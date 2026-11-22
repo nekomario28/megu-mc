@@ -23,7 +23,7 @@ from container_wire import stack, wire_stack
 from protocol767 import Client, Reader, ROOT, port, require, status, string, vint
 
 
-BINARY = ROOT / "target/debug/mc-spine"
+BINARY = ROOT / "target/debug/megu"
 # Protocol 767 item registry IDs, pinned by src/main.rs:name_to_item.
 COAL, STICK, TORCH = 803, 848, 291
 RESULTS = []
@@ -96,13 +96,13 @@ def server(root, *, player_admin=False):
     while rcon_port == game:
         rcon_port = port()
     env = os.environ.copy()
-    env.update(MC_SPINE_PORT=str(game), MC_SPINE_BIND_ADDR="127.0.0.1",
-               MC_SPINE_RCON_PORT=str(rcon_port), MC_SPINE_RCON_BIND_ADDR="127.0.0.1",
-               MC_SPINE_RCON_PASS=RCON_SECRET, MC_SPINE_WG="old",
-               MC_SPINE_RESOURCE_PACK_URL="")
-    env.pop("MC_SPINE_ALLOW_PLAYER_ADMIN_COMMANDS", None)
+    env.update(MEGU_PORT=str(game), MEGU_BIND_ADDR="127.0.0.1",
+               MEGU_RCON_PORT=str(rcon_port), MEGU_RCON_BIND_ADDR="127.0.0.1",
+               MEGU_RCON_PASS=RCON_SECRET, MEGU_WG="old",
+               MEGU_RESOURCE_PACK_URL="")
+    env.pop("MEGU_ALLOW_PLAYER_ADMIN_COMMANDS", None)
     if player_admin:
-        env["MC_SPINE_ALLOW_PLAYER_ADMIN_COMMANDS"] = "1"
+        env["MEGU_ALLOW_PLAYER_ADMIN_COMMANDS"] = "1"
     with (root / "server.log").open("w+") as log:
         process = subprocess.Popen([str(BINARY)], cwd=root, env=env, stdout=log, stderr=log)
         try:

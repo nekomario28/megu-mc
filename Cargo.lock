@@ -83,7 +83,7 @@ dependencies = [
 name = "create-adapter"
 version = "0.1.0"
 dependencies = [
- "mc-spine-core",
+ "megu-core",
  "mod-adapter-core",
  "mod-offload",
 ]
@@ -288,14 +288,14 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "f9f8bd3e56ce4dfc153cf470fffbfa98c7620958b312ca5c3a4b8d5181fd13c6"
 
 [[package]]
-name = "mc-spine"
+name = "megu"
 version = "0.0.0"
 dependencies = [
  "create-adapter",
  "flate2",
  "jni",
- "mc-spine-core",
- "mc-spine-state-store",
+ "megu-core",
+ "megu-state-store",
  "mod-adapter-core",
  "mod-offload",
  "rand",
@@ -305,14 +305,14 @@ dependencies = [
 ]
 
 [[package]]
-name = "mc-spine-core"
+name = "megu-core"
 version = "0.1.0"
 
 [[package]]
-name = "mc-spine-state-store"
+name = "megu-state-store"
 version = "0.1.0"
 dependencies = [
- "mc-spine-core",
+ "megu-core",
 ]
 
 [[package]]
@@ -335,7 +335,7 @@ dependencies = [
 name = "mod-adapter-core"
 version = "0.1.0"
 dependencies = [
- "mc-spine-core",
+ "megu-core",
  "mod-offload",
 ]
 

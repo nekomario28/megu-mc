@@ -20,7 +20,7 @@ def main():
     with pinned_runtime(args.jar) as (work, classpath, _):
         output = work / 'faces.tsv'
         run_probe(work, classpath, REPO / 'tools/structure-oracle/VoxelFaceOracle.java',
-                  'dev.mcspine.tools.VoxelFaceOracle', args.cases.resolve(), output,
+                  'dev.megu.tools.VoxelFaceOracle', args.cases.resolve(), output,
                   extra_sources=(REPO / 'tools/structure-oracle/NativeHarness.java',))
         generated = output.read_text()
         rows = generated.splitlines()

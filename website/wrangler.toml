@@ -1,4 +1,4 @@
-# Cloudflare Pages configuration for the mc-spine / Megu landing site.
+# Cloudflare Pages configuration for the megu / Megu landing site.
 #
 # Deploy: the `website/` directory is the Pages project root —
 # static assets come from pages_build_output_dir and the zero-dependency
@@ -11,7 +11,7 @@ compatibility_date = "2025-01-01"
 # ---------------------------------------------------------------------------
 # Non-secret vars (safe to commit):
 #
-#   GITHUB_REPO = "nekomario28/mc-spine"   # optional; this is the default
+#   GITHUB_REPO = "nekomario28/megu-mc"   # optional; this is the default
 #   ALLOW_DEV_UNVERIFIED_REPORTS = "1"      # LOCAL DEVELOPMENT ONLY:
 #                           bypass missing Turnstile secret; never set in production
 #

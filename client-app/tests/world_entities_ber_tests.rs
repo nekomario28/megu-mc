@@ -5,11 +5,11 @@
 //! 4096 cap), block entities (chunk payload, `block_entity_data`, and
 //! `forget_chunk` pruning), world time/weather, and block-break overlays.
 
-use mc_spine_client::protocol::{
+use megu_client::protocol::{
     DecodedBlockEntity, DecodedChunk, DecodedLightData, DecodedSection, DimensionMeta,
     EquipmentEntry, PlayEvent,
 };
-use mc_spine_client::world::{
+use megu_client::world::{
     BlockTable, WorldState, MAX_BLOCK_DESTRUCTIONS, MAX_TRACKED_BLOCK_ENTITIES,
     MAX_TRACKED_ENTITIES,
 };

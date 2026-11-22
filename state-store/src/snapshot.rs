@@ -39,7 +39,7 @@
 //! never a partial restore or a panic.
 
 use crate::sharded::{ChunkCoord, ChunkOverlay, DimensionState, ServerContext};
-use mc_spine_core::version::TargetVersion;
+use megu_core::version::TargetVersion;
 use std::collections::HashMap;
 use std::error::Error;
 use std::fmt;

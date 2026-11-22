@@ -108,7 +108,7 @@ def main():
             work,
             classpath,
             REPO / "tools/structure-oracle/TemplateInitOracle.java",
-            "dev.mcspine.tools.TemplateInitOracle",
+            "dev.megu.tools.TemplateInitOracle",
             data,
             extra_sources=(REPO / "tools/structure-oracle/NativeHarness.java",
                            REPO / "tools/structure-oracle/StructureTemplateOracle.java"),

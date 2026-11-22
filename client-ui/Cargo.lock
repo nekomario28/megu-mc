@@ -3,12 +3,12 @@
 version = 4
 
 [[package]]
-name = "mc-spine-client-ui"
+name = "megu-client-ui"
 version = "0.1.0"
 dependencies = [
- "mc-spine-core",
+ "megu-core",
 ]
 
 [[package]]
-name = "mc-spine-core"
+name = "megu-core"
 version = "0.1.0"

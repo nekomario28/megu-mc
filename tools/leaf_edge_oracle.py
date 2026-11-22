@@ -16,7 +16,7 @@ def main():
     source = ROOT / "tools/leaf-distance-oracle"
     with pinned_runtime(args.jar) as (work, classpath, _):
         out = work / "leaf-edge.tsv"
-        run_probe(work, classpath, source / "LeafEdgeOracle.java", "dev.mcspine.tools.LeafEdgeOracle", out,
+        run_probe(work, classpath, source / "LeafEdgeOracle.java", "dev.megu.tools.LeafEdgeOracle", out,
                   extra_sources=[source / "LeafDistanceOracle.java", source / "LeafQueueOracle.java",
                                  ROOT / "tools/vanilla-probe/VanillaBlockTags.java"])
         actual = out.read_bytes()

@@ -8,34 +8,34 @@
 
 use std::sync::{Arc, Mutex};
 
-use mc_spine_client_gpu::atmosphere::{
+use megu_client_gpu::atmosphere::{
     extruded_mesh_to_geometry, planet_body_to_geometry, planet_subworld_transform,
     voxel_clouds_to_geometry, AtmosphereParams, BiomeAtmosphereBlender, ChunkFadeTracker,
     CLOUD_RENDER_ALPHA,
 };
-use mc_spine_client_gpu::renderer::{
+use megu_client_gpu::renderer::{
     probe_adapters, request_gpu_device, ComposedFrame, GpuRenderer, RendererError, OFFSCREEN_FORMAT,
 };
-use mc_spine_client_gpu::subworld_render::{
+use megu_client_gpu::subworld_render::{
     box_mesh, quat_from_axis_angle, CompositeDrawUniforms, InstancedPartBatch, InstancedPartRecord,
     SubWorldRenderBank, SubWorldRenderEntry, SubWorldTransform, TerrainVertex, COMPOSITE_LIT_WGSL,
     COMPOSITE_TERRAIN_WGSL, DRAW_UNIFORM_STRIDE,
 };
-use mc_spine_client_gpu::{build_demo_scene, mat4_mul_vec4, Camera, Mat4};
-use mc_spine_client_mesh::builtin_shadow_wgsl::{
+use megu_client_gpu::{build_demo_scene, mat4_mul_vec4, Camera, Mat4};
+use megu_client_mesh::builtin_shadow_wgsl::{
     BuiltinShadowQuality, RenderScalePreset, ShadowCacheDecision,
 };
-use mc_spine_client_mesh::space_sky_bridge::{
+use megu_client_mesh::space_sky_bridge::{
     compute_sky_body_placement, derive_dimension_policy, ExternalOverrideFlags,
     PlanetDimensionMeta, PlanetSkyBody, SkyBodyPlacement,
 };
-use mc_spine_client_mesh::vanilla_plus_nature::{
+use megu_client_mesh::vanilla_plus_nature::{
     compute_cloud_lighting, generate_layered_voxel_clouds, VanillaPlusNatureConfig,
 };
-use mc_spine_client_mesh::vfx_engine::DynamicColoredLight;
-use mc_spine_client_mesh::RenderBackendPreference;
-use mc_spine_ui::draw::rasterize_draw_list;
-use mc_spine_ui::state::{HudState, Screen, UiState};
+use megu_client_mesh::vfx_engine::DynamicColoredLight;
+use megu_client_mesh::RenderBackendPreference;
+use megu_ui::draw::rasterize_draw_list;
+use megu_ui::state::{HudState, Screen, UiState};
 use wgpu::naga::front::wgsl;
 use wgpu::naga::valid::{Capabilities, ValidationFlags, Validator};
 use wgpu::naga::ShaderStage;
@@ -659,7 +659,7 @@ fn composed_frame_renders_on_real_gpu() {
     assert_eq!(
         renderer.shadow_decision(&camera_for_cache, 7, 6000),
         ShadowCacheDecision::Rerender(
-            mc_spine_client_mesh::builtin_shadow_wgsl::ShadowDirtyReason::FirstFrame
+            megu_client_mesh::builtin_shadow_wgsl::ShadowDirtyReason::FirstFrame
         )
     );
     assert_eq!(
@@ -727,7 +727,7 @@ fn composed_frame_renders_on_real_gpu() {
         is_below_horizon_parent: false,
     };
     let (planet_v, planet_i) = planet_body_to_geometry(&planet);
-    let placement = mc_spine_client_mesh::space_sky_bridge::SkyBodyPlacement {
+    let placement = megu_client_mesh::space_sky_bridge::SkyBodyPlacement {
         direction: [0.0, 0.35, -1.0],
         apparent_angular_radius_deg: 10.0,
         sun_direction: [0.0, 1.0, 0.0],
@@ -923,7 +923,7 @@ fn chunk_fade_tracker_is_bounded_and_recycles_finished_fades() {
 
 #[test]
 fn voxel_cloud_geometry_sanitizes_lighting_and_degenerate_cells() {
-    use mc_spine_client_mesh::vanilla_plus_nature::{CloudLighting, VoxelCloudCell, ALL_FACES};
+    use megu_client_mesh::vanilla_plus_nature::{CloudLighting, VoxelCloudCell, ALL_FACES};
     let lighting = CloudLighting {
         top_rgb: [f32::NAN, -0.5, 0.8],
         side_rgb: [1.0, 1.0, 1.0],
@@ -966,7 +966,7 @@ fn voxel_cloud_geometry_sanitizes_lighting_and_degenerate_cells() {
 
 #[test]
 fn extruded_mesh_to_geometry_skips_non_finite_quads_and_bounds_albedo() {
-    use mc_spine_client_mesh::vanilla_plus_3d::{ExtrudedMesh, ExtrudedQuad};
+    use megu_client_mesh::vanilla_plus_3d::{ExtrudedMesh, ExtrudedQuad};
     let quad = |positions: [[f32; 3]; 4]| ExtrudedQuad {
         positions,
         normal: [0.0, 0.0, 1.0],

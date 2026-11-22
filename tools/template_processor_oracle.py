@@ -99,7 +99,7 @@ def main():
         native = ROOT / 'tools/structure-oracle'
         with pinned_runtime(a.jar) as (runtime, cp, _):
             run_probe(runtime, cp, native / 'TemplateProcessorOracle.java',
-                      'dev.mcspine.tools.TemplateProcessorOracle', source, actual, ROOT,
+                      'dev.megu.tools.TemplateProcessorOracle', source, actual, ROOT,
                       extra_sources=(native / 'NativeHarness.java', native / 'StructureTemplateOracle.java'))
         for path, data in ((INPUT, inputs), (EXPECTED, actual.read_bytes())):
             if not a.write:

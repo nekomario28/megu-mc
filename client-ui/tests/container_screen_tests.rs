@@ -1,10 +1,10 @@
 // SPDX-License-Identifier: LGPL-3.0-or-later
 //! Behavior tests for the declarative container/menu screen engine.
 
-use mc_spine_client_ui::container_screen::{
+use megu_client_ui::container_screen::{
     menu_schema, ContainerScreenState, SlotKind, UiItemStack, VANILLA_MENU_COUNT,
 };
-use mc_spine_client_ui::draw::{
+use megu_client_ui::draw::{
     rasterize_draw_list, text_height, text_width, UiColor, UiCommand, UiDrawList,
 };
 
@@ -309,14 +309,14 @@ fn button_click_emits_deterministic_container_button_click() {
     let mut enchant = state(13);
     assert_eq!(
         enchant.button_click(1),
-        Some(mc_spine_client_ui::container_screen::ContainerButtonClick {
+        Some(megu_client_ui::container_screen::ContainerButtonClick {
             window_id: 1,
             button_id: 1
         })
     );
     assert_eq!(
         enchant.button_click(1),
-        Some(mc_spine_client_ui::container_screen::ContainerButtonClick {
+        Some(megu_client_ui::container_screen::ContainerButtonClick {
             window_id: 1,
             button_id: 1
         })
@@ -326,7 +326,7 @@ fn button_click_emits_deterministic_container_button_click() {
     let mut stonecutter = state(24);
     assert_eq!(
         stonecutter.button_click(7),
-        Some(mc_spine_client_ui::container_screen::ContainerButtonClick {
+        Some(megu_client_ui::container_screen::ContainerButtonClick {
             window_id: 1,
             button_id: 7
         })
@@ -335,14 +335,14 @@ fn button_click_emits_deterministic_container_button_click() {
     let mut lectern = state(17);
     assert_eq!(
         lectern.button_click(3),
-        Some(mc_spine_client_ui::container_screen::ContainerButtonClick {
+        Some(megu_client_ui::container_screen::ContainerButtonClick {
             window_id: 1,
             button_id: 3
         })
     );
     assert_eq!(
         lectern.button_click(105),
-        Some(mc_spine_client_ui::container_screen::ContainerButtonClick {
+        Some(megu_client_ui::container_screen::ContainerButtonClick {
             window_id: 1,
             button_id: 105
         })

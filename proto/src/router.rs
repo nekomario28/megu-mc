@@ -83,7 +83,7 @@ impl SessionRemapSummary {
 /// `*_to_wire`, client ids heading inward go through `*_from_wire`.
 /// Translation is `Option`-returning by design — a name the other version
 /// does not have is `None`, and the caller decides how to fail (vanilla
-/// substitutes or disconnects; mc-spine must never silently emit a wrong id).
+/// substitutes or disconnects; megu must never silently emit a wrong id).
 ///
 /// When both tables declare the same protocol version the remapper is
 /// *identity*: translation is a free pass-through. The fast path assumes an

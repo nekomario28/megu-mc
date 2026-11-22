@@ -3,7 +3,7 @@
 
 use std::collections::BTreeSet;
 
-use mc_spine_core::i18n::{
+use megu_core::i18n::{
     detect_os_locale_from_env, parse_locale_code, BuiltinLocale as L, I18nCatalog, I18nError,
     LocaleId, UiTextKey, ALL_BUILTIN_LOCALES, ALL_UI_KEYS, MAX_LANG_JSON_BYTES, MAX_LANG_KEYS,
 };

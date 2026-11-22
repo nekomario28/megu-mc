@@ -38,7 +38,7 @@ def main():
         parser.exit(2, "not the pinned 1.21.1 server jar: %s\n" % args.jar)
     info = validate(args.tsv)
     with pinned_runtime(args.jar) as (work, classpath, inner):
-        run_probe(work, classpath, SOURCE, "dev.mcspine.tools.BiomeTieOracle",
+        run_probe(work, classpath, SOURCE, "dev.megu.tools.BiomeTieOracle",
                   str(args.tsv.resolve()))
     print("biome tie oracle: %d rows (%d ties) match the pinned classes (%s)" %
           (info["rows"], info["ties"], info["sha256"][:12]))

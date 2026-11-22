@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: LGPL-3.0-or-later OR GPL-3.0-or-later OR AGPL-3.0-or-later
 
-//! `mc-spine-mod-check` — zero-dependency modpack pre-flight checker and
+//! `megu-mod-check` — zero-dependency modpack pre-flight checker and
 //! mod-JAR mixin scanner.
 //!
 //! `--modpack` points [`modpack::ModpackManifest::from_path`] and
@@ -15,7 +15,7 @@
 //! on one mod JAR: every `*.mixins.json` config is read, the registered
 //! mixin classes' bytecode annotations are reduced to injection sites,
 //! and [`mixin_lifter::lift_mixin_sites`] either lifts each site onto a
-//! standard mc-spine event hook (Tier 2, bounded JVM shim) or reports it
+//! standard megu event hook (Tier 2, bounded JVM shim) or reports it
 //! unliftable with the reason it stays at Tier 3.
 //!
 //! `--scan-mods-dir` points the same engines at an entire `mods/` folder:
@@ -30,11 +30,11 @@
 //! [`auto_adapter`](mod_adapter_core::auto_adapter)'s full zero-JVM
 //! pipeline automatically — loader metadata, generic data / culinary /
 //! dimension discovery, Mixin bytecode lifting — and either emit a
-//! validated `mc-spine-mod-bundle/1` document (`--out` writes
+//! validated `megu-mod-bundle/1` document (`--out` writes
 //! `<mod_id>.bundle.json` + `adaptation-report.json`) or report the exact
 //! blockers that keep a mod at Tier 3.
 //!
-//! `--scaffold-native` emits a validated starter `mc-spine-mod-bundle/1`
+//! `--scaffold-native` emits a validated starter `megu-mod-bundle/1`
 //! document (via
 //! [`scaffold_native_bundle`](mod_adapter_core::auto_adapter::scaffold_native_bundle))
 //! for authors building native zero-JVM Megu mods.
@@ -68,16 +68,16 @@ use mod_adapter_core::modpack::{
 use mod_adapter_core::version_compat::McVersion;
 
 const USAGE: &str = "\
-mc-spine-mod-check — check whether a modpack can run on this mc-spine server,
+megu-mod-check — check whether a modpack can run on this megu server,
 scan one mod JAR's mixin bytecode for Tier 2 liftability, inspect a whole
 mods/ directory, or auto-adapt mod JARs into native bundles — all zero JVM
 
-Usage: mc-spine-mod-check --modpack <path> [options]
-       mc-spine-mod-check --scan-jar <mod.jar> [--include-client-mixins] [--json]
-       mc-spine-mod-check --scan-mods-dir <dir> [--include-client-mixins] [--json]
-       mc-spine-mod-check --adapt-jar <mod.jar> [--out <dir>] [--include-client-mixins] [--json]
-       mc-spine-mod-check --adapt-mods-dir <dir> [--out <dir>] [--include-client-mixins] [--json]
-       mc-spine-mod-check --scaffold-native <mod_id> [--name <display>] [--version <ver>] [--out <file>]
+Usage: megu-mod-check --modpack <path> [options]
+       megu-mod-check --scan-jar <mod.jar> [--include-client-mixins] [--json]
+       megu-mod-check --scan-mods-dir <dir> [--include-client-mixins] [--json]
+       megu-mod-check --adapt-jar <mod.jar> [--out <dir>] [--include-client-mixins] [--json]
+       megu-mod-check --adapt-mods-dir <dir> [--out <dir>] [--include-client-mixins] [--json]
+       megu-mod-check --scaffold-native <mod_id> [--name <display>] [--version <ver>] [--out <file>]
 
 --modpack accepts a Modrinth .mrpack archive, a standalone modrinth.index.json,
 or a CurseForge manifest.json / pack .zip, and reports — before anything is
@@ -87,7 +87,7 @@ a compatibility inspection.
 
 --scan-jar parses one mod JAR's .class bytecode directly, with no JVM: every
 *.mixins.json config is read, only the classes it registers are parsed, and
-each mixin injection site is either lifted onto a standard mc-spine event
+each mixin injection site is either lifted onto a standard megu event
 hook (Tier 2, bounded JVM shim) or reported unliftable with the reason it
 stays at Tier 3.
 
@@ -106,7 +106,7 @@ Tier 2 lifted shim, or Tier 3 fallback with exact blockers. With --out,
 each adapted JAR's <mod_id>.bundle.json plus an adaptation-report.json are
 written to the output directory.
 
---scaffold-native emits a validated mc-spine-mod-bundle/1 starter document
+--scaffold-native emits a validated megu-mod-bundle/1 starter document
 for a native zero-JVM mod: to stdout, or to the exact --out file.
 
 Options:
@@ -590,7 +590,7 @@ fn format_scan_human(path: &Path, report: &JarMixinScanReport) -> String {
         "Result: {}",
         match &report.verdict {
             MixinLiftVerdict::FullyLiftable(_) =>
-                "fully liftable — every mixin site maps onto a standard mc-spine event hook; this JAR is Tier 2 eligible (bounded JVM shim).".to_string(),
+                "fully liftable — every mixin site maps onto a standard megu event hook; this JAR is Tier 2 eligible (bounded JVM shim).".to_string(),
             MixinLiftVerdict::RequiresFallback { unliftable, .. } => format!(
                 "requires fallback — {} mixin site(s) cannot be proven safe; this JAR stays at Tier 3.",
                 unliftable.len()
@@ -688,13 +688,13 @@ fn json_site_fields(out: &mut String, level: usize, site: &MixinSite) {
     );
 }
 
-/// Deterministic `mc-spine-jar-mixin-scan/1` JSON form of a
+/// Deterministic `megu-jar-mixin-scan/1` JSON form of a
 /// [`JarMixinScanReport`].
 fn scan_report_json(path: &Path, report: &JarMixinScanReport) -> String {
     use std::fmt::Write;
     let mut out = String::with_capacity(512 + report.sites.len() * 256);
     out.push_str("{\n");
-    json_field_str(&mut out, 1, "schema", "mc-spine-jar-mixin-scan/1", true);
+    json_field_str(&mut out, 1, "schema", "megu-jar-mixin-scan/1", true);
     json_field_str(&mut out, 1, "path", &path.display().to_string(), true);
     let _ = writeln!(
         out,
@@ -989,7 +989,7 @@ fn format_mods_dir_human(
             ModsDirClass::SupersededPerfMod => {
                 let _ = writeln!(
                     out,
-                    "  {} [{id}]: skipped — already covered by mc-spine built-in optimizations.",
+                    "  {} [{id}]: skipped — already covered by megu built-in optimizations.",
                     jar.name
                 );
             }
@@ -1056,7 +1056,7 @@ fn format_mods_dir_human(
     out
 }
 
-/// Per-JAR `jars[]` entry of the `mc-spine-mods-dir-scan/1` schema: file
+/// Per-JAR `jars[]` entry of the `megu-mods-dir-scan/1` schema: file
 /// name, inferred mod id, class, then — for scanned JARs — the same
 /// `lifted_hooks`/`unliftable` site detail `--scan-jar` emits plus the
 /// per-JAR culinary counters.
@@ -1157,7 +1157,7 @@ fn mods_dir_jar_json(out: &mut String, jar: &ModsDirJar, last: bool) {
     let _ = writeln!(out, "    }}{}", if last { "" } else { "," });
 }
 
-/// Deterministic `mc-spine-mods-dir-scan/1` JSON form of a directory
+/// Deterministic `megu-mods-dir-scan/1` JSON form of a directory
 /// scan: totals by class, merged culinary counters, then one entry per
 /// JAR in the same filename order as the human report.
 fn mods_dir_json(
@@ -1169,7 +1169,7 @@ fn mods_dir_json(
     use std::fmt::Write;
     let mut out = String::with_capacity(1024 + jars.len() * 384);
     out.push_str("{\n");
-    json_field_str(&mut out, 1, "schema", "mc-spine-mods-dir-scan/1", true);
+    json_field_str(&mut out, 1, "schema", "megu-mods-dir-scan/1", true);
     json_field_str(&mut out, 1, "dir", &dir.display().to_string(), true);
     json_field_u64(&mut out, 1, "jars_found", jars.len() as u64, true);
     json_field_u64(&mut out, 1, "non_jar_entries", non_jar as u64, true);
@@ -1255,7 +1255,7 @@ fn run_modpack(cli: Cli) -> ExitCode {
     let manifest = match ModpackManifest::from_path(&cli.modpack) {
         Ok(m) => m,
         Err(e) => {
-            eprintln!("mc-spine-mod-check: {e}");
+            eprintln!("megu-mod-check: {e}");
             return ExitCode::FAILURE;
         }
     };
@@ -1279,7 +1279,7 @@ fn run_scan_jar(cli: &JarCli) -> ExitCode {
     let report = match scan_jar_path_with_options(&cli.jar, opts) {
         Ok(r) => r,
         Err(e) => {
-            eprintln!("mc-spine-mod-check: {e}");
+            eprintln!("megu-mod-check: {e}");
             return ExitCode::FAILURE;
         }
     };
@@ -1298,7 +1298,7 @@ fn run_scan_mods_dir(cli: &ModsDirCli) -> ExitCode {
     let (jars, non_jar, culinary) = match scan_mods_dir(cli) {
         Ok(r) => r,
         Err(e) => {
-            eprintln!("mc-spine-mod-check: {e}");
+            eprintln!("megu-mod-check: {e}");
             return ExitCode::FAILURE;
         }
     };
@@ -1344,7 +1344,7 @@ fn run_adapt_jar(cli: &AdaptCli) -> ExitCode {
     let result = match auto_adapt_jar(&cli.path, &adapt_options(cli.server_only)) {
         Ok(r) => r,
         Err(e) => {
-            eprintln!("mc-spine-mod-check: {e}");
+            eprintln!("megu-mod-check: {e}");
             return ExitCode::FAILURE;
         }
     };
@@ -1352,7 +1352,7 @@ fn run_adapt_jar(cli: &AdaptCli) -> ExitCode {
         if let Err(e) =
             write_adaptation_outputs(out, &result.to_json(), std::slice::from_ref(&result))
         {
-            eprintln!("mc-spine-mod-check: {e}");
+            eprintln!("megu-mod-check: {e}");
             return ExitCode::FAILURE;
         }
     }
@@ -1368,13 +1368,13 @@ fn run_adapt_mods_dir(cli: &AdaptCli) -> ExitCode {
     let report = match auto_adapt_mods_dir(&cli.path, &adapt_options(cli.server_only)) {
         Ok(r) => r,
         Err(e) => {
-            eprintln!("mc-spine-mod-check: {e}");
+            eprintln!("megu-mod-check: {e}");
             return ExitCode::FAILURE;
         }
     };
     if let Some(out) = &cli.out {
         if let Err(e) = write_adaptation_outputs(out, &report.to_json(), &report.jars) {
-            eprintln!("mc-spine-mod-check: {e}");
+            eprintln!("megu-mod-check: {e}");
             return ExitCode::FAILURE;
         }
     }
@@ -1394,7 +1394,7 @@ fn run_scaffold_native(cli: &ScaffoldCli) -> ExitCode {
     ) {
         Ok(j) => j,
         Err(e) => {
-            eprintln!("mc-spine-mod-check: {e}");
+            eprintln!("megu-mod-check: {e}");
             return ExitCode::from(2);
         }
     };
@@ -1406,7 +1406,7 @@ fn run_scaffold_native(cli: &ScaffoldCli) -> ExitCode {
         Some(path) => match std::fs::write(path, &json) {
             Ok(()) => {
                 println!(
-                    "wrote {}: mc-spine-mod-bundle/1 starter for mod id '{}' ({} bytes)",
+                    "wrote {}: megu-mod-bundle/1 starter for mod id '{}' ({} bytes)",
                     path.display(),
                     cli.mod_id,
                     json.len()
@@ -1415,7 +1415,7 @@ fn run_scaffold_native(cli: &ScaffoldCli) -> ExitCode {
             }
             Err(e) => {
                 eprintln!(
-                    "mc-spine-mod-check: '{}': cannot write scaffold bundle: {e}",
+                    "megu-mod-check: '{}': cannot write scaffold bundle: {e}",
                     path.display()
                 );
                 ExitCode::FAILURE
@@ -1438,8 +1438,8 @@ fn main() -> ExitCode {
         Ok(Action::AdaptModsDir(cli)) => run_adapt_mods_dir(&cli),
         Ok(Action::ScaffoldNative(cli)) => run_scaffold_native(&cli),
         Err(msg) => {
-            eprintln!("mc-spine-mod-check: {msg}");
-            eprintln!("Try 'mc-spine-mod-check --help' for usage.");
+            eprintln!("megu-mod-check: {msg}");
+            eprintln!("Try 'megu-mod-check --help' for usage.");
             ExitCode::from(2)
         }
     }

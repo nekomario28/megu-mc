@@ -11,9 +11,9 @@ WORKFLOW = ROOT / ".github/workflows/release.yml"
 TOOLCHAIN = ROOT / "rust-toolchain.toml"
 REQUIRED_JOBS = {"preflight", "build-matrix", "docker-check", "publish-release"}
 BINARIES = (
-    "mc-spine", "mc-spine-client", "mc-spine-mod-check",
-    "mc-spine-world-migrate", "mc-spine-init", "mc-spine-admin",
-    "mc-spine-client-gpu",
+    "megu", "megu-client", "megu-mod-check",
+    "megu-world-migrate", "megu-init", "megu-admin",
+    "megu-client-gpu",
 )
 
 
@@ -116,7 +116,7 @@ class ReleaseWorkflowTest(unittest.TestCase):
             self.assertIn(manifest, job)
         self.assertEqual(job.count("cargo build --locked --release"), 6)
         self.assertIn("--manifest-path server-files/Cargo.toml --bins", job)
-        self.assertIn("--manifest-path client-gpu/Cargo.toml --bin mc-spine-client-gpu", job)
+        self.assertIn("--manifest-path client-gpu/Cargo.toml --bin megu-client-gpu", job)
         self.assertIn("tools/release_bundle.py build", job)
         self.assertIn("tools/release_bundle.py verify", job)
         self.assertEqual(job.count("--extra-binary"), 6)
@@ -124,7 +124,7 @@ class ReleaseWorkflowTest(unittest.TestCase):
             self.assertIn(f"release/{binary}$suffix", job)
         self.assertIn("if-no-files-found: error", job)
         self.assertIn(
-            "cargo build --locked --release --features mod-suite,create-offload --bin mc-spine",
+            "cargo build --locked --release --features mod-suite,create-offload --bin megu",
             job,
         )
 
@@ -140,19 +140,19 @@ class ReleaseWorkflowTest(unittest.TestCase):
         job = self.jobs["build-matrix"]
         self.assertIn(
             "cargo build --locked --release --manifest-path client-gpu/Cargo.toml"
-            " --bin mc-spine-client-gpu",
+            " --bin megu-client-gpu",
             job,
         )
         self.assertNotIn("cargo build --offline", job)
         self.assertIn(
-            '"client-gpu/target/release/mc-spine-client-gpu$suffix" --headless-probe',
+            '"client-gpu/target/release/megu-client-gpu$suffix" --headless-probe',
             job,
         )
         self.assertIn(
-            '--extra-binary "client-gpu/target/release/mc-spine-client-gpu$suffix"',
+            '--extra-binary "client-gpu/target/release/megu-client-gpu$suffix"',
             job,
         )
-        self.assertIn("'mc-spine-client-gpu'", self.jobs["publish-release"])
+        self.assertIn("'megu-client-gpu'", self.jobs["publish-release"])
 
     def test_workflow_yaml_parses(self):
         try:

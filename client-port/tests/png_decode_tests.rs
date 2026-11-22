@@ -10,9 +10,9 @@ use std::fs;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use mc_spine_client_mesh::asset_pipeline::{CompiledAssetBundle, ResourcePackLayer};
-use mc_spine_client_mesh::atlas::AtlasTileRect;
-use mc_spine_client_mesh::png_decode::{decode_png_rgba, PngDecodeError, MAX_PNG_DIM};
+use megu_client_mesh::asset_pipeline::{CompiledAssetBundle, ResourcePackLayer};
+use megu_client_mesh::atlas::AtlasTileRect;
+use megu_client_mesh::png_decode::{decode_png_rgba, PngDecodeError, MAX_PNG_DIM};
 
 // ---------------------------------------------------------------------------
 // Real PNG fixtures (Python zlib.compress, level 9)

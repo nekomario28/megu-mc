@@ -1,13 +1,13 @@
 // SPDX-License-Identifier: LGPL-3.0-or-later
 //! Focused headless-client integration coverage for the shared 1.21.1 kernels.
 
-use mc_spine_client::protocol::{
+use megu_client::protocol::{
     DecodedChunk, DecodedLightData, DecodedSection, DimensionMeta, TeleportSync,
 };
-use mc_spine_client::sim::{PlayerPhysics, TickInput};
-use mc_spine_client::world::{BlockTable, WorldState};
-use mc_spine_client_mesh::section_index;
-use mc_spine_kernel::{BlockHitFace, FluidClipMode};
+use megu_client::sim::{PlayerPhysics, TickInput};
+use megu_client::world::{BlockTable, WorldState};
+use megu_client_mesh::section_index;
+use megu_kernel::{BlockHitFace, FluidClipMode};
 
 fn world_with_blocks(blocks: impl IntoIterator<Item = ([usize; 3], u32)>) -> WorldState {
     let dimension = DimensionMeta {

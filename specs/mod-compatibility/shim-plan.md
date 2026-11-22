@@ -12,7 +12,7 @@
 
 ## 計測プロトコル（全S共通）
 
-seed 0、view/simulation distance 4、プレイヤー0人とN人、datapackのworldgenが有効であることをログで確認（平らなワールドで測らない）。RSSは `/proc/<pid>/status` の `VmRSS`・`VmHWM`・`RssAnon`・`RssFile` を12秒後と負荷後に取る。起動はプロセス開始から RCON `list` が返るまで。tick時間はp50/p95/p99。基準は (a) mc-spineのみ、(b) JVMのみ・Modなし、(c) **NeoForge 1.21.1 + Lithium + FerriteCore（ユーザー側で実測）**、(d) vanilla 1.21.1。JVMフラグ・JDK・ロード済みクラス数も記録する。
+seed 0、view/simulation distance 4、プレイヤー0人とN人、datapackのworldgenが有効であることをログで確認（平らなワールドで測らない）。RSSは `/proc/<pid>/status` の `VmRSS`・`VmHWM`・`RssAnon`・`RssFile` を12秒後と負荷後に取る。起動はプロセス開始から RCON `list` が返るまで。tick時間はp50/p95/p99。基準は (a) meguのみ、(b) JVMのみ・Modなし、(c) **NeoForge 1.21.1 + Lithium + FerriteCore（ユーザー側で実測）**、(d) vanilla 1.21.1。JVMフラグ・JDK・ロード済みクラス数も記録する。
 
 ## マイルストーン
 
@@ -33,7 +33,7 @@ seed 0、view/simulation distance 4、プレイヤー0人とN人、datapackのwo
 
 ## 将来拡張：汎用オフロードカーネル＋重量 Mod 向けネイティブ加速（S3 以降）
 
-Create・Mekanism・AE2 等の重量 Mod は、別プロジェクトへ切り出さず **`mc-spine` 本体（[M3 基盤](../chunk-parallelism/README.md)の `PalettedSection`・空間索引・[`tick_queue`](../../src/tick_queue.rs)・差分配信）の上に「汎用オフロードカーネル（7〜8 割）＋ Mod 固有薄型アダプタ（2〜3 割）」として統合**する方針を採る（純 Vanilla コア層との境界は [`tools/layers_check.sh`](../../tools/layers_check.sh) で隔離する）。
+Create・Mekanism・AE2 等の重量 Mod は、別プロジェクトへ切り出さず **`megu` 本体（[M3 基盤](../chunk-parallelism/README.md)の `PalettedSection`・空間索引・[`tick_queue`](../../src/tick_queue.rs)・差分配信）の上に「汎用オフロードカーネル（7〜8 割）＋ Mod 固有薄型アダプタ（2〜3 割）」として統合**する方針を採る（純 Vanilla コア層との境界は [`tools/layers_check.sh`](../../tools/layers_check.sh) で隔離する）。
 
 1. **全 Mod 向けに汎化する 5 つの共通カーネル**
    - **データ駆動コンテンツ層**: Mod JAR 内のブロック/アイテム/レシピ/タグ/DataComponent を Java を動かさず Rust 側へ直接登録・配信。

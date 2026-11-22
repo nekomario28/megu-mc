@@ -16,7 +16,7 @@ def main():
     with pinned_runtime(args.jar) as (work, cp, _):
         output = work / 'end-island-feature.tsv'
         run_probe(work, cp, ROOT / 'tools/structure-oracle/EndIslandOracle.java',
-                  'dev.mcspine.tools.EndIslandOracle', output)
+                  'dev.megu.tools.EndIslandOracle', output)
         actual = output.read_bytes()
     if args.write:
         VECTORS.write_bytes(actual)

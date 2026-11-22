@@ -6,14 +6,14 @@
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use mc_spine_client::protocol::{
+use megu_client::protocol::{
     DecodedBlockEntity, DecodedChunk, DecodedLightData, DecodedSection, DimensionMeta,
 };
-use mc_spine_client::settings::{
+use megu_client::settings::{
     ClientSettings, SettingsFlush, SettingsSaveGuard, MAX_FOV, MIN_FOV,
 };
-use mc_spine_client::sound_assets::{SoundLibrary, DEFAULT_SOUND_PCM_CACHE_CAP_BYTES};
-use mc_spine_client::world::{BlockTable, WorldState};
+use megu_client::sound_assets::{SoundLibrary, DEFAULT_SOUND_PCM_CACHE_CAP_BYTES};
+use megu_client::world::{BlockTable, WorldState};
 
 fn scratch_dir(tag: &str) -> PathBuf {
     let dir = std::env::temp_dir().join(format!("mc-ultra-app2-{tag}-{}", std::process::id()));
@@ -98,7 +98,7 @@ fn sound_library_lru_strictly_caps_decoded_pcm_bytes_and_evicts_oldest() {
 #[test]
 fn settings_flush_skips_unchanged_and_writes_once_after_slider_burst() {
     let dir = scratch_dir("settings");
-    let path = dir.join("mc-spine-client.toml");
+    let path = dir.join("megu-client.toml");
     let mut settings = ClientSettings::default();
     let mut guard = SettingsSaveGuard::new();
 
@@ -122,7 +122,7 @@ fn settings_flush_skips_unchanged_and_writes_once_after_slider_burst() {
     assert!(!guard.is_dirty());
     assert_eq!(std::fs::read_to_string(&path).unwrap(), settings.to_toml());
     assert!(
-        !dir.join("mc-spine-client.toml.tmp").exists(),
+        !dir.join("megu-client.toml.tmp").exists(),
         "atomic temp file was renamed, not left behind"
     );
 

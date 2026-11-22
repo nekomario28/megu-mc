@@ -10,7 +10,7 @@ use std::sync::Arc;
 use std::thread::{self, JoinHandle};
 use std::time::Duration;
 
-use mc_spine_proto::friend_relay::{
+use megu_proto::friend_relay::{
     decode_frame, encode_frame, FriendPacket, InviteCode, MAX_FRL1_FRAME_BYTES,
     MAX_STREAM_PAYLOAD_BYTES,
 };

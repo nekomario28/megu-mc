@@ -22,7 +22,7 @@ from protocol767 import Client, ContractFailure, Reader, ROOT, require, string, 
 from wire_smoke import port, status
 
 
-SYNC_CHANNEL = "mc-spine:mod_sync_v1"
+SYNC_CHANNEL = "megu:mod_sync_v1"
 EXHAUSTION_CHANNEL = "appleskin:exhaustion_sync"
 SATURATION_CHANNEL = "appleskin:saturation_sync"
 CUSTOM_PAYLOAD_ID = 0x19
@@ -79,9 +79,9 @@ def renamed_perf_jar(path):
 
 
 def native_bundle_document():
-    """A standalone `mc-spine-mod-bundle/1` document for `mods/` auto-load."""
+    """A standalone `megu-mod-bundle/1` document for `mods/` auto-load."""
     return {
-        "schema": "mc-spine-mod-bundle/1",
+        "schema": "megu-mod-bundle/1",
         "mod_id": NATIVE_BUNDLE_ID,
         "mc_version_range": "[1.21,)",
         "portals": [],
@@ -178,7 +178,7 @@ class ModClient(Client):
 
 
 def self_test():
-    with tempfile.TemporaryDirectory(prefix="mc-spine-mods-selftest-") as tmp:
+    with tempfile.TemporaryDirectory(prefix="megu-mods-selftest-") as tmp:
         mods, manifest, entry = make_fixture(Path(tmp))
         require(json.loads(manifest.read_text())["entries"] == [entry],
                 "selftest-json-manifest")
@@ -194,7 +194,7 @@ def self_test():
                     "selftest-renamed-jar-manifest")
         bundle = json.loads((mods / NATIVE_BUNDLE_FILE).read_text())
         require(bundle == native_bundle_document()
-                and bundle["schema"] == "mc-spine-mod-bundle/1",
+                and bundle["schema"] == "megu-mod-bundle/1",
                 "selftest-native-bundle-document")
         for name, namespace in zip(JAR_NAMES, NAMESPACES):
             with zipfile.ZipFile(mods / name) as archive:
@@ -252,7 +252,7 @@ def log_tail(path):
 def run_live(binary):
     require(binary.is_file(), f"compiled-binary-missing: {binary}")
     require(os.access(binary, os.X_OK), f"compiled-binary-not-executable: {binary}")
-    with tempfile.TemporaryDirectory(prefix="mc-spine-mods-live-") as tmp:
+    with tempfile.TemporaryDirectory(prefix="megu-mods-live-") as tmp:
         root = Path(tmp)
         mods, manifest, entry = make_fixture(root)
         for name in ("config_packets.bin", "assets"):
@@ -262,16 +262,16 @@ def run_live(binary):
 
         game = port()
         env = os.environ.copy()
-        for key in ("MC_SPINE_RCON_PORT", "MC_SPINE_RCON_PASS",
-                    "MC_SPINE_ALLOW_PLAYER_ADMIN_COMMANDS", "MC_SPINE_PROGRESSION",
-                    "MC_SPINE_MOD_SYNC_MIRRORS"):
+        for key in ("MEGU_RCON_PORT", "MEGU_RCON_PASS",
+                    "MEGU_ALLOW_PLAYER_ADMIN_COMMANDS", "MEGU_PROGRESSION",
+                    "MEGU_MOD_SYNC_MIRRORS"):
             env.pop(key, None)
         env.update(
-            MC_SPINE_PORT=str(game), MC_SPINE_BIND_ADDR="127.0.0.1",
-            MC_SPINE_MODS_DIR=str(mods), MC_SPINE_MOD_SYNC=str(manifest),
-            MC_SPINE_WG="old", MC_SPINE_ENABLE_QUERY="0",
-            MC_SPINE_ANVIL_WORLD_DIR="", MC_SPINE_RESOURCE_PACK_URL="",
-            MC_SPINE_ANTICHEAT="off",
+            MEGU_PORT=str(game), MEGU_BIND_ADDR="127.0.0.1",
+            MEGU_MODS_DIR=str(mods), MEGU_MOD_SYNC=str(manifest),
+            MEGU_WG="old", MEGU_ENABLE_QUERY="0",
+            MEGU_ANVIL_WORLD_DIR="", MEGU_RESOURCE_PACK_URL="",
+            MEGU_ANTICHEAT="off",
         )
         log_path = root / "server.log"
         try:
@@ -306,7 +306,7 @@ def run_live(binary):
                         require(alice.payloads[SYNC_CHANNEL] == [entry],
                                 f"live-mod-sync-entry: {alice.payloads[SYNC_CHANNEL]}")
                         print("PASS Protocol 767 Alice login -> configuration -> play", flush=True)
-                        print("PASS 0x19 mc-spine:mod_sync_v1 MSY1 manifest (1 SHA-256 entry)",
+                        print("PASS 0x19 megu:mod_sync_v1 MSY1 manifest (1 SHA-256 entry)",
                               flush=True)
                         print("PASS 0x19 AppleSkin exhaustion/saturation big-endian f32", flush=True)
                 finally:
@@ -382,7 +382,7 @@ def main():
     elif len(sys.argv) == 2:
         run_live(Path(sys.argv[1]).resolve())
     else:
-        raise SystemExit(f"usage: {sys.argv[0]} --self-test | /path/to/mc-spine-mod-suite")
+        raise SystemExit(f"usage: {sys.argv[0]} --self-test | /path/to/megu-mod-suite")
 
 
 if __name__ == "__main__":

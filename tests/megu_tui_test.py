@@ -2,7 +2,7 @@
 """Regression tests for tools/megu_tui.py.
 
 Covers sparkline rendering, the no-side-effects fallback detection, the
-MetricsParser against realistic mc-spine log lines, deterministic frame
+MetricsParser against realistic megu log lines, deterministic frame
 layout at several terminal sizes, and end-to-end plain-mode passthrough of
 a stub subprocess (stdio forwarding + exact exit code preservation).
 """
@@ -26,7 +26,7 @@ BLOCKS = megu_tui.SPARK_BLOCKS
 
 REALISTIC_LOG = [
     "[config] loaded server.toml (profile default)",
-    "mc-spine v0.6 listening 127.0.0.1:25599 (offline identities; no Mojang authentication)",
+    "megu v0.6 listening 127.0.0.1:25599 (offline identities; no Mojang authentication)",
     "[live-mods] 5 jar(s): 1 auto-skipped, 2 native-bundle, 1 tier2-shim, 1 tier3",
     "[live-mods] dual-loader: 2 unified, 1 client-only, 0 superseded, 0 rejected, 0 duplicate ids, 0 missing deps, 3 verified damage hooks",
     "[live-mods] weirdmod.jar (weirdmod) tier3: 412 classes, 9 site(s) - mixin target missing",
@@ -176,7 +176,7 @@ class MetricsParserTest(unittest.TestCase):
     def test_feed_returns_kinds(self):
         parser = megu_tui.MetricsParser()
         self.assertEqual(parser.feed(
-            "mc-spine v0.6 listening 127.0.0.1:25599 (x)"), "ready")
+            "megu v0.6 listening 127.0.0.1:25599 (x)"), "ready")
         self.assertEqual(parser.feed(
             "[tick] observed_tps=20.00 avg_work_ms=1.0 max_work_ms=2.0 "
             "over_budget=0/100"), "tick")
@@ -324,7 +324,7 @@ class DemoFrameCliTest(unittest.TestCase):
 
 class ProcMetricsTest(unittest.TestCase):
     STATUS_TEXT = (
-        "Name:\tmc-spine\n"
+        "Name:\tmegu\n"
         "State:\tR (running)\n"
         "Pid:\t4242\n"
         "Threads:\t14\n"

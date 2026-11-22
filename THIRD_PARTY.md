@@ -18,7 +18,7 @@
 ## 1. コミット済みの非オリジナル資産・確認済み資産 / Committed assets & provenance inventory
 
 > 開発ブランチはテスト用の生成データを一部追跡します。以下は開発ツリーの一覧です。
-> `tools/export_public_branch.sh --out ../mc-spine-public --verify` は §5 の生成物を除外して ignore し、開発履歴を継がない別リポジトリを作ります。
+> `tools/export_public_branch.sh --out ../megu-public --verify` は §5 の生成物を除外して ignore し、開発履歴を継がない別リポジトリを作ります。
 > `tools/provenance_check.py --strict-public` は D5 の対象パスが未追跡かつ ignore 済みかを検査します。
 
 | パス / Path | 内容・規模 / What & size | README の記述 | 出所 | 根拠・観察 (facts) |
@@ -35,12 +35,12 @@
 | `evidence/gameplay/**/*.javap.txt` (旧 6 files) | **削除** (§9) | — | 削除済み | Mojang クラスの逆アセンブルは再配布しない。`tools/bytecode_probe.sh <class>` が手元の jar と公式マッピングから同じ出力を作る。 |
 | `evidence/gameplay/**/*.mapping.txt`, `evidence/gameplay/light-update/mappings.txt` (旧 3 files) | **削除** (§9) | — | 削除済み | Mojang 公式マッピングの抜粋は再配布しない。`tools/bytecode_probe.sh` が利用者の手元のマッピングを読む。 |
 | `evidence/foundation/audit-snapshots/main.*.rs` (4 files) | 過去の自作 `src/main.rs` のスナップショット | (第三者物ではない) | `documented` (first-party) | 同ディレクトリの README が由来と sha256 を記載。第三者由来ではなく、このリポジトリの自作コードの旧版です。`AUDIT_WIRE.md` / `SECURITY_NOTES.md` から参照されています (削除していません)。 |
-| `src/brigadier.rs` (Rust 移植) | Mojang の Brigadier 1.3.10 (MIT) のコア (StringReader / コマンド木 / dispatcher / context / suggestion / 基本引数型) を Rust に翻訳したもの。**Java のソースは同梱していない** | 記述なし (issue #51 slice 1 で追加) | `documented` (下記 §11) | 上流 `https://github.com/Mojang/brigadier` の commit `b5419b186e4882290a188d11d6e661d4f56bd8fd` (2024-08-07) を参照。MIT の著作権表示は上流 LICENSE のまま「Copyright (c) Microsoft Corporation」。NOTICE に MIT 全文と帰属を記載。参照クローンは `/home/yuu/mc-spine-local/reference/brigadier-1.3.10/` に置き、リポジトリには含めない。 |
+| `src/brigadier.rs` (Rust 移植) | Mojang の Brigadier 1.3.10 (MIT) のコア (StringReader / コマンド木 / dispatcher / context / suggestion / 基本引数型) を Rust に翻訳したもの。**Java のソースは同梱していない** | 記述なし (issue #51 slice 1 で追加) | `documented` (下記 §11) | 上流 `https://github.com/Mojang/brigadier` の commit `b5419b186e4882290a188d11d6e661d4f56bd8fd` (2024-08-07) を参照。MIT の著作権表示は上流 LICENSE のまま「Copyright (c) Microsoft Corporation」。NOTICE に MIT 全文と帰属を記載。参照クローンは `/home/yuu/megu-local/reference/brigadier-1.3.10/` に置き、リポジトリには含めない。 |
 | `*.storyboard.png` (リポジトリ直下 6 files) | 旧図 (`auth`, `deps`, `deps_target`, `escape`, `machine`, `schema`) | — | 削除済み (`git rm`) | 不要につきリポジトリ直下の 6 枚を削除 (2026-11-20)。`evidence/gameplay/protocol-lifecycle/spine_proto.storyboard.png` は自作のプロトコル状態遷移図 (`documented`, first-party)。 |
 
 ## 2. Rust 依存クレートのライセンス / Rust dependency licenses
 
-`cargo metadata --format-version 1 --locked --all-features` (Cargo.lock, 2026-10-25) の `license` フィールドをそのまま転記したもの。`cargo-deny` (`deny.toml`) が CI で同じ集合を検査します。`mc-spine` 自体は `Cargo.toml` で `license = "GPL-3.0-or-later OR LGPL-3.0-or-later"` を宣言しています (`LICENSE` / `COPYING.LESSER` と一致)。依存クレート 78 個に GPL / LGPL / AGPL / MPL のものはありません (LICENSING.md §2a)。
+`cargo metadata --format-version 1 --locked --all-features` (Cargo.lock, 2026-10-25) の `license` フィールドをそのまま転記したもの。`cargo-deny` (`deny.toml`) が CI で同じ集合を検査します。`megu` 自体は `Cargo.toml` で `license = "GPL-3.0-or-later OR LGPL-3.0-or-later"` を宣言しています (`LICENSE` / `COPYING.LESSER` と一致)。依存クレート 78 個に GPL / LGPL / AGPL / MPL のものはありません (LICENSING.md §2a)。
 Copied verbatim from the `license` field of each crate's published metadata; this is what the crates declare, not an independent verification of their license texts. 78 crates (optional JNI adapters included).
 
 | crate | version | license (as declared) | 種別 |
@@ -135,7 +135,7 @@ Copied verbatim from the `license` field of each crate's published metadata; thi
 
 2026-10-25 に、Pumpkin-MC/Pumpkin (`LICENSE` は GPL-3.0、issue #3 が参照する commit `b0c48b2d7688bbfa09956adf530b8bc56dcc0c56`, 2026-10-11) の公開ファイルを GitHub API で取得し、sha256 を比較した事実:
 
-| mc-spine のファイル | Pumpkin のファイル @ `b0c48b2` | sha256 | 結果 |
+| megu のファイル | Pumpkin のファイル @ `b0c48b2` | sha256 | 結果 |
 |---|---|---|---|
 | `assets/pblocks.json` | `assets/blocks.json` | `cc748df18e6fbc3f0016c4616cc869c168d77bf5d8ec283f6ef3b5f412613e28` | 同一 (7,526,001 bytes) |
 | `assets/properties.json` | `assets/properties.json` | `da8e094913cb05348092b2fcd6b32462dd81b3602d6d89b146529f0ac655ab85` | 同一 |
@@ -143,7 +143,7 @@ Copied verbatim from the `license` field of each crate's published metadata; thi
 
 追加の事実 / Additional facts:
 
-- 時系列 / Timeline (GitHub API で確認): Pumpkin の `assets/blocks.json` は commit `df88eeaa` (2026-09-18)、`9707ae45` (2026-10-14)、`8e61e0bd` (2026-10-17) で変更されています。`df88eeaa` 時点の内容は `cc748df1…` と同一で、これは mc-spine が初めて `assets/pblocks.json` を追加した commit `f9924b0` (2026-10-05, "Restore mc-spine v2.37 source and runtime assets") より前です。`assets/multi_noise_biome_tree.json` の Pumpkin 側の最終変更は `df88eeaa` (2026-09-18) です。**どちらが他方から取り込んだか、共通の上流から得たかは、このリポジトリの情報からは判断できません。**
+- 時系列 / Timeline (GitHub API で確認): Pumpkin の `assets/blocks.json` は commit `df88eeaa` (2026-09-18)、`9707ae45` (2026-10-14)、`8e61e0bd` (2026-10-17) で変更されています。`df88eeaa` 時点の内容は `cc748df1…` と同一で、これは megu が初めて `assets/pblocks.json` を追加した commit `f9924b0` (2026-10-05, "Restore megu v2.37 source and runtime assets") より前です。`assets/multi_noise_biome_tree.json` の Pumpkin 側の最終変更は `df88eeaa` (2026-09-18) です。**どちらが他方から取り込んだか、共通の上流から得たかは、このリポジトリの情報からは判断できません。**
 - Pumpkin の `assets/NOTICE.md` (同 commit に存在) は、`assets/blocks.json` や `assets/properties.json` などを「© Mojang Studios / Microsoft」の抽出・派生物であり、Pumpkin の GPLv3 の対象ではない、と記述しています (Pumpkin 側の記述の引用であり、ここでの判断ではありません)。
 - 今回の比較が確認したのは上記3ファイルだけです。(その後の §9 の比較も参照。)
 - 再現方法 / Reproduce: `gh api -H 'Accept: application/vnd.github.raw' 'repos/Pumpkin-MC/Pumpkin/contents/assets/blocks.json?ref=b0c48b2d7688bbfa09956adf530b8bc56dcc0c56' | sha256sum` と `sha256sum assets/pblocks.json`。
@@ -153,7 +153,7 @@ Copied verbatim from the `license` field of each crate's published metadata; thi
 
 issue #51 (Brigadier 互換のコマンドディスパッチャ) の slice 1 で、`src/brigadier.rs` を Mojang の
 Brigadier (MIT) から Rust に翻訳した。**上流の Java ソース・jar はこのリポジトリに含まれない**
-(参照クローンは `/home/yuu/mc-spine-local/reference/brigadier-1.3.10/` のローカルデータ)。
+(参照クローンは `/home/yuu/megu-local/reference/brigadier-1.3.10/` のローカルデータ)。
 Pumpkin (GPL-3.0) のコードは読んでいない・参照していない。
 
 固定した参照 / Pinned reference (2026-11-17 に確認):

@@ -83,7 +83,7 @@ def main():
     assert hashlib.sha256((ROOT/'.cache/seedprotect-1.21.1-fabric-1.0.0.jar').read_bytes()).hexdigest()=='ccd48d96239f485846ced57968e73c6040df4a66ca6ea02cb180a29a5cff7a3f'
     if args.neoforge:
         assert hashlib.sha256((ROOT.parent/'neoforge-events/.cache/seedprotect-1.0.0.jar').read_bytes()).hexdigest()=='90d3318ce049d2e684b08d12ab6e35410a9d8e159afc43757102ab127c028acf'
-    with tempfile.TemporaryDirectory(prefix='mc-spine-normal-') as scratch:
+    with tempfile.TemporaryDirectory(prefix='megu-normal-') as scratch:
         modes=['native','fabric_baseline','fabric_seedprotect']
         if args.neoforge: modes += ['neoforge_baseline','neoforge_seedprotect']
         for index,mode in enumerate(modes):
@@ -92,11 +92,11 @@ def main():
             (cwd/'mods').mkdir()
             if mode=='fabric_seedprotect': shutil.copyfile(ROOT/'.cache/seedprotect-1.21.1-fabric-1.0.0.jar',cwd/'mods/seedprotect.jar')
             port=25650+index*2; rcon=port+1
-            env={**os.environ,'JAVA_HOME':'/usr/lib/jvm/java-21-openjdk','MC_SPINE_WG':'old','MC_SPINE_PORT':str(port),'MC_SPINE_RCON_PORT':str(rcon),'MC_SPINE_RCON_PASS':'probe-only'}
-            env.pop('MC_SPINE_FABRIC_CLASSPATH',None)
-            env.pop('MC_SPINE_NEOFORGE_CLASSPATH',None)
-            if mode.startswith('fabric_'): env['MC_SPINE_FABRIC_CLASSPATH']=str(build/'classpath-seedprotect.txt')
-            if mode.startswith('neoforge_'): env['MC_SPINE_NEOFORGE_CLASSPATH']=str(ROOT.parent/'neoforge-events/.build/classpath.txt')
+            env={**os.environ,'JAVA_HOME':'/usr/lib/jvm/java-21-openjdk','MEGU_WG':'old','MEGU_PORT':str(port),'MEGU_RCON_PORT':str(rcon),'MEGU_RCON_PASS':'probe-only'}
+            env.pop('MEGU_FABRIC_CLASSPATH',None)
+            env.pop('MEGU_NEOFORGE_CLASSPATH',None)
+            if mode.startswith('fabric_'): env['MEGU_FABRIC_CLASSPATH']=str(build/'classpath-seedprotect.txt')
+            if mode.startswith('neoforge_'): env['MEGU_NEOFORGE_CLASSPATH']=str(ROOT.parent/'neoforge-events/.build/classpath.txt')
             if mode=='neoforge_seedprotect': shutil.copyfile(ROOT.parent/'neoforge-events/.cache/seedprotect-1.0.0.jar',cwd/'mods/seedprotect.jar')
             log=cwd/'capture.log'
             with log.open('w') as output:
@@ -164,12 +164,12 @@ def main():
         if args.neoforge: refusals.append(('neoforge_unknown_mod','neoforge','ShimCheck rejected NeoForge mod:'))
         for index,(name,adapter,reason) in enumerate(refusals):
             cwd=pathlib.Path(scratch)/name;cwd.mkdir();(cwd/'mods').mkdir()
-            env={**os.environ,'JAVA_HOME':'/usr/lib/jvm/java-21-openjdk','MC_SPINE_WG':'old','MC_SPINE_PORT':str(25670+index*2),'MC_SPINE_RCON_PORT':str(25671+index*2),'MC_SPINE_RCON_PASS':'probe-only'}
-            env.pop('MC_SPINE_FABRIC_CLASSPATH',None);env.pop('MC_SPINE_NEOFORGE_CLASSPATH',None)
-            if adapter in ['fabric','both']:env['MC_SPINE_FABRIC_CLASSPATH']=str(build/'classpath-seedprotect.txt')
-            if adapter in ['neoforge','both']:env['MC_SPINE_NEOFORGE_CLASSPATH']=str(ROOT.parent/'neoforge-events/.build/classpath.txt')
+            env={**os.environ,'JAVA_HOME':'/usr/lib/jvm/java-21-openjdk','MEGU_WG':'old','MEGU_PORT':str(25670+index*2),'MEGU_RCON_PORT':str(25671+index*2),'MEGU_RCON_PASS':'probe-only'}
+            env.pop('MEGU_FABRIC_CLASSPATH',None);env.pop('MEGU_NEOFORGE_CLASSPATH',None)
+            if adapter in ['fabric','both']:env['MEGU_FABRIC_CLASSPATH']=str(build/'classpath-seedprotect.txt')
+            if adapter in ['neoforge','both']:env['MEGU_NEOFORGE_CLASSPATH']=str(ROOT.parent/'neoforge-events/.build/classpath.txt')
             if name=='fabric_missing_invoke':
-                env['MC_SPINE_FABRIC_CLASSPATH']=str(build/'classpath-seedprotect-missing-invoke.txt')
+                env['MEGU_FABRIC_CLASSPATH']=str(build/'classpath-seedprotect-missing-invoke.txt')
                 shutil.copyfile(ROOT/'.cache/seedprotect-1.21.1-fabric-1.0.0.jar',cwd/'mods/seedprotect.jar')
             if name.endswith('unknown_mod'):(cwd/'mods/unsupported.jar').write_bytes(b'not-a-supported-artifact')
             result=subprocess.run([str(binary)],cwd=cwd,env=env,text=True,capture_output=True,timeout=15)

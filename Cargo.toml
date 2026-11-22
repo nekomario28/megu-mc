@@ -1,5 +1,5 @@
 [package]
-name = "mc-spine"
+name = "megu"
 version = "0.0.0"
 edition = "2021"
 license = "LGPL-3.0-or-later"
@@ -54,8 +54,8 @@ mod-suite = [
     "dep:mod-adapter-core",
     "dep:create-adapter",
     "dep:mod-offload",
-    "dep:mc-spine-core",
-    "dep:mc-spine-state-store",
+    "dep:megu-core",
+    "dep:megu-state-store",
 ]
 
 [dependencies]
@@ -63,8 +63,8 @@ flate2 = { version = "1.1.10", default-features = false, features = ["rust_backe
 jni = { version = "0.21.1", features = ["invocation"], optional = true }
 mod-adapter-core = { path = "mod-adapter-core", optional = true }
 create-adapter = { path = "create-adapter", optional = true }
-mc-spine-core = { path = "core", optional = true }
-mc-spine-state-store = { path = "state-store", optional = true }
+megu-core = { path = "core", optional = true }
+megu-state-store = { path = "state-store", optional = true }
 mod-offload = { path = "mod-offload", optional = true }
 ureq = { version = "3.4.2", features = ["rustls"] }
 rsa = "=0.9.10"

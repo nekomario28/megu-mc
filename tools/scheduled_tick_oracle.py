@@ -57,14 +57,14 @@ def main():
         proto = work / "proto.tsv"
         delivery = work / "delivery.tsv"
         run_probe(work, classpath, ROOT / "tools/leaf-distance-oracle/ScheduledTickOracle.java",
-                  "dev.mcspine.tools.ScheduledTickOracle", out, proto)
+                  "dev.megu.tools.ScheduledTickOracle", out, proto)
         actual = out.read_bytes()
         generated = proto.read_bytes()
         if len(actual.splitlines()) != 48:
             raise ValueError("native scheduled collection omitted cases")
         validate_proto(generated)
         run_probe(work, classpath, DELIVERY_VECTORS.with_name("ScheduledTickDeliveryOracle.java"),
-                  "dev.mcspine.tools.ScheduledTickDeliveryOracle", delivery)
+                  "dev.megu.tools.ScheduledTickDeliveryOracle", delivery)
         delivered = delivery.read_bytes()
         operations = [row.split(b"\t", 1)[0] for row in delivered.splitlines()]
         print(f"native delivery cases: {operations.count(b'case')}"

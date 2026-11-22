@@ -1,6 +1,6 @@
 // Evaluate actual 1.21.1 SurfaceRules conditions against synthetic contexts.
 // No chunk/IWorld execution: this pins the condition formulas and field mapping.
-package dev.mcspine.tools;
+package dev.megu.tools;
 
 import com.google.gson.*;
 import java.lang.reflect.*;

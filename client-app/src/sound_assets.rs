@@ -47,7 +47,7 @@ const MAX_DECODED_SAMPLES: usize = MIX_SAMPLE_RATE as usize * 300;
 /// keeping long music tracks from ballooning RSS without bound.
 pub const DEFAULT_SOUND_PCM_CACHE_CAP_BYTES: usize = 32 * 1024 * 1024;
 
-/// The `minecraft:sound_event` registry ids mc-spine's server can emit.
+/// The `minecraft:sound_event` registry ids megu's server can emit.
 /// `id -> name`; mirrors the `sound_id` table in `src/play_protocol.rs`
 /// (minecraft-data 1.21.1 registration order). Events arriving with an id
 /// outside this subset are still played — labelled `sound.<id>` — and
@@ -85,7 +85,7 @@ const SOUND_ID_TO_NAME: &[(u32, &str)] = &[
     (84, "entity.arrow.hit_player"),
 ];
 
-/// Registry id → event name for the ids mc-spine emits.
+/// Registry id → event name for the ids megu emits.
 pub fn sound_name_for_id(id: u32) -> Option<&'static str> {
     SOUND_ID_TO_NAME
         .iter()

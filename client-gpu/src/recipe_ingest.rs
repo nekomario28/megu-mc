@@ -6,14 +6,14 @@
 //!
 //! * `<gameDir>/mods/*.jar` — mod JARs in deterministic filename order,
 //!   including one level of `META-INF/jarjar`/`META-INF/jars` nesting via
-//!   [`mc_spine_core::zip_archive::LazyZipIndex`].
+//!   [`megu_core::zip_archive::LazyZipIndex`].
 //! * `<gameDir>/versions/<id>/<id>.jar` — the vanilla client JAR for the
 //!   launcher `--version` id (falls back to `1.21.1`), which ships every
 //!   vanilla `data/minecraft/...` document.
 //! * `<gameDir>/saves/<world>/datapacks/<pack>` — datapack directories and
 //!   `.zip` packs carrying a `data/` root.
-//! * `MC_SPINE_RECIPE_INGEST_JARS` — optional extra JAR list (host-path
-//!   separated), mirroring the `MC_SPINE_RESOURCE_PACK_DIR` env-override
+//! * `MEGU_RECIPE_INGEST_JARS` — optional extra JAR list (host-path
+//!   separated), mirroring the `MEGU_RESOURCE_PACK_DIR` env-override
 //!   pattern; empty entries are skipped.
 //!
 //! Inside each source the recognizer scans:
@@ -21,7 +21,7 @@
 //! * `data/<ns>/recipe(s)/**/*.json` — vanilla + Create + **any** unknown
 //!   `<ns>:<type>` recipe JSON: the type's namespace is auto-registered
 //!   through [`RecipeIndex::register_mod_namespace`] so unknown types land
-//!   in a declared [`mc_spine_ui::recipe_browser::RecipeCategory::CustomModCategory`]
+//!   in a declared [`megu_ui::recipe_browser::RecipeCategory::CustomModCategory`]
 //!   instead of silently failing closed.
 //! * `data/<ns>/tags/item(s)/**/*.json` — item tag membership, including
 //!   nested `#ns:tag` references resolved with a bounded fixpoint.
@@ -38,14 +38,14 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
 
-use mc_spine_core::zip_archive::LazyZipIndex;
-use mc_spine_proto::table::ProtocolTable;
-use mc_spine_ui::draw::UiColor;
-use mc_spine_ui::recipe_browser::{
+use megu_core::zip_archive::LazyZipIndex;
+use megu_proto::table::ProtocolTable;
+use megu_ui::draw::UiColor;
+use megu_ui::recipe_browser::{
     item_color, AnimatedPart, DungeonLootEntry, ItemEntry, MobDropEntry, PonderAnim, PonderAxis,
     PonderScene, PonderStep, RecipeBrowserState, RecipeIndex, RecipeIngredient,
 };
-use mc_spine_ui::state::UiLang;
+use megu_ui::state::UiLang;
 
 use crate::live_session::{jar_version_ids, SessionPaths};
 
@@ -180,7 +180,7 @@ pub fn collect_jar_paths(paths: &SessionPaths) -> Vec<PathBuf> {
             }
         }
     }
-    if let Ok(raw) = std::env::var("MC_SPINE_RECIPE_INGEST_JARS") {
+    if let Ok(raw) = std::env::var("MEGU_RECIPE_INGEST_JARS") {
         jars.extend(
             std::env::split_paths(&raw)
                 .filter(|p| p.is_file())
@@ -610,7 +610,7 @@ impl<'a> IngestWork<'a> {
 
     /// Every concrete item a recipe touches becomes a catalog row so the
     /// browser can search/focus it (tag slots resolve lazily at query time).
-    fn register_recipe_items(&mut self, recipe: &mc_spine_ui::recipe_browser::Recipe) {
+    fn register_recipe_items(&mut self, recipe: &megu_ui::recipe_browser::Recipe) {
         let mut ids: Vec<&str> = Vec::new();
         for ing in &recipe.inputs {
             if let RecipeIngredient::Item { id, .. } = ing {

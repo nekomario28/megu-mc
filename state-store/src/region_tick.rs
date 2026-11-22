@@ -12,14 +12,14 @@
 //! bit-identical results for any worker count.
 //!
 //! Parallelism runs on the resident [`MeguTaskPool`] workers of
-//! `mc_spine_core::task_pool` via `scope_blocking` — scoped, stack-borrowing
+//! `megu_core::task_pool` via `scope_blocking` — scoped, stack-borrowing
 //! fan-out with caller help-stealing, so there is no per-wave OS thread
 //! spawn/join cost and even a single-worker pool cannot deadlock.
 
 use std::collections::BTreeMap;
 use std::sync::OnceLock;
 
-use mc_spine_core::task_pool::{MeguTaskPool, TaskLane};
+use megu_core::task_pool::{MeguTaskPool, TaskLane};
 
 use crate::sharded::{ChunkCoord, DimensionState};
 

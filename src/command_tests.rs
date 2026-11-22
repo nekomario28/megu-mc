@@ -385,7 +385,7 @@ fn operators_persist_and_gate_player_commands() {
         return;
     }
     let _directory = CommandDirectory::enter();
-    std::env::remove_var("MC_SPINE_ALLOW_PLAYER_ADMIN_COMMANDS");
+    std::env::remove_var("MEGU_ALLOW_PLAYER_ADMIN_COMMANDS");
     let (mut client, _socket) = crate::effect_tests::client_pair();
     client.name = "Fixture_Op".into();
     let player = command_context(Some(Arc::new(client)));
@@ -1106,7 +1106,7 @@ fn playsound_validates_arguments_and_encodes_sound_packets() {
     let _world = world_guard();
     let (a, mut ra) = packet_client(8331, "sound-a", 0.5, 16.0, 0.5);
     clients().lock().unwrap_or_else(|e| e.into_inner()).push(a.clone());
-    std::env::set_var("MC_SPINE_ALLOW_PLAYER_ADMIN_COMMANDS", "1");
+    std::env::set_var("MEGU_ALLOW_PLAYER_ADMIN_COMMANDS", "1");
     let ctx = command_context(Some(a.clone()));
     let run = |msg| run_command_ctx(&ctx, msg, &mut None);
 
@@ -1204,7 +1204,7 @@ fn playsound_validates_arguments_and_encodes_sound_packets() {
     assert_eq!(be_f32(&payload, base + 16), 1.0);
 
     clients().lock().unwrap_or_else(|e| e.into_inner()).retain(|c| c.eid != 8331);
-    std::env::remove_var("MC_SPINE_ALLOW_PLAYER_ADMIN_COMMANDS");
+    std::env::remove_var("MEGU_ALLOW_PLAYER_ADMIN_COMMANDS");
 }
 
 #[test]
@@ -1374,7 +1374,7 @@ fn live_permission_levels_gate_commands_and_function_return_stops_execution() {
     }
     let _world = world_guard();
     let _directory = CommandDirectory::enter();
-    std::env::remove_var("MC_SPINE_ALLOW_PLAYER_ADMIN_COMMANDS");
+    std::env::remove_var("MEGU_ALLOW_PLAYER_ADMIN_COMMANDS");
 
     let fixture = |name: &str, eid: i32| {
         let (mut client, _hold) = crate::effect_tests::client_pair();
@@ -1494,7 +1494,7 @@ fn execute_non_player_sources_keep_dispatcher_permission_level() {
     }
     let _world = world_guard();
     let _directory = CommandDirectory::enter();
-    std::env::remove_var("MC_SPINE_ALLOW_PLAYER_ADMIN_COMMANDS");
+    std::env::remove_var("MEGU_ALLOW_PLAYER_ADMIN_COMMANDS");
 
     let fixture = |name: &str, eid: i32| {
         let (mut client, _hold) = crate::effect_tests::client_pair();

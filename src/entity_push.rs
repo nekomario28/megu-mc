@@ -976,9 +976,9 @@ mod entity_push_tests {
         // Costs the part the spatial index replaced - discovering each mob's neighbourhood - with
         // the *same* downstream work in both arms (`push_entities_step_indexed`, so cramming
         // counting and impulse accumulation are identical; only candidate discovery differs).
-        // Default test run checks all three layouts fast; set `MC_SPINE_PUSH_BENCH=1` for full sweep.
+        // Default test run checks all three layouts fast; set `MEGU_PUSH_BENCH=1` for full sweep.
         use std::time::Instant;
-        let bench_mode = std::env::var_os("MC_SPINE_PUSH_BENCH").is_some();
+        let bench_mode = std::env::var_os("MEGU_PUSH_BENCH").is_some();
         let counts: &[usize] = if bench_mode { &[600, 2000] } else { &[80] };
         for (label, spacing, full_iters) in [
             ("entity_heavy_16b", 16.0f64, 200usize),

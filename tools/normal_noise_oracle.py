@@ -17,7 +17,7 @@ def main():
     with pinned_runtime(args.jar) as (work, classpath, _):
         output = work / "normal-noise.tsv"
         run_probe(work, classpath, ROOT / "tools/normal-noise-oracle/NormalNoiseOracle.java",
-                  "dev.mcspine.tools.NormalNoiseOracle", output)
+                  "dev.megu.tools.NormalNoiseOracle", output)
         actual = output.read_bytes()
     if args.write:
         VECTORS.write_bytes(actual)

@@ -1,8 +1,8 @@
 blank_issues_enabled: false
 contact_links:
   - name: Feature requests & questions
-    url: https://github.com/nekomario28/mc-spine/discussions
+    url: https://github.com/nekomario28/megu-mc/discussions
     about: Ideas, support questions, and general discussion live in GitHub Discussions — not in the issue tracker. 機能要望・質問・雑談は Discussions へ。
   - name: Security vulnerability
-    url: https://github.com/nekomario28/mc-spine/blob/main/.github/SECURITY.md
+    url: https://github.com/nekomario28/megu-mc/blob/main/.github/SECURITY.md
     about: Report vulnerabilities privately — do NOT open a public issue. 脆弱性は公開 issue ではなく SECURITY.md の手順で私的に報告してください。

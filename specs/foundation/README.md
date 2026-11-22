@@ -114,7 +114,7 @@ for (x,y,z) in cells {
 
 ## Pumpkin の扱い
 
-[issue #3](https://github.com/nekomario28/mc-spine/issues/3) の制約に従う。
+[issue #3](https://github.com/nekomario28/megu-mc/issues/3) の制約に従う。
 
 - Pumpkin のライセンスは GPL-3.0。server コードと asset は**貼らない**。
 - 参考にするのは高レベル挙動と設計。独立実装し、出典を issue に残す。

@@ -4,7 +4,7 @@
 //! and `--auto-tune` hardware auto-tune CLI wiring tests.
 //!
 //! Determinism contract: the Xaero control signal and the
-//! `MC_SPINE_FAIR_PLAY*` env pairs are pure functions of the resolved
+//! `MEGU_FAIR_PLAY*` env pairs are pure functions of the resolved
 //! settings — no test here depends on a live server spawn. The only
 //! host-dependent part is `--auto-tune`, which is compared against the same
 //! `recommend_tuning(probe_host_hardware())` the resolver computes.
@@ -12,24 +12,24 @@
 use std::collections::BTreeMap;
 use std::path::PathBuf;
 
-use mc_spine_client::cli::{help_text, parse_args};
-use mc_spine_client::hardware_profile::{probe_host_hardware, recommend_tuning};
-use mc_spine_client::integrated::{
+use megu_client::cli::{help_text, parse_args};
+use megu_client::hardware_profile::{probe_host_hardware, recommend_tuning};
+use megu_client::integrated::{
     IntegratedServerConfig, FAIR_PLAY_ENV_ALLOW_CAVE_MAP, FAIR_PLAY_ENV_ALLOW_ENTITY_RADAR,
     FAIR_PLAY_ENV_ALLOW_MOB_RADAR, FAIR_PLAY_ENV_ALLOW_WAYPOINT_TELEPORT,
     FAIR_PLAY_ENV_ENABLED, FAIR_PLAY_ENV_MINIMAP_MODE, FAIR_PLAY_ENV_PLAYER_RADAR_SCOPE,
     FAIR_PLAY_ENV_XAERO_SIGNAL,
 };
-use mc_spine_client::settings::{
+use megu_client::settings::{
     ClientSettings, HostMapFairPlaySettings, HostMinimapMode, HostPlayerRadarScope,
     XAERO_FAIR_PLAY_SIGNAL, XAERO_NO_ENTITY_RADAR_SIGNAL, XAERO_RESET_SIGNAL,
 };
-use mc_spine_client_mesh::gpu_pipeline::RenderBackendPreference;
+use megu_client_mesh::gpu_pipeline::RenderBackendPreference;
 
-/// A scratch directory guaranteed not to contain a `mc-spine-client.toml`
+/// A scratch directory guaranteed not to contain a `megu-client.toml`
 /// auto-load file (the resolver only reads one when the file exists).
 fn empty_scratch_dir(tag: &str) -> PathBuf {
-    let dir = std::env::temp_dir().join(format!("mc-spine-fairplay-{tag}-{}", std::process::id()));
+    let dir = std::env::temp_dir().join(format!("megu-fairplay-{tag}-{}", std::process::id()));
     std::fs::create_dir_all(&dir).unwrap();
     dir
 }
@@ -257,34 +257,34 @@ fn fair_play_flag_locks_all_features_and_emits_fairxaero() {
 
     let env = env_map(&config);
     assert_eq!(env.len(), 8);
-    assert_eq!(env["MC_SPINE_FAIR_PLAY"], "true");
-    assert_eq!(env["MC_SPINE_FAIR_PLAY_ALLOW_CAVE_MAP"], "false");
-    assert_eq!(env["MC_SPINE_FAIR_PLAY_ALLOW_ENTITY_RADAR"], "false");
-    assert_eq!(env["MC_SPINE_FAIR_PLAY_ALLOW_WAYPOINT_TELEPORT"], "false");
-    assert_eq!(env["MC_SPINE_FAIR_PLAY_XAERO_SIGNAL"], "§f§a§i§r§x§a§e§r§o");
-    assert_eq!(env["MC_SPINE_MINIMAP_MODE"], "fair_play");
-    assert_eq!(env["MC_SPINE_ALLOW_MOB_RADAR"], "false");
-    assert_eq!(env["MC_SPINE_PLAYER_RADAR_SCOPE"], "none");
+    assert_eq!(env["MEGU_FAIR_PLAY"], "true");
+    assert_eq!(env["MEGU_FAIR_PLAY_ALLOW_CAVE_MAP"], "false");
+    assert_eq!(env["MEGU_FAIR_PLAY_ALLOW_ENTITY_RADAR"], "false");
+    assert_eq!(env["MEGU_FAIR_PLAY_ALLOW_WAYPOINT_TELEPORT"], "false");
+    assert_eq!(env["MEGU_FAIR_PLAY_XAERO_SIGNAL"], "§f§a§i§r§x§a§e§r§o");
+    assert_eq!(env["MEGU_MINIMAP_MODE"], "fair_play");
+    assert_eq!(env["MEGU_ALLOW_MOB_RADAR"], "false");
+    assert_eq!(env["MEGU_PLAYER_RADAR_SCOPE"], "none");
     // The public constant names line up with the emitted keys.
-    assert_eq!(FAIR_PLAY_ENV_ENABLED, "MC_SPINE_FAIR_PLAY");
-    assert_eq!(FAIR_PLAY_ENV_ALLOW_CAVE_MAP, "MC_SPINE_FAIR_PLAY_ALLOW_CAVE_MAP");
+    assert_eq!(FAIR_PLAY_ENV_ENABLED, "MEGU_FAIR_PLAY");
+    assert_eq!(FAIR_PLAY_ENV_ALLOW_CAVE_MAP, "MEGU_FAIR_PLAY_ALLOW_CAVE_MAP");
     assert_eq!(
         FAIR_PLAY_ENV_ALLOW_ENTITY_RADAR,
-        "MC_SPINE_FAIR_PLAY_ALLOW_ENTITY_RADAR"
+        "MEGU_FAIR_PLAY_ALLOW_ENTITY_RADAR"
     );
     assert_eq!(
         FAIR_PLAY_ENV_ALLOW_WAYPOINT_TELEPORT,
-        "MC_SPINE_FAIR_PLAY_ALLOW_WAYPOINT_TELEPORT"
+        "MEGU_FAIR_PLAY_ALLOW_WAYPOINT_TELEPORT"
     );
     assert_eq!(
         FAIR_PLAY_ENV_XAERO_SIGNAL,
-        "MC_SPINE_FAIR_PLAY_XAERO_SIGNAL"
+        "MEGU_FAIR_PLAY_XAERO_SIGNAL"
     );
-    assert_eq!(FAIR_PLAY_ENV_MINIMAP_MODE, "MC_SPINE_MINIMAP_MODE");
-    assert_eq!(FAIR_PLAY_ENV_ALLOW_MOB_RADAR, "MC_SPINE_ALLOW_MOB_RADAR");
+    assert_eq!(FAIR_PLAY_ENV_MINIMAP_MODE, "MEGU_MINIMAP_MODE");
+    assert_eq!(FAIR_PLAY_ENV_ALLOW_MOB_RADAR, "MEGU_ALLOW_MOB_RADAR");
     assert_eq!(
         FAIR_PLAY_ENV_PLAYER_RADAR_SCOPE,
-        "MC_SPINE_PLAYER_RADAR_SCOPE"
+        "MEGU_PLAYER_RADAR_SCOPE"
     );
 
     // A default (non-fair-play) run resets the client's map-mod features.
@@ -293,13 +293,13 @@ fn fair_play_flag_locks_all_features_and_emits_fairxaero() {
     let config = IntegratedServerConfig::from_settings(&cfg.client_settings);
     assert_eq!(config.xaero_control, "§r§e§s§e§t§x§a§e§r§o");
     let env = env_map(&config);
-    assert_eq!(env["MC_SPINE_FAIR_PLAY"], "false");
-    assert_eq!(env["MC_SPINE_FAIR_PLAY_ALLOW_CAVE_MAP"], "true");
-    assert_eq!(env["MC_SPINE_FAIR_PLAY_ALLOW_ENTITY_RADAR"], "true");
-    assert_eq!(env["MC_SPINE_FAIR_PLAY_ALLOW_WAYPOINT_TELEPORT"], "true");
-    assert_eq!(env["MC_SPINE_MINIMAP_MODE"], "unrestricted");
-    assert_eq!(env["MC_SPINE_ALLOW_MOB_RADAR"], "true");
-    assert_eq!(env["MC_SPINE_PLAYER_RADAR_SCOPE"], "all");
+    assert_eq!(env["MEGU_FAIR_PLAY"], "false");
+    assert_eq!(env["MEGU_FAIR_PLAY_ALLOW_CAVE_MAP"], "true");
+    assert_eq!(env["MEGU_FAIR_PLAY_ALLOW_ENTITY_RADAR"], "true");
+    assert_eq!(env["MEGU_FAIR_PLAY_ALLOW_WAYPOINT_TELEPORT"], "true");
+    assert_eq!(env["MEGU_MINIMAP_MODE"], "unrestricted");
+    assert_eq!(env["MEGU_ALLOW_MOB_RADAR"], "true");
+    assert_eq!(env["MEGU_PLAYER_RADAR_SCOPE"], "all");
 }
 
 #[test]
@@ -318,9 +318,9 @@ fn fair_play_allow_cave_map_selective_override() {
 
     let config = IntegratedServerConfig::from_settings(&cfg.client_settings);
     let env = env_map(&config);
-    assert_eq!(env["MC_SPINE_FAIR_PLAY_ALLOW_CAVE_MAP"], "true");
-    assert_eq!(env["MC_SPINE_FAIR_PLAY_ALLOW_ENTITY_RADAR"], "false");
-    assert_eq!(env["MC_SPINE_FAIR_PLAY_ALLOW_WAYPOINT_TELEPORT"], "false");
+    assert_eq!(env["MEGU_FAIR_PLAY_ALLOW_CAVE_MAP"], "true");
+    assert_eq!(env["MEGU_FAIR_PLAY_ALLOW_ENTITY_RADAR"], "false");
+    assert_eq!(env["MEGU_FAIR_PLAY_ALLOW_WAYPOINT_TELEPORT"], "false");
     // Partial lock no longer emits the blanket fair-play signal.
     assert_ne!(config.xaero_control, XAERO_FAIR_PLAY_SIGNAL);
     assert!(config.xaero_control.contains(XAERO_NO_ENTITY_RADAR_SIGNAL));
@@ -453,12 +453,12 @@ fn fair_play_with_player_radar_party_only() {
 
     let config = IntegratedServerConfig::from_settings(&cfg.client_settings);
     let env = env_map(&config);
-    assert_eq!(env["MC_SPINE_FAIR_PLAY"], "true");
-    assert_eq!(env["MC_SPINE_MINIMAP_MODE"], "fair_play");
-    assert_eq!(env["MC_SPINE_ALLOW_MOB_RADAR"], "false");
-    assert_eq!(env["MC_SPINE_PLAYER_RADAR_SCOPE"], "party_only");
+    assert_eq!(env["MEGU_FAIR_PLAY"], "true");
+    assert_eq!(env["MEGU_MINIMAP_MODE"], "fair_play");
+    assert_eq!(env["MEGU_ALLOW_MOB_RADAR"], "false");
+    assert_eq!(env["MEGU_PLAYER_RADAR_SCOPE"], "party_only");
     // Cave map + mob radar both locked -> the blanket fair-play signal.
-    assert_eq!(env["MC_SPINE_FAIR_PLAY_XAERO_SIGNAL"], XAERO_FAIR_PLAY_SIGNAL);
+    assert_eq!(env["MEGU_FAIR_PLAY_XAERO_SIGNAL"], XAERO_FAIR_PLAY_SIGNAL);
 
     // Every player-radar token parses, case-insensitively.
     for (token, want) in [
@@ -493,8 +493,8 @@ fn minimap_mode_flag_parses_and_disables() {
     let config = IntegratedServerConfig::from_settings(&cfg.client_settings);
     assert_eq!(config.xaero_control, XAERO_FAIR_PLAY_SIGNAL);
     let env = env_map(&config);
-    assert_eq!(env["MC_SPINE_FAIR_PLAY"], "true");
-    assert_eq!(env["MC_SPINE_MINIMAP_MODE"], "disabled");
+    assert_eq!(env["MEGU_FAIR_PLAY"], "true");
+    assert_eq!(env["MEGU_MINIMAP_MODE"], "disabled");
 
     // `unrestricted` is the explicit no-restriction spelling.
     let mut cfg = parse_args(&["--minimap-mode", "unrestricted"]).unwrap();
@@ -725,10 +725,10 @@ fn help_text_documents_fair_play_and_auto_tune_flags() {
         "--player-radar",
         "--allow-waypoint-teleport",
         "--auto-tune",
-        "MC_SPINE_FAIR_PLAY",
-        "MC_SPINE_MINIMAP_MODE",
-        "MC_SPINE_ALLOW_MOB_RADAR",
-        "MC_SPINE_PLAYER_RADAR_SCOPE",
+        "MEGU_FAIR_PLAY",
+        "MEGU_MINIMAP_MODE",
+        "MEGU_ALLOW_MOB_RADAR",
+        "MEGU_PLAYER_RADAR_SCOPE",
     ] {
         assert!(help.contains(needle), "help text missing {needle}");
     }

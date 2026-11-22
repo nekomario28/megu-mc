@@ -4,13 +4,13 @@
 
 use std::path::{Path, PathBuf};
 
-use mc_spine_client::protocol::{encode_slot_stack, ClientPlayEvent, PlayEvent};
-use mc_spine_client::sound_assets::SoundLibrary;
-use mc_spine_client_gpu::live_session::{discover_asset_layers, LiveSession, SessionPaths};
-use mc_spine_client_gpu::window::{GpuApp, WindowInputEvent};
-use mc_spine_client_gpu::{parse_gpu_args, GpuCliConfig};
-use mc_spine_ui::draw::encode_png_rgba;
-use mc_spine_ui::state::{Screen, UiAction};
+use megu_client::protocol::{encode_slot_stack, ClientPlayEvent, PlayEvent};
+use megu_client::sound_assets::SoundLibrary;
+use megu_client_gpu::live_session::{discover_asset_layers, LiveSession, SessionPaths};
+use megu_client_gpu::window::{GpuApp, WindowInputEvent};
+use megu_client_gpu::{parse_gpu_args, GpuCliConfig};
+use megu_ui::draw::encode_png_rgba;
+use megu_ui::state::{Screen, UiAction};
 
 /// Clean-room temp dir per test process (no external crates).
 struct TempDir(PathBuf);
@@ -18,7 +18,7 @@ struct TempDir(PathBuf);
 impl TempDir {
     fn new(tag: &str) -> Self {
         let dir =
-            std::env::temp_dir().join(format!("mc-spine-playpath123-{tag}-{}", std::process::id()));
+            std::env::temp_dir().join(format!("megu-playpath123-{tag}-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         Self(dir)
@@ -132,8 +132,8 @@ fn cli_accepts_full_official_launcher_argv_and_redacts_token() {
     assert!(!cfg.show_version);
 
     // `=` forms and bare-`--version` version-print both behave.
-    let eq = parse_gpu_args(&["--version=mc-spine-1.21.1", "--accessToken=tok"]).unwrap();
-    assert_eq!(eq.version_id.as_deref(), Some("mc-spine-1.21.1"));
+    let eq = parse_gpu_args(&["--version=megu-1.21.1", "--accessToken=tok"]).unwrap();
+    assert_eq!(eq.version_id.as_deref(), Some("megu-1.21.1"));
     assert_eq!(eq.mc_version, "1.21.1");
     assert!(parse_gpu_args(&["--version"]).unwrap().show_version);
     assert!(parse_gpu_args(&["-V"]).unwrap().show_version);
@@ -204,7 +204,7 @@ fn e_key_opens_and_closes_own_player_inventory_and_title_actions_dispatch() {
     // Singleplayer with a guaranteed-missing server binary surfaces an
     // actionable status instead of silently doing nothing.
     let mut solo = GpuApp::new(GpuCliConfig {
-        server_bin: Some(PathBuf::from("/nonexistent/mc-spine-integrated")),
+        server_bin: Some(PathBuf::from("/nonexistent/megu-integrated")),
         ..GpuCliConfig::default()
     });
     assert_eq!(solo.screen(), Screen::Title);

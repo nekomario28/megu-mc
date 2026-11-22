@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: LGPL-3.0-or-later OR GPL-3.0-or-later OR AGPL-3.0-or-later
-//! `mc_spine_core::task_pool` — a zero-dependency, dual-lane, work-stealing
+//! `megu_core::task_pool` — a zero-dependency, dual-lane, work-stealing
 //! parallel runtime for the voxel engine hot paths.
 //!
 //! * [`TaskLane`] — two scheduling lanes mirroring heterogeneous hardware:

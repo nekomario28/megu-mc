@@ -577,7 +577,7 @@ impl ModpackManifest {
     }
 
     /// Load a manifest from a path on disk — the entry point the
-    /// `mc-spine-mod-check` CLI and `tools/mod_launcher.py --modpack`
+    /// `megu-mod-check` CLI and `tools/mod_launcher.py --modpack`
     /// share. Accepts three shapes:
     ///
     /// - a standalone `modrinth.index.json` or CurseForge `manifest.json`
@@ -686,7 +686,7 @@ pub struct ModpackEntry {
 /// Overall pre-flight verdict for the pack.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ModpackReadiness {
-    /// Every file runs natively on `mc-spine` — nothing to skip, nothing to
+    /// Every file runs natively on `megu` — nothing to skip, nothing to
     /// inspect.
     ReadyNative,
     /// Ready once redundant perf mods and client-only files are
@@ -815,7 +815,7 @@ impl ModpackPreflightReport {
         if !skipped.is_empty() {
             let _ = writeln!(
                 out,
-                "  - {} performance mod(s) skipped automatically — mc-spine already has the same optimizations built in (clean-room): {}",
+                "  - {} performance mod(s) skipped automatically — megu already has the same optimizations built in (clean-room): {}",
                 skipped.len(),
                 skipped.join(", ")
             );
@@ -853,7 +853,7 @@ impl ModpackPreflightReport {
             "Result: {}",
             match self.readiness {
                 ModpackReadiness::ReadyNative =>
-                    "ready — every file in this pack runs natively on mc-spine.".to_string(),
+                    "ready — every file in this pack runs natively on megu.".to_string(),
                 ModpackReadiness::ReadyWithAutoSkips =>
                     "ready — redundant and client-only files are skipped automatically; the rest runs natively.".to_string(),
                 ModpackReadiness::NeedsJarInspection =>
@@ -866,7 +866,7 @@ impl ModpackPreflightReport {
     }
 
     /// Deterministic JSON form of this report — the
-    /// `mc-spine-modpack-preflight/1` schema `tools/mod_launcher.py`
+    /// `megu-modpack-preflight/1` schema `tools/mod_launcher.py`
     /// emits with `json.dumps(report, indent=2)`, with the same key
     /// order, snake_case enum spellings, and ASCII-only escaping so the
     /// Rust and Python reports diff byte-for-byte.
@@ -874,7 +874,7 @@ impl ModpackPreflightReport {
         use fmt::Write;
         let mut out = String::with_capacity(768 + self.entries.len() * 224);
         out.push_str("{\n");
-        json_field_str(&mut out, 1, "schema", "mc-spine-modpack-preflight/1", true);
+        json_field_str(&mut out, 1, "schema", "megu-modpack-preflight/1", true);
         json_field_str(&mut out, 1, "pack_name", &self.pack_name, true);
         json_field_str(&mut out, 1, "pack_version", &self.pack_version, true);
         json_field_str(
@@ -956,7 +956,7 @@ impl ModpackPreflightReport {
 }
 
 /// `ModpackEntryClass` as the snake_case string the
-/// `mc-spine-modpack-preflight/1` schema uses.
+/// `megu-modpack-preflight/1` schema uses.
 fn entry_class_name(class: ModpackEntryClass) -> &'static str {
     match class {
         ModpackEntryClass::SupersededPerfMod => "superseded_perf_mod",
@@ -1143,7 +1143,7 @@ fn classify_entry(
         if superseded.contains(&key) {
             return (
                 ModpackEntryClass::SupersededPerfMod,
-                "redundant performance mod — mc-spine already ships an equivalent clean-room optimization".to_string(),
+                "redundant performance mod — megu already ships an equivalent clean-room optimization".to_string(),
             );
         }
         if flagship.contains(&key) {
@@ -2379,7 +2379,7 @@ mod tests {
         let root = parse_json(json.as_bytes()).expect("to_json must be valid JSON");
         let r = root.as_object().unwrap();
         let s = |k: &str| r.get(k).and_then(JsonValue::as_str).unwrap_or("");
-        assert_eq!(s("schema"), "mc-spine-modpack-preflight/1");
+        assert_eq!(s("schema"), "megu-modpack-preflight/1");
         assert_eq!(s("pack_name"), "Create NeoForge Adventure");
         assert_eq!(s("pack_version"), "1.4.0");
         assert_eq!(s("format"), "modrinth");
@@ -2655,7 +2655,7 @@ mod tests {
     fn from_path_loads_standalone_and_archive_manifests() {
         use std::io::Write;
         let dir = std::env::temp_dir().join(format!(
-            "mc-spine-modpack-from-path-{}",
+            "megu-modpack-from-path-{}",
             std::process::id()
         ));
         fs::create_dir_all(&dir).unwrap();

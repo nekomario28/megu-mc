@@ -1,5 +1,5 @@
 name: Bug report
-description: Report a crash, misbehavior, or compatibility bug in Megu (mc-spine). Crash reports need a MEGU-E fingerprint. クラッシュ報告には MEGU-E フィンガープリントが必要です。
+description: Report a crash, misbehavior, or compatibility bug in Megu (megu). Crash reports need a MEGU-E fingerprint. クラッシュ報告には MEGU-E フィンガープリントが必要です。
 title: "[Bug] "
 labels: ["triage"]
 body:

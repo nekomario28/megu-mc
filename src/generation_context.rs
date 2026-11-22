@@ -1199,7 +1199,7 @@ impl<'a> FC<'a> {
     }
 }
 
-/// `MC_SPINE_HM_DUMP=cx,cz`: print, for every column of one chunk, the three live
+/// `MEGU_HM_DUMP=cx,cz`: print, for every column of one chunk, the three live
 /// heightmaps a feature can read - `OCEAN_FLOOR`, `WORLD_SURFACE` and `MOTION_BLOCKING` -
 /// followed by the same values for `MOTION_BLOCKING_NO_LEAVES`.
 ///
@@ -1243,7 +1243,7 @@ pub(crate) fn hm_dump(spec: &str, populate: fn(&mut Gen, i32, i32)) {
     });
 }
 
-/// `MC_SPINE_WG_DUMP_HM=<path>`: write the OCEAN_FLOOR height of every column of
+/// `MEGU_WG_DUMP_HM=<path>`: write the OCEAN_FLOOR height of every column of
 /// the dumped region, 256 i32 per chunk in the block dump's chunk order.
 ///
 /// Why: the kelp residual was attributed to "the two sides read a different

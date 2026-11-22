@@ -107,23 +107,23 @@ count to make a broken check green is not a migration.
 ## CF-3 — integrated JAR boundary
 
 `python3 tools/client_launcher/build_integrated_mod.py --out-dir DIR` creates
-reproducible `DIR/mc-spine-integrated.jar`. It contains `fabric.mod.json`,
+reproducible `DIR/megu-integrated.jar`. It contains `fabric.mod.json`,
 `META-INF/neoforge.mods.toml`, the shared Java 21 coordinator,
 `FabricIntegratedMod implements ClientModInitializer`, and
-`NeoForgeIntegratedMod @Mod("mc_spine_integrated")`. Loader API stubs exist only
+`NeoForgeIntegratedMod @Mod("megu_integrated")`. Loader API stubs exist only
 for offline Java compilation and are excluded from the archive. The same jar
 is discoverable in Fabric and NeoForge 1.21.1 `mods/` directories. Real mod
 loader launch, Minecraft client connection and in-game world lifecycle
 integration require separate verification and hooks.
 
 Activation in a mod loader is **explicit** via JVM properties
-`-Dmc.spine.integrated.enabled=true`,
-`-Dmc.spine.integrated.serverBin=/absolute/path/to/mc-spine`, optionally
-`-Dmc.spine.integrated.gameDir=/game/directory`,
-`-Dmc.spine.integrated.world=mc-spine`, and
-`-Dmc.spine.integrated.seed=0`. If disabled, initialization has no process
+`-Dmegu.integrated.enabled=true`,
+`-Dmegu.integrated.serverBin=/absolute/path/to/megu`, optionally
+`-Dmegu.integrated.gameDir=/game/directory`,
+`-Dmegu.integrated.world=megu`, and
+`-Dmegu.integrated.seed=0`. If disabled, initialization has no process
 side effect. A server binary must be installed independently, with compatible
-`config_packets.bin`/`assets` available via `MC_SPINE_SERVER_HOME` or the
+`config_packets.bin`/`assets` available via `MEGU_SERVER_HOME` or the
 resolved game directory/native binary directory. No native executable, game
 client classes, game asset pack or third-party JAR is embedded.
 `IntegratedServerBridge.startConfigured()` starts one monitored instance and
@@ -134,13 +134,13 @@ in-game launch have not yet been validated.
 
 For standalone use the JAR has `Main-Class` set to the bridge. Run
 `java -Djava.io.tmpdir="$PWD/target/tmp" -XX:-UsePerfData -jar \
- DIR/mc-spine-integrated.jar --server-bin /path/to/mc-spine \
- --game-dir /path/to/game --world mc-spine --seed 0`.
+ DIR/megu-integrated.jar --server-bin /path/to/megu \
+ --game-dir /path/to/game --world megu --seed 0`.
 The process emits `READY 127.0.0.1:<port> pid=<pid>` only after the
 protocol-767 Status response matches the expected 1.21.1 server. Closing
 stdin, writing to stdin, or JVM shutdown requests close. The coordinator
-selects a free ephemeral port, passes `MC_SPINE_BIND_ADDR`, `MC_SPINE_PORT`,
-`MC_SPINE_WORLD_DIR` and `MC_SPINE_SEED` to its child, stores the world under
+selects a free ephemeral port, passes `MEGU_BIND_ADDR`, `MEGU_PORT`,
+`MEGU_WORLD_DIR` and `MEGU_SEED` to its child, stores the world under
 `gameDir/saves/<world>`, holds an exclusive world lock, and on cleanup sends
 termination with bounded wait then force-kill fallback. Invalid binary, escaped
 world path, non-loopback bind, explicit non-ephemeral port, malformed seed and
@@ -151,7 +151,7 @@ child binding. Repeated protocol probes and child liveness narrow the gap.
 Current `tools/client_launcher/integrated_bridge.py` remains the existing
 native-client Quick Play path. Its Python launcher and the new Java loader
 adapter can coexist. Neither currently redirects an installed unmodified
-Minecraft client's integrated-world UI into mc-spine automatically.
+Minecraft client's integrated-world UI into megu automatically.
 
 ### CF-3 to FFI migration
 
@@ -170,7 +170,7 @@ Minecraft client's integrated-world UI into mc-spine automatically.
 
 ## CF-3b — Direct `ByteBuffer` `MCSI` v1 frame bridge
 
-Lane `E4-30` extends `tools/client_launcher/net/mcspine/integrated/IntegratedServerBridge.java`
+Lane `E4-30` extends `tools/client_launcher/net/megu/integrated/IntegratedServerBridge.java`
 with a deterministic, fail-closed direct-`ByteBuffer` frame codec for the
 single-player / LAN-host `CF-3` integrated server exchange. It does not replace
 the protocol-767 socket lifecycle bridge; it adds a framing layer that the
@@ -217,7 +217,7 @@ limit per field so a header read cannot swallow the payload.
 
 `build_integrated_mod.py` packages every compiled class via a sorted `rglob`
 over `javac` output, so the nested
-`net/mcspine/integrated/IntegratedServerBridge$DirectFrame.class` is included.
+`net/megu/integrated/IntegratedServerBridge$DirectFrame.class` is included.
 Entries use the fixed ZIP time `(1980, 1, 1, 0, 0, 0)`, mode `0644`, creator
 system `3`, and deterministic deflate; consecutive builds are byte-identical.
 Compile-only Fabric/NeoForge stubs are rejected if they leak into the archive.

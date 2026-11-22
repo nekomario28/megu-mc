@@ -545,7 +545,7 @@ mod tests {
 }
 
 fn main() {
-    let temp = std::env::temp_dir().join(format!("mc-spine-storage-bench-{}", std::process::id()));
+    let temp = std::env::temp_dir().join(format!("megu-storage-bench-{}", std::process::id()));
     let _ = fs::remove_dir_all(&temp);
     fs::create_dir_all(&temp).expect("create bench temp dir");
     let args: Vec<_> = std::env::args().collect();

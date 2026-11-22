@@ -43,7 +43,7 @@
 //!   `Data.Version.Name`, `Data.LevelName`, `Data.RandomSeed` (falling back
 //!   to `Data.WorldGenSettings.seed`) and the `Data.DataPacks` enabled/
 //!   disabled lists, classifies the save against
-//!   [`mc_spine_core::version::TargetVersion`] (`1.21.1` = 3955, `26.3` =
+//!   [`megu_core::version::TargetVersion`] (`1.21.1` = 3955, `26.3` =
 //!   5023), and scans `region/`, `DIM-1/region/` and `DIM1/region/` for
 //!   `r.<x>.<z>.mca` files. The resulting [`AnvilWorldReport`] renders as
 //!   deterministic JSON ([`AnvilWorldReport::to_json`]) or a plain-English
@@ -53,11 +53,11 @@
 //! (gzip or raw), runs the document through the
 //! [`crate::datafix::DataFixer`] between the two pinned targets, and
 //! re-seals it as a verified RFC 1952 gzip member — the direct file-level
-//! migrator behind `mc-spine-world-migrate migrate-level`.
+//! migrator behind `megu-world-migrate migrate-level`.
 
 use crate::datafix::{DataFixError, DataFixReport, DataFixer, DataValue, DV_1_21_1, DV_26_3};
 use crate::migrate::to_data_json;
-use mc_spine_core::version::TargetVersion;
+use megu_core::version::TargetVersion;
 use std::collections::BTreeMap;
 use std::error::Error;
 use std::fmt;
@@ -1223,7 +1223,7 @@ impl LevelDatCompression {
     }
 }
 
-/// How the world relates to the two targets mc-spine serves.
+/// How the world relates to the two targets megu serves.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum AnvilCompatibility {
     /// `DataVersion` pins exactly one supported target.
@@ -1270,7 +1270,7 @@ impl AnvilCompatibility {
         }
     }
 
-    /// One plain-English sentence about what the version means for mc-spine.
+    /// One plain-English sentence about what the version means for megu.
     fn describe(self, data_version: i32) -> String {
         match self {
             Self::Supported(t) => {
@@ -1308,7 +1308,7 @@ pub struct LevelDatSummary {
     pub data_version: i32,
     /// `Data.RandomSeed`, falling back to `Data.WorldGenSettings.seed`.
     pub random_seed: Option<i64>,
-    /// Version classification against the two mc-spine targets.
+    /// Version classification against the two megu targets.
     pub compatibility: AnvilCompatibility,
     /// `Data.DataPacks.Enabled` entries (string items only).
     pub enabled_datapacks: Vec<String>,
@@ -1894,7 +1894,7 @@ mod tests {
     impl TestDir {
         fn new(tag: &str) -> Self {
             let dir = std::env::temp_dir().join(format!(
-                "mc-spine-anvil-inspect-{}-{}-{tag}",
+                "megu-anvil-inspect-{}-{}-{tag}",
                 std::process::id(),
                 DIR_COUNTER.fetch_add(1, Ordering::Relaxed)
             ));

@@ -10,20 +10,20 @@
 //! 4. The composed pass runs graph/frustum (+ optional Hi-Z) visibility
 //!    checks before GPU draw submission with a `culled_sections` counter.
 
-use mc_spine_client::protocol::{decode_chunk_packet, ClientPlayEvent, PlayEvent, TeleportSync};
-use mc_spine_client_gpu::live_session::hw_adaptive_engine::{
+use megu_client::protocol::{decode_chunk_packet, ClientPlayEvent, PlayEvent, TeleportSync};
+use megu_client_gpu::live_session::hw_adaptive_engine::{
     ComputeKernelMode, MemoryTransferStrategy,
 };
-use mc_spine_client_gpu::live_session::LiveSession;
-use mc_spine_client_gpu::renderer::{
+use megu_client_gpu::live_session::LiveSession;
+use megu_client_gpu::renderer::{
     probe_adapters, request_gpu_device, GpuRenderer, OFFSCREEN_FORMAT,
 };
-use mc_spine_client_gpu::Camera;
-use mc_spine_client_mesh::builtin_shadow_wgsl::RenderScalePreset;
-use mc_spine_client_mesh::{
+use megu_client_gpu::Camera;
+use megu_client_mesh::builtin_shadow_wgsl::RenderScalePreset;
+use megu_client_mesh::{
     ChunkUploadBudget, HiZPyramid, RenderBackendPreference, DEFAULT_MAX_UPLOADS_PER_FRAME,
 };
-use mc_spine_ui::state::UiState;
+use megu_ui::state::UiState;
 
 // ---------------------------------------------------------------------------
 // Shared fixtures
@@ -122,7 +122,7 @@ fn mini_hud_host_sampling_is_throttled_while_frame_stats_update() {
     ui.settings.qol.cycle_mini_hud(); // Off -> Basic
     assert_ne!(
         ui.settings.qol.mini_hud_preset(),
-        mc_spine_ui::state::MiniHudPreset::Off
+        megu_ui::state::MiniHudPreset::Off
     );
 
     // 120 frames at ~120 fps ~= 1.0 s of accumulated frame time. The
@@ -167,7 +167,7 @@ fn compute_strategy_and_kernel_autotuner_are_consumed() {
     assert!(live.hw_caps.logical_cores >= 1);
     assert_eq!(
         live.compute_strategy,
-        mc_spine_client_gpu::live_session::hw_adaptive_engine::select_compute_strategy(
+        megu_client_gpu::live_session::hw_adaptive_engine::select_compute_strategy(
             &live.hw_caps
         )
     );
@@ -408,7 +408,7 @@ fn c4c5c6_poll_drains_dirty_meshes_through_ordered_rebuild() {
         pitch_deg: -20.0,
         ..Camera::default()
     };
-    let planes = mc_spine_client_gpu::renderer::frustum_planes_from_view_proj(
+    let planes = megu_client_gpu::renderer::frustum_planes_from_view_proj(
         &camera.view_projection(16.0 / 9.0),
     );
     live.poll(camera.position, &planes);

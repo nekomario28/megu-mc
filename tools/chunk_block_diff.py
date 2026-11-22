@@ -4,7 +4,7 @@
   tools/chunk_block_diff.py <port_a> <port_b> <cx> <cz> [limit]
 
 Both servers are assumed to speak protocol 767 and share the block-state id
-order (true for vanilla 1.21.1 and mc-spine's assets/blocks_1211.json), so the
+order (true for vanilla 1.21.1 and megu's assets/blocks_1211.json), so the
 decoded ids are directly comparable.
 
 Each differing cell is classified into the layer a worldgen fix would live in:

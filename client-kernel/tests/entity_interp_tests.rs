@@ -1,14 +1,14 @@
 // SPDX-License-Identifier: LGPL-3.0-or-later OR GPL-3.0-or-later OR AGPL-3.0-or-later
-use mc_spine_kernel::{
-    evaluate_sky_and_fog, lerp_angle_deg, mc_spine_interp_entities_batch,
-    mc_spine_interp_table_free, mc_spine_interp_table_new, mc_spine_sky_fog_eval,
+use megu_kernel::{
+    evaluate_sky_and_fog, lerp_angle_deg, megu_interp_entities_batch,
+    megu_interp_table_free, megu_interp_table_new, megu_sky_fog_eval,
     EntityInterpolationTable, Error, InterpEntityUpdate, InterpPoseOut, SkyFogInput,
     SkyFogInputC, SkyFogOutputC, INTERP_UPDATE_POSITION, INTERP_UPDATE_REMOVE,
     INTERP_UPDATE_ROTATION, INTERP_UPDATE_SNAP,
 };
 use std::ptr;
 
-fn pose_bits(pose: &mc_spine_kernel::InterpolatedPose) -> ([u64; 3], u32, u32, u32) {
+fn pose_bits(pose: &megu_kernel::InterpolatedPose) -> ([u64; 3], u32, u32, u32) {
     (
         [
             pose.position[0].to_bits(),
@@ -202,49 +202,49 @@ fn ffi_batch_validates_pointers_and_lengths() {
     let updates = [update(1, INTERP_UPDATE_SNAP, [0.0; 3])];
     let mut out = [empty_pose(); 2];
     unsafe {
-        assert_eq!(mc_spine_interp_table_new(ptr::null_mut()), Error::Null as i32);
-        assert_eq!(mc_spine_interp_table_new(&mut table), 0);
+        assert_eq!(megu_interp_table_new(ptr::null_mut()), Error::Null as i32);
+        assert_eq!(megu_interp_table_new(&mut table), 0);
         assert!(!table.is_null());
 
         // Null table, undersized output, null inputs, bad partial tick, bad kind.
         assert_eq!(
-            mc_spine_interp_entities_batch(ptr::null_mut(), updates.as_ptr(), 1, 0.5, out.as_mut_ptr(), 2),
+            megu_interp_entities_batch(ptr::null_mut(), updates.as_ptr(), 1, 0.5, out.as_mut_ptr(), 2),
             Error::Null as i32
         );
         assert_eq!(
-            mc_spine_interp_entities_batch(table, updates.as_ptr(), 1, 0.5, out.as_mut_ptr(), 0),
+            megu_interp_entities_batch(table, updates.as_ptr(), 1, 0.5, out.as_mut_ptr(), 0),
             Error::BufferTooSmall as i32
         );
         assert_eq!(
-            mc_spine_interp_entities_batch(table, ptr::null(), 1, 0.5, out.as_mut_ptr(), 2),
+            megu_interp_entities_batch(table, ptr::null(), 1, 0.5, out.as_mut_ptr(), 2),
             Error::Null as i32
         );
         assert_eq!(
-            mc_spine_interp_entities_batch(table, updates.as_ptr(), 1, 0.5, ptr::null_mut(), 2),
+            megu_interp_entities_batch(table, updates.as_ptr(), 1, 0.5, ptr::null_mut(), 2),
             Error::Null as i32
         );
         assert_eq!(
-            mc_spine_interp_entities_batch(table, updates.as_ptr(), 1, f32::NAN, out.as_mut_ptr(), 2),
+            megu_interp_entities_batch(table, updates.as_ptr(), 1, f32::NAN, out.as_mut_ptr(), 2),
             Error::InvalidArgument as i32
         );
         assert_eq!(
-            mc_spine_interp_entities_batch(table, updates.as_ptr(), 1, 0.5, out.as_mut_ptr(), 2),
+            megu_interp_entities_batch(table, updates.as_ptr(), 1, 0.5, out.as_mut_ptr(), 2),
             0
         );
         let bad = [update(2, 99, [0.0; 3])];
         assert_eq!(
-            mc_spine_interp_entities_batch(table, bad.as_ptr(), 1, 0.5, out.as_mut_ptr(), 2),
+            megu_interp_entities_batch(table, bad.as_ptr(), 1, 0.5, out.as_mut_ptr(), 2),
             Error::InvalidArgument as i32
         );
         // Rotation for an untracked entity fails closed.
         let rot = [update(77, INTERP_UPDATE_ROTATION, [0.0; 3])];
         assert_eq!(
-            mc_spine_interp_entities_batch(table, rot.as_ptr(), 1, 0.5, out.as_mut_ptr(), 2),
+            megu_interp_entities_batch(table, rot.as_ptr(), 1, 0.5, out.as_mut_ptr(), 2),
             Error::NotFound as i32
         );
 
-        assert_eq!(mc_spine_interp_table_free(table), 0);
-        assert_eq!(mc_spine_interp_table_free(ptr::null_mut()), Error::Null as i32);
+        assert_eq!(megu_interp_table_free(table), 0);
+        assert_eq!(megu_interp_table_free(ptr::null_mut()), Error::Null as i32);
     }
 }
 
@@ -253,7 +253,7 @@ fn ffi_batch_matches_the_rust_api_bit_for_bit() {
     let mut ffi_table: *mut EntityInterpolationTable = ptr::null_mut();
     let mut rust_table = EntityInterpolationTable::new();
     unsafe {
-        assert_eq!(mc_spine_interp_table_new(&mut ffi_table), 0);
+        assert_eq!(megu_interp_table_new(&mut ffi_table), 0);
     }
 
     // The batch applies each update and samples that entity immediately, so
@@ -269,7 +269,7 @@ fn ffi_batch_matches_the_rust_api_bit_for_bit() {
     let mut out = [empty_pose(); 6];
     unsafe {
         assert_eq!(
-            mc_spine_interp_entities_batch(
+            megu_interp_entities_batch(
                 ffi_table,
                 updates.as_ptr(),
                 updates.len(),
@@ -322,7 +322,7 @@ fn ffi_batch_matches_the_rust_api_bit_for_bit() {
         }
     }
     unsafe {
-        assert_eq!(mc_spine_interp_table_free(ffi_table), 0);
+        assert_eq!(megu_interp_table_free(ffi_table), 0);
     }
 }
 
@@ -366,15 +366,15 @@ fn ffi_sky_fog_eval_matches_rust_bit_for_bit() {
         fog_end: 0.0,
     };
     unsafe {
-        assert_eq!(mc_spine_sky_fog_eval(ptr::null(), &mut out), Error::Null as i32);
-        assert_eq!(mc_spine_sky_fog_eval(&input, ptr::null_mut()), Error::Null as i32);
+        assert_eq!(megu_sky_fog_eval(ptr::null(), &mut out), Error::Null as i32);
+        assert_eq!(megu_sky_fog_eval(&input, ptr::null_mut()), Error::Null as i32);
         let mut bad = input;
         bad.underwater = 2;
         assert_eq!(
-            mc_spine_sky_fog_eval(&bad, &mut out),
+            megu_sky_fog_eval(&bad, &mut out),
             Error::InvalidArgument as i32
         );
-        assert_eq!(mc_spine_sky_fog_eval(&input, &mut out), 0);
+        assert_eq!(megu_sky_fog_eval(&input, &mut out), 0);
     }
     assert_eq!(out.celestial_angle.to_bits(), rust.celestial_angle.to_bits());
     assert_eq!(out.star_brightness.to_bits(), rust.star_brightness.to_bits());

@@ -96,7 +96,7 @@ def main():
         subprocess.run(javac, check=True, timeout=120)
         result = subprocess.run([
             "java", "-Xmx1024m", "-cp", str(work) + os.pathsep + classpath,
-            "dev.mcspine.tools.NativeSurvivalOracle", str(source), str(output),
+            "dev.megu.tools.NativeSurvivalOracle", str(source), str(output),
             str(expected),
         ], cwd=work, timeout=args.timeout, check=False)
         if not output.exists():

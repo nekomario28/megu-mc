@@ -6,14 +6,14 @@
 
 use std::panic::{catch_unwind, AssertUnwindSafe};
 
-use mc_spine_client::protocol::{
+use megu_client::protocol::{
     decode_chunk_packet, decode_extended_play_event, encode_chat_command, encode_chat_message,
     encode_container_button_click, encode_container_click, encode_container_close,
     encode_interact_attack, encode_interact_use, encode_pick_item, encode_player_action,
     encode_slot_stack, encode_swing, encode_use_item, encode_use_item_on, pack_position,
     write_varint, write_varlong, PlayEvent, WireReader, PROTOCOL_767,
 };
-use mc_spine_proto::{PacketDir, PacketPhase, ProtocolVersion, VersionRouter};
+use megu_proto::{PacketDir, PacketPhase, ProtocolVersion, VersionRouter};
 
 // ---------------------------------------------------------------------------
 // Wire builders (test-side mirrors of the canonical layouts)
@@ -123,10 +123,10 @@ fn no_panic<R>(f: impl FnOnce() -> R) -> R {
 }
 
 // ---------------------------------------------------------------------------
-// Packet-name -> id resolution through mc_spine_proto (never hardcoded)
+// Packet-name -> id resolution through megu_proto (never hardcoded)
 // ---------------------------------------------------------------------------
 
-fn v767_table() -> mc_spine_proto::ProtocolTable {
+fn v767_table() -> megu_proto::ProtocolTable {
     VersionRouter::with_v767_and_v777()
         .select(ProtocolVersion::V1_21_1.number())
         .expect("select v767")

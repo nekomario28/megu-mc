@@ -1,15 +1,15 @@
 // SPDX-License-Identifier: LGPL-3.0-or-later OR GPL-3.0-or-later OR AGPL-3.0-or-later
 
-use mc_spine_client_mesh::mesher::{
+use megu_client_mesh::mesher::{
     evaluate_block_visual_pipeline, BlockVisualEnhancementResult, BlockVisualInput,
     VanillaPlusPipelineConfig,
 };
-use mc_spine_client_mesh::vanilla_plus_3d::{MeshUpgradeDecision, VanillaPlusCategory};
-use mc_spine_client_mesh::vanilla_plus_nature::{NatureModRegistry, WindSwayCategory};
-use mc_spine_client_mesh::vanilla_plus_visuals::{
+use megu_client_mesh::vanilla_plus_3d::{MeshUpgradeDecision, VanillaPlusCategory};
+use megu_client_mesh::vanilla_plus_nature::{NatureModRegistry, WindSwayCategory};
+use megu_client_mesh::vanilla_plus_visuals::{
     CtmNeighbors, CtmTile, SideFaceStyle, RELIEF_TINT_EMISSIVE,
 };
-use mc_spine_client_mesh::Direction;
+use megu_client_mesh::Direction;
 
 fn input(block_id: &str) -> BlockVisualInput<'_> {
     BlockVisualInput {
@@ -317,7 +317,7 @@ fn special_and_mod_ores_stay_preserved() {
     // A mod ore outside scope (VanillaOnly) is excluded even though it is an
     // ore, and a plain non-ore block is never a candidate.
     let mut cfg = enabled_cfg();
-    cfg.classic_ores.scope = mc_spine_client_mesh::classic_ores::ClassicOresScope::VanillaOnly;
+    cfg.classic_ores.scope = megu_client_mesh::classic_ores::ClassicOresScope::VanillaOnly;
     let r = evaluate_block_visual_pipeline(&input("create:zinc_ore"), &cfg, &reg);
     assert!(r.classic_ore.is_none());
     let r = evaluate_block_visual_pipeline(&input("minecraft:stone"), &cfg, &reg);

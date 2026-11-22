@@ -52,7 +52,7 @@ def main() -> int:
     try:
         cp = classpath.read_text(encoding="utf-8").strip()
         command = [str(java), "-XX:-UsePerfData", f"-Djava.io.tmpdir={tmp}", "-cp", cp,
-                   "net.mcspine.neoforge.ShimCheck"]
+                   "net.megu.neoforge.ShimCheck"]
         if args.json:
             command.append("--json")
         command += ["--surface", str(args.surface)]

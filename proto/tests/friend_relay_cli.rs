@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: LGPL-3.0-or-later OR GPL-3.0-or-later OR AGPL-3.0-or-later
-//! End-to-end tests for the `mc-spine-friend-relay` binary: real process
+//! End-to-end tests for the `megu-friend-relay` binary: real process
 //! invocations for usage/security exits, plus a live spawned relay proving
 //! host registration, the edge host/guest caps, and bidirectional FRL1
 //! StreamData forwarding over kernel TCP.
@@ -9,11 +9,11 @@ use std::net::{IpAddr, Ipv4Addr, SocketAddr, TcpListener, TcpStream};
 use std::process::{Child, Command, Output, Stdio};
 use std::time::Duration;
 
-use mc_spine_proto::friend_relay::{
+use megu_proto::friend_relay::{
     decode_packet, encode_frame, FriendPacket, InviteCode, MAX_FRL1_FRAME_BYTES,
 };
 
-const BIN: &str = env!("CARGO_BIN_EXE_mc-spine-friend-relay");
+const BIN: &str = env!("CARGO_BIN_EXE_megu-friend-relay");
 const HOST_SECRET: [u8; 16] = [0x5E; 16];
 
 fn run(args: &[&str]) -> Output {

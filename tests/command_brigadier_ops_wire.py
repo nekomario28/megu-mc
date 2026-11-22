@@ -33,15 +33,15 @@ def server(binary, root):
         rcon = port()
     env = dict(
         os.environ,
-        MC_SPINE_PORT=str(game),
-        MC_SPINE_BIND_ADDR="127.0.0.1",
-        MC_SPINE_RCON_PORT=str(rcon),
-        MC_SPINE_RCON_BIND_ADDR="127.0.0.1",
-        MC_SPINE_RCON_PASS=SECRET,
-        MC_SPINE_WG="old",
-        MC_SPINE_RESOURCE_PACK_URL="",
+        MEGU_PORT=str(game),
+        MEGU_BIND_ADDR="127.0.0.1",
+        MEGU_RCON_PORT=str(rcon),
+        MEGU_RCON_BIND_ADDR="127.0.0.1",
+        MEGU_RCON_PASS=SECRET,
+        MEGU_WG="old",
+        MEGU_RESOURCE_PACK_URL="",
     )
-    env.pop("MC_SPINE_ALLOW_PLAYER_ADMIN_COMMANDS", None)
+    env.pop("MEGU_ALLOW_PLAYER_ADMIN_COMMANDS", None)
     with (root / "server.log").open("w+") as log:
         proc = subprocess.Popen(
             [str(binary)], cwd=root, env=env, stdout=log, stderr=log
@@ -360,7 +360,7 @@ if __name__ == "__main__":
     binary = (
         Path(sys.argv[1]).resolve()
         if len(sys.argv) > 1
-        else ROOT / "target/debug/mc-spine"
+        else ROOT / "target/debug/megu"
     )
     with tempfile.TemporaryDirectory(prefix="spine-brigadier-wire-") as directory:
         main(binary, Path(directory))

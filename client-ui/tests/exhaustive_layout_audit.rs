@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: LGPL-3.0-or-later OR GPL-3.0-or-later OR AGPL-3.0-or-later
-//! Exhaustive pre-release layout audit for `mc-spine-client-ui`.
+//! Exhaustive pre-release layout audit for `megu-client-ui`.
 //!
 //! Every screen, every settings tab, every modal, every embedded
 //! sub-screen, and the fully-populated in-game HUD (MiniHUD at every
@@ -16,24 +16,24 @@
 //!   explicit GUI scale,
 //! * a reachable Back/Close/Escape path on every screen.
 
-use mc_spine_client_ui::draw::{
+use megu_client_ui::draw::{
     rasterize_draw_list, tessellate_draw_list, text_height, text_width, UiColor, UiCommand,
     UiDrawList, UiRect,
 };
-use mc_spine_client_ui::magic_hud::{
+use megu_client_ui::magic_hud::{
     CastBarState, CooldownSlotState, MagicHudState, StatusBadgeState,
 };
-use mc_spine_client_ui::mod_menu::{ModMenuEntry, ModMenuState};
-use mc_spine_client_ui::recipe_browser::{
+use megu_client_ui::mod_menu::{ModMenuEntry, ModMenuState};
+use megu_client_ui::recipe_browser::{
     BrowserTab, DetailMode, ItemEntry, RecipeBrowserState, RecipeIndex,
 };
-use mc_spine_client_ui::shader_screen::ShaderPackScreenState;
-use mc_spine_client_ui::state::{
+use megu_client_ui::shader_screen::ShaderPackScreenState;
+use megu_client_ui::state::{
     CraftingConflictOverlay, HitRegion, HudState, HudSubtitle, LanguageSetting, ModSyncEntry,
     Screen, SettingsTab, SubtitleDirection, UiInputEvent, UiLang, UiModal, UiState, WidgetId,
 };
-use mc_spine_core::crash_report::CrashContext;
-use mc_spine_core::sys_metrics::{MiniHudAnchor, MiniHudConfig, MiniHudData};
+use megu_core::crash_report::CrashContext;
+use megu_core::sys_metrics::{MiniHudAnchor, MiniHudConfig, MiniHudData};
 
 /// Required ship resolutions: compact, vanilla default, 720p/Deck,
 /// 1080p, 1440p, 4K HiDPI.
@@ -348,12 +348,12 @@ fn all_screens(ui: &mut UiState) -> Vec<Screen> {
         ModSyncEntry {
             name: "jei".to_string(),
             sha256_hex: "ff00ff00ff00ff00ff00ff00ff00ff00".to_string(),
-            change: mc_spine_client_ui::state::ModSyncChange::Updated,
+            change: megu_client_ui::state::ModSyncChange::Updated,
         },
         ModSyncEntry {
             name: "old-mod".to_string(),
             sha256_hex: "11".repeat(32),
-            change: mc_spine_client_ui::state::ModSyncChange::Removed,
+            change: megu_client_ui::state::ModSyncChange::Removed,
         },
     ];
     ui.missing_mod_deps = vec!["create".into(), "jei".into()];
@@ -757,7 +757,7 @@ fn pathological_embedded_screens_never_panic() {
 
         let magic = populated_magic();
         let list =
-            mc_spine_client_ui::magic_hud::build_magic_hud_draw_list(&magic, w, h);
+            megu_client_ui::magic_hud::build_magic_hud_draw_list(&magic, w, h);
         let _ = rasterize_draw_list(w, h, &list);
     }
 }
@@ -786,10 +786,10 @@ fn every_screen_escapes_to_a_safe_place() {
         ui.nav_stack.clear();
         ui.modal = Some(UiModal::ConfirmSendCrashReport);
         // Escape dismisses the modal first.
-        ui.handle_input(UiInputEvent::KeyPressed(mc_spine_client_ui::state::UiKey::Escape));
+        ui.handle_input(UiInputEvent::KeyPressed(megu_client_ui::state::UiKey::Escape));
         assert!(ui.modal.is_none(), "{screen:?}: escape did not dismiss modal");
         // Escape again must never panic and must land somewhere defined.
-        ui.handle_input(UiInputEvent::KeyPressed(mc_spine_client_ui::state::UiKey::Escape));
+        ui.handle_input(UiInputEvent::KeyPressed(megu_client_ui::state::UiKey::Escape));
         match screen {
             // In-game Escape opens the pause menu.
             Screen::InGameHud => assert_eq!(ui.screen, Screen::Pause),

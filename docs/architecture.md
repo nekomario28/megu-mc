@@ -1,6 +1,6 @@
 # Architecture
 
-`mc-spine` is the canonical server package and executable. Its standalone
+`megu` is the canonical server package and executable. Its standalone
 crates and dependency edges are indexed in
 [architecture-crates.md](architecture-crates.md). The capabilities below
 refer to modules present in this tree.

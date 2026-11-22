@@ -286,7 +286,7 @@ def hunger(game):
 
 
 def main(binary):
-    os.environ["MC_SPINE_ALLOW_PLAYER_ADMIN_COMMANDS"] = "1"
+    os.environ["MEGU_ALLOW_PLAYER_ADMIN_COMMANDS"] = "1"
     os.environ.setdefault("MC_PROBE_DEADLINE", "30")
     with local_server(binary) as game:
         for contract in (borders, scoreboard, advancements, modifications, experience, hunger):
@@ -296,7 +296,7 @@ def main(binary):
 
 if __name__ == "__main__":
     binary = Path(sys.argv[1]).resolve() if len(sys.argv) > 1 else (
-        Path(__file__).resolve().parents[1] / "target/debug/mc-spine")
+        Path(__file__).resolve().parents[1] / "target/debug/megu")
     try:
         main(binary)
     except ContractFailure as error:

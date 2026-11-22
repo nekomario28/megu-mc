@@ -1,6 +1,6 @@
-package net.mcspine.jvm_eval;
+package net.megu.jvm_eval;
 
-import net.mcspine.neoforge.Bootstrap;
+import net.megu.neoforge.Bootstrap;
 import net.neoforged.bus.api.EventPriority;
 import net.neoforged.neoforge.common.NeoForge;
 import net.neoforged.neoforge.event.level.BlockEvent.FarmlandTrampleEvent;

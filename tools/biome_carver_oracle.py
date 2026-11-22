@@ -43,7 +43,7 @@ def main():
         parser.exit(2, "not the pinned 1.21.1 server jar: %s\n" % args.jar)
     with pinned_runtime(args.jar) as (work, classpath, inner):
         out = work / "carvers.json"
-        run_probe(work, classpath, SOURCE, "dev.mcspine.tools.BiomeCarverOracle", out)
+        run_probe(work, classpath, SOURCE, "dev.megu.tools.BiomeCarverOracle", out)
         biomes = json.loads(out.read_text())
     fixture = {
         "minecraft": "1.21.1", "server_sha1": JAR_SHA1,

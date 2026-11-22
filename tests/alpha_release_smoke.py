@@ -194,7 +194,7 @@ def surface(client):
 
 
 def exercise(binary, root, passed):
-    extra_env = {"MC_SPINE_ALLOW_PLAYER_ADMIN_COMMANDS": "1", "MC_SPINE_SAFE_SPAWN": "1"}
+    extra_env = {"MEGU_ALLOW_PLAYER_ADMIN_COMMANDS": "1", "MEGU_SAFE_SPAWN": "1"}
     persisted = {}
     with local_server(binary, root, extra_env=extra_env) as game:
         with AlphaClient(game, "Alice") as alice, AlphaClient(game, "Bob") as bob:
@@ -370,7 +370,7 @@ class OfflineTests(unittest.TestCase):
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("server_binary", nargs="?", default=str(ROOT / "target/debug/mc-spine"))
+    parser.add_argument("server_binary", nargs="?", default=str(ROOT / "target/debug/megu"))
     parser.add_argument("--self-test", action="store_true", help="offline payload and step tests")
     parser.add_argument("--json", action="store_true", help="machine-readable summary only")
     args = parser.parse_args()
@@ -395,7 +395,7 @@ def main():
     failure = None
     try:
         require(binary.is_file(), f"missing-server-binary:{binary}")
-        with tempfile.TemporaryDirectory(prefix="mc-spine-alpha-") as root:
+        with tempfile.TemporaryDirectory(prefix="megu-alpha-") as root:
             exercise(binary, Path(root), passed)
     except (AssertionError, OSError, TimeoutError, ValueError) as exc:
         failure = f"{type(exc).__name__}: {exc}"

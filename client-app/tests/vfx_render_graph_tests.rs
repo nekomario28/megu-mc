@@ -3,12 +3,12 @@
 
 use std::time::Duration;
 
-use mc_spine_client::render::{ClientVfxHost, FrameBudgetGovernor, ThrottleStage};
-use mc_spine_client::render_graph::{
+use megu_client::render::{ClientVfxHost, FrameBudgetGovernor, ThrottleStage};
+use megu_client::render_graph::{
     plan_frame, plan_frame_with_vfx, vfx_budget_for_pipeline, FramePlanInput, GpuPipelineKind,
     PassSubmission, RenderPassId,
 };
-use mc_spine_client_mesh::vfx_engine::{
+use megu_client_mesh::vfx_engine::{
     BeamEffect, ColorRamp, DynamicColoredLight, EntityAura, ParticleDraw, ParticleEmitterSpec,
     ParticleOrientation, RibbonDraw, RibbonVertex, ScalarCurve, Vfx1Packet, VfxBudget,
     VfxCodecError, VfxCommand, VfxFrameOutput, VfxHardwareTier, VFX1_CHANNEL,
@@ -115,7 +115,7 @@ fn all_gpu_pipelines_receive_the_expected_vfx_budget() {
 
 #[test]
 fn vfx1_wire_commands_step_into_translucent_pass_and_colored_lights() {
-    assert_eq!(VFX1_CHANNEL, "mc-spine:vfx_v1");
+    assert_eq!(VFX1_CHANNEL, "megu:vfx_v1");
     let pipeline = GpuPipelineKind::Classic;
     let mut host = ClientVfxHost::new(pipeline);
     let encoded = packet().encode().unwrap();

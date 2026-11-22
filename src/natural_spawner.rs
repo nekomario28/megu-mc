@@ -3323,7 +3323,7 @@ fn nether_spawn_cycle() -> u64 {
     static EVERY_TICK: OnceLock<bool> = OnceLock::new();
     if cfg!(debug_assertions)
         && *EVERY_TICK.get_or_init(|| {
-            std::env::var("MC_SPINE_TEST_NETHER_SPAWN_EVERY_TICK").as_deref() == Ok("1")
+            std::env::var("MEGU_TEST_NETHER_SPAWN_EVERY_TICK").as_deref() == Ok("1")
         })
     {
         1

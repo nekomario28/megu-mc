@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: LGPL-3.0-or-later OR GPL-3.0-or-later OR AGPL-3.0-or-later
 
 //! C boundary for the standalone kernels. The matching public header is
-//! `include/mc_spine_mod_offload.h`.
+//! `include/megu_mod_offload.h`.
 #![allow(unsafe_code)]
 
 use std::mem::{align_of, size_of};
@@ -704,7 +704,7 @@ pub unsafe extern "C" fn mso_contraption_export_delta(
 
 macro_rules! region_api {
     ($(fn $name:ident($region:ident $(, $arg:ident: $ty:ty)*) $body:block)*) => {$(
-        /// See the matching declaration in `include/mc_spine_mod_offload.h`.
+        /// See the matching declaration in `include/megu_mod_offload.h`.
         ///
         /// # Safety
         ///

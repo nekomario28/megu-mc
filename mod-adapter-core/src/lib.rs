@@ -108,7 +108,7 @@
 //!   instruction runs) plus a strict fuel cap so no mod loop can hang a
 //!   server tick.
 //! - [`mod_sync`]: hardened server→client mod sync protocol — the `MSY1`
-//!   `CustomPacketPayload` body on channel `mc-spine:mod_sync_v1`, an
+//!   `CustomPacketPayload` body on channel `megu:mod_sync_v1`, an
 //!   HTTPS-only trusted-CDN allowlist with SSRF/IP-literal/credentials
 //!   rejection, a strict `.jar` basename jail, zero-dependency pure-`std`
 //!   FIPS 180-4 SHA-256 with constant-time digest comparison,
@@ -127,7 +127,7 @@
 //!   NeoForge `data_maps` + `neoforge/biome_modifier` documents, and the
 //!   ten `c:` conventional tag families with `forge:`/`neoforge:` alias
 //!   resolution over a Vanilla 1.21.1 baseline.
-//! - [`unified_bundle`]: shrink-to-generic `mc-spine-mod-bundle/1`
+//! - [`unified_bundle`]: shrink-to-generic `megu-mod-bundle/1`
 //!   declarative mod bundle — one pure-JSON document declaring a mod's
 //!   portals, progression barriers, biome regions, creature specs, and
 //!   custom payload channels, installed atomically into
@@ -138,12 +138,12 @@
 //!   one [`auto_adapter::auto_adapt_jar`]/[`auto_adapter::auto_adapt_mods_dir`]
 //!   call chains superseded-perf-mod skip, loader-manifest metadata,
 //!   generic data/culinary/dimension discovery, `.class` Mixin bytecode
-//!   lifting, and `mc-spine-mod-bundle/1` synthesis into a four-tier
+//!   lifting, and `megu-mod-bundle/1` synthesis into a four-tier
 //!   [`auto_adapter::AdaptationTier`] verdict with exact human-readable
 //!   blockers, plus [`auto_adapter::scaffold_native_bundle`] emitting a
 //!   validated starter bundle for native mod authors.
 //! - [`mod_tick_runtime`]: generic modded block-entity tick runtime on
-//!   `mc_spine_core::perf_kit` — O(1) dirty-fingerprint idle skips,
+//!   `megu_core::perf_kit` — O(1) dirty-fingerprint idle skips,
 //!   exact-tick wake scheduling, per-tick-budget burst slicing, and
 //!   last-write-wins coalesced outbound deltas for any machine family.
 //! - [`magic_primitives`]: clean-room magic-mod primitives engine —
@@ -156,7 +156,7 @@
 //!   [`magic_primitives::CustomStatusRegistry`] DoT/HoT/absorption/CC
 //!   statuses, multiblock [`magic_primitives::RitualRecipe`] altars with a
 //!   bounded cycle-safe [`magic_primitives::ManaNetwork`], and the `MAG1`
-//!   `mc-spine:magic_v1` sync codec.
+//!   `megu:magic_v1` sync codec.
 
 #![deny(unsafe_code)]
 

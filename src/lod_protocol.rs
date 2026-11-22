@@ -1,15 +1,15 @@
 // SPDX-License-Identifier: LGPL-3.0-or-later OR GPL-3.0-or-later OR AGPL-3.0-or-later
-// Opt-in `mc-spine:lod_v1` server plugin channel (Wave B3).
+// Opt-in `megu:lod_v1` server plugin channel (Wave B3).
 //
 // Negotiation rides the standard C2S `0x12` plugin-channel payloads: a client
-// that registers `mc-spine:lod_v1` on `minecraft:register` is answered with an
+// that registers `megu:lod_v1` on `minecraft:register` is answered with an
 // S2C `0x19` echo and may then send `REQ1` column requests on the channel.
 // A vanilla client never registers the channel and therefore never sees a
 // `lod_v1` packet. The `LOD1` frame layout is byte-for-byte the codec in
 // `client-app/src/lod.rs` (`encode_lod_v1` / `decode_lod_v1`).
 
 /// The plugin channel a LOD client registers to opt in.
-const LOD_V1_CHANNEL: &str = "mc-spine:lod_v1";
+const LOD_V1_CHANNEL: &str = "megu:lod_v1";
 
 /// `LOD1` frame constants shared with `client-app/src/lod.rs`.
 const LOD_V1_MAGIC: &[u8; 4] = b"LOD1";
@@ -388,7 +388,7 @@ fn registered_channels(payload: &[u8]) -> impl Iterator<Item = &str> {
         .filter_map(|part| std::str::from_utf8(part).ok())
 }
 
-/// A `minecraft:register` advertising `mc-spine:lod_v1` flips the client's
+/// A `minecraft:register` advertising `megu:lod_v1` flips the client's
 /// opt-in flag on and is answered with the S2C `0x19` echo naming the channel.
 fn lod_v1_register(client: &Client, payload: &[u8]) {
     if !registered_channels(payload).any(|name| name == LOD_V1_CHANNEL) {
@@ -464,7 +464,7 @@ fn lod_v1_request(client: &Client, payload: &[u8]) {
 }
 
 /// C2S `0x12` (Custom Payload) dispatch. `minecraft:register`,
-/// `minecraft:unregister` and the `mc-spine:lod_v1` request channel are handled
+/// `minecraft:unregister` and the `megu:lod_v1` request channel are handled
 /// here unconditionally; every other non-`minecraft:` channel keeps flowing to
 /// the mod runtime when the `neoforge-events` feature is built.
 fn custom_payload_c2s(client: &Client, body: &[u8]) {

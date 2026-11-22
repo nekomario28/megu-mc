@@ -17,19 +17,19 @@
 
 use std::time::Duration;
 
-use mc_spine_client::protocol::{decode_chunk_packet, ClientPlayEvent, PlayEvent, TeleportSync};
-use mc_spine_client::render::{FrameBudgetGovernor, ThrottleStage};
-use mc_spine_client_gpu::atmosphere::{AtmosphereParams, BiomeAtmosphereBlender, ChunkFadeTracker};
-use mc_spine_client_gpu::live_session::LiveSession;
-use mc_spine_client_gpu::renderer::{
+use megu_client::protocol::{decode_chunk_packet, ClientPlayEvent, PlayEvent, TeleportSync};
+use megu_client::render::{FrameBudgetGovernor, ThrottleStage};
+use megu_client_gpu::atmosphere::{AtmosphereParams, BiomeAtmosphereBlender, ChunkFadeTracker};
+use megu_client_gpu::live_session::LiveSession;
+use megu_client_gpu::renderer::{
     probe_adapters, request_gpu_device, ComposedFrame, GpuRenderer, OFFSCREEN_FORMAT,
 };
-use mc_spine_client_gpu::{select_display_presentation_policy, Camera, DisplayServerKind};
-use mc_spine_client_mesh::builtin_shadow_wgsl::BuiltinShadowQuality;
-use mc_spine_client_mesh::ffi::PackedVertex;
-use mc_spine_client_mesh::vfx_engine::DynamicColoredLight;
-use mc_spine_client_mesh::RenderBackendPreference;
-use mc_spine_ui::draw::{palette, tessellate_draw_list, UiCommand, UiDrawList, UiRect};
+use megu_client_gpu::{select_display_presentation_policy, Camera, DisplayServerKind};
+use megu_client_mesh::builtin_shadow_wgsl::BuiltinShadowQuality;
+use megu_client_mesh::ffi::PackedVertex;
+use megu_client_mesh::vfx_engine::DynamicColoredLight;
+use megu_client_mesh::RenderBackendPreference;
+use megu_ui::draw::{palette, tessellate_draw_list, UiCommand, UiDrawList, UiRect};
 
 fn try_gpu_renderer() -> Option<GpuRenderer> {
     if probe_adapters(RenderBackendPreference::Auto).is_empty() {

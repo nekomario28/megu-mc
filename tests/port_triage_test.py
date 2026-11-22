@@ -114,34 +114,34 @@ class PortTriageContracts(unittest.TestCase):
             pop_order = tmp_path / "order.tsv"
             pop_order.write_text("0\t0\n")
 
-            fake_bin = tmp_path / "fake-mc-spine"
+            fake_bin = tmp_path / "fake-megu"
             env_log = tmp_path / "captured_env.json"
             fake_bin.write_text(f'''#!{sys.executable}
 import json, os, struct
 from pathlib import Path
 env = dict(os.environ)
-Path({str(env_log)!r}).write_text(json.dumps({{k: v for k, v in env.items() if k.startswith(("MC_SPINE_", "FSEED_", "FEATURE_"))}}))
-n = int(env["MC_SPINE_WG_DUMP_N"])
+Path({str(env_log)!r}).write_text(json.dumps({{k: v for k, v in env.items() if k.startswith(("MEGU_", "FSEED_", "FEATURE_"))}}))
+n = int(env["MEGU_WG_DUMP_N"])
 chunk_cells = 2 * 4096
 grid = [0] * (n * n * chunk_cells)
 # Match (0,0) stone and mismatch (1,0) stone vs native granite
 grid[0 * chunk_cells + 4 * 256 + 0] = {stone}
 grid[1 * chunk_cells + 4 * 256 + 0] = {stone}
-Path(env["MC_SPINE_WG_DUMP"]).write_bytes(struct.pack(f"<{{len(grid)}}I", *grid))
-if "MC_SPINE_WG_DUMP_HM" in env:
+Path(env["MEGU_WG_DUMP"]).write_bytes(struct.pack(f"<{{len(grid)}}I", *grid))
+if "MEGU_WG_DUMP_HM" in env:
     hm = [-64] * (n * n * 256)
     hm[0] = -59  # matches (0,0) top + 1
-    Path(env["MC_SPINE_WG_DUMP_HM"]).write_bytes(struct.pack(f"<{{len(hm)}}i", *hm))
-if "MC_SPINE_WG_DUMP_CANON" in env:
-    Path(env["MC_SPINE_WG_DUMP_CANON"]).write_text("# chunk 0,0 min_y -64 height 32 cells 0\\n")
+    Path(env["MEGU_WG_DUMP_HM"]).write_bytes(struct.pack(f"<{{len(hm)}}i", *hm))
+if "MEGU_WG_DUMP_CANON" in env:
+    Path(env["MEGU_WG_DUMP_CANON"]).write_text("# chunk 0,0 min_y -64 height 32 cells 0\\n")
 ''')
             fake_bin.chmod(0o755)
 
             out_dir = tmp_path / "artifacts"
             json_out = tmp_path / "report.json"
 
-            # Pollute caller env with stale MC_SPINE_* / FSEED_* vars to verify stripping.
-            with patch.dict(os.environ, {"MC_SPINE_NOFEAT": "1", "FSEED_ARM": "0,0,0,0", "FEATURE_TRACE": "1"}), \
+            # Pollute caller env with stale MEGU_* / FSEED_* vars to verify stripping.
+            with patch.dict(os.environ, {"MEGU_NOFEAT": "1", "FSEED_ARM": "0,0,0,0", "FEATURE_TRACE": "1"}), \
                  patch.object(pt.chunk_triage, "read_chunk_nbt", side_effect=lambda w, cx, cz: chunks[(cx, cz)]):
                 out = io.StringIO()
                 with contextlib.redirect_stdout(out):
@@ -160,12 +160,12 @@ if "MC_SPINE_WG_DUMP_CANON" in env:
                     ])
             self.assertEqual(rc, 1)
             captured = json.loads(env_log.read_text())
-            self.assertEqual(captured["MC_SPINE_SEED"], "4242")
-            self.assertEqual(captured["MC_SPINE_WG_PROFILE"], "0")
-            self.assertEqual(captured["MC_SPINE_NOFEAT"], "1")
-            self.assertEqual(captured["MC_SPINE_NOCARVE"], "1")
-            self.assertEqual(captured["MC_SPINE_NOAQ"], "1")
-            self.assertEqual(captured["MC_SPINE_POP_ORDER_SCOPE"], "recorded")
+            self.assertEqual(captured["MEGU_SEED"], "4242")
+            self.assertEqual(captured["MEGU_WG_PROFILE"], "0")
+            self.assertEqual(captured["MEGU_NOFEAT"], "1")
+            self.assertEqual(captured["MEGU_NOCARVE"], "1")
+            self.assertEqual(captured["MEGU_NOAQ"], "1")
+            self.assertEqual(captured["MEGU_POP_ORDER_SCOPE"], "recorded")
             self.assertNotIn("FSEED_ARM", captured)
             self.assertNotIn("FEATURE_TRACE", captured)
             self.assertTrue((out_dir / "dump.bin").is_file())
@@ -195,16 +195,16 @@ if "MC_SPINE_WG_DUMP_CANON" in env:
                 "[w=Worker-Main-2] POP_CHUNK 0 0\n"
                 "[w=Worker-Main-1] POP_CHUNK 1 0\n"
             )
-            fake_bin = tmp_path / "fake-mc-spine"
+            fake_bin = tmp_path / "fake-megu"
             captured_order = tmp_path / "captured_order.txt"
             fake_bin.write_text(f'''#!{sys.executable}
 import os, struct
 from pathlib import Path
 env = dict(os.environ)
-Path({str(captured_order)!r}).write_text(Path(env["MC_SPINE_POP_ORDER"]).read_text())
+Path({str(captured_order)!r}).write_text(Path(env["MEGU_POP_ORDER"]).read_text())
 grid = [0] * (2 * 4096)
 grid[4 * 256 + 0] = {stone}
-Path(env["MC_SPINE_WG_DUMP"]).write_bytes(struct.pack(f"<{{len(grid)}}I", *grid))
+Path(env["MEGU_WG_DUMP"]).write_bytes(struct.pack(f"<{{len(grid)}}I", *grid))
 ''')
             fake_bin.chmod(0o755)
             out_dir = tmp_path / "out"
@@ -264,15 +264,15 @@ Path(env["MC_SPINE_WG_DUMP"]).write_bytes(struct.pack(f"<{{len(grid)}}I", *grid)
             # `DIM-1/`, not in the root's `region/`.
             (world / "DIM-1" / "region").mkdir(parents=True)
             env_log = tmp_path / "env.json"
-            fake_bin = tmp_path / "fake-mc-spine"
+            fake_bin = tmp_path / "fake-megu"
             # 8 sections of all-air for the 0..128 window the port generates.
             fake_bin.write_text(f'''#!{sys.executable}
 import json, os, struct
 from pathlib import Path
 env = dict(os.environ)
 Path({str(env_log)!r}).write_text(json.dumps(env))
-n = int(env["MC_SPINE_WG_DUMP_N"])
-Path(env["MC_SPINE_WG_DUMP"]).write_bytes(struct.pack(f"<{{n * 8 * 4096}}I", *([0] * (n * 8 * 4096))))
+n = int(env["MEGU_WG_DUMP_N"])
+Path(env["MEGU_WG_DUMP"]).write_bytes(struct.pack(f"<{{n * 8 * 4096}}I", *([0] * (n * 8 * 4096))))
 ''')
             fake_bin.chmod(0o755)
             with patch.object(pt.chunk_triage, "read_chunk_nbt", return_value=native):
@@ -285,10 +285,10 @@ Path(env["MC_SPINE_WG_DUMP"]).write_bytes(struct.pack(f"<{{n * 8 * 4096}}I", *([
                     ])
             self.assertEqual(rc, 0, out.getvalue())
             env = json.loads(env_log.read_text())
-            self.assertEqual(env["MC_SPINE_WG_PRESET"], "nether")
+            self.assertEqual(env["MEGU_WG_PRESET"], "nether")
             # full decoration: neither the feature layer nor the carver pass is skipped
-            self.assertNotIn("MC_SPINE_NOFEAT", env)
-            self.assertNotIn("MC_SPINE_NOCARVE", env)
+            self.assertNotIn("MEGU_NOFEAT", env)
+            self.assertNotIn("MEGU_NOCARVE", env)
 
             # A native block above the generated window must fail closed instead of
             # being silently left out of the comparison.

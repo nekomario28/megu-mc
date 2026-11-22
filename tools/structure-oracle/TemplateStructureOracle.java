@@ -1,4 +1,4 @@
-package dev.mcspine.tools;
+package dev.megu.tools;
 
 import com.google.gson.*;
 import com.mojang.serialization.Codec;
@@ -451,8 +451,8 @@ public final class TemplateStructureOracle {
     }
 
     static Class<?> buildBiomeSourceClass() throws Throwable {
-        var oracleDesc = java.lang.constant.ClassDesc.of("dev.mcspine.tools.TemplateStructureOracle");
-        var thisDesc = java.lang.constant.ClassDesc.of("dev.mcspine.tools.GenBiomeSource");
+        var oracleDesc = java.lang.constant.ClassDesc.of("dev.megu.tools.TemplateStructureOracle");
+        var thisDesc = java.lang.constant.ClassDesc.of("dev.megu.tools.GenBiomeSource");
         var deaDesc = java.lang.constant.ClassDesc.of("dea");
         var jmDesc = java.lang.constant.ClassDesc.of("jm");
         var defFDesc = java.lang.constant.ClassDesc.of("def$f");
@@ -494,8 +494,8 @@ public final class TemplateStructureOracle {
     }
 
     static Class<?> buildChunkGeneratorClass() throws Throwable {
-        var oracleDesc = java.lang.constant.ClassDesc.of("dev.mcspine.tools.TemplateStructureOracle");
-        var thisDesc = java.lang.constant.ClassDesc.of("dev.mcspine.tools.GenChunkGenerator");
+        var oracleDesc = java.lang.constant.ClassDesc.of("dev.megu.tools.TemplateStructureOracle");
+        var thisDesc = java.lang.constant.ClassDesc.of("dev.megu.tools.GenChunkGenerator");
         var duzDesc = java.lang.constant.ClassDesc.of("duz");
         var deaDesc = java.lang.constant.ClassDesc.of("dea");
         var ddiDesc = java.lang.constant.ClassDesc.of("ddi");

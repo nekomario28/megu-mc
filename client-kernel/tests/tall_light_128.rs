@@ -9,7 +9,7 @@
 use std::alloc::{GlobalAlloc, Layout, System};
 use std::cell::Cell;
 
-use mc_spine_kernel::{Error, LightEdit, LightEngine, LightFact, LightKind, LightMasksMultiWord};
+use megu_kernel::{Error, LightEdit, LightEngine, LightFact, LightKind, LightMasksMultiWord};
 
 struct CountingAlloc;
 

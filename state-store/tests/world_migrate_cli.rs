@@ -1,10 +1,10 @@
 // SPDX-License-Identifier: LGPL-3.0-or-later OR GPL-3.0-or-later OR AGPL-3.0-or-later
-//! End-to-end tests for the `mc-spine-world-migrate` binary: real process
+//! End-to-end tests for the `megu-world-migrate` binary: real process
 //! invocations against real files, asserting stdout content and exit codes
 //! (`0` success, `2` refused downgrade / bad args, `1` file errors).
 
-use mc_spine_core::version::TargetVersion;
-use mc_spine_state_store::{
+use megu_core::version::TargetVersion;
+use megu_state_store::{
     decode_snapshot, encode_data_value_to_nbt, encode_snapshot, gzip_encode_stored,
     inspect_level_dat, parse_data_json, spiral_order, AuditAction, AuditLog, AuditRecord,
     BlockCoord, ChunkCoord, DataValue, PregenShape, ServerContext,
@@ -14,7 +14,7 @@ use std::process::{Command, Output};
 use std::sync::atomic::{AtomicU64, Ordering};
 
 fn bin() -> PathBuf {
-    PathBuf::from(env!("CARGO_BIN_EXE_mc-spine-world-migrate"))
+    PathBuf::from(env!("CARGO_BIN_EXE_megu-world-migrate"))
 }
 
 static DIR_COUNTER: AtomicU64 = AtomicU64::new(0);
@@ -25,7 +25,7 @@ struct TestDir(PathBuf);
 impl TestDir {
     fn new(tag: &str) -> Self {
         let dir = std::env::temp_dir().join(format!(
-            "mc-spine-world-migrate-cli-{}-{}-{tag}",
+            "megu-world-migrate-cli-{}-{}-{tag}",
             std::process::id(),
             DIR_COUNTER.fetch_add(1, Ordering::Relaxed)
         ));
@@ -54,7 +54,7 @@ fn run(args: &[&str]) -> Output {
     Command::new(bin())
         .args(args)
         .output()
-        .expect("failed to launch mc-spine-world-migrate")
+        .expect("failed to launch megu-world-migrate")
 }
 
 fn code(out: &Output) -> i32 {
@@ -955,7 +955,7 @@ fn audit_query_rows_filters_and_json() {
     let m = doc.as_map().unwrap();
     assert_eq!(
         m["schema"],
-        DataValue::Str("mc-spine-audit-query/1".to_string())
+        DataValue::Str("megu-audit-query/1".to_string())
     );
     assert_eq!(m["total_records"], DataValue::Int(4));
     assert_eq!(m["truncated_tail_bytes"], DataValue::Int(0));
@@ -1178,7 +1178,7 @@ fn rollback_restores_pre_grief_blocks_and_preserves_target() {
     let m = doc.as_map().unwrap();
     assert_eq!(
         m["schema"],
-        DataValue::Str("mc-spine-rollback/1".to_string())
+        DataValue::Str("megu-rollback/1".to_string())
     );
     assert_eq!(m["rolled_back_blocks"], DataValue::Int(2));
     assert_eq!(m["target_version"], DataValue::Str("26.3".to_string()));
@@ -1316,7 +1316,7 @@ fn pregen_plan_square_circle_ticks_and_bad_args() {
     let m = doc.as_map().unwrap();
     assert_eq!(
         m["schema"],
-        DataValue::Str("mc-spine-pregen-plan/1".to_string())
+        DataValue::Str("megu-pregen-plan/1".to_string())
     );
     assert_eq!(m["shape"], DataValue::Str("square".to_string()));
     assert_eq!(m["total_chunks"], DataValue::Int(121));
@@ -1437,7 +1437,7 @@ fn pregen_run_square_and_circle_execute_the_spiral() {
     let m = doc.as_map().unwrap();
     assert_eq!(
         m["schema"],
-        DataValue::Str("mc-spine-pregen-run/1".to_string())
+        DataValue::Str("megu-pregen-run/1".to_string())
     );
     assert_eq!(m["shape"], DataValue::Str("square".to_string()));
     assert_eq!(m["radius_chunks"], DataValue::Int(5));
@@ -1568,6 +1568,6 @@ fn pregen_run_fails_closed_on_bad_args() {
     ] {
         let out = run(args);
         assert_eq!(code(&out), 2, "{args:?} -> {}", stdout(&out));
-        assert!(stderr(&out).starts_with("mc-spine-world-migrate:"), "{args:?}");
+        assert!(stderr(&out).starts_with("megu-world-migrate:"), "{args:?}");
     }
 }

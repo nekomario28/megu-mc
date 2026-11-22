@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: LGPL-3.0-or-later OR GPL-3.0-or-later OR AGPL-3.0-or-later
-//! Lane CORE-LAZY-ZIP tests for `mc_spine_core::zip_archive`: lazy index I/O
+//! Lane CORE-LAZY-ZIP tests for `megu_core::zip_archive`: lazy index I/O
 //! telemetry, 1-level Jar-in-Jar for NeoForge/Fabric layouts, ZIP64 handling,
 //! and fail-closed traversal/encryption/bomb rejection — all with a pure-std
 //! fixture writer so no external ZIP tooling or crates are needed.
@@ -8,7 +8,7 @@ use std::fs;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
-use mc_spine_core::zip_archive::{
+use megu_core::zip_archive::{
     inflate_raw_rfc1951, validate_entry_name, LazyZipIndex, ZipError, MAX_OGG_BYTES,
 };
 
@@ -16,7 +16,7 @@ static DIR_CTR: AtomicUsize = AtomicUsize::new(0);
 
 fn fresh_dir(tag: &str) -> PathBuf {
     let dir = std::env::temp_dir().join(format!(
-        "mcspine-lazyzip-{}-{tag}-{}",
+        "megu-lazyzip-{}-{tag}-{}",
         std::process::id(),
         DIR_CTR.fetch_add(1, Ordering::Relaxed)
     ));

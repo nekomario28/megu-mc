@@ -1,6 +1,6 @@
 // Compare actual SurfaceSystem.buildSurface on a synthetic stone/water column.
 // No server/world: a ProtoChunk is filled directly, then the real surface scan runs.
-package dev.mcspine.tools;
+package dev.megu.tools;
 import com.google.gson.*;
 import java.lang.reflect.*;
 import java.nio.file.*;

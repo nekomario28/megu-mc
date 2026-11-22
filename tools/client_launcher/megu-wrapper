@@ -1,0 +1,125 @@
+#!/usr/bin/env python3
+"""Prism Wrapper command: verify and exec the native client without a JVM."""
+
+import hashlib
+import os
+from pathlib import Path
+import re
+import shutil
+import sys
+
+
+WITH_VALUE = {
+    "-cp", "-classpath", "--class-path", "-p", "--module-path", "--upgrade-module-path",
+    "--add-modules", "--limit-modules", "--add-exports", "--add-opens", "--add-reads",
+    "--patch-module", "--enable-native-access", "--source", "-splash",
+}
+TOKEN_OPTIONS = {"--accessToken", "--clientToken", "--authToken", "--token"}
+
+
+def redact(message, arguments):
+    """Sanitize diagnostics, including tokens supplied as --key=value."""
+    secrets = []
+    for index, argument in enumerate(arguments):
+        key, equals, value = argument.partition("=")
+        if key in TOKEN_OPTIONS:
+            if not equals and index + 1 < len(arguments):
+                value = arguments[index + 1]
+            if value:
+                secrets.append(value)
+    for secret in sorted(secrets, key=len, reverse=True):
+        message = message.replace(secret, "<REDACTED>")
+    return re.sub(r'(?i)\bBearer\s+[^\s,;"\x27]+', "Bearer <REDACTED>", message)
+
+
+def game_arguments(argv):
+    if not argv:
+        raise ValueError("missing Java invocation")
+    executable = Path(argv[0]).name.lower()
+    if executable not in ("java", "java.exe", "javaw", "javaw.exe"):
+        raise ValueError("expected java executable as the first wrapper argument")
+    index = 1
+    while index < len(argv):
+        arg = argv[index]
+        if arg in ("-jar", "-m", "--module"):
+            if index + 1 >= len(argv):
+                raise ValueError(f"missing target after {arg}")
+            return argv[index + 2:]
+        if arg in WITH_VALUE:
+            if index + 1 >= len(argv):
+                raise ValueError(f"missing JVM option value after {arg}")
+            index += 2
+        elif arg.startswith("-"):
+            index += 1
+        elif arg.startswith("@"):
+            raise ValueError("Java @argument files are not supported in wrapper mode")
+        else:
+            return argv[index + 1:]
+    raise ValueError("missing Minecraft main class")
+
+
+def options(argv):
+    """Private flags precede the Java command and never reach the game."""
+    values = {}
+    index = 0
+    while index < len(argv):
+        key, equals, value = argv[index].partition("=")
+        if key not in ("--client-bin", "--client-sha256"):
+            break
+        if not equals:
+            if index + 1 >= len(argv):
+                raise ValueError(f"missing value for {key}")
+            value = argv[index + 1]
+            index += 1
+        if not value:
+            raise ValueError(f"empty value for {key}")
+        values[key] = value
+        index += 1
+    return values, argv[index:]
+
+
+def find_binary(configured):
+    if configured is not None:
+        candidate = Path(configured).expanduser()
+        return candidate if candidate.is_file() and os.access(candidate, os.X_OK) else None
+    local = Path(__file__).resolve().parent / "bin/megu-client"
+    if local.is_file() and os.access(local, os.X_OK):
+        return local
+    found = shutil.which("megu-client")
+    return Path(found) if found is not None else None
+
+
+def verify_sha256(path, expected):
+    if expected is None:
+        return
+    if not re.fullmatch(r"[0-9a-fA-F]{64}", expected):
+        raise ValueError("--client-sha256 must be 64 hexadecimal characters")
+    digest = hashlib.sha256()
+    with path.open("rb") as stream:
+        for block in iter(lambda: stream.read(1024 * 1024), b""):
+            digest.update(block)
+    if digest.hexdigest() != expected.lower():
+        raise ValueError("native client SHA-256 mismatch")
+
+
+def main():
+    arguments = sys.argv[1:]
+    try:
+        private, java = options(arguments)
+        game = game_arguments(java)
+        configured = private.get("--client-bin", os.environ.get("MEGU_CLIENT_BIN"))
+        binary = find_binary(configured)
+        if binary is None:
+            raise ValueError("native client not found or not executable "
+                             "(use --client-bin, MEGU_CLIENT_BIN, instance/bin or PATH)")
+        verify_sha256(binary, private.get("--client-sha256", os.environ.get("MEGU_CLIENT_SHA256")))
+        os.execv(str(binary.resolve()), [str(binary), *game])
+    except (ValueError, OSError) as error:
+        # Do not include OSError.filename or a command containing authentication data.
+        detail = error.strerror if isinstance(error, OSError) else str(error)
+        print("megu wrapper: " + redact(detail, arguments), file=sys.stderr)
+        return 2
+
+
+if __name__ == "__main__":
+    sys.exit(main())

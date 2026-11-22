@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: LGPL-3.0-or-later OR GPL-3.0-or-later OR AGPL-3.0-or-later
-//! `mc_spine_core::perf_kit` — reusable, zero-dependency performance
+//! `megu_core::perf_kit` — reusable, zero-dependency performance
 //! primitives for any block entity, modded machine, transport node, or
 //! persistence unit.
 //!

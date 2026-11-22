@@ -1,4 +1,4 @@
-package dev.mcspine.tools;
+package dev.megu.tools;
 
 import com.google.gson.JsonParser;
 import java.io.BufferedReader;

@@ -16,7 +16,7 @@ def main():
     with pinned_runtime(args.jar) as (work, cp, _):
         output = work/'nbt.tsv'
         run_probe(work, cp, ROOT/'tools/structure-oracle/NbtCodecOracle.java',
-                  'dev.mcspine.tools.NbtCodecOracle', output,
+                  'dev.megu.tools.NbtCodecOracle', output,
                   extra_sources=(ROOT/'tools/structure-oracle/StructureTemplateOracle.java',))
         actual = output.read_bytes()
     if args.write:

@@ -237,7 +237,7 @@ public record DimensionCheck(ResourceKey<Level> dimension) implements CustomPack
 """
 
 BRIDGE_RUNNER = """
-package net.mcspine.neoforge;
+package net.megu.neoforge;
 
 import java.lang.reflect.InvocationTargetException;
 import java.lang.reflect.Method;
@@ -384,7 +384,7 @@ public final class Unsupported {
 
 INTERNAL = """
 package fixture;
-import net.mcspine.neoforge.S4NetworkBridge;
+import net.megu.neoforge.S4NetworkBridge;
 import net.neoforged.fml.common.Mod;
 @Mod("nf5_fixture")
 public final class Internal {
@@ -471,7 +471,7 @@ class NeoForgeS4NetworkTests(unittest.TestCase):
         output = self.checked(
             "cargo", "test", "--offline", "--locked", "--features", "fabric-probe,neoforge-events",
             "java_compat::tests::s4_jni_fixture", "--", "--exact", "--nocapture", "--test-threads=1",
-            extra_env={"MC_SPINE_S4_FIXTURE": str(self.root)},
+            extra_env={"MEGU_S4_FIXTURE": str(self.root)},
         )
         self.assertIn("S4 targeted and broadcast payloads round-tripped", output)
         self.assertIn("S4 invalid, oversized and depth-five payloads rejected", output)
@@ -484,7 +484,7 @@ class NeoForgeS4NetworkTests(unittest.TestCase):
         source.write_text(BRIDGE_RUNNER)
         self.checked(JAVA / "bin/javac", "--release", "21", "-cp", self.classpath, "-d", self.root, source)
         classpath = os.pathsep.join([str(self.root), self.classpath])
-        self.checked(JAVA / "bin/java", "-cp", classpath, "net.mcspine.neoforge.BridgeCheck", self.root)
+        self.checked(JAVA / "bin/java", "-cp", classpath, "net.megu.neoforge.BridgeCheck", self.root)
 
 
 if __name__ == "__main__":

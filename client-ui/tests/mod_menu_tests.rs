@@ -6,12 +6,12 @@
 //! and a layout that must never overlap hit regions or rasterize blank at
 //! `640×360` through `3840×2160` in English and Japanese.
 
-use mc_spine_client_ui::draw::{rasterize_draw_list, UiCommand, UiRect};
-use mc_spine_client_ui::mod_menu::{
+use megu_client_ui::draw::{rasterize_draw_list, UiCommand, UiRect};
+use megu_client_ui::mod_menu::{
     ModAdaptationBadge, ModLoaderTag, ModMenuAction, ModMenuEntry, ModMenuFilter, ModMenuHitRegion,
     ModMenuSort, ModMenuState, ModMenuWidgetId, ModReloadBadge,
 };
-use mc_spine_client_ui::state::{GamepadButton, UiInputEvent, UiKey, UiLang};
+use megu_client_ui::state::{GamepadButton, UiInputEvent, UiKey, UiLang};
 
 const SIZES: [(u32, u32); 4] = [(640, 360), (1280, 720), (1920, 1080), (3840, 2160)];
 

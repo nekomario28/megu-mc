@@ -2,7 +2,7 @@
 """Hermetic unit tests for tools/perf_bench.py.
 
 No cargo, no release binary and no network: a tiny Python script stands in for
-``mc-spine``.  It writes a deterministic dump, prints a real-format ``[wgdump]``
+``megu``.  It writes a deterministic dump, prints a real-format ``[wgdump]``
 line, logs its invocation order, and emits the exact ``[m3]`` lines that
 ``worldgen::m3_report()`` produces.
 
@@ -58,27 +58,27 @@ M3_STDERR = """[m3] terrain_store_bound=512 jobs=5
 """
 
 FAKE_TEMPLATE = '''#!/usr/bin/env python3
-"""Stand-in for target/release/mc-spine: no Rust, no cargo, <1 ms."""
+"""Stand-in for target/release/megu: no Rust, no cargo, <1 ms."""
 import os, sys
 TAG = __TAG__
 log = os.environ.get("PERF_FAKE_LOG")
 arm = "full"
-if os.environ.get("MC_SPINE_NOFEAT"):
+if os.environ.get("MEGU_NOFEAT"):
     arm = "nofeat"
-    if os.environ.get("MC_SPINE_NOCARVE"):
+    if os.environ.get("MEGU_NOCARVE"):
         arm = "terrain"
-jobs = os.environ.get("MC_SPINE_GEN_JOBS", "?")
+jobs = os.environ.get("MEGU_GEN_JOBS", "?")
 if log:
     with open(log, "a", encoding="utf-8") as fh:
         fh.write("%s|%s|%s\\n" % (TAG, arm, jobs))
-n = int(os.environ.get("MC_SPINE_WG_DUMP_N", "8"))
+n = int(os.environ.get("MEGU_WG_DUMP_N", "8"))
 size = 64 * n * n
 data = bytes(((i * 31 + len(arm)) & 0xff) for i in range(size))
-with open(os.environ["MC_SPINE_WG_DUMP"], "wb") as fh:
+with open(os.environ["MEGU_WG_DUMP"], "wb") as fh:
     fh.write(data)
 dur = os.environ.get("PERF_FAKE_DUR_" + TAG, os.environ.get("PERF_FAKE_DUR", "1.500s"))
 sys.stderr.write("[wgdump] %d chunks -> dump.bin (%d bytes) in %s\\n" % (n * n, size, dur))
-if os.environ.get("MC_SPINE_M3_PROFILE"):
+if os.environ.get("MEGU_M3_PROFILE"):
     sys.stderr.write(__M3_TEXT__)
 '''
 
@@ -140,7 +140,7 @@ class PerfBenchTest(unittest.TestCase):
         stderr = (
             "[wgprof] 8x8 chunks in 8.30s (129.7 ms/chunk)\n"
             "[wgprof] eval_c calls: 114688 (1792 per chunk)\n"
-            "[wgdump] 64 chunks -> /home/yuu/mc-spine/target/tmp/d.bin "
+            "[wgdump] 64 chunks -> /home/yuu/megu/target/tmp/d.bin "
             "(25165824 bytes) in 8.273123s\n"
         )
         parsed = pb.parse_wgdump(stderr)
@@ -422,9 +422,9 @@ class PerfBenchTest(unittest.TestCase):
 
         # --dry-run parses arguments and reports the plan; it exits 0 when
         # llvm-profdata is discoverable, otherwise with the actionable message.
-        proc = run(["--dry-run", "--out", "target/pgo/mc-spine", "--jobs", "2"])
+        proc = run(["--dry-run", "--out", "target/pgo/megu", "--jobs", "2"])
         if proc.returncode == 0:
-            self.assertIn("target/pgo/mc-spine", proc.stdout)
+            self.assertIn("target/pgo/megu", proc.stdout)
             self.assertIn("llvm-profdata", proc.stdout)
             self.assertIn("step 1 instrumented build", proc.stdout)
             self.assertIn("step 5", proc.stdout)

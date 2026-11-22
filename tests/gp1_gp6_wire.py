@@ -193,7 +193,7 @@ def piglin(client):
 
 
 def main(binary):
-    os.environ["MC_SPINE_ALLOW_PLAYER_ADMIN_COMMANDS"] = "1"
+    os.environ["MEGU_ALLOW_PLAYER_ADMIN_COMMANDS"] = "1"
     os.environ.setdefault("MC_PROBE_DEADLINE", "30")
     with local_server(binary) as game, MobClient(game) as client:
         client.login()
@@ -215,4 +215,4 @@ def main(binary):
 
 
 if __name__ == "__main__":
-    main(Path(sys.argv[1]).resolve() if len(sys.argv) > 1 else ROOT / "target/debug/mc-spine")
+    main(Path(sys.argv[1]).resolve() if len(sys.argv) > 1 else ROOT / "target/debug/megu")

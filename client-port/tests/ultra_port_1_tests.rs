@@ -5,7 +5,7 @@
 //! `[MEM-1]` `Uniform(Block)` section compression + distance eviction +
 //! post-upload opaque CPU-mesh release.
 
-use mc_spine_client_mesh::{
+use megu_client_mesh::{
     mesh_section, Block, ChunkUploadBudget, CompressedSection, Light, MeshCache, Quad, Section,
     SectionBlocks, SectionCoord, UploadBudget, UploadBudgetProfile, WorldState,
     HARD_FLOOR_1000FPS_MAX_UPLOADS_PER_FRAME, HARD_FLOOR_1000FPS_MAX_UPLOAD_BYTES_PER_FRAME,

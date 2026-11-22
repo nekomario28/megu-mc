@@ -2,7 +2,7 @@
 //
 // The server runs without it. On first boot a short, commented file is written next to
 // the world so an operator can see the few choices there are; every key in it is
-// optional. Environment variables (`MC_SPINE_*`) keep working and win over the file, so
+// optional. Environment variables (`MEGU_*`) keep working and win over the file, so
 // existing launch scripts behave exactly as before.
 //
 // Only a small TOML subset is read (tables, `key = value` with strings, integers,
@@ -14,12 +14,12 @@
 /// The file written when none exists. Short on purpose: anti-cheat thresholds are
 /// constants in code, derived from vanilla physics and each player's attributes, so
 /// the file only switches the optional protections on or off.
-const SERVER_CONFIG_DEFAULT_FILE: &str = r#"# mc-spine settings. Every key is optional; delete this file to get it back.
-# Environment variables (MC_SPINE_*) override anything set here.
+const SERVER_CONFIG_DEFAULT_FILE: &str = r#"# megu settings. Every key is optional; delete this file to get it back.
+# Environment variables (MEGU_*) override anything set here.
 
 [server]
 # port = 25565
-# motd = "mc-spine"
+# motd = "megu"
 # max_players = 20
 # The Minecraft release this server runs as: "1.21.1" (default) or "26.3".
 # target_version = "1.21.1"
@@ -236,28 +236,28 @@ fn server_config_parse_value(s: &str) -> Option<ServerConfigValue> {
 /// is listed first so it wins over `white-list` for the shared target variable, the
 /// same precedence Vanilla gives it.
 const SERVER_PROPERTIES_KEYS: &[(&str, &str)] = &[
-    ("server-port", "MC_SPINE_PORT"),
-    ("server-ip", "MC_SPINE_BIND_ADDR"),
-    ("motd", "MC_SPINE_MOTD"),
-    ("max-players", "MC_SPINE_MAX_PLAYERS"),
-    ("level-seed", "MC_SPINE_SEED"),
-    ("network-compression-threshold", "MC_SPINE_COMPRESSION_THRESHOLD"),
-    ("enforce-whitelist", "MC_SPINE_WHITELIST_ENABLED"),
-    ("white-list", "MC_SPINE_WHITELIST_ENABLED"),
-    ("difficulty", "MC_SPINE_DIFFICULTY"),
-    ("gamemode", "MC_SPINE_DEFAULT_GAMEMODE"),
-    ("view-distance", "MC_SPINE_VIEW_DISTANCE"),
-    ("simulation-distance", "MC_SPINE_SIMULATION_DISTANCE"),
-    ("rcon.port", "MC_SPINE_RCON_PORT"),
-    ("rcon.password", "MC_SPINE_RCON_PASSWORD"),
-    // The listener actually reads `MC_SPINE_RCON_PASS`; the properties layer feeds
+    ("server-port", "MEGU_PORT"),
+    ("server-ip", "MEGU_BIND_ADDR"),
+    ("motd", "MEGU_MOTD"),
+    ("max-players", "MEGU_MAX_PLAYERS"),
+    ("level-seed", "MEGU_SEED"),
+    ("network-compression-threshold", "MEGU_COMPRESSION_THRESHOLD"),
+    ("enforce-whitelist", "MEGU_WHITELIST_ENABLED"),
+    ("white-list", "MEGU_WHITELIST_ENABLED"),
+    ("difficulty", "MEGU_DIFFICULTY"),
+    ("gamemode", "MEGU_DEFAULT_GAMEMODE"),
+    ("view-distance", "MEGU_VIEW_DISTANCE"),
+    ("simulation-distance", "MEGU_SIMULATION_DISTANCE"),
+    ("rcon.port", "MEGU_RCON_PORT"),
+    ("rcon.password", "MEGU_RCON_PASSWORD"),
+    // The listener actually reads `MEGU_RCON_PASS`; the properties layer feeds
     // both so a Vanilla file's `rcon.password` takes effect, not just parses.
-    ("rcon.password", "MC_SPINE_RCON_PASS"),
-    ("player-idle-timeout", "MC_SPINE_IDLE_TIMEOUT_SECS"),
-    ("op-permission-level", "MC_SPINE_OP_PERMISSION_LEVEL"),
-    ("pvp", "MC_SPINE_PVP"),
-    ("allow-flight", "MC_SPINE_ALLOW_FLIGHT"),
-    ("online-mode", "MC_SPINE_ONLINE_MODE"),
+    ("rcon.password", "MEGU_RCON_PASS"),
+    ("player-idle-timeout", "MEGU_IDLE_TIMEOUT_SECS"),
+    ("op-permission-level", "MEGU_OP_PERMISSION_LEVEL"),
+    ("pvp", "MEGU_PVP"),
+    ("allow-flight", "MEGU_ALLOW_FLIGHT"),
+    ("online-mode", "MEGU_ONLINE_MODE"),
 ];
 
 /// Java `.properties` escape sequences. `\n`, `\t`, `\r`, `\f` and `\uXXXX` produce
@@ -330,7 +330,7 @@ fn server_properties_parse(text: &str) -> BTreeMap<String, String> {
 }
 
 /// `server.properties` lives next to the `server.toml` in use (the working directory
-/// for the default `server.toml`, the custom file's directory under `MC_SPINE_CONFIG`).
+/// for the default `server.toml`, the custom file's directory under `MEGU_CONFIG`).
 fn server_properties_path(config_path: &std::path::Path) -> std::path::PathBuf {
     config_path
         .parent()
@@ -354,7 +354,7 @@ fn server_properties_read(path: &std::path::Path) -> Option<BTreeMap<String, Str
 
 /// Vanilla keys as `(env var, value)` for every variable not already set. Values
 /// needing a unit change are converted here (`player-idle-timeout` is minutes,
-/// `MC_SPINE_IDLE_TIMEOUT_SECS` is seconds); `op-permission-level` is clamped to
+/// `MEGU_IDLE_TIMEOUT_SECS` is seconds); `op-permission-level` is clamped to
 /// Vanilla's `1..=4` range. Empty values are skipped: Vanilla writes e.g.
 /// `server-ip=` to mean "unset".
 fn server_properties_env(
@@ -396,37 +396,37 @@ fn server_properties_env(
 /// `[server]` keys and the environment variable each one stands for. The file only
 /// fills a variable that is not already set, so the environment keeps priority.
 const SERVER_CONFIG_KEYS: &[(&str, &str)] = &[
-    ("port", "MC_SPINE_PORT"),
-    ("bind_addr", "MC_SPINE_BIND_ADDR"),
-    ("motd", "MC_SPINE_MOTD"),
-    ("max_players", "MC_SPINE_MAX_PLAYERS"),
-    ("seed", "MC_SPINE_SEED"),
-    ("compression_threshold", "MC_SPINE_COMPRESSION_THRESHOLD"),
-    ("allowlist", "MC_SPINE_ALLOWLIST"),
-    ("idle_timeout_secs", "MC_SPINE_IDLE_TIMEOUT_SECS"),
-    ("login_timeout_secs", "MC_SPINE_LOGIN_TIMEOUT_SECS"),
-    ("backup_interval_secs", "MC_SPINE_BACKUP_INTERVAL_SECS"),
-    ("max_conn_per_ip", "MC_SPINE_MAX_CONN_PER_IP"),
-    ("resource_pack_url", "MC_SPINE_RESOURCE_PACK_URL"),
-    ("resource_pack_required", "MC_SPINE_RESOURCE_PACK_REQUIRED"),
-    ("rcon_port", "MC_SPINE_RCON_PORT"),
+    ("port", "MEGU_PORT"),
+    ("bind_addr", "MEGU_BIND_ADDR"),
+    ("motd", "MEGU_MOTD"),
+    ("max_players", "MEGU_MAX_PLAYERS"),
+    ("seed", "MEGU_SEED"),
+    ("compression_threshold", "MEGU_COMPRESSION_THRESHOLD"),
+    ("allowlist", "MEGU_ALLOWLIST"),
+    ("idle_timeout_secs", "MEGU_IDLE_TIMEOUT_SECS"),
+    ("login_timeout_secs", "MEGU_LOGIN_TIMEOUT_SECS"),
+    ("backup_interval_secs", "MEGU_BACKUP_INTERVAL_SECS"),
+    ("max_conn_per_ip", "MEGU_MAX_CONN_PER_IP"),
+    ("resource_pack_url", "MEGU_RESOURCE_PACK_URL"),
+    ("resource_pack_required", "MEGU_RESOURCE_PACK_REQUIRED"),
+    ("rcon_port", "MEGU_RCON_PORT"),
     // Reliability / ops / multi-version keys read by `RuntimeOpsConfig`. Keeping
     // them in the shared table means the boot export reaches the consumers that
-    // already read the variable directly (`MC_SPINE_VERSION_DIR` in
-    // block_registry, `MC_SPINE_TARGET_VERSION`/`MC_SPINE_MC_VERSION` in
+    // already read the variable directly (`MEGU_VERSION_DIR` in
+    // block_registry, `MEGU_TARGET_VERSION`/`MEGU_MC_VERSION` in
     // save_v2). `target_version` is the canonical Two-Target knob;
     // `target_mc_version` is the pre-Two-Target spelling kept so existing files
     // keep working.
-    ("online_mode", "MC_SPINE_ONLINE_MODE"),
-    ("velocity_forwarding", "MC_SPINE_VELOCITY_FORWARDING"),
-    ("velocity_forwarding_secret", "MC_SPINE_VELOCITY_SECRET"),
-    ("autosave_interval_secs", "MC_SPINE_AUTOSAVE_SECS"),
-    ("backup_max_keep", "MC_SPINE_BACKUP_MAX_KEEP"),
-    ("lan_broadcast", "MC_SPINE_LAN_BROADCAST"),
-    ("auto_load_balance", "MC_SPINE_AUTO_LOAD_BALANCE"),
-    ("target_version", "MC_SPINE_TARGET_VERSION"),
-    ("target_mc_version", "MC_SPINE_MC_VERSION"),
-    ("version_pack_dir", "MC_SPINE_VERSION_DIR"),
+    ("online_mode", "MEGU_ONLINE_MODE"),
+    ("velocity_forwarding", "MEGU_VELOCITY_FORWARDING"),
+    ("velocity_forwarding_secret", "MEGU_VELOCITY_SECRET"),
+    ("autosave_interval_secs", "MEGU_AUTOSAVE_SECS"),
+    ("backup_max_keep", "MEGU_BACKUP_MAX_KEEP"),
+    ("lan_broadcast", "MEGU_LAN_BROADCAST"),
+    ("auto_load_balance", "MEGU_AUTO_LOAD_BALANCE"),
+    ("target_version", "MEGU_TARGET_VERSION"),
+    ("target_mc_version", "MEGU_MC_VERSION"),
+    ("version_pack_dir", "MEGU_VERSION_DIR"),
 ];
 
 /// `[anticheat]` keys: the ones in the default file, then old ones that still work
@@ -445,10 +445,10 @@ const SERVER_CONFIG_ANTICHEAT_KEYS: &[&str] = &[
     "anti_xray",
 ];
 
-/// The file in use: `MC_SPINE_CONFIG`, else `server.toml` in the working directory
+/// The file in use: `MEGU_CONFIG`, else `server.toml` in the working directory
 /// (where the world files live).
 fn server_config_path() -> std::path::PathBuf {
-    std::env::var_os("MC_SPINE_CONFIG")
+    std::env::var_os("MEGU_CONFIG")
         .map(std::path::PathBuf::from)
         .unwrap_or_else(|| std::path::PathBuf::from("server.toml"))
 }
@@ -561,14 +561,14 @@ fn server_config_reread() -> Result<(ServerConfigDoc, Vec<String>), String> {
 //
 // The typed view of the `[server]` keys the reliability, operator-UX and
 // multi-version lanes read. Resolution is deliberately small: the file fills
-// what the environment leaves unset and `MC_SPINE_*` always wins, exactly like
+// what the environment leaves unset and `MEGU_*` always wins, exactly like
 // `AcConfig::from_doc`. A dropped-in vanilla `server.properties` reaches the
 // same variables through `server_config_boot` (`online-mode` is the only one
 // of these that has a vanilla key).
 
-/// The MC release the bundled data pack targets; `MC_SPINE_TARGET_VERSION` and
+/// The MC release the bundled data pack targets; `MEGU_TARGET_VERSION` and
 /// the `[server] target_version` key move it together (the legacy
-/// `MC_SPINE_MC_VERSION` / `target_mc_version` pair still fills it).
+/// `MEGU_MC_VERSION` / `target_mc_version` pair still fills it).
 pub(crate) const RUNTIME_OPS_DEFAULT_MC_VERSION: &str = "1.21.1";
 /// The two first-class MC releases this server can run as
 /// (`specs/multi-version-architecture.md`): the native `1.21.1` line and the
@@ -590,35 +590,35 @@ const BACKUP_MAX_KEEP_DEFAULT: usize = 5;
 #[derive(Clone, PartialEq)]
 pub(crate) struct RuntimeOpsConfig {
     /// Mojang session authentication (vanilla `online-mode`,
-    /// `MC_SPINE_ONLINE_MODE`). Off keeps the loopback test behaviour: no
+    /// `MEGU_ONLINE_MODE`). Off keeps the loopback test behaviour: no
     /// encryption request, offline UUIDs.
     pub(crate) online_mode: bool,
-    /// Velocity modern forwarding (`MC_SPINE_VELOCITY_FORWARDING`): the login
+    /// Velocity modern forwarding (`MEGU_VELOCITY_FORWARDING`): the login
     /// handshake trusts the signed `velocity:player_info` payload instead of a
     /// Mojang session lookup. Meaningful only with a secret.
     pub(crate) velocity_forwarding: bool,
     /// Shared secret Velocity signs forwarding data with
-    /// (`MC_SPINE_VELOCITY_SECRET`). Never printed: `Debug` and `summary()`
+    /// (`MEGU_VELOCITY_SECRET`). Never printed: `Debug` and `summary()`
     /// show `[REDACTED]`; the raw value leaves the struct only through
     /// `velocity_forwarding_secret()`.
     velocity_forwarding_secret: Option<String>,
     /// Autosave cadence for the background save worker
-    /// (`MC_SPINE_AUTOSAVE_SECS`), clamped to
+    /// (`MEGU_AUTOSAVE_SECS`), clamped to
     /// `AUTOSAVE_SECS_MIN..=AUTOSAVE_SECS_MAX`.
     pub(crate) autosave_interval_secs: u64,
-    /// Generations `rotate_world_backups` keeps (`MC_SPINE_BACKUP_MAX_KEEP`).
+    /// Generations `rotate_world_backups` keeps (`MEGU_BACKUP_MAX_KEEP`).
     pub(crate) backup_max_keep: usize,
-    /// Vanilla-style LAN broadcast announcements (`MC_SPINE_LAN_BROADCAST`) so
+    /// Vanilla-style LAN broadcast announcements (`MEGU_LAN_BROADCAST`) so
     /// the server appears in the client multiplayer list.
     pub(crate) lan_broadcast: bool,
-    /// `AutoLoadBalancer` tick smoothing (`MC_SPINE_AUTO_LOAD_BALANCE`). On
+    /// `AutoLoadBalancer` tick smoothing (`MEGU_AUTO_LOAD_BALANCE`). On
     /// unless an operator explicitly turns it off.
     pub(crate) auto_load_balance: bool,
     /// The MC release the active version pack describes
-    /// (`MC_SPINE_TARGET_VERSION` / `[server] target_version`, validated
+    /// (`MEGU_TARGET_VERSION` / `[server] target_version`, validated
     /// against `RUNTIME_OPS_TARGET_VERSIONS`).
     pub(crate) target_version: String,
-    /// Explicit version-pack directory (`MC_SPINE_VERSION_DIR`); unset means
+    /// Explicit version-pack directory (`MEGU_VERSION_DIR`); unset means
     /// the bundled tables.
     pub(crate) version_pack_dir: Option<String>,
     /// One line per value that had to be repaired, ignored or is incomplete,
@@ -749,8 +749,8 @@ fn ops_str(
 }
 
 /// The MC release the server runs as. Layers, highest first:
-/// `MC_SPINE_TARGET_VERSION`, `[server] target_version`, then the legacy pair
-/// `MC_SPINE_MC_VERSION` / `[server] target_mc_version`. A layer must name one
+/// `MEGU_TARGET_VERSION`, `[server] target_version`, then the legacy pair
+/// `MEGU_MC_VERSION` / `[server] target_mc_version`. A layer must name one
 /// of `RUNTIME_OPS_TARGET_VERSIONS`; an unrecognized value is noted and the
 /// next layer is tried, so a typo can never make the server claim a release it
 /// does not implement.
@@ -768,9 +768,9 @@ fn ops_target_version(
         None => None,
     };
     let layers = [
-        env("MC_SPINE_TARGET_VERSION"),
+        env("MEGU_TARGET_VERSION"),
         file_str("target_version"),
-        env("MC_SPINE_MC_VERSION"),
+        env("MEGU_MC_VERSION"),
         file_str("target_mc_version"),
     ];
     for raw in layers.into_iter().flatten() {
@@ -790,11 +790,11 @@ fn ops_target_version(
 
 impl RuntimeOpsConfig {
     /// `[server]` from the parsed file, then the environment on top:
-    /// `MC_SPINE_ONLINE_MODE`, `MC_SPINE_VELOCITY_FORWARDING`,
-    /// `MC_SPINE_VELOCITY_SECRET`, `MC_SPINE_AUTOSAVE_SECS`,
-    /// `MC_SPINE_BACKUP_MAX_KEEP`, `MC_SPINE_LAN_BROADCAST`,
-    /// `MC_SPINE_AUTO_LOAD_BALANCE`, `MC_SPINE_TARGET_VERSION` (and the legacy
-    /// `MC_SPINE_MC_VERSION`), `MC_SPINE_VERSION_DIR`.
+    /// `MEGU_ONLINE_MODE`, `MEGU_VELOCITY_FORWARDING`,
+    /// `MEGU_VELOCITY_SECRET`, `MEGU_AUTOSAVE_SECS`,
+    /// `MEGU_BACKUP_MAX_KEEP`, `MEGU_LAN_BROADCAST`,
+    /// `MEGU_AUTO_LOAD_BALANCE`, `MEGU_TARGET_VERSION` (and the legacy
+    /// `MEGU_MC_VERSION`), `MEGU_VERSION_DIR`.
     pub(crate) fn from_doc(
         doc: &ServerConfigDoc,
         env: impl Fn(&str) -> Option<String>,
@@ -803,11 +803,11 @@ impl RuntimeOpsConfig {
         let get = |k: &str| table.and_then(|t| t.get(k));
         let mut notes = Vec::new();
         let mut c = RuntimeOpsConfig {
-            online_mode: ops_bool(&mut notes, "online_mode", get("online_mode"), env("MC_SPINE_ONLINE_MODE"), false),
-            velocity_forwarding: ops_bool(&mut notes, "velocity_forwarding", get("velocity_forwarding"), env("MC_SPINE_VELOCITY_FORWARDING"), false),
-            velocity_forwarding_secret: ops_str(&mut notes, "velocity_forwarding_secret", get("velocity_forwarding_secret"), env("MC_SPINE_VELOCITY_SECRET")),
+            online_mode: ops_bool(&mut notes, "online_mode", get("online_mode"), env("MEGU_ONLINE_MODE"), false),
+            velocity_forwarding: ops_bool(&mut notes, "velocity_forwarding", get("velocity_forwarding"), env("MEGU_VELOCITY_FORWARDING"), false),
+            velocity_forwarding_secret: ops_str(&mut notes, "velocity_forwarding_secret", get("velocity_forwarding_secret"), env("MEGU_VELOCITY_SECRET")),
             autosave_interval_secs: {
-                let raw = ops_u64(&mut notes, "autosave_interval_secs", get("autosave_interval_secs"), env("MC_SPINE_AUTOSAVE_SECS"), AUTOSAVE_SECS_DEFAULT);
+                let raw = ops_u64(&mut notes, "autosave_interval_secs", get("autosave_interval_secs"), env("MEGU_AUTOSAVE_SECS"), AUTOSAVE_SECS_DEFAULT);
                 let clamped = raw.clamp(AUTOSAVE_SECS_MIN, AUTOSAVE_SECS_MAX);
                 if raw != clamped {
                     notes.push(format!(
@@ -817,21 +817,21 @@ impl RuntimeOpsConfig {
                 clamped
             },
             backup_max_keep: {
-                let raw = ops_u64(&mut notes, "backup_max_keep", get("backup_max_keep"), env("MC_SPINE_BACKUP_MAX_KEEP"), BACKUP_MAX_KEEP_DEFAULT as u64);
+                let raw = ops_u64(&mut notes, "backup_max_keep", get("backup_max_keep"), env("MEGU_BACKUP_MAX_KEEP"), BACKUP_MAX_KEEP_DEFAULT as u64);
                 usize::try_from(raw).unwrap_or_else(|_| {
                     notes.push(format!("backup_max_keep {raw} does not fit; using {BACKUP_MAX_KEEP_DEFAULT}"));
                     BACKUP_MAX_KEEP_DEFAULT
                 })
             },
-            lan_broadcast: ops_bool(&mut notes, "lan_broadcast", get("lan_broadcast"), env("MC_SPINE_LAN_BROADCAST"), false),
-            auto_load_balance: ops_bool(&mut notes, "auto_load_balance", get("auto_load_balance"), env("MC_SPINE_AUTO_LOAD_BALANCE"), true),
+            lan_broadcast: ops_bool(&mut notes, "lan_broadcast", get("lan_broadcast"), env("MEGU_LAN_BROADCAST"), false),
+            auto_load_balance: ops_bool(&mut notes, "auto_load_balance", get("auto_load_balance"), env("MEGU_AUTO_LOAD_BALANCE"), true),
             target_version: ops_target_version(&mut notes, |k| get(k).cloned(), |n| env(n)),
-            version_pack_dir: ops_str(&mut notes, "version_pack_dir", get("version_pack_dir"), env("MC_SPINE_VERSION_DIR")),
+            version_pack_dir: ops_str(&mut notes, "version_pack_dir", get("version_pack_dir"), env("MEGU_VERSION_DIR")),
             notes: Vec::new(),
         };
         if c.velocity_forwarding && c.velocity_forwarding_secret.is_none() {
             notes.push(
-                "velocity_forwarding is on but no secret is set (velocity_forwarding_secret / MC_SPINE_VELOCITY_SECRET); forwarding data cannot be verified"
+                "velocity_forwarding is on but no secret is set (velocity_forwarding_secret / MEGU_VELOCITY_SECRET); forwarding data cannot be verified"
                     .to_owned(),
             );
         }
@@ -952,12 +952,12 @@ mod server_config_tests {
     #[test]
     fn environment_wins_over_server_table() {
         let (doc, _) = server_config_parse("[server]\nport = 25570\nmotd = \"hi\"\nallowlist = [\"A\", \"B\"]\n");
-        let env = server_config_server_env(&doc, |name| name == "MC_SPINE_PORT");
+        let env = server_config_server_env(&doc, |name| name == "MEGU_PORT");
         assert_eq!(
             env,
             vec![
-                ("MC_SPINE_MOTD", "hi".to_owned()),
-                ("MC_SPINE_ALLOWLIST", "A,B".to_owned())
+                ("MEGU_MOTD", "hi".to_owned()),
+                ("MEGU_ALLOWLIST", "A,B".to_owned())
             ]
         );
     }
@@ -988,17 +988,17 @@ mod server_config_tests {
 
         // `is_set` stands for "a higher layer already decided this variable":
         // the environment wins over everything, `server.toml` over the properties.
-        let decided: HashSet<&str> = ["MC_SPINE_PORT", "MC_SPINE_MOTD"].into_iter().collect();
+        let decided: HashSet<&str> = ["MEGU_PORT", "MEGU_MOTD"].into_iter().collect();
         let env = server_properties_env(&props, |name| decided.contains(name));
         let got: BTreeMap<&str, String> = env.into_iter().collect();
-        assert!(!got.contains_key("MC_SPINE_PORT")); // server.toml won
-        assert!(!got.contains_key("MC_SPINE_MOTD")); // environment won
-        assert!(!got.contains_key("MC_SPINE_BIND_ADDR")); // `server-ip=` skipped
-        assert_eq!(got["MC_SPINE_MAX_PLAYERS"], "5");
-        assert_eq!(got["MC_SPINE_IDLE_TIMEOUT_SECS"], "600"); // minutes × 60
-        assert_eq!(got["MC_SPINE_OP_PERMISSION_LEVEL"], "4"); // clamped to 1..=4
+        assert!(!got.contains_key("MEGU_PORT")); // server.toml won
+        assert!(!got.contains_key("MEGU_MOTD")); // environment won
+        assert!(!got.contains_key("MEGU_BIND_ADDR")); // `server-ip=` skipped
+        assert_eq!(got["MEGU_MAX_PLAYERS"], "5");
+        assert_eq!(got["MEGU_IDLE_TIMEOUT_SECS"], "600"); // minutes × 60
+        assert_eq!(got["MEGU_OP_PERMISSION_LEVEL"], "4"); // clamped to 1..=4
         // `enforce-whitelist` wins over `white-list` for the shared variable.
-        assert_eq!(got["MC_SPINE_WHITELIST_ENABLED"], "false");
+        assert_eq!(got["MEGU_WHITELIST_ENABLED"], "false");
     }
 
     #[test]
@@ -1006,7 +1006,7 @@ mod server_config_tests {
         // Under the build tree, not /tmp.
         let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
             .join("target")
-            .join(format!("mc-spine-cfg-{}", std::process::id()));
+            .join(format!("megu-cfg-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("server.toml");
         let _ = std::fs::remove_file(&path);
@@ -1056,10 +1056,10 @@ mod server_config_tests {
         assert!(warnings.is_empty(), "{warnings:?}");
         assert!(server_config_unknown_keys(&doc).is_empty());
         let env = |name: &str| match name {
-            "MC_SPINE_ONLINE_MODE" => Some("0".to_owned()),
-            "MC_SPINE_AUTOSAVE_SECS" => Some("45".to_owned()),
-            "MC_SPINE_BACKUP_MAX_KEEP" => Some("8".to_owned()),
-            "MC_SPINE_TARGET_VERSION" => Some("1.21.1".to_owned()),
+            "MEGU_ONLINE_MODE" => Some("0".to_owned()),
+            "MEGU_AUTOSAVE_SECS" => Some("45".to_owned()),
+            "MEGU_BACKUP_MAX_KEEP" => Some("8".to_owned()),
+            "MEGU_TARGET_VERSION" => Some("1.21.1".to_owned()),
             _ => None,
         };
         let c = RuntimeOpsConfig::from_doc(&doc, env);
@@ -1080,16 +1080,16 @@ mod server_config_tests {
     #[test]
     fn runtime_ops_new_keys_export_through_the_env_layer() {
         // A `[server]` key with no environment override lands in the same
-        // `MC_SPINE_*` variable its env-reading consumers already watch.
+        // `MEGU_*` variable its env-reading consumers already watch.
         let (doc, _) = server_config_parse(
             "[server]\nonline_mode = true\ntarget_version = \"26.3\"\ntarget_mc_version = \"1.21.1\"\nversion_pack_dir = \"p\"\n",
         );
-        let env = server_config_server_env(&doc, |name| name == "MC_SPINE_ONLINE_MODE");
+        let env = server_config_server_env(&doc, |name| name == "MEGU_ONLINE_MODE");
         let got: BTreeMap<&str, String> = env.into_iter().collect();
-        assert!(!got.contains_key("MC_SPINE_ONLINE_MODE")); // env already won
-        assert_eq!(got["MC_SPINE_TARGET_VERSION"], "26.3");
-        assert_eq!(got["MC_SPINE_MC_VERSION"], "1.21.1");
-        assert_eq!(got["MC_SPINE_VERSION_DIR"], "p");
+        assert!(!got.contains_key("MEGU_ONLINE_MODE")); // env already won
+        assert_eq!(got["MEGU_TARGET_VERSION"], "26.3");
+        assert_eq!(got["MEGU_MC_VERSION"], "1.21.1");
+        assert_eq!(got["MEGU_VERSION_DIR"], "p");
         // And resolving the file sees the value the env layer would have set.
         let c = RuntimeOpsConfig::from_doc(&doc, |_| None);
         assert!(c.online_mode);
@@ -1100,10 +1100,10 @@ mod server_config_tests {
         let props = server_properties_parse("online-mode=true\nmotd=x\n");
         let env = server_properties_env(&props, |_| false);
         let got: BTreeMap<&str, String> = env.into_iter().collect();
-        assert_eq!(got["MC_SPINE_ONLINE_MODE"], "true");
+        assert_eq!(got["MEGU_ONLINE_MODE"], "true");
         // A higher layer that already decided the variable keeps it.
-        let env = server_properties_env(&props, |n| n == "MC_SPINE_ONLINE_MODE");
-        assert!(env.iter().all(|(name, _)| *name != "MC_SPINE_ONLINE_MODE"));
+        let env = server_properties_env(&props, |n| n == "MEGU_ONLINE_MODE");
+        assert!(env.iter().all(|(name, _)| *name != "MEGU_ONLINE_MODE"));
     }
 
     #[test]
@@ -1128,7 +1128,7 @@ mod server_config_tests {
             "[server]\nautosave_interval_secs = 2\nbackup_max_keep = \"many\"\nonline_mode = 7\n",
         );
         let env = |name: &str| match name {
-            "MC_SPINE_AUTOSAVE_SECS" => Some("notanum".to_owned()),
+            "MEGU_AUTOSAVE_SECS" => Some("notanum".to_owned()),
             _ => None,
         };
         let c = RuntimeOpsConfig::from_doc(&doc, env);
@@ -1166,9 +1166,9 @@ mod server_config_tests {
     fn runtime_ops_env_bool_spellings_and_empty_env_falls_back() {
         let doc = ServerConfigDoc::new();
         let env = |name: &str| match name {
-            "MC_SPINE_ONLINE_MODE" => Some("TRUE".to_owned()),
-            "MC_SPINE_LAN_BROADCAST" => Some(" yes ".to_owned()),
-            "MC_SPINE_AUTO_LOAD_BALANCE" => Some("".to_owned()),
+            "MEGU_ONLINE_MODE" => Some("TRUE".to_owned()),
+            "MEGU_LAN_BROADCAST" => Some(" yes ".to_owned()),
+            "MEGU_AUTO_LOAD_BALANCE" => Some("".to_owned()),
             _ => None,
         };
         let c = RuntimeOpsConfig::from_doc(&doc, env);
@@ -1191,16 +1191,16 @@ mod server_config_tests {
             assert_eq!(c.target_version, *version);
             assert!(c.notes.is_empty(), "{:?}", c.notes);
         }
-        // `MC_SPINE_TARGET_VERSION` beats the file.
+        // `MEGU_TARGET_VERSION` beats the file.
         let (doc, _) = server_config_parse("[server]\ntarget_version = \"26.3\"\n");
-        let env = |name: &str| (name == "MC_SPINE_TARGET_VERSION").then(|| "1.21.1".to_owned());
+        let env = |name: &str| (name == "MEGU_TARGET_VERSION").then(|| "1.21.1".to_owned());
         let c = RuntimeOpsConfig::from_doc(&doc, env);
         assert_eq!(c.target_version, "1.21.1");
         assert!(c.notes.is_empty(), "{:?}", c.notes);
         // The canonical pair outranks the legacy one entirely.
         let env = |name: &str| match name {
-            "MC_SPINE_TARGET_VERSION" => Some("26.3".to_owned()),
-            "MC_SPINE_MC_VERSION" => Some("1.21.1".to_owned()),
+            "MEGU_TARGET_VERSION" => Some("26.3".to_owned()),
+            "MEGU_MC_VERSION" => Some("1.21.1".to_owned()),
             _ => None,
         };
         let c = RuntimeOpsConfig::from_doc(&doc, env);
@@ -1209,14 +1209,14 @@ mod server_config_tests {
 
     #[test]
     fn runtime_ops_target_version_legacy_pair_and_fail_closed() {
-        // The pre-Two-Target `target_mc_version` / `MC_SPINE_MC_VERSION` pair
+        // The pre-Two-Target `target_mc_version` / `MEGU_MC_VERSION` pair
         // still fills the knob when the canonical one is unset.
         let (doc, _) = server_config_parse("[server]\ntarget_mc_version = \"26.3\"\n");
         let c = RuntimeOpsConfig::from_doc(&doc, |_| None);
         assert_eq!(c.target_version, "26.3");
         assert!(c.notes.is_empty(), "{:?}", c.notes);
         let c = RuntimeOpsConfig::from_doc(&doc, |name| {
-            (name == "MC_SPINE_MC_VERSION").then(|| "1.21.1".to_owned())
+            (name == "MEGU_MC_VERSION").then(|| "1.21.1".to_owned())
         });
         assert_eq!(c.target_version, "1.21.1");
         // An unknown file value is noted and fails closed to the default.
@@ -1230,14 +1230,14 @@ mod server_config_tests {
         // An invalid env value falls through to a valid file layer.
         let (doc, _) = server_config_parse("[server]\ntarget_version = \"26.3\"\n");
         let c = RuntimeOpsConfig::from_doc(&doc, |name| {
-            (name == "MC_SPINE_TARGET_VERSION").then(|| "beta".to_owned())
+            (name == "MEGU_TARGET_VERSION").then(|| "beta".to_owned())
         });
         assert_eq!(c.target_version, "26.3");
         assert!(c.notes.iter().any(|n| n.contains("beta")));
         // Every layer invalid means the default, with one note per bad value.
         let (doc, _) = server_config_parse("[server]\ntarget_mc_version = \"snapshot-25w99a\"\n");
         let c = RuntimeOpsConfig::from_doc(&doc, |name| {
-            (name == "MC_SPINE_MC_VERSION").then(|| "1.99".to_owned())
+            (name == "MEGU_MC_VERSION").then(|| "1.99".to_owned())
         });
         assert_eq!(c.target_version, "1.21.1");
         assert_eq!(

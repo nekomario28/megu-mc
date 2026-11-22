@@ -39,7 +39,7 @@ def main():
         parser.exit(2, "not the pinned 1.21.1 server jar: %s\n" % args.jar)
     with pinned_runtime(args.jar) as (work, classpath, inner):
         out = work / "scan.json"
-        run_probe(work, classpath, SOURCE, "dev.mcspine.tools.BuildSurfaceScanOracle", out)
+        run_probe(work, classpath, SOURCE, "dev.megu.tools.BuildSurfaceScanOracle", out)
         payload = json.loads(out.read_text())
     fixture = {"minecraft": "1.21.1", "server_sha1": JAR_SHA1,
                "inner_game_sha256": hashlib.sha256(inner).hexdigest(),

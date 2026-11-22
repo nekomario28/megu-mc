@@ -77,7 +77,7 @@ struct TestDir(PathBuf);
 impl TestDir {
     fn new(tag: &str) -> Self {
         let dir = std::env::temp_dir().join(format!(
-            "mc-spine-media-{}-{}-{tag}",
+            "megu-media-{}-{}-{tag}",
             std::process::id(),
             DIR_COUNTER.fetch_add(1, Ordering::Relaxed)
         ));

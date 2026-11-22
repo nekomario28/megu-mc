@@ -9,7 +9,7 @@
 // Bindings / vars (see website/wrangler.toml):
 //   env.CRASH_INDEX        KV namespace — required for dedup; also rate limits
 //   env.GITHUB_TOKEN       secret — fine-grained PAT, issues:write
-//   env.GITHUB_REPO        var    — "owner/name", default nekomario28/mc-spine
+//   env.GITHUB_REPO        var    — "owner/name", default nekomario28/megu-mc
 //   env.TURNSTILE_SECRET_KEY secret — required for production reports;
 //                          every kind must supply a valid turnstile_token
 //   env.ALLOW_DEV_UNVERIFIED_REPORTS var — set exactly '1' to allow local
@@ -24,7 +24,7 @@ const MAX_TRACKED = 8;
 const REPORT_SCHEMA = "megu-report/1";
 const FINGERPRINT_RE = /^MEGU-E-[0-9A-Fa-f]{8}$/;
 const GITHUB_API = "https://api.github.com";
-const DEFAULT_REPO = "nekomario28/mc-spine";
+const DEFAULT_REPO = "nekomario28/megu-mc";
 const TURNSTILE_VERIFY_URL =
   "https://challenges.cloudflare.com/turnstile/v0/siteverify";
 // Five reports per Cloudflare-provided client IP per ten-minute window.

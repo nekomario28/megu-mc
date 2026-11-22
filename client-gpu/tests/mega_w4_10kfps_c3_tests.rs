@@ -14,19 +14,19 @@
 //!   draw plus a 6-DOF contraption `SubWorldRenderEntry` whose pixels
 //!   move cleanly on pose-only updates.
 
-use mc_spine_client::protocol::{ClientPlayEvent, PlayEvent};
-use mc_spine_client_gpu::atmosphere::{AtmosphereParams, BiomeAtmosphereBlender, ChunkFadeTracker};
-use mc_spine_client_gpu::live_session::{KineticPartSpec, LiveSession};
-use mc_spine_client_gpu::renderer::{
+use megu_client::protocol::{ClientPlayEvent, PlayEvent};
+use megu_client_gpu::atmosphere::{AtmosphereParams, BiomeAtmosphereBlender, ChunkFadeTracker};
+use megu_client_gpu::live_session::{KineticPartSpec, LiveSession};
+use megu_client_gpu::renderer::{
     probe_adapters, request_gpu_device, ComposedFrame, GpuRenderer, OFFSCREEN_FORMAT,
 };
-use mc_spine_client_gpu::subworld_render::{box_mesh, quat_from_axis_angle, SubWorldTransform};
-use mc_spine_client_gpu::{select_present_mode, should_call_pre_present_notify, Camera};
-use mc_spine_client_mesh::vfx_engine::DynamicColoredLight;
-use mc_spine_client_mesh::RenderBackendPreference;
-use mc_spine_ui::draw::palette;
-use mc_spine_ui::draw::{tessellate_draw_list, UiCommand, UiDrawList, UiRect};
-use mc_spine_ui::state::HudState;
+use megu_client_gpu::subworld_render::{box_mesh, quat_from_axis_angle, SubWorldTransform};
+use megu_client_gpu::{select_present_mode, should_call_pre_present_notify, Camera};
+use megu_client_mesh::vfx_engine::DynamicColoredLight;
+use megu_client_mesh::RenderBackendPreference;
+use megu_ui::draw::palette;
+use megu_ui::draw::{tessellate_draw_list, UiCommand, UiDrawList, UiRect};
+use megu_ui::state::HudState;
 
 /// A headless renderer, or `None` when the host has no GPU adapter (the
 /// same graceful skip every client-gpu GPU test uses).

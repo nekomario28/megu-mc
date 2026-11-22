@@ -2,10 +2,10 @@
 //! Tests for the spatial subtitle HUD: dedup/capacity/TTL semantics,
 //! directional formatting, fade-out, and viewport/hotbar non-overlap.
 
-use mc_spine_client_ui::draw::{text_width, UiColor, UiCommand, UiDrawList, UiRect};
-use mc_spine_client_ui::layout::layout_subtitle_hud;
-use mc_spine_client_ui::state::{HudState, Screen, UiState};
-use mc_spine_client_ui::subtitle_hud::{
+use megu_client_ui::draw::{text_width, UiColor, UiCommand, UiDrawList, UiRect};
+use megu_client_ui::layout::layout_subtitle_hud;
+use megu_client_ui::state::{HudState, Screen, UiState};
+use megu_client_ui::subtitle_hud::{
     SubtitleArrow, SubtitleHudState, DEFAULT_TTL_SECS, MAX_SUBTITLE_ENTRIES,
 };
 
@@ -347,13 +347,13 @@ fn layout_subtitle_hud_never_overlaps_hud_chrome() {
     ] {
         let mut ui = hostile_ui(true);
         ui.hud.subtitles = vec![
-            mc_spine_client_ui::state::HudSubtitle {
+            megu_client_ui::state::HudSubtitle {
                 label: "Legacy zombie groans".into(),
-                direction: mc_spine_client_ui::state::SubtitleDirection::Left,
+                direction: megu_client_ui::state::SubtitleDirection::Left,
             },
-            mc_spine_client_ui::state::HudSubtitle {
+            megu_client_ui::state::HudSubtitle {
                 label: "Legacy creeper".into(),
-                direction: mc_spine_client_ui::state::SubtitleDirection::Behind,
+                direction: megu_client_ui::state::SubtitleDirection::Behind,
             },
         ];
         let subs = spatial_subtitles();

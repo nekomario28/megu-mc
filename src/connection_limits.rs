@@ -6,14 +6,14 @@
 //!
 //! | env | default | meaning |
 //! |---|---|---|
-//! | `MC_SPINE_ALLOW_PUBLIC_BIND` | off | required to bind any non-loopback address |
-//! | `MC_SPINE_MAX_CONN_PER_IP` | 4 (non-loopback only) | concurrent connections per remote IP, `0` = unlimited; when set explicitly it also applies to loopback |
-//! | `MC_SPINE_LOGIN_TIMEOUT_SECS` | 15 | wall-clock budget for handshake + login + configuration |
-//! | `MC_SPINE_IDLE_TIMEOUT_SECS` | 60 | play state: no complete packet for this long drops the client |
-//! | `MC_SPINE_ALLOWLIST` | unset (off) | comma/space separated player names and/or UUIDs permitted to log in |
-//! | `MC_SPINE_RCON_MAX_FAILURES` | 5 | failed RCON passwords from one IP before a lockout |
-//! | `MC_SPINE_RCON_LOCKOUT_SECS` | 30 | first lockout length; doubles per further failure, capped at 15 min |
-//! | `MC_SPINE_BACKUP_INTERVAL_SECS` | 600 | minimum age before an older world backup generation is rotated |
+//! | `MEGU_ALLOW_PUBLIC_BIND` | off | required to bind any non-loopback address |
+//! | `MEGU_MAX_CONN_PER_IP` | 4 (non-loopback only) | concurrent connections per remote IP, `0` = unlimited; when set explicitly it also applies to loopback |
+//! | `MEGU_LOGIN_TIMEOUT_SECS` | 15 | wall-clock budget for handshake + login + configuration |
+//! | `MEGU_IDLE_TIMEOUT_SECS` | 60 | play state: no complete packet for this long drops the client |
+//! | `MEGU_ALLOWLIST` | unset (off) | comma/space separated player names and/or UUIDs permitted to log in |
+//! | `MEGU_RCON_MAX_FAILURES` | 5 | failed RCON passwords from one IP before a lockout |
+//! | `MEGU_RCON_LOCKOUT_SECS` | 30 | first lockout length; doubles per further failure, capped at 15 min |
+//! | `MEGU_BACKUP_INTERVAL_SECS` | 600 | minimum age before an older world backup generation is rotated |
 
 use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::net::IpAddr;
@@ -34,16 +34,16 @@ pub(crate) fn set_compression(threshold: i32) -> Vec<u8> {
     payload
 }
 
-/// `MC_SPINE_COMPRESSION_THRESHOLD` resolution: unset means vanilla 1.21.1's
+/// `MEGU_COMPRESSION_THRESHOLD` resolution: unset means vanilla 1.21.1's
 /// 256-byte threshold, `0` or a negative value disables compression, and a
 /// positive value is the threshold negotiated with the client.
 pub(crate) fn compression_threshold_env(get: impl Fn(&str) -> Option<String>) -> i32 {
-    get("MC_SPINE_COMPRESSION_THRESHOLD")
+    get("MEGU_COMPRESSION_THRESHOLD")
         .and_then(|value| value.parse::<i32>().ok())
         .map_or(256, |value| if value <= 0 { -1 } else { value })
 }
 
-/// Zlib level for compressed frames: `MC_SPINE_ZLIB_LEVEL` clamped to
+/// Zlib level for compressed frames: `MEGU_ZLIB_LEVEL` clamped to
 /// `1..=9`, defaulting to 1 (`Compression::fast`). Level 1 is several times
 /// quicker than the old level-6 default and the per-chunk send latency win
 /// dwarfs the few-percent size cost on already-compressible chunk data.
@@ -56,7 +56,7 @@ fn zlib_level_from(value: Option<&str>) -> u32 {
 fn zlib_level() -> u32 {
     static LEVEL: OnceLock<u32> = OnceLock::new();
     *LEVEL.get_or_init(|| {
-        zlib_level_from(std::env::var("MC_SPINE_ZLIB_LEVEL").ok().as_deref())
+        zlib_level_from(std::env::var("MEGU_ZLIB_LEVEL").ok().as_deref())
     })
 }
 
@@ -1048,7 +1048,7 @@ pub(crate) fn is_loopback_bind(addr: &str) -> bool {
 }
 
 pub(crate) fn public_bind_allowed() -> bool {
-    std::env::var("MC_SPINE_ALLOW_PUBLIC_BIND").is_ok_and(|v| truthy(&v))
+    std::env::var("MEGU_ALLOW_PUBLIC_BIND").is_ok_and(|v| truthy(&v))
 }
 
 /// `Ok` for loopback, or for anything when the operator opted in explicitly.
@@ -1058,7 +1058,7 @@ pub(crate) fn check_bind(what: &str, addr: &str, allow_public: bool) -> Result<(
     }
     Err(format!(
         "refusing to bind {what} to non-loopback address {addr}: this server uses offline-mode \
-         identities (no authentication) and plaintext traffic. Set MC_SPINE_ALLOW_PUBLIC_BIND=1 \
+         identities (no authentication) and plaintext traffic. Set MEGU_ALLOW_PUBLIC_BIND=1 \
          only behind a firewall/private network you control."
     ))
 }
@@ -1067,7 +1067,7 @@ pub(crate) fn check_bind(what: &str, addr: &str, allow_public: bool) -> Result<(
 
 pub(crate) fn login_timeout() -> Duration {
     Duration::from_secs(
-        env_parse("MC_SPINE_LOGIN_TIMEOUT_SECS")
+        env_parse("MEGU_LOGIN_TIMEOUT_SECS")
             .unwrap_or(15)
             .max(1),
     )
@@ -1077,7 +1077,7 @@ static IDLE_TIMEOUT_SECS: OnceLock<AtomicU64> = OnceLock::new();
 
 fn idle_timeout_secs() -> &'static AtomicU64 {
     IDLE_TIMEOUT_SECS.get_or_init(|| {
-        AtomicU64::new(env_parse("MC_SPINE_IDLE_TIMEOUT_SECS").unwrap_or(60).max(1))
+        AtomicU64::new(env_parse("MEGU_IDLE_TIMEOUT_SECS").unwrap_or(60).max(1))
     })
 }
 
@@ -1091,7 +1091,7 @@ pub(crate) fn set_idle_timeout(timeout: Duration) {
 }
 
 pub(crate) fn backup_interval() -> Duration {
-    Duration::from_secs(env_parse("MC_SPINE_BACKUP_INTERVAL_SECS").unwrap_or(600))
+    Duration::from_secs(env_parse("MEGU_BACKUP_INTERVAL_SECS").unwrap_or(600))
 }
 
 // ------------------------------------------------------------ per-IP limiting
@@ -1153,9 +1153,9 @@ impl IpConnections {
 
 /// Per-IP limit for `ip`. Default 4, not applied to loopback (a developer's own
 /// bots, or a local reverse proxy where everyone is 127.0.0.1); setting
-/// `MC_SPINE_MAX_CONN_PER_IP` explicitly applies it everywhere. `0` = unlimited.
+/// `MEGU_MAX_CONN_PER_IP` explicitly applies it everywhere. `0` = unlimited.
 pub(crate) fn per_ip_limit(ip: IpAddr) -> usize {
-    per_ip_limit_with(ip, env_parse::<usize>("MC_SPINE_MAX_CONN_PER_IP"))
+    per_ip_limit_with(ip, env_parse::<usize>("MEGU_MAX_CONN_PER_IP"))
 }
 
 pub(crate) fn per_ip_limit_with(ip: IpAddr, explicit: Option<usize>) -> usize {
@@ -1276,11 +1276,11 @@ impl Allowlist {
     }
 }
 
-/// The configured allowlist (`MC_SPINE_ALLOWLIST`), read once. `None` = off.
+/// The configured allowlist (`MEGU_ALLOWLIST`), read once. `None` = off.
 pub(crate) fn allowlist() -> Option<&'static Allowlist> {
     static LIST: std::sync::OnceLock<Option<Allowlist>> = std::sync::OnceLock::new();
     LIST.get_or_init(|| {
-        let list = Allowlist::parse(&std::env::var("MC_SPINE_ALLOWLIST").unwrap_or_default());
+        let list = Allowlist::parse(&std::env::var("MEGU_ALLOWLIST").unwrap_or_default());
         if let Some(l) = &list {
             eprintln!(
                 "[security] login allowlist active: {} name(s), {} uuid(s)",
@@ -1499,11 +1499,11 @@ impl AuthThrottle {
 }
 
 pub(crate) fn rcon_max_failures() -> u32 {
-    env_parse("MC_SPINE_RCON_MAX_FAILURES").unwrap_or(5)
+    env_parse("MEGU_RCON_MAX_FAILURES").unwrap_or(5)
 }
 
 pub(crate) fn rcon_lockout() -> Duration {
-    Duration::from_secs(env_parse("MC_SPINE_RCON_LOCKOUT_SECS").unwrap_or(30).max(1))
+    Duration::from_secs(env_parse("MEGU_RCON_LOCKOUT_SECS").unwrap_or(30).max(1))
 }
 
 // ------------------------------------------------------------- tick supervision
@@ -1628,7 +1628,7 @@ mod tests {
             "",
         ] {
             let e = check_bind("game listener", bad, false).unwrap_err();
-            assert!(e.contains("MC_SPINE_ALLOW_PUBLIC_BIND"), "{bad}: {e}");
+            assert!(e.contains("MEGU_ALLOW_PUBLIC_BIND"), "{bad}: {e}");
             assert!(check_bind("x", bad, true).is_ok(), "{bad} with opt-in");
         }
         assert!(truthy("1") && truthy("TRUE") && !truthy("0") && !truthy(""));
@@ -2071,7 +2071,7 @@ mod tests {
         assert_eq!(zlib_level_from(Some("9")), 9);
         assert_eq!(zlib_level_from(Some("42")), 9, "clamped at the top");
         assert_eq!(zlib_level(), zlib_level_from(
-            std::env::var("MC_SPINE_ZLIB_LEVEL").ok().as_deref()
+            std::env::var("MEGU_ZLIB_LEVEL").ok().as_deref()
         ));
     }
 

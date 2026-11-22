@@ -5,7 +5,7 @@ Mirrors `mod-adapter-core/src/fallback.rs` (`plan_mod_startup`) and
 `specs/mod-compatibility/universal-mod-adapter.md`: every JAR, pure-data
 zip, or datapack directory in `--mods-dir` is classified into exactly one
 execution tier, then one of three fallback policies decides whether to
-launch `mc-spine` natively, quarantine unsupported mods, or delegate to a
+launch `megu` natively, quarantine unsupported mods, or delegate to a
 pinned upstream NeoForge 1.21.1 runtime.
 
   Tier 0 NativeFlagship   : mod_id in --flagship-mods (dedicated Rust adapter, zero JVM)
@@ -15,7 +15,7 @@ pinned upstream NeoForge 1.21.1 runtime.
   Tier 3 RequiresFallback : Java mod rejected by ShimCheck (Mixin/AT/missing API)
                             or any `data/*/dimension/*.json` declaring a custom
                             Java ChunkGenerator (CUSTOM_CHUNK_GENERATOR)
-  BuiltInSuperseded       : optimization mod whose function mc-spine already
+  BuiltInSuperseded       : optimization mod whose function megu already
                             implements natively (BUILTIN_SUPERSEDED_PERF_MODS);
                             checked before every other step, skipped
                             automatically, never ShimCheck-scanned, never
@@ -23,7 +23,7 @@ pinned upstream NeoForge 1.21.1 runtime.
 
 Clean-room note: matching a mod id against BUILTIN_SUPERSEDED_PERF_MODS only
 *skips loading* a user-supplied JAR — it copies, links, bundles, or derives
-nothing from that mod. All built-in optimizations in mc-spine, client-port,
+nothing from that mod. All built-in optimizations in megu, client-port,
 and client-app are 100% clean-room original Rust implementations.
 
 Dimension-adding mods shipping `data/<ns>/dimension_type/*.json` plus
@@ -52,7 +52,7 @@ Fallback policies when >= 1 Tier 3 mod exists:
                namespace exists in the saved world unless
                --force-drop-saved-blocks; otherwise stage active mods
                (plus optional data-only extracts with --quarantine-load-data)
-               and launch --mc-spine-cmd
+               and launch --megu-cmd
   delegate   : hand off to --neoforge-fallback-cmd with exact triggering
                mods + reason codes logged (0 Tier 3 mods => pure native,
                NeoForge is never started)
@@ -109,11 +109,11 @@ REASON_FLAGSHIP = "handled by flagship native Rust adapter"
 REASON_UNIVERSAL = "handled by zero-JVM universal adapter / offload profile"
 REASON_SHIM = "verified compatible with bounded S0-S4 JVM shim"
 REASON_FALLBACK_DEFAULT = "unsupported Mixin/AT or Minecraft API surface"
-REASON_SUPERSEDED = "already covered by mc-spine built-in optimizations"
+REASON_SUPERSEDED = "already covered by megu built-in optimizations"
 
 # Exact mirror of BUILTIN_SUPERSEDED_PERF_MODS in
 # mod-adapter-core/src/fallback.rs: mod ids whose optimization surface
-# mc-spine already implements natively (both Fabric and NeoForge/Forge ids,
+# megu already implements natively (both Fabric and NeoForge/Forge ids,
 # compared case-insensitively). These jars are skipped before ShimCheck so
 # their heavy Mixins can never force Tier 3 NeoForge fallback.
 BUILTIN_SUPERSEDED_PERF_MODS = frozenset({
@@ -179,14 +179,14 @@ VERSION_RANGE_LINE = re.compile(
 #       `1.21` means `1.21.x`, so `>1.21` is `>=1.22.0`.
 # ---------------------------------------------------------------------------
 
-# The Minecraft version this mc-spine runtime implements, mirroring
+# The Minecraft version this megu runtime implements, mirroring
 # McVersion::CURRENT; the default for --mc-version.
 DEFAULT_MC_VERSION = (1, 21, 1)
 
 _KEY_MAX = (1 << 64) - 1  # u64::MAX — unbounded interval end.
 _ASCII_WS = " \t\n\r\x0c"  # Rust is_ascii_whitespace: ' ' \t \n \x0C \r
 
-# pack_format / DataVersion tables covering the 1.20.4-1.21.5 line mc-spine
+# pack_format / DataVersion tables covering the 1.20.4-1.21.5 line megu
 # ships profiles for, plus latest vanilla 26.3 (mirrors
 # data_pack_format_for / data_version_for).
 _DATA_PACK_FORMATS = {
@@ -987,7 +987,7 @@ def discover_native_bundles(mods_dir, target):
                 doc = json.loads(path.read_text(encoding="utf-8"))
             except (OSError, UnicodeError, ValueError) as error:
                 raise LauncherError(f"invalid native bundle {path}: {error}")
-            if not isinstance(doc, dict) or doc.get("schema") != "mc-spine-mod-bundle/1":
+            if not isinstance(doc, dict) or doc.get("schema") != "megu-mod-bundle/1":
                 raise LauncherError(f"invalid native bundle {path}: unsupported schema")
             if set(doc) - allowed:
                 raise LauncherError(f"invalid native bundle {path}: unknown top-level keys")
@@ -1020,9 +1020,9 @@ def run_auto_adapt_scan(mods_dir):
     """Use the native bounded JAR scanner when installed; otherwise defer to
     the existing Python + ShimCheck classifier without assuming bytecode safety.
     """
-    native = ROOT / "target" / "debug" / "mc-spine-mod-check"
+    native = ROOT / "target" / "debug" / "megu-mod-check"
     checker = str(native) if native.is_file() and os.access(native, os.X_OK) else shutil.which(
-        "mc-spine-mod-check")
+        "megu-mod-check")
     if checker is None:
         return "python", {}
     try:
@@ -1031,11 +1031,11 @@ def run_auto_adapt_scan(mods_dir):
         if proc.returncode not in (0, 2):
             raise ValueError(proc.stderr.strip() or f"exit {proc.returncode}")
         report = json.loads(proc.stdout)
-        if report.get("schema") != "mc-spine-mods-dir-scan/1":
+        if report.get("schema") != "megu-mods-dir-scan/1":
             raise ValueError("unexpected report schema")
     except (OSError, ValueError) as error:
         return f"python (native checker unavailable: {error})", {}
-    return "mc-spine-mod-check", {
+    return "megu-mod-check", {
         item["jar"]: item for item in report.get("jars", [])
         if isinstance(item, dict) and isinstance(item.get("jar"), str)
     }
@@ -1492,17 +1492,17 @@ def _expand_command(command, mods_dir, staging_dir):
 
 def _child_env(plan, mods_dir, staging_dir, policy):
     env = dict(os.environ)
-    env["MC_SPINE_LAUNCHER_PLAN"] = plan["plan"]
-    env["MC_SPINE_FALLBACK_POLICY"] = policy
-    env["MC_SPINE_MODS_DIR"] = str(mods_dir.resolve())
-    env["MC_SPINE_STAGING_DIR"] = str(staging_dir)
-    env["MC_SPINE_NEEDS_BOUNDED_JVM"] = (
+    env["MEGU_LAUNCHER_PLAN"] = plan["plan"]
+    env["MEGU_FALLBACK_POLICY"] = policy
+    env["MEGU_MODS_DIR"] = str(mods_dir.resolve())
+    env["MEGU_STAGING_DIR"] = str(staging_dir)
+    env["MEGU_NEEDS_BOUNDED_JVM"] = (
         "true" if plan.get("needs_bounded_jvm") else "false")
-    env["MC_SPINE_QUARANTINED_MODS"] = ",".join(
+    env["MEGU_QUARANTINED_MODS"] = ",".join(
         a.mod_id for a in plan.get("quarantined_mods", []))
-    env["MC_SPINE_TIER3_MODS"] = ",".join(
+    env["MEGU_TIER3_MODS"] = ",".join(
         a.mod_id for a in plan.get("triggering_mods", []))
-    env["MC_SPINE_SUPERSEDED_PERF_MODS"] = ",".join(
+    env["MEGU_SUPERSEDED_PERF_MODS"] = ",".join(
         plan.get("superseded_perf_mods", []))
     return env
 
@@ -1517,7 +1517,7 @@ def _run_command(argv, env):
 
 def build_report(args, plan, launch):
     report = {
-        "schema": "mc-spine-mod-launcher/1",
+        "schema": "megu-mod-launcher/1",
         "mods_dir": str(args.mods_dir),
         "policy": args.fallback,
         "mc_version": plan.get("mc_version"),
@@ -1557,7 +1557,7 @@ def _print_table(assignments):
 
 
 def _print_human(report):
-    print("== mc-spine mod startup classification ==")
+    print("== megu mod startup classification ==")
     print(f"policy      : {report['policy']}")
     print(f"mc_version  : {report['mc_version']}")
     print(f"mods_dir    : {report['mods_dir']}")
@@ -2134,7 +2134,7 @@ class ModpackPreflightReport:
         if skipped:
             lines.append(
                 f"  - {len(skipped)} performance mod(s) skipped "
-                "automatically — mc-spine already has the same "
+                "automatically — megu already has the same "
                 "optimizations built in (clean-room): "
                 + ", ".join(skipped))
         client_only = self.client_only_names()
@@ -2157,7 +2157,7 @@ class ModpackPreflightReport:
         result = {
             READINESS_READY_NATIVE:
                 "ready — every file in this pack runs natively on "
-                "mc-spine.",
+                "megu.",
             READINESS_READY_WITH_AUTO_SKIPS:
                 "ready — redundant and client-only files are skipped "
                 "automatically; the rest runs natively.",
@@ -2173,7 +2173,7 @@ class ModpackPreflightReport:
 
     def as_dict(self):
         return {
-            "schema": "mc-spine-modpack-preflight/1",
+            "schema": "megu-modpack-preflight/1",
             "pack_name": self.pack_name,
             "pack_version": self.pack_version,
             "format": self.format,
@@ -2207,7 +2207,7 @@ def _classify_pack_entry(pack_file, superseded, flagship, profile):
         key = _normalized_mod_key(pack_file.candidate_mod_id)
         if key in superseded:
             return CLASS_SUPERSEDED_PERF_MOD, (
-                "redundant performance mod — mc-spine already ships an "
+                "redundant performance mod — megu already ships an "
                 "equivalent clean-room optimization")
         if key in flagship:
             return CLASS_NATIVE_FLAGSHIP, (
@@ -2318,8 +2318,8 @@ def main():
                         help="ShimCheck command for Java mods (default: tools/shimcheck.py)")
     parser.add_argument("--shimcheck-json", type=Path,
                         help="precomputed ShimCheck JSON report (offline/CI)")
-    parser.add_argument("--mc-spine-cmd", type=str,
-                        help="native mc-spine launch command ({mods_dir} {staging_dir} expand)")
+    parser.add_argument("--megu-cmd", type=str,
+                        help="native megu launch command ({mods_dir} {staging_dir} expand)")
     parser.add_argument("--neoforge-fallback-cmd", type=str,
                         help="pinned upstream NeoForge 1.21.1 server command")
     parser.add_argument("--staging-dir", type=Path, default=DEFAULT_STAGING,
@@ -2417,13 +2417,13 @@ def main():
                 active_mods_dir = stage_mods(plan, staging_dir, args.mods_dir, log)
             elif plan["quarantined_mods"]:
                 active_mods_dir = staging_dir / "mods"
-            command = _expand_command(args.mc_spine_cmd, active_mods_dir, staging_dir) \
-                if args.mc_spine_cmd else []
-            launch["kind"] = "mc_spine"
+            command = _expand_command(args.megu_cmd, active_mods_dir, staging_dir) \
+                if args.megu_cmd else []
+            launch["kind"] = "megu"
             launch["command"] = command
             if not command:
                 if not args.dry_run:
-                    log("mod-launcher: --mc-spine-cmd is required to launch natively")
+                    log("mod-launcher: --megu-cmd is required to launch natively")
                     exit_code = 2
             elif args.dry_run:
                 pass

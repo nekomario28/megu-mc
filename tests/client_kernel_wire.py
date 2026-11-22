@@ -48,8 +48,8 @@ from tools.client_kernel_wire.driver import BLOCKS, STONE, KernelClient, Movemen
 def verify_abi(kernel, include_dir, temporary_dir):
     incompatible = temporary_dir / "abi-v2.so"
     abi.compile_c(include_dir, incompatible,
-                  '#include "mc_spine_kernel.h"\n'
-                  'uint32_t mc_spine_kernel_abi_version(void) { return 2; }\n',
+                  '#include "megu_kernel.h"\n'
+                  'uint32_t megu_kernel_abi_version(void) { return 2; }\n',
                   "-shared", "-fPIC")
     try:
         abi.Kernel(incompatible)
@@ -331,15 +331,15 @@ def exercise_wire(game, kernel):
 def main():
     tmp = ROOT / "target/tmp"
     tmp.mkdir(parents=True, exist_ok=True)
-    os.environ.update(TMPDIR=str(tmp), MC_SPINE_WG="old", MC_SPINE_SEED="4242",
-                      MC_SPINE_ALLOW_PLAYER_ADMIN_COMMANDS="1")
+    os.environ.update(TMPDIR=str(tmp), MEGU_WG="old", MEGU_SEED="4242",
+                      MEGU_ALLOW_PLAYER_ADMIN_COMMANDS="1")
     for args, target in (([], ROOT / "target"),
                          (["--manifest-path", "client-kernel/Cargo.toml", "--release"],
                           ROOT / "client-kernel/target")):
         subprocess.run(["cargo", "build", "--offline", "--locked", *args], cwd=ROOT, check=True,
                        env=dict(os.environ, CARGO_TARGET_DIR=str(target)))
-    library = ROOT / "client-kernel/target/release/libmc_spine_kernel.so"
-    server = ROOT / "target/debug/mc-spine"
+    library = ROOT / "client-kernel/target/release/libmegu_kernel.so"
+    server = ROOT / "target/debug/megu"
     for artifact in (library, server):
         with artifact.open("rb") as stream:
             digest = hashlib.file_digest(stream, "sha256").hexdigest()

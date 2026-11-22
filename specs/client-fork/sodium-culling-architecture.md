@@ -91,7 +91,7 @@ sight. `compute` packs a closed-cell bitmap, then floods each open
 connected component with a stack-allocated 512-bit visited bitmap —
 allocation-free. `compute_hinted` honours the `uniform_air` /
 `sealed_solid` caller guarantees in O(1), matching the
-`MC_SPINE_MESH_COLUMN_*` column flags. Reachability is symmetric and
+`MEGU_MESH_COLUMN_*` column flags. Reachability is symmetric and
 `visible_from(enter)` returns the six-bit exit mask for O(1) graph
 traversal. Covered by unit tests in the same file (air = `ALL`, sealed =
 `NONE`, enclosed cavity, x=8 wall disconnecting only West↔East, single-file
@@ -145,7 +145,7 @@ seven-way *direction* bucketing: six face-direction buckets plus
 the draw mask — three back-facing buckets are skipped — and
 `DirectionBuckets::group`/`group_into` stably regroups quads into
 contiguous per-bucket ranges. The C ABI exposes this as
-`mc_spine_client_mesh_bucket_directions` in
+`megu_client_mesh_bucket_directions` in
 [client-port/src/ffi.rs](../../client-port/src/ffi.rs) (null output =
 query counts; `DirectionBuckets` reports offsets/counts). The "7-direction"
 invariant is unchanged: culling happens before greedy merging, never after.
@@ -173,7 +173,7 @@ keeping the `PackedVertex`/`Quad` contracts unchanged.
 Existing substrate this builds on:
 
 - `PackedVertex` — 16-byte vertex, 4 per quad, integer attributes — produced
-  by `mc_spine_client_mesh_pack_vertices` in
+  by `megu_client_mesh_pack_vertices` in
   [client-port/src/ffi.rs](../../client-port/src/ffi.rs) /
   [client-port/src/packed.rs](../../client-port/src/packed.rs); positions,
   state id, tint, AO, block/sky light, diagonal and UV extents are all
@@ -201,7 +201,7 @@ two schedulers in [client-port/src/cache.rs](../../client-port/src/cache.rs):
   (default 1 block, `DEFAULT_RESORT_THRESHOLD`) of the last committed sort
   it is a no-op; once crossed, every clean mesh has its translucent quads
   reordered back-to-front with the same `depth_key` + ascending-index
-  tie-break as `mc_spine_client_mesh_sort_translucent`, and only sections
+  tie-break as `megu_client_mesh_sort_translucent`, and only sections
   whose order actually changed are reported. Dirty sections are skipped —
   their rebuild replaces the order anyway.
 
@@ -273,8 +273,8 @@ python3 tests/culling_perf_gate.py --self-test
 python3 tests/culling_perf_gate.py            # builds client-port benches first
 
 # Wire-level client checks that exercise the same kernel through protocol 767
-python3 tests/client_mesh_wire.py target/debug/mc-spine   # when binary exists
-python3 tests/client_kernel_wire.py target/debug/mc-spine # when binary exists
+python3 tests/client_mesh_wire.py target/debug/megu   # when binary exists
+python3 tests/client_kernel_wire.py target/debug/megu # when binary exists
 
 # Repo gates
 bash tools/layers_check.sh

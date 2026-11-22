@@ -2,24 +2,24 @@
 //! `client-gpu` tests: pure-logic units plus a real `wgpu` headless
 //! probe/offscreen render that skips gracefully when no adapter exists.
 
-use mc_spine_client::shaders::{
+use megu_client::shaders::{
     validate_wgsl_module, WgslStage, TERRAIN_OPAQUE_WGSL, TERRAIN_TRANSLUCENT_WGSL,
 };
-use mc_spine_client_gpu::renderer::{
+use megu_client_gpu::renderer::{
     probe_adapters, request_gpu_device, section_geometry, GpuRenderer, RendererError,
     OFFSCREEN_FORMAT,
 };
-use mc_spine_client_gpu::{
+use megu_client_gpu::{
     aligned_copy_bytes_per_row, build_demo_scene, build_index_buffer, gpu_capabilities_for,
     gpu_shader_caps_for, gpu_vendor_for_id, is_translucent_quad, mat4_mul_vec4, negotiate_pipeline,
     pack_quads_to_vertices, parse_gpu_args, present_mode_for, split_opaque_translucent,
     translucent_quad_order, ui_rgba_len, wgpu_backends_for, Camera, GpuCliConfig, MoveInput,
     UI_BLIT_WGSL,
 };
-use mc_spine_client_mesh::ffi::PackedVertex;
-use mc_spine_client_mesh::{ActiveRenderBackend, GpuVendor, Layer, RenderBackendPreference};
-use mc_spine_ui::draw::rasterize_draw_list;
-use mc_spine_ui::state::{HudState, Screen, UiState};
+use megu_client_mesh::ffi::PackedVertex;
+use megu_client_mesh::{ActiveRenderBackend, GpuVendor, Layer, RenderBackendPreference};
+use megu_ui::draw::rasterize_draw_list;
+use megu_ui::state::{HudState, Screen, UiState};
 
 // ---------------------------------------------------------------------------
 // Camera math
@@ -312,7 +312,7 @@ fn features_and_vendor_map_to_gpu_caps() {
 
 #[test]
 fn minimal_caps_negotiate_classic() {
-    let caps = mc_spine_client_mesh::GpuCapabilities::software();
+    let caps = megu_client_mesh::GpuCapabilities::software();
     let res = negotiate_pipeline(RenderBackendPreference::Auto, &caps);
     assert_eq!(res.backend, ActiveRenderBackend::Classic);
     assert!(res.fallback_reason.is_some());

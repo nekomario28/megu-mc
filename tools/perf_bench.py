@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Reproducible 64-chunk worldgen benchmark and M1-M6 counter harness.
 
-Automates the ``MC_SPINE_WG_DUMP_N=8`` release dump measurements documented in
+Automates the ``MEGU_WG_DUMP_N=8`` release dump measurements documented in
 ``evidence/foundation/performance/README.md``.  No cargo and no Rust source
 build is involved: the harness drives an existing binary with the environment
 variables the binary already reads.
@@ -14,7 +14,7 @@ What it measures, per (arm, jobs) cell:
 * child CPU -- ``RUSAGE_CHILDREN`` user+sys delta (/usr/bin/time is absent here),
 * sha256 -- of the dump bytes, optionally checked against the recorded digests,
 * M1-M6 -- parsed from the exact ``[m3]`` lines ``m3_report()`` prints when
-  ``MC_SPINE_M3_PROFILE=1`` is set.
+  ``MEGU_M3_PROFILE=1`` is set.
 
 Runs are interleaved (round -> arm -> jobs -> binary) so host-load drift hits
 every arm equally.  With ``--compare-binary`` both binaries run in the same
@@ -51,16 +51,16 @@ from typing import Any, Dict, Iterable, List, Mapping, Optional, Sequence, Tuple
 # Constants that mirror the binary's env contract and the recorded digests.
 # ---------------------------------------------------------------------------
 
-DEFAULT_BINARY = "./target/release/mc-spine"
+DEFAULT_BINARY = "./target/release/megu"
 ARMS: Tuple[str, ...] = ("full", "nofeat", "terrain")
 
 ARM_ENV: Dict[str, Dict[str, str]] = {
     # full: features on, nothing disabled
     "full": {},
     # terrain + carvers
-    "nofeat": {"MC_SPINE_NOFEAT": "1"},
+    "nofeat": {"MEGU_NOFEAT": "1"},
     # terrain only
-    "terrain": {"MC_SPINE_NOFEAT": "1", "MC_SPINE_NOCARVE": "1"},
+    "terrain": {"MEGU_NOFEAT": "1", "MEGU_NOCARVE": "1"},
 }
 
 # sha256 of the 25,165,824-byte seed-0 N=8 Overworld block dump (see the
@@ -429,15 +429,15 @@ def run_one(
     """Run one dump, hash and delete it, and return timing/parsed metadata."""
     env = dict(base_env if base_env is not None else os.environ)
     env.update(ARM_ENV[arm])
-    env["MC_SPINE_WG_PROFILE"] = "0"
-    env["MC_SPINE_WG_DUMP_N"] = str(dump_n)
-    env["MC_SPINE_WG_DUMP_X"] = "0"
-    env["MC_SPINE_WG_DUMP_Z"] = "0"
-    env["MC_SPINE_GEN_JOBS"] = str(jobs)
+    env["MEGU_WG_PROFILE"] = "0"
+    env["MEGU_WG_DUMP_N"] = str(dump_n)
+    env["MEGU_WG_DUMP_X"] = "0"
+    env["MEGU_WG_DUMP_Z"] = "0"
+    env["MEGU_GEN_JOBS"] = str(jobs)
     if profile:
-        env["MC_SPINE_M3_PROFILE"] = "1"
+        env["MEGU_M3_PROFILE"] = "1"
     else:
-        env.pop("MC_SPINE_M3_PROFILE", None)
+        env.pop("MEGU_M3_PROFILE", None)
 
     fd, dump_path = tempfile.mkstemp(
         prefix="perf-%s-r%d-%s-j%d-" % (label, round_no, arm, jobs),
@@ -445,7 +445,7 @@ def run_one(
         dir=str(tmpdir),
     )
     os.close(fd)
-    env["MC_SPINE_WG_DUMP"] = dump_path
+    env["MEGU_WG_DUMP"] = dump_path
 
     cmd = list(wrap) + [binary]
     cpu_before = _child_cpu_seconds()
@@ -611,12 +611,12 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--binary", default=DEFAULT_BINARY, help="binary under test")
     parser.add_argument("--arms", default=",".join(ARMS), help="comma-separated subset of full,nofeat,terrain")
-    parser.add_argument("--jobs", default="1,5,8", help="comma-separated MC_SPINE_GEN_JOBS values")
+    parser.add_argument("--jobs", default="1,5,8", help="comma-separated MEGU_GEN_JOBS values")
     parser.add_argument("--rounds", type=int, default=3, help="interleaved rounds per (arm, jobs) pair")
     parser.add_argument("--dump-n", type=int, default=8, help="dump window N (N x N chunks)")
     parser.add_argument(
         "--profile-counters", action="store_true",
-        help="also run one pass per cell with MC_SPINE_M3_PROFILE=1 and parse M1-M6",
+        help="also run one pass per cell with MEGU_M3_PROFILE=1 and parse M1-M6",
     )
     parser.add_argument(
         "--compare-binary", metavar="PATH",

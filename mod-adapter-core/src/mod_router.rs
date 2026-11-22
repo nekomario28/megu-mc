@@ -194,7 +194,7 @@ pub fn inspect_jar_security_and_capabilities(
                 indicator: "embedded native library or executable member".to_string(),
             });
         }
-        if name == "mc-spine-bundle.json" {
+        if name == "megu-bundle.json" {
             signals.has_gameplay_content = true;
         }
         if let Some(rest) = name.strip_prefix("data/") {
@@ -312,7 +312,7 @@ pub fn inspect_jar_security_and_capabilities(
 /// Known IDs are considered only after the full static security scan —
 /// the archive is always fail-closed validated first — but a verified
 /// superseded id resolves its route before the *bytecode* quarantine
-/// verdict: `mc-spine` never executes a single byte of these
+/// verdict: `megu` never executes a single byte of these
 /// engine-replacement mods, so their constant pools can never run.
 /// Embedded native/executable *members* still quarantine regardless: a
 /// hostile archive renamed after a known mod must stay reported.

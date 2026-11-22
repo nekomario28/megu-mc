@@ -8,7 +8,7 @@
 
 use std::collections::BTreeSet;
 
-pub const MOTION_CHANNEL: &str = "mc-spine:motion_v1";
+pub const MOTION_CHANNEL: &str = "megu:motion_v1";
 pub const MOT1_MAGIC: [u8; 4] = *b"MOT1";
 pub const MOT1_PACKET_LEN: usize = 28;
 

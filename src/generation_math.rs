@@ -2152,7 +2152,7 @@ mod tests {
 
     #[test]
     fn draw_trace_separates_wrapped_and_raw_sources() {
-        const CHILD: &str = "MC_SPINE_DRAW_TRACE_CHILD";
+        const CHILD: &str = "MEGU_DRAW_TRACE_CHILD";
         if std::env::var_os(CHILD).is_some() {
             DTRACE.store(0, std::sync::atomic::Ordering::Relaxed);
             XTRACE_FEAT.store((1_i64 << 32) | 7, std::sync::atomic::Ordering::Relaxed);

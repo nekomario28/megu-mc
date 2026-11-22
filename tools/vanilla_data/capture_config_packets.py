@@ -82,7 +82,7 @@ def main():
         print(__doc__, file=sys.stderr)
         return 2
     jar, out = sys.argv[1], sys.argv[2]
-    work = tempfile.mkdtemp(prefix="mc-spine-config-capture-")
+    work = tempfile.mkdtemp(prefix="megu-config-capture-")
     proc = None
     try:
         s = socket.socket()

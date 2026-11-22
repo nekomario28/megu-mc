@@ -14,7 +14,7 @@
 //! exact mirror: it refuses documents newer than `5023`, reverses each fix,
 //! warns on 26.3-only entries it cannot represent, and stamps `3955`.
 
-use mc_spine_core::version::TargetVersion;
+use megu_core::version::TargetVersion;
 use std::collections::BTreeMap;
 use std::error::Error;
 use std::fmt;

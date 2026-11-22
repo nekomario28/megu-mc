@@ -24,14 +24,14 @@
 //! to a clean "incompatible" diagnostic instead of a startup crash.
 //!
 //! The `1.21.1` and `26.3` rows of the `pack_format` / `DataVersion` lookup
-//! table source their numbers from [`mc_spine_core::version::TargetVersion`],
+//! table source their numbers from [`megu_core::version::TargetVersion`],
 //! the single source of truth the whole crate DAG shares; historical rows
-//! (`1.20.4`-`1.21.5`, `1.21.0`) stay local since `mc-spine-core` only pins
+//! (`1.20.4`-`1.21.5`, `1.21.0`) stay local since `megu-core` only pins
 //! the two current targets.
 
 use std::fmt;
 
-use mc_spine_core::version::TargetVersion;
+use megu_core::version::TargetVersion;
 
 /// A Minecraft release version triple (`major.minor.patch`).
 ///
@@ -67,7 +67,7 @@ impl McVersion {
     /// first-class target, on the year-based `26.<minor>` scheme.
     pub const V26_3: Self = Self::new(26, 3, 0);
 
-    /// The Minecraft version this `mc-spine` runtime currently implements.
+    /// The Minecraft version this `megu` runtime currently implements.
     /// Used as the default target for version-aware mod classification; bump
     /// when the wire/runtime moves to a newer release line.
     pub const CURRENT: Self = Self::V1_21_1;
@@ -91,14 +91,14 @@ impl fmt::Display for McVersion {
 /// one of the two canonical targets (`1.21.1`, `26.3`).
 ///
 /// Other table rows (`1.20.4`-`1.21.5`, `1.21.0`) are real versions the range
-/// engine understands but they sit outside the `mc-spine-core` target set —
+/// engine understands but they sit outside the `megu-core` target set —
 /// they fail here instead of silently collapsing onto the nearest target.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct NoTargetVersion(pub McVersion);
 
 impl fmt::Display for NoTargetVersion {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "{} is not a canonical mc-spine target version", self.0)
+        write!(f, "{} is not a canonical megu target version", self.0)
     }
 }
 
@@ -550,7 +550,7 @@ pub fn check_mod_mc_version(target: McVersion, declared_range: &str) -> VersionC
 }
 
 /// `pack_format` datapack/data format number for `v` (`pack.mcmeta`
-/// `pack.pack_format`), covering the 1.20.4-1.21.5 line mc-spine ships
+/// `pack.pack_format`), covering the 1.20.4-1.21.5 line megu ships
 /// profiles for plus latest vanilla 26.3. `None` for versions outside the
 /// table.
 pub fn data_pack_format_for(v: McVersion) -> Option<u32> {
@@ -569,7 +569,7 @@ pub fn data_pack_format_for(v: McVersion) -> Option<u32> {
 
 /// `(major, minor)` data pack format tuple for `v` — the shape `pack.mcmeta`
 /// `min_format`/`max_format` use on the 26.x line. The two canonical targets
-/// report the tuple `mc-spine-core` pins: `1.21.1` -> `(48, 0)`, `26.3` ->
+/// report the tuple `megu-core` pins: `1.21.1` -> `(48, 0)`, `26.3` ->
 /// `(121, 0)`. Other scalar-`pack_format` versions report `(format, 0)`.
 /// `None` for versions outside the table.
 pub fn data_pack_format_tuple_for(v: McVersion) -> Option<(u32, u32)> {
@@ -1042,7 +1042,7 @@ mod tests {
     }
 
     #[test]
-    fn target_rows_come_from_mc_spine_core_meta() {
+    fn target_rows_come_from_megu_core_meta() {
         // The two canonical target rows of the pack-format / DataVersion
         // table must equal `TargetVersion::meta()` exactly — this is what
         // makes the core crate the single source of truth.
@@ -1091,7 +1091,7 @@ mod tests {
         assert_eq!(err.0, v(9, 9, 9));
         assert_eq!(
             err.to_string(),
-            "9.9.9 is not a canonical mc-spine target version"
+            "9.9.9 is not a canonical megu target version"
         );
     }
 }

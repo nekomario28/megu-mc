@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: LGPL-3.0-or-later OR GPL-3.0-or-later OR AGPL-3.0-or-later
-//! `mc-spine-core`: the foundational primitives every other mc-spine crate
+//! `megu-core`: the foundational primitives every other megu crate
 //! (`proto`, `state-store`, `server-files`, `worldgen`, `sim`, `client-*`)
 //! shares, in the same role `horizon-core` fills upstream.
 //!

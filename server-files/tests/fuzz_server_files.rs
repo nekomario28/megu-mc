@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: LGPL-3.0-or-later OR GPL-3.0-or-later OR AGPL-3.0-or-later
 //! Lane P6e: deterministic adversarial fuzz harness for every untrusted
-//! config/wire/cache decoder in `mc-spine-server-files`.
+//! config/wire/cache decoder in `megu-server-files`.
 //!
 //! Everything a hostile server directory, disk image, or connected client
 //! can carry — `server.properties` escapes, the shared JSON core behind
@@ -13,9 +13,9 @@
 //! bounded memory** on every byte string, valid or hostile.
 //!
 //! Determinism: all inputs derive from fixed-seed `splitmix64` PRNGs — no
-//! `SystemTime`, no OS entropy, no external crates. `MC_SPINE_FUZZ_ITERS`
+//! `SystemTime`, no OS entropy, no external crates. `MEGU_FUZZ_ITERS`
 //! scales the per-target iteration count (default `3_000`; operators crank
-//! `MC_SPINE_FUZZ_ITERS=100000` for a deep soak). A parser panic is caught,
+//! `MEGU_FUZZ_ITERS=100000` for a deep soak). A parser panic is caught,
 //! the offending input is hex-dumped for reproduction, and the panic is
 //! re-thrown so the test still fails.
 
@@ -23,26 +23,26 @@ use std::path::PathBuf;
 
 use std::panic::{catch_unwind, resume_unwind, AssertUnwindSafe};
 
-use mc_spine_server_files::claims::{
+use megu_server_files::claims::{
     ClaimChunkKey, ClaimsWorld, PartyRank, SubClaimId, CLAIMS_FILE, PARTIES_FILE,
 };
-use mc_spine_server_files::claims_wire::{
+use megu_server_files::claims_wire::{
     decode_claims_batch, decode_custom_payload_frame, encode_claims_batch,
     encode_custom_payload_frame, ClaimsWireBatch, ClaimsWireCell, ClaimsWireEntry,
-    WireOwnerKind, CHANNEL_FTBCHUNKS_CLAIMS_SYNC, CHANNEL_MC_SPINE_CLAIMS_V1,
+    WireOwnerKind, CHANNEL_FTBCHUNKS_CLAIMS_SYNC, CHANNEL_MEGU_CLAIMS_V1,
     CHANNEL_OPENPAC_CLAIMS_SYNC,
 };
-use mc_spine_server_files::eula::{check_eula, EULA_FILE};
-use mc_spine_server_files::json;
-use mc_spine_server_files::lists::{
+use megu_server_files::eula::{check_eula, EULA_FILE};
+use megu_server_files::json;
+use megu_server_files::lists::{
     normalize_ban_ip, offline_uuid, valid_player_name, BannedIps, BannedPlayers, OpsList,
     Whitelist,
 };
-use mc_spine_server_files::perf_cache::{
+use megu_server_files::perf_cache::{
     CacheLookup, StartupBinaryCache, StartupInputFile, CACHE_SCHEMA_VERSION, STARTUP_CACHE_MAGIC,
 };
-use mc_spine_server_files::properties::{PropertiesFile, ServerProperties};
-use mc_spine_server_files::usercache::UserCache;
+use megu_server_files::properties::{PropertiesFile, ServerProperties};
+use megu_server_files::usercache::UserCache;
 
 // ---------------------------------------------------------------------------
 // Deterministic PRNG (splitmix64) — the same finalizer the codebase uses.
@@ -80,9 +80,9 @@ impl Rng {
     }
 }
 
-/// Per-target iteration count: `MC_SPINE_FUZZ_ITERS` overrides, default 3000.
+/// Per-target iteration count: `MEGU_FUZZ_ITERS` overrides, default 3000.
 fn iters() -> usize {
-    std::env::var("MC_SPINE_FUZZ_ITERS")
+    std::env::var("MEGU_FUZZ_ITERS")
         .ok()
         .and_then(|v| v.parse().ok())
         .unwrap_or(3_000)
@@ -130,7 +130,7 @@ const DICTIONARY: &[&[u8]] = &[
     b"openpac_parties.json",
     b"openpartiesandclaims:claims_sync",
     b"ftbchunks:claims_sync",
-    b"mc-spine:claims_v1",
+    b"megu:claims_v1",
     b"ops.json",
     b"whitelist.json",
     b"banned-players.json",
@@ -377,7 +377,7 @@ fn fuzz_input(rng: &mut Rng, corpus: &[Vec<u8>], max_len: usize) -> Vec<u8> {
 
 fn scratch_dir(tag: &str) -> PathBuf {
     let dir = std::env::temp_dir().join(format!(
-        "mc-spine-fuzz-p6e-sf-{tag}-{}",
+        "megu-fuzz-p6e-sf-{tag}-{}",
         std::process::id()
     ));
     std::fs::create_dir_all(&dir).unwrap();
@@ -557,7 +557,7 @@ fn claims_wire_corpus() -> Vec<Vec<u8>> {
         for channel in [
             CHANNEL_OPENPAC_CLAIMS_SYNC,
             CHANNEL_FTBCHUNKS_CLAIMS_SYNC,
-            CHANNEL_MC_SPINE_CLAIMS_V1,
+            CHANNEL_MEGU_CLAIMS_V1,
         ] {
             if let Ok(frame) = encode_custom_payload_frame(channel, &batch) {
                 corpus.push(frame);

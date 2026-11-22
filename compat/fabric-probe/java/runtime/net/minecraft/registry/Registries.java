@@ -1,6 +1,6 @@
 package net.minecraft.registry;
 
-import net.mcspine.probe.RegistryStore;
+import net.megu.probe.RegistryStore;
 
 public final class Registries {
     private Registries() {}

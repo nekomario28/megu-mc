@@ -14,12 +14,12 @@
 
 use std::collections::BTreeMap;
 
-use mc_spine_client_mesh::space_sky_bridge::{
+use megu_client_mesh::space_sky_bridge::{
     build_3d_planet_mesh, DimensionAdaptationPolicy, PlanetSkyBody, SkyBodyPlacement,
     PLANET_TINT_ATMOSPHERE, PLANET_TINT_RELIEF, PLANET_TINT_RING, PLANET_TINT_SURFACE,
 };
-use mc_spine_client_mesh::vanilla_plus_3d::ExtrudedMesh;
-use mc_spine_client_mesh::vanilla_plus_nature::{
+use megu_client_mesh::vanilla_plus_3d::ExtrudedMesh;
+use megu_client_mesh::vanilla_plus_nature::{
     CloudLighting, VoxelCloudCell, FACE_NEG_X, FACE_NEG_Y, FACE_NEG_Z, FACE_POS_X, FACE_POS_Y,
     FACE_POS_Z,
 };
@@ -472,7 +472,7 @@ fn cloud_channel(v: f32) -> f32 {
 /// `alpha = CLOUD_RENDER_ALPHA` and an identity transform — cell positions
 /// are already world-space.
 ///
-/// [`generate_layered_voxel_clouds`]: mc_spine_client_mesh::vanilla_plus_nature::generate_layered_voxel_clouds
+/// [`generate_layered_voxel_clouds`]: megu_client_mesh::vanilla_plus_nature::generate_layered_voxel_clouds
 pub fn voxel_clouds_to_geometry(
     cells: &[VoxelCloudCell],
     lighting: &CloudLighting,

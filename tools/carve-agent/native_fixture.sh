@@ -19,7 +19,7 @@ ROOT="$(cd "$(dirname "$0")/../.." && pwd)"
 DIR="${1:?output directory}"; CX="${2:?chunk x}"; CZ="${3:?chunk z}"; N="${4:-3}"; MODE="${5:-frozen}"
 DIMENSION="${MC_FIXTURE_DIMENSION:-minecraft:overworld}"
 STAGE="${MC_FIXTURE_STAGE:-features}"
-SEED="${MC_SPINE_SEED:-0}"
+SEED="${MEGU_SEED:-0}"
 HEIGHT_WINDOW="${MC_FIXTURE_HEIGHT_WINDOW:-noise}"
 case "$DIMENSION" in
     minecraft:overworld) N_MINY=-64; N_HEIGHT=384; D_MINY=-64; D_HEIGHT=384; WORLD_REL=world ;;

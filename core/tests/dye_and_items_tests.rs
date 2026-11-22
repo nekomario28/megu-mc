@@ -9,7 +9,7 @@
 
 use std::collections::BTreeSet;
 
-use mc_spine_core::dye_and_items::*;
+use megu_core::dye_and_items::*;
 
 // ---------------------------------------------------------------------------
 // DyeColor

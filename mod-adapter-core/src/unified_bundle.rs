@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: LGPL-3.0-or-later OR GPL-3.0-or-later OR AGPL-3.0-or-later
 
 //! Shrink-to-generic unified declarative mod bundle
-//! (`mc-spine-mod-bundle/1`).
+//! (`megu-mod-bundle/1`).
 //!
 //! One pure-JSON schema onboards an entire dimension/biome/creature/QoL mod
 //! with **zero mod-specific Rust code**: a [`DeclarativeModBundle`] declares
@@ -24,7 +24,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 
-use mc_spine_core::id::ResourceLocation;
+use megu_core::id::ResourceLocation;
 
 use crate::creature_primitives::{
     CreatureSpec, MovementProfile, DEFAULT_BABY_GROWTH_TICKS, DEFAULT_BREED_COOLDOWN_TICKS,
@@ -44,7 +44,7 @@ use crate::world_extensions::{
 };
 
 /// The only `schema` value a [`DeclarativeModBundle`] document may carry.
-pub const BUNDLE_SCHEMA: &str = "mc-spine-mod-bundle/1";
+pub const BUNDLE_SCHEMA: &str = "megu-mod-bundle/1";
 
 /// Bound on each top-level section (`portals`, `progression_barriers`,
 /// `biome_regions`, `creatures`, `custom_channels`, `spells`,
@@ -60,7 +60,7 @@ const MAX_INNER_ENTRIES: usize = 512;
 pub enum BundleError {
     /// The document is not well-formed JSON within the loader's bounds.
     Json(String),
-    /// `schema` is absent or not `"mc-spine-mod-bundle/1"`.
+    /// `schema` is absent or not `"megu-mod-bundle/1"`.
     UnknownSchema(String),
     /// A field failed fail-closed validation (type, id, bound, unknown key).
     Validation(String),
@@ -133,7 +133,7 @@ pub struct DeclarativeModBundle {
 }
 
 impl DeclarativeModBundle {
-    /// Parse and fully validate a `mc-spine-mod-bundle/1` document.
+    /// Parse and fully validate a `megu-mod-bundle/1` document.
     ///
     /// # Errors
     ///
@@ -2106,7 +2106,7 @@ const BUILTIN_BUNDLE_RANGE: &str = "[1.21,)";
 
 /// Convert the existing hardcoded [`builtin_dimension_mod_profiles`] into
 /// clean declarative bundles — proof the reference profiles are 100%
-/// expressible as pure `mc-spine-mod-bundle/1` JSON data.
+/// expressible as pure `megu-mod-bundle/1` JSON data.
 pub fn export_builtin_dimension_bundles() -> Vec<DeclarativeModBundle> {
     builtin_dimension_mod_profiles()
         .into_iter()
@@ -2131,7 +2131,7 @@ mod magic_bundle_tests {
 
     fn document(extra: &str) -> String {
         format!(
-            r#"{{"schema":"mc-spine-mod-bundle/1","mod_id":"demo","mc_version_range":"[1.21,)","portals":[],"progression_barriers":[],"biome_regions":[],"creatures":[],"custom_channels":[]{extra}}}"#
+            r#"{{"schema":"megu-mod-bundle/1","mod_id":"demo","mc_version_range":"[1.21,)","portals":[],"progression_barriers":[],"biome_regions":[],"creatures":[],"custom_channels":[]{extra}}}"#
         )
     }
 

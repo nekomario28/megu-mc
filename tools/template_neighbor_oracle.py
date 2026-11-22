@@ -69,7 +69,7 @@ def main() -> int:
         output = work / "neighbor-shapes.tsv"
         run_probe(
             work, classpath, REPO / "tools/structure-oracle/NeighborShapeOracle.java",
-            "dev.mcspine.tools.NeighborShapeOracle", output,
+            "dev.megu.tools.NeighborShapeOracle", output,
             extra_sources=(REPO / "tools/structure-oracle/NativeHarness.java",
                            REPO / "tools/vanilla-probe/VanillaBlockTags.java",
                            REPO / "tools/structure-oracle/NativeFluidTags.java"),

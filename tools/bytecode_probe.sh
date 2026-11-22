@@ -17,20 +17,20 @@
 #                       sha256 e3bc55693e93cda0188f2e60aea28113fc647c5e85a15fa3d1b347349231b4bb
 #   official mappings   server.txt 03f8985492bda0afc0898465341eb0acef35f570
 #   (the manifest and mapping URLs that produced them are in
-#    ~/.cache/mc-spine-work/mc121/{url.txt,map_url.txt})
+#    ~/.cache/megu-work/mc121/{url.txt,map_url.txt})
 set -euo pipefail
 
 CLASS="${1:-}"
 PATTERN="${2:-}"
 [ -n "$CLASS" ] || { sed -n '2,4p' "$0" >&2; exit 2; }
 
-JAR="${MC_SPINE_VANILLA_JAR:-/tmp/carverfresh/server.jar}"
-MAPS="${MC_SPINE_VANILLA_MAPPINGS:-$HOME/.cache/mc-spine-work/mc121/server.txt}"
+JAR="${MEGU_VANILLA_JAR:-/tmp/carverfresh/server.jar}"
+MAPS="${MEGU_VANILLA_MAPPINGS:-$HOME/.cache/megu-work/mc121/server.txt}"
 JAR_SHA1=59353fb40c36d304f2035d51e7d6e6baa98dc05c
 
 command -v javap >/dev/null || { echo "bytecode probe: javap is required (a JDK, not just a JRE)" >&2; exit 2; }
-[ -f "$JAR" ] || { echo "bytecode probe: no server jar at $JAR (MC_SPINE_VANILLA_JAR, or tools/fixture_base.sh)" >&2; exit 2; }
-[ -f "$MAPS" ] || { echo "bytecode probe: no official mappings at $MAPS (MC_SPINE_VANILLA_MAPPINGS)" >&2; exit 2; }
+[ -f "$JAR" ] || { echo "bytecode probe: no server jar at $JAR (MEGU_VANILLA_JAR, or tools/fixture_base.sh)" >&2; exit 2; }
+[ -f "$MAPS" ] || { echo "bytecode probe: no official mappings at $MAPS (MEGU_VANILLA_MAPPINGS)" >&2; exit 2; }
 
 got="$(sha1sum "$JAR" | cut -d' ' -f1)"
 [ "$got" = "$JAR_SHA1" ] || {

@@ -4,13 +4,13 @@
 
 use std::collections::BTreeSet;
 
-use mc_spine_client_ui::mod_menu::{
+use megu_client_ui::mod_menu::{
     active_builtin_qol_overrides, modrinth_project_url, modrinth_version_lookup_url,
     valid_modrinth_slug, BuiltinQolFeature, BuiltinQolResolution, ModLoaderTag, ModMenuAction,
     ModMenuEntry, ModMenuFilter, ModMenuHitRegion, ModMenuState, ModMenuWidgetId, QolSubCategory,
     CURATED_MODRINTH_QOL_MODS,
 };
-use mc_spine_client_ui::state::{UiInputEvent, UiKey, UiLang};
+use megu_client_ui::state::{UiInputEvent, UiKey, UiLang};
 
 fn recommended_ids(state: &mut ModMenuState) -> Vec<String> {
     (0..state.visible_indices().len())

@@ -1,20 +1,20 @@
 // SPDX-License-Identifier: LGPL-3.0-or-later OR GPL-3.0-or-later OR AGPL-3.0-or-later
 
-use mc_spine_state_store::anvil_inspect::{
+use megu_state_store::anvil_inspect::{
     decode_nbt_to_data_value, encode_data_value_to_nbt, gzip_decompress, gzip_encode_stored,
     NBT_SIZE_CAP,
 };
-use mc_spine_state_store::datafix::{DataValue, DV_1_21_1, DV_26_3};
-use mc_spine_state_store::namespace_guard::{
+use megu_state_store::datafix::{DataValue, DV_1_21_1, DV_26_3};
+use megu_state_store::namespace_guard::{
     NamespaceTombstoneSidecar, PreservedKind, UnknownEntry,
 };
-use mc_spine_state_store::world_interop::{
+use megu_state_store::world_interop::{
     extract_preserved_attachments, inspect_world_interop, merge_preserved_attachments,
     prepare_cross_loader_handoff, roundtrip_level_dat_preserving_attachments,
     roundtrip_playerdata_preserving_attachments, CrossLoaderHandoff, InteropError,
     WorldLoaderOrigin, PRESERVED_MOD_ATTACHMENT_KEYS,
 };
-use mc_spine_state_store::world_snapshot::{SnapshotReason, WorldSnapshotStore};
+use megu_state_store::world_snapshot::{SnapshotReason, WorldSnapshotStore};
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::path::{Path, PathBuf};

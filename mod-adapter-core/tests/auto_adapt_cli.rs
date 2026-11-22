@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: LGPL-3.0-or-later OR GPL-3.0-or-later OR AGPL-3.0-or-later
 
-//! End-to-end checks of the compiled `mc-spine-mod-check` auto-adapter CLI.
+//! End-to-end checks of the compiled `megu-mod-check` auto-adapter CLI.
 //! All JAR fixtures are self-contained stored ZIPs with valid central directories.
 
 use std::fs;
@@ -11,7 +11,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use mod_adapter_core::data_loader::{parse_json, JsonValue};
 use mod_adapter_core::unified_bundle::DeclarativeModBundle;
 
-const BIN: &str = env!("CARGO_BIN_EXE_mc-spine-mod-check");
+const BIN: &str = env!("CARGO_BIN_EXE_megu-mod-check");
 static NEXT_DIR: AtomicUsize = AtomicUsize::new(0);
 
 struct Scratch(PathBuf);
@@ -19,7 +19,7 @@ struct Scratch(PathBuf);
 impl Scratch {
     fn new(tag: &str) -> Self {
         let path = std::env::temp_dir().join(format!(
-            "mc-spine-auto-adapt-{}-{}-{tag}",
+            "megu-auto-adapt-{}-{}-{tag}",
             std::process::id(),
             NEXT_DIR.fetch_add(1, Ordering::Relaxed)
         ));
@@ -48,7 +48,7 @@ fn run(args: &[&str], expected_exit: i32) -> Output {
     let output = Command::new(BIN)
         .args(args)
         .output()
-        .expect("spawn mc-spine-mod-check");
+        .expect("spawn megu-mod-check");
     assert_eq!(
         output.status.code(),
         Some(expected_exit),
@@ -90,7 +90,7 @@ fn bundle_file(path: &Path, expected_mod_id: &str) {
     assert_eq!(bundle.mod_id, expected_mod_id);
     assert_eq!(
         text_field(&json(body.as_bytes()), "schema"),
-        "mc-spine-mod-bundle/1"
+        "megu-mod-bundle/1"
     );
 }
 
@@ -376,12 +376,12 @@ fn adapt_jar_writes_valid_native_bundle() {
         0,
     );
     let report = json(&result.stdout);
-    assert_eq!(text_field(&report, "schema"), "mc-spine-jar-adaptation/1");
+    assert_eq!(text_field(&report, "schema"), "megu-jar-adaptation/1");
     assert_eq!(text_field(&report, "mod_id"), "tastymod");
     assert_eq!(text_field(&report, "tier"), "native_bundle");
     assert_eq!(
         text_field(field(&report, "bundle"), "schema"),
-        "mc-spine-mod-bundle/1"
+        "megu-mod-bundle/1"
     );
     assert_eq!(text_field(&report, "bundle_file"), "tastymod.bundle.json");
     bundle_file(&output_dir.join("tastymod.bundle.json"), "tastymod");
@@ -397,7 +397,7 @@ fn adapt_jar_skips_manifest_declared_superseded_mod_even_with_an_unrelated_filen
     let input = scratch.write("totally-not-sodium.jar", &superseded_jar());
     let result = run(&["--adapt-jar", arg(&input), "--json"], 0);
     let report = json(&result.stdout);
-    assert_eq!(text_field(&report, "schema"), "mc-spine-jar-adaptation/1");
+    assert_eq!(text_field(&report, "schema"), "megu-jar-adaptation/1");
     assert_eq!(text_field(&report, "mod_id"), "sodium");
     assert_eq!(text_field(&report, "tier"), "auto_skipped");
     assert!(matches!(field(&report, "bundle"), JsonValue::Null));
@@ -424,7 +424,7 @@ fn adapt_mods_dir_writes_deterministic_report_and_native_bundle_despite_tier3() 
     let report = json(&result.stdout);
     assert_eq!(
         text_field(&report, "schema"),
-        "mc-spine-mods-dir-adaptation/1"
+        "megu-mods-dir-adaptation/1"
     );
     assert_eq!(text_field(&report, "verdict"), "requires_fallback");
     assert_eq!(count_field(&report, "jars_found"), 3);
@@ -472,7 +472,7 @@ fn adapt_mods_dir_all_native_succeeds() {
     let report = json(&result.stdout);
     assert_eq!(
         text_field(&report, "schema"),
-        "mc-spine-mods-dir-adaptation/1"
+        "megu-mods-dir-adaptation/1"
     );
     assert_eq!(text_field(&report, "verdict"), "adapted");
     assert_eq!(count_field(field(&report, "totals"), "native_bundle"), 2);

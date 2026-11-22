@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: LGPL-3.0-or-later
 //! Clean-room synthetic fixtures for bounded CEM/CTM resource-pack parsing.
 
-use mc_spine_server_files::optifine_compat::{
+use megu_server_files::optifine_compat::{
     model_fingerprint, parse_ctm_properties, parse_emissive_properties, parse_jem, parse_jpm,
     resolve_jem_with_jpm, CtmConnect, CtmLayer, CtmMethod, CtmSymmetry, CtmTile,
     OptifineCompatError, MAX_ANIMATIONS, MAX_BOXES_PER_PART, MAX_CTM_TILES, MAX_PARTS,
@@ -63,7 +63,7 @@ const JPM: &str = r#"{
     }]
 }"#;
 
-fn resolved_fixture() -> mc_spine_server_files::optifine_compat::ResolvedEntityModel {
+fn resolved_fixture() -> megu_server_files::optifine_compat::ResolvedEntityModel {
     let mut models = BTreeMap::new();
     models.insert("body.jpm".to_owned(), parse_jpm(JPM).unwrap());
     resolve_jem_with_jpm(&parse_jem(JEM).unwrap(), &models).unwrap()

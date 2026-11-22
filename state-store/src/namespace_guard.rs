@@ -41,7 +41,7 @@ use std::path::{Path, PathBuf};
 
 /// Sidecar document format tag, checked on every load so a foreign or
 /// corrupt document is never mistaken for a tombstone sidecar.
-const SIDECAR_FORMAT: &str = "mcspine-namespace-tombstone-v1";
+const SIDECAR_FORMAT: &str = "megu-namespace-tombstone-v1";
 
 /// Fail-closed cap on parked entries. Far past anything a real modded save
 /// produces — it exists to refuse garbage, never to bound legitimate worlds.

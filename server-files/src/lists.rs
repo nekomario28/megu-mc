@@ -3,7 +3,7 @@
 //!
 //! The on-disk schemas byte-match what `src/server_ops.rs` writes, so a file
 //! this crate saves is interchangeable with one a real Vanilla server (or the
-//! existing mc-spine runtime) produces: pretty-printed arrays of objects,
+//! existing megu runtime) produces: pretty-printed arrays of objects,
 //! `level` clamped to `0..=4`, `expires` as `"forever"` or an ISO date, and a
 //! legacy flat name array in `ops.json` upgraded to level-4 operators.
 //!

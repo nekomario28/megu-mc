@@ -1,8 +1,8 @@
 // SPDX-License-Identifier: LGPL-3.0-or-later OR GPL-3.0-or-later OR AGPL-3.0-or-later
 
-use mc_spine_client_mesh::vanilla_plus_3d::{ExtrudedMesh, TEXEL};
-use mc_spine_client_mesh::vanilla_plus_visuals::*;
-use mc_spine_client_mesh::Direction;
+use megu_client_mesh::vanilla_plus_3d::{ExtrudedMesh, TEXEL};
+use megu_client_mesh::vanilla_plus_visuals::*;
+use megu_client_mesh::Direction;
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -69,7 +69,7 @@ fn outward(d: Direction) -> [f32; 3] {
 
 /// Whether a quad's outward-facing positions are all recessed at least
 /// `depth` inside the surface plane of `dir`.
-fn is_recessed_on(q: &mc_spine_client_mesh::vanilla_plus_3d::ExtrudedQuad, dir: Direction, depth: f32) {
+fn is_recessed_on(q: &megu_client_mesh::vanilla_plus_3d::ExtrudedQuad, dir: Direction, depth: f32) {
     let axis = axis_of(dir);
     let out = outward(dir)[axis];
     for p in &q.positions {

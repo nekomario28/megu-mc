@@ -1674,7 +1674,7 @@ struct Client {
     portal_at: Mutex<Option<Instant>>,
     held: Mutex<i16>,
     effs: Mutex<Vec<Eff>>,
-    // The `mc-spine:lod_v1` opt-in from the client's `minecraft:register`
+    // The `megu:lod_v1` opt-in from the client's `minecraft:register`
     // payload. Vanilla clients never set it and must never receive a `lod_v1`
     // packet, so the flag is checked before every channel write.
     lod_v1_enabled: AtomicBool,
@@ -3983,7 +3983,7 @@ fn resource_pack_pkt() -> Option<Vec<u8>> {
     Some(p)
 }
 /// Whether the configured resource pack is mandatory. The server config's
-/// `resource_pack_required` key boots into `MC_SPINE_RESOURCE_PACK_REQUIRED`;
+/// `resource_pack_required` key boots into `MEGU_RESOURCE_PACK_REQUIRED`;
 /// a Vanilla `server.properties` says `require-resource-pack`. Either marks the
 /// pack required.
 fn resource_pack_required() -> bool {
@@ -3993,7 +3993,7 @@ fn resource_pack_required() -> bool {
             "1" | "true" | "yes"
         )
     }
-    std::env::var("MC_SPINE_RESOURCE_PACK_REQUIRED").is_ok_and(|v| truthy(&v))
+    std::env::var("MEGU_RESOURCE_PACK_REQUIRED").is_ok_and(|v| truthy(&v))
         || server_properties_lookup("require-resource-pack").is_some_and(|v| truthy(&v))
 }
 
@@ -7213,7 +7213,7 @@ fn json_text(s: &str) -> String {
 /// A sign side, in the shape the game itself writes.
 ///
 /// Measured from native (`SignText.DIRECT_CODEC` encoded with the level's ops, see
-/// `~/.cache/mc-spine-audit/save-booking-20261110/sign-probe6.log`):
+/// `~/.cache/megu-audit/save-booking-20261110/sign-probe6.log`):
 /// `{color, filtered_messages:[4], has_glowing_text, messages:[4]}` with each message a
 /// **JSON string** component (`'"Hi"'`), not a `{"text":...}` object, and with
 /// `filtered_messages` present. A tag without that list loads as empty text natively, so
@@ -7906,7 +7906,7 @@ fn save_live_player_snapshot(
 /// The live copies of the Vanilla ops/ban/whitelist files, loaded lazily from
 /// the server working directory on the first login and refreshed by the admin
 /// commands. `None` means "not loaded yet"; `max_players` snapshots
-/// `MC_SPINE_MAX_PLAYERS` (default 20) at load so the check is a single read.
+/// `MEGU_MAX_PLAYERS` (default 20) at load so the check is a single read.
 struct LiveAdmission {
     ops: OpsRegistry,
     bans: BanRegistry,
@@ -7919,16 +7919,16 @@ impl LiveAdmission {
         let dir = std::path::Path::new(".");
         let mut whitelist =
             WhitelistRegistry::load(&dir.join(WHITELIST_FILE)).unwrap_or_default();
-        // `enforceWhitelist` is a server.properties fact upstream; mc-spine keeps
+        // `enforceWhitelist` is a server.properties fact upstream; megu keeps
         // it in the environment so whitelist.json stays data-only.
-        whitelist.enabled = std::env::var("MC_SPINE_WHITELIST")
+        whitelist.enabled = std::env::var("MEGU_WHITELIST")
             .map(|v| matches!(v.as_str(), "1" | "true" | "on"))
             .unwrap_or(false);
         Self {
             ops: OpsRegistry::load(&dir.join(OPS_FILE)).unwrap_or_default(),
             bans: BanRegistry::load(dir).unwrap_or_default(),
             whitelist,
-            max_players: std::env::var("MC_SPINE_MAX_PLAYERS")
+            max_players: std::env::var("MEGU_MAX_PLAYERS")
                 .ok()
                 .and_then(|v| v.parse::<usize>().ok())
                 .unwrap_or(20),
@@ -7959,7 +7959,7 @@ fn env_flag(name: &str) -> bool {
         .unwrap_or(false)
 }
 
-/// Opt-in minimap policy (`MC_SPINE_FAIR_PLAY` and `/megu policy`
+/// Opt-in minimap policy (`MEGU_FAIR_PLAY` and `/megu policy`
 /// `minimap_mode`, both default **off**). The Xaero fair-play control code
 /// `§f§a§i§r§x§a§e§r§o` is only ever emitted when the operator armed the flag
 /// or the live policy restricts the map — a client that did not ask for
@@ -7977,7 +7977,7 @@ struct MapFairPlayPolicy {
 }
 
 fn map_fair_play_policy() -> MapFairPlayPolicy {
-    let env_fair_play = env_flag("MC_SPINE_FAIR_PLAY");
+    let env_fair_play = env_flag("MEGU_FAIR_PLAY");
     let allow = |name: &str| {
         std::env::var_os(name)
             .map(|_| env_flag(name))
@@ -7991,9 +7991,9 @@ fn map_fair_play_policy() -> MapFairPlayPolicy {
         .lock()
         .unwrap_or_else(|e| e.into_inner())
         .clone();
-    let allow_cave_map = allow("MC_SPINE_ALLOW_CAVE_MAP") && live.allow_cave_map;
+    let allow_cave_map = allow("MEGU_ALLOW_CAVE_MAP") && live.allow_cave_map;
     let allow_entity_radar =
-        allow("MC_SPINE_ALLOW_ENTITY_RADAR") && live.allow_mob_radar;
+        allow("MEGU_ALLOW_ENTITY_RADAR") && live.allow_mob_radar;
     let live_restricted = live.minimap_mode != "unrestricted";
     let control = if env_fair_play
         || live.minimap_mode == "disabled"
@@ -8037,21 +8037,21 @@ fn map_fair_play_join_chats(policy: &MapFairPlayPolicy) -> Vec<Vec<u8>> {
     vec![system_chat(&policy.control)]
 }
 
-/// Velocity "modern forwarding" gate (`MC_SPINE_VELOCITY_FORWARDING=1`). When
+/// Velocity "modern forwarding" gate (`MEGU_VELOCITY_FORWARDING=1`). When
 /// on, the connecting peer must answer `velocity:player_info` with an
 /// HMAC-SHA256-signed identity — a direct client, a dropped response or one
 /// flipped byte all fail closed, because the forwarded name/UUID/IP is the
 /// only trustworthy identity from that point on.
 fn velocity_forwarding_enabled() -> bool {
-    env_flag("MC_SPINE_VELOCITY_FORWARDING")
+    env_flag("MEGU_VELOCITY_FORWARDING")
 }
 
-/// `MC_SPINE_ONLINE_MODE=1`: the Encryption Request/Response exchange plus the
+/// `MEGU_ONLINE_MODE=1`: the Encryption Request/Response exchange plus the
 /// session check. Kept `else if` behind forwarding — a Velocity proxy already
 /// terminated the client's real authentication, and running both on one
 /// connection would contradict that.
 fn online_mode_enabled() -> bool {
-    env_flag("MC_SPINE_ONLINE_MODE")
+    env_flag("MEGU_ONLINE_MODE")
 }
 
 /// The public-bind gate the startup listener applies after `check_bind`: a
@@ -8059,7 +8059,7 @@ fn online_mode_enabled() -> bool {
 /// admit any claimed name as if it were verified — including an operator's —
 /// so the listener refuses to start. Loopback and LAN play, online-mode and
 /// forwarded deployments all pass; anything else needs the explicit
-/// `MC_SPINE_ALLOW_INSECURE_OFFLINE_PUBLIC=1` override.
+/// `MEGU_ALLOW_INSECURE_OFFLINE_PUBLIC=1` override.
 fn offline_public_bind_check(
     bind: &str,
     online_mode: bool,
@@ -8078,9 +8078,9 @@ fn offline_public_bind_check(
          online-mode off and no Velocity forwarding: offline mode trusts the \
          claimed player name for operator, whitelist and ban checks, so anyone \
          could log in as an operator. Set `online_mode = true` \
-         (MC_SPINE_ONLINE_MODE=1), enable Velocity forwarding \
-         (MC_SPINE_VELOCITY_FORWARDING=1 + MC_SPINE_VELOCITY_SECRET), or set \
-         MC_SPINE_ALLOW_INSECURE_OFFLINE_PUBLIC=1 only on a network segment you \
+         (MEGU_ONLINE_MODE=1), enable Velocity forwarding \
+         (MEGU_VELOCITY_FORWARDING=1 + MEGU_VELOCITY_SECRET), or set \
+         MEGU_ALLOW_INSECURE_OFFLINE_PUBLIC=1 only on a network segment you \
          fully control."
     ))
 }
@@ -8116,8 +8116,8 @@ fn velocity_login(s: &mut TcpStream, deadline: Instant) -> Result<VelocityForwar
     if rest.is_empty() {
         return Err("plugin response carried no forwarding data".into());
     }
-    let secret = std::env::var("MC_SPINE_VELOCITY_SECRET")
-        .map_err(|_| "MC_SPINE_VELOCITY_SECRET is not configured".to_string())?;
+    let secret = std::env::var("MEGU_VELOCITY_SECRET")
+        .map_err(|_| "MEGU_VELOCITY_SECRET is not configured".to_string())?;
     verify_velocity_forwarding(secret.as_bytes(), rest)
 }
 
@@ -9113,8 +9113,8 @@ fn handle_inner(mut s: TcpStream, live_eid: Arc<AtomicI32>) {
                 .iter()
                 .map(|c| (c.name.clone(), c.uuid))
                 .collect();
-            let max = std::env::var("MC_SPINE_MAX_PLAYERS").ok().and_then(|v| v.parse::<usize>().ok()).unwrap_or(20);
-            let motd = std::env::var("MC_SPINE_MOTD").unwrap_or_else(|_| "mc-spine".to_owned());
+            let max = std::env::var("MEGU_MAX_PLAYERS").ok().and_then(|v| v.parse::<usize>().ok()).unwrap_or(20);
+            let motd = std::env::var("MEGU_MOTD").unwrap_or_else(|_| "megu".to_owned());
             let json = build_status_json_rich(&motd, max, &online_players, status_favicon());
             let mut pl = Vec::new();
             write_str(&mut pl, &json);
@@ -9232,7 +9232,7 @@ fn handle_inner(mut s: TcpStream, live_eid: Arc<AtomicI32>) {
     let threshold =
         connection_limits::compression_threshold_env(|name| std::env::var(name).ok());
     let threshold = if cfg!(test)
-        && std::env::var_os("MC_SPINE_COMPRESSION_THRESHOLD").is_none()
+        && std::env::var_os("MEGU_COMPRESSION_THRESHOLD").is_none()
     {
         -1
     } else {
@@ -9346,7 +9346,7 @@ fn handle_inner(mut s: TcpStream, live_eid: Arc<AtomicI32>) {
     // `ClientboundServerDataPacket`: the MOTD component plus the optional
     // server icon (raw PNG bytes when `server-icon.png` validated).
     {
-        let motd = std::env::var("MC_SPINE_MOTD").unwrap_or_else(|_| "mc-spine".to_owned());
+        let motd = std::env::var("MEGU_MOTD").unwrap_or_else(|_| "megu".to_owned());
         let icon = if status_favicon().is_some() {
             std::fs::read("server-icon.png").ok()
         } else {
@@ -9448,7 +9448,7 @@ fn handle_inner(mut s: TcpStream, live_eid: Arc<AtomicI32>) {
     write_varint(&mut hp, saved_player.as_ref().map_or(20, |save| save.food) as i64);
     hp.extend_from_slice(&saved_player.as_ref().map_or(5.0, |save| save.saturation).to_be_bytes());
     let _ = send_packet(&mut s, 0x5d, hp);
-    // Live mod suite: the armed `mc-spine:mod_sync_v1` (MSY1) manifest rides
+    // Live mod suite: the armed `megu:mod_sync_v1` (MSY1) manifest rides
     // the play-phase 0x19 custom payload. No-op unless an operator manifest
     // validated at boot (default builds send nothing new).
     live_mod_sync_on_join(&mut s);
@@ -9457,15 +9457,15 @@ fn handle_inner(mut s: TcpStream, live_eid: Arc<AtomicI32>) {
     }
     // ---- configured session packets (all opt-in; a default server sends
     // none of them) ----
-    // `cookie_request`/`store_cookie`: `MC_SPINE_COOKIE_REQUEST` is a `;`-list
-    // of keys to query and `MC_SPINE_STORE_COOKIE` a `;`-list of `key=value`
+    // `cookie_request`/`store_cookie`: `MEGU_COOKIE_REQUEST` is a `;`-list
+    // of keys to query and `MEGU_STORE_COOKIE` a `;`-list of `key=value`
     // pairs to persist — the answers land on the 0x11 cookie_response branch.
-    if let Ok(keys) = std::env::var("MC_SPINE_COOKIE_REQUEST") {
+    if let Ok(keys) = std::env::var("MEGU_COOKIE_REQUEST") {
         for key in keys.split(';').map(str::trim).filter(|k| !k.is_empty()) {
             let _ = send_play_cookie_request(&mut s, key);
         }
     }
-    if let Ok(pairs) = std::env::var("MC_SPINE_STORE_COOKIE") {
+    if let Ok(pairs) = std::env::var("MEGU_STORE_COOKIE") {
         for pair in pairs.split(';').map(str::trim).filter(|p| !p.is_empty()) {
             if let Some((key, value)) = pair.split_once('=') {
                 let _ = send_play_store_cookie(&mut s, key, value.as_bytes());
@@ -9474,7 +9474,7 @@ fn handle_inner(mut s: TcpStream, live_eid: Arc<AtomicI32>) {
     }
     // `custom_report_details` / `server_links` ride the play phase when
     // configured, the same as a mid-session vanilla push.
-    if let Ok(details) = std::env::var("MC_SPINE_REPORT_DETAILS") {
+    if let Ok(details) = std::env::var("MEGU_REPORT_DETAILS") {
         let entries: Vec<(&str, &str)> = details
             .split(';')
             .filter_map(|pair| pair.split_once('='))
@@ -9484,7 +9484,7 @@ fn handle_inner(mut s: TcpStream, live_eid: Arc<AtomicI32>) {
             let _ = send_packet(&mut s, 0x7a, payload);
         }
     }
-    if let Ok(links) = std::env::var("MC_SPINE_SERVER_LINKS") {
+    if let Ok(links) = std::env::var("MEGU_SERVER_LINKS") {
         // `builtin:<id>=<url>` or `<text>=<url>`; text labels ride a component
         // built by the same `text_component_nbt` as /title.
         let mut parsed: Vec<(Option<u32>, Option<Vec<u8>>, &str)> = Vec::new();
@@ -9528,8 +9528,8 @@ fn handle_inner(mut s: TcpStream, live_eid: Arc<AtomicI32>) {
             to_highlight: book.to_highlight(),
         };
         let _ = send_packet(&mut s, 0x41, encode_update_recipes_book(&init));
-        if let Ok(header) = std::env::var("MC_SPINE_TABLIST_HEADER") {
-            let footer = std::env::var("MC_SPINE_TABLIST_FOOTER").unwrap_or_default();
+        if let Ok(header) = std::env::var("MEGU_TABLIST_HEADER") {
+            let footer = std::env::var("MEGU_TABLIST_FOOTER").unwrap_or_default();
             let _ = send_packet(&mut s, 0x6d, encode_tab_list(&header, &footer));
         }
     }
@@ -9735,7 +9735,7 @@ fn handle_inner(mut s: TcpStream, live_eid: Arc<AtomicI32>) {
         drop(ms);
         // drops/xp/mobs stream via interest_tick (distance-gated)
     }
-    // Opt-in minimap fair-play (`MC_SPINE_FAIR_PLAY` or `/megu policy`
+    // Opt-in minimap fair-play (`MEGU_FAIR_PLAY` or `/megu policy`
     // `minimap_mode`, default off): the control code goes out once here, on
     // play join. Off by default — nothing is sent unless the operator armed
     // the flag or restricted the map.
@@ -15533,7 +15533,7 @@ mod sleep_protocol_parity_tests {
         assert_eq!(connection_limits::compression_threshold_env(|_| None), 256);
         for (raw, want) in [("-1", -1), ("0", -1), ("64", 64), ("junk", 256)] {
             let value = connection_limits::compression_threshold_env(|name| {
-                (name == "MC_SPINE_COMPRESSION_THRESHOLD").then(|| raw.to_string())
+                (name == "MEGU_COMPRESSION_THRESHOLD").then(|| raw.to_string())
             });
             assert_eq!(value, want, "threshold for {raw:?}");
         }
@@ -16754,7 +16754,7 @@ mod w4_tests {
             text.contains("\"favicon\":\"data:image/png;base64,"),
             "{text}"
         );
-        assert!(text.contains("\"text\":\"mc-spine\""), "{text}");
+        assert!(text.contains("\"text\":\"megu\""), "{text}");
 
         // Ping keeps working after the rich response (payload echoes).
         w4_send(&mut cli, 0x01, &0xfeed_beefi64.to_be_bytes());
@@ -16769,13 +16769,13 @@ mod w4_tests {
 
     #[test]
     fn w4_velocity_forwarding_accepts_signed_and_rejects_tampered_login() {
-        // `MC_SPINE_VELOCITY_*` env plus the registered client are
+        // `MEGU_VELOCITY_*` env plus the registered client are
         // process-global; the sibling online-mode test reads the same env.
         let _guard = world_guard();
         let secret = "w4-shared-secret";
         let _env = W4Env::new()
-            .set("MC_SPINE_VELOCITY_FORWARDING", "1")
-            .set("MC_SPINE_VELOCITY_SECRET", secret);
+            .set("MEGU_VELOCITY_FORWARDING", "1")
+            .set("MEGU_VELOCITY_SECRET", secret);
         let deadline = w4_deadline();
 
         // A valid signed payload adopts the forwarded identity: the client lied
@@ -16872,10 +16872,10 @@ mod w4_tests {
 
     #[test]
     fn w4_encrypted_stream_roundtrips_protocol_packets_with_aes128_cfb8() {
-        // `MC_SPINE_ONLINE_MODE` steers every concurrent `handle` login — a
+        // `MEGU_ONLINE_MODE` steers every concurrent `handle` login — a
         // plain-text login racing this test is refused for missing encryption.
         let _guard = world_guard();
-        let _env = W4Env::new().set("MC_SPINE_ONLINE_MODE", "1");
+        let _env = W4Env::new().set("MEGU_ONLINE_MODE", "1");
         let deadline = w4_deadline();
         let secret = [0x5au8; 16];
         let key_der = vec![0x30, 0x82, 0x01, 0x0a];
@@ -19120,9 +19120,9 @@ mod wire_ops_fair_play_tests {
     use super::*;
 
     const FAIR_PLAY_ENV: [&str; 3] = [
-        "MC_SPINE_FAIR_PLAY",
-        "MC_SPINE_ALLOW_CAVE_MAP",
-        "MC_SPINE_ALLOW_ENTITY_RADAR",
+        "MEGU_FAIR_PLAY",
+        "MEGU_ALLOW_CAVE_MAP",
+        "MEGU_ALLOW_ENTITY_RADAR",
     ];
 
     fn save_env() -> Vec<(&'static str, Option<std::ffi::OsString>)> {
@@ -19141,7 +19141,7 @@ mod wire_ops_fair_play_tests {
         }
     }
 
-    /// `MC_SPINE_FAIR_PLAY` unset or explicit-off emits zero control codes;
+    /// `MEGU_FAIR_PLAY` unset or explicit-off emits zero control codes;
     /// only the armed flag emits `§f§a§i§r§x§a§e§r§o`, and the allow switches
     /// follow the documented defaults.
     #[test]
@@ -19162,13 +19162,13 @@ mod wire_ops_fair_play_tests {
 
         // Explicit-off spellings must not emit codes either.
         for v in ["0", "false", "off"] {
-            std::env::set_var("MC_SPINE_FAIR_PLAY", v);
+            std::env::set_var("MEGU_FAIR_PLAY", v);
             assert!(map_fair_play_join_chats(&map_fair_play_policy()).is_empty());
         }
 
         // Armed: exactly one chat carrying the control code, allow defaults
         // flip to off, an explicit allow still wins.
-        std::env::set_var("MC_SPINE_FAIR_PLAY", "1");
+        std::env::set_var("MEGU_FAIR_PLAY", "1");
         let chats = map_fair_play_join_chats(&map_fair_play_policy());
         assert_eq!(chats.len(), 1);
         let code = "§f§a§i§r§x§a§e§r§o".as_bytes();
@@ -19177,7 +19177,7 @@ mod wire_ops_fair_play_tests {
         assert!(!policy.allow_cave_map);
         assert!(!policy.allow_entity_radar);
 
-        std::env::set_var("MC_SPINE_ALLOW_CAVE_MAP", "true");
+        std::env::set_var("MEGU_ALLOW_CAVE_MAP", "true");
         assert!(map_fair_play_policy().allow_cave_map);
         assert!(!map_fair_play_policy().allow_entity_radar);
 
@@ -19368,15 +19368,15 @@ mod p8a_parity_protocol_tests {
     #[test]
     fn p8a_parity_resource_pack_statuses_disconnect_only_when_required() {
         let _guard = world_guard();
-        let saved_pack = std::env::var("MC_SPINE_RESOURCE_PACK_REQUIRED").ok();
-        let saved_config = std::env::var_os("MC_SPINE_CONFIG");
+        let saved_pack = std::env::var("MEGU_RESOURCE_PACK_REQUIRED").ok();
+        let saved_config = std::env::var_os("MEGU_CONFIG");
         // Point the config lookup at a path that cannot exist so only the env
         // variable drives `resource_pack_required` here.
         std::env::set_var(
-            "MC_SPINE_CONFIG",
-            std::env::temp_dir().join("mc-spine-p8a-no-such-config.toml"),
+            "MEGU_CONFIG",
+            std::env::temp_dir().join("megu-p8a-no-such-config.toml"),
         );
-        std::env::set_var("MC_SPINE_RESOURCE_PACK_REQUIRED", "1");
+        std::env::set_var("MEGU_RESOURCE_PACK_REQUIRED", "1");
         for status in [1i64, 2, 5, 6] {
             assert!(
                 resource_pack_status_disconnects(Some(status)),
@@ -19389,22 +19389,22 @@ mod p8a_parity_protocol_tests {
                 "status {status} is not a refusal"
             );
         }
-        std::env::set_var("MC_SPINE_RESOURCE_PACK_REQUIRED", "0");
+        std::env::set_var("MEGU_RESOURCE_PACK_REQUIRED", "0");
         for status in [1i64, 2, 5, 6] {
             assert!(
                 !resource_pack_status_disconnects(Some(status)),
                 "optional pack never disconnects on status {status}"
             );
         }
-        std::env::remove_var("MC_SPINE_RESOURCE_PACK_REQUIRED");
+        std::env::remove_var("MEGU_RESOURCE_PACK_REQUIRED");
         assert!(!resource_pack_status_disconnects(Some(1)));
         match saved_pack {
-            Some(v) => std::env::set_var("MC_SPINE_RESOURCE_PACK_REQUIRED", v),
-            None => std::env::remove_var("MC_SPINE_RESOURCE_PACK_REQUIRED"),
+            Some(v) => std::env::set_var("MEGU_RESOURCE_PACK_REQUIRED", v),
+            None => std::env::remove_var("MEGU_RESOURCE_PACK_REQUIRED"),
         }
         match saved_config {
-            Some(v) => std::env::set_var("MC_SPINE_CONFIG", v),
-            None => std::env::remove_var("MC_SPINE_CONFIG"),
+            Some(v) => std::env::set_var("MEGU_CONFIG", v),
+            None => std::env::remove_var("MEGU_CONFIG"),
         }
     }
 }
@@ -19646,8 +19646,8 @@ mod bot_net2_tests {
                         .lock()
                         .unwrap_or_else(|e| e.into_inner()),
                 ),
-                env_unload: std::env::var("MC_SPINE_AUTO_UNLOAD_TICKS").ok(),
-                env_anvil: std::env::var("MC_SPINE_ANVIL_WORLD_DIR").ok(),
+                env_unload: std::env::var("MEGU_AUTO_UNLOAD_TICKS").ok(),
+                env_anvil: std::env::var("MEGU_ANVIL_WORLD_DIR").ok(),
             }
         }
     }
@@ -19677,12 +19677,12 @@ mod bot_net2_tests {
                 .lock()
                 .unwrap_or_else(|e| e.into_inner()) = std::mem::take(&mut self.evicted);
             match self.env_unload.take() {
-                Some(v) => std::env::set_var("MC_SPINE_AUTO_UNLOAD_TICKS", v),
-                None => std::env::remove_var("MC_SPINE_AUTO_UNLOAD_TICKS"),
+                Some(v) => std::env::set_var("MEGU_AUTO_UNLOAD_TICKS", v),
+                None => std::env::remove_var("MEGU_AUTO_UNLOAD_TICKS"),
             }
             match self.env_anvil.take() {
-                Some(v) => std::env::set_var("MC_SPINE_ANVIL_WORLD_DIR", v),
-                None => std::env::remove_var("MC_SPINE_ANVIL_WORLD_DIR"),
+                Some(v) => std::env::set_var("MEGU_ANVIL_WORLD_DIR", v),
+                None => std::env::remove_var("MEGU_ANVIL_WORLD_DIR"),
             }
         }
     }
@@ -19810,15 +19810,15 @@ mod bot_net2_tests {
         // The default is off: the stage must not touch resident state no
         // matter where TICK_IDX sits — this is what keeps the saved-payload
         // digest bit-identical with the hook wired in.
-        std::env::remove_var("MC_SPINE_AUTO_UNLOAD_TICKS");
-        std::env::remove_var("MC_SPINE_ANVIL_WORLD_DIR");
+        std::env::remove_var("MEGU_AUTO_UNLOAD_TICKS");
+        std::env::remove_var("MEGU_ANVIL_WORLD_DIR");
         *WORLD_SPAWN.lock().unwrap_or_else(|e| e.into_inner()) = (0.5, 64.0, 0.5, 0.0);
         assert_eq!(auto_unload_period(), 0, "unset disables the stage");
-        std::env::set_var("MC_SPINE_AUTO_UNLOAD_TICKS", "0");
+        std::env::set_var("MEGU_AUTO_UNLOAD_TICKS", "0");
         assert_eq!(auto_unload_period(), 0, "an explicit 0 disables too");
-        std::env::set_var("MC_SPINE_AUTO_UNLOAD_TICKS", "abc");
+        std::env::set_var("MEGU_AUTO_UNLOAD_TICKS", "abc");
         assert_eq!(auto_unload_period(), 0, "unparseable disables");
-        std::env::set_var("MC_SPINE_AUTO_UNLOAD_TICKS", "600");
+        std::env::set_var("MEGU_AUTO_UNLOAD_TICKS", "600");
         assert_eq!(auto_unload_period(), 600);
 
         let stone = name_to_state("stone").expect("stone must exist");
@@ -19832,13 +19832,13 @@ mod bot_net2_tests {
         };
 
         // Disabled at a tick boundary that would fire if enabled: nothing moves.
-        std::env::remove_var("MC_SPINE_AUTO_UNLOAD_TICKS");
+        std::env::remove_var("MEGU_AUTO_UNLOAD_TICKS");
         TICK_IDX.store(600, Ordering::Relaxed);
         auto_unload_tick();
         assert_eq!(overlay_len(), 1, "disabled stage must not evict");
 
         // Enabled at period 5: off-boundary ticks skip, on-boundary ticks run.
-        std::env::set_var("MC_SPINE_AUTO_UNLOAD_TICKS", "5");
+        std::env::set_var("MEGU_AUTO_UNLOAD_TICKS", "5");
         TICK_IDX.store(602, Ordering::Relaxed);
         auto_unload_tick();
         assert_eq!(overlay_len(), 1, "602 is not a multiple of 5");
@@ -20606,7 +20606,7 @@ mod parity_58_c2s_tests {
 mod security_hardening_tests {
     use super::*;
 
-    /// A `REQ1` frame on `mc-spine:lod_v1` (the same layout
+    /// A `REQ1` frame on `megu:lod_v1` (the same layout
     /// `registry_tests::lod_test_req1` builds; private there, so re-made here).
     fn sec_req1(resolution: u8, cx: i32, cz: i32) -> Vec<u8> {
         let mut d = b"REQ1".to_vec();

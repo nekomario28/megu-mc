@@ -310,12 +310,12 @@ def local_server(binary, root=None, extra_env=None):
         if not (root / link).exists():
             (root / link).symlink_to(target, target_is_directory=target.is_dir())
     game = port()
-    env = dict(os.environ, MC_SPINE_PORT=str(game), MC_SPINE_BIND_ADDR="127.0.0.1",
-               MC_SPINE_WG="old", MC_SPINE_RESOURCE_PACK_URL="")
-    env.pop("MC_SPINE_RCON_PORT", None)
+    env = dict(os.environ, MEGU_PORT=str(game), MEGU_BIND_ADDR="127.0.0.1",
+               MEGU_WG="old", MEGU_RESOURCE_PACK_URL="")
+    env.pop("MEGU_RCON_PORT", None)
     # These clients warp across chunks in single packets to exercise the protocol;
     # the anti-cheat has its own live tests (cargo test anticheat_live).
-    env.setdefault("MC_SPINE_ANTICHEAT", "off")
+    env.setdefault("MEGU_ANTICHEAT", "off")
     for key, value in (extra_env or {}).items():
         if value is None:
             env.pop(key, None)
@@ -662,7 +662,7 @@ def live_wire_parity(binary):
     os.environ.setdefault("MC_PROBE_DEADLINE", "30")
     # Deleting any ambient override makes this session see the server's own
     # default: vanilla 1.21.1 negotiates the 256-byte threshold over 0x03.
-    compressed = wire_session(binary, {"MC_SPINE_COMPRESSION_THRESHOLD": None})
+    compressed = wire_session(binary, {"MEGU_COMPRESSION_THRESHOLD": None})
     require(compressed["threshold"] == 256, "0x03-default-threshold")
     require(compressed["chunks"] == spawn_window(), "0x03-window")
     # Real 0x03 wire evidence: some frames (chunk data) ride zlib bodies while
@@ -672,14 +672,14 @@ def live_wire_parity(binary):
 
     # 0x03 negotiated above every packet's size: the compression wrapper is on
     # the wire yet no body is large enough to compress.
-    wrapped = wire_session(binary, {"MC_SPINE_COMPRESSION_THRESHOLD": "1048576"})
+    wrapped = wire_session(binary, {"MEGU_COMPRESSION_THRESHOLD": "1048576"})
     require(wrapped["threshold"] == 1048576, "0x03-high-threshold")
     require(wrapped["chunks"] == spawn_window(), "0x03-high-window")
     require(wrapped["compressed_frames"] == 0, "0x03-high-zlib-frames")
     require(wrapped["uncompressed_frames"] > 0, "0x03-high-plain-frames")
 
     # Compression off: no 0x03, every frame is a bare length-prefixed packet.
-    plain = wire_session(binary, {"MC_SPINE_COMPRESSION_THRESHOLD": "-1"})
+    plain = wire_session(binary, {"MEGU_COMPRESSION_THRESHOLD": "-1"})
     require(plain["threshold"] == -1, "uncompressed-negotiated")
     require(plain["chunks"] == spawn_window(), "uncompressed-window")
     require(plain["compressed_frames"] == 0 and plain["uncompressed_frames"] == 0,
@@ -698,7 +698,7 @@ def main(binary):
 
 
 if __name__ == "__main__":
-    target = Path(sys.argv[1]).resolve() if len(sys.argv) > 1 else ROOT / "target/debug/mc-spine"
+    target = Path(sys.argv[1]).resolve() if len(sys.argv) > 1 else ROOT / "target/debug/megu"
     try:
         main(target)
     except ContractFailure as error:

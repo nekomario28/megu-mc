@@ -37,7 +37,7 @@ import net.minecraft.network.protocol.common.custom.CustomPacketPayload;
 import net.minecraft.resources.ResourceLocation;
 import net.minecraft.world.level.Level;
 import net.minecraft.world.level.block.state.BlockState;
-import net.mcspine.neoforge.DirectBatchBridge;
+import net.megu.neoforge.DirectBatchBridge;
 import net.neoforged.bus.api.IEventBus;
 import net.neoforged.bus.api.SubscribeEvent;
 import net.neoforged.fml.common.Mod;
@@ -201,8 +201,8 @@ def payload_value(body):
 def rejected_startup(binary, root, jar):
     link_inputs(root)
     game = port()
-    env = dict(os.environ, MC_SPINE_NEOFORGE_MODS=str(jar), MC_SPINE_PORT=str(game),
-               MC_SPINE_BIND_ADDR="127.0.0.1", MC_SPINE_WG="old")
+    env = dict(os.environ, MEGU_NEOFORGE_MODS=str(jar), MEGU_PORT=str(game),
+               MEGU_BIND_ADDR="127.0.0.1", MEGU_WG="old")
     result = subprocess.run([str(binary)], cwd=root, env=env, capture_output=True,
                             text=True, timeout=15)
     assert result.returncode == 1, result.stderr
@@ -215,7 +215,7 @@ def rejected_startup(binary, root, jar):
 
 def exercise(binary, root, jar):
     link_inputs(root)
-    os.environ["MC_SPINE_NEOFORGE_MODS"] = str(jar)
+    os.environ["MEGU_NEOFORGE_MODS"] = str(jar)
     with server(binary, root) as (game, rcon):
         with CommandClient(game, "NeoWire") as player:
             player.login()
@@ -309,10 +309,10 @@ def wait_for_player_logout(rcon, name):
 
 
 if __name__ == "__main__":
-    binary = Path(sys.argv[1]).resolve() if len(sys.argv) > 1 else ROOT / "target/debug/mc-spine"
+    binary = Path(sys.argv[1]).resolve() if len(sys.argv) > 1 else ROOT / "target/debug/megu"
     os.environ["JAVA_HOME"] = str(JAVA)
-    os.environ.pop("MC_SPINE_FABRIC_CLASSPATH", None)
-    os.environ["MC_SPINE_NEOFORGE_CLASSPATH"] = str(CLASSPATH)
+    os.environ.pop("MEGU_FABRIC_CLASSPATH", None)
+    os.environ["MEGU_NEOFORGE_CLASSPATH"] = str(CLASSPATH)
     with tempfile.TemporaryDirectory(prefix="spine-neoforge-wire-") as directory:
         root = Path(directory)
         good, rejected = compile_mod(root)

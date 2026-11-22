@@ -36,7 +36,7 @@ use crate::spatial_audio::{
     SoundSource, SpatialAudioEngine, SpatialAudioPreset, SpatialSubtitleCue, VoxelAcousticWorld,
 };
 use crate::world::WorldState;
-use mc_spine_client_mesh::tactile_effects::EnvironmentAudioHint;
+use megu_client_mesh::tactile_effects::EnvironmentAudioHint;
 
 /// Default spatial-audio sample rate (matches the `VCR1` PCM path).
 const DEFAULT_SAMPLE_RATE: u32 = 48_000;
@@ -1264,9 +1264,9 @@ mod tests {
     fn test_env() -> ReportEnv {
         ReportEnv {
             mc_version: "26.3".to_string(),
-            engine_version: "mc-spine-client 0.1.0".to_string(),
+            engine_version: "megu-client 0.1.0".to_string(),
             os: "linux-x86_64".to_string(),
-            culprit: "mc-spine-client".to_string(),
+            culprit: "megu-client".to_string(),
             subsystem: None,
             stage: None,
             gpu_class: None,
@@ -1277,7 +1277,7 @@ mod tests {
 
     fn scratch_dir(tag: &str) -> PathBuf {
         let dir =
-            std::env::temp_dir().join(format!("mc-spine-session-{tag}-{}", std::process::id()));
+            std::env::temp_dir().join(format!("megu-session-{tag}-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         dir
     }

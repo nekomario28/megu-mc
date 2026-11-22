@@ -1,26 +1,26 @@
 [package]
-name = "mc-spine-proto"
+name = "megu-proto"
 version = "0.1.0"
 edition = "2021"
 publish = false
 license = "LGPL-3.0-or-later"
-description = "Standalone canonical protocol IR, versioned protocol tables and the protocol-767 codec for mc-spine"
+description = "Standalone canonical protocol IR, versioned protocol tables and the protocol-767 codec for megu"
 
 # Zero external dependencies by contract: this crate is the clean-room protocol
 # core both the server (`src/play_protocol.rs`) and the client
 # (`client-app/src/protocol.rs`) can share, so it must build on pure `std`.
-# `mc-spine-core` is the in-repo leaf crate (also zero-dependency) that owns the
+# `megu-core` is the in-repo leaf crate (also zero-dependency) that owns the
 # canonical 1.21.1/26.3 `TargetVersion`/`VersionMeta` constants this crate
 # derives its version tables from — still no crates.io dependencies.
 [dependencies]
-mc_spine_core = { package = "mc-spine-core", path = "../core" }
+megu_core = { package = "megu-core", path = "../core" }
 
 [[bin]]
-name = "mc-spine-voice-relay"
+name = "megu-voice-relay"
 path = "src/bin/voice_relay.rs"
 
 [[bin]]
-name = "mc-spine-friend-relay"
+name = "megu-friend-relay"
 path = "src/bin/friend_relay.rs"
 
 # Standalone manifest: the root `[profile.release]` is not inherited, so the

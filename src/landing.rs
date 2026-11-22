@@ -9,8 +9,8 @@ use std::sync::mpsc::{self, SyncSender};
 static CALLBACKS: OnceLock<SyncSender<Request>> = OnceLock::new();
 
 pub fn initialize() -> Result<(), String> {
-    let fabric = std::env::var_os("MC_SPINE_FABRIC_CLASSPATH");
-    let neoforge = std::env::var_os("MC_SPINE_NEOFORGE_CLASSPATH");
+    let fabric = std::env::var_os("MEGU_FABRIC_CLASSPATH");
+    let neoforge = std::env::var_os("MEGU_NEOFORGE_CLASSPATH");
     if fabric.is_some() && neoforge.is_some() {
         return Err("Select only one Java loader adapter".into());
     }
@@ -33,9 +33,9 @@ pub fn initialize() -> Result<(), String> {
     {
         let _ = classpath;
         match loader {
-            Loader::Fabric => Err("MC_SPINE_FABRIC_CLASSPATH requires --features fabric-probe".into()),
+            Loader::Fabric => Err("MEGU_FABRIC_CLASSPATH requires --features fabric-probe".into()),
             Loader::NeoForge => {
-                Err("MC_SPINE_NEOFORGE_CLASSPATH requires --features neoforge-events".into())
+                Err("MEGU_NEOFORGE_CLASSPATH requires --features neoforge-events".into())
             }
         }
     }

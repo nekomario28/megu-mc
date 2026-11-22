@@ -5,7 +5,7 @@
 
 use std::collections::BTreeMap;
 
-use mc_spine_client_mesh::atlas::*;
+use megu_client_mesh::atlas::*;
 
 // ---------------------------------------------------------------------------
 // Helpers

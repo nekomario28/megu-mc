@@ -22,7 +22,7 @@ use mod_adapter_core::version_compat::McVersion;
 #[test]
 fn fair_play_config_parses_server_properties_and_toml_pairs() {
     let text = r#"
-# mc-spine fair-play section
+# megu fair-play section
 motd=fairest of them all
 view-distance: 10
 
@@ -41,7 +41,7 @@ world-level-id = 13371337
 
     // TOML-style quoted values and prefixed/dotted keys land on the same fields.
     let cfg = MapFairPlayConfig::from_kv_pairs([
-        ("mc_spine.fair-play", "\"true\""),
+        ("megu.fair-play", "\"true\""),
         ("allow_cave_map", "'false'"),
         ("xaero.allow-entity-radar", "off"),
         ("world_level_id", "-42"),

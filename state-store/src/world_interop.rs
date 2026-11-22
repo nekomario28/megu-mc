@@ -113,7 +113,7 @@ pub enum WorldLoaderOrigin {
     Vanilla,
     NeoForge,
     Fabric,
-    McSpine,
+    Megu,
     HybridModded { detected_brands: Vec<String> },
     Unknown,
 }
@@ -830,7 +830,7 @@ fn origin_for(brands: &[String], tags: &BTreeMap<String, DataValue>) -> WorldLoa
     for brand in brands {
         let lowered = brand.to_ascii_lowercase();
         match lowered.as_str() {
-            "vanilla" | "neoforge" | "fabric" | "mc-spine" => {
+            "vanilla" | "neoforge" | "fabric" | "megu" => {
                 observed.insert(lowered);
             }
             _ => {}
@@ -857,7 +857,7 @@ fn origin_for(brands: &[String], tags: &BTreeMap<String, DataValue>) -> WorldLoa
         Some("vanilla") => WorldLoaderOrigin::Vanilla,
         Some("neoforge") => WorldLoaderOrigin::NeoForge,
         Some("fabric") => WorldLoaderOrigin::Fabric,
-        Some("mc-spine") => WorldLoaderOrigin::McSpine,
+        Some("megu") => WorldLoaderOrigin::Megu,
         _ if brands.is_empty() => WorldLoaderOrigin::Vanilla,
         _ => WorldLoaderOrigin::Unknown,
     }

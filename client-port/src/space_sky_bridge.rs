@@ -1261,7 +1261,7 @@ fn parse_body(v: &JVal, force_below_horizon: bool) -> Result<PlanetSkyBody, Stri
 }
 
 /// Parse planet/orbit dimension metadata from JSON. Accepts both the
-/// `mc-spine` space schema (`dimension_id`, `gravity_scale`,
+/// `megu` space schema (`dimension_id`, `gravity_scale`,
 /// `atmosphere_density`, `sky_tint_rgb`, `parent_body`, `sky_bodies`) and
 /// Ad Astra-style keys (`dimension`, `gravity` in m/s², `oxygen`,
 /// `temperature`, `solar_power`, `orbit`, `tier` — the descriptive keys are

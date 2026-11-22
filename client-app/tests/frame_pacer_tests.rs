@@ -4,15 +4,15 @@
 
 use std::path::PathBuf;
 
-use mc_spine_client::cli::parse_args;
-use mc_spine_client::frame_pacer::{FrameBudgetPacer, FrameStats, FRAME_STATS_WINDOW};
-use mc_spine_client::settings::{
+use megu_client::cli::parse_args;
+use megu_client::frame_pacer::{FrameBudgetPacer, FrameStats, FRAME_STATS_WINDOW};
+use megu_client::settings::{
     ClientSettings, FPS_SLIDER_PRESETS, MAX_MAX_FPS, MIN_MAX_FPS, VANILLA_OPTIONS_UNLIMITED_FPS,
 };
 
 fn scratch_dir(tag: &str) -> PathBuf {
     let dir =
-        std::env::temp_dir().join(format!("mc-spine-frame-pacer-{tag}-{}", std::process::id()));
+        std::env::temp_dir().join(format!("megu-frame-pacer-{tag}-{}", std::process::id()));
     std::fs::create_dir_all(&dir).unwrap();
     dir
 }
@@ -351,7 +351,7 @@ fn pacer_end_frame_feeds_the_sliding_window() {
 
 #[test]
 fn pacer_window_drives_upload_budget_adaptation() {
-    use mc_spine_client_mesh::ChunkUploadBudget;
+    use megu_client_mesh::ChunkUploadBudget;
 
     let mut pacer = FrameBudgetPacer::default().with_target_frame_us(16_667);
     let mut budget = ChunkUploadBudget::new();

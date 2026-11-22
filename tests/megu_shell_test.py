@@ -141,7 +141,7 @@ class HistoryStoreTest(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
         self.addCleanup(self.tmp.cleanup)
-        self.path = Path(self.tmp.name) / ".mc-spine-history"
+        self.path = Path(self.tmp.name) / ".megu-history"
         self.h = shell.HistoryStore(self.path)
 
     def test_round_trip(self):
@@ -177,7 +177,7 @@ class HistoryStoreTest(unittest.TestCase):
         self.h.add("seed")
         self.h.save()
         self.assertTrue(self.path.exists())
-        self.assertFalse((self.path.parent / ".mc-spine-history.tmp").exists())
+        self.assertFalse((self.path.parent / ".megu-history.tmp").exists())
         self.assertEqual(self.path.read_text().splitlines(), ["seed"])
 
     def test_suggest_most_recent_prefix(self):

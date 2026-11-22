@@ -1,17 +1,17 @@
 // SPDX-License-Identifier: LGPL-3.0-or-later OR GPL-3.0-or-later OR AGPL-3.0-or-later
 //! Concurrency, determinism and low-spec topology tests for
-//! `mc_spine_core::task_pool`.
+//! `megu_core::task_pool`.
 
 use std::hint::spin_loop;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
-use mc_spine_core::hw_adaptive_engine::{
+use megu_core::hw_adaptive_engine::{
     CacheDomainTopology, CoreHeterogeneity, ExtendedSimdTier, GpuComputeParadigm, HostHardwareCaps,
     MemoryFootprintClass, MemoryTopology, PowerThermalProfile, SimdKernelTier, StorageIoClass,
     UniversalHardwareProfile,
 };
-use mc_spine_core::task_pool::{MeguTaskPool, PoolTopologyConfig, TaskLane};
+use megu_core::task_pool::{MeguTaskPool, PoolTopologyConfig, TaskLane};
 
 /// Bounded spin-wait: returns as soon as `condition` holds, `false` after
 /// a generous iteration budget so a scheduling bug fails instead of

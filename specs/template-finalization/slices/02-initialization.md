@@ -58,7 +58,7 @@ static biome registry to satisfy that — the same wall the sculk path hit. So t
 route is **not** "more harness": it needs either a registry access loaded from the
 vanilla data half of a real startup, or a captured run inside a running server.
 
-Log: `~/.cache/mc-spine-audit/save-booking-20261110/init-probe-attempt.log`.
+Log: `~/.cache/megu-audit/save-booking-20261110/init-probe-attempt.log`.
 
 ### Attempt 2 (2026-11-11): datapack registry access — chunk constructs, entity does not
 
@@ -328,7 +328,7 @@ Slot/id/count), the loot-table shadowing rule, the rotated cells, and the genera
 `LootTableSeed` all come from `tests/data/template_init_1211.tsv`.
 
 Stopped here with the WIP patch stored outside the repository
-(`~/.cache/mc-spine-audit/save-booking-20261110/init-port-wip.patch`): it adds a
+(`~/.cache/megu-audit/save-booking-20261110/init-port-wip.patch`): it adds a
 `Tag` decoder plus generation-owned container staging, and it is only useful once a
 general placement path exists to stage into. The next slice is that path (or an
 explicit decision to let non-fossil templates reuse the solid placement with a

@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Compare vanilla 1.21.1 and mc-spine under a moving viewer, not at idle.
+# Compare vanilla 1.21.1 and megu under a moving viewer, not at idle.
 #
 # tools/idle_compare.sh measures a server nobody is on. That number says nothing
 # about the goal, because the work a lightweight server exists to make cheap is
@@ -13,7 +13,7 @@
 #
 #   tools/load_compare.sh [seconds] [seed]
 #
-# It is still not an apples-to-apples feature comparison: mc-spine implements
+# It is still not an apples-to-apples feature comparison: megu implements
 # fewer features, so part of any difference is "does less", not "does it
 # cheaper". Compression is disabled on both sides so the two speak the identical
 # protocol and neither pays for a codec the other does not.
@@ -22,7 +22,7 @@ set -euo pipefail
 SECONDS_WINDOW="${1:-20}"
 SEED="${2:-0}"
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
-WORK="${MC_SPINE_LOAD_WORK:-$HOME/.cache/mc-spine-audit/load}"
+WORK="${MEGU_LOAD_WORK:-$HOME/.cache/megu-audit/load}"
 VANILLA_DIR="$WORK/vanilla"
 SPINE_DIR="$WORK/spine"
 JAR="$WORK/server.jar"
@@ -117,7 +117,7 @@ sample_load() { # pid port loadout -> "cpu(s) rss(MiB) threads chunks ms/chunk"
   printf '%s\n' "$load" > "$out"
   # The driver reports the chunks each server actually delivered. Without the
   # count a CPU number is unattributable: the same window cost 4.2 s for nine
-  # vanilla chunks and 20.6 s for eighty-one mc-spine chunks.
+  # vanilla chunks and 20.6 s for eighty-one megu chunks.
   chunks=$(printf '%s\n' "$load" | sed -n 's/.*chunks_login=\([0-9]*\).*chunks_drive=\([0-9]*\).*/\1 \2/p' \
            | awk 'NF{print $1+$2; exit}')
   [ -n "$chunks" ] || chunks=0
@@ -140,7 +140,7 @@ mkdir -p "$WORK"
 if ! jar_ok "$JAR"; then
   # Reuse a pinned jar already on the host before reaching for the network: an
   # offline run must measure the same build, not fail because it cannot fetch.
-  for candidate in "${MC_SPINE_VANILLA_JAR_CACHE:-$HOME/tmpx/carverfresh/server.jar}" /tmp/idle-compare/server.jar; do
+  for candidate in "${MEGU_VANILLA_JAR_CACHE:-$HOME/tmpx/carverfresh/server.jar}" /tmp/idle-compare/server.jar; do
     if jar_ok "$candidate"; then
       echo "reusing the pinned vanilla server jar from $candidate"
       cp "$candidate" "$JAR"
@@ -167,10 +167,10 @@ VAN=$(sample_load "$VPID" "$VAN_PORT" "$WORK/van-load.txt")
 kill "$VPID" 2>/dev/null || true; wait "$VPID" 2>/dev/null || true
 VPID=
 
-echo "-- mc-spine, datapack worldgen, seed $SEED, moving viewer ${SECONDS_WINDOW}s"
+echo "-- megu, datapack worldgen, seed $SEED, moving viewer ${SECONDS_WINDOW}s"
 # Build into the directory this script runs from. With CARGO_TARGET_DIR exported (the project's
 # own workflow sets it) a bare `cargo build` writes elsewhere and the run below executes a stale
-# `$ROOT/target/release/mc-spine`, silently measuring a binary nobody just built.
+# `$ROOT/target/release/megu`, silently measuring a binary nobody just built.
 cargo build --release --offline --locked -j 4 --target-dir "$ROOT/target" --manifest-path "$ROOT/Cargo.toml" >/dev/null
 rm -rf "$SPINE_DIR"; mkdir -p "$SPINE_DIR"
 ln -s "$ROOT/datapacks" "$SPINE_DIR/datapacks"
@@ -181,10 +181,10 @@ ln -s "$ROOT/assets" "$SPINE_DIR/assets"
 # No resource pack, so the configuration exchange matches vanilla's and the
 # driver reaches finish-configuration without a pack handshake. Anti-cheat off: the
 # driver climbs 4 blocks per packet with no world model, which vanilla only accepts
-# because it runs in creative; a survival mc-spine viewer would be pulled back.
-( cd "$SPINE_DIR" && MC_SPINE_PORT="$SPINE_PORT" MC_SPINE_SEED="$SEED" MC_SPINE_RESOURCE_PACK_URL="" \
-    MC_SPINE_COMPRESSION_THRESHOLD=-1 \
-    MC_SPINE_ANTICHEAT=off exec "$ROOT/target/release/mc-spine" ) > "$SPINE_DIR/spine.log" 2>&1 &
+# because it runs in creative; a survival megu viewer would be pulled back.
+( cd "$SPINE_DIR" && MEGU_PORT="$SPINE_PORT" MEGU_SEED="$SEED" MEGU_RESOURCE_PACK_URL="" \
+    MEGU_COMPRESSION_THRESHOLD=-1 \
+    MEGU_ANTICHEAT=off exec "$ROOT/target/release/megu" ) > "$SPINE_DIR/spine.log" 2>&1 &
 SPID=$!
 wait_for_line "$SPINE_DIR/spine.log" "$SPID" 'listening' 60
 SPI=$(sample_load "$SPID" "$SPINE_PORT" "$WORK/spine-load.txt")
@@ -194,8 +194,8 @@ SPID=
 
 printf '\n%-12s %8s %9s %8s %9s %10s\n' "load ${SECONDS_WINDOW}s" "cpu(s)" "rss(MiB)" "threads" "chunks" "ms/chunk"
 row vanilla "$VAN"
-row mc-spine "$SPI"
+row megu "$SPI"
 printf 'vanilla   driver: %s\n' "$(cat "$WORK/van-load.txt")"
-printf 'mc-spine  driver: %s\n' "$(cat "$WORK/spine-load.txt")"
+printf 'megu  driver: %s\n' "$(cat "$WORK/spine-load.txt")"
 echo
-echo "caveat: mc-spine implements fewer features, so this is not a like-for-like feature comparison."
+echo "caveat: megu implements fewer features, so this is not a like-for-like feature comparison."

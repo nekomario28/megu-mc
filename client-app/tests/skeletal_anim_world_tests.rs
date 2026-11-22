@@ -1,8 +1,8 @@
 // SPDX-License-Identifier: LGPL-3.0-or-later OR GPL-3.0-or-later OR AGPL-3.0-or-later
 
-use mc_spine_client::protocol::DimensionMeta;
-use mc_spine_client::world::{BlockTable, WorldState};
-use mc_spine_kernel::skeletal_anim::{
+use megu_client::protocol::DimensionMeta;
+use megu_client::world::{BlockTable, WorldState};
+use megu_kernel::skeletal_anim::{
     encode_animation_trigger, parse_animation_json, parse_geometry_json, AnimationError,
     AnimationTrigger, BoneMask, LoopMode, ANM1_BYTES,
 };

@@ -60,7 +60,7 @@ def reference(jar, requested=None):
     with pinned_runtime(jar) as (work, cp, _inner):
         input_path, output_path = work / "cases.json", work / "results.json"
         input_path.write_text(json.dumps(requested))
-        run_probe(work, cp, SOURCE, "dev.mcspine.tools.ContainerOracle", input_path, output_path)
+        run_probe(work, cp, SOURCE, "dev.megu.tools.ContainerOracle", input_path, output_path)
         rows = json.loads(output_path.read_text())
     if not rows or len(rows) != len(requested):
         raise ValueError("empty or truncated container reference")

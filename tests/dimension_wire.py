@@ -22,7 +22,7 @@ from protocol767 import Client, ContractFailure, local_server, parse_respawn, re
 
 # The wire fixture drives the server as a player. This opt-in exists for local
 # compatibility testing, and the commands below are exactly the cross-dimension ones S4 adds.
-os.environ["MC_SPINE_ALLOW_PLAYER_ADMIN_COMMANDS"] = "1"
+os.environ["MEGU_ALLOW_PLAYER_ADMIN_COMMANDS"] = "1"
 os.environ.setdefault("MC_PROBE_DEADLINE", "30")
 
 

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Differential Protocol 767 client. Default runs two mc-spine consistency sessions."""
+"""Differential Protocol 767 client. Default runs two megu consistency sessions."""
 
 import argparse
 import json
@@ -143,9 +143,9 @@ def compare(left, right):
             comparisons[name] = {"status": "MISMATCH", "reason": "scenario missing"}
             continue
         failures = {side: errors for side, errors in
-                    (("mc_spine", validate(name, a)), ("reference", validate(name, b)))
+                    (("megu", validate(name, a)), ("reference", validate(name, b)))
                     if errors}
-        diffs = {key: {"mc_spine": a.get(key), "reference": b.get(key)}
+        diffs = {key: {"megu": a.get(key), "reference": b.get(key)}
                  for key in COMPARISON_FIELDS[name] if a.get(key) != b.get(key)}
         row = {"status": "MISMATCH" if failures or diffs else "PASS",
                "differences": diffs, "validation_failures": failures}
@@ -154,7 +154,7 @@ def compare(left, right):
             limit = 0.03 if name == "submerged_ticks" else 1e-5
             if len(positions_a) != len(positions_b):
                 diffs["server_positions_length"] = {
-                    "mc_spine": len(positions_a), "reference": len(positions_b)}
+                    "megu": len(positions_a), "reference": len(positions_b)}
             else:
                 delta = max((abs(x - y) for pa, pb in zip(positions_a, positions_b)
                              for x, y in zip(pa, pb)), default=0)
@@ -162,7 +162,7 @@ def compare(left, right):
                 row["position_tolerance"] = limit
                 if delta > limit:
                     diffs["server_positions"] = {
-                        "mc_spine": positions_a, "reference": positions_b,
+                        "megu": positions_a, "reference": positions_b,
                         "max_delta": delta, "tolerance": limit}
             if diffs:
                 row["status"] = "MISMATCH"
@@ -174,7 +174,7 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--with-vanilla", action="store_true", help="spawn pinned official JVM")
     parser.add_argument("--vanilla-jar", type=Path, default=JAR)
-    parser.add_argument("--binary", type=Path, default=ROOT / "target/debug/mc-spine")
+    parser.add_argument("--binary", type=Path, default=ROOT / "target/debug/megu")
     parser.add_argument("--build", action="store_true", help="build Rust with offline lockfile")
     args = parser.parse_args()
     (ROOT / "target/tmp").mkdir(parents=True, exist_ok=True)
@@ -186,15 +186,15 @@ def main():
         parser.error(f"missing server binary {binary}")
     os.environ.setdefault("MC_PROBE_DEADLINE", "30")
     assert HARNESS_ROOT == ROOT
-    left = run_target("mc-spine", binary, args.vanilla_jar)
-    right_kind = "vanilla" if args.with_vanilla else "mc-spine"
+    left = run_target("megu", binary, args.vanilla_jar)
+    right_kind = "vanilla" if args.with_vanilla else "megu"
     right = run_target(right_kind, binary, args.vanilla_jar)
     comparisons = compare(left, right)
     report = {
         "protocol": 767,
         "mode": "vanilla-differential" if args.with_vanilla else "self-consistency",
         "seed": 4242,
-        "mc_spine": left,
+        "megu": left,
         "reference": right,
         "scenarios": comparisons,
     }

@@ -2,11 +2,11 @@
 # SPDX-License-Identifier: LGPL-3.0-or-later OR GPL-3.0-or-later OR AGPL-3.0-or-later
 """End-to-end test of the whole Client Fork stack.
 
-CF-0 client-kernel + CF-2 client-port + client-app mc-spine-client are built
+CF-0 client-kernel + CF-2 client-port + client-app megu-client are built
 (if absent), exported by CF-4 export_launcher_bundle.py into a Prism instance
-and a Modrinth .mrpack, and the exported mc-spine-wrapper is then executed
+and a Modrinth .mrpack, and the exported megu-wrapper is then executed
 exactly as Prism would (WrapperCommand + a fake JVM command line) against a
-real mc-spine server on an ephemeral loopback port.
+real megu server on an ephemeral loopback port.
 
 Usage: python3 tests/client_fork_e2e.py [server_binary] [--ticks N] [--self-test]
 """
@@ -31,12 +31,12 @@ import zipfile
 ROOT = Path(__file__).resolve().parent.parent
 LAUNCHER_DIR = ROOT / "tools/client_launcher"
 EXPORTER = LAUNCHER_DIR / "export_launcher_bundle.py"
-WRAPPER_SOURCE = LAUNCHER_DIR / "mc-spine-wrapper"
+WRAPPER_SOURCE = LAUNCHER_DIR / "megu-wrapper"
 
-MESH_NAME = "libmc_spine_client_mesh.so"
-KERNEL_NAME = "libmc_spine_kernel.so"
-JAR_NAME = "mc-spine-integrated.jar"
-MRPACK_NAME = "mc-spine-1.21.1.mrpack"
+MESH_NAME = "libmegu_client_mesh.so"
+KERNEL_NAME = "libmegu_kernel.so"
+JAR_NAME = "megu-integrated.jar"
+MRPACK_NAME = "megu-1.21.1.mrpack"
 LOADER = "neoforge"
 LOADER_VERSION = "21.1.215"
 
@@ -45,7 +45,7 @@ ARTIFACTS = (
     # (crate directory, artifact relative to the crate directory)
     ("client-kernel", f"target/release/{KERNEL_NAME}"),
     ("client-port", f"target/release/{MESH_NAME}"),
-    ("client-app", "target/release/mc-spine-client"),
+    ("client-app", "target/release/megu-client"),
 )
 SERVER_FILES = ("assets", "datapacks", "config_packets.bin")
 
@@ -169,8 +169,8 @@ def wrapper_argv(wrapper, private_tokens, client_bin, game):
 
 def wrapper_env():
     env = dict(os.environ)
-    env.pop("MC_SPINE_CLIENT_BIN", None)
-    env.pop("MC_SPINE_CLIENT_SHA256", None)
+    env.pop("MEGU_CLIENT_BIN", None)
+    env.pop("MEGU_CLIENT_SHA256", None)
     return env
 
 
@@ -251,7 +251,7 @@ def ensure_server(server, explicit):
     if server.is_file():
         return server.resolve()
     check(not explicit, f"server binary {server} does not exist")
-    log("building mc-spine (debug)")
+    log("building megu (debug)")
     subprocess.run(["cargo", "build", *CARGO_FLAGS], cwd=ROOT, check=True, timeout=BUILD_TIMEOUT)
     check(server.is_file(), f"build did not produce {server}")
     return server.resolve()
@@ -271,8 +271,8 @@ def export_bundle(out_dir, client_bin, mesh, kernel):
 
 def verify_prism(prism, client_bin, mesh, kernel):
     expected = {
-        "mc-spine-wrapper": WRAPPER_SOURCE,
-        "bin/mc-spine-client": client_bin,
+        "megu-wrapper": WRAPPER_SOURCE,
+        "bin/megu-client": client_bin,
         f"native/{MESH_NAME}": mesh,
         f"native/{KERNEL_NAME}": kernel,
     }
@@ -282,15 +282,15 @@ def verify_prism(prism, client_bin, mesh, kernel):
         exported = prism / relative
         check(exported.is_file(), f"prism/{relative} missing")
         check(file_hash(exported) == file_hash(source), f"prism/{relative} hash mismatch")
-    for relative in ("mc-spine-wrapper", "bin/mc-spine-client"):
+    for relative in ("megu-wrapper", "bin/megu-client"):
         check(os.access(prism / relative, os.X_OK), f"prism/{relative} is not executable")
 
     wrapper, private, parsed = parse_wrapper_command(cfg.read_text(encoding="utf-8"))
-    check(Path(wrapper).resolve() == (prism / "mc-spine-wrapper").resolve(),
+    check(Path(wrapper).resolve() == (prism / "megu-wrapper").resolve(),
           f"WrapperCommand points at {wrapper}, not the exported wrapper")
     pinned = parsed["--client-sha256"].lower()
-    check(pinned == file_hash(prism / "bin/mc-spine-client"),
-          "WrapperCommand --client-sha256 does not match exported bin/mc-spine-client")
+    check(pinned == file_hash(prism / "bin/megu-client"),
+          "WrapperCommand --client-sha256 does not match exported bin/megu-client")
     check(pinned == file_hash(client_bin), "WrapperCommand pin does not match built client")
     return Path(wrapper), private, pinned
 
@@ -301,13 +301,13 @@ def verify_mrpack(out_dir, prism, mesh, kernel):
     with zipfile.ZipFile(bundle) as archive:
         check(archive.testzip() is None, f"{MRPACK_NAME} has a corrupt entry")
         index = json.loads(archive.read("modrinth.index.json"))
-        bundled = index.get("mcSpine", {}).get("bundledOverrides")
-        check(isinstance(bundled, dict), "modrinth.index.json lacks mcSpine.bundledOverrides")
+        bundled = index.get("megu", {}).get("bundledOverrides")
+        check(isinstance(bundled, dict), "modrinth.index.json lacks megu.bundledOverrides")
         check(index.get("dependencies", {}).get(LOADER) == LOADER_VERSION,
               "modrinth.index.json does not pin the NeoForge loader version")
         sources = {
-            f"mc-spine/native/{MESH_NAME}": Path(mesh).read_bytes(),
-            f"mc-spine/native/{KERNEL_NAME}": Path(kernel).read_bytes(),
+            f"megu/native/{MESH_NAME}": Path(mesh).read_bytes(),
+            f"megu/native/{KERNEL_NAME}": Path(kernel).read_bytes(),
             f"mods/{JAR_NAME}": (prism / ".minecraft/mods" / JAR_NAME).read_bytes(),
         }
         for path, content in sources.items():
@@ -337,14 +337,14 @@ def start_server(server, workdir, port, flat):
         check(source.exists(), f"server input {source} missing")
         (workdir / name).symlink_to(source.resolve())
     env = dict(os.environ)
-    for key in ("MC_SPINE_RCON_PORT", "MC_SPINE_RCON_PASS", "MC_SPINE_WG_PROFILE"):
+    for key in ("MEGU_RCON_PORT", "MEGU_RCON_PASS", "MEGU_WG_PROFILE"):
         env.pop(key, None)
-    env.update(MC_SPINE_PORT=str(port), MC_SPINE_COMPRESSION_THRESHOLD="64")
+    env.update(MEGU_PORT=str(port), MEGU_COMPRESSION_THRESHOLD="64")
     if flat:
-        env["MC_SPINE_WG"] = "old"
+        env["MEGU_WG"] = "old"
     else:
-        env.pop("MC_SPINE_WG", None)
-        env["MC_SPINE_SEED"] = "0"
+        env.pop("MEGU_WG", None)
+        env["MEGU_SEED"] = "0"
     log_path = workdir / "server.log"
     stream = log_path.open("wb")
     process = subprocess.Popen([str(server)], cwd=workdir, env=env, stdin=subprocess.DEVNULL,
@@ -377,7 +377,7 @@ def stop_server(process):
 # ---------------------------------------------------------------- scenarios
 
 def run_client(wrapper, private, prism, port, ticks):
-    argv = wrapper_argv(wrapper, private, prism / "bin/mc-spine-client", game_arguments(port, ticks))
+    argv = wrapper_argv(wrapper, private, prism / "bin/megu-client", game_arguments(port, ticks))
     result = run(argv, timeout=CLIENT_TIMEOUT, cwd=prism, env=wrapper_env())
     assert_no_secret(SECRET, stdout=result.stdout, stderr=result.stderr)
     check(result.returncode == 0,
@@ -388,9 +388,9 @@ def run_client(wrapper, private, prism, port, ticks):
 
 
 def run_tamper(wrapper, private, prism, scratch, port, ticks):
-    tampered = scratch / "tampered/mc-spine-client"
-    flip_byte(prism / "bin/mc-spine-client", tampered)
-    check(file_hash(tampered) != file_hash(prism / "bin/mc-spine-client"), "tampering had no effect")
+    tampered = scratch / "tampered/megu-client"
+    flip_byte(prism / "bin/megu-client", tampered)
+    check(file_hash(tampered) != file_hash(prism / "bin/megu-client"), "tampering had no effect")
     argv = wrapper_argv(wrapper, private, tampered, game_arguments(port, ticks))
     result = run(argv, timeout=60, cwd=prism, env=wrapper_env())
     assert_no_secret(SECRET, stdout=result.stdout, stderr=result.stderr)
@@ -402,9 +402,9 @@ def run_tamper(wrapper, private, prism, scratch, port, ticks):
 
 def e2e(server_arg, ticks, flat, keep):
     explicit = server_arg is not None
-    server = ensure_server(Path(server_arg or ROOT / "target/debug/mc-spine"), explicit)
+    server = ensure_server(Path(server_arg or ROOT / "target/debug/megu"), explicit)
     artifacts = ensure_artifacts(ROOT)
-    client_bin = artifacts["mc-spine-client"]
+    client_bin = artifacts["megu-client"]
     mesh, kernel = artifacts[MESH_NAME], artifacts[KERNEL_NAME]
 
     scratch = Path(tempfile.mkdtemp(prefix="client-fork-e2e-"))
@@ -422,7 +422,7 @@ def e2e(server_arg, ticks, flat, keep):
         server_dir.mkdir()
         port = free_port()
         process, server_log = start_server(server, server_dir, port, flat)
-        log(f"mc-spine listening on 127.0.0.1:{port}")
+        log(f"megu listening on 127.0.0.1:{port}")
         summary = run_client(wrapper, private, prism, port, ticks)
         log("client summary: " + json.dumps(summary, sort_keys=True))
         run_tamper(wrapper, private, prism, scratch, port, ticks)
@@ -453,14 +453,14 @@ def expect_failure(function, *args, **kwargs):
 def self_test():
     sha = "ab" * 32
     wrapper, private, parsed = parse_wrapper_command(
-        "[General]\nInstanceType=OneSix\nname=mc-spine 1.21.1\nOverrideCommands=true\n"
-        f'WrapperCommand="/inst dir/prism/mc-spine-wrapper" --client-sha256 {sha}\n')
-    check(wrapper == "/inst dir/prism/mc-spine-wrapper", f"bad wrapper path {wrapper!r}")
+        "[General]\nInstanceType=OneSix\nname=megu 1.21.1\nOverrideCommands=true\n"
+        f'WrapperCommand="/inst dir/prism/megu-wrapper" --client-sha256 {sha}\n')
+    check(wrapper == "/inst dir/prism/megu-wrapper", f"bad wrapper path {wrapper!r}")
     check(private == ["--client-sha256", sha], f"bad private tokens {private!r}")
     check(parsed == {"--client-sha256": sha}, f"bad parsed options {parsed!r}")
     _, _, parsed = parse_wrapper_command(
-        f"WrapperCommand=/w --client-bin=/x/mc-spine-client --client-sha256={sha.upper()}")
-    check(parsed["--client-bin"] == "/x/mc-spine-client", "--key=value form not parsed")
+        f"WrapperCommand=/w --client-bin=/x/megu-client --client-sha256={sha.upper()}")
+    check(parsed["--client-bin"] == "/x/megu-client", "--key=value form not parsed")
     for bad in ("[General]\nname=x\n",
                 'WrapperCommand="/w"\n',
                 "WrapperCommand=/w --client-sha256 1234\n",
@@ -512,10 +512,10 @@ def self_test_wrapper(scratch):
     """Drive the real wrapper with a fake (script) client: no compiled binaries."""
     prism = scratch / "prism dir"
     (prism / "bin").mkdir(parents=True)
-    wrapper = prism / "mc-spine-wrapper"
+    wrapper = prism / "megu-wrapper"
     shutil.copyfile(WRAPPER_SOURCE, wrapper)
     wrapper.chmod(0o755)
-    client = prism / "bin/mc-spine-client"
+    client = prism / "bin/megu-client"
     client.write_text(f"#!{sys.executable}\nimport json, sys\n"
                       "print(json.dumps({'argv': sys.argv[1:]}))\n", encoding="utf-8")
     client.chmod(0o755)
@@ -528,7 +528,7 @@ def self_test_wrapper(scratch):
     check(parse_summary(result.stdout)["argv"] == game,
           "wrapper did not forward exactly the game arguments")
 
-    tampered = scratch / "tampered/mc-spine-client"
+    tampered = scratch / "tampered/megu-client"
     flip_byte(client, tampered, offset=len(client.read_bytes()) - 2)
     for token_args in (game, [arg.replace("--accessToken", f"--accessToken={SECRET}")
                               if arg == "--accessToken" else arg
@@ -554,10 +554,10 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__,
                                      formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("server_binary", nargs="?",
-                        help="mc-spine server binary (default: target/debug/mc-spine)")
+                        help="megu server binary (default: target/debug/megu)")
     parser.add_argument("--ticks", type=int, default=20, help="client ticks to run (default 20)")
     parser.add_argument("--flat", action="store_true",
-                        help="use the old flat generator (MC_SPINE_WG=old) instead of seed 0")
+                        help="use the old flat generator (MEGU_WG=old) instead of seed 0")
     parser.add_argument("--keep-temp", action="store_true", help="keep the scratch directory")
     parser.add_argument("--self-test", action="store_true",
                         help="offline checks of the parser and tamper/redaction helpers")

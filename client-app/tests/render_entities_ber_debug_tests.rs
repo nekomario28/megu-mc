@@ -1,21 +1,21 @@
 // SPDX-License-Identifier: LGPL-3.0-or-later OR GPL-3.0-or-later OR AGPL-3.0-or-later
-//! Coverage for the additive overlay renderers in `mc_spine_client::render`:
+//! Coverage for the additive overlay renderers in `megu_client::render`:
 //! articulated entity rigs, vanilla BER meshes, billboard particles, and the
 //! F3+G chunk-border / F3+B hitbox debug wireframes — all composited into
 //! deterministic software-framebuffer PNG captures.
 
 use std::collections::HashSet;
 
-use mc_spine_client::render::{
+use megu_client::render::{
     render_debug_lines, render_entity_rig, render_entity_rig_facing, render_vanilla_ber,
     render_vanilla_ber_state, render_vanilla_particles, FrameBuffer, OverlayCamera,
 };
-use mc_spine_client_mesh::ber_instancing::{
+use megu_client_mesh::ber_instancing::{
     VanillaBerFacing, VanillaBerKind, VanillaBerState, VanillaParticleKind, VanillaParticleWorld,
 };
-use mc_spine_client_mesh::entity_rig::EntityPose;
-use mc_spine_kernel::debug_chords::{build_chunk_border_lines, build_entity_hitbox_lines, DebugLine};
-use mc_spine_kernel::Aabb;
+use megu_client_mesh::entity_rig::EntityPose;
+use megu_kernel::debug_chords::{build_chunk_border_lines, build_entity_hitbox_lines, DebugLine};
+use megu_kernel::Aabb;
 
 const WIDTH: u32 = 320;
 const HEIGHT: u32 = 180;

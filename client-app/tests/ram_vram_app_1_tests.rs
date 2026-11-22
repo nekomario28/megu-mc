@@ -7,9 +7,9 @@
 
 use std::collections::BTreeSet;
 
-use mc_spine_client::protocol::{DecodedChunk, DecodedLightData, DecodedSection, DimensionMeta};
-use mc_spine_client::world::{BlockTable, WorldState};
-use mc_spine_client_mesh::SectionCoord;
+use megu_client::protocol::{DecodedChunk, DecodedLightData, DecodedSection, DimensionMeta};
+use megu_client::world::{BlockTable, WorldState};
+use megu_client_mesh::SectionCoord;
 
 const STONE: u32 = 1;
 const WATER: u32 = 80;
@@ -29,9 +29,9 @@ fn uniform_section(state: u32) -> DecodedSection {
         non_air: if state == AIR {
             0
         } else {
-            mc_spine_client_mesh::SECTION_CELLS as i16
+            megu_client_mesh::SECTION_CELLS as i16
         },
-        states: Box::new([state; mc_spine_client_mesh::SECTION_CELLS]),
+        states: Box::new([state; megu_client_mesh::SECTION_CELLS]),
         biomes: [0; 64],
     }
 }
@@ -39,7 +39,7 @@ fn uniform_section(state: u32) -> DecodedSection {
 /// Stone floor at local y=0, water layer at local y=1, air above: one mixed
 /// opaque + fluid section that produces both opaque and translucent quads.
 fn mixed_section() -> DecodedSection {
-    let mut states = [AIR; mc_spine_client_mesh::SECTION_CELLS];
+    let mut states = [AIR; megu_client_mesh::SECTION_CELLS];
     states[..256].fill(STONE);
     states[256..512].fill(WATER);
     DecodedSection {

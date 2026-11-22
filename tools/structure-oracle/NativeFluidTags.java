@@ -1,4 +1,4 @@
-package dev.mcspine.tools;
+package dev.megu.tools;
 
 import java.lang.reflect.Method;
 import java.util.ArrayList;

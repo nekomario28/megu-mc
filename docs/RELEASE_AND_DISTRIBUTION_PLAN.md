@@ -1,4 +1,4 @@
-# Release & Distribution Plan — Megu (mc-spine)
+# Release & Distribution Plan — Megu (megu)
 
 `v0.1.0-alpha.1` 公開に向けた、ライセンス・配布経路・公式サイト・
 スポンサーシップ・ローンチチェックリストの実践ガイド。
@@ -23,7 +23,7 @@
 
 ### 推奨: 本体を `LGPL-3.0-or-later` に統一する
 
-`mc-spine` は **mod エコシステム上で動くエンジン**であり、配布形態としては
+`megu` は **mod エコシステム上で動くエンジン**であり、配布形態としては
 「単体サーバー/クライアント」だけでなく「外部 mod JAR を動的ロードする
 ホスト」として振る舞う。ここで `GPL-3.0-or-later` を選ぶと、外部 mod 作者が
 「自分の MIT/Apache-2.0 mod が GPL エンジン上で動くとライセンス感染するのでは」
@@ -36,8 +36,8 @@ Horizon=GPL-3.0、C2ME=MIT、NeoForge=LGPL-2.1、Fabric=Apache-2.0）との
 1. **エコシステム整合** — Sodium (MIT), Lithium (LGPL-3.0), C2ME (MIT),
    Starlight, FerriteCore など主要 performance mod と同じ「weak copyleft」
    レイヤーに立てる。mod 作者の心理的・法的ハードルが最も低い。
-2. **エンジン fork への強い copyleft は維持** — `mc-spine` 本体や
-   `mc-spine-core` の改変・再配布には依然 LGPLv3 のソース公開義務がかかる。
+2. **エンジン fork への強い copyleft は維持** — `megu` 本体や
+   `megu-core` の改変・再配布には依然 LGPLv3 のソース公開義務がかかる。
    「クローズド商用 fork による持ち逃げ」は防げる（GPL との実質的差は
    「リンク/ロードされる側への波及」のみ）。
 3. **外部 mod JAR への非波及をライセンス条文で明確化** — LGPLv3 §4/§5 と
@@ -74,16 +74,16 @@ Horizon=GPL-3.0、C2ME=MIT、NeoForge=LGPL-2.1、Fabric=Apache-2.0）との
 ### 2.1 Launcher Thin JAR Bootstrapper — **第一配布経路（#1）**
 
 `tools/client_launcher/` の thin Java bootstrapper
-（`mc-spine-bootstrapper.jar`、**32 KiB 未満**・再現ビルド可能）は、
+（`megu-bootstrapper.jar`、**32 KiB 未満**・再現ビルド可能）は、
 プレイヤーが普段使うランチャーの Microsoft/Minecraft アカウント
-ログインと Mojang 正規アセットをそのまま使って `mc-spine` / Megu を
+ログインと Mojang 正規アセットをそのまま使って `megu` / Megu を
 起動する、Fabric / NeoForge と同じ「ワンクリック導入」UX を実現する
 **最優先の配布経路**。対応ランチャー:
 
 - **Official Minecraft Launcher** — `versions/<id>/<id>.json` プロファイル
-  （`inheritsFrom` + `mainClass: net.mcspine.launcher.Main`）を生成。
+  （`inheritsFrom` + `mainClass: net.megu.launcher.Main`）を生成。
   バニラと同じアカウント・アセット解決がそのまま効く。
-- **Prism Launcher / MultiMC** — `patches/net.mcspine.bootstrapper.json`
+- **Prism Launcher / MultiMC** — `patches/net.megu.bootstrapper.json`
   カスタムパッチで `mainClass` を差し替える**ネイティブ patch export**
   （`--bootstrap-jar`）。シェル wrapper 不要で Windows / macOS / Linux
   全てで動作。`mmc-pack.json` + `instance.cfg` の従来 export も維持。
@@ -115,39 +115,39 @@ for V in 1.21.1 26.3; do
   # 任意: --client-bin /<native client> --client-sha256 <sha256> で native を pin
   # 任意: --version-id megu-$V でプロファイル ID を変更
 done
-# → ランチャーのバージョン選択に "mc-spine-1.21.1" / "mc-spine-26.3" が出る
+# → ランチャーのバージョン選択に "megu-1.21.1" / "megu-26.3" が出る
 
 # 3) Prism Launcher インスタンス（ネイティブ patch・シェル wrapper 無し）
 for V in 1.21.1 26.3; do
   python3 tools/client_launcher/export_launcher_bundle.py \
     --format prism --mc-version $V \
-    --bootstrap-jar dist/boot-$V/mc-spine-bootstrapper.jar \
-    --client-bin target/release/mc-spine-client \
-    --client-sha256 "$(sha256sum target/release/mc-spine-client | cut -d' ' -f1)" \
+    --bootstrap-jar dist/boot-$V/megu-bootstrapper.jar \
+    --client-bin target/release/megu-client \
+    --client-sha256 "$(sha256sum target/release/megu-client | cut -d' ' -f1)" \
     --out-dir dist/prism-$V
 done
 # → Prism のインスタンスフォルダにコピーして起動（patches/ が mainClass を差し替え）
-#   --bootstrap-jar 無しの従来 export は mc-spine-wrapper 経由（互換維持）
+#   --bootstrap-jar 無しの従来 export は megu-wrapper 経由（互換維持）
 
 # 4) Modrinth App 向け .mrpack（loader はバージョンごとに要確認）
 python3 tools/client_launcher/export_launcher_bundle.py \
   --format mrpack --mc-version 1.21.1 \
   --loader fabric --loader-version 0.16.10 \
-  --integrated-jar dist/mc-spine-integrated.jar \
+  --integrated-jar dist/megu-integrated.jar \
   --out-dir dist/mrpack-1.21.1
 python3 tools/client_launcher/export_launcher_bundle.py \
   --format mrpack --mc-version 26.3 \
   --loader neoforge --loader-version <26.3 対応版> \
-  --integrated-jar dist/mc-spine-integrated.jar \
+  --integrated-jar dist/megu-integrated.jar \
   --out-dir dist/mrpack-26.3
 ```
 
 `--accessToken` 等の認証情報は argv に残す既定動作を維持しつつ、
-`--mc-spine-token-env` / `MC_SPINE_TOKEN_ENV=1` 指定時は子プロセスへ
-`MC_SPINE_LAUNCHER_ACCESS_TOKEN` 環境変数経由で渡し、ログ・manifest に
+`--megu-token-env` / `MEGU_TOKEN_ENV=1` 指定時は子プロセスへ
+`MEGU_LAUNCHER_ACCESS_TOKEN` 環境変数経由で渡し、ログ・manifest に
 一切残さない（`redact()` が `--accessToken` / `--authToken` /
 `--clientToken` / `--token` と Bearer トークンを常時マスク）。
-Windows `.exe` 名（`mc-spine-client-gpu.exe` 等）も `--gameDir` /
+Windows `.exe` 名（`megu-client-gpu.exe` 等）も `--gameDir` /
 `--gameDir/bin` / `PATH` から自動検出する。
 
 ### 2.2 GitHub Releases（一次配布）
@@ -158,31 +158,31 @@ Windows `.exe` 名（`mc-spine-client-gpu.exe` 等）も `--gameDir` /
 
 | Platform | Artifact | 備考 |
 |---|---|---|
-| Linux x86_64 | `mc-spine-<ver>-x86_64-unknown-linux-gnu.tar.gz` | `tools/release_bundle.py` の決定的 tarball |
-| Linux arm64 | `mc-spine-<ver>-aarch64-unknown-linux-gnu.tar.gz` | 同上 |
-| Linux x86_64 | `mc-spine-<ver>-x86_64.AppImage` | AppImage 化（任意・後追い可） |
-| Windows x86_64 | `mc-spine-<ver>-windows-x86_64.zip` | `.msi` は WiX/インストーラ整備後に検討 |
-| macOS Universal | `mc-spine-<ver>-macos-universal.dmg` | arm64+x86_64 universal binary |
+| Linux x86_64 | `megu-<ver>-x86_64-unknown-linux-gnu.tar.gz` | `tools/release_bundle.py` の決定的 tarball |
+| Linux arm64 | `megu-<ver>-aarch64-unknown-linux-gnu.tar.gz` | 同上 |
+| Linux x86_64 | `megu-<ver>-x86_64.AppImage` | AppImage 化（任意・後追い可） |
+| Windows x86_64 | `megu-<ver>-windows-x86_64.zip` | `.msi` は WiX/インストーラ整備後に検討 |
+| macOS Universal | `megu-<ver>-macos-universal.dmg` | arm64+x86_64 universal binary |
 
 - 各リリースに `SHA256SUMS` と `release-manifest.json` を必ず添付
   （`release_bundle.py verify` が bytes レベルで再検証する）。
 - **SBOM**: `cargo-sbom` / `cargo-cyclonedx` で CycloneDX SBOM を生成し
-  `mc-spine-<ver>.cdx.json` として添付する（サプライチェーン透明性、
+  `megu-<ver>.cdx.json` として添付する（サプライチェーン透明性、
   `deny.toml` の advisory 情報と整合）。
-- Companion binaries（`mc-spine-client`, `mc-spine-mod-check`,
-  `mc-spine-world-migrate`, `mc-spine-init`, `client-gpu`）は
+- Companion binaries（`megu-client`, `megu-mod-check`,
+  `megu-world-migrate`, `megu-init`, `client-gpu`）は
   `--extra-binary` で同一 tarball に同梱する（H18 で対応済み）。
-- コンテナイメージ `mc-spine:<ver>` は GHCR (`ghcr.io/<owner>/mc-spine`)
+- コンテナイメージ `megu:<ver>` は GHCR (`ghcr.io/<owner>/megu`)
   へ push。Docker Hub は学生アカウントでも可だが GHCR が無料・連携が楽。
 
 ### 2.3 Modrinth
 
 - **Server software listing**: Modrinth は server-side software も
-  ホストできる。`mc-spine` を "server software" として登録し、
+  ホストできる。`megu` を "server software" として登録し、
   GitHub Releases の各プラットフォーム artifact を versions として紐付け。
   launcher からワンクリック導入できる導線になる。
-- **Modpack companion**: `mc-spine` 対応を謳う modpack は
-  `mc-spine-mod-check` の pre-flight レポートを description に貼る。
+- **Modpack companion**: `megu` 対応を謳う modpack は
+  `megu-mod-check` の pre-flight レポートを description に貼る。
 - **Launcher listing**: Modrinth App / ATLauncher 系 launcher での
   一覧掲載を目指す。掲載要件（changelog, license 表記, provenance）は
   事前に Modrinth のガイドラインを確認。
@@ -191,9 +191,9 @@ Windows `.exe` 名（`mc-spine-client-gpu.exe` 等）も `--gameDir` /
 
 | Channel | Package | 状態 |
 |---|---|---|
-| AUR | `mc-spine-bin` | Arch Linux ユーザーに最も刺さる。PKGBUILD は GitHub Releases tarball を fetch して `SHA256SUMS` 検証するだけの薄いラッパーでよい |
-| Homebrew | `homebrew-tap` (`<owner>/homebrew-mc-spine`) | macOS/Linux。`brew install <owner>/mc-spine/mc-spine` 形式。tap リポジトリは別 repo でよい |
-| Winget | `microsoft/winget-pkgs` への manifest PR | Windows ユーザー向け。`winget install <Publisher>.mc-spine`。manifest は YAML で portable + installer 両対応 |
+| AUR | `megu-bin` | Arch Linux ユーザーに最も刺さる。PKGBUILD は GitHub Releases tarball を fetch して `SHA256SUMS` 検証するだけの薄いラッパーでよい |
+| Homebrew | `homebrew-tap` (`<owner>/homebrew-megu`) | macOS/Linux。`brew install <owner>/megu/megu` 形式。tap リポジトリは別 repo でよい |
+| Winget | `microsoft/winget-pkgs` への manifest PR | Windows ユーザー向け。`winget install <Publisher>.megu`。manifest は YAML で portable + installer 両対応 |
 | Scoop | `ScoopInstaller/Extras` or 独自 bucket | Windows 代替。AUR と同様に tarball fetch 型で簡単 |
 | Flathub | `dev.<domain>.Megu.yml` metainfo | Flatpak 化は `org.freedesktop.Platform` runtime + バイナリ同梱。審査に数週間かかるため後追いでよい |
 
@@ -213,8 +213,8 @@ package manager はその裏側の配布網として機能する。
 | **Cloudflare Pages** | ¥0 | Global | ✅ free | `website/wrangler.toml` が既に Pages 前提。Functions で `/api/report` crash relay も実装済み。**推奨** |
 | **GitHub Pages** | ¥0 | Global | ✅ free | Jekyll 不要・静的 HTML で十分。ただし crash relay API は別途 Worker が必要 |
 
-- ドメインは任意。`mc-spine.pages.dev` / `megu-site.pages.dev` で十分。
-  こだわるなら `megu.gg` / `mc-spine.dev` 等を Cloudflare Registrar
+- ドメインは任意。`megu.pages.dev` / `megu-site.pages.dev` で十分。
+  こだわるなら `megu.gg` / `megu.dev` 等を Cloudflare Registrar
   （原価販売）で年 ¥1,500 前後。
 - HTTPS/証明書/CDN は両者とも自動。アクセス解析は Cloudflare Web
   Analytics（無料・Cookie なし）で十分。
@@ -228,7 +228,7 @@ package manager はその裏側の配布網として機能する。
    ギャラリー。テーマ案: 『陰翳礼讃』(In Praise of Shadows) の陰影表現、
    侘び寂び、桜・紅葉・四季の光。`assets/` の screenshot を整備して
    `<figure>` + caption で並べる。EN/JA キャプション両対応。
-3. **Mod compatibility checker showcase** — `mc-spine-mod-check --json`
+3. **Mod compatibility checker showcase** — `megu-mod-check --json`
    の出力例（`native_bundle` / `auto_skipped` / `tier2_lifted_shim` /
    `tier3_fallback_required`）をインタラクティブに見せるデモ。
    「あなたの modpack は動くか?」を 30 秒で体験させる導線。
@@ -306,7 +306,7 @@ BOOTH BOOST     ← 国内向け。無料配布 mod/resourcepack に「BOOST」�
 ### 4.4 文面テンプレート（寄付ページ用）
 
 ```
-Megu (mc-spine) は日本の学生が一人で開発している
+Megu (megu) は日本の学生が一人で開発している
 Minecraft 互換エンジン（Rust 製）です。
 
 サーバー運営・mod 開発・配布の費用（ドメイン・CI・テスト環境）を
@@ -349,14 +349,14 @@ Donation is optional and does not affect features or roadmap.
 
 ### 5.2 Build & package
 
-- [ ] `python3 tools/export_public_branch.sh --out ../mc-spine-public --verify`
-- [ ] `python3 tools/release_bundle.py build --binary target/release/mc-spine
+- [ ] `python3 tools/export_public_branch.sh --out ../megu-public --verify`
+- [ ] `python3 tools/release_bundle.py build --binary target/release/megu
       --out-dir dist --version 0.1.0-alpha.1 --target <triple>`
       + companion `--extra-binary`（client/mod-check/world-migrate/init/gpu）
 - [ ] `python3 tools/release_bundle.py verify` — manifest + SHA256SUMS +
       per-member records 一致、purity guard 通過
 - [ ] CycloneDX SBOM 生成・添付
-- [ ] `docker build -f docker/Dockerfile -t mc-spine:0.1.0-alpha.1 .`
+- [ ] `docker build -f docker/Dockerfile -t megu:0.1.0-alpha.1 .`
       + EULA negative test 2 件
 
 ### 5.3 Publish
@@ -371,7 +371,7 @@ Donation is optional and does not affect features or roadmap.
   - SBOM + SHA256SUMS + manifest リンク
 - [ ] GHCR へコンテナイメージ push
 - [ ] Modrinth server software listing 作成（GitHub Releases と紐付け）
-- [ ] AUR `mc-spine-bin` PKGBUILD 提出（任意タイミング）
+- [ ] AUR `megu-bin` PKGBUILD 提出（任意タイミング）
 - [ ] Homebrew tap / Winget manifest / Scoop bucket（漸進的）
 
 ### 5.4 Website & community
@@ -387,7 +387,7 @@ Donation is optional and does not affect features or roadmap.
 ### 5.5 Post-launch
 
 - [ ] 初週の issue triage 方針を決める（label: triage → bug/feature/mod-compat）
-- [ ] `mc-spine-mod-check` の出力を issue template で収集し、
+- [ ] `megu-mod-check` の出力を issue template で収集し、
       adapter の対応範囲を data-driven に拡張
 - [ ] analytics（Cloudflare Web Analytics）で download 数・流入元を確認
 - [ ] 月次で `cargo audit` / `cargo deny` を回し、advisory に対応

@@ -8,7 +8,7 @@
 use std::alloc::{GlobalAlloc, Layout, System};
 use std::cell::Cell;
 
-use mc_spine_kernel::{
+use megu_kernel::{
     CoalescedLightQueue, LightEdit, LightEngine, LightFact, LightKind, LightUpdateMultiWord,
     QueuedLightEdit,
 };
@@ -245,11 +245,11 @@ fn perf_client_kernel_load_chunk_skips_intermediate_vector() {
     cells[cell_index(0, 3, 9, 3)] = bad;
     assert_eq!(
         engine.load_chunk(0, 0, &cells).err(),
-        Some(mc_spine_kernel::Error::InvalidArgument)
+        Some(megu_kernel::Error::InvalidArgument)
     );
     assert_eq!(
         engine.section(0, 0, LightKind::Block, 1).err(),
-        Some(mc_spine_kernel::Error::OutOfRange)
+        Some(megu_kernel::Error::OutOfRange)
     );
     cells[cell_index(0, 3, 9, 3)] = STONE;
     engine.load_chunk(0, 0, &cells).unwrap();

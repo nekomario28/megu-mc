@@ -16,12 +16,12 @@
 set -euo pipefail
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 DIR="${1:-${CARVER_FIXTURE_BASE:-/tmp/carverfresh}}"
-JAR_SHA1="${MC_SPINE_VANILLA_JAR_SHA1:-59353fb40c36d304f2035d51e7d6e6baa98dc05c}"
-SEED="${MC_SPINE_FIXTURE_SEED:-0}"
+JAR_SHA1="${MEGU_VANILLA_JAR_SHA1:-59353fb40c36d304f2035d51e7d6e6baa98dc05c}"
+SEED="${MEGU_FIXTURE_SEED:-0}"
 
 DONORS=(
-  "${MC_SPINE_VANILLA_SERVER:-}"
-  "$HOME/.cache/mc-spine-audit/load/vanilla"
+  "${MEGU_VANILLA_SERVER:-}"
+  "$HOME/.cache/megu-audit/load/vanilla"
   "/data/lane-scratch/mc-vanilla-eval"
   "/data/lane-scratch/wg-oracle"
 )
@@ -33,7 +33,7 @@ done
 if [ -z "$donor" ]; then
   echo "fixture base: no installed 1.21.1 server found." >&2
   echo "  Looked in: ${DONORS[*]}" >&2
-  echo "  Point MC_SPINE_VANILLA_SERVER at a directory holding server.jar, libraries/ and versions/." >&2
+  echo "  Point MEGU_VANILLA_SERVER at a directory holding server.jar, libraries/ and versions/." >&2
   echo "  The jar must be sha1 $JAR_SHA1." >&2
   exit 2
 fi

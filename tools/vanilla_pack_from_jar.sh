@@ -27,12 +27,12 @@
 set -euo pipefail
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 DEST="${1:-$ROOT/datapacks/vanilla}"
-JAR="${MC_SPINE_VANILLA_SERVER_JAR:-}"
-JAR_SHA1="${MC_SPINE_VANILLA_JAR_SHA1:-59353fb40c36d304f2035d51e7d6e6baa98dc05c}"
+JAR="${MEGU_VANILLA_SERVER_JAR:-}"
+JAR_SHA1="${MEGU_VANILLA_JAR_SHA1:-59353fb40c36d304f2035d51e7d6e6baa98dc05c}"
 
 DONORS=(
-  "${MC_SPINE_VANILLA_SERVER:-}"
-  "$HOME/.cache/mc-spine-audit/load/vanilla"
+  "${MEGU_VANILLA_SERVER:-}"
+  "$HOME/.cache/megu-audit/load/vanilla"
   "/data/lane-scratch/mc-vanilla-eval"
   "/data/lane-scratch/wg-oracle"
   "${CARVER_FIXTURE_BASE:-}"

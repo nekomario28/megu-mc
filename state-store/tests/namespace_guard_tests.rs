@@ -5,12 +5,12 @@
 //! persistence, restore-on-mod-return, and the verified pre-change
 //! `WorldSnapshotStore` rollback — exercised against real files on disk.
 
-use mc_spine_state_store::datafix::DataValue;
-use mc_spine_state_store::namespace_guard::{
+use megu_state_store::datafix::DataValue;
+use megu_state_store::namespace_guard::{
     guard_world_load_with_snapshot, namespace_of, NamespaceGuardError, NamespaceTombstoneSidecar,
     PreservedKind, UnknownEntry, PLACEHOLDER_BLOCK, PLACEHOLDER_ENTITY, PLACEHOLDER_ITEM,
 };
-use mc_spine_state_store::world_snapshot::{SnapshotReason, WorldSnapshotStore};
+use megu_state_store::world_snapshot::{SnapshotReason, WorldSnapshotStore};
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -23,7 +23,7 @@ struct TestDir(PathBuf);
 impl TestDir {
     fn new(tag: &str) -> Self {
         let dir = std::env::temp_dir().join(format!(
-            "mc-spine-nsguard-{}-{}-{tag}",
+            "megu-nsguard-{}-{}-{tag}",
             std::process::id(),
             DIR_COUNTER.fetch_add(1, Ordering::Relaxed)
         ));
@@ -336,7 +336,7 @@ fn save_reload_and_restore_round_trip_losslessly() {
         assert_eq!(entry.namespace, "create");
         assert_eq!(entry.quarantined_at_tick, 42);
     }
-    let by_loc: BTreeMap<&str, &mc_spine_state_store::namespace_guard::PreservedEntry> =
+    let by_loc: BTreeMap<&str, &megu_state_store::namespace_guard::PreservedEntry> =
         restored.iter().map(|e| (e.location_key.as_str(), e)).collect();
     assert_eq!(
         by_loc["minecraft:overworld@12,64,-8"].raw_payload,
@@ -503,7 +503,7 @@ fn corrupt_or_foreign_sidecar_fails_closed() {
     // Valid JSON, wrong format tag.
     std::fs::write(
         &path,
-        r#"{"format":"mcspine-world-snapshot-v1","entries":[]}"#,
+        r#"{"format":"megu-world-snapshot-v1","entries":[]}"#,
     )
     .unwrap();
     assert!(matches!(
@@ -512,7 +512,7 @@ fn corrupt_or_foreign_sidecar_fails_closed() {
     ));
 
     // Right tag, but entries is not an array.
-    std::fs::write(&path, r#"{"format":"mcspine-namespace-tombstone-v1","entries":{}}"#).unwrap();
+    std::fs::write(&path, r#"{"format":"megu-namespace-tombstone-v1","entries":{}}"#).unwrap();
     assert!(matches!(
         NamespaceTombstoneSidecar::load_verified(&path).unwrap_err(),
         NamespaceGuardError::Schema(_)
@@ -521,7 +521,7 @@ fn corrupt_or_foreign_sidecar_fails_closed() {
     // A forged entry whose namespace lies about its original_id.
     std::fs::write(
         &path,
-        r#"{"entries":[{"kind":"block","location_key":"minecraft:overworld@1,2,3","namespace":"forge","original_id":"create:press","placeholder_id":"minecraft:structure_void","quarantined_at_tick":1,"raw_payload":{}}],"entry_count":1,"format":"mcspine-namespace-tombstone-v1"}"#,
+        r#"{"entries":[{"kind":"block","location_key":"minecraft:overworld@1,2,3","namespace":"forge","original_id":"create:press","placeholder_id":"minecraft:structure_void","quarantined_at_tick":1,"raw_payload":{}}],"entry_count":1,"format":"megu-namespace-tombstone-v1"}"#,
     )
     .unwrap();
     assert!(matches!(
@@ -532,7 +532,7 @@ fn corrupt_or_foreign_sidecar_fails_closed() {
     // A modded placeholder id is refused: it would itself need quarantining.
     std::fs::write(
         &path,
-        r#"{"entries":[{"kind":"item","location_key":"player:a:slot:0","namespace":"create","original_id":"create:wrench","placeholder_id":"create:wrench","quarantined_at_tick":1,"raw_payload":{}}],"entry_count":1,"format":"mcspine-namespace-tombstone-v1"}"#,
+        r#"{"entries":[{"kind":"item","location_key":"player:a:slot:0","namespace":"create","original_id":"create:wrench","placeholder_id":"create:wrench","quarantined_at_tick":1,"raw_payload":{}}],"entry_count":1,"format":"megu-namespace-tombstone-v1"}"#,
     )
     .unwrap();
     assert!(matches!(
@@ -543,7 +543,7 @@ fn corrupt_or_foreign_sidecar_fails_closed() {
     // Declared entry_count disagreeing with the array.
     std::fs::write(
         &path,
-        r#"{"entries":[],"entry_count":7,"format":"mcspine-namespace-tombstone-v1"}"#,
+        r#"{"entries":[],"entry_count":7,"format":"megu-namespace-tombstone-v1"}"#,
     )
     .unwrap();
     assert!(matches!(
@@ -588,5 +588,5 @@ fn sidecar_is_deterministic_across_insertion_orders() {
     reverse.save_atomic(&p2).unwrap();
     assert_eq!(std::fs::read(&p1).unwrap(), std::fs::read(&p2).unwrap());
     let text = std::fs::read_to_string(&p1).unwrap();
-    assert!(text.contains("mcspine-namespace-tombstone-v1"));
+    assert!(text.contains("megu-namespace-tombstone-v1"));
 }

@@ -87,7 +87,7 @@ BiomeManager相当の問い合わせ。保存されたquart paletteを、その�
 
 ## 6. ローカル配置と公開境界
 
-このhostの正本は `~/mc-spine`、支援データは `~/mc-spine-local`。
+このhostの正本は `~/megu`、支援データは `~/megu-local`。
 新しいcaptureは `captures/`、実行記録は `audit/`、作業用実験は `scratch/current/` に置く。
 別hostではrootを選び直す。廃止した一時pathや旧cache aliasに依存させない。
 jar、decompile、native worldはローカルに保持し、既存fixtureも権利判断なしに追加公開しない。

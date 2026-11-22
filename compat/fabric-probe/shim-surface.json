@@ -1,5 +1,5 @@
 {
-  "schema": "mc-spine-fabric-s0",
+  "schema": "megu-fabric-s0",
   "target": {
     "minecraft": "1.21.1",
     "fabric_loader": ["0.15.11", "0.19.5"],

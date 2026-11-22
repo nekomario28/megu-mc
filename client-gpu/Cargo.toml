@@ -1,17 +1,17 @@
 [package]
-name = "mc-spine-client-gpu"
+name = "megu-client-gpu"
 version = "0.1.0"
 edition = "2021"
 license = "LGPL-3.0-or-later"
-description = "Standalone real windowed GPU client for mc-spine (winit + wgpu)"
+description = "Standalone real windowed GPU client for megu (winit + wgpu)"
 publish = false
 
 [lib]
-name = "mc_spine_client_gpu"
+name = "megu_client_gpu"
 path = "src/lib.rs"
 
 [[bin]]
-name = "mc-spine-client-gpu"
+name = "megu-client-gpu"
 path = "src/main.rs"
 
 # Zero-bloat release contract: this manifest produces the shipped GUI client
@@ -32,12 +32,12 @@ codegen-units = 4
 incremental = false
 
 [dependencies]
-mc_spine_client = { package = "mc-spine-client", path = "../client-app" }
-mc_spine_client_mesh = { package = "mc-spine-client-mesh", path = "../client-port" }
-mc_spine_core = { package = "mc-spine-core", path = "../core" }
-mc_spine_kernel = { package = "mc-spine-kernel", path = "../client-kernel" }
-mc_spine_proto = { package = "mc-spine-proto", path = "../proto" }
-mc_spine_ui = { package = "mc-spine-client-ui", path = "../client-ui" }
+megu_client = { package = "megu-client", path = "../client-app" }
+megu_client_mesh = { package = "megu-client-mesh", path = "../client-port" }
+megu_core = { package = "megu-core", path = "../core" }
+megu_kernel = { package = "megu-kernel", path = "../client-kernel" }
+megu_proto = { package = "megu-proto", path = "../proto" }
+megu_ui = { package = "megu-client-ui", path = "../client-ui" }
 bytemuck = { version = "1.25", features = ["derive"] }
 pollster = "0.4"
 # Pure-wgpu policy: no OpenGL/GLES/EGL/WGL anywhere in the dependency graph.

@@ -78,9 +78,9 @@ fi
 zero_all_but_keep "$CTL"
 
 cd "$ROOT"
-MC_SPINE_WG_PROFILE=0 MC_SPINE_WG_DUMP="$DIR/dump.bin" MC_SPINE_WG_DUMP_N="$N" \
-  MC_SPINE_WG_DUMP_X="$X0" MC_SPINE_WG_DUMP_Z="$Z0" \
-  ./target/release/mc-spine >/dev/null 2>&1
+MEGU_WG_PROFILE=0 MEGU_WG_DUMP="$DIR/dump.bin" MEGU_WG_DUMP_N="$N" \
+  MEGU_WG_DUMP_X="$X0" MEGU_WG_DUMP_Z="$Z0" \
+  ./target/release/megu >/dev/null 2>&1
 # the placed feature's *block* (ore_gravel places gravel), read from its config
 BLOCK="$(python3 - "$REPO_PF/$KEEP.json" <<'PY2'
 import json, os, sys

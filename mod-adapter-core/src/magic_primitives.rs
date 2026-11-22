@@ -1813,11 +1813,11 @@ impl ManaNetwork {
 }
 
 // ===========================================================================
-// 6. MAG1 wire codec (channel `mc-spine:magic_v1`)
+// 6. MAG1 wire codec (channel `megu:magic_v1`)
 // ===========================================================================
 
 /// Custom-payload channel for `MAG1` magic sync frames.
-pub const MAGIC_CHANNEL: &str = "mc-spine:magic_v1";
+pub const MAGIC_CHANNEL: &str = "megu:magic_v1";
 /// 4-byte frame magic.
 pub const MAGIC_SYNC_MAGIC: &[u8; 4] = b"MAG1";
 /// Hard cap on wire cooldown entries.

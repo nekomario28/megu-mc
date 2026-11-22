@@ -1,9 +1,9 @@
 // SPDX-License-Identifier: LGPL-3.0-or-later OR GPL-3.0-or-later OR AGPL-3.0-or-later
-//! `mc-spine-proto`: the canonical, version-aware Minecraft Java protocol core.
+//! `megu-proto`: the canonical, version-aware Minecraft Java protocol core.
 //!
 //! This crate is a standalone, zero-dependency library so the same protocol
-//! knowledge can be shared by the mc-spine server (`src/play_protocol.rs`), the
-//! mc-spine client (`client-app/src/protocol.rs`) and any future tooling, and so
+//! knowledge can be shared by the megu server (`src/play_protocol.rs`), the
+//! megu client (`client-app/src/protocol.rs`) and any future tooling, and so
 //! new Minecraft versions slot in as *data* (a version pack) rather than as a
 //! second copy of the codec.
 //!

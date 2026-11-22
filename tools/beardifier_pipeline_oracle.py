@@ -23,7 +23,7 @@ def main():
         out = work / "beardifier_pipeline.tsv"
         run_probe(work, classpath,
                   ROOT / "tools/structure-oracle/BeardifierPipelineOracle.java",
-                  "dev.mcspine.tools.BeardifierPipelineOracle", str(out),
+                  "dev.megu.tools.BeardifierPipelineOracle", str(out),
                   extra_sources=[ROOT / "tools/structure-oracle/NativeHarness.java"])
         rows = out.read_text().splitlines()
     kinds = {}

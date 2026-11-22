@@ -19,31 +19,31 @@
 
 use std::collections::BTreeMap;
 
-use mc_spine_client::protocol::{decode_chunk_packet, ClientPlayEvent, PlayEvent, TeleportSync};
-use mc_spine_client_gpu::gpu_hiz::{
+use megu_client::protocol::{decode_chunk_packet, ClientPlayEvent, PlayEvent, TeleportSync};
+use megu_client_gpu::gpu_hiz::{
     CullStats, CullUniforms, GpuHizCuller, IndirectArgs, SectionGpuRecord, HIZ_BUILD_WGSL,
     HIZ_DOWNSAMPLE_WGSL, SECTION_CULL_WGSL,
 };
-use mc_spine_client_gpu::live_session::hw_adaptive_engine::{
+use megu_client_gpu::live_session::hw_adaptive_engine::{
     MemoryFootprintClass, MemoryTransferStrategy,
 };
-use mc_spine_client_gpu::live_session::{CompiledAssetMeta, LiveSession, PendingAtlasPixels};
-use mc_spine_client_gpu::renderer::{
+use megu_client_gpu::live_session::{CompiledAssetMeta, LiveSession, PendingAtlasPixels};
+use megu_client_gpu::renderer::{
     frustum_planes_from_view_proj, probe_adapters, request_gpu_device,
     rotate_opaque_quads_for_shared_index, GpuRenderer, TransferTopologyBudget, UploadStagingRing,
     OFFSCREEN_FORMAT, QUAD_DIAGONAL_FLIP_BIT,
 };
-use mc_spine_client_gpu::Camera;
-use mc_spine_client_mesh::atlas::{AtlasMip, PackedAtlas, SpritePlacement};
-use mc_spine_client_mesh::builtin_shadow_wgsl::{BuiltinShadowQuality, RenderScalePreset};
-use mc_spine_client_mesh::ffi::PackedVertex;
-use mc_spine_client_mesh::{RenderBackendPreference, SectionCoord};
+use megu_client_gpu::Camera;
+use megu_client_mesh::atlas::{AtlasMip, PackedAtlas, SpritePlacement};
+use megu_client_mesh::builtin_shadow_wgsl::{BuiltinShadowQuality, RenderScalePreset};
+use megu_client_mesh::ffi::PackedVertex;
+use megu_client_mesh::{RenderBackendPreference, SectionCoord};
 use wgpu::naga::front::wgsl;
 use wgpu::naga::valid::{Capabilities, ValidationFlags, Validator};
 
 /// A headless renderer, or `None` when the host has no GPU adapter (the
 /// same graceful skip the live-session GPU tests use).
-fn try_gpu() -> Option<mc_spine_client_gpu::renderer::GpuDevice> {
+fn try_gpu() -> Option<megu_client_gpu::renderer::GpuDevice> {
     if probe_adapters(RenderBackendPreference::Auto).is_empty() {
         eprintln!("SKIP gpu-ramvram-zerobloat test: probe_adapters found 0 adapters");
         return None;

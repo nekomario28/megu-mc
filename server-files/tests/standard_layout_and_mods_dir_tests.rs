@@ -4,8 +4,8 @@
 //! classification, and the standard dedicated-server / client `<gameDir>`
 //! folder layouts.
 
-use mc_spine_core::version::TargetVersion;
-use mc_spine_server_files::{
+use megu_core::version::TargetVersion;
+use megu_server_files::{
     check_eula, ensure_client_game_dir_layout, ensure_server_game_dir_layout, scan_mods_folder,
     EulaStatus, FolderOutcome, ModsDirSkipReason, ModsFolderScan, ServerDirectory, EULA_FILE,
 };
@@ -19,7 +19,7 @@ struct Scratch(PathBuf);
 impl Scratch {
     fn new(tag: &str) -> Self {
         let root = std::env::temp_dir().join(format!(
-            "mc-spine-layout-{}-{}-{tag}",
+            "megu-layout-{}-{}-{tag}",
             std::process::id(),
             NEXT_DIR.fetch_add(1, Ordering::Relaxed)
         ));

@@ -1,6 +1,6 @@
 // Dump the pinned 1.21.1 biome MobSpawnSettings through their real codecs.
 // No server/world; ordinary RegistryDataLoader and Biome methods.
-package dev.mcspine.tools;
+package dev.megu.tools;
 
 import com.google.gson.*;
 import java.lang.reflect.*;

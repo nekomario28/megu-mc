@@ -179,7 +179,7 @@ impl DimensionModData {
     }
 
     /// Every custom ore/chest block id merged, deduplicated, and sorted — the
-    /// direct input for `mc-spine`'s anti-xray hidden set.
+    /// direct input for `megu`'s anti-xray hidden set.
     pub fn anti_xray_hidden_blocks(&self) -> Vec<String> {
         self.ore_blocks
             .iter()

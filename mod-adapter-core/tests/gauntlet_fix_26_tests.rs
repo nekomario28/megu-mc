@@ -11,7 +11,7 @@
 //!    `CONSTANT_Methodref`/`CONSTANT_InterfaceMethodref` entries and
 //!    class indicators through real `CONSTANT_Class` entries.
 //! 2. Superseded engine-replacement mods (`sodium`, `lithium`, `iris`,
-//!    ...) were quarantined by their own bytecode even though mc-spine
+//!    ...) were quarantined by their own bytecode even though megu
 //!    never executes a single byte of them — the verified catalog id
 //!    now resolves to a native subsystem before the bytecode quarantine
 //!    verdict (embedded native/executable *members* still quarantine).
@@ -375,7 +375,7 @@ fn methodref_security_scan_allows_system_arraycopy_plus_unrelated_load_and_quara
 fn superseded_perf_mod_auto_skips_before_quarantine_since_zero_bytecode_runs() {
     // The real gauntlet shapes: sodium probes `Runtime#exec` + JNA,
     // lithium and iris touch `sun/misc/Unsafe`, iris also pairs
-    // `System#load`. None of it ever executes under mc-spine.
+    // `System#load`. None of it ever executes under megu.
     for (jar_name, hostile) in [
         (
             "sodium-neoforge-0.8.13+mc1.21.1.jar",

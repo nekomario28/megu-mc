@@ -96,7 +96,7 @@ def main():
     parser.add_argument("--vanilla-jar", type=Path, default=JAR)
     parser.add_argument(
         "--binary", type=Path,
-        default=Path(os.environ.get("MC_SPINE_BIN", str(ROOT / "target/debug/mc-spine"))),
+        default=Path(os.environ.get("MEGU_BIN", str(ROOT / "target/debug/megu"))),
     )
     args = parser.parse_args()
     binary = args.binary.resolve()
@@ -109,8 +109,8 @@ def main():
 
     with binary.open("rb") as stream:
         binary_sha256 = file_digest(stream, "sha256").hexdigest()
-    left = collect("mc-spine", binary, args.vanilla_jar, scratch)
-    report = {"protocol": 767, "server_sha256": binary_sha256, "mc_spine": left}
+    left = collect("megu", binary, args.vanilla_jar, scratch)
+    report = {"protocol": 767, "server_sha256": binary_sha256, "megu": left}
     if args.with_vanilla:
         right = collect("vanilla", binary, args.vanilla_jar, scratch)
         report["reference"] = right

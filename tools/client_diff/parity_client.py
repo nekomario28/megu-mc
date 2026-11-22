@@ -418,14 +418,14 @@ def live_server(kind, binary, root, jar=JAR):
     while rcon_port == game:
         rcon_port = port()
     env = dict(os.environ, TMPDIR=str(ROOT / "target/tmp"))
-    if kind == "mc-spine":
+    if kind == "megu":
         for link, source in (("config_packets.bin", ROOT / "config_packets.bin"),
                              ("assets", ROOT / "assets")):
             (root / link).symlink_to(source, target_is_directory=source.is_dir())
-        env.update(MC_SPINE_PORT=str(game), MC_SPINE_BIND_ADDR="127.0.0.1",
-                   MC_SPINE_SEED=str(SEED), MC_SPINE_WG="old",
-                   MC_SPINE_RESOURCE_PACK_URL="", MC_SPINE_RCON_PORT=str(rcon_port),
-                   MC_SPINE_RCON_PASS=RCON_PASS, MC_SPINE_RCON_BIND_ADDR="127.0.0.1")
+        env.update(MEGU_PORT=str(game), MEGU_BIND_ADDR="127.0.0.1",
+                   MEGU_SEED=str(SEED), MEGU_WG="old",
+                   MEGU_RESOURCE_PACK_URL="", MEGU_RCON_PORT=str(rcon_port),
+                   MEGU_RCON_PASS=RCON_PASS, MEGU_RCON_BIND_ADDR="127.0.0.1")
         argv = [str(binary)]
     else:
         if hashlib.sha1(jar.read_bytes()).hexdigest() != JAR_SHA1:

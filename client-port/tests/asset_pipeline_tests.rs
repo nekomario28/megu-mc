@@ -10,10 +10,10 @@ use std::fs;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use mc_spine_client_mesh::asset_pipeline::{
+use megu_client_mesh::asset_pipeline::{
     AssetPipelineError, CompiledAssetBundle, ResourcePackLayer, MAX_ASSET_FILE_BYTES,
 };
-use mc_spine_client_mesh::atlas::AtlasTileRect;
+use megu_client_mesh::atlas::AtlasTileRect;
 
 /// RGBA8 sprite payload: `(width, height, pixels)`.
 type Sprite = (u32, u32, Vec<u8>);
@@ -425,7 +425,7 @@ impl Drop for TempDir {
     }
 }
 
-/// `.rgba` encoding matching [`RGBA8_SPRITE_FORMAT`][mc_spine_client_mesh::asset_pipeline::RGBA8_SPRITE_FORMAT].
+/// `.rgba` encoding matching [`RGBA8_SPRITE_FORMAT`][megu_client_mesh::asset_pipeline::RGBA8_SPRITE_FORMAT].
 fn encode_rgba(width: u32, height: u32, rgba: &[u8]) -> Vec<u8> {
     let mut out = Vec::with_capacity(8 + rgba.len());
     out.extend_from_slice(&width.to_le_bytes());

@@ -1,4 +1,4 @@
-package dev.mcspine.tools;
+package dev.megu.tools;
 
 import com.mojang.serialization.Codec;
 import java.lang.reflect.*;

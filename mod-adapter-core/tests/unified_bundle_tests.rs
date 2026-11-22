@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: LGPL-3.0-or-later OR GPL-3.0-or-later OR AGPL-3.0-or-later
 
 //! Integration tests for [`mod_adapter_core::unified_bundle`]: the
-//! `mc-spine-mod-bundle/1` declarative mod schema — full JSON roundtrip of a
+//! `megu-mod-bundle/1` declarative mod schema — full JSON roundtrip of a
 //! rich unknown mod, live `UnifiedModRuntime` subsystem driving, fail-closed
 //! version/corruption/bounds handling, and clean export of the built-in
 //! dimension profiles. All bundle data below is invented test data.
@@ -24,7 +24,7 @@ use mod_adapter_core::world_extensions::ProgressionVerdict;
 /// gliding creature, custom channels, and a Maven range admitting both
 /// `1.21.1` and `26.3`.
 const RICH_BUNDLE_JSON: &str = r##"{
-  "schema": "mc-spine-mod-bundle/1",
+  "schema": "megu-mod-bundle/1",
   "mod_id": "mirrorlands",
   "mc_version_range": "[1.21,)",
   "portals": [
@@ -178,7 +178,7 @@ fn rich_bundle_roundtrips_through_json() {
     assert_eq!(reparsed, bundle);
 
     // Key order is deterministic sorted: schema first in the sorted order.
-    assert!(once.contains("\"schema\": \"mc-spine-mod-bundle/1\""));
+    assert!(once.contains("\"schema\": \"megu-mod-bundle/1\""));
 }
 
 #[test]
@@ -386,8 +386,8 @@ fn corrupt_unknown_schema_and_unparseable_range_fail_closed() {
     assert!(DeclarativeModBundle::from_json("null").is_err());
     // Unknown or missing schema.
     for bad in [
-        r#"{"schema": "mc-spine-mod-bundle/2"}"#,
-        r#"{"schema": "mc-spine-mod-bundle/1x"}"#,
+        r#"{"schema": "megu-mod-bundle/2"}"#,
+        r#"{"schema": "megu-mod-bundle/1x"}"#,
         r#"{"mod_id": "mirrorlands"}"#,
     ] {
         assert!(
@@ -400,10 +400,10 @@ fn corrupt_unknown_schema_and_unparseable_range_fail_closed() {
     }
     // Invalid mod id / version range.
     for bad in [
-        r#"{"schema": "mc-spine-mod-bundle/1", "mod_id": "Bad Mod!"}"#,
-        r#"{"schema": "mc-spine-mod-bundle/1", "mod_id": "mirrorlands",
+        r#"{"schema": "megu-mod-bundle/1", "mod_id": "Bad Mod!"}"#,
+        r#"{"schema": "megu-mod-bundle/1", "mod_id": "mirrorlands",
             "mc_version_range": "not a range"}"#,
-        r#"{"schema": "mc-spine-mod-bundle/1", "mod_id": "mirrorlands",
+        r#"{"schema": "megu-mod-bundle/1", "mod_id": "mirrorlands",
             "mc_version_range": "[1.21"}"#,
     ] {
         assert!(
@@ -456,7 +456,7 @@ fn unknown_trigger_movement_and_keys_fail_closed() {
 fn oversized_sections_fail_closed() {
     // A portals array over the 1024-entry section cap.
     let mut json = String::from(
-        r#"{"schema": "mc-spine-mod-bundle/1", "mod_id": "mirrorlands",
+        r#"{"schema": "megu-mod-bundle/1", "mod_id": "mirrorlands",
             "mc_version_range": "[1.21,)", "portals": ["#,
     );
     for i in 0..1100 {
@@ -559,7 +559,7 @@ fn export_builtin_dimension_bundles_roundtrips_every_profile() {
 
 #[test]
 fn schema_constant_is_the_only_accepted_tag() {
-    assert_eq!(BUNDLE_SCHEMA, "mc-spine-mod-bundle/1");
+    assert_eq!(BUNDLE_SCHEMA, "megu-mod-bundle/1");
     let json = RICH_BUNDLE_JSON.replace(BUNDLE_SCHEMA, "other-schema/9");
     assert!(matches!(
         DeclarativeModBundle::from_json(&json),

@@ -18,11 +18,11 @@ GENERATION = 0x8000_0003
 
 MOD = """
 package fixture;
-import net.mcspine.neoforge.DirectBatchBridge;
-import net.mcspine.neoforge.DirectBatchBridge.BlockEntityHandle;
-import net.mcspine.neoforge.DirectBatchBridge.EntityHandle;
-import net.mcspine.neoforge.DirectBatchBridge.TickContext;
-import static net.mcspine.neoforge.DirectBatchBridge.Activation.*;
+import net.megu.neoforge.DirectBatchBridge;
+import net.megu.neoforge.DirectBatchBridge.BlockEntityHandle;
+import net.megu.neoforge.DirectBatchBridge.EntityHandle;
+import net.megu.neoforge.DirectBatchBridge.TickContext;
+import static net.megu.neoforge.DirectBatchBridge.Activation.*;
 import net.minecraft.core.BlockPos;
 import net.minecraft.world.level.Level;
 import net.minecraft.world.level.LevelAccessor;
@@ -107,7 +107,7 @@ public final class S3Mod {
         DirectBatchBridge.register(BLOCK_ENTITY_TICK, 17, context ->
             context.sendSystemMessage(0, String.valueOf((char) 0xd800)));
         DirectBatchBridge.register(BLOCK_ENTITY_TICK, 18, context ->
-            net.mcspine.neoforge.ServerHooks.land(0, 0, 0, 0.0f));
+            net.megu.neoforge.ServerHooks.land(0, 0, 0, 0.0f));
         DirectBatchBridge.register(BLOCK_ENTITY_TICK, 20, context -> {
             throw new AssertionError("malformed input must fail before any callback runs");
         });
@@ -190,8 +190,8 @@ import java.lang.reflect.InvocationTargetException;
 import java.nio.ByteBuffer;
 import java.nio.file.Files;
 import java.nio.file.Path;
-import net.mcspine.neoforge.Bootstrap;
-import net.mcspine.neoforge.DirectBatchBridge;
+import net.megu.neoforge.Bootstrap;
+import net.megu.neoforge.DirectBatchBridge;
 
 public class BatchCheck {
     public static void main(String[] args) throws Exception {
@@ -315,7 +315,7 @@ class NeoForgeS3BatchTests(unittest.TestCase):
         stdout = self.checked(
             "cargo", "test", "--offline", "--locked", "--features", "fabric-probe,neoforge-events",
             "java_compat::tests::s3_direct_jni_fixture", "--", "--exact", "--nocapture", "--test-threads=1",
-            extra_env={"MC_SPINE_S3_FIXTURE": str(self.root), "MC_SPINE_S3_MODE": mode},
+            extra_env={"MEGU_S3_FIXTURE": str(self.root), "MEGU_S3_MODE": mode},
         )
         self.assertIn(marker, stdout)
         self.assertIn("1 passed", stdout)
@@ -417,13 +417,13 @@ package fixture;
 import net.neoforged.fml.common.Mod;
 @Mod("nf4_fixture")
 public final class HostCaller {
-    public HostCaller() { net.mcspine.probe.Host.getBlock(0, 0, 0); }
+    public HostCaller() { net.megu.probe.Host.getBlock(0, 0, 0); }
 }
 """)
         self.addCleanup(jar.unlink)
         result = self.run_process(sys.executable, ROOT / "tools/shimcheck.py", "--json", jar)
         self.assertEqual(result.returncode, 2, result.stdout + result.stderr)
-        self.assertIn("net/mcspine/probe/Host#getBlock(III)I", result.stdout)
+        self.assertIn("net/megu/probe/Host#getBlock(III)I", result.stdout)
 
 
 if __name__ == "__main__":

@@ -22,7 +22,7 @@
 ### (b) JVM 側の部品 (NeoForge / Fabric / Mixin ほか)
 実物を `compat/*/dependencies.json` の URL から取得し、SHA-256 が一致することを確認したうえで、jar 内のメタデータと上流の POM/LICENSE を読んだ結果:
 
-| 部品 | 宣言ライセンス | 根拠 | mc-spine での扱い |
+| 部品 | 宣言ライセンス | 根拠 | megu での扱い |
 |---|---|---|---|
 | Fabric Loader 0.19.5 | **Apache-2.0** | `fabric.mod.json`, `LICENSE_fabric-loader` (jar 内)。jar は MixinExtras 0.5.5 (MIT) を内蔵 | 実行時に取得 (`.cache/`) |
 | Mixin (FabricMC sponge-mixin 0.17.4) | **MIT** | jar 内 `LICENSE.txt` | 同上 |
@@ -36,7 +36,7 @@
 
 **`LGPL-3.0-or-later` との互換性**:
 - `LGPL-2.1`（および `LGPL-2.1-only`）は LGPL-2.1 §3 および §6（動的リンク利用）により `LGPL-3.0-or-later` と互換です。
-- さらに `mc-spine` はこれらの JAR をリポジトリにコミット・再配布せず、ビルド／テスト実行時に利用者の環境（`.cache/`）へ取得します。
+- さらに `megu` はこれらの JAR をリポジトリにコミット・再配布せず、ビルド／テスト実行時に利用者の環境（`.cache/`）へ取得します。
 
 ### (c) minecraft-data (PrismarineJS, MIT)
 `assets/blocks_1211.json` は上流の `data/pc/1.21.1/blocks.json` とバイト一致 (MIT)。[NOTICE](NOTICE) に帰属を記載済み。
@@ -44,7 +44,7 @@
 ### (d) Mojang / Minecraft
 - `src/brigadier.rs` は Mojang の `com.mojang:brigadier:1.3.10` (**MIT License**, Copyright Microsoft Corporation) の Rust 移植であり、[NOTICE](NOTICE) に MIT 全文を収録しています。
 - 開発ブランチ（`main` / `perf/worldgen-parallel`）は共同開発およびテスト高速化のため、1.21.1 `server.jar` 由来の datapack、状態表 (`assets/block_states_1211.json`)、テスト TSV、`config_packets.bin` を追跡しています。
-- 外部一般公開・配布用のクリーンな単一ルートコミット（Mojang 由来生成物を一切含まないツリー）を作る場合は、`tools/export_public_branch.sh --out ../mc-spine-public --verify` を実行します。
+- 外部一般公開・配布用のクリーンな単一ルートコミット（Mojang 由来生成物を一切含まないツリー）を作る場合は、`tools/export_public_branch.sh --out ../megu-public --verify` を実行します。
 
 ## 3. 単一 `LGPL-3.0-or-later` ライセンスの設計
 
@@ -56,7 +56,7 @@
    - **C2ME (`MIT`)** や **Lithium (`LGPL-3.0`)**、**NeoForge (`LGPL-2.1`)**、**Fabric (`Apache-2.0`)** は、`LGPL-3.0-or-later` と**完全互換**です。
    - 一方、外部の第三者が書いた `GPL-3.0-only` や `AGPL-3.0-only` のコードをファーストパーティのソースファイルに直接コピーすると、そのファイルは `LGPL-3.0-or-later` 単独では頒布できなくなります。そのため、ファーストパーティのファイルには `MIT` / `Apache-2.0` / `BSD` / `LGPL` 互換のコードのみを入れるか、万一外部 GPL/AGPL 専用コードを組み合わせる場合は専用モジュール／オプショナルクレートに分離します。
 3. **外部 Mod JAR への非波及**:
-   - `compat/`（Fabric / NeoForge 互換レイヤ）やプラグイン機構を通じて実行時にロードされる独立した 3rd-party Mod JAR は `mc-spine` の派生物とはみなさず、Mod 作者自身のライセンス（ARR / MIT / LGPL 等）のまま動作します。動的ロードであるため、外部 Mod JAR に mc-spine のコピーレフトは波及しません。
+   - `compat/`（Fabric / NeoForge 互換レイヤ）やプラグイン機構を通じて実行時にロードされる独立した 3rd-party Mod JAR は `megu` の派生物とはみなさず、Mod 作者自身のライセンス（ARR / MIT / LGPL 等）のまま動作します。動的ロードであるため、外部 Mod JAR に megu のコピーレフトは波及しません。
 
 ## 4. 確認・解消済み項目と Git 履歴クリーンアップ済みの記録 (2026-11-20)
 

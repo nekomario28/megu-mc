@@ -2663,12 +2663,12 @@ impl SaveVersionHeader {
 }
 
 /// The MC release this process writes and loads natively:
-/// `MC_SPINE_TARGET_VERSION`, then the legacy `MC_SPINE_MC_VERSION`, each
+/// `MEGU_TARGET_VERSION`, then the legacy `MEGU_MC_VERSION`, each
 /// expected to name one of the two first-class targets
 /// (`SAVE_TARGET_VERSIONS`). An unset, empty or unrecognized variable is
 /// skipped with a warning — the 1.21.1 default is the only silent choice.
 fn running_save_version() -> SaveVersionHeader {
-    for var in ["MC_SPINE_TARGET_VERSION", "MC_SPINE_MC_VERSION"] {
+    for var in ["MEGU_TARGET_VERSION", "MEGU_MC_VERSION"] {
         let Ok(name) = std::env::var(var) else {
             continue;
         };
@@ -2945,7 +2945,7 @@ fn load_world_seed_in(dir: &std::path::Path) -> Result<Option<u64>, &'static str
 fn resolve_world_seed(requested: Option<u64>, saved: Option<u64>) -> Result<u64, &'static str> {
     match (requested, saved) {
         (Some(requested), Some(saved)) if requested != saved => {
-            Err("MC_SPINE_SEED does not match the saved world seed")
+            Err("MEGU_SEED does not match the saved world seed")
         }
         (Some(requested), _) => Ok(requested),
         (None, Some(saved)) => Ok(saved),
@@ -4095,23 +4095,23 @@ fn decode_world_payload(payload: &[u8]) -> Result<(), &'static str> {
         SaveVersionCompat::Exact => {}
         SaveVersionCompat::OlderUpgradeable { delta } => {
             eprintln!(
-                "[save] refusing to load a world written for {} (DataVersion {}, {delta} versions behind this build's {} / DataVersion {}); run mc-spine-world-migrate to upgrade it",
+                "[save] refusing to load a world written for {} (DataVersion {}, {delta} versions behind this build's {} / DataVersion {}); run megu-world-migrate to upgrade it",
                 save_version.mc_version,
                 save_version.data_version,
                 running.mc_version,
                 running.data_version
             );
             return Err(
-                "world snapshot was written for an older Minecraft version; run mc-spine-world-migrate to upgrade it",
+                "world snapshot was written for an older Minecraft version; run megu-world-migrate to upgrade it",
             );
         }
         SaveVersionCompat::NewerUnknown { file_dv, running_dv } => {
             eprintln!(
-                "[save] refusing to load a world written for {} (DataVersion {file_dv}), newer than this build's {} / DataVersion {running_dv}; run mc-spine-world-migrate to convert it",
+                "[save] refusing to load a world written for {} (DataVersion {file_dv}), newer than this build's {} / DataVersion {running_dv}; run megu-world-migrate to convert it",
                 save_version.mc_version, running.mc_version
             );
             return Err(
-                "world snapshot was written for a newer or unknown Minecraft version; run mc-spine-world-migrate to convert it",
+                "world snapshot was written for a newer or unknown Minecraft version; run megu-world-migrate to convert it",
             );
         }
     }
@@ -6323,7 +6323,7 @@ mod world_seed_persistence_tests {
         assert_eq!(resolve_world_seed(None, None), Ok(0));
         assert_eq!(
             resolve_world_seed(Some(456), Some(123)),
-            Err("MC_SPINE_SEED does not match the saved world seed")
+            Err("MEGU_SEED does not match the saved world seed")
         );
     }
 }
@@ -6422,7 +6422,7 @@ mod save_backup_tests {
 mod save_v2_version_tests {
     use super::*;
 
-    /// Run `run` with `MC_SPINE_TARGET_VERSION` / `MC_SPINE_MC_VERSION` set to
+    /// Run `run` with `MEGU_TARGET_VERSION` / `MEGU_MC_VERSION` set to
     /// the given values, then put back whatever was there before — even on a
     /// panic, so a failed assertion cannot leak a target into the next test.
     fn with_target_env<R>(
@@ -6441,15 +6441,15 @@ mod save_v2_version_tests {
                 }
             }
         }
-        let vars = ["MC_SPINE_TARGET_VERSION", "MC_SPINE_MC_VERSION"];
+        let vars = ["MEGU_TARGET_VERSION", "MEGU_MC_VERSION"];
         let _restore = Restore(
             vars.iter()
                 .map(|name| (*name, std::env::var_os(name)))
                 .collect(),
         );
         for (name, value) in [
-            ("MC_SPINE_TARGET_VERSION", target),
-            ("MC_SPINE_MC_VERSION", legacy),
+            ("MEGU_TARGET_VERSION", target),
+            ("MEGU_MC_VERSION", legacy),
         ] {
             match value {
                 Some(value) => std::env::set_var(name, value),
@@ -6582,7 +6582,7 @@ mod save_v2_version_tests {
         // `with_target_env` mutates the same process-global vars the guarded
         // save fixtures read through `save_world_into` — serialize them all.
         let _guard = world_guard();
-        // `MC_SPINE_TARGET_VERSION` is the canonical selector.
+        // `MEGU_TARGET_VERSION` is the canonical selector.
         with_target_env(Some("26.3"), None, || {
             let header = save_version_header().unwrap();
             assert_eq!(
@@ -6594,7 +6594,7 @@ mod save_v2_version_tests {
                 ("26.3", 5023, 777)
             );
         });
-        // The legacy `MC_SPINE_MC_VERSION` still selects a target when the
+        // The legacy `MEGU_MC_VERSION` still selects a target when the
         // canonical variable is unset, and loses to it otherwise.
         with_target_env(None, Some("26.3"), || {
             assert_eq!(save_version_header().unwrap().mc_version, "26.3");
@@ -6697,7 +6697,7 @@ mod save_v2_version_tests {
             with_target_env(None, None, || {
                 let err = load_world_from(&foreign).unwrap_err();
                 assert!(
-                    err.contains("mc-spine-world-migrate"),
+                    err.contains("megu-world-migrate"),
                     "{err} should direct to the migration tool"
                 );
             });
@@ -6718,7 +6718,7 @@ mod save_v2_version_tests {
         with_target_env(Some("26.3"), None, || {
             let err = load_world_from(&native).unwrap_err();
             assert!(
-                err.contains("mc-spine-world-migrate"),
+                err.contains("megu-world-migrate"),
                 "{err} should direct to the migration tool"
             );
         });
@@ -6731,7 +6731,7 @@ mod save_v2_version_tests {
         with_target_env(Some("26.3"), None, || {
             let err = load_world_from(&tagged).unwrap_err();
             assert!(
-                err.contains("mc-spine-world-migrate"),
+                err.contains("megu-world-migrate"),
                 "{err} should direct to the migration tool"
             );
         });
@@ -6760,7 +6760,7 @@ mod save_v2_version_tests {
             with_target_env(target, None, || {
                 let err = load_world_from(&future).unwrap_err();
                 assert!(
-                    err.contains("mc-spine-world-migrate"),
+                    err.contains("megu-world-migrate"),
                     "{err} should direct to the migration tool"
                 );
             });
@@ -7820,7 +7820,7 @@ mod p8b4_issue105_tests {
         let _guard = world_guard();
         test_support::require_vanilla_data();
         let dir =
-            std::env::temp_dir().join(format!("mc-spine-p8b4-flush-{}", std::process::id()));
+            std::env::temp_dir().join(format!("megu-p8b4-flush-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
 

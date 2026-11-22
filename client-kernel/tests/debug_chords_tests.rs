@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: LGPL-3.0-or-later
-use mc_spine_kernel::{
+use megu_kernel::{
     debug_chords::{
         build_chunk_border_lines, build_entity_hitbox_lines, finish_gamemode_switcher,
         format_advanced_tooltip_lines, handle_f3_chord, DebugChordAction, DebugChordContext,

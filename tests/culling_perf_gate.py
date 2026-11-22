@@ -464,7 +464,7 @@ def summarize_column(sections, edge):
 
 # ---------------------------------------------------------------------------
 # client-port translucent sort model: packed.rs is_translucent/depth_key and
-# ffi.rs mc_spine_client_mesh_sort_translucent ordering.
+# ffi.rs megu_client_mesh_sort_translucent ordering.
 # ---------------------------------------------------------------------------
 
 LAYER_OPAQUE, LAYER_CUTOUT, LAYER_TRANSLUCENT, LAYER_FLUID = range(4)

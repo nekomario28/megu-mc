@@ -1,10 +1,10 @@
 // SPDX-License-Identifier: LGPL-3.0-or-later OR GPL-3.0-or-later OR AGPL-3.0-or-later
 //! End-to-end live-session sound routing through decoded chunk acoustics.
 
-use mc_spine_client::protocol::{
+use megu_client::protocol::{
     decode_chunk_packet, ClientPlayEvent, PlayEvent, TeleportSync, WireSoundEvent,
 };
-use mc_spine_client_gpu::live_session::LiveSession;
+use megu_client_gpu::live_session::LiveSession;
 
 fn varint(bytes: &mut Vec<u8>, mut value: u32) {
     loop {
@@ -17,7 +17,7 @@ fn varint(bytes: &mut Vec<u8>, mut value: u32) {
     }
 }
 
-fn decoded_chunk_with_wall(state: u32) -> mc_spine_client::protocol::DecodedChunk {
+fn decoded_chunk_with_wall(state: u32) -> megu_client::protocol::DecodedChunk {
     // Protocol 767, -64..320, section y=0..15 filled with the given state.
     let mut sections = Vec::new();
     for section in 0..24 {

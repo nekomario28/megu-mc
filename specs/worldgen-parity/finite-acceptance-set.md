@@ -169,7 +169,7 @@ binary sha256 `486435229adfb20525e5c7cbe8c8fefd84074ed52170133742990419d5cde23d`
   うち nether_bricks 979セル(→netherrack 508 / →air 471)が消える — fortress writerのセルが
   比較集合に入っていることの証明。
 - **lane gates**: fixture_suite `manifest-promotable.json` **8 → 9 MATCH、exit 0**。
-  seed-0 の64chunk identity dump(`MC_SPINE_WG_DUMP_N=8`, 25,165,824 B)=
+  seed-0 の64chunk identity dump(`MEGU_WG_DUMP_N=8`, 25,165,824 B)=
   `670fdfe3472812afeeba823a30e08f472ea8eb69965d6ba0c54b30a2e9949def` **bit-identical**。
   serial suite **694 passed / 0 failed / 1 ignored**、`--test-threads=8` も
   **694 passed / 0 failed / 1 ignored、exit 0**(3回)。
@@ -273,15 +273,15 @@ binaryで再生成して比較した。raw: `audit/p2-1-acceptance-s04-s07-20261
   - `t6b/nat-taiga-mlight`(recorded order `d1b02f30…`): **0 / 884,736**、`OCEAN_FLOOR` 0列差。
   - **対照**: `--mode terrain` = **76,736 / 884,736**、wrong-seed `4243` = **185,879 / 884,736**。
   - **`manifest-promotable.json` 昇格**: `ow-4242-structures-4--32--64-384-n3` を追加し **11 → 12行、12 MATCH / 0 DIFF / 0 INVALID、exit 0** (`expected_runtime_writes`: count 5 = `air`×3 + `water[level=1]`×2、`writes_sha256 62fc3ddcc136e96cad1e45fc197a744fbe7f807d0a47db5ae2ecdda09b7cdde1`、両独立captureで同一)。なお(6,7)・(74,−41)と同様に `(4,−32)` 3×3 も凍結済み §2 には含まれないため §3 の `village` = MATCH と `manifest-promotable.json` を支える行であり、§2 の追加は別 revision に委ねる。
-  - **seed-0 64-chunk identity dump(`MC_SPINE_WG_DUMP_N=8`)**: `670fdfe3472812afeeba823a30e08f472ea8eb69965d6ba0c54b30a2e9949def`(25,165,824 B) **bit-identical**。詳細は `evidence/gameplay/feature-parity/village-taiga-p2-1-t0-and-mark-above-closure-20261118.md`。
+  - **seed-0 64-chunk identity dump(`MEGU_WG_DUMP_N=8`)**: `670fdfe3472812afeeba823a30e08f472ea8eb69965d6ba0c54b30a2e9949def`(25,165,824 B) **bit-identical**。詳細は `evidence/gameplay/feature-parity/village-taiga-p2-1-t0-and-mark-above-closure-20261118.md`。
 
 **2026-11-19 構造物batch(T3レシピ + `ruined_portal` B-run + `igloo`/`monument`/`village_plains`、基点 `0fa6807`)**
 
-source `0fa6807`(`perf/worldgen-parallel`、worktree dirty 0)。port binary `target/debug/mc-spine`
+source `0fa6807`(`perf/worldgen-parallel`、worktree dirty 0)。port binary `target/debug/megu`
 (sha256 `7dc623bf3372e5e8d71ad6cab6b65196f2a3ba7f125862234b4371524c4ef7ca`、`cargo build --offline --locked -j6`)。
 pinned jar sha1 `59353fb40c36d304f2035d51e7d6e6baa98dc05c`(`/home/yuu/tmpx/carverfresh/server.jar`)。
 **`src/` は無変更**。capture はすべて `tools/structure_capture.py`(新しいレシピ)で作った。
-raw: `/home/yuu/mc-spine-local/audit/p21t3-20261119/`、capture/dump: `/home/yuu/mc-spine-local/captures/matrix-v3/`。
+raw: `/home/yuu/megu-local/audit/p21t3-20261119/`、capture/dump: `/home/yuu/megu-local/captures/matrix-v3/`。
 
 - **レシピの再現性(§4-1〜4-4 を満たす道具の検証)**: 既存行を2件作り直し、native・port の両方が
   **byte一致**した — jungle `(74,−41)`(native.bin `77964c22…a715bf`、dump `77964c22…a715bf`、
@@ -347,7 +347,7 @@ level内順序はwall clock由来で**vanilla自身もrun-to-runで再現しな�
 ゆえに「既定順序で両参照に0差」はいかなる実装でも達成不能(参照AとB自身が23セル異なる)。
 
 **改訂後の受入条件**: この行の一致は **順序を入力として指定した比較**で判定する。
-`MC_SPINE_POP_ORDER=order-A.txt` で native A に、`order-B.txt` で native B に、
+`MEGU_POP_ORDER=order-A.txt` で native A に、`order-B.txt` で native B に、
 それぞれore差分0(population順序由来の差がないこと)。既定順序自体は
 「規律の名前つきメンバー(level優先+宣言済みtie-break)」として実装し、
 どのcaptureともbit一致しないことを明記する。順序が入力であることは

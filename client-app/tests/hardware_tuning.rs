@@ -9,18 +9,18 @@
 
 use std::path::PathBuf;
 
-use mc_spine_client::cli::parse_args;
-use mc_spine_client::hardware_profile::{
+use megu_client::cli::parse_args;
+use megu_client::hardware_profile::{
     classify_gpu, classify_intel_device, classify_macos_cpu_brand, parse_cache_size_kib,
     parse_meminfo_total_kib, parse_pci_id, parse_sysctl_l3_cache_kib, parse_sysctl_memsize_mib,
     probe_host_hardware, recommend_tuning, GpuVendorClass, HostHardwareProfile,
     LocalLlmRecommendation,
 };
-use mc_spine_client::render::RenderConfig;
-use mc_spine_client::settings::{
+use megu_client::render::RenderConfig;
+use megu_client::settings::{
     ClientSettings, DistantHorizon, QualityPreset, DEFAULT_BACKGROUND_FPS_LIMIT, MAX_BACKGROUND_FPS,
 };
-use mc_spine_client_mesh::gpu_pipeline::RenderBackendPreference;
+use megu_client_mesh::gpu_pipeline::RenderBackendPreference;
 
 fn profile(
     logical_cpus: u16,
@@ -44,10 +44,10 @@ fn profile(
     }
 }
 
-/// A scratch directory guaranteed not to contain a `mc-spine-client.toml`
+/// A scratch directory guaranteed not to contain a `megu-client.toml`
 /// auto-load file (the resolver only reads one when the file exists).
 fn empty_scratch_dir(tag: &str) -> PathBuf {
-    let dir = std::env::temp_dir().join(format!("mc-spine-hw-tuning-{tag}-{}", std::process::id()));
+    let dir = std::env::temp_dir().join(format!("megu-hw-tuning-{tag}-{}", std::process::id()));
     std::fs::create_dir_all(&dir).unwrap();
     dir
 }

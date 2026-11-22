@@ -124,8 +124,8 @@ class PgoBuildScriptTest(unittest.TestCase):
         self.assertIn("-Cprofile-use=%s/target/pgo/merged.profdata -Cllvm-args=-pgo-warn-missing-function"
                       % self.root.resolve(), out)
         self.assertIn("overworld-j1, overworld-j8, nofeat-j8, nether-4242, end-0", out)
-        self.assertIn("against the 64-chunk seed-0 full dump sha256 of target/pgo/gen/release/mc-spine", out)
-        self.assertIn("final binary (server): target/pgo/use/release/mc-spine", out)
+        self.assertIn("against the 64-chunk seed-0 full dump sha256 of target/pgo/gen/release/megu", out)
+        self.assertIn("final binary (server): target/pgo/use/release/megu", out)
         self.assertNotIn("target-cpu=native", out)
 
     def test_dry_run_server_explicit_matches_default(self):
@@ -156,8 +156,8 @@ class PgoBuildScriptTest(unittest.TestCase):
         self.assertIn("-Cprofile-generate=%s/target/pgo/client-app/raw" % self.root.resolve(), out)
         self.assertIn("-Cprofile-use=%s/target/pgo/client-app/merged.profdata" % self.root.resolve(), out)
         self.assertIn("cargo build --manifest-path client-app/Cargo.toml --release --offline --locked -j 2 "
-                      "--target-dir target/pgo/client-app/use --bin mc-spine-client", out)
-        self.assertIn("final binary (client-app): target/pgo/client-app/use/release/mc-spine-client", out)
+                      "--target-dir target/pgo/client-app/use --bin megu-client", out)
+        self.assertIn("final binary (client-app): target/pgo/client-app/use/release/megu-client", out)
 
     def test_dry_run_all_runs_every_target_in_order(self):
         out = self.dry_run("--target", "all")
@@ -168,7 +168,7 @@ class PgoBuildScriptTest(unittest.TestCase):
             self.assertEqual(out.count("== target %s ==" % t), 1)
         self.assertIn("--bin mesh_bench -- 500", out)
         self.assertIn("cargo test --manifest-path client-app/Cargo.toml", out)
-        self.assertIn("against the 64-chunk seed-0 full dump sha256 of target/pgo/gen/release/mc-spine", out)
+        self.assertIn("against the 64-chunk seed-0 full dump sha256 of target/pgo/gen/release/megu", out)
 
     # ---- --native-cpu ----------------------------------------------------------
     def test_native_cpu_all_targets(self):
@@ -210,9 +210,9 @@ class PgoBuildScriptTest(unittest.TestCase):
         self.assertIn("-j 6", out)
         self.assertNotIn("-j 2", out)
         self.assertIn("against --expected-sha %s" % GOOD_SHA, out)
-        self.assertIn("final binary (server): dist/mc-spine", out)
+        self.assertIn("final binary (server): dist/megu", out)
         self.assertIn("final binary (client-port): dist/mesh_bench", out)
-        self.assertIn("final binary (client-app): dist/mc-spine-client", out)
+        self.assertIn("final binary (client-app): dist/megu-client", out)
 
     def test_malformed_expected_sha_exit_2(self):
         bad = ["", "a" * 63, "a" * 65, "g" * 64, "0x" + "a" * 62, " " + "a" * 63, "a" * 63 + " ",
@@ -272,9 +272,9 @@ class PgoBuildScriptTest(unittest.TestCase):
         self.assertIn("-j 5 --target-dir target/pgo/gen", out)
         self.assertIn("-j 5 --target-dir target/pgo/use", out)
         self.assertEqual(self.dry_run("--jobs=5"), out)
-        out = self.dry_run("--out", "/opt/mc-spine-pgo")
-        self.assertIn("final binary (server): /opt/mc-spine-pgo", out)
-        self.assertEqual(self.dry_run("--out=/opt/mc-spine-pgo"), out)
+        out = self.dry_run("--out", "/opt/megu-pgo")
+        self.assertIn("final binary (server): /opt/megu-pgo", out)
+        self.assertEqual(self.dry_run("--out=/opt/megu-pgo"), out)
         out = self.dry_run("--out", "x.bin", "--jobs", "3", "--native-cpu", "--target", "client-port")
         self.assertIn("final binary (client-port): x.bin", out)
         self.assertIn("-j 3", out)

@@ -4572,7 +4572,7 @@ mod p1_combat_tests {
     fn attr_mod(attribute_id: i32, amount: f64, op: ItemAttrOp, slot: ItemAttrSlotGroup) -> ItemAttributeModifier {
         ItemAttributeModifier {
             attribute_id,
-            modifier_id: "mc-spine:test".to_string(),
+            modifier_id: "megu:test".to_string(),
             amount,
             operation: op,
             slot,

@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Generate a pinned-vanilla saved region and diff mc-spine's generation dump.
+# Generate a pinned-vanilla saved region and diff megu's generation dump.
 #
 #   tools/chunk_world_fixture.sh <tag> <cx> <cz> <n> <mode>
 #
@@ -105,13 +105,13 @@ if [ "$missing" -gt 0 ]; then
   exit 2
 fi
 cd "$ROOT"
-envs=(MC_SPINE_WG_PROFILE=0 MC_SPINE_WG_DUMP="$DIR/dump.bin" MC_SPINE_WG_DUMP_N="$N"
-      MC_SPINE_WG_DUMP_X="$CX" MC_SPINE_WG_DUMP_Z="$CZ" MC_SPINE_SEED=0)
+envs=(MEGU_WG_PROFILE=0 MEGU_WG_DUMP="$DIR/dump.bin" MEGU_WG_DUMP_N="$N"
+      MEGU_WG_DUMP_X="$CX" MEGU_WG_DUMP_Z="$CZ" MEGU_SEED=0)
 case "$MODE" in
-  terrain) envs+=(MC_SPINE_NOFEAT=1 MC_SPINE_NOCARVE=1) ;;
-  carvers) envs+=(MC_SPINE_NOFEAT=1) ;;
+  terrain) envs+=(MEGU_NOFEAT=1 MEGU_NOCARVE=1) ;;
+  carvers) envs+=(MEGU_NOFEAT=1) ;;
 esac
-env "${envs[@]}" ./target/release/mc-spine >/dev/null 2>&1
+env "${envs[@]}" ./target/release/megu >/dev/null 2>&1
 python3 tools/carver_diff.py "$DIR/dump.bin" "$DIR/world" --n "$N" --x0 "$CX" --z0 "$CZ" --tick > "$DIR/diff.txt" || true
 cat "$DIR/diff.txt"
 echo "chunk fixture: reference/dump/diff under $DIR"

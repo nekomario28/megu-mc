@@ -21,9 +21,9 @@ def build_runtime(build, sources, javac, java, legacy_classes, libraries):
                     *map(str, sources)], check=True)
     intermediary = build / 'runtime-intermediary'
     subprocess.run([java, '-Xmx128m', '-cp', os.pathsep.join(map(str, [legacy_classes, *libraries])),
-                    'net.mcspine.probe.RemapFacade', str(ROOT / 'runtime-intermediary.properties'),
+                    'net.megu.probe.RemapFacade', str(ROOT / 'runtime-intermediary.properties'),
                     str(named), str(intermediary)], check=True)
-    manifest = b'Manifest-Version: 1.0\r\nMain-Class: net.mcspine.probe.FabricRuntimeAdapter\r\n\r\n'
+    manifest = b'Manifest-Version: 1.0\r\nMain-Class: net.megu.probe.FabricRuntimeAdapter\r\n\r\n'
     surface = (ROOT / 'shim-surface.json').read_bytes()
     for classes, filename, namespace in ((named, 'fabric-runtime.jar', 'named'),
                                          (intermediary, 'fabric-runtime-intermediary.jar', 'intermediary')):
@@ -69,20 +69,20 @@ def main():
     runtime_sources = sorted(runtime.rglob('*.java'))
     subprocess.run([javac, '-J-Xmx128m', '--release', '21', '-proc:none', '-cp', os.pathsep.join(map(str, libraries)), '-d', str(classes), *map(str, sources)], check=True)
     build_runtime(build, runtime_sources, javac, java, classes, libraries)
-    app = {str(p.relative_to(classes)): p.read_bytes() for p in (classes / 'net/mcspine/probe').rglob('*.class')}
-    app['META-INF/services/net.fabricmc.loader.impl.game.GameProvider'] = b'net.mcspine.probe.SpineGameProvider\n'
+    app = {str(p.relative_to(classes)): p.read_bytes() for p in (classes / 'net/megu/probe').rglob('*.class')}
+    app['META-INF/services/net.fabricmc.loader.impl.game.GameProvider'] = b'net.megu.probe.SpineGameProvider\n'
     jar(build / 'game.jar', app)
     def fixture(name, cls=None, mixin=None, depends=None):
-        metadata = {'schemaVersion': 1, 'id': name, 'version': '1.0.0', 'environment': 'server', 'depends': depends or {'fabricloader': '>=0.19.5', 'java': '>=21', 'mcspine_probe': '*'}}
+        metadata = {'schemaVersion': 1, 'id': name, 'version': '1.0.0', 'environment': 'server', 'depends': depends or {'fabricloader': '>=0.19.5', 'java': '>=21', 'megu_probe': '*'}}
         entries = {}
         if cls:
-            file = 'net/mcspine/fixture/' + ('mixin/' if mixin else '') + cls + '.class'
+            file = 'net/megu/fixture/' + ('mixin/' if mixin else '') + cls + '.class'
             entries[file] = (classes / file).read_bytes()
         if name == 'place_block':
-            metadata['entrypoints'] = {'main': ['net.mcspine.fixture.PlaceBlock']}
+            metadata['entrypoints'] = {'main': ['net.megu.fixture.PlaceBlock']}
         if mixin:
             metadata['mixins'] = [name + '.mixins.json']
-            entries[name + '.mixins.json'] = json.dumps({'required': True, 'minVersion': '0.8', 'compatibilityLevel': 'JAVA_21', 'package': 'net.mcspine.fixture.mixin', 'mixins': [mixin], 'injectors': {'defaultRequire': 1}}).encode()
+            entries[name + '.mixins.json'] = json.dumps({'required': True, 'minVersion': '0.8', 'compatibilityLevel': 'JAVA_21', 'package': 'net.megu.fixture.mixin', 'mixins': [mixin], 'injectors': {'defaultRequire': 1}}).encode()
         entries['fabric.mod.json'] = json.dumps(metadata, sort_keys=True).encode()
         jar(build / (name + '.jar'), entries)
     fixture('place_block', 'PlaceBlock')

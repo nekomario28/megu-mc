@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: LGPL-3.0-or-later OR GPL-3.0-or-later OR AGPL-3.0-or-later
 //! Lane UX-CRASH-2: end-to-end wiring of the crash reporter into the
-//! `mc-spine-client` executable — the `--crash-report-mode` /
+//! `megu-client` executable — the `--crash-report-mode` /
 //! `--report-endpoint` / `--crash-reports-dir` / `--flush-crash-reports` /
 //! `--confirm-send` CLI surface, the `crash_report_mode` / `report_endpoint`
 //! TOML keys, and a loopback `/api/report` flush driven through the real
@@ -14,15 +14,15 @@ use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::Duration;
 
-use mc_spine_client::cli::parse_args;
-use mc_spine_client::crash_reporter::{
+use megu_client::cli::parse_args;
+use megu_client::crash_reporter::{
     capture_panic_context, write_pending_payload, ReportEnv, ReportKind,
 };
-use mc_spine_client::settings::{ClientSettings, CrashReportMode, QualityPreset};
+use megu_client::settings::{ClientSettings, CrashReportMode, QualityPreset};
 
 fn scratch_dir(tag: &str) -> PathBuf {
     let dir = std::env::temp_dir().join(format!(
-        "mc-spine-crash-cli-{tag}-{}",
+        "megu-crash-cli-{tag}-{}",
         std::process::id()
     ));
     let _ = std::fs::remove_dir_all(&dir);
@@ -33,7 +33,7 @@ fn scratch_dir(tag: &str) -> PathBuf {
 fn test_env() -> ReportEnv {
     ReportEnv {
         mc_version: "26.3".to_string(),
-        engine_version: "mc-spine-client 0.1.0".to_string(),
+        engine_version: "megu-client 0.1.0".to_string(),
         os: "linux-x86_64".to_string(),
         culprit: "create".to_string(),
         subsystem: None,
@@ -236,7 +236,7 @@ fn crash_keys_fail_closed_in_toml() {
 // --- End-to-end --flush-crash-reports over loopback --------------------------
 
 fn client_bin() -> &'static str {
-    env!("CARGO_BIN_EXE_mc-spine-client")
+    env!("CARGO_BIN_EXE_megu-client")
 }
 
 struct MockRelay {
@@ -325,7 +325,7 @@ fn spawn_mock_relay(status: u16, body: String, expected: usize) -> MockRelay {
 }
 
 /// Run the real binary in an empty working directory (no stray
-/// `mc-spine-client.toml` can leak in) and return its captured output.
+/// `megu-client.toml` can leak in) and return its captured output.
 fn run_client(run_dir: &Path, args: &[&str]) -> std::process::Output {
     Command::new(client_bin())
         .current_dir(run_dir)
@@ -346,7 +346,7 @@ fn flush_sends_pending_report_over_loopback_when_confirmed() {
     let relay = spawn_mock_relay(
         200,
         format!(
-            "{{\"ok\":true,\"fingerprint\":\"{fingerprint}\",\"issue_url\":\"https://github.com/nekomario28/mc-spine/issues/7\",\"duplicate\":false,\"total_reports\":1}}"
+            "{{\"ok\":true,\"fingerprint\":\"{fingerprint}\",\"issue_url\":\"https://github.com/nekomario28/megu-mc/issues/7\",\"duplicate\":false,\"total_reports\":1}}"
         ),
         1,
     );

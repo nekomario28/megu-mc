@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 # SPDX-License-Identifier: LGPL-3.0-or-later OR GPL-3.0-or-later OR AGPL-3.0-or-later
-"""Multiplayer wire stress test for mc-spine.
+"""Multiplayer wire stress test for megu.
 
-Launches an mc-spine server on an ephemeral loopback port, connects N headless
-mc-spine-client bots concurrently, and fail-closed asserts on every client's
+Launches an megu server on an ephemeral loopback port, connects N headless
+megu-client bots concurrently, and fail-closed asserts on every client's
 JSON summary plus server health. Prints a JSON summary to stdout.
 
 Usage:
@@ -29,8 +29,8 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence
 
 ROOT = Path(__file__).resolve().parents[1]
-DEFAULT_SERVER_BIN = "target/debug/mc-spine"
-DEFAULT_CLIENT_BIN = ROOT / "client-app/target/release/mc-spine-client"
+DEFAULT_SERVER_BIN = "target/debug/megu"
+DEFAULT_CLIENT_BIN = ROOT / "client-app/target/release/megu-client"
 SCRIPTS = ("walk", "jump", "sprint", "survey")
 SERVER_READY_TIMEOUT_S = 30.0
 CLIENTS_TIMEOUT_S = 120.0
@@ -52,16 +52,16 @@ def log(msg: str) -> None:
 def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(
         prog="multiplayer_stress_wire.py",
-        description="Concurrent headless-client wire stress test for mc-spine.",
+        description="Concurrent headless-client wire stress test for megu.",
     )
     p.add_argument("server_binary", nargs="?", default=DEFAULT_SERVER_BIN,
-                   help=f"mc-spine server binary (default: {DEFAULT_SERVER_BIN})")
+                   help=f"megu server binary (default: {DEFAULT_SERVER_BIN})")
     p.add_argument("--clients", type=int, default=8, help="concurrent clients (default: 8)")
     p.add_argument("--ticks", type=int, default=40, help="ticks per client (default: 40)")
     p.add_argument("--compression-threshold", type=int, default=64,
-                   help="MC_SPINE_COMPRESSION_THRESHOLD; negative leaves it unset (default: 64)")
+                   help="MEGU_COMPRESSION_THRESHOLD; negative leaves it unset (default: 64)")
     p.add_argument("--client-bin", type=Path, default=None,
-                   help=f"mc-spine-client binary (default: {DEFAULT_CLIENT_BIN})")
+                   help=f"megu-client binary (default: {DEFAULT_CLIENT_BIN})")
     p.add_argument("--build", action="store_true", help="force rebuilding the client")
     p.add_argument("--self-test", action="store_true", help="run offline self-tests and exit")
     return p
@@ -232,14 +232,14 @@ def aggregate(args: argparse.Namespace, per_client: List[Dict[str, Any]],
 def server_env(port: int, compression_threshold: int,
                base: Optional[Dict[str, str]] = None) -> Dict[str, str]:
     env = dict(os.environ if base is None else base)
-    env["MC_SPINE_PORT"] = str(port)
-    env["MC_SPINE_BIND_ADDR"] = "127.0.0.1"
-    env["MC_SPINE_SEED"] = "0"
-    env["MC_SPINE_RESOURCE_PACK_URL"] = ""
+    env["MEGU_PORT"] = str(port)
+    env["MEGU_BIND_ADDR"] = "127.0.0.1"
+    env["MEGU_SEED"] = "0"
+    env["MEGU_RESOURCE_PACK_URL"] = ""
     if compression_threshold >= 0:
-        env["MC_SPINE_COMPRESSION_THRESHOLD"] = str(compression_threshold)
+        env["MEGU_COMPRESSION_THRESHOLD"] = str(compression_threshold)
     else:
-        env.pop("MC_SPINE_COMPRESSION_THRESHOLD", None)
+        env.pop("MEGU_COMPRESSION_THRESHOLD", None)
     return env
 
 
@@ -498,15 +498,15 @@ def self_test() -> int:
             self.assertIn("--json-summary", argv)
 
         def test_server_env(self):
-            env = server_env(4242, 64, {"MC_SPINE_COMPRESSION_THRESHOLD": "9"})
-            self.assertEqual(env["MC_SPINE_PORT"], "4242")
-            self.assertEqual(env["MC_SPINE_BIND_ADDR"], "127.0.0.1")
-            self.assertEqual(env["MC_SPINE_SEED"], "0")
-            self.assertEqual(env["MC_SPINE_RESOURCE_PACK_URL"], "")
-            self.assertEqual(env["MC_SPINE_COMPRESSION_THRESHOLD"], "64")
-            env = server_env(4242, -1, {"MC_SPINE_COMPRESSION_THRESHOLD": "9"})
-            self.assertNotIn("MC_SPINE_COMPRESSION_THRESHOLD", env)
-            self.assertEqual(server_env(1, 0, {})["MC_SPINE_COMPRESSION_THRESHOLD"], "0")
+            env = server_env(4242, 64, {"MEGU_COMPRESSION_THRESHOLD": "9"})
+            self.assertEqual(env["MEGU_PORT"], "4242")
+            self.assertEqual(env["MEGU_BIND_ADDR"], "127.0.0.1")
+            self.assertEqual(env["MEGU_SEED"], "0")
+            self.assertEqual(env["MEGU_RESOURCE_PACK_URL"], "")
+            self.assertEqual(env["MEGU_COMPRESSION_THRESHOLD"], "64")
+            env = server_env(4242, -1, {"MEGU_COMPRESSION_THRESHOLD": "9"})
+            self.assertNotIn("MEGU_COMPRESSION_THRESHOLD", env)
+            self.assertEqual(server_env(1, 0, {})["MEGU_COMPRESSION_THRESHOLD"], "0")
 
         def test_proc_stat(self):
             line = ("1234 (mc spine) (x)) S 1 1234 1234 0 -1 4194560 100 0 0 0 "
@@ -518,7 +518,7 @@ def self_test() -> int:
                 parse_proc_stat("1 (a) S 1 2", 100)
 
         def test_proc_status(self):
-            text = "Name:\tmc-spine\nVmRSS:\t  204800 kB\nThreads:\t17\n"
+            text = "Name:\tmegu\nVmRSS:\t  204800 kB\nThreads:\t17\n"
             self.assertEqual(parse_proc_status(text), {"rss_mib": 200.0, "threads": 17})
             self.assertEqual(parse_proc_status("Name: x\n"),
                              {"rss_mib": None, "threads": None})

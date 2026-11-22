@@ -4,8 +4,8 @@
 //! synthetic 16x16 mask drawn from first principles — zero Mojang or mod
 //! texture bytes are referenced anywhere.
 
-use mc_spine_client_mesh::crop_archetype::*;
-use mc_spine_client_mesh::vanilla_plus_3d::Crop3dArchetype;
+use megu_client_mesh::crop_archetype::*;
+use megu_client_mesh::vanilla_plus_3d::Crop3dArchetype;
 
 // ---------------------------------------------------------------------------
 // Sprite builders (all coordinates are texels, y = 0 is the top row)

@@ -6848,7 +6848,7 @@ fn trunk_dirt_joins_the_log_list_and_a_log_below_is_kept() {
 }
 
 /// The four `Heightmap.Types` a feature can read are different quantities, and
-/// `MC_SPINE_HM_DUMP` now prints them live (via the same `FC::heightmap` accessors this
+/// `MEGU_HM_DUMP` now prints them live (via the same `FC::heightmap` accessors this
 /// test drives). Read off the pinned jungle chunk (73,-41) at column (1170,-652): the
 /// stored vanilla `Heightmaps` are WORLD_SURFACE 70, OCEAN_FLOOR 70, MOTION_BLOCKING 70
 /// and MOTION_BLOCKING_NO_LEAVES 69, where the column is `jungle_log` at 68 and

@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: LGPL-3.0-or-later OR GPL-3.0-or-later OR AGPL-3.0-or-later
 
-//! CLI integration tests for the `mc-spine-mod-check` binary
+//! CLI integration tests for the `megu-mod-check` binary
 //! (`src/bin/mod_check.rs` + `modpack::ModpackManifest::from_path`).
 //!
 //! Every fixture is generated in-process: stored and raw-deflate `.mrpack`
@@ -18,7 +18,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 
 use mod_adapter_core::data_loader::{parse_json, JsonValue};
 
-const BIN: &str = env!("CARGO_BIN_EXE_mc-spine-mod-check");
+const BIN: &str = env!("CARGO_BIN_EXE_megu-mod-check");
 
 static NEXT_DIR: AtomicUsize = AtomicUsize::new(0);
 
@@ -26,7 +26,7 @@ static NEXT_DIR: AtomicUsize = AtomicUsize::new(0);
 /// a pid + counter is unique enough and keeps the run deterministic).
 fn fixture_dir(tag: &str) -> PathBuf {
     let dir = std::env::temp_dir().join(format!(
-        "mc-spine-mod-check-{}-{}-{tag}",
+        "megu-mod-check-{}-{}-{tag}",
         std::process::id(),
         NEXT_DIR.fetch_add(1, Ordering::Relaxed)
     ));
@@ -44,7 +44,7 @@ fn run(args: &[&str]) -> (i32, String, String) {
     let out = Command::new(BIN)
         .args(args)
         .output()
-        .expect("spawn mc-spine-mod-check");
+        .expect("spawn megu-mod-check");
     (
         out.status.code().unwrap_or(-1),
         String::from_utf8_lossy(&out.stdout).into_owned(),
@@ -413,7 +413,7 @@ fn json_report_matches_preflight_schema() {
 
     let root = parse_json(stdout.as_bytes()).expect("stdout must be valid JSON");
     let r = obj(&root);
-    assert_eq!(str_field(r, "schema"), "mc-spine-modpack-preflight/1");
+    assert_eq!(str_field(r, "schema"), "megu-modpack-preflight/1");
     assert_eq!(str_field(r, "pack_name"), "Create NeoForge Adventure");
     assert_eq!(str_field(r, "pack_version"), "1.4.0");
     assert_eq!(str_field(r, "format"), "modrinth");
@@ -563,7 +563,7 @@ fn missing_file_and_malformed_inputs_exit_1() {
     let dir = fixture_dir("errors");
     let (code, _, stderr) = run(&["--modpack", "/nonexistent/pack.mrpack"]);
     assert_eq!(code, 1);
-    assert!(stderr.contains("mc-spine-mod-check"), "stderr: {stderr}");
+    assert!(stderr.contains("megu-mod-check"), "stderr: {stderr}");
 
     let bad_json = write_fixture(&dir, "broken.json", b"{ not json");
     let (code, _, _) = run(&["--modpack", bad_json.to_str().unwrap()]);
@@ -963,7 +963,7 @@ fn scan_jar_safe_inject_lifts_and_exits_0() {
     assert_eq!(code, 0, "stderr: {stderr}");
     let root = parse_json(stdout.as_bytes()).expect("stdout must be valid JSON");
     let r = obj(&root);
-    assert_eq!(str_field(r, "schema"), "mc-spine-jar-mixin-scan/1");
+    assert_eq!(str_field(r, "schema"), "megu-jar-mixin-scan/1");
     assert_eq!(str_field(r, "path"), jar);
     assert_eq!(
         r.get("mixin_configs_found").and_then(JsonValue::as_u64),
@@ -1091,7 +1091,7 @@ fn scan_jar_missing_and_corrupt_inputs_exit_1() {
     let dir = fixture_dir("scan-errors");
     let (code, _, stderr) = run(&["--scan-jar", "/nonexistent/mod.jar"]);
     assert_eq!(code, 1);
-    assert!(stderr.contains("mc-spine-mod-check"), "stderr: {stderr}");
+    assert!(stderr.contains("megu-mod-check"), "stderr: {stderr}");
 
     // Not a ZIP archive at all.
     let garbage = write_fixture(&dir, "garbage.jar", b"not a zip at all");
@@ -1193,7 +1193,7 @@ fn invalid_cli_args_exit_2() {
         let (code, _, stderr) = run(&args);
         assert_eq!(code, 2, "args {args:?} must exit 2");
         assert!(
-            stderr.contains("mc-spine-mod-check"),
+            stderr.contains("megu-mod-check"),
             "args {args:?} stderr must explain the error: {stderr}"
         );
     }
@@ -1299,7 +1299,7 @@ fn scan_mods_dir_mixed_folder_exits_0() {
     assert_eq!(code, 0, "stderr: {stderr}");
     let root = parse_json(stdout.as_bytes()).expect("stdout must be valid JSON");
     let r = obj(&root);
-    assert_eq!(str_field(r, "schema"), "mc-spine-mods-dir-scan/1");
+    assert_eq!(str_field(r, "schema"), "megu-mods-dir-scan/1");
     assert_eq!(str_field(r, "verdict"), "clean");
     assert_eq!(r.get("jars_found").and_then(JsonValue::as_u64), Some(5));
     assert_eq!(
@@ -1540,7 +1540,7 @@ fn scan_mods_dir_missing_and_corrupt_inputs_exit_1() {
 
     let (code, _, stderr) = run(&["--scan-mods-dir", "/nonexistent/mods"]);
     assert_eq!(code, 1);
-    assert!(stderr.contains("mc-spine-mod-check"), "stderr: {stderr}");
+    assert!(stderr.contains("megu-mod-check"), "stderr: {stderr}");
     assert!(stderr.contains("not an existing directory"), "stderr: {stderr}");
 
     // A regular file is not a directory.
@@ -1595,7 +1595,7 @@ fn scan_mods_dir_mutual_exclusion_and_flag_gating_exit_2() {
         let (code, _, stderr) = run(&args);
         assert_eq!(code, 2, "args {args:?} must exit 2");
         assert!(
-            stderr.contains("mc-spine-mod-check"),
+            stderr.contains("megu-mod-check"),
             "args {args:?} stderr must explain the error: {stderr}"
         );
     }
@@ -1620,7 +1620,7 @@ fn scan_mods_dir_empty_dir_and_equals_form_exit_0() {
     assert_eq!(code, 0);
     let root = parse_json(stdout.as_bytes()).unwrap();
     let r = obj(&root);
-    assert_eq!(str_field(r, "schema"), "mc-spine-mods-dir-scan/1");
+    assert_eq!(str_field(r, "schema"), "megu-mods-dir-scan/1");
     assert_eq!(str_field(r, "verdict"), "clean");
     assert_eq!(r.get("jars_found").and_then(JsonValue::as_u64), Some(0));
     assert!(r

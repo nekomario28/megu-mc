@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 # SPDX-License-Identifier: LGPL-3.0-or-later
-"""Seeded, deterministic adversarial Protocol 767 wire fuzz suite for mc-spine.
+"""Seeded, deterministic adversarial Protocol 767 wire fuzz suite for megu.
 
-Launches an isolated loopback mc-spine server (temporary world under
-target/tmp, ephemeral ports, RCON enabled, MC_SPINE_ALLOW_PLAYER_ADMIN_COMMANDS=0)
+Launches an isolated loopback megu server (temporary world under
+target/tmp, ephemeral ports, RCON enabled, MEGU_ALLOW_PLAYER_ADMIN_COMMANDS=0)
 and drives structured edge-case packets through the live protocol:
 
   wave 1  malformed framing / VarInt / handshake / configuration abuse
@@ -852,7 +852,7 @@ def all_cases(seed, total, game_port=25565):
 
 @contextlib.contextmanager
 def fuzz_server(binary, root):
-    """Isolated mc-spine: loopback, RCON, anvil playerdata, admin cmds OFF."""
+    """Isolated megu: loopback, RCON, anvil playerdata, admin cmds OFF."""
     game, rcon = port(), port()
     while rcon == game:
         rcon = port()
@@ -860,18 +860,18 @@ def fuzz_server(binary, root):
     anvil.mkdir(parents=True, exist_ok=True)
     env = dict(
         os.environ,
-        MC_SPINE_PORT=str(game),
-        MC_SPINE_BIND_ADDR="127.0.0.1",
-        MC_SPINE_RCON_PORT=str(rcon),
-        MC_SPINE_RCON_BIND_ADDR="127.0.0.1",
-        MC_SPINE_RCON_PASS=RCON_SECRET,
-        MC_SPINE_WG="old",
-        MC_SPINE_RESOURCE_PACK_URL="",
-        MC_SPINE_ALLOW_PLAYER_ADMIN_COMMANDS="0",
-        MC_SPINE_ANVIL_WORLD_DIR=str(anvil),
-        MC_SPINE_SEED="0",
+        MEGU_PORT=str(game),
+        MEGU_BIND_ADDR="127.0.0.1",
+        MEGU_RCON_PORT=str(rcon),
+        MEGU_RCON_BIND_ADDR="127.0.0.1",
+        MEGU_RCON_PASS=RCON_SECRET,
+        MEGU_WG="old",
+        MEGU_RESOURCE_PACK_URL="",
+        MEGU_ALLOW_PLAYER_ADMIN_COMMANDS="0",
+        MEGU_ANVIL_WORLD_DIR=str(anvil),
+        MEGU_SEED="0",
     )
-    env.pop("MC_SPINE_WAL_PATH", None)
+    env.pop("MEGU_WAL_PATH", None)
     log_path = root / "server.log"
     with log_path.open("w+") as log:
         proc = subprocess.Popen([str(binary)], cwd=root, env=env,
@@ -1900,7 +1900,7 @@ def self_test():
 
 def main():
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
-    ap.add_argument("server_binary", nargs="?", default="target/debug/mc-spine")
+    ap.add_argument("server_binary", nargs="?", default="target/debug/megu")
     ap.add_argument("--seed", type=int, default=1211)
     ap.add_argument("--cases", type=int, default=250)
     ap.add_argument("--self-test", action="store_true")

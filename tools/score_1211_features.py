@@ -3,7 +3,7 @@
 """Evidence-based parity scorer for the Minecraft 1.21.1 feature CSV.
 
 Reads the external feature CSV (10,436 rows, 17 prefixes) and mechanically
-scores every row against the live mc-spine repository.  Scoring is honest by
+scores every row against the live megu repository.  Scoring is honest by
 construction:
 
 * Rust sources are lexed so ``//`` / ``/* */`` comments and string/char
@@ -42,7 +42,7 @@ NEEDS_VERIFY = "NEEDS_VERIFY"
 MANUAL_MECH = "MANUAL_MECH"
 ALL_STATUSES = (COVERED, PARTIAL, MISSING, NEEDS_VERIFY, MANUAL_MECH)
 
-DEFAULT_CSV = "/home/yuu/src/mc-spine-fix/out/minecraft-1.21.1-features.csv"
+DEFAULT_CSV = "/home/yuu/src/megu-fix/out/minecraft-1.21.1-features.csv"
 CSV_ENV = "MC_1211_FEATURES_CSV"
 
 PREFIXES = (

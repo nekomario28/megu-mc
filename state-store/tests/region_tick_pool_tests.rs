@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: LGPL-3.0-or-later OR GPL-3.0-or-later OR AGPL-3.0-or-later
 //! Gates P1 & P2 from
 //! `audit/full-multithreading-server-client-parallel-architecture-20261123.md`
-//! for the [`mc_spine_state_store::region_tick`] resident-pool migration.
+//! for the [`megu_state_store::region_tick`] resident-pool migration.
 //!
 //! * **P1** — 16 active regions across the 4 checkerboard waves, ticked for
 //!   200 rounds on a 1-interactive-worker [`MeguTaskPool`] vs an 8-worker
@@ -15,11 +15,11 @@
 
 use std::sync::{Mutex, MutexGuard};
 
-use mc_spine_core::task_pool::{MeguTaskPool, PoolTopologyConfig, TaskLane};
-use mc_spine_state_store::region_tick::{tick_regions_in_pool, RegionCoord, RegionMobTable};
-use mc_spine_state_store::sharded::{BlockCoord, ChunkCoord, DimensionState};
+use megu_core::task_pool::{MeguTaskPool, PoolTopologyConfig, TaskLane};
+use megu_state_store::region_tick::{tick_regions_in_pool, RegionCoord, RegionMobTable};
+use megu_state_store::sharded::{BlockCoord, ChunkCoord, DimensionState};
 
-/// Poison-tolerant lock — same contract as `mc_spine_core::task_pool`'s
+/// Poison-tolerant lock — same contract as `megu_core::task_pool`'s
 /// internal helper; a panicked tick must not wedge the merge path.
 fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
     mutex

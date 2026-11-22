@@ -1,4 +1,4 @@
-# AUDIT_WIRE — mc-spine OOM signature hunt (lane mc-spine-audit-2)
+# AUDIT_WIRE — megu OOM signature hunt (lane megu-audit-2)
 
 Scope: play-state dispatch (`handle`, L4872–6128), persistence (`save_world`/`load_world`
 L1163–1303), spawn paths, `thread::spawn` sites, tick fns (L374–1032), command executor
@@ -130,7 +130,7 @@ slower steady `sent` growth; idle stays flat.
 
 ---
 
-# Audit-3 addendum (2026-09-26, lane mc-spine-audit-3)
+# Audit-3 addendum (2026-09-26, lane megu-audit-3)
 
 ## The geometric single-mapping signature: identified
 
@@ -153,7 +153,7 @@ fn write_varint(out: &mut Vec<u8>, mut v: i64) {
 
 Any negative `v` pushes `0xFF` forever into a fresh `Vec<u8>` → capacity doubles 1→2→…→32 GiB on one mapping; `send_packet` is never reached (the Vec is still being built); the handler thread spins at 100% CPU while other connections stay live — matching the ESTAB sockets and flat-idle behavior in the captures.
 
-Current source is FIXED (L23–32): `v<0 && v>=i32::MIN → v as u32 as u64` (correct 5-byte VarInt for negatives), wider negatives → `v as u64` (10-byte VarLong). The comment documents this exact failure. Verify `target/release/mc-spine` (and any running pids / `mc-spine-inst` binaries — inst pid 2471559 still carries the bug) postdate the fix; a stale binary still OOMs.
+Current source is FIXED (L23–32): `v<0 && v>=i32::MIN → v as u32 as u64` (correct 5-byte VarInt for negatives), wider negatives → `v as u64` (10-byte VarLong). The comment documents this exact failure. Verify `target/release/megu` (and any running pids / `megu-inst` binaries — inst pid 2471559 still carries the bug) postdate the fix; a stale binary still OOMs.
 
 ### Negative-value sinks (all client-connected-only ⇒ idle/probes flat)
 
@@ -241,7 +241,7 @@ It cannot be a wire/state count in this source. The geometric 2×-capacity
 single-mapping + ~1 GB/s tail-write rate in the captures points uniquely at
 `Vec<u8>` push-doubling, and the only such unbounded loop ever present was
 `write_varint` (fixed). Check in order: (a) stale binary/process — any pid
-predating the fix (or `mc-spine-inst` copies) still OOMs; (b) reproduce under
+predating the fix (or `megu-inst` copies) still OOMs; (b) reproduce under
 `systemd-run --user --scope -p MemoryMax=4G` and capture `/proc/<pid>/smaps` +
 `gdb -p <pid> -batch -ex 'thread apply all bt'` mid-growth — the writing
 thread's frame names the Vec owner directly; (c) `x<0` vanilla play is the

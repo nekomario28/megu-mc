@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: LGPL-3.0-or-later OR GPL-3.0-or-later OR AGPL-3.0-or-later
 
-use mc_spine_client_mesh::hiz_culler::{HiZCullStats, HiZError, HiZPyramid};
+use megu_client_mesh::hiz_culler::{HiZCullStats, HiZError, HiZPyramid};
 
 /// Orthographic `view_proj` for a `side x side` pixel buffer: world x/y in
 /// `[0, side]` map 1:1 onto pixels and world z passes through as NDC depth

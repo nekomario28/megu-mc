@@ -19,17 +19,17 @@ HERE = Path(__file__).resolve().parent
 ZIP_TIME = (1980, 1, 1, 0, 0, 0)
 MINECRAFT = "1.21.1"
 MC_VERSIONS = ("1.21.1", "26.3")
-BOOTSTRAP_UID = "net.mcspine.bootstrapper"
-BOOTSTRAP_LIBRARY = "net.mcspine:bootstrapper:1.0.0"
-BOOTSTRAP_JAR = Path("net/mcspine/bootstrapper/1.0.0/bootstrapper-1.0.0.jar")
-BOOTSTRAP_PATCH = "net.mcspine.bootstrapper.json"
+BOOTSTRAP_UID = "net.megu.bootstrapper"
+BOOTSTRAP_LIBRARY = "net.megu:bootstrapper:1.0.0"
+BOOTSTRAP_JAR = Path("net/megu/bootstrapper/1.0.0/bootstrapper-1.0.0.jar")
+BOOTSTRAP_PATCH = "net.megu.bootstrapper.json"
 MAX_BOOTSTRAP_JAR = 32 * 1024
 MESH_ABI = 1
 KERNEL_ABI = 1
 LOADER_UID = {"fabric": "net.fabricmc.fabric-loader", "neoforge": "net.neoforged"}
 LOADER_DEPENDENCY = {"fabric": "fabric-loader", "neoforge": "neoforge"}
-MESH_NAME = "libmc_spine_client_mesh.so"
-KERNEL_NAME = "libmc_spine_kernel.so"
+MESH_NAME = "libmegu_client_mesh.so"
+KERNEL_NAME = "libmegu_kernel.so"
 
 
 def sha(path, algorithm):
@@ -66,13 +66,13 @@ def verify_library_abi(library, label, symbol, expected):
 
 
 def verify_mesh_abi(library):
-    """The current client-port C ABI exposes mc_spine_mesh_abi_version (v1)."""
-    verify_library_abi(library, "mesh", "mc_spine_mesh_abi_version", MESH_ABI)
+    """The current client-port C ABI exposes megu_mesh_abi_version (v1)."""
+    verify_library_abi(library, "mesh", "megu_mesh_abi_version", MESH_ABI)
 
 
 def verify_kernel_abi(library):
-    """The client-kernel C ABI exposes mc_spine_kernel_abi_version (v1)."""
-    verify_library_abi(library, "kernel", "mc_spine_kernel_abi_version", KERNEL_ABI)
+    """The client-kernel C ABI exposes megu_kernel_abi_version (v1)."""
+    verify_library_abi(library, "kernel", "megu_kernel_abi_version", KERNEL_ABI)
 
 
 def write_text(path, contents):
@@ -97,13 +97,13 @@ def bootstrap_patch(mc_version, client_sha256):
         "formatVersion": 1,
         "uid": BOOTSTRAP_UID,
         "version": "1.0.0",
-        "name": "mc-spine bootstrapper",
-        "mainClass": "net.mcspine.launcher.Main",
+        "name": "megu bootstrapper",
+        "mainClass": "net.megu.launcher.Main",
         "inheritsFrom": mc_version,
         "libraries": [{"name": BOOTSTRAP_LIBRARY, "MMC-hint": "local"}],
     }
     if client_sha256:
-        patch["+jvmArgs"] = [f"-Dmc.spine.clientSha256={client_sha256.lower()}"]
+        patch["+jvmArgs"] = [f"-Dmegu.clientSha256={client_sha256.lower()}"]
     return patch
 
 
@@ -120,7 +120,7 @@ def prism_export(directory, loader, loader_version, name, client_bin, client_sha
         write_text(patch, json_text(bootstrap_patch(mc_version, client_sha256)))
         if client_bin:
             exe = ".exe" if client_bin.name.lower().endswith(".exe") else ""
-            target = directory / f".minecraft/bin/mc-spine-client{exe}"
+            target = directory / f".minecraft/bin/megu-client{exe}"
             target.parent.mkdir(parents=True, exist_ok=True)
             shutil.copyfile(client_bin, target)
             target.chmod(0o755)
@@ -134,12 +134,12 @@ def prism_export(directory, loader, loader_version, name, client_bin, client_sha
     else:
         # Prism's wrapper command needs a fully resolved executable. Double quotes
         # preserve paths containing spaces in Prism's command-line splitter.
-        wrapper = directory / "mc-spine-wrapper"
-        shutil.copyfile(HERE / "mc-spine-wrapper", wrapper)
+        wrapper = directory / "megu-wrapper"
+        shutil.copyfile(HERE / "megu-wrapper", wrapper)
         wrapper.chmod(0o755)
         wrapper_command = f'"{wrapper.resolve()}"'
         if client_bin:
-            target = directory / "bin/mc-spine-client"
+            target = directory / "bin/megu-client"
             target.parent.mkdir(parents=True, exist_ok=True)
             shutil.copyfile(client_bin, target)
             target.chmod(0o755)
@@ -155,7 +155,7 @@ def prism_export(directory, loader, loader_version, name, client_bin, client_sha
                    "[General]\nInstanceType=OneSix\n"
                    f"name={name}\nOverrideCommands=true\nWrapperCommand={wrapper_command}\n")
     if integrated_jar:
-        destination = directory / ".minecraft/mods/mc-spine-integrated.jar"
+        destination = directory / ".minecraft/mods/megu-integrated.jar"
         destination.parent.mkdir(parents=True, exist_ok=True)
         shutil.copyfile(integrated_jar, destination)
     for name, library in sorted(native_libs.items()):
@@ -188,21 +188,21 @@ def prism_zip_export(prism_dir, destination):
 def mrpack_export(directory, loader, loader_version, name, version_id, integrated_jar,
                   native_libs, mc_version=MINECRAFT, client_bin=None):
     directory.mkdir(parents=True, exist_ok=True)
-    contents = {"overrides/mods/mc-spine-integrated.jar": (integrated_jar.read_bytes(), 0o644)}
+    contents = {"overrides/mods/megu-integrated.jar": (integrated_jar.read_bytes(), 0o644)}
     for lib_name, library in native_libs.items():
-        contents[f"overrides/mc-spine/native/{lib_name}"] = (library.read_bytes(), 0o644)
+        contents[f"overrides/megu/native/{lib_name}"] = (library.read_bytes(), 0o644)
     if client_bin is not None:
         exe = ".exe" if client_bin.name.lower().endswith(".exe") else ""
-        rel_bin = f"bin/mc-spine-client{exe}"
+        rel_bin = f"bin/megu-client{exe}"
         contents[f"overrides/{rel_bin}"] = (client_bin.read_bytes(), 0o755)
         cfg = (
-            "# Auto-generated by mc-spine export_launcher_bundle.py for Modrinth .mrpack\n"
+            "# Auto-generated by megu export_launcher_bundle.py for Modrinth .mrpack\n"
             "enabled=true\n"
             f"serverBin={rel_bin}\n"
-            "world=mc-spine\n"
+            "world=megu\n"
             "seed=0\n"
         ).encode("utf-8")
-        contents["overrides/config/mc-spine-integrated.properties"] = (cfg, 0o644)
+        contents["overrides/config/megu-integrated.properties"] = (cfg, 0o644)
     # .mrpack files[] describes downloadable URLs. Local overrides are bundled,
     # so checksums are retained in a namespaced extension instead.
     bundled = {}
@@ -217,13 +217,13 @@ def mrpack_export(directory, loader, loader_version, name, version_id, integrate
         "game": "minecraft",
         "versionId": version_id,
         "name": name,
-        "summary": f"mc-spine Integrated Server bridge for Minecraft {mc_version}",
+        "summary": f"megu Integrated Server bridge for Minecraft {mc_version}",
         "files": [],
         "dependencies": {"minecraft": mc_version,
                          LOADER_DEPENDENCY[loader]: loader_version},
-        "mcSpine": {"bundledOverrides": bundled},
+        "megu": {"bundledOverrides": bundled},
     }
-    destination = directory / f"mc-spine-{mc_version}.mrpack"
+    destination = directory / f"megu-{mc_version}.mrpack"
     with zipfile.ZipFile(destination, "w") as archive:
         zip_entry(archive, "modrinth.index.json", json_text(index).encode())
         for path, (content, mode) in sorted(contents.items()):
@@ -241,7 +241,7 @@ def main():
                         help="exact Fabric Loader or NeoForge version for this Minecraft release")
     parser.add_argument("--mc-version", choices=MC_VERSIONS, default=MINECRAFT,
                         help="Minecraft release for Prism components and .mrpack dependencies")
-    parser.add_argument("--name", help="instance/pack name (default: mc-spine <mc-version>)")
+    parser.add_argument("--name", help="instance/pack name (default: megu <mc-version>)")
     parser.add_argument("--version-id", default="0.1.0")
     parser.add_argument("--client-bin", type=Path,
                         help="optional native executable to bundle into the Prism instance")
@@ -254,19 +254,19 @@ def main():
                         help="optional client-kernel cdylib (C ABI v1 required)")
     parser.add_argument("--include-ffi-libs", action="store_true",
                         help="also bundle the client-port/client-kernel release cdylibs "
-                             "(libmc_spine_client_mesh.so / libmc_spine_kernel.so) found "
+                             "(libmegu_client_mesh.so / libmegu_kernel.so) found "
                              "under this repo's target/release dirs - explicit opt-in "
                              "for external JVM FFI consumers; statically linked clients "
                              "never need them, so exports omit them by default")
     parser.add_argument("--bootstrap-jar", type=Path,
-                        help="mc-spine-bootstrapper.jar (<32 KiB) for a native Prism "
+                        help="megu-bootstrapper.jar (<32 KiB) for a native Prism "
                              "patches/*.json install (no shell wrapper)")
     parser.add_argument("--prism-zip", action="store_true",
-                        help="also emit a deterministic Prism import archive mc-spine-prism-<mc>.zip")
+                        help="also emit a deterministic Prism import archive megu-prism-<mc>.zip")
     args = parser.parse_args()
     exporting_mrpack = args.format in ("mrpack", "modrinth", "all")
     if args.name is None:
-        args.name = f"mc-spine {args.mc_version}"
+        args.name = f"megu {args.mc_version}"
     if args.bootstrap_jar is not None and args.format not in ("prism", "all"):
         parser.error("--bootstrap-jar requires --format prism or all")
     if bool(args.loader) != bool(args.loader_version):
@@ -322,7 +322,7 @@ def main():
 
     output = args.out_dir.resolve()
     output.mkdir(parents=True, exist_ok=True)
-    with tempfile.TemporaryDirectory(prefix="mc-spine-cf4-") as scratch:
+    with tempfile.TemporaryDirectory(prefix="megu-cf4-") as scratch:
         if args.loader and integrated_jar is None:
             integrated_jar = build_integrated_jar(Path(scratch))
         if args.format in ("prism", "all"):
@@ -332,7 +332,7 @@ def main():
                          mc_version=args.mc_version, bootstrap_jar=bootstrap_jar)
             print(f"Prism instance: {prism_dir}")
             if args.prism_zip:
-                zip_dest = output / f"mc-spine-prism-{args.mc_version}.zip"
+                zip_dest = output / f"megu-prism-{args.mc_version}.zip"
                 prism_zip_export(prism_dir, zip_dest)
                 print(f"Prism archive: {zip_dest} (sha256={sha(zip_dest, 'sha256')})")
         if exporting_mrpack:

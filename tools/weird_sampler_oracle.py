@@ -3,7 +3,7 @@
 
 The Java probe constructs the real name-seeded NormalNoise values used by the
 vanilla weird-scaled sampler.  These references pin transform/coordinate
-semantics; they do not independently prove that mc-spine implements the same
+semantics; they do not independently prove that megu implements the same
 NormalNoise construction.  No server, world, downloads, or extra dependencies.
 """
 import argparse
@@ -192,7 +192,7 @@ def reference(jar):
         noises = {name: json.loads(payload) for name, payload in payloads.items()}
         source, destination = work / "input.json", work / "output.json"
         source.write_text(json.dumps({"cases": requested, "noises": noises}))
-        run_probe(work, classpath, SOURCE, "dev.mcspine.tools.WeirdSamplerOracle",
+        run_probe(work, classpath, SOURCE, "dev.megu.tools.WeirdSamplerOracle",
                   source, destination)
         rows = json.loads(destination.read_text())
     validate(rows, requested)

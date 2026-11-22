@@ -1,8 +1,8 @@
 // SPDX-License-Identifier: LGPL-3.0-or-later
-use mc_spine_kernel::player_physics::{
+use megu_kernel::player_physics::{
     apply_knockback, step_player_physics, PlayerInputState, PlayerPhysicsState, SurfaceKind,
 };
-use mc_spine_kernel::{Aabb, Error, FluidCell, FluidKind};
+use megu_kernel::{Aabb, Error, FluidCell, FluidKind};
 
 fn bounds(min: [f64; 3], max: [f64; 3]) -> Aabb {
     Aabb { min, max }
@@ -24,7 +24,7 @@ fn tick(
     input: PlayerInputState,
     surface: SurfaceKind,
     shapes: &[Aabb],
-) -> mc_spine_kernel::player_physics::PhysicsStepOutcome {
+) -> megu_kernel::player_physics::PhysicsStepOutcome {
     step_player_physics(state, input, surface, shapes, |_, _, _| {
         Ok(FluidCell::default())
     })

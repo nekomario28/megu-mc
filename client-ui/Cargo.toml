@@ -1,18 +1,18 @@
 [package]
-name = "mc-spine-client-ui"
+name = "megu-client-ui"
 version = "0.1.0"
 edition = "2021"
 publish = false
 license = "LGPL-3.0-or-later"
-description = "Standalone zero-dependency pure-Rust client UI for mc-spine: UiDrawList, built-in 8x8 bitmap font, software RGBA rasterizer, WGSL quad tessellation, title/settings/HUD/pause/friends/mod-sync/crash-recovery screens"
+description = "Standalone zero-dependency pure-Rust client UI for megu: UiDrawList, built-in 8x8 bitmap font, software RGBA rasterizer, WGSL quad tessellation, title/settings/HUD/pause/friends/mod-sync/crash-recovery screens"
 
 # Zero external dependencies by contract: the whole UI stack is clean-room
-# pure `std`. `mc-spine-core` is the in-repo leaf crate (also zero-dependency)
+# pure `std`. `megu-core` is the in-repo leaf crate (also zero-dependency)
 # that owns the canonical `MEGU-E-XXXXXXXX` crash fingerprint and the
 # privacy redaction the crash-recovery screen displays — still no crates.io
 # dependencies anywhere in the graph.
 [dependencies]
-mc_spine_core = { package = "mc-spine-core", path = "../core" }
+megu_core = { package = "megu-core", path = "../core" }
 
 # Standalone manifest: the root `[profile.release]` is not inherited, so the
 # shipped binary opts into full optimisation, LTO and symbol stripping itself.

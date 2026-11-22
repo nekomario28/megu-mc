@@ -1,40 +1,40 @@
 // SPDX-License-Identifier: LGPL-3.0-or-later OR GPL-3.0-or-later OR AGPL-3.0-or-later
 //! `winit` 0.30 window + input loop: `ApplicationHandler`, FPS camera
-//! controls, pause/settings via `mc_spine_ui`, background-FPS throttling,
+//! controls, pause/settings via `megu_ui`, background-FPS throttling,
 //! and `FrameBudgetGovernor` pacing — all driving the real `wgpu` renderer.
 
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use crate::live_session::LiveHudFeed;
-use mc_spine_client::audio_qol::{ZoomState, DEFAULT_ZOOM_SMOOTHING_RATE};
-use mc_spine_client::friend_client::{FriendGuestBridge, FriendHostSession};
-use mc_spine_client::integrated;
-use mc_spine_client::protocol::encode_slot_stack;
-use mc_spine_client::render::{FrameBudgetGovernor, RenderConfig, ThrottleStage};
-use mc_spine_client::spatial_audio::SpatialAudioPreset;
-use mc_spine_client::zsh_command_bar::ZshCommandBar;
-use mc_spine_client_mesh::builtin_shadow_wgsl::{BuiltinShadowQuality, RenderScalePreset};
-use mc_spine_client_mesh::tactile_effects::{TactileEffectsConfig, TactilePreset};
-use mc_spine_client_mesh::ChunkUploadBudget;
-use mc_spine_kernel::debug_chords::{
+use megu_client::audio_qol::{ZoomState, DEFAULT_ZOOM_SMOOTHING_RATE};
+use megu_client::friend_client::{FriendGuestBridge, FriendHostSession};
+use megu_client::integrated;
+use megu_client::protocol::encode_slot_stack;
+use megu_client::render::{FrameBudgetGovernor, RenderConfig, ThrottleStage};
+use megu_client::spatial_audio::SpatialAudioPreset;
+use megu_client::zsh_command_bar::ZshCommandBar;
+use megu_client_mesh::builtin_shadow_wgsl::{BuiltinShadowQuality, RenderScalePreset};
+use megu_client_mesh::tactile_effects::{TactileEffectsConfig, TactilePreset};
+use megu_client_mesh::ChunkUploadBudget;
+use megu_kernel::debug_chords::{
     finish_gamemode_switcher, handle_f3_chord, DebugChordAction, DebugChordContext,
     DebugChordState, DebugTarget, F3Chord, PlayerDebugInfo,
 };
-use mc_spine_ui::container_screen::{
+use megu_ui::container_screen::{
     menu_schema, ContainerScreenState, DragState, InventorySortState, MenuScreenSchema, SlotDef,
     SlotKind, UiItemStack,
 };
-use mc_spine_ui::draw::tessellate_draw_list;
-use mc_spine_ui::draw::{UiColor, UiRect};
-use mc_spine_ui::hud_widgets::ScoreboardEntry;
-use mc_spine_ui::recipe_browser::{
+use megu_ui::draw::tessellate_draw_list;
+use megu_ui::draw::{UiColor, UiRect};
+use megu_ui::hud_widgets::ScoreboardEntry;
+use megu_ui::recipe_browser::{
     BrowserTab, DetailMode, ItemEntry, RecipeBrowserAction, RecipeBrowserState,
 };
-use mc_spine_ui::magic_hud::build_magic_hud_draw_list;
-use mc_spine_ui::magic_hud::LookingAtBlockState;
-use mc_spine_ui::state::{invite_code_display, ScoreboardState, TitleOverlayState};
-use mc_spine_ui::state::{
+use megu_ui::magic_hud::build_magic_hud_draw_list;
+use megu_ui::magic_hud::LookingAtBlockState;
+use megu_ui::state::{invite_code_display, ScoreboardState, TitleOverlayState};
+use megu_ui::state::{
     Screen, SettingsTab, UiAction, UiInputEvent, UiKey, UiSettings, UiState, VideoPreset,
     VisualStylePreset,
 };
@@ -54,7 +54,7 @@ use crate::{
 };
 
 /// Window title.
-pub const WINDOW_TITLE: &str = "mc-spine";
+pub const WINDOW_TITLE: &str = "megu";
 
 /// Event-loop wake interval while the surface is occluded: slow enough for
 /// zero-GPU sleep, fast enough to keep a live session's network pump alive.
@@ -544,7 +544,7 @@ pub struct GpuApp {
     /// Boot-time recipe-browser ingest report (mod JARs + vanilla client
     /// JAR + datapacks); empty when no `--gameDir` was supplied.
     recipe_ingest: crate::recipe_ingest::IngestReport,
-    /// Integrated `mc-spine` server guard while a singleplayer world runs.
+    /// Integrated `megu` server guard while a singleplayer world runs.
     singleplayer_server: Option<integrated::SingleplayerServer>,
     /// Friend-relay host session while an invite code is live.
     friend_host: Option<FriendHostSession>,
@@ -658,7 +658,7 @@ impl GpuApp {
             Screen::Title
         };
         if ui.screen == Screen::InGameHud {
-            ui.hud = mc_spine_ui::state::HudState::demo();
+            ui.hud = megu_ui::state::HudState::demo();
         }
         let mut app = Self {
             config,
@@ -1122,7 +1122,7 @@ impl GpuApp {
         // the synchronous `pump()` path by design.
         self.live = Some(live);
         self.ui.screen = Screen::InGameHud;
-        self.ui.hud = mc_spine_ui::state::HudState::default();
+        self.ui.hud = megu_ui::state::HudState::default();
         self.paused = false;
         self.maybe_regrab();
     }
@@ -1134,7 +1134,7 @@ impl GpuApp {
         config: &GpuCliConfig,
         world: &str,
     ) -> Result<integrated::SingleplayerServer, String> {
-        let mut cli = mc_spine_client::cli::CliConfig::default();
+        let mut cli = megu_client::cli::CliConfig::default();
         cli.quick_play_singleplayer = Some(world.to_owned());
         cli.server_bin = config.server_bin.clone();
         cli.game_dir = config.game_dir.clone();
@@ -1177,7 +1177,7 @@ impl GpuApp {
             .clone()
             .ok_or_else(|| "friend invites need --relay host:port".to_owned())?;
         let display = invite_code_display(code_value);
-        let code = mc_spine_proto::InviteCode::parse(&display)
+        let code = megu_proto::InviteCode::parse(&display)
             .map_err(|e| format!("invite code {display}: {e}"))?;
         let bridge =
             FriendGuestBridge::start(&relay, &code, &self.config.username, FRIEND_TIMEOUT)?;
@@ -1308,7 +1308,7 @@ impl GpuApp {
         live: Option<&LiveSession>,
         w: i32,
         h: i32,
-        out: &mut mc_spine_ui::draw::UiDrawList,
+        out: &mut megu_ui::draw::UiDrawList,
     ) {
         let panel_w = w.saturating_sub(80).clamp(200, 520);
         let rows = live.map_or(0, |live| live.advancements.len()) as i32;
@@ -1459,7 +1459,7 @@ impl GpuApp {
         // Phase 1: resolve the schema + snapshot the shared state under an
         // immutable borrow of `self.live`.
         struct Snapshot {
-            schema: &'static mc_spine_ui::container_screen::MenuScreenSchema,
+            schema: &'static megu_ui::container_screen::MenuScreenSchema,
             window_id: u8,
             state_id: i32,
         }
@@ -1564,7 +1564,7 @@ impl GpuApp {
     /// `container_button_click` serverbound packet on the worker.
     fn forward_click_action(
         live: &mut LiveSession,
-        action: mc_spine_ui::container_screen::ClickWindowAction,
+        action: megu_ui::container_screen::ClickWindowAction,
     ) {
         let changed: Vec<(i16, Vec<u8>)> = action
             .changed_slots
@@ -1858,7 +1858,7 @@ impl GpuApp {
                     .get(objective)
                     .and_then(|(nbt, _, _)| nbt.as_ref())
                     .and_then(|bytes| {
-                        mc_spine_client::protocol::WireReader::new(bytes)
+                        megu_client::protocol::WireReader::new(bytes)
                             .read_nbt()
                             .ok()
                             .map(|value| value.extract_text())
@@ -2543,9 +2543,9 @@ fn surface_config_for(
     }
 }
 
-/// The 40-bit value inside an [`mc_spine_proto::InviteCode`], matching
+/// The 40-bit value inside an [`megu_proto::InviteCode`], matching
 /// `InviteCode`'s private `value()` — `as_bytes` is the code big-endian.
-fn invite_code_value(code: &mc_spine_proto::InviteCode) -> u64 {
+fn invite_code_value(code: &megu_proto::InviteCode) -> u64 {
     let b = code.as_bytes();
     u64::from_be_bytes([0, 0, 0, b[0], b[1], b[2], b[3], b[4]])
 }
@@ -2800,7 +2800,7 @@ impl ApplicationHandler for GpuApp {
 
 pub const MEGU_WEBSITE_URL: &str = "https://megu.megumin.tech/";
 pub const MEGU_SUPPORT_URL: &str = "https://megu.megumin.tech/#support";
-pub const MEGU_CONTRIBUTE_URL: &str = "https://github.com/nekomario28/mc-spine";
+pub const MEGU_CONTRIBUTE_URL: &str = "https://github.com/nekomario28/megu-mc";
 pub const MEGU_REPORT_URL: &str = "https://megu.megumin.tech/";
 
 /// Populate the official Megu links on a windowed [`UiState`] without
@@ -2844,7 +2844,7 @@ mod tests {
         assert_eq!(app.ui.support_url, "https://megu.megumin.tech/#support");
         assert_eq!(
             app.ui.contribute_url,
-            "https://github.com/nekomario28/mc-spine"
+            "https://github.com/nekomario28/megu-mc"
         );
         assert_eq!(app.ui.report_url, "https://megu.megumin.tech/");
         assert_eq!(app.ui.screen, Screen::Title);
@@ -2854,19 +2854,19 @@ mod tests {
         let _ = app.ui.render(1280, 720);
         for (id, expected) in [
             (
-                mc_spine_ui::state::WidgetId::WebsiteLink,
+                megu_ui::state::WidgetId::WebsiteLink,
                 "https://megu.megumin.tech/",
             ),
             (
-                mc_spine_ui::state::WidgetId::SupportLink,
+                megu_ui::state::WidgetId::SupportLink,
                 "https://megu.megumin.tech/#support",
             ),
             (
-                mc_spine_ui::state::WidgetId::ContributeLink,
-                "https://github.com/nekomario28/mc-spine",
+                megu_ui::state::WidgetId::ContributeLink,
+                "https://github.com/nekomario28/megu-mc",
             ),
             (
-                mc_spine_ui::state::WidgetId::ReportLink,
+                megu_ui::state::WidgetId::ReportLink,
                 "https://megu.megumin.tech/",
             ),
         ] {
@@ -2877,7 +2877,7 @@ mod tests {
                 .find(|h| h.id == id)
                 .cloned()
                 .expect("expected link hit region on Title when show_support_links=true");
-            let acts = app.ui.handle_input(mc_spine_ui::state::UiInputEvent::Click {
+            let acts = app.ui.handle_input(megu_ui::state::UiInputEvent::Click {
                 x: hit.rect.x + 2,
                 y: hit.rect.y + 2,
             });
@@ -2891,21 +2891,21 @@ mod tests {
             !app.ui
                 .hit_regions
                 .iter()
-                .any(|h| h.id == mc_spine_ui::state::WidgetId::SupportLink),
+                .any(|h| h.id == megu_ui::state::WidgetId::SupportLink),
             "SupportLink must hide when show_support_links=false"
         );
         assert!(
             !app.ui
                 .hit_regions
                 .iter()
-                .any(|h| h.id == mc_spine_ui::state::WidgetId::ContributeLink),
+                .any(|h| h.id == megu_ui::state::WidgetId::ContributeLink),
             "ContributeLink must hide when show_support_links=false"
         );
         assert!(
             app.ui
                 .hit_regions
                 .iter()
-                .any(|h| h.id == mc_spine_ui::state::WidgetId::ReportLink),
+                .any(|h| h.id == megu_ui::state::WidgetId::ReportLink),
             "ReportLink stays accessible even when show_support_links=false"
         );
     }

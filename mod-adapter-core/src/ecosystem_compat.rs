@@ -127,12 +127,12 @@ fn parse_bool_value(raw: &str, key: &str) -> Result<bool, FairPlayConfigError> {
     }
 }
 
-/// Normalize a config key: lowercase, `-` folded to `_`, `xaero.`/`mc-spine.`
-/// style prefixes flattened so `mc_spine.fair-play`, `fair-play`, and
+/// Normalize a config key: lowercase, `-` folded to `_`, `xaero.`/`megu.`
+/// style prefixes flattened so `megu.fair-play`, `fair-play`, and
 /// `fair_play` all land on the same field.
 fn normalize_fair_play_key(key: &str) -> String {
     let mut k = key.trim().to_ascii_lowercase().replace(['-', '.'], "_");
-    for prefix in ["mc_spine_", "mcspine_", "xaero_", "map_", "minimap_"] {
+    for prefix in ["megu_", "megu_", "xaero_", "map_", "minimap_"] {
         if let Some(rest) = k.strip_prefix(prefix) {
             k = rest.to_string();
             break;
@@ -1179,7 +1179,7 @@ fn jar_err(msg: impl Into<String>) -> JarScanError {
 }
 
 /// Mod ids the runtime itself provides: the game, the JVM, and the loader
-/// layers mc-spine natively implements. Never reported as missing.
+/// layers megu natively implements. Never reported as missing.
 pub const RUNTIME_PROVIDED_MOD_IDS: &[&str] = &[
     "minecraft",
     "java",

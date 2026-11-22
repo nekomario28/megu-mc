@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
-"""Terminal-art dashboard and live telemetry wrapper for the mc-spine server CLI.
+"""Terminal-art dashboard and live telemetry wrapper for the megu server CLI.
 
 Three modes:
 
-    python3 tools/megu_tui.py --server-bin ./target/release/mc-spine -- <server-args...>
+    python3 tools/megu_tui.py --server-bin ./target/release/megu -- <server-args...>
         Spawn the server under a live dashboard: banner, TPS/MSPT/RSS
         sparklines, status cards, a scrolling log tail, and a '/' command
         line that forwards operator commands to the server's stdin console.
@@ -102,10 +102,10 @@ LOGO_ASCII = (
     "| |  | || |___ | |_| || |_| |",
     "|_|  |_||_____| \\____| \\___/ ",
 )
-TAGLINE = " mc-spine · server telemetry console"
-TAGLINE_ASCII = " mc-spine - server telemetry console"
-WORDMARK = "═╡ MEGU · mc-spine ╞═"
-WORDMARK_ASCII = "==[ MEGU mc-spine ]=="
+TAGLINE = " megu · server telemetry console"
+TAGLINE_ASCII = " megu - server telemetry console"
+WORDMARK = "═╡ MEGU · megu ╞═"
+WORDMARK_ASCII = "==[ MEGU megu ]=="
 
 
 # ---------------------------------------------------------------- text utils
@@ -241,7 +241,7 @@ def sparkline(values, width, low=None, high=None, ascii_mode=False):
 # ---------------------------------------------------------------- log parser
 
 RE_READY = re.compile(
-    r"mc-spine v([0-9]+(?:\.[0-9]+)*)\s+listening\s+(\S+):(\d+)")
+    r"megu v([0-9]+(?:\.[0-9]+)*)\s+listening\s+(\S+):(\d+)")
 RE_TICK = re.compile(
     r"\[tick\]\s+observed_tps=([0-9.]+)\s+avg_work_ms=([0-9.]+)\s+"
     r"max_work_ms=([0-9.]+)\s+over_budget=(\d+)/(\d+)")
@@ -293,7 +293,7 @@ def ms_per_chunk_from(line):
 
 
 class MetricsParser:
-    """Fold raw mc-spine stdout/stderr lines into a rolling metrics snapshot.
+    """Fold raw megu stdout/stderr lines into a rolling metrics snapshot.
 
     Every line lands in the `log` ring buffer; lines whose shape is known are
     additionally decoded into structured state. feed() returns the matched
@@ -617,7 +617,7 @@ def _info_line(snap, ascii_mode, color):
                   + mods.get("fallback", 0) + mods.get("auto_skipped", 0))
     status = snap.get("status") or "Booting"
     return (
-        paint(f" mc-spine v{version}", "cyan", color)
+        paint(f" megu v{version}", "cyan", color)
         + dot + f"MC {MC_VERSIONS}"
         + dot + address
         + dot + f"mods {mods_total}"
@@ -691,10 +691,10 @@ def _log_color(line, color):
 def _bottom_line(snap, cols, ascii_mode, color, ui):
     dot = " " + _dot(ascii_mode) + " "
     if ui.get("stopping"):
-        text = " stopping mc-spine gracefully" + ("..." if ascii_mode else "…")
+        text = " stopping megu gracefully" + ("..." if ascii_mode else "…")
         return paint(text, "yellow", color)
     if ui.get("exited") is not None:
-        text = f" mc-spine exited{dot}code {ui['exited']}"
+        text = f" megu exited{dot}code {ui['exited']}"
         return paint(text, "grey", color)
     if ui.get("cmd_mode"):
         cursor = "_" if ascii_mode else "█"
@@ -815,7 +815,7 @@ DEMO_LOG = """\
 [live-mods] weirdmod.jar (weirdmod) tier3: 412 classes, 9 site(s) - mixin target missing
 [live-mods] liftcraft.jar (liftcraft) tier2 shim: 208 classes, 4 site(s) - damage hooks lifted
 [tick] observed_tps=19.97 avg_work_ms=8.21 max_work_ms=21.44 over_budget=0/100
-mc-spine v0.6 listening 127.0.0.1:25599 (offline identities; no Mojang authentication)
+megu v0.6 listening 127.0.0.1:25599 (offline identities; no Mojang authentication)
 [lan] advertising "Megu demo server" on port 25599
 [spine] Alice joined from 127.0.0.1:51112 (uuid 0123456789abcdef0123456789abcdef)
 [spine] Bob joined from 127.0.0.1:51130 (uuid fedcba9876543210fedcba9876543210)
@@ -1210,7 +1210,7 @@ def tui_loop(proc, parser, lock, threads, state, term, args, color):
 
 def report_exit(code, parser):
     """After the alt screen is left, leave a short tail for scrollback."""
-    out = [f"megu-tui: mc-spine exited, code {exit_code(code)}"]
+    out = [f"megu-tui: megu exited, code {exit_code(code)}"]
     tail = [line for line in parser.log if line.strip()][-8:]
     if tail:
         out.append("megu-tui: last server log lines:")
@@ -1330,17 +1330,17 @@ def frame_color(args, env):
 def build_parser():
     parser = argparse.ArgumentParser(
         prog="megu_tui",
-        description="mc-spine server terminal dashboard / safe passthrough wrapper",
+        description="megu server terminal dashboard / safe passthrough wrapper",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog=(
             "examples:\n"
-            "  %(prog)s --server-bin ./target/release/mc-spine -- --port 25599\n"
+            "  %(prog)s --server-bin ./target/release/megu -- --port 25599\n"
             "  %(prog)s --demo-frame --cols 100 --rows 28\n"
             "  %(prog)s --render-snapshot server.log\n"
         ),
     )
     parser.add_argument("--server-bin", metavar="PATH",
-                        help="mc-spine binary to launch")
+                        help="megu binary to launch")
     parser.add_argument("--cols", type=int, default=0,
                         help="frame width (default: terminal size or 80)")
     parser.add_argument("--rows", type=int, default=0,

@@ -31,6 +31,8 @@ Checks, all fail-closed:
 Exit status: 0 clean, 1 findings.
 """
 
+import base64
+import hashlib
 import html.parser
 import json
 import re
@@ -245,7 +247,7 @@ def check_site_config_keys():
     for required in (
         "Runs 100% locally in your browser — nothing is uploaded.",
         "ブラウザ内で完結します — ファイルは一切送信されません。",
-        "mc-spine-mod-check --scan-mods-dir",
+        "megu-mod-check --scan-mods-dir",
         "Mixin/.class",
         'id="paste-json"',
         'id="paste-analyze-btn"',
@@ -311,7 +313,7 @@ def check_seo_metadata():
 
     required_meta = {
         ("property", "og:type"): "website",
-        ("property", "og:site_name"): "Megu (mc-spine)",
+        ("property", "og:site_name"): "Megu (megu)",
         ("property", "og:title"): None,
         ("property", "og:description"): None,
         ("property", "og:url"): CANONICAL_URL,
@@ -344,13 +346,13 @@ def check_seo_metadata():
         findings.append("index.html has no parseable SoftwareApplication JSON-LD")
     else:
         expected_fields = {
-            "name": "Megu (mc-spine)",
+            "name": "Megu (megu)",
             "applicationCategory": "GameApplication",
             "operatingSystem": "Linux, Windows, macOS",
             "license": "https://www.gnu.org/licenses/lgpl-3.0.html",
             "isAccessibleForFree": True,
             "url": CANONICAL_URL,
-            "codeRepository": "https://github.com/nekomario28/mc-spine",
+            "codeRepository": "https://github.com/nekomario28/megu-mc",
         }
         for key, expected in expected_fields.items():
             if app.get(key) != expected:
@@ -408,6 +410,25 @@ def check_seo_metadata():
                 el.text for el in root.iter() if el.tag.endswith("lastmod")]
             if not lastmods:
                 findings.append("sitemap.xml entries lack <lastmod>")
+
+    headers_path = WEBSITE / "_headers"
+    if headers_path.is_file():
+        headers_text = headers_path.read_text(encoding="utf-8")
+        for idx, m in enumerate(
+            re.finditer(r"<script(?![^>]*\bsrc=)([^>]*)>(.*?)</script>", markup, re.S),
+            1,
+        ):
+            attrs, body = m.group(1), m.group(2)
+            if "application/ld+json" in attrs:
+                continue
+            digest = base64.b64encode(
+                hashlib.sha256(body.encode("utf-8")).digest()
+            ).decode("ascii")
+            token = f"'sha256-{digest}'"
+            if token not in headers_text:
+                findings.append(
+                    f"website/_headers CSP is missing inline script #{idx} hash {token}"
+                )
     return findings
 
 
@@ -471,16 +492,16 @@ assert.ok(!Object.hasOwn(crashNoFingerprint.report, "fingerprint"));
 assert.ok(m.enforceReportByteLimit("界".repeat(1365)) <= 4096);
 assert.throws(() => m.enforceReportByteLimit("界".repeat(1366)), /4 KiB/);
 const fallback = new URL(m.makeGitHubIssueUrl(
-  "https://github.com/nekomario28/mc-spine", compact));
+  "https://github.com/nekomario28/megu-mc", compact));
 assert.strictEqual(fallback.origin, "https://github.com");
-assert.strictEqual(fallback.pathname, "/nekomario28/mc-spine/issues/new");
+assert.strictEqual(fallback.pathname, "/nekomario28/megu-mc/issues/new");
 assert.ok(fallback.searchParams.get("title").startsWith(
   "[Crash] MEGU-E-AB12CD34"));
 assert.ok(fallback.searchParams.get("body").includes(compact.json));
 assert.ok(!fallback.searchParams.get("body").includes("alice"));
 const search = new URL(m.makeFingerprintSearchUrl(
-  "https://github.com/nekomario28/mc-spine", compact.report.fingerprint));
-assert.strictEqual(search.pathname, "/nekomario28/mc-spine/issues");
+  "https://github.com/nekomario28/megu-mc", compact.report.fingerprint));
+assert.strictEqual(search.pathname, "/nekomario28/megu-mc/issues");
 assert.strictEqual(search.searchParams.get("q"), "MEGU-E-AB12CD34");
 
 // --- Sample Modrinth pack: every classification exercised --------------
@@ -488,7 +509,7 @@ const report = m.analyzeModpackJson(m.SAMPLE_MODRINTH_INDEX_JSON, {
   fileName: "modrinth.index.json",
   target: "1.21.1",
 });
-assert.strictEqual(report.schema, "mc-spine-modpack-preflight/1");
+assert.strictEqual(report.schema, "megu-modpack-preflight/1");
 assert.strictEqual(report.format, "modrinth");
 assert.strictEqual(report.mc_version_declared, "1.21.1");
 assert.strictEqual(report.target, "1.21.1");

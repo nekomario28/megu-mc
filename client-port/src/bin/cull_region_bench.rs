@@ -16,7 +16,7 @@
 use std::hint::black_box;
 use std::time::Instant;
 
-use mc_spine_client_mesh::{
+use megu_client_mesh::{
     mesh_section, section_index, Block, FaceVisibility, GraphCuller, Light, RenderRegions, Section,
     SectionCoord, SectionGraph, EDGE, FACE_CELLS, SECTION_CELLS, THROUGH_ALL,
 };

@@ -4,7 +4,7 @@
 //! fail-closed path safety, and the atomic 1-click rollback — exercised
 //! against real directories on disk.
 
-use mc_spine_state_store::world_snapshot::{
+use megu_state_store::world_snapshot::{
     SnapshotReason, WorldSnapshotError, WorldSnapshotStore,
 };
 use std::collections::BTreeMap;
@@ -19,7 +19,7 @@ struct TestDir(PathBuf);
 impl TestDir {
     fn new(tag: &str) -> Self {
         let dir = std::env::temp_dir().join(format!(
-            "mc-spine-uxbackup1-{}-{}-{tag}",
+            "megu-uxbackup1-{}-{}-{tag}",
             std::process::id(),
             DIR_COUNTER.fetch_add(1, Ordering::Relaxed)
         ));
@@ -160,7 +160,7 @@ fn create_snapshot_manifest_is_deterministic_and_sorted() {
         .join("snapshots")
         .join(format!("{}.json", m.snapshot_id));
     let text = std::fs::read_to_string(on_disk).unwrap();
-    assert!(text.contains("mcspine-world-snapshot-v1"));
+    assert!(text.contains("megu-world-snapshot-v1"));
     assert!(text.contains(&m.snapshot_id));
     // Round-trips through the strict loader byte-identically.
     let loaded = store.load_manifest(&m.snapshot_id).unwrap();
@@ -513,7 +513,7 @@ fn traversal_in_manifest_and_id_is_refused_fail_closed() {
     // before any restore planning can touch it.
     let real = m.files.iter().find(|f| f.rel_path == "level.dat").unwrap();
     let forged = format!(
-        "{{\"file_count\":1,\"files\":[{{\"path\":\"../escape.txt\",\"sha256\":\"{}\",\"size\":{}}}],\"format\":\"mcspine-world-snapshot-v1\",\"mc_version\":\"26.3\",\"reason\":{{\"kind\":\"manual\"}},\"snapshot_id\":\"forged\",\"timestamp_secs\":1,\"total_bytes\":{}}}",
+        "{{\"file_count\":1,\"files\":[{{\"path\":\"../escape.txt\",\"sha256\":\"{}\",\"size\":{}}}],\"format\":\"megu-world-snapshot-v1\",\"mc_version\":\"26.3\",\"reason\":{{\"kind\":\"manual\"}},\"snapshot_id\":\"forged\",\"timestamp_secs\":1,\"total_bytes\":{}}}",
         real.sha256, real.size, real.size
     );
     std::fs::write(backup.join("snapshots/forged.json"), forged).unwrap();

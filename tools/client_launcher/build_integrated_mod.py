@@ -15,9 +15,9 @@ import zipfile
 
 
 HERE = Path(__file__).resolve().parent
-JAVA_PACKAGE = HERE / "net/mcspine/integrated"
+JAVA_PACKAGE = HERE / "net/megu/integrated"
 ZIP_TIME = (1980, 1, 1, 0, 0, 0)
-MOD_ID = "mc_spine_integrated"
+MOD_ID = "megu_integrated"
 
 COMPILE_STUBS = {
     "net/fabricmc/api/ClientModInitializer.java": """package net.fabricmc.api;
@@ -55,10 +55,10 @@ def manifests():
         "schemaVersion": 1,
         "id": MOD_ID,
         "version": "0.1.0",
-        "name": "mc-spine Integrated Bridge",
+        "name": "megu Integrated Bridge",
         "description": "Loopback native server lifecycle coordinator for Minecraft 1.21.1",
         "environment": "client",
-        "entrypoints": {"client": ["net.mcspine.integrated.FabricIntegratedMod"]},
+        "entrypoints": {"client": ["net.megu.integrated.FabricIntegratedMod"]},
         "depends": {"fabricloader": ">=0.16.0", "minecraft": "1.21.1", "java": ">=21"},
         "license": "LGPL-3.0-or-later",
     }
@@ -67,18 +67,18 @@ loaderVersion="[1,)"
 license="LGPL-3.0-or-later"
 
 [[mods]]
-modId="mc_spine_integrated"
+modId="megu_integrated"
 version="0.1.0"
-displayName="mc-spine Integrated Bridge"
-description="Local mc-spine process lifecycle bridge for Minecraft 1.21.1"
+displayName="megu Integrated Bridge"
+description="Local megu process lifecycle bridge for Minecraft 1.21.1"
 
-[[dependencies.mc_spine_integrated]]
+[[dependencies.megu_integrated]]
 modId="minecraft"
 type="required"
 versionRange="[1.21.1,1.21.2)"
 side="CLIENT"
 
-[[dependencies.mc_spine_integrated]]
+[[dependencies.megu_integrated]]
 modId="neoforge"
 type="required"
 versionRange="[21.1,)"
@@ -86,7 +86,7 @@ side="CLIENT"
 """
     return {
         "META-INF/MANIFEST.MF": b"Manifest-Version: 1.0\r\nImplementation-Version: 0.1.0\r\n"
-        b"Main-Class: net.mcspine.integrated.IntegratedServerBridge\r\n\r\n",
+        b"Main-Class: net.megu.integrated.IntegratedServerBridge\r\n\r\n",
         "fabric.mod.json": (json.dumps(fabric, indent=2) + "\n").encode(),
         "META-INF/neoforge.mods.toml": neoforge.encode(),
     }
@@ -95,7 +95,7 @@ side="CLIENT"
 def build_jar(out_dir):
     out_dir = Path(out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
-    with tempfile.TemporaryDirectory(prefix="mc-spine-integrated-javac-") as scratch:
+    with tempfile.TemporaryDirectory(prefix="megu-integrated-javac-") as scratch:
         scratch = Path(scratch)
         stubs = scratch / "stub_sources"
         classes = scratch / "stub_classes"
@@ -131,7 +131,7 @@ def build_jar(out_dir):
             raise RuntimeError("compile-only loader stubs leaked into the integrated jar")
         entries = manifests()
         entries.update({name: (output / name).read_bytes() for name in compiled})
-        jar = out_dir / "mc-spine-integrated.jar"
+        jar = out_dir / "megu-integrated.jar"
         with zipfile.ZipFile(jar, "w") as archive:
             for name, data in sorted(entries.items()):
                 entry = zipfile.ZipInfo(name, ZIP_TIME)

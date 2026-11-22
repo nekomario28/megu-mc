@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: LGPL-3.0-or-later OR GPL-3.0-or-later OR AGPL-3.0-or-later
 
-//! C ABI v1. See `include/mc_spine_client_mesh.h` for the caller contract.
+//! C ABI v1. See `include/megu_client_mesh.h` for the caller contract.
 
 use std::mem::MaybeUninit;
 use std::ptr;
@@ -38,7 +38,7 @@ pub struct MeshInput {
 }
 
 #[no_mangle]
-pub extern "C" fn mc_spine_mesh_abi_version() -> u32 {
+pub extern "C" fn megu_mesh_abi_version() -> u32 {
     ABI_VERSION
 }
 
@@ -53,7 +53,7 @@ pub extern "C" fn mc_spine_mesh_abi_version() -> u32 {
 /// count pointers must be aligned and writable for their declared lengths and
 /// must not overlap each other or the input. Inputs may alias other inputs.
 #[no_mangle]
-pub unsafe extern "C" fn mc_spine_mesh_section(
+pub unsafe extern "C" fn megu_mesh_section(
     input: *const MeshInput,
     output: *mut Quad,
     capacity: usize,
@@ -152,7 +152,7 @@ static AIR_BLOCKS: [Block; SECTION_CELLS] = [Block::AIR; SECTION_CELLS];
 /// The input and its buffers must be initialized and readable. Output and count
 /// must be writable and disjoint from each other and all input buffers.
 #[no_mangle]
-pub unsafe extern "C" fn mc_spine_client_mesh_column(
+pub unsafe extern "C" fn megu_client_mesh_column(
     input: *const MeshColumnInput,
     output: *mut Quad,
     capacity: usize,
@@ -280,7 +280,7 @@ unsafe fn validate_quad_enums(quad: *const Quad) -> bool {
 /// Input fields must be initialized and readable. Output and count must be
 /// writable and disjoint from the input and each other.
 #[no_mangle]
-pub unsafe extern "C" fn mc_spine_client_mesh_pack_vertices(
+pub unsafe extern "C" fn megu_client_mesh_pack_vertices(
     quads: *const Quad,
     quad_count: usize,
     output: *mut PackedVertex,
@@ -337,7 +337,7 @@ pub unsafe extern "C" fn mc_spine_client_mesh_pack_vertices(
 /// Input fields must be initialized and readable. Output and count must be
 /// writable and disjoint from the input and each other.
 #[no_mangle]
-pub unsafe extern "C" fn mc_spine_client_mesh_sort_translucent(
+pub unsafe extern "C" fn megu_client_mesh_sort_translucent(
     quads: *const Quad,
     quad_count: usize,
     camera_x: f32,
@@ -423,7 +423,7 @@ pub unsafe extern "C" fn mc_spine_client_mesh_sort_translucent(
 /// fields must be initialized and readable. Output, buckets and count must be
 /// writable and disjoint from the input and each other; buckets may be null.
 #[no_mangle]
-pub unsafe extern "C" fn mc_spine_client_mesh_bucket_directions(
+pub unsafe extern "C" fn megu_client_mesh_bucket_directions(
     quads: *const Quad,
     quad_count: usize,
     output: *mut Quad,
@@ -481,11 +481,11 @@ pub unsafe extern "C" fn mc_spine_client_mesh_bucket_directions(
 }
 
 /// One summarized LOD cell as seen by C callers: 12 bytes, matching
-/// `mc_spine_lod_cell` in the header. Differs from the internal `LodCell`,
+/// `megu_lod_cell` in the header. Differs from the internal `LodCell`,
 /// which reserves five trailing bytes per cell.
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub struct McSpineLodCell {
+pub struct MeguLodCell {
     /// Global palette state id at `top_y` (0 when the footprint is empty).
     pub state_id: u32,
     /// Block tint for `TINTED` tops, fluid tint for `FLUID_TINTED` tops, else 0.
@@ -506,15 +506,15 @@ pub struct McSpineLodCell {
 ///
 /// # Safety
 ///
-/// Same contract as `mc_spine_client_mesh_column`: non-null buffers must be
+/// Same contract as `megu_client_mesh_column`: non-null buffers must be
 /// aligned and valid for the lengths in the header, initialized and readable.
 /// Output and count must be writable and disjoint from each other and all
 /// input buffers.
 #[no_mangle]
-pub unsafe extern "C" fn mc_spine_client_mesh_summarize_column(
+pub unsafe extern "C" fn megu_client_mesh_summarize_column(
     input: *const MeshColumnInput,
     resolution: u32,
-    output: *mut McSpineLodCell,
+    output: *mut MeguLodCell,
     capacity: usize,
     count: *mut usize,
 ) -> i32 {
@@ -597,7 +597,7 @@ pub unsafe extern "C" fn mc_spine_client_mesh_summarize_column(
     for (i, cell) in cells[..required].iter().enumerate() {
         // SAFETY: output has room for required cells and is disjoint.
         unsafe {
-            output.add(i).write(McSpineLodCell {
+            output.add(i).write(MeguLodCell {
                 state_id: cell.state_id,
                 tint: cell.tint,
                 top_y: cell.top_y,

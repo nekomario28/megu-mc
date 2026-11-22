@@ -1,10 +1,10 @@
 // SPDX-License-Identifier: LGPL-3.0-or-later OR GPL-3.0-or-later OR AGPL-3.0-or-later
-//! Unit tests for `mc_spine_core::server_perf_governors`.
+//! Unit tests for `megu_core::server_perf_governors`.
 
 use std::cell::Cell;
 use std::sync::Arc;
 
-use mc_spine_core::server_perf_governors::{
+use megu_core::server_perf_governors::{
     ChunkPacketCacheKey, CompressedChunkPacketCache, CrowdTickGuard, EntityTickClass, TickDecision,
     VelocityViewGovernor, DEFAULT_CROWD_THRESHOLD, HIGH_SPEED_THRESHOLD, MAX_VIEW_DISTANCE,
     MIN_VIEW_DISTANCE,

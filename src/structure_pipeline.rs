@@ -3231,7 +3231,7 @@ mod pipeline_tests {
         let d = defs().expect("structure definitions load");
 
         // Offline full-decoration parity for the two non-Overworld dimensions. Until
-        // now `MC_SPINE_WG_PRESET=nether|end` refused to run the feature layer at all
+        // now `MEGU_WG_PRESET=nether|end` refused to run the feature layer at all
         // (`main.rs`) and `tools/port_triage.py` refused `--mode full`, so no test could
         // reach this path. Seed 4242 was scanned for one start of each structure; the
         // chunk is the piece-densest chunk of that start.

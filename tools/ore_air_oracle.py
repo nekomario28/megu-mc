@@ -17,7 +17,7 @@ def main():
     with pinned_runtime(args.jar) as (work, classpath, _):
         output = work / "ore-air.tsv"
         run_probe(work, classpath, ROOT / "tools/ore-air-oracle/OreAirOracle.java",
-                  "dev.mcspine.tools.OreAirOracle", output)
+                  "dev.megu.tools.OreAirOracle", output)
         actual = output.read_bytes()
     if args.write:
         VECTORS.write_bytes(actual)

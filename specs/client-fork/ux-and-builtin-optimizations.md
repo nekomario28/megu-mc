@@ -15,7 +15,7 @@ Implementation: [mod-adapter-core/src/fallback.rs](../../mod-adapter-core/src/fa
 
 ## 1. Built-in optimization superseding
 
-`mc-spine` natively implements the whole optimization stack that popular
+`megu` natively implements the whole optimization stack that popular
 performance mods provide. When `mods/` contains them, loading their JARs
 buys nothing and their heavy Mixins previously forced Tier 3
 `DelegateToNeoForge` — dragging *every* mod in the pack onto the JVM.
@@ -36,14 +36,14 @@ classified `ExecutionTier::BuiltInSuperseded`:
   ```
 
   (Rust side: `StartupPlan::superseded_notice()` prints
-  `Skipped 3 redundant performance mods (already built into mc-spine): lithium, modernfix, sodium`.)
+  `Skipped 3 redundant performance mods (already built into megu): lithium, modernfix, sodium`.)
 
 Real content mods in the same pack (`create`, `aether`, `ae2`, …) are
 unaffected and keep 100% pure native Rust execution.
 
 ### Coverage matrix
 
-| Superseded mod ids | What they did | mc-spine built-in |
+| Superseded mod ids | What they did | megu built-in |
 | --- | --- | --- |
 | `sodium`, `embeddium`, `rubidium`, `xenon`, `magnesium` | Chunk mesh pipeline, compact vertex formats, graph culling | `client-port` greedy mesher + S1/S2 `GraphCuller` + packed 16-byte `PackedVertex` |
 | `immediatelyfast` | HUD/text batching | Batched HUD submission (`BuiltInOptimizations::fast_hud_batching`) |
@@ -101,7 +101,7 @@ Rules:
 
 ## 3. Clean-room & licensing policy
 
-1. **All built-in optimizations in `mc-spine`, `client-port`, `client-kernel`,
+1. **All built-in optimizations in `megu`, `client-port`, `client-kernel`,
    and `client-app` are 100% clean-room original Rust implementations.**
    Zero code, shaders, assets, or logic is ported, translated, or copied
    from any third-party optimization mod.
@@ -117,7 +117,7 @@ Rules:
    Studying their implementations to replicate behavior is prohibited;
    behavior parity is established from observable semantics and Vanilla
    contracts only.
-4. Because everything superseded is clean-room, `mc-spine`'s own
+4. Because everything superseded is clean-room, `megu`'s own
    `GPL-3.0-or-later` / `LGPL-3.0-or-later` / `AGPL-3.0-or-later` crate
    licenses remain 100% unencumbered regardless of how the skipped mods
    are licensed.
@@ -143,6 +143,6 @@ here is consumed):
 | Krypton, LazyDFU, MemoryLeakFix, Alternate Current, Clumps, MoreCulling, Noisium, Voxy, Bobby, Farsight, Saturn, SmoothBoot, Fastload, DashLoader, ServerCore | MIT/LGPL/ARR-mixed per upstream | All treated identically: id-match → skip; never read, copy, or port |
 
 Rule of thumb for reviews: a diff that adds a mod id to
-`BUILTIN_SUPERSEDED_PERF_MODS` must come with evidence that `mc-spine`
+`BUILTIN_SUPERSEDED_PERF_MODS` must come with evidence that `megu`
 already implements the function natively (code + tests), not code taken
 from that mod.

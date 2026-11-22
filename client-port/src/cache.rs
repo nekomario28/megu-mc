@@ -775,7 +775,7 @@ impl MeshCache {
     /// empty list. Once the camera crosses it, every clean mesh has its
     /// translucent quads (the `is_translucent` set: translucent blocks and
     /// water) reordered back-to-front with the same depth key and tie-break
-    /// as `mc_spine_client_mesh_sort_translucent`, and `camera` is recorded
+    /// as `megu_client_mesh_sort_translucent`, and `camera` is recorded
     /// as the new sort origin. Dirty sections are skipped: their rebuild
     /// replaces the order anyway. Returns the coordinates whose translucent
     /// quad order actually changed.

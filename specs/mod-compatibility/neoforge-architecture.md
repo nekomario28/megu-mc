@@ -1,4 +1,4 @@
-# mc-spine NeoForge 1.21.1 互換層 アーキテクチャ設計（S0〜S3+）
+# megu NeoForge 1.21.1 互換層 アーキテクチャ設計（S0〜S3+）
 
 - **対象版**: Minecraft Java 1.21.1（protocol 767）/ Java 21 / NeoForge `21.1.172`・FML `4.0.39`・EventBus `8.0.2`・ASM `9.10.1`
 - **上位契約**: [mod-compatibility README](README.md) / [shim計画（S0〜S5）](shim-plan.md) / [Slice 03 NeoForge](slices/03-neoforge.md)
@@ -10,14 +10,14 @@
 
 | 要素 | 現状（`perf/worldgen-parallel`） | 課題（一般 NeoForge Mod へのギャップ） |
 |---|---|---|
-| Mod 検出 | [`Bootstrap.java`](../../compat/neoforge-events/java/net/mcspine/neoforge/Bootstrap.java) で Seed Protect の SHA-256 をハードコード | `neoforge.mods.toml` の解析・依存関係検証・複数 Mod ロード・`@EventBusSubscriber` が未実装 |
-| イベント配送 | `FarmlandTrampleEvent` 1 種のみ（[`ServerHooks.java`](../../compat/neoforge-events/java/net/mcspine/neoforge/ServerHooks.java)） | 参加・チャット・破壊/設置・コマンド・tick・Mod Bus ライフサイクルが未配線 |
+| Mod 検出 | [`Bootstrap.java`](../../compat/neoforge-events/java/net/megu/neoforge/Bootstrap.java) で Seed Protect の SHA-256 をハードコード | `neoforge.mods.toml` の解析・依存関係検証・複数 Mod ロード・`@EventBusSubscriber` が未実装 |
+| イベント配送 | `FarmlandTrampleEvent` 1 種のみ（[`ServerHooks.java`](../../compat/neoforge-events/java/net/megu/neoforge/ServerHooks.java)） | 参加・チャット・破壊/設置・コマンド・tick・Mod Bus ライフサイクルが未配線 |
 | World ABI | 単発 `Trample` 専用（`DimId` 伝播は完了済み、[`src/java_compat.rs`](../../src/java_compat.rs)） | Entity/BlockState が opaque、1 セル毎の JNI 往復を避ける汎用 `MutationBatch` ABI が未配線 |
 | 静的拒否 | 未実装 | 未対応 `net.minecraft.*` メンバーや `@Redirect` Mixin を起動前に明示拒否できない |
 
 ---
 
-## 2. 設計原則（mc-spine 固有の不変条件）
+## 2. 設計原則（megu 固有の不変条件）
 
 1. **Single Authority in Rust**: ワールド状態・チャンク（`PalettedSection`）・tick・在庫・セーブ・ネットワークは 100% Rust 所有。Java 側は「世代付きハンドル＋ファサード＋変更バッファ」のみを持ち、第二のワールド状態を作らない。
 2. **Fail-Closed Startup (`shimcheck`)**: 起動前に全 Mod JAR を ASM で静的検査し、未対応のクラス/メソッド/フィールド・未対応 `@Mixin` 注入種別・未対応 AccessTransformer・依存バージョン不一致を **TCP リスナ開始前に具体的な理由付きで拒否**する。
@@ -45,7 +45,7 @@ flowchart TD
         FACADE --> MBUF["MutationBuffer (CAS差分バッチ)"]
     end
 
-    subgraph Rust["mc-spine Rust コア (唯一の権威)"]
+    subgraph Rust["megu Rust コア (唯一の権威)"]
         DISPATCH["src/java_compat.rs (CompatCall チャネル)"] <-->|"同期RPC / Direct ByteBuffer"| JVM
         TICK["Tick / Player / Block / Command / Dimension(DimId)"] --> DISPATCH
         MBUF -->|"キャンセル時は破棄 / 許可時のみ一括CAS適用"| WORLD["World / BReg / Inventory / Save (DimId対応)"]

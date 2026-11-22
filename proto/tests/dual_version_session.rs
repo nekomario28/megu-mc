@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: LGPL-3.0-or-later OR GPL-3.0-or-later OR AGPL-3.0-or-later
-//! Loopback proof for [`mc_spine_proto::session::ServerSession`]: a
+//! Loopback proof for [`megu_proto::session::ServerSession`]: a
 //! `1.21.1`/`767` client and a `26.3`/`777` client both complete status
 //! ping/pong and the full Handshake -> Login -> Configuration -> Play flow
 //! against one `VersionRouter::with_v767_and_v777()`, with distinct wire ids
@@ -8,16 +8,16 @@
 
 use std::sync::Arc;
 
-use mc_spine_proto::codec::CodecV767;
-use mc_spine_proto::router::TableDrivenCodec;
-use mc_spine_proto::session::{
+use megu_proto::codec::CodecV767;
+use megu_proto::router::TableDrivenCodec;
+use megu_proto::session::{
     text_component, BroadcastBatch, BroadcastBatchStats, ServerSession, ServerSessionConfig,
     SessionEvent, SessionOutput, SessionPhase, SharedPacketFrame,
 };
-use mc_spine_proto::table::{PacketDir, PacketPhase, ProtocolTable};
-use mc_spine_proto::version::ProtocolVersion;
-use mc_spine_proto::wire::{read_frame, write_frame, ProtoError, WireReader, WireWriter};
-use mc_spine_proto::{
+use megu_proto::table::{PacketDir, PacketPhase, ProtocolTable};
+use megu_proto::version::ProtocolVersion;
+use megu_proto::wire::{read_frame, write_frame, ProtoError, WireReader, WireWriter};
+use megu_proto::{
     C2SPacket, EquipmentSlot, ItemStack, LoginProperty, MenuKind, ProtocolCodec, RegistryDataEntry,
     S2CPacket, TeamOperation, VersionRouter,
 };
@@ -424,7 +424,7 @@ fn v767_and_v777_complete_full_flow_interleaved_on_one_router() {
     }
 
     // -- S2C play packets: same IR, distinct wire ids ---------------------------
-    let block = mc_spine_proto::BlockPos::new(1, 64, -2);
+    let block = megu_proto::BlockPos::new(1, 64, -2);
     let title = text_component("Dual Window");
     let cases: [(S2CPacket, i32, i32, &str); 9] = [
         (S2CPacket::KeepAlive { id: 42 }, 0x26, 0x2d, "keep_alive"),

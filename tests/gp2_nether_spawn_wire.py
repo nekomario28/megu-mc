@@ -31,11 +31,11 @@ def server(binary, root):
     game, rcon = port(), port()
     while rcon == game:
         rcon = port()
-    env = dict(os.environ, MC_SPINE_PORT=str(game), MC_SPINE_BIND_ADDR="127.0.0.1",
-               MC_SPINE_RCON_PORT=str(rcon), MC_SPINE_RCON_BIND_ADDR="127.0.0.1",
-               MC_SPINE_RCON_PASS=SECRET, MC_SPINE_WG="vanilla", MC_SPINE_SEED="0",
-               MC_SPINE_RESOURCE_PACK_URL="", MC_SPINE_TEST_NETHER_SPAWN_EVERY_TICK="1",
-               MC_SPINE_NOFEAT="1", MC_SPINE_NOCARVE="1")
+    env = dict(os.environ, MEGU_PORT=str(game), MEGU_BIND_ADDR="127.0.0.1",
+               MEGU_RCON_PORT=str(rcon), MEGU_RCON_BIND_ADDR="127.0.0.1",
+               MEGU_RCON_PASS=SECRET, MEGU_WG="vanilla", MEGU_SEED="0",
+               MEGU_RESOURCE_PACK_URL="", MEGU_TEST_NETHER_SPAWN_EVERY_TICK="1",
+               MEGU_NOFEAT="1", MEGU_NOCARVE="1")
     with (root / "server.log").open("w+") as log:
         with subprocess.Popen([str(binary)], cwd=root, env=env, stdout=log, stderr=log) as process:
             try:
@@ -162,7 +162,7 @@ def exercise(game, rcon):
 
 
 if __name__ == "__main__":
-    binary = Path(sys.argv[1]).resolve() if len(sys.argv) > 1 else ROOT / "target/debug/mc-spine"
+    binary = Path(sys.argv[1]).resolve() if len(sys.argv) > 1 else ROOT / "target/debug/megu"
     os.environ.setdefault("MC_PROBE_DEADLINE", "30")
     with tempfile.TemporaryDirectory(prefix="spine-gp2-wire-") as directory:
         with server(binary, Path(directory)) as ports:

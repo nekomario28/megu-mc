@@ -8,15 +8,15 @@
 //! Every sprite below is a synthetic 16x16 mask drawn from first
 //! principles; zero Mojang or mod texture bytes are referenced.
 
-use mc_spine_client_mesh::crop_archetype::{self, CropArchetype, CropInput, CropTagFlags};
-use mc_spine_client_mesh::mesher::{
+use megu_client_mesh::crop_archetype::{self, CropArchetype, CropInput, CropTagFlags};
+use megu_client_mesh::mesher::{
     evaluate_block_visual_pipeline, BlockVisualInput, VanillaPlusPipelineConfig,
 };
-use mc_spine_client_mesh::vanilla_plus_3d::{
+use megu_client_mesh::vanilla_plus_3d::{
     build_3d_crop_mesh, build_3d_cross_mesh, mesh_fingerprint, Crop3dSpec, CrossLayout,
     MeshUpgradeDecision, VanillaPlusCategory,
 };
-use mc_spine_client_mesh::vanilla_plus_nature::NatureModRegistry;
+use megu_client_mesh::vanilla_plus_nature::NatureModRegistry;
 
 // ---------------------------------------------------------------------------
 // Synthetic sprites (mirrors crop_archetype_tests fixtures)
@@ -345,7 +345,7 @@ fn explicit_crop_3d_spec_wins_over_auto_input() {
         Some(&wheat_tex),
     );
     let explicit = Crop3dSpec {
-        archetype: mc_spine_client_mesh::vanilla_plus_3d::Crop3dArchetype::VineFruit,
+        archetype: megu_client_mesh::vanilla_plus_3d::Crop3dArchetype::VineFruit,
         stage: 2,
         max_stage: 7,
         seed: 42,

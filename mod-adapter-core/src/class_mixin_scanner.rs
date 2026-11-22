@@ -143,7 +143,7 @@ impl From<DataLoadError> for ClassScanError {
 /// Which mixin classes a JAR scan parses.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct JarScanOptions {
-    /// `true` (the default — mc-spine is a dedicated server): classes a
+    /// `true` (the default — megu is a dedicated server): classes a
     /// config lists only under `client` never apply server-side and are
     /// skipped entirely. `false` scans them too.
     pub server_only: bool,

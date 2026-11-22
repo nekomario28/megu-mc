@@ -6,7 +6,7 @@
 //! archetype. This test loads **six** distinct archetypes together through
 //! one `mods/` directory — a renamed performance mod, a NeoForge culinary
 //! mod, a dimension+portal+progression mod, a liftable Mixin mod, a
-//! standalone native `mc-spine-mod-bundle/1` Megu mod, and an invasive
+//! standalone native `megu-mod-bundle/1` Megu mod, and an invasive
 //! coremod — through [`auto_adapt_mods_dir`] and then folds every emitted
 //! bundle into [`UnifiedModRuntime`], the same composition the live
 //! `mod-suite` boot path performs.
@@ -46,7 +46,7 @@ struct Scratch(PathBuf);
 impl Scratch {
     fn new(tag: &str) -> Self {
         let path = std::env::temp_dir().join(format!(
-            "mc-spine-multi-mod-{}-{}-{tag}",
+            "megu-multi-mod-{}-{}-{tag}",
             std::process::id(),
             NEXT_DIR.fetch_add(1, Ordering::Relaxed)
         ));
@@ -418,12 +418,12 @@ side = "BOTH"
     ])
 }
 
-/// The `mc-spine-mod-bundle/1` document embedded inside archetype 3's JAR:
+/// The `megu-mod-bundle/1` document embedded inside archetype 3's JAR:
 /// one vertical-frame portal into `aether_demo:skyreach` plus a progression
 /// barrier sealing `aether_demo:storm_peaks` until an advancement is held.
 fn aether_bundle_json() -> &'static str {
     r#"{
-  "schema": "mc-spine-mod-bundle/1",
+  "schema": "megu-mod-bundle/1",
   "mod_id": "aether_demo",
   "mc_version_range": "[1.21,)",
   "portals": [
@@ -487,7 +487,7 @@ fn dimension_mod_jar() -> Vec<u8> {
             "data/aether_demo/tags/blocks/ores.json",
             br#"{"replace":false,"values":["aether_demo:zephyr_ore","aether_demo:cloudium_ore"]}"#,
         ),
-        ("mc-spine-bundle.json", aether_bundle_json().as_bytes()),
+        ("megu-bundle.json", aether_bundle_json().as_bytes()),
     ])
 }
 
@@ -595,12 +595,12 @@ fn coremod_jar() -> Vec<u8> {
 }
 
 /// Archetype 5 — a standalone native Megu mod: a plain
-/// `mc-spine-mod-bundle/1` document dropped next to the JARs, declaring
+/// `megu-mod-bundle/1` document dropped next to the JARs, declaring
 /// custom content (tame/heal item ids inside a creature spec), a
 /// progression barrier, a biome region, and custom payload channels.
 fn native_bundle_json() -> &'static str {
     r##"{
-  "schema": "mc-spine-mod-bundle/1",
+  "schema": "megu-mod-bundle/1",
   "mod_id": "custom_creatures",
   "mc_version_range": "[1.21,)",
   "portals": [],
@@ -1005,7 +1005,7 @@ fn six_archetypes_adapt_together_in_one_mods_dir() {
 }
 
 // ---------------------------------------------------------------------------
-// Deterministic mc-spine-mods-dir-adaptation/1 report + bundle outputs
+// Deterministic megu-mods-dir-adaptation/1 report + bundle outputs
 // ---------------------------------------------------------------------------
 
 #[test]
@@ -1022,10 +1022,10 @@ fn mods_dir_report_is_deterministic_and_outputs_parse() {
         "adaptation report must be byte-deterministic"
     );
 
-    // The emitted JSON is a real mc-spine-mods-dir-adaptation/1 document.
+    // The emitted JSON is a real megu-mods-dir-adaptation/1 document.
     let report_json = first.to_json();
     let root = parse_json(report_json.as_bytes()).expect("report JSON parses");
-    assert_eq!(json_text(&root, "schema"), "mc-spine-mods-dir-adaptation/1");
+    assert_eq!(json_text(&root, "schema"), "megu-mods-dir-adaptation/1");
     assert_eq!(json_count(&root, "jars_found"), 5);
     assert_eq!(json_count(&root, "non_jar_entries"), 1);
     assert_eq!(json_text(&root, "verdict"), "requires_fallback");
@@ -1038,7 +1038,7 @@ fn mods_dir_report_is_deterministic_and_outputs_parse() {
     assert_eq!(jars.len(), 5);
     // Every row carries the per-jar schema and a tier string.
     for row in jars {
-        assert_eq!(json_text(row, "schema"), "mc-spine-jar-adaptation/1");
+        assert_eq!(json_text(row, "schema"), "megu-jar-adaptation/1");
         assert!(!json_text(row, "tier").is_empty());
     }
 

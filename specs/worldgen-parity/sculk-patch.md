@@ -22,7 +22,7 @@ world全体やruntimeの一致を意味しない。以下の監査記録の数�
 
 ## 計器とreplayの追加監査（2026-10-29）
 
-`MC_SPINE_POP_ORDER_SCOPE=recorded` は観測した範囲外sourceも順序通り実行する
+`MEGU_POP_ORDER_SCOPE=recorded` は観測した範囲外sourceも順序通り実行する
 診断専用経路。既定のexact範囲制約は維持し、recordedでも必要haloの欠落と重複は拒否する。
 最初のfrozen captureの全145 passesをreplayしても、16件を選択したreplayとdumpは
 byte-identicalで52差分のままだった。省略したsourceが当該52差分の原因という仮説は棄却する。
@@ -89,7 +89,7 @@ portに存在しないnonempty 61 patchesのキーを監査出力に列挙した
 中間修正時の320より増えた。参照値の正しさをセル総数で判断せず、
 入力・順序・範囲を揃えた比較と `--require-match` の合格を引き続き要求する。
 全trace・binary・provenanceはrepo外の
-`~/.cache/mc-spine-audit/sculk-spread-20261029/` に保持する。
+`~/.cache/megu-audit/sculk-spread-20261029/` に保持する。
 
 ## a/b 再監査による訂正（同日、追加監査前の記録）
 
@@ -131,7 +131,7 @@ paired native 再現性・active placement 窓の一致は未証明。`regrow` �
 新 port 実行で **503回**、`one-charge-sculk=1947 / one-charge-vein=3431`。
 比の改善を原因証明には使わない。
 
-成果物は `~/.cache/mc-spine-audit/sculk-traces/ab-20261029T153108/`:
+成果物は `~/.cache/megu-audit/sculk-traces/ab-20261029T153108/`:
 `provenance.txt`（開始・終了時刻、HEAD、binary SHA256）、`source.patch`、
 `port.bin`、`port.log`、`gate.txt`。新 binary SHA256 は
 `994879ac5a64a5d4738e2a8f6556886185050cefbd7b08376ccbcaca9ab80bad`。
@@ -267,8 +267,8 @@ feature 単体の oracle は使えない（下の「測った障害」）。**�
 # 1. 参照: 固定 1.21.1 の実サーバーで deep dark の 2x2 チャンクを生成
 tools/chunk_world_fixture.sh dd3 -16 112 2 features      # seed 0、約3分
 # 2. port の dump（1 秒）
-MC_SPINE_WG_PROFILE=0 MC_SPINE_WG_DUMP=/var/tmp/dd3.bin MC_SPINE_WG_DUMP_N=2 \
-  MC_SPINE_WG_DUMP_X=-16 MC_SPINE_WG_DUMP_Z=112 MC_SPINE_SEED=0 ./target/release/mc-spine
+MEGU_WG_PROFILE=0 MEGU_WG_DUMP=/var/tmp/dd3.bin MEGU_WG_DUMP_N=2 \
+  MEGU_WG_DUMP_X=-16 MEGU_WG_DUMP_Z=112 MEGU_SEED=0 ./target/release/megu
 # 3. sculk セルだけを照合
 tools/sculk_gate.py /tmp/chunkfix-dd3/world /var/tmp/dd3.bin 2 -16 112 [--require-match]
 ```
@@ -279,7 +279,7 @@ tools/sculk_gate.py /tmp/chunkfix-dd3/world /var/tmp/dd3.bin 2 -16 112 [--requir
 ### チャンクの選び方（実測）
 
 deep dark は origin 付近には無い。port の気候 router で走査して座標を決めた
-（`MC_SPINE_WG_PROFILE=1 MC_SPINE_BIOME_AT=...`、chunk 中心を y=-63 で):
+（`MEGU_WG_PROFILE=1 MEGU_BIOME_AT=...`、chunk 中心を y=-63 で):
 `container=minecraft:deep_dark` になるのは **chunk (-16,112) と (-15,112) 付近**
 （±512 ブロックの走査で 3468 点中 108 点が deep dark、多くは z≈1536-2048）。
 `container` を見るのは、feature 層の biome フィルタが読むのがそれだから
@@ -755,7 +755,7 @@ native は隣接セルに書いている。→ この経路で**3 型の spreade
 `gen_sculk_patch` の入口。agent の再ビルド手順は `tools/carve-agent/README.md`）。
 これで「どのパッチが」「どこで spreading したか」を突き合わせられる。
 
-seed 0、native は chunk (-16,112) を起点に生成された領域、port は `MC_SPINE_WG_DUMP_N=8`
+seed 0、native は chunk (-16,112) を起点に生成された領域、port は `MEGU_WG_DUMP_N=8`
 で近傍を含む 82 chunk を dump して計測（native capture 1回=3分、port dump は秒）。
 
 **最初に出した数字は coverage artifact だった（自分で訂正、2026-10-28）**。生の合計
@@ -798,7 +798,7 @@ chunk 集合が違う**だけだった。両側が実際に試行した origin �
    上の 20 chunk の不一致は、その未計測領域を初めて見た数字である。
 
    次の一手: chunk の feature 配置列を両側で突き合わせ、**最初にずれる feature** を特定する。
-   port 側は `MC_SPINE_POP_ORDER` / `XTRACE_FEAT` があるが、native 側で「配置を試行した
+   port 側は `MEGU_POP_ORDER` / `XTRACE_FEAT` があるが、native 側で「配置を試行した
    feature と位置」を出すフックがまだ無い → `ebq`（`PlacedFeature`）の配置メソッドに
    `SPLACE <place-x> <place-z> <pos-x> <pos-y> <pos-z>` を足すのが次の計測（パターンは
    `edi` フックと同じ）。
@@ -963,7 +963,7 @@ compare-biomef` で候補の**列**を突き合わせた結果:
 **配置の side ではなく feature の中**（`SculkPatchFeature` / `SculkSpreader`）にある。
 
 次の計測（**パッチごとの draw**）に進む前に踏んだ罠: **port の dump ログは2つの phase からなる**。
-`MC_SPINE_WG_DUMP` は `MC_SPINE_WG_PROFILE` で gate されているので、port はまず profile pass
+`MEGU_WG_DUMP` は `MEGU_WG_PROFILE` で gate されているので、port はまず profile pass
 （arm 無し）を回し、次に dump pass（arm 有り）を回す。実測では chunk (-16,112) の `SPATCH` 行は
 **profile pass** のもので、`DRAW` 行は 1万2千行あと = **dump pass** のものだった。つまり
 そのファイルから「どのパッチが何を引いたか」を読むと **2つの run を混ぜる**。
@@ -974,7 +974,7 @@ compare-biomef` で候補の**列**を突き合わせた結果:
 
 ## 分岐は「feature 自身の draw」に絞られた（2026-10-28、実測）
 
-`tools/sculk_port_run.sh` を足して **port 側も1コマンド・1 run** で取れるようにし（`MC_SPINE_WG_PROFILE=0`
+`tools/sculk_port_run.sh` を足して **port 側も1コマンド・1 run** で取れるようにし（`MEGU_WG_PROFILE=0`
 で warm-up pass を切る = 配置行と arm 済み draw 行が同じ run に入る）、arm を
 `-16,112,1,7`（`sculk_patch_deep_dark`）にして両側を突き合わせた:
 
@@ -1052,7 +1052,7 @@ port 側の `SculkPatchFeature`/`SculkSpreader` が引いていない（また�
 列は一致しない。
 
 **次の1手（順序づけ）**: raw search をやめ、**パスを揃えて**比較する。候補は
-(a) port 側を `MC_SPINE_POP_ORDER` で native と同じパス順に固定する、
+(a) port 側を `MEGU_POP_ORDER` で native と同じパス順に固定する、
 (b) **各スレッドの最初の sculk 窓**を両側から取り出して比べる（thread タグで可能になった）。
 
 ### 差の正体を ratio で押さえた（2026-10-28、thread 単位で集計）
@@ -1568,7 +1568,7 @@ native trace に対して行っており、そちらは再現する範囲で有�
 | `cargo test sculk_cursor` | **これが今の反復ループ**（5 秒）。port がチャンク (-16,112) を in-process 生成し、native スライスと `(round, index)` で比較。ratchet（現在 30 行一致を要求）なので退行は赤、前進したら数字を上げる。CLI も dump も手作業も不要 |
 | `tools/sculk_trace.py extract <run.log> [--rounds N]` / `compare <native> <port>` | `SCURSOR` 行を抽出し、**(round, index) で整列**して比較。共有キーが食い違えば exit 1（gate として使える） |
 | `tests/data/sculk_cursor_1211.tsv` | chunk (-16,112) の population が最初に走らせたパッチ（origin `-261,-42,1785`）の 60 行（round 0..5）。再生成: `tools/sculk_trace.py extract <run.log> --origin -261,-42,1785 --lines 60`。**capture はどのパッチが先に出るか・`r` の番号が違う**ので、パッチを origin で選び `r` をパッチ内の round に正規化する |
-| `~/.cache/mc-spine-audit/sculk-traces/`（repo 外・再生成可能） | これまでの native/port の完全な trace（`traces-mk*.txt` = agent run の生 log 抽出、`port_after_fixes.txt`）。repo には先頭スライスだけを置き、完全版は再生成コマンドで作る |
+| `~/.cache/megu-audit/sculk-traces/`（repo 外・再生成可能） | これまでの native/port の完全な trace（`traces-mk*.txt` = agent run の生 log 抽出、`port_after_fixes.txt`）。repo には先頭スライスだけを置き、完全版は再生成コマンドで作る |
 
 現在の比較結果（この capture、round 0..5 のスライス）:
 

@@ -13,7 +13,7 @@ use std::cell::Cell;
 use std::collections::BTreeSet;
 use std::f32::consts::PI;
 
-use mc_spine_client::spatial_audio::{
+use megu_client::spatial_audio::{
     precomputed_er_gains, soft_clip, AcousticMaterial, AcousticScene, AcousticSceneCache,
     AcousticTracer, DenseVoxelGrid, EarlyReflectionTap, ListenerPose, MaterialClass, OcclusionInfo,
     OnePoleLp, SharedListenerFdnBus, SoundSource, SpatialAudioEngine, SpatialAudioPreset,

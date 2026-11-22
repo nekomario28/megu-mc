@@ -34,7 +34,7 @@ static NEXT_DIR: AtomicUsize = AtomicUsize::new(0);
 /// a pid + counter is unique enough and keeps the run deterministic).
 fn fixture_dir(tag: &str) -> PathBuf {
     let dir = std::env::temp_dir().join(format!(
-        "mc-spine-mod-sync-{}-{}-{tag}",
+        "megu-mod-sync-{}-{}-{tag}",
         std::process::id(),
         NEXT_DIR.fetch_add(1, Ordering::Relaxed)
     ));
@@ -140,7 +140,7 @@ fn sha256_streaming_matches_one_shot_for_every_chunking() {
 
 #[test]
 fn digest_hex_parse_and_consttime_equality() {
-    let d = sha256(b"mc-spine");
+    let d = sha256(b"megu");
     let hex = digest_hex(&d);
     assert_eq!(hex.len(), 64);
     assert_eq!(parse_sha256_hex(&hex), Some(d));
@@ -201,7 +201,7 @@ fn wire_roundtrip_preserves_every_field_and_is_deterministic() {
     assert_eq!(decoded.entries[1], e2);
     assert_eq!(decoded.entries[2], e3);
     // The channel constant stays the documented payload channel.
-    assert_eq!(MOD_SYNC_CHANNEL, "mc-spine:mod_sync_v1");
+    assert_eq!(MOD_SYNC_CHANNEL, "megu:mod_sync_v1");
 }
 
 #[test]

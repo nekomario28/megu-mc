@@ -19,7 +19,7 @@
 //!   content-addressed and atomic.
 //! * **Hot-reload planning** — [`assess_hot_reload_after_add`] classifies a
 //!   newly dropped/fetched JAR as [`ReloadRequirement::HotReloadable`]
-//!   (datapack/recipe/tag/culinary data, `mc-spine-mod-bundle/1` documents,
+//!   (datapack/recipe/tag/culinary data, `megu-mod-bundle/1` documents,
 //!   or `.class` files where *every* method verifies under the bounded
 //!   [`crate::bytecode_subset_vm`] subset) or
 //!   [`ReloadRequirement::RestartRequired`] (Mixin bytecode, native
@@ -315,7 +315,7 @@ pub const MODRINTH_API_BASE: &str = "https://api.modrinth.com/v2";
 /// Map the plan's [`ModLoaderKind`] preferences onto Modrinth loader names,
 /// deduplicated in first-seen order. `DualFabricNeoForge` contributes both
 /// `fabric` and `neoforge`; `DatapackOnly` contributes nothing. An empty
-/// result defaults to `[Fabric, NeoForge]` — mc-spine's dual-loader world —
+/// result defaults to `[Fabric, NeoForge]` — megu's dual-loader world —
 /// so the query always carries an explicit loader filter.
 fn modrinth_loaders_for(preferred: &[ModLoaderKind]) -> Vec<ModrinthLoader> {
     let mut out: Vec<ModrinthLoader> = Vec::new();
@@ -1154,7 +1154,7 @@ fn build_summary_ja(entries: &[DepRecoveryEntry]) -> String {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum ReloadRequirement {
     /// Safe to hot-apply: datapack/recipe/tag/culinary data,
-    /// `mc-spine-mod-bundle/1` documents, and/or `.class` members where every
+    /// `megu-mod-bundle/1` documents, and/or `.class` members where every
     /// method verifies under the bounded subset VM. `reasons` lists the
     /// positive evidence found.
     HotReloadable { reasons: Vec<String> },
@@ -1183,7 +1183,7 @@ impl ReloadRequirement {
 const MAX_HOT_SCAN_CLASSES: usize = 4096;
 /// Cumulative decompressed `.class` bytes one assessment may read.
 const MAX_HOT_SCAN_BYTES: u64 = 256 * 1024 * 1024;
-/// `.json` members inspected for `mc-spine-mod-bundle/1` schema tags.
+/// `.json` members inspected for `megu-mod-bundle/1` schema tags.
 const MAX_BUNDLE_SCAN_MEMBERS: usize = 128;
 /// Cumulative `.json` bytes inspected for bundle schema tags.
 const MAX_BUNDLE_SCAN_BYTES: u64 = 64 * 1024 * 1024;
@@ -1210,7 +1210,7 @@ fn is_bundle_candidate_name(name: &str) -> bool {
     name.to_ascii_lowercase().contains("bundle")
 }
 
-/// Count `mc-spine-mod-bundle/1` documents among plausible `.json` members.
+/// Count `megu-mod-bundle/1` documents among plausible `.json` members.
 /// Detection is by schema tag only — the runtime fully validates bundle
 /// contents at install time; for hot-reload classification the document is
 /// pure data either way.

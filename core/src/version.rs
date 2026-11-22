@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: LGPL-3.0-or-later OR GPL-3.0-or-later OR AGPL-3.0-or-later
 //! Canonical two-target version registry.
 //!
-//! mc-spine simulates exactly two vanilla releases: `1.21.1` (protocol 767)
+//! megu simulates exactly two vanilla releases: `1.21.1` (protocol 767)
 //! and the latest vanilla `26.3` (protocol 777). Downstream crates key on
 //! [`TargetVersion`] instead of scattering protocol literals, and on
 //! [`VersionMeta`] for the per-version constants (data version, pack formats,
@@ -9,7 +9,7 @@
 
 use std::fmt;
 
-/// One of the two vanilla releases mc-spine targets.
+/// One of the two vanilla releases megu targets.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub enum TargetVersion {
     /// Minecraft Java 1.21.1 — protocol 767.

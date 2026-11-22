@@ -19,7 +19,7 @@ def main():
         output = work / "leaf-distance.tsv"
         queue = work / "leaf-queue.tsv"
         run_probe(work, classpath, ROOT / "tools/leaf-distance-oracle/LeafDistanceOracle.java",
-                  "dev.mcspine.tools.LeafDistanceOracle", output, queue,
+                  "dev.megu.tools.LeafDistanceOracle", output, queue,
                   extra_sources=[ROOT / "tools/vanilla-probe/VanillaBlockTags.java",
                                  ROOT / "tools/leaf-distance-oracle/LeafQueueOracle.java"])
         captures = [(VECTORS, output.read_bytes()), (QUEUE_VECTORS, queue.read_bytes())]

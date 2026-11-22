@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: LGPL-3.0-or-later OR GPL-3.0-or-later OR AGPL-3.0-or-later
-//! `mc_spine_core::romaji_ime` — a clean-room, zero-dependency, opt-in
+//! `megu_core::romaji_ime` — a clean-room, zero-dependency, opt-in
 //! Japanese romaji → kana chat converter in the LunaChat style.
 //!
 //! Everything here is pure `std`, fully deterministic, and never reads a

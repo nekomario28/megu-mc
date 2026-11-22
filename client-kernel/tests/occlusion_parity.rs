@@ -4,12 +4,12 @@ use std::collections::BTreeMap;
 use std::mem::size_of;
 use std::path::Path;
 
-use mc_spine_kernel::occlusion_table::{
+use megu_kernel::occlusion_table::{
     BlockLightState, BlockShapeKind, CoalescedLightQueue, Direction, HorizontalFacing,
     PackedLightProps, PrebakedLightTable, QueuedLightEdit, BLOCKS_SKYLIGHT, DOWN, EAST,
     IS_OPAQUE_FULL_CUBE, UP, WEST,
 };
-use mc_spine_kernel::{Error, Registry};
+use megu_kernel::{Error, Registry};
 
 fn states() -> Vec<BlockLightState> {
     use BlockShapeKind as Shape;

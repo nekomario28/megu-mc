@@ -18,7 +18,7 @@ def main():
         output = work / 'nether-biomes.tsv'
         surface = work / 'nether-surface.tsv'
         run_probe(work, cp, ROOT / 'tools/structure-oracle/NetherBiomeOracle.java',
-                  'dev.mcspine.tools.NetherBiomeOracle', output, surface)
+                  'dev.megu.tools.NetherBiomeOracle', output, surface)
         captures = [(VECTORS, output.read_bytes()), (SURFACE, surface.read_bytes())]
     for path, actual in captures:
         if args.write:

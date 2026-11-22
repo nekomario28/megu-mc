@@ -2,7 +2,7 @@
 //! `ChunkUploadBudget`: per-frame upload admission, P95-driven adaptive
 //! throttling, and burst-smooth spreading of join/teleport upload floods.
 
-use mc_spine_client_mesh::upload_budget::{
+use megu_client_mesh::upload_budget::{
     ChunkUploadBudget, DEFAULT_MAX_UPLOADS_PER_FRAME, DEFAULT_MAX_UPLOAD_BYTES_PER_FRAME,
     DEFAULT_MAX_UPLOAD_WORK_US_PER_FRAME, DEFAULT_MIN_UPLOADS_PER_FRAME, DEFAULT_TARGET_FRAME_US,
 };

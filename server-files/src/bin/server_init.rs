@@ -1,11 +1,11 @@
 // SPDX-License-Identifier: LGPL-3.0-or-later OR GPL-3.0-or-later OR AGPL-3.0-or-later
-//! `mc-spine-init`: bootstrap a Vanilla-compatible server directory, run a
+//! `megu-init`: bootstrap a Vanilla-compatible server directory, run a
 //! pre-flight health check (`doctor`), and administer ops/bans/whitelist
 //! offline while the server is stopped.
 //!
-//! Pure `std` plus `mc-spine-core`: the binary shares the crate's
+//! Pure `std` plus `megu-core`: the binary shares the crate's
 //! zero-dependency contract, so every file it writes goes through the same
-//! atomic persistence [`mc_spine_server_files::ServerDirectory`] uses.
+//! atomic persistence [`megu_server_files::ServerDirectory`] uses.
 //!
 //! Exit codes: `0` success (doctor: directory is ready to boot), `2` a bad
 //! command line or a doctor verdict of "EULA not accepted", `1` a file-level
@@ -14,9 +14,9 @@
 //! `rcon.password` is a secret: neither the text output nor `--json` ever
 //! prints it — reports carry `rcon_password_set` / `[REDACTED]` instead.
 
-use mc_spine_core::version::TargetVersion;
-use mc_spine_server_files::json::Json;
-use mc_spine_server_files::{
+use megu_core::version::TargetVersion;
+use megu_server_files::json::Json;
+use megu_server_files::{
     check_eula, valid_player_name, BannedIps, BannedPlayers, ClaimChunkKey, ClaimOwner,
     ClaimsWorld, ChunkClaim, EulaStatus, MinimapMode, OpsList, Party, PlayerRadarScope,
     ServerDirectory, ServerProperties, SubClaimId, UserCache, Whitelist, BANNED_IPS_FILE,
@@ -27,10 +27,10 @@ use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
 const HELP: &str = "\
-mc-spine-init — bootstrap and administer a Vanilla-compatible server directory
+megu-init — bootstrap and administer a Vanilla-compatible server directory
 
 USAGE:
-    mc-spine-init init --dir <dir> [--mc-version 1.21.1|26.3] [--port <u16>]
+    megu-init init --dir <dir> [--mc-version 1.21.1|26.3] [--port <u16>]
                        [--motd <text>] [--online-mode true|false]
                        [--max-players <u32>]
                        [--minimap-mode unrestricted|fair_play|disabled]
@@ -38,18 +38,18 @@ USAGE:
                        [--allow-cave-map true|false]
                        [--allow-mob-radar true|false]
                        [--allow-waypoint-teleport true|false] [--json]
-    mc-spine-init doctor --dir <dir> [--mc-version 1.21.1|26.3] [--json]
-    mc-spine-init op --dir <dir> <player> [--level 1..4] [--bypass-limit] [--json]
-    mc-spine-init deop --dir <dir> <player> [--json]
-    mc-spine-init ban --dir <dir> <player> [--reason \"<text>\"]
+    megu-init doctor --dir <dir> [--mc-version 1.21.1|26.3] [--json]
+    megu-init op --dir <dir> <player> [--level 1..4] [--bypass-limit] [--json]
+    megu-init deop --dir <dir> <player> [--json]
+    megu-init ban --dir <dir> <player> [--reason \"<text>\"]
                       [--created <stamp>] [--source <name>] [--json]
-    mc-spine-init pardon --dir <dir> <player> [--json]
-    mc-spine-init whitelist --dir <dir> <on|off|add|remove|list> [player] [--json]
-    mc-spine-init claims --dir <dir> list [--dimension <dim>] [--json]
-    mc-spine-init claims --dir <dir> parties [--json]
-    mc-spine-init claims --dir <dir> server-claim <dim> <cx> <cz> [--forceload] [--json]
-    mc-spine-init claims --dir <dir> unclaim <dim> <cx> <cz> [--json]
-    mc-spine-init --help
+    megu-init pardon --dir <dir> <player> [--json]
+    megu-init whitelist --dir <dir> <on|off|add|remove|list> [player] [--json]
+    megu-init claims --dir <dir> list [--dimension <dim>] [--json]
+    megu-init claims --dir <dir> parties [--json]
+    megu-init claims --dir <dir> server-claim <dim> <cx> <cz> [--forceload] [--json]
+    megu-init claims --dir <dir> unclaim <dim> <cx> <cz> [--json]
+    megu-init --help
 
 COMMANDS:
     init        Create the directory when missing, write eula.txt (eula=false —
@@ -77,7 +77,7 @@ COMMANDS:
     ban         Ban a player by name (offline UUID). --reason defaults to
                 \"Banned by an operator.\"; --created defaults to the epoch
                 because this tool keeps no clock; --source defaults to
-                \"mc-spine-init\".
+                \"megu-init\".
     pardon      Lift a player ban.
     whitelist   on/off toggle white-list in server.properties; add/remove edit
                 whitelist.json; list prints its entries.
@@ -116,11 +116,11 @@ EXIT CODES:
 /// clock, so `created` defaults to the epoch and `source` names the tool.
 const DEFAULT_BAN_REASON: &str = "Banned by an operator.";
 const DEFAULT_BAN_CREATED: &str = "1970-01-01T00:00:00Z";
-const DEFAULT_BAN_SOURCE: &str = "mc-spine-init";
+const DEFAULT_BAN_SOURCE: &str = "megu-init";
 
 /// The name this process was invoked as: the executable's basename, so the
-/// `mc-spine-admin` build names itself correctly instead of borrowing the
-/// launcher's `mc-spine-init`. `mc-spine-init` re-execs this binary for its
+/// `megu-admin` build names itself correctly instead of borrowing the
+/// launcher's `megu-init`. `megu-init` re-execs this binary for its
 /// legacy subcommands, which is why usage text must come from argv[0] rather
 /// than a constant.
 fn prog_name() -> String {
@@ -130,15 +130,15 @@ fn prog_name() -> String {
         .and_then(|arg0| Path::new(arg0).file_name())
         .map(|name| name.to_string_lossy().into_owned())
         .filter(|name| !name.is_empty())
-        .unwrap_or_else(|| "mc-spine-init".into())
+        .unwrap_or_else(|| "megu-init".into())
 }
 
 /// `HELP` with the invoked-as name substituted: the title line plus every
-/// `    mc-spine-init ` usage line. The `--source` default mention keeps the
+/// `    megu-init ` usage line. The `--source` default mention keeps the
 /// literal string — it names a stored value, not the program.
 fn help_text(prog: &str) -> String {
-    HELP.replacen("mc-spine-init", prog, 1)
-        .replace("    mc-spine-init ", &format!("    {prog} "))
+    HELP.replacen("megu-init", prog, 1)
+        .replace("    megu-init ", &format!("    {prog} "))
 }
 
 /// The seven files a server directory is made of, in report order.

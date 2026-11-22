@@ -59,7 +59,7 @@ def main():
     with pinned_runtime(args.jar) as (work, cp, _):
         vectors, states = work/'transforms.tsv', work/'states.tsv'
         run_probe(work, cp, ROOT/'tools/structure-oracle/StructureTransformOracle.java',
-                  'dev.mcspine.tools.StructureTransformOracle', vectors, states)
+                  'dev.megu.tools.StructureTransformOracle', vectors, states)
         actual = vectors.read_bytes()
         mapping = encode(states.read_text(), json.loads((ROOT/'assets/blocks_1211.json').read_text()))
     for path, data in [(VECTORS, actual), (STATES, mapping)]:

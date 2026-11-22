@@ -3,13 +3,13 @@
 //! manifest features: the state models in `state.rs`/`magic_hud.rs` and
 //! their draw-list output through the real `UiState::render` HUD path.
 
-use mc_spine_client_ui::draw::{UiCommand, UiDrawList};
-use mc_spine_client_ui::hud_widgets::ScoreboardEntry;
-use mc_spine_client_ui::layout::{
+use megu_client_ui::draw::{UiCommand, UiDrawList};
+use megu_client_ui::hud_widgets::ScoreboardEntry;
+use megu_client_ui::layout::{
     layout_looking_at, layout_scoreboard_sidebar, layout_title_overlay,
 };
-use mc_spine_client_ui::magic_hud::LookingAtBlockState;
-use mc_spine_client_ui::state::{
+use megu_client_ui::magic_hud::LookingAtBlockState;
+use megu_client_ui::state::{
     ScoreboardState, Screen, TitleOverlayState, UiState, SCOREBOARD_SIDEBAR_MAX_ROWS,
 };
 
@@ -286,7 +286,7 @@ fn title_overlay_draws_centered_title_only_while_visible() {
     assert!(title_scale >= 2, "title scale {title_scale}");
     // Centered horizontally around the viewport middle (shadow copies
     // share the same x; pick the max-scale emit).
-    let w = mc_spine_client_ui::draw::text_width("Victory", title_scale) as i32;
+    let w = megu_client_ui::draw::text_width("Victory", title_scale) as i32;
     assert!(
         (title_x - (VIEW.0 as i32 / 2 - w / 2)).abs() <= 4,
         "title x {title_x} w {w}"
@@ -397,7 +397,7 @@ fn all_three_features_compose_through_ui_state_render() {
             }
             UiCommand::Text { x, y, text, .. } => {
                 assert!(*x >= 0 && *y >= 0);
-                assert!(*x + mc_spine_client_ui::draw::text_width(text, 1) as i32 <= VIEW.0 as i32);
+                assert!(*x + megu_client_ui::draw::text_width(text, 1) as i32 <= VIEW.0 as i32);
             }
         }
     }

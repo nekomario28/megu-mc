@@ -3,7 +3,7 @@
 
 Connects the same clean-room protocol-767 client to BOTH:
 
-  * Server A (Megu):  --megu-bin /path/to/mc-spine, booted on an ephemeral
+  * Server A (Megu):  --megu-bin /path/to/megu, booted on an ephemeral
     loopback port inside a disposable directory (offline mode, DiffBot op 4).
   * Server B (Vanilla 1.21.1, optional):  --vanilla-jar /path/to/server.jar,
     booted as `java -Xmx1G -jar <jar> nogui` inside a disposable directory
@@ -960,7 +960,7 @@ def _wait_listener(endpoint, proc, deadline, ready_check=None):
 
 @contextlib.contextmanager
 def megu_server(binary, repo_root, deadline):
-    """Boot mc-spine on a loopback port inside a disposable dir; yields port."""
+    """Boot megu on a loopback port inside a disposable dir; yields port."""
     binary = Path(binary).resolve()
     if not binary.is_file() or not os.access(binary, os.X_OK):
         raise SetupError(f"megu binary not executable: {binary}")
@@ -975,13 +975,13 @@ def megu_server(binary, repo_root, deadline):
         (root / "ops.json").write_text(
             f'[{{"uuid":"{uuid}","name":"{BOT_NAME}","level":4,'
             f'"bypassesPlayerLimit":false}}]', encoding="utf-8")
-        env = dict(os.environ, MC_SPINE_PORT=str(port),
-                   MC_SPINE_BIND_ADDR="127.0.0.1", MC_SPINE_ONLINE_MODE="false",
-                   MC_SPINE_RESOURCE_PACK_URL="", MC_SPINE_ANTICHEAT="off")
-        for key in ("MC_SPINE_RCON_PORT", "MC_SPINE_RCON_PASS",
-                    "MC_SPINE_ENABLE_QUERY"):
+        env = dict(os.environ, MEGU_PORT=str(port),
+                   MEGU_BIND_ADDR="127.0.0.1", MEGU_ONLINE_MODE="false",
+                   MEGU_RESOURCE_PACK_URL="", MEGU_ANTICHEAT="off")
+        for key in ("MEGU_RCON_PORT", "MEGU_RCON_PASS",
+                    "MEGU_ENABLE_QUERY"):
             env.pop(key, None)
-        env.setdefault("MC_SPINE_WG", "old")
+        env.setdefault("MEGU_WG", "old")
         with (root / "server.log").open("w+b") as log:
             proc = subprocess.Popen([str(binary)], cwd=root, env=env,
                                     stdin=subprocess.DEVNULL,
@@ -1826,7 +1826,7 @@ def main(argv=None):
     parser = argparse.ArgumentParser(
         description="Protocol 767 Megu-vs-Vanilla-1.21.1 live differential oracle")
     parser.add_argument("--megu-bin", default=None,
-                        help="path to the mc-spine server binary")
+                        help="path to the megu server binary")
     parser.add_argument("--vanilla-jar", default=None,
                         help="path to a read-only Vanilla 1.21.1 server.jar")
     parser.add_argument("--megu-endpoint", default=None, metavar="HOST:PORT",

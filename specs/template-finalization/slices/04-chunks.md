@@ -98,7 +98,7 @@ bakes into its terrain dump, against a native world where features were stripped
 | … 25 more pairs | | |
 
 So this is **not** a parity result, and it is worth recording precisely because the first
-number looked like one: the two sides are at different stages. The port's `MC_SPINE_WG_DUMP`
+number looked like one: the two sides are at different stages. The port's `MEGU_WG_DUMP`
 is not terrain-only — it includes the blocks a feature pass places — while the native
 world had every feature removed. Either the native capture must keep features, or the port
 needs a stage-limited dump; comparing the current pair would measure the nofeit pack.
@@ -140,7 +140,7 @@ Structures and entities were not compared, and one chunk says nothing about othe
 
 The historical measurement used the tooling now in the tree: `tools/nofeat_pack.py` (stage-limited
 capture), `tools/terrain_chunk_dump.py` (now a canonical-state dump), and the port's own
-`MC_SPINE_WG_DUMP` (requires `MC_SPINE_WG_PROFILE`, else it refuses to run).
+`MEGU_WG_DUMP` (requires `MEGU_WG_PROFILE`, else it refuses to run).
 
 ## The Overworld corpus is now in the tree, at full state level (2026-11-11)
 
@@ -227,7 +227,7 @@ is changed merely to fit that diagnosis.
 1. **18 セルの `snowy` 残差は解消 (`0` 残差):**
    旧 `Gen::apply_snowy` による surface 事後書き換えは、上に `short_grass`/`poppy`/`dandelion` がある `grass_block` を誤って `snowy=true` にしていた（18/18 例すべて両 native run で同じ植物が直上）。これを撤去し、[FreezeTopLayerOracle.java](../../../tools/structure-oracle/FreezeTopLayerOracle.java)（`edn` 29 場面）に一致する `Cf::FreezeTop` + `snow_can_survive`（`MotionBlocking` heightmap、温度・光・`snow_layer_can_survive_on`）へ一本化した結果、`238/238` の `snowy=true` を保ったまま `snowy` 差分は **0** になった（コンパイルする 4 件の mutant を含む）。
 2. **残り `30 diorite→granite` と native A/B 間 `23 andesite→diorite` は population 順で説明済み:**
-   `FEATURE_CELL_TRACE` と `MC_SPINE_POP_ORDER` により、`(3,-1)`・`(2,-3)` と `(3,-2)` の生成順入れ替えだけで A/B ともに ore 差分は **0** になることを確認。
+   `FEATURE_CELL_TRACE` と `MEGU_POP_ORDER` により、`(3,-1)`・`(2,-3)` と `(3,-2)` の生成順入れ替えだけで A/B ともに ore 差分は **0** になることを確認。
 3. **残る `34` 非air セル（全空気種別では `53` セル）は未実装 `minecraft:mineshaft`:**
    `c32['structures']['References']['minecraft:mineshaft']` の開始 chunk `(4,3)` に属する `child 85 mscorridor` / `child 86 msstairs` / `child 185 mscorridor` が交差領域（`51/53` は piece BB 内の `cave_air` 掘削、残り `2` は `child 185` の `y=21` 支持 `oak_planks`）と一致する。
 
@@ -235,10 +235,10 @@ Seed 4242 は `minecraft:mineshaft`（P2-1）と生成順固定が未完了の�
 
 ## Local artifact locations
 
-On the reorganized host, source is `~/mc-spine`; retained captures are under
-`~/mc-spine-local/captures/native/`, TSV exports under `captures/exports/`, and audit
-records under `~/mc-spine-local/audit/historical/save-booking-20261110/`.
+On the reorganized host, source is `~/megu`; retained captures are under
+`~/megu-local/captures/native/`, TSV exports under `captures/exports/`, and audit
+records under `~/megu-local/audit/historical/save-booking-20261110/`.
 Historical temporary paths above record where captures originally ran; their compatibility
-aliases have been retired. The local `~/mc-spine-local/inventory/` maps old paths to new ones.
+aliases have been retired. The local `~/megu-local/inventory/` maps old paths to new ones.
 Native worlds/jars and exploratory dumps remain local; this document does not authorize
 their redistribution or change tracked fixture expectations.

@@ -1,4 +1,4 @@
-<!-- Thanks for contributing to Megu (mc-spine). Keep PRs small and focused. -->
+<!-- Thanks for contributing to Megu (megu). Keep PRs small and focused. -->
 
 ## Checklist
 

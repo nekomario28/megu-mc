@@ -4,7 +4,7 @@
 //! binaural ITD/ILD, underwater muffle, voice-frame plumbing, and subtitle
 //! cues.
 
-use mc_spine_client::spatial_audio::{
+use megu_client::spatial_audio::{
     AcousticMaterial, AcousticTracer, DenseVoxelGrid, FreqBand, ListenerPose, MaterialClass,
     SoundSource, SpatialAudioEngine, SpatialAudioPreset, SubtitleDirection, OUTPUT_LIMIT,
 };

@@ -23,9 +23,9 @@
 //! so Japanese strings render as fallback glyphs in the software
 //! rasterizer — the string data stays correct for richer GPU atlases.
 
-use mc_spine_core::crash_report::CrashContext;
-use mc_spine_core::i18n::{BuiltinLocale, I18nCatalog, UiTextKey, ALL_BUILTIN_LOCALES};
-use mc_spine_core::sys_metrics::{MiniHudConfig, MiniHudData};
+use megu_core::crash_report::CrashContext;
+use megu_core::i18n::{BuiltinLocale, I18nCatalog, UiTextKey, ALL_BUILTIN_LOCALES};
+use megu_core::sys_metrics::{MiniHudConfig, MiniHudData};
 
 use crate::draw::UiRect;
 use crate::layout;
@@ -2140,7 +2140,7 @@ impl UiState {
     /// apply it as the player's language preference. Reports `Auto` in
     /// the legacy field because the choice was automatic.
     pub fn detect_and_apply_os_locale(&mut self) {
-        let detected = mc_spine_core::i18n::detect_os_locale();
+        let detected = megu_core::i18n::detect_os_locale();
         self.set_locale(detected);
         self.settings.language = LanguageSetting::Auto;
     }
@@ -3218,4 +3218,4 @@ fn clamp_i(v: i32, lo: i32, hi: i32) -> u8 {
 }
 
 /// Re-export for tests/embedders: privacy redaction of free-form text.
-pub use mc_spine_core::crash_report::redact_sensitive as ui_redact_sensitive;
+pub use megu_core::crash_report::redact_sensitive as ui_redact_sensitive;

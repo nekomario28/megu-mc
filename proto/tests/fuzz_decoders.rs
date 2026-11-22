@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: LGPL-3.0-or-later OR GPL-3.0-or-later OR AGPL-3.0-or-later
 //! Lane P6b (#222): deterministic adversarial fuzz harness for every
-//! untrusted wire decoder in `mc-spine-proto`.
+//! untrusted wire decoder in `megu-proto`.
 //!
 //! Every input a remote peer can put on the wire — packet frames in all five
 //! phases on both builtin tables (767/1.21.1 and 777/26.3), session-driving
@@ -10,9 +10,9 @@
 //! panics and bounded memory** on every byte string, valid or hostile.
 //!
 //! Determinism: all inputs derive from a fixed-seed `splitmix64` PRNG — no
-//! `SystemTime`, no OS entropy, no external crates. `MC_SPINE_FUZZ_ITERS`
+//! `SystemTime`, no OS entropy, no external crates. `MEGU_FUZZ_ITERS`
 //! scales the per-target iteration count (default `4_000`, so `cargo test`
-//! stays under seconds; operators crank `MC_SPINE_FUZZ_ITERS=100000` for a
+//! stays under seconds; operators crank `MEGU_FUZZ_ITERS=100000` for a
 //! deep soak). A decoder panic is caught, the offending input is hex-dumped
 //! for reproduction, and the panic is re-thrown so the test still fails.
 
@@ -25,13 +25,13 @@ use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
 use std::time::Duration;
 
-use mc_spine_proto::friend_relay::{self, FriendPacket, InviteCode};
-use mc_spine_proto::session::{text_component, ServerSession, ServerSessionConfig};
-use mc_spine_proto::voice_relay::{self, VoicePacket};
-use mc_spine_proto::wire::{
+use megu_proto::friend_relay::{self, FriendPacket, InviteCode};
+use megu_proto::session::{text_component, ServerSession, ServerSessionConfig};
+use megu_proto::voice_relay::{self, VoicePacket};
+use megu_proto::wire::{
     read_frame, read_frame_bounded, write_frame, WireReader, WireWriter, MAX_STRING_CHARS,
 };
-use mc_spine_proto::{
+use megu_proto::{
     BitSet, BlockPos, C2SPacket, CodecV767, EquipmentSlot, ItemStack, LoginProperty, MenuKind,
     PacketPhase, ProtocolCodec, ProtocolTable, ProtocolVersion, RawComponent, RegistryDataEntry,
     S2CPacket, TableDrivenCodec, TeamInfo, TeamOperation, VersionRouter,
@@ -81,9 +81,9 @@ impl Rng {
     }
 }
 
-/// Per-target iteration count: `MC_SPINE_FUZZ_ITERS` overrides, default 4000.
+/// Per-target iteration count: `MEGU_FUZZ_ITERS` overrides, default 4000.
 fn iters() -> usize {
-    std::env::var("MC_SPINE_FUZZ_ITERS")
+    std::env::var("MEGU_FUZZ_ITERS")
         .ok()
         .and_then(|v| v.parse().ok())
         .unwrap_or(4_000)
@@ -618,17 +618,17 @@ fn codec_frame_corpus() -> Vec<Vec<u8>> {
 /// `decode_c2s_in`/`decode_s2c_in` — reachable through one object.
 trait Codec: ProtocolCodec {
     fn set_phase(&mut self, phase: PacketPhase);
-    fn decode_c2s_in(&self, phase: PacketPhase, frame: &[u8]) -> Result<C2SPacket, mc_spine_proto::ProtoError>;
-    fn decode_s2c_in(&self, phase: PacketPhase, frame: &[u8]) -> Result<S2CPacket, mc_spine_proto::ProtoError>;
+    fn decode_c2s_in(&self, phase: PacketPhase, frame: &[u8]) -> Result<C2SPacket, megu_proto::ProtoError>;
+    fn decode_s2c_in(&self, phase: PacketPhase, frame: &[u8]) -> Result<S2CPacket, megu_proto::ProtoError>;
 }
 impl Codec for CodecV767 {
     fn set_phase(&mut self, phase: PacketPhase) {
         CodecV767::set_phase(self, phase);
     }
-    fn decode_c2s_in(&self, phase: PacketPhase, frame: &[u8]) -> Result<C2SPacket, mc_spine_proto::ProtoError> {
+    fn decode_c2s_in(&self, phase: PacketPhase, frame: &[u8]) -> Result<C2SPacket, megu_proto::ProtoError> {
         CodecV767::decode_c2s_in(self, phase, frame)
     }
-    fn decode_s2c_in(&self, phase: PacketPhase, frame: &[u8]) -> Result<S2CPacket, mc_spine_proto::ProtoError> {
+    fn decode_s2c_in(&self, phase: PacketPhase, frame: &[u8]) -> Result<S2CPacket, megu_proto::ProtoError> {
         CodecV767::decode_s2c_in(self, phase, frame)
     }
 }
@@ -636,10 +636,10 @@ impl Codec for TableDrivenCodec {
     fn set_phase(&mut self, phase: PacketPhase) {
         TableDrivenCodec::set_phase(self, phase);
     }
-    fn decode_c2s_in(&self, phase: PacketPhase, frame: &[u8]) -> Result<C2SPacket, mc_spine_proto::ProtoError> {
+    fn decode_c2s_in(&self, phase: PacketPhase, frame: &[u8]) -> Result<C2SPacket, megu_proto::ProtoError> {
         TableDrivenCodec::decode_c2s_in(self, phase, frame)
     }
-    fn decode_s2c_in(&self, phase: PacketPhase, frame: &[u8]) -> Result<S2CPacket, mc_spine_proto::ProtoError> {
+    fn decode_s2c_in(&self, phase: PacketPhase, frame: &[u8]) -> Result<S2CPacket, megu_proto::ProtoError> {
         TableDrivenCodec::decode_s2c_in(self, phase, frame)
     }
 }

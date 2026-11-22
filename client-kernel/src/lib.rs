@@ -43,8 +43,8 @@ pub use light::{
     ChunkLightUpdate, ChunkLightUpdateMultiWord, LightEdit, LightEngine, LightFact, LightKind,
     LightMasksMultiWord, LightUpdate, LightUpdateMultiWord, LIGHT_SECTION_BYTES,
 };
-pub use mc_spine_core::id::ResourceLocation;
-pub use mc_spine_core::version::{TargetVersion, VersionMeta};
+pub use megu_core::id::ResourceLocation;
+pub use megu_core::version::{TargetVersion, VersionMeta};
 pub use occlusion_table::{
     BlockLightState, BlockShapeKind, ChunkLightBatch, CoalescedLightQueue, Direction, FaceMask,
     HorizontalFacing, PackedLightProps, PrebakedLightTable, QueuedLightEdit,
@@ -59,22 +59,22 @@ pub use raycast::{
 // pin the pointer/length contract against the checked API bit-for-bit.
 #[doc(hidden)]
 pub use ffi::{
-    mc_spine_interp_entities_batch, mc_spine_interp_table_free, mc_spine_interp_table_new,
-    mc_spine_sky_fog_eval, InterpEntityUpdate, InterpPoseOut, SkyFogInputC, SkyFogOutputC,
+    megu_interp_entities_batch, megu_interp_table_free, megu_interp_table_new,
+    megu_sky_fog_eval, InterpEntityUpdate, InterpPoseOut, SkyFogInputC, SkyFogOutputC,
 };
 pub use registry::{BlockFacts, Registry};
 pub use section::PalettedSection;
 
 pub const ABI_VERSION: u32 = 1;
 /// The single vanilla release this kernel implements, sourced from the
-/// `mc-spine-core` target registry every crate shares.
+/// `megu-core` target registry every crate shares.
 pub const TARGET_VERSION: TargetVersion = TargetVersion::V1_21_1;
 /// Numeric protocol version sent in handshakes, derived from
 /// [`TARGET_VERSION`] so the constant cannot drift from the core registry.
 pub const PROTOCOL: u32 = TARGET_VERSION.protocol() as u32;
 
 /// The canonical metadata for [`TARGET_VERSION`]: release id, protocol,
-/// `DataVersion`, pack formats and the Java floor, pinned in `mc-spine-core`.
+/// `DataVersion`, pack formats and the Java floor, pinned in `megu-core`.
 pub const fn version_meta() -> &'static VersionMeta {
     TARGET_VERSION.meta()
 }

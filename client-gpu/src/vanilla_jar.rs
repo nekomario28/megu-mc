@@ -19,9 +19,9 @@
 use std::fmt;
 use std::path::Path;
 
-use mc_spine_client_mesh::asset_pipeline::ResourcePackLayer;
-use mc_spine_client_mesh::png_decode;
-use mc_spine_core::zip_archive::{LazyZipIndex, ZipError};
+use megu_client_mesh::asset_pipeline::ResourcePackLayer;
+use megu_client_mesh::png_decode;
+use megu_core::zip_archive::{LazyZipIndex, ZipError};
 
 /// Total on-disk bytes the archive itself may occupy.
 pub const MAX_ARCHIVE_BYTES: u64 = 256 * 1024 * 1024;
@@ -481,7 +481,7 @@ mod tests {
             ),
             ("META-INF/MANIFEST.MF", b"MF".as_slice()),
         ]);
-        let dir = std::env::temp_dir().join(format!("mc-spine-ziptest-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("megu-ziptest-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let jar = dir.join("test.jar");
         std::fs::write(&jar, &zip).unwrap();
@@ -500,7 +500,7 @@ mod tests {
             ("../evil.png", b"E".as_slice()),
             ("assets/minecraft/textures/block/ok.png", b"K".as_slice()),
         ]);
-        let dir = std::env::temp_dir().join(format!("mc-spine-ziptest-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("megu-ziptest-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let jar = dir.join("evil.jar");
         std::fs::write(&jar, &zip).unwrap();

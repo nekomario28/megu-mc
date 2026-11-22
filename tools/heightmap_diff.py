@@ -8,7 +8,7 @@ Why this exists: the kelp residual in a 6x6 ocean fixture
 column, and 53 of the 484 reference columns were put down to "the two sides read
 a different `getHeight(OCEAN_FLOOR)`". A saved vanilla chunk carries its own
 heightmap, so that attribution can be checked rather than assumed: the port
-writes the same quantity with `MC_SPINE_WG_DUMP_HM` and this compares them.
+writes the same quantity with `MEGU_WG_DUMP_HM` and this compares them.
 
 Both sides are the value a feature reads, i.e. the first free y above the floor.
 The port's is `max(chunk top, feature layer)`; vanilla's went through its own

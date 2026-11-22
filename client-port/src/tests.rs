@@ -1181,8 +1181,8 @@ impl XorShift64 {
 fn parity_against_scalar_reference_on_bench_and_complex_fixtures() {
     use crate::column::{mesh_column, ColumnSection};
     use crate::ffi::{
-        mc_spine_client_mesh_column, mc_spine_client_mesh_pack_vertices,
-        mc_spine_client_mesh_sort_translucent, MeshColumnInput, MeshColumnSection, PackedVertex,
+        megu_client_mesh_column, megu_client_mesh_pack_vertices,
+        megu_client_mesh_sort_translucent, MeshColumnInput, MeshColumnSection, PackedVertex,
         ABI_AIR, ABI_COLUMN_UNIFORM_AIR, ABI_OK, ABI_VERSION,
     };
     use std::mem::MaybeUninit;
@@ -1281,13 +1281,13 @@ fn parity_against_scalar_reference_on_bench_and_complex_fixtures() {
     };
     let mut quad_count = 0;
     assert_eq!(
-        unsafe { mc_spine_client_mesh_column(&ow_input, ptr::null_mut(), 0, &mut quad_count) },
+        unsafe { megu_client_mesh_column(&ow_input, ptr::null_mut(), 0, &mut quad_count) },
         ABI_OK
     );
     let mut ow_buf = vec![MaybeUninit::<Quad>::uninit(); quad_count];
     assert_eq!(
         unsafe {
-            mc_spine_client_mesh_column(
+            megu_client_mesh_column(
                 &ow_input,
                 ow_buf.as_mut_ptr().cast(),
                 ow_buf.len(),
@@ -1307,7 +1307,7 @@ fn parity_against_scalar_reference_on_bench_and_complex_fixtures() {
     let mut vert_count = 0;
     assert_eq!(
         unsafe {
-            mc_spine_client_mesh_pack_vertices(
+            megu_client_mesh_pack_vertices(
                 ow_actual.as_ptr(),
                 ow_actual.len(),
                 ow_verts.as_mut_ptr(),
@@ -1369,7 +1369,7 @@ fn parity_against_scalar_reference_on_bench_and_complex_fixtures() {
         let mut vcount = 0;
         assert_eq!(
             unsafe {
-                mc_spine_client_mesh_pack_vertices(
+                megu_client_mesh_pack_vertices(
                     actual.as_ptr(),
                     actual.len(),
                     verts.as_mut_ptr(),
@@ -1391,7 +1391,7 @@ fn parity_against_scalar_reference_on_bench_and_complex_fixtures() {
             let mut scount = 0;
             assert_eq!(
                 unsafe {
-                    mc_spine_client_mesh_sort_translucent(
+                    megu_client_mesh_sort_translucent(
                         actual.as_ptr(),
                         actual.len(),
                         cam[0],
@@ -1981,7 +1981,7 @@ fn direction_buckets_draw_mask_and_vertex_ranges() {
 mod lod_ffi {
     use super::*;
     use crate::ffi::{
-        mc_spine_client_mesh_summarize_column, McSpineLodCell, MeshColumnInput, MeshColumnSection,
+        megu_client_mesh_summarize_column, MeguLodCell, MeshColumnInput, MeshColumnSection,
         ABI_BUFFER_TOO_SMALL, ABI_INVALID_ARGUMENT, ABI_OK, ABI_OPAQUE, ABI_VERSION,
     };
     use std::ptr;
@@ -2021,11 +2021,11 @@ mod lod_ffi {
     unsafe fn summarize(
         input: &MeshColumnInput,
         resolution: u32,
-        output: *mut McSpineLodCell,
+        output: *mut MeguLodCell,
         capacity: usize,
         count: &mut usize,
     ) -> i32 {
-        unsafe { mc_spine_client_mesh_summarize_column(input, resolution, output, capacity, count) }
+        unsafe { megu_client_mesh_summarize_column(input, resolution, output, capacity, count) }
     }
 
     fn clone_input(input: &MeshColumnInput) -> MeshColumnInput {
@@ -2065,12 +2065,12 @@ mod lod_ffi {
     fn lod_ffi_rejects_invalid_arguments() {
         let (_sections, input, _inputs) = fixture();
         let mut count = usize::MAX;
-        let mut out = [McSpineLodCell::default(); LOD_FINE * LOD_FINE];
+        let mut out = [MeguLodCell::default(); LOD_FINE * LOD_FINE];
 
         // Null count pointer.
         assert_eq!(
             unsafe {
-                mc_spine_client_mesh_summarize_column(
+                megu_client_mesh_summarize_column(
                     &input,
                     LOD_FINE as u32,
                     out.as_mut_ptr(),
@@ -2083,7 +2083,7 @@ mod lod_ffi {
         // Null input zeroes the count.
         assert_eq!(
             unsafe {
-                mc_spine_client_mesh_summarize_column(
+                megu_client_mesh_summarize_column(
                     ptr::null(),
                     LOD_FINE as u32,
                     out.as_mut_ptr(),
@@ -2186,7 +2186,7 @@ mod lod_ffi {
         let sections = vec![air(), air()];
         let (mut inputs, input) = column_input(&sections, |_| 0);
         let mut count = 0usize;
-        let mut out = [McSpineLodCell::default(); LOD_COARSE * LOD_COARSE];
+        let mut out = [MeguLodCell::default(); LOD_COARSE * LOD_COARSE];
 
         // Dense flags require a block array.
         inputs[0].blocks = ptr::null();
@@ -2265,9 +2265,9 @@ mod lod_ffi {
 
             // A short buffer reports the requirement and stays untouched.
             let mut short = vec![
-                McSpineLodCell {
+                MeguLodCell {
                     state_id: u32::MAX,
-                    ..McSpineLodCell::default()
+                    ..MeguLodCell::default()
                 };
                 required - 1
             ];
@@ -2288,7 +2288,7 @@ mod lod_ffi {
             assert_eq!(short[0], sentinel);
 
             // A full buffer matches summarize_column field for field.
-            let mut out = vec![McSpineLodCell::default(); required];
+            let mut out = vec![MeguLodCell::default(); required];
             assert_eq!(
                 unsafe { summarize(&input, resolution, out.as_mut_ptr(), out.len(), &mut count) },
                 ABI_OK

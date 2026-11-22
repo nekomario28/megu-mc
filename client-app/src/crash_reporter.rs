@@ -27,9 +27,9 @@
 //! JSON receipt carrying `issue_url` / `receipt_id` / `duplicate`.
 //!
 //! `client-app` is pinned to `std`-only manifests, so the canonical
-//! `mc-spine-core` crash-report implementation (fingerprinting +
+//! `megu-core` crash-report implementation (fingerprinting +
 //! redaction) is compiled in-tree via `#[path]` rather than duplicated.
-//! The code below is byte-for-byte the same source `mc-spine-core` ships,
+//! The code below is byte-for-byte the same source `megu-core` ships,
 //! so fingerprints always match the core definition.
 
 use std::collections::HashSet;
@@ -145,8 +145,8 @@ impl ReportEnv {
     /// the client crate version, and `std::env::consts` OS/arch.
     pub fn detect() -> Self {
         Self {
-            mc_version: mc_spine_kernel::TargetVersion::LATEST.id().to_string(),
-            engine_version: format!("mc-spine-client {}", env!("CARGO_PKG_VERSION")),
+            mc_version: megu_kernel::TargetVersion::LATEST.id().to_string(),
+            engine_version: format!("megu-client {}", env!("CARGO_PKG_VERSION")),
             os: format!("{}-{}", std::env::consts::OS, std::env::consts::ARCH),
             culprit: "unknown".to_string(),
             subsystem: None,
@@ -1246,7 +1246,7 @@ impl StdHttpReportTransport {
         let request = format!(
             "POST {path} HTTP/1.1\r\n\
              Host: {authority}\r\n\
-             User-Agent: mc-spine-crash-reporter/{version}\r\n\
+             User-Agent: megu-crash-reporter/{version}\r\n\
              Content-Type: application/json\r\n\
              Accept: application/json\r\n\
              Content-Length: {len}\r\n\
@@ -1766,7 +1766,7 @@ mod reporter_tests {
     fn test_env() -> ReportEnv {
         ReportEnv {
             mc_version: "26.3".to_string(),
-            engine_version: "mc-spine-client 0.1.0".to_string(),
+            engine_version: "megu-client 0.1.0".to_string(),
             os: "linux-x86_64".to_string(),
             culprit: "create".to_string(),
             subsystem: None,

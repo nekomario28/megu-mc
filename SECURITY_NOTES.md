@@ -1,4 +1,4 @@
-# mc-spine security notes
+# megu security notes
 
 ## FIXED 2026-09-25 (root cause confirmed) — negative VarInt write_varint runaway
 
@@ -57,7 +57,7 @@ Second hardening pass after the 16 MiB frame cap:
   a stalling client no longer wedges the single http loop.
 - oversized-packet rejection now also shuts down the socket —
   previously a desynced stream kept churning garbage frames.
-- MC_SPINE_PORT env selects the bind port (default 25599) so a
+- MEGU_PORT env selects the bind port (default 25599) so a
   capped observation instance and a dev instance can coexist.
 - verified: probe_evil_packet.py rejects a 0x7fffffff frame with
   flat 3 MB RSS (previously ~2 GiB alloc attempt = kernel OOM-kill).
@@ -139,8 +139,8 @@ What changed to contain that, without pretending it is authentication:
 
 - **Public bind needs an explicit opt-in.** The game listener, the RCON
   listener and the resource-pack HTTP listener refuse to bind a non-loopback
-  address (`MC_SPINE_BIND_ADDR`, `MC_SPINE_RCON_BIND_ADDR`,
-  `MC_SPINE_RESOURCE_PACK_BIND_ADDR`) unless `MC_SPINE_ALLOW_PUBLIC_BIND=1`
+  address (`MEGU_BIND_ADDR`, `MEGU_RCON_BIND_ADDR`,
+  `MEGU_RESOURCE_PACK_BIND_ADDR`) unless `MEGU_ALLOW_PUBLIC_BIND=1`
   is set. The game listener exits with status 2 and a message; RCON and the
   pack server log the reason and do not start. Existing deployments that bind
   `0.0.0.0` must add the flag.
@@ -150,7 +150,7 @@ What changed to contain that, without pretending it is authentication:
   been saved, which closes the "connect twice, load stale state, overwrite
   the real save" race. It does **not** stop someone from logging in as a player
   who is currently offline.
-- **Optional allowlist**: `MC_SPINE_ALLOWLIST="Steve,Alex,01234567-89ab-..."`
+- **Optional allowlist**: `MEGU_ALLOWLIST="Steve,Alex,01234567-89ab-..."`
   (comma/space separated names and/or UUIDs, unset by default). UUID entries
   match the server-derived `OfflinePlayer:<name>` UUID. Update any entries
   recorded from older client-supplied UUIDs. Offline identities remain
@@ -160,12 +160,12 @@ What changed to contain that, without pretending it is authentication:
 
 | env | default | effect |
 |---|---|---|
-| `MC_SPINE_MAX_CONN_PER_IP` | 4 for non-loopback peers; loopback unlimited unless the variable is set (then it applies everywhere); `0` = unlimited | concurrent connections per remote IP, in addition to the global 64 |
-| `MC_SPINE_LOGIN_TIMEOUT_SECS` | 15 (was a fixed 30) | one wall-clock budget for handshake + login + configuration |
-| `MC_SPINE_IDLE_TIMEOUT_SECS` | 60 | play state: no *complete* packet for this long drops the client (keep-alive challenges have a separate 15 s deadline) |
-| `MC_SPINE_RCON_MAX_FAILURES` | 5 | wrong RCON passwords from one IP before lockout |
-| `MC_SPINE_RCON_LOCKOUT_SECS` | 30 | first lockout; doubles per further failure, max 15 min; locked-out IPs are dropped at accept |
-| `MC_SPINE_BACKUP_INTERVAL_SECS` | 600 | see persistence below |
+| `MEGU_MAX_CONN_PER_IP` | 4 for non-loopback peers; loopback unlimited unless the variable is set (then it applies everywhere); `0` = unlimited | concurrent connections per remote IP, in addition to the global 64 |
+| `MEGU_LOGIN_TIMEOUT_SECS` | 15 (was a fixed 30) | one wall-clock budget for handshake + login + configuration |
+| `MEGU_IDLE_TIMEOUT_SECS` | 60 | play state: no *complete* packet for this long drops the client (keep-alive challenges have a separate 15 s deadline) |
+| `MEGU_RCON_MAX_FAILURES` | 5 | wrong RCON passwords from one IP before lockout |
+| `MEGU_RCON_LOCKOUT_SECS` | 30 | first lockout; doubles per further failure, max 15 min; locked-out IPs are dropped at accept |
+| `MEGU_BACKUP_INTERVAL_SECS` | 600 | see persistence below |
 
 Chat and chat commands follow vanilla: more than 256 characters, or a `§` /
 control character, disconnects the player; vanilla's spam counter (20 per
@@ -200,6 +200,6 @@ the world overlay. Use a firewall / fail2ban for a public listener.
 - World saves: failures are logged with the path; the tmp file is fsynced; the
   backups are `world_overlay.bin.bak` (previous save) plus `.bak.1` and
   `.bak.2`, which only advance when `.bak.1` is at least
-  `MC_SPINE_BACKUP_INTERVAL_SECS` old.
+  `MEGU_BACKUP_INTERVAL_SECS` old.
 - Configuration-phase read loops return on EOF/timeout instead of
   `continue`-spinning at 100 % CPU.

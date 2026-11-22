@@ -6,9 +6,9 @@
 
 use std::panic::{catch_unwind, AssertUnwindSafe};
 
-use mc_spine_client::audio_out::AudioSinkKind;
-use mc_spine_client::cli::parse_args;
-use mc_spine_client::protocol::{
+use megu_client::audio_out::AudioSinkKind;
+use megu_client::cli::parse_args;
+use megu_client::protocol::{
     decode_extended_play_event, encode_container_slot_state_changed, encode_edit_book,
     encode_lock_difficulty, encode_ping_request, encode_place_recipe, encode_player_abilities,
     encode_pong, encode_recipe_book_change_settings, encode_recipe_book_seen_recipe,
@@ -16,7 +16,7 @@ use mc_spine_client::protocol::{
     encode_set_command_block, encode_set_command_minecart, encode_slot_stack,
     encode_teleport_to_entity, pack_position, write_varint, write_varlong, PlayEvent,
 };
-use mc_spine_proto::{PacketDir, PacketPhase, ProtocolVersion, VersionRouter};
+use megu_proto::{PacketDir, PacketPhase, ProtocolVersion, VersionRouter};
 
 // ---------------------------------------------------------------------------
 // Wire builders (test-side mirrors of the canonical 767 layouts)
@@ -132,7 +132,7 @@ fn assert_truncation_safe(name: &str, body: &[u8]) {
     .expect("decoder panicked on full body");
 }
 
-fn v767_table() -> mc_spine_proto::ProtocolTable {
+fn v767_table() -> megu_proto::ProtocolTable {
     VersionRouter::with_v767_and_v777()
         .select(ProtocolVersion::V1_21_1.number())
         .expect("select v767")

@@ -3,12 +3,12 @@
 version = 4
 
 [[package]]
-name = "mc-spine-core"
+name = "megu-core"
 version = "0.1.0"
 
 [[package]]
-name = "mc-spine-state-store"
+name = "megu-state-store"
 version = "0.1.0"
 dependencies = [
- "mc-spine-core",
+ "megu-core",
 ]

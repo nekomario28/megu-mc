@@ -39,8 +39,8 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 
-use mc_spine_core::perf_kit::{FingerprintBuilder, FingerprintStats};
-use mc_spine_core::random::Xoroshiro128pp;
+use megu_core::perf_kit::{FingerprintBuilder, FingerprintStats};
+use megu_core::random::Xoroshiro128pp;
 
 use crate::data_loader::{parse_json, DataLoadError, JsonValue};
 use crate::mod_tick_runtime::ModTickRuntime;

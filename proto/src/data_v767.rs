@@ -1,12 +1,12 @@
 // Protocol 767 (Minecraft 1.21.1) canonical name tables.
 //
 // `minecraft:block`, `minecraft:item` and `minecraft:entity_type` mirror the
-// name tables mc-spine already drives its wire path with (`blocks_1211.json`,
+// name tables megu already drives its wire path with (`blocks_1211.json`,
 // `src/menus_and_items.rs` ITEM_NAMES, `src/entity_registry.rs`
 // ENTITY_REGISTRY_1211); `minecraft:menu` and `minecraft:data_component_type`
 // follow the vanilla registry order, and every entry the codebase exercises on
 // the wire is cross-checked against it. Packet names are the Mojang class name
-// minus its `Clientbound`/`Serverbound` prefix; every id mc-spine sends or
+// minus its `Clientbound`/`Serverbound` prefix; every id megu sends or
 // receives appears here under the same numeric value.
 use crate::table::{PacketDir, PacketPhase};
 

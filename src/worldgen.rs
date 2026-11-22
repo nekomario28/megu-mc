@@ -1,4 +1,4 @@
-// worldgen.rs — datapack-driven vanilla worldgen slice for mc-spine.
+// worldgen.rs — datapack-driven vanilla worldgen slice for megu.
 // Loads vanilla worldgen JSONs (noise_settings / density_function / noise)
 // from datapacks/<pack>/data/minecraft/worldgen/ and evaluates the vanilla
 // density-function pipeline: per-chunk cell grid + trilinear interp.
@@ -112,12 +112,12 @@ pub(crate) fn record_worldgen_parse_error(
     e
 }
 
-/// `MC_SPINE_STRICT_WORLDGEN=1` opts a load into fail-closed parsing: the first
+/// `MEGU_STRICT_WORLDGEN=1` opts a load into fail-closed parsing: the first
 /// failure in any of the four worldgen datapack families aborts the load
 /// (`Err` / refusal) instead of continuing with the entry dropped. Read per
 /// call, never cached, so a test can toggle it between loads.
 pub(crate) fn strict_worldgen_parse() -> bool {
-    std::env::var("MC_SPINE_STRICT_WORLDGEN").as_deref() == Ok("1")
+    std::env::var("MEGU_STRICT_WORLDGEN").as_deref() == Ok("1")
 }
 
 // ---------- density functions ----------
@@ -2187,12 +2187,12 @@ pub struct GenData {
     upper_bound_interp: Option<usize>,
     fallback_share: std::sync::Arc<TerrainShare>,
     /// `final_density` compiled once into a flat post-order program (see
-    /// `DfProg`). `None` keeps the interpreted evaluator (`MC_SPINE_DF_INTERP`).
+    /// `DfProg`). `None` keeps the interpreted evaluator (`MEGU_DF_INTERP`).
     dfprog: Option<Box<DfProg>>,
     /// The `interpolated` inputs of the density path, compiled for the
     /// corner-grid column sweep (`DfCols`): a hoisted 2D prefix per `(x, z)`
     /// column plus a 3D program per grid. `None` keeps `eval_flat`
-    /// (`MC_SPINE_DF_INTERP` or `MC_SPINE_DFCOL=0`).
+    /// (`MEGU_DF_INTERP` or `MEGU_DFCOL=0`).
     dfcols: Option<Box<DfCols>>,
     /// The same for the vein-path `interpolated` inputs (`vein_interp_nodes`).
     vfcols: Option<Box<DfCols>>,
@@ -2328,7 +2328,7 @@ pub struct Gen {
     /// for the M3 P1a M4 counter only. Lives on the generator (not in a process-wide set)
     /// so "was this row evicted before its consumer read it" is a property of one store:
     /// the answer is what the `TERRAIN_STORE_BOUND` A/B is asking. Untouched unless
-    /// `MC_SPINE_M3_PROFILE`/`FEAT_PROFILE` is on.
+    /// `MEGU_M3_PROFILE`/`FEAT_PROFILE` is on.
     terr_pending: std::collections::BTreeSet<(i32, i32, i32)>,
     // feature layer: chunk -> {(y-min)<<8|z<<4|x -> state}
     feat_c: HashMap<(i32, i32), HashMap<u32, u32>>,
@@ -2396,7 +2396,7 @@ pub struct Gen {
     /// Generation metadata persists independently of evictable block caches.
     pub(crate) mineshaft_spawners: HashSet<(i32, i32, usize)>,
     pub(crate) payload_sources: HashSet<(i32, i32)>,
-    /// Decoration region whose lexicographic scan order to follow (`MC_SPINE_POP_REGION`).
+    /// Decoration region whose lexicographic scan order to follow (`MEGU_POP_REGION`).
     pop_region: Option<(i32, i32, i32, i32)>,
     /// A3-a dispatch hand-off. `populate_in_order` records the pending chunks here when a
     /// multi-chunk feature run can be parallelised; the first `feature::populate` call takes
@@ -2508,15 +2508,15 @@ const FEATURE_BUCKET_BOUND: usize = 384;
 /// each), so the store does not have to evict a row its consumer is about to read; the
 /// bound exists so a caller that prefetches without consuming cannot grow it.
 ///
-/// The A/B switch is `MC_SPINE_TERRAIN_STORE_BOUND` (see [`terrain_store_bound`]): retention
+/// The A/B switch is `MEGU_TERRAIN_STORE_BOUND` (see [`terrain_store_bound`]): retention
 /// is the only thing the bound decides, so the two arms must produce the same bytes and the
 /// same `terr_c` hit/miss counts for every section a caller actually asks for.
 const TERRAIN_STORE_BOUND: usize = 512;
 
-/// The retention bound in force, `MC_SPINE_TERRAIN_STORE_BOUND` or [`TERRAIN_STORE_BOUND`].
+/// The retention bound in force, `MEGU_TERRAIN_STORE_BOUND` or [`TERRAIN_STORE_BOUND`].
 pub fn terrain_store_bound() -> usize {
     static BOUND: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
-    *BOUND.get_or_init(|| parse_terrain_store_bound(env_str!("MC_SPINE_TERRAIN_STORE_BOUND")))
+    *BOUND.get_or_init(|| parse_terrain_store_bound(env_str!("MEGU_TERRAIN_STORE_BOUND")))
 }
 
 /// [`terrain_store_bound`] without the environment, so the parse rule is testable in a
@@ -2867,7 +2867,7 @@ impl<K: std::hash::Hash + Eq + Clone, V: Clone> Drop for FlightLeader<'_, K, V> 
 /// each compute privately.
 ///
 /// Three caches, all keyed `(world_seed, preset, chunk)` plus the two things that change what
-/// a column contains (`MC_SPINE_NOFEAT`, and which beardifier resolver is in force):
+/// a column contains (`MEGU_NOFEAT`, and which beardifier resolver is in force):
 ///
 /// * `bases` (64) - `base_cols`, pure even while a beard resolves;
 /// * `beards` (128) - `resolve_beard`, only filed by an outermost resolution;
@@ -2888,7 +2888,7 @@ pub(crate) struct TerrainShare {
 }
 
 /// `(world_seed, preset, cx, cz, flags)` with the flags that change a column's bytes: the
-/// `MC_SPINE_NOFEAT` switch, which the beard/column path reads on every call.
+/// `MEGU_NOFEAT` switch, which the beard/column path reads on every call.
 type TerrainKey = (u64, u8, i32, i32, u8, usize);
 
 /// Which cache a [`flight_token`] belongs to. The token only has to distinguish a key from the
@@ -2898,12 +2898,12 @@ const SHARE_DOMAIN_BASES: u64 = 0x1_0000_0001;
 const SHARE_DOMAIN_BEARDS: u64 = 0x1_0000_0002;
 const SHARE_DOMAIN_COLS: u64 = 0x1_0000_0003;
 
-/// `MC_SPINE_NOFEAT=1` is the terrain-only switch: it skips the whole feature layer, and a
+/// `MEGU_NOFEAT=1` is the terrain-only switch: it skips the whole feature layer, and a
 /// structure-shaped terrain is part of that layer. Cached once per process (the flag cannot
 /// change under a run) because the share keys on it.
 fn share_nofeat() -> bool {
     static NOFEAT: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *NOFEAT.get_or_init(|| env_flag!("MC_SPINE_NOFEAT"))
+    *NOFEAT.get_or_init(|| env_flag!("MEGU_NOFEAT"))
 }
 
 const BASE_CACHE_CAP: usize = 512;
@@ -2978,7 +2978,7 @@ pub(crate) fn terrain_share(round: u64) -> Option<std::sync::Arc<TerrainShare>> 
 // feature-side fallbacks, sections filled - so `jobs=1` against `jobs=5` and `512` against
 // `1536` are comparable, and they change no decision: nothing reads them.
 //
-// The switch is `MC_SPINE_M3_PROFILE=1` (or the older `FEAT_PROFILE=1`). With neither set,
+// The switch is `MEGU_M3_PROFILE=1` (or the older `FEAT_PROFILE=1`). With neither set,
 // every site pays one cached `OnceLock` load and a branch that is predicted not-taken, and
 // nothing else: no environment reads, no allocation, no atomics.
 //
@@ -3143,7 +3143,7 @@ pub(crate) fn m3_on() -> bool {
     if M3_TEST_ON.load(std::sync::atomic::Ordering::Relaxed) {
         return true;
     }
-    *M3_ON.get_or_init(|| env_flag!("MC_SPINE_M3_PROFILE") || env_flag!("FEAT_PROFILE"))
+    *M3_ON.get_or_init(|| env_flag!("MEGU_M3_PROFILE") || env_flag!("FEAT_PROFILE"))
 }
 
 #[cfg(test)]
@@ -3624,7 +3624,7 @@ impl Gen {
         #[cfg(test)]
         {
             if std::env::var_os("LOAD_TRACE").is_none()
-                && std::env::var_os("MC_SPINE_VEINDBG").is_none()
+                && std::env::var_os("MEGU_VEINDBG").is_none()
             {
                 use std::sync::{Mutex, OnceLock};
                 type Key = (u64, u8, usize, bool, Vec<std::path::PathBuf>);
@@ -3635,7 +3635,7 @@ impl Gen {
                     NoisePreset::Nether => 1,
                     NoisePreset::End => 2,
                 };
-                let noaq = std::env::var_os("MC_SPINE_NOAQ").is_some();
+                let noaq = std::env::var_os("MEGU_NOAQ").is_some();
                 let key = (seed, preset_id, res as usize, noaq, Self::packs());
                 let cache = CACHE.get_or_init(|| Mutex::new(HashMap::new()));
                 if let Some(hit) = cache.lock().unwrap_or_else(|e| e.into_inner()).get(&key) {
@@ -3789,7 +3789,7 @@ impl Gen {
             suppress_generated_ticks: false,
             carve_c: HashMap::new(),
             carve_ord: std::collections::VecDeque::new(),
-            pop_region: std::env::var("MC_SPINE_POP_REGION").ok().and_then(|v| {
+            pop_region: std::env::var("MEGU_POP_REGION").ok().and_then(|v| {
                 let p: Vec<i32> = v.split(',').filter_map(|n| n.parse().ok()).collect();
                 if p.len() == 4 {
                     Some((p[0], p[1], p[2], p[3]))
@@ -3925,7 +3925,7 @@ impl Gen {
                     router_df(&mut g, &files, &b),
                     router_df(&mut g, &files, &c),
                 );
-                if std::env::var("MC_SPINE_VEINDBG").is_ok() {
+                if std::env::var("MEGU_VEINDBG").is_ok() {
                     eprintln!("VEINCFG refs a={:?} b={:?} c={:?}", ta, tb, tc);
                 }
                 if let (Some(ta), Some(tb), Some(tc)) = (ta, tb, tc) {
@@ -4079,7 +4079,7 @@ impl Gen {
             }
         }
         // aquifer config: noise DF ids + positional deriver (minecraft:aquifer)
-        let noaq = std::env::var("MC_SPINE_NOAQ").is_ok() || !jbool(&ns, "aquifers_enabled", true);
+        let noaq = std::env::var("MEGU_NOAQ").is_ok() || !jbool(&ns, "aquifers_enabled", true);
         // 1.21.1 has no top-level `aquifers`: the same four functions sit in
         // `noise_router` under their own names. 1.21.1's deep-aquifer test reads
         // `erosion` and `depth` (OverworldBiomeBuilder.isDeepDark; NoiseRouter's
@@ -4931,7 +4931,7 @@ impl Gen {
     /// The four values are the four `block_density` values bit for bit (see `DF4`); the
     /// vector arm exists because the terrain stage asks for the same row of a section 16
     /// blocks at a time. A generator that kept the interpreter
-    /// (`MC_SPINE_DF_INTERP=1`) answers the four positions through it, so the A/B switch
+    /// (`MEGU_DF_INTERP=1`) answers the four positions through it, so the A/B switch
     /// keeps meaning what it meant.
     #[cfg(test)]
     pub(crate) fn block_density_x4(&self, cc: &ChunkCols, x: i32, y: i32, z: i32) -> [f64; DF4] {
@@ -4949,7 +4949,7 @@ impl Gen {
     /// [`Gen::block_density`] at the eight consecutive columns `x..x+8` (layer A2-c). The
     /// values are eight `block_density` values bit for bit; the vector arm exists because the
     /// terrain stage asks for a whole 16-wide row of a section. A generator that kept the
-    /// interpreter (`MC_SPINE_DF_INTERP=1`) answers the eight positions through it, so the A/B
+    /// interpreter (`MEGU_DF_INTERP=1`) answers the eight positions through it, so the A/B
     /// switch keeps meaning what it meant.
     pub(crate) fn block_density_x8(&self, cc: &ChunkCols, x: i32, y: i32, z: i32) -> [f64; DF8] {
         if let Some(prog) = self.dfprog.as_ref() {
@@ -5452,13 +5452,13 @@ impl Gen {
 // hash lookup per cached visit and a `HashMap` insert per block; it cannot
 // change a value, and `compiled_density_matches_interpreter` holds that.
 
-/// `MC_SPINE_DF_INTERP=1` keeps `final_density` interpreted: the program is not
+/// `MEGU_DF_INTERP=1` keeps `final_density` interpreted: the program is not
 /// even built, so the compiled path then costs one `None` test per block. This
 /// is the A/B arm for the performance page and the reference arm for the
 /// identity tests.
 fn df_compile_disabled() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("MC_SPINE_DF_INTERP").is_some())
+    *ON.get_or_init(|| std::env::var_os("MEGU_DF_INTERP").is_some())
 }
 
 /// One instruction of a compiled density program.
@@ -5646,7 +5646,7 @@ impl DfProg {
         Self::compile_inner(d)
     }
 
-    /// The compiler itself, independent of `MC_SPINE_DF_INTERP`: the identity
+    /// The compiler itself, independent of `MEGU_DF_INTERP`: the identity
     /// tests ask it for a program the switch may have suppressed, so that a tree
     /// with the A/B switch exported does not silently stop testing anything.
     fn compile_inner(d: &GenData) -> Option<Box<DfProg>> {
@@ -5974,7 +5974,7 @@ struct DfColScratch {
 impl DfCols {
     /// Compile one program per `(grid, inner)` pair, sharing the hoisted 2D
     /// prefix so a node two inputs read is still evaluated once per column.
-    /// `None` when the switch keeps the interpreter (`MC_SPINE_DF_INTERP`) or
+    /// `None` when the switch keeps the interpreter (`MEGU_DF_INTERP`) or
     /// the set has no `InterpKind::General` inputs.
     fn compile(d: &GenData, roots: &[(usize, usize)]) -> Option<Box<DfCols>> {
         if roots.is_empty() || df_compile_disabled() {
@@ -6117,17 +6117,17 @@ impl DfCols {
 }
 
 /// The A/B switch for the compiled column fill, mirroring `df4_disabled`:
-/// `MC_SPINE_DFCOL=0` keeps the flat-memo evaluator, and the test toggle runs
+/// `MEGU_DFCOL=0` keeps the flat-memo evaluator, and the test toggle runs
 /// the same binary through both arms.
 fn dfcol_flat() -> bool {
     #[cfg(test)]
     if DFCOL_TEST_FLAT.load(std::sync::atomic::Ordering::Relaxed) {
         return true;
     }
-    matches!(env_str!("MC_SPINE_DFCOL").as_deref(), Some("0"))
+    matches!(env_str!("MEGU_DFCOL").as_deref(), Some("0"))
 }
 
-/// The in-process form of `MC_SPINE_DFCOL=0`, so the parity/bench test holds
+/// The in-process form of `MEGU_DFCOL=0`, so the parity/bench test holds
 /// the two fill paths to the same bytes without a second binary.
 #[cfg(test)]
 static DFCOL_TEST_FLAT: std::sync::atomic::AtomicBool =
@@ -6188,7 +6188,7 @@ const DF4: usize = 4;
 /// a shape no preset produces.
 const DF4_SLOTS: usize = 16;
 
-/// The A/B switch: `MC_SPINE_DF4=0` disables the vector arm and leaves the same binary's
+/// The A/B switch: `MEGU_DF4=0` disables the vector arm and leaves the same binary's
 /// one-lane path.
 fn df4_disabled() -> bool {
     #[cfg(test)]
@@ -6196,7 +6196,7 @@ fn df4_disabled() -> bool {
         return true;
     }
     // `env_str!` caches the read itself.
-    matches!(env_str!("MC_SPINE_DF4").as_deref(), Some("0"))
+    matches!(env_str!("MEGU_DF4").as_deref(), Some("0"))
 }
 
 /// The in-process form of that switch, so one test can build the same chunk with the vector
@@ -6224,19 +6224,19 @@ fn df4_avx2() -> bool {
 // `DfProg::run`, no FMA, the same compare/blend sequences for min/max/clamp and the same
 // lane-uniform branch rule. A conditional that splits the eight lanes returns `None` and the
 // caller finishes the group through two `eval_x4` calls (so a four-lane subset that agrees
-// still gets AVX2). `MC_SPINE_DF8=0` keeps the same binary on the 4-lane path for A/B.
+// still gets AVX2). `MEGU_DF8=0` keeps the same binary on the 4-lane path for A/B.
 
 /// Lanes in the eight-lane evaluator: one `__m512d`.
 pub(crate) const DF8: usize = 8;
 
-/// The A/B switch for the eight-lane arm: `MC_SPINE_DF8=0` leaves the 4-lane path (and
-/// `MC_SPINE_DF4=0` / `DF4_TEST_SCALAR` still disable every vector arm).
+/// The A/B switch for the eight-lane arm: `MEGU_DF8=0` leaves the 4-lane path (and
+/// `MEGU_DF4=0` / `DF4_TEST_SCALAR` still disable every vector arm).
 fn df8_disabled() -> bool {
     #[cfg(test)]
     if DF4_TEST_SCALAR.load(std::sync::atomic::Ordering::Relaxed) {
         return true;
     }
-    df4_disabled() || matches!(env_str!("MC_SPINE_DF8").as_deref(), Some("0"))
+    df4_disabled() || matches!(env_str!("MEGU_DF8").as_deref(), Some("0"))
 }
 
 /// Does this CPU have AVX-512F + AVX-512DQ? Asked once; `dq` is required for the
@@ -6283,7 +6283,7 @@ impl DfProg {
     /// Density at the four consecutive columns `x..x+4`, all at one `(y, z)`.
     ///
     /// Called only when a compiled program exists (the callers keep the interpreter for
-    /// `MC_SPINE_DF_INTERP=1`), so both arms here are programs: the vector one where the CPU
+    /// `MEGU_DF_INTERP=1`), so both arms here are programs: the vector one where the CPU
     /// and the program allow it, and otherwise the same four positions one at a time.
     fn eval_x4(&self, g: &Gen, cc: Option<&ChunkCols>, x: i32, y: i32, z: i32) -> [f64; DF4] {
         #[cfg(target_arch = "x86_64")]
@@ -8867,7 +8867,7 @@ pub fn take_generated_fluid_ticks() -> Vec<GeneratedTick> {
 ///
 /// Before this the process had exactly one generator (`GEN`), and "which dimension" was a
 /// property of `init`'s last call — which is why the Nether and the End could only ever be an
-/// offline diagnostic (`MC_SPINE_WG_PRESET`). The Overworld keeps its old meaning exactly:
+/// offline diagnostic (`MEGU_WG_PRESET`). The Overworld keeps its old meaning exactly:
 /// the dim-less accessors ([`with_gen`], [`terrain_section`], [`facts`], [`data_snapshot`])
 /// answer for the [`active_dim`] slot, and `init` always makes that the Overworld.
 ///
@@ -8905,7 +8905,7 @@ static BLOCK_LOOKUP: Mutex<Option<BlockLookupFn>> = Mutex::new(None);
 /// Which slot the dim-less accessors answer for.
 ///
 /// `init_preset` publishes here the generator it installed, so every offline diagnostic that
-/// selects a dimension with `MC_SPINE_WG_PRESET` keeps meaning what it meant (its
+/// selects a dimension with `MEGU_WG_PRESET` keeps meaning what it meant (its
 /// `with_gen`, its `world_min_y()`, its dump length). `init` — the runtime's only call —
 /// always installs the Overworld, so a server's dim-less path is the Overworld.
 static ACTIVE_DIM: std::sync::atomic::AtomicU8 =
@@ -9123,9 +9123,9 @@ fn gen_lock() -> GenLock {
 /// One dimension's generator lock.
 fn gen_lock_dim(dimension: DimId) -> GenLock {
     // Either switch turns the timing on: `FEAT_PROFILE` for generation-only runs,
-    // `MC_SPINE_TICK_PROFILE` for a live server, where the tick thread is the caller
+    // `MEGU_TICK_PROFILE` for a live server, where the tick thread is the caller
     // that queues behind a section pass.
-    let prof = env_flag!("FEAT_PROFILE") || env_flag!("MC_SPINE_TICK_PROFILE");
+    let prof = env_flag!("FEAT_PROFILE") || env_flag!("MEGU_TICK_PROFILE");
     let started = prof.then(std::time::Instant::now);
     let mut guard = PER_DIM.gens.lock().unwrap_or_else(|e| e.into_inner());
     // The caller's slot always exists: a custom dimension registers before it can be
@@ -9148,7 +9148,7 @@ fn gen_lock_dim(dimension: DimId) -> GenLock {
 /// `wait / (wait + hold)` is the share of lock-attributed time spent queued; a
 /// worker-per-chunk design removes the queue, not the hold.
 pub fn report_gen_lock() {
-    if !env_flag!("FEAT_PROFILE") && !env_flag!("MC_SPINE_TICK_PROFILE") {
+    if !env_flag!("FEAT_PROFILE") && !env_flag!("MEGU_TICK_PROFILE") {
         return;
     }
     use std::sync::atomic::Ordering;
@@ -9191,7 +9191,7 @@ pub(crate) fn init_dim(dimension: DimId, seed: u64, res: fn(&str) -> Option<u32>
 /// Install `preset`'s generator and make its dimension the active one.
 ///
 /// The runtime reaches this through [`init`], i.e. with the Overworld. The offline
-/// diagnostics (`MC_SPINE_WG_PRESET=nether|end`) reach it with another preset, and because
+/// diagnostics (`MEGU_WG_PRESET=nether|end`) reach it with another preset, and because
 /// the installed generator also becomes the active one, every dim-less accessor keeps
 /// answering for it exactly as it did before the registry existed.
 pub(crate) fn init_preset(seed: u64, res: fn(&str) -> Option<u32>, preset: NoisePreset) -> bool {
@@ -9261,7 +9261,7 @@ fn install(dimension: DimId, seed: u64, res: fn(&str) -> Option<u32>, activate: 
     }
     true
 }
-/// `MC_SPINE_DFDUMP=x,y,z` diagnostic: print the vein-sampler inputs.
+/// `MEGU_DFDUMP=x,y,z` diagnostic: print the vein-sampler inputs.
 pub fn dfdump(spec: &str) {
     let p: Vec<i32> = spec.split(',').filter_map(|n| n.parse().ok()).collect();
     if p.len() != 3 {
@@ -9304,7 +9304,7 @@ pub(crate) struct PopBatch {
     pub decorated: Vec<(i32, i32)>,
 }
 
-/// The request set in the box shape `MC_SPINE_POP_REGION` already uses, walked x-then-z.
+/// The request set in the box shape `MEGU_POP_REGION` already uses, walked x-then-z.
 ///
 /// This walk is the *declared* half of the default order and the reason the whole default is
 /// named: vanilla fixes the priority discipline and leaves the within-level sequence to the wall
@@ -9337,7 +9337,7 @@ pub(crate) fn request_box(x0: i32, z0: i32, x1: i32, z1: i32) -> Vec<(i32, i32)>
 /// The rule is fixed; the within-level order is wall clock, and identical-setting native runs
 /// differ (9/49 common prefix). This function therefore implements *one named member* and does not
 /// claim bit-parity with any capture — for a comparison against a recorded order the order is an
-/// input (`MC_SPINE_POP_ORDER`), which is what the finite acceptance set compares with.
+/// input (`MEGU_POP_ORDER`), which is what the finite acceptance set compares with.
 ///
 /// The member, exactly:
 ///
@@ -9532,7 +9532,7 @@ fn ensure_dim_generator(dimension: DimId) {
 
 /// Run a diagnostic against the active dimension's generator — the Overworld for every
 /// runtime caller (`init` is the only install the server does); an offline
-/// `MC_SPINE_WG_PRESET` diagnostic is what can make it another dimension. Feature-facing
+/// `MEGU_WG_PRESET` diagnostic is what can make it another dimension. Feature-facing
 /// accessors stay in the caller's layer to avoid worldgen depending on generation_context.
 pub fn with_gen<R>(f: impl FnOnce(&mut Gen) -> R) -> Option<R> {
     with_gen_dim(active_dim(), f)
@@ -9611,10 +9611,10 @@ type PrefetchedCols = Vec<((i32, i32), Option<std::sync::Arc<ChunkCols>>)>;
 /// sleeping. Lane B (Background) is where the audit routes chunk generation
 /// and feature placement.
 #[cfg(feature = "mod-suite")]
-pub(crate) fn bg_task_pool() -> &'static mc_spine_core::task_pool::MeguTaskPool {
-    static POOL: std::sync::OnceLock<mc_spine_core::task_pool::MeguTaskPool> =
+pub(crate) fn bg_task_pool() -> &'static megu_core::task_pool::MeguTaskPool {
+    static POOL: std::sync::OnceLock<megu_core::task_pool::MeguTaskPool> =
         std::sync::OnceLock::new();
-    POOL.get_or_init(mc_spine_core::task_pool::MeguTaskPool::for_host)
+    POOL.get_or_init(megu_core::task_pool::MeguTaskPool::for_host)
 }
 
 /// Run `f` in a scoped parallel batch: the resident background task pool under
@@ -9625,7 +9625,7 @@ macro_rules! bg_scope {
     ($f:expr) => {{
         #[cfg(feature = "mod-suite")]
         let r = $crate::worldgen::bg_task_pool()
-            .scope_blocking(mc_spine_core::task_pool::TaskLane::Background, $f);
+            .scope_blocking(megu_core::task_pool::TaskLane::Background, $f);
         #[cfg(not(feature = "mod-suite"))]
         let r = ::std::thread::scope($f);
         r
@@ -9718,7 +9718,7 @@ pub(crate) struct PrefetchedTerrain {
 ///
 /// The marks travel with the rows because the cell decisions are made on the worker: a
 /// worker that reported cells without their marks would make the mark set depend on which
-/// thread built the section, which is exactly what `MC_SPINE_WG_GEN_JOBS=1` vs `8` has to
+/// thread built the section, which is exactly what `MEGU_WG_GEN_JOBS=1` vs `8` has to
 /// stay identical on.
 #[derive(Clone)]
 pub(crate) struct BaseRow {
@@ -9853,16 +9853,16 @@ pub(crate) fn prefetch_terrain(
                     }
                 }
                 // The meter is per thread, so the worker's own counts die with this thread
-                // unless they are merged first: `MC_SPINE_M3_PROFILE` would then under-count
+                // unless they are merged first: `MEGU_M3_PROFILE` would then under-count
                 // exactly the work P1a exists to attribute.
                 m3_flush();
             });
         }
     });
-    // `MC_SPINE_GEN_TRACE=1`: one line per round, so a run can show the parallel path
+    // `MEGU_GEN_TRACE=1`: one line per round, so a run can show the parallel path
     // actually executed instead of assuming it did (a bit-identical dump is produced by
     // the serial fallback too).
-    if env_flag!("MC_SPINE_GEN_TRACE") {
+    if env_flag!("MEGU_GEN_TRACE") {
         let filled = out.iter().filter(|c| c.is_some()).count();
         eprintln!(
             "[terrain] round chunks={} filled={} jobs={} sections={} fill_ms={:.1}",
@@ -9880,18 +9880,18 @@ pub(crate) fn prefetch_terrain(
 
 /// The parallel terrain worker count.
 ///
-/// `MC_SPINE_GEN_JOBS` (0 or 1 = run inline) wins; the older name `MC_SPINE_GEN_WORKERS`
+/// `MEGU_GEN_JOBS` (0 or 1 = run inline) wins; the older name `MEGU_GEN_WORKERS`
 /// still selects a count. The default is `min(available_parallelism, TERRAIN_MAX_JOBS)`:
 /// terrain is what the whole generation costs (§"Baseline" in the performance README) and
 /// the win is wall clock, not CPU — one chunk per worker is what vanilla does, so the
 /// parallel arm is the default and the environment variable is the escape hatch.
 pub fn terrain_jobs() -> usize {
-    if let Some(v) = env_str!("MC_SPINE_GEN_JOBS") {
+    if let Some(v) = env_str!("MEGU_GEN_JOBS") {
         if let Ok(n) = v.trim().parse::<usize>() {
             return n;
         }
     }
-    if let Some(v) = env_str!("MC_SPINE_GEN_WORKERS") {
+    if let Some(v) = env_str!("MEGU_GEN_WORKERS") {
         if let Ok(n) = v.trim().parse::<usize>() {
             return n;
         }
@@ -10092,7 +10092,7 @@ impl Gen {
             suppress_generated_ticks: false,
             carve_c: HashMap::new(),
             carve_ord: std::collections::VecDeque::new(),
-            pop_region: std::env::var("MC_SPINE_POP_REGION").ok().and_then(|v| {
+            pop_region: std::env::var("MEGU_POP_REGION").ok().and_then(|v| {
                 let p: Vec<i32> = v.split(',').filter_map(|n| n.parse().ok()).collect();
                 if p.len() == 4 {
                     Some((p[0], p[1], p[2], p[3]))
@@ -10484,7 +10484,7 @@ impl Gen {
         if self.beard_depth > 0 {
             return None;
         }
-        // `MC_SPINE_NOFEAT=1` is the terrain-only comparison switch: it skips the whole
+        // `MEGU_NOFEAT=1` is the terrain-only comparison switch: it skips the whole
         // feature layer (`feature::populate`), and a structure-shaped terrain is part of
         // that layer. Applying structures to a terrain fixture would compare the port's
         // beardified terrain with a native capture that had none.
@@ -10578,7 +10578,7 @@ impl Gen {
     }
 
     /// The share key for one chunk. Two things beyond the chunk's identity change what a
-    /// shared column contains and are therefore part of the key: the `MC_SPINE_NOFEAT` switch
+    /// shared column contains and are therefore part of the key: the `MEGU_NOFEAT` switch
     /// (a terrain-only run has no beardifier at all) and which beardifier resolver is in force
     /// (a test's per-generator override is not the world's). Without them a terrain-only arm
     /// could take a bearded column from a neighbouring run's cache.
@@ -11810,7 +11810,7 @@ impl Gen {
         }
     }
 
-    /// `MC_SPINE_DFDUMP=x,y,z`: print the four density functions the vein
+    /// `MEGU_DFDUMP=x,y,z`: print the four density functions the vein
     /// sampler's caller passes, for comparison with the live server.
     pub(crate) fn dump_dfs(&mut self, x: i32, y: i32, z: i32) {
         let mut memo = std::mem::take(&mut self.memo);
@@ -11891,7 +11891,7 @@ impl Gen {
             None => {
                 static ONCE: std::sync::atomic::AtomicBool =
                     std::sync::atomic::AtomicBool::new(true);
-                if env_flag!("MC_SPINE_VEINDBG")
+                if env_flag!("MEGU_VEINDBG")
                     && ONCE.swap(false, std::sync::atomic::Ordering::Relaxed)
                 {
                     eprintln!("VEINCFG sampler active but vein=None");
@@ -11911,10 +11911,10 @@ impl Gen {
                 (v - lo) / (hi - lo) * (to - from) + from
             }
         };
-        // `MC_SPINE_VEINTRACE="x,y,z"`: parsed once.
+        // `MEGU_VEINTRACE="x,y,z"`: parsed once.
         static VEIN_TRACE_AT: std::sync::OnceLock<Option<[i32; 3]>> = std::sync::OnceLock::new();
         let dbg = *VEIN_TRACE_AT.get_or_init(|| {
-            let v = std::env::var("MC_SPINE_VEINTRACE").ok()?;
+            let v = std::env::var("MEGU_VEINTRACE").ok()?;
             let p: Vec<i32> = v.split(',').filter_map(|n| n.parse().ok()).collect();
             <[i32; 3]>::try_from(p).ok()
         }) == Some([x, y, z]);
@@ -12693,7 +12693,7 @@ impl Gen {
             }
             self.populate_in_order([(cx, cz)], &mut populate);
         } else {
-            let nbr = env_str!("MC_SPINE_FEAT_NBR")
+            let nbr = env_str!("MEGU_FEAT_NBR")
                 .map(|v| v != "0")
                 .unwrap_or(true);
             if !self.pop_done.contains(&(cx, cz)) {
@@ -12763,7 +12763,7 @@ impl Gen {
     /// name, and because the marks are max-only: they never record a removal, they miss
     /// every state the predicate rejects (a leaf above the floor), and they know nothing
     /// about carver writes (`FC::feature_override` is the carver's channel, not this
-    /// tally). `MC_SPINE_HM_DUMP` used to print `max(top_oc, tally)` and that is exactly
+    /// tally). `MEGU_HM_DUMP` used to print `max(top_oc, tally)` and that is exactly
     /// the bug this comment exists to stop: the printed answer was the bound.
     pub(crate) fn note_feature_write(&mut self, x: i32, y: i32, z: i32, solid: bool, air: bool) {
         let e = self.feat_hm.entry((x, z)).or_insert((i32::MIN, i32::MIN));
@@ -13080,7 +13080,7 @@ impl Gen {
     }
 
     /// Execute the default population order for a request box: the named member of vanilla's
-    /// order family documented on [`population_discipline`], over the box shape `MC_SPINE_POP_REGION`
+    /// order family documented on [`population_discipline`], over the box shape `MEGU_POP_REGION`
     /// already uses. `.0` is the number of chunks this call decorated.
     pub(crate) fn populate_request_box(
         &mut self,
@@ -13399,7 +13399,7 @@ pub fn debug_eval(name: &str, x: i32, y: i32, z: i32) -> Option<f64> {
     Some(g.eval(id, x, y, z, &mut m))
 }
 
-/// Diagnostics: `WG_COUNT=1 MC_SPINE_DFSTATS=1` prints where the density-node
+/// Diagnostics: `WG_COUNT=1 MEGU_DFSTATS=1` prints where the density-node
 /// visits went (per kind and per node), so an evaluator change can be attributed.
 pub fn df_stats() -> String {
     let hits = match DF_HITS.get() {
@@ -13519,13 +13519,13 @@ pub fn deep_state(x: i32, y: i32, z: i32, cc: &ChunkCols) -> u32 {
     }
 }
 
-/// `MC_SPINE_BEDROCK=flat` replaces the per-cell vanilla bedrock gradient with a solid
+/// `MEGU_BEDROCK=flat` replaces the per-cell vanilla bedrock gradient with a solid
 /// five-block floor. It is a deliberate parity/cheapness option for players who prefer the
 /// flat floor; measured at ~8us a chunk (about 0.14% of the terrain layer), so the vanilla
 /// per-cell pattern stays the default.
 pub fn flat_bedrock() -> bool {
     static FLAT: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *FLAT.get_or_init(|| std::env::var("MC_SPINE_BEDROCK").ok().as_deref() == Some("flat"))
+    *FLAT.get_or_init(|| std::env::var("MEGU_BEDROCK").ok().as_deref() == Some("flat"))
 }
 impl Gen {
     /// in-lock deep rule evaluation (feature layer / tests use this; the free
@@ -15320,11 +15320,11 @@ pub fn biome_at(qx: i32, qy: i32, qz: i32) -> Option<i64> {
 }
 
 /// 4x4x4 biome ids for one chunk section, quart-space index (y<<4|z<<2|x).
-/// `MC_SPINE_HM_DUMP=cx,cz` lives in `generation_context::hm_dump`: the live maps are
+/// `MEGU_HM_DUMP=cx,cz` lives in `generation_context::hm_dump`: the live maps are
 /// what a feature reads (`FC::hm_oc`/`hm_ws`), and `worldgen` may not reach for the
 /// generation context (module layers).
 ///
-/// `MC_SPINE_BIOME_AT=x,y,z;x,y,z;...`: print both biome notions at each position.
+/// `MEGU_BIOME_AT=x,y,z;x,y,z;...`: print both biome notions at each position.
 /// The container (what a saved chunk holds) and the blended lookup that
 /// `LevelReader.getBiome` returns are different answers; a placement filter reads
 /// the second, so seeing both at once is how a boundary disagreement is read.
@@ -15352,7 +15352,7 @@ pub fn biome_at_dump(spec: &str) {
     }
 }
 
-/// `MC_SPINE_BIOME_DUMP=cx,sy,cz`: print the quart-sampled biome name for every
+/// `MEGU_BIOME_DUMP=cx,sy,cz`: print the quart-sampled biome name for every
 /// 4x4x4 cell of one section, to compare against a saved vanilla chunk.
 pub fn biome_dump(spec: &str) {
     let p: Vec<i32> = spec.split(',').filter_map(|n| n.parse().ok()).collect();
@@ -19596,7 +19596,7 @@ mod wg_tests {
     /// no byte.
     ///
     /// The arms are the configurations the dump runs: the serial reference (no round opened at
-    /// all, which is what `MC_SPINE_GEN_JOBS=1` is), then the same block at 1, 5 and 8 workers
+    /// all, which is what `MEGU_GEN_JOBS=1` is), then the same block at 1, 5 and 8 workers
     /// inside one round - so the share is entered on one thread, on five and on eight, and every
     /// arm must produce the same columns and the same section rows chunk for chunk. The Nether
     /// fixture is in it on purpose: seed `-1` is where a cache that leaks across contexts shows
@@ -19612,7 +19612,7 @@ mod wg_tests {
         let resolver = crate::feature::beard_resolver;
         let lo = min_y();
         let hi = min_y() + (max_y() + 1 - min_y()) / 16 * 16 - 16;
-        // The overworld arm is the dump's own block (`MC_SPINE_WG_DUMP_N=8`, seed 0); the Nether
+        // The overworld arm is the dump's own block (`MEGU_WG_DUMP_N=8`, seed 0); the Nether
         // arm is a smaller block of the same fixture seed, because it is here for its structures
         // and not for its size.
         for (preset, seed, n) in [
@@ -19800,7 +19800,7 @@ mod wg_tests {
         );
     }
 
-    /// M3 Slice P1a (`specs/chunk-parallelism`): `MC_SPINE_TERRAIN_STORE_BOUND` decides
+    /// M3 Slice P1a (`specs/chunk-parallelism`): `MEGU_TERRAIN_STORE_BOUND` decides
     /// retention and nothing else. Three arms of the same round — a bound small enough to
     /// evict rows the consumer has not read yet, and the two A/B values — must return the
     /// same section bytes, and each arm's own counters must say whether it dropped a row
@@ -20101,7 +20101,7 @@ mod wg_tests {
     /// level-major priority queue with the serialized demand scan tie-break documented on
     /// [`population_discipline`]. This pinned list is that member for a one-chunk request set, and
     /// it is the whole contract of the default — vanilla fixes the rule, not the sequence, so no
-    /// captured run is reproduced bit-for-bit here (`MC_SPINE_POP_ORDER` is how a comparison
+    /// captured run is reproduced bit-for-bit here (`MEGU_POP_ORDER` is how a comparison
     /// against one recorded order is made).
     ///
     /// Before this discipline the default was a lazy x-then-z 3x3, so this list is 9 entries long

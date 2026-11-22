@@ -19,7 +19,7 @@ def main():
             work,
             classpath,
             ROOT / "tools/structure-oracle/SinglePieceOracle.java",
-            "dev.mcspine.tools.SinglePieceOracle",
+            "dev.megu.tools.SinglePieceOracle",
             out,
             extra_sources=[ROOT / "tools/structure-oracle/NativeHarness.java"],
         )

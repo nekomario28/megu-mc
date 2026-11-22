@@ -6,7 +6,7 @@
 // described only by motion/interior/model keys — nothing in the pipeline
 // knows or cares which block-entity type produced it.
 
-use mc_spine_client_mesh::ber_instancing::*;
+use megu_client_mesh::ber_instancing::*;
 
 const ATLAS: BerAtlasKey = 0;
 const SHELL_MODEL_A: BerModelKey = 10;

@@ -1,4 +1,4 @@
-package net.mcspine.launcher;
+package net.megu.launcher;
 
 import java.io.BufferedReader;
 import java.io.IOException;
@@ -30,37 +30,37 @@ import java.time.format.DateTimeFormatter;
 /** Launcher entry point for the native client, pure-Java integrated server bridge, and Official Launcher self-installer. */
 public final class Main {
     private static final String LOOPBACK = "127.0.0.1";
-    private static final String LIBRARY_COORD = "net.mcspine:bootstrapper:1.0.0";
-    private static final String LIBRARY_REL = "libraries/net/mcspine/bootstrapper/1.0.0/bootstrapper-1.0.0.jar";
+    private static final String LIBRARY_COORD = "net.megu:bootstrapper:1.0.0";
+    private static final String LIBRARY_REL = "libraries/net/megu/bootstrapper/1.0.0/bootstrapper-1.0.0.jar";
     private static final DateTimeFormatter ISO_UTC =
             DateTimeFormatter.ofPattern("yyyy-MM-dd'T'HH:mm:ssxxx").withZone(ZoneOffset.UTC);
     private static final String RUN_SH = """
             #!/bin/sh
-            # mc-spine dedicated server launcher (Linux/macOS).
+            # megu dedicated server launcher (Linux/macOS).
             cd "$(dirname "$0")" || exit 1
             if [ "$EULA" != "TRUE" ] && ! grep -q '^eula=true' eula.txt 2>/dev/null; then
-                echo "mc-spine: agree to the Minecraft EULA first:" >&2
+                echo "megu: agree to the Minecraft EULA first:" >&2
                 echo "  put 'eula=true' into eula.txt, or re-run with EULA=TRUE." >&2
                 exit 1
             fi
-            if [ -x ./mc-spine ]; then
-                exec ./mc-spine "$@"
+            if [ -x ./megu ]; then
+                exec ./megu "$@"
             fi
-            exec mc-spine "$@"
+            exec megu "$@"
             """;
     private static final String RUN_BAT = "@echo off\r\n"
-            + "rem mc-spine dedicated server launcher (Windows).\r\n"
+            + "rem megu dedicated server launcher (Windows).\r\n"
             + "cd /d \"%~dp0\"\r\n"
             + "if /i \"%EULA%\"==\"TRUE\" goto :run\r\n"
             + "findstr /b /l /c:\"eula=true\" eula.txt >nul 2>&1\r\n"
             + "if errorlevel 1 (\r\n"
-            + "    echo mc-spine: agree to the Minecraft EULA first ^(eula=true in eula.txt, or EULA=TRUE^) 1>&2\r\n"
+            + "    echo megu: agree to the Minecraft EULA first ^(eula=true in eula.txt, or EULA=TRUE^) 1>&2\r\n"
             + "    exit /b 1\r\n"
             + ")\r\n"
             + ":run\r\n"
-            + "mc-spine.exe %*\r\n";
+            + "megu.exe %*\r\n";
     private static final String SERVER_README = """
-            mc-spine dedicated server
+            megu dedicated server
             =========================
 
             1. Accept the Minecraft EULA before the first launch. This installer
@@ -74,7 +74,7 @@ public final class Main {
                Extra arguments are forwarded to the server binary via "$@" / %*.
 
             3. --server-bin stages the native binary next to these scripts as
-               mc-spine / mc-spine.exe. Without it the scripts use mc-spine(.exe)
+               megu / megu.exe. Without it the scripts use megu(.exe)
                from this directory or PATH.
             """;
     private static final Set<String> QUICK_PLAY_TARGETS = Set.of(
@@ -88,13 +88,13 @@ public final class Main {
 
     private static int run(String[] args) {
         if (args.length == 0) {
-            if (!"1".equals(System.getenv("MC_SPINE_HEADLESS"))
+            if (!"1".equals(System.getenv("MEGU_HEADLESS"))
                     && !java.awt.GraphicsEnvironment.isHeadless()) {
                 return InstallerGui.show();
             }
             return runSelfInstall(null, "1.21.1", true, null, null);
         }
-        if ("--mc-spine-integrated-watch".equals(args[0])) {
+        if ("--megu-integrated-watch".equals(args[0])) {
             return runIntegratedWatch(args);
         }
         List<String> gameArgs = new ArrayList<>();
@@ -110,10 +110,10 @@ public final class Main {
         boolean installMode = false;
         boolean uninstallMode = false;
         boolean noProfile = false;
-        boolean detach = "1".equals(System.getenv("MC_SPINE_DETACH"));
+        boolean detach = "1".equals(System.getenv("MEGU_DETACH"));
         boolean integrated = false;
-        boolean tokenEnv = "1".equals(System.getenv("MC_SPINE_TOKEN_ENV"));
-        boolean handoffFile = "1".equals(System.getenv("MC_SPINE_HANDOFF_FILE"));
+        boolean tokenEnv = "1".equals(System.getenv("MEGU_TOKEN_ENV"));
+        boolean handoffFile = "1".equals(System.getenv("MEGU_HANDOFF_FILE"));
         for (int i = 0; i < args.length; i++) {
             String arg = args[i];
             if ("--install".equals(arg)) {
@@ -134,7 +134,7 @@ public final class Main {
                 } else if (i + 1 < args.length) {
                     installServerDir = args[++i];
                 } else {
-                    System.err.println("mc-spine launcher: missing value for --install-server");
+                    System.err.println("megu launcher: missing value for --install-server");
                     return 2;
                 }
                 continue;
@@ -145,7 +145,7 @@ public final class Main {
                 } else if (i + 1 < args.length) {
                     serverBin = args[++i];
                 } else {
-                    System.err.println("mc-spine launcher: missing value for --server-bin");
+                    System.err.println("megu launcher: missing value for --server-bin");
                     return 2;
                 }
                 continue;
@@ -166,33 +166,33 @@ public final class Main {
                 mcVersion = arg.substring("--mc-version=".length());
                 continue;
             }
-            if ("--mc-spine-detach".equals(arg)) {
+            if ("--megu-detach".equals(arg)) {
                 detach = true;
                 continue;
             }
-            if ("--mc-spine-integrated".equals(arg)) {
+            if ("--megu-integrated".equals(arg)) {
                 integrated = true;
                 continue;
             }
-            if ("--mc-spine-token-env".equals(arg)) {
+            if ("--megu-token-env".equals(arg)) {
                 tokenEnv = true;
                 continue;
             }
-            if ("--mc-spine-handoff-file".equals(arg)) {
+            if ("--megu-handoff-file".equals(arg)) {
                 handoffFile = true;
                 continue;
             }
-            if ("--mc-spine-handoff-manifest".equals(arg)) {
+            if ("--megu-handoff-manifest".equals(arg)) {
                 if (i + 1 >= args.length) {
-                    System.err.println("mc-spine launcher: missing value for --mc-spine-handoff-manifest");
+                    System.err.println("megu launcher: missing value for --megu-handoff-manifest");
                     return 2;
                 }
                 handoffManifest = args[++i];
                 handoffFile = true;
                 continue;
             }
-            if (arg.startsWith("--mc-spine-handoff-manifest=")) {
-                handoffManifest = arg.substring("--mc-spine-handoff-manifest=".length());
+            if (arg.startsWith("--megu-handoff-manifest=")) {
+                handoffManifest = arg.substring("--megu-handoff-manifest=".length());
                 handoffFile = true;
                 continue;
             }
@@ -212,11 +212,11 @@ public final class Main {
                 } else if (i + 1 < args.length) {
                     value = args[++i];
                 } else {
-                    System.err.println("mc-spine launcher: missing value for " + key);
+                    System.err.println("megu launcher: missing value for " + key);
                     return 2;
                 }
                 if (value.isBlank()) {
-                    System.err.println("mc-spine launcher: empty value for " + key);
+                    System.err.println("megu launcher: empty value for " + key);
                     return 2;
                 }
                 if ("--client-bin".equals(key)) {
@@ -235,11 +235,11 @@ public final class Main {
         }
 
         if (uninstallMode && (installMode || installServerDir != null)) {
-            System.err.println("mc-spine launcher: --uninstall conflicts with install flags");
+            System.err.println("megu launcher: --uninstall conflicts with install flags");
             return 2;
         }
         if (serverBin != null && installServerDir == null) {
-            System.err.println("mc-spine launcher: --server-bin requires --install-server");
+            System.err.println("megu launcher: --server-bin requires --install-server");
             return 2;
         }
         if (installServerDir != null) {
@@ -256,13 +256,13 @@ public final class Main {
         }
 
         if (integrated && (detach || gameDir == null || gameDir.isBlank())) {
-            System.err.println("mc-spine launcher: --mc-spine-integrated requires --gameDir and wait mode");
+            System.err.println("megu launcher: --megu-integrated requires --gameDir and wait mode");
             return 2;
         }
         Path binary = resolveBinary(gameDir, clientBin);
         if (binary == null) {
-            System.err.println("mc-spine launcher: native client not found or not executable "
-                    + "(--client-bin, MC_SPINE_CLIENT_BIN, --gameDir/<name>, "
+            System.err.println("megu launcher: native client not found or not executable "
+                    + "(--client-bin, MEGU_CLIENT_BIN, --gameDir/<name>, "
                     + "--gameDir/bin/<name>, PATH; Unix and Windows .exe names)");
             return 2;
         }
@@ -273,9 +273,9 @@ public final class Main {
         try {
             String expectedSha256 = clientSha256;
             if (expectedSha256 == null) {
-                String profileSha256 = System.getProperty("mc.spine.clientSha256");
+                String profileSha256 = System.getProperty("megu.clientSha256");
                 expectedSha256 = profileSha256 != null && !profileSha256.isBlank()
-                        ? profileSha256 : System.getenv("MC_SPINE_CLIENT_SHA256");
+                        ? profileSha256 : System.getenv("MEGU_CLIENT_SHA256");
             }
             verifySha256(binary, expectedSha256);
             ensureExecutable(binary);
@@ -285,10 +285,10 @@ public final class Main {
             }
             String mode = detach ? "detach" : "wait";
             ProcessBuilder builder = new ProcessBuilder(command).inheritIO();
-            builder.environment().put("MC_SPINE_HANDOFF_JSON",
+            builder.environment().put("MEGU_HANDOFF_JSON",
                     handoffJson(mode, -1, gameArgs.size(), null));
             if (launcherAccessToken != null && !launcherAccessToken.isEmpty()) {
-                builder.environment().put("MC_SPINE_LAUNCHER_ACCESS_TOKEN", launcherAccessToken);
+                builder.environment().put("MEGU_LAUNCHER_ACCESS_TOKEN", launcherAccessToken);
             }
             Process process = builder.start();
             if (handoffPath != null) {
@@ -299,11 +299,11 @@ public final class Main {
             }
             return process.waitFor();
         } catch (IOException error) {
-            System.err.println("mc-spine launcher: " + redact(error.getMessage(), gameArgs));
+            System.err.println("megu launcher: " + redact(error.getMessage(), gameArgs));
             return 2;
         } catch (InterruptedException error) {
             Thread.currentThread().interrupt();
-            System.err.println("mc-spine launcher: interrupted while waiting for native client");
+            System.err.println("megu launcher: interrupted while waiting for native client");
             return 1;
         }
     }
@@ -316,7 +316,7 @@ public final class Main {
                     writeProfile, clientBin, clientSha256));
             return 0;
         } catch (IOException | InvalidPathException error) {
-            System.err.println("mc-spine launcher: install failed: " + error.getMessage());
+            System.err.println("megu launcher: install failed: " + error.getMessage());
             return 2;
         }
     }
@@ -327,7 +327,7 @@ public final class Main {
                     updateProfile));
             return 0;
         } catch (IOException | InvalidPathException error) {
-            System.err.println("mc-spine launcher: uninstall failed: " + error.getMessage());
+            System.err.println("megu launcher: uninstall failed: " + error.getMessage());
             return 2;
         }
     }
@@ -337,7 +337,7 @@ public final class Main {
             System.out.println(installServer(Path.of(directory), serverBin));
             return 0;
         } catch (IOException | InvalidPathException error) {
-            System.err.println("mc-spine launcher: server install failed: " + error.getMessage());
+            System.err.println("megu launcher: server install failed: " + error.getMessage());
             return 2;
         }
     }
@@ -421,7 +421,7 @@ public final class Main {
             }
             boolean exe = binary.getFileName().toString()
                     .toLowerCase(Locale.ROOT).endsWith(".exe");
-            Path staged = dir.resolve(exe ? "mc-spine.exe" : "mc-spine");
+            Path staged = dir.resolve(exe ? "megu.exe" : "megu");
             refuseSymlink(staged);
             Files.copy(binary, staged, StandardCopyOption.REPLACE_EXISTING);
             makeExecutable(staged);
@@ -436,14 +436,14 @@ public final class Main {
         makeExecutable(runSh);
         atomicWriteString(runBat, RUN_BAT);
         atomicWriteString(readme, SERVER_README);
-        return "Installed mc-spine server launcher into " + dir;
+        return "Installed megu server launcher into " + dir;
     }
 
     private static String versionId(String mcVersion) throws IOException {
         if (!"1.21.1".equals(mcVersion) && !"26.3".equals(mcVersion)) {
             throw new IOException("unsupported --mc-version: " + mcVersion);
         }
-        return "mc-spine-" + mcVersion;
+        return "megu-" + mcVersion;
     }
 
     private static String isoNow() {
@@ -455,16 +455,16 @@ public final class Main {
         String now = isoNow();
         List<String> jvm = new ArrayList<>();
         if (pinnedBin != null) {
-            jvm.add("-Dmc.spine.clientBin=" + pinnedBin);
+            jvm.add("-Dmegu.clientBin=" + pinnedBin);
         }
         if (clientSha256 != null && !clientSha256.isBlank()) {
-            jvm.add("-Dmc.spine.clientSha256=" + clientSha256.toLowerCase(Locale.ROOT));
+            jvm.add("-Dmegu.clientSha256=" + clientSha256.toLowerCase(Locale.ROOT));
         }
         StringBuilder json = new StringBuilder("{\n")
                 .append("  \"id\": \"").append(escapeJson(versionId)).append("\",\n")
                 .append("  \"inheritsFrom\": \"").append(escapeJson(mcVersion)).append("\",\n")
                 .append("  \"type\": \"release\",\n")
-                .append("  \"mainClass\": \"net.mcspine.launcher.Main\",\n")
+                .append("  \"mainClass\": \"net.megu.launcher.Main\",\n")
                 .append("  \"releaseTime\": \"").append(now).append("\",\n")
                 .append("  \"time\": \"").append(now).append("\",\n");
         if (!jvm.isEmpty()) {
@@ -828,7 +828,7 @@ public final class Main {
     private static void atomicWriteString(Path destination, String content) throws IOException {
         Path parent = destination.toAbsolutePath().getParent();
         Files.createDirectories(parent);
-        Path temp = Files.createTempFile(parent, ".mc-spine-", ".tmp");
+        Path temp = Files.createTempFile(parent, ".megu-", ".tmp");
         try {
             Files.writeString(temp, content, StandardCharsets.UTF_8);
             Files.move(temp, destination, StandardCopyOption.REPLACE_EXISTING);
@@ -856,7 +856,7 @@ public final class Main {
             cmd.add(System.getProperty("java.class.path", "."));
             cmd.add(Main.class.getName());
         }
-        cmd.add("--mc-spine-integrated-watch");
+        cmd.add("--megu-integrated-watch");
         cmd.add(gameDir);
         cmd.add("--");
         cmd.addAll(client);
@@ -864,11 +864,11 @@ public final class Main {
                 .redirectOutput(ProcessBuilder.Redirect.INHERIT)
                 .redirectError(ProcessBuilder.Redirect.INHERIT);
         if (accessToken != null && !accessToken.isEmpty()) {
-            builder.environment().put("MC_SPINE_LAUNCHER_ACCESS_TOKEN", accessToken);
+            builder.environment().put("MEGU_LAUNCHER_ACCESS_TOKEN", accessToken);
         }
         if (handoffFile && handoffPath != null) {
-            builder.environment().put("MC_SPINE_HANDOFF_FILE", "1");
-            builder.environment().put("MC_SPINE_HANDOFF_MANIFEST", handoffPath);
+            builder.environment().put("MEGU_HANDOFF_FILE", "1");
+            builder.environment().put("MEGU_HANDOFF_MANIFEST", handoffPath);
         }
         Process bridge = builder.start();
         try (var parentPipe = bridge.getOutputStream()) {
@@ -880,7 +880,7 @@ public final class Main {
     /** Pure-Java integrated server & client coordinator (zero python3 dependency on Windows/macOS/Linux). */
     private static int runIntegratedWatch(String[] args) {
         if (args.length < 4 || !"--".equals(args[2])) {
-            System.err.println("mc-spine integrated: malformed internal watch arguments");
+            System.err.println("megu integrated: malformed internal watch arguments");
             return 2;
         }
         Path gameDir = Path.of(args[1]).toAbsolutePath().normalize();
@@ -899,7 +899,7 @@ public final class Main {
             } finally {
                 stopping.set(true);
             }
-        }, "mc-spine-parent-eof");
+        }, "megu-parent-eof");
         parentWatch.setDaemon(true);
         parentWatch.start();
 
@@ -908,12 +908,12 @@ public final class Main {
         try {
             Path serverBin = resolveServerBinary(gameDir);
             if (serverBin == null) {
-                throw new IOException("mc-spine server not found or not executable (MC_SPINE_SERVER_BIN, --gameDir, PATH)");
+                throw new IOException("megu server not found or not executable (MEGU_SERVER_BIN, --gameDir, PATH)");
             }
             ensureExecutable(serverBin);
-            String worldName = System.getenv("MC_SPINE_INTEGRATED_WORLD");
+            String worldName = System.getenv("MEGU_INTEGRATED_WORLD");
             if (worldName == null || worldName.isBlank()) {
-                worldName = "mc-spine";
+                worldName = "megu";
             }
             if (!worldName.matches("[a-zA-Z0-9 _-]{1,64}") || ".".equals(worldName) || "..".equals(worldName)) {
                 throw new IOException("world must be a single safe directory name");
@@ -936,12 +936,12 @@ public final class Main {
             sb.directory(world.toFile());
             sb.redirectErrorStream(true);
             Map<String, String> env = sb.environment();
-            env.put("MC_SPINE_BIND_ADDR", LOOPBACK);
-            env.put("MC_SPINE_PORT", Integer.toString(port));
-            env.put("MC_SPINE_WORLD_DIR", world.toString());
-            env.put("MC_SPINE_RESOURCE_PACK_URL", "");
-            env.put("MC_SPINE_MAX_CONN_PER_IP", "1");
-            env.remove("MC_SPINE_RCON_PORT");
+            env.put("MEGU_BIND_ADDR", LOOPBACK);
+            env.put("MEGU_PORT", Integer.toString(port));
+            env.put("MEGU_WORLD_DIR", world.toString());
+            env.put("MEGU_RESOURCE_PACK_URL", "");
+            env.put("MEGU_MAX_CONN_PER_IP", "1");
+            env.remove("MEGU_RCON_PORT");
             server = sb.start();
             server.getOutputStream().close();
 
@@ -953,7 +953,7 @@ public final class Main {
                         new InputStreamReader(finalServer.getInputStream(), StandardCharsets.UTF_8))) {
                     String line;
                     while ((line = reader.readLine()) != null) {
-                        if (line.startsWith("mc-spine ") && line.contains(banner)) {
+                        if (line.startsWith("megu ") && line.contains(banner)) {
                             ready.countDown();
                         }
                         System.err.println(line);
@@ -961,7 +961,7 @@ public final class Main {
                 } catch (IOException ignored) {
                     // Server closed output.
                 }
-            }, "mc-spine-server-log");
+            }, "megu-server-log");
             logReader.setDaemon(true);
             logReader.start();
 
@@ -985,11 +985,11 @@ public final class Main {
             }
             List<String> clientCmd = buildIntegratedClientCommand(client, endpoint);
             ProcessBuilder cb = new ProcessBuilder(clientCmd).inheritIO();
-            cb.environment().put("MC_SPINE_HANDOFF_JSON",
+            cb.environment().put("MEGU_HANDOFF_JSON",
                     handoffJson("integrated", -1, clientCmd.size() - 1, endpoint));
             clientProc = cb.start();
             String handoffPath = handoffManifestPath(null, gameDir.toString());
-            if ("1".equals(System.getenv("MC_SPINE_HANDOFF_FILE")) && handoffPath != null) {
+            if ("1".equals(System.getenv("MEGU_HANDOFF_FILE")) && handoffPath != null) {
                 writeHandoffManifest(Path.of(handoffPath), "integrated", clientProc.pid(),
                         clientCmd.size() - 1, endpoint);
             }
@@ -1002,7 +1002,7 @@ public final class Main {
             }
             return clientProc.exitValue();
         } catch (IOException error) {
-            System.err.println("mc-spine integrated: " + redact(error.getMessage(), client));
+            System.err.println("megu integrated: " + redact(error.getMessage(), client));
             return 2;
         } catch (InterruptedException error) {
             Thread.currentThread().interrupt();
@@ -1035,7 +1035,7 @@ public final class Main {
     }
 
     private static void linkRuntimeData(Path world, Path binary, Path gameDir) throws IOException {
-        String configured = System.getenv("MC_SPINE_SERVER_HOME");
+        String configured = System.getenv("MEGU_SERVER_HOME");
         List<Path> candidates = new ArrayList<>();
         if (configured != null && !configured.isBlank()) {
             candidates.add(Path.of(configured).toAbsolutePath().normalize());
@@ -1054,7 +1054,7 @@ public final class Main {
             }
         }
         if (home == null && configured != null && !configured.isBlank()) {
-            throw new IOException("MC_SPINE_SERVER_HOME must contain config_packets.bin and assets");
+            throw new IOException("MEGU_SERVER_HOME must contain config_packets.bin and assets");
         }
         if (home == null) {
             return;
@@ -1087,13 +1087,13 @@ public final class Main {
     }
 
     private static Path resolveServerBinary(Path gameDir) {
-        String configured = System.getenv("MC_SPINE_SERVER_BIN");
+        String configured = System.getenv("MEGU_SERVER_BIN");
         if (configured != null && !configured.isBlank()) {
             return regularFile(configured);
         }
         List<String> names = isWindows()
-                ? List.of("mc-spine.exe", "mc-spine")
-                : List.of("mc-spine", "mc-spine.exe");
+                ? List.of("megu.exe", "megu")
+                : List.of("megu", "megu.exe");
         for (String sub : new String[]{"", "bin/"}) {
             for (String n : names) {
                 Path p = regularFile(gameDir.resolve(sub + n).toString());
@@ -1131,9 +1131,9 @@ public final class Main {
     }
 
     private static List<String> binaryNames() {
-        String[] unix = {"mc-spine-client-gpu", "mc-spine-client", "megu", "mc-spine"};
-        String[] windows = {"mc-spine-client-gpu.exe", "mc-spine-client.exe",
-                            "megu.exe", "mc-spine.exe"};
+        String[] unix = {"megu-client-gpu", "megu-client", "megu", "megu"};
+        String[] windows = {"megu-client-gpu.exe", "megu-client.exe",
+                            "megu.exe", "megu.exe"};
         boolean windowsOs = isWindows();
         List<String> names = new ArrayList<>();
         for (String name : windowsOs ? windows : unix) {
@@ -1165,11 +1165,11 @@ public final class Main {
         if (clientBin != null) {
             return regularFile(clientBin);
         }
-        String configured = System.getenv("MC_SPINE_CLIENT_BIN");
+        String configured = System.getenv("MEGU_CLIENT_BIN");
         if (configured != null && !configured.isBlank()) {
             return regularFile(configured);
         }
-        String property = System.getProperty("mc.spine.clientBin");
+        String property = System.getProperty("megu.clientBin");
         if (property != null && !property.isBlank()) {
             return regularFile(property);
         }
@@ -1252,12 +1252,12 @@ public final class Main {
         if (override != null && !override.isBlank()) {
             return override;
         }
-        String configured = System.getenv("MC_SPINE_HANDOFF_MANIFEST");
+        String configured = System.getenv("MEGU_HANDOFF_MANIFEST");
         if (configured != null && !configured.isBlank()) {
             return configured;
         }
         if (gameDir != null && !gameDir.isBlank()) {
-            return Path.of(gameDir).resolve(".mc-spine-handoff.json").toString();
+            return Path.of(gameDir).resolve(".megu-handoff.json").toString();
         }
         return null;
     }

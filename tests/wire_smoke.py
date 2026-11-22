@@ -62,7 +62,7 @@ def status(game_port):
         sock.sendall(frame(0, handshake) + frame(0))
         n = recv_vint(sock)
         response = recv_exact(sock, n)
-        assert b"mc-spine" in response and b"767" in response, response[:100]
+        assert b"megu" in response and b"767" in response, response[:100]
 
 
 def malformed_handshake(game_port):
@@ -103,10 +103,10 @@ def main():
     game, rcon = port(), port()
     assert game != rcon
     env = os.environ.copy()
-    env.update(MC_SPINE_PORT=str(game), MC_SPINE_RCON_PORT=str(rcon),
-               MC_SPINE_RCON_PASS="local-test-secret", MC_SPINE_WG="old",
-               MC_SPINE_BIND_ADDR="127.0.0.1")
-    with tempfile.TemporaryDirectory(prefix="mc-spine-smoke-") as workdir:
+    env.update(MEGU_PORT=str(game), MEGU_RCON_PORT=str(rcon),
+               MEGU_RCON_PASS="local-test-secret", MEGU_WG="old",
+               MEGU_BIND_ADDR="127.0.0.1")
+    with tempfile.TemporaryDirectory(prefix="megu-smoke-") as workdir:
         proc = subprocess.Popen([str(binary)], cwd=workdir, env=env,
                                 stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         try:

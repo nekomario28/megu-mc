@@ -4,8 +4,8 @@
 //! discriminator change, and fail closed on corrupt input — never panic,
 //! never serve stale bytes.
 
-use mc_spine_core::version::TargetVersion;
-use mc_spine_server_files::{
+use megu_core::version::TargetVersion;
+use megu_server_files::{
     look_dir_from_yaw, CacheLookup, CacheMissReason, ChunkWireKey, DirectionalChunkQueue,
     SharedChunkWireCache, StartupBinaryCache, StartupInputFile, StartupInputFingerprint,
     CACHE_SCHEMA_VERSION, STARTUP_CACHE_MAGIC,
@@ -23,7 +23,7 @@ struct TestDir(PathBuf);
 impl TestDir {
     fn new(tag: &str) -> Self {
         let dir = std::env::temp_dir().join(format!(
-            "mc-spine-perf-cache-{}-{}-{tag}",
+            "megu-perf-cache-{}-{}-{tag}",
             std::process::id(),
             DIR_COUNTER.fetch_add(1, Ordering::Relaxed)
         ));
@@ -421,7 +421,7 @@ fn degenerate_look_vector_still_covers_the_whole_square_deterministically() {
 fn packs() -> Vec<String> {
     vec![
         "vanilla".to_owned(),
-        "file/mc-spine-base.zip".to_owned(),
+        "file/megu-base.zip".to_owned(),
         "file/extra-tweaks.zip".to_owned(),
     ]
 }
@@ -429,11 +429,11 @@ fn packs() -> Vec<String> {
 fn input_files() -> Vec<StartupInputFile> {
     vec![
         StartupInputFile::from_contents(
-            "world/datapacks/mc-spine-base/data/mc/recipes/ingot.json",
+            "world/datapacks/megu-base/data/mc/recipes/ingot.json",
             b"{\"type\":\"minecraft:crafting_shaped\"}",
         ),
         StartupInputFile::from_contents(
-            "world/datapacks/mc-spine-base/pack.mcmeta",
+            "world/datapacks/megu-base/pack.mcmeta",
             b"{\"pack\":{\"pack_format\":48}}",
         ),
         StartupInputFile::from_contents("server.properties", b"view-distance=10\n"),

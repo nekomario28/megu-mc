@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: LGPL-3.0-or-later OR GPL-3.0-or-later OR AGPL-3.0-or-later
-//! Player-facing graphics settings for the native mc-spine client.
+//! Player-facing graphics settings for the native megu client.
 //!
 //! Design rule (low cognitive load): optimizations with zero player-visible
 //! downside are ALWAYS ON under the hood and deliberately have no toggle —
@@ -9,14 +9,14 @@
 //! lighting, entity shadows, FOV, VSync, an FPS cap, and the GPU backend
 //! preference.
 //!
-//! Persistence is human-readable TOML (`mc-spine-client.toml`) plus a
+//! Persistence is human-readable TOML (`megu-client.toml`) plus a
 //! [`ClientSettings::import_vanilla_options_txt`] helper so players migrating
 //! from the official launcher keep their FOV, render distance, clouds,
 //! particles, and VSync automatically. Pure std Rust; zero dependencies.
 
 use std::path::Path;
 
-use mc_spine_client_mesh::RenderBackendPreference;
+use megu_client_mesh::RenderBackendPreference;
 
 use crate::crash_reporter::{parse_report_url, CrashSubmitPolicy};
 
@@ -72,7 +72,7 @@ pub const DISTANT_HORIZON_FAR_CHUNKS: i32 = 128;
 /// LOD summary memory budget shared by every distant-horizon level.
 const LOD_MEMORY_BUDGET_BYTES: usize = 64 * 1024 * 1024;
 /// Default filename for [`ClientSettings::to_toml`] output.
-pub const SETTINGS_FILE_NAME: &str = "mc-spine-client.toml";
+pub const SETTINGS_FILE_NAME: &str = "megu-client.toml";
 
 /// Named bundle of player-visible settings.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -157,7 +157,7 @@ named_option!(ParticleLevel, ParticleLevel::All,
 /// the game slower. This is also the coverage matrix behind the launcher's
 /// built-in optimization catalog — every capability is an original
 /// clean-room Rust implementation inside `client-port` / `client-app` /
-/// `mc-spine`; no third-party optimization-mod code, shaders, assets, or
+/// `megu`; no third-party optimization-mod code, shaders, assets, or
 /// logic is ever copied or linked (see
 /// `specs/client-fork/ux-and-builtin-optimizations.md`).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -550,7 +550,7 @@ impl ClientSettings {
         BuiltInOptimizations::ALL_ON
     }
 
-    /// Serialize to the human-readable `mc-spine-client.toml` format.
+    /// Serialize to the human-readable `megu-client.toml` format.
     pub fn to_toml(&self) -> String {
         let max_fps = self
             .max_fps
@@ -580,7 +580,7 @@ impl ClientSettings {
             }
         }
         format!(
-            "# mc-spine client settings\n\
+            "# megu client settings\n\
              preset = \"{}\"\n\
              view_distance = {}\n\
              distant_horizon = \"{}\"\n\
@@ -644,7 +644,7 @@ impl ClientSettings {
         )
     }
 
-    /// Parse a `mc-spine-client.toml` document. Returns the resolved
+    /// Parse a `megu-client.toml` document. Returns the resolved
     /// settings plus one warning string per unknown key, invalid value, or
     /// clamped out-of-range value — malformed files degrade gracefully to
     /// defaults instead of failing.
@@ -653,7 +653,7 @@ impl ClientSettings {
         (settings, warnings)
     }
 
-    /// Apply only the keys a `mc-spine-client.toml` document actually
+    /// Apply only the keys a `megu-client.toml` document actually
     /// defines onto `self`, keeping every field the file does not mention.
     /// Returns the same warnings [`ClientSettings::from_toml`] would.
     pub fn apply_toml(&mut self, text: &str) -> Vec<String> {
@@ -1152,7 +1152,7 @@ impl ClientSettings {
         if let Some(v) = get("maxFps").and_then(parse_i64) {
             applied = true;
             // Vanilla's slider tops out at 260, which its UI shows as
-            // "Unlimited"; mc-spine's own cap now extends to 2000.
+            // "Unlimited"; megu's own cap now extends to 2000.
             self.max_fps = if v >= VANILLA_OPTIONS_UNLIMITED_FPS {
                 None
             } else {
@@ -1185,7 +1185,7 @@ pub enum SettingsFlush {
 }
 
 /// Debounced, dirty-only persistence gate for the settings file
-/// (`mc-spine-client.toml`) and any equally serialized blob such as an
+/// (`megu-client.toml`) and any equally serialized blob such as an
 /// exported `options.txt`.
 ///
 /// While the player drags sliders or flips toggles, UI code only updates
@@ -1657,7 +1657,7 @@ mod tests {
     #[test]
     fn write_toml_round_trips_through_from_toml() {
         let dir = std::env::temp_dir().join(format!(
-            "mc-spine-settings-test-{}",
+            "megu-settings-test-{}",
             std::process::id()
         ));
         std::fs::create_dir_all(&dir).unwrap();

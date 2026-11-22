@@ -4,12 +4,12 @@ Phase E Wave 4, Lane E4-15. The acceptance target is a clean-room Java 21
 dedicated-server probe running synthetic mod JARs. It exercises callback decisions
 and Java-local registration in a fresh JVM. The
 [Fabric foundation probe](../../compat/fabric-probe/README.md) covers the separate
-pinned Seed Protect path through Fabric Loader and mc-spine.
+pinned Seed Protect path through Fabric Loader and megu.
 
 ## Admission and startup
 
 The adapter stages private copies of the submitted JARs and checks them with
-[FabricShimCheck](../../compat/fabric-probe/java/net/mcspine/probe/FabricShimCheck.java)
+[FabricShimCheck](../../compat/fabric-probe/java/net/megu/probe/FabricShimCheck.java)
 and its [policy driver](../../compat/fabric-probe/fabric_shimcheck.py). The runtime
 JAR embeds the [exact symbol surface](../../compat/fabric-probe/shim-surface.json)
 for admission. A plain static audit can report S0 compatibility for a legacy

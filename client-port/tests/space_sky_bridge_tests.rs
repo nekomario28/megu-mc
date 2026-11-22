@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: LGPL-3.0-or-later OR GPL-3.0-or-later OR AGPL-3.0-or-later
 
-use mc_spine_client_mesh::space_sky_bridge::*;
-use mc_spine_client_mesh::vanilla_plus_3d::ExtrudedMesh;
+use megu_client_mesh::space_sky_bridge::*;
+use megu_client_mesh::vanilla_plus_3d::ExtrudedMesh;
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -129,7 +129,7 @@ fn orbit_meta() -> PlanetDimensionMeta {
 fn earthlike_meta() -> PlanetDimensionMeta {
     load_planet_meta_json(
         r#"{
-            "dimension_id": "mcspine:terra_nova",
+            "dimension_id": "megu:terra_nova",
             "gravity_scale": 0.95,
             "atmosphere_density": 1.0,
             "has_oxygen": true,
@@ -138,7 +138,7 @@ fn earthlike_meta() -> PlanetDimensionMeta {
             "star_brightness_boost": 1.0,
             "sky_bodies": [
                 {
-                    "id": "mcspine:ringed_gemini",
+                    "id": "megu:ringed_gemini",
                     "angular_radius_deg": 14.0,
                     "orbit_period_ticks": 96000,
                     "orbit_phase_offset": 0.25,
@@ -304,7 +304,7 @@ fn earthlike_keeps_clouds_seasons_and_ringed_neighbour() {
     assert!(policy.render_builtin_planets);
     assert_eq!(policy.sky_bodies.len(), 1);
     let neighbour = &policy.sky_bodies[0];
-    assert_eq!(neighbour.id, "mcspine:ringed_gemini");
+    assert_eq!(neighbour.id, "megu:ringed_gemini");
     assert!(neighbour.ring.is_some());
 }
 
@@ -451,9 +451,9 @@ fn atmosphere_rim_adds_shell_quads() {
 // ---------------------------------------------------------------------------
 
 #[test]
-fn parses_mcspine_schema() {
+fn parses_megu_schema() {
     let meta = earthlike_meta();
-    assert_eq!(meta.dimension_id, "mcspine:terra_nova");
+    assert_eq!(meta.dimension_id, "megu:terra_nova");
     assert_eq!(meta.gravity_scale, 0.95);
     assert_eq!(meta.atmosphere_density, 1.0);
     assert!(meta.has_oxygen);

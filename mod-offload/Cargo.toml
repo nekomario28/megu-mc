@@ -3,7 +3,7 @@ name = "mod-offload"
 version = "0.1.0"
 edition = "2021"
 license = "LGPL-3.0-or-later"
-description = "Standalone factory simulation kernel prototypes for mc-spine"
+description = "Standalone factory simulation kernel prototypes for megu"
 publish = false
 
 [lib]

@@ -1,50 +1,50 @@
 // SPDX-License-Identifier: LGPL-3.0-or-later OR GPL-3.0-or-later OR AGPL-3.0-or-later
-//! End-to-end tests for `mc-spine-client-ui`: every screen must lay out
+//! End-to-end tests for `megu-client-ui`: every screen must lay out
 //! with zero overlapping interactive hitboxes and rasterize to non-blank
 //! pixels at both `1280×720` and `640×360`, and every interactive flow
 //! (FPS cap, QoL toggles, fair-play, mod-sync consent, crash send gate)
 //! must behave through the real input router.
 
-use mc_spine_client_ui::draw::{
+use megu_client_ui::draw::{
     encode_png_rgba, font_atlas_rgba, glyph_for, rasterize_draw_list, tessellate_draw_list,
     text_height, text_width, UiColor, UiCommand, UiDrawList, UiRect, FONT_ATLAS_HEIGHT,
     FONT_ATLAS_WIDTH,
 };
-use mc_spine_client_ui::magic_hud::{
+use megu_client_ui::magic_hud::{
     CastBarState, CooldownSlotState, MagicHudState, StatusBadgeState,
 };
-use mc_spine_client_ui::mod_menu::{ModMenuEntry, ModMenuState, ModMenuWidgetId};
-use mc_spine_client_ui::recipe_browser::{
+use megu_client_ui::mod_menu::{ModMenuEntry, ModMenuState, ModMenuWidgetId};
+use megu_client_ui::recipe_browser::{
     BrowserTab, ItemEntry, PonderScene, PonderStep, RecipeBrowserState, RecipeIndex,
     RecipeWidgetId,
 };
-use mc_spine_client_ui::state::{
+use megu_client_ui::state::{
     invite_code_display, invite_code_parse, CraftingConflictOverlay, CrashReportMode,
     GamepadButton, HitRegion, HudSubtitle, LanguageSetting, MiniHudPreset, MinimapMode,
     ModSyncEntry, PlayerRadarScope, Screen, SettingsTab, SubtitleDirection, UiAction, UiInputEvent,
     UiKey, UiLang, UiModal, UiState, WidgetId, CRASH_PREVIEW_MAX_BYTES,
 };
-use mc_spine_core::crash_report::CrashContext;
-use mc_spine_core::sys_metrics::{MiniHudAnchor, MiniHudConfig, MiniHudData};
+use megu_core::crash_report::CrashContext;
+use megu_core::sys_metrics::{MiniHudAnchor, MiniHudConfig, MiniHudData};
 
 const SIZES: [(u32, u32); 2] = [(1280, 720), (640, 360)];
 const HIT_SIZES: [(u32, u32); 4] = [(640, 360), (1280, 720), (1920, 1080), (3840, 2160)];
 
 /// Every screen the UI can show, with the state needed to render it.
 fn all_screens(ui: &mut UiState) -> Vec<Screen> {
-    ui.hud = mc_spine_client_ui::state::HudState::demo();
+    ui.hud = megu_client_ui::state::HudState::demo();
     ui.hud.show_player_list = true;
     ui.pending_mod_sync = vec![
         ModSyncEntry::added("create", "aabbccddee001122334455667788990011"),
         ModSyncEntry {
             name: "jei".to_string(),
             sha256_hex: "ff00ff00ff00ff00ff00ff00ff00ff00".to_string(),
-            change: mc_spine_client_ui::state::ModSyncChange::Updated,
+            change: megu_client_ui::state::ModSyncChange::Updated,
         },
         ModSyncEntry {
             name: "old-mod".to_string(),
             sha256_hex: "11".repeat(32),
-            change: mc_spine_client_ui::state::ModSyncChange::Removed,
+            change: megu_client_ui::state::ModSyncChange::Removed,
         },
     ];
     ui.missing_mod_deps = vec!["create".into(), "jei".into()];
@@ -351,7 +351,7 @@ fn title_links_respect_support_preference_and_report_is_always_accessible() {
             .commands
             .iter()
             .find_map(|cmd| match cmd {
-                UiCommand::Text { y, text, .. } if text.starts_with("mc-spine client-ui") => {
+                UiCommand::Text { y, text, .. } if text.starts_with("megu client-ui") => {
                     Some(*y)
                 }
                 _ => None,
@@ -1022,7 +1022,7 @@ fn escape_navigation_and_pause() {
 #[test]
 fn hud_tab_list_toggles_and_rasterizes() {
     let mut ui = UiState::new();
-    ui.hud = mc_spine_client_ui::state::HudState::demo();
+    ui.hud = megu_client_ui::state::HudState::demo();
     ui.screen = Screen::InGameHud;
     ui.render(1280, 720);
     assert!(ui.hit_regions.is_empty(), "HUD must not eat clicks");
@@ -1048,7 +1048,7 @@ fn minihud_and_subtitles_default_off_and_emit_zero_commands() {
     assert_eq!(ui.settings.qol.mini_hud_preset(), MiniHudPreset::Off);
     assert!(ui.hud.mini_hud_data.fps.is_none());
     assert!(ui.hud.subtitles.is_empty());
-    assert!(!mc_spine_client_ui::state::QolSettings::default()
+    assert!(!megu_client_ui::state::QolSettings::default()
         .mini_hud
         .enabled);
 
@@ -1156,7 +1156,7 @@ fn minihud_basic_and_advanced_render_in_bounds_at_every_anchor() {
     ] {
         let mut ui = UiState::new();
         ui.screen = Screen::InGameHud;
-        ui.hud = mc_spine_client_ui::state::HudState::demo();
+        ui.hud = megu_client_ui::state::HudState::demo();
         ui.hud.mini_hud_data = populated_mini_hud_data();
         ui.settings.qol.mini_hud = MiniHudConfig {
             enabled: true,
@@ -1218,7 +1218,7 @@ fn minihud_basic_and_advanced_render_in_bounds_at_every_anchor() {
 fn directional_subtitles_render_markers_and_cap_at_four_rows() {
     let mut ui = UiState::new();
     ui.screen = Screen::InGameHud;
-    ui.hud = mc_spine_client_ui::state::HudState::demo();
+    ui.hud = megu_client_ui::state::HudState::demo();
     // Six entries: the two oldest must be trimmed to the 4-row cap.
     ui.hud.subtitles = vec![
         HudSubtitle {
@@ -1275,7 +1275,7 @@ fn font_covers_ascii_and_fallback() {
     assert!(glyph_for(' ').iter().all(|&b| b == 0));
     assert!(glyph_for('あ').iter().any(|&b| b != 0));
     assert_ne!(glyph_for('あ'), glyph_for('A'));
-    assert_eq!(text_width("MC-SPINE", 1), 8 * 8);
+    assert_eq!(text_width("MEGU", 1), 8 * 8);
     assert_eq!(text_width("ab\ncd", 2), 4 * 8);
 }
 
@@ -1298,21 +1298,21 @@ fn tessellation_and_atlas_are_real() {
     let mut list = UiDrawList::new();
     list.fill_rect(
         UiRect::new(0, 0, 64, 32),
-        mc_spine_client_ui::draw::UiColor::rgb(255, 0, 0),
+        megu_client_ui::draw::UiColor::rgb(255, 0, 0),
     );
     list.text(
         2,
         2,
         1,
-        mc_spine_client_ui::draw::UiColor::rgb(255, 255, 255),
+        megu_client_ui::draw::UiColor::rgb(255, 255, 255),
         "Hi",
     );
     list.progress_bar(
         UiRect::new(0, 40, 100, 10),
         0.5,
-        mc_spine_client_ui::draw::UiColor::rgb(0, 255, 0),
-        mc_spine_client_ui::draw::UiColor::rgb(0, 0, 0),
-        mc_spine_client_ui::draw::UiColor::rgb(80, 80, 80),
+        megu_client_ui::draw::UiColor::rgb(0, 255, 0),
+        megu_client_ui::draw::UiColor::rgb(0, 0, 0),
+        megu_client_ui::draw::UiColor::rgb(80, 80, 80),
     );
     let mesh = tessellate_draw_list(640, 360, &list);
     assert!(!mesh.vertices.is_empty());
@@ -1341,18 +1341,18 @@ fn draw_commands_match_spec_shape() {
     let mut list = UiDrawList::new();
     list.push(UiCommand::FillRect {
         rect: UiRect::new(0, 0, 10, 10),
-        color: mc_spine_client_ui::draw::UiColor::rgb(1, 2, 3),
+        color: megu_client_ui::draw::UiColor::rgb(1, 2, 3),
     });
     list.push(UiCommand::BorderRect {
         rect: UiRect::new(0, 0, 10, 10),
-        color: mc_spine_client_ui::draw::UiColor::rgb(255, 255, 255),
+        color: megu_client_ui::draw::UiColor::rgb(255, 255, 255),
         thickness: 1,
     });
     list.push(UiCommand::Text {
         x: 0,
         y: 0,
         scale: 1,
-        color: mc_spine_client_ui::draw::UiColor::rgb(255, 255, 255),
+        color: megu_client_ui::draw::UiColor::rgb(255, 255, 255),
         text: "ok".to_string(),
     });
     assert_eq!(list.len(), 3);
@@ -1363,7 +1363,7 @@ fn draw_commands_match_spec_shape() {
 #[test]
 fn render_into_reuses_draw_list_buffers_and_recycles_text_heaps() {
     let mut ui = UiState::new();
-    ui.hud = mc_spine_client_ui::state::HudState::demo();
+    ui.hud = megu_client_ui::state::HudState::demo();
     ui.navigate(Screen::InGameHud);
 
     let mut list = UiDrawList::new();
@@ -1396,7 +1396,7 @@ fn render_into_reuses_draw_list_buffers_and_recycles_text_heaps() {
         0,
         0,
         1,
-        mc_spine_client_ui::draw::UiColor::rgb(1, 2, 3),
+        megu_client_ui::draw::UiColor::rgb(1, 2, 3),
         "hud",
     );
     assert_eq!(list.recycled_text_buffer_count(), text_count - 1);
@@ -1555,7 +1555,7 @@ fn recipe_browser_opens_from_pause_with_ponder_and_done_back() {
 fn crafting_conflict_overlay_is_zero_clutter_until_two_candidates() {
     let mut ui = UiState::new();
     ui.screen = Screen::InGameHud;
-    ui.hud = mc_spine_client_ui::state::HudState::demo();
+    ui.hud = megu_client_ui::state::HudState::demo();
     assert_eq!(ui.hud.crafting_conflict.total_candidates, 0);
     assert!(!ui.hud.crafting_conflict.is_active());
 
@@ -1607,7 +1607,7 @@ fn crafting_conflict_overlay_is_zero_clutter_until_two_candidates() {
 /// glyph cell emitted to the draw list has real font coverage.
 #[test]
 fn every_ja_screen_has_zero_tofu_glyphs() {
-    use mc_spine_client_ui::draw::glyph_is_covered;
+    use megu_client_ui::draw::glyph_is_covered;
     let mut missing = std::collections::BTreeSet::new();
     let mut ui = UiState::new();
     ui.settings.language = LanguageSetting::Japanese;
@@ -1640,7 +1640,7 @@ fn every_ja_screen_has_zero_tofu_glyphs() {
 /// distinct, non-blank, non-fallback bitmap.
 #[test]
 fn cjk_glyphs_are_distinct_non_blank_and_fullwidth() {
-    use mc_spine_client_ui::draw::{glyph_bitmap, glyph_cells, glyph_is_covered};
+    use megu_client_ui::draw::{glyph_bitmap, glyph_cells, glyph_is_covered};
     let wide = [
         'あ', 'い', 'ん', 'を', 'が', 'ぱ', 'っ', 'ゃ', // hiragana
         'ア', 'イ', 'ン', 'ヲ', 'ガ', 'パ', 'ッ', 'ャ', // katakana
@@ -1677,7 +1677,7 @@ fn cjk_glyphs_are_distinct_non_blank_and_fullwidth() {
 /// keep ASCII pixel-identical to the legacy 8px-per-char table.
 #[test]
 fn fullwidth_advance_is_exactly_double() {
-    use mc_spine_client_ui::draw::{measure_text_px, text_width};
+    use megu_client_ui::draw::{measure_text_px, text_width};
     assert_eq!(text_width("abc", 1), 24);
     assert_eq!(text_width("abc", 2), 48);
     assert_eq!(text_width("あいう", 1), 48);
@@ -1694,7 +1694,7 @@ fn fullwidth_advance_is_exactly_double() {
 /// built-in font lacks.
 #[test]
 fn unifont_pack_loads_and_rasters_distinct_glyphs() {
-    use mc_spine_client_ui::font_cjk::GlyphAtlas;
+    use megu_client_ui::font_cjk::GlyphAtlas;
     // 8x16 half-width 'A' (Unifont's canonical U+0041 bitmap).
     let a = "0041:0000000018242442427E424242420000";
     // 16x16 full-width box (private-use codepoint built-ins miss).
@@ -1716,7 +1716,7 @@ fn unifont_pack_loads_and_rasters_distinct_glyphs() {
 /// and nothing installed.
 #[test]
 fn unifont_loader_fails_closed_on_bad_input() {
-    use mc_spine_client_ui::font_cjk::GlyphAtlas;
+    use megu_client_ui::font_cjk::GlyphAtlas;
     let bad = [
         "0041", // no separator
         "0041:", // empty hexbits

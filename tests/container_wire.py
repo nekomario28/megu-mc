@@ -210,7 +210,7 @@ def place(client, pos):
 @contextlib.contextmanager
 def local_server_rcon(binary, root):
     """`local_server` plus an RCON listener. protocol767.local_server strips
-    MC_SPINE_RCON_PORT, so the one session that must issue `gamemode creative`
+    MEGU_RCON_PORT, so the one session that must issue `gamemode creative`
     (0x32 creative-slot packets are ignored in the survival default) gets its
     own launcher here, shaped like command_datapack_wire.server."""
     root = Path(root)
@@ -221,11 +221,11 @@ def local_server_rcon(binary, root):
     game, rcon_port = port(), port()
     while rcon_port == game:
         rcon_port = port()
-    env = dict(os.environ, MC_SPINE_PORT=str(game), MC_SPINE_BIND_ADDR="127.0.0.1",
-               MC_SPINE_RCON_PORT=str(rcon_port), MC_SPINE_RCON_BIND_ADDR="127.0.0.1",
-               MC_SPINE_RCON_PASS=RCON_SECRET, MC_SPINE_WG="old",
-               MC_SPINE_RESOURCE_PACK_URL="")
-    env.pop("MC_SPINE_ALLOW_PLAYER_ADMIN_COMMANDS", None)
+    env = dict(os.environ, MEGU_PORT=str(game), MEGU_BIND_ADDR="127.0.0.1",
+               MEGU_RCON_PORT=str(rcon_port), MEGU_RCON_BIND_ADDR="127.0.0.1",
+               MEGU_RCON_PASS=RCON_SECRET, MEGU_WG="old",
+               MEGU_RESOURCE_PACK_URL="")
+    env.pop("MEGU_ALLOW_PLAYER_ADMIN_COMMANDS", None)
     with (root / "server.log").open("w+") as log:
         proc = subprocess.Popen([str(binary)], cwd=root, env=env, stdout=log, stderr=log)
         try:

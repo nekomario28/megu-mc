@@ -9,7 +9,7 @@ use std::collections::VecDeque;
 use std::f32::consts::TAU;
 use std::sync::Arc;
 
-pub const VFX1_CHANNEL: &str = "mc-spine:vfx_v1";
+pub const VFX1_CHANNEL: &str = "megu:vfx_v1";
 pub const MAX_VFX1_PACKET_BYTES: usize = 64 * 1024;
 pub const MAX_VFX1_COMMANDS: usize = 64;
 pub const MAX_CURVE_STOPS: usize = 16;
@@ -2325,7 +2325,7 @@ mod tests {
         };
         let bytes = packet.encode().unwrap();
         assert_eq!(&bytes[..4], b"VFX1");
-        assert_eq!(VFX1_CHANNEL, "mc-spine:vfx_v1");
+        assert_eq!(VFX1_CHANNEL, "megu:vfx_v1");
         let decoded = Vfx1Packet::decode(&bytes).unwrap();
         assert_eq!(decoded, packet);
         assert_eq!(decoded.encode().unwrap(), bytes);

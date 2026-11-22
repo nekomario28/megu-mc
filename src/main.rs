@@ -1,4 +1,4 @@
-// mc-spine v0.6 — joinable 1.21.1 (protocol 767) flat server:
+// megu v0.6 — joinable 1.21.1 (protocol 767) flat server:
 // handshake -> status | login -> config (vanilla blob replay) -> play
 // (join_game + 9x9 chunks + teleport + health) -> consume loop with
 // creative block dig/place backed by a shared overlay world.
@@ -644,7 +644,7 @@ fn environment_time_tick() {
     // One region borrow for the stage. A static scan confirmed that nothing this
     // stage calls re-enters the region lock.
     //
-    // Split under `MC_SPINE_TICK_PROFILE=1`: this step is the whole tick body under a
+    // Split under `MEGU_TICK_PROFILE=1`: this step is the whole tick body under a
     // moving viewer (9-11 ms of 9.3-11.4), so the split below says which part of it.
     let __prof = tickprof::enabled();
     let mut __t = __prof.then(std::time::Instant::now);
@@ -1438,7 +1438,7 @@ fn environment_time_tick() {
         // despawn xp orbs after 300s — plus the same hard cap as drops:
         // a farm can out-spawn the despawn window.
         //
-        // Split under `MC_SPINE_TICK_PROFILE=1`: this block is most of `env/rest`
+        // Split under `MEGU_TICK_PROFILE=1`: this block is most of `env/rest`
         // once a fixture has orbs, and the merge walks 27 cells per orb, so "rest"
         // alone cannot say whether the despawn pass or the merge is the cost.
         let __prof = tickprof::enabled();
@@ -5983,7 +5983,7 @@ static WORLD: Registry<DimChunkKey, HashMap<u32, u32>> = OnceLock::new();
 ///
 /// The tick profile put 10.8 ms of an 11.4 ms tick body in `environment`, a step that
 /// computes a clock read and a 1 Hz broadcast — so the question is what it waits for.
-/// `MC_SPINE_LOCKPROFILE=1` answers it for `WORLD` (the block overlay) and `REGION`.
+/// `MEGU_LOCKPROFILE=1` answers it for `WORLD` (the block overlay) and `REGION`.
 pub(crate) mod lockprof {
     use std::sync::atomic::{AtomicU64, Ordering};
     pub(super) static WORLD_WAIT_NS: AtomicU64 = AtomicU64::new(0);
@@ -5993,7 +5993,7 @@ pub(crate) mod lockprof {
     pub(super) static REGION_HOLD_NS: AtomicU64 = AtomicU64::new(0);
     pub(super) static REGION_N: AtomicU64 = AtomicU64::new(0);
     pub(super) fn enabled() -> bool {
-        crate::trace_env::env_flag!("MC_SPINE_LOCKPROFILE")
+        crate::trace_env::env_flag!("MEGU_LOCKPROFILE")
     }
     pub(super) fn report() {
         let ms = |v: &AtomicU64| v.load(Ordering::Relaxed) as f64 / 1e6;
@@ -7237,7 +7237,7 @@ static EMPTY_HIDDEN: OnceLock<HashSet<u32>> = OnceLock::new();
 fn anti_xray_value_enabled(value: &str) -> bool {
     !matches!(value.trim().to_ascii_lowercase().as_str(), "0" | "false" | "off" | "no")
 }
-/// `[anticheat] antixray` in `server.toml` (default: on); `MC_SPINE_ANTI_XRAY` overrides.
+/// `[anticheat] antixray` in `server.toml` (default: on); `MEGU_ANTI_XRAY` overrides.
 fn anti_xray_enabled() -> bool {
     ac_anti_xray_enabled()
 }
@@ -7306,7 +7306,7 @@ static HIDDEN_EXTRA: OnceLock<Mutex<HashSet<u32>>> = OnceLock::new();
 fn hidden_extra() -> &'static Mutex<HashSet<u32>> {
     HIDDEN_EXTRA.get_or_init(|| {
         Mutex::new(
-            std::env::var("MC_SPINE_HIDDEN_EXTRA")
+            std::env::var("MEGU_HIDDEN_EXTRA")
                 .unwrap_or_default()
                 .split(',')
                 .filter_map(|t| t.trim().parse::<u32>().ok())
@@ -9205,7 +9205,7 @@ fn plugin_backoff() -> &'static Mutex<HashMap<CellKey, (u64, u8)>> {
 fn plugins() -> &'static Mutex<Vec<Box<dyn Plugin>>> {
     PLUGINS.get_or_init(|| {
         let mut v: Vec<Box<dyn Plugin>> = Vec::new();
-        let want = std::env::var("MC_SPINE_PLUGINS").unwrap_or_default();
+        let want = std::env::var("MEGU_PLUGINS").unwrap_or_default();
         if want.split(',').any(|w| w.trim() == "growthlamp") {
             v.push(Box::new(GrowthLamp));
         }
@@ -11853,10 +11853,10 @@ fn resource_pack_url(bind: &str, configured: Option<&str>) -> Option<String> {
     }
 }
 fn load_pack_info() -> Option<(String, String)> {
-    let bind = std::env::var("MC_SPINE_BIND_ADDR").unwrap_or_else(|_| "127.0.0.1".into());
+    let bind = std::env::var("MEGU_BIND_ADDR").unwrap_or_else(|_| "127.0.0.1".into());
     let url = resource_pack_url(
         &bind,
-        std::env::var("MC_SPINE_RESOURCE_PACK_URL").ok().as_deref(),
+        std::env::var("MEGU_RESOURCE_PACK_URL").ok().as_deref(),
     )?;
     let data = std::fs::read("resourcepack.zip").ok()?;
     Some((url, hex(&sha1(&data))))
@@ -11957,8 +11957,8 @@ fn http_server() {
     let Ok(data) = std::fs::read("resourcepack.zip") else {
         return;
     };
-    let bind = std::env::var("MC_SPINE_RESOURCE_PACK_BIND_ADDR")
-        .or_else(|_| std::env::var("MC_SPINE_BIND_ADDR"))
+    let bind = std::env::var("MEGU_RESOURCE_PACK_BIND_ADDR")
+        .or_else(|_| std::env::var("MEGU_BIND_ADDR"))
         .unwrap_or_else(|_| "127.0.0.1".into());
     if let Err(why) = connection_limits::check_bind(
         "resource pack http",
@@ -12840,7 +12840,7 @@ fn sky_spill_apply(
 /// The first opaque block y in each column, scanning down from the surface (the sky floor).
 /// Opacity for the cells the light computation reads, per chunk, read in batches.
 ///
-/// Measured with `MC_SPINE_CHUNK_PROFILE=1`: one delivered chunk makes **21,619-29,536**
+/// Measured with `MEGU_CHUNK_PROFILE=1`: one delivered chunk makes **21,619-29,536**
 /// `block_at` calls, ~100% of which miss the overlay (it holds edits only) and fall
 /// through to `base_state` → `worldgen::block_state` — a full terrain evaluation with
 /// the worldgen lock. At 1-2 µs each that is the whole 25-50 ms the light phase costs.
@@ -13338,7 +13338,7 @@ fn opacity_windowed_dim(dim: DimId, x: i32, y: i32, z: i32) -> u8 {
 /// Per-chunk sky floors, memoized.
 ///
 /// `sky_floors` walks 256 columns and up to 24 cells each, and every `opacity` call is
-/// a `block_at` (one world lock). Measured under `MC_SPINE_CHUNK_PROFILE=1`: 32-62 ms
+/// a `block_at` (one world lock). Measured under `MEGU_CHUNK_PROFILE=1`: 32-62 ms
 /// per delivered chunk, in **10 calls** — the centre chunk plus the whole 3x3 window,
 /// each of which is the centre of some other chunk's delivery.
 ///
@@ -13887,10 +13887,10 @@ fn chunk_data(cx: i32, cz: i32, dim: DimId, gen: &mut GenSources) -> Vec<u8> {
     chunk_data_opt(cx, cz, dim, gen, chunk_prefetch_enabled())
 }
 
-/// On by default. `MC_SPINE_NO_PREFETCH_NEIGHBOUR=1` turns it off (the digest guard
+/// On by default. `MEGU_NO_PREFETCH_NEIGHBOUR=1` turns it off (the digest guard
 /// passes the setting explicitly, so it can compare both without the environment).
 fn chunk_prefetch_enabled() -> bool {
-    std::env::var("MC_SPINE_NO_PREFETCH_NEIGHBOUR").is_err()
+    std::env::var("MEGU_NO_PREFETCH_NEIGHBOUR").is_err()
 }
 
 #[cfg(test)]
@@ -14007,7 +14007,7 @@ fn chunk_data_lane(
     // chunks are populated in *is* an input to the feature layer, so that had to be checked
     // rather than assumed: `chunk_delivery_digest` compares terrain-state digests with this
     // setting on and off over 2 seeds x 3 sweep directions (60 sweeps) and finds them
-    // identical, and it asserts that stays true. `MC_SPINE_NO_PREFETCH_NEIGHBOUR=1` reverts.
+    // identical, and it asserts that stays true. `MEGU_NO_PREFETCH_NEIGHBOUR=1` reverts.
     // Packed sections, not raw 16 KB arrays: the store hands out the very same `Arc` the
     // encode step writes to the wire, so publishing and reading a section costs neither a
     // copy nor a repack.
@@ -15750,7 +15750,7 @@ fn light_dirty_for_dim(dim: DimId, gen: &GenSources, cx: i32, cz: i32) -> Vec<(i
     out
 }
 
-/// Worker count for terrain prefetch: `MC_SPINE_GEN_JOBS` (0/1 = inline), else
+/// Worker count for terrain prefetch: `MEGU_GEN_JOBS` (0/1 = inline), else
 /// `min(available_parallelism, 8)`. Terrain is pure, so this only trades threads for wall
 /// time and never changes what is generated; the count itself is owned by
 /// `worldgen::terrain_jobs` so the dump path and the delivery path cannot disagree.
@@ -15759,7 +15759,7 @@ fn light_dirty_for_dim(dim: DimId, gen: &GenSources, cx: i32, cz: i32) -> Vec<(i
 /// `WARM=1 load_compare.sh` measured CPU 21.9 s -> 23.3 s with 4 workers, and CPU seconds
 /// are what that lane measures; that stands as a measurement of *CPU*, and the trade it
 /// describes is the one this change takes deliberately: the same work, spread over
-/// threads, with wall clock down several times and CPU slightly up. `MC_SPINE_GEN_JOBS=1`
+/// threads, with wall clock down several times and CPU slightly up. `MEGU_GEN_JOBS=1`
 /// restores the serial arm for a CPU-sensitive comparison.
 fn gen_workers() -> usize {
     worldgen::terrain_jobs()
@@ -15774,7 +15774,7 @@ fn terrain_group(workers: usize) -> usize {
 
 /// Worker count for the **delivery** path's terrain prefetch, which runs on the tick thread.
 ///
-/// Opt-in (`MC_SPINE_GEN_JOBS`), unlike the offline dump path. Reason, measured on this
+/// Opt-in (`MEGU_GEN_JOBS`), unlike the offline dump path. Reason, measured on this
 /// host: the delivery path's prefetch runs between the client's batch and the send loop, so
 /// a round of chunks is built while the tick thread waits. That is a *latency* change to the
 /// tick, and it moved `tick_tests::wall_clock_boundaries_are_gated_on_elapsed_time_not_tick_count`
@@ -15783,7 +15783,7 @@ fn terrain_group(workers: usize) -> usize {
 /// what this slice measures and it is default; the delivery arm stays a flag until a
 /// tick-latency measurement (not a throughput one) says it is safe.
 fn delivery_prefetch_jobs() -> usize {
-    std::env::var("MC_SPINE_GEN_JOBS")
+    std::env::var("MEGU_GEN_JOBS")
         .ok()
         .and_then(|v| v.trim().parse::<usize>().ok())
         .unwrap_or(1)
@@ -15829,7 +15829,7 @@ fn prefetch_terrain_group_dim(
     // `jobs = 1` builds the same rows on one scratch generator instead of eight. It is not
     // skipped: the base rows carry the terrain stage's `markPosForPostprocessing` decisions,
     // so a serial run that let the sections be built lazily would file those marks after the
-    // chunk was already promoted, and `MC_SPINE_WG_GEN_JOBS=1` vs `8` would stop being a
+    // chunk was already promoted, and `MEGU_WG_GEN_JOBS=1` vs `8` would stop being a
     // comparison of the same thing.
     let jobs = workers.max(1);
     let resolver = worldgen::with_gen_dim(dim, |g| g.beard_resolver()).flatten();
@@ -15943,18 +15943,18 @@ fn rcon_conn(mut s: TcpStream, pass: String) {
     }
 }
 fn rcon_listener() {
-    let Some(port) = std::env::var("MC_SPINE_RCON_PORT")
+    let Some(port) = std::env::var("MEGU_RCON_PORT")
         .ok()
         .and_then(|p| p.parse::<u16>().ok())
     else {
         return;
     };
-    let pass = std::env::var("MC_SPINE_RCON_PASS").unwrap_or_default();
+    let pass = std::env::var("MEGU_RCON_PASS").unwrap_or_default();
     if pass.trim().is_empty() {
-        eprintln!("[rcon] refusing to start without a nonempty MC_SPINE_RCON_PASS");
+        eprintln!("[rcon] refusing to start without a nonempty MEGU_RCON_PASS");
         return;
     }
-    let bind = std::env::var("MC_SPINE_RCON_BIND_ADDR").unwrap_or_else(|_| "127.0.0.1".into());
+    let bind = std::env::var("MEGU_RCON_BIND_ADDR").unwrap_or_else(|_| "127.0.0.1".into());
     if let Err(why) =
         connection_limits::check_bind("RCON", &bind, connection_limits::public_bind_allowed())
     {
@@ -15996,8 +15996,8 @@ fn rcon_listener() {
 ///
 /// Measured 2026-10-28 with one moving viewer (`tools/load_compare.sh` conditions):
 /// ~29.5 s of CPU in a 20 s window, of which terrain+features are ~1.7 s. These two
-/// counters say where the rest is: `MC_SPINE_CHUNK_PROFILE=1` splits the chunk packet,
-/// `MC_SPINE_TICK_PROFILE=1` splits the tick body.
+/// counters say where the rest is: `MEGU_CHUNK_PROFILE=1` splits the chunk packet,
+/// `MEGU_TICK_PROFILE=1` splits the tick body.
 pub(crate) mod chunkprof {
     use std::sync::atomic::{AtomicU64, Ordering};
     pub(super) static MAP: AtomicU64 = AtomicU64::new(0);
@@ -16045,7 +16045,7 @@ pub(crate) mod chunkprof {
     pub(super) static EPOCH_BUMPS: AtomicU64 = AtomicU64::new(0);
     pub(super) static N: AtomicU64 = AtomicU64::new(0);
     pub(super) fn enabled() -> bool {
-        crate::trace_env::env_flag!("MC_SPINE_CHUNK_PROFILE")
+        crate::trace_env::env_flag!("MEGU_CHUNK_PROFILE")
     }
     pub(super) fn add(slot: &AtomicU64, t: std::time::Instant) {
         slot.fetch_add(t.elapsed().as_nanos() as u64, Ordering::Relaxed);
@@ -16164,7 +16164,7 @@ pub(crate) mod tickprof {
     pub(super) static PLATE_ON: AtomicU64 = AtomicU64::new(0);
     pub(super) static PLATE_OFF: AtomicU64 = AtomicU64::new(0);
     pub(crate) fn enabled() -> bool {
-        crate::trace_env::env_flag!("MC_SPINE_TICK_PROFILE")
+        crate::trace_env::env_flag!("MEGU_TICK_PROFILE")
     }
     pub(crate) fn add(name: &'static str, elapsed: std::time::Duration) {
         let v = NS.get_or_init(|| Mutex::new(Vec::new()));
@@ -16266,9 +16266,9 @@ fn reset_live_load_balancer() {
     *MOB_SPAWN_CREDIT.lock().unwrap_or_else(|e| e.into_inner()) = [0.0; 6];
 }
 
-/// `MC_SPINE_MAX_PLAYERS` (default 20) — the same read the status reply uses.
+/// `MEGU_MAX_PLAYERS` (default 20) — the same read the status reply uses.
 fn operator_max_players() -> usize {
-    std::env::var("MC_SPINE_MAX_PLAYERS")
+    std::env::var("MEGU_MAX_PLAYERS")
         .ok()
         .and_then(|v| v.parse().ok())
         .unwrap_or(20)
@@ -16343,11 +16343,11 @@ fn note_world_saved_through(epoch: u64) {
     LAST_SAVED_EPOCH.fetch_max(epoch, Ordering::Release);
 }
 
-/// `MC_SPINE_BACKUP_MAX_KEEP`: how many `backups/world-*.bak` snapshots stay
+/// `MEGU_BACKUP_MAX_KEEP`: how many `backups/world-*.bak` snapshots stay
 /// after each rotation. `0` (the default, or an unparseable value) disables
 /// the directory entirely.
 fn backup_max_keep() -> usize {
-    std::env::var("MC_SPINE_BACKUP_MAX_KEEP")
+    std::env::var("MEGU_BACKUP_MAX_KEEP")
         .ok()
         .and_then(|v| v.trim().parse::<usize>().ok())
         .unwrap_or(0)
@@ -16509,7 +16509,7 @@ fn submit_world_snapshot(
     Ok(())
 }
 
-// ---------- opt-in delta WAL (`MC_SPINE_WAL_PATH`) live wiring ----------
+// ---------- opt-in delta WAL (`MEGU_WAL_PATH`) live wiring ----------
 //
 // When the operator names a WAL file, every committed overlay block write is
 // journaled (`DeltaWalRecord::BlockSet`, flushed per frame) so a crash loses
@@ -16532,12 +16532,12 @@ fn dwal_enabled() -> bool {
     DWAL_ON.load(Ordering::Relaxed)
 }
 
-/// `MC_SPINE_WAL_PATH`, screened by the same `..`/NUL/control-character rule
+/// `MEGU_WAL_PATH`, screened by the same `..`/NUL/control-character rule
 /// every operator-controlled data path goes through. An invalid value is
 /// treated like an unset one: the WAL is opt-in, so a bad path must not crash
 /// boot — it logs and stays off.
 fn dwal_path_from_env() -> Option<std::path::PathBuf> {
-    let raw = std::env::var_os("MC_SPINE_WAL_PATH")?;
+    let raw = std::env::var_os("MEGU_WAL_PATH")?;
     if raw.is_empty() {
         return None;
     }
@@ -16930,10 +16930,10 @@ fn mob_spawn_permitted(slot: usize, scale: f64) -> bool {
 static LAN_ANNOUNCER: Mutex<Option<LanAnnouncer>> = Mutex::new(None);
 
 fn start_lan_announcer(port: u16) {
-    if std::env::var("MC_SPINE_LAN_BROADCAST").as_deref() != Ok("1") {
+    if std::env::var("MEGU_LAN_BROADCAST").as_deref() != Ok("1") {
         return;
     }
-    let motd = std::env::var("MC_SPINE_MOTD").unwrap_or_else(|_| "mc-spine".into());
+    let motd = std::env::var("MEGU_MOTD").unwrap_or_else(|_| "megu".into());
     match LanAnnouncer::start(&motd, port) {
         Ok(announcer) => {
             *LAN_ANNOUNCER.lock().unwrap_or_else(|e| e.into_inner()) = Some(announcer);
@@ -16951,8 +16951,8 @@ fn stop_lan_announcer() {
 
 /// The opt-in GS4 query responder ("enable-query" in vanilla
 /// server.properties): one UDP thread serving challenge tokens and the live
-/// status/rules snapshot. Armed by `MC_SPINE_ENABLE_QUERY=1` (or `true`) or a
-/// `enable-query=true` line in server.properties; `MC_SPINE_QUERY_PORT`, then
+/// status/rules snapshot. Armed by `MEGU_ENABLE_QUERY=1` (or `true`) or a
+/// `enable-query=true` line in server.properties; `MEGU_QUERY_PORT`, then
 /// a `query.port` property, then the game port itself select the UDP port —
 /// vanilla's own default.
 static GS4_QUERY: Mutex<Option<Gs4QueryHandle>> = Mutex::new(None);
@@ -16977,14 +16977,14 @@ fn server_properties_lookup(key: &str) -> Option<String> {
 }
 
 fn gs4_query_enabled() -> bool {
-    if let Ok(v) = std::env::var("MC_SPINE_ENABLE_QUERY").as_deref() {
+    if let Ok(v) = std::env::var("MEGU_ENABLE_QUERY").as_deref() {
         return v == "1" || v.eq_ignore_ascii_case("true");
     }
     server_properties_lookup("enable-query").is_some_and(|v| v.eq_ignore_ascii_case("true"))
 }
 
 fn gs4_query_port(game_port: u16) -> u16 {
-    if let Some(port) = std::env::var("MC_SPINE_QUERY_PORT")
+    if let Some(port) = std::env::var("MEGU_QUERY_PORT")
         .ok()
         .and_then(|v| v.parse().ok())
     {
@@ -17006,7 +17006,7 @@ fn start_gs4_query(bind: &str, game_port: u16) {
             .iter()
             .map(|c| c.name.clone())
             .collect::<Vec<_>>();
-        let motd = std::env::var("MC_SPINE_MOTD").unwrap_or_else(|_| "mc-spine".into());
+        let motd = std::env::var("MEGU_MOTD").unwrap_or_else(|_| "megu".into());
         let map = world_save_dir()
             .file_name()
             .map(|n| n.to_string_lossy().into_owned())
@@ -17034,7 +17034,7 @@ fn stop_gs4_query() {
     GS4_QUERY.lock().unwrap_or_else(|e| e.into_inner()).take();
 }
 
-/// Live Anvil world store: `MC_SPINE_ANVIL_WORLD_DIR` points the running
+/// Live Anvil world store: `MEGU_ANVIL_WORLD_DIR` points the running
 /// server at a vanilla-format world directory. The boot import runs after the
 /// overlay save loads so Anvil data wins on overlap; every autosave and the
 /// shutdown save write the world back through the region codec.
@@ -17058,12 +17058,12 @@ fn live_anvil_save_if_armed() {
     }
 }
 
-/// The dry-ground search is opt-in (`MC_SPINE_SAFE_SPAWN=1`) or automatic on a
+/// The dry-ground search is opt-in (`MEGU_SAFE_SPAWN=1`) or automatic on a
 /// world that has never been saved when the vanilla datapack generator is
 /// running — a fresh vanilla world can put (0, 0) under an ocean. The flat
 /// generator and wire tests keep their fixed spawn unless the flag says so.
 fn safe_spawn_search_enabled(fresh_world: bool) -> bool {
-    std::env::var("MC_SPINE_SAFE_SPAWN").as_deref() == Ok("1")
+    std::env::var("MEGU_SAFE_SPAWN").as_deref() == Ok("1")
         || (fresh_world && worldgen::enabled())
 }
 
@@ -17256,22 +17256,22 @@ fn world_block_entity_tick() {
     });
 }
 
-/// `MC_SPINE_AUTO_UNLOAD_TICKS`: the opt-in game-tick interval between live
+/// `MEGU_AUTO_UNLOAD_TICKS`: the opt-in game-tick interval between live
 /// issue-#105 region sweeps. `0`, unset or unparseable disables the stage
 /// entirely — the default tick pays one env read and nothing else, so a
 /// server that never asks for the sweep keeps an identical tick.
 fn auto_unload_period() -> u64 {
-    std::env::var("MC_SPINE_AUTO_UNLOAD_TICKS")
+    std::env::var("MEGU_AUTO_UNLOAD_TICKS")
         .ok()
         .and_then(|raw| raw.trim().parse::<u64>().ok())
         .unwrap_or(0)
 }
 
-/// The `auto_unload` stage of `game_tick`: every `MC_SPINE_AUTO_UNLOAD_TICKS`
+/// The `auto_unload` stage of `game_tick`: every `MEGU_AUTO_UNLOAD_TICKS`
 /// ticks, `sweep_unticketed_regions` evicts resident chunks whose ticket
 /// lapsed — chunks covered by no connected client's view window, the
 /// Overworld spawn ring or `/forceload` — flushing each unload into the Anvil
-/// world dir when `MC_SPINE_ANVIL_WORLD_DIR` is armed or parking it in
+/// world dir when `MEGU_ANVIL_WORLD_DIR` is armed or parking it in
 /// `evicted_regions` for re-hydration otherwise, so a long-running server
 /// stops holding every explored chunk's RAM forever.
 fn auto_unload_tick() {
@@ -17307,8 +17307,8 @@ fn auto_unload_tick() {
 /// `teams_and_commands.rs`) — a second instance would record tick timings a
 /// command can never see.
 /// Issue #88: an empty world starts with zero debug mobs unless the seeding
-/// is explicitly opted into (`MC_SPINE_DEBUG_SEED_MOBS=1` /
-/// `MC_SPINE_SEED_DEBUG_MOBS=1`). With the opt-in, two cows (etype 22) and
+/// is explicitly opted into (`MEGU_DEBUG_SEED_MOBS=1` /
+/// `MEGU_SEED_DEBUG_MOBS=1`). With the opt-in, two cows (etype 22) and
 /// two zombies (etype 124) appear on the surface near spawn; a world that
 /// already restored mobs from a save is never re-seeded.
 fn seed_debug_mobs(enabled: bool) {
@@ -17450,7 +17450,7 @@ fn game_tick(mut step: impl FnMut(&'static str, fn())) {
     run("generated_content", materialize_pending_generation);
     run("interest", interest_tick);
     // Vanilla `ChunkMap.tick` evicts chunks whose tickets lapsed; the sweep is
-    // opt-in (`MC_SPINE_AUTO_UNLOAD_TICKS`), so the default stage is a no-op.
+    // opt-in (`MEGU_AUTO_UNLOAD_TICKS`), so the default stage is a no-op.
     run("auto_unload", auto_unload_tick);
     run("drops", stage_drops);
     run("arrows", w1_arrow_tick);
@@ -17510,7 +17510,7 @@ fn game_tick(mut step: impl FnMut(&'static str, fn())) {
 /// The line `--version` prints: the engine name, the build tag and the vanilla
 /// release/protocol pair it speaks.
 const MEGU_VERSION_LINE: &str =
-    "Megu (mc-spine) 0.1.0-alpha.1 (Minecraft 1.21.1 / 26.3, Protocol 767)";
+    "Megu (megu) 0.1.0-alpha.1 (Minecraft 1.21.1 / 26.3, Protocol 767)";
 
 /// `--help` output: every flag a first boot can take, and what each one does.
 /// Printed and exited before the world, the config or a socket exists.
@@ -17518,14 +17518,14 @@ const MEGU_CLI_USAGE: &str = "\
 Megu v0.1.0-alpha.1 - clean-room Rust Minecraft engine (Minecraft 1.21.1 / 26.3, protocol 767)
 
 USAGE:
-    mc-spine [options]
+    megu [options]
 
 OPTIONS:
     --dir <path>     Server directory: its eula.txt, server.toml and world/ are
                      used (default: the current directory). Also --dir=<path>.
     --port <u16>     Listen port (default: 25599; [server] port in server.toml
-                     or MC_SPINE_PORT can also set it).
-    --bind <addr>    Bind address (default: 127.0.0.1; MC_SPINE_BIND_ADDR).
+                     or MEGU_PORT can also set it).
+    --bind <addr>    Bind address (default: 127.0.0.1; MEGU_BIND_ADDR).
     --no-banner      Suppress the interactive startup banner.
     -V, --version    Print the version and exit.
     -h, --help       Print this help and exit.
@@ -17568,13 +17568,13 @@ fn parse_startup_flags() -> Vec<String> {
         } else if arg == "--no-banner" {
             // Set rather than returned: the banner gate reads one place, and a
             // server the launcher spawns inherits the same suppression.
-            std::env::set_var("MC_SPINE_NO_BANNER", "1");
+            std::env::set_var("MEGU_NO_BANNER", "1");
         } else if arg == "--dir" || arg.starts_with("--dir=") {
             let dir = if arg == "--dir" {
                 match args.next() {
                     Some(dir) if !dir.is_empty() => dir,
                     _ => {
-                        eprintln!("mc-spine: --dir requires a path (see --help)");
+                        eprintln!("megu: --dir requires a path (see --help)");
                         std::process::exit(2);
                     }
                 }
@@ -17582,13 +17582,13 @@ fn parse_startup_flags() -> Vec<String> {
                 match arg.strip_prefix("--dir=") {
                     Some(dir) if !dir.is_empty() => dir.to_owned(),
                     _ => {
-                        eprintln!("mc-spine: --dir requires a nonempty path (see --help)");
+                        eprintln!("megu: --dir requires a nonempty path (see --help)");
                         std::process::exit(2);
                     }
                 }
             };
             if let Err(e) = std::env::set_current_dir(&dir) {
-                eprintln!("mc-spine: --dir {dir}: {e}");
+                eprintln!("megu: --dir {dir}: {e}");
                 std::process::exit(2);
             }
         } else if arg == "--port" || arg.starts_with("--port=") {
@@ -17599,9 +17599,9 @@ fn parse_startup_flags() -> Vec<String> {
             };
             let port = value.and_then(|v| v.parse::<u16>().ok()).filter(|p| *p != 0);
             match port {
-                Some(port) => std::env::set_var("MC_SPINE_PORT", port.to_string()),
+                Some(port) => std::env::set_var("MEGU_PORT", port.to_string()),
                 None => {
-                    eprintln!("mc-spine: --port requires a port in 1..65535 (see --help)");
+                    eprintln!("megu: --port requires a port in 1..65535 (see --help)");
                     std::process::exit(2);
                 }
             }
@@ -17613,10 +17613,10 @@ fn parse_startup_flags() -> Vec<String> {
             };
             match value {
                 Some(bind) if !bind.is_empty() => {
-                    std::env::set_var("MC_SPINE_BIND_ADDR", bind)
+                    std::env::set_var("MEGU_BIND_ADDR", bind)
                 }
                 _ => {
-                    eprintln!("mc-spine: --bind requires an address (see --help)");
+                    eprintln!("megu: --bind requires an address (see --help)");
                     std::process::exit(2);
                 }
             }
@@ -17665,12 +17665,12 @@ fn eula_direct_launch_check() {
 }
 
 /// Print the big-letter greeting — only ever to an interactive terminal.
-/// `--no-banner`, `MC_SPINE_NO_BANNER=1` or `NO_BANNER=1` suppress it, and a
+/// `--no-banner`, `MEGU_NO_BANNER=1` or `NO_BANNER=1` suppress it, and a
 /// non-TTY stdout (pipes, CI, tests, log collectors) gets zero extra lines.
 fn megu_startup_banner() {
     use std::io::IsTerminal;
     if !std::io::stdout().is_terminal()
-        || std::env::var("MC_SPINE_NO_BANNER").as_deref() == Ok("1")
+        || std::env::var("MEGU_NO_BANNER").as_deref() == Ok("1")
         || std::env::var("NO_BANNER").as_deref() == Ok("1")
     {
         return;
@@ -17684,12 +17684,12 @@ fn main() {
     // before `server.toml`/`eula.txt`/the world are resolved.
     let rest = parse_startup_flags();
     // `server.toml` first, while the process is single-threaded: its `[server]` keys are
-    // exported as the `MC_SPINE_*` variables everything below already reads.
+    // exported as the `MEGU_*` variables everything below already reads.
     // Tool modes (probe arguments, worldgen dumps) never touch it — and neither do
     // the EULA gate nor the banner, which belong to the real boot alone.
     if rest.is_empty()
-        && std::env::var_os("MC_SPINE_WG_DUMP").is_none()
-        && std::env::var_os("MC_SPINE_WG_PROFILE").is_none()
+        && std::env::var_os("MEGU_WG_DUMP").is_none()
+        && std::env::var_os("MEGU_WG_PROFILE").is_none()
     {
         eula_direct_launch_check();
         megu_startup_banner();
@@ -17697,7 +17697,7 @@ fn main() {
         ac_install(AcConfig::from_doc(&doc, |name| std::env::var(name).ok()));
         refresh_hidden_tags_from_datapacks(std::path::Path::new(DATAPACK_DIRECTORY));
     }
-    // Live mod suite (mod-suite feature): scans MC_SPINE_MODS_DIR and arms the
+    // Live mod suite (mod-suite feature): scans MEGU_MODS_DIR and arms the
     // operator mod-sync/progression files. Inert unless the feature is built
     // in *and* one of its env vars names a file or directory.
     live_mod_suite_boot();
@@ -17711,10 +17711,10 @@ fn main() {
     // beardifier resolver is. Without it the pass would keep skipping marked fluid cells.
     structure_template::register_fluid_ticker(promotion_fluid_tick);
     // A dump request must never fall through to the live server/save path.
-    if std::env::var_os("MC_SPINE_WG_DUMP").is_some()
-        && std::env::var_os("MC_SPINE_WG_PROFILE").is_none()
+    if std::env::var_os("MEGU_WG_DUMP").is_some()
+        && std::env::var_os("MEGU_WG_PROFILE").is_none()
     {
-        eprintln!("[wgdump] MC_SPINE_WG_DUMP requires MC_SPINE_WG_PROFILE (use 0 for dump only)");
+        eprintln!("[wgdump] MEGU_WG_DUMP requires MEGU_WG_PROFILE (use 0 for dump only)");
         std::process::exit(2);
     }
     let probe_args: Vec<String> = rest.clone();
@@ -18040,21 +18040,21 @@ fn main() {
         return;
     }
 
-    // quick profile: MC_SPINE_WG_PROFILE=n generates n^2 chunks then exits
-    if let Ok(n) = std::env::var("MC_SPINE_WG_PROFILE") {
-        let seed: u64 = std::env::var("MC_SPINE_SEED")
+    // quick profile: MEGU_WG_PROFILE=n generates n^2 chunks then exits
+    if let Ok(n) = std::env::var("MEGU_WG_PROFILE") {
+        let seed: u64 = std::env::var("MEGU_SEED")
             .ok()
             .map(|v| {
                 worldgen::parse_world_seed(&v)
-                    .expect("MC_SPINE_SEED must be a signed long or its unsigned bit pattern")
+                    .expect("MEGU_SEED must be a signed long or its unsigned bit pattern")
             })
             .unwrap_or(0);
-        let preset = std::env::var("MC_SPINE_WG_PRESET").unwrap_or_else(|_| "overworld".into());
+        let preset = std::env::var("MEGU_WG_PRESET").unwrap_or_else(|_| "overworld".into());
         let preset =
             worldgen::NoisePreset::parse(&preset).expect("implemented offline noise preset");
         if preset != worldgen::NoisePreset::Overworld
-            && (std::env::var_os("MC_SPINE_WG_LEAF_RUNTIME_DUMP").is_some()
-                || std::env::var_os("MC_SPINE_WG_DIAG_LOAD_WORLD").is_some())
+            && (std::env::var_os("MEGU_WG_LEAF_RUNTIME_DUMP").is_some()
+                || std::env::var_os("MEGU_WG_DIAG_LOAD_WORLD").is_some())
         {
             eprintln!("[wg] dimension-specific tick/save diagnostics are not implemented");
             std::process::exit(2);
@@ -18088,37 +18088,37 @@ fn main() {
                 );
             }
         }
-        if std::env::var_os("MC_SPINE_DFSTATS").is_some() {
+        if std::env::var_os("MEGU_DFSTATS").is_some() {
             eprint!("{}", worldgen::df_stats());
         }
-        if let Ok(spec) = std::env::var("MC_SPINE_DFDUMP") {
+        if let Ok(spec) = std::env::var("MEGU_DFDUMP") {
             worldgen::dfdump(&spec);
         }
-        if let Ok(spec) = std::env::var("MC_SPINE_BIOME_DUMP") {
+        if let Ok(spec) = std::env::var("MEGU_BIOME_DUMP") {
             worldgen::biome_dump(&spec);
         }
-        if let Ok(spec) = std::env::var("MC_SPINE_HM_DUMP") {
+        if let Ok(spec) = std::env::var("MEGU_HM_DUMP") {
             generation_context::hm_dump(&spec, feature::populate);
         }
-        if let Ok(spec) = std::env::var("MC_SPINE_BIOME_AT") {
+        if let Ok(spec) = std::env::var("MEGU_BIOME_AT") {
             worldgen::biome_at_dump(&spec);
         }
-        if let Ok(path) = std::env::var("MC_SPINE_WG_DUMP") {
-            if std::env::var("MC_SPINE_WG_DIAG_LOAD_WORLD").as_deref() == Ok("1") {
+        if let Ok(path) = std::env::var("MEGU_WG_DUMP") {
+            if std::env::var("MEGU_WG_DIAG_LOAD_WORLD").as_deref() == Ok("1") {
                 load_world().expect("load diagnostic world save");
             }
-            // Offline block dump for parity diffs: `MC_SPINE_WG_DUMP_N` chunks per
+            // Offline block dump for parity diffs: `MEGU_WG_DUMP_N` chunks per
             // side from (0,0), each section in the send layout `(ly<<8)|(lz<<4)|lx`.
             // `tools/carver_diff.py` reads it against a vanilla region file.
-            let n: i32 = std::env::var("MC_SPINE_WG_DUMP_N")
+            let n: i32 = std::env::var("MEGU_WG_DUMP_N")
                 .ok()
                 .and_then(|v| v.parse().ok())
                 .unwrap_or(6);
-            let ox: i32 = std::env::var("MC_SPINE_WG_DUMP_X")
+            let ox: i32 = std::env::var("MEGU_WG_DUMP_X")
                 .ok()
                 .and_then(|v| v.parse().ok())
                 .unwrap_or(0);
-            let oz: i32 = std::env::var("MC_SPINE_WG_DUMP_Z")
+            let oz: i32 = std::env::var("MEGU_WG_DUMP_Z")
                 .ok()
                 .and_then(|v| v.parse().ok())
                 .unwrap_or(0);
@@ -18130,14 +18130,14 @@ fn main() {
             // reader of those rows expects): `tools/port_triage.py
             // --height-window noise` sets it together with the triage window, so the dump
             // length and the compared window cannot disagree.
-            let (lo, hi) = match std::env::var("MC_SPINE_WG_DUMP_WINDOW").as_deref() {
+            let (lo, hi) = match std::env::var("MEGU_WG_DUMP_WINDOW").as_deref() {
                 Err(std::env::VarError::NotPresent) | Ok("world") => {
                     (worldgen::world_min_y(), worldgen::world_max_y())
                 }
                 Ok("noise") => (worldgen::min_y(), worldgen::max_y()),
                 other => {
                     eprintln!(
-                        "[wgdump] invalid MC_SPINE_WG_DUMP_WINDOW {other:?}; expected world or noise"
+                        "[wgdump] invalid MEGU_WG_DUMP_WINDOW {other:?}; expected world or noise"
                     );
                     std::process::exit(2);
                 }
@@ -18151,23 +18151,23 @@ fn main() {
             if let Some(round) = dump_round {
                 let _ = worldgen::with_gen(|g| g.starts_round = Some(round));
             }
-            if let Ok(order_path) = std::env::var("MC_SPINE_POP_ORDER") {
+            if let Ok(order_path) = std::env::var("MEGU_POP_ORDER") {
                 let fail = |message: String| -> ! {
                     eprintln!("[wgdump] population plan: {message}");
                     std::process::exit(2);
                 };
-                if std::env::var_os("MC_SPINE_POP_REGION").is_some() {
+                if std::env::var_os("MEGU_POP_REGION").is_some() {
                     fail(
-                        "MC_SPINE_POP_ORDER and MC_SPINE_POP_REGION are mutually exclusive".into(),
+                        "MEGU_POP_ORDER and MEGU_POP_REGION are mutually exclusive".into(),
                     );
                 }
                 let text = std::fs::read_to_string(&order_path)
                     .unwrap_or_else(|error| fail(format!("{order_path}: {error}")));
-                let allow_extra = match std::env::var("MC_SPINE_POP_ORDER_SCOPE").as_deref() {
+                let allow_extra = match std::env::var("MEGU_POP_ORDER_SCOPE").as_deref() {
                     Err(std::env::VarError::NotPresent) | Ok("exact") => false,
                     Ok("recorded") => true,
                     other => fail(format!(
-                        "invalid MC_SPINE_POP_ORDER_SCOPE {other:?}; expected exact or recorded"
+                        "invalid MEGU_POP_ORDER_SCOPE {other:?}; expected exact or recorded"
                     )),
                 };
                 let plan = worldgen::parse_population_order(&text, ox, oz, n, allow_extra)
@@ -18186,7 +18186,7 @@ fn main() {
                     worldgen::with_gen(|g| g.populate_plan(plan, feature::populate))
                         .unwrap_or_else(|| fail("generator not initialized".into()));
                 if executed != requested {
-                    fail(format!("{executed} of {requested} chunks executed; plan overlaps prior population (use MC_SPINE_WG_PROFILE=0)"));
+                    fail(format!("{executed} of {requested} chunks executed; plan overlaps prior population (use MEGU_WG_PROFILE=0)"));
                 }
                 eprintln!(
                     "[wgdump] population plan {order_path}: {executed} source chunks executed (scope={})",
@@ -18220,7 +18220,7 @@ fn main() {
                 crate::feature::starts_round_end(round);
             }
             std::fs::write(&path, &out).unwrap();
-            if let Ok(canon_path) = std::env::var("MC_SPINE_WG_DUMP_CANON") {
+            if let Ok(canon_path) = std::env::var("MEGU_WG_DUMP_CANON") {
                 // Canonical state strings, one per non-air cell, for a comparison that can see
                 // a property: the binary dump above is numeric and a name-level diff hides a
                 // stair facing the wrong way.
@@ -18271,7 +18271,7 @@ fn main() {
                 std::fs::write(&canon_path, text).unwrap();
                 eprintln!("[wgdump] canonical states -> {canon_path}");
             }
-            if let Ok(tick_path) = std::env::var("MC_SPINE_WG_LEAF_TICKS") {
+            if let Ok(tick_path) = std::env::var("MEGU_WG_LEAF_TICKS") {
                 let reg =
                     crate::block_registry::breg().expect("block registry required for tick dump");
                 let ticks = worldgen::with_gen(|g| {
@@ -18283,24 +18283,24 @@ fn main() {
                 .expect("generator required for tick dump");
                 std::fs::write(tick_path, ticks).expect("write generated leaf tick dump");
             }
-            if let Ok(path) = std::env::var("MC_SPINE_WG_FLUID_TICKS") {
+            if let Ok(path) = std::env::var("MEGU_WG_FLUID_TICKS") {
                 let ticks = worldgen::take_generated_fluid_ticks()
                     .iter()
                     .map(|(p, id)| format!("{}\t{}\t{}\t{id}\n", p.0, p.1, p.2))
                     .collect::<String>();
                 std::fs::write(path, ticks).expect("write generated fluid tick dump");
             }
-            if let Ok(runtime_path) = std::env::var("MC_SPINE_WG_LEAF_RUNTIME_DUMP") {
-                if std::env::var_os("MC_SPINE_POP_ORDER").is_none() {
-                    eprintln!("[wgdump] leaf runtime diagnostic requires MC_SPINE_POP_ORDER");
+            if let Ok(runtime_path) = std::env::var("MEGU_WG_LEAF_RUNTIME_DUMP") {
+                if std::env::var_os("MEGU_POP_ORDER").is_none() {
+                    eprintln!("[wgdump] leaf runtime diagnostic requires MEGU_POP_ORDER");
                     std::process::exit(2);
                 }
-                let steps: u64 = std::env::var("MC_SPINE_WG_LEAF_RUNTIME_STEPS")
+                let steps: u64 = std::env::var("MEGU_WG_LEAF_RUNTIME_STEPS")
                     .ok()
                     .and_then(|v| v.parse().ok())
                     .filter(|n| *n > 0 && *n <= 10_000)
                     .expect("leaf runtime diagnostic needs 1..=10000 steps");
-                let halo: i32 = std::env::var("MC_SPINE_WG_LEAF_RUNTIME_HALO")
+                let halo: i32 = std::env::var("MEGU_WG_LEAF_RUNTIME_HALO")
                     .ok()
                     .and_then(|v| v.parse().ok())
                     .filter(|n| (0..=3).contains(n))
@@ -18313,12 +18313,12 @@ fn main() {
                     region.hot = warm.clone();
                     region.warm = warm;
                 }
-                let fluid_seeds = std::env::var("MC_SPINE_WG_DIAG_FLUID_SEEDS").ok();
+                let fluid_seeds = std::env::var("MEGU_WG_DIAG_FLUID_SEEDS").ok();
                 let fluid_native =
-                    std::env::var("MC_SPINE_WG_DIAG_FLUID_NATIVE").as_deref() == Ok("1");
+                    std::env::var("MEGU_WG_DIAG_FLUID_NATIVE").as_deref() == Ok("1");
                 let production_fluid =
-                    std::env::var("MC_SPINE_WG_DIAG_PRODUCTION_FLUID").as_deref() == Ok("1");
-                let full_tick = std::env::var("MC_SPINE_WG_DIAG_FULL_TICK").as_deref() == Ok("1");
+                    std::env::var("MEGU_WG_DIAG_PRODUCTION_FLUID").as_deref() == Ok("1");
+                let full_tick = std::env::var("MEGU_WG_DIAG_FULL_TICK").as_deref() == Ok("1");
                 if full_tick {
                     for x in ox..ox + n {
                         for z in oz..oz + n {
@@ -18376,7 +18376,7 @@ fn main() {
                         }
                     }
                 }
-                if std::env::var("MC_SPINE_WG_DIAG_SAVE_WORLD").as_deref() == Ok("1") {
+                if std::env::var("MEGU_WG_DIAG_SAVE_WORLD").as_deref() == Ok("1") {
                     save_world();
                 }
                 let edits = world().lock().unwrap_or_else(|e| e.into_inner());
@@ -18412,26 +18412,26 @@ fn main() {
             );
             // M3 P1a: the load-independent counters for this run, printed after the binary's
             // own phase time so a measurement line and its attribution travel together.
-            // Empty unless `MC_SPINE_M3_PROFILE`/`FEAT_PROFILE` is on.
+            // Empty unless `MEGU_M3_PROFILE`/`FEAT_PROFILE` is on.
             let m3 = worldgen::m3_report();
             if !m3.is_empty() {
                 eprint!("{m3}");
             }
         }
-        if let Ok(path) = std::env::var("MC_SPINE_WG_DUMP_HM") {
-            let n: i32 = std::env::var("MC_SPINE_WG_DUMP_N")
+        if let Ok(path) = std::env::var("MEGU_WG_DUMP_HM") {
+            let n: i32 = std::env::var("MEGU_WG_DUMP_N")
                 .ok()
                 .and_then(|v| v.parse().ok())
                 .unwrap_or(6);
-            let ox: i32 = std::env::var("MC_SPINE_WG_DUMP_X")
+            let ox: i32 = std::env::var("MEGU_WG_DUMP_X")
                 .ok()
                 .and_then(|v| v.parse().ok())
                 .unwrap_or(0);
-            let oz: i32 = std::env::var("MC_SPINE_WG_DUMP_Z")
+            let oz: i32 = std::env::var("MEGU_WG_DUMP_Z")
                 .ok()
                 .and_then(|v| v.parse().ok())
                 .unwrap_or(0);
-            let terrain_only = std::env::var("MC_SPINE_WG_DUMP_HM_TERRAIN").is_ok();
+            let terrain_only = std::env::var("MEGU_WG_DUMP_HM_TERRAIN").is_ok();
             crate::generation_context::heightmap_dump(&path, n, ox, oz, terrain_only);
         }
         if std::env::var("WGD2").is_ok() {
@@ -18662,11 +18662,11 @@ fn main() {
     }
     // datapack worldgen uses the saved seed by default. An explicit environment seed may only
     // select a new world's seed or confirm the existing one.
-    let requested_seed = std::env::var("MC_SPINE_SEED")
+    let requested_seed = std::env::var("MEGU_SEED")
         .ok()
         .map(|v| {
             worldgen::parse_world_seed(&v)
-                .expect("MC_SPINE_SEED must be a signed long or its unsigned bit pattern")
+                .expect("MEGU_SEED must be a signed long or its unsigned bit pattern")
         });
     let saved_seed = match load_world_seed_in(&world_save_dir()) {
         Ok(seed) => seed,
@@ -18682,7 +18682,7 @@ fn main() {
             std::process::exit(1);
         }
     };
-    if std::env::var("MC_SPINE_WG").ok().as_deref() != Some("old") {
+    if std::env::var("MEGU_WG").ok().as_deref() != Some("old") {
         if worldgen::init(wg_seed, name_to_state) {
             // The Nether and the End are generated by the same seed with their own noise
             // settings, so they are installed here, once, next to the Overworld: a streamed
@@ -18700,7 +18700,7 @@ fn main() {
             }
             *WORLD_SPAWN.lock().unwrap_or_else(|e| e.into_inner()) = (0.5, worldgen::surface_of(0, 0) as f64 + 0.5, 0.5, 0.0);
             eprintln!("[wg] vanilla datapack worldgen active (seed {})", wg_seed);
-            if let Ok(spec) = std::env::var("MC_SPINE_DFDUMP") {
+            if let Ok(spec) = std::env::var("MEGU_DFDUMP") {
                 worldgen::dfdump(&spec);
             }
         } else {
@@ -18723,13 +18723,13 @@ fn main() {
     // A configured live Anvil directory imports after the overlay save so its
     // chunks win where both stores name the same position.
     live_anvil_load_if_armed();
-    // Opt-in delta WAL (`MC_SPINE_WAL_PATH`): replay journaled post-save edits
+    // Opt-in delta WAL (`MEGU_WAL_PATH`): replay journaled post-save edits
     // last so the newest recorded write wins, then arm the journal for live
     // edits. A no-op unless the variable names a valid path.
     dwal_boot_recover_and_arm();
     // The initial-spawn decision happens after the save loads so a recorded
     // `setworldspawn` always wins; only a world with nothing recorded (or an
-    // explicit MC_SPINE_SAFE_SPAWN=1) takes the dry-ground search.
+    // explicit MEGU_SAFE_SPAWN=1) takes the dry-ground search.
     if safe_spawn_search_enabled(fresh_world) {
         let (x, y, z) = compute_safe_initial_world_spawn();
         let mut spawn = WORLD_SPAWN.lock().unwrap_or_else(|e| e.into_inner());
@@ -18741,7 +18741,7 @@ fn main() {
         std::process::exit(1);
     }
     // Fail before any state is loaded or listener opened.
-    let bind = std::env::var("MC_SPINE_BIND_ADDR").unwrap_or_else(|_| "127.0.0.1".into());
+    let bind = std::env::var("MEGU_BIND_ADDR").unwrap_or_else(|_| "127.0.0.1".into());
     if let Err(why) = connection_limits::check_bind(
         "game listener",
         &bind,
@@ -18767,7 +18767,7 @@ fn main() {
         &bind,
         online_mode_enabled(),
         velocity_forwarding_enabled(),
-        env_flag("MC_SPINE_ALLOW_INSECURE_OFFLINE_PUBLIC"),
+        env_flag("MEGU_ALLOW_INSECURE_OFFLINE_PUBLIC"),
     ) {
         eprintln!("[security] {why}");
         std::process::exit(2);
@@ -18782,12 +18782,12 @@ fn main() {
     http_server();
     // Opt-in debug seeding of a few mobs near spawn (only if none restored
     // from save). Vanilla spawns nothing at startup; a live natural spawner
-    // populates the area instead. `MC_SPINE_DEBUG_SEED_MOBS=1` (the issue-#88
-    // name; `MC_SPINE_SEED_DEBUG_MOBS` stays accepted) restores the old fixed
+    // populates the area instead. `MEGU_DEBUG_SEED_MOBS=1` (the issue-#88
+    // name; `MEGU_SEED_DEBUG_MOBS` stays accepted) restores the old fixed
     // cow/zombie pair for harnesses that want a known entity set.
     seed_debug_mobs(
-        std::env::var("MC_SPINE_DEBUG_SEED_MOBS").as_deref() == Ok("1")
-            || std::env::var("MC_SPINE_SEED_DEBUG_MOBS").as_deref() == Ok("1"),
+        std::env::var("MEGU_DEBUG_SEED_MOBS").as_deref() == Ok("1")
+            || std::env::var("MEGU_SEED_DEBUG_MOBS").as_deref() == Ok("1"),
     );
     // The live autosave worker: periodic saves hand it serialized snapshots so
     // a slow disk coalesces behind one pending slot instead of stalling the
@@ -18873,7 +18873,7 @@ fn main() {
             String::new()
         });
     });
-    let port: u16 = std::env::var("MC_SPINE_PORT")
+    let port: u16 = std::env::var("MEGU_PORT")
         .ok()
         .and_then(|p| p.parse().ok())
         .unwrap_or(25599);
@@ -18891,9 +18891,9 @@ fn main() {
     } else {
         "offline identities; no Mojang authentication"
     };
-    eprintln!("mc-spine v0.6 listening {bind}:{port} ({identity_mode})");
+    eprintln!("megu v0.6 listening {bind}:{port} ({identity_mode})");
     if !connection_limits::is_loopback_bind(&bind) {
-        eprintln!("[security] non-loopback bind (MC_SPINE_ALLOW_PUBLIC_BIND set): restrict access with a firewall/private network");
+        eprintln!("[security] non-loopback bind (MEGU_ALLOW_PUBLIC_BIND set): restrict access with a firewall/private network");
     }
     static ACTIVE: AtomicUsize = AtomicUsize::new(0);
     for s in l.incoming().flatten() {
@@ -19781,14 +19781,14 @@ mod mineshaft_runtime_tests {
 
         // An operator in survival is trusted (check_ops defaults to false).
         ac_test_set_player_preset("AcOperator", AcPreset::Standard);
-        std::env::set_var("MC_SPINE_ALLOW_PLAYER_ADMIN_COMMANDS", "1");
+        std::env::set_var("MEGU_ALLOW_PLAYER_ADMIN_COMMANDS", "1");
         let (mut sock, server_thread, me) = connect_play_client("AcOperator", [0x46u8; 16]);
         *me.gm.lock().unwrap_or_else(|e| e.into_inner()) = 0;
         *me.pos.lock().unwrap_or_else(|e| e.into_inner()) = (0.5, 71.0, 0.5, 0.0, 0.0, true);
         ac_move(&mut sock, (9000.5, 71.0, 0.5), true);
         let op_x = x_of(&me);
         let reason = ac_exemption(&me);
-        std::env::remove_var("MC_SPINE_ALLOW_PLAYER_ADMIN_COMMANDS");
+        std::env::remove_var("MEGU_ALLOW_PLAYER_ADMIN_COMMANDS");
         assert_eq!(reason, Some("operator"));
         assert_eq!(op_x, 9000.5, "an operator's move is not checked");
         ac_move(&mut sock, (0.5, 71.0, 0.5), true);
@@ -20895,7 +20895,7 @@ mod wire_ops_tests {
 
     fn wire_ops_dir(tag: &str) -> std::path::PathBuf {
         let dir = std::env::temp_dir()
-            .join(format!("mc-spine-wire-ops-{tag}-{}", std::process::id()));
+            .join(format!("megu-wire-ops-{tag}-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         dir
@@ -20951,19 +20951,19 @@ mod wire_ops_tests {
         assert_eq!(ac_player_rtt_ms(-4242), 250);
     }
 
-    /// Opt-in `MC_SPINE_WAL_PATH`: a live edit lands in the journal, a
+    /// Opt-in `MEGU_WAL_PATH`: a live edit lands in the journal, a
     /// crash-recovery replays it into the live overlay, and a checkpointed
     /// full save compacts the log to its anchor marker.
     #[test]
     fn wire_ops_dwal_append_recover_replay_and_compact() {
-        // `MC_SPINE_WAL_PATH`, `DWAL_ON`, the journal slot and live world cells
+        // `MEGU_WAL_PATH`, `DWAL_ON`, the journal slot and live world cells
         // are all process-global: the §5.2 WAL tests share every one of them.
         let _guard = world_guard();
         let dir = wire_ops_dir("dwal");
         let wal_path = dir.join("delta.wal");
         let save_dir = dir.join("save");
         std::fs::create_dir_all(&save_dir).unwrap();
-        std::env::set_var("MC_SPINE_WAL_PATH", &wal_path);
+        std::env::set_var("MEGU_WAL_PATH", &wal_path);
         wire_ops_dwal_disarm();
 
         let dim = DimId::Overworld;
@@ -21018,25 +21018,25 @@ mod wire_ops_tests {
 
         // Leave nothing behind: journal off, env cleared, cells dropped.
         wire_ops_dwal_disarm();
-        std::env::remove_var("MC_SPINE_WAL_PATH");
+        std::env::remove_var("MEGU_WAL_PATH");
         wire_lock(world()).remove(&chunk_key);
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// An invalid `MC_SPINE_WAL_PATH` must behave like an unset one — no
+    /// An invalid `MEGU_WAL_PATH` must behave like an unset one — no
     /// journal, no writes, no crash.
     #[test]
     fn wire_ops_dwal_rejects_traversal_path() {
-        // Mutates `MC_SPINE_WAL_PATH`; another WAL test's `dwal_path_from_env`
+        // Mutates `MEGU_WAL_PATH`; another WAL test's `dwal_path_from_env`
         // read beside this one is exactly the flake the guard exists for.
         let _guard = world_guard();
         let dir = wire_ops_dir("dwal-bad");
-        let saved = std::env::var_os("MC_SPINE_WAL_PATH");
-        std::env::set_var("MC_SPINE_WAL_PATH", dir.join("..").join("escape.wal"));
+        let saved = std::env::var_os("MEGU_WAL_PATH");
+        std::env::set_var("MEGU_WAL_PATH", dir.join("..").join("escape.wal"));
         assert!(dwal_path_from_env().is_none());
         match saved {
-            Some(v) => std::env::set_var("MC_SPINE_WAL_PATH", v),
-            None => std::env::remove_var("MC_SPINE_WAL_PATH"),
+            Some(v) => std::env::set_var("MEGU_WAL_PATH", v),
+            None => std::env::remove_var("MEGU_WAL_PATH"),
         }
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -21056,7 +21056,7 @@ mod ultra_disk_5_tests {
 
     fn d5_dir(tag: &str) -> std::path::PathBuf {
         let dir = std::env::temp_dir()
-            .join(format!("mc-spine-ultra-disk-5-{tag}-{}", std::process::id()));
+            .join(format!("megu-ultra-disk-5-{tag}-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         dir
@@ -21150,7 +21150,7 @@ mod ultra_disk_5_tests {
         let wal_path = dir.join("delta.wal");
         let save_dir = dir.join("save");
         std::fs::create_dir_all(&save_dir).unwrap();
-        std::env::set_var("MC_SPINE_WAL_PATH", &wal_path);
+        std::env::set_var("MEGU_WAL_PATH", &wal_path);
         d5_dwal_disarm();
         dwal_boot_recover_and_arm();
         assert!(dwal_enabled());
@@ -21221,7 +21221,7 @@ mod ultra_disk_5_tests {
         assert!(report.records.is_empty());
 
         d5_dwal_disarm();
-        std::env::remove_var("MC_SPINE_WAL_PATH");
+        std::env::remove_var("MEGU_WAL_PATH");
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -21235,14 +21235,14 @@ mod ultra_disk_5_tests {
         let backup_dir = dir.join("backups");
         let newest = backup_dir.join("world.bak");
         let old_tick = TICK.load(Ordering::Relaxed);
-        let old_keep = std::env::var_os("MC_SPINE_BACKUP_MAX_KEEP");
+        let old_keep = std::env::var_os("MEGU_BACKUP_MAX_KEEP");
         let old_min = backup_rotate_min_ticks();
         // Reset global rotation state so earlier tests' rotations cannot
         // suppress this one's interval window.
         backup_last_digests().lock().unwrap_or_else(|e| e.into_inner()).clear();
         LAST_BACKUP_ROTATE_TICK.store(0, Ordering::Relaxed);
         set_backup_rotate_min_ticks(6000);
-        std::env::set_var("MC_SPINE_BACKUP_MAX_KEEP", "3");
+        std::env::set_var("MEGU_BACKUP_MAX_KEEP", "3");
         TICK.store(1_000_000, Ordering::Relaxed);
 
         let snapshot_of = |tag: u8| WorldSaveSnapshot {
@@ -21294,8 +21294,8 @@ mod ultra_disk_5_tests {
         // Restore shared state: tick, env, rotation trackers.
         TICK.store(old_tick, Ordering::Relaxed);
         match old_keep {
-            Some(v) => std::env::set_var("MC_SPINE_BACKUP_MAX_KEEP", v),
-            None => std::env::remove_var("MC_SPINE_BACKUP_MAX_KEEP"),
+            Some(v) => std::env::set_var("MEGU_BACKUP_MAX_KEEP", v),
+            None => std::env::remove_var("MEGU_BACKUP_MAX_KEEP"),
         }
         set_backup_rotate_min_ticks(old_min);
         backup_last_digests().lock().unwrap_or_else(|e| e.into_inner()).clear();
@@ -21836,7 +21836,7 @@ mod w3_live_wire_tests {
         );
     }
 
-    /// #3: `live_server_policy()` joins `MC_SPINE_FAIR_PLAY` at the join
+    /// #3: `live_server_policy()` joins `MEGU_FAIR_PLAY` at the join
     /// decision — `unrestricted` sends nothing, `fair_play` sends the reset
     /// plus selective deny codes, `disabled` sends the full lock — and
     /// `max_frame_mib` scales the decompressed play-frame bound.
@@ -21844,9 +21844,9 @@ mod w3_live_wire_tests {
     fn w3_live_wire_policy_minimap_signal_and_frame_bound() {
         let _guard = world_guard();
         const ENVS: [&str; 3] = [
-            "MC_SPINE_FAIR_PLAY",
-            "MC_SPINE_ALLOW_CAVE_MAP",
-            "MC_SPINE_ALLOW_ENTITY_RADAR",
+            "MEGU_FAIR_PLAY",
+            "MEGU_ALLOW_CAVE_MAP",
+            "MEGU_ALLOW_ENTITY_RADAR",
         ];
         let saved_env: Vec<Option<std::ffi::OsString>> =
             ENVS.iter().map(env::var_os).collect();
@@ -21917,10 +21917,10 @@ mod w3_live_wire_tests {
                 .unwrap_or_else(|e| e.into_inner());
             p.minimap_mode = "unrestricted".to_owned();
         }
-        env::set_var("MC_SPINE_FAIR_PLAY", "1");
+        env::set_var("MEGU_FAIR_PLAY", "1");
         let policy = map_fair_play_policy();
         assert_eq!(policy.control, "§f§a§i§r§x§a§e§r§o");
-        env::remove_var("MC_SPINE_FAIR_PLAY");
+        env::remove_var("MEGU_FAIR_PLAY");
         // `max_frame_mib` scales the decompressed frame bound.
         live_server_policy()
             .lock()

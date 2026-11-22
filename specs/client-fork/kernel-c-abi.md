@@ -1,8 +1,8 @@
 # CF-0 shared kernel C ABI v1
 
-`client-kernel/` builds `mc_spine_kernel` as a Rust `rlib` and a C-linkable
+`client-kernel/` builds `megu_kernel` as a Rust `rlib` and a C-linkable
 `cdylib`. It has no Cargo dependencies or additional native libraries. Its
-source build uses the mc-spine checkout and the repository-pinned Rust
+source build uses the megu checkout and the repository-pinned Rust
 toolchain. The first-party license is
 `LGPL-3.0-or-later OR GPL-3.0-or-later OR AGPL-3.0-or-later`.
 See [LICENSE](../../LICENSE), [COPYING.LESSER](../../COPYING.LESSER),
@@ -10,9 +10,9 @@ See [LICENSE](../../LICENSE), [COPYING.LESSER](../../COPYING.LESSER),
 Brigadier MIT attribution.
 
 The C11 and C++ declarations in
-[`mc_spine_kernel.h`](../../client-kernel/include/mc_spine_kernel.h)
-define ABI v1. Check that `mc_spine_kernel_abi_version()` equals
-`MC_SPINE_KERNEL_ABI_VERSION` before calling other symbols. The ABI uses
+[`megu_kernel.h`](../../client-kernel/include/megu_kernel.h)
+define ABI v1. Check that `megu_kernel_abi_version()` equals
+`MEGU_KERNEL_ABI_VERSION` before calling other symbols. The ABI uses
 C-layout records, fixed-width record fields, native pointers and `size_t`
 for buffer extents. Scalars use native byte order. Protocol and NBT byte
 spans carry their respective wire encodings.
@@ -33,7 +33,7 @@ world. Migration of server callers belongs to the broader
 
 ## Entry points
 
-Names below use the `mc_spine_kernel_` prefix. Palette wire decode, lighting
+Names below use the `megu_kernel_` prefix. Palette wire decode, lighting
 and the block-state registry are additive ABI v1 symbols.
 
 | Family | Entry points | Contract |
@@ -108,11 +108,11 @@ TMPDIR="$PWD/target/tmp" cargo build --manifest-path client-kernel/Cargo.toml --
 kernel_lib="$PWD/client-kernel/target/release"
 gcc -std=c11 -Wall -Wextra -Werror -pedantic \
   -I client-kernel/include client-kernel/tests/abi_roundtrip.c \
-  -L "$kernel_lib" -Wl,-rpath,"$kernel_lib" -lmc_spine_kernel \
+  -L "$kernel_lib" -Wl,-rpath,"$kernel_lib" -lmegu_kernel \
   -o "$TMPDIR/kernel-abi-roundtrip"
 "$TMPDIR/kernel-abi-roundtrip"
 g++ -std=c++11 -Wall -Wextra -Werror -pedantic -fsyntax-only -x c++ \
-  client-kernel/include/mc_spine_kernel.h
+  client-kernel/include/megu_kernel.h
 
 TMPDIR="$PWD/target/tmp" cargo fmt --manifest-path client-kernel/Cargo.toml -- --check
 cargo clippy --manifest-path client-kernel/Cargo.toml --offline --locked --all-targets -- -D warnings

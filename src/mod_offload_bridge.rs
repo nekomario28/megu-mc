@@ -1,4 +1,4 @@
-// Production bridge between mc-spine and the local mod-adapter crates.
+// Production bridge between megu and the local mod-adapter crates.
 //
 // `include!`d into `main.rs` under `#[cfg(feature = "create-offload")]`, in the same
 // flat root-scope style as `anticheat.rs`/`play_protocol.rs`, so the layers module
@@ -69,7 +69,7 @@ struct ContraptionRider {
 }
 
 /// Everything the feature-gated mod offload owns at runtime. Constructed empty;
-/// `has_work`/`mod_blocks_active` stay false until `MC_SPINE_MOD_OFFLOAD` (or a
+/// `has_work`/`mod_blocks_active` stay false until `MEGU_MOD_OFFLOAD` (or a
 /// test) opts pieces in, keeping untouched vanilla connections and worlds at
 /// literally zero bridge cost.
 #[allow(dead_code)]
@@ -204,13 +204,13 @@ impl ModOffloadBridge {
         }
     }
 
-    /// `MC_SPINE_MOD_OFFLOAD` (comma list): `create` arms the flagship adapter;
+    /// `MEGU_MOD_OFFLOAD` (comma list): `create` arms the flagship adapter;
     /// `universal`/`all` loads the built-in reference profiles; `ae2`, `mekanism`
     /// and `pipez` load single reference profiles. Absent/empty means a fully
     /// vanilla server with zero mod-offload surface.
     fn from_env() -> Self {
         let mut bridge = Self::new();
-        let Ok(spec) = std::env::var("MC_SPINE_MOD_OFFLOAD") else {
+        let Ok(spec) = std::env::var("MEGU_MOD_OFFLOAD") else {
             return bridge;
         };
         let mut profiles: Vec<ModOffloadProfile> = Vec::new();
@@ -221,7 +221,7 @@ impl ModOffloadBridge {
                 "ae2" => profiles.push(mod_profile::ae2_class_profile()),
                 "mekanism" => profiles.push(mod_profile::mekanism_class_profile()),
                 "pipez" => profiles.push(mod_profile::pipez_class_profile()),
-                other => eprintln!("[mod-offload] ignoring unknown MC_SPINE_MOD_OFFLOAD token {other:?}"),
+                other => eprintln!("[mod-offload] ignoring unknown MEGU_MOD_OFFLOAD token {other:?}"),
             }
         }
         if !profiles.is_empty() {
@@ -1295,7 +1295,7 @@ fn mob_r_snapshot(bytes: &[u8], cursor: &mut usize) -> Option<ContraptionSnapsho
 
 // ---------- global bridge + tick hook ----------
 
-/// The process-wide bridge, lazily armed from `MC_SPINE_MOD_OFFLOAD`.
+/// The process-wide bridge, lazily armed from `MEGU_MOD_OFFLOAD`.
 fn mod_offload_bridge() -> &'static Mutex<ModOffloadBridge> {
     static BRIDGE: OnceLock<Mutex<ModOffloadBridge>> = OnceLock::new();
     BRIDGE.get_or_init(|| Mutex::new(ModOffloadBridge::from_env()))

@@ -20,7 +20,7 @@ def main():
     with pinned_runtime(a.jar) as (work, cp, _):
         output = work / "data"
         run_probe(work, cp, ROOT / "tools/structure-oracle/MineshaftDataOracle.java",
-                  "dev.mcspine.tools.MineshaftDataOracle", output,
+                  "dev.megu.tools.MineshaftDataOracle", output,
                   extra_sources=[ROOT / "tools/structure-oracle/NativeHarness.java"])
         files = {target: (output / source).read_bytes() for source, target in FILES.items()}
     meta = json.loads(files["mineshaft_data_1211.json"])

@@ -13,7 +13,7 @@
 | クラス | 何が要る | 無いとどうなるか |
 |---|---|---|
 | Python | `python3` >= 3.9（`str.removeprefix` を使う道具がある） | T0 が動かない |
-| 層ゲート | `depsgx`（CI が `.github/workflows/ci.yml` の `GXKIT_REV` を固定して入れる。`MC_SPINE_DEPSGX` でも可） | `layers_gate_test.py` と `tools/layers_check.sh` は**失敗する**（skip にしない契約）。他は動く |
+| 層ゲート | `depsgx`（CI が `.github/workflows/ci.yml` の `GXKIT_REV` を固定して入れる。`MEGU_DEPSGX` でも可） | `layers_gate_test.py` と `tools/layers_check.sh` は**失敗する**（skip にしない契約）。他は動く |
 | Rust | 固定 toolchain（`rust-toolchain.toml` の 1.98.0）と `Cargo.lock` の crate（初回だけ取得が要る） | T1・T2 が動かない |
 | JDK | JDK 21（`java`/`javac`） | jar 側（T3）の oracle/capture だけが動かない |
 | 固定 jar | 1.21.1 server jar（sha1 固定、**再配布しない**。各自が用意する） | 参照を**作り直す**段だけが動かない。保存済み参照との照合は動く |
@@ -82,5 +82,5 @@ hermetic（temp の合成ツリー・偽の `rustup`/`javac`/`cargo`・実 JDK/C
 導かれること（include の欠落は toolchain があっても Rust を NOT READY にする）、
 `javac -version` の解析（空・雑音・要求不明は NOT_CHECKED）、欠けた入力を赤にできること、
 cwd を変えてもリポジトリを掴むこと、ツリーを書き換えないこと、`cargo` を起動しないこと、
-壊れた `MC_SPINE_DEV_CHECK_TIMEOUT_MS` が exit 2 になること。
+壊れた `MEGU_DEV_CHECK_TIMEOUT_MS` が exit 2 になること。
 `verify.sh` への組み込みは未実施（親が判断する）。

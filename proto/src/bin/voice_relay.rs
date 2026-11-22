@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: LGPL-3.0-or-later OR GPL-3.0-or-later OR AGPL-3.0-or-later
-//! `mc-spine-voice-relay`: zero-dependency operator sidecar for the `VCR1`
-//! UDP proximity voice relay implemented by `mc_spine_proto::voice_relay`.
+//! `megu-voice-relay`: zero-dependency operator sidecar for the `VCR1`
+//! UDP proximity voice relay implemented by `megu_proto::voice_relay`.
 //!
 //! Three modes:
 //!
@@ -28,23 +28,23 @@ use std::net::{IpAddr, Ipv4Addr, SocketAddr, UdpSocket};
 use std::process::ExitCode;
 use std::time::{Duration, Instant};
 
-use mc_spine_proto::voice_relay::{
+use megu_proto::voice_relay::{
     decode_packet, encode_packet, UdpVoiceRelay, VoicePacket, VoicePlayerState, VoiceRelayConfig,
     VoiceRelayState,
 };
 
 const HELP: &str = "\
-mc-spine-voice-relay — zero-dependency `VCR1` UDP proximity voice relay
+megu-voice-relay — zero-dependency `VCR1` UDP proximity voice relay
 
 USAGE:
-    mc-spine-voice-relay [OPTIONS]
+    megu-voice-relay [OPTIONS]
 
 OPTIONS:
     --bind <ip:port>           UDP socket to serve on (default 127.0.0.1:24454).
                                Only loopback binds are permitted unless
                                --allow-public-bind is passed.
     --allow-public-bind        Opt in to binding a non-loopback address. The
-                               default posture matches mc-spine: LAN exposure
+                               default posture matches megu: LAN exposure
                                must be a deliberate operator choice.
     --max-distance <f64>       Earshot for normal speech, blocks (default 48.0).
     --whisper-distance <f64>   Earshot for whispered frames, blocks (default 16.0).
@@ -216,7 +216,7 @@ fn main() -> ExitCode {
         }
         Ok(Parsed::Run(c)) => c,
         Err(e) => {
-            eprintln!("error: {e}\nrun `mc-spine-voice-relay --help` for usage");
+            eprintln!("error: {e}\nrun `megu-voice-relay --help` for usage");
             return ExitCode::from(2);
         }
     };
@@ -267,7 +267,7 @@ fn main() -> ExitCode {
 fn serve(bind: SocketAddr, config: VoiceRelayConfig) -> io::Result<()> {
     let mut relay = UdpVoiceRelay::bind(bind, VoiceRelayState::new(config.clone()))?;
     eprintln!(
-        "mc-spine-voice-relay: VCR1 listening on {} \
+        "megu-voice-relay: VCR1 listening on {} \
          (max_distance={}, whisper_distance={}, max_pps={})",
         relay.local_addr()?,
         config.max_distance,

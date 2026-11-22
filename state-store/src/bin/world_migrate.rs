@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: LGPL-3.0-or-later OR GPL-3.0-or-later OR AGPL-3.0-or-later
-//! `mc-spine-world-migrate`: inspect `STV1` world snapshots and migrate world
+//! `megu-world-migrate`: inspect `STV1` world snapshots and migrate world
 //! data between Minecraft `1.21.1` and `26.3`, plus the pure-offline operator
 //! subcommands `audit-query` / `rollback` over `AUD1` audit logs and
 //! `pregen-plan` / `pregen-run` for spiral pregeneration sizing and execution.
@@ -8,8 +8,8 @@
 //! rollback or bad command line, `1` anything wrong with the files themselves
 //! (unreadable, corrupt, CRC mismatch, malformed JSON).
 
-use mc_spine_core::version::TargetVersion;
-use mc_spine_state_store::{
+use megu_core::version::TargetVersion;
+use megu_state_store::{
     decode_snapshot, encode_snapshot, inspect_anvil_world_dir, inspect_snapshot,
     migrate_anvil_level_dat, migrate_json_document, migrate_snapshot, to_data_json,
     write_file_atomic, AnvilInspectError, AuditAction, AuditLog, AuditQuery, AuditRecord,
@@ -21,20 +21,20 @@ use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
 const HELP: &str = "\
-mc-spine-world-migrate — inspect and migrate mc-spine world data
+megu-world-migrate — inspect and migrate megu world data
 between Minecraft 1.21.1 (DataVersion 3955) and 26.3 (DataVersion 5023)
 
 USAGE:
-    mc-spine-world-migrate inspect <file.stv1> [--json]
-    mc-spine-world-migrate inspect-anvil <world_dir> [--json]
-    mc-spine-world-migrate migrate --in <in.stv1> --out <out.stv1> --to <1.21.1|26.3> [--allow-downgrade] [--json]
-    mc-spine-world-migrate migrate-json --in <in.json> --out <out.json> --to <1.21.1|26.3> [--allow-downgrade] [--json]
-    mc-spine-world-migrate migrate-level --in <in_level.dat> --out <out_level.dat> --to <1.21.1|26.3> [--allow-downgrade] [--backup-old] [--json]
-    mc-spine-world-migrate audit-query --log <audit.aud1> [--actor <name>] [--dim <dim>] [--pos <x,y,z> --radius <r>] [--since-tick <t>] [--limit <n>] [--json]
-    mc-spine-world-migrate rollback --log <audit.aud1> --in <world.stv1> --out <restored.stv1> [--actor <name>] [--dim <dim>] [--pos <x,y,z> --radius <r>] [--since-tick <t>] [--max-blocks <n>] [--json]
-    mc-spine-world-migrate pregen-plan --radius <chunks> [--shape square|circle] [--center <cx,cz>] [--batch-size <n>] [--json]
-    mc-spine-world-migrate pregen-run --radius <chunks> --budget-per-tick <n> [--shape square|circle] [--center <cx,cz>] [--max-resident <n>] [--json]
-    mc-spine-world-migrate --help
+    megu-world-migrate inspect <file.stv1> [--json]
+    megu-world-migrate inspect-anvil <world_dir> [--json]
+    megu-world-migrate migrate --in <in.stv1> --out <out.stv1> --to <1.21.1|26.3> [--allow-downgrade] [--json]
+    megu-world-migrate migrate-json --in <in.json> --out <out.json> --to <1.21.1|26.3> [--allow-downgrade] [--json]
+    megu-world-migrate migrate-level --in <in_level.dat> --out <out_level.dat> --to <1.21.1|26.3> [--allow-downgrade] [--backup-old] [--json]
+    megu-world-migrate audit-query --log <audit.aud1> [--actor <name>] [--dim <dim>] [--pos <x,y,z> --radius <r>] [--since-tick <t>] [--limit <n>] [--json]
+    megu-world-migrate rollback --log <audit.aud1> --in <world.stv1> --out <restored.stv1> [--actor <name>] [--dim <dim>] [--pos <x,y,z> --radius <r>] [--since-tick <t>] [--max-blocks <n>] [--json]
+    megu-world-migrate pregen-plan --radius <chunks> [--shape square|circle] [--center <cx,cz>] [--batch-size <n>] [--json]
+    megu-world-migrate pregen-run --radius <chunks> --budget-per-tick <n> [--shape square|circle] [--center <cx,cz>] [--max-resident <n>] [--json]
+    megu-world-migrate --help
 
 COMMANDS:
     inspect        Validate an STV1 snapshot file and print what it carries:
@@ -1215,7 +1215,7 @@ fn cmd_audit_query(
                 ("returned", int(returned)),
                 (
                     "schema",
-                    DataValue::Str("mc-spine-audit-query/1".to_string()),
+                    DataValue::Str("megu-audit-query/1".to_string()),
                 ),
                 ("total_records", int(log.len())),
                 ("truncated_tail_bytes", int(truncated)),
@@ -1292,7 +1292,7 @@ fn cmd_rollback(
                 ("output_bytes", int(out.len())),
                 ("output_file", DataValue::Str(output.display().to_string())),
                 ("rolled_back_blocks", int(deltas.len())),
-                ("schema", DataValue::Str("mc-spine-rollback/1".to_string()),),
+                ("schema", DataValue::Str("megu-rollback/1".to_string()),),
                 ("target_version", DataValue::Str(target.id().to_string())),
                 ("total_records", int(log.len())),
                 ("truncated_tail_bytes", int(truncated)),
@@ -1384,7 +1384,7 @@ fn cmd_pregen_plan(
                 ("ring_count", DataValue::Int(rings as i64)),
                 (
                     "schema",
-                    DataValue::Str("mc-spine-pregen-plan/1".to_string()),
+                    DataValue::Str("megu-pregen-plan/1".to_string()),
                 ),
                 ("shape", DataValue::Str(shape_name(shape).to_string())),
                 ("ticks", DataValue::Int(ticks as i64)),
@@ -1458,7 +1458,7 @@ fn cmd_pregen_run(
                 ("resident_chunks", int(report.resident_chunks)),
                 (
                     "schema",
-                    DataValue::Str("mc-spine-pregen-run/1".to_string()),
+                    DataValue::Str("megu-pregen-run/1".to_string()),
                 ),
                 ("shape", DataValue::Str(shape_name(shape).to_string())),
                 (
@@ -1493,7 +1493,7 @@ fn main() -> ExitCode {
     let command = match parse_args(&args) {
         Ok(c) => c,
         Err(e) => {
-            eprintln!("mc-spine-world-migrate: {}", e.message);
+            eprintln!("megu-world-migrate: {}", e.message);
             return ExitCode::from(e.code);
         }
     };
@@ -1559,7 +1559,7 @@ fn main() -> ExitCode {
     match result {
         Ok(()) => ExitCode::SUCCESS,
         Err(e) => {
-            eprintln!("mc-spine-world-migrate: {}", e.message);
+            eprintln!("megu-world-migrate: {}", e.message);
             ExitCode::from(e.code)
         }
     }

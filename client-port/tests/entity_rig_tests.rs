@@ -2,11 +2,11 @@
 
 use std::f32::consts::FRAC_PI_2;
 
-use mc_spine_client_mesh::entity_rig::{
+use megu_client_mesh::entity_rig::{
     build_entity_from_cem_boxes, build_entity_rig_mesh, classify_entity_rig,
     entity_mesh_fingerprint, CemBox, EntityPose, EntityRigArchetype, EntityRigPart,
 };
-use mc_spine_client_mesh::vanilla_plus_3d::ExtrudedMesh;
+use megu_client_mesh::vanilla_plus_3d::ExtrudedMesh;
 
 fn verify_mesh(mesh: &ExtrudedMesh) {
     assert!(!mesh.quads.is_empty());

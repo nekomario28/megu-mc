@@ -30,7 +30,7 @@ Exit status
      pretending the environment is complete.
   1  a required check is MISSING, or any check is ERROR.
   2  the preflight itself could not run (no repository root, unreadable source, or a
-     malformed MC_SPINE_DEV_CHECK_TIMEOUT_MS).
+     malformed MEGU_DEV_CHECK_TIMEOUT_MS).
 
 A route marked READY means the checks it depends on were inspected and hold at this
 preflight's limited scope. It is not a suite result: the commands it names were not run.
@@ -39,7 +39,7 @@ Every line states whether it executed something (`ran:`) or skipped it (`not run
 so a report is never mistaken for work that did not happen.
 
   python3 tools/dev_check.py [--timeout-ms N]     # run from anywhere
-  MC_SPINE_DEV_CHECK_TIMEOUT_MS=N                 # the same bound; non-integer exits 2
+  MEGU_DEV_CHECK_TIMEOUT_MS=N                 # the same bound; non-integer exits 2
 """
 import argparse
 import hashlib
@@ -85,7 +85,7 @@ QUOTE = 300
 JAVAC_VERSION = re.compile(r"^\s*javac\s+(\d+)", re.MULTILINE)
 
 # The standalone workspace crates a quickstart expects next to the root crate.
-# `core` (mc-spine-core) is the shared leaf every other standalone crate builds on.
+# `core` (megu-core) is the shared leaf every other standalone crate builds on.
 STANDALONE_CRATES = (
     "client-port",
     "client-kernel",
@@ -110,10 +110,10 @@ WORKSPACE_FILES = (
 
 # Free-space floor for the build target dir and TMPDIR. A `cargo` build writes
 # several GiB and fails with opaque errors on a full filesystem; under this
-# floor the report warns but stays green unless MC_SPINE_DEV_CHECK_DISK_FATAL
+# floor the report warns but stays green unless MEGU_DEV_CHECK_DISK_FATAL
 # opts in to blocking.
 DISK_MIN_FREE_GIB = 5
-DISK_FATAL_ENV = "MC_SPINE_DEV_CHECK_DISK_FATAL"
+DISK_FATAL_ENV = "MEGU_DEV_CHECK_DISK_FATAL"
 
 
 class Result:
@@ -230,7 +230,7 @@ def check_build_inputs():
     executed = f"ran: scanned {len(sources)} src/*.rs for include_str!/include_bytes!"
     if not sources:
         return Result("build_inputs", MISSING, "no src/*.rs", executed, required=True,
-                      detail="this is not the mc-spine tree")
+                      detail="this is not the megu tree")
     pattern = re.compile(r'include_(?:str|bytes)!\s*\(\s*"([^"]+)"')
     sites = []
     missing = []
@@ -322,9 +322,9 @@ def check_vanilla_jar():
     if pinned is None:
         return Result("vanilla_jar", ERROR, problem, "not run: cannot read the pin",
                       detail="without the pinned identity a jar cannot be judged")
-    env = os.environ.get("MC_SPINE_VANILLA_SERVER_JAR")
+    env = os.environ.get("MEGU_VANILLA_SERVER_JAR")
     if env:
-        path, origin = Path(env).expanduser(), "MC_SPINE_VANILLA_SERVER_JAR"
+        path, origin = Path(env).expanduser(), "MEGU_VANILLA_SERVER_JAR"
     elif default is not None:
         path, origin = default, "the default cache path in tools/vanilla_java.py"
     else:
@@ -403,24 +403,24 @@ def check_jdk(timeout_ms):
 
 
 def check_depsgx():
-    env = os.environ.get("MC_SPINE_DEPSGX")
+    env = os.environ.get("MEGU_DEPSGX")
     if env:
         path = Path(env).expanduser()
         if not path.is_file():
-            return Result("depsgx", MISSING, f"MC_SPINE_DEPSGX is not a file: {path}",
-                          "ran: checked MC_SPINE_DEPSGX")
+            return Result("depsgx", MISSING, f"MEGU_DEPSGX is not a file: {path}",
+                          "ran: checked MEGU_DEPSGX")
         if not os.access(path, os.X_OK):
-            return Result("depsgx", ERROR, "not executable", "ran: checked MC_SPINE_DEPSGX",
+            return Result("depsgx", ERROR, "not executable", "ran: checked MEGU_DEPSGX",
                           detail=str(path))
-        return Result("depsgx", OK, f"MC_SPINE_DEPSGX={path}",
-                      "ran: checked MC_SPINE_DEPSGX (the tool was not executed)",
+        return Result("depsgx", OK, f"MEGU_DEPSGX={path}",
+                      "ran: checked MEGU_DEPSGX (the tool was not executed)",
                       detail="presence only: the version is unverified, so whether it is the "
                              "pinned build is unknown until tools/layers_check.sh runs")
-    venv_env = os.environ.get("MC_SPINE_DEPSGX_VENV")
+    venv_env = os.environ.get("MEGU_DEPSGX_VENV")
     venv_path = (
         Path(venv_env).expanduser()
         if venv_env
-        else Path.home() / ".cache/mc-spine-work/gxkit-venv/bin/depsgx"
+        else Path.home() / ".cache/megu-work/gxkit-venv/bin/depsgx"
     )
     if venv_path.is_file() and os.access(venv_path, os.X_OK):
         return Result("depsgx", OK, str(venv_path),
@@ -432,7 +432,7 @@ def check_depsgx():
                       "ran: looked for depsgx on PATH",
                       detail="tests/layers_gate_test.py and tools/layers_check.sh fail without "
                              "it; CI installs the pinned revision named in "
-                             ".github/workflows/ci.yml (GXKIT_REV), or set MC_SPINE_DEPSGX")
+                             ".github/workflows/ci.yml (GXKIT_REV), or set MEGU_DEPSGX")
     return Result("depsgx", OK, found, "ran: looked for depsgx on PATH (not executed)",
                   detail="presence only: the version is unverified")
 
@@ -468,7 +468,7 @@ def check_disk_headroom():
     """Free space on the build target dir and TMPDIR — a warning, not a gate.
 
     A near-full filesystem fails `cargo` late and opaquely; naming it here is
-    cheap. Never required, and it only blocks when MC_SPINE_DEV_CHECK_DISK_FATAL
+    cheap. Never required, and it only blocks when MEGU_DEV_CHECK_DISK_FATAL
     is set, so tight CI hosts stay green by default.
     """
     target = Path(os.environ.get("CARGO_TARGET_DIR") or (ROOT / "target"))
@@ -528,7 +528,7 @@ def route_blockers(keys, by_key):
 
 
 def render(results, timeout_ms):
-    lines = ["mc-spine preflight (read-only: no build, no download, no install, no server)",
+    lines = ["megu preflight (read-only: no build, no download, no install, no server)",
              f"repo: {ROOT}",
              f"probe timeout: {timeout_ms} ms     python: "
              f"{sys.version_info.major}.{sys.version_info.minor}.{sys.version_info.micro}"]
@@ -586,7 +586,7 @@ def render(results, timeout_ms):
 
 
 def main(argv=None):
-    env_raw = os.environ.get("MC_SPINE_DEV_CHECK_TIMEOUT_MS", "").strip()
+    env_raw = os.environ.get("MEGU_DEV_CHECK_TIMEOUT_MS", "").strip()
     env_timeout, env_problem = DEFAULT_TIMEOUT_MS, None
     if env_raw:
         try:
@@ -600,13 +600,13 @@ def main(argv=None):
                         help="bound for each probe command (default %(default)s)")
     args = parser.parse_args(argv)
     if env_problem is not None:
-        print(f"dev_check: MC_SPINE_DEV_CHECK_TIMEOUT_MS must be an integer, got "
+        print(f"dev_check: MEGU_DEV_CHECK_TIMEOUT_MS must be an integer, got "
               f"{env_problem!r}", file=sys.stderr)
         return 2
     timeout_ms = max(MIN_TIMEOUT_MS, min(MAX_TIMEOUT_MS, args.timeout_ms))
 
     if not (ROOT / "Cargo.toml").is_file() or not (ROOT / "src").is_dir():
-        print(f"dev_check: {ROOT} is not the mc-spine root (no Cargo.toml or src/)",
+        print(f"dev_check: {ROOT} is not the megu root (no Cargo.toml or src/)",
               file=sys.stderr)
         return 2
     try:

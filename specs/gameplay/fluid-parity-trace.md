@@ -1,11 +1,11 @@
 # Fluid update parity trace (Minecraft Java 1.21.1)
 
-Status: portable comparison tool only. **No native capture or mc-spine adapter is included yet**, so passing the tool's own tests does not assert gameplay parity. Tracking issue #39.
+Status: portable comparison tool only. **No native capture or megu adapter is included yet**, so passing the tool's own tests does not assert gameplay parity. Tracking issue #39.
 
 ## Reference boundary and provenance
 
 - Native truth: user's independently obtained, SHA1-pinned Minecraft 1.21.1 server JAR; only observable state-update events should leave that local test environment.
-- Candidate: the mc-spine binary checked out at a specific commit. Use identical scenario, seed, initial blocks, dimension and tick-zero alignment.
+- Candidate: the megu binary checked out at a specific commit. Use identical scenario, seed, initial blocks, dimension and tick-zero alignment.
 - FerrumC's 1.21.8 fluid implementation is a research reference, not a copy source or oracle. This tool contains no FerrumC, Torch, Azalea or Mojang code.
 - Do not check in copied mappings, generated registry tables, entire upstream worlds, or raw Mojang-derived assets. Keep local captures out of commits until a fixture's redistribution/provenance is reviewed.
 
@@ -14,7 +14,7 @@ Status: portable comparison tool only. **No native capture or mc-spine adapter i
 Each trace is UTF-8, newline terminated, and consists of the following fields in exactly this order:
 
 ```text
-# format=mc-spine-fluid-trace-v1
+# format=megu-fluid-trace-v1
 # version=1.21.1
 # scenario=water_hole
 tick	sequence	x	y	z	state
@@ -35,7 +35,7 @@ tick	sequence	x	y	z	state
 
 ```sh
 python3 tests/fluid_trace_diff_test.py
-python3 tools/fluid_trace_diff.py --native /tmp/native.tsv --candidate /tmp/mc-spine.tsv
+python3 tools/fluid_trace_diff.py --native /tmp/native.tsv --candidate /tmp/megu.tsv
 ```
 
 Exit code 0 = exact match, 1 = mismatch, 2 = invalid/uncomparable trace. The JSON report includes counts, first mismatched event, and examples of missing/extra updates. Empty, wrong-version, wrong-scenario, noncontiguous sequence, out-of-order, and truncated traces fail closed.
@@ -43,6 +43,6 @@ Exit code 0 = exact match, 1 = mismatch, 2 = invalid/uncomparable trace. The JSO
 ## Next slices
 
 1. Add independent native 1.21.1 capture of deterministic water, lava, hole-search, two-source, waterlogged and cross-chunk fixtures.
-2. Capture the corresponding mc-spine updates on the same tick alignment and record exact observed events.
+2. Capture the corresponding megu updates on the same tick alignment and record exact observed events.
 3. Add mutation controls for wrong time, missing neighbor wake-up, wrong state, and duplicate publication.
 4. Compare CPU time, p95/p99 tick duration, and RSS **only after** matching output; evaluate the FerrumC kernel design separately.

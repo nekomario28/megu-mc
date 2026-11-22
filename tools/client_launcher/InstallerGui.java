@@ -1,4 +1,4 @@
-package net.mcspine.launcher;
+package net.megu.launcher;
 
 import java.awt.BorderLayout;
 import java.awt.FlowLayout;
@@ -26,7 +26,7 @@ final class InstallerGui {
 
     /** Opens the modal installer dialog and returns the process exit code. */
     static int show() {
-        JDialog dialog = new JDialog((java.awt.Frame) null, "mc-spine Installer", true);
+        JDialog dialog = new JDialog((java.awt.Frame) null, "megu Installer", true);
         JTabbedPane tabs = new JTabbedPane();
         JTextArea status = new JTextArea(5, 48);
         status.setEditable(false);
@@ -54,7 +54,7 @@ final class InstallerGui {
         tabs.addTab("Client", client);
 
         JTextField serverDir = new JTextField(
-                Main.detectMinecraftDir().resolveSibling("mc-spine-server").toString(), 30);
+                Main.detectMinecraftDir().resolveSibling("megu-server").toString(), 30);
         JButton installServer = new JButton("Install server");
         installServer.addActionListener(e -> run(status, () -> Main.installServer(
                 Path.of(serverDir.getText().trim()), null)));
@@ -89,7 +89,7 @@ final class InstallerGui {
             }
             String result = message;
             SwingUtilities.invokeLater(() -> status.setText(result));
-        }, "mc-spine-installer");
+        }, "megu-installer");
         worker.setDaemon(true);
         worker.start();
     }

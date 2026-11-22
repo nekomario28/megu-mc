@@ -1,25 +1,25 @@
 [package]
-name = "mc-spine-server-files"
+name = "megu-server-files"
 version = "0.1.0"
 edition = "2021"
 publish = false
 license = "LGPL-3.0-or-later"
-description = "Standalone Vanilla server files for mc-spine: server.properties, eula.txt, ops/whitelist/bans, usercache.json and atomic persistence"
+description = "Standalone Vanilla server files for megu: server.properties, eula.txt, ops/whitelist/bans, usercache.json and atomic persistence"
 
 # Zero external dependencies by contract: this crate is the clean-room server
 # files core the dedicated-server lanes converge on, so it must build on pure
-# `std`. `mc-spine-core` is the workspace-internal leaf crate (the canonical
+# `std`. `megu-core` is the workspace-internal leaf crate (the canonical
 # TargetVersion registry), not a crates.io dependency.
 [dependencies]
-mc_spine_core = { package = "mc-spine-core", path = "../core" }
+megu_core = { package = "megu-core", path = "../core" }
 
 [[bin]]
-name = "mc-spine-admin"
+name = "megu-admin"
 path = "src/bin/server_init.rs"
 
 [[bin]]
-name = "mc-spine-init"
-path = "src/bin/mc_spine_init.rs"
+name = "megu-init"
+path = "src/bin/megu_init.rs"
 
 # Standalone manifest: the root `[profile.release]` is not inherited, so the
 # shipped binary opts into full optimisation, LTO and symbol stripping itself.

@@ -7,10 +7,10 @@
 // required. Cached at the edge for 10 minutes.
 //
 // Vars (see website/wrangler.toml):
-//   env.GITHUB_REPO  var — "owner/name", default nekomario28/mc-spine
+//   env.GITHUB_REPO  var — "owner/name", default nekomario28/megu-mc
 
 const GITHUB_API = "https://api.github.com";
-const DEFAULT_REPO = "nekomario28/mc-spine";
+const DEFAULT_REPO = "nekomario28/megu-mc";
 const MC_TARGETS = ["1.21.1", "26.3"];
 
 export async function onRequestGet(context) {

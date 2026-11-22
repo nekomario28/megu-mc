@@ -25,7 +25,7 @@
 //! * [`WorldSnapshotStore::create_snapshot`] refuses symlinks, `..`,
 //!   absolute components, NUL bytes, non-UTF-8 names and special files
 //!   (fifos/sockets/devices) anywhere under the world root.
-//! * Manifests are strict JSON (`"format": "mcspine-world-snapshot-v1"`),
+//! * Manifests are strict JSON (`"format": "megu-world-snapshot-v1"`),
 //!   parsed back through the crate's pure-`std` JSON codec with every
 //!   relative path re-validated on load — a hand-edited `../escape` entry
 //!   can never drive a write outside the staging tree.
@@ -54,7 +54,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 /// Manifest format tag, checked on every load so a foreign or corrupt
 /// document can never be mistaken for a snapshot.
-const MANIFEST_FORMAT: &str = "mcspine-world-snapshot-v1";
+const MANIFEST_FORMAT: &str = "megu-world-snapshot-v1";
 
 /// Fail-closed caps. They sit far past any real save — they exist to refuse
 /// garbage, never to bound legitimate worlds.

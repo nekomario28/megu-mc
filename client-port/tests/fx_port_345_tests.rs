@@ -8,9 +8,9 @@ use std::mem::{align_of, size_of};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Mutex;
 
-use mc_spine_client_mesh::builtin_shadow_wgsl::*;
-use mc_spine_client_mesh::vanilla_plus_3d::*;
-use mc_spine_client_mesh::vfx_engine::*;
+use megu_client_mesh::builtin_shadow_wgsl::*;
+use megu_client_mesh::vanilla_plus_3d::*;
+use megu_client_mesh::vfx_engine::*;
 
 // ---------------------------------------------------------------------------
 // Allocation accounting: the FX-4/FX-5 invariants are "zero allocations on

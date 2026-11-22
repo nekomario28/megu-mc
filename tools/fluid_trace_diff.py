@@ -13,7 +13,7 @@ import json
 from pathlib import Path
 import sys
 
-FORMAT = "mc-spine-fluid-trace-v1"
+FORMAT = "megu-fluid-trace-v1"
 VERSION = "1.21.1"
 HEADER = "tick\tsequence\tx\ty\tz\tstate"
 STATE_COUNT = 26684

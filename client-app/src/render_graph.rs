@@ -15,8 +15,8 @@
 //! UBOs; `Classic` keeps the Hi-Z chain for CPU-side occlusion queries but
 //! submits plain per-section draws.
 
-use mc_spine_client_mesh::vfx_engine::{VfxBudget, VfxFrameOutput, VfxHardwareTier};
-use mc_spine_client_mesh::{
+use megu_client_mesh::vfx_engine::{VfxBudget, VfxFrameOutput, VfxHardwareTier};
+use megu_client_mesh::{
     ActiveRenderBackend, PassKind, PipelineStage, BLOCK_ENTITY_INSTANCE_GPU_BYTES,
     KINETIC_INSTANCE_GPU_BYTES, MAX_INSTANCES_PER_UBO_16KB,
 };
@@ -33,7 +33,7 @@ use crate::shaders::{
 // ---------------------------------------------------------------------------
 
 /// The GPU pipeline family a frame plan is tailored for. Mirrors
-/// `mc_spine_client_mesh::ActiveRenderBackend` one-to-one; kept as a
+/// `megu_client_mesh::ActiveRenderBackend` one-to-one; kept as a
 /// distinct type so the graph names stay stable if backend negotiation grows
 /// more variants.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]

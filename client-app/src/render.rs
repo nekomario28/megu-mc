@@ -10,25 +10,25 @@ use std::collections::{HashMap, HashSet};
 use std::path::Path;
 use std::time::{Duration, Instant};
 
-use mc_spine_client_mesh::ffi::PackedVertex;
-use mc_spine_client_mesh::vfx_engine::{
+use megu_client_mesh::ffi::PackedVertex;
+use megu_client_mesh::vfx_engine::{
     Vfx1Packet, VfxBudget, VfxCodecError, VfxFrameOutput, VfxHardwareTier, VfxWorld,
 };
-use mc_spine_client_mesh::{
+use megu_client_mesh::{
     aabb_distance_sq, box_facing_mask, bucket_draw_mask, depth_key, BakedModelQuad,
     DirectionBuckets, DrawOrder, GraphCuller, HiZPyramid, MultidrawScratch,
     RenderBackendPreference, RenderRegions, SectionCoord, DIRECTION_BUCKETS,
     DIRECTION_BUCKET_UNASSIGNED,
 };
 
-use mc_spine_client_mesh::{PackDimension, ShaderOptionOverrides, ShaderPackSource};
-use mc_spine_client_mesh::ber_instancing::{
+use megu_client_mesh::{PackDimension, ShaderOptionOverrides, ShaderPackSource};
+use megu_client_mesh::ber_instancing::{
     build_ber_mesh, VanillaBerFacing, VanillaBerKind, VanillaBerState, VanillaParticleQuad,
     VanillaParticleWorld,
 };
-use mc_spine_client_mesh::entity_rig::{build_entity_rig_mesh, classify_entity_rig, EntityPose};
-use mc_spine_client_mesh::vanilla_plus_3d::ExtrudedMesh;
-use mc_spine_kernel::debug_chords::DebugLine;
+use megu_client_mesh::entity_rig::{build_entity_rig_mesh, classify_entity_rig, EntityPose};
+use megu_client_mesh::vanilla_plus_3d::ExtrudedMesh;
+use megu_kernel::debug_chords::DebugLine;
 
 use crate::audio_qol::ZoomState;
 use crate::lod::LodConfig;
@@ -47,7 +47,7 @@ const NEAR_Z: f64 = 0.08;
 const FAR_Z: f64 = 1024.0;
 const DEFAULT_FOV_DEG: f64 = 70.0;
 
-// Packed vertex `attributes` bit layout (see mc_spine_client_mesh.h).
+// Packed vertex `attributes` bit layout (see megu_client_mesh.h).
 const ATTR_DIRECTION_MASK: u32 = 0x7;
 const ATTR_AO_SHIFT: u32 = 3;
 const ATTR_BLOCK_LIGHT_SHIFT: u32 = 5;
@@ -482,7 +482,7 @@ impl FrameBudgetGovernor {
 }
 
 /// Client-side owner of the bounded fixed-tick VFX simulation. The caller
-/// routes `mc-spine:vfx_v1` custom payload bytes here and submits the
+/// routes `megu:vfx_v1` custom payload bytes here and submits the
 /// resulting [`VfxFrameOutput`] alongside the terrain frame plan.
 pub struct ClientVfxHost {
     pipeline: GpuPipelineKind,
@@ -963,7 +963,7 @@ fn camera_basis(yaw: f32, pitch: f32) -> ([f64; 3], [f64; 3], [f64; 3]) {
 }
 
 /// The six world-space frustum planes of a camera pose at the default FOV,
-/// in `mc_spine_client_mesh::box_in_frustum` form (`dot(n, p) + d >= 0`
+/// in `megu_client_mesh::box_in_frustum` form (`dot(n, p) + d >= 0`
 /// inside). `aspect` is render width / height. Used by the `GraphCuller`
 /// walk and to prioritize `MeshCache::rebuild_dirty_ordered`.
 pub fn frustum_planes(camera: [f32; 3], yaw: f32, pitch: f32, aspect: f64) -> [[f32; 4]; 6] {
@@ -1171,7 +1171,7 @@ fn rasterize_section_opaque(
 /// One placed batch of resource-pack model geometry: `BakedModelQuad`s in
 /// block-local `0..=1` space drawn at `origin` with a uniform `scale`.
 /// Resource packs produce these through
-/// `mc_spine_client_mesh::model_baker::bake_model`.
+/// `megu_client_mesh::model_baker::bake_model`.
 #[derive(Clone, Debug)]
 pub struct BakedModelDraw<'a> {
     /// Quads in block-local model space (e.g. `BakedModel::quads`).
@@ -2150,7 +2150,7 @@ fn clip_depth_slab(a: [f64; 3], b: [f64; 3]) -> Option<([f64; 3], [f64; 3])> {
 }
 
 /// Render world-space [`DebugLine`] wireframes — the F3+G chunk-border
-/// grid from [`mc_spine_kernel::debug_chords::build_chunk_border_lines`]
+/// grid from [`megu_kernel::debug_chords::build_chunk_border_lines`]
 /// and the F3+B hitboxes from `build_entity_hitbox_lines` — into
 /// `framebuffer`.
 ///
@@ -2384,7 +2384,7 @@ pub fn encode_png_rgb(width: u32, height: u32, rgb: &[u8]) -> Vec<u8> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use mc_spine_client_mesh::SECTION_CELLS;
+    use megu_client_mesh::SECTION_CELLS;
 
     use crate::protocol::{DecodedChunk, DecodedLightData, DecodedSection, DimensionMeta};
     use crate::settings::QualityPreset;

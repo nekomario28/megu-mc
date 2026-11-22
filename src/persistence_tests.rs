@@ -1241,7 +1241,7 @@ fn p2_3_s2a_companion_dim_files_are_written_loaded_and_removed_when_empty() {
     let _world_guard = world_guard();
     p2_3_s2a_init_generators();
     let old_world = std::mem::take(&mut *world().lock().unwrap_or_else(|e| e.into_inner()));
-    let dir = std::env::temp_dir().join(format!("mc-spine-p2_3_s2a-{}", std::process::id()));
+    let dir = std::env::temp_dir().join(format!("megu-p2_3_s2a-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir).expect("scratch save directory");
     let file = |dim: DimId| dim_overlay_path(&dir, dim);

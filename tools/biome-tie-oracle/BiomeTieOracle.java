@@ -1,6 +1,6 @@
 // Recompute the tie-heavy biome answers from the pinned 1.21.1 Climate tree.
 // Reads the committed probe TSV; it does not trust the recorded answer.
-package dev.mcspine.tools;
+package dev.megu.tools;
 
 import java.lang.reflect.*;
 import java.nio.file.*;

@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Vanilla 1.21.1 differential survival+creative parity & save-restart matrix.
 
-Drives one deterministic scenario script against ``mc-spine`` and, with
+Drives one deterministic scenario script against ``megu`` and, with
 ``--with-vanilla``, the pinned official ``server.jar`` (SHA-1
 59353fb40c36d304f2035d51e7d6e6baa98dc05c). Each target runs a full
 Save-v2 stop -> relaunch -> fresh-client reconnect so persisted world,
@@ -133,7 +133,7 @@ EMPTY_STACK = (0, 0, {})
 # on any component outside its fixture set); live servers legitimately emit
 # damage (3), custom_data (0), lore (7), attribute_modifiers (12), potion
 # contents (31), armor_trim (35), banner_patterns (49) etc. This parser mirrors
-# mc-spine's own `slot_read_component` skip table so every Protocol-767
+# megu's own `slot_read_component` skip table so every Protocol-767
 # component payload is consumed correctly; kinds we can value cheaply are
 # returned semantically, opaque kinds as their exact payload hex.
 # ---------------------------------------------------------------------------
@@ -429,7 +429,7 @@ def _snbt_entries(text):
 
 def canonical_inv_slot(kind, slot):
     """Map a `/data get entity Inventory` Slot index to a functional location.
-    mc-spine reports protocol window slots (hotbar 36-44, armor 5-8, offhand
+    megu reports protocol window slots (hotbar 36-44, armor 5-8, offhand
     45); vanilla reports its internal indices (hotbar 0-8, armor 36-39,
     offhand 40). Both normalize to the same hotbar:/main:/armor:/offhand keys."""
     if kind == "vanilla":
@@ -469,7 +469,7 @@ def inventory_dataget(rcon_port, name, kind=None):
         if not (ms and mi and mc):
             continue
         comps = None
-        # vanilla emits unquoted SNBT keys (`components: {...}`), mc-spine
+        # vanilla emits unquoted SNBT keys (`components: {...}`), megu
         # quotes them — accept both.
         km = re.search(r'"?components"?\s*:', entry)
         k = km.end() - 1 if km else -1
@@ -513,7 +513,7 @@ def inventory_item_total(inv, item_name):
 
 
 def settled_inventory(rcon_port, name, kind=None, timeout=15.0):
-    """mc-spine refreshes the player `Inventory` NBT lazily (observed ~5s
+    """megu refreshes the player `Inventory` NBT lazily (observed ~5s
     cadence after the triggering change), so a single read can be mid-cycle
     stale. Poll until two consecutive reads agree."""
     prev = inventory_dataget(rcon_port, name, kind)
@@ -530,7 +530,7 @@ def settled_inventory(rcon_port, name, kind=None, timeout=15.0):
 def inventory_view_of(client):
     """Player-inventory view as {slot: canon_stack}. Prefers the window-0
     SetContainerContent (0x13) when the server sends one, overlaid with every
-    SetContainerSlot (0x15) echo — mc-spine only emits the echoes, vanilla
+    SetContainerSlot (0x15) echo — megu only emits the echoes, vanilla
     emits both, and the merged view is identical either way."""
     w0 = client.contents.get(0)
     base = w0["slots"] if w0 else []
@@ -788,25 +788,25 @@ def server_session(kind, binary, root, jar=JAR):
 
     Vanilla runs survival default + force-gamemode=false so the `gamemode`
     command's persisted value is what the restart join observes — the same
-    semantics mc-spine has."""
+    semantics megu has."""
     root = Path(root)
     root.mkdir(parents=True, exist_ok=True)
     game, rcon_port = port(), port()
     while rcon_port == game:
         rcon_port = port()
     env = dict(os.environ, TMPDIR=str(ROOT / "target/tmp"))
-    if kind == "mc-spine":
+    if kind == "megu":
         for link, source in (("config_packets.bin", ROOT / "config_packets.bin"),
                              ("assets", ROOT / "assets")):
             if not (root / link).exists():
                 (root / link).symlink_to(source,
                                          target_is_directory=source.is_dir())
-        env.update(MC_SPINE_PORT=str(game), MC_SPINE_BIND_ADDR="127.0.0.1",
-                   MC_SPINE_SEED=str(SEED), MC_SPINE_WG="old",
-                   MC_SPINE_RESOURCE_PACK_URL="",
-                   MC_SPINE_RCON_PORT=str(rcon_port), MC_SPINE_RCON_PASS=RCON_PASS,
-                   MC_SPINE_RCON_BIND_ADDR="127.0.0.1")
-        env.pop("MC_SPINE_ALLOW_PLAYER_ADMIN_COMMANDS", None)
+        env.update(MEGU_PORT=str(game), MEGU_BIND_ADDR="127.0.0.1",
+                   MEGU_SEED=str(SEED), MEGU_WG="old",
+                   MEGU_RESOURCE_PACK_URL="",
+                   MEGU_RCON_PORT=str(rcon_port), MEGU_RCON_PASS=RCON_PASS,
+                   MEGU_RCON_BIND_ADDR="127.0.0.1")
+        env.pop("MEGU_ALLOW_PLAYER_ADMIN_COMMANDS", None)
         argv = [str(binary)]
     else:
         if hashlib.sha1(jar.read_bytes()).hexdigest() != JAR_SHA1:
@@ -852,7 +852,7 @@ def server_session(kind, binary, root, jar=JAR):
                     time.sleep(0.25)
             yield game, rcon_port
         finally:
-            proc.terminate()          # SIGTERM -> vanilla/mc-spine Save v2
+            proc.terminate()          # SIGTERM -> vanilla/megu Save v2
             try:
                 proc.wait(timeout=20)
             except subprocess.TimeoutExpired:
@@ -869,7 +869,7 @@ class Env:
         self.c = client
         self.rcon = rcon_port
         self.origin = origin          # (ax, ay, az); floor top = ay-1, feet = ay
-        self.kind = kind              # "mc-spine" | "vanilla" | None
+        self.kind = kind              # "megu" | "vanilla" | None
         self.checks = []
         self.errors = []
         self.touched = set()          # absolute positions ever placed/toggled
@@ -1704,19 +1704,19 @@ def diff_values(a, b, path=""):
     if isinstance(a, dict) and isinstance(b, dict):
         for key in sorted(set(a) | set(b), key=str):
             if key not in a:
-                diffs.append({"path": child(key), "mc-spine": "<absent>", "vanilla": b[key]})
+                diffs.append({"path": child(key), "megu": "<absent>", "vanilla": b[key]})
             elif key not in b:
-                diffs.append({"path": child(key), "mc-spine": a[key], "vanilla": "<absent>"})
+                diffs.append({"path": child(key), "megu": a[key], "vanilla": "<absent>"})
             else:
                 diffs += diff_values(a[key], b[key], child(key))
     elif isinstance(a, list) and isinstance(b, list):
         if len(a) != len(b):
-            diffs.append({"path": path or "<root>", "mc-spine": f"len={len(a)}",
+            diffs.append({"path": path or "<root>", "megu": f"len={len(a)}",
                           "vanilla": f"len={len(b)}"})
         for i, (x, y) in enumerate(zip(a, b)):
             diffs += diff_values(x, y, f"{path}[{i}]" if path else f"[{i}]")
     elif a != b:
-        diffs.append({"path": path or "<root>", "mc-spine": a, "vanilla": b})
+        diffs.append({"path": path or "<root>", "megu": a, "vanilla": b})
     return diffs
 
 
@@ -1734,11 +1734,11 @@ def compare_targets(spine, vanilla):
         matrix.append({
             "scenario": name,
             "status": status,
-            "mc-spine_status": s.get("status"),
+            "megu_status": s.get("status"),
             "vanilla_status": v.get("status"),
             "diff_count": len(diffs),
             "diffs": diffs[:60],
-            "mc-spine_errors": s.get("errors", []),
+            "megu_errors": s.get("errors", []),
             "vanilla_errors": v.get("errors", []),
         })
     return matrix
@@ -1759,7 +1759,7 @@ def build_report(binary, jar, spine, vanilla):
         "targets": {},
     }
     if spine:
-        report["targets"]["mc-spine"] = spine
+        report["targets"]["megu"] = spine
     if vanilla:
         report["targets"]["vanilla"] = vanilla
     if spine and vanilla:
@@ -1812,7 +1812,7 @@ class SelfTest(unittest.TestCase):
         self.assertIn("a.c", paths)
 
     def test_report_schema(self):
-        spine = {"kind": "mc-spine", "scenarios": {}, "restart": None, "errors": []}
+        spine = {"kind": "megu", "scenarios": {}, "restart": None, "errors": []}
         for name in REQUIRED_SCENARIOS:
             spine["scenarios"][name] = {"status": "PASS", "checks": [], "errors": [], "obs": {}}
         vanilla = {"kind": "vanilla", "scenarios": {}, "restart": None, "errors": []}
@@ -1907,7 +1907,7 @@ def faulted_report(kind, exc):
 def main(argv):
     import argparse
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--binary", default=str(ROOT / "target/debug/mc-spine"))
+    parser.add_argument("--binary", default=str(ROOT / "target/debug/megu"))
     parser.add_argument("--with-vanilla", action="store_true")
     parser.add_argument("--vanilla-jar", default=str(JAR))
     parser.add_argument("--self-test", action="store_true")
@@ -1929,9 +1929,9 @@ def main(argv):
     spine = vanilla = None
     try:
         with tempfile.TemporaryDirectory(prefix="matrix-spine-", dir=tmp) as folder:
-            spine = run_target("mc-spine", binary, jar, Path(folder) / "world")
+            spine = run_target("megu", binary, jar, Path(folder) / "world")
     except Exception as exc:
-        spine = faulted_report("mc-spine", exc)
+        spine = faulted_report("megu", exc)
     if args.with_vanilla:
         if not jar.is_file():
             print(f"vanilla jar absent: {jar}", file=sys.stderr)
@@ -1948,7 +1948,7 @@ def main(argv):
     else:
         for row in report["matrix"]:
             print(f"{row['scenario']:38s} {row['status']:9s} "
-                  f"spine={row.get('mc-spine_status', row['status'])} "
+                  f"spine={row.get('megu_status', row['status'])} "
                   f"vanilla={row.get('vanilla_status', '-')} diffs={row.get('diff_count', 0)}")
         print(json.dumps({"summary": report["summary"]}, sort_keys=True))
         if any(r["status"] != "PASS" for r in report["matrix"]):
@@ -1958,8 +1958,8 @@ def main(argv):
                     continue
                 for d in row.get("diffs", [])[:8]:
                     print(f"  {row['scenario']} {d['path']}: "
-                          f"mc-spine={d.get('mc-spine')} vanilla={d.get('vanilla')}")
-                for e in row.get("mc-spine_errors", [])[:3]:
+                          f"megu={d.get('megu')} vanilla={d.get('vanilla')}")
+                for e in row.get("megu_errors", [])[:3]:
                     print(f"  {row['scenario']} spine-error: {e}")
                 for e in row.get("vanilla_errors", [])[:3]:
                     print(f"  {row['scenario']} vanilla-error: {e}")

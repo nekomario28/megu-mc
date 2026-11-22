@@ -5,7 +5,7 @@
 //! The JAR/ZIP entry scan is done locally so real production mod JARs —
 //! where ~100% of entries are Deflate-compressed (`method == 8`) — load
 //! natively: Stored entries pass through verbatim and Deflate entries are
-//! inflated with [`mc_spine_core::zip_archive::inflate_raw_rfc1951`], then
+//! inflated with [`megu_core::zip_archive::inflate_raw_rfc1951`], then
 //! the decoded payloads are repacked as a stored-only archive and ingested
 //! by [`mod_adapter_core::data_loader::load_from_stored_zip`] so recipes,
 //! tags and blockstates share one parse path.
@@ -13,7 +13,7 @@
 use std::collections::BTreeMap;
 use std::path::Path;
 
-use mc_spine_core::zip_archive::{inflate_raw_rfc1951, validate_entry_name};
+use megu_core::zip_archive::{inflate_raw_rfc1951, validate_entry_name};
 use mod_adapter_core::data_loader::{
     load_from_directory as load_mod_directory, load_from_stored_zip as load_mod_zip,
     parse_json, parse_mod_recipe_json, JsonValue, LoadedModData, ParsedModRecipe,

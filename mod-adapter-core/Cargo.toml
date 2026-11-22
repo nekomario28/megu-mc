@@ -7,11 +7,11 @@ description = "Universal zero-JVM mod adapter, declarative offload profile engin
 publish = false
 
 [dependencies]
-mc_spine_core = { package = "mc-spine-core", path = "../core" }
+megu_core = { package = "megu-core", path = "../core" }
 mod-offload = { path = "../mod-offload" }
 
 [[bin]]
-name = "mc-spine-mod-check"
+name = "megu-mod-check"
 path = "src/bin/mod_check.rs"
 
 # Standalone manifest: the root `[profile.release]` is not inherited, so the

@@ -12,7 +12,7 @@ import time
 from container_wire import stack, wire_stack
 from protocol767 import Client, ContractFailure, Reader, local_server, position, require, vint
 
-os.environ["MC_SPINE_ALLOW_PLAYER_ADMIN_COMMANDS"] = "1"
+os.environ["MEGU_ALLOW_PLAYER_ADMIN_COMMANDS"] = "1"
 os.environ.setdefault("MC_PROBE_DEADLINE", "30")
 
 OAK_LOG = 132
@@ -260,7 +260,7 @@ def exercise(binary, root):
 
 if __name__ == "__main__":
     binary = Path(sys.argv[1]).resolve() if len(sys.argv) > 1 else (
-        Path(__file__).resolve().parents[1] / "target/debug/mc-spine")
+        Path(__file__).resolve().parents[1] / "target/debug/megu")
     try:
         with tempfile.TemporaryDirectory(prefix="spine-m2-wire-") as root:
             exercise(binary, Path(root))

@@ -17,8 +17,8 @@ offline harnesses that can observe those paths.
   tools/parity_cache.py --self-test
 
 Cache entries live one JSON document per file under the cache dir (default
-`$XDG_CACHE_HOME/mc-spine/parity-cache`, falling back to
-`~/.cache/mc-spine/parity-cache`) and are written atomically (temp file +
+`$XDG_CACHE_HOME/megu/parity-cache`, falling back to
+`~/.cache/megu/parity-cache`) and are written atomically (temp file +
 rename). Captured output is decoded UTF-8 with replacement, so a cache hit can
 differ from a live run only for non-UTF-8 bytes.
 
@@ -68,8 +68,8 @@ CRATE_EXTRA_HARNESS = {
 
 # Direct consumers in the crate DAG: editing a shared leaf crate invalidates the
 # crates built on it, so their harnesses run as if they had changed too.
-# mc-spine-core is the zero-dependency leaf (see core/Cargo.toml); its direct
-# consumers are the five crates whose manifest names mc-spine-core.
+# megu-core is the zero-dependency leaf (see core/Cargo.toml); its direct
+# consumers are the five crates whose manifest names megu-core.
 CRATE_DOWNSTREAM = {
     "core": ("proto", "state-store", "server-files", "mod-adapter-core",
              "client-kernel"),
@@ -119,7 +119,7 @@ def focused_test(name_filter):
 def default_cache_dir():
     base = os.environ.get("XDG_CACHE_HOME")
     root = Path(base) if base else Path.home() / ".cache"
-    return root / "mc-spine" / "parity-cache"
+    return root / "megu" / "parity-cache"
 
 
 def sha256_file(path):

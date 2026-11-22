@@ -545,7 +545,7 @@ fn generated_fluid_handoff_matches_native_proto_unpack() {
 fn generated_dispatchers_unpack_the_published_generator_queues() {
     let _world_guard = world_guard();
     let _gen_guard = worldgen::lock_gen_for_tests();
-    let is_parent = std::env::var_os("MC_SPINE_GENERATED_DISPATCH_CHILD").as_deref()
+    let is_parent = std::env::var_os("MEGU_GENERATED_DISPATCH_CHILD").as_deref()
         != Some(std::ffi::OsStr::new("1"));
     let epoch = worldgen::generation_seq();
     if is_parent {
@@ -555,7 +555,7 @@ fn generated_dispatchers_unpack_the_published_generator_queues() {
                 "tick_tests::generated_dispatchers_unpack_the_published_generator_queues",
                 "--test-threads=1",
             ])
-            .env("MC_SPINE_GENERATED_DISPATCH_CHILD", "1")
+            .env("MEGU_GENERATED_DISPATCH_CHILD", "1")
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::piped())
             .spawn()
@@ -2622,7 +2622,7 @@ fn tick_pacing_holds_cadence_and_refuses_to_catch_up() {
 fn profile_game_tick() {
     let _world_guard = world_guard();
     let scratch =
-        std::env::var("MC_SPINE_TICK_PROFILE_DIR").expect("use the isolated profiling runner");
+        std::env::var("MEGU_TICK_PROFILE_DIR").expect("use the isolated profiling runner");
     assert_eq!(
         std::env::current_dir().unwrap(),
         std::path::PathBuf::from(scratch)
@@ -5806,27 +5806,27 @@ fn gp2_nightly_hostiles_respect_spawn_light() {
 /// load client's own pacing adds a second source of variance, so a wall-clock A/B there
 /// cannot resolve a change. This drives the same sequence `stream_chunks` drives —
 /// section terrain, band install, overlay, light arrays — over a fixed sweep of chunk
-/// centres, and prints the same counters `MC_SPINE_CHUNK_PROFILE` prints in production.
+/// centres, and prints the same counters `MEGU_CHUNK_PROFILE` prints in production.
 ///
-///   MC_SPINE_CHUNK_BENCH=1 cargo test --release --nocapture chunk_delivery_path_bench
+///   MEGU_CHUNK_BENCH=1 cargo test --release --nocapture chunk_delivery_path_bench
 #[test]
 fn chunk_delivery_path_bench() {
     let _guard = crate::world_guard();
-    if std::env::var("MC_SPINE_CHUNK_BENCH").is_err() {
+    if std::env::var("MEGU_CHUNK_BENCH").is_err() {
         return;
     }
-    // `MC_SPINE_BENCH_WRITER=1` runs a thread that writes blocks the way the tick loop does
+    // `MEGU_BENCH_WRITER=1` runs a thread that writes blocks the way the tick loop does
     // (~500 writes/s for 90 chunks x 111 writes/chunk in 20 s), so the bench can tell
     // whether the cost the production profile shows is computation or contention on the
     // store/band/world locks that every write takes.
     let writer_stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
-    let writer = if std::env::var("MC_SPINE_BENCH_WRITER").is_ok() {
+    let writer = if std::env::var("MEGU_BENCH_WRITER").is_ok() {
         let stop = writer_stop.clone();
         Some(std::thread::spawn(move || {
             // `=inside` writes into the sweep's own chunks, so the encode loop sees a
             // non-empty overlay and takes its per-cell lookup path; the default writes far
             // away, so only the locks are shared.
-            let inside = std::env::var("MC_SPINE_BENCH_WRITER").as_deref() == Ok("inside");
+            let inside = std::env::var("MEGU_BENCH_WRITER").as_deref() == Ok("inside");
             let (x, z) = if inside {
                 (0, 0)
             } else {
@@ -5939,15 +5939,15 @@ fn chunk_delivery_path_bench() {
 /// neighbour is populated, and population order is an input to the feature layer, so the
 /// question "does it change the world?" needs a byte comparison).
 ///
-///   MC_SPINE_CHUNK_DIGEST=1 cargo test --release --nocapture chunk_delivery_digest > a.txt
-///   MC_SPINE_PREFETCH_NEIGHBOUR=1 MC_SPINE_CHUNK_DIGEST=1 ... > b.txt ; diff a.txt b.txt
+///   MEGU_CHUNK_DIGEST=1 cargo test --release --nocapture chunk_delivery_digest > a.txt
+///   MEGU_PREFETCH_NEIGHBOUR=1 MEGU_CHUNK_DIGEST=1 ... > b.txt ; diff a.txt b.txt
 ///
 /// The digest is over the `chunk_data` payload, which is what the client would receive for
 /// that chunk (blocks, biomes, light arrays).
 #[test]
 fn chunk_delivery_digest() {
     let _guard = world_guard();
-    if std::env::var("MC_SPINE_CHUNK_DIGEST").is_err() {
+    if std::env::var("MEGU_CHUNK_DIGEST").is_err() {
         return;
     }
     let _gen_guard = crate::worldgen::lock_gen_for_tests();

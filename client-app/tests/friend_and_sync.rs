@@ -7,12 +7,12 @@ use std::sync::Arc;
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
-use mc_spine_client::cli::{help_text, parse_args};
-use mc_spine_client::friend_client::{
+use megu_client::cli::{help_text, parse_args};
+use megu_client::friend_client::{
     FriendGuestBridge, FriendGuestSession, FriendHostEvent, FriendHostSession,
 };
-use mc_spine_client::protocol::{encode_packet, write_string, write_varint};
-use mc_spine_proto::friend_relay::{InviteCode, TcpFriendRelay, MAX_STREAM_PAYLOAD_BYTES};
+use megu_client::protocol::{encode_packet, write_string, write_varint};
+use megu_proto::friend_relay::{InviteCode, TcpFriendRelay, MAX_STREAM_PAYLOAD_BYTES};
 
 const TIMEOUT: Duration = Duration::from_secs(5);
 

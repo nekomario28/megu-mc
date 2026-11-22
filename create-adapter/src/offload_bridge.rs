@@ -41,7 +41,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::thread;
 
-use mc_spine_core::perf_kit::FingerprintBuilder;
+use megu_core::perf_kit::FingerprintBuilder;
 use mod_offload::region_scheduler::{Region, RegionKey};
 use mod_offload::sleeping_transport::TransportError;
 use mod_offload::sync_bridge::{GraphDeltaSink, MeGraphTarget, OffloadSyncBridge};

@@ -3,7 +3,7 @@
 //! Every expected byte sequence here is either computed by hand from the layout documented in
 //! `brigadier_wire`'s module docs, or captured from the pinned 1.21.1 server jar by building the
 //! same tree in Java and letting the jar's own `ClientboundCommandsPacket` write it (the probe is
-//! recorded in `~/mc-spine-local/audit/brigadier-slice2-*/evidence/probe-output.txt`). Both kinds
+//! recorded in `~/megu-local/audit/brigadier-slice2-*/evidence/probe-output.txt`). Both kinds
 //! of case assert the bytes, never just success: a serializer that writes a plausible-looking but
 //! wrong tree passes every `is_ok` assertion and puts an unloadable tab-completion list on a
 //! client.

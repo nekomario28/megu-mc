@@ -12,7 +12,7 @@
 //! (`ticking_state_packet`, `set_player_team_packet`, `encode_set_equipment`,
 //! `encode_set_passengers`, the 0x33 window open, 0x6d tab list and the
 //! vehicle/input decoders all produce the layouts used here), and its decoders
-//! share mc-spine's fail-closed stance: trailing bytes, malformed varints,
+//! share megu's fail-closed stance: trailing bytes, malformed varints,
 //! over-long strings and unknown component types are [`ProtoError`]s, never
 //! partial packets.
 //!
@@ -155,7 +155,7 @@ pub struct RawComponent {
 /// component patch `VarInt added, VarInt removed, added…, removed…`).
 ///
 /// `count == 0` means the empty stack and carries no further bytes — the
-/// `SlotDisplay` convention vanilla and mc-spine share.
+/// `SlotDisplay` convention vanilla and megu share.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct ItemStack {
     /// `minecraft:item` registry id.
@@ -625,7 +625,7 @@ fn write_item_stack(w: &mut WireWriter, stack: &ItemStack) {
 }
 
 /// Consume one wire item stack. Component payloads have no length prefix, so
-/// boundaries can only be recovered for the component shapes mc-spine
+/// boundaries can only be recovered for the component shapes megu
 /// understands — the same accepted-type table `slot_read_wire`/`wm_stack_decode`
 /// enforce. Unknown types fail the whole stack rather than desynchronizing the
 /// entry list.
@@ -802,7 +802,7 @@ fn skip_component_value(
             }
         }
         // trim: two registry holders (VarInt id each; a `0` holder would mean
-        // "by name" which this codec's accepted set rejects like mc-spine) and
+        // "by name" which this codec's accepted set rejects like megu) and
         // a show-in-tooltip bool.
         "minecraft:trim" => {
             let material = r.read_varint()?;
@@ -824,7 +824,7 @@ fn skip_component_value(
 
 /// `MobEffectInstance` details: amplifier, duration, three bools, optional
 /// nested details (the `hidden_effect` field), bounded at the same depth
-/// mc-spine's `read_live_potion_effect_details` uses.
+/// megu's `read_live_potion_effect_details` uses.
 fn skip_effect_details(r: &mut WireReader<'_>, depth: usize) -> Result<(), ProtoError> {
     if depth == 16 {
         return Err(ProtoError::Malformed("effect details too deep"));
@@ -1875,7 +1875,7 @@ mod tests {
         codec.decode_c2s_in(phase, &frame).unwrap()
     }
 
-    // -- byte-exact agreement with mc-spine's encoders -----------------------
+    // -- byte-exact agreement with megu's encoders -----------------------
 
     #[test]
     fn handshake_frame_is_byte_exact() {
@@ -2242,14 +2242,14 @@ mod tests {
         let c = codec();
         let packet = S2CPacket::TabList {
             header: text_component("Welcome"),
-            footer: text_component("mc-spine"),
+            footer: text_component("megu"),
         };
         let mut frame = Vec::new();
         c.encode_s2c(&packet, &mut frame).unwrap();
         let mut expected = Vec::new();
         write_frame(&mut expected, 0x6d, &{
             let mut b = text_component("Welcome");
-            b.extend_from_slice(&text_component("mc-spine"));
+            b.extend_from_slice(&text_component("megu"));
             b
         });
         assert_eq!(frame, expected);

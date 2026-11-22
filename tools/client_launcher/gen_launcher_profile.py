@@ -14,8 +14,8 @@ import zipfile
 
 
 ROOT = Path(__file__).resolve().parent
-LIBRARY_NAME = "net.mcspine:bootstrapper:1.0.0"
-LIBRARY_PATH = Path("net/mcspine/bootstrapper/1.0.0/bootstrapper-1.0.0.jar")
+LIBRARY_NAME = "net.megu:bootstrapper:1.0.0"
+LIBRARY_PATH = Path("net/megu/bootstrapper/1.0.0/bootstrapper-1.0.0.jar")
 ZIP_TIME = (1980, 1, 1, 0, 0, 0)
 MC_VERSIONS = ("1.21.1", "26.3")
 WINDOWS_EXECUTABLE_SUFFIXES = (".exe", ".bat", ".cmd")
@@ -30,7 +30,7 @@ def iso_utc_now():
 
 
 def build_jar(out_dir):
-    with tempfile.TemporaryDirectory(prefix="mc-spine-javac-") as build:
+    with tempfile.TemporaryDirectory(prefix="megu-javac-") as build:
         compiled = Path(build)
         sources = [str(ROOT / "Main.java")]
         gui = ROOT / "InstallerGui.java"
@@ -40,10 +40,10 @@ def build_jar(out_dir):
                         "--release", "21", "-d", str(compiled),
                         *sources], check=True)
         entries = [("META-INF/MANIFEST.MF",
-                    b"Manifest-Version: 1.0\r\nMain-Class: net.mcspine.launcher.Main\r\n\r\n")]
+                    b"Manifest-Version: 1.0\r\nMain-Class: net.megu.launcher.Main\r\n\r\n")]
         entries.extend((str(path.relative_to(compiled)).replace("\\", "/"), path.read_bytes())
                        for path in sorted(compiled.rglob("*.class")))
-        jar = out_dir / "mc-spine-bootstrapper.jar"
+        jar = out_dir / "megu-bootstrapper.jar"
         with zipfile.ZipFile(jar, "w") as archive:
             for name, data in entries:
                 info = zipfile.ZipInfo(name, ZIP_TIME)
@@ -80,7 +80,7 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--out-dir", type=Path,
                         help="Minecraft directory or staging root for versions/ and libraries/")
-    parser.add_argument("--version-id", help="profile id (default: mc-spine-<mc-version>)")
+    parser.add_argument("--version-id", help="profile id (default: megu-<mc-version>)")
     parser.add_argument("--mc-version", choices=MC_VERSIONS, default="1.21.1",
                         help="Minecraft release the profile inheritsFrom (default: 1.21.1)")
     parser.add_argument("--detect-minecraft-dir", action="store_true",
@@ -94,7 +94,7 @@ def main():
         return
     if args.out_dir is None:
         parser.error("--out-dir is required unless --detect-minecraft-dir is used")
-    args.version_id = args.version_id or f"mc-spine-{args.mc_version}"
+    args.version_id = args.version_id or f"megu-{args.mc_version}"
     if not args.version_id or args.version_id in (".", "..") or any(
             char in args.version_id for char in "/\\"):
         parser.error("--version-id must be a single safe directory name")
@@ -108,7 +108,7 @@ def main():
         "id": args.version_id,
         "inheritsFrom": args.mc_version,
         "type": "release",
-        "mainClass": "net.mcspine.launcher.Main",
+        "mainClass": "net.megu.launcher.Main",
         "releaseTime": stamp,
         "time": stamp,
         "libraries": [{"name": LIBRARY_NAME}],
@@ -122,7 +122,7 @@ def main():
                 path.suffix.lower() not in WINDOWS_EXECUTABLE_SUFFIXES
                 and not path.stat().st_mode & 0o111):
             parser.error("--client-bin must point to an executable native client")
-        game_profile["arguments"] = {"jvm": [f"-Dmc.spine.clientBin={path}"]}
+        game_profile["arguments"] = {"jvm": [f"-Dmegu.clientBin={path}"]}
         if args.client_sha256 and hashlib.sha256(path.read_bytes()).hexdigest() != args.client_sha256.lower():
             parser.error("native client SHA-256 mismatch")
     if args.client_sha256:
@@ -130,7 +130,7 @@ def main():
                                                 for char in args.client_sha256):
             parser.error("--client-sha256 must be 64 hexadecimal characters")
         game_profile.setdefault("arguments", {}).setdefault("jvm", []).append(
-            f"-Dmc.spine.clientSha256={args.client_sha256.lower()}")
+            f"-Dmegu.clientSha256={args.client_sha256.lower()}")
     dest = out_dir / "versions" / args.version_id / (args.version_id + ".json")
     dest.parent.mkdir(parents=True, exist_ok=True)
     dest.write_text(json.dumps(game_profile, indent=2, ensure_ascii=False) + "\n")

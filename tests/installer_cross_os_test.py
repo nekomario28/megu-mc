@@ -32,7 +32,7 @@ def iso8601(value):
 class InstallerCrossOsTest(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
-        cls.temporary = tempfile.TemporaryDirectory(prefix="mc-spine-xos-installer-")
+        cls.temporary = tempfile.TemporaryDirectory(prefix="megu-xos-installer-")
         cls.addClassCleanup(cls.temporary.cleanup)
         cls.root = Path(cls.temporary.name)
         for name in ("jar-a", "jar-b"):
@@ -42,7 +42,7 @@ class InstallerCrossOsTest(unittest.TestCase):
                 capture_output=True, text=True)
             if result.returncode != 0:
                 raise RuntimeError("bootstrapper build failed: " + result.stderr)
-        cls.jar = cls.root / "jar-a" / "mc-spine-bootstrapper.jar"
+        cls.jar = cls.root / "jar-a" / "megu-bootstrapper.jar"
 
     def java(self, *args, os_name=None, user_home=None, env=None, check=False):
         command = ["java", "-Djava.io.tmpdir=" + tempfile.gettempdir(),
@@ -52,9 +52,9 @@ class InstallerCrossOsTest(unittest.TestCase):
         if user_home:
             command.append(f"-Duser.home={user_home}")
         command += ["-jar", str(self.jar), *args]
-        full_env = dict(os.environ, MC_SPINE_HEADLESS="1")
-        full_env.pop("MC_SPINE_CLIENT_BIN", None)
-        full_env.pop("MC_SPINE_CLIENT_SHA256", None)
+        full_env = dict(os.environ, MEGU_HEADLESS="1")
+        full_env.pop("MEGU_CLIENT_BIN", None)
+        full_env.pop("MEGU_CLIENT_SHA256", None)
         if env:
             full_env.update(env)
         result = subprocess.run(command, capture_output=True, text=True,
@@ -87,10 +87,10 @@ class InstallerCrossOsTest(unittest.TestCase):
         self.assertEqual(profile["id"], version_id)
         self.assertEqual(profile["inheritsFrom"], inherits)
         self.assertEqual(profile["type"], "release")
-        self.assertEqual(profile["mainClass"], "net.mcspine.launcher.Main")
+        self.assertEqual(profile["mainClass"], "net.megu.launcher.Main")
         self.assertEqual(profile["libraries"],
-                         [{"name": "net.mcspine:bootstrapper:1.0.0"}])
-        self.assertTrue((mc_dir / "libraries/net/mcspine/bootstrapper/1.0.0"
+                         [{"name": "net.megu:bootstrapper:1.0.0"}])
+        self.assertTrue((mc_dir / "libraries/net/megu/bootstrapper/1.0.0"
                          "/bootstrapper-1.0.0.jar").is_file())
         for key in ("releaseTime", "time"):
             self.assertIn(key, profile)
@@ -98,8 +98,8 @@ class InstallerCrossOsTest(unittest.TestCase):
         return profile
 
     def test_jar_size_and_deterministic_build(self):
-        first = self.root / "jar-a" / "mc-spine-bootstrapper.jar"
-        second = self.root / "jar-b" / "mc-spine-bootstrapper.jar"
+        first = self.root / "jar-a" / "megu-bootstrapper.jar"
+        second = self.root / "jar-b" / "megu-bootstrapper.jar"
         self.assertLess(first.stat().st_size, MAX_JAR)
         self.assertEqual(first.read_bytes(), second.read_bytes())
 
@@ -127,7 +127,7 @@ class InstallerCrossOsTest(unittest.TestCase):
 
         self.java("--install", os_name="Windows 11",
                   env={"APPDATA": str(appdata)}, check=True)
-        version = self.assert_version_json(mc_dir, "mc-spine-1.21.1")
+        version = self.assert_version_json(mc_dir, "megu-1.21.1")
         self.assertNotIn("arguments", version)
 
         # Both launcher profile files updated, both backups hold pre-edit bytes.
@@ -136,9 +136,9 @@ class InstallerCrossOsTest(unittest.TestCase):
             backup = mc_dir / (name + ".bak")
             self.assertTrue(backup.is_file(), name + ".bak")
             self.assertEqual(backup.read_text(encoding="utf-8"), original)
-        self.assert_profile_entry(mc_dir / "launcher_profiles.json", "mc-spine-1.21.1")
+        self.assert_profile_entry(mc_dir / "launcher_profiles.json", "megu-1.21.1")
         self.assert_profile_entry(mc_dir / "launcher_profiles_microsoft_store.json",
-                                  "mc-spine-1.21.1")
+                                  "megu-1.21.1")
         std = self.read_json(mc_dir / "launcher_profiles.json")
         self.assertIn("vanilla prof", std["profiles"])
         self.assertEqual(std["profiles"]["vanilla prof"]["nested"]["a"][2]["b"], "x{y}")
@@ -150,22 +150,22 @@ class InstallerCrossOsTest(unittest.TestCase):
         self.java("--install", os_name="Windows 11",
                   env={"APPDATA": str(appdata)}, check=True)
         std = self.read_json(mc_dir / "launcher_profiles.json")
-        self.assertEqual(list(std["profiles"]).count("mc-spine-1.21.1"), 1)
+        self.assertEqual(list(std["profiles"]).count("megu-1.21.1"), 1)
         self.assertIn("vanilla prof", std["profiles"])
         entry = self.assert_profile_entry(mc_dir / "launcher_profiles.json",
-                                          "mc-spine-1.21.1")
+                                          "megu-1.21.1")
         iso8601(entry["lastUsed"])
 
         # --uninstall removes the version dir and profile entries only.
         self.java("--uninstall", os_name="Windows 11",
                   env={"APPDATA": str(appdata)}, check=True)
-        self.assertFalse((mc_dir / "versions" / "mc-spine-1.21.1").exists())
+        self.assertFalse((mc_dir / "versions" / "megu-1.21.1").exists())
         std = self.read_json(mc_dir / "launcher_profiles.json")
-        self.assertNotIn("mc-spine-1.21.1", std["profiles"])
+        self.assertNotIn("megu-1.21.1", std["profiles"])
         self.assertIn("vanilla prof", std["profiles"])
         self.assertEqual(std["selectedProfile"], "vanilla prof")
         store = self.read_json(mc_dir / "launcher_profiles_microsoft_store.json")
-        self.assertNotIn("mc-spine-1.21.1", store["profiles"])
+        self.assertNotIn("megu-1.21.1", store["profiles"])
         self.assertIn("store one", store["profiles"])
 
     def test_windows_fallback_dir_without_appdata(self):
@@ -175,21 +175,21 @@ class InstallerCrossOsTest(unittest.TestCase):
         env.pop("APPDATA", None)
         self.java("--install", os_name="Windows 11", user_home=str(home),
                   env=env, check=True)
-        self.assert_version_json(mc_dir, "mc-spine-1.21.1")
+        self.assert_version_json(mc_dir, "megu-1.21.1")
 
     def test_macos_library_dir_no_profile_flag(self):
         home = self.root / "mac home"
         mc_dir = home / "Library" / "Application Support" / "minecraft"
         self.java("--install", os_name="Mac OS X", user_home=str(home), check=True)
-        self.assert_version_json(mc_dir, "mc-spine-1.21.1")
-        self.assert_profile_entry(mc_dir / "launcher_profiles.json", "mc-spine-1.21.1")
+        self.assert_version_json(mc_dir, "megu-1.21.1")
+        self.assert_profile_entry(mc_dir / "launcher_profiles.json", "megu-1.21.1")
 
         # --no-profile installs versions/ + libraries/ but leaves profiles alone.
         home2 = self.root / "mac home 2"
         mc_dir2 = home2 / "Library" / "Application Support" / "minecraft"
         self.java("--install", "--no-profile", "--mc-version", "26.3",
                   os_name="Mac OS X", user_home=str(home2), check=True)
-        self.assert_version_json(mc_dir2, "mc-spine-26.3", inherits="26.3")
+        self.assert_version_json(mc_dir2, "megu-26.3", inherits="26.3")
         self.assertFalse((mc_dir2 / "launcher_profiles.json").exists())
         self.assertFalse((mc_dir2 / "launcher_profiles_microsoft_store.json").exists())
 
@@ -199,14 +199,14 @@ class InstallerCrossOsTest(unittest.TestCase):
         flatpak.mkdir(parents=True)
         # Flatpak dir wins only when ~/.minecraft is absent.
         self.java("--install", os_name="Linux", user_home=str(home), check=True)
-        self.assert_version_json(flatpak, "mc-spine-1.21.1")
+        self.assert_version_json(flatpak, "megu-1.21.1")
         self.assertFalse((home / ".minecraft").exists())
 
         # A present ~/.minecraft always wins over the Flatpak location.
         (home / ".minecraft").mkdir()
         self.java("--install", "--mc-version", "26.3",
                   os_name="Linux", user_home=str(home), check=True)
-        self.assert_version_json(home / ".minecraft", "mc-spine-26.3", inherits="26.3")
+        self.assert_version_json(home / ".minecraft", "megu-26.3", inherits="26.3")
 
     def test_install_server_scripts_and_eula_never_forced(self):
         server_dir = self.root / "server dir with spaces"
@@ -225,7 +225,7 @@ class InstallerCrossOsTest(unittest.TestCase):
         self.assertIn(b"\r\n", bat)
         self.assertNotIn(b"\nmc", bat.replace(b"\r\n", b""))
         self.assertTrue(bat.startswith(b"@echo off"))
-        self.assertIn(b"mc-spine.exe %*", bat)
+        self.assertIn(b"megu.exe %*", bat)
         self.assertIn("eula", readme.read_text().lower())
         # The installer must never pre-accept the EULA.
         self.assertFalse((server_dir / "eula.txt").exists())
@@ -243,7 +243,7 @@ class InstallerCrossOsTest(unittest.TestCase):
         server_dir = self.root / "server with bin"
         self.java("--install-server", str(server_dir), "--server-bin", str(fake),
                   check=True)
-        staged = server_dir / "mc-spine"
+        staged = server_dir / "megu"
         self.assertTrue(staged.is_file())
         self.assertEqual(staged.read_bytes(), fake.read_bytes())
         self.assertTrue(stat.S_IMODE(staged.stat().st_mode) & 0o111)
@@ -252,7 +252,7 @@ class InstallerCrossOsTest(unittest.TestCase):
         fake_exe.write_text("MZ")
         self.java("--install-server", str(exe_dir), "--server-bin", str(fake_exe),
                   check=True)
-        self.assertTrue((exe_dir / "mc-spine.exe").is_file())
+        self.assertTrue((exe_dir / "megu.exe").is_file())
 
     def test_install_server_fail_closed(self):
         bad = self.java("--install-server", str(self.root / ".." / "escape"),
@@ -291,10 +291,10 @@ class InstallerCrossOsTest(unittest.TestCase):
         sha = hashlib.sha256(client.read_bytes()).hexdigest()
         self.java("--install", "--minecraft-dir", str(mc_dir),
                   "--client-bin", str(client), "--client-sha256", sha, check=True)
-        profile = self.assert_version_json(mc_dir, "mc-spine-1.21.1")
+        profile = self.assert_version_json(mc_dir, "megu-1.21.1")
         self.assertEqual(profile["arguments"]["jvm"],
-                         [f"-Dmc.spine.clientBin={client.resolve()}",
-                          f"-Dmc.spine.clientSha256={sha}"])
+                         [f"-Dmegu.clientBin={client.resolve()}",
+                          f"-Dmegu.clientSha256={sha}"])
 
         for extra, needle in (
                 (("--mc-version", "bogus"), "unsupported --mc-version"),
@@ -313,14 +313,14 @@ class InstallerCrossOsTest(unittest.TestCase):
         home = self.root / "headless home"
         result = self.java(os_name="Linux", user_home=str(home))
         self.assertEqual(result.returncode, 0, result.stderr)
-        self.assert_version_json(home / ".minecraft", "mc-spine-1.21.1")
+        self.assert_version_json(home / ".minecraft", "megu-1.21.1")
         self.assert_profile_entry(home / ".minecraft" / "launcher_profiles.json",
-                                  "mc-spine-1.21.1")
+                                  "megu-1.21.1")
 
     def test_gen_profile_windows_client_bin_suffix(self):
         """gen_launcher_profile.py accepts .exe/.bat/.cmd client binaries cross-platform."""
         out = self.root / "gen-win-bin"
-        exe = self.root / "mc-spine-client.exe"
+        exe = self.root / "megu-client.exe"
         exe.write_text("MZ not posix executable")
         exe.chmod(0o644)
         result = subprocess.run(
@@ -329,7 +329,7 @@ class InstallerCrossOsTest(unittest.TestCase):
             capture_output=True, text=True)
         self.assertEqual(result.returncode, 0, result.stderr)
         profile = json.loads(
-            (out / "versions/mc-spine-1.21.1/mc-spine-1.21.1.json").read_text())
+            (out / "versions/megu-1.21.1/megu-1.21.1.json").read_text())
         self.assertIn("arguments", profile)
         iso8601(profile["releaseTime"])
         iso8601(profile["time"])

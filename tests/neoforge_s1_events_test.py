@@ -36,7 +36,7 @@ import net.neoforged.neoforge.event.tick.ServerTickEvent;
 import net.neoforged.neoforge.event.ServerChatEvent;
 import net.neoforged.neoforge.event.RegisterCommandsEvent;
 import net.minecraft.commands.Commands;
-import net.mcspine.neoforge.ServerHooks;
+import net.megu.neoforge.ServerHooks;
 
 @Mod("s1fixture")
 public class FixtureMod {
@@ -162,7 +162,7 @@ UNKNOWN_CLASS = """package com.mojang.brigadier.unknown;
 public class Unavailable { public static void invoke() {} }
 """
 
-RUNNER = r"""package net.mcspine.neoforge;
+RUNNER = r"""package net.megu.neoforge;
 import java.util.List;
 import com.mojang.brigadier.CommandDispatcher;
 import net.minecraft.core.BlockPos;
@@ -389,7 +389,7 @@ class NeoForgeS1EventsTests(unittest.TestCase):
             "nf2/LoginSubscriber.java": SUBSCRIBER,
             "nf2/UnsupportedMod.java": UNKNOWN,
             "com/mojang/brigadier/unknown/Unavailable.java": UNKNOWN_CLASS,
-            "net/mcspine/neoforge/S1Checks.java": RUNNER,
+            "net/megu/neoforge/S1Checks.java": RUNNER,
         }
         src = cls.root / "src"
         for relative, content in sources.items():
@@ -429,7 +429,7 @@ class NeoForgeS1EventsTests(unittest.TestCase):
                               cwd=ROOT, env=self.env, capture_output=True, text=True, timeout=30)
 
     def test_shimcheck_accepts_s1_event_mod(self):
-        result = self.run_java("net.mcspine.neoforge.ShimCheck", "--json",
+        result = self.run_java("net.megu.neoforge.ShimCheck", "--json",
                                "--surface", ADAPTER / "shim-surface.json", self.mod_jar)
         self.assertEqual(result.returncode, 0, result.stderr + result.stdout)
         data = json.loads(result.stdout)
@@ -437,34 +437,34 @@ class NeoForgeS1EventsTests(unittest.TestCase):
         self.assertEqual(data["jars"][0]["coverage"]["unsupported"], 0)
 
     def test_s1_rejects_unsupported_brigadier_class(self):
-        result = self.run_java("net.mcspine.neoforge.ShimCheck", "--json",
+        result = self.run_java("net.megu.neoforge.ShimCheck", "--json",
                                "--surface", ADAPTER / "shim-surface.json", self.bad_jar)
         self.assertEqual(result.returncode, 2, result.stderr + result.stdout)
         self.assertIn("com/mojang/brigadier/unknown/Unavailable", result.stdout)
         self.assertIn("UNSUPPORTED_SYMBOL", result.stdout)
 
     def test_six_events_bootstrap_and_batch(self):
-        result = self.run_java("net.mcspine.neoforge.S1Checks", "batch", self.mod_dir.parent)
+        result = self.run_java("net.megu.neoforge.S1Checks", "batch", self.mod_dir.parent)
         self.assertEqual(result.returncode, 0, result.stderr + result.stdout)
         self.assertIn("PASS S1 six events", result.stdout)
 
     def test_six_events_encoded_batch(self):
-        result = self.run_java("net.mcspine.neoforge.S1Checks", "encoded", self.mod_dir.parent)
+        result = self.run_java("net.megu.neoforge.S1Checks", "encoded", self.mod_dir.parent)
         self.assertEqual(result.returncode, 0, result.stderr + result.stdout)
         self.assertIn("PASS encoded S1 six events", result.stdout)
 
     def test_mutation_scopes_and_overflow(self):
-        result = self.run_java("net.mcspine.neoforge.S1Checks", "scopes", self.mod_dir.parent)
+        result = self.run_java("net.megu.neoforge.S1Checks", "scopes", self.mod_dir.parent)
         self.assertEqual(result.returncode, 0, result.stderr + result.stdout)
         self.assertIn("PASS scoped mutation rollback", result.stdout)
 
     def test_actual_event_bus_recursive_dispatch_fail_closed(self):
-        result = self.run_java("net.mcspine.neoforge.S1Checks", "overflow", self.mod_dir.parent)
+        result = self.run_java("net.megu.neoforge.S1Checks", "overflow", self.mod_dir.parent)
         self.assertEqual(result.returncode, 0, result.stderr + result.stdout)
         self.assertIn("PASS real event bus reentrancy", result.stdout)
 
     def test_host_tick_phases_and_damage_round_trip(self):
-        result = self.run_java("net.mcspine.neoforge.S1Checks", "host-events", self.mod_dir.parent)
+        result = self.run_java("net.megu.neoforge.S1Checks", "host-events", self.mod_dir.parent)
         self.assertEqual(result.returncode, 0, result.stderr + result.stdout)
         self.assertIn("PASS host tick phases and pre-absorption damage", result.stdout)
 

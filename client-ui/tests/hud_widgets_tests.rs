@@ -4,8 +4,8 @@
 //! non-overlap, hostile-input sanitization, fade-curve math, Brigadier
 //! completion cycling, and creative-mode vitals hiding.
 
-use mc_spine_client_ui::draw::{text_height, text_width, UiCommand, UiDrawList};
-use mc_spine_client_ui::hud_widgets::{
+use megu_client_ui::draw::{text_height, text_width, UiCommand, UiDrawList};
+use megu_client_ui::hud_widgets::{
     effect_icon_visible, BossBarColor, BossBarEntry, ChatInputOverlay, F3DebugOverlay,
     HeartStyle, HudRegionReport, HudSnapshot, HudWidgetsRenderer, ScoreboardEntry,
     ScoreboardSidebar, StatusEffectEntry, StatusEffectHud, TabPlayerEntry, TabPlayerList,
@@ -70,7 +70,7 @@ fn assert_commands_in_viewport(list: &UiDrawList, w: u32, h: u32) {
     }
 }
 
-fn region(report: &HudRegionReport, name: &str) -> Option<mc_spine_client_ui::draw::UiRect> {
+fn region(report: &HudRegionReport, name: &str) -> Option<megu_client_ui::draw::UiRect> {
     report
         .regions()
         .iter()

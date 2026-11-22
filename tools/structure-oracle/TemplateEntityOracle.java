@@ -1,4 +1,4 @@
-package dev.mcspine.tools;
+package dev.megu.tools;
 import java.lang.reflect.*;
 /** Native `StructureTemplate.transform(Vec3, Mirror, Rotation, BlockPos)` for entity offsets. */
 public final class TemplateEntityOracle {

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Start a local mc-spine server with an explicit EULA gate and safe preflight.
+"""Start a local megu server with an explicit EULA gate and safe preflight.
 
 The modpack checker classifies referenced files but does not download them.
 No server process is started for --dry-run, including with --json.
@@ -120,7 +120,7 @@ def diagnose_error(stderr_text, lang="en"):
         ("port", r"address already in use|addrinuse|os error 98|error 10048|game listener bind failed|port.*in use"),
         ("java", r"unsupportedclassversion|class file version|java version|requires java|java runtime"),
         ("mixin", r"mixin|access.transformer|unsupported mod|incompatible mod"),
-        ("data", r"vanilla data missing|block_states_1211|mc_spine_version_dir|missing generated data|config_packets\.bin"),
+        ("data", r"vanilla data missing|block_states_1211|megu_version_dir|missing generated data|config_packets\.bin"),
         ("corrupt", r"corrupt|invalid json|serde_json|json parse|level\.dat|save file|unexpected end of file"),
     )
     for category, pattern in patterns:
@@ -205,17 +205,17 @@ def bootstrap(directory, port, accept):
 
 
 def init_binary():
-    """Find a built mc-spine-init, including a custom Cargo target directory."""
+    """Find a built megu-init, including a custom Cargo target directory."""
     targets = [ROOT / "target", ROOT / "server-files" / "target"]
     if os.environ.get("CARGO_TARGET_DIR"):
         target = Path(os.environ["CARGO_TARGET_DIR"])
         targets.insert(0, target if target.is_absolute() else ROOT / target)
     for target in targets:
         for profile in ("debug", "release"):
-            candidate = target / profile / "mc-spine-init"
+            candidate = target / profile / "megu-init"
             if candidate.is_file() and os.access(candidate, os.X_OK):
                 return str(candidate)
-    return shutil.which("mc-spine-init")
+    return shutil.which("megu-init")
 
 
 def initialize_directory(directory, mc_version, port, accept, dry_run):
@@ -234,18 +234,18 @@ def initialize_directory(directory, mc_version, port, accept, dry_run):
                                 capture_output=True, text=True, encoding="utf-8",
                                 errors="replace", timeout=30, check=False)
         if result.returncode != 0:
-            raise ValueError("mc-spine-init failed")
+            raise ValueError("megu-init failed")
         report = json.loads(result.stdout)
         if (not isinstance(report, dict) or report.get("dir") != str(directory)
                 or report.get("mc_version") != mc_version or report.get("port") != port
                 or report.get("dry_run") is not dry_run
                 or report.get("eula_accepted") is not True):
-            raise ValueError("mc-spine-init returned an invalid initialization report")
+            raise ValueError("megu-init returned an invalid initialization report")
     except (OSError, subprocess.TimeoutExpired, json.JSONDecodeError) as error:
-        raise ValueError("mc-spine-init could not complete initialization") from error
+        raise ValueError("megu-init could not complete initialization") from error
     # Native initialization must never invalidate a previously accepted EULA.
     if not eula_accepted((directory / "eula.txt").read_text(encoding="utf-8")):
-        raise ValueError("mc-spine-init left the EULA unaccepted")
+        raise ValueError("megu-init left the EULA unaccepted")
 
 
 def validate_archive(path):
@@ -318,7 +318,7 @@ def mod_preflight(args, plan, lang):
         plan["action_items"].append("\n".join(MESSAGES["input"][lang]))
         return 1
     if args.modpack is not None:
-        if report.get("schema") != "mc-spine-modpack-preflight/1":
+        if report.get("schema") != "megu-modpack-preflight/1":
             raise ValueError("unexpected mod report")
         plan["skipped_perf_mods"] = safe_names(report.get("skipped_perf_mods", []))
         plan["native_mods"] = safe_names(report.get("native_mods", []))
@@ -332,7 +332,7 @@ def mod_preflight(args, plan, lang):
         if plan["native_mods"]:
             plan["action_items"].append("\n".join(MESSAGES["staging"][lang]))
     else:
-        if report.get("schema") != "mc-spine-mod-launcher/1":
+        if report.get("schema") != "megu-mod-launcher/1":
             raise ValueError("unexpected mod report")
         plan["skipped_perf_mods"] = safe_names(report.get("superseded_perf_mods", []))
         plan["native_mods"] = safe_names([entry.get("mod_id") for entry in report.get("assignments", [])
@@ -593,7 +593,7 @@ def runtime_settings(directory, properties, requested_port):
         except (ImportError, ValueError, OSError):
             settings = {}
     port = requested_port if requested_port is not None else (
-        os.environ.get("MC_SPINE_PORT") or settings.get("port")
+        os.environ.get("MEGU_PORT") or settings.get("port")
         or properties.get("server-port") or DEFAULT_PORT)
     try:
         port = int(port)
@@ -601,7 +601,7 @@ def runtime_settings(directory, properties, requested_port):
         raise ValueError("invalid server port") from error
     if not 1 <= port <= 65535:
         raise ValueError("invalid server port")
-    bind = (os.environ.get("MC_SPINE_BIND_ADDR") or settings.get("bind_addr")
+    bind = (os.environ.get("MEGU_BIND_ADDR") or settings.get("bind_addr")
             or properties.get("server-ip") or "127.0.0.1")
     if not isinstance(bind, str) or "\x00" in bind or ".." in bind:
         raise ValueError("invalid bind address")
@@ -613,7 +613,7 @@ def runtime_settings(directory, properties, requested_port):
 
 
 def data_ready(mc_version):
-    override = os.environ.get("MC_SPINE_VERSION_DIR")
+    override = os.environ.get("MEGU_VERSION_DIR")
     if override:
         directory = checked_path(override, "version data directory")
         check_no_symlink(directory)
@@ -629,10 +629,10 @@ def data_command(accept):
 
 
 def launch_command():
-    binary = ROOT / "target" / "debug" / "mc-spine"
+    binary = ROOT / "target" / "debug" / "megu"
     if binary.is_file() and os.access(binary, os.X_OK):
         return [str(binary)]
-    return ["cargo", "run", "--manifest-path", str(ROOT / "Cargo.toml"), "--bin", "mc-spine"]
+    return ["cargo", "run", "--manifest-path", str(ROOT / "Cargo.toml"), "--bin", "megu"]
 
 
 def setup_runtime_data(directory):
@@ -671,13 +671,13 @@ def main(argv=None):
     if mods_argv is not None:
         return mods_passthrough(head, mods_argv)
     parser = argparse.ArgumentParser(
-        description="Start mc-spine with a guided, safe setup",
+        description="Start megu with a guided, safe setup",
         epilog="also: megu_start.py [--dir <dir>] mods "
                "<search|add|resolve-deps> ... — delegate to tools/megu_mods.py")
     parser.add_argument("--dir", required=True, help="server directory")
     parser.add_argument("--modpack", help="Modrinth or CurseForge modpack for pre-flight checks")
     parser.add_argument("--mods-dir", help="existing installed mods directory")
-    parser.add_argument("--mod-check-bin", help="optional pre-built mc-spine-mod-check binary")
+    parser.add_argument("--mod-check-bin", help="optional pre-built megu-mod-check binary")
     parser.add_argument("--mc-version", choices=("1.21.1", "26.3"), default="1.21.1")
     parser.add_argument("--port", type=int)
     parser.add_argument("--accept-eula", action="store_true")
@@ -747,10 +747,10 @@ def main(argv=None):
 
         setup_runtime_data(directory)
         env = os.environ.copy()
-        env["MC_SPINE_PORT"] = str(port)
-        env["MC_SPINE_BIND_ADDR"] = bind
-        if env.get("MC_SPINE_VERSION_DIR"):
-            env["MC_SPINE_VERSION_DIR"] = str(checked_path(env["MC_SPINE_VERSION_DIR"], "version directory"))
+        env["MEGU_PORT"] = str(port)
+        env["MEGU_BIND_ADDR"] = bind
+        if env.get("MEGU_VERSION_DIR"):
+            env["MEGU_VERSION_DIR"] = str(checked_path(env["MEGU_VERSION_DIR"], "version directory"))
         if not args.json:
             notice = "サーバーを起動します。" if lang == "ja" else "Starting server."
             print(f"Megu: {notice}", flush=True)

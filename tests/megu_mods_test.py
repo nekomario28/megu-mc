@@ -196,7 +196,7 @@ class AddTest(MeguModsTestBase):
         proc = self.cli("add", "sodium", "--mods-dir", str(self.mods_dir),
                         "--yes")
         self.assertEqual(proc.returncode, 0, proc.stderr)
-        self.assertIn("already covered by mc-spine built-in optimizations",
+        self.assertIn("already covered by megu built-in optimizations",
                       proc.stdout)
         self.assertIn("--force", proc.stdout)
         self.assertEqual(self.file_requests(), [])

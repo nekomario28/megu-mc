@@ -1,10 +1,10 @@
 // SPDX-License-Identifier: LGPL-3.0-or-later
 //! End-to-end pack facade tests with independently constructed ZIP fixtures.
 
-use mc_spine_server_files::pack_loader::{
+use megu_server_files::pack_loader::{
     load_validated_pack_dir, load_validated_pack_zip, PackLoadError,
 };
-use mc_spine_server_files::{
+use megu_server_files::{
     inspect_and_route_pack, PackKind, PackRouteDecision, PackRouterPolicy, PackThreatKind,
 };
 use std::fs;
@@ -109,7 +109,7 @@ fn fixtures() -> Vec<(&'static str, &'static [u8], bool)> {
     ]
 }
 
-fn assert_loaded(pack: mc_spine_server_files::pack_loader::LoadedPack) {
+fn assert_loaded(pack: megu_server_files::pack_loader::LoadedPack) {
     assert_eq!(pack.kind, PackKind::ResourcePack);
     assert_eq!(pack.pack_format, Some(15));
     assert_eq!(pack.blockstates.len(), 1);

@@ -440,7 +440,7 @@ fn compute_datapack_tree_digest(
     }
     let sources = datapack_sources(root);
     let mut hash = Dpc1Sha256::new();
-    hash.update(b"mc-spine DPC1 tree v1");
+    hash.update(b"megu DPC1 tree v1");
     hash.update(&(enabled_order.len() as u64).to_le_bytes());
     let mut seen = std::collections::HashSet::new();
     for name in enabled_order {
@@ -931,7 +931,7 @@ where
 
 #[allow(dead_code)]
 fn dpc1_configured_cache_dir() -> Option<std::path::PathBuf> {
-    std::env::var_os("MC_SPINE_DATAPACK_CACHE_DIR")
+    std::env::var_os("MEGU_DATAPACK_CACHE_DIR")
         .filter(|value| !value.is_empty())
         .map(std::path::PathBuf::from)
 }

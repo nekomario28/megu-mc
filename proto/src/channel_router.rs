@@ -150,12 +150,12 @@ pub fn classify_channel(channel: &str) -> ChannelHandlerKind {
         "minecraft:brand" => ChannelHandlerKind::Brand,
         "minecraft:register" => ChannelHandlerKind::Register,
         "minecraft:unregister" => ChannelHandlerKind::Unregister,
-        "mc-spine:season_v1" => ChannelHandlerKind::NativeSeasonSync,
-        "mc-spine:mod_sync_v1" => ChannelHandlerKind::NativeModSync,
-        "mc-spine:magic_v1" => ChannelHandlerKind::NativeMagicSync,
-        "mc-spine:accessory_v1" => ChannelHandlerKind::NativeAccessorySync,
-        "mc-spine:media_v1" => ChannelHandlerKind::NativeMediaTransfer,
-        "mc-spine:claims_v1" | "openpartiesandclaims:claims_sync" | "ftbchunks:claims_sync" => {
+        "megu:season_v1" => ChannelHandlerKind::NativeSeasonSync,
+        "megu:mod_sync_v1" => ChannelHandlerKind::NativeModSync,
+        "megu:magic_v1" => ChannelHandlerKind::NativeMagicSync,
+        "megu:accessory_v1" => ChannelHandlerKind::NativeAccessorySync,
+        "megu:media_v1" => ChannelHandlerKind::NativeMediaTransfer,
+        "megu:claims_v1" | "openpartiesandclaims:claims_sync" | "ftbchunks:claims_sync" => {
             ChannelHandlerKind::NativeClaimsSync
         }
         "appleskin:exhaustion_sync" | "appleskin:saturation_sync" => {

@@ -62,10 +62,10 @@ exit 0
 
 
 class Fixture:
-    """A synthetic mc-spine-shaped tree plus the fake tools the probes will find."""
+    """A synthetic megu-shaped tree plus the fake tools the probes will find."""
 
     def __init__(self):
-        self.tmp = Path(tempfile.mkdtemp(prefix="mc-spine-devcheck-"))
+        self.tmp = Path(tempfile.mkdtemp(prefix="megu-devcheck-"))
         self.root = self.tmp / "repo"
         self.home = self.tmp / "home"
         self.bin = self.tmp / "bin"
@@ -77,7 +77,7 @@ class Fixture:
             folder.mkdir(parents=True, exist_ok=True)
 
         shutil.copy2(SCRIPT, self.root / "tools/dev_check.py")
-        (self.root / "Cargo.toml").write_text('[package]\nname = "mc-spine"\n')
+        (self.root / "Cargo.toml").write_text('[package]\nname = "megu"\n')
         (self.root / "rust-toolchain.toml").write_text(
             '# pinned\n[toolchain]\nchannel = "1.98.0"\ncomponents = ["rustfmt", "clippy"]\n')
         (self.root / "src/lib.rs").write_text(
@@ -93,8 +93,8 @@ class Fixture:
             'from pathlib import Path\n'
             'import os\n'
             f'JAR_SHA1 = "{PINNED_SHA1}"\n'
-            'DEFAULT_JAR = Path(os.environ.get("MC_SPINE_VANILLA_SERVER_JAR", str(\n'
-            '    Path.home() / ".cache/mc-spine-audit/load/vanilla/server.jar")))\n')
+            'DEFAULT_JAR = Path(os.environ.get("MEGU_VANILLA_SERVER_JAR", str(\n'
+            '    Path.home() / ".cache/megu-audit/load/vanilla/server.jar")))\n')
         # The jar-side generator documents the JDK it needs; dev_check reads that number.
         (self.root / "tools/vanilla_data").mkdir()
         (self.root / "tools/vanilla_data/gen_vanilla_data.sh").write_text(
@@ -232,7 +232,7 @@ class DevCheckContract(unittest.TestCase):
     def test_wrong_archive_is_an_error_and_blocks(self):
         archive = self.fixture.tmp / "server.jar"
         archive.write_bytes(b"not the pinned build")
-        env = self.fixture.env(MC_SPINE_VANILLA_SERVER_JAR=str(archive))
+        env = self.fixture.env(MEGU_VANILLA_SERVER_JAR=str(archive))
         code, output = self.fixture.run(env=env)
         self.assertEqual(code, 1, output)
         statuses = self.fixture.statuses(output)
@@ -260,7 +260,7 @@ class DevCheckContract(unittest.TestCase):
     def test_all_four_statuses_can_appear_in_one_report(self):
         archive = self.fixture.tmp / "server.jar"
         archive.write_bytes(b"wrong")
-        env = self.fixture.env(MC_SPINE_VANILLA_SERVER_JAR=str(archive), FAKE_RUSTUP_EXIT="2")
+        env = self.fixture.env(MEGU_VANILLA_SERVER_JAR=str(archive), FAKE_RUSTUP_EXIT="2")
         code, output = self.fixture.run(env=env)
         self.assertEqual(code, 1, output)
         self.assertEqual(set(self.fixture.statuses(output).values()),
@@ -356,10 +356,10 @@ class DevCheckContract(unittest.TestCase):
     # ---- the advertised exit status covers a bad environment ---------------------------
 
     def test_malformed_timeout_env_exits_two_without_a_traceback(self):
-        env = self.fixture.env(MC_SPINE_DEV_CHECK_TIMEOUT_MS="soon")
+        env = self.fixture.env(MEGU_DEV_CHECK_TIMEOUT_MS="soon")
         code, output = self.fixture.run(env=env)
         self.assertEqual(code, 2, output)
-        self.assertIn("MC_SPINE_DEV_CHECK_TIMEOUT_MS", output)
+        self.assertIn("MEGU_DEV_CHECK_TIMEOUT_MS", output)
         self.assertNotIn("Traceback", output)
 
     # ---- safety: anchoring, no mutation, no compile, no execution of repository code ---
@@ -377,7 +377,7 @@ class DevCheckContract(unittest.TestCase):
             'import os\n'
             'open(os.environ["MARKER_DIR"] + "/vanilla_java-imported", "w").close()\n'
             f'JAR_SHA1 = "{PINNED_SHA1}"\n'
-            'DEFAULT_JAR = Path.home() / ".cache/mc-spine-audit/load/vanilla/server.jar"\n')
+            'DEFAULT_JAR = Path.home() / ".cache/megu-audit/load/vanilla/server.jar"\n')
         self.fixture.write_shim("depsgx", """#!/bin/sh
 : > "$MARKER_DIR/depsgx-executed"
 echo "depsgx 0.0.0"
@@ -409,7 +409,7 @@ echo "depsgx 0.0.0"
                               cwd=str(self.fixture.elsewhere), capture_output=True, text=True,
                               timeout=120)
         self.assertEqual(proc.returncode, 2, proc.stdout + proc.stderr)
-        self.assertIn("is not the mc-spine root", proc.stderr)
+        self.assertIn("is not the megu root", proc.stderr)
 
 
 def load_dev_check_module():
@@ -498,7 +498,7 @@ class DiskHeadroomContract(unittest.TestCase):
 
     def setUp(self):
         self.module = load_dev_check_module()
-        self.tmp = Path(tempfile.mkdtemp(prefix="mc-spine-diskcheck-"))
+        self.tmp = Path(tempfile.mkdtemp(prefix="megu-diskcheck-"))
         self.addCleanup(shutil.rmtree, self.tmp, True)
         (self.tmp / "target").mkdir()
         (self.tmp / "tmp").mkdir()
@@ -508,7 +508,7 @@ class DiskHeadroomContract(unittest.TestCase):
     def headroom(self, free_by_label, extra_env=None):
         def fake_disk_usage(path):
             return FAKE_USAGE(100 * GIB, 0, free_by_label[str(path)])
-        env = {"MC_SPINE_DEV_CHECK_DISK_FATAL": ""}
+        env = {"MEGU_DEV_CHECK_DISK_FATAL": ""}
         env.update(self.env)
         env.update(extra_env or {})
         with mock.patch.dict(os.environ, env, clear=False), \
@@ -544,7 +544,7 @@ class DiskHeadroomContract(unittest.TestCase):
     def test_fatal_env_turns_the_warning_into_an_error(self):
         result = self.headroom({str(self.tmp / "target"): 2 * GIB,
                                 str(self.tmp / "tmp"): 20 * GIB},
-                               extra_env={"MC_SPINE_DEV_CHECK_DISK_FATAL": "1"})
+                               extra_env={"MEGU_DEV_CHECK_DISK_FATAL": "1"})
         self.assertEqual(result.status, "ERROR")
         self.assertIn("LOW DISK", result.summary)
 

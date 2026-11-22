@@ -1,25 +1,25 @@
 // SPDX-License-Identifier: LGPL-3.0-or-later OR GPL-3.0-or-later OR AGPL-3.0-or-later
-//! End-to-end tests for the `mc-spine-init` binary: real process invocations
+//! End-to-end tests for the `megu-init` binary: real process invocations
 //! against real server directories, asserting stdout content, on-disk results
 //! and exit codes (`0` success, `2` bad args or EULA-not-accepted doctor
 //! verdict, `1` corrupt/unreadable files). `rcon.password` must never appear
 //! in any output.
 
-use mc_spine_core::version::TargetVersion;
-use mc_spine_server_files::json::{self, Json};
-use mc_spine_server_files::{
+use megu_core::version::TargetVersion;
+use megu_server_files::json::{self, Json};
+use megu_server_files::{
     offline_uuid, AdmissionDecision, ClaimChunkKey, ClaimOwner, ClaimsWorld, EulaStatus,
     MinimapMode, PlayerRadarScope, ServerDirectory, ServerFairPlayPolicy, SubClaimId,
     BANNED_IPS_FILE, BANNED_PLAYERS_FILE, CLAIMS_FILE, EULA_FILE, OPS_FILE, PARTIES_FILE,
     PROPERTIES_FILE, USERCACHE_FILE, WHITELIST_FILE,
 };
-use mc_spine_server_files::properties::MAX_PROPERTIES_BYTES;
+use megu_server_files::properties::MAX_PROPERTIES_BYTES;
 use std::path::PathBuf;
 use std::process::{Command, Output};
 use std::sync::atomic::{AtomicU64, Ordering};
 
 fn bin() -> PathBuf {
-    PathBuf::from(env!("CARGO_BIN_EXE_mc-spine-init"))
+    PathBuf::from(env!("CARGO_BIN_EXE_megu-init"))
 }
 
 static DIR_COUNTER: AtomicU64 = AtomicU64::new(0);
@@ -30,7 +30,7 @@ struct TestDir(PathBuf);
 impl TestDir {
     fn new(tag: &str) -> Self {
         let dir = std::env::temp_dir().join(format!(
-            "mc-spine-init-cli-{}-{}-{tag}",
+            "megu-init-cli-{}-{}-{tag}",
             std::process::id(),
             DIR_COUNTER.fetch_add(1, Ordering::Relaxed)
         ));
@@ -59,7 +59,7 @@ fn run(args: &[&str]) -> Output {
     Command::new(bin())
         .args(args)
         .output()
-        .expect("failed to launch mc-spine-init")
+        .expect("failed to launch megu-init")
 }
 
 fn code(out: &Output) -> i32 {
@@ -456,7 +456,7 @@ fn admin_commands_roundtrip_through_admit_login() {
     // Vanilla ban fields landed in the file.
     let ban = &sd.banned_players.entries[0];
     assert_eq!(ban.expires, "forever");
-    assert_eq!(ban.source, "mc-spine-init");
+    assert_eq!(ban.source, "megu-init");
     assert_eq!(ban.uuid, griefer_uuid);
 
     // pardon -> no longer banned, but the whitelist still gates him.

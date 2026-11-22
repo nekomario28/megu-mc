@@ -1,10 +1,10 @@
-# Kernel Convergence Theory & mc-spine 1.21.1 Completion Plan
+# Kernel Convergence Theory & megu 1.21.1 Completion Plan
 
 > **状態訂正 (2026-11-18, P2-1/P2-3 監査レーンによる実読):** この文書の Part 2.2/2.3 の波計画は
 > HEAD (`03744b1`) より古い状態を記述している。**16アルゴリズム型すべてが現在ライブな dispatch 先
 > (`src/structure_pipeline.rs:226-256`) と専用 owner、 committed native oracle TSV を持つ**
 > (`evidence-dispatch.txt` 参照; 実装の棚卸しは
-> `/home/yuu/mc-spine-local/audit/p2-1-p2-3-blueprint-20261118T050548Z/blueprint.md`)。
+> `/home/yuu/megu-local/audit/p2-1-p2-3-blueprint-20261118T050548Z/blueprint.md`)。
 > Kernel A/Wave 3 を「未着手」として P2-1 の規模推定に使わないこと。残る実務は
 > (a) 共通の書込側契約（`StructurePiece.placeBlock` の `SHAPE_CHECK_BLOCKS` マークが
 > template/jigsaw 経路で欠落 — Step 3レーンが対応中）、(b) 34定義中24の live-chunk 受入。
@@ -47,9 +47,9 @@ Step 5: アーキタイプ単位の一括バッチ開通 (Batch Kernel Rollout)
 
 ---
 
-## Part 2: `mc-spine` 1.21.1 最短完遂計画（実行ロードマップ）
+## Part 2: `megu` 1.21.1 最短完遂計画（実行ロードマップ）
 
-### 1. 現在地の定量監査（[`tools/p0_2_audit.py`](/home/yuu/mc-spine/tools/p0_2_audit.py) / [`tools/feature_type_coverage.py`](/home/yuu/mc-spine/tools/feature_type_coverage.py)）
+### 1. 現在地の定量監査（[`tools/p0_2_audit.py`](/home/yuu/megu/tools/p0_2_audit.py) / [`tools/feature_type_coverage.py`](/home/yuu/megu/tools/feature_type_coverage.py)）
 
 - **Density Function / Noise / Surface Rule / Condition (Overworld, Nether, End)**: 未対応 **0件**
 - **Placement Modifier (全18種)**: 未対応 **0件**
@@ -63,17 +63,17 @@ Step 5: アーキタイプ単位の一括バッチ開通 (Batch Kernel Rollout)
 
 | カーネル | 対象構造物（計34定義） | 共通エンジン |
 |---|---|---|
-| **Kernel A: 単一/少数 Template + Processor（12定義）** | `nether_fossil`, `igloo`, `shipwreck`, `shipwreck_beached`, `ocean_ruin_cold`, `ocean_ruin_warm`, `ruined_portal` (7種) | [`src/structure_template.rs`](/home/yuu/mc-spine/src/structure_template.rs) の `place_blocks` + Processor 群 |
+| **Kernel A: 単一/少数 Template + Processor（12定義）** | `nether_fossil`, `igloo`, `shipwreck`, `shipwreck_beached`, `ocean_ruin_cold`, `ocean_ruin_warm`, `ruined_portal` (7種) | [`src/structure_template.rs`](/home/yuu/megu/src/structure_template.rs) の `place_blocks` + Processor 群 |
 | **Kernel B: Jigsaw Pool + Template（10定義）** | `village_plains`, `village_desert`, `village_savanna`, `village_snowy`, `village_taiga`, `pillager_outpost`, `ancient_city`, `bastion_remnant`, `trail_ruins`, `trial_chambers` | `JigsawPlacement`（プール抽選・Joint 接続・AABB 衝突判定）+ Kernel A |
-| **Kernel C: Procedural Piece Box（12定義）** | **完了(2)**: `mineshaft`, `mineshaft_mesa`<br>**単一Piece(4)**: `buried_treasure`, `swamp_hut`, `desert_pyramid`, `jungle_pyramid`<br>**複合Piece(6)**: `fortress`, `stronghold`, `end_city`, `monument`, `mansion` | [`src/mineshaft.rs`](/home/yuu/mc-spine/src/mineshaft.rs) で確立した Piece BoundingBox クリップ + [`src/generation_payload.rs`](/home/yuu/mc-spine/src/generation_payload.rs) |
+| **Kernel C: Procedural Piece Box（12定義）** | **完了(2)**: `mineshaft`, `mineshaft_mesa`<br>**単一Piece(4)**: `buried_treasure`, `swamp_hut`, `desert_pyramid`, `jungle_pyramid`<br>**複合Piece(6)**: `fortress`, `stronghold`, `end_city`, `monument`, `mansion` | [`src/mineshaft.rs`](/home/yuu/megu/src/mineshaft.rs) で確立した Piece BoundingBox クリップ + [`src/generation_payload.rs`](/home/yuu/megu/src/generation_payload.rs) |
 
 ### 3. Wave 実行計画（`gemini-4-hydrogen` 並列オーケストレーション）
 
 - **Wave 1（進行中）: 構造的ブレーキの全撤去 & P1 100% 完結**
   1. `minecraft:end_spike` 実装 + Native Oracle 照合（Configured Feature 到達率 100% 達成）
-  2. [`src/structure_template.rs`](/home/yuu/mc-spine/src/structure_template.rs) の Fossil 専用制限の分離・全40種 `processor_list` 対応・テンプレート `LootTable` + BlockEntity ペイロード汎用化・近傍形状更新統合
+  2. [`src/structure_template.rs`](/home/yuu/megu/src/structure_template.rs) の Fossil 専用制限の分離・全40種 `processor_list` 対応・テンプレート `LootTable` + BlockEntity ペイロード汎用化・近傍形状更新統合
   3. Seed 4242 Chunk `(3, -2)` の本番 `mineshaft` 接続後 **98,304 / 98,304 (0-diff)** 実証完了 & `POP_CHUNK` / `--pop-order` 自動化（**完了**）
 - **Wave 2: 構造物バッチ前半（Kernel A 12定義 + 単一 Piece 4定義 + Jigsaw エンジン 10定義）**
-  - Wave 1 で解放された [`src/structure_template.rs`](/home/yuu/mc-spine/src/structure_template.rs) 上で並列実装。
+  - Wave 1 で解放された [`src/structure_template.rs`](/home/yuu/megu/src/structure_template.rs) 上で並列実装。
 - **Wave 3: 構造物バッチ後半（複合 Piece 5種） & 3次元サーバー配信 + M2/M3 ベンチマーク証明**
-  - `fortress`, `stronghold`, `end_city`, `monument`, `mansion` の実装と、Overworld/Nether/End の runtime 統合・20TPS 負荷証明（[`specs/PLAN.md`](/home/yuu/mc-spine/specs/PLAN.md) G1〜G4）。
+  - `fortress`, `stronghold`, `end_city`, `monument`, `mansion` の実装と、Overworld/Nether/End の runtime 統合・20TPS 負荷証明（[`specs/PLAN.md`](/home/yuu/megu/specs/PLAN.md) G1〜G4）。

@@ -3,22 +3,22 @@
 //! per-pipeline pass planning + binding consistency, and the live software
 //! frame path exercising `HiZPyramid`, `BakedModelQuad`, and `ZoomState`.
 
-use mc_spine_client::audio_qol::ZoomState;
-use mc_spine_client::protocol::{
+use megu_client::audio_qol::ZoomState;
+use megu_client::protocol::{
     DecodedChunk, DecodedLightData, DecodedSection, DimensionMeta,
 };
-use mc_spine_client::render::{
+use megu_client::render::{
     frustum_planes, rasterize_baked_model_quads, render_frame,
     render_frame_with_hiz_and_zoom, BakedModelDraw, RenderConfig,
 };
-use mc_spine_client::render_graph::{
+use megu_client::render_graph::{
     plan_frame, FramePlanInput, GpuPipelineKind, InstanceSubmission, PassSubmission, RenderPassId,
 };
-use mc_spine_client::shaders::{
+use megu_client::shaders::{
     validate_wgsl_module, WgslStage, WgslValidationError, SHADER_SUITE,
 };
-use mc_spine_client::world::{BlockTable, WorldState};
-use mc_spine_client_mesh::{ActiveRenderBackend, BakedModelQuad, MAX_INSTANCES_PER_UBO_16KB};
+use megu_client::world::{BlockTable, WorldState};
+use megu_client_mesh::{ActiveRenderBackend, BakedModelQuad, MAX_INSTANCES_PER_UBO_16KB};
 
 // ---------------------------------------------------------------------------
 // WGSL structural validation
@@ -123,12 +123,12 @@ fn validator_catches_broken_modules() {
 #[test]
 fn validator_reports_binding_kinds() {
     let info = validate_wgsl_module(
-        mc_spine_client::shaders::MESHLET_CULL_COMPUTE_WGSL,
+        megu_client::shaders::MESHLET_CULL_COMPUTE_WGSL,
         &[WgslStage::Compute],
     )
     .unwrap();
     let kinds: Vec<_> = info.bindings.iter().map(|b| (b.binding, b.kind)).collect();
-    use mc_spine_client::shaders::WgslBindingKind as K;
+    use megu_client::shaders::WgslBindingKind as K;
     assert_eq!(
         kinds,
         vec![
@@ -157,7 +157,7 @@ fn plan_input() -> FramePlanInput {
     }
 }
 
-fn pass_ids(plan: &mc_spine_client::render_graph::RenderGraphPlan) -> Vec<RenderPassId> {
+fn pass_ids(plan: &megu_client::render_graph::RenderGraphPlan) -> Vec<RenderPassId> {
     plan.passes.iter().map(|p| p.id).collect()
 }
 
@@ -307,9 +307,9 @@ fn uniform_section(state: u32) -> DecodedSection {
         non_air: if state == 0 {
             0
         } else {
-            mc_spine_client_mesh::SECTION_CELLS as i16
+            megu_client_mesh::SECTION_CELLS as i16
         },
-        states: Box::new([state; mc_spine_client_mesh::SECTION_CELLS]),
+        states: Box::new([state; megu_client_mesh::SECTION_CELLS]),
         biomes: [0; 64],
     }
 }

@@ -17,20 +17,20 @@ use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use mc_spine_client::audio_out::{AudioRuntime, AudioSessionConfig, AudioSinkKind};
-use mc_spine_client::protocol::{
+use megu_client::audio_out::{AudioRuntime, AudioSessionConfig, AudioSinkKind};
+use megu_client::protocol::{
     DecodedChunk, DecodedLightData, DecodedSection, DimensionMeta, WireSoundEvent,
 };
-use mc_spine_client::session::{PlaySoundEvent, SoundMixer, WorldAcousticSnapshot};
-use mc_spine_client::sound_assets::{
+use megu_client::session::{PlaySoundEvent, SoundMixer, WorldAcousticSnapshot};
+use megu_client::sound_assets::{
     DecodedPcm, SoundEventRegistry, SoundLibrary, SoundSourceData, MIX_SAMPLE_RATE,
 };
-use mc_spine_client::spatial_audio::{
+use megu_client::spatial_audio::{
     AcousticMaterial, AcousticMaterialLut, ListenerPose, MaterialClass, SpatialAudioPreset,
     VoxelAcousticWorld,
 };
-use mc_spine_client::world::{BlockTable, WorldState};
-use mc_spine_client_mesh::tactile_effects::EnvironmentAudioHint;
+use megu_client::world::{BlockTable, WorldState};
+use megu_client_mesh::tactile_effects::EnvironmentAudioHint;
 
 fn tmp_root(tag: &str) -> PathBuf {
     let dir = std::env::temp_dir().join(format!("mc-qual-{tag}-{}", std::process::id()));

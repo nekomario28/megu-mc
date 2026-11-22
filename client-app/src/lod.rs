@@ -2,11 +2,11 @@
 //! Distance-tiered far-terrain LOD column store: summarized `LodCell` grids
 //! keyed by chunk column, drawing that never overlaps full-detail meshes,
 //! LRU/farthest-first eviction under a strict byte budget, and the opt-in
-//! `mc-spine:lod_v1` wire codec.
+//! `megu:lod_v1` wire codec.
 
 use std::collections::{HashMap, HashSet};
 
-use mc_spine_client_mesh::{summarize_column, LodCell, SectionView, LOD_COARSE, LOD_FINE};
+use megu_client_mesh::{summarize_column, LodCell, SectionView, LOD_COARSE, LOD_FINE};
 
 /// Distance tier for one chunk column, measured in Chebyshev chunk units
 /// from the camera column.
@@ -73,7 +73,7 @@ pub struct LodStats {
     pub skipped_full_detail: usize,
 }
 
-/// A decoded `mc-spine:lod_v1` frame: one column summary at `resolution`
+/// A decoded `megu:lod_v1` frame: one column summary at `resolution`
 /// (`LOD_COARSE` or `LOD_FINE`) with `resolution * resolution` cells in
 /// x-fastest, z-major order.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -349,7 +349,7 @@ impl LodManager {
     }
 }
 
-/// Encode one column summary as an `mc-spine:lod_v1` frame.
+/// Encode one column summary as an `megu:lod_v1` frame.
 ///
 /// Layout (all integers little-endian):
 /// `"LOD1"` magic, version `1`, resolution byte, cell count u16, `cx`/`cz`
@@ -383,7 +383,7 @@ pub fn encode_lod_v1(
     Ok(frame)
 }
 
-/// Decode an `mc-spine:lod_v1` frame. Rejects truncated, oversized,
+/// Decode an `megu:lod_v1` frame. Rejects truncated, oversized,
 /// wrong-magic, wrong-version, bad-resolution and count-mismatched input.
 pub fn decode_lod_v1(frame: &[u8]) -> Result<LodFrame, LodError> {
     if frame.len() < LOD_V1_HEADER {
@@ -441,7 +441,7 @@ pub fn decode_lod_v1(frame: &[u8]) -> Result<LodFrame, LodError> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use mc_spine_client_mesh::{Block, Light, Section};
+    use megu_client_mesh::{Block, Light, Section};
 
     fn column_with_top(state_id: u32, y: usize) -> Section {
         let mut section = Section::filled(Block::AIR, Light::new(0, 15));
@@ -641,7 +641,7 @@ mod tests {
     fn world_column_sections_feed_lod_manager() {
         use crate::protocol::{DecodedChunk, DecodedLightData, DecodedSection, DimensionMeta};
         use crate::world::{BlockTable, WorldState};
-        use mc_spine_client_mesh::SECTION_CELLS;
+        use megu_client_mesh::SECTION_CELLS;
 
         let dimension = DimensionMeta {
             name: "minecraft:overworld".to_string(),

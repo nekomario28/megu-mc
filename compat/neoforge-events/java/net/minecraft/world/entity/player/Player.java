@@ -1,6 +1,6 @@
 package net.minecraft.world.entity.player;
 
-import net.mcspine.neoforge.MutationBuffer;
+import net.megu.neoforge.MutationBuffer;
 import net.minecraft.network.chat.Component;
 import net.minecraft.world.entity.LivingEntity;
 

@@ -1,6 +1,6 @@
 # Fabric foundation probe
 
-Diagnostic only: actual Fabric Loader + Mixin execute Java fixtures against mc-spine's existing Rust world. This does not implement the Minecraft API or claim existing Minecraft mod compatibility. Design: `../../specs/mod-compatibility/README.md`.
+Diagnostic only: actual Fabric Loader + Mixin execute Java fixtures against megu's existing Rust world. This does not implement the Minecraft API or claim existing Minecraft mod compatibility. Design: `../../specs/mod-compatibility/README.md`.
 
 ## Compatibility scope
 
@@ -16,7 +16,7 @@ For the selected existing Seed Protect contract, append `--seedprotect` to both 
 
 ## Normal server integration
 
-The same pinned original Seed Protect JAR now handles eligible player and adult-cow farmland conversion in normal server startup. Build `--features fabric-probe`; set `MC_SPINE_FABRIC_CLASSPATH` to the absolute path of `.build/classpath-seedprotect.txt` and use the supported original JAR alone in the server's `mods/`. Startup initializes actual Fabric Loader/Mixin and validates the required target before networking begins. Native callers synchronously wait for a dedicated JVM owner; the final Rust commit compares the initial farmland state under its world mutex. Existing fall damage stays separate from conversion cancellation.
+The same pinned original Seed Protect JAR now handles eligible player and adult-cow farmland conversion in normal server startup. Build `--features fabric-probe`; set `MEGU_FABRIC_CLASSPATH` to the absolute path of `.build/classpath-seedprotect.txt` and use the supported original JAR alone in the server's `mods/`. Startup initializes actual Fabric Loader/Mixin and validates the required target before networking begins. Native callers synchronously wait for a dedicated JVM owner; the final Rust commit compares the initial farmland state under its world mutex. Existing fall damage stays separate from conversion cancellation.
 
 `server_verify.py` uses normal TCP play packets and cow ticks, then checks save/reload. Its `--neoforge` option adds the separately built actual NeoForge event adapter; it does not run the full FML loader. Real Vanilla/Fabric reference checks use an adult cow on dry farmland, verify the live result and decode the saved MCA block palette. Player/adult-cow conversion is the supported scope; crop/loot, complete collision and other entities remain open.
 

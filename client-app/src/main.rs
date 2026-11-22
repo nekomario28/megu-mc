@@ -1,24 +1,24 @@
 // SPDX-License-Identifier: LGPL-3.0-or-later OR GPL-3.0-or-later OR AGPL-3.0-or-later
-//! Native Minecraft 1.21.1 (Protocol 767) client executable for mc-spine.
+//! Native Minecraft 1.21.1 (Protocol 767) client executable for megu.
 
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::time::Duration;
 
-use mc_spine_client::cli::{
+use megu_client::cli::{
     help_text, parse_args, parse_host_port, redact_from_argv, version_info_text, CliConfig,
 };
-use mc_spine_client::crash_reporter::{
+use megu_client::crash_reporter::{
     self, parse_report_receipt, parse_report_url, CrashSubmitPolicy, ReportTransport,
     SessionReportDeduper, StdHttpReportTransport, DEFAULT_REPORT_TIMEOUT, MAX_BODY_BYTES,
 };
-use mc_spine_client::frame_pacer::FrameBudgetPacer;
-use mc_spine_client::friend_client::FriendGuestBridge;
-use mc_spine_client::integrated;
-use mc_spine_client::protocol::ping_server;
-use mc_spine_client::session::ClientSession;
-use mc_spine_client::settings::ClientSettings;
-use mc_spine_client::sim::run_session;
+use megu_client::frame_pacer::FrameBudgetPacer;
+use megu_client::friend_client::FriendGuestBridge;
+use megu_client::integrated;
+use megu_client::protocol::ping_server;
+use megu_client::session::ClientSession;
+use megu_client::settings::ClientSettings;
+use megu_client::sim::run_session;
 
 /// Status ping gives the server ten seconds for the whole exchange —
 /// generous on a loaded loopback, short enough for an operator's patience.
@@ -29,7 +29,7 @@ fn main() -> ExitCode {
     let cfg = match parse_args(&raw_args) {
         Ok(cfg) => cfg,
         Err(err) => {
-            eprintln!("mc-spine-client: {}", redact_from_argv(&err, &raw_args));
+            eprintln!("megu-client: {}", redact_from_argv(&err, &raw_args));
             return ExitCode::from(2);
         }
     };
@@ -52,11 +52,11 @@ fn main() -> ExitCode {
     match cfg.resolve_client_settings() {
         Ok(warnings) => {
             for warning in warnings {
-                eprintln!("mc-spine-client: {}", cfg.redact(&warning));
+                eprintln!("megu-client: {}", cfg.redact(&warning));
             }
         }
         Err(err) => {
-            eprintln!("mc-spine-client: {}", cfg.redact(&err));
+            eprintln!("megu-client: {}", cfg.redact(&err));
             return ExitCode::from(2);
         }
     }
@@ -85,7 +85,7 @@ fn main() -> ExitCode {
                 ExitCode::SUCCESS
             }
             Err(err) => {
-                eprintln!("mc-spine-client: {}", cfg.redact(&err));
+                eprintln!("megu-client: {}", cfg.redact(&err));
                 ExitCode::FAILURE
             }
         };
@@ -94,7 +94,7 @@ fn main() -> ExitCode {
         match cfg.client_settings.write_toml(&path) {
             Ok(()) => println!("wrote settings to {}", path.display()),
             Err(err) => {
-                eprintln!("mc-spine-client: {}", cfg.redact(&err));
+                eprintln!("megu-client: {}", cfg.redact(&err));
                 return ExitCode::FAILURE;
             }
         }
@@ -125,7 +125,7 @@ fn main() -> ExitCode {
                 Some(bridge)
             }
             Err(err) => {
-                eprintln!("mc-spine-client: {}", cfg.redact(&err));
+                eprintln!("megu-client: {}", cfg.redact(&err));
                 return ExitCode::FAILURE;
             }
         }
@@ -136,12 +136,12 @@ fn main() -> ExitCode {
     let endpoint = match cfg.target_endpoint() {
         Ok(ep) => ep,
         Err(err) => {
-            eprintln!("mc-spine-client: {}", cfg.redact(&err));
+            eprintln!("megu-client: {}", cfg.redact(&err));
             return ExitCode::from(2);
         }
     };
 
-    // Real --quickPlaySingleplayer loopback: launch the integrated mc-spine
+    // Real --quickPlaySingleplayer loopback: launch the integrated megu
     // server on an ephemeral port and keep the guard alive for the session.
     let mut integrated_server = None;
     if endpoint.is_none() {
@@ -154,13 +154,13 @@ fn main() -> ExitCode {
                     integrated_server = Some(server);
                 }
                 Err(err) => {
-                    eprintln!("mc-spine-client: {}", cfg.redact(&err));
+                    eprintln!("megu-client: {}", cfg.redact(&err));
                     return ExitCode::from(2);
                 }
             }
         } else {
             eprintln!(
-                "mc-spine-client: no server specified (pass --quickPlayMultiplayer <host[:port]>, --quickPlaySingleplayer <world>, or --server <host>; use --help for usage)"
+                "megu-client: no server specified (pass --quickPlayMultiplayer <host[:port]>, --quickPlaySingleplayer <world>, or --server <host>; use --help for usage)"
             );
             return ExitCode::from(2);
         }
@@ -173,8 +173,8 @@ fn main() -> ExitCode {
     // ProtocolClient when it connects. `off` leaves the runtime absent;
     // `auto`/`pipewire`/`alsa` fail closed to the null sink when no
     // playback tool exists or the child dies.
-    mc_spine_client::audio_out::install_session_audio_config(
-        mc_spine_client::audio_out::AudioSessionConfig {
+    megu_client::audio_out::install_session_audio_config(
+        megu_client::audio_out::AudioSessionConfig {
             sink: cfg.audio_sink.clone(),
             assets_dir: cfg.assets_dir.clone(),
             asset_index: cfg.asset_index.clone(),
@@ -203,7 +203,7 @@ fn main() -> ExitCode {
             ExitCode::SUCCESS
         }
         Err(err) => {
-            eprintln!("mc-spine-client: {}", cfg.redact(&err));
+            eprintln!("megu-client: {}", cfg.redact(&err));
             ExitCode::FAILURE
         }
     }
@@ -215,7 +215,7 @@ fn run_status_ping(cfg: &CliConfig, target: &str) -> ExitCode {
     let (host, port) = match parse_host_port(target, cfg.port) {
         Ok(endpoint) => endpoint,
         Err(err) => {
-            eprintln!("mc-spine-client: {}", cfg.redact(&err));
+            eprintln!("megu-client: {}", cfg.redact(&err));
             return ExitCode::from(2);
         }
     };
@@ -229,7 +229,7 @@ fn run_status_ping(cfg: &CliConfig, target: &str) -> ExitCode {
             ExitCode::SUCCESS
         }
         Err(err) => {
-            eprintln!("mc-spine-client: {}", cfg.redact(&err));
+            eprintln!("megu-client: {}", cfg.redact(&err));
             ExitCode::FAILURE
         }
     }
@@ -296,7 +296,7 @@ fn flush_crash_reports(cfg: &CliConfig, crash_dir: &Path) -> ExitCode {
             // existing but unreadable one, is a real failure.
             if cfg.crash_reports_dir.is_some() || crash_dir.exists() {
                 eprintln!(
-                    "mc-spine-client: cannot read crash reports directory {}: {err}",
+                    "megu-client: cannot read crash reports directory {}: {err}",
                     crash_dir.display()
                 );
                 return ExitCode::FAILURE;
@@ -313,7 +313,7 @@ fn flush_crash_reports(cfg: &CliConfig, crash_dir: &Path) -> ExitCode {
         Some(url) => match parse_report_url(url) {
             Ok(_) => Some(url.to_string()),
             Err(err) => {
-                eprintln!("mc-spine-client: configured report_endpoint rejected: {err}");
+                eprintln!("megu-client: configured report_endpoint rejected: {err}");
                 None
             }
         },

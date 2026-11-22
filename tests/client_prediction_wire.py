@@ -22,7 +22,7 @@ from protocol767 import (AIR_STATES, Client, ContractFailure, Reader, ROOT,
                          position, require, vint)
 
 
-os.environ["MC_SPINE_ALLOW_PLAYER_ADMIN_COMMANDS"] = "1"
+os.environ["MEGU_ALLOW_PLAYER_ADMIN_COMMANDS"] = "1"
 os.environ.setdefault("MC_PROBE_DEADLINE", "40")
 
 STONE_STATE = 1
@@ -314,7 +314,7 @@ def set_creative_stone(client):
 
 
 def decode_single_water_update(actor, cell):
-    # mc-spine batches water edits into 0x49. Exercise the 1.21.1 single
+    # megu batches water edits into 0x49. Exercise the 1.21.1 single
     # update decoder with a separate socket over a copy of the live chunk.
     x, _, z = cell
     coord = (x // 16, z // 16)
@@ -520,7 +520,7 @@ def exercise(game, gravity_ticks, horizontal_ticks):
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--binary", type=Path,
-                        default=Path(os.environ.get("MC_SPINE_BIN", ROOT / "target/debug/mc-spine")))
+                        default=Path(os.environ.get("MEGU_BIN", ROOT / "target/debug/megu")))
     parser.add_argument("--build", action="store_true", help="build server with cargo before test")
     parser.add_argument("--world-dir", type=Path, help="optional persistent test world directory")
     parser.add_argument("--gravity-ticks", type=int, default=36)
@@ -528,7 +528,7 @@ def main():
     args = parser.parse_args()
     if args.gravity_ticks < 3 or args.horizontal_ticks < 8:
         parser.error("--gravity-ticks must be >=3 and --horizontal-ticks must be >=8")
-    if args.build or (not args.binary.is_file() and args.binary == ROOT / "target/debug/mc-spine"):
+    if args.build or (not args.binary.is_file() and args.binary == ROOT / "target/debug/megu"):
         subprocess.run(["cargo", "build", "--offline", "--locked"], cwd=ROOT, check=True)
     binary = args.binary.resolve()
     require(binary.is_file() and os.access(binary, os.X_OK), "server-binary-required")

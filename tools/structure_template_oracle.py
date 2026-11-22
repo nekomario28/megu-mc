@@ -30,7 +30,7 @@ def main():
                     target.write_bytes(archive.read(name))
         out, states = work / 'templates.tsv', work / 'states.tsv'
         run_probe(work, cp, ROOT / 'tools/structure-oracle/StructureTemplateOracle.java',
-                  'dev.mcspine.tools.StructureTemplateOracle', templates, out, states)
+                  'dev.megu.tools.StructureTemplateOracle', templates, out, states)
         actual = out.read_bytes()
         # This oracle consumes only the solid and support columns; collision fullness is
         # not sampled here, so encode a false placeholder and discard that output column.

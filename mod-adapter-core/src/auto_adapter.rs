@@ -26,14 +26,14 @@
 //! 4. **Mixin bytecode.** [`scan_jar_mixins_with_options`] parses `.class`
 //!    bytecode directly, and the lifter binds every `@Inject` site to a
 //!    standard event hook or reports it unliftable with its reason.
-//! 5. **Tier synthesis.** A validated `mc-spine-mod-bundle/1` document is
+//! 5. **Tier synthesis.** A validated `megu-mod-bundle/1` document is
 //!    produced for native JARs (an embedded bundle preferred, otherwise one
 //!    synthesized from the discovered data) and the JAR lands in
 //!    [`AdaptationTier`]: `AutoSkipped`, `NativeBundle`,
 //!    `Tier2LiftedShim`, or `Tier3FallbackRequired` carrying exact
 //!    human-readable blockers.
 //!
-//! [`scaffold_native_bundle`] emits the same `mc-spine-mod-bundle/1`
+//! [`scaffold_native_bundle`] emits the same `megu-mod-bundle/1`
 //! document as a starter for mod authors building native zero-JVM Megu
 //! mods, and [`write_adaptation_outputs`] persists the per-mod
 //! `<mod_id>.bundle.json` files plus the deterministic
@@ -42,7 +42,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 
-use mc_spine_core::id::ResourceLocation;
+use megu_core::id::ResourceLocation;
 
 use crate::class_mixin_scanner::{
     scan_jar_mixins_with_options, JarMixinScanReport, JarScanOptions,
@@ -76,8 +76,8 @@ use crate::unified_bundle::{DeclarativeModBundle, BUNDLE_SCHEMA};
 use crate::version_compat::{McVersion, VersionRange};
 
 /// JAR member (archive root) carrying an embedded native
-/// `mc-spine-mod-bundle/1` document for this adapter to install verbatim.
-pub const EMBEDDED_BUNDLE_MEMBER: &str = "mc-spine-bundle.json";
+/// `megu-mod-bundle/1` document for this adapter to install verbatim.
+pub const EMBEDDED_BUNDLE_MEMBER: &str = "megu-bundle.json";
 
 /// Deterministic report filename written into a `--out` directory.
 pub const ADAPTATION_REPORT_FILE: &str = "adaptation-report.json";
@@ -104,7 +104,7 @@ const MAX_SCAFFOLD_FIELD_CHARS: usize = 128;
 /// Options shared by [`auto_adapt_jar`] and [`auto_adapt_mods_dir`].
 #[derive(Clone, Debug)]
 pub struct AutoAdaptOptions {
-    /// `true` (default — mc-spine is a dedicated server): mixin classes a
+    /// `true` (default — megu is a dedicated server): mixin classes a
     /// config lists only under `client` are skipped; `false` scans them
     /// too (`--include-client-mixins`).
     pub server_only: bool,
@@ -139,7 +139,7 @@ pub enum AdaptationTier {
     /// mod, a capability-routed engine mod, or a client-only mod.
     AutoSkipped,
     /// Runs fully native with zero JVM: a validated
-    /// `mc-spine-mod-bundle/1` document was produced (embedded or
+    /// `megu-mod-bundle/1` document was produced (embedded or
     /// synthesized from discovered data).
     NativeBundle,
     /// Every extracted mixin site lifted onto a standard event hook; the
@@ -228,7 +228,7 @@ pub struct ModDataBundle {
 }
 
 /// The artifact [`synthesize_bundle`] produces for a native JAR: the
-/// validated `mc-spine-mod-bundle/1` document packaged together with the
+/// validated `megu-mod-bundle/1` document packaged together with the
 /// real [`ModDataBundle`] extracted from the JAR's `data/` members.
 #[derive(Clone, Debug)]
 pub struct SynthesizedBundle {
@@ -276,7 +276,7 @@ pub struct JarAdaptationResult {
     /// only when the JAR was skipped before generic discovery ran or held
     /// no `data/` members at all.
     pub data_bundle: ModDataBundle,
-    /// The validated `mc-spine-mod-bundle/1` document — `Some` iff the
+    /// The validated `megu-mod-bundle/1` document — `Some` iff the
     /// tier is [`AdaptationTier::NativeBundle`].
     pub bundle: Option<DeclarativeModBundle>,
 }
@@ -297,12 +297,12 @@ impl JarAdaptationResult {
         self.tier == AdaptationTier::Tier3FallbackRequired
     }
 
-    /// Deterministic `mc-spine-mod-bundle/1` JSON for the emitted bundle.
+    /// Deterministic `megu-mod-bundle/1` JSON for the emitted bundle.
     pub fn bundle_json(&self) -> Option<String> {
         self.bundle.as_ref().map(DeclarativeModBundle::to_json)
     }
 
-    /// Deterministic `mc-spine-jar-adaptation/1` JSON form of the result.
+    /// Deterministic `megu-jar-adaptation/1` JSON form of the result.
     pub fn to_json(&self) -> String {
         jar_result_json(self)
     }
@@ -338,7 +338,7 @@ impl ModsDirAdaptationReport {
         self.jars.iter().any(JarAdaptationResult::requires_fallback)
     }
 
-    /// Deterministic `mc-spine-mods-dir-adaptation/1` JSON report.
+    /// Deterministic `megu-mods-dir-adaptation/1` JSON report.
     pub fn to_json(&self) -> String {
         mods_dir_report_json(self)
     }
@@ -744,7 +744,7 @@ fn skipped_result(
 
 /// Build the native adaptation artifact for a JAR: the embedded bundle
 /// verbatim when present, otherwise a synthesized empty-section
-/// `mc-spine-mod-bundle/1` document carrying the mod id and its declared
+/// `megu-mod-bundle/1` document carrying the mod id and its declared
 /// Minecraft range (or [`DEFAULT_BUNDLE_MC_RANGE`] when undeclared) —
 /// either way packaged with the real [`ModDataBundle`] the generic data
 /// extraction pass lifted out of the JAR.
@@ -1527,7 +1527,7 @@ pub fn write_adaptation_outputs(
     Ok(written)
 }
 
-/// Emit a starter `mc-spine-mod-bundle/1` document for a native zero-JVM
+/// Emit a starter `megu-mod-bundle/1` document for a native zero-JVM
 /// mod. `mod_id` must be a bare resource-location id (`[a-z0-9_.-]`, no
 /// `:`) — anything else is rejected. `version`, when non-empty, becomes
 /// the bundle's `mc_version_range` and must parse as a Maven or SemVer
@@ -1975,7 +1975,7 @@ fn jar_result_json(result: &JarAdaptationResult) -> String {
     use std::fmt::Write;
     let mut out = String::with_capacity(1024);
     out.push_str("{\n");
-    jf_str(&mut out, 1, "schema", "mc-spine-jar-adaptation/1", true);
+    jf_str(&mut out, 1, "schema", "megu-jar-adaptation/1", true);
     jf_str(&mut out, 1, "jar", &result.jar, true);
     jf_opt(
         &mut out,
@@ -2195,7 +2195,7 @@ fn mods_dir_report_json(report: &ModsDirAdaptationReport) -> String {
         &mut out,
         1,
         "schema",
-        "mc-spine-mods-dir-adaptation/1",
+        "megu-mods-dir-adaptation/1",
         true,
     );
     jf_str(&mut out, 1, "dir", &report.dir, true);
@@ -2444,7 +2444,7 @@ fn format_adapt_dir_human(report: &ModsDirAdaptationReport) -> String {
                 format!("auto-skipped — {REASON_SUPERSEDED}")
             }
             AdaptationTier::NativeBundle => {
-                "native — mc-spine-mod-bundle/1 produced".to_string()
+                "native — megu-mod-bundle/1 produced".to_string()
             }
             AdaptationTier::Tier2LiftedShim => {
                 let lifted = jar
@@ -2968,7 +2968,7 @@ mod tests {
 
     fn tmp_dir(tag: &str) -> PathBuf {
         let dir = std::env::temp_dir().join(format!(
-            "mc-spine-auto-adapter-{}-{}-{tag}",
+            "megu-auto-adapter-{}-{}-{tag}",
             std::process::id(),
             NEXT_DIR.fetch_add(1, Ordering::Relaxed)
         ));
@@ -3136,7 +3136,7 @@ mod tests {
 
     #[test]
     fn invalid_embedded_bundle_is_tier3() {
-        let bad = r#"{"schema":"mc-spine-mod-bundle/1","mod_id":"embmod","surprise":1}"#;
+        let bad = r#"{"schema":"megu-mod-bundle/1","mod_id":"embmod","surprise":1}"#;
         let result = auto_adapt_jar_bytes(&embedded_bundle_jar(bad), "embmod-1.0.jar", &opts())
             .unwrap();
         assert_eq!(result.tier, AdaptationTier::Tier3FallbackRequired);
@@ -3285,7 +3285,7 @@ mod tests {
         let json = result.to_json();
         assert_eq!(json, result.to_json());
         crate::data_loader::parse_json(json.as_bytes()).expect("result JSON parses");
-        assert!(json.contains("mc-spine-jar-adaptation/1"));
+        assert!(json.contains("megu-jar-adaptation/1"));
         assert!(json.contains("EntityDamagePre"));
         assert!(result.format_human().contains("Tier 2"));
     }

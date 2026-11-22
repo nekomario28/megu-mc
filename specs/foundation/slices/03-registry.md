@@ -260,4 +260,4 @@ struct Content { revision: u64, smelts: Vec<...>, tags: HashMap<...> }
 - revision の上げ忘れ（datapack を読み直したのに古いキャッシュが残る）。
   revision を `load_datapacks` の**唯一の出口**で上げる。
 - 出典の欠落。どの表がどこ由来かを定義側にコメントで残す
-  （[issue #3](https://github.com/nekomario28/mc-spine/issues/3) の provenance 方針）。
+  （[issue #3](https://github.com/nekomario28/megu-mc/issues/3) の provenance 方針）。

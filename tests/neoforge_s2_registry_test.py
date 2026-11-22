@@ -160,7 +160,7 @@ public class Unsupported {
 }
 """
 
-RUNNER = """package net.mcspine.neoforge;
+RUNNER = """package net.megu.neoforge;
 import java.nio.file.Files;
 import java.nio.file.Path;
 
@@ -287,7 +287,7 @@ public interface ItemLike { net.minecraft.world.item.Item asItem(); }
                     *(source(name, code) for name, code in fixtures.values()))
         cls.runner = cls.root / "runner"
         cls.checked(JAVA / "javac", "--release", "21", "-proc:none", "-cp", cls.cp,
-                    "-d", cls.runner, source("net/mcspine/neoforge/S2Checks", RUNNER))
+                    "-d", cls.runner, source("net/megu/neoforge/S2Checks", RUNNER))
 
         cls.jars = {}
         for mod_id, (name, _) in fixtures.items():
@@ -328,10 +328,10 @@ public interface ItemLike { net.minecraft.world.item.Item asItem(); }
 
     def run_boot(self, *args):
         return self.checked(JAVA / "java", "-cp", os.pathsep.join((str(self.runner), self.cp)),
-                            "net.mcspine.neoforge.S2Checks", *args)
+                            "net.megu.neoforge.S2Checks", *args)
 
     def shimcheck(self, *jars):
-        return self.run_process(JAVA / "java", "-cp", self.cp, "net.mcspine.neoforge.ShimCheck",
+        return self.run_process(JAVA / "java", "-cp", self.cp, "net.megu.neoforge.ShimCheck",
                                 "--json", "--surface", ADAPTER / "shim-surface.json", *jars)
 
     def test_shimcheck_accepts_s2_mod_jars(self):

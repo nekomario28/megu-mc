@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Build and verify a deterministic, fail-closed mc-spine release bundle.
+"""Build and verify a deterministic, fail-closed megu release bundle.
 
   tools/release_bundle.py build --binary <path> [--extra-binary <path>]... \
       --out-dir <dir> --version <ver> --target <triple> \
@@ -12,12 +12,12 @@
 with the repeatable `--extra-binary` flag, the licence/legal/docs files and
 the user-facing setup, translation, Modrinth and vanilla-data tools into
 
-  <out-dir>/mc-spine-<version>-<target>.tar.gz   the bundle
+  <out-dir>/megu-<version>-<target>.tar.gz   the bundle
   <out-dir>/release-manifest.json                machine-readable contents
   <out-dir>/SHA256SUMS                           sha256 of both artifacts
 
 Inside the tarball every member lives under the single directory
-`mc-spine-<version>-<target>/`:
+`megu-<version>-<target>/`:
 
   <prefix>/<binary basename>                     each release binary (0755)
   <prefix>/LICENSE, COPYING.LESSER, COPYING.AGPL, NOTICE,
@@ -31,13 +31,13 @@ Inside the tarball every member lives under the single directory
   <prefix>/tools/megu_mods.py                    public setup/mod management,
                                                 translation and data helpers
 
-The five-binary release suite is `mc-spine` plus `mc-spine-client`,
-`mc-spine-mod-check`, `mc-spine-world-migrate` and `mc-spine-init`. Pass the
+The five-binary release suite is `megu` plus `megu-client`,
+`megu-mod-check`, `megu-world-migrate` and `megu-init`. Pass the
 server as `--binary` and each of the other four as `--extra-binary`, for example
 from the same Cargo release directory. Each binary is recorded independently
 in `release-manifest.json` under `files`, with its SHA-256, size and mode.
 The CLI also supports single-binary bundles and other companion binaries,
-including `mc-spine-client-gpu` and `mc-spine-client-gpu.exe`.
+including `megu-client-gpu` and `megu-client-gpu.exe`.
 
 Determinism: members are sorted by name, written to a USTAR archive with
 mtime 0, uid/gid 0, empty uname/gname and modes normalised to 0644/0755, and
@@ -87,7 +87,7 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parent.parent
 
 FORMAT = 1
-PRODUCT = "mc-spine"
+PRODUCT = "megu"
 MC_TARGETS = ["1.21.1", "26.3"]
 LICENSE_ID = "GPL-3.0-or-later"
 SUBCRATE_LICENSE = "LGPL-3.0-or-later OR GPL-3.0-or-later OR AGPL-3.0-or-later"
@@ -133,8 +133,8 @@ _SUMS_LINE_RE = re.compile(r"^([0-9a-f]{64}) [ *](\S+)$")
 # the launcher bootstrapper JAR must stay under 32 KiB. Sizes are matched on
 # the staged binary basename (`.exe` suffix tolerated).
 SIZE_BUDGET_MAX_BYTES = {
-    "mc-spine": 16 * 1024 * 1024,
-    "mc-spine-client-gpu": 24 * 1024 * 1024,
+    "megu": 16 * 1024 * 1024,
+    "megu-client-gpu": 24 * 1024 * 1024,
 }
 BOOTSTRAP_JAR_MAX_BYTES = 32 * 1024
 
@@ -627,7 +627,7 @@ def _fixture_repo(root):
         target.chmod(0o644 if rel == "tools/megu_mods.py" else 0o755)
     binary = root / "build" / PRODUCT
     binary.parent.mkdir(parents=True, exist_ok=True)
-    binary.write_bytes(b"\x7fELF fake mc-spine binary v1\n")
+    binary.write_bytes(b"\x7fELF fake megu binary v1\n")
     binary.chmod(0o755)
     return binary
 
@@ -646,7 +646,7 @@ def _consistent_bad_bundle(tmp, name, extra=None, drop=(), mutate=None, sort=Tru
     """A tar+manifest+sums triple that is internally consistent but built from a
     member list `mutate`/`extra` shapes - used to prove verify rejects the
     *content*, not a checksum slip. Members are written in `entries` order."""
-    entries = [("mc-spine", b"\x7fELF fake\n", 0o755),
+    entries = [("megu", b"\x7fELF fake\n", 0o755),
                ("LICENSE", b"stub LICENSE\n", 0o644)]
     entries = [entry for entry in entries if entry[0] not in drop]
     entries += extra or []
@@ -688,7 +688,7 @@ def _symlink_bundle(tmp, name):
     raw = io.BytesIO()
     with tarfile.open(fileobj=raw, mode="w", format=tarfile.USTAR_FORMAT) as tar:
         for arcname, data, mode in sorted(
-                [("LICENSE", b"stub\n", 0o644), ("mc-spine", b"\x7fELF\n", 0o755)]):
+                [("LICENSE", b"stub\n", 0o644), ("megu", b"\x7fELF\n", 0o755)]):
             info = tarfile.TarInfo(f"{prefix}/{arcname}")
             info.size = len(data)
             info.mtime = 0
@@ -704,7 +704,7 @@ def _symlink_bundle(tmp, name):
     tar_path.write_bytes(gzip.compress(raw.getvalue(), compresslevel=9, mtime=0))
     tar_bytes = tar_path.read_bytes()
     members = []
-    for arcname, data, mode in [("LICENSE", b"stub\n", 0o644), ("mc-spine", b"\x7fELF\n", 0o755)]:
+    for arcname, data, mode in [("LICENSE", b"stub\n", 0o644), ("megu", b"\x7fELF\n", 0o755)]:
         members.append({"path": f"{prefix}/{arcname}", "sha256": sha256_hex(data),
                         "bytes": len(data), "mode": f"{mode:04o}"})
     members.append({"path": f"{prefix}/tools/evil.sh",
@@ -792,8 +792,8 @@ def self_test():
         # deterministic, and verify passes on the result unchanged.
         suite_dir = Path(tmp) / "suite-bin"
         suite_dir.mkdir()
-        suite_names = ("mc-spine-client", "mc-spine-mod-check",
-                       "mc-spine-world-migrate", "mc-spine-init")
+        suite_names = ("megu-client", "megu-mod-check",
+                       "megu-world-migrate", "megu-init")
         suite_flags = []
         for suite_name in suite_names:
             suite_path = suite_dir / suite_name
@@ -898,13 +898,13 @@ def self_test():
                               "--target", "x86_64-unknown-linux-gnu",
                               "--repo-root", str(repo), "--git-sha", SELFTEST_GIT_SHA)
         try:
-            check_names(["mc-spine", "datapacks/vanilla/pack.mcmeta"], "staged tree")
+            check_names(["megu", "datapacks/vanilla/pack.mcmeta"], "staged tree")
             staged_fail = False
         except BundleError:
             staged_fail = True
         check("guard: staged-tree scan rejects datapacks/vanilla", staged_fail)
         try:
-            check_names(["mc-spine", "x/../y"], "staged tree")
+            check_names(["megu", "x/../y"], "staged tree")
             staged_fail = False
         except BundleError:
             staged_fail = True
@@ -1000,23 +1000,23 @@ def self_test():
         oversized = Path(tmp) / "oversized-bin" / PRODUCT
         oversized.parent.mkdir(parents=True, exist_ok=True)
         oversized.write_bytes(b"\x7fELF" + b"\0" * SIZE_BUDGET_MAX_BYTES[PRODUCT])
-        expect_build_fail("build: size budget rejects an oversized mc-spine",
+        expect_build_fail("build: size budget rejects an oversized megu",
                           "--binary", str(oversized), "--enforce-size-budget",
                           "--out-dir", str(Path(tmp) / "out-budget-big"),
                           "--version", "0.1.0",
                           "--target", "x86_64-unknown-linux-gnu",
                           "--repo-root", str(repo), "--git-sha", SELFTEST_GIT_SHA)
-        check("build: oversized mc-spine still builds without the flag",
+        check("build: oversized megu still builds without the flag",
               main(["build", "--binary", str(oversized),
                     "--out-dir", str(Path(tmp) / "out-budget-off"),
                     "--version", "0.1.0", "--target", "x86_64-unknown-linux-gnu",
                     "--repo-root", str(repo), "--git-sha", SELFTEST_GIT_SHA]) == 0)
         rc, out_budget = _build(tmp, "budget-ok", repo, binary,
                                 flags=["--enforce-size-budget"])
-        check("build: size budget passes a small mc-spine", rc == 0)
+        check("build: size budget passes a small megu", rc == 0)
         budget_manifest = load_json(out_budget / MANIFEST_NAME, MANIFEST_NAME)
         report = budget_manifest.get("size_budget", {})
-        check("manifest: size_budget records the mc-spine measurement",
+        check("manifest: size_budget records the megu measurement",
               report.get(PRODUCT, {}).get("ok") is True
               and report[PRODUCT]["bytes"] < SIZE_BUDGET_MAX_BYTES[PRODUCT]
               and report[PRODUCT]["max_bytes"] == SIZE_BUDGET_MAX_BYTES[PRODUCT])
@@ -1030,8 +1030,8 @@ def self_test():
         # any *.jar staged as a binary.
         for jar_size, expect_ok in ((BOOTSTRAP_JAR_MAX_BYTES - 1, True),
                                     (BOOTSTRAP_JAR_MAX_BYTES, False)):
-            entries = [("mc-spine-bootstrapper.jar", b"x" * jar_size, 0o644)]
-            unit = size_budget_report(entries)["mc-spine-bootstrapper.jar"]
+            entries = [("megu-bootstrapper.jar", b"x" * jar_size, 0o644)]
+            unit = size_budget_report(entries)["megu-bootstrapper.jar"]
             check(f"guard: bootstrapper.jar at {jar_size} bytes ok={expect_ok}",
                   unit["ok"] is expect_ok)
             try:
@@ -1042,9 +1042,9 @@ def self_test():
             check(f"guard: enforce_size_budget {'accepts' if expect_ok else 'rejects'} "
                   f"a {jar_size}-byte bootstrapper.jar", enforced is expect_ok)
         gpu_report = size_budget_report(
-            [("mc-spine-client-gpu", b"x" * (24 * 1024 * 1024 + 1), 0o755)])
-        check("guard: size budget flags an oversized mc-spine-client-gpu",
-              gpu_report["mc-spine-client-gpu"]["ok"] is False)
+            [("megu-client-gpu", b"x" * (24 * 1024 * 1024 + 1), 0o755)])
+        check("guard: size budget flags an oversized megu-client-gpu",
+              gpu_report["megu-client-gpu"]["ok"] is False)
 
         # The purity unit itself is also exercised directly.
         check("guard: unit check accepts the shipped layout",
@@ -1067,7 +1067,7 @@ def self_test():
 def main(argv=None):
     parser = argparse.ArgumentParser(
         prog="release_bundle.py",
-        description="Build and verify deterministic, fail-closed mc-spine "
+        description="Build and verify deterministic, fail-closed megu "
                     "release bundles.")
     parser.add_argument("--self-test", action="store_true",
                         help="run the offline self-test suite and exit")
@@ -1089,7 +1089,7 @@ def main(argv=None):
                          help="source sha to record (default: git rev-parse HEAD)")
     p_build.add_argument("--enforce-size-budget", action="store_true",
                          help="Gate G3: fail closed when a staged binary breaks the "
-                              "size budget (mc-spine <= 16 MiB, mc-spine-client-gpu "
+                              "size budget (megu <= 16 MiB, megu-client-gpu "
                               "<= 24 MiB, bootstrapper.jar < 32 KiB) and record the "
                               "per-binary budget in release-manifest.json")
 

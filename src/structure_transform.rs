@@ -133,7 +133,7 @@ pub(crate) fn bounds(
 // jar, so the build never `include_bytes!`s them: a stripped checkout carries
 // none of the files until `tools/vanilla_data/gen_vanilla_data.sh` runs.
 // Resolution order matches the block-registry pack: the directory
-// `MC_SPINE_VERSION_DIR` names first (version-neutral spelling, then the
+// `MEGU_VERSION_DIR` names first (version-neutral spelling, then the
 // bundled `*_1211` tag), then the checkout layout relative to the working
 // directory, then the manifest directory so in-repo callers still resolve
 // when the working directory is somewhere else.
@@ -142,7 +142,7 @@ pub(crate) fn bounds(
 /// failure can name the whole search instead of a bare "not found".
 fn pinned_data_candidates(rel: &str) -> Vec<std::path::PathBuf> {
     let mut out = Vec::with_capacity(4);
-    if let Some(dir) = std::env::var_os("MC_SPINE_VERSION_DIR") {
+    if let Some(dir) = std::env::var_os("MEGU_VERSION_DIR") {
         if !dir.is_empty() {
             let dir = std::path::PathBuf::from(dir);
             if let Some(name) = rel.strip_prefix("assets/") {

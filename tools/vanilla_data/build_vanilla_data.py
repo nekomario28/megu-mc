@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Turn what Extract.java read out of the vanilla 1.21.1 server into mc-spine's data files,
+"""Turn what Extract.java read out of the vanilla 1.21.1 server into megu's data files,
 after checking it against the data generator's own reports.
 
   build_vanilla_data.py <extract-dir> <datagen-reports-dir> <repo-root> <jar-sha1>

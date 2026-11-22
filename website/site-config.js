@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: LGPL-3.0-or-later
 //
-// Single-source brand configuration for the mc-spine landing page.
+// Single-source brand configuration for the megu landing page.
 //
 // Everything brandable on index.html binds from this ONE object: rename the
 // project, swap the tagline, point at a different repo, or set a custom
@@ -19,12 +19,12 @@
     // Prefix every CLI binary shares: `<cliPrefix>-init`,
     // `<cliPrefix>-mod-check`, `<cliPrefix>-world-migrate`,
     // `<cliPrefix>-client`, and the bare `<cliPrefix>` server binary.
-    // Kept at "mc-spine" while binaries/packages remain on the development
+    // Kept at "megu" while binaries/packages remain on the development
     // codename (provisional brand preview only).
-    cliPrefix: "mc-spine",
+    cliPrefix: "megu",
 
     // Short line under the project name in the nav/hero.
-    tagline: "A Minecraft-compatible engine written in Rust (codename: mc-spine)",
+    tagline: "A Minecraft-compatible engine written in Rust (codename: megu)",
 
     // Badge shown next to the project name.
     statusBadge: "Experimental Alpha",
@@ -34,15 +34,13 @@
       "A Rust-native Minecraft server & client runtime with tiered " +
       "NeoForge/Fabric mod compatibility and Velocity forwarding support.",
 
-    // Minecraft versions this runtime targets. The first entry is the LTS
-    // target and the pre-flight checker's default; the last is labelled
-    // "Latest". Keep in sync with McVersion::V1_21_1 / McVersion::V26_3.
-    mcTargets: ["1.21.1", "26.3"],
+    // Minecraft versions this runtime targets. Currently focused on 1.21.1.
+    mcTargets: ["1.21.1"],
 
     // Canonical repository and derived links.
-    githubUrl: "https://github.com/nekomario28/mc-spine",
-    releasesUrl: "https://github.com/nekomario28/mc-spine/releases",
-    docsBaseUrl: "https://github.com/nekomario28/mc-spine/tree/main/docs",
+    githubUrl: "https://github.com/nekomario28/megu-mc",
+    releasesUrl: "https://github.com/nekomario28/megu-mc/releases",
+    docsBaseUrl: "https://github.com/nekomario28/megu-mc/tree/main/docs",
 
     // Optional custom domain once the brand name is final, e.g.
     // "megu.megumin.tech". Leave "" while undecided: the footer deploy note
@@ -50,24 +48,40 @@
     customDomain: "megu.megumin.tech",
 
     // Default classification sets for the browser pre-flight checker,
-    // mirroring the `mc-spine-mod-check` CLI defaults
+    // mirroring the `megu-mod-check` CLI defaults
     // (--flagship-mods create, no --profiles-dir).
     flagshipMods: ["create"],
     profileMods: [],
 
-    // Report endpoint and optional community/support links. Empty links stay
-    // hidden in the footer until a destination is configured.
-    // reportApiUrl  — Cloudflare Pages Functions endpoint
-    // turnstileSiteKey — public Cloudflare Turnstile widget key (never a secret)
-    // discussionsUrl — GitHub Discussions (or forum) for ideas & support
-    // discordUrl     — Discord invite, when the community server exists
-    // sponsorUrl     — GitHub Sponsors / donation page
+    // Report endpoint and optional community/support/partner links.
+    // Every support/partner link is single-source: change a URL here later
+    // (e.g. Ko-fi -> GitHub Sponsors -> Certified Host) with zero HTML edits
+    // and without re-shipping the Megu client binary (client points to
+    // https://megu.megumin.tech/#support).
+    //
+    // reportApiUrl       — Cloudflare Pages Functions endpoint
+    // turnstileSiteKey   — public Cloudflare Turnstile widget key (never a secret)
+    // discussionsUrl     — GitHub Discussions (or forum) for ideas & support
+    // discordUrl         — Discord invite, when the community server exists
+    // sponsorUrl         — primary support link in the footer
+    // githubSponsorsUrl  — GitHub Sponsors page (0% fee, Stripe JP bank payout)
+    // kofiUrl            — Ko-fi tip/membership page (0% fee, global MC users)
+    // ofuseUrl           — OFUSE / FANBOX page (JP domestic support)
+    // partnerEmail       — Cloudflare Email Routing alias (e.g. partners@megumin.tech)
+    // certifiedHostName  — optional recommended Megu Certified Host name
+    // certifiedHostUrl   — optional partner/affiliate link for one-click hosting
     reportApiUrl: "/api/report",
     latestApiUrl: "/api/latest",
     turnstileSiteKey: "0x4AAAAAAGNFPiu-LWbjNy5A",
-    discussionsUrl: "https://github.com/nekomario28/mc-spine/discussions",
+    discussionsUrl: "https://github.com/nekomario28/megu-mc/discussions",
     discordUrl: "",
-    sponsorUrl: "",
+    sponsorUrl: "https://github.com/sponsors/nekomario28",
+    githubSponsorsUrl: "https://github.com/sponsors/nekomario28",
+    kofiUrl: "",
+    ofuseUrl: "",
+    partnerEmail: "partners@megumin.tech",
+    certifiedHostName: "",
+    certifiedHostUrl: "",
   };
 
   root.SITE_CONFIG = SITE_CONFIG;

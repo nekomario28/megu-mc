@@ -2119,7 +2119,7 @@ fn hopper_suck(hx: i32, hy: i32, hz: i32) -> bool {
     sucked
 }
 fn drop_tick() {
-    // Split under `MC_SPINE_TICK_PROFILE=1`. The bucketed merge landed without a
+    // Split under `MEGU_TICK_PROFILE=1`. The bucketed merge landed without a
     // split, so `drops` could not say whether the residual is the pickup scan, the
     // cell build, the neighbourhood walk or the despawn pass.
     let __prof = tickprof::enabled();
@@ -5604,7 +5604,7 @@ fn items_nbt_to_stacks(tag: &crate::nbt::Tag) -> Result<HashMap<i16, Stack>, &'s
                                     .get("id")
                                     .and_then(|t| t.string())
                                     .and_then(|s| s.to_utf8().ok())
-                                    .unwrap_or_else(|| "mc-spine:custom".to_string());
+                                    .unwrap_or_else(|| "megu:custom".to_string());
                                 let amount = e
                                     .get("amount")
                                     .and_then(|t| match t {
@@ -13038,7 +13038,7 @@ mod p1_combat_item_tests {
     fn am_mod(attribute_id: i32, amount: f64, op: ItemAttrOp, slot: ItemAttrSlotGroup) -> ItemAttributeModifier {
         ItemAttributeModifier {
             attribute_id,
-            modifier_id: "mc-spine:test".to_string(),
+            modifier_id: "megu:test".to_string(),
             amount,
             operation: op,
             slot,

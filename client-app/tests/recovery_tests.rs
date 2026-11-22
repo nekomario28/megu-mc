@@ -8,8 +8,8 @@ use std::path::PathBuf;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
-use mc_spine_client::crash_reporter::{crash_file_path, ReportEnv};
-use mc_spine_client::recovery::{
+use megu_client::crash_reporter::{crash_file_path, ReportEnv};
+use megu_client::recovery::{
     install_panic_site_recorder, BreakerDecision, ContainmentOutcome, CrashCircuitBreaker,
     CrashGuard, MissingDep, ModEntry, ModReloadOutcome, ModReloadPlanner, ModReloadTransaction,
     RecoveryAction, ReloadStrategy, ReloadTier, DEFAULT_CRASH_WINDOW_MS,
@@ -19,9 +19,9 @@ use mc_spine_client::recovery::{
 fn test_env() -> ReportEnv {
     ReportEnv {
         mc_version: "26.3".to_string(),
-        engine_version: "mc-spine-client 0.1.0".to_string(),
+        engine_version: "megu-client 0.1.0".to_string(),
         os: "linux-x86_64".to_string(),
-        culprit: "mc-spine-world".to_string(),
+        culprit: "megu-world".to_string(),
         subsystem: Some("tick".to_string()),
         stage: None,
         gpu_class: None,
@@ -31,7 +31,7 @@ fn test_env() -> ReportEnv {
 }
 
 fn scratch_dir(tag: &str) -> PathBuf {
-    let dir = std::env::temp_dir().join(format!("mc-spine-recovery-{tag}-{}", std::process::id()));
+    let dir = std::env::temp_dir().join(format!("megu-recovery-{tag}-{}", std::process::id()));
     std::fs::create_dir_all(&dir).unwrap();
     dir
 }
@@ -89,7 +89,7 @@ fn contained_panic_drops_poisoned_session_and_returns_soft_restart() {
                 } => {
                     assert_eq!(attempt, 1);
                     assert_eq!(crash_id, report.fingerprint);
-                    assert_eq!(blame_hint, "mc-spine-world");
+                    assert_eq!(blame_hint, "megu-world");
                 }
                 RecoveryAction::ReturnToCrashScreen { reason, .. } => {
                     panic!("first crash must soft-restart, got crash screen: {reason}")

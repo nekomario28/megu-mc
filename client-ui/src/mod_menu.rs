@@ -26,7 +26,7 @@ use crate::state::{tr, GamepadButton, UiInputEvent, UiKey, UiLang};
 /// Which loader ecosystem an entry belongs to.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum ModLoaderTag {
-    /// First-class mc-spine native module.
+    /// First-class megu native module.
     #[default]
     MeguNative,
     /// Fabric mod running under the compatibility shim.

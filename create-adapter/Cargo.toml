@@ -7,7 +7,7 @@ description = "Flagship zero-JVM Create Mod special-case optimizer built on mod-
 publish = false
 
 [dependencies]
-mc_spine_core = { package = "mc-spine-core", path = "../core" }
+megu_core = { package = "megu-core", path = "../core" }
 mod-adapter-core = { path = "../mod-adapter-core" }
 mod-offload = { path = "../mod-offload" }
 

@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: LGPL-3.0-or-later OR GPL-3.0-or-later OR AGPL-3.0-or-later
 
 //! Generic modded block-entity tick runtime bridging
-//! [`mc_spine_core::perf_kit`] primitives into one sleep/wake/coalesce loop.
+//! [`megu_core::perf_kit`] primitives into one sleep/wake/coalesce loop.
 //!
 //! Any modded machine family — cooking pots, tech processors, magic
 //! infusers, dimension miners, collector buses — fits the same contract:
@@ -27,7 +27,7 @@
 
 use std::hash::Hash;
 
-use mc_spine_core::perf_kit::{
+use megu_core::perf_kit::{
     BoundedScratchVec, CoalescedDeltaBatch, DirtyFingerprintGate, DrainReport, EventWakeWheel,
     FingerprintStats, TickBudgetQueue,
 };

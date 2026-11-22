@@ -6,8 +6,8 @@
 //! reproduce `MeshCache::build` geometry bit-for-bit, and that 4 parallel OS
 //! threads produce bit-identical `BuiltSectionMesh` output to sequential runs.
 
-use mc_spine_client_mesh::ffi::{mc_spine_client_mesh_pack_vertices, ABI_OK};
-use mc_spine_client_mesh::{
+use megu_client_mesh::ffi::{megu_client_mesh_pack_vertices, ABI_OK};
+use megu_client_mesh::{
     build_and_pack_section_mesh, Block, BuiltSectionMesh, CompressedSection, DirectionBuckets,
     Layer, Light, MeshCache, PackedVertex, Quad, Section, SectionCoord, SectionMeshInput,
     DIRECTION_BUCKETS, LIGHT_BYTES, SECTION_CELLS, WATER,
@@ -49,7 +49,7 @@ fn stone(id: u32) -> Block {
 fn glass(id: u32) -> Block {
     Block {
         state_id: id,
-        flags: mc_spine_client_mesh::TRANSLUCENT,
+        flags: megu_client_mesh::TRANSLUCENT,
         occlusion: 0,
         ..Block::AIR
     }
@@ -58,7 +58,7 @@ fn glass(id: u32) -> Block {
 fn cutout(id: u32) -> Block {
     Block {
         state_id: id,
-        flags: mc_spine_client_mesh::CUTOUT,
+        flags: megu_client_mesh::CUTOUT,
         occlusion: 0,
         ..Block::AIR
     }
@@ -76,7 +76,7 @@ fn water(level: u8) -> Block {
 fn lava(level: u8) -> Block {
     Block {
         state_id: 2_000 + u32::from(level),
-        fluid_kind: mc_spine_client_mesh::LAVA,
+        fluid_kind: megu_client_mesh::LAVA,
         fluid_level: level,
         ..Block::AIR
     }
@@ -130,7 +130,7 @@ fn pack_via_ffi(quads: &[Quad]) -> Vec<PackedVertex> {
     }
     let mut count = 0usize;
     let status = unsafe {
-        mc_spine_client_mesh_pack_vertices(
+        megu_client_mesh_pack_vertices(
             quads.as_ptr(),
             quads.len(),
             std::ptr::null_mut(),
@@ -141,7 +141,7 @@ fn pack_via_ffi(quads: &[Quad]) -> Vec<PackedVertex> {
     assert_eq!(status, ABI_OK, "pack_vertices count query failed");
     let mut out = vec![PackedVertex::default(); count];
     let status = unsafe {
-        mc_spine_client_mesh_pack_vertices(
+        megu_client_mesh_pack_vertices(
             quads.as_ptr(),
             quads.len(),
             out.as_mut_ptr(),

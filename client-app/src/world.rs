@@ -6,21 +6,21 @@ use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::path::{Path, PathBuf};
 use std::time::Instant;
 
-use mc_spine_client_mesh::ffi::{
-    mc_spine_client_mesh_pack_vertices, mc_spine_client_mesh_sort_translucent, PackedVertex, ABI_OK,
+use megu_client_mesh::ffi::{
+    megu_client_mesh_pack_vertices, megu_client_mesh_sort_translucent, PackedVertex, ABI_OK,
 };
-use mc_spine_client_mesh::{
+use megu_client_mesh::{
     section_index, Block, CompressedSection, DirectionBuckets, FaceVisibility, Layer, Light,
     MeshCache, MissingNeighbor, Quad, ReleasedMeshMeta, RenderRegions, Section, SectionBlocks,
     SectionCoord, SectionGraph, ALL_FACES, CUTOUT, FLUID_TINTED, LAVA, LIGHT_BYTES, NO_FLUID,
     OPAQUE, SAME_STATE_CULL, SECTION_CELLS, TINTED, TRANSLUCENT, WATER,
 };
-use mc_spine_kernel::skeletal_anim::{
+use megu_kernel::skeletal_anim::{
     decode_animation_trigger, parse_animation_json, parse_geometry_json, parse_jem_model,
     parse_jpm_model, AnimationClip, AnimationController, AnimationError, BoneMask, LoopMode,
     SkeletonRig, MAX_CLIPS,
 };
-use mc_spine_kernel::{
+use megu_kernel::{
     Aabb, FluidCell, FluidKind, LightEdit, LightEngine, LightFact, LightUpdateMultiWord,
     PalettedSection, Registry, STATE_COUNT,
 };
@@ -39,7 +39,7 @@ pub fn pack_vertices(quads: &[Quad]) -> Result<Vec<PackedVertex>, i32> {
     }
     let mut required = 0usize;
     let query = unsafe {
-        mc_spine_client_mesh_pack_vertices(
+        megu_client_mesh_pack_vertices(
             quads.as_ptr(),
             quads.len(),
             std::ptr::null_mut(),
@@ -53,7 +53,7 @@ pub fn pack_vertices(quads: &[Quad]) -> Result<Vec<PackedVertex>, i32> {
     let mut out = vec![PackedVertex::default(); required];
     let mut written = 0usize;
     let status = unsafe {
-        mc_spine_client_mesh_pack_vertices(
+        megu_client_mesh_pack_vertices(
             quads.as_ptr(),
             quads.len(),
             out.as_mut_ptr(),
@@ -74,7 +74,7 @@ pub fn sort_translucent(quads: &[Quad], camera: [f32; 3]) -> Result<Vec<u32>, i3
     }
     let mut required = 0usize;
     let query = unsafe {
-        mc_spine_client_mesh_sort_translucent(
+        megu_client_mesh_sort_translucent(
             quads.as_ptr(),
             quads.len(),
             camera[0],
@@ -94,7 +94,7 @@ pub fn sort_translucent(quads: &[Quad], camera: [f32; 3]) -> Result<Vec<u32>, i3
     let mut out = vec![0u32; required];
     let mut written = 0usize;
     let status = unsafe {
-        mc_spine_client_mesh_sort_translucent(
+        megu_client_mesh_sort_translucent(
             quads.as_ptr(),
             quads.len(),
             camera[0],
@@ -1282,7 +1282,7 @@ impl WorldAnimationHost {
             .add_layer(mask, weight)
     }
 
-    /// Ingest a complete `mc-spine:anim_v1` (ANM1) custom-payload body.
+    /// Ingest a complete `megu:anim_v1` (ANM1) custom-payload body.
     /// Protocol fade ticks use Minecraft's 20 ticks per second.
     pub fn ingest_anm1_payload(&mut self, bytes: &[u8]) -> Result<(), AnimationError> {
         let trigger = decode_animation_trigger(bytes)?;

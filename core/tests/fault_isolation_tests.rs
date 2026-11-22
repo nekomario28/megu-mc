@@ -1,12 +1,12 @@
 // SPDX-License-Identifier: LGPL-3.0-or-later OR GPL-3.0-or-later OR AGPL-3.0-or-later
-//! Unit tests for `mc_spine_core::fault_isolation`.
+//! Unit tests for `megu_core::fault_isolation`.
 
-use mc_spine_core::crash_report::CrashContext;
-use mc_spine_core::fault_isolation::{
+use megu_core::crash_report::CrashContext;
+use megu_core::fault_isolation::{
     CircuitState, ExecutionPermit, FaultIsolationConfig, FaultIsolationRouter, IsolationReason,
     SubsystemScope,
 };
-use mc_spine_core::version::TargetVersion;
+use megu_core::version::TargetVersion;
 
 fn mod_scope(name: &str) -> SubsystemScope {
     SubsystemScope::ModNamespace(name.to_string())

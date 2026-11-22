@@ -2,7 +2,7 @@
 
 use std::collections::BTreeMap;
 
-use mc_spine_kernel::{
+use megu_kernel::{
     qol_gameplay::{
         evaluate_looking_at_hud, plan_mouse_tweak, sort_and_merge_inventory, ContainerFill,
         CropGrowth, FurnaceProgress, HarvestTool, HudTarget, InventoryLocation, InventorySide,

@@ -37,7 +37,7 @@ static NEXT_DIR: AtomicUsize = AtomicUsize::new(0);
 
 fn fixture_dir(tag: &str) -> PathBuf {
     let dir = std::env::temp_dir().join(format!(
-        "mc-spine-dep-resolver-{}-{}-{tag}",
+        "megu-dep-resolver-{}-{}-{tag}",
         std::process::id(),
         NEXT_DIR.fetch_add(1, Ordering::Relaxed)
     ));
@@ -576,7 +576,7 @@ fn datapack_jar() -> Vec<u8> {
             br#"{"pack":{"pack_format":48,"description":"dep test pack"}}"#.as_slice(),
         ),
         (
-            "data/mcspine_test/recipes/test_stew.json",
+            "data/megu_test/recipes/test_stew.json",
             br#"{"type":"minecraft:crafting_shapeless","category":"misc","ingredients":[{"item":"minecraft:carrot"}],"result":{"id":"minecraft:stick","count":4}}"#.as_slice(),
         ),
         (
@@ -584,21 +584,21 @@ fn datapack_jar() -> Vec<u8> {
             br#"{"type":"farmersdelight:cooking","ingredient":["minecraft:beetroot"],"result":"minecraft:beetroot_soup","experience":0.35,"cookingtime":200}"#.as_slice(),
         ),
         (
-            "data/mcspine_test/tags/blocks/rocks.json",
+            "data/megu_test/tags/blocks/rocks.json",
             br#"{"replace":false,"values":["minecraft:stone","minecraft:cobblestone"]}"#.as_slice(),
         ),
         (
-            "data/mcspine_test/loot_tables/chests/test.json",
+            "data/megu_test/loot_tables/chests/test.json",
             br#"{"type":"minecraft:chest","pools":[]}"#.as_slice(),
         ),
     ])
 }
 
-/// A `mc-spine-mod-bundle/1` document at the archive root.
+/// A `megu-mod-bundle/1` document at the archive root.
 fn bundle_jar() -> Vec<u8> {
     jar(&[(
         "bundle.json",
-        br#"{"schema":"mc-spine-mod-bundle/1","mod_id":"testbundle","mc_version_range":"*","portals":[],"progression_barriers":[],"biome_regions":[],"creatures":[],"custom_channels":[]}"#.as_slice(),
+        br#"{"schema":"megu-mod-bundle/1","mod_id":"testbundle","mc_version_range":"*","portals":[],"progression_barriers":[],"biome_regions":[],"creatures":[],"custom_channels":[]}"#.as_slice(),
     )])
 }
 

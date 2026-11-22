@@ -384,7 +384,7 @@ impl ActiveSeasonKind {
 }
 
 /// Seasonal ambience state pushed by a live Season Mod sync — the `SSN1`
-/// frame on `mc-spine:season_v1` produced by the Serene Seasons / Fabric
+/// frame on `megu:season_v1` produced by the Serene Seasons / Fabric
 /// Seasons / Ecliptic Seasons adapters.
 ///
 /// `Default` is the neutral, seasonless vanilla fallback: every derived

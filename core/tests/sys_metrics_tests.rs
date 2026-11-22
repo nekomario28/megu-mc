@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: LGPL-3.0-or-later OR GPL-3.0-or-later OR AGPL-3.0-or-later
-//! Unit and smoke tests for `mc_spine_core::sys_metrics`.
+//! Unit and smoke tests for `megu_core::sys_metrics`.
 
-use mc_spine_core::sys_metrics::{
+use megu_core::sys_metrics::{
     cpu_usage_percent, format_mini_hud_lines, gpu_backend_for_vendor, parse_drm_gpu_metrics,
     parse_gpu_busy_percent, parse_proc_meminfo, parse_proc_self_status_rss_kib,
     parse_proc_stat_cpu_totals, parse_vram_bytes_to_mib, sample_gpu_metrics, sample_host_metrics,

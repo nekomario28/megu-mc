@@ -28,7 +28,7 @@ import zipfile
 
 PINNED_SHA1 = "59353fb40c36d304f2035d51e7d6e6baa98dc05c"
 JAR_CANDIDATES = [
-    "~/.cache/mc-spine-audit/load/vanilla/server.jar",
+    "~/.cache/megu-audit/load/vanilla/server.jar",
     "/data/lane-scratch/wg-oracle/server.jar",
     "/data/lane-scratch/mc-vanilla-eval/server.jar",
 ]

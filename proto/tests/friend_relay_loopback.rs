@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: LGPL-3.0-or-later OR GPL-3.0-or-later OR AGPL-3.0-or-later
-//! Real loopback proof for [`mc_spine_proto::friend_relay`]: one
+//! Real loopback proof for [`megu_proto::friend_relay`]: one
 //! [`TcpFriendRelay`] on an ephemeral `127.0.0.1:0` port, one real host
 //! tunnel and multiple real guest links exercise the whole `FRL1` path —
 //! `MEGU-XXXX-XXXX` invite issuance, per-stream multiplexing of genuine
@@ -12,11 +12,11 @@ use std::io::{self, Read, Write};
 use std::net::{SocketAddr, TcpStream};
 use std::time::{Duration, Instant};
 
-use mc_spine_proto::friend_relay::{
+use megu_proto::friend_relay::{
     decode_packet, encode_frame, FriendPacket, InviteCode, TcpFriendRelay,
     MAX_FRL1_FRAME_BYTES,
 };
-use mc_spine_proto::wire::{write_frame, WireWriter};
+use megu_proto::wire::{write_frame, WireWriter};
 
 const HOST_SECRET: [u8; 16] = [0xC7; 16];
 

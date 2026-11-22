@@ -1079,7 +1079,7 @@ mod operator_ux_tests {
         }
         let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
             .join("target")
-            .join(format!("mc-spine-icon-{}", std::process::id()));
+            .join(format!("megu-icon-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
 
         let missing = dir.join("server-icon.png");
@@ -1138,11 +1138,11 @@ mod operator_ux_tests {
             "[MOTD]A Minecraft Server[/MOTD][AD]25565[/AD]"
         );
         assert_eq!(
-            format_lan_announcement("mc-spine", 25599),
-            "[MOTD]mc-spine[/MOTD][AD]25599[/AD]"
+            format_lan_announcement("megu", 25599),
+            "[MOTD]megu[/MOTD][AD]25599[/AD]"
         );
         // Lifecycle: start on an ephemeral UDP socket, stop joins the thread.
-        if let Ok(announcer) = LanAnnouncer::start("mc-spine", 25599) {
+        if let Ok(announcer) = LanAnnouncer::start("megu", 25599) {
             announcer.stop();
         }
     }
@@ -2276,7 +2276,7 @@ struct OperatorMetricsSnapshot {
 #[allow(dead_code)]
 impl OperatorMetricsSnapshot {
     /// Prometheus text exposition (0.0.4): a `# HELP`/`# TYPE` pair then one
-    /// sample line per metric, every name `mc_spine_`-prefixed for a
+    /// sample line per metric, every name `megu_`-prefixed for a
     /// localhost scrape. Non-finite floats render as `0` — a NaN sample makes
     /// some collectors reject the whole exposition, and `0` is the honest
     /// "no reading" anyway.
@@ -2290,47 +2290,47 @@ impl OperatorMetricsSnapshot {
         }
         let rows: [(&str, &str, String); 9] = [
             (
-                "mc_spine_tps",
+                "megu_tps",
                 "Server ticks per second, 20.0 nominal",
                 gauge(self.tps),
             ),
             (
-                "mc_spine_mspt_p50",
+                "megu_mspt_p50",
                 "Median tick time in milliseconds",
                 gauge(self.mspt_p50),
             ),
             (
-                "mc_spine_mspt_p95",
+                "megu_mspt_p95",
                 "95th-percentile tick time in milliseconds",
                 gauge(self.mspt_p95),
             ),
             (
-                "mc_spine_mspt_p99",
+                "megu_mspt_p99",
                 "99th-percentile tick time in milliseconds",
                 gauge(self.mspt_p99),
             ),
             (
-                "mc_spine_players_online",
+                "megu_players_online",
                 "Players currently online",
                 self.players_online.to_string(),
             ),
             (
-                "mc_spine_loaded_chunks",
+                "megu_loaded_chunks",
                 "World chunks currently loaded",
                 self.loaded_chunks.to_string(),
             ),
             (
-                "mc_spine_quarantined_faults",
+                "megu_quarantined_faults",
                 "Tick targets frozen by the fault quarantine",
                 self.quarantined_faults.to_string(),
             ),
             (
-                "mc_spine_rss_mib",
+                "megu_rss_mib",
                 "Resident memory in MiB",
                 gauge(self.rss_mib),
             ),
             (
-                "mc_spine_uptime_seconds",
+                "megu_uptime_seconds",
                 "Process uptime in seconds",
                 gauge(self.uptime_seconds),
             ),
@@ -2707,15 +2707,15 @@ mod ops_sre_tests {
         };
         let text = snap.format_prometheus();
         for name in [
-            "mc_spine_tps",
-            "mc_spine_mspt_p50",
-            "mc_spine_mspt_p95",
-            "mc_spine_mspt_p99",
-            "mc_spine_players_online",
-            "mc_spine_loaded_chunks",
-            "mc_spine_quarantined_faults",
-            "mc_spine_rss_mib",
-            "mc_spine_uptime_seconds",
+            "megu_tps",
+            "megu_mspt_p50",
+            "megu_mspt_p95",
+            "megu_mspt_p99",
+            "megu_players_online",
+            "megu_loaded_chunks",
+            "megu_quarantined_faults",
+            "megu_rss_mib",
+            "megu_uptime_seconds",
         ] {
             assert!(text.contains(&format!("# TYPE {name} gauge\n")), "{name} missing TYPE");
             assert!(text.contains(&format!("# HELP {name} ")), "{name} missing HELP");
@@ -2729,17 +2729,17 @@ mod ops_sre_tests {
                 "{name} sample is not a number: {value}"
             );
         }
-        assert!(text.contains("mc_spine_tps 19.98\n"), "{text}");
-        assert!(text.contains("mc_spine_players_online 3\n"), "{text}");
-        assert!(text.contains("mc_spine_quarantined_faults 2\n"), "{text}");
-        assert!(text.contains("mc_spine_uptime_seconds 3600.5\n"), "{text}");
+        assert!(text.contains("megu_tps 19.98\n"), "{text}");
+        assert!(text.contains("megu_players_online 3\n"), "{text}");
+        assert!(text.contains("megu_quarantined_faults 2\n"), "{text}");
+        assert!(text.contains("megu_uptime_seconds 3600.5\n"), "{text}");
         // Every line is a comment, a TYPE/HELP header, or `name value` — no
         // stray prose can break a scraper.
         for line in text.lines() {
             assert!(
                 line.starts_with('#')
                     || line.split_once(' ').is_some_and(|(name, _)| {
-                        name.starts_with("mc_spine_") && !name.contains(' ')
+                        name.starts_with("megu_") && !name.contains(' ')
                     }),
                 "non exposition line: {line}"
             );
@@ -2761,18 +2761,18 @@ mod ops_sre_tests {
         assert!(!text.contains("NaN"), "{text}");
         assert!(!text.contains("inf"), "{text}");
         for name in [
-            "mc_spine_tps",
-            "mc_spine_mspt_p50",
-            "mc_spine_mspt_p95",
-            "mc_spine_rss_mib",
-            "mc_spine_uptime_seconds",
+            "megu_tps",
+            "megu_mspt_p50",
+            "megu_mspt_p95",
+            "megu_rss_mib",
+            "megu_uptime_seconds",
         ] {
             assert!(
                 text.contains(&format!("{name} 0\n")),
                 "{name} must scrub to 0:\n{text}"
             );
         }
-        assert!(text.contains("mc_spine_mspt_p99 0\n"), "{text}");
+        assert!(text.contains("megu_mspt_p99 0\n"), "{text}");
     }
 }
 

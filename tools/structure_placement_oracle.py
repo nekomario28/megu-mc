@@ -25,7 +25,7 @@ def main():
                     (data / Path(name).name).write_bytes(archive.read(name))
         out = work / 'placements.tsv'
         run_probe(work, cp, ROOT / 'tools/structure-oracle/StructurePlacementOracle.java',
-                  'dev.mcspine.tools.StructurePlacementOracle', data, out)
+                  'dev.megu.tools.StructurePlacementOracle', data, out)
         actual = out.read_bytes()
     if args.write:
         VECTORS.write_bytes(actual)

@@ -1,23 +1,23 @@
 # Operator guide
 
-Running an mc-spine server: first-time setup, modpack pre-flight, runtime
+Running an megu server: first-time setup, modpack pre-flight, runtime
 knobs, Docker, world migration and status probing. Every command below is
 copied from the binaries in this tree — each binary's `--help` is the
 authoritative flag list.
 
 Seven primary operator-facing binaries ship in this repository, alongside
-`mc-spine-admin` for the legacy offline administration commands:
+`megu-admin` for the legacy offline administration commands:
 
 | binary | built from | job |
 |---|---|---|
-| `mc-spine` | root package ([../src/main.rs](../src/main.rs)) | the game server |
-| `mc-spine-init` | [../server-files](../server-files) | server directory bootstrap; dispatches legacy subcommands to `mc-spine-admin` |
-| `mc-spine-admin` | [../server-files](../server-files) | offline server-file administration (`init`, `doctor`, `op`, `claims`, etc.) |
-| `mc-spine-mod-check` | [../mod-adapter-core](../mod-adapter-core) | modpack pre-flight checker |
-| `mc-spine-world-migrate` | [../state-store](../state-store) | inspect and migrate world data between 1.21.1 and 26.3 |
-| `mc-spine-client` | [../client-app](../client-app) | native client; `--ping` doubles as a status probe |
-| `mc-spine-client-gpu` | [../client-gpu](../client-gpu) | wgpu client; adapter probe and offline demo |
-| `mc-spine-voice-relay` | [../proto](../proto) | zero-dependency `VCR1` UDP proximity voice relay sidecar |
+| `megu` | root package ([../src/main.rs](../src/main.rs)) | the game server |
+| `megu-init` | [../server-files](../server-files) | server directory bootstrap; dispatches legacy subcommands to `megu-admin` |
+| `megu-admin` | [../server-files](../server-files) | offline server-file administration (`init`, `doctor`, `op`, `claims`, etc.) |
+| `megu-mod-check` | [../mod-adapter-core](../mod-adapter-core) | modpack pre-flight checker |
+| `megu-world-migrate` | [../state-store](../state-store) | inspect and migrate world data between 1.21.1 and 26.3 |
+| `megu-client` | [../client-app](../client-app) | native client; `--ping` doubles as a status probe |
+| `megu-client-gpu` | [../client-gpu](../client-gpu) | wgpu client; adapter probe and offline demo |
+| `megu-voice-relay` | [../proto](../proto) | zero-dependency `VCR1` UDP proximity voice relay sidecar |
 
 The server and the tools target two Minecraft versions: `1.21.1`
 (protocol 767, DataVersion 3955) and `26.3` (protocol 777, DataVersion
@@ -26,7 +26,7 @@ honest about today's coverage.
 
 ## 1. First-time server setup
 
-Direct `mc-spine-init --dir` creates `world/`, `mods/`, `datapacks/`,
+Direct `megu-init --dir` creates `world/`, `mods/`, `datapacks/`,
 `backups/`, `server.toml`, `eula.txt`, `ops.json` and `whitelist.json`.
 The defaults are `--mc-version 1.21.1` and `--port 25565`; `26.3` is
 also a tooling target. The initializer preserves existing files unless
@@ -35,9 +35,9 @@ Minecraft EULA before using `--accept-eula`; without that flag, a new
 `eula.txt` contains `eula=false`.
 
 ```sh
-mc-spine-init --dir /srv/spine --mc-version 1.21.1 --port 25565 --accept-eula
-mc-spine-init --dir /srv/spine-263 --mc-version 26.3 --accept-eula
-mc-spine-init --dir /srv/spine --dry-run --json
+megu-init --dir /srv/spine --mc-version 1.21.1 --port 25565 --accept-eula
+megu-init --dir /srv/spine-263 --mc-version 26.3 --accept-eula
+megu-init --dir /srv/spine --dry-run --json
 ```
 
 Direct `--dry-run` plans without writing files; `--json` emits the
@@ -46,7 +46,7 @@ initializer, use `--force --accept-eula` and review the overwrite plan
 first: `--force` also replaces other generated configuration files.
 
 **One-command onboarding.** The Python launcher bootstraps a local server
-directory, checks the EULA and optional modpack, and starts `mc-spine` only
+directory, checks the EULA and optional modpack, and starts `megu` only
 when the pre-flight succeeds. Review the Minecraft EULA before opting in.
 
 ```sh
@@ -58,7 +58,7 @@ python3 tools/megu_start.py --dir ./server-263 --mc-version 26.3 \
 ```
 
 `megu_start.py` uses `1.21.1` by default and delegates initialization
-to a built or PATH-resolved `mc-spine-init` when available, after its
+to a built or PATH-resolved `megu-init` when available, after its
 Python EULA and `server.properties` setup. `--lang` accepts `auto`,
 `en`, or `ja`. `--json` emits a
 `megu-start-plan/1` plan; `--dry-run` avoids launching the server while
@@ -66,8 +66,8 @@ still initializing `eula.txt` and `server.properties` in the chosen
 directory. A modpack is checked, not downloaded or installed. A plan
 with `action_items` must be resolved before starting the server.
 
-Legacy `mc-spine-init init|doctor|op|deop|ban|pardon|whitelist|claims`
-commands dispatch to the sibling `mc-spine-admin` executable. Install
+Legacy `megu-init init|doctor|op|deop|ban|pardon|whitelist|claims`
+commands dispatch to the sibling `megu-admin` executable. Install
 both binaries together to use these offline administration commands;
 the legacy `init` subcommand has its own options.
 
@@ -75,16 +75,16 @@ the legacy `init` subcommand has its own options.
 # Read-only pre-flight. Exit 0 = READY, 2 = EULA missing/not accepted,
 # 1 = a server file is unreadable or corrupt. rcon.password is always
 # redacted in the report.
-mc-spine-init doctor --dir /srv/spine
+megu-init doctor --dir /srv/spine
 
 # Offline administration (all take --json for machine output).
-mc-spine-init op --dir /srv/spine <player> --level 4
-mc-spine-init deop --dir /srv/spine <player>
-mc-spine-init whitelist --dir /srv/spine on
-mc-spine-init whitelist --dir /srv/spine add <player>
-mc-spine-init whitelist --dir /srv/spine list
-mc-spine-init ban --dir /srv/spine <player> --reason "griefing"
-mc-spine-init pardon --dir /srv/spine <player>
+megu-init op --dir /srv/spine <player> --level 4
+megu-init deop --dir /srv/spine <player>
+megu-init whitelist --dir /srv/spine on
+megu-init whitelist --dir /srv/spine add <player>
+megu-init whitelist --dir /srv/spine list
+megu-init ban --dir /srv/spine <player> --reason "griefing"
+megu-init pardon --dir /srv/spine <player>
 ```
 
 `op` defaults to the directory's `op-permission-level` (else 4);
@@ -103,14 +103,14 @@ may be negative.
 ```sh
 # List every claim (optionally --dimension <dim>), plus the forceload
 # count; parties prints parties with members, allies and invites.
-mc-spine-init claims --dir /srv/spine list [--json]
-mc-spine-init claims --dir /srv/spine parties
+megu-init claims --dir /srv/spine list [--json]
+megu-init claims --dir /srv/spine parties
 
 # Spawn-protection style server claim on chunk (3, -2), force-loaded.
-mc-spine-init claims --dir /srv/spine server-claim overworld 3 -2 --forceload
+megu-init claims --dir /srv/spine server-claim overworld 3 -2 --forceload
 
 # Drop any claim on that chunk as admin.
-mc-spine-init claims --dir /srv/spine unclaim overworld 3 -2
+megu-init claims --dir /srv/spine unclaim overworld 3 -2
 ```
 
 ## 2. Modpack pre-flight
@@ -133,14 +133,14 @@ allowlist and verify the declared size plus SHA-512 and/or SHA-256 (whichever
 hashes Modrinth provides) before atomic installation. Built-in superseded
 performance mods are skipped by default; `add --force` overrides the skip.
 
-Before a pack is downloaded or launched, `mc-spine-mod-check` reports
+Before a pack is downloaded or launched, `megu-mod-check` reports
 whether it can run on this server. It accepts a Modrinth `.mrpack`
 archive, a standalone `modrinth.index.json`, or a CurseForge
 `manifest.json` / pack `.zip`.
 
 ```sh
-mc-spine-mod-check --modpack pack.mrpack --mc-version 1.21.1
-mc-spine-mod-check --modpack pack.mrpack --mc-version 26.3
+megu-mod-check --modpack pack.mrpack --mc-version 1.21.1
+megu-mod-check --modpack pack.mrpack --mc-version 26.3
 ```
 
 The report says which files run natively, which client-only files are
@@ -166,8 +166,8 @@ mod ids before scanning. Safe `@Inject` sites can be lifted from Tier 3 to
 Tier 2; other hooks remain flagged for inspection.
 
 ```sh
-mc-spine-mod-check --scan-mods-dir ./mods --json
-mc-spine-mod-check --scan-mods-dir ./mods --include-client-mixins --json
+megu-mod-check --scan-mods-dir ./mods --json
+megu-mod-check --scan-mods-dir ./mods --include-client-mixins --json
 ```
 
 Client mixins are excluded by default on dedicated servers. For directory
@@ -179,9 +179,9 @@ read or parsed.
 directory and optionally write native bundle candidates and a report:
 
 ```sh
-mc-spine-mod-check --adapt-jar ./mods/example.jar --out ./adapted --json
-mc-spine-mod-check --adapt-mods-dir ./mods --out ./adapted --json
-mc-spine-mod-check --scaffold-native examplemod --out ./examplemod.bundle.json
+megu-mod-check --adapt-jar ./mods/example.jar --out ./adapted --json
+megu-mod-check --adapt-mods-dir ./mods --out ./adapted --json
+megu-mod-check --scaffold-native examplemod --out ./examplemod.bundle.json
 python3 tools/mod_launcher.py --mods-dir ./mods --auto-adapt --dry-run --json
 python3 tools/mod_launcher.py --adapt-mods-dir ./mods --dry-run --json
 ```
@@ -190,7 +190,7 @@ python3 tools/mod_launcher.py --adapt-mods-dir ./mods --dry-run --json
 skip, native bundle, Tier 2 shim or Tier 3 fallback with explicit
 blockers. With `--out`, adaptation writes `<mod_id>.bundle.json` and
 `adaptation-report.json`. `--scaffold-native` writes a starter
-`mc-spine-mod-bundle/1` document. The launcher uses the same scan for
+`megu-mod-bundle/1` document. The launcher uses the same scan for
 startup planning; `--adapt-mods-dir` implies `--auto-adapt`. These paths
 do not establish compatibility for every Java mod. For the bundle format
 and supported extension points, see [mod-author-guide.md](mod-author-guide.md).
@@ -208,7 +208,7 @@ pending a bytecode inspection), `2` a version mismatch or bad arguments,
 
 **About the automatic skips.** `sodium`, `lithium`, `modernfix`,
 `distanthorizons`, `ferritecore` and similar performance mods are never
-loaded: `mc-spine` already ships equivalent optimization categories as
+loaded: `megu` already ships equivalent optimization categories as
 its own original clean-room Rust code. The skip list is a mod-id
 blocklist — `BUILTIN_SUPERSEDED_PERF_MODS` in
 [../mod-adapter-core/src/fallback.rs](../mod-adapter-core/src/fallback.rs)
@@ -242,12 +242,12 @@ Start it in the server working directory; the world saves to
 
 ```sh
 cd /srv/spine
-mc-spine            # or: MC_SPINE_PORT=25565 mc-spine
+megu            # or: MEGU_PORT=25565 megu
 ```
 
 Settings resolve in three layers, highest wins: **environment →
 `server.toml` → a dropped-in Vanilla `server.properties`** (the last one
-is read, never created). `server.toml` is optional; `MC_SPINE_CONFIG`
+is read, never created). `server.toml` is optional; `MEGU_CONFIG`
 points it elsewhere. A running server re-reads `server.toml` on the
 vanilla `/reload` command.
 
@@ -255,37 +255,37 @@ Environment knobs the runtime actually reads:
 
 | variable | default | effect |
 |---|---|---|
-| `MC_SPINE_PORT` | 25565 | game listener port |
-| `MC_SPINE_BIND_ADDR` | 127.0.0.1 | game listener address |
-| `MC_SPINE_ALLOW_PUBLIC_BIND` | off | required to bind any non-loopback address |
-| `MC_SPINE_MOTD` | "mc-spine" | server-list description and LAN announcement text |
-| `MC_SPINE_MAX_PLAYERS` | 20 | player cap (also the `status` reply) |
-| `MC_SPINE_SEED` | unset | signed 64-bit world seed |
-| `MC_SPINE_ONLINE_MODE` | off | `1`: encryption request/response plus the session check. Fails closed without a keypair/session provider — the flag alone is not a keypair |
-| `MC_SPINE_VELOCITY_FORWARDING` | off | `1`: Velocity modern forwarding. The proxy must answer `velocity:player_info` with an HMAC-SHA256 identity checked against `MC_SPINE_VELOCITY_SECRET` (required when this is on). Checked before online mode — a proxy already terminated the client's real authentication, so the two are never stacked |
-| `MC_SPINE_ALLOWLIST` | off | comma/space-separated player names and/or UUIDs permitted to log in |
-| `MC_SPINE_BACKUP_MAX_KEEP` | 0 (off) | how many `backups/world-*.bak` snapshots stay after each rotation |
-| `MC_SPINE_BACKUP_INTERVAL_SECS` | 600 | minimum age before an older backup generation is rotated |
-| `MC_SPINE_LAN_BROADCAST` | off | `1`: multicast "Open to LAN" announcement armed once the game listener owns a port |
-| `MC_SPINE_SAFE_SPAWN` | auto | `1` forces the dry-ground spawn search; it already runs automatically on a never-saved world when the datapack worldgen is active |
-| `MC_SPINE_COMPRESSION_THRESHOLD` | 256 | packet compression threshold; `0`/negative disables |
-| `MC_SPINE_ZLIB_LEVEL` | 1 | compressed packet zlib level, clamped to `1..=9` |
-| `MC_SPINE_STRICT_WORLDGEN` | off | `1`: fail the datapack worldgen load on the first parse failure instead of omitting that entry |
-| `MC_SPINE_IDLE_TIMEOUT_SECS` | 60 | play state: no complete packet for this long drops the client |
-| `MC_SPINE_LOGIN_TIMEOUT_SECS` | 15 | wall-clock budget for handshake + login + configuration |
-| `MC_SPINE_MAX_CONN_PER_IP` | 4 (non-loopback) | concurrent connections per remote IP; `0` = unlimited; when set explicitly it also applies to loopback |
-| `MC_SPINE_RCON_PORT` | unset | RCON listener port — only starts when set together with a nonempty `MC_SPINE_RCON_PASS` |
-| `MC_SPINE_RCON_BIND_ADDR` | 127.0.0.1 | RCON bind address |
-| `MC_SPINE_VERSION_DIR` | unset | kernel version pack directory for the block registry |
-| `MC_SPINE_CONFIG` | `server.toml` | path of the optional config file |
-| `MC_SPINE_ENABLE_QUERY` | off | `1`/`true` enables the GameSpy4 UDP Query responder; `enable-query=true` in `server.properties` also enables it |
-| `MC_SPINE_QUERY_PORT` | game port | UDP Query port; overrides `query.port` in `server.properties` |
-| `MC_SPINE_ANVIL_WORLD_DIR` | unset | load a vanilla-format Anvil world at boot and write it on autosave/shutdown; back up `playerdata/<uuid>.dat` with the world |
+| `MEGU_PORT` | 25565 | game listener port |
+| `MEGU_BIND_ADDR` | 127.0.0.1 | game listener address |
+| `MEGU_ALLOW_PUBLIC_BIND` | off | required to bind any non-loopback address |
+| `MEGU_MOTD` | "megu" | server-list description and LAN announcement text |
+| `MEGU_MAX_PLAYERS` | 20 | player cap (also the `status` reply) |
+| `MEGU_SEED` | unset | signed 64-bit world seed |
+| `MEGU_ONLINE_MODE` | off | `1`: encryption request/response plus the session check. Fails closed without a keypair/session provider — the flag alone is not a keypair |
+| `MEGU_VELOCITY_FORWARDING` | off | `1`: Velocity modern forwarding. The proxy must answer `velocity:player_info` with an HMAC-SHA256 identity checked against `MEGU_VELOCITY_SECRET` (required when this is on). Checked before online mode — a proxy already terminated the client's real authentication, so the two are never stacked |
+| `MEGU_ALLOWLIST` | off | comma/space-separated player names and/or UUIDs permitted to log in |
+| `MEGU_BACKUP_MAX_KEEP` | 0 (off) | how many `backups/world-*.bak` snapshots stay after each rotation |
+| `MEGU_BACKUP_INTERVAL_SECS` | 600 | minimum age before an older backup generation is rotated |
+| `MEGU_LAN_BROADCAST` | off | `1`: multicast "Open to LAN" announcement armed once the game listener owns a port |
+| `MEGU_SAFE_SPAWN` | auto | `1` forces the dry-ground spawn search; it already runs automatically on a never-saved world when the datapack worldgen is active |
+| `MEGU_COMPRESSION_THRESHOLD` | 256 | packet compression threshold; `0`/negative disables |
+| `MEGU_ZLIB_LEVEL` | 1 | compressed packet zlib level, clamped to `1..=9` |
+| `MEGU_STRICT_WORLDGEN` | off | `1`: fail the datapack worldgen load on the first parse failure instead of omitting that entry |
+| `MEGU_IDLE_TIMEOUT_SECS` | 60 | play state: no complete packet for this long drops the client |
+| `MEGU_LOGIN_TIMEOUT_SECS` | 15 | wall-clock budget for handshake + login + configuration |
+| `MEGU_MAX_CONN_PER_IP` | 4 (non-loopback) | concurrent connections per remote IP; `0` = unlimited; when set explicitly it also applies to loopback |
+| `MEGU_RCON_PORT` | unset | RCON listener port — only starts when set together with a nonempty `MEGU_RCON_PASS` |
+| `MEGU_RCON_BIND_ADDR` | 127.0.0.1 | RCON bind address |
+| `MEGU_VERSION_DIR` | unset | kernel version pack directory for the block registry |
+| `MEGU_CONFIG` | `server.toml` | path of the optional config file |
+| `MEGU_ENABLE_QUERY` | off | `1`/`true` enables the GameSpy4 UDP Query responder; `enable-query=true` in `server.properties` also enables it |
+| `MEGU_QUERY_PORT` | game port | UDP Query port; overrides `query.port` in `server.properties` |
+| `MEGU_ANVIL_WORLD_DIR` | unset | load a vanilla-format Anvil world at boot and write it on autosave/shutdown; back up `playerdata/<uuid>.dat` with the world |
 
 **GameSpy4 (GS4) Query.** Enable the opt-in UDP status/rules responder
-with `MC_SPINE_ENABLE_QUERY=1 mc-spine`, or add `enable-query=true` to
+with `MEGU_ENABLE_QUERY=1 megu`, or add `enable-query=true` to
 `server.properties`. It uses the game port for UDP unless
-`MC_SPINE_QUERY_PORT` or `query.port` selects another port. Open the
+`MEGU_QUERY_PORT` or `query.port` selects another port. Open the
 corresponding UDP port if the query service should be remotely reachable.
 
 **Console.** In live mode, stdin lines run as level-4 console commands:
@@ -293,7 +293,7 @@ corresponding UDP port if the query service should be remotely reachable.
 line (TPS band + ms/tick, players, loaded chunks, memory). `status` is
 deliberately console/RCON-only and never enters the player command tree —
 tab completion stays 100% Vanilla. The same commands reach the server
-over RCON when `MC_SPINE_RCON_PORT` + `MC_SPINE_RCON_PASS` are set.
+over RCON when `MEGU_RCON_PORT` + `MEGU_RCON_PASS` are set.
 
 **Level-4 server policies.** Operators can inspect or change the running
 server's opt-in policy with `/megu policy`; settings are in-memory and
@@ -323,7 +323,7 @@ execution. The integrated client provides corresponding host-world flags,
 for example:
 
 ```sh
-mc-spine-client --fair-play --minimap-mode fair_play \
+megu-client --fair-play --minimap-mode fair_play \
     --allow-cave-map false --allow-mob-radar false \
     --player-radar party_only --allow-waypoint-teleport false
 ```
@@ -348,9 +348,9 @@ entrypoint — **no Mojang data**. The container runs as uid 10001 with
 `/data` as the working directory and exposes `25565/tcp`.
 
 ```sh
-docker build -f docker/Dockerfile -t mc-spine:alpha .
-docker run --name mc-spine -e EULA=TRUE -p 25565:25565 \
-    -v mc-spine-data:/data mc-spine:alpha
+docker build -f docker/Dockerfile -t megu:alpha .
+docker run --name megu -e EULA=TRUE -p 25565:25565 \
+    -v megu-data:/data megu:alpha
 ```
 
 [docker/entrypoint.sh](../docker/entrypoint.sh) does, in order:
@@ -359,14 +359,14 @@ docker run --name mc-spine -e EULA=TRUE -p 25565:25565 \
    counts and it is never accepted for you; a `eula.txt` is written into
    `/data` once as the same evidence a vanilla server carries.
 2. **Writability check** — `/data` must be writable by uid 10001.
-3. **Modpack pre-flight** — when `MC_SPINE_MODPACK` names a pack inside
+3. **Modpack pre-flight** — when `MEGU_MODPACK` names a pack inside
    the container, `tools/mod_launcher.py --modpack … --mc-version
-   "${MC_SPINE_MC_VERSION:-1.21.1}"` runs before the server may start.
-4. `exec /usr/local/bin/mc-spine` with the `MC_SPINE_*` environment
+   "${MEGU_MC_VERSION:-1.21.1}"` runs before the server may start.
+4. `exec /usr/local/bin/megu` with the `MEGU_*` environment
    passed straight through.
 
-The image defaults `MC_SPINE_BIND_ADDR=0.0.0.0`,
-`MC_SPINE_ALLOW_PUBLIC_BIND=1` and `MC_SPINE_PORT=25565` — inside the
+The image defaults `MEGU_BIND_ADDR=0.0.0.0`,
+`MEGU_ALLOW_PUBLIC_BIND=1` and `MEGU_PORT=25565` — inside the
 image the container network is the isolation boundary and the operator's
 `-p` still decides exposure; all three stay overridable from the
 environment.
@@ -381,44 +381,44 @@ is [docs/release-checklist.md](release-checklist.md) §5.
 
 ## 5. World inspection, migration and status probing
 
-`mc-spine-world-migrate` works on `STV1` snapshots — the state-store
+`megu-world-migrate` works on `STV1` snapshots — the state-store
 crate's world snapshot codec — and on JSON world-metadata documents,
 between `1.21.1` and `26.3`.
 
 ```sh
 # Validate an STV1 file and print the version it was saved under plus
 # its dimension, chunk, block-override and block-entity counts.
-mc-spine-world-migrate inspect save.stv1
+megu-world-migrate inspect save.stv1
 
 # Inspect a vanilla save directory directly: level.dat (gzip-wrapped or
 # raw NBT) for the level name, saved-by version, seed and data packs,
 # plus a region/, DIM-1/region/ and DIM1/region/ header scan counting
 # populated chunks and classifying compression methods. Pure-Rust,
 # read-only.
-mc-spine-world-migrate inspect-anvil /path/to/vanilla-world --json
+megu-world-migrate inspect-anvil /path/to/vanilla-world --json
 
 # Migrate a real level.dat (gzip or raw NBT) to the 26.3 DataVersion.
 # --in stays untouched; --backup-old preserves any existing --out.
-mc-spine-world-migrate migrate-level --in ./world/level.dat \
+megu-world-migrate migrate-level --in ./world/level.dat \
     --out ./converted/level.dat --to 26.3 --backup-old --json
 
 # Re-seal a snapshot for another version. --out is written atomically
 # and verified decodable before it is reported; --in is never modified.
-mc-spine-world-migrate migrate --in old.stv1 --out new.stv1 --to 26.3
+megu-world-migrate migrate --in old.stv1 --out new.stv1 --to 26.3
 
 # JSON world metadata (level.dat export, chunk or datapack metadata)
 # through the same pipeline; output is deterministic sorted-key JSON.
-mc-spine-world-migrate migrate-json --in level-1211.json \
+megu-world-migrate migrate-json --in level-1211.json \
     --out level-263.json --to 26.3
 
 # 26.3 -> 1.21.1 needs the explicit opt-in; downgrades can lose data the
 # older format cannot represent.
-mc-spine-world-migrate migrate --in new.stv1 --out old.stv1 \
+megu-world-migrate migrate --in new.stv1 --out old.stv1 \
     --to 1.21.1 --allow-downgrade
 ```
 
 For a live vanilla-format world, start the server with
-`MC_SPINE_ANVIL_WORLD_DIR=/path/to/vanilla-world mc-spine`. The Anvil
+`MEGU_ANVIL_WORLD_DIR=/path/to/vanilla-world megu`. The Anvil
 import runs after the overlay load and wins on overlapping data; saves
 write back to that directory. Back up an existing world before enabling
 live writes, including its `playerdata/<uuid>.dat` entries. Verify player
@@ -430,11 +430,11 @@ mismatch, malformed JSON, unknown DataVersion), `2` a refused downgrade
 without `--allow-downgrade` or a bad command line. Every report takes
 `--json`.
 
-`mc-spine-client --ping` is the server-list status probe:
+`megu-client --ping` is the server-list status probe:
 
 ```sh
-mc-spine-client --ping 127.0.0.1:25565
-mc-spine-client --ping example.org --mc-version 26.3 --json
+megu-client --ping 127.0.0.1:25565
+megu-client --ping example.org --mc-version 26.3 --json
 ```
 
 It is SRV-aware and reports the version name/protocol the server
@@ -444,14 +444,14 @@ online/max with the sample name list, MOTD, latency and favicon.
 `767`/`777` (default `1.21.1`); `--json`/`--json-summary` prints the
 machine-readable status.
 
-**Crash reporting flags.** `mc-spine-client` installs a redacted panic hook at
+**Crash reporting flags.** `megu-client` installs a redacted panic hook at
 startup, writes local `crash-<fp>.md` reports, and supports `ask` (default),
 `auto_crash_only`, and `off` policies via:
 
 ```sh
-mc-spine-client --crash-report-mode ask|auto_crash_only|off
-mc-spine-client --report-endpoint https://<host>/api/report
-mc-spine-client --crash-reports-dir <dir> --flush-crash-reports [--confirm-send]
+megu-client --crash-report-mode ask|auto_crash_only|off
+megu-client --report-endpoint https://<host>/api/report
+megu-client --crash-reports-dir <dir> --flush-crash-reports [--confirm-send]
 ```
 
 `--report-endpoint` enforces HTTPS (or loopback HTTP for local testing) and
@@ -460,7 +460,7 @@ are never transmitted without `--confirm-send`.
 
 ## 6. Proximity voice relay
 
-`mc-spine-voice-relay` is the zero-dependency UDP sidecar for the
+`megu-voice-relay` is the zero-dependency UDP sidecar for the
 clean-room `VCR1` proximity voice protocol in
 [../proto/src/voice_relay.rs](../proto/src/voice_relay.rs). Serve mode
 (the default) binds a datagram socket, authenticates players by shared
@@ -468,16 +468,16 @@ secret, and forwards microphone frames to the players in earshot —
 distance and dimension culling plus a per-sender rate cap. It binds
 `127.0.0.1:24454` by default; a non-loopback `--bind` is refused with
 exit 2 unless `--allow-public-bind` is passed — the same opt-in posture
-as `MC_SPINE_ALLOW_PUBLIC_BIND` on the game listener.
+as `MEGU_ALLOW_PUBLIC_BIND` on the game listener.
 
 ```sh
-mc-spine-voice-relay                                # serve on 127.0.0.1:24454
-mc-spine-voice-relay --bind 0.0.0.0:24454 --allow-public-bind
-mc-spine-voice-relay --max-distance 64 --whisper-distance 24 --max-pps 128
+megu-voice-relay                                # serve on 127.0.0.1:24454
+megu-voice-relay --bind 0.0.0.0:24454 --allow-public-bind
+megu-voice-relay --max-distance 64 --whisper-distance 24 --max-pps 128
 
 # Offline checks that open no public socket.
-mc-spine-voice-relay --self-test                    # loopback auth + proximity, exit 0
-mc-spine-voice-relay --bench-packets 100000 --json  # p50/p99 routing latency + packets/s
+megu-voice-relay --self-test                    # loopback auth + proximity, exit 0
+megu-voice-relay --bench-packets 100000 --json  # p50/p99 routing latency + packets/s
 ```
 
 The serve loop starts with an empty player table: until a game host
@@ -495,7 +495,7 @@ self-test, `2` a bad command line or a refused public bind.
 router port forwarding using the existing client flags:
 
 ```sh
-mc-spine-client --join-code MEGU-XXXX-XXXX --relay relay.example.org:24455
+megu-client --join-code MEGU-XXXX-XXXX --relay relay.example.org:24455
 ```
 
 The code must be issued by a running host/relay; the example code is a
@@ -506,34 +506,34 @@ backend preferences. `classic-low-spec` selects the 16 KiB UBO-batched
 path for legacy Intel HD/UHD GPUs with limited shader support.
 
 ```sh
-mc-spine-client --gpu-backend auto
-mc-spine-client --gpu-backend mesh-shader
-mc-spine-client --gpu-backend compute-indirect
-mc-spine-client --gpu-backend classic-low-spec
-mc-spine-client --gpu-backend classic
+megu-client --gpu-backend auto
+megu-client --gpu-backend mesh-shader
+megu-client --gpu-backend compute-indirect
+megu-client --gpu-backend classic-low-spec
+megu-client --gpu-backend classic
 ```
 
-The optional `mc-spine-client-gpu` binary accepts a separate CLI:
+The optional `megu-client-gpu` binary accepts a separate CLI:
 
 ```sh
-mc-spine-client-gpu --headless-probe
-mc-spine-client-gpu --offline-demo
-mc-spine-client-gpu --connect 127.0.0.1:25565
+megu-client-gpu --headless-probe
+megu-client-gpu --offline-demo
+megu-client-gpu --connect 127.0.0.1:25565
 ```
 
 `--headless-probe` enumerates GPU adapters and the selected pipeline without
 opening a window. `--offline-demo` opens a built-in scene without a server.
 `--connect` currently records the target and shows it in the HUD; the live
 gameplay wire session is still being integrated. Ship this optional binary
-with `release_bundle.py build --extra-binary <path/to/mc-spine-client-gpu>`
+with `release_bundle.py build --extra-binary <path/to/megu-client-gpu>`
 (or `.exe` on Windows).
 
 **External shader packs.** Supply a shaderpack ZIP or directory and,
 optionally, a named `profile.<NAME>` in its `shaders.properties`:
 
 ```sh
-mc-spine-client --shader-pack ./shaderpacks/example.zip
-mc-spine-client --shader-pack ./shaderpacks/example --shader-profile quality
+megu-client --shader-pack ./shaderpacks/example.zip
+megu-client --shader-pack ./shaderpacks/example --shader-profile quality
 ```
 
 OptiFine/Iris packs, DistantHorizons LOD packs and native Megu WGSL
@@ -550,26 +550,26 @@ No third-party shaders are bundled.
 - **Version coverage today.** The game listener accepts protocol 767
   (1.21.1): other handshakes get the vanilla "Outdated client! Please
   use 1.21.1." / "Outdated server!" reply. The `26.3` target lives in the
-  tooling — `mc-spine-init`, `mc-spine-mod-check`,
-  `mc-spine-world-migrate`, `mc-spine-client --mc-version` and the
-  `mc-spine-proto` tables — and in the world-migration pipeline.
+  tooling — `megu-init`, `megu-mod-check`,
+  `megu-world-migrate`, `megu-client --mc-version` and the
+  `megu-proto` tables — and in the world-migration pipeline.
 - **The default listener is unauthenticated.** Loopback bind plus
   offline-mode login means unverified names/UUIDs and plaintext traffic.
   Do not expose the server on a public interface in that state. A
-  non-loopback bind requires `MC_SPINE_ALLOW_PUBLIC_BIND` and logs a
-  security warning; for anything reachable, run `MC_SPINE_ONLINE_MODE=1`
+  non-loopback bind requires `MEGU_ALLOW_PUBLIC_BIND` and logs a
+  security warning; for anything reachable, run `MEGU_ONLINE_MODE=1`
   or sit the server behind a Velocity proxy
-  (`MC_SPINE_VELOCITY_FORWARDING=1` + a shared
-  `MC_SPINE_VELOCITY_SECRET`), and still restrict access with a
-  firewall/private network and optionally `MC_SPINE_ALLOWLIST`.
-- **RCON stays off** unless `MC_SPINE_RCON_PORT` *and* a nonempty
-  `MC_SPINE_RCON_PASS` are set; it binds loopback by default and has
+  (`MEGU_VELOCITY_FORWARDING=1` + a shared
+  `MEGU_VELOCITY_SECRET`), and still restrict access with a
+  firewall/private network and optionally `MEGU_ALLOWLIST`.
+- **RCON stays off** unless `MEGU_RCON_PORT` *and* a nonempty
+  `MEGU_RCON_PASS` are set; it binds loopback by default and has
   per-IP failure lockouts. Treat the password as a secret — the tools
   never print it.
-- **EULA acceptance requires an operator action.** Direct `mc-spine-init`
+- **EULA acceptance requires an operator action.** Direct `megu-init`
   writes `eula=true` only with explicit `--accept-eula` when creating or
   replacing `eula.txt`. The container requires `EULA=TRUE` to start.
-  The bare `mc-spine` binary does not read `eula.txt`.
+  The bare `megu` binary does not read `eula.txt`.
 - [../SECURITY_NOTES.md](../SECURITY_NOTES.md) carries the full
   bind/allowlist posture; [../SECURITY.md](../SECURITY.md) is the
   reporting channel.

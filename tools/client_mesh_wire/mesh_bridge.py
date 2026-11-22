@@ -72,19 +72,19 @@ assert C.sizeof(MeshQuad) == 84
 
 
 def load_library(path: Path | None = None, build: bool = True):
-    path = path or ROOT / "client-port/target/release/libmc_spine_client_mesh.so"
+    path = path or ROOT / "client-port/target/release/libmegu_client_mesh.so"
     if not path.exists() and build:
         (ROOT / "target/tmp").mkdir(parents=True, exist_ok=True)
         env = dict(os.environ, TMPDIR=str(ROOT / "target/tmp"))
         subprocess.run(["cargo", "build", "--release", "--offline", "--locked", "--lib"],
                        cwd=ROOT / "client-port", env=env, check=True)
     lib = C.CDLL(str(path.resolve()))
-    lib.mc_spine_mesh_abi_version.argtypes = []
-    lib.mc_spine_mesh_abi_version.restype = C.c_uint32
-    lib.mc_spine_mesh_section.argtypes = [C.POINTER(MeshInput), C.POINTER(MeshQuad),
+    lib.megu_mesh_abi_version.argtypes = []
+    lib.megu_mesh_abi_version.restype = C.c_uint32
+    lib.megu_mesh_section.argtypes = [C.POINTER(MeshInput), C.POINTER(MeshQuad),
                                           C.c_size_t, C.POINTER(C.c_size_t)]
-    lib.mc_spine_mesh_section.restype = C.c_int32
-    if lib.mc_spine_mesh_abi_version() != ABI_VERSION:
+    lib.megu_mesh_section.restype = C.c_int32
+    if lib.megu_mesh_abi_version() != ABI_VERSION:
         raise RuntimeError("unsupported client mesh ABI version")
     return lib
 
@@ -235,10 +235,10 @@ class WorldSections:
         for i,border in enumerate(border_arrays):
             if border is not None: inp.borders[i]=C.cast(border,C.POINTER(MeshSample))
         count=C.c_size_t()
-        status=lib.mc_spine_mesh_section(C.byref(inp),None,0,C.byref(count))
+        status=lib.megu_mesh_section(C.byref(inp),None,0,C.byref(count))
         if status != ABI_OK: raise AssertionError(f"mesh count query status {status}")
         out=(MeshQuad*count.value)()
-        status=lib.mc_spine_mesh_section(C.byref(inp),out,count.value,C.byref(count))
+        status=lib.megu_mesh_section(C.byref(inp),out,count.value,C.byref(count))
         if status != ABI_OK: raise AssertionError(f"mesh output status {status}")
         quads=list(out)
         for q in quads:

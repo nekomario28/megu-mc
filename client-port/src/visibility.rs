@@ -78,13 +78,13 @@ impl FaceVisibility {
     pub const ALL: Self = Self(MATRIX_BITS);
 
     /// O(1) graph for a caller-known uniform-air section, matching the
-    /// `MC_SPINE_MESH_COLUMN_UNIFORM_AIR` guarantee.
+    /// `MEGU_MESH_COLUMN_UNIFORM_AIR` guarantee.
     pub const fn uniform_air() -> Self {
         Self::ALL
     }
 
     /// O(1) graph for a caller-known section of only full-occlusion opaque
-    /// non-fluid cubes, matching the `MC_SPINE_MESH_COLUMN_SEALED_SOLID`
+    /// non-fluid cubes, matching the `MEGU_MESH_COLUMN_SEALED_SOLID`
     /// guarantee: sight cannot cross any cell, so no face reaches another.
     pub const fn sealed_solid() -> Self {
         Self::NONE

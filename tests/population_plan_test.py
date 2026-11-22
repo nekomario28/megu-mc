@@ -14,20 +14,20 @@ def main():
     core = [(x, z) for x in range(-1, 2) for z in range(-1, 2)]
     recorded = [(3, 0), *reversed(core)]
     base = {k: v for k, v in os.environ.items()
-            if not k.startswith(('MC_SPINE_', 'SPC_', 'FSEED_', 'BIOMEF_', 'FEATURE_'))}
-    base.update(MC_SPINE_SEED='0', MC_SPINE_WG_PROFILE='0', MC_SPINE_WG_DUMP_N='1',
-                MC_SPINE_WG_DUMP_X='0', MC_SPINE_WG_DUMP_Z='0')
+            if not k.startswith(('MEGU_', 'SPC_', 'FSEED_', 'BIOMEF_', 'FEATURE_'))}
+    base.update(MEGU_SEED='0', MEGU_WG_PROFILE='0', MEGU_WG_DUMP_N='1',
+                MEGU_WG_DUMP_X='0', MEGU_WG_DUMP_Z='0')
     with tempfile.TemporaryDirectory(prefix='population-plan-contract-') as tmp:
         directory = Path(tmp)
 
         def run(name, order, scope, expected, marker, *, profile=True):
             plan, dump = directory / f'{name}.tsv', directory / f'{name}.bin'
             plan.write_text(''.join(f'{x}\t{z}\n' for x, z in order))
-            env = dict(base, MC_SPINE_POP_ORDER=str(plan), MC_SPINE_WG_DUMP=str(dump))
+            env = dict(base, MEGU_POP_ORDER=str(plan), MEGU_WG_DUMP=str(dump))
             if scope is not None:
-                env['MC_SPINE_POP_ORDER_SCOPE'] = scope
+                env['MEGU_POP_ORDER_SCOPE'] = scope
             if not profile:
-                env.pop('MC_SPINE_WG_PROFILE')
+                env.pop('MEGU_WG_PROFILE')
             try:
                 result = subprocess.run([str(binary)], cwd=ROOT if profile else directory, env=env,
                                         capture_output=True, text=True, timeout=45 if profile else 2)
@@ -50,9 +50,9 @@ def main():
         run('explicit-exact', recorded, 'exact', 2, 'outside')
         run('missing-core', recorded[:-1], 'recorded', 2, 'incomplete population footprint')
         run('duplicate-extra', [*recorded, (3, 0)], 'recorded', 2, 'duplicate population chunk')
-        run('unknown-scope', core, 'unknown', 2, 'invalid MC_SPINE_POP_ORDER_SCOPE')
+        run('unknown-scope', core, 'unknown', 2, 'invalid MEGU_POP_ORDER_SCOPE')
         run('missing-profile', core, 'exact', 2,
-            'MC_SPINE_WG_DUMP requires MC_SPINE_WG_PROFILE', profile=False)
+            'MEGU_WG_DUMP requires MEGU_WG_PROFILE', profile=False)
         assert not list(directory.glob('world_overlay.bin*')), 'diagnostic entered persistence path'
     print('population plan: PASS')
 

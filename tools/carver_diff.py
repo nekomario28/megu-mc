@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
-"""Diff mc-spine's offline chunk dump against a vanilla (Anvil) world.
+"""Diff megu's offline chunk dump against a vanilla (Anvil) world.
 
   tools/carver_diff.py <dump.bin> <world_dir> [--n 6] [--y 0:60] [--cells N]
 
-The dump comes from `MC_SPINE_WG_DUMP=<file> MC_SPINE_WG_DUMP_N=<n>` (see
+The dump comes from `MEGU_WG_DUMP=<file> MEGU_WG_DUMP_N=<n>` (see
 `main.rs`): `n*n` chunks from (0,0) in chunk-major order, each 24 sections of
 `(ly << 8) | (lz << 4) | lx` `u32` block states, one section per 16 block y.
 

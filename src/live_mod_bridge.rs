@@ -8,14 +8,14 @@
 // byte-identical wire behavior.
 //
 // Surfaces wired under `--features mod-suite`:
-//   * `live_mod_suite_boot` — startup `mods/` scan over `MC_SPINE_MODS_DIR`
+//   * `live_mod_suite_boot` — startup `mods/` scan over `MEGU_MODS_DIR`
 //     (set in `main`, before the listener binds) delegated 1:1 to
 //     `mod_adapter_core::auto_adapter::auto_adapt_mods_dir` — the same
-//     engine `mc-spine-mod-check --adapt-mods-dir` runs: renamed
+//     engine `megu-mod-check --adapt-mods-dir` runs: renamed
 //     `BUILTIN_SUPERSEDED_PERF_MODS` entries are skipped before any
 //     bytecode read on their manifest-declared ids, loader metadata,
 //     data/culinary/dimension discovery, `.class` Mixin lifting, and
-//     `mc-spine-mod-bundle/1` synthesis all come from the adapter. Its
+//     `megu-mod-bundle/1` synthesis all come from the adapter. Its
 //     emitted bundles register into `live_mod_unified_runtime()` next to
 //     standalone `*.bundle.json` files, the culinary registry feeds every
 //     discovered JAR (Farmer's Delight + addon `*:cooking` /
@@ -31,11 +31,11 @@
 //   * `live_check_progression_barrier` + `live_progression_denies_break` —
 //     declarative dimension/biome progression gates (Twilight-Forest-style)
 //     evaluated against a player's completed advancements; armed rules are
-//     loaded from `MC_SPINE_PROGRESSION` JSON, and `live_progression_grant`
+//     loaded from `MEGU_PROGRESSION` JSON, and `live_progression_grant`
 //     covers advancement ids the vanilla tree cannot represent.
-//   * `live_mod_sync_on_join` — serves the `mc-spine:mod_sync_v1` (`MSY1`)
+//   * `live_mod_sync_on_join` — serves the `megu:mod_sync_v1` (`MSY1`)
 //     `CustomPacketPayload` to joining clients when an operator manifest
-//     (`MC_SPINE_MOD_SYNC` JSON, `MC_SPINE_MOD_SYNC_MIRRORS` allowlist)
+//     (`MEGU_MOD_SYNC` JSON, `MEGU_MOD_SYNC_MIRRORS` allowlist)
 //     validates under `mod_sync`'s structural + trusted-CDN rules.
 
 /// Protocol 767 Play-phase clientbound Custom Payload packet id — the
@@ -70,9 +70,9 @@ enum LiveProgressionVerdict {
 // movement, gravity, combat and damage remain on the regular tick path.
 #[cfg(feature = "mod-suite")]
 struct LiveServerPerfBridge {
-    velocity: mc_spine_core::server_perf_governors::VelocityViewGovernor,
-    crowd: mc_spine_core::server_perf_governors::CrowdTickGuard,
-    chunks: mc_spine_core::server_perf_governors::CompressedChunkPacketCache,
+    velocity: megu_core::server_perf_governors::VelocityViewGovernor,
+    crowd: megu_core::server_perf_governors::CrowdTickGuard,
+    chunks: megu_core::server_perf_governors::CompressedChunkPacketCache,
 }
 
 #[cfg(feature = "mod-suite")]
@@ -80,9 +80,9 @@ fn live_server_perf_bridge() -> &'static Mutex<LiveServerPerfBridge> {
     static BRIDGE: OnceLock<Mutex<LiveServerPerfBridge>> = OnceLock::new();
     BRIDGE.get_or_init(|| {
         Mutex::new(LiveServerPerfBridge {
-            velocity: mc_spine_core::server_perf_governors::VelocityViewGovernor::new(10),
-            crowd: mc_spine_core::server_perf_governors::CrowdTickGuard::default(),
-            chunks: mc_spine_core::server_perf_governors::CompressedChunkPacketCache::new(1024),
+            velocity: megu_core::server_perf_governors::VelocityViewGovernor::new(10),
+            crowd: megu_core::server_perf_governors::CrowdTickGuard::default(),
+            chunks: megu_core::server_perf_governors::CompressedChunkPacketCache::new(1024),
         })
     })
 }
@@ -124,7 +124,7 @@ fn live_should_tick_crowd_mob_ai(
     chunk_entity_count: u32,
     is_critical: bool,
 ) -> bool {
-    use mc_spine_core::server_perf_governors::EntityTickClass;
+    use megu_core::server_perf_governors::EntityTickClass;
 
     let mut bridge = live_server_perf_bridge()
         .lock()
@@ -156,7 +156,7 @@ fn live_chunk_packet_cache_get_or_encode<F>(
 where
     F: FnOnce() -> Vec<u8>,
 {
-    use mc_spine_core::server_perf_governors::ChunkPacketCacheKey;
+    use megu_core::server_perf_governors::ChunkPacketCacheKey;
 
     live_server_perf_bridge()
         .lock()
@@ -283,12 +283,12 @@ use mod_adapter_core::world_extensions::{
 };
 
 // The bridge speaks protocol 767 (Minecraft 1.21.1) exclusively — the release
-// every adapter target pins. `mc_spine_core`'s shared version table is the
+// every adapter target pins. `megu_core`'s shared version table is the
 // source of truth; if its protocol ever drifts from 767 this fails to compile
 // instead of silently serving a wrong-version manifest or QoL payload.
 #[cfg(feature = "mod-suite")]
 const _: () = assert!(
-    mc_spine_core::version::TargetVersion::V1_21_1.protocol() == 767,
+    megu_core::version::TargetVersion::V1_21_1.protocol() == 767,
     "live mod bridge: protocol table drifted from 767"
 );
 #[cfg(feature = "mod-suite")]
@@ -314,7 +314,7 @@ mod live_server_perf_bridge_tests {
 
     #[test]
     fn live_perf_bridge_crowd_ai_strides_without_skipping_physics() {
-        use mc_spine_core::server_perf_governors::{EntityTickClass, TickDecision};
+        use megu_core::server_perf_governors::{EntityTickClass, TickDecision};
 
         let entity_id = 203;
         let (cx, cz) = (900, 901);
@@ -428,7 +428,7 @@ struct LiveModSuite {
     appleskin: HashMap<i32, AppleSkinDeltaTracker>,
     /// Last successfully sent SSN1 frame, scoped to the player's session.
     season_sync: HashMap<i32, ([u8; 16], [u8; SSN1_FRAME_LEN])>,
-    /// Encoded `MSY1` body for `mc-spine:mod_sync_v1`, validated at arm time.
+    /// Encoded `MSY1` body for `megu:mod_sync_v1`, validated at arm time.
     mod_sync_body: Option<Vec<u8>>,
     mod_sync_root_hash: Option<[u8; 32]>,
 }
@@ -479,10 +479,10 @@ impl LiveModSuite {
 
     /// Scan one `mods/` directory. JAR classification is delegated 1:1 to
     /// [`auto_adapt_mods_dir`] — the single source of truth shared with
-    /// `mc-spine-mod-check --adapt-mods-dir`: filename- and
+    /// `megu-mod-check --adapt-mods-dir`: filename- and
     /// manifest-declared superseded-perf-mod skips, loader metadata,
     /// data/culinary/dimension discovery, `.class` Mixin lifting, and
-    /// `mc-spine-mod-bundle/1` synthesis all happen inside the adapter. The
+    /// `megu-mod-bundle/1` synthesis all happen inside the adapter. The
     /// bridge folds each [`JarAdaptationResult`] back into the live suite:
     /// emitted bundles join the unified runtime, culinary stats aggregate
     /// for the boot report, and fully lifted Tier 2 bindings arm
@@ -490,7 +490,7 @@ impl LiveModSuite {
     fn scan_mods_dir(&mut self, dir: &std::path::Path) {
         if !dir.is_dir() {
             eprintln!(
-                "[live-mods] MC_SPINE_MODS_DIR {} is not a directory — mod scan skipped",
+                "[live-mods] MEGU_MODS_DIR {} is not a directory — mod scan skipped",
                 dir.display()
             );
             return;
@@ -680,7 +680,7 @@ impl LiveModSuite {
         self.barriers = self.unified.progression_engine();
     }
 
-    /// Install one validated `mc-spine-mod-bundle/1` document into the
+    /// Install one validated `megu-mod-bundle/1` document into the
     /// unified runtime — the single registration path shared by standalone
     /// `*.bundle.json` files and bundles the auto-adapter synthesized for
     /// native JARs. First mod id wins (an operator's standalone bundle
@@ -809,7 +809,7 @@ impl LiveModSuite {
     /// Install only an explicitly named damage entrypoint after full static
     /// verification. The archive scanner enforces ZIP and decoded-size bounds.
     fn load_damage_hooks(&mut self, jar_name: &str, jar: &[u8]) {
-        const DAMAGE_DESCRIPTOR: &str = "(Lmcspine/api/Event;)V";
+        const DAMAGE_DESCRIPTOR: &str = "(Lmegu/api/Event;)V";
         let classes = match live_mod_class_members(jar) {
             Ok(classes) => classes,
             Err(reason) => {
@@ -950,10 +950,10 @@ impl LiveModSuite {
         }
     }
 
-    /// Arm the `mc-spine:mod_sync_v1` manifest from an operator JSON file:
+    /// Arm the `megu:mod_sync_v1` manifest from an operator JSON file:
     /// `{"entries":[{"mod_id","file_name","download_url","sha256_hex",
     /// "size_bytes"}]}`. Every entry must pass `mod_sync`'s structural +
-    /// trusted-CDN validation (plus `MC_SPINE_MOD_SYNC_MIRRORS` hosts) before
+    /// trusted-CDN validation (plus `MEGU_MOD_SYNC_MIRRORS` hosts) before
     /// the encoded `MSY1` body is installed — an invalid manifest arms
     /// nothing.
     fn arm_mod_sync_json(&mut self, path: &std::path::Path) {
@@ -967,7 +967,7 @@ impl LiveModSuite {
                 return;
             }
         };
-        let policy = match std::env::var("MC_SPINE_MOD_SYNC_MIRRORS") {
+        let policy = match std::env::var("MEGU_MOD_SYNC_MIRRORS") {
             Ok(spec) => {
                 let mirrors: Vec<&str> = spec
                     .split(',')
@@ -1017,7 +1017,7 @@ impl LiveModSuite {
         }
     }
 
-    /// Load declarative progression rules from `MC_SPINE_PROGRESSION` JSON:
+    /// Load declarative progression rules from `MEGU_PROGRESSION` JSON:
     /// `{"rules":[{"id","dimension","biomes":[..],"requires":[..],
     /// "block_break":bool,"block_place":bool,"effects":[[id,ticks,amp]],
     /// "damage":[hearts,interval_ticks]}]}`.
@@ -1867,15 +1867,15 @@ fn live_mod_magic_send_frame(client: &Client, frame: &[u8]) {
     let _ = send_packet(&mut socket, LIVE_MOD_S2C_CUSTOM_PAYLOAD_ID, bytes.to_vec());
 }
 
-/// Startup entry wired from `main`: scans `MC_SPINE_MODS_DIR` (if set), then
-/// arms the optional operator manifest (`MC_SPINE_MOD_SYNC`) and progression
-/// rules (`MC_SPINE_PROGRESSION`). Without any of the three the bridge stays
+/// Startup entry wired from `main`: scans `MEGU_MODS_DIR` (if set), then
+/// arms the optional operator manifest (`MEGU_MOD_SYNC`) and progression
+/// rules (`MEGU_PROGRESSION`). Without any of the three the bridge stays
 /// completely inert — same as a default build.
 #[cfg(feature = "mod-suite")]
 fn live_mod_suite_boot() {
-    let mods_dir = std::env::var_os("MC_SPINE_MODS_DIR");
-    let sync_path = std::env::var_os("MC_SPINE_MOD_SYNC");
-    let progression_path = std::env::var_os("MC_SPINE_PROGRESSION");
+    let mods_dir = std::env::var_os("MEGU_MODS_DIR");
+    let sync_path = std::env::var_os("MEGU_MOD_SYNC");
+    let progression_path = std::env::var_os("MEGU_PROGRESSION");
     if mods_dir.is_none() && sync_path.is_none() && progression_path.is_none() {
         return;
     }
@@ -1973,7 +1973,7 @@ fn live_mod_tick() {
     }
 }
 
-/// Serve the armed `mc-spine:mod_sync_v1` (`MSY1`) manifest to a client that
+/// Serve the armed `megu:mod_sync_v1` (`MSY1`) manifest to a client that
 /// just entered play, wired from the join path. A no-op until an operator
 /// manifest validates — vanilla joins send nothing new.
 #[cfg(feature = "mod-suite")]
@@ -2453,7 +2453,7 @@ mod wire_mods_stub_tests {
     #[test]
     fn wire_mods_stubs_compile_and_noop() {
         live_mod_suite_boot();
-        assert!(live_mod_custom_payload_frame("mc-spine:magic_v1", b"MAG1").is_empty());
+        assert!(live_mod_custom_payload_frame("megu:magic_v1", b"MAG1").is_empty());
         assert_eq!(live_mod_magic_tick_player([1; 16]), None);
         assert!(!live_mod_magic_remove_player([1; 16]));
         assert_eq!(live_mod_magic_absorb_damage([1; 16], 3.0), 3.0);
@@ -2791,14 +2791,14 @@ mod live_mod_bridge_magic_tests {
         );
         let frame = live_mod_magic_tick_player(uuid).unwrap().frame.unwrap();
         let (channel, payload) = decode_custom_frame(&frame);
-        assert_eq!(channel, "mc-spine:magic_v1");
+        assert_eq!(channel, "megu:magic_v1");
         assert!(payload.starts_with(b"MAG1"));
         let decoded = lmb_magic::decode_magic_sync(payload).expect("MAG1 decode");
         assert_eq!(decoded, snapshot(uuid));
         assert_eq!(lmb_magic::encode_magic_sync(&decoded).unwrap(), payload);
         assert_eq!(decoded.mana, 90.0);
         assert_eq!(decoded.cooldowns["test:instant"], 3);
-        for channel in ["mc-spine:vfx_v1", "mc-spine:anim_v1", "mc-spine:motion_v1"] {
+        for channel in ["megu:vfx_v1", "megu:anim_v1", "megu:motion_v1"] {
             let frame = live_mod_custom_payload_frame(channel, b"\0\x01\xff");
             let (actual_channel, body) = decode_custom_frame(&frame);
             assert_eq!(actual_channel, channel);
@@ -3364,7 +3364,7 @@ mod wire_mods_tests {
     fn lmb_temp_dir(tag: &str) -> std::path::PathBuf {
         static N: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
         let dir = std::env::temp_dir().join(format!(
-            "mc-spine-wire-mods-{tag}-{}-{}",
+            "megu-wire-mods-{tag}-{}-{}",
             std::process::id(),
             N.fetch_add(1, Ordering::Relaxed)
         ));
@@ -3509,22 +3509,22 @@ mod wire_mods_tests {
             ),
         ] {
             std::fs::write(path, format!(
-                r#"{{"schema":"mc-spine-mod-bundle/1","mod_id":"{id}","mc_version_range":"[1.21.1,1.21.1]","portals":[],"progression_barriers":[],"biome_regions":[],"creatures":[],"custom_channels":["{channel}"]}}"#
+                r#"{{"schema":"megu-mod-bundle/1","mod_id":"{id}","mc_version_range":"[1.21.1,1.21.1]","portals":[],"progression_barriers":[],"biome_regions":[],"creatures":[],"custom_channels":["{channel}"]}}"#
             )).unwrap();
         }
         // A parsed but incompatible bundle must not reserve the id of a
         // subsequent valid bundle during the same boot.
         std::fs::write(dir.join("a-incompatible.bundle.json"),
-            r#"{"schema":"mc-spine-mod-bundle/1","mod_id":"first:mod","mc_version_range":"[1.20.1,1.20.1]","portals":[],"progression_barriers":[],"biome_regions":[],"creatures":[],"custom_channels":[]}"#
+            r#"{"schema":"megu-mod-bundle/1","mod_id":"first:mod","mc_version_range":"[1.20.1,1.20.1]","portals":[],"progression_barriers":[],"biome_regions":[],"creatures":[],"custom_channels":[]}"#
         ).unwrap();
         std::fs::write(dir.join("invalid.bundle.json"), r#"{"schema":"wrong"}"#).unwrap();
-        let previous = std::env::var_os("MC_SPINE_MODS_DIR");
-        std::env::set_var("MC_SPINE_MODS_DIR", &dir);
+        let previous = std::env::var_os("MEGU_MODS_DIR");
+        std::env::set_var("MEGU_MODS_DIR", &dir);
         live_mod_suite_boot();
         if let Some(value) = previous {
-            std::env::set_var("MC_SPINE_MODS_DIR", value);
+            std::env::set_var("MEGU_MODS_DIR", value);
         } else {
-            std::env::remove_var("MC_SPINE_MODS_DIR");
+            std::env::remove_var("MEGU_MODS_DIR");
         }
         let runtime = live_mod_unified_runtime();
         assert_eq!(runtime.installed_mod_ids(), &["first:mod", "second:mod"]);
@@ -3563,13 +3563,13 @@ mod wire_mods_tests {
             ),
         )
         .unwrap();
-        let previous = std::env::var_os("MC_SPINE_MODS_DIR");
-        std::env::set_var("MC_SPINE_MODS_DIR", &dir);
+        let previous = std::env::var_os("MEGU_MODS_DIR");
+        std::env::set_var("MEGU_MODS_DIR", &dir);
         live_mod_suite_boot();
         if let Some(value) = previous {
-            std::env::set_var("MC_SPINE_MODS_DIR", value);
+            std::env::set_var("MEGU_MODS_DIR", value);
         } else {
-            std::env::remove_var("MC_SPINE_MODS_DIR");
+            std::env::remove_var("MEGU_MODS_DIR");
         }
         let suite = live_mod_suite().lock().unwrap_or_else(|e| e.into_inner());
         assert_eq!(suite.auto_adapted.len(), 3);
@@ -3812,14 +3812,14 @@ mod wire_mods_tests {
         .unwrap();
         std::fs::write(
             dir.join("gated.bundle.json"),
-            r#"{"schema":"mc-spine-mod-bundle/1","mod_id":"gated_pack","mc_version_range":"[1.21,)","portals":[],"progression_barriers":[{"id":"gated_pack:seal","dimension":"minecraft:overworld","target_biomes":["minecraft:plains"],"required_advancements":["minecraft:story/mine_diamond"],"block_break_protected":true,"block_place_protected":false,"enforce_effects":[],"periodic_damage":null}],"biome_regions":[],"creatures":[],"custom_channels":["gated_pack:sync"]}"#,
+            r#"{"schema":"megu-mod-bundle/1","mod_id":"gated_pack","mc_version_range":"[1.21,)","portals":[],"progression_barriers":[{"id":"gated_pack:seal","dimension":"minecraft:overworld","target_biomes":["minecraft:plains"],"required_advancements":["minecraft:story/mine_diamond"],"block_break_protected":true,"block_place_protected":false,"enforce_effects":[],"periodic_damage":null}],"biome_regions":[],"creatures":[],"custom_channels":["gated_pack:sync"]}"#,
         )
         .unwrap();
         let mut suite = LiveModSuite::new();
         suite.scan_mods_dir(&dir);
 
         // Standalone files register first; the adapter's synthesized
-        // `mc-spine-mod-bundle/1` for the native jar joins the same
+        // `megu-mod-bundle/1` for the native jar joins the same
         // runtime — one registry, zero manual steps.
         assert_eq!(
             suite.unified.installed_mod_ids(),
@@ -3860,13 +3860,13 @@ mod wire_mods_tests {
             ),
         )
         .unwrap();
-        let previous = std::env::var_os("MC_SPINE_MODS_DIR");
-        std::env::set_var("MC_SPINE_MODS_DIR", &dir);
+        let previous = std::env::var_os("MEGU_MODS_DIR");
+        std::env::set_var("MEGU_MODS_DIR", &dir);
         live_mod_suite_boot();
         if let Some(value) = previous {
-            std::env::set_var("MC_SPINE_MODS_DIR", value);
+            std::env::set_var("MEGU_MODS_DIR", value);
         } else {
-            std::env::remove_var("MC_SPINE_MODS_DIR");
+            std::env::remove_var("MEGU_MODS_DIR");
         }
 
         // The lifted JAR's binding fires EntityDamagePre — live-queryable
@@ -4217,7 +4217,7 @@ mod wire_mods_tests {
             assert!(suite.mod_sync_body.is_some(), "valid manifest must arm");
         }
 
-        // The join hook emits one 0x19 frame on `mc-spine:mod_sync_v1`
+        // The join hook emits one 0x19 frame on `megu:mod_sync_v1`
         // whose body decodes as MSY1 back into the same entry.
         let (mut send, mut peer) = lmb_socket_pair();
         live_mod_sync_on_join(&mut send);
@@ -4281,7 +4281,7 @@ mod wire_mods_tests {
     #[test]
     fn wire_mods_protocol_table_pins_767() {
         assert_eq!(
-            mc_spine_core::version::TargetVersion::V1_21_1.protocol(),
+            megu_core::version::TargetVersion::V1_21_1.protocol(),
             767
         );
         assert_eq!(LIVE_MOD_S2C_CUSTOM_PAYLOAD_ID, 0x19);
@@ -4385,8 +4385,8 @@ version="3.0.0"
         let _serial = WIRE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         fresh_suite();
         let mut asm = ClassAssembler::new("example/ThresholdDamage");
-        let get = asm.cp.method_ref("mcspine/api/Event", "getDamage", "()F");
-        let set = asm.cp.method_ref("mcspine/api/Event", "setDamage", "(F)V");
+        let get = asm.cp.method_ref("megu/api/Event", "getDamage", "()F");
+        let set = asm.cp.method_ref("megu/api/Event", "setDamage", "(F)V");
         let ten = asm.cp.float(10.0);
         let half = asm.cp.float(0.5);
         let code = vec![
@@ -4415,7 +4415,7 @@ version="3.0.0"
         ];
         let class = asm.finish(&[MethodSpec::new(
             "onDamage",
-            "(Lmcspine/api/Event;)V",
+            "(Lmegu/api/Event;)V",
             4,
             1,
             code,

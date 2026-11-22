@@ -1,5 +1,5 @@
 /* SPDX-License-Identifier: LGPL-3.0-or-later OR GPL-3.0-or-later OR AGPL-3.0-or-later */
-#include "mc_spine_mod_offload.h"
+#include "megu_mod_offload.h"
 
 #include <assert.h>
 #include <stdio.h>

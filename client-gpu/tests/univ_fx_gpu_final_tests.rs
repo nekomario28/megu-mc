@@ -7,22 +7,22 @@
 //! and the stack-array `BiomeAtmosphereBlender::is_settled`. GPU tests skip
 //! only when the host has no adapter at all.
 
-use mc_spine_client::protocol::{decode_chunk_packet, ClientPlayEvent, PlayEvent, TeleportSync};
-use mc_spine_client_gpu::atmosphere::{AtmosphereParams, BiomeAtmosphereBlender, ChunkFadeTracker};
-use mc_spine_client_gpu::live_session::hw_adaptive_engine::GpuComputeParadigm;
-use mc_spine_client_gpu::live_session::{LiveSession, PlayerPose, CLOUD_SUBWORLD_ID};
-use mc_spine_client_gpu::renderer::{
+use megu_client::protocol::{decode_chunk_packet, ClientPlayEvent, PlayEvent, TeleportSync};
+use megu_client_gpu::atmosphere::{AtmosphereParams, BiomeAtmosphereBlender, ChunkFadeTracker};
+use megu_client_gpu::live_session::hw_adaptive_engine::GpuComputeParadigm;
+use megu_client_gpu::live_session::{LiveSession, PlayerPose, CLOUD_SUBWORLD_ID};
+use megu_client_gpu::renderer::{
     probe_adapters, request_gpu_device, select_depth_store_op, sort_regions_front_to_back,
     ComposedFrame, GpuRenderer, OFFSCREEN_FORMAT, SKY_DEPTH_COMPARE,
 };
-use mc_spine_client_gpu::subworld_render::{
+use megu_client_gpu::subworld_render::{
     box_mesh, SubWorldRenderBank, SubWorldRenderEntry, SubWorldTransform, COMPOSITE_TERRAIN_WGSL,
 };
-use mc_spine_client_gpu::Camera;
-use mc_spine_client_mesh::ber_instancing::{VanillaParticleKind, VanillaParticleQuad};
-use mc_spine_client_mesh::builtin_shadow_wgsl::BuiltinShadowQuality;
-use mc_spine_client_mesh::vanilla_plus_3d::{ExtrudedMesh, ExtrudedQuad};
-use mc_spine_client_mesh::{ChunkUploadBudget, RenderBackendPreference};
+use megu_client_gpu::Camera;
+use megu_client_mesh::ber_instancing::{VanillaParticleKind, VanillaParticleQuad};
+use megu_client_mesh::builtin_shadow_wgsl::BuiltinShadowQuality;
+use megu_client_mesh::vanilla_plus_3d::{ExtrudedMesh, ExtrudedQuad};
+use megu_client_mesh::{ChunkUploadBudget, RenderBackendPreference};
 use wgpu::naga::front::wgsl;
 use wgpu::naga::valid::{Capabilities, ValidationFlags, Validator};
 

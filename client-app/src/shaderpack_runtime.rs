@@ -23,11 +23,11 @@
 use std::cmp::Ordering;
 use std::collections::{BTreeMap, BTreeSet};
 
-use mc_spine_client_mesh::shaderpack_reflect::{
+use megu_client_mesh::shaderpack_reflect::{
     plan_wgsl_binding_table, reflect_glsl_program, AttachmentUsagePlan,
     ReflectedProgramBindings, WgslBindingTable,
 };
-use mc_spine_client_mesh::{
+use megu_client_mesh::{
     is_megu_wgsl_pack, load_megu_wgsl_pack, plan_shader_pipeline_with_options, GpuShaderCaps,
     MeguWgslPack, PackDimension, PassKind, PipelineStage, Profile, ShaderOption,
     ShaderOptionOverrides, ShaderPackFamily, ShaderPackLang, ShaderPackSource, ShaderPass,
@@ -897,7 +897,7 @@ mod tests {
             .iter()
             .find(|p| p.name == "composite")
             .expect("composite pass");
-        let frag = &comp.shaders[&mc_spine_client_mesh::ShaderKind::Fragment];
+        let frag = &comp.shaders[&megu_client_mesh::ShaderKind::Fragment];
         assert!(frag.source.contains("#define BLOOM"));
         assert!(frag.source.contains("#define SHADOW_RES 2048"));
         assert!(plan.uniforms.color_attachments.contains(&0));
@@ -1054,7 +1054,7 @@ mod tests {
                 r#"
 [pack]
 name = "Megu Native Fast"
-author = "mc-spine"
+author = "megu"
 version = "1.0.0"
 api = 1
 supports_lod = true

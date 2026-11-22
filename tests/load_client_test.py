@@ -2,7 +2,7 @@
 """Pin the protocol-767 behaviours that made the live load comparison invalid.
 
 Measured 2026-11-21 (`evidence/perf/m3-warm-worldgen.md`): vanilla delivered nine
-login chunks and zero during the movement drive while mc-spine delivered its whole
+login chunks and zero during the movement drive while megu delivered its whole
 view, so the CPU numbers measured different work. The cause was the driver, not
 the servers: a protocol 767 server stops after Chunk Batch Finished (0x0C) until
 the client answers Chunk Batch Received (0x08), and a client that is awaiting a

@@ -211,14 +211,14 @@ class StructureOracleTests(unittest.TestCase):
             self.assertEqual(kwargs, {})
             self.assertTrue(all(isinstance(path, Path) for path in args))
             if source.name == 'ScheduledTickOracle.java':
-                self.assertEqual(main, 'dev.mcspine.tools.ScheduledTickOracle')
+                self.assertEqual(main, 'dev.megu.tools.ScheduledTickOracle')
                 self.assertEqual(args, (work / 'scheduled.tsv', work / 'proto.tsv'))
                 args[0].write_bytes(scheduled.VECTORS.read_bytes())
                 args[1].write_bytes(scheduled.PROTO_VECTORS.read_bytes())
                 stages.append('collection')
             else:
                 self.assertEqual(source.name, 'ScheduledTickDeliveryOracle.java')
-                self.assertEqual(main, 'dev.mcspine.tools.ScheduledTickDeliveryOracle')
+                self.assertEqual(main, 'dev.megu.tools.ScheduledTickDeliveryOracle')
                 self.assertEqual(args, (work / 'delivery.tsv',))
                 args[0].write_bytes(scheduled.DELIVERY_VECTORS.read_bytes())
                 stages.append('delivery')

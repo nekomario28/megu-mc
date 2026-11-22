@@ -3,13 +3,13 @@
 //! coalescing, smooth zoom, low-durability tool guard, extended chat
 //! history, and `[qol]` settings persistence.
 
-use mc_spine_client::audio_qol::{
+use megu_client::audio_qol::{
     check_tool_durability_warning, AudioLimiter, ChatHistory, SoundAdmission, SoundKey,
     ToolDurability, ZoomState, DEFAULT_CHAT_HISTORY_LINES, DEFAULT_TOOL_WARN_PERCENT,
     DEFAULT_ZOOM_DIVISOR, MAX_CHAT_HISTORY_LINES, MAX_TOOL_WARN_PERCENT, MAX_VOLUME_CAP,
     MIN_CHAT_HISTORY_LINES, MIN_ZOOM_DIVISOR,
 };
-use mc_spine_client::settings::{ClientQolSettings, ClientSettings};
+use megu_client::settings::{ClientQolSettings, ClientSettings};
 
 fn assert_within_cap(samples: &[f32], cap: f32) {
     for (i, s) in samples.iter().enumerate() {

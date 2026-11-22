@@ -38,7 +38,7 @@
 
 use std::collections::BTreeMap;
 
-use mc_spine_core::math::Mth;
+use megu_core::math::Mth;
 
 use crate::draw::{palette, text_width, UiColor, UiDrawList, UiRect};
 use crate::state::{tr, GamepadButton, UiInputEvent, UiKey, UiLang};

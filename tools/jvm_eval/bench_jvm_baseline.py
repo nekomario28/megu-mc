@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Reproducible mc-spine embedded-HotSpot baseline; artifacts stay in target/tmp."""
+"""Reproducible megu embedded-HotSpot baseline; artifacts stay in target/tmp."""
 from __future__ import annotations
 
 import hashlib
@@ -56,7 +56,7 @@ def fetch_pinned_neoforge_deps(env: dict[str, str]) -> tuple[list[pathlib.Path],
         filename = pin["url"].rsplit("/", 1)[1]
         dest = cache / filename
         if not dest.is_file():
-            request = urllib.request.Request(pin["url"], headers={"User-Agent": "mc-spine-jvm-eval/1"})
+            request = urllib.request.Request(pin["url"], headers={"User-Agent": "megu-jvm-eval/1"})
             with urllib.request.urlopen(request, timeout=45) as response:
                 data = response.read(32 * 1024 * 1024 + 1)
             if len(data) > 32 * 1024 * 1024:
@@ -73,12 +73,12 @@ def fetch_pinned_neoforge_deps(env: dict[str, str]) -> tuple[list[pathlib.Path],
     classes = build / "classes"
     classes.mkdir(parents=True)
     java_sources = sorted((ROOT / "compat/neoforge-events/java").rglob("*.java"))
-    java_sources.append(ROOT / "compat/fabric-probe/java/net/mcspine/probe/Host.java")
+    java_sources.append(ROOT / "compat/fabric-probe/java/net/megu/probe/Host.java")
     java_sources.append(ROOT / "tools/jvm_eval/NeoForgeEvalHarness.java")
     run([str(JAVAC), "-J-Xmx128m", "--release", "21", "-proc:none", "-cp",
          os.pathsep.join(map(str, libraries)), "-d", str(classes), *map(str, java_sources)], env=env)
     shutil.copyfile(ROOT / "compat/neoforge-events/shim-surface.json",
-                    classes / "net/mcspine/neoforge/shim-surface.json")
+                    classes / "net/megu/neoforge/shim-surface.json")
     game_jar = build / "game.jar"
     run([sys.executable, "-c", "import pathlib,sys,zipfile; r=pathlib.Path(sys.argv[1]); "
          "z=zipfile.ZipFile(sys.argv[2],'w',zipfile.ZIP_DEFLATED); "
@@ -98,7 +98,7 @@ def fetch_pinned_fabric_artifacts() -> dict[str, pathlib.Path]:
     for item in manifest["libraries"]:
         dest = cache / item["url"].rsplit("/", 1)[1]
         if not dest.is_file():
-            request = urllib.request.Request(item["url"], headers={"User-Agent": "mc-spine-jvm-eval/1"})
+            request = urllib.request.Request(item["url"], headers={"User-Agent": "megu-jvm-eval/1"})
             with urllib.request.urlopen(request, timeout=45) as response:
                 data = response.read(32 * 1024 * 1024 + 1)
             if len(data) > 32 * 1024 * 1024:
@@ -189,13 +189,13 @@ def run_server_trials(binary: pathlib.Path, env_base: dict[str, str], *, classpa
         cwd.mkdir(parents=True)
         port = reserve_port()
         env = env_base.copy()
-        env["MC_SPINE_BIND_ADDR"] = "127.0.0.1"
-        env["MC_SPINE_PORT"] = str(port)
-        env["MC_SPINE_RCON_PORT"] = "0"
+        env["MEGU_BIND_ADDR"] = "127.0.0.1"
+        env["MEGU_PORT"] = str(port)
+        env["MEGU_RCON_PORT"] = "0"
         if classpath_file:
-            env["MC_SPINE_NEOFORGE_CLASSPATH"] = str(classpath_file)
+            env["MEGU_NEOFORGE_CLASSPATH"] = str(classpath_file)
         else:
-            env.pop("MC_SPINE_NEOFORGE_CLASSPATH", None)
+            env.pop("MEGU_NEOFORGE_CLASSPATH", None)
         elapsed, process, log = tcp_ready(binary, env, port, cwd)
         timings.append(elapsed)
         if memory and trial == 0:
@@ -218,12 +218,12 @@ def main() -> int:
     }
 
     run(["cargo", "build", "--offline", "--locked", "--features", "fabric-probe,neoforge-events", "-j", "1"], env=env)
-    feature_bin = TMP / "mc-spine-jvm"
-    shutil.copyfile(ROOT / "target/debug/mc-spine", feature_bin)
+    feature_bin = TMP / "megu-jvm"
+    shutil.copyfile(ROOT / "target/debug/megu", feature_bin)
     feature_bin.chmod(0o755)
     run(["cargo", "build", "--offline", "--locked", "--no-default-features", "-j", "1"], env=env)
-    rust_bin = TMP / "mc-spine-rust"
-    shutil.copyfile(ROOT / "target/debug/mc-spine", rust_bin)
+    rust_bin = TMP / "megu-rust"
+    shutil.copyfile(ROOT / "target/debug/megu", rust_bin)
     rust_bin.chmod(0o755)
 
     classpath, classpath_file = fetch_pinned_neoforge_deps(env)
@@ -234,7 +234,7 @@ def main() -> int:
     for _ in range(N_RUNS):
         event_samples = run([str(JAVA), "-Djava.io.tmpdir=" + str(TMP), "-XX:-UsePerfData",
                              "-Xms16m", "-Xmx128m", "-Xcheck:jni", "-cp", os.pathsep.join(map(str, classpath)),
-                             "net.mcspine.jvm_eval.NeoForgeEvalHarness", str(TMP / "empty-mods")], env=env)
+                             "net.megu.jvm_eval.NeoForgeEvalHarness", str(TMP / "empty-mods")], env=env)
         event_line = next(line for line in event_samples.stdout.splitlines() if line.startswith("bootstrap_ns="))
         fields = dict(item.split("=", 1) for item in event_line.split())
         bootstrap_trials.append(int(fields["bootstrap_ns"]))

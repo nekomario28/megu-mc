@@ -5,29 +5,29 @@
 Proves the five pure-Rust companion CLI binaries and the multi-binary
 release bundler work together through the complete operator lifecycle:
 
-  1. mc-spine-init      (server-files)  — the flag-mode bootstrap
+  1. megu-init      (server-files)  — the flag-mode bootstrap
                         (--dir/--mc-version 26.3/--accept-eula/--json)
                         fails closed on the EULA, then the legacy
                         init/doctor/op/whitelist/ban/claims subcommands
-                        (re-exec'd to a sibling mc-spine-admin): doctor
+                        (re-exec'd to a sibling megu-admin): doctor
                         gating on the EULA (rcon.password never printed),
                         offline admin, and claims with eula.txt
                         byte-unchanged throughout.
-  2. mc-spine-mod-check (mod-adapter-core) — pre-flight a real ZIP_DEFLATED
+  2. megu-mod-check (mod-adapter-core) — pre-flight a real ZIP_DEFLATED
                         .mrpack; its --json report must match
                         tools/mod_launcher.py --modpack byte-for-byte, and a
                         mismatched --mc-version must exit 2. Then
                         --scaffold-native emits a validated
-                        mc-spine-mod-bundle/1 starter bundle, failing
+                        megu-mod-bundle/1 starter bundle, failing
                         closed on a malformed mod id.
-  3. mc-spine-world-migrate (state-store) — migrate a 1.21.1 (DataVersion
+  3. megu-world-migrate (state-store) — migrate a 1.21.1 (DataVersion
                         3955) level.dat-style JSON document + chunk palette
                         to 26.3 (5023), refuse an unapproved downgrade
                         (exit 2), and restore 3955 with --allow-downgrade.
-  4. mc-spine-client    (client-app)    — --ping a mock status server
+  4. megu-client    (client-app)    — --ping a mock status server
                         speaking Protocol 777 (26.3): handshake, status
                         response JSON, ping/pong RTT.
-  5. mc-spine-voice-relay (proto)       — --self-test, a --bench-packets
+  5. megu-voice-relay (proto)       — --self-test, a --bench-packets
                         200 --json routing benchmark (routed == 200,
                         packets_per_second > 0), and a public --bind
                         refused with exit 2 without --allow-public-bind.
@@ -70,19 +70,19 @@ MOD_LAUNCHER = ROOT / "tools" / "mod_launcher.py"
 
 # (key, crate directory, cargo --bin name, CLI flag attribute)
 BINARIES = (
-    ("init", "server-files", "mc-spine-init", "init_bin"),
-    ("mod_check", "mod-adapter-core", "mc-spine-mod-check", "mod_check_bin"),
-    ("world_migrate", "state-store", "mc-spine-world-migrate", "world_migrate_bin"),
-    ("client", "client-app", "mc-spine-client", "client_bin"),
-    ("voice_relay", "proto", "mc-spine-voice-relay", "voice_relay_bin"),
+    ("init", "server-files", "megu-init", "init_bin"),
+    ("mod_check", "mod-adapter-core", "megu-mod-check", "mod_check_bin"),
+    ("world_migrate", "state-store", "megu-world-migrate", "world_migrate_bin"),
+    ("client", "client-app", "megu-client", "client_bin"),
+    ("voice_relay", "proto", "megu-voice-relay", "voice_relay_bin"),
 )
 
 # Extra bins a companion's crate must leave in the same target dir without
-# being stepped individually: mc-spine-init's legacy subcommands (init,
-# doctor, op, whitelist, ban, claims) re-exec a sibling mc-spine-admin, so
+# being stepped individually: megu-init's legacy subcommands (init,
+# doctor, op, whitelist, ban, claims) re-exec a sibling megu-admin, so
 # building init alone would leave step 1 delegating to a missing binary.
 EXTRA_BINS = {
-    "init": ("mc-spine-admin",),
+    "init": ("megu-admin",),
 }
 
 CARGO_FLAGS = ["--offline", "--locked", "-j1"]
@@ -97,7 +97,7 @@ RCON_SECRET = "e2e-rcon-s3cr3t-not-for-print"
 BUNDLE_GIT_SHA = "0000000000000000000000000000000000000001"
 BUNDLE_VERSION = "0.1.0"
 BUNDLE_TARGET = "x86_64-unknown-linux-gnu"
-BUNDLE_PREFIX = f"mc-spine-{BUNDLE_VERSION}-{BUNDLE_TARGET}"
+BUNDLE_PREFIX = f"megu-{BUNDLE_VERSION}-{BUNDLE_TARGET}"
 
 
 class E2EFailure(AssertionError):
@@ -196,10 +196,10 @@ def ensure_binaries(args):
     return resolved
 
 
-# ------------------------------------------------------- step 1: mc-spine-init
+# ------------------------------------------------------- step 1: megu-init
 
 def step_init(bins, work):
-    log("step 1/6: mc-spine-init server bootstrap + offline admin")
+    log("step 1/6: megu-init server bootstrap + offline admin")
     binary = bins["init"]
     srv = work / "server"
 
@@ -236,7 +236,7 @@ def step_init(bins, work):
           in (boot / "server.toml").read_text(encoding="utf-8"),
           "init did not record mc_version 26.3 in server.toml")
 
-    # The legacy subcommands re-exec the sibling mc-spine-admin binary.
+    # The legacy subcommands re-exec the sibling megu-admin binary.
     expect([binary, "init", "--dir", srv,
             "--mc-version", "1.21.1",
             "--port", "25565",
@@ -328,7 +328,7 @@ def step_init(bins, work):
     log("  init/doctor/op/whitelist/ban/claims lifecycle verified")
 
 
-# --------------------------------------------- step 2: mc-spine-mod-check
+# --------------------------------------------- step 2: megu-mod-check
 
 def mrpack_manifest():
     """A 1.21.1 NeoForge Modrinth index: a flagship native adapter mod, three
@@ -371,7 +371,7 @@ def build_mrpack(path):
 
 
 def step_mod_check(bins, work):
-    log("step 2/6: mc-spine-mod-check .mrpack pre-flight (parity with mod_launcher.py)")
+    log("step 2/6: megu-mod-check .mrpack pre-flight (parity with mod_launcher.py)")
     binary = bins["mod_check"]
     pack = work / "e2e-pack.mrpack"
     build_mrpack(pack)
@@ -380,7 +380,7 @@ def step_mod_check(bins, work):
     python = expect([sys.executable, MOD_LAUNCHER,
                      "--modpack", pack, "--mc-version", "1.21.1", "--json"], 0)
     check(rust.stdout.encode() == python.stdout.encode(),
-          "mc-spine-mod-check --json differs from tools/mod_launcher.py --json\n"
+          "megu-mod-check --json differs from tools/mod_launcher.py --json\n"
           f"rust:\n{tail(rust.stdout, 60)}\npython:\n{tail(python.stdout, 60)}")
     report = parse_json_stdout(rust, "mod-check --json")
     check(report.get("readiness") == "ready_with_auto_skips",
@@ -402,12 +402,12 @@ def step_mod_check(bins, work):
     check(rust_bad.stdout.encode() == python_bad.stdout.encode(),
           "version-mismatch reports differ between Rust and Python")
 
-    # --scaffold-native emits a validated mc-spine-mod-bundle/1 starter for
+    # --scaffold-native emits a validated megu-mod-bundle/1 starter for
     # native zero-JVM mods; a malformed mod id fails closed with exit 2.
     bundle_path = work / "demo_mod.bundle.json"
     expect([binary, "--scaffold-native", "demo_mod", "--out", bundle_path], 0)
     bundle = json.loads(bundle_path.read_text(encoding="utf-8"))
-    check(bundle.get("schema") == "mc-spine-mod-bundle/1",
+    check(bundle.get("schema") == "megu-mod-bundle/1",
           f"scaffold bundle schema is {bundle.get('schema')!r}")
     check(bundle.get("mod_id") == "demo_mod",
           "scaffold bundle lost the requested mod id")
@@ -424,7 +424,7 @@ def step_mod_check(bins, work):
         "exits 2; --scaffold-native bundle validated")
 
 
-# ------------------------------------------- step 3: mc-spine-world-migrate
+# ------------------------------------------- step 3: megu-world-migrate
 
 def world_metadata_3955():
     """A 1.21.1 (DataVersion 3955) level.dat-style export: version metadata,
@@ -464,7 +464,7 @@ def world_metadata_3955():
 
 
 def step_world_migrate(bins, work):
-    log("step 3/6: mc-spine-world-migrate 1.21.1 -> 26.3 -> 1.21.1")
+    log("step 3/6: megu-world-migrate 1.21.1 -> 26.3 -> 1.21.1")
     binary = bins["world_migrate"]
     src = work / "level-1.21.1.json"
     src.write_text(world_metadata_3955(), encoding="utf-8")
@@ -524,7 +524,7 @@ def step_world_migrate(bins, work):
     log("  3955 -> 5023 migration, namespace preservation, downgrade gate verified")
 
 
-# ------------------------------------------------- step 4: mc-spine-client
+# ------------------------------------------------- step 4: megu-client
 
 def _write_varint(value):
     out = bytearray()
@@ -606,7 +606,7 @@ def status_response_json(motd, online, max_players, sample, protocol=777,
 def mock_status_exchange(conn, status_json, observed):
     """Serve one protocol status exchange on `conn`, recording the handshake.
 
-    Mirrors the vanilla server-list sequence mc-spine-client --ping drives:
+    Mirrors the vanilla server-list sequence megu-client --ping drives:
     handshake (next_state 1) -> status_request -> status_response ->
     ping_request -> pong_response.
     """
@@ -630,7 +630,7 @@ def mock_status_exchange(conn, status_json, observed):
 
 
 def step_client_ping(bins, work):
-    log("step 4/6: mc-spine-client --ping against a Protocol 777 mock server")
+    log("step 4/6: megu-client --ping against a Protocol 777 mock server")
     binary = bins["client"]
     motd = "Alpha Test Server"
     status_json = status_response_json(motd, online=2, max_players=20,
@@ -687,10 +687,10 @@ def step_client_ping(bins, work):
         f"rtt {doc['rtt_ms']:.3f} ms)")
 
 
-# ----------------------------------------- step 5: mc-spine-voice-relay
+# ----------------------------------------- step 5: megu-voice-relay
 
 def step_voice_relay(bins, work):
-    log("step 5/6: mc-spine-voice-relay self-test, bench & bind posture")
+    log("step 5/6: megu-voice-relay self-test, bench & bind posture")
     binary = bins["voice_relay"]
 
     expect([binary, "--self-test"], 0, cwd=work)
@@ -732,9 +732,9 @@ def _bundle_argv(out_dir, primary, companions):
 
 def step_release_bundle(bins, work):
     log("step 6/6: release_bundle.py multi-binary build x2 + verify")
-    primary = work / "bin" / "mc-spine"
+    primary = work / "bin" / "megu"
     primary.parent.mkdir(parents=True, exist_ok=True)
-    primary.write_bytes(b"#!/bin/sh\n# e2e stand-in for the mc-spine server binary\n")
+    primary.write_bytes(b"#!/bin/sh\n# e2e stand-in for the megu server binary\n")
     primary.chmod(0o755)
     companions = [bins[key] for key, _, _, _ in BINARIES]
 
@@ -756,9 +756,9 @@ def step_release_bundle(bins, work):
     with tarfile.open(tar_path, "r:gz") as archive:
         members = {member.name for member in archive.getmembers()}
     expected = {f"{BUNDLE_PREFIX}/{name}"
-                for name in ("mc-spine", "mc-spine-init", "mc-spine-mod-check",
-                             "mc-spine-world-migrate", "mc-spine-client",
-                             "mc-spine-voice-relay")}
+                for name in ("megu", "megu-init", "megu-mod-check",
+                             "megu-world-migrate", "megu-client",
+                             "megu-voice-relay")}
     check(expected <= members,
           f"bundle is missing suite binaries: {sorted(expected - members)}")
     manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
@@ -871,7 +871,7 @@ def self_test():
                and isinstance(start_plan.get("ready"), bool)
                and isinstance(start_plan.get("action_items"), list)
                and isinstance(start_plan.get("launch_argv"), list)
-               and "mc-spine" in start_plan["launch_argv"])
+               and "megu" in start_plan["launch_argv"])
         check_("onboarding: dry-run only creates the server bootstrap files",
                {path.relative_to(Path(tmp)).as_posix()
                 for path in Path(tmp).rglob("*")}
@@ -900,7 +900,7 @@ def self_test():
                doc["DataVersion"] == 3955
                and any("create:" in p.get("id", "")
                        for p in doc["sections"][0]["block_states"]["palette"]))
-        dummy = Path(tmp) / "bin" / "mc-spine"
+        dummy = Path(tmp) / "bin" / "megu"
         dummy.parent.mkdir(parents=True)
         dummy.write_bytes(b"x")
         argv = _bundle_argv(Path(tmp) / "out", dummy, [Path("/a/b")])
@@ -915,7 +915,7 @@ def self_test():
            and len({name for _, _, name, _ in BINARIES}) == 5
            and len({attr for _, _, _, attr in BINARIES}) == 5)
     check_("binaries table: voice relay ships from proto",
-           ("voice_relay", "proto", "mc-spine-voice-relay", "voice_relay_bin")
+           ("voice_relay", "proto", "megu-voice-relay", "voice_relay_bin")
            in BINARIES)
     check_("extra bins: delegation helpers sit beside a listed companion",
            set(EXTRA_BINS) <= {key for key, _, _, _ in BINARIES}
@@ -966,15 +966,15 @@ def main():
                              "(default: $CARGO_TARGET_DIR or repo "
                              "target/companion-e2e)")
     parser.add_argument("--init-bin", type=Path, default=None,
-                        help="prebuilt mc-spine-init binary (skip building it)")
+                        help="prebuilt megu-init binary (skip building it)")
     parser.add_argument("--mod-check-bin", type=Path, default=None,
-                        help="prebuilt mc-spine-mod-check binary")
+                        help="prebuilt megu-mod-check binary")
     parser.add_argument("--world-migrate-bin", type=Path, default=None,
-                        help="prebuilt mc-spine-world-migrate binary")
+                        help="prebuilt megu-world-migrate binary")
     parser.add_argument("--client-bin", type=Path, default=None,
-                        help="prebuilt mc-spine-client binary")
+                        help="prebuilt megu-client binary")
     parser.add_argument("--voice-relay-bin", type=Path, default=None,
-                        help="prebuilt mc-spine-voice-relay binary")
+                        help="prebuilt megu-voice-relay binary")
     args = parser.parse_args()
     if args.self_test:
         return self_test()

@@ -14,7 +14,7 @@ FAIL = 'mineshaft dispatch: FAIL structures without placed features'
 def main():
     binary = Path(sys.argv[1]).resolve()
     env = {k: v for k, v in os.environ.items()
-           if not k.startswith(('MC_SPINE_', 'SPC_', 'FSEED_', 'BIOMEF_', 'FEATURE_', 'MINESHAFT_'))}
+           if not k.startswith(('MEGU_', 'SPC_', 'FSEED_', 'BIOMEF_', 'FEATURE_', 'MINESHAFT_'))}
     with tempfile.TemporaryDirectory(prefix='mineshaft-dispatch-') as tmp:
         cwd = Path(tmp)
         (cwd / 'assets').symlink_to(ROOT / 'assets', target_is_directory=True)
@@ -29,9 +29,9 @@ def main():
             (target / source.name).write_text(json.dumps(biome))
         assert len(list(target.glob('*.json'))) == 64, 'test overlay did not cover the biome registry'
         dump, canon = cwd / 'chunk.bin', cwd / 'chunk.tsv'
-        env.update(MC_SPINE_WG_PROFILE='0', MC_SPINE_SEED='4242', MC_SPINE_WG_DUMP_N='1',
-                   MC_SPINE_WG_DUMP_X='3', MC_SPINE_WG_DUMP_Z='-2',
-                   MC_SPINE_WG_DUMP=str(dump), MC_SPINE_WG_DUMP_CANON=str(canon),
+        env.update(MEGU_WG_PROFILE='0', MEGU_SEED='4242', MEGU_WG_DUMP_N='1',
+                   MEGU_WG_DUMP_X='3', MEGU_WG_DUMP_Z='-2',
+                   MEGU_WG_DUMP=str(dump), MEGU_WG_DUMP_CANON=str(canon),
                    FEATURE_ATTEMPT_TRACE='1')
         result = subprocess.run([str(binary)], cwd=cwd, env=env,
                                 capture_output=True, text=True, timeout=90)

@@ -16,7 +16,7 @@ def main():
     with pinned_runtime(args.jar) as (work, cp, _):
         output = work / 'blended-noise.tsv'
         run_probe(work, cp, ROOT / 'tools/structure-oracle/BlendedNoiseOracle.java',
-                  'dev.mcspine.tools.BlendedNoiseOracle', output)
+                  'dev.megu.tools.BlendedNoiseOracle', output)
         actual = output.read_bytes()
     if args.write:
         VECTORS.write_bytes(actual)

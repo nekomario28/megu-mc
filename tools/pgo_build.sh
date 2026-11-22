@@ -29,7 +29,7 @@
 #     instrumented `cargo test --manifest-path client-app/Cargo.toml --release
 #     --offline --locked` (target/pgo/client-app/gen), merge into
 #     target/pgo/client-app/merged.profdata, PGO-use release build of
-#     `--bin mc-spine-client` (target/pgo/client-app/use).
+#     `--bin megu-client` (target/pgo/client-app/use).
 #
 # --target all: server, then client-port, then client-app.
 #
@@ -69,8 +69,8 @@ RAW_DIR="$PGO_DIR/raw"
 # directory, so the raw-profile directories are absolute too.
 MERGED="$ROOT/target/pgo/merged.profdata"
 TRAIN_DIR="$PGO_DIR/tmp"
-BIN_GEN="$GEN_DIR/release/mc-spine"
-BIN_USE="$USE_DIR/release/mc-spine"
+BIN_GEN="$GEN_DIR/release/megu"
+BIN_USE="$USE_DIR/release/megu"
 
 CP_MANIFEST="client-port/Cargo.toml"
 CP_DIR="$PGO_DIR/client-port"
@@ -89,7 +89,7 @@ CA_GEN_DIR="$CA_DIR/gen"
 CA_USE_DIR="$CA_DIR/use"
 CA_RAW_DIR="$CA_DIR/raw"
 CA_MERGED="$ROOT/$CA_DIR/merged.profdata"
-CA_BIN_USE="$CA_USE_DIR/release/mc-spine-client"
+CA_BIN_USE="$CA_USE_DIR/release/megu-client"
 
 OUT=""
 DRY_RUN=0
@@ -107,8 +107,8 @@ Usage: tools/pgo_build.sh [--out <path>] [--dry-run] [--jobs N]
 
 Options:
   --out <path>          copy the PGO binary to <path> after building it
-                        (server: mc-spine, client-port: mesh_bench,
-                        client-app: mc-spine-client; with --target all <path>
+                        (server: megu, client-port: mesh_bench,
+                        client-app: megu-client; with --target all <path>
                         is a directory that receives all three binaries)
   --dry-run             print the plan and the discovered llvm-profdata; build nothing
   --jobs N              cargo parallelism (default 2)
@@ -282,7 +282,7 @@ if [ "$DRY_RUN" -eq 1 ]; then
         echo "== target client-app =="
         echo "step 1 instrumented training: RUSTFLAGS='$(gen_rustflags "$ROOT/$CA_RAW_DIR")' cargo test --manifest-path $CA_MANIFEST --release --offline --locked -j $JOBS --target-dir $CA_GEN_DIR"
         echo "step 2 merge: first candidate that merges the .profraw files in $CA_RAW_DIR -> $CA_MERGED"
-        echo "step 3 optimized build: RUSTFLAGS='$(use_rustflags "$CA_MERGED")' cargo build --manifest-path $CA_MANIFEST --release --offline --locked -j $JOBS --target-dir $CA_USE_DIR --bin mc-spine-client"
+        echo "step 3 optimized build: RUSTFLAGS='$(use_rustflags "$CA_MERGED")' cargo build --manifest-path $CA_MANIFEST --release --offline --locked -j $JOBS --target-dir $CA_USE_DIR --bin megu-client"
         echo "step 4 verify: $CA_BIN_USE exists and is executable"
         ;;
     esac
@@ -338,7 +338,7 @@ copy_out() {
   cp -f "$2" "$dest"
 }
 
-# Same dump recipe as tools/perf_bench.py run_one(): MC_SPINE_WG_PROFILE=0,
+# Same dump recipe as tools/perf_bench.py run_one(): MEGU_WG_PROFILE=0,
 # DUMP_N=8, DUMP_X=0, DUMP_Z=0, SEED/PRESET per arm.  Sets DUMP_SHA.
 DUMP_SHA=""
 run_dump() {
@@ -346,9 +346,9 @@ run_dump() {
   local path="$TRAIN_DIR/$name.bin" log="$TRAIN_DIR/$name.log"
   DUMP_SHA=""
   rm -f "$path"
-  if ! env MC_SPINE_WG_PROFILE=0 MC_SPINE_SEED="$seed" MC_SPINE_WG_PRESET="$preset" \
-      MC_SPINE_WG_DUMP="$path" MC_SPINE_WG_DUMP_N=8 MC_SPINE_WG_DUMP_X=0 MC_SPINE_WG_DUMP_Z=0 \
-      MC_SPINE_GEN_JOBS="$jobs" ${nofeat:+MC_SPINE_NOFEAT=1} \
+  if ! env MEGU_WG_PROFILE=0 MEGU_SEED="$seed" MEGU_WG_PRESET="$preset" \
+      MEGU_WG_DUMP="$path" MEGU_WG_DUMP_N=8 MEGU_WG_DUMP_X=0 MEGU_WG_DUMP_Z=0 \
+      MEGU_GEN_JOBS="$jobs" ${nofeat:+MEGU_NOFEAT=1} \
       "$bin" >"$log" 2>&1; then
     echo "tools/pgo_build.sh: dump $name failed on $bin (preset=$preset seed=$seed nofeat=$nofeat jobs=$jobs); last log lines:" >&2
     tail -n 20 "$log" >&2 || true
@@ -463,7 +463,7 @@ build_client_app() {
 
   RUSTFLAGS="$(use_rustflags "$CA_MERGED")" \
     cargo build --manifest-path "$CA_MANIFEST" --release --offline --locked -j "$JOBS" \
-      --target-dir "$CA_USE_DIR" --bin mc-spine-client
+      --target-dir "$CA_USE_DIR" --bin megu-client
 
   if [ ! -x "$CA_BIN_USE" ]; then
     echo "tools/pgo_build.sh: client-app build produced no executable $CA_BIN_USE" >&2

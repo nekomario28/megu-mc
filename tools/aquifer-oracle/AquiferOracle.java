@@ -1,6 +1,6 @@
 // Call the pinned 1.21.1 NoiseChunk/Aquifer through their ordinary public API.
 // No running server, world, or constructor bypass. See tools/aquifer_oracle.py.
-package dev.mcspine.tools;
+package dev.megu.tools;
 
 import com.google.gson.*;
 import java.lang.reflect.*;

@@ -32,7 +32,7 @@
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::fmt;
 
-use mc_spine_core::perf_kit::{
+use megu_core::perf_kit::{
     BoundedScratchVec, DirtyFingerprintGate, FingerprintBuilder, FingerprintStats,
 };
 use mod_adapter_core::neoforge_wire::{

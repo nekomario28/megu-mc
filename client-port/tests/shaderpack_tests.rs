@@ -8,7 +8,7 @@ use std::collections::BTreeMap;
 use std::fs;
 use std::path::PathBuf;
 
-use mc_spine_client_mesh::shaderpack::*;
+use megu_client_mesh::shaderpack::*;
 
 // ---------------------------------------------------------------------------
 // Synthetic pack fixtures
@@ -468,7 +468,7 @@ fn deflated_payload() -> Vec<u8> {
 
 fn temp_dir(tag: &str) -> PathBuf {
     let dir = std::env::temp_dir().join(format!(
-        "mc_spine_shaderpack_{}_{}",
+        "megu_shaderpack_{}_{}",
         tag,
         std::process::id()
     ));

@@ -36,7 +36,7 @@ def main():
         parser.exit(2, "not the pinned 1.21.1 server jar: %s\n" % args.jar)
     info = validate(args.tsv)
     with pinned_runtime(args.jar) as (work, classpath, inner):
-        run_probe(work, classpath, SOURCE, "dev.mcspine.tools.NextIntOracle",
+        run_probe(work, classpath, SOURCE, "dev.megu.tools.NextIntOracle",
                   str(args.tsv.resolve()))
     print("nextInt oracle: %d rows match the pinned classes (%s)" %
           (info["rows"], info["sha256"][:12]))

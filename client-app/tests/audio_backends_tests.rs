@@ -5,14 +5,14 @@
 //! fail-closed `Null` path. No real devices are required — probing is
 //! injected and every native open fails closed.
 
-use mc_spine_client::audio_out::{
+use megu_client::audio_out::{
     detect_available_sinks_for_os, encode_pcm_le, open_sink, wav_header_bytes,
     AudioSessionConfig, AudioSinkKind, TargetOs,
 };
-use mc_spine_client::audio_qol::AudioLimiter;
-use mc_spine_client::session::SoundMixer;
-use mc_spine_client::sound_assets::{placeholder_pcm, MIX_SAMPLE_RATE};
-use mc_spine_client::spatial_audio::SpatialAudioPreset;
+use megu_client::audio_qol::AudioLimiter;
+use megu_client::session::SoundMixer;
+use megu_client::sound_assets::{placeholder_pcm, MIX_SAMPLE_RATE};
+use megu_client::spatial_audio::SpatialAudioPreset;
 use std::sync::Arc;
 
 // ---------------------------------------------------------------------------
@@ -201,7 +201,7 @@ fn mixer_output_stays_bounded_through_limiter() {
     let mut mixer = SoundMixer::new(MIX_SAMPLE_RATE, SpatialAudioPreset::Realistic);
     mixer.limiter.set_max_volume_cap(0.4);
     for _ in 0..8 {
-        mixer.submit(mc_spine_client::session::PlaySoundEvent {
+        mixer.submit(megu_client::session::PlaySoundEvent {
             label: "loud".to_string(),
             pcm: Arc::new(placeholder_pcm("entity.explode", 0, MIX_SAMPLE_RATE)),
             stereo_pcm: None,
@@ -235,8 +235,8 @@ fn null_sink_runtime_pumps_without_panic() {
         subtitle_path: None,
         subtitles_to_stderr: false,
     };
-    assert!(mc_spine_client::audio_out::AudioRuntime::enabled(&cfg));
-    let mut rt = mc_spine_client::audio_out::AudioRuntime::new(&cfg);
+    assert!(megu_client::audio_out::AudioRuntime::enabled(&cfg));
+    let mut rt = megu_client::audio_out::AudioRuntime::new(&cfg);
     assert_eq!(rt.sink_label(), "null");
     rt.pump_frames(480);
     rt.finish();

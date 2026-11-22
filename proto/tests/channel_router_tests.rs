@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: LGPL-3.0-or-later OR GPL-3.0-or-later OR AGPL-3.0-or-later
-use mc_spine_proto::channel_router::{
+use megu_proto::channel_router::{
     classify_channel, decode_register_payload, encode_register_payload, validate_channel_name,
     ChannelDirection, ChannelFirewall, ChannelFirewallConfig, ChannelHandlerKind, ChannelNameError,
     DropReason, FirewallDisconnectReason, FirewallVerdict, OperatorRuleError, RegisterPayloadError,
@@ -22,15 +22,15 @@ fn known_capability_names_route_exactly() {
         ("minecraft:brand", ChannelHandlerKind::Brand),
         ("minecraft:register", ChannelHandlerKind::Register),
         ("minecraft:unregister", ChannelHandlerKind::Unregister),
-        ("mc-spine:season_v1", ChannelHandlerKind::NativeSeasonSync),
-        ("mc-spine:mod_sync_v1", ChannelHandlerKind::NativeModSync),
-        ("mc-spine:magic_v1", ChannelHandlerKind::NativeMagicSync),
+        ("megu:season_v1", ChannelHandlerKind::NativeSeasonSync),
+        ("megu:mod_sync_v1", ChannelHandlerKind::NativeModSync),
+        ("megu:magic_v1", ChannelHandlerKind::NativeMagicSync),
         (
-            "mc-spine:accessory_v1",
+            "megu:accessory_v1",
             ChannelHandlerKind::NativeAccessorySync,
         ),
-        ("mc-spine:media_v1", ChannelHandlerKind::NativeMediaTransfer),
-        ("mc-spine:claims_v1", ChannelHandlerKind::NativeClaimsSync),
+        ("megu:media_v1", ChannelHandlerKind::NativeMediaTransfer),
+        ("megu:claims_v1", ChannelHandlerKind::NativeClaimsSync),
         (
             "openpartiesandclaims:claims_sync",
             ChannelHandlerKind::NativeClaimsSync,
@@ -77,7 +77,7 @@ fn known_capability_names_route_exactly() {
 fn resource_locations_are_strictly_validated() {
     for channel in [
         "minecraft:brand",
-        "mc-spine:path/sub.file-1",
+        "megu:path/sub.file-1",
         "x:a",
         "a.b:c_d",
     ] {
@@ -483,7 +483,7 @@ fn operator_allowlist_and_explicit_bulk_permission_are_bounded() {
             4,
             0,
             ChannelDirection::Clientbound,
-            "mc-spine:media_v1",
+            "megu:media_v1",
             &large
         ),
         FirewallVerdict::Route {
@@ -492,15 +492,15 @@ fn operator_allowlist_and_explicit_bulk_permission_are_bounded() {
         }
     ));
     assert!(matches!(
-        inspect(&mut firewall, 5, 0, "mc-spine:media_v1", &large),
+        inspect(&mut firewall, 5, 0, "megu:media_v1", &large),
         FirewallVerdict::Throttle {
             reason: ThrottleReason::OversizedPayload,
             ..
         }
     ));
-    assert_eq!(firewall.allow_bulk_channel("mc-spine:media_v1"), Ok(()));
+    assert_eq!(firewall.allow_bulk_channel("megu:media_v1"), Ok(()));
     assert!(matches!(
-        inspect(&mut firewall, 6, 0, "mc-spine:media_v1", &large),
+        inspect(&mut firewall, 6, 0, "megu:media_v1", &large),
         FirewallVerdict::Route {
             handler: ChannelHandlerKind::NativeMediaTransfer,
             ..

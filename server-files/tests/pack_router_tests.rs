@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: LGPL-3.0-or-later OR GPL-3.0-or-later OR AGPL-3.0-or-later
 //! In-memory ZIP fixtures. No external compressor, clock or filesystem needed.
 
-use mc_spine_server_files::{
+use megu_server_files::{
     inspect_and_route_pack, PackKind, PackRouteDecision, PackRouterPolicy, PackThreatKind,
     ShaderFallbackTarget,
 };
@@ -129,7 +129,7 @@ fn png(width: u32, height: u32) -> Vec<u8> {
     data
 }
 
-fn report(bytes: &[u8]) -> mc_spine_server_files::PackRoutingReport {
+fn report(bytes: &[u8]) -> megu_server_files::PackRoutingReport {
     inspect_and_route_pack(bytes, &PackRouterPolicy::default())
 }
 

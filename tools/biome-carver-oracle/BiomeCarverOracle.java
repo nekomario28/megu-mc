@@ -1,6 +1,6 @@
 // Actual pinned 1.21.1 biome carver lists from the jar's own datapack.
 // Ordinary RegistryDataLoader/Biome methods; no server, world or constructor bypass.
-package dev.mcspine.tools;
+package dev.megu.tools;
 
 import com.google.gson.*;
 import java.lang.reflect.*;

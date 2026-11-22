@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: LGPL-3.0-or-later
 //! Behavior tests for `InventorySortState` QoL container sorting.
 
-use mc_spine_client_ui::container_screen::{
+use megu_client_ui::container_screen::{
     menu_schema, ContainerScreenState, InventorySortState, UiItemStack,
 };
 

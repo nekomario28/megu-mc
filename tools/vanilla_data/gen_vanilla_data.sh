@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Regenerate every Minecraft 1.21.1 data file mc-spine reads, from the vanilla server jar:
+# Regenerate every Minecraft 1.21.1 data file megu reads, from the vanilla server jar:
 #
 #   assets/block_states_1211.json               per-state light, flags, solid faces and collision boxes
 #   datapacks/vanilla/data/minecraft/           the game's own worldgen data (biome, configured_carver,
@@ -73,8 +73,8 @@ WORLDGEN=(biome configured_carver configured_feature density_function flat_level
           multi_noise_biome_source_parameter_list noise noise_settings placed_feature processor_list
           structure structure_set template_pool world_preset)
 
-JAR="${MC_SPINE_VANILLA_JAR:-}"
-MAPS="${MC_SPINE_FABRIC_MAPPINGS:-$HOME/.cache/mc-spine-vanilla-data}"
+JAR="${MEGU_VANILLA_JAR:-}"
+MAPS="${MEGU_FABRIC_MAPPINGS:-$HOME/.cache/megu-vanilla-data}"
 DP="$ROOT/datapacks/vanilla"
 STAGE="$ROOT/datapacks/vanilla.stage"
 FETCH=0

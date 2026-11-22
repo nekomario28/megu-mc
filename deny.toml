@@ -27,9 +27,9 @@ allow = [
     "Unlicense",
     "Unicode-3.0",
     "CDLA-Permissive-2.0", # webpki-roots (Mozilla CA bundle)
-    "GPL-3.0-or-later",    # root crate mc-spine (LICENSE)
-    "LGPL-3.0-or-later",   # root crate mc-spine (COPYING.LESSER)
-    "AGPL-3.0-or-later",   # root crate mc-spine (COPYING.AGPL)
+    "GPL-3.0-or-later",    # root crate megu (LICENSE)
+    "LGPL-3.0-or-later",   # root crate megu (COPYING.LESSER)
+    "AGPL-3.0-or-later",   # root crate megu (COPYING.AGPL)
 ]
 confidence-threshold = 0.93
 

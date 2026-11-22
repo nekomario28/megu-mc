@@ -927,7 +927,7 @@ impl AsyncSaveWorker {
         ));
         let worker_state = std::sync::Arc::clone(&state);
         let thread = thread::Builder::new()
-            .name("mc-spine-save".into())
+            .name("megu-save".into())
             .spawn(move || Self::run(&worker_state))
             .expect("spawn save worker");
         AsyncSaveWorker {
@@ -1757,7 +1757,7 @@ impl Default for TickFaultQuarantine {
     }
 }
 
-const QUARANTINE_FILE_HEADER: &str = "MCSPINE-QUARANTINE-V1";
+const QUARANTINE_FILE_HEADER: &str = "MEGU-QUARANTINE-V1";
 
 /// One line for the persisted frozen set. Control characters in `kind` and the
 /// diagnostic become spaces, so a field can never smuggle extra lines or
@@ -2104,7 +2104,7 @@ mod server_reliability_tests {
     fn async_save_worker_coalesces_writes_and_rotates_backups_cleanly() {
         static TEMP_SEQ: AtomicU64 = AtomicU64::new(0);
         let dir = std::env::temp_dir().join(format!(
-            "mc-spine-reliability-{}-{}",
+            "megu-reliability-{}-{}",
             std::process::id(),
             TEMP_SEQ.fetch_add(1, Ordering::SeqCst)
         ));
@@ -2222,7 +2222,7 @@ mod server_reliability_tests {
     fn ops2_temp_dir(tag: &str) -> std::path::PathBuf {
         static SEQ: AtomicU64 = AtomicU64::new(0);
         let dir = std::env::temp_dir().join(format!(
-            "mc-spine-ops2-{tag}-{}-{}",
+            "megu-ops2-{tag}-{}-{}",
             std::process::id(),
             SEQ.fetch_add(1, Ordering::SeqCst)
         ));

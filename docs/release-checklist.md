@@ -51,7 +51,7 @@ cargo clippy --manifest-path client-gpu/Cargo.toml --locked \
 Produce the Mojang-free export and let `--verify` rehearse it:
 
 ```sh
-bash tools/export_public_branch.sh --out ../mc-spine-public --verify
+bash tools/export_public_branch.sh --out ../megu-public --verify
 ```
 
 [tools/export_public_branch.sh](../tools/export_public_branch.sh) creates a
@@ -61,7 +61,7 @@ and every generated `*_1211*` file are removed and ignored.
 Re-check provenance on the exact directory you will ship:
 
 ```sh
-cd ../mc-spine-public
+cd ../megu-public
 python3 tools/provenance_check.py --strict-public
 ```
 
@@ -102,12 +102,12 @@ reproducible.
 
 ```sh
 python3 tools/release_bundle.py build \
-    --binary target/release/mc-spine \
+    --binary target/release/megu \
     --out-dir dist \
     --version 0.1.0-alpha.1 \
     --target x86_64-unknown-linux-gnu
 python3 tools/release_bundle.py verify \
-    --bundle dist/mc-spine-0.1.0-alpha.1-x86_64-unknown-linux-gnu.tar.gz \
+    --bundle dist/megu-0.1.0-alpha.1-x86_64-unknown-linux-gnu.tar.gz \
     --manifest dist/release-manifest.json \
     --sums dist/SHA256SUMS
 ```
@@ -118,8 +118,8 @@ the tarball bytes: manifest, `SHA256SUMS` and per-member records must all
 agree, and the purity guard rejects any Mojang-derived or
 repository-internal member.
 The payload includes `tools/megu_start.py` and `tools/megu_translate.py` as
-executable helpers. Separately built `mc-spine-client`, `mc-spine-mod-check`
-`mc-spine-world-migrate` and `mc-spine-init` binaries can be included with repeated
+executable helpers. Separately built `megu-client`, `megu-mod-check`
+`megu-world-migrate` and `megu-init` binaries can be included with repeated
 `--extra-binary <path>` arguments to `build`.
 
 ## 5. Container image
@@ -128,7 +128,7 @@ Build from a checkout that carries the compile-time tables - the dev tree,
 or the export after step 3:
 
 ```sh
-docker build -f docker/Dockerfile -t mc-spine:0.1.0-alpha.1 .
+docker build -f docker/Dockerfile -t megu:0.1.0-alpha.1 .
 ```
 
 [docker/Dockerfile](../docker/Dockerfile) is multi-stage: the Rust 1.98.0
@@ -142,25 +142,25 @@ Gate the EULA behaviour before publishing - both must exit non-zero and
 never start the server:
 
 ```sh
-docker run --rm mc-spine:0.1.0-alpha.1; test $? -ne 0
-docker run --rm -e EULA=FALSE mc-spine:0.1.0-alpha.1; test $? -ne 0
+docker run --rm megu:0.1.0-alpha.1; test $? -ne 0
+docker run --rm -e EULA=FALSE megu:0.1.0-alpha.1; test $? -ne 0
 ```
 
 Run:
 
 ```sh
-docker run --name mc-spine -e EULA=TRUE -p 25565:25565 \
-    -v mc-spine-data:/data mc-spine:0.1.0-alpha.1
+docker run --name megu -e EULA=TRUE -p 25565:25565 \
+    -v megu-data:/data megu:0.1.0-alpha.1
 ```
 
 [docker/entrypoint.sh](../docker/entrypoint.sh) refuses to start without
-`EULA=TRUE`, passes the `MC_SPINE_*` environment through
-(`MC_SPINE_PORT`, `MC_SPINE_ONLINE_MODE`, `MC_SPINE_VELOCITY_FORWARDING`,
-`MC_SPINE_BACKUP_MAX_KEEP`, `MC_SPINE_LAN_BROADCAST`,
-`MC_SPINE_SAFE_SPAWN`), and - when `MC_SPINE_MODPACK` names a pack inside the
+`EULA=TRUE`, passes the `MEGU_*` environment through
+(`MEGU_PORT`, `MEGU_ONLINE_MODE`, `MEGU_VELOCITY_FORWARDING`,
+`MEGU_BACKUP_MAX_KEEP`, `MEGU_LAN_BROADCAST`,
+`MEGU_SAFE_SPAWN`), and - when `MEGU_MODPACK` names a pack inside the
 container - runs the
 [tools/mod_launcher.py](../tools/mod_launcher.py) pre-flight first
-(`MC_SPINE_MC_VERSION`, default `1.21.1`).
+(`MEGU_MC_VERSION`, default `1.21.1`).
 
 The server reads `assets/`, `datapacks/` and `config_packets.bin` from its
 working directory. To serve real worlds, mount a `/data` volume that holds

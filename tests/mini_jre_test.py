@@ -197,7 +197,7 @@ class MiniJreTests(unittest.TestCase):
             env=self.fake_env())
         self.assertEqual(proc.returncode, 0, proc.stderr)
         report = json.loads(proc.stdout)
-        self.assertEqual(report["schema"], "mc-spine-mini-jre/1")
+        self.assertEqual(report["schema"], "megu-mini-jre/1")
         self.assertTrue(report["dry_run"])
         self.assertEqual(report["profile"], "neoforge-delegate")
         self.assertEqual(report["modules"], NEOFORGE_MODULES)
@@ -240,7 +240,7 @@ class MiniJreTests(unittest.TestCase):
         self.assertFalse(self.staging.exists())
         manifest = json.loads(
             (self.out / "mini-jre-manifest.json").read_text())
-        self.assertEqual(manifest["schema"], "mc-spine-mini-jre/1")
+        self.assertEqual(manifest["schema"], "megu-mini-jre/1")
         self.assertEqual(manifest["profile"], "minimal")
         self.assertEqual(manifest["modules"], MINIMAL_MODULES)
         self.assertEqual(manifest["delegate_flags"], EXPECTED_FLAGS_32_256)

@@ -22,7 +22,7 @@ pub enum ExecutionTier {
     /// Tier 3: Requires unsupported Mixin/AT or unknown `net.minecraft.*` APIs.
     RequiresFallback,
     /// Not a JVM tier: an optimization mod whose entire function is already
-    /// implemented natively inside `mc-spine` / `client-port` / `client-app`.
+    /// implemented natively inside `megu` / `client-port` / `client-app`.
     /// Always skipped, never staged, never counted toward Tier 3 fallback.
     ///
     /// Clean-room note: matching a mod id against
@@ -35,7 +35,7 @@ pub enum ExecutionTier {
     BuiltInSuperseded,
 }
 
-/// Mod ids whose optimization surface `mc-spine` already implements natively.
+/// Mod ids whose optimization surface `megu` already implements natively.
 ///
 /// When a user drops a real CurseForge/Modrinth modpack folder into `mods/`,
 /// these redundant performance mods (with their heavy Mixins) would
@@ -49,9 +49,9 @@ pub enum ExecutionTier {
 /// compared case-insensitively. It is an id blocklist only: ids here are
 /// never loaded, so no third-party mod code is ever copied, linked, bundled,
 /// or derived from — every named optimization is an original clean-room Rust
-/// implementation inside `mc-spine`.
+/// implementation inside `megu`.
 pub const BUILTIN_SUPERSEDED_PERF_MODS: &[&str] = &[
-    // Rendering / mesh / LOD — superseded by mc-spine's native wgpu renderer
+    // Rendering / mesh / LOD — superseded by megu's native wgpu renderer
     // (client-gpu / client-port), never loaded as Java mods.
     "sodium",
     "embeddium",
@@ -84,7 +84,7 @@ pub const BUILTIN_SUPERSEDED_PERF_MODS: &[&str] = &[
     "enhancedblockentities",
     "cullleaves",
     "cull-less-leaves",
-    // Shader pipeline — superseded by mc-spine's native shaderpack
+    // Shader pipeline — superseded by megu's native shaderpack
     // subsystem; user shaderpacks reach it through the
     // `shader_pipeline_bridge` resource bridge, the JAR itself is never
     // loaded (same shape as the `distanthorizons`/`voxy` LOD bridges).
@@ -117,9 +117,9 @@ pub const BUILTIN_SUPERSEDED_PERF_MODS: &[&str] = &[
 /// Reason attached to [`ExecutionTier::BuiltInSuperseded`] assignments.
 /// `tools/mod_launcher.py` mirrors this string so CLI output matches the
 /// Rust startup report 1:1.
-pub const REASON_SUPERSEDED: &str = "already covered by mc-spine built-in optimizations";
+pub const REASON_SUPERSEDED: &str = "already covered by megu built-in optimizations";
 
-/// Whether `mod_id` names an optimization `mc-spine` already implements
+/// Whether `mod_id` names an optimization `megu` already implements
 /// natively. Case-insensitive; matches both Fabric and NeoForge/Forge ids.
 pub fn is_builtin_superseded_mod(mod_id: &str) -> bool {
     BUILTIN_SUPERSEDED_PERF_MODS
@@ -141,7 +141,7 @@ pub enum FallbackPolicy {
     },
     /// When >=1 Tier 3 mod is present, hand off automatically to the user's
     /// pinned upstream NeoForge 1.21.1 server runtime so every mod works 100%
-    /// normally; when 0 Tier 3 mods are present, run pure `mc-spine` native
+    /// normally; when 0 Tier 3 mods are present, run pure `megu` native
     /// with zero NeoForge overhead.
     DelegateNeoForge,
 }
@@ -174,7 +174,7 @@ pub struct ModAssignment {
 /// Final startup execution plan produced before opening TCP listeners.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum StartupPlan {
-    /// All mods run natively on `mc-spine` (with optional bounded JVM shim if
+    /// All mods run natively on `megu` (with optional bounded JVM shim if
     /// any Tier 2 mod is present); zero upstream NeoForge runtime started.
     RunNative {
         assignments: Vec<ModAssignment>,
@@ -528,7 +528,7 @@ impl StartupPlan {
     }
 
     /// One-line operator notice for skipped perf mods, e.g.
-    /// `Skipped 3 redundant performance mods (already built into mc-spine): lithium, modernfix, sodium`.
+    /// `Skipped 3 redundant performance mods (already built into megu): lithium, modernfix, sodium`.
     /// `None` when nothing was superseded.
     pub fn superseded_notice(&self) -> Option<String> {
         let ids = self.superseded_perf_mods();
@@ -536,7 +536,7 @@ impl StartupPlan {
             return None;
         }
         Some(format!(
-            "Skipped {} redundant performance mods (already built into mc-spine): {}",
+            "Skipped {} redundant performance mods (already built into megu): {}",
             ids.len(),
             ids.join(", ")
         ))
@@ -716,7 +716,7 @@ mod tests {
             let notice = plan.superseded_notice().unwrap();
             assert_eq!(
                 notice,
-                "Skipped 3 redundant performance mods (already built into mc-spine): \
+                "Skipped 3 redundant performance mods (already built into megu): \
                  lithium, modernfix, sodium"
             );
             match plan {

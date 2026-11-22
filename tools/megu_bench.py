@@ -295,8 +295,8 @@ def benchmark_run(command: list[str], requested_port: int) -> dict:
         directory = Path(temporary)
         port = select_port(requested_port)
         environment = {key: value for key, value in os.environ.items()
-                       if not key.startswith("MC_SPINE_")}
-        environment.update(MC_SPINE_BIND_ADDR="127.0.0.1", MC_SPINE_PORT=str(port),
+                       if not key.startswith("MEGU_")}
+        environment.update(MEGU_BIND_ADDR="127.0.0.1", MEGU_PORT=str(port),
                            TMPDIR=temporary, TMP=temporary, TEMP=temporary)
         log = directory / "server.log"
         with log.open("wb") as stream:
@@ -370,8 +370,8 @@ def benchmark_plan(binary: Path, command: list[str], runs: int, port: int) -> di
         "pings_per_run": PING_COUNT,
         "startup_timeout_seconds": STARTUP_TIMEOUT_S,
         "environment_overrides": {
-            "MC_SPINE_BIND_ADDR": "127.0.0.1",
-            "MC_SPINE_PORT": str(port) if port else "<ephemeral per run>",
+            "MEGU_BIND_ADDR": "127.0.0.1",
+            "MEGU_PORT": str(port) if port else "<ephemeral per run>",
             "TMPDIR": "<fresh isolated workdir per run>",
             "TMP": "<fresh isolated workdir per run>",
             "TEMP": "<fresh isolated workdir per run>",
@@ -450,10 +450,10 @@ def main(argv: list[str] | None = None) -> int:
     if args.dry_run:
         report = benchmark_plan(binary, command, args.runs, args.port)
     else:
-        flags = {"argv": command, "MC_SPINE_BIND_ADDR": "127.0.0.1",
-                 "MC_SPINE_PORT": args.port if args.port else "ephemeral per run",
+        flags = {"argv": command, "MEGU_BIND_ADDR": "127.0.0.1",
+                 "MEGU_PORT": args.port if args.port else "ephemeral per run",
                  "TMPDIR": "fresh isolated workdir per run", "TMP": "same as TMPDIR",
-                 "TEMP": "same as TMPDIR", "other_MC_SPINE_vars": "cleared"}
+                 "TEMP": "same as TMPDIR", "other_MEGU_vars": "cleared"}
         try:
             runs = [benchmark_run(command, args.port) for _ in range(args.runs)]
         except (OSError, BenchmarkError) as error:

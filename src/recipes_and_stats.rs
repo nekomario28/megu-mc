@@ -1423,7 +1423,7 @@ mod recipes_and_stats_tests {
 
     #[test]
     fn tab_list_0x6d_header_footer_roundtrip() {
-        let wire = encode_tab_list("Welcome", "mc-spine");
+        let wire = encode_tab_list("Welcome", "megu");
         assert_eq!(wire[0], 0x0a); // anonymous TAG_Compound
         let mut rest = &wire[..];
         let (header, footer) = decode_tab_list(&mut rest).unwrap();
@@ -1434,11 +1434,11 @@ mod recipes_and_stats_tests {
                 .and_then(|s| s.to_utf8().ok())
         };
         assert_eq!(text(&header).as_deref(), Some("Welcome"));
-        assert_eq!(text(&footer).as_deref(), Some("mc-spine"));
+        assert_eq!(text(&footer).as_deref(), Some("megu"));
 
         // The encoded form is byte-identical to two chat_nbt components.
         let mut expect = chat_nbt("Welcome");
-        expect.extend_from_slice(&chat_nbt("mc-spine"));
+        expect.extend_from_slice(&chat_nbt("megu"));
         assert_eq!(wire, expect);
 
         // Trailing bytes and a truncated footer are rejected.

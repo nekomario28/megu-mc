@@ -1,6 +1,6 @@
 // Do not put the transport in the default package: the obfuscated game classes
 // occupy that package in a signed jar, so an unsigned peer triggers a signer error.
-package dev.mcspine.tools;
+package dev.megu.tools;
 
 import com.google.gson.JsonArray;
 import com.google.gson.JsonObject;

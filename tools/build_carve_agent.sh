@@ -8,12 +8,12 @@
 # traces, so the measurement looked fine and was not.
 #
 # Usage: tools/build_carve_agent.sh [output-dir]
-#   default output-dir: ~/.cache/mc-spine-audit/carve-agent
+#   default output-dir: ~/.cache/megu-audit/carve-agent
 # Prints the two jar paths on stdout (last two lines) and a SHA-256 of the agent jar.
 set -euo pipefail
 cd "$(dirname "$0")/.."
 
-OUT="${1:-$HOME/.cache/mc-spine-audit/carve-agent}"
+OUT="${1:-$HOME/.cache/megu-audit/carve-agent}"
 SRC=tools/carve-agent
 
 # The ASM jar lives in the local Maven cache, or in a mod-loader's bundled libraries. Take the

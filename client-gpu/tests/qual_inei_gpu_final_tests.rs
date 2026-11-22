@@ -17,25 +17,25 @@
 //!   on a session (3D blocks/skins, nature effects, tactile config,
 //!   spatial-audio preset, shadow quality, render scale).
 
-use mc_spine_client::protocol::{DecodedChunk, DecodedLightData, DecodedSection, DimensionMeta};
-use mc_spine_client::spatial_audio::SpatialAudioPreset;
-use mc_spine_client::world::{BlockTable, WorldState};
-use mc_spine_client_gpu::atmosphere::{AtmosphereParams, BiomeAtmosphereBlender, ChunkFadeTracker};
-use mc_spine_client_gpu::live_session::LiveSession;
-use mc_spine_client_gpu::renderer::{
+use megu_client::protocol::{DecodedChunk, DecodedLightData, DecodedSection, DimensionMeta};
+use megu_client::spatial_audio::SpatialAudioPreset;
+use megu_client::world::{BlockTable, WorldState};
+use megu_client_gpu::atmosphere::{AtmosphereParams, BiomeAtmosphereBlender, ChunkFadeTracker};
+use megu_client_gpu::live_session::LiveSession;
+use megu_client_gpu::renderer::{
     probe_adapters, request_gpu_device, ComposedFrame, GpuRenderer, OFFSCREEN_FORMAT,
 };
-use mc_spine_client_gpu::Camera;
-use mc_spine_client_mesh::builtin_shadow_wgsl::{
+use megu_client_gpu::Camera;
+use megu_client_mesh::builtin_shadow_wgsl::{
     build_shadow_uniforms_celestial, compute_sun_direction, BuiltinShadowQuality, EclipseMode,
     RenderScalePreset, ShadowCacheDecision, ShadowCamera, MEGU_SHADOW_CUTOUT_DEPTH_WGSL,
     MEGU_SPATIAL_SHARPEN_WGSL, MEGU_STAINED_GLASS_SHADOW_COLOR_WGSL, MEGU_TERRAIN_LIT_WGSL,
     MEGU_WATER_SURFACE_WGSL,
 };
-use mc_spine_client_mesh::tactile_effects::{TactileEffectsConfig, TactilePreset};
-use mc_spine_client_mesh::{Block, MeshCache, Section, SectionCoord, SectionMeshInput};
-use mc_spine_core::task_pool::{MeguTaskPool, TaskLane};
-use mc_spine_core::zip_archive::LazyZipIndex;
+use megu_client_mesh::tactile_effects::{TactileEffectsConfig, TactilePreset};
+use megu_client_mesh::{Block, MeshCache, Section, SectionCoord, SectionMeshInput};
+use megu_core::task_pool::{MeguTaskPool, TaskLane};
+use megu_core::zip_archive::LazyZipIndex;
 
 const STONE: u32 = 1;
 const WATER: u32 = 80;
@@ -55,9 +55,9 @@ fn uniform_section(state: u32) -> DecodedSection {
         non_air: if state == 0 {
             0
         } else {
-            mc_spine_client_mesh::SECTION_CELLS as i16
+            megu_client_mesh::SECTION_CELLS as i16
         },
-        states: Box::new([state; mc_spine_client_mesh::SECTION_CELLS]),
+        states: Box::new([state; megu_client_mesh::SECTION_CELLS]),
         biomes: [0; 64],
     }
 }
@@ -98,7 +98,7 @@ fn try_gpu_renderer() -> Option<GpuRenderer> {
     Some(GpuRenderer::new(ctx, OFFSCREEN_FORMAT))
 }
 
-use mc_spine_client_mesh::RenderBackendPreference;
+use megu_client_mesh::RenderBackendPreference;
 
 fn naga_validate(name: &str, source: &str) {
     use wgpu::naga::front::wgsl;
@@ -225,7 +225,7 @@ fn qual_gpu_parallel_taskpool_meshing_releases_cpu_copies_and_lazy_zip_jar() {
     for y in -1..=1 {
         for z in -1..=1 {
             for x in -1..=1 {
-                let mut blocks = Box::new([Block::AIR; mc_spine_client_mesh::SECTION_CELLS]);
+                let mut blocks = Box::new([Block::AIR; megu_client_mesh::SECTION_CELLS]);
                 // One solid floor per section keeps every mesh non-trivial.
                 for i in 0..256 {
                     blocks[i] = Block::opaque_cube(STONE);
@@ -234,8 +234,8 @@ fn qual_gpu_parallel_taskpool_meshing_releases_cpu_copies_and_lazy_zip_jar() {
                     SectionCoord(x, y, z),
                     Section {
                         blocks,
-                        block_light: [0u8; mc_spine_client_mesh::LIGHT_BYTES],
-                        sky_light: [255u8; mc_spine_client_mesh::LIGHT_BYTES],
+                        block_light: [0u8; megu_client_mesh::LIGHT_BYTES],
+                        sky_light: [255u8; megu_client_mesh::LIGHT_BYTES],
                     },
                 );
             }
@@ -259,7 +259,7 @@ fn qual_gpu_parallel_taskpool_meshing_releases_cpu_copies_and_lazy_zip_jar() {
             built
                 .lock()
                 .unwrap_or_else(|e| e.into_inner())
-                .push(mc_spine_client_mesh::build_and_pack_section_mesh(job));
+                .push(megu_client_mesh::build_and_pack_section_mesh(job));
         });
         let _ = scope;
     });

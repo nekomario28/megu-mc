@@ -20,8 +20,8 @@
 use std::collections::BTreeMap;
 
 use bytemuck::{Pod, Zeroable};
-use mc_spine_client_mesh::builtin_shadow_wgsl::VfxLightUniforms;
-use mc_spine_client_mesh::BerInstanceData;
+use megu_client_mesh::builtin_shadow_wgsl::VfxLightUniforms;
+use megu_client_mesh::BerInstanceData;
 
 use crate::{mat4_mul, Mat4};
 

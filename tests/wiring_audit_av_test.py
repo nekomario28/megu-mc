@@ -53,7 +53,7 @@ class WiringAuditAvTests(unittest.TestCase):
             put(root, "client-app/src/feature.rs", "pub fn dead_feature() {}\n")
             put(root, "client-app/src/session.rs", "pub fn run() {}\n")
             put(root, "client-app/tests/feature_tests.rs", """
-                use mc_spine_client::feature::dead_feature;
+                use megu_client::feature::dead_feature;
                 #[test]
                 fn check() { dead_feature(); }
             """)
@@ -75,7 +75,7 @@ class WiringAuditAvTests(unittest.TestCase):
             base_tree(root)
             put(root, "client-port/src/live.rs", "pub fn live_feature() {}\n")
             put(root, "client-gpu/src/renderer.rs", """
-                use mc_spine_client_mesh::live::live_feature;
+                use megu_client_mesh::live::live_feature;
                 pub fn render() { live_feature(); }
             """)
             put_json(root, "tools/wiring_audit_features.json", features(
@@ -94,7 +94,7 @@ class WiringAuditAvTests(unittest.TestCase):
             base_tree(root)
             put(root, "client-port/src/live.rs", "pub fn live_feature() {}\n")
             put(root, "client-gpu/src/renderer.rs", """
-                use mc_spine_client_mesh::live::live_feature;
+                use megu_client_mesh::live::live_feature;
                 pub fn render() { live_feature(); }
             """)
             put_json(root, "tools/wiring_audit_features.json", features(

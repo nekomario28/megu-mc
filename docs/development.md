@@ -66,7 +66,7 @@ tools/vanilla_data/gen_vanilla_data.sh --jar /path/to/server.jar --fetch-fabric-
 `tools/vanilla_data/gen_vanilla_data.sh --verify` で確認できます（jar 不要）。
 
 ```sh
-tools/export_public_branch.sh --out ../mc-spine-public --verify
+tools/export_public_branch.sh --out ../megu-public --verify
 ```
 
 このコマンドは HEAD の追跡ファイルから、D5 対象の datapack・状態表・4 TSV・パケットを除いた
@@ -88,7 +88,7 @@ tools/export_public_branch.sh --out ../mc-spine-public --verify
 ```sh
 cargo build --locked
 cargo test --locked -- --test-threads=1
-MC_SPINE_PORT=25699 cargo run --locked
+MEGU_PORT=25699 cargo run --locked
 ```
 
 - `--test-threads=1` はテストが共有する生成ディレクトリ・環境変数を壊さないためです。
@@ -148,7 +148,7 @@ Java adapterの `cargo check`、mutation（ゲートが赤くなれることの�
 - `.github/workflows/ci.yml` は `main` へのPRと一部pushで走ります。ローカルの代用にはなりません。
 - `.github/workflows/audit.yml` は `cargo-deny`（advisory・license・bans・sources）、`gitleaks.yml` は秘密情報の検査です。
 - `p1-native-oracle.yml` は固定jarとJava 21でnative照合を行います。対象ブランチは限られ、`workflow_dispatch` でも起動できます。手元で回す場合は `tools/native_cargo_gate.py` と各oracleの引数を読んでください。jarの取得・EULA同意を自動化しないでください。
-- T2の層ゲートは `tools/check_layers.py` が検査器の同一性を確認します。`depsgx` が無い環境では実行できないため、`MC_SPINE_DEPSGX` に固定ビルドを指定します。
+- T2の層ゲートは `tools/check_layers.py` が検査器の同一性を確認します。`depsgx` が無い環境では実行できないため、`MEGU_DEPSGX` に固定ビルドを指定します。
 
 ## 5. ソースの歩き方
 
@@ -193,7 +193,7 @@ Java adapterの `cargo check`、mutation（ゲートが赤くなれることの�
 
    サーバーも生成データも要らないunitテストです。このガイドの作業では未実行です（NOT RUN。ビルド予算）。
 5. **経路を確かめる**: wireの振る舞いが変わるなら、ビルド後に
-   `python3 tests/wire_smoke.py target/debug/mc-spine`、または `bash tests/verify.sh`。
+   `python3 tests/wire_smoke.py target/debug/megu`、または `bash tests/verify.sh`。
    `tests/protocol767_test.py` はCLIデコーダのknown-answer検査で、サーバーの受信経路を実行しないため**証明になりません**。
 6. **提出する**: 実行したコマンドとexit、実行していない段階、変更したテスト名をPRに書く。
    「一部のテストが緑」を「全体合格」と書かない。

@@ -3,8 +3,8 @@
 //! Geometry audit pins: rim UV sampling, HD sprite extrusion, model-projected
 //! fixture UVs, coplanar z-fighting freedom, and ladder facing orientation.
 
-use mc_spine_client_mesh::vanilla_plus_3d::*;
-use mc_spine_client_mesh::Direction;
+use megu_client_mesh::vanilla_plus_3d::*;
+use megu_client_mesh::Direction;
 
 // ---------------------------------------------------------------------------
 // Helpers

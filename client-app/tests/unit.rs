@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: LGPL-3.0-or-later OR GPL-3.0-or-later OR AGPL-3.0-or-later
-//! Unit and integration tests for mc-spine-client (CLI, redaction, Protocol 767,
+//! Unit and integration tests for megu-client (CLI, redaction, Protocol 767,
 //! RFC 1950 zlib, chunk decode -> client-port greedy meshing + vertex packing,
 //! and client-kernel physics prediction).
 
@@ -9,18 +9,18 @@ use std::path::Path;
 use std::thread;
 use std::time::Duration;
 
-use mc_spine_client::cli::{parse_args, parse_host_port, redact_from_argv, ScriptMode};
-use mc_spine_client::protocol::{
+use megu_client::cli::{parse_args, parse_host_port, redact_from_argv, ScriptMode};
+use megu_client::protocol::{
     decode_chunk_packet, decode_packet_body, decode_paletted_container,
     decode_section_blocks_update, decode_update_light_packet, encode_packet, offline_uuid,
     pack_position, parse_uuid, unpack_position, write_string, write_varint, write_varlong,
     zlib_compress_stored, zlib_decompress, DimensionMeta, PlayEvent, ProtocolClient, TeleportSync,
     WireReader,
 };
-use mc_spine_kernel::Aabb;
-use mc_spine_client::sim::{PlayerPhysics, TickInput};
-use mc_spine_client::world::{pack_vertices, sort_translucent, BlockTable, WorldState};
-use mc_spine_client_mesh::ffi::PackedVertex;
+use megu_kernel::Aabb;
+use megu_client::sim::{PlayerPhysics, TickInput};
+use megu_client::world::{pack_vertices, sort_translucent, BlockTable, WorldState};
+use megu_client_mesh::ffi::PackedVertex;
 
 #[test]
 fn cli_launcher_flags_and_token_redaction() {
@@ -42,7 +42,7 @@ fn cli_launcher_flags_and_token_redaction() {
         "--userType",
         "msa",
         "--version",
-        "1.21.1-mc-spine",
+        "1.21.1-megu",
         "--versionType",
         "release",
         "--gameDir",
@@ -163,13 +163,13 @@ fn rfc1950_zlib_stored_and_huffman_and_packet_framing() {
         assert_eq!(restored, data);
     }
 
-    // 2. Real fixed-Huffman RFC 1950 zlib stream ("hello mc-spine! " * 8, Python zlib.compress)
+    // 2. Real fixed-Huffman RFC 1950 zlib stream ("hello megu! " * 8, Python zlib.compress)
     let fixed_zlib: &[u8] = &[
         0x78, 0x9c, 0xcb, 0x48, 0xcd, 0xc9, 0xc9, 0x57, 0xc8, 0x4d, 0xd6, 0x2d, 0x2e, 0xc8, 0xcc,
         0x4b, 0x55, 0x54, 0xc8, 0xa0, 0x33, 0x1f, 0x00, 0x53, 0xfd, 0x2c, 0x89,
     ];
     let decoded = zlib_decompress(fixed_zlib, 1024).expect("decompress fixed Huffman zlib");
-    assert_eq!(decoded, b"hello mc-spine! ".repeat(8));
+    assert_eq!(decoded, b"hello megu! ".repeat(8));
 
     // 3. Real dynamic-Huffman RFC 1950 zlib stream (BTYPE=2, Python zlib.compress level=9)
     let dynamic_zlib: &[u8] = &[
@@ -617,10 +617,10 @@ fn physics_prediction_gravity_wall_and_water_fluid_impulse() {
 
 use std::path::PathBuf;
 
-use mc_spine_client::integrated;
-use mc_spine_client::render;
-use mc_spine_client::sim::run_session;
-use mc_spine_client_mesh::{section_index, LIGHT_BYTES};
+use megu_client::integrated;
+use megu_client::render;
+use megu_client::sim::run_session;
+use megu_client_mesh::{section_index, LIGHT_BYTES};
 
 fn test_block_table() -> BlockTable {
     let json_path = Path::new("../assets/block_states_1211.json");
@@ -744,7 +744,7 @@ fn tall_dimension_multiword_light_edit_remesh_render() {
 
     // The high section (min_sy -32 + 75 = sec_y 43) is dirty — marked via a
     // word-1 mask bit — and remeshes through client-port.
-    let high_coord = mc_spine_client_mesh::SectionCoord(0, 43, 0);
+    let high_coord = megu_client_mesh::SectionCoord(0, 43, 0);
     assert!(world.pending_mesh_sections() > 0);
     assert!(
         world.mesh_cache.mesh(high_coord).is_none(),
@@ -907,7 +907,7 @@ fn cli_quickplay_render_and_server_flags() {
         "--gameDir",
         "/tmp/g",
         "--server-bin",
-        "/tmp/mc-spine",
+        "/tmp/megu",
         "--seed",
         "42",
         "--render-png",
@@ -922,7 +922,7 @@ fn cli_quickplay_render_and_server_flags() {
     ];
     let cfg = parse_args(&argv).expect("parse flags");
     assert_eq!(cfg.quick_play_singleplayer.as_deref(), Some("testworld"));
-    assert_eq!(cfg.server_bin.as_deref(), Some(Path::new("/tmp/mc-spine")));
+    assert_eq!(cfg.server_bin.as_deref(), Some(Path::new("/tmp/megu")));
     assert_eq!(cfg.seed, Some(42));
     assert_eq!(cfg.render_png.as_deref(), Some(Path::new("/tmp/f.png")));
     assert_eq!(cfg.render_width, 640);
@@ -940,8 +940,8 @@ fn find_server_bin() -> Option<PathBuf> {
         return Some(bin);
     }
     [
-        PathBuf::from("../target/debug/mc-spine"),
-        PathBuf::from("../target/release/mc-spine"),
+        PathBuf::from("../target/debug/megu"),
+        PathBuf::from("../target/release/megu"),
     ]
     .into_iter()
     .find(|candidate| candidate.is_file())
@@ -950,10 +950,10 @@ fn find_server_bin() -> Option<PathBuf> {
 #[test]
 fn quickplay_singleplayer_loopback_e2e_renders_png() {
     let Some(bin) = find_server_bin() else {
-        eprintln!("mc-spine server binary not built; skipping live E2E");
+        eprintln!("megu server binary not built; skipping live E2E");
         return;
     };
-    let game_dir = std::env::temp_dir().join(format!("mc-spine-client-e2e-{}", std::process::id()));
+    let game_dir = std::env::temp_dir().join(format!("megu-client-e2e-{}", std::process::id()));
     let png_path = game_dir.join("frame.png");
     let _ = std::fs::remove_dir_all(&game_dir);
 
@@ -1023,7 +1023,7 @@ fn cli_mc_version_named_numeric_and_fail_closed() {
     // Default stays the pinned 1.21.1 profile.
     let cfg = parse_args(&["--headless".to_string()]).expect("default parse");
     assert_eq!(cfg.mc_version.number(), 767);
-    assert_eq!(cfg.mc_version, mc_spine_proto::ProtocolVersion::V1_21_1);
+    assert_eq!(cfg.mc_version, megu_proto::ProtocolVersion::V1_21_1);
     // Unknown values fail closed instead of guessing a table.
     for bad in ["1.20.4", "765", "26.4", "778", "", "vanilla"] {
         assert!(
@@ -1034,7 +1034,7 @@ fn cli_mc_version_named_numeric_and_fail_closed() {
     // parse_mc_version itself accepts surrounding whitespace-free values only
     // via trim, so a padded-but-valid string still resolves.
     assert_eq!(
-        mc_spine_client::cli::parse_mc_version(" 777 ")
+        megu_client::cli::parse_mc_version(" 777 ")
             .unwrap()
             .number(),
         777
@@ -1043,8 +1043,8 @@ fn cli_mc_version_named_numeric_and_fail_closed() {
 
 #[test]
 fn cli_gpu_backend_flag_flows_into_render_config() {
-    use mc_spine_client::render::RenderConfig;
-    use mc_spine_client_mesh::RenderBackendPreference;
+    use megu_client::render::RenderConfig;
+    use megu_client_mesh::RenderBackendPreference;
 
     // --gpu-backend classic-low-spec selects the legacy Intel iGPU path
     // end-to-end: argv -> CliConfig -> ClientSettings -> RenderConfig.
@@ -1085,7 +1085,7 @@ fn cli_gpu_backend_flag_flows_into_render_config() {
 
 #[test]
 fn cli_version_dir_flag_env_fallback_and_precedence() {
-    use mc_spine_client::cli::VERSION_DIR_ENV;
+    use megu_client::cli::VERSION_DIR_ENV;
 
     std::env::remove_var(VERSION_DIR_ENV);
     let cfg = parse_args(&["--headless".to_string()]).expect("no dir");
@@ -1173,14 +1173,14 @@ fn srv_redirect_connect_preserves_original_host_in_handshake() {
         offline_uuid("Tester"),
         2,
         Duration::from_secs(5),
-        mc_spine_proto::ProtocolVersion::V1_21_1,
+        megu_proto::ProtocolVersion::V1_21_1,
         move |host, port| {
             // The injected `_minecraft._tcp` SRV answer redirects the socket.
             assert_eq!(host, "play.example.org");
             assert_eq!(port, 25565);
             Ok(vec![format!("127.0.0.1:{backend_port}").parse().unwrap()])
         },
-        mc_spine_client::online_auth::OnlineAuthOptions::default(),
+        megu_client::online_auth::OnlineAuthOptions::default(),
     );
     assert!(result.is_err(), "mock server disconnects during login");
     server.join().unwrap();
@@ -1188,7 +1188,7 @@ fn srv_redirect_connect_preserves_original_host_in_handshake() {
 
 #[test]
 fn protocol777_login_config_play_keepalive_mock_server() {
-    use mc_spine_proto::{PacketDir, PacketPhase, ProtocolTable};
+    use megu_proto::{PacketDir, PacketPhase, ProtocolTable};
 
     // The 767 vs 777 KeepAlive split this test exercises end-to-end.
     let t767 = ProtocolTable::v767_builtin();
@@ -1314,7 +1314,7 @@ fn protocol777_login_config_play_keepalive_mock_server() {
         offline_uuid("Tester"),
         2,
         Duration::from_secs(5),
-        mc_spine_proto::ProtocolVersion::V26_3,
+        megu_proto::ProtocolVersion::V26_3,
     )
     .expect("777 connect");
     assert!(report.login_ok && report.config_ok);
@@ -1348,7 +1348,7 @@ fn protocol777_login_config_play_keepalive_mock_server() {
 
 #[test]
 fn protocol_table_driven_ids_match_builtins() {
-    use mc_spine_proto::{PacketDir, PacketPhase, ProtocolTable};
+    use megu_proto::{PacketDir, PacketPhase, ProtocolTable};
 
     let t767 = ProtocolTable::v767_builtin();
     let t777 = ProtocolTable::v777_builtin();
@@ -1435,7 +1435,7 @@ fn world_state_opens_version_dir_pack() {
     // A small custom 5-state pack proves `Registry::from_version_dir` drives
     // `WorldState::state_count` instead of the pinned STATE_COUNT.
     let dir = std::env::temp_dir().join(format!(
-        "mc-spine-client-vdir-{}",
+        "megu-client-vdir-{}",
         std::process::id()
     ));
     let _ = std::fs::remove_dir_all(&dir);
@@ -1483,13 +1483,13 @@ fn world_state_opens_version_dir_pack() {
         pinned_dir,
     )
     .expect("open pinned assets as version pack");
-    assert_eq!(ws.state_count, mc_spine_kernel::STATE_COUNT as usize);
+    assert_eq!(ws.state_count, megu_kernel::STATE_COUNT as usize);
 
     // A missing directory fails closed.
     assert!(WorldState::new_from_version_dir(
         DimensionMeta::default(),
         test_block_table(),
-        Path::new("/nonexistent-mc-spine-version-pack"),
+        Path::new("/nonexistent-megu-version-pack"),
     )
     .is_err());
 }
@@ -1518,7 +1518,7 @@ fn nbt_text_component(text: &str) -> Vec<u8> {
 // builtin 777 `ProtocolTable` — nothing is hardcoded on either side.
 #[test]
 fn protocol777_chunk_blockupdate_chat_disconnect_render_e2e() {
-    use mc_spine_proto::{PacketDir, PacketPhase, ProtocolTable};
+    use megu_proto::{PacketDir, PacketPhase, ProtocolTable};
 
     let t777 = ProtocolTable::v777_builtin();
     let play = PacketPhase::Play;
@@ -1700,7 +1700,7 @@ fn protocol777_chunk_blockupdate_chat_disconnect_render_e2e() {
         offline_uuid("Tester"),
         2,
         Duration::from_secs(5),
-        mc_spine_proto::ProtocolVersion::V26_3,
+        megu_proto::ProtocolVersion::V26_3,
     )
     .expect("777 connect");
     assert!(report.login_ok && report.config_ok);
@@ -1843,7 +1843,7 @@ fn protocol777_chunk_blockupdate_chat_disconnect_render_e2e() {
 // --ping server-list status query (Handshake -> Status -> Ping/Pong)
 // ---------------------------------------------------------------------------
 
-use mc_spine_client::protocol::{ping_server_resolved, ServerStatusPing};
+use megu_client::protocol::{ping_server_resolved, ServerStatusPing};
 
 /// What the mock status server does with the client's Ping Request payload.
 #[derive(Clone, Copy)]
@@ -1939,14 +1939,14 @@ fn loopback_resolver(
 fn ping_status_mock_server_both_protocol_versions() {
     for (version, protocol, label) in [
         (
-            mc_spine_proto::ProtocolVersion::V1_21_1,
+            megu_proto::ProtocolVersion::V1_21_1,
             767i64,
-            "mc-spine 1.21.1",
+            "megu 1.21.1",
         ),
         (
-            mc_spine_proto::ProtocolVersion::V26_3,
+            megu_proto::ProtocolVersion::V26_3,
             777i64,
-            "mc-spine 26.3",
+            "megu 26.3",
         ),
     ] {
         let json = status_json(protocol, label, true);
@@ -1998,7 +1998,7 @@ fn ping_srv_redirect_preserves_original_host_in_handshake() {
     let status = ping_server_resolved(
         "play.example.org",
         25565,
-        mc_spine_proto::ProtocolVersion::V1_21_1,
+        megu_proto::ProtocolVersion::V1_21_1,
         Duration::from_secs(5),
         move |host, port| {
             // The injected SRV answer redirects the socket to the backend.
@@ -2021,14 +2021,14 @@ fn ping_srv_redirect_preserves_original_host_in_handshake() {
 /// A pong echoing a different nonce is a hard error, not a silent pass.
 #[test]
 fn ping_rejects_mismatched_pong_nonce() {
-    let json = status_json(777, "mc-spine 26.3", true);
+    let json = status_json(777, "megu 26.3", true);
     let (port, server) =
         spawn_status_server(777, "127.0.0.1", None, json, MockPong::Corrupt);
 
     let err = ping_server_resolved(
         "127.0.0.1",
         port,
-        mc_spine_proto::ProtocolVersion::V26_3,
+        megu_proto::ProtocolVersion::V26_3,
         Duration::from_secs(5),
         loopback_resolver(port),
     )
@@ -2049,7 +2049,7 @@ fn ping_reports_protocol_mismatch() {
     let status = ping_server_resolved(
         "127.0.0.1",
         port,
-        mc_spine_proto::ProtocolVersion::V26_3,
+        megu_proto::ProtocolVersion::V26_3,
         Duration::from_secs(5),
         loopback_resolver(port),
     )

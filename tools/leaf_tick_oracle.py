@@ -18,7 +18,7 @@ def main():
     with pinned_runtime(args.jar) as (work, classpath, _):
         output = work / "leaf-tick.tsv"
         run_probe(work, classpath, source / "LeafTickOracle.java",
-                  "dev.mcspine.tools.LeafTickOracle", output,
+                  "dev.megu.tools.LeafTickOracle", output,
                   extra_sources=[source / "LeafDistanceOracle.java", source / "LeafQueueOracle.java",
                                  ROOT / "tools/vanilla-probe/VanillaBlockTags.java"])
         actual = output.read_bytes()

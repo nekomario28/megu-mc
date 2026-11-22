@@ -28,9 +28,9 @@
 //! *before* TOML files, `options.txt` imports, or explicit CLI flags are
 //! overlaid, never after.
 //!
-//! Pure `std` Rust; zero dependencies beyond `mc-spine-client-mesh` types.
+//! Pure `std` Rust; zero dependencies beyond `megu-client-mesh` types.
 
-use mc_spine_client_mesh::gpu_pipeline::RenderBackendPreference;
+use megu_client_mesh::gpu_pipeline::RenderBackendPreference;
 
 use crate::settings::{
     ClientSettings, DistantHorizon, QualityPreset, DISTANT_HORIZON_MEDIUM_CHUNKS,

@@ -23,7 +23,7 @@ TOOLS = ROOT / "tools/client_launcher"
 class LauncherTest(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
-        cls.temporary = tempfile.TemporaryDirectory(prefix="mc-spine-client-launcher-")
+        cls.temporary = tempfile.TemporaryDirectory(prefix="megu-client-launcher-")
         cls.addClassCleanup(cls.temporary.cleanup)
         cls.root = Path(cls.temporary.name)
         cls.jar_dir = cls.root / "profile-one"
@@ -47,9 +47,9 @@ if os.environ.get('TEST_INTEGRATED_CONNECT'):
 Path(os.environ['TEST_NATIVE_LOG']).write_text(json.dumps(sys.argv[1:]))
 if os.environ.get('TEST_NATIVE_ENV_LOG'):
     Path(os.environ['TEST_NATIVE_ENV_LOG']).write_text(json.dumps({
-        'MC_SPINE_LAUNCHER_ACCESS_TOKEN': os.environ.get('MC_SPINE_LAUNCHER_ACCESS_TOKEN'),
-        'MC_SPINE_TOKEN_ENV': os.environ.get('MC_SPINE_TOKEN_ENV'),
-        'MC_SPINE_HANDOFF_JSON': os.environ.get('MC_SPINE_HANDOFF_JSON'),
+        'MEGU_LAUNCHER_ACCESS_TOKEN': os.environ.get('MEGU_LAUNCHER_ACCESS_TOKEN'),
+        'MEGU_TOKEN_ENV': os.environ.get('MEGU_TOKEN_ENV'),
+        'MEGU_HANDOFF_JSON': os.environ.get('MEGU_HANDOFF_JSON'),
     }))
 time.sleep(float(os.environ.get('TEST_NATIVE_SLEEP', '0')))
 sys.exit(int(os.environ.get('TEST_NATIVE_EXIT', '0')))
@@ -70,18 +70,18 @@ def stop(*_):
     sys.exit(0)
 
 signal.signal(signal.SIGTERM, stop)
-host = os.environ['MC_SPINE_BIND_ADDR']
-port = int(os.environ['MC_SPINE_PORT'])
+host = os.environ['MEGU_BIND_ADDR']
+port = int(os.environ['MEGU_PORT'])
 with socket.socket() as listener:
     time.sleep(0.2)
     listener.bind((host, port))
     listener.listen()
     Path('server.json').write_text(json.dumps({
         'pid': os.getpid(), 'port': port, 'bind': host, 'cwd': os.getcwd(),
-        'world': os.environ['MC_SPINE_WORLD_DIR'],
-        'rcon': os.environ.get('MC_SPINE_RCON_PORT'),
+        'world': os.environ['MEGU_WORLD_DIR'],
+        'rcon': os.environ.get('MEGU_RCON_PORT'),
     }))
-    print(f'mc-spine stub listening {host}:{port} (test)', flush=True)
+    print(f'megu stub listening {host}:{port} (test)', flush=True)
     while True:
         conn, _ = listener.accept()
         conn.close()
@@ -100,15 +100,15 @@ with socket.socket() as listener:
     def invocation(self, *args, extra_env=None):
         log = self.root / (self.id().replace(".", "_") + ".json")
         log.unlink(missing_ok=True)
-        env = dict(os.environ, MC_SPINE_CLIENT_BIN=str(self.stub), TEST_NATIVE_LOG=str(log))
-        env.pop("MC_SPINE_DETACH", None)
-        env.pop("MC_SPINE_HANDOFF_MANIFEST", None)
-        env.pop("MC_SPINE_HANDOFF_FILE", None)
+        env = dict(os.environ, MEGU_CLIENT_BIN=str(self.stub), TEST_NATIVE_LOG=str(log))
+        env.pop("MEGU_DETACH", None)
+        env.pop("MEGU_HANDOFF_MANIFEST", None)
+        env.pop("MEGU_HANDOFF_FILE", None)
         if extra_env:
             env.update(extra_env)
         # In detach mode the native child inherits stderr, so capturing that
         # pipe would make subprocess.run wait for the child after Java exits.
-        stderr = subprocess.DEVNULL if "--mc-spine-detach" in args else subprocess.PIPE
+        stderr = subprocess.DEVNULL if "--megu-detach" in args else subprocess.PIPE
         result = subprocess.run(args, env=env, stdout=subprocess.DEVNULL,
                                 stderr=stderr, text=True, timeout=20)
         return result, log
@@ -116,14 +116,14 @@ with socket.socket() as listener:
     def java(self, *args, extra_env=None):
         return self.invocation("java", "-Djava.io.tmpdir=" + tempfile.gettempdir(),
                                "-XX:-UsePerfData",
-                               "-jar", str(self.jar_dir / "mc-spine-bootstrapper.jar"),
+                               "-jar", str(self.jar_dir / "megu-bootstrapper.jar"),
                                *args, extra_env=extra_env)
 
     def integrated_fixture(self):
         game = self.root / self._testMethodName / "game with spaces"
-        env = {"MC_SPINE_SERVER_BIN": str(self.server), "MC_SPINE_RCON_PORT": "25575",
-               "MC_SPINE_INTEGRATED_WORLD": "Loopback World", "TEST_INTEGRATED_CONNECT": "1"}
-        return game, game / "saves" / env["MC_SPINE_INTEGRATED_WORLD"], env
+        env = {"MEGU_SERVER_BIN": str(self.server), "MEGU_RCON_PORT": "25575",
+               "MEGU_INTEGRATED_WORLD": "Loopback World", "TEST_INTEGRATED_CONNECT": "1"}
+        return game, game / "saves" / env["MEGU_INTEGRATED_WORLD"], env
 
     def assert_server_stopped(self, world):
         info = json.loads((world / "server.json").read_text())
@@ -140,20 +140,20 @@ with socket.socket() as listener:
     def test_jar_reproducible_and_profile_installable(self):
         other = self.root / "profile-two"
         self.generate(other, "--build-jar", "--client-bin", str(self.stub))
-        first = self.jar_dir / "mc-spine-bootstrapper.jar"
-        second = other / "mc-spine-bootstrapper.jar"
+        first = self.jar_dir / "megu-bootstrapper.jar"
+        second = other / "megu-bootstrapper.jar"
         self.assertLess(first.stat().st_size, 32 * 1024)
         self.assertEqual(first.read_bytes(), second.read_bytes())
-        version = other / "versions/mc-spine-1.21.1/mc-spine-1.21.1.json"
+        version = other / "versions/megu-1.21.1/megu-1.21.1.json"
         profile = json.loads(version.read_text())
-        self.assertEqual(profile["mainClass"], "net.mcspine.launcher.Main")
+        self.assertEqual(profile["mainClass"], "net.megu.launcher.Main")
         self.assertEqual(profile["inheritsFrom"], "1.21.1")
-        self.assertEqual(profile["id"], "mc-spine-1.21.1")
-        self.assertEqual(profile["libraries"], [{"name": "net.mcspine:bootstrapper:1.0.0"}])
-        library = other / "libraries/net/mcspine/bootstrapper/1.0.0/bootstrapper-1.0.0.jar"
+        self.assertEqual(profile["id"], "megu-1.21.1")
+        self.assertEqual(profile["libraries"], [{"name": "net.megu:bootstrapper:1.0.0"}])
+        library = other / "libraries/net/megu/bootstrapper/1.0.0/bootstrapper-1.0.0.jar"
         self.assertEqual(library.read_bytes(), second.read_bytes())
         self.assertEqual(profile["arguments"]["jvm"],
-                         [f"-Dmc.spine.clientBin={self.stub.resolve()}"])
+                         [f"-Dmegu.clientBin={self.stub.resolve()}"])
 
     def test_game_arguments_preserved_verbatim_and_exit_code(self):
         args = ("--username", "Steve", "--uuid", "00000000-0000-0000-0000-000000000001",
@@ -164,13 +164,13 @@ with socket.socket() as listener:
                 "--port", "25565", "--unknownFlag", "value with spaces")
         manifest = self.root / "handoff.json"
         env_log = self.root / "handoff-env.json"
-        result, log = self.java(*args, extra_env={"MC_SPINE_HANDOFF_MANIFEST": str(manifest),
+        result, log = self.java(*args, extra_env={"MEGU_HANDOFF_MANIFEST": str(manifest),
                                                   "TEST_NATIVE_ENV_LOG": str(env_log),
                                                   "TEST_NATIVE_EXIT": "37"})
         self.assertEqual(result.returncode, 37, result.stderr)
         self.assertEqual(json.loads(log.read_text()), list(args))
         self.assertFalse(manifest.exists())
-        handoff = json.loads(json.loads(env_log.read_text())["MC_SPINE_HANDOFF_JSON"])
+        handoff = json.loads(json.loads(env_log.read_text())["MEGU_HANDOFF_JSON"])
         self.assertEqual(handoff["mode"], "wait")
         self.assertEqual(handoff["argumentCount"], len(args))
         self.assertNotIn("private-secret", json.dumps(handoff))
@@ -178,11 +178,11 @@ with socket.socket() as listener:
     def test_handoff_manifest_file_requires_explicit_legacy_flag(self):
         args = ("--username", "Steve", "--port", "25565")
         manifest = self.root / "legacy-handoff.json"
-        result, _ = self.java(*args, extra_env={"MC_SPINE_HANDOFF_MANIFEST": str(manifest)})
+        result, _ = self.java(*args, extra_env={"MEGU_HANDOFF_MANIFEST": str(manifest)})
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertFalse(manifest.exists())
-        result, _ = self.java("--mc-spine-handoff-file", *args,
-                              extra_env={"MC_SPINE_HANDOFF_MANIFEST": str(manifest)})
+        result, _ = self.java("--megu-handoff-file", *args,
+                              extra_env={"MEGU_HANDOFF_MANIFEST": str(manifest)})
         self.assertEqual(result.returncode, 0, result.stderr)
         summary = json.loads(manifest.read_text())
         self.assertEqual(summary["mode"], "wait")
@@ -190,7 +190,7 @@ with socket.socket() as listener:
         self.assertGreater(summary["pid"], 0)
         manifest.unlink()
         cli_manifest = self.root / "cli-handoff.json"
-        result, _ = self.java(f"--mc-spine-handoff-manifest={cli_manifest}", *args)
+        result, _ = self.java(f"--megu-handoff-manifest={cli_manifest}", *args)
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(json.loads(cli_manifest.read_text())["mode"], "wait")
 
@@ -199,28 +199,28 @@ with socket.socket() as listener:
         game.mkdir()
         env_log = self.root / "handoff-zero-env.json"
         watched = [game, Path(tempfile.gettempdir())]
-        before = {d: set(d.glob(".mc-spine-handoff-*")) for d in watched}
+        before = {d: set(d.glob(".megu-handoff-*")) for d in watched}
         result, log = self.java("--username", "Steve", "--gameDir", str(game),
                                 "--accessToken", "private-secret",
                                 extra_env={"TEST_NATIVE_ENV_LOG": str(env_log),
-                                           "MC_SPINE_HANDOFF_MANIFEST": str(game / "handoff.json"),
-                                           "MC_SPINE_HANDOFF_FILE": ""})
+                                           "MEGU_HANDOFF_MANIFEST": str(game / "handoff.json"),
+                                           "MEGU_HANDOFF_FILE": ""})
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(json.loads(log.read_text()),
                          ["--username", "Steve", "--gameDir", str(game),
                           "--accessToken", "private-secret"])
         for directory in watched:
-            self.assertEqual(before[directory], set(directory.glob(".mc-spine-handoff-*")),
-                             f"unexpected .mc-spine-handoff-* files in {directory}")
+            self.assertEqual(before[directory], set(directory.glob(".megu-handoff-*")),
+                             f"unexpected .megu-handoff-* files in {directory}")
         self.assertFalse((game / "handoff.json").exists())
-        handoff = json.loads(json.loads(env_log.read_text())["MC_SPINE_HANDOFF_JSON"])
+        handoff = json.loads(json.loads(env_log.read_text())["MEGU_HANDOFF_JSON"])
         self.assertEqual(handoff["mode"], "wait")
         self.assertEqual(handoff["argumentCount"], 6)
         self.assertNotIn("private-secret", json.dumps(handoff))
 
     def test_detach_does_not_wait_and_removes_only_private_flag(self):
         started = time.monotonic()
-        result, log = self.java("--username", "Steve", "--mc-spine-detach", "--port", "25565",
+        result, log = self.java("--username", "Steve", "--megu-detach", "--port", "25565",
                                 extra_env={"TEST_NATIVE_SLEEP": "2.0"})
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertLess(time.monotonic() - started, 1.5)
@@ -231,7 +231,7 @@ with socket.socket() as listener:
         self.assertEqual(json.loads(log.read_text()), ["--username", "Steve", "--port", "25565"])
 
     def test_detach_environment(self):
-        result, log = self.java("--uuid", "xyz", extra_env={"MC_SPINE_DETACH": "1"})
+        result, log = self.java("--uuid", "xyz", extra_env={"MEGU_DETACH": "1"})
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(json.loads(log.read_text()), ["--uuid", "xyz"])
 
@@ -239,17 +239,17 @@ with socket.socket() as listener:
         folder = self.root / "game with spaces" / "bin"
         folder.mkdir(parents=True)
         import shutil
-        shutil.copyfile(self.stub, folder / "mc-spine-client")
-        (folder / "mc-spine-client").chmod(0o755)
+        shutil.copyfile(self.stub, folder / "megu-client")
+        (folder / "megu-client").chmod(0o755)
         result, log = self.java("--gameDir", str(folder.parent), "--username", "Alex",
-                                extra_env={"MC_SPINE_CLIENT_BIN": ""})
+                                extra_env={"MEGU_CLIENT_BIN": ""})
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(json.loads(log.read_text()), ["--gameDir", str(folder.parent),
                                                       "--username", "Alex"])
 
     def test_missing_native_binary_has_exit_code_two(self):
         result, _ = self.java("--username", "Steve",
-                              extra_env={"MC_SPINE_CLIENT_BIN": str(self.root / "absent")})
+                              extra_env={"MEGU_CLIENT_BIN": str(self.root / "absent")})
         self.assertEqual(result.returncode, 2)
         self.assertIn("not found", result.stderr)
 
@@ -257,9 +257,9 @@ with socket.socket() as listener:
         game, world, env = self.integrated_fixture()
         manifest = game / "handoff.json"
         env_log = game.parent / "handoff-env.json"
-        env.update(MC_SPINE_HANDOFF_MANIFEST=str(manifest), TEST_NATIVE_EXIT="37",
+        env.update(MEGU_HANDOFF_MANIFEST=str(manifest), TEST_NATIVE_EXIT="37",
                    TEST_NATIVE_ENV_LOG=str(env_log))
-        result, log = self.java("--mc-spine-handoff-file", "--mc-spine-integrated",
+        result, log = self.java("--megu-handoff-file", "--megu-integrated",
                                 "--gameDir", str(game),
                                 "--quickPlaySingleplayer=stale", "--quickPlayMultiplayer",
                                 "example.invalid:25565", "--accessToken", "private-secret",
@@ -273,7 +273,7 @@ with socket.socket() as listener:
         self.assertEqual(summary["endpoint"], endpoint)
         self.assertEqual(summary["mode"], "integrated")
         self.assertNotIn("private-secret", manifest.read_text())
-        handoff = json.loads(json.loads(env_log.read_text())["MC_SPINE_HANDOFF_JSON"])
+        handoff = json.loads(json.loads(env_log.read_text())["MEGU_HANDOFF_JSON"])
         self.assertEqual(handoff["mode"], "integrated")
         self.assertEqual(handoff["endpoint"], endpoint)
         self.assertEqual(handoff["argumentCount"], 6)
@@ -285,8 +285,8 @@ with socket.socket() as listener:
         game.parent.mkdir()
         broken.write_text("#!/nonexistent/interpreter\n")
         broken.chmod(0o755)
-        env["MC_SPINE_CLIENT_BIN"] = str(broken)
-        result, log = self.java("--mc-spine-integrated", f"--gameDir={game}", extra_env=env)
+        env["MEGU_CLIENT_BIN"] = str(broken)
+        result, log = self.java("--megu-integrated", f"--gameDir={game}", extra_env=env)
         self.assertEqual(result.returncode, 2, result.stderr)
         self.assertIn("broken-client", result.stderr)
         self.assertFalse(log.exists())
@@ -303,7 +303,7 @@ with socket.socket() as listener:
         endpoint = self.assert_server_stopped(world)
         self.assertEqual(json.loads(log.read_text()),
                          ["--username", "Alex", "--quickPlayMultiplayer", endpoint])
-        handoff = json.loads(json.loads(env_log.read_text())["MC_SPINE_HANDOFF_JSON"])
+        handoff = json.loads(json.loads(env_log.read_text())["MEGU_HANDOFF_JSON"])
         self.assertEqual(handoff["mode"], "integrated")
         self.assertEqual(handoff["endpoint"], endpoint)
         self.assertEqual(handoff["argumentCount"], 4)
@@ -311,12 +311,12 @@ with socket.socket() as listener:
     def test_integrated_stops_when_java_wrapper_exits_abruptly(self):
         game, world, env = self.integrated_fixture()
         client_log = game.parent / "client.json"
-        env = dict(os.environ, **env, MC_SPINE_CLIENT_BIN=str(self.stub),
-                   TEST_NATIVE_LOG=str(client_log), TEST_NATIVE_SLEEP="30", MC_SPINE_DETACH="0")
-        env.pop("MC_SPINE_HANDOFF_MANIFEST", None)
+        env = dict(os.environ, **env, MEGU_CLIENT_BIN=str(self.stub),
+                   TEST_NATIVE_LOG=str(client_log), TEST_NATIVE_SLEEP="30", MEGU_DETACH="0")
+        env.pop("MEGU_HANDOFF_MANIFEST", None)
         command = ["java", "-Djava.io.tmpdir=" + tempfile.gettempdir(), "-XX:-UsePerfData", "-jar",
-                   str(self.jar_dir / "mc-spine-bootstrapper.jar"),
-                   "--mc-spine-integrated", "--gameDir", str(game)]
+                   str(self.jar_dir / "megu-bootstrapper.jar"),
+                   "--megu-integrated", "--gameDir", str(game)]
         with subprocess.Popen(command, env=env, stdout=subprocess.DEVNULL,
                               stderr=subprocess.DEVNULL) as java:
             try:
@@ -339,7 +339,7 @@ with socket.socket() as listener:
         self.assert_server_stopped(world)
 
     def test_wrapper_removes_jvm_arguments_and_execs_native(self):
-        wrapper = str(TOOLS / "mc-spine-wrapper")
+        wrapper = str(TOOLS / "megu-wrapper")
         args = ("--username", "Steve", "--uuid", "0-1-2", "--unknown", "as-is")
         result, log = self.invocation(wrapper, "/usr/bin/java", "-Xmx4G", "-Dfoo=bar",
                                       "-cp", "a.jar:b.jar", "--add-opens",
@@ -349,22 +349,22 @@ with socket.socket() as listener:
         self.assertEqual(json.loads(log.read_text()), list(args))
 
     def test_wrapper_jar_mode_and_native_exit_code(self):
-        result, log = self.invocation(str(TOOLS / "mc-spine-wrapper"), "java", "-Xms1G",
+        result, log = self.invocation(str(TOOLS / "megu-wrapper"), "java", "-Xms1G",
                                       "-jar", "minecraft.jar", "--username", "Alex",
                                       extra_env={"TEST_NATIVE_EXIT": "9"})
         self.assertEqual(result.returncode, 9, result.stderr)
         self.assertEqual(json.loads(log.read_text()), ["--username", "Alex"])
 
     def test_java_integrated_real_server_and_native_protocol_handshake(self):
-        server = ROOT / "target/debug/mc-spine"
+        server = ROOT / "target/debug/megu"
         if not server.is_file():
             self.skipTest("cargo build --offline --locked required for real protocol handshake")
         game = self.root / "cf4-real-integrated" / "game"
         game.mkdir(parents=True)
-        env = {"MC_SPINE_SERVER_BIN": str(server), "MC_SPINE_SERVER_HOME": str(ROOT),
+        env = {"MEGU_SERVER_BIN": str(server), "MEGU_SERVER_HOME": str(ROOT),
                "TEST_INTEGRATED_CONNECT": "1", "TEST_INTEGRATED_PROTOCOL": "1",
                "TEST_WIRE_MODULE": str(ROOT / "tests")}
-        result, log = self.java("--mc-spine-integrated", "--gameDir", str(game),
+        result, log = self.java("--megu-integrated", "--gameDir", str(game),
                                 "--username", "Steve", "--accessToken", "super-secret-token",
                                 "--version", "1.21.1", "--assetIndex", "17", extra_env=env)
         self.assertEqual(result.returncode, 0, result.stderr)
@@ -372,7 +372,7 @@ with socket.socket() as listener:
         args = json.loads(log.read_text())
         self.assertIn("--quickPlayMultiplayer", args)
         self.assertEqual(args[args.index("--accessToken") + 1], "super-secret-token")
-        world = game / "saves/mc-spine"
+        world = game / "saves/megu"
         self.assertTrue((world / "config_packets.bin").is_symlink())
         self.assertTrue((world / "assets").is_symlink())
 
@@ -407,11 +407,11 @@ with socket.socket() as listener:
         result, log = self.invocation(
             "/usr/lib/jvm/java-21-openjdk/bin/java",
             "-Djava.io.tmpdir=" + tempfile.gettempdir(),
-            "-Dmc.spine.clientSha256=" + valid_sha256,
+            "-Dmegu.clientSha256=" + valid_sha256,
             "-XX:-UsePerfData", "-jar",
-            str(self.jar_dir / "mc-spine-bootstrapper.jar"),
+            str(self.jar_dir / "megu-bootstrapper.jar"),
             "--accessToken", "super-secret-token",
-            extra_env={"MC_SPINE_CLIENT_SHA256": "0" * 64})
+            extra_env={"MEGU_CLIENT_SHA256": "0" * 64})
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertNotIn("super-secret-token", result.stderr or "")
         self.assertTrue(log.exists())
@@ -419,11 +419,11 @@ with socket.socket() as listener:
         result, log = self.invocation(
             "/usr/lib/jvm/java-21-openjdk/bin/java",
             "-Djava.io.tmpdir=" + tempfile.gettempdir(),
-            "-Dmc.spine.clientSha256=" + "0" * 64,
+            "-Dmegu.clientSha256=" + "0" * 64,
             "-XX:-UsePerfData", "-jar",
-            str(self.jar_dir / "mc-spine-bootstrapper.jar"),
+            str(self.jar_dir / "megu-bootstrapper.jar"),
             "--accessToken", "super-secret-token",
-            extra_env={"MC_SPINE_CLIENT_SHA256": valid_sha256})
+            extra_env={"MEGU_CLIENT_SHA256": valid_sha256})
         self.assertEqual(result.returncode, 2)
         self.assertIn("SHA-256 mismatch", result.stderr)
         self.assertNotIn("super-secret-token", result.stderr)
@@ -433,8 +433,8 @@ with socket.socket() as listener:
         import shutil
         cases = []
         for index, (rel, name) in enumerate((
-                ("", "mc-spine-client.exe"), ("bin", "megu.exe"),
-                ("bin", "mc-spine-client-gpu.exe"), ("", "megu.exe"))):
+                ("", "megu-client.exe"), ("bin", "megu.exe"),
+                ("bin", "megu-client-gpu.exe"), ("", "megu.exe"))):
             folder = self.root / f"exe-game-{index}" / ("gamedir with spaces" if index % 2 else "gamedir")
             target = folder / rel / name if rel else folder / name
             target.parent.mkdir(parents=True, exist_ok=True)
@@ -444,17 +444,17 @@ with socket.socket() as listener:
         for folder, target in cases:
             with self.subTest(binary=target.name):
                 result, log = self.java("--gameDir", str(folder), "--username", "Steve",
-                                        extra_env={"MC_SPINE_CLIENT_BIN": ""})
+                                        extra_env={"MEGU_CLIENT_BIN": ""})
                 self.assertEqual(result.returncode, 0, result.stderr)
                 self.assertEqual(json.loads(log.read_text()),
                                  ["--gameDir", str(folder), "--username", "Steve"])
         bindir = self.root / "exe-path-bin"
         bindir.mkdir()
-        shutil.copyfile(self.stub, bindir / "mc-spine.exe")
-        (bindir / "mc-spine.exe").chmod(0o755)
+        shutil.copyfile(self.stub, bindir / "megu.exe")
+        (bindir / "megu.exe").chmod(0o755)
         env_path = str(bindir) + os.pathsep + os.environ.get("PATH", "")
         result, log = self.java("--username", "PATHUser",
-                                extra_env={"MC_SPINE_CLIENT_BIN": "", "PATH": env_path})
+                                extra_env={"MEGU_CLIENT_BIN": "", "PATH": env_path})
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(json.loads(log.read_text()), ["--username", "PATHUser"])
 
@@ -462,27 +462,27 @@ with socket.socket() as listener:
         env_log = self.root / "token-env.json"
         extra = {"TEST_NATIVE_ENV_LOG": str(env_log)}
         for label, token_args, env_extra in (
-                ("flag-space", ("--accessToken", "flag-secret-token"), {"MC_SPINE_TOKEN_ENV": ""}),
-                ("flag-equals", ("--accessToken=equals-secret-token",), {"MC_SPINE_TOKEN_ENV": ""}),
-                ("env-var", ("--accessToken", "envvar-secret-token"), {"MC_SPINE_TOKEN_ENV": "1"})):
+                ("flag-space", ("--accessToken", "flag-secret-token"), {"MEGU_TOKEN_ENV": ""}),
+                ("flag-equals", ("--accessToken=equals-secret-token",), {"MEGU_TOKEN_ENV": ""}),
+                ("env-var", ("--accessToken", "envvar-secret-token"), {"MEGU_TOKEN_ENV": "1"})):
             with self.subTest(mode=label):
                 env_log.unlink(missing_ok=True)
                 args = ["--username", "Steve", "--uuid", "u-1", *token_args,
                         "--gameDir", "/tmp/game dir", "--assetsDir", "/tmp/äöü assets",
                         "--assetIndex", "26.3"]
                 if label != "env-var":
-                    args.insert(0, "--mc-spine-token-env")
+                    args.insert(0, "--megu-token-env")
                 result, log = self.java(*args, extra_env={**extra, **env_extra})
                 self.assertEqual(result.returncode, 0, result.stderr)
                 forwarded = json.loads(log.read_text())
                 self.assertNotIn("--accessToken", forwarded)
-                self.assertNotIn("--mc-spine-token-env", forwarded)
+                self.assertNotIn("--megu-token-env", forwarded)
                 self.assertEqual(forwarded, ["--username", "Steve", "--uuid", "u-1",
                                              "--gameDir", "/tmp/game dir",
                                              "--assetsDir", "/tmp/äöü assets",
                                              "--assetIndex", "26.3"])
                 seen = json.loads(env_log.read_text())
-                self.assertEqual(seen["MC_SPINE_LAUNCHER_ACCESS_TOKEN"],
+                self.assertEqual(seen["MEGU_LAUNCHER_ACCESS_TOKEN"],
                                  {"flag-space": "flag-secret-token",
                                   "flag-equals": "equals-secret-token",
                                   "env-var": "envvar-secret-token"}[label])
@@ -492,11 +492,11 @@ with socket.socket() as listener:
         env_log = self.root / "token-env-default.json"
         result, log = self.java("--username", "Steve", "--accessToken", "argv-secret-token",
                                 extra_env={"TEST_NATIVE_ENV_LOG": str(env_log),
-                                           "MC_SPINE_TOKEN_ENV": ""})
+                                           "MEGU_TOKEN_ENV": ""})
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(json.loads(log.read_text()),
                          ["--username", "Steve", "--accessToken", "argv-secret-token"])
-        self.assertIsNone(json.loads(env_log.read_text())["MC_SPINE_LAUNCHER_ACCESS_TOKEN"])
+        self.assertIsNone(json.loads(env_log.read_text())["MEGU_LAUNCHER_ACCESS_TOKEN"])
 
     def test_launcher_forwards_unicode_and_spaced_arguments_verbatim(self):
         game = self.root / "unicode ゲーム dir" / "saves/ワールド"
@@ -511,11 +511,11 @@ with socket.socket() as listener:
     def test_mc_version_263_profile_and_detect_minecraft_dir(self):
         profile_dir = self.root / "profile-263"
         self.generate(profile_dir, "--mc-version", "26.3")
-        version = profile_dir / "versions/mc-spine-26.3/mc-spine-26.3.json"
+        version = profile_dir / "versions/megu-26.3/megu-26.3.json"
         profile = json.loads(version.read_text())
         self.assertEqual(profile["inheritsFrom"], "26.3")
-        self.assertEqual(profile["id"], "mc-spine-26.3")
-        self.assertEqual(profile["mainClass"], "net.mcspine.launcher.Main")
+        self.assertEqual(profile["id"], "megu-26.3")
+        self.assertEqual(profile["mainClass"], "net.megu.launcher.Main")
         custom = self.root / "profile-custom-id"
         self.generate(custom, "--mc-version", "26.3", "--version-id", "megu-custom")
         self.assertEqual(json.loads(
@@ -539,7 +539,7 @@ with socket.socket() as listener:
 class CF4ExportTest(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
-        cls.temporary = tempfile.TemporaryDirectory(prefix="mc-spine-cf4-export-")
+        cls.temporary = tempfile.TemporaryDirectory(prefix="megu-cf4-export-")
         cls.addClassCleanup(cls.temporary.cleanup)
         cls.root = Path(cls.temporary.name)
         cls.native = cls.root / "fake native"
@@ -551,7 +551,7 @@ from pathlib import Path
 Path(os.environ['TEST_NATIVE_LOG']).write_text(json.dumps(sys.argv[1:]))
 ''')
         cls.native.chmod(0o755)
-        cls.integrated = cls.root / "mc-spine-integrated.jar"
+        cls.integrated = cls.root / "megu-integrated.jar"
         subprocess.run([sys.executable, str(TOOLS / "build_integrated_mod.py"),
                         "--out-dir", str(cls.root)], check=True, capture_output=True)
 
@@ -579,15 +579,15 @@ Path(os.environ['TEST_NATIVE_LOG']).write_text(json.dumps(sys.argv[1:]))
         config.read(output / "instance.cfg")
         self.assertEqual(config["General"]["OverrideCommands"], "true")
         command = shlex.split(config["General"]["WrapperCommand"])
-        self.assertEqual(command[0], str((output / "mc-spine-wrapper").resolve()))
+        self.assertEqual(command[0], str((output / "megu-wrapper").resolve()))
         self.assertTrue(os.access(command[0], os.X_OK))
         self.assertEqual(command[1:], ["--client-sha256",
                                        hashlib.sha256(self.native.read_bytes()).hexdigest()])
-        self.assertEqual((output / ".minecraft/mods/mc-spine-integrated.jar").read_bytes(),
+        self.assertEqual((output / ".minecraft/mods/megu-integrated.jar").read_bytes(),
                          self.integrated.read_bytes())
         log = self.root / "prism-native.json"
         env = dict(os.environ, TEST_NATIVE_LOG=str(log))
-        env.pop("MC_SPINE_CLIENT_BIN", None)
+        env.pop("MEGU_CLIENT_BIN", None)
         result = subprocess.run([*command, "/usr/lib/jvm/java-21-openjdk/bin/java", "-Xmx2G",
                                  "-cp", "minecraft.jar", "net.minecraft.client.main.Main",
                                  "--username", "Steve", "--uuid", "test-uuid", "--accessToken",
@@ -606,20 +606,20 @@ Path(os.environ['TEST_NATIVE_LOG']).write_text(json.dumps(sys.argv[1:]))
         first, second = self.root / "mrpack-one", self.root / "mrpack-two"
         self.export(first, *arguments)
         self.export(second, *arguments)
-        name = "mc-spine-1.21.1.mrpack"
+        name = "megu-1.21.1.mrpack"
         self.assertEqual((first / name).read_bytes(), (second / name).read_bytes())
         with zipfile.ZipFile(first / name) as archive:
             self.assertEqual(archive.namelist(), ["modrinth.index.json",
-                             "overrides/mods/mc-spine-integrated.jar"])
+                             "overrides/mods/megu-integrated.jar"])
             index = json.loads(archive.read("modrinth.index.json"))
             self.assertEqual(index["formatVersion"], 1)
             self.assertEqual(index["game"], "minecraft")
             self.assertEqual(index["dependencies"], {"minecraft": "1.21.1",
                                                        "neoforge": "21.1.215"})
             self.assertEqual(index["files"], [])
-            contents = archive.read("overrides/mods/mc-spine-integrated.jar")
+            contents = archive.read("overrides/mods/megu-integrated.jar")
             self.assertEqual(contents, self.integrated.read_bytes())
-            meta = index["mcSpine"]["bundledOverrides"]["mods/mc-spine-integrated.jar"]
+            meta = index["megu"]["bundledOverrides"]["mods/megu-integrated.jar"]
             self.assertEqual(meta["fileSize"], len(contents))
             self.assertEqual(meta["hashes"], {
                 "sha1": hashlib.sha1(contents).hexdigest(),
@@ -630,8 +630,8 @@ Path(os.environ['TEST_NATIVE_LOG']).write_text(json.dumps(sys.argv[1:]))
                 self.assertEqual(item.create_system, 3)
 
     def test_wrapper_and_exporter_fail_closed(self):
-        wrapper = str(TOOLS / "mc-spine-wrapper")
-        env = dict(os.environ, MC_SPINE_CLIENT_BIN=str(self.root / "missing"))
+        wrapper = str(TOOLS / "megu-wrapper")
+        env = dict(os.environ, MEGU_CLIENT_BIN=str(self.root / "missing"))
         test_args = ["java", "-jar", "minecraft.jar", "--accessToken", "super-secret-token"]
         for commands, reason in (
             ([wrapper, *test_args], "not found"),
@@ -652,19 +652,19 @@ Path(os.environ['TEST_NATIVE_LOG']).write_text(json.dumps(sys.argv[1:]))
         self.assertNotEqual(missing_loader.returncode, 0)
 
     def test_optional_mesh_library_abi_and_packaging(self):
-        mesh = ROOT / "client-port/target/release/libmc_spine_client_mesh.so"
+        mesh = ROOT / "client-port/target/release/libmegu_client_mesh.so"
         if not mesh.is_file():
             self.skipTest("build client-port release cdylib to test ABI packaging")
         output = self.root / "mesh-bundle"
         self.export(output, "--format", "all", "--loader", "fabric",
                     "--loader-version", "0.16.10", "--integrated-jar",
                     str(self.integrated), "--mesh-library", str(mesh))
-        self.assertEqual((output / "prism/native/libmc_spine_client_mesh.so").read_bytes(),
+        self.assertEqual((output / "prism/native/libmegu_client_mesh.so").read_bytes(),
                          mesh.read_bytes())
-        with zipfile.ZipFile(output / "mc-spine-1.21.1.mrpack") as archive:
-            content = archive.read("overrides/mc-spine/native/libmc_spine_client_mesh.so")
+        with zipfile.ZipFile(output / "megu-1.21.1.mrpack") as archive:
+            content = archive.read("overrides/megu/native/libmegu_client_mesh.so")
             index = json.loads(archive.read("modrinth.index.json"))
-            expected = index["mcSpine"]["bundledOverrides"]["mc-spine/native/libmc_spine_client_mesh.so"]
+            expected = index["megu"]["bundledOverrides"]["megu/native/libmegu_client_mesh.so"]
             self.assertEqual(expected["hashes"]["sha512"], hashlib.sha512(content).hexdigest())
             self.assertEqual(content, mesh.read_bytes())
         invalid_lib = self.root / "not-a-library.so"
@@ -672,7 +672,7 @@ Path(os.environ['TEST_NATIVE_LOG']).write_text(json.dumps(sys.argv[1:]))
         invalid = self.export(self.root / "invalid-mesh", "--format", "prism",
                               "--mesh-library", str(invalid_lib), check=False)
         self.assertNotEqual(invalid.returncode, 0)
-        self.assertIn("mc_spine_mesh_abi_version", invalid.stderr)
+        self.assertIn("megu_mesh_abi_version", invalid.stderr)
 
 
     def test_optional_kernel_library_abi_and_packaging(self):
@@ -690,16 +690,16 @@ Path(os.environ['TEST_NATIVE_LOG']).write_text(json.dumps(sys.argv[1:]))
                                     for path in first.rglob("*") if path.is_file()})
         for name, library in ((KERNEL_LIB_NAME, kernel), (MESH_LIB_NAME, mesh)):
             self.assertEqual((first / "prism/native" / name).read_bytes(), library.read_bytes())
-        with zipfile.ZipFile(first / "mc-spine-1.21.1.mrpack") as archive:
+        with zipfile.ZipFile(first / "megu-1.21.1.mrpack") as archive:
             self.assertEqual(archive.namelist(), [
                 "modrinth.index.json",
-                f"overrides/mc-spine/native/{MESH_LIB_NAME}",
-                f"overrides/mc-spine/native/{KERNEL_LIB_NAME}",
-                "overrides/mods/mc-spine-integrated.jar"])
+                f"overrides/megu/native/{MESH_LIB_NAME}",
+                f"overrides/megu/native/{KERNEL_LIB_NAME}",
+                "overrides/mods/megu-integrated.jar"])
             index = json.loads(archive.read("modrinth.index.json"))
-            content = archive.read(f"overrides/mc-spine/native/{KERNEL_LIB_NAME}")
+            content = archive.read(f"overrides/megu/native/{KERNEL_LIB_NAME}")
             self.assertEqual(content, kernel.read_bytes())
-            meta = index["mcSpine"]["bundledOverrides"][f"mc-spine/native/{KERNEL_LIB_NAME}"]
+            meta = index["megu"]["bundledOverrides"][f"megu/native/{KERNEL_LIB_NAME}"]
             self.assertEqual(meta["fileSize"], len(content))
             self.assertEqual(meta["hashes"], {"sha1": hashlib.sha1(content).hexdigest(),
                                               "sha512": hashlib.sha512(content).hexdigest()})
@@ -710,15 +710,15 @@ Path(os.environ['TEST_NATIVE_LOG']).write_text(json.dumps(sys.argv[1:]))
     def test_kernel_library_fails_closed(self):
         fixtures = self.root / "kernel-fixtures"
         wrong_abi = compile_c_library(fixtures / "abi", KERNEL_LIB_NAME,
-                                      "unsigned mc_spine_kernel_abi_version(void) { return 2; }\n")
+                                      "unsigned megu_kernel_abi_version(void) { return 2; }\n")
         no_symbol = compile_c_library(fixtures / "symbol", KERNEL_LIB_NAME,
-                                      "unsigned mc_spine_mesh_abi_version(void) { return 1; }\n")
+                                      "unsigned megu_mesh_abi_version(void) { return 1; }\n")
         junk = fixtures / "junk.so"
         junk.write_bytes(b"missing ABI")
         for index, (library, reason) in enumerate((
                 (wrong_abi, "unsupported kernel C ABI version 2, expected 1"),
-                (no_symbol, "mc_spine_kernel_abi_version"),
-                (junk, "mc_spine_kernel_abi_version"),
+                (no_symbol, "megu_kernel_abi_version"),
+                (junk, "megu_kernel_abi_version"),
                 (fixtures / "absent.so", "kernel library is missing"))):
             with self.subTest(reason=reason):
                 for fmt in ("prism", "mrpack"):
@@ -736,7 +736,7 @@ Path(os.environ['TEST_NATIVE_LOG']).write_text(json.dumps(sys.argv[1:]))
         subprocess.run([sys.executable, str(TOOLS / "gen_launcher_profile.py"),
                         "--out-dir", str(destination), "--build-jar"],
                        check=True, capture_output=True)
-        jar = destination / "mc-spine-bootstrapper.jar"
+        jar = destination / "megu-bootstrapper.jar"
         self.assertLess(jar.stat().st_size, 32 * 1024)
         return jar
 
@@ -749,19 +749,19 @@ Path(os.environ['TEST_NATIVE_LOG']).write_text(json.dumps(sys.argv[1:]))
                          {"uid": "net.minecraft", "version": "26.3", "important": True})
         config = configparser.ConfigParser(interpolation=None)
         config.read(output / "instance.cfg")
-        self.assertIn("mc-spine 26.3", config["General"]["name"])
+        self.assertIn("megu 26.3", config["General"]["name"])
 
     def test_mrpack_mc_version_263(self):
         output = self.root / "mrpack-263"
         self.export(output, "--format", "mrpack", "--loader", "fabric",
                     "--loader-version", "0.16.10", "--mc-version", "26.3",
                     "--integrated-jar", str(self.integrated))
-        bundle = output / "mc-spine-26.3.mrpack"
+        bundle = output / "megu-26.3.mrpack"
         self.assertTrue(bundle.is_file())
         with zipfile.ZipFile(bundle) as archive:
             index = json.loads(archive.read("modrinth.index.json"))
         self.assertEqual(index["dependencies"]["minecraft"], "26.3")
-        self.assertEqual(index["name"], "mc-spine 26.3")
+        self.assertEqual(index["name"], "megu 26.3")
         self.assertIn("26.3", index["summary"])
 
     def test_prism_bootstrap_jar_native_patch_export(self):
@@ -772,15 +772,15 @@ Path(os.environ['TEST_NATIVE_LOG']).write_text(json.dumps(sys.argv[1:]))
         self.export(output, "--format", "prism", "--mc-version", "26.3",
                     "--bootstrap-jar", str(jar), "--client-bin", str(self.native),
                     "--client-sha256", digest)
-        patch = json.loads((output / "patches/net.mcspine.bootstrapper.json").read_text())
+        patch = json.loads((output / "patches/net.megu.bootstrapper.json").read_text())
         self.assertEqual(patch["formatVersion"], 1)
-        self.assertEqual(patch["uid"], "net.mcspine.bootstrapper")
-        self.assertEqual(patch["mainClass"], "net.mcspine.launcher.Main")
+        self.assertEqual(patch["uid"], "net.megu.bootstrapper")
+        self.assertEqual(patch["mainClass"], "net.megu.launcher.Main")
         self.assertEqual(patch["inheritsFrom"], "26.3")
         self.assertEqual(patch["libraries"],
-                         [{"name": "net.mcspine:bootstrapper:1.0.0", "MMC-hint": "local"}])
-        self.assertEqual(patch["+jvmArgs"], [f"-Dmc.spine.clientSha256={digest}"])
-        library = (output / "libraries/net/mcspine/bootstrapper/1.0.0/"
+                         [{"name": "net.megu:bootstrapper:1.0.0", "MMC-hint": "local"}])
+        self.assertEqual(patch["+jvmArgs"], [f"-Dmegu.clientSha256={digest}"])
+        library = (output / "libraries/net/megu/bootstrapper/1.0.0/"
                    "bootstrapper-1.0.0.jar")
         self.assertEqual(library.read_bytes(), jar.read_bytes())
         self.assertTrue((output / "mmc-pack.json").is_file())
@@ -790,17 +790,17 @@ Path(os.environ['TEST_NATIVE_LOG']).write_text(json.dumps(sys.argv[1:]))
         config.read(output / "instance.cfg")
         self.assertNotIn("WrapperCommand", config["General"])
         self.assertEqual(config["General"]["OverrideCommands"], "false")
-        bundled = output / ".minecraft/bin/mc-spine-client"
+        bundled = output / ".minecraft/bin/megu-client"
         self.assertEqual(bundled.read_bytes(), self.native.read_bytes())
         self.assertTrue(os.access(bundled, os.X_OK))
-        self.assertFalse((output / "mc-spine-wrapper").exists())
+        self.assertFalse((output / "megu-wrapper").exists())
         # Export stays reproducible.
         again = self.root / "prism bootstrap patch again"
         self.export(again, "--format", "prism", "--mc-version", "26.3",
                     "--bootstrap-jar", str(jar), "--client-bin", str(self.native),
                     "--client-sha256", digest)
-        self.assertEqual((again / "patches/net.mcspine.bootstrapper.json").read_bytes(),
-                         (output / "patches/net.mcspine.bootstrapper.json").read_bytes())
+        self.assertEqual((again / "patches/net.megu.bootstrapper.json").read_bytes(),
+                         (output / "patches/net.megu.bootstrapper.json").read_bytes())
 
     def test_bootstrap_jar_fails_closed(self):
         missing = self.export(self.root / "bad-bootstrap-missing", "--format", "prism",
@@ -823,15 +823,15 @@ Path(os.environ['TEST_NATIVE_LOG']).write_text(json.dumps(sys.argv[1:]))
 class IntegratedModTest(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
-        cls.temporary = tempfile.TemporaryDirectory(prefix="mc-spine-integrated-test-")
+        cls.temporary = tempfile.TemporaryDirectory(prefix="megu-integrated-test-")
         cls.addClassCleanup(cls.temporary.cleanup)
         cls.root = Path(cls.temporary.name)
         cls.output = cls.root / "build-a"
-        cls.jar = cls.output / "mc-spine-integrated.jar"
+        cls.jar = cls.output / "megu-integrated.jar"
         for folder in (cls.output, cls.root / "build-b"):
             subprocess.run([sys.executable, str(TOOLS / "build_integrated_mod.py"),
                             "--out-dir", str(folder)], check=True, capture_output=True)
-        cls.mock = cls.root / "mock-mc-spine"
+        cls.mock = cls.root / "mock-megu"
         cls.mock.write_text('''#!/usr/bin/env python3
 import json
 import os
@@ -874,17 +874,17 @@ def stop(*_):
     sys.exit(0)
 
 signal.signal(signal.SIGTERM, stop)
-host = os.environ['MC_SPINE_BIND_ADDR']
-port = int(os.environ['MC_SPINE_PORT'])
+host = os.environ['MEGU_BIND_ADDR']
+port = int(os.environ['MEGU_PORT'])
 with socket.socket() as listener:
     listener.bind((host, port))
     listener.listen()
     Path('server.json').write_text(json.dumps({
         'pid': os.getpid(), 'host': host, 'port': port,
-        'cwd': os.getcwd(), 'world': os.environ['MC_SPINE_WORLD_DIR'],
-        'seed': os.environ['MC_SPINE_SEED'],
-        'rcon': os.getenv('MC_SPINE_RCON_PORT'),
-        'public': os.getenv('MC_SPINE_ALLOW_PUBLIC_BIND'),
+        'cwd': os.getcwd(), 'world': os.environ['MEGU_WORLD_DIR'],
+        'seed': os.environ['MEGU_SEED'],
+        'rcon': os.getenv('MEGU_RCON_PORT'),
+        'public': os.getenv('MEGU_ALLOW_PUBLIC_BIND'),
     }))
     while True:
         conn, _ = listener.accept()
@@ -900,7 +900,7 @@ with socket.socket() as listener:
                     continue
                 if vint(conn) != 1 or read(conn, 1) != b'\\x00':
                     continue
-                description = b'{"version":{"name":"1.21.1","protocol":767},"description":{"text":"mc-spine"}}'
+                description = b'{"version":{"name":"1.21.1","protocol":767},"description":{"text":"megu"}}'
                 body = encode(0) + encode(len(description)) + description
                 conn.sendall(encode(len(body)) + body)
             except (OSError, EOFError, ValueError):
@@ -908,7 +908,7 @@ with socket.socket() as listener:
 ''')
         cls.mock.chmod(0o755)
         harness = cls.root / "ConfiguredBridgeHarness.java"
-        harness.write_text('''import net.mcspine.integrated.IntegratedServerBridge;
+        harness.write_text('''import net.megu.integrated.IntegratedServerBridge;
 public final class ConfiguredBridgeHarness {
     public static void main(String[] args) throws Exception {
         IntegratedServerBridge.startConfigured();
@@ -924,7 +924,7 @@ public final class ConfiguredBridgeHarness {
 
     def command(self, binary, game, world="E2-4 world", seed="4242", *extra, jar_entry=False):
         entry = (["-jar", str(self.jar)] if jar_entry else
-                 ["-cp", str(self.jar), "net.mcspine.integrated.IntegratedServerBridge"])
+                 ["-cp", str(self.jar), "net.megu.integrated.IntegratedServerBridge"])
         return ["java", "-Djava.io.tmpdir=" + tempfile.gettempdir(), "-XX:-UsePerfData",
                 *entry,
                 "--server-bin", str(binary), "--game-dir", str(game),
@@ -960,35 +960,35 @@ public final class ConfiguredBridgeHarness {
             except ProcessLookupError:
                 return
             time.sleep(0.05)
-        self.fail(f"mc-spine server pid {pid} survived Java shutdown")
+        self.fail(f"megu server pid {pid} survived Java shutdown")
 
     def test_manifest_both_loaders_and_reproducible(self):
         self.assertEqual(self.jar.read_bytes(),
-                         (self.root / "build-b/mc-spine-integrated.jar").read_bytes())
+                         (self.root / "build-b/megu-integrated.jar").read_bytes())
         with zipfile.ZipFile(self.jar) as archive:
             entries = set(archive.namelist())
             fabric = json.loads(archive.read("fabric.mod.json"))
             neoforge = tomllib.loads(archive.read("META-INF/neoforge.mods.toml").decode())
-            self.assertEqual(fabric["id"], "mc_spine_integrated")
+            self.assertEqual(fabric["id"], "megu_integrated")
             self.assertEqual(fabric["depends"]["minecraft"], "1.21.1")
             self.assertEqual(fabric["depends"]["java"], ">=21")
             self.assertEqual(fabric["environment"], "client")
             self.assertEqual(fabric["entrypoints"]["client"],
-                             ["net.mcspine.integrated.FabricIntegratedMod"])
+                             ["net.megu.integrated.FabricIntegratedMod"])
             self.assertEqual(neoforge["modLoader"], "javafml")
-            self.assertEqual(neoforge["mods"][0]["modId"], "mc_spine_integrated")
-            self.assertEqual(neoforge["dependencies"]["mc_spine_integrated"][0]["modId"],
+            self.assertEqual(neoforge["mods"][0]["modId"], "megu_integrated")
+            self.assertEqual(neoforge["dependencies"]["megu_integrated"][0]["modId"],
                              "minecraft")
-            self.assertIn("net/mcspine/integrated/IntegratedServerBridge.class", entries)
-            self.assertIn("net/mcspine/integrated/FabricIntegratedMod.class", entries)
-            self.assertIn("net/mcspine/integrated/NeoForgeIntegratedMod.class", entries)
+            self.assertIn("net/megu/integrated/IntegratedServerBridge.class", entries)
+            self.assertIn("net/megu/integrated/FabricIntegratedMod.class", entries)
+            self.assertIn("net/megu/integrated/NeoForgeIntegratedMod.class", entries)
             self.assertFalse(any(name.startswith("net/fabricmc/") or
                                  name.startswith("net/neoforged/") for name in entries))
 
     def test_mock_protocol_seed_world_and_explicit_close(self):
         game = self.root / "mock-game"
         game.mkdir(exist_ok=True)
-        env = dict(os.environ, MC_SPINE_RCON_PORT="25575", MC_SPINE_ALLOW_PUBLIC_BIND="1")
+        env = dict(os.environ, MEGU_RCON_PORT="25575", MEGU_ALLOW_PUBLIC_BIND="1")
         process, port, pid = self.start(self.mock, game, env=env)
         world = game / "saves/E2-4 world"
         try:
@@ -1015,11 +1015,11 @@ public final class ConfiguredBridgeHarness {
         game = self.root / "configured-game"
         game.mkdir(exist_ok=True)
         command = ["java", "-Djava.io.tmpdir=" + tempfile.gettempdir(), "-XX:-UsePerfData",
-                   "-Dmc.spine.integrated.enabled=true",
-                   "-Dmc.spine.integrated.serverBin=" + str(self.mock),
-                   "-Dmc.spine.integrated.gameDir=" + str(game),
-                   "-Dmc.spine.integrated.world=Configured world",
-                   "-Dmc.spine.integrated.seed=123",
+                   "-Dmegu.integrated.enabled=true",
+                   "-Dmegu.integrated.serverBin=" + str(self.mock),
+                   "-Dmegu.integrated.gameDir=" + str(game),
+                   "-Dmegu.integrated.world=Configured world",
+                   "-Dmegu.integrated.seed=123",
                    "-cp", os.pathsep.join([str(self.jar), str(self.root)]),
                    "ConfiguredBridgeHarness"]
         result = subprocess.run(command, capture_output=True, text=True, timeout=15)
@@ -1091,12 +1091,12 @@ public final class ConfiguredBridgeHarness {
             type(self).lifecycle_dir = classes
         game = self.root / f"lifecycle-{loader}-{event}-{enabled}"
         game.mkdir(exist_ok=True)
-        flags = ["-Dmc.spine.integrated.enabled=true"] if enabled else []
+        flags = ["-Dmegu.integrated.enabled=true"] if enabled else []
         return game, subprocess.run(
             ["java", "-Djava.io.tmpdir=" + tempfile.gettempdir(), "-XX:-UsePerfData", *flags,
-             "-Dmc.spine.integrated.serverBin=" + str(self.mock),
-             "-Dmc.spine.integrated.gameDir=" + str(game),
-             "-Dmc.spine.integrated.world=Lifecycle world",
+             "-Dmegu.integrated.serverBin=" + str(self.mock),
+             "-Dmegu.integrated.gameDir=" + str(game),
+             "-Dmegu.integrated.world=Lifecycle world",
              "-cp", os.pathsep.join([str(self.lifecycle_dir), str(self.jar)]),
              "LifecycleHarness", loader, event], capture_output=True, text=True, timeout=30)
 
@@ -1127,7 +1127,7 @@ public final class ConfiguredBridgeHarness {
         game.mkdir(exist_ok=True)
         classes = self.root / "no-api-classes"
         source = self.root / "NoApiHarness.java"
-        source.write_text("""import net.mcspine.integrated.FabricIntegratedMod;
+        source.write_text("""import net.megu.integrated.FabricIntegratedMod;
 public final class NoApiHarness {
     public static void main(String[] args) { new FabricIntegratedMod().onInitializeClient(); }
 }
@@ -1141,10 +1141,10 @@ public final class NoApiHarness {
                        check=True, capture_output=True)
         result = subprocess.run(
             ["java", "-Djava.io.tmpdir=" + tempfile.gettempdir(), "-XX:-UsePerfData",
-             "-Dmc.spine.integrated.enabled=true",
-             "-Dmc.spine.integrated.serverBin=" + str(self.mock),
-             "-Dmc.spine.integrated.gameDir=" + str(game),
-             "-Dmc.spine.integrated.world=Lifecycle world",
+             "-Dmegu.integrated.enabled=true",
+             "-Dmegu.integrated.serverBin=" + str(self.mock),
+             "-Dmegu.integrated.gameDir=" + str(game),
+             "-Dmegu.integrated.world=Lifecycle world",
              "-cp", os.pathsep.join([str(classes), str(self.jar)]), "NoApiHarness"],
             capture_output=True, text=True, timeout=30)
         self.assertEqual(result.returncode, 0, result.stderr)
@@ -1157,12 +1157,12 @@ public final class NoApiHarness {
 
 
     def test_real_protocol_767_and_clean_shutdown(self):
-        binary = ROOT / "target/debug/mc-spine"
+        binary = ROOT / "target/debug/megu"
         if not binary.is_file():
-            self.skipTest("build target/debug/mc-spine to run the real binary integration test")
+            self.skipTest("build target/debug/megu to run the real binary integration test")
         game = self.root / "real-game"
         game.mkdir(exist_ok=True)
-        env = dict(os.environ, MC_SPINE_SERVER_HOME=str(ROOT))
+        env = dict(os.environ, MEGU_SERVER_HOME=str(ROOT))
         process, port, pid = self.start(binary, game, env=env, jar_entry=True)
         world = game / "saves/E2-4 world"
         try:
@@ -1196,8 +1196,8 @@ import java.util.Arrays;
 import java.util.concurrent.atomic.AtomicReference;
 import java.util.zip.CRC32;
 
-import net.mcspine.integrated.IntegratedServerBridge;
-import net.mcspine.integrated.IntegratedServerBridge.DirectFrame;
+import net.megu.integrated.IntegratedServerBridge;
+import net.megu.integrated.IntegratedServerBridge.DirectFrame;
 
 public final class DirectFrameHarness {
     private static int checks;
@@ -1470,7 +1470,7 @@ public final class DirectFrameHarness {
 
     @classmethod
     def setUpClass(cls):
-        cls.temporary = tempfile.TemporaryDirectory(prefix="mc-spine-direct-frame-")
+        cls.temporary = tempfile.TemporaryDirectory(prefix="megu-direct-frame-")
         cls.addClassCleanup(cls.temporary.cleanup)
         cls.root = Path(cls.temporary.name)
         cls.build_a = cls.root / "build-a"
@@ -1478,7 +1478,7 @@ public final class DirectFrameHarness {
         for folder in (cls.build_a, cls.build_b):
             subprocess.run([sys.executable, str(TOOLS / "build_integrated_mod.py"),
                             "--out-dir", str(folder)], check=True, capture_output=True)
-        cls.jar = cls.build_a / "mc-spine-integrated.jar"
+        cls.jar = cls.build_a / "megu-integrated.jar"
         cls.harness = cls.root / "DirectFrameHarness.java"
         cls.harness.write_text(cls.HARNESS)
         subprocess.run(["javac", "-J-Djava.io.tmpdir=" + tempfile.gettempdir(),
@@ -1514,12 +1514,12 @@ public final class DirectFrameHarness {
 
     def test_integrated_jar_rebuild_is_byte_identical(self):
         first = self.jar
-        second = self.build_b / "mc-spine-integrated.jar"
+        second = self.build_b / "megu-integrated.jar"
         digest = hashlib.sha256(first.read_bytes()).hexdigest()
         self.assertEqual(digest, hashlib.sha256(second.read_bytes()).hexdigest())
         with zipfile.ZipFile(first) as archive:
             names = set(archive.namelist())
-            self.assertIn("net/mcspine/integrated/IntegratedServerBridge$DirectFrame.class", names)
+            self.assertIn("net/megu/integrated/IntegratedServerBridge$DirectFrame.class", names)
             self.assertFalse(any(name.startswith(("net/fabricmc/", "net/neoforged/"))
                                  for name in names))
             for item in archive.infolist():
@@ -1528,20 +1528,20 @@ public final class DirectFrameHarness {
                 self.assertEqual(item.create_system, 3)
 
 
-KERNEL_LIB_NAME = "libmc_spine_kernel.so"
-MESH_LIB_NAME = "libmc_spine_client_mesh.so"
+KERNEL_LIB_NAME = "libmegu_kernel.so"
+MESH_LIB_NAME = "libmegu_client_mesh.so"
 _NATIVE = {}
 
 
 def native_libraries():
     """Build the client-kernel/client-port cdylibs once. Returns {name: (path|None, reason)}.
 
-    MC_SPINE_TEST_KERNEL_LIBRARY may name a prebuilt libmc_spine_kernel.so instead of the
+    MEGU_TEST_KERNEL_LIBRARY may name a prebuilt libmegu_kernel.so instead of the
     cargo build. A failed build yields (None, first failure) so tests report it.
     """
     if _NATIVE:
         return _NATIVE
-    override = os.environ.get("MC_SPINE_TEST_KERNEL_LIBRARY")
+    override = os.environ.get("MEGU_TEST_KERNEL_LIBRARY")
     for crate, name in (("client-kernel", KERNEL_LIB_NAME), ("client-port", MESH_LIB_NAME)):
         if name == KERNEL_LIB_NAME and override:
             _NATIVE[name] = (Path(override), "")
@@ -1579,9 +1579,9 @@ class NativeBridgeTest(unittest.TestCase):
 import java.nio.ByteOrder;
 import java.nio.file.Path;
 import java.util.Arrays;
-import net.mcspine.integrated.NativeBridgeException;
-import net.mcspine.integrated.NativeKernelBridge;
-import net.mcspine.integrated.NativeMeshBridge;
+import net.megu.integrated.NativeBridgeException;
+import net.megu.integrated.NativeKernelBridge;
+import net.megu.integrated.NativeMeshBridge;
 
 public final class NativeBridgeHarness {
     static int checks;
@@ -1702,8 +1702,8 @@ public final class NativeBridgeHarness {
     }
 
     static void failClosed(Path directory) {
-        String kernel = "libmc_spine_kernel.so";
-        String mesh = "libmc_spine_client_mesh.so";
+        String kernel = "libmegu_kernel.so";
+        String mesh = "libmegu_client_mesh.so";
         expect(() -> NativeKernelBridge.open(null), "absolute");
         expect(() -> NativeKernelBridge.open(Path.of(kernel)), "absolute");
         expect(() -> NativeKernelBridge.open(directory.resolve("missing/../missing/" + kernel)), "normalized");
@@ -1716,7 +1716,7 @@ public final class NativeBridgeHarness {
         expect(() -> NativeKernelBridge.open(directory.resolve("crosswired").resolve(kernel)), "lacks symbol");
         expect(() -> NativeMeshBridge.open(directory.resolve("crosswired").resolve(mesh)), "lacks symbol");
         expect(() -> NativeKernelBridge.open(directory.resolve("partial").resolve(kernel)),
-                "lacks symbol mc_spine_kernel_palette_new_single");
+                "lacks symbol megu_kernel_palette_new_single");
     }
 
     public static void main(String[] args) throws Exception {
@@ -1733,13 +1733,13 @@ public final class NativeBridgeHarness {
 
     @classmethod
     def setUpClass(cls):
-        cls.temporary = tempfile.TemporaryDirectory(prefix="mc-spine-native-bridge-")
+        cls.temporary = tempfile.TemporaryDirectory(prefix="megu-native-bridge-")
         cls.addClassCleanup(cls.temporary.cleanup)
         cls.root = Path(cls.temporary.name)
         cls.jar_dir = cls.root / "jar"
         subprocess.run([sys.executable, str(TOOLS / "build_integrated_mod.py"),
                         "--out-dir", str(cls.jar_dir)], check=True, capture_output=True)
-        cls.jar = cls.jar_dir / "mc-spine-integrated.jar"
+        cls.jar = cls.jar_dir / "megu-integrated.jar"
         harness = cls.root / "NativeBridgeHarness.java"
         harness.write_text(cls.HARNESS)
         subprocess.run(["javac", "-J-Djava.io.tmpdir=" + tempfile.gettempdir(),
@@ -1748,7 +1748,7 @@ public final class NativeBridgeHarness {
         fixtures = cls.root / "fixtures"
         cls.fixtures = fixtures
         abi = "unsigned %s(void) { return %d; }\n"
-        kernel_abi, mesh_abi = "mc_spine_kernel_abi_version", "mc_spine_mesh_abi_version"
+        kernel_abi, mesh_abi = "megu_kernel_abi_version", "megu_mesh_abi_version"
         for folder in ("missing", "wrongname"):
             (fixtures / folder).mkdir(parents=True, exist_ok=True)
         (fixtures / "wrongname/libother.so").write_bytes(b"x")
@@ -1789,12 +1789,12 @@ public final class NativeBridgeHarness {
         second = self.root / "jar-second"
         subprocess.run([sys.executable, str(TOOLS / "build_integrated_mod.py"),
                         "--out-dir", str(second)], check=True, capture_output=True)
-        self.assertEqual(self.jar.read_bytes(), (second / "mc-spine-integrated.jar").read_bytes())
+        self.assertEqual(self.jar.read_bytes(), (second / "megu-integrated.jar").read_bytes())
         with zipfile.ZipFile(self.jar) as archive:
             names = set(archive.namelist())
         for name in ("NativeBridgeException", "NativeKernelBridge", "NativeKernelBridge$Palette",
                      "NativeKernelBridge$Collision", "NativeLibrary", "NativeMeshBridge"):
-            self.assertIn(f"net/mcspine/integrated/{name}.class", names)
+            self.assertIn(f"net/megu/integrated/{name}.class", names)
         self.assertFalse(any(name.startswith(("net/fabricmc/", "net/neoforged/")) for name in names))
 
 
@@ -1863,8 +1863,8 @@ public abstract class ClientPlayerNetworkEvent extends net.neoforged.bus.api.Eve
 import java.nio.file.Path;
 import net.fabricmc.fabric.api.client.event.lifecycle.v1.ClientLifecycleEvents;
 import net.fabricmc.fabric.api.client.networking.v1.ClientPlayConnectionEvents;
-import net.mcspine.integrated.FabricIntegratedMod;
-import net.mcspine.integrated.NeoForgeIntegratedMod;
+import net.megu.integrated.FabricIntegratedMod;
+import net.megu.integrated.NeoForgeIntegratedMod;
 import net.neoforged.neoforge.client.event.ClientPlayerNetworkEvent;
 import net.neoforged.neoforge.common.NeoForge;
 import net.neoforged.neoforge.event.GameShuttingDownEvent;
@@ -1883,8 +1883,8 @@ public final class LifecycleHarness {
             hooks = NeoForge.LISTENERS.size();
         }
         System.out.println("HOOKS " + hooks);
-        Path info = Path.of(System.getProperty("mc.spine.integrated.gameDir"), "saves",
-                System.getProperty("mc.spine.integrated.world"), "server.json");
+        Path info = Path.of(System.getProperty("megu.integrated.gameDir"), "saves",
+                System.getProperty("megu.integrated.world"), "server.json");
         if (hooks == 0) {
             System.out.println("INERT " + Files.exists(info));
             return;
@@ -1917,7 +1917,7 @@ class ThreeLauncherEasyInstallTests(unittest.TestCase):
     """Pins the 5 thin-JAR 3-launcher easy-install contracts (zero python3 runtime dep)."""
 
     def test_bootstrapper_self_install_and_auto_chmod_after_sha256(self):
-        with tempfile.TemporaryDirectory(prefix="mc-spine-easy-inst-") as td:
+        with tempfile.TemporaryDirectory(prefix="megu-easy-inst-") as td:
             root = Path(td)
             stage = root / "stage"
             subprocess.run(
@@ -1925,7 +1925,7 @@ class ThreeLauncherEasyInstallTests(unittest.TestCase):
                  "--out-dir", str(stage), "--mc-version", "1.21.1", "--build-jar"],
                 check=True, capture_output=True, text=True,
             )
-            jar = stage / "mc-spine-bootstrapper.jar"
+            jar = stage / "megu-bootstrapper.jar"
             self.assertLess(jar.stat().st_size, 32 * 1024)
             with zipfile.ZipFile(jar) as zf:
                 self.assertNotIn("integrated_bridge.py", zf.namelist())
@@ -1941,11 +1941,11 @@ class ThreeLauncherEasyInstallTests(unittest.TestCase):
                 capture_output=True, text=True,
             )
             self.assertEqual(res.returncode, 0, res.stderr + res.stdout)
-            self.assertTrue((mc_dir / "libraries/net/mcspine/bootstrapper/1.0.0/bootstrapper-1.0.0.jar").is_file())
-            self.assertTrue((mc_dir / "versions/mc-spine-1.21.1/mc-spine-1.21.1.json").is_file())
+            self.assertTrue((mc_dir / "libraries/net/megu/bootstrapper/1.0.0/bootstrapper-1.0.0.jar").is_file())
+            self.assertTrue((mc_dir / "versions/megu-1.21.1/megu-1.21.1.json").is_file())
             profiles = json.loads((mc_dir / "launcher_profiles.json").read_text())
             self.assertIn("existing", profiles["profiles"])
-            self.assertIn("mc-spine-1.21.1", profiles["profiles"])
+            self.assertIn("megu-1.21.1", profiles["profiles"])
 
             # Non-executable client binary: bad SHA fails closed WITHOUT setting +x; good SHA restores +x and runs.
             client = root / "client-stub"
@@ -1970,7 +1970,7 @@ class ThreeLauncherEasyInstallTests(unittest.TestCase):
             self.assertTrue(os.access(client, os.X_OK))
 
     def test_mrpack_client_bin_config_and_deterministic_prism_zip(self):
-        with tempfile.TemporaryDirectory(prefix="mc-spine-easy-bundles-") as td:
+        with tempfile.TemporaryDirectory(prefix="megu-easy-bundles-") as td:
             root = Path(td)
             stage = root / "stage"
             subprocess.run(
@@ -1978,8 +1978,8 @@ class ThreeLauncherEasyInstallTests(unittest.TestCase):
                  "--out-dir", str(stage), "--mc-version", "1.21.1", "--build-jar"],
                 check=True, capture_output=True, text=True,
             )
-            jar = stage / "mc-spine-bootstrapper.jar"
-            fake_bin = root / "mc-spine-client"
+            jar = stage / "megu-bootstrapper.jar"
+            fake_bin = root / "megu-client"
             fake_bin.write_text("#!/bin/sh\nexit 0\n")
             fake_bin.chmod(0o755)
 
@@ -1993,25 +1993,25 @@ class ThreeLauncherEasyInstallTests(unittest.TestCase):
                      "--prism-zip"],
                     check=True, capture_output=True, text=True,
                 )
-            prism_a = out_a / "mc-spine-prism-1.21.1.zip"
-            prism_b = out_b / "mc-spine-prism-1.21.1.zip"
+            prism_a = out_a / "megu-prism-1.21.1.zip"
+            prism_b = out_b / "megu-prism-1.21.1.zip"
             self.assertEqual(prism_a.read_bytes(), prism_b.read_bytes())
             with zipfile.ZipFile(prism_a) as zf:
-                self.assertIn("patches/net.mcspine.bootstrapper.json", zf.namelist())
-                self.assertIn(".minecraft/bin/mc-spine-client", zf.namelist())
+                self.assertIn("patches/net.megu.bootstrapper.json", zf.namelist())
+                self.assertIn(".minecraft/bin/megu-client", zf.namelist())
                 for info in zf.infolist():
                     self.assertEqual(info.date_time, (1980, 1, 1, 0, 0, 0))
 
-            mrpack = out_a / "mc-spine-1.21.1.mrpack"
+            mrpack = out_a / "megu-1.21.1.mrpack"
             with zipfile.ZipFile(mrpack) as zf:
                 names = set(zf.namelist())
-                self.assertIn("overrides/bin/mc-spine-client", names)
-                self.assertIn("overrides/config/mc-spine-integrated.properties", names)
-                cfg = zf.read("overrides/config/mc-spine-integrated.properties").decode()
+                self.assertIn("overrides/bin/megu-client", names)
+                self.assertIn("overrides/config/megu-integrated.properties", names)
+                cfg = zf.read("overrides/config/megu-integrated.properties").decode()
                 self.assertIn("enabled=true", cfg)
-                self.assertIn("serverBin=bin/mc-spine-client", cfg)
+                self.assertIn("serverBin=bin/megu-client", cfg)
                 import io
-                with zipfile.ZipFile(io.BytesIO(zf.read("overrides/mods/mc-spine-integrated.jar"))) as mod_jar:
+                with zipfile.ZipFile(io.BytesIO(zf.read("overrides/mods/megu-integrated.jar"))) as mod_jar:
                     fabric = json.loads(mod_jar.read("fabric.mod.json"))
                     self.assertEqual(fabric["license"], "LGPL-3.0-or-later")
 

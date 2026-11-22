@@ -6,7 +6,7 @@
 //! hardware frontends share one copy of the shader text; nothing here links
 //! a GPU API — the strings are data until a Vulkan backend compiles them.
 //!
-//! Struct layouts mirror the `#[repr(C)]` records in `mc_spine_client_mesh`
+//! Struct layouts mirror the `#[repr(C)]` records in `megu_client_mesh`
 //! field-for-field so a single CPU-side writer feeds both paths:
 //!
 //! * `PackedVertex` — four u32 words (16 B) bound as vertex attributes

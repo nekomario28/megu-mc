@@ -7,18 +7,18 @@
 //!
 //! The two primary targets (`1.21.1` and `26.3`) source every constant —
 //! protocol number, release id, `DataVersion`, pack formats — from
-//! [`mc_spine_core::version::TargetVersion`], the single source of truth the
+//! [`megu_core::version::TargetVersion`], the single source of truth the
 //! whole crate DAG shares; the historical `1.21.3`/`1.21.4`/`1.21.5` rows stay
-//! local since `mc-spine-core` only pins the two current targets.
+//! local since `megu-core` only pins the two current targets.
 
 use std::fmt;
 
-use mc_spine_core::version::TargetVersion;
+use megu_core::version::TargetVersion;
 
 /// A negotiated Java-protocol version number.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub enum ProtocolVersion {
-    /// Minecraft 1.21 / 1.21.1 — the protocol mc-spine speaks today.
+    /// Minecraft 1.21 / 1.21.1 — the protocol megu speaks today.
     V1_21_1,
     /// Minecraft 1.21.2 / 1.21.3.
     V1_21_3,
@@ -108,8 +108,8 @@ impl fmt::Display for ProtocolVersion {
 /// Error from `TryFrom<ProtocolVersion>` for [`TargetVersion`]: the protocol
 /// version is not one of the two canonical targets (`1.21.1`, `26.3`).
 ///
-/// `V1_21_3`/`V1_21_4`/`V1_21_5` are real protocols mc-spine ships tables for
-/// but they sit outside the `mc-spine-core` target set, and `Custom` is by
+/// `V1_21_3`/`V1_21_4`/`V1_21_5` are real protocols megu ships tables for
+/// but they sit outside the `megu-core` target set, and `Custom` is by
 /// definition unidentified — all three cases fail here instead of silently
 /// collapsing onto the nearest target.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -117,7 +117,7 @@ pub struct NoTargetVersion(pub ProtocolVersion);
 
 impl fmt::Display for NoTargetVersion {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "{} is not a canonical mc-spine target version", self.0)
+        write!(f, "{} is not a canonical megu target version", self.0)
     }
 }
 
@@ -147,7 +147,7 @@ impl TryFrom<ProtocolVersion> for TargetVersion {
 /// How a version distributes the recipe book.
 ///
 /// - [`RecipeSyncMode::FullOnJoin`]: 1.21.x servers push the whole unlocked
-///   recipe set in `unlock_recipes` during play login — the mode mc-spine's
+///   recipe set in `unlock_recipes` during play login — the mode megu's
 ///   `src/recipes_and_stats.rs` emits today.
 /// - [`RecipeSyncMode::LazyOnDemand`]: newer protocols fetch recipes on demand;
 ///   declared now so the capability switch is in place before 1.21.6+ packs land.
@@ -411,8 +411,8 @@ mod tests {
     }
 
     #[test]
-    fn primary_target_capabilities_come_from_mc_spine_core() {
-        // Every field `mc-spine-core` pins must equal `TargetVersion::meta()`
+    fn primary_target_capabilities_come_from_megu_core() {
+        // Every field `megu-core` pins must equal `TargetVersion::meta()`
         // exactly — this is what makes the core crate the single source of
         // truth for the two-target constants.
         for (proto, target) in [
@@ -464,7 +464,7 @@ mod tests {
         assert_eq!(err.0, ProtocolVersion::Custom(999));
         assert_eq!(
             err.to_string(),
-            "protocol 999 is not a canonical mc-spine target version"
+            "protocol 999 is not a canonical megu target version"
         );
     }
 }

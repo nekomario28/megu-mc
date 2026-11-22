@@ -1,13 +1,13 @@
 name: Mod compatibility report
-description: Report a mod compatibility issue or share mc-spine-mod-check results. mod の互換性問題・mod-check 結果の共有用。
+description: Report a mod compatibility issue or share megu-mod-check results. mod の互換性問題・mod-check 結果の共有用。
 title: "[ModCompat] "
 labels: ["mod-compat"]
 body:
   - type: markdown
     attributes:
       value: |
-        Use this form when a mod misbehaves under Megu/mc-spine, or to share
-        `mc-spine-mod-check` output for a modpack. One mod (or one modpack)
+        Use this form when a mod misbehaves under Megu/megu, or to share
+        `megu-mod-check` output for a modpack. One mod (or one modpack)
         per report. Please redact anything sensitive before pasting output.
 
         Note on v0.1.0 Alpha scope: Rust owns Tick/World/Save; limited S1–S4
@@ -15,8 +15,8 @@ body:
         `@Inject` Mixins are supported, while unsupported Mixins fail closed
         and full arbitrary FML/ModLauncher JAR execution is not yet guaranteed.
 
-        Megu/mc-spine 上で mod が正常に動かない場合、または modpack の
-        `mc-spine-mod-check` 出力を共有したい場合に使用してください。
+        Megu/megu 上で mod が正常に動かない場合、または modpack の
+        `megu-mod-check` 出力を共有したい場合に使用してください。
         1 件につき 1 mod（または 1 modpack）。貼り付け前に機密情報を
         マスクしてください。
         （※ v0.1.0 Alpha では限定 Event/Registry/Offload 互換であり、未対応
@@ -78,8 +78,8 @@ body:
   - type: dropdown
     id: check_status
     attributes:
-      label: mc-spine-mod-check classification
-      description: "Run `mc-spine-mod-check --scan-jar <jar> --json` or `--modpack <pack.mrpack> --mc-version <ver> --json` first."
+      label: megu-mod-check classification
+      description: "Run `megu-mod-check --scan-jar <jar> --json` or `--modpack <pack.mrpack> --mc-version <ver> --json` first."
       options:
         - "`native_bundle` — native bundle available"
         - "`auto_skipped` — auto-skipped"
@@ -92,7 +92,7 @@ body:
   - type: textarea
     id: check_output
     attributes:
-      label: mc-spine-mod-check output (JSON or human)
+      label: megu-mod-check output (JSON or human)
       description: |
         Paste the full `--json` output (preferred) or the human-readable
         summary. Redact paths and usernames if needed.

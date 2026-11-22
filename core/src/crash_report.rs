@@ -25,7 +25,7 @@
 pub struct CrashContext {
     /// Coarse failure class, e.g. `"panic"`, `"oom"`, `"protocol_error"`.
     pub error_kind: String,
-    /// Mod id or module blamed for the crash, e.g. `"create"`, `"mc-spine-proto"`.
+    /// Mod id or module blamed for the crash, e.g. `"create"`, `"megu-proto"`.
     pub culprit_mod_or_module: String,
     /// Minecraft version string, e.g. `"26.3"` or `"1.21.1"`.
     pub mc_version: String,
@@ -377,12 +377,12 @@ mod tests {
     fn blame_and_markdown_are_redacted_and_bilingual() {
         let ctx = CrashContext::new(
             "protocol_error",
-            "mc-spine-proto",
+            "megu-proto",
             "1.21.1",
             "frame from 10.0.0.5 exceeded cap; Bearer tok_live",
         );
         let (en, ja) = ctx.blame_lines();
-        assert!(en.contains("mc-spine-proto"));
+        assert!(en.contains("megu-proto"));
         assert!(ja.contains("原因候補"));
         assert!(!en.contains("10.0.0.5") && !ja.contains("tok_live"));
         let md = ctx.markdown_summary();

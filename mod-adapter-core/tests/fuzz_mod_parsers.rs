@@ -14,9 +14,9 @@
 //! hostile.
 //!
 //! Determinism: all inputs derive from fixed-seed `splitmix64` PRNGs — no
-//! `SystemTime`, no OS entropy, no external crates. `MC_SPINE_FUZZ_ITERS`
+//! `SystemTime`, no OS entropy, no external crates. `MEGU_FUZZ_ITERS`
 //! scales the per-target iteration count (default `3_000`; operators crank
-//! `MC_SPINE_FUZZ_ITERS=100000` for a deep soak). A parser panic is caught,
+//! `MEGU_FUZZ_ITERS=100000` for a deep soak). A parser panic is caught,
 //! the offending input is hex-dumped for reproduction, and the panic is
 //! re-thrown so the test still fails.
 
@@ -94,9 +94,9 @@ impl Rng {
     }
 }
 
-/// Per-target iteration count: `MC_SPINE_FUZZ_ITERS` overrides, default 3000.
+/// Per-target iteration count: `MEGU_FUZZ_ITERS` overrides, default 3000.
 fn iters() -> usize {
-    std::env::var("MC_SPINE_FUZZ_ITERS")
+    std::env::var("MEGU_FUZZ_ITERS")
         .ok()
         .and_then(|v| v.parse().ok())
         .unwrap_or(3_000)
@@ -587,7 +587,7 @@ fn zip_stored(entries: &[(&str, &[u8])]) -> Vec<u8> {
 
 fn scratch_dir(tag: &str) -> PathBuf {
     let dir = std::env::temp_dir().join(format!(
-        "mc-spine-fuzz-p6e-{tag}-{}",
+        "megu-fuzz-p6e-{tag}-{}",
         std::process::id()
     ));
     std::fs::create_dir_all(&dir).unwrap();
@@ -1086,7 +1086,7 @@ fn entity_meta_corpus() -> Vec<Vec<u8>> {
     corpus.push(vec![0xff]);
     corpus.push(b"\x07\x0fminecraft:block".to_vec());
     if let Ok(body) = build_config_registry_data_0x07(
-        "mcspine:custom",
+        "megu:custom",
         &["minecraft:stone".to_string(), "minecraft:dirt".to_string()],
     ) {
         corpus.push(body);
@@ -1503,8 +1503,8 @@ fn vm_class_corpus() -> Vec<Vec<u8>> {
     // Damage-hook event method: host calls + fcmpl + ifle branch, fully
     // verified and executed (like a real mod's onDamage hook).
     let mut a = ClassAssembler::new("com/fuzz/DamageHook");
-    let get_damage = a.cp.method_ref("mcspine/api/Event", "getDamage", "()F");
-    let set_damage = a.cp.method_ref("mcspine/api/Event", "setDamage", "(F)V");
+    let get_damage = a.cp.method_ref("megu/api/Event", "getDamage", "()F");
+    let set_damage = a.cp.method_ref("megu/api/Event", "setDamage", "(F)V");
     let ten = a.cp.float(10.0);
     let half = a.cp.float(0.5);
     let hook = bc(&[
@@ -1523,7 +1523,7 @@ fn vm_class_corpus() -> Vec<Vec<u8>> {
     ]);
     corpus.push(a.finish(&[MethodSpec::new(
         "onDamage",
-        "(Lmcspine/api/Event;)V",
+        "(Lmegu/api/Event;)V",
         4,
         1,
         hook,
@@ -1564,7 +1564,7 @@ fn vm_class_corpus() -> Vec<Vec<u8>> {
 
     // Static Math host call returning a float.
     let mut a = ClassAssembler::new("com/fuzz/Clamp");
-    let clamp = a.cp.method_ref("mcspine/api/Math", "clamp", "(FFF)F");
+    let clamp = a.cp.method_ref("megu/api/Math", "clamp", "(FFF)F");
     let clamped = bc(&[
         &[0x0B], // fconst_0
         &[0x0C], // fconst_1
@@ -1823,8 +1823,8 @@ config="neofuzz.mixins.json"
 /// `server.properties`/fair-play config text corpus.
 fn properties_corpus() -> Vec<Vec<u8>> {
     [
-        &b"# mc-spine fair-play\nmotd=fuzz\nview-distance: 10\nfair-play = true\nallow-cave-map = false\nallow-entity-radar = false\nallow-waypoint-teleport = true\nworld-level-id = 13371337\n"[..],
-        b"[mc_spine]\nfair_play = true\nworld_level_id = -42\n",
+        &b"# megu fair-play\nmotd=fuzz\nview-distance: 10\nfair-play = true\nallow-cave-map = false\nallow-entity-radar = false\nallow-waypoint-teleport = true\nworld-level-id = 13371337\n"[..],
+        b"[megu]\nfair_play = true\nworld_level_id = -42\n",
         b"fair-play:true\nallow-cave-map:true\nxaero.allow-entity-radar = off\n",
         b"just-a-lonely-line\n",
         b"key=value\na:b:c\nworld_level_id = 0\n",
@@ -1943,11 +1943,11 @@ fn dual_loader_and_accessories_never_panic() {
 }
 
 // ---------------------------------------------------------------------------
-// Unified declarative mod bundle (`mc-spine-mod-bundle/1`).
+// Unified declarative mod bundle (`megu-mod-bundle/1`).
 // ---------------------------------------------------------------------------
 
 /// Bundle-JSON corpus: every `export_builtin_dimension_bundles()` document
-/// (real `mc-spine-mod-bundle/1` wire form), a minimal valid bundle,
+/// (real `megu-mod-bundle/1` wire form), a minimal valid bundle,
 /// near-misses, and deep-nesting shapes past the 64-level JSON cap.
 fn bundle_corpus() -> Vec<Vec<u8>> {
     let mut corpus: Vec<Vec<u8>> = export_builtin_dimension_bundles()
@@ -1955,14 +1955,14 @@ fn bundle_corpus() -> Vec<Vec<u8>> {
         .map(|b| b.to_json().into_bytes())
         .collect();
     corpus.push(
-        br#"{"schema":"mc-spine-mod-bundle/1","mod_id":"fuzzmod","mc_version_range":"[1.21,)","portals":[],"progression_barriers":[],"biome_regions":[],"creatures":[],"custom_channels":[]}"#
+        br#"{"schema":"megu-mod-bundle/1","mod_id":"fuzzmod","mc_version_range":"[1.21,)","portals":[],"progression_barriers":[],"biome_regions":[],"creatures":[],"custom_channels":[]}"#
             .to_vec(),
     );
     corpus.push(
-        br#"{"schema":"mc-spine-mod-bundle/1","mod_id":"fuzzmod","mc_version_range":"[1.21,)"}"#
+        br#"{"schema":"megu-mod-bundle/1","mod_id":"fuzzmod","mc_version_range":"[1.21,)"}"#
             .to_vec(),
     );
-    corpus.push(br#"{"schema":"mc-spine-mod-bundle/2"}"#.to_vec());
+    corpus.push(br#"{"schema":"megu-mod-bundle/2"}"#.to_vec());
     corpus.push(b"{\"portals\":[{\"name\":\"x\"}]}".to_vec());
     // Deep nests far past MAX_JSON_DEPTH (64): object and array forms.
     let depth = 192;
@@ -1978,7 +1978,7 @@ fn bundle_corpus() -> Vec<Vec<u8>> {
     deep_arr.extend(std::iter::repeat_n(b']', depth));
     corpus.push(deep_arr);
     // Nesting inside a real bundle document (deep "portals" payload).
-    let mut nested = br#"{"schema":"mc-spine-mod-bundle/1","mod_id":"fuzzmod","mc_version_range":"[1.21,)","portals":"#.to_vec();
+    let mut nested = br#"{"schema":"megu-mod-bundle/1","mod_id":"fuzzmod","mc_version_range":"[1.21,)","portals":"#.to_vec();
     nested.extend(std::iter::repeat_n(b'[', depth));
     nested.extend(std::iter::repeat_n(b']', depth));
     nested.extend_from_slice(

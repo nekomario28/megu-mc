@@ -1,4 +1,4 @@
-package dev.mcspine.tools;
+package dev.megu.tools;
 
 import java.nio.charset.StandardCharsets;
 import java.nio.file.*;

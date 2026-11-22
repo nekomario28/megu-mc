@@ -11,18 +11,18 @@ use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::Duration;
 
-use mc_spine_client::online_auth::{
+use megu_client::online_auth::{
     aes128_encrypt_block, decode_encryption_request_body, encode_encryption_response_body,
     mc_server_hash, parse_rsa_public_key_der, plan_encryption_response,
     rsa_pkcs1v15_encrypt, rsa_pkcs1v15_pad, rsa_pkcs1v15_unpad, rsa_public_key_to_spki_der,
     Aes128Cfb8, BigUint, MojangSessionJoinClient, OnlineAuthOptions, SessionJoinClient,
     SessionJoinRequest,
 };
-use mc_spine_client::protocol::{
+use megu_client::protocol::{
     decode_packet_body, encode_packet, offline_uuid, write_string, write_varint, PlayEvent,
     ProtocolClient, WireReader,
 };
-use mc_spine_client::crash_reporter::{ReportTransport, TransportError, TransportResponse};
+use megu_client::crash_reporter::{ReportTransport, TransportError, TransportResponse};
 
 fn unhex(s: &str) -> Vec<u8> {
     (0..s.len())
@@ -644,7 +644,7 @@ fn encrypted_online_mode_login_end_to_end_loopback() {
         uuid,
         2,
         Duration::from_secs(30),
-        mc_spine_proto::ProtocolVersion::V1_21_1,
+        megu_proto::ProtocolVersion::V1_21_1,
         move |h, p| Ok(vec![format!("{h}:{p}").parse().unwrap()]),
         OnlineAuthOptions {
             access_token: Some("TEST-ACCESS-TOKEN".to_string()),
@@ -707,7 +707,7 @@ fn encryption_request_without_token_fails_closed_loopback() {
         offline_uuid("Tester"),
         2,
         Duration::from_secs(10),
-        mc_spine_proto::ProtocolVersion::V1_21_1,
+        megu_proto::ProtocolVersion::V1_21_1,
         move |h, p| Ok(vec![format!("{h}:{p}").parse().unwrap()]),
         OnlineAuthOptions {
             access_token: None,

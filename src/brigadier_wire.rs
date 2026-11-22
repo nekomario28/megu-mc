@@ -12,7 +12,7 @@
 //! wrong byte on the wire that no offline test could catch. Every number here was therefore read
 //! out of the pinned 1.21.1 server jar and, where it is a registry id, printed by a probe that
 //! bootstrapped that jar's own registries. The reading aids are recorded outside the tree
-//! (`~/mc-spine-local/audit/brigadier-slice2-*/evidence/`), as `tools/vanilla_src.sh` requires.
+//! (`~/megu-local/audit/brigadier-slice2-*/evidence/`), as `tools/vanilla_src.sh` requires.
 //!
 //! Inputs (SHA-1 checked against the pins in `tools/vanilla_src.sh`):
 //!

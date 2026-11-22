@@ -12,7 +12,7 @@ from rust_module_graph import ROOT, POLICY, source_graph
 DIR = ROOT / "evidence/foundation/module-layers"
 # The limit only stops a hung inspector. On a loaded host the pinned inspector takes over
 # 30 s, which used to fail the gate for timing alone. The env var overrides the default.
-INSPECT_TIMEOUT = float(os.environ.get("MC_SPINE_LAYERS_INSPECT_TIMEOUT", "180"))
+INSPECT_TIMEOUT = float(os.environ.get("MEGU_LAYERS_INSPECT_TIMEOUT", "180"))
 
 
 def inspect(executable, name):
@@ -49,7 +49,7 @@ def find_inspector():
     documented entry point, is where a host-local build of the pinned revision is
     preferred; this function stays authoritative about the choice it is given.
     """
-    explicit = os.environ.get("MC_SPINE_DEPSGX")
+    explicit = os.environ.get("MEGU_DEPSGX")
     if explicit:
         return explicit
     return shutil.which("depsgx")
@@ -61,7 +61,7 @@ def main():
         rev = pinned_revision()
         raise ValueError(
             "depsgx is required; an absent inspector cannot satisfy the gate. Install the "
-            f"pinned revision ({rev}) as CI does, set MC_SPINE_DEPSGX to an existing build, "
+            f"pinned revision ({rev}) as CI does, set MEGU_DEPSGX to an existing build, "
             "or put one on PATH"
         )
     probe = inspect(tool, "gate_probe.py")

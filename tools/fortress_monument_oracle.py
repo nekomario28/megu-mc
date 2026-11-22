@@ -20,7 +20,7 @@ def main():
             work,
             classpath,
             ROOT / "tools/structure-oracle/FortressMonumentOracle.java",
-            "dev.mcspine.tools.FortressMonumentOracle",
+            "dev.megu.tools.FortressMonumentOracle",
             out,
             extra_sources=[ROOT / "tools/structure-oracle/NativeHarness.java"],
         )

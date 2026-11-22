@@ -16,7 +16,7 @@ def main():
     with pinned_runtime(args.jar) as (work, cp, _):
         output = work / 'chorus-plant.tsv'
         run_probe(work, cp, ROOT / 'tools/structure-oracle/ChorusPlantOracle.java',
-                  'dev.mcspine.tools.ChorusPlantOracle', output)
+                  'dev.megu.tools.ChorusPlantOracle', output)
         actual = output.read_bytes()
     if args.write:
         VECTORS.write_bytes(actual)

@@ -7,56 +7,56 @@ use std::path::PathBuf;
 use std::sync::mpsc::{self, Receiver, SyncSender, TryRecvError};
 use std::time::{Duration, Instant};
 
-use mc_spine_client::audio_out::{
+use megu_client::audio_out::{
     AudioCmd, AudioCmdRing, AudioRuntime, AudioSessionConfig, AudioSinkKind,
 };
-use mc_spine_client::online_auth::OnlineAuthOptions;
-use mc_spine_client::protocol::{
+use megu_client::online_auth::OnlineAuthOptions;
+use megu_client::protocol::{
     decode_item_stack_components, handle_transfer_packet, offline_uuid, parse_uuid,
     ClientCustomChannelEvent, ClientPlayEvent, DecodedMagicCastState, DecodedMagicSync,
     DecodedMotionTrigger, DimensionMeta, ItemStackComponents, PlayEvent, PlayerInfoUpdateEntry,
     ProtocolClient, SeasonWireSync, TeleportSync, TransferTarget, WireReader, WireSoundEvent,
     WireStopSound,
 };
-use mc_spine_client::render::ClientVfxHost;
-use mc_spine_client::render_graph::GpuPipelineKind;
-use mc_spine_client::session::{AudioStats, WorldAcousticSnapshot};
-use mc_spine_client::spatial_audio::{SpatialAudioPreset, SpatialSubtitleCue, SubtitleDirection};
-use mc_spine_client::world::{BlockTable, WorldState};
-use mc_spine_client_mesh::asset_pipeline::{CompiledAssetBundle, ResourcePackLayer};
-use mc_spine_client_mesh::atlas::{AtlasMip, PackedAtlas, SpriteAnimation, SpritePlacement};
-use mc_spine_client_mesh::builtin_shadow_wgsl::BuiltinShadowQuality;
-use mc_spine_client_mesh::entity_rig::{classify_entity_rig, EntityRigSpec};
-use mc_spine_client_mesh::mesher::{
+use megu_client::render::ClientVfxHost;
+use megu_client::render_graph::GpuPipelineKind;
+use megu_client::session::{AudioStats, WorldAcousticSnapshot};
+use megu_client::spatial_audio::{SpatialAudioPreset, SpatialSubtitleCue, SubtitleDirection};
+use megu_client::world::{BlockTable, WorldState};
+use megu_client_mesh::asset_pipeline::{CompiledAssetBundle, ResourcePackLayer};
+use megu_client_mesh::atlas::{AtlasMip, PackedAtlas, SpriteAnimation, SpritePlacement};
+use megu_client_mesh::builtin_shadow_wgsl::BuiltinShadowQuality;
+use megu_client_mesh::entity_rig::{classify_entity_rig, EntityRigSpec};
+use megu_client_mesh::mesher::{
     BlockVisualEnhancementResult, BlockVisualInput, VanillaPlusPipelineConfig,
 };
-use mc_spine_client_mesh::model_baker::blockstate::BlockStateDef;
-use mc_spine_client_mesh::model_baker::ResourcePackModelStack;
-use mc_spine_client_mesh::tactile_effects::{
+use megu_client_mesh::model_baker::blockstate::BlockStateDef;
+use megu_client_mesh::model_baker::ResourcePackModelStack;
+use megu_client_mesh::tactile_effects::{
     compute_environment_audio_hint, evaluate_night_sky_drama, CameraMicroOffset,
     EnvironmentAudioHint, FluidEntryEvent, GroundSurfaceKind, ImpactMaterial, LeafCanopyKind,
     NightSkyDrama, TactileEffectsConfig, TactileEffectsSim,
 };
-use mc_spine_client_mesh::vanilla_plus_nature::{
+use megu_client_mesh::vanilla_plus_nature::{
     compute_cloud_lighting, generate_layered_voxel_clouds, tick_nature_ambience, ActiveSeasonKind,
     CloudLighting, NatureAmbienceEnv, NatureAmbienceState, NatureModRegistry, SeasonAmbienceInput,
     CLOUD_CELL_BLOCKS, CLOUD_SCROLL_BLOCKS_PER_TICK,
 };
-use mc_spine_client_mesh::SectionCoord;
-use mc_spine_kernel::player_physics::{
+use megu_client_mesh::SectionCoord;
+use megu_kernel::player_physics::{
     step_player_physics, PlayerInputState, PlayerPhysicsState, SurfaceKind,
 };
-use mc_spine_kernel::raycast::{raycast_blocks, raycast_entities, FluidClipMode, RayBlockShapes};
-use mc_spine_kernel::Aabb;
-use mc_spine_kernel::CommandDispatcher;
-use mc_spine_ui::magic_hud::{CastBarState, CooldownSlotState, MagicHudState, StatusBadgeState};
-use mc_spine_ui::state::{HudState, MiniHudPreset, UiState};
-use mc_spine_ui::subtitle_hud::{SubtitleArrow, DEFAULT_TTL_SECS};
+use megu_kernel::raycast::{raycast_blocks, raycast_entities, FluidClipMode, RayBlockShapes};
+use megu_kernel::Aabb;
+use megu_kernel::CommandDispatcher;
+use megu_ui::magic_hud::{CastBarState, CooldownSlotState, MagicHudState, StatusBadgeState};
+use megu_ui::state::{HudState, MiniHudPreset, UiState};
+use megu_ui::subtitle_hud::{SubtitleArrow, DEFAULT_TTL_SECS};
 
 // Re-exported so embedders and tests keep the historical
 // `live_session::{hw_adaptive_engine,sys_metrics}` paths while the crate
-// compiles the canonical `mc-spine-core` sources exactly once.
-pub use mc_spine_core::{hw_adaptive_engine, sys_metrics};
+// compiles the canonical `megu-core` sources exactly once.
+pub use megu_core::{hw_adaptive_engine, sys_metrics};
 
 use crate::atmosphere::{
     voxel_clouds_to_geometry, AtmosphereParams, BiomeAtmosphereBlender, ChunkFadeTracker,
@@ -150,7 +150,7 @@ enum WorkerMessage {
 /// Launcher-supplied filesystem locations: the parsed `--gameDir`,
 /// `--assetsDir`, `--assetIndex`, `--version` and `--resourcePackDir`
 /// values a `GpuCliConfig` carries into the session. `None` fields fall
-/// back to the historical `MC_SPINE_*` environment lookups.
+/// back to the historical `MEGU_*` environment lookups.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct SessionPaths {
     /// `--gameDir` — `.minecraft` root; client JARs, `resourcepacks/`,
@@ -163,7 +163,7 @@ pub struct SessionPaths {
     /// Launcher `--version` id — `<gameDir>/versions/<id>/<id>.jar`.
     pub version_id: Option<String>,
     /// `--resourcePackDir` — the launcher's pack folder; the env var
-    /// `MC_SPINE_RESOURCE_PACK_DIR` keeps its higher priority.
+    /// `MEGU_RESOURCE_PACK_DIR` keeps its higher priority.
     pub resource_pack_dir: Option<PathBuf>,
 }
 
@@ -535,10 +535,10 @@ pub struct LiveSession {
     /// `--resourcePackDir`). Empty means env-lookup defaults only.
     pub session_paths: SessionPaths,
     /// Asset store root actually handed to the audio runtime (CLI wins over
-    /// `MC_SPINE_ASSETS_DIR`).
+    /// `MEGU_ASSETS_DIR`).
     pub resolved_assets_dir: Option<PathBuf>,
     /// Asset index id actually handed to the audio runtime (CLI wins over
-    /// `MC_SPINE_ASSET_INDEX`).
+    /// `MEGU_ASSET_INDEX`).
     pub resolved_asset_index: Option<String>,
     /// Window-0 player-inventory slot mirror: `container_set_content` /
     /// `container_set_slot` targeting window 0 lands here even without an
@@ -557,7 +557,7 @@ pub struct LiveSession {
     pub advancements_tab: Option<String>,
     /// Resident metadata of the lazily compiled resource-pack bundle
     /// (atlas placements + blockstates + model stack + animations) built
-    /// once when `MC_SPINE_RESOURCE_PACK_DIR` points at a pack root
+    /// once when `MEGU_RESOURCE_PACK_DIR` points at a pack root
     /// containing `assets/`; absent env keeps the procedural fallback.
     /// The multi-MiB RGBA payloads never live here — they exist only in
     /// [`Self::pending_atlas_pixels`] until `upload_block_atlas` drops
@@ -686,7 +686,7 @@ pub struct LiveSession {
     pub vanilla_plus_cfg: VanillaPlusPipelineConfig,
     pub nature_mod_registry: NatureModRegistry,
     /// The latest decoded `SSN1` season sync, or `None` before the first
-    /// `mc-spine:season_v1` frame (and on seasonless dimensions).
+    /// `megu:season_v1` frame (and on seasonless dimensions).
     pub latest_season: Option<SeasonWireSync>,
     /// Live seasonal ambience input derived from `latest_season`; the
     /// neutral seasonless fallback until a Season Mod frame arrives.
@@ -845,11 +845,11 @@ impl LiveSession {
         let resolved_assets_dir = paths
             .assets_dir
             .clone()
-            .or_else(|| std::env::var_os("MC_SPINE_ASSETS_DIR").map(Into::into));
+            .or_else(|| std::env::var_os("MEGU_ASSETS_DIR").map(Into::into));
         let resolved_asset_index = paths
             .asset_index
             .clone()
-            .or_else(|| std::env::var("MC_SPINE_ASSET_INDEX").ok());
+            .or_else(|| std::env::var("MEGU_ASSET_INDEX").ok());
         let mut audio = AudioRuntime::new(&AudioSessionConfig {
             sink,
             assets_dir: resolved_assets_dir.clone(),
@@ -975,7 +975,7 @@ impl LiveSession {
     /// Evaluate opt-in block enhancements with the session's active pack
     /// configuration and modded-nature registry.
     pub fn evaluate_block_visuals(&self, input: &BlockVisualInput) -> BlockVisualEnhancementResult {
-        mc_spine_client_mesh::mesher::evaluate_block_visual_pipeline(
+        megu_client_mesh::mesher::evaluate_block_visual_pipeline(
             input,
             &self.vanilla_plus_cfg,
             &self.nature_mod_registry,
@@ -1058,7 +1058,7 @@ impl LiveSession {
     /// Current VFX1 dynamic colored lights for the frame's light UBO.
     pub fn dynamic_colored_lights(
         &self,
-    ) -> Vec<mc_spine_client_mesh::vfx_engine::DynamicColoredLight> {
+    ) -> Vec<megu_client_mesh::vfx_engine::DynamicColoredLight> {
         let forward = self.pose.map_or([0.0, 0.0, 1.0], |p| {
             let (yaw, pitch) = (p.yaw.to_radians(), p.pitch.to_radians());
             [
@@ -1087,7 +1087,7 @@ impl LiveSession {
     /// was spawned with.
     pub fn set_spatial_audio_preset(&mut self, preset: SpatialAudioPreset) {
         let mut mixer =
-            mc_spine_client::session::SoundMixer::new(self.audio.mixer.sample_rate(), preset);
+            megu_client::session::SoundMixer::new(self.audio.mixer.sample_rate(), preset);
         mixer.set_world(Box::new(self.acoustic_world.clone()));
         self.audio.mixer = mixer;
     }
@@ -1496,7 +1496,7 @@ impl LiveSession {
 
     /// `container_click` — one window transaction; `changed`/`carried` are
     /// raw `Slot` wire blobs (build simple stacks via
-    /// `mc_spine_client::protocol::encode_slot_stack`).
+    /// `megu_client::protocol::encode_slot_stack`).
     #[allow(clippy::too_many_arguments)]
     pub fn container_click(
         &mut self,
@@ -1814,7 +1814,7 @@ impl LiveSession {
     /// priority (last layer wins): the vanilla client JAR at
     /// `<gameDir>/versions/<version>/<version>.jar` first, then every
     /// `options.txt`-configured pack from `resourcepacks/` (dir or `.zip`),
-    /// then the explicit `MC_SPINE_RESOURCE_PACK_DIR` override.
+    /// then the explicit `MEGU_RESOURCE_PACK_DIR` override.
     /// `CompiledAssetBundle::build` produces the gutter-padded block atlas
     /// and its linear-sRGB mip chain; `window.rs` uploads it via
     /// `upload_block_atlas`. What was resolved (and skipped) lands in
@@ -1832,7 +1832,7 @@ impl LiveSession {
             // Nothing configured at all — historical env-var-only behaviour.
         } else {
             for note in &discovery.notes {
-                eprintln!("mc-spine-client assets: {note}");
+                eprintln!("megu-client assets: {note}");
             }
         }
         self.asset_discovery = discovery;
@@ -1846,7 +1846,7 @@ impl LiveSession {
             Ok(bundle) => {
                 if !bundle.skipped_errors.is_empty() {
                     eprintln!(
-                        "mc-spine-client assets: {} pack entries skipped",
+                        "megu-client assets: {} pack entries skipped",
                         bundle.skipped_errors.len()
                     );
                 }
@@ -1855,7 +1855,7 @@ impl LiveSession {
                 self.pending_atlas_pixels = Some(pixels);
                 self.asset_bundle_pending_upload = true;
             }
-            Err(err) => eprintln!("mc-spine-client assets: bundle build failed: {err}"),
+            Err(err) => eprintln!("megu-client assets: bundle build failed: {err}"),
         }
     }
 
@@ -1872,7 +1872,7 @@ impl LiveSession {
             return true;
         };
         if let Err(err) = renderer.upload_block_atlas(&pixels.atlas, &pixels.mipmaps) {
-            eprintln!("mc-spine-client assets: atlas upload failed: {err}");
+            eprintln!("megu-client assets: atlas upload failed: {err}");
         }
         self.asset_bundle_pending_upload = false;
         self.pending_atlas_pixels.is_none()
@@ -1921,7 +1921,7 @@ impl LiveSession {
                     _ => continue,
                 };
                 if let Err(err) = result {
-                    eprintln!("mc-spine-client assets: CEM model {path:?} skipped: {err:?}");
+                    eprintln!("megu-client assets: CEM model {path:?} skipped: {err:?}");
                 }
             }
         }
@@ -3026,7 +3026,7 @@ fn run_connection(
     tx: &SyncSender<WorkerMessage>,
     rx: Receiver<WorkerCommand>,
 ) -> Result<(), String> {
-    let protocol = mc_spine_client::cli::parse_mc_version(version)?;
+    let protocol = megu_client::cli::parse_mc_version(version)?;
     let (mut client, _) = ProtocolClient::connect_for_version_with_auth(
         host,
         port,
@@ -3238,7 +3238,7 @@ pub(crate) fn jar_version_ids(paths: &SessionPaths) -> Vec<String> {
 /// Resolve the full texture layer stack for a session: the vanilla client
 /// JAR (`<gameDir>/versions/<id>/<id>.jar`) as the base layer, then every
 /// pack `options.txt` enables inside `resourcepacks/` (dir or `.zip`), then
-/// the explicit `MC_SPINE_RESOURCE_PACK_DIR` override on top. Returns the
+/// the explicit `MEGU_RESOURCE_PACK_DIR` override on top. Returns the
 /// layers in lowest-to-highest priority order, an [`AssetDiscovery`] report
 /// of every source resolved or skipped, and the on-disk pack roots CEM
 /// model scanning can still walk (zip packs contribute no CEM dir).
@@ -3335,7 +3335,7 @@ pub fn discover_asset_layers(
 
     // Explicit override stays last and wins every earlier layer, matching
     // the historical env-var behaviour.
-    if let Some(dir) = std::env::var_os("MC_SPINE_RESOURCE_PACK_DIR") {
+    if let Some(dir) = std::env::var_os("MEGU_RESOURCE_PACK_DIR") {
         let dir = PathBuf::from(dir);
         match ResourcePackLayer::from_dir(&dir) {
             Ok(layer) => {
@@ -3344,7 +3344,7 @@ pub fn discover_asset_layers(
                 layers.push(layer);
             }
             Err(err) => report.notes.push(format!(
-                "MC_SPINE_RESOURCE_PACK_DIR {} failed: {err}",
+                "MEGU_RESOURCE_PACK_DIR {} failed: {err}",
                 dir.display()
             )),
         }
@@ -3365,7 +3365,7 @@ fn nbt_text(nbt_bytes: &[u8]) -> Option<String> {
 /// the same literals the bar highlights before any `declare_commands`.
 fn seeded_command_dispatcher() -> CommandDispatcher {
     let mut dispatcher = CommandDispatcher::new();
-    for name in mc_spine_client::zsh_command_bar::vanilla_command_names() {
+    for name in megu_client::zsh_command_bar::vanilla_command_names() {
         let _ = dispatcher.register_literal(name);
     }
     dispatcher
@@ -3421,18 +3421,18 @@ mod tests {
         OFFSCREEN_FORMAT,
     };
     use crate::Camera;
-    use mc_spine_client::protocol::{
+    use megu_client::protocol::{
         decode_chunk_packet, decode_custom_payload_packet, decode_packet_body, encode_packet,
         DecodedMotionPhase, EquipmentEntry, WireReader, CHANNEL_ANIM_V1, CHANNEL_MAGIC_V1,
         CHANNEL_MOTION_V1, CHANNEL_SEASON_V1, CHANNEL_VFX_V1, SSN1_MAGIC, SSN1_VERSION,
     };
-    use mc_spine_client_mesh::tactile_effects::{
+    use megu_client_mesh::tactile_effects::{
         FluidEntryBody, TactileParticleKind, TactilePreset,
     };
-    use mc_spine_client_mesh::vanilla_plus_nature::{ActiveSeasonKind, NatureParticleKind};
-    use mc_spine_client_mesh::vfx_engine::{DynamicColoredLight, Vfx1Packet, VfxCommand};
-    use mc_spine_client_mesh::RenderBackendPreference;
-    use mc_spine_kernel::skeletal_anim::{encode_animation_trigger, AnimationTrigger, LoopMode};
+    use megu_client_mesh::vanilla_plus_nature::{ActiveSeasonKind, NatureParticleKind};
+    use megu_client_mesh::vfx_engine::{DynamicColoredLight, Vfx1Packet, VfxCommand};
+    use megu_client_mesh::RenderBackendPreference;
+    use megu_kernel::skeletal_anim::{encode_animation_trigger, AnimationTrigger, LoopMode};
     use std::io::{Read, Write};
     use std::net::{TcpListener, TcpStream};
 

@@ -11,12 +11,12 @@ Fixtures mirror `mod-adapter-core/tests/multi_mod_archetypes.rs` exactly:
                              modifier -> NativeBundle
   3. aether-frontier-*.jar  -- Fabric dimension mod: dimension_type +
                              dimension + ores tag + embedded
-                             mc-spine-bundle.json (portal + progression
+                             megu-bundle.json (portal + progression
                              barrier + channel) -> NativeBundle
   4. guard-events-*.jar     -- Fabric mixin mod: real JVM `.class` bytes with
                              @Mixin/@Inject on hurt/placeNewPlayer ->
                              Tier2LiftedShim (EntityDamagePre + PlayerJoin)
-  5. custom_creatures.bundle.json -- standalone mc-spine-mod-bundle/1 Megu
+  5. custom_creatures.bundle.json -- standalone megu-mod-bundle/1 Megu
                              mod (creature + barrier + region + channel)
   6. invasive-coremod-*.jar -- @Overwrite/@Redirect bytecode -> clean
                              Tier3FallbackRequired (checked in a second
@@ -46,11 +46,11 @@ from protocol767 import Client, ContractFailure, Reader, ROOT, require, string, 
 from wire_smoke import port, status
 
 
-SYNC_CHANNEL = "mc-spine:mod_sync_v1"
+SYNC_CHANNEL = "megu:mod_sync_v1"
 EXHAUSTION_CHANNEL = "appleskin:exhaustion_sync"
 SATURATION_CHANNEL = "appleskin:saturation_sync"
 CUSTOM_PAYLOAD_ID = 0x19
-BUNDLE_SCHEMA = "mc-spine-mod-bundle/1"
+BUNDLE_SCHEMA = "megu-mod-bundle/1"
 DOWNLOAD_URL = ("https://cdn.modrinth.com/data/hearthcraft/versions/1.4.2/"
                 "hearthcraft-neoforge-1.4.2.jar")
 
@@ -299,7 +299,7 @@ side = "BOTH"
 
 
 def aether_bundle_document():
-    """The mc-spine-mod-bundle/1 document embedded in archetype 3's JAR."""
+    """The megu-mod-bundle/1 document embedded in archetype 3's JAR."""
     return {
         "schema": BUNDLE_SCHEMA,
         "mod_id": "aether_demo",
@@ -368,7 +368,7 @@ def dimension_jar_members():
          json.dumps(dimension_type)),
         ("data/aether_demo/dimension/skyreach.json", json.dumps(dimension)),
         ("data/aether_demo/tags/blocks/ores.json", json.dumps(ores)),
-        ("mc-spine-bundle.json", json.dumps(aether_bundle_document())),
+        ("megu-bundle.json", json.dumps(aether_bundle_document())),
     ]
 
 
@@ -440,7 +440,7 @@ def coremod_jar_members():
 
 
 def native_bundle_document():
-    """Archetype 5: standalone mc-spine-mod-bundle/1 Megu mod — custom
+    """Archetype 5: standalone megu-mod-bundle/1 Megu mod — custom
     creature (with tame/heal items), progression barrier, biome region and
     custom payload channel."""
     return {
@@ -592,7 +592,7 @@ def _require_class(class_bytes, markers, code):
 
 
 def self_test():
-    with tempfile.TemporaryDirectory(prefix="mc-spine-multimod-selftest-") as tmp:
+    with tempfile.TemporaryDirectory(prefix="megu-multimod-selftest-") as tmp:
         root = Path(tmp)
         mods = root / "mods"
         culinary_bytes = make_fixture(mods, with_coremod=True)
@@ -645,7 +645,7 @@ def self_test():
             require(dim["type"] == "aether_demo:skyreach"
                     and dim["generator"]["type"] == "minecraft:noise",
                     "selftest-dimension-entry")
-            embedded = json.loads(archive.read("mc-spine-bundle.json"))
+            embedded = json.loads(archive.read("megu-bundle.json"))
             require(embedded == aether_bundle_document()
                     and embedded["schema"] == BUNDLE_SCHEMA,
                     "selftest-embedded-bundle")
@@ -747,21 +747,21 @@ def log_tail(path):
 def _server_env(root, mods, manifest):
     game = port()
     env = os.environ.copy()
-    for key in ("MC_SPINE_RCON_PORT", "MC_SPINE_RCON_PASS",
-                "MC_SPINE_ALLOW_PLAYER_ADMIN_COMMANDS", "MC_SPINE_PROGRESSION",
-                "MC_SPINE_MOD_SYNC_MIRRORS"):
+    for key in ("MEGU_RCON_PORT", "MEGU_RCON_PASS",
+                "MEGU_ALLOW_PLAYER_ADMIN_COMMANDS", "MEGU_PROGRESSION",
+                "MEGU_MOD_SYNC_MIRRORS"):
         env.pop(key, None)
     env.update(
-        MC_SPINE_PORT=str(game), MC_SPINE_BIND_ADDR="127.0.0.1",
-        MC_SPINE_MODS_DIR=str(mods),
-        MC_SPINE_WG="old", MC_SPINE_ENABLE_QUERY="0",
-        MC_SPINE_ANVIL_WORLD_DIR="", MC_SPINE_RESOURCE_PACK_URL="",
-        MC_SPINE_ANTICHEAT="off",
+        MEGU_PORT=str(game), MEGU_BIND_ADDR="127.0.0.1",
+        MEGU_MODS_DIR=str(mods),
+        MEGU_WG="old", MEGU_ENABLE_QUERY="0",
+        MEGU_ANVIL_WORLD_DIR="", MEGU_RESOURCE_PACK_URL="",
+        MEGU_ANTICHEAT="off",
     )
     if manifest is not None:
-        env["MC_SPINE_MOD_SYNC"] = str(manifest)
+        env["MEGU_MOD_SYNC"] = str(manifest)
     else:
-        env.pop("MC_SPINE_MOD_SYNC", None)
+        env.pop("MEGU_MOD_SYNC", None)
     return game, env
 
 
@@ -831,7 +831,7 @@ def run_live(binary):
 
 def _run_live_five(binary):
     """Boot 1: archetypes 1-5 share one mods/ directory and one live client."""
-    with tempfile.TemporaryDirectory(prefix="mc-spine-multimod-live-") as tmp:
+    with tempfile.TemporaryDirectory(prefix="megu-multimod-live-") as tmp:
         root = Path(tmp)
         mods = root / "mods"
         culinary_bytes = make_fixture(mods, with_coremod=False)
@@ -853,7 +853,7 @@ def _run_live_five(binary):
                         f"live-mod-sync-entry: {alice.payloads[SYNC_CHANNEL]}")
                 print("PASS Protocol 767 Alice login -> configuration -> play "
                       "(5-archetype mods dir)", flush=True)
-                print("PASS 0x19 mc-spine:mod_sync_v1 MSY1 manifest (1 SHA-256 entry)",
+                print("PASS 0x19 megu:mod_sync_v1 MSY1 manifest (1 SHA-256 entry)",
                       flush=True)
                 print("PASS 0x19 AppleSkin exhaustion/saturation big-endian f32",
                       flush=True)
@@ -921,7 +921,7 @@ def _run_live_five(binary):
 def _run_live_coremod(binary):
     """Boot 2: the invasive coremod alone — Tier 3 must be reported cleanly
     and must not crash boot, client login, or graceful shutdown."""
-    with tempfile.TemporaryDirectory(prefix="mc-spine-coremod-live-") as tmp:
+    with tempfile.TemporaryDirectory(prefix="megu-coremod-live-") as tmp:
         root = Path(tmp)
         mods = root / "mods"
         make_coremod_fixture(mods)
@@ -961,7 +961,7 @@ def main():
     elif len(sys.argv) == 2:
         run_live(Path(sys.argv[1]).resolve())
     else:
-        raise SystemExit(f"usage: {sys.argv[0]} --self-test | /path/to/mc-spine-mod-suite")
+        raise SystemExit(f"usage: {sys.argv[0]} --self-test | /path/to/megu-mod-suite")
 
 
 if __name__ == "__main__":

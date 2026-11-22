@@ -2,7 +2,7 @@
 //
 // `server.toml` has four anti-cheat keys: `antixray`, `antifullbright`,
 // `hide_underground` and `check_ops`. The movement, fall and placement checks are always on (only
-// `MC_SPINE_ANTICHEAT=off`, meant for tests and development, turns them off). Every
+// `MEGU_ANTICHEAT=off`, meant for tests and development, turns them off). Every
 // threshold is a constant here, derived from vanilla 1.21.1 movement physics, and is
 // scaled per player, per packet, from state the server already owns: attributes
 // (`movement_speed`, `jump_strength`, `gravity`, `step_height`, `flying_speed`, ...),
@@ -23,7 +23,7 @@
 // ---------- configuration ----------
 
 /// Whether the movement, fall and placement checks run. Not a file key any more: they
-/// are always on unless `MC_SPINE_ANTICHEAT=off` (tests, development) or an old file
+/// are always on unless `MEGU_ANTICHEAT=off` (tests, development) or an old file
 /// still says `enabled = false` / `preset = "off"`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum AcPreset {
@@ -90,8 +90,8 @@ fn ac_env_bool(v: &str) -> bool {
 
 impl AcConfig {
     /// `[anticheat]` from the parsed file, then the environment on top:
-    /// `MC_SPINE_ANTICHEAT` (on/off), `MC_SPINE_ANTI_XRAY`, `MC_SPINE_ANTI_FULLBRIGHT`,
-    /// `MC_SPINE_ANTI_XRAY_UNDERGROUND`.
+    /// `MEGU_ANTICHEAT` (on/off), `MEGU_ANTI_XRAY`, `MEGU_ANTI_FULLBRIGHT`,
+    /// `MEGU_ANTI_XRAY_UNDERGROUND`.
     /// Old keys (`preset`, `enabled`, `alerts`, `exempt`, `exempt_ops`, `ops_bypass`,
     /// `anti_xray`) are still honoured, with a note asking to move off them.
     pub(crate) fn from_doc(
@@ -207,21 +207,21 @@ impl AcConfig {
         if let Some(b) = hide_underground {
             c.hide_underground = b;
         }
-        if let Some(v) = env("MC_SPINE_ANTICHEAT") {
+        if let Some(v) = env("MEGU_ANTICHEAT") {
             match AcPreset::parse(&v) {
                 Some(p) => c.preset = p,
                 None => c.notes.push(format!(
-                    "[anticheat] MC_SPINE_ANTICHEAT={v:?} is not on/off; ignored"
+                    "[anticheat] MEGU_ANTICHEAT={v:?} is not on/off; ignored"
                 )),
             }
         }
-        if let Some(v) = env("MC_SPINE_ANTI_XRAY") {
+        if let Some(v) = env("MEGU_ANTI_XRAY") {
             c.anti_xray = ac_env_bool(&v);
         }
-        if let Some(v) = env("MC_SPINE_ANTI_FULLBRIGHT") {
+        if let Some(v) = env("MEGU_ANTI_FULLBRIGHT") {
             c.anti_fullbright = ac_env_bool(&v);
         }
-        if let Some(v) = env("MC_SPINE_ANTI_XRAY_UNDERGROUND") {
+        if let Some(v) = env("MEGU_ANTI_XRAY_UNDERGROUND") {
             c.hide_underground = ac_env_bool(&v);
         }
         c
@@ -279,15 +279,15 @@ fn ac_unbooted_default() -> AcConfig {
         } else {
             AcPreset::Standard
         },
-        anti_xray: std::env::var("MC_SPINE_ANTI_XRAY")
+        anti_xray: std::env::var("MEGU_ANTI_XRAY")
             .map(|v| ac_env_bool(&v))
             .unwrap_or(true),
-        anti_fullbright: std::env::var("MC_SPINE_ANTI_FULLBRIGHT")
+        anti_fullbright: std::env::var("MEGU_ANTI_FULLBRIGHT")
             .map(|v| ac_env_bool(&v))
             .unwrap_or(!cfg!(test)),
         // Same fixture rule as anti-fullbright: tests keep byte-identical chunks
         // unless a fixture opts the occlusion in explicitly.
-        hide_underground: std::env::var("MC_SPINE_ANTI_XRAY_UNDERGROUND")
+        hide_underground: std::env::var("MEGU_ANTI_XRAY_UNDERGROUND")
             .map(|v| ac_env_bool(&v))
             .unwrap_or(!cfg!(test)),
         ..AcConfig::default()
@@ -2144,9 +2144,9 @@ mod anticheat_unit_tests {
         assert!(c.anti_xray && c.notes.len() == 1, "{:?}", c.notes);
         // The environment wins: on/off and the old preset names.
         let env = [
-            ("MC_SPINE_ANTICHEAT", "off"),
-            ("MC_SPINE_ANTI_XRAY", "0"),
-            ("MC_SPINE_ANTI_FULLBRIGHT", "false"),
+            ("MEGU_ANTICHEAT", "off"),
+            ("MEGU_ANTI_XRAY", "0"),
+            ("MEGU_ANTI_FULLBRIGHT", "false"),
         ];
         let c = cfg("[anticheat]\nantixray = true\n", &env);
         assert_eq!(
@@ -2155,10 +2155,10 @@ mod anticheat_unit_tests {
         );
         let c = cfg(
             "[anticheat]\nenabled = false\n",
-            &[("MC_SPINE_ANTICHEAT", "strict")],
+            &[("MEGU_ANTICHEAT", "strict")],
         );
         assert_eq!(c.preset, AcPreset::Standard);
-        let c = cfg("", &[("MC_SPINE_ANTICHEAT", "sideways")]);
+        let c = cfg("", &[("MEGU_ANTICHEAT", "sideways")]);
         assert_eq!((c.preset, c.notes.len()), (AcPreset::Standard, 1));
     }
 

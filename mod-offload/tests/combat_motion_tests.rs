@@ -395,7 +395,7 @@ fn invalid_geometry_and_specs_are_rejected_without_recording_hits() {
 
 #[test]
 fn mot1_roundtrip_has_fixed_big_endian_layout() {
-    assert_eq!(MOTION_CHANNEL, "mc-spine:motion_v1");
+    assert_eq!(MOTION_CHANNEL, "megu:motion_v1");
     let mut swing = ActiveAction::start(slash(0x0102_0304), 1.5, 100, Hand::OffHand).unwrap();
     swing.advance_to(104).unwrap();
     let mut snapshot = MotionTrigger::from_action(0x0102_0304_0506_0708, &swing);

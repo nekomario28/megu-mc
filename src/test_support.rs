@@ -71,17 +71,17 @@ fn receipt_path(name: &str) -> std::path::PathBuf {
         .chars()
         .map(|c| if c.is_ascii_alphanumeric() { c } else { '_' })
         .collect();
-    std::env::temp_dir().join(format!("mc-spine-receipt-{}-{tag}", std::process::id()))
+    std::env::temp_dir().join(format!("megu-receipt-{}-{tag}", std::process::id()))
 }
 
 /// True when this process *is* the isolated child for the test it is running. It writes the
 /// receipt the parent checks, so "ran and panicked" and "never started" stay distinguishable.
 pub(crate) fn is_isolated_child() -> bool {
     let name = harness_name();
-    if std::env::var("MC_SPINE_TEST_CHILD").as_deref() != Ok(name.as_str()) {
+    if std::env::var("MEGU_TEST_CHILD").as_deref() != Ok(name.as_str()) {
         return false;
     }
-    if let Ok(path) = std::env::var("MC_SPINE_TEST_RECEIPT") {
+    if let Ok(path) = std::env::var("MEGU_TEST_RECEIPT") {
         let _ = std::fs::write(path, &name);
     }
     true
@@ -91,7 +91,7 @@ pub(crate) fn is_isolated_child() -> bool {
 /// writing, so the parent can tell "the child wrote and then panicked" from "the child did not
 /// run": both leave the parent's own scene untouched.
 pub(crate) fn child_note(note: &str) {
-    if let Ok(path) = std::env::var("MC_SPINE_TEST_RECEIPT") {
+    if let Ok(path) = std::env::var("MEGU_TEST_RECEIPT") {
         use std::io::Write;
         if let Ok(mut file) = std::fs::OpenOptions::new().append(true).open(path) {
             let _ = writeln!(file, "{note}");
@@ -99,31 +99,31 @@ pub(crate) fn child_note(note: &str) {
     }
 }
 
-/// `MC_SPINE_*` variables that in-process tests mutate. A child spawned while such a
-/// mutation is live inherits it — `MC_SPINE_ONLINE_MODE=1` mid-flip makes the child's own
+/// `MEGU_*` variables that in-process tests mutate. A child spawned while such a
+/// mutation is live inherits it — `MEGU_ONLINE_MODE=1` mid-flip makes the child's own
 /// loopback login demand an encryption response — so the child starts from defaults.
 /// Harness variables are not here: `Command::env` sets them after this list is applied.
 const CHILD_ENV_SCRUB: &[&str] = &[
-    "MC_SPINE_ALLOW_CAVE_MAP",
-    "MC_SPINE_ALLOW_ENTITY_RADAR",
-    "MC_SPINE_ALLOW_PLAYER_ADMIN_COMMANDS",
-    "MC_SPINE_ANTI_XRAY",
-    "MC_SPINE_ANVIL_WORLD_DIR",
-    "MC_SPINE_AUTO_UNLOAD_TICKS",
-    "MC_SPINE_BACKUP_MAX_KEEP",
-    "MC_SPINE_CONFIG",
-    "MC_SPINE_DATAPACK_CACHE_DIR",
-    "MC_SPINE_ENABLE_COMMAND_BLOCK",
-    "MC_SPINE_FAIR_PLAY",
-    "MC_SPINE_MC_VERSION",
-    "MC_SPINE_MODS_DIR",
-    "MC_SPINE_ONLINE_MODE",
-    "MC_SPINE_RESOURCE_PACK_REQUIRED",
-    "MC_SPINE_STRICT_WORLDGEN",
-    "MC_SPINE_TARGET_VERSION",
-    "MC_SPINE_VELOCITY_FORWARDING",
-    "MC_SPINE_VELOCITY_SECRET",
-    "MC_SPINE_WAL_PATH",
+    "MEGU_ALLOW_CAVE_MAP",
+    "MEGU_ALLOW_ENTITY_RADAR",
+    "MEGU_ALLOW_PLAYER_ADMIN_COMMANDS",
+    "MEGU_ANTI_XRAY",
+    "MEGU_ANVIL_WORLD_DIR",
+    "MEGU_AUTO_UNLOAD_TICKS",
+    "MEGU_BACKUP_MAX_KEEP",
+    "MEGU_CONFIG",
+    "MEGU_DATAPACK_CACHE_DIR",
+    "MEGU_ENABLE_COMMAND_BLOCK",
+    "MEGU_FAIR_PLAY",
+    "MEGU_MC_VERSION",
+    "MEGU_MODS_DIR",
+    "MEGU_ONLINE_MODE",
+    "MEGU_RESOURCE_PACK_REQUIRED",
+    "MEGU_STRICT_WORLDGEN",
+    "MEGU_TARGET_VERSION",
+    "MEGU_VELOCITY_FORWARDING",
+    "MEGU_VELOCITY_SECRET",
+    "MEGU_WAL_PATH",
 ];
 
 /// Run exactly `name` in a child and return its status with the receipt it left. Bounded: a
@@ -134,8 +134,8 @@ pub(crate) fn run_isolated_child(name: &str) -> (std::process::ExitStatus, Strin
     let _ = std::fs::remove_file(&receipt);
     let mut cmd = std::process::Command::new(std::env::current_exe().unwrap());
     cmd.args(["--exact", name, "--test-threads=1", "--nocapture"])
-        .env("MC_SPINE_TEST_CHILD", name)
-        .env("MC_SPINE_TEST_RECEIPT", &receipt);
+        .env("MEGU_TEST_CHILD", name)
+        .env("MEGU_TEST_RECEIPT", &receipt);
     for var in CHILD_ENV_SCRUB {
         cmd.env_remove(var);
     }

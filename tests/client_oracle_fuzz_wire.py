@@ -1,17 +1,17 @@
 #!/usr/bin/env python3
 # SPDX-License-Identifier: LGPL-3.0-or-later
-"""Client-side 3-layer bedrock gate for `mc-spine-client` (Protocol 767).
+"""Client-side 3-layer bedrock gate for `megu-client` (Protocol 767).
 
 Layer 1 — seeded adversarial S2C fuzz: a deterministic loopback mock
 Protocol 767 server completes Login + Configuration (uncompressed and
 compressed ``0x03`` framing) and then streams hostile Play packets at the
-real ``mc-spine-client`` binary. Hard invariants per wave: no ``panicked
+real ``megu-client`` binary. Hard invariants per wave: no ``panicked
 at``, no fatal signal (negative exit), no hang beyond a bounded timeout,
 and no ``--accessToken`` leakage into stdout/stderr.
 
 Layer 2 — clean loopback live verification: the same client runs
 ``--script walk`` with ``--render-png``/``--audio-wav``/``--json-summary``
-against a fresh ``mc-spine`` server (and, with ``--with-vanilla``, the
+against a fresh ``megu`` server (and, with ``--with-vanilla``, the
 pinned official Vanilla 1.21.1 ``server.jar``). Session-summary invariants
 plus PNG/WAV artifact validation and byte-identical determinism across two
 runs are enforced.
@@ -43,8 +43,8 @@ from typing import NamedTuple
 sys.dont_write_bytecode = True
 
 ROOT = Path(__file__).resolve().parents[1]
-DEFAULT_CLIENT = ROOT / "client-app/target/release/mc-spine-client"
-DEFAULT_SERVER = ROOT / "target/debug/mc-spine"
+DEFAULT_CLIENT = ROOT / "client-app/target/release/megu-client"
+DEFAULT_SERVER = ROOT / "target/debug/megu"
 DEFAULT_JAR = Path("/home/yuu/tmpx/carverfresh/server.jar")
 JAR_SHA1 = "59353fb40c36d304f2035d51e7d6e6baa98dc05c"
 JAVA_CANDIDATES = (
@@ -653,7 +653,7 @@ def build_context_vectors():
                    game_mode=0) + b"\x00",
         "respawn with unregistered dimension (fallback meta)")
     add("custom_payload_vfx", P_CUSTOM_PAYLOAD,
-        mc_string("mc-spine:vfx_v1") + b"\xff\xfe\xfd" * 8,
+        mc_string("megu:vfx_v1") + b"\xff\xfe\xfd" * 8,
         "known custom channel, malformed payload (ignored by recv_play)")
     add("custom_payload_unknown", P_CUSTOM_PAYLOAD,
         mc_string("totally:unknown") + bytes(range(256)),
@@ -912,7 +912,7 @@ def build_wave(case_index, case_seed):
     or "context_soak"; actions are ("packet", pid, body) | ("raw", bytes)
     | ("close",) tuples.
     """
-    rng = random.Random(f"mc-spine-oracle:{case_seed}:{case_index}")
+    rng = random.Random(f"megu-oracle:{case_seed}:{case_index}")
     slot = case_index % 8
 
     if slot == 7:
@@ -1332,7 +1332,7 @@ def wait_port(port, proc, timeout=SERVER_READY_TIMEOUT):
 
 
 class LiveServer:
-    """Disposable loopback game server (mc-spine or pinned Vanilla jar)."""
+    """Disposable loopback game server (megu or pinned Vanilla jar)."""
 
     def __init__(self, kind, binary, jar, workdir, seed):
         self.kind = kind
@@ -1348,7 +1348,7 @@ class LiveServer:
         self.workdir.mkdir(parents=True, exist_ok=True)
         env = dict(os.environ)
         env["TMPDIR"] = str(ROOT / "target/tmp")
-        if self.kind == "mc-spine":
+        if self.kind == "megu":
             for link, source in (
                     ("config_packets.bin", ROOT / "config_packets.bin"),
                     ("assets", ROOT / "assets")):
@@ -1357,15 +1357,15 @@ class LiveServer:
                     target.symlink_to(source.resolve(),
                                       target_is_directory=source.is_dir())
             env.update(
-                MC_SPINE_PORT=str(self.port),
-                MC_SPINE_BIND_ADDR="127.0.0.1",
-                MC_SPINE_SEED=str(self.seed),
-                MC_SPINE_WG="old",
-                MC_SPINE_RESOURCE_PACK_URL="",
-                MC_SPINE_ANTICHEAT="off",
-                MC_SPINE_COMPRESSION_THRESHOLD="256",
+                MEGU_PORT=str(self.port),
+                MEGU_BIND_ADDR="127.0.0.1",
+                MEGU_SEED=str(self.seed),
+                MEGU_WG="old",
+                MEGU_RESOURCE_PACK_URL="",
+                MEGU_ANTICHEAT="off",
+                MEGU_COMPRESSION_THRESHOLD="256",
             )
-            env.pop("MC_SPINE_RCON_PORT", None)
+            env.pop("MEGU_RCON_PORT", None)
             argv = [str(self.binary)]
         else:
             check(self.jar.is_file(), f"vanilla jar missing: {self.jar}")
@@ -1661,7 +1661,7 @@ def run_layer2(client_bin, server_bin, jar, seed, scratch):
     """Two identical live runs per server kind; PNG bytes and mesh metrics
     must match exactly."""
     results = {}
-    kinds = ["mc-spine"]
+    kinds = ["megu"]
     if jar is not None and jar.is_file():
         kinds.append("vanilla")
     for kind in kinds:
@@ -1681,8 +1681,8 @@ def run_layer2(client_bin, server_bin, jar, seed, scratch):
                 f"chunks={result['metrics']['chunks_decoded']} "
                 f"quads={result['metrics']['total_quads']} "
                 f"png={result['png']['sha256'][:16]}…")
-        if kind == "mc-spine":
-            # mc-spine emits a deterministic chunk stream: identical runs
+        if kind == "megu":
+            # megu emits a deterministic chunk stream: identical runs
             # must produce byte-identical PNGs and identical metrics.
             check(runs[0]["metrics"] == runs[1]["metrics"],
                   f"{kind}: mesh/session metrics differ between identical "
@@ -1707,7 +1707,7 @@ def run_layer2(client_bin, server_bin, jar, seed, scratch):
                 f"(camera/render counters legitimately differ under "
                 f"async chunk delivery)")
         results[kind] = runs[0]
-        if kind == "mc-spine":
+        if kind == "megu":
             log(f"{kind}: deterministic PNG + metrics verified "
                 f"({runs[0]['png']['width']}x{runs[0]['png']['height']}, "
                 f"{runs[0]['png']['distinct_colors']} colors)")
@@ -1814,7 +1814,7 @@ def self_test():
     check(outcome_violations(0, False, "ok", "") == [],
           "clean outcome flagged")
     check(outcome_violations(1, False, "",
-                             "mc-spine-client: connection closed") == [],
+                             "megu-client: connection closed") == [],
           "clean error exit flagged")
     v = outcome_violations(-11, False, "", "")
     check(any("signal" in x for x in v), f"SIGSEGV not caught: {v}")
@@ -1926,7 +1926,7 @@ def self_test():
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Client-side 3-layer bedrock gate for mc-spine-client "
+        description="Client-side 3-layer bedrock gate for megu-client "
                     "(Protocol 767 adversarial S2C fuzz + live "
                     "render/audio/prediction verification).")
     parser.add_argument("--client-bin", type=Path, default=DEFAULT_CLIENT)

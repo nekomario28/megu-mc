@@ -2,12 +2,12 @@
 
 use std::mem::{align_of, offset_of, size_of};
 
-use mc_spine_client_mesh::builtin_shadow_wgsl::*;
-use mc_spine_client_mesh::gpu_pipeline::GpuCapabilities;
-use mc_spine_client_mesh::shaderpack::{
+use megu_client_mesh::builtin_shadow_wgsl::*;
+use megu_client_mesh::gpu_pipeline::GpuCapabilities;
+use megu_client_mesh::shaderpack::{
     load_megu_wgsl_pack, GpuShaderCaps, PipelineStage, ShaderPackSource, MEGU_WGSL_MANIFEST,
 };
-use mc_spine_client_mesh::vfx_engine::DynamicColoredLight;
+use megu_client_mesh::vfx_engine::DynamicColoredLight;
 
 #[test]
 fn default_off_has_zero_shadow_work() {

@@ -39,22 +39,22 @@ versionRange="[21.1,)"
 side="BOTH"
 '''
 
-# Stub "mc-spine" / "NeoForge" server: writes its launch context (argv plus the
-# MC_SPINE_* env the launcher exports) to the marker file in argv[1], then
+# Stub "megu" / "NeoForge" server: writes its launch context (argv plus the
+# MEGU_* env the launcher exports) to the marker file in argv[1], then
 # exits with the code in argv[2] (0 when absent).
 STUB = '''#!/usr/bin/env python3
 import json, os, sys
 from pathlib import Path
 Path(sys.argv[1]).write_text(json.dumps({
     "argv": sys.argv[2:],
-    "plan": os.environ.get("MC_SPINE_LAUNCHER_PLAN"),
-    "policy": os.environ.get("MC_SPINE_FALLBACK_POLICY"),
-    "mods_dir": os.environ.get("MC_SPINE_MODS_DIR"),
-    "staging_dir": os.environ.get("MC_SPINE_STAGING_DIR"),
-    "needs_bounded_jvm": os.environ.get("MC_SPINE_NEEDS_BOUNDED_JVM"),
-    "quarantined": os.environ.get("MC_SPINE_QUARANTINED_MODS"),
-    "tier3": os.environ.get("MC_SPINE_TIER3_MODS"),
-    "superseded": os.environ.get("MC_SPINE_SUPERSEDED_PERF_MODS"),
+    "plan": os.environ.get("MEGU_LAUNCHER_PLAN"),
+    "policy": os.environ.get("MEGU_FALLBACK_POLICY"),
+    "mods_dir": os.environ.get("MEGU_MODS_DIR"),
+    "staging_dir": os.environ.get("MEGU_STAGING_DIR"),
+    "needs_bounded_jvm": os.environ.get("MEGU_NEEDS_BOUNDED_JVM"),
+    "quarantined": os.environ.get("MEGU_QUARANTINED_MODS"),
+    "tier3": os.environ.get("MEGU_TIER3_MODS"),
+    "superseded": os.environ.get("MEGU_SUPERSEDED_PERF_MODS"),
 }), encoding="utf-8")
 sys.exit(int(sys.argv[2]) if len(sys.argv) > 2 else 0)
 '''
@@ -316,7 +316,7 @@ class ClassifierUnitTests(unittest.TestCase):
                 if a.tier == mod_launcher.TIER_SUPERSEDED:
                     self.assertEqual(
                         a.reasons,
-                        ["already covered by mc-spine built-in optimizations"])
+                        ["already covered by megu built-in optimizations"])
 
     def test_superseded_match_is_case_insensitive_multi_id(self):
         # Any declared id (Fabric or NeoForge) hits the catalog, whatever case.
@@ -346,7 +346,7 @@ class ClassifierUnitTests(unittest.TestCase):
         tier, reasons = mod_launcher.classify(sodium, set(), set())
         self.assertEqual(tier, mod_launcher.TIER_SUPERSEDED)
         self.assertEqual(reasons,
-                         ["already covered by mc-spine built-in optimizations"])
+                         ["already covered by megu built-in optimizations"])
 
     def test_incompatible_declared_range_is_tier3_with_plain_language_reason(self):
         # A real content mod declaring a 1.20.1-only Maven range on a 1.21.1
@@ -504,7 +504,7 @@ class ClassifierUnitTests(unittest.TestCase):
         tier, reasons = mod_launcher.classify(sodium, set(), set(), (26, 3, 0))
         self.assertEqual(tier, mod_launcher.TIER_SUPERSEDED)
         self.assertEqual(reasons,
-                         ["already covered by mc-spine built-in optimizations"])
+                         ["already covered by megu built-in optimizations"])
 
 
 class VersionCompatUnitTests(unittest.TestCase):
@@ -818,14 +818,14 @@ class LauncherIntegrationTests(unittest.TestCase):
         for path, mod_id in ((self.mods / "first.bundle.json", "first:mod"),
                              (adapted / "second.bundle.json", "second:mod")):
             path.write_text(json.dumps({
-                "schema": "mc-spine-mod-bundle/1", "mod_id": mod_id,
+                "schema": "megu-mod-bundle/1", "mod_id": mod_id,
                 "mc_version_range": "[1.21.1,1.21.1]",
                 "portals": [], "progression_barriers": [],
                 "biome_regions": [], "creatures": [],
                 "custom_channels": [mod_id.replace(":mod", ":sync")],
             }), encoding="utf-8")
         marker = self.tmp / "auto.json"
-        proc, report = self.invoke("--auto-adapt", "--mc-spine-cmd",
+        proc, report = self.invoke("--auto-adapt", "--megu-cmd",
                                    self.cmd(marker), "--json")
         self.assertEqual(proc.returncode, 0, proc.stderr)
         self.assertEqual(report["plan"], "RunNative")
@@ -864,7 +864,7 @@ class LauncherIntegrationTests(unittest.TestCase):
 
     def test_auto_adapt_rejects_invalid_native_bundle(self):
         (self.mods / "invalid.bundle.json").write_text(json.dumps({
-            "schema": "mc-spine-mod-bundle/1", "mod_id": "invalid:mod",
+            "schema": "megu-mod-bundle/1", "mod_id": "invalid:mod",
             "mc_version_range": "[1.20.1,1.20.1]",
         }), encoding="utf-8")
         proc, _ = self.invoke("--auto-adapt", "--dry-run", "--json")
@@ -873,7 +873,7 @@ class LauncherIntegrationTests(unittest.TestCase):
 
     def test_auto_adapt_rejects_missing_required_bundle_sections(self):
         (self.mods / "incomplete.bundle.json").write_text(json.dumps({
-            "schema": "mc-spine-mod-bundle/1", "mod_id": "missing:sections",
+            "schema": "megu-mod-bundle/1", "mod_id": "missing:sections",
             "mc_version_range": "[1.21.1,1.21.1]",
             "custom_channels": [],
         }), encoding="utf-8")
@@ -885,7 +885,7 @@ class LauncherIntegrationTests(unittest.TestCase):
         """create flagship + pure-data pack + mekanism profile => all Tier 0/1.
 
         Under --fallback delegate with a NeoForge fallback command wired up,
-        0 Tier 3 mods must launch mc-spine directly and never touch the
+        0 Tier 3 mods must launch megu directly and never touch the
         NeoForge runtime (zero additional RSS / startup time invariant).
         """
         create = self.mods / "create.jar"
@@ -911,7 +911,7 @@ class LauncherIntegrationTests(unittest.TestCase):
             "--fallback", "delegate",
             "--profiles-dir", str(self.profiles),
             "--shimcheck-json", str(shim),
-            "--mc-spine-cmd", self.cmd(mc_marker),
+            "--megu-cmd", self.cmd(mc_marker),
             "--neoforge-fallback-cmd", self.cmd(neo_marker),
             "--world-namespaces", "create,minecraft",
             "--json")
@@ -924,9 +924,9 @@ class LauncherIntegrationTests(unittest.TestCase):
             "mekanism": "UniversalNative",
             "twilight": "UniversalNative",
         })
-        self.assertEqual(report["launch"]["kind"], "mc_spine")
+        self.assertEqual(report["launch"]["kind"], "megu")
         self.assertTrue(report["launch"]["executed"])
-        self.assertTrue(mc_marker.is_file(), "mc-spine stub never ran")
+        self.assertTrue(mc_marker.is_file(), "megu stub never ran")
         marker = json.loads(mc_marker.read_text())
         self.assertEqual(marker["plan"], "RunNative")
         self.assertEqual(marker["needs_bounded_jvm"], "false")
@@ -941,7 +941,7 @@ class LauncherIntegrationTests(unittest.TestCase):
         proc, report = self.invoke(
             "--fallback", "delegate",
             "--shimcheck-json", str(shim),
-            "--mc-spine-cmd", self.cmd(mc_marker),
+            "--megu-cmd", self.cmd(mc_marker),
             "--json")
         self.assertEqual(proc.returncode, 0, proc.stderr)
         self.assertEqual(report["plan"], "RunNative")
@@ -966,7 +966,7 @@ class LauncherIntegrationTests(unittest.TestCase):
         proc, report = self.invoke(
             "--fallback", "strict",
             "--shimcheck-json", str(shim),
-            "--mc-spine-cmd", self.cmd(mc_marker),
+            "--megu-cmd", self.cmd(mc_marker),
             "--json")
         self.assertEqual(proc.returncode, 2, (proc.returncode, proc.stderr))
         self.assertEqual(report["plan"], "RefuseStartup")
@@ -993,7 +993,7 @@ class LauncherIntegrationTests(unittest.TestCase):
             "--fallback", "quarantine",
             "--shimcheck-json", str(shim),
             "--world-namespaces", "create,minecraft,badmixin",
-            "--mc-spine-cmd", self.cmd(self.tmp / "mc.json"),
+            "--megu-cmd", self.cmd(self.tmp / "mc.json"),
             "--json")
         self.assertEqual(proc.returncode, 2, proc.stderr)
         self.assertEqual(report["plan"], "RefuseStartup")
@@ -1001,7 +1001,7 @@ class LauncherIntegrationTests(unittest.TestCase):
         self.assertEqual([a["mod_id"] for a in report["blocking_mods"]],
                          ["badmixin"])
 
-    def test_quarantine_stages_safe_mods_and_launches_mc_spine(self):
+    def test_quarantine_stages_safe_mods_and_launches_megu(self):
         create = self.mods / "create.jar"
         _jar(create, "create")
         twilight = self.mods / "twilight_dim.zip"
@@ -1021,7 +1021,7 @@ class LauncherIntegrationTests(unittest.TestCase):
             "--shimcheck-json", str(shim),
             "--world-namespaces", "create,minecraft",
             "--quarantine-load-data",
-            "--mc-spine-cmd", self.cmd(mc_marker) + " {mods_dir}",
+            "--megu-cmd", self.cmd(mc_marker) + " {mods_dir}",
             "--json")
         self.assertEqual(proc.returncode, 0, proc.stderr)
         self.assertEqual(report["plan"], "RunNative")
@@ -1055,7 +1055,7 @@ class LauncherIntegrationTests(unittest.TestCase):
             "--shimcheck-json", str(shim),
             "--world-namespaces", "badmixin",
             "--force-drop-saved-blocks",
-            "--mc-spine-cmd", self.cmd(mc_marker),
+            "--megu-cmd", self.cmd(mc_marker),
             "--json")
         self.assertEqual(proc.returncode, 0, proc.stderr)
         self.assertEqual(report["plan"], "RunNative")
@@ -1076,7 +1076,7 @@ class LauncherIntegrationTests(unittest.TestCase):
             "--fallback", "quarantine",
             "--shimcheck-json", str(shim),
             "--save-file", str(save_dir),
-            "--mc-spine-cmd", self.cmd(self.tmp / "mc.json"),
+            "--megu-cmd", self.cmd(self.tmp / "mc.json"),
             "--json")
         self.assertEqual(proc.returncode, 2, proc.stderr)
         self.assertEqual(report["plan"], "RefuseStartup")
@@ -1098,13 +1098,13 @@ class LauncherIntegrationTests(unittest.TestCase):
             "--fallback", "delegate",
             "--shimcheck-json", str(shim),
             "--world-namespaces", "badmixin",
-            "--mc-spine-cmd", self.cmd(mc_marker),
+            "--megu-cmd", self.cmd(mc_marker),
             "--neoforge-fallback-cmd", self.cmd(neo_marker, 7),
             "--json")
         self.assertEqual(proc.returncode, 7, (proc.returncode, proc.stderr))
         self.assertEqual(report["plan"], "DelegateToNeoForge")
         self.assertEqual(report["launch"]["exit_code"], 7)
-        self.assertFalse(mc_marker.exists(), "mc-spine ran during delegation")
+        self.assertFalse(mc_marker.exists(), "megu ran during delegation")
         self.assertTrue(neo_marker.is_file(), "NeoForge fallback never ran")
         marker = json.loads(neo_marker.read_text())
         self.assertEqual(marker["plan"], "DelegateToNeoForge")
@@ -1123,7 +1123,7 @@ class LauncherIntegrationTests(unittest.TestCase):
         proc, report = self.invoke(
             "--fallback", "delegate",
             "--shimcheck-json", str(shim),
-            "--mc-spine-cmd", self.cmd(self.tmp / "mc.json"),
+            "--megu-cmd", self.cmd(self.tmp / "mc.json"),
             "--json")
         self.assertEqual(proc.returncode, 2, proc.stderr)
         self.assertEqual(report["plan"], "DelegateToNeoForge")
@@ -1148,7 +1148,7 @@ class LauncherIntegrationTests(unittest.TestCase):
     def test_pure_data_dimension_mod_jar_is_tier1_zero_jvm(self):
         """Aether-style data-driven dimension mod: dimension_type + dimension
         + worldgen + ore tags, vanilla noise generator, zero .class files =>
-        Tier 1, mc-spine launches natively and NeoForge never starts."""
+        Tier 1, megu launches natively and NeoForge never starts."""
         aether = self.mods / "aetherlike.jar"
         _data_zip(aether, [
             ("data/aetherlike/dimension_type/the_aether.json", _dim_type_json()),
@@ -1165,7 +1165,7 @@ class LauncherIntegrationTests(unittest.TestCase):
         neo_marker = self.tmp / "neo.json"
         proc, report = self.invoke(
             "--fallback", "delegate",
-            "--mc-spine-cmd", self.cmd(mc_marker),
+            "--megu-cmd", self.cmd(mc_marker),
             "--neoforge-fallback-cmd", self.cmd(neo_marker),
             "--json")
         self.assertEqual(proc.returncode, 0, proc.stderr)
@@ -1184,7 +1184,7 @@ class LauncherIntegrationTests(unittest.TestCase):
                          ["aetherlike:ambrosium_ore"])
         self.assertEqual(dims[0]["chest_tag_blocks"],
                          ["aetherlike:skyroot_chest"])
-        self.assertTrue(mc_marker.is_file(), "mc-spine stub never ran")
+        self.assertTrue(mc_marker.is_file(), "megu stub never ran")
         self.assertFalse(neo_marker.exists(),
                          "NeoForge ran for a pure data-driven dimension mod")
 
@@ -1205,7 +1205,7 @@ class LauncherIntegrationTests(unittest.TestCase):
         proc, report = self.invoke(
             "--fallback", "delegate",
             "--shimcheck-json", str(shim),
-            "--mc-spine-cmd", self.cmd(mc_marker),
+            "--megu-cmd", self.cmd(mc_marker),
             "--neoforge-fallback-cmd", self.cmd(neo_marker),
             "--json")
         self.assertEqual(proc.returncode, 0, proc.stderr)
@@ -1218,14 +1218,14 @@ class LauncherIntegrationTests(unittest.TestCase):
         self.assertEqual(len(dims), 1)
         self.assertEqual(dims[0]["custom_chunk_generators"],
                          ["deepdim:echoing_void_gen"])
-        self.assertFalse(mc_marker.exists(), "mc-spine ran during delegation")
+        self.assertFalse(mc_marker.exists(), "megu ran during delegation")
         self.assertTrue(neo_marker.is_file(), "NeoForge fallback never ran")
 
     def test_builtin_perf_modpack_launches_pure_native_zero_fallback(self):
         """Real modpack shape: content mods + sodium/lithium/modernfix whose
         ShimCheck-visible Mixins must be superseded — never Tier 3.
 
-        Every policy launches pure native mc-spine; the NeoForge fallback
+        Every policy launches pure native megu; the NeoForge fallback
         command is never executed and the operator line names the 3 skipped
         mods.
         """
@@ -1249,7 +1249,7 @@ class LauncherIntegrationTests(unittest.TestCase):
             proc, report = self.invoke(
                 "--fallback", policy,
                 "--shimcheck-json", str(shim),
-                "--mc-spine-cmd", self.cmd(mc_marker),
+                "--megu-cmd", self.cmd(mc_marker),
                 "--neoforge-fallback-cmd", self.cmd(neo_marker),
                 "--world-namespaces", "create,minecraft",
                 "--json")
@@ -1267,9 +1267,9 @@ class LauncherIntegrationTests(unittest.TestCase):
                 "lithium": "BuiltInSuperseded",
                 "modernfix": "BuiltInSuperseded",
             }, policy)
-            self.assertEqual(report["launch"]["kind"], "mc_spine", policy)
+            self.assertEqual(report["launch"]["kind"], "megu", policy)
             self.assertTrue(mc_marker.is_file(),
-                            f"mc-spine stub never ran under {policy}")
+                            f"megu stub never ran under {policy}")
             marker = json.loads(mc_marker.read_text())
             self.assertEqual(marker["plan"], "RunNative")
             self.assertEqual(marker["superseded"],
@@ -1287,7 +1287,7 @@ class LauncherIntegrationTests(unittest.TestCase):
                 if a["tier_name"] == "BuiltInSuperseded":
                     self.assertEqual(
                         a["reasons"],
-                        ["already covered by mc-spine built-in optimizations"])
+                        ["already covered by megu built-in optimizations"])
 
     def test_quarantine_never_stages_superseded_perf_mods(self):
         """Quarantine staging copies active + tier3-adjacent data only —
@@ -1311,7 +1311,7 @@ class LauncherIntegrationTests(unittest.TestCase):
             "--shimcheck-json", str(shim),
             "--world-namespaces", "create,minecraft",
             "--quarantine-load-data",
-            "--mc-spine-cmd", self.cmd(mc_marker),
+            "--megu-cmd", self.cmd(mc_marker),
             "--json")
         self.assertEqual(proc.returncode, 0, proc.stderr)
         self.assertEqual(report["plan"], "RunNative")
@@ -1429,7 +1429,7 @@ class LauncherIntegrationTests(unittest.TestCase):
         assignment = report["assignments"][0]
         self.assertEqual(assignment["tier_name"], "BuiltInSuperseded")
         self.assertEqual(assignment["reasons"],
-                         ["already covered by mc-spine built-in optimizations"])
+                         ["already covered by megu built-in optimizations"])
         # The declared range is still recorded for audit, verdict uncomputed.
         self.assertEqual(assignment["mc_version_range"], "1.20.x")
         self.assertIsNone(assignment["mc_version_verdict"])
@@ -1532,7 +1532,7 @@ class LauncherIntegrationTests(unittest.TestCase):
         assignment = report["assignments"][0]
         self.assertEqual(assignment["tier_name"], "BuiltInSuperseded")
         self.assertEqual(assignment["reasons"],
-                         ["already covered by mc-spine built-in optimizations"])
+                         ["already covered by megu built-in optimizations"])
         self.assertEqual(assignment["mc_version_range"], "[1.21.1]")
         self.assertIsNone(assignment["mc_version_verdict"])
 
@@ -1613,7 +1613,7 @@ class LauncherIntegrationTests(unittest.TestCase):
         shim = self.write_shim((create, "COMPATIBLE", []))
         proc, _ = self.invoke(
             "--shimcheck-json", str(shim),
-            "--mc-spine-cmd", self.cmd(self.tmp / "mc.json"))
+            "--megu-cmd", self.cmd(self.tmp / "mc.json"))
         self.assertEqual(proc.returncode, 0, proc.stderr)
         self.assertIn("Tier 0 NativeFlagship", proc.stdout)
         self.assertIn("create", proc.stdout)
@@ -2051,7 +2051,7 @@ class ModpackPreflightCliTests(unittest.TestCase):
         proc, report = self.invoke(
             pack, "--format", "json", "--flagship-mods", "create,aether")
         self.assertEqual(proc.returncode, 0, proc.stderr)
-        self.assertEqual(report["schema"], "mc-spine-modpack-preflight/1")
+        self.assertEqual(report["schema"], "megu-modpack-preflight/1")
         self.assertEqual(report["format"], "modrinth")
         self.assertEqual(report["pack_name"], "Create NeoForge Adventure")
         self.assertEqual(report["mc_version_declared"], "1.21.1")
@@ -2247,7 +2247,7 @@ class ModpackPreflightCliTests(unittest.TestCase):
         proc, report = self.invoke(
             pack, "--json", "--flagship-mods", "create,aether")
         self.assertEqual(proc.returncode, 0, proc.stderr)
-        self.assertEqual(report["schema"], "mc-spine-modpack-preflight/1")
+        self.assertEqual(report["schema"], "megu-modpack-preflight/1")
         # --mods-dir and --modpack are mutually exclusive.
         command = [sys.executable, str(TOOL),
                    "--mods-dir", str(self.tmp), "--modpack", str(pack)]

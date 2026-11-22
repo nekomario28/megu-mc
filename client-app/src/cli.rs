@@ -5,8 +5,8 @@
 use std::fmt;
 use std::path::{Path, PathBuf};
 
-use mc_spine_client_mesh::RenderBackendPreference;
-use mc_spine_proto::friend_relay::InviteCode;
+use megu_client_mesh::RenderBackendPreference;
+use megu_proto::friend_relay::InviteCode;
 
 use crate::audio_out::AudioSinkKind;
 use crate::crash_reporter::parse_report_url;
@@ -20,20 +20,20 @@ use crate::settings::{
 
 pub const CLIENT_VERSION: &str = env!("CARGO_PKG_VERSION");
 pub const MINECRAFT_VERSION: &str = "1.21.1";
-pub const PROTOCOL_VERSION: u32 = mc_spine_proto::ProtocolVersion::V1_21_1.number() as u32;
+pub const PROTOCOL_VERSION: u32 = megu_proto::ProtocolVersion::V1_21_1.number() as u32;
 
 /// Environment variable consulted for the kernel version pack directory when
 /// `--version-dir` is not passed — the same name the server's
 /// `VersionAssetPaths::resolve` honors.
-pub const VERSION_DIR_ENV: &str = "MC_SPINE_VERSION_DIR";
+pub const VERSION_DIR_ENV: &str = "MEGU_VERSION_DIR";
 
 /// Parse a `--mc-version` value into the protocol the client should speak.
 /// Accepts the Minecraft release name or its numeric protocol; anything else
 /// fails closed instead of guessing a table.
-pub fn parse_mc_version(value: &str) -> Result<mc_spine_proto::ProtocolVersion, String> {
+pub fn parse_mc_version(value: &str) -> Result<megu_proto::ProtocolVersion, String> {
     match value.trim() {
-        "1.21.1" | "767" => Ok(mc_spine_proto::ProtocolVersion::V1_21_1),
-        "26.3" | "777" => Ok(mc_spine_proto::ProtocolVersion::V26_3),
+        "1.21.1" | "767" => Ok(megu_proto::ProtocolVersion::V1_21_1),
+        "26.3" | "777" => Ok(megu_proto::ProtocolVersion::V26_3),
         other => Err(format!(
             "invalid --mc-version '{other}' (expected 1.21.1, 26.3, 767, or 777)"
         )),
@@ -106,14 +106,14 @@ pub struct CliConfig {
     pub server_bin: Option<PathBuf>,
     pub seed: Option<i64>,
 
-    // Native mc-spine-client flags
+    // Native megu-client flags
     /// Protocol the client handshakes with (`--mc-version`); defaults to
     /// 1.21.1/767.
-    pub mc_version: mc_spine_proto::ProtocolVersion,
+    pub mc_version: megu_proto::ProtocolVersion,
     /// `--ping <host[:port]>`: run a server-list status query and exit.
     pub ping: Option<String>,
     /// Kernel version pack directory (`--version-dir` or
-    /// `MC_SPINE_VERSION_DIR`) for `Registry::from_version_dir`.
+    /// `MEGU_VERSION_DIR`) for `Registry::from_version_dir`.
     pub version_dir: Option<PathBuf>,
     pub headless: bool,
     /// `--audio-sink <auto|pipewire|alsa|coreaudio|winmm|null|off>`:
@@ -245,7 +245,7 @@ impl Default for CliConfig {
             relay: None,
             server_bin: None,
             seed: None,
-            mc_version: mc_spine_proto::ProtocolVersion::V1_21_1,
+            mc_version: megu_proto::ProtocolVersion::V1_21_1,
             ping: None,
             version_dir: None,
             headless: false,
@@ -438,7 +438,7 @@ impl CliConfig {
     /// given explicitly.
     ///
     /// Precedence, lowest to highest: `--preset` base, `--settings` file (or
-    /// `mc-spine-client.toml` in the working directory) keys,
+    /// `megu-client.toml` in the working directory) keys,
     /// `--import-vanilla-options` keys, explicit per-flag overrides. Returns
     /// one plain-language warning per recoverable file problem; an
     /// unreadable explicit `--settings` or `--import-vanilla-options` path
@@ -449,7 +449,7 @@ impl CliConfig {
     }
 
     /// [`CliConfig::resolve_client_settings`] with an explicit directory for
-    /// the `mc-spine-client.toml` auto-load, kept separate so tests can
+    /// the `megu-client.toml` auto-load, kept separate so tests can
     /// point it at a scratch directory.
     pub fn resolve_client_settings_from(&mut self, auto_dir: &Path) -> Result<Vec<String>, String> {
         let mut warnings = Vec::new();
@@ -1109,11 +1109,11 @@ fn parse_args_inner<S: AsRef<str>>(args: &[S], secrets: Vec<String>) -> Result<C
 pub fn help_text() -> String {
     format!(
         "\
-mc-spine-client {CLIENT_VERSION} (Minecraft {MINECRAFT_VERSION}, Protocol {PROTOCOL_VERSION})
-Native zero-dependency Rust client combining mc-spine-kernel and mc-spine-client-mesh.
+megu-client {CLIENT_VERSION} (Minecraft {MINECRAFT_VERSION}, Protocol {PROTOCOL_VERSION})
+Native zero-dependency Rust client combining megu-kernel and megu-client-mesh.
 
 USAGE:
-  mc-spine-client [LAUNCHER FLAGS] [NATIVE FLAGS]
+  megu-client [LAUNCHER FLAGS] [NATIVE FLAGS]
 
 LAUNCHER COMPATIBILITY FLAGS:
   --username <name>                  Player name (default: SpinePlayer)
@@ -1128,12 +1128,12 @@ LAUNCHER COMPATIBILITY FLAGS:
   --assetsDir <path>                 Minecraft assets directory
   --assetIndex <id>                  Asset index identifier
   --quickPlayMultiplayer <host[:p]>  Connect directly to multiplayer server
-  --quickPlaySingleplayer <world>    Launch integrated mc-spine server for world
+  --quickPlaySingleplayer <world>    Launch integrated megu server for world
   --server <host>                    Server host (alternative to quickPlayMultiplayer)
   --join-code <MEGU-XXXX-XXXX>       Join a shared world using a friend invite
   --relay <host:port>                Relay address (required with --join-code)
   --port <port>                      Server port (default: 25565)
-  --server-bin <path>                mc-spine server binary for --quickPlaySingleplayer
+  --server-bin <path>                megu server binary for --quickPlaySingleplayer
   --seed <seed>                      World seed for a new --quickPlaySingleplayer world
 
 NATIVE CLIENT FLAGS:
@@ -1142,7 +1142,7 @@ NATIVE CLIENT FLAGS:
                                      MOTD, latency, icon) and exit; honors
                                      --mc-version and --json/--json-summary
   --version-dir <path>               Kernel version pack directory for the block
-                                     registry (env: MC_SPINE_VERSION_DIR)
+                                     registry (env: MEGU_VERSION_DIR)
   --headless                         Run headless protocol + meshing + physics session
   --audio-sink <backend>             Sound playback: auto|pipewire|alsa|coreaudio|winmm|null|off
                                      (default: auto = pw-cat, else aplay, else null;
@@ -1166,7 +1166,7 @@ PLAYER SETTINGS:
   Settings resolve in this order: --preset first, then the settings file,
   then --import-vanilla-options, then any explicit flags below.
   --settings <path>                Load settings from a TOML file
-                                   (default: ./mc-spine-client.toml when present)
+                                   (default: ./megu-client.toml when present)
   --preset <name>                  Start from a preset: fast|balanced|high|ultra
   --import-vanilla-options <path>  Import a Vanilla options.txt into the settings
   --write-settings <path>          Save the resolved settings to a TOML file
@@ -1205,8 +1205,8 @@ SHADER PACKS:
 HOST WORLD MAP FAIR PLAY:
   Applied when this client hosts a world (--quickPlaySingleplayer, LAN
   share, or a MEGU-XXXX-XXXX friend relay) and forwarded to the spawned
-  mc-spine server as MC_SPINE_FAIR_PLAY*, MC_SPINE_MINIMAP_MODE,
-  MC_SPINE_ALLOW_MOB_RADAR and MC_SPINE_PLAYER_RADAR_SCOPE environment
+  megu server as MEGU_FAIR_PLAY*, MEGU_MINIMAP_MODE,
+  MEGU_ALLOW_MOB_RADAR and MEGU_PLAYER_RADAR_SCOPE environment
   variables plus the Xaero §-coded control signal. The five granular
   switches mirror the server's minimap-mode / allow-cave-map /
   allow-mob-radar / player-radar-scope / allow-waypoint-teleport keys.
@@ -1247,9 +1247,9 @@ CRASH REPORTS:
 
 pub fn version_info_text() -> String {
     format!(
-        "mc-spine-client {CLIENT_VERSION} (minecraft={MINECRAFT_VERSION}, protocol={PROTOCOL_VERSION}, kernel_abi={}, mesh_abi={})",
-        mc_spine_kernel::ABI_VERSION,
-        mc_spine_client_mesh::ffi::ABI_VERSION,
+        "megu-client {CLIENT_VERSION} (minecraft={MINECRAFT_VERSION}, protocol={PROTOCOL_VERSION}, kernel_abi={}, mesh_abi={})",
+        megu_kernel::ABI_VERSION,
+        megu_client_mesh::ffi::ABI_VERSION,
     )
 }
 
@@ -1260,7 +1260,7 @@ mod tests {
 
     fn scratch_dir(tag: &str) -> PathBuf {
         let dir =
-            std::env::temp_dir().join(format!("mc-spine-cli-test-{tag}-{}", std::process::id()));
+            std::env::temp_dir().join(format!("megu-cli-test-{tag}-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         dir
@@ -1333,7 +1333,7 @@ mod tests {
     }
 
     #[test]
-    fn auto_loads_mc_spine_client_toml_and_warns_on_bad_values() {
+    fn auto_loads_megu_client_toml_and_warns_on_bad_values() {
         let dir = scratch_dir("auto-load");
         write_file(
             &dir,

@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: LGPL-3.0-or-later OR GPL-3.0-or-later OR AGPL-3.0-or-later
-//! Tests for `mc_spine_core::romaji_ime`.
+//! Tests for `megu_core::romaji_ime`.
 
-use mc_spine_core::romaji_ime::{
+use megu_core::romaji_ime::{
     format_romaji_chat, romaji_to_hiragana, RomajiChatConfig, RomajiChatMode,
 };
 

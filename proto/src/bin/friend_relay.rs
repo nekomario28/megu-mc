@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: LGPL-3.0-or-later OR GPL-3.0-or-later OR AGPL-3.0-or-later
-//! `mc-spine-friend-relay`: standalone TCP operator for the `FRL1` friend
-//! invite relay implemented by `mc_spine_proto::friend_relay`.
+//! `megu-friend-relay`: standalone TCP operator for the `FRL1` friend
+//! invite relay implemented by `megu_proto::friend_relay`.
 //!
 //! The public listener is a small fail-closed edge in front of an internal
 //! loopback [`TcpFriendRelay`]. It parses only the tiny `FRL1` control frames
@@ -21,16 +21,16 @@ use std::sync::{mpsc, Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 
-use mc_spine_proto::friend_relay::{
+use megu_proto::friend_relay::{
     decode_frame, decode_packet, encode_frame, FriendPacket, FriendRelayConfig, FriendRelayRouter,
     TcpFriendRelay, FRIEND_MAGIC, MAX_FRL1_FRAME_BYTES,
 };
 
 const HELP: &str = "\
-mc-spine-friend-relay — standalone FRL1 friend invite relay
+megu-friend-relay — standalone FRL1 friend invite relay
 
 USAGE:
-    mc-spine-friend-relay [OPTIONS]
+    megu-friend-relay [OPTIONS]
 
 OPTIONS:
     --bind <ip:port>             TCP address to serve on (default 127.0.0.1:25580).
@@ -200,7 +200,7 @@ fn main() -> ExitCode {
         }
         Ok(Parsed::Run(c)) => c,
         Err(e) => {
-            eprintln!("error: {e}\nrun `mc-spine-friend-relay --help` for usage");
+            eprintln!("error: {e}\nrun `megu-friend-relay --help` for usage");
             return ExitCode::from(2);
         }
     };
@@ -258,7 +258,7 @@ fn serve(cli: &Cli) -> io::Result<()> {
     let hosts: SharedHosts = Arc::new(Mutex::new(HostAccounting::default()));
     let limits = cli.limits;
     eprintln!(
-        "mc-spine-friend-relay: FRL1 listening on {} \
+        "megu-friend-relay: FRL1 listening on {} \
          (max_hosts={}, max_guests_per_host={}, invite_ttl_secs={})",
         public_addr, cli.limits.max_hosts, cli.limits.max_guests_per_host, cli.ttl_secs,
     );
@@ -275,7 +275,7 @@ fn serve(cli: &Cli) -> io::Result<()> {
                 let hosts = Arc::clone(&hosts);
                 thread::spawn(move || {
                     if let Err(e) = bridge_client(client, internal_addr, hosts, limits) {
-                        eprintln!("mc-spine-friend-relay: client {peer}: {e}");
+                        eprintln!("megu-friend-relay: client {peer}: {e}");
                     }
                 });
             }

@@ -33,17 +33,17 @@ Safety contract — a pure-stdlib mirror of the invariants enforced by
 5. Superseded performance mods — ids matching
    `BUILTIN_SUPERSEDED_PERF_MODS` (exact mirror of
    `mod-adapter-core/src/fallback.rs`) are skipped up front with a
-   friendly explanation: mc-spine already builds that optimization in
+   friendly explanation: megu already builds that optimization in
    natively, so no download happens unless `--force` is passed.
 
 Clean-room note: matching a mod id against BUILTIN_SUPERSEDED_PERF_MODS
 only *skips downloading* a mod — it copies, links, bundles, or derives
 nothing from that mod. Every built-in optimization is a 100% clean-room
-original Rust implementation inside mc-spine.
+original Rust implementation inside megu.
 
-After a successful install, if a compiled `mc-spine-mod-check` binary is
+After a successful install, if a compiled `megu-mod-check` binary is
 on PATH or under `target/`, it is run as
-`mc-spine-mod-check --adapt-mods-dir <dir> --json` and its verdict is
+`megu-mod-check --adapt-mods-dir <dir> --json` and its verdict is
 summarized for the operator along with the reload/restart hint.
 """
 
@@ -87,7 +87,7 @@ HTTP_TIMEOUT = 30
 MAX_DEP_DEPTH = 4
 MAX_SEARCH_LIMIT = 100
 DEFAULT_MC_VERSION = "1.21.1"
-USER_AGENT = f"mc-spine/{PROG} (Modrinth v2 dependency installer)"
+USER_AGENT = f"megu/{PROG} (Modrinth v2 dependency installer)"
 
 MOD_ID_RE = re.compile(r"^[A-Za-z0-9_-]{1,64}$")
 SLUG_RE = re.compile(r"^[a-z0-9_-]{1,64}$")
@@ -118,7 +118,7 @@ _SUPERSEDED_NORMALIZED = frozenset(
 )
 
 # Mirror of REASON_SUPERSEDED in mod-adapter-core/src/fallback.rs.
-REASON_SUPERSEDED = "already covered by mc-spine built-in optimizations"
+REASON_SUPERSEDED = "already covered by megu built-in optimizations"
 
 # Exact mirror of RUNTIME_PROVIDED_MOD_IDS in
 # mod-adapter-core/src/ecosystem_compat.rs — never reported as missing.
@@ -874,20 +874,20 @@ def scan_mods_dir(mods_dir):
 
 
 # ---------------------------------------------------------------------------
-# mc-spine-mod-check integration
+# megu-mod-check integration
 # ---------------------------------------------------------------------------
 
 def find_mod_check_binary():
-    for rel in ("target/debug/mc-spine-mod-check",
-                "target/release/mc-spine-mod-check"):
+    for rel in ("target/debug/megu-mod-check",
+                "target/release/megu-mod-check"):
         candidate = ROOT / rel
         if candidate.is_file() and os.access(candidate, os.X_OK):
             return str(candidate)
-    return shutil.which("mc-spine-mod-check")
+    return shutil.which("megu-mod-check")
 
 
 def run_mod_check(mods_dir):
-    """Run `mc-spine-mod-check --adapt-mods-dir <dir> --json` when available.
+    """Run `megu-mod-check --adapt-mods-dir <dir> --json` when available.
     Returns (binary_path_or_None, report_dict_or_None, warning_or_None)."""
     binary = find_mod_check_binary()
     if binary is None:
@@ -903,7 +903,7 @@ def run_mod_check(mods_dir):
     except json.JSONDecodeError:
         return binary, None, (
             f"adapt check exited {proc.returncode} with no JSON report")
-    if report.get("schema") != "mc-spine-mods-dir-adaptation/1":
+    if report.get("schema") != "megu-mods-dir-adaptation/1":
         return binary, None, "adapt check returned an unexpected schema"
     return binary, report, None
 
@@ -911,7 +911,7 @@ def run_mod_check(mods_dir):
 def format_adapt_summary(report):
     """Operator-friendly compatibility + reload/restart summary."""
     totals = report.get("totals") or {}
-    lines = ["compatibility check (mc-spine-mod-check):"]
+    lines = ["compatibility check (megu-mod-check):"]
     lines.append(
         "  verdict: {verdict} — {native} native bundle(s), "
         "{shim} tier-2 shimmed, {skipped} auto-skipped, "
@@ -934,9 +934,9 @@ def format_adapt_summary(report):
             lines.append(f"  fallback blocker {name}: {reason}")
     if report.get("verdict") == "requires_fallback":
         lines.append("  next: fix/replace the tier-3 JAR(s), then restart "
-                     "mc-spine to load the rest.")
+                     "megu to load the rest.")
     else:
-        lines.append("  next: restart mc-spine (or run '/mods reload' for "
+        lines.append("  next: restart megu (or run '/mods reload' for "
                      "hot-reloadable data mods) to load the new JARs.")
     return "\n".join(lines)
 
@@ -1076,7 +1076,7 @@ def cmd_add(args):
             })
         else:
             print(f"'{slug}' is a performance mod that is "
-                  f"{REASON_SUPERSEDED} — mc-spine builds this "
+                  f"{REASON_SUPERSEDED} — megu builds this "
                   "optimization in natively, so it is skipped and nothing "
                   "was downloaded. Pass --force to install it anyway.")
         return 0

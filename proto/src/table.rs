@@ -432,7 +432,7 @@ pub struct RemapReport {
 /// O(1) id translation between two versions of one registry, matched by
 /// resource name — correct under renumbering, additions and removals.
 ///
-/// `canonical` is the side mc-spine reasons in (normally the builtin table);
+/// `canonical` is the side megu reasons in (normally the builtin table);
 /// `wire` is the negotiated side. `to_wire` is indexed by canonical id,
 /// `from_wire` by wire id; both are dense `Vec`s so a lookup is one bounds
 /// check.
@@ -798,7 +798,7 @@ fn int(value: &Json, _what: &'static str) -> Result<i64, ProtoError> {
 mod tests {
     use super::*;
 
-    // -- builtin table agreement with mc-spine -------------------------------
+    // -- builtin table agreement with megu -------------------------------
 
     #[test]
     fn v767_packet_ids_match_server_constants() {

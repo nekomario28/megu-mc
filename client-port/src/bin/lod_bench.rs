@@ -8,9 +8,9 @@ use std::mem::MaybeUninit;
 use std::ptr;
 use std::time::Instant;
 
-use mc_spine_client_mesh::{
+use megu_client_mesh::{
     ffi::{
-        mc_spine_client_mesh_column, MeshColumnInput, MeshColumnSection, ABI_AIR,
+        megu_client_mesh_column, MeshColumnInput, MeshColumnSection, ABI_AIR,
         ABI_COLUMN_SEALED_SOLID, ABI_OK, ABI_OPAQUE, ABI_VERSION,
     },
     mesh_section, summarize_column, Block, Light, LodCell, LodSummary, MissingNeighbor, Quad,
@@ -160,13 +160,13 @@ fn main() {
     let mut quad_count = usize::MAX;
     // SAFETY: input buffers live for the call; count is disjoint.
     assert_eq!(
-        unsafe { mc_spine_client_mesh_column(&sealed_input, ptr::null_mut(), 0, &mut quad_count) },
+        unsafe { megu_client_mesh_column(&sealed_input, ptr::null_mut(), 0, &mut quad_count) },
         ABI_OK
     );
     assert_eq!(quad_count, 0);
     let culled_us = time_us(runs, || unsafe {
         assert_eq!(
-            mc_spine_client_mesh_column(
+            megu_client_mesh_column(
                 black_box(&sealed_input),
                 ptr::null_mut(),
                 0,
@@ -181,13 +181,13 @@ fn main() {
     // sections silent, just less cheaply.
     let (_scan_inputs, scan_input) = column_input(&solids, ABI_OPAQUE);
     assert_eq!(
-        unsafe { mc_spine_client_mesh_column(&scan_input, ptr::null_mut(), 0, &mut quad_count) },
+        unsafe { megu_client_mesh_column(&scan_input, ptr::null_mut(), 0, &mut quad_count) },
         ABI_OK
     );
     assert_eq!(quad_count, 0);
     let scanned_us = time_us(runs, || unsafe {
         assert_eq!(
-            mc_spine_client_mesh_column(
+            megu_client_mesh_column(
                 black_box(&scan_input),
                 ptr::null_mut(),
                 0,
@@ -202,7 +202,7 @@ fn main() {
     // this is the full-pipeline cost for the same data shape.
     let (_open_inputs, open_input) = column_input(&solids, ABI_AIR);
     assert_eq!(
-        unsafe { mc_spine_client_mesh_column(&open_input, ptr::null_mut(), 0, &mut quad_count) },
+        unsafe { megu_client_mesh_column(&open_input, ptr::null_mut(), 0, &mut quad_count) },
         ABI_OK
     );
     let open_quads = quad_count;
@@ -210,7 +210,7 @@ fn main() {
     let full_us = time_us(runs, || {
         unsafe {
             assert_eq!(
-                mc_spine_client_mesh_column(
+                megu_client_mesh_column(
                     black_box(&open_input),
                     open_buf.as_mut_ptr().cast(),
                     open_buf.len(),
@@ -234,14 +234,14 @@ fn main() {
     let (_world_inputs, world_input) = column_input(&world, ABI_OPAQUE);
     // SAFETY: as above.
     assert_eq!(
-        unsafe { mc_spine_client_mesh_column(&world_input, ptr::null_mut(), 0, &mut quad_count) },
+        unsafe { megu_client_mesh_column(&world_input, ptr::null_mut(), 0, &mut quad_count) },
         ABI_OK
     );
     let mut quads = vec![MaybeUninit::<Quad>::uninit(); quad_count];
     let us = time_us(runs, || {
         unsafe {
             assert_eq!(
-                mc_spine_client_mesh_column(
+                megu_client_mesh_column(
                     black_box(&world_input),
                     quads.as_mut_ptr().cast(),
                     quads.len(),

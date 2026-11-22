@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: LGPL-3.0-or-later OR GPL-3.0-or-later OR AGPL-3.0-or-later
-//! Unit, parity and live-host tests for `mc_spine_core::hw_adaptive_engine`.
+//! Unit, parity and live-host tests for `megu_core::hw_adaptive_engine`.
 
-use mc_spine_core::hw_adaptive_engine::{
+use megu_core::hw_adaptive_engine::{
     build_unified_optimization_plan, detect_host_hardware_caps, detect_universal_hardware_profile,
     max_nibble_arrays_adaptive, max_nibble_arrays_tiered, select_compute_strategy,
     CacheDomainTopology, CacheStrategy, ComputeKernelMode, ComputeStrategy, CoreAffinityHint,
@@ -940,7 +940,7 @@ fn nibble_max_is_bit_exact_across_every_tier_and_lut_choice() {
                 },
                 memory: MemoryTransferStrategy::UnifiedZeroCopy,
                 simd: tier,
-                workers: mc_spine_core::hw_adaptive_engine::WorkerSplitPlan {
+                workers: megu_core::hw_adaptive_engine::WorkerSplitPlan {
                     foreground_threads: 1,
                     background_threads: 1,
                 },

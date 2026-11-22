@@ -7,7 +7,7 @@ import ctypes as C
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
-os.environ["MC_SPINE_ALLOW_PLAYER_ADMIN_COMMANDS"] = "1"
+os.environ["MEGU_ALLOW_PLAYER_ADMIN_COMMANDS"] = "1"
 os.environ.setdefault("MC_PROBE_DEADLINE", "60")
 os.environ.setdefault("TMPDIR", str(ROOT / "target/tmp"))
 
@@ -177,8 +177,8 @@ def best_live_reduction(client, lib):
 
 
 def live_wire_e2e(lib):
-    binary=ROOT/"target/debug/mc-spine"
-    check(binary.is_file(), "built target/debug/mc-spine")
+    binary=ROOT/"target/debug/megu"
+    check(binary.is_file(), "built target/debug/megu")
     with local_server(binary) as game:
         with MeshWireClient(game) as client:
             client.login(view=2)

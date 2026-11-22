@@ -1,6 +1,6 @@
 package net.minecraft.util;
 
-import net.mcspine.probe.RegistryId;
+import net.megu.probe.RegistryId;
 
 public final class Identifier {
     private final RegistryId id;

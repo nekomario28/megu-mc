@@ -1,4 +1,4 @@
-# mc-spine Java mod compatibility
+# megu Java mod compatibility
 
 Status: slice 01 passed; slice 02 pinned Redirect and normal player/adult-cow landing passed against a real reference; broader physics/crop coverage pending; arbitrary Minecraft mod compatibility remains NOT RUN.
 Target: Minecraft Java 1.21.1, Java 21, Fabric and NeoForge server mods. Client rendering mods are outside this server's execution boundary.

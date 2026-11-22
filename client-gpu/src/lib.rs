@@ -1,12 +1,12 @@
 // SPDX-License-Identifier: LGPL-3.0-or-later OR GPL-3.0-or-later OR AGPL-3.0-or-later
-//! `mc-spine-client-gpu`: the real windowed GPU client crate.
+//! `megu-client-gpu`: the real windowed GPU client crate.
 //!
 //! Layers on top of the headless client stack:
 //!
 //! * [`renderer`] — a real `wgpu` backend (Vulkan / Metal / DX12) that
-//!   uploads `mc_spine_client_mesh` packed quad geometry, compiles the WGSL
-//!   shader suite from `mc_spine_client::shaders`, composites the
-//!   `mc_spine_ui` software-rasterized RGBA framebuffer, and validates Megu
+//!   uploads `megu_client_mesh` packed quad geometry, compiles the WGSL
+//!   shader suite from `megu_client::shaders`, composites the
+//!   `megu_ui` software-rasterized RGBA framebuffer, and validates Megu
 //!   native WGSL shaderpack modules against the live `wgpu::Device`.
 //! * [`window`] — a `winit` 0.30 `ApplicationHandler` driving the window,
 //!   FPS input and the `FrameBudgetGovernor` pacing loop.
@@ -27,23 +27,23 @@ pub mod window;
 
 use std::path::PathBuf;
 
-use mc_spine_client::cli::parse_host_port;
-use mc_spine_client_mesh::ffi::PackedVertex;
-use mc_spine_client_mesh::{
+use megu_client::cli::parse_host_port;
+use megu_client_mesh::ffi::PackedVertex;
+use megu_client_mesh::{
     mesh_section, resolve_render_backend, Block, GpuCapabilities, GpuShaderCaps, GpuVendor, Layer,
     Quad, RenderBackendPreference, Section, WATER,
 };
-use mc_spine_ui::draw::{UiColor, UiCommand, UiDrawList, UiRect};
+use megu_ui::draw::{UiColor, UiCommand, UiDrawList, UiRect};
 
 /// Crate/binary name used in diagnostics.
-pub const CLIENT_GPU_NAME: &str = "mc-spine-client-gpu";
+pub const CLIENT_GPU_NAME: &str = "megu-client-gpu";
 
 // ---------------------------------------------------------------------------
 // CLI
 // ---------------------------------------------------------------------------
 
 /// A credential value accepted from the launcher (`--accessToken`,
-/// `--xuid`, `MC_SPINE_LAUNCHER_ACCESS_TOKEN`) that must never appear in
+/// `--xuid`, `MEGU_LAUNCHER_ACCESS_TOKEN`) that must never appear in
 /// diagnostics: `Debug` prints `<redacted>` and no `Display` exists.
 /// `reveal` is deliberately the *only* way to read the value back so call
 /// sites that format it stand out in review.
@@ -73,12 +73,12 @@ impl std::fmt::Debug for SecretString {
     }
 }
 
-/// Everything `mc-spine-client-gpu` accepts on the command line.
+/// Everything `megu-client-gpu` accepts on the command line.
 ///
 /// The Official/Prism/Modrinth launchers invoke the game with a fixed
 /// argument surface (`--username`, `--version`, `--gameDir`,
 /// `--quickPlayMultiplayer`, ...). Every one of those flags parses
-/// cleanly here; mc-spine's own flags (`--connect`, `--mc-version`,
+/// cleanly here; megu's own flags (`--connect`, `--mc-version`,
 /// `--shader-pack`, `--gpu-backend`, `--offline-demo`, `--headless-probe`,
 /// `--vsync`, `--relay`, `--server-bin`) keep their existing meanings.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -91,7 +91,7 @@ pub struct GpuCliConfig {
     pub username: String,
     /// Minecraft protocol, 767 (1.21.1) or 777 (26.3).
     pub mc_version: String,
-    /// Launcher `--version <id>` (`1.21.1`, `mc-spine-1.21.1`): the
+    /// Launcher `--version <id>` (`1.21.1`, `megu-1.21.1`): the
     /// `<gameDir>/versions/<id>/<id>.jar` discovery key. When the id also
     /// parses as a protocol (`1.21.1`/`767`/`26.3`/`777`), `mc_version`
     /// follows it.
@@ -99,7 +99,7 @@ pub struct GpuCliConfig {
     /// `--uuid <uuid>` — the account id the launcher reports (kept for
     /// parity; offline sessions still use `offline_uuid(username)`).
     pub uuid: Option<String>,
-    /// `--accessToken <token>` or `MC_SPINE_LAUNCHER_ACCESS_TOKEN`; always
+    /// `--accessToken <token>` or `MEGU_LAUNCHER_ACCESS_TOKEN`; always
     /// [`SecretString`]-wrapped so `Debug` of this config can never leak it.
     pub access_token: Option<SecretString>,
     /// `--clientToken`/`--authToken`/`--token` — Mojang session id.
@@ -126,18 +126,18 @@ pub struct GpuCliConfig {
     /// (defaults to `<gameDir>/resourcepacks` when absent).
     pub resource_pack_dir: Option<PathBuf>,
     /// `--quickPlaySingleplayer <world>` — validated by
-    /// `mc_spine_client::integrated::validate_world_name` at launch time.
+    /// `megu_client::integrated::validate_world_name` at launch time.
     pub quick_play_singleplayer: Option<String>,
     /// `--quickPlayPath <path>` — accepted for compatibility; no consumer.
     pub quick_play_path: Option<String>,
     /// `--quickPlayRealms <id>` — accepted; realms join is unimplemented
     /// and surfaces a status message rather than failing silently.
     pub quick_play_realms: Option<String>,
-    /// `--server-bin <path>` — explicit `mc-spine` binary for the
+    /// `--server-bin <path>` — explicit `megu` binary for the
     /// integrated singleplayer server.
     pub server_bin: Option<PathBuf>,
     /// `--relay <host:port>` — friend-invite relay (`JoinWithCode`
-    /// dispatches a [`mc_spine_client::friend_client::FriendGuestBridge`]
+    /// dispatches a [`megu_client::friend_client::FriendGuestBridge`]
     /// to it).
     pub relay: Option<String>,
     /// `--width <px>` — initial window width.
@@ -209,11 +209,11 @@ impl Default for GpuCliConfig {
 
 /// Record the launcher's `--version <id>`: `version_id` keeps the raw id
 /// for JAR discovery, and `mc_version` follows when the id (or the part
-/// after a `mc-spine-` prefix) parses as a supported protocol.
+/// after a `megu-` prefix) parses as a supported protocol.
 fn apply_launcher_version_id(cfg: &mut GpuCliConfig, id: &str) {
     cfg.version_id = Some(id.to_owned());
-    let stripped = id.strip_prefix("mc-spine-").unwrap_or(id);
-    if mc_spine_client::cli::parse_mc_version(stripped).is_ok() {
+    let stripped = id.strip_prefix("megu-").unwrap_or(id);
+    if megu_client::cli::parse_mc_version(stripped).is_ok() {
         cfg.mc_version = stripped.to_owned();
     }
 }
@@ -336,7 +336,7 @@ pub fn parse_gpu_args<S: AsRef<str>>(args: &[S]) -> Result<GpuCliConfig, String>
             }
             "--mc-version" => {
                 let version = take_value(&mut i)?;
-                mc_spine_client::cli::parse_mc_version(&version)?;
+                megu_client::cli::parse_mc_version(&version)?;
                 cfg.mc_version = version;
             }
             "--shader-pack" => cfg.shader_pack = Some(PathBuf::from(take_value(&mut i)?)),
@@ -363,7 +363,7 @@ pub fn parse_gpu_args<S: AsRef<str>>(args: &[S]) -> Result<GpuCliConfig, String>
     // Launcher-env credential fallback: the launcher can hand the token via
     // the environment instead of argv; argv wins when both are present.
     if cfg.access_token.is_none() {
-        if let Ok(token) = std::env::var("MC_SPINE_LAUNCHER_ACCESS_TOKEN") {
+        if let Ok(token) = std::env::var("MEGU_LAUNCHER_ACCESS_TOKEN") {
             if !token.is_empty() {
                 cfg.access_token = Some(SecretString::new(token));
             }
@@ -375,7 +375,7 @@ pub fn parse_gpu_args<S: AsRef<str>>(args: &[S]) -> Result<GpuCliConfig, String>
 /// Usage text for `--help`.
 pub fn gpu_help_text() -> String {
     format!(
-        "{CLIENT_GPU_NAME} {version} — real wgpu windowed client for mc-spine (1.21.1 / protocol 767)\n\
+        "{CLIENT_GPU_NAME} {version} — real wgpu windowed client for megu (1.21.1 / protocol 767)\n\
          \n\
          USAGE:\n    {CLIENT_GPU_NAME} [OPTIONS]\n\
          \n\
@@ -390,7 +390,7 @@ pub fn gpu_help_text() -> String {
          \x20   --headless-probe            list wgpu adapters + chosen pipeline, then exit\n\
          \x20   --vsync <on|off|mailbox>    presentation mode (default: on)\n\
          \x20   --relay <host:port>         friend-invite relay for invite-code joins\n\
-         \x20   --server-bin <path>         explicit mc-spine binary for singleplayer\n\
+         \x20   --server-bin <path>         explicit megu binary for singleplayer\n\
          \x20   -h, --help                  print this help\n\
          \x20   -V, --version               print the version\n\
          \n\
@@ -606,7 +606,7 @@ impl std::fmt::Display for PackQuadsError {
         match self {
             Self::InvalidArgument => write!(
                 f,
-                "mc_spine_client_mesh_pack_vertices rejected the quads (unrepresentable or \
+                "megu_client_mesh_pack_vertices rejected the quads (unrepresentable or \
                  unaligned input)"
             ),
             Self::Overflow => write!(f, "quad count overflows the packed vertex buffer"),
@@ -616,18 +616,18 @@ impl std::fmt::Display for PackQuadsError {
 
 impl std::error::Error for PackQuadsError {}
 
-/// Pack `quads` through the real `mc_spine_client_mesh` C ABI
-/// (`mc_spine_client_mesh_pack_vertices`): four 16-byte [`PackedVertex`]s per
+/// Pack `quads` through the real `megu_client_mesh` C ABI
+/// (`megu_client_mesh_pack_vertices`): four 16-byte [`PackedVertex`]s per
 /// quad, in input order. Fails closed when a quad is not representable in
 /// the packed format (the [`ffi` contract](PackedVertex) covers that).
 pub fn pack_quads_to_vertices(quads: &[Quad]) -> Result<Vec<PackedVertex>, PackQuadsError> {
-    use mc_spine_client_mesh::ffi::mc_spine_client_mesh_pack_vertices;
+    use megu_client_mesh::ffi::megu_client_mesh_pack_vertices;
     let mut count = 0usize;
     // Query the required vertex count first (null output, zero capacity).
     // SAFETY: count is a valid writable pointer; all other pointers are null
     // or readable for quad_count elements.
     let status = unsafe {
-        mc_spine_client_mesh_pack_vertices(
+        megu_client_mesh_pack_vertices(
             quads.as_ptr(),
             quads.len(),
             std::ptr::null_mut(),
@@ -635,13 +635,13 @@ pub fn pack_quads_to_vertices(quads: &[Quad]) -> Result<Vec<PackedVertex>, PackQ
             &mut count,
         )
     };
-    if status != mc_spine_client_mesh::ffi::ABI_OK {
+    if status != megu_client_mesh::ffi::ABI_OK {
         return Err(PackQuadsError::InvalidArgument);
     }
     let mut out = vec![PackedVertex::default(); count];
     // SAFETY: `out` has exactly `count` writable vertices; inputs unchanged.
     let status = unsafe {
-        mc_spine_client_mesh_pack_vertices(
+        megu_client_mesh_pack_vertices(
             quads.as_ptr(),
             quads.len(),
             out.as_mut_ptr(),
@@ -650,7 +650,7 @@ pub fn pack_quads_to_vertices(quads: &[Quad]) -> Result<Vec<PackedVertex>, PackQ
         )
     };
     match status {
-        mc_spine_client_mesh::ffi::ABI_OK => Ok(out),
+        megu_client_mesh::ffi::ABI_OK => Ok(out),
         _ => Err(PackQuadsError::InvalidArgument),
     }
 }
@@ -678,14 +678,14 @@ pub fn split_opaque_translucent(quads: &[Quad]) -> (Vec<Quad>, Vec<Quad>) {
 }
 
 /// Back-to-front translucent quad order against `camera`, through the real
-/// `mc_spine_client_mesh_sort_translucent` FFI. `None` when the FFI rejects
+/// `megu_client_mesh_sort_translucent` FFI. `None` when the FFI rejects
 /// the input (non-finite camera or quads) — callers draw unsorted then.
 pub fn translucent_quad_order(quads: &[Quad], camera: [f32; 3]) -> Option<Vec<u32>> {
-    use mc_spine_client_mesh::ffi::mc_spine_client_mesh_sort_translucent;
+    use megu_client_mesh::ffi::megu_client_mesh_sort_translucent;
     let mut count = 0usize;
     // SAFETY: count is writable; null output queries the required capacity.
     let status = unsafe {
-        mc_spine_client_mesh_sort_translucent(
+        megu_client_mesh_sort_translucent(
             quads.as_ptr(),
             quads.len(),
             camera[0],
@@ -696,13 +696,13 @@ pub fn translucent_quad_order(quads: &[Quad], camera: [f32; 3]) -> Option<Vec<u3
             &mut count,
         )
     };
-    if status != mc_spine_client_mesh::ffi::ABI_OK {
+    if status != megu_client_mesh::ffi::ABI_OK {
         return None;
     }
     let mut order = vec![0u32; count];
     // SAFETY: `order` has `count` writable u32 slots; inputs unchanged.
     let status = unsafe {
-        mc_spine_client_mesh_sort_translucent(
+        megu_client_mesh_sort_translucent(
             quads.as_ptr(),
             quads.len(),
             camera[0],
@@ -713,7 +713,7 @@ pub fn translucent_quad_order(quads: &[Quad], camera: [f32; 3]) -> Option<Vec<u3
             &mut count,
         )
     };
-    (status == mc_spine_client_mesh::ffi::ABI_OK).then_some(order)
+    (status == megu_client_mesh::ffi::ABI_OK).then_some(order)
 }
 
 // ---------------------------------------------------------------------------
@@ -1033,7 +1033,7 @@ fn fnv1a_color(hash: &mut u64, color: &UiColor) {
 }
 
 /// Deterministic 64-bit FNV-1a fingerprint over everything
-/// [`rasterize_draw_list`](mc_spine_ui::draw::rasterize_draw_list) reads:
+/// [`rasterize_draw_list`](megu_ui::draw::rasterize_draw_list) reads:
 /// the framebuffer size `(width, height)` plus every [`UiCommand`] in
 /// `list` — variant, rects, colors, text payloads and progress fractions.
 /// Two draw lists that paint identical pixels share a fingerprint, so the
@@ -1138,13 +1138,13 @@ impl DemoScene {
 }
 
 /// Build the `--offline-demo` world: one 16³ section meshed through the real
-/// `mc_spine_client_mesh::mesh_section` — a heightmap of grass/dirt/stone, a
+/// `megu_client_mesh::mesh_section` — a heightmap of grass/dirt/stone, a
 /// tree, a stained-glass block, and a water pool — split into the opaque and
 /// translucent draw lists (translucent sorted back-to-front from `camera`).
 pub fn build_demo_scene(camera: [f32; 3]) -> DemoScene {
     use demo_states::*;
-    let mut section = Section::filled(Block::AIR, mc_spine_client_mesh::Light::new(0, 15));
-    let full_light = mc_spine_client_mesh::Light::new(0, 15);
+    let mut section = Section::filled(Block::AIR, megu_client_mesh::Light::new(0, 15));
+    let full_light = megu_client_mesh::Light::new(0, 15);
     // Heightmap: gentle 4..9 rolling terrain, stone deep, dirt middle,
     // grass on top.
     for x in 0..16 {
@@ -1194,7 +1194,7 @@ pub fn build_demo_scene(camera: [f32; 3]) -> DemoScene {
     let glass = Block {
         state_id: GLASS,
         tint: 0x3366cc,
-        flags: mc_spine_client_mesh::TRANSLUCENT | mc_spine_client_mesh::TINTED,
+        flags: megu_client_mesh::TRANSLUCENT | megu_client_mesh::TINTED,
         ..Block::AIR
     };
     for z in 6..=10 {
@@ -1220,7 +1220,7 @@ pub fn build_demo_scene(camera: [f32; 3]) -> DemoScene {
 // UI framebuffer sizing (client-ui RGBA -> wgpu texture upload)
 // ---------------------------------------------------------------------------
 
-/// Channels in the `mc_spine_ui` software-rasterized framebuffer.
+/// Channels in the `megu_ui` software-rasterized framebuffer.
 pub const UI_RGBA_CHANNELS: usize = 4;
 
 /// Expected byte length of a `rasterize_draw_list` framebuffer.
@@ -1279,7 +1279,7 @@ fn ui_blit_fs(in: UiVertex) -> @location(0) vec4<f32> {
 pub fn negotiate_pipeline(
     pref: RenderBackendPreference,
     caps: &GpuCapabilities,
-) -> mc_spine_client_mesh::BackendResolution {
+) -> megu_client_mesh::BackendResolution {
     resolve_render_backend(pref, caps)
 }
 

@@ -1509,7 +1509,7 @@ impl PropulsionSpec {
 }
 
 /// Compatibility of a [`CreateAddonProfile`] against the two canonical
-/// mc-spine targets: `1.21.1` (`DataVersion` 3955) and latest vanilla `26.3`
+/// megu targets: `1.21.1` (`DataVersion` 3955) and latest vanilla `26.3`
 /// (`DataVersion` 5023). `None` verdicts mean the profile declares no
 /// `mc_version_range` and applies unconditionally.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -1907,7 +1907,7 @@ impl CreateAddonProfile {
         }
     }
 
-    /// Whether this profile applies to BOTH canonical mc-spine targets:
+    /// Whether this profile applies to BOTH canonical megu targets:
     /// `1.21.1` (`DataVersion` 3955) and latest vanilla `26.3` (`DataVersion`
     /// 5023). Profiles declaring no range apply unconditionally; malformed
     /// declarations fail closed on both.
@@ -1915,7 +1915,7 @@ impl CreateAddonProfile {
         self.supports_mc_version(McVersion::V1_21_1) && self.supports_mc_version(McVersion::V26_3)
     }
 
-    /// Per-target [`VersionCompatVerdict`] for the two canonical mc-spine
+    /// Per-target [`VersionCompatVerdict`] for the two canonical megu
     /// targets — the diagnostic view behind
     /// [`Self::supports_both_targets`], reporting *why* a profile does not
     /// offload on a given target (minor vs major mismatch vs malformed).
@@ -2580,7 +2580,7 @@ fn axis_from_name(name: &str) -> Axis {
 /// 1.21.1/1.21.3/1.21.4/1.21.5+ via [`CreateAddonProfile::supports_mc_version`].
 pub const BUILTIN_ADDON_MC_VERSION_RANGE: &str = "[1.21.1,1.22)";
 
-/// Declared Minecraft compatibility spanning BOTH canonical mc-spine
+/// Declared Minecraft compatibility spanning BOTH canonical megu
 /// targets: the `1.21.x` line from 1.21.1 plus the `26.3.x` band, written as
 /// a NeoForge Maven union interval (parsed by [`VersionRange`]). Profiles
 /// carrying this declaration satisfy

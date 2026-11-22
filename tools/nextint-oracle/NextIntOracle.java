@@ -1,6 +1,6 @@
 // Recompute the nextInt(bound) fixtures from the pinned 1.21.1 random classes.
 // No server, world or constructor bypass; the tsv is a request, not trusted output.
-package dev.mcspine.tools;
+package dev.megu.tools;
 
 import java.lang.reflect.*;
 import java.nio.file.*;

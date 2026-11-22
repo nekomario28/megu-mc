@@ -20,13 +20,13 @@
 | native capture を取り直す | `sculk_capture.sh`、`*_fixture.sh`、`native_chunk_capture.py`。jar・JDK・（`config_packets.bin` だけは）EULA 同意が要る |
 | 構造物1つを capture から manifest 行まで通す | `structure_capture.py`（下の[構造物 capture のレシピ](#構造物-capture-のレシピ)）。候補chunkの確定 → 固定jarで `structures` stage capture → **capture自身の `structures.starts` で start を確認** → `port_triage` → manifest 行 |
 | 出自と層の監査 | `provenance_scan.py`（コード共有の測定）、`pack_provenance.py`（同梱 pack と固定 jar の data の距離）、`asset_coverage.py` |
-| サーバーディレクトリを準備・起動する | `megu_start.py --dir <dir> [--mc-version 1.21.1\|26.3] --accept-eula` — 既定 `1.21.1`。Python で EULA と `server.properties` を用意し、ビルド済み／PATH 上の `mc-spine-init` があれば `--dir`/`--mc-version`/`--port` を渡して初期化を委譲する。`--dry-run` でも Python 側の初期ファイルは生成する。直接 `mc-spine-init --dry-run` を呼ぶ場合は書き込まない |
-| リリース bundle を組む・検査する | `release_bundle.py build --binary <bin> [--extra-binary <path>]... --out-dir <dir> --version <v> --target <triple>` — 標準5バイナリは `mc-spine`（`--binary`）と `mc-spine-client`、`mc-spine-mod-check`、`mc-spine-world-migrate`、`mc-spine-init`（各 `--extra-binary`）。`mc-spine-client-gpu`（Windows は `.exe`）も任意追加可能。公開 CLI `megu_start.py`、`megu_translate.py`、`megu_mods.py` を同梱。member 順・mtime・mode を正規化した tarball＋`release-manifest.json`＋`SHA256SUMS`。`verify --bundle … --manifest … --sums …` は実際の byte と manifest を照合し、Mojang 由来・repo 内部 member を拒否する。`self-test` も利用可能 |
+| サーバーディレクトリを準備・起動する | `megu_start.py --dir <dir> [--mc-version 1.21.1\|26.3] --accept-eula` — 既定 `1.21.1`。Python で EULA と `server.properties` を用意し、ビルド済み／PATH 上の `megu-init` があれば `--dir`/`--mc-version`/`--port` を渡して初期化を委譲する。`--dry-run` でも Python 側の初期ファイルは生成する。直接 `megu-init --dry-run` を呼ぶ場合は書き込まない |
+| リリース bundle を組む・検査する | `release_bundle.py build --binary <bin> [--extra-binary <path>]... --out-dir <dir> --version <v> --target <triple>` — 標準5バイナリは `megu`（`--binary`）と `megu-client`、`megu-mod-check`、`megu-world-migrate`、`megu-init`（各 `--extra-binary`）。`megu-client-gpu`（Windows は `.exe`）も任意追加可能。公開 CLI `megu_start.py`、`megu_translate.py`、`megu_mods.py` を同梱。member 順・mtime・mode を正規化した tarball＋`release-manifest.json`＋`SHA256SUMS`。`verify --bundle … --manifest … --sums …` は実際の byte と manifest を照合し、Mojang 由来・repo 内部 member を拒否する。`self-test` も利用可能 |
 | Modrinth から Mod を探して追加する | `python3 tools/megu_mods.py search <query>`、`add <slug> --mods-dir ./mods [--yes\|--dry-run]`、`resolve-deps --mods-dir ./mods [--yes\|--dry-run]`。ダウンロードは明示同意が必要で、サイズと SHA-512（提供時）、SHA-256（提供時）を検証し、HTTPS の `cdn.modrinth.com` のみ許可。標準で内蔵最適化と重複する性能 Mod をスキップ（`add --force` で上書き） |
-| クライアントの診断・GPU 起動 | `mc-spine-client-gpu --headless-probe`（GPU 列挙）、`--offline-demo`（内蔵シーン表示）、`--connect <host[:port]>`。`mc-spine-client` のクラッシュ報告フラグは `--crash-report-mode <ask\|auto_crash_only\|off>`、`--report-endpoint <url>`、`--crash-reports-dir <dir>`、`--flush-crash-reports [--confirm-send]` |
-| modpack が起動前に動くか判定 | `mod_launcher.py --modpack <pack.mrpack\|.zip\|manifest.json> --mc-version <1.21.1\|26.3>` — DL・起動前に MC 版の一致・自動 skip・native/bytecode 検査を分類する。`mc-spine-mod-check` と同じ判定（exit 0/2/1）。コンテナでは `MC_SPINE_MODPACK`/`MC_SPINE_MC_VERSION` 経由で entrypoint がこれを呼ぶ |
-| インストール済み Mod を自動適応・起動判定する | `mod_launcher.py --mods-dir <dir> --auto-adapt [--dry-run] [--json]` または `mod_launcher.py --adapt-mods-dir <dir> [--dry-run] [--json]`（`--auto-adapt` を含意）。`mc-spine-mod-check` の走査と ShimCheck を使い、native bundle / Tier 2 shim / Tier 3 fallback と blocker を計画する。Mod ごとの実行互換性は判定結果で確認する |
-| protocol 767 の live wire / 圧縮経路を検査する | `python3 tests/protocol767.py [binary]`（既定 `target/debug/mc-spine`）。隔離した実サーバーで login/config/play を検査し、`0x03` 圧縮しきい値 `256`（圧縮済み・未圧縮）、`1048576`（非圧縮 wrapper）、`-1`（圧縮 packet なし）のフレーム・chunk payload を照合する。実行にはビルド済みサーバーが必要 |
+| クライアントの診断・GPU 起動 | `megu-client-gpu --headless-probe`（GPU 列挙）、`--offline-demo`（内蔵シーン表示）、`--connect <host[:port]>`。`megu-client` のクラッシュ報告フラグは `--crash-report-mode <ask\|auto_crash_only\|off>`、`--report-endpoint <url>`、`--crash-reports-dir <dir>`、`--flush-crash-reports [--confirm-send]` |
+| modpack が起動前に動くか判定 | `mod_launcher.py --modpack <pack.mrpack\|.zip\|manifest.json> --mc-version <1.21.1\|26.3>` — DL・起動前に MC 版の一致・自動 skip・native/bytecode 検査を分類する。`megu-mod-check` と同じ判定（exit 0/2/1）。コンテナでは `MEGU_MODPACK`/`MEGU_MC_VERSION` 経由で entrypoint がこれを呼ぶ |
+| インストール済み Mod を自動適応・起動判定する | `mod_launcher.py --mods-dir <dir> --auto-adapt [--dry-run] [--json]` または `mod_launcher.py --adapt-mods-dir <dir> [--dry-run] [--json]`（`--auto-adapt` を含意）。`megu-mod-check` の走査と ShimCheck を使い、native bundle / Tier 2 shim / Tier 3 fallback と blocker を計画する。Mod ごとの実行互換性は判定結果で確認する |
+| protocol 767 の live wire / 圧縮経路を検査する | `python3 tests/protocol767.py [binary]`（既定 `target/debug/megu`）。隔離した実サーバーで login/config/play を検査し、`0x03` 圧縮しきい値 `256`（圧縮済み・未圧縮）、`1048576`（非圧縮 wrapper）、`-1`（圧縮 packet なし）のフレーム・chunk payload を照合する。実行にはビルド済みサーバーが必要 |
 | 版ごとの VersionPack を組む・検査・比較 | `vanilla_data/version_pack.py {build\|verify\|diff}` — vanilla DataGenerator の `--reports` 出力から pack を build（`--version-json` で jar の版情報を取る）、fail-closed `verify`、2 pack 間の packet/registry 差分を `diff` |
 | 変更 path から回すべき harness を選ぶ | `parity_cache.py map --paths <files>`（`--git-diff REF`/`--changed-files` も可）。`run --name <oracle> --dep <files>` は oracle 実行を内容 hash で cache する |
 
@@ -49,7 +49,7 @@ Python の fixture 段が走る（測った範囲は [tests/README.md](../tests/
 
 | 道具 | 何をするか |
 |---|---|
-| `vanilla_src.sh <official class...>` | 固定1.21.1 jar を**ソースに逆コンパイル**して読む（`javap` はオフセット引用、こちらはアルゴリズムの移植）。公式mappingsで難読名に引き、入れ子jarから本体と入れ子クラスを出す。jar と mappings の SHA-1 を検査し、**repo 内への出力は拒否**する（Mojang のコードは読解用で、再配布しない）。既定の出力は `~/.cache/mc-spine-work/mc121/src` |
+| `vanilla_src.sh <official class...>` | 固定1.21.1 jar を**ソースに逆コンパイル**して読む（`javap` はオフセット引用、こちらはアルゴリズムの移植）。公式mappingsで難読名に引き、入れ子jarから本体と入れ子クラスを出す。jar と mappings の SHA-1 を検査し、**repo 内への出力は拒否**する（Mojang のコードは読解用で、再配布しない）。既定の出力は `~/.cache/megu-work/mc121/src` |
 | `structure-oracle/NativeHarness.java` + `FeatureOracle.java` + `feature_oracles.py [<type> --cases <json> [--write] [--cells <path>]]` | 固定 jar の**実 feature クラス**を scripted level で実行し、`scene/oy/seed/wrote/cells/digest/rngProbe` を記録する。cases はデータ（origin 相対の ply・seeds・box）、`class` は registry と一致を assert。port 側は同じ cases を `generic_feature_cases` が読む。失敗時は `GENERIC_CASE_DUMP=<path>` で port セルを出して cell 単位で diff する。契約と**測った限界**（署名済み jar で `ChunkGenerator` を継承できない／`getLevel()` は供給不能／build height 外の scene は不可）は [native oracle の記録](../evidence/gameplay/feature-parity/native-oracle.md) |
 | `mineshaft_layout_oracle.py [--jar <server.jar>] [--check <fixture> \| --output <fixture>]` | 固定jarの実normal-mineshaft layoutと、同じnative呼出を境界ごとに分けた実行を照合する。既定はpiece列・非消費RNG状態の数値fixtureを検査し、書換えは明示時だけ。start採否・biome・Mesa・block配置は含まない。[検証境界](../evidence/gameplay/feature-parity/mineshaft-layout-20261113.md) |
 | `mineshaft_pipeline_oracle.py [--jar <server.jar>] [--output <fixture>]` | 実native admission・自然Mesaのgeometry・createReferences/manager順・authored配置とRNGを照合。既定は検査だけ、書換えは明示時だけ。自然world全体のparityとは分ける。[検証範囲](../evidence/gameplay/feature-parity/mineshaft-entities-20261113.md) |
@@ -82,18 +82,18 @@ Python の fixture 段が走る（測った範囲は [tests/README.md](../tests/
 | `vanilla_sculk_pack.py <jar> <world> --variant veins\|one-patch [--count N] [--height MIN:MAX]` | deep-dark の step 7 を片方だけに絞った datapack を書く（`sculk_vein` と `sculk_patch_deep_dark` は 同じ decorator stream を共有するので、全セル比較ではどちらが動いたか言えない）。port 側にも同じ ファイルを入れる必要がある（script は path を印字するだけで port の pack には触らない）。 fixture 側は `sculk_veins` / `sculk_one_patch` / `sculk_cave_patch` モード |
 | `tools/carve-agent/`（`Agent.java` + `CarveLog.java` + `SculkLog.java`、`JAVA_AGENT=` で参照サーバーに載せる） | 固定 jar を ASM で instrument して**native の中間状態**を取る。sculk 用に `SCURSOR r=<round> i=<index> x y z charge decayDelay updateDelay facingMask`（`dmp$a` の `ChargeCursor.update` 入口）と `SCMARK`（呼び出し元）/`SSPREADALL types=<n>`（spread type 数）を出す。`-Dfeaturebox=minX,minY,minZ,maxX,maxY,maxZ` で feature 層の書き込みを `FCELL x y z state=<id> feature=<gi>,<step> chunk=<pop>` としても出る。port 側は対応する `SPC_CURSOR_TRACE` / `SPC_TRACE_ALL` / `FEATURE_WRITE_TRACE`（+`GENERIC_CASE_DUMP`）で同じ形を出せる。[計器と実測](../specs/worldgen-parity/sculk-patch.md) |
 | `build_carve_agent.sh [out-dir]` | carve-agent の jar を組んで**検証する**（`Agent.class`/ASM/ロガーの中身、マーカー文字列、フックの配線まで確認してから返す）。手順を手で打つと `head` が javac の終了コードを飲んだり、半分適用された編集から jar を作ったりして「動いているように見える古い jar」ができる（実測で2回踏んだ）。`sculk_capture.sh` はこれを使う |
-| `sculk_capture.sh <tag> [--chunk CX CZ] [--n N] [--mode M] [--jar PATH] [--settle S]` | **native capture を1コマンドに**する。agent を組む → fixture を回す（trace は `-Dsculktrace=` で自前ファイルへ）→ `PROVENANCE-<tag>.txt`（seed/chunk/agent sha/行数）を書く → `sculk_trace.py sanity` で**読めない trace を不合格**にする。既定の保存先 `~/.cache/mc-spine-audit/sculk-traces/` |
-| `sculk_port_run.sh <tag> [--n N --x CX --z CZ --arm cx,cz,gi,step --limit N]` | **port 側の run を1コマンドに**（`MC_SPINE_WG_PROFILE=0` で warm-up を切る／`FEATURE_ATTEMPT_TRACE`・`SPC_CURSOR_TRACE`・`FSEED_ARM`＋`FEATURE_DRAW_LIMIT` を1箇所に／provenance／`sanity`）。env を1つ忘れると trace が答えられない問いが生まれる（例: `FEATURE_ATTEMPT_TRACE` 無しだと `SPASS` が無く pass 比較が無意味）ので、一緒に運ぶ env は1ファイルに置く |
+| `sculk_capture.sh <tag> [--chunk CX CZ] [--n N] [--mode M] [--jar PATH] [--settle S]` | **native capture を1コマンドに**する。agent を組む → fixture を回す（trace は `-Dsculktrace=` で自前ファイルへ）→ `PROVENANCE-<tag>.txt`（seed/chunk/agent sha/行数）を書く → `sculk_trace.py sanity` で**読めない trace を不合格**にする。既定の保存先 `~/.cache/megu-audit/sculk-traces/` |
+| `sculk_port_run.sh <tag> [--n N --x CX --z CZ --arm cx,cz,gi,step --limit N]` | **port 側の run を1コマンドに**（`MEGU_WG_PROFILE=0` で warm-up を切る／`FEATURE_ATTEMPT_TRACE`・`SPC_CURSOR_TRACE`・`FSEED_ARM`＋`FEATURE_DRAW_LIMIT` を1箇所に／provenance／`sanity`）。env を1つ忘れると trace が答えられない問いが生まれる（例: `FEATURE_ATTEMPT_TRACE` 無しだと `SPASS` が無く pass 比較が無意味）ので、一緒に運ぶ env は1ファイルに置く |
 | `sculk_capture.sh <tag> --jvm-opt=-Dfoo=bar` | JVM プロパティを capture に渡す（例: `-Dbiomefchunk=cx,cz` で native 側の biome フィルタ判定 `BIOMEF` を出し、port の `BIOMEF_TRACE=cx,cz` と突き合わせる。実測: sculk patch の候補 256/256、判定 256/256、採用 21/21 が一致）|
 | `sculk_trace.py compare-draws <native> <port-draw.log>` | port の draw 列を native の流れから **`(bound, value)`** で探し、一致長と最初の食い違いを出す（native 側は `SculkLog.drawIBound` が bound を出す）。実測: `sculk_patch_deep_dark` chunk (-16,112) で **24本一致**、25本目で port `nextInt(16)=12` / native `nextInt(49)=6` |
 | `sculk_trace.py summary\|sanity\|passes\|windows\|draws\|names\|compare-passes\|extract\|patches` | trace の読み取り・検査・比較を**1つの道具**にした。`sanity` は「窓に draw が入っていない」「`SPLACE` が feature 表に無いクラスを指す」「`run.log`（= log4j、行順がプログラム順でない）を位置で切ろうとしている」「port のログに `[wgprof]` と `[wgdump]` の2 phase が混ざっている（= 配置行と arm 済み draw 行が別 run のもの）」を**不合格にする**。実測: 健全な capture = SANE、`ebq`（=`ConfiguredFeature`）で arm した capture = UNUSABLE、draw フック無し = UNUSABLE。`compare-passes` は pass 単位で試行 origin 集合を突き合わせ、差の分布と最初の食い違いを出す |
 | `sculk_trace.py extract <run.log> [--origin x,y,z] [--lines N]` | `SculkSpreader$ChargeCursor.update` の trace を抽出し **(round, index) で整列**して比較する（cell の集合ではなく trajectory を比べる）。共有キーが食い違えば exit 1。native 側の先頭スライスは `tests/data/sculk_cursor_1211.tsv`。capture はパッチの出現順と `r` の通し番号が実行ごとに変わるので、`--origin` でパッチを選び `r` をパッチ内 round に正規化する（実測: 同一パッチは 2 capture で 60/60 一致）|
 | `sculk_gate.py <world> <dump.bin> <n> <x0> <z0> [--require-match]` | sculk ファミリ（`sculk`/`sculk_vein`/`sculk_catalyst`/`sculk_shrieker`）のセルだけを参照 region と port dump で照合する。feature 単体の oracle が使えない `sculk_patch` の合格条件。sculk の無い参照は exit 2（何も証明しない）。[経路と実測値](../specs/worldgen-parity/sculk-patch.md) |
 | `structure_capture.py --structure <id> --seed <n> --dimension <d> --root <captures> [--chunk CX CZ] [--scan-radius N]` | **構造物1つのレシピ**。`(structure_id, seed, cx, cz, dimension)` から native capture・port dump・triage・`fixture_suite` manifest 行までを1コマンドで作り、`--manifest <既存manifest>` で昇格する。chunk を省略すると port の `--worldgen-structure-candidates`（候補/admit probe、spacing セルごとに1回）で候補を列挙し、biome hint で順序を決める。**候補は必要条件でしかない**（probe 自身が `biome_and_pieces_unchecked=true` と書く）ので、採否は capture した chunk の `structures.starts` で決め、start が無い capture は `refuted.txt` を残して次へ進む。既存 capture は上書きしない |
-| `chunk_world_fixture.sh <tag> <cx> <cz> <n> <terrain\|carvers\|features\|structures>` | 固定jarの同一座標regionをforceloadし、mc-spineの同じstage dumpと`carver_diff`で比較する。参照chunkの完成を先に検査する |
+| `chunk_world_fixture.sh <tag> <cx> <cz> <n> <terrain\|carvers\|features\|structures>` | 固定jarの同一座標regionをforceloadし、meguの同じstage dumpと`carver_diff`で比較する。参照chunkの完成を先に検査する |
 | `ore_fixture.sh <tag> <keep> [n]` | `ore_*`/`disk_*` のうち `<keep>` 以外の placement を `count: 0` にした world を作る（1 feature 隔離） |
 | `vanilla_nofeat_pack.py <jar> <world> [--keep-carvers]` | biome の features と carvers を空にした pack を書く（地形だけの比較用） |
-| `native_chunk_capture.py <world> <cx> <cz> [--preset ...] --out <tsv[.gz]>` | 参照 world の 1 chunk を **正規化 state（名前＋全property）** の TSV にする。property を落とす name 比較では接続bit・向き・waterlogged が見えないため、`StructurePiece.placeBlock` の postprocess が決める `oak_fence` の接続bit のような差はこの形でしか固定できない。出力形式は port の `MC_SPINE_WG_DUMP_CANON` と同じ（絶対座標、`minecraft:air` は落とす）で、`tests/data/` の chunk 固定具の生産者。`air` 以外の空気（`cave_air`/`void_air`）は両側とも残す |
+| `native_chunk_capture.py <world> <cx> <cz> [--preset ...] --out <tsv[.gz]>` | 参照 world の 1 chunk を **正規化 state（名前＋全property）** の TSV にする。property を落とす name 比較では接続bit・向き・waterlogged が見えないため、`StructurePiece.placeBlock` の postprocess が決める `oak_fence` の接続bit のような差はこの形でしか固定できない。出力形式は port の `MEGU_WG_DUMP_CANON` と同じ（絶対座標、`minecraft:air` は落とす）で、`tests/data/` の chunk 固定具の生産者。`air` 以外の空気（`cave_air`/`void_air`）は両側とも残す |
 | `vanilla_region_blocks.py` | region の location entry と対象 payload だけを読む共通層。region 全体の保持・永続キャッシュはせず、割当sector／ファイル境界を検査する。[I/O量と互換検証](../evidence/foundation/region-reader/README.md) |
 | `vanilla_data/gen_vanilla_data.sh --jar <1.21.1 server jar> [--mappings DIR \| --fetch-fabric-mappings] [--accept-eula]` / `--verify` | 1.21.1 jar から `assets/block_states_1211.json`・`datapacks/vanilla/**` (worldgen と tags/block)・`datapacks/vanilla/biome_climate_tree.json`・`tests/data/biome_probe_1211.tsv`・`biome_probe_ties_1211.tsv`・`random_next_int_1211.tsv`、`--accept-eula` 付きで `config_packets.bin` (`capture_config_packets.py` 経由) を生成する。`--verify` は追跡パック（2,350 ファイル）の決定論的ダイジェストを照合する（Java 不要）。どの出力が追跡されているかは `git ls-files` と `tools/provenance_check.py` で確認する |
 | `provenance_check.py [--self-test] [--strict-public]` | 禁止パス（旧 Pumpkin 同値 `assets/pblocks.json` / `assets/properties.json`、出所不明の `resourcepack.zip` 等）の追跡再混入を fail-closed で拒否するゲート。`--strict-public` は Stage F1 D5 の公開前残件（5 項目）を検査する |
@@ -106,22 +106,22 @@ Python の fixture 段が走る（測った範囲は [tests/README.md](../tests/
 ```sh
 # 候補だけ見る（capture しない）
 python3 tools/structure_capture.py --structure minecraft:igloo --seed 4242 \
-    --dimension overworld --root ~/mc-spine-local/captures/matrix-v3 --dry-run
+    --dimension overworld --root ~/megu-local/captures/matrix-v3 --dry-run
 # capture → triage → 行
 python3 tools/structure_capture.py --structure minecraft:igloo --seed 4242 \
-    --dimension overworld --root ~/mc-spine-local/captures/matrix-v3 --scan-radius 512
+    --dimension overworld --root ~/megu-local/captures/matrix-v3 --scan-radius 512
 # 既存 capture を採り直して行を既存 manifest に昇格（経路は manifest の dir 相対）
 python3 tools/structure_capture.py --structure minecraft:monument --seed 4242 \
-    --root ~/mc-spine-local/captures/matrix-v3 --chunk 202 -369 \
-    --capture-dir ~/mc-spine-local/captures/matrix-v3/nat-4242-monument \
-    --manifest ~/mc-spine-local/captures/matrix-v2/manifest-promotable.json
+    --root ~/megu-local/captures/matrix-v3 --chunk 202 -369 \
+    --capture-dir ~/megu-local/captures/matrix-v3/nat-4242-monument \
+    --manifest ~/megu-local/captures/matrix-v2/manifest-promotable.json
 ```
 
-1. **admission** — `mc-spine --worldgen-structure-candidates <seed> <cx> <cz>`（port 自身の候補
+1. **admission** — `megu --worldgen-structure-candidates <seed> <cx> <cz>`（port 自身の候補
    probe）。chunk を spacing で割ったセルの候補を返すので、**セルの角を1回聞けばセルが1つ埋まる**。
    返るのは「そのセルの候補」であって「聞いた chunk」ではない。frequency reducer と exclusion
    zone の判定も同じ行に出る。ring 型（strongholds）は点列を返し、セル候補ではない。
-2. **biome hint** — `MC_SPINE_BIOME_AT` の quart biome を構造物の `biomes` タグ（`datapacks/`
+2. **biome hint** — `MEGU_BIOME_AT` の quart biome を構造物の `biomes` タグ（`datapacks/`
    から解決）と突き合わせて試行順を決める。**hint であって判定ではない**。
 3. **capture** — `tools/carve-agent/native_fixture.sh`（frozen / `MC_FIXTURE_STAGE=structures` /
    自前の `order.tsv` / `boundary.json`）。jar は sha1 で固定。
@@ -129,7 +129,7 @@ python3 tools/structure_capture.py --structure minecraft:monument --seed 4242 \
    その capture は **REFUTED**（`refuted.txt` を残して次候補へ）。候補が通ったことは start が
    あることの証明ではない。
 5. **比較** — `port_triage.py --height-window`（build/env/dump/triage 一体）。`--use-pop-order`
-   で capture の `order.tsv` を `MC_SPINE_POP_ORDER` として渡せる。既定は渡さない
+   で capture の `order.tsv` を `MEGU_POP_ORDER` として渡せる。既定は渡さない
    （`matrix-v1|v2` の行は既定順序で 0 になっており、順序は行ごとの主張だから）。
 6. **行** — `level.dat`・窓の region・`dump.bin`・`run.log`・`order.tsv` を sha256 で束縛し、
    `runtime_writes > 0` なら `inputs.expected_runtime_writes` を **`fixture_suite` と同じ読み取り
@@ -147,7 +147,7 @@ python3 tools/structure_capture.py --structure minecraft:monument --seed 4242 \
 | 道具 | 何をするか |
 |---|---|
 | `chunk_triage.py <world> <cx> <cz> (--port-tsv \| --port-bin) [--n N] [--world-b] [--port-hm]` | 1 chunk または `N×N` 領域の causal triage を 1 コマンドで実行。保存 world を直接読み `air`/`cave_air`/`void_air` を区別して比較、`--world-b` で native 実行間ゆらぎを分離、`structures.References`→start chunk `Children[].BB`（＋`--halo`）と高度帯で原因帰属を分類。A・port・指定時のBが完全一致する層は単セルループを省く（[測定と境界](../evidence/foundation/triage-layer-skip/README.md)）。欠損/`Status != full`/座標不一致は exit 2 |
-| `port_triage.py <world> <cx> <cz> [--n N] [--mode full\|terrain\|carvers] [--preset overworld\|nether\|end] [--world-b] [--port-hm]` | `cargo build --message-format=json-render-diagnostics` で正確な binary を取得し、`level.dat` の seed・`nofeat` stage 一致・chunk 完成・比較窓（`--min-y`/`--height`、既定は preset の `noise_settings` の `min_y`/`height`）を先に検査してから clean env で `MC_SPINE_WG_DUMP` を生成し、そのまま `chunk_triage`（1 chunk / `N×N`）を実行する。`--mode full` は 3 preset とも装飾まで走る（`the_nether`/`the_end` の dimension height は 256 だが生成は `noise_settings` の 0..128 なので、窓の外に native ブロックがあれば build 前に exit 2） |
+| `port_triage.py <world> <cx> <cz> [--n N] [--mode full\|terrain\|carvers] [--preset overworld\|nether\|end] [--world-b] [--port-hm]` | `cargo build --message-format=json-render-diagnostics` で正確な binary を取得し、`level.dat` の seed・`nofeat` stage 一致・chunk 完成・比較窓（`--min-y`/`--height`、既定は preset の `noise_settings` の `min_y`/`height`）を先に検査してから clean env で `MEGU_WG_DUMP` を生成し、そのまま `chunk_triage`（1 chunk / `N×N`）を実行する。`--mode full` は 3 preset とも装飾まで走る（`the_nether`/`the_end` の dimension height は 256 だが生成は `noise_settings` の 0..128 なので、窓の外に native ブロックがあれば build 前に exit 2） |
 | `carver_diff.py <dump> <world> [--n --x0 --z0 --cells --tick]` | port の dump と保存 world を block state 単位で diff。層別（carver/deep/surface）、tick 由来（葉の distance）を分離、`--cells` で座標と名前、**全 chunk skip なら exit 2** |
 | `ore_diff.py <dump> <world> <block> [...]` | **ブロック1種**のセル集合を比較（ours-only/vanilla-only＋クラスタサイズ＝「同数で形違い」と「セルが少ない」を区別）。参照が full でない chunk は両側とも除外し、比較ゼロなら失敗 |
 | `world_diff.py <worldA> <worldB> [...]` | 保存 world 同士を比較＝**参照自身の実行間ノイズ床**を測る |
@@ -157,20 +157,20 @@ python3 tools/structure_capture.py --structure minecraft:monument --seed 4242 \
 
 | 変数 | 何が出るか |
 |---|---|
-| `MC_SPINE_WG_PROFILE=n` | `n×n` chunk を処理する**offline診断モード**。診断用envだけを付けて通常起動すると、サーバーがlistenし続けるので、先にこのモードを指定し、終了ログを確認する |
-| `MC_SPINE_WG_DUMP/_N/_X/_Z` | offline mode 内で block state dump（比較の入力）。**hot region の外では返らない**（実測: spawn から172 chunk で wall 240s / user 0.3s = 計算せず待っている、79 chunk なら5s）。遠い領域の固定具はこれを使えないので、先に `populate` の待ちを診断するか、領域を hot region 内に取る |
-| `MC_SPINE_WG_DUMP_HM=<path>` | 同じ領域の各列の OCEAN_FLOOR 高さ（絶対y、256×i32/chunk）を書く。`heightmap_diff.py` の参照と対にする |
-| `MC_SPINE_NOFEAT` / `_NOCARVE` / `_NOAQ` | 層を止めて帰属を分ける |
-| `MC_SPINE_FEAT_NBR=0` | 隣 chunk を decorate しない（順序の実験用） |
-| `MC_SPINE_POP_REGION=x0,z0,x1,z1` | その領域を辞書順で decorate（順序の実験用） |
-| （既定） | 名前つきの順序 — level優先キュー（level 31 + Chebyshev距離、levelの低いbucketからpop）+ 宣言済みtie-break（箱のmin cornerからx-then-z、demandの窓もx-outer/z-inner、level内FIFO）。装飾集合は要求箱+3 ring。どのcaptureともbit一致しない（vanilla自身がlevel内順序を固定しない）。**capture と比較するときは `MC_SPINE_POP_ORDER` で順序を入力する**（`specs/worldgen-parity/finite-acceptance-set.md` revision 1） |
+| `MEGU_WG_PROFILE=n` | `n×n` chunk を処理する**offline診断モード**。診断用envだけを付けて通常起動すると、サーバーがlistenし続けるので、先にこのモードを指定し、終了ログを確認する |
+| `MEGU_WG_DUMP/_N/_X/_Z` | offline mode 内で block state dump（比較の入力）。**hot region の外では返らない**（実測: spawn から172 chunk で wall 240s / user 0.3s = 計算せず待っている、79 chunk なら5s）。遠い領域の固定具はこれを使えないので、先に `populate` の待ちを診断するか、領域を hot region 内に取る |
+| `MEGU_WG_DUMP_HM=<path>` | 同じ領域の各列の OCEAN_FLOOR 高さ（絶対y、256×i32/chunk）を書く。`heightmap_diff.py` の参照と対にする |
+| `MEGU_NOFEAT` / `_NOCARVE` / `_NOAQ` | 層を止めて帰属を分ける |
+| `MEGU_FEAT_NBR=0` | 隣 chunk を decorate しない（順序の実験用） |
+| `MEGU_POP_REGION=x0,z0,x1,z1` | その領域を辞書順で decorate（順序の実験用） |
+| （既定） | 名前つきの順序 — level優先キュー（level 31 + Chebyshev距離、levelの低いbucketからpop）+ 宣言済みtie-break（箱のmin cornerからx-then-z、demandの窓もx-outer/z-inner、level内FIFO）。装飾集合は要求箱+3 ring。どのcaptureともbit一致しない（vanilla自身がlevel内順序を固定しない）。**capture と比較するときは `MEGU_POP_ORDER` で順序を入力する**（`specs/worldgen-parity/finite-acceptance-set.md` revision 1） |
 | `FEAT_TRACE` / `CARVE_TRACE` / `AQ_TRACE` | 1 feature / 1 chunk / 1 column の生ログ |
 | `FSEED_TRACE` / `INSQ_TRACE` / `BIOMEF_TRACE` | feature の添字集合・in_square の生座標・biome 判定 |
 | `FSEED_ARM=cx,cz,i,step` | その placed feature の**型付きドロー**（`DRAW n f=i,step nextInt(16)=…`） |
 | `KELP_TRACE` | kelp の候補ごとに 基準 y・高さ予算・停止位置・水判定を出す（列ごとの参照比較用） |
 | `SIMPLE_TRACE` / `ORE_TRACE` / `TREE_TRACE` / `ORE_CELL_TRACE` | 個別 feature の試行・origin・書き込み数 |
 | `PF_UNKNOWN` / `CF_MISSING` | **落ちた** placement modifier / configured feature の名前 |
-| `MC_SPINE_POP_REGION` / `MC_SPINE_DFDUMP` / `MC_SPINE_HM_DUMP` / `MC_SPINE_BIOME_AT` / `MC_SPINE_BIOME_DUMP` | 密度値・ハイトマップ・biome の2定義の実測 |
+| `MEGU_POP_REGION` / `MEGU_DFDUMP` / `MEGU_HM_DUMP` / `MEGU_BIOME_AT` / `MEGU_BIOME_DUMP` | 密度値・ハイトマップ・biome の2定義の実測 |
 
 ## sculk trace の読み方（この順で）
 
@@ -217,7 +217,7 @@ python3 tools/structure_capture.py --structure minecraft:monument --seed 4242 \
 `rust-toolchain.toml`/`src`/`tests`/`tools`/`assets`/`datapacks`/`evidence`（build が
 `include_bytes!` する fixture を含む）と、**server が cwd から読む** `config_packets.bin`/
 `resourcepack.zip` を**1キャンペーンに1回だけ**
-`${XDG_CACHE_HOME:-$HOME/.cache}/mc-spine/mutation-runs/run.XXXXXXXX` へコピーし、
+`${XDG_CACHE_HOME:-$HOME/.cache}/megu/mutation-runs/run.XXXXXXXX` へコピーし、
 `CARGO_TARGET_DIR` もその中に置いて、そこで実行し、終了時に削除する。置き場所だけ
 `MUTATION_SNAPSHOT_PARENT` で変えられる（`/tmp` が小さい tmpfs のホスト用。冷えた private
 target が 853 MiB なので 1.5 GiB 未満では起動しない）。

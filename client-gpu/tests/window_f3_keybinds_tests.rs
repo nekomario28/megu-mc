@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: LGPL-3.0-or-later
 
-use mc_spine_client_gpu::window::{WindowInputEvent, WindowInputRouter};
-use mc_spine_kernel::debug_chords::{
+use megu_client_gpu::window::{WindowInputEvent, WindowInputRouter};
+use megu_kernel::debug_chords::{
     DebugChordAction, DebugTarget, F3Chord, GameMode, PlayerDebugInfo, ALL_F3_CHORDS,
 };
 use winit::event::ElementState;

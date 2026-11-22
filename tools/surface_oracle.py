@@ -73,7 +73,7 @@ def reference(jar):
             raise ValueError("installed surface settings differ from the pinned jar")
         src, dst = work / "input.json", work / "output.json"
         src.write_text(json.dumps({"cases": requested, "surface_rule": json.loads(settings)["surface_rule"]}))
-        run_probe(work, cp, SOURCE, "dev.mcspine.tools.SurfaceOracle", src, dst)
+        run_probe(work, cp, SOURCE, "dev.megu.tools.SurfaceOracle", src, dst)
         rows = json.loads(dst.read_text())
     if not rows or len(rows) != len(requested):
         raise ValueError("empty or truncated surface reference")

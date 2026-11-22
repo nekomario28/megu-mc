@@ -536,7 +536,7 @@ def smithing(game):
 
 
 def main(binary):
-    os.environ["MC_SPINE_ALLOW_PLAYER_ADMIN_COMMANDS"] = "1"
+    os.environ["MEGU_ALLOW_PLAYER_ADMIN_COMMANDS"] = "1"
     os.environ.setdefault("MC_PROBE_DEADLINE", "30")
     with tempfile.TemporaryDirectory(prefix="spine-gp3-gp4-gp5-") as directory:
         root = Path(directory)
@@ -557,6 +557,6 @@ def main(binary):
 
 
 if __name__ == "__main__":
-    binary = Path(sys.argv[1]).resolve() if len(sys.argv) > 1 else ROOT / "target/debug/mc-spine"
+    binary = Path(sys.argv[1]).resolve() if len(sys.argv) > 1 else ROOT / "target/debug/megu"
     main(binary)
     print("gp3/gp4/gp5 wire: PASS")

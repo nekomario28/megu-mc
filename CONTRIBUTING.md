@@ -1,6 +1,6 @@
 # Contributing / 貢献について
 
-mc-spine は実験段階のサーバーで、完成品ではありません。小さく検証できる変更を歓迎します。
+megu は実験段階のサーバーで、完成品ではありません。小さく検証できる変更を歓迎します。
 このページは**作業の進め方**と**提出時の契約**を持ちます。環境・データ・テストの詳細は
 [開発ガイド](docs/development.md)、現在の作業は [specs/README.md](specs/README.md)、
 次の順序は [specs/ROADMAP.md](specs/ROADMAP.md) を参照してください。
@@ -66,7 +66,7 @@ cargo test --locked <test_filter>
 ## データと来歴
 
 - **C2ME (`MIT`) や Lithium (`LGPL-3.0`) などの互換ライセンス実装との関係**:
-  - `mc-spine` 本体は `LGPL-3.0-or-later` で配布されるため、**C2ME (`MIT`)** や **Lithium (`LGPL-3.0`)**、**Brigadier (`MIT`)** などの `MIT` / `Apache-2.0` / `BSD` / `LGPL-2.1` / `LGPL-3.0` プロジェクトは `LGPL-3.0-or-later` と完全にライセンス互換です（LGPLv3 §2 により下流は GPLv3 としても利用できます）。
+  - `megu` 本体は `LGPL-3.0-or-later` で配布されるため、**C2ME (`MIT`)** や **Lithium (`LGPL-3.0`)**、**Brigadier (`MIT`)** などの `MIT` / `Apache-2.0` / `BSD` / `LGPL-2.1` / `LGPL-3.0` プロジェクトは `LGPL-3.0-or-later` と完全にライセンス互換です（LGPLv3 §2 により下流は GPLv3 としても利用できます）。
   - もし他プロジェクト（C2ME / Lithium 等）からアルゴリズムやコードを取り込む場合は、①クリーンルームで仕様から実装する、または②取り込む場合は必ず上流の著作権表示とライセンス（`MIT` / `LGPL-3.0` 等）を [THIRD_PARTY.md](THIRD_PARTY.md) と [NOTICE](NOTICE) に明記します。ファーストパーティのファイルには `MIT` / `Apache-2.0` / `BSD` / `LGPL` 互換のコードのみを入れてください。外部の `GPL-3.0-only` や `AGPL-3.0-only` のコードを直接コピーするとそのファイルが `LGPL-3.0-or-later` 単独で頒布できなくなるため、必要な場合は専用モジュール/クレート境界で分離します。
 - Mojang由来のデータ（jar・マッピング・`datapacks/vanilla/`・`config_packets.bin`・javap出力・生成JSON）を**新たに追加しない**。
   必要なデータは手元のjarから [開発ガイド](docs/development.md#22-生成器) の手順で生成し、コミットしない。

@@ -13,7 +13,7 @@ from urllib.request import urlopen
 from zipfile import ZipFile
 
 ROOT = Path(__file__).resolve().parent
-SCANNER = ROOT / "java/net/mcspine/probe/FabricShimCheck.java"
+SCANNER = ROOT / "java/net/megu/probe/FabricShimCheck.java"
 MAX_JAR = 64 * 1024 * 1024
 
 
@@ -174,7 +174,7 @@ def metadata_for(path, zf, names):
 
 
 PLATFORM_PREFIXES = ("net/minecraft/", "net/fabricmc/", "com/mojang/brigadier/")
-RUNTIME_RESERVED = (*PLATFORM_PREFIXES, "net/mcspine/probe/", "java/",
+RUNTIME_RESERVED = (*PLATFORM_PREFIXES, "net/megu/probe/", "java/",
                     "org/spongepowered/asm/", "org/objectweb/asm/")
 ENTRY_CLASS = re.compile(r"[A-Za-z_$][A-Za-z0-9_$]*(?:\.[A-Za-z_$][A-Za-z0-9_$]*)*")
 
@@ -237,7 +237,7 @@ def runtime_classes(rows, entries, reasons, jar):
             reasons.append(fail("CLIENT_ONLY_MEMBER", "runtime cannot strip client-only members", jar, owner))
         for ref in sorted(set(row["refs"]) & excluded):
             reasons.append(fail("CLIENT_ONLY_REFERENCE", "server class references " + ref, jar, owner))
-        if any(ref.startswith("net/mcspine/probe/") for ref in row["refs"]):
+        if any(ref.startswith("net/megu/probe/") for ref in row["refs"]):
             reasons.append(fail("INTERNAL_RUNTIME_REFERENCE", "class references probe internals", jar, owner))
     return sorted(excluded & classes)
 
@@ -278,7 +278,7 @@ def audit(args, classes_surface, tmp, classes, cp):
                 reasons.append(fail("INVALID_MOD_ID", "expected a Fabric mod identifier", jar))
         jar_classes = {n[:-6] for n in names if n.endswith(".class")}
         command = [java, "-Djava.io.tmpdir=" + str(tmp), "-XX:-UsePerfData", "-cp",
-                   os.pathsep.join([str(classes), cp]), "net.mcspine.probe.FabricShimCheck", str(path)]
+                   os.pathsep.join([str(classes), cp]), "net.megu.probe.FabricShimCheck", str(path)]
         scan = subprocess.run(command, text=True, capture_output=True)
         if scan.returncode != 0:
             reasons.append(fail("INVALID_CLASS_FILE", "ASM could not scan archive class entries", jar))
@@ -334,7 +334,7 @@ def audit(args, classes_surface, tmp, classes, cp):
     rejected = any(r["status"] == "REJECTED" for r in records)
     if args.runtime_plan and not rejected:
         args.runtime_plan.write_text("\n".join(plan) + "\n", encoding="utf-8")
-    return {"schema": "mc-spine-fabric-shimcheck-v1", "minecraft": "1.21.1",
+    return {"schema": "megu-fabric-shimcheck-v1", "minecraft": "1.21.1",
             "status": "REJECTED" if rejected else "COMPATIBLE", "jars": records}
 
 
@@ -369,7 +369,7 @@ def main():
     try:
         report = run(args)
     except Exception as exc:
-        print(json.dumps({"schema": "mc-spine-fabric-shimcheck-v1", "status": "REJECTED", "error": str(exc)}, sort_keys=True, separators=(",", ":")))
+        print(json.dumps({"schema": "megu-fabric-shimcheck-v1", "status": "REJECTED", "error": str(exc)}, sort_keys=True, separators=(",", ":")))
         return 1
     print(json.dumps(report, sort_keys=True, separators=(",", ":")))
     return 0 if report["status"] == "COMPATIBLE" else 2

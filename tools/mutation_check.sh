@@ -135,7 +135,7 @@ if [ ! -d "$source_root/src" ]; then
   exit 2
 fi
 
-snapshot_parent=${MUTATION_SNAPSHOT_PARENT:-${XDG_CACHE_HOME:-$HOME/.cache}/mc-spine/mutation-runs}
+snapshot_parent=${MUTATION_SNAPSHOT_PARENT:-${XDG_CACHE_HOME:-$HOME/.cache}/megu/mutation-runs}
 resolved_parent=$(physical_path "$snapshot_parent") ||
   fail "could not resolve the snapshot parent $snapshot_parent"
 snapshot_parent=$resolved_parent
@@ -2419,9 +2419,9 @@ check "typed feature draws exclude raw positional RNGs" \
   generation_math::tests::draw_trace_separates_wrapped_and_raw_sources
 
 check "dump-only requests cannot fall through to runtime persistence" \
-  src/main.rs '    if std::env::var_os("MC_SPINE_WG_DUMP").is_some()
-        && std::env::var_os("MC_SPINE_WG_PROFILE").is_none()' \
-  '    if std::env::var_os("MC_SPINE_WG_DUMP").is_some()
+  src/main.rs '    if std::env::var_os("MEGU_WG_DUMP").is_some()
+        && std::env::var_os("MEGU_WG_PROFILE").is_none()' \
+  '    if std::env::var_os("MEGU_WG_DUMP").is_some()
         && false' tests/population_plan_test.py 'population plan: FAIL missing-profile'
 
 # Both huge mushrooms and huge fungus double height. Bind this mutation to the

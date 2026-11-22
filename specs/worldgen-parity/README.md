@@ -108,11 +108,11 @@ Nether surface depth and named positional random values match 29,120 native
 cases. The existing modern constructor over a legacy RNG is distinct from the
 old Nether biome constructor; those paths are not interchangeable.
 
-The offline `MC_SPINE_WG_PRESET=end|nether` terrain path uses the selected noise
+The offline `MEGU_WG_PRESET=end|nether` terrain path uses the selected noise
 settings, height, interpolation cell dimensions and biome source. It required
-`MC_SPINE_NOFEAT=1` while the feature layer was gated on the Overworld; the gate
+`MEGU_NOFEAT=1` while the feature layer was gated on the Overworld; the gate
 is gone, so those presets now run the carver and feature passes (their own
-feature order, their own structure sets by biome) and `MC_SPINE_NOFEAT=1` remains
+feature order, their own structure sets by biome) and `MEGU_NOFEAT=1` remains
 the layer-attribution switch it is for the Overworld. Ordinary server dimensions
 and realm-specific save/tick/wire output are still outside that switch.
 

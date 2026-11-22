@@ -1,5 +1,5 @@
 name: Feature request
-description: Propose a feature, UX improvement, or aesthetic enhancement for Megu/mc-spine. 機能・UX・見た目の改善提案。
+description: Propose a feature, UX improvement, or aesthetic enhancement for Megu/megu. 機能・UX・見た目の改善提案。
 title: "[Feature] "
 labels: ["enhancement"]
 body:
@@ -8,7 +8,7 @@ body:
       value: |
         Describe the problem first, then the proposal. Small, focused
         requests are much easier to evaluate. Check
-        [GitHub Discussions](https://github.com/nekomario28/mc-spine/discussions)
+        [GitHub Discussions](https://github.com/nekomario28/megu-mc/discussions)
         and existing issues before filing — duplicates will be closed.
 
         まず課題を、次に提案を書いてください。小さく焦点の絞られた
@@ -60,5 +60,5 @@ body:
       options:
         - label: I searched existing issues and Discussions first
           required: true
-        - label: This request is about Megu/mc-spine itself, not a third-party mod bug (mod bugs → Mod compatibility form)
+        - label: This request is about Megu/megu itself, not a third-party mod bug (mod bugs → Mod compatibility form)
           required: false

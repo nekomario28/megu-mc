@@ -1,11 +1,11 @@
 #!/usr/bin/env python3
-"""Build/resolve mc-spine, dump offline port chunks, and run causal chunk_triage in one command.
+"""Build/resolve megu, dump offline port chunks, and run causal chunk_triage in one command.
 
   tools/port_triage.py <world> <cx> <cz> [--n 1] [options]
 
 Why this exists: running a parity check previously took manual `cargo build
 --message-format=json-render-diagnostics`, `cargo_executable.py`, sanitized
-`MC_SPINE_WG_*` environment variables, reading `level.dat` for the native seed
+`MEGU_WG_*` environment variables, reading `level.dat` for the native seed
 and stage flags (`file/nofeat`), and invoking `chunk_triage.py` per chunk.
 
 This tool automates the full loop fail-closed:
@@ -40,16 +40,16 @@ import chunk_triage  # noqa: E402
 import sculk_trace  # noqa: E402
 from vanilla_region_blocks import parse_nbt  # noqa: E402
 
-STRIP_ENV_PREFIXES = ("MC_SPINE_", "SPC_", "FSEED_", "BIOMEF_", "FEATURE_")
+STRIP_ENV_PREFIXES = ("MEGU_", "SPC_", "FSEED_", "BIOMEF_", "FEATURE_")
 
-# The y window `mc-spine` dumps, per preset, from two different files.
+# The y window `megu` dumps, per preset, from two different files.
 #
 # `noise` is the preset's `worldgen/noise_settings/<preset>.json` `noise.min_y`/`noise.height`:
 # the range the *terrain* generates. `dimension` is `data/minecraft/dimension_type/
 # <dimension>.json`'s `min_y`/`height`: the range a chunk *stores* (sections, heightmaps,
 # the dump length). 1.21.1 disagrees for the Nether and the End (0/128 vs 0/256) and agrees
 # for the Overworld. `MC_FIXTURE_HEIGHT_WINDOW` / `--height-window` picks which one a run
-# uses, and the same value drives `MC_SPINE_WG_DUMP_WINDOW`, so the dump length and the
+# uses, and the same value drives `MEGU_WG_DUMP_WINDOW`, so the dump length and the
 # triage window agree instead of letting `chunk_triage` infer a height from whichever
 # sections the native chunk happens to have non-empty (an air-only section is not written,
 # so that inference is not stable). The default is `noise`: every saved row in
@@ -284,34 +284,34 @@ def preflight(args):
 def build_dump_env(args, seed, dump_bin, dump_hm, dump_canon, *, pop_order_file=None):
     env = {k: v for k, v in os.environ.items() if not k.startswith(STRIP_ENV_PREFIXES)}
     env.update({
-        "MC_SPINE_SEED": str(seed),
-        "MC_SPINE_WG_PROFILE": "0",
-        "MC_SPINE_WG_PRESET": args.preset,
-        "MC_SPINE_WG_DUMP": str(dump_bin),
-        "MC_SPINE_WG_DUMP_WINDOW": args.dump_window,
-        "MC_SPINE_WG_DUMP_X": str(args.cx),
-        "MC_SPINE_WG_DUMP_Z": str(args.cz),
-        "MC_SPINE_WG_DUMP_N": str(args.n),
+        "MEGU_SEED": str(seed),
+        "MEGU_WG_PROFILE": "0",
+        "MEGU_WG_PRESET": args.preset,
+        "MEGU_WG_DUMP": str(dump_bin),
+        "MEGU_WG_DUMP_WINDOW": args.dump_window,
+        "MEGU_WG_DUMP_X": str(args.cx),
+        "MEGU_WG_DUMP_Z": str(args.cz),
+        "MEGU_WG_DUMP_N": str(args.n),
     })
     if args.mode == "terrain":
-        env["MC_SPINE_NOFEAT"] = "1"
-        env["MC_SPINE_NOCARVE"] = "1"
+        env["MEGU_NOFEAT"] = "1"
+        env["MEGU_NOCARVE"] = "1"
     elif args.mode == "carvers":
-        env["MC_SPINE_NOFEAT"] = "1"
+        env["MEGU_NOFEAT"] = "1"
     if args.noaq:
-        env["MC_SPINE_NOAQ"] = "1"
+        env["MEGU_NOAQ"] = "1"
     if dump_hm is not None:
-        env["MC_SPINE_WG_DUMP_HM"] = str(dump_hm)
+        env["MEGU_WG_DUMP_HM"] = str(dump_hm)
     if dump_canon is not None:
-        env["MC_SPINE_WG_DUMP_CANON"] = str(dump_canon)
+        env["MEGU_WG_DUMP_CANON"] = str(dump_canon)
     if pop_order_file is not None:
-        env["MC_SPINE_POP_ORDER"] = str(pop_order_file)
+        env["MEGU_POP_ORDER"] = str(pop_order_file)
         if args.pop_order_scope:
-            env["MC_SPINE_POP_ORDER_SCOPE"] = args.pop_order_scope
+            env["MEGU_POP_ORDER_SCOPE"] = args.pop_order_scope
     elif args.pop_order:
-        env["MC_SPINE_POP_ORDER"] = str(Path(args.pop_order).resolve())
+        env["MEGU_POP_ORDER"] = str(Path(args.pop_order).resolve())
         if args.pop_order_scope:
-            env["MC_SPINE_POP_ORDER_SCOPE"] = args.pop_order_scope
+            env["MEGU_POP_ORDER_SCOPE"] = args.pop_order_scope
     return env
 
 
@@ -323,7 +323,7 @@ def run_port_dump(binary, env, dump_log):
     dump_log.write_text(log_text, encoding="utf-8")
     if proc.returncode != 0:
         tail = "\n".join(log_text.splitlines()[-25:])
-        raise PortTriageError(f"mc-spine dump failed (exit {proc.returncode}):\n{tail}")
+        raise PortTriageError(f"megu dump failed (exit {proc.returncode}):\n{tail}")
     return wall
 
 
@@ -364,9 +364,9 @@ def execute(args):
         dump_wall = run_port_dump(binary, env, dump_log)
 
         if not dump_bin.is_file():
-            raise PortTriageError(f"mc-spine exited 0 without writing {dump_bin}")
+            raise PortTriageError(f"megu exited 0 without writing {dump_bin}")
         if dump_hm is not None and not dump_hm.is_file():
-            raise PortTriageError(f"mc-spine exited 0 without writing {dump_hm}")
+            raise PortTriageError(f"megu exited 0 without writing {dump_hm}")
 
         ct_args = SimpleNamespace(
             world=str(args.world),
@@ -445,22 +445,22 @@ def build_parser():
                     help="Offline noise preset (default: overworld); also selects the native dimension directory")
     ap.add_argument("--dim",
                     help="Native dimension directory to read: overworld|nether|end|DIM-1|DIM1 (overrides --preset)")
-    ap.add_argument("--noaq", action="store_true", help="Set MC_SPINE_NOAQ=1 during port dump")
-    ap.add_argument("--pop-order", help="Optional MC_SPINE_POP_ORDER TSV or SculkLog trace (POP_CHUNK/SPASS)")
+    ap.add_argument("--noaq", action="store_true", help="Set MEGU_NOAQ=1 during port dump")
+    ap.add_argument("--pop-order", help="Optional MEGU_POP_ORDER TSV or SculkLog trace (POP_CHUNK/SPASS)")
     ap.add_argument("--pop-order-scope", choices=("exact", "recorded"), default="exact",
-                    help="MC_SPINE_POP_ORDER_SCOPE (default: exact)")
+                    help="MEGU_POP_ORDER_SCOPE (default: exact)")
     ap.add_argument("--allow-stage-mismatch", action="store_true",
                     help="Allow --mode full even if native level.dat enables nofeat or generate_features=0")
     ap.add_argument("--allow-seed-mismatch", action="store_true",
                     help="Allow --seed / --world-b differing from level.dat seed")
     ap.add_argument("--release", action="store_true", help="Build and run --release binary")
     ap.add_argument("--jobs", type=int, default=2, help="Cargo build -j worker count (default: 2)")
-    ap.add_argument("--binary", help="Use an explicit prebuilt mc-spine binary (skips cargo build)")
+    ap.add_argument("--binary", help="Use an explicit prebuilt megu binary (skips cargo build)")
     ap.add_argument("--out-dir", help="Keep dump.bin / dump.log (and hm.bin / canon.tsv) in DIR")
     ap.add_argument("--keep-dump", action="store_true", help="Keep temporary dump directory and print its path")
-    ap.add_argument("--port-hm", action="store_true", help="Also dump MC_SPINE_WG_DUMP_HM and compare heightmaps")
+    ap.add_argument("--port-hm", action="store_true", help="Also dump MEGU_WG_DUMP_HM and compare heightmaps")
     ap.add_argument("--hm-name", default="OCEAN_FLOOR", help="Native Heightmaps entry for --port-hm (default: OCEAN_FLOOR)")
-    ap.add_argument("--canon", action="store_true", help="Also emit MC_SPINE_WG_DUMP_CANON into --out-dir/--keep-dump")
+    ap.add_argument("--canon", action="store_true", help="Also emit MEGU_WG_DUMP_CANON into --out-dir/--keep-dump")
     ap.add_argument("--min-y", type=int,
                     help="Override min_y passed to chunk_triage (default: the preset's window for "
                          "--height-window)")

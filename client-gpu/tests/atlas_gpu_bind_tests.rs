@@ -1,25 +1,25 @@
 // SPDX-License-Identifier: LGPL-3.0-or-later OR GPL-3.0-or-later OR AGPL-3.0-or-later
 //! Atlas GPU upload, tiled terrain and extruded UV readback, and CSM regression.
 
-use mc_spine_client_gpu::atmosphere::{
+use megu_client_gpu::atmosphere::{
     extruded_mesh_to_geometry, AtmosphereParams, BiomeAtmosphereBlender, ChunkFadeTracker,
 };
-use mc_spine_client_gpu::renderer::{
+use megu_client_gpu::renderer::{
     composed_shadow_wgsl, probe_adapters, request_gpu_device, ComposedFrame, GpuRenderer,
     OFFSCREEN_FORMAT,
 };
-use mc_spine_client_gpu::subworld_render::{
+use megu_client_gpu::subworld_render::{
     box_mesh, SubWorldRenderBank, SubWorldRenderEntry, SubWorldTransform, COMPOSITE_LIT_WGSL,
     COMPOSITE_TERRAIN_WGSL,
 };
-use mc_spine_client_gpu::{build_demo_scene, mat4_mul_vec4, Camera, DemoScene};
-use mc_spine_client_mesh::atlas::{build_mipmaps_linear, AtlasBuilder, PaddingMode};
-use mc_spine_client_mesh::builtin_shadow_wgsl::{
+use megu_client_gpu::{build_demo_scene, mat4_mul_vec4, Camera, DemoScene};
+use megu_client_mesh::atlas::{build_mipmaps_linear, AtlasBuilder, PaddingMode};
+use megu_client_mesh::builtin_shadow_wgsl::{
     BuiltinShadowQuality, RenderScalePreset, BUILTIN_SHADOW_SHADERS, MEGU_SHADOW_CASTERS_WGSL,
     MEGU_SHADOW_DEPTH_WGSL,
 };
-use mc_spine_client_mesh::vanilla_plus_3d::{ExtrudedMesh, ExtrudedQuad};
-use mc_spine_client_mesh::RenderBackendPreference;
+use megu_client_mesh::vanilla_plus_3d::{ExtrudedMesh, ExtrudedQuad};
+use megu_client_mesh::RenderBackendPreference;
 use wgpu::naga::front::wgsl;
 use wgpu::naga::valid::{Capabilities, ValidationFlags, Validator};
 

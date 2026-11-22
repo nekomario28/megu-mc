@@ -4,9 +4,9 @@
 //! crate `wgpu` re-exports, so a syntax or type error that would reject a
 //! `wgpu::ShaderModule` at runtime is caught here.
 
-use mc_spine_client_gpu::renderer::composed_shadow_wgsl;
-use mc_spine_client_gpu::subworld_render::{COMPOSITE_LIT_WGSL, COMPOSITE_TERRAIN_WGSL};
-use mc_spine_client_mesh::builtin_shadow_wgsl::{
+use megu_client_gpu::renderer::composed_shadow_wgsl;
+use megu_client_gpu::subworld_render::{COMPOSITE_LIT_WGSL, COMPOSITE_TERRAIN_WGSL};
+use megu_client_mesh::builtin_shadow_wgsl::{
     BUILTIN_SHADOW_SHADERS, MEGU_SHADOW_CASTERS_WGSL, MEGU_SHADOW_DEPTH_WGSL,
     MEGU_SHADOW_SAMPLING_WGSL, MEGU_SKY_ATMOSPHERE_WGSL, MEGU_SPATIAL_SHARPEN_WGSL,
     MEGU_TERRAIN_LIT_WGSL, MEGU_WATER_SURFACE_WGSL,

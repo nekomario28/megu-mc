@@ -21,14 +21,14 @@
 # Pinned inputs (same chain as bytecode_probe.sh):
 #   server.jar          sha1   59353fb40c36d304f2035d51e7d6e6baa98dc05c
 #   official mappings   server.txt 03f8985492bda0afc0898465341eb0acef35f570
-# Overridable with MC_SPINE_VANILLA_JAR, MC_SPINE_VANILLA_MAPPINGS, MC_SPINE_VINEFLOWER and
-# MC_SPINE_VANILLA_SRC (the output directory, default ~/.cache/mc-spine-work/mc121/src).
+# Overridable with MEGU_VANILLA_JAR, MEGU_VANILLA_MAPPINGS, MEGU_VINEFLOWER and
+# MEGU_VANILLA_SRC (the output directory, default ~/.cache/megu-work/mc121/src).
 set -euo pipefail
 
-JAR="${MC_SPINE_VANILLA_JAR:-$HOME/.cache/mc-spine-audit/load/vanilla/server.jar}"
-MAPS="${MC_SPINE_VANILLA_MAPPINGS:-$HOME/.cache/mc-spine-work/mc121/server.txt}"
-VINE="${MC_SPINE_VINEFLOWER:-$HOME/.cache/mc-spine-work/mc121/vineflower-1.11.1.jar}"
-OUT="${MC_SPINE_VANILLA_SRC:-$HOME/.cache/mc-spine-work/mc121/src}"
+JAR="${MEGU_VANILLA_JAR:-$HOME/.cache/megu-audit/load/vanilla/server.jar}"
+MAPS="${MEGU_VANILLA_MAPPINGS:-$HOME/.cache/megu-work/mc121/server.txt}"
+VINE="${MEGU_VINEFLOWER:-$HOME/.cache/megu-work/mc121/vineflower-1.11.1.jar}"
+OUT="${MEGU_VANILLA_SRC:-$HOME/.cache/megu-work/mc121/src}"
 JAR_SHA1=59353fb40c36d304f2035d51e7d6e6baa98dc05c
 MAPS_SHA1=03f8985492bda0afc0898465341eb0acef35f570
 REPO="$(cd "$(dirname "$0")/.." && pwd)"
@@ -50,7 +50,7 @@ done
 case "$(realpath -m "$OUT")" in
   "$REPO"|"$REPO"/*)
     echo "vanilla_src: refusing to write decompiled Mojang code inside the repository ($OUT)" >&2
-    echo "vanilla_src: set MC_SPINE_VANILLA_SRC to a directory outside $REPO" >&2
+    echo "vanilla_src: set MEGU_VANILLA_SRC to a directory outside $REPO" >&2
     exit 2;;
 esac
 mkdir -p "$OUT"

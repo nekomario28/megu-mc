@@ -13,7 +13,7 @@ from fluid_trace_diff import TraceError, compare, load_trace  # noqa: E402
 
 SCRIPT = ROOT / "tools/fluid_trace_diff.py"
 PREFIX = (
-    "# format=mc-spine-fluid-trace-v1\n"
+    "# format=megu-fluid-trace-v1\n"
     "# version=1.21.1\n"
     "# scenario=water_hole\n"
     "tick\tsequence\tx\ty\tz\tstate\n"

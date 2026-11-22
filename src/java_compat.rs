@@ -387,7 +387,7 @@ pub(crate) fn fetch_registry_snapshot(env: &mut JNIEnv) -> Result<ModRegistrySna
     let wire = env.with_local_frame(4, |env| -> jni::errors::Result<String> {
         let encoded = env
             .call_static_method(
-                "net/mcspine/neoforge/Bootstrap",
+                "net/megu/neoforge/Bootstrap",
                 "frozenRegistryEncoded",
                 "()Ljava/lang/String;",
                 &[],
@@ -413,7 +413,7 @@ fn fetch_java_callbacks(env: &mut JNIEnv) -> Result<bool, String> {
     let count = env
         .with_local_frame(4, |env| -> jni::errors::Result<jint> {
             Ok(env
-                .call_static_method("net/mcspine/neoforge/Bootstrap", "javaCallbacks", "()I", &[])?
+                .call_static_method("net/megu/neoforge/Bootstrap", "javaCallbacks", "()I", &[])?
                 .i()?)
         })
         .map_err(|error| java_error(env, error))?;
@@ -463,7 +463,7 @@ impl<'local> S3BatchBridge<'local> {
             return Err("S3 bridge requires the JVM owner thread".into());
         }
         let bind = (|| -> jni::errors::Result<Self> {
-            let class = env.find_class("net/mcspine/neoforge/DirectBatchBridge")?;
+            let class = env.find_class("net/megu/neoforge/DirectBatchBridge")?;
             let class = env.auto_local(class);
             let dispatch = env.get_static_method_id(
                 &*class,
@@ -575,7 +575,7 @@ fn dispatch_s4_payload_frame(
             let name = env.new_string(player_name)?;
             let out = env
                 .call_static_method(
-                    "net/mcspine/neoforge/S4NetworkBridge",
+                    "net/megu/neoforge/S4NetworkBridge",
                     "dispatch",
                     "([BILjava/lang/String;)[B",
                     &[
@@ -630,7 +630,7 @@ pub(crate) fn query_s4_block_items(
             env.set_int_array_region(&frame, 0, &input)?;
             let out = env
                 .call_static_method(
-                    "net/mcspine/neoforge/S4CapabilityBridge",
+                    "net/megu/neoforge/S4CapabilityBridge",
                     "query",
                     "([I)[I",
                     &[JValue::Object(&frame)],
@@ -854,7 +854,7 @@ pub fn run(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
     let result = (|| -> Result<bool, Box<dyn std::error::Error>> {
         initialize_fabric(&mut env, &classpath, trample)?;
         Ok(env
-            .call_static_method("net/mcspine/probe/Bootstrap", "run", "()Z", &[])?
+            .call_static_method("net/megu/probe/Bootstrap", "run", "()Z", &[])?
             .z()?)
     })();
     let changed = match result {
@@ -919,7 +919,7 @@ fn initialize_fabric(
     let dir = JObject::from(env.new_string(directory.to_string_lossy())?);
     let host = env
         .call_static_method(
-            "net/mcspine/probe/Bootstrap",
+            "net/megu/probe/Bootstrap",
             "initialize",
             "(Ljava/lang/String;Ljava/lang/String;Z)Ljava/lang/Class;",
             &[
@@ -962,7 +962,7 @@ pub fn serve(
             let bootstrap = match loader {
                 Loader::Fabric => {
                     initialize_fabric(&mut env, &classpath, true)?;
-                    "net/mcspine/probe/Bootstrap"
+                    "net/megu/probe/Bootstrap"
                 }
                 Loader::NeoForge => {
                     let version = env
@@ -988,14 +988,14 @@ pub fn serve(
                     );
                     let host = env
                         .call_static_method(
-                            "net/mcspine/neoforge/Bootstrap",
+                            "net/megu/neoforge/Bootstrap",
                             "initialize",
                             "(Ljava/lang/String;)Ljava/lang/Class;",
                             &[JValue::Object(&directory)],
                         )?
                         .l()?;
                     register_host(&mut env, host)?;
-                    "net/mcspine/neoforge/Bootstrap"
+                    "net/megu/neoforge/Bootstrap"
                 }
             };
             let hooks = env
@@ -1095,10 +1095,10 @@ struct StagedMods(std::path::PathBuf);
 #[cfg(feature = "neoforge-events")]
 impl StagedMods {
     fn from_env() -> Result<Option<Self>, Box<dyn std::error::Error>> {
-        let Some(paths) = std::env::var_os("MC_SPINE_NEOFORGE_MODS") else {
+        let Some(paths) = std::env::var_os("MEGU_NEOFORGE_MODS") else {
             return Ok(None);
         };
-        let directory = std::env::temp_dir().join(format!("mc-spine-mods-{}", std::process::id()));
+        let directory = std::env::temp_dir().join(format!("megu-mods-{}", std::process::id()));
         let mut builder = std::fs::DirBuilder::new();
         #[cfg(unix)]
         builder.mode(0o700);
@@ -1840,7 +1840,7 @@ mod tests {
         use crate::landing_types::build_config_registry_sync_packets;
         use crate::landing_types::{S4BlockSide, S4ItemStack, S4SlotMutation, S4SlotResult};
 
-        let Some(directory) = std::env::var_os("MC_SPINE_S4_FIXTURE") else {
+        let Some(directory) = std::env::var_os("MEGU_S4_FIXTURE") else {
             return;
         };
         let directory = Path::new(&directory);
@@ -1849,7 +1849,7 @@ mod tests {
         let mut env = jvm.attach_current_thread().unwrap();
         let path = env.new_string(directory.to_str().unwrap()).unwrap();
         let initialized = env.call_static_method(
-            "net/mcspine/neoforge/Bootstrap",
+            "net/megu/neoforge/Bootstrap",
             "initialize",
             "(Ljava/lang/String;)Ljava/lang/Class;",
             &[JValue::Object(&path)],
@@ -2067,7 +2067,7 @@ mod tests {
         use crate::landing_types::S3Activation::*;
 
         // The Python suite builds and supplies the audited mod and Java 21 classpath.
-        let Some(directory) = std::env::var_os("MC_SPINE_S3_FIXTURE") else {
+        let Some(directory) = std::env::var_os("MEGU_S3_FIXTURE") else {
             return;
         };
         let directory = Path::new(&directory);
@@ -2076,7 +2076,7 @@ mod tests {
         let mut env = jvm.attach_current_thread().unwrap();
         let path = JObject::from(env.new_string(directory.to_str().unwrap()).unwrap());
         let host = env.call_static_method(
-            "net/mcspine/neoforge/Bootstrap",
+            "net/megu/neoforge/Bootstrap",
             "initialize",
             "(Ljava/lang/String;)Ljava/lang/Class;",
             &[JValue::Object(&path)],
@@ -2099,7 +2099,7 @@ mod tests {
             let header = unsafe { std::slice::from_raw_parts(bridge.response.bytes.as_ptr(), 4) };
             assert_eq!(header, [0; 4]);
         };
-        let mode = std::env::var("MC_SPINE_S3_MODE").unwrap();
+        let mode = std::env::var("MEGU_S3_MODE").unwrap();
         match mode.as_str() {
             "stress" => {
                 let blocks: Vec<_> = (0..1024).map(|i| request(BlockEntityTick, 7, i)).collect();
@@ -2275,7 +2275,7 @@ mod tests {
                 .len(),
             1
         );
-        env.call_static_method("net/mcspine/neoforge/Bootstrap", "close", "()V", &[])
+        env.call_static_method("net/megu/neoforge/Bootstrap", "close", "()V", &[])
             .unwrap();
         let error = bridge.dispatch(&mut env, &[]).err().unwrap();
         assert!(
@@ -2917,8 +2917,8 @@ mod tests {
     #[test]
     fn jni_contract_callback_census_matches_fixture() {
         let (Some(directory), Some(expected)) = (
-            std::env::var_os("MC_SPINE_JNI_FIXTURE"),
-            std::env::var_os("MC_SPINE_JNI_EXPECT_CALLBACKS"),
+            std::env::var_os("MEGU_JNI_FIXTURE"),
+            std::env::var_os("MEGU_JNI_EXPECT_CALLBACKS"),
         ) else {
             return;
         };
@@ -2928,7 +2928,7 @@ mod tests {
         let mut env = jvm.attach_current_thread().unwrap();
         let path = JObject::from(env.new_string(directory.to_str().unwrap()).unwrap());
         let host = env.call_static_method(
-            "net/mcspine/neoforge/Bootstrap",
+            "net/megu/neoforge/Bootstrap",
             "initialize",
             "(Ljava/lang/String;)Ljava/lang/Class;",
             &[JValue::Object(&path)],
@@ -2951,7 +2951,7 @@ mod tests {
     fn jni_contract_10k_localref_exception_and_thread_attach_stress() {
         // The Python suite supplies the audited fixture dir (classpath.txt +
         // mods/) and runs this test alone: one JavaVM per process.
-        let Some(directory) = std::env::var_os("MC_SPINE_JNI_FIXTURE") else {
+        let Some(directory) = std::env::var_os("MEGU_JNI_FIXTURE") else {
             return;
         };
         let directory = Path::new(&directory);
@@ -2960,7 +2960,7 @@ mod tests {
         let mut env = jvm.attach_current_thread().unwrap();
         let path = JObject::from(env.new_string(directory.to_str().unwrap()).unwrap());
         let host = env.call_static_method(
-            "net/mcspine/neoforge/Bootstrap",
+            "net/megu/neoforge/Bootstrap",
             "initialize",
             "(Ljava/lang/String;)Ljava/lang/Class;",
             &[JValue::Object(&path)],
@@ -2969,7 +2969,7 @@ mod tests {
         register_host(&mut env, host.l().unwrap()).unwrap();
         let hooks = env
             .call_static_method(
-                "net/mcspine/neoforge/Bootstrap",
+                "net/megu/neoforge/Bootstrap",
                 "initializeServer",
                 "()Ljava/lang/Class;",
                 &[],

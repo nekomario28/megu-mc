@@ -9,7 +9,7 @@
 //!
 //! The channel names are the ones those overlays listen on —
 //! `openpartiesandclaims:claims_sync`, `ftbchunks:claims_sync` — plus our own
-//! `mc-spine:claims_v1`. The *payload* is a deterministic clean-room format
+//! `megu:claims_v1`. The *payload* is a deterministic clean-room format
 //! defined here, not a byte-compat clone of either mod's private schema:
 //!
 //! ```text
@@ -40,7 +40,7 @@
 //! [`ClaimsWireError`]s. Nothing in this module panics on hostile input.
 
 use crate::claims::{ClaimOwner, ClaimsSyncDelta, ClaimsWorld, ChunkClaim, SubClaimId};
-use mc_spine_core::id::ResourceLocation;
+use megu_core::id::ResourceLocation;
 use std::collections::BTreeMap;
 use std::fmt;
 
@@ -48,8 +48,8 @@ use std::fmt;
 pub const CHANNEL_OPENPAC_CLAIMS_SYNC: &str = "openpartiesandclaims:claims_sync";
 /// FTB Chunks' claims sync channel name.
 pub const CHANNEL_FTBCHUNKS_CLAIMS_SYNC: &str = "ftbchunks:claims_sync";
-/// mc-spine's own claims sync channel name.
-pub const CHANNEL_MC_SPINE_CLAIMS_V1: &str = "mc-spine:claims_v1";
+/// megu's own claims sync channel name.
+pub const CHANNEL_MEGU_CLAIMS_V1: &str = "megu:claims_v1";
 
 /// The only `protocol_tag` this codec reads or writes. A bump is a format
 /// change; unknown tags are rejected, never guessed at.
@@ -816,7 +816,7 @@ mod tests {
         for channel in [
             CHANNEL_OPENPAC_CLAIMS_SYNC,
             CHANNEL_FTBCHUNKS_CLAIMS_SYNC,
-            CHANNEL_MC_SPINE_CLAIMS_V1,
+            CHANNEL_MEGU_CLAIMS_V1,
         ] {
             let frame = encode_custom_payload_frame(channel, &batch).unwrap();
             let (decoded_channel, decoded) = decode_custom_payload_frame(&frame).unwrap();
@@ -825,11 +825,11 @@ mod tests {
         }
         // The frame really is VarInt(len) + channel + payload.
         let frame =
-            encode_custom_payload_frame(CHANNEL_MC_SPINE_CLAIMS_V1, &batch).unwrap();
-        assert_eq!(frame[0] as usize, CHANNEL_MC_SPINE_CLAIMS_V1.len());
+            encode_custom_payload_frame(CHANNEL_MEGU_CLAIMS_V1, &batch).unwrap();
+        assert_eq!(frame[0] as usize, CHANNEL_MEGU_CLAIMS_V1.len());
         assert_eq!(
-            &frame[1..1 + CHANNEL_MC_SPINE_CLAIMS_V1.len()],
-            CHANNEL_MC_SPINE_CLAIMS_V1.as_bytes()
+            &frame[1..1 + CHANNEL_MEGU_CLAIMS_V1.len()],
+            CHANNEL_MEGU_CLAIMS_V1.as_bytes()
         );
     }
 

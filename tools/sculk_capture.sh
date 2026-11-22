@@ -45,7 +45,7 @@ if [ -z "$TAG" ]; then
   exit 2
 fi
 
-OUT="${SCULK_TRACE_DIR:-$HOME/.cache/mc-spine-audit/sculk-traces}"
+OUT="${SCULK_TRACE_DIR:-$HOME/.cache/megu-audit/sculk-traces}"
 FIXTURE_DIR="${FIXTURE_DIR:-/var/tmp}"
 mkdir -p "$OUT"
 

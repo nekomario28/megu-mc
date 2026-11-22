@@ -18,7 +18,7 @@ from zipfile import ZipFile, ZipInfo
 ROOT = Path(__file__).resolve().parents[2]
 ADAPTER = ROOT / "compat/neoforge-events"
 SURFACE = ADAPTER / "shim-surface.json"
-SCANNER = Path("java/net/mcspine/neoforge/ShimCheck.java")
+SCANNER = Path("java/net/megu/neoforge/ShimCheck.java")
 FIXTURES = Path(__file__).resolve().parent / "fixtures"
 CASES = ("gameplay", "content", "automation", "network", "transforms", "implicit_at", "fabric")
 MAX_JAR_BYTES = 20 * 1024 * 1024

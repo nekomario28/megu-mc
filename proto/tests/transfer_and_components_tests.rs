@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: LGPL-3.0-or-later
 
-use mc_spine_proto::item_components::{
+use megu_proto::item_components::{
     plain_text_component, sanitize_and_roundtrip_components, sanitize_text_component,
     AttributeModifier, BannerPattern, BannerPatternKind, BeeData, BlockPredicate, BlockProperty,
     BlockPropertyValue, BookPage, Enchantment, FireworkExplosion, Food, FoodEffect, Holder, IdSet,
@@ -9,9 +9,9 @@ use mc_spine_proto::item_components::{
     TrimMaterial, TrimPattern, VerifiedComponent, WrittenBook, WrittenPage, MAX_COMPONENT_BYTES,
     MAX_CONTAINER_SLOTS, MAX_LIST_ENTRIES, MAX_STACK_COMPONENTS_BYTES,
 };
-use mc_spine_proto::table::{PacketDir, PacketPhase, ProtocolTable};
-use mc_spine_proto::wire::{read_frame, write_frame, BlockPos, WireReader, WireWriter};
-use mc_spine_proto::{
+use megu_proto::table::{PacketDir, PacketPhase, ProtocolTable};
+use megu_proto::wire::{read_frame, write_frame, BlockPos, WireReader, WireWriter};
+use megu_proto::{
     C2SPacket, CodecV767, EquipmentSlot, ItemStack, ProtocolCodec, RawComponent, S2CPacket,
     MAX_COOKIE_PAYLOAD_BYTES,
 };

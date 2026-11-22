@@ -28,9 +28,9 @@ def server(binary, **env_overrides):
         (root / "config_packets.bin").symlink_to(ROOT / "config_packets.bin")
         (root / "assets").symlink_to(ROOT / "assets", target_is_directory=True)
         game = port()
-        env = dict(os.environ, MC_SPINE_PORT=str(game), MC_SPINE_BIND_ADDR="127.0.0.1",
-                   MC_SPINE_WG="old", MC_SPINE_RESOURCE_PACK_URL="")
-        env.pop("MC_SPINE_RCON_PORT", None)
+        env = dict(os.environ, MEGU_PORT=str(game), MEGU_BIND_ADDR="127.0.0.1",
+                   MEGU_WG="old", MEGU_RESOURCE_PACK_URL="")
+        env.pop("MEGU_RCON_PORT", None)
         env.update({k: str(v) for k, v in env_overrides.items()})
         log_path = root / "server.log"
         with log_path.open("w+") as log:
@@ -116,7 +116,7 @@ def duplicate_login(binary):
 
 
 def allowlist(binary):
-    with server(binary, MC_SPINE_ALLOWLIST="Friend") as (game, _proc, log):
+    with server(binary, MEGU_ALLOWLIST="Friend") as (game, _proc, log):
         sock = raw_login_start(game, "Stranger")
         body = recv_exact(sock, recv_vint(sock))
         assert body[0] == 0 and b"white-listed" in body, body
@@ -127,7 +127,7 @@ def allowlist(binary):
 
 
 def per_ip_limit(binary):
-    with server(binary, MC_SPINE_MAX_CONN_PER_IP=2) as (game, _proc, log):
+    with server(binary, MEGU_MAX_CONN_PER_IP=2) as (game, _proc, log):
         time.sleep(0.5)  # let the readiness probe's own connection finish closing
         a = socket.create_connection(("127.0.0.1", game))
         b = socket.create_connection(("127.0.0.1", game))
@@ -146,7 +146,7 @@ def per_ip_limit(binary):
 
 
 def pre_play_deadline_and_no_spin(binary):
-    with server(binary, MC_SPINE_LOGIN_TIMEOUT_SECS=3) as (game, proc, log):
+    with server(binary, MEGU_LOGIN_TIMEOUT_SECS=3) as (game, proc, log):
         silent = socket.create_connection(("127.0.0.1", game))
         t0 = time.monotonic()
         assert closes_within(silent, 6), "silent handshake socket must be dropped"
@@ -176,7 +176,7 @@ def pre_play_deadline_and_no_spin(binary):
 
 
 def idle_timeout(binary):
-    with server(binary, MC_SPINE_IDLE_TIMEOUT_SECS=3) as (game, _proc, log):
+    with server(binary, MEGU_IDLE_TIMEOUT_SECS=3) as (game, _proc, log):
         with Client(game, "Sleeper") as c:
             c.login()
             c.socket.settimeout(0.2)
@@ -217,23 +217,23 @@ def chat_limits(binary):
 
 def public_bind_guard(binary):
     with tempfile.TemporaryDirectory(prefix="spine-bind-") as tmp:
-        env = dict(os.environ, MC_SPINE_PORT=str(port()), MC_SPINE_BIND_ADDR="0.0.0.0",
-                   MC_SPINE_WG="old")
-        env.pop("MC_SPINE_ALLOW_PUBLIC_BIND", None)
-        env.pop("MC_SPINE_RCON_PORT", None)
+        env = dict(os.environ, MEGU_PORT=str(port()), MEGU_BIND_ADDR="0.0.0.0",
+                   MEGU_WG="old")
+        env.pop("MEGU_ALLOW_PUBLIC_BIND", None)
+        env.pop("MEGU_RCON_PORT", None)
         r = subprocess.run([str(binary)], cwd=tmp, env=env, capture_output=True, text=True, timeout=20)
         assert r.returncode == 2, (r.returncode, r.stderr[-500:])
-        assert "MC_SPINE_ALLOW_PUBLIC_BIND" in r.stderr, r.stderr[-500:]
+        assert "MEGU_ALLOW_PUBLIC_BIND" in r.stderr, r.stderr[-500:]
     # with the explicit opt-in it starts (and still answers on loopback)
-    with server(binary, MC_SPINE_BIND_ADDR="0.0.0.0", MC_SPINE_ALLOW_PUBLIC_BIND=1) as (_g, _p, log):
+    with server(binary, MEGU_BIND_ADDR="0.0.0.0", MEGU_ALLOW_PUBLIC_BIND=1) as (_g, _p, log):
         assert "non-loopback bind" in log_text(log)
     print("public bind guard: PASS")
 
 
 def rcon_lockout(binary):
     rcon = port()
-    with server(binary, MC_SPINE_RCON_PORT=rcon, MC_SPINE_RCON_PASS="right-secret",
-                MC_SPINE_RCON_MAX_FAILURES=3, MC_SPINE_RCON_LOCKOUT_SECS=60) as (game, _p, log):
+    with server(binary, MEGU_RCON_PORT=rcon, MEGU_RCON_PASS="right-secret",
+                MEGU_RCON_MAX_FAILURES=3, MEGU_RCON_LOCKOUT_SECS=60) as (game, _p, log):
         time.sleep(0.5)
         for i in range(3):
             with socket.create_connection(("127.0.0.1", rcon), timeout=5) as s:
@@ -250,7 +250,7 @@ def rcon_lockout(binary):
         assert "rcon lockout" in text
     # a correct login is audited, with the command
     rcon = port()
-    with server(binary, MC_SPINE_RCON_PORT=rcon, MC_SPINE_RCON_PASS="right-secret") as (game, _p, log):
+    with server(binary, MEGU_RCON_PORT=rcon, MEGU_RCON_PASS="right-secret") as (game, _p, log):
         time.sleep(0.5)
         with socket.create_connection(("127.0.0.1", rcon), timeout=5) as s:
             s.settimeout(5)

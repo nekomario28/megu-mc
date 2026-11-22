@@ -42,10 +42,10 @@ import time
 ROOT = Path(__file__).resolve().parents[1]
 SCRIPT = ROOT / "tools/mutation_check.sh"
 CONTROL = "running 1 test\ntest result: ok. 1 passed; 0 failed; 0 ignored"
-DIRTY = "// MC_SPINE_DIRTY_MARKER"
+DIRTY = "// MEGU_DIRTY_MARKER"
 # The wire config the fixture plants: its bytes are what a copy has to carry, so the assertion names
 # a digest rather than "a file exists".
-WIRE_CONFIG = b"MCSPINE-CONFIG-" + bytes(range(96))
+WIRE_CONFIG = b"MEGU-CONFIG-" + bytes(range(96))
 WIRE_SHA = hashlib.sha256(WIRE_CONFIG).hexdigest()
 # Files the campaign must not copy even though they sit inside an input directory: the exclusion
 # policy and the copy used to be separate (`find -type f` versus `tar` over the directory).
@@ -59,7 +59,7 @@ INCLUDED = ["Cargo.toml", "src/main.rs", "tools/mutation_check.sh", "assets/sent
 # The campaign refuses to start without room for a cold private target (1.5 GiB), and /tmp is a
 # small tmpfs on some hosts, so the fixture's tree sits where the real snapshot parent sits and
 # `TemporaryDirectory` removes it - including any residue a killed fixture left behind.
-WORK = Path(os.environ.get("XDG_CACHE_HOME", Path.home() / ".cache")) / "mc-spine"
+WORK = Path(os.environ.get("XDG_CACHE_HOME", Path.home() / ".cache")) / "megu"
 WORK.mkdir(parents=True, exist_ok=True)
 
 
@@ -112,7 +112,7 @@ def build_fixture(root, *, dirty=False, leftover=False, missing_anchor=False, sy
     script = Path(script or SCRIPT)
     for folder in ["tools", "src", "bin", "tests", "assets", "datapacks", "evidence"]:
         (root / folder).mkdir()
-    (root / "Cargo.toml").write_text('[package]\nname = "mc-spine"\nversion = "0.0.0"\n')
+    (root / "Cargo.toml").write_text('[package]\nname = "megu"\nversion = "0.0.0"\n')
     (root / "config_packets.bin").write_bytes(WIRE_CONFIG)
     for path in EXCLUDED:
         (root / path).parent.mkdir(parents=True, exist_ok=True)
@@ -195,7 +195,7 @@ def write_cargo(root, artifact, *, cargo_output, cargo_status, empty_artifact, b
                 restored_error, repeat_output, sleep_while_mutated):
     probe = root / "bin/probe-paths.txt"
     probe.write_text("\n".join(EXCLUDED + INCLUDED) + "\n")
-    event = {"reason": "compiler-artifact", "target": {"name": "mc-spine", "kind": ["bin"]},
+    event = {"reason": "compiler-artifact", "target": {"name": "megu", "kind": ["bin"]},
              "executable": str(artifact)}
     if empty_artifact:
         event = {"reason": "build-finished", "success": True}
@@ -289,7 +289,7 @@ def run_case(cargo_output, cargo_status, *, script=None, missing_anchor=False, l
         root = Path(tmp)
         snapshot_parent = Path(snaps)
         script = Path(script or SCRIPT)
-        artifact = root / "alternate-target/debug/mc-spine"
+        artifact = root / "alternate-target/debug/megu"
         artifact.parent.mkdir(parents=True)
         artifact.write_text("fake executable")
         build_fixture(root, dirty=dirty, leftover=leftover, missing_anchor=missing_anchor,
@@ -307,7 +307,7 @@ def run_case(cargo_output, cargo_status, *, script=None, missing_anchor=False, l
             text = script_path.read_text()
             anchor = 'python3 "$filter" "$executable"'
             assert text.count(anchor) == 1
-            script_path.write_text(text.replace(anchor, 'python3 "$filter" target/debug/mc-spine'))
+            script_path.write_text(text.replace(anchor, 'python3 "$filter" target/debug/megu'))
         before = {p.name: hashlib.sha256(p.read_bytes()).digest() for p in (root / "src").glob("*.rs")}
         write_cargo(root, artifact, cargo_output=cargo_output, cargo_status=cargo_status,
                     empty_artifact=empty_artifact, baseline_error=baseline_error,

@@ -1,6 +1,6 @@
 package net.minecraft.core.registries;
 
-import net.mcspine.probe.RegistryStore;
+import net.megu.probe.RegistryStore;
 import net.minecraft.core.DefaultedRegistry;
 
 public final class BuiltInRegistries {

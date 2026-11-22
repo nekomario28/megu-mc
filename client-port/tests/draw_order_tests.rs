@@ -3,12 +3,12 @@
 //! back-to-front transparent draws for blending, and zero-allocation
 //! scratch reuse across frames.
 
-use mc_spine_client_mesh::draw_order::{DrawOrder, DrawOrderScratch, MultidrawScratch};
-use mc_spine_client_mesh::{
+use megu_client_mesh::draw_order::{DrawOrder, DrawOrderScratch, MultidrawScratch};
+use megu_client_mesh::{
     aabb_distance_sq, depth_key, mesh_section, Block, Light, RenderRegions, Section, SectionCoord,
 };
 
-fn stone_section_quads() -> Vec<mc_spine_client_mesh::Quad> {
+fn stone_section_quads() -> Vec<megu_client_mesh::Quad> {
     let section = Section::filled(Block::opaque_cube(1), Light::new(0, 15));
     mesh_section(&section.view())
 }

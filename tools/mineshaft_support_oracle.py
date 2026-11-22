@@ -18,7 +18,7 @@ def main():
     with pinned_runtime(args.jar) as (work, classpath, _):
         output = work / "support.tsv"
         run_probe(work, classpath, ROOT / "tools/structure-oracle/MineshaftSupportOracle.java",
-                  "dev.mcspine.tools.MineshaftSupportOracle", output,
+                  "dev.megu.tools.MineshaftSupportOracle", output,
                   extra_sources=[ROOT / "tools/structure-oracle/NativeHarness.java"])
         data, _, _ = encode(output.read_text(), json.loads((ROOT / "assets/blocks_1211.json").read_text()))
     if args.output:

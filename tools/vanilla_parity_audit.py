@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""vanilla_parity_audit.py -- mc-spine vs Vanilla 1.21.1 (protocol 767) parity gap detector.
+"""vanilla_parity_audit.py -- megu vs Vanilla 1.21.1 (protocol 767) parity gap detector.
 
 Schema: "megu-parity-audit/1".
 
@@ -1976,7 +1976,7 @@ def render_text(report):
     lines = []
     off = report["offline"]
     p = off["packets"]
-    lines.append("mc-spine vanilla parity audit (megu-parity-audit/1)")
+    lines.append("megu vanilla parity audit (megu-parity-audit/1)")
     lines.append("=" * 60)
     lines.append(f"Mode A - offline static & live-wiring audit")
     lines.append(f"  C2S Play packets (protocol 767): "
@@ -2072,7 +2072,7 @@ def render_text(report):
 
 
 def render_markdown(report):
-    lines = ["# mc-spine vanilla parity audit", "",
+    lines = ["# megu vanilla parity audit", "",
              f"Schema: `{SCHEMA}`", ""]
     off = report["offline"]
     p = off["packets"]
@@ -2167,7 +2167,7 @@ def render_markdown(report):
 
 def build_parser():
     ap = argparse.ArgumentParser(
-        description="mc-spine vs Vanilla 1.21.1 parity gap detector "
+        description="megu vs Vanilla 1.21.1 parity gap detector "
                     "(megu-parity-audit/1). Mode A always runs offline; "
                     "Mode B diffs against vanilla --reports output.")
     ap.add_argument("--repo", default=".", help="repo root (default: .)")

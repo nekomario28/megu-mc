@@ -38,10 +38,10 @@ def run(binary, wg):
         (root / "assets").symlink_to(ROOT / "assets", target_is_directory=True)
         (root / "datapacks").symlink_to(ROOT / "datapacks", target_is_directory=True)
         game = port()
-        env = dict(os.environ, MC_SPINE_PORT=str(game), MC_SPINE_BIND_ADDR="127.0.0.1",
-                   MC_SPINE_RESOURCE_PACK_URL="")
+        env = dict(os.environ, MEGU_PORT=str(game), MEGU_BIND_ADDR="127.0.0.1",
+                   MEGU_RESOURCE_PACK_URL="")
         if wg:
-            env["MC_SPINE_WG"] = wg
+            env["MEGU_WG"] = wg
         with (root / "server.log").open("w+") as log:
             proc = subprocess.Popen([str(binary)], cwd=root, env=env, stdout=log, stderr=log)
             try:

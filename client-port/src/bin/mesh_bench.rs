@@ -5,9 +5,9 @@ use std::mem::MaybeUninit;
 use std::ptr;
 use std::time::Instant;
 
-use mc_spine_client_mesh::{
+use megu_client_mesh::{
     ffi::{
-        mc_spine_client_mesh_column, mc_spine_client_mesh_pack_vertices, MeshColumnInput,
+        megu_client_mesh_column, megu_client_mesh_pack_vertices, MeshColumnInput,
         MeshColumnSection, PackedVertex, ABI_AIR, ABI_COLUMN_UNIFORM_AIR, ABI_OK, ABI_VERSION,
     },
     mesh_section, Block, Light, Quad, Section, EDGE, LIGHT_BYTES, SECTION_CELLS, WATER,
@@ -109,7 +109,7 @@ fn overworld_column(runs: usize) {
     let mut quad_count = 0;
     // SAFETY: inputs and count are live and have the lengths in the ABI.
     assert_eq!(
-        unsafe { mc_spine_client_mesh_column(&input, ptr::null_mut(), 0, &mut quad_count) },
+        unsafe { megu_client_mesh_column(&input, ptr::null_mut(), 0, &mut quad_count) },
         ABI_OK
     );
     let mut quads = vec![MaybeUninit::<Quad>::uninit(); quad_count];
@@ -121,7 +121,7 @@ fn overworld_column(runs: usize) {
         // the initialized prefix on success. All output buffers are disjoint.
         unsafe {
             assert_eq!(
-                mc_spine_client_mesh_column(
+                megu_client_mesh_column(
                     black_box(&input),
                     quads.as_mut_ptr().cast(),
                     quads.len(),
@@ -130,7 +130,7 @@ fn overworld_column(runs: usize) {
                 ABI_OK
             );
             assert_eq!(
-                mc_spine_client_mesh_pack_vertices(
+                megu_client_mesh_pack_vertices(
                     quads.as_ptr().cast(),
                     quad_count,
                     vertices.as_mut_ptr(),

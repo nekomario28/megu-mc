@@ -39,8 +39,8 @@ jobs:
         run: python3 tests/native_cargo_gate_test.py
       - name: Enumerate all pinned states
         run: |
-          python3 tools/native_support_inventory.py --scope all --output "${RUNNER_TEMP}/mcspine-states.tsv"
-          test "$(wc -l < "${RUNNER_TEMP}/mcspine-states.tsv")" -eq 26684
+          python3 tools/native_support_inventory.py --scope all --output "${RUNNER_TEMP}/megu-states.tsv"
+          test "$(wc -l < "${RUNNER_TEMP}/megu-states.tsv")" -eq 26684
 
   native:
     name: Pinned 1.21.1 Java oracle (all 26684 states)

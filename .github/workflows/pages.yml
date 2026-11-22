@@ -4,7 +4,7 @@ name: Deploy website to GitHub Pages
 # schedule: a maintainer starts a deploy from the Actions tab, and only after
 # the site check and the provenance gate pass.
 #
-# Custom domain: pass a bare hostname such as `mc-spine.megumin.tech` in the
+# Custom domain: pass a bare hostname such as `megu.megumin.tech` in the
 # `cname` input and the deploy writes it to `website/CNAME` (the DNS record and
 # the repo's Pages custom-domain setting are still configured by hand). Leave
 # the input empty to serve from the default <owner>.github.io/<repo> URL.
@@ -12,7 +12,7 @@ on:
   workflow_dispatch:
     inputs:
       cname:
-        description: 'Custom domain written to CNAME (e.g. mc-spine.megumin.tech); empty = github.io'
+        description: 'Custom domain written to CNAME (e.g. megu.megumin.tech); empty = github.io'
         required: false
         type: string
         default: ''

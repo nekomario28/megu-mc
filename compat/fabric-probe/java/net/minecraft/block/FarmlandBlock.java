@@ -2,7 +2,7 @@ package net.minecraft.block;
 import net.minecraft.entity.Entity;
 import net.minecraft.world.World;
 import net.minecraft.util.math.BlockPos;
-import net.mcspine.probe.Host;
+import net.megu.probe.Host;
 /** Only the already-eligible dirt-conversion branch; not Vanilla landing eligibility. */
 public final class FarmlandBlock {
     public void onLandedUpon(World world, BlockState state, BlockPos pos, Entity entity, float distance) {

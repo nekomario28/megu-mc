@@ -10,14 +10,14 @@
 
 use std::collections::BTreeMap;
 
-use mc_spine_client_ui::draw::{rasterize_draw_list, UiCommand, UiRect};
-use mc_spine_client_ui::recipe_browser::{
+use megu_client_ui::draw::{rasterize_draw_list, UiCommand, UiRect};
+use megu_client_ui::recipe_browser::{
     AnimatedPart, BrowserTab, DetailMode, DungeonLootEntry, EnchantmentCompat, HeatRequirement,
     ItemEntry, JerTab, MobDropEntry, OreDistribution, PonderAnim, PonderAxis, PonderScene,
     PonderStep, Recipe, RecipeBrowserAction, RecipeBrowserState, RecipeCategory,
     RecipeHitRegion, RecipeIndex, RecipeIngredient, RecipeWidgetId, VillagerTradeEntry,
 };
-use mc_spine_client_ui::state::{GamepadButton, UiInputEvent, UiKey, UiLang};
+use megu_client_ui::state::{GamepadButton, UiInputEvent, UiKey, UiLang};
 
 const SIZES: [(u32, u32); 4] = [(640, 360), (1280, 720), (1920, 1080), (3840, 2160)];
 
@@ -70,7 +70,7 @@ fn fixture_index() -> RecipeIndex {
     // 9x ingot -> block (shaped grid).
     let mut to_block = Recipe::new("minecraft:iron_block", RecipeCategory::CraftingShaped);
     to_block.inputs = vec![RecipeIngredient::item("minecraft:iron_ingot", 9)];
-    to_block.outputs = vec![mc_spine_client_ui::recipe_browser::ItemStack {
+    to_block.outputs = vec![megu_client_ui::recipe_browser::ItemStack {
         item: "minecraft:iron_block".into(),
         count: 1,
     }];
@@ -78,7 +78,7 @@ fn fixture_index() -> RecipeIndex {
     // ingot -> 9 nuggets (ingot compression, another loop arm).
     let mut to_nuggets = Recipe::new("minecraft:iron_nugget", RecipeCategory::CraftingShapeless);
     to_nuggets.inputs = vec![RecipeIngredient::item("minecraft:iron_ingot", 1)];
-    to_nuggets.outputs = vec![mc_spine_client_ui::recipe_browser::ItemStack {
+    to_nuggets.outputs = vec![megu_client_ui::recipe_browser::ItemStack {
         item: "minecraft:iron_nugget".into(),
         count: 9,
     }];
@@ -86,7 +86,7 @@ fn fixture_index() -> RecipeIndex {
     // block -> 9 ingots (completes the block<->ingot cycle).
     let mut to_ingots = Recipe::new("minecraft:iron_ingot_from_block", RecipeCategory::CraftingShapeless);
     to_ingots.inputs = vec![RecipeIngredient::item("minecraft:iron_block", 1)];
-    to_ingots.outputs = vec![mc_spine_client_ui::recipe_browser::ItemStack {
+    to_ingots.outputs = vec![megu_client_ui::recipe_browser::ItemStack {
         item: "minecraft:iron_ingot".into(),
         count: 9,
     }];
@@ -94,7 +94,7 @@ fn fixture_index() -> RecipeIndex {
     // ore -> ingot smelting.
     let mut smelt = Recipe::new("minecraft:smelt_iron", RecipeCategory::Smelting);
     smelt.inputs = vec![RecipeIngredient::item("minecraft:iron_ore", 1)];
-    smelt.outputs = vec![mc_spine_client_ui::recipe_browser::ItemStack {
+    smelt.outputs = vec![megu_client_ui::recipe_browser::ItemStack {
         item: "minecraft:iron_ingot".into(),
         count: 1,
     }];
@@ -103,7 +103,7 @@ fn fixture_index() -> RecipeIndex {
     // log -> 4 planks (tag input via oak_log? use concrete id).
     let mut to_planks = Recipe::new("minecraft:oak_planks", RecipeCategory::CraftingShapeless);
     to_planks.inputs = vec![RecipeIngredient::item("minecraft:oak_log", 1)];
-    to_planks.outputs = vec![mc_spine_client_ui::recipe_browser::ItemStack {
+    to_planks.outputs = vec![megu_client_ui::recipe_browser::ItemStack {
         item: "minecraft:oak_planks".into(),
         count: 4,
     }];
@@ -111,7 +111,7 @@ fn fixture_index() -> RecipeIndex {
     // stonecutting: cobble -> 4 stairs.
     let mut cut = Recipe::new("minecraft:cobblestone_stairs_cut", RecipeCategory::Stonecutting);
     cut.inputs = vec![RecipeIngredient::item("minecraft:cobblestone", 1)];
-    cut.outputs = vec![mc_spine_client_ui::recipe_browser::ItemStack {
+    cut.outputs = vec![megu_client_ui::recipe_browser::ItemStack {
         item: "minecraft:cobblestone_stairs".into(),
         count: 4,
     }];
@@ -119,7 +119,7 @@ fn fixture_index() -> RecipeIndex {
     // Create pressing: ingot -> sheet.
     let mut press = Recipe::new("create:pressing/iron_sheet", RecipeCategory::CreatePressing);
     press.inputs = vec![RecipeIngredient::item("minecraft:iron_ingot", 1)];
-    press.outputs = vec![mc_spine_client_ui::recipe_browser::ItemStack {
+    press.outputs = vec![megu_client_ui::recipe_browser::ItemStack {
         item: "create:iron_sheet".into(),
         count: 1,
     }];
@@ -567,7 +567,7 @@ fn tree_node_budget_and_depth_cap_never_hang() {
     // would explode without the node budget.
     let mut r = Recipe::new("test:branch", RecipeCategory::CraftingShapeless);
     r.inputs = vec![RecipeIngredient::item("test:a", 1), RecipeIngredient::item("test:b", 1)];
-    r.outputs = vec![mc_spine_client_ui::recipe_browser::ItemStack {
+    r.outputs = vec![megu_client_ui::recipe_browser::ItemStack {
         item: "test:root".into(),
         count: 1,
     }];
@@ -575,7 +575,7 @@ fn tree_node_budget_and_depth_cap_never_hang() {
     for (id, inp) in [("test:a", "test:b"), ("test:b", "test:a")] {
         let mut rr = Recipe::new(&format!("test:{id}"), RecipeCategory::CraftingShapeless);
         rr.inputs = vec![RecipeIngredient::item(inp, 1)];
-        rr.outputs = vec![mc_spine_client_ui::recipe_browser::ItemStack {
+        rr.outputs = vec![megu_client_ui::recipe_browser::ItemStack {
             item: id.into(),
             count: 1,
         }];
@@ -754,7 +754,7 @@ fn jer_tabs_render_all_sub_lists() {
 // ---------------------------------------------------------------------------
 
 fn fixture_ponder() -> PonderScene {
-    use mc_spine_client_ui::draw::UiColor;
+    use megu_client_ui::draw::UiColor;
     let mut scene = PonderScene::new("Crushing Wheels");
     // 3x3 stone floor.
     for x in 0..3 {

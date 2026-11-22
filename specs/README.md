@@ -73,7 +73,7 @@ READMEや他の計画文書に状態表を複製しません。更新時はこ�
 
 - **hosted CIの過去の未開始はコード失敗とは別です。** 当時の注記は「The job was not started because recent account payments have failed or your spending limit needs to be increased」。今回hosted CIは実行していません。必須ローカルゲートにも未実行の範囲があり、CI・ローカルとも未実行を緑にしません。
 - **比較の前提（固定具の基点）は再構成できます:** `tools/fixture_base.sh` が `CARVER_FIXTURE_BASE`（既定 `/tmp/carverfresh`）を組みます。jar は sha1 で固定（`59353fb4…`、既存の1.21.1導入ディレクトリを donor に使う）。基点が無いまま固定具を回すと比較は空振りします。
-- **層ゲートの検査器は固定revision:** `.github/workflows/ci.yml` の `GXKIT_REV`。同一バージョン文字列の古いビルドは独立した2循環を1つしか報告しないため、`tools/layers_check.sh` が `MC_SPINE_DEPSGX` → ローカルの固定ビルド → PATH の順で解決します。
+- **層ゲートの検査器は固定revision:** `.github/workflows/ci.yml` の `GXKIT_REV`。同一バージョン文字列の古いビルドは独立した2循環を1つしか報告しないため、`tools/layers_check.sh` が `MEGU_DEPSGX` → ローカルの固定ビルド → PATH の順で解決します。
 - **被ダメ無敵は vanilla の `invulnerableTime` に載せ替えました**（slice 25、2026-10-24）。環境ダメージが timer を立てる点までは実装、環境ダメージ自身の差分適用は簡略（同 slice に明記）。
 - **ライセンス・出所・Issue #7/#11:** 本体は 2026-11-22 に **`LGPL-3.0-or-later`** 単一表記へ統一済み（[LICENSING.md](../LICENSING.md)）、過去の削除済み不純ファイルは `git filter-repo --invert-paths` で全履歴から完全抹消済みです。旧 Issue #1, #7, #11, #38, #51 はすべて解決・クローズ済みです。
 - **draft PR #2/#4/#6 は決着しました（2026-10-24）。** `main` に同一patchが無かった62コミットを読み、

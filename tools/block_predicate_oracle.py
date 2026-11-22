@@ -69,7 +69,7 @@ def main():
     with pinned_runtime(args.jar) as (work, classpath, _):
         output = work / "block-predicates.tsv"
         run_probe(work, classpath, ROOT / "tools/block-predicate-oracle/BlockPredicateOracle.java",
-                  "dev.mcspine.tools.BlockPredicateOracle", output)
+                  "dev.megu.tools.BlockPredicateOracle", output)
         predicates, support, collision_full = encode(output.read_text(), json.loads((ROOT / "assets/blocks_1211.json").read_text()))
     for path, data in [(ASSET, predicates), (SUPPORT, support), (COLLISION_FULL, collision_full)]:
         if args.write:

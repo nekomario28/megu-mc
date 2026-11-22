@@ -17,7 +17,7 @@ def main():
     with pinned_runtime(args.jar) as (work, classpath, _):
         output = work / "multiface.tsv"
         run_probe(work, classpath, ROOT / "tools/multiface-oracle/MultifaceOracle.java",
-                  "dev.mcspine.tools.MultifaceOracle", output)
+                  "dev.megu.tools.MultifaceOracle", output)
         actual = output.read_bytes()
     if args.write:
         VECTORS.write_bytes(actual)

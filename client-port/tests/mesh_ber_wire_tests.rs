@@ -7,16 +7,16 @@
 // skin overlay parts — and `gpu_pipeline::upload_ber_instances` must pack
 // those batches into the instanced-part record stream.
 
-use mc_spine_client_mesh::ber_instancing::{build_ber_mesh, VanillaBerFacing, VanillaBerKind, VanillaBerState};
-use mc_spine_client_mesh::gpu_pipeline::upload_ber_instances;
-use mc_spine_client_mesh::mesher::{
+use megu_client_mesh::ber_instancing::{build_ber_mesh, VanillaBerFacing, VanillaBerKind, VanillaBerState};
+use megu_client_mesh::gpu_pipeline::upload_ber_instances;
+use megu_client_mesh::mesher::{
     block_render_layer, classify_vanilla_ber, humanoid_skin_layer_parts, mesh_section_with_cutout,
     BerInstanceCollector, SectionBerInstance, VANILLA_BER_KINDS,
 };
-use mc_spine_client_mesh::vanilla_plus_visuals::{
+use megu_client_mesh::vanilla_plus_visuals::{
     VanillaPlusVisualsConfig, SKIN_RGBA_BYTES,
 };
-use mc_spine_client_mesh::{Block, Layer, Light, Section, CUTOUT, OPAQUE};
+use megu_client_mesh::{Block, Layer, Light, Section, CUTOUT, OPAQUE};
 
 /// A non-degenerate [`VanillaBerState`] per family — every variant must
 /// produce a non-empty `build_ber_mesh`.
@@ -299,7 +299,7 @@ fn humanoid_skin_layer_parts_returns_overlay_geometry() {
     };
     let parts = humanoid_skin_layer_parts(&config, &skin, false, 0.0);
     assert_eq!(parts.len(), 6);
-    for (expected, (part, mesh)) in mc_spine_client_mesh::mesher::HUMANOID_SKIN_OVERLAY_PARTS
+    for (expected, (part, mesh)) in megu_client_mesh::mesher::HUMANOID_SKIN_OVERLAY_PARTS
         .iter()
         .zip(parts.iter())
     {

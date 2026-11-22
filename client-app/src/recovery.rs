@@ -680,7 +680,7 @@ pub struct ModReloadPlanner {
 impl Default for ModReloadPlanner {
     fn default() -> Self {
         Self {
-            target_mc: mc_spine_kernel::TargetVersion::LATEST.id().to_string(),
+            target_mc: megu_kernel::TargetVersion::LATEST.id().to_string(),
             loaders: vec!["fabric".to_string(), "neoforge".to_string()],
         }
     }

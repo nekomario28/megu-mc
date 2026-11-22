@@ -14,11 +14,11 @@
 //! Usage: `crop_contact_sheet [--out <path>]` (default
 //! `target/tmp/crop_ore_contact_sheet.png`).
 
-use mc_spine_client_mesh::vanilla_plus_3d::{
+use megu_client_mesh::vanilla_plus_3d::{
     build_3d_crop_mesh, build_3d_ore_relief, mesh_fingerprint, Crop3dArchetype, Crop3dSpec,
     ExtrudedMesh, ExtrudedQuad,
 };
-use mc_spine_client_mesh::Direction;
+use megu_client_mesh::Direction;
 
 // ---------------------------------------------------------------------------
 // Sheet layout

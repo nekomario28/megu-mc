@@ -107,7 +107,7 @@ import org.spongepowered.asm.mixin.injection.Inject;
 }
 '''
 
-CALLBACK_CHECKS = '''package net.mcspine.neoforge;
+CALLBACK_CHECKS = '''package net.megu.neoforge;
 public final class BoundaryChecks {
   public static void main(String[] args) throws Exception {
     Bootstrap.initialize(args[1]);
@@ -135,7 +135,7 @@ class NeoForgeS1S4BoundaryTests(unittest.TestCase):
             "nf2/BoundaryRedirectMixin.java": REDIRECT_MIXIN,
             "nf2/BoundaryModifyArgMixin.java": MODIFY_ARG_MIXIN,
             "nf2/BoundaryInvokeMixin.java": INVOKE_MIXIN,
-            "net/mcspine/neoforge/BoundaryChecks.java": CALLBACK_CHECKS,
+            "net/megu/neoforge/BoundaryChecks.java": CALLBACK_CHECKS,
         })
         src = cls.fixture.root / "boundary-src"
         paths = []
@@ -165,7 +165,7 @@ class NeoForgeS1S4BoundaryTests(unittest.TestCase):
 
     def run_fixture(self, mode, expected):
         result = self.run_java(
-            "net.mcspine.neoforge.S1Checks", mode,
+            "net.megu.neoforge.S1Checks", mode,
             self.fixture.mod_dir.parent,
         )
         self.assertEqual(result.returncode, 0, result.stderr + result.stdout)
@@ -185,7 +185,7 @@ class NeoForgeS1S4BoundaryTests(unittest.TestCase):
         return jar
 
     def shim(self, jar):
-        return self.run_java("net.mcspine.neoforge.ShimCheck", "--json",
+        return self.run_java("net.megu.neoforge.ShimCheck", "--json",
                              "--surface", SURFACE, jar)
 
     def test_listener_order_and_canceled_frames(self):
@@ -200,7 +200,7 @@ class NeoForgeS1S4BoundaryTests(unittest.TestCase):
         (game / "mods").mkdir(parents=True)
         shutil.copy(ADAPTER / ".cache/seedprotect-1.0.0.jar",
                     game / "mods" / "seedprotect.jar")
-        result = self.run_java("net.mcspine.neoforge.EventChecks", game)
+        result = self.run_java("net.megu.neoforge.EventChecks", game)
         self.assertEqual(result.returncode, 0, result.stderr + result.stdout)
         self.assertIn("PASS original mod registration", result.stdout)
 
@@ -267,7 +267,7 @@ class NeoForgeS1S4BoundaryTests(unittest.TestCase):
             (game / "mods").mkdir(parents=True, exist_ok=True)
             if mod_jar is not None:
                 shutil.copy(mod_jar, game / "mods" / mod_jar.name)
-            result = self.run_java("net.mcspine.neoforge.BoundaryChecks",
+            result = self.run_java("net.megu.neoforge.BoundaryChecks",
                                    "callbacks", game)
             self.assertEqual(result.returncode, 0, result.stderr + result.stdout)
             return int(result.stdout.strip().rsplit("callbacks=", 1)[1])
@@ -299,7 +299,7 @@ class NeoForgeS1S4BoundaryTests(unittest.TestCase):
         fixture = self.jni_fixture("jni-10k-fixture", self.fixture.mod_jar)
         stdout = self.run_jni(
             "java_compat::tests::jni_contract_10k_localref_exception_and_thread_attach_stress",
-            {"MC_SPINE_JNI_FIXTURE": str(fixture)})
+            {"MEGU_JNI_FIXTURE": str(fixture)})
         self.assertIn("PASS 10000 local-frame dispatches", stdout)
 
     def test_jni_callback_census_matches_fixture_mods(self):
@@ -311,8 +311,8 @@ class NeoForgeS1S4BoundaryTests(unittest.TestCase):
                 fixture = self.jni_fixture(f"jni-census-{tag}", mod_jar)
                 self.run_jni(
                     "java_compat::tests::jni_contract_callback_census_matches_fixture",
-                    {"MC_SPINE_JNI_FIXTURE": str(fixture),
-                     "MC_SPINE_JNI_EXPECT_CALLBACKS": expected})
+                    {"MEGU_JNI_FIXTURE": str(fixture),
+                     "MEGU_JNI_EXPECT_CALLBACKS": expected})
 
 
 if __name__ == "__main__":

@@ -1,13 +1,13 @@
 [package]
-name = "mc-spine-core"
+name = "megu-core"
 version = "0.1.0"
 edition = "2021"
 publish = false
 license = "LGPL-3.0-or-later"
-description = "Standalone foundational primitives for mc-spine: canonical 1.21.1/26.3 version constants, validated ResourceLocation, Java-exact LegacyRandom/Xoroshiro128++ RNG and vanilla Mth math"
+description = "Standalone foundational primitives for megu: canonical 1.21.1/26.3 version constants, validated ResourceLocation, Java-exact LegacyRandom/Xoroshiro128++ RNG and vanilla Mth math"
 
 # Zero external dependencies by contract: this crate is the leaf every other
-# mc-spine crate (proto, state-store, server-files, worldgen, sim, client-*)
+# megu crate (proto, state-store, server-files, worldgen, sim, client-*)
 # builds on, so it must stay pure `std`.
 [dependencies]
 

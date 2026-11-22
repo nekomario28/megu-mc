@@ -43,7 +43,7 @@ Create 規模の超重量級 Mod に対して「無改造の Create 実 JAR を 
 |---|---|---|---|---|
 | **無改造 Create クライアント接続** | 可（基準） | 可 | プロトコル完全実装なら可 | **可**（NeoForge Registry Sync + `create:*` Payload を Rust で実装） |
 | **サーバー側 Create JAR の Java 実行** | フル実行（Registrate + Mixin + AT） | 必須（数千の `net.minecraft.*` メソッド + MixinExtras `@WrapOperation`/`@Redirect` + AT の完全再現が必要） | なし（データ JSON のみ読込） | **Create コアは不要（データ JSON のみ読込）**。他 Mod 用に JVM は opt-in 保持 |
-| **サーバー RSS 見積り** | 大（JVM + Vanilla + NeoForge + Create で概ね 1.2〜2.5+ GiB 級。*同条件実測は C5 で実施*） | 中〜大（JVM + Create クラス群 + 大規模 facade で +300〜800 MiB 増、軽量化幅が縮小） | 最小（純 Rust `mc-spine` 380 MiB 基準 + Create 状態 ~10〜30 MiB。*実測は C5*） | **純 Create サーバーは最小（JVM なし起動可）**。他 NeoForge Mod 併用時でも +55.1 MiB 基準（[ristretto-eval](../../evidence/mod-compatibility/ristretto-eval-20261120.md)）から増分を抑制 |
+| **サーバー RSS 見積り** | 大（JVM + Vanilla + NeoForge + Create で概ね 1.2〜2.5+ GiB 級。*同条件実測は C5 で実施*） | 中〜大（JVM + Create クラス群 + 大規模 facade で +300〜800 MiB 増、軽量化幅が縮小） | 最小（純 Rust `megu` 380 MiB 基準 + Create 状態 ~10〜30 MiB。*実測は C5*） | **純 Create サーバーは最小（JVM なし起動可）**。他 NeoForge Mod 併用時でも +55.1 MiB 基準（[ristretto-eval](../../evidence/mod-compatibility/ristretto-eval-20261120.md)）から増分を抑制 |
 | **大規模工場の tick 負荷** | Java `BlockEntity.tick()` 毎 tick 走査＋GC | Create Java tick がそのまま走るため、結局 JNI 往復地獄になり NeoForge より遅くなるリスク大 | **最速**（実測: 待機 10,000 機械 **6.00 ns/tick**、混合 5,500 連鎖 **396.66 µs/tick**、256 ブロック Contraption **11.50 µs/tick**） | **案 B と同等のネイティブ速度**（Create コア演算に JNI 境界を挟まない） |
 | **他 NeoForge Mod / Create アドオン** | フル対応 | 表面積が広がれば対応 | 不可（Java Mod 非対応） | **S0〜S4 適合 Mod ＋ データ駆動/OFF5 アドオン対応**（未対応 Mixin/AT は起動時フェイルクローズ） |
 | **実装・保守コスト（版追従）** | 上流依存 | **極大**（Create の内部 Mixin 変更ごとに `net.minecraft` バイトコード互換が崩壊） | 中（Create の全機能を段階実装） | **中・段階出荷可能**（C1〜C5 でコア機械から順に実用化、Mixin 地獄を回避） |
@@ -53,7 +53,7 @@ Create 規模の超重量級 Mod に対して「無改造の Create 実 JAR を 
 
 1. **Mixin / AccessTransformer の壁**:
    - Create 1.21.1 は `create.mixins.json` と `META-INF/accesstransformer.cfg` で `Level` / `ServerLevel` / `ChunkMap` / `Entity` / `LivingEntity` / `AbstractMinecart` / `FluidState` / `StructureTemplate` 等のメソッド本体内部へ `@Inject(at = @At("INVOKE"))`・`@Redirect`・`@ModifyVariable`・MixinExtras `@WrapOperation` を注入する。
-   - `mc-spine` は「Vanilla クラスを読み込まず Rust が唯一のワールド権威を持つ」設計（[neoforge-architecture.md §2](neoforge-architecture.md)）であり、Vanilla メソッドの正確なバイトコード命令列が存在しないため、メソッド本体内部への Mixin 注入は構造的に成立しない。
+   - `megu` は「Vanilla クラスを読み込まず Rust が唯一のワールド権威を持つ」設計（[neoforge-architecture.md §2](neoforge-architecture.md)）であり、Vanilla メソッドの正確なバイトコード命令列が存在しないため、メソッド本体内部への Mixin 注入は構造的に成立しない。
 2. **API 表面積の爆発**:
    - Create は Registrate を介して約 700+ ブロック・500+ アイテム・100+ BlockEntity・約 60+ カスタムネットワークパケット・独自 `RecipeType` / `DataComponent` / `FluidHandler` / `Menu` を登録し、`net.minecraft.*` 全体で数千メンバーを参照する。これを手書きファサードで追従するのは保守不能である。
 3. **本末転倒な性能劣化**:
@@ -63,7 +63,7 @@ Create 規模の超重量級 Mod に対して「無改造の Create 実 JAR を 
 
 ## 3. 現状資産と技術ギャップの正確な棚卸し
 
-すでに `mc-spine` に実装・検証済みの土台と、Create 稼働までに埋めるべき 6 つの具体的ギャップを整理する。
+すでに `megu` に実装・検証済みの土台と、Create 稼働までに埋めるべき 6 つの具体的ギャップを整理する。
 
 ### 3.1 既存資産（実測・テスト済み）
 
@@ -80,7 +80,7 @@ Create 規模の超重量級 Mod に対して「無改造の Create 実 JAR を 
 |---|---|---|---|
 | **G1** | **多状態（Multi-Property）`BlockState` 登録** | 現行 S2 はカスタムブロック 1 個につき 1 状態（ID 26,684 以降）。 | Create ブロックは `axis`, `facing`, `waterlogged`, `part`, `shape`, `powered` 等のデカルト積（例: ベルト・歯車・シャフト・パイプ）を持つ。`BReg` の動的ブロック登録を **ブロック単位 + Property 組合せ展開（複数 State ID）** へ拡張し、NeoForge の `BlockState` 展開順（定義順の直積）と 100% 一致させる必要がある。 |
 | **G2** | **NeoForge Configuration ネットワークハンドシェイクの本番配線** | `build_config_registry_sync_packets` と S4 設計書（[s4-network-capabilities-and-fabric.md](s4-network-capabilities-and-fabric.md)）はあるが、`src/play_protocol.rs` の Configuration ループ未配線。 | `neoforge:register` / `neoforge:network` / `neoforge:frozen_registry_sync_start` / `neoforge:frozen_registry` / `neoforge:frozen_registry_sync_completed` を `0x01`/`0x02` Configuration Custom Payload 上で処理し、無改造 NeoForge クライアント（Create 導入済み）を Vanilla クライアントと共存させつつ受け入れる。 |
-| **G3** | **`mod-offload` のサーバー本体 tick ループ直接統合** | `mod-offload` は独立クレートであり、`src/main.rs` の 20 TPS tick ループ・ブロック設置/破壊・インベントリ・セーブと未接続。 | `mc-spine` から `mod-offload` を Rust path 依存（`#[cfg(feature = "create-offload")]` またはワークスペース依存）で直接呼び出し、ブロック設置/破壊時に `KineticGraph`/`FluidNetwork`/`Transport` トポロジを差分更新し、毎 tick `RegionScheduler::step()` の出力 delta を直接ワールド・パケット送信へ適用する。 |
+| **G3** | **`mod-offload` のサーバー本体 tick ループ直接統合** | `mod-offload` は独立クレートであり、`src/main.rs` の 20 TPS tick ループ・ブロック設置/破壊・インベントリ・セーブと未接続。 | `megu` から `mod-offload` を Rust path 依存（`#[cfg(feature = "create-offload")]` またはワークスペース依存）で直接呼び出し、ブロック設置/破壊時に `KineticGraph`/`FluidNetwork`/`Transport` トポロジを差分更新し、毎 tick `RegionScheduler::step()` の出力 delta を直接ワールド・パケット送信へ適用する。 |
 | **G4** | **流体ケイパビリティ (`IFluidHandler`) と流体レジストリ** | 現行 S4 は `Capabilities.ItemHandler.BLOCK` のみ。流体は Vanilla の水/溶岩のみ。 | Create の流体パイプ・ポンプ・タンク・スパウト向けに、名前空間付き流体 ID レジストリ（`minecraft:water`, `minecraft:lava`, `create:chocolate`, `create:honey`, `create:tea` 等）と mB 単位のタンク永続化・S4 `FluidHandler` 契約を追加する。 |
 | **G5** | **Create Play ペイロード & BlockEntity 同期プロトコル** | 未実装。 | 無改造 Create クライアントが回転アニメーション・ベルト上アイテム・タンク液面・Contraption 移動を正しく描画するため、`0x07` BlockEntity Data (`updateTag`) と `create:*` Play Custom Payload（レンチ回転・フィルタ設定・Contraption エンティティ同期・速度設定等）のコーデックを実装する。 |
 | **G6** | **Contraption のチャンク分解/再組立 & Save v2 永続化** | `mod-offload/src/contraption.rs` は疎パレット・姿勢・衝突・乗客デルタを実装済みだが、ワールドブロックとの組立/設置変換・セーブ永続化が未接続。 | 回転軸/ピストン/ガントリー起動時の連結ブロック収集（スーパーグルー/シャーシ規則）→ ワールドから除去＆`Contraption` 生成 → 停止時のグリッドスナップ再配置（CAS + `set_block_if_dim`）→ Save v2 への Contraption 状態・機械状態の名前ベース保存を実装する。 |
@@ -96,12 +96,12 @@ flowchart TD
         NFCREATE["NeoForge 1.21.1 + Create Client\n(Flywheel描画 / Ponder / UI)"]
     end
 
-    subgraph Proto["mc-spine Protocol 767 + NeoForge Wire Layer (src/play_protocol.rs)"]
+    subgraph Proto["megu Protocol 767 + NeoForge Wire Layer (src/play_protocol.rs)"]
         CFG["Configuration 0x01/0x02/0x07\n- neoforge:register / frozen_registry*\n- 動的 DimId (dimension_type)\n- 多状態 BlockState / Item / Fluid ID 同期"]
         PLAY["Play 0x19/0x12/0x27/0x07\n- ChunkPacketCache (共有 0x27)\n- broadcast_near 距離/次元カリング\n- create:* Payload & BE UpdateTag 同期"]
     end
 
-    subgraph Core["mc-spine Rust コア (唯一のワールド権威)"]
+    subgraph Core["megu Rust コア (唯一のワールド権威)"]
         BREG["BReg (動的 Multi-Property BlockState)\n+ DimensionRegistry (任意 DimId)"]
         WORLD["World / PalettedSection / Save v2\n(名前空間ベース パレット & BE 永続化)"]
         TICK["20 TPS Tick Owner\n(ブロック編集フック + Region 割当)"]
@@ -136,7 +136,7 @@ flowchart TD
 
 既存の 44 モジュール層契約（[`evidence/foundation/module-layers/policy.json`](../../evidence/foundation/module-layers/policy.json)）および「純 Vanilla ビルド時のオーバーヘッドゼロ」契約を厳守するため：
 
-1. **Create 固有ロジックは独立クレート `create-adapter/` として分離**し、`mod-offload/` に依存する（`mc-spine` 本体はオプショナル feature `create-offload` 経由でのみ `create-adapter` を参照する）。
+1. **Create 固有ロジックは独立クレート `create-adapter/` として分離**し、`mod-offload/` に依存する（`megu` 本体はオプショナル feature `create-offload` 経由でのみ `create-adapter` を参照する）。
 2. **`mod-offload/` 自体は引き続き Create 非依存の汎用カーネル**（AE2・Mekanism にも転用可能）に保ち、Create 固有のブロック名・応力係数・レシピ種別はすべて `create-adapter/` に閉じ込める。
 3. **純 Rust デフォルトビルド（`--no-default-features`）では `java-compat` も `create-offload` も完全にコンパイル除外**され、Vanilla ワールド生成・`layers_check.sh`・`debt_ratchet.sh`・`provenance_check.py` に一切影響しない。
 4. **動的ディメンション（Track 2）との整合**: `mod-offload` の `RegionKey { dimension: i32, x: i32, z: i32 }` は既に任意 `i32` 次元 ID を受け取る設計であるため、Track 2 の動的 `DimId(u32)`（Overworld=0, Nether=1, End=2, Custom>=3）とそのまま 1 対 1 で結合でき、**カスタム次元内に建てた Create 工場もリージョン隔離付きでそのまま動作する**。
@@ -165,7 +165,7 @@ flowchart TD
 | **C2: `create-adapter` 創設 ＋ 回転動力網（Kinetics）本番接続** | ギャップ G3・G5（第 1 弾） | `create-adapter/` クレート新設。`mod-offload::KineticGraph`＋`RegionScheduler` を `src/main.rs` 20 TPS tick ループへ接続。Shaft / Cogwheel / Gearbox / Clutch / Water Wheel / Stressometer の設置・接続・応力計算・過負荷停止・BlockEntity 同期・Save v2 保存。 | ① 無改造 NeoForge 1.21.1 + Create クライアントから接続し、水車→歯車→シャフトの回転描画・応力計表示・過負荷停止・再起動復元が動作すること<br>② 10,000 静止回転ノード配置時の tick 追加負荷 ≤ 0.1 ms |
 | **C3: ベルト輸送 ＋ 機械加工 ＋ 流体網** | ギャップ G4・G5（第 2 弾） | `SleepingTransport`（Belt / Funnel / Chute / Depot）、`RecipeProcessor`（Press / Mixer / Basin / Millstone / Saw / Fan）、`FluidNetwork`（Pipe / Pump / Tank / Spout / Drain）＋流体レジストリ＆タンク永続化。 | ① 自動化ライン（原木→製材→ベルト→プレス→チェスト、流体ポンプ→タンク→スパウト）が無改造 Create クライアントで動作し、再起動後もアイテム・液量・加工状態が保存されること<br>② 500 稼働ライン + 5,000 待機ライン同時配置でサーバー MSPT p95 < 5 ms |
 | **C4: Contraption ＋ Optional JVM Add-on Bridge (`OFF5`)** | ギャップ G6 + アドオン連携 | 回転ベアリング / ピストン / ガントリーの組立・衝突・乗客輸送・再配置＋Save v2 保存。S0〜S4 NeoForge 互換層へ `OFF5`/`S5` アドオン橋渡し口（追加応力・追加レシピ・カスタム機械）を接続。 | ① 256 ブロック回転 Contraption 上にプレイヤーが乗って落下せず移動でき、停止後にブロックが元の位置へ完全復元されること<br>② 合成 Create アドオン JAR が `ShimCheck` 通過＋`OFF5` 経由でカスタムレシピ/応力を登録できること |
-| **C5: 実 NeoForge 1.21.1 + Create 6.x 直接比較ベンチマーク** | 性能実証ゲート | 同一シード・同一巨大工場ワールド・同一クライアント数（0人 / 1人 / 8人）での **実 NeoForge 1.21.1 (+ Lithium/FerriteCore 有無) + Create 6.x** vs **`mc-spine` (`--features create-offload`)** 再現可能ベンチマーク（`tools/create_load_compare.sh`）と証拠文書化。 | 実測レポートに以下をすべて記録（捏造・推測なし）：<br>- `VmRSS` / `VmHWM`（定常・負荷後）<br>- サーバー MSPT `p50 / p95 / p99`<br>- スレッド数・CPU 時間<br>- クライアントあたり下り帯域（KB/s）<br>- 目標: **RSS 1/3 以下、大規模工場 MSPT p95 1/5 以下** |
+| **C5: 実 NeoForge 1.21.1 + Create 6.x 直接比較ベンチマーク** | 性能実証ゲート | 同一シード・同一巨大工場ワールド・同一クライアント数（0人 / 1人 / 8人）での **実 NeoForge 1.21.1 (+ Lithium/FerriteCore 有無) + Create 6.x** vs **`megu` (`--features create-offload`)** 再現可能ベンチマーク（`tools/create_load_compare.sh`）と証拠文書化。 | 実測レポートに以下をすべて記録（捏造・推測なし）：<br>- `VmRSS` / `VmHWM`（定常・負荷後）<br>- サーバー MSPT `p50 / p95 / p99`<br>- スレッド数・CPU 時間<br>- クライアントあたり下り帯域（KB/s）<br>- 目標: **RSS 1/3 以下、大規模工場 MSPT p95 1/5 以下** |
 
 ---
 

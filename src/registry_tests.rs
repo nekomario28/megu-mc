@@ -3937,12 +3937,12 @@ fn lod_v1_wire_matches_client_app_codec_and_vanilla_unaffected() {
     );
 
     // Opt-in: registering the channel flips the flag and earns the S2C
-    // `minecraft:register` echo naming `mc-spine:lod_v1`.
+    // `minecraft:register` echo naming `megu:lod_v1`.
     let (lod, mut lod_r) = effect_tests::client_pair();
     lod_r.set_read_timeout(Some(Duration::from_millis(200))).unwrap();
     custom_payload_c2s(
         &lod,
-        &lod_test_payload("minecraft:register", b"other:chan\x00mc-spine:lod_v1\x00more:x"),
+        &lod_test_payload("minecraft:register", b"other:chan\x00megu:lod_v1\x00more:x"),
     );
     assert!(lod.lod_v1_enabled.load(Ordering::Relaxed));
     let acks = lod_test_frames(&mut lod_r);
@@ -3950,7 +3950,7 @@ fn lod_v1_wire_matches_client_app_codec_and_vanilla_unaffected() {
     assert_eq!(acks[0].0, 0x19);
     let (channel, data) = lod_test_channel(&acks[0].1);
     assert_eq!(channel, "minecraft:register");
-    assert_eq!(data, b"mc-spine:lod_v1");
+    assert_eq!(data, b"megu:lod_v1");
 
     // A fine REQ1 for (0, 0) answers with a 2832-byte LOD1 frame of non-air
     // surface cells; the coarse request answers 192 bytes.
@@ -4000,7 +4000,7 @@ fn lod_v1_wire_matches_client_app_codec_and_vanilla_unaffected() {
     assert_eq!(lod_test_frames(&mut lod_r).len(), 1);
 
     // Unregister flips the flag off and the channel goes silent again.
-    custom_payload_c2s(&lod, &lod_test_payload("minecraft:unregister", b"mc-spine:lod_v1"));
+    custom_payload_c2s(&lod, &lod_test_payload("minecraft:unregister", b"megu:lod_v1"));
     assert!(!lod.lod_v1_enabled.load(Ordering::Relaxed));
     custom_payload_c2s(&lod, &lod_test_payload(LOD_V1_CHANNEL, &lod_test_req1(4, 0, 0)));
     assert!(lod_test_frames(&mut lod_r).is_empty());

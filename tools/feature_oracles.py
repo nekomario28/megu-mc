@@ -114,10 +114,10 @@ def main():
     fixture = ROOT / ORACLES[args.name]
     if args.cases:
         oracle = ROOT / 'tools/structure-oracle/FeatureOracle.java'
-        main = 'dev.mcspine.tools.FeatureOracle'
+        main = 'dev.megu.tools.FeatureOracle'
     else:
         oracle = ROOT / f'tools/structure-oracle/{args.name.title().replace("_", "")}Oracle.java'
-        main = 'dev.mcspine.tools.' + oracle.stem
+        main = 'dev.megu.tools.' + oracle.stem
     with pinned_runtime(args.jar) as (work, cp, inner):
         os.environ['MC_NATIVE_BLOCK_TAGS'] = str(block_tags(work / 'block_tags.tsv'))
         os.environ['MC_NATIVE_FLUID_TAGS'] = str(fluid_tags(inner, work / 'fluid_tags.tsv'))

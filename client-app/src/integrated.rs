@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: LGPL-3.0-or-later OR GPL-3.0-or-later OR AGPL-3.0-or-later
-//! Real `--quickPlaySingleplayer <world>` support: resolve the `mc-spine`
+//! Real `--quickPlaySingleplayer <world>` support: resolve the `megu`
 //! server binary, launch it on an ephemeral loopback port with the world save
 //! rooted at `<gameDir>/saves/<world>`, wait for TCP readiness, and always
 //! terminate + reap the child via a `Drop` guard.
@@ -20,7 +20,7 @@ use crate::settings::{ClientSettings, HostMapFairPlaySettings};
 const READY_TIMEOUT: Duration = Duration::from_secs(15);
 const READY_POLL: Duration = Duration::from_millis(50);
 
-/// A running integrated `mc-spine` server child. Dropping kills and reaps it.
+/// A running integrated `megu` server child. Dropping kills and reaps it.
 pub struct SingleplayerServer {
     child: Child,
     pub port: u16,
@@ -86,27 +86,27 @@ pub fn validate_world_name(name: &str) -> Result<(), String> {
     Ok(())
 }
 
-/// Enqueue the platform server-binary names inside `dir`: `mc-spine`
-/// everywhere, plus `mc-spine.exe` — the name the Windows toolchain
+/// Enqueue the platform server-binary names inside `dir`: `megu`
+/// everywhere, plus `megu.exe` — the name the Windows toolchain
 /// actually emits — tried first there.
 #[cfg(windows)]
 fn push_server_bin_candidates(candidates: &mut Vec<PathBuf>, dir: &Path) {
-    candidates.push(dir.join("mc-spine.exe"));
-    candidates.push(dir.join("mc-spine"));
+    candidates.push(dir.join("megu.exe"));
+    candidates.push(dir.join("megu"));
 }
 
 #[cfg(not(windows))]
 fn push_server_bin_candidates(candidates: &mut Vec<PathBuf>, dir: &Path) {
-    candidates.push(dir.join("mc-spine"));
+    candidates.push(dir.join("megu"));
 }
 
 fn is_executable_file(path: &Path) -> bool {
     path.is_file()
 }
 
-/// Resolve the `mc-spine` server binary (`mc-spine.exe` on Windows).
-/// Order: `--server-bin`, `MC_SPINE_SERVER_BIN`, a `mc-spine` sibling of
-/// this executable, then `target/{debug,release}/mc-spine` relative to
+/// Resolve the `megu` server binary (`megu.exe` on Windows).
+/// Order: `--server-bin`, `MEGU_SERVER_BIN`, a `megu` sibling of
+/// this executable, then `target/{debug,release}/megu` relative to
 /// the working directory and to ancestors of the working directory and
 /// this executable.
 pub fn resolve_server_bin(explicit: Option<&Path>) -> Result<PathBuf, String> {
@@ -120,14 +120,14 @@ pub fn resolve_server_bin(explicit: Option<&Path>) -> Result<PathBuf, String> {
             path.display()
         ));
     }
-    if let Ok(env_path) = env::var("MC_SPINE_SERVER_BIN") {
+    if let Ok(env_path) = env::var("MEGU_SERVER_BIN") {
         if !env_path.is_empty() {
             let path = PathBuf::from(&env_path);
             if is_executable_file(&path) {
                 return Ok(path);
             }
             return Err(format!(
-                "MC_SPINE_SERVER_BIN '{}' does not exist or is not a file",
+                "MEGU_SERVER_BIN '{}' does not exist or is not a file",
                 path.display()
             ));
         }
@@ -155,7 +155,7 @@ pub fn resolve_server_bin(explicit: Option<&Path>) -> Result<PathBuf, String> {
         }
     }
     Err(
-        "could not locate the mc-spine server binary (set --server-bin <path> or MC_SPINE_SERVER_BIN)"
+        "could not locate the megu server binary (set --server-bin <path> or MEGU_SERVER_BIN)"
             .to_string(),
     )
 }
@@ -240,28 +240,28 @@ pub fn server_view_distance(cfg: &CliConfig) -> Option<i8> {
 }
 
 /// Environment variable carrying the map fair-play master switch.
-pub const FAIR_PLAY_ENV_ENABLED: &str = "MC_SPINE_FAIR_PLAY";
+pub const FAIR_PLAY_ENV_ENABLED: &str = "MEGU_FAIR_PLAY";
 /// Environment variable carrying the cave-map permission.
-pub const FAIR_PLAY_ENV_ALLOW_CAVE_MAP: &str = "MC_SPINE_FAIR_PLAY_ALLOW_CAVE_MAP";
+pub const FAIR_PLAY_ENV_ALLOW_CAVE_MAP: &str = "MEGU_FAIR_PLAY_ALLOW_CAVE_MAP";
 /// Environment variable carrying the entity-radar permission.
-pub const FAIR_PLAY_ENV_ALLOW_ENTITY_RADAR: &str = "MC_SPINE_FAIR_PLAY_ALLOW_ENTITY_RADAR";
+pub const FAIR_PLAY_ENV_ALLOW_ENTITY_RADAR: &str = "MEGU_FAIR_PLAY_ALLOW_ENTITY_RADAR";
 /// Environment variable carrying the waypoint-teleport permission.
 pub const FAIR_PLAY_ENV_ALLOW_WAYPOINT_TELEPORT: &str =
-    "MC_SPINE_FAIR_PLAY_ALLOW_WAYPOINT_TELEPORT";
+    "MEGU_FAIR_PLAY_ALLOW_WAYPOINT_TELEPORT";
 /// Environment variable carrying the Xaero `§`-coded control signal the
 /// hosted server broadcasts to joining map-mod clients.
-pub const FAIR_PLAY_ENV_XAERO_SIGNAL: &str = "MC_SPINE_FAIR_PLAY_XAERO_SIGNAL";
+pub const FAIR_PLAY_ENV_XAERO_SIGNAL: &str = "MEGU_FAIR_PLAY_XAERO_SIGNAL";
 /// Environment variable carrying the granular minimap mode
 /// (`unrestricted`/`fair_play`/`disabled`), mirroring the server's
 /// `minimap-mode` key (OPS-4).
-pub const FAIR_PLAY_ENV_MINIMAP_MODE: &str = "MC_SPINE_MINIMAP_MODE";
+pub const FAIR_PLAY_ENV_MINIMAP_MODE: &str = "MEGU_MINIMAP_MODE";
 /// Environment variable carrying the mob/entity-radar permission under
 /// the server's `allow-mob-radar` spelling (OPS-4).
-pub const FAIR_PLAY_ENV_ALLOW_MOB_RADAR: &str = "MC_SPINE_ALLOW_MOB_RADAR";
+pub const FAIR_PLAY_ENV_ALLOW_MOB_RADAR: &str = "MEGU_ALLOW_MOB_RADAR";
 /// Environment variable carrying the player-radar scope
 /// (`all`/`party_only`/`none`), mirroring the server's
 /// `player-radar-scope` key (OPS-4).
-pub const FAIR_PLAY_ENV_PLAYER_RADAR_SCOPE: &str = "MC_SPINE_PLAYER_RADAR_SCOPE";
+pub const FAIR_PLAY_ENV_PLAYER_RADAR_SCOPE: &str = "MEGU_PLAYER_RADAR_SCOPE";
 
 /// Launch policy carried by a world this client hosts — integrated
 /// (`--quickPlaySingleplayer`), LAN share, or a `MEGU-XXXX-XXXX` friend
@@ -346,7 +346,7 @@ pub fn launch(cfg: &CliConfig) -> Result<SingleplayerServer, String> {
     let server_bin = resolve_server_bin(cfg.server_bin.as_deref())?;
     let runtime_root = find_runtime_root(&server_bin).ok_or_else(|| {
         format!(
-            "could not find mc-spine runtime assets (config_packets.bin, datapacks/, assets/) near {}",
+            "could not find megu runtime assets (config_packets.bin, datapacks/, assets/) near {}",
             server_bin.display()
         )
     })?;
@@ -368,26 +368,26 @@ pub fn launch(cfg: &CliConfig) -> Result<SingleplayerServer, String> {
     let mut command = Command::new(&server_bin);
     command
         .current_dir(&world_dir)
-        .env("MC_SPINE_BIND_ADDR", "127.0.0.1")
-        .env("MC_SPINE_PORT", port.to_string())
-        .env("MC_SPINE_WORLD_DIR", &world_dir)
+        .env("MEGU_BIND_ADDR", "127.0.0.1")
+        .env("MEGU_PORT", port.to_string())
+        .env("MEGU_WORLD_DIR", &world_dir)
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::inherit());
     if let Some(view) = server_view_distance(cfg) {
-        command.env("MC_SPINE_VIEW_DISTANCE", view.to_string());
+        command.env("MEGU_VIEW_DISTANCE", view.to_string());
     }
     if let Some(seed) = cfg.seed {
-        command.env("MC_SPINE_SEED", seed.to_string());
+        command.env("MEGU_SEED", seed.to_string());
     }
     // The hosted world inherits the resolved map fair-play policy:
     // LAN-opened and friend-relay worlds share this spawn path, so the
-    // same MC_SPINE_FAIR_PLAY* env vars and Xaero signal apply to all of
+    // same MEGU_FAIR_PLAY* env vars and Xaero signal apply to all of
     // them.
     IntegratedServerConfig::from_settings(&cfg.client_settings).apply_env(&mut command);
     let mut child = command.spawn().map_err(|e| {
         format!(
-            "failed to spawn mc-spine server '{}': {e}",
+            "failed to spawn megu server '{}': {e}",
             server_bin.display()
         )
     })?;
@@ -397,7 +397,7 @@ pub fn launch(cfg: &CliConfig) -> Result<SingleplayerServer, String> {
     loop {
         if let Ok(Some(status)) = child.try_wait() {
             return Err(format!(
-                "mc-spine server exited during startup (status {status}) for world '{world}'"
+                "megu server exited during startup (status {status}) for world '{world}'"
             ));
         }
         if TcpStream::connect_timeout(&addr, Duration::from_millis(250)).is_ok() {
@@ -411,7 +411,7 @@ pub fn launch(cfg: &CliConfig) -> Result<SingleplayerServer, String> {
             let _ = child.kill();
             let _ = child.wait();
             return Err(format!(
-                "timed out after {}s waiting for mc-spine server on {addr}",
+                "timed out after {}s waiting for megu server on {addr}",
                 READY_TIMEOUT.as_secs()
             ));
         }

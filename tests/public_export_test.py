@@ -13,8 +13,8 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 EXPORT = ROOT / 'tools/export_public_branch.sh'
 TSVS = ('biome_probe', 'vanilla_vectors', 'biome_probe_ties', 'random_next_int')
-SUITE = ('mc-spine', 'mc-spine-client', 'mc-spine-mod-check',
-         'mc-spine-world-migrate', 'mc-spine-init')
+SUITE = ('megu', 'megu-client', 'megu-mod-check',
+         'megu-world-migrate', 'megu-init')
 
 
 def run(cwd, *cmd, expect=0, env=None):
@@ -76,7 +76,7 @@ def check_exported_bundle(out, tmp):
                  '--target', 'x86_64-unknown-linux-gnu', '--repo-root', out))
     run(out, *args)
 
-    prefix = 'mc-spine-0.1.0-x86_64-unknown-linux-gnu'
+    prefix = 'megu-0.1.0-x86_64-unknown-linux-gnu'
     bundle = artifacts / f'{prefix}.tar.gz'
     manifest = artifacts / 'release-manifest.json'
     run(out, 'python3', 'tools/release_bundle.py', 'verify',
@@ -105,7 +105,7 @@ def test_export(from_worktree):
         run(ROOT, EXPORT, '--out', out, '--verify', *extra, env=export_env)
         assert run(out, 'git', 'rev-list', '--count', 'HEAD').strip() == '1'
         assert not run(out, 'git', 'show', '-s', '--format=%P').strip()
-        release_identity = 'mc-spine release <release@mc-spine.invalid>'
+        release_identity = 'megu release <release@megu.invalid>'
         identities = run(out, 'git', 'show', '-s', '--format=%an <%ae>%n%cn <%ce>').splitlines()
         assert identities == [release_identity, release_identity], identities
         assert run(out, 'git', 'branch', '--show-current').strip() == 'public-export'
@@ -127,7 +127,7 @@ def test_export(from_worktree):
                      'tools/vanilla_data/gen_vanilla_data.sh', 'tools/mod_launcher.py',
                      'tools/parity_cache.py', 'tools/release_bundle.py',
                      'tests/companion_suite_e2e.py', 'tests/release_bundle_test.py',
-                     'server-files/src/bin/mc_spine_init.rs',
+                     'server-files/src/bin/megu_init.rs',
                      'docs/mod-author-guide.md', 'docker/Dockerfile',
                      'docker/entrypoint.sh', 'docs/operator-guide.md',
                      'docs/architecture-crates.md', 'docs/release-checklist.md',

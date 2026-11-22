@@ -14,7 +14,7 @@ import sys
 import time
 from pathlib import Path
 
-os.environ["MC_SPINE_ALLOW_PLAYER_ADMIN_COMMANDS"] = "1"
+os.environ["MEGU_ALLOW_PLAYER_ADMIN_COMMANDS"] = "1"
 
 from protocol767 import (AIR_STATES, Client, ContractFailure, Reader, ROOT,
                          WIRE_BLOCKS, local_server, position, require,
@@ -356,7 +356,7 @@ def exercise(game):
 
 if __name__ == "__main__":
     binary = Path(sys.argv[1]).resolve() if len(sys.argv) > 1 \
-        else ROOT / "target/debug/mc-spine"
+        else ROOT / "target/debug/megu"
     try:
         with local_server(binary) as game:
             exercise(game)

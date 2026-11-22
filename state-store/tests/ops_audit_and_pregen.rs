@@ -3,7 +3,7 @@
 //! (`audit_log`) and the Chunky-style pregen controller + ticket-driven LRU
 //! unloader (`pregen`), exercised end to end against a live `ServerContext`.
 
-use mc_spine_state_store::{
+use megu_state_store::{
     spiral_order, AuditAction, AuditLog, AuditQuery, AuditRecord, BlockCoord, ChunkCoord,
     ChunkTicketLruUnloader, PregenJob, PregenShape, PregenState, ServerContext, TicketKind,
 };
@@ -19,7 +19,7 @@ struct TestDir(PathBuf);
 impl TestDir {
     fn new(tag: &str) -> Self {
         let dir = std::env::temp_dir().join(format!(
-            "mc-spine-ops1-{}-{}-{tag}",
+            "megu-ops1-{}-{}-{tag}",
             std::process::id(),
             DIR_COUNTER.fetch_add(1, Ordering::Relaxed)
         ));

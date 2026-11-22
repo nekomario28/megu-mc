@@ -1,24 +1,24 @@
 // SPDX-License-Identifier: LGPL-3.0-or-later OR GPL-3.0-or-later OR AGPL-3.0-or-later
 //! Real adapter readback for debug geometry, articulated rigs, BERs, and particles.
 
-use mc_spine_client_gpu::atmosphere::{AtmosphereParams, BiomeAtmosphereBlender, ChunkFadeTracker};
-use mc_spine_client_gpu::renderer::{
+use megu_client_gpu::atmosphere::{AtmosphereParams, BiomeAtmosphereBlender, ChunkFadeTracker};
+use megu_client_gpu::renderer::{
     probe_adapters, request_gpu_device, ComposedFrame, GpuRenderer, MAX_DEBUG_LINES,
     OFFSCREEN_FORMAT,
 };
-use mc_spine_client_gpu::subworld_render::{SubWorldRenderBank, DEBUG_LINE_WGSL};
-use mc_spine_client_gpu::Camera;
-use mc_spine_client_mesh::ber_instancing::{
+use megu_client_gpu::subworld_render::{SubWorldRenderBank, DEBUG_LINE_WGSL};
+use megu_client_gpu::Camera;
+use megu_client_mesh::ber_instancing::{
     build_ber_mesh, VanillaBerFacing, VanillaBerKind, VanillaBerState, VanillaParticleKind,
     VanillaParticleWorld,
 };
-use mc_spine_client_mesh::builtin_shadow_wgsl::BuiltinShadowQuality;
-use mc_spine_client_mesh::entity_rig::{build_entity_rig_mesh, classify_entity_rig, EntityPose};
-use mc_spine_client_mesh::RenderBackendPreference;
-use mc_spine_kernel::debug_chords::{
+use megu_client_mesh::builtin_shadow_wgsl::BuiltinShadowQuality;
+use megu_client_mesh::entity_rig::{build_entity_rig_mesh, classify_entity_rig, EntityPose};
+use megu_client_mesh::RenderBackendPreference;
+use megu_kernel::debug_chords::{
     build_chunk_border_lines, build_entity_hitbox_lines, DebugLine,
 };
-use mc_spine_kernel::Aabb;
+use megu_kernel::Aabb;
 use wgpu::naga::front::wgsl;
 use wgpu::naga::valid::{Capabilities, ValidationFlags, Validator};
 

@@ -6,25 +6,25 @@
 
 既存の `.jar` は `mods/` に置く運用を想定しています。作者が JAR を手作業で Rust に変換する必要はありません。サーバー側の `mod-adapter-core` がメタデータ、JSON データ、Mixin と JVM バイトコードを調べ、利用できるネイティブ機能・互換経路・フォールバックを振り分けます。**自動判定とすべての Mod の完全動作は別**で、実行には Mod ごとの互換性が必要です。
 
-- **組み込み最適化の重複排除** — `BUILTIN_SUPERSEDED_PERF_MODS` に登録された Sodium、Embeddium、Lithium、Starlight、FerriteCore、ModernFix、Distant Horizons などは、対応する Mod ID を認識してスキップ対象とします。mc-spine 側の独立した最適化実装を使います。第三者の JAR は実行・取り込みません。
+- **組み込み最適化の重複排除** — `BUILTIN_SUPERSEDED_PERF_MODS` に登録された Sodium、Embeddium、Lithium、Starlight、FerriteCore、ModernFix、Distant Horizons などは、対応する Mod ID を認識してスキップ対象とします。megu 側の独立した最適化実装を使います。第三者の JAR は実行・取り込みません。
 - **データのネイティブ処理** — データパック由来のレシピ、アイテム・ブロックタグ、loot modifier、調理・切断・発酵データ、`dimension_type`・`dimension`・worldgen といった宣言データを解析する仕組みがあります。生物の飼育・繁殖・移動やポータルなどは汎用プリミティブで表現できます。個別 Mod の全挙動を自動再現できるという意味ではありません。
 - **`.class` / Mixin の解析** — `*.mixins.json` に登録されたクラスの `.class` を JVM を起動せず静的走査します。対応する `@Inject` の `HEAD`・`TAIL`・`RETURN` などは標準イベントへ lift（対応付け）を試みます。`@Redirect`・`@Overwrite`、locals capture、不明な対象などは安全側に倒して未対応と報告します。
 
 | 区分 | 実行経路 | JVM |
 | --- | --- | --- |
 | Tier 0 — Native | 専用 Rust アダプター | 不要 |
-| Tier 1 — Data + Bundle | データパック、宣言的プロファイルと `mc-spine-mod-bundle/1` | 不要 |
+| Tier 1 — Data + Bundle | データパック、宣言的プロファイルと `megu-mod-bundle/1` | 不要 |
 | Tier 2 — Lifted Shim | 対応する Mixin をイベントへ lift し、制限付き NeoForge/Fabric JVM shim で実行 | shim で使用 |
 | Tier 3 — Fallback | 未対応の Mixin / API / AT。ポリシーに従い起動拒否、隔離、上流 NeoForge への委譲を判断 | 委譲時は使用 |
 
 この区分とは別に、組み込み済み最適化 Mod は `BuiltInSuperseded` としてスキップします。**Tier 3 の Mod がネイティブの小型 JRE で必ず動くわけではありません。**
 
-事前検査 CLI は `mod-adapter-core/src/bin/mod_check.rs` の `mc-spine-mod-check` です。現在実装されている呼び出しは次のとおりです。
+事前検査 CLI は `mod-adapter-core/src/bin/mod_check.rs` の `megu-mod-check` です。現在実装されている呼び出しは次のとおりです。
 
 ```sh
-mc-spine-mod-check --modpack example.mrpack --mc-version 1.21.1 --json
-mc-spine-mod-check --scan-jar mods/example.jar --json
-mc-spine-mod-check --scan-mods-dir mods/ --json
+megu-mod-check --modpack example.mrpack --mc-version 1.21.1 --json
+megu-mod-check --scan-jar mods/example.jar --json
+megu-mod-check --scan-mods-dir mods/ --json
 ```
 
 - `--modpack` は Modrinth `.mrpack` / `modrinth.index.json`、CurseForge `manifest.json` / パック ZIP の **ダウンロード・起動前**の対応 Minecraft バージョン、軽量化 Mod のスキップ、ネイティブ候補、追加検査が必要な JAR を報告します。`--flagship <id,...>`・`--profiles <id,...>` もこのモード専用です。終了コード `0` でも未検査 JAR の実行成功を証明しません。
@@ -34,51 +34,51 @@ mc-spine-mod-check --scan-mods-dir mods/ --json
 
 ### 自動アダプト CLI（実装済み）
 
-`mc-spine-mod-check` の `--adapt-jar` と `--adapt-mods-dir` は利用できます。JAR 内の loader manifest、宣言データ、Mixin バイトコードを読み、`auto_skipped`、`native_bundle`、`tier2_lifted_shim`、`tier3_fallback_required` のいずれかに分類します。実行は JVM 不要です。
+`megu-mod-check` の `--adapt-jar` と `--adapt-mods-dir` は利用できます。JAR 内の loader manifest、宣言データ、Mixin バイトコードを読み、`auto_skipped`、`native_bundle`、`tier2_lifted_shim`、`tier3_fallback_required` のいずれかに分類します。実行は JVM 不要です。
 
 ```sh
 # 単一 JAR の自動分類。生成されたネイティブ Bundle と診断 JSON を保存
-mc-spine-mod-check --adapt-jar mods/example.jar --out mods/adapted --json
+megu-mod-check --adapt-jar mods/example.jar --out mods/adapted --json
 
 # mods/ の全 JAR を分類。結果を mods/adapted/ に保存
-mc-spine-mod-check --adapt-mods-dir mods/ --out mods/adapted/ --json
+megu-mod-check --adapt-mods-dir mods/ --out mods/adapted/ --json
 
 # サーバー用途では除外される client-only Mixin も解析する場合
-mc-spine-mod-check --adapt-jar mods/example.jar --include-client-mixins --json
+megu-mod-check --adapt-jar mods/example.jar --include-client-mixins --json
 ```
 
-`--json` の標準出力は単一 JAR では `mc-spine-jar-adaptation/1`、ディレクトリでは `mc-spine-mods-dir-adaptation/1` です。`--out <dir>` を指定すると `adaptation-report.json` と、ネイティブ化できた Mod ごとの `<mod_id>.bundle.json` を書き出します。後者の JSON は厳格な `mc-spine-mod-bundle/1` スキーマで検証されます。`--out` を省略するとファイルを生成せず、診断のみ表示します。
+`--json` の標準出力は単一 JAR では `megu-jar-adaptation/1`、ディレクトリでは `megu-mods-dir-adaptation/1` です。`--out <dir>` を指定すると `adaptation-report.json` と、ネイティブ化できた Mod ごとの `<mod_id>.bundle.json` を書き出します。後者の JSON は厳格な `megu-mod-bundle/1` スキーマで検証されます。`--out` を省略するとファイルを生成せず、診断のみ表示します。
 
 終了コード `0` は全 JAR がスキップ・Native・Tier 2 のいずれかと判定されたことを示し、`2` は Tier 3 が含まれるか引数が不正、`1` はファイルの読み書き不可や危険・破損した入力を示します。`2` の場合でも、`--out` を指定していれば成功した Native Bundle と診断レポートは保存されます。
 
-サーバーの `src/live_mod_bridge.rs` には起動時の JAR 分類・宣言データ読込・対応する Mixin の lift と、`mods/` および `mods/adapted/` の検証済み `*.bundle.json` 登録が実装されています。ランチャーの `tools/mod_launcher.py --auto-adapt` も実装済みで、起動計画時に既存 Bundle を事前確認し、利用可能な `mc-spine-mod-check --scan-mods-dir` の結果と ShimCheck を組み合わせて判定します。次のコマンドで起動計画を確認できます。
+サーバーの `src/live_mod_bridge.rs` には起動時の JAR 分類・宣言データ読込・対応する Mixin の lift と、`mods/` および `mods/adapted/` の検証済み `*.bundle.json` 登録が実装されています。ランチャーの `tools/mod_launcher.py --auto-adapt` も実装済みで、起動計画時に既存 Bundle を事前確認し、利用可能な `megu-mod-check --scan-mods-dir` の結果と ShimCheck を組み合わせて判定します。次のコマンドで起動計画を確認できます。
 
 ```sh
 python3 tools/mod_launcher.py --mods-dir mods/ --auto-adapt --dry-run --json
 ```
 
-ランチャーの `--auto-adapt` は `--adapt-mods-dir --out` による Bundle ファイルの書き出しとは別の入口です。JAR から生成ファイルが必要な場合は上記の `mc-spine-mod-check --adapt-* --out` を実行してください。
+ランチャーの `--auto-adapt` は `--adapt-mods-dir --out` による Bundle ファイルの書き出しとは別の入口です。JAR から生成ファイルが必要な場合は上記の `megu-mod-check --adapt-* --out` を実行してください。
 
-## 2. 既存 Mod を mc-spine で最大限速く・互換性高く動かすための設計ベストプラクティス
+## 2. 既存 Mod を megu で最大限速く・互換性高く動かすための設計ベストプラクティス
 
 1. **NeoForge / Fabric の標準 registry とデータパックを使う。** レシピ、タグ、loot table、dimension、worldgen をできる限り `data/<namespace>/...` の JSON で記述します。一般的なデータ形式ほど JVM を使わない Tier 1 への対応付けが容易です。
 2. **イベントを標準 API の範囲に収める。** ライフサイクルイベントや既知の `@Inject` 対象は、独自イベントに変換しやすくなります。`@Redirect` / `@Overwrite`、ローカル変数の捕捉、深い Minecraft 内部 API の差し替えに依存する設計は互換性を下げます。
-3. **軽量化機能はオプションとして切り離す。** サーバー tick、照明、メモリ管理、描画・LOD に関する独自最適化は mc-spine に実装済みの分野と重複し得ます。既存の最適化 Mod と機能・性能が同等とは未検証です。
+3. **軽量化機能はオプションとして切り離す。** サーバー tick、照明、メモリ管理、描画・LOD に関する独自最適化は megu に実装済みの分野と重複し得ます。既存の最適化 Mod と機能・性能が同等とは未検証です。
 4. **Mod ID と対応バージョンを正確に宣言する。** `fabric.mod.json` と `META-INF/neoforge.mods.toml` の依存関係、サイド区分、Minecraft バージョン制約が自動振り分けの入力になります。
 5. **実行検証する。** `--scan-*` の結果を開発中の診断に使い、実際のサーバーで登録、データ保存、イベント、ワールド生成、クライアント接続を別途試験してください。
 
-## 3. JVM 不要・最速ネイティブ Mod フォーマット（`mc-spine-mod-bundle/1`）の作り方
+## 3. JVM 不要・最速ネイティブ Mod フォーマット（`megu-mod-bundle/1`）の作り方
 
 **ネイティブ開発の利点** — 対応する宣言的プリミティブだけで完結する Mod は、**Gradle・JDK・Minecraft mappings・Mixin の設定やボイラープレートが不要**です。JSON を記述して Rust の汎用ランタイムに渡せるため、個別の Java クラスをコンパイルする工程と JVM 実行コストを省けます。対応範囲では変更もデータ中心で、`dep_resolver::assess_hot_reload_after_add` は Bundle を含む安全な JAR を **hot-reload 可能と判定**します。再起動不要の適用可否は JAR 内の Mixin・ネイティブライブラリ・バイトコードに依存します。
 
-**スターターの自動生成は実装済み**です。`--scaffold-native` は `mc-spine-mod-bundle/1` の検証可能な宣言 JSON を標準出力または指定ファイルに生成します。`--version` は Bundle の `mc_version_range`（バージョン指定または Maven / SemVer 範囲）、`--name` は表示名の検証用引数です。現行のスキーマには表示名のフィールドがないため、Bundle に保存されるのは `mod_id` とバージョン範囲などの定義済みフィールドです。データパックの JSON は別途作成してください。
+**スターターの自動生成は実装済み**です。`--scaffold-native` は `megu-mod-bundle/1` の検証可能な宣言 JSON を標準出力または指定ファイルに生成します。`--version` は Bundle の `mc_version_range`（バージョン指定または Maven / SemVer 範囲）、`--name` は表示名の検証用引数です。現行のスキーマには表示名のフィールドがないため、Bundle に保存されるのは `mod_id` とバージョン範囲などの定義済みフィールドです。データパックの JSON は別途作成してください。
 
 ```sh
 # ファイルに保存する（親ディレクトリは事前に作成）
-mc-spine-mod-check --scaffold-native my_sample_mod --version '[1.21,)' --out my_sample_mod.bundle.json
+megu-mod-check --scaffold-native my_sample_mod --version '[1.21,)' --out my_sample_mod.bundle.json
 
 # ファイル指定がない場合は Bundle JSON を標準出力する
-mc-spine-mod-check --scaffold-native my_sample_mod
+megu-mod-check --scaffold-native my_sample_mod
 ```
 
 Mod ID は安全な小文字の英数字・`_`・`.`・`-` のみで構成された単独 ID に限られます。`../escape` のようなパスを含む ID は終了コード `2` で拒否されます。ファイル書き込み失敗時は `1` です。
@@ -89,7 +89,7 @@ Mod ID は安全な小文字の英数字・`_`・`.`・`-` のみで構成され
 
 ```json
 {
-  "schema": "mc-spine-mod-bundle/1",
+  "schema": "megu-mod-bundle/1",
   "mod_id": "starling",
   "mc_version_range": "[1.21,)",
   "portals": [
@@ -178,7 +178,7 @@ Mod ID は安全な小文字の英数字・`_`・`.`・`-` のみで構成され
 
 `spells[].cast.kind` は `instant` / `cast_time` / `channeled`、`steps[].form.kind` は `self_cast` / `touch` / `projectile` / `raycast_beam` / `aoe_zone` / `chain` / `orbit` / `summon`、`effects[].kind` は `damage` / `heal` / `shield` / `apply_status` / `knockback` / `blink` / `conjure_light` / `break_block` / `emit_vfx` に対応します。`custom_statuses` は DoT、HoT、吸収シールド、行動制限（`frozen` / `rooted` / `silenced` / `disarmed`）、属性補正、VFX オーラを定義します。儀式の `pattern` は祭壇原点からの相対座標で、`reagents` はアイテム ID ごとの必要数です。
 
-宣言は `SpellDefinition::validate`、`CustomStatusRegistry`、`RitualRecipe::validate` によって制限され、未知のキー・種類、重複 ID、上限を超えるパラメータは拒否されます。Bundle のパースとランタイム登録により魔法定義を参照できます。ゲーム内の発動操作・描画・ワールドへの効果適用には対応する実行経路との接続が必要です。魔法同期用の `MAG1` コーデックは `mc-spine:magic_v1` チャネルを使用します。
+宣言は `SpellDefinition::validate`、`CustomStatusRegistry`、`RitualRecipe::validate` によって制限され、未知のキー・種類、重複 ID、上限を超えるパラメータは拒否されます。Bundle のパースとランタイム登録により魔法定義を参照できます。ゲーム内の発動操作・描画・ワールドへの効果適用には対応する実行経路との接続が必要です。魔法同期用の `MAG1` コーデックは `megu:magic_v1` チャネルを使用します。
 
 ### ブロック・アイテム・レシピ・タグとディメンション
 
@@ -276,9 +276,9 @@ fn fs_main() -> @location(0) vec4<f32> {
 
 ## 5. ライセンスとクリーンルーム境界
 
-mc-spine 本体の配布ライセンスは **`GPL-3.0-or-later`** です。寄稿・ファーストパーティのコードについては `LGPL-3.0-or-later OR GPL-3.0-or-later OR AGPL-3.0-or-later` のトリプルライセンスの方針があります。詳細は [LICENSING.md](../LICENSING.md)、[LICENSE](../LICENSE)、[NOTICE](../NOTICE) を参照してください。
+megu 本体の配布ライセンスは **`GPL-3.0-or-later`** です。寄稿・ファーストパーティのコードについては `LGPL-3.0-or-later OR GPL-3.0-or-later OR AGPL-3.0-or-later` のトリプルライセンスの方針があります。詳細は [LICENSING.md](../LICENSING.md)、[LICENSE](../LICENSE)、[NOTICE](../NOTICE) を参照してください。
 
-Fabric / NeoForge 互換レイヤ経由で動的ロードする **独立した外部 Mod JAR** と、利用者が自らインストールする **外部シェーダーパック**はそれぞれの作者のライセンスのままです。利用するだけで mc-spine 本体の GPL がそれらの独立した配布物に自動波及することはありません。再配布・コードの組み込み・派生物の扱いは、各ライセンスと実際の結合形態を確認してください。
+Fabric / NeoForge 互換レイヤ経由で動的ロードする **独立した外部 Mod JAR** と、利用者が自らインストールする **外部シェーダーパック**はそれぞれの作者のライセンスのままです。利用するだけで megu 本体の GPL がそれらの独立した配布物に自動波及することはありません。再配布・コードの組み込み・派生物の扱いは、各ライセンスと実際の結合形態を確認してください。
 
 本体には **第三者のシェーダーや Mojang のアセットを同梱しません**。互換機能は仕様・観測可能な挙動に基づくクリーンルーム実装で、第三者の ARR / PolyForm Shield などのソースやアセットを取り込みません。公開用成果物の来歴チェックは [LICENSING.md](../LICENSING.md) の配布境界に従ってください。
 
@@ -290,15 +290,15 @@ Fabric / NeoForge 互換レイヤ経由で動的ロードする **独立した�
 - Known redundant performance mod IDs are skipped in favor of built-in optimizations.
 - Recipes, tags, loot modifiers and dimension/worldgen data have native parsing paths.
 - Tier 0 uses a dedicated Rust adapter with no JVM.
-- Tier 1 uses declarative data and `mc-spine-mod-bundle/1` with no JVM.
+- Tier 1 uses declarative data and `megu-mod-bundle/1` with no JVM.
 - Tier 2 lifts supported Mixin injection sites into bounded JVM-shim events.
 - Tier 3 needs a safe fallback policy, quarantine or delegation to NeoForge.
-- Inspect packs with `mc-spine-mod-check --modpack <pack.mrpack>`.
+- Inspect packs with `megu-mod-check --modpack <pack.mrpack>`.
 - Inspect Mixin bytecode with `--scan-jar <mod.jar>`.
 - Inspect a complete `mods/` folder with `--scan-mods-dir mods/`.
-- Auto-adapt an existing JAR with `--adapt-jar mods/example.jar --out mods/adapted --json` (schema `mc-spine-jar-adaptation/1`).
-- Auto-adapt a full folder with `--adapt-mods-dir mods/ --out mods/adapted --json` (schema `mc-spine-mods-dir-adaptation/1`).
-- Generate a valid `mc-spine-mod-bundle/1` starter with `--scaffold-native my_sample_mod --out my_sample_mod.bundle.json`.
+- Auto-adapt an existing JAR with `--adapt-jar mods/example.jar --out mods/adapted --json` (schema `megu-jar-adaptation/1`).
+- Auto-adapt a full folder with `--adapt-mods-dir mods/ --out mods/adapted --json` (schema `megu-mods-dir-adaptation/1`).
+- Generate a valid `megu-mod-bundle/1` starter with `--scaffold-native my_sample_mod --out my_sample_mod.bundle.json`.
 - `--adapt-*` exits 0 for accepted/skipped/Tier 2 mods, 2 for Tier 3 or invalid arguments, and 1 for unreadable or unsafe input.
 - `live_mod_bridge` auto-classifies JARs and registers validated bundles during boot. `tools/mod_launcher.py --auto-adapt` enables launcher preflight classification.
 - Native bundle authors can avoid Gradle, JDK, mappings and Mixin boilerplate.

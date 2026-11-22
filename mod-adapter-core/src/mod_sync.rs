@@ -3,9 +3,9 @@
 //! Hardened server → client mod sync protocol, manifest, and security
 //! verifier (Lane NET-2).
 //!
-//! A `mc-spine` server advertises the exact set of `.jar` mods a connecting
+//! A `megu` server advertises the exact set of `.jar` mods a connecting
 //! client needs via a Protocol 767 `CustomPacketPayload` on channel
-//! [`MOD_SYNC_CHANNEL`] (`mc-spine:mod_sync_v1`) whose body is the compact
+//! [`MOD_SYNC_CHANNEL`] (`megu:mod_sync_v1`) whose body is the compact
 //! deterministic `MSY1` frame produced by [`encode_sync_manifest`]. The
 //! client decodes it fail-closed with [`decode_sync_manifest`], computes a
 //! [`ModSyncPlan`] with [`plan_mod_sync`], downloads each `to_download`
@@ -66,7 +66,7 @@ use crate::fallback::BUILTIN_SUPERSEDED_PERF_MODS;
 use crate::modpack::infer_candidate_mod_id;
 
 /// Protocol 767 `CustomPacketPayload` channel carrying `MSY1` sync bodies.
-pub const MOD_SYNC_CHANNEL: &str = "mc-spine:mod_sync_v1";
+pub const MOD_SYNC_CHANNEL: &str = "megu:mod_sync_v1";
 
 /// 4-byte magic prefix of every [`encode_sync_manifest`] body. The `1` is
 /// the wire version: a future incompatible frame bumps the magic, so old
@@ -1079,7 +1079,7 @@ pub fn compute_manifest_diff_with_policy(
 // Sync planning & verified install
 // ---------------------------------------------------------------------------
 
-/// Whether `entry` names a performance mod `mc-spine` already implements
+/// Whether `entry` names a performance mod `megu` already implements
 /// natively — checked by the advertised `mod_id` AND the id inferred from
 /// the JAR filename, with `-`/`_` folded so `ferrite_core` still matches
 /// `ferritecore`. Skipped entries are never downloaded.

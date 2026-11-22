@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: LGPL-3.0-or-later OR GPL-3.0-or-later OR AGPL-3.0-or-later
-use mc_spine_core::math_opt_foundation::{
+use megu_core::math_opt_foundation::{
     chebyshev_eval, classify_subtile_lipschitz, exp_decay_exact, fast_exp_neg,
     fast_exp_neg_chebyshev, fast_exp_neg_unit, hermite_eval_and_deriv, morton_decode_3d,
     morton_decode_3d_u16, morton_encode_3d, morton_encode_3d_u16, morton_section_index,

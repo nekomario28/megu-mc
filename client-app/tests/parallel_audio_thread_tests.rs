@@ -14,11 +14,11 @@
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use mc_spine_client::audio_out::{
+use megu_client::audio_out::{
     AudioCmd, AudioCmdRing, AudioMixThread, AudioMixThreadOptions, NullSink,
     AUDIO_CMD_RING_CAPACITY, AUDIO_MIX_VOICE_SLOTS,
 };
-use mc_spine_client::sound_assets::{DecodedPcm, MIX_SAMPLE_RATE};
+use megu_client::sound_assets::{DecodedPcm, MIX_SAMPLE_RATE};
 
 /// One second of a constant tone — long enough that no voice finishes
 /// inside the test window.

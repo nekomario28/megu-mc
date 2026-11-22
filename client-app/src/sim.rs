@@ -5,11 +5,11 @@
 use std::collections::HashSet;
 use std::time::{Duration, Instant};
 
-use mc_spine_kernel::player_physics::{
+use megu_kernel::player_physics::{
     step_player_physics, PlayerInputState, PlayerPhysicsState, SurfaceKind,
 };
-use mc_spine_kernel::raycast::{raycast_blocks, RayBlockShapes};
-use mc_spine_kernel::{Aabb, FluidClipMode, RayHit};
+use megu_kernel::raycast::{raycast_blocks, RayBlockShapes};
+use megu_kernel::{Aabb, FluidClipMode, RayHit};
 
 use crate::cli::{CliConfig, ScriptMode};
 use crate::lod::LodManager;
@@ -519,7 +519,7 @@ impl SessionSummary {
     pub fn to_human(&self) -> String {
         format!(
             concat!(
-                "mc-spine-client session complete (Protocol {})\n",
+                "megu-client session complete (Protocol {})\n",
                 "  server:        {} (dimension={}, entity_id={})\n",
                 "  handshake:     login={} config={} play={} compression={:?}\n",
                 "  world:         chunks_decoded={} loaded={} unloaded={} batches={} light_updates={} block_updates={} local_light={}\n",

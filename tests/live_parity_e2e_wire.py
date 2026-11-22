@@ -21,7 +21,7 @@ from protocol767 import Client, ContractFailure, Reader, ROOT, require, string, 
 from wire_smoke import port, status
 
 
-MOTD = "mc-spine live parity E2E"
+MOTD = "megu live parity E2E"
 SESSION = b"\x19\x28\x37\x46"
 MASKED_SESSION = bytes(b & 0x0f for b in SESSION)
 GS4_KEYS = (
@@ -188,14 +188,14 @@ def server(binary, root, overrides=None):
         udp.bind(("127.0.0.1", 0))
         query = udp.getsockname()[1]
     env = os.environ.copy()
-    env.pop("MC_SPINE_RCON_PORT", None)
-    env.pop("MC_SPINE_RCON_PASS", None)
-    env.pop("MC_SPINE_ALLOW_PLAYER_ADMIN_COMMANDS", None)
-    env.update(MC_SPINE_PORT=str(game), MC_SPINE_BIND_ADDR="127.0.0.1",
-               MC_SPINE_QUERY_PORT=str(query), MC_SPINE_ENABLE_QUERY="0",
-               MC_SPINE_ANVIL_WORLD_DIR="", MC_SPINE_MOTD=MOTD,
-               MC_SPINE_WG="old", MC_SPINE_RESOURCE_PACK_URL="",
-               MC_SPINE_ANTICHEAT="off")
+    env.pop("MEGU_RCON_PORT", None)
+    env.pop("MEGU_RCON_PASS", None)
+    env.pop("MEGU_ALLOW_PLAYER_ADMIN_COMMANDS", None)
+    env.update(MEGU_PORT=str(game), MEGU_BIND_ADDR="127.0.0.1",
+               MEGU_QUERY_PORT=str(query), MEGU_ENABLE_QUERY="0",
+               MEGU_ANVIL_WORLD_DIR="", MEGU_MOTD=MOTD,
+               MEGU_WG="old", MEGU_RESOURCE_PACK_URL="",
+               MEGU_ANTICHEAT="off")
     if overrides:
         env.update(overrides)
     failure = False
@@ -394,14 +394,14 @@ def anvil_roundtrip(binary, root):
     world = root / "anvil-world"
     first = root / "anvil-server-1"
     second = root / "anvil-server-2"
-    with server(binary, first, {"MC_SPINE_ANVIL_WORLD_DIR": str(world)}):
+    with server(binary, first, {"MEGU_ANVIL_WORLD_DIR": str(world)}):
         pass
     level = world / "level.dat"
     check(level.is_file() and level.stat().st_size > 0,
           "anvil-first-graceful-save-level-dat", log_tail(first))
     check("[anvil] saved" in log_tail(first), "anvil-first-save-log", log_tail(first))
     no_staging_files(world)
-    with server(binary, second, {"MC_SPINE_ANVIL_WORLD_DIR": str(world)}):
+    with server(binary, second, {"MEGU_ANVIL_WORLD_DIR": str(world)}):
         pass
     second_log = log_tail(second)
     check("[anvil] loaded" in second_log and "level_loaded: true" in second_log,
@@ -422,11 +422,11 @@ def main():
         self_test()
         return
     if len(sys.argv) != 2:
-        raise SystemExit("usage: live_parity_e2e_wire.py --self-test | /path/to/mc-spine")
+        raise SystemExit("usage: live_parity_e2e_wire.py --self-test | /path/to/megu")
     binary = Path(sys.argv[1]).resolve()
     check(binary.is_file() and os.access(binary, os.X_OK), "compiled-binary-missing", binary)
     os.environ.setdefault("MC_PROBE_DEADLINE", "20")
-    with tempfile.TemporaryDirectory(prefix="mc-spine-live-parity-") as temporary:
+    with tempfile.TemporaryDirectory(prefix="megu-live-parity-") as temporary:
         root = Path(temporary)
         game_root = root / "network-server"
         op = offline_uuid("Alice").hex()
@@ -435,7 +435,7 @@ def main():
         (game_root / "ops.json").write_text(
             '[{"uuid":"' + uuid + '","name":"Alice","level":4,'
             '"bypassesPlayerLimit":false}]', encoding="utf-8")
-        with server(binary, game_root, {"MC_SPINE_ENABLE_QUERY": "1"}) as (game, query, _):
+        with server(binary, game_root, {"MEGU_ENABLE_QUERY": "1"}) as (game, query, _):
             query_live(game, query, 0, ())
             print("PASS live GS4 UDP challenge/basic/full/10 keys/invalid token", flush=True)
             two_players(game, query)

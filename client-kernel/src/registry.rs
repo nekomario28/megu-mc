@@ -4,7 +4,7 @@ use crate::{
     light::face_occlusion_from_octants,
     Error, STATE_COUNT,
 };
-use mc_spine_core::id::ResourceLocation;
+use megu_core::id::ResourceLocation;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
@@ -38,7 +38,7 @@ static STAGED_FACTS: OnceLock<Vec<u8>> = OnceLock::new();
 static DISCOVERED_FACTS: OnceLock<Option<Vec<u8>>> = OnceLock::new();
 
 /// Every directory a `block_state_facts` table may live in, mirroring the
-/// server's `pinned_data_candidates` order: `MC_SPINE_VERSION_DIR` first (a
+/// server's `pinned_data_candidates` order: `MEGU_VERSION_DIR` first (a
 /// generated version-pack root), then the checkout's `assets/` relative to the
 /// working directory and to the manifest so in-repo callers still resolve
 /// when the working directory is somewhere else. Each directory is tried with
@@ -46,7 +46,7 @@ static DISCOVERED_FACTS: OnceLock<Option<Vec<u8>>> = OnceLock::new();
 /// same fallback [`version_pack_path`] uses inside a pack.
 fn state_facts_candidates() -> Vec<PathBuf> {
     let mut dirs = Vec::with_capacity(4);
-    if let Some(dir) = std::env::var_os("MC_SPINE_VERSION_DIR") {
+    if let Some(dir) = std::env::var_os("MEGU_VERSION_DIR") {
         if !dir.is_empty() {
             dirs.push(PathBuf::from(dir));
         }
@@ -666,7 +666,7 @@ impl Registry {
 
     /// The default state of a validated [`ResourceLocation`], or `None` when
     /// the pack does not define the block. `id` is already proven to parse by
-    /// the `mc-spine-core` identifier rules, so the only failure mode left is
+    /// the `megu-core` identifier rules, so the only failure mode left is
     /// a name absent from this registry — reported as `None`, never silently
     /// repaired.
     pub fn lookup_resource(&self, id: &ResourceLocation) -> Option<u32> {
@@ -1044,7 +1044,7 @@ mod tests {
 
     fn version_dir(tagged: bool, with_states: bool) -> PathBuf {
         let dir = std::env::temp_dir().join(format!(
-            "mc-spine-kernel-registry-{}-{}-{}",
+            "megu-kernel-registry-{}-{}-{}",
             std::process::id(),
             tagged,
             with_states
@@ -1086,7 +1086,7 @@ mod tests {
         }
         // A missing directory and a directory missing required files fail closed.
         let missing = std::env::temp_dir().join(format!(
-            "mc-spine-kernel-registry-{}-absent",
+            "megu-kernel-registry-{}-absent",
             std::process::id()
         ));
         assert!(matches!(

@@ -44,30 +44,30 @@ if [ -z "$TAG" ]; then
   echo "usage: tools/sculk_port_run.sh <tag> [--n N --x CX --z CZ --arm cx,cz,gi,step --limit N]" >&2
   exit 2
 fi
-if [ ! -x target/release/mc-spine ]; then
+if [ ! -x target/release/megu ]; then
   echo "sculk_port_run: build first (cargo build --release)" >&2
   exit 1
 fi
 
-OUT="${SCULK_TRACE_DIR:-$HOME/.cache/mc-spine-audit/sculk-traces}"
+OUT="${SCULK_TRACE_DIR:-$HOME/.cache/megu-audit/sculk-traces}"
 mkdir -p "$OUT"
 DUMP="${DUMP:-/var/tmp/sculk-port-$TAG.bin}"
 LOG="$OUT/port-$TAG.log"
 
-# `MC_SPINE_WG_PROFILE=0` is the gate the dump path needs, with the warm-up pass switched off: any
+# `MEGU_WG_PROFILE=0` is the gate the dump path needs, with the warm-up pass switched off: any
 # other value runs a profile pass first and the placement lines then come from a *different run*
 # than the armed draws (sanity fails on that, by design).
-env MC_SPINE_WG_PROFILE=0 \
-    MC_SPINE_WG_DUMP="$DUMP" \
-    MC_SPINE_WG_DUMP_N="$N" \
-    MC_SPINE_WG_DUMP_X="$OX" \
-    MC_SPINE_WG_DUMP_Z="$OZ" \
-    MC_SPINE_SEED=0 \
+env MEGU_WG_PROFILE=0 \
+    MEGU_WG_DUMP="$DUMP" \
+    MEGU_WG_DUMP_N="$N" \
+    MEGU_WG_DUMP_X="$OX" \
+    MEGU_WG_DUMP_Z="$OZ" \
+    MEGU_SEED=0 \
     FEATURE_ATTEMPT_TRACE=1 \
     SPC_CURSOR_TRACE=1 \
     ${ARM:+FSEED_ARM=$ARM} \
     ${ARM:+FEATURE_DRAW_LIMIT=$LIMIT} \
-    ./target/release/mc-spine 2>"$LOG" >/dev/null
+    ./target/release/megu 2>"$LOG" >/dev/null
 
 {
   echo "tag: $TAG"

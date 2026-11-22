@@ -10,11 +10,11 @@
 
 use std::collections::BTreeMap;
 
-use mc_spine_client_mesh::model_baker::blockstate::{
+use megu_client_mesh::model_baker::blockstate::{
     self, bake_blockstate, resolve_blockstate, BlockStateDef, BlockStateResolution,
 };
-use mc_spine_client_mesh::model_baker::*;
-use mc_spine_client_mesh::Direction;
+use megu_client_mesh::model_baker::*;
+use megu_client_mesh::Direction;
 
 // ---------------------------------------------------------------------------
 // Helpers

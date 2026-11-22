@@ -12,11 +12,11 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 RELEASE = ROOT / "tools/release_bundle.py"
 BINARIES = (
-    "mc-spine",
-    "mc-spine-client",
-    "mc-spine-mod-check",
-    "mc-spine-world-migrate",
-    "mc-spine-init",
+    "megu",
+    "megu-client",
+    "megu-mod-check",
+    "megu-world-migrate",
+    "megu-init",
 )
 DOCUMENTS = (
     "LICENSE",
@@ -39,7 +39,7 @@ TOOLS = (
 VERSION = "0.1.0"
 TARGET = "x86_64-unknown-linux-gnu"
 GIT_SHA = "a" * 40
-PREFIX = f"mc-spine-{VERSION}-{TARGET}"
+PREFIX = f"megu-{VERSION}-{TARGET}"
 
 
 def run(*args, expect=0):
@@ -139,9 +139,9 @@ def test_five_binary_bundle():
 def test_optional_gpu_companion():
     with tempfile.TemporaryDirectory(prefix="release-gpu-test-") as tmp:
         work = Path(tmp)
-        server = work / "mc-spine"
+        server = work / "megu"
         server.write_bytes(b"\x7fELF fake server\n")
-        for gpu_name in ("mc-spine-client-gpu", "mc-spine-client-gpu.exe"):
+        for gpu_name in ("megu-client-gpu", "megu-client-gpu.exe"):
             gpu = work / gpu_name
             gpu_bytes = f"fake gpu companion {gpu_name}\n".encode()
             gpu.write_bytes(gpu_bytes)

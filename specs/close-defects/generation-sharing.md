@@ -50,10 +50,10 @@ probeはseed 0、負/正座標・隣接領域への移動・再照会を含む�
 これは既存結果の保存対照であり、vanilla oracleではない。
 
 - 基準commit: `9c43051ffa203824ee53085abbdcc48b321d2139`
-- 所有worktree: `<HOME>/.cache/mc-spine-audit/H-owner-baseline`
+- 所有worktree: `<HOME>/.cache/megu-audit/H-owner-baseline`
 - probeの正本: [generation_capture.rs](../../evidence/foundation/module-layers/generation_capture.rs)
 - probe SHA-256: `2ffc81799773ac2dc70c322d7837f1ada476913dd4ec574168d6c95f9e2fed38`
-- 正準バイト列: `<HOME>/.cache/mc-spine-audit/H-owner-baseline-1.bin`
+- 正準バイト列: `<HOME>/.cache/megu-audit/H-owner-baseline-1.bin`
 - バイト列SHA-256: `0ab88652a45f7d0917c21c8d09f6b610c856f7315c954a9eb81fcde689e3277c`
 
 worktreeのworldgenへ足したのはtest限定のprobe importだけで、製品コードは基準commitのまま。
@@ -61,7 +61,7 @@ worktreeのworldgenへ足したのはtest限定のprobe importだけで、製品
 Cargo自身にテスト実行ファイルを選ばせ、既存の`target/debug/deps`から推測して起動しない。
 別の実行環境で再開するときは、これらのキャッシュを存在すると仮定せず基準から再生成する。
 所有checkoutのworldgen内にtest限定の `generation_equivalence_capture` 子モジュールとして
-上のprobeを読み込み、`MC_SPINE_CAPTURE_OUT`を所有出力パスへ設定して、
+上のprobeを読み込み、`MEGU_CAPTURE_OUT`を所有出力パスへ設定して、
 `cargo test --offline --locked -j 2 worldgen::generation_equivalence_capture::capture_generation_outputs -- --exact --nocapture --test-threads=1`
 をcheckoutの根から実行する。資産も同じ基準commitを使う。
 

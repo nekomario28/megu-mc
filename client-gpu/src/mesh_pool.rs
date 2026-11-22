@@ -24,8 +24,8 @@ use std::sync::mpsc::{sync_channel, Receiver, SyncSender};
 use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
 
-use mc_spine_client_mesh::ffi::PackedVertex;
-use mc_spine_client_mesh::{DirectionBuckets, HiZPyramid, SectionCoord, DIRECTION_BUCKETS};
+use megu_client_mesh::ffi::PackedVertex;
+use megu_client_mesh::{DirectionBuckets, HiZPyramid, SectionCoord, DIRECTION_BUCKETS};
 
 use crate::renderer::{section_geometry, view_proj_row_major, LiveSectionGeometry};
 use crate::Mat4;

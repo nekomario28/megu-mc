@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Live W1/W3 protocol-767 contracts against the real mc-spine binary.
+"""Live W1/W3 protocol-767 contracts against the real megu binary.
 
 W3 login admission (pre-seeded banned-players.json and whitelist.json), the
 W1 P3-B server-ops command packets a level-4 operator receives (0x77/0x41 on
@@ -153,10 +153,10 @@ def live_server(binary, root, extra_env=None):
     game = port()
     # The binary negotiates vanilla's 256-byte compression threshold by default;
     # protocol767.Client speaks that framing, so the default stays enabled.
-    env = dict(os.environ, MC_SPINE_PORT=str(game), MC_SPINE_BIND_ADDR="127.0.0.1",
-               MC_SPINE_WG="old", MC_SPINE_RESOURCE_PACK_URL="")
-    env.pop("MC_SPINE_RCON_PORT", None)
-    env.setdefault("MC_SPINE_ANTICHEAT", "off")
+    env = dict(os.environ, MEGU_PORT=str(game), MEGU_BIND_ADDR="127.0.0.1",
+               MEGU_WG="old", MEGU_RESOURCE_PACK_URL="")
+    env.pop("MEGU_RCON_PORT", None)
+    env.setdefault("MEGU_ANTICHEAT", "off")
     if extra_env:
         env.update(extra_env)
     with (root / "server.log").open("w+") as log:
@@ -201,7 +201,7 @@ def seed_admission_files(root):
 
 def admission_and_console(binary, root):
     seed_admission_files(root)
-    with live_server(binary, root, {"MC_SPINE_WHITELIST": "1"}) as (game, proc, log):
+    with live_server(binary, root, {"MEGU_WHITELIST": "1"}) as (game, proc, log):
         # W3: a banned name gets the Login Disconnect before Login Success.
         require("banned" in refused_login(game, BANNED), "ban-refusal-text")
         # W3: enforcement on, name absent from whitelist.json, not an operator.
@@ -247,7 +247,7 @@ def admission_and_console(binary, root):
 
 
 def anvil_cli(binary, root):
-    env = dict(os.environ, MC_SPINE_WG="old")
+    env = dict(os.environ, MEGU_WG="old")
     out = root / "exported-world"
     export = subprocess.run([str(binary), "--export-anvil", str(out)],
                             cwd=root, env=env, capture_output=True, text=True,
@@ -276,7 +276,7 @@ def main(binary):
 
 if __name__ == "__main__":
     binary = Path(sys.argv[1]).resolve() if len(sys.argv) > 1 else (
-        ROOT / "target/debug/mc-spine")
+        ROOT / "target/debug/megu")
     try:
         main(binary)
     except ContractFailure as error:

@@ -79,8 +79,8 @@ def stop_on_stdin():
             os._exit(0)
 
 
-port = int(os.environ["MC_SPINE_PORT"])
-assert os.environ["MC_SPINE_BIND_ADDR"] == "127.0.0.1"
+port = int(os.environ["MEGU_PORT"])
+assert os.environ["MEGU_BIND_ADDR"] == "127.0.0.1"
 assert os.environ["TMPDIR"] == os.getcwd()
 assert os.environ["TEMP"] == os.getcwd()
 threading.Thread(target=stop_on_stdin, daemon=True).start()
@@ -128,7 +128,7 @@ class MeguBenchTests(unittest.TestCase):
             self.assertEqual(plan["pings_per_run"], 10)
             self.assertEqual(plan["protocol"], 767)
             self.assertEqual(plan["command"], [sys.executable, str(fake.resolve())])
-            self.assertEqual(plan["environment_overrides"]["MC_SPINE_PORT"],
+            self.assertEqual(plan["environment_overrides"]["MEGU_PORT"],
                              "<ephemeral per run>")
             self.assertFalse(receipt.exists())
 
@@ -187,7 +187,7 @@ class MeguBenchTests(unittest.TestCase):
                "active_rss_mib": 13.0, "idle_threads": 2,
                "active_threads": 3, "ping_rtt_ms": 0.5}
         receipt = {"schema": bench.SCHEMA, "binary": "/example/server", "runs": [run],
-                   "flags": {"MC_SPINE_BIND_ADDR": "127.0.0.1"},
+                   "flags": {"MEGU_BIND_ADDR": "127.0.0.1"},
                    "hardware": {"cpu": "Example CPU", "logical_cpus": 4,
                                 "ram_mib": 8192.0, "os": "Example OS"},
                    "metrics": bench.aggregate([run]), "note": bench.NOTE}
@@ -235,7 +235,7 @@ class MeguBenchTests(unittest.TestCase):
                     self.assertGreater(run["active_threads"], 0)
             self.assertEqual(marker.read_bytes(), b"stop\nstop\n")
             self.assertEqual(list(root.glob("megu-bench-*")), [])
-            self.assertEqual(report["flags"]["MC_SPINE_BIND_ADDR"], "127.0.0.1")
+            self.assertEqual(report["flags"]["MEGU_BIND_ADDR"], "127.0.0.1")
 
 
 if __name__ == "__main__":

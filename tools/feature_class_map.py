@@ -59,7 +59,7 @@ def main():
         (work / 'types.txt').write_text('\n'.join(types) + '\n')
         output = work / 'feature_classes.tsv'
         run_probe(work, cp, ROOT / 'tools/structure-oracle/FeatureClassMap.java',
-                  'dev.mcspine.tools.FeatureClassMap', work / 'types.txt', output)
+                  'dev.megu.tools.FeatureClassMap', work / 'types.txt', output)
         actual = output.read_bytes()
     if args.write:
         VECTORS.write_bytes(actual)

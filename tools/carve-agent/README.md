@@ -118,7 +118,7 @@ captures seed 0 with structures disabled. It refuses overwrite, authenticates
 the supplied 1.21.1 bundler and uses the existing cached ASM dependency; it does
 not download or execute a newly fetched artifact.
 
-Set `MC_SPINE_VANILLA_SERVER_JAR` (or the existing fixture base), then run only
+Set `MEGU_VANILLA_SERVER_JAR` (or the existing fixture base), then run only
 after host resource admission, inside a bounded scope. The server uses a 1GB
 heap and two active processors; the measured capture scope was limited to
 1800MB and one CPU. Use disk-backed `TMPDIR` if tmpfs is full. The driver does

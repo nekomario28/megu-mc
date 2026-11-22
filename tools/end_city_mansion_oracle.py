@@ -211,7 +211,7 @@ def main():
                 runtime,
                 cp,
                 native / 'EndCityMansionOracle.java',
-                'dev.mcspine.tools.EndCityMansionOracle',
+                'dev.megu.tools.EndCityMansionOracle',
                 source,
                 actual,
                 ROOT,

@@ -16,7 +16,7 @@ def main():
     with pinned_runtime(args.jar) as (work, cp, _):
         output = work/'rings.tsv'
         run_probe(work, cp, ROOT/'tools/structure-oracle/ConcentricRingsOracle.java',
-                  'dev.mcspine.tools.ConcentricRingsOracle', output)
+                  'dev.megu.tools.ConcentricRingsOracle', output)
         actual = output.read_bytes()
     if args.write:
         VECTORS.write_bytes(actual)

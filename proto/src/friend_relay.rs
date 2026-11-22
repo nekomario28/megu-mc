@@ -78,7 +78,7 @@ use std::io::{self, Read, Write};
 use std::net::{SocketAddr, TcpListener, TcpStream};
 use std::time::{Duration, Instant};
 
-use mc_spine_core::random::Xoroshiro128pp;
+use megu_core::random::Xoroshiro128pp;
 
 use crate::wire::{ProtoError, WireReader, WireWriter};
 

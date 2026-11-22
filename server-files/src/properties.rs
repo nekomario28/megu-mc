@@ -946,7 +946,7 @@ mod tests {
     #[test]
     fn load_from_enforces_size_boundary_and_rejects_malformed_escapes() {
         let path = std::env::temp_dir().join(format!(
-            "mc-spine-properties-boundary-{}.properties",
+            "megu-properties-boundary-{}.properties",
             std::process::id()
         ));
         let valid = format!("k={}", "a".repeat(MAX_PROPERTIES_BYTES - 2));

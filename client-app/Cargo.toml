@@ -1,23 +1,23 @@
 [package]
-name = "mc-spine-client"
+name = "megu-client"
 version = "0.1.0"
 edition = "2021"
 license = "LGPL-3.0-or-later"
-description = "Standalone native Minecraft 1.21.1 (Protocol 767) client executable for mc-spine"
+description = "Standalone native Minecraft 1.21.1 (Protocol 767) client executable for megu"
 publish = false
 
 [lib]
-name = "mc_spine_client"
+name = "megu_client"
 path = "src/lib.rs"
 
 [[bin]]
-name = "mc-spine-client"
+name = "megu-client"
 path = "src/main.rs"
 
 [dependencies]
-mc_spine_kernel = { package = "mc-spine-kernel", path = "../client-kernel" }
-mc_spine_client_mesh = { package = "mc-spine-client-mesh", path = "../client-port" }
-mc_spine_proto = { package = "mc-spine-proto", path = "../proto" }
+megu_kernel = { package = "megu-kernel", path = "../client-kernel" }
+megu_client_mesh = { package = "megu-client-mesh", path = "../client-port" }
+megu_proto = { package = "megu-proto", path = "../proto" }
 symphonia = { version = "=0.5.5", default-features = false, features = ["ogg", "vorbis"] }
 
 [profile.release]

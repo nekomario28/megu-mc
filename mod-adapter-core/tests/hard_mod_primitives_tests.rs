@@ -17,7 +17,7 @@ struct ScratchDir(PathBuf);
 impl ScratchDir {
     fn new() -> Self {
         let path = std::env::temp_dir().join(format!(
-            "mc-spine-hard-mod-adaptation-{}-{}",
+            "megu-hard-mod-adaptation-{}-{}",
             std::process::id(),
             NEXT_SCRATCH.fetch_add(1, Ordering::Relaxed)
         ));

@@ -84,7 +84,7 @@ flowchart TD
 ### 4.2 座標変換と乗客追従
 
 - `local_to_world(p) = pos + R·p`、`world_to_local(p) = Rᵀ·(p − pos)`（共役による厳密逆変換）。
-- `passenger_world_delta(local_offset, dt) = (v + ω × (R·offset))·dt` — 有限差分一致を単体テストで固定。`mc-spine` の `ac_note_carried_motion` フックへ直接供給する設計で、飛行艇の操縦者・乗客がアンチチートでラバーバンドしない。
+- `passenger_world_delta(local_offset, dt) = (v + ω × (R·offset))·dt` — 有限差分一致を単体テストで固定。`megu` の `ac_note_carried_motion` フックへ直接供給する設計で、飛行艇の操縦者・乗客がアンチチートでラバーバンドしない。
 
 ### 4.3 `AERO` v1 スナップショットコーデック
 

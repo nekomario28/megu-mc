@@ -536,16 +536,16 @@ const PLAYER_CLASSES: &[&str] = &[
     "net/minecraft/world/entity/player/ServerPlayer",
     "net/minecraft/world/entity/LivingEntity",
     "net/minecraft/world/entity/Entity",
-    "mcspine/api/Player",
-    "mcspine/Player",
+    "megu/api/Player",
+    "megu/Player",
 ];
 
 const LEVEL_CLASSES: &[&str] = &[
     "net/minecraft/world/level/Level",
     "net/minecraft/world/level/LevelAccessor",
     "net/minecraft/server/level/ServerLevel",
-    "mcspine/api/Level",
-    "mcspine/Level",
+    "megu/api/Level",
+    "megu/Level",
 ];
 
 /// Forge/NeoForge damage events plus the clean symbolic event surface.
@@ -553,9 +553,9 @@ const EVENT_CLASSES: &[&str] = &[
     "net/minecraftforge/event/entity/living/LivingDamageEvent",
     "net/minecraftforge/event/entity/living/LivingHurtEvent",
     "net/neoforged/neoforge/event/entity/living/LivingDamageEvent",
-    "mcspine/api/Event",
-    "mcspine/api/DamageEvent",
-    "mcspine/Event",
+    "megu/api/Event",
+    "megu/api/DamageEvent",
+    "megu/Event",
 ];
 
 // ---------------------------------------------------------------------------
@@ -640,10 +640,10 @@ const NEOFORGE_1211_EVENTS: &[&str] = &[
 const MATH_CLASSES: &[&str] = &[
     "java/lang/Math",
     "net/minecraft/util/Mth",
-    "mcspine/api/Math",
+    "megu/api/Math",
 ];
 
-const CLAMP_CLASSES: &[&str] = &["net/minecraft/util/Mth", "mcspine/api/Math"];
+const CLAMP_CLASSES: &[&str] = &["net/minecraft/util/Mth", "megu/api/Math"];
 
 const HOST_ALLOWLIST: &[HostAllow] = &[
     HostAllow {
@@ -1107,7 +1107,7 @@ fn read_constant_pool(r: &mut Cursor<'_>, count: u16) -> Result<ConstantPool, Vm
 pub struct ParsedMethod {
     /// Method name (`CONSTANT_Utf8` at `name_index`).
     pub name: String,
-    /// Method descriptor, e.g. `(Lmcspine/api/Event;)V`.
+    /// Method descriptor, e.g. `(Lmegu/api/Event;)V`.
     pub descriptor: String,
     /// `access_flags` — `ACC_STATIC` etc. Informational: the subset
     /// executes instance and static methods identically, seeding locals
@@ -2595,8 +2595,8 @@ pub mod testkit {
     /// Usage:
     /// ```text
     /// let mut a = ClassAssembler::new("com/acme/Hook");
-    /// let mr = a.cp.method_ref("mcspine/api/Event", "getDamage", "()F");
-    /// let bytes = a.finish(&[MethodSpec::new("onDamage", "(Lmcspine/api/Event;)V", 4, 2, code)]);
+    /// let mr = a.cp.method_ref("megu/api/Event", "getDamage", "()F");
+    /// let bytes = a.finish(&[MethodSpec::new("onDamage", "(Lmegu/api/Event;)V", 4, 2, code)]);
     /// ```
     pub struct ClassAssembler {
         /// The constant pool under construction — intern strings,

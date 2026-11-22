@@ -18,7 +18,7 @@ use crate::lists::{
 };
 use crate::properties::{ServerProperties, PROPERTIES_FILE};
 use crate::usercache::{UserCache, USERCACHE_FILE};
-use mc_spine_core::version::TargetVersion;
+use megu_core::version::TargetVersion;
 use std::io;
 use std::path::{Path, PathBuf};
 
@@ -39,7 +39,7 @@ impl AdmissionDecision {
 
 /// Every file a Vanilla dedicated server owns in its working directory, plus
 /// the [`TargetVersion`] the server runs — the version registry in
-/// `mc-spine-core` is the single source of truth, so a directory pins it
+/// `megu-core` is the single source of truth, so a directory pins it
 /// once instead of re-deriving it.
 ///
 /// The registries are public fields: commands and the ops/whitelist/ban

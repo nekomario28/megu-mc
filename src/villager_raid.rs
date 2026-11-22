@@ -3423,7 +3423,7 @@ fn live_raid_omen_tick() {
 #[cfg_attr(not(test), allow(dead_code))]
 fn live_raid_bar_id(dim: DimId, center: BlockPos) -> String {
     format!(
-        "mc-spine:raid-{}-{}-{}-{}",
+        "megu:raid-{}-{}-{}-{}",
         dim.raw(),
         center.0,
         center.1,

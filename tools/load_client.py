@@ -2,7 +2,7 @@
 """Representative-load CLI driver for the server comparison.
 
 Speaks protocol 767 with or without negotiated compression, so the same driver
-drives both vanilla 1.21.1 and mc-spine from the same movement script. It consumes and
+drives both vanilla 1.21.1 and megu from the same movement script. It consumes and
 acknowledges packets but never decodes chunk bodies: the point is to make both
 servers do the same work (stream chunks for a moving viewer, tick the world),
 not to assert one server's chunk format.
@@ -15,7 +15,7 @@ between Chunk Batch Start (0x0B) and Chunk Batch Finished (0x0C), and after
 0x0C it sends nothing more until the client answers with Chunk Batch Received
 (0x08) carrying a big-endian f32 chunks-per-tick. A driver that never answers
 receives exactly one batch and stalls; measured, vanilla delivered nine login
-chunks and zero during the movement drive while mc-spine sent its whole view.
+chunks and zero during the movement drive while megu sent its whole view.
 This driver acknowledges every batch, confirms the initial Synchronize Player
 Position (0x40) before moving - a server that is awaiting a teleport confirm
 ignores movement - and drains every readable packet between 20 Hz movement
@@ -131,7 +131,7 @@ class RawClient:
     def note_rtt(self, body):
         """Vanilla puts its send time in the keepalive id, so its age is an RTT.
 
-        mc-spine counts keepalives (1, 2, 3, ...), which is not a timestamp: the
+        megu counts keepalives (1, 2, 3, ...), which is not a timestamp: the
         sample is left at None rather than reported as a nonsense duration.
         """
         if len(body) < 8:

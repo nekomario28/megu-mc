@@ -64,7 +64,7 @@ def main():
             work,
             classpath,
             REPO / "tools/structure-oracle/TemplateEntityOracle.java",
-            "dev.mcspine.tools.TemplateEntityOracle",
+            "dev.megu.tools.TemplateEntityOracle",
             extra_sources=(REPO / "tools/structure-oracle/NativeHarness.java",),
             capture=True,
         )

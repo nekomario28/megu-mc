@@ -147,7 +147,7 @@ def main():
                   src / "NativeFluidTags.java")
         for target in (left, right):
             run_probe(work, classpath, src / "NativeNeighborTraceOracle.java",
-                      "dev.mcspine.tools.NativeNeighborTraceOracle", target,
+                      "dev.megu.tools.NativeNeighborTraceOracle", target,
                       extra_sources=extras)
             with target.open(encoding="utf-8") as rows:
                 summary = validate_trace(rows)
@@ -160,7 +160,7 @@ def main():
         delivery_source = src / "NativeTraceDeliveryOracle.java"
         for target in (delivered_a, delivered_b):
             run_probe(work, classpath, delivery_source,
-                      "dev.mcspine.tools.NativeTraceDeliveryOracle", left, target)
+                      "dev.megu.tools.NativeTraceDeliveryOracle", left, target)
             with left.open(encoding="utf-8") as requests, target.open(encoding="utf-8") as delivered:
                 delivery_count = validate_delivery(requests, delivered)
         if delivered_a.read_bytes() != delivered_b.read_bytes():

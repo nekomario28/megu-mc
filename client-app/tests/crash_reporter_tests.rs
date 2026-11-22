@@ -12,7 +12,7 @@ use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::Duration;
 
-use mc_spine_client::crash_reporter::{
+use megu_client::crash_reporter::{
     capture_panic_context, crash_file_path, install_panic_hook, parse_report_url,
     pending_file_path, set_active_stage, submit_crash_report, CrashSubmitPolicy, PanicSite,
     ReportEnv, ReportKind, ReportTransport, SessionReportDeduper, StdHttpReportTransport,
@@ -24,7 +24,7 @@ const TIMEOUT: Duration = Duration::from_secs(5);
 
 fn scratch_dir(tag: &str) -> PathBuf {
     let dir = std::env::temp_dir().join(format!(
-        "mc-spine-crash-{tag}-{}",
+        "megu-crash-{tag}-{}",
         std::process::id()
     ));
     std::fs::create_dir_all(&dir).unwrap();
@@ -34,7 +34,7 @@ fn scratch_dir(tag: &str) -> PathBuf {
 fn test_env() -> ReportEnv {
     ReportEnv {
         mc_version: "26.3".to_string(),
-        engine_version: "mc-spine-client 0.1.0".to_string(),
+        engine_version: "megu-client 0.1.0".to_string(),
         os: "linux-x86_64".to_string(),
         culprit: "create".to_string(),
         subsystem: None,
@@ -45,7 +45,7 @@ fn test_env() -> ReportEnv {
     }
 }
 
-fn crash_report(env: &ReportEnv, message: &str) -> mc_spine_client::crash_reporter::CrashReport {
+fn crash_report(env: &ReportEnv, message: &str) -> megu_client::crash_reporter::CrashReport {
     capture_panic_context(env, ReportKind::Crash, "panic", message, None)
 }
 
@@ -413,7 +413,7 @@ fn auto_crash_only_sends_crash_over_loopback_and_parses_receipt() {
     let relay = spawn_mock_relay(
         200,
         format!(
-            "{{\"ok\":true,\"fingerprint\":\"{fp}\",\"issue_url\":\"https://github.com/nekomario28/mc-spine/issues/42\",\"duplicate\":false,\"total_reports\":1}}",
+            "{{\"ok\":true,\"fingerprint\":\"{fp}\",\"issue_url\":\"https://github.com/nekomario28/megu-mc/issues/42\",\"duplicate\":false,\"total_reports\":1}}",
             fp = report.fingerprint
         ),
         1,
@@ -438,7 +438,7 @@ fn auto_crash_only_sends_crash_over_loopback_and_parses_receipt() {
         } => {
             assert_eq!(
                 receipt.issue_url.as_deref(),
-                Some("https://github.com/nekomario28/mc-spine/issues/42")
+                Some("https://github.com/nekomario28/megu-mc/issues/42")
             );
             assert_eq!(receipt.fingerprint.as_deref(), Some(report.fingerprint.as_str()));
             assert!(!receipt.deduped);
@@ -460,7 +460,7 @@ fn auto_crash_only_sends_crash_over_loopback_and_parses_receipt() {
         "\"kind\":\"crash\"",
         fp_field.as_str(),
         "\"mc_version\":\"26.3\"",
-        "\"engine_version\":\"mc-spine-client 0.1.0\"",
+        "\"engine_version\":\"megu-client 0.1.0\"",
         "\"os\":\"linux-x86_64\"",
         "\"summary\":\"",
         "\"culprit\":\"create\"",

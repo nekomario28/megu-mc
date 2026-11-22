@@ -9,7 +9,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 
 /// The runtime switch, default on so existing behaviour and tests are
 /// unchanged. [`set_anti_xray_enabled`] flips it for the whole process;
-/// [`init_anti_xray_from_env`] seeds it from `MC_SPINE_ANTI_XRAY`.
+/// [`init_anti_xray_from_env`] seeds it from `MEGU_ANTI_XRAY`.
 #[cfg_attr(not(test), allow(dead_code))]
 static ANTI_XRAY_ENABLED: AtomicBool = AtomicBool::new(true);
 
@@ -25,12 +25,12 @@ pub(crate) fn set_anti_xray_enabled(on: bool) {
     ANTI_XRAY_ENABLED.store(on, Ordering::Relaxed);
 }
 
-/// Seed the runtime switch from `MC_SPINE_ANTI_XRAY`: `0`/`false`/`off`/`no`
+/// Seed the runtime switch from `MEGU_ANTI_XRAY`: `0`/`false`/`off`/`no`
 /// disable; `1`/`true`/`on`/`yes` enable; unset or unrecognised keeps the
 /// default, on.
 #[cfg_attr(not(test), allow(dead_code))]
 pub(crate) fn init_anti_xray_from_env() {
-    let on = std::env::var("MC_SPINE_ANTI_XRAY")
+    let on = std::env::var("MEGU_ANTI_XRAY")
         .map(|v| super::anti_xray_value_enabled(&v))
         .unwrap_or(true);
     ANTI_XRAY_ENABLED.store(on, Ordering::Relaxed);
@@ -179,17 +179,17 @@ mod antixray_tests {
             ("on", true),
             ("yes", true),
         ] {
-            std::env::set_var("MC_SPINE_ANTI_XRAY", value);
+            std::env::set_var("MEGU_ANTI_XRAY", value);
             init_anti_xray_from_env();
             assert_eq!(anti_xray_enabled(), expected, "{value}");
         }
-        std::env::remove_var("MC_SPINE_ANTI_XRAY");
+        std::env::remove_var("MEGU_ANTI_XRAY");
         init_anti_xray_from_env();
         assert!(anti_xray_enabled(), "unset defaults on");
-        std::env::set_var("MC_SPINE_ANTI_XRAY", "bogus");
+        std::env::set_var("MEGU_ANTI_XRAY", "bogus");
         init_anti_xray_from_env();
         assert!(anti_xray_enabled(), "unrecognised defaults on");
-        std::env::remove_var("MC_SPINE_ANTI_XRAY");
+        std::env::remove_var("MEGU_ANTI_XRAY");
         set_anti_xray_enabled(true);
     }
 }

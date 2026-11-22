@@ -5,7 +5,7 @@
 //! and machines keep ticking in flight), a deterministic fixed-step 20 TPS
 //! integrator (thrust, rudder torque, altitude-tapered buoyancy, quadratic
 //! drag, Euler angular dynamics), exact coordinate transforms and passenger
-//! carry deltas for `mc-spine`'s `ac_note_carried_motion` anti-cheat hook,
+//! carry deltas for `megu`'s `ac_note_carried_motion` anti-cheat hook,
 //! and a deterministic binary `AERO` v1 Save codec.
 
 use std::collections::{BTreeMap, BTreeSet};
@@ -598,7 +598,7 @@ impl RigidBodySubWorld {
     /// Exact world-space displacement of a carried passenger over `dt` given
     /// their rigid-body point `local_offset` (the rider's local position
     /// measured from [`Self::center_of_mass`]): `(v + ω × (R·offset)) * dt`.
-    /// Feeds `mc-spine`'s `ac_note_carried_motion` hook so anti-cheat never
+    /// Feeds `megu`'s `ac_note_carried_motion` hook so anti-cheat never
     /// rubber-bands airship pilots or passengers.
     pub fn passenger_world_delta(&self, local_offset: [f64; 3], dt: f64) -> [f64; 3] {
         let r_world = quat_rotate(self.quat, local_offset);

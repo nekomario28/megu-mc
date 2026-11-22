@@ -11,17 +11,17 @@
 
 use std::path::PathBuf;
 
-use mc_spine_client::protocol::{encode_slot_stack, ClientPlayEvent, PlayEvent};
-use mc_spine_client_gpu::live_session::{LiveSession, SessionStatus};
-use mc_spine_client_gpu::recipe_ingest::{
+use megu_client::protocol::{encode_slot_stack, ClientPlayEvent, PlayEvent};
+use megu_client_gpu::live_session::{LiveSession, SessionStatus};
+use megu_client_gpu::recipe_ingest::{
     ingest_mod_jars_into_ui, ingest_mod_recipes_into_ui,
 };
-use mc_spine_client_gpu::window::{GpuApp, RecipeFocus, WindowInputEvent};
-use mc_spine_client_gpu::GpuCliConfig;
-use mc_spine_ui::recipe_browser::{
+use megu_client_gpu::window::{GpuApp, RecipeFocus, WindowInputEvent};
+use megu_client_gpu::GpuCliConfig;
+use megu_ui::recipe_browser::{
     BrowserTab, DetailMode, RecipeBrowserAction, RecipeBrowserState, RecipeCategory,
 };
-use mc_spine_ui::state::{Screen, UiAction};
+use megu_ui::state::{Screen, UiAction};
 
 // ---------------------------------------------------------------------------
 // Clean-room fixtures (no external crates — mirrors the playpath_123 pattern)
@@ -32,7 +32,7 @@ struct TempDir(PathBuf);
 impl TempDir {
     fn new(tag: &str) -> Self {
         let dir =
-            std::env::temp_dir().join(format!("mc-spine-jeiwire-{tag}-{}", std::process::id()));
+            std::env::temp_dir().join(format!("megu-jeiwire-{tag}-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         Self(dir)
@@ -536,7 +536,7 @@ fn jei_ingest_reads_loose_datapack_dir_and_plural_layouts() {
     )
     .unwrap();
 
-    let paths = mc_spine_client_gpu::live_session::SessionPaths {
+    let paths = megu_client_gpu::live_session::SessionPaths {
         game_dir: Some(tmp.0.join("game")),
         ..Default::default()
     };

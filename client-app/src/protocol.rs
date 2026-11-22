@@ -8,23 +8,23 @@ use std::net::{SocketAddr, TcpStream};
 use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant};
 
-use mc_spine_proto::{PacketDir, PacketPhase, ProtocolCodec, RecipeSyncMode};
+use megu_proto::{PacketDir, PacketPhase, ProtocolCodec, RecipeSyncMode};
 
 use crate::online_auth::{self, Aes128Cfb8, OnlineAuthOptions, SessionJoinClient};
 use crate::render::ClientVfxHost;
 use crate::world::WorldAnimationHost;
-use mc_spine_client_mesh::vfx_engine::Vfx1Packet;
-use mc_spine_kernel::skeletal_anim::decode_animation_trigger;
+use megu_client_mesh::vfx_engine::Vfx1Packet;
+use megu_kernel::skeletal_anim::decode_animation_trigger;
 
 /// Protocol 767 / Minecraft 1.21.1 — the single canonical version constant,
-/// sourced from `mc-spine-proto` rather than a local literal.
-pub const PROTOCOL_767: i32 = mc_spine_proto::ProtocolVersion::V1_21_1.number();
+/// sourced from `megu-proto` rather than a local literal.
+pub const PROTOCOL_767: i32 = megu_proto::ProtocolVersion::V1_21_1.number();
 pub const MAX_PACKET_SIZE: usize = 16 * 1024 * 1024;
-pub const CHANNEL_MAGIC_V1: &str = "mc-spine:magic_v1";
-pub const CHANNEL_VFX_V1: &str = "mc-spine:vfx_v1";
-pub const CHANNEL_ANIM_V1: &str = "mc-spine:anim_v1";
-pub const CHANNEL_MOTION_V1: &str = "mc-spine:motion_v1";
-pub const CHANNEL_SEASON_V1: &str = "mc-spine:season_v1";
+pub const CHANNEL_MAGIC_V1: &str = "megu:magic_v1";
+pub const CHANNEL_VFX_V1: &str = "megu:vfx_v1";
+pub const CHANNEL_ANIM_V1: &str = "megu:anim_v1";
+pub const CHANNEL_MOTION_V1: &str = "megu:motion_v1";
+pub const CHANNEL_SEASON_V1: &str = "megu:season_v1";
 /// Product-level alias the "megu" custom-payload family is addressed by on
 /// some peers; decoded identically to [`CHANNEL_SEASON_V1`].
 pub const CHANNEL_MEGU_SEASON: &str = "megu:season";
@@ -509,20 +509,20 @@ impl<'a> WireReader<'a> {
         Ok(f64::from_be_bytes(self.take(8)?.try_into().unwrap()))
     }
 
-    /// Delegated to `mc_spine_proto`'s canonical reader — identical bounds
+    /// Delegated to `megu_proto`'s canonical reader — identical bounds
     /// (final byte `& 0xf0` rejected, five bytes max); the `String` error
     /// surface this module's callers use is kept.
     pub fn read_varint(&mut self) -> Result<i32, String> {
-        let mut r = mc_spine_proto::WireReader::new(self.rest());
+        let mut r = megu_proto::WireReader::new(self.rest());
         let value = r.read_varint().map_err(|e| e.to_string())?;
         self.pos += r.position();
         Ok(value)
     }
 
-    /// Delegated to `mc_spine_proto`'s canonical reader — identical bounds
+    /// Delegated to `megu_proto`'s canonical reader — identical bounds
     /// (final byte `& 0xfe` rejected, ten bytes max).
     pub fn read_varlong(&mut self) -> Result<i64, String> {
-        let mut r = mc_spine_proto::WireReader::new(self.rest());
+        let mut r = megu_proto::WireReader::new(self.rest());
         let value = r.read_varlong().map_err(|e| e.to_string())?;
         self.pos += r.position();
         Ok(value)
@@ -727,16 +727,16 @@ impl NbtValue {
     }
 }
 
-/// Delegated to `mc_spine_proto`'s canonical `WireWriter` — `from_vec`
+/// Delegated to `megu_proto`'s canonical `WireWriter` — `from_vec`
 /// appends in place, so no copy of the caller's buffer is made.
 pub fn write_varint(buf: &mut Vec<u8>, value: i32) {
-    let mut w = mc_spine_proto::WireWriter::from_vec(std::mem::take(buf));
+    let mut w = megu_proto::WireWriter::from_vec(std::mem::take(buf));
     w.write_varint(value);
     *buf = w.into_vec();
 }
 
 pub fn write_varlong(buf: &mut Vec<u8>, value: i64) {
-    let mut w = mc_spine_proto::WireWriter::from_vec(std::mem::take(buf));
+    let mut w = megu_proto::WireWriter::from_vec(std::mem::take(buf));
     w.write_varlong(value);
     *buf = w.into_vec();
 }
@@ -746,15 +746,15 @@ pub fn write_string(buf: &mut Vec<u8>, s: &str) {
     buf.extend_from_slice(s.as_bytes());
 }
 
-/// `x:26 | z:26 | y:12` packing, delegated to `mc_spine_proto::BlockPos`.
+/// `x:26 | z:26 | y:12` packing, delegated to `megu_proto::BlockPos`.
 pub fn pack_position(pos: [i32; 3]) -> i64 {
     let [x, y, z] = pos;
-    mc_spine_proto::BlockPos::new(x, y, z).pack()
+    megu_proto::BlockPos::new(x, y, z).pack()
 }
 
 /// Inverse of [`pack_position`], sign-extending each field.
 pub fn unpack_position(packed: i64) -> [i32; 3] {
-    let p = mc_spine_proto::BlockPos::unpack(packed);
+    let p = megu_proto::BlockPos::unpack(packed);
     [p.x, p.y, p.z]
 }
 
@@ -1469,7 +1469,7 @@ impl ChunkDecodeProfile {
     /// long-array light masks.
     pub fn v767() -> Self {
         Self {
-            state_count: mc_spine_kernel::STATE_COUNT as usize,
+            state_count: megu_kernel::STATE_COUNT as usize,
             heightmaps_are_records: false,
             byte_array_light_masks: false,
         }
@@ -2365,7 +2365,7 @@ pub enum ClientPlayEvent {
 // ---------------------------------------------------------------------------
 //
 // Packet layouts follow the canonical 1.21.1 (protocol 767) schemas resolved
-// through `mc_spine_proto`'s packet table — names, never hardcoded ids. Every
+// through `megu_proto`'s packet table — names, never hardcoded ids. Every
 // reader is bounded: counts are capped by remaining input or explicit limits,
 // NBT goes through the depth/array-bounded `WireReader::read_nbt`, and `Slot`
 // payloads are skipped by a fail-closed walker that mirrors the server-side
@@ -3025,7 +3025,7 @@ pub struct TransferTarget {
 }
 
 /// Handle one decoded play-phase `transfer` instruction: validate the
-/// advertised `host`/`port` (matching `mc_spine_proto`'s wire-side
+/// advertised `host`/`port` (matching `megu_proto`'s wire-side
 /// `validate_transfer` rules) and return the reconnect target the session
 /// should dial next. Fails closed on empty/oversized hosts and
 /// out-of-range ports so a hostile packet cannot steer the reconnect.
@@ -3995,7 +3995,7 @@ pub fn decode_extended_play_event(name: &str, body: &[u8]) -> Result<Option<Play
 // ---------------------------------------------------------------------------
 //
 // Each helper returns `(packet_name, payload)`: the canonical 767 packet name
-// that `mc_spine_proto`'s table resolves to the version-correct packet id at
+// that `megu_proto`'s table resolves to the version-correct packet id at
 // send time (via `ProtocolClient::send_named` / `c2s_id`), plus the encoded
 // body. Names come from the Protocol 767 table — never hardcoded ids.
 
@@ -4365,7 +4365,7 @@ pub struct ProtocolClient {
     dimension_types_by_id: HashMap<i32, (i32, i32, bool)>,
     dimension_types_by_name: HashMap<String, (i32, i32, bool)>,
     /// Upper bound on global block-state ids for `level_chunk_with_light`
-    /// decoding (`mc_spine_kernel::STATE_COUNT` with the pinned assets);
+    /// decoding (`megu_kernel::STATE_COUNT` with the pinned assets);
     /// `sim` reseeds it from `WorldState::state_count` so `--version-dir`
     /// packs bound the global palette correctly.
     pub block_state_count: usize,
@@ -4373,7 +4373,7 @@ pub struct ProtocolClient {
     pub biome_count: usize,
     /// The protocol version this client offered in its handshake
     /// (`V1_21_1`/`767` by default, `V26_3`/`777` via `--mc-version`).
-    pub protocol_version: mc_spine_proto::ProtocolVersion,
+    pub protocol_version: megu_proto::ProtocolVersion,
     pub packets_rx: u64,
     pub packets_tx: u64,
     /// Decoded `sound_effect`/`sound_entity` payloads, retained bounded for
@@ -4408,7 +4408,7 @@ impl ProtocolClient {
     fn on_stream(
         stream: TcpStream,
         codec: Arc<dyn ProtocolCodec>,
-        protocol_version: mc_spine_proto::ProtocolVersion,
+        protocol_version: megu_proto::ProtocolVersion,
         auth: OnlineAuthOptions,
     ) -> Self {
         Self {
@@ -4418,7 +4418,7 @@ impl ProtocolClient {
             codec,
             dimension_types_by_id: HashMap::new(),
             dimension_types_by_name: HashMap::new(),
-            block_state_count: mc_spine_kernel::STATE_COUNT as usize,
+            block_state_count: megu_kernel::STATE_COUNT as usize,
             dimension: DimensionMeta::default(),
             biome_count: 64,
             protocol_version,
@@ -4503,7 +4503,7 @@ impl ProtocolClient {
             uuid,
             view_distance,
             timeout,
-            mc_spine_proto::ProtocolVersion::V1_21_1,
+            megu_proto::ProtocolVersion::V1_21_1,
         )
     }
 
@@ -4518,7 +4518,7 @@ impl ProtocolClient {
         uuid: [u8; 16],
         view_distance: i8,
         timeout: Duration,
-        protocol_version: mc_spine_proto::ProtocolVersion,
+        protocol_version: megu_proto::ProtocolVersion,
     ) -> Result<(Self, HandshakeReport), String> {
         Self::connect_resolved(
             host,
@@ -4528,7 +4528,7 @@ impl ProtocolClient {
             view_distance,
             timeout,
             protocol_version,
-            |h, p| mc_spine_proto::resolve_server_address(h, p).map_err(|e| e.to_string()),
+            |h, p| megu_proto::resolve_server_address(h, p).map_err(|e| e.to_string()),
             OnlineAuthOptions::default(),
         )
     }
@@ -4544,7 +4544,7 @@ impl ProtocolClient {
         uuid: [u8; 16],
         view_distance: i8,
         timeout: Duration,
-        protocol_version: mc_spine_proto::ProtocolVersion,
+        protocol_version: megu_proto::ProtocolVersion,
         auth: OnlineAuthOptions,
     ) -> Result<(Self, HandshakeReport), String> {
         Self::connect_resolved(
@@ -4555,7 +4555,7 @@ impl ProtocolClient {
             view_distance,
             timeout,
             protocol_version,
-            |h, p| mc_spine_proto::resolve_server_address(h, p).map_err(|e| e.to_string()),
+            |h, p| megu_proto::resolve_server_address(h, p).map_err(|e| e.to_string()),
             auth,
         )
     }
@@ -4571,11 +4571,11 @@ impl ProtocolClient {
         uuid: [u8; 16],
         view_distance: i8,
         timeout: Duration,
-        protocol_version: mc_spine_proto::ProtocolVersion,
+        protocol_version: megu_proto::ProtocolVersion,
         resolve: impl FnOnce(&str, u16) -> Result<Vec<SocketAddr>, String>,
         auth: OnlineAuthOptions,
     ) -> Result<(Self, HandshakeReport), String> {
-        let codec = mc_spine_proto::VersionRouter::with_v767_and_v777()
+        let codec = megu_proto::VersionRouter::with_v767_and_v777()
             .select(protocol_version.number())
             .map_err(|e| e.to_string())?;
         let addrs = resolve(host, port)?;
@@ -5583,7 +5583,7 @@ impl ProtocolClient {
 
 fn build_client_information(
     view_distance: i8,
-    caps: &mc_spine_proto::VersionCapabilities,
+    caps: &megu_proto::VersionCapabilities,
 ) -> Vec<u8> {
     let mut out = Vec::with_capacity(18);
     write_string(&mut out, "en_us");
@@ -5770,11 +5770,11 @@ fn status_ping_nonce() -> i64 {
 pub fn ping_server(
     host: &str,
     port: u16,
-    version: mc_spine_proto::ProtocolVersion,
+    version: megu_proto::ProtocolVersion,
     timeout: Duration,
 ) -> Result<ServerStatusPing, String> {
     ping_server_resolved(host, port, version, timeout, |h, p| {
-        mc_spine_proto::resolve_server_address(h, p).map_err(|e| e.to_string())
+        megu_proto::resolve_server_address(h, p).map_err(|e| e.to_string())
     })
 }
 
@@ -5785,11 +5785,11 @@ pub fn ping_server(
 pub fn ping_server_resolved(
     host: &str,
     port: u16,
-    version: mc_spine_proto::ProtocolVersion,
+    version: megu_proto::ProtocolVersion,
     timeout: Duration,
     resolve: impl FnOnce(&str, u16) -> Result<Vec<SocketAddr>, String>,
 ) -> Result<ServerStatusPing, String> {
-    let codec = mc_spine_proto::VersionRouter::with_v767_and_v777()
+    let codec = megu_proto::VersionRouter::with_v767_and_v777()
         .select(version.number())
         .map_err(|e| e.to_string())?;
     let addrs = resolve(host, port)?;

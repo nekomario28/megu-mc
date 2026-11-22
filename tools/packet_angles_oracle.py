@@ -46,7 +46,7 @@ def reference(jar):
     with pinned_runtime(jar) as (work, cp, _):
         src, dst = work / "input.json", work / "output.json"
         src.write_text(json.dumps({"cases": requested}))
-        run_probe(work, cp, SOURCE, "dev.mcspine.tools.PacketAnglesOracle", src, dst)
+        run_probe(work, cp, SOURCE, "dev.megu.tools.PacketAnglesOracle", src, dst)
         rows = json.loads(dst.read_text())
     if not rows or len(rows) != len(requested):
         raise ValueError("empty or truncated entity angles")

@@ -16,7 +16,7 @@ def main():
     with pinned_runtime(args.jar) as (work, cp, _):
         output = work / 'feature-order.json'
         run_probe(work, cp, ROOT / 'tools/structure-oracle/FeatureOrderOracle.java',
-                  'dev.mcspine.tools.FeatureOrderOracle', output)
+                  'dev.megu.tools.FeatureOrderOracle', output)
         actual = output.read_bytes()
     if args.write:
         VECTORS.write_bytes(actual)

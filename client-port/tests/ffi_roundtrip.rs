@@ -5,7 +5,7 @@ use std::{
     ptr,
 };
 
-use mc_spine_client_mesh::{ffi::*, *};
+use megu_client_mesh::{ffi::*, *};
 
 #[test]
 fn ffi_output_matches_rust_with_both_border_kinds_and_light_channels() {
@@ -31,7 +31,7 @@ fn ffi_output_matches_rust_with_both_border_kinds_and_light_channels() {
     assert_eq!(top.ao, [3, 3, 3, 2]);
 
     let input = MeshInput {
-        abi_version: mc_spine_mesh_abi_version(),
+        abi_version: megu_mesh_abi_version(),
         missing: ABI_AIR,
         blocks: view.blocks.as_ptr(),
         block_light: view.block_light.as_ptr(),
@@ -44,7 +44,7 @@ fn ffi_output_matches_rust_with_both_border_kinds_and_light_channels() {
     let mut count = 0;
     // SAFETY: input references live arrays, and the count slot is disjoint.
     assert_eq!(
-        unsafe { mc_spine_mesh_section(&input, ptr::null_mut(), 0, &mut count) },
+        unsafe { megu_mesh_section(&input, ptr::null_mut(), 0, &mut count) },
         ABI_OK
     );
     assert_eq!(count, expected.len());
@@ -52,7 +52,7 @@ fn ffi_output_matches_rust_with_both_border_kinds_and_light_channels() {
     let mut too_small = [expected[0]];
     // SAFETY: output is writable for the supplied capacity.
     assert_eq!(
-        unsafe { mc_spine_mesh_section(&input, too_small.as_mut_ptr(), 1, &mut count) },
+        unsafe { megu_mesh_section(&input, too_small.as_mut_ptr(), 1, &mut count) },
         ABI_BUFFER_TOO_SMALL
     );
     assert_eq!(count, expected.len());
@@ -61,7 +61,7 @@ fn ffi_output_matches_rust_with_both_border_kinds_and_light_channels() {
     let mut out = vec![MaybeUninit::<Quad>::uninit(); count];
     // SAFETY: the allocation has count writable slots, and input is unchanged.
     assert_eq!(
-        unsafe { mc_spine_mesh_section(&input, out.as_mut_ptr().cast(), out.len(), &mut count) },
+        unsafe { megu_mesh_section(&input, out.as_mut_ptr().cast(), out.len(), &mut count) },
         ABI_OK
     );
     assert_eq!(count, expected.len());
@@ -111,7 +111,7 @@ fn ffi_rejects_invalid_scalars_and_missing_required_buffers() {
         let mut count = 99;
         // SAFETY: all non-null input pointers are valid; count is writable.
         assert_eq!(
-            unsafe { mc_spine_mesh_section(&input, ptr::null_mut(), 0, &mut count) },
+            unsafe { megu_mesh_section(&input, ptr::null_mut(), 0, &mut count) },
             ABI_INVALID_ARGUMENT
         );
         assert_eq!(count, 0);
@@ -119,23 +119,23 @@ fn ffi_rejects_invalid_scalars_and_missing_required_buffers() {
     let mut count = 99;
     // SAFETY: input arrays and the count slot are live. Null output is rejected.
     assert_eq!(
-        unsafe { mc_spine_mesh_section(&valid, ptr::null_mut(), 1, &mut count) },
+        unsafe { megu_mesh_section(&valid, ptr::null_mut(), 1, &mut count) },
         ABI_INVALID_ARGUMENT
     );
     assert_eq!(count, 0);
     // SAFETY: null input is rejected before dereference.
     assert_eq!(
-        unsafe { mc_spine_mesh_section(ptr::null(), ptr::null_mut(), 0, &mut count) },
+        unsafe { megu_mesh_section(ptr::null(), ptr::null_mut(), 0, &mut count) },
         ABI_INVALID_ARGUMENT
     );
     // SAFETY: count is rejected before dereference.
     assert_eq!(
-        unsafe { mc_spine_mesh_section(&valid, ptr::null_mut(), 0, ptr::null_mut()) },
+        unsafe { megu_mesh_section(&valid, ptr::null_mut(), 0, ptr::null_mut()) },
         ABI_INVALID_ARGUMENT
     );
     // SAFETY: valid empty input and a writable count.
     assert_eq!(
-        unsafe { mc_spine_mesh_section(&valid, ptr::null_mut(), 0, &mut count) },
+        unsafe { megu_mesh_section(&valid, ptr::null_mut(), 0, &mut count) },
         ABI_OK
     );
     assert_eq!(count, 0);
@@ -203,20 +203,20 @@ fn column_skips_air_and_packs_the_maximum_height_endpoint() {
         for invalid_count in [0, ABI_MAX_COLUMN_SECTIONS + 1] {
             input.section_count = invalid_count;
             assert_eq!(
-                mc_spine_client_mesh_column(&input, ptr::null_mut(), 0, &mut count),
+                megu_client_mesh_column(&input, ptr::null_mut(), 0, &mut count),
                 ABI_INVALID_ARGUMENT
             );
             assert_eq!(count, 0);
         }
         input.section_count = 24;
         assert_eq!(
-            mc_spine_client_mesh_column(&input, ptr::null_mut(), 0, &mut count),
+            megu_client_mesh_column(&input, ptr::null_mut(), 0, &mut count),
             ABI_OK
         );
         assert_eq!(count, 0);
         input.section_count = sections.len();
         assert_eq!(
-            mc_spine_client_mesh_column(&input, quads.as_mut_ptr(), quads.len(), &mut count),
+            megu_client_mesh_column(&input, quads.as_mut_ptr(), quads.len(), &mut count),
             ABI_OK
         );
         assert_eq!(count, 6);
@@ -225,7 +225,7 @@ fn column_skips_air_and_packs_the_maximum_height_endpoint() {
         // vertex field, so packing fails closed instead of truncating.
         assert_eq!(quads[1].positions.map(|p| p[1]), [2048.0; 4]);
         assert_eq!(
-            mc_spine_client_mesh_pack_vertices(
+            megu_client_mesh_pack_vertices(
                 quads.as_ptr(),
                 quads.len(),
                 output.as_mut_ptr(),
@@ -261,14 +261,14 @@ fn column_skips_air_and_packs_the_maximum_height_endpoint() {
     // SAFETY: all non-null buffers are live, sized as supplied and disjoint.
     unsafe {
         assert_eq!(
-            mc_spine_client_mesh_column(&input, quads.as_mut_ptr(), quads.len(), &mut count),
+            megu_client_mesh_column(&input, quads.as_mut_ptr(), quads.len(), &mut count),
             ABI_OK
         );
         assert_eq!(count, 6);
         assert_eq!(quads[1].positions.map(|p| p[1]), [512.0; 4]);
 
         assert_eq!(
-            mc_spine_client_mesh_pack_vertices(
+            megu_client_mesh_pack_vertices(
                 quads.as_ptr(),
                 quads.len(),
                 output.as_mut_ptr(),
@@ -280,7 +280,7 @@ fn column_skips_air_and_packs_the_maximum_height_endpoint() {
         assert_eq!(count, 24);
         assert_eq!(output, [PackedVertex::default(); 24]);
         assert_eq!(
-            mc_spine_client_mesh_pack_vertices(
+            megu_client_mesh_pack_vertices(
                 quads.as_ptr(),
                 quads.len(),
                 output.as_mut_ptr(),
@@ -340,7 +340,7 @@ fn column_sealed_solid_flag_culls_without_changing_output() {
             ..input
         };
         assert_eq!(
-            mc_spine_client_mesh_column(&bad, ptr::null_mut(), 0, &mut count),
+            megu_client_mesh_column(&bad, ptr::null_mut(), 0, &mut count),
             ABI_INVALID_ARGUMENT
         );
         assert_eq!(count, 0);
@@ -351,19 +351,19 @@ fn column_sealed_solid_flag_culls_without_changing_output() {
         }];
         bad.sections = bad_flags.as_ptr();
         assert_eq!(
-            mc_spine_client_mesh_column(&bad, ptr::null_mut(), 0, &mut count),
+            megu_client_mesh_column(&bad, ptr::null_mut(), 0, &mut count),
             ABI_INVALID_ARGUMENT
         );
         assert_eq!(count, 0);
         // Hinted output must equal the unhinted expanded output.
         let mesh_all = |input: &MeshColumnInput, count: &mut usize| {
             assert_eq!(
-                mc_spine_client_mesh_column(input, ptr::null_mut(), 0, count),
+                megu_client_mesh_column(input, ptr::null_mut(), 0, count),
                 ABI_OK
             );
             let mut out = vec![MaybeUninit::<Quad>::uninit(); *count];
             assert_eq!(
-                mc_spine_client_mesh_column(input, out.as_mut_ptr().cast(), out.len(), count),
+                megu_client_mesh_column(input, out.as_mut_ptr().cast(), out.len(), count),
                 ABI_OK
             );
             out.into_iter()
@@ -409,7 +409,7 @@ fn translucent_sort_uses_camera_distance_and_preserves_index_order_on_ties() {
     unsafe {
         for bad in [f32::NAN, f32::NEG_INFINITY, f32::INFINITY] {
             assert_eq!(
-                mc_spine_client_mesh_sort_translucent(
+                megu_client_mesh_sort_translucent(
                     quads.as_ptr(),
                     quads.len(),
                     0.0,
@@ -424,7 +424,7 @@ fn translucent_sort_uses_camera_distance_and_preserves_index_order_on_ties() {
             assert_eq!(count, 0);
         }
         assert_eq!(
-            mc_spine_client_mesh_sort_translucent(
+            megu_client_mesh_sort_translucent(
                 quads.as_ptr(),
                 quads.len(),
                 0.0,
@@ -440,7 +440,7 @@ fn translucent_sort_uses_camera_distance_and_preserves_index_order_on_ties() {
         assert_eq!(output, [u32::MAX; 4]);
         for (camera_x, expected) in [(0.0, [1, 3, 0]), (16.0, [0, 1, 3]), (f32::MAX, [0, 1, 3])] {
             assert_eq!(
-                mc_spine_client_mesh_sort_translucent(
+                megu_client_mesh_sort_translucent(
                     quads.as_ptr(),
                     quads.len(),
                     camera_x,
@@ -481,7 +481,7 @@ fn packed_fluid_vertices_preserve_fractional_heights_and_material() {
     // SAFETY: one valid input and four disjoint writable vertex slots.
     assert_eq!(
         unsafe {
-            mc_spine_client_mesh_pack_vertices(
+            megu_client_mesh_pack_vertices(
                 top,
                 1,
                 output.as_mut_ptr(),
@@ -525,7 +525,7 @@ fn ffi_bucket_directions_regroups_like_the_rust_helper() {
     // SAFETY: quads is a live slice; buckets and count are writable.
     assert_eq!(
         unsafe {
-            mc_spine_client_mesh_bucket_directions(
+            megu_client_mesh_bucket_directions(
                 quads.as_ptr(),
                 quads.len(),
                 ptr::null_mut(),
@@ -543,7 +543,7 @@ fn ffi_bucket_directions_regroups_like_the_rust_helper() {
     // SAFETY: output has one extra writable slot past the required count.
     assert_eq!(
         unsafe {
-            mc_spine_client_mesh_bucket_directions(
+            megu_client_mesh_bucket_directions(
                 quads.as_ptr(),
                 quads.len(),
                 output.as_mut_ptr(),
@@ -559,7 +559,7 @@ fn ffi_bucket_directions_regroups_like_the_rust_helper() {
     // SAFETY: output now has enough writable slots, still disjoint from input.
     assert_eq!(
         unsafe {
-            mc_spine_client_mesh_bucket_directions(
+            megu_client_mesh_bucket_directions(
                 quads.as_ptr(),
                 quads.len(),
                 output.as_mut_ptr(),
@@ -577,7 +577,7 @@ fn ffi_bucket_directions_regroups_like_the_rust_helper() {
     // SAFETY: null input is rejected without a dereference.
     assert_eq!(
         unsafe {
-            mc_spine_client_mesh_bucket_directions(
+            megu_client_mesh_bucket_directions(
                 ptr::null(),
                 0,
                 ptr::null_mut(),

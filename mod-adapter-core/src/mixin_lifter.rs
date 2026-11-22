@@ -6,7 +6,7 @@
 //! `@Inject(at = @At("HEAD" | "TAIL" | "RETURN"))` hooks on vanilla lifecycle
 //! methods — damage, block break/place, server/player ticks, chat, join/leave,
 //! and block interaction. [`lift_mixin_sites`] maps exactly those sites onto
-//! mc-spine's [`StandardEventHook`]s so
+//! megu's [`StandardEventHook`]s so
 //! [`crate::fallback::classify_mod_with_mixins`] can promote a mod whose *only*
 //! unsupported surface is a fully liftable mixin set from Tier 3
 //! (`RequiresFallback`) to Tier 2 (`BoundedJvmShim`) with exact event

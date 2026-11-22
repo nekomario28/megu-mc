@@ -15,8 +15,8 @@ HARNESS = ROOT / 'tools/structure-oracle/NativeHarness.java'
 ORACLE = ROOT / 'tools/structure-oracle/JigsawOracle.java'
 FIXTURE = ROOT / 'tests/data/jigsaw_structures_1211.tsv'
 LOCAL_JAR = Path(os.environ.get(
-    'MC_SPINE_JIGSAW_JAR',
-    str(Path.home() / 'mc-spine-local/captures/native/mc-native-overworld-20261111/server.jar'),
+    'MEGU_JIGSAW_JAR',
+    str(Path.home() / 'megu-local/captures/native/mc-native-overworld-20261111/server.jar'),
 ))
 
 CASES = [
@@ -54,7 +54,7 @@ def main():
         cases_path.write_text(json.dumps(CASES, indent=2))
         output = work / 'jigsaw_structures_1211.tsv'
         run_probe(
-            work, cp, ORACLE, 'dev.mcspine.tools.JigsawOracle',
+            work, cp, ORACLE, 'dev.megu.tools.JigsawOracle',
             str(cases_path), str(output),
             extra_sources=(HARNESS,),
         )

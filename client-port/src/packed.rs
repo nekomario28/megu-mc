@@ -4,7 +4,7 @@ use crate::mesh::{DirectionBuckets, DIRECTION_BUCKETS};
 use crate::{Layer, Quad, EDGE, LAVA, QUAD_FALLING, QUAD_TINTED, WATER};
 
 /// Input bound for column meshing and LOD calls, mirrored by
-/// `MC_SPINE_MESH_MAX_COLUMN_SECTIONS` in the C header. Sized for tall Mod
+/// `MEGU_MESH_MAX_COLUMN_SECTIONS` in the C header. Sized for tall Mod
 /// dimensions well past the vanilla 24-section window (e.g. a 96-section
 /// custom dimension at Y -512..1024): 128 sections is 2,048 blocks.
 pub(crate) const MAX_COLUMN_SECTIONS: usize = 128;

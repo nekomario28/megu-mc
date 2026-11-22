@@ -1,4 +1,4 @@
-# mc-spine
+# megu
 
 Minecraft Java 1.21.1（protocol 767）向けの実験的なRustサーバーです。小規模・低負荷の世界で、観測できる挙動を保ちながら計算量を減らし、必要な既存Modを接続できるかを試しています。**互換性・軽量性・任意Mod対応は未達で、完成品でも、vanillaより軽いと確認済みの製品でもありません。**
 
@@ -54,7 +54,7 @@ bash tools/layers_check.sh && bash tools/debt_ratchet.sh && python3 tools/proven
 
 # 3. ビルド・単体テスト・サーバー起動
 cargo test --locked -- --test-threads=1
-MC_SPINE_PORT=25699 cargo run --locked
+MEGU_PORT=25699 cargo run --locked
 ```
 
 > **Note**: `tools/export_public_branch.sh` で生成されたクリーンエクスポート環境（Mojang 由来データを含まないツリー）から始める場合は、ステップ 1 の後に手元の 1.21.1 `server.jar` から 1 コマンドでデータを再生成できます：
@@ -62,21 +62,21 @@ MC_SPINE_PORT=25699 cargo run --locked
 
 通常のゲームlistenerは `127.0.0.1` にbindし、セーブはカレントディレクトリの `world_overlay.bin` に書きます。外部ネットワークに公開しないでください（[SECURITY_NOTES.md](SECURITY_NOTES.md)）。データの種類、生成手順、テストの段階（T0 → T1 → T2）は [開発ガイド](docs/development.md) にまとめています。
 
-設定ファイルは任意です。初回起動時にカレントディレクトリへ短い `server.toml` を書き出します（`MC_SPINE_CONFIG` で場所を変更可）。`[server]` の各キーは既存の `MC_SPINE_*` 環境変数に対応し、環境変数が常に優先されます。`[anticheat]` は on/off の 4 項目です: `enabled`（移動・落下・設置チェックの on/off）、`antixray`（埋まったバニラ鉱石＋`#c:ores`/`#forge:ores` 等の Mod 鉱石・チェスト・埋没 BlockEntity NBT を隠す）、`antifullbright`（密閉された地下空洞の光を送らない。クライアントのガンマ/フルブライト自体はサーバーからは止められません）、`check_ops`（`true` で OP も検査対象）。しきい値はプレイヤーの属性・エフェクト・エンチャント・Mod ブロック輸送からサーバー側で毎回自動計算し（`src/anticheat.rs`）、違反は引き戻し・取り消しのみでキックしません。クリエイティブ・スペクテイターは常に対象外で、サバイバル復帰時は短い猶予が付きます。非バニラコマンドは追加せず、既存のバニラ `/reload` で `server.toml` と Mod タグも自然に再読込されます。環境変数 `MC_SPINE_ANTICHEAT=off` でも無効化できます。
+設定ファイルは任意です。初回起動時にカレントディレクトリへ短い `server.toml` を書き出します（`MEGU_CONFIG` で場所を変更可）。`[server]` の各キーは既存の `MEGU_*` 環境変数に対応し、環境変数が常に優先されます。`[anticheat]` は on/off の 4 項目です: `enabled`（移動・落下・設置チェックの on/off）、`antixray`（埋まったバニラ鉱石＋`#c:ores`/`#forge:ores` 等の Mod 鉱石・チェスト・埋没 BlockEntity NBT を隠す）、`antifullbright`（密閉された地下空洞の光を送らない。クライアントのガンマ/フルブライト自体はサーバーからは止められません）、`check_ops`（`true` で OP も検査対象）。しきい値はプレイヤーの属性・エフェクト・エンチャント・Mod ブロック輸送からサーバー側で毎回自動計算し（`src/anticheat.rs`）、違反は引き戻し・取り消しのみでキックしません。クリエイティブ・スペクテイターは常に対象外で、サバイバル復帰時は短い猶予が付きます。非バニラコマンドは追加せず、既存のバニラ `/reload` で `server.toml` と Mod タグも自然に再読込されます。環境変数 `MEGU_ANTICHEAT=off` でも無効化できます。
 
 ## 導入・周辺ツール（Alpha）
 
 - **1 コマンド導入**: `python3 tools/megu_start.py --dir ./server [--modpack pack.mrpack] [--accept-eula]`（`[]` 内は任意）。ローカルサーバーの初期設定と起動を補助します。`--accept-eula` は EULA に同意した場合のみ指定してください。`--modpack` は事前検査用で、Mod の自動ダウンロード・導入はしません。
 - **任意のローカル Mod 翻訳**: `python3 tools/megu_translate.py --mods-dir ./mods --out ./megu-auto-lang-ja_jp.zip`。欠けている日本語訳から、ローカルで個人利用するためのクライアント用リソースパックをオンデマンド生成します。ローカルの翻訳 API が必要で、既定の接続先は `127.0.0.1` のループバックのみです。外部 API への接続は `--allow-remote-llm` による明示的な許可が必要です。
-- **JVM 不要の Mod 検査**: `mc-spine-mod-check --scan-mods-dir ./mods` で `mods/` 内の JAR を静的検査し、互換性経路を分類します。任意の Mod が動作する保証ではありません。
-- **ワールド操作**: `mc-spine-world-migrate` は `inspect-anvil`、`migrate-level`、`audit-query`、`rollback`、`pregen-plan` を提供します。`pregen-plan` は事前生成の計画のみを行います。
-- **クライアント CLI**: `mc-spine-client` は `--ping <host:port>`、`--join-code <code> --relay <host:port>`、`--gpu-backend classic-low-spec`、`--background-fps <0..240>` を提供します。
+- **JVM 不要の Mod 検査**: `megu-mod-check --scan-mods-dir ./mods` で `mods/` 内の JAR を静的検査し、互換性経路を分類します。任意の Mod が動作する保証ではありません。
+- **ワールド操作**: `megu-world-migrate` は `inspect-anvil`、`migrate-level`、`audit-query`、`rollback`、`pregen-plan` を提供します。`pregen-plan` は事前生成の計画のみを行います。
+- **クライアント CLI**: `megu-client` は `--ping <host:port>`、`--join-code <code> --relay <host:port>`、`--gpu-backend classic-low-spec`、`--background-fps <0..240>` を提供します。
 - **Mod 統合の検証**: `cargo check --offline --locked --features mod-suite` で `mod-suite` feature を有効にしたビルドを検査できます。
 
 ## 軽量化 Mod について（プレイヤー・運用者向け）
 
 - 描画カリング・ライティング・パレット圧縮・並列チャンク処理・遠景 LOD など、既存の軽量化 Mod と同じ分野の Rust 実装があります。`Sodium` / `Embeddium` / `Lithium` / `Starlight` / `FerriteCore` / `ModernFix` / `EntityCulling` / `Distant Horizons` と機能・性能が同等であることは検証されていません。
-- `mc-spine-mod-check` の事前検査では、組み込みの置換対象として登録された軽量化 Mod の ID をスキップ対象に分類します。それ以外のコンテンツ Mod の動作可否は個別の互換性検査・実行検証に依存します（対象一覧と仕組み: [ux-and-builtin-optimizations.md](specs/client-fork/ux-and-builtin-optimizations.md)）。
+- `megu-mod-check` の事前検査では、組み込みの置換対象として登録された軽量化 Mod の ID をスキップ対象に分類します。それ以外のコンテンツ Mod の動作可否は個別の互換性検査・実行検証に依存します（対象一覧と仕組み: [ux-and-builtin-optimizations.md](specs/client-fork/ux-and-builtin-optimizations.md)）。
 - スキップ対象の分類は事前検査の挙動です。上記 Mod 群の公式同梱・提携・コード移植は行っていません（詳細は下の「クリーンルーム実装と設計上の先行技術」を参照）。
 
 ## どこから読むか

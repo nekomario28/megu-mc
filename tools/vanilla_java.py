@@ -11,8 +11,8 @@ import tempfile
 import zipfile
 
 JAR_SHA1 = "59353fb40c36d304f2035d51e7d6e6baa98dc05c"
-DEFAULT_JAR = Path(os.environ.get("MC_SPINE_VANILLA_SERVER_JAR", str(
-    Path.home() / ".cache/mc-spine-audit/load/vanilla/server.jar")))
+DEFAULT_JAR = Path(os.environ.get("MEGU_VANILLA_SERVER_JAR", str(
+    Path.home() / ".cache/megu-audit/load/vanilla/server.jar")))
 
 
 @contextmanager

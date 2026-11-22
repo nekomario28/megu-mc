@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: LGPL-3.0-or-later OR GPL-3.0-or-later OR AGPL-3.0-or-later
-//! `mc-spine-server-files`: the Vanilla server's on-disk files, standalone.
+//! `megu-server-files`: the Vanilla server's on-disk files, standalone.
 //!
 //! A zero-dependency crate owning the file formats a dedicated server shares
 //! with Vanilla — `server.properties`, `eula.txt`, the four admin registries
@@ -38,10 +38,10 @@
 //! * [`claims_wire`] — the deterministic `CustomPacketPayload` codec that
 //!   carries those claims and sync deltas to client overlays over the
 //!   `openpartiesandclaims:claims_sync` / `ftbchunks:claims_sync` /
-//!   `mc-spine:claims_v1` channels.
+//!   `megu:claims_v1` channels.
 //! * [`directory`] — [`directory::ServerDirectory`], the facade that owns the
 //!   whole set: `load_or_init`, Vanilla-precedence `admit_login` and
-//!   `save_all_atomic`, pinned to a [`mc_spine_core::version::TargetVersion`].
+//!   `save_all_atomic`, pinned to a [`megu_core::version::TargetVersion`].
 //!   Also home to the standard folder layouts:
 //!   [`directory::ensure_server_game_dir_layout`] /
 //!   [`directory::ensure_client_game_dir_layout`] scaffold the
@@ -84,7 +84,7 @@ pub use claims_wire::{
     build_delta_batches, build_dimension_sync_batches, decode_claims_batch,
     decode_custom_payload_frame, encode_claims_batch, encode_custom_payload_frame, ClaimsWireBatch,
     ClaimsWireCell, ClaimsWireEntry, ClaimsWireError, WireOwnerKind,
-    CHANNEL_FTBCHUNKS_CLAIMS_SYNC, CHANNEL_MC_SPINE_CLAIMS_V1, CHANNEL_OPENPAC_CLAIMS_SYNC,
+    CHANNEL_FTBCHUNKS_CLAIMS_SYNC, CHANNEL_MEGU_CLAIMS_V1, CHANNEL_OPENPAC_CLAIMS_SYNC,
     MAX_WIRE_CLAIMS_PER_BATCH, MAX_WIRE_STRING_BYTES, WIRE_PROTOCOL_TAG,
 };
 pub use directory::{

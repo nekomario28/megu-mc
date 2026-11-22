@@ -1965,7 +1965,7 @@ struct RawDatapack {
 
 /// The 1.21.1 `PackType.SERVER_DATA` release the `pack.mcmeta` compatibility
 /// check targets: scalar `pack_format` 48, `(major, minor)` `(48, 0)` —
-/// matching `TargetVersion::V1_21_1.data_pack_format()` in mc-spine-core.
+/// matching `TargetVersion::V1_21_1.data_pack_format()` in megu-core.
 const DATAPACK_TARGET_PACK_FORMAT: u32 = 48;
 const DATAPACK_TARGET_PACK_FORMAT_TUPLE: (u32, u32) = (48, 0);
 
@@ -2175,7 +2175,7 @@ fn reload_datapacks(
         sources.sort_by_key(|(name, _, _)| rank.get(name.as_str()).copied().unwrap_or(usize::MAX));
     }
     // Collect every enabled source as raw text entries first. With
-    // `MC_SPINE_DATAPACK_CACHE_DIR` set, `dpc1_load_or_build` then serves the
+    // `MEGU_DATAPACK_CACHE_DIR` set, `dpc1_load_or_build` then serves the
     // covered categories (tags, extended recipes, loot JSON, pack verdicts,
     // dynamic registries) from the DPC1 startup cache on a warm hit; the
     // residual warm parse below re-reads everything else, and a single changed
@@ -5733,7 +5733,7 @@ fn command_usage(name: &str) -> String {
     }
 }
 fn allow_unsafe_player_admin() -> bool {
-    std::env::var("MC_SPINE_ALLOW_PLAYER_ADMIN_COMMANDS")
+    std::env::var("MEGU_ALLOW_PLAYER_ADMIN_COMMANDS")
         .ok()
         .as_deref()
         == Some("1")
@@ -10860,18 +10860,18 @@ mod issue225_parity_tests {
         // legacy spellings still work
         assert!(c225_run(
             &ctx,
-            "/attribute @a[name=c225-attr] generic.movement_speed modifier add mcspine:legacy 0.25 add"
+            "/attribute @a[name=c225-attr] generic.movement_speed modifier add megu:legacy 0.25 add"
         )
         .starts_with("Added modifier"));
         // vanilla 1.21.1 spellings
         assert!(c225_run(
             &ctx,
-            "/attribute @a[name=c225-attr] generic.movement_speed modifier add mcspine:mb 1.0 add_multiplied_base"
+            "/attribute @a[name=c225-attr] generic.movement_speed modifier add megu:mb 1.0 add_multiplied_base"
         )
         .starts_with("Added modifier"));
         assert!(c225_run(
             &ctx,
-            "/attribute @a[name=c225-attr] generic.movement_speed modifier add mcspine:mt 1.0 add_multiplied_total"
+            "/attribute @a[name=c225-attr] generic.movement_speed modifier add megu:mt 1.0 add_multiplied_total"
         )
         .starts_with("Added modifier"));
         // (base + add) * (1 + multiply_base) * (1 + multiply_total)
@@ -10883,13 +10883,13 @@ mod issue225_parity_tests {
         assert_eq!(
             c225_run(
                 &ctx,
-                "/attribute @a[name=c225-attr] generic.movement_speed modifier value get mcspine:mb"
+                "/attribute @a[name=c225-attr] generic.movement_speed modifier value get megu:mb"
             ),
-            "Value of modifier mcspine:mb on attribute generic.movement_speed for entity c225-attr is 1"
+            "Value of modifier megu:mb on attribute generic.movement_speed for entity c225-attr is 1"
         );
         assert!(c225_run(
             &ctx,
-            "/attribute @a[name=c225-attr] generic.movement_speed modifier remove mcspine:mb"
+            "/attribute @a[name=c225-attr] generic.movement_speed modifier remove megu:mb"
         )
         .starts_with("Removed modifier"));
         assert_eq!(

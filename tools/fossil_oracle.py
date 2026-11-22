@@ -82,7 +82,7 @@ def main():
         os.environ['MC_NATIVE_FLUID_TAGS'] = str(fluid_tags(inner, work / 'fluid-tags.tsv'))
         generated = work / 'fossil.tsv'
         proto = work / 'proto.tsv'
-        run_probe(work, classpath, JAVA, 'dev.mcspine.tools.FossilOracle',
+        run_probe(work, classpath, JAVA, 'dev.megu.tools.FossilOracle',
                   args.cases.resolve(), generated, proto,
                   extra_sources=(REPO / 'tools/structure-oracle/NativeHarness.java',))
         text = generated.read_text()

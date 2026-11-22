@@ -13,8 +13,8 @@
 //! modal is composited on top and — critically — only the modal's hit
 //! regions are returned, so the dimmed screen is truly inert.
 
-use mc_spine_core::i18n::UiTextKey;
-use mc_spine_core::sys_metrics::{format_mini_hud_lines, MiniHudAnchor};
+use megu_core::i18n::UiTextKey;
+use megu_core::sys_metrics::{format_mini_hud_lines, MiniHudAnchor};
 
 use crate::draw::{palette as pal, text_width, UiColor, UiCommand, UiDrawList, UiRect};
 use crate::hud_widgets::{HudSnapshot, HudWidgetsRenderer};
@@ -376,7 +376,7 @@ fn title(ctx: &mut Ctx) {
     let lang = ctx.lang;
     let cx = ctx.w / 2;
 
-    ctx.ctext(cx, 34, 3, pal::TEXT, "MC-SPINE");
+    ctx.ctext(cx, 34, 3, pal::TEXT, "MEGU");
     ctx.ctext(
         cx,
         62,
@@ -467,8 +467,8 @@ fn title(ctx: &mut Ctx) {
             tr(lang, "Website", "公式サイト"),
         );
     }
-    let full_version = "mc-spine client-ui 0.1.0 - zero-dep pure Rust";
-    let short_version = "mc-spine client-ui 0.1.0";
+    let full_version = "megu client-ui 0.1.0 - zero-dep pure Rust";
+    let short_version = "megu client-ui 0.1.0";
     let version = if text_width(full_version, 1) as i32 + 8 <= ctx.w {
         full_version
     } else {
@@ -1349,7 +1349,7 @@ fn language_tab(ctx: &mut Ctx, y0: i32) {
             "{} — {} · {} {}",
             locale.code(),
             locale.english_name(),
-            mc_spine_core::i18n::ALL_BUILTIN_LOCALES.len(),
+            megu_core::i18n::ALL_BUILTIN_LOCALES.len(),
             tr(lang, "built-in + .json packs", "内蔵 + .jsonパック")
         ),
     );
@@ -1921,7 +1921,7 @@ fn hud(ctx: &mut Ctx) {
     }
 
     if mini_lines.is_empty() {
-        ctx.text(4, 4, 1, pal::TEXT_DIM, "mc-spine HUD");
+        ctx.text(4, 4, 1, pal::TEXT_DIM, "megu HUD");
     }
 
     // MagicHUD occupies the centered bottom stack and the top-right

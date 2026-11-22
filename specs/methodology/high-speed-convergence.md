@@ -1,6 +1,6 @@
 # Universal High-Speed Parity & Engineering Methodology
 
-Status: Portable methodology synthesis (2026-11-13). For project-specific execution order in `mc-spine`, see [ROADMAP.md](../ROADMAP.md), [implementation-checklist.md](../implementation-checklist.md), and [investigation-workflow.md](../worldgen-parity/investigation-workflow.md).
+Status: Portable methodology synthesis (2026-11-13). For project-specific execution order in `megu`, see [ROADMAP.md](../ROADMAP.md), [implementation-checklist.md](../implementation-checklist.md), and [investigation-workflow.md](../worldgen-parity/investigation-workflow.md).
 
 ---
 
@@ -21,7 +21,7 @@ This document codifies **six foundational theories** and a **5-step convergence 
 In WWII aircraft analysis, inspecting only the bullet holes on returning bombers led to reinforcing the least critical areas; the fatal hits were on the planes that never returned. In software verification, survivorship bias appears in four forms:
 
 1. **Filtered-Output Bias ("Non-Empty Only" Dumps):**
-   - *Trap:* Filtering out default/empty/air states or normalizing subtypes before comparing hides destructive overwrites (e.g., `cave_air -> air` in `mc-spine` hiding structure piece bounding boxes).
+   - *Trap:* Filtering out default/empty/air states or normalizing subtypes before comparing hides destructive overwrites (e.g., `cave_air -> air` in `megu` hiding structure piece bounding boxes).
    - *Rule:* Compare full canonical states across the entire domain before applying any view filter.
 2. **Immortal-Test Bias ("Green Test" Fallacy):**
    - *Trap:* A test suite that is 100% green may include tests that read back their own setup, bypass the production dispatcher, or assert a tautology.

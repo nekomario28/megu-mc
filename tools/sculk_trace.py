@@ -274,7 +274,7 @@ def sanity_problems(path, required=()):
     # reading off that file silently mixes two runs.
     raw = Path(path).read_text(errors='replace')
     # The profile pass is what makes it two runs - and it is harmless when it is a no-op:
-    # `MC_SPINE_WG_PROFILE=0` still prints the banner and generates nothing, so the banner alone
+    # `MEGU_WG_PROFILE=0` still prints the banner and generates nothing, so the banner alone
     # is not the signal. (Found by this guard firing wrongly on the very capture that avoided the
     # trap; a guard that cries wolf gets switched off, which is worse than not having it.)
     prof = re.search(r'\[wgprof\] (\d+)x(\d+) chunks', raw)
@@ -1061,7 +1061,7 @@ def main():
     s.set_defaults(func=cmd_patches)
 
     s = sub.add_parser('pop-order',
-                       help='extract MC_SPINE_POP_ORDER TSV from POP_CHUNK/SPASS trace')
+                       help='extract MEGU_POP_ORDER TSV from POP_CHUNK/SPASS trace')
     s.add_argument('trace')
     s.add_argument('--bbox', help='optional inclusive chunk box x0,z0,x1,z1')
     s.add_argument('--out', help='write TSV to FILE instead of stdout')

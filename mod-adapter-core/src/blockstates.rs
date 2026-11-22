@@ -5,7 +5,7 @@
 
 use std::collections::{BTreeMap, HashMap};
 
-/// Default first dynamic state ID, matching `mc-spine` S2 custom block space.
+/// Default first dynamic state ID, matching `megu` S2 custom block space.
 pub const DEFAULT_BASE_STATE_ID: u32 = 26_684;
 
 /// Generic role tag for any mod block declared through `ModOffloadProfile`.

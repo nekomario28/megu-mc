@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: LGPL-3.0-or-later OR GPL-3.0-or-later OR AGPL-3.0-or-later
 
-use mc_spine_client_mesh::ber_instancing::*;
-use mc_spine_client_mesh::vanilla_plus_3d::{ExtrudedMesh, MAX_UPGRADE_QUADS};
+use megu_client_mesh::ber_instancing::*;
+use megu_client_mesh::vanilla_plus_3d::{ExtrudedMesh, MAX_UPGRADE_QUADS};
 
 const SOUTH: VanillaBerFacing = VanillaBerFacing::South;
 

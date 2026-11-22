@@ -103,12 +103,12 @@ pub const QUILT_MOD_JSON: &str = "quilt.mod.json";
 
 /// Maven coordinate providing the `quilt_loader` runtime dependency. The
 /// `org.quiltmc` toolchain layers — like `net.fabricmc:fabric-loader` — are
-/// implemented natively by mc-spine, so a dependency on them never needs a
+/// implemented natively by megu, so a dependency on them never needs a
 /// JVM-side artifact.
 pub const QUILT_LOADER_ARTIFACT: &str = "org.quiltmc:quilt-loader";
 
 /// Runtime artifacts that satisfy loader/game dependency ids — Quilt and
-/// Fabric loader layers mc-spine implements natively, the game itself, and
+/// Fabric loader layers megu implements natively, the game itself, and
 /// the JRE. Used by dependency planning to map a `depends` entry onto the
 /// artifact coordinate that provides it.
 pub fn provided_loader_artifact(mod_id: &str) -> Option<&'static str> {

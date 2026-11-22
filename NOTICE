@@ -1,8 +1,8 @@
-mc-spine
+megu
 Copyright 2026 nekomario28
 
 COPYING.LESSER (GNU Lesser GPL v3.0 or later) and Cargo.toml (`license = "LGPL-3.0-or-later"`) specify
-`LGPL-3.0-or-later` as the distribution license of mc-spine: all first-party code is provided under
+`LGPL-3.0-or-later` as the distribution license of megu: all first-party code is provided under
 `LGPL-3.0-or-later`. LGPLv3 requires the GPLv3 license text as a companion, so LICENSE (GNU GPL v3.0)
 is included alongside COPYING.LESSER, and LGPLv3 section 2 permits downstream users to convey the
 work under GPLv3. Independent third-party Mod JARs loaded at runtime via the Fabric/NeoForge
@@ -62,7 +62,7 @@ was extracted from wiki.vg and minecraft.gamepedia.com.
 
 Minecraft data (development checkout versus public export)
 ---------------------------------------------------------
-Derived from Minecraft, (c) Mojang Studios / Microsoft; not covered by mc-spine's LGPL-3.0-or-later
+Derived from Minecraft, (c) Mojang Studios / Microsoft; not covered by megu's LGPL-3.0-or-later
 license. Do not redistribute these outputs or the jar. The development
 branch tracks datapacks/vanilla/, assets/block_states_1211.json, config_packets.bin,
 tests/data/biome_probe_ties_1211.tsv and tests/data/random_next_int_1211.tsv.
@@ -83,7 +83,7 @@ JVM-side components (fetched at build/run time, not distributed)
 ----------------------------------------------------------------
 compat/*/build.py download the following, pinned by URL and SHA-256 in compat/*/dependencies.json,
 into git-ignored .cache/ directories. No jar, class file or source of these is committed here,
-and mc-spine does not redistribute them. They keep their own licenses (as declared by the
+and megu does not redistribute them. They keep their own licenses (as declared by the
 upstream projects; check the downloaded artifacts before redistributing any of them):
   Fabric Loader 0.19.5 (Apache-2.0, FabricMC); SpongePowered Mixin 0.17.4 as built by FabricMC
   (MIT); ASM 9.10.1 (BSD-3-Clause); NeoForge 21.1.172, NeoForged event bus 8.0.2, FancyModLoader
@@ -92,5 +92,5 @@ upstream projects; check the downloaded artifacts before redistributing any of t
 The pinned third-party test mod (Seed Protect 1.0.0 by Itamio, from Modrinth) is used only as a
 test input and is not distributed here; its jar metadata says "All Rights Reserved" while its
 Modrinth page says MIT, so do not redistribute it.
-The Java sources under compat/ are mc-spine's own code. The classes under compat/*/java/net/minecraft/
+The Java sources under compat/ are megu's own code. The classes under compat/*/java/net/minecraft/
 are empty placeholder shapes (a name only, no Minecraft code) that satisfy method signatures.

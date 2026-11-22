@@ -5,9 +5,9 @@ feature 並列実行や vanilla parity の達成を示すものではない。
 
 ## なぜ
 
-`WARM=1`（spawn burst を除く移動視点）で mc-spine は vanilla の 1.65-2.85 倍の
+`WARM=1`（spawn burst を除く移動視点）で megu は vanilla の 1.65-2.85 倍の
 CPU を使う（中央値 x1.79、[証拠](../../evidence/gameplay/worldgen-cost/README.md)）。
-vanilla は 62-64 スレッドでチャンク生成を並列化し、mc-spine は 3 スレッドで
+vanilla は 62-64 スレッドでチャンク生成を並列化し、megu は 3 スレッドで
 feature を単一実行している。個別 feature のループを削るより、同じ仕事を
 並列化する方が桁が大きい。
 
@@ -84,7 +84,7 @@ per-chunk の所有に分ければ消える種類の時間。段 2/3 の効果�
    (step, gi, pos) の順で `feat_c` に適用する。worker 間で同じセルへの書き込みが
    競合する場合は、順序キーで最後のものが勝つ（vanilla の逐次実行と同じ）。
 4. **ワーカー数**: `std::thread::available_parallelism()` を上限に、既定は
-   4-8。`MC_SPINE_GEN_WORKERS` で固定できるようにする（0/1 で逐次）。
+   4-8。`MEGU_GEN_WORKERS` で固定できるようにする（0/1 で逐次）。
 5. **失敗時**: worker の panic は owner に伝播し、起動時と同じ fail-closed
    経路で停止する（部分的なチャンクを送らない）。
 
@@ -142,7 +142,7 @@ mutation check が緑であることを要求する。段 3 の perf 主張は `
    **25-46 回/chunk**。
 3. **anti-xray 露出テストを手持ちの配列から返す**（同一セクション＋繰り越した上下
    セクション）: `base_state` 6,795 → **482 回/chunk**。
-4. **+x 隣チャンクのセクション先読み**（既定 on、`MC_SPINE_NO_PREFETCH_NEIGHBOUR=1` で
+4. **+x 隣チャンクのセクション先読み**（既定 on、`MEGU_NO_PREFETCH_NEIGHBOUR=1` で
    off）: 露出テストが読む深い水平近傍を、隣の配信時に消費される形で先に計算する。
    encode 42 → **29 ms/chunk**（+z と対角まで広げると 12 ms まで下がるが、窓の CPU が
    29.6 → 32.1 s に増えるので +x のみ）。
@@ -186,14 +186,14 @@ mutation check が緑であることを要求する。段 3 の perf 主張は `
 - **対象は地形ステージだけ**（density / material / aquifer / surface・deep rules）。
   population dispatch・promotion・`hasPostProcess` マーク・feature 順序は不変。
   carvers は引き続き直列（`±8` seed 走査が chunk 境界を越えて書くため）。
-- **既定で並列**: `MC_SPINE_GEN_JOBS`（0/1 で直列）を読む。既定は
+- **既定で並列**: `MEGU_GEN_JOBS`（0/1 で直列）を読む。既定は
   `min(available_parallelism, 8)`。dump（このスライスの測定路）は既定で並列、
-  配信路（tick スレッド上で走る）は `MC_SPINE_GEN_JOBS` 指定時のみ並列 —
+  配信路（tick スレッド上で走る）は `MEGU_GEN_JOBS` 指定時のみ並列 —
   tick の latency を測っていないため。
 - **勝ちは wall clock**: terrain-only の 64 chunk dump が 2.633 → 0.557 s（8 workers、
   4.73x）。CPU は +13%（terrain-only）。full（feature 込み）は 1.15x / CPU +88% で、
   残りはこのスライスが直列のまま残したステージと、worker 側の `cols`/beardifier の
-  重複。`MC_SPINE_GEN_JOBS=1` が CPU 重視の比较用の逃げ道。
+  重複。`MEGU_GEN_JOBS=1` が CPU 重視の比较用の逃げ道。
 - **構造キャッシュは per-thread だった**（`STARTS` / `RING_CACHE`）。per-round 共有に
   変えた（process 全体の共有は fixture を壊すため不可、証拠は上記 README）。
 
@@ -233,7 +233,7 @@ mutation check が緑であることを要求する。段 3 の perf 主張は `
 
 ### OSS / Mod アルゴリズム参照のライセンス境界
 
-- **参照＋設計/コード参考にしてよい許容ライセンス（帰属・ヘッダ遵守）**: `Soju06/hyperchunk`（MIT、`/home/yuu/mc-spine-local/reference/hyperchunk-387c9ad/`）、`valence-rs/valence`（MIT）、`MCHPR/MCHPRS`（MIT）、および `0564ab0bcd3235daa6001033261b79aef5f81de1` 以前の Horizon（MIT）。詳細は [OSS survey](../../evidence/foundation/oss-survey/README.md)。
+- **参照＋設計/コード参考にしてよい許容ライセンス（帰属・ヘッダ遵守）**: `Soju06/hyperchunk`（MIT、`/home/yuu/megu-local/reference/hyperchunk-387c9ad/`）、`valence-rs/valence`（MIT）、`MCHPR/MCHPRS`（MIT）、および `0564ab0bcd3235daa6001033261b79aef5f81de1` 以前の Horizon（MIT）。詳細は [OSS survey](../../evidence/foundation/oss-survey/README.md)。
 - **アルゴリズム概念の参照のみ（コードのコピー・翻訳・派生移植は厳禁）**: C2ME、Starlight / ScalableLux、Lithium、Paper / Moonrise、Pumpkin（GPL-3.0）、SteelMC（AGPL-3.0）、`fb1135c6` 以降の Horizon（LGPL-3.0）。
 
 ### 大量エンティティ・Mob・Mod 負荷への構造的防衛（M2 / M3 / R5 接続）

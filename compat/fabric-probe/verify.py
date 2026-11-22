@@ -31,7 +31,7 @@ def main():
             group = pathlib.Path('/sys/fs/cgroup') / line[3:].lstrip('/')
             for setting in ['memory.max', 'memory.swap.max', 'cpu.max']:
                 resource_scope[setting] = (group / setting).read_text().strip()
-    with tempfile.TemporaryDirectory(prefix='mcspine-fabric-') as temporary:
+    with tempfile.TemporaryDirectory(prefix='megu-fabric-') as temporary:
         root = pathlib.Path(temporary)
         for name, mods, expected, success in [
             ('api', ['place_block'], 2, True),

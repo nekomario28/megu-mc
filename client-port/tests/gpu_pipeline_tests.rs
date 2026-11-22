@@ -2,8 +2,8 @@
 
 use std::mem::{align_of, offset_of, size_of, size_of_val};
 
-use mc_spine_client_mesh::gpu_pipeline::*;
-use mc_spine_client_mesh::{mesh_section, Block, Direction, Light, Section, ALL_FACES, EDGE};
+use megu_client_mesh::gpu_pipeline::*;
+use megu_client_mesh::{mesh_section, Block, Direction, Light, Section, ALL_FACES, EDGE};
 
 const DAY: Light = Light::new(0, 15);
 

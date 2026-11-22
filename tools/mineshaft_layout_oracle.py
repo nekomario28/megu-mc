@@ -18,7 +18,7 @@ def main():
     with pinned_runtime(args.jar) as (work, cp, _):
         out = work / "layout.tsv"
         run_probe(work, cp, ROOT / "tools/structure-oracle/MineshaftLayoutOracle.java",
-                  "dev.mcspine.tools.MineshaftLayoutOracle", out,
+                  "dev.megu.tools.MineshaftLayoutOracle", out,
                   extra_sources=(ROOT / "tools/structure-oracle/NativeHarness.java",))
         actual = out.read_bytes()
     if not actual.startswith(b"C\t") or b"\nP\t" not in actual:

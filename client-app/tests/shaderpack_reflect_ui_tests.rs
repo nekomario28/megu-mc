@@ -9,17 +9,17 @@
 
 use std::collections::BTreeSet;
 
-use mc_spine_client::lod::LodConfig;
-use mc_spine_client::render_graph::{FramePlanInput, GpuPipelineKind};
-use mc_spine_client::shaderpack_runtime::{
+use megu_client::lod::LodConfig;
+use megu_client::render_graph::{FramePlanInput, GpuPipelineKind};
+use megu_client::shaderpack_runtime::{
     activate_shaderpack, ActiveShaderSession, ShaderActivationOutcome,
     ShaderActivationRequest, ShaderpackUiSnapshot,
 };
-use mc_spine_client::shaders::{HIZ_DOWNSAMPLE_COMPUTE_WGSL, TERRAIN_OPAQUE_WGSL};
-use mc_spine_client_mesh::shaderpack_reflect::{
+use megu_client::shaders::{HIZ_DOWNSAMPLE_COMPUTE_WGSL, TERRAIN_OPAQUE_WGSL};
+use megu_client_mesh::shaderpack_reflect::{
     ImageAccess, SamplerSemantic, UniformCategory, WgslResourceKind,
 };
-use mc_spine_client_mesh::{
+use megu_client_mesh::{
     PackDimension, PipelineStage, ShaderOptionOverrides, ShaderPackFamily, ShaderPackSource,
 };
 
@@ -156,7 +156,7 @@ fn megu_wgsl_pack() -> ShaderPackSource {
             r#"
 [pack]
 name = "Megu Native Fast"
-author = "mc-spine"
+author = "megu"
 version = "1.0.0"
 api = 1
 supports_lod = true

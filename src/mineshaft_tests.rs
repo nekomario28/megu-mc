@@ -651,7 +651,7 @@ fn generated_entities_and_mutated_spawner_nbt_resume_in_a_new_process_once() {
                 .any(|(_, n)| n == "minecraft:spawner")
         })
         .unwrap();
-    if let Ok(path) = std::env::var("MC_SPINE_MINESHAFT_RESTART") {
+    if let Ok(path) = std::env::var("MEGU_MINESHAFT_RESTART") {
         let raw = std::fs::read(path).unwrap();
         let payload = crate::unwrap_world_payload(raw).unwrap();
         let saved = crate::generated_content::Snapshot::read(
@@ -802,7 +802,7 @@ fn generated_entities_and_mutated_spawner_nbt_resume_in_a_new_process_once() {
         "saving must not reroll loot or regenerate entities"
     );
     let path = std::env::temp_dir().join(format!(
-        "mc-spine-mineshaft-restart-{}.bin",
+        "megu-mineshaft-restart-{}.bin",
         std::process::id()
     ));
     std::fs::write(&path, crate::wrap_world_payload(&payload)).unwrap();
@@ -810,8 +810,8 @@ fn generated_entities_and_mutated_spawner_nbt_resume_in_a_new_process_once() {
         "mineshaft::tests::generated_entities_and_mutated_spawner_nbt_resume_in_a_new_process_once";
     let status = std::process::Command::new(std::env::current_exe().unwrap())
         .args(["--exact", name, "--test-threads=1", "--nocapture"])
-        .env("MC_SPINE_TEST_CHILD", name)
-        .env("MC_SPINE_MINESHAFT_RESTART", &path)
+        .env("MEGU_TEST_CHILD", name)
+        .env("MEGU_MINESHAFT_RESTART", &path)
         .status()
         .unwrap();
     assert!(

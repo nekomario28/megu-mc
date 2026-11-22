@@ -1,6 +1,6 @@
 package net.neoforged.neoforge.capabilities;
 
-import net.mcspine.neoforge.S4CapabilityBridge;
+import net.megu.neoforge.S4CapabilityBridge;
 import net.minecraft.core.BlockPos;
 import net.minecraft.world.level.Level;
 import net.minecraft.world.level.block.entity.BlockEntity;

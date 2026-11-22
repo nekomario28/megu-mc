@@ -34,7 +34,7 @@ def main():
             work,
             classpath,
             ROOT / "tools/structure-oracle/StrongholdOracle.java",
-            "dev.mcspine.tools.StrongholdOracle",
+            "dev.megu.tools.StrongholdOracle",
             out,
             BIOME_TAG,
             extra_sources=[ROOT / "tools/structure-oracle/NativeHarness.java"],

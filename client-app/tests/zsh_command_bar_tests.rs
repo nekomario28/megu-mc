@@ -2,7 +2,7 @@
 //! Behavior tests for the zsh-style command bar: readline editing, ghost text,
 //! reverse search, completion cycling, syntax highlighting, and badges.
 
-use mc_spine_client::zsh_command_bar::{
+use megu_client::zsh_command_bar::{
     BadgeKind, BadgeSide, CommandBarAction, CommandKey, CompletionCandidate, HighlightColor,
     HighlightKind, ZshCommandBar, GLYPH_PIXELS,
 };

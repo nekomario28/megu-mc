@@ -76,9 +76,9 @@ if [ "$total" -eq 0 ]; then
 fi
 
 PORT_DUMP="$DIR/port.bin"
-( cd "$ROOT" && MC_SPINE_WG_PROFILE=0 MC_SPINE_WG_DUMP="$PORT_DUMP" \
-    MC_SPINE_WG_DUMP_N="$N" MC_SPINE_WG_DUMP_X="$CX" MC_SPINE_WG_DUMP_Z="$CZ" \
-    MC_SPINE_SEED="$SEED" ./target/release/mc-spine >/dev/null 2>&1 )
+( cd "$ROOT" && MEGU_WG_PROFILE=0 MEGU_WG_DUMP="$PORT_DUMP" \
+    MEGU_WG_DUMP_N="$N" MEGU_WG_DUMP_X="$CX" MEGU_WG_DUMP_Z="$CZ" \
+    MEGU_SEED="$SEED" ./target/release/megu >/dev/null 2>&1 )
 
 failed=0
 for b in amethyst_block budding_amethyst calcite smooth_basalt; do

@@ -26,7 +26,7 @@ class CargoResolverTests(unittest.TestCase):
 
     def lines(self, harness):
         return [json.dumps({"reason": "compiler-artifact",
-                            "target": {"name": "mc-spine", "kind": ["bin"]},
+                            "target": {"name": "megu", "kind": ["bin"]},
                             "profile": {"test": harness},
                             "executable": str(Path(__file__).resolve())})]
 
@@ -51,7 +51,7 @@ class ReceiptProducerTests(unittest.TestCase):
         subprocess.run(["git", "commit", "-qm", "base"], cwd=self.root, check=True)
         self.head = subprocess.run(["git", "rev-parse", "HEAD"], cwd=self.root,
                                    capture_output=True, text=True, check=True).stdout.strip()
-        self.binary = self.root / "fake-mc-spine"
+        self.binary = self.root / "fake-megu"
         self.binary.write_text(textwrap.dedent("""\
             #!/bin/sh
             case "$FAKE_BIN_MODE" in
@@ -78,7 +78,7 @@ class ReceiptProducerTests(unittest.TestCase):
               echo '{{"reason":"build-finished","success":true}}'
               exit 0
             fi
-            printf '%s\\n' '{{"reason":"compiler-artifact","target":{{"name":"mc-spine","kind":["bin"]}},"profile":{{"test":true}},"executable":"{self.binary}"}}'
+            printf '%s\\n' '{{"reason":"compiler-artifact","target":{{"name":"megu","kind":["bin"]}},"profile":{{"test":true}},"executable":"{self.binary}"}}'
             """))
         self.cargo.chmod(0o755)
 

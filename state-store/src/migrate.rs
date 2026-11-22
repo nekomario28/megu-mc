@@ -31,7 +31,7 @@
 use crate::datafix::{DataFixError, DataFixReport, DataFixer, DataValue, DV_1_21_1};
 use crate::sharded::ServerContext;
 use crate::snapshot::{decode_snapshot, encode_snapshot, SnapshotError};
-use mc_spine_core::version::TargetVersion;
+use megu_core::version::TargetVersion;
 use std::error::Error;
 use std::fmt;
 use std::io::{self, Write};
@@ -1298,7 +1298,7 @@ mod tests {
     fn test_dir(tag: &str) -> std::path::PathBuf {
         static DIR_COUNTER: AtomicU64 = AtomicU64::new(0);
         let dir = std::env::temp_dir().join(format!(
-            "mc-spine-migrate-test-{}-{}-{tag}",
+            "megu-migrate-test-{}-{}-{tag}",
             std::process::id(),
             DIR_COUNTER.fetch_add(1, Ordering::Relaxed)
         ));

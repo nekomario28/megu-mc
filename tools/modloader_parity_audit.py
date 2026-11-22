@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""modloader_parity_audit.py -- mc-spine NeoForge/Fabric 1.21.1 parity detector.
+"""modloader_parity_audit.py -- megu NeoForge/Fabric 1.21.1 parity detector.
 
 Schema: "megu-modloader-parity-audit/1".
 
@@ -268,8 +268,8 @@ _DIMENSIONS = [
             {"id": "fabric:registry/sync/direct", "loaders": ["fabric"],
              "needles": ["fabric:registry/sync/direct",
                          "fabric:registry/sync", "registry/sync/direct"]},
-            {"id": "mc-spine:mod_sync_v1", "loaders": ["neoforge", "fabric"],
-             "needles": ["mc-spine:mod_sync_v1", "mod_sync_v1"]},
+            {"id": "megu:mod_sync_v1", "loaders": ["neoforge", "fabric"],
+             "needles": ["megu:mod_sync_v1", "mod_sync_v1"]},
             {"id": "appleskin", "loaders": ["neoforge", "fabric"],
              "needles": ["appleskin"]},
             {"id": "custom_payload", "loaders": ["neoforge", "fabric"],
@@ -964,7 +964,7 @@ def render_text(report):
     lines = []
     ma = report["mode_a"]
     p = ma["parity"]
-    lines.append("mc-spine modloader parity audit "
+    lines.append("megu modloader parity audit "
                  f"({SCHEMA})")
     lines.append("=" * 64)
     lines.append("Mode A - repository self-audit "
@@ -1034,7 +1034,7 @@ def render_text(report):
 
 def build_parser():
     ap = argparse.ArgumentParser(
-        description="mc-spine NeoForge/Fabric 1.21.1 compatibility & "
+        description="megu NeoForge/Fabric 1.21.1 compatibility & "
                     "incompatibility detector "
                     f"({SCHEMA}). Mode A always runs offline; Mode B audits "
                     "real mod JARs read-only.")

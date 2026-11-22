@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: LGPL-3.0-or-later OR GPL-3.0-or-later OR AGPL-3.0-or-later
-//! Unit and stress tests for `mc_spine_core::perf_kit`.
+//! Unit and stress tests for `megu_core::perf_kit`.
 
-use mc_spine_core::perf_kit::{
+use megu_core::perf_kit::{
     fingerprint_bytes, fnv1a64, splitmix64, AdaptiveLoadGovernor, BoundedScratchVec,
     CoalescedDeltaBatch, DirtyFingerprintGate, EventWakeWheel, FingerprintBuilder,
     TickBudgetQueue, GOVERNOR_WINDOW,

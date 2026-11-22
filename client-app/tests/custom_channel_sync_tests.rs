@@ -1,15 +1,15 @@
 // SPDX-License-Identifier: LGPL-3.0-or-later OR GPL-3.0-or-later OR AGPL-3.0-or-later
 
-use mc_spine_client::protocol::{
+use megu_client::protocol::{
     decode_custom_channel_event, decode_custom_payload_packet, dispatch_custom_channel_to_hosts,
     ClientCustomChannelEvent, DecodedMagicCastState, DecodedMotionHand, DecodedMotionPhase,
     CHANNEL_ANIM_V1, CHANNEL_MAGIC_V1, CHANNEL_MOTION_V1, CHANNEL_VFX_V1,
 };
-use mc_spine_client::render::ClientVfxHost;
-use mc_spine_client::render_graph::GpuPipelineKind;
-use mc_spine_client::world::WorldAnimationHost;
-use mc_spine_client_mesh::vfx_engine::{DynamicColoredLight, Vfx1Packet, VfxCommand};
-use mc_spine_kernel::skeletal_anim::{encode_animation_trigger, AnimationTrigger, LoopMode};
+use megu_client::render::ClientVfxHost;
+use megu_client::render_graph::GpuPipelineKind;
+use megu_client::world::WorldAnimationHost;
+use megu_client_mesh::vfx_engine::{DynamicColoredLight, Vfx1Packet, VfxCommand};
+use megu_kernel::skeletal_anim::{encode_animation_trigger, AnimationTrigger, LoopMode};
 
 const GEOMETRY: &str = r#"{
   "format_version":"1.12.0",

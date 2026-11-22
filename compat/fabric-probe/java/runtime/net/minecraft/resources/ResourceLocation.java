@@ -1,6 +1,6 @@
 package net.minecraft.resources;
 
-import net.mcspine.probe.RegistryId;
+import net.megu.probe.RegistryId;
 
 public final class ResourceLocation {
     private final RegistryId id;

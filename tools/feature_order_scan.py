@@ -129,15 +129,15 @@ def main() -> int:
     )
     parser.add_argument(
         "--jar",
-        default=os.environ.get("MC_SPINE_VANILLA_JAR", "/tmp/carverfresh/server.jar"),
-        help="pinned server.jar (MC_SPINE_VANILLA_JAR)",
+        default=os.environ.get("MEGU_VANILLA_JAR", "/tmp/carverfresh/server.jar"),
+        help="pinned server.jar (MEGU_VANILLA_JAR)",
     )
     parser.add_argument(
         "--mappings",
         default=os.environ.get(
-            "MC_SPINE_VANILLA_MAPPINGS", "~/.cache/mc-spine-work/mc121/server.txt"
+            "MEGU_VANILLA_MAPPINGS", "~/.cache/megu-work/mc121/server.txt"
         ),
-        help="official mappings (MC_SPINE_VANILLA_MAPPINGS)",
+        help="official mappings (MEGU_VANILLA_MAPPINGS)",
     )
     parser.add_argument(
         "--class-prefix",

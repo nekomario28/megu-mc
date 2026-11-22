@@ -62,17 +62,17 @@ python3 tests/native_survival_oracle_test.py
 python3 tests/native_neighbor_trace_test.py
 
 # Generate an owned temporary local fixture, not a tracked vanilla dataset.
-python3 tools/native_support_inventory.py --scope all --output /tmp/mcspine-states.tsv
+python3 tools/native_support_inventory.py --scope all --output /tmp/megu-states.tsv
 
 # Expensive full native canSurvive pass. May reveal unsupported native calls.
 python3 tools/native_survival_oracle.py --scope all \
   --jar /path/to/pinned-1.21.1/server.jar \
-  --output /tmp/mcspine-native-support.tsv
+  --output /tmp/megu-native-support.tsv
 
 # Native callback requests, duplicate run, then native LevelTicks delivery.
 python3 tools/native_neighbor_trace.py \
   --jar /path/to/pinned-1.21.1/server.jar \
-  --output /tmp/mcspine-native-request.tsv
+  --output /tmp/megu-native-request.tsv
 
 # Finally rebuild/regress the port on this exact git SHA.
 cargo test --locked -- --test-threads=1
@@ -85,7 +85,7 @@ before evaluating their provenance, reproducibility and licensing.
 
 ## Recorded evidence (2026-11-07)
 
-- [CI: Native/JVM and Rust pairing, run #42338550702](https://github.com/nekomario28/mc-spine/actions/runs/42338550702): 26,684 states in 12 **synthetic** contexts (320,208 rows, zero unsupported); 336 support decisions across 8 implemented fragile families matched Rust; 25 single-callback native state transitions matched Rust; native 8 appointments / 8 deliveries matched Rust's queue at identical time, identity, position and order. All native and dedicated Rust pairing jobs passed.
+- [CI: Native/JVM and Rust pairing, run #42338550702](https://github.com/nekomario28/megu-mc/actions/runs/42338550702): 26,684 states in 12 **synthetic** contexts (320,208 rows, zero unsupported); 336 support decisions across 8 implemented fragile families matched Rust; 25 single-callback native state transitions matched Rust; native 8 appointments / 8 deliveries matched Rust's queue at identical time, identity, position and order. All native and dedicated Rust pairing jobs passed.
 - Run #42338550702's **full repository verification failed** at the ignored-test debt ratchet, not at the native pairing tests. The source-layer dependency violation from the previous run was repaired, and 17/17 layering tests passed.
 - The three fixture-only Rust tests now require the explicit Cargo feature \`native-oracle\`; the native CI supplies real JAR-generated TSVs. There are no added \`#[ignore]\` gates and the debt limit was **not** raised. Confirm the complete post-fix \`tests/verify.sh\` run before claiming a green full suite.
 - The runtime still creates falling entities immediately on support removal while native FallingBlock.updateShape **schedules a 2-game-tick block callback**. This remains a known behavior mismatch; do not treat 8/8 delivery parity (which replays already-authored requests) as booking parity or full tick effects.
@@ -93,12 +93,12 @@ before evaluating their provenance, reproducibility and licensing.
 Reproduce the mandatory paired tests after collecting fixtures from the same JAR and commit:
 
 \`\`\`sh
-MC_NATIVE_SURVIVAL_MATRIX=/tmp/mcspine-native-support.tsv \
+MC_NATIVE_SURVIVAL_MATRIX=/tmp/megu-native-support.tsv \
   cargo test --locked --features native-oracle native_survival_fragile_port_pair -- --nocapture
-MC_NATIVE_NEIGHBOR_SHAPES=/tmp/mcspine-neighbor-shapes.tsv \
+MC_NATIVE_NEIGHBOR_SHAPES=/tmp/megu-neighbor-shapes.tsv \
   cargo test --locked --features native-oracle native_neighbor_shape_port_pair -- --nocapture
-MC_NATIVE_TICK_REQUESTS=/tmp/mcspine-native-request.tsv \
-MC_NATIVE_TICK_DELIVERIES=/tmp/mcspine-native-request.delivered.tsv \
+MC_NATIVE_TICK_REQUESTS=/tmp/megu-native-request.tsv \
+MC_NATIVE_TICK_DELIVERIES=/tmp/megu-native-request.delivered.tsv \
   cargo test --locked --features native-oracle native_level_ticks_port_delivery_pair -- --nocapture
 \`\`\`
 

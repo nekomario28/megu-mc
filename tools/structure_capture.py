@@ -11,7 +11,7 @@ pinned server at the `structures` stage with the decorate set recorded, dump the
 triage against the recorded window, and bind every artifact the comparison reads into a
 manifest row. The steps are already owned by other tools:
 
-  1. **admission** - `mc-spine --worldgen-structure-candidates <seed> <cx> <cz>`, the port's
+  1. **admission** - `megu --worldgen-structure-candidates <seed> <cx> <cz>`, the port's
      own structural candidate/admit probe (`src/main.rs`). It reports, per structure set,
      the spread candidate of the chunk's grid cell, whether the frequency reducer allows
      it, and whether an exclusion zone is involved. It is *necessary*, not sufficient:
@@ -333,16 +333,16 @@ BIOMEAT_RE = re.compile(r"^BIOMEAT (-?\d+) (-?\d+) (-?\d+) blended=(\S+) contain
 
 
 def port_biomes(binary, seed, preset, positions):
-    """`MC_SPINE_BIOME_AT` for a batch of block positions -> `{(x,y,z): (blended, container)}`."""
+    """`MEGU_BIOME_AT` for a batch of block positions -> `{(x,y,z): (blended, container)}`."""
     if not positions:
         return {}
     spec = ";".join(f"{x},{y},{z}" for x, y, z in positions)
-    env = {k: v for k, v in os.environ.items() if not k.startswith("MC_SPINE_")}
+    env = {k: v for k, v in os.environ.items() if not k.startswith("MEGU_")}
     env.update({
-        "MC_SPINE_SEED": str(seed),
-        "MC_SPINE_WG_PRESET": preset,
-        "MC_SPINE_WG_PROFILE": "0",
-        "MC_SPINE_BIOME_AT": spec,
+        "MEGU_SEED": str(seed),
+        "MEGU_WG_PRESET": preset,
+        "MEGU_WG_PROFILE": "0",
+        "MEGU_BIOME_AT": spec,
     })
     proc = subprocess.run([str(binary)], cwd=ROOT, env=env, capture_output=True, text=True,
                              check=False)
@@ -391,7 +391,7 @@ def run_capture(capture_dir, chunk, n, dimension, seed, height_window, jar_base,
         "MC_FIXTURE_DIMENSION": DIMENSIONS[dimension]["vanilla"],
         "MC_FIXTURE_STAGE": "structures",
         "MC_FIXTURE_HEIGHT_WINDOW": height_window,
-        "MC_SPINE_SEED": str(seed),
+        "MEGU_SEED": str(seed),
         "CARVER_FIXTURE_BASE": str(jar_base),
     })
     command = ["bash", str(TOOLS / "carve-agent" / "native_fixture.sh"),
@@ -535,10 +535,10 @@ def resolve_binary(args):
         if not path.is_file():
             raise RecipeError(f"--binary does not exist: {path}")
         return path.resolve()
-    path = ROOT / "target" / "debug" / "mc-spine"
+    path = ROOT / "target" / "debug" / "megu"
     if not path.is_file():
         raise RecipeError(
-            f"no mc-spine binary at {path}; build it first "
+            f"no megu binary at {path}; build it first "
             "(cargo build --offline --locked) or pass --binary"
         )
     return path.resolve()
@@ -582,7 +582,7 @@ def main(argv=None):
     ap.add_argument("--jar-base", default=os.environ.get("CARVER_FIXTURE_BASE", ""),
                     help="installed 1.21.1 tree (server.jar+libraries+versions); "
                          "default $CARVER_FIXTURE_BASE")
-    ap.add_argument("--binary", help="mc-spine binary (default target/debug/mc-spine)")
+    ap.add_argument("--binary", help="megu binary (default target/debug/megu)")
     ap.add_argument("--mem-max", default="3G",
                     help="MemoryMax for the native capture scope (default 3G; '' disables)")
     ap.add_argument("--max-attempts", type=int, default=4,

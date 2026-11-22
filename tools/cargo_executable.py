@@ -6,7 +6,7 @@ import sys
 
 
 def _one(lines, harness):
-    """The one mc-spine binary Cargo reported, for the build or the test harness.
+    """The one megu binary Cargo reported, for the build or the test harness.
 
     `cargo build` reports `test: false`; `cargo test --no-run` reports the harness
     with `test: true`. They are different binaries, so the caller says which it
@@ -17,13 +17,13 @@ def _one(lines, harness):
         event = json.loads(line)
         target = event.get("target", {})
         profile = event.get("profile", {})
-        if (event.get("reason") == "compiler-artifact" and target.get("name") == "mc-spine"
+        if (event.get("reason") == "compiler-artifact" and target.get("name") == "megu"
                 and target.get("kind") == ["bin"] and bool(profile.get("test")) is harness
                 and event.get("executable")):
             paths.add(Path(event["executable"]).resolve())
     kind = "test harness" if harness else "build"
     if len(paths) != 1:
-        raise ValueError(f"expected one mc-spine {kind} executable, received {len(paths)}")
+        raise ValueError(f"expected one megu {kind} executable, received {len(paths)}")
     path = paths.pop()
     if not path.is_file():
         raise ValueError(f"Cargo's executable does not exist: {path}")

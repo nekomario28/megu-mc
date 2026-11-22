@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
-"""Run mc-spine for a local client and inject its Quick Play multiplayer address.
+"""Run megu for a local client and inject its Quick Play multiplayer address.
 
 Usage: python3 integrated_bridge.py --game-dir DIR [--world NAME] -- CLIENT [ARGS...]
-The default world is mc-spine, overridable with MC_SPINE_INTEGRATED_WORLD.
-Set MC_SPINE_SERVER_BIN for an explicit server executable and MC_SPINE_SERVER_HOME
+The default world is megu, overridable with MEGU_INTEGRATED_WORLD.
+Set MEGU_SERVER_BIN for an explicit server executable and MEGU_SERVER_HOME
 for its runtime data (config_packets.bin, assets, and optional datapacks/vanilla).
 """
 import argparse
@@ -25,26 +25,26 @@ QUICK_PLAY_TARGETS = {"--quickPlayMultiplayer", "--quickPlaySingleplayer", "--qu
 
 
 def server_binary(game_dir):
-    configured = os.environ.get("MC_SPINE_SERVER_BIN")
+    configured = os.environ.get("MEGU_SERVER_BIN")
     candidates = [configured] if configured else [
-        str(game_dir / "mc-spine"), str(game_dir / "bin" / "mc-spine"), "mc-spine",
+        str(game_dir / "megu"), str(game_dir / "bin" / "megu"), "megu",
     ]
     for candidate in candidates:
         found = shutil.which(candidate)
         if found:
             return Path(found).resolve()
-    raise ValueError("mc-spine server not found or not executable (MC_SPINE_SERVER_BIN, --gameDir, PATH)")
+    raise ValueError("megu server not found or not executable (MEGU_SERVER_BIN, --gameDir, PATH)")
 
 
 def link_runtime_data(world, binary, game_dir):
-    configured = os.environ.get("MC_SPINE_SERVER_HOME")
+    configured = os.environ.get("MEGU_SERVER_HOME")
     candidates = [Path(configured).resolve()] if configured else [
         game_dir, Path.cwd(), *binary.parents,
     ]
     home = next((root for root in candidates
                  if (root / "config_packets.bin").is_file() and (root / "assets").is_dir()), None)
     if home is None and configured:
-        raise ValueError("MC_SPINE_SERVER_HOME must contain config_packets.bin and assets")
+        raise ValueError("MEGU_SERVER_HOME must contain config_packets.bin and assets")
     if home is not None:
         for name in ("config_packets.bin", "assets", "datapacks/vanilla"):
             source, target = home / name, world / name
@@ -81,7 +81,7 @@ def log_server(server, endpoint, ready):
     banner = f" listening {endpoint} "
     with server.stdout:
         for line in server.stdout:
-            if line.startswith("mc-spine ") and banner in line:
+            if line.startswith("megu ") and banner in line:
                 ready.set()
             print(line, end="", file=sys.stderr, flush=True)
 
@@ -92,16 +92,16 @@ def handoff_json(command, endpoint):
 
 
 def write_manifest(process, command, endpoint):
-    # Legacy opt-in only: the default channel is the MC_SPINE_HANDOFF_JSON
+    # Legacy opt-in only: the default channel is the MEGU_HANDOFF_JSON
     # environment variable, so launches create zero temporary files.
-    if os.environ.get("MC_SPINE_HANDOFF_FILE") != "1":
+    if os.environ.get("MEGU_HANDOFF_FILE") != "1":
         return
-    destination = os.environ.get("MC_SPINE_HANDOFF_MANIFEST")
+    destination = os.environ.get("MEGU_HANDOFF_MANIFEST")
     if not destination:
         return
     path = Path(destination).absolute()
     path.parent.mkdir(parents=True, exist_ok=True)
-    fd, name = tempfile.mkstemp(dir=path.parent, prefix=".mc-spine-handoff-")
+    fd, name = tempfile.mkstemp(dir=path.parent, prefix=".megu-handoff-")
     temp = Path(name)
     try:
         with os.fdopen(fd, "w", encoding="utf-8") as stream:
@@ -121,10 +121,10 @@ def run_server(binary, world, client, stopping):
         reserved.bind((LOOPBACK, 0))
         port = reserved.getsockname()[1]
     endpoint = f"{LOOPBACK}:{port}"
-    env = dict(os.environ, MC_SPINE_BIND_ADDR=LOOPBACK, MC_SPINE_PORT=str(port),
-               MC_SPINE_WORLD_DIR=str(world), MC_SPINE_RESOURCE_PACK_URL="",
-               MC_SPINE_MAX_CONN_PER_IP="1")
-    env.pop("MC_SPINE_RCON_PORT", None)
+    env = dict(os.environ, MEGU_BIND_ADDR=LOOPBACK, MEGU_PORT=str(port),
+               MEGU_WORLD_DIR=str(world), MEGU_RESOURCE_PACK_URL="",
+               MEGU_MAX_CONN_PER_IP="1")
+    env.pop("MEGU_RCON_PORT", None)
     server = subprocess.Popen([str(binary)], cwd=world, env=env, stdin=subprocess.DEVNULL,
                               stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
                               encoding="utf-8", errors="replace")
@@ -146,7 +146,7 @@ def run_server(binary, world, client, stopping):
             raise ValueError(f"server exited during startup ({server.returncode})")
         command = client_command(client, endpoint)
         client_env = dict(os.environ,
-                          MC_SPINE_HANDOFF_JSON=handoff_json(command, endpoint))
+                          MEGU_HANDOFF_JSON=handoff_json(command, endpoint))
         process = subprocess.Popen(command, stdin=subprocess.DEVNULL, env=client_env)
         try:
             write_manifest(process, command, endpoint)
@@ -181,7 +181,7 @@ def lock_world(lock):
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--game-dir", type=Path, required=True)
-    parser.add_argument("--world", default=os.environ.get("MC_SPINE_INTEGRATED_WORLD", "mc-spine"))
+    parser.add_argument("--world", default=os.environ.get("MEGU_INTEGRATED_WORLD", "megu"))
     parser.add_argument("--parent-stdin", action="store_true", help=argparse.SUPPRESS)
     parser.add_argument("client", nargs=argparse.REMAINDER)
     args = parser.parse_args()
@@ -213,12 +213,12 @@ def main():
         if world.parent != saves:
             raise ValueError("integrated world must be inside the saves directory")
         world.mkdir(parents=True, exist_ok=True)
-        with (world / ".mc-spine-integrated.lock").open("ab") as lock:
+        with (world / ".megu-integrated.lock").open("ab") as lock:
             lock_world(lock)
             link_runtime_data(world, binary, game_dir)
             return run_server(binary, world, client, lambda: stopped)
     except (OSError, ValueError) as error:
-        print(f"mc-spine integrated: {error}", file=sys.stderr)
+        print(f"megu integrated: {error}", file=sys.stderr)
         return 2
 
 

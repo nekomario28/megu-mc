@@ -9,21 +9,21 @@
 
 use std::path::PathBuf;
 
-use mc_spine_client::cli::parse_args;
-use mc_spine_client::lod::LodConfig;
-use mc_spine_client::render::{RenderConfig, ShaderpackResolveInput};
-use mc_spine_client::render_graph::{
+use megu_client::cli::parse_args;
+use megu_client::lod::LodConfig;
+use megu_client::render::{RenderConfig, ShaderpackResolveInput};
+use megu_client::render_graph::{
     plan_frame, plan_frame_with_shaderpack, FramePlanInput, GpuPipelineKind,
 };
-use mc_spine_client::settings::{
+use megu_client::settings::{
     is_valid_shader_selector, ClientSettings, QualityPreset,
 };
-use mc_spine_client::shaderpack_runtime::{
+use megu_client::shaderpack_runtime::{
     activate_shaderpack, ActiveShaderSession, ShaderActivationOutcome,
     ShaderActivationRequest,
 };
-use mc_spine_client::shaders::{HIZ_DOWNSAMPLE_COMPUTE_WGSL, TERRAIN_OPAQUE_WGSL};
-use mc_spine_client_mesh::{
+use megu_client::shaders::{HIZ_DOWNSAMPLE_COMPUTE_WGSL, TERRAIN_OPAQUE_WGSL};
+use megu_client_mesh::{
     PackDimension, PassKind, PipelineStage, ShaderOptionOverrides, ShaderPackFamily,
     ShaderPackSource,
 };
@@ -147,7 +147,7 @@ fn megu_wgsl_pack() -> ShaderPackSource {
             r#"
 [pack]
 name = "Megu Native Fast"
-author = "mc-spine"
+author = "megu"
 version = "1.0.0"
 api = 1
 supports_lod = true
@@ -182,7 +182,7 @@ fn active_session(
     *session
 }
 
-fn pack_pass_names(plan: &mc_spine_client::render_graph::RenderGraphPlan) -> Vec<&str> {
+fn pack_pass_names(plan: &megu_client::render_graph::RenderGraphPlan) -> Vec<&str> {
     plan.shaderpack_passes.iter().map(|p| p.name.as_str()).collect()
 }
 
@@ -284,7 +284,7 @@ fn shader_selectors_toml_roundtrip_and_reject_traversal_gracefully() {
 
 fn scratch_dir(tag: &str) -> PathBuf {
     let dir = std::env::temp_dir().join(format!(
-        "mc-spine-shaderpack-test-{tag}-{}",
+        "megu-shaderpack-test-{tag}-{}",
         std::process::id()
     ));
     let _ = std::fs::remove_dir_all(&dir);
@@ -646,7 +646,7 @@ fn resolve_shaderpack_falls_back_cleanly_on_classic_low_spec() {
     let pack = nextgen_iris_pack();
     let settings = ClientSettings {
         shader_pack: Some("shaderpacks/nextgen-ray-style.zip".to_owned()),
-        gpu_backend: mc_spine_client_mesh::RenderBackendPreference::ClassicLowSpec,
+        gpu_backend: megu_client_mesh::RenderBackendPreference::ClassicLowSpec,
         ..ClientSettings::default()
     };
     let config = RenderConfig::from_settings(&settings);
@@ -742,7 +742,7 @@ fn resolve_shaderpack_profile_flows_into_activation() {
         },
     );
     let session = state.session.expect("classic pack activates");
-    let mc_spine_client::shaderpack_runtime::LoadedPackKind::IrisOptiFine(plan) = &session.pack
+    let megu_client::shaderpack_runtime::LoadedPackKind::IrisOptiFine(plan) = &session.pack
     else {
         panic!("expected IrisOptiFine plan");
     };
@@ -752,6 +752,6 @@ fn resolve_shaderpack_profile_flows_into_activation() {
         .iter()
         .find(|p| p.name == "composite")
         .expect("composite pass");
-    let frag = &comp.shaders[&mc_spine_client_mesh::ShaderKind::Fragment];
+    let frag = &comp.shaders[&megu_client_mesh::ShaderKind::Fragment];
     assert!(frag.source.contains("#define SHADOW_RES 2048"));
 }

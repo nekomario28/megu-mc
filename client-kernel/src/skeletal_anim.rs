@@ -14,7 +14,7 @@ pub const MAX_JSON_DEPTH: usize = 48;
 pub const MAX_CLIPS: usize = 128;
 pub const MAX_KEYFRAMES: usize = 4096;
 pub const MAX_LAYERS: usize = 16;
-pub const ANIMATION_CHANNEL: &str = "mc-spine:anim_v1";
+pub const ANIMATION_CHANNEL: &str = "megu:anim_v1";
 pub const ANM1_BYTES: usize = 19;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

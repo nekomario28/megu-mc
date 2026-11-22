@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Build, verify and diff mc-spine VersionPacks from vanilla DataGenerator reports.
+"""Build, verify and diff megu VersionPacks from vanilla DataGenerator reports.
 
   version_pack.py build --reports <datagen_reports_dir> --out <pack_dir>
                         [--version-json <version.json>] [--mc-version <ver>]
@@ -1303,7 +1303,7 @@ def self_test():
 def main(argv=None):
     parser = argparse.ArgumentParser(
         prog="version_pack.py",
-        description="Build, verify and diff mc-spine VersionPacks from vanilla "
+        description="Build, verify and diff megu VersionPacks from vanilla "
                     "DataGenerator --reports output.")
     parser.add_argument("--self-test", action="store_true",
                         help="run the offline self-test suite and exit")

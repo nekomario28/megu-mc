@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # SPDX-License-Identifier: LGPL-3.0-or-later
-"""Live Protocol 767 block-shape/redstone checks against mc-spine and Vanilla.
+"""Live Protocol 767 block-shape/redstone checks against megu and Vanilla.
 
 The two servers receive the same ordered C2S placement/break/interact trace
 and RCON fixture commands. Block-state observations come from the actual 0x27/
@@ -507,11 +507,11 @@ def compare(name, spine, vanilla):
         for label in sorted(left.keys() | right.keys()):
             x, y = left.get(label), right.get(label)
             if x is None or y is None or x["actual"] != y["actual"]:
-                differences.append({"check": label, "mc_spine": x["actual"] if x else None,
+                differences.append({"check": label, "megu": x["actual"] if x else None,
                                     "vanilla": y["actual"] if y else None})
     status = ("PASS" if a["status"] == "PASS" and
               (b is None or b["status"] == "PASS") and not differences else "MISMATCH")
-    return {"name": name, "status": status, "mc_spine": a,
+    return {"name": name, "status": status, "megu": a,
             "vanilla": b, "differences": differences}
 
 
@@ -540,18 +540,18 @@ def self_test():
     assert compare(SCENARIO_NAMES[0], {SCENARIO_NAMES[0]: good},
                    {SCENARIO_NAMES[0]: good})["status"] == "PASS"
     sample = report(dict.fromkeys(SCENARIO_NAMES, good),
-                    dict.fromkeys(SCENARIO_NAMES, good), Path("mc-spine"), Path("server.jar"))
+                    dict.fromkeys(SCENARIO_NAMES, good), Path("megu"), Path("server.jar"))
     encoded = json.loads(json.dumps(sample, sort_keys=True))
     assert encoded["schema"] == SCHEMA and len(encoded["scenarios"]) == 11
     assert encoded["summary"] == {"pass": 11, "mismatch": 0, "vanilla_executed": True}
-    assert all({"name", "status", "mc_spine", "vanilla", "differences"} <= set(row)
+    assert all({"name", "status", "megu", "vanilla", "differences"} <= set(row)
                for row in encoded["scenarios"])
     print("PASS: 11 scenarios, mismatch detector, JSON schema")
 
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--binary", type=Path, default=ROOT / "target/debug/mc-spine")
+    parser.add_argument("--binary", type=Path, default=ROOT / "target/debug/megu")
     parser.add_argument("--with-vanilla", action="store_true")
     parser.add_argument("--vanilla-jar", type=Path, default=JAR)
     parser.add_argument("--self-test", action="store_true")
@@ -569,18 +569,18 @@ def main():
         digest = hashlib.file_digest(jar.open("rb"), "sha1").hexdigest()
         if digest != JAR_SHA1:
             parser.error(f"untrusted Vanilla JAR SHA-1 {digest}, expected {JAR_SHA1}")
-    spine = run_target("mc-spine", binary, jar)
+    spine = run_target("megu", binary, jar)
     vanilla = run_target("vanilla", binary, jar) if args.with_vanilla else None
     result = report(spine, vanilla, binary, jar)
     if args.json:
         print(json.dumps(result, indent=2, ensure_ascii=False, sort_keys=True))
     else:
-        print(f"{'Scenario':48} {'mc-spine':9} {'Vanilla':9} {'Differential':12}")
+        print(f"{'Scenario':48} {'megu':9} {'Vanilla':9} {'Differential':12}")
         for row in result["scenarios"]:
             vanilla_status = row["vanilla"]["status"] if row["vanilla"] else "NOT RUN"
-            print(f"{row['name']:48} {row['mc_spine']['status']:9} "
+            print(f"{row['name']:48} {row['megu']['status']:9} "
                   f"{vanilla_status:9} {row['status']:12}")
-            for server in ("mc_spine", "vanilla"):
+            for server in ("megu", "vanilla"):
                 case = row[server]
                 if case is not None:
                     failed = [check["label"] for check in case["checks"] if not check["pass"]]

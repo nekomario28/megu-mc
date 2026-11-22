@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: LGPL-3.0-or-later OR GPL-3.0-or-later OR AGPL-3.0-or-later
 //! Clean-room chunk claims, parties, allies and force-loading in the spirit of
 //! Open Parties and Claims (`openpartiesandclaims`) and FTB Chunks
-//! (`ftbchunks`), implemented from scratch on `std` + [`mc_spine_core`].
+//! (`ftbchunks`), implemented from scratch on `std` + [`megu_core`].
 //!
 //! The engine is deterministic end to end: every collection is a `BTree*` so
 //! iteration order (and therefore persistence bytes, sync deltas and command
@@ -31,7 +31,7 @@
 
 use crate::atomic::write_atomic;
 use crate::json::{self, Json};
-use mc_spine_core::id::ResourceLocation;
+use megu_core::id::ResourceLocation;
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 use std::io;

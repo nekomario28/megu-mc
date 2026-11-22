@@ -12,13 +12,13 @@ command instead of a paragraph: it reads the chunk out of the world's region fil
 the palette's canonical `name[prop=value,...]` form, drops `minecraft:air`, and writes
 the rows sorted by (local x, y, local z).
 
-The output format is the same one `MC_SPINE_WG_DUMP_CANON` writes from the port, so a
+The output format is the same one `MEGU_WG_DUMP_CANON` writes from the port, so a
 test can compare the two maps cell for cell:
 
     # chunk <cx>,<cz> min_y <min_y> height <tallest content y - min_y + 1> cells <n>
     <x>\\t<y>\\t<z>\\t<state>
 
-Coordinates are absolute, the same ones `MC_SPINE_WG_DUMP_CANON` prints, and the cells
+Coordinates are absolute, the same ones `MEGU_WG_DUMP_CANON` prints, and the cells
 are the states the pinned server produced for that chunk; nothing here is copied from
 the jar.
 """

@@ -80,17 +80,17 @@ def compile_c(include_dir, output, source, *flags):
 
 def verify_layout(include_dir, temporary_dir):
     """Compare size, alignment and offsets to the public C11 header."""
-    expressions = ["MC_SPINE_KERNEL_ABI_VERSION"]
+    expressions = ["MEGU_KERNEL_ABI_VERSION"]
     expected = [ABI_VERSION]
     for name, record in RECORDS.items():
-        c_type = f"mc_spine_kernel_{name}"
+        c_type = f"megu_kernel_{name}"
         expressions.extend((f"sizeof({c_type})", f"_Alignof({c_type})"))
         expected.extend((C.sizeof(record), C.alignment(record)))
         for field, field_type in record._fields_:
             expressions.extend((f"offsetof({c_type}, {field})", f"sizeof((({c_type} *)0)->{field})"))
             expected.extend((getattr(record, field).offset, C.sizeof(field_type)))
     source = (
-        '#include "mc_spine_kernel.h"\n#include <stdio.h>\nint main(void) {\n'
+        '#include "megu_kernel.h"\n#include <stdio.h>\nint main(void) {\n'
         + "".join(f'    printf("%zu\\n", (size_t)({expr}));\n' for expr in expressions)
         + "    return 0;\n}\n"
     )
@@ -105,7 +105,7 @@ def verify_layout(include_dir, temporary_dir):
 class Kernel:
     def __init__(self, path):
         self.lib = C.CDLL(str(path))
-        version = self.lib.mc_spine_kernel_abi_version
+        version = self.lib.megu_kernel_abi_version
         version.argtypes, version.restype = [], U32
         actual_version = version()
         require(actual_version == ABI_VERSION,
@@ -136,7 +136,7 @@ class Kernel:
         }
         self.functions = {}
         for name, args in signatures.items():
-            function = getattr(self.lib, "mc_spine_kernel_" + name)
+            function = getattr(self.lib, "megu_kernel_" + name)
             function.argtypes, function.restype = args, Status
             self.functions[name] = function
 

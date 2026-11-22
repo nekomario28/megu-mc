@@ -214,13 +214,13 @@ impl SubsetVmHost for RecordingHost {
 // Fixture builders
 // ---------------------------------------------------------------------------
 
-/// `onDamage(Lmcspine/api/Event;)V` implementing the classic
+/// `onDamage(Lmegu/api/Event;)V` implementing the classic
 /// `if (event.getDamage() > 10.0f) event.setDamage(event.getDamage() * 0.5f)`
-/// damage-modifier hook — symbolic `mcspine/api` host names.
+/// damage-modifier hook — symbolic `megu/api` host names.
 fn damage_hook_class() -> Vec<u8> {
     let mut a = ClassAssembler::new("com/example/DamageHook");
-    let get_damage = a.cp.method_ref("mcspine/api/Event", "getDamage", "()F");
-    let set_damage = a.cp.method_ref("mcspine/api/Event", "setDamage", "(F)V");
+    let get_damage = a.cp.method_ref("megu/api/Event", "getDamage", "()F");
+    let set_damage = a.cp.method_ref("megu/api/Event", "setDamage", "(F)V");
     let ten = a.cp.float(10.0);
     let half = a.cp.float(0.5);
     //  0: aload_0
@@ -252,7 +252,7 @@ fn damage_hook_class() -> Vec<u8> {
     assert_eq!(bc.len(), 22);
     a.finish(&[MethodSpec::new(
         "onDamage",
-        "(Lmcspine/api/Event;)V",
+        "(Lmegu/api/Event;)V",
         4,
         1,
         bc,
@@ -337,7 +337,7 @@ fn parses_class_structure() {
     assert_eq!(parsed.methods.len(), 1);
     let m = &parsed.methods[0];
     assert_eq!(m.name, "onDamage");
-    assert_eq!(m.descriptor, "(Lmcspine/api/Event;)V");
+    assert_eq!(m.descriptor, "(Lmegu/api/Event;)V");
     assert_eq!(m.max_stack, 4);
     assert_eq!(m.max_locals, 1);
     assert_eq!(m.code.len(), 22);
@@ -347,7 +347,7 @@ fn parses_class_structure() {
 fn damage_hook_halves_damage_above_threshold_zero_jvm() {
     let bytes = damage_hook_class();
     let parsed = parse_class_methods(&bytes).unwrap();
-    let method = verify_subset_method(&parsed, "onDamage", "(Lmcspine/api/Event;)V")
+    let method = verify_subset_method(&parsed, "onDamage", "(Lmegu/api/Event;)V")
         .expect("damage hook verifies cleanly");
 
     // 14.0 damage: above threshold -> halved to 7.0.
@@ -412,8 +412,8 @@ fn interface_invoke_and_block_access_roundtrip() {
     //   else give item. Simplified: set a block, give a pickaxe, read a
     //   block name back via Str result.
     let mut a = ClassAssembler::new("com/example/BlockLogic");
-    let level = "mcspine/api/Level";
-    let player = "mcspine/api/Player";
+    let level = "megu/api/Level";
+    let player = "megu/api/Player";
     let get_block =
         a.cp.interface_method_ref(level, "getBlockId", "(III)Ljava/lang/String;");
     let set_block =
@@ -444,13 +444,13 @@ fn interface_invoke_and_block_access_roundtrip() {
     ]);
     let bytes = a.finish(&[MethodSpec::new(
         "run",
-        "(Lmcspine/api/Level;Lmcspine/api/Player;)V",
+        "(Lmegu/api/Level;Lmegu/api/Player;)V",
         8,
         2,
         bc,
     )]);
     let parsed = parse_class_methods(&bytes).unwrap();
-    let method = verify_subset_method(&parsed, "run", "(Lmcspine/api/Level;Lmcspine/api/Player;)V")
+    let method = verify_subset_method(&parsed, "run", "(Lmegu/api/Level;Lmegu/api/Player;)V")
         .expect("block logic verifies");
     let mut host = RecordingHost::default();
     execute_verified_method(

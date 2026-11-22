@@ -56,7 +56,7 @@ def export(jar, destination):
             biomes = {"minecraft:" + name[len(prefix):-5] for name in archive.namelist()
                       if name.startswith(prefix) and name.endswith(".json")}
         output = work / "tree.json"
-        run_probe(work, cp, SOURCE, "dev.mcspine.tools.ExportBiomeTree", output)
+        run_probe(work, cp, SOURCE, "dev.megu.tools.ExportBiomeTree", output)
         tree = json.loads(output.read_text())
         counts = validate_tree(tree, biomes)
         tree["_provenance"] = {"minecraft": "1.21.1", "server_sha1": JAR_SHA1,

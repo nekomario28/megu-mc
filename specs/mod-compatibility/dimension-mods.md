@@ -6,7 +6,7 @@ Status: **`mod-adapter-core/src/dimension_mod.rs` + launcher awareness implement
 
 ## 1. Position on Track 2 dynamic dimensions
 
-mc-spine already owns the four pieces a custom dimension needs at runtime:
+megu already owns the four pieces a custom dimension needs at runtime:
 
 - `DimId(u32)` + append-only `DimensionRegistry` (`src/worldgen.rs`): custom `dimension_type` JSON registers a slot ≥ 3 with `min_y`, `height`, `coordinate_scale`, `has_skylight`, `has_ceiling`, `ultrawarm`, `bed_works`, `respawn_anchor_works`, `effects`.
 - `0x07` Registry Data + custom `dimension_type` NBT in the Configuration phase so unmodified clients learn the dimension.

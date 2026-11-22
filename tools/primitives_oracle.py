@@ -93,7 +93,7 @@ def reference(jar):
     with pinned_runtime(jar) as (work, cp, _):
         src, dst = work / "input.json", work / "output.json"
         src.write_text(json.dumps({"cases": requested}))
-        run_probe(work, cp, SOURCE, "dev.mcspine.tools.PrimitivesOracle", src, dst)
+        run_probe(work, cp, SOURCE, "dev.megu.tools.PrimitivesOracle", src, dst)
         rows = json.loads(dst.read_text())
     validate(rows, requested)
     return {"minecraft": "1.21.1", "server_sha1": JAR_SHA1,

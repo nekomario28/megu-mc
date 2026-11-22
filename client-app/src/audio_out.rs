@@ -471,7 +471,7 @@ impl SubprocessSink {
             let writer_done = writer_done.clone();
             let dead = dead.clone();
             std::thread::Builder::new()
-                .name("mc-spine-audio-sink".to_string())
+                .name("megu-audio-sink".to_string())
                 .spawn(move || {
                     let _mark_done = writer_done;
                     while let Some(chunk) = queue.pop(Duration::from_millis(100)) {
@@ -1409,7 +1409,7 @@ impl AudioRuntime {
     pub fn new(cfg: &AudioSessionConfig) -> Self {
         let (sink, warning) = open_sink(&cfg.sink);
         if let Some(w) = warning {
-            eprintln!("mc-spine-client audio: {w}");
+            eprintln!("megu-client audio: {w}");
         }
         let label = sink.label();
         let mut mixer = SoundMixer::new(MIX_SAMPLE_RATE, SpatialAudioPreset::Realistic);
@@ -1433,12 +1433,12 @@ impl AudioRuntime {
         let subtitle_file = subtitle_path.and_then(|p| match std::fs::File::create(&p) {
             Ok(f) => Some(BufWriter::new(f)),
             Err(e) => {
-                eprintln!("mc-spine-client audio: cannot write {}: {e}", p.display());
+                eprintln!("megu-client audio: cannot write {}: {e}", p.display());
                 None
             }
         });
         if cfg.sink != AudioSinkKind::Off {
-            eprintln!("mc-spine-client audio: sink={label} (48 kHz s16 stereo)");
+            eprintln!("megu-client audio: sink={label} (48 kHz s16 stereo)");
         }
         Self {
             mixer,
@@ -1481,7 +1481,7 @@ impl AudioRuntime {
                 (Some(dir), Some(index)) => match SoundLibrary::load(dir, index) {
                     Ok(lib) => {
                         eprintln!(
-                            "mc-spine-client audio: {} sound events from {}",
+                            "megu-client audio: {} sound events from {}",
                             lib.event_count(),
                             dir.display()
                         );
@@ -1489,7 +1489,7 @@ impl AudioRuntime {
                     }
                     Err(e) => {
                         eprintln!(
-                            "mc-spine-client audio: sound library unavailable ({e}); \
+                            "megu-client audio: sound library unavailable ({e}); \
                              placeholder tones will play"
                         );
                         None
@@ -1516,12 +1516,12 @@ impl AudioRuntime {
                     match lib.merge_sound_layer(&path) {
                         Ok(n) => {
                             eprintln!(
-                                "mc-spine-client audio: merged {n} sounds.json from {}",
+                                "megu-client audio: merged {n} sounds.json from {}",
                                 path.display()
                             );
                         }
                         Err(e) => {
-                            eprintln!("mc-spine-client audio: {}: {e}", path.display());
+                            eprintln!("megu-client audio: {}: {e}", path.display());
                         }
                     }
                 }
@@ -1595,7 +1595,7 @@ impl AudioRuntime {
                         Err(e) => {
                             self.mixer.stats.decode_errors += 1;
                             if self.mixer.stats.decode_errors <= 3 {
-                                eprintln!("mc-spine-client audio: {e}");
+                                eprintln!("megu-client audio: {e}");
                             }
                         }
                     }
@@ -1737,7 +1737,7 @@ impl AudioRuntime {
             if !self.warned_null {
                 self.warned_null = true;
                 eprintln!(
-                    "mc-spine-client audio: {} sink failed; continuing on null",
+                    "megu-client audio: {} sink failed; continuing on null",
                     self.sink.label()
                 );
             }
@@ -1767,7 +1767,7 @@ impl AudioRuntime {
             );
             if self.subtitles_to_stderr {
                 eprintln!(
-                    "mc-spine-client subtitle: {dir} {} ({:.1}m)",
+                    "megu-client subtitle: {dir} {} ({:.1}m)",
                     sub.name, sub.cue.distance_m
                 );
             }
@@ -1865,7 +1865,7 @@ impl AudioRuntime {
         // sink once enabled (`self.sink` is a null stand-in by then).
         self.mix_thread = None;
         self.sink.finish();
-        eprintln!("mc-spine-client audio done: {}", self.report_line());
+        eprintln!("megu-client audio done: {}", self.report_line());
     }
 }
 
@@ -2623,7 +2623,7 @@ impl AudioMixThread {
         // successful spawn — a failed spawn keeps it for manual mode.
         let (tx, rx) = std::sync::mpsc::channel::<AudioMixCore>();
         match std::thread::Builder::new()
-            .name("mc-spine-audio-mix".to_string())
+            .name("megu-audio-mix".to_string())
             .spawn(move || {
                 let Ok(mut core) = rx.recv() else {
                     return;

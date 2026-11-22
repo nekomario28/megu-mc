@@ -37,7 +37,7 @@ fi
 # Install by rename only after every check passes. Never delete a caller-owned directory.
 parent=$(dirname -- "$out")
 mkdir -p -- "$parent"
-stage=$(mktemp -d -- "$parent/.mc-spine-export.XXXXXXXX")
+stage=$(mktemp -d -- "$parent/.megu-export.XXXXXXXX")
 trap 'rm -rf -- "$stage"' EXIT
 if ((worktree)); then
     { git ls-files -z; git ls-files --others --exclude-standard -z; } | tar --null --no-recursion -cf - -T - | tar -xf - -C "$stage"
@@ -72,10 +72,10 @@ printf '/assets/**/*_1211*\n/tests/data/**/*_1211*\n' >> .gitignore
 
 git init -q --template= -b "$branch"
 git -c core.hooksPath=/dev/null add -- .
-GIT_AUTHOR_NAME="${GIT_AUTHOR_NAME:-mc-spine release}" \
-GIT_AUTHOR_EMAIL="${GIT_AUTHOR_EMAIL:-release@mc-spine.invalid}" \
-GIT_COMMITTER_NAME="${GIT_COMMITTER_NAME:-mc-spine release}" \
-GIT_COMMITTER_EMAIL="${GIT_COMMITTER_EMAIL:-release@mc-spine.invalid}" \
+GIT_AUTHOR_NAME="${GIT_AUTHOR_NAME:-megu release}" \
+GIT_AUTHOR_EMAIL="${GIT_AUTHOR_EMAIL:-release@megu.invalid}" \
+GIT_COMMITTER_NAME="${GIT_COMMITTER_NAME:-megu release}" \
+GIT_COMMITTER_EMAIL="${GIT_COMMITTER_EMAIL:-release@megu.invalid}" \
     git -c core.hooksPath=/dev/null -c commit.gpgSign=false commit -q -s -m "Clean public export from $short (P0-3 D5)"
 
 count=$(git rev-list --count HEAD)

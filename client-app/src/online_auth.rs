@@ -969,8 +969,8 @@ pub struct EncryptionRequestFields {
 /// Decode an Encryption Request body, fail-closed on truncation, overlong
 /// fields, or trailing bytes.
 pub fn decode_encryption_request_body(body: &[u8]) -> Result<EncryptionRequestFields, String> {
-    let mut r = mc_spine_proto::WireReader::new(body);
-    let map_err = |e: mc_spine_proto::ProtoError| format!("malformed encryption request: {e}");
+    let mut r = megu_proto::WireReader::new(body);
+    let map_err = |e: megu_proto::ProtoError| format!("malformed encryption request: {e}");
     let fields = EncryptionRequestFields {
         server_id: r.read_string(MAX_SERVER_ID_CHARS).map_err(map_err)?,
         public_key_der: r
@@ -997,7 +997,7 @@ pub fn encode_encryption_response_body(
     let mut out = Vec::with_capacity(
         10 + encrypted_shared_secret.len() + encrypted_verify_token.len(),
     );
-    let mut w = mc_spine_proto::WireWriter::from_vec(std::mem::take(&mut out));
+    let mut w = megu_proto::WireWriter::from_vec(std::mem::take(&mut out));
     w.write_bytes(encrypted_shared_secret);
     w.write_bytes(encrypted_verify_token);
     w.into_vec()

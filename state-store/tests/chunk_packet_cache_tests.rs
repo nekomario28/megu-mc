@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: LGPL-3.0-or-later
 
-use mc_spine_state_store::chunk_packet_cache::{ChunkPacketCache, ChunkPacketKey};
+use megu_state_store::chunk_packet_cache::{ChunkPacketCache, ChunkPacketKey};
 use std::sync::Arc;
 
 fn key(dim: u8, cx: i32, cz: i32, compression_threshold: i32) -> ChunkPacketKey {

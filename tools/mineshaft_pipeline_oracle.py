@@ -19,7 +19,7 @@ def main():
         output = work / "mineshafts.json"
         args = [output] + (["missing-tags-control"] if a.missing_tags_control else [])
         run_probe(work, classpath, ROOT / "tools/structure-oracle/MineshaftPipelineOracle.java",
-                  "dev.mcspine.tools.MineshaftPipelineOracle", *args, extra_sources=[
+                  "dev.megu.tools.MineshaftPipelineOracle", *args, extra_sources=[
                       ROOT / "tools/structure-oracle/NativeHarness.java",
                       ROOT / "tools/structure-oracle/MineshaftLayoutOracle.java"])
         data = json.loads(output.read_text())

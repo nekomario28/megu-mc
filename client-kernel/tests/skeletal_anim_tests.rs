@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: LGPL-3.0-or-later OR GPL-3.0-or-later OR AGPL-3.0-or-later
 use std::collections::HashMap;
 
-use mc_spine_kernel::skeletal_anim::{
+use megu_kernel::skeletal_anim::{
     decode_animation_trigger, encode_animation_trigger, parse_animation_json, parse_geometry_json,
     parse_geometry_rigs_json, parse_jem_model, parse_jpm_model, AnimationClip, AnimationController,
     AnimationError, AnimationTrigger,
@@ -308,7 +308,7 @@ fn once_loop_and_hold_follow_distinct_end_behavior() {
 
 #[test]
 fn anm1_roundtrip_byte_layout_and_hostile_payloads() {
-    assert_eq!(ANIMATION_CHANNEL, "mc-spine:anim_v1");
+    assert_eq!(ANIMATION_CHANNEL, "megu:anim_v1");
     let event = AnimationTrigger {
         entity_id: 0x01020304,
         layer: 3,

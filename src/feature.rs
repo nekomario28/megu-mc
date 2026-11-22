@@ -1,5 +1,5 @@
 // feature.rs — datapack-driven placement and configured-feature execution for
-// mc-spine. Loads placed/configured feature JSON and biome feature lists, runs
+// megu. Loads placed/configured feature JSON and biome feature lists, runs
 // the vanilla placement-modifier chain per chunk (3x3 neighborhood, population
 // seeds) and writes block-state overrides into Gen::feat_c.
 //
@@ -6236,7 +6236,7 @@ pub(crate) fn choose_supported_hostile(biome: &str, roll: u64) -> Option<&'stati
 
 #[cfg(test)]
 mod empty_registry_tests {
-    /// The wire-test harness runs `mc-spine` from a scratch working directory
+    /// The wire-test harness runs `megu` from a scratch working directory
     /// that carries only `assets` and `config_packets.bin`, so `Gen::packs()`
     /// sees no `datapacks/` tree and every datapack inventory — biome files
     /// included — comes back empty. `load_freg` must still build an (empty)
@@ -10208,7 +10208,7 @@ struct CarveRun<'a, 's> {
     grass_state: u32,
     podzol_state: u32,
     dirt_state: u32,
-    /// `MC_SPINE_NOFOLD`, hoisted out of the per-cell `carve_block`.
+    /// `MEGU_NOFOLD`, hoisted out of the per-cell `carve_block`.
     nofold: bool,
     /// First cell the current source chunk wrote, for the `SRC` trace that is
     /// compared against the real server's carve agent.
@@ -10245,7 +10245,7 @@ impl<'a, 's> CarveRun<'a, 's> {
             grass_state: br.map_or(0, |b| b.state_of("minecraft:grass_block", None)),
             podzol_state: br.map_or(0, |b| b.state_of("minecraft:podzol", None)),
             dirt_state: br.map_or(0, |b| b.state_of("minecraft:dirt", None)),
-            nofold: env_flag!("MC_SPINE_NOFOLD"),
+            nofold: env_flag!("MEGU_NOFOLD"),
             mark: None,
         }
     }
@@ -10356,7 +10356,7 @@ impl<'a, 's> CarveRun<'a, 's> {
 /// Diagnostics are env-gated and deliberately small, because each one is a way to
 /// compare against vanilla without a second implementation standing in for it:
 ///
-/// * `MC_SPINE_NOCARVE` — skip carvers (the "no carvers" world fixture).
+/// * `MEGU_NOCARVE` — skip carvers (the "no carvers" world fixture).
 /// * `CARVE_TRACE` — one line per chunk: configs loaded, starts, cells written.
 /// * `CARVE_PROBE=<tx,tz>|all` — carve an all-stone world (every ellipsoid cell is
 ///   replaceable and the aquifer answers cave_air) and print the writes. That is
@@ -10379,7 +10379,7 @@ pub(crate) fn apply_carvers(g: &mut Gen, tx: i32, tz: i32) {
 /// `grid`, when a batch has already resolved the origins, is passed straight through; a serial
 /// single-chunk call falls back to [`origin_carvers`] and its owner-thread cache.
 fn apply_carvers_body(g: &mut Gen, tx: i32, tz: i32, grid: Option<&OriginGrid>) {
-    if env_flag!("MC_SPINE_NOCARVE") {
+    if env_flag!("MEGU_NOCARVE") {
         return;
     }
     let reg = creg();
@@ -10442,7 +10442,7 @@ fn carve_ring_with(g: &mut Gen, sx: i32, sz: i32, jobs: usize) {
 
 /// `true` when a carver diagnostic that prints per-carver or per-cell lines is on.
 fn carver_diag_env() -> bool {
-    env_flag!("MC_SPINE_NOCARVE")
+    env_flag!("MEGU_NOCARVE")
         || env_flag!("CARVE_TRACE")
         || env_str!("CARVE_PROBE").is_some()
         || env_str!("CARVE_DUMP_WRITES").is_some()
@@ -10450,7 +10450,7 @@ fn carver_diag_env() -> bool {
         || env_str!("CARVE_SRC").is_some()
         || env_flag!("CV_TRACE")
         || env_str!("CV_TUN").is_some()
-        || env_flag!("MC_SPINE_NOFOLD")
+        || env_flag!("MEGU_NOFOLD")
 }
 
 /// Carve a batch of chunks on `jobs` worker threads, the same work the serial arm does on one.
@@ -10465,7 +10465,7 @@ fn carver_diag_env() -> bool {
 pub(crate) fn carve_batch(g: &mut Gen, order: &[(i32, i32)], jobs: usize) {
     // The same gates `apply_carvers_body` applies, once for the whole batch: a run that skips
     // carvers or has no carver registry must not claim anything.
-    if env_flag!("MC_SPINE_NOCARVE") {
+    if env_flag!("MEGU_NOCARVE") {
         return;
     }
     let reg = creg();
@@ -10631,8 +10631,8 @@ fn populate_diag_env() -> bool {
         || env_str!("FEATURE_REFUSE_TRACE").is_some()
         || env_str!("FEATURE_WRITE_TRACE").is_some()
         || env_str!("MARK_TRACE").is_some()
-        || env_flag!("MC_SPINE_NOFEAT")
-        || env_str!("MC_SPINE_HM_DUMP").is_some()
+        || env_flag!("MEGU_NOFEAT")
+        || env_str!("MEGU_HM_DUMP").is_some()
         || env_str!("CEL_COLUMN_TRACE").is_some()
         || env_flag!("MINESHAFT_TRACE")
 }
@@ -10803,7 +10803,7 @@ fn populate_worker(
         cols: Vec::new(),
         chunk_biomes: Vec::new(),
     };
-    if env_flag!("MC_SPINE_NOFEAT") {
+    if env_flag!("MEGU_NOFEAT") {
         return empty();
     }
     let fr = freg();
@@ -11796,7 +11796,7 @@ impl CarveRun<'_, '_> {
         // vanilla writes with the *target* chunk and lets the position fold
         // (`x & 15`), so a tunnel from a source chunk up to 8 chunks away paints
         // its cells into the target chunk at folded coordinates. Keep that as
-        // the default; MC_SPINE_NOFOLD=1 clips instead, for experiments.
+        // the default; MEGU_NOFOLD=1 clips instead, for experiments.
         if self.nofold && ((x >> 4) != self.tx || (z >> 4) != self.tz) {
             return false;
         }
@@ -11934,15 +11934,15 @@ fn populate_body(g: &mut Gen, sx: i32, sz: i32) {
     // Vanilla's chunk status order is CARVERS then FEATURES, and both write into
     // the chunk's block state, so the carver pass runs here — before the feature
     // gate, because "no features" is a comparison fixture, not a carver switch
-    // (`MC_SPINE_NOCARVE` is). Vanilla carves the whole decoration area before
+    // (`MEGU_NOCARVE` is). Vanilla carves the whole decoration area before
     // decorating the centre, so a feature may read a neighbour's carver air; the
     // `begin_carve` claim makes the later per-chunk populate a no-op for its
     // carver stage. `carve_ring` carves that 3x3, on one thread or across the
     // terrain workers.
     carve_ring(g, sx, sz);
-    // Diagnostic: MC_SPINE_NOFEAT=1 skips the whole feature layer so a block diff can
+    // Diagnostic: MEGU_NOFEAT=1 skips the whole feature layer so a block diff can
     // attribute the remainder to terrain or to features.
-    if env_flag!("MC_SPINE_NOFEAT") {
+    if env_flag!("MEGU_NOFEAT") {
         return;
     }
     let fr = freg();
@@ -13042,7 +13042,7 @@ mod a3a_tests {
 
     /// The headline A3-a gate: three dimensions, three seeds, 5x5 windows at both ends of
     /// the job range. The serial arm is the original `populate_in_order` loop inlined (the
-    /// process-wide `MC_SPINE_GEN_JOBS` env cannot be changed mid-test).
+    /// process-wide `MEGU_GEN_JOBS` env cannot be changed mid-test).
     #[test]
     fn populate_order_parallel_matches_serial_bit_for_bit() {
         crate::test_support::require_vanilla_data();
@@ -13085,7 +13085,7 @@ mod a3a_tests {
 
     /// The real `populate_in_order` dispatch (not just the private wave helper) must take
     /// the parallel arm and leave the owner in the serial state. This is the path the
-    /// `--wgdump` plan uses; the env-cached `MC_SPINE_GEN_JOBS` is whatever the harness set.
+    /// `--wgdump` plan uses; the env-cached `MEGU_GEN_JOBS` is whatever the harness set.
     #[test]
     fn populate_in_order_dispatches_to_waves_bit_for_bit() {
         crate::test_support::require_vanilla_data();
@@ -13162,7 +13162,7 @@ mod p8b1_issue199_tests {
     // Issue #199: a configured_feature / placed_feature / configured_carver
     // file that fails to parse used to be dropped with at most an env-gated
     // trace. These tests pin the structured report (`WorldgenParseReport`),
-    // the default-mode continuation, and the `MC_SPINE_STRICT_WORLDGEN=1`
+    // the default-mode continuation, and the `MEGU_STRICT_WORLDGEN=1`
     // fail-closed mode.
     use super::*;
 
@@ -13349,7 +13349,7 @@ mod p8b1_issue199_tests {
         assert_eq!(rep.of_kind("configured_feature").count(), 2);
         assert!(reg.cfg.is_empty());
 
-        // Strict (`MC_SPINE_STRICT_WORLDGEN=1`): the first failure is the `Err`.
+        // Strict (`MEGU_STRICT_WORLDGEN=1`): the first failure is the `Err`.
         let mut rep = WorldgenParseReport::default();
         let e = load_freg_report(&mut rep, true, &bad_cf, &empty, &empty)
             .err()
@@ -13377,11 +13377,11 @@ mod p8b1_issue199_tests {
 
     #[test]
     fn p8b1_issue199_strict_flag_is_read_per_load() {
-        std::env::set_var("MC_SPINE_STRICT_WORLDGEN", "1");
+        std::env::set_var("MEGU_STRICT_WORLDGEN", "1");
         assert!(strict_worldgen_parse());
-        std::env::set_var("MC_SPINE_STRICT_WORLDGEN", "0");
+        std::env::set_var("MEGU_STRICT_WORLDGEN", "0");
         assert!(!strict_worldgen_parse());
-        std::env::remove_var("MC_SPINE_STRICT_WORLDGEN");
+        std::env::remove_var("MEGU_STRICT_WORLDGEN");
         assert!(!strict_worldgen_parse());
     }
 

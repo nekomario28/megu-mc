@@ -3903,9 +3903,9 @@ fn publish_state() -> &'static Mutex<Option<PublishState>> {
 }
 
 /// The port `/publish` advertises when the argument is omitted: the configured
-/// game port (`MC_SPINE_PORT`, default 25599) like the main listener.
+/// game port (`MEGU_PORT`, default 25599) like the main listener.
 fn publish_default_port() -> u16 {
-    std::env::var("MC_SPINE_PORT")
+    std::env::var("MEGU_PORT")
         .ok()
         .and_then(|p| p.parse::<u16>().ok())
         .filter(|p| *p >= 1024)
@@ -4845,7 +4845,7 @@ fn run_megu_metrics(level: u8, args: &[&str]) -> String {
     live_operator_metrics_prometheus()
 }
 
-/// MOD-SUITE bridge: the bounded pregen sweep `mc-spine-world-migrate
+/// MOD-SUITE bridge: the bounded pregen sweep `megu-world-migrate
 /// pregen-run` drives offline, offered to the live mod suite over a real
 /// `ServerContext` — the same `PregenJob` spiral, the same ticket-LRU
 /// unloader cap, the same counters. `generate` is the mod host's real
@@ -4857,12 +4857,12 @@ fn run_megu_metrics(level: u8, args: &[&str]) -> String {
 #[cfg(feature = "mod-suite")]
 #[allow(dead_code)]
 fn modsuite_pregen_run(
-    ctx: &mc_spine_state_store::sharded::ServerContext,
-    job: &mut mc_spine_state_store::pregen::PregenJob,
-    config: &mc_spine_state_store::pregen::PregenRunConfig<'_>,
+    ctx: &megu_state_store::sharded::ServerContext,
+    job: &mut megu_state_store::pregen::PregenJob,
+    config: &megu_state_store::pregen::PregenRunConfig<'_>,
     generate: impl FnMut(i32, i32),
-    flushed: impl FnMut(mc_spine_state_store::pregen::FlushedChunk),
-) -> mc_spine_state_store::pregen::PregenRunReport {
+    flushed: impl FnMut(megu_state_store::pregen::FlushedChunk),
+) -> megu_state_store::pregen::PregenRunReport {
     job.run(ctx, config, generate, flushed)
 }
 
@@ -5859,12 +5859,12 @@ fn command_minecarts() -> &'static Mutex<HashMap<i32, CommandMinecartRecord>> {
     CARTS.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
-/// `enable-command-block` policy: `MC_SPINE_ENABLE_COMMAND_BLOCK` in the
+/// `enable-command-block` policy: `MEGU_ENABLE_COMMAND_BLOCK` in the
 /// environment (server policy may layer the same switch). Anything but an
 /// explicit false-y value keeps the vanilla default `true`.
 #[allow(dead_code)]
 fn command_blocks_enabled() -> bool {
-    std::env::var("MC_SPINE_ENABLE_COMMAND_BLOCK")
+    std::env::var("MEGU_ENABLE_COMMAND_BLOCK")
         .map(|value| {
             !matches!(
                 value.to_ascii_lowercase().as_str(),
@@ -10130,14 +10130,14 @@ mod vanilla_cmdblk_tests {
         let _world = world_guard();
         clear_cmd_state();
         let dim = DimId::Overworld;
-        std::env::set_var("MC_SPINE_ENABLE_COMMAND_BLOCK", "0");
+        std::env::set_var("MEGU_ENABLE_COMMAND_BLOCK", "0");
         let pkt = update((7, 7, 7), "time add 1", CommandBlockMode::Auto, (false, false, true));
         assert!(apply_set_command_block(2, 1, true, dim, pkt).is_err(), "env-disabled edit refused");
         put_block(dim, (7, 7, 8), CommandBlockMode::Auto, CommandBlockFacing::Up, "time add 1", (false, true, false));
         let t0 = world_time();
         command_block_tick();
         assert_eq!(world_time(), t0, "disabled engine must not tick");
-        std::env::remove_var("MC_SPINE_ENABLE_COMMAND_BLOCK");
+        std::env::remove_var("MEGU_ENABLE_COMMAND_BLOCK");
         command_block_tick();
         assert_eq!(world_time(), t0 + 1, "re-enabled engine ticks again");
     }
@@ -10317,7 +10317,7 @@ mod vanilla_cmdblk_tests {
             b"time add 1\n",
         );
         let cache = f.dir.join("cache");
-        std::env::set_var("MC_SPINE_DATAPACK_CACHE_DIR", &cache);
+        std::env::set_var("MEGU_DATAPACK_CACHE_DIR", &cache);
         reload_datapacks(&f.root(), None, false).expect("cold reload");
         assert!(!DPC1_LAST_RELOAD_WARM.load(Ordering::Relaxed), "first load is cold");
         assert!(cache.join("datapacks.dpc1").is_file(), "cache file written");
@@ -10346,7 +10346,7 @@ mod vanilla_cmdblk_tests {
         let registry = datapack_registry().lock().unwrap_or_else(|e| e.into_inner());
         assert_eq!(registry.tags["item"]["zz:probe"], vec!["minecraft:emerald".to_owned()]);
         drop(registry);
-        std::env::remove_var("MC_SPINE_DATAPACK_CACHE_DIR");
+        std::env::remove_var("MEGU_DATAPACK_CACHE_DIR");
     }
 }
 
@@ -10954,9 +10954,9 @@ mod ops_admin_builtin_tests {
         assert!(status.contains("Retention: keep at most 12"), "{status}");
         assert!(status.contains("Existing backups:"), "{status}");
         let metrics = ops_run(&op, "/megu metrics");
-        assert!(metrics.starts_with("# HELP mc_spine_tps"), "{metrics}");
-        assert!(metrics.contains("mc_spine_players_online"), "{metrics}");
-        assert!(metrics.contains("mc_spine_uptime_seconds"), "{metrics}");
+        assert!(metrics.starts_with("# HELP megu_tps"), "{metrics}");
+        assert!(metrics.contains("megu_players_online"), "{metrics}");
+        assert!(metrics.contains("megu_uptime_seconds"), "{metrics}");
         // Usage failures are clean, and levels below 4 never reach the handlers.
         assert_eq!(ops_run(&op, "/megu backup"), "usage: /megu backup plan|status");
         assert_eq!(ops_run(&op, "/megu metrics now"), "usage: /megu metrics");

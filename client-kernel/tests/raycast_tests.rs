@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: LGPL-3.0-or-later
-use mc_spine_kernel::{
+use megu_kernel::{
     raycast::RayBlockShapes, raycast_blocks, raycast_entities, Aabb, BlockHitFace, FluidClipMode,
 };
 

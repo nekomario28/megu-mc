@@ -3,16 +3,16 @@
 //! four clean OFF/ON toggles, the mistake-proof `SettingsTransaction`
 //! (dirty dots, per-item revert, multi-step undo/redo, discard, and the
 //! confirmation-gated undo-recoverable reset), the 16-locale
-//! `mc_spine_core::i18n` language tab, and the adaptive startup
+//! `megu_core::i18n` language tab, and the adaptive startup
 //! timeline (`Boot: N ms` badge + 250 ms live-overlay threshold).
 
-use mc_spine_client_ui::draw::UiCommand;
-use mc_spine_client_ui::state::{
+use megu_client_ui::draw::UiCommand;
+use megu_client_ui::state::{
     LanguageSetting, Screen, SettingKey, StartupStageTiming, StartupTimeline, UiAction,
     UiInputEvent, UiLang, UiModal, UiState, VisualStylePreset, WidgetId,
     LIVE_LOADING_OVERLAY_MIN_MS, SETTINGS_SESSION_UNDO_CAP,
 };
-use mc_spine_core::i18n::{BuiltinLocale, ALL_BUILTIN_LOCALES};
+use megu_core::i18n::{BuiltinLocale, ALL_BUILTIN_LOCALES};
 
 const SIZES: [(u32, u32); 6] = [
     (640, 360),
@@ -478,7 +478,7 @@ fn detect_os_locale_applies_a_builtin_locale() {
 #[test]
 fn ui_text_resolves_builtin_catalog_entries() {
     let mut ui = UiState::new();
-    use mc_spine_core::i18n::UiTextKey;
+    use megu_core::i18n::UiTextKey;
     ui.set_locale(BuiltinLocale::JaJp);
     assert_eq!(ui.lang(), UiLang::Ja);
     assert_eq!(ui.ui_text(UiTextKey::LanguageAuto), "言語を自動判定");

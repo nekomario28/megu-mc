@@ -7,7 +7,7 @@
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::time::Duration;
 
-use mc_spine_core::perf_kit::{
+use megu_core::perf_kit::{
     BoundedScratchVec, CoalescedDeltaBatch, DirtyFingerprintGate, FingerprintBuilder,
     FingerprintStats,
 };

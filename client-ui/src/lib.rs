@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: LGPL-3.0-or-later OR GPL-3.0-or-later OR AGPL-3.0-or-later
-//! `mc-spine-client-ui`: the complete zero-dependency pure-Rust client UI.
+//! `megu-client-ui`: the complete zero-dependency pure-Rust client UI.
 //!
 //! Three layers, all `std`-only:
 //!
@@ -23,8 +23,8 @@
 //! Typical frame loop for an embedder:
 //!
 //! ```no_run
-//! use mc_spine_client_ui::state::UiState;
-//! use mc_spine_client_ui::draw::rasterize_draw_list;
+//! use megu_client_ui::state::UiState;
+//! use megu_client_ui::draw::rasterize_draw_list;
 //!
 //! let mut ui = UiState::new();
 //! let list = ui.render(1280, 720);          // layout + hit-region cache

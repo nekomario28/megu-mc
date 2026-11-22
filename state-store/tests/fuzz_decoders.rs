@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: LGPL-3.0-or-later OR GPL-3.0-or-later OR AGPL-3.0-or-later
 //! Lane P6b (#222): deterministic adversarial fuzz harness for every
-//! untrusted persistence/storage decoder in `mc-spine-state-store`.
+//! untrusted persistence/storage decoder in `megu-state-store`.
 //!
 //! Everything a hostile disk image can carry — `STV1` snapshots, `level.dat`
 //! JSON/NBT documents (gzip-wrapped or raw), `r.*.*.mca` region headers and
@@ -10,17 +10,17 @@
 //! memory** on every byte string, valid or hostile.
 //!
 //! Determinism: all inputs derive from a fixed-seed `splitmix64` PRNG — no
-//! `SystemTime`, no OS entropy, no external crates. `MC_SPINE_FUZZ_ITERS`
+//! `SystemTime`, no OS entropy, no external crates. `MEGU_FUZZ_ITERS`
 //! scales the per-target iteration count (default `4_000`; operators crank
-//! `MC_SPINE_FUZZ_ITERS=100000` for a deep soak). A decoder panic is caught,
+//! `MEGU_FUZZ_ITERS=100000` for a deep soak). A decoder panic is caught,
 //! the offending input is hex-dumped for reproduction, and the panic is
 //! re-thrown so the test still fails.
 
 use std::collections::BTreeMap;
 use std::panic::{catch_unwind, resume_unwind, AssertUnwindSafe};
 
-use mc_spine_core::version::TargetVersion;
-use mc_spine_state_store::{
+use megu_core::version::TargetVersion;
+use megu_state_store::{
     decode_nbt_to_data_value, decode_snapshot, encode_data_value_to_nbt, encode_snapshot,
     gzip_decompress, gzip_encode_stored, inspect_level_dat, inspect_mca_header,
     migrate_json_document, parse_data_json, to_data_json, AuditAction, AuditLog, AuditRecord,
@@ -63,9 +63,9 @@ impl Rng {
     }
 }
 
-/// Per-target iteration count: `MC_SPINE_FUZZ_ITERS` overrides, default 4000.
+/// Per-target iteration count: `MEGU_FUZZ_ITERS` overrides, default 4000.
 fn iters() -> usize {
-    std::env::var("MC_SPINE_FUZZ_ITERS")
+    std::env::var("MEGU_FUZZ_ITERS")
         .ok()
         .and_then(|v| v.parse().ok())
         .unwrap_or(4_000)

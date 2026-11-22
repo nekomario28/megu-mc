@@ -57,7 +57,7 @@ class MeguStartTest(unittest.TestCase):
         self.base = Path(self.temp.name)
         self.server = self.base / "server"
         self.env_patch = mock.patch.dict(os.environ, {
-            "MC_SPINE_PORT": "", "MC_SPINE_BIND_ADDR": "", "MC_SPINE_VERSION_DIR": "",
+            "MEGU_PORT": "", "MEGU_BIND_ADDR": "", "MEGU_VERSION_DIR": "",
         })
         self.env_patch.start()
         self.addCleanup(self.env_patch.stop)
@@ -290,7 +290,7 @@ class MeguStartTest(unittest.TestCase):
         native_run.assert_not_called()
 
     def test_native_binary_found_in_server_files_cargo_target(self):
-        binary = self.base / "server-files" / "target" / "debug" / "mc-spine-init"
+        binary = self.base / "server-files" / "target" / "debug" / "megu-init"
         binary.parent.mkdir(parents=True)
         binary.write_text("#!/bin/sh\nexit 0\n")
         binary.chmod(0o755)
@@ -306,7 +306,7 @@ class MeguStartTest(unittest.TestCase):
                 "dry_run": True, "eula_accepted": True, "actions": [],
             }), stderr="",
         )
-        with mock.patch.object(megu_start, "init_binary", return_value="/built/mc-spine-init"):
+        with mock.patch.object(megu_start, "init_binary", return_value="/built/megu-init"):
             with mock.patch.object(megu_start, "data_ready", return_value=True):
                 with mock.patch.object(megu_start.subprocess, "run", return_value=response) as run:
                     with mock.patch.object(megu_start.subprocess, "Popen") as launch:
@@ -319,7 +319,7 @@ class MeguStartTest(unittest.TestCase):
         self.assertEqual(json.loads(output.getvalue())["mc_version"], "26.3")
         self.assertEqual((self.server / "eula.txt").read_text(), "eula=true\n")
         self.assertEqual(run.call_args.args[0], [
-            "/built/mc-spine-init", "--dir", str(self.server), "--mc-version", "26.3",
+            "/built/megu-init", "--dir", str(self.server), "--mc-version", "26.3",
             "--port", "25566", "--json", "--accept-eula", "--dry-run",
         ])
         self.assertFalse(run.call_args.kwargs["shell"])
@@ -333,7 +333,7 @@ class MeguStartTest(unittest.TestCase):
             "dir": str(self.server), "mc_version": "1.21.1", "port": 25565,
             "dry_run": True, "eula_accepted": True,
         }), stderr="")
-        with mock.patch.object(megu_start, "init_binary", return_value="/built/mc-spine-init"):
+        with mock.patch.object(megu_start, "init_binary", return_value="/built/megu-init"):
             with mock.patch.object(megu_start, "data_ready", return_value=True):
                 with mock.patch.object(megu_start.subprocess, "run", return_value=response) as run:
                     with contextlib.redirect_stdout(io.StringIO()):
@@ -358,7 +358,7 @@ class MeguStartTest(unittest.TestCase):
         ]
         for response in responses:
             with self.subTest(response=response.stdout):
-                with mock.patch.object(megu_start, "init_binary", return_value="/built/mc-spine-init"):
+                with mock.patch.object(megu_start, "init_binary", return_value="/built/megu-init"):
                     with mock.patch.object(megu_start, "data_ready", return_value=True):
                         with mock.patch.object(megu_start.subprocess, "run", return_value=response):
                             with mock.patch.object(megu_start.subprocess, "Popen") as launch:
@@ -390,13 +390,13 @@ class MeguStartTest(unittest.TestCase):
         data.mkdir()
         (data / "block_states.json").write_text("{}")
         process = self.cli("--dry-run", "--json", "--mc-version", "26.3",
-                           env={"MC_SPINE_VERSION_DIR": str(data)})
+                           env={"MEGU_VERSION_DIR": str(data)})
         self.assertEqual(process.returncode, 0)
         self.assertTrue(json.loads(process.stdout)["ready"])
 
     def test_preflight_uses_argv_and_explicit_no_shell(self):
         pack = self.pack()
-        report = {"schema": "mc-spine-modpack-preflight/1", "readiness": "ready_native",
+        report = {"schema": "megu-modpack-preflight/1", "readiness": "ready_native",
                   "skipped_perf_mods": ["sodium"], "native_mods": [],
                   "client_only_mods": [], "needs_inspection_mods": []}
         result = mock.Mock(returncode=0, stdout=json.dumps(report), stderr="")
@@ -457,8 +457,8 @@ class MeguStartModsTest(unittest.TestCase):
         self.loopback = f"http://127.0.0.1:{self.api.server_address[1]}"
         self.api_base = f"{self.loopback}/v2"
         self.env_patch = mock.patch.dict(os.environ, {
-            "MC_SPINE_PORT": "", "MC_SPINE_BIND_ADDR": "",
-            "MC_SPINE_VERSION_DIR": "",
+            "MEGU_PORT": "", "MEGU_BIND_ADDR": "",
+            "MEGU_VERSION_DIR": "",
         })
         self.env_patch.start()
         self.addCleanup(self.env_patch.stop)

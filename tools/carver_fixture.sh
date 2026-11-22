@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Controlled carver fixture: generate a fresh keep-carvers world with a chosen
-# set of configured_carver overrides, then diff mc-spine against it.
+# set of configured_carver overrides, then diff megu against it.
 #
 #   tools/carver_fixture.sh <tag> <cave-json> <extra-json> <canyon-json> [chunks]
 #
@@ -68,7 +68,7 @@ restore_repo() {
 }
 trap restore_repo EXIT
 
-# the repo (mc-spine's data) must read the same files
+# the repo (megu's data) must read the same files
 for pair in "cave:$CAVE" "cave_extra_underground:$EXTRA" "canyon:$CANYON"; do
   name="${pair%%:*}"; src="${pair#*:}"
   case "$src" in
@@ -95,7 +95,7 @@ AGENT=""
       java -Xmx2G -Xms512M $AGENT -jar server.jar nogui > run.log 2>&1 || true )
 
 cd "$ROOT"
-MC_SPINE_WG_PROFILE=0 MC_SPINE_WG_DUMP="$DIR/dump.bin" MC_SPINE_WG_DUMP_N="$N" \
-  MC_SPINE_WG_DUMP_X="$X0" MC_SPINE_WG_DUMP_Z="$Z0" MC_SPINE_NOFEAT=1 \
-  ./target/release/mc-spine >/dev/null 2>&1
+MEGU_WG_PROFILE=0 MEGU_WG_DUMP="$DIR/dump.bin" MEGU_WG_DUMP_N="$N" \
+  MEGU_WG_DUMP_X="$X0" MEGU_WG_DUMP_Z="$Z0" MEGU_NOFEAT=1 \
+  ./target/release/megu >/dev/null 2>&1
 python3 tools/carver_diff.py "$DIR/dump.bin" "$DIR/world" --n "$N" --x0 "$X0" --z0 "$Z0"

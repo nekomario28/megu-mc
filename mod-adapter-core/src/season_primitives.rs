@@ -1361,11 +1361,11 @@ pub fn is_under_greenhouse_glass(blocks_above: &[&str], max_height: usize) -> bo
 }
 
 // ===========================================================================
-// 5. SSN1 wire codec (channel `mc-spine:season_v1`)
+// 5. SSN1 wire codec (channel `megu:season_v1`)
 // ===========================================================================
 
 /// Custom-payload channel for `SSN1` season sync frames.
-pub const SEASON_CHANNEL: &str = "mc-spine:season_v1";
+pub const SEASON_CHANNEL: &str = "megu:season_v1";
 /// 4-byte frame magic.
 pub const SSN1_MAGIC: &[u8; 4] = b"SSN1";
 /// Wire format version.

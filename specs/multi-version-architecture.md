@@ -16,7 +16,7 @@ VersionPack + IdRemapper machinery, but tests, gates and docs pin exactly the tw
 targets above. Everything is designed so a third target is a data pack, not a code fork.
 
 **Reference implementation:** the architecture borrows patterns from the MIT-licensed
-Horizon rewrite (`mc-spine-local/reference/horizon-survey/`): a single pinned version
+Horizon rewrite (`megu-local/reference/horizon-survey/`): a single pinned version
 module (`horizon-core`'s `version.rs` — here, `mod-adapter-core`'s
 `McVersion`/`version_compat` tables and the pack manifests), a name→id table plus
 resolver split as in `horizon-protocol`'s `ids.rs`/`resolver.rs` (here:
@@ -46,8 +46,8 @@ can be re-checked after later syncs ([ROADMAP](ROADMAP.md) records the live head
 | DataVersion | `ANVIL_DATA_VERSION = 3955`, `ANVIL_LEVEL_VERSION = 19133` constants; every chunk/level write stamps them ([`src/anvil_io.rs`](../src/anvil_io.rs) L16-18) | Reading a world written by another version has no migration path. |
 | Save format versioning | `save_v2.rs` already versions its own format (MET2/MET3/MET4 + legacy tick conversion) | Proves the in-tree idiom for versioned storage; protocol DataVersion is not wired to it. |
 | Process-global state | `type Registry<K, V> = OnceLock<Mutex<HashMap<K, V>>>` ([`src/main.rs`](../src/main.rs) L99) plus ~40 `static` registries (`BREG`, `ANVIL_BLOCK_ENTITIES`, `ARROWS`/`PRIMED`/`BOBBERS`/`PEARLS`/`SNOWBALLS`/`XPS`, `SESSIONS`, `FORCELOADED`, `PACKS`, `RULES`, `SCORES`, `BORDER`, loot/advancement/bossbar tables, `INV_STORE`/`POS_STORE`, `DIM_WIRE_IDS`, the mod-bridge singletons) | Globals are one-version-one-world; parallel tests and multi-world are structurally blocked. |
-| Build shape | One `mc-spine` crate: 230,969 lines across `src/*.rs`; [`src/main.rs`](../src/main.rs) is 15,776 lines of module text pulling in **32 `include!()` directives** (50 `include!()` total once nested includes in `feature.rs`, `natural_spawner.rs`, `mineshaft_piece.rs`, `structure_template.rs`, `redstone.rs` are counted) | One compilation unit: server, client-shared codec, worldgen, storage and sim all rebuild together; no place to put a shared `mc-spine-proto`. |
-| Sibling crates | `client-app` (mc-spine-client), `client-kernel` (mc-spine-kernel), `client-port` (mc-spine-client-mesh), `mod-adapter-core`, `create-adapter`, `mod-offload` each have an independent `Cargo.toml`/`Cargo.lock`; the root [`Cargo.toml`](../Cargo.toml) has no `[workspace]` | Client and server already duplicate the protocol (`client-app/src/protocol.rs` re-implements the wire). A workspace lets `mc-spine-proto` be shared. |
+| Build shape | One `megu` crate: 230,969 lines across `src/*.rs`; [`src/main.rs`](../src/main.rs) is 15,776 lines of module text pulling in **32 `include!()` directives** (50 `include!()` total once nested includes in `feature.rs`, `natural_spawner.rs`, `mineshaft_piece.rs`, `structure_template.rs`, `redstone.rs` are counted) | One compilation unit: server, client-shared codec, worldgen, storage and sim all rebuild together; no place to put a shared `megu-proto`. |
+| Sibling crates | `client-app` (megu-client), `client-kernel` (megu-kernel), `client-port` (megu-client-mesh), `mod-adapter-core`, `create-adapter`, `mod-offload` each have an independent `Cargo.toml`/`Cargo.lock`; the root [`Cargo.toml`](../Cargo.toml) has no `[workspace]` | Client and server already duplicate the protocol (`client-app/src/protocol.rs` re-implements the wire). A workspace lets `megu-proto` be shared. |
 | Vanilla data pipeline | [`tools/vanilla_data/gen_vanilla_data.sh`](../tools/vanilla_data/gen_vanilla_data.sh) pins the 1.21.1 bundler jar by sha1, runs `net.minecraft.data.Main --reports --server`, and [`verify_pack.py`](../tools/vanilla_data/verify_pack.py) fail-closes on the datapack inventory + member hashes | The jar already emits `reports/packets.json` + `reports/registries.json` + `reports/blocks.json` on 1.20.5+ — the raw material for version packs exists and is unused today. |
 | License layout | Root crate `GPL-3.0-or-later` ([`Cargo.toml`](../Cargo.toml), [`LICENSE`](../LICENSE)); all subcrates and contributions `LGPL-3.0-or-later OR GPL-3.0-or-later OR AGPL-3.0-or-later` ([`COPYING.LESSER`](../COPYING.LESSER), [`COPYING.AGPL`](../COPYING.AGPL), [LICENSING.md](../LICENSING.md), [CONTRIBUTING.md](../CONTRIBUTING.md)) | The workspace split must preserve exactly this boundary. |
 
@@ -82,7 +82,7 @@ questions through typed APIs. Nobody outside layer 1 ever sees a protocol number
 - The version gate (`protocol != 767` today) becomes a lookup into the set of packs under
   `assets/versions/`; the status response's `"version":{"name","protocol"}` is rendered
   from the active pack manifest instead of a format literal.
-- `client-app` consumes the same `mc-spine-proto` crate (§3) — it already keeps its own
+- `client-app` consumes the same `megu-proto` crate (§3) — it already keeps its own
   `PROTOCOL_767` codec and is the second consumer that justifies sharing the layer.
 
 ### 1.2 Registry/data layer — `VersionPack` + `IdRemapper`
@@ -254,27 +254,27 @@ the generated stream is proven byte-equal per packet, then it is dropped.
 ## 3. Incremental Cargo workspace DAG
 
 Goal: replace `include!()` text inclusion with acyclic crates so the protocol/data layers
-are shared (`mc-spine` server and `mc-spine-client`), compile incrementally, and version
+are shared (`megu` server and `megu-client`), compile incrementally, and version
 facts have exactly one owner. Target shape:
 
 ```
-mc-spine-types      DimId/DimChunkKey/DimBlockPos, AABB, VarInt, NBT Tag, json::J,
+megu-types      DimId/DimChunkKey/DimBlockPos, AABB, VarInt, NBT Tag, json::J,
                     block/entity name types. Deps: none.
-mc-spine-data       VersionPack loader, RegistryTable, IdRemapper, BREG/state facts,
+megu-data       VersionPack loader, RegistryTable, IdRemapper, BREG/state facts,
                     assets/* readers.   Deps: types.
-mc-spine-proto      ProtocolCodec, PacketIdTable, handshake/status/login, packet
+megu-proto      ProtocolCodec, PacketIdTable, handshake/status/login, packet
                     framing, 0x07 registry-packet generation.
-                    Deps: types, data.  Consumers: mc-spine AND client-app.
-mc-spine-storage    anvil_io, save_v2, paletted, tick_persistence, DataVersion
+                    Deps: types, data.  Consumers: megu AND client-app.
+megu-storage    anvil_io, save_v2, paletted, tick_persistence, DataVersion
                     migration.          Deps: types, data.
-mc-spine-worldgen   worldgen.rs + feature/tree/mineshaft/structure/jigsaw/aquifer
+megu-worldgen   worldgen.rs + feature/tree/mineshaft/structure/jigsaw/aquifer
                     (the currently-moduled worldgen cluster + generation_*).
                     Deps: types, data (+ storage's Section type at most).
-mc-spine-sim        entity_*, mob_*, natural_spawner, redstone, lighting, commands_*,
+megu-sim        entity_*, mob_*, natural_spawner, redstone, lighting, commands_*,
                     menus_and_items, combat_and_health, player_mechanisms,
                     recipes_and_stats, workstations_and_mounts, villager_raid,
                     anticheat, save hooks.   Deps: proto, worldgen, storage.
-mc-spine (bin)      thin main.rs: config, listener, ServerContext assembly, tick loop.
+megu (bin)      thin main.rs: config, listener, ServerContext assembly, tick loop.
                     Deps: all of the above.
 ```
 
@@ -300,7 +300,7 @@ Rules:
   the split is mechanical, never a rewrite.
 - **API style on seams:** `pub(crate)` becomes `pub` only across the new crate edges;
   nothing is widened for convenience. A crate that needs a sim concept gets it as a
-  parameter, not a dependency (e.g. `mc-spine-data` never learns what a `Player` is).
+  parameter, not a dependency (e.g. `megu-data` never learns what a `Player` is).
 
 ---
 
@@ -353,7 +353,7 @@ Follows the repo's Wave/lane convention ([ROADMAP](ROADMAP.md),
 |---|---|---|
 | **N1** | *This lane (N1a):* this blueprint + `version_pack.py` (build/verify/diff/self-test). *N1b:* regenerate 1.21.1 datagen `--reports` from the pinned jar ([`gen_vanilla_data.sh`](../tools/vanilla_data/gen_vanilla_data.sh) already runs the generator; add a step exporting `reports/` + `version.json`), `version_pack.py build assets/versions/1.21.1`, pack committed with provenance notes in [THIRD_PARTY.md](../THIRD_PARTY.md) (data is jar-derived, same provenance class as `assets/block_states_1211.json`). | `--self-test` green; `verify` green on the 1.21.1 pack; `tools/provenance_check.py` green. |
 | **N2** | VersionPack loader + `PacketIdTable` inside `src/`; packet/registry literals replaced by table lookups; `0x07` registry packets generated from the pack + datapack overlays and proven **byte-equal per packet** against `config_packets.bin`; `ANVIL_DATA_VERSION` reads the manifest. | Wire-parity probes (`tests/verify.sh`, dimension wire, container wire) unchanged; generated config stream ≡ captured stream; `config_packets.bin` demoted to test oracle. |
-| **N3** | Workspace split per §3 (types → data → proto first, worldgen/storage/sim next, thin binary last); `ServerContext`/`DimensionState` + 64-shard chunk store per §4; `client-app` switched to `mc-spine-proto`. | `cargo test` in each new crate + full suite green; no `include!()` left on the converted paths; lock-order documented in [docs/development.md](../docs/development.md). |
+| **N3** | Workspace split per §3 (types → data → proto first, worldgen/storage/sim next, thin binary last); `ServerContext`/`DimensionState` + 64-shard chunk store per §4; `client-app` switched to `megu-proto`. | `cargo test` in each new crate + full suite green; no `include!()` left on the converted paths; lock-order documented in [docs/development.md](../docs/development.md). |
 | **N4** | Second version onboarded end-to-end (checklist §6); `IdRemapper` applied to storage reads (old pack → current pack); `VersionCapabilities` wired through `ServerContext`; parity probes run against both versions. | Both packs serve clients; a 1.21.1-written world loads on the 1.21.4 pack via remap; diff artifact checked in under `assets/versions/diff-1.21.1-1.21.4.json`. |
 
 Sequencing: N2 needs N1's pack; N3 is independent of N2 and can interleave (it only moves

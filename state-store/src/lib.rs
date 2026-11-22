@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: LGPL-3.0-or-later OR GPL-3.0-or-later OR AGPL-3.0-or-later
-//! `mc-spine-state-store`: owned, instance-scoped runtime state for the server.
+//! `megu-state-store`: owned, instance-scoped runtime state for the server.
 //!
 //! This crate is a standalone, zero-dependency library implementing the two
 //! architectural pillars of `specs/multi-version-architecture.md` §4 and the
@@ -37,7 +37,7 @@
 //! * [`snapshot`] — the `STV1` binary codec ([`snapshot::encode_snapshot`] /
 //!   [`snapshot::decode_snapshot`]): a deterministic, CRC32-sealed snapshot of
 //!   a [`sharded::ServerContext`]'s chunk overlays keyed on
-//!   `mc_spine_core::version::TargetVersion`, failing closed on any
+//!   `megu_core::version::TargetVersion`, failing closed on any
 //!   corruption.
 //! * [`migrate`] — the operator-facing migration engine
 //!   ([`migrate::inspect_snapshot`], [`migrate::migrate_snapshot`],

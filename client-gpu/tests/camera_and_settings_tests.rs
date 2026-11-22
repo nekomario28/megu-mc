@@ -1,8 +1,8 @@
 // SPDX-License-Identifier: LGPL-3.0-or-later OR GPL-3.0-or-later OR AGPL-3.0-or-later
 
-use mc_spine_client_gpu::window::{CameraController, CameraMode, GpuApp};
-use mc_spine_client_gpu::{Camera, GpuCliConfig};
-use mc_spine_ui::state::{UiSettings, VideoPreset};
+use megu_client_gpu::window::{CameraController, CameraMode, GpuApp};
+use megu_client_gpu::{Camera, GpuCliConfig};
+use megu_ui::state::{UiSettings, VideoPreset};
 
 fn distance(a: [f32; 3], b: [f32; 3]) -> f32 {
     ((a[0] - b[0]).powi(2) + (a[1] - b[1]).powi(2) + (a[2] - b[2]).powi(2)).sqrt()

@@ -13,7 +13,7 @@ The pack overrides every biome with `"features": []` and, unless
 holds exactly the caves and canyons that the carvers produce - the fixture for
 cave parity, which a features-and-carvers-off world cannot say anything about. Load it
 in a **fresh** world (`level-name=<new dir>`), because generated chunks are not
-regenerated. Then run mc-spine with `MC_SPINE_NOFEAT=1` and diff the two chunks:
+regenerated. Then run megu with `MEGU_NOFEAT=1` and diff the two chunks:
 what remains is density, the surface material rule and the aquifer.
 """
 import io

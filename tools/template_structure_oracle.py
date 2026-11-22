@@ -378,7 +378,7 @@ def main():
                 runtime,
                 cp,
                 native / 'TemplateStructureOracle.java',
-                'dev.mcspine.tools.TemplateStructureOracle',
+                'dev.megu.tools.TemplateStructureOracle',
                 source,
                 actual,
                 ROOT,

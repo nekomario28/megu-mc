@@ -1,5 +1,5 @@
 // Production runtime bridge: Create: Aeronautics 6-DOF sub-worlds, universal
-// Create addon discovery, and dimension-adding mods wired into mc-spine's live
+// Create addon discovery, and dimension-adding mods wired into megu's live
 // subsystems.
 //
 // `include!`d into `main.rs` under `#[cfg(feature = "create-offload")]`, in the

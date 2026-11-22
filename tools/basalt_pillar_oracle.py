@@ -26,7 +26,7 @@ def main():
         if args_cells := getattr(p.parse_args(), 'cells', None):
             args.append(cells)
         run_probe(work, cp, ROOT / 'tools/structure-oracle/BasaltPillarOracle.java',
-                  'dev.mcspine.tools.BasaltPillarOracle', *args)
+                  'dev.megu.tools.BasaltPillarOracle', *args)
         actual = output.read_bytes()
         if args_cells:
             args_cells.write_bytes(cells.read_bytes())

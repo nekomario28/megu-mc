@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: LGPL-3.0-or-later
 //
-// mc-spine landing page script.
+// megu landing page script.
 //
 // Two halves, one file:
 //
@@ -12,7 +12,7 @@
 //    documents fail-closed — malformed JSON, wrong
 //    formatVersion/manifestType/game, and path-traversal entries are hard
 //    errors, never silent skips — and emits the same
-//    `mc-spine-modpack-preflight/1` report shape the CLIs print. A small
+//    `megu-modpack-preflight/1` report shape the CLIs print. A small
 //    bounds-checked ZIP reader (Stored + Deflate via the standard
 //    DecompressionStream, no third-party libraries) pulls the manifest
 //    member straight out of a dropped .mrpack/.zip archive.
@@ -26,7 +26,7 @@
 // whether a user-supplied JAR is loaded or skipped. No code, assets, or
 // data from any third-party mod is copied, linked, bundled, or derived —
 // every built-in optimization is an original clean-room Rust
-// implementation inside mc-spine, and no affiliation with any named mod is
+// implementation inside megu, and no affiliation with any named mod is
 // claimed.
 (function (root) {
   "use strict";
@@ -36,8 +36,8 @@
   // ---------------------------------------------------------------------
 
   var DEFAULT_CONFIG = {
-    projectName: "mc-spine",
-    cliPrefix: "mc-spine",
+    projectName: "megu",
+    cliPrefix: "megu",
     tagline: "Experimental Rust Minecraft runtime and standalone CLI tools",
     statusBadge: "Experimental Alpha",
     valueProp:
@@ -46,12 +46,12 @@
       "NeoForge/Fabric JAR adaptation, external shaderpack planning, and declarative " +
       "Magic/VFX/Animation/Combat-Motion engines. Full parity remains unverified.",
     mcTargets: ["1.21.1", "26.3"],
-    githubUrl: "https://github.com/nekomario28/mc-spine",
+    githubUrl: "https://github.com/nekomario28/megu-mc",
     reportApiUrl: "",
     latestApiUrl: "",
     turnstileSiteKey: "",
-    releasesUrl: "https://github.com/nekomario28/mc-spine/releases",
-    docsBaseUrl: "https://github.com/nekomario28/mc-spine/tree/main/docs",
+    releasesUrl: "https://github.com/nekomario28/megu-mc/releases",
+    docsBaseUrl: "https://github.com/nekomario28/megu-mc/tree/main/docs",
     customDomain: "",
     flagshipMods: ["create"],
     profileMods: [],
@@ -148,7 +148,7 @@
         return url.origin + url.pathname.replace(/\/$/, "");
       }
     } catch (_) {}
-    return "https://github.com/nekomario28/mc-spine";
+    return "https://github.com/nekomario28/megu-mc";
   }
 
   function makeGitHubIssueUrl(githubUrl, compact) {
@@ -591,7 +591,7 @@
   // ---------------------------------------------------------------------
 
   var BUILTIN_SUPERSEDED_PERF_MODS = [
-    // Rendering / mesh / LOD — superseded by mc-spine's native wgpu
+    // Rendering / mesh / LOD — superseded by megu's native wgpu
     // renderer (client-gpu / client-port), never loaded as Java mods.
     "sodium",
     "embeddium",
@@ -658,7 +658,7 @@
     "fabric-api",
   ];
 
-  // Entry class spellings mirror the mc-spine-modpack-preflight/1 schema.
+  // Entry class spellings mirror the megu-modpack-preflight/1 schema.
   var CLASS_SUPERSEDED_PERF_MOD = "superseded_perf_mod";
   var CLASS_CLIENT_ONLY_SKIPPED = "client_only_skipped";
   var CLASS_NATIVE_FLAGSHIP = "native_flagship";
@@ -1435,7 +1435,7 @@
       if (superseded[key]) {
         return {
           cls: CLASS_SUPERSEDED_PERF_MOD,
-          note: "redundant performance mod — mc-spine already ships an " +
+          note: "redundant performance mod — megu already ships an " +
             "equivalent clean-room optimization",
         };
       }
@@ -1474,7 +1474,7 @@
     }
     return {
       cls: CLASS_NEEDS_INSPECTION,
-      note: "unrecognized Java mod — use mc-spine-mod-check " +
+      note: "unrecognized Java mod — use megu-mod-check " +
         "--scan-mods-dir to inspect Mixin/.class before launch",
     };
   }
@@ -1535,7 +1535,7 @@
     }
 
     return {
-      schema: "mc-spine-modpack-preflight/1",
+      schema: "megu-modpack-preflight/1",
       pack_name: manifest.name,
       pack_version: manifest.version,
       format: manifest.format,
@@ -1585,7 +1585,7 @@
     if (skipped.length) {
       lines.push(
         "  - " + skipped.length +
-          " performance mod(s) skipped automatically — mc-spine already " +
+          " performance mod(s) skipped automatically — megu already " +
           "has the same optimizations built in (clean-room): " +
           skipped.join(", "));
     }
@@ -1608,7 +1608,7 @@
     if (inspect.length) {
       lines.push(
         "  - " + inspect.length +
-          " Java mod(s) need mc-spine-mod-check --scan-mods-dir " +
+          " Java mod(s) need megu-mod-check --scan-mods-dir " +
           "for Mixin/.class inspection: " + inspect.join(", "));
     }
 
@@ -1646,7 +1646,7 @@
   //   flagshipMods — flagship adapter ids (default SITE_CONFIG.flagshipMods)
   //   profileMods  — declarative profile ids (default SITE_CONFIG.profileMods)
   //
-  // Returns the mc-spine-modpack-preflight/1 report object; throws
+  // Returns the megu-modpack-preflight/1 report object; throws
   // ModpackError on any malformed or unsafe input (fail closed).
   // ---------------------------------------------------------------------
 
@@ -1714,7 +1714,7 @@
     game: "minecraft",
     name: "Create + Perf Sample Pack",
     versionId: "1.0.0",
-    summary: "Sample pack demonstrating the mc-spine pre-flight checker",
+    summary: "Sample pack demonstrating the megu pre-flight checker",
     dependencies: {
       minecraft: "1.21.1",
       neoforge: "21.1.93",
@@ -1795,7 +1795,7 @@
     VersionRangeError: VersionRangeError,
   };
 
-  root.McSpinePreflight = api;
+  root.MeguPreflight = api;
   if (typeof module !== "undefined" && module.exports) {
     module.exports = api;
   }
@@ -1842,14 +1842,16 @@
         el.textContent = tpl.replace(/\{\{cli\}\}/g, CFG.cliPrefix);
       });
 
-    // Hero target pills: first target = LTS, last = Latest.
+    // Hero target pills: single target shows no extra tag; multiple targets label first=LTS, last=Latest.
     var pills = $("target-pills");
     if (pills && Array.isArray(CFG.mcTargets) && CFG.mcTargets.length) {
       pills.textContent = "";
       CFG.mcTargets.forEach(function (target, i) {
-        var tag = i === 0 && CFG.mcTargets.length > 1
-          ? "LTS"
-          : i === CFG.mcTargets.length - 1 ? "Latest" : "";
+        var tag = CFG.mcTargets.length === 1
+          ? ""
+          : i === 0
+            ? "LTS"
+            : i === CFG.mcTargets.length - 1 ? "Latest" : "";
         var pill = document.createElement("span");
         pill.className = "pill" + (i === CFG.mcTargets.length - 1 &&
           CFG.mcTargets.length > 1 ? " latest" : "");
@@ -2510,7 +2512,7 @@
     jaNotes[CLASS_SUPERSEDED_PERF_MOD] = "置き換え済み軽量化 Mod。独立した Rust 最適化があります。";
     jaNotes[CLASS_NATIVE_FLAGSHIP] = "既知のネイティブ／アダプター候補。JAR と Mixin のローカル検査が必要です。";
     jaNotes[CLASS_UNIVERSAL_NATIVE] = "データ／宣言プロファイル候補。必要に応じてローカル検査してください。";
-    jaNotes[CLASS_NEEDS_INSPECTION] = "未確認の Java Mod。mc-spine-mod-check --scan-mods-dir で Mixin/.class を検査してください。";
+    jaNotes[CLASS_NEEDS_INSPECTION] = "未確認の Java Mod。megu-mod-check --scan-mods-dir で Mixin/.class を検査してください。";
     report.entries.forEach(function (entry) {
       var tr = document.createElement("tr");
       var tdPath = document.createElement("td");

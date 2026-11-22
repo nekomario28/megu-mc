@@ -3,19 +3,19 @@
 
 Clean-room wire check modeled on `tests/mod_suite_live_wire.py` and
 `tests/multi_mod_e2e_wire.py` (Lane E2E-MAGIC-WIRE).  A synthetic Fabric JAR
-carries an embedded `mc-spine-bundle.json` — the member name
+carries an embedded `megu-bundle.json` — the member name
 `auto_adapter::EMBEDDED_BUNDLE_MEMBER` installs verbatim as a
-`mc-spine-mod-bundle/1` document — declaring:
+`megu-mod-bundle/1` document — declaring:
 
   * spells: an instant projectile, a cast-time AoE zone, and a channeled
     raycast beam, each delivering damage / apply_status / emit_vfx effects,
   * custom_statuses: a DoT burn and an absorption mana-shield,
   * rituals: one multiblock altar recipe (pattern + reagents + mana drain),
-  * custom_channels: the four live magic wire channels (`mc-spine:magic_v1`,
-    `mc-spine:vfx_v1`, `mc-spine:anim_v1`, `mc-spine:motion_v1`).
+  * custom_channels: the four live magic wire channels (`megu:magic_v1`,
+    `megu:vfx_v1`, `megu:anim_v1`, `megu:motion_v1`).
 
 `--self-test` validates the fixtures offline, then runs
-`mc-spine-mod-check --adapt-mods-dir <mods> --out <dir> --json` three times:
+`megu-mod-check --adapt-mods-dir <mods> --out <dir> --json` three times:
 
   1. the magic JAR must adapt Tier 1 (`native_bundle`) with zero blockers
      and emit `<mod_id>.bundle.json` byte-equivalent to the embedded document;
@@ -25,7 +25,7 @@ carries an embedded `mc-spine-bundle.json` — the member name
      must land in `tier3_fallback_required` with exact validation blockers —
      fail-closed, no crash, no emitted bundle files.
 
-Default mode runs every `--self-test` check, then boots a real `mc-spine`
+Default mode runs every `--self-test` check, then boots a real `megu`
 binary built `--features mod-suite` against the adapted magic mods dir,
 drives a Protocol 767 client through login -> configuration -> play, waits
 for the spawn window and a 0x26 keep-alive, disconnects, and requires a
@@ -52,10 +52,10 @@ from protocol767 import (
 from wire_smoke import port, status
 
 
-BUNDLE_SCHEMA = "mc-spine-mod-bundle/1"
-EMBEDDED_BUNDLE_MEMBER = "mc-spine-bundle.json"
+BUNDLE_SCHEMA = "megu-mod-bundle/1"
+EMBEDDED_BUNDLE_MEMBER = "megu-bundle.json"
 ADAPTATION_REPORT_FILE = "adaptation-report.json"
-REPORT_SCHEMA = "mc-spine-mods-dir-adaptation/1"
+REPORT_SCHEMA = "megu-mods-dir-adaptation/1"
 
 MAGIC_MOD_ID = "starlight_magic"
 MAGIC_JAR = "starlight-magic-1.0.jar"
@@ -65,10 +65,10 @@ BAD_SCHEMA_JAR = "schemaforged-bad-schema.jar"
 
 # The four declarative magic wire channels (MAG1/VFX1/ANM1/MOT1 payloads).
 CUSTOM_CHANNELS = (
-    "mc-spine:magic_v1",
-    "mc-spine:vfx_v1",
-    "mc-spine:anim_v1",
-    "mc-spine:motion_v1",
+    "megu:magic_v1",
+    "megu:vfx_v1",
+    "megu:anim_v1",
+    "megu:motion_v1",
 )
 CUSTOM_PAYLOAD_ID = 0x19
 KEEP_ALIVE_ID = 0x26
@@ -100,7 +100,7 @@ def _sorted_pattern(blocks):
 
 
 def magic_bundle_document():
-    """The `mc-spine-mod-bundle/1` document embedded verbatim in the magic
+    """The `megu-mod-bundle/1` document embedded verbatim in the magic
     JAR — written in the canonical emitted shape (every validated field
     present, including defaulted ones) so the adapter's deterministic
     `bundle.to_json()` output compares equal to the embedded bytes."""
@@ -257,7 +257,7 @@ def unknown_schema_document():
     """A bundle carrying a foreign schema tag — `UnknownSchema` must surface
     as a Tier 3 blocker, never a crash or a silent default."""
     return {
-        "schema": "mc-spine-mod-bundle/2",
+        "schema": "megu-mod-bundle/2",
         "mod_id": "schemaforged",
         "mc_version_range": "[1.21,)",
         "portals": [],
@@ -270,7 +270,7 @@ def unknown_schema_document():
 
 def write_jar(path, mod_id, bundle_doc):
     """One clean-room magic mod JAR: a loader manifest plus the embedded
-    `mc-spine-bundle.json` the adapter installs verbatim."""
+    `megu-bundle.json` the adapter installs verbatim."""
     with zipfile.ZipFile(path, "w", compression=zipfile.ZIP_STORED) as archive:
         archive.writestr("fabric.mod.json", fabric_manifest(mod_id))
         if bundle_doc is not None:
@@ -319,9 +319,9 @@ def resolve_mod_check(given):
     else:
         binary = _cargo_build(
             ROOT / "mod-adapter-core" / "Cargo.toml",
-            ["--bin", "mc-spine-mod-check"],
+            ["--bin", "megu-mod-check"],
             ROOT / "target" / "mod-adapter-core",
-            "mc-spine-mod-check")
+            "megu-mod-check")
     require(binary.is_file(), f"mod-check-binary-missing: {binary}")
     require(os.access(binary, os.X_OK),
             f"mod-check-binary-not-executable: {binary}")
@@ -330,7 +330,7 @@ def resolve_mod_check(given):
 
 def resolve_server(given):
     """`--server-bin` wins; otherwise build the mod-suite server binary the
-    live boot needs (`MC_SPINE_MODS_DIR` adaptation only exists behind that
+    live boot needs (`MEGU_MODS_DIR` adaptation only exists behind that
     feature)."""
     if given is not None:
         binary = Path(given).resolve()
@@ -339,7 +339,7 @@ def resolve_server(given):
             ROOT / "Cargo.toml",
             ["--features", "mod-suite"],
             ROOT / "target" / "magic-e2e",
-            "mc-spine")
+            "megu")
     require(binary.is_file(), f"compiled-binary-missing: {binary}")
     require(os.access(binary, os.X_OK),
             f"compiled-binary-not-executable: {binary}")
@@ -482,7 +482,7 @@ def self_test(mod_check, tmp):
             "adapt-malformed-totals")
     mana = _jar_by_name(bad, BAD_MANA_JAR)
     require(mana["tier"] == "tier3_fallback_required", "adapt-mana-tier")
-    require(any("failed mc-spine-mod-bundle/1 validation" in b
+    require(any("failed megu-mod-bundle/1 validation" in b
                 and "BadManaCost" in b for b in mana["blockers"]),
             "adapt-mana-blocker")
     schema = _jar_by_name(bad, BAD_SCHEMA_JAR)
@@ -557,18 +557,18 @@ def run_live(binary, tmp):
 
     game = port()
     env = os.environ.copy()
-    for key in ("MC_SPINE_RCON_PORT", "MC_SPINE_RCON_PASS",
-                "MC_SPINE_ALLOW_PLAYER_ADMIN_COMMANDS", "MC_SPINE_PROGRESSION",
-                "MC_SPINE_MOD_SYNC_MIRRORS"):
+    for key in ("MEGU_RCON_PORT", "MEGU_RCON_PASS",
+                "MEGU_ALLOW_PLAYER_ADMIN_COMMANDS", "MEGU_PROGRESSION",
+                "MEGU_MOD_SYNC_MIRRORS"):
         env.pop(key, None)
     env.update(
-        MC_SPINE_PORT=str(game), MC_SPINE_BIND_ADDR="127.0.0.1",
-        MC_SPINE_MODS_DIR=str(mods),
-        MC_SPINE_WG="old", MC_SPINE_ENABLE_QUERY="0",
-        MC_SPINE_ANVIL_WORLD_DIR="", MC_SPINE_RESOURCE_PACK_URL="",
-        MC_SPINE_ANTICHEAT="off",
+        MEGU_PORT=str(game), MEGU_BIND_ADDR="127.0.0.1",
+        MEGU_MODS_DIR=str(mods),
+        MEGU_WG="old", MEGU_ENABLE_QUERY="0",
+        MEGU_ANVIL_WORLD_DIR="", MEGU_RESOURCE_PACK_URL="",
+        MEGU_ANTICHEAT="off",
     )
-    env.pop("MC_SPINE_MOD_SYNC", None)
+    env.pop("MEGU_MOD_SYNC", None)
     log_path = live / "server.log"
     try:
         with log_path.open("w") as output:
@@ -656,10 +656,10 @@ def main():
                         help="run only the offline fixture + adapter checks "
                              "(no server boot)")
     parser.add_argument("--server-bin", type=Path, default=None,
-                        help="prebuilt mc-spine server binary built with "
+                        help="prebuilt megu server binary built with "
                              "--features mod-suite (skips the cargo build)")
     parser.add_argument("--mod-check-bin", type=Path, default=None,
-                        help="prebuilt mc-spine-mod-check binary "
+                        help="prebuilt megu-mod-check binary "
                              "(skips the cargo build)")
     parser.add_argument("--keep-tmp", action="store_true",
                         help="keep the temporary working directory and "
@@ -668,7 +668,7 @@ def main():
 
     mod_check = resolve_mod_check(args.mod_check_bin)
     tmp = tempfile.TemporaryDirectory(
-        prefix="mc-spine-magic-wire-", delete=not args.keep_tmp)
+        prefix="megu-magic-wire-", delete=not args.keep_tmp)
     try:
         self_test(mod_check, tmp.name)
         if not args.self_test:

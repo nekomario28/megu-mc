@@ -22,7 +22,7 @@ displayName="NF-1 test {id}"
 {dependencies}
 '''
 
-RUNNER = '''package net.mcspine.neoforge;
+RUNNER = '''package net.megu.neoforge;
 import java.util.Map;
 import net.neoforged.bus.api.IEventBus;
 import net.neoforged.api.distmarker.Dist;
@@ -190,7 +190,7 @@ public class Unavailable { public static void call() { } }
 import net.neoforged.bus.api.IEventBus;
 @net.neoforged.fml.common.Mod("busctor") public class BusCtor {
   public static boolean ok;
-  public BusCtor(IEventBus bus) { ok = bus == net.mcspine.neoforge.Bootstrap.modBus("busctor"); }
+  public BusCtor(IEventBus bus) { ok = bus == net.megu.neoforge.Bootstrap.modBus("busctor"); }
 }
 ''',
     "nf1/DistCtor.java": '''package nf1;
@@ -206,7 +206,7 @@ import net.neoforged.bus.api.IEventBus;
 @net.neoforged.fml.common.Mod("reversector") public class ReversedCtor {
   public static boolean ok;
   public ReversedCtor(Dist dist, IEventBus bus) {
-    ok = dist == Dist.DEDICATED_SERVER && bus == net.mcspine.neoforge.Bootstrap.modBus("reversector");
+    ok = dist == Dist.DEDICATED_SERVER && bus == net.megu.neoforge.Bootstrap.modBus("reversector");
   }
 }
 ''',
@@ -227,7 +227,7 @@ class NeoForgeBootstrapTests(unittest.TestCase):
                            cwd=ROOT, env=cls.env, check=True, capture_output=True)
         cls.cp = (ADAPTER / ".build/classpath.txt").read_text().strip()
         src = cls.root / "src"
-        for name, source in {**SOURCES, "net/mcspine/neoforge/BootstrapChecks.java": RUNNER}.items():
+        for name, source in {**SOURCES, "net/megu/neoforge/BootstrapChecks.java": RUNNER}.items():
             path = src / name
             path.parent.mkdir(parents=True, exist_ok=True)
             path.write_text(source)
@@ -269,17 +269,17 @@ class NeoForgeBootstrapTests(unittest.TestCase):
 
     def test_seed_protect_original_event_contract(self):
         directory = self.mods(("a-seedprotect.jar", "", (), ""))
-        self.assertIn("PASS original mod registration", self.run_java("net.mcspine.neoforge.EventChecks", directory))
+        self.assertIn("PASS original mod registration", self.run_java("net.megu.neoforge.EventChecks", directory))
 
     def test_two_mods_subscribers_and_injection(self):
         directory = self.mods(("a-seedprotect.jar", "", (), ""),
                               ("z-second.jar", "secondmod", ("nf1/SecondMod", "nf1/GameSubscriber",
                               "nf1/DefaultGameSubscriber", "nf1/ModSubscriber", "nf1/ModEvent",
                               "nf1/ClientSubscriber", "nf1/ClientEntrypoint"), ""))
-        self.assertIn("PASS two mods", self.run_java("net.mcspine.neoforge.BootstrapChecks", "multi", directory))
+        self.assertIn("PASS two mods", self.run_java("net.megu.neoforge.BootstrapChecks", "multi", directory))
 
     def test_baseline_empty_directory(self):
-        self.assertIn("PASS baseline", self.run_java("net.mcspine.neoforge.BootstrapChecks", "baseline",
+        self.assertIn("PASS baseline", self.run_java("net.megu.neoforge.BootstrapChecks", "baseline",
                                                      self.mods()))
 
     def test_all_supported_constructor_shapes(self):
@@ -287,45 +287,45 @@ class NeoForgeBootstrapTests(unittest.TestCase):
                  ("distctor", "DistCtor"), ("reversector", "ReversedCtor"))
         directory = self.mods(*[(f"{index}-{modid}.jar", modid, ("nf1/" + name,), "")
                                 for index, (modid, name) in enumerate(names)])
-        self.assertIn("PASS constructors", self.run_java("net.mcspine.neoforge.BootstrapChecks",
+        self.assertIn("PASS constructors", self.run_java("net.megu.neoforge.BootstrapChecks",
                                                          "constructors", directory))
 
     def test_unsupported_constructor_fails_closed(self):
         directory = self.mods(("bad.jar", "badctor", ("nf1/BadConstructor",), ""))
-        self.assertIn("PASS unsupported constructor", self.run_java("net.mcspine.neoforge.BootstrapChecks",
+        self.assertIn("PASS unsupported constructor", self.run_java("net.megu.neoforge.BootstrapChecks",
                                                                      "bad-constructor", directory))
 
     def test_unknown_api_rejected_before_any_class_is_loaded(self):
         directory = self.mods(("a-seedprotect.jar", "", (), ""),
                               ("z-bad.jar", "unsupported", ("nf1/UnsupportedMod",), ""))
-        self.assertIn("UNSUPPORTED_SYMBOL", self.run_java("net.mcspine.neoforge.BootstrapChecks",
+        self.assertIn("UNSUPPORTED_SYMBOL", self.run_java("net.megu.neoforge.BootstrapChecks",
                                                            "reject", directory, "UNSUPPORTED_SYMBOL"))
 
     def test_missing_metadata_fails_closed(self):
         directory = self.mods(("bad.jar", None, ("nf1/SecondMod",), ""))
-        self.assertIn("MISSING_METADATA", self.run_java("net.mcspine.neoforge.BootstrapChecks",
+        self.assertIn("MISSING_METADATA", self.run_java("net.megu.neoforge.BootstrapChecks",
                                                         "reject", directory, "MISSING_METADATA"))
 
     def test_bad_nonjar_entry_fails_closed(self):
         directory = self.mods(invalid_file="README.txt")
-        self.assertIn("INVALID_MOD_ENTRY", self.run_java("net.mcspine.neoforge.BootstrapChecks",
+        self.assertIn("INVALID_MOD_ENTRY", self.run_java("net.megu.neoforge.BootstrapChecks",
                                                          "reject", directory, "INVALID_MOD_ENTRY"))
 
     def test_subdirectory_entry_fails_closed(self):
         directory = self.mods()
         (directory / "mods" / "nested.jar").mkdir()
-        self.assertIn("INVALID_MOD_ENTRY", self.run_java("net.mcspine.neoforge.BootstrapChecks",
+        self.assertIn("INVALID_MOD_ENTRY", self.run_java("net.megu.neoforge.BootstrapChecks",
                                                          "reject", directory, "INVALID_MOD_ENTRY"))
 
     def test_malformed_jar_fails_closed(self):
         directory = self.mods(invalid_file="corrupt.jar")
-        self.assertIn("INVALID_JAR", self.run_java("net.mcspine.neoforge.BootstrapChecks",
+        self.assertIn("INVALID_JAR", self.run_java("net.megu.neoforge.BootstrapChecks",
                                                    "reject", directory, "INVALID_JAR"))
 
     def test_duplicate_modid_fails_closed(self):
         directory = self.mods(("a.jar", "secondmod", ("nf1/SecondMod",), ""),
                               ("b.jar", "secondmod", ("nf1/SecondMod",), ""))
-        self.assertIn("DUPLICATE_MOD_ID", self.run_java("net.mcspine.neoforge.BootstrapChecks",
+        self.assertIn("DUPLICATE_MOD_ID", self.run_java("net.megu.neoforge.BootstrapChecks",
                                                          "reject", directory, "DUPLICATE_MOD_ID"))
 
     def test_missing_required_intermod_dependency_fails_closed(self):
@@ -336,7 +336,7 @@ versionRange="[1,)"
 side="BOTH"
 '''
         directory = self.mods(("a.jar", "secondmod", ("nf1/SecondMod",), dependency))
-        self.assertIn("MISSING_DEPENDENCY", self.run_java("net.mcspine.neoforge.BootstrapChecks",
+        self.assertIn("MISSING_DEPENDENCY", self.run_java("net.megu.neoforge.BootstrapChecks",
                                                            "reject", directory, "MISSING_DEPENDENCY"))
 
 

@@ -1,6 +1,6 @@
 package net.minecraft.core;
 
-import net.mcspine.probe.RegistryStore;
+import net.megu.probe.RegistryStore;
 import net.minecraft.resources.ResourceLocation;
 
 public interface Registry<T> {

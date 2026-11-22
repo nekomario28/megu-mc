@@ -1,6 +1,6 @@
 package net.neoforged.neoforge.network.registration;
 
-import net.mcspine.neoforge.S4NetworkBridge;
+import net.megu.neoforge.S4NetworkBridge;
 import net.minecraft.network.FriendlyByteBuf;
 import net.minecraft.network.RegistryFriendlyByteBuf;
 import net.minecraft.network.codec.StreamCodec;

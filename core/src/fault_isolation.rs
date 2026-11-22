@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: LGPL-3.0-or-later OR GPL-3.0-or-later OR AGPL-3.0-or-later
-//! `mc_spine_core::fault_isolation` — a deterministic, zero-dependency
+//! `megu_core::fault_isolation` — a deterministic, zero-dependency
 //! per-subsystem runtime fault-isolation circuit breaker.
 //!
 //! One runaway mod, lag machine, corrupt chunk region, or misbehaving

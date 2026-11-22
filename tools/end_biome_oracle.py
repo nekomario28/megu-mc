@@ -16,7 +16,7 @@ def main():
     with pinned_runtime(args.jar) as (work, cp, _):
         output = work/'end-biomes.tsv'
         run_probe(work, cp, ROOT/'tools/structure-oracle/EndBiomeOracle.java',
-                  'dev.mcspine.tools.EndBiomeOracle', output)
+                  'dev.megu.tools.EndBiomeOracle', output)
         actual = output.read_bytes()
     if args.write:
         VECTORS.write_bytes(actual)

@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
-"""Minimal Zsh-like interactive console for mc-spine servers.
+"""Minimal Zsh-like interactive console for megu servers.
 
-  tools/megu_shell.py --server-bin ./target/release/mc-spine -- <server-args...>
+  tools/megu_shell.py --server-bin ./target/release/megu -- <server-args...>
   tools/megu_shell.py --complete "time set "
 
 Interactive mode (TTY only) gives the server console smart Tab completion,
@@ -13,7 +13,7 @@ and `COMMAND_GAMERULE_DEFAULTS`).
 Non-TTY, `--plain`, or `NO_COLOR` output is a transparent byte passthrough:
 no ANSI, no history writes, and the exact server exit code.
 
-History lives in `<server_dir>/.mc-spine-history` (bounded, adjacent-deduped,
+History lives in `<server_dir>/.megu-history` (bounded, adjacent-deduped,
 atomic save; empty lines and secret-looking entries are never written).
 """
 
@@ -755,10 +755,10 @@ def run_passthrough(server_bin, server_args, server_dir):
     return code
 
 
-def run_interactive(server_bin, server_args, server_dir, prompt="mc-spine> ",
+def run_interactive(server_bin, server_args, server_dir, prompt="megu> ",
                     color=True):
     """Raw-mode console: completion, ghost hints, highlighting, history."""
-    history = HistoryStore(Path(server_dir) / ".mc-spine-history")
+    history = HistoryStore(Path(server_dir) / ".megu-history")
     history.load()
     completer = CommandCompleter()
     editor = LineEditor(completer, history)
@@ -834,9 +834,9 @@ def run_interactive(server_bin, server_args, server_dir, prompt="mc-spine> ",
 def main(argv=None):
     parser = argparse.ArgumentParser(
         prog="megu_shell",
-        description="Minimal Zsh-like interactive console for mc-spine.")
+        description="Minimal Zsh-like interactive console for megu.")
     parser.add_argument("--server-bin",
-                        help="path to the mc-spine server binary")
+                        help="path to the megu server binary")
     parser.add_argument("--server-dir", default=".",
                         help="server working directory (history lives here)")
     parser.add_argument("--plain", action="store_true",

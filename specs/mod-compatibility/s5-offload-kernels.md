@@ -47,7 +47,7 @@ Each region or contraption handle queues at most 4,096 records and 256 KiB of en
 
 ## C ABI
 
-The [C11 header](../../mod-offload/include/mc_spine_mod_offload.h) declares the `mso_*` functions exported by the crate's `cdylib`. Serialize calls on a live region handle. Distinct handles are independent. The host configures kinetics, transport, tanks, and recipes through the region, supplies each processor's drive, then steps to an absolute tick with a work quota and a soft microsecond budget. The step report gives the first due tick if work remains. A full queue requires exporting records before resuming.
+The [C11 header](../../mod-offload/include/megu_mod_offload.h) declares the `mso_*` functions exported by the crate's `cdylib`. Serialize calls on a live region handle. Distinct handles are independent. The host configures kinetics, transport, tanks, and recipes through the region, supplies each processor's drive, then steps to an absolute tick with a work quota and a soft microsecond budget. The step report gives the first due tick if work remains. A full queue requires exporting records before resuming.
 
 Export encodes S5 directly into caller storage, which may be uninitialized. There is no intermediate frame buffer. Recipe definitions are copied into region ownership at registration. Invalid arguments, incompatible fluids and heads, and undersized buffers have explicit statuses. An undersized buffer reports the required capacity for the first record. Rust panics that unwind are caught at the ABI entry points.
 
@@ -72,7 +72,7 @@ gcc -std=c11 -Wall -Wextra -Werror -Imod-offload/include mod-offload/tests/ffi_s
   -Lmod-offload/target/release -Wl,-rpath,"$PWD/mod-offload/target/release" \
   -lmod_offload -o "$TMPDIR/ffi_smoke" &&
 "$TMPDIR/ffi_smoke" &&
-g++ -fsyntax-only -Wall -Wextra -Werror -x c++ mod-offload/include/mc_spine_mod_offload.h &&
+g++ -fsyntax-only -Wall -Wextra -Werror -x c++ mod-offload/include/megu_mod_offload.h &&
 cargo run --manifest-path mod-offload/Cargo.toml --release --offline --locked --bin offload_bench &&
 bash tools/layers_check.sh && bash tools/debt_ratchet.sh &&
 python3 tools/provenance_check.py && git diff --check

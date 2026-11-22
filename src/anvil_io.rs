@@ -35,7 +35,7 @@ fn anvil_take_world_snapshot(
     label: &str,
     timestamp_secs: u64,
 ) -> Result<String, String> {
-    use mc_spine_state_store::world_snapshot::{SnapshotReason, WorldSnapshotStore};
+    use megu_state_store::world_snapshot::{SnapshotReason, WorldSnapshotStore};
 
     let store = WorldSnapshotStore::new(world_root, backup_root).map_err(|e| e.to_string())?;
     // A damaged or incomplete world must still be recoverable from a snapshot.
@@ -69,7 +69,7 @@ fn anvil_verify_and_restore_world_snapshot(
     snapshot_id: &str,
     timestamp_secs: u64,
 ) -> Result<(), String> {
-    use mc_spine_state_store::world_snapshot::WorldSnapshotStore;
+    use megu_state_store::world_snapshot::WorldSnapshotStore;
 
     let store = WorldSnapshotStore::new(world_root, backup_root).map_err(|e| e.to_string())?;
     store
@@ -531,7 +531,7 @@ fn write_region_file(path: &std::path::Path, region: &AnvilRegion) -> Result<(),
 // reader live in the sibling file (same translation unit as this one).
 include!("region.rs");
 
-// ---------- chunk NBT <-> mc-spine section/state model ----------
+// ---------- chunk NBT <-> megu section/state model ----------
 
 /// One 16x16x16 section decoded to this registry's state ids. `biomes` keeps the
 /// canonical names (import does not apply them; export writes them back out).
@@ -1469,7 +1469,7 @@ fn anvil_dim_region_dir(dim: DimId) -> Option<&'static str> {
 }
 
 /// One chunk's sections as generated terrain plus its overlay edits. With no
-/// generator installed (tests, `MC_SPINE_WG=old`, custom dims) the base is air;
+/// generator installed (tests, `MEGU_WG=old`, custom dims) the base is air;
 /// the overlay still lands on top.
 fn anvil_export_sections(
     dim: DimId,
@@ -1694,18 +1694,18 @@ fn export_anvil_world_with_options(
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[allow(dead_code)] // Consumed by the runtime startup/save hooks.
 enum AnvilStorageMode {
-    /// No `MC_SPINE_ANVIL_WORLD_DIR`: saves stay on the v2 overlay files.
+    /// No `MEGU_ANVIL_WORLD_DIR`: saves stay on the v2 overlay files.
     Disabled,
     /// A world directory is configured: load it at startup, flush to it on
     /// every save.
     Live,
 }
 
-/// `MC_SPINE_ANVIL_WORLD_DIR`: when set to a non-empty path the runtime treats
+/// `MEGU_ANVIL_WORLD_DIR`: when set to a non-empty path the runtime treats
 /// it as the live world store — loaded at startup, flushed on every autosave.
 #[allow(dead_code)]
 fn anvil_world_dir_from_env() -> Option<std::path::PathBuf> {
-    let raw = std::env::var("MC_SPINE_ANVIL_WORLD_DIR").ok()?;
+    let raw = std::env::var("MEGU_ANVIL_WORLD_DIR").ok()?;
     let trimmed = raw.trim();
     if trimmed.is_empty() {
         None
@@ -3059,7 +3059,7 @@ mod anvil_io_tests {
     use super::*;
 
     fn anvil_tmp_dir(tag: &str) -> std::path::PathBuf {
-        let dir = std::env::temp_dir().join(format!("mc-spine-anvil-{tag}-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("megu-anvil-{tag}-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         dir
@@ -3133,7 +3133,7 @@ mod anvil_io_tests {
 
         let snapshot_id = anvil_take_world_snapshot(&world_root, &backup_root, "pre-import", 100)
             .unwrap();
-        let store = mc_spine_state_store::world_snapshot::WorldSnapshotStore::new(
+        let store = megu_state_store::world_snapshot::WorldSnapshotStore::new(
             &world_root,
             &backup_root,
         )
@@ -4030,13 +4030,13 @@ mod anvil_io_tests {
     #[test]
     fn p4a_anvil_world_dir_from_env_arms_live_storage_mode() {
         let _guard = crate::world_guard();
-        std::env::remove_var("MC_SPINE_ANVIL_WORLD_DIR");
+        std::env::remove_var("MEGU_ANVIL_WORLD_DIR");
         assert_eq!(anvil_world_dir_from_env(), None);
         assert_eq!(anvil_storage_mode(), AnvilStorageMode::Disabled);
-        std::env::set_var("MC_SPINE_ANVIL_WORLD_DIR", "   ");
+        std::env::set_var("MEGU_ANVIL_WORLD_DIR", "   ");
         assert_eq!(anvil_world_dir_from_env(), None, "blank is unset");
         std::env::set_var(
-            "MC_SPINE_ANVIL_WORLD_DIR",
+            "MEGU_ANVIL_WORLD_DIR",
             " /data/tmp/p4a-live-world ",
         );
         assert_eq!(
@@ -4045,7 +4045,7 @@ mod anvil_io_tests {
             "surrounding whitespace is trimmed"
         );
         assert_eq!(anvil_storage_mode(), AnvilStorageMode::Live);
-        std::env::remove_var("MC_SPINE_ANVIL_WORLD_DIR");
+        std::env::remove_var("MEGU_ANVIL_WORLD_DIR");
         assert_eq!(anvil_storage_mode(), AnvilStorageMode::Disabled);
     }
 

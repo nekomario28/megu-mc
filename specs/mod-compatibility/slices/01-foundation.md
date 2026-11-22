@@ -22,7 +22,7 @@ The initializer writes state `1` to the existing Rust world. Without a guard, th
 
 ## Evidence boundary
 
-Fixtures are authored here against a diagnostic `net.mcspine.probe.Host` API. They exercise the actual loader and transformation mechanism but are not pre-existing Minecraft mods. No Minecraft classes, Fabric API, intermediary mapping, NeoForge runtime, real client, tick timing or broad Mixin compatibility is proven. `mcspine_probe` is the only game dependency advertised; pretending that `minecraft` is provided would hide missing contracts.
+Fixtures are authored here against a diagnostic `net.megu.probe.Host` API. They exercise the actual loader and transformation mechanism but are not pre-existing Minecraft mods. No Minecraft classes, Fabric API, intermediary mapping, NeoForge runtime, real client, tick timing or broad Mixin compatibility is proven. `megu_probe` is the only game dependency advertised; pretending that `minecraft` is provided would hide missing contracts.
 
 ## Files / handoff
 

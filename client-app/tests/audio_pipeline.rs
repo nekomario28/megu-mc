@@ -7,14 +7,14 @@
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use mc_spine_client::audio_out::{open_sink, AudioSinkKind};
-use mc_spine_client::cli::parse_args;
-use mc_spine_client::protocol::{decode_play_sound_body, decode_stop_sound_body, write_varint};
-use mc_spine_client::session::{PlaySoundEvent, SoundMixer};
-use mc_spine_client::sound_assets::{
+use megu_client::audio_out::{open_sink, AudioSinkKind};
+use megu_client::cli::parse_args;
+use megu_client::protocol::{decode_play_sound_body, decode_stop_sound_body, write_varint};
+use megu_client::session::{PlaySoundEvent, SoundMixer};
+use megu_client::sound_assets::{
     placeholder_pcm, sound_name_for_id, SoundLibrary, MIX_SAMPLE_RATE,
 };
-use mc_spine_client::spatial_audio::{ListenerPose, SpatialAudioPreset, SubtitleDirection};
+use megu_client::spatial_audio::{ListenerPose, SpatialAudioPreset, SubtitleDirection};
 
 fn put_string(buf: &mut Vec<u8>, s: &str) {
     write_varint(buf, s.len() as i32);
@@ -96,7 +96,7 @@ fn sound_effect_decodes_registry_holder() {
     body.extend_from_slice(&7i64.to_be_bytes());
     let ev = decode_play_sound_body(&body, false).unwrap();
     assert_eq!(ev.registry_id, Some(6));
-    // Registry ids the mc-spine server emits map to event names; a
+    // Registry ids the megu server emits map to event names; a
     // pinned spot-check plus coverage of unknown ids.
     assert_eq!(sound_name_for_id(1362), Some("block.stone.break"));
     assert_eq!(sound_name_for_id(6), None);
@@ -218,7 +218,7 @@ fn library_placeholder_tone_is_deterministic_and_category_tinted() {
 fn decode_ogg_rejects_garbage() {
     let dir = std::env::temp_dir().join(format!("mc-ogg-bad-{}", std::process::id()));
     std::fs::write(&dir, b"not an ogg file").unwrap();
-    assert!(mc_spine_client::sound_assets::decode_ogg_mono(&dir, 1 << 20, 1 << 20).is_err());
+    assert!(megu_client::sound_assets::decode_ogg_mono(&dir, 1 << 20, 1 << 20).is_err());
     let _ = std::fs::remove_file(&dir);
 }
 
@@ -253,13 +253,13 @@ fn decode_ogg_vorbis_real_file() {
         .unwrap();
     assert!(ok.status.success());
     let (pcm, rate) =
-        mc_spine_client::sound_assets::decode_ogg_mono(&ogg, 1 << 20, 4_000_000).unwrap();
+        megu_client::sound_assets::decode_ogg_mono(&ogg, 1 << 20, 4_000_000).unwrap();
     assert_eq!(rate, 44_100);
     assert!(pcm.len() > 8_000, "decoded {} samples", pcm.len());
     let peak = pcm.iter().fold(0.0f32, |m, s| m.max(s.abs()));
     assert!(peak > 0.1, "decoded audio is non-silent (peak {peak})");
     // Resample path: 44.1k -> 48k linear.
-    let rs = mc_spine_client::sound_assets::resample_linear(&pcm, 44_100, MIX_SAMPLE_RATE);
+    let rs = megu_client::sound_assets::resample_linear(&pcm, 44_100, MIX_SAMPLE_RATE);
     assert!(rs.len() > pcm.len());
     let _ = std::fs::remove_file(&ogg);
 }

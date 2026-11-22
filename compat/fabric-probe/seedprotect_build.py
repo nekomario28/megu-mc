@@ -33,11 +33,11 @@ def prepare(root, build, classes, libraries, java):
     if remapped.exists():
         import shutil
         shutil.rmtree(remapped)
-    subprocess.run([str(java),'-Xmx128m','-cp',os.pathsep.join(map(str,[classes,*libraries])),'net.mcspine.probe.RemapFacade',str(properties),str(classes),str(remapped)],check=True)
-    entries={str(p.relative_to(remapped)):p.read_bytes() for parent in ['net/mcspine/probe','net/minecraft'] for p in (remapped/parent).rglob('*.class')}
-    entries.pop('net/mcspine/probe/RemapFacade.class',None)
-    entries.pop('net/mcspine/probe/RemapFacade$1.class',None)
-    entries['META-INF/services/net.fabricmc.loader.impl.game.GameProvider']=b'net.mcspine.probe.SpineGameProvider\n'
+    subprocess.run([str(java),'-Xmx128m','-cp',os.pathsep.join(map(str,[classes,*libraries])),'net.megu.probe.RemapFacade',str(properties),str(classes),str(remapped)],check=True)
+    entries={str(p.relative_to(remapped)):p.read_bytes() for parent in ['net/megu/probe','net/minecraft'] for p in (remapped/parent).rglob('*.class')}
+    entries.pop('net/megu/probe/RemapFacade.class',None)
+    entries.pop('net/megu/probe/RemapFacade$1.class',None)
+    entries['META-INF/services/net.fabricmc.loader.impl.game.GameProvider']=b'net.megu.probe.SpineGameProvider\n'
     (build/'seedprotect-bindings.json').write_text(json.dumps({'pins':pins,'class_mappings':mappings,'methods':methods},indent=2)+'\n')
     bad = build/'bindings-missing-invoke.properties'
     bad.write_text('\n'.join(k+'='+v for k,v in sorted(mappings.items()) if '.setToDirt(' not in k)+'\n')
@@ -45,7 +45,7 @@ def prepare(root, build, classes, libraries, java):
     if broken.exists():
         import shutil
         shutil.rmtree(broken)
-    subprocess.run([str(java),'-Xmx128m','-cp',os.pathsep.join(map(str,[classes,*libraries])),'net.mcspine.probe.RemapFacade',str(bad),str(classes),str(broken)],check=True)
-    broken_entries={str(p.relative_to(broken)):p.read_bytes() for parent in ['net/mcspine/probe','net/minecraft'] for p in (broken/parent).rglob('*.class')}
+    subprocess.run([str(java),'-Xmx128m','-cp',os.pathsep.join(map(str,[classes,*libraries])),'net.megu.probe.RemapFacade',str(bad),str(classes),str(broken)],check=True)
+    broken_entries={str(p.relative_to(broken)):p.read_bytes() for parent in ['net/megu/probe','net/minecraft'] for p in (broken/parent).rglob('*.class')}
     broken_entries['META-INF/services/net.fabricmc.loader.impl.game.GameProvider']=entries['META-INF/services/net.fabricmc.loader.impl.game.GameProvider']
     return entries, broken_entries, paths['slf4j']

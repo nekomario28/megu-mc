@@ -1,6 +1,6 @@
 # syntax=docker/dockerfile:1
 #
-# Clean multi-stage image for the mc-spine Alpha release.
+# Clean multi-stage image for the megu Alpha release.
 #
 # The builder compiles the release binary on the pinned Rust toolchain; the
 # runtime carries only the binary, the licence texts, the public-facing tools
@@ -42,13 +42,13 @@ RUN if [ -n "$CARGO_FEATURES" ]; then \
     else \
       cargo build --release --locked; \
     fi \
-    && cargo build --manifest-path server-files/Cargo.toml --release --locked --bin mc-spine-init \
-    && cargo build --manifest-path state-store/Cargo.toml --release --locked --bin mc-spine-world-migrate \
-    && cargo build --manifest-path mod-adapter-core/Cargo.toml --release --locked --bin mc-spine-mod-check
+    && cargo build --manifest-path server-files/Cargo.toml --release --locked --bin megu-init \
+    && cargo build --manifest-path state-store/Cargo.toml --release --locked --bin megu-world-migrate \
+    && cargo build --manifest-path mod-adapter-core/Cargo.toml --release --locked --bin megu-mod-check
 
 FROM debian:bookworm-slim AS runtime
 
-# python3 runs tools/mod_launcher.py (the MC_SPINE_MODPACK pre-flight) and
+# python3 runs tools/mod_launcher.py (the MEGU_MODPACK pre-flight) and
 # tools/vanilla_data/version_pack.py; ca-certificates keeps TLS fetches sane.
 RUN apt-get update \
     && apt-get install -y --no-install-recommends python3 ca-certificates \
@@ -57,30 +57,30 @@ RUN apt-get update \
 # Non-root runtime user. /data is the server's working directory: it holds
 # the world save, server.toml and the regenerated vanilla data, so it must be
 # writable by this uid before the entrypoint runs.
-RUN groupadd --gid 10001 mc-spine \
-    && useradd --uid 10001 --gid mc-spine --no-create-home --shell /usr/sbin/nologin mc-spine \
+RUN groupadd --gid 10001 megu \
+    && useradd --uid 10001 --gid megu --no-create-home --shell /usr/sbin/nologin megu \
     && mkdir -p /data \
-    && chown mc-spine:mc-spine /data
+    && chown megu:megu /data
 
-COPY --from=builder /build/target/release/mc-spine /usr/local/bin/mc-spine
-COPY --from=builder /build/server-files/target/release/mc-spine-init /usr/local/bin/mc-spine-init
-COPY --from=builder /build/state-store/target/release/mc-spine-world-migrate /usr/local/bin/mc-spine-world-migrate
-COPY --from=builder /build/mod-adapter-core/target/release/mc-spine-mod-check /usr/local/bin/mc-spine-mod-check
+COPY --from=builder /build/target/release/megu /usr/local/bin/megu
+COPY --from=builder /build/server-files/target/release/megu-init /usr/local/bin/megu-init
+COPY --from=builder /build/state-store/target/release/megu-world-migrate /usr/local/bin/megu-world-migrate
+COPY --from=builder /build/mod-adapter-core/target/release/megu-mod-check /usr/local/bin/megu-mod-check
 
 # The same payload the release bundle ships: licence texts plus the tools a
 # public user needs (modpack pre-flight, vanilla-data regeneration).
-COPY COPYING.LESSER NOTICE LICENSING.md THIRD_PARTY.md /opt/mc-spine/
-COPY tools/mod_launcher.py /opt/mc-spine/tools/mod_launcher.py
-COPY tools/vanilla_data/gen_vanilla_data.sh tools/vanilla_data/version_pack.py /opt/mc-spine/tools/vanilla_data/
-COPY docker/entrypoint.sh /opt/mc-spine/entrypoint.sh
-RUN chmod 0755 /usr/local/bin/mc-spine /usr/local/bin/mc-spine-init \
-        /usr/local/bin/mc-spine-world-migrate /usr/local/bin/mc-spine-mod-check \
-        /opt/mc-spine/entrypoint.sh \
-        /opt/mc-spine/tools/mod_launcher.py \
-        /opt/mc-spine/tools/vanilla_data/gen_vanilla_data.sh \
-        /opt/mc-spine/tools/vanilla_data/version_pack.py
+COPY COPYING.LESSER NOTICE LICENSING.md THIRD_PARTY.md /opt/megu/
+COPY tools/mod_launcher.py /opt/megu/tools/mod_launcher.py
+COPY tools/vanilla_data/gen_vanilla_data.sh tools/vanilla_data/version_pack.py /opt/megu/tools/vanilla_data/
+COPY docker/entrypoint.sh /opt/megu/entrypoint.sh
+RUN chmod 0755 /usr/local/bin/megu /usr/local/bin/megu-init \
+        /usr/local/bin/megu-world-migrate /usr/local/bin/megu-mod-check \
+        /opt/megu/entrypoint.sh \
+        /opt/megu/tools/mod_launcher.py \
+        /opt/megu/tools/vanilla_data/gen_vanilla_data.sh \
+        /opt/megu/tools/vanilla_data/version_pack.py
 
-USER mc-spine
+USER megu
 WORKDIR /data
 EXPOSE 25565/tcp
-ENTRYPOINT ["/opt/mc-spine/entrypoint.sh"]
+ENTRYPOINT ["/opt/megu/entrypoint.sh"]

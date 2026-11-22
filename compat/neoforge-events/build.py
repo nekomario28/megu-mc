@@ -21,11 +21,11 @@ def main():
         if sha(path)!=pin['sha256']:raise RuntimeError('Pinned hash mismatch: '+name)
         paths[name]=path
     libraries=[path for name,path in paths.items() if name!='mod' and not name.endswith('_sources')]
-    sources=sorted((ROOT/'java').rglob('*.java'))+[ROOT.parent/'fabric-probe/java/net/mcspine/probe/Host.java']
+    sources=sorted((ROOT/'java').rglob('*.java'))+[ROOT.parent/'fabric-probe/java/net/megu/probe/Host.java']
     classes=build/'classes';classes.mkdir()
     subprocess.run([str(pathlib.Path(args.java_home)/'bin/javac'),'-J-Xmx128m','--release','21','-proc:none','-cp',os.pathsep.join(map(str,libraries)),'-d',str(classes),*map(str,sources)],check=True)
     contents={str(path.relative_to(classes)):path.read_bytes() for path in classes.rglob('*.class')}
-    contents['net/mcspine/neoforge/shim-surface.json']=(ROOT/'shim-surface.json').read_bytes()
+    contents['net/megu/neoforge/shim-surface.json']=(ROOT/'shim-surface.json').read_bytes()
     jar(build/'game.jar',contents)
     (build/'classpath.txt').write_text(os.pathsep.join(map(str,[build/'game.jar',*libraries])))
     (build/'build-receipt.json').write_text(json.dumps({'pins':pins,'sources':{str(path):sha(path) for path in sources},'surface_sha256':sha(ROOT/'shim-surface.json'),'jar_sha256':sha(build/'game.jar')},indent=2)+'\n')

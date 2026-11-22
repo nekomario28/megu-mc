@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: LGPL-3.0-or-later OR GPL-3.0-or-later OR AGPL-3.0-or-later
-//! The C pointer and lifetime contract is declared in include/mc_spine_kernel.h.
+//! The C pointer and lifetime contract is declared in include/megu_kernel.h.
 
 use crate::{
     entity_interp::{
@@ -196,12 +196,12 @@ unsafe fn write_result<T>(out: *mut T, value: impl FnOnce() -> Result<T, Error>)
 }
 
 #[no_mangle]
-pub extern "C" fn mc_spine_kernel_abi_version() -> u32 {
+pub extern "C" fn megu_kernel_abi_version() -> u32 {
     crate::ABI_VERSION
 }
 
 #[no_mangle]
-pub unsafe extern "C" fn mc_spine_kernel_bytes_free(bytes: Bytes) -> i32 {
+pub unsafe extern "C" fn megu_kernel_bytes_free(bytes: Bytes) -> i32 {
     status(|| {
         check_ptr(bytes.data)?;
         let len = usize::try_from(bytes.len).map_err(|_| Error::OutOfRange)?;
@@ -215,7 +215,7 @@ pub unsafe extern "C" fn mc_spine_kernel_bytes_free(bytes: Bytes) -> i32 {
 }
 
 #[no_mangle]
-pub unsafe extern "C" fn mc_spine_kernel_palette_new_single(
+pub unsafe extern "C" fn megu_kernel_palette_new_single(
     state: u32,
     out: *mut *mut PalettedSection,
 ) -> i32 {
@@ -227,12 +227,12 @@ pub unsafe extern "C" fn mc_spine_kernel_palette_new_single(
 }
 
 #[no_mangle]
-pub unsafe extern "C" fn mc_spine_kernel_palette_free(section: *mut PalettedSection) -> i32 {
+pub unsafe extern "C" fn megu_kernel_palette_free(section: *mut PalettedSection) -> i32 {
     unsafe { drop_handle(section) }
 }
 
 #[no_mangle]
-pub unsafe extern "C" fn mc_spine_kernel_palette_get(
+pub unsafe extern "C" fn megu_kernel_palette_get(
     section: *const PalettedSection,
     index: u32,
     out: *mut u32,
@@ -241,7 +241,7 @@ pub unsafe extern "C" fn mc_spine_kernel_palette_get(
 }
 
 #[no_mangle]
-pub unsafe extern "C" fn mc_spine_kernel_palette_set(
+pub unsafe extern "C" fn megu_kernel_palette_set(
     section: *mut PalettedSection,
     index: u32,
     state: u32,
@@ -253,7 +253,7 @@ pub unsafe extern "C" fn mc_spine_kernel_palette_set(
 }
 
 #[no_mangle]
-pub unsafe extern "C" fn mc_spine_kernel_palette_non_air(
+pub unsafe extern "C" fn megu_kernel_palette_non_air(
     section: *const PalettedSection,
     out: *mut u16,
 ) -> i32 {
@@ -261,7 +261,7 @@ pub unsafe extern "C" fn mc_spine_kernel_palette_non_air(
 }
 
 #[no_mangle]
-pub unsafe extern "C" fn mc_spine_kernel_palette_is_uniform(
+pub unsafe extern "C" fn megu_kernel_palette_is_uniform(
     section: *const PalettedSection,
     out: *mut u8,
 ) -> i32 {
@@ -269,7 +269,7 @@ pub unsafe extern "C" fn mc_spine_kernel_palette_is_uniform(
 }
 
 #[no_mangle]
-pub unsafe extern "C" fn mc_spine_kernel_palette_uniform_state(
+pub unsafe extern "C" fn megu_kernel_palette_uniform_state(
     section: *const PalettedSection,
     out_present: *mut u8,
     out_state: *mut u32,
@@ -285,7 +285,7 @@ pub unsafe extern "C" fn mc_spine_kernel_palette_uniform_state(
 }
 
 #[no_mangle]
-pub unsafe extern "C" fn mc_spine_kernel_palette_bits(
+pub unsafe extern "C" fn megu_kernel_palette_bits(
     section: *const PalettedSection,
     out: *mut u8,
 ) -> i32 {
@@ -293,7 +293,7 @@ pub unsafe extern "C" fn mc_spine_kernel_palette_bits(
 }
 
 #[no_mangle]
-pub unsafe extern "C" fn mc_spine_kernel_palette_unpack_into(
+pub unsafe extern "C" fn megu_kernel_palette_unpack_into(
     section: *const PalettedSection,
     out: *mut u32,
     capacity: usize,
@@ -312,7 +312,7 @@ pub unsafe extern "C" fn mc_spine_kernel_palette_unpack_into(
 }
 
 #[no_mangle]
-pub unsafe extern "C" fn mc_spine_kernel_palette_write_block_states_wire(
+pub unsafe extern "C" fn megu_kernel_palette_write_block_states_wire(
     section: *const PalettedSection,
     out: *mut Bytes,
 ) -> i32 {
@@ -326,7 +326,7 @@ pub unsafe extern "C" fn mc_spine_kernel_palette_write_block_states_wire(
 }
 
 #[no_mangle]
-pub unsafe extern "C" fn mc_spine_kernel_palette_decode_block_states_wire(
+pub unsafe extern "C" fn megu_kernel_palette_decode_block_states_wire(
     input: *const u8,
     len: usize,
     out_consumed: *mut usize,
@@ -346,7 +346,7 @@ pub unsafe extern "C" fn mc_spine_kernel_palette_decode_block_states_wire(
 }
 
 #[no_mangle]
-pub unsafe extern "C" fn mc_spine_kernel_light_new(
+pub unsafe extern "C" fn megu_kernel_light_new(
     min_y: i32,
     height: u32,
     has_skylight: u8,
@@ -364,12 +364,12 @@ pub unsafe extern "C" fn mc_spine_kernel_light_new(
 }
 
 #[no_mangle]
-pub unsafe extern "C" fn mc_spine_kernel_light_free(engine: *mut LightEngine) -> i32 {
+pub unsafe extern "C" fn megu_kernel_light_free(engine: *mut LightEngine) -> i32 {
     unsafe { drop_handle(engine) }
 }
 
 #[no_mangle]
-pub unsafe extern "C" fn mc_spine_kernel_light_load_chunk(
+pub unsafe extern "C" fn megu_kernel_light_load_chunk(
     engine: *mut LightEngine,
     chunk_x: i32,
     chunk_z: i32,
@@ -387,7 +387,7 @@ pub unsafe extern "C" fn mc_spine_kernel_light_load_chunk(
 }
 
 #[no_mangle]
-pub unsafe extern "C" fn mc_spine_kernel_light_apply_edit(
+pub unsafe extern "C" fn megu_kernel_light_apply_edit(
     engine: *mut LightEngine,
     edits: *const LightEditRecord,
     count: usize,
@@ -411,7 +411,7 @@ pub unsafe extern "C" fn mc_spine_kernel_light_apply_edit(
 }
 
 #[no_mangle]
-pub unsafe extern "C" fn mc_spine_kernel_light_get_section(
+pub unsafe extern "C" fn megu_kernel_light_get_section(
     engine: *const LightEngine,
     chunk_x: i32,
     chunk_z: i32,
@@ -433,7 +433,7 @@ pub unsafe extern "C" fn mc_spine_kernel_light_get_section(
 }
 
 #[no_mangle]
-pub unsafe extern "C" fn mc_spine_kernel_light_update_info(
+pub unsafe extern "C" fn megu_kernel_light_update_info(
     update: *const LightUpdate,
     out: *mut LightUpdateInfo,
 ) -> i32 {
@@ -449,7 +449,7 @@ pub unsafe extern "C" fn mc_spine_kernel_light_update_info(
 }
 
 #[no_mangle]
-pub unsafe extern "C" fn mc_spine_kernel_light_update_chunk(
+pub unsafe extern "C" fn megu_kernel_light_update_chunk(
     update: *const LightUpdate,
     index: usize,
     out: *mut LightChunkInfo,
@@ -475,7 +475,7 @@ pub unsafe extern "C" fn mc_spine_kernel_light_update_chunk(
 }
 
 #[no_mangle]
-pub unsafe extern "C" fn mc_spine_kernel_light_update_section(
+pub unsafe extern "C" fn megu_kernel_light_update_section(
     update: *const LightUpdate,
     chunk_index: usize,
     kind: u8,
@@ -502,12 +502,12 @@ pub unsafe extern "C" fn mc_spine_kernel_light_update_section(
 }
 
 #[no_mangle]
-pub unsafe extern "C" fn mc_spine_kernel_light_update_free(update: *mut LightUpdate) -> i32 {
+pub unsafe extern "C" fn megu_kernel_light_update_free(update: *mut LightUpdate) -> i32 {
     unsafe { drop_handle(update) }
 }
 
 #[no_mangle]
-pub unsafe extern "C" fn mc_spine_kernel_registry_open_json(
+pub unsafe extern "C" fn megu_kernel_registry_open_json(
     states_json: *const u8,
     states_len: usize,
     blocks_json: *const u8,
@@ -528,7 +528,7 @@ pub unsafe extern "C" fn mc_spine_kernel_registry_open_json(
 /// Opens a registry from the raw buffers of any version pack. `states_json` may
 /// be NULL to skip the optional `block_states.json` table.
 #[no_mangle]
-pub unsafe extern "C" fn mc_spine_kernel_registry_open_parts(
+pub unsafe extern "C" fn megu_kernel_registry_open_parts(
     blocks_json: *const u8,
     blocks_len: usize,
     states_json: *const u8,
@@ -555,7 +555,7 @@ pub unsafe extern "C" fn mc_spine_kernel_registry_open_parts(
 
 /// Opens a registry from a version pack directory. `path` is a UTF-8 span.
 #[no_mangle]
-pub unsafe extern "C" fn mc_spine_kernel_registry_open_dir(
+pub unsafe extern "C" fn megu_kernel_registry_open_dir(
     path: *const u8,
     path_len: usize,
     out: *mut *mut Registry,
@@ -569,12 +569,12 @@ pub unsafe extern "C" fn mc_spine_kernel_registry_open_dir(
 }
 
 #[no_mangle]
-pub unsafe extern "C" fn mc_spine_kernel_registry_free(registry: *mut Registry) -> i32 {
+pub unsafe extern "C" fn megu_kernel_registry_free(registry: *mut Registry) -> i32 {
     unsafe { drop_handle(registry) }
 }
 
 #[no_mangle]
-pub unsafe extern "C" fn mc_spine_kernel_registry_state_count(
+pub unsafe extern "C" fn megu_kernel_registry_state_count(
     registry: *const Registry,
     out: *mut u32,
 ) -> i32 {
@@ -586,7 +586,7 @@ pub unsafe extern "C" fn mc_spine_kernel_registry_state_count(
 }
 
 #[no_mangle]
-pub unsafe extern "C" fn mc_spine_kernel_registry_state_name(
+pub unsafe extern "C" fn megu_kernel_registry_state_name(
     registry: *const Registry,
     state: u32,
     out: *mut Text,
@@ -603,7 +603,7 @@ pub unsafe extern "C" fn mc_spine_kernel_registry_state_name(
 }
 
 #[no_mangle]
-pub unsafe extern "C" fn mc_spine_kernel_registry_default_state(
+pub unsafe extern "C" fn megu_kernel_registry_default_state(
     registry: *const Registry,
     name: *const u8,
     len: usize,
@@ -617,7 +617,7 @@ pub unsafe extern "C" fn mc_spine_kernel_registry_default_state(
 }
 
 #[no_mangle]
-pub unsafe extern "C" fn mc_spine_kernel_registry_state_facts(
+pub unsafe extern "C" fn megu_kernel_registry_state_facts(
     registry: *const Registry,
     state: u32,
     out: *mut BlockFacts,
@@ -626,7 +626,7 @@ pub unsafe extern "C" fn mc_spine_kernel_registry_state_facts(
 }
 
 #[no_mangle]
-pub unsafe extern "C" fn mc_spine_kernel_nbt_read_named_validate(
+pub unsafe extern "C" fn megu_kernel_nbt_read_named_validate(
     input: *const u8,
     len: usize,
 ) -> i32 {
@@ -634,7 +634,7 @@ pub unsafe extern "C" fn mc_spine_kernel_nbt_read_named_validate(
 }
 
 #[no_mangle]
-pub unsafe extern "C" fn mc_spine_kernel_nbt_read_gzip_validate(
+pub unsafe extern "C" fn megu_kernel_nbt_read_gzip_validate(
     input: *const u8,
     len: usize,
     max_uncompressed: usize,
@@ -643,7 +643,7 @@ pub unsafe extern "C" fn mc_spine_kernel_nbt_read_gzip_validate(
 }
 
 #[no_mangle]
-pub unsafe extern "C" fn mc_spine_kernel_nbt_roundtrip_named(
+pub unsafe extern "C" fn megu_kernel_nbt_roundtrip_named(
     input: *const u8,
     len: usize,
     out: *mut Bytes,
@@ -656,7 +656,7 @@ pub unsafe extern "C" fn mc_spine_kernel_nbt_roundtrip_named(
 }
 
 #[no_mangle]
-pub unsafe extern "C" fn mc_spine_kernel_dispatcher_new(out: *mut *mut CommandDispatcher) -> i32 {
+pub unsafe extern "C" fn megu_kernel_dispatcher_new(out: *mut *mut CommandDispatcher) -> i32 {
     unsafe {
         write_result(out, || {
             Ok(Box::into_raw(Box::new(CommandDispatcher::new())))
@@ -665,14 +665,14 @@ pub unsafe extern "C" fn mc_spine_kernel_dispatcher_new(out: *mut *mut CommandDi
 }
 
 #[no_mangle]
-pub unsafe extern "C" fn mc_spine_kernel_dispatcher_free(
+pub unsafe extern "C" fn megu_kernel_dispatcher_free(
     dispatcher: *mut CommandDispatcher,
 ) -> i32 {
     unsafe { drop_handle(dispatcher) }
 }
 
 #[no_mangle]
-pub unsafe extern "C" fn mc_spine_kernel_dispatcher_register_literal(
+pub unsafe extern "C" fn megu_kernel_dispatcher_register_literal(
     dispatcher: *mut CommandDispatcher,
     literal: *const u8,
     len: usize,
@@ -685,7 +685,7 @@ pub unsafe extern "C" fn mc_spine_kernel_dispatcher_register_literal(
 }
 
 #[no_mangle]
-pub unsafe extern "C" fn mc_spine_kernel_dispatcher_parse(
+pub unsafe extern "C" fn megu_kernel_dispatcher_parse(
     dispatcher: *const CommandDispatcher,
     input: *const u8,
     len: usize,
@@ -703,7 +703,7 @@ pub unsafe extern "C" fn mc_spine_kernel_dispatcher_parse(
 }
 
 #[no_mangle]
-pub unsafe extern "C" fn mc_spine_kernel_dispatcher_complete_suggestions(
+pub unsafe extern "C" fn megu_kernel_dispatcher_complete_suggestions(
     dispatcher: *const CommandDispatcher,
     input: *const u8,
     len: usize,
@@ -720,7 +720,7 @@ pub unsafe extern "C" fn mc_spine_kernel_dispatcher_complete_suggestions(
 }
 
 #[no_mangle]
-pub unsafe extern "C" fn mc_spine_kernel_suggestions_info(
+pub unsafe extern "C" fn megu_kernel_suggestions_info(
     suggestions: *const Suggestions,
     out: *mut SuggestionsInfo,
 ) -> i32 {
@@ -738,7 +738,7 @@ pub unsafe extern "C" fn mc_spine_kernel_suggestions_info(
 }
 
 #[no_mangle]
-pub unsafe extern "C" fn mc_spine_kernel_suggestions_get(
+pub unsafe extern "C" fn megu_kernel_suggestions_get(
     suggestions: *const Suggestions,
     index: usize,
     out: *mut Text,
@@ -757,12 +757,12 @@ pub unsafe extern "C" fn mc_spine_kernel_suggestions_get(
 }
 
 #[no_mangle]
-pub unsafe extern "C" fn mc_spine_kernel_suggestions_free(suggestions: *mut Suggestions) -> i32 {
+pub unsafe extern "C" fn megu_kernel_suggestions_free(suggestions: *mut Suggestions) -> i32 {
     unsafe { drop_handle(suggestions) }
 }
 
 #[no_mangle]
-pub unsafe extern "C" fn mc_spine_kernel_collide(
+pub unsafe extern "C" fn megu_kernel_collide(
     aabb: *const Aabb,
     delta: *const [f64; 3],
     on_ground: u8,
@@ -828,7 +828,7 @@ impl TryFrom<FluidFacts> for FluidCell {
 }
 
 #[no_mangle]
-pub unsafe extern "C" fn mc_spine_kernel_fluid_impulse(
+pub unsafe extern "C" fn megu_kernel_fluid_impulse(
     aabb: *const Aabb,
     input: *const FluidInput,
     lookup: Option<FluidLookup>,
@@ -919,10 +919,10 @@ pub struct SkyFogOutputC {
 ///
 /// # Safety
 /// `out` must be a valid, aligned, writable pointer; on success it receives
-/// the table handle for [`mc_spine_interp_entities_batch`] and
-/// [`mc_spine_interp_table_free`].
+/// the table handle for [`megu_interp_entities_batch`] and
+/// [`megu_interp_table_free`].
 #[no_mangle]
-pub unsafe extern "C" fn mc_spine_interp_table_new(
+pub unsafe extern "C" fn megu_interp_table_new(
     out: *mut *mut EntityInterpolationTable,
 ) -> i32 {
     unsafe {
@@ -932,13 +932,13 @@ pub unsafe extern "C" fn mc_spine_interp_table_new(
     }
 }
 
-/// Free a table from [`mc_spine_interp_table_new`]. NULL is rejected.
+/// Free a table from [`megu_interp_table_new`]. NULL is rejected.
 ///
 /// # Safety
-/// `table` must be a live handle from [`mc_spine_interp_table_new`] or NULL;
+/// `table` must be a live handle from [`megu_interp_table_new`] or NULL;
 /// it must not be used afterwards.
 #[no_mangle]
-pub unsafe extern "C" fn mc_spine_interp_table_free(table: *mut EntityInterpolationTable) -> i32 {
+pub unsafe extern "C" fn megu_interp_table_free(table: *mut EntityInterpolationTable) -> i32 {
     unsafe { drop_handle(table) }
 }
 
@@ -949,13 +949,13 @@ pub unsafe extern "C" fn mc_spine_interp_table_free(table: *mut EntityInterpolat
 /// nothing beyond the table's own storage.
 ///
 /// # Safety
-/// `table` must be a live handle from [`mc_spine_interp_table_new`].
+/// `table` must be a live handle from [`megu_interp_table_new`].
 /// `updates` must point to `update_count` valid `InterpEntityUpdate` records
 /// when `update_count > 0`; `out` must point to `out_capacity` writable
 /// `InterpPoseOut` slots and `update_count <= out_capacity`. `partial_tick`
 /// must be finite.
 #[no_mangle]
-pub unsafe extern "C" fn mc_spine_interp_entities_batch(
+pub unsafe extern "C" fn megu_interp_entities_batch(
     table: *mut EntityInterpolationTable,
     updates: *const InterpEntityUpdate,
     update_count: usize,
@@ -1035,7 +1035,7 @@ pub unsafe extern "C" fn mc_spine_interp_entities_batch(
 /// `input` must point to a valid `SkyFogInputC` and `out` to a writable
 /// `SkyFogOutputC`; flag bytes must be 0 or 1.
 #[no_mangle]
-pub unsafe extern "C" fn mc_spine_sky_fog_eval(
+pub unsafe extern "C" fn megu_sky_fog_eval(
     input: *const SkyFogInputC,
     out: *mut SkyFogOutputC,
 ) -> i32 {
@@ -1086,7 +1086,7 @@ mod tests {
                 Error::Panic as i32
             );
             assert_eq!(
-                mc_spine_kernel_palette_get(ptr::null(), 0, &mut output),
+                megu_kernel_palette_get(ptr::null(), 0, &mut output),
                 Error::Null as i32
             );
         }
@@ -1129,7 +1129,7 @@ mod tests {
         let mut count = 0u32;
         unsafe {
             assert_eq!(
-                mc_spine_kernel_registry_open_parts(
+                megu_kernel_registry_open_parts(
                     ptr::null(),
                     0,
                     states.as_ptr(),
@@ -1141,7 +1141,7 @@ mod tests {
                 Error::Null as i32
             );
             assert_eq!(
-                mc_spine_kernel_registry_open_parts(
+                megu_kernel_registry_open_parts(
                     blocks.as_ptr(),
                     blocks.len(),
                     states.as_ptr(),
@@ -1154,7 +1154,7 @@ mod tests {
             );
             // A truncated facts table fails closed before any table is built.
             assert_eq!(
-                mc_spine_kernel_registry_open_parts(
+                megu_kernel_registry_open_parts(
                     blocks.as_ptr(),
                     blocks.len(),
                     states.as_ptr(),
@@ -1168,7 +1168,7 @@ mod tests {
             assert!(registry.is_null());
             // With the optional states table.
             assert_eq!(
-                mc_spine_kernel_registry_open_parts(
+                megu_kernel_registry_open_parts(
                     blocks.as_ptr(),
                     blocks.len(),
                     states.as_ptr(),
@@ -1180,15 +1180,15 @@ mod tests {
                 0
             );
             assert_eq!(
-                mc_spine_kernel_registry_state_count(registry, &mut count),
+                megu_kernel_registry_state_count(registry, &mut count),
                 0
             );
             assert_eq!(count as usize, crate::STATE_COUNT as usize);
-            assert_eq!(mc_spine_kernel_registry_free(registry), 0);
+            assert_eq!(megu_kernel_registry_free(registry), 0);
             // Without it, `states_json` may be NULL and `states_len` is ignored.
             registry = ptr::null_mut();
             assert_eq!(
-                mc_spine_kernel_registry_open_parts(
+                megu_kernel_registry_open_parts(
                     blocks.as_ptr(),
                     blocks.len(),
                     ptr::null(),
@@ -1200,11 +1200,11 @@ mod tests {
                 0
             );
             assert_eq!(
-                mc_spine_kernel_registry_state_count(registry, &mut count),
+                megu_kernel_registry_state_count(registry, &mut count),
                 0
             );
             assert_eq!(count as usize, crate::STATE_COUNT as usize);
-            assert_eq!(mc_spine_kernel_registry_free(registry), 0);
+            assert_eq!(megu_kernel_registry_free(registry), 0);
         }
     }
 
@@ -1216,27 +1216,27 @@ mod tests {
         let mut count = 0u32;
         unsafe {
             assert_eq!(
-                mc_spine_kernel_registry_open_dir(assets.as_ptr(), assets.len(), &mut registry),
+                megu_kernel_registry_open_dir(assets.as_ptr(), assets.len(), &mut registry),
                 0
             );
             assert_eq!(
-                mc_spine_kernel_registry_state_count(registry, &mut count),
+                megu_kernel_registry_state_count(registry, &mut count),
                 0
             );
             assert_eq!(count as usize, crate::STATE_COUNT as usize);
-            assert_eq!(mc_spine_kernel_registry_free(registry), 0);
+            assert_eq!(megu_kernel_registry_free(registry), 0);
             registry = ptr::null_mut();
             assert_eq!(
-                mc_spine_kernel_registry_open_dir(missing.as_ptr(), missing.len(), &mut registry),
+                megu_kernel_registry_open_dir(missing.as_ptr(), missing.len(), &mut registry),
                 Error::NotFound as i32
             );
             assert!(registry.is_null());
             assert_eq!(
-                mc_spine_kernel_registry_open_dir([0xff].as_ptr(), 1, &mut registry),
+                megu_kernel_registry_open_dir([0xff].as_ptr(), 1, &mut registry),
                 Error::InvalidUtf8 as i32
             );
             assert_eq!(
-                mc_spine_kernel_registry_open_dir(assets.as_ptr(), assets.len(), ptr::null_mut()),
+                megu_kernel_registry_open_dir(assets.as_ptr(), assets.len(), ptr::null_mut()),
                 Error::Null as i32
             );
         }

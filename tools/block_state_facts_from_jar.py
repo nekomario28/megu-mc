@@ -90,7 +90,7 @@ def main():
         output = work / "block-state-facts.tsv"
         run_probe(work, classpath,
                   ROOT / "tools/block-state-facts-oracle/BlockStateFactsOracle.java",
-                  "dev.mcspine.tools.BlockStateFactsOracle", output)
+                  "dev.megu.tools.BlockStateFactsOracle", output)
         data = encode(output.read_text(), json.loads((ROOT / "assets/blocks_1211.json").read_text()))
     if args.write:
         ASSET.write_bytes(data)

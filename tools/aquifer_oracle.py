@@ -115,7 +115,7 @@ def main():
     work_file.write_text(json.dumps(req, sort_keys=True) + "\n")
     with pinned_runtime(args.jar) as (work, classpath, inner):
         out_file = work / "aquifer-result.json"
-        run_probe(work, classpath, SOURCE, "dev.mcspine.tools.AquiferOracle", work_file, out_file)
+        run_probe(work, classpath, SOURCE, "dev.megu.tools.AquiferOracle", work_file, out_file)
         result = json.loads(out_file.read_text())
         observed = {"prelim": result["prelim"], "state": result["state"],
                     "density": result["density"]}

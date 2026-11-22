@@ -111,7 +111,7 @@ def main(argv=None):
         if (root / anchor).is_file():
             os.utime(root / anchor)
     artifact_status, artifact_text, artifact_err = run(
-        [args.cargo, "test", "--offline", "--locked", "-j1", "--bin", "mc-spine",
+        [args.cargo, "test", "--offline", "--locked", "-j1", "--bin", "megu",
          "--no-run", "--message-format=json-render-diagnostics"], root, log)
     if artifact_status != 0:
         fail(f"cargo --no-run exited {artifact_status}: {artifact_err.strip()[-400:]}")

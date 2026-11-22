@@ -987,7 +987,7 @@ pub(crate) fn run_stdin_console_loop(
 // ------------------------------------------------------- signed chat policy
 
 /// Vanilla `enforce-secure-profile` (`server.properties`, exported as
-/// `MC_SPINE_ENFORCE_SECURE_PROFILE`): whether an online-mode client must
+/// `MEGU_ENFORCE_SECURE_PROFILE`): whether an online-mode client must
 /// present a Mojang chat-signing session for its chat to relay. The default is
 /// off — offline and modded deployments have no session keys at all, so
 /// forcing the check there would silence every client.
@@ -1015,7 +1015,7 @@ impl Default for ChatSignaturePolicy {
 #[allow(dead_code)]
 impl ChatSignaturePolicy {
     /// Layered resolution, the same precedence `server_config_boot` gives every
-    /// ops knob: `MC_SPINE_ENFORCE_SECURE_PROFILE` wins, a dropped-in
+    /// ops knob: `MEGU_ENFORCE_SECURE_PROFILE` wins, a dropped-in
     /// `server.properties` `enforce-secure-profile` fills an unset variable,
     /// and nothing configured means off. An unparsable value falls through to
     /// the layer below, like `ops_bool`.
@@ -1039,7 +1039,7 @@ impl ChatSignaturePolicy {
 /// the same location `server_config_boot` reads).
 #[allow(dead_code)]
 pub(crate) fn chat_signature_policy() -> ChatSignaturePolicy {
-    let env = std::env::var("MC_SPINE_ENFORCE_SECURE_PROFILE").ok();
+    let env = std::env::var("MEGU_ENFORCE_SECURE_PROFILE").ok();
     let props = if env.as_deref().is_some_and(|v| ops_bool_str(v).is_some()) {
         // The variable is set and valid: it decides, no file read needed.
         None
@@ -1408,7 +1408,7 @@ mod server_ops_tests {
     fn tmp_dir(tag: &str) -> std::path::PathBuf {
         let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
             .join("target")
-            .join(format!("mc-spine-ops-{tag}-{}", std::process::id()));
+            .join(format!("megu-ops-{tag}-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         dir
     }

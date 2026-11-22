@@ -12,13 +12,13 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use bytemuck::{Pod, Zeroable};
-use mc_spine_client::shaders::{
+use megu_client::shaders::{
     validate_wgsl_module, WgslStage, TERRAIN_OPAQUE_WGSL, TERRAIN_TRANSLUCENT_WGSL,
 };
-use mc_spine_client::world::WorldState;
-use mc_spine_client_mesh::atlas::{AtlasMip, PackedAtlas};
-use mc_spine_client_mesh::ber_instancing::{VanillaParticleQuad, VanillaParticleWorld};
-use mc_spine_client_mesh::builtin_shadow_wgsl::{
+use megu_client::world::WorldState;
+use megu_client_mesh::atlas::{AtlasMip, PackedAtlas};
+use megu_client_mesh::ber_instancing::{VanillaParticleQuad, VanillaParticleWorld};
+use megu_client_mesh::builtin_shadow_wgsl::{
     build_shadow_uniforms_celestial, compute_cascade_splits, compute_sun_direction,
     negotiate_builtin_shadow_quality, pack_vfx1_lights, BuiltinShadowQuality, CascadeConfig,
     DirtyOnlyShadowCache, EclipseMode, RenderScalePreset, ShadowCacheDecision, ShadowCamera,
@@ -27,21 +27,21 @@ use mc_spine_client_mesh::builtin_shadow_wgsl::{
     MEGU_SPATIAL_SHARPEN_WGSL, MEGU_STAINED_GLASS_SHADOW_COLOR_WGSL, MEGU_TERRAIN_LIT_WGSL,
     MEGU_WATER_SURFACE_WGSL,
 };
-use mc_spine_client_mesh::ffi::PackedVertex;
-use mc_spine_client_mesh::vanilla_plus_3d::ExtrudedMesh;
-use mc_spine_client_mesh::vfx_engine::DynamicColoredLight;
-use mc_spine_client_mesh::{
+use megu_client_mesh::ffi::PackedVertex;
+use megu_client_mesh::vanilla_plus_3d::ExtrudedMesh;
+use megu_client_mesh::vfx_engine::DynamicColoredLight;
+use megu_client_mesh::{
     box_facing_mask, box_in_frustum, bucket_draw_mask, ChunkUploadBudget, Direction,
     DirectionBuckets, GraphCuller, HiZPyramid, RenderRegions, SectionCoord, SectionGraph,
     DIRECTION_BUCKETS, EDGE, REGION_X, REGION_Y, REGION_Z,
 };
-use mc_spine_client_mesh::{
+use megu_client_mesh::{
     is_megu_wgsl_pack, BackendResolution, GpuCapabilities, GpuShaderCaps, MeguWgslPack, PassKind,
     PipelineStage, RenderBackendPreference, ShaderPackSource,
 };
-use mc_spine_kernel::debug_chords::DebugLine;
-use mc_spine_kernel::entity_interp::{evaluate_sky_and_fog, SkyFogInput, SkyFogOutput};
-use mc_spine_ui::draw::{font_atlas_rgba, UiMesh, FONT_ATLAS_HEIGHT, FONT_ATLAS_WIDTH};
+use megu_kernel::debug_chords::DebugLine;
+use megu_kernel::entity_interp::{evaluate_sky_and_fog, SkyFogInput, SkyFogOutput};
+use megu_ui::draw::{font_atlas_rgba, UiMesh, FONT_ATLAS_HEIGHT, FONT_ATLAS_WIDTH};
 use winit::event_loop::OwnedDisplayHandle;
 
 use crate::atmosphere::{AtmosphereParams, BiomeAtmosphereBlender, ChunkFadeTracker};
@@ -237,7 +237,7 @@ pub fn request_gpu_device(
     })?;
     let report = adapter_report(&adapter, pref);
     let (device, queue) = pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor {
-        label: Some("mc-spine-client-gpu"),
+        label: Some("megu-client-gpu"),
         required_features: wgpu::Features::empty(),
         // The adapter's own limits, clamped to sane engine ceilings:
         // guaranteed grantable, and low-spec adapters keep their clamped
@@ -1765,7 +1765,7 @@ struct UiQuadGpu {
     index_count: u32,
 }
 
-/// Pod mirror of `mc_spine_ui::draw::UiVertex` (pixel-space position,
+/// Pod mirror of `megu_ui::draw::UiVertex` (pixel-space position,
 /// atlas uv, straight-alpha color): 32 bytes, bound at locations 0-2.
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Default, Pod, Zeroable)]
@@ -4280,7 +4280,7 @@ impl GpuRenderer {
             .device
             .create_shader_module(wgpu::ShaderModuleDescriptor {
                 label: Some("ui-quad"),
-                source: wgpu::ShaderSource::Wgsl(Cow::Borrowed(mc_spine_ui::draw::UI_QUAD_WGSL)),
+                source: wgpu::ShaderSource::Wgsl(Cow::Borrowed(megu_ui::draw::UI_QUAD_WGSL)),
             });
         let ui_quad_pipeline = ctx
             .device
@@ -4656,7 +4656,7 @@ impl GpuRenderer {
             gpu_paradigm,
             tbdr_depth_discards: 0,
             last_shadow_decision: ShadowCacheDecision::Rerender(
-                mc_spine_client_mesh::builtin_shadow_wgsl::ShadowDirtyReason::FirstFrame,
+                megu_client_mesh::builtin_shadow_wgsl::ShadowDirtyReason::FirstFrame,
             ),
             shaderpack: ShaderpackAttempt::Fallback {
                 notice: "built-in terrain pipeline".to_string(),
@@ -5402,7 +5402,7 @@ impl GpuRenderer {
                 ));
             }
             let pack =
-                mc_spine_client_mesh::load_megu_wgsl_pack(&source, &self.ctx.report.shader_caps)
+                megu_client_mesh::load_megu_wgsl_pack(&source, &self.ctx.report.shader_caps)
                     .map_err(|e| format!("cannot load {}: {e}", path.display()))?;
             Ok(self.apply_shaderpack(&pack))
         })();
@@ -5418,7 +5418,7 @@ impl GpuRenderer {
         }
     }
 
-    /// Upload a meshed scene: quads -> real `mc_spine_client_mesh` packed
+    /// Upload a meshed scene: quads -> real `megu_client_mesh` packed
     /// vertices -> GPU vertex/index buffers.
     pub fn upload_scene(&mut self, scene: &DemoScene) -> Result<(), RendererError> {
         let opaque_verts = pack_quads_to_vertices(&scene.opaque_quads)
@@ -6673,7 +6673,7 @@ impl GpuRenderer {
     }
 
     /// Write the `frame` uniform (camera view-proj + fog from the real
-    /// `mc_spine_kernel::evaluate_sky_and_fog` at noon, clear weather).
+    /// `megu_kernel::evaluate_sky_and_fog` at noon, clear weather).
     /// Store `camera` and upload the frame UBO — with a byte-compare dedup
     /// so an identical camera costs zero `write_buffer` calls. This is the
     /// single frame-UBO write per render call; `render_frame` no longer
@@ -6824,7 +6824,7 @@ impl GpuRenderer {
         Ok(())
     }
 
-    /// Upload a [`tessellate_draw_list`](mc_spine_ui::draw::tessellate_draw_list)
+    /// Upload a [`tessellate_draw_list`](megu_ui::draw::tessellate_draw_list)
     /// mesh for the GPU-quad UI overlay: rewrites only the 16-byte
     /// screen-size uniform plus the dynamic vertex/index buffers (grown,
     /// never shrunk). The static font atlas uploaded at construction is

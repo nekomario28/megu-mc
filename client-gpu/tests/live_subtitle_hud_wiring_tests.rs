@@ -3,11 +3,11 @@
 //! `SubtitleHudState` and the in-game HUD draw list through
 //! `record_frame_and_refresh_minihud` + `UiState::render`.
 
-use mc_spine_client::protocol::{ClientPlayEvent, PlayEvent, TeleportSync, WireSoundEvent};
-use mc_spine_client_gpu::live_session::LiveSession;
-use mc_spine_ui::draw::UiCommand;
-use mc_spine_ui::state::{Screen, UiState};
-use mc_spine_ui::subtitle_hud::SubtitleArrow;
+use megu_client::protocol::{ClientPlayEvent, PlayEvent, TeleportSync, WireSoundEvent};
+use megu_client_gpu::live_session::LiveSession;
+use megu_ui::draw::UiCommand;
+use megu_ui::state::{Screen, UiState};
+use megu_ui::subtitle_hud::SubtitleArrow;
 
 fn teleport_session() -> LiveSession {
     let mut session = LiveSession::offline_with_null_audio();

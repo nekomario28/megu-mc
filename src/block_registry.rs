@@ -18,7 +18,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 // One block-registry pack exists per Minecraft version: the bundled 1.21.1
 // pack spells the tag on every filename (`blocks_1211.json`), and a future
 // pack directory uses version-neutral names (`blocks.json`). The
-// `MC_SPINE_VERSION_DIR` environment override points at such a directory;
+// `MEGU_VERSION_DIR` environment override points at such a directory;
 // when it is unset the bundled `assets/` pack resolves to exactly the paths
 // this module always used. This is the single place the `1211` tag appears.
 
@@ -73,12 +73,12 @@ const VERSION_ASSET_FILES: &[&str] = &[
 ];
 
 impl VersionAssetPaths {
-    /// The pack for this run: the directory `MC_SPINE_VERSION_DIR` names when
+    /// The pack for this run: the directory `MEGU_VERSION_DIR` names when
     /// set, else the bundled 1.21.1 `assets/` pack — byte-identical paths to
     /// what the hardcoded reads used, so the default run cannot observe the
     /// indirection.
     pub(crate) fn resolve() -> VersionAssetPaths {
-        match std::env::var_os("MC_SPINE_VERSION_DIR") {
+        match std::env::var_os("MEGU_VERSION_DIR") {
             Some(dir) if !dir.is_empty() => Self::from_dir(Path::new(&dir)),
             _ => Self::default_pack(),
         }
@@ -1703,14 +1703,14 @@ mod version_asset_tests {
     use super::VersionAssetPaths;
     use std::path::Path;
 
-    /// With no `MC_SPINE_VERSION_DIR` override the resolver must produce the
+    /// With no `MEGU_VERSION_DIR` override the resolver must produce the
     /// same `assets/*_1211.*` paths the hardcoded reads used — the zero
     /// behavior change contract for default 1.21.1 runs.
     #[test]
     fn default_pack_resolves_the_bundled_1211_paths() {
         // A set override is an operator choice; this test only proves the
         // default branch, so it declines rather than fight the environment.
-        if std::env::var_os("MC_SPINE_VERSION_DIR").is_some() {
+        if std::env::var_os("MEGU_VERSION_DIR").is_some() {
             return;
         }
         let dir = Path::new("assets");
@@ -1755,7 +1755,7 @@ mod version_asset_tests {
     /// file when neither exists so the read error points at what is missing.
     #[test]
     fn version_dir_prefers_neutral_and_falls_back_to_the_tagged_names() {
-        let dir = std::env::temp_dir().join(format!("mc-spine-vpack-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("megu-vpack-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         // Neutral + tagged both present: the neutral file is the pack's own.

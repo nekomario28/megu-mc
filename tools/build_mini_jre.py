@@ -5,7 +5,7 @@
       [--profile minimal|neoforge-delegate] [--xms-mib 32] [--xmx-mib 256] \
       [--jlink /path/to/jlink] [--dry-run] [--json]
 
-mc-spine's Rust core already owns chunks, lighting, palettes, network and save
+megu's Rust core already owns chunks, lighting, palettes, network and save
 storage, so a Tier 2/3 JVM delegation only needs a runtime large enough to boot
 a headless mod loader worker. This tool builds that runtime on demand from the
 operator's own installed JDK 21+ `jlink` — nothing JVM-related is ever shipped
@@ -25,7 +25,7 @@ Curated headless module profiles:
 
 Build layout: `jlink` writes into a sibling staging directory
 `.<out-name>.jlink-staging`, `mini-jre-manifest.json` (schema
-`mc-spine-mini-jre/1`) is generated inside it, and the finished tree is then
+`megu-mini-jre/1`) is generated inside it, and the finished tree is then
 atomically renamed onto `--out`. Any failure removes the staging directory and
 leaves `--out` untouched. A pre-existing `--out` or a leftover staging
 directory is refused rather than overwritten.
@@ -49,7 +49,7 @@ import shutil
 import subprocess
 import sys
 
-SCHEMA = "mc-spine-mini-jre/1"
+SCHEMA = "megu-mini-jre/1"
 MANIFEST_NAME = "mini-jre-manifest.json"
 
 PROFILES = {

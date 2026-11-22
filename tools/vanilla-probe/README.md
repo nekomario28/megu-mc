@@ -48,12 +48,12 @@ java -Dcanyon=1 -Dk=2 -cp "classes:$CP" CarverProbe 0 -5 -3
 It walks the same -8..8 origin neighbourhood `applyCarvers` walks, with one shared
 `CarvingMask`, and records `setBlockState`; the aquifer is a proxy that answers
 cave air, so the recorded set is exactly the carver's geometry. Compare it with
-mc-spine's all-stone probe:
+megu's all-stone probe:
 
 ```sh
-MC_SPINE_NOFEAT=1 CARVE_PROBE="0,-3" CARVE_ONLY=minecraft:cave \
-  MC_SPINE_WG_DUMP=/tmp/x.bin MC_SPINE_WG_DUMP_N=1 MC_SPINE_WG_DUMP_Z=-3 \
-  ./target/release/mc-spine        # prints CELL x y z state
+MEGU_NOFEAT=1 CARVE_PROBE="0,-3" CARVE_ONLY=minecraft:cave \
+  MEGU_WG_DUMP=/tmp/x.bin MEGU_WG_DUMP_N=1 MEGU_WG_DUMP_Z=-3 \
+  ./target/release/megu        # prints CELL x y z state
 ```
 
 Two findings came out of this comparison, both invisible in the port by reading

@@ -17,7 +17,7 @@ def main():
     with pinned_runtime(args.jar) as (work, classpath, _):
         output = work / "monster-room.tsv"
         run_probe(work, classpath, ROOT / "tools/monster-room-oracle/MonsterRoomOracle.java",
-                  "dev.mcspine.tools.MonsterRoomOracle", output,
+                  "dev.megu.tools.MonsterRoomOracle", output,
                   extra_sources=[ROOT / "tools/vanilla-probe/VanillaBlockTags.java"])
         actual = output.read_bytes()
     if args.write:

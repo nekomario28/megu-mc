@@ -284,7 +284,7 @@ mod tests {
     fn test_dir(tag: &str) -> PathBuf {
         static DIR_COUNTER: AtomicU64 = AtomicU64::new(0);
         let dir = std::env::temp_dir().join(format!(
-            "mc-spine-incremental-save-{}-{}-{tag}",
+            "megu-incremental-save-{}-{}-{tag}",
             std::process::id(),
             DIR_COUNTER.fetch_add(1, Ordering::Relaxed)
         ));

@@ -104,11 +104,11 @@ def expanded_modules(root):
     # This private diagnostic flag is isolated to this subprocess and this crate.
     # The dedicated cache never supplies a runtime executable or substitutes a
     # prior source dump. Empty/failed expansion is a hard failure.
-    env["RUSTC_BOOTSTRAP"] = "mc_spine"
+    env["RUSTC_BOOTSTRAP"] = "megu"
     cache = Path(env.get("CARGO_TARGET_DIR", str(root / "target"))).resolve() / "module-graph"
     env["CARGO_TARGET_DIR"] = str(cache)
     result = subprocess.run(
-        ["cargo", "rustc", "--offline", "--locked", "--all-features", "--bin", "mc-spine",
+        ["cargo", "rustc", "--offline", "--locked", "--all-features", "--bin", "megu",
          "--", "-Zunpretty=expanded"], cwd=root, env=env, capture_output=True, text=True, timeout=120)
     if result.returncode or not result.stdout.strip():
         raise ValueError(f"Rust expansion unavailable (exit {result.returncode}): {result.stderr[-3000:]}")

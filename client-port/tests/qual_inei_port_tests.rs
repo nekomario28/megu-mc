@@ -6,8 +6,8 @@
 //! darkness, real `-sun` moonlight cascades with 8-phase lunar contrast,
 //! cutout/stained-glass shadow casters, and authentic geometry komorebi.
 
-use mc_spine_client_mesh::builtin_shadow_wgsl::*;
-use mc_spine_client_mesh::vanilla_plus_nature::MEGU_WIND_SWAY_WGSL_FN;
+use megu_client_mesh::builtin_shadow_wgsl::*;
+use megu_client_mesh::vanilla_plus_nature::MEGU_WIND_SWAY_WGSL_FN;
 
 fn assert_balanced_wgsl(src: &str) {
     let mut brackets = Vec::new();

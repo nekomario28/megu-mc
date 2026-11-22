@@ -8,7 +8,7 @@ The caller expands each Java 1.21.1 (protocol 767) section to 4,096 registry sta
 
 Block and sky light use separate 2,048-byte arrays in the server [light packer's](../../src/main.rs) layout. Each byte stores the even cell in its low nibble and the odd cell in its high nibble. A border sample instead stores both kinds in one byte, block low and sky high. Packet decoding, registry metadata lookup, and selection of the correct light-array section belong to the caller.
 
-The six 256-cell border slices are ordered Down, Up, North, South, West, East, matching [voxel face directions](../../src/voxel_faces.rs). Indices are `z*16+x` for Down/Up, `y*16+x` for North/South, and `z*16+y` for West/East. Each slice is the adjacent section's touching layer in world axis order. An optional 200-sample halo covers cells one step past two or three section axes. Its packing is defined in the [C header](../../client-port/include/mc_spine_client_mesh.h). The halo lets independently built sections sample the same AO neighbors and fluid corner heights where multiple section borders meet. Missing samples use the selected air (block 0, sky 15) or opaque (both zero) fallback.
+The six 256-cell border slices are ordered Down, Up, North, South, West, East, matching [voxel face directions](../../src/voxel_faces.rs). Indices are `z*16+x` for Down/Up, `y*16+x` for North/South, and `z*16+y` for West/East. Each slice is the adjacent section's touching layer in world axis order. An optional 200-sample halo covers cells one step past two or three section axes. Its packing is defined in the [C header](../../client-port/include/megu_client_mesh.h). The halo lets independently built sections sample the same AO neighbors and fluid corner heights where multiple section borders meet. Missing samples use the selected air (block 0, sky 15) or opaque (both zero) fallback.
 
 ## Geometry and lighting
 
@@ -22,15 +22,15 @@ The mesh is deterministic for the same cell data and halo. The zero-drift contra
 
 ## CF-2b chunk columns
 
-Phase E Wave 4, lane E4-23. Pass 1–32 contiguous sections to `mc_spine_client_mesh_column` in bottom-to-top order. An Overworld column has 24 sections starting at world Y=-64. A Nether or End column has 16 starting at Y=0. Output uses column-local Y, so add the dimension's minimum Y to obtain world Y. The mesher samples the touching cell and light planes directly from adjacent sections. Supplied cardinal neighbor columns also provide the vertical edges used for AO and fluid heights. The missing-neighbor policy supplies the column ends, missing cardinal neighbors, and halo cells that require diagonal columns.
+Phase E Wave 4, lane E4-23. Pass 1–32 contiguous sections to `megu_client_mesh_column` in bottom-to-top order. An Overworld column has 24 sections starting at world Y=-64. A Nether or End column has 16 starting at Y=0. Output uses column-local Y, so add the dimension's minimum Y to obtain world Y. The mesher samples the touching cell and light planes directly from adjacent sections. Supplied cardinal neighbor columns also provide the vertical edges used for AO and fluid heights. The missing-neighbor policy supplies the column ends, missing cardinal neighbors, and halo cells that require diagonal columns.
 
-Set `MC_SPINE_MESH_COLUMN_UNIFORM_AIR` for known-air sections, with a null block pointer and both light arrays present. The mesher skips their block traversal and geometry generation in constant time. Adjacent occupied sections still read their boundary light. Output keeps the original section mesher's greedy rectangles and ordering within each section. A caller with a sufficiently sized quad buffer can mesh the entire column in one call.
+Set `MEGU_MESH_COLUMN_UNIFORM_AIR` for known-air sections, with a null block pointer and both light arrays present. The mesher skips their block traversal and geometry generation in constant time. Adjacent occupied sections still read their boundary light. Output keeps the original section mesher's greedy rectangles and ordering within each section. A caller with a sufficiently sized quad buffer can mesh the entire column in one call.
 
 ## Packed vertices and translucent drawing
 
-`mc_spine_client_mesh_pack_vertices` writes four 16-byte vertices per quad directly into caller-owned memory, including an aligned, writable mapped upload buffer. Each vertex includes integer X/Z, Y rounded to 1/1024 block, the full state ID, fluid kind, face direction, tint, corner AO and light, and the quad's diagonal and tiled UV extents. Each greedy rectangle uses its width and height along the existing U and V tangent axes. Fluids use unit UV extents and retain their fractional Y heights. The header specifies bit positions for integer vertex attributes. The original quads also carry face light and fluid flow.
+`megu_client_mesh_pack_vertices` writes four 16-byte vertices per quad directly into caller-owned memory, including an aligned, writable mapped upload buffer. Each vertex includes integer X/Z, Y rounded to 1/1024 block, the full state ID, fluid kind, face direction, tint, corner AO and light, and the quad's diagonal and tiled UV extents. Each greedy rectangle uses its width and height along the existing U and V tangent axes. Fluids use unit UV extents and retain their fractional Y heights. The header specifies bit positions for integer vertex attributes. The original quads also carry face light and fluid flow.
 
-`mc_spine_client_mesh_sort_translucent` returns original quad indices for the translucent block layer and water. It sorts by decreasing squared camera distance from the four-vertex centroid, with ascending input index for ties. Supply the camera in section-local coordinates for section meshes and column-local coordinates for column meshes. The index list lets a renderer reorder translucent draws while reusing the packed vertex buffer.
+`megu_client_mesh_sort_translucent` returns original quad indices for the translucent block layer and water. It sorts by decreasing squared camera distance from the four-vertex centroid, with ascending input index for ties. Supply the camera in section-local coordinates for section meshes and column-local coordinates for column meshes. The index list lets a renderer reorder translucent draws while reusing the packed vertex buffer.
 
 ## Incremental rebuilds
 
@@ -42,9 +42,9 @@ Commit `5d8e199` restructures the mesh pass without changing its output. Each se
 
 ## C ABI
 
-Check `mc_spine_mesh_abi_version()` and initialize `mc_spine_mesh_input`. Call `mc_spine_mesh_section` with a null output and zero capacity to obtain the quad count, then call again with the same inputs and a caller-owned buffer. A short buffer returns the required count and leaves the output untouched. Each call performs a mesh pass and retains no pointers. The header specifies alignment, native byte order, statuses, and vertex/index conventions. A renderer can reconstruct repeating unit-cube UVs from the face direction and section-local positions. The C ABI exports stateless meshing for use by C, C++, or Java native interop. The incremental cache is a Rust API.
+Check `megu_mesh_abi_version()` and initialize `megu_mesh_input`. Call `megu_mesh_section` with a null output and zero capacity to obtain the quad count, then call again with the same inputs and a caller-owned buffer. A short buffer returns the required count and leaves the output untouched. Each call performs a mesh pass and retains no pointers. The header specifies alignment, native byte order, statuses, and vertex/index conventions. A renderer can reconstruct repeating unit-cube UVs from the face direction and section-local positions. The C ABI exports stateless meshing for use by C, C++, or Java native interop. The incremental cache is a Rust API.
 
-The three CF-2b functions are additive ABI v1 symbols. Their capacities and counts are in quads, packed vertices, and quad indices respectively. Each supports the null-output size query. A required null pointer, an out-of-range section count, or a non-finite camera returns `MC_SPINE_MESH_INVALID_ARGUMENT` and zeroes the count when present.
+The three CF-2b functions are additive ABI v1 symbols. Their capacities and counts are in quads, packed vertices, and quad indices respectively. Each supports the null-output size query. A required null pointer, an out-of-range section count, or a non-finite camera returns `MEGU_MESH_INVALID_ARGUMENT` and zeroes the count when present.
 
 ## Verification
 
@@ -58,9 +58,9 @@ cargo test --offline --locked
 cargo run --release --offline --locked --bin mesh_bench -- 500
 cargo build --offline --locked --lib
 cc -std=c11 -Wall -Wextra -Werror -pedantic -Iinclude tests/abi_smoke.c \
-    -Ltarget/debug -lmc_spine_client_mesh -o "$TMPDIR/mesh_abi_smoke"
+    -Ltarget/debug -lmegu_client_mesh -o "$TMPDIR/mesh_abi_smoke"
 LD_LIBRARY_PATH="$PWD/target/debug" "$TMPDIR/mesh_abi_smoke"
-g++ -fsyntax-only -Wall -Wextra -Werror -x c++ include/mc_spine_client_mesh.h
+g++ -fsyntax-only -Wall -Wextra -Werror -x c++ include/megu_client_mesh.h
 ```
 
 The solid benchmark fixture begins with 24,576 block faces, exposes 1,536 unit faces after culling, and produces six quads after merging. The checkerboard fixture exposes 12,288 faces and produces 12,288 quads. The timing covers the CPU mesh pass and excludes conversion, I/O, and rendering.
