@@ -87,6 +87,7 @@ pub mod pregen;
 pub mod region_tick;
 pub mod sharded;
 pub mod snapshot;
+pub mod world_snapshot;
 
 pub use anvil_inspect::{
     decode_nbt_to_data_value, encode_data_value_to_nbt, gzip_decompress, gzip_encode_stored,
