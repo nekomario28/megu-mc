@@ -763,6 +763,7 @@ impl LiveSession {
             sink,
             assets_dir: resolved_assets_dir.clone(),
             asset_index: resolved_asset_index.clone(),
+            game_dir: paths.game_dir.clone(),
             max_volume_cap: 1.0,
             max_concurrent_same_sound: 8,
             subtitle_path: None,
