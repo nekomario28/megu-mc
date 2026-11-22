@@ -156,10 +156,11 @@ jobs:
           python3 tools/client_launcher/export_launcher_bundle.py \
             --out-dir dist/launcher-bundles/prism --format prism --mc-version 1.21.1 \
             --bootstrap-jar dist/publish/mc-spine-bootstrapper.jar
+          python3 -c "import shutil; shutil.make_archive('dist/publish/mc-spine-1.21.1-prism', 'zip', 'dist/launcher-bundles/prism')"
           python3 tools/client_launcher/export_launcher_bundle.py \
             --out-dir dist/launcher-bundles/mrpack --format mrpack --mc-version 1.21.1 \
             --loader fabric --loader-version 0.16.9
-          find dist/launcher-bundles -maxdepth 3 \( -name '*.zip' -o -name '*.mrpack' \) -type f -exec cp {} dist/publish/ \;
+          find dist/launcher-bundles/mrpack -maxdepth 2 -name '*.mrpack' -type f -exec cp {} dist/publish/ \;
           python3 - <<'PY'
           import json
           import os
