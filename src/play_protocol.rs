@@ -15484,6 +15484,9 @@ mod w3_tests {
 
     #[test]
     fn w3_login_admission_rejects_banned_and_full_server() {
+        // `w3_connect` drives a live login through `handle`, which reads the
+        // online-mode env and registers into `clients()` — all process-global.
+        let _guard = world_guard();
         let banned = BanRegistry {
             players: vec![BanEntry {
                 uuid: "00000000-0000-0000-0000-000000000001".into(),
@@ -15541,6 +15544,7 @@ mod w3_tests {
 
     #[test]
     fn w3_vehicle_move_0x1e_and_dismount_0x26_and_stats_0x09_live() {
+        let _guard = world_guard();
         let (mut cli, server, me) = w3_connect("W3Rider", [0x77u8; 16]);
         let (px, py, pz, ..) = *me.pos.lock().unwrap_or_else(|e| e.into_inner());
         let boat_eid = NEXT_EID.fetch_add(1, Ordering::SeqCst);
@@ -15630,6 +15634,11 @@ mod w3_tests {
 
     #[test]
     fn w3_tall_custom_dim_over_64_sections_encodes_multiword_light_mask() {
+        // The dimension registry is process-global: resetting and registering
+        // beside `bughunt_net_dim_wire_ids_*` (which takes both locks) made
+        // `parse_dimension_id` see a torn registry.
+        let _world_guard = world_guard();
+        let _gen_guard = worldgen::lock_gen_for_tests();
         // 1024-block-tall custom dimension: 64 block sections + the 2
         // light-only guard sections = 66 light sections -> a 2-word bitset.
         worldgen::reset_dimension_registry();
@@ -15724,6 +15733,7 @@ mod w3_tests {
 
     #[test]
     fn bughunt_net_look_packet_0x1c_rejects_non_finite_angles() {
+        let _guard = world_guard();
         let (mut cli, server, me) = w3_connect("BugHuntLook", [0x66u8; 16]);
         *me.pos.lock().unwrap_or_else(|e| e.into_inner()) = (0.5, 71.0, 0.5, 10.0, 20.0, true);
         let look = |yaw: f32, pitch: f32| {
@@ -16545,6 +16555,9 @@ mod w4_tests {
 
     #[test]
     fn w4_velocity_forwarding_accepts_signed_and_rejects_tampered_login() {
+        // `MC_SPINE_VELOCITY_*` env plus the registered client are
+        // process-global; the sibling online-mode test reads the same env.
+        let _guard = world_guard();
         let secret = "w4-shared-secret";
         let _env = W4Env::new()
             .set("MC_SPINE_VELOCITY_FORWARDING", "1")
@@ -16645,6 +16658,9 @@ mod w4_tests {
 
     #[test]
     fn w4_encrypted_stream_roundtrips_protocol_packets_with_aes128_cfb8() {
+        // `MC_SPINE_ONLINE_MODE` steers every concurrent `handle` login — a
+        // plain-text login racing this test is refused for missing encryption.
+        let _guard = world_guard();
         let _env = W4Env::new().set("MC_SPINE_ONLINE_MODE", "1");
         let deadline = w4_deadline();
         let secret = [0x5au8; 16];
@@ -16752,6 +16768,10 @@ mod w4_tests {
 
     #[test]
     fn w4_isolated_connection_catches_panic_without_poisoning_server() {
+        // `clients()`, `mounts()`, `NEXT_EID` and the shared disconnect counter
+        // (`server_reliability`'s test asserts `before + 1` on the same atomic)
+        // are all process-global.
+        let _guard = world_guard();
         // A registered, mounted client that a panicking handler would orphan.
         let (client, _peer) = effect_tests::client_pair();
         let me = Arc::new(client);
@@ -18701,6 +18721,9 @@ mod wire_ops_fair_play_tests {
     /// follow the documented defaults.
     #[test]
     fn wire_ops_fair_play_codes_only_on_opt_in() {
+        // `FAIR_PLAY_ENV` is process-global env; `map_fair_play_policy` readers
+        // in other tests must not observe these mutations mid-flip.
+        let _guard = world_guard();
         let saved = save_env();
         for name in FAIR_PLAY_ENV {
             std::env::remove_var(name);
@@ -19861,6 +19884,8 @@ mod parity_58_c2s_tests {
     /// the stack into `written_book` — and a non-book slot is untouched.
     #[test]
     fn parity_58_c2s_edit_book_writes_and_signs() {
+        // `p58_client` registers into the shared `clients()` list.
+        let _guard = world_guard();
         let (me, _peer) = p58_client("P58Book", 58005);
         // Raw slot 0 -> window slot 36.
         me.inv.lock().unwrap_or_else(|e| e.into_inner()).insert(36, (1091, 1, Vec::new()));

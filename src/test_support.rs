@@ -16,18 +16,21 @@ const REQUIRED_DATA: &[&str] = &[
 /// Every test that reads it calls this first, before it takes a global lock: a panic
 /// while holding one poisons it, and the next test then fails with `PoisonError` instead
 /// of the reason, which reads as dozens of unrelated failures.
+///
+/// The check is anchored at `CARGO_MANIFEST_DIR`, not the process cwd: fixtures that
+/// need a synthetic `datapacks/` move the cwd (`std::env::set_current_dir` is
+/// process-global), and a relative `exists()` running beside one would report the
+/// committed data as missing — a flake that reads like a broken checkout.
 pub(crate) fn require_vanilla_data() {
-    if REQUIRED_DATA
-        .iter()
-        .any(|p| !std::path::Path::new(p).exists())
-    {
+    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+    if REQUIRED_DATA.iter().any(|p| !root.join(p).exists()) {
         panic!("{}", crate::worldgen::VANILLA_DATA_MISSING);
     }
     // Present is not enough: a `datapacks/vanilla/` copied from an older pack uses another
     // schema (`material_rule`, `aquifers`, no `surface_rule`), loads without an error and
     // then shifts every value the frozen baselines pin, which reads as a code regression.
     let current_schema = std::fs::read_to_string(
-        "datapacks/vanilla/data/minecraft/worldgen/noise_settings/overworld.json",
+        root.join("datapacks/vanilla/data/minecraft/worldgen/noise_settings/overworld.json"),
     )
     .is_ok_and(|s| s.contains("\"surface_rule\""));
     if !current_schema {
@@ -36,6 +39,20 @@ pub(crate) fn require_vanilla_data() {
             crate::worldgen::VANILLA_DATA_MISSING
         );
     }
+}
+
+/// The one guard every test that touches process-global state must hold: env vars, the
+/// working directory, the live world overlay, `TICK`/`TICK_IDX`, the client and mob
+/// registries, the delta-WAL arm, connection counters, and every fixture that snapshots
+/// one of them. It is the same mutex `world_guard()` and `WORLD_TEST_LOCK` already
+/// serialize on, so a fixture added here cannot run beside one added there.
+///
+/// Poison-tolerant like the lock it wraps: a test that fails while holding it must fail
+/// with its own reason, not turn every later test into a `PoisonError`.
+pub(crate) fn global_world_test_guard() -> std::sync::MutexGuard<'static, ()> {
+    crate::WORLD_TEST_LOCK
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
 }
 
 /// The name libtest gave this test, which is also the selector `--exact` needs.
@@ -82,18 +99,47 @@ pub(crate) fn child_note(note: &str) {
     }
 }
 
+/// `MC_SPINE_*` variables that in-process tests mutate. A child spawned while such a
+/// mutation is live inherits it — `MC_SPINE_ONLINE_MODE=1` mid-flip makes the child's own
+/// loopback login demand an encryption response — so the child starts from defaults.
+/// Harness variables are not here: `Command::env` sets them after this list is applied.
+const CHILD_ENV_SCRUB: &[&str] = &[
+    "MC_SPINE_ALLOW_CAVE_MAP",
+    "MC_SPINE_ALLOW_ENTITY_RADAR",
+    "MC_SPINE_ALLOW_PLAYER_ADMIN_COMMANDS",
+    "MC_SPINE_ANTI_XRAY",
+    "MC_SPINE_ANVIL_WORLD_DIR",
+    "MC_SPINE_AUTO_UNLOAD_TICKS",
+    "MC_SPINE_BACKUP_MAX_KEEP",
+    "MC_SPINE_CONFIG",
+    "MC_SPINE_DATAPACK_CACHE_DIR",
+    "MC_SPINE_ENABLE_COMMAND_BLOCK",
+    "MC_SPINE_FAIR_PLAY",
+    "MC_SPINE_MC_VERSION",
+    "MC_SPINE_MODS_DIR",
+    "MC_SPINE_ONLINE_MODE",
+    "MC_SPINE_RESOURCE_PACK_REQUIRED",
+    "MC_SPINE_STRICT_WORLDGEN",
+    "MC_SPINE_TARGET_VERSION",
+    "MC_SPINE_VELOCITY_FORWARDING",
+    "MC_SPINE_VELOCITY_SECRET",
+    "MC_SPINE_WAL_PATH",
+];
+
 /// Run exactly `name` in a child and return its status with the receipt it left. Bounded: a
 /// fixture that hangs is a failure of that fixture, not a hung suite. A caller whose fixture is
 /// *expected* to fail decides what the status means; the receipt and the bound are not weaker for it.
 pub(crate) fn run_isolated_child(name: &str) -> (std::process::ExitStatus, String) {
     let receipt = receipt_path(name);
     let _ = std::fs::remove_file(&receipt);
-    let mut child = std::process::Command::new(std::env::current_exe().unwrap())
-        .args(["--exact", name, "--test-threads=1", "--nocapture"])
+    let mut cmd = std::process::Command::new(std::env::current_exe().unwrap());
+    cmd.args(["--exact", name, "--test-threads=1", "--nocapture"])
         .env("MC_SPINE_TEST_CHILD", name)
-        .env("MC_SPINE_TEST_RECEIPT", &receipt)
-        .spawn()
-        .expect("start isolated world fixture");
+        .env("MC_SPINE_TEST_RECEIPT", &receipt);
+    for var in CHILD_ENV_SCRUB {
+        cmd.env_remove(var);
+    }
+    let mut child = cmd.spawn().expect("start isolated world fixture");
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(180);
     let status = loop {
         if let Some(status) = child.try_wait().expect("wait for isolated fixture") {

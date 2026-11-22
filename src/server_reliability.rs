@@ -2062,6 +2062,9 @@ mod server_reliability_tests {
     /// a counted, cleaned-up disconnect rather than a crash.
     #[test]
     fn connection_crash_isolation_catches_panic_and_runs_cleanup() {
+        // `ISOLATED_CONNECTION_DISCONNECTS` is asserted as `before + 1` below
+        // and by `w4_isolated_connection_*` — concurrent runs break both.
+        let _guard = crate::test_support::global_world_test_guard();
         let req = encode_encryption_request("", &[0x30; 5], &[9, 8, 7, 6], true);
         assert_eq!(
             decode_encryption_request(&req),

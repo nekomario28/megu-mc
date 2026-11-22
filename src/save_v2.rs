@@ -6579,6 +6579,9 @@ mod save_v2_version_tests {
 
     #[test]
     fn save_v2_target_env_selects_the_written_header() {
+        // `with_target_env` mutates the same process-global vars the guarded
+        // save fixtures read through `save_world_into` — serialize them all.
+        let _guard = world_guard();
         // `MC_SPINE_TARGET_VERSION` is the canonical selector.
         with_target_env(Some("26.3"), None, || {
             let header = save_version_header().unwrap();
@@ -6608,6 +6611,8 @@ mod save_v2_version_tests {
 
     #[test]
     fn save_v2_unknown_target_env_fails_closed() {
+        // Same env mutation as `save_v2_target_env_selects_the_written_header`.
+        let _guard = world_guard();
         // An unrecognized name can never steer the written schema: the save
         // keeps the native 1.21.1 layout and emits no VER1 claim.
         for bogus in ["bogus", "1.21.4", "26.4"] {

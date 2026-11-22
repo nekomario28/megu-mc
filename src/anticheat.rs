@@ -2395,6 +2395,9 @@ mod anticheat_unit_tests {
     /// never see half-set shared state.
     #[test]
     fn ops2_lag_compensation_tick_feed_and_rtt_hook_drive_allowance() {
+        // `ops2_reset_lag`/`ac_note_server_tick_ms` write the shared lag feed
+        // `wire_ops_game_tick` asserts on — serialize against it.
+        let _guard = crate::test_support::global_world_test_guard();
         ops2_reset_lag();
         assert_eq!(ac_last_tick_ms(), 0, "no ticks reported reads as healthy");
         ac_note_server_tick_ms(200);

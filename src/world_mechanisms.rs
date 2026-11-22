@@ -3250,6 +3250,9 @@ mod w_be_integration_tests {
 
     #[test]
     fn w_be_campfire_cooks_four_slots_at_600_ticks_and_clears() {
+        // Writes into the shared live `world()` overlay — must
+        // not run beside other world fixtures.
+        let _guard = world_guard();
         let dim = DimId::Overworld;
         let pos = (23420, 220, 23420);
         let reg = breg().expect("block registry");
@@ -3276,6 +3279,9 @@ mod w_be_integration_tests {
 
     #[test]
     fn w_be_campfire_keeps_unsupported_saved_input() {
+        // Writes into the shared live `world()` overlay — must
+        // not run beside other world fixtures.
+        let _guard = world_guard();
         let dim = DimId::Overworld;
         let pos = (23425, 220, 23425);
         let reg = breg().expect("block registry");
@@ -3370,6 +3376,9 @@ mod w_be_integration_tests {
 
     #[test]
     fn w_be_beacon_pyramid_effect_every_80_ticks_and_radius() {
+        // Writes into the shared live `world()` overlay — must
+        // not run beside other world fixtures.
+        let _guard = world_guard();
         let dim = DimId::Overworld;
         let pos = (23450, 220, 23450);
         let reg = breg().expect("block registry");
@@ -9700,6 +9709,9 @@ mod vanilla_blocks_tests {
 
     #[test]
     fn vanilla_blocks_note_dim_use_power_and_obstruction() {
+        // Writes into the shared live `world()` overlay — must
+        // not run beside other world fixtures.
+        let _guard = world_guard();
         let reg = reg();
         let dim = DimId::Overworld;
         let pos = (24300, 210, 24300);
@@ -9958,6 +9970,9 @@ mod vanilla_blocks_tests {
 
     #[test]
     fn vanilla_blocks_lodestone_bind_and_break() {
+        // Writes into the shared live `world()` overlay — must
+        // not run beside other world fixtures.
+        let _guard = world_guard();
         let reg = reg();
         let dim = DimId::End;
         let pos = (24400, 120, 24400);
@@ -9975,6 +9990,9 @@ mod vanilla_blocks_tests {
 
     #[test]
     fn vanilla_blocks_sponge_bfs_depth_and_connectivity() {
+        // Writes into the shared live `world()` overlay — must
+        // not run beside other world fixtures.
+        let _guard = world_guard();
         let dim = DimId::Overworld;
         let sponge = (24500, 210, 24500);
         set_block_dim(dim, sponge.0, sponge.1, sponge.2, state("minecraft:sponge"));
@@ -10000,6 +10018,9 @@ mod vanilla_blocks_tests {
 
     #[test]
     fn vanilla_blocks_sponge_visited_cap_and_waterlogged() {
+        // Writes into the shared live `world()` overlay — must
+        // not run beside other world fixtures.
+        let _guard = world_guard();
         let reg = reg();
         let dim = DimId::Overworld;
         let sponge = (24600, 210, 24600);

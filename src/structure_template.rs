@@ -2234,6 +2234,8 @@ mod tests {
     /// the chunk packet carries the text.
     #[test]
     fn template_sign_text_matches_native_and_reaches_the_sign_store() {
+        // The run writes the process-global `signs()` store.
+        let _guard = crate::test_support::global_world_test_guard();
         use crate::generation_payload::GenerationPayload;
         let reg = crate::block_registry::breg().unwrap();
         let sign_state = reg.state_of("minecraft:oak_sign", None);

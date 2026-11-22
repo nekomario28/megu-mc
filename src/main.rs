@@ -18502,7 +18502,7 @@ static WORLD_TEST_LOCK: Mutex<()> = Mutex::new(());
 /// to stop two tests touching the world at once, and a test that has finished cannot do that.
 #[cfg(test)]
 fn world_guard() -> std::sync::MutexGuard<'static, ()> {
-    WORLD_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner())
+    crate::test_support::global_world_test_guard()
 }
 mod brigadier;
 mod brigadier_wire;
@@ -20449,6 +20449,9 @@ mod wire_ops_tests {
     /// OPS-2 lag-compensation feed, in matching units off one `Instant`.
     #[test]
     fn wire_ops_game_tick_feeds_profiler_and_lag_compensation() {
+        // A live `game_tick` walks `tick_controller`, the profiler, the lag feed
+        // and `dwal_flush_pending` — all process-global, so it runs serialized.
+        let _guard = world_guard();
         {
             // Another test may leave the controller frozen; a skipped tick
             // would feed nothing.
@@ -20477,6 +20480,7 @@ mod wire_ops_tests {
     /// the readback is what the movement envelope scales with.
     #[test]
     fn wire_ops_keepalive_rtt_feeds_lag_compensation() {
+        let _guard = world_guard();
         ac_note_player_rtt_ms(-4242, 250);
         assert_eq!(ac_player_rtt_ms(-4242), 250);
     }
@@ -20486,6 +20490,9 @@ mod wire_ops_tests {
     /// full save compacts the log to its anchor marker.
     #[test]
     fn wire_ops_dwal_append_recover_replay_and_compact() {
+        // `MC_SPINE_WAL_PATH`, `DWAL_ON`, the journal slot and live world cells
+        // are all process-global: the §5.2 WAL tests share every one of them.
+        let _guard = world_guard();
         let dir = wire_ops_dir("dwal");
         let wal_path = dir.join("delta.wal");
         let save_dir = dir.join("save");
@@ -20554,6 +20561,9 @@ mod wire_ops_tests {
     /// journal, no writes, no crash.
     #[test]
     fn wire_ops_dwal_rejects_traversal_path() {
+        // Mutates `MC_SPINE_WAL_PATH`; another WAL test's `dwal_path_from_env`
+        // read beside this one is exactly the flake the guard exists for.
+        let _guard = world_guard();
         let dir = wire_ops_dir("dwal-bad");
         let saved = std::env::var_os("MC_SPINE_WAL_PATH");
         std::env::set_var("MC_SPINE_WAL_PATH", dir.join("..").join("escape.wal"));
@@ -21010,6 +21020,9 @@ mod p8a_parity_tests {
     /// `ServerHotspotProfiler` `/profile` reads — one `OnceLock`, not two.
     #[test]
     fn p8a_parity_game_tick_profiler_is_the_profiled_instance() {
+        // `ring_next` must advance by exactly one: a second live `game_tick`
+        // running beside this one records the same shared ring.
+        let _guard = world_guard();
         {
             // Another test may leave the controller frozen; a skipped tick
             // would feed nothing.
@@ -21034,6 +21047,9 @@ mod p8a_parity_tests {
     /// block entities, `tickChunk` random ticks), then queued block events.
     #[test]
     fn p8a_parity_tick_phases_follow_vanilla_order() {
+        // `game_tick` mutates shared world and controller state; the stage
+        // order assertion only holds when no second tick runs beside it.
+        let _guard = world_guard();
         {
             let mut ctl = p8a_lock(tick_controller());
             ctl.frozen = false;
@@ -21067,6 +21083,8 @@ mod p8a_parity_tests {
     /// `disableRaids` gamerule atomic.
     #[test]
     fn p8a_parity_raid_stage_is_wired_and_disable_gated() {
+        // Live `game_tick` plus `GR_DISABLE_RAIDS` are process-global.
+        let _guard = world_guard();
         {
             let mut ctl = p8a_lock(tick_controller());
             ctl.frozen = false;
