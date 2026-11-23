@@ -1,13 +1,13 @@
 // SPDX-License-Identifier: LGPL-3.0-or-later OR GPL-3.0-or-later OR AGPL-3.0-or-later
 //! Cross-platform audio backend tests: deterministic per-OS sink probing
-//! (Linux → PipeWire/ALSA, macOS → CoreAudio, Windows → WinMM), exact
-//! RIFF/WAVE framing, `AudioLimiter` output bounds, and the headless
+//! (Linux → PipeWire/PulseAudio/ALSA, macOS → CoreAudio, Windows → WinMM),
+//! exact RIFF/WAVE framing, `AudioLimiter` output bounds, and the headless
 //! fail-closed `Null` path. No real devices are required — probing is
 //! injected and every native open fails closed.
 
 use megu_client::audio_out::{
     detect_available_sinks_for_os, encode_pcm_le, open_sink, wav_header_bytes,
-    AudioSessionConfig, AudioSinkKind, TargetOs,
+    AudioSessionConfig, AudioSinkKind, TargetOs, PAPLAY_ARGS,
 };
 use megu_client::audio_qol::AudioLimiter;
 use megu_client::session::SoundMixer;
@@ -26,8 +26,12 @@ fn probe_selects_native_backend_per_os() {
     let all = |_: &str| true;
     assert_eq!(
         detect_available_sinks_for_os(TargetOs::Linux, all),
-        vec![AudioSinkKind::PipeWire, AudioSinkKind::Alsa],
-        "Linux must probe PipeWire first, then ALSA"
+        vec![
+            AudioSinkKind::PipeWire,
+            AudioSinkKind::PulseAudio,
+            AudioSinkKind::Alsa
+        ],
+        "Linux must probe PipeWire, then PulseAudio (paplay), then ALSA"
     );
     assert_eq!(
         detect_available_sinks_for_os(TargetOs::MacOs, all),
@@ -53,6 +57,16 @@ fn probe_filters_missing_backends() {
     assert_eq!(
         detect_available_sinks_for_os(TargetOs::Linux, |k| k == "pipewire"),
         vec![AudioSinkKind::PipeWire]
+    );
+    // PulseAudio-only host (Ubuntu 22.04, Debian 12, Void, Alpine, NixOS):
+    // paplay is probed ahead of ALSA so `paplay` wins over `aplay`.
+    assert_eq!(
+        detect_available_sinks_for_os(TargetOs::Linux, |k| k == "pulseaudio"),
+        vec![AudioSinkKind::PulseAudio]
+    );
+    assert_eq!(
+        detect_available_sinks_for_os(TargetOs::Linux, |k| k != "pipewire"),
+        vec![AudioSinkKind::PulseAudio, AudioSinkKind::Alsa]
     );
     // macOS/Windows never see Linux subprocess sinks, and vice versa.
     assert_eq!(
@@ -111,13 +125,48 @@ fn wrong_os_backend_fails_closed_to_null() {
     }
 }
 
+/// The `paplay` subprocess spec is the same 48 kHz s16le stereo PCM every
+/// other backend consumes — raw on stdin, no file target.
+#[test]
+fn paplay_command_spec_matches_sink_pcm_format() {
+    assert_eq!(
+        PAPLAY_ARGS.map(String::from),
+        [
+            "--raw".to_string(),
+            "--format=s16le".to_string(),
+            format!("--rate={MIX_SAMPLE_RATE}"),
+            "--channels=2".to_string(),
+        ],
+        "paplay must stream raw s16le {MIX_SAMPLE_RATE} Hz stereo from stdin"
+    );
+}
+
+/// Explicit `PulseAudio` selection opens `paplay` when it can start and
+/// fails closed to `null` + warning otherwise — never a wrong-OS backend.
+#[test]
+fn explicit_pulseaudio_sink_is_native_or_null_never_wrong_os() {
+    let (mut sink, warn) = open_sink(&AudioSinkKind::PulseAudio);
+    if cfg!(target_os = "linux") {
+        assert!(matches!(sink.label(), "pulseaudio" | "null"));
+    } else {
+        assert_eq!(sink.label(), "null", "paplay is a Linux backend");
+    }
+    if sink.label() == "null" {
+        assert!(warn.is_some(), "silent Null fallback is forbidden");
+    }
+    sink.finish();
+}
+
 /// `Auto` on this host never panics and lands on a Linux subprocess sink
 /// or the null fallback — and it never selects a wrong-OS backend.
 #[test]
 fn auto_sink_is_native_or_null_never_wrong_os() {
     let (mut sink, warn) = open_sink(&AudioSinkKind::Auto);
     #[cfg(target_os = "linux")]
-    assert!(matches!(sink.label(), "pipewire" | "alsa" | "null"));
+    assert!(matches!(
+        sink.label(),
+        "pipewire" | "pulseaudio" | "alsa" | "null"
+    ));
     #[cfg(target_os = "macos")]
     assert!(matches!(sink.label(), "coreaudio" | "null"));
     #[cfg(target_os = "windows")]

@@ -1,8 +1,9 @@
 // SPDX-License-Identifier: LGPL-3.0-or-later OR GPL-3.0-or-later OR AGPL-3.0-or-later
-//! Audio output stage: [`AudioSink`] backends (PipeWire/ALSA subprocess pipe,
-//! null, WAV file), the bounded PCM queue that feeds a stalled sink without
-//! unbounded growth, and [`AudioRuntime`] — the live pipeline that turns
-//! decoded `sound_*` packets into spatialized, limited stereo PCM.
+//! Audio output stage: [`AudioSink`] backends (PipeWire/PulseAudio/ALSA
+//! subprocess pipe, null, WAV file), the bounded PCM queue that feeds a
+//! stalled sink without unbounded growth, and [`AudioRuntime`] — the live
+//! pipeline that turns decoded `sound_*` packets into spatialized, limited
+//! stereo PCM.
 //!
 //! The runtime lives inside [`crate::protocol::ProtocolClient`]: it is fed
 //! by the play-packet decode arms and pumped from the same call sites the
@@ -72,12 +73,15 @@ pub trait AudioSink: Send {
 /// Selected backend from `--audio-sink`/`--audio-wav`.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum AudioSinkKind {
-    /// Native backend in OS probe order (`pw-cat`/`aplay` on Linux,
+    /// Native backend in OS probe order (`pw-cat`/`paplay`/`aplay` on Linux,
     /// CoreAudio on macOS, WinMM on Windows), else `null` (with a warning).
     Auto,
     /// Force `pw-cat`; falls back to `null` with a warning when it cannot
     /// start or dies.
     PipeWire,
+    /// Force `paplay` (PulseAudio or PipeWire's PulseAudio-compat layer);
+    /// same null fallback. Not exposed via `--audio-sink`.
+    PulseAudio,
     /// Force `aplay`; same null fallback.
     Alsa,
     /// Force the macOS CoreAudio/AudioQueue backend; null fallback when the
@@ -98,7 +102,7 @@ pub enum AudioSinkKind {
 /// probe ordering is unit-testable without cross-compiling.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum TargetOs {
-    /// Linux (and other Unixes that ship `pw-cat`/`aplay`).
+    /// Linux (and other Unixes that ship `pw-cat`/`paplay`/`aplay`).
     Linux,
     /// macOS — CoreAudio/AudioQueue.
     MacOs,
@@ -177,7 +181,7 @@ fn path_has_executable(prog: &str) -> bool {
 }
 
 /// Availability probe for the *native* backend `key` (`"pipewire"`,
-/// `"alsa"`, `"coreaudio"`, `"winmm"`). Injected into
+/// `"pulseaudio"`, `"alsa"`, `"coreaudio"`, `"winmm"`). Injected into
 /// [`detect_available_sinks_for_os`] in production; tests substitute a stub
 /// so probe order is checked without spawning or cross-compiling.
 ///
@@ -187,6 +191,7 @@ fn path_has_executable(prog: &str) -> bool {
 pub fn native_backend_available(key: &str) -> bool {
     match key {
         "pipewire" => path_has_executable("pw-cat"),
+        "pulseaudio" => path_has_executable("paplay"),
         "alsa" => path_has_executable("aplay"),
         "coreaudio" => cfg!(target_os = "macos"),
         "winmm" => cfg!(target_os = "windows"),
@@ -196,7 +201,9 @@ pub fn native_backend_available(key: &str) -> bool {
 
 /// Ordered native sink candidates for `os`, filtered by `available`.
 ///
-/// - Linux → `[PipeWire, Alsa]` (PipeWire first — the modern stack)
+/// - Linux → `[PipeWire, PulseAudio, Alsa]` (PipeWire first — the modern
+///   stack; PulseAudio/`paplay` covers distros without `pw-cat` such as
+///   Ubuntu 22.04, Debian 12, Void, Alpine, and NixOS)
 /// - macOS → `[CoreAudio]`
 /// - Windows → `[WinMm]`
 /// - anything else → `[]`
@@ -211,6 +218,7 @@ pub fn detect_available_sinks_for_os(
     let candidates: &[(&str, AudioSinkKind)] = match os {
         TargetOs::Linux => &[
             ("pipewire", AudioSinkKind::PipeWire),
+            ("pulseaudio", AudioSinkKind::PulseAudio),
             ("alsa", AudioSinkKind::Alsa),
         ],
         TargetOs::MacOs => &[("coreaudio", AudioSinkKind::CoreAudio)],
@@ -354,7 +362,7 @@ impl Drop for WavSink {
 }
 
 // ---------------------------------------------------------------------------
-// Subprocess sink (pw-cat / aplay) + bounded queue
+// Subprocess sink (pw-cat / paplay / aplay) + bounded queue
 // ---------------------------------------------------------------------------
 
 /// Bounded byte queue between the mixer thread and the sink writer thread.
@@ -465,9 +473,10 @@ impl PcmQueue {
     }
 }
 
-/// `pw-cat`/`aplay` subprocess sink. Mixed PCM is queued on a bounded buffer
-/// and drained into the child's stdin by a writer thread; a dead or stalled
-/// child fails the sink closed (the runtime swaps in [`NullSink`]).
+/// `pw-cat`/`paplay`/`aplay` subprocess sink. Mixed PCM is queued on a
+/// bounded buffer and drained into the child's stdin by a writer thread; a
+/// dead or stalled child fails the sink closed (the runtime swaps in
+/// [`NullSink`]).
 pub struct SubprocessSink {
     prog: &'static str,
     label: &'static str,
@@ -1275,9 +1284,20 @@ const PW_CAT_ARGS: [&str; 9] = [
 const APLAY_ARGS: [&str; 10] = [
     "-q", "-f", "S16_LE", "-r", "48000", "-c", "2", "-t", "raw", "-",
 ];
+/// `paplay` raw playback: reads interleaved s16le stereo 48 kHz PCM from
+/// stdin when no file is given, so no `-` target is appended. Public so
+/// backend tests can pin the exact subprocess contract.
+#[doc(hidden)]
+pub const PAPLAY_ARGS: [&str; 4] = [
+    "--raw",
+    "--format=s16le",
+    "--rate=48000",
+    "--channels=2",
+];
 const PW_TARGET: [&str; 1] = ["-"];
 
-/// Open one subprocess sink (`pw-cat` or `aplay`); `None` on spawn failure.
+/// Open one subprocess sink (`pw-cat`, `paplay`, or `aplay`); `None` on
+/// spawn failure.
 fn try_subprocess(
     prog: &'static str,
     args: &'static [&'static str],
@@ -1297,6 +1317,7 @@ fn try_subprocess(
 fn sink_kind_label(kind: &AudioSinkKind) -> &'static str {
     match kind {
         AudioSinkKind::PipeWire => "pipewire",
+        AudioSinkKind::PulseAudio => "pulseaudio",
         AudioSinkKind::Alsa => "alsa",
         AudioSinkKind::CoreAudio => "coreaudio",
         AudioSinkKind::WinMm => "winmm",
@@ -1311,6 +1332,8 @@ fn open_native(kind: &AudioSinkKind) -> Result<Box<dyn AudioSink>, String> {
     match kind {
         AudioSinkKind::PipeWire => try_subprocess("pw-cat", &PW_CAT_ARGS, "pipewire")
             .ok_or_else(|| "pw-cat could not start".to_string()),
+        AudioSinkKind::PulseAudio => try_subprocess("paplay", &PAPLAY_ARGS, "pulseaudio")
+            .ok_or_else(|| "paplay could not start".to_string()),
         AudioSinkKind::Alsa => try_subprocess("aplay", &APLAY_ARGS, "alsa")
             .ok_or_else(|| "aplay could not start".to_string()),
         AudioSinkKind::CoreAudio => coreaudio_sink(),
@@ -1322,7 +1345,8 @@ fn open_native(kind: &AudioSinkKind) -> Result<Box<dyn AudioSink>, String> {
 
 /// Open a sink for `kind`, returning the sink plus an optional warning.
 /// `Auto` walks [`detect_available_sinks_for_os`] for the host OS
-/// (`pw-cat`→`aplay` on Linux, CoreAudio on macOS, WinMM on Windows) and
+/// (`pw-cat`→`paplay`→`aplay` on Linux, CoreAudio on macOS, WinMM on
+/// Windows) and
 /// falls back to `null` when every candidate is missing or refuses to
 /// start — the headless path.
 pub fn open_sink(kind: &AudioSinkKind) -> (Box<dyn AudioSink>, Option<String>) {
