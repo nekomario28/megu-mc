@@ -72,7 +72,7 @@ pub(crate) mod owner {
             }
             if let Some(chunk) = self.chunks.get(&chunk) {
                 if (1..count - 1).contains(&index) {
-                    out = pack_light_nibbles(&chunk.light(kind)[(index - 1) << 12..][..4096]);
+                    out = chunk.pack_section(kind, index - 1);
                 } else if index + 1 == count && self.has_skylight && kind == LightKind::Sky {
                     out.fill(0xff);
                 }
@@ -217,14 +217,14 @@ pub(crate) mod owner {
 
         fn source(&self, kind: LightKind, p: Position) -> u8 {
             self.cell(p).map_or(0, |(chunk, index)| match kind {
-                LightKind::Sky => chunk.direct_sky[index],
-                LightKind::Block => chunk.blocks[index].emission,
+                LightKind::Sky => chunk.direct_sky_at(index),
+                LightKind::Block => chunk.states[index] >> 4,
             })
         }
 
         pub(crate) fn level(&self, kind: LightKind, p: Position) -> u8 {
             self.cell(p)
-                .map_or(0, |(chunk, index)| chunk.light(kind)[index])
+                .map_or(0, |(chunk, index)| chunk.light_at(kind, index))
         }
 
         fn set_level(&mut self, kind: LightKind, p: Position, level: u8) {
@@ -236,38 +236,19 @@ pub(crate) mod owner {
             }
         }
 
-        fn next_stamp(&mut self) -> u32 {
-            if self.stamp == u32::MAX {
-                for chunk in self.chunks.values_mut() {
-                    chunk.patch.0.fill(0);
-                }
-                self.stamp = 0;
-            }
-            self.stamp += 1;
-            self.stamp
-        }
-
         /// Marks a loaded cell as part of the patch; false if absent or already marked.
-        fn claim(&mut self, p: Position, stamp: u32) -> bool {
-            let Some(index) = self.index(p) else {
+        fn claim(&self, p: Position, patch_set: &mut LightingHashSet<Position>) -> bool {
+            if self.index(p).is_none() || !self.chunks.contains_key(&p.chunk()) {
                 return false;
-            };
-            let Some(chunk) = self.chunks.get_mut(&p.chunk()) else {
-                return false;
-            };
-            std::mem::replace(&mut chunk.patch.0[index], stamp) != stamp
-        }
-
-        fn in_patch(&self, p: Position, stamp: u32) -> bool {
-            self.cell(p)
-                .is_some_and(|(chunk, index)| chunk.patch.0[index] == stamp)
+            }
+            patch_set.insert(p)
         }
 
         fn propagate(
             &mut self,
             kind: LightKind,
             queue: &mut LightingVecDeque<(Position, u8)>,
-            patch: Option<u32>,
+            patch: Option<&LightingHashSet<Position>>,
         ) {
             let Self {
                 min_y,
@@ -286,23 +267,23 @@ pub(crate) mod owner {
                 let Some(chunk) = chunks.get(&p.chunk()) else {
                     continue;
                 };
-                if chunk.light(kind)[index] != level {
+                if chunk.light_at(kind, index) != level {
                     continue;
                 }
-                let from = chunk.blocks[index];
+                let from = chunk.light_block(index);
                 for (face, next) in p.adjacent() {
                     let Some(index) = Self::flat(*min_y, *height, next) else {
                         continue;
                     };
+                    if patch.is_some_and(|set| !set.contains(&next)) {
+                        continue;
+                    }
                     let key = next.chunk();
                     let Some(chunk) = chunks.get_mut(&key) else {
                         continue;
                     };
-                    if patch.is_some_and(|stamp| chunk.patch.0[index] != stamp) {
-                        continue;
-                    }
-                    let candidate = from.transmitted(face, chunk.blocks[index], level);
-                    if candidate > chunk.light(kind)[index] {
+                    let candidate = from.transmitted(face, chunk.light_block(index), level);
+                    if candidate > chunk.light_at(kind, index) {
                         chunk.store(kind, index, candidate, key, snap);
                         queue.push_back((next, candidate));
                     }
@@ -318,18 +299,21 @@ pub(crate) mod owner {
                     for i in 0..256 {
                         Self::refresh_column(self.min_y, self.height, chunk, i, &mut |_| {});
                     }
-                    chunk.sky.copy_from_slice(&chunk.direct_sky);
+                    for i in 0..chunk.light_nibbles.len() {
+                        chunk.set_light(LightKind::Sky, i, chunk.direct_sky_at(i));
+                    }
                 }
-                for (i, state) in chunk.blocks.iter().enumerate() {
-                    if state.emission > 0 {
-                        chunk.block[i] = state.emission;
+                for i in 0..chunk.states.len() {
+                    let emission = chunk.states[i] >> 4;
+                    if emission > 0 {
+                        chunk.set_light(LightKind::Block, i, emission);
                         block.push_back((
                             Position::new(
                                 cx * 16 + (i & 15) as i32,
                                 self.min_y + (i >> 8) as i32,
                                 cz * 16 + ((i >> 4) & 15) as i32,
                             ),
-                            state.emission,
+                            emission,
                         ));
                     }
                 }
@@ -355,8 +339,8 @@ pub(crate) mod owner {
                         let ni = ((nz & 15) << 4 | (nx & 15)) as usize;
                         for y in self.min_y..=other.sky_top[ni] {
                             let offset = ((y - self.min_y) as usize) << 8;
-                            let from = chunk.direct_sky[offset | i];
-                            if from > other.direct_sky[offset | ni] + 1 {
+                            let from = chunk.direct_sky_at(offset | i);
+                            if from > other.direct_sky_at(offset | ni) + 1 {
                                 sky.push_back((Position::new(x, y, z), from));
                             }
                         }
@@ -380,7 +364,7 @@ pub(crate) mod owner {
             for dy in (0..height).rev() {
                 let i = ((dy as usize) << 8) | column;
                 if level > 0 {
-                    let block = chunk.blocks[i];
+                    let block = chunk.light_block(i);
                     level = if above.seals(Face::Down, block.occlusion) {
                         0
                     } else {
@@ -391,8 +375,8 @@ pub(crate) mod owner {
                 if level < 15 {
                     top = top.max(min_y + dy);
                 }
-                if chunk.direct_sky[i] != level {
-                    chunk.direct_sky[i] = level;
+                if chunk.direct_sky_at(i) != level {
+                    set_packed_nibbles(&mut chunk.direct_sky, i, level);
                     changed(min_y + dy);
                 }
             }
@@ -458,7 +442,7 @@ pub(crate) mod owner {
             }
             if let Some(chunk) = self.chunks.get(&chunk) {
                 if (1..count - 1).contains(&index) {
-                    out = pack_light_nibbles(&chunk.light(kind)[(index - 1) << 12..][..4096]);
+                    out = chunk.pack_section(kind, index - 1);
                 } else if index + 1 == count && self.has_skylight && kind == LightKind::Sky {
                     out.fill(0xff);
                 }
@@ -476,16 +460,17 @@ pub(crate) mod owner {
             let mut scratch = std::mem::take(&mut self.scratch);
             let Scratch {
                 patch,
+                patch_set,
                 frontier,
                 queue,
                 ..
             } = &mut scratch;
             patch.clear();
+            patch_set.clear();
             frontier.clear();
             queue.clear();
-            let stamp = self.next_stamp();
             for &p in changed {
-                if self.claim(p, stamp) {
+                if self.claim(p, patch_set) {
                     patch.push(p);
                     frontier.push_back((p, 0u8));
                 }
@@ -495,7 +480,7 @@ pub(crate) mod owner {
                     continue;
                 }
                 for (_, n) in p.adjacent() {
-                    if self.claim(n, stamp) {
+                    if self.claim(n, patch_set) {
                         patch.push(n);
                         frontier.push_back((n, distance + 1));
                     }
@@ -509,12 +494,12 @@ pub(crate) mod owner {
             for &p in patch.iter() {
                 let mut level = self.source(kind, p);
                 let (chunk, index) = self.cell(p).expect("patch lies in the light window");
-                let target = chunk.blocks[index];
+                let target = chunk.light_block(index);
                 for (face, neighbor) in p.adjacent() {
-                    if !self.in_patch(neighbor, stamp) {
+                    if !patch_set.contains(&neighbor) {
                         if let Some((chunk, index)) = self.cell(neighbor) {
-                            let incoming = chunk.light(kind)[index];
-                            level = level.max(chunk.blocks[index].transmitted(
+                            let incoming = chunk.light_at(kind, index);
+                            level = level.max(chunk.light_block(index).transmitted(
                                 face.opposite(),
                                 target,
                                 incoming,
@@ -527,7 +512,7 @@ pub(crate) mod owner {
                     queue.push_back((p, level));
                 }
             }
-            self.propagate(kind, queue, Some(stamp));
+            self.propagate(kind, queue, Some(patch_set));
             let len = patch.len();
             self.scratch = scratch;
             len
@@ -561,7 +546,7 @@ pub(crate) mod owner {
                 let Some(chunk) = self.chunks.get_mut(&p.chunk()) else {
                     continue;
                 };
-                let old = std::mem::replace(&mut chunk.blocks[i], block);
+                let old = chunk.set_block(i, block);
                 if old == block {
                     continue;
                 }
@@ -603,11 +588,10 @@ pub(crate) mod owner {
                         break;
                     }
                     let kind = [LightKind::Sky, LightKind::Block][kind];
-                    let new = &light.light(kind)[section << 12..][..4096];
-                    if &self.snap.arena[offset..offset + 4096] == new {
+                    let packed = light.pack_section(kind, section);
+                    if self.snap.arena[offset..offset + 2048] == packed {
                         continue;
                     }
-                    let packed = pack_light_nibbles(new);
                     let bit = section + 1;
                     let (mask, empty, sections) = match kind {
                         LightKind::Sky => (
@@ -657,11 +641,8 @@ pub(crate) mod owner {
             let count = (self.height / 16 + 2) as usize;
             let mut out = vec![[0u8; 2048]; count];
             if let Some(chunk) = self.chunks.get(&chunk) {
-                for (array, levels) in out[1..count - 1]
-                    .iter_mut()
-                    .zip(chunk.light(kind).chunks_exact(4096))
-                {
-                    *array = pack_light_nibbles(levels);
+                for (section, array) in out[1..count - 1].iter_mut().enumerate() {
+                    *array = chunk.pack_section(kind, section);
                 }
                 if self.has_skylight && kind == LightKind::Sky {
                     out[count - 1].fill(0xff);
