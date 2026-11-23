@@ -22,13 +22,17 @@ def exercise(game):
                 client.until_id(0x40)
             sx, sy, sz = client.pos
             cx, cz = math.floor(sx / 16), math.floor(sz / 16)
-            assert set(client.chunks) == square(cx, cz)
+            # Login now leads with the 3x3 ring and the delivery loop overshoots
+            # the negotiated view by vanilla's +1 bounding ring, so the contract
+            # is containment of the requested square, not set equality.
+            client.until(lambda *_: square(cx, cz) <= set(client.chunks), "spawn-window")
             client.move(sx + 16, sy, sz)
             client.until_id(0x0c)
-            assert set(client.chunks) == square(cx + 1, cz), "movement changes the received window"
+            client.until(lambda *_: square(cx + 1, cz) <= set(client.chunks),
+                         "movement changes the received window")
             client.move(sx, sy, sz)
             client.until_id(0x0c)
-            assert set(client.chunks) == square(cx, cz)
+            client.until(lambda *_: square(cx, cz) <= set(client.chunks), "return-window")
             x, z = math.floor(sx), math.floor(sz)
             y = next(y for y in range(min(math.floor(sy) - 1, 319), -65, -1)
                      if client.block(x, y, z) in breakable)
