@@ -196,6 +196,16 @@ impl ZipArchive {
         self.entries.iter().any(|e| e.name == name)
     }
 
+    /// Compressed size in bytes of an indexed entry — a cheap size hint
+    /// for decode-queue budgeting; `None` when the entry is absent. The
+    /// index is already in memory, so this performs no IO.
+    pub fn entry_comp_size(&self, name: &str) -> Option<u64> {
+        self.entries
+            .iter()
+            .find(|e| e.name == name)
+            .map(|e| u64::from(e.comp_size))
+    }
+
     /// Decompress `name` into memory, bounded to `max_out` bytes. Returns
     /// `Ok(None)` when the entry is absent or was dropped as unsafe; `Err`
     /// when the entry exists but cannot be decoded (truncated archive,

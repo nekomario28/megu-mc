@@ -526,7 +526,29 @@ fn qual_b3_b4_b5_2d_stereo_bypass_volume_range_doppler_and_shared_fdn_tail() {
     rt.ingest(&wire("big.boom", 4.0));
     rt.ingest(&wire("wide.thunder", 2.0));
     rt.ingest(&wire("far.hiss", 1.0));
-    rt.pump_frames(240);
+    // Decode runs on the async worker now — pump until every voice has
+    // landed (bounded wait; the fixture "ogg" fails decode → placeholder).
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    loop {
+        rt.pump_frames(240);
+        if rt
+            .mixer
+            .voice_max_range("minecraft:big.boom")
+            .is_some()
+            && rt
+                .mixer
+                .voice_max_range("minecraft:wide.thunder")
+                .is_some()
+            && rt.mixer.voice_max_range("minecraft:far.hiss").is_some()
+        {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "decoded voices never reached the mixer"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(5));
+    }
     assert_eq!(
         rt.mixer.voice_max_range("minecraft:big.boom"),
         Some(64.0),

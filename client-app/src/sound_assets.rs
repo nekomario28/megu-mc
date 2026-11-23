@@ -736,22 +736,38 @@ impl SoundLibrary {
     }
 
     /// Decode a resolved source to 48 kHz [`DecodedPcm`] (mono or stereo),
-    /// memoized under the bounded LRU replay cache.
+    /// memoized under the bounded LRU replay cache. Implemented as the
+    /// three phased steps below so the async decode worker can hold a
+    /// read lock through the expensive decode while ingest-side
+    /// `resolve` calls stay shared.
     pub fn decode_source(&mut self, source: &SoundSourceData) -> Result<Arc<DecodedPcm>, String> {
-        let cache_key = match source {
-            SoundSourceData::File(p) => p.clone(),
-            SoundSourceData::ZipEntry {
-                archive_path,
-                entry_name,
-            } => PathBuf::from(format!("{}!{entry_name}", archive_path.display())),
-        };
+        if let Some(hit) = self.cached_pcm(source) {
+            return Ok(hit);
+        }
+        let pcm = self.decode_uncached(source)?;
+        let shared: Arc<DecodedPcm> = Arc::new(pcm);
+        self.cache_pcm(source, shared.clone());
+        Ok(shared)
+    }
+
+    /// Replay-cache probe for [`SoundLibrary::decode_source`]: `Some` on
+    /// hit with recency refreshed, `None` on miss. Brief `&mut` critical
+    /// section — safe under a write lock.
+    pub fn cached_pcm(&mut self, source: &SoundSourceData) -> Option<Arc<DecodedPcm>> {
+        let cache_key = Self::cache_key(source);
         self.lru_clock += 1;
         let tick = self.lru_clock;
-        if let Some(entry) = self.decode_cache.get_mut(&cache_key) {
-            entry.last_used = tick;
-            self.pcm_cache_hits += 1;
-            return Ok(entry.pcm.clone());
-        }
+        let entry = self.decode_cache.get_mut(&cache_key)?;
+        entry.last_used = tick;
+        self.pcm_cache_hits += 1;
+        Some(entry.pcm.clone())
+    }
+
+    /// Decode `source` to 48 kHz [`DecodedPcm`] *without* consulting or
+    /// updating the replay cache — read-only against the layer tables,
+    /// so it is safe (and intended) to run under a shared read lock while
+    /// ingest-side lookups proceed concurrently.
+    pub fn decode_uncached(&self, source: &SoundSourceData) -> Result<DecodedPcm, String> {
         let pcm = match source {
             SoundSourceData::File(p) => decode_ogg(p, MAX_OGG_BYTES, MAX_DECODED_SAMPLES)?,
             SoundSourceData::ZipEntry {
@@ -781,27 +797,67 @@ impl SoundLibrary {
                 decode_ogg_mem(&bytes, MAX_DECODED_SAMPLES)?
             }
         };
-        let pcm = match pcm {
-            (DecodedPcm::Mono(v), rate) => {
-                DecodedPcm::Mono(resample_if_needed(&v, rate))
-            }
+        Ok(match pcm {
+            (DecodedPcm::Mono(v), rate) => DecodedPcm::Mono(resample_if_needed(&v, rate)),
             (DecodedPcm::Stereo(v), rate) => DecodedPcm::Stereo(resample_stereo(&v, rate)),
-        };
-        let shared: Arc<DecodedPcm> = Arc::new(pcm);
-        let bytes = shared.bytes();
-        if bytes <= self.pcm_cache_cap_bytes {
-            self.decode_cache.insert(
-                cache_key,
-                CachedPcm {
-                    pcm: shared.clone(),
-                    bytes,
-                    last_used: tick,
-                },
-            );
-            self.pcm_cache_bytes += bytes;
-            self.evict_pcm_over_cap();
+        })
+    }
+
+    /// Insert freshly decoded PCM into the bounded LRU replay cache —
+    /// brief `&mut` critical section. Clips larger than the whole cap are
+    /// played uncached, exactly like [`SoundLibrary::decode_source`].
+    pub fn cache_pcm(&mut self, source: &SoundSourceData, pcm: Arc<DecodedPcm>) {
+        let bytes = pcm.bytes();
+        if bytes > self.pcm_cache_cap_bytes {
+            return;
         }
-        Ok(shared)
+        self.lru_clock += 1;
+        let tick = self.lru_clock;
+        self.decode_cache.insert(
+            Self::cache_key(source),
+            CachedPcm {
+                pcm,
+                bytes,
+                last_used: tick,
+            },
+        );
+        self.pcm_cache_bytes += bytes;
+        self.evict_pcm_over_cap();
+    }
+
+    /// Cache key for a resolved source: the filesystem path for plain
+    /// files, the `archive!entry` surrogate for ZIP/JAR members.
+    fn cache_key(source: &SoundSourceData) -> PathBuf {
+        match source {
+            SoundSourceData::File(p) => p.clone(),
+            SoundSourceData::ZipEntry {
+                archive_path,
+                entry_name,
+            } => PathBuf::from(format!("{}!{entry_name}", archive_path.display())),
+        }
+    }
+
+    /// Encoded-size hint for decode-queue budgeting: the file length for
+    /// plain files, the compressed entry size for archive members, `0`
+    /// when neither is cheaply known (a job-count cap still bounds those).
+    pub fn source_size_hint(&self, source: &SoundSourceData) -> usize {
+        match source {
+            SoundSourceData::File(p) => std::fs::metadata(p)
+                .map(|m| m.len() as usize)
+                .unwrap_or(0),
+            SoundSourceData::ZipEntry {
+                archive_path,
+                entry_name,
+            } => self
+                .layers
+                .iter()
+                .rev()
+                .filter_map(|l| l.zip.as_ref())
+                .find(|z| archive_path == &zip_archive_path(z) && z.contains(entry_name))
+                .and_then(|z| z.entry_comp_size(entry_name))
+                .map(|n| n as usize)
+                .unwrap_or(0),
+        }
     }
 
     /// Decode an object-store OGG to 48 kHz mono `f32`, memoized by path

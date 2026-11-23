@@ -31,7 +31,6 @@ use crate::kinetic_sync::{
     CHANNEL_CREATE_KINETIC_SYNC, CHANNEL_CREATE_KINETIC_UPDATE, KineticSyncRecord,
     KineticSyncStore, decode_kinetic_sync_batch,
 };
-use crate::mod_assets_meta::{ClientModRegistry, decode_mrs1_frame};
 use crate::online_auth::OnlineAuthOptions;
 use crate::protocol::{decode_megu_custom_payload, MeguCustomPayload, SeasonWireSync};
 use crate::recovery::{ContainmentOutcome, CrashCircuitBreaker, CrashGuard, RecoveryAction};
@@ -45,11 +44,6 @@ use megu_client_mesh::tactile_effects::EnvironmentAudioHint;
 
 /// Default spatial-audio sample rate (matches the `VCR1` PCM path).
 const DEFAULT_SAMPLE_RATE: u32 = 48_000;
-
-/// Play S2C `custom_payload` channel carrying the `MRS1` dynamic mod
-/// registry frame (matches `mod_adapter_core`'s
-/// `MOD_REGISTRY_SYNC_CHANNEL`).
-pub const CHANNEL_MOD_REGISTRY_SYNC: &str = "megu:mod_registry_sync_v1";
 
 /// A session subsystem that [`ClientSession::run_guarded_subsystem`] can
 /// contain individually. Once the circuit breaker trips on a subsystem's
@@ -128,14 +122,6 @@ pub struct ClientSession {
     pub latest_season: Option<SeasonWireSync>,
     /// Live Create kinetic nodes and changes waiting for the GPU session.
     kinetic_sync: KineticSyncStore,
-    /// Latest `MRS1` dynamic mod registry accepted on
-    /// [`CHANNEL_MOD_REGISTRY_SYNC`]; `None` until the first frame.
-    mod_registry: Option<ClientModRegistry>,
-    /// Set when an accepted `MRS1` frame has not yet been drained by
-    /// [`Self::take_mod_registry_update`] — the forward edge a session
-    /// host consumes to push the registry into the GPU `LiveSession`
-    /// over its worker channel.
-    mod_registry_dirty: bool,
     /// Subsystems disabled after their breaker trip.
     disabled_subsystems: BTreeSet<GuardedSubsystem>,
     /// Blame metadata for crash reports captured by [`CrashGuard`].
@@ -158,8 +144,6 @@ impl ClientSession {
             crash_breaker: CrashCircuitBreaker::new(),
             latest_season: None,
             kinetic_sync: KineticSyncStore::default(),
-            mod_registry: None,
-            mod_registry_dirty: false,
             disabled_subsystems: BTreeSet::new(),
             report_env,
             crash_dir,
@@ -172,15 +156,6 @@ impl ClientSession {
     /// [`MeguCustomPayload::Season`]. Malformed frames and unrecognized
     /// channels fail closed with `false` and leave session state untouched.
     pub fn handle_megu_custom_payload(&mut self, channel: &str, data: &[u8]) -> bool {
-        if channel == CHANNEL_MOD_REGISTRY_SYNC {
-            return decode_mrs1_frame(data)
-                .map(|registry| {
-                    self.mod_registry = Some(registry);
-                    self.mod_registry_dirty = true;
-                    true
-                })
-                .unwrap_or(false);
-        }
         if matches!(
             channel,
             CHANNEL_CREATE_KINETIC_SYNC | CHANNEL_CREATE_KINETIC_UPDATE
@@ -199,24 +174,6 @@ impl ClientSession {
             }
             Some(_) => true,
             None => false,
-        }
-    }
-
-    /// The latest accepted `MRS1` dynamic mod registry, `None` until the
-    /// first [`CHANNEL_MOD_REGISTRY_SYNC`] frame decodes.
-    pub fn mod_registry(&self) -> Option<&ClientModRegistry> {
-        self.mod_registry.as_ref()
-    }
-
-    /// Drain the pending registry forward: returns the registry once per
-    /// accepted `MRS1` frame so the host can push it to the GPU session's
-    /// worker channel; `None` when nothing new arrived.
-    pub fn take_mod_registry_update(&mut self) -> Option<ClientModRegistry> {
-        if self.mod_registry_dirty {
-            self.mod_registry_dirty = false;
-            self.mod_registry.clone()
-        } else {
-            None
         }
     }
 
@@ -497,6 +454,9 @@ pub struct AudioStats {
     pub placeholder_voices: u64,
     /// OGG decode failures after a successful resolve.
     pub decode_errors: u64,
+    /// Decode jobs dropped by the bounded decode queue (declined or
+    /// evicted) before reaching the worker.
+    pub decode_dropped: u64,
     /// Events dropped when the submit queue was full.
     pub queue_dropped: u64,
     /// Subtitle cues emitted.
@@ -1436,73 +1396,6 @@ mod tests {
         assert!(session.handle_megu_custom_payload(CHANNEL_CREATE_KINETIC_UPDATE, &payload));
         session.handle_kinetic_chunk_unload(1, -1);
         assert_eq!(session.drain_kinetic_updates().1, vec![(17, 64, -1)]);
-    }
-
-    fn mrs1_frame(base_block_state: u32, base_item: u32, block: (u32, &str)) -> Vec<u8> {
-        fn crc32(bytes: &[u8]) -> u32 {
-            let mut crc = !0u32;
-            for &byte in bytes {
-                crc ^= u32::from(byte);
-                for _ in 0..8 {
-                    let mask = 0u32.wrapping_sub(crc & 1);
-                    crc = (crc >> 1) ^ (0xEDB8_8320 & mask);
-                }
-            }
-            !crc
-        }
-        let mut frame = b"MRS1".to_vec();
-        frame.extend_from_slice(&1u16.to_be_bytes());
-        frame.extend_from_slice(&base_block_state.to_be_bytes());
-        frame.extend_from_slice(&base_item.to_be_bytes());
-        frame.extend_from_slice(&1u32.to_be_bytes());
-        frame.extend_from_slice(&block.0.to_be_bytes());
-        frame.extend_from_slice(&(block.1.len() as u16).to_be_bytes());
-        frame.extend_from_slice(block.1.as_bytes());
-        frame.extend_from_slice(&1u16.to_be_bytes());
-        for s in ["axis", "x"] {
-            frame.extend_from_slice(&(s.len() as u16).to_be_bytes());
-            frame.extend_from_slice(s.as_bytes());
-        }
-        frame.extend_from_slice(&0u32.to_be_bytes());
-        let crc = crc32(&frame);
-        frame.extend_from_slice(&crc.to_be_bytes());
-        frame
-    }
-
-    #[test]
-    fn mrs1_payload_stores_registry_and_drains_forward_once() {
-        let mut session = session("mrs1");
-        assert!(session.mod_registry().is_none());
-        assert!(session.take_mod_registry_update().is_none());
-
-        let frame = mrs1_frame(26_684, 9_000, (26_684, "create:shaft"));
-        assert!(session.handle_megu_custom_payload(CHANNEL_MOD_REGISTRY_SYNC, &frame));
-        let registry = session.mod_registry().unwrap();
-        assert_eq!(registry.base_block_state_id, 26_684);
-        assert_eq!(registry.block_state_name(26_684), Some("create:shaft"));
-        assert_eq!(
-            registry
-                .block_state(26_684)
-                .and_then(|b| b.properties.get("axis"))
-                .map(String::as_str),
-            Some("x")
-        );
-
-        let forwarded = session.take_mod_registry_update().unwrap();
-        assert_eq!(forwarded.block_state_name(26_684), Some("create:shaft"));
-        assert!(session.take_mod_registry_update().is_none());
-
-        // Corrupt frames fail closed; the stored registry survives.
-        let mut bad = mrs1_frame(26_684, 9_000, (26_684, "create:cogwheel"));
-        let last = bad.len() - 1;
-        bad[last] ^= 0xFF;
-        assert!(!session.handle_megu_custom_payload(CHANNEL_MOD_REGISTRY_SYNC, &bad));
-        assert!(!session.handle_megu_custom_payload(CHANNEL_MOD_REGISTRY_SYNC, b"junk"));
-        assert_eq!(
-            session.mod_registry().unwrap().block_state_name(26_684),
-            Some("create:shaft")
-        );
-        assert!(session.take_mod_registry_update().is_none());
     }
 
     #[test]

@@ -18,7 +18,7 @@ use std::mem::MaybeUninit;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
-use std::sync::{Arc, Condvar, Mutex};
+use std::sync::{mpsc, Arc, Condvar, Mutex, RwLock};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
@@ -26,8 +26,8 @@ use crate::audio_qol::AudioLimiter;
 use crate::protocol::{WireSoundEvent, WireStopSound};
 use crate::session::{AudioStats, OpenAirWorld, PlaySoundEvent, SoundMixer};
 use crate::sound_assets::{
-    placeholder_pcm, sound_name_for_id, DecodedPcm, SoundEventRegistry, SoundLibrary,
-    MIX_SAMPLE_RATE,
+    normalize_sound_name, placeholder_pcm, sound_name_for_id, DecodedPcm, SoundEventRegistry,
+    SoundLibrary, SoundSourceData, MIX_SAMPLE_RATE,
 };
 use crate::spatial_audio::{
     ListenerPose, SharedListenerFdnBus, SoundSource, SpatialAudioEngine, SpatialAudioPreset,
@@ -1430,6 +1430,365 @@ pub fn session_audio_config() -> Option<AudioSessionConfig> {
 }
 
 // ---------------------------------------------------------------------------
+// Async OGG decode queue — ingest enqueues, a worker decodes off-thread
+// ---------------------------------------------------------------------------
+
+/// Decode jobs the worker may have queued — same bounded-queue style as
+/// `SOUND_QUEUE_CAP`/`MAX_PENDING_WIRE_EVENTS`: full ⇒ the oldest queued
+/// job *for the same source* is evicted to make room, else the new job is
+/// declined. Ingest never blocks on decode.
+const MAX_DECODE_QUEUE_JOBS: usize = 128;
+/// Estimated encoded-byte ceiling for queued decode jobs. Jobs carry a
+/// source reference, not the bytes, but the cap keeps a packet flood from
+/// queueing minutes of OGG work. A single job larger than the cap is
+/// accepted only when the queue is otherwise empty.
+const MAX_DECODE_QUEUE_BYTES: usize = 16 * 1024 * 1024;
+/// `stop_sound` records retained for in-flight decodes — only recorded
+/// while decodes are outstanding; the cap is a backstop for stop spam
+/// during a long decode backlog.
+const MAX_PENDING_DECODE_STOPS: usize = 256;
+
+/// One decode request: the resolved source plus everything needed to
+/// rebuild the `PlaySoundEvent` when PCM lands. Packet scalars are
+/// computed on the ingest thread so the result path is a pure submit.
+struct DecodeJob {
+    /// Ingest order shared with [`PendingDecodeStop`] — a stop recorded
+    /// after this job cancels it.
+    order: u64,
+    /// Source identity for same-source eviction (`ResolvedSound::path`).
+    source_key: PathBuf,
+    /// Estimated encoded size charged against the queue byte cap.
+    size_hint: usize,
+    /// Shared library — the worker locks it for the phased decode so the
+    /// LRU PCM cache keeps a single owner and ingest `resolve` stays
+    /// shared under the read lock.
+    library: Arc<RwLock<SoundLibrary>>,
+    /// Where to read the OGG bytes from.
+    source: SoundSourceData,
+    /// Event name — placeholder fallback on decode failure.
+    name: String,
+    /// `PlaySoundEvent::label`.
+    label: String,
+    category: i32,
+    position: Option<[f32; 3]>,
+    entity_id: Option<i32>,
+    /// Effective volume (packet × variant, finite-clamped).
+    volume: f32,
+    /// Clamped pitch multiplier.
+    pitch: f32,
+    seed: i64,
+    max_range_m: f32,
+}
+
+/// Worker result: channel-preserving PCM on success (mono downmix plus
+/// the optional stereo bypass pair), the decode error string on failure.
+enum DecodeOutcome {
+    /// Decoded clip in the mixer's `(mono, stereo)` payload shape.
+    Decoded {
+        /// Mono `f32` at [`MIX_SAMPLE_RATE`] — the 3D/spatial path input.
+        mono: Arc<Vec<f32>>,
+        /// Original stereo frames for 2D-bypassed voices, when present.
+        stereo: Option<Arc<Vec<[f32; 2]>>>,
+    },
+    /// Decode failed — the runtime falls back to the placeholder tone.
+    Failed(String),
+}
+
+/// `(job, outcome)` pairs the worker posts back in submission order.
+type DecodeResult = (DecodeJob, DecodeOutcome);
+
+/// A `stop_sound` retained while decodes are outstanding — cancels
+/// matching [`DecodeJob`]s whose ingest order precedes the stop's, the
+/// same category/name rule the mixer applies to already-queued events.
+struct PendingDecodeStop {
+    /// Shared ingest order — only jobs with a smaller `order` match.
+    order: u64,
+    category: Option<i32>,
+    name: Option<String>,
+}
+
+/// Bounded FIFO of [`DecodeJob`]s between ingest and the decode worker.
+/// `push` never blocks: when the job/job-byte caps would overflow, the
+/// oldest queued job *for the same source* is evicted to make room; when
+/// that cannot help the new job is declined. `close` discards the backlog
+/// so shutdown stays prompt — at most the in-flight decode is awaited.
+struct DecodeQueue {
+    inner: Mutex<DecodeQueueInner>,
+    not_empty: Condvar,
+}
+
+struct DecodeQueueInner {
+    jobs: VecDeque<DecodeJob>,
+    bytes: usize,
+    cap_jobs: usize,
+    cap_bytes: usize,
+    closed: bool,
+    dropped: u64,
+}
+
+/// What [`DecodeQueue::push`] did with a job.
+struct PushResult {
+    /// `true` when the job was queued for the worker.
+    accepted: bool,
+    /// Same-source jobs evicted to make room — each was counted
+    /// outstanding by the runtime and must be un-counted.
+    evicted: u64,
+}
+
+impl DecodeQueue {
+    fn new(cap_jobs: usize, cap_bytes: usize) -> Self {
+        Self {
+            inner: Mutex::new(DecodeQueueInner {
+                jobs: VecDeque::new(),
+                bytes: 0,
+                cap_jobs,
+                cap_bytes,
+                closed: false,
+                dropped: 0,
+            }),
+            not_empty: Condvar::new(),
+        }
+    }
+
+    /// Enqueue `job`, never blocking. Evicts oldest same-source jobs to
+    /// make room; declines (counted in [`Self::dropped`]) when even
+    /// evicting every queued job for this source cannot fit it. A job
+    /// larger than the whole byte cap is accepted only into an empty
+    /// queue — the cap bounds backlog, not a lone oversized source.
+    fn push(&self, job: DecodeJob) -> PushResult {
+        let mut g = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        if g.closed {
+            g.dropped += 1;
+            return PushResult {
+                accepted: false,
+                evicted: 0,
+            };
+        }
+        let oversized = job.size_hint > g.cap_bytes;
+        let mut evicted = 0u64;
+        if oversized {
+            // A lone oversized job is accepted only into an empty queue —
+            // the byte cap bounds backlog, not a single big source.
+            if !g.jobs.is_empty() {
+                g.dropped += 1;
+                return PushResult {
+                    accepted: false,
+                    evicted: 0,
+                };
+            }
+        } else {
+            // Best case: evicting every queued job for this source — if
+            // that still does not fit, decline without touching the
+            // backlog (evicting other sources' jobs is not allowed).
+            let mut bytes_if_cleared = g.bytes;
+            let mut len_if_cleared = g.jobs.len();
+            for j in &g.jobs {
+                if j.source_key == job.source_key {
+                    bytes_if_cleared = bytes_if_cleared.saturating_sub(j.size_hint);
+                    len_if_cleared -= 1;
+                }
+            }
+            if bytes_if_cleared + job.size_hint > g.cap_bytes
+                || len_if_cleared + 1 > g.cap_jobs
+            {
+                g.dropped += 1;
+                return PushResult {
+                    accepted: false,
+                    evicted: 0,
+                };
+            }
+            // Evict oldest same-source jobs until the new one fits —
+            // guaranteed to succeed by the pre-check above.
+            while g.bytes + job.size_hint > g.cap_bytes || g.jobs.len() + 1 > g.cap_jobs {
+                let Some(pos) = g
+                    .jobs
+                    .iter()
+                    .position(|j| j.source_key == job.source_key)
+                else {
+                    break;
+                };
+                if let Some(old) = g.jobs.remove(pos) {
+                    g.bytes = g.bytes.saturating_sub(old.size_hint);
+                    evicted += 1;
+                }
+            }
+            g.dropped += evicted;
+        }
+        g.bytes += job.size_hint;
+        g.jobs.push_back(job);
+        drop(g);
+        self.not_empty.notify_one();
+        PushResult {
+            accepted: true,
+            evicted,
+        }
+    }
+
+    /// Oldest job, or `None` once closed. Waits on the condvar — the
+    /// worker is never polled. `close` discards the backlog so shutdown
+    /// does not decode sounds nobody will hear.
+    fn pop_blocking(&self) -> Option<DecodeJob> {
+        let mut g = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        loop {
+            if let Some(job) = g.jobs.pop_front() {
+                g.bytes = g.bytes.saturating_sub(job.size_hint);
+                return Some(job);
+            }
+            if g.closed {
+                return None;
+            }
+            g = self
+                .not_empty
+                .wait(g)
+                .unwrap_or_else(|e| e.into_inner());
+        }
+    }
+
+    /// Stop accepting and discard the backlog; the worker exits after its
+    /// in-flight decode.
+    fn close(&self) {
+        let mut g = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        g.closed = true;
+        g.jobs.clear();
+        g.bytes = 0;
+        drop(g);
+        self.not_empty.notify_all();
+    }
+}
+
+/// Decode worker + result channel. Spawned lazily on the first resolved
+/// sound; [`Self::shutdown`] closes the queue (discarding the backlog)
+/// and joins — at most one in-flight decode is awaited.
+struct DecodePipeline {
+    queue: Arc<DecodeQueue>,
+    results: mpsc::Receiver<DecodeResult>,
+    worker: Option<JoinHandle<()>>,
+}
+
+impl DecodePipeline {
+    /// Spawn the production pipeline (`decode_one` on a named thread).
+    fn spawn() -> Result<Self, String> {
+        Self::spawn_with(decode_one)
+    }
+
+    /// `spawn` with an injected decoder — tests substitute a blocking or
+    /// recording decode to prove ingest never waits on it.
+    fn spawn_with(
+        decode: impl Fn(&DecodeJob) -> DecodeOutcome + Send + 'static,
+    ) -> Result<Self, String> {
+        let queue = Arc::new(DecodeQueue::new(
+            MAX_DECODE_QUEUE_JOBS,
+            MAX_DECODE_QUEUE_BYTES,
+        ));
+        let (tx, rx) = mpsc::channel::<DecodeResult>();
+        let q = queue.clone();
+        let worker = std::thread::Builder::new()
+            .name("megu-audio-decode".to_string())
+            .spawn(move || {
+                while let Some(job) = q.pop_blocking() {
+                    let outcome = decode(&job);
+                    // A gone receiver means the runtime is finished —
+                    // exit instead of decoding a dead pipeline's backlog.
+                    if tx.send((job, outcome)).is_err() {
+                        return;
+                    }
+                }
+            })
+            .map_err(|e| format!("cannot spawn audio decode thread: {e}"))?;
+        Ok(Self {
+            queue,
+            results: rx,
+            worker: Some(worker),
+        })
+    }
+
+    /// Close the queue and join the worker. Idempotent; also runs in
+    /// `Drop`.
+    fn shutdown(&mut self) {
+        self.queue.close();
+        if let Some(worker) = self.worker.take() {
+            let _ = worker.join();
+        }
+    }
+}
+
+impl Drop for DecodePipeline {
+    fn drop(&mut self) {
+        self.shutdown();
+    }
+}
+
+/// Repack a decoded clip into the mixer's `(mono, optional stereo)`
+/// payload — stereo assets keep L/R for the 2D bypass, everything else
+/// consumes the mono downmix.
+fn pcm_payload(pcm: &DecodedPcm) -> (Arc<Vec<f32>>, Option<Arc<Vec<[f32; 2]>>>) {
+    let stereo = match pcm {
+        DecodedPcm::Stereo(v) => Some(Arc::new(v.clone())),
+        DecodedPcm::Mono(_) => None,
+    };
+    (Arc::new(pcm.to_mono()), stereo)
+}
+
+/// The production decode step. Cache probe and insert take brief write
+/// locks; the expensive OGG decode runs under a *read* lock shared with
+/// ingest's `resolve`, so a large decode never stalls the packet path.
+fn decode_one(job: &DecodeJob) -> DecodeOutcome {
+    if let Some(pcm) = job
+        .library
+        .write()
+        .unwrap_or_else(|e| e.into_inner())
+        .cached_pcm(&job.source)
+    {
+        let (mono, stereo) = pcm_payload(&pcm);
+        return DecodeOutcome::Decoded { mono, stereo };
+    }
+    let decoded = job
+        .library
+        .read()
+        .unwrap_or_else(|e| e.into_inner())
+        .decode_uncached(&job.source);
+    match decoded {
+        Ok(dpcm) => {
+            let (mono, stereo) = pcm_payload(&dpcm);
+            job.library
+                .write()
+                .unwrap_or_else(|e| e.into_inner())
+                .cache_pcm(&job.source, Arc::new(dpcm));
+            DecodeOutcome::Decoded { mono, stereo }
+        }
+        Err(e) => DecodeOutcome::Failed(e),
+    }
+}
+
+/// Vanilla mixing scalars shared by the synchronous placeholder path and
+/// the async decode job: the packet volume widens the audible range
+/// (`attenuation_distance * max(volume, 1.0)`) while output gain still
+/// saturates at `min(volume, 1.0)` inside the mixer — so a `volume=4.0`
+/// explosion carries 64 m, not 16. An inline `fixed_range` overrides
+/// everything, exactly like the wire semantics. Returns
+/// `(effective_volume, pitch, max_range_m)`.
+fn sound_scalars(
+    ev: &WireSoundEvent,
+    variant_volume: f32,
+    variant_pitch: f32,
+    attenuation_distance: Option<f32>,
+) -> (f32, f32, f32) {
+    let effective_volume = if (ev.volume * variant_volume).is_finite() {
+        (ev.volume * variant_volume).max(0.0)
+    } else {
+        0.0
+    };
+    let max_range_m = ev.fixed_range.unwrap_or_else(|| {
+        attenuation_distance.unwrap_or(16.0) * effective_volume.max(1.0)
+    });
+    (
+        effective_volume,
+        (ev.pitch * variant_pitch).clamp(0.5, 2.0),
+        max_range_m,
+    )
+}
+
+// ---------------------------------------------------------------------------
 // AudioRuntime — the live pipeline inside ProtocolClient
 // ---------------------------------------------------------------------------
 
@@ -1440,7 +1799,11 @@ pub struct AudioRuntime {
     pub mixer: SoundMixer,
     sink: Box<dyn AudioSink>,
     sink_kind: AudioSinkKind,
-    library: Option<SoundLibrary>,
+    /// Shared with the decode worker — `resolve`/size hints take the read
+    /// lock, `decode_source`'s cache phases take brief write locks, and
+    /// the expensive OGG decode itself runs under the read lock so it
+    /// never stalls ingest.
+    library: Option<Arc<RwLock<SoundLibrary>>>,
     library_tried: bool,
     assets_dir: Option<PathBuf>,
     asset_index: Option<String>,
@@ -1465,6 +1828,21 @@ pub struct AudioRuntime {
     scratch_i16: Vec<i16>,
     warned_null: bool,
     finished: bool,
+    /// Async OGG decode pipeline — `ingest` enqueues and returns; the
+    /// worker decodes off-thread and [`Self::drain_decode_results`]
+    /// submits results to the mixer in submission order.
+    decode: Option<DecodePipeline>,
+    /// `true` when the decode thread failed to spawn — ingest falls back
+    /// to decoding inline (the pre-queue behavior) rather than dropping
+    /// real sounds on the floor.
+    decode_spawn_failed: bool,
+    /// Decode jobs accepted but not yet drained — backs stop-sound
+    /// matching for in-flight decodes.
+    decode_outstanding: u64,
+    /// Next order shared by decode jobs and retained stop records.
+    next_ingest_order: u64,
+    /// `stop_sound` records that may still cancel in-flight decodes.
+    pending_decode_stops: VecDeque<PendingDecodeStop>,
     /// Dedicated real-time mix thread once
     /// [`AudioRuntime::enable_dedicated_mix_thread`] hands it the sink —
     /// the Render Thread then drives audio purely through the lock-free
@@ -1535,6 +1913,11 @@ impl AudioRuntime {
             scratch_i16: Vec::new(),
             warned_null: false,
             finished: false,
+            decode: None,
+            decode_spawn_failed: false,
+            decode_outstanding: 0,
+            next_ingest_order: 0,
+            pending_decode_stops: VecDeque::new(),
             mix_thread: None,
         }
     }
@@ -1547,8 +1930,9 @@ impl AudioRuntime {
     /// Lazily load the sound library on first use so a session that never
     /// hears a sound never pays the index parse. When `--gameDir` is set,
     /// `mods/*.jar` then `resourcepacks/*` merge on top of the vanilla
-    /// index (lowest→highest priority, matching vanilla layer order).
-    fn library(&mut self) -> Option<&mut SoundLibrary> {
+    /// index (lowest→highest priority, matching vanilla layer order). The
+    /// loaded library is shared with the decode worker over an `RwLock`.
+    fn library(&mut self) -> Option<Arc<RwLock<SoundLibrary>>> {
         if self.library.is_none() && !self.library_tried {
             self.library_tried = true;
             let mut lib = match (&self.assets_dir, &self.asset_index) {
@@ -1600,9 +1984,9 @@ impl AudioRuntime {
                     }
                 }
             }
-            self.library = lib;
+            self.library = lib.map(|l| Arc::new(RwLock::new(l)));
         }
-        self.library.as_mut()
+        self.library.clone()
     }
 
     /// Install the `minecraft:sound_event` registry table captured from
@@ -1623,8 +2007,13 @@ impl AudioRuntime {
         self.mixer.remove_entity_position(entity_id);
     }
 
-    /// Ingest one decoded `sound_effect`/`sound_entity` packet.
+    /// Ingest one decoded `sound_effect`/`sound_entity` packet. Resolution
+    /// and scalar math stay on this thread; the OGG decode itself is
+    /// handed to the bounded decode worker so a large decode cannot stall
+    /// protocol handling — results reach the mixer in submission order
+    /// via [`Self::drain_decode_results`].
     pub fn ingest(&mut self, ev: &WireSoundEvent) {
+        self.drain_decode_results();
         let (name, label) = match (&ev.name, ev.registry_id) {
             (Some(n), _) => (n.clone(), n.clone()),
             (None, Some(id)) => {
@@ -1645,92 +2034,231 @@ impl AudioRuntime {
 
         // Asset resolution: real OGG when the layered sound library maps
         // this event, else a deterministic placeholder tone counted as
-        // such. Stereo assets keep their L/R for the 2D-bypass path; the
-        // spatializer always consumes the mono downmix.
-        let mut pcm = None;
-        let mut is_placeholder = false;
-        let mut variant_volume = 1.0f32;
-        let mut variant_pitch = 1.0f32;
-        let mut attenuation_distance = None;
-        if let Some(lib) = self.library() {
-            match lib.resolve(&name, ev.seed) {
-                Some(resolved) => {
-                    variant_volume = resolved.volume;
-                    variant_pitch = resolved.pitch;
-                    attenuation_distance = resolved.attenuation_distance;
-                    match lib.decode_source(&resolved.source) {
-                        Ok(dpcm) => {
-                            let stereo = match &*dpcm {
-                                DecodedPcm::Stereo(v) => Some(Arc::new(v.clone())),
-                                DecodedPcm::Mono(_) => None,
-                            };
-                            pcm = Some((Arc::new(dpcm.to_mono()), stereo));
-                        }
-                        Err(e) => {
-                            self.mixer.stats.decode_errors += 1;
-                            if self.mixer.stats.decode_errors <= 3 {
-                                eprintln!("megu-client audio: {e}");
-                            }
-                        }
-                    }
+        // such. The read lock is shared with the decode worker's
+        // long-running decode, so resolve never waits on it.
+        let lib = self.library();
+        let (resolved, size_hint) = match &lib {
+            Some(l) => {
+                let g = l.read().unwrap_or_else(|e| e.into_inner());
+                let r = g.resolve(&name, ev.seed);
+                let hint = r
+                    .as_ref()
+                    .map_or(0, |res| g.source_size_hint(&res.source));
+                if r.is_none() {
+                    self.mixer.stats.missing_event_def += 1;
                 }
-                None => self.mixer.stats.missing_event_def += 1,
+                (r, hint)
             }
-        } else {
-            self.mixer.stats.missing_assets += 1;
-        }
-        let (pcm, stereo_pcm) = match pcm {
-            Some((m, s)) => (m, s),
             None => {
-                is_placeholder = true;
-                self.mixer.stats.placeholder_voices += 1;
-                (
-                    Arc::new(placeholder_pcm(
-                        &name,
-                        ev.category,
-                        self.mixer.sample_rate(),
-                    )),
-                    None,
-                )
+                self.mixer.stats.missing_assets += 1;
+                (None, 0)
             }
         };
-        // Vanilla distance law: the packet volume widens the audible range
-        // (`attenuation_distance * max(volume, 1.0)`) while output gain
-        // still saturates at `min(volume, 1.0)` inside the mixer — so a
-        // `volume=4.0` explosion carries 64 m, not 16. An inline
-        // `fixed_range` overrides everything, exactly like the wire
-        // semantics.
-        let effective_volume = if (ev.volume * variant_volume).is_finite() {
-            (ev.volume * variant_volume).max(0.0)
-        } else {
-            0.0
+        let Some(resolved) = resolved else {
+            self.submit_placeholder_sound(&name, &label, ev, 1.0, 1.0, None);
+            return;
         };
-        let max_range_m = ev.fixed_range.unwrap_or_else(|| {
-            attenuation_distance.unwrap_or(16.0) * effective_volume.max(1.0)
-        });
-        if let Some(eid) = ev.entity_id {
-            if self.mixer.entity_position(eid).is_none() {
-                self.mixer.stats.entity_pos_unresolved += 1;
-            }
-        }
-        self.mixer.submit(PlaySoundEvent {
+        let (volume, pitch, max_range_m) = sound_scalars(
+            ev,
+            resolved.volume,
+            resolved.pitch,
+            resolved.attenuation_distance,
+        );
+        let job = DecodeJob {
+            // Assigned in `enqueue_decode` from the shared ingest order.
+            order: 0,
+            source_key: resolved.path.clone(),
+            size_hint,
+            // `resolved.is_some()` implies the library resolved — it can
+            // only come from the `Some` arm above.
+            library: lib.expect("resolved sound implies a library"),
+            source: resolved.source,
+            name,
             label,
-            pcm,
-            stereo_pcm,
-            is_placeholder,
             category: ev.category,
             position: ev.position,
             entity_id: ev.entity_id,
-            volume: effective_volume,
-            pitch: (ev.pitch * variant_pitch).clamp(0.5, 2.0),
+            volume,
+            pitch,
+            seed: ev.seed,
+            max_range_m,
+        };
+        self.enqueue_decode(job);
+    }
+
+    /// Ingest one decoded `stop_sound` packet.
+    pub fn ingest_stop(&mut self, s: &WireStopSound) {
+        self.drain_decode_results();
+        self.mixer.submit_stop(s.category, s.name.as_deref());
+        // Retain the stop while decodes are outstanding: a matching job
+        // still in flight must not start sounding after this stop —
+        // the same category/name rule the mixer applies to queued events.
+        if self.decode_outstanding > 0 {
+            self.next_ingest_order += 1;
+            if self.pending_decode_stops.len() >= MAX_PENDING_DECODE_STOPS {
+                self.pending_decode_stops.pop_front();
+            }
+            self.pending_decode_stops.push_back(PendingDecodeStop {
+                order: self.next_ingest_order,
+                category: s.category,
+                name: s.name.clone(),
+            });
+        }
+    }
+
+    /// Queue `job` for the decode worker — never blocks. When the worker
+    /// failed to spawn, decode inline instead (the pre-queue behavior) so
+    /// a thread-exhausted session still plays real sounds.
+    fn enqueue_decode(&mut self, job: DecodeJob) {
+        if self.decode.is_none() && !self.decode_spawn_failed {
+            match DecodePipeline::spawn() {
+                Ok(p) => self.decode = Some(p),
+                Err(e) => {
+                    self.decode_spawn_failed = true;
+                    eprintln!("megu-client audio: {e}; decoding sounds inline");
+                }
+            }
+        }
+        let mut job = job;
+        self.next_ingest_order += 1;
+        job.order = self.next_ingest_order;
+        let Some(pipe) = &self.decode else {
+            let outcome = decode_one(&job);
+            self.finish_decode(job, outcome);
+            return;
+        };
+        let res = pipe.queue.push(job);
+        self.decode_outstanding = self
+            .decode_outstanding
+            .saturating_add(u64::from(res.accepted))
+            .saturating_sub(res.evicted);
+        if !res.accepted {
+            self.mixer.stats.decode_dropped += 1;
+        }
+        self.mixer.stats.decode_dropped += res.evicted;
+    }
+
+    /// Submit every decode result the worker has finished, in submission
+    /// order — called from `ingest`, `ingest_stop` and `pump_frames` so
+    /// completed sounds reach the mixer without waiting for the next
+    /// packet.
+    fn drain_decode_results(&mut self) {
+        let mut done = Vec::new();
+        if let Some(pipe) = &self.decode {
+            while let Ok(result) = pipe.results.try_recv() {
+                done.push(result);
+            }
+        }
+        for (job, outcome) in done {
+            self.decode_outstanding = self.decode_outstanding.saturating_sub(1);
+            self.finish_decode(job, outcome);
+        }
+        if self.decode_outstanding == 0 {
+            // No decode can still be cancelled — every future job
+            // postdates all recorded stops.
+            self.pending_decode_stops.clear();
+        }
+    }
+
+    /// Complete one decode job: a `stop_sound` recorded after its ingest
+    /// cancels it; otherwise submit the decoded PCM, or the placeholder
+    /// fallback on failure.
+    fn finish_decode(&mut self, job: DecodeJob, outcome: DecodeOutcome) {
+        let stopped = self.pending_decode_stops.iter().any(|s| {
+            s.order > job.order
+                && s.category.is_none_or(|c| c == job.category)
+                && s.name
+                    .as_deref()
+                    .map(normalize_sound_name)
+                    .is_none_or(|n| n == normalize_sound_name(&job.label))
+        });
+        if stopped {
+            return;
+        }
+        match outcome {
+            DecodeOutcome::Decoded { mono, stereo } => self.submit_play(PlaySoundEvent {
+                label: job.label,
+                pcm: mono,
+                stereo_pcm: stereo,
+                is_placeholder: false,
+                category: job.category,
+                position: job.position,
+                entity_id: job.entity_id,
+                volume: job.volume,
+                pitch: job.pitch,
+                seed: job.seed,
+                max_range_m: job.max_range_m,
+            }),
+            DecodeOutcome::Failed(e) => {
+                self.mixer.stats.decode_errors += 1;
+                if self.mixer.stats.decode_errors <= 3 {
+                    eprintln!("megu-client audio: {e}");
+                }
+                self.mixer.stats.placeholder_voices += 1;
+                self.submit_play(PlaySoundEvent {
+                    label: job.label,
+                    pcm: Arc::new(placeholder_pcm(
+                        &job.name,
+                        job.category,
+                        self.mixer.sample_rate(),
+                    )),
+                    stereo_pcm: None,
+                    is_placeholder: true,
+                    category: job.category,
+                    position: job.position,
+                    entity_id: job.entity_id,
+                    volume: job.volume,
+                    pitch: job.pitch,
+                    seed: job.seed,
+                    max_range_m: job.max_range_m,
+                });
+            }
+        }
+    }
+
+    /// Immediate `PlaySoundEvent` for events with no decodable asset —
+    /// the deterministic placeholder tone, counted as such.
+    fn submit_placeholder_sound(
+        &mut self,
+        name: &str,
+        label: &str,
+        ev: &WireSoundEvent,
+        variant_volume: f32,
+        variant_pitch: f32,
+        attenuation_distance: Option<f32>,
+    ) {
+        let (volume, pitch, max_range_m) =
+            sound_scalars(ev, variant_volume, variant_pitch, attenuation_distance);
+        self.mixer.stats.placeholder_voices += 1;
+        self.submit_play(PlaySoundEvent {
+            label: label.to_string(),
+            pcm: Arc::new(placeholder_pcm(
+                name,
+                ev.category,
+                self.mixer.sample_rate(),
+            )),
+            stereo_pcm: None,
+            is_placeholder: true,
+            category: ev.category,
+            position: ev.position,
+            entity_id: ev.entity_id,
+            volume,
+            pitch,
             seed: ev.seed,
             max_range_m,
         });
     }
 
-    /// Ingest one decoded `stop_sound` packet.
-    pub fn ingest_stop(&mut self, s: &WireStopSound) {
-        self.mixer.submit_stop(s.category, s.name.as_deref());
+    /// Hand one finished `PlaySoundEvent` to the mixer — the single place
+    /// entity-position accounting and queue submission happen for both
+    /// the synchronous placeholder path and async decode results.
+    fn submit_play(&mut self, ev: PlaySoundEvent) {
+        if let Some(eid) = ev.entity_id {
+            if self.mixer.entity_position(eid).is_none() {
+                self.mixer.stats.entity_pos_unresolved += 1;
+            }
+        }
+        self.mixer.submit(ev);
     }
 
     /// Listener pose update (feet position + optional look angles — `None`
@@ -1794,6 +2322,9 @@ impl AudioRuntime {
 
     /// Render exactly `frames` stereo frames and push them to the sink.
     pub fn pump_frames(&mut self, frames: usize) {
+        // Completed decodes submit here too — a sound must not wait for
+        // the next packet to start.
+        self.drain_decode_results();
         if frames == 0 {
             self.drain_subtitles();
             return;
@@ -1938,7 +2469,7 @@ impl AudioRuntime {
         let s = self.stats();
         format!(
             "sink={} events={} voices={} stolen={} suppressed={} placeholder={} \
-             unknown_id={} missing_event={} decode_err={} subtitles={}",
+             unknown_id={} missing_event={} decode_err={} decode_drop={} subtitles={}",
             self.sink_label(),
             s.events_submitted,
             s.voices_started,
@@ -1948,6 +2479,7 @@ impl AudioRuntime {
             s.unknown_sound_id,
             s.missing_event_def,
             s.decode_errors,
+            s.decode_dropped,
             s.subtitle_cues,
         )
     }
@@ -1961,6 +2493,12 @@ impl AudioRuntime {
         // Stop and join the dedicated mix thread first — it owns the real
         // sink once enabled (`self.sink` is a null stand-in by then).
         self.mix_thread = None;
+        // Then the decode worker: the queue is closed (backlog
+        // discarded), the in-flight decode finishes, and its result is
+        // dropped with the channel — at most one decode is awaited.
+        if let Some(mut pipe) = self.decode.take() {
+            pipe.shutdown();
+        }
         self.sink.finish();
         eprintln!("megu-client audio done: {}", self.report_line());
     }
@@ -2943,5 +3481,325 @@ mod tests {
         let (sink, warn) = open_sink(&AudioSinkKind::Null);
         assert!(warn.is_none());
         assert_eq!(sink.label(), "null");
+    }
+
+    // ------------------------------------------------------------------
+    // Async decode queue (ledger L26)
+    // ------------------------------------------------------------------
+
+    /// Minimal [`DecodeJob`] for queue/pipeline tests — the library is an
+    /// empty `SoundLibrary` since injected decoders never touch it.
+    fn test_decode_job(order: u64, key: &str, size_hint: usize) -> DecodeJob {
+        DecodeJob {
+            order,
+            source_key: PathBuf::from(key),
+            size_hint,
+            library: Arc::new(RwLock::new(SoundLibrary::empty())),
+            source: SoundSourceData::File(PathBuf::from(format!("/{key}.ogg"))),
+            name: key.to_string(),
+            label: key.to_string(),
+            category: 0,
+            position: None,
+            entity_id: None,
+            volume: 1.0,
+            pitch: 1.0,
+            seed: 0,
+            max_range_m: f32::INFINITY,
+        }
+    }
+
+    fn decoded_outcome() -> DecodeOutcome {
+        DecodeOutcome::Decoded {
+            mono: Arc::new(vec![0.0; 8]),
+            stereo: None,
+        }
+    }
+
+    #[test]
+    fn decode_queue_is_fifo_and_close_discards_backlog() {
+        let q = DecodeQueue::new(8, 1 << 20);
+        for i in 0..3 {
+            let r = q.push(test_decode_job(i, &format!("s{i}"), 10));
+            assert!(r.accepted);
+        }
+        assert_eq!(q.pop_blocking().unwrap().order, 0);
+        q.close();
+        // The remaining backlog is discarded, not drained.
+        assert!(q.pop_blocking().is_none());
+        assert!(!q.push(test_decode_job(9, "late", 10)).accepted);
+        let g = q.inner.lock().unwrap_or_else(|e| e.into_inner());
+        assert_eq!(g.dropped, 1, "only the post-close push counts as dropped");
+    }
+
+    #[test]
+    fn decode_queue_cap_evicts_same_source_then_declines() {
+        // Byte cap 100: a(30)+b(30)+a(30)+b(30) = 120 overflows, so the
+        // fourth push evicts the oldest same-source job ("b" order 2).
+        let q = DecodeQueue::new(8, 100);
+        for (order, key) in [(1, "a"), (2, "b"), (3, "a"), (4, "b")] {
+            assert!(q.push(test_decode_job(order, key, 30)).accepted);
+        }
+        let mut orders = Vec::new();
+        for _ in 0..3 {
+            orders.push(q.pop_blocking().unwrap().order);
+        }
+        assert_eq!(orders, vec![1, 3, 4], "oldest same-source job evicted");
+        q.close();
+
+        // Refill to 90/100 bytes across three sources, then a fourth
+        // unrelated source cannot fit — decline without evicting.
+        let q = DecodeQueue::new(8, 100);
+        for (order, key) in [(10, "a"), (11, "b"), (12, "c")] {
+            assert!(q.push(test_decode_job(order, key, 30)).accepted);
+        }
+        let r = q.push(test_decode_job(13, "d", 30));
+        assert!(!r.accepted, "unrelated-source job must be declined");
+        assert_eq!(r.evicted, 0, "decline must not evict other sources");
+        let g = q.inner.lock().unwrap_or_else(|e| e.into_inner());
+        assert_eq!(g.jobs.len(), 3);
+        drop(g);
+        q.close();
+    }
+
+    #[test]
+    fn decode_queue_job_cap_evicts_only_same_source() {
+        let q = DecodeQueue::new(2, 1 << 20);
+        assert!(q.push(test_decode_job(1, "a", 1)).accepted);
+        assert!(q.push(test_decode_job(2, "b", 1)).accepted);
+        // "c" fits nowhere: evicting same-source (none) can't help.
+        assert!(!q.push(test_decode_job(3, "c", 1)).accepted);
+        // "a" again: evicts oldest "a" (order 1), keeps "b".
+        let r = q.push(test_decode_job(4, "a", 1));
+        assert!(r.accepted);
+        assert_eq!(r.evicted, 1);
+        assert_eq!(q.pop_blocking().unwrap().order, 2);
+        assert_eq!(q.pop_blocking().unwrap().order, 4);
+        q.close();
+    }
+
+    #[test]
+    fn decode_pipeline_returns_results_in_submission_order() {
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let seen_rx = seen.clone();
+        let mut pipe = DecodePipeline::spawn_with(move |job| {
+            seen_rx.lock().unwrap().push(job.order);
+            decoded_outcome()
+        })
+        .unwrap();
+        for i in 0..5u64 {
+            assert!(pipe.queue.push(test_decode_job(i, &format!("s{i}"), 1)).accepted);
+        }
+        let mut got = Vec::new();
+        for _ in 0..5 {
+            let (job, _outcome) = pipe
+                .results
+                .recv_timeout(Duration::from_secs(5))
+                .expect("worker must answer every job");
+            got.push(job.order);
+        }
+        pipe.shutdown();
+        assert_eq!(got, vec![0, 1, 2, 3, 4], "results must stay in order");
+        assert_eq!(*seen.lock().unwrap(), vec![0, 1, 2, 3, 4]);
+    }
+
+    #[test]
+    fn decode_pipeline_shutdown_discards_backlog_promptly() {
+        let decodes = Arc::new(AtomicUsize::new(0));
+        let d = decodes.clone();
+        let mut pipe = DecodePipeline::spawn_with(move |_job| {
+            d.fetch_add(1, Ordering::Relaxed);
+            std::thread::sleep(Duration::from_millis(150));
+            decoded_outcome()
+        })
+        .unwrap();
+        for i in 0..8u64 {
+            assert!(pipe.queue.push(test_decode_job(i, &format!("s{i}"), 1)).accepted);
+        }
+        // Let the worker pick up the first job, then close: the backlog
+        // must be discarded — shutdown waits on at most the in-flight
+        // decode, never the whole queue.
+        std::thread::sleep(Duration::from_millis(50));
+        let t = Instant::now();
+        pipe.shutdown();
+        assert!(
+            t.elapsed() < Duration::from_secs(2),
+            "shutdown blocked on backlog: {:?}",
+            t.elapsed()
+        );
+        assert!(
+            decodes.load(Ordering::Relaxed) <= 2,
+            "backlog decoded anyway: {}",
+            decodes.load(Ordering::Relaxed)
+        );
+    }
+
+    /// Minimal asset fixture: one `test.ping` event resolving to a plain
+    /// file source (contents are never decoded — tests inject the
+    /// decoder).
+    fn decode_test_assets() -> PathBuf {
+        // Parallel tests share the process — the fixture dir must be
+        // unique per call or one test's `remove_dir_all` races another's
+        // library load.
+        static FIXTURE_SEQ: AtomicUsize = AtomicUsize::new(0);
+        let dir = std::env::temp_dir().join(format!(
+            "mc-decode-fix-{}-{}",
+            std::process::id(),
+            FIXTURE_SEQ.fetch_add(1, Ordering::Relaxed)
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("indexes")).unwrap();
+        let h1 = "aa".repeat(20);
+        let h3 = "cc".repeat(20);
+        for h in [&h1, &h3] {
+            std::fs::create_dir_all(dir.join(format!("objects/{}", &h[..2]))).unwrap();
+        }
+        std::fs::write(dir.join(format!("objects/{}/{}", &h1[..2], h1)), b"ogg-bytes").unwrap();
+        std::fs::write(
+            dir.join(format!("objects/{}/{}", &h3[..2], h3)),
+            br#"{"test.ping": {"sounds": [{"name": "test/ping1"}]}}"#,
+        )
+        .unwrap();
+        std::fs::write(
+            dir.join("indexes/fix.json"),
+            format!(
+                r#"{{"objects": {{
+                    "minecraft/sounds/test/ping1.ogg": {{"hash": "{h1}", "size": 9}},
+                    "minecraft/sounds.json": {{"hash": "{h3}", "size": 300}}
+                }}}}"#
+            ),
+        )
+        .unwrap();
+        dir
+    }
+
+    fn decode_test_runtime() -> AudioRuntime {
+        let dir = decode_test_assets();
+        let cfg = AudioSessionConfig {
+            sink: AudioSinkKind::Null,
+            assets_dir: Some(dir),
+            asset_index: Some("fix".to_string()),
+            game_dir: None,
+            max_volume_cap: 1.0,
+            max_concurrent_same_sound: 4,
+            subtitle_path: None,
+            subtitles_to_stderr: false,
+        };
+        AudioRuntime::new(&cfg)
+    }
+
+    fn ping_event() -> WireSoundEvent {
+        WireSoundEvent {
+            name: Some("test.ping".to_string()),
+            registry_id: None,
+            category: 0,
+            position: Some([1.0, 64.0, 1.0]),
+            entity_id: None,
+            volume: 1.0,
+            pitch: 1.0,
+            seed: 0,
+            fixed_range: None,
+        }
+    }
+
+    /// A decoder parked on a channel gate: each call waits for one token,
+    /// so a test controls exactly when each decode finishes.
+    fn gated_pipeline() -> (DecodePipeline, mpsc::Sender<()>, Arc<AtomicUsize>) {
+        let (tx, rx) = mpsc::channel::<()>();
+        let calls = Arc::new(AtomicUsize::new(0));
+        let c = calls.clone();
+        let pipe = DecodePipeline::spawn_with(move |_job| {
+            c.fetch_add(1, Ordering::Relaxed);
+            let _ = rx.recv();
+            decoded_outcome()
+        })
+        .unwrap();
+        (pipe, tx, calls)
+    }
+
+    #[test]
+    fn ingest_returns_before_decode_finishes_then_submits_in_order() {
+        let mut rt = decode_test_runtime();
+        let (pipe, gate, calls) = gated_pipeline();
+        rt.decode = Some(pipe);
+
+        let t = Instant::now();
+        rt.ingest(&ping_event());
+        rt.ingest(&ping_event());
+        let elapsed = t.elapsed();
+        assert!(
+            elapsed < Duration::from_millis(500),
+            "ingest blocked on decode: {elapsed:?}"
+        );
+        assert_eq!(rt.decode_outstanding, 2, "both jobs queued, none drained");
+        assert_eq!(rt.mixer.voice_count(), 0, "nothing may submit early");
+
+        // Release the first decode only: its result must reach the mixer
+        // while the second job is still parked.
+        gate.send(()).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            rt.pump_frames(64);
+            if rt.stats().events_submitted >= 1 {
+                break;
+            }
+            assert!(Instant::now() < deadline, "first decode never landed");
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert_eq!(rt.stats().events_submitted, 1);
+        assert_eq!(rt.decode_outstanding, 1);
+
+        gate.send(()).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            rt.pump_frames(64);
+            if rt.stats().events_submitted >= 2 {
+                break;
+            }
+            assert!(Instant::now() < deadline, "second decode never landed");
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert_eq!(calls.load(Ordering::Relaxed), 2);
+        rt.finish();
+    }
+
+    #[test]
+    fn stop_sound_cancels_in_flight_decode_but_not_later_ones() {
+        let mut rt = decode_test_runtime();
+        let (pipe, gate, _calls) = gated_pipeline();
+        rt.decode = Some(pipe);
+
+        rt.ingest(&ping_event());
+        // Stop arrives while the decode is parked: it must cancel the
+        // in-flight job exactly like a queued mixer event.
+        rt.ingest_stop(&WireStopSound {
+            category: None,
+            name: Some("test.ping".to_string()),
+        });
+        gate.send(()).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while rt.decode_outstanding > 0 {
+            rt.pump_frames(64);
+            assert!(Instant::now() < deadline, "decode never drained");
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert_eq!(
+            rt.stats().events_submitted, 0,
+            "stopped decode must never reach the mixer"
+        );
+        assert_eq!(rt.mixer.voice_count(), 0);
+
+        // A sound ingested *after* the stop is unaffected.
+        rt.ingest(&ping_event());
+        gate.send(()).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            rt.pump_frames(64);
+            if rt.stats().events_submitted >= 1 {
+                break;
+            }
+            assert!(Instant::now() < deadline, "post-stop decode never landed");
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        rt.finish();
     }
 }
