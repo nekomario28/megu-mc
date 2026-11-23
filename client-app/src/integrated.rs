@@ -104,6 +104,10 @@ fn is_executable_file(path: &Path) -> bool {
     path.is_file()
 }
 
+fn canonicalize_best_effort(path: PathBuf) -> PathBuf {
+    fs::canonicalize(&path).unwrap_or(path)
+}
+
 /// Resolve the `megu` server binary (`megu.exe` on Windows).
 /// Order: `--server-bin`, `MEGU_SERVER_BIN`, a `megu` sibling of
 /// this executable, then `target/{debug,release}/megu` relative to
@@ -113,7 +117,7 @@ pub fn resolve_server_bin(explicit: Option<&Path>) -> Result<PathBuf, String> {
     if let Some(path) = explicit {
         let path = path.to_path_buf();
         if is_executable_file(&path) {
-            return Ok(path);
+            return Ok(canonicalize_best_effort(path));
         }
         return Err(format!(
             "--server-bin '{}' does not exist or is not a file",
@@ -124,7 +128,7 @@ pub fn resolve_server_bin(explicit: Option<&Path>) -> Result<PathBuf, String> {
         if !env_path.is_empty() {
             let path = PathBuf::from(&env_path);
             if is_executable_file(&path) {
-                return Ok(path);
+                return Ok(canonicalize_best_effort(path));
             }
             return Err(format!(
                 "MEGU_SERVER_BIN '{}' does not exist or is not a file",
@@ -151,7 +155,7 @@ pub fn resolve_server_bin(explicit: Option<&Path>) -> Result<PathBuf, String> {
     }
     for candidate in candidates {
         if is_executable_file(&candidate) {
-            return Ok(candidate);
+            return Ok(canonicalize_best_effort(candidate));
         }
     }
     Err(
@@ -164,12 +168,30 @@ pub fn resolve_server_bin(explicit: Option<&Path>) -> Result<PathBuf, String> {
 /// `datapacks/` and `assets/block_states_1211.json`, searched from the server
 /// binary's ancestors and the working directory upwards.
 fn find_runtime_root(server_bin: &Path) -> Option<PathBuf> {
+    let resolved_bin = if server_bin.is_absolute() {
+        canonicalize_best_effort(server_bin.to_path_buf())
+    } else if let Ok(cwd) = env::current_dir() {
+        canonicalize_best_effort(cwd.join(server_bin))
+    } else {
+        canonicalize_best_effort(server_bin.to_path_buf())
+    };
     let mut bases: Vec<PathBuf> = Vec::new();
-    if let Some(dir) = server_bin.parent() {
-        bases.extend(dir.ancestors().take(8).map(Path::to_path_buf));
+    if let Some(dir) = resolved_bin.parent() {
+        bases.extend(
+            dir.ancestors()
+                .take(8)
+                .filter(|p| !p.as_os_str().is_empty())
+                .map(Path::to_path_buf),
+        );
     }
     if let Ok(cwd) = env::current_dir() {
-        bases.extend(cwd.ancestors().take(8).map(Path::to_path_buf));
+        let cwd = canonicalize_best_effort(cwd);
+        bases.extend(
+            cwd.ancestors()
+                .take(8)
+                .filter(|p| !p.as_os_str().is_empty())
+                .map(Path::to_path_buf),
+        );
     }
     bases.sort();
     bases.dedup();
@@ -182,13 +204,20 @@ fn find_runtime_root(server_bin: &Path) -> Option<PathBuf> {
 
 #[cfg(unix)]
 fn link_or_copy(src: &Path, dst: &Path) -> io::Result<()> {
-    if dst.symlink_metadata().is_ok() {
-        return Ok(());
+    if let Ok(meta) = dst.symlink_metadata() {
+        // Heal broken symlinks (e.g. from an earlier relative-path bug) so the
+        // world recovers cleanly on next launch.
+        if meta.file_type().is_symlink() && !dst.exists() {
+            let _ = fs::remove_file(dst);
+        } else {
+            return Ok(());
+        }
     }
-    match std::os::unix::fs::symlink(src, dst) {
+    let abs_src = canonicalize_best_effort(src.to_path_buf());
+    match std::os::unix::fs::symlink(&abs_src, dst) {
         Ok(()) => Ok(()),
-        Err(_) if src.is_dir() => copy_dir_all(src, dst),
-        Err(_) => fs::copy(src, dst).map(|_| ()),
+        Err(_) if abs_src.is_dir() => copy_dir_all(&abs_src, dst),
+        Err(_) => fs::copy(&abs_src, dst).map(|_| ()),
     }
 }
 
@@ -218,15 +247,47 @@ fn copy_dir_all(src: &Path, dst: &Path) -> io::Result<()> {
     Ok(())
 }
 
-/// Expose the server runtime assets (`assets/`, `datapacks/`,
+/// Expose the server runtime assets (`assets/`, `datapacks/vanilla`,
 /// `config_packets.bin`) inside the per-world run directory, which doubles as
 /// the server's working directory and save location.
+///
+/// Only `datapacks/vanilla` is linked when present so repository test datapacks
+/// (such as `modtest`/`testpack`) are not loaded into player singleplayer worlds.
 fn prepare_world_dir(world_dir: &Path, runtime_root: &Path) -> Result<(), String> {
+    let runtime_root = canonicalize_best_effort(runtime_root.to_path_buf());
     fs::create_dir_all(world_dir)
         .map_err(|e| format!("cannot create world dir {}: {e}", world_dir.display()))?;
-    for name in ["assets", "datapacks", "config_packets.bin"] {
+    for name in ["assets", "config_packets.bin"] {
         link_or_copy(&runtime_root.join(name), &world_dir.join(name))
             .map_err(|e| format!("cannot link {} into {}: {e}", name, world_dir.display()))?;
+    }
+    let vanilla_dp = runtime_root.join("datapacks").join("vanilla");
+    let world_dp = world_dir.join("datapacks");
+    if vanilla_dp.is_dir() {
+        // If a previous launch created a broken symlink at `world_dir/datapacks`,
+        // clear it before creating the real `datapacks/` directory.
+        if let Ok(meta) = world_dp.symlink_metadata() {
+            if meta.file_type().is_symlink() && !world_dp.exists() {
+                let _ = fs::remove_file(&world_dp);
+            }
+        }
+        let is_symlink = world_dp
+            .symlink_metadata()
+            .is_ok_and(|m| m.file_type().is_symlink());
+        if !is_symlink && (world_dp.symlink_metadata().is_err() || world_dp.is_dir()) {
+            fs::create_dir_all(&world_dp).map_err(|e| {
+                format!("cannot create datapacks dir {}: {e}", world_dp.display())
+            })?;
+            link_or_copy(&vanilla_dp, &world_dp.join("vanilla")).map_err(|e| {
+                format!(
+                    "cannot link datapacks/vanilla into {}: {e}",
+                    world_dir.display()
+                )
+            })?;
+        }
+    } else {
+        link_or_copy(&runtime_root.join("datapacks"), &world_dp)
+            .map_err(|e| format!("cannot link datapacks into {}: {e}", world_dir.display()))?;
     }
     Ok(())
 }
@@ -439,5 +500,49 @@ mod tests {
         cfg.view_distance = 9;
         cfg.view_distance_explicit = true;
         assert_eq!(server_view_distance(&cfg), Some(9));
+    }
+
+    #[test]
+    fn resolve_server_bin_canonicalizes_and_prepare_world_dir_links_only_vanilla_datapack() {
+        let root = std::env::temp_dir().join(format!(
+            "megu-integrated-test-{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&root);
+        let runtime = root.join("runtime");
+        let bin = runtime.join("target").join("release").join("megu");
+        fs::create_dir_all(bin.parent().unwrap()).unwrap();
+        fs::write(&bin, b"stub").unwrap();
+        fs::create_dir_all(runtime.join("assets")).unwrap();
+        fs::write(runtime.join("assets").join("block_states_1211.json"), b"{}").unwrap();
+        fs::write(runtime.join("config_packets.bin"), b"cfg").unwrap();
+        fs::create_dir_all(runtime.join("datapacks").join("vanilla")).unwrap();
+        fs::write(
+            runtime.join("datapacks").join("vanilla").join("pack.mcmeta"),
+            b"{}",
+        )
+        .unwrap();
+        fs::create_dir_all(runtime.join("datapacks").join("testpack")).unwrap();
+        fs::write(
+            runtime.join("datapacks").join("testpack").join("pack.mcmeta"),
+            b"{}",
+        )
+        .unwrap();
+
+        let resolved = resolve_server_bin(Some(&bin)).unwrap();
+        assert!(resolved.is_absolute());
+        let found = find_runtime_root(&resolved).expect("runtime root should be found");
+        assert_eq!(found, canonicalize_best_effort(runtime.clone()));
+
+        let world_dir = root.join("saves").join("TestWorld");
+        prepare_world_dir(&world_dir, &found).unwrap();
+        assert!(world_dir.join("assets").join("block_states_1211.json").is_file());
+        assert!(world_dir.join("config_packets.bin").is_file());
+        assert!(world_dir.join("datapacks").join("vanilla").join("pack.mcmeta").is_file());
+        assert!(
+            !world_dir.join("datapacks").join("testpack").exists(),
+            "repository test datapacks must not be linked into singleplayer worlds"
+        );
+        let _ = fs::remove_dir_all(&root);
     }
 }

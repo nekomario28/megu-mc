@@ -401,6 +401,7 @@ impl PcmQueue {
 
     /// Oldest chunk, or `None` once closed and drained. Waits up to `wait`
     /// for new data so the writer can notice shutdown promptly.
+    #[cfg(test)]
     fn pop(&self, wait: Duration) -> Option<Vec<u8>> {
         let mut g = self.inner.lock().unwrap_or_else(|e| e.into_inner());
         let deadline = Instant::now() + wait;
@@ -418,6 +419,25 @@ impl PcmQueue {
                 .wait_timeout(g, rem)
                 .unwrap_or_else(|e| e.into_inner());
             g = guard;
+        }
+    }
+
+    /// Block until a chunk arrives, or return `None` once closed and drained.
+    /// Unlike [`Self::pop`], idle silence never terminates the stream.
+    fn pop_blocking(&self) -> Option<Vec<u8>> {
+        let mut g = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        loop {
+            if let Some(chunk) = g.chunks.pop_front() {
+                g.bytes = g.bytes.saturating_sub(chunk.len());
+                return Some(chunk);
+            }
+            if g.closed {
+                return None;
+            }
+            g = self
+                .not_empty
+                .wait(g)
+                .unwrap_or_else(|e| e.into_inner());
         }
     }
 
@@ -500,7 +520,7 @@ impl SubprocessSink {
                 .name("megu-audio-sink".to_string())
                 .spawn(move || {
                     let _mark_done = writer_done;
-                    while let Some(chunk) = queue.pop(Duration::from_millis(100)) {
+                    while let Some(chunk) = queue.pop_blocking() {
                         if stdin.write_all(&chunk).is_err() {
                             dead.store(true, Ordering::Relaxed);
                             _mark_done.store(true, Ordering::Relaxed);
@@ -2894,6 +2914,25 @@ mod tests {
         drop(g);
         q.close();
         assert_eq!(q.pop(Duration::from_millis(5)), None);
+    }
+
+    #[test]
+    fn pcm_queue_pop_blocking_survives_idle_silence_until_closed() {
+        let q = Arc::new(PcmQueue::new(64));
+        let q_rx = q.clone();
+        let reader = std::thread::spawn(move || {
+            let first = q_rx.pop_blocking();
+            let second = q_rx.pop_blocking();
+            (first, second)
+        });
+        // Sleep past the old 100 ms timeout before pushing: the writer must
+        // stay open instead of treating silence as EOF.
+        std::thread::sleep(Duration::from_millis(130));
+        q.push(vec![42, 43]);
+        q.close();
+        let (first, second) = reader.join().unwrap();
+        assert_eq!(first, Some(vec![42, 43]));
+        assert_eq!(second, None);
     }
 
     #[test]
