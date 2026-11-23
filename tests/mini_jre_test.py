@@ -125,9 +125,9 @@ class MiniJreTests(unittest.TestCase):
             list(builder.PROFILES["neoforge-delegate"]), NEOFORGE_MODULES)
 
     def test_jlink_argv_exact_shape(self):
+        staging = Path("/tmp/x/.out.jlink-staging")
         argv = builder.build_jlink_argv(
-            "/opt/jdk/bin/jlink", builder.PROFILES["minimal"],
-            Path("/tmp/x/.out.jlink-staging"))
+            "/opt/jdk/bin/jlink", builder.PROFILES["minimal"], staging)
         self.assertEqual(argv, [
             "/opt/jdk/bin/jlink",
             "--add-modules", "java.base,java.logging,jdk.unsupported",
@@ -135,7 +135,7 @@ class MiniJreTests(unittest.TestCase):
             "--no-man-pages",
             "--no-header-files",
             "--compress=zip-6",
-            "--output", "/tmp/x/.out.jlink-staging",
+            "--output", str(staging),
         ])
 
     def test_jlink_argv_compress_override(self):
