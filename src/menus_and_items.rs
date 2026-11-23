@@ -3834,6 +3834,10 @@ fn name_to_item(n: &str) -> Option<i64> {
         return Some(i64::from(state));
     }
     let n = n.strip_prefix("minecraft:").unwrap_or(n);
+    #[cfg(feature = "mod-suite")]
+    if let Some(id) = live_create_resolve_item(n) {
+        return Some(id);
+    }
     Some(match n {
         "air" => 0,
         "stone" => 1,
@@ -5421,6 +5425,10 @@ static ITEM_NAMES: [&str; 1333] = [
     "breeze_rod",
 ];
 fn item_to_name(id: i64) -> Option<&'static str> {
+    #[cfg(feature = "mod-suite")]
+    if let Some(name) = live_create_item_name(id) {
+        return Some(name);
+    }
     usize::try_from(id).ok().and_then(|i| ITEM_NAMES.get(i).copied())
 }
 fn read_nbt_string_bytes(data: &[u8], p: &mut usize) -> Option<String> {

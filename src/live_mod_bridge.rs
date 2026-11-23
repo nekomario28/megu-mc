@@ -2196,6 +2196,668 @@ fn live_mod_progression_rules_from_json(bytes: &[u8]) -> Result<Vec<ProgressionR
 }
 
 // ===========================================================================
+// Live Create runtime (`mod-suite` only): binds `create-adapter`'s
+// `CreateFactory` to the real world — block placement/break hooks, wrench
+// rotation, a per-tick kinetic step, the Play S2C `0x19` broadcast, the
+// late-join snapshot, `create:*` item resolution, and the
+// `create_factory.bin` world sidecar.
+//
+// Wire contract (mirrors `create-adapter/src/neoforge_wire.rs`):
+//   packet id : Play S2C custom_payload `0x19`
+//   channel   : `"create:kinetic_sync_v1"` (CHANNEL_CREATE_KINETIC_SYNC)
+//   body      : write_str(channel) + VarInt count + per-record 29 bytes
+//               [ i32be dim | i32be x | i32be y | i32be z
+//               | f32be speed_rpm | f32be stress_capacity | f32be stress_load
+//               | u8 overstressed (0|1) ]
+// ===========================================================================
+
+#[cfg(feature = "mod-suite")]
+use crate::block_registry::{
+    live_create_enabled, live_create_item_table, LIVE_CREATE_ITEM_BASE,
+};
+#[cfg(all(test, feature = "mod-suite"))]
+use crate::block_registry::LIVE_CREATE_TEST_GATE;
+
+/// The 1.21.1 `water`/`flowing_water` state-id window the fluid scheduler
+/// already relies on (`register_overworld_scheduled` uses the same range).
+/// Used when `breg()` is unavailable so the wheel check stays zero-cost.
+#[cfg(feature = "mod-suite")]
+const LIVE_CREATE_WATER_STATES: std::ops::RangeInclusive<u32> = 80..=95;
+
+/// `/give` resolution: `"create:shaft"` -> a stable `1_000_000+` item id.
+/// Returns `None` for every non-Create name so the vanilla tables below it
+/// still answer first.
+#[cfg(feature = "mod-suite")]
+fn live_create_resolve_item(name: &str) -> Option<i64> {
+    if !live_create_enabled() || !name.starts_with("create:") {
+        return None;
+    }
+    live_create_item_table()
+        .iter()
+        .position(|(n, _)| n == name)
+        .map(|i| LIVE_CREATE_ITEM_BASE + i as i64)
+}
+
+/// Reverse of [`live_create_resolve_item`]; `None` for vanilla item ids.
+#[cfg(feature = "mod-suite")]
+fn live_create_item_name(item: i64) -> Option<&'static str> {
+    if !live_create_enabled() {
+        return None;
+    }
+    let idx = usize::try_from(item.checked_sub(LIVE_CREATE_ITEM_BASE)?).ok()?;
+    live_create_item_table().get(idx).map(|(n, _)| n.as_str())
+}
+
+/// The block id a `create:*` item places, or `None` for the wrench.
+#[cfg(feature = "mod-suite")]
+fn live_create_item_block_name(item: i64) -> Option<&'static str> {
+    let idx = usize::try_from(item.checked_sub(LIVE_CREATE_ITEM_BASE)?).ok()?;
+    live_create_item_table().get(idx)?.1.as_deref()
+}
+
+/// Water check used by the wheel rule. Prefers the live registry name so
+/// waterlogged/fluid renames keep working, with the hardcoded 1.21.1 window
+/// (see [`LIVE_CREATE_WATER_STATES`]) as the no-assets fallback.
+#[cfg(feature = "mod-suite")]
+fn live_create_is_water(st: u32) -> bool {
+    if LIVE_CREATE_WATER_STATES.contains(&st) {
+        return true;
+    }
+    breg().is_some_and(|reg| {
+        matches!(reg.name_of(st), "minecraft:water" | "minecraft:flowing_water")
+    })
+}
+
+/// Live `CreateFactory` bound to the server world. `placed` mirrors every
+/// Create block currently in the world (the authoritative set for
+/// persistence); `dormant` marks the subset — water wheels with no adjacent
+/// water — that are placed but intentionally NOT registered in the kinetic
+/// graph so they contribute no RPM until flow arrives.
+#[cfg(feature = "mod-suite")]
+struct LiveCreateRuntime {
+    factory: create_adapter::factory::CreateFactory,
+    placed: std::collections::BTreeMap<create_adapter::factory::DimBlockPos, u32>,
+    dormant: std::collections::BTreeSet<create_adapter::factory::DimBlockPos>,
+    /// Number of non-empty kinetic batches drained since boot (test hook).
+    kinetic_batches_emitted: u64,
+}
+
+#[cfg(feature = "mod-suite")]
+type FactoryPos = create_adapter::factory::DimBlockPos;
+
+#[cfg(feature = "mod-suite")]
+fn live_create_state() -> &'static Mutex<Option<LiveCreateRuntime>> {
+    static RT: OnceLock<Mutex<Option<LiveCreateRuntime>>> = OnceLock::new();
+    RT.get_or_init(|| Mutex::new(None))
+}
+
+#[cfg(feature = "mod-suite")]
+fn live_create_runtime_init() -> Option<LiveCreateRuntime> {
+    if !live_create_enabled() {
+        return None;
+    }
+    let registry = create_adapter::blockstates::core_create_registry(
+        create_adapter::blockstates::DEFAULT_BASE_STATE_ID,
+    );
+    Some(LiveCreateRuntime {
+        factory: create_adapter::factory::CreateFactory::new(registry),
+        placed: std::collections::BTreeMap::new(),
+        dormant: std::collections::BTreeSet::new(),
+        kinetic_batches_emitted: 0,
+    })
+}
+
+/// Borrow the armed runtime, lazily arming it on first use. `None` when
+/// Create is disabled — every caller treats that as a zero-cost no-op, so
+/// default builds and unconfigured mod-suite builds stay byte-identical.
+#[cfg(feature = "mod-suite")]
+fn live_create_with<R>(f: impl FnOnce(&mut LiveCreateRuntime) -> R) -> Option<R> {
+    if !live_create_enabled() {
+        return None;
+    }
+    let mut guard = live_create_state().lock().unwrap_or_else(|e| e.into_inner());
+    if guard.is_none() {
+        *guard = live_create_runtime_init();
+    }
+    guard.as_mut().map(f)
+}
+
+#[cfg(feature = "mod-suite")]
+impl LiveCreateRuntime {
+    fn is_create_state(&self, st: u32) -> bool {
+        self.factory.registry().state(st).is_some()
+    }
+
+    fn is_water_wheel(&self, st: u32) -> bool {
+        self.factory
+            .registry()
+            .block_def_for_state(st)
+            .is_some_and(|def| def.id.ends_with("water_wheel"))
+    }
+
+    /// Any of the six orthogonally adjacent cells holds water.
+    fn adjacent_water(&self, pos: FactoryPos) -> bool {
+        let dim = DimId::from_raw(pos.dim as u32);
+        [
+            (1i32, 0i32, 0i32),
+            (-1, 0, 0),
+            (0, 1, 0),
+            (0, -1, 0),
+            (0, 0, 1),
+            (0, 0, -1),
+        ]
+        .iter()
+        .any(|&(dx, dy, dz)| {
+            live_create_is_water(block_at_dim(dim, pos.x + dx, pos.y + dy, pos.z + dz))
+        })
+    }
+
+    /// Bring the kinetic graph in line with `st` at `pos`. A water wheel
+    /// beside no water stays in `placed`/`dormant` (visible block, inert
+    /// node); everything else registers directly.
+    fn sync_cell(&mut self, pos: FactoryPos, st: u32) {
+        if !self.is_create_state(st) {
+            self.placed.remove(&pos);
+            self.dormant.remove(&pos);
+            let _ = self.factory.remove_block(pos);
+            return;
+        }
+        let active = !self.is_water_wheel(st) || self.adjacent_water(pos);
+        if active
+            && self.placed.get(&pos) == Some(&st)
+            && !self.dormant.contains(&pos)
+            && self.factory.kinetic_solution(pos).is_some()
+        {
+            // Already registered with this exact state — the wrench path
+            // pre-committed the factory node; skip the redundant re-solve.
+            return;
+        }
+        if active {
+            self.dormant.remove(&pos);
+            self.placed.insert(pos, st);
+            let _ = self.factory.place_block(pos, st);
+        } else {
+            let _ = self.factory.remove_block(pos);
+            self.placed.insert(pos, st);
+            self.dormant.insert(pos);
+        }
+    }
+
+    /// A water cell appeared/vanished at `pos`: re-evaluate every tracked
+    /// water wheel in the adjacent cells so a wheel activates when flow
+    /// arrives and idles when it leaves.
+    fn reeval_wheel_neighbors(&mut self, pos: FactoryPos) {
+        for (dx, dy, dz) in [
+            (1i32, 0i32, 0i32),
+            (-1, 0, 0),
+            (0, 1, 0),
+            (0, -1, 0),
+            (0, 0, 1),
+            (0, 0, -1),
+        ] {
+            let npos = pos.offset(dx, dy, dz);
+            let Some(&st) = self.placed.get(&npos) else {
+                continue;
+            };
+            if self.is_water_wheel(st) {
+                self.sync_cell(npos, st);
+            }
+        }
+    }
+
+    /// Rebuild the whole runtime from saved entries (`load_entries` is only
+    /// reached after the world overlay is applied, so `adjacent_water`
+    /// already sees the restored fluids).
+    fn load_entries(&mut self, entries: Vec<(FactoryPos, u32)>) {
+        self.factory = create_adapter::factory::CreateFactory::new(
+            create_adapter::blockstates::core_create_registry(
+                create_adapter::blockstates::DEFAULT_BASE_STATE_ID,
+            ),
+        );
+        self.placed.clear();
+        self.dormant.clear();
+        for (pos, st) in entries {
+            self.sync_cell(pos, st);
+        }
+    }
+
+    /// Full kinetic snapshot used by the join packet.
+    fn snapshot_tags(&self) -> Vec<create_adapter::factory::KineticUpdateTag> {
+        let mut tags = Vec::with_capacity(self.placed.len());
+        for &pos in self.placed.keys() {
+            if self.dormant.contains(&pos) {
+                continue;
+            }
+            if let Some(sol) = self.factory.kinetic_solution(pos) {
+                tags.push(create_adapter::factory::KineticUpdateTag {
+                    pos,
+                    speed_rpm: sol.speed,
+                    stress_capacity: sol.capacity,
+                    stress_load: sol.load,
+                    overstressed: matches!(
+                        sol.status,
+                        mod_offload::kinetic_graph::NetworkStatus::Overstressed
+                    ),
+                });
+            }
+        }
+        tags
+    }
+}
+
+/// World-write hook wired beside `live_block_changed` in every block
+/// mutation path (`set_block_if_inner_dim`, `set_block_if_dim_edit`,
+/// `set_blocks_bulk_dim`). Vanilla-only writes pay two compares and exit;
+/// a water<->non-water edge additionally probes the runtime so flow
+/// arriving next to a wheel activates it.
+#[cfg(feature = "mod-suite")]
+fn live_create_on_block_set(dim: DimId, x: i32, y: i32, z: i32, old: u32, st: u32) {
+    if !live_create_enabled() {
+        return;
+    }
+    let base = create_adapter::blockstates::DEFAULT_BASE_STATE_ID;
+    let was_mod = old >= base;
+    let is_mod = st >= base;
+    let water_edge =
+        !was_mod && !is_mod && live_create_is_water(old) != live_create_is_water(st);
+    if !was_mod && !is_mod && !water_edge {
+        return;
+    }
+    let pos = FactoryPos::new(dim.raw() as i32, x, y, z);
+    live_create_with(|rt| {
+        if was_mod || is_mod {
+            rt.sync_cell(pos, st);
+        }
+        if water_edge {
+            rt.reeval_wheel_neighbors(pos);
+        }
+    });
+}
+
+/// `BlockItem.place` for `create:*` block items, invoked from
+/// `try_live_block_placement` before the vanilla item table is consulted.
+/// Reproduces the vanilla placement contract: clicked-replaceable absorbs,
+/// face offsets otherwise; `axis` follows the clicked face, `facing`
+/// follows the look direction (or the clicked face for all-direction
+/// blocks), `powered=false`, `waterlogged` follows the replaced fluid.
+/// The write goes through `set_block_if_inner_dim`, so the kinetic-graph
+/// hook, save guard, and client resync all see one ordinary block write.
+#[cfg(feature = "mod-suite")]
+fn live_create_block_place(
+    c: &Client,
+    (dim, x, y, z): (DimId, i32, i32, i32),
+    face: usize,
+    held: i16,
+    item: i64,
+) -> bool {
+    let Some(reg) = breg() else {
+        return false;
+    };
+    let Some(block_id) = live_create_item_block_name(item) else {
+        return false;
+    };
+    let clicked_st = block_at_dim(dim, x, y, z);
+    if reg.is_air(clicked_st) {
+        return false;
+    }
+    let fdir = RsDir::ALL[face.min(5)];
+    let (dx, dy, dz) = fdir.offset();
+    let (tx, ty, tz) = if reg.is_replaceable(clicked_st) {
+        (x, y, z)
+    } else {
+        (x + dx, y + dy, z + dz)
+    };
+    let target_old = block_at_dim(dim, tx, ty, tz);
+    if !reg.is_replaceable(target_old) {
+        return true;
+    }
+    if matches!(*c.gm.lock().unwrap_or_else(|e| e.into_inner()), 2 | 3) {
+        return true;
+    }
+    let yaw = c.pos.lock().unwrap_or_else(|e| e.into_inner()).3;
+    let look = placement_look(yaw);
+    let Some(st) = live_create_with(|rt| {
+        let registry = rt.factory.registry();
+        let def = registry.block_def(block_id)?;
+        let mut st = registry.default_state(block_id)?;
+        if def.properties.iter().any(|p| p.name == "axis") {
+            let axis = match fdir.axis() {
+                RsAxis::X => "x",
+                RsAxis::Y => "y",
+                RsAxis::Z => "z",
+            };
+            st = registry.with_property(st, "axis", axis).unwrap_or(st);
+        }
+        if let Some(prop) = def.properties.iter().find(|p| p.name == "facing") {
+            let wanted = fdir.opposite().property();
+            let facing = if prop.values.iter().any(|v| v == wanted) {
+                wanted
+            } else {
+                let horiz = look.opposite().property();
+                if prop.values.iter().any(|v| v == horiz) {
+                    horiz
+                } else {
+                    prop.values[0].as_str()
+                }
+            };
+            st = registry.with_property(st, "facing", facing).unwrap_or(st);
+        }
+        if def.properties.iter().any(|p| p.name == "powered") {
+            st = registry.with_property(st, "powered", "false").unwrap_or(st);
+        }
+        if def.properties.iter().any(|p| p.name == "waterlogged") {
+            let wet = reg.fluid_name(target_old) == "minecraft:water";
+            st = registry
+                .with_property(st, "waterlogged", if wet { "true" } else { "false" })
+                .unwrap_or(st);
+        }
+        Some(st)
+    })
+    .flatten() else {
+        return false;
+    };
+    with_save_guard(|| {
+        if set_block_if_inner_dim(dim, tx, ty, tz, st, Some(target_old)) {
+            note_block_update_dim(dim, tx, ty, tz, block_at_dim(dim, tx, ty, tz));
+            ac_consume_placed_item(c, held);
+        }
+    });
+    true
+}
+
+/// `create:wrench` right-click on a tracked Create block: cycle `axis`
+/// first, then `facing` (press/pump/funnel/bearing family), re-solve the
+/// network through `CreateFactory::wrench_rotate`, and write the rotated
+/// state back so clients see the new blockstate. Rotation while sneaking
+/// follows the same contract.
+#[cfg(feature = "mod-suite")]
+fn live_create_wrench_use(
+    me: &Client,
+    dim: DimId,
+    x: i32,
+    y: i32,
+    z: i32,
+    clicked: u32,
+    held_slot: i16,
+) -> bool {
+    if !live_create_enabled() {
+        return false;
+    }
+    let item = me
+        .inv
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .get(&(36 + held_slot))
+        .map(|s| s.0)
+        .unwrap_or(0);
+    if live_create_item_name(item) != Some("create:wrench") {
+        return false;
+    }
+    let pos = FactoryPos::new(dim.raw() as i32, x, y, z);
+    let Some(next) = live_create_wrench_rotate(pos, clicked) else {
+        return false;
+    };
+    if set_block_if_dim(dim, x, y, z, next, Some(clicked)) {
+        note_block_update_dim(dim, x, y, z, next);
+    }
+    true
+}
+
+/// The runtime half of the wrench interaction — separated from `Client` so
+/// tests exercise the exact factory + world-write contract.
+#[cfg(feature = "mod-suite")]
+fn live_create_wrench_rotate(pos: FactoryPos, clicked: u32) -> Option<u32> {
+    live_create_with(|rt| {
+        if rt.factory.kinetic_solution(pos).is_none() && !rt.placed.contains_key(&pos) {
+            return None;
+        }
+        if let Some((next, _diffs)) = rt.factory.wrench_rotate(pos) {
+            rt.placed.insert(pos, next);
+            return Some(next);
+        }
+        let st = *rt.placed.get(&pos).unwrap_or(&clicked);
+        let next = rt
+            .factory
+            .registry()
+            .cycle_property(st, "facing")
+            .or_else(|| rt.factory.registry().cycle_property(st, "axis"))?;
+        if rt.dormant.contains(&pos) {
+            rt.placed.insert(pos, next);
+        } else {
+            let _ = rt.factory.place_block(pos, next);
+            rt.placed.insert(pos, next);
+        }
+        Some(next)
+    })
+    .flatten()
+}
+
+/// The tick-half without the socket write — step the factory once, drain
+/// the coalesced `KineticUpdateTag` batch (only changed nodes; the
+/// fingerprint gate suppresses idle churn), and encode it for the wire.
+/// Factored out so tests observe the exact bytes clients receive.
+#[cfg(feature = "mod-suite")]
+fn live_create_tick_body() -> Option<Vec<u8>> {
+    if !live_create_enabled() {
+        return None;
+    }
+    let tick = TICK_IDX.load(Ordering::Relaxed);
+    live_create_with(|rt| {
+        let _ = rt.factory.step_tick(tick, 1_024, None);
+        let mut drained = Vec::new();
+        rt.factory.drain_update_batch_into(&mut drained);
+        if drained.is_empty() {
+            return None;
+        }
+        let tags: Vec<create_adapter::factory::KineticUpdateTag> =
+            drained.into_iter().map(|(_, tag)| tag).collect();
+        rt.kinetic_batches_emitted += 1;
+        Some(live_mod_payload_body(
+            create_adapter::neoforge_wire::CHANNEL_CREATE_KINETIC_SYNC,
+            &create_adapter::neoforge_wire::encode_kinetic_update_batch(&tags),
+        ))
+    })
+    .flatten()
+}
+
+/// Per-game-tick stage (`run("live_create", live_create_tick)`): broadcast
+/// the drained kinetic batch to every connected client over Play S2C
+/// `0x19` on channel `create:kinetic_sync_v1`. The factory lock is released
+/// before any socket is touched.
+#[cfg(feature = "mod-suite")]
+fn live_create_tick() {
+    let Some(body) = live_create_tick_body() else {
+        return;
+    };
+    for client in client_snapshot() {
+        let mut socket = client.sock.lock().unwrap_or_else(|e| e.into_inner());
+        let _ = send_packet(&mut socket, LIVE_MOD_S2C_CUSTOM_PAYLOAD_ID, body.clone());
+    }
+}
+
+/// Full kinetic snapshot packet for a joining client, sent right after
+/// `live_mod_sync_on_join` so late joiners see spinning wheels/shafts
+/// without waiting for the next delta.
+#[cfg(feature = "mod-suite")]
+fn live_create_sync_on_join(s: &mut TcpStream) {
+    let Some(body) = live_create_with(|rt| {
+        let tags = rt.snapshot_tags();
+        if tags.is_empty() {
+            return None;
+        }
+        Some(live_mod_payload_body(
+            create_adapter::neoforge_wire::CHANNEL_CREATE_KINETIC_SYNC,
+            &create_adapter::neoforge_wire::encode_kinetic_update_batch(&tags),
+        ))
+    })
+    .flatten() else {
+        return;
+    };
+    let _ = send_packet(s, LIVE_MOD_S2C_CUSTOM_PAYLOAD_ID, body);
+}
+
+// ---- create_factory.bin sidecar ------------------------------------------
+//
+// Format (`MCF1`): magic(4) + VarInt entry_count + per entry
+// [ i32be dim | i32be x | i32be y | i32be z | VarStr canonical ], then a
+// big-endian u32 FNV-1a checksum over every preceding byte. `canonical` is
+// `BlockRegistry::encode_canonical(state_id)` — e.g.
+// `create:shaft[axis=x,waterlogged=false]` — so the sidecar survives table
+// reordering; on load each entry is re-decoded through
+// `decode_canonical`. Any malformed tail fails the load closed.
+
+#[cfg(feature = "mod-suite")]
+const LIVE_CREATE_SIDECAR_MAGIC: &[u8; 4] = b"MCF1";
+#[cfg(feature = "mod-suite")]
+const LIVE_CREATE_SIDECAR_FILE: &str = "create_factory.bin";
+
+#[cfg(feature = "mod-suite")]
+fn live_create_fnv32(bytes: &[u8]) -> u32 {
+    let mut hash: u32 = 0x811c_9dc5;
+    for &b in bytes {
+        hash ^= u32::from(b);
+        hash = hash.wrapping_mul(0x0100_0193);
+    }
+    hash
+}
+
+/// Bytes for `create_factory.bin`, or `None` while Create is unarmed —
+/// callers must not write the file in that case.
+#[cfg(feature = "mod-suite")]
+fn live_create_serialize() -> Option<Vec<u8>> {
+    if !live_create_enabled() {
+        return None;
+    }
+    live_create_with(|rt| {
+        let registry = create_adapter::blockstates::core_create_registry(
+            create_adapter::blockstates::DEFAULT_BASE_STATE_ID,
+        );
+        let mut out = Vec::new();
+        out.extend_from_slice(LIVE_CREATE_SIDECAR_MAGIC);
+        write_varint(&mut out, rt.placed.len() as i64);
+        for (pos, st) in &rt.placed {
+            out.extend_from_slice(&pos.dim.to_be_bytes());
+            out.extend_from_slice(&pos.x.to_be_bytes());
+            out.extend_from_slice(&pos.y.to_be_bytes());
+            out.extend_from_slice(&pos.z.to_be_bytes());
+            let canon = registry.encode_canonical(*st).unwrap_or_default();
+            write_str(&mut out, canon);
+        }
+        let sum = live_create_fnv32(&out);
+        out.extend_from_slice(&sum.to_be_bytes());
+        out
+    })
+}
+
+/// Decode + validate the sidecar into `(pos, state_id)` entries. Every
+/// malformed tail — bad magic, bad checksum, truncation, unknown canonical,
+/// impossible count — is `Err` so `load_world_in` fails closed.
+#[cfg(feature = "mod-suite")]
+fn live_create_decode_sidecar(
+    raw: &[u8],
+) -> Result<Vec<(FactoryPos, u32)>, &'static str> {
+    const ERR: &str = "corrupt create factory save";
+    if raw.len() < 9 || raw[..4] != *LIVE_CREATE_SIDECAR_MAGIC {
+        return Err(ERR);
+    }
+    let (body, check) = raw.split_at(raw.len() - 4);
+    let want = u32::from_be_bytes(check.try_into().map_err(|_| ERR)?);
+    if live_create_fnv32(body) != want {
+        return Err(ERR);
+    }
+    let mut rest = &body[4..];
+    let count = read_varint(&mut rest).ok_or(ERR)?;
+    if !(0..=1_000_000).contains(&count) {
+        return Err(ERR);
+    }
+    let registry = create_adapter::blockstates::core_create_registry(
+        create_adapter::blockstates::DEFAULT_BASE_STATE_ID,
+    );
+    let mut entries = Vec::with_capacity(count as usize);
+    for _ in 0..count {
+        if rest.len() < 16 {
+            return Err(ERR);
+        }
+        let dim = i32::from_be_bytes(rest[0..4].try_into().map_err(|_| ERR)?);
+        let x = i32::from_be_bytes(rest[4..8].try_into().map_err(|_| ERR)?);
+        let y = i32::from_be_bytes(rest[8..12].try_into().map_err(|_| ERR)?);
+        let z = i32::from_be_bytes(rest[12..16].try_into().map_err(|_| ERR)?);
+        rest = &rest[16..];
+        let strlen = read_varint(&mut rest).ok_or(ERR)?;
+        if !(0..=256).contains(&strlen) || rest.len() < strlen as usize {
+            return Err(ERR);
+        }
+        let canon = std::str::from_utf8(&rest[..strlen as usize]).map_err(|_| ERR)?;
+        rest = &rest[strlen as usize..];
+        let st = registry.decode_canonical(canon).ok_or(ERR)?;
+        entries.push((FactoryPos::new(dim, x, y, z), st));
+    }
+    if !rest.is_empty() {
+        return Err(ERR);
+    }
+    Ok(entries)
+}
+
+/// Called by `load_world_in` after the dim overlays are applied. A missing
+/// file means an empty factory; a corrupt file fails the whole load
+/// (fail-closed, same contract as the protected world save).
+#[cfg(feature = "mod-suite")]
+fn live_create_load_sidecar(dir: &std::path::Path) -> Result<(), &'static str> {
+    if !live_create_enabled() {
+        return Ok(());
+    }
+    let path = dir.join(LIVE_CREATE_SIDECAR_FILE);
+    let raw = match std::fs::read(&path) {
+        Ok(raw) => raw,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(_) => return Err("failed to read create factory save"),
+    };
+    let entries = live_create_decode_sidecar(&raw)?;
+    live_create_with(|rt| rt.load_entries(entries));
+    Ok(())
+}
+
+#[cfg(not(feature = "mod-suite"))]
+#[allow(dead_code)]
+#[inline(always)]
+fn live_create_on_block_set(_dim: DimId, _x: i32, _y: i32, _z: i32, _old: u32, _st: u32) {}
+
+#[cfg(not(feature = "mod-suite"))]
+#[allow(dead_code)]
+#[inline(always)]
+fn live_create_wrench_use(
+    _me: &Client,
+    _dim: DimId,
+    _x: i32,
+    _y: i32,
+    _z: i32,
+    _clicked: u32,
+    _held_slot: i16,
+) -> bool {
+    false
+}
+
+#[cfg(not(feature = "mod-suite"))]
+#[inline(always)]
+fn live_create_tick() {}
+
+#[cfg(not(feature = "mod-suite"))]
+#[inline(always)]
+fn live_create_sync_on_join(_s: &mut TcpStream) {}
+
+#[cfg(not(feature = "mod-suite"))]
+#[inline(always)]
+fn live_create_serialize() -> Option<Vec<u8>> {
+    None
+}
+
+#[cfg(not(feature = "mod-suite"))]
+#[inline(always)]
+fn live_create_load_sidecar(_dir: &std::path::Path) -> Result<(), &'static str> {
+    Ok(())
+}
+
+// ===========================================================================
 // Default-build stubs: identical call sites, zero emitted code.
 // ===========================================================================
 
@@ -4890,4 +5552,424 @@ version="3.0.0"
         let _ = std::fs::remove_dir_all(dir);
     }
 
+}
+
+// ===========================================================================
+// Live Create runtime tests (`mod-suite`).
+// ===========================================================================
+
+#[cfg(all(test, feature = "mod-suite"))]
+mod live_create_tests {
+    use super::*;
+
+    /// Force-arm the runtime for the test and reset it to a clean slate.
+    /// `world_guard` serializes every test that writes world cells.
+    fn arm() {
+        LIVE_CREATE_TEST_GATE.store(1, Ordering::Relaxed);
+        *live_create_state().lock().unwrap_or_else(|e| e.into_inner()) = None;
+    }
+
+    fn registry() -> create_adapter::blockstates::CreateBlockRegistry {
+        create_adapter::blockstates::core_create_registry(
+            create_adapter::blockstates::DEFAULT_BASE_STATE_ID,
+        )
+    }
+
+    fn state_of(id: &str, props: &[(&str, &str)]) -> u32 {
+        let reg = registry();
+        let mut st = reg.default_state(id).expect(id);
+        for (k, v) in props {
+            st = reg.with_property(st, k, v).expect(k);
+        }
+        st
+    }
+
+    /// Write `st` directly into the world overlay (no hooks), then fire the
+    /// real write hook so the test exercises the same path as `set_block`.
+    fn put(dim: DimId, x: i32, y: i32, z: i32, st: u32) {
+        let old = world()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(&(dim, x >> 4, z >> 4))
+            .and_then(|m| m.get(&local_idx(x, y, z)).copied())
+            .unwrap_or(0);
+        world()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .entry((dim, x >> 4, z >> 4))
+            .or_default()
+            .insert(local_idx(x, y, z), st);
+        live_create_on_block_set(dim, x, y, z, old, st);
+    }
+
+    fn clear(x: i32, y: i32, z: i32) {
+        put(DimId::Overworld, x, y, z, 0);
+    }
+
+    /// A water state id inside the pinned 1.21.1 `water`/`flowing_water`
+    /// window the fluid scheduler uses — resolved without `breg()`.
+    const TEST_WATER: u32 = 90;
+
+    // Unique far-away coordinates per test so parallel world writes never
+    // meet a foreign cell. W1 sits mid-region: negative offsets stay inside
+    // the same kinetic region, keeping every link intra-region.
+    const W1: (i32, i32, i32) = (9_000_008, 80, 0);
+    const W2: (i32, i32, i32) = (9_000_000, 80, 100);
+    const W3: (i32, i32, i32) = (9_000_000, 80, 200);
+    const W4: (i32, i32, i32) = (9_000_000, 80, 300);
+    const W5: (i32, i32, i32) = (9_000_000, 80, 400);
+
+    fn pos_of(c: (i32, i32, i32)) -> FactoryPos {
+        FactoryPos::new(DimId::Overworld.raw() as i32, c.0, c.1, c.2)
+    }
+
+    #[test]
+    fn create_item_resolution_and_names() {
+        let _g = world_guard();
+        arm();
+        let wrench = live_create_resolve_item("create:wrench").expect("wrench item");
+        assert_eq!(live_create_item_name(wrench), Some("create:wrench"));
+        assert_eq!(live_create_item_block_name(wrench), None);
+        let shaft = live_create_resolve_item("create:shaft").expect("shaft item");
+        assert_eq!(live_create_item_name(shaft), Some("create:shaft"));
+        assert_eq!(live_create_item_block_name(shaft), Some("create:shaft"));
+        // The belt alias resolves to the mechanical_belt block.
+        let belt = live_create_resolve_item("create:belt").expect("belt item");
+        assert_eq!(live_create_item_block_name(belt), Some("create:mechanical_belt"));
+        for block in [
+            "create:water_wheel",
+            "create:cogwheel",
+            "create:large_cogwheel",
+            "create:gearbox",
+            "create:clutch",
+            "create:gearshift",
+            "create:mechanical_press",
+            "create:depot",
+            "create:basin",
+        ] {
+            assert!(
+                live_create_resolve_item(block).is_some(),
+                "missing item for {block}"
+            );
+        }
+        // /give entry points resolve through the real tables.
+        assert_eq!(name_to_item("create:wrench"), Some(wrench));
+        assert_eq!(name_to_item("create:shaft"), Some(shaft));
+        assert_eq!(item_to_name(wrench), Some("create:wrench"));
+        assert_eq!(item_to_name(shaft), Some("create:shaft"));
+        // Vanilla items are untouched.
+        assert_eq!(name_to_item("minecraft:stone"), Some(1));
+        assert_eq!(live_create_resolve_item("minecraft:stone"), None);
+        assert_eq!(live_create_resolve_item("diamond"), None);
+    }
+
+    #[test]
+    fn create_kinetic_lifecycle_rpm_wire_wrench_break() {
+        let _g = world_guard();
+        arm();
+        let (wx, wy, wz) = W1;
+        let wheel_pos = pos_of(W1);
+        // A real Create train: water -> water_wheel(x) -> shaft(x) ->
+        // gearbox(x) -> shaft(y) + mechanical_press(facing=east, axis X).
+        // The gearbox turns one shaft vertical; the press links axially in
+        // the direction its facing resolves to (east -> X axis).
+        let water = (wx + 1, wy, wz);
+        let shaft = (wx - 1, wy, wz);
+        let gearbox = (wx - 2, wy, wz);
+        let shaft_y = (wx - 2, wy - 1, wz);
+        let press = (wx - 3, wy, wz);
+        for c in [water, shaft, gearbox, shaft_y, press] {
+            clear(c.0, c.1, c.2);
+        }
+        clear(wx, wy, wz);
+
+        // Water, then the wheel: adjacency is checked on the wheel write.
+        put(DimId::Overworld, water.0, water.1, water.2, TEST_WATER);
+        let wheel = state_of("create:water_wheel", &[("axis", "x")]);
+        put(DimId::Overworld, wx, wy, wz, wheel);
+        let shaft_st = state_of("create:shaft", &[("axis", "x")]);
+        put(DimId::Overworld, shaft.0, shaft.1, shaft.2, shaft_st);
+        let gearbox_st = state_of("create:gearbox", &[("axis", "x")]);
+        put(DimId::Overworld, gearbox.0, gearbox.1, gearbox.2, gearbox_st);
+        let shaft_y_st = state_of("create:shaft", &[("axis", "y")]);
+        put(DimId::Overworld, shaft_y.0, shaft_y.1, shaft_y.2, shaft_y_st);
+        let press_st = state_of("create:mechanical_press", &[("facing", "east")]);
+        put(DimId::Overworld, press.0, press.1, press.2, press_st);
+
+        // Generator -> shaft -> gearbox -> press: non-zero RPM propagates.
+        live_create_with(|rt| {
+            assert!(rt.placed.contains_key(&wheel_pos));
+            assert!(!rt.dormant.contains(&wheel_pos));
+            for c in [shaft, gearbox, shaft_y] {
+                let sol = rt
+                    .factory
+                    .kinetic_solution(pos_of(c))
+                    .expect("node in graph");
+                assert!(
+                    sol.speed.abs() > 1e-6,
+                    "{c:?} must carry non-zero RPM, got {}",
+                    sol.speed
+                );
+            }
+            let press_sol = rt
+                .factory
+                .kinetic_solution(pos_of(press))
+                .expect("press in graph");
+            assert!(
+                matches!(
+                    press_sol.status,
+                    mod_offload::kinetic_graph::NetworkStatus::Running
+                ),
+                "press must be powered, got {:?}",
+                press_sol.status
+            );
+        });
+
+        // Tick drains the accumulated UpdateTags into one S2C batch whose
+        // exact bytes are the play-phase 0x19 custom payload body.
+        let body = live_create_tick_body().expect("kinetic batch emitted");
+        // body = write_str(channel) + payload
+        let mut rest: &[u8] = &body;
+        let chan_len = read_varint(&mut rest).expect("channel varint") as usize;
+        let channel = std::str::from_utf8(&rest[..chan_len]).unwrap();
+        assert_eq!(
+            channel,
+            create_adapter::neoforge_wire::CHANNEL_CREATE_KINETIC_SYNC
+        );
+        let tags =
+            create_adapter::neoforge_wire::decode_kinetic_update_batch(&rest[chan_len..])
+                .expect("batch decodes");
+        assert!(tags
+            .iter()
+            .any(|t| t.pos == pos_of(shaft) && t.speed_rpm.abs() > 1e-6));
+
+        // The snapshot the join packet carries names the same nodes.
+        live_create_with(|rt| {
+            let snap = rt.snapshot_tags();
+            assert!(snap.iter().any(|t| t.pos == pos_of(shaft)));
+        });
+
+        // Wrench on the shaft cycles axis x -> y and re-solves the graph.
+        let rotated = live_create_wrench_rotate(pos_of(shaft), shaft_st)
+            .expect("wrench rotates shaft");
+        assert_ne!(rotated, shaft_st);
+        assert_eq!(
+            registry().encode_canonical(rotated).unwrap(),
+            "create:shaft[axis=y,waterlogged=false]"
+        );
+        live_create_with(|rt| {
+            assert_eq!(rt.placed.get(&pos_of(shaft)), Some(&rotated));
+            let sol = rt
+                .factory
+                .kinetic_solution(pos_of(shaft))
+                .expect("shaft still tracked");
+            // Axis Y disconnects it from the x-axis wheel: network re-solved.
+            assert!(
+                sol.speed.abs() <= 1e-6,
+                "disconnected shaft must stop, got {}",
+                sol.speed
+            );
+        });
+
+        // Breaking the shaft removes the graph node and the tracking entry.
+        put(DimId::Overworld, shaft.0, shaft.1, shaft.2, 0);
+        live_create_with(|rt| {
+            assert!(rt.factory.kinetic_solution(pos_of(shaft)).is_none());
+            assert!(!rt.placed.contains_key(&pos_of(shaft)));
+        });
+
+        for c in [water, shaft, gearbox, shaft_y, press] {
+            clear(c.0, c.1, c.2);
+        }
+        clear(wx, wy, wz);
+    }
+
+    #[test]
+    fn create_water_wheel_dormant_until_flow_arrives() {
+        let _g = world_guard();
+        arm();
+        let (wx, wy, wz) = W2;
+        clear(wx, wy, wz);
+        clear(wx + 1, wy, wz);
+        let wheel = state_of("create:water_wheel", &[("axis", "x")]);
+        put(DimId::Overworld, wx, wy, wz, wheel);
+        // No adjacent water: tracked as placed but dormant — no graph node.
+        live_create_with(|rt| {
+            assert!(rt.dormant.contains(&pos_of(W2)));
+            assert!(rt.factory.kinetic_solution(pos_of(W2)).is_none());
+        });
+        // Water arriving beside it flips the wheel live through the same
+        // water-edge hook a real fluid write fires.
+        put(DimId::Overworld, wx + 1, wy, wz, TEST_WATER);
+        live_create_with(|rt| {
+            assert!(!rt.dormant.contains(&pos_of(W2)));
+            let sol = rt
+                .factory
+                .kinetic_solution(pos_of(W2))
+                .expect("wheel joined graph");
+            assert!(sol.speed.abs() > 1e-6, "wheel must spin, got {}", sol.speed);
+        });
+        // Removing the water idles the wheel again.
+        put(DimId::Overworld, wx + 1, wy, wz, 0);
+        live_create_with(|rt| {
+            assert!(rt.dormant.contains(&pos_of(W2)));
+            assert!(rt.factory.kinetic_solution(pos_of(W2)).is_none());
+        });
+        clear(wx, wy, wz);
+    }
+
+    #[test]
+    fn create_sidecar_roundtrip_and_fail_closed() {
+        let _g = world_guard();
+        arm();
+        let (sx, sy, sz) = W3;
+        clear(sx, sy, sz);
+        clear(sx + 1, sy, sz);
+        put(DimId::Overworld, sx + 1, sy, sz, TEST_WATER);
+        let wheel = state_of("create:water_wheel", &[("axis", "x")]);
+        put(DimId::Overworld, sx, sy, sz, wheel);
+
+        let bytes = live_create_serialize().expect("armed runtime serializes");
+        let entries = live_create_decode_sidecar(&bytes).expect("sidecar decodes");
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0], (pos_of(W3), wheel));
+
+        // Rebuild into a fresh runtime and confirm the graph re-solves.
+        live_create_with(|rt| rt.load_entries(entries.clone()));
+        live_create_with(|rt| {
+            let sol = rt
+                .factory
+                .kinetic_solution(pos_of(W3))
+                .expect("wheel restored");
+            assert!(sol.speed.abs() > 1e-6);
+            assert_eq!(rt.placed.get(&pos_of(W3)), Some(&wheel));
+        });
+
+        // Fail-closed: corrupt magic, checksum, truncation, trailing bytes.
+        let mut bad = bytes.clone();
+        bad[0] = b'X';
+        assert!(live_create_decode_sidecar(&bad).is_err());
+        let mut bad = bytes.clone();
+        let n = bad.len();
+        bad[n - 1] ^= 0xff;
+        assert!(live_create_decode_sidecar(&bad).is_err());
+        assert!(live_create_decode_sidecar(&bytes[..bytes.len() - 2]).is_err());
+        let mut bad = bytes.clone();
+        bad.push(0);
+        assert!(live_create_decode_sidecar(&bad).is_err());
+        // A state id not in the registry must not decode.
+        let mut bogus = Vec::new();
+        bogus.extend_from_slice(LIVE_CREATE_SIDECAR_MAGIC);
+        write_varint(&mut bogus, 1);
+        bogus.extend_from_slice(&0i32.to_be_bytes());
+        bogus.extend_from_slice(&0i32.to_be_bytes());
+        bogus.extend_from_slice(&0i32.to_be_bytes());
+        bogus.extend_from_slice(&0i32.to_be_bytes());
+        write_str(&mut bogus, "create:not_a_block[axis=x]");
+        let sum = live_create_fnv32(&bogus);
+        bogus.extend_from_slice(&sum.to_be_bytes());
+        assert!(live_create_decode_sidecar(&bogus).is_err());
+
+        clear(sx, sy, sz);
+        clear(sx + 1, sy, sz);
+    }
+
+    #[test]
+    fn create_join_snapshot_and_tick_frame_shape() {
+        let _g = world_guard();
+        arm();
+        let (wx, wy, wz) = W4;
+        clear(wx, wy, wz);
+        clear(wx + 1, wy, wz);
+        clear(wx + 2, wy, wz);
+        put(DimId::Overworld, wx + 1, wy, wz, TEST_WATER);
+        let wheel = state_of("create:water_wheel", &[("axis", "x")]);
+        put(DimId::Overworld, wx, wy, wz, wheel);
+        let shaft = state_of("create:shaft", &[("axis", "x")]);
+        put(DimId::Overworld, wx + 2, wy, wz, shaft);
+
+        // The join packet: a real socket pair carries the exact S2C frame —
+        // packet id 0x19, channel create:kinetic_sync_v1, batch payload.
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let mut send = std::net::TcpStream::connect(addr).unwrap();
+        live_create_sync_on_join(&mut send);
+        drop(send);
+        let (mut recv, _) = listener.accept().unwrap();
+        use std::io::Read;
+        let mut buf = Vec::new();
+        recv.read_to_end(&mut buf).unwrap();
+        assert!(!buf.is_empty(), "join snapshot emitted");
+        let mut frame: &[u8] = &buf;
+        // Outer packet length varint, then packet id 0x19.
+        let plen = read_varint(&mut frame).expect("frame len") as usize;
+        assert_eq!(frame.len(), plen);
+        let id = read_varint(&mut frame).expect("packet id");
+        assert_eq!(id, LIVE_MOD_S2C_CUSTOM_PAYLOAD_ID);
+        let chan_len = read_varint(&mut frame).expect("channel len") as usize;
+        let channel = std::str::from_utf8(&frame[..chan_len]).unwrap();
+        assert_eq!(
+            channel,
+            create_adapter::neoforge_wire::CHANNEL_CREATE_KINETIC_SYNC
+        );
+        let tags =
+            create_adapter::neoforge_wire::decode_kinetic_update_batch(&frame[chan_len..])
+                .expect("snapshot decodes");
+        assert!(tags.iter().any(|t| t.pos == pos_of(W4)));
+
+        for c in [(wx, wy, wz), (wx + 1, wy, wz), (wx + 2, wy, wz)] {
+            clear(c.0, c.1, c.2);
+        }
+    }
+
+    #[test]
+    fn create_disabled_gate_is_inert() {
+        let _g = world_guard();
+        LIVE_CREATE_TEST_GATE.store(2, Ordering::Relaxed);
+        assert!(!live_create_enabled());
+        assert!(live_create_resolve_item("create:shaft").is_none());
+        assert_eq!(live_create_item_name(LIVE_CREATE_ITEM_BASE), None);
+        assert!(live_create_serialize().is_none());
+        // on_block_set with a create state id is a no-op while disabled.
+        live_create_on_block_set(DimId::Overworld, W5.0, W5.1, W5.2, 0, 26_684);
+        live_create_with(|_rt| panic!("runtime must not arm while disabled"));
+        // Restoring the gate for later tests.
+        LIVE_CREATE_TEST_GATE.store(1, Ordering::Relaxed);
+    }
+
+    /// `breg()`-dependent coverage: only meaningful when the vanilla assets
+    /// are checked out (the `megu_vanilla_data` cfg). With the test gate on,
+    /// the extension ran at `BReg::load` whenever it initialized — assert
+    /// the Create block table answers through the vanilla accessors.
+    #[test]
+    #[cfg(megu_vanilla_data)]
+    fn create_breg_extension_resolves_states() {
+        let _g = world_guard();
+        arm();
+        let Some(reg) = breg() else {
+            return;
+        };
+        let Some(_create) = reg.create_registry() else {
+            // BReg loaded before the test gate armed the env flag; the
+            // extension is env-gated at load time — nothing to assert here.
+            return;
+        };
+        let shaft = reg.state_of("create:shaft", None);
+        assert!(shaft >= create_adapter::blockstates::DEFAULT_BASE_STATE_ID);
+        assert_eq!(reg.name_of(shaft), "create:shaft");
+        let rotated = reg.with_prop(shaft, "axis", "y");
+        assert_eq!(
+            reg.get_prop(rotated, "axis").as_deref(),
+            Some("y")
+        );
+        assert_eq!(
+            reg.canonical_state(rotated),
+            "create:shaft[axis=y,waterlogged=false]"
+        );
+        assert!(reg.is_solid_render(shaft));
+        assert!(!reg.is_air(shaft));
+        assert!(!reg.is_replaceable(shaft));
+        // Vanilla states are untouched by the extension.
+        assert_eq!(reg.name_of(0), "minecraft:air");
+    }
 }

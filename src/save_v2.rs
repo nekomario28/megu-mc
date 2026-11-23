@@ -1823,6 +1823,9 @@ fn save_world_guarded(
 struct WorldSaveSnapshot {
     overworld: Vec<u8>,
     companions: [(DimId, Option<Vec<u8>>); 2],
+    /// `create_factory.bin` bytes when the live Create runtime is armed
+    /// (`mod-suite`); `None` in every other build — no file is touched then.
+    create_factory: Option<Vec<u8>>,
 }
 
 impl WorldSaveSnapshot {
@@ -1837,6 +1840,7 @@ impl WorldSaveSnapshot {
         Self {
             overworld,
             companions,
+            create_factory: live_create_serialize(),
         }
     }
 
@@ -1856,7 +1860,15 @@ impl WorldSaveSnapshot {
                 None => remove_world_save(&path),
             }
         });
-        results.into_iter().collect()
+        for result in results {
+            result?;
+        }
+        // The Create kinetic sidecar lands after every dimension overlay so a
+        // reader always sees a consistent factory for the newest world.
+        if let Some(bytes) = self.create_factory {
+            write_world_file(&dir.join("create_factory.bin"), &bytes, interval)?;
+        }
+        Ok(())
     }
 }
 
@@ -4085,6 +4097,10 @@ fn load_world_in(dir: &std::path::Path) -> Result<(), &'static str> {
     for dim in [DimId::Nether, DimId::End] {
         load_dim_overlay_file(dir, dim)?;
     }
+    // Create sidecar last: the overlay writes already landed, so the
+    // rebuild's adjacent-water check sees the restored world. A corrupt
+    // `create_factory.bin` fails the whole load (fail-closed).
+    live_create_load_sidecar(dir)?;
     Ok(())
 }
 

@@ -9871,6 +9871,7 @@ fn set_block_if_inner_dim(
     live_block_changed(dim, RsPos(x, y, z), old, st);
     #[cfg(feature = "create-offload")]
     create_block_changed(dim, x, y, z, old, st);
+    live_create_on_block_set(dim, x, y, z, old, st);
     note_world_persist_dirty();
     dwal_note_block_set(dim, x, y, z, st);
     true
@@ -10007,6 +10008,7 @@ fn set_block_if_dim_edit(
     register_dim_scheduled(dim, x, y, z, st);
     #[cfg(feature = "create-offload")]
     create_block_changed(dim, x, y, z, old, st);
+    live_create_on_block_set(dim, x, y, z, old, st);
     note_world_persist_dirty();
     dwal_note_block_set(dim, x, y, z, st);
     true
@@ -10660,6 +10662,7 @@ fn set_blocks_bulk_dim(dim: DimId, edits: &[(i32, i32, i32, u32)]) -> usize {
             live_block_changed(dim, RsPos(x, y, z), old, st);
             #[cfg(feature = "create-offload")]
             create_block_changed(dim, x, y, z, old, st);
+            live_create_on_block_set(dim, x, y, z, old, st);
             if let Some(reg) = reg {
                 if reg.name_of(old) != reg.name_of(st) {
                     // Identity change — the same metadata rule the per-block
@@ -11938,6 +11941,10 @@ fn try_live_block_placement(
     _against: u32,
 ) -> bool {
     let Some(reg) = breg() else { return false };
+    #[cfg(feature = "mod-suite")]
+    if live_create_item_name(item).is_some() {
+        return live_create_block_place(c, (dim, x, y, z), face, held, item);
+    }
     let Some(item_name) = item_to_name(item) else { return false };
     if placement_block_name(item_name, face as u8).is_none() {
         return false;
@@ -18836,6 +18843,7 @@ fn game_tick(mut step: impl FnMut(&'static str, fn())) {
     #[cfg(feature = "create-offload")]
     run("mod_offload", mod_offload_tick);
     run("live_mods", live_mod_tick);
+    run("live_create", live_create_tick);
     run("gamerules", gamerule_watch_tick);
     let wire_us = wire_tick_start.elapsed().as_micros().min(u128::from(u32::MAX)) as u32;
     // Vanilla `MinecraftServer.pushTickTimeMetric`: the finished tick's cost is
@@ -22648,6 +22656,7 @@ mod ultra_disk_5_tests {
         let snapshot_of = |tag: u8| WorldSaveSnapshot {
             overworld: vec![tag; 64],
             companions: [(DimId::Nether, None), (DimId::End, None)],
+            create_factory: None,
         };
         let count_baks = |dir: &std::path::Path| {
             std::fs::read_dir(dir).map(|rd| rd.count()).unwrap_or(0)

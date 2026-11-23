@@ -12,10 +12,19 @@ pub use mod_adapter_core::neoforge_wire::{
 
 use crate::factory::{DimBlockPos, KineticUpdateTag};
 
+/// Canonical live-sync channel for Create kinetic deltas. The live server
+/// (`src/live_mod_bridge.rs`) sends these as Play S2C `0x19` custom payloads:
+/// `write_str("create:kinetic_sync_v1")` followed by the batch below.
 pub const CHANNEL_CREATE_KINETIC_SYNC: &str = "create:kinetic_sync_v1";
 
 /// Encode a batch of changed [`KineticUpdateTag`] deltas into a compact binary
 /// custom-payload body suitable for Play `0x19` broadcast to tracked observers.
+///
+/// Wire layout: a VarInt tag count, then 29 bytes per record —
+/// `i32be dim | i32be x | i32be y | i32be z | f32be speed_rpm |
+/// f32be stress_capacity | f32be stress_load | u8 overstressed (0|1)`.
+/// [`decode_kinetic_update_batch`] is the exact inverse and rejects malformed
+/// tails (count > 4096, truncation, non-boolean flag, trailing bytes).
 pub fn encode_kinetic_update_batch(tags: &[KineticUpdateTag]) -> Vec<u8> {
     let mut out = Vec::with_capacity(4 + tags.len() * 29);
     write_varint(&mut out, tags.len() as u32);

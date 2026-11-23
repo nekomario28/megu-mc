@@ -13,6 +13,92 @@ use std::hash::{BuildHasherDefault, Hasher};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
+/// Item-id base for the `create:*` BlockItem/wrench table. Owned here so
+/// `block_registry` never depends upward on `main` / `live_mod_bridge`.
+#[cfg(feature = "mod-suite")]
+pub(crate) const LIVE_CREATE_ITEM_BASE: i64 = 1_000_000;
+
+/// Test override for [`live_create_enabled`]: 0 = follow the environment,
+/// 1 = force on, 2 = force off. Compiled into test builds only.
+#[cfg(all(test, feature = "mod-suite"))]
+pub(crate) static LIVE_CREATE_TEST_GATE: std::sync::atomic::AtomicU8 =
+    std::sync::atomic::AtomicU8::new(0);
+
+/// Whether the Create adapter is armed for this process: `MEGU_ENABLE_CREATE`
+/// truthy, or `MEGU_MODS_DIR` holding a `*.jar` whose filename mentions
+/// "create". Evaluated once — the runtime decision must not drift mid-run.
+#[cfg(feature = "mod-suite")]
+pub(crate) fn live_create_enabled() -> bool {
+    #[cfg(test)]
+    match LIVE_CREATE_TEST_GATE.load(Ordering::Relaxed) {
+        1 => return true,
+        2 => return false,
+        _ => {}
+    }
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        let flag = std::env::var("MEGU_ENABLE_CREATE")
+            .map(|v| {
+                matches!(
+                    v.trim().to_ascii_lowercase().as_str(),
+                    "1" | "true" | "yes" | "on"
+                )
+            })
+            .unwrap_or(false);
+        if flag {
+            return true;
+        }
+        let Some(dir) = std::env::var_os("MEGU_MODS_DIR") else {
+            return false;
+        };
+        let Ok(rd) = std::fs::read_dir(dir) else {
+            return false;
+        };
+        rd.filter_map(|e| e.ok())
+            .filter_map(|e| e.file_name().into_string().ok())
+            .any(|n| {
+                n.len() > 4
+                    && n[n.len() - 4..].eq_ignore_ascii_case(".jar")
+                    && n.to_ascii_lowercase().contains("create")
+            })
+    })
+}
+
+/// The `create:*` item table: `(item_name, Option<block_id>)` sorted by name
+/// so item ids are deterministic across runs. `None` marks the wrench —
+/// an item with no corresponding block.
+#[cfg(feature = "mod-suite")]
+pub(crate) fn live_create_item_table() -> &'static [(String, Option<String>)] {
+    static TABLE: std::sync::OnceLock<Vec<(String, Option<String>)>> = std::sync::OnceLock::new();
+    TABLE.get_or_init(|| {
+        let mut items: Vec<(String, Option<String>)> =
+            create_adapter::blockstates::core_create_block_defs()
+                .into_iter()
+                .map(|def| {
+                    let id = def.id.clone();
+                    (id.clone(), Some(id))
+                })
+                .collect();
+        items.push((
+            "create:belt".to_string(),
+            Some("create:mechanical_belt".to_string()),
+        ));
+        items.push(("create:wrench".to_string(), None));
+        items.sort();
+        items
+    })
+}
+
+/// Item id a block drop resolves to for `BReg::block_drop`; `-1` = no drop.
+#[cfg(feature = "mod-suite")]
+pub(crate) fn live_create_block_item_id(block_id: &str) -> i64 {
+    live_create_item_table()
+        .iter()
+        .position(|(n, _)| n == block_id)
+        .map(|i| LIVE_CREATE_ITEM_BASE + i as i64)
+        .unwrap_or(-1)
+}
+
 // ---------- version-pack asset paths ----------
 //
 // One block-registry pack exists per Minecraft version: the bundled 1.21.1
@@ -281,6 +367,12 @@ pub(crate) struct BReg {
     multiface: Box<[u8]>,
     /// The pack's `template_solid` bytes.
     template_solid: Box<[u8]>,
+    /// Dynamic mod blockstate extension (`mod-suite`): Create's dynamic
+    /// registry is appended after the vanilla states so `state_of("create:x")`,
+    /// `name_of`, `with_prop`, `canonical_state` and friends all answer for
+    /// ids >= `DEFAULT_BASE_STATE_ID` through the same dense columns.
+    #[cfg(feature = "mod-suite")]
+    create_reg: Option<create_adapter::blockstates::CreateBlockRegistry>,
 }
 
 /// Slots in the `in_tag` name-resolution memo. Tag names at call sites are
@@ -455,6 +547,8 @@ impl BReg {
             mineshaft,
             multiface,
             template_solid,
+            #[cfg(feature = "mod-suite")]
+            create_reg: None,
         };
         // Copy the pinned per-state fact bytes into dense tables once, so the
         // hot predicates below are a single indexed load rather than a slice
@@ -721,7 +815,95 @@ impl BReg {
             reg.tag_bits.push(bits);
         }
         reg.tag_ids = tag_ids;
+        #[cfg(feature = "mod-suite")]
+        reg.extend_mod_blocks();
         Some(reg)
+    }
+    /// Dynamic mod blockstate extension (`mod-suite`): when Create is armed
+    /// (`MEGU_ENABLE_CREATE=1` or a `create` JAR under `MEGU_MODS_DIR`), the
+    /// adapter's `core_create_registry` table is appended after the vanilla
+    /// states at `DEFAULT_BASE_STATE_ID`, so `state_of("create:shaft")`,
+    /// `name_of`, `with_prop`, `properties_of`, `canonical_state`,
+    /// `is_solid_render`, drops, and hardness all answer through the same
+    /// dense columns as vanilla ids — chunk-section palettes and the `0x09`
+    /// block-update varints then carry mod states naturally.
+    #[cfg(feature = "mod-suite")]
+    fn extend_mod_blocks(&mut self) {
+        if !live_create_enabled() {
+            return;
+        }
+        let create = create_adapter::blockstates::core_create_registry(
+            create_adapter::blockstates::DEFAULT_BASE_STATE_ID,
+        );
+        let base = create.base_state_id() as usize;
+        if self.st_blk.len() > base {
+            // A vanilla table that already reaches into the mod range would
+            // collide; refuse rather than corrupting both id spaces.
+            return;
+        }
+        let need = base + create.state_count();
+        self.st_blk.resize(need, 0);
+        self.st_fl.resize(need, 0);
+        self.hardness.resize(need, 0.6);
+        self.drops.resize(need, -1);
+        self.drops_second.resize(need, -1);
+        self.stack_size.resize(need, 64);
+        self.col_range.resize(need, (0, 0));
+        self.pred.resize(need, 0);
+        self.light.resize(need, 0);
+        self.postproc.resize(need, 0);
+        self.faces.resize(need, 0);
+        let pred = FACT_BLOCKS_MOTION | FACT_SOLID_RENDER | FACT_FLUID_EMPTY
+            | FACT_COLLISION_EMPTY;
+        for (ci, def) in create.blocks().iter().enumerate() {
+            let bi = self.bname.len() as u32;
+            self.idx.insert(def.id.clone(), bi);
+            self.bname.push(def.id.clone());
+            self.props.push(
+                def.properties
+                    .iter()
+                    .map(|p| Prop {
+                        name: p.name.clone(),
+                        vals: p.values.clone(),
+                    })
+                    .collect::<Vec<_>>()
+                    .into_boxed_slice(),
+            );
+            let first = create.default_state(&def.id).unwrap_or(0);
+            self.dfl.push(first);
+            self.st_lo.push(first);
+            let mut n = 0u32;
+            for entry in create.states().iter().filter(|e| e.block_index == ci) {
+                let st = entry.state_id as usize;
+                self.st_blk[st] = bi;
+                self.hardness[st] = 1.0;
+                self.drops[st] = live_create_block_item_id(&def.id);
+                self.stack_size[st] = 64;
+                self.pred[st] = pred;
+                n += 1;
+            }
+            self.n_states.push(n);
+            self.htools.push(Vec::new());
+            self.tool_kind.push(2); // pickaxe family
+            self.behaviour.push(B_NONE);
+        }
+        self.create_reg = Some(create);
+    }
+    /// The armed Create registry, when the mod-suite extension ran.
+    #[cfg(feature = "mod-suite")]
+    #[allow(dead_code)]
+    pub(crate) fn create_registry(
+        &self,
+    ) -> Option<&create_adapter::blockstates::CreateBlockRegistry> {
+        self.create_reg.as_ref()
+    }
+    /// `true` for dynamically registered mod states (Create's range).
+    #[cfg(feature = "mod-suite")]
+    #[allow(dead_code)]
+    pub(crate) fn is_mod_state(&self, st: u32) -> bool {
+        self.create_reg
+            .as_ref()
+            .is_some_and(|r| r.state(st).is_some())
     }
     /// resolve (name, props) to a 1.21.1 state id
     pub(crate) fn state_of(&self, name: &str, props: Option<&J>) -> u32 {

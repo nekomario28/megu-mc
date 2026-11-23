@@ -9746,6 +9746,9 @@ fn handle_inner(mut s: TcpStream, live_eid: Arc<AtomicI32>) {
     // the play-phase 0x19 custom payload. No-op unless an operator manifest
     // validated at boot (default builds send nothing new).
     live_mod_sync_on_join(&mut s);
+    // Create (`mod-suite`): the current kinetic snapshot rides the same
+    // play-phase 0x19 channel so late joiners see spinning wheels/shafts.
+    live_create_sync_on_join(&mut s);
     if let Some(rp) = resource_pack_pkt() {
         let _ = send_packet(&mut s, 0x46, rp);
     }
@@ -11033,6 +11036,15 @@ fn handle_inner(mut s: TcpStream, live_eid: Arc<AtomicI32>) {
                 // `EndPortalFrameBlock.useItemOn`: an `ender_eye` on an eyeless
                 // frame sets its eye and tries the 5x5 ring activation.
                 if try_insert_ender_eye(&me, dim, x, y, z, clicked, held_slot, seq) {
+                    continue;
+                }
+                // `create:wrench` (`mod-suite`): right-clicking a tracked
+                // Create block cycles axis/facing and re-solves its kinetic
+                // network; the world write resyncs the blockstate.
+                #[cfg(feature = "mod-suite")]
+                if live_create_wrench_use(&me, dim, x, y, z, clicked, held_slot) {
+                    let mut socket = me.sock.lock().unwrap_or_else(|e| e.into_inner());
+                    let _ = send_packet(&mut socket, 0x05, ack(seq));
                     continue;
                 }
                 let place = |pos: BlockPos, state| {
