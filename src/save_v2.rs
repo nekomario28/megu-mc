@@ -2595,6 +2595,10 @@ fn save_world_into(f: &mut Vec<u8>) {
     // WBE1 tucks beneath WBD1: a registry with nothing in it emits not one
     // byte, so an untouched world keeps the exact pre-record tail.
     append_wbe_footer(f);
+    // BAR1/TEM1 tuck between WBE1 and MOF1: the operator registries emit
+    // nothing while empty, same default-only convention as WBE1.
+    append_bossbar_footer(f);
+    append_team_footer(f);
     // MOF1/AER1 tuck between WBE1 and WBD1: each is emitted only while its
     // mod bridge holds state, so an untouched vanilla save keeps the exact
     // pre-record tail byte-for-byte.
@@ -4171,6 +4175,9 @@ fn decode_world_payload(payload: &[u8]) -> Result<(), &'static str> {
     // MOF1/AER1 tuck between WBE1 and WBD1; footers strip last-written-first.
     let (payload, aer1) = read_mod_bridge_trailer(payload, AERONAUTICS_TRAILER_MAGIC)?;
     let (payload, mof1) = read_mod_bridge_trailer(payload, MOD_OFFLOAD_TRAILER_MAGIC)?;
+    // TEM1/BAR1 tuck between MOF1 and WBE1: strip them last-written-first.
+    let (payload, saved_teams) = read_team_footer(payload)?;
+    let (payload, saved_bossbars) = read_bossbar_footer(payload)?;
     let (payload, wbe_entries) = read_wbe_footer(payload)?;
     let (payload, sign_meta_records) = read_sign_meta_footer(payload)?;
     let (payload, dxt) = read_dxt_footer(payload)?;
@@ -5443,6 +5450,8 @@ fn decode_world_payload(payload: &[u8]) -> Result<(), &'static str> {
     *saved_raids().lock().unwrap_or_else(|e| e.into_inner()) = state.raids;
     *live_brewing_stands().lock().unwrap_or_else(|e| e.into_inner()) = brewing;
     restore_wbe_entries(wbe_entries);
+    restore_saved_bossbars(saved_bossbars);
+    restore_saved_teams(saved_teams);
     restore_saved_block_entities(block_entities);
     // The mod-bridge trailers apply last: their codecs validate the whole blob
     // before touching live state, and running them after the core world is
@@ -6104,6 +6113,231 @@ fn restore_wbe_entries(entries: Vec<(DimBlockPos, VanillaBlockEntity)>) {
     for (key, entity) in entries {
         registry.insert(key, entity);
     }
+}
+
+// ---------- gameplay registries (BAR1 / TEM1) ----------
+//
+// Custom bossbars and scoreboard teams live entirely in operator-created
+// registries; vanilla keeps both in the world's persistent data, so a restart
+// that forgets them strips every bar off its viewers and every member off its
+// team. Each footer is emitted only while its registry holds entries, keeping
+// an untouched world's tail byte-for-byte.
+
+const BOSSBAR_MAGIC: &[u8; 4] = b"BAR1";
+const TEAM_MAGIC: &[u8; 4] = b"TEM1";
+const GAMEPLAY_REGISTRY_SCHEMA: u8 = 1;
+const MAX_SAVED_BARS: usize = 4_096;
+const MAX_SAVED_TEAMS: usize = 4_096;
+const MAX_BAR_PLAYERS: usize = 65_536;
+const MAX_TEAM_MEMBERS: usize = 65_536;
+const MAX_REGISTRY_STR: usize = 8_192;
+
+fn write_registry_str(out: &mut Vec<u8>, value: &str) {
+    assert!(
+        value.len() <= MAX_REGISTRY_STR,
+        "bossbar/team string exceeds save bound"
+    );
+    out.extend_from_slice(&(value.len() as u16).to_be_bytes());
+    out.extend_from_slice(value.as_bytes());
+}
+
+fn read_registry_str(input: &mut SaveInput<'_>) -> Result<String, &'static str> {
+    let len = u16::from_be_bytes(input.take()?) as usize;
+    if len > MAX_REGISTRY_STR {
+        return Err("invalid registry string length");
+    }
+    std::str::from_utf8(input.bytes(len)?)
+        .map(str::to_owned)
+        .map_err(|_| "invalid registry string UTF-8")
+}
+
+fn append_bossbar_footer(out: &mut Vec<u8>) {
+    let bars = bossbars().lock().unwrap_or_else(|e| e.into_inner());
+    if bars.is_empty() {
+        return;
+    }
+    let mut ids: Vec<&String> = bars.keys().collect();
+    ids.sort();
+    let start = out.len();
+    out.push(GAMEPLAY_REGISTRY_SCHEMA);
+    write_varint(out, ids.len() as i64);
+    for id in ids {
+        let bar = &bars[id];
+        write_registry_str(out, id);
+        write_registry_str(out, &bar.name);
+        out.push(bar.color);
+        out.push(bar.style);
+        save_numbers!(out, bar.value, bar.max);
+        out.push(u8::from(bar.visible));
+        let mut uuids: Vec<&[u8; 16]> = bar.players.iter().collect();
+        uuids.sort();
+        write_varint(out, uuids.len() as i64);
+        for uuid in uuids {
+            out.extend_from_slice(uuid);
+        }
+    }
+    let size = (out.len() - start) as u64;
+    save_numbers!(out, size);
+    out.extend_from_slice(BOSSBAR_MAGIC);
+}
+
+fn read_bossbar_footer(
+    payload: &[u8],
+) -> Result<(&[u8], Vec<(String, Bossbar)>), &'static str> {
+    let (payload, body) = split_save_footer(payload, BOSSBAR_MAGIC)?;
+    let Some(body) = body else {
+        return Ok((payload, Vec::new()));
+    };
+    let mut input = SaveInput(body);
+    if input.byte()? != GAMEPLAY_REGISTRY_SCHEMA {
+        return Err("unsupported bossbar footer");
+    }
+    let count = input.var_count(4)?;
+    if count > MAX_SAVED_BARS {
+        return Err("invalid bossbar count");
+    }
+    let mut bars = Vec::with_capacity(count);
+    for _ in 0..count {
+        let id = read_registry_str(&mut input)?;
+        if id.is_empty() {
+            return Err("empty bossbar id");
+        }
+        let bar = Bossbar {
+            name: read_registry_str(&mut input)?,
+            color: input.byte()?,
+            style: input.byte()?,
+            value: i32::from_be_bytes(input.take()?),
+            max: i32::from_be_bytes(input.take()?),
+            visible: input.flag()?,
+            players: HashSet::new(),
+        };
+        if bar.max <= 0 {
+            return Err("invalid bossbar max");
+        }
+        let pcount = input.var_count(16)?;
+        if pcount > MAX_BAR_PLAYERS {
+            return Err("invalid bossbar player count");
+        }
+        let mut players = HashSet::with_capacity(pcount);
+        for _ in 0..pcount {
+            if !players.insert(input.take::<16>()?) {
+                return Err("duplicate bossbar player");
+            }
+        }
+        let bar = Bossbar { players, ..bar };
+        bars.push((id, bar));
+    }
+    if !input.0.is_empty() {
+        return Err("trailing bytes in bossbar footer");
+    }
+    Ok((payload, bars))
+}
+
+fn append_team_footer(out: &mut Vec<u8>) {
+    let reg = teams().lock().unwrap_or_else(|e| e.into_inner());
+    if reg.teams.is_empty() {
+        return;
+    }
+    let start = out.len();
+    out.push(GAMEPLAY_REGISTRY_SCHEMA);
+    write_varint(out, reg.teams.len() as i64);
+    // BTreeMap iterates sorted, keeping the save deterministic.
+    for (name, team) in &reg.teams {
+        write_registry_str(out, name);
+        write_registry_str(out, &team.display_name);
+        write_varint(out, team.color as i64);
+        out.push(team.friendly_flags());
+        write_registry_str(out, &team.nametag_visibility);
+        write_registry_str(out, &team.collision_rule);
+        write_registry_str(out, &team.prefix);
+        write_registry_str(out, &team.suffix);
+        write_varint(out, team.members.len() as i64);
+        for member in &team.members {
+            write_registry_str(out, member);
+        }
+    }
+    let size = (out.len() - start) as u64;
+    save_numbers!(out, size);
+    out.extend_from_slice(TEAM_MAGIC);
+}
+
+fn read_team_footer(payload: &[u8]) -> Result<(&[u8], TeamRegistry), &'static str> {
+    let (payload, body) = split_save_footer(payload, TEAM_MAGIC)?;
+    let Some(body) = body else {
+        return Ok((payload, TeamRegistry::default()));
+    };
+    let mut input = SaveInput(body);
+    if input.byte()? != GAMEPLAY_REGISTRY_SCHEMA {
+        return Err("unsupported team footer");
+    }
+    let count = input.var_count(4)?;
+    if count > MAX_SAVED_TEAMS {
+        return Err("invalid team count");
+    }
+    let mut reg = TeamRegistry::default();
+    for _ in 0..count {
+        let name = read_registry_str(&mut input)?;
+        if name.is_empty() {
+            return Err("empty team name");
+        }
+        let display_name = read_registry_str(&mut input)?;
+        let color = input.varint()?;
+        if !(0..=21).contains(&color) {
+            return Err("invalid team color");
+        }
+        let flags = input.byte()?;
+        if flags > 3 {
+            return Err("invalid team flags");
+        }
+        let nametag_visibility = read_registry_str(&mut input)?;
+        let collision_rule = read_registry_str(&mut input)?;
+        let prefix = read_registry_str(&mut input)?;
+        let suffix = read_registry_str(&mut input)?;
+        let mcount = input.var_count(3)?;
+        if mcount > MAX_TEAM_MEMBERS {
+            return Err("invalid team member count");
+        }
+        let mut members = BTreeSet::new();
+        for _ in 0..mcount {
+            let member = read_registry_str(&mut input)?;
+            if member.is_empty() || !members.insert(member.clone()) {
+                return Err("invalid or duplicate team member");
+            }
+            // Vanilla keeps a member on at most one team; a save claiming
+            // otherwise is corrupt rather than a tie to break.
+            if reg.member_team.insert(member, name.clone()).is_some() {
+                return Err("team member listed on two teams");
+            }
+        }
+        let team = Team {
+            name: name.clone(),
+            display_name,
+            color: color as i32,
+            friendly_fire: flags & 1 != 0,
+            see_friendly_invisibles: flags & 2 != 0,
+            nametag_visibility,
+            collision_rule,
+            prefix,
+            suffix,
+            members,
+        };
+        if reg.teams.insert(name, team).is_some() {
+            return Err("duplicate team name");
+        }
+    }
+    if !input.0.is_empty() {
+        return Err("trailing bytes in team footer");
+    }
+    Ok((payload, reg))
+}
+
+fn restore_saved_bossbars(entries: Vec<(String, Bossbar)>) {
+    *bossbars().lock().unwrap_or_else(|e| e.into_inner()) =
+        entries.into_iter().collect();
+}
+
+fn restore_saved_teams(reg: TeamRegistry) {
+    *teams().lock().unwrap_or_else(|e| e.into_inner()) = reg;
 }
 
 // ---------- mod-bridge trailers (MOF1 / AER1) ----------
@@ -8326,6 +8560,126 @@ mod fix_save_tests {
         padded.extend_from_slice(&((body_len + 1) as u64).to_be_bytes());
         padded.extend_from_slice(WBE_MAGIC);
         assert!(read_wbe_footer(&padded).is_err(), "trailing bytes in body");
+    }
+
+    #[test]
+    fn save_bossbar_footer_round_trips_and_rejects_corruption() {
+        if test_support::isolated_world_test() {
+            return;
+        }
+        let _guard = world_guard();
+        bossbars().lock().unwrap_or_else(|e| e.into_inner()).clear();
+        {
+            let mut bars = bossbars().lock().unwrap_or_else(|e| e.into_inner());
+            bars.insert(
+                "raid:alarm".to_string(),
+                Bossbar {
+                    name: "{\"text\":\"Raid!\"}".to_string(),
+                    color: 4,
+                    style: 2,
+                    value: 37,
+                    max: 100,
+                    visible: true,
+                    players: [[9u8; 16], [7u8; 16]].into_iter().collect(),
+                },
+            );
+            bars.insert(
+                "empty:bar".to_string(),
+                Bossbar {
+                    name: "quiet".to_string(),
+                    color: 0,
+                    style: 0,
+                    value: 0,
+                    max: 20,
+                    visible: false,
+                    players: HashSet::new(),
+                },
+            );
+        }
+        let mut out = b"payload".to_vec();
+        append_bossbar_footer(&mut out);
+        assert!(out.ends_with(BOSSBAR_MAGIC));
+        let (rest, entries) = read_bossbar_footer(&out).unwrap();
+        assert_eq!(rest, b"payload");
+        assert_eq!(entries.len(), 2);
+        let raid = entries.iter().find(|(id, _)| id == "raid:alarm").map(|(_, b)| b).unwrap();
+        assert_eq!(raid.name, "{\"text\":\"Raid!\"}");
+        assert_eq!((raid.color, raid.style, raid.value, raid.max), (4, 2, 37, 100));
+        assert!(raid.visible);
+        assert_eq!(raid.players.len(), 2);
+        assert!(raid.players.contains(&[9u8; 16]) && raid.players.contains(&[7u8; 16]));
+        let quiet = entries.iter().find(|(id, _)| id == "empty:bar").map(|(_, b)| b).unwrap();
+        assert!(!quiet.visible && quiet.players.is_empty());
+        bossbars().lock().unwrap_or_else(|e| e.into_inner()).clear();
+        // Corruption: a zero max is rejected (progress() divides by it).
+        let mut corrupt = out.clone();
+        let max_pos = corrupt.windows(4).position(|w| w == 100i32.to_be_bytes()).unwrap();
+        corrupt[max_pos..max_pos + 4].copy_from_slice(&0i32.to_be_bytes());
+        assert!(read_bossbar_footer(&corrupt).is_err(), "zero bossbar max");
+    }
+
+    #[test]
+    fn save_team_footer_round_trips_members_and_index() {
+        if test_support::isolated_world_test() {
+            return;
+        }
+        let _guard = world_guard();
+        {
+            let mut reg = teams().lock().unwrap_or_else(|e| e.into_inner());
+            *reg = TeamRegistry::default();
+            reg.add("red", Some("Red Team")).unwrap();
+            let team = reg.teams.get_mut("red").unwrap();
+            team.color = 14;
+            team.friendly_fire = false;
+            team.see_friendly_invisibles = true;
+            team.prefix = "[R]".to_string();
+            team.suffix = "!".to_string();
+            team.nametag_visibility = "hideForOtherTeams".to_string();
+            team.collision_rule = "pushOtherTeams".to_string();
+            drop(team);
+            reg.join("red", "alice").unwrap();
+            reg.join("red", "bob").unwrap();
+        }
+        let mut out = Vec::new();
+        append_team_footer(&mut out);
+        assert!(out.ends_with(TEAM_MAGIC));
+        let (rest, reg) = read_team_footer(&out).unwrap();
+        assert!(rest.is_empty());
+        let team = reg.get("red").unwrap();
+        assert_eq!(team.display_name, "Red Team");
+        assert_eq!(team.color, 14);
+        assert!(!team.friendly_fire && team.see_friendly_invisibles);
+        assert_eq!(team.prefix, "[R]");
+        assert_eq!(team.suffix, "!");
+        assert_eq!(team.nametag_visibility, "hideForOtherTeams");
+        assert_eq!(team.collision_rule, "pushOtherTeams");
+        assert_eq!(team.members.iter().cloned().collect::<Vec<_>>(), ["alice", "bob"]);
+        // The reverse index is rebuilt, so team_of/leave work post-load.
+        assert_eq!(reg.team_of("alice"), Some("red"));
+        assert_eq!(reg.team_of("carol"), None);
+        // A member appearing twice in one team's list is corruption and
+        // fails closed rather than silently deduping.
+        let mut one_team_dup = Vec::new();
+        one_team_dup.push(GAMEPLAY_REGISTRY_SCHEMA);
+        write_varint(&mut one_team_dup, 1);
+        write_registry_str(&mut one_team_dup, "t");
+        write_registry_str(&mut one_team_dup, "t");
+        write_varint(&mut one_team_dup, 21);
+        one_team_dup.push(0);
+        write_registry_str(&mut one_team_dup, "always");
+        write_registry_str(&mut one_team_dup, "always");
+        write_registry_str(&mut one_team_dup, "");
+        write_registry_str(&mut one_team_dup, "");
+        write_varint(&mut one_team_dup, 2);
+        write_registry_str(&mut one_team_dup, "m");
+        write_registry_str(&mut one_team_dup, "m");
+        let mut framed = Vec::new();
+        framed.extend_from_slice(&one_team_dup);
+        framed.extend_from_slice(&(one_team_dup.len() as u64).to_be_bytes());
+        framed.extend_from_slice(TEAM_MAGIC);
+        assert!(read_team_footer(&framed).is_err(), "duplicate member in team");
+        teams().lock().unwrap_or_else(|e| e.into_inner()).teams.clear();
+        teams().lock().unwrap_or_else(|e| e.into_inner()).member_team.clear();
     }
 
     #[test]
