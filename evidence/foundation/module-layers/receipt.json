@@ -30,7 +30,7 @@
     "tests/verify.sh": "dc5d2f2dba686c928e8d470a3f436b3a1bdb5d6f994ae4b29ca912e6152288bf",
     "tools/check_layers.py": "8ff2decd5b6d0a3bd43920f221e4569467cfcb56a8e885c35c8bb3e34e5a120b",
     "tools/layers_check.sh": "fc9a8759ee822c231d43462f4855029517383e3e20b433ce31fe0a984d9055b4",
-    "tools/rust_module_graph.py": "bf445e343f4f4460017f2ed46a3f0307b5e6d6d7591e93b7b86ee5bb446262b0"
+    "tools/rust_module_graph.py": "9a86f7ff9deb817895ad8ec2956e7144d91edf54fd443cdd7e9c7706f373df3c"
   },
   "rustc": "rustc 1.98.1 (48a229cea 2026-09-01)",
   "analysis": {

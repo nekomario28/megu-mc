@@ -59,12 +59,12 @@
   "recorded_at": "2026-10-26T01:12:56.079091+00:00",
   "reference": {
     "basis": "actual dzp$g conditions; actual SurfaceSystem.buildSurface on a filled ProtoChunk with a stone-depth rule; no server/world/Unsafe.",
-    "condition_oracle_sha256": "a96a50985ba047c75d5f182c5b6bfa8620e2b45d8e724d04c9f894400223d513",
+    "condition_oracle_sha256": "d867b386c9395e07775519f3e5fe0c4443e485a4d9ff43bb20a4087476b7154d",
     "condition_rows": 4037,
     "minecraft": "1.21.1",
     "scan_columns": 768,
     "scan_gold_cells": 1536,
-    "scan_oracle_sha256": "393637ca1f8960609a674bf5bc7949b7c830bde429525646bed47362a8ab8251",
+    "scan_oracle_sha256": "baa6f1a3d7fa9a1e35adb4b89a1d8b4ade683b0fc651a922c6b774da846380f3",
     "server_sha1": "59353fb40c36d304f2035d51e7d6e6baa98dc05c",
     "surface_decode_cases": 97
   },
@@ -158,10 +158,10 @@
     "tests/verify.sh": "f63ead3c9b41dd8b8f99125046beb047604a3bdc7d1510e319306a79143b0994",
     "tools/README.md": "1cd6be09b80e936bbaf41537ff813273b83826c7ea4f2c7e9997d965562747af",
     "tools/mutation_check.sh": "89b8265112d5082e656133253586ade5c54886424a05a60b33e972ec7133af05",
-    "tools/surface-context-oracle/BuildSurfaceScanOracle.java": "393637ca1f8960609a674bf5bc7949b7c830bde429525646bed47362a8ab8251",
-    "tools/surface-context-oracle/SurfaceConditionOracle.java": "a96a50985ba047c75d5f182c5b6bfa8620e2b45d8e724d04c9f894400223d513",
-    "tools/surface_condition_oracle.py": "b428f3e473beb4571179ac3120622db299b47204d221243ace59a9e0d5c12cf5",
-    "tools/surface_oracle.py": "4a8e8b02c166f58f4e5a2f25550ab7959cc197bc989f776151d3f917172b1130",
-    "tools/surface_scan_oracle.py": "d26d5cc381429b1d84d02ff372845158fdf357cb5ba47302d90a317efe968b15"
+    "tools/surface-context-oracle/BuildSurfaceScanOracle.java": "baa6f1a3d7fa9a1e35adb4b89a1d8b4ade683b0fc651a922c6b774da846380f3",
+    "tools/surface-context-oracle/SurfaceConditionOracle.java": "d867b386c9395e07775519f3e5fe0c4443e485a4d9ff43bb20a4087476b7154d",
+    "tools/surface_condition_oracle.py": "f988bfdd50b659dba52758d7e31d58df94e0ccefc749e52e0af57b277d06db04",
+    "tools/surface_oracle.py": "82f3bc0ffebd92c62ebce9e5d0b0a98b174f255a9842a0b7acde28cf1298f416",
+    "tools/surface_scan_oracle.py": "5f82fd0a8278e1769511c4402db8e79d92041fb7bb5a482df95f37a92e991c7c"
   }
 }

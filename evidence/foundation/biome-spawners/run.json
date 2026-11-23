@@ -66,7 +66,7 @@
     "fixture_sha256": "e45d4d256d4e76a49dda96a4ed6f7ee52d3b13a76eefe786c7f29c0ad7e57c67",
     "inner_game_sha256": "c301de10f575027d13eac18c7f34409d60648cf56a35d566aa1f530ff617840a",
     "minecraft": "1.21.1",
-    "oracle_sha256": "fe14687fe0d001ef37ebd1abcd47aa7c58c816405376741d03226fdf8bf20ff5",
+    "oracle_sha256": "e253caf8f18dd61018e715e08a426feeb7b010a32d6cf06588d049bed59f5cb1",
     "server_sha1": "59353fb40c36d304f2035d51e7d6e6baa98dc05c",
     "spawn_costs": 5,
     "spawner_entries": 746
@@ -154,8 +154,8 @@
     "tests/biome_spawn_oracle_test.py": "b27cdc4ce81054fea898effbb8d3482af4a0e565401aac1ecbaf43d0ce1e6b07",
     "tests/verify.sh": "872ff516d4a00df674de1d5df8fb28183145c9be4c10e44adff9f1475661559e",
     "tools/README.md": "d62afd42b82c67fc98f1aa8d37846304b10b3651c84726cb29543c99f6eb1da4",
-    "tools/biome-spawn-oracle/BiomeSpawnOracle.java": "fe14687fe0d001ef37ebd1abcd47aa7c58c816405376741d03226fdf8bf20ff5",
-    "tools/biome_spawn_oracle.py": "b87b499dcda2a56509ed59d485590cab0fea8e9ce330bbeaa850100314ea045c",
+    "tools/biome-spawn-oracle/BiomeSpawnOracle.java": "e253caf8f18dd61018e715e08a426feeb7b010a32d6cf06588d049bed59f5cb1",
+    "tools/biome_spawn_oracle.py": "d964aacbc14f09e06cdaeb287a8a8c095de8553edfea12fe6ceaf75cd8d9eaa9",
     "tools/mutation_check.sh": "79968bf47d721d303df71e4f7fe8344a48a21f4762f5d6b7944cf015dfa85b7f"
   }
 }

@@ -90,7 +90,7 @@
   "native_container_cases": 82,
   "native_inventory_cases": 49,
   "native_repeat": "both complete fixtures equal; see repeat.txt",
-  "oracle_sha256": "996e01ce497db82e3b4abecd26415e1b7250a50c5383c220cad1aed7e76e6e62",
+  "oracle_sha256": "9b5ee897dc6682a094c6e53026e01dcc1b4db056276268c20fec1076d0eeb5d9",
   "production_tick": {
     "failed": 0,
     "ignored": 0,
@@ -121,8 +121,8 @@
     "src/tick_tests.rs": "89420b8407f5ae16cae7b62a87cf1884bcd1042017f61c7c68eb8de5e986f8c2",
     "tests/container_oracle_test.py": "1e3e88920a09afcbd475beb6af2fec494168cb8a64362f371d2ff53236f0cab6",
     "tests/gate_scripts.py": "35c57181a6eab12d5866adcb6c68191b5f6025a129639f642b32d38c02af2dcc",
-    "tools/container-oracle/ContainerOracle.java": "996e01ce497db82e3b4abecd26415e1b7250a50c5383c220cad1aed7e76e6e62",
-    "tools/container_oracle.py": "521e04a44f58893285dd46f7af7d4888f0befc33aea5e3c4d0485297df40411d",
+    "tools/container-oracle/ContainerOracle.java": "9b5ee897dc6682a094c6e53026e01dcc1b4db056276268c20fec1076d0eeb5d9",
+    "tools/container_oracle.py": "8e1350aeb7833f1496ea66c6009ecb6a1f39641006cb300f0c405d12802aa1ca",
     "tools/inventory_oracle.py": "20a066bb6d7006afa15b91cf1dca11c548a83dd1ca5ea1d95e624b0482a9bc47",
     "tools/mutation_check.sh": "1f2a377713934bb55f057b2cebe9d9cbdea33c5521e813c4c15b48e917b47db5",
     "tools/vanilla_java.py": "7c960b97895dc7031aa628c11ebb26cd648cb0a170d9686c282e032514247d89"

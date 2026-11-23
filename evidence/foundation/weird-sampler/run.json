@@ -90,7 +90,7 @@
     "fixture_sha256": "ba61b625cefdc163b46b7fb8a43f4e8c9d51d4766a670f2bcdc57d12af5444bd",
     "inner_game_sha256": "c301de10f575027d13eac18c7f34409d60648cf56a35d566aa1f530ff617840a",
     "mapper_cases": 38,
-    "oracle_sha256": "afb97e062e222b55f737e4497fe23a2146493afe47acb171afbe99acfe820015",
+    "oracle_sha256": "253f77e795ede33315274796aff2ccc1414c40e97de9c4d8961af9611fa980a2",
     "sample_cases": 216,
     "server_sha1": "59353fb40c36d304f2035d51e7d6e6baa98dc05c"
   },
@@ -213,8 +213,8 @@
     "tools/mutation_check.sh": "74d6456775af7d1548c4d5ed18178424dabc2f5be3fd0d48c30363299c6b244b",
     "tools/suite_compare.py": "b4e3d397c5437ee4926aa74221637896d071f36544e2bd55fc3cc51468ae1531",
     "tools/vanilla_java.py": "7c960b97895dc7031aa628c11ebb26cd648cb0a170d9686c282e032514247d89",
-    "tools/weird-sampler-oracle/WeirdSamplerOracle.java": "afb97e062e222b55f737e4497fe23a2146493afe47acb171afbe99acfe820015",
-    "tools/weird_sampler_oracle.py": "76de8d5ec2d5ff1dff61b85f0bfb0138d7646fedc5a16c91461dc822d3416f1b"
+    "tools/weird-sampler-oracle/WeirdSamplerOracle.java": "253f77e795ede33315274796aff2ccc1414c40e97de9c4d8961af9611fa980a2",
+    "tools/weird_sampler_oracle.py": "7281ff2502f10a39a92dbecf2f7873f4e0a6d13fb90d4deb4c12ceb422b8db0c"
   },
   "static_review": {
     "core_source_identities_match": {
@@ -222,8 +222,8 @@
       "src/weird_sampler_tests.rs": "03fda74db84ad32ae96f9208b343cb6d607c0806e680274782a433e28edbf910",
       "src/worldgen.rs": "92751fbf0b99b9c3d52f7ceb44a4e9f8070e13cf74aea52a505a01eb92315eca",
       "tests/weird_sampler_oracle_test.py": "b2bf4d645f41f298917f100cf3b71dab12108aa1e0319cc526889e8541a13a9f",
-      "tools/weird-sampler-oracle/WeirdSamplerOracle.java": "afb97e062e222b55f737e4497fe23a2146493afe47acb171afbe99acfe820015",
-      "tools/weird_sampler_oracle.py": "76de8d5ec2d5ff1dff61b85f0bfb0138d7646fedc5a16c91461dc822d3416f1b"
+      "tools/weird-sampler-oracle/WeirdSamplerOracle.java": "253f77e795ede33315274796aff2ccc1414c40e97de9c4d8961af9611fa980a2",
+      "tools/weird_sampler_oracle.py": "7281ff2502f10a39a92dbecf2f7873f4e0a6d13fb90d4deb4c12ceb422b8db0c"
     },
     "scope": "Static-only; two additional mutation registrations added after review, parent audited and runtime-proved."
   },

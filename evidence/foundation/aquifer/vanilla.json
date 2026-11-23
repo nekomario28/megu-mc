@@ -2,7 +2,7 @@
   "datapack": "server jar data/minecraft/worldgen loaded by RegistryDataLoader",
   "inner_game_sha256": "c301de10f575027d13eac18c7f34409d60648cf56a35d566aa1f530ff617840a",
   "minecraft": "1.21.1",
-  "oracle_sha256": "70a4727b0a8ccf4ebe9e1d9a53a46fc6dabb47deb7a037e06c70244299b51e91",
+  "oracle_sha256": "8c6ae7c2638b4f76631216ed0e76aa61b5ebdb0d8b648ce5bb4734d561d106cd",
   "request": {
     "chunk": [
       7,

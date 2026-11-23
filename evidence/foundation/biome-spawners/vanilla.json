@@ -5631,6 +5631,6 @@
   "datapack": "server jar data/minecraft/worldgen loaded by RegistryDataLoader",
   "inner_game_sha256": "c301de10f575027d13eac18c7f34409d60648cf56a35d566aa1f530ff617840a",
   "minecraft": "1.21.1",
-  "oracle_sha256": "fe14687fe0d001ef37ebd1abcd47aa7c58c816405376741d03226fdf8bf20ff5",
+  "oracle_sha256": "e253caf8f18dd61018e715e08a426feeb7b010a32d6cf06588d049bed59f5cb1",
   "server_sha1": "59353fb40c36d304f2035d51e7d6e6baa98dc05c"
 }

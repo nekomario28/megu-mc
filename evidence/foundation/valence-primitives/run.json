@@ -55,7 +55,7 @@
     "construction": "Real block-state ID map and PalettedContainer; synthetic 64-ID biome identity map; actual StringTag.write and JDK readUTF; actual AABB.clip. No constructor bypass or world execution.",
     "fixture_sha256": "6ddc3f68d85184324d6750de1be552c9f3bf3b28312231d15cc2ccd153a0e682",
     "minecraft": "1.21.1",
-    "oracle_sha256": "e2539e38e45b33d464a33f8cb9f64e2ec3c2db0918cc9a4bbe16a7b27befb817",
+    "oracle_sha256": "507b355239398f33439e3a565abed09848399a66220ec56b56f6d3ad0ffbced2",
     "server_sha1": "59353fb40c36d304f2035d51e7d6e6baa98dc05c"
   },
   "resource_contract": {
@@ -155,8 +155,8 @@
     "tests/verify.sh": "587e45227a999fa30ffe114b451fde3931e18a86809fc94c09e037edbd671162",
     "third_party/licenses/valence.txt": "01c39d867eb175cce2f8dcafd98f151d2e704b4adedc8c6a8e1c2721cd9663cd",
     "tools/mutation_check.sh": "c9bd8a581496715ed587ed4ac86a52d8f312d6b2a41490399003603fa50162e4",
-    "tools/primitives-oracle/PrimitivesOracle.java": "e2539e38e45b33d464a33f8cb9f64e2ec3c2db0918cc9a4bbe16a7b27befb817",
-    "tools/primitives_oracle.py": "d9ae504a816abf19ecd259c15b7c1d423b31f391c57fef04544baff48f8ec342",
+    "tools/primitives-oracle/PrimitivesOracle.java": "507b355239398f33439e3a565abed09848399a66220ec56b56f6d3ad0ffbced2",
+    "tools/primitives_oracle.py": "9b55fc38c4723cdd83cb2c956936dd0595046c84160c2b7d4fabb30de708c7fb",
     "tools/suite_compare.py": "b4e3d397c5437ee4926aa74221637896d071f36544e2bd55fc3cc51468ae1531",
     "tools/vanilla_java.py": "7c960b97895dc7031aa628c11ebb26cd648cb0a170d9686c282e032514247d89"
   },

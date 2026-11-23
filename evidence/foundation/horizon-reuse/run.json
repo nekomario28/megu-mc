@@ -50,7 +50,7 @@
     "new_overworld_biomes": 53,
     "nether_leaves": 5,
     "tree_provenance": {
-      "exporter_sha256": "9528401bb0c11c281ac24513f0079a2999856f58d968385713c41eee7619ae95",
+      "exporter_sha256": "4ac667251f17187949ac171581a5ace2819c56b5f2abf9e4e1d9ed30f418c656",
       "minecraft": "1.21.1",
       "server_sha1": "59353fb40c36d304f2035d51e7d6e6baa98dc05c"
     }
@@ -58,7 +58,7 @@
   "source_sha256": {
     "src/worldgen.rs": "72fee9cd2c0304651b5b5bc66017e3be7292c00a27dd0149edbec1a093e0f3cd",
     "tools/biome_tree_from_jar.py": "8f45effca8772822bd9f11514351c2d0cd8702ccfc8525508e496af55f6b4386",
-    "tools/biome-tree/ExportBiomeTree.java": "9528401bb0c11c281ac24513f0079a2999856f58d968385713c41eee7619ae95",
+    "tools/biome-tree/ExportBiomeTree.java": "4ac667251f17187949ac171581a5ace2819c56b5f2abf9e4e1d9ed30f418c656",
     "tools/vanilla_pack_from_jar.sh": "4ff1f6e8691116473a897f5c3718b0d0f9237105f302c81251c400e0d9fb0cd4",
     "tests/biome_tree_test.py": "417571f98440aff57a886f7b9c37f915e63a2deae0a3ce2ce0cdb262e4d0e906",
     "tests/verify.sh": "5388b4a966f0efc2d5f97566999d4a346a039f43d215768d7bc86e12b1c9a3d7",

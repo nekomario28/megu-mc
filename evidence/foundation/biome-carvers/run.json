@@ -62,7 +62,7 @@
     "inner_game_sha256": "c301de10f575027d13eac18c7f34409d60648cf56a35d566aa1f530ff617840a",
     "minecraft": "1.21.1",
     "nonempty_lists": 58,
-    "oracle_sha256": "43da9b8d77d5f9e23d81b1abe0eeaa7e6f4dd05f8d8ce57ae9efc8c9a2fe111c",
+    "oracle_sha256": "114616bc3aa88403db2fce8b7ad756d18c2160f8e4bf1a3c490a8e2bd96b1ccb",
     "server_sha1": "59353fb40c36d304f2035d51e7d6e6baa98dc05c"
   },
   "results": {
@@ -165,8 +165,8 @@
     "tests/biome_carver_oracle_test.py": "9dab06032b930161b24a198678a2941fd2c1ab8bbb0b106a3bd50c88e9dfe1db",
     "tests/verify.sh": "3810b47dbdc08e01c774080cbc43dc2d4d44f8cc51b3a213302a038d1654020a",
     "tools/README.md": "b7aa4968a78da16a679cb1d5e45a6b7e5b0f19b1c9198ae576cff39e0bc495eb",
-    "tools/biome-carver-oracle/BiomeCarverOracle.java": "43da9b8d77d5f9e23d81b1abe0eeaa7e6f4dd05f8d8ce57ae9efc8c9a2fe111c",
-    "tools/biome_carver_oracle.py": "4c6f111e51d6b366a4d0b4dccb79664690da4e8ffd198bb7171578e43ea080a5",
+    "tools/biome-carver-oracle/BiomeCarverOracle.java": "114616bc3aa88403db2fce8b7ad756d18c2160f8e4bf1a3c490a8e2bd96b1ccb",
+    "tools/biome_carver_oracle.py": "a300a1ac9d9ed602a437fa14d41fcd789c1e5375a4be174ca0ac13fc957592b8",
     "tools/mutation_check.sh": "d9bd6349449541e6631254ec69405a413aca23e5231a3248eea4b05a5debae56",
     "tools/suite_compare.py": "b4e3d397c5437ee4926aa74221637896d071f36544e2bd55fc3cc51468ae1531"
   },

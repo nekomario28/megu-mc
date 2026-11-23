@@ -46,7 +46,7 @@
     "datapack_manifest_sha256": "ecfce96db244372f11f8c7e1b24e20f184febaaf51cdec842c68be135706a2a3",
     "fixture_sha256": "d53956d76b9c3164bc4495ed506f63baed51d468360b0f43342298518434300d",
     "manifest_encoding": "sha256(json.dumps(sorted [[repo-relative POSIX path, file sha256], ...], separators=(comma, colon)).encode()); all datapack files in the post-check input snapshot",
-    "oracle_sha256": "cdce9c83d577df626749af3c2e70351340df7f946389d385dde595a151d890a1",
+    "oracle_sha256": "c12eb11201f42d008a8387bc43d04067980e87353dec574181330f1062b80b6b",
     "server_sha1": "59353fb40c36d304f2035d51e7d6e6baa98dc05c",
     "settings_sha256": "6a6e1ddfbbbd85c3d8cb0a06a1b6f348185bb3717d3404d0089f7b42440688b4"
   },
@@ -162,8 +162,8 @@
     "tests/surface_oracle_test.py": "fd114581a32ada44931a108cb001483533df01aa7a120bde2fd3e992b6be4cab",
     "tests/verify.sh": "ecbfd68c01c1c20333e115f03f000b411f008a9d4b57539fa5ea64d44ce0ee3b",
     "tools/mutation_check.sh": "b98c17a914f772dbdee7dcbe65e66381f735d79c65f9bfd73bea935da1c3d041",
-    "tools/surface-oracle/SurfaceOracle.java": "cdce9c83d577df626749af3c2e70351340df7f946389d385dde595a151d890a1",
-    "tools/surface_oracle.py": "4a8e8b02c166f58f4e5a2f25550ab7959cc197bc989f776151d3f917172b1130",
+    "tools/surface-oracle/SurfaceOracle.java": "c12eb11201f42d008a8387bc43d04067980e87353dec574181330f1062b80b6b",
+    "tools/surface_oracle.py": "82f3bc0ffebd92c62ebce9e5d0b0a98b174f255a9842a0b7acde28cf1298f416",
     "tools/vanilla_java.py": "7c960b97895dc7031aa628c11ebb26cd648cb0a170d9686c282e032514247d89"
   },
   "units": [

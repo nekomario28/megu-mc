@@ -84,12 +84,12 @@
   "reference": {
     "construction": "Actual 1.21.1 random classes and Climate parameter tree; no server/world, no constructor bypass; previous-result thread-local cleared per tie lookup.",
     "minecraft": "1.21.1",
-    "nextint_oracle_sha256": "8afac81d2608d6e35b10d543b55b74b31b10ce6cd20c867f9d201cb8a169161a",
+    "nextint_oracle_sha256": "edf34c35fb2d75e2a9b7c4f92fe592945f799aafbb14c1242e40b97e4834576c",
     "nextint_rows": 1116,
     "nextint_tsv_sha256": "a6dd4bb4028b0803c53a4367e684a53f55c195e43562b151f87952a19e73c341",
     "server_sha1": "59353fb40c36d304f2035d51e7d6e6baa98dc05c",
     "tie_flagged": 2287,
-    "tie_oracle_sha256": "fa3b0801babe405c4e7e06241642cc44fba26e600959c2cc9256a2a5c8eae645",
+    "tie_oracle_sha256": "e6cf16a1deccf0bb8d04eb01010ff3e41fa5566080f1ec9a1adba94739b17840",
     "tie_rows": 2500,
     "tie_tsv_sha256": "f3aea42792ff088ed1e9bc8f7b3c25ee961124e04ddb5e8f932e2361fecc6895"
   },
@@ -191,12 +191,12 @@
     "tests/nextint_oracle_test.py": "3ebd4f16d59dcbbf33fdbcbe7fc2379e0cbb80e7caf4383d5fa19cb7bdb234d0",
     "tests/verify.sh": "8679b171815cda8f71101d8b3cd20f2591a932599f3e8e93c06aad9559a1f522",
     "tools/README.md": "03b3dad7b230f780b7b02fc0758731caf2fdb7b6f8b507b534bed3795c6f3a3f",
-    "tools/biome-tie-oracle/BiomeTieOracle.java": "fa3b0801babe405c4e7e06241642cc44fba26e600959c2cc9256a2a5c8eae645",
-    "tools/biome_carver_oracle.py": "4c6f111e51d6b366a4d0b4dccb79664690da4e8ffd198bb7171578e43ea080a5",
-    "tools/biome_tie_oracle.py": "de6c00325ad7a71a491a6a2c0eff73bd9f1a0984e5913c29cf6fa788fdcf5d8e",
+    "tools/biome-tie-oracle/BiomeTieOracle.java": "e6cf16a1deccf0bb8d04eb01010ff3e41fa5566080f1ec9a1adba94739b17840",
+    "tools/biome_carver_oracle.py": "a300a1ac9d9ed602a437fa14d41fcd789c1e5375a4be174ca0ac13fc957592b8",
+    "tools/biome_tie_oracle.py": "abb81b1e2ccadbca3816d3660a12a2337cee3e7c55ac15a4e6d78ca70fa11258",
     "tools/mutation_check.sh": "43e24c7f8cea65bc8032e7e67545b7f6abf5d52ead5716679022782a9c7006e1",
-    "tools/nextint-oracle/NextIntOracle.java": "8afac81d2608d6e35b10d543b55b74b31b10ce6cd20c867f9d201cb8a169161a",
-    "tools/nextint_oracle.py": "54f03e127ba330ac141d2d6fe959d54e4af672ec6b228771813a27714b402c8c"
+    "tools/nextint-oracle/NextIntOracle.java": "edf34c35fb2d75e2a9b7c4f92fe592945f799aafbb14c1242e40b97e4834576c",
+    "tools/nextint_oracle.py": "d64bf3868a29c783d563e3c2db6865ddc0f6f4ed280903b3883082b3901247de"
   },
   "units": [
     {

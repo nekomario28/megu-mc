@@ -43,7 +43,7 @@
     "construction": "Actual AddEntityPacket constructor; normal Marker with absent Level then actual TeleportEntityPacket constructor; actual Mth.floor helper for head updates. No constructor bypass.",
     "fixture_sha256": "53ccd9ef65c21ce6042898384f8e89e8a2673685b2b72a951793f6b50b9c1434",
     "minecraft": "1.21.1",
-    "oracle_sha256": "f47d6056de2c8428c7fcac3e0f4223896de68d8107c51dea5292e28f63d4de82",
+    "oracle_sha256": "3bfb991d9c484eaedec4ac635194839d38116308a0debe3d0644092ec35c02bd",
     "server_sha1": "59353fb40c36d304f2035d51e7d6e6baa98dc05c"
   },
   "resource_contract": {
@@ -140,8 +140,8 @@
     "tests/verify.sh": "49e275e1d6560a2c96dad2a4530ad0f0ab3a93c7b577eb4d445b78152640c81b",
     "third_party/licenses/valence.txt": "01c39d867eb175cce2f8dcafd98f151d2e704b4adedc8c6a8e1c2721cd9663cd",
     "tools/mutation_check.sh": "b200fc8bac14e0115d4855cfca429ab4589cbdaea67feb46a4ad6b85dad46def",
-    "tools/packet-angles-oracle/PacketAnglesOracle.java": "f47d6056de2c8428c7fcac3e0f4223896de68d8107c51dea5292e28f63d4de82",
-    "tools/packet_angles_oracle.py": "ce61fd4f4285f98b1eb66f4a687db771e2bcfad32e61e6dac8ff24ee2d776664",
+    "tools/packet-angles-oracle/PacketAnglesOracle.java": "3bfb991d9c484eaedec4ac635194839d38116308a0debe3d0644092ec35c02bd",
+    "tools/packet_angles_oracle.py": "b41fb0eeebe95d59e7b26dc8d111d621114e4cc95bbd7dd9559b5643b6cdaa17",
     "tools/vanilla_java.py": "7c960b97895dc7031aa628c11ebb26cd648cb0a170d9686c282e032514247d89"
   },
   "units": [
