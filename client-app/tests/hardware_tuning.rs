@@ -13,8 +13,8 @@ use megu_client::cli::parse_args;
 use megu_client::hardware_profile::{
     classify_gpu, classify_intel_device, classify_macos_cpu_brand, parse_cache_size_kib,
     parse_meminfo_total_kib, parse_pci_id, parse_sysctl_l3_cache_kib, parse_sysctl_memsize_mib,
-    probe_host_hardware, recommend_tuning, GpuVendorClass, HostHardwareProfile,
-    LocalLlmRecommendation,
+    parse_windows_display_device_id, probe_host_hardware, recommend_tuning, GpuVendorClass,
+    HostHardwareProfile, LocalLlmRecommendation,
 };
 use megu_client::render::RenderConfig;
 use megu_client::settings::{
@@ -138,12 +138,74 @@ fn pci_id_parser_and_gpu_classification() {
         classify_gpu(Some(0x8086), None),
         GpuVendorClass::IntelModernIntegrated
     );
-    // Unknown vendor and absent GPU.
+    // Unknown vendor and unidentified probe both retain the neutral Auto path.
     assert_eq!(
         classify_gpu(Some(0x1234), Some(0x5678)),
         GpuVendorClass::Unknown
     );
-    assert_eq!(classify_gpu(None, None), GpuVendorClass::NoneSoftware);
+    assert_eq!(classify_gpu(None, None), GpuVendorClass::Unknown);
+    assert_eq!(
+        classify_gpu(Some(0x1414), Some(0)),
+        GpuVendorClass::NoneSoftware
+    );
+}
+
+#[test]
+fn windows_display_device_parser_classifies_vendor_and_software_adapters() {
+    assert_eq!(
+        parse_windows_display_device_id(
+            r"PCI\VEN_10DE&DEV_2684&SUBSYS_12345678&REV_A1",
+            "NVIDIA GeForce RTX 4090",
+        ),
+        Some((0x10de, 0x2684))
+    );
+    assert_eq!(
+        parse_windows_display_device_id(
+            r"PCI\VEN_1002&DEV_747E&SUBSYS_12345678",
+            "AMD Radeon RX 7900 XTX",
+        ),
+        Some((0x1002, 0x747e))
+    );
+    assert_eq!(
+        parse_windows_display_device_id(r"PCI\VEN_8086&DEV_56A0&SUBSYS_12345678", "Intel Arc A770",),
+        Some((0x8086, 0x56a0))
+    );
+    assert_eq!(
+        parse_windows_display_device_id("", "NVIDIA Adapter"),
+        Some((0x10de, 0))
+    );
+    assert_eq!(
+        parse_windows_display_device_id("", "AMD Radeon Adapter"),
+        Some((0x1002, 0))
+    );
+    assert_eq!(
+        parse_windows_display_device_id("", "Intel Graphics"),
+        Some((0x8086, 0))
+    );
+    assert_eq!(
+        parse_windows_display_device_id("ROOT\\BASICRENDER", "Microsoft Basic Render Driver"),
+        Some((0x1414, 0))
+    );
+    assert_eq!(
+        parse_windows_display_device_id(r"PCI\VEN_1414&DEV_008C", "Microsoft adapter"),
+        Some((0x1414, 0x008c))
+    );
+    assert_eq!(
+        parse_windows_display_device_id("", "llvmpipe (LLVM 18.1.8, 256 bits)"),
+        Some((0x1414, 0))
+    );
+    assert_eq!(
+        parse_windows_display_device_id("", "lavapipe"),
+        Some((0x1414, 0))
+    );
+    assert_eq!(
+        parse_windows_display_device_id("", "SwiftShader Device"),
+        Some((0x1414, 0))
+    );
+    assert_eq!(
+        parse_windows_display_device_id("ROOT\\UNKNOWN", "Unknown"),
+        None
+    );
 }
 
 #[test]
@@ -365,6 +427,25 @@ fn tuning_apple_silicon_prefers_compute_indirect() {
         plan.local_llm,
         LocalLlmRecommendation::MediumQuantized8BTo12B
     );
+}
+
+#[test]
+fn tuning_unknown_gpu_keeps_auto_backend_and_balanced_distance() {
+    assert_eq!(
+        HostHardwareProfile::default().gpu_class,
+        GpuVendorClass::Unknown
+    );
+    let plan = recommend_tuning(&profile(
+        8,
+        16 * 1024,
+        16 * 1024,
+        GpuVendorClass::Unknown,
+        0,
+    ));
+    assert_eq!(plan.gpu_backend, RenderBackendPreference::Auto);
+    assert_eq!(plan.view_distance, 10);
+    assert_eq!(plan.lod_radius_chunks, 48);
+    assert_eq!(plan.max_rebuilds_per_frame, 4);
 }
 
 #[test]

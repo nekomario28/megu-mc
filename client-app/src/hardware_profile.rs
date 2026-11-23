@@ -18,7 +18,7 @@
 //!   `GlobalMemoryStatusEx` kernel32 call on Windows. On hosts with no
 //!   probe the fields degrade gracefully (`total_ram_mib`/
 //!   `l3_cache_kib` become `0`, `gpu_class` becomes
-//!   [`GpuVendorClass::NoneSoftware`]).
+//!   [`GpuVendorClass::Unknown`]).
 //!
 //! [`recommend_tuning`] maps a [`HostHardwareProfile`] onto a
 //! [`HardwareTuningPlan`]: GPU backend preference, meshing worker threads,
@@ -41,15 +41,16 @@ use crate::settings::{
 pub const PCI_VENDOR_NVIDIA: u16 = 0x10de;
 pub const PCI_VENDOR_AMD: u16 = 0x1002;
 pub const PCI_VENDOR_INTEL: u16 = 0x8086;
+/// Microsoft Basic Display Adapter / software display device.
+pub const PCI_VENDOR_MICROSOFT: u16 = 0x1414;
 
 /// Coarse GPU class the auto-tuner reasons about. Finer distinctions
 /// (exact model, driver) deliberately stay out of scope — only what the
 /// tuning policy actually branches on is tracked.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum GpuVendorClass {
-    /// No GPU device found at all: the software rasterizer is the only
-    /// render path.
-    #[default]
+    /// A software display adapter or explicit headless/no-GPU profile was
+    /// positively identified.
     NoneSoftware,
     /// Legacy Intel integrated GPU (Gen7-Gen11: HD 4000 through UHD 630).
     /// Only pure wgpu core (Vulkan 1.1 / DX12 / Metal) is safe to assume — the
@@ -66,6 +67,7 @@ pub enum GpuVendorClass {
     /// Apple Silicon unified-memory GPU (probe fallback on macOS).
     AppleSilicon,
     /// A GPU device exists but its vendor id is unrecognized.
+    #[default]
     Unknown,
 }
 
@@ -204,6 +206,62 @@ pub fn parse_pci_id(text: &str) -> Option<u16> {
     u16::from_str_radix(hex, 16).ok()
 }
 
+/// Parse a Windows display adapter's PCI device ID and name. Returns
+/// `(vendor_id, device_id)` for PCI adapters, or `(0x1414, 0)` for a
+/// confirmed software adapter. `None` means the device was not identified.
+/// This parser is platform independent so every CI OS can exercise it.
+pub fn parse_windows_display_device_id(device_id: &str, device_string: &str) -> Option<(u16, u16)> {
+    let name = device_string.to_ascii_lowercase();
+    if [
+        "llvmpipe",
+        "lavapipe",
+        "swiftshader",
+        "microsoft basic render",
+    ]
+    .iter()
+    .any(|marker| name.contains(marker))
+    {
+        return Some((PCI_VENDOR_MICROSOFT, 0));
+    }
+
+    let mut vendor_id = None;
+    let mut device_id_value = None;
+    for component in device_id.split(['&', '\\', '#']) {
+        if let Some(value) = component
+            .get(..4)
+            .filter(|prefix| prefix.eq_ignore_ascii_case("VEN_"))
+            .and_then(|_| component.get(4..))
+            .and_then(|hex| u16::from_str_radix(hex, 16).ok())
+        {
+            vendor_id = Some(value);
+        }
+        if let Some(value) = component
+            .get(..4)
+            .filter(|prefix| prefix.eq_ignore_ascii_case("DEV_"))
+            .and_then(|_| component.get(4..))
+            .and_then(|hex| u16::from_str_radix(hex, 16).ok())
+        {
+            device_id_value = Some(value);
+        }
+    }
+    if let Some(vendor) = vendor_id {
+        return Some((vendor, device_id_value.unwrap_or(0)));
+    }
+
+    // Some display drivers omit the PCI identifier. Their Windows adapter
+    // description still carries a usable vendor name.
+    let vendor = if name.contains("nvidia") {
+        PCI_VENDOR_NVIDIA
+    } else if name.contains("amd") || name.contains("radeon") || name.contains("ati ") {
+        PCI_VENDOR_AMD
+    } else if name.contains("intel") {
+        PCI_VENDOR_INTEL
+    } else {
+        return None;
+    };
+    Some((vendor, device_id_value.unwrap_or(0)))
+}
+
 /// Parse `sysctl -n hw.memsize` output — a byte count in decimal — into
 /// MiB. `None` on empty or unparseable input; sub-MiB values floor to `0`.
 pub fn parse_sysctl_memsize_mib(text: &str) -> Option<u32> {
@@ -245,12 +303,13 @@ pub fn classify_macos_cpu_brand(brand: &str) -> GpuVendorClass {
 }
 
 /// Map a PCI vendor (+ optional device) id pair onto a [`GpuVendorClass`].
-/// `vendor_id == None` means no GPU was found at all →
-/// [`GpuVendorClass::NoneSoftware`]; an unrecognized vendor →
+/// `vendor_id == None` means the probe did not identify an adapter →
+/// [`GpuVendorClass::Unknown`]; an unrecognized vendor →
 /// [`GpuVendorClass::Unknown`].
 pub fn classify_gpu(vendor_id: Option<u16>, device_id: Option<u16>) -> GpuVendorClass {
     match vendor_id {
-        None => GpuVendorClass::NoneSoftware,
+        None => GpuVendorClass::Unknown,
+        Some(PCI_VENDOR_MICROSOFT) => GpuVendorClass::NoneSoftware,
         Some(PCI_VENDOR_NVIDIA) => GpuVendorClass::NvidiaDedicated,
         Some(PCI_VENDOR_AMD) => GpuVendorClass::AmdDedicated,
         Some(PCI_VENDOR_INTEL) => device_id
@@ -310,7 +369,7 @@ fn gpu_class_rank(class: GpuVendorClass) -> u8 {
 /// `/proc` and `/sys` files on Linux, runs `sysctl -n` on macOS and calls
 /// the Win32 `GlobalMemoryStatusEx` kernel32 export on Windows — never
 /// writes, never panics on missing data; every absent source degrades to
-/// `0` / `NoneSoftware` defaults.
+/// `0` / `Unknown` defaults.
 pub fn probe_host_hardware() -> HostHardwareProfile {
     let logical_cpus = std::thread::available_parallelism()
         .map(|n| u16::try_from(n.get()).unwrap_or(u16::MAX))
@@ -472,10 +531,10 @@ fn probe_l3_cache_kib() -> u32 {
 
 /// Walk `/sys/class/drm/card*` for the strongest GPU. Returns the class
 /// plus the driver-reported dedicated VRAM total in MiB (amdgpu's
-/// `mem_info_vram_total`; `0` when no driver reports it). Absent sysfs →
-/// `NoneSoftware`, refined on macOS by the `sysctl` CPU-brand probe.
+/// `mem_info_vram_total`; `0` when no driver reports it). Missing probes
+/// remain `Unknown` unless a platform probe identifies an adapter.
 fn probe_gpu() -> (GpuVendorClass, u32) {
-    let mut class = GpuVendorClass::NoneSoftware;
+    let mut class: Option<GpuVendorClass> = None;
     let mut vram_mib = 0u32;
     if let Ok(entries) = std::fs::read_dir("/sys/class/drm") {
         for entry in entries.flatten() {
@@ -496,8 +555,10 @@ fn probe_gpu() -> (GpuVendorClass, u32) {
                 .ok()
                 .and_then(|s| parse_pci_id(&s));
             let candidate = classify_gpu(vendor, device);
-            if gpu_class_rank(candidate) > gpu_class_rank(class) {
-                class = candidate;
+            if class.is_none()
+                || class.is_some_and(|best| gpu_class_rank(candidate) > gpu_class_rank(best))
+            {
+                class = Some(candidate);
                 vram_mib = std::fs::read_to_string(device_dir.join("mem_info_vram_total"))
                     .ok()
                     .and_then(|s| s.trim().parse::<u64>().ok())
@@ -506,21 +567,85 @@ fn probe_gpu() -> (GpuVendorClass, u32) {
             }
         }
     }
-    // macOS exposes no `/sys/class/drm`: classify the GPU from the CPU
-    // brand string instead — `Apple M<n>` parts share one unified-memory
-    // GPU, everything else is an unclassifiable-but-real Intel GPU.
-    // When sysctl itself is unavailable keep the historical Apple
-    // Silicon assumption (virtually every shipping Mac is one).
+    // macOS exposes no `/sys/class/drm`; classify only when the CPU-brand
+    // probe identifies Apple Silicon or confirms a real but unknown GPU.
     #[cfg(target_os = "macos")]
-    if matches!(class, GpuVendorClass::NoneSoftware) {
-        class = sysctl_value("machdep.cpu.brand_string")
-            .map(|brand| classify_macos_cpu_brand(&brand))
-            .unwrap_or(GpuVendorClass::AppleSilicon);
+    if class.is_none() {
+        class =
+            sysctl_value("machdep.cpu.brand_string").map(|brand| classify_macos_cpu_brand(&brand));
     }
-    // Any platform without DRM sysfs (Windows, the BSDs, ...) keeps
-    // `NoneSoftware` — the safe classic-low-spec fallback — rather than
-    // guessing a GPU class the probe never verified.
-    (class, vram_mib)
+
+    #[cfg(target_os = "windows")]
+    if class.is_none() {
+        let (windows_class, windows_vram) = probe_windows_gpu();
+        if !matches!(windows_class, GpuVendorClass::Unknown) {
+            class = Some(windows_class);
+            vram_mib = windows_vram;
+        }
+    }
+
+    (class.unwrap_or(GpuVendorClass::Unknown), vram_mib)
+}
+
+/// Enumerate Windows display adapters using the zero-dependency Win32
+/// `EnumDisplayDevicesW` API.
+#[cfg(target_os = "windows")]
+fn probe_windows_gpu() -> (GpuVendorClass, u32) {
+    #[repr(C)]
+    struct DisplayDeviceW {
+        cb: u32,
+        device_name: [u16; 32],
+        device_string: [u16; 128],
+        state_flags: u32,
+        device_id: [u16; 128],
+        device_key: [u16; 128],
+    }
+
+    #[link(name = "user32")]
+    extern "system" {
+        fn EnumDisplayDevicesW(
+            device: *const u16,
+            device_num: u32,
+            display_device: *mut DisplayDeviceW,
+            flags: u32,
+        ) -> i32;
+    }
+
+    fn wide_string(value: &[u16]) -> String {
+        let length = value
+            .iter()
+            .position(|unit| *unit == 0)
+            .unwrap_or(value.len());
+        String::from_utf16_lossy(&value[..length])
+    }
+
+    let mut best: Option<GpuVendorClass> = None;
+    for index in 0..64 {
+        let mut device = DisplayDeviceW {
+            cb: std::mem::size_of::<DisplayDeviceW>() as u32,
+            device_name: [0; 32],
+            device_string: [0; 128],
+            state_flags: 0,
+            device_id: [0; 128],
+            device_key: [0; 128],
+        };
+        if unsafe { EnumDisplayDevicesW(std::ptr::null(), index, &mut device, 0) } == 0 {
+            break;
+        }
+        let parsed = parse_windows_display_device_id(
+            &wide_string(&device.device_id),
+            &wide_string(&device.device_string),
+        );
+        if let Some((vendor, id)) = parsed {
+            let candidate = classify_gpu(Some(vendor), Some(id));
+            if best.is_none()
+                || best.is_some_and(|current| gpu_class_rank(candidate) > gpu_class_rank(current))
+            {
+                best = Some(candidate);
+            }
+        }
+    }
+    (best.unwrap_or(GpuVendorClass::Unknown), 0)
 }
 
 // ---------------------------------------------------------------------------
@@ -564,7 +689,8 @@ fn recommend_chunk_cache_mib(hw: &HostHardwareProfile) -> u32 {
 
 /// Map a probed (or hand-built) profile onto a [`HardwareTuningPlan`].
 ///
-/// Backend policy: no-GPU and legacy Intel iGPUs pin `ClassicLowSpec`
+/// Backend policy: confirmed software/headless and legacy Intel iGPUs pin
+/// `ClassicLowSpec`
 /// (pure wgpu Vulkan 1.1 / DX12 / Metal core); NVIDIA/AMD/Intel Arc run `Auto` so
 /// capability negotiation can reach the mesh-shader pipeline;
 /// Apple Silicon takes `ComputeIndirect` (no `VK_EXT_mesh_shader` on
