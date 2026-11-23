@@ -18,7 +18,10 @@
 //!    candidates — all through the production `client-gpu`/`client-app`
 //!    paths.
 
-use megu_client::protocol::{decode_chunk_packet, ClientPlayEvent, PlayEvent, TeleportSync};
+use megu_client::protocol::{
+    decode_chunk_packet, ClientPlayEvent, DimensionMeta, PlayEvent, TeleportSync,
+};
+use megu_client::world::{BlockTable, WorldState};
 use megu_client::zsh_command_bar::{CommandBarAction, ZshCommandBar};
 use megu_client_gpu::live_session::LiveSession;
 use megu_client_gpu::renderer::{
@@ -82,6 +85,14 @@ fn chunk_body(cx: i32, cz: i32, stone_section: i32) -> Vec<u8> {
 /// mesh so `world.packed_meshes()`/`section_graphs()` are populated.
 fn session_with_stone_chunks(chunks: &[(i32, i32)]) -> LiveSession {
     let mut live = LiveSession::offline_with_null_audio();
+    feed_stone_chunks(&mut live, chunks);
+    live
+}
+
+/// The ingest-and-mesh tail of [`session_with_stone_chunks`], split out so a
+/// test can swap `live.world` for a registry-backed `WorldState` before the
+/// columns land.
+fn feed_stone_chunks(live: &mut LiveSession, chunks: &[(i32, i32)]) {
     live.apply_event(ClientPlayEvent::Play(PlayEvent::Teleport(TeleportSync {
         x: 8.0,
         y: 20.0,
@@ -107,7 +118,6 @@ fn session_with_stone_chunks(chunks: &[(i32, i32)]) -> LiveSession {
             .expect("mesh rebuild");
     }
     assert_eq!(live.world.pending_mesh_sections(), 0);
-    live
 }
 
 /// A headless GPU device, or `None` when the host has no adapter (the
@@ -365,13 +375,46 @@ fn live_session_looking_at_hud_uses_qol_gameplay_projection() {
     assert!(live.looking_at_entity.is_none());
 }
 
+/// Minimal version pack: `blocks.json` alone. With no
+/// `block_state_facts.bin`/`block_states.json` the kernel derives a
+/// structural facts table — `air` passes light, every other state an
+/// opaque full cube — which is enough to build `WorldState`'s registry
+/// and `LightEngine` on a checkout whose generated `assets/*_1211*`
+/// pack is absent.
+fn write_stone_light_pack() -> std::path::PathBuf {
+    let dir = std::env::temp_dir().join(format!("megu-wire-qol-light-pack-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).expect("create synthetic pack dir");
+    std::fs::write(
+        dir.join("blocks.json"),
+        r#"[
+            {"name": "air", "defaultState": 0, "minStateId": 0, "maxStateId": 0},
+            {"name": "stone", "defaultState": 1, "minStateId": 1, "maxStateId": 1}
+        ]"#,
+    )
+    .expect("write blocks.json");
+    dir
+}
+
 /// `occlusion_table`'s `CoalescedLightQueue` drains real block edits into
 /// the `LightEngine`: batched section updates coalesce last-write-wins
 /// into one engine call per chunk, and `local_light_edits` counts the
 /// applied edits — the counter proves the queue→batch→engine path ran.
 #[test]
 fn world_block_updates_drain_coalesced_light_queue() {
-    let mut live = session_with_stone_chunks(&[(0, 0)]);
+    // `queue_local_light_edit`/`flush_light_queue` only run with a kernel
+    // registry + `LightEngine`, and `WorldState::new` finds none on the
+    // public clean-room checkout — the `assets/*_1211*` pack is a generated
+    // Mojang fixture excluded from git, so the offline session's edits
+    // silently dropped and the counter stayed zero. The synthetic pack
+    // gives the session a real engine, keeping every assertion below a
+    // proof that the drain ran rather than a vacuous `>=` pass.
+    let pack = write_stone_light_pack();
+    let mut live = LiveSession::offline_with_null_audio();
+    live.world =
+        WorldState::new_from_version_dir(DimensionMeta::default(), BlockTable::load(None), &pack)
+            .expect("synthetic version pack opens");
+    feed_stone_chunks(&mut live, &[(0, 0)]);
     let baseline = live.world.local_light_edits;
 
     // A `SectionBlocksUpdate` batch carrying three edits — two to the
@@ -384,17 +427,12 @@ fn world_block_updates_drain_coalesced_light_queue() {
     ])))
     .unwrap();
 
-    assert!(
-        live.world.local_light_edits >= baseline,
-        "light edits must flow through the coalesced queue"
-    );
-    // The queue dedups the same-cell rewrite: at most two distinct cells
+    // The queue dedups the same-cell rewrite: exactly two distinct cells
     // applied for three pushed edits.
-    assert!(
-        live.world.local_light_edits <= baseline + 2,
-        "same-cell rewrites coalesce — expected <= {} applied, got {}",
+    assert_eq!(
+        live.world.local_light_edits,
         baseline + 2,
-        live.world.local_light_edits
+        "three pushed edits coalesce last-write-wins into two engine edits"
     );
     // A single `BlockUpdate` exercises the same queue→flush machinery.
     live.apply_event(ClientPlayEvent::Play(PlayEvent::BlockUpdate {
@@ -402,10 +440,12 @@ fn world_block_updates_drain_coalesced_light_queue() {
         state_id: 0,
     }))
     .unwrap();
-    assert!(
-        live.world.local_light_edits > baseline,
+    assert_eq!(
+        live.world.local_light_edits,
+        baseline + 3,
         "a live block update must propagate light through the queue"
     );
+    let _ = std::fs::remove_dir_all(&pack);
 }
 
 /// `command`'s `CommandDispatcher` filters the bar's command candidates
