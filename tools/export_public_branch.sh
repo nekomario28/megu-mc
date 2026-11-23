@@ -68,7 +68,11 @@ while IFS= read -r -d '' path; do generated+=("$path"); done \
     < <(find assets tests/data -name '*_1211*' -print0)
 ((${#generated[@]})) || die 'no generated *_1211* artifacts found to strip'
 for path in "${generated[@]}"; do rm -rf -- "$path"; done
-printf '/assets/**/*_1211*\n/tests/data/**/*_1211*\n' >> .gitignore
+# Strip raw local systemd journal dumps (`*unit.jsonl`) from public exports so
+# host paths and invocation IDs never enter the public source tree.
+while IFS= read -r -d '' path; do rm -f -- "$path"; done \
+    < <(find evidence -name '*unit.jsonl' -print0 2>/dev/null || true)
+printf '/assets/**/*_1211*\n/tests/data/**/*_1211*\n/evidence/**/*unit.jsonl\n' >> .gitignore
 
 git init -q --template= -b "$branch"
 git -c core.hooksPath=/dev/null add -- .
