@@ -7799,7 +7799,7 @@ fn reload_unticketed_chunk_overlay(
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, megu_vanilla_data))]
 mod p8b4_issue105_tests {
     use super::*;
 

@@ -3,6 +3,10 @@ name = "megu"
 version = "0.0.0"
 edition = "2021"
 license = "LGPL-3.0-or-later"
+# Never published: wildcard path dependencies below are legal only for a
+# non-published crate (crates.io forbids path dependencies), which is what
+# `allow-wildcard-paths` in deny.toml keys on.
+publish = false
 [profile.release]
 opt-level = 3
 lto = "thin"

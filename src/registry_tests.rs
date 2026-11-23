@@ -1668,6 +1668,7 @@ fn a_panicking_scene_fixture_leaves_the_parent_untouched() {
 /// never looks in `deep_c` and mutating the hit arm there changes nothing. The Nether rule
 /// carries `not` conditions the fast evaluator has no form for, so `deep_fast` stays unset
 /// and every read lands on the memo.
+#[cfg(megu_vanilla_data)]
 #[test]
 fn deep_state_memo_returns_the_value_it_computed() {
     crate::test_support::require_vanilla_data();

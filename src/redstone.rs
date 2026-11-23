@@ -2377,10 +2377,12 @@ fn rs_run_tick(world: &mut impl RedstoneUpdates, pos: RsPos, now: u64) {
 #[cfg(test)]
 mod redstone_tests {
     use super::*;
+    #[cfg(megu_vanilla_data)]
     use crate::json::jparse;
 
     const ORIGIN: RsPos = RsPos(0, 0, 0);
 
+    #[cfg_attr(not(megu_vanilla_data), allow(dead_code))]
     fn registered(reg: &BReg, name: &str, properties: &[(&str, &str)]) -> u32 {
         let properties = properties
             .iter()
@@ -2391,6 +2393,7 @@ mod redstone_tests {
     }
 
     #[test]
+    #[cfg(megu_vanilla_data)]
     fn registry_codec_round_trips_every_supported_1211_state() {
         let _guard = crate::world_guard();
         let reg = breg().unwrap();
@@ -2461,6 +2464,7 @@ mod redstone_tests {
     }
 
     #[test]
+    #[cfg(megu_vanilla_data)]
     fn registry_conductor_and_support_use_native_state_flags() {
         let _guard = crate::world_guard();
         let reg = breg().unwrap();
@@ -2485,6 +2489,7 @@ mod redstone_tests {
     }
 
     #[test]
+    #[cfg(megu_vanilla_data)]
     fn registry_states_drive_torch_wire_repeater_lamp_circuit() {
         let _guard = crate::world_guard();
         let reg = breg().unwrap();
@@ -3188,6 +3193,7 @@ mod redstone_tests {
         assert_eq!(grid.take_dispense_events(), [first, second, third, later]);
     }
 
+    #[cfg_attr(not(megu_vanilla_data), allow(dead_code))]
     struct MemoryWorld<'a> {
         reg: &'a BReg,
         states: BTreeMap<RsPos, u32>,
@@ -3204,6 +3210,7 @@ mod redstone_tests {
     }
 
     impl<'a> MemoryWorld<'a> {
+        #[cfg_attr(not(megu_vanilla_data), allow(dead_code))]
         fn new(reg: &'a BReg) -> Self {
             Self {
                 reg,
@@ -3221,12 +3228,14 @@ mod redstone_tests {
             }
         }
 
+        #[cfg_attr(not(megu_vanilla_data), allow(dead_code))]
         fn drain_updates(&mut self, torches: &mut BTreeMap<RsPos, RsTorchHistory>) {
             while let Some(pos) = self.updates.pop_front() {
                 RedstoneWorldAdapter::new(self.reg, self, torches).neighbor_changed(pos);
             }
         }
 
+        #[cfg_attr(not(megu_vanilla_data), allow(dead_code))]
         fn advance(&mut self, to: u64, torches: &mut BTreeMap<RsPos, RsTorchHistory>) {
             assert!(to >= self.now);
             while let Some((index, &(due, tick))) = self
@@ -3318,6 +3327,7 @@ mod redstone_tests {
     }
 
     #[test]
+    #[cfg(megu_vanilla_data)]
     fn lever_wire_repeater_lamp_writes_vanilla_ids_at_the_due_ticks() {
         let _guard = crate::world_guard();
         let reg = breg().unwrap();
@@ -3422,6 +3432,7 @@ mod redstone_tests {
     }
 
     #[test]
+    #[cfg(megu_vanilla_data)]
     fn comparator_reads_and_updates_the_block_entity_independently_of_powered() {
         let _guard = crate::world_guard();
         let reg = breg().unwrap();
@@ -3469,6 +3480,7 @@ mod redstone_tests {
     }
 
     #[test]
+    #[cfg(megu_vanilla_data)]
     fn stepped_dust_reads_wire_power_and_uses_the_full_attachment_face() {
         let _guard = crate::world_guard();
         let reg = breg().unwrap();
@@ -3521,6 +3533,7 @@ mod redstone_tests {
     }
 
     #[test]
+    #[cfg(megu_vanilla_data)]
     fn powered_dust_emits_using_live_geometry_before_its_stored_shape_is_refreshed() {
         let _guard = crate::world_guard();
         let reg = breg().unwrap();
@@ -3554,6 +3567,7 @@ mod redstone_tests {
     }
 
     #[test]
+    #[cfg(megu_vanilla_data)]
     fn mounted_controls_observers_and_targets_emit_in_the_vanilla_directions() {
         let _guard = crate::world_guard();
         let reg = breg().unwrap();
@@ -3609,6 +3623,7 @@ mod redstone_tests {
     }
 
     #[test]
+    #[cfg(megu_vanilla_data)]
     fn a_pending_tick_does_not_run_on_a_replacement_block() {
         let _guard = crate::world_guard();
         let reg = breg().unwrap();
@@ -3630,6 +3645,7 @@ mod redstone_tests {
         assert_eq!(world.state_at(pos), torch_off);
     }
     #[test]
+    #[cfg(megu_vanilla_data)]
     fn registry_batch_settles_dust_and_delivers_queued_ticks_after_power_falls() {
         let _guard = crate::world_guard();
         let reg = breg().unwrap();
@@ -3676,6 +3692,7 @@ mod redstone_tests {
     }
 
     #[test]
+    #[cfg(megu_vanilla_data)]
     fn comparator_uses_the_stronger_analog_source_behind_a_conductor() {
         let _guard = crate::world_guard();
         let reg = breg().unwrap();
@@ -3963,6 +3980,7 @@ mod redstone_tests {
     }
 
     #[test]
+    #[cfg(megu_vanilla_data)]
     fn redstone_world_decodes_sensor_state_properties() {
         let _guard = crate::world_guard();
         let reg = breg().unwrap();
@@ -4041,6 +4059,7 @@ mod redstone_tests {
     }
 
     #[test]
+    #[cfg(megu_vanilla_data)]
     fn redstone_sensors_daylight_tripwire_sculk_live_wire() {
         let _guard = crate::world_guard();
         let reg = breg().unwrap();

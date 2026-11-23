@@ -4383,6 +4383,7 @@ mod villager_raid_tests {
     }
 
     #[test]
+    #[cfg(megu_vanilla_data)]
     fn poi_box_scanner_reconciles_head_and_deleted_sites() {
         let reg = crate::block_registry::breg().expect("BReg");
         let property = |part: &str| vec![("part".to_string(), part.to_string())];
@@ -5585,6 +5586,7 @@ mod villager_raid_tests {
     /// opens: a lectern next to the villager claims into Librarian with the
     /// real site trades, so the `farmer_merchant` fallback never applies.
     #[test]
+    #[cfg(megu_vanilla_data)]
     fn live_poi_assigns_non_farmer_villager_profession_and_trades() {
         let _guard = crate::world_guard();
         let lectern = (50_000, 70, 50_000);
@@ -5817,7 +5819,7 @@ mod villager_raid_tests {
 
 /// P2 parity tests: the special-spawner gamerules and the raid gate's live
 /// atomic read.
-#[cfg(test)]
+#[cfg(all(test, megu_vanilla_data))]
 mod p2_parity_village_tests {
     use super::*;
 
@@ -6575,7 +6577,7 @@ mod perf1_villager_lod_tests {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, megu_vanilla_data))]
 mod parity_live_wire_utility_tests {
     use super::*;
 

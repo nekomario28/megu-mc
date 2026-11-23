@@ -752,6 +752,14 @@ pub struct UdpVoiceRelay {
     tx_scratch: Vec<u8>,
 }
 
+/// `true` when `recv_from` failed because the datagram was larger than the
+/// receive buffer: `WSAEMSGSIZE` (10040) on Windows, `EMSGSIZE` on Unix
+/// (90 on Linux, 40 on the BSDs and macOS). In every case the OS has already
+/// discarded the datagram, so `poll_once` can count it and keep draining.
+fn is_truncated_datagram(e: &io::Error) -> bool {
+    matches!(e.raw_os_error(), Some(10040) | Some(90) | Some(40))
+}
+
 impl UdpVoiceRelay {
     /// Bind `bind_addr` (e.g. `127.0.0.1:0` for an ephemeral test port) and
     /// serve `state`. The socket is non-blocking: `poll_once` never waits.
@@ -792,10 +800,13 @@ impl UdpVoiceRelay {
     /// consults a clock of its own. Returns how many datagrams were
     /// processed (0 when the socket had nothing pending).
     pub fn poll_once(&mut self, now: Instant) -> io::Result<u32> {
-        // One byte of headroom over the cap: a datagram that had to be
-        // truncated to fit reports n = 1401 > 1400 and is correctly counted
-        // malformed instead of being half-parsed.
-        let mut buf = [0u8; MAX_VOICE_DATAGRAM_BYTES + 1];
+        // The largest datagram UDP can carry (64KiB), so an oversized packet
+        // is rejected on its true length by decode_packet — never on a
+        // truncation artifact. Windows reports WSAEMSGSIZE instead of
+        // truncating when a datagram does not fit the buffer; with this
+        // buffer no real datagram can, but if one ever did, the OS has
+        // already discarded it, which is exactly the malformed-drop result.
+        let mut buf = [0u8; u16::MAX as usize + 1];
         let mut handled = 0u32;
         loop {
             match self.socket.recv_from(&mut buf) {
@@ -805,6 +816,11 @@ impl UdpVoiceRelay {
                     handled += 1;
                 }
                 Err(e) if e.kind() == io::ErrorKind::WouldBlock => break,
+                Err(e) if is_truncated_datagram(&e) => {
+                    self.metrics.rx_packets += 1;
+                    self.metrics.dropped_malformed += 1;
+                    handled += 1;
+                }
                 Err(e) => return Err(e),
             }
         }

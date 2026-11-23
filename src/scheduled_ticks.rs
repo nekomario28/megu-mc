@@ -65,6 +65,7 @@ fn bound_collect_scratch(v: &mut Vec<ChunkPos>) {
 /// Retained capacity of the shared `collect` container heap — test-only proof
 /// that the scratch buffer is reused (and bounded) across drains.
 #[cfg(test)]
+#[cfg_attr(not(megu_vanilla_data), allow(dead_code))]
 fn collect_scratch_capacity() -> usize {
     COLLECT_CONTAINERS.with(|cell| cell.borrow().capacity())
 }
@@ -219,7 +220,7 @@ impl NextChunks {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, megu_vanilla_data))]
 mod tests {
     use super::*;
 
@@ -1222,7 +1223,7 @@ mod tests {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, megu_vanilla_data))]
 pub(crate) mod delivery_fixture {
     use super::*;
 
@@ -1359,6 +1360,7 @@ impl ScheduledTicks {
     /// Test-only inspection of queued identities; the production scheduler
     /// exposes collections only when their eligible game tick is due.
     #[cfg(test)]
+    #[cfg_attr(not(megu_vanilla_data), allow(dead_code))]
     pub(crate) fn has_pending_matching(
         &self,
         pred: impl Fn(&ScheduledTick) -> bool,

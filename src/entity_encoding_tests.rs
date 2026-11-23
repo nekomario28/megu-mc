@@ -1,5 +1,6 @@
 use super::*;
 
+#[cfg(megu_vanilla_data)]
 fn entity_angle_cases() -> Vec<json::J> {
     let fixture = json::jparse(include_bytes!(
         "../evidence/gameplay/entity-angles/vanilla.json"

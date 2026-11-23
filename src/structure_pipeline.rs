@@ -251,6 +251,7 @@ struct Defs {
     sets: Vec<SetDef>,
     set_meta: Vec<SetMeta>,
     #[cfg_attr(not(test), allow(dead_code))]
+    #[cfg_attr(not(megu_vanilla_data), allow(dead_code))]
     by_id: HashMap<String, usize>,
     structures: HashMap<String, StructureDef>,
     struct_ids: Vec<String>,
@@ -732,6 +733,7 @@ fn ring_admit(d: &Defs, g: &mut Gen, set: usize, x: i32, z: i32) -> bool {
 }
 
 #[cfg_attr(not(test), allow(dead_code))]
+#[cfg_attr(not(megu_vanilla_data), allow(dead_code))]
 fn ring_chunks(d: &Defs, g: &mut Gen, set: usize) -> std::sync::Arc<HashSet<(i32, i32)>> {
     let seed = g.wseed();
     let tag = preset_tag(g.preset);
@@ -760,6 +762,7 @@ fn ring_chunks(d: &Defs, g: &mut Gen, set: usize) -> std::sync::Arc<HashSet<(i32
 /// which reads the biome quart sweep for all 128 candidates and threads one `last`
 /// hint across them. Kept as the reference the lazy path is tested against.
 #[cfg_attr(not(test), allow(dead_code))]
+#[cfg_attr(not(megu_vanilla_data), allow(dead_code))]
 fn ring_chunks_uncached(d: &Defs, g: &mut Gen, set: usize) -> HashSet<(i32, i32)> {
     let seed = g.wseed();
     if g.preset != worldgen::NoisePreset::Overworld {
@@ -844,6 +847,7 @@ fn placement_admits(d: &Defs, set: usize, seed: u64, x: i32, z: i32) -> bool {
 
 /// `StructurePlacement.isStructureChunk` for one set, including the exclusion zone.
 #[cfg(test)]
+#[cfg_attr(not(megu_vanilla_data), allow(dead_code))]
 fn set_admits(d: &Defs, set: usize, seed: u64, x: i32, z: i32, depth: u32) -> bool {
     if depth > 2 {
         // The exclusion graph is shallow in 1.21.1 (one set points at another); a
@@ -1079,6 +1083,7 @@ fn with_templates<R>(f: impl FnOnce(&Templates) -> R) -> R {
 }
 
 #[cfg_attr(not(test), allow(dead_code))]
+#[cfg_attr(not(megu_vanilla_data), allow(dead_code))]
 fn valid_biome(g: &mut Gen, allowed: &HashSet<String>, pos: (i32, i32, i32)) -> bool {
     valid_biome_fast(g, allowed, None, pos)
 }
@@ -1651,6 +1656,7 @@ struct RoundCache {
     /// Adapting-only starts: beard resolution asks for these without ever generating a
     /// non-adapting structure. `starts_cached` takes its adapting half from this cache.
     adapting_starts: AdaptingStartsFlight,
+    #[cfg_attr(not(megu_vanilla_data), allow(dead_code))]
     rings: RingsFlight,
     /// One lazily relocated chunk per `(seed, preset, set, ring index)`.
     ring_i: RingIFlight,
@@ -1680,6 +1686,7 @@ impl Default for RoundCache {
 
 /// Flight domains for this module's four caches (see `worldgen::flight_token`).
 const STARTS_FLIGHT_DOMAIN: u64 = 0x3_0000_0001;
+#[cfg_attr(not(megu_vanilla_data), allow(dead_code))]
 const RINGS_FLIGHT_DOMAIN: u64 = 0x3_0000_0002;
 const ADAPTING_STARTS_FLIGHT_DOMAIN: u64 = 0x3_0000_0003;
 const RING_I_FLIGHT_DOMAIN: u64 = 0x3_0000_0004;
@@ -1694,6 +1701,7 @@ fn starts_rounds() -> &'static std::sync::Mutex<StartsRoundMap> {
 
 /// Test probe: how many `chunk_starts` scans this round has run (see [`RoundCache::scans`]).
 #[cfg(test)]
+#[cfg_attr(not(megu_vanilla_data), allow(dead_code))]
 pub(crate) fn round_start_scans(round: u64) -> Option<u64> {
     round_cache(round).map(|c| c.scans.load(std::sync::atomic::Ordering::Relaxed))
 }
@@ -1701,6 +1709,7 @@ pub(crate) fn round_start_scans(round: u64) -> Option<u64> {
 /// Test probe: `(built, shared)` for the round's adapting-starts flight cache — the number
 /// of distinct keys computed against the number of asks served from a flight or a slot.
 #[cfg(test)]
+#[cfg_attr(not(megu_vanilla_data), allow(dead_code))]
 pub(crate) fn round_adapting_flight_counts(round: u64) -> Option<(u64, u64)> {
     round_cache(round).map(|c| c.adapting_starts.flight_counts())
 }
@@ -2462,7 +2471,7 @@ pub(crate) fn register_beard_resolver() {
 
 // ---------------------------------------------------------------- tests
 
-#[cfg(test)]
+#[cfg(all(test, megu_vanilla_data))]
 mod pipeline_tests {
     use super::*;
 
@@ -3789,6 +3798,7 @@ mod pipeline_tests {
 /// module that owns `mod_positions` / `freg` / `Pf`.)
 #[cfg(test)]
 mod window_tests {
+    #[cfg(megu_vanilla_data)]
     use super::*;
 
     /// `height_range` samples the **generator** window, not the world window.
@@ -3805,6 +3815,7 @@ mod window_tests {
     /// `BelowTop(10)` over a 0/128 window; with `hi = 245` roughly half of the ~150
     /// quartz cells would land in air above the roof.
     #[test]
+    #[cfg(megu_vanilla_data)]
     fn height_range_positions_sample_the_generator_window() {
         let mut g = crate::worldgen::Gen::load_preset(
             4242,
@@ -3873,12 +3884,14 @@ mod window_tests {
 mod defs_loader_tests {
     use super::*;
 
+    #[cfg_attr(not(megu_vanilla_data), allow(dead_code))]
     fn vanilla(kind: &str) -> Vec<(String, Vec<u8>)> {
         let mut files: Vec<_> = Gen::dp_files(kind).into_iter().collect();
         files.sort_by_key(|a| registry_sort_key(&a.0));
         files
     }
 
+    #[cfg_attr(not(megu_vanilla_data), allow(dead_code))]
     fn fingerprint(d: &Defs) -> String {
         let mut s = String::new();
         let mut ids: Vec<_> = d.structures.keys().collect();
@@ -3952,14 +3965,17 @@ mod defs_loader_tests {
     /// vanilla datapack — measured at HEAD `8dad8c7` before `load_defs_from_files`
     /// existed. If a refactor moves one structure slot, template payload, set
     /// placement, biome list or adapting-set index, this digest moves with it.
+    #[cfg_attr(not(megu_vanilla_data), allow(dead_code))]
     const VANILLA_FP: &str = "915d86995cdbf21f7df2b7e40fb6d6152e19a683edc8b081c7146cb60a35f230";
 
+    #[cfg_attr(not(megu_vanilla_data), allow(dead_code))]
     fn digest(d: &Defs) -> String {
         let bytes = crate::generation_math::sha256(fingerprint(d).as_bytes());
         bytes.iter().map(|b| format!("{b:02x}")).collect()
     }
 
     #[test]
+    #[cfg(megu_vanilla_data)]
     fn vanilla_defs_load_identically() {
         let structures = vanilla("structure");
         let sets = vanilla("structure_set");
@@ -3978,6 +3994,7 @@ mod defs_loader_tests {
     }
 
     #[test]
+    #[cfg(megu_vanilla_data)]
     fn malformed_structure_entries_are_skipped_without_shifting_slots() {
         let mut structures = vanilla("structure");
         // All three ids sort before `minecraft:ancient_city`, so an entry that
@@ -4012,6 +4029,7 @@ mod defs_loader_tests {
     }
 
     #[test]
+    #[cfg(megu_vanilla_data)]
     fn malformed_structure_set_entries_are_skipped() {
         let structures = vanilla("structure");
         let mut sets = vanilla("structure_set");

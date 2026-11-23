@@ -6,7 +6,7 @@ use crate::feature::SpawnerData;
 
 // `NetherSpawnRules::vanilla` reads this file at runtime; the test module still
 // pins the same bytes so its assertions read the datapack file itself.
-#[cfg(test)]
+#[cfg(all(test, megu_vanilla_data))]
 const NETHER_DIMENSION_TYPE: &[u8] =
     include_bytes!("../datapacks/vanilla/data/minecraft/dimension_type/the_nether.json");
 
@@ -327,6 +327,7 @@ mod nether_spawn_tests {
         panic!("spawn rule should not draw RNG")
     }
 
+    #[cfg(megu_vanilla_data)]
     #[test]
     fn nether_spawn_light_uses_pinned_constant_and_consumes_one_sky_roll() {
         let light = NetherSpawnRules::vanilla().light;
@@ -492,6 +493,7 @@ mod nether_spawn_tests {
         assert!(!rules.allows(Blaze, POS, &world, no_roll));
     }
 
+    #[cfg_attr(not(megu_vanilla_data), allow(dead_code))]
     fn assert_spawners(entries: &[SpawnerData], expected: &[(&str, i32, i32, i32)]) {
         let actual: Vec<_> = entries
             .iter()
@@ -515,6 +517,7 @@ mod nether_spawn_tests {
     }
 
     #[test]
+    #[cfg(megu_vanilla_data)]
     fn nether_spawn_biome_lists_and_weighted_picks() {
         // Orders and group sizes from the pinned MobSpawnSettings biome oracle.
         type BiomeSpawnCase<'a> = (&'a str, &'a [(&'a str, i32, i32, i32)]);
@@ -577,6 +580,7 @@ mod nether_spawn_tests {
     }
 
     #[test]
+    #[cfg(megu_vanilla_data)]
     fn nether_spawn_fortress_monster_overrides() {
         let rules = NetherSpawnRules::vanilla();
         let spawners = |category, bricks, structure, piece| {

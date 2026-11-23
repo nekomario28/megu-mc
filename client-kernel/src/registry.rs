@@ -691,15 +691,37 @@ mod tests {
     use super::*;
     use crate::light::owner::{FaceOcclusion, Half};
 
-    fn open() -> Registry {
+    /// The pinned pack, or `None` on a strict-public export where the
+    /// generated `assets/*_1211*` files are absent — a skip, never a silent
+    /// pass: any other read error still panics.
+    fn try_open() -> Option<Registry> {
         let dir = concat!(env!("CARGO_MANIFEST_DIR"), "/../assets/");
-        let read = |name| std::fs::read(format!("{dir}{name}")).unwrap();
-        Registry::open_json(&read("block_states_1211.json"), &read("blocks_1211.json")).unwrap()
+        let read = |name| match std::fs::read(format!("{dir}{name}")) {
+            Ok(bytes) => Some(bytes),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
+            Err(e) => panic!("cannot read {dir}{name}: {e}"),
+        };
+        let (states, blocks) = (read("block_states_1211.json")?, read("blocks_1211.json")?);
+        Some(Registry::open_json(&states, &blocks).unwrap())
+    }
+
+    /// Open the pinned pack or skip the calling test on a strict-public
+    /// export (the generated `assets/*_1211*` files are not redistributed).
+    macro_rules! open_or_skip {
+        () => {
+            match try_open() {
+                Some(registry) => registry,
+                None => {
+                    eprintln!("pinned assets absent (strict-public export); skipped");
+                    return;
+                }
+            }
+        };
     }
 
     #[test]
     fn pinned_assets_open_and_expose_light_facts() {
-        let registry = open();
+        let registry = open_or_skip!();
         assert_eq!(registry.block_count(), 1060);
         assert_eq!(registry.state_count(), STATE_COUNT as usize);
         let stone = registry.default_state("minecraft:stone").unwrap();
@@ -726,7 +748,7 @@ mod tests {
 
     #[test]
     fn fluid_and_slab_facts_follow_the_pinned_states() {
-        let registry = open();
+        let registry = open_or_skip!();
         let water = registry.facts(80).unwrap();
         assert_eq!(
             (water.fluid_kind, water.fluid_level, water.is_liquid),
@@ -764,10 +786,11 @@ mod tests {
 
     #[test]
     fn invalid_lookups_and_inputs_fail_closed() {
-        let registry = open();
-        assert_eq!(registry.state_name(STATE_COUNT), Err(Error::InvalidState));
-        assert_eq!(registry.facts(STATE_COUNT), Err(Error::InvalidState));
-        assert_eq!(registry.default_state("stone"), Err(Error::NotFound));
+        if let Some(registry) = try_open() {
+            assert_eq!(registry.state_name(STATE_COUNT), Err(Error::InvalidState));
+            assert_eq!(registry.facts(STATE_COUNT), Err(Error::InvalidState));
+            assert_eq!(registry.default_state("stone"), Err(Error::NotFound));
+        }
         assert!(matches!(
             Registry::open_json(b"", b""),
             Err(Error::InvalidJson)
@@ -857,7 +880,7 @@ mod tests {
 
     #[test]
     fn lookup_resource_resolves_validated_ids_and_fails_closed() {
-        let registry = open();
+        let registry = open_or_skip!();
         let stone = registry.default_state("minecraft:stone").unwrap();
         // An explicit namespace resolves like `default_state`.
         assert_eq!(
@@ -1104,13 +1127,14 @@ mod tests {
 
     #[test]
     fn from_version_dir_opens_the_pinned_assets_as_a_pack() {
-        let registry = Registry::from_version_dir(Path::new(concat!(
-            env!("CARGO_MANIFEST_DIR"),
-            "/../assets"
-        )))
-        .unwrap();
+        let dir = Path::new(concat!(env!("CARGO_MANIFEST_DIR"), "/../assets"));
+        if !dir.join("blocks_1211.json").is_file() {
+            eprintln!("pinned assets absent (strict-public export); skipped");
+            return;
+        }
+        let registry = Registry::from_version_dir(dir).unwrap();
         assert_eq!(registry.state_count(), STATE_COUNT as usize);
-        let pinned = open();
+        let pinned = open_or_skip!();
         let stone = pinned.default_state("minecraft:stone").unwrap();
         assert_eq!(registry.facts(stone).unwrap(), pinned.facts(stone).unwrap());
         let slab = pinned.default_state("minecraft:oak_slab").unwrap();
@@ -1120,11 +1144,18 @@ mod tests {
     #[test]
     fn pinned_pack_without_states_json_still_loads() {
         let dir = concat!(env!("CARGO_MANIFEST_DIR"), "/../assets/");
-        let read = |name| std::fs::read(format!("{dir}{name}")).unwrap();
+        let read = |name| match std::fs::read(format!("{dir}{name}")) {
+            Ok(bytes) => Some(bytes),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
+            Err(e) => panic!("cannot read {dir}{name}: {e}"),
+        };
+        let Some(blocks) = read("blocks_1211.json") else {
+            eprintln!("pinned assets absent (strict-public export); skipped");
+            return;
+        };
         // The generated table is preferred; on a stripped export it is absent
         // and the runtime fallback derives the same coarse registry from
         // `blocks.json` alone.
-        let blocks = read("blocks_1211.json");
         let facts = std::fs::read(format!("{dir}block_state_facts_1211.bin"))
             .unwrap_or_else(|_| derive_state_facts(&parse(&blocks).unwrap(), None).unwrap());
         let registry = Registry::from_parts(&blocks, None, &facts).unwrap();
@@ -1162,7 +1193,7 @@ mod tests {
             Registry::load_state_facts_from_bytes(&[0u8; FACT_BYTES]),
             Err(Error::InvalidJson)
         );
-        let registry = open();
+        let registry = open_or_skip!();
         assert_eq!(registry.state_count(), STATE_COUNT as usize);
         assert_eq!(registry.facts(0).unwrap().is_air, 1);
     }
@@ -1170,15 +1201,24 @@ mod tests {
     #[test]
     fn derived_facts_reproduce_the_pinned_table_columns() {
         let dir = concat!(env!("CARGO_MANIFEST_DIR"), "/../assets/");
-        let read = |name| std::fs::read(format!("{dir}{name}")).unwrap();
-        let (blocks, states) = (read("blocks_1211.json"), read("block_states_1211.json"));
+        let read = |name| match std::fs::read(format!("{dir}{name}")) {
+            Ok(bytes) => Some(bytes),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
+            Err(e) => panic!("cannot read {dir}{name}: {e}"),
+        };
+        let (Some(blocks), Some(states)) =
+            (read("blocks_1211.json"), read("block_states_1211.json"))
+        else {
+            eprintln!("pinned assets absent (strict-public export); skipped");
+            return;
+        };
         let derived = derive_state_facts(
             &parse(&blocks).unwrap(),
             Some(&parse(&states).unwrap()),
         )
         .unwrap();
         let fallback = Registry::from_parts(&blocks, Some(&states), &derived).unwrap();
-        let pinned = open();
+        let pinned = open_or_skip!();
         // Every kernel-visible field must agree for the structural basics the
         // fallback commits to: air, full cubes, slabs, stairs, fluids and
         // partial occluders with a lone non-full collision box.

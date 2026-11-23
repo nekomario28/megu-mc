@@ -251,6 +251,7 @@ mod tests {
         }
     }
 
+    #[cfg(megu_vanilla_data)]
     #[test]
     fn native_callback_metadata_after_block_and_fluid_reload() {
         use crate::scheduled_ticks::delivery_fixture;

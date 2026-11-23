@@ -19,7 +19,7 @@ mod effects;
 mod java_compat;
 mod landing;
 mod landing_types;
-#[cfg(test)]
+#[cfg(all(test, megu_vanilla_data))]
 mod light_pack_tests;
 use cached_lookup::CachedLookup;
 use chunk_ack::ChunkFeedback;
@@ -345,6 +345,7 @@ const BOBBER_BITE_GT: u64 = 75; // 3.75s, bobber settles before biting
 const MOB_BURN_TICK_GT: u64 = 20; // 1s, vanilla burning damage interval
 const CREEPER_IGNITE_GT: u64 = 30; // 1.5s, creeper fuse before igniting
 #[cfg(test)]
+#[cfg_attr(not(megu_vanilla_data), allow(dead_code))]
 const STARVE_GT: u64 = 80; // 4s, starvation damage interval
 const FLUID_TICK_GT: u64 = 30; // 1.5s, scheduled lava/fluid tick
                                // Per-tick probabilities, not intervals: the denominator scales WITH ticks per
@@ -1756,6 +1757,7 @@ fn spawn_passive_natural(tick: u64) {
 /// One water-mob attempt: the cell holds water in the sea-level band vanilla
 /// water spawning reads (50..=63), under the category's cap.
 #[cfg(test)]
+#[cfg_attr(not(megu_vanilla_data), allow(dead_code))]
 fn live_aquatic_spawn_attempt(
     x: i32,
     y: i32,
@@ -1903,6 +1905,7 @@ fn spawn_underground_natural(tick: u64) {
 /// light level 7 or darker, under the hostile cap and a non-peaceful
 /// difficulty — `Monster.checkMonsterSpawnRules` for `the_end`.
 #[cfg(test)]
+#[cfg_attr(not(megu_vanilla_data), allow(dead_code))]
 fn live_end_spawn_attempt(x: i32, y: i32, z: i32, light: i32, cap: usize) -> bool {
     if DIFFICULTY.load(Ordering::Relaxed) == 0
         || live_category_count(DimId::End, MobCategory::Monster) >= cap
@@ -6216,6 +6219,7 @@ fn generated_content() -> &'static Mutex<generated_content::Content> {
     CONTENT.get_or_init(|| Mutex::new(generated_content::Content::default()))
 }
 #[cfg(test)]
+#[cfg_attr(not(megu_vanilla_data), allow(dead_code))]
 fn materialize_generation_payloads(
     staged: Vec<(
         (i32, i32, i32),
@@ -12806,6 +12810,7 @@ fn gc_backoff() {
 /// biome has no usable entry. This is not NaturalSpawner: placement, group size,
 /// difficulty and category caps are still the tick loop's own contract.
 #[cfg(test)]
+#[cfg_attr(not(megu_vanilla_data), allow(dead_code))]
 fn spawn_etype_for_biome(biome: Option<&str>, attempt: u64) -> i64 {
     biome
         .and_then(|b| feature::choose_supported_hostile(b, attempt))
@@ -13350,6 +13355,7 @@ pub(crate) type GenSources = HashMap<(i32, i32), Vec<((i32, i32, i32), u8)>>;
 const LIGHT_MIN_Y: i32 = MIN_Y - 16;
 
 #[cfg(test)]
+#[cfg_attr(not(megu_vanilla_data), allow(dead_code))]
 fn block_light_sections_from(
     cx: i32,
     cz: i32,
@@ -13620,6 +13626,7 @@ fn block_light_sections_dim(dim: DimId, cx: i32, cz: i32, gen: &GenSources) -> V
 }
 
 #[cfg(test)]
+#[cfg_attr(not(megu_vanilla_data), allow(dead_code))]
 fn sky_light_sections(cx: i32, cz: i32) -> Vec<[u8; 2048]> {
     let reg = crate::block_registry::breg();
     let mut floors = [0i32; 256];
@@ -13664,6 +13671,7 @@ struct SkySpill {
     w: usize,
     d: usize,
     #[cfg(test)]
+    #[cfg_attr(not(megu_vanilla_data), allow(dead_code))]
     h: usize,
     light: Vec<u8>,
     /// Every cell the spread lit, as a flat index and its level, in the order it was set. The
@@ -13703,6 +13711,7 @@ impl SkySpill {
     /// The map-shaped accessor the spill's own behavioural test drives, kept so that test states
     /// positions rather than flat indices.
     #[cfg(test)]
+    #[cfg_attr(not(megu_vanilla_data), allow(dead_code))]
     fn get(&self, key: &(i32, i32, i32)) -> Option<&u8> {
         let (x, y, z) = *key;
         if self.w == 0
@@ -14029,6 +14038,7 @@ fn section_index_dim(dim: DimId, sy: i32) -> Option<usize> {
 }
 
 #[cfg(test)]
+#[cfg_attr(not(megu_vanilla_data), allow(dead_code))]
 fn section_index(sy: i32) -> Option<usize> {
     section_index_dim(DimId::Overworld, sy)
 }
@@ -14861,6 +14871,7 @@ fn sky_light_sections_dim(dim: DimId, cx: i32, cz: i32) -> Vec<[u8; 2048]> {
 /// the independent statement of what the dense grid must produce — `light_pack_tests` hands it
 /// levels the producer cannot make (negative coordinates, out-of-range y) and compares every
 /// nibble against a formula written from the layout alone.
+#[cfg_attr(not(megu_vanilla_data), allow(dead_code))]
 fn sky_light_sections_with_spill(
     cx: i32,
     cz: i32,
@@ -14920,6 +14931,7 @@ fn pack_sky_section(sy: i32, floors: &[i32; 256]) -> [u8; 2048] {
 }
 
 #[cfg(test)]
+#[cfg_attr(not(megu_vanilla_data), allow(dead_code))]
 fn sky_light_sections_from(cx: i32, cz: i32, floors: &[i32; 256]) -> Vec<[u8; 2048]> {
     sky_light_sections_from_dim(DimId::Overworld, cx, cz, floors)
 }
@@ -14974,6 +14986,7 @@ fn sky_light_sections_from_dim(
 /// Overworld arm passes [`DimId::Overworld`] and is byte-for-byte what it was before the
 /// per-dimension registry existed.
 #[cfg(test)]
+#[cfg_attr(not(megu_vanilla_data), allow(dead_code))]
 fn chunk_data(cx: i32, cz: i32, dim: DimId, gen: &mut GenSources) -> Vec<u8> {
     chunk_data_opt(cx, cz, dim, gen, chunk_prefetch_enabled())
 }
@@ -15706,6 +15719,7 @@ fn map_chunk_sig(dim: DimId, cx: i32, cz: i32, gen: &GenSources) -> u64 {
 
 /// Drop every chunk-scoped cache so tests start cold.
 #[cfg(test)]
+#[cfg_attr(not(megu_vanilla_data), allow(dead_code))]
 fn clear_chunk_caches_for_tests() {
     map_chunk_cache().lock().unwrap_or_else(|e| e.into_inner()).map.clear();
     map_chunk_cache().lock().unwrap_or_else(|e| e.into_inner()).order.clear();
@@ -15721,6 +15735,7 @@ fn clear_chunk_caches_for_tests() {
 }
 
 #[cfg(test)]
+#[cfg_attr(not(megu_vanilla_data), allow(dead_code))]
 fn map_chunk(cx: i32, cz: i32, dim: DimId, gen: &mut GenSources) -> Vec<u8> {
     map_chunk_lane(cx, cz, dim, gen, false)
 }
@@ -16267,11 +16282,13 @@ fn write_light_arrays_lane(
 }
 
 #[cfg(test)] // the Overworld-named seam for light tests
+#[cfg_attr(not(megu_vanilla_data), allow(dead_code))]
 fn update_light_packet(cx: i32, cz: i32, gen: &GenSources) -> Vec<u8> {
     update_light_packet_dim(DimId::Overworld, cx, cz, gen)
 }
 
 #[cfg(test)]
+#[cfg_attr(not(megu_vanilla_data), allow(dead_code))]
 fn update_light_packet_dim(dim: DimId, cx: i32, cz: i32, gen: &GenSources) -> Vec<u8> {
     update_light_packet_lane(dim, cx, cz, gen, None)
 }
@@ -16969,6 +16986,7 @@ fn light_pass_once() {
 /// and re-sent. Neighbours generated later name this chunk in their own call, so every ordered
 /// pair is covered once.
 #[cfg(test)]
+#[cfg_attr(not(megu_vanilla_data), allow(dead_code))]
 fn light_dirty_for(gen: &GenSources, cx: i32, cz: i32) -> Vec<(i32, i32)> {
     light_dirty_for_dim(DimId::Overworld, gen, cx, cz)
 }
@@ -17308,6 +17326,7 @@ pub(crate) mod chunkprof {
     /// where the bench's milliseconds are not (the same build measured 30.1 and 67.0
     /// ms/chunk on this host within an hour, tracking the other lanes' load).
     #[cfg(test)]
+    #[cfg_attr(not(megu_vanilla_data), allow(dead_code))]
     pub(crate) fn counters() -> [u64; 14] {
         [
             N.load(Ordering::Relaxed),
@@ -20272,13 +20291,13 @@ mod brigadier_tests;
 mod brigadier_wire_tests;
 #[cfg(test)]
 mod command_tests;
-#[cfg(test)]
+#[cfg(all(test, megu_vanilla_data))]
 mod container_tests;
 #[cfg(test)]
 mod craft_tests;
 #[cfg(test)]
 mod effect_tests;
-#[cfg(test)]
+#[cfg(all(test, megu_vanilla_data))]
 mod entity_encoding_tests;
 #[cfg(test)]
 mod fanout_tests;
@@ -20288,11 +20307,11 @@ mod furnace_cache_tests;
 #[cfg(test)]
 mod merge_tests;
 mod nbt;
-#[cfg(test)]
+#[cfg(all(test, megu_vanilla_data))]
 mod persistence_tests;
-#[cfg(test)]
+#[cfg(all(test, megu_vanilla_data))]
 mod primitives_tests;
-#[cfg(test)]
+#[cfg(all(test, megu_vanilla_data))]
 mod registry_tests;
 mod mineshaft_layout;
 mod mineshaft;
@@ -20305,7 +20324,7 @@ mod structure_transform;
 mod test_support;
 mod tick_persistence;
 mod tick_queue;
-#[cfg(test)]
+#[cfg(all(test, megu_vanilla_data))]
 mod tick_tests;
 #[cfg(test)]
 mod anticheat_world_tests;
@@ -20354,7 +20373,7 @@ mod resource_pack_url_tests {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, megu_vanilla_data))]
 mod mineshaft_runtime_tests {
     use super::*;
     use std::net::{Shutdown, TcpListener};
@@ -22094,6 +22113,7 @@ mod mineshaft_runtime_tests {
 mod dim_block_entity_invalidation_tests {
     use super::*;
 
+    #[cfg_attr(not(megu_vanilla_data), allow(dead_code))]
     struct Restore {
         store: LiveBlockEntityStore,
         cells: Vec<(DimBlockPos, u32)>,
@@ -22101,6 +22121,7 @@ mod dim_block_entity_invalidation_tests {
     }
 
     impl Restore {
+        #[cfg_attr(not(megu_vanilla_data), allow(dead_code))]
         fn take() -> Self {
             Self {
                 store: std::mem::take(&mut *live_block_entities().lock().unwrap_or_else(|e| e.into_inner())),
@@ -22126,6 +22147,7 @@ mod dim_block_entity_invalidation_tests {
     }
 
     #[test]
+    #[cfg(megu_vanilla_data)]
     fn dim_block_rewrite_drops_live_block_entity_immediately_but_keeps_state_writes() {
         let _guard = world_guard();
         let mut restore = Restore::take();
@@ -22611,7 +22633,7 @@ mod ultra_disk_5_tests {
 
 // ---------------- Lane P8a: parity tests ----------------
 
-#[cfg(test)]
+#[cfg(all(test, megu_vanilla_data))]
 mod p8a_parity_tests {
     use super::*;
     use std::collections::BTreeMap;
@@ -22881,7 +22903,7 @@ mod p8a_parity_tests {
 /// registry through the `block_entities` `game_tick` stage, the live policy
 /// into the join fair-play signal and play frame bound, and the P8b-2
 /// `award_stats` encoder behind C2S `ClientCommand` action 1.
-#[cfg(test)]
+#[cfg(all(test, megu_vanilla_data))]
 mod w3_live_wire_tests {
     use super::*;
     use std::collections::{BTreeMap, BinaryHeap};
@@ -23703,7 +23725,7 @@ mod issue88_seed_mobs_tests {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, megu_vanilla_data))]
 mod mega_w2_tests {
     use super::*;
 

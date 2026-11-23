@@ -1,6 +1,7 @@
 use super::*;
 use crate::block_registry::{breg, HeightmapKind};
 
+#[cfg(megu_vanilla_data)]
 fn fixture() -> J {
     jparse(include_bytes!("../tests/data/mineshaft_pipeline_1211.json")).unwrap()
 }
@@ -414,6 +415,7 @@ fn production_populate_reaches_admission_dispatch_and_out_of_bounds_floor() {
     assert_eq!(reg.canonical_state(s), "minecraft:cave_air");
 }
 
+#[cfg(megu_vanilla_data)]
 #[test]
 fn mineshaft_support_distinguishes_full_faces_center_and_falling_blocks() {
     let r = breg().unwrap();
@@ -632,6 +634,7 @@ pub(crate) fn strip_outer_footers(payload: &[u8]) -> &[u8] {
     payload
 }
 
+#[cfg(megu_vanilla_data)]
 #[test]
 fn generated_entities_and_mutated_spawner_nbt_resume_in_a_new_process_once() {
     if crate::test_support::isolated_world_test() {

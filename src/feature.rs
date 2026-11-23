@@ -20,7 +20,7 @@ use std::collections::{HashMap, HashSet};
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
 
-#[cfg(test)]
+#[cfg(all(test, megu_vanilla_data))]
 #[path = "generation_contract_tests.rs"]
 mod generation_contract_tests;
 
@@ -446,6 +446,7 @@ enum Cf {
     /// draw, and sets `bedrock` at `height` and default `fire` at `height + 1`.
     EndSpike(EndSpikeCfg),
     #[cfg_attr(not(test), allow(dead_code))]
+    #[cfg_attr(not(megu_vanilla_data), allow(dead_code))]
     Ore {
         size: i32,
         discard: f32,
@@ -3082,9 +3083,11 @@ fn bc_find_air(
 
 #[cfg(test)]
 mod basalt_sea_tests {
+    #[cfg(megu_vanilla_data)]
     use super::*;
 
     #[test]
+    #[cfg(megu_vanilla_data)]
     fn basalt_columns_use_the_generators_sea_level() {
         let reg = breg().expect("block registry");
         let lava = reg.state_of("minecraft:lava", None);
@@ -3160,11 +3163,13 @@ thread_local! {
 }
 
 #[cfg(test)]
+#[cfg_attr(not(megu_vanilla_data), allow(dead_code))]
 pub(crate) fn spc_trace_begin() {
     SPC_TRACE_SINK.with(|s| *s.borrow_mut() = Some(Vec::new()));
 }
 
 #[cfg(test)]
+#[cfg_attr(not(megu_vanilla_data), allow(dead_code))]
 pub(crate) fn spc_trace_take() -> Vec<String> {
     SPC_TRACE_SINK
         .with(|s| s.borrow_mut().take())
@@ -3993,9 +3998,11 @@ fn spc_can_spread_from(ctx: &mut FC, reg: &BReg, pos: (i32, i32, i32)) -> bool {
 
 #[cfg(test)]
 mod sculk_patch_entry_tests {
+    #[cfg(megu_vanilla_data)]
     use super::*;
 
     #[test]
+    #[cfg(megu_vanilla_data)]
     fn sculk_patch_entry_requires_full_collision_shape() {
         let reg = breg().expect("block registry");
         let path = reg.state_of("minecraft:dirt_path", None);
@@ -4018,6 +4025,7 @@ mod sculk_patch_entry_tests {
     }
 
     #[test]
+    #[cfg(megu_vanilla_data)]
     fn sculk_patch_entry_rejects_flowing_water() {
         let reg = breg().expect("block registry");
         let source = reg.with_prop(reg.state_of("minecraft:water", None), "level", "0");
@@ -5573,8 +5581,10 @@ type FeatureOrder = Vec<Vec<(u32, String)>>;
 /// chunk's `present_mask`. `placed_idx` indexes `placed_vec` directly.
 struct StepEntry {
     #[cfg(test)]
+    #[cfg_attr(not(megu_vanilla_data), allow(dead_code))]
     gi: u32,
     #[cfg(test)]
+    #[cfg_attr(not(megu_vanilla_data), allow(dead_code))]
     name: String,
     step_biome_mask: u128,
     ball_mask: u128,
@@ -6205,6 +6215,7 @@ pub(crate) fn spawn_cost_for(biome: &str, entity: &str) -> Option<SpawnCost> {
 /// hard-coded type list irrespective of biome. Mob-specific spawn placement,
 /// group size, difficulty and per-category caps remain the caller's contract.
 #[cfg(test)]
+#[cfg_attr(not(megu_vanilla_data), allow(dead_code))]
 pub(crate) fn choose_supported_hostile(biome: &str, roll: u64) -> Option<&'static str> {
     const SUPPORTED: [&str; 4] = [
         "minecraft:zombie",
@@ -6735,6 +6746,7 @@ fn leaf_bit(ctx: &mut FC, fr: &FReg, leaf: u16) -> Option<u128> {
 }
 
 #[cfg(test)]
+#[cfg_attr(not(megu_vanilla_data), allow(dead_code))]
 fn mod_positions(
     m: &PM,
     fr: &'static FReg,
@@ -7029,6 +7041,7 @@ thread_local! {
 }
 
 #[cfg(test)]
+#[cfg_attr(not(megu_vanilla_data), allow(dead_code))]
 fn ore_should_place(
     discard: f32,
     ctx: &mut FC,
@@ -7365,6 +7378,7 @@ fn gen_ore_fast(ctx: &mut FC, rng: &mut Xor, pos: (i32, i32, i32), ore: &FastOre
 /// always matches, so the geometry can be compared cell for cell with vanilla's own output
 /// (see evidence/gameplay/feature-parity/ore_andesite_666.txt).
 #[cfg(test)]
+#[cfg_attr(not(megu_vanilla_data), allow(dead_code))]
 pub(crate) fn ore_cells_for_test(
     seed: u64,
     pos: (i32, i32, i32),
@@ -7382,7 +7396,7 @@ pub(crate) fn ore_cells_for_test(
 
 /// Pins the ore geometry and the full feature-population capture to SHA-256 while
 /// reporting the elapsed time per populated chunk for this exact fixture.
-#[cfg(test)]
+#[cfg(all(test, megu_vanilla_data))]
 #[test]
 fn perf_ore_parity_and_timing() {
     use std::time::{Duration, Instant};
@@ -9547,6 +9561,7 @@ pub(crate) struct CarverReg {
 impl CarverReg {
     /// A configured carver by its resource name, for diagnostics and tests only.
     #[cfg(test)]
+    #[cfg_attr(not(megu_vanilla_data), allow(dead_code))]
     fn def(&self, name: &str) -> Option<&'static CarverDef> {
         self.cfg.get(name).copied()
     }
@@ -10721,6 +10736,7 @@ fn pop_wave_spacing() -> i32 {
 #[cfg(test)]
 static POP_WAVE_SPACING: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 #[cfg(test)]
+#[cfg_attr(not(megu_vanilla_data), allow(dead_code))]
 pub(crate) fn set_pop_wave_spacing(spacing: usize) {
     POP_WAVE_SPACING.store(spacing, Ordering::Relaxed);
 }
@@ -10729,6 +10745,7 @@ pub(crate) fn set_pop_wave_spacing(spacing: usize) {
 pub(crate) static POPULATE_WORKERS: std::sync::atomic::AtomicUsize =
     std::sync::atomic::AtomicUsize::new(0);
 #[cfg(test)]
+#[cfg_attr(not(megu_vanilla_data), allow(dead_code))]
 pub(crate) fn populate_workers() -> usize {
     POPULATE_WORKERS.load(Ordering::Relaxed)
 }
@@ -11273,6 +11290,7 @@ fn compute_carve_chunk(
 /// function a carved cell set instead of running a carve (a `CarveRun` is the carver's own
 /// storage and carries a mask and an order a fixture has no use for).
 #[cfg(test)]
+#[cfg_attr(not(megu_vanilla_data), allow(dead_code))]
 fn wg_heightmaps_after_carve(
     g: &mut Gen,
     cc: &ChunkCols,
@@ -11887,6 +11905,7 @@ pub(crate) fn feat_prof_record(name: &str, ns: u128) {
 }
 /// Dumps the feature-profile counters the test-gated probes fill.
 #[cfg(test)]
+#[cfg_attr(not(megu_vanilla_data), allow(dead_code))]
 pub(crate) fn feat_prof_dump() {
     let Some(m) = FEAT_PROF.get() else { return };
     let m = m.lock().unwrap_or_else(|e| e.into_inner());
@@ -12257,17 +12276,24 @@ fn promote_full_chunks(ctx: &mut FC<'_>, sx: i32, sz: i32) {
 
 #[cfg(test)]
 mod mark_above_tests {
+    #[cfg(megu_vanilla_data)]
     use super::{freg, gen_cf, Cf};
+    #[cfg(megu_vanilla_data)]
     use crate::block_registry::breg;
+    #[cfg(megu_vanilla_data)]
     use crate::generation_context::FC;
+    #[cfg(megu_vanilla_data)]
     use crate::generation_math::Xor;
+    #[cfg(megu_vanilla_data)]
     use crate::json::jparse;
+    #[cfg(megu_vanilla_data)]
     use crate::worldgen::Gen;
 
     /// `DiskFeature` calls `Feature.markAboveForPostProcessing` (`ece.a`), which walks `y+1`,
     /// `y+2`, stops at the first air cell (or outside build height), and files marks on the
     /// owning chunk.
     #[test]
+    #[cfg(megu_vanilla_data)]
     fn disk_feature_marks_above_for_post_processing_stopping_on_air() {
         let reg = breg().expect("block registry");
         let fr = freg();
@@ -12329,6 +12355,7 @@ mod mark_above_tests {
     /// `LakeFeature` (`ect.a`) calls `markAboveForPostProcessing` at two sites: after placing
     /// `CAVE_AIR` (`y >= 4`, NOT for `y < 4` fluid) and after placing the `barrier` block.
     #[test]
+    #[cfg(megu_vanilla_data)]
     fn lake_feature_marks_above_at_cave_air_and_barrier_sites() {
         let reg = breg().expect("block registry");
         let fr = freg();
@@ -12421,7 +12448,7 @@ mod mark_above_tests {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, megu_vanilla_data))]
 mod carver_parity_tests {
     use super::{apply_carvers, build_origin_grid, carve_ring_with, resolve_origin, OriginGrid};
     use crate::worldgen::{lock_gen_for_tests, Gen, ChunkCols};
@@ -12799,7 +12826,7 @@ mod carver_parity_tests {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, megu_vanilla_data))]
 mod a3b_tests {
     use super::*;
 
@@ -12932,7 +12959,7 @@ mod a3b_tests {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, megu_vanilla_data))]
 mod a3a_tests {
     use super::*;
     use crate::worldgen::{lock_gen_for_tests, NoisePreset};
@@ -13157,7 +13184,7 @@ mod a3a_tests {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, megu_vanilla_data))]
 mod p8b1_issue199_tests {
     // Issue #199: a configured_feature / placed_feature / configured_carver
     // file that fails to parse used to be dropped with at most an env-gated

@@ -337,6 +337,7 @@ impl FlatChunkWriteMap {
     }
 
     #[cfg(test)]
+    #[cfg_attr(not(megu_vanilla_data), allow(dead_code))]
     pub(crate) fn values(&self) -> impl Iterator<Item = &u32> + '_ {
         self.iter().map(|(_, v)| v)
     }

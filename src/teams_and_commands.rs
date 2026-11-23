@@ -6488,7 +6488,7 @@ fn apply_set_command_minecart(
 
 // ------------------------------------------------------------------ tests ---
 
-#[cfg(test)]
+#[cfg(all(test, megu_vanilla_data))]
 mod teams_and_commands_tests {
     use super::*;
 
@@ -6845,7 +6845,7 @@ mod teams_and_commands_tests {
 
 // ------------------------------------------------------------ p3_parity ---
 
-#[cfg(test)]
+#[cfg(all(test, megu_vanilla_data))]
 mod p3_parity_tests {
     use super::*;
     use std::io::Read;
@@ -7206,7 +7206,7 @@ mod p3_parity_tests {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, megu_vanilla_data))]
 mod p5d_parity_tests {
     // Lane P5d — issues #159, #163, #166, #168, #171, #172, #177, #224.
     use super::*;

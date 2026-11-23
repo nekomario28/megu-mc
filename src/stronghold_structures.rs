@@ -30,6 +30,7 @@ pub(crate) enum StrongholdKind {
 
 impl StrongholdKind {
     #[cfg_attr(not(test), allow(dead_code))]
+    #[cfg_attr(not(megu_vanilla_data), allow(dead_code))]
     pub(crate) fn name(self) -> &'static str {
         match self {
             Self::Start => "StartPiece",
@@ -64,6 +65,7 @@ pub(crate) enum SmallDoor {
 }
 
 impl SmallDoor {
+    #[cfg_attr(not(megu_vanilla_data), allow(dead_code))]
     fn ordinal(self) -> i32 {
         match self {
             Self::Opening => 0,
@@ -149,6 +151,7 @@ impl StrongholdPiece {
 
     /// The oracle's piece signature: identity, box, depth, orientation, door, flags.
     #[cfg_attr(not(test), allow(dead_code))]
+    #[cfg_attr(not(megu_vanilla_data), allow(dead_code))]
     pub(crate) fn signature(&self) -> String {
         let b = self.bounds;
         let orient = match self.orientation {
@@ -244,7 +247,9 @@ struct StrongholdGen {
 #[derive(Clone, Debug)]
 pub(crate) struct StrongholdStart {
     pub(crate) pieces: Vec<StrongholdPiece>,
+    #[cfg_attr(not(megu_vanilla_data), allow(dead_code))]
     pub(crate) portal_room: Option<usize>,
+    #[cfg_attr(not(megu_vanilla_data), allow(dead_code))]
     pub(crate) attempts: i32,
 }
 
@@ -971,6 +976,7 @@ pub(crate) fn generate_stronghold_pieces_with_rng(
 }
 
 #[cfg_attr(not(test), allow(dead_code))]
+#[cfg_attr(not(megu_vanilla_data), allow(dead_code))]
 pub(crate) fn generate_stronghold_pieces(
     seed: u64,
     chunk_x: i32,
@@ -2049,7 +2055,7 @@ pub(crate) fn place_stronghold_chunk(
     placement
 }
 
-#[cfg(test)]
+#[cfg(all(test, megu_vanilla_data))]
 mod stronghold_tests {
     use super::*;
     use crate::generation_math::sha256;

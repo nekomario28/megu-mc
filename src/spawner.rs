@@ -276,6 +276,6 @@ pub(crate) fn tick(tag:&mut Tag,origin:Pos,world:&mut impl World,random:&mut Lcg
     Ok(())
 }
 
-#[cfg(test)]
+#[cfg(all(test, megu_vanilla_data))]
 #[path = "spawner_tests.rs"]
 mod tests;

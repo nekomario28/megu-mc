@@ -3116,7 +3116,7 @@ pub(crate) fn mansion_after_place<W: TemplateWorld>(
 
 // ---------------------------------------------------------------- native fixture
 
-#[cfg(test)]
+#[cfg(all(test, megu_vanilla_data))]
 mod end_city_mansion_tests {
     use super::*;
     use crate::block_registry::breg;

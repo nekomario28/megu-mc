@@ -89,6 +89,7 @@ mod spawn_costs_tests {
     use std::cell::Cell;
 
     const SOUL_SAND_VALLEY: &str = "minecraft:soul_sand_valley";
+    #[cfg_attr(not(megu_vanilla_data), allow(dead_code))]
     const WARPED_FOREST: &str = "minecraft:warped_forest";
     const ENDERMAN: &str = "minecraft:enderman";
     const SKELETON: &str = "minecraft:skeleton";
@@ -128,6 +129,7 @@ mod spawn_costs_tests {
     }
 
     #[test]
+    #[cfg(megu_vanilla_data)]
     fn existing_mobs_seed_only_costs_in_their_own_biome() {
         let uncharged = pos(0, 64, 0);
         let charged = pos(-16, 64, 0);
@@ -150,6 +152,7 @@ mod spawn_costs_tests {
     }
 
     #[test]
+    #[cfg(megu_vanilla_data)]
     fn every_check_refreshes_the_charge_including_when_there_is_no_cost() {
         let site = pos(0, 64, 0);
         let mut state = SpawnCostState::from_existing([], |_, chunk| match chunk {
@@ -185,6 +188,7 @@ mod spawn_costs_tests {
     }
 
     #[test]
+    #[cfg(megu_vanilla_data)]
     fn after_spawn_accumulates_charges_across_entity_types() {
         let mut state = SpawnCostState::from_existing([], |_, _| Some(SOUL_SAND_VALLEY));
         let chunk = (0, 0);
@@ -200,6 +204,7 @@ mod spawn_costs_tests {
     }
 
     #[test]
+    #[cfg(megu_vanilla_data)]
     fn pinned_biomes_only_charge_for_soul_sand_valley_and_warped_forest() {
         let dir = concat!(
             env!("CARGO_MANIFEST_DIR"),

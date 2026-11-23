@@ -425,6 +425,7 @@ impl Xor {
         }
     }
     #[cfg(test)]
+    #[cfg_attr(not(megu_vanilla_data), allow(dead_code))]
     pub(crate) fn split(&mut self) -> Self {
         Xor::raw(self.next_long(), self.next_long())
     }
@@ -1807,7 +1808,7 @@ impl EndIslands {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, megu_vanilla_data))]
 mod end_island_tests {
     use super::*;
     #[test]
@@ -2146,7 +2147,7 @@ impl BlendedNoise {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, megu_vanilla_data))]
 mod tests {
     use super::*;
 
@@ -2457,6 +2458,7 @@ mod deco_seed_tests {
 mod next_int_vs_vanilla_tests {
     use super::*;
 
+    #[cfg_attr(not(megu_vanilla_data), allow(dead_code))]
     fn fnv_of(results: impl Iterator<Item = i32>) -> u64 {
         let mut h = 0xcbf29ce484222325u64;
         for x in results {
@@ -2469,6 +2471,7 @@ mod next_int_vs_vanilla_tests {
     }
 
     #[test]
+    #[cfg(megu_vanilla_data)]
     fn next_int_streams_match_the_game_for_every_class_seed_and_bound() {
         let data = std::fs::read_to_string("tests/data/random_next_int_1211.tsv")
             .expect("vanilla nextInt vectors");

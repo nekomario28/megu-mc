@@ -2562,6 +2562,7 @@ fn block_pred_match(st: u32, pred: &str) -> bool {
 
 #[cfg(test)]
 mod execute_dimension_tests {
+    #[cfg(megu_vanilla_data)]
     use super::*;
 
     fn execute_console(command: &str) -> String {
@@ -2605,6 +2606,7 @@ mod execute_dimension_tests {
     }
 
     #[test]
+    #[cfg(megu_vanilla_data)]
     fn execute_in_nether_if_loaded_and_data_block_use_dimension_state() {
         if crate::test_support::isolated_world_test() {
             return;

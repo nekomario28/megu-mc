@@ -1,6 +1,7 @@
 //! Anti-xray and anti-fullbright against the generated world: what reaches the wire.
 use super::*;
 
+#[cfg_attr(not(megu_vanilla_data), allow(dead_code))]
 const SIDES: [(i32, i32, i32); 6] = [
     (1, 0, 0),
     (-1, 0, 0),
@@ -10,6 +11,7 @@ const SIDES: [(i32, i32, i32); 6] = [
     (0, 0, -1),
 ];
 
+#[cfg_attr(not(megu_vanilla_data), allow(dead_code))]
 fn rv(b: &[u8], i: &mut usize) -> i64 {
     let (mut r, mut s) = (0i64, 0);
     loop {
@@ -23,6 +25,7 @@ fn rv(b: &[u8], i: &mut usize) -> i64 {
     }
 }
 
+#[cfg_attr(not(megu_vanilla_data), allow(dead_code))]
 fn read_container(b: &[u8], i: &mut usize, n: usize, global: bool) -> Vec<u32> {
     let bits = b[*i] as usize;
     *i += 1;
@@ -58,6 +61,7 @@ fn read_container(b: &[u8], i: &mut usize, n: usize, global: bool) -> Vec<u32> {
 }
 
 /// The block states a chunk's section data puts on the wire.
+#[cfg_attr(not(megu_vanilla_data), allow(dead_code))]
 fn wire_states(dim: DimId, cx: i32, cz: i32, gen: &mut GenSources) -> Vec<Vec<u32>> {
     let data = chunk_data_opt(cx, cz, dim, gen, true);
     let mut i = 0;
@@ -73,6 +77,7 @@ fn wire_states(dim: DimId, cx: i32, cz: i32, gen: &mut GenSources) -> Vec<Vec<u3
     out
 }
 
+#[cfg_attr(not(megu_vanilla_data), allow(dead_code))]
 fn hidden_name(st: u32) -> bool {
     let name = breg().unwrap().name_of(st);
     HIDDEN_BLOCK_NAMES.contains(&name.trim_start_matches("minecraft:"))
@@ -83,6 +88,7 @@ fn hidden_name(st: u32) -> bool {
 /// Before: about a third of buried Overworld ores (deepslate ores won the filler vote
 /// against deepslate) and every Nether gold/quartz ore reached the wire.
 #[test]
+#[cfg(megu_vanilla_data)]
 fn buried_valuables_never_reach_the_wire_and_visible_ones_do() {
     // Generator initialisation is process-global: run in a child like the other
     // generated-world fixtures.
@@ -196,6 +202,7 @@ fn buried_valuables_never_reach_the_wire_and_visible_ones_do() {
 
 /// Every state of a hidden block is hidden, and see-through blocks expose a face.
 #[test]
+#[cfg(megu_vanilla_data)]
 fn hidden_set_covers_every_state_and_see_through_blocks_expose() {
     let reg = breg().unwrap();
     for name in [
@@ -228,11 +235,13 @@ fn hidden_set_covers_every_state_and_see_through_blocks_expose() {
     }
 }
 
+#[cfg_attr(not(megu_vanilla_data), allow(dead_code))]
 fn nibble(arr: &[u8; 2048], k: usize) -> u8 {
     (arr[k >> 1] >> ((k & 1) * 4)) & 15
 }
 
 /// Decode the light half of a chunk packet back into full section lists.
+#[cfg_attr(not(megu_vanilla_data), allow(dead_code))]
 fn read_light(p: &[u8], sections: usize) -> (Vec<[u8; 2048]>, Vec<[u8; 2048]>, usize) {
     let mut i = 0;
     let mut masks = [0u64; 4];
@@ -269,6 +278,7 @@ fn read_light(p: &[u8], sections: usize) -> (Vec<[u8; 2048]>, Vec<[u8; 2048]>, u
 /// All-zero light sections travel in the empty masks with no array, and nothing else
 /// changes: the decoded light equals the computed light bit for bit.
 #[test]
+#[cfg(megu_vanilla_data)]
 fn zero_light_sections_use_the_empty_masks_losslessly() {
     // Generator initialisation is process-global: run in a child like the other
     // generated-world fixtures.
@@ -305,6 +315,7 @@ fn zero_light_sections_use_the_empty_masks_losslessly() {
 /// clears is reachable by sky light, open caves keep their light, the switch off sends
 /// everything, and opening a pocket brings its real light back.
 #[test]
+#[cfg(megu_vanilla_data)]
 fn sealed_pocket_light_is_hidden_until_the_pocket_is_opened() {
     // Generator initialisation is process-global: run in a child like the other
     // generated-world fixtures.
@@ -405,6 +416,7 @@ fn sealed_pocket_light_is_hidden_until_the_pocket_is_opened() {
 /// must not leak their block-entity NBT in `0x27` chunk frames while anti-xray is on,
 /// and must appear immediately once an adjacent block is exposed.
 #[test]
+#[cfg(megu_vanilla_data)]
 fn buried_block_entity_nbt_is_suppressed_until_exposed() {
     if crate::test_support::isolated_world_test() {
         return;
@@ -455,6 +467,7 @@ fn buried_block_entity_nbt_is_suppressed_until_exposed() {
 /// recursive sub-tags like `#c:ores/custom`) automatically add every matching block
 /// state into `hidden_extra()` without manual ID configuration.
 #[test]
+#[cfg(megu_vanilla_data)]
 fn conventional_c_and_forge_ore_tags_auto_register_for_antixray() {
     let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("target/tmp")
@@ -506,6 +519,7 @@ fn conventional_c_and_forge_ore_tags_auto_register_for_antixray() {
 
 /// The (block count, states) each section of a chunk encode puts on the wire,
 /// for one anti-xray lane.
+#[cfg_attr(not(megu_vanilla_data), allow(dead_code))]
 fn wire_sections_lane(
     dim: DimId,
     cx: i32,
@@ -529,6 +543,7 @@ fn wire_sections_lane(
 }
 
 /// Skip one NBT payload (the tag id is already known).
+#[cfg_attr(not(megu_vanilla_data), allow(dead_code))]
 fn skip_nbt(b: &[u8], i: &mut usize, id: u8) {
     match id {
         0 => {}
@@ -577,6 +592,7 @@ fn skip_nbt(b: &[u8], i: &mut usize, id: u8) {
 
 /// The index just past a `map_chunk` payload's block entities, after parsing
 /// them into (local x, y, local z).
+#[cfg_attr(not(megu_vanilla_data), allow(dead_code))]
 fn map_chunk_block_entities(payload: &[u8]) -> Vec<(i32, i32, i32)> {
     let mut i = 8; // chunk x and z
     assert_eq!(payload[i], 10, "heightmaps compound");
@@ -601,6 +617,7 @@ fn map_chunk_block_entities(payload: &[u8]) -> Vec<(i32, i32, i32)> {
 }
 
 /// The block entities inside a whole `0x27` wire frame.
+#[cfg_attr(not(megu_vanilla_data), allow(dead_code))]
 fn frame_block_entities(frame: &[u8]) -> Vec<(i32, i32, i32)> {
     let mut i = 0;
     let len = rv(frame, &mut i) as usize;
@@ -610,6 +627,7 @@ fn frame_block_entities(frame: &[u8]) -> Vec<(i32, i32, i32)> {
 }
 
 /// The decoded sky and block light arrays of a `map_chunk` payload.
+#[cfg_attr(not(megu_vanilla_data), allow(dead_code))]
 fn map_chunk_light(payload: &[u8], dim: DimId) -> (Vec<[u8; 2048]>, Vec<[u8; 2048]>) {
     let mut i = 8;
     assert_eq!(payload[i], 10, "heightmaps compound");
@@ -636,6 +654,7 @@ fn map_chunk_light(payload: &[u8], dim: DimId) -> (Vec<[u8; 2048]>, Vec<[u8; 204
 /// above the ceiling is byte-identical to the real lane. Underground block
 /// entities and cave glow are stripped just as hard.
 #[test]
+#[cfg(megu_vanilla_data)]
 fn underground_occlusion_masks_caves_and_stronghold_sections_for_surface_player() {
     // Generator initialisation is process-global: run in a child like the other
     // generated-world fixtures.
@@ -790,6 +809,7 @@ fn underground_occlusion_masks_caves_and_stronghold_sections_for_surface_player(
 /// re-occludes only clearly back on top. `update_underground_lane` turns a flip
 /// into an immediate nearest-first re-send of everything the client holds.
 #[test]
+#[cfg(megu_vanilla_data)]
 fn underground_occlusion_reveals_on_descent_and_hysteresis() {
     ac_test_set_underground_occlusion(Some(true));
     let ow = DimId::Overworld;
@@ -872,6 +892,7 @@ fn underground_occlusion_reveals_on_descent_and_hysteresis() {
 }
 
 /// Read one length-prefixed wire frame; `None` when nothing was sent.
+#[cfg_attr(not(megu_vanilla_data), allow(dead_code))]
 fn recv_wire_frame(s: &mut std::net::TcpStream) -> Option<Vec<u8>> {
     use std::io::Read;
     let mut raw = Vec::new();
@@ -901,6 +922,7 @@ fn recv_wire_frame(s: &mut std::net::TcpStream) -> Option<Vec<u8>> {
 /// the real lane — and even if an `occluded` flag reached the encode for the
 /// Nether or End, it changes nothing there.
 #[test]
+#[cfg(megu_vanilla_data)]
 fn underground_occlusion_skips_spectators_and_nether_end_and_config_off() {
     ac_test_set_underground_occlusion(Some(true));
     let ow = DimId::Overworld;
@@ -952,6 +974,7 @@ fn underground_occlusion_skips_spectators_and_nether_end_and_config_off() {
 /// the honest player looking down sees real rock, water and cave walls instead
 /// of fake stone sealing the opening.
 #[test]
+#[cfg(megu_vanilla_data)]
 fn underground_occlusion_preserves_open_ravines_and_oceans() {
     // The formula: capped at Y=32 over normal terrain, section-aligned, and
     // pulled down 16 under the lowest column so openings stay open.

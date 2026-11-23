@@ -3327,6 +3327,6 @@ pub(crate) fn vanilla_loot_generate(id: &str, seed: i64) -> Vec<LootEntry> {
 }
 
 
-#[cfg(test)]
+#[cfg(all(test, megu_vanilla_data))]
 #[path = "chest_loot_tests.rs"]
 mod tests;

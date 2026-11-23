@@ -360,6 +360,7 @@ fn weird_bits(j: &J) -> u64 {
     u64::from_str_radix(j.str(), 16).expect("raw f64 hex")
 }
 
+#[cfg(megu_vanilla_data)]
 #[test]
 fn weird_sampler_matches_native_mapper_and_samples() {
     let fixture = jparse(include_bytes!(

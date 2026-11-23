@@ -17,6 +17,7 @@ const WORLD_HEIGHT: i32 = 384;
 const MAX_Y_EXCL: i32 = MIN_Y + WORLD_HEIGHT; // 320
 
 #[cfg(test)]
+#[cfg_attr(not(megu_vanilla_data), allow(dead_code))]
 fn hex(bytes: &[u8]) -> String {
     bytes.iter().map(|b| format!("{b:02x}")).collect()
 }
@@ -1079,6 +1080,7 @@ impl PoolElement {
     }
 
     #[cfg(test)]
+    #[cfg_attr(not(megu_vanilla_data), allow(dead_code))]
     fn describe(&self) -> String {
         match self {
             Self::Empty => "empty".to_owned(),
@@ -1158,6 +1160,7 @@ trait JigsawData {
 
 struct DatapackRepo {
     #[cfg(test)]
+    #[cfg_attr(not(megu_vanilla_data), allow(dead_code))]
     structures: HashMap<String, JigsawStructure>,
     pools: HashMap<String, TemplatePool>,
     processor_lists: HashMap<String, Vec<Processor>>,
@@ -1238,6 +1241,7 @@ impl JigsawData for LiveJigsawRepo<'_> {
 }
 
 #[cfg(test)]
+#[cfg_attr(not(megu_vanilla_data), allow(dead_code))]
 fn collect_json_files(dir: &Path, prefix: &str, out: &mut Vec<(String, std::path::PathBuf)>) -> Result<(), String> {
     if !dir.exists() {
         return Ok(());
@@ -1311,6 +1315,7 @@ impl DatapackRepo {
     }
 
     #[cfg(test)]
+    #[cfg_attr(not(megu_vanilla_data), allow(dead_code))]
     fn load(reg: &BReg) -> Result<Self, String> {
         let base = Path::new("datapacks/vanilla/data/minecraft/worldgen");
 
@@ -1847,6 +1852,7 @@ trait JigsawWorld {
 }
 
 #[cfg(test)]
+#[cfg_attr(not(megu_vanilla_data), allow(dead_code))]
 struct TestJigsawWorld {
     flat_top: i32,
 }
@@ -2282,6 +2288,7 @@ fn generate_pieces_with_hm<D: JigsawData, W: JigsawWorld>(
 }
 
 #[cfg(test)]
+#[cfg_attr(not(megu_vanilla_data), allow(dead_code))]
 fn generate_pieces(
     repo: &mut DatapackRepo,
     structure: &JigsawStructure,
@@ -2396,6 +2403,7 @@ fn scene_state(scene: &str, x: i32, y: i32, z: i32, reg: &BReg) -> u32 {
 
 enum JigsawTarget<'a, 'g> {
     #[cfg(test)]
+    #[cfg_attr(not(megu_vanilla_data), allow(dead_code))]
     Scene {
         scene: &'a str,
         writes: &'a mut HashMap<Pos, u32>,
@@ -3107,6 +3115,7 @@ pub(crate) fn place_jigsaw_chunk_live(
 }
 
 #[cfg(test)]
+#[cfg_attr(not(megu_vanilla_data), allow(dead_code))]
 fn decoration_rng(seed: i64, cx: i32, cz: i32) -> Xor {
     let mut r = Xor::seed_worldgen(seed as u64);
     let l = r.next_i64_legacy() | 1;
@@ -3119,6 +3128,7 @@ fn decoration_rng(seed: i64, cx: i32, cz: i32) -> Xor {
 
 #[cfg(test)]
 #[expect(clippy::too_many_arguments, reason = "preserve the established placement and simulation call signature")]
+#[cfg_attr(not(megu_vanilla_data), allow(dead_code))]
 fn place_chunk(
     repo: &mut DatapackRepo,
     pieces: &[JigsawPiece],
@@ -3175,6 +3185,7 @@ fn place_chunk(
 
 #[cfg(test)]
 pub(crate) mod jigsaw_structures {
+#[cfg(megu_vanilla_data)]
     pub(crate) mod tests {
         use super::super::*;
 

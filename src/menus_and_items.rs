@@ -448,6 +448,7 @@ fn block_hardness(b: i64) -> f32 {
 /// Test-only: production goes through item_stack_max, which resolves the item to its
 /// block first.
 #[cfg(test)]
+#[cfg_attr(not(megu_vanilla_data), allow(dead_code))]
 fn stack_size_of(st: u32) -> i64 {
     crate::block_registry::breg()
         .map(|reg| reg.stack_size_of(st))
@@ -2745,6 +2746,7 @@ fn unpack_window_loot_if_needed(window: (ContainerKey, Option<ContainerKey>)) {
 // seeded `abandoned_mineshaft` table uses, then land in `slot_limit` slots.
 
 #[cfg_attr(not(test), allow(dead_code))]
+#[cfg_attr(not(megu_vanilla_data), allow(dead_code))]
 fn loot_json_tag_items(tag: &str, depth: usize) -> Vec<&'static str> {
     let mut out = Vec::new();
     if depth > 8 {
@@ -2774,6 +2776,7 @@ fn loot_json_tag_items(tag: &str, depth: usize) -> Vec<&'static str> {
 }
 
 #[cfg_attr(not(test), allow(dead_code))]
+#[cfg_attr(not(megu_vanilla_data), allow(dead_code))]
 fn loot_json_stack(item: &crate::chest_loot::LootItem) -> Option<Stack> {
     let id = name_to_item(item.item.as_str())?;
     if id == 0 || item.count <= 0 {
@@ -2803,6 +2806,7 @@ fn loot_json_stack(item: &crate::chest_loot::LootItem) -> Option<Stack> {
 }
 
 #[cfg_attr(not(test), allow(dead_code))]
+#[cfg_attr(not(megu_vanilla_data), allow(dead_code))]
 fn loot_json_next_int(rng: &mut crate::generation_math::Lcg, min: i32, max: i32) -> i32 {
     if min >= max {
         min
@@ -2812,6 +2816,7 @@ fn loot_json_next_int(rng: &mut crate::generation_math::Lcg, min: i32, max: i32)
 }
 
 #[cfg_attr(not(test), allow(dead_code))]
+#[cfg_attr(not(megu_vanilla_data), allow(dead_code))]
 fn loot_json_shuffle<T>(list: &mut [T], rng: &mut crate::generation_math::Lcg) {
     for i in (2..=list.len()).rev() {
         let j = rng.next_bound(i as i32) as usize;
@@ -2822,6 +2827,7 @@ fn loot_json_shuffle<T>(list: &mut [T], rng: &mut crate::generation_math::Lcg) {
 // The same split vanilla applies when a rolled stack does not fit the free
 // slots: oversized stacks are divided at random, then the survivors shuffle.
 #[cfg_attr(not(test), allow(dead_code))]
+#[cfg_attr(not(megu_vanilla_data), allow(dead_code))]
 fn loot_json_split(
     items: Vec<Stack>,
     empty_slots: usize,
@@ -2861,6 +2867,7 @@ fn loot_json_split(
 /// (`data/<ns>/loot_table/**.json` or a vanilla table). Seed 0 is unseeded,
 /// matching `RandomizableContainer.unpackLootTable`.
 #[cfg_attr(not(test), allow(dead_code))]
+#[cfg_attr(not(megu_vanilla_data), allow(dead_code))]
 pub(crate) fn unpack_loot_table_json(
     table_json: &str,
     seed: i64,
@@ -6888,6 +6895,7 @@ impl Jukebox {
             .map_or(0, |song| song.comparator_output.min(15))
     }
 
+    #[cfg_attr(not(megu_vanilla_data), allow(dead_code))]
     pub(crate) fn playing_ticks(&self) -> Option<i64> {
         self.playback.map(|(ticks, _)| ticks)
     }
@@ -7009,6 +7017,7 @@ impl Banner {
     }
 
     /// Washing removes the last layer.
+    #[cfg_attr(not(megu_vanilla_data), allow(dead_code))]
     pub(crate) fn remove_last_pattern(&mut self) -> Option<BannerPattern> {
         self.patterns.pop()
     }
@@ -7122,6 +7131,7 @@ impl SkullProfile {
     }
 
     #[cfg_attr(not(test), allow(dead_code))]
+    #[cfg_attr(not(megu_vanilla_data), allow(dead_code))]
     pub(crate) fn needs_resolution(&self) -> bool {
         self.properties.is_empty() && self.name.is_some() != self.id.is_some()
     }
@@ -7229,6 +7239,7 @@ impl Brushable {
         Tag::Compound(fields)
     }
 
+    #[cfg_attr(not(megu_vanilla_data), allow(dead_code))]
     pub(crate) fn update_nbt(&self) -> Tag {
         let mut fields = BlockEntityNbtFields::new();
         if let Some(index) = Self::DIRECTIONS
@@ -9361,6 +9372,7 @@ fn write_open_chest_packets(
     let _ = send_packet(s, 0x13, q);
 }
 #[cfg(test)]
+#[cfg_attr(not(megu_vanilla_data), allow(dead_code))]
 fn open_chest_window(
     s: &mut TcpStream,
     first: ContainerKey,
@@ -13226,11 +13238,13 @@ mod p1_combat_item_tests {
 #[cfg(test)]
 mod p5a_beacon_tests {
     use super::*;
+    #[cfg(megu_vanilla_data)]
     use crate::effect_tests::client_pair;
     use std::io::Read;
 
     /// Restores the block-entity store, placed cells, menu sessions, clients
     /// and drops around a live beacon-menu test.
+    #[cfg_attr(not(megu_vanilla_data), allow(dead_code))]
     struct BeaconWorld {
         store: LiveBlockEntityStore,
         cells: Vec<(DimBlockPos, u32)>,
@@ -13239,6 +13253,7 @@ mod p5a_beacon_tests {
     }
 
     impl BeaconWorld {
+        #[cfg_attr(not(megu_vanilla_data), allow(dead_code))]
         fn new() -> Self {
             Self {
                 store: std::mem::take(&mut *live_block_entities().lock().unwrap_or_else(|e| e.into_inner())),
@@ -13248,6 +13263,7 @@ mod p5a_beacon_tests {
             }
         }
 
+        #[cfg_attr(not(megu_vanilla_data), allow(dead_code))]
         fn place(&mut self, key @ (dim, x, y, z): DimBlockPos, block: &str) -> u32 {
             let state = item_to_state(name_to_item(block).unwrap()).unwrap();
             let old = block_at_dim(dim, x, y, z);
@@ -13269,6 +13285,7 @@ mod p5a_beacon_tests {
         }
     }
 
+    #[cfg_attr(not(megu_vanilla_data), allow(dead_code))]
     fn attach(c: &Client) {
         c.enter_play_wire(None, Default::default());
         player_mechanism_sessions().lock().unwrap_or_else(|e| e.into_inner()).insert(
@@ -13287,6 +13304,7 @@ mod p5a_beacon_tests {
 
     /// Drain every frame the socket received; `read` hits the fixture's 1s
     /// timeout once the batch is exhausted.
+    #[cfg_attr(not(megu_vanilla_data), allow(dead_code))]
     fn read_frames(rx: &mut TcpStream) -> Vec<(i64, Vec<u8>)> {
         let mut buf = Vec::new();
         let mut chunk = [0u8; 8192];
@@ -13313,6 +13331,7 @@ mod p5a_beacon_tests {
         frames
     }
 
+    #[cfg_attr(not(megu_vanilla_data), allow(dead_code))]
     fn beacon_of(key: DimBlockPos) -> (Option<BeaconEffect>, Option<BeaconEffect>, i32) {
         let store = live_block_entities().lock().unwrap_or_else(|e| e.into_inner());
         let Some((_, LiveBlockEntity::Beacon(beacon))) = store.entries.get(&key) else {
@@ -13434,6 +13453,7 @@ mod p5a_beacon_tests {
     // three `ContainerSetData` rows, and the payment slot; `apply` writes the
     // choice into the anchored block entity.
     #[test]
+    #[cfg(megu_vanilla_data)]
     fn p5a_parity_beacon_live_menu_wire_and_apply() {
         let _guard = world_guard();
         let mut world = BeaconWorld::new();
@@ -13545,6 +13565,7 @@ mod p5a_beacon_tests {
     // #204 — a click on slot 0 follows the payment rules through the real
     // `live_menu_click` path: one item lands, non-payment items are refused.
     #[test]
+    #[cfg(megu_vanilla_data)]
     fn p5a_parity_beacon_slot_click_enforces_payment_rules() {
         let _guard = world_guard();
         let mut world = BeaconWorld::new();
@@ -13713,6 +13734,7 @@ mod p6c_hopper_parity_tests {
     }
 
     #[test]
+    #[cfg(megu_vanilla_data)]
     fn p6c_parity_powered_hopper_holds_items_and_pull_needs_no_push_target() {
         let _guard = world_guard();
         let saved = save_world();
@@ -13841,7 +13863,7 @@ mod p6c_hopper_parity_tests {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, megu_vanilla_data))]
 mod p8b2_parity_component_wire_tests {
     use super::*;
 
@@ -15980,6 +16002,7 @@ fn ominous_bottle_amplifier(st: &Stack) -> Option<i64> {
 /// (adventure-mode predicates; the server applies them to block-break and
 /// block-place decisions like vanilla's `AdventureModePredicate.test`).
 #[cfg_attr(not(test), allow(dead_code))]
+#[cfg_attr(not(megu_vanilla_data), allow(dead_code))]
 fn block_predicates_allow(data: &[u8], state: u32, reg: &crate::block_registry::BReg) -> bool {
     let mut p = 0;
     let Some(n) = slot_read_count(data, &mut p, 256) else {
@@ -16005,6 +16028,7 @@ fn block_predicates_allow(data: &[u8], state: u32, reg: &crate::block_registry::
 /// Re-reads one `can_break`/`can_place_on` block predicate
 /// (`{blocks?, properties?, nbt?}`) and tests whether it covers `state`.
 #[cfg_attr(not(test), allow(dead_code))]
+#[cfg_attr(not(megu_vanilla_data), allow(dead_code))]
 fn predicate_matches_state(
     data: &[u8],
     p: &mut usize,
@@ -16086,6 +16110,7 @@ fn predicate_matches_state(
 }
 
 #[cfg_attr(not(test), allow(dead_code))]
+#[cfg_attr(not(megu_vanilla_data), allow(dead_code))]
 fn stack_can_break(st: &Stack, state: u32, reg: &crate::block_registry::BReg) -> bool {
     match comp_get(&st.2, COMP_CAN_BREAK) {
         Some(data) => block_predicates_allow(data, state, reg),
@@ -16094,6 +16119,7 @@ fn stack_can_break(st: &Stack, state: u32, reg: &crate::block_registry::BReg) ->
 }
 
 #[cfg_attr(not(test), allow(dead_code))]
+#[cfg_attr(not(megu_vanilla_data), allow(dead_code))]
 fn stack_can_place_on(st: &Stack, state: u32, reg: &crate::block_registry::BReg) -> bool {
     match comp_get(&st.2, COMP_CAN_PLACE_ON) {
         Some(data) => block_predicates_allow(data, state, reg),
@@ -16376,6 +16402,7 @@ fn item_block_entity_data(st: &Stack) -> Option<crate::nbt::Tag> {
 /// placed block state, like vanilla `BlockItem.updateCustomBlockEntityTag`'s
 /// state application.
 #[cfg_attr(not(test), allow(dead_code))]
+#[cfg_attr(not(megu_vanilla_data), allow(dead_code))]
 fn item_block_state_override(st: &Stack, base: u32) -> u32 {
     let Some(reg) = breg() else { return base };
     let Some(data) = comp_get(&st.2, COMP_BLOCK_STATE) else {
@@ -17588,6 +17615,7 @@ mod v1211_comp_tests {
     }
 
     /// `minecraft:tool` payload with one explicit-block rule.
+    #[cfg_attr(not(megu_vanilla_data), allow(dead_code))]
     fn tool_payload(block_id: i64, speed: f32, correct: bool, dpb: i64) -> Vec<u8> {
         let mut d = vi(1); // rules
         d.extend_from_slice(&vi(2)); // holder set of 1 explicit block id
@@ -17602,6 +17630,7 @@ mod v1211_comp_tests {
     }
 
     /// `minecraft:can_break`/`can_place_on` payload naming one explicit block.
+    #[cfg_attr(not(megu_vanilla_data), allow(dead_code))]
     fn predicate_payload(block_id: i64) -> Vec<u8> {
         let mut d = vi(1); // predicates
         d.push(1); // blocks present
@@ -17698,6 +17727,7 @@ mod v1211_comp_tests {
     }
 
     #[test]
+    #[cfg(megu_vanilla_data)]
     fn v1211_comp_tool_custom_speed_and_damage() {
         let reg = breg().unwrap();
         let stone_state = reg.state_of("minecraft:stone", None);
@@ -17836,6 +17866,7 @@ mod v1211_comp_tests {
     }
 
     #[test]
+    #[cfg(megu_vanilla_data)]
     fn v1211_comp_can_place_can_break_predicates() {
         let reg = breg().unwrap();
         let stone_state = reg.state_of("minecraft:stone", None);
@@ -17863,6 +17894,7 @@ mod v1211_comp_tests {
     }
 
     #[test]
+    #[cfg(megu_vanilla_data)]
     fn v1211_comp_block_state_override() {
         let reg = breg().unwrap();
         let base = reg.state_of("minecraft:furnace", None);

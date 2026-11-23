@@ -3249,6 +3249,7 @@ mod w_be_integration_tests {
     }
 
     #[test]
+    #[cfg(megu_vanilla_data)]
     fn w_be_campfire_cooks_four_slots_at_600_ticks_and_clears() {
         // Writes into the shared live `world()` overlay — must
         // not run beside other world fixtures.
@@ -3278,6 +3279,7 @@ mod w_be_integration_tests {
     }
 
     #[test]
+    #[cfg(megu_vanilla_data)]
     fn w_be_campfire_keeps_unsupported_saved_input() {
         // Writes into the shared live `world()` overlay — must
         // not run beside other world fixtures.
@@ -3375,6 +3377,7 @@ mod w_be_integration_tests {
     }
 
     #[test]
+    #[cfg(megu_vanilla_data)]
     fn w_be_beacon_pyramid_effect_every_80_ticks_and_radius() {
         // Writes into the shared live `world()` overlay — must
         // not run beside other world fixtures.
@@ -4366,6 +4369,7 @@ fn wbe_reconcile_at(
 #[cfg_attr(not(test), allow(dead_code))]
 enum ExplosionDropKind {
     /// `blockExplosionDropDecay` — beds, respawn anchors, etc.
+    #[cfg_attr(not(megu_vanilla_data), allow(dead_code))]
     Block,
     /// `mobExplosionDropDecay` — creepers, ghasts, withers, end crystals.
     Mob,
@@ -4432,6 +4436,7 @@ const VANILLA_ADVANCEMENT_EXPERIENCE: &[(&str, i32)] = &[
 /// named criterion on a definition; `grant_criterion` accepts the criterion
 /// only when it appears in that definition's requirement groups.
 #[cfg_attr(not(test), allow(dead_code))]
+#[cfg_attr(not(megu_vanilla_data), allow(dead_code))]
 const VANILLA_ADVANCEMENT_TRIGGERS: &[&str] = &[
     "minecraft:allay_drop_item_on_block",
     "minecraft:avoid_vibration",
@@ -4497,6 +4502,7 @@ const TRUNCATED_ADVANCEMENT_CRITERIA: &[&str] = &["consume_i", "player_gene", "t
 /// Whether `trigger` (bare or `minecraft:`-prefixed) is one of the vanilla
 /// 1.21.1 advancement trigger types the catalogue references.
 #[cfg_attr(not(test), allow(dead_code))]
+#[cfg_attr(not(megu_vanilla_data), allow(dead_code))]
 fn advancement_trigger_supported(trigger: &str) -> bool {
     let bare = trigger.strip_prefix("minecraft:").unwrap_or(trigger);
     VANILLA_ADVANCEMENT_TRIGGERS
@@ -6265,6 +6271,7 @@ mod world_mechanisms_tests {
     }
 
     #[test]
+    #[cfg(megu_vanilla_data)]
     fn fill_keep_accepts_all_registered_air_states() {
         let reg = breg().expect("block registry");
         let air = reg.state_of("minecraft:air", None);
@@ -6756,7 +6763,7 @@ mod world_mechanisms_tests {
 
 /// P1-A live wiring tests: production `on_random_tick` and the live gamerule
 /// atomics, not just the pure evaluators.
-#[cfg(test)]
+#[cfg(all(test, megu_vanilla_data))]
 mod p1a_random_tick_and_gamerule_tests {
     use super::*;
 
@@ -7401,7 +7408,7 @@ mod p1a_random_tick_and_gamerule_tests {
 
 /// P2 parity tests: the plant random ticks, the remaining gamerule reads and
 /// the advancement rewards grant path.
-#[cfg(test)]
+#[cfg(all(test, megu_vanilla_data))]
 mod p2_parity_world_tests {
     use super::*;
 
@@ -9464,6 +9471,7 @@ pub(crate) fn respawn_anchor_comparator(charges: u8) -> u8 {
 /// 1.21.1 `lodestone_target` component's tracked pos and dimension).
 #[cfg_attr(not(test), allow(dead_code))]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg_attr(not(megu_vanilla_data), allow(dead_code))]
 pub(crate) struct LodestoneTarget {
     pub dim: DimId,
     pub pos: BlockPos,
@@ -9475,6 +9483,7 @@ pub(crate) struct LodestoneTarget {
 /// no longer a lodestone.
 #[cfg_attr(not(test), allow(dead_code))]
 #[derive(Debug, Clone, Default)]
+#[cfg_attr(not(megu_vanilla_data), allow(dead_code))]
 pub(crate) struct LodestoneTracker {
     pub target: Option<LodestoneTarget>,
 }
@@ -9482,6 +9491,7 @@ pub(crate) struct LodestoneTracker {
 #[cfg_attr(not(test), allow(dead_code))]
 impl LodestoneTracker {
     /// Right-click `lodestone` with a `compass`: store `(dim, x, y, z)`.
+    #[cfg_attr(not(megu_vanilla_data), allow(dead_code))]
     pub(crate) fn bind(&mut self, dim: DimId, pos: BlockPos) -> LodestoneTarget {
         let target = LodestoneTarget { dim, pos };
         self.target = Some(target);
@@ -9490,6 +9500,7 @@ impl LodestoneTracker {
 
     /// True while the tracked block is still `minecraft:lodestone`; clears the
     /// binding and returns false once it is broken or replaced.
+    #[cfg_attr(not(megu_vanilla_data), allow(dead_code))]
     pub(crate) fn validate(&mut self, reg: &crate::block_registry::BReg) -> bool {
         let Some(target) = self.target else { return false };
         let st = block_at_dim(target.dim, target.pos.0, target.pos.1, target.pos.2);
@@ -9601,12 +9612,15 @@ mod vanilla_blocks_tests {
     use super::*;
     use crate::block_registry::BReg;
 
+    #[cfg_attr(not(megu_vanilla_data), allow(dead_code))]
     fn reg() -> &'static BReg {
         breg().expect("block registry")
     }
+    #[cfg_attr(not(megu_vanilla_data), allow(dead_code))]
     fn state(name: &str) -> u32 {
         reg().state_of(name, None)
     }
+    #[cfg_attr(not(megu_vanilla_data), allow(dead_code))]
     fn name_at(dim: DimId, x: i32, y: i32, z: i32) -> String {
         reg().name_of(block_at_dim(dim, x, y, z)).to_owned()
     }
@@ -9710,6 +9724,7 @@ mod vanilla_blocks_tests {
     }
 
     #[test]
+    #[cfg(megu_vanilla_data)]
     fn vanilla_blocks_note_dim_use_power_and_obstruction() {
         // Writes into the shared live `world()` overlay — must
         // not run beside other world fixtures.
@@ -9767,6 +9782,7 @@ mod vanilla_blocks_tests {
     }
 
     #[test]
+    #[cfg(megu_vanilla_data)]
     fn vanilla_blocks_cauldron_state_and_comparator() {
         use CauldronState::*;
         let reg = reg();
@@ -9971,6 +9987,7 @@ mod vanilla_blocks_tests {
     }
 
     #[test]
+    #[cfg(megu_vanilla_data)]
     fn vanilla_blocks_lodestone_bind_and_break() {
         // Writes into the shared live `world()` overlay — must
         // not run beside other world fixtures.
@@ -9991,6 +10008,7 @@ mod vanilla_blocks_tests {
     }
 
     #[test]
+    #[cfg(megu_vanilla_data)]
     fn vanilla_blocks_sponge_bfs_depth_and_connectivity() {
         // Writes into the shared live `world()` overlay — must
         // not run beside other world fixtures.
@@ -10019,6 +10037,7 @@ mod vanilla_blocks_tests {
     }
 
     #[test]
+    #[cfg(megu_vanilla_data)]
     fn vanilla_blocks_sponge_visited_cap_and_waterlogged() {
         // Writes into the shared live `world()` overlay — must
         // not run beside other world fixtures.
@@ -10075,6 +10094,7 @@ mod vanilla_blocks_tests {
     /// scratch; two identical water shells must absorb in the identical
     /// relative BFS order, and the retained scratch stays tiny.
     #[test]
+    #[cfg(megu_vanilla_data)]
     fn xpoll_redstone_ticks_sponge_bfs_reuses_scratch_bit_identical() {
         let _guard = world_guard();
         let dim = DimId::Overworld;
@@ -10134,6 +10154,7 @@ mod vanilla_blocks_tests {
     /// rewrite the block or queue a neighbor broadcast; a real change still
     /// does, and the next identical refresh is silent again.
     #[test]
+    #[cfg(megu_vanilla_data)]
     fn xpoll_redstone_ticks_unchanged_state_skips_broadcast() {
         let _guard = world_guard();
         let dim = DimId::Overworld;
@@ -10188,6 +10209,7 @@ mod vanilla_blocks_tests {
     /// bounded scratch; two identical ticks over an identical registry emit
     /// identical events and the scratch stays under the 256 KiB bound.
     #[test]
+    #[cfg(megu_vanilla_data)]
     fn xpoll_redstone_ticks_be_tick_scratch_bounded_and_deterministic() {
         let _guard = world_guard();
         let dim = DimId::Overworld;
@@ -10249,7 +10271,7 @@ mod vanilla_blocks_tests {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, megu_vanilla_data))]
 mod parity_live_wire_world_tests {
     use super::*;
 

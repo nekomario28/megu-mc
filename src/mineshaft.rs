@@ -1,6 +1,6 @@
 //! Procedural structure admission and decoration. Layout, placement primitives,
 //! biome lookup and block writes keep their existing owners.
-#[cfg(test)]
+#[cfg(all(test, megu_vanilla_data))]
 #[path = "mineshaft_tests.rs"]
 mod tests;
 use crate::generation_context::FC;
@@ -19,6 +19,7 @@ struct Entry {
     weight: i32,
     biomes: HashSet<String>,
     #[cfg(test)]
+    #[cfg_attr(not(megu_vanilla_data), allow(dead_code))]
     step: usize,
     #[cfg(test)]
     slot: usize,
@@ -328,11 +329,13 @@ pub(crate) fn reference_order_by_type(keys: impl IntoIterator<Item = (usize, u64
         .collect()
 }
 #[cfg(test)]
+#[cfg_attr(not(megu_vanilla_data), allow(dead_code))]
 fn packed(x: i32, z: i32) -> u64 {
     u64::from(x as u32) | (u64::from(z as u32) << 32)
 }
 
 #[cfg(test)]
+#[cfg_attr(not(megu_vanilla_data), allow(dead_code))]
 fn decoration_entries(entries: &[Entry], step: usize) -> Vec<(usize, &Entry)> {
     let mut result: Vec<_> = entries
         .iter()
@@ -344,12 +347,14 @@ fn decoration_entries(entries: &[Entry], step: usize) -> Vec<(usize, &Entry)> {
 }
 
 #[cfg(test)]
+#[cfg_attr(not(megu_vanilla_data), allow(dead_code))]
 pub(crate) struct References {
     starts: Vec<(u64, Start)>,
     rng_after: HashMap<(usize, usize), (u64, u64)>,
 }
 #[cfg(test)]
 impl References {
+    #[cfg_attr(not(megu_vanilla_data), allow(dead_code))]
     pub(crate) fn collect(g: &mut Gen, cx: i32, cz: i32) -> Self {
         if g.preset != crate::worldgen::NoisePreset::Overworld || config().is_none() {
             return Self {
@@ -393,6 +398,7 @@ impl References {
             rng_after: HashMap::new(),
         }
     }
+    #[cfg_attr(not(megu_vanilla_data), allow(dead_code))]
     pub(crate) fn place_step(
         &mut self,
         ctx: &mut FC,

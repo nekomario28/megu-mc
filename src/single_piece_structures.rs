@@ -1945,7 +1945,7 @@ impl JungleTemplePiece {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, megu_vanilla_data))]
 mod single_piece_tests {
     use super::*;
     use crate::generation_math::sha256;

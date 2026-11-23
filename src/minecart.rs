@@ -128,7 +128,7 @@ impl State {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, megu_vanilla_data))]
 #[path = "minecart_tests.rs"]
 mod tests;
 

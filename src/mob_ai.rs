@@ -1980,6 +1980,7 @@ mod mob_ai_tests {
         AiEntityPerception::new(id, (x, y, z))
     }
 
+    #[cfg_attr(not(megu_vanilla_data), allow(dead_code))]
     fn state(name: &str, props: &[(&str, &str)]) -> u32 {
         crate::block_registry::breg()
             .unwrap()
@@ -1994,6 +1995,7 @@ mod mob_ai_tests {
     }
 
     #[test]
+    #[cfg(megu_vanilla_data)]
     fn world_path_raw_types_match_pinned_vanilla_digest() {
         let registry = crate::block_registry::breg().unwrap();
         // FNV-1a of one PascalCase PathType name plus newline per raw state ID.
@@ -2010,6 +2012,7 @@ mod mob_ai_tests {
     }
 
     #[test]
+    #[cfg(megu_vanilla_data)]
     fn real_registry_block_path_types_and_properties() {
         use BlockPathType::*;
         let registry = crate::block_registry::breg().unwrap();
@@ -2080,6 +2083,7 @@ mod mob_ai_tests {
     }
 
     #[test]
+    #[cfg(megu_vanilla_data)]
     fn world_path_classifies_support_and_neighbor_hazards() {
         use BlockPathType::*;
         let registry = crate::block_registry::breg().unwrap();
@@ -2129,6 +2133,7 @@ mod mob_ai_tests {
     }
 
     #[test]
+    #[cfg(megu_vanilla_data)]
     fn world_path_uses_collision_tops_for_floor_and_waypoints() {
         let stone = state("stone", &[]);
         let slab = state("oak_slab", &[("type", "bottom")]);
@@ -2167,6 +2172,7 @@ mod mob_ai_tests {
     }
 
     #[test]
+    #[cfg(megu_vanilla_data)]
     fn world_path_routes_zombie_around_lava_and_through_open_door() {
         let reg = crate::block_registry::breg().unwrap();
         let stone = state("stone", &[]);
@@ -2214,6 +2220,7 @@ mod mob_ai_tests {
     }
 
     #[test]
+    #[cfg(megu_vanilla_data)]
     fn live_adapter_dimension_bounds_and_real_collision_shapes() {
         let reg = crate::block_registry::breg().expect("1.21.1 block registry");
         let stone = reg.state_of("stone", None);
@@ -2390,6 +2397,7 @@ mod mob_ai_tests {
     }
 
     #[test]
+    #[cfg(megu_vanilla_data)]
     fn mob_goal_factories_and_tick_driver() {
         let mut creeper = build_goal_selector_for_etype(23);
         let mut zombie = build_goal_selector_for_etype(124);

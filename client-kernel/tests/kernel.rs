@@ -111,14 +111,34 @@ fn hex(text: &str) -> Vec<u8> {
 
 #[test]
 fn named_nbt_matches_native_codec_vectors() {
-    for row in include_str!("../../tests/data/nbt_codec_1211.tsv").lines() {
-        let (input, expected) = row.split_once('\t').unwrap();
-        let input = hex(input);
-        if expected == "REJECT" {
-            assert!(nbt_read_named_validate(&input).is_err(), "{row}");
-        } else {
-            assert_eq!(nbt_roundtrip_named(&input), Ok(hex(expected)), "{row}");
+    // `tests/data/nbt_codec_1211.tsv`, resolved against the repo root (the
+    // crate lives at `client-kernel/`, so the fixtures are one directory
+    // up). The file is a generated fixture: in a strict-public export it is
+    // absent, which is a skip — anything else (unreadable, malformed,
+    // mismatched) is a failure, so a silently dropped row cannot pass.
+    let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("..")
+        .join("tests/data/nbt_codec_1211.tsv");
+    match std::fs::read_to_string(&path) {
+        Ok(data) => {
+            for row in data.lines() {
+                let (input, expected) = row.split_once('\t').unwrap();
+                let input = hex(input);
+                if expected == "REJECT" {
+                    assert!(nbt_read_named_validate(&input).is_err(), "{row}");
+                } else {
+                    assert_eq!(nbt_roundtrip_named(&input), Ok(hex(expected)), "{row}");
+                }
+            }
         }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            eprintln!(
+                "{}: optional generated fixture absent (strict-public export); \
+                 vector check skipped",
+                path.display()
+            );
+        }
+        Err(e) => panic!("cannot read {}: {e}", path.display()),
     }
     let nested = |depth| {
         let mut nbt = [10, 0, 0].repeat(depth);
@@ -591,16 +611,27 @@ fn light_without_skylight_keeps_sky_dark() {
     }
 }
 
-fn open_registry() -> Registry {
+/// The pinned pack, or `None` on a strict-public export where the
+/// generated `assets/*_1211*` files are absent — a skip, never a silent
+/// pass: any other read error still panics.
+fn open_registry() -> Option<Registry> {
     let read = |name: &str| {
-        std::fs::read(format!("{}/../assets/{name}", env!("CARGO_MANIFEST_DIR"))).unwrap()
+        match std::fs::read(format!("{}/../assets/{name}", env!("CARGO_MANIFEST_DIR"))) {
+            Ok(bytes) => Some(bytes),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
+            Err(e) => panic!("cannot read assets/{name}: {e}"),
+        }
     };
-    Registry::open_json(&read("block_states_1211.json"), &read("blocks_1211.json")).unwrap()
+    let (states, blocks) = (read("block_states_1211.json")?, read("blocks_1211.json")?);
+    Some(Registry::open_json(&states, &blocks).unwrap())
 }
 
 #[test]
 fn registry_facts_feed_the_light_engine_and_agree_with_palette_ids() {
-    let registry = open_registry();
+    let Some(registry) = open_registry() else {
+        eprintln!("pinned assets absent (strict-public export); skipped");
+        return;
+    };
     assert_eq!(registry.state_count(), STATE_COUNT as usize);
     let stone = registry.default_state("minecraft:stone").unwrap();
     let glowstone = registry.default_state("minecraft:glowstone").unwrap();
@@ -639,16 +670,19 @@ fn registry_facts_feed_the_light_engine_and_agree_with_palette_ids() {
 
 #[test]
 fn version_dir_registry_bounds_sections_to_its_state_count() {
-    // The pinned assets directory is itself a version pack (`*_1211` fallback).
-    let registry = Registry::from_version_dir(std::path::Path::new(concat!(
-        env!("CARGO_MANIFEST_DIR"),
-        "/../assets"
-    )))
-    .unwrap();
-    assert_eq!(registry.state_count(), STATE_COUNT as usize);
-    let section = PalettedSection::new_single_in(STATE_COUNT - 1, &registry).unwrap();
-    assert_eq!(section.state_limit(), STATE_COUNT);
-    assert_eq!(section.uniform_state(), Some(STATE_COUNT - 1));
+    // The pinned assets directory is itself a version pack (`*_1211`
+    // fallback) — where it exists; a strict-public export carries none of
+    // those generated files, so that half of the check is a skip there.
+    let pinned = std::path::Path::new(concat!(env!("CARGO_MANIFEST_DIR"), "/../assets"));
+    if pinned.join("blocks_1211.json").is_file() {
+        let registry = Registry::from_version_dir(pinned).unwrap();
+        assert_eq!(registry.state_count(), STATE_COUNT as usize);
+        let section = PalettedSection::new_single_in(STATE_COUNT - 1, &registry).unwrap();
+        assert_eq!(section.state_limit(), STATE_COUNT);
+        assert_eq!(section.uniform_state(), Some(STATE_COUNT - 1));
+    } else {
+        eprintln!("pinned assets absent (strict-public export); pack check skipped");
+    }
 
     // A wire container for a pack larger than the pin decodes under its own
     // bound and still fails closed under the pinned one.

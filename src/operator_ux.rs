@@ -947,11 +947,13 @@ fn spawn_gs4_query_thread(
 mod operator_ux_tests {
     use super::*;
 
+    #[cfg_attr(not(megu_vanilla_data), allow(dead_code))]
     fn st(name: &str) -> u32 {
         breg().expect("block registry").state_of(name, None)
     }
 
     #[test]
+    #[cfg(megu_vanilla_data)]
     fn safe_spawn_finder_avoids_ocean_and_lava_and_finds_dry_land() {
         let (grass, dirt, stone) = (st("grass_block"), st("dirt"), st("stone"));
         let (water, lava) = (st("water"), st("lava"));

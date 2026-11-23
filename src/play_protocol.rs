@@ -7337,6 +7337,7 @@ fn is_sign_block_state(state: u32) -> bool {
 /// Remove legacy formatting sequences and C0/C1 controls before any sign text
 /// reaches persistent state or a block-entity broadcast. Retain normal Unicode.
 #[cfg_attr(not(test), allow(dead_code))]
+#[cfg_attr(not(megu_vanilla_data), allow(dead_code))]
 fn sanitize_sign_line(input: &str) -> String {
     let mut clean = String::with_capacity(input.len());
     let mut chars = input.chars().peekable();
@@ -15268,7 +15269,7 @@ mod skin_cache_tests {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, megu_vanilla_data))]
 mod connection_limits_wire_tests {
     use super::*;
 
@@ -15840,6 +15841,7 @@ mod w3_tests {
     }
 
     /// `w3_login_session` continued through configuration into the play loop.
+    #[cfg_attr(not(megu_vanilla_data), allow(dead_code))]
     fn w3_connect(name: &str, uuid: [u8; 16]) -> (TcpStream, std::thread::JoinHandle<()>, Arc<Client>) {
         let (mut cli, server) = w3_login_session(name, uuid);
         let deadline = w3_deadline();
@@ -15896,6 +15898,7 @@ mod w3_tests {
     }
 
     /// Read until `wanted` arrives or the deadline passes; returns the payload.
+    #[cfg_attr(not(megu_vanilla_data), allow(dead_code))]
     fn w3_read_until(cli: &mut TcpStream, wanted: i64) -> Option<Vec<u8>> {
         let deadline = Instant::now() + Duration::from_secs(5);
         while let Some((pid, body)) = read_packet(cli, deadline) {
@@ -15994,6 +15997,7 @@ mod w3_tests {
     }
 
     #[test]
+    #[cfg(megu_vanilla_data)]
     fn w3_vehicle_move_0x1e_and_dismount_0x26_and_stats_0x09_live() {
         let _guard = world_guard();
         let (mut cli, server, me) = w3_connect("W3Rider", [0x77u8; 16]);
@@ -16183,6 +16187,7 @@ mod w3_tests {
     }
 
     #[test]
+    #[cfg(megu_vanilla_data)]
     fn bughunt_net_look_packet_0x1c_rejects_non_finite_angles() {
         let _guard = world_guard();
         let (mut cli, server, me) = w3_connect("BugHuntLook", [0x66u8; 16]);
@@ -16276,12 +16281,14 @@ mod fix_tame_rejoin_tests {
     use super::*;
     use std::net::TcpListener;
 
+    #[cfg_attr(not(megu_vanilla_data), allow(dead_code))]
     fn fx_deadline() -> Instant {
         Instant::now() + Duration::from_secs(15)
     }
 
     /// Handshake + Login Start on a fresh loopback connection, then the raw
     /// socket; the server side is a spawned `handle` on the accepted half.
+    #[cfg_attr(not(megu_vanilla_data), allow(dead_code))]
     fn fx_login_session(name: &str, uuid: [u8; 16]) -> (TcpStream, std::thread::JoinHandle<()>) {
         let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
         let addr = listener.local_addr().unwrap();
@@ -16307,6 +16314,7 @@ mod fix_tame_rejoin_tests {
 
     /// `fx_login_session` through configuration into the play loop, also
     /// capturing the 0x54 SetChunkCacheCenter body sent right after Join Game.
+    #[cfg_attr(not(megu_vanilla_data), allow(dead_code))]
     fn fx_connect(
         name: &str,
         uuid: [u8; 16],
@@ -16371,6 +16379,7 @@ mod fix_tame_rejoin_tests {
 
     /// The offline-mode UUID `login_identity` derives from the player name —
     /// the key `saved_players` is read under on rejoin.
+    #[cfg_attr(not(megu_vanilla_data), allow(dead_code))]
     fn fx_offline_uuid(name: &str) -> [u8; 16] {
         let mut uuid = generation_math::md5(format!("OfflinePlayer:{name}").as_bytes());
         uuid[6] = (uuid[6] & 0x0f) | 0x30;
@@ -16378,6 +16387,7 @@ mod fix_tame_rejoin_tests {
         uuid
     }
 
+    #[cfg_attr(not(megu_vanilla_data), allow(dead_code))]
     fn fx_save(uuid: [u8; 16], position: DimPosRot) {
         saved_players()
             .lock()
@@ -16441,6 +16451,7 @@ mod fix_tame_rejoin_tests {
     }
 
     #[test]
+    #[cfg(megu_vanilla_data)]
     fn fix_tame_rejoin_chunk_cache_center_uses_saved_position() {
         let uuid = fx_offline_uuid("FarRejoin");
         fx_save(uuid, (DimId::Overworld, 1000.5, 70.0, -640.2, 0.0, 0.0));
@@ -16464,6 +16475,7 @@ mod fix_tame_rejoin_tests {
     }
 
     #[test]
+    #[cfg(megu_vanilla_data)]
     fn fix_tame_rejoin_disconnect_clears_spectator_camera() {
         let (cli, server, me, _center) = fx_connect("SpecCam", [0x66u8; 16]);
         {
@@ -17108,6 +17120,7 @@ mod w4_tests {
     }
 
     #[test]
+    #[cfg(megu_vanilla_data)]
     fn w4_encrypted_stream_roundtrips_protocol_packets_with_aes128_cfb8() {
         // `MEGU_ONLINE_MODE` steers every concurrent `handle` login — a
         // plain-text login racing this test is refused for missing encryption.
@@ -17268,7 +17281,7 @@ mod w4_tests {
 
 // ---------------- Lane P5c: live-path wiring tests ----------------
 
-#[cfg(test)]
+#[cfg(all(test, megu_vanilla_data))]
 mod p5c_live_tests {
     use super::*;
     use std::io::Read;
@@ -18691,7 +18704,7 @@ mod p5c_live_tests {
         assert!(power > 0, "target block must carry projectile-hit power");
     }
 
-    #[cfg(test)]
+    #[cfg(all(test, megu_vanilla_data))]
     mod vanilla_end_tests {
         use super::*;
 
@@ -19156,6 +19169,7 @@ mod p5c_live_tests {
     /// only while sneaking; a claimed neighbour chunk bounds the BFS and
     /// a one-durability tool stops after the origin.
     #[cfg(feature = "mod-suite")]
+#[cfg(megu_vanilla_data)]
     mod wire_mine_cut_all_tests {
         use super::*;
 
@@ -19432,7 +19446,7 @@ mod wire_ops_fair_play_tests {
 
 // ---------------- Lane P8a: parity tests ----------------
 
-#[cfg(test)]
+#[cfg(all(test, megu_vanilla_data))]
 mod p8a_parity_protocol_tests {
     use super::*;
     use std::net::TcpListener;
@@ -19982,6 +19996,7 @@ mod bot_net2_tests {
     }
 
     #[test]
+    #[cfg(megu_vanilla_data)]
     fn bot_net2_live_tick_teleports_standing_wolf_past_twelve_blocks() {
         if crate::test_support::isolated_world_test() {
             return;

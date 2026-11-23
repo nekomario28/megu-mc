@@ -28,6 +28,7 @@ fn slot_map(value: &J) -> HashMap<i16, Stack> {
         .collect()
 }
 
+#[cfg(megu_vanilla_data)]
 #[test]
 fn container_transfers_match_real_1_21_1_classes() {
     let fixture = jparse(include_bytes!(
@@ -135,6 +136,7 @@ fn inventory_slots(value: &J) -> HashMap<i16, Stack> {
         .map(|(slot, st)| (inventory_menu_slot(slot), st))
         .collect()
 }
+#[cfg(megu_vanilla_data)]
 #[test]
 fn pickup_inventory_matches_real_1_21_1_classes() {
     let fixture = jparse(include_bytes!(

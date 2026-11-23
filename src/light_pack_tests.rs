@@ -98,6 +98,7 @@ fn light_sections_start_one_below_the_world() {
 
 /// A generated light source (lava, glowstone) is not in the overlay, so the block-light pass
 /// must take it from the chunk's recorded generated sources.
+#[cfg(megu_vanilla_data)]
 #[test]
 fn block_light_uses_generated_sources() {
     crate::test_support::require_vanilla_data();
@@ -121,6 +122,7 @@ fn block_light_uses_generated_sources() {
 
 /// A generated emitter in the next chunk must light this one across the border: the light pass
 /// may not assume every source is inside the chunk being lit.
+#[cfg(megu_vanilla_data)]
 #[test]
 fn block_light_sees_a_neighbours_generated_source() {
     crate::test_support::require_vanilla_data();
@@ -171,6 +173,7 @@ fn a_source_marks_an_already_generated_neighbour_for_a_light_update() {
 /// A light update carries only block light: no sky mask, no sky arrays, and every zero block
 /// section goes in the empty mask. The client leaves sky unchanged for an unmasked section, so
 /// omitting it is what keeps the update small without dimming the world.
+#[cfg(megu_vanilla_data)]
 #[test]
 fn update_light_packet_sends_block_light_only() {
     crate::test_support::require_vanilla_data();
@@ -216,6 +219,7 @@ fn update_light_packet_sends_block_light_only() {
 
 /// A generated emitter the player has since removed must stop lighting. The cached generated
 /// source is skipped when the overlay now holds that cell, so the live overlay decides emission.
+#[cfg(megu_vanilla_data)]
 #[test]
 fn a_removed_generated_emitter_stops_lighting() {
     crate::test_support::require_vanilla_data();

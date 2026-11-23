@@ -4,6 +4,7 @@
 /// The data files this branch ships in the tree. `tools/vanilla_data/gen_vanilla_data.sh`
 /// can rewrite them from a 1.21.1 jar, but they are committed here on purpose: the suite
 /// reads them, so a checkout without them is a broken checkout, not a normal state.
+#[cfg_attr(not(megu_vanilla_data), allow(dead_code))]
 const REQUIRED_DATA: &[&str] = &[
     "assets/blocks_1211.json",
     "assets/block_states_1211.json",
@@ -21,6 +22,7 @@ const REQUIRED_DATA: &[&str] = &[
 /// need a synthetic `datapacks/` move the cwd (`std::env::set_current_dir` is
 /// process-global), and a relative `exists()` running beside one would report the
 /// committed data as missing — a flake that reads like a broken checkout.
+#[cfg_attr(not(megu_vanilla_data), allow(dead_code))]
 pub(crate) fn require_vanilla_data() {
     let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
     if REQUIRED_DATA.iter().any(|p| !root.join(p).exists()) {

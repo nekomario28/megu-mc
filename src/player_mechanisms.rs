@@ -878,6 +878,7 @@ fn swift_sneak_speed_multiplier(level: i32) -> f32 {
 // 1.21.1 enchantment effects from Enchantments.bootstrap and the relevant
 // item implementations. These evaluators take the world conditions explicitly.
 #[cfg_attr(not(test), allow(dead_code))]
+#[cfg_attr(not(megu_vanilla_data), allow(dead_code))]
 fn soul_speed_on_soul_block_bonus(level: i32, standing_on_soul_block: bool) -> f32 {
     if !standing_on_soul_block || level <= 0 {
         return 0.0;
@@ -886,53 +887,63 @@ fn soul_speed_on_soul_block_bonus(level: i32, standing_on_soul_block: bool) -> f
 }
 
 #[cfg_attr(not(test), allow(dead_code))]
+#[cfg_attr(not(megu_vanilla_data), allow(dead_code))]
 fn frost_walker_freeze_radius(level: i32) -> i32 {
     if level <= 0 { 0 } else { level.saturating_add(2).min(16) }
 }
 
 #[cfg_attr(not(test), allow(dead_code))]
+#[cfg_attr(not(megu_vanilla_data), allow(dead_code))]
 fn respiration_air_loss_probability(level: i32) -> f32 {
     1.0 / (level.max(0) as f32 + 1.0)
 }
 
 #[cfg_attr(not(test), allow(dead_code))]
+#[cfg_attr(not(megu_vanilla_data), allow(dead_code))]
 fn aqua_affinity_mining_factor(level: i32, submerged: bool) -> f32 {
     if submerged && level <= 0 { 0.2 } else { 1.0 }
 }
 
 #[cfg_attr(not(test), allow(dead_code))]
+#[cfg_attr(not(megu_vanilla_data), allow(dead_code))]
 fn feather_falling_damage_reduction(level: i32) -> f32 {
     // Each level contributes three protection points; each point is four percent.
     (level.max(0) as f32 * 0.12).min(0.80)
 }
 
 #[cfg_attr(not(test), allow(dead_code))]
+#[cfg_attr(not(megu_vanilla_data), allow(dead_code))]
 fn quick_charge_crossbow_ticks(level: i32) -> i32 {
     // floor((1.25 - 0.25 * level) * 20) in CrossbowItem.getPullTime.
     25 - 5 * level.clamp(0, 3)
 }
 
 #[cfg_attr(not(test), allow(dead_code))]
+#[cfg_attr(not(megu_vanilla_data), allow(dead_code))]
 fn multishot_projectile_angles(level: i32) -> &'static [f32] {
     if level > 0 { &[-10.0, 0.0, 10.0] } else { &[0.0] }
 }
 
 #[cfg_attr(not(test), allow(dead_code))]
+#[cfg_attr(not(megu_vanilla_data), allow(dead_code))]
 fn piercing_max_entities(level: i32) -> i32 {
     level.max(0).saturating_add(1)
 }
 
 #[cfg_attr(not(test), allow(dead_code))]
+#[cfg_attr(not(megu_vanilla_data), allow(dead_code))]
 fn density_smash_bonus_damage(level: i32, fall_blocks: f32) -> f32 {
     level.max(0) as f32 * 0.5 * fall_blocks.max(0.0)
 }
 
 #[cfg_attr(not(test), allow(dead_code))]
+#[cfg_attr(not(megu_vanilla_data), allow(dead_code))]
 fn breach_effective_armor_fraction(level: i32) -> f32 {
     (1.0 - 0.15 * level.max(0) as f32).max(0.0)
 }
 
 #[cfg_attr(not(test), allow(dead_code))]
+#[cfg_attr(not(megu_vanilla_data), allow(dead_code))]
 fn wind_burst_bounce_strength(level: i32, smash_fall_blocks: f32, fall_flying: bool) -> f32 {
     // The wind explosion uses strength 3.5; the resulting upward velocity
     // also depends on the explosion geometry and affected entity position.
@@ -944,6 +955,7 @@ fn wind_burst_bounce_strength(level: i32, smash_fall_blocks: f32, fall_flying: b
 }
 
 #[cfg_attr(not(test), allow(dead_code))]
+#[cfg_attr(not(megu_vanilla_data), allow(dead_code))]
 fn riptide_dash_velocity(
     level: i32,
     wet: bool,
@@ -965,6 +977,7 @@ fn riptide_dash_velocity(
 }
 
 #[cfg_attr(not(test), allow(dead_code))]
+#[cfg_attr(not(megu_vanilla_data), allow(dead_code))]
 fn channeling_strikes_lightning(
     level: i32,
     thunderstorm: bool,
@@ -993,6 +1006,7 @@ fn encode_award_stats_0x04(entries: &[(u8, i32, i32)]) -> Vec<u8> {
 // Vanilla 1.21.1's CUSTOM_STAT registry uses Stats.register insertion order.
 // These are the raw ids sent under category 8 in ClientboundAwardStatsPacket.
 #[cfg_attr(not(test), allow(dead_code))]
+#[cfg_attr(not(megu_vanilla_data), allow(dead_code))]
 fn v767_custom_stat_id(name: &str) -> Option<i32> {
     match name {
         "minecraft:play_time" => Some(1),
@@ -4249,7 +4263,7 @@ mod p5e_parity_mining_tests {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, megu_vanilla_data))]
 mod p8b2_parity_enchantment_and_stats_tests {
     use super::*;
 

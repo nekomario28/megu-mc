@@ -1,6 +1,7 @@
 use super::*;
 use std::collections::BTreeMap;
 
+#[cfg(megu_vanilla_data)]
 #[test]
 fn native_abandoned_mineshaft_loot_matches_all_19_seeds() {
     let tsv = include_str!("../tests/data/mineshaft_loot_1211.tsv");

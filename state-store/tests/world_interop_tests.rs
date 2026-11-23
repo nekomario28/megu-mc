@@ -33,7 +33,11 @@ impl TestWorld {
             NEXT_DIR.fetch_add(1, Ordering::Relaxed)
         ));
         fs::create_dir_all(&path).unwrap();
-        Self(path)
+        // Canonicalize after creation: on macOS `temp_dir()` is
+        // `/var/folders/...` where `/var` is a symlink to `/private/var`,
+        // and `inspect_world_interop` correctly fails closed on a world
+        // root that passes through a symlinked component.
+        Self(fs::canonicalize(&path).unwrap())
     }
 
     fn path(&self, name: &str) -> PathBuf {

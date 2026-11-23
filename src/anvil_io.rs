@@ -843,14 +843,17 @@ impl AnvilLevelDat {
     }
 
     #[cfg_attr(not(test), allow(dead_code))]
+    #[cfg_attr(not(megu_vanilla_data), allow(dead_code))]
     fn data_version(&self) -> i32 {
         anvil_i32(self.data(), "DataVersion").unwrap_or(0)
     }
     #[cfg_attr(not(test), allow(dead_code))]
+    #[cfg_attr(not(megu_vanilla_data), allow(dead_code))]
     fn version_id(&self) -> i32 {
         anvil_i32(self.data(), "version").unwrap_or(0)
     }
     #[cfg_attr(not(test), allow(dead_code))]
+    #[cfg_attr(not(megu_vanilla_data), allow(dead_code))]
     fn level_name(&self) -> String {
         anvil_str(self.data(), "LevelName").unwrap_or_default()
     }
@@ -879,10 +882,12 @@ impl AnvilLevelDat {
         anvil_i8(self.data(), "Difficulty").unwrap_or(2)
     }
     #[cfg_attr(not(test), allow(dead_code))]
+    #[cfg_attr(not(megu_vanilla_data), allow(dead_code))]
     fn difficulty_locked(&self) -> bool {
         anvil_i8(self.data(), "DifficultyLocked").unwrap_or(0) != 0
     }
     #[cfg_attr(not(test), allow(dead_code))]
+    #[cfg_attr(not(megu_vanilla_data), allow(dead_code))]
     fn game_type(&self) -> i32 {
         anvil_i32(self.data(), "GameType").unwrap_or(0)
     }
@@ -1216,9 +1221,11 @@ struct AnvilImportedChunk {
     block_entities: Vec<AnvilNbt>,
     /// Palette entries that resolved to no known state — reported, not applied.
     #[cfg_attr(not(test), allow(dead_code))]
+    #[cfg_attr(not(megu_vanilla_data), allow(dead_code))]
     unknown_states: usize,
     /// Section entries dropped for carrying no `Y` index at all.
     #[cfg_attr(not(test), allow(dead_code))]
+    #[cfg_attr(not(megu_vanilla_data), allow(dead_code))]
     dropped_sections: usize,
 }
 
@@ -3082,7 +3089,7 @@ fn reload_single_chunk_from_anvil_dir(
     Ok(true)
 }
 
-#[cfg(test)]
+#[cfg(all(test, megu_vanilla_data))]
 mod anvil_io_tests {
     use super::*;
 

@@ -238,6 +238,7 @@ impl World for NativeScene {
     }
 }
 
+#[cfg(megu_vanilla_data)]
 #[test]
 fn native_spawner_ticks_match_all_1211_cases() {
     let _guard = crate::world_guard();

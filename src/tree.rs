@@ -222,6 +222,7 @@ fn tree_tables(reg: &BReg) -> &'static TreeTables {
 /// rather than three copies of the test with a different tag baked into each. That
 /// is how a placer ends up overwriting something it should not.
 #[cfg_attr(not(test), allow(dead_code))]
+#[cfg_attr(not(megu_vanilla_data), allow(dead_code))]
 fn is_replaceable(reg: &BReg, cur: u32, tags: &[&str]) -> bool {
     reg.is_air(cur) || tags.iter().any(|t| reg.in_tag(cur, t))
 }
@@ -956,6 +957,7 @@ fn fancy_high(h: i32, y: i32) -> bool {
 /// leaves) **or logs** (`BlockTags.LOGS`, mapping `awe.u`). A stone cell is not
 /// free; a branch cannot pass through rock.
 #[cfg_attr(not(test), allow(dead_code))]
+#[cfg_attr(not(megu_vanilla_data), allow(dead_code))]
 fn fancy_branch_open(reg: &BReg, cur: u32) -> bool {
     tree_tables(reg).is_replaceable_or_log(reg, cur)
 }
@@ -3241,7 +3243,7 @@ use crate::generation_context::FC;
 use crate::generation_providers::{dir_off, is_water_st, p_bsp, p_ip, Bsp, IP};
 use crate::json::{jint, jnum, js, jstr};
 
-#[cfg(test)]
+#[cfg(all(test, megu_vanilla_data))]
 mod tests {
     use super::*;
 

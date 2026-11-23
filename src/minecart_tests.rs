@@ -12,6 +12,7 @@ impl World for Scene {
         (delta,ground)
     }
 }
+#[cfg(megu_vanilla_data)]
 #[test]
 fn native_live_entity_ticks_match_empty_pending_loot_and_off_rail_cases(){
     let mut states=[State{pos:[0.5,200.5,0.5],velocity:[0.,0.,0.2],on_ground:false,in_water:false};3];

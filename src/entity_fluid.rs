@@ -496,6 +496,7 @@ fn player_bounding_box(x: f64, y: f64, z: f64, sneaking: bool, fall_fly: bool) -
 }
 
 #[cfg(test)]
+#[cfg_attr(not(megu_vanilla_data), allow(dead_code))]
 fn player_eye_in_water(x: f64, y: f64, z: f64, sneaking: bool, fall_fly: bool) -> bool {
     let eh = player_eye_height(sneaking, fall_fly);
     eye_in_fluid_with(x, y, z, eh, EntityFluidKind::Water, &block_at_cached)
@@ -625,6 +626,7 @@ fn level_ultra_warm() -> bool {
 }
 
 #[cfg(test)]
+#[cfg_attr(not(megu_vanilla_data), allow(dead_code))]
 fn set_level_ultra_warm(v: bool) {
     LEVEL_ULTRA_WARM.store(v, Ordering::Relaxed);
 }
@@ -1044,7 +1046,7 @@ fn mob_fluid_travel_tick(
     Some(out)
 }
 
-#[cfg(test)]
+#[cfg(all(test, megu_vanilla_data))]
 mod entity_fluid_tests {
     use super::*;
 

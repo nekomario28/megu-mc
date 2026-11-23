@@ -9543,6 +9543,7 @@ mod p5f_parity_tests {
     }
 
     #[test]
+    #[cfg(megu_vanilla_data)]
     fn p5f_parity_setblock_keep_destroy_replace_and_snbt() {
         let _guard = crate::world_guard();
         if crate::test_support::isolated_world_test() {
@@ -9956,6 +9957,7 @@ mod p5f_parity_tests {
     }
 
     #[test]
+    #[cfg(megu_vanilla_data)]
     fn p5f_parity_loot_insert_replace_block_and_mine() {
         let _guard = crate::world_guard();
         if crate::test_support::isolated_world_test() {

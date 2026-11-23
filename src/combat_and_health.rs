@@ -903,6 +903,7 @@ struct WindChargeProfile {
     /// `AdvancedExplosionDamageCalculator.getKnockbackMultiplier`.
     knockback_multiplier: f64,
     /// `onHitEntity` damage.
+    #[cfg_attr(not(megu_vanilla_data), allow(dead_code))]
     direct_hit_damage: f32,
 }
 
@@ -1400,6 +1401,7 @@ fn shield_raised_ticks(c: &Client) -> u64 {
 
 /// The spin-attack window a Riptide launch armed for `eid`, in game ticks.
 #[cfg_attr(not(test), allow(dead_code))]
+#[cfg_attr(not(megu_vanilla_data), allow(dead_code))]
 fn spin_attack_ticks_left(eid: i32) -> u64 {
     let now = TICK_IDX.load(Ordering::Relaxed);
     riptide_spin()
@@ -1555,6 +1557,7 @@ enum TotemDamageKind {
     Ordinary,
     Void,
     #[cfg_attr(not(test), allow(dead_code))]
+    #[cfg_attr(not(megu_vanilla_data), allow(dead_code))]
     Kill,
 }
 
@@ -5263,7 +5266,7 @@ mod p5a_parity_tests {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, megu_vanilla_data))]
 mod vanilla_combat2_tests {
     use super::effect_tests::client_pair;
     use super::*;
@@ -6373,7 +6376,7 @@ mod vanilla_combat2_tests {
 /// MEGA-SCALE T1 + T3 fixtures: a large power-aware blast slices into bounded
 /// per-tick rings, invalid input fails closed without a mutation, and a
 /// 2,000-strong primed-TNT wave ticks in one pass.
-#[cfg(test)]
+#[cfg(all(test, megu_vanilla_data))]
 mod mega_scale_t1t3_tests {
     use super::*;
 

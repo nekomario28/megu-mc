@@ -496,7 +496,7 @@ impl LeafQueue {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, megu_vanilla_data))]
 mod tests {
     use super::*;
     use std::collections::HashSet;

@@ -350,12 +350,14 @@ thread_local! {
 /// Per-thread override so a test can flip the anti-xray master switch without
 /// changing what concurrent tests see; `None` restores the configured default.
 #[cfg(test)]
+#[cfg_attr(not(megu_vanilla_data), allow(dead_code))]
 fn ac_test_set_anti_xray(on: Option<bool>) {
     TEST_XRAY.with(|c| c.set(on));
 }
 
 /// Per-thread override so a light test does not change what concurrent tests see.
 #[cfg(test)]
+#[cfg_attr(not(megu_vanilla_data), allow(dead_code))]
 fn ac_test_set_anti_fullbright(on: Option<bool>) {
     TEST_FULLBRIGHT.with(|c| c.set(on));
 }
@@ -363,6 +365,7 @@ fn ac_test_set_anti_fullbright(on: Option<bool>) {
 /// Per-thread override so an occlusion test does not change what concurrent
 /// tests see; `None` restores the configured default.
 #[cfg(test)]
+#[cfg_attr(not(megu_vanilla_data), allow(dead_code))]
 fn ac_test_set_underground_occlusion(on: Option<bool>) {
     TEST_UNDERGROUND.with(|c| c.set(on));
 }
@@ -373,6 +376,7 @@ static TEST_PRESETS: Mutex<Vec<(String, AcPreset)>> = Mutex::new(Vec::new());
 /// Tests run many players against one in-process server; a per-name preset keeps an
 /// anti-cheat fixture from changing what concurrent fixtures see.
 #[cfg(test)]
+#[cfg_attr(not(megu_vanilla_data), allow(dead_code))]
 fn ac_test_set_player_preset(name: &str, preset: AcPreset) {
     let mut v = TEST_PRESETS.lock().unwrap_or_else(|e| e.into_inner());
     v.retain(|(n, _)| !n.eq_ignore_ascii_case(name));
@@ -1301,6 +1305,7 @@ fn ac_violation_level(eid: i32, check: AcCheckId) -> f64 {
 }
 
 #[cfg_attr(not(test), allow(dead_code))]
+#[cfg_attr(not(megu_vanilla_data), allow(dead_code))]
 fn ac_flag_count(eid: i32, check: AcCheckId) -> u64 {
     ac_players()
         .lock()

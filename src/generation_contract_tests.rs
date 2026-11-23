@@ -98,6 +98,7 @@ fn fossil_case_feature(case: &J) -> Cf {
     cf
 }
 
+#[cfg(megu_vanilla_data)]
 fn fossil_native_case(case: &J, row: &[&str], through_dispatch: bool) {
     use crate::block_registry::HeightmapKind;
     let reg = breg().unwrap();
@@ -249,6 +250,7 @@ fn fossil_native_case(case: &J, row: &[&str], through_dispatch: bool) {
     );
 }
 
+#[cfg(megu_vanilla_data)]
 #[test]
 fn fossil_feature_matches_actual_native_placement() {
     let cases = jparse(include_bytes!("../tests/data/fossil_cases_1211.json")).unwrap();
@@ -270,6 +272,7 @@ fn fossil_feature_matches_actual_native_placement() {
     }
 }
 
+#[cfg(megu_vanilla_data)]
 #[test]
 fn fossil_window_clipping_matches_native() {
     let cases = jparse(include_bytes!("../tests/data/fossil_cases_1211.json")).unwrap();
@@ -286,6 +289,7 @@ fn fossil_window_clipping_matches_native() {
     assert!(checked > 0, "clipping cases disappeared");
 }
 
+#[cfg(megu_vanilla_data)]
 #[test]
 fn fossil_production_dispatch_matches_native() {
     let cases = jparse(include_bytes!("../tests/data/fossil_cases_1211.json")).unwrap();
@@ -496,6 +500,7 @@ fn block_column_provider_accepts_native_and_legacy_keys() {
     }
 }
 
+#[cfg(megu_vanilla_data)]
 #[test]
 fn block_column_up_matches_native_cells_and_rng() {
     generic_feature_cases(
@@ -504,6 +509,7 @@ fn block_column_up_matches_native_cells_and_rng() {
     );
 }
 
+#[cfg(megu_vanilla_data)]
 #[test]
 fn block_column_down_matches_native_cells_and_rng() {
     generic_feature_cases(
@@ -535,6 +541,7 @@ fn required_feature_children_cannot_silently_disappear() {
     }
 }
 
+#[cfg(megu_vanilla_data)]
 #[test]
 fn glowstone_matches_native_cells_and_rng() {
     let reg = breg().unwrap();
@@ -804,6 +811,7 @@ fn within_manhattan_keeps_the_native_order() {
     assert_eq!(order.len(), 5 * 3 * 7);
 }
 
+#[cfg(megu_vanilla_data)]
 #[test]
 fn netherrack_replace_blobs_matches_native_cells_and_rng() {
     let reg = breg().unwrap();
@@ -882,6 +890,7 @@ fn netherrack_replace_blobs_matches_native_cells_and_rng() {
     }
 }
 
+#[cfg(megu_vanilla_data)]
 #[test]
 fn end_gateway_matches_native_cells() {
     let reg = breg().unwrap();
@@ -930,6 +939,7 @@ fn end_gateway_matches_native_cells() {
     }
 }
 
+#[cfg(megu_vanilla_data)]
 #[test]
 fn huge_brown_mushroom_matches_native_cells_and_height() {
     let reg = breg().unwrap();
@@ -1005,6 +1015,7 @@ fn huge_brown_mushroom_matches_native_cells_and_height() {
     }
 }
 
+#[cfg(megu_vanilla_data)]
 #[test]
 fn huge_red_mushroom_matches_native_cells_and_layers() {
     let reg = breg().unwrap();
@@ -1226,6 +1237,7 @@ fn generic_feature_cases(cases_json: &str, fixture: &str) {
     }
 }
 
+#[cfg(megu_vanilla_data)]
 #[test]
 fn pointed_dripstone_matches_native_cells_and_rng() {
     generic_feature_cases(
@@ -1234,6 +1246,7 @@ fn pointed_dripstone_matches_native_cells_and_rng() {
     );
 }
 
+#[cfg(megu_vanilla_data)]
 #[test]
 fn coral_tree_matches_native_cells_and_rng() {
     generic_feature_cases(
@@ -1242,6 +1255,7 @@ fn coral_tree_matches_native_cells_and_rng() {
     );
 }
 
+#[cfg(megu_vanilla_data)]
 #[test]
 fn coral_claw_matches_native_cells_and_rng() {
     generic_feature_cases(
@@ -1250,6 +1264,7 @@ fn coral_claw_matches_native_cells_and_rng() {
     );
 }
 
+#[cfg(megu_vanilla_data)]
 #[test]
 fn coral_mushroom_matches_native_cells_and_rng() {
     generic_feature_cases(
@@ -1258,6 +1273,7 @@ fn coral_mushroom_matches_native_cells_and_rng() {
     );
 }
 
+#[cfg(megu_vanilla_data)]
 #[test]
 fn huge_fungus_matches_native_cells_and_rng() {
     generic_feature_cases(
@@ -1266,6 +1282,7 @@ fn huge_fungus_matches_native_cells_and_rng() {
     );
 }
 
+#[cfg(megu_vanilla_data)]
 #[test]
 fn huge_fungus_crimson_matches_native_cells_and_rng() {
     generic_feature_cases(
@@ -1274,6 +1291,7 @@ fn huge_fungus_crimson_matches_native_cells_and_rng() {
     );
 }
 
+#[cfg(megu_vanilla_data)]
 #[test]
 fn basalt_columns_matches_native_cells_and_rng() {
     generic_feature_cases(
@@ -1330,6 +1348,7 @@ fn sculk_catalyst_requires_a_full_collision_block_below() {
     }
 }
 
+#[cfg(megu_vanilla_data)]
 #[test]
 fn sculk_cursor_matches_the_native_trace() {
     // The sink is thread-local and the generator lock keeps the other generator tests out, so
@@ -1382,6 +1401,7 @@ fn sculk_cursor_matches_the_native_trace() {
 
 /// The same chunk's cursor trace, captured for the record: `SPC_CURSOR_TRACE=1` on the CLI dump
 /// must produce the same first lines as the in-process test above.
+#[cfg(megu_vanilla_data)]
 #[test]
 fn sculk_cursor_trace_is_the_same_shape_as_the_agents() {
     let first = include_str!("../tests/data/sculk_cursor_1211.tsv")
@@ -1643,6 +1663,7 @@ fn sculk_cursor_discharges_the_captured_state_after_conversion() {
     }
 }
 
+#[cfg(megu_vanilla_data)]
 #[test]
 fn sculk_discharge_matches_native_state_snapshots() {
     let reg = breg().unwrap();
@@ -1755,6 +1776,7 @@ fn sculk_vein_wrap_checks_the_source_corner() {
     }
 }
 
+#[cfg(megu_vanilla_data)]
 #[test]
 fn sculk_charge_decay_matches_native() {
     // Captured by invoking the pinned jar's private getDecayPenalty itself.
@@ -1818,6 +1840,7 @@ fn sculk_patch_converts_a_deepslate_floor() {
     );
 }
 
+#[cfg(megu_vanilla_data)]
 #[test]
 fn twisting_vines_matches_native_cells_and_rng() {
     let reg = breg().unwrap();
@@ -1896,6 +1919,7 @@ fn twisting_vines_matches_native_cells_and_rng() {
     }
 }
 
+#[cfg(megu_vanilla_data)]
 #[test]
 fn weeping_vines_matches_native_cells_and_rng() {
     let reg = breg().unwrap();
@@ -1963,6 +1987,7 @@ fn weeping_vines_matches_native_cells_and_rng() {
     }
 }
 
+#[cfg(megu_vanilla_data)]
 #[test]
 fn delta_feature_matches_native_cells_and_rng() {
     let reg = breg().unwrap();
@@ -2044,6 +2069,7 @@ fn delta_feature_matches_native_cells_and_rng() {
     }
 }
 
+#[cfg(megu_vanilla_data)]
 #[test]
 fn nether_forest_vegetation_matches_native_cells_and_rng() {
     let reg = breg().unwrap();
@@ -2080,6 +2106,7 @@ fn nether_forest_vegetation_matches_native_cells_and_rng() {
     }
 }
 
+#[cfg(megu_vanilla_data)]
 #[test]
 fn flower_type_names_share_one_native_class_and_one_port_arm() {
     let mut classes = std::collections::HashSet::new();
@@ -2177,6 +2204,7 @@ fn block_state_cells_digest(
         .collect()
 }
 
+#[cfg(megu_vanilla_data)]
 #[test]
 fn void_start_platform_matches_native_cells() {
     let reg = breg().unwrap();
@@ -2200,6 +2228,7 @@ fn void_start_platform_matches_native_cells() {
     }
 }
 
+#[cfg(megu_vanilla_data)]
 #[test]
 fn end_platform_matches_native_cells() {
     let reg = breg().unwrap();
@@ -2267,6 +2296,7 @@ fn end_platform_matches_native_cells() {
     }
 }
 
+#[cfg(megu_vanilla_data)]
 #[test]
 fn basalt_pillar_matches_native_cells_and_rng() {
     let reg = breg().unwrap();
@@ -2325,6 +2355,7 @@ fn basalt_pillar_matches_native_cells_and_rng() {
     }
 }
 
+#[cfg(megu_vanilla_data)]
 #[test]
 fn chorus_plant_matches_native_cells_states_and_rng() {
     let reg = breg().unwrap();
@@ -2396,6 +2427,7 @@ fn chorus_plant_matches_native_cells_states_and_rng() {
     }
 }
 
+#[cfg(megu_vanilla_data)]
 #[test]
 fn each_dimension_feature_order_matches_native_sorter_indices() {
     let native = jparse(include_bytes!("../assets/feature_order_1211.json")).unwrap();
@@ -2424,6 +2456,7 @@ fn each_dimension_feature_order_matches_native_sorter_indices() {
     }
 }
 
+#[cfg(megu_vanilla_data)]
 #[test]
 fn end_island_feature_matches_native_writes_and_rng() {
     let reg = breg().unwrap();
@@ -2547,6 +2580,7 @@ fn feature_context_sees_carver_writes() {
 
 /// Native canPlaceOre vectors pin both the decision and the following RNG draw.
 /// In particular discard=1 means check all six neighbours, not reject all ore.
+#[cfg(megu_vanilla_data)]
 #[test]
 fn ore_air_exposure_matches_native_decisions_and_rng() {
     let reg = breg().unwrap();
@@ -2619,6 +2653,7 @@ fn monster_room_volume(seed: u64, wrapped: bool) -> Gen {
     g
 }
 
+#[cfg(megu_vanilla_data)]
 #[test]
 fn monster_room_cells_and_rng_match_native() {
     let reg = breg().unwrap();
@@ -3281,6 +3316,7 @@ fn normal_cache_identity_survives_slot_reuse() {
     assert_eq!(slot.get(-982.0, -35.0, 520.0).to_bits(), expected.to_bits());
 }
 
+#[cfg(megu_vanilla_data)]
 #[test]
 fn normal_noise_legacy_source_matches_native_create() {
     let cases: &[(i32, &[f64])] = &[
@@ -3314,6 +3350,7 @@ fn normal_noise_legacy_source_matches_native_create() {
 /// Native OreFeature.place queried these 121 OCEAN_FLOOR_WG columns for
 /// (-1003,71,513), then skipped its vein. A neighbour's canopy must not cause
 /// the port to consume the 17 sphere-size draws that vanilla skipped.
+#[cfg(megu_vanilla_data)]
 #[test]
 fn ore_uses_frozen_worldgen_floor() {
     let mut g = Gen::load(0, crate::name_to_state).expect("data pack");
@@ -3353,6 +3390,7 @@ fn ore_uses_frozen_worldgen_floor() {
 /// The actual patch_grass_forest origins from neighbouring chunk (-64,33).
 /// Its 388 typed draws matched; only the parsed WORLD_SURFACE_WG height was
 /// wrong (+5 from the canopy), losing a grass cell in the target chunk.
+#[cfg(megu_vanilla_data)]
 #[test]
 fn grass_patch_keeps_worldgen_heightmap_through_the_modifier() {
     let mut g = Gen::load(0, crate::name_to_state).expect("data pack");
@@ -3393,6 +3431,7 @@ fn grass_patch_keeps_worldgen_heightmap_through_the_modifier() {
     assert_eq!(rows, 2);
 }
 
+#[cfg(megu_vanilla_data)]
 #[test]
 fn multiface_cells_and_following_rng_match_native() {
     let reg = breg().unwrap();
@@ -4301,6 +4340,7 @@ fn carver_configs_parse_the_1_21_1_field_shapes() {
 /// Every biome's AIR carver list, in the order the carver seed index counts,
 /// against the pinned jar's own `BiomeGenerationSettings`. The list is written as
 /// `{"air": [...]}` in 1.21.1, not as a bare array.
+#[cfg(megu_vanilla_data)]
 #[test]
 fn carver_lists_match_the_pinned_biomes() {
     let fixture = jparse(include_bytes!(
@@ -4358,6 +4398,7 @@ fn converted_carver_lists_still_parse() {
 /// each weighted entry, the two spawn-cost fields and the creature probability.
 /// The nightly runtime uses only the supported monsters, but the whole loaded
 /// table is pinned so a loader change cannot silently drop a category.
+#[cfg(megu_vanilla_data)]
 #[test]
 fn biome_spawn_tables_match_the_pinned_classes() {
     let fixture = jparse(include_bytes!(
@@ -5864,6 +5905,7 @@ fn large_dripstone_sways_when_both_spikes_clear_the_wind_gate() {
     assert_eq!(with_wind.len(), 126, "golden cell count");
 }
 
+#[cfg(megu_vanilla_data)]
 #[test]
 fn freeze_top_layer_matches_native_oracle() {
     let reg = breg().expect("registry");
@@ -6036,6 +6078,7 @@ fn end_spike_config_parses_explicit_fields_and_rejects_malformed() {
     assert!(super::p_cf(&bad_target).is_none());
 }
 
+#[cfg(megu_vanilla_data)]
 #[test]
 fn end_spike_matches_native_oracle() {
     let reg = breg().expect("registry");
@@ -6907,6 +6950,7 @@ fn live_heightmap_types_differ_on_leaves() {
 /// The three older assets record the same native calls the fact table now owns. They are read
 /// here and nowhere else, so a shifted state id or a swapped plane in either exporter shows up
 /// as a disagreement instead of as two plausible tables.
+#[cfg(megu_vanilla_data)]
 #[test]
 fn pinned_fact_tables_agree_with_the_older_oracle_assets() {
     let reg = breg().expect("registry");

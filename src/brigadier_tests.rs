@@ -2435,6 +2435,7 @@ fn execute_pipeline_forks_and_carries_each_entity_position_and_rotation() {
 }
 
 #[test]
+#[cfg(megu_vanilla_data)]
 fn execute_pipeline_runs_in_selected_dimension_and_evaluates_world_conditions() {
     if crate::test_support::isolated_world_test() {
         return;

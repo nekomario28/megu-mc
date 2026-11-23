@@ -882,7 +882,7 @@ pub(crate) fn run_paletted_bench() {
     println!("write_wire_ns_per_section={write_ns_per_sec:.1} rounds={rounds}");
 }
 
-#[cfg(test)]
+#[cfg(all(test, megu_vanilla_data))]
 mod paletted_tests {
     use super::*;
 

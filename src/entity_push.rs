@@ -360,7 +360,7 @@ fn apply_entity_push_step(
     dead_by_cramming
 }
 
-#[cfg(test)]
+#[cfg(all(test, megu_vanilla_data))]
 mod entity_push_tests {
     use super::*;
 

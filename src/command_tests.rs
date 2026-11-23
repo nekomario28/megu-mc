@@ -945,6 +945,7 @@ fn spreadplayers_rejects_bad_arguments_and_empty_targets() {
 }
 
 #[test]
+#[cfg(megu_vanilla_data)]
 fn spreadplayers_places_players_and_mobs_deterministically() {
     let _world = world_guard();
     let (a, _ra) = packet_client(8311, "spread-a", 0.5, 16.0, 0.5);
@@ -1717,6 +1718,7 @@ fn w5_live_balancer_walks_smooth_to_overloaded_and_back() {
 /// live entry point on the real world always answers a finite, in-bounds
 /// point whose cells are never a contact-damage block.
 #[test]
+#[cfg(megu_vanilla_data)]
 fn w5_safe_initial_world_spawn_avoids_ocean_lava_and_returns_dry_ground() {
     if crate::test_support::isolated_world_test() {
         return;

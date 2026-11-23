@@ -24,6 +24,7 @@ impl Facing {
         matches!(self, Self::North | Self::South)
     }
     #[cfg(test)]
+    #[cfg_attr(not(megu_vanilla_data), allow(dead_code))]
     fn data2d(self) -> i32 {
         match self {
             Self::South => 0,
@@ -65,6 +66,7 @@ pub(crate) struct Layout {
     pub(crate) pieces: Vec<Piece>,
     /// Context, discarded double, room, children, height adjustment: no draws.
     #[cfg(test)]
+    #[cfg_attr(not(megu_vanilla_data), allow(dead_code))]
     pub(crate) checkpoints: [u64; 5],
     pub(crate) vertical_shift: i32,
 }
@@ -427,7 +429,7 @@ fn layout(
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, megu_vanilla_data))]
 mod tests {
     use super::*;
     fn csv(b: &Bounds) -> String {

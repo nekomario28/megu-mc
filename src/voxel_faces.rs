@@ -45,7 +45,7 @@ pub(crate) fn exposed_faces(points: impl IntoIterator<Item = Pos>) -> Vec<(u8, P
     faces
 }
 
-#[cfg(test)]
+#[cfg(all(test, megu_vanilla_data))]
 mod tests {
     use super::*;
 

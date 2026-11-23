@@ -467,7 +467,7 @@ impl Snapshot {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, megu_vanilla_data))]
 mod tests {
     use super::*;
     #[test]

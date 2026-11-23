@@ -399,6 +399,7 @@ impl<'a, 'g> PieceWorld<'a, 'g> {
 
 /// Java's `boolean` spelling in the piece tags.
 #[cfg_attr(not(test), allow(dead_code))]
+#[cfg_attr(not(megu_vanilla_data), allow(dead_code))]
 fn piece_bool(v: bool) -> &'static str {
     if v {
         "1"
@@ -444,6 +445,7 @@ impl FortressKind {
     /// The 1.21.1 `StructurePieceType` registry id this piece serialises as. The ids are the
     /// game's own (`NeBS` and friends lowercased), so the fixture's piece list is the native
     /// tag's `id` field rather than a name the port invented.
+    #[cfg_attr(not(megu_vanilla_data), allow(dead_code))]
     pub(crate) fn registry_id(self) -> &'static str {
         match self {
             // `StartPiece` calls `BridgeCrossing(int, int, Direction)`, which hardcodes the
@@ -581,6 +583,7 @@ pub(crate) struct FortressPiece {
 
 #[cfg_attr(not(test), allow(dead_code))]
 impl FortressPiece {
+    #[cfg_attr(not(megu_vanilla_data), allow(dead_code))]
     pub(crate) fn canonical(&self) -> String {
         let bb = self
             .bounds
@@ -1625,7 +1628,7 @@ pub(crate) fn place_fortress_chunk<R: StructureRng + ?Sized>(
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, megu_vanilla_data))]
 mod fortress_monument_tests {
     use super::*;
     use crate::generation_math::sha256;
@@ -2128,6 +2131,7 @@ pub(crate) enum MonumentKind {
 #[cfg_attr(not(test), allow(dead_code))]
 impl MonumentKind {
     /// The 1.21.1 `StructurePieceType` registry id, which is what the piece tag carries.
+    #[cfg_attr(not(megu_vanilla_data), allow(dead_code))]
     pub(crate) fn registry_id(self) -> &'static str {
         match self {
             Self::Building => "minecraft:omb",
@@ -2191,6 +2195,7 @@ pub(crate) struct MonumentPiece {
 
 #[cfg_attr(not(test), allow(dead_code))]
 impl MonumentPiece {
+    #[cfg_attr(not(megu_vanilla_data), allow(dead_code))]
     pub(crate) fn canonical(&self, rooms: &[RoomDefinition]) -> String {
         let bb = self
             .bounds
@@ -2220,7 +2225,9 @@ pub(crate) struct MonumentLayout {
     /// Index 0 is the `MonumentBuilding`; the rest are its `childPieces` in creation order.
     pub(crate) pieces: Vec<MonumentPiece>,
     pub(crate) rooms: Vec<RoomDefinition>,
+    #[cfg_attr(not(megu_vanilla_data), allow(dead_code))]
     pub(crate) source_room: u32,
+    #[cfg_attr(not(megu_vanilla_data), allow(dead_code))]
     pub(crate) core_room: u32,
 }
 

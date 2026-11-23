@@ -79,6 +79,7 @@ fn p02_biome_row(biome: &str, category: &str, mob: &str) -> feature::SpawnerData
     entry.clone()
 }
 
+#[cfg(megu_vanilla_data)]
 #[test]
 fn p02_end_biome_weighted_enderman_reaches_live_entity_registry() {
     let _guard = world_guard();
@@ -103,6 +104,7 @@ fn p02_end_biome_weighted_enderman_reaches_live_entity_registry() {
     }));
 }
 
+#[cfg(megu_vanilla_data)]
 #[test]
 fn p02_water_biome_rows_spawn_in_water_and_reject_dry_cells() {
     let _guard = world_guard();
@@ -137,6 +139,7 @@ fn p02_water_biome_rows_spawn_in_water_and_reject_dry_cells() {
     }
 }
 
+#[cfg(megu_vanilla_data)]
 #[test]
 fn p02_underground_bat_glow_squid_and_lush_axolotl_require_valid_sites() {
     let _guard = world_guard();
@@ -238,6 +241,7 @@ impl std::ops::Drop for RuntimeRegistrySnapshot {
     }
 }
 
+#[cfg(megu_vanilla_data)]
 #[test]
 fn d1_nether_crop_growth_writes_only_its_dimension() {
     let _guard = world_guard();
@@ -257,6 +261,7 @@ fn d1_nether_crop_growth_writes_only_its_dimension() {
     assert_eq!(crops().lock().unwrap_or_else(|e| e.into_inner()).get(&(DimId::Nether, x, y, z)), Some(&1));
 }
 
+#[cfg(megu_vanilla_data)]
 #[test]
 fn d1_reload_saved_drop_eid_does_not_collide_with_mob() {
     let _guard = world_guard();
@@ -368,6 +373,7 @@ fn gp2_mismatched_mob_dimension_footer_does_not_apply_overlay() {
     assert!(!world().lock().unwrap_or_else(|e| e.into_inner()).contains_key(&chunk));
 }
 
+#[cfg(megu_vanilla_data)]
 #[test]
 fn d1_player_fluid_checks_use_nether_blocks() {
     let _guard = world_guard();
@@ -422,6 +428,7 @@ fn m2_join_game_uses_actual_player_entity_id() {
     assert_eq!(first[4..], second[4..]);
 }
 
+#[cfg(megu_vanilla_data)]
 #[test]
 fn generated_fluid_handoff_matches_native_proto_unpack() {
     fn ticks(text: &str) -> Vec<scheduled_ticks::ScheduledTick> {
@@ -594,6 +601,7 @@ fn generated_dispatchers_unpack_the_published_generator_queues() {
     }
 }
 
+#[cfg(megu_vanilla_data)]
 // Gen initialization is process-global and cannot be undone by WorldSnapshot.
 // Keep this fixture in the child; otherwise later cadence tests generate terrain.
 fn generated_dispatcher_fixture() {
@@ -819,6 +827,7 @@ impl std::ops::Drop for WorldSnapshot {
     }
 }
 
+#[cfg(megu_vanilla_data)]
 #[test]
 fn fragile_support_loss_drops_torches_and_lanterns_exactly_once() {
     let _guard = world_guard();
@@ -931,6 +940,7 @@ fn multiway_wall_post_and_compatible_fence_pane_connections() {
     );
 }
 
+#[cfg(megu_vanilla_data)]
 #[test]
 fn runtime_connected_shapes_connect_and_disconnect_with_waterlogged_retained() {
     let _guard = world_guard();
@@ -969,6 +979,7 @@ fn runtime_connected_shapes_connect_and_disconnect_with_waterlogged_retained() {
     WATERLOGGED_DEFER.with(|v| v.borrow_mut().clear());
 }
 
+#[cfg(megu_vanilla_data)]
 #[test]
 fn waterlogged_source_flows_on_fifth_game_tick_without_replacing_its_block() {
     let _guard = world_guard();
@@ -1023,6 +1034,7 @@ fn waterlogged_source_flows_on_fifth_game_tick_without_replacing_its_block() {
     WATERLOGGED_DEFER.with(|v| v.borrow_mut().clear());
 }
 
+#[cfg(megu_vanilla_data)]
 #[test]
 fn world_mechanisms_fluid_reactions_resolve_vanilla_blocks() {
     let _guard = crate::world_guard();
@@ -1037,6 +1049,7 @@ fn world_mechanisms_fluid_reactions_resolve_vanilla_blocks() {
     }
 }
 
+#[cfg(megu_vanilla_data)]
 #[test]
 fn world_mechanisms_fluid_wash_away_excludes_waterloggable_hosts() {
     let _guard = crate::world_guard();
@@ -1059,6 +1072,7 @@ fn world_mechanisms_fluid_wash_away_excludes_waterloggable_hosts() {
     }
 }
 
+#[cfg(megu_vanilla_data)]
 #[test]
 fn world_mechanisms_generated_fluids_cross_chunk_borders_on_their_tick_deadlines() {
     let _guard = world_guard();
@@ -1107,6 +1121,7 @@ fn world_mechanisms_generated_fluids_cross_chunk_borders_on_their_tick_deadlines
     WATERLOGGED_DEFER.with(|deferred| deferred.borrow_mut().clear());
 }
 
+#[cfg(megu_vanilla_data)]
 #[test]
 fn scheduled_leaf_distance_matches_native_vectors() {
     let _guard = crate::world_guard();
@@ -3364,6 +3379,7 @@ fn a_backoff_past_the_queue_cap_waits_for_its_real_deadline() {
 /// would pass age 15, so sixteen random ticks raise the column by one. That makes it the
 /// one behaviour a random tick can drive that can be pinned exactly, which is why it is
 /// the first consumer of the stream.
+#[cfg(megu_vanilla_data)]
 #[test]
 fn sixteen_random_ticks_raise_sugar_cane_one_block() {
     let _world_guard = world_guard();
@@ -3438,6 +3454,7 @@ fn sixteen_random_ticks_raise_sugar_cane_one_block() {
 /// they are measured here directly. Run with --nocapture to see the numbers. The point of the
 /// pair is the difference: with no light source in the chunk the block light spread must do
 /// nothing, and that is what makes it safe to compute unconditionally.
+#[cfg(megu_vanilla_data)]
 #[test]
 fn measure_the_light_cost_per_chunk() {
     let _g = world_guard();
@@ -3669,6 +3686,7 @@ fn falling_world_tick_test() {
 
 /// A delayed gravity callback must re-read support; re-adding the floor
 /// before due time prevents conversion, and a subsequent removal rebooks.
+#[cfg(megu_vanilla_data)]
 #[test]
 fn falling_booking_is_two_game_ticks_and_support_rescue_cancels_it() {
     let _guard = world_guard();
@@ -3710,6 +3728,7 @@ fn falling_booking_is_two_game_ticks_and_support_rescue_cancels_it() {
 /// Sand over air falls as a vanilla falling-block entity: the block leaves the world, the
 /// entity integrates `dy -= 0.04` per tick (`y_n = y0 - 0.02 n(n+1)`), and it lands on the
 /// first solid block below. The bytecode contract is evidence/gameplay/falling-vanilla.
+#[cfg(megu_vanilla_data)]
 #[test]
 fn sand_falls_under_vanilla_gravity_until_it_lands() {
     let _world_guard = world_guard();
@@ -3809,6 +3828,7 @@ fn sand_falls_under_vanilla_gravity_until_it_lands() {
 /// A fall that moves more than one block per tick must still land on a one-block platform it
 /// crosses. The support scan starts at the old feet and sweeps down to the new feet, so it sees
 /// a platform whose cell is entirely above `floor(new_y)`.
+#[cfg(megu_vanilla_data)]
 #[test]
 fn a_fast_falling_block_lands_on_a_thin_platform_it_crosses() {
     let _world_guard = world_guard();
@@ -3891,6 +3911,7 @@ fn beginning_a_falling_tick_leaves_the_queue_visible() {
 /// A save that runs while blocks are falling must not lose or duplicate them. A saver thread
 /// snapshots under `SAVE_LOCK` throughout the fall, and a snapshot taken mid-fall is reloaded and
 /// ticked to completion: every starting block must reappear exactly once.
+#[cfg(megu_vanilla_data)]
 #[test]
 fn a_save_concurrent_with_falling_conserves_every_block() {
     let _world_guard = world_guard();
@@ -4039,6 +4060,7 @@ fn a_save_concurrent_with_falling_conserves_every_block() {
 
 /// A block that falls out of the world becomes exactly one item; a save racing that
 /// transition must neither duplicate nor lose the item when its snapshot is reloaded.
+#[cfg(megu_vanilla_data)]
 #[test]
 fn a_saved_below_world_drop_is_not_duplicated() {
     let _world_guard = world_guard();
@@ -4255,6 +4277,7 @@ fn concurrent_knockout_and_falling_conserve_blocks() {
 /// Two stacked blocks must both fall, and must not deadlock. The first version held the queue lock
 /// while calling set_block, which reaches note_falling_above, which takes the same lock: with one
 /// block it never showed, because the check returns before locking when there is nothing above.
+#[cfg(megu_vanilla_data)]
 #[test]
 fn two_stacked_sand_blocks_fall_without_deadlocking() {
     let _world_guard = world_guard();
@@ -4335,6 +4358,7 @@ fn two_stacked_sand_blocks_fall_without_deadlocking() {
 /// A falling entity has already left its block cell, so a *new* gravity block placed into that
 /// same cell must still fall. Keying the spawn guard on "an entity occupies this cell" suppressed
 /// it and left the block hanging in the air forever.
+#[cfg(megu_vanilla_data)]
 #[test]
 fn a_new_block_in_a_passing_entity_cell_still_falls() {
     let _g = world_guard();
@@ -4408,6 +4432,7 @@ fn a_new_block_in_a_passing_entity_cell_still_falls() {
 
 /// Vanilla's collision uses the block shape, so a falling block passes through a replaceable
 /// block (a flower) and replaces it, rather than resting on top of it.
+#[cfg(megu_vanilla_data)]
 #[test]
 fn a_falling_block_passes_through_a_replaceable_block() {
     let _g = world_guard();
@@ -4470,6 +4495,7 @@ fn a_falling_block_passes_through_a_replaceable_block() {
 
 /// A long unsupported column must convert entirely in one pass, not stop at the neighbour-update
 /// recursion bound.
+#[cfg(megu_vanilla_data)]
 #[test]
 fn a_long_unsupported_column_converts_in_one_pass() {
     let _g = world_guard();
@@ -4521,6 +4547,7 @@ fn a_long_unsupported_column_converts_in_one_pass() {
 /// Placing unsupported sand must queue the air the world now holds, not the sand that was
 /// requested: the block converts to an entity in the same call, and notifying the requested state
 /// would leave a ghost block on the client.
+#[cfg(megu_vanilla_data)]
 #[test]
 fn placing_unsupported_sand_queues_air_not_a_ghost() {
     let _g = world_guard();
@@ -4569,6 +4596,7 @@ fn placing_unsupported_sand_queues_air_not_a_ghost() {
 /// block name from the asset is walked here, because the registry test alone cannot tell whether a
 /// name that is classified as falling is also scheduled and moved - reverting the tick to a hand
 /// list of three states kept that test green.
+#[cfg(megu_vanilla_data)]
 #[test]
 fn every_falling_block_becomes_an_entity_and_lands() {
     let _g = world_guard();
@@ -4634,6 +4662,7 @@ fn every_falling_block_becomes_an_entity_and_lands() {
 /// A queued block in a chunk nobody is near must not move. Vanilla's falling block is an entity and
 /// entities do not tick where there is no player, so without this the queue would carry a block all
 /// the way down and land it in a chunk nobody had ever visited.
+#[cfg(megu_vanilla_data)]
 #[test]
 fn a_falling_block_waits_in_a_cold_chunk() {
     let _g = world_guard();
@@ -4801,6 +4830,7 @@ fn drop_count(item: i64) -> usize {
 /// taken at that moment reloads to the same landing. This is the ownership case: the entity has
 /// already left its block cell, so the support is placed into an empty cell and the landing is
 /// deferred to the next tick's re-check.
+#[cfg(megu_vanilla_data)]
 #[test]
 fn a_support_placed_under_a_falling_entity_is_landed_on() {
     let _world_guard = world_guard();
@@ -4954,6 +4984,7 @@ fn a_knockout_and_a_save_in_the_same_tick_conserve_the_block() {
 
 /// Two threads removing adjacent supports while the tick thread runs: every block ends up either
 /// placed or dropped, and no block falls twice.
+#[cfg(megu_vanilla_data)]
 #[test]
 fn two_knockouts_of_adjacent_supports_conserve_every_block() {
     let _world_guard = world_guard();
@@ -5036,6 +5067,7 @@ fn two_knockouts_of_adjacent_supports_conserve_every_block() {
 
 /// Conversion to a drop at the world floor is one item whether the snapshot is taken in flight or
 /// after conversion.
+#[cfg(megu_vanilla_data)]
 #[test]
 fn a_save_during_entity_conversion_has_no_duplicate_drop() {
     let _world_guard = world_guard();
@@ -5107,6 +5139,7 @@ fn a_save_during_entity_conversion_has_no_duplicate_drop() {
 
 /// A block in a chunk that leaves the warm set stays in flight without moving, and lands once the
 /// chunk is warm again.
+#[cfg(megu_vanilla_data)]
 #[test]
 fn region_change_mid_fall_keeps_the_entity() {
     let _world_guard = world_guard();
@@ -6483,6 +6516,7 @@ fn a_block_write_waits_for_an_in_progress_save_before_booking() {
 /// The invariant the lock protects, checked on the persisted form: a snapshot may
 /// not hold a gravity block standing over a fallable cell without the callback
 /// that will move it.
+#[cfg(megu_vanilla_data)]
 #[test]
 fn a_saved_snapshot_never_holds_an_unbooked_gravity_block() {
     let _world_guard = world_guard();
@@ -6594,6 +6628,7 @@ fn a_saved_snapshot_never_holds_an_unbooked_gravity_block() {
 /// The "book the cell above" branch is the only scheduler when the support under
 /// a gravity block is removed: that write never touches the gravity cell itself.
 /// The placement booking has already fired by then, so it cannot stand in for it.
+#[cfg(megu_vanilla_data)]
 #[test]
 fn removing_a_support_schedules_the_block_above_after_its_own_booking_fired() {
     let _g = world_guard();
@@ -6649,6 +6684,7 @@ fn removing_a_support_schedules_the_block_above_after_its_own_booking_fired() {
 
 /// An entity that is already in flight when its chunk goes cold has to stay put;
 /// the block callback gate alone cannot cover this, because the entity exists.
+#[cfg(megu_vanilla_data)]
 #[test]
 fn a_falling_entity_stops_moving_when_its_chunk_goes_cold() {
     let _g = world_guard();
@@ -7256,6 +7292,7 @@ fn fast_chest_viewer(eid: i32, at: BlockPos) -> (Arc<Client>, TcpStream) {
     (viewer, receiver)
 }
 
+#[cfg(megu_vanilla_data)]
 #[test]
 fn chest_contract_redstone_conductor_matches_1211_rules() {
     let _world_guard = world_guard();
@@ -7338,6 +7375,7 @@ fn chest_contract_redstone_conductor_matches_1211_rules() {
     set_block(cell.0, cell.1 + 1, cell.2, 0);
 }
 
+#[cfg(megu_vanilla_data)]
 #[test]
 fn chest_contract_blocked_single_double_cat_and_unblocked_barrel() {
     let _world_guard = world_guard();
@@ -7444,6 +7482,7 @@ fn chest_contract_blocked_single_double_cat_and_unblocked_barrel() {
     }
 }
 
+#[cfg(megu_vanilla_data)]
 #[test]
 fn chest_contract_multi_viewer_broadcast_changes() {
     let _world_guard = world_guard();
@@ -7541,6 +7580,7 @@ fn chest_contract_multi_viewer_broadcast_changes() {
     }
 }
 
+#[cfg(megu_vanilla_data)]
 #[test]
 fn chest_contract_recheck_openers_reach_and_lid_close() {
     let _world_guard = world_guard();
@@ -7937,6 +7977,7 @@ fn decode_block_updates(frames: Vec<(i64, Vec<u8>)>) -> Vec<(BlockPos, u32)> {
         .collect()
 }
 
+#[cfg(megu_vanilla_data)]
 #[test]
 fn chest_contract_3d_block_loot_stays_lazy_until_first_open() {
     let _world_guard = world_guard();
@@ -8133,6 +8174,7 @@ fn chest_contract_3d_block_loot_stays_lazy_until_first_open() {
     }
 }
 
+#[cfg(megu_vanilla_data)]
 #[test]
 fn chest_contract_3d_barrel_toggles_open_property_without_block_event() {
     let _world_guard = world_guard();
@@ -8205,6 +8247,7 @@ fn chest_contract_3d_barrel_toggles_open_property_without_block_event() {
     set_block(barrel_pos.0, barrel_pos.1, barrel_pos.2, 0);
 }
 
+#[cfg(megu_vanilla_data)]
 #[test]
 fn chest_contract_3d_waterlogged_double_chest_schedules_and_spreads_without_dry_partner_error() {
     let _world_guard = world_guard();
@@ -8302,6 +8345,7 @@ fn chest_contract_3d_waterlogged_double_chest_schedules_and_spreads_without_dry_
     WATERLOGGED_DEFER.with(|v| v.borrow_mut().clear());
 }
 
+#[cfg(megu_vanilla_data)]
 #[test]
 fn chest_contract_3d_ender_chest_emits_block_event_and_invalidates_on_break() {
     let _world_guard = world_guard();
@@ -8878,6 +8922,7 @@ fn travel_contract_4d_lava_push_scale_dimension() {
     );
 }
 
+#[cfg(megu_vanilla_data)]
 #[test]
 fn travel_contract_4d_mob_tick_water_and_lava_sink_without_fall_damage() {
     let _guard = world_guard();
@@ -9388,6 +9433,7 @@ fn s3_parse_map_chunk(bytes: &[u8]) -> S3Packet {
     }
 }
 
+#[cfg(megu_vanilla_data)]
 #[test]
 fn p2_3_s3_nether_and_end_chunk_packets_emit_16_sections_and_zero_sky_mask() {
     let _guard = world_guard();
@@ -9436,6 +9482,7 @@ fn p2_3_s3_nether_and_end_chunk_packets_emit_16_sections_and_zero_sky_mask() {
     assert_eq!(worldgen::active_dim(), DimId::Overworld);
 }
 
+#[cfg(megu_vanilla_data)]
 #[test]
 fn p2_3_s3_nether_and_end_block_light_anchors_at_light_min_y_minus_16() {
     let _guard = world_guard();
@@ -9536,6 +9583,7 @@ fn p2_3_s3_nether_and_end_block_light_anchors_at_light_min_y_minus_16() {
     );
 }
 
+#[cfg(megu_vanilla_data)]
 #[test]
 fn p2_3_s3_chunk_caches_isolate_dimensions_on_same_coords() {
     let _guard = world_guard();
@@ -9706,6 +9754,7 @@ fn p2_3_s4_join_game_declares_all_three_dimensions_and_names_spawn_dim() {
     }
 }
 
+#[cfg(megu_vanilla_data)]
 #[test]
 fn p2_3_s4_switch_client_dimension_emits_respawn_clears_chunks_and_syncs_position() {
     let _guard = world_guard();
@@ -9820,6 +9869,7 @@ fn p2_3_s4_broadcast_chunk_dim_filters_other_dimensions() {
     assert!(!ow_ids.contains(&0x49), "the Overworld holder must not: {ow_ids:?}");
 }
 
+#[cfg(megu_vanilla_data)]
 #[test]
 fn m3_p5_map_chunk_cache_hit_and_invalidation() {
     let _guard = world_guard();
@@ -9911,6 +9961,7 @@ fn m3_p5_map_chunk_cache_hit_and_invalidation() {
 /// band were installed by a real delivery, with overlay edits spread across every
 /// read regime — inside a published section/band row (write-through), high above the
 /// surface where only the overlay answers, and a surface block carved back to air.
+#[cfg(megu_vanilla_data)]
 #[test]
 fn perf_sky_floors_fast_matches_reference_cell_for_cell() {
     let _guard = world_guard();
@@ -10025,6 +10076,7 @@ fn perf_sky_floors_fast_matches_reference_cell_for_cell() {
     );
 }
 
+#[cfg(megu_vanilla_data)]
 #[test]
 fn p2_c_uniform_sections_emitters_match_cell_by_cell() {
     let _guard = world_guard();

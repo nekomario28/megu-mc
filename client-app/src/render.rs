@@ -2606,9 +2606,13 @@ mod tests {
         // view-distance cap must reject.
         let cam32 = [8.0, 40.0, 8.0];
         let planes = frustum_planes(cam32, 0.0, 0.0, 16.0 / 9.0);
-        world
-            .rebuild_dirty_bounded_ordered(usize::MAX, cam32, &planes)
-            .unwrap();
+        // One call admits only the per-frame upload allowance, so drain the
+        // dirty queue like the live loop does before measuring the cap.
+        while world.pending_mesh_sections() > 0 {
+            world
+                .rebuild_dirty_bounded_ordered(usize::MAX, cam32, &planes)
+                .unwrap();
+        }
 
         let eye = [8.0, 40.0, 8.0];
         let full = render_frame(&world, eye, 0.0, 0.0, 160, 90).unwrap();

@@ -217,7 +217,7 @@ pub(crate) fn state(state: u32, mirror: Mirror, rotation: Rotation) -> Option<u3
     Some(u32::from_be_bytes(bytes.try_into().unwrap()))
 }
 
-#[cfg(test)]
+#[cfg(all(test, megu_vanilla_data))]
 mod tests {
     use super::*;
     #[test]

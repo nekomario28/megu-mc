@@ -1,5 +1,6 @@
 use super::*;
 
+#[cfg(megu_vanilla_data)]
 fn cases(kind: &str) -> Vec<json::J> {
     let fixture = json::jparse(include_bytes!(
         "../evidence/foundation/valence-primitives/vanilla.json"

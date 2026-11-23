@@ -511,7 +511,7 @@ fn mob_collide_move(m: &Arc<Mob>, mp: &mut (f64, f64, f64, f32, f32), dx: f64, d
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, megu_vanilla_data))]
 mod entity_collision_tests {
     use super::*;
 

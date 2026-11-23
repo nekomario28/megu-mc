@@ -13,6 +13,7 @@ fn aq_state_name(raw: &str) -> Option<u32> {
     }
 }
 
+#[cfg(megu_vanilla_data)]
 #[test]
 fn aquifer_matches_the_pinned_chunk_through_its_public_api() {
     let fixture = jparse(include_bytes!(

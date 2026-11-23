@@ -1056,6 +1056,7 @@ fn p2_3_s2a_init_generators() {
 /// With the overlay keyed by `(cx, cz)` alone, the three writes below are one entry: whichever
 /// dimension wrote last owns that coordinate, and a read in either of the other two answers with
 /// it.
+#[cfg(megu_vanilla_data)]
 #[test]
 fn p2_3_s2a_one_cell_in_three_dimensions_stays_independent() {
     if test_support::isolated_world_test() {
@@ -1120,6 +1121,7 @@ fn p2_3_s2a_one_cell_in_three_dimensions_stays_independent() {
 /// A legacy `(cx, cz)` chunk loads as `(DimId::Overworld, cx, cz)`, and another dimension's edits
 /// change none of its bytes: the format, the header count and the keys are what they were before
 /// the key carried a dimension, which is what lets an older build read this file.
+#[cfg(megu_vanilla_data)]
 #[test]
 fn p2_3_s2a_legacy_overworld_save_and_dim_overlay_tables_round_trip() {
     if test_support::isolated_world_test() {
@@ -1232,6 +1234,7 @@ fn p2_3_s2a_legacy_overworld_save_and_dim_overlay_tables_round_trip() {
 ///
 /// The save path is the one the server runs, pointed at a scratch directory so the fixture does not
 /// write into the checkout's working directory.
+#[cfg(megu_vanilla_data)]
 #[test]
 fn p2_3_s2a_companion_dim_files_are_written_loaded_and_removed_when_empty() {
     if test_support::isolated_world_test() {
@@ -2768,6 +2771,7 @@ fn save_v2_rejects_a_truncated_companion_before_publishing_any_of_its_edits() {
     assert_eq!(world().lock().unwrap_or_else(|e| e.into_inner())[&(DimId::Nether, 0, 0)][&3], 501);
 }
 
+#[cfg(megu_vanilla_data)]
 #[test]
 fn save_v2_live_block_entities_round_trip_all_families() {
     test_support::require_vanilla_data();

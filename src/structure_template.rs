@@ -24,6 +24,7 @@ pub(crate) struct EntityInfo {
 /// `yaw`/`pitch` are what `moveTo` applies (`pitch` is never transformed).
 #[derive(Clone, Debug, PartialEq)]
 #[cfg_attr(not(test), allow(dead_code))]
+#[cfg_attr(not(megu_vanilla_data), allow(dead_code))]
 pub(crate) struct PlacedEntity {
     pub pos: [f64; 3],
     pub block_pos: Pos,
@@ -120,6 +121,7 @@ fn state_from_json(value: &crate::json::J, reg: &BReg) -> Result<u32, &'static s
 /// that is not a float list fails closed — the spawn path would otherwise lose
 /// the entity to `loadEntityRecursive`'s empty `Optional`.
 #[cfg_attr(not(test), allow(dead_code))]
+#[cfg_attr(not(megu_vanilla_data), allow(dead_code))]
 fn entity_rotation(nbt: &Tag) -> Result<(f32, f32), &'static str> {
     let Some(tag) = nbt.get("Rotation") else {
         return Ok((0.0, 0.0));
@@ -143,6 +145,7 @@ fn entity_rotation(nbt: &Tag) -> Result<(f32, f32), &'static str> {
 
 /// `Mth.wrapDegrees`: fold an angle into `[-180, 180)`.
 #[cfg_attr(not(test), allow(dead_code))]
+#[cfg_attr(not(megu_vanilla_data), allow(dead_code))]
 fn wrap_degrees(angle: f32) -> f32 {
     let wrapped = angle % 360.0;
     if wrapped >= 180.0 {
@@ -164,6 +167,7 @@ fn wrap_degrees(angle: f32) -> f32 {
 /// none/CW90/CW180/CCW90. `getYRot()` in the subtraction is the stored yaw
 /// un-updated, so `w` is used twice rather than the wrapped result replacing it.
 #[cfg_attr(not(test), allow(dead_code))]
+#[cfg_attr(not(megu_vanilla_data), allow(dead_code))]
 fn transformed_yaw(
     raw_yaw: f32,
     mirror: crate::structure_transform::Mirror,
@@ -720,6 +724,7 @@ impl Processor {
         processors.iter().map(|p| Self::parse(p, reg)).collect()
     }
     #[cfg(test)]
+    #[cfg_attr(not(megu_vanilla_data), allow(dead_code))]
     pub(crate) fn from_json(value: &crate::json::J, reg: &BReg) -> Result<Self, &'static str> {
         Self::parse(value, reg)
     }
@@ -1407,6 +1412,7 @@ impl Template {
     /// requires full cubes), so admission is not baked into placement and one owner
     /// serves every caller.
     #[cfg(test)]
+    #[cfg_attr(not(megu_vanilla_data), allow(dead_code))]
     pub(crate) fn validate_placement(&self) -> Result<(), &'static str> {
         let reg = crate::block_registry::breg().ok_or("missing block registry")?;
         if !self.entities.is_empty() {
@@ -1754,6 +1760,7 @@ impl Template {
     /// (`loadEntityRecursive` answers `Optional.empty`) and this port's contract
     /// is to refuse it instead.
     #[cfg_attr(not(test), allow(dead_code))]
+    #[cfg_attr(not(megu_vanilla_data), allow(dead_code))]
     pub(crate) fn transformed_entities(
         &self,
         placement: Placement,
@@ -1932,7 +1939,7 @@ impl Template {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, megu_vanilla_data))]
 mod tests {
     use super::*;
     use crate::generation_math::sha256;

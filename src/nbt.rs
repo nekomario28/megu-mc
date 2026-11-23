@@ -593,7 +593,7 @@ impl RegistryJson<'_> {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, megu_vanilla_data))]
 mod tests {
     use super::*;
     fn bytes(hex: &str) -> Vec<u8> {

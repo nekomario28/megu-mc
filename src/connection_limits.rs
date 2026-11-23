@@ -543,6 +543,7 @@ impl ChunkPacketCache {
     }
 
     #[cfg(test)]
+    #[cfg_attr(not(megu_vanilla_data), allow(dead_code))]
     pub(crate) fn clear(&mut self) {
         self.map.clear();
         self.order.clear();

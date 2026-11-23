@@ -1552,9 +1552,13 @@ fn spectator_cameras() -> &'static Mutex<HashMap<i32, i32>> {
 #[derive(Clone, Debug)]
 #[cfg_attr(not(test), allow(dead_code))]
 struct PlaceDispatch {
+    #[cfg_attr(not(megu_vanilla_data), allow(dead_code))]
     dim: DimId,
+    #[cfg_attr(not(megu_vanilla_data), allow(dead_code))]
     pos: (i32, i32, i32),
+    #[cfg_attr(not(megu_vanilla_data), allow(dead_code))]
     id: String,
+    #[cfg_attr(not(megu_vanilla_data), allow(dead_code))]
     kind: PlaceKind,
 }
 
@@ -3688,7 +3692,7 @@ fn refresh_dynamic_registries() {
 
 // ------------------------------------------------------------ p3_parity ---
 
-#[cfg(test)]
+#[cfg(all(test, megu_vanilla_data))]
 mod p3_datapack_tests {
     use super::*;
     use std::path::{Path, PathBuf};

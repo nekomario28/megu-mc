@@ -1674,6 +1674,7 @@ mod tag_tests {
     /// an earlier one placed (measured: this port's gravel set was a strict subset of
     /// vanilla's, 121 cells missing, while its stone-variant sets were supersets).
     #[test]
+    #[cfg(megu_vanilla_data)]
     fn base_stone_overworld_excludes_gravel_and_dirt() {
         let reg = super::breg().expect("registry");
         for name in [
@@ -1710,6 +1711,7 @@ mod tag_tests {
     /// nested tag (`#small_flowers` + `#tall_flowers` + direct members). The
     /// expansion must reach members two levels deep or flowers never pop.
     #[test]
+    #[cfg(megu_vanilla_data)]
     fn nested_flowers_tag_reaches_small_flower_members() {
         let reg = super::breg().expect("registry");
         for name in ["poppy", "dandelion", "torchflower", "sunflower"] {
@@ -1727,12 +1729,14 @@ mod tag_tests {
 #[cfg(test)]
 mod version_asset_tests {
     use super::VersionAssetPaths;
+    #[cfg(megu_vanilla_data)]
     use std::path::Path;
 
     /// With no `MEGU_VERSION_DIR` override the resolver must produce the
     /// same `assets/*_1211.*` paths the hardcoded reads used — the zero
     /// behavior change contract for default 1.21.1 runs.
     #[test]
+    #[cfg(megu_vanilla_data)]
     fn default_pack_resolves_the_bundled_1211_paths() {
         // A set override is an operator choice; this test only proves the
         // default branch, so it declines rather than fight the environment.

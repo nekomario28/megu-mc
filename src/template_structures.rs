@@ -308,6 +308,7 @@ pub(crate) struct BlockEntityRecord {
     pub(crate) loot_seed: Option<i64>,
     /// The container `Items` list as `BlockEntity.saveWithoutMetadata` writes it.
     #[cfg_attr(not(test), allow(dead_code))]
+    #[cfg_attr(not(megu_vanilla_data), allow(dead_code))]
     pub(crate) items: Option<Tag>,
     /// Entity id inside `SpawnData.entity.id` for `minecraft:mob_spawner`.
     pub(crate) spawner_entity: Option<String>,
@@ -3880,7 +3881,7 @@ fn set_block_entity_loot(out: &mut PlacementOut, pos: Pos, table: &str, seed: i6
 
 // ---------------------------------------------------------------- native fixture
 
-#[cfg(test)]
+#[cfg(all(test, megu_vanilla_data))]
 mod template_structures_tests {
     use super::*;
     use crate::generation_math::sha256;
