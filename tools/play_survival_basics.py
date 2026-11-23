@@ -175,6 +175,21 @@ def exercise(game):
             )
             require(client.block(*target) != 0, "placed-state")
             summary["steps"].append("place")
+
+            # Sleep: night + a real two-part bed, then use_block on the foot.
+            # Vanilla's 100-tick sleep gate fires skip_night for a lone sleeper;
+            # the observable is the system chat line plus the morning jump.
+            chat_command(client, "time set night")
+            bed = (target[0] + 2, target[1] + 1, target[2])
+            chat_command(client, f"setblock {bed[0]} {bed[1]} {bed[2]} minecraft:red_bed[facing=east,part=foot]")
+            chat_command(client, f"setblock {bed[0]+1} {bed[1]} {bed[2]} minecraft:red_bed[facing=east,part=head]")
+            client.move(bed[0] + 0.5, float(bed[1] + 1), bed[2] + 0.5)
+            place_block(client, bed, sequence=90)
+            client.until(
+                lambda *_: any("slept through the night" in m for m in client.messages),
+                "night-skip",
+            )
+            summary["steps"].append("sleep")
         summary["placed_cell"] = list(target)
         summary["dug_cell"] = list(target)
         # A fresh reader must see the edited world — persistence-by-chunk, the
