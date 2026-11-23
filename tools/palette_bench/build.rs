@@ -5,7 +5,9 @@ fn main() {
     // worldgen benchmark or its repository-only integration tests.
     let source = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../src/paletted.rs");
     println!("cargo:rerun-if-changed={}", source.display());
-    let content = fs::read_to_string(&source).expect("read current production paletted.rs");
+    let content = fs::read_to_string(&source)
+        .expect("read current production paletted.rs")
+        .replace("\r\n", "\n");
     let marker = "\npub(crate) fn run_paletted_bench() {";
     let (implementation, _) = content
         .split_once(marker)

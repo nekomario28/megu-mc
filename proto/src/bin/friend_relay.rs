@@ -271,6 +271,13 @@ fn serve(cli: &Cli) -> io::Result<()> {
         }
         match listener.accept() {
             Ok((client, peer)) => {
+                // On macOS/BSD, accepted sockets inherit O_NONBLOCK from a
+                // non-blocking listener; restore blocking mode for the
+                // per-connection pump threads.
+                if let Err(e) = client.set_nonblocking(false) {
+                    eprintln!("megu-friend-relay: client {peer}: set_nonblocking(false): {e}");
+                    continue;
+                }
                 let _ = client.set_nodelay(true);
                 let hosts = Arc::clone(&hosts);
                 thread::spawn(move || {

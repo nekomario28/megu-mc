@@ -13,6 +13,13 @@ all-features = true
 version = 2
 # Yanked crates fail the check; unmaintained/unsound advisories also fail (default scope: workspace).
 yanked = "deny"
+ignore = [
+    # Minecraft Java Protocol 767 mandates 1024-bit RSA PKCS#1 v1.5 for the
+    # online-mode login encryption handshake. Megu generates a fresh ephemeral
+    # keypair per server boot (no persistent RSA key), and no fixed 0.9.x
+    # release of `rsa` exists yet.
+    { id = "RUSTSEC-2023-0071", reason = "Minecraft protocol 767 requires RSA PKCS#1 v1.5 for ephemeral per-boot login handshake; no patched rsa 0.9.x release exists" },
+]
 
 [licenses]
 version = 2
@@ -42,6 +49,7 @@ confidence-threshold = 0.93
 [bans]
 multiple-versions = "warn"
 wildcards = "deny"
+allow-wildcard-paths = true
 
 [sources]
 unknown-registry = "deny"

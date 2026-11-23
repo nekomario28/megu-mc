@@ -4,7 +4,9 @@ use std::{env, fs, path::PathBuf};
 fn source(path: &str) -> String {
     let path = format!("../src/{path}.rs");
     println!("cargo:rerun-if-changed={path}");
-    fs::read_to_string(&path).unwrap_or_else(|e| panic!("read {path}: {e}"))
+    fs::read_to_string(&path)
+        .unwrap_or_else(|e| panic!("read {path}: {e}"))
+        .replace("\r\n", "\n")
 }
 
 fn split<'a>(source: &'a str, marker: &str) -> (&'a str, &'a str) {

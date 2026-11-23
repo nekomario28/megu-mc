@@ -14,17 +14,24 @@ use megu_core::math_opt_engine::{
 };
 use megu_core::perf_kit::splitmix64;
 use std::alloc::{GlobalAlloc, Layout, System};
+use std::cell::Cell;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
-// Heap-counting allocator: proves the streaming estimators allocate zero
-// bytes per sample. Only observes counters; every call forwards to System.
+// Per-thread heap-counting allocator: proves the streaming estimators allocate
+// zero bytes per sample even when sibling tests run in parallel on other threads.
 static HEAP_ALLOCATIONS: AtomicUsize = AtomicUsize::new(0);
+
+thread_local! {
+    static COUNT_THIS_THREAD: Cell<bool> = const { Cell::new(false) };
+}
 
 struct CountingAllocator;
 
 unsafe impl GlobalAlloc for CountingAllocator {
     unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
-        HEAP_ALLOCATIONS.fetch_add(1, Ordering::Relaxed);
+        if COUNT_THIS_THREAD.try_with(Cell::get).unwrap_or(false) {
+            HEAP_ALLOCATIONS.fetch_add(1, Ordering::Relaxed);
+        }
         System.alloc(layout)
     }
 
@@ -287,9 +294,11 @@ fn p2_uses_constant_memory_and_zero_heap_per_sample() {
     let mut p99 = P2QuantileEstimator::new(0.99);
     p99.observe(10.0); // settle bootstrap outside the measured window
     let before = HEAP_ALLOCATIONS.load(Ordering::Relaxed);
+    COUNT_THIS_THREAD.with(|flag| flag.set(true));
     for &x in &samples {
         p99.observe(x);
     }
+    COUNT_THIS_THREAD.with(|flag| flag.set(false));
     let after = HEAP_ALLOCATIONS.load(Ordering::Relaxed);
     assert_eq!(
         after - before,

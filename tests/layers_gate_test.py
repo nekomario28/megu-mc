@@ -30,6 +30,10 @@ def fixture():
         for name in ("Cargo.toml", "Cargo.lock"):
             shutil.copy2(ROOT / name, root / name)
         (root / "assets").symlink_to(ROOT / "assets", target_is_directory=True)
+        for dep in ("core", "state-store", "mod-offload", "mod-adapter-core", "create-adapter"):
+            src_dep = ROOT / dep
+            if src_dep.is_dir():
+                (root / dep).symlink_to(src_dep, target_is_directory=True)
         for name in ("rust_module_graph.py", "check_layers.py"):
             shutil.copy2(ROOT / "tools" / name, root / "tools" / name)
         for name in ("deps.py", "deps_target.py", "policy.json", "gate_probe.py"):
@@ -58,7 +62,7 @@ class LayerGateTests(unittest.TestCase):
 
     def test_forbidden_edge_is_read_from_rust(self):
         for imported in ["use crate::tree::TreeExtra;\n",
-                         "use crate::{tree::TreeExtra, block_registry::BReg};\n",
+                         "use crate::{tree::TreeExtra, block_registry::BReg as _};\n",
                          "use crate::{{tree as hidden}};\n"]:
             with self.subTest(imported=imported), fixture() as root:
                 p = root / "src/worldgen.rs"
