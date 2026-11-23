@@ -59,8 +59,10 @@ if os.environ.get("FAKE_JLINK_FAIL") == "1":
 output = Path(args[args.index("--output") + 1])
 (output / "bin").mkdir(parents=True)
 (output / "lib").mkdir(parents=True)
-(output / "bin" / "java").write_text("#!/bin/sh\\n")
-os.chmod(output / "bin" / "java", 0o755)
+java_bin = output / "bin" / ("java.exe" if os.name == "nt" else "java")
+java_bin.write_text("#!/bin/sh\\n")
+if os.name != "nt":
+    os.chmod(java_bin, 0o755)
 (output / "lib" / "modules").write_bytes(b"fake-jimage-blob")
 (output / "release").write_text('JAVA_VERSION="99"\\n')
 sys.exit(0)
@@ -87,13 +89,21 @@ class MiniJreTests(unittest.TestCase):
     def setUp(self):
         temp = tempfile.TemporaryDirectory(prefix="mini-jre-test-")
         self.addCleanup(temp.cleanup)
-        self.root = Path(temp.name)
+        self.root = Path(os.path.realpath(temp.name))
         self.out = self.root / "mini-jre"
         self.staging = self.root / ".mini-jre.jlink-staging"
         self.log = self.root / "jlink-argv.log"
-        self.fake = self.root / "fake-jlink"
-        self.fake.write_text(FAKE_JLINK)
-        self.fake.chmod(0o755)
+        if os.name == "nt":
+            py_script = self.root / "fake-jlink.py"
+            py_script.write_text(FAKE_JLINK)
+            self.fake = self.root / "fake-jlink.cmd"
+            self.fake.write_text(
+                f'@echo off\r\n"{sys.executable}" "{py_script}" %*\r\n'
+            )
+        else:
+            self.fake = self.root / "fake-jlink"
+            self.fake.write_text(FAKE_JLINK)
+            self.fake.chmod(0o755)
 
     def cli(self, *extra, env=None):
         merged = dict(os.environ)
@@ -139,7 +149,8 @@ class MiniJreTests(unittest.TestCase):
 
     def test_delegate_jvm_argv_prepends_java_binary(self):
         argv = builder.build_delegate_jvm_argv(self.out, 64, 512)
-        self.assertEqual(Path(argv[0]), self.out / "bin" / "java")
+        expected_java = "java.exe" if os.name == "nt" else "java"
+        self.assertEqual(Path(argv[0]), self.out / "bin" / expected_java)
         self.assertEqual(argv[1:], builder.delegate_flags(64, 512))
         self.assertIn("-Xms64m", argv)
         self.assertIn("-Xmx512m", argv)
@@ -219,12 +230,13 @@ class MiniJreTests(unittest.TestCase):
         empty_bin = self.root / "empty-bin"
         empty_bin.mkdir()
         proc = self.cli("--out", str(self.out), "--dry-run", "--json",
-                        env={"PATH": str(empty_bin)})
+                        env={"PATH": str(empty_bin), "JAVA_HOME": ""})
         self.assertEqual(proc.returncode, 0, proc.stderr)
         report = json.loads(proc.stdout)
         self.assertIsNone(report["jlink"]["bin"])
         self.assertFalse(report["jlink"]["available"])
-        self.assertEqual(report["jlink_argv"][0], "jlink")
+        expected_jlink = "jlink.exe" if os.name == "nt" else "jlink"
+        self.assertEqual(report["jlink_argv"][0], expected_jlink)
 
     def test_explicit_missing_jlink_is_usage_error(self):
         proc = self.cli("--out", str(self.out),
@@ -235,7 +247,8 @@ class MiniJreTests(unittest.TestCase):
         proc = self.cli("--out", str(self.out), "--jlink", str(self.fake),
                         "--json", env=self.fake_env())
         self.assertEqual(proc.returncode, 0, proc.stderr)
-        self.assertTrue((self.out / "bin" / "java").is_file())
+        expected_java = "java.exe" if os.name == "nt" else "java"
+        self.assertTrue((self.out / "bin" / expected_java).is_file())
         self.assertTrue((self.out / "lib" / "modules").is_file())
         self.assertFalse(self.staging.exists())
         manifest = json.loads(

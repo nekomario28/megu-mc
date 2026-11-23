@@ -42,6 +42,8 @@ fn fixture_dir(tag: &str) -> PathBuf {
         NEXT_DIR.fetch_add(1, Ordering::Relaxed)
     ));
     fs::create_dir_all(&dir).expect("create fixture dir");
+    #[cfg(unix)]
+    let dir = fs::canonicalize(&dir).expect("canonicalize fixture dir");
     dir
 }
 
