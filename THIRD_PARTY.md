@@ -153,7 +153,7 @@ Copied verbatim from the `license` field of each crate's published metadata; thi
 
 issue #51 (Brigadier 互換のコマンドディスパッチャ) の slice 1 で、`src/brigadier.rs` を Mojang の
 Brigadier (MIT) から Rust に翻訳した。**上流の Java ソース・jar はこのリポジトリに含まれない**
-(参照クローンは `/home/yuu/megu-local/reference/brigadier-1.3.10/` のローカルデータ)。
+(参照クローンはリポジトリ外のローカルデータに置き、本リポジトリには含めない)。
 Pumpkin (GPL-3.0) のコードは読んでいない・参照していない。
 
 固定した参照 / Pinned reference (2026-11-17 に確認):
