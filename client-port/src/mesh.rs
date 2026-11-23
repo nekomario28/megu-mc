@@ -1014,32 +1014,37 @@ const DIR_SEC_STRIDES: [(usize, usize, usize, isize); 6] = [
     (1, FACE_CELLS, EDGE, 1),
 ];
 
-#[derive(Clone, Copy)]
-struct CornerBase {
-    face_bl: u8,
-    face_sk: u8,
-    src_bl: u8,
-}
+/// Packed corner shading for one 8-bit neighbour occupancy mask. The low byte
+/// holds the four 2-bit AO values for corners 0-3; bits 8-11 flag the corners
+/// whose two side neighbours both occlude — such a corner reads the face
+/// light instead of the diagonal sample. The whole table is 512 bytes, so a
+/// handful of L1 lines replaces the per-corner AO branches.
+const AO_LUT: [u16; 256] = build_ao_lut();
 
-#[derive(Clone, Copy)]
-struct SideSample {
-    occ: u8,
-    bl: u8,
-    sk: u8,
-}
-
-#[inline(always)]
-fn shade_corner_unpacked(base: CornerBase, a: SideSample, b: SideSample, od: u8, ld: u8) -> u64 {
-    let both = a.occ & b.occ;
-    let ao = if both != 0 { 0 } else { 3 - a.occ - b.occ - od };
-    let (d_bl, d_sk) = if both != 0 {
-        (base.face_bl, base.face_sk)
-    } else {
-        (ld & 15, ld >> 4)
-    };
-    let c_bl = ((base.face_bl + a.bl + b.bl + d_bl + 2) >> 2).max(base.src_bl);
-    let c_sk = (base.face_sk + a.sk + b.sk + d_sk + 2) >> 2;
-    u64::from(c_bl | (c_sk << 4)) | (u64::from(ao) << 8)
+const fn build_ao_lut() -> [u16; 256] {
+    // Mask bit order: 0=mu, 1=pu, 2=mv, 3=pv, 4=mm, 5=pm, 6=pp, 7=mp.
+    // Corner i combines sides (a, b) and the diagonal d between them.
+    const CORNER: [(usize, usize, usize); 4] = [(0, 2, 4), (1, 2, 5), (1, 3, 6), (0, 3, 7)];
+    let mut table = [0u16; 256];
+    let mut mask = 0usize;
+    while mask < 256 {
+        let mut entry = 0u16;
+        let mut c = 0usize;
+        while c < 4 {
+            let (a, b, d) = CORNER[c];
+            let both = ((mask >> a) & (mask >> b) & 1) as u16;
+            let ao = if both != 0 {
+                0
+            } else {
+                (3 - ((mask >> a) & 1) - ((mask >> b) & 1) - ((mask >> d) & 1)) as u16
+            };
+            entry |= ao << (2 * c) | both << (8 + c);
+            c += 1;
+        }
+        table[mask] = entry;
+        mask += 1;
+    }
+    table
 }
 
 /// SAFETY invariant for callers: `pad_idx` must address an interior cell with
@@ -1107,41 +1112,77 @@ unsafe fn shade_fast(
             return c | (c << 12) | (c << 24) | (c << 36) | (u64::from(face) << 48);
         }
 
-        let base = CornerBase {
-            face_bl,
-            face_sk,
-            src_bl,
-        };
-        let s_mu = SideSample {
-            occ: u8::from((o0 & opp_bit) != 0),
-            bl: l_mu & 15,
-            sk: l_mu >> 4,
-        };
-        let s_pu = SideSample {
-            occ: u8::from((o1 & opp_bit) != 0),
-            bl: l_pu & 15,
-            sk: l_pu >> 4,
-        };
-        let s_mv = SideSample {
-            occ: u8::from((o2 & opp_bit) != 0),
-            bl: l_mv & 15,
-            sk: l_mv >> 4,
-        };
-        let s_pv = SideSample {
-            occ: u8::from((o3 & opp_bit) != 0),
-            bl: l_pv & 15,
-            sk: l_pv >> 4,
-        };
-        let o_mm = u8::from((o4 & opp_bit) != 0);
-        let o_pm = u8::from((o5 & opp_bit) != 0);
-        let o_pp = u8::from((o6 & opp_bit) != 0);
-        let o_mp = u8::from((o7 & opp_bit) != 0);
+        // 8-bit occupancy mask in LUT bit order (mu, pu, mv, pv, mm, pm, pp, mp).
+        let occ_mask = u8::from((o0 & opp_bit) != 0)
+            | u8::from((o1 & opp_bit) != 0) << 1
+            | u8::from((o2 & opp_bit) != 0) << 2
+            | u8::from((o3 & opp_bit) != 0) << 3
+            | u8::from((o4 & opp_bit) != 0) << 4
+            | u8::from((o5 & opp_bit) != 0) << 5
+            | u8::from((o6 & opp_bit) != 0) << 6
+            | u8::from((o7 & opp_bit) != 0) << 7;
+        let entry = AO_LUT[occ_mask as usize];
 
-        let c0 = shade_corner_unpacked(base, s_mu, s_mv, o_mm, l_mm);
-        let c1 = shade_corner_unpacked(base, s_pu, s_mv, o_pm, l_pm);
-        let c2 = shade_corner_unpacked(base, s_pu, s_pv, o_pp, l_pp);
-        let c3 = shade_corner_unpacked(base, s_mu, s_pv, o_mp, l_mp);
-        c0 | (c1 << 12) | (c2 << 24) | (c3 << 36) | (u64::from(face) << 48)
+        // Per-corner light samples as byte lanes, one lane per corner:
+        // side a, side b and the diagonal between them.
+        let va = u32::from(l_mu)
+            | u32::from(l_pu) << 8
+            | u32::from(l_pu) << 16
+            | u32::from(l_mu) << 24;
+        let vb = u32::from(l_mv)
+            | u32::from(l_mv) << 8
+            | u32::from(l_pv) << 16
+            | u32::from(l_pv) << 24;
+        let vd0 = u32::from(l_mm)
+            | u32::from(l_pm) << 8
+            | u32::from(l_pp) << 16
+            | u32::from(l_mp) << 24;
+
+        // Corners with both sides occluded take the face light instead of the
+        // diagonal sample: spread the four LUT flag bits to 0xFF byte lanes.
+        let face_splat = u32::from(face) * 0x0101_0101;
+        let both = u32::from(entry >> 8);
+        let bm = ((both * 0x0020_4081) & 0x0101_0101) * 0xFF;
+        let vd = (vd0 & !bm) | (face_splat & bm);
+
+        // SWAR nibble averaging over the four corner lanes at once. Every
+        // lane sum is at most 15*3 + 17 = 62, so bytes cannot carry into each
+        // other and one `>> 2` applies the +2 rounding to all four corners.
+        const NIB: u32 = 0x0f0f_0f0f;
+        let lo = (va & NIB)
+            + (vb & NIB)
+            + (vd & NIB)
+            + (u32::from(face_bl) + 2) * 0x0101_0101;
+        let hi = ((va >> 4) & NIB)
+            + ((vb >> 4) & NIB)
+            + ((vd >> 4) & NIB)
+            + (u32::from(face_sk) + 2) * 0x0101_0101;
+        let bl_avg = (lo >> 2) & NIB;
+        let sk_avg = (hi >> 2) & NIB;
+
+        // c_bl = max(bl_avg, src_bl) per lane. Each byte of
+        // `16 + src_bl - bl_avg` stays in 1..=31 (no borrows) and its bit 4 is
+        // set exactly where src_bl wins; expand that bit to a 0x0F mask.
+        let src_splat = u32::from(src_bl) * 0x0101_0101;
+        let ge = (((src_splat + 0x1010_1010).wrapping_sub(bl_avg)) >> 4 & 0x0101_0101) * 0x0F;
+        let bl = bl_avg ^ ((bl_avg ^ src_splat) & ge);
+
+        // Scatter the four corner light bytes to their 12-bit fields.
+        let lv = bl | (sk_avg << 4);
+        let lv64 = u64::from(lv);
+        let light_fields = (lv64 & 0xff)
+            | (lv64 & 0xff00) << 4
+            | (lv64 & 0xff_0000) << 8
+            | (lv64 & 0xff00_0000) << 12;
+
+        // Scatter the packed 2-bit AO values to bits 8-9 of each field.
+        let ao = u64::from(entry & 0xff);
+        let ao_fields = ((ao & 0x03) << 8)
+            | ((ao & 0x0c) << 18)
+            | ((ao & 0x30) << 28)
+            | ((ao & 0xc0) << 38);
+
+        light_fields | ao_fields | (u64::from(face) << 48)
     }
 }
 
@@ -2171,5 +2212,261 @@ impl DirectionBuckets {
             );
         }
         buckets
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[derive(Clone, Copy)]
+    struct CornerBase {
+        face_bl: u8,
+        face_sk: u8,
+        src_bl: u8,
+    }
+
+    #[derive(Clone, Copy)]
+    struct SideSample {
+        occ: u8,
+        bl: u8,
+        sk: u8,
+    }
+
+    #[inline(always)]
+    fn shade_corner_unpacked(base: CornerBase, a: SideSample, b: SideSample, od: u8, ld: u8) -> u64 {
+        let both = a.occ & b.occ;
+        let ao = if both != 0 { 0 } else { 3 - a.occ - b.occ - od };
+        let (d_bl, d_sk) = if both != 0 {
+            (base.face_bl, base.face_sk)
+        } else {
+            (ld & 15, ld >> 4)
+        };
+        let c_bl = ((base.face_bl + a.bl + b.bl + d_bl + 2) >> 2).max(base.src_bl);
+        let c_sk = (base.face_sk + a.sk + b.sk + d_sk + 2) >> 2;
+        u64::from(c_bl | (c_sk << 4)) | (u64::from(ao) << 8)
+    }
+
+    /// The pre-LUT scalar implementation of `shade_fast`, kept verbatim as the
+    /// oracle for the exhaustive parity test below.
+    unsafe fn shade_ref(
+        occ: &[u8; PAD_CELLS],
+        light: &[u8; PAD_CELLS],
+        pad_idx: usize,
+        step_dir: isize,
+        su: isize,
+        sv: isize,
+        opp_bit: u8,
+    ) -> u64 {
+        let out = pad_idx.wrapping_add_signed(step_dir);
+        let i_mu = out.wrapping_add_signed(-su);
+        let i_pu = out.wrapping_add_signed(su);
+        let i_mv = out.wrapping_add_signed(-sv);
+        let i_pv = out.wrapping_add_signed(sv);
+        let i_mm = i_mu.wrapping_add_signed(-sv);
+        let i_pm = i_pu.wrapping_add_signed(-sv);
+        let i_pp = i_pu.wrapping_add_signed(sv);
+        let i_mp = i_mu.wrapping_add_signed(sv);
+
+        unsafe {
+            let src_bl = *light.get_unchecked(pad_idx) & 15;
+            let center = *light.get_unchecked(out);
+            let face_bl = (center & 15).max(src_bl);
+            let face_sk = center >> 4;
+            let face = face_bl | (face_sk << 4);
+
+            let o0 = *occ.get_unchecked(i_mu);
+            let o1 = *occ.get_unchecked(i_pu);
+            let o2 = *occ.get_unchecked(i_mv);
+            let o3 = *occ.get_unchecked(i_pv);
+            let o4 = *occ.get_unchecked(i_mm);
+            let o5 = *occ.get_unchecked(i_pm);
+            let o6 = *occ.get_unchecked(i_pp);
+            let o7 = *occ.get_unchecked(i_mp);
+
+            let l_mu = *light.get_unchecked(i_mu);
+            let l_pu = *light.get_unchecked(i_pu);
+            let l_mv = *light.get_unchecked(i_mv);
+            let l_pv = *light.get_unchecked(i_pv);
+            let l_mm = *light.get_unchecked(i_mm);
+            let l_pm = *light.get_unchecked(i_pm);
+            let l_pp = *light.get_unchecked(i_pp);
+            let l_mp = *light.get_unchecked(i_mp);
+
+            let occ_any = (o0 | o1 | o2 | o3 | o4 | o5 | o6 | o7) & opp_bit;
+            let light_diff = (l_mu ^ face)
+                | (l_pu ^ face)
+                | (l_mv ^ face)
+                | (l_pv ^ face)
+                | (l_mm ^ face)
+                | (l_pm ^ face)
+                | (l_pp ^ face)
+                | (l_mp ^ face);
+
+            if (occ_any | light_diff) == 0 {
+                let c = u64::from(face) | (3u64 << 8);
+                return c | (c << 12) | (c << 24) | (c << 36) | (u64::from(face) << 48);
+            }
+
+            let base = CornerBase {
+                face_bl,
+                face_sk,
+                src_bl,
+            };
+            let s_mu = SideSample {
+                occ: u8::from((o0 & opp_bit) != 0),
+                bl: l_mu & 15,
+                sk: l_mu >> 4,
+            };
+            let s_pu = SideSample {
+                occ: u8::from((o1 & opp_bit) != 0),
+                bl: l_pu & 15,
+                sk: l_pu >> 4,
+            };
+            let s_mv = SideSample {
+                occ: u8::from((o2 & opp_bit) != 0),
+                bl: l_mv & 15,
+                sk: l_mv >> 4,
+            };
+            let s_pv = SideSample {
+                occ: u8::from((o3 & opp_bit) != 0),
+                bl: l_pv & 15,
+                sk: l_pv >> 4,
+            };
+            let o_mm = u8::from((o4 & opp_bit) != 0);
+            let o_pm = u8::from((o5 & opp_bit) != 0);
+            let o_pp = u8::from((o6 & opp_bit) != 0);
+            let o_mp = u8::from((o7 & opp_bit) != 0);
+
+            let c0 = shade_corner_unpacked(base, s_mu, s_mv, o_mm, l_mm);
+            let c1 = shade_corner_unpacked(base, s_pu, s_mv, o_pm, l_pm);
+            let c2 = shade_corner_unpacked(base, s_pu, s_pv, o_pp, l_pp);
+            let c3 = shade_corner_unpacked(base, s_mu, s_pv, o_mp, l_mp);
+            c0 | (c1 << 12) | (c2 << 24) | (c3 << 36) | (u64::from(face) << 48)
+        }
+    }
+
+    /// Neighbour pad indices in the LUT bit order mu, pu, mv, pv, mm, pm, pp, mp.
+    fn neighbor_indices(out: usize, su: isize, sv: isize) -> [usize; 8] {
+        let i_mu = out.wrapping_add_signed(-su);
+        let i_pu = out.wrapping_add_signed(su);
+        let i_mv = out.wrapping_add_signed(-sv);
+        let i_pv = out.wrapping_add_signed(sv);
+        [
+            i_mu,
+            i_pu,
+            i_mv,
+            i_pv,
+            i_mu.wrapping_add_signed(-sv),
+            i_pu.wrapping_add_signed(-sv),
+            i_pu.wrapping_add_signed(sv),
+            i_mu.wrapping_add_signed(sv),
+        ]
+    }
+
+    fn shade_pair(
+        mask: u8,
+        opp_bit: u8,
+        occ_junk: u8,
+        src_light: u8,
+        center_light: u8,
+        neigh_light: [u8; 8],
+    ) -> (u64, u64) {
+        assert_eq!(occ_junk & opp_bit, 0, "junk must not contain opp_bit");
+        let mut occ = Box::new([0u8; PAD_CELLS]);
+        let mut light = Box::new([0u8; PAD_CELLS]);
+        let pad_idx = pad_index(8, 8, 8);
+        let step_dir = PAD_SLICE as isize;
+        let su = PAD_EDGE as isize;
+        let sv = 1isize;
+        let out = pad_idx.wrapping_add_signed(step_dir);
+        for (i, &ni) in neighbor_indices(out, su, sv).iter().enumerate() {
+            occ[ni] = (((mask >> i) & 1) * opp_bit) | occ_junk;
+            light[ni] = neigh_light[i];
+        }
+        light[pad_idx] = src_light;
+        light[out] = center_light;
+        // SAFETY: pad_index(8,8,8) is interior, so all neighbour indices stay
+        // inside the padded arrays.
+        unsafe {
+            (
+                shade_fast(&occ, &light, pad_idx, step_dir, su, sv, opp_bit),
+                shade_ref(&occ, &light, pad_idx, step_dir, su, sv, opp_bit),
+            )
+        }
+    }
+
+    #[test]
+    fn ao_lut_spot_checks() {
+        // No occluders: every corner keeps full AO, no "both" flags.
+        assert_eq!(AO_LUT[0], 0x00FF);
+        // All four sides occlude: every corner has both sides set -> ao 0.
+        assert_eq!(AO_LUT[0b0000_1111], 0x0F00);
+        // Only the -u side occludes: corners 0 and 3 drop to ao 2.
+        assert_eq!(AO_LUT[0x01] & 0xff, 0xBE);
+        assert_eq!(AO_LUT[0x01] >> 8, 0);
+        // Diagonals alone never set the both flag.
+        assert_eq!(AO_LUT[0b1111_0000] >> 8, 0);
+        assert_eq!(AO_LUT[0b1111_0000] & 0xff, 0xAA);
+    }
+
+    #[test]
+    fn shade_fast_matches_scalar_oracle_exhaustively() {
+        let face_l = 0x2Au8; // face_bl = max(0x0A, src_bl), face_sk = 2
+        let fixtures: Vec<(u8, u8, [u8; 8])> = vec![
+            // Uniform light -> exercises the flat fast path when mask == 0.
+            (0x05, face_l, [face_l; 8]),
+            (0x0F, face_l, [face_l; 8]),
+            // One differing neighbour pulls every case off the fast path.
+            (0x05, face_l, {
+                let mut n = [face_l; 8];
+                n[0] = 0x2B;
+                n
+            }),
+            // Extremes.
+            (0x00, 0x00, [0x00; 8]),
+            (0x0F, 0xFF, [0xFF; 8]),
+            (0x0F, 0x0F, [0xF0; 8]),
+            // Mixed nibbles.
+            (0x07, 0x3E, [0x00, 0x11, 0xF0, 0x0F, 0x55, 0xAA, 0x99, 0x34]),
+            (0x0C, 0x91, [0x77, 0x08, 0x23, 0xFE, 0x40, 0x15, 0x6A, 0xB2]),
+        ];
+
+        let mut cases = 0usize;
+        for opp in 0..6u8 {
+            let opp_bit = 1u8 << opp;
+            let occ_junks = [0x00u8, 0x80, ALL_FACES & !opp_bit];
+            for &occ_junk in &occ_junks {
+                // Deterministic pseudo-random light fixture per (opp, junk).
+                let mut rng = 0x9E37_79B9u32 ^ (u32::from(opp_bit) << 8) ^ u32::from(occ_junk);
+                let mut rand_byte = || {
+                    rng ^= rng << 13;
+                    rng ^= rng >> 17;
+                    rng ^= rng << 5;
+                    rng as u8
+                };
+                let mut random_neigh = [0u8; 8];
+                for v in &mut random_neigh {
+                    *v = rand_byte();
+                }
+                let random_fixture = (rand_byte(), rand_byte(), random_neigh);
+
+                for &(src_l, center_l, ref neigh) in
+                    fixtures.iter().chain(std::iter::once(&random_fixture))
+                {
+                    for mask in 0..=255u8 {
+                        let (got, want) =
+                            shade_pair(mask, opp_bit, occ_junk, src_l, center_l, *neigh);
+                        assert_eq!(
+                            got, want,
+                            "mask={mask:08b} opp={opp_bit:#04x} junk={occ_junk:#04x} \
+                             src={src_l:#04x} center={center_l:#04x} neigh={neigh:?}"
+                        );
+                        cases += 1;
+                    }
+                }
+            }
+        }
+        assert_eq!(cases, 6 * 3 * 9 * 256);
     }
 }
