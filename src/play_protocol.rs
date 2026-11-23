@@ -3931,6 +3931,18 @@ fn live_mine_cut_all_apply(
     }
 }
 
+/// Scale a per-tick work budget by the server PID load-shed factor
+/// (`live_server_budget_scale`, `1.0` when `mod-suite` is off). The `.max(1)`
+/// floor keeps at least one unit flowing so streaming and interest tracking
+/// always make forward progress even at the 0.25 shed floor; a scale `>= 1.0`
+/// or an empty budget is a no-op.
+fn live_scaled_tick_budget(base: usize, scale: f32) -> usize {
+    if base == 0 || scale >= 1.0 {
+        return base;
+    }
+    ((base as f64 * f64::from(scale)).ceil() as usize).clamp(1, base)
+}
+
 fn interest_entity_eligible(
     client: &Client,
     entity: &TrackedSpawn,
@@ -4077,6 +4089,12 @@ fn sync_entity_interest_indexed_inner(
             scratch.added.push((eid, entity_index));
         }
     }
+    // PID load shedding: under CPU pressure each client ingests only a
+    // fraction of the new-entity burst per tick. The deferred spawns stay
+    // unseen, so they re-enter `added` on the next tick — the cap throttles
+    // wire work without dropping tracking state.
+    let add_cap = live_scaled_tick_budget(scratch.added.len(), live_server_budget_scale());
+    scratch.added.truncate(add_cap);
     if scratch.added.is_empty() && scratch.removed.is_empty() {
         return;
     }
@@ -7446,66 +7464,24 @@ fn nbt_wire_skip(data: &[u8], p: &mut usize, depth: usize) -> bool {
     nbt_wire_value(data, p, tag, depth)
 }
 /// Skip the *payload* of a value whose tag byte has already been consumed.
-fn nbt_wire_value(data: &[u8], p: &mut usize, tag: u8, depth: usize) -> bool {
-    if depth > 32 || *p > data.len() {
+/// Delegates to `megu_core::nbt_wire` — the canonical iterative, allocation-
+/// free skipper — so hostile shapes fail closed under `NbtWireLimits` instead
+/// of looping: `TAG_List(TAG_End, 1 << 20)` is a list of zero-byte elements
+/// that used to burn ~1M iterations per frame, and `elem == 0 && n != 0` is
+/// rejected outright as `InvalidEmptyElementList`.
+fn nbt_wire_value(data: &[u8], p: &mut usize, tag: u8, _depth: usize) -> bool {
+    if *p > data.len() {
         return false;
     }
-    fn take(data: &[u8], p: &mut usize, n: usize) -> bool {
-        n <= data.len().saturating_sub(*p) && {
-            *p += n;
-            true
-        }
-    }
-    fn num(data: &[u8], p: &mut usize, n: usize) -> Option<u64> {
-        if !take(data, p, n) {
-            return None;
-        }
-        Some(data[*p - n..*p].iter().fold(0u64, |v, &b| (v << 8) | u64::from(b)))
-    }
-    match tag {
-        0 => true,
-        1 => take(data, p, 1),
-        2 => take(data, p, 2),
-        3 => take(data, p, 4),
-        4 => take(data, p, 8),
-        5 => take(data, p, 4),
-        6 => take(data, p, 8),
-        7 | 11 | 12 => {
-            let width = if tag == 7 { 1 } else if tag == 11 { 4 } else { 8 };
-            let Some(n) = num(data, p, 4) else { return false };
-            n <= (1 << 24) && take(data, p, (n as usize).saturating_mul(width))
-        }
-        8 => {
-            let Some(n) = num(data, p, 2) else { return false };
-            take(data, p, n as usize)
-        }
-        9 => {
-            let Some(elem) = data.get(*p).copied() else { return false };
-            *p += 1;
-            let Some(n) = num(data, p, 4) else { return false };
-            if n > (1 << 20) {
-                return false;
-            }
-            for _ in 0..n {
-                if !nbt_wire_value(data, p, elem, depth + 1) {
-                    return false;
-                }
-            }
-            true
-        }
-        10 => loop {
-            let Some(child) = data.get(*p).copied() else { return false };
-            *p += 1;
-            if child == 0 {
-                return true;
-            }
-            let Some(n) = num(data, p, 2) else { return false };
-            if !take(data, p, n as usize) || !nbt_wire_value(data, p, child, depth + 1) {
-                return false;
-            }
-        },
-        _ => false,
-    }
+    let Ok(consumed) = megu_core::nbt_wire::skip_nbt_payload(
+        tag,
+        &data[*p..],
+        megu_core::nbt_wire::NbtWireLimits::default(),
+    ) else {
+        return false;
+    };
+    *p += consumed;
+    true
 }
 
 /// The `dimension_type` registry ids from `config_packets.bin`, indexed by `DimId::index()`.
@@ -17287,17 +17263,17 @@ mod w3_tests {
     }
 
     /// A VarInt-counted `long[]` bitset off the wire, like `readProtocol.i` in
-    /// vanilla's `FriendlyByteBuf`.
-    fn w3_read_bitset(b: &mut &[u8]) -> Vec<u64> {
-        let count = usize::try_from(read_protocol_i32(b).expect("bitset word count"))
-            .expect("bitset word count");
-        let mut words = Vec::with_capacity(count);
+    /// vanilla's `FriendlyByteBuf`. `None` on truncation — a declared word
+    /// count larger than the bytes left fails closed instead of panicking.
+    fn w3_read_bitset(b: &mut &[u8]) -> Option<Vec<u64>> {
+        let count = usize::try_from(read_protocol_i32(b)?).ok()?;
+        let mut words = Vec::with_capacity(count.min(b.len() / 8));
         for _ in 0..count {
-            let (head, tail) = b.split_at(8);
-            words.push(u64::from_be_bytes(head.try_into().unwrap()));
-            *b = tail;
+            let head = b.get(..8)?;
+            words.push(u64::from_be_bytes(head.try_into().ok()?));
+            *b = &b[8..];
         }
-        words
+        Some(words)
     }
 
     fn w3_test_admission(
@@ -17511,10 +17487,10 @@ mod w3_tests {
         let mut p = Vec::new();
         write_light_arrays(&mut p, 0, 0, tall, &gen);
         let mut light = &p[..];
-        let sky_mask = w3_read_bitset(&mut light);
-        let block_mask = w3_read_bitset(&mut light);
-        let sky_empty = w3_read_bitset(&mut light);
-        let block_empty = w3_read_bitset(&mut light);
+        let sky_mask = w3_read_bitset(&mut light).expect("sky mask bitset");
+        let block_mask = w3_read_bitset(&mut light).expect("block mask bitset");
+        let sky_empty = w3_read_bitset(&mut light).expect("sky empty bitset");
+        let block_empty = w3_read_bitset(&mut light).expect("block empty bitset");
         assert!(sky_mask.is_empty() && sky_empty.is_empty());
         // Words are trimmed like `BitSet.toLongArray`, so cover every section
         // index across mask+empty rather than comparing word vectors blindly.
@@ -17536,10 +17512,10 @@ mod w3_tests {
         sections[129][0] = 1;
         let wire = block_light_update((0, 0), &sections);
         let mut light = &wire[2..]; // skip the two cx/cz varints
-        let sky_mask = w3_read_bitset(&mut light);
-        let block_mask = w3_read_bitset(&mut light);
-        let sky_empty = w3_read_bitset(&mut light);
-        let block_empty = w3_read_bitset(&mut light);
+        let sky_mask = w3_read_bitset(&mut light).expect("sky mask bitset");
+        let block_mask = w3_read_bitset(&mut light).expect("block mask bitset");
+        let sky_empty = w3_read_bitset(&mut light).expect("sky empty bitset");
+        let block_empty = w3_read_bitset(&mut light).expect("block empty bitset");
         assert!(sky_mask.is_empty() && sky_empty.is_empty());
         assert_eq!(block_mask, vec![0, 0, 0b10]);
         assert_eq!(block_empty, vec![u64::MAX, u64::MAX, 0b01]);
@@ -17554,10 +17530,10 @@ mod w3_tests {
         // 2-word empty coverage for the 66-section dim.
         let packet = update_light_packet_lane(tall, 0, 0, &gen, None);
         let mut light = &packet[2..];
-        let _sky = w3_read_bitset(&mut light);
-        let _block = w3_read_bitset(&mut light);
-        let _sky_empty = w3_read_bitset(&mut light);
-        let block_empty = w3_read_bitset(&mut light);
+        let _sky = w3_read_bitset(&mut light).expect("sky mask bitset");
+        let _block = w3_read_bitset(&mut light).expect("block mask bitset");
+        let _sky_empty = w3_read_bitset(&mut light).expect("sky empty bitset");
+        let block_empty = w3_read_bitset(&mut light).expect("block empty bitset");
         assert_eq!(block_empty, tall.light_mask_longs());
 
         worldgen::reset_dimension_registry();
@@ -22707,6 +22683,57 @@ mod security_hardening_tests {
             "exactly the burst allowance reaches the socket; {} dropped",
             flood - LOD_V1_REQ_BURST
         );
+    }
+
+    /// P1: `TAG_List(TAG_End, 1 << 20)` — a list of zero-byte elements — used
+    /// to spin ~1M iterations per skipped frame. The canonical
+    /// `megu_core::nbt_wire` skipper rejects it immediately, while a valid
+    /// empty `TAG_List(TAG_End, 0)` still skips cleanly.
+    #[test]
+    fn nbt_wire_skip_rejects_empty_element_list_dos() {
+        // TAG_Compound { "x": TAG_List(elem=TAG_End, n=1<<20) } + TAG_End.
+        let mut evil = vec![0x0a, 0x09, 0x00, 0x01, b'x', 0x00];
+        evil.extend_from_slice(&1_048_576i32.to_be_bytes());
+        evil.push(0x00);
+        let mut p = 0usize;
+        assert!(
+            !nbt_wire_skip(&evil, &mut p, 0),
+            "a zero-byte-element list must fail fast"
+        );
+
+        // The same shape with n = 0 is a legal empty list and skips fine.
+        let mut ok = vec![0x0a, 0x09, 0x00, 0x01, b'x', 0x00];
+        ok.extend_from_slice(&0i32.to_be_bytes());
+        ok.push(0x00);
+        let mut p = 0usize;
+        assert!(nbt_wire_skip(&ok, &mut p, 0));
+        assert_eq!(p, ok.len());
+    }
+
+    /// The spinning PID `budget_scale` reaches runtime: the per-tick
+    /// interest-spawn cap scales with it (floored at 1 so tracking always
+    /// progresses), and `live_server_budget_scale` clamps to `[0.25, 1.0]`
+    /// whatever the controller stored.
+    #[test]
+    fn pid_budget_scale_drives_tick_budget_with_progress_floor() {
+        let _guard = world_guard();
+        for (stored, want) in [
+            (1.0f32, 1.0f32),
+            (0.5, 0.5),
+            (0.25, 0.25),
+            (0.1, 0.25),
+            (2.0, 1.0),
+        ] {
+            LIVE_SERVER_BUDGET_SCALE.store(stored.to_bits(), Ordering::Relaxed);
+            assert_eq!(live_server_budget_scale(), want);
+        }
+        LIVE_SERVER_BUDGET_SCALE.store(0.5f32.to_bits(), Ordering::Relaxed);
+        assert_eq!(live_scaled_tick_budget(100, live_server_budget_scale()), 50);
+        LIVE_SERVER_BUDGET_SCALE.store(0.25f32.to_bits(), Ordering::Relaxed);
+        assert_eq!(live_scaled_tick_budget(100, live_server_budget_scale()), 25);
+        assert_eq!(live_scaled_tick_budget(3, live_server_budget_scale()), 1);
+        LIVE_SERVER_BUDGET_SCALE.store(1.0f32.to_bits(), Ordering::Relaxed);
+        assert_eq!(live_scaled_tick_budget(100, live_server_budget_scale()), 100);
     }
 }
 

@@ -3281,7 +3281,13 @@ fn live_create_decode_sidecar(
     let registry = create_adapter::blockstates::core_create_registry(
         create_adapter::blockstates::DEFAULT_BASE_STATE_ID,
     );
-    let mut entries = Vec::with_capacity(count as usize);
+    // A crafted `count` (up to 1_000_000) must not become a ~44 MB
+    // pre-allocation before the entry bytes are validated: every entry costs
+    // at least 16 B position + 1 B length VarInt + 1 B string minimum (18 B
+    // for `MCF2`'s item-count VarInt), so the decodable count can never exceed
+    // `rest.len() / 18`. The capacity is only a hint — a smaller `rest` still
+    // decodes correctly, it just reallocates.
+    let mut entries = Vec::with_capacity((count as usize).min(rest.len() / 18));
     for _ in 0..count {
         if rest.len() < 16 {
             return Err(ERR);
@@ -3728,6 +3734,7 @@ fn live_observe_server_tick_mspt(mspt: f64) {
         rt.mspt_p99.observe(mspt);
         let p95 = rt.mspt_p95.estimate().unwrap_or(mspt);
         rt.budget_scale = rt.pid_budget.update(p95);
+        LIVE_SERVER_BUDGET_SCALE.store((rt.budget_scale as f32).to_bits(), Ordering::Relaxed);
         rt.ticks_observed = rt.ticks_observed.saturating_add(1);
     }
 }
@@ -3735,6 +3742,27 @@ fn live_observe_server_tick_mspt(mspt: f64) {
 #[cfg(not(feature = "mod-suite"))]
 #[inline]
 fn live_observe_server_tick_mspt(_mspt: f64) {}
+
+/// Lock-free mirror of `ServerMathOptRuntime::budget_scale` — the spinning PID
+/// output — for per-tick consumers that must not take the runtime mutex
+/// (e.g. the interest-stream burst cap in `play_protocol.rs`). Written as
+/// `f32::to_bits` on every PID update; `1.0` until the first observation, and
+/// forever when `mod-suite` is disabled, so default builds shed nothing.
+static LIVE_SERVER_BUDGET_SCALE: std::sync::atomic::AtomicU32 =
+    std::sync::atomic::AtomicU32::new(1.0f32.to_bits());
+
+/// The server's current runtime load-shed factor, clamped to `[0.25, 1.0]`:
+/// `1.0` means no shedding, `0.25` is the floor the PID can reach. Non-finite
+/// payloads read as `1.0`.
+#[inline]
+pub(crate) fn live_server_budget_scale() -> f32 {
+    let scale = f32::from_bits(LIVE_SERVER_BUDGET_SCALE.load(Ordering::Relaxed));
+    if scale.is_finite() {
+        scale.clamp(0.25, 1.0)
+    } else {
+        1.0
+    }
+}
 
 #[cfg(feature = "mod-suite")]
 #[allow(dead_code)]
@@ -6553,6 +6581,21 @@ mod live_create_tests {
 
         clear(sx, sy, sz);
         clear(sx + 1, sy, sz);
+    }
+
+    /// A 12-byte crafted `MCF2` — magic + VarInt `count = 1_000_000` + one pad
+    /// byte + a *valid* FNV trailer — must fail closed on the entry walk
+    /// without pre-allocating `count` entries (~44 MB).
+    #[test]
+    fn create_sidecar_huge_count_fails_without_huge_alloc() {
+        let mut body = Vec::new();
+        body.extend_from_slice(LIVE_CREATE_SIDECAR_MAGIC);
+        write_varint(&mut body, 1_000_000);
+        body.push(0);
+        let sum = live_create_fnv32(&body);
+        body.extend_from_slice(&sum.to_be_bytes());
+        assert_eq!(body.len(), 12);
+        assert!(live_create_decode_sidecar(&body).is_err());
     }
 
     /// Drive `live_create_tick_body` for up to `max` game ticks, returning
