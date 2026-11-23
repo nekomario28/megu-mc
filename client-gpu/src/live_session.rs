@@ -3496,9 +3496,6 @@ fn cloud_lighting_key(lighting: &CloudLighting) -> [u32; 10] {
     ]
 }
 
-/// Candidate client-JAR version ids, `--version` id first: `1.21.1` stays
-/// a fallback because a launcher that omits `--version` still keeps the
-/// JAR under the well-known release dir.
 /// Candidate version-directory names under `<gameDir>/versions/` for the active
 /// session. Never falls back across different Minecraft versions: an explicit
 /// `26.3` or `megu-26.3` session only probes `26.3` directories (preventing
@@ -5068,5 +5065,23 @@ mod tests {
         }))
         .unwrap();
         assert_eq!(live.title_text, None);
+    }
+
+    #[test]
+    fn jar_version_ids_never_crosses_versions_on_explicit_26_3() {
+        let paths = |vid: Option<&str>| SessionPaths {
+            version_id: vid.map(str::to_owned),
+            ..SessionPaths::default()
+        };
+        assert_eq!(jar_version_ids(&paths(None)), vec!["1.21.1"]);
+        assert_eq!(
+            jar_version_ids(&paths(Some("megu-1.21.1"))),
+            vec!["megu-1.21.1", "1.21.1"]
+        );
+        assert_eq!(jar_version_ids(&paths(Some("26.3"))), vec!["26.3"]);
+        assert_eq!(
+            jar_version_ids(&paths(Some("megu-26.3"))),
+            vec!["megu-26.3", "26.3"]
+        );
     }
 }

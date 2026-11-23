@@ -1275,7 +1275,7 @@ fn font_covers_ascii_and_fallback() {
     assert!(glyph_for(' ').iter().all(|&b| b == 0));
     assert!(glyph_for('あ').iter().any(|&b| b != 0));
     assert_ne!(glyph_for('あ'), glyph_for('A'));
-    assert_eq!(text_width("MEGU", 1), 8 * 8);
+    assert_eq!(text_width("MEGU", 1), 4 * 8);
     assert_eq!(text_width("ab\ncd", 2), 4 * 8);
 }
 

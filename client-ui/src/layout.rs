@@ -377,17 +377,7 @@ fn title(ctx: &mut Ctx) {
     let cx = ctx.w / 2;
 
     ctx.ctext(cx, 34, 3, pal::TEXT, "MEGU");
-    ctx.ctext(
-        cx,
-        62,
-        1,
-        pal::TEXT_DIM,
-        tr(
-            lang,
-            "clean-room native client",
-            "クリーンルーム ネイティブクライアント",
-        ),
-    );
+    ctx.ctext(cx, 62, 1, pal::TEXT_DIM, "MEGU EDITION");
 
     let bw = 200.min(ctx.w - 8).max(24);
     let x = cx - bw / 2;
