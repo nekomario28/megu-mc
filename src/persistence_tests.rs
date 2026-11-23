@@ -3201,3 +3201,351 @@ fn mega_w3_save_v2_roundtrips_mof1_and_aer1_while_empty_vanilla_stays_identical(
     // Clean up the live bridges so no later test inherits mod state.
     reset_bridges();
 }
+
+// ---------- RCP1 / STA1 per-player gameplay state ----------
+
+fn player_section_frame(body: &[u8], magic: &[u8; 4]) -> Vec<u8> {
+    let mut out = body.to_vec();
+    out.extend_from_slice(&(body.len() as u64).to_be_bytes());
+    out.extend_from_slice(magic);
+    out
+}
+
+fn strip_player_section_tail(payload: &[u8]) -> &[u8] {
+    // Peel the trailers that can sit above RCP1/STA1 in a vanilla test save:
+    // SED1 (with VER1/WBD1 beneath it), then AER1 and MOF1 last-written-first.
+    let (payload, _) = read_world_seed_footer(payload).unwrap();
+    let (payload, _) = read_mod_bridge_trailer(payload, AERONAUTICS_TRAILER_MAGIC).unwrap();
+    let (payload, _) = read_mod_bridge_trailer(payload, MOD_OFFLOAD_TRAILER_MAGIC).unwrap();
+    payload
+}
+
+fn sample_recipe_book() -> PlayerRecipeBook {
+    let mut book = PlayerRecipeBook::new();
+    assert!(book.unlock("minecraft:crafting_table"));
+    assert!(book.unlock("minecraft:stick"));
+    book.seen_recipe("minecraft:stick");
+    book.apply_book_settings(RecipeBookCategory::Crafting, true, true);
+    book.apply_book_settings(RecipeBookCategory::Smoker, false, true);
+    book
+}
+
+fn sample_player_stats() -> PlayerStats {
+    let mut stats = PlayerStats::new();
+    stats.increment(StatCategory::Mined, 1, 5);
+    stats.increment(StatCategory::Mined, 1, -2);
+    stats.increment(StatCategory::Custom, 42, i32::MAX);
+    stats.increment(StatCategory::Killed, -7, 3);
+    stats
+}
+
+#[test]
+fn save_v2_recipe_books_and_player_stats_round_trip_bit_for_bit() {
+    if test_support::isolated_world_test() {
+        return;
+    }
+    let _guard = world_guard();
+    let old_books = std::mem::take(&mut *recipe_books().lock().unwrap_or_else(|e| e.into_inner()));
+    let old_stats = std::mem::take(&mut *player_stats().lock().unwrap_or_else(|e| e.into_inner()));
+
+    // With both registries empty the save carries neither footer — the same
+    // tail a build predating RCP1/STA1 would write.
+    let mut legacy = Vec::new();
+    save_world_into(&mut legacy);
+    let tail = strip_player_section_tail(&legacy);
+    let (tail, saved_stats) = read_player_stats_footer(tail).unwrap();
+    assert!(saved_stats.is_empty());
+    let (_, saved_books) = read_recipe_book_footer(tail).unwrap();
+    assert!(saved_books.is_empty());
+
+    let uuid_a = [0xA1; 16];
+    let uuid_b = [0xB2; 16];
+    {
+        let mut books = recipe_books().lock().unwrap_or_else(|e| e.into_inner());
+        books.insert(uuid_a, sample_recipe_book());
+        books.insert(uuid_b, PlayerRecipeBook::new());
+    }
+    {
+        let mut stats = player_stats().lock().unwrap_or_else(|e| e.into_inner());
+        stats.insert(uuid_a, sample_player_stats());
+        stats.insert(uuid_b, PlayerStats::new());
+    }
+
+    let mut payload = Vec::new();
+    save_world_into(&mut payload);
+    let mut again = Vec::new();
+    save_world_into(&mut again);
+    assert_eq!(payload, again, "player-section output must be deterministic");
+
+    // STA1 is written after RCP1, so it sits closer to the tail.
+    let tail = strip_player_section_tail(&payload);
+    assert!(tail.ends_with(PLAYER_STATS_MAGIC));
+    let (tail, _) = split_save_footer(tail, PLAYER_STATS_MAGIC).unwrap();
+    assert!(tail.ends_with(RECIPE_BOOK_MAGIC));
+
+    let expected_books = recipe_books().lock().unwrap_or_else(|e| e.into_inner()).clone();
+    let expected_stats = player_stats().lock().unwrap_or_else(|e| e.into_inner()).clone();
+
+    recipe_books().lock().unwrap_or_else(|e| e.into_inner()).clear();
+    player_stats().lock().unwrap_or_else(|e| e.into_inner()).clear();
+    load_world_from(&payload).unwrap();
+    assert_eq!(
+        *recipe_books().lock().unwrap_or_else(|e| e.into_inner()),
+        expected_books
+    );
+    assert_eq!(
+        *player_stats().lock().unwrap_or_else(|e| e.into_inner()),
+        expected_stats
+    );
+    let restored = recipe_books().lock().unwrap_or_else(|e| e.into_inner());
+    let book = &restored[&uuid_a];
+    assert!(book.is_unlocked("minecraft:crafting_table"));
+    assert!(book.is_unlocked("minecraft:stick"));
+    assert!(!book.displayed.contains("minecraft:stick"));
+    assert_eq!(book.to_highlight(), vec!["minecraft:crafting_table".to_string()]);
+    assert!(restored[&uuid_b].unlocked.is_empty());
+    drop(restored);
+    let counters = player_stats().lock().unwrap_or_else(|e| e.into_inner());
+    assert_eq!(counters[&uuid_a].get(StatCategory::Mined, 1), 3);
+    assert_eq!(counters[&uuid_a].get(StatCategory::Custom, 42), i32::MAX);
+    assert_eq!(counters[&uuid_a].get(StatCategory::Killed, -7), 3);
+    assert!(counters[&uuid_b].counts.is_empty());
+    drop(counters);
+
+    // A second save after the load is byte-identical: restore is lossless.
+    let mut resaved = Vec::new();
+    save_world_into(&mut resaved);
+    assert_eq!(payload, resaved);
+
+    // The legacy blob (no RCP1/STA1) loads cleanly and leaves empty defaults
+    // even when the live registries still hold entries.
+    recipe_books().lock().unwrap_or_else(|e| e.into_inner())
+        .insert(uuid_a, sample_recipe_book());
+    player_stats().lock().unwrap_or_else(|e| e.into_inner())
+        .insert(uuid_a, sample_player_stats());
+    load_world_from(&legacy).unwrap();
+    assert!(recipe_books().lock().unwrap_or_else(|e| e.into_inner()).is_empty());
+    assert!(player_stats().lock().unwrap_or_else(|e| e.into_inner()).is_empty());
+
+    *recipe_books().lock().unwrap_or_else(|e| e.into_inner()) = old_books;
+    *player_stats().lock().unwrap_or_else(|e| e.into_inner()) = old_stats;
+}
+
+#[test]
+fn save_v2_player_section_footers_fail_closed_on_corruption() {
+    let uuid = [0xC3; 16];
+
+    // A minimal well-formed RCP1 body: one player, two unlocked recipes, one
+    // highlight, and non-default book settings.
+    let mut book_body = vec![PLAYER_SECTION_SCHEMA];
+    megu_core::varint::write_varlong_i64(1, &mut book_body);
+    book_body.extend_from_slice(&uuid);
+    megu_core::varint::write_varlong_i64(2, &mut book_body);
+    write_registry_str(&mut book_body, "minecraft:crafting_table");
+    write_registry_str(&mut book_body, "minecraft:stick");
+    megu_core::varint::write_varlong_i64(1, &mut book_body);
+    write_registry_str(&mut book_body, "minecraft:crafting_table");
+    book_body.extend_from_slice(&[1, 1, 0, 0, 0, 1, 1, 0]);
+
+    let framed = player_section_frame(&book_body, RECIPE_BOOK_MAGIC);
+    let (rest, books) = read_recipe_book_footer(&framed).unwrap();
+    assert!(rest.is_empty());
+    assert_eq!(books.len(), 1);
+    assert!(books[0].1.unlocked.contains("minecraft:stick"));
+    assert_eq!(books[0].1.displayed.len(), 1);
+
+    let mut bad_schema = book_body.clone();
+    bad_schema[0] = 99;
+    let mut trailing = book_body.clone();
+    trailing.push(0);
+    let mut truncated = book_body.clone();
+    truncated.pop();
+    // A highlight outside the unlocked set violates the runtime invariant.
+    let mut highlight_orphan = book_body.clone();
+    // Rewrite displayed count 1 -> keep, but swap the displayed id for one
+    // that is not unlocked: rebuild the tail deterministically instead.
+    highlight_orphan.clear();
+    highlight_orphan.push(PLAYER_SECTION_SCHEMA);
+    megu_core::varint::write_varlong_i64(1, &mut highlight_orphan);
+    highlight_orphan.extend_from_slice(&uuid);
+    megu_core::varint::write_varlong_i64(1, &mut highlight_orphan);
+    write_registry_str(&mut highlight_orphan, "minecraft:crafting_table");
+    megu_core::varint::write_varlong_i64(1, &mut highlight_orphan);
+    write_registry_str(&mut highlight_orphan, "minecraft:furnace");
+    highlight_orphan.extend_from_slice(&[0; 8]);
+    // Duplicate uuid across two player records.
+    let mut dup_uuid = vec![PLAYER_SECTION_SCHEMA];
+    megu_core::varint::write_varlong_i64(2, &mut dup_uuid);
+    dup_uuid.extend_from_slice(&book_body[2..]);
+    dup_uuid.extend_from_slice(&book_body[2..]);
+    // Oversized player count: varint far beyond what the body can hold.
+    let mut huge_count = vec![PLAYER_SECTION_SCHEMA];
+    megu_core::varint::write_varlong_i64(MAX_SAVED_PLAYER_SECTIONS as i64 + 1, &mut huge_count);
+    huge_count.extend_from_slice(&book_body[1..]);
+    // Duplicate recipe id inside one set.
+    let mut dup_recipe = book_body.clone();
+    // unlocked count is at offset 17 (16 uuid bytes after schema+count); the
+    // two strings follow — append a third identical entry by rebuilding.
+    dup_recipe.clear();
+    dup_recipe.push(PLAYER_SECTION_SCHEMA);
+    megu_core::varint::write_varlong_i64(1, &mut dup_recipe);
+    dup_recipe.extend_from_slice(&uuid);
+    megu_core::varint::write_varlong_i64(2, &mut dup_recipe);
+    write_registry_str(&mut dup_recipe, "minecraft:crafting_table");
+    write_registry_str(&mut dup_recipe, "minecraft:crafting_table");
+    megu_core::varint::write_varlong_i64(0, &mut dup_recipe);
+    dup_recipe.extend_from_slice(&[0; 8]);
+    // Overlong registry string (> u16 cap is impossible; > MAX_REGISTRY_STR is).
+    let mut long_string = book_body.clone();
+    // Locate the first string's u16 length (after schema+count+uuid+count).
+    let pos = 1 + 1 + 16 + 1;
+    long_string[pos..pos + 2].copy_from_slice(&(MAX_REGISTRY_STR as u16 + 1).to_be_bytes());
+
+    for (reason, body) in [
+        ("bad schema", bad_schema),
+        ("trailing bytes", trailing),
+        ("truncated body", truncated),
+        ("highlight outside unlocked", highlight_orphan),
+        ("duplicate player uuid", dup_uuid),
+        ("oversized player count", huge_count),
+        ("duplicate recipe id", dup_recipe),
+        ("oversized recipe string", long_string),
+    ] {
+        let framed = player_section_frame(&body, RECIPE_BOOK_MAGIC);
+        assert!(
+            read_recipe_book_footer(&framed).is_err(),
+            "RCP1 {reason} must fail closed"
+        );
+    }
+
+    // Minimal well-formed STA1 body: one player, two counters.
+    let counters = sample_player_stats();
+    let blob = encode_stats(&counters);
+    let mut stats_body = vec![PLAYER_SECTION_SCHEMA];
+    megu_core::varint::write_varlong_i64(1, &mut stats_body);
+    stats_body.extend_from_slice(&uuid);
+    megu_core::varint::write_varlong_i64(blob.len() as i64, &mut stats_body);
+    stats_body.extend_from_slice(&blob);
+
+    let framed = player_section_frame(&stats_body, PLAYER_STATS_MAGIC);
+    let (rest, entries) = read_player_stats_footer(&framed).unwrap();
+    assert!(rest.is_empty());
+    assert_eq!(entries.len(), 1);
+    assert_eq!(entries[0].1.get(StatCategory::Mined, 1), 3);
+
+    let mut bad_stats_schema = stats_body.clone();
+    bad_stats_schema[0] = 0;
+    let mut bad_stats_truncated = stats_body.clone();
+    bad_stats_truncated.pop();
+    let mut bad_stats_trailing = stats_body.clone();
+    bad_stats_trailing.push(0);
+    // Blob length claiming more bytes than the body holds.
+    let mut bad_stats_len = stats_body.clone();
+    bad_stats_len.truncate(1 + 1 + 16);
+    megu_core::varint::write_varlong_i64(1_000, &mut bad_stats_len);
+    bad_stats_len.extend_from_slice(&[0; 20]);
+    // A blob whose stat category id is outside the registry.
+    let mut bad_blob = vec![PLAYER_SECTION_SCHEMA];
+    megu_core::varint::write_varlong_i64(1, &mut bad_blob);
+    bad_blob.extend_from_slice(&uuid);
+    let mut inner = Vec::new();
+    megu_core::varint::write_varlong_i64(1, &mut inner);
+    megu_core::varint::write_varlong_i64(99, &mut inner);
+    megu_core::varint::write_varlong_i64(1, &mut inner);
+    megu_core::varint::write_varlong_i64(1, &mut inner);
+    megu_core::varint::write_varlong_i64(inner.len() as i64, &mut bad_blob);
+    bad_blob.extend_from_slice(&inner);
+    // Duplicate uuid across two player records.
+    let mut dup_stats_uuid = vec![PLAYER_SECTION_SCHEMA];
+    megu_core::varint::write_varlong_i64(2, &mut dup_stats_uuid);
+    dup_stats_uuid.extend_from_slice(&stats_body[2..]);
+    dup_stats_uuid.extend_from_slice(&stats_body[2..]);
+
+    for (reason, body) in [
+        ("bad schema", bad_stats_schema),
+        ("truncated body", bad_stats_truncated),
+        ("trailing bytes", bad_stats_trailing),
+        ("oversized blob length", bad_stats_len),
+        ("invalid stat category", bad_blob),
+        ("duplicate player uuid", dup_stats_uuid),
+    ] {
+        let framed = player_section_frame(&body, PLAYER_STATS_MAGIC);
+        assert!(
+            read_player_stats_footer(&framed).is_err(),
+            "STA1 {reason} must fail closed"
+        );
+    }
+}
+
+#[test]
+fn save_v2_player_section_corruption_fails_load_without_touching_live_maps() {
+    if test_support::isolated_world_test() {
+        return;
+    }
+    let _guard = world_guard();
+    let old_books = std::mem::take(&mut *recipe_books().lock().unwrap_or_else(|e| e.into_inner()));
+    let old_stats = std::mem::take(&mut *player_stats().lock().unwrap_or_else(|e| e.into_inner()));
+
+    let uuid = [0x5E; 16];
+    recipe_books().lock().unwrap_or_else(|e| e.into_inner())
+        .insert(uuid, sample_recipe_book());
+    player_stats().lock().unwrap_or_else(|e| e.into_inner())
+        .insert(uuid, sample_player_stats());
+    let mut payload = Vec::new();
+    save_world_into(&mut payload);
+
+    // Sentinel live state that must survive every rejected load untouched:
+    // wipe the saved entries first so their presence can only come from a
+    // successful restore.
+    let sentinel_book = PlayerRecipeBook::new();
+    let mut sentinel_stats = PlayerStats::new();
+    sentinel_stats.increment(StatCategory::Used, 9, 1);
+    {
+        let mut books = recipe_books().lock().unwrap_or_else(|e| e.into_inner());
+        books.clear();
+        books.insert([0x77; 16], sentinel_book.clone());
+    }
+    {
+        let mut stats = player_stats().lock().unwrap_or_else(|e| e.into_inner());
+        stats.clear();
+        stats.insert([0x77; 16], sentinel_stats.clone());
+    }
+
+    // Locate the STA1 and RCP1 frames inside the real payload: both readers
+    // return prefixes of `payload`, so a prefix's length is the frame offset.
+    let tail = strip_player_section_tail(&payload);
+    let (before_stats, sta1_body) = split_save_footer(tail, PLAYER_STATS_MAGIC).unwrap();
+    assert!(sta1_body.is_some());
+    let sta1_start = before_stats.len();
+    let (before_recipes, _) = split_save_footer(before_stats, RECIPE_BOOK_MAGIC).unwrap();
+    let rcp1_start = before_recipes.len();
+
+    // Flip the schema byte of each footer in turn: the readers reject the
+    // section during the strip phase, before any live map is restored.
+    for (offset, reason) in [(sta1_start, "STA1 schema"), (rcp1_start, "RCP1 schema")] {
+        let mut corrupt = payload.clone();
+        corrupt[offset] = PLAYER_SECTION_SCHEMA + 1;
+        assert!(
+            load_world_from(&corrupt).is_err(),
+            "{reason} corruption must fail the load"
+        );
+        let books = recipe_books().lock().unwrap_or_else(|e| e.into_inner());
+        assert_eq!(books.get(&[0x77; 16]), Some(&sentinel_book), "{reason}");
+        assert!(!books.contains_key(&uuid), "{reason}");
+        drop(books);
+        let stats = player_stats().lock().unwrap_or_else(|e| e.into_inner());
+        assert_eq!(stats.get(&[0x77; 16]), Some(&sentinel_stats), "{reason}");
+        assert!(!stats.contains_key(&uuid), "{reason}");
+        drop(stats);
+    }
+
+    // The untouched payload still loads and restores the saved sections.
+    load_world_from(&payload).unwrap();
+    assert!(recipe_books().lock().unwrap_or_else(|e| e.into_inner())
+        .contains_key(&uuid));
+    assert!(player_stats().lock().unwrap_or_else(|e| e.into_inner())
+        .contains_key(&uuid));
+
+    *recipe_books().lock().unwrap_or_else(|e| e.into_inner()) = old_books;
+    *player_stats().lock().unwrap_or_else(|e| e.into_inner()) = old_stats;
+}

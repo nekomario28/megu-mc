@@ -196,7 +196,7 @@ impl PlayerSave {
             self.xp_total
         );
         out.push(self.gamemode);
-        write_varint(out, self.effects.len() as i64);
+        megu_core::varint::write_varlong_i64(self.effects.len() as i64, out);
         for &(id, amp, left) in &self.effects {
             save_numbers!(out, id, amp, left);
         }
@@ -293,7 +293,7 @@ fn saved_slots(slots: &HashMap<i16, Stack>, range: std::ops::Range<i16>) -> Hash
 fn write_saved_slots(out: &mut Vec<u8>, slots: &HashMap<i16, Stack>) {
     let mut entries: Vec<_> = slots.iter().collect();
     entries.sort_unstable_by_key(|(&slot, _)| slot);
-    write_varint(out, entries.len() as i64);
+    megu_core::varint::write_varlong_i64(entries.len() as i64, out);
     for (&slot, stack) in entries {
         save_numbers!(out, slot);
         write_saved_stack(out, stack);
@@ -301,16 +301,16 @@ fn write_saved_slots(out: &mut Vec<u8>, slots: &HashMap<i16, Stack>) {
 }
 
 fn write_saved_stack(out: &mut Vec<u8>, (item, count, comps): &Stack) {
-    write_varint(out, *item);
+    megu_core::varint::write_varlong_i64(*item, out);
     out.push(*count);
     write_saved_components(out, comps);
 }
 
 fn write_saved_components(out: &mut Vec<u8>, comps: &Comps) {
-    write_varint(out, comps.len() as i64);
+    megu_core::varint::write_varlong_i64(comps.len() as i64, out);
     for (ty, data) in comps {
-        write_varint(out, *ty);
-        write_varint(out, data.len() as i64);
+        megu_core::varint::write_varlong_i64(*ty, out);
+        megu_core::varint::write_varlong_i64(data.len() as i64, out);
         out.extend_from_slice(data);
     }
 }
@@ -361,7 +361,7 @@ fn read_saved_potion(input: &mut SaveInput<'_>) -> Result<WitchPotion, &'static 
 impl MobSave {
     fn write(out: &mut Vec<u8>, mob: &Mob, yaw: f32, pitch: f32, now: u64) {
         out.extend_from_slice(&mob.uuid);
-        write_varint(out, mob.etype);
+        megu_core::varint::write_varlong_i64(mob.etype, out);
         let [dx, dy, dz] = saved_value(&mob.vel);
         save_numbers!(
             out,
@@ -394,7 +394,7 @@ impl MobSave {
                 .iter()
                 .filter(|(_, until)| *until > now)
                 .collect();
-            write_varint(out, effects.len() as i64);
+            megu_core::varint::write_varlong_i64(effects.len() as i64, out);
             for &(potion, until) in effects {
                 write_saved_potion(out, potion);
                 save_numbers!(out, until - now);
@@ -626,11 +626,11 @@ fn write_saved_villager(out: &mut Vec<u8>, villager: &Villager) {
         }
     }
     let write_cost = |out: &mut Vec<u8>, cost: &ItemCost| {
-        write_varint(out, cost.item);
+        megu_core::varint::write_varlong_i64(cost.item, out);
         save_numbers!(out, cost.count);
         write_saved_components(out, &cost.components);
     };
-    write_varint(out, villager.offers.len() as i64);
+    megu_core::varint::write_varlong_i64(villager.offers.len() as i64, out);
     for offer in &villager.offers {
         write_cost(out, &offer.cost_a);
         out.push(u8::from(offer.cost_b.is_some()));
@@ -650,7 +650,7 @@ fn write_saved_villager(out: &mut Vec<u8>, villager: &Villager) {
     }
     let mut gossip: Vec<_> = villager.gossip.by_player.iter().collect();
     gossip.sort_unstable_by_key(|&(&uuid, _)| uuid);
-    write_varint(out, gossip.len() as i64);
+    megu_core::varint::write_varlong_i64(gossip.len() as i64, out);
     for (uuid, values) in gossip {
         out.extend_from_slice(uuid);
         for value in values {
@@ -770,12 +770,12 @@ fn write_saved_raid(out: &mut Vec<u8>, dim: DimId, raid: &Raid) {
     save_numbers!(out, raid.countdown, raid.ticks_elapsed);
     let mut remaining: Vec<_> = raid.remaining.iter().collect();
     remaining.sort_unstable_by_key(|r| (r.wave, r.slot));
-    write_varint(out, remaining.len() as i64);
+    megu_core::varint::write_varlong_i64(remaining.len() as i64, out);
     for raider in remaining {
         out.push(raider.wave);
-        write_varint(out, raider.slot as i64);
+        megu_core::varint::write_varlong_i64(raider.slot as i64, out);
     }
-    write_varint(out, raid.participants.len() as i64);
+    megu_core::varint::write_varlong_i64(raid.participants.len() as i64, out);
     for uuid in &raid.participants {
         out.extend_from_slice(uuid);
     }
@@ -958,13 +958,13 @@ fn append_advancements_footer(out: &mut Vec<u8>) {
         && datapack.len() <= ADV_MAX_PLAYERS, "too many advancement players");
     let mut players: Vec<_> = granted.iter().filter(|(_, ids)| !ids.is_empty()).collect();
     players.sort_unstable_by(|a, b| a.0.cmp(b.0));
-    write_varint(out, players.len() as i64);
+    megu_core::varint::write_varlong_i64(players.len() as i64, out);
     for (player, ids) in players {
         write_advancement_string(out, player);
         assert!(ids.len() <= ADV_MAX_IDS, "too many granted advancements");
         let mut ids: Vec<_> = ids.iter().collect();
         ids.sort_unstable();
-        write_varint(out, ids.len() as i64);
+        megu_core::varint::write_varlong_i64(ids.len() as i64, out);
         for id in ids {
             write_advancement_string(out, id);
         }
@@ -972,17 +972,17 @@ fn append_advancements_footer(out: &mut Vec<u8>) {
 
     let mut players: Vec<_> = core.iter().filter(|(_, rows)| !rows.is_empty()).collect();
     players.sort_unstable_by(|a, b| a.0.cmp(b.0));
-    write_varint(out, players.len() as i64);
+    megu_core::varint::write_varlong_i64(players.len() as i64, out);
     for (player, rows) in players {
         write_advancement_string(out, player);
         assert!(rows.len() <= ADV_MAX_IDS, "too many core advancements");
         let mut ids: Vec<_> = rows.iter().collect();
         ids.sort_unstable_by_key(|&(id, _)| id);
-        write_varint(out, ids.len() as i64);
+        megu_core::varint::write_varlong_i64(ids.len() as i64, out);
         for (id, criteria) in ids {
             write_advancement_string(out, id);
             assert!(criteria.len() <= ADV_MAX_CRITERIA, "too many advancement criteria");
-            write_varint(out, criteria.len() as i64);
+            megu_core::varint::write_varlong_i64(criteria.len() as i64, out);
             for (criterion, timestamp) in criteria {
                 write_advancement_string(out, criterion);
                 out.extend_from_slice(&timestamp.to_be_bytes());
@@ -992,19 +992,19 @@ fn append_advancements_footer(out: &mut Vec<u8>) {
 
     let mut players: Vec<_> = datapack.iter().filter(|(_, rows)| !rows.is_empty()).collect();
     players.sort_unstable_by(|a, b| a.0.cmp(b.0));
-    write_varint(out, players.len() as i64);
+    megu_core::varint::write_varlong_i64(players.len() as i64, out);
     for (player, rows) in players {
         write_advancement_string(out, player);
         assert!(rows.len() <= ADV_MAX_IDS, "too many datapack advancements");
         let mut ids: Vec<_> = rows.iter().collect();
         ids.sort_unstable_by(|a, b| a.0.cmp(b.0));
-        write_varint(out, ids.len() as i64);
+        megu_core::varint::write_varlong_i64(ids.len() as i64, out);
         for (id, criteria) in ids {
             write_advancement_string(out, id);
             assert!(criteria.len() <= ADV_MAX_CRITERIA, "too many datapack criteria");
             let mut criteria: Vec<_> = criteria.iter().collect();
             criteria.sort_unstable();
-            write_varint(out, criteria.len() as i64);
+            megu_core::varint::write_varlong_i64(criteria.len() as i64, out);
             for criterion in criteria {
                 write_advancement_string(out, criterion);
             }
@@ -1105,14 +1105,14 @@ fn append_save_state(
     save_numbers!(out, spawn_pitch);
     let mut players: Vec<_> = players.iter().collect();
     players.sort_unstable_by_key(|&(&uuid, _)| uuid);
-    write_varint(out, players.len() as i64);
+    megu_core::varint::write_varlong_i64(players.len() as i64, out);
     for (uuid, state) in players {
         out.extend_from_slice(uuid);
         state.write(out);
     }
-    write_varint(out, mobs.len() as i64);
+    megu_core::varint::write_varlong_i64(mobs.len() as i64, out);
     out.extend_from_slice(mob_data);
-    write_varint(out, raids.len() as i64);
+    megu_core::varint::write_varlong_i64(raids.len() as i64, out);
     for (dim, raid) in raids.iter() {
         write_saved_raid(out, *dim, raid);
     }
@@ -1120,9 +1120,9 @@ fn append_save_state(
     // this version can still load older SVP1 bodies with no SVX1 suffix.
     out.extend_from_slice(SAVE_ENTITY_RULES_MAGIC);
     let rules = command_gamerules().lock().unwrap_or_else(|e| e.into_inner());
-    write_varint(out, COMMAND_GAMERULE_DEFAULTS.len() as i64);
+    megu_core::varint::write_varlong_i64(COMMAND_GAMERULE_DEFAULTS.len() as i64, out);
     for &(name, _, _) in COMMAND_GAMERULE_DEFAULTS.iter() {
-        write_varint(out, name.len() as i64);
+        megu_core::varint::write_varlong_i64(name.len() as i64, out);
         out.extend_from_slice(name.as_bytes());
         save_numbers!(out, gamerule_value(name, &rules));
     }
@@ -1141,15 +1141,15 @@ fn append_save_state(
             }
         }
     }
-    write_varint(out, mob_attrs.len() as i64);
+    megu_core::varint::write_varlong_i64(mob_attrs.len() as i64, out);
     for (index, selector_key, values) in mob_attrs {
-        write_varint(out, index as i64);
+        megu_core::varint::write_varlong_i64(index as i64, out);
         out.push(u8::from(selector_key));
         let mut entries: Vec<_> = values.iter().collect();
         entries.sort_unstable_by_key(|(name, _)| *name);
-        write_varint(out, entries.len() as i64);
+        megu_core::varint::write_varlong_i64(entries.len() as i64, out);
         for (name, value) in entries {
-            write_varint(out, name.len() as i64);
+            megu_core::varint::write_varlong_i64(name.len() as i64, out);
             out.extend_from_slice(name.as_bytes());
             save_numbers!(out, value);
         }
@@ -1362,15 +1362,15 @@ fn save_dim_overlay_into(dim: DimId, f: &mut Vec<u8>) -> usize {
     let chunks: Vec<(&DimChunkKey, &HashMap<u32, u32>)> =
         w.iter().filter(|(key, _)| key.0 == dim).collect();
     let count = chunks.len();
-    write_varint(&mut *f, count as i64);
+    megu_core::varint::write_varlong_i64(count as i64, &mut *f);
     for (key, c) in chunks {
         let (_, cx, cz) = *key;
         (*f).extend_from_slice(&cx.to_be_bytes());
         (*f).extend_from_slice(&cz.to_be_bytes());
-        write_varint(&mut *f, c.len() as i64);
+        megu_core::varint::write_varlong_i64(c.len() as i64, &mut *f);
         for (&idx, &st) in c.iter() {
             (*f).extend_from_slice(&idx.to_be_bytes());
-            write_varint(&mut *f, st as i64);
+            megu_core::varint::write_varlong_i64(st as i64, &mut *f);
         }
     }
     count
@@ -1420,9 +1420,9 @@ fn load_dim_overlay_from(dim: DimId, payload: &[u8]) -> Result<(), &'static str>
 }
 
 fn write_comps(f: &mut Vec<u8>, c: &Comps) {
-    write_varint(f, c.len() as i64);
+    megu_core::varint::write_varlong_i64(c.len() as i64, f);
     for (ty, d) in c {
-        write_varint(f, *ty);
+        megu_core::varint::write_varlong_i64(*ty, f);
         f.extend_from_slice(&(d.len() as u16).to_be_bytes());
         f.extend_from_slice(d);
     }
@@ -1455,10 +1455,10 @@ fn read_comps(b: &[u8], p: &mut usize) -> Comps {
 /// The one wire encoder for a container's slot table. The legacy chest section and the DIM2
 /// footer both call this, so a future change to item components cannot make one format drift.
 fn write_stack_table(out: &mut Vec<u8>, slots: &HashMap<i16, Stack>) {
-    write_varint(out, slots.len() as i64);
+    megu_core::varint::write_varlong_i64(slots.len() as i64, out);
     for (&slot, (item, cnt, comps)) in slots.iter() {
         out.extend_from_slice(&slot.to_be_bytes());
-        write_varint(out, *item);
+        megu_core::varint::write_varlong_i64(*item, out);
         out.push(*cnt);
         write_comps(out, comps);
     }
@@ -1507,13 +1507,13 @@ fn clone_furnace_for_footer(fr: &Furnace) -> Furnace {
 }
 /// One Furnace's three stacks and two counters, in the legacy furnace-section layout.
 fn write_furnace_state(out: &mut Vec<u8>, fr: &Furnace) {
-    write_varint(out, fr.input.0);
+    megu_core::varint::write_varlong_i64(fr.input.0, out);
     out.push(fr.input.1);
     write_comps(out, &fr.input.2);
-    write_varint(out, fr.fuel.0);
+    megu_core::varint::write_varlong_i64(fr.fuel.0, out);
     out.push(fr.fuel.1);
     write_comps(out, &fr.fuel.2);
-    write_varint(out, fr.output.0);
+    megu_core::varint::write_varlong_i64(fr.output.0, out);
     out.push(fr.output.1);
     write_comps(out, &fr.output.2);
     out.extend_from_slice(&fr.burn_left.to_be_bytes());
@@ -1565,6 +1565,15 @@ fn read_furnace_state(
     })
 }
 fn rv_varint(b: &[u8], p: &mut usize) -> i64 {
+    // Canonical varints take the strict core path; anything it rejects falls
+    // through to the lenient legacy scan so truncated or non-canonical MET
+    // bodies keep their historical truncate-and-continue behavior.
+    if *p < b.len() {
+        if let Ok((value, len)) = megu_core::varint::read_varlong_i64(&b[*p..]) {
+            *p += len;
+            return value;
+        }
+    }
     let mut v = 0i64;
     let mut sh = 0;
     loop {
@@ -1602,7 +1611,10 @@ impl<'a> SaveInput<'a> {
     }
 
     fn varint(&mut self) -> Result<i64, &'static str> {
-        read_varint(&mut self.0).ok_or("invalid save VarInt")
+        let (value, len) = megu_core::varint::read_varlong_i64(self.0)
+            .map_err(|_| "invalid save VarInt")?;
+        self.0 = &self.0[len..];
+        Ok(value)
     }
 
     fn var_count(&mut self, min_entry_size: usize) -> Result<usize, &'static str> {
@@ -2023,10 +2035,10 @@ fn save_world_into(f: &mut Vec<u8>) {
     let mut mob_data = Vec::new();
     {
         let now = TICK.load(Ordering::Relaxed);
-        write_varint(&mut *f, ms.len() as i64);
+        megu_core::varint::write_varlong_i64(ms.len() as i64, &mut *f);
         for m in &ms {
             let (x, y, z, yaw, pitch) = saved_value(&m.pos);
-            write_varint(&mut *f, m.etype);
+            megu_core::varint::write_varlong_i64(m.etype, &mut *f);
             (*f).extend_from_slice(&x.to_be_bytes());
             (*f).extend_from_slice(&y.to_be_bytes());
             (*f).extend_from_slice(&z.to_be_bytes());
@@ -2046,18 +2058,18 @@ fn save_world_into(f: &mut Vec<u8>) {
         for (_, name, slots, _) in &active_players {
             all.insert(name.clone(), slots.clone());
         }
-        write_varint(&mut *f, all.len() as i64);
+        megu_core::varint::write_varlong_i64(all.len() as i64, &mut *f);
         for (name, inv) in all.iter() {
             (*f).extend_from_slice(&(name.len() as u16).to_be_bytes());
             (*f).extend_from_slice(name.as_bytes());
-            write_varint(&mut *f, inv.len() as i64);
+            megu_core::varint::write_varlong_i64(inv.len() as i64, &mut *f);
             for (&slot, (item, cnt, ic)) in inv.iter() {
                 (*f).extend_from_slice(&slot.to_be_bytes());
-                write_varint(&mut *f, *item);
+                megu_core::varint::write_varlong_i64(*item, &mut *f);
                 (*f).push(*cnt);
-                write_varint(&mut *f, ic.len() as i64);
+                megu_core::varint::write_varlong_i64(ic.len() as i64, &mut *f);
                 for (ty, d) in ic {
-                    write_varint(&mut *f, *ty);
+                    megu_core::varint::write_varlong_i64(*ty, &mut *f);
                     (*f).extend_from_slice(&(d.len() as u16).to_be_bytes());
                     (*f).extend_from_slice(d);
                 }
@@ -2083,7 +2095,7 @@ fn save_world_into(f: &mut Vec<u8>) {
                 ContainerKey::Cart(_) => None,
             })
             .collect();
-        write_varint(&mut *f, ow_chests.len() as i64);
+        megu_core::varint::write_varlong_i64(ow_chests.len() as i64, &mut *f);
         for ((x, y, z), slots) in ow_chests {
             (*f).extend_from_slice(&x.to_be_bytes());
             (*f).extend_from_slice(&y.to_be_bytes());
@@ -2095,7 +2107,7 @@ fn save_world_into(f: &mut Vec<u8>) {
         // layout. Another dimension's sign goes to the footer, so its presence cannot shift a
         // single byte of an Overworld-only save.
         let ow_signs: Vec<_> = sg.iter().filter(|(k, _)| k.0 == DimId::Overworld).collect();
-        write_varint(&mut *f, ow_signs.len() as i64);
+        megu_core::varint::write_varlong_i64(ow_signs.len() as i64, &mut *f);
         for (k, lines) in &ow_signs {
             let &(_dim, x, y, z, front) = *k;
             (*f).extend_from_slice(&x.to_be_bytes());
@@ -2119,7 +2131,7 @@ fn save_world_into(f: &mut Vec<u8>) {
         // forceload tail — vanilla keeps forced chunks across restarts;
         // losing them would silently freeze fixture+machine regions.
         let fl = forceloaded().lock().unwrap_or_else(|e| e.into_inner());
-        write_varint(&mut *f, fl.len() as i64);
+        megu_core::varint::write_varlong_i64(fl.len() as i64, &mut *f);
         for &(cx, cz) in fl.iter() {
             (*f).extend_from_slice(&cx.to_be_bytes());
             (*f).extend_from_slice(&cz.to_be_bytes());
@@ -2131,7 +2143,7 @@ fn save_world_into(f: &mut Vec<u8>) {
         for (_, name, _, state) in &active_players {
             allp.insert(name.clone(), state.position);
         }
-        write_varint(&mut *f, allp.len() as i64);
+        megu_core::varint::write_varlong_i64(allp.len() as i64, &mut *f);
         for (name, &(dim, x, y, z, yaw, pitch)) in allp.iter() {
             (*f).extend_from_slice(&(name.len() as u16).to_be_bytes());
             (*f).extend_from_slice(name.as_bytes());
@@ -2164,13 +2176,13 @@ fn save_world_into(f: &mut Vec<u8>) {
         let mut drop_ages: Vec<u32> = Vec::new();
         {
             let ds = drops().lock().unwrap_or_else(|e| e.into_inner());
-            write_varint(&mut *f, (ds.len() + tridents.len()) as i64);
+            megu_core::varint::write_varlong_i64((ds.len() + tridents.len()) as i64, &mut *f);
             for (idx, d) in ds.iter().enumerate() {
                 (*f).extend_from_slice(&d.eid.to_be_bytes());
                 (*f).extend_from_slice(&d.x.to_be_bytes());
                 (*f).extend_from_slice(&d.y.to_be_bytes());
                 (*f).extend_from_slice(&d.z.to_be_bytes());
-                write_varint(&mut *f, d.item);
+                megu_core::varint::write_varlong_i64(d.item, &mut *f);
                 (*f).push(d.cnt);
                 write_comps(&mut *f, &d.comps);
                 // `as u32` is already a bit-preserving two's complement cast, so a
@@ -2187,7 +2199,7 @@ fn save_world_into(f: &mut Vec<u8>) {
                 (*f).extend_from_slice(&x.to_be_bytes());
                 (*f).extend_from_slice(&y.to_be_bytes());
                 (*f).extend_from_slice(&z.to_be_bytes());
-                write_varint(&mut *f, *item);
+                megu_core::varint::write_varlong_i64(*item, &mut *f);
                 (*f).push(1);
                 write_comps(&mut *f, comps);
                 drop_ages.push(0);
@@ -2217,7 +2229,7 @@ fn save_world_into(f: &mut Vec<u8>) {
                 }
             })
             .collect();
-        write_varint(&mut *f, ow_furnaces.len() as i64);
+        megu_core::varint::write_varlong_i64(ow_furnaces.len() as i64, &mut *f);
         for ((_, x, y, z), fr) in ow_furnaces {
             (*f).extend_from_slice(&x.to_be_bytes());
             (*f).extend_from_slice(&y.to_be_bytes());
@@ -2234,20 +2246,20 @@ fn save_world_into(f: &mut Vec<u8>) {
                 .filter(|(_, m)| sh.contains(&m.eid))
                 .map(|(i, _)| i as i64)
                 .collect();
-            write_varint(&mut *f, idx.len() as i64);
+            megu_core::varint::write_varlong_i64(idx.len() as i64, &mut *f);
             for i in idx {
-                write_varint(&mut *f, i);
+                megu_core::varint::write_varlong_i64(i, &mut *f);
             }
         }
         // Keep the legacy scoreboard layout. Both pieces describe one snapshot.
         let (scoreboard_objectives, scoreboard_sidebar) = {
             let board = scoreboard().lock().unwrap_or_else(|e| e.into_inner());
-            write_varint(&mut *f, board.objectives.len() as i64);
+            megu_core::varint::write_varlong_i64(board.objectives.len() as i64, &mut *f);
             for obj in board.objectives.keys() {
                 (*f).extend_from_slice(&(obj.len() as u16).to_be_bytes());
                 (*f).extend_from_slice(obj.as_bytes());
                 let entries = board.scores.get(obj);
-                write_varint(&mut *f, entries.map_or(0, HashMap::len) as i64);
+                megu_core::varint::write_varlong_i64(entries.map_or(0, HashMap::len) as i64, &mut *f);
                 for (entry, score) in entries.into_iter().flatten() {
                     (*f).extend_from_slice(&(entry.len() as u16).to_be_bytes());
                     (*f).extend_from_slice(entry.as_bytes());
@@ -2262,7 +2274,7 @@ fn save_world_into(f: &mut Vec<u8>) {
         // XP orbs are world entities too — same persistence class as drops
         {
             let xs = xps().lock().unwrap_or_else(|e| e.into_inner());
-            write_varint(&mut *f, xs.len() as i64);
+            megu_core::varint::write_varlong_i64(xs.len() as i64, &mut *f);
             for x in xs.iter() {
                 (*f).extend_from_slice(&x.eid.to_be_bytes());
                 (*f).extend_from_slice(&x.x.to_be_bytes());
@@ -2288,7 +2300,7 @@ fn save_world_into(f: &mut Vec<u8>) {
                 .iter()
                 .filter(|a| !(a.kind == 1 && a.ret_item > 0))
                 .collect();
-            write_varint(&mut *f, persisted.len() as i64);
+            megu_core::varint::write_varlong_i64(persisted.len() as i64, &mut *f);
             for a in persisted {
                 (*f).extend_from_slice(&a.eid.to_be_bytes());
                 (*f).extend_from_slice(&a.owner.to_be_bytes());
@@ -2302,7 +2314,7 @@ fn save_world_into(f: &mut Vec<u8>) {
                 (*f).push(a.stuck as u8);
             }
             let bo = bobbers().lock().unwrap_or_else(|e| e.into_inner());
-            write_varint(&mut *f, bo.len() as i64);
+            megu_core::varint::write_varlong_i64(bo.len() as i64, &mut *f);
             for a in bo.iter() {
                 (*f).extend_from_slice(&a.eid.to_be_bytes());
                 (*f).extend_from_slice(&a.owner.to_be_bytes());
@@ -2316,7 +2328,7 @@ fn save_world_into(f: &mut Vec<u8>) {
                 (*f).push(a.bit as u8);
             }
             let pe = pearls().lock().unwrap_or_else(|e| e.into_inner());
-            write_varint(&mut *f, pe.len() as i64);
+            megu_core::varint::write_varlong_i64(pe.len() as i64, &mut *f);
             for a in pe.iter() {
                 (*f).extend_from_slice(&a.eid.to_be_bytes());
                 (*f).extend_from_slice(&a.owner.to_be_bytes());
@@ -2329,7 +2341,7 @@ fn save_world_into(f: &mut Vec<u8>) {
                 (*f).extend_from_slice(&a.ttl.to_be_bytes());
             }
             let pr = primed().lock().unwrap_or_else(|e| e.into_inner());
-            write_varint(&mut *f, pr.len() as i64);
+            megu_core::varint::write_varlong_i64(pr.len() as i64, &mut *f);
             for a in pr.iter() {
                 (*f).extend_from_slice(&a.eid.to_be_bytes());
                 (*f).extend_from_slice(&a.x.to_be_bytes());
@@ -2362,12 +2374,12 @@ fn save_world_into(f: &mut Vec<u8>) {
             let tm = tags().lock().unwrap_or_else(|e| e.into_inner());
             let players: Vec<(&String, &HashSet<String>)> =
                 tm.iter().filter(|(k, _)| k.starts_with("p:")).collect();
-            write_varint(&mut *f, players.len() as i64);
+            megu_core::varint::write_varlong_i64(players.len() as i64, &mut *f);
             for (k, st) in players {
                 let nm = &k[2..];
                 (*f).extend_from_slice(&(nm.len() as u16).to_be_bytes());
                 (*f).extend_from_slice(nm.as_bytes());
-                write_varint(&mut *f, st.len() as i64);
+                megu_core::varint::write_varlong_i64(st.len() as i64, &mut *f);
                 for t in st.iter() {
                     (*f).extend_from_slice(&(t.len() as u16).to_be_bytes());
                     (*f).extend_from_slice(t.as_bytes());
@@ -2378,10 +2390,10 @@ fn save_world_into(f: &mut Vec<u8>) {
                 .enumerate()
                 .filter_map(|(i, m)| tm.get(&format!("e:{}", m.eid)).map(|st| (i as i64, st)))
                 .collect();
-            write_varint(&mut *f, mobe.len() as i64);
+            megu_core::varint::write_varlong_i64(mobe.len() as i64, &mut *f);
             for (i, st) in mobe {
-                write_varint(&mut *f, i);
-                write_varint(&mut *f, st.len() as i64);
+                megu_core::varint::write_varlong_i64(i, &mut *f);
+                megu_core::varint::write_varlong_i64(st.len() as i64, &mut *f);
                 for t in st.iter() {
                     (*f).extend_from_slice(&(t.len() as u16).to_be_bytes());
                     (*f).extend_from_slice(t.as_bytes());
@@ -2394,14 +2406,14 @@ fn save_world_into(f: &mut Vec<u8>) {
             let t_now = TICK.load(Ordering::Relaxed);
             let sf = sched_fns().lock().unwrap_or_else(|e| e.into_inner());
             let n_sched = sf.len();
-            write_varint(&mut *f, n_sched as i64);
+            megu_core::varint::write_varlong_i64(n_sched as i64, &mut *f);
             for (f2, due) in sf.iter() {
                 (*f).extend_from_slice(&(f2.len() as u16).to_be_bytes());
                 (*f).extend_from_slice(f2.as_bytes());
                 (*f).extend_from_slice(&(due.saturating_sub(t_now)).to_be_bytes());
             }
             let ag = adv_done().lock().unwrap_or_else(|e| e.into_inner());
-            write_varint(&mut *f, ag.len() as i64);
+            megu_core::varint::write_varlong_i64(ag.len() as i64, &mut *f);
             let mut players: Vec<_> = ag.iter().collect();
             // Keep the original legacy layout when no IDs were earned, including
             // worlds with empty per-player entries; ADV1 is absent there too.
@@ -2411,7 +2423,7 @@ fn save_world_into(f: &mut Vec<u8>) {
             for (pn, ids) in players {
                 (*f).extend_from_slice(&(pn.len() as u16).to_be_bytes());
                 (*f).extend_from_slice(pn.as_bytes());
-                write_varint(&mut *f, ids.len() as i64);
+                megu_core::varint::write_varlong_i64(ids.len() as i64, &mut *f);
                 let mut ids: Vec<_> = ids.iter().collect();
                 ids.sort_unstable();
                 for id in ids {
@@ -2423,12 +2435,12 @@ fn save_world_into(f: &mut Vec<u8>) {
             let at = attrs().lock().unwrap_or_else(|e| e.into_inner());
             let pa: Vec<(&String, &HashMap<String, f64>)> =
                 at.iter().filter(|(k, _)| k.starts_with("p:")).collect();
-            write_varint(&mut *f, pa.len() as i64);
+            megu_core::varint::write_varlong_i64(pa.len() as i64, &mut *f);
             for (k, m) in pa {
                 let nm = &k[2..];
                 (*f).extend_from_slice(&(nm.len() as u16).to_be_bytes());
                 (*f).extend_from_slice(nm.as_bytes());
-                write_varint(&mut *f, m.len() as i64);
+                megu_core::varint::write_varlong_i64(m.len() as i64, &mut *f);
                 for (an, v) in m.iter() {
                     (*f).extend_from_slice(&(an.len() as u16).to_be_bytes());
                     (*f).extend_from_slice(an.as_bytes());
@@ -2436,7 +2448,7 @@ fn save_world_into(f: &mut Vec<u8>) {
                 }
             }
             // Legacy objective criteria and sidebar selection.
-            write_varint(&mut *f, scoreboard_objectives.len() as i64);
+            megu_core::varint::write_varlong_i64(scoreboard_objectives.len() as i64, &mut *f);
             for (obj, criterion) in scoreboard_objectives {
                 let name = scoreboard_criterion_name(criterion);
                 (*f).extend_from_slice(&(obj.len() as u16).to_be_bytes());
@@ -2461,7 +2473,7 @@ fn save_world_into(f: &mut Vec<u8>) {
         ))
     });
     (*f).extend_from_slice(b"FAL2");
-    write_varint(&mut *f, in_flight.len() as i64);
+    megu_core::varint::write_varlong_i64(in_flight.len() as i64, &mut *f);
     for fa in in_flight {
         (*f).extend_from_slice(&fa.eid.to_be_bytes());
         (*f).extend_from_slice(&fa.x.to_be_bytes());
@@ -2605,6 +2617,10 @@ fn save_world_into(f: &mut Vec<u8>) {
     // nothing while empty, same default-only convention as WBE1.
     append_bossbar_footer(f);
     append_team_footer(f);
+    // RCP1/STA1 tuck between TEM1 and MOF1: per-player recipe books and stat
+    // counters emit nothing while their registries are empty.
+    append_recipe_book_footer(f);
+    append_player_stats_footer(f);
     // MOF1/AER1 tuck between WBE1 and WBD1: each is emitted only while its
     // mod bridge holds state, so an untouched vanilla save keeps the exact
     // pre-record tail byte-for-byte.
@@ -2788,7 +2804,7 @@ fn loaded_save_version_header() -> Option<SaveVersionHeader> {
 fn append_save_version_footer(out: &mut Vec<u8>, header: &SaveVersionHeader) {
     let start = out.len();
     out.push(1); // VER1 schema version
-    write_varint(out, header.mc_version.len() as i64);
+    megu_core::varint::write_varlong_i64(header.mc_version.len() as i64, out);
     out.extend_from_slice(header.mc_version.as_bytes());
     save_numbers!(out, header.data_version, header.protocol_version);
     let size = (out.len() - start) as u64;
@@ -3537,19 +3553,19 @@ fn append_dxt_footer(out: &mut Vec<u8>, entries: &DxtEntries) {
     }
     let start = out.len();
     out.push(1); // version
-    write_varint(out, entries.overlays.len() as i64);
+    megu_core::varint::write_varlong_i64(entries.overlays.len() as i64, out);
     for (key, table) in &entries.overlays {
         write_dxt_key(out, key);
         out.extend_from_slice(&(table.len() as u32).to_be_bytes());
         out.extend_from_slice(table);
     }
-    write_varint(out, entries.players.len() as i64);
+    megu_core::varint::write_varlong_i64(entries.players.len() as i64, out);
     for (name, key) in &entries.players {
         out.extend_from_slice(&(name.len() as u16).to_be_bytes());
         out.extend_from_slice(name.as_bytes());
         write_dxt_key(out, key);
     }
-    write_varint(out, entries.saved_players.len() as i64);
+    megu_core::varint::write_varlong_i64(entries.saved_players.len() as i64, out);
     for (uuid, position, respawn) in &entries.saved_players {
         out.extend_from_slice(uuid);
         out.push(
@@ -3559,14 +3575,14 @@ fn append_dxt_footer(out: &mut Vec<u8>, entries: &DxtEntries) {
             write_dxt_key(out, key);
         }
     }
-    write_varint(out, entries.mob_dims.len() as i64);
+    megu_core::varint::write_varlong_i64(entries.mob_dims.len() as i64, out);
     for (ordinal, key) in &entries.mob_dims {
-        write_varint(out, i64::from(*ordinal));
+        megu_core::varint::write_varlong_i64(i64::from(*ordinal), out);
         write_dxt_key(out, key);
     }
-    write_varint(out, entries.raid_dims.len() as i64);
+    megu_core::varint::write_varlong_i64(entries.raid_dims.len() as i64, out);
     for (ordinal, key) in &entries.raid_dims {
-        write_varint(out, i64::from(*ordinal));
+        megu_core::varint::write_varlong_i64(i64::from(*ordinal), out);
         write_dxt_key(out, key);
     }
     out.extend_from_slice(&(entries.signs.len() as u32).to_be_bytes());
@@ -4181,6 +4197,9 @@ fn decode_world_payload(payload: &[u8]) -> Result<(), &'static str> {
     // MOF1/AER1 tuck between WBE1 and WBD1; footers strip last-written-first.
     let (payload, aer1) = read_mod_bridge_trailer(payload, AERONAUTICS_TRAILER_MAGIC)?;
     let (payload, mof1) = read_mod_bridge_trailer(payload, MOD_OFFLOAD_TRAILER_MAGIC)?;
+    // STA1/RCP1 tuck between MOF1 and TEM1: strip them last-written-first.
+    let (payload, saved_stats) = read_player_stats_footer(payload)?;
+    let (payload, saved_recipe_books) = read_recipe_book_footer(payload)?;
     // TEM1/BAR1 tuck between MOF1 and WBE1: strip them last-written-first.
     let (payload, saved_teams) = read_team_footer(payload)?;
     let (payload, saved_bossbars) = read_bossbar_footer(payload)?;
@@ -5457,6 +5476,8 @@ fn decode_world_payload(payload: &[u8]) -> Result<(), &'static str> {
     restore_wbe_entries(wbe_entries);
     restore_saved_bossbars(saved_bossbars);
     restore_saved_teams(saved_teams);
+    restore_saved_recipe_books(saved_recipe_books);
+    restore_saved_player_stats(saved_stats);
     restore_saved_block_entities(block_entities);
     // The mod-bridge trailers apply last: their codecs validate the whole blob
     // before touching live state, and running them after the core world is
@@ -6165,7 +6186,7 @@ fn append_bossbar_footer(out: &mut Vec<u8>) {
     ids.sort();
     let start = out.len();
     out.push(GAMEPLAY_REGISTRY_SCHEMA);
-    write_varint(out, ids.len() as i64);
+    megu_core::varint::write_varlong_i64(ids.len() as i64, out);
     for id in ids {
         let bar = &bars[id];
         write_registry_str(out, id);
@@ -6176,7 +6197,7 @@ fn append_bossbar_footer(out: &mut Vec<u8>) {
         out.push(u8::from(bar.visible));
         let mut uuids: Vec<&[u8; 16]> = bar.players.iter().collect();
         uuids.sort();
-        write_varint(out, uuids.len() as i64);
+        megu_core::varint::write_varlong_i64(uuids.len() as i64, out);
         for uuid in uuids {
             out.extend_from_slice(uuid);
         }
@@ -6245,18 +6266,18 @@ fn append_team_footer(out: &mut Vec<u8>) {
     }
     let start = out.len();
     out.push(GAMEPLAY_REGISTRY_SCHEMA);
-    write_varint(out, reg.teams.len() as i64);
+    megu_core::varint::write_varlong_i64(reg.teams.len() as i64, out);
     // BTreeMap iterates sorted, keeping the save deterministic.
     for (name, team) in &reg.teams {
         write_registry_str(out, name);
         write_registry_str(out, &team.display_name);
-        write_varint(out, team.color as i64);
+        megu_core::varint::write_varlong_i64(team.color as i64, out);
         out.push(team.friendly_flags());
         write_registry_str(out, &team.nametag_visibility);
         write_registry_str(out, &team.collision_rule);
         write_registry_str(out, &team.prefix);
         write_registry_str(out, &team.suffix);
-        write_varint(out, team.members.len() as i64);
+        megu_core::varint::write_varlong_i64(team.members.len() as i64, out);
         for member in &team.members {
             write_registry_str(out, member);
         }
@@ -6343,6 +6364,183 @@ fn restore_saved_bossbars(entries: Vec<(String, Bossbar)>) {
 
 fn restore_saved_teams(reg: TeamRegistry) {
     *teams().lock().unwrap_or_else(|e| e.into_inner()) = reg;
+}
+
+// ---------- per-player gameplay state (RCP1 / STA1) ----------
+//
+// Recipe books and stat counters live in per-uuid registries keyed off the
+// protocol lane; vanilla keeps both in each player's own save data, so a
+// restart that forgets them strips every unlocked recipe highlight and every
+// statistic. Each footer is emitted only while its registry holds entries,
+// keeping an untouched world's tail byte-for-byte, and each is validated in
+// full before a single live map is touched.
+
+const RECIPE_BOOK_MAGIC: &[u8; 4] = b"RCP1";
+const PLAYER_STATS_MAGIC: &[u8; 4] = b"STA1";
+const PLAYER_SECTION_SCHEMA: u8 = 1;
+const MAX_SAVED_PLAYER_SECTIONS: usize = 65_536;
+const MAX_BOOK_RECIPES: usize = 16_384;
+
+fn append_recipe_book_footer(out: &mut Vec<u8>) {
+    let books = recipe_books().lock().unwrap_or_else(|e| e.into_inner());
+    if books.is_empty() {
+        return;
+    }
+    // HashMap iteration order is not stable; sort the uuids so the same live
+    // state always encodes to the same bytes. BTreeSet members already sort.
+    let mut ids: Vec<&[u8; 16]> = books.keys().collect();
+    ids.sort_unstable();
+    let start = out.len();
+    out.push(PLAYER_SECTION_SCHEMA);
+    megu_core::varint::write_varlong_i64(ids.len() as i64, out);
+    for id in ids {
+        out.extend_from_slice(id);
+        let book = &books[id];
+        megu_core::varint::write_varlong_i64(book.unlocked.len() as i64, out);
+        for recipe in &book.unlocked {
+            write_registry_str(out, recipe);
+        }
+        megu_core::varint::write_varlong_i64(book.displayed.len() as i64, out);
+        for recipe in &book.displayed {
+            write_registry_str(out, recipe);
+        }
+        book.settings.encode(out);
+    }
+    let size = (out.len() - start) as u64;
+    save_numbers!(out, size);
+    out.extend_from_slice(RECIPE_BOOK_MAGIC);
+}
+
+fn read_book_recipe_set(input: &mut SaveInput<'_>) -> Result<BTreeSet<String>, &'static str> {
+    let count = input.var_count(3)?;
+    if count > MAX_BOOK_RECIPES {
+        return Err("invalid recipe book entry count");
+    }
+    let mut set = BTreeSet::new();
+    for _ in 0..count {
+        let id = read_registry_str(input)?;
+        if id.is_empty() || !set.insert(id) {
+            return Err("invalid or duplicate recipe book entry");
+        }
+    }
+    Ok(set)
+}
+
+fn read_recipe_book_footer(
+    payload: &[u8],
+) -> Result<(&[u8], Vec<([u8; 16], PlayerRecipeBook)>), &'static str> {
+    let (payload, body) = split_save_footer(payload, RECIPE_BOOK_MAGIC)?;
+    let Some(body) = body else {
+        return Ok((payload, Vec::new()));
+    };
+    let mut input = SaveInput(body);
+    if input.byte()? != PLAYER_SECTION_SCHEMA {
+        return Err("unsupported recipe book footer");
+    }
+    let count = input.var_count(16)?;
+    if count > MAX_SAVED_PLAYER_SECTIONS {
+        return Err("invalid recipe book player count");
+    }
+    let mut books = Vec::with_capacity(count);
+    let mut seen = HashSet::with_capacity(count);
+    for _ in 0..count {
+        let uuid: [u8; 16] = input.take()?;
+        if !seen.insert(uuid) {
+            return Err("duplicate recipe book player");
+        }
+        let unlocked = read_book_recipe_set(&mut input)?;
+        let displayed = read_book_recipe_set(&mut input)?;
+        // `unlock`/`revoke`/`seen_recipe` keep highlights inside the unlocked
+        // set; a save that violates it is corrupt, not merely unusual.
+        if !unlocked.is_superset(&displayed) {
+            return Err("recipe book highlight outside unlocked set");
+        }
+        let mut settings = RecipeBookSettings::default();
+        for cat in RecipeBookCategory::ALL {
+            let gui_open = input.flag()?;
+            let filtering = input.flag()?;
+            settings.set(cat, gui_open, filtering);
+        }
+        books.push((
+            uuid,
+            PlayerRecipeBook {
+                unlocked,
+                displayed,
+                settings,
+            },
+        ));
+    }
+    if !input.0.is_empty() {
+        return Err("trailing bytes in recipe book footer");
+    }
+    Ok((payload, books))
+}
+
+fn append_player_stats_footer(out: &mut Vec<u8>) {
+    let stats = player_stats().lock().unwrap_or_else(|e| e.into_inner());
+    if stats.is_empty() {
+        return;
+    }
+    let mut ids: Vec<&[u8; 16]> = stats.keys().collect();
+    ids.sort_unstable();
+    let start = out.len();
+    out.push(PLAYER_SECTION_SCHEMA);
+    megu_core::varint::write_varlong_i64(ids.len() as i64, out);
+    for id in ids {
+        out.extend_from_slice(id);
+        // Length-prefix the shared 0x04 codec blob so `decode_stats`'s
+        // consume-everything check sees exactly one player's counters.
+        let blob = encode_stats(&stats[id]);
+        megu_core::varint::write_varlong_i64(blob.len() as i64, out);
+        out.extend_from_slice(&blob);
+    }
+    let size = (out.len() - start) as u64;
+    save_numbers!(out, size);
+    out.extend_from_slice(PLAYER_STATS_MAGIC);
+}
+
+fn read_player_stats_footer(
+    payload: &[u8],
+) -> Result<(&[u8], Vec<([u8; 16], PlayerStats)>), &'static str> {
+    let (payload, body) = split_save_footer(payload, PLAYER_STATS_MAGIC)?;
+    let Some(body) = body else {
+        return Ok((payload, Vec::new()));
+    };
+    let mut input = SaveInput(body);
+    if input.byte()? != PLAYER_SECTION_SCHEMA {
+        return Err("unsupported player stats footer");
+    }
+    let count = input.var_count(18)?;
+    if count > MAX_SAVED_PLAYER_SECTIONS {
+        return Err("invalid player stats count");
+    }
+    let mut entries = Vec::with_capacity(count);
+    let mut seen = HashSet::with_capacity(count);
+    for _ in 0..count {
+        let uuid: [u8; 16] = input.take()?;
+        if !seen.insert(uuid) {
+            return Err("duplicate player stats entry");
+        }
+        let len = usize::try_from(input.varint()?).map_err(|_| "invalid stats blob length")?;
+        let blob = input.bytes(len)?;
+        let mut slice = blob;
+        let stats = decode_stats(&mut slice).ok_or("invalid saved player stats")?;
+        entries.push((uuid, stats));
+    }
+    if !input.0.is_empty() {
+        return Err("trailing bytes in player stats footer");
+    }
+    Ok((payload, entries))
+}
+
+fn restore_saved_recipe_books(entries: Vec<([u8; 16], PlayerRecipeBook)>) {
+    *recipe_books().lock().unwrap_or_else(|e| e.into_inner()) =
+        entries.into_iter().collect();
+}
+
+fn restore_saved_player_stats(entries: Vec<([u8; 16], PlayerStats)>) {
+    *player_stats().lock().unwrap_or_else(|e| e.into_inner()) =
+        entries.into_iter().collect();
 }
 
 // ---------- mod-bridge trailers (MOF1 / AER1) ----------
@@ -8645,16 +8843,16 @@ mod fix_save_tests {
         // fails closed rather than silently deduping.
         let mut one_team_dup = Vec::new();
         one_team_dup.push(GAMEPLAY_REGISTRY_SCHEMA);
-        write_varint(&mut one_team_dup, 1);
+        megu_core::varint::write_varlong_i64(1, &mut one_team_dup);
         write_registry_str(&mut one_team_dup, "t");
         write_registry_str(&mut one_team_dup, "t");
-        write_varint(&mut one_team_dup, 21);
+        megu_core::varint::write_varlong_i64(21, &mut one_team_dup);
         one_team_dup.push(0);
         write_registry_str(&mut one_team_dup, "always");
         write_registry_str(&mut one_team_dup, "always");
         write_registry_str(&mut one_team_dup, "");
         write_registry_str(&mut one_team_dup, "");
-        write_varint(&mut one_team_dup, 2);
+        megu_core::varint::write_varlong_i64(2, &mut one_team_dup);
         write_registry_str(&mut one_team_dup, "m");
         write_registry_str(&mut one_team_dup, "m");
         let mut framed = Vec::new();
