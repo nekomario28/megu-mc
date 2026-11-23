@@ -2675,7 +2675,200 @@ fn broadcast_in<F: Fn(&Client) -> (i64, Vec<u8>)>(audience: &[Arc<Client>], me_e
 struct TrackedSpawn {
     dim: DimId,
     range: u32,
-    job: SpawnJob,
+    eid: i32,
+    x: f64,
+    z: f64,
+    cx: i32,
+    cz: i32,
+    spawn: SpawnDescriptor,
+}
+
+/// Value form of the old per-tick `Box<dyn FnOnce>` spawn job. The descriptor is
+/// built for every live entity every tick, but its packets are encoded only when
+/// a client actually transitions from untracked to tracked.
+enum SpawnDescriptor {
+    Cart(generated_content::Cart),
+    Frame(generated_content::Frame),
+    Mob(Arc<Mob>),
+    Projectile(LiveMobProjectile),
+    Player(Arc<Client>),
+    ItemDrop {
+        eid: i32,
+        x: f64,
+        y: f64,
+        z: f64,
+        item: i64,
+        cnt: u8,
+        comps: Comps,
+    },
+    Falling {
+        eid: i32,
+        state: u32,
+        x: f64,
+        y: f64,
+        z: f64,
+    },
+    ExperienceOrb {
+        eid: i32,
+        x: f64,
+        y: f64,
+        z: f64,
+        val: i16,
+    },
+    Typed {
+        eid: i32,
+        etype: i64,
+        x: f64,
+        y: f64,
+        z: f64,
+    },
+}
+
+impl SpawnDescriptor {
+    fn packets(&self) -> Vec<(i64, Vec<u8>)> {
+        #[cfg(test)]
+        SPAWN_DESCRIPTOR_MATERIALIZATIONS.with(|count| count.set(count.get() + 1));
+        match self {
+            Self::Cart(cart) => vec![(0x01, spawn_generated_cart(cart))],
+            Self::Frame(frame) => vec![
+                (0x01, spawn_generated_frame(frame)),
+                (0x58, frame_meta_pkt(frame)),
+            ],
+            Self::Mob(mob) => {
+                let mut packets = live_mob_spawn_packets(mob);
+                // SetEquipment trails the spawn so a skeleton's bow or a
+                // pillager's crossbow is visible from the first frame.
+                if let Some(equipment) = mob_equipment_packet(mob) {
+                    packets.push((0x5b, equipment));
+                }
+                packets
+            }
+            Self::Projectile(projectile) => {
+                let mut packets = live_mob_projectile_packets(*projectile);
+                // `ServerEntity.sendPairingData`: every tracked
+                // `AbstractHurtingProjectile` carries a
+                // `set_projectile_power` right after the spawn — the
+                // vanilla `accelerationPower` default is 0.1.
+                if matches!(
+                    projectile.kind,
+                    MobProjectileKind::SmallFireball
+                        | MobProjectileKind::GhastFireball
+                        | MobProjectileKind::DragonFireball
+                        | MobProjectileKind::WitherSkull { .. }
+                ) {
+                    packets.push(encode_play_set_projectile_power(projectile.eid, 0.1));
+                }
+                packets
+            }
+            Self::Player(player) => {
+                let mut packets = vec![(0x01, spawn_player(player))];
+                // SetEquipment trails the spawn so an observer sees the
+                // player's held item and armor from the first frame.
+                if let Some(equipment) = player_equipment_packet(player) {
+                    packets.push((0x5b, equipment));
+                }
+                packets
+            }
+            Self::ItemDrop {
+                eid,
+                x,
+                y,
+                z,
+                item,
+                cnt,
+                comps,
+            } => {
+                let drop = Drop {
+                    eid: *eid,
+                    x: *x,
+                    y: *y,
+                    z: *z,
+                    item: *item,
+                    cnt: *cnt,
+                    comps: comps.clone(),
+                    age: 0,
+                    target: None,
+                    thrower: None,
+                };
+                vec![(0x01, spawn_drop_pkt(&drop)), (0x58, drop_meta_pkt(&drop))]
+            }
+            Self::Falling {
+                eid,
+                state,
+                x,
+                y,
+                z,
+            } => vec![(0x01, spawn_falling_pkt(*eid, *state, *x, *y, *z))],
+            Self::ExperienceOrb { eid, x, y, z, val } => {
+                let (id, body) = encode_play_add_experience_orb(*eid, *x, *y, *z, *val);
+                debug_assert_eq!(body, xp_orb_pkt(*eid, *x, *y, *z, *val));
+                vec![(id, body)]
+            }
+            Self::Typed {
+                eid,
+                etype,
+                x,
+                y,
+                z,
+            } => vec![(0x01, spawn_typed_pkt(*eid, *etype, *x, *y, *z))],
+        }
+    }
+}
+
+/// Entities grouped by the chunk cell `sync_entity_interest` tests for chunk
+/// membership. `order` is the entity indices sorted by `(dim, cx, cz)` and
+/// `ranges` maps each distinct cell to its slice inside `order`, so building the
+/// index allocates two containers rather than a `Vec` per occupied chunk.
+struct InterestChunkIndex {
+    order: Vec<usize>,
+    ranges: HashMap<(DimId, i32, i32), (usize, usize)>,
+}
+
+impl InterestChunkIndex {
+    fn new(entities: &[TrackedSpawn]) -> Self {
+        let mut order: Vec<usize> = (0..entities.len()).collect();
+        order.sort_unstable_by_key(|&index| {
+            let entity = &entities[index];
+            (entity.dim, entity.cx, entity.cz)
+        });
+        let mut ranges = HashMap::new();
+        let mut start = 0usize;
+        while start < order.len() {
+            let first = &entities[order[start]];
+            let key = (first.dim, first.cx, first.cz);
+            let mut end = start + 1;
+            while end < order.len() {
+                let entity = &entities[order[end]];
+                if (entity.dim, entity.cx, entity.cz) != key {
+                    break;
+                }
+                end += 1;
+            }
+            ranges.insert(key, (start, end));
+            start = end;
+        }
+        Self { order, ranges }
+    }
+}
+
+#[derive(Default)]
+struct InterestSyncScratch {
+    eligible: Vec<(i32, usize)>,
+    removed: Vec<i32>,
+    added: Vec<(i32, usize)>,
+}
+
+thread_local! {
+    static INTEREST_SYNC_SCRATCH: std::cell::RefCell<InterestSyncScratch> =
+        std::cell::RefCell::new(InterestSyncScratch::default());
+}
+
+// Test-only count of `SpawnDescriptor::packets` materializations, proving the
+// steady-state path encodes no spawn packets.
+#[cfg(test)]
+thread_local! {
+    static SPAWN_DESCRIPTOR_MATERIALIZATIONS: std::cell::Cell<usize> =
+        std::cell::Cell::new(0);
 }
 
 fn entity_tracking_range(etype: i64) -> u32 {
@@ -2708,33 +2901,41 @@ fn interest_tick() {
     sleep_tick();
     play_content_revision_sync();
     biome_override_sync_tick();
-    // Build spawn payloads only when an observer starts tracking the entity.
+    // Build value descriptors once per tick; spawn packets are encoded only
+    // for clients that actually start tracking an entity.
     let mut ents = Vec::new();
-    let mut queue = |dim, etype, job| {
+    let mut queue = |dim: DimId,
+                     etype: i64,
+                     eid: i32,
+                     x: f64,
+                     z: f64,
+                     spawn: SpawnDescriptor| {
         ents.push(TrackedSpawn {
             dim,
             range: entity_tracking_range(etype),
-            job,
+            eid,
+            x,
+            z,
+            cx: spatial_chunk_coord(x),
+            cz: spatial_chunk_coord(z),
+            spawn,
         });
     };
     for cart in generated_content().lock().unwrap_or_else(|e| e.into_inner()).carts.iter() {
         let cart = cart.clone();
-        let [x, y, z] = cart.pos().expect("validated generated cart");
+        let pos = cart.pos().expect("validated generated cart");
         queue(
             DimId::Overworld,
             name_to_etype("chest_minecart").unwrap(),
-            (
-                cart.eid,
-                x,
-                y,
-                z,
-                Box::new(move || vec![(0x01, spawn_generated_cart(&cart))]),
-            ),
+            cart.eid,
+            pos[0],
+            pos[2],
+            SpawnDescriptor::Cart(cart),
         );
     }
     for frame in generated_content().lock().unwrap_or_else(|e| e.into_inner()).frames.iter() {
         let frame = frame.clone();
-        let [x, y, z] = frame.pos().expect("validated generated frame");
+        let pos = frame.pos().expect("validated generated frame");
         queue(
             DimId::Overworld,
             name_to_etype(if frame.glow() {
@@ -2743,43 +2944,24 @@ fn interest_tick() {
                 "item_frame"
             })
             .unwrap(),
-            (
-                frame.eid,
-                x,
-                y,
-                z,
-                Box::new(move || {
-                    vec![
-                        (0x01, spawn_generated_frame(&frame)),
-                        (0x58, frame_meta_pkt(&frame)),
-                    ]
-                }),
-            ),
+            frame.eid,
+            pos[0],
+            pos[2],
+            SpawnDescriptor::Frame(frame),
         );
     }
     let mut live_eids = HashSet::new();
     for m in mobs().lock().unwrap_or_else(|e| e.into_inner()).iter() {
         let p = *m.pos.lock().unwrap_or_else(|e| e.into_inner());
-        let m = m.clone();
-        live_eids.insert(m.eid);
+        let mob = m.clone();
+        live_eids.insert(mob.eid);
         queue(
-            m.dim,
-            m.etype,
-            (
-                m.eid,
-                p.0,
-                p.1,
-                p.2,
-                Box::new(move || {
-                    let mut packets = live_mob_spawn_packets(&m);
-                    // SetEquipment trails the spawn so a skeleton's bow or a
-                    // pillager's crossbow is visible from the first frame.
-                    if let Some(equipment) = mob_equipment_packet(&m) {
-                        packets.push((0x5b, equipment));
-                    }
-                    packets
-                }),
-            ),
+            mob.dim,
+            mob.etype,
+            mob.eid,
+            p.0,
+            p.2,
+            SpawnDescriptor::Mob(mob),
         );
     }
     mob_equipment()
@@ -2799,45 +2981,27 @@ fn interest_tick() {
         queue(
             dim,
             name_to_etype("leash_knot").unwrap(),
-            (
-                knot_eid,
+            knot_eid,
+            x,
+            z,
+            SpawnDescriptor::Typed {
+                eid: knot_eid,
+                etype: 63,
                 x,
                 y,
                 z,
-                Box::new(move || {
-                    vec![(0x01, spawn_typed_pkt(knot_eid, 63, x, y, z))]
-                }),
-            ),
+            },
         );
     }
     for &projectile in live_mob_projectiles().lock().unwrap_or_else(|e| e.into_inner()).iter() {
-        let [x, y, z] = projectile.pos;
+        let [x, _y, z] = projectile.pos;
         queue(
             projectile.dim,
             projectile.entity_type(),
-            (
-                projectile.eid,
-                x,
-                y,
-                z,
-                Box::new(move || {
-                    let mut packets = live_mob_projectile_packets(projectile);
-                    // `ServerEntity.sendPairingData`: every tracked
-                    // `AbstractHurtingProjectile` carries a
-                    // `set_projectile_power` right after the spawn — the
-                    // vanilla `accelerationPower` default is 0.1.
-                    if matches!(
-                        projectile.kind,
-                        MobProjectileKind::SmallFireball
-                            | MobProjectileKind::GhastFireball
-                            | MobProjectileKind::DragonFireball
-                            | MobProjectileKind::WitherSkull { .. }
-                    ) {
-                        packets.push(encode_play_set_projectile_power(projectile.eid, 0.1));
-                    }
-                    packets
-                }),
-            ),
+            projectile.eid,
+            x,
+            z,
+            SpawnDescriptor::Projectile(projectile),
         );
     }
     for cloud in live_dragon_clouds().lock().unwrap_or_else(|e| e.into_inner()).iter() {
@@ -2845,13 +3009,16 @@ fn interest_tick() {
         queue(
             cloud.dim,
             1,
-            (
+            eid,
+            x,
+            z,
+            SpawnDescriptor::Typed {
                 eid,
+                etype: 1,
                 x,
                 y,
                 z,
-                Box::new(move || vec![(0x01, spawn_typed_pkt(eid, 1, x, y, z))]),
-            ),
+            },
         );
     }
     for d in drops().lock().unwrap_or_else(|e| e.into_inner()).iter() {
@@ -2860,61 +3027,34 @@ fn interest_tick() {
         queue(
             DimId::Overworld,
             name_to_etype("item").unwrap(),
-            (
+            eid,
+            x,
+            z,
+            SpawnDescriptor::ItemDrop {
                 eid,
                 x,
                 y,
                 z,
-                Box::new(move || {
-                    let d = Drop {
-                        eid,
-                        x,
-                        y,
-                        z,
-                        item,
-                        cnt,
-                        comps: comps.clone(),
-                        age: 0,
-                        target: None,
-                        thrower: None,
-                    };
-                    vec![(0x01, spawn_drop_pkt(&d)), (0x58, drop_meta_pkt(&d))]
-                }),
-            ),
+                item,
+                cnt,
+                comps,
+            },
         );
     }
     for a in arrows().lock().unwrap_or_else(|e| e.into_inner()).iter() {
-        let a2 = Arrow {
-            eid: a.eid,
-            owner: a.owner,
-            x: a.x,
-            y: a.y,
-            z: a.z,
-            dx: a.dx,
-            dy: a.dy,
-            dz: a.dz,
-            ttl: a.ttl,
-            dmg: a.dmg,
-            fire: a.fire,
-            punch: a.punch,
-            kind: 0,
-            loy: 0,
-            ret_item: 0,
-            ret_comps: Vec::new(),
-            pierce: 0,
-            last_hit: -1,
-            stuck: false,
-        };
         queue(
             DimId::Overworld,
             4,
-            (
-                a.eid,
-                a.x,
-                a.y,
-                a.z,
-                Box::new(move || vec![(0x01, spawn_arrow_pkt(&a2))]),
-            ),
+            a.eid,
+            a.x,
+            a.z,
+            SpawnDescriptor::Typed {
+                eid: a.eid,
+                etype: 4,
+                x: a.x,
+                y: a.y,
+                z: a.z,
+            },
         );
     }
     for b in bobbers().lock().unwrap_or_else(|e| e.into_inner()).iter() {
@@ -2922,13 +3062,16 @@ fn interest_tick() {
         queue(
             DimId::Overworld,
             129,
-            (
+            eid,
+            x,
+            z,
+            SpawnDescriptor::Typed {
                 eid,
+                etype: 129,
                 x,
                 y,
                 z,
-                Box::new(move || vec![(0x01, spawn_typed_pkt(eid, 129, x, y, z))]),
-            ),
+            },
         );
     }
     for p in pearls().lock().unwrap_or_else(|e| e.into_inner()).iter() {
@@ -2936,13 +3079,16 @@ fn interest_tick() {
         queue(
             DimId::Overworld,
             32,
-            (
+            eid,
+            x,
+            z,
+            SpawnDescriptor::Typed {
                 eid,
+                etype: 32,
                 x,
                 y,
                 z,
-                Box::new(move || vec![(0x01, spawn_typed_pkt(eid, 32, x, y, z))]),
-            ),
+            },
         );
     }
     for sb in snowballs().lock().unwrap_or_else(|e| e.into_inner()).iter() {
@@ -2950,13 +3096,16 @@ fn interest_tick() {
         queue(
             DimId::Overworld,
             97,
-            (
+            eid,
+            x,
+            z,
+            SpawnDescriptor::Typed {
                 eid,
+                etype: 97,
                 x,
                 y,
                 z,
-                Box::new(move || vec![(0x01, spawn_typed_pkt(eid, 97, x, y, z))]),
-            ),
+            },
         );
     }
     for e in eyes().lock().unwrap_or_else(|e| e.into_inner()).iter() {
@@ -2964,13 +3113,16 @@ fn interest_tick() {
         queue(
             DimId::Overworld,
             39,
-            (
+            eid,
+            x,
+            z,
+            SpawnDescriptor::Typed {
                 eid,
+                etype: 39,
                 x,
                 y,
                 z,
-                Box::new(move || vec![(0x01, spawn_typed_pkt(eid, 39, x, y, z))]),
-            ),
+            },
         );
     }
     for t in primed().lock().unwrap_or_else(|e| e.into_inner()).iter() {
@@ -2978,13 +3130,16 @@ fn interest_tick() {
         queue(
             DimId::Overworld,
             106,
-            (
+            eid,
+            x,
+            z,
+            SpawnDescriptor::Typed {
                 eid,
+                etype: 106,
                 x,
                 y,
                 z,
-                Box::new(move || vec![(0x01, spawn_entity_pkt(eid, 106, x, y, z, 0.0, 0.0, 0))]),
-            ),
+            },
         );
     }
     for f in falling().lock().unwrap_or_else(|e| e.into_inner()).iter() {
@@ -2992,13 +3147,16 @@ fn interest_tick() {
         queue(
             DimId::Overworld,
             name_to_etype("falling_block").unwrap(),
-            (
+            eid,
+            x,
+            z,
+            SpawnDescriptor::Falling {
                 eid,
+                state,
                 x,
                 y,
                 z,
-                Box::new(move || vec![(0x01, spawn_falling_pkt(eid, state, x, y, z))]),
-            ),
+            },
         );
     }
     for o in xps().lock().unwrap_or_else(|e| e.into_inner()).iter() {
@@ -3006,47 +3164,35 @@ fn interest_tick() {
         queue(
             DimId::Overworld,
             name_to_etype("experience_orb").unwrap(),
-            (
+            eid,
+            x,
+            z,
+            SpawnDescriptor::ExperienceOrb {
                 eid,
                 x,
                 y,
                 z,
-                Box::new(move || {
-                    let (id, body) = encode_play_add_experience_orb(eid, x, y, z, val);
-                    debug_assert_eq!(body, xp_orb_pkt(eid, x, y, z, val));
-                    vec![(id, body)]
-                }),
-            ),
+                val,
+            },
         );
     }
     // P2-3-S4: a player is only interested in players sharing their dimension. Two players
     // at the same coordinates in different worlds must not spawn for one another; on a
     // dimension switch the 0x42 removals below retire the old-world players.
     for o in cls.iter() {
-        let (dim, x, y, z, _, _) = client_dim_pos(o);
-        let o2 = o.clone();
+        let (dim, x, _, z, _, _) = client_dim_pos(o);
         queue(
             dim,
             PLAYER_ENTITY_TYPE,
-            (
-                o.eid,
-                x,
-                y,
-                z,
-                Box::new(move || {
-                    let mut packets = vec![(0x01, spawn_player(&o2))];
-                    // SetEquipment trails the spawn so an observer sees the
-                    // player's held item and armor from the first frame.
-                    if let Some(equipment) = player_equipment_packet(&o2) {
-                        packets.push((0x5b, equipment));
-                    }
-                    packets
-                }),
-            ),
+            o.eid,
+            x,
+            z,
+            SpawnDescriptor::Player(o.clone()),
         );
     }
+    let index = InterestChunkIndex::new(&ents);
     for client in &cls {
-        sync_entity_interest(client, &ents);
+        sync_entity_interest_indexed(client, &ents, &index);
     }
     dig_progress_tick(&cls);
     combat_tick(&cls);
@@ -3785,48 +3931,173 @@ fn live_mine_cut_all_apply(
     }
 }
 
-fn sync_entity_interest(client: &Client, entities: &[TrackedSpawn]) {
+fn interest_entity_eligible(
+    client: &Client,
+    entity: &TrackedSpawn,
+    dim: DimId,
+    player: (f64, f64),
+    player_chunk: (i32, i32),
+    view: i32,
+) -> bool {
+    if entity.eid == client.eid || entity.dim != dim {
+        return false;
+    }
+    // Integer chunk-gap rejection before the float distance check: two chunk
+    // cells `d` apart leave at least `16 * max(0, d - 1)` blocks between them
+    // on that axis, so an entity whose cells are more than `reach` effective
+    // chunk-gaps away can never satisfy `entity_in_tracking_range`.
+    let reach = i128::from(entity.range.min(view as u32));
+    let gx = (i128::from(entity.cx) - i128::from(player_chunk.0)).abs() - 1;
+    let gz = (i128::from(entity.cz) - i128::from(player_chunk.1)).abs() - 1;
+    let gx = gx.max(0);
+    let gz = gz.max(0);
+    if gx * gx + gz * gz > reach * reach {
+        return false;
+    }
+    entity_in_tracking_range(player, (entity.x, entity.z), entity.range, view)
+}
+
+fn sync_entity_interest_indexed(
+    client: &Client,
+    entities: &[TrackedSpawn],
+    index: &InterestChunkIndex,
+) {
+    INTEREST_SYNC_SCRATCH.with(|cell| {
+        sync_entity_interest_indexed_inner(client, entities, index, &mut cell.borrow_mut())
+    });
+}
+
+fn sync_entity_interest_indexed_inner(
+    client: &Client,
+    entities: &[TrackedSpawn],
+    index: &InterestChunkIndex,
+    scratch: &mut InterestSyncScratch,
+) {
+    scratch.eligible.clear();
+    scratch.removed.clear();
+    scratch.added.clear();
     let mut seen = client.seen.lock().unwrap_or_else(|e| e.into_inner());
+    if entities.is_empty() {
+        if seen.is_empty() {
+            return;
+        }
+        scratch.removed.extend(seen.iter().copied());
+        scratch.removed.sort_unstable();
+        let Ok(mut socket) = client.sock.lock() else {
+            return;
+        };
+        if send_packet(&mut socket, 0x42, remove_entities_payload(scratch.removed.as_slice()))
+            .is_err()
+        {
+            return;
+        }
+        for &eid in &scratch.removed {
+            seen.remove(&eid);
+        }
+        return;
+    }
     let chunks = client.chunks.lock().unwrap_or_else(|e| e.into_inner());
+    if chunks.is_empty() {
+        if seen.is_empty() {
+            return;
+        }
+        scratch.removed.extend(seen.iter().copied());
+        scratch.removed.sort_unstable();
+        let Ok(mut socket) = client.sock.lock() else {
+            return;
+        };
+        if send_packet(&mut socket, 0x42, remove_entities_payload(scratch.removed.as_slice()))
+            .is_err()
+        {
+            return;
+        }
+        for &eid in &scratch.removed {
+            seen.remove(&eid);
+        }
+        return;
+    }
     let (dim, px, _, pz, _, _) = client_dim_pos(client);
     let view = *client.view.lock().unwrap_or_else(|e| e.into_inner());
-    let mut eligible = HashMap::new();
-    for TrackedSpawn {
-        dim: entity_dim,
-        range,
-        job: (eid, x, _, z, spawn),
-    } in entities
-    {
-        if *eid != client.eid
-            && *entity_dim == dim
-            && entity_in_tracking_range((px, pz), (*x, *z), *range, view)
-            && chunks.contains(&(spatial_chunk_coord(*x), spatial_chunk_coord(*z)))
-        {
-            eligible.insert(*eid, spawn);
+    let player_chunk = (spatial_chunk_coord(px), spatial_chunk_coord(pz));
+    let entity_chunks = index.ranges.len();
+    let client_chunks = chunks.len();
+    if client_chunks <= entity_chunks {
+        for &(cx, cz) in chunks.iter() {
+            if let Some(&(start, end)) = index.ranges.get(&(dim, cx, cz)) {
+                for &entity_index in &index.order[start..end] {
+                    let entity = &entities[entity_index];
+                    if interest_entity_eligible(
+                        client,
+                        entity,
+                        dim,
+                        (px, pz),
+                        player_chunk,
+                        view,
+                    ) {
+                        scratch.eligible.push((entity.eid, entity_index));
+                    }
+                }
+            }
+        }
+    } else {
+        for (&(entity_dim, cx, cz), &(start, end)) in index.ranges.iter() {
+            if entity_dim != dim || !chunks.contains(&(cx, cz)) {
+                continue;
+            }
+            for &entity_index in &index.order[start..end] {
+                let entity = &entities[entity_index];
+                if interest_entity_eligible(
+                    client,
+                    entity,
+                    dim,
+                    (px, pz),
+                    player_chunk,
+                    view,
+                ) {
+                    scratch.eligible.push((entity.eid, entity_index));
+                }
+            }
         }
     }
-    let previous: Vec<_> = seen.iter().copied().collect();
-    let next: Vec<_> = eligible.keys().copied().collect();
-    let (added, _, removed) = compute_tracking_diff(&previous, &next);
-    if added.is_empty() && removed.is_empty() {
+    scratch
+        .eligible
+        .sort_unstable_by_key(|&(eid, _)| eid);
+    for &eid in seen.iter() {
+        if scratch
+            .eligible
+            .binary_search_by_key(&eid, |&(entity_eid, _)| entity_eid)
+            .is_err()
+        {
+            scratch.removed.push(eid);
+        }
+    }
+    scratch.removed.sort_unstable();
+    for &(eid, entity_index) in &scratch.eligible {
+        if !seen.contains(&eid) {
+            scratch.added.push((eid, entity_index));
+        }
+    }
+    if scratch.added.is_empty() && scratch.removed.is_empty() {
         return;
     }
     let Ok(mut socket) = client.sock.lock() else {
         return;
     };
-    if !removed.is_empty() {
-        if send_packet(&mut socket, 0x42, remove_entities_payload(&removed)).is_err() {
+    if !scratch.removed.is_empty() {
+        if send_packet(&mut socket, 0x42, remove_entities_payload(scratch.removed.as_slice()))
+            .is_err()
+        {
             return;
         }
-        for eid in removed {
+        for &eid in &scratch.removed {
             seen.remove(&eid);
         }
     }
-    for eid in added {
+    for &(eid, entity_index) in &scratch.added {
         // vanilla `ServerEntity.sendPairingData` wraps an entity's spawn
         // group (spawn + data + equipment) in a bundle so the client applies
         // the burst atomically.
-        let packets = eligible[&eid]();
+        let packets = entities[entity_index].spawn.packets();
         let bundled = packets.len() > 1;
         if bundled
             && send_packet(&mut socket, 0x00, encode_play_bundle_delimiter().1).is_err()
@@ -3848,6 +4119,12 @@ fn sync_entity_interest(client: &Client, entities: &[TrackedSpawn]) {
         }
         seen.insert(eid);
     }
+}
+
+#[cfg(test)]
+fn sync_entity_interest(client: &Client, entities: &[TrackedSpawn]) {
+    let index = InterestChunkIndex::new(entities);
+    sync_entity_interest_indexed(client, entities, &index);
 }
 
 fn remove_entities_payload(entities: &[i32]) -> Vec<u8> {
@@ -3887,6 +4164,11 @@ fn broadcast_chunk_dim_in<F: Fn(&Client) -> (i64, Vec<u8>)>(
 ) {
     let mut shared = None;
     for client in audience {
+        // Cheap dimension reject before the chunk/socket locks; the post-lock
+        // check below still guards a mid-broadcast dimension switch.
+        if *client.dim.lock().unwrap_or_else(|e| e.into_inner()) != dim {
+            continue;
+        }
         // Stream and unload take the chunk lock before the socket. Keep the
         // audience check in that order so a delta cannot follow an unload.
         let chunks = client.chunks.lock().unwrap_or_else(|e| e.into_inner());
@@ -3909,6 +4191,9 @@ fn broadcast_chunk_dim_packet(dim: DimId, cx: i32, cz: i32, id: i64, packet: &[u
     let audience = client_snapshot();
     let mut shared = None;
     for client in audience {
+        if *client.dim.lock().unwrap_or_else(|e| e.into_inner()) != dim {
+            continue;
+        }
         let chunks = client.chunks.lock().unwrap_or_else(|e| e.into_inner());
         if !chunks.contains(&(cx, cz)) {
             continue;
@@ -4030,20 +4315,6 @@ fn broadcast_near_packet(
 }
 
 // broadcast helpers return (packet_id, payload)
-
-fn spawn_arrow_pkt(a: &Arrow) -> Vec<u8> {
-    let mut p = Vec::new();
-    write_varint(&mut p, a.eid as i64);
-    p.extend_from_slice(&[0u8; 16]);
-    write_varint(&mut p, 4); // arrow
-    p.extend_from_slice(&a.x.to_be_bytes());
-    p.extend_from_slice(&a.y.to_be_bytes());
-    p.extend_from_slice(&a.z.to_be_bytes());
-    p.extend_from_slice(&[0u8; 3]);
-    write_varint(&mut p, 0);
-    p.extend_from_slice(&[0u8; 6]);
-    p
-}
 
 fn spawn_typed_pkt(eid: i32, etype: i64, x: f64, y: f64, z: f64) -> Vec<u8> {
     let mut p = Vec::new();
@@ -8539,9 +8810,8 @@ fn use_sign_item(
             inv.remove(&inv_slot);
         }
     }
-    broadcast_chunk_dim(dim, x.div_euclid(16), z.div_euclid(16), |_c| {
-        (0x07, sign_entity_pkt(dim, x, y, z))
-    });
+    let sign_pkt = sign_entity_pkt(dim, x, y, z);
+    broadcast_chunk_dim_packet(dim, x.div_euclid(16), z.div_euclid(16), 0x07, &sign_pkt);
     let _ = send_packet(&mut me.sock.lock().unwrap_or_else(|e| e.into_inner()), 0x05, ack(seq));
     true
 }
@@ -13616,9 +13886,14 @@ fn handle_inner(mut s: TcpStream, live_eid: Arc<AtomicI32>) {
                         .lock()
                         .unwrap_or_else(|e| e.into_inner())
                         .insert((dim, sx, sy, sz, front), lines.clone());
-                    broadcast_chunk_dim(dim, sx.div_euclid(16), sz.div_euclid(16), |_c| {
-                        (0x07, sign_entity_pkt(dim, sx, sy, sz))
-                    });
+                    let sign_pkt = sign_entity_pkt(dim, sx, sy, sz);
+                    broadcast_chunk_dim_packet(
+                        dim,
+                        sx.div_euclid(16),
+                        sz.div_euclid(16),
+                        0x07,
+                        &sign_pkt,
+                    );
                 }
             }
             0x32 => {
@@ -13752,9 +14027,7 @@ fn handle_inner(mut s: TcpStream, live_eid: Arc<AtomicI32>) {
                                 write_pos(&mut pkt, bx, by, bz);
                                 write_varint(&mut pkt, 14); // block entity type: beacon
                                 pkt.extend_from_slice(&nbt);
-                                broadcast_chunk_dim(bdim, bx >> 4, bz >> 4, |_c| {
-                                    (0x07, pkt.clone())
-                                });
+                                broadcast_chunk_dim_packet(bdim, bx >> 4, bz >> 4, 0x07, &pkt);
                                 held_slot_resync(&me);
                             }
                         }
@@ -16390,13 +16663,18 @@ mod connection_limits_wire_tests {
         let arrow = TrackedSpawn {
             dim: DimId::Overworld,
             range: entity_tracking_range(4),
-            job: (
+            eid,
+            x,
+            z,
+            cx: spatial_chunk_coord(x),
+            cz: spatial_chunk_coord(z),
+            spawn: SpawnDescriptor::Typed {
                 eid,
+                etype: 4,
                 x,
                 y,
                 z,
-                Box::new(move || vec![(0x01, spawn_typed_pkt(eid, 4, x, y, z))]),
-            ),
+            },
         };
         let entities = [arrow];
         sync_entity_interest(&client, &entities);
@@ -22875,5 +23153,170 @@ mod gap_s2c_18_tests {
         want.push(19);
         want.extend_from_slice(b"https://example.org");
         assert_eq!(payload, want);
+    }
+}
+
+#[cfg(test)]
+mod interest_sync_tests {
+    use super::*;
+
+    fn deadline() -> Instant {
+        Instant::now() + Duration::from_secs(2)
+    }
+
+    fn materializations() -> usize {
+        SPAWN_DESCRIPTOR_MATERIALIZATIONS.with(|count| count.get())
+    }
+
+    fn typed_entity(dim: DimId, eid: i32, x: f64, z: f64) -> TrackedSpawn {
+        TrackedSpawn {
+            dim,
+            range: 4,
+            eid,
+            x,
+            z,
+            cx: spatial_chunk_coord(x),
+            cz: spatial_chunk_coord(z),
+            spawn: SpawnDescriptor::Typed {
+                eid,
+                etype: 4,
+                x,
+                y: 70.0,
+                z,
+            },
+        }
+    }
+
+    fn tracked_client() -> (Arc<Client>, std::net::TcpStream) {
+        let (client, peer) = effect_tests::client_pair();
+        let client = Arc::new(client);
+        client.enter_play_wire(None, Default::default());
+        client
+            .chunks
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert((1, 0));
+        (client, peer)
+    }
+
+    #[test]
+    fn steady_state_tracking_materializes_no_spawn_packets() {
+        let (client, mut peer) = tracked_client();
+        let entities = [typed_entity(DimId::Overworld, 77, 16.0, 0.0)];
+        sync_entity_interest(&client, &entities);
+        assert_eq!(
+            read_packet(&mut peer, deadline()),
+            Some((0x01, spawn_typed_pkt(77, 4, 16.0, 70.0, 0.0)))
+        );
+        assert!(client
+            .seen
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .contains(&77));
+        let built = materializations();
+        assert_eq!(built, 1, "the entering entity materializes once");
+
+        sync_entity_interest(&client, &entities);
+        sync_entity_interest(&client, &entities);
+        assert_eq!(
+            materializations(),
+            built,
+            "steady-state ticks must not materialize spawn packets"
+        );
+        assert_eq!(read_packet(&mut peer, Instant::now()), None);
+        assert!(client
+            .seen
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .contains(&77));
+    }
+
+    #[test]
+    fn departing_entity_emits_exactly_one_despawn() {
+        let (client, mut peer) = tracked_client();
+        let entities = [typed_entity(DimId::Overworld, 77, 16.0, 0.0)];
+        sync_entity_interest(&client, &entities);
+        assert_eq!(
+            read_packet(&mut peer, deadline()),
+            Some((0x01, spawn_typed_pkt(77, 4, 16.0, 70.0, 0.0)))
+        );
+
+        let gone: [TrackedSpawn; 0] = [];
+        sync_entity_interest(&client, &gone);
+        assert_eq!(
+            read_packet(&mut peer, deadline()),
+            Some((0x42, vec![1, 77]))
+        );
+        assert!(!client
+            .seen
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .contains(&77));
+        assert_eq!(read_packet(&mut peer, Instant::now()), None);
+    }
+
+    #[test]
+    fn chunk_gap_prefilter_keeps_boundary_entities_in_range() {
+        let (client, mut peer) = tracked_client();
+        // The player stands at the far corner of chunk (0,0) while the entity
+        // sits in chunk (2,1): two cells over and one over, yet only ~16
+        // blocks away — well inside the 32-block view. The integer chunk-gap
+        // rejection must not drop it.
+        *client.pos.lock().unwrap_or_else(|e| e.into_inner()) =
+            (15.9, 70.0, 15.9, 0.0, 0.0, true);
+        client
+            .chunks
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clear();
+        client
+            .chunks
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert((2, 1));
+        let entities = [typed_entity(DimId::Overworld, 77, 32.1, 16.1)];
+        sync_entity_interest(&client, &entities);
+        assert_eq!(
+            read_packet(&mut peer, deadline()),
+            Some((0x01, spawn_typed_pkt(77, 4, 32.1, 70.0, 16.1))),
+            "an entity across touching chunk cells stays trackable"
+        );
+    }
+
+    #[test]
+    fn dimension_switch_despawns_and_retracks_in_the_new_dimension() {
+        let (client, mut peer) = tracked_client();
+        let overworld = [typed_entity(DimId::Overworld, 77, 16.0, 0.0)];
+        sync_entity_interest(&client, &overworld);
+        assert_eq!(
+            read_packet(&mut peer, deadline()),
+            Some((0x01, spawn_typed_pkt(77, 4, 16.0, 70.0, 0.0)))
+        );
+
+        *client.dim.lock().unwrap_or_else(|e| e.into_inner()) = DimId::Nether;
+        sync_entity_interest(&client, &overworld);
+        assert_eq!(
+            read_packet(&mut peer, deadline()),
+            Some((0x42, vec![1, 77])),
+            "leaving the dimension must despawn the old-world entity"
+        );
+        assert!(!client
+            .seen
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .contains(&77));
+
+        let nether = [typed_entity(DimId::Nether, 77, 16.0, 0.0)];
+        sync_entity_interest(&client, &nether);
+        assert_eq!(
+            read_packet(&mut peer, deadline()),
+            Some((0x01, spawn_typed_pkt(77, 4, 16.0, 70.0, 0.0))),
+            "the same entity id re-tracks cleanly in the new dimension"
+        );
+        assert!(client
+            .seen
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .contains(&77));
     }
 }
