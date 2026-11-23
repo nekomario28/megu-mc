@@ -60,6 +60,15 @@ FACTORY_RS = "create-adapter/src/factory.rs"
 GZIP_RS = "client-kernel/src/gzip.rs"
 PACK_LOADER_RS = "server-files/src/pack_loader.rs"
 ANVIL_INSPECT_RS = "state-store/src/anvil_inspect.rs"
+VISIBILITY_RS = "client-port/src/visibility.rs"
+PNG_DECODE_RS = "client-port/src/png_decode.rs"
+INFLATE_RS = "client-port/src/inflate.rs"
+PALETTED_RS = "src/paletted.rs"
+LIGHTING_RS = "src/lighting.rs"
+ENTITY_SPATIAL_RS = "src/entity_spatial.rs"
+SERVER_RELIABILITY_RS = "src/server_reliability.rs"
+MENUS_AND_ITEMS_RS = "src/menus_and_items.rs"
+COMBAT_AND_HEALTH_RS = "src/combat_and_health.rs"
 
 # ---------------------------------------------------------------------------
 # Rust source masking — mirrors tools/client_vertical_wiring_audit.py so
@@ -476,6 +485,23 @@ CHECKS = [
      "summary": "Binary Greedy Meshing 4-strip bitboard packing live",
      "file": MESH_RS,
      "requirements": [_call("pack_strips4")]},
+    # -- client-port SIMD/math kernels ------------------------------------
+    {"id": "opt-visibility-non-air-bitmask",
+     "summary": "visibility graph packs closed cells via build_non_air_bitmask_64",
+     "file": VISIBILITY_RS,
+     "requirements": [_call("build_non_air_bitmask_64")]},
+    {"id": "opt-png-palette-4bit-unpack",
+     "summary": "PNG indexed decode uses unpack_palette_4bit_to_u16",
+     "file": PNG_DECODE_RS,
+     "requirements": [_call("unpack_palette_4bit_to_u16")]},
+    {"id": "opt-mesh-light-merge-adaptive",
+     "summary": "mesher merges block/sky nibbles via max_nibble_arrays_adaptive",
+     "file": MESH_RS,
+     "requirements": [_call("max_nibble_arrays_adaptive")]},
+    {"id": "opt-client-port-zlib-consumed-inflate",
+     "summary": "client-port zlib wrapper uses inflate_raw_rfc1951_with_consumed",
+     "file": INFLATE_RS,
+     "requirements": [_call("inflate_raw_rfc1951_with_consumed")]},
     {"id": "opt-simd-guard-simd-voxel",
      "summary": "core/src/simd_voxel.rs target_feature kernels all guarded",
      "file": SIMD_VOXEL_RS,
@@ -544,6 +570,14 @@ CHECKS = [
          _call("unpack_albedo_unorm8x4"),
          _c(r"size_of\s*::<\s*TerrainVertex\s*>\s*\(\s*\)\s*==\s*32"),
      ]},
+    # -- Wave 6 client GPU compact stream + CPU RAM drop -----------------
+    {"id": "opt-wave6-compact-vertex-ram-drop",
+     "summary": "12B CompactVoxelVertex stream + cpu_mesh_bytes_freed telemetry",
+     "file": RENDERER_RS,
+     "requirements": [
+         _c(r"\bCompactVoxelVertex\b"),
+         _c(r"\bcpu_mesh_bytes_freed\b"),
+     ]},
     # -- Client math / feedback wiring (L7) -------------------------------
     {"id": "opt-kernel-challenger-probe",
      "summary": "KernelAutotuner challenger probing (dispatch_kernel_mode)",
@@ -608,6 +642,45 @@ CHECKS = [
          _call("live_scaled_tick_budget"),
          _call("live_server_budget_scale"),
      ]},
+    # -- L6 canonical server bits / light / Morton / CRC ---------------
+    {"id": "opt-paletted-core-bits",
+     "summary": "paletted section storage uses megu_core::bits primitives",
+     "file": PALETTED_RS,
+     "requirements": [_c(r"megu_core::bits::")]},
+    {"id": "opt-lighting-morton-lightarray",
+     "summary": "lighting patch order + packed sections use Morton/LightArray",
+     "file": LIGHTING_RS,
+     "requirements": [
+         _call("morton3_encode_u4"),
+         _c(r"megu_core::bits::"),
+     ]},
+    {"id": "opt-entity-spatial-bitmask-morton",
+     "summary": "entity spatial index uses bitmask occupancy + Morton order",
+     "file": ENTITY_SPATIAL_RS,
+     "requirements": [
+         _call("build_non_air_bitmask_64"),
+         _call("morton2_encode_i16"),
+     ]},
+    {"id": "opt-server-reliability-core-crc32",
+     "summary": "delta WAL frames use canonical crc32_ieee_update",
+     "file": SERVER_RELIABILITY_RS,
+     "requirements": [
+         _call("crc32_ieee_update"),
+         _call("crc32_ieee_parts"),
+     ]},
+    # -- Stage 2 sleeping furnaces / live Mixin dispatch ------------------
+    {"id": "opt-stage2-furnace-due-queue",
+     "summary": "furnaces sleep in FURNACE_DUE_QUEUE behind wake_furnace_at",
+     "file": MENUS_AND_ITEMS_RS,
+     "requirements": [
+         _c(r"\bFURNACE_DUE_QUEUE\b"),
+         _c(r"\bfn\s+wake_furnace_at\b"),
+         _call("furnace_due_queue"),
+     ]},
+    {"id": "opt-live-mod-entity-damage-pre",
+     "summary": "combat damage paths dispatch live_mod_entity_damage_pre",
+     "file": COMBAT_AND_HEALTH_RS,
+     "requirements": [_call("live_mod_entity_damage_pre")]},
     # -- Canonical DoS-proof NBT wire skipper ------------------------------
     {"id": "opt-nbt-wire-skip-play",
      "summary": "play_protocol NBT skipping delegates to megu_core::nbt_wire",

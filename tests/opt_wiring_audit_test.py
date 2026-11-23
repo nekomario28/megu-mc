@@ -42,6 +42,12 @@ fn drive(live: &mut Live, r: &mut R, u: &mut U) {
 """
 
 RENDERER = """\
+use megu_client_mesh::compact_vertex::CompactVoxelVertex;
+
+struct UploadStats {
+    cpu_mesh_bytes_freed: u64,
+}
+
 fn cull() {
     megu_core::simd_voxel::batch_aabb_frustum_cull_soa(a, b, c);
 }
@@ -114,6 +120,18 @@ fn pack_strips4(rows: &[u16], base: usize) -> u64 {
 const AO_LUT: [u16; 256] = [0; 256];
 unsafe fn shade_fast(idx: usize) -> u16 {
     AO_LUT[idx]
+}
+fn fill_light_rows(
+    block_light: &[u8; 4096],
+    sky_light: &[u8; 4096],
+    strategy: &megu_core::hw_adaptive_engine::ComputeStrategy,
+) -> usize {
+    megu_core::hw_adaptive_engine::max_nibble_arrays_adaptive(
+        block_light,
+        sky_light,
+        strategy,
+    )
+    .len()
 }
 fn mesher(rows: &[u16]) -> u64 {
     pack_strips4(rows, 0) + unsafe { shade_fast(0) } as u64
@@ -399,6 +417,105 @@ impl CreateFactory {
 }
 """
 
+VISIBILITY = """\
+fn closed_cell_mask(states: &[u16; 64]) -> u64 {
+    megu_core::simd_voxel::build_non_air_bitmask_64(states)
+}
+"""
+
+PNG_DECODE = """\
+fn unpack_indexed_row(
+    packed_words: &[u64],
+    palette: &[u16; 16],
+    idx16: &mut [u16],
+) {
+    megu_core::simd_voxel::unpack_palette_4bit_to_u16(packed_words, palette, idx16);
+}
+"""
+
+PALETTED = """\
+fn palette_words(values: &[u16], bits: u8) -> Vec<u64> {
+    megu_core::bits::pack_from_u16(values, bits)
+}
+fn palette_indices(words: &[u64], bits: u8) -> Vec<u16> {
+    let mut out = vec![0u16; 4096];
+    megu_core::bits::unpack_to_u16(words, bits, 4096, &mut out);
+    out
+}
+"""
+
+LIGHTING = """\
+fn patch_morton_key(x: u8, y: u8, z: u8) -> u32 {
+    megu_core::morton::morton3_encode_u4(x, y, z)
+}
+fn empty_light_section() -> megu_core::bits::LightArray {
+    megu_core::bits::LightArray::new_zero()
+}
+"""
+
+ENTITY_SPATIAL = """\
+fn occupancy_word(states: &[u16; 64]) -> u64 {
+    megu_core::simd_voxel::build_non_air_bitmask_64(states)
+}
+fn chunk_order_key(cx: i16, cz: i16) -> u32 {
+    megu_core::morton::morton2_encode_i16(cx, cz)
+}
+"""
+
+SERVER_RELIABILITY = """\
+fn crc32_ieee_parts(parts: &[&[u8]]) -> u32 {
+    parts.iter().fold(0u32, |crc, part| {
+        megu_core::hash::crc32_ieee_update(crc, part)
+    })
+}
+fn write_frame(payload: &[u8]) -> Vec<u8> {
+    let mut out = Vec::new();
+    out.extend_from_slice(payload);
+    let crc = crc32_ieee_parts(&[&out]);
+    out.extend_from_slice(&crc.to_be_bytes());
+    out
+}
+"""
+
+MENUS_AND_ITEMS = """\
+use std::sync::{Mutex, OnceLock};
+
+struct DimBlockPos;
+struct DueMachineQueue;
+impl DueMachineQueue {
+    fn drain_due_into(&mut self, _now: u64, _due: &mut Vec<DimBlockPos>) {}
+    fn schedule_due(&mut self, _pos: DimBlockPos, _at: u64) {}
+    fn wake(&mut self, _pos: DimBlockPos, _at: u64) {}
+}
+
+static FURNACE_DUE_QUEUE: OnceLock<Mutex<DueMachineQueue>> = OnceLock::new();
+fn furnace_due_queue() -> &'static Mutex<DueMachineQueue> {
+    FURNACE_DUE_QUEUE.get_or_init(|| Mutex::new(DueMachineQueue))
+}
+fn wake_furnace_at(_dim: u8, _x: i32, _y: i32, _z: i32) {
+    furnace_due_queue()
+        .lock()
+        .unwrap()
+        .wake(DimBlockPos, 0);
+}
+fn furnace_tick() {
+    let mut due = Vec::new();
+    furnace_due_queue()
+        .lock()
+        .unwrap()
+        .drain_due_into(0, &mut due);
+}
+"""
+
+COMBAT_AND_HEALTH = """\
+fn deal_damage(damage: f32) -> bool {
+    let Some(damage) = live_mod_entity_damage_pre(damage) else {
+        return false;
+    };
+    damage > 0.0
+}
+"""
+
 
 def make_root(root):
     put(root, "client-gpu/src/window.rs", WINDOW)
@@ -406,6 +523,9 @@ def make_root(root):
     put(root, "client-gpu/src/live_session.rs", LIVE_SESSION)
     put(root, "client-gpu/src/subworld_render.rs", SUBWORLD_RENDER)
     put(root, "client-port/src/mesh.rs", MESH)
+    put(root, "client-port/src/visibility.rs", VISIBILITY)
+    put(root, "client-port/src/png_decode.rs", PNG_DECODE)
+    put(root, "client-port/src/inflate.rs", INFLATE_CALLER)
     put(root, "core/src/simd_voxel.rs", SIMD_FILE)
     put(root, "src/worldgen.rs", WORLDGEN)
     put(root, "src/generation_math.rs", SIMD_FILE)
@@ -413,6 +533,12 @@ def make_root(root):
     put(root, "src/main.rs", MAIN)
     put(root, "src/connection_limits.rs", CONNECTION_LIMITS)
     put(root, "src/live_mod_bridge.rs", LIVE_MOD_BRIDGE)
+    put(root, "src/paletted.rs", PALETTED)
+    put(root, "src/lighting.rs", LIGHTING)
+    put(root, "src/entity_spatial.rs", ENTITY_SPATIAL)
+    put(root, "src/server_reliability.rs", SERVER_RELIABILITY)
+    put(root, "src/menus_and_items.rs", MENUS_AND_ITEMS)
+    put(root, "src/combat_and_health.rs", COMBAT_AND_HEALTH)
     put(root, "proto/src/wire.rs", NBT_SKIP_CALLER)
     put(root, "state-store/src/world_interop.rs", NBT_SKIP_CALLER)
     put(root, "mod-offload/src/region_scheduler.rs", REGION_SCHEDULER)
@@ -436,7 +562,7 @@ class FixtureTests(unittest.TestCase):
             make_root(root)
             result = run(root)
             self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
-            self.assertIn("44/44 invariants wired", result.stdout)
+            self.assertIn("55/55 invariants wired", result.stdout)
 
     def test_call_moved_into_cfg_test_fails(self):
         """apply_compute_strategy surviving only under #[cfg(test)] must FAIL."""
@@ -703,6 +829,36 @@ fn wire_consumer(body: &[u8]) {
             ok, _ = check_status(root, "opt-nbt-wire-skip-play")
             self.assertFalse(ok)
 
+    def test_furnace_due_queue_removed_fails(self):
+        """Deleting FURNACE_DUE_QUEUE must FAIL the Stage 2 furnace gate."""
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            make_root(root)
+            put(
+                root,
+                "src/menus_and_items.rs",
+                MENUS_AND_ITEMS.replace("FURNACE_DUE_QUEUE", "FURNACE_TIMER_HEAP"),
+            )
+            ok, result = check_status(root, "opt-stage2-furnace-due-queue")
+            self.assertFalse(ok)
+            self.assertEqual(result.returncode, 1)
+
+    def test_compact_voxel_vertex_removed_fails(self):
+        """Dropping CompactVoxelVertex/cpu_mesh_bytes_freed must FAIL Wave 6."""
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            make_root(root)
+            put(
+                root,
+                "client-gpu/src/renderer.rs",
+                RENDERER.replace("CompactVoxelVertex", "PackedVoxelVertex").replace(
+                    "cpu_mesh_bytes_freed", "cpu_mesh_bytes_before"
+                ),
+            )
+            ok, result = check_status(root, "opt-wave6-compact-vertex-ram-drop")
+            self.assertFalse(ok)
+            self.assertEqual(result.returncode, 1)
+
 
 class RealRepoTests(unittest.TestCase):
     def test_real_repository_passes_100_percent(self):
@@ -711,7 +867,7 @@ class RealRepoTests(unittest.TestCase):
             text=True, capture_output=True, check=False, timeout=120,
             cwd=ROOT)
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
-        self.assertIn("44/44 invariants wired", result.stdout)
+        self.assertIn("55/55 invariants wired", result.stdout)
 
     def test_json_report_covers_every_check(self):
         result = subprocess.run(
@@ -721,7 +877,7 @@ class RealRepoTests(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stderr)
         data = json.loads(result.stdout)
         self.assertEqual(data["failed"], 0)
-        self.assertEqual(data["passed"], 44)
+        self.assertEqual(data["passed"], 55)
         for check_id, entry in data["checks"].items():
             with self.subTest(check=check_id):
                 self.assertTrue(entry["ok"], entry["detail"])

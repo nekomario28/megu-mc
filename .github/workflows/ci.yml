@@ -162,8 +162,12 @@ jobs:
             --server-bin target/debug/megu
           # Real-client multiplayer soak: four megu-client bots decode chunks and
           # move concurrently; fail-closed on any client crash/decode error.
-          timeout 300 python3 tests/multiplayer_stress_wire.py target/debug/megu \
-            --clients 4 --client-bin client-app/target/debug/megu-client
+          if [ ! -f assets/block_states_1211.json ] || [ ! -d datapacks/vanilla ]; then
+            echo "::notice::Skipping Mojang-fixture multiplayer_stress_wire.py on the public clean-room checkout (assets/*_1211* and datapacks/vanilla are generated from the pinned jar and excluded from public git)."
+          else
+            timeout 300 python3 tests/multiplayer_stress_wire.py target/debug/megu \
+              --clients 4 --client-bin client-app/target/debug/megu-client
+          fi
 
   # Separate from the suite on purpose: a green suite is not evidence that a gate works. This job
   # breaks each pinned implementation and requires the named test to go red, so a test that can no
