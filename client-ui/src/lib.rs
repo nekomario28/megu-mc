@@ -38,6 +38,7 @@ pub mod font_cjk;
 pub mod hud_widgets;
 pub mod layout;
 pub mod magic_hud;
+pub mod mod_i18n;
 pub mod mod_menu;
 pub mod recipe_browser;
 pub mod shader_screen;

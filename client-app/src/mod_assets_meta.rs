@@ -1,0 +1,605 @@
+// SPDX-License-Identifier: LGPL-3.0-or-later OR GPL-3.0-or-later OR AGPL-3.0-or-later
+//! Bounded, client-side mod translations, item icons, and dynamic registry IDs.
+
+use std::collections::BTreeMap;
+use std::fs;
+use std::path::{Path, PathBuf};
+
+const MAX_ARCHIVES: usize = 256;
+const MAX_LANG_BYTES: usize = 1024 * 1024;
+const MAX_ICON_BYTES: usize = 16 * 1024 * 1024;
+const MAX_INDEXED_ASSETS: usize = 65_535;
+const MAX_MRS_BYTES: usize = 8 * 1024 * 1024;
+const MAX_MRS_ROWS: usize = 131_072;
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct ModMetaReport {
+    pub warnings: Vec<String>,
+}
+
+#[derive(Clone, Debug, Default)]
+pub struct ModTranslationTable {
+    locale: String,
+    translated: BTreeMap<String, String>,
+    english: BTreeMap<String, String>,
+}
+
+impl ModTranslationTable {
+    pub fn load(game_dir: &Path, locale: &str, report: &mut ModMetaReport) -> Self {
+        let locale = normalize_locale(locale);
+        let mut table = Self {
+            locale: locale.clone(),
+            ..Self::default()
+        };
+        let jars = sorted_jars(game_dir, report);
+        for jar in jars {
+            let archive = match crate::zip_entries::ZipArchive::open(&jar) {
+                Ok(archive) => archive,
+                Err(error) => {
+                    report.warnings.push(error);
+                    continue;
+                }
+            };
+            for name in archive
+                .entry_names()
+                .filter(|name| is_lang_path(name, &locale))
+                .map(str::to_owned)
+            {
+                let bytes = match archive.read_entry(&name, MAX_LANG_BYTES) {
+                    Ok(Some(bytes)) => bytes,
+                    Ok(None) => continue,
+                    Err(error) => {
+                        report.warnings.push(format!("{}: {error}", jar.display()));
+                        continue;
+                    }
+                };
+                let parsed = match parse_flat_json(&bytes) {
+                    Ok(parsed) => parsed,
+                    Err(error) => {
+                        report
+                            .warnings
+                            .push(format!("{}:{name}: {error}", jar.display()));
+                        continue;
+                    }
+                };
+                let target = if name.ends_with("/en_us.json") {
+                    &mut table.english
+                } else {
+                    &mut table.translated
+                };
+                for (key, value) in parsed {
+                    target.entry(key).or_insert(value);
+                }
+            }
+        }
+        table
+    }
+
+    pub fn translate_block(&self, namespaced_id: &str) -> String {
+        self.translate("block", namespaced_id)
+    }
+
+    pub fn translate_item(&self, namespaced_id: &str) -> String {
+        self.translate("item", namespaced_id)
+    }
+
+    fn translate(&self, kind: &str, id: &str) -> String {
+        let key = format!("{kind}.{}", id.replace(':', "."));
+        self.translated
+            .get(&key)
+            .or_else(|| self.english.get(&key))
+            .cloned()
+            .unwrap_or_else(|| humanize_id(id))
+    }
+
+    pub fn locale(&self) -> &str {
+        &self.locale
+    }
+}
+
+fn normalize_locale(locale: &str) -> String {
+    locale.trim().replace('-', "_").to_ascii_lowercase()
+}
+
+fn is_lang_path(name: &str, locale: &str) -> bool {
+    let parts: Vec<_> = name.split('/').collect();
+    parts.len() == 4
+        && parts[0] == "assets"
+        && parts[1].len() <= 64
+        && parts[1]
+            .chars()
+            .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_' || c == '-')
+        && parts[2] == "lang"
+        && (parts[3] == "en_us.json" || parts[3] == format!("{locale}.json"))
+}
+
+fn sorted_jars(game_dir: &Path, report: &mut ModMetaReport) -> Vec<PathBuf> {
+    let dir = game_dir.join("mods");
+    let mut jars = match fs::read_dir(&dir) {
+        Ok(entries) => entries
+            .filter_map(Result::ok)
+            .map(|e| e.path())
+            .filter(|p| p.extension().is_some_and(|x| x.eq_ignore_ascii_case("jar")))
+            .collect::<Vec<_>>(),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Vec::new(),
+        Err(error) => {
+            report.warnings.push(format!("{}: {error}", dir.display()));
+            Vec::new()
+        }
+    };
+    jars.sort_by(|a, b| a.file_name().cmp(&b.file_name()));
+    if jars.len() > MAX_ARCHIVES {
+        report.warnings.push(format!(
+            "mod archive count exceeds {MAX_ARCHIVES}; excess archives ignored"
+        ));
+        jars.truncate(MAX_ARCHIVES);
+    }
+    jars
+}
+
+fn humanize_id(id: &str) -> String {
+    let tail = id.split_once(':').map_or(id, |(_, tail)| tail);
+    let words = tail.replace(['_', '-'], " ");
+    let mut out = String::new();
+    let mut start = true;
+    for ch in words.chars() {
+        if ch.is_whitespace() {
+            start = true;
+            out.push(ch);
+        } else if start {
+            out.extend(ch.to_uppercase());
+            start = false;
+        } else {
+            out.push(ch);
+        }
+    }
+    out
+}
+
+#[derive(Clone, Debug, Default)]
+pub struct ModItemIconIndex {
+    icons: BTreeMap<String, (PathBuf, String)>,
+}
+
+impl ModItemIconIndex {
+    pub fn load(game_dir: &Path, report: &mut ModMetaReport) -> Self {
+        let mut index = Self::default();
+        for jar in sorted_jars(game_dir, report) {
+            let archive = match crate::zip_entries::ZipArchive::open(&jar) {
+                Ok(a) => a,
+                Err(e) => {
+                    report.warnings.push(e);
+                    continue;
+                }
+            };
+            for entry in archive.entry_names() {
+                if let Some(id) = icon_id(entry) {
+                    if index.icons.len() >= MAX_INDEXED_ASSETS {
+                        report
+                            .warnings
+                            .push("mod icon index entry budget exceeded".into());
+                        return index;
+                    }
+                    index
+                        .icons
+                        .entry(id)
+                        .or_insert_with(|| (jar.clone(), entry.to_owned()));
+                }
+            }
+        }
+        index
+    }
+    pub fn icon_bytes(&self, namespaced_id: &str) -> Result<Option<Vec<u8>>, String> {
+        let Some((jar, entry)) = self.icons.get(namespaced_id) else {
+            return Ok(None);
+        };
+        crate::zip_entries::ZipArchive::open(jar)?.read_entry(entry, MAX_ICON_BYTES)
+    }
+    pub fn len(&self) -> usize {
+        self.icons.len()
+    }
+    pub fn is_empty(&self) -> bool {
+        self.icons.is_empty()
+    }
+}
+
+fn icon_id(path: &str) -> Option<String> {
+    let parts: Vec<_> = path.split('/').collect();
+    if parts.len() >= 5
+        && parts[0] == "assets"
+        && parts[2] == "textures"
+        && parts[3] == "item"
+        && parts.last()?.ends_with(".png")
+    {
+        let id = parts[4..].join("/");
+        Some(format!("{}:{}", parts[1], id.trim_end_matches(".png")))
+    } else {
+        None
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ModBlockState {
+    pub name: String,
+    pub properties: BTreeMap<String, String>,
+}
+
+#[derive(Clone, Debug, Default)]
+pub struct ClientModRegistry {
+    pub base_block_state_id: u32,
+    pub base_item_id: u32,
+    blocks: Vec<ModBlockState>,
+    items: Vec<String>,
+}
+
+impl ClientModRegistry {
+    /// Decode MRS1: magic, version u16, bases u32/u32, block count u32, then
+    /// each block as UTF-8 name, u16 property count and UTF-8 key/value pairs;
+    /// item count u32 followed by UTF-8 names. Strings use u16 byte lengths.
+    pub fn decode_mrs1_frame(frame: &[u8]) -> Result<Self, String> {
+        if frame.len() > MAX_MRS_BYTES {
+            return Err("MRS1 frame exceeds byte budget".into());
+        }
+        let mut r = Reader {
+            bytes: frame,
+            pos: 0,
+        };
+        if r.take(4)? != b"MRS1" {
+            return Err("invalid MRS1 magic".into());
+        }
+        if r.u16()? != 1 {
+            return Err("unsupported MRS1 version".into());
+        }
+        let base_block_state_id = r.u32()?;
+        let base_item_id = r.u32()?;
+        let block_count = r.count()?;
+        let mut blocks = Vec::with_capacity(block_count);
+        for _ in 0..block_count {
+            let name = r.string()?;
+            let property_count = usize::from(r.u16()?);
+            if property_count > 4096 {
+                return Err("MRS1 property budget exceeded".into());
+            }
+            let mut properties = BTreeMap::new();
+            for _ in 0..property_count {
+                let k = r.string()?;
+                let v = r.string()?;
+                if properties.insert(k, v).is_some() {
+                    return Err("duplicate MRS1 property".into());
+                }
+            }
+            blocks.push(ModBlockState { name, properties });
+        }
+        let item_count = r.count()?;
+        let mut items = Vec::with_capacity(item_count);
+        for _ in 0..item_count {
+            items.push(r.string()?);
+        }
+        if r.pos != frame.len() {
+            return Err("trailing bytes in MRS1 frame".into());
+        }
+        Ok(Self {
+            base_block_state_id,
+            base_item_id,
+            blocks,
+            items,
+        })
+    }
+    pub fn block_state_name(&self, id: u32) -> Option<&str> {
+        id.checked_sub(self.base_block_state_id)
+            .and_then(|n| self.blocks.get(n as usize))
+            .map(|b| b.name.as_str())
+    }
+    pub fn block_state(&self, id: u32) -> Option<&ModBlockState> {
+        id.checked_sub(self.base_block_state_id)
+            .and_then(|n| self.blocks.get(n as usize))
+    }
+    pub fn item_name(&self, id: u32) -> Option<&str> {
+        id.checked_sub(self.base_item_id)
+            .and_then(|n| self.items.get(n as usize))
+            .map(String::as_str)
+    }
+}
+
+pub fn decode_mrs1_frame(frame: &[u8]) -> Result<ClientModRegistry, String> {
+    ClientModRegistry::decode_mrs1_frame(frame)
+}
+
+struct Reader<'a> {
+    bytes: &'a [u8],
+    pos: usize,
+}
+impl<'a> Reader<'a> {
+    fn take(&mut self, n: usize) -> Result<&'a [u8], String> {
+        let end = self.pos.checked_add(n).ok_or("MRS1 offset overflow")?;
+        let out = self
+            .bytes
+            .get(self.pos..end)
+            .ok_or("truncated MRS1 frame")?;
+        self.pos = end;
+        Ok(out)
+    }
+    fn u16(&mut self) -> Result<u16, String> {
+        Ok(u16::from_be_bytes(
+            self.take(2)?.try_into().map_err(|_| "truncated u16")?,
+        ))
+    }
+    fn u32(&mut self) -> Result<u32, String> {
+        Ok(u32::from_be_bytes(
+            self.take(4)?.try_into().map_err(|_| "truncated u32")?,
+        ))
+    }
+    fn count(&mut self) -> Result<usize, String> {
+        let n = self.u32()? as usize;
+        if n > MAX_MRS_ROWS {
+            return Err("MRS1 row budget exceeded".into());
+        }
+        Ok(n)
+    }
+    fn string(&mut self) -> Result<String, String> {
+        let n = usize::from(self.u16()?);
+        let s = std::str::from_utf8(self.take(n)?).map_err(|_| "invalid MRS1 UTF-8")?;
+        if s.is_empty() || s.len() > 512 {
+            return Err("invalid MRS1 string length".into());
+        }
+        Ok(s.to_owned())
+    }
+}
+
+fn parse_flat_json(bytes: &[u8]) -> Result<BTreeMap<String, String>, &'static str> {
+    let s = std::str::from_utf8(bytes).map_err(|_| "invalid UTF-8")?;
+    let mut p = Json { s, i: 0 };
+    p.ws();
+    p.expect('{')?;
+    p.ws();
+    let mut map = BTreeMap::new();
+    if p.peek() == Some('}') {
+        p.i += 1;
+    } else {
+        loop {
+            let k = p.string()?;
+            p.ws();
+            p.expect(':')?;
+            p.ws();
+            let v = p.string()?;
+            if k.is_empty() || v.is_empty() || map.insert(k, v).is_some() {
+                return Err("invalid or duplicate translation");
+            };
+            p.ws();
+            match p.peek() {
+                Some(',') => {
+                    p.i += 1;
+                    p.ws()
+                }
+                Some('}') => {
+                    p.i += 1;
+                    break;
+                }
+                _ => return Err("invalid JSON object"),
+            }
+        }
+    }
+    p.ws();
+    if p.i == s.len() {
+        Ok(map)
+    } else {
+        Err("trailing JSON content")
+    }
+}
+struct Json<'a> {
+    s: &'a str,
+    i: usize,
+}
+impl Json<'_> {
+    fn peek(&self) -> Option<char> {
+        self.s[self.i..].chars().next()
+    }
+    fn ws(&mut self) {
+        while self.peek().is_some_and(char::is_whitespace) {
+            self.i += self.peek().unwrap_or(' ').len_utf8()
+        }
+    }
+    fn expect(&mut self, c: char) -> Result<(), &'static str> {
+        if self.peek() == Some(c) {
+            self.i += c.len_utf8();
+            Ok(())
+        } else {
+            Err("invalid JSON syntax")
+        }
+    }
+    fn string(&mut self) -> Result<String, &'static str> {
+        self.expect('"')?;
+        let mut o = String::new();
+        loop {
+            let c = self.peek().ok_or("unterminated JSON string")?;
+            self.i += c.len_utf8();
+            match c {
+                '"' => return Ok(o),
+                '\\' => {
+                    let e = self.peek().ok_or("invalid JSON escape")?;
+                    self.i += e.len_utf8();
+                    let decoded = match e {
+                        '"' => '"',
+                        '\\' => '\\',
+                        '/' => '/',
+                        'b' => '\u{8}',
+                        'f' => '\u{c}',
+                        'n' => '\n',
+                        'r' => '\r',
+                        't' => '\t',
+                        'u' => {
+                            let first = self.hex4()?;
+                            let scalar = if (0xd800..=0xdbff).contains(&first) {
+                                self.expect('\\')?;
+                                self.expect('u')?;
+                                let second = self.hex4()?;
+                                if !(0xdc00..=0xdfff).contains(&second) {
+                                    return Err("invalid JSON surrogate pair");
+                                }
+                                0x10000 + ((u32::from(first) - 0xd800) << 10) + u32::from(second)
+                                    - 0xdc00
+                            } else {
+                                u32::from(first)
+                            };
+                            o.push(char::from_u32(scalar).ok_or("invalid JSON unicode escape")?);
+                            continue;
+                        }
+                        _ => return Err("invalid JSON escape"),
+                    };
+                    o.push(decoded);
+                }
+                c if c.is_control() => return Err("control character in JSON string"),
+                _ => o.push(c),
+            }
+        }
+    }
+
+    fn hex4(&mut self) -> Result<u16, &'static str> {
+        let mut value = 0u16;
+        for _ in 0..4 {
+            let c = self.peek().ok_or("truncated JSON unicode escape")?;
+            self.i += c.len_utf8();
+            value = (value << 4) | c.to_digit(16).ok_or("invalid JSON unicode escape")? as u16;
+        }
+        Ok(value)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::{Seek, Write};
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    static NEXT: AtomicUsize = AtomicUsize::new(0);
+
+    fn temporary_game_dir() -> PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "megu-mod-meta-{}-{}",
+            std::process::id(),
+            NEXT.fetch_add(1, Ordering::Relaxed)
+        ));
+        fs::create_dir_all(dir.join("mods")).expect("create temp mod dir");
+        dir
+    }
+
+    fn write_jar(path: &Path, entries: &[(&str, &[u8])]) {
+        let mut file = fs::File::create(path).expect("create jar");
+        let mut central = Vec::new();
+        for (name, data) in entries {
+            let offset = file.stream_position().expect("position") as u32;
+            let name_bytes = name.as_bytes();
+            let crc = crate::zip_entries::crc32(data);
+            let mut local = Vec::new();
+            local.extend_from_slice(&0x0403_4b50u32.to_le_bytes());
+            local.extend_from_slice(&20u16.to_le_bytes());
+            local.extend_from_slice(&0u16.to_le_bytes());
+            local.extend_from_slice(&0u16.to_le_bytes());
+            local.extend_from_slice(&[0; 4]);
+            local.extend_from_slice(&crc.to_le_bytes());
+            local.extend_from_slice(&(data.len() as u32).to_le_bytes());
+            local.extend_from_slice(&(data.len() as u32).to_le_bytes());
+            local.extend_from_slice(&(name_bytes.len() as u16).to_le_bytes());
+            local.extend_from_slice(&0u16.to_le_bytes());
+            local.extend_from_slice(name_bytes);
+            local.extend_from_slice(data);
+            file.write_all(&local).expect("write entry");
+            central.extend_from_slice(&0x0201_4b50u32.to_le_bytes());
+            central.extend_from_slice(&20u16.to_le_bytes());
+            central.extend_from_slice(&20u16.to_le_bytes());
+            central.extend_from_slice(&0u16.to_le_bytes());
+            central.extend_from_slice(&0u16.to_le_bytes());
+            central.extend_from_slice(&[0; 4]);
+            central.extend_from_slice(&crc.to_le_bytes());
+            central.extend_from_slice(&(data.len() as u32).to_le_bytes());
+            central.extend_from_slice(&(data.len() as u32).to_le_bytes());
+            central.extend_from_slice(&(name_bytes.len() as u16).to_le_bytes());
+            central.extend_from_slice(&0u16.to_le_bytes());
+            central.extend_from_slice(&0u16.to_le_bytes());
+            central.extend_from_slice(&0u16.to_le_bytes());
+            central.extend_from_slice(&0u16.to_le_bytes());
+            central.extend_from_slice(&0u32.to_le_bytes());
+            central.extend_from_slice(&offset.to_le_bytes());
+            central.extend_from_slice(name_bytes);
+        }
+        let cd_offset = file.stream_position().expect("position") as u32;
+        file.write_all(&central).expect("write directory");
+        let cd_size = central.len() as u32;
+        let count = entries.len() as u16;
+        let mut end = Vec::new();
+        end.extend_from_slice(&0x0605_4b50u32.to_le_bytes());
+        end.extend_from_slice(&0u16.to_le_bytes());
+        end.extend_from_slice(&0u16.to_le_bytes());
+        end.extend_from_slice(&count.to_le_bytes());
+        end.extend_from_slice(&count.to_le_bytes());
+        end.extend_from_slice(&cd_size.to_le_bytes());
+        end.extend_from_slice(&cd_offset.to_le_bytes());
+        end.extend_from_slice(&0u16.to_le_bytes());
+        file.write_all(&end).expect("write end record");
+    }
+
+    #[test]
+    fn loads_locale_english_fallback_icons_and_skips_bad_sibling() {
+        let dir = temporary_game_dir();
+        write_jar(&dir.join("mods/01-create.jar"), &[
+            ("assets/create/lang/ja_jp.json", r#"{"block.create.water_wheel":"水車","item.create.wrench":"レンチ"}"#.as_bytes()),
+            ("assets/create/lang/en_us.json", br#"{"block.create.water_wheel":"Water Wheel","item.create.wrench":"Wrench","item.create.goggles":"Goggles"}"#),
+            ("assets/create/textures/item/wrench.png", b"png-bytes"),
+            ("../assets/create/lang/ja_jp.json", br#"{"item.create.bad":"Bad"}"#),
+        ]);
+        fs::write(dir.join("mods/02-broken.jar"), b"not a zip").expect("write broken sibling");
+        let mut report = ModMetaReport::default();
+        let translations = ModTranslationTable::load(&dir, "ja-JP", &mut report);
+        assert_eq!(translations.translate_block("create:water_wheel"), "水車");
+        assert_eq!(translations.translate_item("create:goggles"), "Goggles");
+        assert_eq!(
+            translations.translate_item("create:brass_ingot"),
+            "Brass Ingot"
+        );
+        let icons = ModItemIconIndex::load(&dir, &mut report);
+        assert_eq!(
+            icons.icon_bytes("create:wrench").expect("icon read"),
+            Some(b"png-bytes".to_vec())
+        );
+        assert!(!report.warnings.is_empty());
+        fs::remove_dir_all(dir).expect("remove temp dir");
+    }
+
+    #[test]
+    fn decodes_mrs1_and_rejects_bad_frames() {
+        let mut frame = b"MRS1".to_vec();
+        frame.extend_from_slice(&1u16.to_be_bytes());
+        frame.extend_from_slice(&40u32.to_be_bytes());
+        frame.extend_from_slice(&70u32.to_be_bytes());
+        frame.extend_from_slice(&1u32.to_be_bytes());
+        let block_name = "create:wheel";
+        frame.extend_from_slice(&(block_name.len() as u16).to_be_bytes());
+        frame.extend_from_slice(block_name.as_bytes());
+        frame.extend_from_slice(&1u16.to_be_bytes());
+        for s in ["axis", "y"] {
+            frame.extend_from_slice(&(s.len() as u16).to_be_bytes());
+            frame.extend_from_slice(s.as_bytes());
+        }
+        frame.extend_from_slice(&1u32.to_be_bytes());
+        let item = "create:wrench";
+        frame.extend_from_slice(&(item.len() as u16).to_be_bytes());
+        frame.extend_from_slice(item.as_bytes());
+        let registry = decode_mrs1_frame(&frame).expect("valid frame");
+        assert_eq!(registry.block_state_name(40), Some("create:wheel"));
+        assert_eq!(
+            registry
+                .block_state(40)
+                .and_then(|b| b.properties.get("axis"))
+                .map(String::as_str),
+            Some("y")
+        );
+        assert_eq!(registry.item_name(70), Some("create:wrench"));
+        for bad in [&b"NOPE"[..], &frame[..frame.len() - 1]] {
+            assert!(decode_mrs1_frame(bad).is_err());
+        }
+        let mut wrong_version = frame;
+        wrong_version[4] = 0;
+        wrong_version[5] = 2;
+        assert!(decode_mrs1_frame(&wrong_version).is_err());
+    }
+}
