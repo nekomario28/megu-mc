@@ -8,7 +8,9 @@
 
 use std::fmt;
 
-use megu_core::zip_archive::{inflate_raw_rfc1951, ZipError};
+use megu_core::zip_archive::{
+    adler32, inflate_raw_rfc1951, inflate_raw_rfc1951_with_consumed, ZipError,
+};
 
 /// Reason an inflate failed, in a form every caller can wrap into its own
 /// error enum.
@@ -89,20 +91,25 @@ pub fn inflate_zlib(input: &[u8], limit: usize) -> Result<Vec<u8>, InflateError>
         return err("preset dictionary not supported");
     }
     let deflate = &input[2..];
-    // The Adler-32 sits on the first byte boundary after the last DEFLATE
-    // bit. The canonical kernel does not report the consumed-bit position,
-    // so the boundary is pinned instead: the deflate payload is exactly
-    // `deflate[..len - 4]` — decoding it must succeed while the one-byte
-    // shorter prefix must fail to terminate.
-    let data_len = match deflate.len().checked_sub(4) {
-        Some(len) => len,
-        None => return err("zlib stream truncated before Adler-32"),
-    };
-    let (data, adler_bytes) = deflate.split_at(data_len);
-    let out = inflate(data, limit)?;
-    if inflate(&deflate[..data_len.saturating_sub(1)], limit).is_ok() {
+    if deflate.len() < 4 {
+        return err("zlib stream truncated before Adler-32");
+    }
+    // Single pass: the kernel reports the exact byte extent of the DEFLATE
+    // stream (rounded up to the byte boundary), so the 4-byte Adler-32
+    // trailer is read at `consumed` rather than located by decoding the
+    // payload twice.
+    let (out, consumed) =
+        inflate_raw_rfc1951_with_consumed(deflate, limit).map_err(from_zip)?;
+    let remaining = deflate.len() - consumed;
+    if remaining < 4 {
+        // The stream ended inside what would be the trailer region: the
+        // old double-decode saw this as a truncated payload.
+        return err("deflate stream truncated");
+    }
+    if remaining > 4 {
         return err("trailing bytes after zlib trailer");
     }
+    let adler_bytes = &deflate[consumed..consumed + 4];
     let want = u32::from_be_bytes([
         adler_bytes[0],
         adler_bytes[1],
@@ -113,19 +120,4 @@ pub fn inflate_zlib(input: &[u8], limit: usize) -> Result<Vec<u8>, InflateError>
         return err("Adler-32 checksum mismatch");
     }
     Ok(out)
-}
-
-/// Adler-32 (RFC 1950) over `data`, used to verify the zlib trailer.
-fn adler32(data: &[u8]) -> u32 {
-    // NMAX-style chunking keeps the u64 accumulators far from overflow.
-    let (mut a, mut b) = (1u64, 0u64);
-    for chunk in data.chunks(5552) {
-        for &byte in chunk {
-            a += u64::from(byte);
-            b += a;
-        }
-        a %= 65521;
-        b %= 65521;
-    }
-    ((b << 16) | a) as u32
 }

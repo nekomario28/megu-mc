@@ -467,44 +467,6 @@ fn draw_text(img: &mut Image, x: usize, y: usize, text: &str, scale: usize, c: [
 // Minimal PNG writer: signature + IHDR + IDAT (zlib stored blocks) + IEND
 // ---------------------------------------------------------------------------
 
-const fn crc_table() -> [u32; 256] {
-    let mut t = [0u32; 256];
-    let mut i = 0usize;
-    while i < 256 {
-        let mut c = i as u32;
-        let mut k = 0;
-        while k < 8 {
-            c = if c & 1 != 0 {
-                0xEDB8_8320 ^ (c >> 1)
-            } else {
-                c >> 1
-            };
-            k += 1;
-        }
-        t[i] = c;
-        i += 1;
-    }
-    t
-}
-
-static CRC_TABLE: [u32; 256] = crc_table();
-
-fn crc32_update(mut crc: u32, data: &[u8]) -> u32 {
-    for &b in data {
-        crc = CRC_TABLE[((crc ^ b as u32) & 0xFF) as usize] ^ (crc >> 8);
-    }
-    crc
-}
-
-fn adler32(data: &[u8]) -> u32 {
-    let (mut a, mut b) = (1u32, 0u32);
-    for &byte in data {
-        a = (a + byte as u32) % 65521;
-        b = (b + a) % 65521;
-    }
-    (b << 16) | a
-}
-
 /// RFC 1950 zlib wrapper around RFC 1951 *stored* (uncompressed) deflate
 /// blocks: header `0x78 0x01`, then `BFINAL`/`LEN`/`NLEN`/literal chunks of
 /// at most 65535 bytes, then the Adler-32 of the raw payload.
@@ -525,7 +487,7 @@ fn zlib_stored(data: &[u8]) -> Vec<u8> {
             break;
         }
     }
-    out.extend_from_slice(&adler32(data).to_be_bytes());
+    out.extend_from_slice(&megu_core::zip_archive::adler32(data).to_be_bytes());
     out
 }
 
@@ -533,7 +495,10 @@ fn write_chunk(out: &mut Vec<u8>, kind: &[u8; 4], data: &[u8]) {
     out.extend_from_slice(&(data.len() as u32).to_be_bytes());
     out.extend_from_slice(kind);
     out.extend_from_slice(data);
-    let crc = crc32_update(crc32_update(0xFFFF_FFFF, kind), data) ^ 0xFFFF_FFFF;
+    let crc = megu_core::hash::crc32_ieee_update(
+        megu_core::hash::crc32_ieee_update(0, kind),
+        data,
+    );
     out.extend_from_slice(&crc.to_be_bytes());
 }
 

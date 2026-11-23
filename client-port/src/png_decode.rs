@@ -216,6 +216,11 @@ impl ParsedPng {
     }
 }
 
+/// CRC-32 over `kind || data`, the exact bytes a PNG chunk CRC covers.
+fn crc32_chunk(kind: &[u8; 4], data: &[u8]) -> u32 {
+    megu_core::hash::crc32_ieee_update(megu_core::hash::crc32_ieee_update(0, kind), data)
+}
+
 /// Parses and validates the whole chunk layer: signature, IHDR, PLTE, tRNS,
 /// IDAT collection and IEND. Every chunk's CRC-32 is verified before its
 /// payload is used.
@@ -447,43 +452,6 @@ fn validate_trns(
     Ok(())
 }
 
-// ---------------------------------------------------------------------------
-// CRC-32 (PNG polynomial, reflected)
-// ---------------------------------------------------------------------------
-
-const fn crc_table() -> [u32; 256] {
-    let mut t = [0u32; 256];
-    let mut i = 0usize;
-    while i < 256 {
-        let mut c = i as u32;
-        let mut k = 0;
-        while k < 8 {
-            c = if c & 1 != 0 {
-                0xEDB8_8320 ^ (c >> 1)
-            } else {
-                c >> 1
-            };
-            k += 1;
-        }
-        t[i] = c;
-        i += 1;
-    }
-    t
-}
-
-static CRC_TABLE: [u32; 256] = crc_table();
-
-fn crc32_update(mut crc: u32, data: &[u8]) -> u32 {
-    for &b in data {
-        crc = CRC_TABLE[((crc ^ u32::from(b)) & 0xFF) as usize] ^ (crc >> 8);
-    }
-    crc
-}
-
-/// CRC-32 over `kind || data`, the exact bytes a PNG chunk CRC covers.
-fn crc32_chunk(kind: &[u8; 4], data: &[u8]) -> u32 {
-    crc32_update(crc32_update(0xFFFF_FFFF, kind), data) ^ 0xFFFF_FFFF
-}
 // ---------------------------------------------------------------------------
 // Scanline unfiltering + RGBA expansion
 // ---------------------------------------------------------------------------
