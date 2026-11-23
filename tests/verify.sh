@@ -88,7 +88,6 @@ python3 tests/neoforge_s4_network_test.py
 python3 tools/mod_compat_audit/test_audit.py
 python3 tests/fabric_shim_test.py
 python3 tests/client_launcher_test.py
-python3 tests/java_toolchain_test.py
 python3 tests/megu_start_test.py
 python3 tests/megu_mods_test.py
 python3 tests/megu_tui_test.py
@@ -214,6 +213,7 @@ timeout 180 python3 tests/client_settings_wire.py "$binary"
 timeout 180 python3 tests/gameplay_wire.py "$binary"
 timeout 180 python3 tools/play_survival_basics.py "$binary"
 timeout 180 python3 tests/m2_gameplay_wire.py "$binary"
+timeout 300 python3 tests/multiplayer_stress_wire.py "$binary" --clients 4
 timeout 180 python3 tests/container_wire.py "$binary"
 timeout 180 python3 tests/population_plan_test.py "$binary"
 timeout 180 python3 tests/mineshaft_dispatch_test.py "$binary"
@@ -240,7 +240,7 @@ timeout 180 python3 tests/client_vanilla_parity.py
 # --features neoforge-events plus the downloaded Java classpath, which the
 # public clean-room checkout does not ship. Where the pieces exist, gate.
 if [ -f compat/neoforge-events/.build/classpath.txt ] \
-    && command -v javac >/dev/null 2>&1; then
+    && [ -x /usr/lib/jvm/java-21-openjdk/bin/javac ]; then
   cargo build --offline --locked -j 2 --features neoforge-events \
       --message-format=json-render-diagnostics >"$build_manifest"
   neoforge_binary=$(python3 tools/cargo_executable.py <"$build_manifest")

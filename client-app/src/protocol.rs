@@ -3789,7 +3789,7 @@ pub fn decode_extended_play_event(name: &str, body: &[u8]) -> Result<Option<Play
             forced: r.read_bool()?,
             prompt_nbt: if r.read_bool()? { Some(read_nbt_raw(&mut r)?.to_vec()) } else { None },
         },
-        "set_carried_item" => PlayEvent::SetCarriedItem(r.read_i16()?),
+        "set_carried_item" => PlayEvent::SetCarriedItem(i16::from(r.read_i8()?)),
         "store_cookie" => {
             let key = r.read_string(32767)?;
             let len = usize::try_from(r.read_varint()?)
@@ -5496,7 +5496,9 @@ impl ProtocolClient {
             return Ok(None);
         };
         self.pump_audio();
-        let event = self.decode_play_event(pid, &body)?;
+        let event = self
+            .decode_play_event(pid, &body)
+            .map_err(|err| format!("play packet 0x{pid:02x}: {err}"))?;
         self.record_play_state(&event);
         Ok(Some(event))
     }
@@ -5517,7 +5519,9 @@ impl ProtocolClient {
                 .map(ClientPlayEvent::CustomChannel)
                 .map(Some);
         }
-        let event = self.decode_play_event(pid, &body)?;
+        let event = self
+            .decode_play_event(pid, &body)
+            .map_err(|err| format!("play packet 0x{pid:02x}: {err}"))?;
         self.record_play_state(&event);
         Ok(Some(ClientPlayEvent::Play(event)))
     }

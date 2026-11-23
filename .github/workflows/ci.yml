@@ -155,6 +155,10 @@ jobs:
             --mod-check-bin mod-adapter-core/target/debug/megu-mod-check \
             --client-bin client-app/target/debug/megu-client \
             --server-bin target/debug/megu
+          # Real-client multiplayer soak: four megu-client bots decode chunks and
+          # move concurrently; fail-closed on any client crash/decode error.
+          timeout 300 python3 tests/multiplayer_stress_wire.py target/debug/megu \
+            --clients 4 --client-bin client-app/target/debug/megu-client
 
   # Separate from the suite on purpose: a green suite is not evidence that a gate works. This job
   # breaks each pinned implementation and requires the named test to go red, so a test that can no
