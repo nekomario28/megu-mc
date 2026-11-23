@@ -7,16 +7,16 @@
 //! degrades to `None`/empty on any OS or kernel where the source files do
 //! not exist:
 //!
-//! * Pure parsers for the Linux `/proc` and `/sys/class/drm` text formats:
+//! * Pure parsers for Linux `/proc` and DRM data, Windows CPU counters, and
+//!   macOS `vm_stat`/`top` output:
 //!   [`parse_proc_self_status_rss_kib`], [`parse_proc_meminfo`],
 //!   [`parse_proc_stat_cpu_totals`] + [`cpu_usage_percent`], and
 //!   [`parse_drm_gpu_metrics`]. These never touch the filesystem, so every
 //!   malformed/truncated-input path is unit-testable.
 //! * Live readers — [`sample_host_metrics`], [`sample_gpu_metrics`] and
-//!   [`read_drm_gpu_metrics`] — that bind the parsers to `/proc` and
-//!   `/sys/class/drm`. Every read is size-bounded and every failure maps to
-//!   `None`, so a non-Linux host gets an all-`None` snapshot rather than an
-//!   error.
+//!   [`read_drm_gpu_metrics`] — that bind the parsers to platform sources.
+//!   Linux reads `/proc` and `/sys/class/drm`; Windows uses kernel32; macOS
+//!   uses `sysctl`, `vm_stat` and `top`. Unsupported sensors remain `None`.
 //! * [`FrameTimingStats`] — a fixed-capacity ring buffer (default
 //!   [`FRAME_TIMING_CAPACITY`] = 120 samples) producing deterministic
 //!   `fps_avg`, `fps_one_percent_low`, `frame_ms_avg`, `frame_ms_p95`,
@@ -220,6 +220,183 @@ pub fn cpu_usage_percent(prev: &CpuSample, curr: &CpuSample) -> Option<f32> {
     let d_busy = d_total.saturating_sub(d_idle);
     let pct = (d_busy as f64) * 100.0 / (d_total as f64);
     Some((pct as f32).clamp(0.0, 100.0))
+}
+
+/// Parse the user/kernel/idle values from a Windows `GetSystemTimes` sample.
+pub fn parse_windows_cpu_times(idle: u64, kernel: u64, user: u64) -> CpuSample {
+    let total = kernel.saturating_add(user);
+    CpuSample {
+        total_jiffies: total,
+        idle_jiffies: idle.min(total),
+    }
+}
+
+/// Parse macOS `vm_stat` output. Available pages include free, inactive,
+/// speculative and purgeable pages; total physical memory comes from sysctl.
+pub fn parse_macos_vm_stat(text: &str, total_bytes: u64) -> Option<MemInfoMiB> {
+    let page_size = text.lines().find_map(|line| {
+        let start = line.find("page size of ")? + "page size of ".len();
+        let digits: String = line[start..]
+            .chars()
+            .take_while(char::is_ascii_digit)
+            .collect();
+        digits.parse::<u64>().ok().filter(|&n| n > 0)
+    })?;
+    let mut available_pages = 0u64;
+    for line in text.lines() {
+        let Some((name, count)) = line.split_once(':') else {
+            continue;
+        };
+        let count = count
+            .trim()
+            .trim_end_matches('.')
+            .replace('.', "")
+            .parse::<u64>()
+            .ok();
+        let Some(count) = count else { continue };
+        if [
+            "Pages free",
+            "Pages inactive",
+            "Pages speculative",
+            "Pages purgeable",
+        ]
+        .contains(&name.trim())
+        {
+            available_pages = available_pages.saturating_add(count);
+        }
+    }
+    let total_mib = total_bytes / BYTES_PER_MIB;
+    if total_mib == 0 {
+        return None;
+    }
+    let available_mib = available_pages.saturating_mul(page_size) / BYTES_PER_MIB;
+    let available_mib = available_mib.min(total_mib);
+    Some(MemInfoMiB {
+        total_mib,
+        available_mib,
+        used_mib: total_mib.saturating_sub(available_mib),
+    })
+}
+
+/// Parse the aggregate CPU line emitted by macOS `top -l 1 -n 0`.
+pub fn parse_macos_top_cpu_percent(text: &str) -> Option<f32> {
+    let line = text.lines().find(|line| line.contains("CPU usage:"))?;
+    let idle = line
+        .split(',')
+        .find(|part| part.contains("idle"))?
+        .split_whitespace()
+        .find_map(|part| part.trim_end_matches('%').parse::<f32>().ok())?;
+    idle.is_finite().then_some((100.0 - idle).clamp(0.0, 100.0))
+}
+
+#[cfg(target_os = "windows")]
+#[repr(C)]
+#[derive(Default)]
+struct MemoryStatusEx {
+    dw_length: u32,
+    dw_memory_load: u32,
+    ull_total_phys: u64,
+    ull_avail_phys: u64,
+    ull_total_page_file: u64,
+    ull_avail_page_file: u64,
+    ull_total_virtual: u64,
+    ull_avail_virtual: u64,
+    ull_avail_extended_virtual: u64,
+}
+
+#[cfg(target_os = "windows")]
+#[repr(C)]
+#[derive(Default)]
+struct FileTime {
+    low: u32,
+    high: u32,
+}
+
+#[cfg(target_os = "windows")]
+#[link(name = "kernel32")]
+#[allow(unsafe_code)]
+unsafe extern "system" {
+    fn GlobalMemoryStatusEx(buffer: *mut MemoryStatusEx) -> i32;
+    fn GetSystemTimes(idle: *mut FileTime, kernel: *mut FileTime, user: *mut FileTime) -> i32;
+}
+
+#[cfg(target_os = "windows")]
+fn windows_u64_time(time: &FileTime) -> u64 {
+    (u64::from(time.high) << 32) | u64::from(time.low)
+}
+
+#[cfg(target_os = "windows")]
+#[allow(unsafe_code)]
+fn windows_memory() -> Option<MemInfoMiB> {
+    let mut status = MemoryStatusEx {
+        dw_length: std::mem::size_of::<MemoryStatusEx>() as u32,
+        ..MemoryStatusEx::default()
+    };
+    // SAFETY: the repr(C) output structure is valid and sized for this API.
+    if unsafe { GlobalMemoryStatusEx(&mut status) } == 0 || status.ull_total_phys == 0 {
+        return None;
+    }
+    let total_mib = status.ull_total_phys / BYTES_PER_MIB;
+    let available_mib = (status.ull_avail_phys / BYTES_PER_MIB).min(total_mib);
+    Some(MemInfoMiB {
+        total_mib,
+        available_mib,
+        used_mib: total_mib.saturating_sub(available_mib),
+    })
+}
+
+#[cfg(target_os = "windows")]
+#[allow(unsafe_code)]
+fn windows_cpu_sample() -> Option<CpuSample> {
+    let (mut idle, mut kernel, mut user) = (
+        FileTime::default(),
+        FileTime::default(),
+        FileTime::default(),
+    );
+    // SAFETY: all three pointers refer to writable FILETIME output values.
+    if unsafe { GetSystemTimes(&mut idle, &mut kernel, &mut user) } == 0 {
+        return None;
+    }
+    Some(parse_windows_cpu_times(
+        windows_u64_time(&idle),
+        windows_u64_time(&kernel),
+        windows_u64_time(&user),
+    ))
+}
+
+#[cfg(target_os = "macos")]
+fn macos_memory() -> Option<MemInfoMiB> {
+    let total = std::process::Command::new("/usr/sbin/sysctl")
+        .args(["-n", "hw.memsize"])
+        .output()
+        .ok()?;
+    if !total.status.success() {
+        return None;
+    }
+    let total_bytes = std::str::from_utf8(&total.stdout)
+        .ok()?
+        .trim()
+        .parse()
+        .ok()?;
+    let vm_stat = std::process::Command::new("/usr/bin/vm_stat")
+        .output()
+        .ok()?;
+    if !vm_stat.status.success() {
+        return None;
+    }
+    parse_macos_vm_stat(&String::from_utf8_lossy(&vm_stat.stdout), total_bytes)
+}
+
+#[cfg(target_os = "macos")]
+fn macos_cpu_percent() -> Option<f32> {
+    let output = std::process::Command::new("/usr/bin/top")
+        .args(["-l", "1", "-n", "0"])
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    parse_macos_top_cpu_percent(&String::from_utf8_lossy(&output.stdout))
 }
 
 // ---------------------------------------------------------------------------
@@ -487,19 +664,36 @@ pub fn sample_host_metrics(sampler: &mut CpuSampler) -> HostMetricsSnapshot {
 
 /// [`sample_host_metrics`] with injectable paths for tests.
 pub fn sample_host_metrics_under(
-    sampler: &mut CpuSampler,
-    status_path: &Path,
-    meminfo_path: &Path,
-    stat_path: &Path,
+    _sampler: &mut CpuSampler,
+    _status_path: &Path,
+    _meminfo_path: &Path,
+    _stat_path: &Path,
     drm_root: &Path,
 ) -> HostMetricsSnapshot {
-    let rss_mib = read_attr_bounded(status_path)
+    #[cfg(target_os = "linux")]
+    let rss_mib = read_attr_bounded(_status_path)
         .and_then(|t| parse_proc_self_status_rss_kib(&t))
         .map(|kib| kib / 1024);
-    let mem = read_attr_bounded(meminfo_path).map(|t| parse_proc_meminfo(&t));
-    let cpu_percent = read_attr_bounded(stat_path)
+    #[cfg(not(target_os = "linux"))]
+    let rss_mib = None;
+    #[cfg(target_os = "linux")]
+    let mem = read_attr_bounded(_meminfo_path).map(|t| parse_proc_meminfo(&t));
+    #[cfg(target_os = "windows")]
+    let mem = windows_memory();
+    #[cfg(target_os = "macos")]
+    let mem = macos_memory();
+    #[cfg(not(any(target_os = "linux", target_os = "windows", target_os = "macos")))]
+    let mem: Option<MemInfoMiB> = None;
+    #[cfg(target_os = "linux")]
+    let cpu_percent = read_attr_bounded(_stat_path)
         .and_then(|t| parse_proc_stat_cpu_totals(&t))
-        .and_then(|sample| sampler.observe(sample));
+        .and_then(|sample| _sampler.observe(sample));
+    #[cfg(target_os = "windows")]
+    let cpu_percent = windows_cpu_sample().and_then(|sample| _sampler.observe(sample));
+    #[cfg(target_os = "macos")]
+    let cpu_percent = macos_cpu_percent();
+    #[cfg(not(any(target_os = "linux", target_os = "windows", target_os = "macos")))]
+    let cpu_percent = None;
     HostMetricsSnapshot {
         process_rss_mib: rss_mib,
         mem_total_mib: mem.map(|m| m.total_mib),

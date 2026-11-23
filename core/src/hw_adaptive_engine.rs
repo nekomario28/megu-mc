@@ -463,6 +463,8 @@ pub enum StorageIoClass {
     SataSsd,
     HddOrSlowSd,
     RamBacked,
+    /// The host storage could not be identified; do not assume it is slow.
+    Unknown,
 }
 
 /// SIMD capabilities broader than the legacy executable kernel tiers.
@@ -718,7 +720,7 @@ fn linux_power_profile(gpu: GpuComputeParadigm) -> PowerThermalProfile {
 #[cfg(target_os = "linux")]
 fn linux_storage_io() -> StorageIoClass {
     let Ok(devices) = fs::read_dir("/sys/block") else {
-        return StorageIoClass::HddOrSlowSd;
+        return StorageIoClass::Unknown;
     };
     let mut solid_state = false;
     let mut rotating_or_sd = false;
@@ -752,7 +754,86 @@ fn linux_storage_io() -> StorageIoClass {
     } else if ram_backed {
         StorageIoClass::RamBacked
     } else {
+        StorageIoClass::Unknown
+    }
+}
+
+#[cfg(target_os = "windows")]
+#[repr(C)]
+#[derive(Default)]
+struct MemoryStatusEx {
+    dw_length: u32,
+    dw_memory_load: u32,
+    ull_total_phys: u64,
+    ull_avail_phys: u64,
+    ull_total_page_file: u64,
+    ull_avail_page_file: u64,
+    ull_total_virtual: u64,
+    ull_avail_virtual: u64,
+    ull_avail_extended_virtual: u64,
+}
+
+#[cfg(target_os = "windows")]
+#[link(name = "kernel32")]
+#[allow(unsafe_code)]
+unsafe extern "system" {
+    fn GlobalMemoryStatusEx(buffer: *mut MemoryStatusEx) -> i32;
+}
+
+#[cfg(target_os = "windows")]
+#[allow(unsafe_code)]
+fn windows_ram_mib() -> Option<u64> {
+    let mut status = MemoryStatusEx {
+        dw_length: std::mem::size_of::<MemoryStatusEx>() as u32,
+        ..MemoryStatusEx::default()
+    };
+    // SAFETY: the repr(C) structure is initialized and dwLength is set as
+    // required by GlobalMemoryStatusEx.
+    let success = unsafe { GlobalMemoryStatusEx(&mut status) };
+    (success != 0 && status.ull_total_phys > 0).then_some(status.ull_total_phys / 1_048_576)
+}
+
+fn detected_memory_class(total_ram_mib: u64) -> MemoryFootprintClass {
+    if total_ram_mib == 0 {
+        MemoryFootprintClass::Standard
+    } else {
+        MemoryFootprintClass::from_ram_mib(total_ram_mib)
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn macos_storage_io() -> StorageIoClass {
+    let output = std::process::Command::new("/usr/sbin/diskutil")
+        .args(["info", "/"])
+        .output();
+    let Ok(output) = output else {
+        return StorageIoClass::Unknown;
+    };
+    if !output.status.success() {
+        return StorageIoClass::Unknown;
+    }
+    let text = String::from_utf8_lossy(&output.stdout).to_ascii_lowercase();
+    if text.contains("rotational: yes") || text.contains("solid state: no") {
         StorageIoClass::HddOrSlowSd
+    } else if text.contains("solid state: yes") || text.contains("ssd") || text.contains("nvme") {
+        StorageIoClass::NvmeFastRandom
+    } else {
+        StorageIoClass::Unknown
+    }
+}
+
+#[cfg(test)]
+mod hardware_detection_tests {
+    use super::{detected_memory_class, MemoryFootprintClass};
+
+    #[test]
+    fn unknown_detected_ram_uses_neutral_memory_tier() {
+        assert_eq!(detected_memory_class(0), MemoryFootprintClass::Standard);
+        assert_eq!(
+            detected_memory_class(4096),
+            MemoryFootprintClass::Constrained
+        );
+        assert_eq!(detected_memory_class(4097), MemoryFootprintClass::Standard);
     }
 }
 
@@ -808,7 +889,8 @@ fn macos_sysctl_u64(name: &str) -> Option<u64> {
 }
 
 /// Read independent hardware hints without using clocks or external crates.
-/// Unknown RAM is classified as constrained to keep pool budgets conservative.
+/// Unknown RAM receives a balanced neutral tier rather than a false low-RAM
+/// classification.
 pub fn detect_universal_hardware_profile() -> UniversalHardwareProfile {
     let base = detect_host_hardware_caps();
     #[cfg(target_os = "linux")]
@@ -850,12 +932,12 @@ pub fn detect_universal_hardware_profile() -> UniversalHardwareProfile {
     let (
         l2_per_core_kib,
         cache_line_bytes,
-        total_ram_mib,
+        _total_ram_mib,
         cache_domains,
         core_layout,
         gpu_paradigm,
         power_profile,
-        storage_io,
+        _storage_io,
     ) = (
         0,
         if cfg!(all(target_os = "macos", target_arch = "aarch64")) {
@@ -874,8 +956,10 @@ pub fn detect_universal_hardware_profile() -> UniversalHardwareProfile {
             GpuComputeParadigm::LowPowerIntegratedWgpu
         },
         PowerThermalProfile::AcDesktop,
-        StorageIoClass::HddOrSlowSd,
+        StorageIoClass::Unknown,
     );
+    #[cfg(target_os = "windows")]
+    let total_ram_mib = windows_ram_mib().unwrap_or(_total_ram_mib);
     #[cfg(target_os = "macos")]
     let (l2_per_core_kib, cache_line_bytes, total_ram_mib, core_layout) = {
         let p_cores = macos_sysctl_u64("hw.perflevel0.physicalcpu").unwrap_or(0);
@@ -894,10 +978,19 @@ pub fn detect_universal_hardware_profile() -> UniversalHardwareProfile {
                 .and_then(|bytes| u16::try_from(bytes).ok())
                 .filter(|&bytes| bytes == 64 || bytes == 128)
                 .unwrap_or(cache_line_bytes),
-            macos_sysctl_u64("hw.memsize").unwrap_or(0) / 1_048_576,
+            macos_sysctl_u64("hw.memsize")
+                .filter(|&bytes| bytes > 0)
+                .unwrap_or(0)
+                / 1_048_576,
             layout,
         )
     };
+    #[cfg(target_os = "macos")]
+    let storage_io = macos_storage_io();
+    #[cfg(not(any(target_os = "linux", target_os = "windows", target_os = "macos")))]
+    let total_ram_mib = _total_ram_mib;
+    #[cfg(all(not(target_os = "macos"), not(target_os = "linux")))]
+    let storage_io = _storage_io;
     UniversalHardwareProfile {
         base,
         l2_per_core_kib,
@@ -905,7 +998,7 @@ pub fn detect_universal_hardware_profile() -> UniversalHardwareProfile {
         cache_domains,
         core_layout,
         total_ram_mib,
-        memory_class: MemoryFootprintClass::from_ram_mib(total_ram_mib),
+        memory_class: detected_memory_class(total_ram_mib),
         gpu_paradigm,
         power_profile,
         storage_io,

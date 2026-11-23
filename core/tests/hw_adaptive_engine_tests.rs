@@ -342,6 +342,18 @@ fn two_gib_pi_slow_sd_budgets_less_than_desktop_and_coalesces_io() {
 }
 
 #[test]
+fn unknown_storage_does_not_assume_slow_disk_policy() {
+    let mut profile = synthetic_desktop();
+    profile.storage_io = StorageIoClass::Unknown;
+    let plan = build_unified_optimization_plan(&profile, None);
+    assert!(
+        !plan
+            .for_domain(DomainKind::Worldgen)
+            .coalesce_background_bursts
+    );
+}
+
+#[test]
 fn handheld_apu_uses_uma_bounded_workers_and_burst_coalescing() {
     let mut deck = synthetic_desktop();
     deck.base.memory_topology = MemoryTopology::UnifiedUma;

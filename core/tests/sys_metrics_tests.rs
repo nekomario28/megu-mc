@@ -3,10 +3,10 @@
 
 use megu_core::sys_metrics::{
     cpu_usage_percent, format_mini_hud_lines, gpu_backend_for_vendor, parse_drm_gpu_metrics,
-    parse_gpu_busy_percent, parse_proc_meminfo, parse_proc_self_status_rss_kib,
-    parse_proc_stat_cpu_totals, parse_vram_bytes_to_mib, sample_gpu_metrics, sample_host_metrics,
-    CpuSample, CpuSampler, FrameTimingStats, GpuBackend, MiniHudAnchor, MiniHudConfig, MiniHudData,
-    FRAME_TIMING_CAPACITY,
+    parse_gpu_busy_percent, parse_macos_top_cpu_percent, parse_macos_vm_stat, parse_proc_meminfo,
+    parse_proc_self_status_rss_kib, parse_proc_stat_cpu_totals, parse_vram_bytes_to_mib,
+    parse_windows_cpu_times, sample_gpu_metrics, sample_host_metrics, CpuSample, CpuSampler,
+    FrameTimingStats, GpuBackend, MiniHudAnchor, MiniHudConfig, MiniHudData, FRAME_TIMING_CAPACITY,
 };
 
 const MEMINFO: &str = "\
@@ -40,6 +40,48 @@ intr 12345
 #[test]
 fn status_rss_parses_the_vm_rss_line() {
     assert_eq!(parse_proc_self_status_rss_kib(SELF_STATUS), Some(2416));
+}
+
+#[test]
+fn windows_cpu_times_use_kernel_including_idle_without_double_counting() {
+    let before = parse_windows_cpu_times(100, 150, 50);
+    let after = parse_windows_cpu_times(140, 230, 70);
+    assert_eq!(
+        before,
+        CpuSample {
+            total_jiffies: 200,
+            idle_jiffies: 100
+        }
+    );
+    assert_eq!(cpu_usage_percent(&before, &after), Some(60.0));
+}
+
+#[test]
+fn macos_vm_stat_parser_converts_pages_and_handles_bad_or_missing_memory() {
+    let sample = "Mach Virtual Memory Statistics: (page size of 4096 bytes)\n\
+Pages free: 100.\nPages inactive: 200.\nPages speculative: 10.\nPages purgeable: 5.\n";
+    let mem = parse_macos_vm_stat(sample, 1_073_741_824).expect("valid vm_stat");
+    assert_eq!(mem.total_mib, 1024);
+    assert_eq!(mem.available_mib, 1);
+    assert_eq!(mem.used_mib, 1023);
+    assert_eq!(parse_macos_vm_stat("garbage", 1024), None);
+    assert_eq!(parse_macos_vm_stat(sample, 0), None);
+}
+
+#[test]
+fn macos_top_parser_returns_busy_percent_only_for_valid_idle_reading() {
+    assert_eq!(
+        parse_macos_top_cpu_percent("CPU usage: 10.00% user, 5.00% sys, 85.00% idle"),
+        Some(15.0)
+    );
+    assert_eq!(
+        parse_macos_top_cpu_percent("CPU usage: 99% user, 1% sys"),
+        None
+    );
+    assert_eq!(
+        parse_macos_top_cpu_percent("CPU usage: 100% idle"),
+        Some(0.0)
+    );
 }
 
 #[test]
@@ -557,8 +599,11 @@ fn live_sample_reports_nonzero_ram_and_rss() {
         let cpu = cpu.expect("CPU jiffies should advance within the bound");
         assert!((0.0..=100.0).contains(&cpu), "cpu={cpu}");
     } else {
-        // Fail-safe contract off Linux: everything is None/empty.
-        assert!(snap.mem_total_mib.is_none());
+        // Supported desktop platforms report system RAM; RSS and GPU remain
+        // unavailable where no portable source is implemented.
+        if cfg!(any(target_os = "windows", target_os = "macos")) {
+            assert!(snap.mem_total_mib.is_some_and(|mib| mib > 0));
+        }
         assert!(snap.process_rss_mib.is_none());
         assert!(snap.gpus.is_empty());
     }
