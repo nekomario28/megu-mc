@@ -972,6 +972,13 @@ enum Bend {
     Two { p1: [f32; 3], p2: [f32; 3] },
 }
 
+// One scratch buffer per thread instead of a fresh 450-entry Vec per call:
+// occlusion is queried once per audible source per frame.
+thread_local! {
+    static DIFFRACTION_SCRATCH: std::cell::RefCell<Vec<DiffractionCand>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+}
+
 /// A diffraction probe candidate plus its lower bound on penalized loss:
 /// the bend tax plus the detour penalty, before any traversal loss is known.
 struct DiffractionCand {
@@ -1305,7 +1312,9 @@ impl<'w> AcousticTracer<'w> {
                     from[2] + seg[2] * f,
                 ]
             };
-            let mut cands = Vec::with_capacity(450);
+            DIFFRACTION_SCRATCH.with(|s| {
+            let mut cands = s.borrow_mut();
+            cands.clear();
             for &f in &FRACTIONS {
                 for &mag in &OFFSETS {
                     for axis in 0..3 {
@@ -1354,7 +1363,7 @@ impl<'w> AcousticTracer<'w> {
                     .partial_cmp(&b.lower_bound)
                     .unwrap_or(std::cmp::Ordering::Equal)
             });
-            for cand in &cands {
+            for cand in cands.iter() {
                 // Sorted ascending: the first bound that already meets the
                 // incumbent prunes every candidate after it in one test.
                 if cand.lower_bound >= effective {
@@ -1405,6 +1414,7 @@ impl<'w> AcousticTracer<'w> {
                     }
                 }
             }
+            });
         }
         let cutoff = (OCCLUSION_MAX_CUTOFF_HZ * 2.0_f32.powf(-effective / 15.0))
             .clamp(OCCLUSION_MIN_CUTOFF_HZ, OCCLUSION_MAX_CUTOFF_HZ);

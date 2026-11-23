@@ -17,6 +17,7 @@ pub mod draw_order;
 pub mod entity_rig;
 pub mod ffi;
 pub mod gpu_pipeline;
+pub mod inflate;
 pub mod hiz_culler;
 mod lod;
 mod mesh;
