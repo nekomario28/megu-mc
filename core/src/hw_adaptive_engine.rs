@@ -81,7 +81,9 @@ const MAX_CPUS_SCANNED: u32 = 128;
 /// The instruction-set kernel tier a dispatch should schedule for.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum SimdKernelTier {
-    /// AVX-512 class x86_64 host (runtime `avx512f` feature detected).
+    /// AVX-512 class x86_64 host — the full `avx512f`+`avx512bw`+`avx512vl`
+    /// native-512 set (Zen 5 and later, plus Skylake-X/Ice Lake client
+    /// parts); runtime-detected, never assumed.
     Avx512,
     /// AVX2 class x86_64 host (runtime `avx2` feature detected).
     Avx2,
@@ -295,11 +297,26 @@ fn detect_hybrid_cores(_logical_cores: u32) -> bool {
     false
 }
 
+/// `true` when the host supports the *full* native 512-bit AVX-512
+/// foundation the voxel kernels need: `avx512f` for the wide vectors,
+/// `avx512bw` for 16-bit mask compares (`vpcmpeqw`/`vpcmpneqw` →
+/// `__mmask32`) and byte permutes, and `avx512vl` for the 256/128-bit
+/// masked forms used below 512-bit widths. Knights Landing-style parts
+/// with `avx512f`/`cd` but no `bw`/`vl`, and every pre-AVX-512 core
+/// (including Core 2 Duo), correctly report `false` and stay on AVX2 or
+/// scalar.
+#[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+fn avx512_native_detected() -> bool {
+    std::arch::is_x86_feature_detected!("avx512f")
+        && std::arch::is_x86_feature_detected!("avx512bw")
+        && std::arch::is_x86_feature_detected!("avx512vl")
+}
+
 /// Runtime SIMD tier detection. Pure feature probes — no unsafe, no
 /// inline asm, and every non-x86/aarch64 target falls back to scalar.
 #[cfg(target_arch = "x86_64")]
 fn detect_simd_tier() -> SimdKernelTier {
-    if std::arch::is_x86_feature_detected!("avx512f") {
+    if avx512_native_detected() {
         SimdKernelTier::Avx512
     } else if std::arch::is_x86_feature_detected!("avx2") {
         SimdKernelTier::Avx2
@@ -958,7 +975,7 @@ mod hardware_detection_tests {
 fn detect_extended_simd() -> ExtendedSimdTier {
     #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
     {
-        if std::arch::is_x86_feature_detected!("avx512f") {
+        if avx512_native_detected() {
             return ExtendedSimdTier::Avx512;
         }
         if std::arch::is_x86_feature_detected!("avx2") {

@@ -100,6 +100,23 @@
 //!   controller, and exact 63-bit Morton Z-order keys with the
 //!   Mara-McGuire 2013 closed-form projected sphere diameter for
 //!   sub-pixel LOD/Hi-Z culling.
+//! * [`morton`] — branchless SWAR magic-bit Morton (Z-order) spatial
+//!   encoding for cache locality: [`morton::morton3_encode_u4`] /
+//!   [`morton::morton3_decode_u4`] give the 12-bit `0..4096` index space
+//!   of a `16³` chunk section (L1/L2-friendly 6-neighbour traversal for
+//!   lighting, fluid and meshing), [`morton::morton3_encode_u10`] /
+//!   [`morton::morton3_decode_u10`] cover 10-bit-per-axis region/entity
+//!   spatial hashing, and [`morton::morton2_encode_i16`] /
+//!   [`morton::morton2_decode_u32`] give sign-biased 2D chunk keys.
+//! * [`simd_voxel`] — runtime-dispatched, hardware-aware low-level
+//!   kernels with bit-identical scalar oracles: [`simd_voxel::build_non_air_bitmask_64`]
+//!   (AVX-512 masked compare / AVX2 pack+movemask / NEON narrow /
+//!   branchless scalar), [`simd_voxel::batch_aabb_frustum_cull_soa`]
+//!   (SoA frustum culling emitting packed `u64` visibility words), and
+//!   [`simd_voxel::unpack_palette_4bit_to_u16`] (vectorised nibble
+//!   expansion + bounds-safe palette gather). Every `#[target_feature]`
+//!   path is guarded by `is_x86_feature_detected!` — Core 2 Duo
+//!   (x86-64-v1) always lands on the safe scalar tier.
 
 #![deny(unsafe_code)]
 
@@ -113,10 +130,12 @@ pub mod i18n;
 pub mod math;
 pub mod math_opt_engine;
 pub mod math_opt_foundation;
+pub mod morton;
 pub mod perf_kit;
 pub mod random;
 pub mod romaji_ime;
 pub mod server_perf_governors;
+pub mod simd_voxel;
 pub mod sys_metrics;
 pub mod task_pool;
 pub mod tier25_guard_batch;
