@@ -39,6 +39,10 @@ jobs:
           python3 tools/provenance_check.py --strict-zero-gl
           python3 tests/public_hygiene_test.py
           python3 tests/release_workflow_test.py
+          python3 tests/ci_playability_gate_test.py
+          if [ -f tests/live_playability_e2e_test.py ]; then
+            python3 tests/live_playability_e2e_test.py
+          fi
           python3 tests/megu_tui_test.py
           python3 tests/installer_cross_os_test.py
           python3 website/check_site.py
@@ -138,6 +142,14 @@ jobs:
           cargo check --locked --features neoforge-events
           cargo check --locked --features create-offload
           cargo check --locked --features mod-suite
+          cargo test --locked --features mod-suite,create-offload --bin megu --no-run
+          cargo build --locked --features mod-suite,create-offload --bin megu
+          cargo build --locked --manifest-path mod-adapter-core/Cargo.toml --bin megu-mod-check
+          cargo build --locked --manifest-path client-app/Cargo.toml --bin megu-client
+          python3 tools/ci_playability_gate.py \
+            --mod-check-bin mod-adapter-core/target/debug/megu-mod-check \
+            --client-bin client-app/target/debug/megu-client \
+            --server-bin target/debug/megu
 
   # Separate from the suite on purpose: a green suite is not evidence that a gate works. This job
   # breaks each pinned implementation and requires the named test to go red, so a test that can no
