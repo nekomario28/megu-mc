@@ -147,9 +147,9 @@ class CommandClient(Client):
 
     def login(self):
         super().login()
-        # Join Game, then the vanilla view-distance pair (SetChunkCacheRadius,
-        # SetSimulationDistance), then the command tree.
-        assert self.play_prefix == [0x2B, 0x55, 0x62, COMMANDS], self.play_prefix
+        # Join Game, ServerData, then the vanilla view-distance pair
+        # (SetChunkCacheRadius, SetSimulationDistance), then the command tree.
+        assert self.play_prefix == [0x2B, 0x4B, 0x55, 0x62, COMMANDS], self.play_prefix
         self.until_id(0x40)
 
     def suggest(self, transaction, text):
@@ -218,7 +218,7 @@ def assert_initial_permissions(client, rcon):
     assert client.suggest(5, "/hel") == (1, 3, {"help"})
     denied = "You do not have permission to run that command"
     client.apply_command("time set 12345", denied)
-    client.apply_command(f"op {PLAYER}", denied, 0x06)
+    client.apply_command(f"op {PLAYER}", denied)
     assert rcon_command(rcon, "gamerule doDaylightCycle false").endswith("false")
     before = rcon_command(rcon, "time query gametime")
     client.apply_command("time set 54321", denied, 0x05)
@@ -339,7 +339,7 @@ def main(binary, root):
     with server(binary, root) as (game, rcon), CommandClient(game, PLAYER) as client:
         client.login()
         assert_tree(client.initial_tree, True)
-        client.apply_command("time set 23456", "Set time to 23456", 0x06)
+        client.apply_command("time set 23456", "Set time to 23456")
         assert rcon_command(rcon, f"deop {PLAYER.lower()}").endswith(
             "no longer a server operator"
         )

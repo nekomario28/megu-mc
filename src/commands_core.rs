@@ -8522,16 +8522,13 @@ fn run_command_ctx(ctx: &CmdCtx, msg: &str, s: &mut Option<&Client>) -> String {
                 }
             }
             place_block_dim(dim, x, y, z, st);
-            // Vanilla `SetBlockCommand` pushes a `ClientboundBlockUpdatePacket`
-            // (0x09) to every player tracking the chunk in that dimension as
-            // soon as the block lands; the queued section batch alone does not
-            // reach the wire the way the live server does.
-            {
-                let mut body = Vec::with_capacity(12);
-                write_pos(&mut body, x, y, z);
-                write_varint(&mut body, i64::from(visible_block_update_state(dim, x, y, z, st)));
-                broadcast_chunk_dim(dim, x >> 4, z >> 4, |_c| (0x09, body.clone()));
-            }
+            // `place_block_dim` already queues the dirty cell via
+            // `note_block_update_dim`; `apply_queued_block_updates` publishes a
+            // single `block_update` (0x09) for a lone dirty cell in the column
+            // to every chunk tracker, exactly like vanilla's
+            // `PlayerChunk.broadcastChanges`. A direct broadcast here would
+            // duplicate that packet on every client in range (measured: the
+            // same update arrived twice per /setblock).
             // OPS-ADMIN-BUILTIN: every live block write lands in the bounded
             // audit ring so `/megu audit`/`/megu rollback` can answer who
             // changed what and when. Net transition old -> new; the destroy

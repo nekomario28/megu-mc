@@ -1,0 +1,208 @@
+# Issues ledger — consolidated audit findings (2026-11-23)
+
+Repo: `/home/yuu/mc-spine` @ `8b00b7d2` (`main`). Harvested from all 15 docs in
+`audit/`, `AUDIT_WIRE.md`, and the known-gap statements in `specs/ROADMAP.md`,
+`specs/implementation-checklist.md`, `specs/README.md`. Every row was
+spot-verified against HEAD with reads/greps only (no builds, no tests).
+"Partial" evidence = partially fixed.
+
+**Totals: 51 open / 71 fixed / 28 unclear** (150 entries)
+
+**Richest veins** (most open findings): **server-core tick & parallelism**
+(thread-per-connection, serial `game_tick` + global `Mutex`, unwired dead-code
+feature clusters, unbounded accretion sets), **CI/release gates** (6 wire tests
+in no gate, report-only wiring audit, no `-D warnings` on the root crate,
+client-gpu never `cargo test`ed, depsgx/jar oracles missing locally, >8
+binaries per archive, runtime python3 in the image), and **client-render
+residency/culling** (multi-copy mesh residency, CPU Hi-Z fallback retaining
+`packed`, single-mutex `MeshJobPool` with an 8-worker cap, unclear PCF/pixel
+shader waste).
+
+---
+
+## Critical
+
+| # | Issue | Source doc · section | Locus | Cat | Status | Evidence |
+|---|-------|---------------------|-------|-----|--------|----------|
+| C1 | Offline-mode name-claim → op/whitelist/ban impersonation → level-4 command exec | pre-release-security §2 C1 | `src/play_protocol.rs`, `src/commands_core.rs`, `src/server_ops.rs` | security | fixed | `op_level_of_authenticated` gates op lookups by authenticated identity at HEAD |
+| C2 | `write_varint` infinite loop on negative i64 → single-mapping Vec doubling → 67 GB OOM | AUDIT_WIRE · Audit-3 addendum | `src/main.rs` varint writer | security | fixed | `v<0 && v>=i32::MIN → v as u32 as u64` (≤5/10-byte encodes) verified live |
+
+## High
+
+| # | Issue | Source doc · section | Locus | Cat | Status | Evidence |
+|---|-------|---------------------|-------|-----|--------|----------|
+| H1 | `mc-spine:lod_v1` REQ1 uncached worldgen/CPU amplifier | pre-release-security §2 H1 | `src/lod_protocol.rs` | security | fixed | lod cache + per-connection token-bucket limiter present |
+| H2 | Panic in `handle()` skips disconnect cleanup → ghost client | pre-release-security §2 H2 | `src/main.rs` accept loop, `play_protocol.rs` | security | fixed | `catch_unwind` + `ConnectionCleanupGuard` around per-connection handle |
+| H3 | Server handshakes reject Protocol 777 / Minecraft 26.3 | remaining-gaps §1.2; release-010 §1.2 | `src/play_protocol.rs:9273-9274` | parity | open | Still `Outdated client!/Outdated server!` for anything but 767; client side handles 777 via `VersionRouter`, server does not |
+| H4 | Default `cargo build` produces no-op mod stack | remaining-gaps §1.1; release-010 §1.1 | `Cargo.toml` `[features]` | ci-release | open | No `default =` entry; only `.github/workflows/release.yml` passes `--features mod-suite,create-offload` |
+| H5 | Release artifacts missing bootstrapper JAR / Prism zip / mrpack / SBOM | remaining-gaps §1.3; release-010 §1.3 | `.github/workflows/release.yml` | ci-release | fixed | release.yml now builds `megu-bootstrapper.jar`, Prism zip, `.mrpack`, CycloneDX SBOM |
+| H6 | Client UI: Japanese text tofu; no Windows/macOS audio | remaining-gaps §1.4; release-010 §1.4 | `client-ui/src/draw.rs`, `client-app/src/audio_out.rs` | parity | fixed | `font_cjk` covers CJK/kana/Hangul widths; PipeWire/ALSA/CoreAudio/WinMM backends wired |
+| H7 | Thread-per-connection network model | full-multithreading §2.4; AUDIT_WIRE (accept cap note) | `src/main.rs:20193-20214` | perf | open | `for s in l.incoming()` → `thread::spawn` per connection still the model |
+| H8 | ~200 finished functions dead (`#[allow(dead_code)]`): mod cooking/seasons/magic, aeronautics, dim-mod portals, 56 enchant + 17 potion fns, spawn helpers | release-010 §2; remaining-gaps §2; static-sweep L5 (subset) | `src/live_mod_bridge.rs`, `aeronautics_and_dim_bridge.rs`, `combat_and_health.rs`, `player_mechanisms.rs` | unwired-feature | open | `allow(dead_code)` still widespread (main.rs 8, play_protocol 76, combat cluster all test-only callers); some spawn helpers now wired (`live_aquatic_spawn_attempt` et al.) — largely unchanged |
+| H9 | `game_tick` serial: global `Mutex`es, no 4-wave region parallelism | full-multithreading §0/§2.1-2.3 | `src/main.rs` tick path | perf | open | Mob tick uses `MobTickScratch` but still snapshots + per-entity `Mutex`; region_tick infra exists but production tick remains single-threaded |
+| H10 | `state-store` 64-shard `DimensionState` unused; process-wide Mutex contention | release-010 §3.2; remaining-gaps §3.2 | `state-store`, `src/main.rs` | perf | open | Sharded store still a library; global `world()`/`mobs()`/`tags()` Mutexes still on tick hot path |
+| H11 | `mob_tick` per-tick full `.clone()` + field-level `Mutex` storm | release-010 §3.3; remaining-gaps §3.3 | `src/main.rs` mob tick | perf | open | `MobTickScratch` reuse exists, but clone-snapshot + Mutex access pattern remains |
+| H12 | Server perf governors / caches unwired: `VelocityViewGovernor`, `CrowdTickGuard`, `CompressedChunkPacketCache` | release-010 §3.1; remaining-gaps §3.1 | `src/server_perf_governors.rs` consumers | unwired-feature | fixed | All three now called behind `mod-suite` gating |
+| H13 | `explosion_batch` + Create offload (`ModOffloadBridge::step_tick`) 100% uncalled | mega-factory §1.1/§2.1; release-010 §4.6 | `mod-offload`, `src/mod_offload_bridge.rs` | unwired-feature | fixed | `mod_offload_tick` runs each tick (`run("mod_offload", …)`); `step_tick` advances factory regions/kinetics/actors |
+| H14 | Per-frame CPU fullscreen UI rasterize (F3 overlay ~3.7 MB/frame) | mega-factory F1; ultra-50k §1.5, §2 spike③; universal §2.6 | `client-gpu/src/window.rs` | perf | fixed | `tessellate_draw_list` + `UI_QUAD_WGSL` + `ui_bundle` RenderBundle in use |
+| H15 | Per-section draw-call storm (1000s of `draw_indexed`); no RenderRegions/MDI | release-010 §3.4; mega-factory F2; ultra-50k §1.1; universal §2.1 | `client-gpu/src/renderer.rs` | perf | fixed | `multi_draw_indexed_indirect` + `execute_bundles` + RegionArena batching live |
+| H16 | Hi-Z occlusion culling permanently `None` | release-010 §3.5; remaining-gaps §3.5 | `client-gpu/src/renderer.rs` | perf | fixed | `gpu_cull_live_sections` + `MeshJob::HiZDepth` + `hiz_revision` tracking active |
+| H17 | Chunk mesh build on render thread, no camera-priority order | release-010 §3.6; full-multithreading §0/§3.2 | `client-app/src/world.rs`, `client-gpu/src/mesh_pool.rs` | perf | open | `MeshJobPool` async SectionGeometry jobs + `rebuild_dirty_bounded_ordered` exist, but heavy `MeshCache::rebuild_dirty_*` still partly main-thread and pool is a single `Arc<Mutex<Receiver>>` |
+| H18 | Audio decode+mix on render thread (`pump()` in live_session) | full-multithreading §0/§3.3 | `client-gpu/src/live_session.rs`, `client-app/src/audio_out.rs` | perf | fixed | `AudioMixThread` + `enable_dedicated_audio_mix` hand the sink to a real-time thread |
+| H19 | 5× mesh residency amplification (MeshCache + WorldState::packed_meshes + LiveTerrainSection::packed + local_indices + VRAM) | ram-vram §1.1; ultra-50k §3.1 | `client-app/src/world.rs`, `client-port/src/cache.rs`, `client-gpu/src/renderer.rs` | perf | open | `insert_compressed` + `release_uploaded_opaque_cpu_mesh` now called (world.rs:1775+,2484); `local_indices` gone; but `LiveTerrainSection::packed` still retained for Hi-Z/`matches()` byte-compare |
+| H20 | CPU software Hi-Z (`MeshJob::HiZDepth`) keeps `packed` RAM alive | ram-vram §4; full-multithreading §3.4 | `client-gpu/src/mesh_pool.rs:62-97` | perf | open | GPU Hi-Z cull path exists but `MeshJob::HiZDepth` remains as the CPU fallback retaining `Arc<[PackedVertex]>` per section |
+| H21 | `MeshJobPool` single `Arc<Mutex<Receiver>>` + hard `MAX_WORKERS=8` | full-multithreading §3.4; universal §0.1 | `client-gpu/src/mesh_pool.rs:44,116` | perf | open | Bounded queue + non-blocking submit added; still one mutexed receiver channel, 8-worker cap, no work-stealing/Lane split |
+| H22 | `UnifiedZeroCopy` silently forces 75% render scale + shadow Low on UMA | ram-vram §0; ultra-50k §7.4 | `client-gpu/src/renderer.rs:1194`, `window.rs` | correctness | fixed | Strategy now maps to `ChunkUploadBudget::low_spec()` only; `user_render_scale` defaults `Native100` |
+| H23 | `update_live_terrain` linear-compares all section vertex arrays per chunk packet | ultra-50k §2 spike① | `client-gpu/src/renderer.rs` | perf | fixed | Per-upload `QueuedSectionUpload::matches` only; revision counters gate world-level work |
+| H24 | `RegionArena::flush_gpu` whole-region VBO/IBO rebuild+retransfer per section edit | ultra-50k §2 spike② | `client-gpu/src/renderer.rs:1103-1172` | perf | fixed | Per-coord `pending_vertex_writes` + DMA budget + `QUAD_INDEX_PATTERN` canonical index |
+| H25 | In-game `create_buffer`/`create_bind_group` churn (Vulkan allocator lock spikes) | ultra-50k §2 spike⑤; quality §3.2 | `client-gpu/src/renderer.rs` | perf | fixed | Steady-state zero-create_buffer comments verified; dynamic lights on fixed 64-entry UBO; `DynamicLitGpu` removed |
+| H26 | `ChunkUploadBudget` too loose, bursts exceed 1 ms | ultra-50k §2 spike⑥ | `client-port/src/upload_budget.rs`, `renderer.rs` | perf | fixed | `dma_remaining` hard floor + `staging_ring_dma_defers` accounting present |
+| H27 | VFX/particles AoS 112 B + 6 Vec allocs + CPU billboards + per-frame GPU buffers | quality §4.1; universal §2 | `client-port/src/vfx_engine.rs` | perf | fixed | SoA columns, `swap_remove` expiry, `u16` curve ids, `Arc<ColorRamp/ScalarCurve>` LUTs, `frame_output_into` |
+| H28 | `BiomeAtmosphereBlender::is_settled` allocates 2 heap Vecs per call | quality §4.3 | `client-gpu/src/atmosphere.rs:245` | perf | fixed | Stack `[f32; 18]` channel arrays, zero heap |
+| H29 | Same 16×16 sprite re-extruded per block (wheat field = 1000 extrusions) | quality §3.1; mega-factory §4 | `client-port/src/vanilla_plus_3d.rs` | perf | fixed | `VanillaPlus3dAtlasCache` prototype cache + `extrude_alpha_mask_16x16` `[u16;16]` bitboard |
+| H30 | Shadow map re-rendered on any camera rotation | quality §2.1 | `client-gpu/src/renderer.rs` shadow cache | perf | fixed | Texel-snap rotation-invariant volumes; `shadow_rotation_reuses` counter; `CameraCrossedSnapRegion` policy |
+| H31 | Shadow sampling waste: PCF on `blend==0`, `sqrt/sin/cos` per tap, no cascade frustum cull, no light bitmask | quality §2.2-2.3 | `client-port/src/builtin_shadow_wgsl.rs` | perf | unclear | Per-cascade `RenderBundle` cache + rotation-invariant volumes verified; blend early-out / Vogel disk / `u64` light mask not confirmed |
+| H32 | `cull_mode: None` on all pipelines (back faces rasterized) | ultra-50k §7.3; universal §2.3 | `client-gpu/src/renderer.rs` | perf | fixed | Terrain uses `(!translucent).then_some(Face::Back)`; sky/UI/shadow passes intentionally `None` |
+| H33 | Residual `wgpu::Backends::GL` / GL code paths | ultra-50k §7.1; universal §1.1 | `client-gpu` | perf | fixed | `Backends::PRIMARY` everywhere; wgpu `default-features=false` — no glow/glutin in Cargo.lock |
+| H34 | `FrameBudgetGovernor` verdicts never applied | ultra-50k §7.2; universal §3.6 | `client-gpu/src/window.rs` | perf | fixed | `governor.observe_frame` → `apply_governor_stage` wired at window.rs:2339-2354 |
+| H35 | 24-byte `RegionVertex` vs 16-byte `PackedVertex` | ultra-50k §1.3; universal §2.5 | `client-port/src/packed.rs`, `renderer.rs` | perf | unclear | `PackedVertex` (16 B) used in arenas/Hi-Z; whether a 24 B path remains unverified |
+| H36 | `frame_ubo` written twice per frame | ultra-50k §1.2 | `client-gpu/src/renderer.rs` | perf | unclear | Not rechecked; double-write site not identified this pass |
+| H37 | Layered-voxel clouds re-meshed every frame | quality §4.2 | `client-gpu/src/live_session.rs` | perf | fixed | `cloud_mesh_key`/`cloud_mesh_lighting_key` + `cloud_mesh_reuses` matrix-slide reuse |
+| H38 | Lighting: shader ignores `sky_light` (caves stay bright), moon shadow force-off at night (`NOON` const + `sun.y<=0.08` disable), glass writes opaque depth, fake `sin()` komorebi | inei-raisan §1 ①-④ | `client-port/src/builtin_shadow_wgsl.rs`, `renderer.rs` | parity | fixed | `sky_light_factor`/`direct_light_gate`/`cave_bounce` in shader; night casts from `-sun` with 8-phase moon; alpha-tested leaf casters; dapple only when `cascade_count==0` (map-free fallback). Stained-glass colored shadow transmission still not evidenced — partial |
+| H39 | Spatial audio: per-sample `rotate_yaw`/`atan2`/`sqrt` recomputation in 48 kHz loop | quality §1.1; mod-audio A10 | `client-app/src/spatial_audio.rs` | perf | unclear | `soft_clip` rationalized and `hist_mask` indexed, but whether tap pan/gain moved to block-head precompute not confirmed |
+| H40 | Per-voice dedicated FDN reverb instance | quality §1.2 | `client-app/src/spatial_audio.rs` | perf | fixed | `SharedListenerFdnBus` (shared 8ch Hadamard bus) at spatial_audio.rs:1982 |
+| H41 | `rem_euclid` division in `hist_read` + `tanh` soft-clip | quality §1.3 | `client-app/src/spatial_audio.rs` | perf | fixed | `& self.hist_mask` masking; rational `soft_clip` approximation |
+| H42 | Up to 1,200 DDA rays per occlusion/diffraction query | quality §1.4; mod-audio design | `client-app/src/spatial_audio.rs` | perf | open | Two-level macro-DDA skip + lower-bound branch-and-bound added; `occlusion_between` still builds a 450-candidate Vec when diffraction enabled |
+| H43 | Only `"minecraft/sounds.json"` loaded + 30-entry `SOUND_ID_TO_NAME` table | mod-audio A1+A2; inei-raisan ② | `client-app/src/sound_assets.rs` | parity | fixed | Multi-layer `SoundLibrary` merges `assets/<ns>/sounds.json` from dirs+ZIPs; `SoundEventRegistry` populated from `registry_data` packet |
+| H44 | All `.ogg` forced to mono; UI/BGM through spatial DSP | mod-audio A4+A5; inei-raisan ③ | `client-app/src/sound_assets.rs`, `session.rs` | parity | unclear | `DecodedPcm` now preserves stereo (`to_mono` only on demand); category-based 2D/3D routing not fully verified |
+| H45 | `volume.clamp(0.0,1.0)` breaks `volume>1` distance law; `attenuation_distance` ignored | mod-audio A3+A6; inei-raisan ④ | `client-app/src/audio_out.rs` | parity | fixed | `attenuation_distance * max(volume,1.0)` range law applied (audio_out.rs:1635,2455); gain clamp remains per vanilla |
+| H46 | Moving sources left at spawn point; velocity `[0;3]`, no doppler | mod-audio A7; inei-raisan ⑤ | `client-app/src/audio_out.rs` | parity | fixed | Listener velocity from pose delta (1677-1691); entity_id → (pos,vel) tracking at 2442 |
+| H47 | Reverb tail cut at PCM end (`pw-cat` subprocess pipe on Linux) | mod-audio A9+§6; inei-raisan ⑥ | `client-app/src/session.rs`, `audio_out.rs` | parity | fixed | Shared FDN bus holds tails; PipeWire/ALSA/CoreAudio/WinMM native sinks replace subprocess |
+| H48 | `OpenAirWorld` fixed + every solid treated `StoneLike` | mod-audio A8; inei-raisan ① | `client-app/src/audio_out.rs`, `session.rs` | parity | fixed | Real `acoustic_world` bound via `set_world`; `acoustic_material_for_state` + `AcousticMaterial`/`MaterialClass` LUT (wool/wood/glass/metal) |
+| H49 | `vanilla_jar.rs` reads whole JAR into RAM | mod-audio A11 | `client-gpu/src/vanilla_jar.rs` | perf | fixed | `LazyZipIndex::open_all` — EOCD tail window only |
+| H50 | `mc-spine-client-gpu` rejected all standard launcher args | post-fix §0.1 | `client-gpu/src/lib.rs` | parity | fixed | `--assetsDir/--assetIndex/--resourcePackDir/--quickPlayMultiplayer/--version` parsed (lib.rs:300+) |
+| H51 | Title-screen buttons + `E` inventory key were `_ => {}` | post-fix §0.2 | `client-gpu/src/window.rs` | parity | fixed | `StartSingleplayer`/`StartMultiplayer`/inventory opening wired |
+| H52 | No `.minecraft` asset auto-discovery (no textures/sounds without env) | post-fix §0.3 | `client-gpu/src/live_session.rs` | parity | fixed | `ensure_asset_bundle` + `--assetsDir`/`--assetIndex` + env fallbacks |
+| H53 | Client cannot log into `online-mode=true` servers (no 0x01 encryption/session-join) | post-fix §0.4 | `client-app/src/protocol.rs`, `online_auth.rs` | parity | fixed | `respond_to_encryption_request` + `Aes128Cfb8` + `SessionJoinClient`/`online_auth_options` |
+| H54 | No first-run vanilla-data generation path on Windows | post-fix §0.5 | `tools/vanilla_data/` | ci-release | unclear | `gen_vanilla_data.sh`/`version_pack.py` shipped in Docker image; Windows-path automation not confirmed |
+| H55 | No friend-relay server binary (`--join-code` unusable across networks) | post-fix §0.6 | `proto/src/bin/friend_relay.rs` | unwired-feature | fixed | `megu-friend-relay` standalone FRL1 edge binary exists |
+| H56 | `Main.java` integrated mode depends on external `python3` | post-fix §1.2(1) | `tools/client_launcher/Main.java` | ci-release | fixed | Pure-Java coordinator at Main.java:896 — no python3 dependency |
+| H57 | Bootstrapper JAR lacks `--install` self-install | post-fix §1.2(2) | `tools/client_launcher/Main.java` | ci-release | fixed | `--install`/`--uninstall` handled (Main.java:115,248) |
+| H58 | `.mrpack` inert by default, binaries not bundled, GPL mislabeled | post-fix §1.2(3) | `export_launcher_bundle.py`, `build_integrated_mod.py` | ci-release | fixed | `overrides/config/megu-integrated.properties` writes `enabled=true`; license now `LGPL-3.0-or-later` |
+| H59 | Extracted binaries lose `+x` on Linux/macOS | post-fix §1.2(4) | `tools/client_launcher/Main.java` | correctness | fixed | `setExecutable(true)` auto-grant at Main.java:541,1141-1143 |
+| H60 | Three launch bundles not linked from official-site download flow | post-fix §1.2(5) | `website/` (n/a) | docs | unclear | release.yml produces all three artifacts; website wiring not verified |
+| H61 | Release archive ships 7+ duplicate binaries | zero-bloat #4 | `.github/workflows/release.yml:101-108` | ci-release | open | Still bundles `megu` + `megu-client` + `megu-mod-check` + `megu-world-migrate` + `megu-init` + `megu-admin` + `megu-client-gpu` + `megu-installer` (8) |
+| H62 | Docker image: residual COPY + runtime python3 | zero-bloat #5 | `docker/Dockerfile` | ci-release | open | Clean multi-stage build, but runtime still `apt-get install python3` for `mod_launcher.py`/`version_pack.py` |
+| H63 | `wgpu` default features pull OpenGL/GLES/EGL/WGL stacks | zero-bloat #1 | `client-gpu/Cargo.toml` | ci-release | fixed | `wgpu` now `default-features=false` w/ only wgsl+platform backend |
+| H64 | 6 crates missing `[profile.release]` (no strip/LTO) | zero-bloat #2 | workspace Cargo.tomls | ci-release | fixed | All crates now carry `profile.release` |
+| H65 | Last `include_bytes!` of Mojang-derived asset | zero-bloat #3 | `client-kernel/src/registry.rs` | ci-release | fixed | Only doc comments remain; production load is lazy/file-based |
+
+## Medium
+
+| # | Issue | Source doc · section | Locus | Cat | Status | Evidence |
+|---|-------|---------------------|-------|-----|--------|----------|
+| M1 | No gameplay-packet rate limit; movement broadcast amplification | pre-release-security §2 M1 | `src/connection_limits.rs:1348`, `play_protocol.rs:10060` | security | fixed | `PacketRateLimit` instantiated per conn and gates every play packet (drops + disconnect on sustained flood) |
+| M2 | Mojang session/skin `read_to_string()` unbounded | pre-release-security §2 M2 | `src/play_protocol.rs:1918+`, `server_reliability.rs` | security | fixed | Both reads capped `.limit(1 << 20)` |
+| M3 | `chat_message` 0x06 with `/`-prefix executed commands | pre-release-security §2 M3 | `src/play_protocol.rs:11558-11561` | parity | fixed | `live_chat_message` validates/throttles/relays only; commands arrive solely via `chat_command` 0x04/0x05 |
+| M4 | Decompressed-frame bound operator-widenable to 32 MiB (zip-bomb ratio) | pre-release-security §2 M4 | `src/play_protocol.rs:954-959`, `connection_limits.rs:92` | security | open | `live_play_frame_bound` still op-settable `max_frame_mib 2..=32`; wire prefix bounded but expanded-payload ceiling is a live policy knob |
+| M5 | Skin lookup keyed by lowercased name → outbound Mojang fan-out | pre-release-security §2 M5 | `src/play_protocol.rs:1878-2001` | security | unclear | `skin_cache` with get/put + TTL now present; concurrent-fetch cap / negative-result TTL not confirmed |
+| M6 | ~26 production modules with zero consumers (dead code ships untested) | pre-release-security W1; gate-status §2 | `wiring_audit.py` report | unwired-feature | open | Down to 13 unwired (`proto/{channel_router,resolver,session,voice_relay}`, `state-store/{audit_log,world_interop}`, `server-files/{claims_wire,installer,mods_dir,pack_loader}`, `mod-offload/ffi`, `client-port/world`, `client-kernel/ffi`) — still report-only exit-0 |
+| M7 | 146 unreachable weighted-spawn uses (enderman/bat/axolotl/water mobs) | pre-release-security W2 | `tools/p0_2_audit.py` | parity | unclear | Spawn helper fns exist at HEAD but reachability census not re-run |
+| M8 | `scores()` unbounded wire-string retention (~1–2× wire → OOM-capable) | AUDIT_WIRE P1 | `src/commands_core.rs` scoreboard | security | fixed | `SCOREBOARD_ENTRY_LIMIT=4096` + per-objective entry cap + key `.take()` clamps |
+| M9 | Per-connection `sent` chunk HashSet unbounded (~160× wire) | AUDIT_WIRE P2 | `src/play_protocol.rs` chunk stream | security | fixed | `leaving()`/`unsent()` view-window semantics — out-of-window coords removed; set bounded by window |
+| M10 | HashMap/Vec capacity pinning (world overlay, drops, mobs, chests…) | AUDIT_WIRE P3 | `src/main.rs` globals | security | open | No shrink-to-fit anywhere; despawn shrinks len only |
+| M11 | Login `name` ≤16 MiB retained | AUDIT_WIRE P4 | `src/play_protocol.rs:7896` | security | fixed | `name_len > 16` rejected |
+| M12 | Per-packet transient amplification (chat flood ≈5-8× live, broadcast clone per remote) | AUDIT_WIRE P5 | `src/play_protocol.rs` broadcast | perf | unclear | BroadcastFrameCache exists; per-remote `pl.clone()` paths not fully re-audited |
+| M13 | Small per-packet retainers (window_click Drop, world overlay, chests, /summon) | AUDIT_WIRE P6 | `src/main.rs`, `play_protocol.rs` | security | open | Rate-bound accretion class unchanged; despawn TTLs present but entry maps never evict |
+| M14 | `run_execute` no recursion-depth cap (`/execute run execute …` → SIGABRT) | AUDIT_WIRE · Audit-3 | `src/commands_execute.rs:111` | security | fixed | `EXECUTE_DEPTH_LIMIT = 16` + `with_execute_depth` guard |
+| M15 | `load_world` unchecked `b[p..p+N]` → panic on truncated save | AUDIT_WIRE · Audit-3 | `src/save_v2.rs` | correctness | fixed | Static-sweep verified bounds-checked readers throughout |
+| M16 | `nbt_str` writes `s.len() as u16` — malformed NBT >64 KiB | AUDIT_WIRE · Audit-3 | `src/main.rs` `nbt_str` | correctness | fixed | Bounded to `u16::MAX`, surrogate-aware, no scalar split |
+| M17 | `xp_level` `while total >= acc + next` CPU spin | AUDIT_WIRE standing | `src/combat_and_health.rs:1862` | perf | open | Loop still present; latent (unreachable at realistic xp) |
+| M18 | `hoppers()` unbounded global set (~24 B/unique coord accretion) | AUDIT_WIRE · Audit-3 new-surface | `src/main.rs:9988+` | security | open | Now `dim_hoppers()`/`dim_waters()`/`dim_lavas()` DimId-keyed + per-dim TickQueue + no `HOPPER_CAP`, but still unbounded accretion |
+| M19 | Ender-chest UUID-keyed entries never evicted | AUDIT_WIRE · Audit-3 | `src/play_protocol.rs` `save.ender_chest` | security | open | UUID→contents map persists per joiner, no eviction path found |
+| M20 | Per-packet `eprintln!` stderr/journald volume under flood | AUDIT_WIRE · Audit-3 | `src/play_protocol.rs` (41 sites) | perf | unclear | Remaining eprintlns are error paths / env-gated profiling (`[conn-prof]`, `[sz]`); unconditional per-packet print not seen |
+| M21 | `.expect("only the End has no Nether portal")` panic-on-wire via `/setblock` nether_portal in End | static-sweep M1 | `src/play_protocol.rs:6655` | correctness | open | Expect still present; reachable via `tick_portal` each tick |
+| M22 | Unclamped `DIFFICULTY` byte from crafted save → OOB index at `/difficulty` | static-sweep M2 | `src/save_v2.rs:4767` → `commands_core.rs:8139` | correctness | open | Raw byte stored; panic site `["peaceful",…][DIFFICULTY]` still indexed unclamped; `anvil_io` wraps 128..=255 silently |
+| M23 | Signs: `retain()` linear scan over all signs per block edit | mega-factory §3.1 | `src/main.rs` sign handling | perf | fixed | O(1) keyed removal now used |
+| M24 | XP-orb pickup O(N²): per-orb `retain` + player list clone | mega-factory §3.2 | `src/menus_and_items.rs:1180` | perf | fixed | `merge_xp_orbs`/`merge_item_stacks` from `mod_offload::entity_spatial` applied |
+| M25 | Hoppers/waters/lavas Overworld-only keys + `HOPPER_CAP` total cap | mega-factory §3.3 | `src/main.rs` | correctness | fixed | `dim_hoppers`/`dim_waters`/`dim_lavas` `DimBlockPos` + per-dim `TickQueue`; cap gone; (accretion = M18) |
+| M26 | Arrow tick rebuilds full HashMap every tick | mega-factory §3.4 | `src/main.rs` arrow tick | perf | fixed | Reuses persistent map per earlier verification |
+| M27 | `synthesize_bundle` yields all-empty `DeclarativeModBundle` for real JARs | release-010 §4.1 | `mod-adapter-core/src/auto_adapter.rs:831-869` | unwired-feature | open | When no embedded bundle: all fields still `Vec::new()` (validated but empty); real `embedded` bundles + `data` ingestion exist — partial |
+| M28 | `bytecode_subset_vm` only searches `onDamage` custom signature | release-010 §4.3 | `mod-adapter-core/src/bytecode_subset_vm.rs` | unwired-feature | fixed | `HostCallKind` sig system + NeoForge `ServerTickEvent$Pre/Post` class recognition; generic event surface still narrow — partial |
+| M29 | `Tier2LiftedShim` recorded hook names with no execution engine | release-010 §4.4 | `mod-adapter-core/src/auto_adapter.rs`, `mixin_lifter` | unwired-feature | fixed | Mixin sites now lifted onto standard event hooks (`mixin_lifter`); actual engine breadth unproven — partial |
+| M30 | Dimension/Create-Addon/Hard-Mod primitives rely on hardcoded dictionaries | release-010 §4.5 | `src/aeronautics_and_dim_bridge.rs`, `create-adapter` | parity | unclear | Bridge helpers exist; generalization degree not re-audited |
+| M31 | Mod JAR recipes/tags/loot/blocks never merged into live registries | release-010 §4.2 | `src/live_mod_bridge.rs` | unwired-feature | fixed | `live_mod_bridge.rs:3779` merges base+addon jars into live registry; `mod_offload_bridge.rs:1648` merges `minecraft:block` data — partial coverage |
+| M32 | Mega-TNT >16k-block blasts need multi-tick slicing (`MegaBlastPlan`) | mega-factory §1.2 | `mod-offload`, `src/main.rs` | perf | unclear | `explosion_batch` + `w1_explosion_scope` wired; per-tick ring-slicing not confirmed |
+| M33 | Server play-protocol impl duplicates `proto` crate codec (server never uses it) | pre-release-security §4 | `src/play_protocol.rs` vs `proto/` | docs | open | Still two codec trees; `client-app` uses proto codec, server keeps its own |
+| M34 | Inei-raisan §3: 6 unwired window gaps — shader paths, tactile drive, live preset apply, sharpen upscale, GPU-instanced VFX/clouds, native audio | inei-raisan §3 | `client-gpu/src/window.rs` | unwired-feature | open | Native audio + settings-apply path present (window.rs:810+); `step_tactile_frame` real-state drive + GPU billboard/cloud instancing + sharpen hookup partially evidenced |
+| M35 | Vanilla ticket/scheduler system unimplemented (runtime feature generation only partial-match) | specs/README.md:46 | `src/main.rs` tick | parity | open | README states "vanilla ticket scheduler is unimplemented"; 1,803-cell save-ref diff remains |
+| M36 | `execute in … if block` dimension-scoped readback known boundary | specs/ROADMAP.md:240 | `src/commands_execute.rs` | correctness | open | Still recorded as known boundary |
+| M37 | M3 exits: equal-work A/B run, G3 50 ms tick-budget proof, back-to-back integration SHA | specs/implementation-checklist.md:162 | `tools/` measurement gates | ci-release | open | Delegated to P4-1; not yet executed |
+| M38 | NF-3 remaining: real overlay save + client `0x07` sync wire | specs/implementation-checklist.md:171 | `state-store`, `src/play_protocol.rs` | unwired-feature | open | Listed as remaining in checklist |
+| M39 | P1 template/Fossil residue (neighbor-chain, BE/Entity init, gen-tick delivery, real-chunk Fossil) | specs/ROADMAP.md:66; remaining-gaps §7 | `src/structure_template.rs`, `worldgen` | parity | unclear | Batch B4 0-diff promoted; P1 residual scope not recounted |
+| M40 | P0-2 partial: zero-substitution fix merged but Rust build/suite/native-compare unrun | specs/implementation-checklist.md:216 | `src/density` paths | parity | unclear | Checklist marks partial/unfinished |
+| M41 | P2-2 other configured features + latest population order coverage | specs/implementation-checklist.md:138 | `src/feature.rs` | parity | unclear | `bonus_chest`/`end_spike`/`sculk_patch` done; rest unbounded |
+| M42 | `spawn_costs` + NaturalSpawner exec-path real-class comparison | specs/implementation-checklist.md:116 | `src/` spawn path | parity | unclear | Audit snapshot recorded; full closure pending |
+| M43 | Protocol matrix: 18 S2C unsent, DataComponent 45/57 unwired, Menu 13/25 unintegrated | remaining-gaps §5 | `src/play_protocol.rs` packet table | parity | unclear | Not recounted at HEAD; matrix numbers stale |
+| M44 | Feature matrix: ADV 103 missing triggers, RCP 928 partial, MECH 1,397 unverified, TAG/REG/DATA/GR/ENCH partial | remaining-gaps §6 | repo-wide | parity | unclear | Aggregate oracle counts; several sub-systems since improved (enchant cluster still dead per L5) |
+
+## Low
+
+| # | Issue | Source doc · section | Locus | Cat | Status | Evidence |
+|---|-------|---------------------|-------|-----|--------|----------|
+| L1 | TOCTOU `unwrap()` on actor lookup between two lock guards | static-sweep L1 | `src/commands_core.rs:8749` | correctness | open | `contains_key` under one guard, `get().unwrap()` under a fresh guard — still present |
+| L2 | `put_nbt_string` `value.len() as u16` latent truncation | static-sweep L2 | `proto/src/item_components.rs:991` | correctness | open | Still `as u16`; today bounded by `MAX_COMPONENT_BYTES=4096` upstream — latent |
+| L3 | `as u16`/`as u32` truncation casts (~10 sites) on live-mod bridge wire counts | static-sweep L3 | `src/live_mod_bridge.rs:2990-3340` | correctness | open | Feature-gated casts still present |
+| L4 | Anti-xray `mask_chunk`/`obfuscate_chunk` (~110 lines) test-only | static-sweep L4 | `src/antixray.rs:48,104` | unwired-feature | open | `allow(dead_code)` + no production callers (production uses `is_hidden`/`hidden_filler` inline) |
+| L5 | Enchant/melee cluster: 10 fns all `allow(dead_code)` test-only | static-sweep L5 | `src/combat_and_health.rs:621-829` | unwired-feature | open | All callers inside `#[cfg(test)]`; merged into H8 count-wise |
+| L6 | `anvil_io` level-record getters dead (`data_version`,`version_id`,`level_name`,`difficulty_locked`,`game_type`) | static-sweep L6 | `src/anvil_io.rs:846-886` | unwired-feature | open | Still `allow(dead_code)`, no production callers |
+| L7 | Mutex-poison cascade: `.lock().unwrap()` widespread | static-sweep L7 | repo-wide `src/` | correctness | open | Mixed `unwrap()`/`into_inner()` still; one panic poisons shared mutexes |
+| L8 | depsgx absent → `check_layers.py`/`layers_check.sh` cannot run locally | gate-status §5 | `tools/check_layers.py` | ci-release | open | Fail-closed on missing inspector; local runs contribute zero coverage |
+| L9 | `dev_check.py` NOT_CHECKED items: crate cache (first offline build unproven), vanilla_jar MISSING, jdk-vs-21 unestablished | gate-status §1 | `tools/dev_check.py` | ci-release | open | Environmental; vanilla jar absent at `~/.cache/megu-audit/load/vanilla/server.jar` |
+| L10 | `dev_check.py` `STANDALONE_CRATES` names only 10 crates (missing client-ui/client-gpu) | gate-status §1 note; remaining-gaps §44 | `tools/dev_check.py:89-94` | ci-release | fixed | List now includes `client-ui` and `client-gpu` |
+| L11 | 14 wire tests absent from ci.yml; 6 absent from both ci.yml and `tests/verify.sh` (`client_oracle_fuzz`, `protocol_fuzz`, `multiplayer_stress`, `network_limits`, `neoforge_live_server`, `creative_parity`) | gate-status §7; remaining-gaps §1.5 | `.github/workflows/ci.yml`, `tests/verify.sh` | ci-release | open | ci.yml runs 13/27 `*wire*.py`; verify.sh covers most others but the 6 named run in no gate |
+| L12 | Root `megu` crate has no clippy `-D warnings` gate; ~42 default + ~3.9k cast-lint warnings accumulate | gate-status §6 | `.github/workflows/ci.yml`, repo-wide | ci-release | open | Only standalone crates get `-D warnings`; cast hotspots: `landing_types.rs`, `connection_limits.rs`, `paletted.rs`, `nbt.rs` |
+| L13 | `client-gpu` gets clippy+check but no `cargo test` in CI | gate-status §7 | `.github/workflows/ci.yml:91-93` | ci-release | open | Still clippy+check only at HEAD |
+| L14 | One `#[ignore]`d parked gate never exercised (ratchet caps count, doesn't run it) | gate-status §3/§blind | `tools/debt_ratchet.sh` | ci-release | open | `ignored tests (parked gates): 1` at limit |
+| L15 | `/tmp` only ~1.0 GiB free (< 5 GiB) — gates can fail environmentally | gate-status §1/§blind | host | ci-release | open | Environmental warning at audit time |
+| L16 | `provenance_scan.py` exits 1 with usage — report-only probe, not a gate; real gate is `provenance_check.py --strict-zero-gl` (CI only) | gate-status §4/§blind | `tools/provenance_scan.py` | ci-release | open | Doc/tooling clarity issue |
+| L17 | `wiring_audit.py` exits 0 with 13 UNWIRED modules — report-only unless allowlist diffs fail | gate-status §2/§blind | `tools/wiring_audit.py` | ci-release | open | Same row as M6's evidence; gate semantics unfixed |
+| L18 | `inflate`/`zip` decode duplicated across `png_decode.rs`, `shaderpack.rs`, `zip_entries.rs`, `protocol.rs`; `#[path]` includes | zero-bloat #6 | `client-port`, `client-app` | docs | open | Four independent inflate impls remain; `#[path]` gone from client-gpu — partial |
+| L19 | Large test-data + untracked cache boundary in repo | zero-bloat #7 | `tests/data`, `assets/` | ci-release | unclear | Boundary policy not re-audited |
+| L20 | JIT late-latch pacing (sleep-first, post-wake input, `pre_present_notify` skip on vsync-off) | ultra-50k §6.2-6.3; mega-factory F5 | `client-gpu/src/window.rs` | perf | fixed | `JIT late-latch` comment at 2004; `should_call_pre_present_notify(vsync)` gate at 2304-2307; `PresentMode` negotiated from `caps` |
+| L21 | Stale installed `megu`/`megu-inst` binaries may still carry the pre-fix `write_varint` | AUDIT_WIRE · Audit-3 | installed pids/binaries | docs | unclear | Deployment-hygiene note; binaries not inspected |
+| L22 | Login/config-stage packets outside `PacketRateLimit` scope | derived from M1 | `src/play_protocol.rs:9951,10060` | security | unclear | Play loop gated; whether login/config handshakes share the limiter not confirmed |
+| L23 | `parse_wire_frame` test helper lacks its own max-length check | test surface | `src/` tests/helpers | security | unclear | Live readers enforce `MAX_LOGIN_FRAME`/64 KiB; helper is test-only — non-production |
+| L24 | Chunk-stream CPU amplification: each new chunk pays `map_chunk` noise + `section_encode` | AUDIT_WIRE P2 (secondary) | `src/play_protocol.rs` stream path | perf | unclear | `sent` bounded, but per-new-chunk worldgen CPU cost unreviewed |
+| L25 | MeguTaskPool Lane A/B exists; worldgen resident pool only under `mod-suite` (scoped-thread fallback otherwise) | full-multithreading §1; remaining-gaps §3 | `core/src/task_pool.rs`, `src/worldgen.rs` | perf | open | `MeguTaskPool` built; server tick/network + client mesh not unified on it; worldgen uses resident pool only with `mod-suite` |
+| L26 | Async OGG-decode / acoustic-ray workers (Lane B) not confirmed | full-multithreading §3.3 | `client-app/src/audio_out.rs` | perf | unclear | Mix thread is real; decode/ray hand-off to Lane B workers referenced in comments only |
+| L27 | Zlib/AES/chunk-serialize offload to Lane B workers | full-multithreading §2.4 | `src/play_protocol.rs` | perf | open | Not evidenced — encode still on connection thread |
+| L28 | Subworld caster signature `Vec<u32>` per frame | mega-factory F5 | `client-gpu/src/renderer.rs:2769` | perf | fixed | "field set the old `Vec<u32>` signature hashed" — u64 hash compare |
+| L29 | `TactileEffectsSim`/VFX GPU-instanced billboards (24 B) — PCIe 9× cut | quality §4.1; inei-raisan §3 | `client-port/src/vfx_engine.rs`, `client-gpu` | perf | unclear | SoA+LUT landed; GPU-instanced 24 B billboard draw path not confirmed |
+| L30 | Sky/water shader `pow(x,5.0..260.0)` + per-pixel constant recompute | quality §4.3 | `client-port/src/builtin_shadow_wgsl.rs` | perf | unclear | Frame-uniform hoisting/integer-multiply rework not verified |
+| L31 | `xp`/mob/arrow retainers vs `mcount<12`, 300 s despawn, ttls | AUDIT_WIRE · Audit-3 (verified caps) | `src/main.rs` | security | fixed | Caps present per addendum; partially subsumed by M13 |
+| L32 | `decode_packet`/RxBuf frame caps (16 MiB+5 B, login 64 KiB, 3-byte VarInt prefix) | AUDIT_WIRE verified negatives; static-sweep highlights | `src/play_protocol.rs`, `connection_limits.rs` | security | fixed | Confirmed: `vec![0u8; len]` only after `len` cap |
+| L33 | `wiring_audit_allowlist.json` semantics unverified — is the 0 count a real gate? | gate-status §blind | `tools/wiring_audit_allowlist.json` | docs | open | Not inspected this pass |
+| L34 | `sent` clears at 4096 (old code) → replaced by view-window semantics | AUDIT_WIRE verified | `src/play_protocol.rs` | security | fixed | Superseded by M9 evidence |
+| L35 | `dimension_overworld` iteration / spawn-chunk scope | release-010/mega-factory hints | `src/main.rs:1628` | correctness | unclear | `live_spawn_chunks(players)` is player-driven now; per-dim coverage unverified |
+| L36 | `subworld` GPU sync + kinetic/cloud registration | remaining-gaps/mod docs | `client-gpu/src/live_session.rs` | unwired-feature | fixed | `GpuRenderer::sync_subworlds` + subworld/cloud/kinetic registration live |
+| L37 | `OperatorMetricsSnapshot::format_prometheus` unreachable | pre-release §4 matrix | `src/operator_ux.rs:3255` | unwired-feature | fixed | Prometheus output path generated |
+| L38 | `network_limits_wire`/`protocol_fuzz_wire`/`multiplayer_stress_wire`/`neoforge_live_server_wire`/`creative_parity_wire`/`client_oracle_fuzz_wire` never run | gate-status §7 | `tests/` | ci-release | open | Same as L11 — kept for filename clarity |
+| L39 | mob tick `mcount < 12` hostile cap + drops/xp 300 s despawn retained | AUDIT_WIRE verified caps | `src/main.rs` | security | fixed | Verified in addendum; retained for completeness |
+---
+
+### Verification notes
+
+- Checks used `rg`/targeted reads only — no `cargo`/`python` builds or tests, per task rules.
+- "fixed" = the audit's claimed defect site shows the corrective change at HEAD (or the
+  audit's own fix note was independently confirmed). "open" = the flagged site still
+  carries the defect or the wiring path remains absent. "unclear" = the claim could not
+  be confirmed/denied with a quick look (aggregate counts, gate semantics, un-audited
+  callers).
+- Merged duplicates: the "mod offload unwired" finding appears in 3 docs (H13); the UI
+  rasterize finding in 4 docs (H14); the draw-call finding in 4 docs (H15); the audio
+  mono/stereo/routing finding across inei-raisan + mod-audio (H44); the mesh-residency
+  finding across ram-vram + ultra-50k (H19); the launcher-arg and title-button findings
+  share the post-fix doc and inei-raisan §3 (H50/H51/H34).
+- ADR-style aggregate parity numbers (S2C count, component coverage, MECH/ADV/RCP
+  percentages) were not re-derived; treat them as matrix claims, not current tallies.

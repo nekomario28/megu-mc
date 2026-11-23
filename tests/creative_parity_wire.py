@@ -18,7 +18,7 @@ os.environ["MEGU_ALLOW_PLAYER_ADMIN_COMMANDS"] = "1"
 
 from protocol767 import (AIR_STATES, Client, ContractFailure, Reader, ROOT,
                          WIRE_BLOCKS, local_server, position, require,
-                         spawn_window, unpack_position, vint)
+                         spawn_window, string, unpack_position, vint)
 
 # Item ids are the pinned 1.21.1 protocol registry ids.
 STONE, DIRT, OAK_SIGN = 1, 28, 886
@@ -206,8 +206,10 @@ def exercise(game):
         client.until_chunks(spawn_window(), "spawn-window")
         require((cx, cz) in client.chunks, "spawn-chunk")
 
-        # 0x32 creative slots are ignored in the survival default.
-        client.chat("/gamemode creative")
+        # 0x32 creative slots are ignored in the survival default; slash text
+        # sent as a 0x06 chat message relays as chat, so the command must go
+        # through the real 0x04 chat_command packet.
+        client.send(0x04, string("gamemode creative"))
         before = len(client.messages)
 
         def gamemode_confirmed(pid, _body):

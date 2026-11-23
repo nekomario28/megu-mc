@@ -210,8 +210,8 @@ def chat_limits(binary):
                 c.chat("spam")
             assert closes_within(c.socket, 15), "chat flood must disconnect"
         text = log_text(log)
-        assert "Talker disconnected: illegal chat message" in text
-        assert "Spammer disconnected: chat spam" in text
+        assert "Talker disconnected: Illegal characters in chat" in text
+        assert "Spammer disconnected: Kicked for spamming!" in text
     print("chat length + spam: PASS")
 
 
@@ -224,8 +224,10 @@ def public_bind_guard(binary):
         r = subprocess.run([str(binary)], cwd=tmp, env=env, capture_output=True, text=True, timeout=20)
         assert r.returncode == 2, (r.returncode, r.stderr[-500:])
         assert "MEGU_ALLOW_PUBLIC_BIND" in r.stderr, r.stderr[-500:]
-    # with the explicit opt-in it starts (and still answers on loopback)
-    with server(binary, MEGU_BIND_ADDR="0.0.0.0", MEGU_ALLOW_PUBLIC_BIND=1) as (_g, _p, log):
+    # the bind opt-in alone is not enough for offline-mode public exposure: the
+    # second gate also requires the insecure-offline override
+    with server(binary, MEGU_BIND_ADDR="0.0.0.0", MEGU_ALLOW_PUBLIC_BIND=1,
+                MEGU_ALLOW_INSECURE_OFFLINE_PUBLIC=1) as (_g, _p, log):
         assert "non-loopback bind" in log_text(log)
     print("public bind guard: PASS")
 

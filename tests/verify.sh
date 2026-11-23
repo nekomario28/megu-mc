@@ -203,6 +203,11 @@ timeout 180 python3 tests/command_brigadier_ops_wire.py "$binary"
 timeout 180 python3 tests/command_datapack_wire.py
 timeout 180 python3 tests/w1_w3_live_wire.py "$binary"
 timeout 180 python3 tests/live_parity_e2e_wire.py "$binary"
+timeout 180 python3 tests/network_limits_wire.py "$binary"
+timeout 180 python3 tests/protocol_fuzz_wire.py "$binary"
+timeout 180 python3 tests/creative_parity_wire.py "$binary"
+# Ratchet: LD3 is a confirmed defect; drop tolerated ids as fixes land.
+timeout 180 python3 tests/wire_minimality_test.py "$binary" --tolerate LD3
 timeout 180 python3 tools/vanilla_live_diff.py --megu-bin "$binary" --format text --strict
 timeout 180 python3 tests/client_prediction_wire.py --binary "$binary"
 timeout 180 python3 tests/client_inventory_pickup_wire.py --binary "$binary"
