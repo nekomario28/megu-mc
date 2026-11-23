@@ -1429,9 +1429,7 @@ fn furnace_tick() {
             if dirty_pos.contains(&(dim, x, y, z)) {
                 let inv = c.inv.lock().unwrap_or_else(|e| e.into_inner()).clone();
                 let slots = furnace_slot_snapshot_dim(dim, (x, y, z));
-                if let Ok(mut w) = c.sock.lock() {
-                    furnace_push_items_snap(&mut w, &inv, &slots);
-                }
+                furnace_push_items_snap(&c, &inv, &slots);
             }
         }
     }
@@ -8364,7 +8362,7 @@ fn use_live_block_entity(c: &Client, key @ (dim, x, y, z): DimBlockPos, state: u
         if inventory_changed {
             let cursor = c.cursor.lock().unwrap_or_else(|e| e.into_inner());
             let mut sock = c.sock.lock().unwrap_or_else(|e| e.into_inner());
-            send_live_contents(&mut sock, 0, 0, &[], &inv, 0..46, &cursor);
+            send_live_contents(&mut sock, 0, inv_state_next(c), &[], &inv, 0..46, &cursor);
         }
         drop(inv);
         if brush_breaks {
@@ -9347,6 +9345,7 @@ fn write_open_chest_packets(
     initial: &[Stack],
     inv: &HashMap<i16, Stack>,
     title: &str,
+    state_id: i32,
 ) {
     // `first` owns window slots 0..=26 and `second` 27..=53. For a chest pair that is
     // `DoubleBlockCombiner`'s order (`CompoundContainer(right, left)`), not a click
@@ -9358,7 +9357,7 @@ fn write_open_chest_packets(
     p.extend_from_slice(&chat_nbt(if wide { "Large Chest" } else { title }));
     let _ = send_packet(s, 0x33, p);
     let mut q = vec![1u8];
-    write_varint(&mut q, 0);
+    write_varint(&mut q, i64::from(state_id));
     write_varint(&mut q, (rows + 36) as i64);
     for norm in initial {
         q.extend_from_slice(&slot_wire(norm));
@@ -9379,9 +9378,10 @@ fn open_chest_window(
     second: Option<ContainerKey>,
     inv: &HashMap<i16, Stack>,
     title: &str,
+    state_id: i32,
 ) {
     let initial = chest_window_slots((first, second));
-    write_open_chest_packets(s, second.is_some(), &initial, inv, title);
+    write_open_chest_packets(s, second.is_some(), &initial, inv, title, state_id);
 }
 fn open_chest_for_client(
     me: &Client,
@@ -9407,8 +9407,16 @@ fn open_chest_for_client(
         state_id: 0,
         last_slots: initial.clone(),
     });
+    // Vanilla's `sendInitial` runs `incrementStateId()` on the fresh menu: the
+    // open snapshot carries 1 and every later delta continues from there.
+    let open_state_id = {
+        let mut sync_guard = me.chest_sync.lock().unwrap_or_else(|e| e.into_inner());
+        let sync = sync_guard.as_mut().unwrap();
+        sync.state_id = (sync.state_id + 1) & 0x7fff;
+        sync.state_id
+    };
     if let Ok(mut w) = me.sock.lock() {
-        write_open_chest_packets(&mut w, window.1.is_some(), &initial, inv, title);
+        write_open_chest_packets(&mut w, window.1.is_some(), &initial, inv, title, open_state_id);
     }
 }
 fn armor_removal_blocked(slot: i16, stack: Option<&Stack>, creative: bool) -> bool {
@@ -9960,12 +9968,10 @@ fn resync_slot(me: &Client, wid: u8, wslot: i16, st: &Stack) {
         return;
     }
     let mut p = vec![wid];
-    // The player inventory menu shares `inv_state_id`; other windows keep
-    // their own counters (`send_chest_slot` for wid 1).
-    write_varint(
-        &mut p,
-        if wid == 0 { i64::from(inv_state_next(me)) } else { 0 },
-    );
+    // The player inventory menu shares `inv_state_id` (wid 0/2/3 and the
+    // -1/-2 echoes); other windows keep their own counters (`send_chest_slot`
+    // for wid 1). Every packet consumes one `incrementStateId` like vanilla.
+    write_varint(&mut p, i64::from(inv_state_next(me)));
     p.extend_from_slice(&wslot.to_be_bytes());
     p.extend_from_slice(&slot_wire(st));
     if let Ok(mut w) = me.sock.lock() {
@@ -10098,13 +10104,15 @@ fn craft_result(grid: &HashMap<i16, Stack>) -> Option<Stack> {
     // `dyed_color` component like the cauldron does.
     dyed_craft_any((1..=4).filter_map(|i| grid.get(&i)))
 }
-fn open_furnace_window(s: &mut TcpStream, inv: &HashMap<i16, Stack>, slots: &[Stack; 3]) {
+fn open_furnace_window(me: &Client, inv: &HashMap<i16, Stack>, slots: &[Stack; 3]) {
     let mut p = Vec::new();
     write_varint(&mut p, 2); // windowId 2 (chest uses 1)
     write_varint(&mut p, 14); // furnace menu
     p.extend_from_slice(&chat_nbt("Furnace"));
-    let _ = send_packet(s, 0x33, p);
-    furnace_push_items_snap(s, inv, slots);
+    if let Ok(mut s) = me.sock.lock() {
+        let _ = send_packet(&mut s, 0x33, p);
+    }
+    furnace_push_items_snap(me, inv, slots);
 }
 fn furnace_slot_snapshot_dim(dim: DimId, pos: (i32, i32, i32)) -> [Stack; 3] {
     let fs = furnaces().lock().unwrap_or_else(|e| e.into_inner());
@@ -10115,9 +10123,9 @@ fn furnace_slot_snapshot_dim(dim: DimId, pos: (i32, i32, i32)) -> [Stack; 3] {
         f.map(|f| f.output.clone()).unwrap_or((0, 0, Vec::new())),
     ]
 }
-fn furnace_push_items_snap(s: &mut TcpStream, inv: &HashMap<i16, Stack>, slots: &[Stack; 3]) {
+fn furnace_push_items_snap(me: &Client, inv: &HashMap<i16, Stack>, slots: &[Stack; 3]) {
     let mut q = vec![2u8];
-    write_varint(&mut q, 0);
+    write_varint(&mut q, i64::from(inv_state_next(me)));
     write_varint(&mut q, 39);
     for slot in slots {
         q.extend_from_slice(&slot_wire(slot));
@@ -10127,13 +10135,15 @@ fn furnace_push_items_snap(s: &mut TcpStream, inv: &HashMap<i16, Stack>, slots: 
         q.extend_from_slice(&slot_wire(&(it, c, _cc)));
     }
     q.extend_from_slice(&slot_wire(&(0, 0, Vec::new())));
-    let _ = send_packet(s, 0x13, q);
+    if let Ok(mut s) = me.sock.lock() {
+        let _ = send_packet(&mut s, 0x13, q);
+    }
 }
 // The frozen reference in furnace_cache_tests still exercises the original signature.
 #[cfg(test)]
-fn furnace_push_items(s: &mut TcpStream, pos: (i32, i32, i32), inv: &HashMap<i16, Stack>) {
+fn furnace_push_items(me: &Client, pos: (i32, i32, i32), inv: &HashMap<i16, Stack>) {
     let slots = furnace_slot_snapshot_dim(DimId::Overworld, pos);
-    furnace_push_items_snap(s, inv, &slots);
+    furnace_push_items_snap(me, inv, &slots);
 }
 fn ingr_match(ig: &Ingr, item: i64, depth: usize) -> bool {
     match ig {
@@ -11603,7 +11613,7 @@ fn close_live_menu_id(c: &Client, id: Option<u8>, send_close: bool, sync: bool) 
         if send_close {
             let _ = send_packet(&mut sock, 0x12, vec![session.id]);
         }
-        send_live_contents(&mut sock, 0, 0, &[], &inventory, 0..46, &Stack::default());
+        send_live_contents(&mut sock, 0, inv_state_next(c), &[], &inventory, 0..46, &Stack::default());
     }
 }
 

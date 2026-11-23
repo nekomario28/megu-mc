@@ -2169,6 +2169,7 @@ mod tests {
             None,
             &inv,
             "Chest",
+            1,
         );
         // 0x33 opens the window, 0x13 carries the slots.
         let (id, _) = crate::read_packet(&mut receiver, std::time::Instant::now() + std::time::Duration::from_secs(2))
@@ -2206,6 +2207,7 @@ mod tests {
             None,
             &inv,
             "Chest",
+            1,
         );
         let _ = crate::read_packet(&mut receiver, std::time::Instant::now() + std::time::Duration::from_secs(2));
         let (id, payload) = crate::read_packet(&mut receiver, std::time::Instant::now() + std::time::Duration::from_secs(2))

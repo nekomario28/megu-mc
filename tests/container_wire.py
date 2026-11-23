@@ -11,8 +11,9 @@ import subprocess
 import sys
 import tempfile
 import time
-from protocol767 import (Client, ContractFailure, Reader, ROOT, WIRE_BLOCKS,
-                         local_server, port, position, require, status, vint)
+from protocol767 import (AIR_STATES, Client, ContractFailure, Reader, ROOT,
+                         WIRE_BLOCKS, local_server, port, position, require,
+                         status, vint)
 
 RCON_SECRET = "container-wire-rcon-secret"
 
@@ -181,6 +182,18 @@ def enter(client):
     return client.pos
 
 
+def flat_z(client, xs, y, zs, solid, air):
+    """First candidate row where every column has solid ground at `y` and an open
+    cell at `y + 1`. `use_on` can only click a real block — a raycast never
+    targets a fluid cell — and the server refuses a placement whose clicked or
+    target cell is not what that raycast could produce."""
+    for zz in zs:
+        if all(client.block(xx, y, zz) in solid and client.block(xx, y + 1, zz) in air
+               for xx in xs):
+            return zz
+    return None
+
+
 def place_pair(client, by_name, left, right):
     """Place two chests whose pair axis is x. Facing is north because the player looks
     yaw 0 (south) and `getStateForPlacement` takes the opposite direction."""
@@ -190,7 +203,11 @@ def place_pair(client, by_name, left, right):
     client.until(lambda *_: client.block(*left) != 0, "pair-left-place")
     set_creative(client, 36, 299, 1)
     place(client, (right[0], right[1] - 1, right[2]))
-    client.until(lambda *_: chest_type_at(by_name, client.block(*right)) not in (None, "single"),
+    # The partner repair (`ChestBlock.updateShape`) is a separate block update
+    # from the placed half's own: wait until BOTH cells read a paired type or
+    # the left snapshot below can catch it still `single`.
+    client.until(lambda *_: chest_type_at(by_name, client.block(*right)) not in (None, "single")
+                 and chest_type_at(by_name, client.block(*left)) not in (None, "single"),
                  "pair-right")
     lp = chest_props(by_name, client.block(*left))
     rp = chest_props(by_name, client.block(*right))
@@ -346,7 +363,11 @@ def exercise(game, rcon):
         client.send(0x0f, bytes([1]))
 
         # ---- pairing, halves, viewer count, invalidation and drop ----
-        zc = z + 3
+        # The pair row must sit on the flat shelf: the +z shore drops into the
+        # sea, where the clicked cells are fluid and `use_on` cannot target them.
+        # Candidates stay within creative reach (6.0) of the stand at `sz`.
+        zc = flat_z(client, (x, x + 1), y, (z - 3, z - 4, z - 5), solid, AIR_STATES)
+        require(zc is not None, "pair-flat-ground")
         left, right = (x, y + 1, zc), (x + 1, y + 1, zc)
         place_pair(client, by_name, left, right)
         chest_id = [b for b in WIRE_BLOCKS if b["name"] == "chest"][0]["id"]
@@ -464,11 +485,25 @@ def exercise(game, rcon):
         require(chest_props(by_name, client.block(*trap))["type"] == "single",
                 "trapped-chest-beside-chest-stays-single")
 
-        row = [(x + 2, y + 1, z), (x + 3, y + 1, z), (x + 4, y + 1, z)]
+        # z - 2 is skipped: the restart pair below lands there, and a single row
+        # chest beside its right half would join the pairing instead. zc is
+        # skipped for the same reason against the replaced single chest at
+        # (x + 1, zc).
+        zr = flat_z(client, (x + 2, x + 3, x + 4), y,
+                    tuple(zz for zz in (z - 1, z - 3, z - 4) if zz != zc),
+                    solid, AIR_STATES)
+        require(zr is not None, "row-flat-ground")
+        row = [(xx, y + 1, zr) for xx in (x + 2, x + 3, x + 4)]
         set_creative(client, 36, chest, 3)
         for cell in row:
             place(client, (cell[0], cell[1] - 1, cell[2]))
             client.until(lambda *_: client.block(*cell) != 0, "row-place")
+        # Same split-update race as `place_pair`: the first chest's repair to
+        # `left` lands after the second chest's own update.
+        client.until(lambda *_: chest_type_at(by_name, client.block(*row[0]))
+                     not in (None, "single")
+                     and chest_type_at(by_name, client.block(*row[1]))
+                     not in (None, "single"), "row-pair-settle")
         first, middle, third = (chest_props(by_name, client.block(*cell)) for cell in row)
         require((first["type"], middle["type"]) == ("left", "right"), "row-pairs-one-neighbour")
         require(third["type"] == "single", "third-chest-cannot-join-a-pair")

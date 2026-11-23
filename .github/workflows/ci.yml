@@ -125,10 +125,11 @@ jobs:
             python3 tests/network_limits_wire.py "$MEGU_TEST_BINARY"
             python3 tests/protocol_fuzz_wire.py "$MEGU_TEST_BINARY"
             python3 tests/creative_parity_wire.py "$MEGU_TEST_BINARY"
-            # Minimality ratchet: LD3 (stale-stateId resync + click processed
-            # anyway → whole-window 0x13 every click) is a confirmed defect;
-            # tolerate caps it so the fix ratchets the list to empty.
-            python3 tests/wire_minimality_test.py "$MEGU_TEST_BINARY" --tolerate LD3
+            # Minimality ratchet: tolerate list is empty (LD3 fixed — container
+            # echoes now carry real incrementing stateIds). Re-add an id only
+            # with a linked confirmed defect; a tolerated check that stops
+            # reproducing fails review.
+            python3 tests/wire_minimality_test.py "$MEGU_TEST_BINARY" --tolerate ''
             python3 tools/vanilla_live_diff.py --megu-bin "$MEGU_TEST_BINARY" --format text --strict
           fi
       - name: Check Java & mod-suite feature compilation

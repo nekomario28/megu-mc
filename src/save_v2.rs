@@ -4764,7 +4764,7 @@ fn decode_world_payload(payload: &[u8]) -> Result<(), &'static str> {
             );
             *WORLD_SPAWN.lock().unwrap_or_else(|e| e.into_inner()) = (x, y, z, 0.0);
             p += 24;
-            DIFFICULTY.store(b[p], Ordering::Relaxed);
+            DIFFICULTY.store(b[p].min(3), Ordering::Relaxed);
             p += 1;
         }
         if p < payload.len() {

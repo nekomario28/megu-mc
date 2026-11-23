@@ -5133,7 +5133,7 @@ fn run_clear_command(args: &[&str], me: Option<&Arc<Client>>) -> String {
             }
             // resync window 0 so the client drops the cleared items
             let mut q = vec![0u8];
-            write_varint(&mut q, 0);
+            write_varint(&mut q, i64::from(inv_state_next(c)));
             write_varint(&mut q, 46);
             for i in 0..46i16 {
                 let (it2, c2, _cc) = inv.get(&i).cloned().unwrap_or((0, 0, Vec::new()));

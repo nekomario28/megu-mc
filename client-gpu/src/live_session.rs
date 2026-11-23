@@ -2,9 +2,9 @@
 //! Asynchronous live Protocol 767/777 session and renderer-facing world state.
 //! Socket operations happen on a worker thread; `poll` never performs I/O.
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::path::PathBuf;
-use std::sync::mpsc::{self, Receiver, SyncSender, TryRecvError};
+use std::sync::mpsc::{self, Receiver, SyncSender, TryRecvError, TrySendError};
 use std::time::{Duration, Instant};
 
 use megu_client::audio_out::{
@@ -854,7 +854,7 @@ impl LiveSession {
             (true, Some(uuid)) => uuid,
             _ => offline_uuid(&username),
         };
-        let (tx, incoming) = mpsc::sync_channel(256);
+        let (tx, incoming) = mpsc::sync_channel(1024);
         let (outgoing, rx) = mpsc::sync_channel(8);
         std::thread::spawn(move || {
             run_worker(host, port, username, version, login_uuid, auth, tx, rx)
@@ -3325,7 +3325,44 @@ fn run_connection(
     }
     let mut last_input = None;
     let mut last_send = Instant::now();
+    // The protocol loop must never block on render-thread backpressure:
+    // keep-alive and chunk-batch acknowledgements are written at read time,
+    // so a stalled render side (atlas/pipeline compile during join) would
+    // otherwise freeze reads long enough for the server to kick us with a
+    // chunk-batch-ack timeout. Forwarding therefore goes through a bounded
+    // overflow queue instead of a blocking channel send.
+    let mut pending: VecDeque<WorkerMessage> = VecDeque::new();
+    const PENDING_CAP: usize = 8192;
+    let enqueue = |pending: &mut VecDeque<WorkerMessage>,
+                       msg: WorkerMessage|
+     -> Result<(), String> {
+        if pending.is_empty() {
+            match tx.try_send(msg) {
+                Ok(()) => return Ok(()),
+                Err(TrySendError::Full(msg)) => pending.push_back(msg),
+                Err(TrySendError::Disconnected(_)) => return Ok(()),
+            }
+        } else {
+            pending.push_back(msg);
+        }
+        if pending.len() > PENDING_CAP {
+            return Err(
+                "render thread stalled: net→render backlog exceeded cap".to_string()
+            );
+        }
+        Ok(())
+    };
     loop {
+        while let Some(msg) = pending.pop_front() {
+            match tx.try_send(msg) {
+                Ok(()) => {}
+                Err(TrySendError::Full(msg)) => {
+                    pending.push_front(msg);
+                    break;
+                }
+                Err(TrySendError::Disconnected(_)) => return Ok(()),
+            }
+        }
         loop {
             match rx.try_recv() {
                 Ok(WorkerCommand::Movement(movement)) => last_input = Some(movement),
@@ -3419,7 +3456,10 @@ fn run_connection(
         match client.recv_play_with_custom_channels(Duration::from_millis(20))? {
             Some(ClientPlayEvent::Play(PlayEvent::KeepAlive(id))) => client.send_keep_alive(id)?,
             Some(ClientPlayEvent::Play(PlayEvent::ChunkBatchFinished(count))) => {
-                client.send_chunk_batch_received((count.max(1)) as f32)?;
+                // Vanilla reports the chunks-per-tick rate it actually
+                // consumed; echoing the server window would request a batch
+                // larger than the render side can absorb during join.
+                client.send_chunk_batch_received((count.max(1).min(10)) as f32)?;
             }
             Some(ClientPlayEvent::Play(PlayEvent::Teleport(ref teleport))) => {
                 let previous_pose = last_input.map(|movement: PlayerMovement| movement.pose);
@@ -3431,14 +3471,12 @@ fn run_connection(
                     pose.pitch,
                     false,
                 )?;
-                if tx
-                    .send(WorkerMessage::Play(ClientPlayEvent::Play(
-                        PlayEvent::Teleport(teleport.clone()),
-                    )))
-                    .is_err()
-                {
-                    return Ok(());
-                }
+                enqueue(
+                    &mut pending,
+                    WorkerMessage::Play(ClientPlayEvent::Play(PlayEvent::Teleport(
+                        teleport.clone(),
+                    ))),
+                )?;
                 last_input = Some(PlayerMovement {
                     pose,
                     strafe: 0.0,
@@ -3447,22 +3485,14 @@ fn run_connection(
                 });
             }
             Some(ClientPlayEvent::Play(PlayEvent::Disconnect(reason))) => return Err(reason),
-            Some(event) => {
-                if tx.send(WorkerMessage::Play(event)).is_err() {
-                    return Ok(());
-                }
-            }
+            Some(event) => enqueue(&mut pending, WorkerMessage::Play(event))?,
             None => {}
         }
         for event in client.sound_events.drain(..) {
-            if tx.send(WorkerMessage::Sound(event)).is_err() {
-                return Ok(());
-            }
+            enqueue(&mut pending, WorkerMessage::Sound(event))?;
         }
         for event in client.stop_sound_events.drain(..) {
-            if tx.send(WorkerMessage::StopSound(event)).is_err() {
-                return Ok(());
-            }
+            enqueue(&mut pending, WorkerMessage::StopSound(event))?;
         }
     }
 }

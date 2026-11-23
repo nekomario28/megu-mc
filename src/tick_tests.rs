@@ -7540,9 +7540,11 @@ fn chest_contract_multi_viewer_broadcast_changes() {
             .insert(5, s_gold.clone());
     }
     chest_viewer_tick_on(&audience);
+    // The open 0x13 consumed stateId 1 (`sendInitial` -> incrementStateId),
+    // so the first delta broadcast starts at 2.
     let expected = vec![
-        (1u8, 1i64, 3i16, s_iron.clone()),
-        (1u8, 2i64, 32i16, s_gold.clone()),
+        (1u8, 2i64, 3i16, s_iron.clone()),
+        (1u8, 3i64, 32i16, s_gold.clone()),
     ];
     assert_eq!(decode_set_slot_frames(frames_on(&mut r1)), expected);
     assert_eq!(decode_set_slot_frames(frames_on(&mut r2)), expected);
@@ -7562,7 +7564,7 @@ fn chest_contract_multi_viewer_broadcast_changes() {
     send_chest_slot(&v1, 32, &empty);
     assert_eq!(
         decode_set_slot_frames(frames_on(&mut r1)),
-        vec![(1u8, 3i64, 32i16, empty.clone())]
+        vec![(1u8, 4i64, 32i16, empty.clone())]
     );
     chest_viewer_tick_on(&audience);
     assert!(
@@ -7571,7 +7573,7 @@ fn chest_contract_multi_viewer_broadcast_changes() {
     );
     assert_eq!(
         decode_set_slot_frames(frames_on(&mut r2)),
-        vec![(1u8, 3i64, 32i16, empty)]
+        vec![(1u8, 4i64, 32i16, empty)]
     );
 
     for cell in [right, left, other] {

@@ -1122,7 +1122,7 @@ fn anvil_level_dat_from_state(level_name: &str, data_version: i32) -> AnvilLevel
     put("DayTime", AnvilNbt::Long(time));
     put(
         "Difficulty",
-        AnvilNbt::Byte(DIFFICULTY.load(Ordering::Relaxed) as i8),
+        AnvilNbt::Byte(DIFFICULTY.load(Ordering::Relaxed).min(3) as i8),
     );
     put("DifficultyLocked", AnvilNbt::Byte(0));
     put("GameType", AnvilNbt::Int(i32::from(DEFAULT_GAME_MODE.load(Ordering::Relaxed))));

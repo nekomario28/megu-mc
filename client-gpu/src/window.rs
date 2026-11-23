@@ -1493,7 +1493,9 @@ impl GpuApp {
         let mut active = ActiveWindow {
             window,
             surface,
-            renderer: GpuRenderer::new(ctx, surface_format),
+            renderer: {
+                GpuRenderer::new(ctx, surface_format)
+            },
             surface_format,
             size,
         };
@@ -2055,7 +2057,9 @@ impl GpuApp {
 
         // Occluded (minimized / fully covered): zero GPU work. The live
         // session above still polls so the connection stays alive.
-        if self.occluded {
+        if self.occluded
+            && std::env::var_os("MEGU_DISABLE_OCCLUSION_SLEEP").is_none()
+        {
             return;
         }
 
@@ -2306,7 +2310,104 @@ impl GpuApp {
                 {
                     active.window.pre_present_notify();
                 }
+                // One-shot ground-truth readback for capture debugging:
+                // MEGU_FRAME_DUMP=/path.ppm copies the presented surface into
+                // a CPU buffer on present #30 and writes a binary PPM.
+                if let Ok(path) = std::env::var("MEGU_FRAME_DUMP") {
+                    static DUMPED: std::sync::atomic::AtomicBool =
+                        std::sync::atomic::AtomicBool::new(false);
+                    static PN0: std::sync::atomic::AtomicU32 =
+                        std::sync::atomic::AtomicU32::new(0);
+                    let pn = PN0.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    if pn >= 30
+                        && !DUMPED.swap(true, std::sync::atomic::Ordering::Relaxed)
+                    {
+                        let dev = &active.renderer.gpu().device;
+                        let queue = &active.renderer.gpu().queue;
+                        let (w, h) = (w as u32, h as u32);
+                        let row = w * 4;
+                        let padded = row.div_ceil(256) * 256;
+                        let buf = dev.create_buffer(&wgpu::BufferDescriptor {
+                            label: Some("frame-dump"),
+                            size: (padded * h) as u64,
+                            usage: wgpu::BufferUsages::COPY_DST
+                                | wgpu::BufferUsages::MAP_READ,
+                            mapped_at_creation: false,
+                        });
+                        let mut enc = dev.create_command_encoder(
+                            &wgpu::CommandEncoderDescriptor {
+                                label: Some("frame-dump"),
+                            },
+                        );
+                        enc.copy_texture_to_buffer(
+                            wgpu::TexelCopyTextureInfo {
+                                texture: &frame.texture,
+                                mip_level: 0,
+                                origin: wgpu::Origin3d::ZERO,
+                                aspect: wgpu::TextureAspect::All,
+                            },
+                            wgpu::TexelCopyBufferInfo {
+                                buffer: &buf,
+                                layout: wgpu::TexelCopyBufferLayout {
+                                    offset: 0,
+                                    bytes_per_row: Some(padded),
+                                    rows_per_image: Some(h),
+                                },
+                            },
+                            wgpu::Extent3d {
+                                width: w,
+                                height: h,
+                                depth_or_array_layers: 1,
+                            },
+                        );
+                        queue.submit([enc.finish()]);
+                        let slice = buf.slice(..);
+                        let (tx2, rx2) = std::sync::mpsc::channel();
+                        slice.map_async(wgpu::MapMode::Read, move |r| {
+                            let _ = tx2.send(r);
+                        });
+                        let _ = dev.poll(wgpu::PollType::Wait {
+                            submission_index: None,
+                            timeout: Some(std::time::Duration::from_secs(10)),
+                        });
+                        if let Ok(Ok(())) = rx2.recv() {
+                            let data = slice.get_mapped_range().unwrap();
+                            let mut img =
+                                format!("P6\n{} {}\n255\n", w, h).into_bytes();
+                            for y in 0..h as usize {
+                                let start = y * padded as usize;
+                                img.extend_from_slice(
+                                    &data[start..start + row as usize],
+                                );
+                            }
+                            drop(data);
+                            buf.unmap();
+                            let _ = std::fs::write(&path, &img);
+                            eprintln!("[dump] wrote {} ({} bytes)", path, img.len());
+                        }
+                    }
+                }
                 active.renderer.gpu().queue.present(frame);
+                if std::env::var_os("MEGU_FPS_LOG").is_some() {
+                    static FPS: std::sync::OnceLock<
+                        std::sync::Mutex<(std::time::Instant, u32)>,
+                    > = std::sync::OnceLock::new();
+                    let st = FPS.get_or_init(|| {
+                        std::sync::Mutex::new((std::time::Instant::now(), 0))
+                    });
+                    let mut g = st.lock().unwrap();
+                    g.1 += 1;
+                    let el = g.0.elapsed();
+                    if el >= std::time::Duration::from_secs(5) {
+                        eprintln!(
+                            "[fps] {:.1} fps ({} frames / {:.1}s)",
+                            g.1 as f64 / el.as_secs_f64(),
+                            g.1,
+                            el.as_secs_f64()
+                        );
+                        *g = (std::time::Instant::now(), 0);
+                    }
+                }
             }
             wgpu::CurrentSurfaceTexture::Timeout | wgpu::CurrentSurfaceTexture::Occluded => {}
             surface_kind @ (wgpu::CurrentSurfaceTexture::Outdated
@@ -2649,7 +2750,12 @@ fn surface_config_for(
     caps: &wgpu::SurfaceCapabilities,
 ) -> wgpu::SurfaceConfiguration {
     wgpu::SurfaceConfiguration {
-        usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
+        usage: wgpu::TextureUsages::RENDER_ATTACHMENT
+            | if std::env::var_os("MEGU_FRAME_DUMP").is_some() {
+                wgpu::TextureUsages::COPY_SRC
+            } else {
+                wgpu::TextureUsages::empty()
+            },
         format: surface_format,
         color_space: wgpu::SurfaceColorSpace::Auto,
         width: size.width.max(1),
@@ -2891,7 +2997,9 @@ impl ApplicationHandler for GpuApp {
             event_loop.exit();
             return;
         }
-        if self.occluded {
+        if self.occluded
+            && std::env::var_os("MEGU_DISABLE_OCCLUSION_SLEEP").is_none()
+        {
             // Zero-GPU sleep: no redraw requests at all. A slow tick keeps
             // the live session polled until the surface un-occludes.
             if let Some(live) = &mut self.live {
@@ -2931,7 +3039,32 @@ impl ApplicationHandler for GpuApp {
         if let Some(active) = &self.active {
             active.window.request_redraw();
         }
-        event_loop.set_control_flow(ControlFlow::Poll);
+        // Wayland frame-callback starvation: a requested redraw that never
+        // gets dispatched means the compositor is throttling this surface
+        // (fully occluded/unmapped — winit only re-emits RedrawRequested
+        // after a wl_surface.frame callback). Spinning `Poll` here burns a
+        // core at ~1.5M `about_to_wait` iterations/sec doing nothing, so
+        // after 500 ms without a delivered frame fall back to a slow wake
+        // tick; when callbacks resume, `frame_start` refreshes and Poll
+        // pacing returns automatically.
+        if self.frame_start.elapsed() > Duration::from_millis(500) {
+            if let Some(live) = &mut self.live {
+                let planes = Self::frustum_planes_for(
+                    &self.camera_controller,
+                    &self.camera,
+                    self.active.as_ref().map(|a| a.size),
+                );
+                live.poll(
+                    self.camera.position,
+                    planes.as_ref().map_or(&[][..], |p| &p[..]),
+                );
+            }
+            event_loop.set_control_flow(ControlFlow::WaitUntil(
+                Instant::now() + Duration::from_millis(33),
+            ));
+        } else {
+            event_loop.set_control_flow(ControlFlow::Poll);
+        }
     }
 }
 

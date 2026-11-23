@@ -2937,7 +2937,7 @@ fn suitable_hotbar_slot(inv: &HashMap<i16, Stack>, held: i16) -> i16 {
 /// (0..=8 hotbar, 9..=35 main inventory), not menu slots.
 fn send_pick_slot(me: &Client, items_slot: i16, st: &Stack) {
     let mut p = vec![0xFEu8]; // containerId -2
-    write_varint(&mut p, 0);
+    write_varint(&mut p, i64::from(inv_state_next(me)));
     p.extend_from_slice(&items_slot.to_be_bytes());
     p.extend_from_slice(&slot_wire(st));
     let _ = send_packet(&mut me.sock.lock().unwrap_or_else(|e| e.into_inner()), 0x15, p);
@@ -6651,8 +6651,11 @@ fn enter_portal(
         }
     } else {
         // 1:8 horizontal scaling. Overworld (x,z) -> Nether (x/8, z/8) and back.
-        let (ndim, nx, ny, nz) =
-            nether_portal_target(dim, bx, by, bz).expect("only the End has no Nether portal");
+        // The End has no Nether-portal destination; a nether_portal block placed
+        // there by an operator is a no-op, not a panic.
+        let Some((ndim, nx, ny, nz)) = nether_portal_target(dim, bx, by, bz) else {
+            return;
+        };
         materialize_nether_landing(ndim, nx, ny, nz);
         switch_client_dimension(
             me,
@@ -9114,7 +9117,7 @@ fn place_live_recipe(me: &Arc<Client>, place: &PlaceRecipe) {
     );
     let mut echo = |slot: i16, st: &Stack| {
         let mut p = vec![wid];
-        write_varint(&mut p, 0);
+        write_varint(&mut p, i64::from(inv_state_next(&me)));
         p.extend_from_slice(&slot.to_be_bytes());
         p.extend_from_slice(&slot_wire(st));
         let _ = send_packet(&mut sock, 0x15, p);
@@ -9903,7 +9906,7 @@ fn handle_inner(mut s: TcpStream, live_eid: Arc<AtomicI32>) {
         let inv = me.inv.lock().unwrap_or_else(|e| e.into_inner());
         for (&slot, st) in inv.iter() {
             let mut p = vec![0u8];
-            write_varint(&mut p, 0);
+            write_varint(&mut p, i64::from(inv_state_next(&me)));
             p.extend_from_slice(&slot.to_be_bytes());
             p.extend_from_slice(&slot_wire(st));
             let _ = send_packet(&mut me.sock.lock().unwrap_or_else(|e| e.into_inner()), 0x15, p);
@@ -10694,7 +10697,7 @@ fn handle_inner(mut s: TcpStream, live_eid: Arc<AtomicI32>) {
                             });
                             {
                                 let mut p = vec![0u8];
-                                write_varint(&mut p, 0);
+                                write_varint(&mut p, i64::from(inv_state_next(&me)));
                                 p.extend_from_slice(&hs.to_be_bytes());
                                 let now = me.inv.lock().unwrap_or_else(|e| e.into_inner()).get(&hs).cloned().unwrap_or((
                                     0,
@@ -11155,7 +11158,7 @@ fn handle_inner(mut s: TcpStream, live_eid: Arc<AtomicI32>) {
                     p.extend_from_slice(&chat_nbt("Crafting"));
                     let _ = send_packet(&mut me.sock.lock().unwrap_or_else(|e| e.into_inner()), 0x33, p);
                     let mut q = vec![3u8];
-                    write_varint(&mut q, 0);
+                    write_varint(&mut q, i64::from(inv_state_next(&me)));
                     write_varint(&mut q, 46);
                     for _ in 0..46 {
                         q.extend_from_slice(&slot_wire(&(0, 0, Vec::new())));
@@ -11165,7 +11168,7 @@ fn handle_inner(mut s: TcpStream, live_eid: Arc<AtomicI32>) {
                     // now fill: grid empty, inv slots
                     let inv = me.inv.lock().unwrap_or_else(|e| e.into_inner()).clone();
                     let mut r = vec![3u8];
-                    write_varint(&mut r, 0);
+                    write_varint(&mut r, i64::from(inv_state_next(&me)));
                     write_varint(&mut r, 46);
                     for _ in 0..10 {
                         r.extend_from_slice(&slot_wire(&(0, 0, Vec::new())));
@@ -11185,7 +11188,7 @@ fn handle_inner(mut s: TcpStream, live_eid: Arc<AtomicI32>) {
                     *me.open_furnace.lock().unwrap_or_else(|e| e.into_inner()) = Some((dim, x, y, z));
                     let inv = me.inv.lock().unwrap_or_else(|e| e.into_inner()).clone();
                     let slots = furnace_slot_snapshot_dim(dim, (x, y, z));
-                    open_furnace_window(&mut me.sock.lock().unwrap_or_else(|e| e.into_inner()), &inv, &slots);
+                    open_furnace_window(&me, &inv, &slots);
                     let _ = send_packet(&mut me.sock.lock().unwrap_or_else(|e| e.into_inner()), 0x05, ack(seq));
                     continue;
                 }
@@ -11214,7 +11217,7 @@ fn handle_inner(mut s: TcpStream, live_eid: Arc<AtomicI32>) {
                                 .unwrap_or((0, 0, Vec::new()));
                         drop(inv);
                         let mut p = vec![0u8];
-                        write_varint(&mut p, 0);
+                        write_varint(&mut p, i64::from(inv_state_next(&me)));
                         p.extend_from_slice(&(36 + held_slot).to_be_bytes());
                         p.extend_from_slice(&slot_wire(&(i2, c2, _cc)));
                         let _ = send_packet(&mut me.sock.lock().unwrap_or_else(|e| e.into_inner()), 0x15, p);
@@ -11236,7 +11239,7 @@ fn handle_inner(mut s: TcpStream, live_eid: Arc<AtomicI32>) {
                             inv.insert(36 + held_slot, (908, 1, Vec::new()));
                             drop(inv);
                             let mut p = vec![0u8];
-                            write_varint(&mut p, 0);
+                            write_varint(&mut p, i64::from(inv_state_next(&me)));
                             p.extend_from_slice(&(36 + held_slot).to_be_bytes());
                             p.extend_from_slice(&slot_wire(&(908, 1, Vec::new())));
                             let _ = send_packet(&mut me.sock.lock().unwrap_or_else(|e| e.into_inner()), 0x15, p);
@@ -11386,7 +11389,7 @@ fn handle_inner(mut s: TcpStream, live_eid: Arc<AtomicI32>) {
                                     .unwrap_or((0, 0, Vec::new()));
                             drop(inv);
                             let mut p = vec![0u8];
-                            write_varint(&mut p, 0);
+                            write_varint(&mut p, i64::from(inv_state_next(&me)));
                             p.extend_from_slice(&(36 + held_slot).to_be_bytes());
                             p.extend_from_slice(&slot_wire(&(it, c, _cc)));
                             let _ = send_packet(&mut me.sock.lock().unwrap_or_else(|e| e.into_inner()), 0x15, p);
@@ -11432,7 +11435,7 @@ fn handle_inner(mut s: TcpStream, live_eid: Arc<AtomicI32>) {
                                     .unwrap_or((0, 0, Vec::new()));
                             drop(inv);
                             let mut p = vec![0u8];
-                            write_varint(&mut p, 0);
+                            write_varint(&mut p, i64::from(inv_state_next(&me)));
                             p.extend_from_slice(&(36 + held_slot).to_be_bytes());
                             p.extend_from_slice(&slot_wire(&(it, c, _cc)));
                             let _ = send_packet(&mut me.sock.lock().unwrap_or_else(|e| e.into_inner()), 0x15, p);
@@ -11790,7 +11793,7 @@ fn handle_inner(mut s: TcpStream, live_eid: Arc<AtomicI32>) {
                                     Vec::new(),
                                 ));
                             let mut p = vec![0u8];
-                            write_varint(&mut p, 0);
+                            write_varint(&mut p, i64::from(inv_state_next(&me)));
                             p.extend_from_slice(&k.to_be_bytes());
                             p.extend_from_slice(&slot_wire(&(it2, c2, _c2)));
                             let _ = send_packet(&mut me.sock.lock().unwrap_or_else(|e| e.into_inner()), 0x15, p);
@@ -11830,7 +11833,7 @@ fn handle_inner(mut s: TcpStream, live_eid: Arc<AtomicI32>) {
                                     inv.get(&k).cloned().unwrap_or((0, 0, Vec::new()));
                                 drop(inv);
                                 let mut p = vec![0u8];
-                                write_varint(&mut p, 0);
+                                write_varint(&mut p, i64::from(inv_state_next(&me)));
                                 p.extend_from_slice(&k.to_be_bytes());
                                 p.extend_from_slice(&slot_wire(&(it, c, _cc)));
                                 let _ = send_packet(&mut me.sock.lock().unwrap_or_else(|e| e.into_inner()), 0x15, p);
@@ -12516,9 +12519,12 @@ fn handle_inner(mut s: TcpStream, live_eid: Arc<AtomicI32>) {
                     );
                     send_attrs(&me);
                     // vanilla resyncs window 0 after respawn — without it
-                    // the client keeps showing the pre-death inventory
+                    // the client keeps showing the pre-death inventory.
+                    // Respawn builds a fresh InventoryMenu server- and
+                    // client-side, so the shared counter restarts too.
+                    me.inv_state_id.store(0, Ordering::Relaxed);
                     let mut q = vec![0u8]; // window 0 = player inventory
-                    write_varint(&mut q, 0);
+                    write_varint(&mut q, i64::from(inv_state_next(&me)));
                     write_varint(&mut q, 46);
                     {
                         let iv = me.inv.lock().unwrap_or_else(|e| e.into_inner());
@@ -12847,9 +12853,13 @@ fn handle_inner(mut s: TcpStream, live_eid: Arc<AtomicI32>) {
                         if wid != active {
                             continue;
                         }
-                        // Vanilla never rejects on a stale stateId: push the
-                        // authoritative SetContainerContent snapshot with a
-                        // fresh id, then process the click anyway.
+                        // Vanilla never rejects on a stale stateId (verified
+                        // in 1.21.1 ServerGamePacketListenerImpl.
+                        // handleContainerClick bytecode): the click applies
+                        // unconditionally; the flag only selects
+                        // broadcastFullState over broadcastChanges. We push
+                        // the authoritative SetContainerContent snapshot with
+                        // a fresh id first, then process the click anyway.
                         if container_state_stale(&me, wid, click_state_id) {
                             resend_container_content(&me, wid);
                         }
@@ -13065,14 +13075,14 @@ fn handle_inner(mut s: TcpStream, live_eid: Arc<AtomicI32>) {
                                     let mut sock = me.sock.lock().unwrap_or_else(|e| e.into_inner());
                                     for (wsl, st) in slots.iter().enumerate() {
                                         let mut p = vec![2u8];
-                                        write_varint(&mut p, 0);
+                                        write_varint(&mut p, i64::from(inv_state_next(&me)));
                                         p.extend_from_slice(&(wsl as i16).to_be_bytes());
                                         p.extend_from_slice(&slot_wire(st));
                                         let _ = send_packet(&mut sock, 0x15, p);
                                     }
                                     if let Some((slot, st)) = player_slot {
                                         let mut p = vec![2u8];
-                                        write_varint(&mut p, 0);
+                                        write_varint(&mut p, i64::from(inv_state_next(&me)));
                                         p.extend_from_slice(&slot.to_be_bytes());
                                         p.extend_from_slice(&slot_wire(&st));
                                         let _ = send_packet(&mut sock, 0x15, p);
@@ -13158,13 +13168,13 @@ fn handle_inner(mut s: TcpStream, live_eid: Arc<AtomicI32>) {
                                 drop(cur);
                                 if slot >= 0 {
                                     let mut p = vec![3u8];
-                                    write_varint(&mut p, 0);
+                                    write_varint(&mut p, i64::from(inv_state_next(&me)));
                                     p.extend_from_slice(&slot.to_be_bytes());
                                     p.extend_from_slice(&slot_wire(&(it, c, _ce)));
                                     let _ = send_packet(&mut me.sock.lock().unwrap_or_else(|e| e.into_inner()), 0x15, p);
                                 }
                                 let mut p0 = vec![3u8];
-                                write_varint(&mut p0, 0);
+                                write_varint(&mut p0, i64::from(inv_state_next(&me)));
                                 p0.extend_from_slice(&0i16.to_be_bytes());
                                 p0.extend_from_slice(&slot_wire(&(out.0, out.1, Vec::new())));
                                 let _ = send_packet(&mut me.sock.lock().unwrap_or_else(|e| e.into_inner()), 0x15, p0);
@@ -13302,7 +13312,7 @@ fn handle_inner(mut s: TcpStream, live_eid: Arc<AtomicI32>) {
                             let mut sock = me.sock.lock().unwrap_or_else(|e| e.into_inner());
                             if post_result != pre_result {
                                 let mut p = vec![0u8];
-                                write_varint(&mut p, 0);
+                                write_varint(&mut p, i64::from(inv_state_next(&me)));
                                 p.extend_from_slice(&0i16.to_be_bytes());
                                 p.extend_from_slice(&slot_wire(&post_result));
                                 let _ = send_packet(&mut sock, 0x15, p);
@@ -13318,7 +13328,7 @@ fn handle_inner(mut s: TcpStream, live_eid: Arc<AtomicI32>) {
                                     .unwrap_or((0, 0, Vec::new()));
                                 if now != was {
                                     let mut p = vec![0u8];
-                                    write_varint(&mut p, 0);
+                                    write_varint(&mut p, i64::from(inv_state_next(&me)));
                                     p.extend_from_slice(&i.to_be_bytes());
                                     p.extend_from_slice(&slot_wire(&now));
                                     let _ = send_packet(&mut sock, 0x15, p);
@@ -13335,7 +13345,7 @@ fn handle_inner(mut s: TcpStream, live_eid: Arc<AtomicI32>) {
                                     .unwrap_or((0, 0, Vec::new()));
                                 if now != was {
                                     let mut p = vec![0u8];
-                                    write_varint(&mut p, 0);
+                                    write_varint(&mut p, i64::from(inv_state_next(&me)));
                                     p.extend_from_slice(&i.to_be_bytes());
                                     p.extend_from_slice(&slot_wire(&now));
                                     let _ = send_packet(&mut sock, 0x15, p);
@@ -13347,7 +13357,7 @@ fn handle_inner(mut s: TcpStream, live_eid: Arc<AtomicI32>) {
                             };
                             if cursor_differs {
                                 let mut p = vec![0xFFu8];
-                                write_varint(&mut p, 0);
+                                write_varint(&mut p, i64::from(inv_state_next(&me)));
                                 p.extend_from_slice(&(-1i16).to_be_bytes());
                                 p.extend_from_slice(&slot_wire(&post_cur));
                                 let _ = send_packet(&mut sock, 0x15, p);
@@ -13583,7 +13593,7 @@ fn handle_inner(mut s: TcpStream, live_eid: Arc<AtomicI32>) {
                             drop(cur);
                             // cursor echo (window slot -1) + whole-inventory refresh is cheapest
                             let mut pc = vec![0u8];
-                            write_varint(&mut pc, 0);
+                            write_varint(&mut pc, i64::from(inv_state_next(&me)));
                             pc.extend_from_slice(&(-1i16).to_be_bytes());
                             pc.extend_from_slice(&slot_wire(&cp2));
                             if let Ok(mut w) = me.sock.lock() {
@@ -18581,6 +18591,31 @@ mod p5c_live_tests {
         *me.gm.lock().unwrap_or_else(|e| e.into_inner()) = 0;
         *me.in_portal.lock().unwrap_or_else(|e| e.into_inner()) = false;
         *me.portal_at.lock().unwrap_or_else(|e| e.into_inner()) = None;
+    }
+
+    #[test]
+    fn w1_live_wire_end_nether_portal_block_is_a_noop() {
+        crate::test_support::require_vanilla_data();
+        let _guard = world_guard();
+        let _rules = Rules::take(&[
+            "playersNetherPortalDefaultDelay",
+            "playersNetherPortalCreativeDelay",
+        ]);
+        let reg = crate::block_registry::breg().unwrap();
+        let (me, _peer) = loopback_client("w1endportal", 0x7403);
+        *me.dim.lock().unwrap_or_else(|e| e.into_inner()) = DimId::End;
+        _rules.set("playersNetherPortalDefaultDelay", 0);
+        // An operator-placed nether_portal in the End has no destination: the
+        // trip must be a no-op, not the old `.expect` panic per tick.
+        let prev = block_at_dim(DimId::End, 0, 65, 0);
+        set_block_dim(DimId::End, 0, 65, 0, reg.state_of("minecraft:nether_portal", None));
+        tick_portal(&me, 2);
+        set_block_dim(DimId::End, 0, 65, 0, prev);
+        assert_eq!(
+            *me.dim.lock().unwrap_or_else(|e| e.into_inner()),
+            DimId::End,
+            "a Nether portal in the End must not switch dimensions"
+        );
     }
 
     #[test]

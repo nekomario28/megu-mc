@@ -3356,7 +3356,7 @@ fn run_clear_command_parity(args: &[&str], me: Option<&Arc<Client>>) -> String {
             }
             // resync window 0 so the client drops the cleared items
             let mut q = vec![0u8];
-            write_varint(&mut q, 0);
+            write_varint(&mut q, i64::from(inv_state_next(c)));
             write_varint(&mut q, 46);
             for i in 0..46i16 {
                 let (it2, c2, cc2) = inv.get(&i).cloned().unwrap_or((0, 0, Vec::new()));
@@ -8136,7 +8136,7 @@ fn run_command_ctx(ctx: &CmdCtx, msg: &str, s: &mut Option<&Client>) -> String {
                     set_difficulty(d);
                     format!("Set difficulty to {}", args[0])
                 }
-                "" => format!("The difficulty is {}", ["peaceful","easy","normal","hard"][DIFFICULTY.load(Ordering::Relaxed) as usize]),
+                "" => format!("The difficulty is {}", ["peaceful","easy","normal","hard"].get(DIFFICULTY.load(Ordering::Relaxed) as usize).copied().unwrap_or("peaceful")),
                 _ => "usage: /difficulty [peaceful|easy|normal|hard]".into(),
             }
         }
@@ -8739,11 +8739,14 @@ fn run_command_ctx(ctx: &CmdCtx, msg: &str, s: &mut Option<&Client>) -> String {
                 "replace" => {
                     // carpet-actor held-item fast path: replace entity
                     // <actor> weapon.mainhand with <item> [count]
-                    if args.get(1) == Some(&"entity") && args.len() >= 6
+                    let actor = if args.get(1) == Some(&"entity") && args.len() >= 6
                         && !clients().lock().unwrap_or_else(|e| e.into_inner()).iter().any(|c| c.name == args[2])
-                        && actors().lock().unwrap_or_else(|e| e.into_inner()).contains_key(args[2]) {
-                        let a = actors().lock().unwrap_or_else(|e| e.into_inner());
-                        let a = a.get(args[2]).unwrap();
+                    {
+                        actors().lock().unwrap_or_else(|e| e.into_inner()).get(args[2]).cloned()
+                    } else {
+                        None
+                    };
+                    if let Some(a) = actor {
                         let it = name_to_item(args.get(5).copied().unwrap_or("")
                             .split('[').next().unwrap_or("")).unwrap_or(0);
                         let cnt = args.get(6).and_then(|v| v.parse::<u8>().ok()).unwrap_or(1);

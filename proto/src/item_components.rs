@@ -988,7 +988,9 @@ fn tag_id(value: &Nbt) -> u8 {
 }
 
 fn put_nbt_string(w: &mut WireWriter, value: &str) {
-    w.write_u16(value.len() as u16);
+    // The u16 length prefix cannot represent longer strings; every producer is
+    // bounded by MAX_COMPONENT_BYTES, so exceeding it is a bug, not input.
+    w.write_u16(u16::try_from(value.len()).expect("NBT string exceeds u16 length prefix"));
     w.raw(value.as_bytes());
 }
 
