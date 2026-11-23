@@ -235,17 +235,6 @@ pub struct ClientModRegistry {
     items: BTreeMap<u32, String>,
 }
 
-fn mrs1_crc32(bytes: &[u8]) -> u32 {
-    let mut crc = !0u32;
-    for &byte in bytes {
-        crc ^= u32::from(byte);
-        for _ in 0..8 {
-            let mask = 0u32.wrapping_sub(crc & 1);
-            crc = (crc >> 1) ^ (0xEDB8_8320 & mask);
-        }
-    }
-    !crc
-}
 
 impl ClientModRegistry {
     /// Decode MRS1 matching `mod_adapter_core::live_registry_bridge::encode_registry_sync_frame`:
@@ -267,7 +256,7 @@ impl ClientModRegistry {
                 .try_into()
                 .map_err(|_| "truncated MRS1 crc32")?,
         );
-        if mrs1_crc32(&frame[..payload_len]) != expected_crc {
+        if megu_core::hash::crc32_ieee(&frame[..payload_len]) != expected_crc {
             return Err("MRS1 crc32 mismatch".into());
         }
         let mut r = Reader {
@@ -528,7 +517,7 @@ mod tests {
         for (name, data) in entries {
             let offset = file.stream_position().expect("position") as u32;
             let name_bytes = name.as_bytes();
-            let crc = crate::zip_entries::crc32(data);
+            let crc = megu_core::hash::crc32_ieee(data);
             let mut local = Vec::new();
             local.extend_from_slice(&0x0403_4b50u32.to_le_bytes());
             local.extend_from_slice(&20u16.to_le_bytes());
@@ -625,7 +614,7 @@ mod tests {
         let item = "create:wrench";
         frame.extend_from_slice(&(item.len() as u16).to_be_bytes());
         frame.extend_from_slice(item.as_bytes());
-        let crc = mrs1_crc32(&frame);
+        let crc = megu_core::hash::crc32_ieee(&frame);
         frame.extend_from_slice(&crc.to_be_bytes());
         let registry = decode_mrs1_frame(&frame).expect("valid frame");
         assert_eq!(registry.block_state_name(40), Some("create:wheel"));
@@ -643,7 +632,7 @@ mod tests {
         let mut wrong_version = frame[..frame.len() - 4].to_vec();
         wrong_version[4] = 0;
         wrong_version[5] = 2;
-        let bad_ver_crc = mrs1_crc32(&wrong_version);
+        let bad_ver_crc = megu_core::hash::crc32_ieee(&wrong_version);
         wrong_version.extend_from_slice(&bad_ver_crc.to_be_bytes());
         assert!(decode_mrs1_frame(&wrong_version).is_err());
         // Corrupt CRC must fail closed.

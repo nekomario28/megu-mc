@@ -1116,58 +1116,6 @@ pub fn rasterize_draw_list(width: u32, height: u32, list: &UiDrawList) -> Vec<u8
 // PNG encoding (RFC 2083, 8-bit RGBA, zlib stored blocks via RFC 1950)
 // ---------------------------------------------------------------------------
 
-fn crc32(data: &[u8]) -> u32 {
-    let mut crc = 0xffff_ffffu32;
-    for &byte in data {
-        crc ^= u32::from(byte);
-        for _ in 0..8 {
-            crc = if crc & 1 != 0 {
-                (crc >> 1) ^ 0xedb8_8320
-            } else {
-                crc >> 1
-            };
-        }
-    }
-    !crc
-}
-
-fn adler32(data: &[u8]) -> u32 {
-    const MOD: u32 = 65_521;
-    let (mut a, mut b) = (1u32, 0u32);
-    for &byte in data {
-        a = (a + u32::from(byte)) % MOD;
-        b = (b + a) % MOD;
-    }
-    (b << 16) | a
-}
-
-fn zlib_compress_stored(input: &[u8]) -> Vec<u8> {
-    let block_count = input.len().div_ceil(65_535).max(1);
-    let mut out = Vec::with_capacity(2 + input.len() + block_count * 5 + 4);
-    out.push(0x78);
-    out.push(0x01);
-    if input.is_empty() {
-        out.push(0x01);
-        out.extend_from_slice(&0u16.to_le_bytes());
-        out.extend_from_slice(&(!0u16).to_le_bytes());
-    } else {
-        let mut offset = 0;
-        while offset < input.len() {
-            let end = (offset + 65_535).min(input.len());
-            let chunk = &input[offset..end];
-            let is_final = end == input.len();
-            out.push(u8::from(is_final));
-            let len = chunk.len() as u16;
-            out.extend_from_slice(&len.to_le_bytes());
-            out.extend_from_slice(&(!len).to_le_bytes());
-            out.extend_from_slice(chunk);
-            offset = end;
-        }
-    }
-    out.extend_from_slice(&adler32(input).to_be_bytes());
-    out
-}
-
 fn png_chunk(tag: &[u8; 4], data: &[u8]) -> Vec<u8> {
     let mut out = Vec::with_capacity(12 + data.len());
     out.extend_from_slice(&(data.len() as u32).to_be_bytes());
@@ -1176,7 +1124,7 @@ fn png_chunk(tag: &[u8; 4], data: &[u8]) -> Vec<u8> {
     let mut crc_input = Vec::with_capacity(4 + data.len());
     crc_input.extend_from_slice(tag);
     crc_input.extend_from_slice(data);
-    out.extend_from_slice(&crc32(&crc_input).to_be_bytes());
+    out.extend_from_slice(&megu_core::hash::crc32_ieee(&crc_input).to_be_bytes());
     out
 }
 
@@ -1193,7 +1141,7 @@ pub fn encode_png_rgba(width: u32, height: u32, rgba: &[u8]) -> Vec<u8> {
         raw.push(0); // filter type 0: None
         raw.extend_from_slice(row);
     }
-    let idat = zlib_compress_stored(&raw);
+    let idat = megu_core::zip_archive::zlib_compress_stored(&raw);
 
     let mut out = Vec::with_capacity(8 + 25 + 12 + idat.len() + 12);
     out.extend_from_slice(b"\x89PNG\r\n\x1a\n");

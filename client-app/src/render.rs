@@ -1211,10 +1211,7 @@ fn normal_face_index(n: [f32; 3]) -> usize {
 /// brightness, and `tintindex >= 0` multiplies in a deterministic biome-class
 /// tint like the CPU `tint` word does for packed quads.
 fn baked_quad_color(quad: &BakedModelQuad) -> [f32; 3] {
-    let mut hash = 0xcbf2_9ce4_8422_2325u64;
-    for &b in quad.texture.as_bytes() {
-        hash = (hash ^ u64::from(b)).wrapping_mul(0x0000_0100_0000_01b3);
-    }
+    let hash = megu_core::hash::fnv1a64(quad.texture.as_bytes());
     let base = hsv_to_rgb((hash as f64 * 0.618_033_988_749_895).fract(), 0.55, 0.9);
     let shade = if quad.shade {
         FACE_SHADE[normal_face_index(quad.normal)]
@@ -2327,21 +2324,6 @@ pub fn render_vanilla_particles(
 // PNG encoding (RFC 2083, 8-bit RGB, zlib stored blocks via RFC 1950)
 // ---------------------------------------------------------------------------
 
-fn crc32(data: &[u8]) -> u32 {
-    let mut crc = 0xffff_ffffu32;
-    for &byte in data {
-        crc ^= u32::from(byte);
-        for _ in 0..8 {
-            crc = if crc & 1 != 0 {
-                (crc >> 1) ^ 0xedb8_8320
-            } else {
-                crc >> 1
-            };
-        }
-    }
-    !crc
-}
-
 fn png_chunk(tag: &[u8; 4], data: &[u8]) -> Vec<u8> {
     let mut out = Vec::with_capacity(12 + data.len());
     out.extend_from_slice(&(data.len() as u32).to_be_bytes());
@@ -2350,7 +2332,7 @@ fn png_chunk(tag: &[u8; 4], data: &[u8]) -> Vec<u8> {
     let mut crc_input = Vec::with_capacity(4 + data.len());
     crc_input.extend_from_slice(tag);
     crc_input.extend_from_slice(data);
-    out.extend_from_slice(&crc32(&crc_input).to_be_bytes());
+    out.extend_from_slice(&megu_core::hash::crc32_ieee(&crc_input).to_be_bytes());
     out
 }
 

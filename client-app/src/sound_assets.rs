@@ -185,12 +185,7 @@ pub fn normalize_sound_name(name: &str) -> &str {
 /// FNV-1a over a sound name — stable `SoundKey::sound_id` for limiter
 /// coalescing and deterministic placeholder/variant hashing.
 pub fn sound_name_hash(name: &str) -> u64 {
-    let mut h = 0xcbf2_9ce4_8422_2325_u64;
-    for b in normalize_sound_name(name).as_bytes() {
-        h ^= u64::from(*b);
-        h = h.wrapping_mul(0x0000_0100_0000_01b3);
-    }
-    h
+    megu_core::hash::fnv1a64(normalize_sound_name(name).as_bytes())
 }
 
 /// One playable variant of a sound event from `sounds.json`.

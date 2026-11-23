@@ -2440,12 +2440,7 @@ fn glyph_fallback(seed: &str, salt: u8) -> [u8; GLYPH_PIXELS] {
 }
 
 fn stable_hash(text: &str) -> u64 {
-    let mut hash = 0xcbf29ce484222325u64;
-    for &byte in text.as_bytes() {
-        hash ^= u64::from(byte);
-        hash = hash.wrapping_mul(0x100000001b3);
-    }
-    hash
+    megu_core::hash::fnv1a64_str(text)
 }
 
 fn badge_palette(kind: BadgeKind, sprite_key: &str, accent: [u8; 4]) -> [[u8; 4]; 8] {

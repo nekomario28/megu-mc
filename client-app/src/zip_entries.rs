@@ -245,7 +245,7 @@ impl ZipArchive {
         // directory already supplied it, so flag bit 3 needs no extra parse.
         let data = match entry.method {
             0 => comp,
-            8 => inflate(&comp, max_out)
+            8 => megu_core::zip_archive::inflate_raw_rfc1951(&comp, max_out)
                 .map_err(|e| format!("zip entry {name}: {e}"))?,
             m => return Err(format!("zip entry {name}: method {m} unsupported")),
         };
@@ -256,37 +256,10 @@ impl ZipArchive {
                 entry.uncomp_size
             ));
         }
-        if crc32(&data) != entry.crc32 {
+        if megu_core::hash::crc32_ieee(&data) != entry.crc32 {
             return Err(format!("zip entry {name}: CRC32 mismatch"));
         }
         Ok(Some(data))
     }
 }
 
-/// IEEE CRC32 (same polynomial as PNG/zlib) — also used by tests to author
-/// clean-room archives.
-pub fn crc32(data: &[u8]) -> u32 {
-    // Bitwise implementation: a 256-entry table build costs a const lookup
-    // anyway, and audio payloads are ≤64 MiB so speed is not the constraint.
-    let mut crc = 0xFFFF_FFFFu32;
-    for &b in data {
-        crc ^= u32::from(b);
-        for _ in 0..8 {
-            crc = if crc & 1 != 0 {
-                (crc >> 1) ^ 0xEDB8_8320
-            } else {
-                crc >> 1
-            };
-        }
-    }
-    !crc
-}
-
-// ---------------------------------------------------------------------------
-// DEFLATE — shared clean-room decoder (same implementation the PNG,
-// shader-pack and protocol readers use).
-// ---------------------------------------------------------------------------
-
-pub fn inflate(compressed: &[u8], max_out: usize) -> Result<Vec<u8>, String> {
-    megu_client_mesh::inflate::inflate(compressed, max_out).map_err(|e| e.to_string())
-}

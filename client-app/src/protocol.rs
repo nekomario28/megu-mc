@@ -519,22 +519,34 @@ impl<'a> WireReader<'a> {
         Ok(f64::from_be_bytes(self.take(8)?.try_into().unwrap()))
     }
 
-    /// Delegated to `megu_proto`'s canonical reader — identical bounds
+    /// Delegated to `megu_core`'s canonical reader — identical bounds
     /// (final byte `& 0xf0` rejected, five bytes max); the `String` error
     /// surface this module's callers use is kept.
     pub fn read_varint(&mut self) -> Result<i32, String> {
-        let mut r = megu_proto::WireReader::new(self.rest());
-        let value = r.read_varint().map_err(|e| e.to_string())?;
-        self.pos += r.position();
+        let (value, len) = megu_core::varint::read_varint_i32(self.rest()).map_err(|e| {
+            match e {
+                megu_core::varint::VarIntError::UnexpectedEof => {
+                    "truncated wire: need 1 byte(s), 0 left".to_string()
+                }
+                other => other.to_string(),
+            }
+        })?;
+        self.pos += len;
         Ok(value)
     }
 
-    /// Delegated to `megu_proto`'s canonical reader — identical bounds
+    /// Delegated to `megu_core`'s canonical reader — identical bounds
     /// (final byte `& 0xfe` rejected, ten bytes max).
     pub fn read_varlong(&mut self) -> Result<i64, String> {
-        let mut r = megu_proto::WireReader::new(self.rest());
-        let value = r.read_varlong().map_err(|e| e.to_string())?;
-        self.pos += r.position();
+        let (value, len) = megu_core::varint::read_varlong_i64(self.rest()).map_err(|e| {
+            match e {
+                megu_core::varint::VarIntError::UnexpectedEof => {
+                    "truncated wire: need 1 byte(s), 0 left".to_string()
+                }
+                other => other.to_string(),
+            }
+        })?;
+        self.pos += len;
         Ok(value)
     }
 
@@ -773,18 +785,14 @@ impl NbtValue {
     }
 }
 
-/// Delegated to `megu_proto`'s canonical `WireWriter` — `from_vec`
-/// appends in place, so no copy of the caller's buffer is made.
+/// Delegated to `megu_core`'s canonical VarInt encoder.
 pub fn write_varint(buf: &mut Vec<u8>, value: i32) {
-    let mut w = megu_proto::WireWriter::from_vec(std::mem::take(buf));
-    w.write_varint(value);
-    *buf = w.into_vec();
+    megu_core::varint::write_varint_i32(value, buf);
 }
 
+/// Delegated to `megu_core`'s canonical VarLong encoder.
 pub fn write_varlong(buf: &mut Vec<u8>, value: i64) {
-    let mut w = megu_proto::WireWriter::from_vec(std::mem::take(buf));
-    w.write_varlong(value);
-    *buf = w.into_vec();
+    megu_core::varint::write_varlong_i64(value, buf);
 }
 
 pub fn write_string(buf: &mut Vec<u8>, s: &str) {
@@ -909,51 +917,17 @@ fn md5(data: &[u8]) -> [u8; 16] {
 // ---------------------------------------------------------------------------
 
 pub fn adler32(data: &[u8]) -> u32 {
-    const MOD: u32 = 65_521;
-    let mut s1 = 1u32;
-    let mut s2 = 0u32;
-    for &b in data {
-        s1 = (s1 + u32::from(b)) % MOD;
-        s2 = (s2 + s1) % MOD;
-    }
-    (s2 << 16) | s1
+    megu_core::zip_archive::adler32(data)
 }
 
 /// Encode bytes into a valid RFC 1950 zlib stream using RFC 1951 stored blocks.
 pub fn zlib_compress_stored(input: &[u8]) -> Vec<u8> {
-    let block_count = input.len().div_ceil(65_535).max(1);
-    let mut out = Vec::with_capacity(2 + input.len() + block_count * 5 + 4);
-    // CMF=0x78 (DEFLATE, 32K window), FLG=0x01 (FCHECK valid, no dict, fastest level)
-    out.push(0x78);
-    out.push(0x01);
-
-    if input.is_empty() {
-        out.push(0x01); // BFINAL=1, BTYPE=00 (stored)
-        out.extend_from_slice(&0u16.to_le_bytes());
-        out.extend_from_slice(&(!0u16).to_le_bytes());
-    } else {
-        let mut offset = 0;
-        while offset < input.len() {
-            let end = (offset + 65_535).min(input.len());
-            let chunk = &input[offset..end];
-            let is_final = end == input.len();
-            out.push(u8::from(is_final));
-            let len = chunk.len() as u16;
-            out.extend_from_slice(&len.to_le_bytes());
-            out.extend_from_slice(&(!len).to_le_bytes());
-            out.extend_from_slice(chunk);
-            offset = end;
-        }
-    }
-
-    out.extend_from_slice(&adler32(input).to_be_bytes());
-    out
+    megu_core::zip_archive::zlib_compress_stored(input)
 }
 
 /// Decode an RFC 1950 zlib stream with an explicit uncompressed byte budget.
-/// Decode an RFC 1950 zlib stream with an explicit uncompressed byte budget.
 pub fn zlib_decompress(input: &[u8], budget: usize) -> Result<Vec<u8>, String> {
-    megu_client_mesh::inflate::inflate_zlib(input, budget).map_err(|e| e.to_string())
+    megu_core::zip_archive::zlib_decompress_capped(input, budget).map_err(|e| e.to_string())
 }
 
 

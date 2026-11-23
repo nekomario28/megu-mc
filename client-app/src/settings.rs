@@ -17,6 +17,7 @@
 use std::path::Path;
 
 use megu_client_mesh::RenderBackendPreference;
+use megu_core::hash::fnv1a64;
 
 use crate::crash_reporter::{parse_report_url, CrashSubmitPolicy};
 
@@ -1288,17 +1289,6 @@ impl SettingsSaveGuard {
     }
 }
 
-/// FNV-1a over `bytes` — the same 64-bit digest `sound_name_hash` uses for
-/// sound names: cheap, deterministic, and sufficient for "did these exact
-/// bytes change" comparisons between one writer and one file.
-fn fnv1a64(bytes: &[u8]) -> u64 {
-    let mut h = 0xcbf2_9ce4_8422_2325_u64;
-    for &b in bytes {
-        h ^= u64::from(b);
-        h = h.wrapping_mul(0x0000_0100_0000_01b3);
-    }
-    h
-}
 
 /// Write `bytes` to `path` atomically: a sibling `*.tmp` file is written
 /// first, then renamed over `path`, so a crash mid-write can never leave a

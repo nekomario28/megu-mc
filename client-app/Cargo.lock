@@ -79,6 +79,7 @@ name = "megu-client"
 version = "0.1.0"
 dependencies = [
  "megu-client-mesh",
+ "megu-core",
  "megu-kernel",
  "megu-proto",
  "signal-hook",

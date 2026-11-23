@@ -18,6 +18,7 @@ path = "src/main.rs"
 megu_kernel = { package = "megu-kernel", path = "../client-kernel" }
 megu_client_mesh = { package = "megu-client-mesh", path = "../client-port" }
 megu_proto = { package = "megu-proto", path = "../proto" }
+megu_core = { package = "megu-core", path = "../core" }
 symphonia = { version = "=0.5.5", default-features = false, features = ["ogg", "vorbis"] }
 
 [target.'cfg(unix)'.dependencies]
