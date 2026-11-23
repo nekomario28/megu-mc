@@ -13,11 +13,120 @@
 //! The shape follows the design of Pumpkin's chunk tick scheduler (a design
 //! reference only, see issue #3 and THIRD_PARTY.md); the code is this repository's own.
 
-use std::collections::HashMap;
+use std::cmp::Reverse;
+use std::collections::{BinaryHeap, HashMap};
+use std::hash::Hash;
 
 /// Four seconds, in ticks. Derived from the cadence rather than written as a
 /// literal so it stays four seconds if the cadence changes.
 pub(crate) const MAX_DELAY: usize = super::MAX_DELAY_TICKS;
+
+/// A deadline queue for machines that should sleep until an event or scheduled
+/// update makes them due. The map is authoritative; superseded heap entries are
+/// lazy tombstones and are discarded when they reach the front or during compaction.
+#[allow(dead_code)]
+pub(crate) struct DueMachineQueue<K: Eq + Hash + Ord + Copy> {
+    deadlines: HashMap<K, u64>,
+    due: BinaryHeap<Reverse<(u64, K)>>,
+}
+
+#[allow(dead_code)]
+impl<K: Eq + Hash + Ord + Copy> DueMachineQueue<K> {
+    const COMPACTION_SLACK: usize = 64;
+
+    pub(crate) fn new() -> Self {
+        Self {
+            deadlines: HashMap::new(),
+            due: BinaryHeap::new(),
+        }
+    }
+
+    /// Schedule a machine once, retaining the earliest requested deadline.
+    pub(crate) fn schedule_due(&mut self, key: K, due_tick: u64) {
+        if let Some(&current) = self.deadlines.get(&key) {
+            if current <= due_tick {
+                return;
+            }
+        }
+
+        self.deadlines.insert(key, due_tick);
+        self.due.push(Reverse((due_tick, key)));
+        self.compact_if_needed();
+    }
+
+    /// Make a machine due immediately after a mutation or other wake event.
+    pub(crate) fn wake(&mut self, key: K, now_tick: u64) {
+        self.schedule_due(key, now_tick);
+    }
+
+    /// Cancel a machine's pending update. Heap removal is lazy and amortized;
+    /// stale entries are bounded by periodic compaction.
+    pub(crate) fn remove(&mut self, key: K) {
+        self.deadlines.remove(&key);
+        if self.deadlines.is_empty() {
+            // The compaction threshold bounds the number of tombstones here.
+            self.due.clear();
+        } else {
+            self.compact_if_needed();
+        }
+    }
+
+    /// Append all due keys in `(due_tick, key)` order.
+    pub(crate) fn drain_due_into(&mut self, now_tick: u64, out: &mut Vec<K>) {
+        if self.next_due_tick().is_none_or(|next| next > now_tick) {
+            return;
+        }
+
+        while let Some(&Reverse((due_tick, key))) = self.due.peek() {
+            if due_tick > now_tick {
+                break;
+            }
+            self.due.pop();
+            if self.deadlines.get(&key).copied() == Some(due_tick) {
+                self.deadlines.remove(&key);
+                out.push(key);
+            }
+        }
+
+        if self.deadlines.is_empty() {
+            self.due.clear();
+        } else {
+            self.compact_if_needed();
+        }
+    }
+
+    pub(crate) fn clear(&mut self) {
+        self.deadlines.clear();
+        self.due.clear();
+    }
+
+    pub(crate) fn len(&self) -> usize {
+        self.deadlines.len()
+    }
+
+    pub(crate) fn is_empty(&self) -> bool {
+        self.deadlines.is_empty()
+    }
+
+    pub(crate) fn next_due_tick(&self) -> Option<u64> {
+        self.due.peek().map(|entry| (entry.0).0)
+    }
+
+    fn compact_if_needed(&mut self) {
+        let limit = self
+            .deadlines
+            .len()
+            .saturating_mul(2)
+            .saturating_add(Self::COMPACTION_SLACK);
+        if self.due.len() > limit {
+            self.due = self
+                .deadlines
+                .iter()
+                .map(|(&key, &tick)| Reverse((tick, key)))
+                .collect();
+        }
+    }
+}
 
 /// A cell that wants to be visited again later.
 ///
@@ -244,5 +353,93 @@ mod tests {
             assert!(q.due().is_empty());
         }
         assert_eq!(q.len(), 0);
+    }
+}
+
+#[cfg(test)]
+mod due_machine_tests {
+    use super::DueMachineQueue;
+
+    #[test]
+    fn idle_drains_do_not_pop_or_allocate_after_all_machines_are_removed() {
+        let mut queue = DueMachineQueue::new();
+        for key in 0..1_000_u32 {
+            queue.schedule_due(key, 10_000 + u64::from(key));
+        }
+        for key in 0..1_000_u32 {
+            queue.remove(key);
+        }
+        assert!(queue.is_empty());
+        assert!(queue.due.is_empty());
+
+        let mut out = Vec::new();
+        for tick in 0..1_000 {
+            queue.drain_due_into(tick, &mut out);
+            assert!(out.is_empty());
+            assert!(queue.due.is_empty(), "idle drain must not pop heap entries");
+        }
+    }
+
+    #[test]
+    fn an_earlier_wakeup_promotes_and_fires_only_once() {
+        let mut queue = DueMachineQueue::new();
+        queue.schedule_due(7_u32, 200);
+        queue.wake(7, 10);
+        assert_eq!(queue.len(), 1);
+        assert_eq!(queue.next_due_tick(), Some(10));
+
+        let mut out = Vec::new();
+        queue.drain_due_into(10, &mut out);
+        assert_eq!(out, vec![7]);
+        queue.drain_due_into(200, &mut out);
+        assert_eq!(out, vec![7], "superseded deadline must not fire again");
+        assert!(queue.is_empty());
+    }
+
+    #[test]
+    fn due_keys_are_ordered_by_tick_then_key() {
+        let mut queue = DueMachineQueue::new();
+        queue.schedule_due(9_u32, 20);
+        queue.schedule_due(4, 10);
+        queue.schedule_due(2, 20);
+        queue.schedule_due(1, 10);
+
+        let mut out = Vec::new();
+        queue.drain_due_into(20, &mut out);
+        assert_eq!(out, vec![1, 4, 2, 9]);
+    }
+
+    #[test]
+    fn removal_suppresses_firing_and_churn_keeps_heap_bounded() {
+        let mut queue = DueMachineQueue::new();
+        queue.schedule_due(0_u32, 1_000);
+        queue.remove(0);
+        let mut out = Vec::new();
+        queue.drain_due_into(2_000, &mut out);
+        assert!(out.is_empty());
+
+        queue.schedule_due(0, 10_000);
+        for key in 1..10_001_u32 {
+            queue.schedule_due(key, u64::from(key));
+            queue.remove(key);
+            assert!(queue.due.len() <= queue.len() * 2 + DueMachineQueue::<u32>::COMPACTION_SLACK);
+        }
+        queue.remove(0);
+        assert!(queue.is_empty());
+        assert!(queue.due.is_empty());
+        queue.drain_due_into(u64::MAX, &mut out);
+        assert!(out.is_empty());
+    }
+
+    #[test]
+    fn clear_discards_scheduled_and_stale_entries() {
+        let mut queue = DueMachineQueue::new();
+        queue.schedule_due(1_u32, 10);
+        queue.wake(1, 2);
+        queue.schedule_due(2, 20);
+        queue.clear();
+        assert!(queue.is_empty());
+        assert_eq!(queue.len(), 0);
+        assert_eq!(queue.next_due_tick(), None);
     }
 }
