@@ -9,8 +9,8 @@ note per item.
 Confirmed non-persisted vanilla state, by source inspection:
 
 - map data (`live_map_states` — item frame / cartography map payloads)
-- scoreboard teams beyond partial fields
-- custom bossbars
+- ~~scoreboard teams beyond partial fields~~ — persisted as TEM1 (beeaa890)
+- ~~custom bossbars~~ — persisted as BAR1 (beeaa890)
 - End-fight tracking (dragon fight sequence state)
 - portal link records
 - wandering-trader scheduler timers
@@ -19,7 +19,13 @@ Confirmed non-persisted vanilla state, by source inspection:
 
 Already persisted (verified present): modeled villager restock data, raids,
 world time, weather countdowns, player respawn targets, scheduled fluid
-ticks, falling blocks.
+ticks, falling blocks, custom bossbars, scoreboard teams.
+
+Note: `save_v2_panics_abort_the_boundary_and_corruption_cannot_apply_the_new_state`
+fails on clean HEAD (pre-existing, another lane's refactor) — the fixture's
+poisoned-mutex premise no longer panics inside `WorldSaveSnapshot::capture`
+because `saved_value` is poison-tolerant; the writer runs outside the catch
+boundary. Needs a lane to re-establish the guard's coverage or update the test.
 
 Partial: scoreboards, projectile ownership (raw entity IDs rather than UUID),
 item-frame and armor-stand state.
