@@ -8,6 +8,9 @@ on:
   pull_request:
     branches: [main]
   workflow_dispatch:
+  schedule:
+    # Full verify.sh sweep (wire/oracle tail beyond the per-push smoke subset).
+    - cron: '17 3 * * *'
 
 permissions:
   contents: read
@@ -45,6 +48,7 @@ jobs:
             python3 tests/live_playability_e2e_test.py
           fi
           python3 tests/megu_tui_test.py
+          python3 tests/verify_gate_coverage_test.py
           python3 tests/installer_cross_os_test.py
           python3 website/check_site.py
           node website/test_functions.mjs
@@ -186,3 +190,20 @@ jobs:
             git diff -- src
             exit 1
           fi
+  nightly-verify:
+    if: github.event_name == 'schedule'
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    env:
+      CARGO_BUILD_JOBS: 2
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master
+        with:
+          toolchain: 1.98.0
+      - name: Fetch locked dependencies
+        run: cargo fetch --locked
+      - name: Full verify sweep without mutations
+        run: bash tests/verify.sh --without-mutations

@@ -33,6 +33,9 @@ export MC_PROBE_DEADLINE="${MC_PROBE_DEADLINE:-30}"
 
 echo "== portable fluid trace comparator"
 python3 tests/fluid_trace_diff_test.py
+python3 tests/ci_playability_gate_test.py
+python3 tests/live_playability_e2e_test.py
+python3 tests/fossil_chunk_acceptance_test.py
 
 echo "== gate exit contracts"
 python3 tests/gate_scripts.py
