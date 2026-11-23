@@ -40,7 +40,7 @@
 
 ## 2. Rust 依存クレートのライセンス / Rust dependency licenses
 
-`cargo metadata --format-version 1 --locked --all-features` (Cargo.lock, 2026-10-25) の `license` フィールドをそのまま転記したもの。`cargo-deny` (`deny.toml`) が CI で同じ集合を検査します。`megu` 自体は `Cargo.toml` で `license = "GPL-3.0-or-later OR LGPL-3.0-or-later"` を宣言しています (`LICENSE` / `COPYING.LESSER` と一致)。依存クレート 78 個に GPL / LGPL / AGPL / MPL のものはありません (LICENSING.md §2a)。
+`cargo metadata --format-version 1 --locked --all-features` (Cargo.lock, 2026-10-25) の `license` フィールドをそのまま転記したもの。`cargo-deny` (`deny.toml`) が CI で同じ集合を検査します。`megu` 自体は `Cargo.toml` で `license = "LGPL-3.0-or-later"` を宣言しています (`COPYING.LESSER` / 付随 `LICENSE` と一致)。依存クレート 78 個に GPL / LGPL / AGPL / MPL のものはありません (LICENSING.md §2a)。
 Copied verbatim from the `license` field of each crate's published metadata; this is what the crates declare, not an independent verification of their license texts. 78 crates (optional JNI adapters included).
 
 | crate | version | license (as declared) | 種別 |
