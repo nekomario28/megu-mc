@@ -723,6 +723,20 @@ class RunSessionDirect(unittest.TestCase):
         rel = result.cmd[result.cmd.index("--server-bin") + 1]
         self.assertEqual(rel, "./target/release/megu")
 
+    def test_create_factory_header_versions(self):
+        world = self.base / "world"
+        world.mkdir()
+        for header in (b"MCF1", b"MCF2"):
+            with self.subTest(header=header):
+                (world / "create_factory.bin").write_bytes(header + b"\x00" * 5)
+                self.assertTrue(gate.valid_create_factory(
+                    (world / "create_factory.bin").read_bytes()))
+        for data in (b"MCF0\x00" * 2, b"XXXX\x00\x00\x00\x00\x00", b"MCF2\x00"):
+            with self.subTest(data=data):
+                (world / "create_factory.bin").write_bytes(data)
+                self.assertFalse(gate.valid_create_factory(
+                    (world / "create_factory.bin").read_bytes()))
+
     def test_session_join_timeout(self):
         result = gate.run_session(
             label="t", mode="vanilla",

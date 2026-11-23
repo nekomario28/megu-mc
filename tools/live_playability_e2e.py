@@ -469,6 +469,10 @@ def _scrub_env(extra):
     return env
 
 
+def valid_create_factory(data):
+    return len(data) >= 9 and data[:4] in (b"MCF1", b"MCF2")
+
+
 def run_session(*, label, mode, client_bin, server_bin_arg, run_cwd, game_dir,
                 world, username, ticks, view_distance, seed, join_timeout,
                 exit_timeout, save_timeout, env_extra=None):
@@ -602,8 +606,7 @@ def run_session(*, label, mode, client_bin, server_bin_arg, run_cwd, game_dir,
     try:
         create_factory = (world_dir / "create_factory.bin").read_bytes()
         result.create_factory_bytes = len(create_factory)
-        result.create_factory_valid = (
-            len(create_factory) >= 9 and create_factory[:4] == b"MCF1")
+        result.create_factory_valid = valid_create_factory(create_factory)
     except OSError:
         pass
     return result
@@ -853,7 +856,7 @@ def check_create_live(first, restart, create_jar, gpu_probe=None):
             check.note("GPU headless probe accepted the modded gameDir and exited cleanly; this probe does not load rendered mod assets")
     else:
         check.note("GPU probe not run because --gpu-client-bin was not supplied")
-    check.note("Create arm is evidenced by a valid MCF1 sidecar on both saves; restart join with Create enabled verifies sidecar reload")
+    check.note("Create arm is evidenced by a valid MCF1/MCF2 sidecar on both saves; restart join with Create enabled verifies sidecar reload")
     return check
 
 
