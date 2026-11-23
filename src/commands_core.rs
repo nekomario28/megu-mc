@@ -8523,6 +8523,13 @@ fn run_command_ctx(ctx: &CmdCtx, msg: &str, s: &mut Option<&Client>) -> String {
                 }
             }
             place_block_dim(dim, x, y, z, st);
+            // `BaseFireBlock.onPlace`: a fire write inside a complete obsidian
+            // frame ignites the portal (spread/flint&steel take the same hook).
+            if let Some(reg) = crate::block_registry::breg() {
+                if reg.name_of(st) == "minecraft:fire" {
+                    try_ignite_nether_portal(reg, dim, x, y, z);
+                }
+            }
             // `place_block_dim` already queues the dirty cell via
             // `note_block_update_dim`; `apply_queued_block_updates` publishes a
             // single `block_update` (0x09) for a lone dirty cell in the column

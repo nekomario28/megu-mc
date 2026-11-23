@@ -3773,6 +3773,11 @@ fn live_mob_projectile_impact(
                 let [x, y, z] = p.map(|axis| axis.floor() as i32);
                 if block_at_dim(projectile.dim, x, y, z) == 0 {
                     place_block_dim(projectile.dim, x, y, z, name_to_state("fire").unwrap());
+                    // vanilla: a fireball-lit fire inside a complete obsidian
+                    // frame ignites the portal (ghast re-light works the same).
+                    if let Some(reg) = crate::block_registry::breg() {
+                        try_ignite_nether_portal(reg, projectile.dim, x, y, z);
+                    }
                 }
             }
         }
@@ -9006,6 +9011,9 @@ fn fire_random_tick(reg: &crate::block_registry::BReg, dim: DimId, x: i32, y: i3
             let fire = reg.state_of("minecraft:fire", None);
             set_block_dim(dim, nx, ny, nz, fire);
             note_block_update_dim(dim, nx, ny, nz, fire);
+            // vanilla: spread fire landing inside a complete obsidian frame
+            // lights the portal, same as a flint & steel click.
+            try_ignite_nether_portal(reg, dim, nx, ny, nz);
         }
     }
 }

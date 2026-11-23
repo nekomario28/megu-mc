@@ -7434,6 +7434,101 @@ fn is_end_portal_state(st: u32) -> bool {
     st == 7406
 }
 
+/// `BaseFireBlock.onPlace` + `PortalShape.findEmptyPortalShape`: fire appearing
+/// inside a complete obsidian frame ignites the portal — the whole interior
+/// becomes nether_portal blocks whose `axis` matches the frame's horizontal
+/// span. Frame rules (vanilla): the interior is a solid rectangle of
+/// replaceable cells (air, fire, grass...) at least 2 wide and 3 tall and at
+/// most 21 on a side; every border cell is obsidian. Portals cannot form in
+/// the End, so the check is a no-op there. Called on every fire write —
+/// flint & steel, `/setblock`, spread, fireball impact.
+fn try_ignite_nether_portal(reg: &block_registry::BReg, dim: DimId, x: i32, y: i32, z: i32) -> bool {
+    if dim == DimId::End {
+        return false;
+    }
+    let obsidian = name_to_state("obsidian").unwrap_or(u32::MAX);
+    if obsidian == u32::MAX {
+        return false;
+    }
+    let empty = |st: u32| {
+        reg.is_replaceable(st)
+            || is_nether_portal_state(st)
+            || matches!(reg.name_of(st), "minecraft:fire" | "minecraft:soul_fire")
+    };
+    // axis 0: the frame spans X (portal[axis=x]); axis 1: it spans Z.
+    for axis in 0..2 {
+        let (ax, az) = if axis == 0 { (1, 0) } else { (0, 1) };
+        // Walk out from the fire cell along the frame axis until a non-empty
+        // cell stops the scan; that cell is a frame wall and must be obsidian.
+        let mut lo = -1i32;
+        while empty(block_at_dim(dim, x + ax * lo, y, z + az * lo)) {
+            lo -= 1;
+            if lo < -22 {
+                break;
+            }
+        }
+        let mut hi = 1i32;
+        while empty(block_at_dim(dim, x + ax * hi, y, z + az * hi)) {
+            hi += 1;
+            if hi > 22 {
+                break;
+            }
+        }
+        if hi - lo - 1 < 2 || hi - lo - 1 > 21 {
+            continue;
+        }
+        // Same scan vertically: interior must be at least 3 tall, capped at 21.
+        let mut ylo = y - 1;
+        while empty(block_at_dim(dim, x, ylo, z)) {
+            ylo -= 1;
+            if ylo < y - 22 {
+                break;
+            }
+        }
+        let mut yhi = y + 1;
+        while empty(block_at_dim(dim, x, yhi, z)) {
+            yhi += 1;
+            if yhi > y + 22 {
+                break;
+            }
+        }
+        if yhi - ylo - 1 < 3 || yhi - ylo - 1 > 21 {
+            continue;
+        }
+        // Verify the complete rectangle: every interior cell empty, every
+        // border cell obsidian (corners included — vanilla's frame check).
+        let mut ok = true;
+        'rect: for off in lo..=hi {
+            for yy in ylo..=yhi {
+                let st = block_at_dim(dim, x + ax * off, yy, z + az * off);
+                let interior = off > lo && off < hi && yy > ylo && yy < yhi;
+                if interior {
+                    if !empty(st) {
+                        ok = false;
+                        break 'rect;
+                    }
+                } else if st != obsidian {
+                    ok = false;
+                    break 'rect;
+                }
+            }
+        }
+        if !ok {
+            continue;
+        }
+        let portal = 5864 + axis as u32;
+        for off in lo + 1..hi {
+            for yy in ylo + 1..yhi {
+                let (bx, bz) = (x + ax * off, z + az * off);
+                set_block_dim(dim, bx, yy, bz, portal);
+                note_block_update_dim(dim, bx, yy, bz, portal);
+            }
+        }
+        return true;
+    }
+    false
+}
+
 /// Materialise a safe landing in a Nether or Overworld destination: an obsidian floor under
 /// the teleported column, clear space above it, and a complete obsidian portal frame with a
 /// live portal inside. Materialising the frame matters for the bounce guard — the arrival
@@ -12351,6 +12446,37 @@ fn handle_inner(mut s: TcpStream, live_eid: Arc<AtomicI32>) {
                         write_pos(&mut op, tx, ty, tz);
                         op.push(1);
                         let _ = send_packet(&mut me.sock.lock().unwrap_or_else(|e| e.into_inner()), 0x34, op);
+                        let _ = send_packet(&mut me.sock.lock().unwrap_or_else(|e| e.into_inner()), 0x05, ack(seq));
+                        continue;
+                    }
+                    // `FlintAndSteelItem.useOn` / `FireChargeItem`: fire on the
+                    // face-adjacent cell — soul_fire when clicked soul soil/sand.
+                    // Inside a complete obsidian frame the fire ignites the
+                    // portal (soul fire does not). Block interactions above keep
+                    // priority; the TNT special case is already handled.
+                    if item == 798 || item == 1089 {
+                        let soul = crate::block_registry::breg().is_some_and(|reg| {
+                            matches!(
+                                reg.name_of(clicked),
+                                "minecraft:soul_sand" | "minecraft:soul_soil"
+                            )
+                        });
+                        let fire = name_to_state(if soul { "soul_fire" } else { "fire" })
+                            .unwrap_or(u32::MAX);
+                        let target_st = block_at_dim(dim, tx, ty, tz);
+                        let can_place = crate::block_registry::breg()
+                            .is_some_and(|reg| reg.is_replaceable(target_st));
+                        if fire != u32::MAX && can_place && place((tx, ty, tz), fire) {
+                            if !soul {
+                                if let Some(reg) = crate::block_registry::breg() {
+                                    try_ignite_nether_portal(reg, dim, tx, ty, tz);
+                                }
+                            }
+                            if *me.gm.lock().unwrap_or_else(|e| e.into_inner()) != 1 {
+                                damage_inv_slot(&me, 36 + held_slot);
+                                held_slot_resync(&me);
+                            }
+                        }
                         let _ = send_packet(&mut me.sock.lock().unwrap_or_else(|e| e.into_inner()), 0x05, ack(seq));
                         continue;
                     }
@@ -19629,6 +19755,67 @@ mod p5c_live_tests {
             DimId::End,
             "a Nether portal in the End must not switch dimensions"
         );
+    }
+
+    #[test]
+    fn w1_live_wire_obsidian_frame_fire_ignites_nether_portal() {
+        crate::test_support::require_vanilla_data();
+        let _guard = world_guard();
+        let reg = crate::block_registry::breg().unwrap();
+        let obs = reg.state_of("minecraft:obsidian", None);
+        let air = 0u32;
+        // Snapshot and restore the far-corner region the frames occupy.
+        let (x0, y0, z0) = (-300, 150, -300);
+        let mut prev = Vec::new();
+        for dx in -1..=5 {
+            for dy in -1..=7 {
+                for dz in -1..=7 {
+                    prev.push((x0 + dx, y0 + dy, z0 + dz, block_at_dim(DimId::Overworld, x0 + dx, y0 + dy, z0 + dz)));
+                }
+            }
+        }
+        let restore = |dim: DimId| {
+            for &(px, py, pz, st) in &prev {
+                set_block_dim(dim, px, py, pz, st);
+            }
+        };
+        // 4x5 ring spanning X with a 2x3 interior; fire on an interior cell.
+        let frame = |dim: DimId, axis_x: bool| {
+            let (ax, az) = if axis_x { (1, 0) } else { (0, 1) };
+            for off in 0..4 {
+                for dy in 0..5 {
+                    let interior = (1..=2).contains(&off) && (1..=3).contains(&dy);
+                    set_block_dim(dim, x0 + ax * off, y0 + dy, z0 + az * off, if interior { air } else { obs });
+                }
+            }
+        };
+        frame(DimId::Overworld, true);
+        set_block_dim(DimId::Overworld, x0 + 1, y0 + 1, z0, reg.state_of("minecraft:fire", None));
+        assert!(try_ignite_nether_portal(reg, DimId::Overworld, x0 + 1, y0 + 1, z0));
+        for dx in 1..=2 {
+            for dy in 1..=3 {
+                assert_eq!(block_at_dim(DimId::Overworld, x0 + dx, y0 + dy, z0), 5864, "axis=x portal fills the interior");
+            }
+        }
+        // A Z-spanning frame produces axis=z portals (5865).
+        frame(DimId::Overworld, false);
+        set_block_dim(DimId::Overworld, x0, y0 + 1, z0 + 1, reg.state_of("minecraft:fire", None));
+        assert!(try_ignite_nether_portal(reg, DimId::Overworld, x0, y0 + 1, z0 + 1));
+        assert_eq!(block_at_dim(DimId::Overworld, x0, y0 + 1, z0 + 1), 5865);
+        // Incomplete frame (one corner broken): fire stays, no portal writes.
+        set_block_dim(DimId::Overworld, x0 + 3, y0 + 4, z0, air);
+        let fire = reg.state_of("minecraft:fire", None);
+        set_block_dim(DimId::Overworld, x0 + 1, y0 + 1, z0, air);
+        set_block_dim(DimId::Overworld, x0 + 1, y0 + 1, z0, fire);
+        assert!(!try_ignite_nether_portal(reg, DimId::Overworld, x0 + 1, y0 + 1, z0));
+        assert_eq!(block_at_dim(DimId::Overworld, x0 + 1, y0 + 1, z0), fire);
+        // No ignition in the End even with a complete frame.
+        frame(DimId::End, true);
+        set_block_dim(DimId::End, x0 + 1, y0 + 1, z0, fire);
+        assert!(!try_ignite_nether_portal(reg, DimId::End, x0 + 1, y0 + 1, z0));
+        assert_eq!(block_at_dim(DimId::End, x0 + 1, y0 + 1, z0), fire);
+        restore(DimId::Overworld);
+        restore(DimId::End);
     }
 
     #[test]

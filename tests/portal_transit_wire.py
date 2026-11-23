@@ -1,10 +1,9 @@
 #!/usr/bin/env python3
 """Live protocol-767 Nether portal transit using the real megu server.
 
-The server currently accepts portal blocks for travel but does not turn an
-obsidian frame into portal blocks when fire is placed. The test records that
-frame-lighting stage as skipped, then uses the supported /setblock portal
-command to exercise the survival delay and both dimension transitions.
+Builds a 4x5 obsidian frame, ignites it with `/setblock fire` (the same
+`BaseFireBlock.onPlace` path flint & steel and spread take), then exercises
+the survival delay and both dimension transitions.
 
 Usage: python3 tests/portal_transit_wire.py target/release/megu
 """
@@ -74,8 +73,12 @@ def exercise(binary, root):
                 sx, sy, sz = block_of(spawn)
                 x, y, z = sx + 3, sy, sz + 2
                 command(client, "gamemode survival")
+                # A 1-thick box is all boundary under vanilla `hollow`, so the
+                # ring is built as a solid fill plus an interior air fill.
                 command(client, f"fill {x} {y} {z} {x + 3} {y + 4} {z} "
-                               "minecraft:obsidian hollow")
+                               "minecraft:obsidian")
+                command(client, f"fill {x + 1} {y + 1} {z} {x + 2} {y + 3} {z} "
+                               "minecraft:air")
                 summary["frame"] = {"status": "passed", "from": [x, y, z],
                                     "to": [x + 3, y + 4, z], "opening": [x + 1, y + 1, z]}
 
@@ -83,19 +86,11 @@ def exercise(binary, root):
                 fire_since = len(client.updates)
                 command(client, f"setblock {interior[0]} {interior[1]} {interior[2]} "
                                 "minecraft:fire")
-                # Drain the fire write's own update so the portal wait below
-                # cannot latch onto it — it arrives after `since` is cut.
-                wait_for_update(client, interior, since=fire_since)
-                summary["frame_ignition"] = {
-                    "status": "skipped",
-                    "reason": "setblock fire places fire but the runtime has no obsidian-frame ignition path",
-                }
-                # Portal blocks are the server's supported transit trigger; this keeps
-                # the wire transition test useful while accurately reporting ignition.
-                since = len(client.updates)
-                command(client, f"setblock {interior[0]} {interior[1]} {interior[2]} "
-                                "minecraft:nether_portal")
-                first_state = wait_for_state(client, interior, (5864, 5865), since=since)
+                # The fire write ignites the frame: every interior cell becomes
+                # a portal block whose axis matches the frame's X span (5864).
+                first_state = wait_for_state(client, interior, (5864, 5865), since=fire_since)
+                summary["frame_ignition"] = {"status": "passed", "block_state": first_state,
+                                             "axis": "x" if first_state == 5864 else "z"}
                 summary["steps"].append({"stage": "portal-trigger-placed", "status": "passed",
                                          "block_state": first_state})
 
