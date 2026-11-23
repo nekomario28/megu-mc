@@ -1610,7 +1610,26 @@ fn live_spawn_clear(reg: &BReg, dim: DimId, x: i32, y: i32, z: i32) -> bool {
 /// light at the cell, from the settled/windowed light passes.
 fn live_light_at(clients: &[Arc<Client>], dim: DimId, x: i32, y: i32, z: i32) -> i32 {
     let (cx, cz) = (x >> 4, z >> 4);
-    let sky = nibble_at_dim(&sky_light_sections_dim(dim, cx, cz), dim, x, y, z);
+    let mut sky = nibble_at_dim(&sky_light_sections_dim(dim, cx, cz), dim, x, y, z);
+    if sky <= 8 && dim == DimId::Overworld {
+        let time_of_day = WORLD_TIME.load(Ordering::Relaxed) % 24_000;
+        if !(13_000..=23_000).contains(&time_of_day) {
+            if let Some(reg) = breg() {
+                // A cold light section may report zero. Trace the actual column
+                // through the build ceiling so edited roofs still block daylight.
+                let mut fallback: i32 = 15;
+                let max_y = dim.min_y() + dim.height();
+                for above_y in y.saturating_add(1)..max_y {
+                    fallback = fallback
+                        .saturating_sub(reg.opacity_of(block_at_dim(dim, x, above_y, z)) as i32);
+                    if fallback <= 8 {
+                        break;
+                    }
+                }
+                sky = sky.max(fallback);
+            }
+        }
+    }
     let sources = natural_spawn_light_sources(clients, dim, cx, cz);
     let block = nibble_at_dim(
         &block_light_sections_dim(dim, cx, cz, &sources),
@@ -1698,13 +1717,66 @@ fn live_passive_spawn_attempt(x: i32, y: i32, z: i32, light: i32, cap: usize, ki
     )
 }
 
+/// Find a spawn cell above the real ground, even when the world-surface
+/// heightmap points at a tree canopy or a layer of vegetation.
+fn find_passive_ground_y(reg: &BReg, x: i32, z: i32) -> Option<i32> {
+    let surface = surface_y(x, z).floor() as i32;
+    let scan_min = surface
+        .saturating_sub(24)
+        .max(DimId::Overworld.min_y());
+    for ground_y in (scan_min..surface).rev() {
+        let state = block_at(x, ground_y, z);
+        let ground = matches!(
+            reg.name_of(state),
+            "minecraft:grass_block"
+                | "minecraft:podzol"
+                | "minecraft:mycelium"
+                | "minecraft:snow_block"
+                | "minecraft:sand"
+                | "minecraft:red_sand"
+        );
+        if ground && live_spawn_clear(reg, DimId::Overworld, x, ground_y + 1, z) {
+            return Some(ground_y + 1);
+        }
+    }
+    None
+}
+
+const PASSIVE_SPAWN_CANDIDATE_OFFSETS: [(i32, i32); 8] = [
+    (28, 0),
+    (24, 24),
+    (0, 40),
+    (-33, 33),
+    (-48, 0),
+    (-33, -33),
+    (0, -28),
+    (33, -33),
+];
+
+fn passive_spawn_candidate(
+    player_x: f64,
+    player_z: f64,
+    tick: u64,
+    attempt: u64,
+    index: usize,
+) -> (i32, i32) {
+    let rotation = (tick.wrapping_add(attempt) % PASSIVE_SPAWN_CANDIDATE_OFFSETS.len() as u64)
+        as usize;
+    let (dx, dz) = PASSIVE_SPAWN_CANDIDATE_OFFSETS
+        [(index + rotation) % PASSIVE_SPAWN_CANDIDATE_OFFSETS.len()];
+    (player_x.floor() as i32 + dx, player_z.floor() as i32 + dz)
+}
+
 /// Daytime animal spawning: one weighted pick from the biome's `creature`
 /// spawners (the farm animals the runtime can simulate) plus a small group on
 /// jittered grass. Runs only outside the night window; the caller gates it.
 fn spawn_passive_natural(tick: u64) {
     let clients = client_snapshot();
     let players = live_spawn_anchors(&clients, DimId::Overworld);
-    if players.is_empty() || breg().is_none() {
+    let Some(reg) = breg() else {
+        return;
+    };
+    if players.is_empty() {
         return;
     }
     let spawn_chunks = live_spawn_chunks(&players);
@@ -1714,54 +1786,71 @@ fn spawn_passive_natural(tick: u64) {
     }
     let attempt = SPAWN_ATTEMPT.fetch_add(1, Ordering::Relaxed);
     let &[px, _, pz] = &players[attempt as usize % players.len()];
-    let angle = tick as f64 * 2.399;
-    let bx = (px + angle.cos() * 32.0).floor() as i32;
-    let bz = (pz + angle.sin() * 32.0).floor() as i32;
-    if !live_spawn_position_ok(&players, &spawn_chunks, bx, 64, bz) {
-        return;
-    }
-    let biome = worldgen::with_gen_dim(DimId::Overworld, |g| g.biome_name_at(bx, 64, bz))
-        .flatten()
-        .unwrap_or_else(|| "minecraft:plains".to_string());
     const FARM_ANIMALS: [&str; 4] = [
         "minecraft:sheep",
         "minecraft:cow",
         "minecraft:pig",
         "minecraft:chicken",
     ];
-    let entries: Vec<&feature::SpawnerData> = feature::spawners_for(&biome, "creature")
-        .unwrap_or_default()
-        .iter()
-        .filter(|entry| FARM_ANIMALS.contains(&entry.kind.as_str()))
-        .collect();
-    let total: i32 = entries.iter().map(|entry| entry.weight).sum();
-    if total <= 0 {
-        return;
-    }
     let mut rng = generation_math::Lcg::new(
         WORLD_SEED
             .load(Ordering::Relaxed)
-            .wrapping_add(tick.wrapping_mul(0x9E37_79B9_7F4A_7C15)),
+            .wrapping_add(tick.wrapping_mul(0x9E37_79B9_7F4A_7C15))
+            .wrapping_add(attempt.wrapping_mul(0xD1B5_4A32_D192_ED03)),
     );
-    let mut roll = rng.next_bound(total);
-    let Some(entry) = entries.iter().find(|entry| {
-        roll -= entry.weight;
-        roll < 0
-    }) else {
-        return;
-    };
-    let span = (entry.max_count - entry.min_count + 1).max(1);
-    let count = entry.min_count + rng.next_bound(span);
-    for _ in 0..count {
-        let x = bx + rng.next_bound(5) - 2;
-        let z = bz + rng.next_bound(5) - 2;
-        if !live_spawn_position_ok(&players, &spawn_chunks, x, 64, z) {
+
+    for candidate in 0..PASSIVE_SPAWN_CANDIDATE_OFFSETS.len() {
+        let (bx, bz) = passive_spawn_candidate(px, pz, tick, attempt, candidate);
+        let Some(anchor_y) = find_passive_ground_y(reg, bx, bz) else {
+            continue;
+        };
+        if !live_spawn_position_ok(&players, &spawn_chunks, bx, anchor_y, bz)
+            || reg.name_of(block_at(bx, anchor_y - 1, bz)) != "minecraft:grass_block"
+        {
             continue;
         }
-        let y = surface_y(x, z).floor() as i32;
-        let light = live_light_at(&clients, DimId::Overworld, x, y, z);
+        let biome = worldgen::with_gen_dim(DimId::Overworld, |g| {
+            g.biome_name_at(bx, anchor_y, bz)
+        })
+        .flatten()
+        .unwrap_or_else(|| "minecraft:plains".to_string());
+        let entries: Vec<&feature::SpawnerData> = feature::spawners_for(&biome, "creature")
+            .unwrap_or_default()
+            .iter()
+            .filter(|entry| FARM_ANIMALS.contains(&entry.kind.as_str()))
+            .collect();
+        let total: i32 = entries.iter().map(|entry| entry.weight).sum();
+        if total <= 0 {
+            continue;
+        }
+        let mut roll = rng.next_bound(total);
+        let Some(entry) = entries.iter().find(|entry| {
+            roll -= entry.weight;
+            roll < 0
+        }) else {
+            continue;
+        };
+        let span = (entry.max_count - entry.min_count + 1).max(1);
+        let count = entry.min_count + rng.next_bound(span);
         let kind = entry.kind.strip_prefix("minecraft:").unwrap_or(&entry.kind);
-        live_passive_spawn_attempt(x, y, z, light, cap, kind);
+        let mut spawned = false;
+        for _ in 0..count {
+            let x = bx + rng.next_bound(5) - 2;
+            let z = bz + rng.next_bound(5) - 2;
+            let Some(y) = find_passive_ground_y(reg, x, z) else {
+                continue;
+            };
+            if !live_spawn_position_ok(&players, &spawn_chunks, x, y, z)
+                || reg.name_of(block_at(x, y - 1, z)) != "minecraft:grass_block"
+            {
+                continue;
+            }
+            let light = live_light_at(&clients, DimId::Overworld, x, y, z);
+            spawned |= live_passive_spawn_attempt(x, y, z, light, cap, kind);
+        }
+        if spawned {
+            return;
+        }
     }
 }
 
@@ -1965,23 +2054,33 @@ struct LiveChunkGenWorld {
 impl spawner::ChunkGenerationWorld for LiveChunkGenWorld {
     fn spawn_y(&mut self, x: i32, z: i32) -> i32 {
         let base = if self.dim == DimId::Overworld {
-            surface_y(x, z).floor() as i32
+            breg()
+                .and_then(|reg| find_passive_ground_y(reg, x, z))
+                .unwrap_or_else(|| surface_y(x, z).floor() as i32)
         } else {
             height_at_dim(self.dim, x, z) + 1
         };
-        // An edited block above the generated surface is the standing point,
-        // like the world-surface heightmap vanilla herds read.
+        // An edited solid block above the generated surface is the standing
+        // point, while foliage and partial vegetation do not hide the ground.
         let world = timed_world();
+        let reg = breg();
         world
             .get(&(self.dim, x >> 4, z >> 4))
             .and_then(|cells| {
-                let reg = breg();
                 (base..self.dim.min_y() + self.dim.height())
                     .rev()
                     .find(|&y| {
                         cells
                             .get(&local_idx(x, y, z))
-                            .is_some_and(|&st| reg.is_none_or(|reg| !reg.is_air(st)))
+                            .is_some_and(|&st| {
+                                reg.is_none_or(|reg| {
+                                    !reg.is_air(st)
+                                        && !reg.is_liquid(st)
+                                        && !reg.in_tag(st, "minecraft:leaves")
+                                        && !reg.name_of(st).ends_with("_leaves")
+                                        && reg.is_collision_shape_full_block(st)
+                                })
+                            })
                     })
                     .map(|y| y + 1)
             })
@@ -1993,7 +2092,10 @@ impl spawner::ChunkGenerationWorld for LiveChunkGenWorld {
             return false;
         };
         let below = block_at_dim(self.dim, pos.0, pos.1 - 1, pos.2);
-        (reg.name_of(below) == "minecraft:grass_block" || reg.side_solid(below, 1))
+        (reg.name_of(below) == "minecraft:grass_block"
+            || (reg.side_solid(below, 1)
+                && !reg.in_tag(below, "minecraft:leaves")
+                && !reg.name_of(below).ends_with("_leaves")))
             && live_spawn_clear(reg, self.dim, pos.0, pos.1, pos.2)
     }
 
@@ -21580,6 +21682,186 @@ mod mineshaft_runtime_tests {
         drop(sock_b);
         let _ = th_a.join();
         let _ = th_b.join();
+    }
+
+    struct PassiveSpawnGlobals {
+        attempt: u64,
+        seed: u64,
+        mob_spawning: u8,
+    }
+
+    impl PassiveSpawnGlobals {
+        fn take() -> Self {
+            Self {
+                attempt: SPAWN_ATTEMPT.swap(0, Ordering::Relaxed),
+                seed: WORLD_SEED.swap(4242, Ordering::Relaxed),
+                mob_spawning: GR_MOB_SPAWNING.swap(1, Ordering::Relaxed),
+            }
+        }
+    }
+
+    impl std::ops::Drop for PassiveSpawnGlobals {
+        fn drop(&mut self) {
+            SPAWN_ATTEMPT.store(self.attempt, Ordering::Relaxed);
+            WORLD_SEED.store(self.seed, Ordering::Relaxed);
+            GR_MOB_SPAWNING.store(self.mob_spawning, Ordering::Relaxed);
+        }
+    }
+
+    fn passive_test_column(x: i32, z: i32, ground: u32, canopy: Option<u32>) -> i32 {
+        let top = surface_y(x, z).floor() as i32;
+        let ground_y = top - 6;
+        for y in ground_y + 1..top {
+            set_block(x, y, z, 0);
+        }
+        set_block(x, ground_y, z, ground);
+        if let Some(canopy) = canopy {
+            set_block(x, top - 1, z, canopy);
+        }
+        ground_y + 1
+    }
+
+    #[test]
+    fn passive_spawn_ground_search_finds_grass_beneath_oak_leaves() {
+        let _guard = world_guard();
+        let _snap = RuntimeSnapshot::take();
+        let reg = breg().expect("block registry should be initialized");
+        let grass = name_to_state("grass_block").unwrap();
+        let oak_leaves = name_to_state("oak_leaves").unwrap();
+        let spawn_y = passive_test_column(0, 0, grass, Some(oak_leaves));
+
+        assert_eq!(
+            find_passive_ground_y(reg, 0, 0),
+            Some(spawn_y),
+            "ground search should pass the oak-leaf canopy and find the grass block"
+        );
+        assert_eq!(reg.name_of(block_at(0, spawn_y - 1, 0)), "minecraft:grass_block");
+    }
+
+    #[test]
+    fn passive_spawn_sweeps_invalid_columns_and_stops_at_creature_cap() {
+        let _guard = world_guard();
+        let _snap = RuntimeSnapshot::take();
+        let _globals = PassiveSpawnGlobals::take();
+        WORLD_TIME.store(6_000, Ordering::Relaxed);
+        DIFFICULTY.store(2, Ordering::Relaxed);
+
+        let reg = breg().expect("block registry should be initialized");
+        let grass = name_to_state("grass_block").unwrap();
+        let sand = name_to_state("sand").unwrap();
+        let water = name_to_state("water").unwrap();
+        let oak_leaves = name_to_state("oak_leaves").unwrap();
+        let tick = 0;
+        let player_x = 0.5;
+        let player_z = 0.5;
+        let candidates: Vec<(i32, i32)> = (0..PASSIVE_SPAWN_CANDIDATE_OFFSETS.len())
+            .map(|index| passive_spawn_candidate(player_x, player_z, tick, 0, index))
+            .collect();
+
+        let valid_index = candidates
+            .iter()
+            .enumerate()
+            .skip(1)
+            .find_map(|(index, &(x, z))| {
+                let top = surface_y(x, z).floor() as i32;
+                let biome = worldgen::with_gen_dim(DimId::Overworld, |g| {
+                    g.biome_name_at(x, top - 5, z)
+                })
+                .flatten()
+                .unwrap_or_else(|| "minecraft:plains".to_string());
+                let has_farm_animal = feature::spawners_for(&biome, "creature")
+                    .unwrap_or_default()
+                    .iter()
+                    .any(|entry| {
+                        matches!(
+                            entry.kind.as_str(),
+                            "minecraft:sheep"
+                                | "minecraft:cow"
+                                | "minecraft:pig"
+                                | "minecraft:chicken"
+                        )
+                    });
+                has_farm_animal.then_some(index)
+            })
+            .expect("at least one candidate biome should have a farm-animal spawner");
+
+        let (first_x, first_z) = candidates[0];
+        let first_spawn_y = passive_test_column(first_x, first_z, sand, None);
+        set_block(first_x, first_spawn_y, first_z, water);
+        assert_eq!(
+            find_passive_ground_y(reg, first_x, first_z),
+            None,
+            "the first candidate's water cell must be rejected"
+        );
+
+        for &(x, z) in candidates.iter().take(valid_index).skip(1) {
+            passive_test_column(x, z, sand, None);
+        }
+
+        let (valid_x, valid_z) = candidates[valid_index];
+        for dx in -2..=2 {
+            for dz in -2..=2 {
+                passive_test_column(valid_x + dx, valid_z + dz, grass, Some(oak_leaves));
+            }
+        }
+        let valid_spawn_y = find_passive_ground_y(reg, valid_x, valid_z)
+            .expect("the later candidate should expose grass beneath its canopy");
+        assert!(
+            live_light_at(&client_snapshot(), DimId::Overworld, valid_x, valid_spawn_y, valid_z) > 8,
+            "daytime sky light should permit an outdoor grass spawn under a sparse leaf canopy"
+        );
+
+        let (client, _receiver) = effect_tests::client_pair();
+        *client.pos.lock().unwrap_or_else(|e| e.into_inner()) =
+            (player_x, 64.0, player_z, 0.0, 0.0, true);
+        *client.gm.lock().unwrap_or_else(|e| e.into_inner()) = 0;
+        clients()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .push(Arc::new(client));
+        for &(x, z) in &candidates {
+            for dx in -2..=2 {
+                for dz in -2..=2 {
+                    forceloaded()
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .insert(((x + dx) >> 4, (z + dz) >> 4));
+                }
+            }
+        }
+        refresh_hot();
+
+        let players = live_spawn_anchors(&client_snapshot(), DimId::Overworld);
+        let spawn_chunks = live_spawn_chunks(&players);
+        let cap = MobCategory::Creature.global_cap(spawn_chunks.len() as u32) as usize;
+        assert!(cap > 0, "the fixture should have a non-zero creature cap");
+        let filler = new_live_mob(
+            name_to_etype("cow").unwrap(),
+            DimId::Overworld,
+            (player_x, 64.0, player_z, 0.0, 0.0),
+            10.0,
+            None,
+        );
+        mobs()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .extend((0..cap - 1).map(|_| filler.clone()));
+        assert_eq!(live_category_count(DimId::Overworld, MobCategory::Creature), cap - 1);
+
+        spawn_passive_natural(tick);
+
+        assert_eq!(
+            live_category_count(DimId::Overworld, MobCategory::Creature),
+            cap,
+            "the successful candidate should add one creature and never exceed the cap"
+        );
+        let newly_spawned = mobs()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .iter()
+            .filter(|mob| !Arc::ptr_eq(mob, &filler))
+            .count();
+        assert_eq!(newly_spawned, 1, "only one creature fits below the cap");
     }
 
     #[test]
