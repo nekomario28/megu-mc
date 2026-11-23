@@ -663,6 +663,9 @@ fn environment_time_tick() {
     if let Some(t) = __t {
         tickprof::add("env/region_guard", t.elapsed());
     }
+    // One client list for the whole stage instead of re-locking clients() and
+    // re-cloning every Arc<Client> per pass (hunger, effects, pearl dims, ...).
+    let env_clients = client_snapshot();
     __t = __prof.then(std::time::Instant::now);
     let t = TICK.fetch_add(1, Ordering::Relaxed);
     world_border().lock().unwrap_or_else(|e| e.into_inner()).finish_lerp(border_now_ms());
@@ -763,7 +766,7 @@ fn environment_time_tick() {
     }
     // Player hunger and environmental damage.
     {
-        let cls: Vec<Arc<Client>> = client_snapshot();
+        let cls: &[Arc<Client>] = &env_clients;
         for c in cls.iter() {
             let gm = *c.gm.lock().unwrap_or_else(|e| e.into_inner());
             if matches!(gm, 1 | 3) || *c.hp.lock().unwrap_or_else(|e| e.into_inner()) <= 0.0 {
@@ -1062,17 +1065,17 @@ fn environment_time_tick() {
     // powered at the even id, unpowered odd
     {
         let __tspots = __prof.then(std::time::Instant::now);
-        let mut spots: Vec<(i32, i32, i32)> = Vec::new();
+        let mut spots: std::collections::HashSet<(i32, i32, i32)> = std::collections::HashSet::new();
         {
             for c in clients().lock().unwrap_or_else(|e| e.into_inner()).iter() {
                 let p = c.pos.lock().unwrap_or_else(|e| e.into_inner());
-                spots.push((p.0.floor() as i32, p.1.floor() as i32, p.2.floor() as i32));
+                spots.insert((p.0.floor() as i32, p.1.floor() as i32, p.2.floor() as i32));
             }
         }
         {
             for m in mobs().lock().unwrap_or_else(|e| e.into_inner()).iter().filter(|mob| mob.dim == DimId::Overworld) {
                 let p = m.pos.lock().unwrap_or_else(|e| e.into_inner());
-                spots.push((p.0.floor() as i32, p.1.floor() as i32, p.2.floor() as i32));
+                spots.insert((p.0.floor() as i32, p.1.floor() as i32, p.2.floor() as i32));
             }
         }
         if let Some(t) = __tspots {
@@ -1131,7 +1134,7 @@ fn environment_time_tick() {
     // still apply there; damage effects are client-irrelevant in creative)
     {
         let __tsnap = __prof.then(std::time::Instant::now);
-        let cls: Vec<Arc<Client>> = client_snapshot();
+        let cls: &[Arc<Client>] = &env_clients;
         if let Some(t) = __tsnap {
             tickprof::add("env/client_snapshot", t.elapsed());
         }
@@ -1159,7 +1162,7 @@ fn environment_time_tick() {
         // entities (motion, despawn), projectiles, falling blocks and crop
         // ages. Their mere presence means "the world is not unchanged", so
         // the epoch bumps before the gate inside `autosave_world` reads it.
-        if !client_snapshot().is_empty()
+        if !env_clients.is_empty()
             || !mobs().lock().unwrap_or_else(|e| e.into_inner()).is_empty()
             || !drops().lock().unwrap_or_else(|e| e.into_inner()).is_empty()
             || !arrows().lock().unwrap_or_else(|e| e.into_inner()).is_empty()
@@ -1254,7 +1257,7 @@ fn environment_time_tick() {
         let mut done: Vec<(i32, f64, f64, f64, u32)> = vec![];
         // A pearl flies in its thrower's dimension: an End pearl has to collide
         // with End blocks — most importantly an `end_gateway` beam.
-        let pearl_dims: HashMap<i32, DimId> = client_snapshot()
+        let pearl_dims: HashMap<i32, DimId> = env_clients
             .iter()
             .map(|c| (c.eid, *c.dim.lock().unwrap_or_else(|e| e.into_inner())))
             .collect();
@@ -1296,7 +1299,7 @@ fn environment_time_tick() {
             if let Some(peid) = dead_pearl {
                 broadcast_seen_destroy(peid);
             }
-            let cls: Vec<Arc<Client>> = client_snapshot();
+            let cls: &[Arc<Client>] = &env_clients;
             if let Some(c) = cls.iter().find(|c| c.eid == owner) {
                 if is_end_gateway_state(hit_st) {
                     // A pearl that lands in a gateway beam warps its owner to
@@ -1342,6 +1345,18 @@ fn environment_time_tick() {
     }
     {
         // snowballs: fly, hit mob -> hurt flash
+        // Snapshot Overworld mob hitboxes once for the whole pass instead of
+        // re-locking mobs() and every mob pos per projectile.
+        let mob_boxes: Vec<(i32, f64, f64, f64)> = mobs()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .iter()
+            .filter(|mob| mob.dim == DimId::Overworld)
+            .map(|m| {
+                let mp = m.pos.lock().unwrap_or_else(|e| e.into_inner());
+                (m.eid, mp.0, mp.1, mp.2)
+            })
+            .collect();
         let mut sl2 = snowballs().lock().unwrap_or_else(|e| e.into_inner());
         let mut done: Vec<ThrowHit> = vec![];
         for p0 in sl2.iter_mut() {
@@ -1350,18 +1365,14 @@ fn environment_time_tick() {
             }
             p0.ttl -= 1;
             let mut hit_mob: Option<i32> = None;
-            {
-                let ms = mobs().lock().unwrap_or_else(|e| e.into_inner());
-                for m in ms.iter().filter(|mob| mob.dim == DimId::Overworld) {
-                    let mp = m.pos.lock().unwrap_or_else(|e| e.into_inner());
-                    if (mp.0 - p0.x).abs() < 0.6
-                        && (mp.2 - p0.z).abs() < 0.6
-                        && p0.y > mp.1 - 0.3
-                        && p0.y < mp.1 + 2.0
-                    {
-                        hit_mob = Some(m.eid);
-                        break;
-                    }
+            for &(eid, mx, my, mz) in &mob_boxes {
+                if (mx - p0.x).abs() < 0.6
+                    && (mz - p0.z).abs() < 0.6
+                    && p0.y > my - 0.3
+                    && p0.y < my + 2.0
+                {
+                    hit_mob = Some(eid);
+                    break;
                 }
             }
             let blocked = block_at(
@@ -1466,9 +1477,12 @@ fn environment_time_tick() {
             .filter(|x| x.age >= life && region.is_hot(x.x as i32, x.z as i32))
             .map(|x| x.eid)
             .collect();
-        for eid in &exp {
-            xl.retain(|x| x.eid != *eid);
-            broadcast_seen_destroy(*eid);
+        if !exp.is_empty() {
+            let gone: std::collections::HashSet<i32> = exp.iter().copied().collect();
+            xl.retain(|x| !gone.contains(&x.eid));
+            for eid in &exp {
+                broadcast_seen_destroy(*eid);
+            }
         }
         while xl.len() > XP_CAP {
             let x = xl.remove(0);

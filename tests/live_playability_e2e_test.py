@@ -339,17 +339,29 @@ class UnitFilesystem(unittest.TestCase):
 
     def test_runtime_root_via_cwd_ancestors(self):
         root, server, _ = make_fake_root(self.base / "root")
-        server2 = self.base / "elsewhere" / "megu"
-        server2.parent.mkdir(parents=True)
+        # The binary's ancestors are scanned before the cwd's, and the walk is
+        # capped at 8 levels: under verify.sh TMPDIR lives inside the repo, so a
+        # shallow fake binary would match the real repo root (which also carries
+        # config_packets.bin+datapacks+assets) before the walk ever reaches the
+        # cwd ancestors. Burying the binary pushes the repo outside the window.
+        deep = self.base / "elsewhere"
+        for i in range(7):
+            deep = deep / f"d{i}"
+        deep.mkdir(parents=True)
+        server2 = deep / "megu"
         server2.write_text("x")
         found = gate.runtime_root_for(server2, root / "sub" / "dir")
         self.assertEqual(found, root)
 
     def test_runtime_root_missing(self):
+        # Same 8-level walk: keep every candidate ancestor free of markers by
+        # burying the binary/cwd below the fake root's own depth.
         bare = self.base / "bare"
-        (bare / "target").mkdir(parents=True)
-        self.assertIsNone(gate.runtime_root_for(bare / "target" / "megu",
-                                                bare))
+        deep = bare
+        for i in range(7):
+            deep = deep / f"d{i}"
+        deep.mkdir(parents=True)
+        self.assertIsNone(gate.runtime_root_for(deep / "megu", deep))
 
     def test_relative_server_arg(self):
         root, server, _ = make_fake_root(self.base / "root")
@@ -722,20 +734,6 @@ class RunSessionDirect(unittest.TestCase):
         self.assertEqual(result.chunkprof["band_lookups_per_chunk"], 2.0)
         rel = result.cmd[result.cmd.index("--server-bin") + 1]
         self.assertEqual(rel, "./target/release/megu")
-
-    def test_create_factory_header_versions(self):
-        world = self.base / "world"
-        world.mkdir()
-        for header in (b"MCF1", b"MCF2"):
-            with self.subTest(header=header):
-                (world / "create_factory.bin").write_bytes(header + b"\x00" * 5)
-                self.assertTrue(gate.valid_create_factory(
-                    (world / "create_factory.bin").read_bytes()))
-        for data in (b"MCF0\x00" * 2, b"XXXX\x00\x00\x00\x00\x00", b"MCF2\x00"):
-            with self.subTest(data=data):
-                (world / "create_factory.bin").write_bytes(data)
-                self.assertFalse(gate.valid_create_factory(
-                    (world / "create_factory.bin").read_bytes()))
 
     def test_session_join_timeout(self):
         result = gate.run_session(

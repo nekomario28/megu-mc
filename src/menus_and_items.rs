@@ -2256,14 +2256,19 @@ fn drop_tick() {
         {
             let xs = xps().lock().unwrap_or_else(|e| e.into_inner());
             let cls: Vec<Arc<Client>> = client_snapshot();
+            // Snapshot positions once instead of locking each player's pos for
+            // every orb-player pair.
+            let player_pos: Vec<(i32, f64, f64, f64)> = cls
+                .iter()
+                .map(|c| {
+                    let p = c.pos.lock().unwrap_or_else(|e| e.into_inner());
+                    (c.eid, p.0, p.1, p.2)
+                })
+                .collect();
             for x in xs.iter() {
-                for c in cls.iter() {
-                    let (px, py, pz, ..) = {
-                        let p = c.pos.lock().unwrap_or_else(|e| e.into_inner());
-                        *p
-                    };
+                for &(eid, px, py, pz) in &player_pos {
                     if (px - x.x).powi(2) + (py - x.y).powi(2) + (pz - x.z).powi(2) < 2.56 {
-                        collected.push((x.eid, c.eid, x.val));
+                        collected.push((x.eid, eid, x.val));
                         break;
                     }
                 }

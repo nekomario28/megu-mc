@@ -36,6 +36,7 @@ python3 tests/fluid_trace_diff_test.py
 python3 tests/ci_playability_gate_test.py
 python3 tests/live_playability_e2e_test.py
 python3 tests/fossil_chunk_acceptance_test.py
+python3 tests/play_survival_basics_test.py
 
 echo "== gate exit contracts"
 python3 tests/gate_scripts.py
@@ -211,6 +212,7 @@ timeout 180 python3 tests/alpha_release_smoke.py "$binary"
 timeout 180 python3 tests/dimension_wire.py "$binary"
 timeout 180 python3 tests/client_settings_wire.py "$binary"
 timeout 180 python3 tests/gameplay_wire.py "$binary"
+timeout 180 python3 tools/play_survival_basics.py "$binary"
 timeout 180 python3 tests/m2_gameplay_wire.py "$binary"
 timeout 180 python3 tests/container_wire.py "$binary"
 timeout 180 python3 tests/population_plan_test.py "$binary"
