@@ -12921,6 +12921,13 @@ impl Gen {
             }
         }
         let executed = distinct.len();
+        // A populate pass the tick itself executes is the stall the streamed-
+        // generation queue exists to remove; counting it makes the offload
+        // measurable instead of asserted.
+        if executed > 0 && crate::on_tick_thread() {
+            crate::stream_gen::TICK_GENERATED_CHUNKS
+                .fetch_add(executed as u64, std::sync::atomic::Ordering::Relaxed);
+        }
         let jobs = terrain_jobs();
         // A generic `FnMut` callback cannot be analysed or sent to a worker. The one driver
         // this layer is allowed to split is `feature::populate`; every other caller (unit

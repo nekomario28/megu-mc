@@ -4950,19 +4950,52 @@ fn stream_chunks(
     if let Some(round) = delivery_round {
         let _ = worldgen::with_gen(|g| g.starts_round = Some(round));
     }
+    // Hand the batch's generation to the bounded worker pool before the send
+    // loop: workers build the pure terrain half off-lock and a single committer
+    // runs populate + the section fill in request order, so `pop_done`, staged
+    // payloads and generated ticks land exactly as the serial path produced
+    // them. This thread then only waits on the chunk it is about to encode —
+    // the generation for the rest of the batch proceeds on the workers while
+    // it does. A declined ticket (`None`) is a chunk the pool did not accept;
+    // it keeps the original inline path. Spectators are excluded on purpose:
+    // `spectatorsGenerateChunks` false must never ticket fresh worldgen.
+    let tickets: Vec<Option<stream_gen::Ticket>> = if allow_generate {
+        news.iter()
+            .map(|&(cx, cz)| stream_gen::request(dim, cx, cz))
+            .collect()
+    } else {
+        news.iter().map(|_| None).collect()
+    };
     // The terrain rows stop one section below the dimension's own ceiling: a Nether/End
     // window is 0..256 (16 sections), not the Overworld's -64..320.
     let (lo, hi) = (dim.min_y(), dim.min_y() + dim.height() - 16);
     let compression = socket_compression(s);
     let mut failed = false;
-    'delivery: for chunk_group in news.chunks(terrain_group(delivery_workers)) {
+    'delivery: for (chunk_group, ticket_group) in news
+        .chunks(terrain_group(delivery_workers))
+        .zip(tickets.chunks(terrain_group(delivery_workers)))
+    {
+        // A queued chunk carries its own terrain prefetch inside the worker job,
+        // so the group prefetch only covers the chunks the pool declined.
+        let uncovered: Vec<(i32, i32)> = chunk_group
+            .iter()
+            .zip(ticket_group)
+            .filter(|(_, t)| t.is_none())
+            .map(|(&c, _)| c)
+            .collect();
         let __pf = Instant::now();
-        prefetch_terrain_group_dim(dim, chunk_group, lo, hi, delivery_workers, delivery_round);
+        prefetch_terrain_group_dim(dim, &uncovered, lo, hi, delivery_workers, delivery_round);
         let __pfe = __pf.elapsed();
         if conn_prof() && __pfe > Duration::from_millis(50) {
             eprintln!("[conn-prof] prefetch_terrain {:?}", __pfe);
         }
-        for (cx, cz) in chunk_group {
+        for ((cx, cz), ticket) in chunk_group.iter().zip(ticket_group) {
+            if let Some(ticket) = ticket {
+                // A false wait means the worker could not generate it; the
+                // frame builder's own `ensure_populated` covers that chunk
+                // inline exactly as before.
+                let _ = ticket.wait();
+            }
             let __cf = Instant::now();
             let frame = cached_chunk_frame(compression, gen, dim, *cx, *cz, occluded);
             let __cfe = __cf.elapsed();
