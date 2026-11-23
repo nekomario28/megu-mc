@@ -229,6 +229,47 @@ fn emit(cli: &Cli, dir: &str, report: &InstallReport) {
     }
 }
 
+fn auto_discover_sibling_in(
+    explicit: &Option<PathBuf>,
+    stem: &str,
+    search_dirs: &[PathBuf],
+) -> Option<PathBuf> {
+    if explicit.is_some() {
+        return explicit.clone();
+    }
+    let names: Vec<String> = if stem.ends_with(".jar") {
+        vec![stem.to_owned()]
+    } else if cfg!(windows) {
+        vec![format!("{stem}.exe"), stem.to_owned()]
+    } else {
+        vec![stem.to_owned(), format!("{stem}.exe")]
+    };
+    for dir in search_dirs {
+        for name in &names {
+            let candidate = dir.join(name);
+            if candidate.is_file() {
+                return Some(candidate);
+            }
+        }
+    }
+    None
+}
+
+fn auto_discover_sibling(explicit: &Option<PathBuf>, stem: &str) -> Option<PathBuf> {
+    let mut dirs = Vec::new();
+    if let Ok(exe) = std::env::current_exe() {
+        if let Some(parent) = exe.parent() {
+            dirs.push(parent.to_path_buf());
+        }
+    }
+    if let Ok(cwd) = std::env::current_dir() {
+        if !dirs.iter().any(|d| d == &cwd) {
+            dirs.push(cwd);
+        }
+    }
+    auto_discover_sibling_in(explicit, stem, &dirs)
+}
+
 fn run(cli: &Cli) -> std::io::Result<()> {
     match cli.command {
         Command::Client => {
@@ -238,8 +279,8 @@ fn run(cli: &Cli) -> std::io::Result<()> {
             };
             let options = ClientInstallOptions {
                 mc_version: cli.mc_version,
-                bootstrap_jar: cli.bootstrap_jar.clone(),
-                client_bin: cli.client_bin.clone(),
+                bootstrap_jar: auto_discover_sibling(&cli.bootstrap_jar, "megu-bootstrapper.jar"),
+                client_bin: auto_discover_sibling(&cli.client_bin, "megu-client-gpu"),
                 client_sha256: cli.client_sha256.clone(),
             };
             let report = installer::install_client(
@@ -258,8 +299,8 @@ fn run(cli: &Cli) -> std::io::Result<()> {
             };
             let options = ClientInstallOptions {
                 mc_version: cli.mc_version,
-                bootstrap_jar: cli.bootstrap_jar.clone(),
-                client_bin: cli.client_bin.clone(),
+                bootstrap_jar: auto_discover_sibling(&cli.bootstrap_jar, "megu-bootstrapper.jar"),
+                client_bin: auto_discover_sibling(&cli.client_bin, "megu-client-gpu"),
                 client_sha256: cli.client_sha256.clone(),
             };
             let report = installer::install_prism(&instances, &options)?;
@@ -270,7 +311,7 @@ fn run(cli: &Cli) -> std::io::Result<()> {
             let dir = cli.dir.clone().unwrap_or_default();
             let options = ServerInstallOptions {
                 mc_version: cli.mc_version,
-                server_bin: cli.server_bin.clone(),
+                server_bin: auto_discover_sibling(&cli.server_bin, "megu"),
             };
             let report = installer::install_server(&dir, &options)?;
             emit(cli, &dir.display().to_string(), &report);
@@ -342,5 +383,36 @@ mod tests {
         // Bare `megu-installer` installs for the Official Launcher too.
         let cli = parse(&args(&[])).unwrap();
         assert_eq!(cli.command, Command::Client);
+    }
+
+    #[test]
+    fn auto_discovers_sibling_binaries_and_respects_explicit_override() {
+        let dir = std::env::temp_dir().join(format!(
+            "megu-installer-discover-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::create_dir_all(&dir);
+        let gpu = dir.join("megu-client-gpu");
+        let jar = dir.join("megu-bootstrapper.jar");
+        std::fs::write(&gpu, b"fake").unwrap();
+        std::fs::write(&jar, b"fake").unwrap();
+
+        let search = vec![dir.clone()];
+        assert_eq!(
+            auto_discover_sibling_in(&None, "megu-client-gpu", &search),
+            Some(gpu.clone())
+        );
+        assert_eq!(
+            auto_discover_sibling_in(&None, "megu-bootstrapper.jar", &search),
+            Some(jar.clone())
+        );
+        let explicit = Some(PathBuf::from("/custom/path"));
+        assert_eq!(
+            auto_discover_sibling_in(&explicit, "megu-client-gpu", &search),
+            explicit
+        );
+        let _ = std::fs::remove_file(&gpu);
+        let _ = std::fs::remove_file(&jar);
+        let _ = std::fs::remove_dir(&dir);
     }
 }

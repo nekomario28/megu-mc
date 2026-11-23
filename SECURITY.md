@@ -1,21 +1,54 @@
 # Security Policy / セキュリティポリシー
 
-## Supported versions / サポート対象
+Megu (`megu-mc`) is a clean-room Rust server and native GPU client for Minecraft: Java Edition 1.21.1. This policy describes how to report security vulnerabilities privately and what is in scope.
 
-`main` ブランチのみが対象です。リリースやタグ付きバージョンはありません (`Cargo.toml` の version `0.0.0` は復元時の値です)。
-Only the `main` branch is supported. There are no tagged releases.
+日本語での案内は本ページ後半の「[脆弱性の報告（日本語）](#脆弱性の報告日本語)」を参照してください。
 
-## Reporting a vulnerability / 脆弱性の報告
+## Supported Versions
 
-リポジトリが公開された場合は、**GitHub の Private vulnerability reporting** (リポジトリの *Security* タブ → *Report a vulnerability*) から報告してください。公開 issue には書かないでください。
-(現在は非公開リポジトリです。公開する際に、Settings → Code security で *Private vulnerability reporting* を有効にしてください。)
+| Version | Supported |
+|---|---|
+| `main` / `v0.1.0-alpha.*` | Yes |
 
-When (and if) this repository becomes public, please report vulnerabilities privately through GitHub's *Private vulnerability reporting* (Security tab → *Report a vulnerability*), not in a public issue. The repository is currently private; the owner should enable that setting before making it public.
+## Reporting a Vulnerability
 
-## Scope and known limitations / 既知の制約
+**Do NOT open a public GitHub issue for security vulnerabilities.**
 
-これは実験的なサーバーです。認証 (オンラインモード)・通信の暗号化・接続レート制限などは未実装で、既定では `127.0.0.1` にのみ bind します。**インターネットへ公開しないでください。** 既知の問題、過去の事故と対策の記録は [SECURITY_NOTES.md](SECURITY_NOTES.md) と [AUDIT_WIRE.md](AUDIT_WIRE.md) を参照してください。
+- **Preferred**: Use **[GitHub Private Vulnerability Reporting](https://github.com/nekomario28/megu-mc/security/advisories/new)** (*Security* tab → *Report a vulnerability*).
+- **Email fallback**: `partners@megumin.tech` (include `[SECURITY]` in the subject line).
 
-This is an experimental server with no authentication, encryption, or per-IP rate limiting; it binds to loopback by default and must not be exposed to the internet. See [SECURITY_NOTES.md](SECURITY_NOTES.md) for known issues and history.
+Please include:
 
-Third-party data provenance questions are tracked in [THIRD_PARTY.md](THIRD_PARTY.md).
+- A clear description of the vulnerability and its impact.
+- Minimal steps to reproduce or a proof-of-concept.
+- Affected version / commit SHA and OS/platform.
+- For crash-related issues, the `MEGU-E-XXXXXXXX` fingerprint and redacted crash output.
+
+We aim to acknowledge reports within **7 days** and coordinate a fix before public disclosure.
+
+## Scope
+
+### In Scope
+- **Protocol-level denial of service / memory safety**: Malformed packets that crash, hang, or exhaust memory on the server or client (`proto`, packet framing, decompression limits).
+- **Mod inspection & sandbox boundaries**: Bypasses in static JAR security scanning (`mod-adapter-core`, `megu-mod-check`) or bounded mod execution paths.
+- **World save integrity**: Bugs that corrupt or destroy world saves (`state-store`, `megu-world-migrate`).
+- **Crash-report redaction**: Leaks of local file paths, IP addresses, or tokens in crash reports.
+- **Authentication & session handling**: Online-mode authentication, Velocity forwarding (`MEGU_VELOCITY_FORWARDING`), and operator permission checks.
+
+### Out of Scope
+- Issues requiring existing local code execution or physical access to the host.
+- Vulnerabilities inside third-party mods themselves (please report those upstream).
+- Intentional operator misconfiguration (e.g., disabling authentication on a public server without a proxy). See [SECURITY_NOTES.md](SECURITY_NOTES.md) for operator hardening guidelines.
+
+---
+
+## 脆弱性の報告（日本語）
+
+**セキュリティ上の脆弱性を公開 Issue に投稿しないでください。**
+
+- **推奨窓口**: このリポジトリの **[GitHub Private Vulnerability Reporting](https://github.com/nekomario28/megu-mc/security/advisories/new)**（*Security* タブ → *Report a vulnerability*）から非公開で報告してください。
+- **メール窓口**: `partners@megumin.tech`（件名に `[SECURITY]` を含めてください）。
+
+報告時には、問題の具体的な内容・影響範囲・最小再現手順・対象バージョン（タグまたはコミット SHA）・OS 環境（クラッシュを伴う場合は `MEGU-E-XXXXXXXX` フィンガープリント）を添えてください。原則 **7 日以内** に受領確認を行い、修正完了後の公開に向けて調整します。
+
+サーバー公開時のバインド設定やプロキシ連携などの運用上の注意点は [SECURITY_NOTES.md](SECURITY_NOTES.md) を参照してください。

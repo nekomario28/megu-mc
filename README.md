@@ -1,88 +1,117 @@
 # Megu (`megu-mc`)
 
+**English** | **[日本語 (README.ja.md)](README.ja.md)**
+
 > Clean-room Rust engine & native GPU client for **Minecraft: Java Edition 1.21.1** (Protocol 767).
 >
 > **[Official Site](https://megu.megumin.tech/)** · **[Releases](https://github.com/nekomario28/megu-mc/releases)** · **[License: LGPL-3.0-or-later](LICENSE)** · **[Sponsors](https://github.com/sponsors/nekomario28)**
 
-Minecraft: Java Edition 1.21.1 互換を目指す、**100% クリーンルームの Rust 製サーバー＆ネイティブ GPU クライアント（Vulkan / DX12 / Metal・OpenGL 依存ゼロ）** です。バニラ挙動の忠実な再現を最優先に、低メモリ・高速起動・安全な Mod 互換の両立を目指しています。
+Megu is a **100% clean-room Rust server and native GPU client (Vulkan / DX12 / Metal — zero OpenGL dependency)** targeting Minecraft: Java Edition 1.21.1. It focuses on faithful vanilla behavior, low memory usage, fast startup, and safe data-driven mod compatibility.
 
-> **Alpha (`v0.1.0-alpha.1`)**: 開発初期のプレリリース版です。全バニラ要素や任意の複雑 Java/Mixin Mod を無条件にネイティブ実行できる段階ではありません。詳細は [ロードマップ](specs/ROADMAP.md) を参照してください。
+> **Alpha Notice (`v0.1.0-alpha.1`)**: Megu is an early pre-release. It does not yet cover 100% of vanilla features or run arbitrary complex Java/Mixin mods natively. See the [Roadmap](specs/ROADMAP.md) for current boundaries.
 >
-> *Not an official Minecraft product. Not approved by or associated with Mojang or Microsoft.*（[TRADEMARK.md](TRADEMARK.md)）
+> *Not an official Minecraft product. Not approved by or associated with Mojang or Microsoft.* ([TRADEMARK.md](TRADEMARK.md))
 
-## 特徴
+---
 
-- **バニラ 1.21.1 互換重視**: Protocol 767 の主要ゲームプレイ・レッドストーン・コマンド・サバイバル挙動を公式 1.21.1 と継続照合
-- **軽量 Rust サーバー**: 高速起動・省メモリ設計、Tick 負荷ゼロの外部 TUI ダッシュボード付き
-- **純ネイティブ GPU クライアント**: Linux (Vulkan) / Windows (DX12 & Vulkan) / macOS (Metal) 対応、OpenGL 依存なし、手元の `1.21.1.jar` からアセットを直接読込
-- **Mod 互換＆安全検査**: Fabric / NeoForge のデータ駆動 Mod 読込と、JVM 不要の静的セキュリティ検査を内蔵
-- **簡単導入**: 公式ランチャー・Prism Launcher・Modrinth・サーバー用の導入ツールを同梱
+## Highlights
 
-## クイックスタート
+- **Vanilla 1.21.1 Focus**: Continuously verified against the official 1.21.1 server across core gameplay, survival, redstone, and Protocol 767 packets.
+- **Lightweight Rust Server**: Fast boot, low memory footprint, and an external zero-overhead TUI dashboard.
+- **Native GPU Client**: Pure Vulkan (Linux), DX12 & Vulkan (Windows), and Metal (macOS) rendering with zero OpenGL dependencies. Reads assets directly from your local `1.21.1.jar`.
+- **Safe Mod Compatibility**: Built-in data-driven loader for Fabric / NeoForge packs plus a static bytecode security scanner (no JVM required for scanning).
+- **One-Click Installers**: Standalone native `.exe` / Linux / macOS installers for the Official Launcher, Prism Launcher, Modrinth (`.mrpack`), and dedicated servers.
 
-[GitHub Releases](https://github.com/nekomario28/megu-mc/releases) または [megu.megumin.tech](https://megu.megumin.tech/) からお使いの OS 向けアーカイブを取得してください。
+---
 
-### クライアント導入（公式ランチャー / Prism）
+## Quick Start
 
-```sh
-# 公式ランチャーへ導入（Windows は megu-installer.exe）
-./megu-installer client --mc-version 1.21.1 --client-bin ./megu-client-gpu --bootstrap-jar ./megu-bootstrapper.jar
+Download the installer or archive for your OS from **[GitHub Releases](https://github.com/nekomario28/megu-mc/releases)** or **[megu.megumin.tech](https://megu.megumin.tech/)**.
 
-# Prism Launcher インスタンスを生成
-./megu-installer prism --mc-version 1.21.1 --client-bin ./megu-client-gpu
+### 1. Client Installation (Official Launcher / Prism Launcher)
 
-# または GUI/CLI ブートストラッパーを実行
-java -jar megu-bootstrapper.jar
+#### Windows (`.exe` — No Java required)
+Download `megu-installer-windows-x86_64.exe` (or extract `megu-v0.1.0-alpha.1-windows-x86_64.tar.gz`) and run:
+
+```powershell
+# Double-click megu-installer.exe in Explorer, or run in PowerShell:
+.\megu-installer.exe
+
+# Or create a Prism Launcher instance:
+.\megu-installer.exe prism
 ```
 
-### サーバー起動
+#### Linux (One-liner or native binary)
+```sh
+# Automatic Linux installer (verifies SHA-256, installs to ~/.local, registers profile):
+curl -fsSL https://raw.githubusercontent.com/nekomario28/megu-mc/main/tools/install_linux.sh | sh
+
+# Or run the standalone binary from the release archive:
+./megu-installer
+```
+
+#### macOS (Apple Silicon)
+```sh
+# Extract the macOS archive and run:
+./megu-installer
+```
+
+*(When `megu-client-gpu` and `megu-bootstrapper.jar` are in the same folder as `megu-installer`, they are detected and wired automatically without extra flags.)*
+
+### 2. Dedicated Server
 
 ```sh
-# サーバーディレクトリを初期化（eula.txt は既定で eula=false）
-./megu-installer server --dir ./megu-server --server-bin ./megu
+# Initialize a server directory (creates eula.txt with eula=false, run.sh / run.bat)
+./megu-installer server --dir ./megu-server
 
-# eula.txt を確認・同意したうえで起動（既定バインド: 127.0.0.1）
+# Review and accept eula.txt (eula=true), then start the server (default bind: 127.0.0.1)
 cd ./megu-server
 ./megu --port 25565
 ```
 
-外部公開時の設定や運用手順は [運用ガイド](docs/operator-guide.md) と [SECURITY_NOTES.md](SECURITY_NOTES.md) を参照してください。
+See the [Operator Guide](docs/operator-guide.md) and [SECURITY_NOTES.md](SECURITY_NOTES.md) before exposing a server outside localhost.
 
-## 現在の対応範囲（`v0.1.0-alpha.1`）
+---
 
-| 対応済み | 未完了・今後の予定 |
+## Current Scope (`v0.1.0-alpha.1`)
+
+| Supported Today | Work in Progress / Out of Scope |
 |---|---|
-| 1.21.1 基本ゲームプレイ・サバイバル・レッドストーン・Protocol 767 | 全バイオーム・全構造物・全エンティティ AI の完全網羅 |
-| 純 Vulkan / DX12 / Metal GPU 描画・UI・サウンド | すべての外部 OptiFine / Iris シェーダーパック完全再現 |
-| データ駆動 Mod 読込・静的セキュリティ検査 | 任意の複雑 Java / Mixin Mod の無条件ネイティブ実行 |
-| Linux / macOS / Windows 3 OS ビルド＆インストーラ | 大規模マルチプレイヤー長期稼働・全 OS 実機 GPU 網羅検証 |
+| Core 1.21.1 gameplay, survival, redstone, Protocol 767 | 100% coverage of all biomes, structures, and mob AI |
+| Native Vulkan / DX12 / Metal GPU client, UI, audio | Full compatibility with every external OptiFine / Iris shaderpack |
+| Data-driven mods & static JAR security inspection | Arbitrary complex Java / Mixin code execution |
+| Linux, macOS, and Windows release builds & installers | Large-scale public server soak testing across all hardware |
 
-## ソースからのビルド
+---
 
-前提：Rust `1.98.0`（[rust-toolchain.toml](rust-toolchain.toml) 固定）・Python 3。
+## Build from Source
+
+Prerequisites: Rust `1.98.0` (pinned in [rust-toolchain.toml](rust-toolchain.toml)) and Python 3.
 
 ```sh
 python3 tools/dev_check.py
 cargo build --locked --release
 ```
 
-検証データ生成・テスト・アーキテクチャの詳細は [開発ガイド](docs/development.md)・[クレート構成](docs/architecture-crates.md)・[CONTRIBUTING.md](CONTRIBUTING.md) を参照してください。
+For local test-data generation, testing tiers, and crate architecture, see the [Development Guide](docs/development.md), [Crate Architecture](docs/architecture-crates.md), and [CONTRIBUTING.md](CONTRIBUTING.md).
 
-## ドキュメント
+---
 
-- [運用ガイド](docs/operator-guide.md) / [開発ガイド](docs/development.md) / [Mod 作者向けガイド](docs/mod-author-guide.md)
-- [ロードマップ](specs/ROADMAP.md) / [クレート構成](docs/architecture-crates.md) / [参加ガイド (DCO)](CONTRIBUTING.md)
-- [セキュリティ](SECURITY.md) / [ライセンス詳細](LICENSING.md) / [第三者帰属](THIRD_PARTY.md) / [商標ガイドライン](TRADEMARK.md)
+## Documentation
 
-## 開発支援
+- **Users & Operators**: [Operator Guide](docs/operator-guide.md) · [Mod Author Guide](docs/mod-author-guide.md) · [Security Notes](SECURITY_NOTES.md)
+- **Contributors**: [Development Guide](docs/development.md) · [Crate Architecture](docs/architecture-crates.md) · [Roadmap](specs/ROADMAP.md) · [Contributing (DCO)](CONTRIBUTING.md) · [Code of Conduct](CODE_OF_CONDUCT.md)
+- **Legal & Security**: [Security Policy](SECURITY.md) · [Licensing Details](LICENSING.md) · [Third-Party Notices](THIRD_PARTY.md) · [Trademark Guidelines](TRADEMARK.md)
 
-Megu のクライアント・サーバー機能はすべて完全無料 OSS として提供しています。
+## Support & Sponsorship
 
-- **個人・法人スポンサー**: [GitHub Sponsors](https://github.com/sponsors/nekomario28)
-- **ホスティング・法人提携窓口**: `partners@megumin.tech`（[megu.megumin.tech/#support](https://megu.megumin.tech/#support)）
+Megu is 100% free and open-source software under `LGPL-3.0-or-later`.
 
-## ライセンスとクリーンルーム方針
+- **GitHub Sponsors**: [github.com/sponsors/nekomario28](https://github.com/sponsors/nekomario28)
+- **Hosting & Commercial Partnerships**: `partners@megumin.tech` ([megu.megumin.tech/#support](https://megu.megumin.tech/#support))
 
-- **ライセンス**: **`LGPL-3.0-or-later`**（[LICENSE](LICENSE)・付随 GPLv3 [docs/COPYING.GPL](docs/COPYING.GPL)・[NOTICE](NOTICE)・[LICENSING.md](LICENSING.md)）
-- 実行時に動的ロードされる独立した外部 Mod JAR にはコピーレフトは波及しません。
-- 100% クリーンルームのオリジナル Rust 実装であり、Mojang の逆コンパイルコード・アセットおよび PolyForm Shield / All Rights Reserved のソースコードやシェーダーは一切コピー・同梱していません。寄稿は `LGPL-3.0-or-later` 提供と DCO（`git commit -s`）を前提とします。
+## License & Clean-Room Policy
+
+- **License**: **`LGPL-3.0-or-later`** ([LICENSE](LICENSE), companion GPLv3 text in [docs/COPYING.GPL](docs/COPYING.GPL), [NOTICE](NOTICE), [LICENSING.md](LICENSING.md)).
+- Independent external Mod JARs loaded dynamically at runtime remain under their own licenses (copyleft does not spread to external mod JARs).
+- Megu is a 100% clean-room original Rust implementation. No decompiled Mojang code/assets and no PolyForm Shield or All Rights Reserved code/shaders are copied or distributed. Contributions require `LGPL-3.0-or-later` and DCO sign-off (`git commit -s`).

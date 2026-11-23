@@ -1,9 +1,5 @@
-# Funding for Megu (megu)
+# Funding for Megu (megu-mc)
 # https://docs.github.com/en/repositories/managing-your-repositorys-settings-and-features/customizing-your-repository/displaying-a-sponsor-button-in-your-repository
 
-# GitHub Sponsors — platform fee is 0% for individuals.
 github: [nekomario28]
-
-# Ko-fi — 0% platform fee; payment processing ~3.6–4.1% + ¥40 via PayPal/Stripe.
-# TODO(maintainer): uncomment and set your Ko-fi username.
-# ko_fi: TODO
+custom: ["https://megu.megumin.tech/#support"]

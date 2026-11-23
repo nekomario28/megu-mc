@@ -1,20 +1,16 @@
-<!-- Thanks for contributing to Megu (megu). Keep PRs small and focused. -->
+<!-- Thanks for contributing to Megu (megu-mc)! / ご貢献ありがとうございます！ -->
 
-## Checklist
+## Summary / 変更概要
 
-- [ ] I have read [CONTRIBUTING.md](../CONTRIBUTING.md) and agree to the DCO.
-- [ ] I signed off every commit (`git commit -s`) — see [DCO](https://developercertificate.org/).
-- [ ] This change respects the clean-room / provenance policy: no Mojang-derived assets, decompiled code, or `*_1211*` generated files are included.
-- [ ] `python3 tools/provenance_check.py` passes.
-- [ ] `bash tests/verify.sh` passes on this branch.
-- [ ] For Rust changes: `cargo clippy --manifest-path <crate>/Cargo.toml --offline --locked --all-targets -- -D warnings` is clean (0 warnings).
-- [ ] No new wall-clock reads (`Instant::now` / `SystemTime::now`) in production code — determinism is a release gate.
-- [ ] Commit messages explain *why*, not just *what*.
+<!-- 2–5 lines: what changed and why. / 何をなぜ変更したかを簡潔に記入してください。 -->
 
-## What changed and why
+## Checklist / チェックリスト
 
-<!-- 2–5 lines: motivation, approach, and any trade-offs. -->
+- [ ] I read [CONTRIBUTING.md](../CONTRIBUTING.md) and signed off all commits with `git commit -s` ([DCO 1.1](https://developercertificate.org/)). / DCO 署名（`git commit -s`）済み
+- [ ] Clean-room & provenance compliance: no Mojang-derived data, decompiled code, or incompatible (PolyForm / ARR) code is included. / クリーンルーム原則・来歴遵守
+- [ ] `python3 tools/provenance_check.py --strict-zero-gl` and `bash tools/debt_ratchet.sh` pass.
+- [ ] Affected crate tests and `cargo clippy --all-targets --locked -- -D warnings` pass with 0 warnings.
 
-## Test evidence
+## Verification / 検証結果
 
-<!-- Paste the relevant gate output or link the CI run. -->
+<!-- Commands run and their results. / 実行したテストコマンドと結果を記入してください。 -->

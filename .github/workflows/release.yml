@@ -248,6 +248,14 @@ jobs:
                                        (manifest, f'release-manifest-{target}.json')):
                   destination = output / filename
                   shutil.copyfile(source, destination)
+              import tarfile
+              with tarfile.open(archive, 'r:gz') as tf:
+                  inst_member = f'megu-{os.environ["RELEASE_VERSION"]}-{target}/megu-installer{suffix}'
+                  inst_out = output / f'megu-installer-{target}{suffix}'
+                  inst_out.write_bytes(tf.extractfile(inst_member).read())
+                  inst_out.chmod(0o755)
+          shutil.copyfile('tools/install_linux.sh', output / 'megu-install-linux.sh')
+          (output / 'megu-install-linux.sh').chmod(0o755)
           for artifact in sorted(output.iterdir()):
               if artifact.is_file() and artifact.name != 'SHA256SUMS-all.txt':
                   checksums[artifact.name] = hashlib.sha256(artifact.read_bytes()).hexdigest()
