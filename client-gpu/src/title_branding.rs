@@ -450,21 +450,23 @@ pub fn patch_edition_banner_to_megu(
     let total_w = 4 * glyph_w + 3 * letter_gap;
     let base_x = left_box.x as i32 + ((left_box.w as i32 - total_w) / 2).max(outline_px);
 
-    // Build exact per-pixel front-face mask in the left region (`x_limit x height`),
-    // then derive the 3D underside (`bevel_mask`) and outer border (`outline_mask`)
-    // cleanly in separate passes so borders never overwrite letter interiors!
+    // Central vanishing-point perspective matching original `JAVA EDITION`:
+    // every column leans inward toward banner center `cx = width / 2`, so the
+    // leftmost `M` mirrors the rightmost `N` of `EDITION` (~21% of face height
+    // top lean at the outer edge, tapering linearly to ~0 at center), and the
+    // 3D extrusion pulls downward + slightly inward toward `cx`.
+    let cx_f = (width as f32) * 0.5;
+    let max_edge_lean = (face_h as f32) * 0.22;
+
     let mw = x_limit as usize;
     let mh = height as usize;
     let mut face_mask = vec![false; mw * mh];
 
     for (li, glyph) in MEGU_GLYPHS.iter().enumerate() {
         let lx0 = base_x + li as i32 * (glyph_w + letter_gap);
-        // Subtle inward perspective lean mirroring EDITION's right-side slant:
-        // leftmost `M` leans gently right, tapering smoothly to vertical `U`.
-        let max_lean = ((glyph_w / 9).max(0)) * (3 - li as i32) / 3;
         for py in 0..face_h {
             let r = ((py as usize) * GLYPH_ROWS) / (face_h as usize);
-            let lean = (max_lean * (face_h - 1 - py)) / (face_h.max(2) - 1);
+            let y_frac = (face_h - 1 - py) as f32 / (face_h.max(2) - 1) as f32;
             let y = face_y0 + py;
             if y < 0 || y >= mh as i32 {
                 continue;
@@ -474,7 +476,10 @@ pub fn patch_edition_banner_to_megu(
                 if glyph[r] & (1 << c) == 0 {
                     continue;
                 }
-                let x = lx0 + px + lean;
+                let raw_x = lx0 + px;
+                let u = ((cx_f - raw_x as f32) / cx_f).clamp(0.0, 1.0);
+                let lean = (u * max_edge_lean * y_frac).round() as i32;
+                let x = raw_x + lean;
                 if x >= 0 && x < mw as i32 {
                     face_mask[y as usize * mw + x as usize] = true;
                 }
@@ -482,16 +487,24 @@ pub fn patch_edition_banner_to_megu(
         }
     }
 
-    // Pass 1: 3D extruded stone underside (`bevel_mask`), shifted downward from
-    // `face_mask` by `1..=bevel_px` (only where not covered by the front face).
+    // Pass 1: 3D extruded stone underside (`bevel_mask`) pulling downward and
+    // subtly inward toward the center vanishing point, matching `JAVA`'s 3D
+    // right-facing side wall and bottom extrusion.
     let mut bevel_mask = vec![false; mw * mh];
     for y in 0..mh {
         for x in 0..mw {
             if !face_mask[y * mw + x] {
                 continue;
             }
+            let u = ((cx_f - x as f32) / cx_f).clamp(0.0, 1.0);
             for step in 1..=bevel_px as usize {
                 let by = y + step;
+                let dx = (u * 0.42 * step as f32).round() as usize;
+                let bx = x + dx;
+                if by < mh && bx < mw && !face_mask[by * mw + bx] {
+                    bevel_mask[by * mw + bx] = true;
+                }
+                // Also fill straight-down column so thin angled edges stay watertight.
                 if by < mh && !face_mask[by * mw + x] {
                     bevel_mask[by * mw + x] = true;
                 }
@@ -523,8 +536,22 @@ pub fn patch_edition_banner_to_megu(
         }
     }
 
-    // Pass 3: Paint back-to-front: outline -> 3D stone underside -> bright stone
-    // front face + crisp 1-px highlight rim where face meets underside bevel.
+    // Blend helper for subtle 1-px top-rim and face-to-bevel lip transitions
+    // matching EDITION's real anti-aliased stone lip shading.
+    let blend = |a: [u8; 4], b: [u8; 4], num: u16, den: u16| -> [u8; 4] {
+        [
+            ((u16::from(a[0]) * (den - num) + u16::from(b[0]) * num) / den) as u8,
+            ((u16::from(a[1]) * (den - num) + u16::from(b[1]) * num) / den) as u8,
+            ((u16::from(a[2]) * (den - num) + u16::from(b[2]) * num) / den) as u8,
+            255,
+        ]
+    };
+    let top_edge_shade = blend(palette.fill, palette.bevel, 15, 100);
+    let bevel_lip_shade = blend(palette.fill, palette.bevel, 45, 100);
+
+    // Pass 3: Paint back-to-front: outline -> 3D stone underside (with 1-px
+    // lip blend right below the bright rim) -> bright stone front face (with
+    // subtle top edge shading & bright bottom bevel rim matching EDITION).
     for y in 0..mh {
         for x in 0..mw {
             let idx = y * mw + x;
@@ -537,7 +564,13 @@ pub fn patch_edition_banner_to_megu(
         for x in 0..mw {
             let idx = y * mw + x;
             if bevel_mask[idx] {
-                painter.put(x as i32, y as i32, palette.bevel);
+                let just_below_face = y > 0 && face_mask[(y - 1) * mw + x];
+                let color = if just_below_face && bevel_px >= 4 {
+                    bevel_lip_shade
+                } else {
+                    palette.bevel
+                };
+                painter.put(x as i32, y as i32, color);
             }
         }
     }
@@ -546,8 +579,11 @@ pub fn patch_edition_banner_to_megu(
             let idx = y * mw + x;
             if face_mask[idx] {
                 let above_bevel = y + 1 < mh && bevel_mask[(y + 1) * mw + x];
+                let top_edge = y == 0 || !face_mask[(y - 1) * mw + x];
                 let color = if above_bevel {
                     palette.highlight
+                } else if top_edge && bevel_px >= 4 {
+                    top_edge_shade
                 } else {
                     palette.fill
                 };
