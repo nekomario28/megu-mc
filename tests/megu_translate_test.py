@@ -81,7 +81,12 @@ class MeguTranslateTests(unittest.TestCase):
             for filename, content in members.items():
                 if isinstance(content, dict):
                     content = json.dumps(content, ensure_ascii=False)
-                archive.writestr(filename, content)
+                # Assign ZipInfo.filename directly so hostile backslashes
+                # (`assets\evil`) are preserved verbatim on Windows instead of
+                # being normalized to `/` by ZipInfo.__init__.
+                info = zipfile.ZipInfo("placeholder")
+                info.filename = filename
+                archive.writestr(info, content)
         return path
 
     def fixtures(self):

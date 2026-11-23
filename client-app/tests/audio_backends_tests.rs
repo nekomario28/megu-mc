@@ -116,7 +116,12 @@ fn wrong_os_backend_fails_closed_to_null() {
 #[test]
 fn auto_sink_is_native_or_null_never_wrong_os() {
     let (mut sink, warn) = open_sink(&AudioSinkKind::Auto);
+    #[cfg(target_os = "linux")]
     assert!(matches!(sink.label(), "pipewire" | "alsa" | "null"));
+    #[cfg(target_os = "macos")]
+    assert!(matches!(sink.label(), "coreaudio" | "null"));
+    #[cfg(target_os = "windows")]
+    assert!(matches!(sink.label(), "winmm" | "null"));
     if sink.label() == "null" {
         assert!(warn.is_some(), "silent Null fallback is forbidden");
     }
