@@ -328,7 +328,8 @@ mod chunk_delivery_tests {
             .is_empty());
         feedback.acknowledge(&25.0f32.to_be_bytes()).unwrap();
         let selected = delivery.next_batch(new, &sent, 0.0, &feedback, 21);
-        assert_eq!(selected.len(), 9);
+        // A d=1 vanilla window tracks 21 chunks (cross shape), not 9.
+        assert_eq!(selected.len(), 21);
         assert_eq!(selected[0], (10, 10));
         assert!(selected
             .iter()

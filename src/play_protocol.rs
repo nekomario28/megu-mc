@@ -4462,10 +4462,12 @@ fn client_info_view_distance(body: &[u8]) -> Option<i32> {
     Some(view)
 }
 
-/// The number of chunks the current view window can hold.
+/// The number of chunks the current view window can hold: the exact count of
+/// the vanilla rounded-square tracking region (d=2 → 45, not 25).
 fn window_batch(view: i32) -> usize {
-    let side = (2 * view + 1).max(1) as usize;
-    side * side
+    ChunkWindow::at(0.0, 0.0, view)
+        .unsent(&HashSet::new())
+        .count()
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -4483,14 +4485,24 @@ impl ChunkWindow {
     }
 
     fn contains(self, (x, z): (i32, i32)) -> bool {
-        x.abs_diff(self.center.0).max(z.abs_diff(self.center.1)) <= self.radius as u32
+        // Vanilla 1.21.1 `ChunkTrackingView.Positioned`: the tracked region
+        // is a rounded square, not a Chebyshev square — for view distance d
+        // the bounding box is (2d+3)² with the four far corners cut, so
+        // d=2 tracks 45 chunks (rows 5,7,7,7,7,7,5), not 25.
+        let dx = (i64::from(x) - i64::from(self.center.0))
+            .abs()
+            .saturating_sub(1)
+            .max(0);
+        let dz = (i64::from(z) - i64::from(self.center.1))
+            .abs()
+            .saturating_sub(1)
+            .max(0);
+        let lo = dx.min(dz);
+        let hi = dx.max(dz).saturating_sub(1).max(0);
+        lo * lo + hi * hi < i64::from(self.radius) * i64::from(self.radius)
     }
 
-    fn leaving(self, previous: Option<Self>, sent: &HashSet<(i32, i32)>) -> Vec<(i32, i32)> {
-        if let Some(old) = previous.filter(|old| old.radius == self.radius) {
-            let (_, removed) = chunk_view_diff(old.center, self.center, self.radius as u32);
-            return removed.into_iter().filter(|c| sent.contains(c)).collect();
-        }
+    fn leaving(self, _previous: Option<Self>, sent: &HashSet<(i32, i32)>) -> Vec<(i32, i32)> {
         sent.iter()
             .copied()
             .filter(|&c| !self.contains(c))
@@ -4499,10 +4511,11 @@ impl ChunkWindow {
 
     fn unsent(self, sent: &HashSet<(i32, i32)>) -> impl Iterator<Item = (i32, i32)> + '_ {
         let (cx, cz) = self.center;
-        let r = self.radius;
+        // Vanilla bounding box extends one chunk past the nominal radius.
+        let r = self.radius + 1;
         (cx.saturating_sub(r)..=cx.saturating_add(r))
             .flat_map(move |x| (cz.saturating_sub(r)..=cz.saturating_add(r)).map(move |z| (x, z)))
-            .filter(move |c| !sent.contains(c))
+            .filter(move |c| self.contains(*c) && !sent.contains(c))
     }
 }
 
@@ -15428,14 +15441,18 @@ mod connection_limits_wire_tests {
             center: (1, 0),
             radius: 2,
         };
-        let mut sent = HashSet::from([(-2, -2), (-2, 2), (1, 1), (2, 0)]);
-        assert_eq!(window.leaving(Some(previous), &sent), [(-2, -2), (-2, 2)]);
+        // Rounded-square window (d=2 tracks 45): the far diagonal cells
+        // (-3,-3)/(-3,3) leave, while (-2,-2)/(-2,2) stay tracked.
+        let mut sent = HashSet::from([(-3, -3), (-3, 3), (1, 1), (2, 0)]);
+        let mut gone = window.leaving(Some(previous), &sent);
+        gone.sort();
+        assert_eq!(gone, [(-3, -3), (-3, 3)]);
         sent.retain(|&c| window.contains(c));
         let mut feedback = connection_limits::chunk_feedback(25);
         feedback.acknowledge(&25.0f32.to_be_bytes()).unwrap();
         let south = connection_limits::ChunkDelivery::default()
             .next_batch(window, &sent, 0.0, &feedback, 0);
-        assert_eq!(south.len(), 23);
+        assert_eq!(south.len(), 25);
         assert_eq!(south[0], (1, 0));
         assert!(south[1].1 > 0);
         assert_eq!(

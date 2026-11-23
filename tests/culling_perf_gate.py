@@ -284,7 +284,8 @@ class ChunkSendBudget:
             self.queued.append(chunk)
 
     def drain_tick(self, center, radius, look):
-        r = int(radius)
+        # Superset cull: the vanilla window reaches radius+1 on its axes.
+        r = int(radius) + 1
         self.queued = [c for c in self.queued
                        if abs(c[0] - center[0]) <= r and abs(c[1] - center[1]) <= r]
         prioritize_chunks(self.queued, center, look)
@@ -325,7 +326,12 @@ class ChunkDelivery:
 
 
 class ChunkWindow:
-    """Mirror of play_protocol.rs ChunkWindow (Chebyshev window)."""
+    """Mirror of play_protocol.rs ChunkWindow (vanilla rounded-square window).
+
+    Vanilla 1.21.1 ChunkTrackingView.Positioned: the tracked region is a
+    rounded square — bounding box (2d+3)^2 with far corners cut, so d=2
+    tracks 45 chunks (rows 5,7,7,7,7,7,5), not the 25 of a Chebyshev square.
+    """
 
     def __init__(self, center, radius):
         self.center = center
@@ -336,18 +342,21 @@ class ChunkWindow:
                 and self.center == other.center and self.radius == other.radius)
 
     def contains(self, c):
-        return max(abs(c[0] - self.center[0]), abs(c[1] - self.center[1])) <= self.radius
+        dx = max(abs(c[0] - self.center[0]) - 1, 0)
+        dz = max(abs(c[1] - self.center[1]) - 1, 0)
+        lo = min(dx, dz)
+        hi = max(max(dx, dz) - 1, 0)
+        return lo * lo + hi * hi < self.radius * self.radius
 
     @staticmethod
     def _cells(center, radius):
+        probe = radius + 1
         return {(x, z)
-                for x in range(center[0] - radius, center[0] + radius + 1)
-                for z in range(center[1] - radius, center[1] + radius + 1)}
+                for x in range(center[0] - probe, center[0] + probe + 1)
+                for z in range(center[1] - probe, center[1] + probe + 1)
+                if ChunkWindow(center, radius).contains((x, z))}
 
     def leaving(self, previous, sent):
-        if previous is not None and previous.radius == self.radius:
-            removed = self._cells(previous.center, self.radius) - self._cells(self.center, self.radius)
-            return sorted(c for c in removed if c in sent)
         return sorted(c for c in sent if not self.contains(c))
 
     def unsent(self, sent):
@@ -1120,12 +1129,16 @@ def self_test():
     window = ChunkWindow((0, 0), 1)
     sent = {(0, 0), (1, 0), (-1, -1)}
     moved = ChunkWindow((2, 0), 1)
-    check(window.contains((1, 1)) and not window.contains((2, 0)), "window-contains")
-    # Old window x in -1..1 minus new window x in 1..3 leaves x in {-1,0};
-    # of those only (0,0) and (-1,-1) were actually sent.
-    check(moved.leaving(window, sent) == [(-1, -1), (0, 0)], "window-leaving")
-    check(set(moved.unsent(sent)) == {(1, -1), (1, 1), (2, -1), (2, 0), (2, 1),
-                                    (3, -1), (3, 0), (3, 1)}, "window-unsent")
+    # Rounded square: d=1 keeps (2,0) inside but drops (3,0).
+    check(window.contains((1, 1)) and not window.contains((3, 0)), "window-contains")
+    # Under the vanilla predicate only (-1,-1) left the moved window; (0,0)
+    # is still tracked at distance |dx|=2.
+    check(moved.leaving(window, sent) == [(-1, -1)], "window-leaving")
+    check(set(moved.unsent(sent)) == {(0, -1), (0, 1), (1, -2), (1, -1), (1, 1),
+                                    (1, 2), (2, -2), (2, -1), (2, 0), (2, 1),
+                                    (2, 2), (3, -2), (3, -1), (3, 0), (3, 1),
+                                    (3, 2), (4, -1), (4, 0), (4, 1)},
+          "window-unsent")
 
     delivery = ChunkDelivery(window_batch=4)
     w = ChunkWindow((0, 0), 2)

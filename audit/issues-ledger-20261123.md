@@ -189,6 +189,7 @@ shader waste).
 | L37 | `OperatorMetricsSnapshot::format_prometheus` unreachable | pre-release §4 matrix | `src/operator_ux.rs:3255` | unwired-feature | fixed | Prometheus output path generated |
 | L38 | `network_limits_wire`/`protocol_fuzz_wire`/`multiplayer_stress_wire`/`neoforge_live_server_wire`/`creative_parity_wire`/`client_oracle_fuzz_wire` never run | gate-status §7 | `tests/` | ci-release | open | Same as L11 — kept for filename clarity |
 | L39 | mob tick `mcount < 12` hostile cap + drops/xp 300 s despawn retained | AUDIT_WIRE verified caps | `src/main.rs` | security | fixed | Verified in addendum; retained for completeness |
+| L40 | View window is Chebyshev square: 25 chunks at d=2 vs vanilla 45 (BUG-LD4) | live-diff §LD4; W3 jar-verified | `src/play_protocol.rs` `ChunkWindow` | parity | fixed | `contains`/`unsent` now use vanilla `ChunkTrackingView.Positioned` rounded-square predicate; `drain_tick` cull widened to r+1; live-verified 45 chunks on wire |
 ---
 
 ### Verification notes

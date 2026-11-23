@@ -484,7 +484,10 @@ impl ChunkSendBudget {
     }
 
     fn drain_tick(&mut self, center: (i32, i32), radius: u32, look: (f64, f64)) -> Vec<(i32, i32)> {
-        let radius = i64::from(radius);
+        // The vanilla rounded-square window reaches radius+1 on its bounding
+        // axes; the queue only ever holds window cells, so this is a superset
+        // cull, not the tracking predicate itself.
+        let radius = i64::from(radius) + 1;
         self.queued.retain(|&(x, z)| {
             (i64::from(x) - i64::from(center.0)).abs() <= radius &&
             (i64::from(z) - i64::from(center.1)).abs() <= radius
