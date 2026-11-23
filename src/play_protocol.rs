@@ -14371,6 +14371,13 @@ fn disconnect_cleanup(me_cleanup: &Arc<Client>, peer: &str) {
             let record = client_dim_pos(me_cleanup);
             pos_store().lock().unwrap_or_else(|e| e.into_inner()).insert(me_cleanup.name.clone(), record);
             save_live_player_snapshot(me_cleanup, record, &inventory_snapshot);
+            // The working copy now lives in `saved_players`; drop the
+            // UUID-keyed `chests` entry or every unique joiner accretes one
+            // forever. Rejoin reinserts it from the save (login path).
+            chests()
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .remove(&ender_container_key(&me_cleanup.uuid));
         }
         // vanilla `ServerPlayer.disconnect` -> `containerMenu.removed` -> stopOpen:
         // the leaving viewer stops counting before it leaves the client list. The window
