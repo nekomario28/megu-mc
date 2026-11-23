@@ -2906,9 +2906,9 @@ fn share_nofeat() -> bool {
     *NOFEAT.get_or_init(|| env_flag!("MEGU_NOFEAT"))
 }
 
-const BASE_CACHE_CAP: usize = 512;
-const BEARD_CACHE_CAP: usize = 1024;
-const COL_CACHE_CAP: usize = 512;
+const BASE_CACHE_CAP: usize = 128;
+const BEARD_CACHE_CAP: usize = 256;
+const COL_CACHE_CAP: usize = 192;
 
 impl TerrainShare {
     fn new() -> Self {

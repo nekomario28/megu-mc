@@ -188,7 +188,7 @@ pub(crate) struct LiveWorldPathAdapter<'a> {
 impl<'a> LiveWorldPathAdapter<'a> {
     /// Uses the same dimension-aware block lookup as the live mob tick.
     pub fn new(dimension: crate::worldgen::DimId, reg: &'a crate::block_registry::BReg) -> Self {
-        Self::with_block_getter(dimension, reg, block_at_dim)
+        Self::with_block_getter(dimension, reg, block_at_cached_dim)
     }
 
     pub fn with_block_getter(

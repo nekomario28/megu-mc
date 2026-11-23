@@ -3891,7 +3891,7 @@ fn incubation_env_below(
     dim: DimId,
     pos: BlockPos,
 ) -> IncubationEnv {
-    match reg.name_of(block_at_dim(dim, pos.0, pos.1 - 1, pos.2)) {
+    match reg.name_of(block_at_cached_dim(dim, pos.0, pos.1 - 1, pos.2)) {
         "minecraft:sand" | "minecraft:red_sand" => IncubationEnv::SandNight,
         "minecraft:moss_block" | "minecraft:moss_carpet" => IncubationEnv::MossBlock,
         name => IncubationEnv::Custom(name.to_string()),

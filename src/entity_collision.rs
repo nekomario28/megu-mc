@@ -96,7 +96,7 @@ fn collect_block_collision_boxes_into(
     for by in by0..=by1 {
         for bz in bz0..=bz1 {
             for bx in bx0..=bx1 {
-                let st = block_at(bx, by, bz);
+                let st = block_at_cached(bx, by, bz);
                 for (bmin, bmax) in reg.collision_boxes(st) {
                     let wmin = [
                         bx as f64 + bmin[0],
@@ -128,7 +128,7 @@ fn any_block_collision_box(min: [f64; 3], max: [f64; 3]) -> bool {
     for by in by0..=by1 {
         for bz in bz0..=bz1 {
             for bx in bx0..=bx1 {
-                let st = block_at(bx, by, bz);
+                let st = block_at_cached(bx, by, bz);
                 for (bmin, bmax) in reg.collision_boxes(st) {
                     let wmin = [
                         bx as f64 + bmin[0],

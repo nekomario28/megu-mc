@@ -3792,7 +3792,7 @@ fn live_mob_behavior_step(
     let tick = TICK.load(Ordering::Relaxed);
     state.potions.retain(|&(_, expiry)| expiry > tick);
     let mut block_at = |[x, y, z]: [i32; 3]| {
-        let id = block_at_dim(ctx.dim, x, y, z);
+        let id = block_at_cached_dim(ctx.dim, x, y, z);
         EndermanTeleportBlock {
             blocks_motion: reg.blocks_motion(id),
             liquid: reg.fluid_name(id) != "minecraft:empty",
@@ -5106,7 +5106,7 @@ fn collect_block_collision_boxes_into_dim(
     for by in by0..=by1 {
         for bz in bz0..=bz1 {
             for bx in bx0..=bx1 {
-                let st = block_at_dim(dim, bx, by, bz);
+                let st = block_at_cached_dim(dim, bx, by, bz);
                 for (bmin, bmax) in reg.collision_boxes(st) {
                     let wmin = [
                         bx as f64 + bmin[0],
@@ -5505,7 +5505,7 @@ fn live_mob_tick_dimension(
                         owner_pos,
                         (mp.0, mp.1, mp.2),
                         sitting,
-                        |d, x, y, z| reg.blocks_motion(block_at_dim(d, x, y, z)),
+                        |d, x, y, z| reg.blocks_motion(block_at_cached_dim(d, x, y, z)),
                     ) {
                         let (yaw, pitch) = (mp.3, mp.4);
                         *mp = (tx, ty, tz, yaw, pitch);
@@ -5523,7 +5523,7 @@ fn live_mob_tick_dimension(
             }
         }
         let [bx, by, bz] = [mp.0, mp.1, mp.2].map(|value| value.floor() as i32);
-        let feet_state = block_at_dim(dim, bx, by, bz);
+        let feet_state = block_at_cached_dim(dim, bx, by, bz);
         let (in_water, in_lava) = if dim == DimId::Overworld {
             (
                 mob_in_water(m.etype, mp.0, mp.1, mp.2),
@@ -5560,7 +5560,7 @@ fn live_mob_tick_dimension(
                 && if dim == DimId::Overworld {
                     mob_cell_solid(mp.0, mp.1 + 1.0, mp.2)
                 } else {
-                    reg.blocks_motion(block_at_dim(dim, bx, by + 1, bz))
+                    reg.blocks_motion(block_at_cached_dim(dim, bx, by + 1, bz))
                 }
             {
                 damage += 1.0;
@@ -5589,7 +5589,7 @@ fn live_mob_tick_dimension(
             // brightness above 0.5 — water and rain take the light to 0 here.
             // Skeletons and phantoms share the family predicates; zombies use
             // the same rule written inline (they have no dedicated helper).
-            let sky_visible = by + 1 >= height_at(bx, bz) && block_at(bx, by + 2, bz) == 0;
+            let sky_visible = by + 1 >= height_at(bx, bz) && block_at_cached(bx, by + 2, bz) == 0;
             let sky_light = if in_water || raining { 0.0 } else { 1.0 };
             let sun_burn = match m.etype {
                 91 => skeleton_burns_in_sun(day, sky_visible, sky_light, false),
@@ -7202,7 +7202,7 @@ fn mob_passable(st: u32) -> bool {
 fn mob_cell_solid(x: f64, y: f64, z: f64) -> bool {
     // feet cell solid?
     let [cx, cy, cz] = [x, y, z].map(|v| v.floor() as i32);
-    !mob_passable(block_at(cx, cy, cz))
+    !mob_passable(block_at_cached(cx, cy, cz))
 }
 fn ore_state(x: i32, y: i32, z: i32) -> u32 {
     let oh = ((x as i64).wrapping_mul(0x9E3779B1)
@@ -9505,6 +9505,26 @@ fn dim_base_state(dim: DimId, x: i32, y: i32, z: i32) -> Option<u32> {
     })
 }
 
+/// `dim_base_state` for a caller that already holds `dim`'s generator lock. The
+/// addressable-band guard is kept verbatim — a cell outside it is air, and the
+/// guard is also what keeps the generator's `*16`/bound sample arithmetic off
+/// an `i32` overflow. For the Overworld the held generator is the same slot
+/// `base_state`'s `wg2_block` consults, and its `column_state` arm only runs
+/// when no generator is installed, which `with_gen_dim` already ruled out.
+fn dim_gen_state(dim: DimId, g: &mut worldgen::Gen, x: i32, y: i32, z: i32) -> u32 {
+    if y.checked_sub(dim.min_y()).is_none()
+        || !(-(1 << 28)..1 << 28).contains(&x)
+        || !(-(1 << 28)..1 << 28).contains(&z)
+    {
+        return 0;
+    }
+    if dim == DimId::Overworld {
+        return g.block_state_at(x, y, z, crate::feature::populate);
+    }
+    worldgen::custom_dim_state(dim, x, y, z)
+        .unwrap_or_else(|| g.block_state_at(x, y, z, crate::feature::populate))
+}
+
 /// The generated state at a cell in `dim`, air when that dimension has no generator. The
 /// Overworld arm is exactly `base_state`, so the existing Overworld packet bytes are moved by
 /// neither the name nor the fallback here.
@@ -9530,6 +9550,31 @@ fn block_at_dim(dim: DimId, x: i32, y: i32, z: i32) -> u32 {
 
 fn block_at(x: i32, y: i32, z: i32) -> u32 {
     block_at_dim(DimId::Overworld, x, y, z)
+}
+
+/// `block_at_dim` ordered so a loaded chunk never reaches the generator: the
+/// edit overlay, the published section, the surface band, and only then
+/// `dim_base_state`. Published sections and bands carry the same writes as the
+/// overlay, so the answer is `block_at_dim`'s cell for cell — but a mob probe
+/// inside streamed terrain resolves from the store or band instead of paying
+/// a worldgen evaluation under its lock on the tick thread.
+fn block_at_cached_dim(dim: DimId, x: i32, y: i32, z: i32) -> u32 {
+    if let Some(st) = overlay_block_dim(dim, x, y, z) {
+        return st;
+    }
+    if let Some(st) = stored_state(dim, x, y, z) {
+        return st;
+    }
+    if let Some(st) = band_for(dim, x >> 4, z >> 4)
+        .and_then(|b| b.get(y, (x & 15) as usize, (z & 15) as usize))
+    {
+        return st;
+    }
+    dim_base_state(dim, x, y, z).unwrap_or(0)
+}
+
+fn block_at_cached(x: i32, y: i32, z: i32) -> u32 {
+    block_at_cached_dim(DimId::Overworld, x, y, z)
 }
 fn set_block_dim(dim: DimId, x: i32, y: i32, z: i32, st: u32) {
     set_block_if_dim(dim, x, y, z, st, None);
@@ -14524,12 +14569,21 @@ struct SkyFloorCells {
 static SKY_FLOORS_NO_SNAPSHOT: AtomicBool = AtomicBool::new(false);
 #[cfg(test)]
 static SKY_FLOORS_SNAPSHOT_CELLS: AtomicU64 = AtomicU64::new(0);
+/// Cells the snapshot could not settle and the scan resolved against the
+/// generator under its single lock (`SKY_FLOORS_GEN_SCANS` counts the scans
+/// that lock covered).
+#[cfg(test)]
+static SKY_FLOORS_GEN_CELLS: AtomicU64 = AtomicU64::new(0);
+#[cfg(test)]
+static SKY_FLOORS_GEN_SCANS: AtomicU64 = AtomicU64::new(0);
 
 impl SkyFloorCells {
-    /// Snapshot the chunk's sources, or `None` when nothing cached can answer — the
-    /// caller then uses `opacity` for every cell, exactly as before. A chunk that is
-    /// neither in the section store nor the band cache has no cheaper source than the
-    /// per-cell chain, so scanning it through a snapshot would buy nothing.
+    /// Snapshot the chunk's sources, or `None` when the registry or the worldgen
+    /// flag rules the whole fast path out — the caller then uses `opacity` for
+    /// every cell, exactly as before. A chunk with no published sections and no
+    /// band still keeps its overlay: an edit lands there before any section is
+    /// streamed, and the overlay is what lets the caller settle it under the
+    /// generator's single lock instead of paying one lock per cell.
     fn snapshot(dim: DimId, cx: i32, cz: i32) -> Option<Self> {
         #[cfg(test)]
         if SKY_FLOORS_NO_SNAPSHOT.load(Ordering::Relaxed) {
@@ -14548,9 +14602,6 @@ impl SkyFloorCells {
             }
         };
         let band = band_for(dim, cx, cz);
-        if sections.is_none() && band.is_none() {
-            return None;
-        }
         let overlay = timed_world()
             .get(&(dim, cx, cz))
             .cloned()
@@ -14657,28 +14708,65 @@ fn sky_floors_dim(
     // snapshot does not cover still go through `opacity`, so the floors are identical.
     let cells = SkyFloorCells::snapshot(dim, cx, cz);
     let mut floors = [0i32; 256];
-    for lz in 0..16usize {
-        for lx in 0..16usize {
-            let i = (lz << 4) | lx;
-            let (x, z) = (cx * 16 + lx as i32, cz * 16 + lz as i32);
-            let mut y = starts[i].min(dim.min_y() + dim.height() - 1);
-            let mut steps = 0;
-            while steps < 24 {
-                if chunkprof::enabled() {
-                    chunkprof::FLOORS_CELLS.fetch_add(1, Ordering::Relaxed);
+    // The scan is identical either way; only the per-cell resolver changes.
+    let scan = |resolve: &mut dyn FnMut(i32, i32, i32) -> u8, floors: &mut [i32; 256]| {
+        for lz in 0..16usize {
+            for lx in 0..16usize {
+                let i = (lz << 4) | lx;
+                let (x, z) = (cx * 16 + lx as i32, cz * 16 + lz as i32);
+                let mut y = starts[i].min(dim.min_y() + dim.height() - 1);
+                let mut steps = 0;
+                while steps < 24 {
+                    if chunkprof::enabled() {
+                        chunkprof::FLOORS_CELLS.fetch_add(1, Ordering::Relaxed);
+                    }
+                    if resolve(x, y, z) > 0 {
+                        break;
+                    }
+                    y -= 1;
+                    steps += 1;
                 }
-                let opaque = cells
+                floors[i] = y;
+            }
+        }
+    };
+    // A cell the snapshot cannot settle ends in `opacity` → `block_at_dim` →
+    // `dim_base_state`, which evaluates the dimension's generator under its
+    // mutex — once per cell. A not-yet-streamed neighbour chunk (no published
+    // sections) costs ~700 acquisitions per floors scan, so hold the lock once
+    // for the whole scan there. A chunk with published sections leaves only
+    // stragglers (below the grid, past the band) to the per-cell chain, which
+    // is cheaper than taking the lock every scan.
+    let under_one_lock = match (cells.as_ref(), breg()) {
+        (Some(cells), Some(reg)) if cells.sections.is_none() => {
+            worldgen::with_gen_dim(dim, |g| {
+                #[cfg(test)]
+                SKY_FLOORS_GEN_SCANS.fetch_add(1, Ordering::Relaxed);
+                scan(
+                    &mut |x, y, z| {
+                        cells.opacity_at(x, y, z).unwrap_or_else(|| {
+                            #[cfg(test)]
+                            SKY_FLOORS_GEN_CELLS.fetch_add(1, Ordering::Relaxed);
+                            reg.opacity_of(dim_gen_state(dim, g, x, y, z))
+                        })
+                    },
+                    &mut floors,
+                );
+            })
+            .is_some()
+        }
+        _ => false,
+    };
+    if !under_one_lock {
+        scan(
+            &mut |x, y, z| {
+                cells
                     .as_ref()
                     .and_then(|c| c.opacity_at(x, y, z))
-                    .unwrap_or_else(|| opacity(x, y, z));
-                if opaque > 0 {
-                    break;
-                }
-                y -= 1;
-                steps += 1;
-            }
-            floors[i] = y;
-        }
+                    .unwrap_or_else(|| opacity(x, y, z))
+            },
+            &mut floors,
+        );
     }
     sky_floors_cache()
         .lock()
@@ -16435,7 +16523,7 @@ struct LiveLightEngine {
     engine: IncrementalLighting,
 }
 
-const LIVE_LIGHT_ENGINE_CAP: usize = 512;
+const LIVE_LIGHT_ENGINE_CAP: usize = 192;
 
 fn live_light_engines() -> &'static Mutex<HashMap<DimId, LiveLightEngine>> {
     static ENGINES: OnceLock<Mutex<HashMap<DimId, LiveLightEngine>>> = OnceLock::new();

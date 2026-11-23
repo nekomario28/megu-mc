@@ -465,11 +465,11 @@ fn aabb_in_water_with(
 }
 
 fn aabb_in_water(aabb: EntityAabb) -> bool {
-    aabb_in_water_with(aabb, &block_at)
+    aabb_in_water_with(aabb, &block_at_cached)
 }
 
 fn aabb_in_lava(aabb: EntityAabb) -> bool {
-    aabb_in_lava_with(aabb, &block_at)
+    aabb_in_lava_with(aabb, &block_at_cached)
 }
 
 /// 1.21.1 `Player.<clinit>` (`cmx`) pose eye heights:
@@ -498,21 +498,21 @@ fn player_bounding_box(x: f64, y: f64, z: f64, sneaking: bool, fall_fly: bool) -
 #[cfg(test)]
 fn player_eye_in_water(x: f64, y: f64, z: f64, sneaking: bool, fall_fly: bool) -> bool {
     let eh = player_eye_height(sneaking, fall_fly);
-    eye_in_fluid_with(x, y, z, eh, EntityFluidKind::Water, &block_at)
+    eye_in_fluid_with(x, y, z, eh, EntityFluidKind::Water, &block_at_cached)
 }
 
 fn player_drowning_submerged(
     dim: DimId, x: f64, y: f64, z: f64, sneaking: bool, fall_fly: bool,
 ) -> bool {
     let eh = player_eye_height(sneaking, fall_fly);
-    let get_block = |bx, by, bz| block_at_dim(dim, bx, by, bz);
+    let get_block = |bx, by, bz| block_at_cached_dim(dim, bx, by, bz);
     eye_in_fluid_with(x, y, z, eh, EntityFluidKind::Water, &get_block)
         && !eye_in_bubble_column_with(x, y, z, eh, &get_block)
 }
 
 fn player_in_lava(dim: DimId, x: f64, y: f64, z: f64, sneaking: bool, fall_fly: bool) -> bool {
     aabb_in_lava_with(player_bounding_box(x, y, z, sneaking, fall_fly), &|bx, by, bz| {
-        block_at_dim(dim, bx, by, bz)
+        block_at_cached_dim(dim, bx, by, bz)
     })
 }
 
@@ -544,13 +544,13 @@ fn mob_fire_immune(etype: i64) -> bool {
 
 #[allow(dead_code)]
 fn mob_eye_in_water(etype: i64, x: f64, y: f64, z: f64) -> bool {
-    eye_in_fluid_with(x, y, z, mob_eye_height(etype), EntityFluidKind::Water, &block_at)
+    eye_in_fluid_with(x, y, z, mob_eye_height(etype), EntityFluidKind::Water, &block_at_cached)
 }
 
 fn mob_drowning_submerged(etype: i64, x: f64, y: f64, z: f64) -> bool {
     let eh = mob_eye_height(etype);
-    eye_in_fluid_with(x, y, z, eh, EntityFluidKind::Water, &block_at)
-        && !eye_in_bubble_column_with(x, y, z, eh, &block_at)
+    eye_in_fluid_with(x, y, z, eh, EntityFluidKind::Water, &block_at_cached)
+        && !eye_in_bubble_column_with(x, y, z, eh, &block_at_cached)
 }
 
 fn mob_in_water(etype: i64, x: f64, y: f64, z: f64) -> bool {
@@ -864,7 +864,7 @@ fn mob_water_state_vel(etype: i64, pos: [f64; 3], vel: [f64; 3]) -> FluidPushRes
         true,
         false,
         vel,
-        &block_at,
+        &block_at_cached,
     )
 }
 
@@ -881,7 +881,7 @@ fn mob_lava_state_vel(etype: i64, pos: [f64; 3], vel: [f64; 3]) -> FluidPushResu
         true,
         false,
         vel,
-        &block_at,
+        &block_at_cached,
     )
 }
 
@@ -984,7 +984,7 @@ fn fluid_sweep_states(
 fn mob_fluid_states_vel(etype: i64, pos: [f64; 3], vel: [f64; 3]) -> (FluidPushResult, FluidPushResult) {
     let (w, h) = mob_dimensions(etype);
     let aabb = EntityAabb::from_dimensions(pos[0], pos[1], pos[2], w, h);
-    fluid_sweep_states(aabb, vel, &block_at)
+    fluid_sweep_states(aabb, vel, &block_at_cached)
 }
 
 /// One `LivingEntity.travel` fluid tick for a mob.

@@ -34,6 +34,7 @@ impl Hasher for ChunkHasher {
 }
 
 type LightingHashMap<K, V> = LightingStdHashMap<K, V, BuildHasherDefault<ChunkHasher>>;
+type LightingHashSet<T> = std::collections::HashSet<T, BuildHasherDefault<ChunkHasher>>;
 
 type Chunk = (i32, i32);
 
@@ -134,7 +135,7 @@ pub enum StairShape {
 
 /// Occlusion at half-block resolution, sufficient for slab and stair shapes.
 /// Each face records four quadrants in the same world-axis order as its opposite.
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Default, Eq, Hash, PartialEq)]
 pub struct FaceOcclusion([u8; 6]);
 
 impl FaceOcclusion {
@@ -257,8 +258,7 @@ pub struct IncrementalLighting {
     height: i32,
     has_skylight: bool,
     chunks: LightingHashMap<Chunk, LightingChunk>,
-    // Generation counters and buffers reused across edits.
-    stamp: u32,
+    // Buffers reused across edits.
     snap: SnapLog,
     scratch: Scratch,
 }
@@ -266,6 +266,11 @@ pub struct IncrementalLighting {
 #[derive(Clone, Debug, Default)]
 struct Scratch {
     patch: Vec<Position>,
+    // Patch membership lives in the shared scratch, not per chunk: a u32 stamp
+    // per cell cost 384 KiB per Overworld chunk for data that only exists
+    // while a relight patch runs. The set is cleared per patch and its
+    // capacity rides the same retention bound as the other buffers.
+    patch_set: LightingHashSet<Position>,
     frontier: LightingVecDeque<(Position, u8)>,
     queue: LightingVecDeque<(Position, u8)>,
     // `edit_batch` change lists, kept with the BFS buffers so a tick of edits
@@ -297,7 +302,9 @@ fn bound_deque_scratch<T>(v: &mut LightingVecDeque<T>) {
 }
 
 /// Pre-edit copies of the light sections an edit batch writes to, taken on
-/// first write so unchanged sections are never copied or repacked.
+/// first write so unchanged sections are never copied or repacked. Each
+/// entry is one kind's 4096 levels packed to 2048 nibble bytes — the same
+/// layout the wire carries — so a section compare is a 2048-byte memcmp.
 #[derive(Clone, Debug, Default)]
 struct SnapLog {
     active: bool,
@@ -319,38 +326,141 @@ impl PartialEq for Stamps {
 
 impl Eq for Stamps {}
 
+/// One chunk's light window, decomposed so a cell costs ~2.5 bytes instead of
+/// ~11: opacity+emission share one byte, the 6-byte `FaceOcclusion` sits in a
+/// per-chunk palette behind a one-byte index, both light layers share one
+/// nibble byte, and the attenuated sky floor packs two cells per byte.
+///
+/// `direct_sky` is *not* a 0/15 flag: `refresh_column` attenuates the level
+/// through translucent cover, so the field needs the whole nibble range.
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct LightingChunk {
-    blocks: Vec<LightBlock>,
+    // opacity in the low nibble, emission in the high, one byte per cell.
+    states: Vec<u8>,
+    // Palette index per cell; u8::MAX escapes to `occlusions_wide` for a chunk
+    // carrying more than 255 distinct occlusion shapes.
+    occlusion_idx: Vec<u8>,
+    occlusions: Vec<FaceOcclusion>,
+    occlusion_ids: LightingHashMap<FaceOcclusion, u8>,
+    occlusions_wide: LightingHashMap<u32, FaceOcclusion>,
+    // Attenuated direct skylight, first cell in the low nibble.
     direct_sky: Vec<u8>,
-    sky: Vec<u8>,
-    block: Vec<u8>,
+    // sky in the high nibble, block in the low, one byte per cell.
+    light_nibbles: Vec<u8>,
     // Highest cell in each column below full direct skylight. Used to skip
     // the uniform sky over adjacent columns during initialization.
     sky_top: [i32; 256],
-    // Patch membership stamp per cell.
-    patch: Stamps,
     // Last batch that snapshotted each (kind, section).
     touched: Stamps,
+}
+
+/// Cells pack two light levels per byte: even index in the low nibble.
+fn get_packed_nibbles(packed: &[u8], index: usize) -> u8 {
+    (packed[index >> 1] >> ((index & 1) * 4)) & 15
+}
+
+fn set_packed_nibbles(packed: &mut [u8], index: usize, level: u8) {
+    let shift = (index & 1) * 4;
+    packed[index >> 1] = (packed[index >> 1] & !(15 << shift)) | ((level & 15) << shift);
 }
 
 impl LightingChunk {
     fn new(min_y: i32, height: i32, blocks: Vec<LightBlock>) -> Self {
         let len = height as usize * 256;
         assert_eq!(blocks.len(), len);
-        Self {
-            blocks,
-            direct_sky: vec![0; len],
-            sky: vec![0; len],
-            block: vec![0; len],
+        let mut chunk = Self {
+            states: Vec::with_capacity(len),
+            occlusion_idx: Vec::with_capacity(len),
+            occlusions: Vec::new(),
+            occlusion_ids: LightingHashMap::default(),
+            occlusions_wide: LightingHashMap::default(),
+            direct_sky: vec![0; len / 2],
+            light_nibbles: vec![0; len],
             sky_top: [min_y - 1; 256],
-            patch: Stamps(vec![0; len]),
             touched: Stamps(vec![0; height as usize / 8]),
+        };
+        for (index, block) in blocks.iter().enumerate() {
+            chunk.states.push(block.opacity | (block.emission << 4));
+            let slot = chunk.occlusion_slot(index, block.occlusion);
+            chunk.occlusion_idx.push(slot);
+        }
+        chunk
+    }
+
+    /// The palette slot for `occlusion`, interning new shapes up to the u8
+    /// bound; past it the cell index itself keys `occlusions_wide`.
+    fn occlusion_slot(&mut self, index: usize, occlusion: FaceOcclusion) -> u8 {
+        if let Some(&id) = self.occlusion_ids.get(&occlusion) {
+            return id;
+        }
+        if self.occlusions.len() < u8::MAX as usize {
+            let id = self.occlusions.len() as u8;
+            self.occlusions.push(occlusion);
+            self.occlusion_ids.insert(occlusion, id);
+            return id;
+        }
+        self.occlusions_wide.insert(index as u32, occlusion);
+        u8::MAX
+    }
+
+    fn light_block(&self, index: usize) -> LightBlock {
+        let pe = self.states[index];
+        let occlusion = match self.occlusion_idx[index] {
+            u8::MAX => self
+                .occlusions_wide
+                .get(&(index as u32))
+                .copied()
+                .unwrap_or_default(),
+            id => self.occlusions[id as usize],
+        };
+        LightBlock::with_occlusion(pe & 15, pe >> 4, occlusion)
+    }
+
+    fn set_block(&mut self, index: usize, block: LightBlock) -> LightBlock {
+        let old = self.light_block(index);
+        self.states[index] = block.opacity | (block.emission << 4);
+        let slot = self.occlusion_slot(index, block.occlusion);
+        self.occlusion_idx[index] = slot;
+        if slot != u8::MAX {
+            self.occlusions_wide.remove(&(index as u32));
+        }
+        old
+    }
+
+    fn light_at(&self, kind: LightKind, index: usize) -> u8 {
+        let packed = self.light_nibbles[index];
+        match kind {
+            LightKind::Sky => packed >> 4,
+            LightKind::Block => packed & 15,
         }
     }
 
+    fn set_light(&mut self, kind: LightKind, index: usize, level: u8) {
+        let packed = &mut self.light_nibbles[index];
+        *packed = match kind {
+            LightKind::Sky => (*packed & 15) | ((level & 15) << 4),
+            LightKind::Block => (*packed & !15) | (level & 15),
+        };
+    }
+
+    fn direct_sky_at(&self, index: usize) -> u8 {
+        get_packed_nibbles(&self.direct_sky, index)
+    }
+
+    /// One section of one light kind, packed low-nibble-first exactly as the
+    /// wire carries it. Snapshot entries and update payloads share this form.
+    fn pack_section(&self, kind: LightKind, section: usize) -> [u8; 2048] {
+        let base = section << 12;
+        let mut out = [0u8; 2048];
+        for (j, byte) in out.iter_mut().enumerate() {
+            *byte = self.light_at(kind, base + j * 2)
+                | (self.light_at(kind, base + j * 2 + 1) << 4);
+        }
+        out
+    }
+
     fn store(&mut self, kind: LightKind, index: usize, level: u8, key: Chunk, snap: &mut SnapLog) {
-        if self.light(kind)[index] == level {
+        if self.light_at(kind, index) == level {
             return;
         }
         if snap.active {
@@ -360,31 +470,15 @@ impl LightingChunk {
                 self.touched.0[slot] = snap.batch;
                 snap.entries
                     .push((key, kind as usize, section, snap.arena.len()));
-                snap.arena
-                    .extend_from_slice(&self.light(kind)[section << 12..][..4096]);
+                snap.arena.extend_from_slice(&self.pack_section(kind, section));
             }
         }
-        self.light_mut(kind)[index] = level;
+        self.set_light(kind, index, level);
     }
 
     fn clear_light(&mut self) {
         self.direct_sky.fill(0);
-        self.sky.fill(0);
-        self.block.fill(0);
-    }
-
-    fn light(&self, kind: LightKind) -> &[u8] {
-        match kind {
-            LightKind::Sky => &self.sky,
-            LightKind::Block => &self.block,
-        }
-    }
-
-    fn light_mut(&mut self, kind: LightKind) -> &mut [u8] {
-        match kind {
-            LightKind::Sky => &mut self.sky,
-            LightKind::Block => &mut self.block,
-        }
+        self.light_nibbles.fill(0);
     }
 }
 
@@ -412,7 +506,6 @@ impl IncrementalLighting {
                 .into_iter()
                 .map(|(key, blocks)| (key, LightingChunk::new(min_y, height, blocks)))
                 .collect(),
-            stamp: 0,
             snap: SnapLog::default(),
             scratch: Scratch::default(),
         };
@@ -437,15 +530,15 @@ impl IncrementalLighting {
 
     fn source(&self, kind: LightKind, p: Position) -> u8 {
         self.cell(p).map_or(0, |(chunk, index)| match kind {
-            LightKind::Sky => chunk.direct_sky[index],
-            LightKind::Block => chunk.blocks[index].emission,
+            LightKind::Sky => chunk.direct_sky_at(index),
+            LightKind::Block => chunk.states[index] >> 4,
         })
     }
 
     #[allow(dead_code)] // Also used by the standalone Vanilla probe.
     pub fn level(&self, kind: LightKind, p: Position) -> u8 {
         self.cell(p)
-            .map_or(0, |(chunk, index)| chunk.light(kind)[index])
+            .map_or(0, |(chunk, index)| chunk.light_at(kind, index))
     }
 
     fn set_level(&mut self, kind: LightKind, p: Position, level: u8) {
@@ -457,38 +550,18 @@ impl IncrementalLighting {
         }
     }
 
-    fn next_stamp(&mut self) -> u32 {
-        if self.stamp == u32::MAX {
-            for chunk in self.chunks.values_mut() {
-                chunk.patch.0.fill(0);
-            }
-            self.stamp = 0;
-        }
-        self.stamp += 1;
-        self.stamp
-    }
-
     /// Marks a loaded cell as part of the patch; false if absent or already marked.
-    fn claim(&mut self, p: Position, stamp: u32) -> bool {
-        let Some(index) = self.index(p) else {
-            return false;
-        };
-        let Some(chunk) = self.chunks.get_mut(&p.chunk()) else {
-            return false;
-        };
-        std::mem::replace(&mut chunk.patch.0[index], stamp) != stamp
-    }
-
-    fn in_patch(&self, p: Position, stamp: u32) -> bool {
-        self.cell(p)
-            .is_some_and(|(chunk, index)| chunk.patch.0[index] == stamp)
+    fn claim(&mut self, p: Position, patch: &mut LightingHashSet<Position>) -> bool {
+        self.index(p).is_some()
+            && self.chunks.contains_key(&p.chunk())
+            && patch.insert(p)
     }
 
     fn propagate(
         &mut self,
         kind: LightKind,
         queue: &mut LightingVecDeque<(Position, u8)>,
-        patch: Option<u32>,
+        patch: Option<&LightingHashSet<Position>>,
     ) {
         let Self {
             min_y,
@@ -507,10 +580,10 @@ impl IncrementalLighting {
             let Some(chunk) = chunks.get(&p.chunk()) else {
                 continue;
             };
-            if chunk.light(kind)[index] != level {
+            if chunk.light_at(kind, index) != level {
                 continue;
             }
-            let from = chunk.blocks[index];
+            let from = chunk.light_block(index);
             for (face, next) in p.adjacent() {
                 let Some(index) = Self::flat(*min_y, *height, next) else {
                     continue;
@@ -519,11 +592,11 @@ impl IncrementalLighting {
                 let Some(chunk) = chunks.get_mut(&key) else {
                     continue;
                 };
-                if patch.is_some_and(|stamp| chunk.patch.0[index] != stamp) {
+                if patch.is_some_and(|set| !set.contains(&next)) {
                     continue;
                 }
-                let candidate = from.transmitted(face, chunk.blocks[index], level);
-                if candidate > chunk.light(kind)[index] {
+                let candidate = from.transmitted(face, chunk.light_block(index), level);
+                if candidate > chunk.light_at(kind, index) {
                     chunk.store(kind, index, candidate, key, snap);
                     queue.push_back((next, candidate));
                 }
@@ -543,18 +616,21 @@ impl IncrementalLighting {
                 for i in 0..256 {
                     Self::refresh_column(self.min_y, self.height, chunk, i, &mut |_| {});
                 }
-                chunk.sky.copy_from_slice(&chunk.direct_sky);
+                for i in 0..chunk.light_nibbles.len() {
+                    chunk.light_nibbles[i] = get_packed_nibbles(&chunk.direct_sky, i) << 4;
+                }
             }
-            for (i, state) in chunk.blocks.iter().enumerate() {
-                if state.emission > 0 {
-                    chunk.block[i] = state.emission;
+            for (i, &pe) in chunk.states.iter().enumerate() {
+                let emission = pe >> 4;
+                if emission > 0 {
+                    chunk.light_nibbles[i] |= emission;
                     scratch.queue.push_back((
                         Position::new(
                             cx * 16 + (i & 15) as i32,
                             self.min_y + (i >> 8) as i32,
                             cz * 16 + ((i >> 4) & 15) as i32,
                         ),
-                        state.emission,
+                        emission,
                     ));
                 }
             }
@@ -581,8 +657,8 @@ impl IncrementalLighting {
                     let ni = ((nz & 15) << 4 | (nx & 15)) as usize;
                     for y in self.min_y..=other.sky_top[ni] {
                         let offset = ((y - self.min_y) as usize) << 8;
-                        let from = chunk.direct_sky[offset | i];
-                        if from > other.direct_sky[offset | ni] + 1 {
+                        let from = get_packed_nibbles(&chunk.direct_sky, offset | i);
+                        if from > get_packed_nibbles(&other.direct_sky, offset | ni) + 1 {
                             scratch.frontier.push_back((Position::new(x, y, z), from));
                         }
                     }
@@ -621,18 +697,21 @@ impl IncrementalLighting {
                 for i in 0..256 {
                     Self::refresh_column(self.min_y, self.height, &mut chunk, i, &mut |_| {});
                 }
-                chunk.sky.copy_from_slice(&chunk.direct_sky);
+                for i in 0..chunk.light_nibbles.len() {
+                    chunk.light_nibbles[i] = get_packed_nibbles(&chunk.direct_sky, i) << 4;
+                }
             }
-            for (i, state) in chunk.blocks.iter().enumerate() {
-                if state.emission > 0 {
-                    chunk.block[i] = state.emission;
+            for (i, &pe) in chunk.states.iter().enumerate() {
+                let emission = pe >> 4;
+                if emission > 0 {
+                    chunk.light_nibbles[i] |= emission;
                     scratch.queue.push_back((
                         Position::new(
                             cx * 16 + (i & 15) as i32,
                             self.min_y + (i >> 8) as i32,
                             cz * 16 + ((i >> 4) & 15) as i32,
                         ),
-                        state.emission,
+                        emission,
                     ));
                 }
             }
@@ -664,14 +743,14 @@ impl IncrementalLighting {
                     let column = ((lz as usize) << 4) | lx as usize;
                     for dy in 0..self.height {
                         let index = ((dy as usize) << 8) | column;
-                        let block = chunk.block[index];
+                        let block = chunk.light_at(LightKind::Block, index);
                         if block > 1 {
                             scratch.queue.push_back((
                                 Position::new(nx * 16 + lx, self.min_y + dy, nz * 16 + lz),
                                 block,
                             ));
                         }
-                        let sky = chunk.sky[index];
+                        let sky = chunk.light_at(LightKind::Sky, index);
                         if sky > 1 {
                             scratch.frontier.push_back((
                                 Position::new(nx * 16 + lx, self.min_y + dy, nz * 16 + lz),
@@ -700,8 +779,8 @@ impl IncrementalLighting {
                         let ni = ((nz & 15) << 4 | (nx & 15)) as usize;
                         for y in self.min_y..=other.sky_top[ni] {
                             let offset = ((y - self.min_y) as usize) << 8;
-                            let from = chunk.direct_sky[offset | i];
-                            if from > other.direct_sky[offset | ni] + 1 {
+                            let from = get_packed_nibbles(&chunk.direct_sky, offset | i);
+                            if from > get_packed_nibbles(&other.direct_sky, offset | ni) + 1 {
                                 scratch
                                     .frontier
                                     .push_back((Position::new(x, y, z), from));
@@ -776,7 +855,7 @@ impl IncrementalLighting {
         for dy in (0..height).rev() {
             let i = ((dy as usize) << 8) | column;
             if level > 0 {
-                let block = chunk.blocks[i];
+                let block = chunk.light_block(i);
                 level = if above.seals(Face::Down, block.occlusion) {
                     0
                 } else {
@@ -787,8 +866,8 @@ impl IncrementalLighting {
             if level < 15 {
                 top = top.max(min_y + dy);
             }
-            if chunk.direct_sky[i] != level {
-                chunk.direct_sky[i] = level;
+            if get_packed_nibbles(&chunk.direct_sky, i) != level {
+                set_packed_nibbles(&mut chunk.direct_sky, i, level);
                 changed(min_y + dy);
             }
         }
@@ -848,6 +927,16 @@ impl IncrementalLighting {
     /// whose retained capacity outgrew [`SCRATCH_KEEP_BYTES`].
     fn stash_scratch(&mut self, mut scratch: Scratch) {
         bound_vec_scratch(&mut scratch.patch);
+        // `HashSet` capacity is in buckets, not bytes; the bound is the same
+        // 256 KiB ceiling at a worst-case ~48 B/entry load factor.
+        if scratch.patch_set.capacity() > SCRATCH_KEEP_BYTES / 48 {
+            let mut set = LightingHashSet::with_capacity_and_hasher(
+                SCRATCH_KEEP_BYTES / 48,
+                BuildHasherDefault::default(),
+            );
+            set.extend(scratch.patch_set.drain());
+            scratch.patch_set = set;
+        }
         bound_deque_scratch(&mut scratch.frontier);
         bound_deque_scratch(&mut scratch.queue);
         bound_vec_scratch(&mut scratch.block_changes);
@@ -870,16 +959,17 @@ impl IncrementalLighting {
         }
         let Scratch {
             patch,
+            patch_set,
             frontier,
             queue,
             ..
         } = scratch;
         patch.clear();
+        patch_set.clear();
         frontier.clear();
         queue.clear();
-        let stamp = self.next_stamp();
         for &p in changed {
-            if self.claim(p, stamp) {
+            if self.claim(p, patch_set) {
                 patch.push(p);
                 frontier.push_back((p, 0u8));
             }
@@ -889,7 +979,7 @@ impl IncrementalLighting {
                 continue;
             }
             for (_, n) in p.adjacent() {
-                if self.claim(n, stamp) {
+                if self.claim(n, patch_set) {
                     patch.push(n);
                     frontier.push_back((n, distance + 1));
                 }
@@ -905,12 +995,12 @@ impl IncrementalLighting {
             let Some((chunk, index)) = self.cell(p) else {
                 continue;
             };
-            let target = chunk.blocks[index];
+            let target = chunk.light_block(index);
             for (face, neighbor) in p.adjacent() {
-                if !self.in_patch(neighbor, stamp) {
+                if !patch_set.contains(&neighbor) {
                     if let Some((chunk, index)) = self.cell(neighbor) {
-                        let incoming = chunk.light(kind)[index];
-                        level = level.max(chunk.blocks[index].transmitted(
+                        let incoming = chunk.light_at(kind, index);
+                        level = level.max(chunk.light_block(index).transmitted(
                             face.opposite(),
                             target,
                             incoming,
@@ -923,7 +1013,7 @@ impl IncrementalLighting {
                 queue.push_back((p, level));
             }
         }
-        self.propagate(kind, queue, Some(stamp));
+        self.propagate(kind, queue, Some(patch_set));
         patch.len()
     }
 
@@ -955,7 +1045,7 @@ impl IncrementalLighting {
             let Some(chunk) = self.chunks.get_mut(&p.chunk()) else {
                 continue;
             };
-            let old = std::mem::replace(&mut chunk.blocks[i], block);
+            let old = chunk.set_block(i, block);
             if old == block {
                 continue;
             }
@@ -1006,11 +1096,10 @@ impl IncrementalLighting {
                     break;
                 }
                 let kind = [LightKind::Sky, LightKind::Block][kind];
-                let new = &light.light(kind)[section << 12..][..4096];
-                if &self.snap.arena[offset..offset + 4096] == new {
+                let packed = light.pack_section(kind, section);
+                if self.snap.arena[offset..offset + 2048] == packed {
                     continue;
                 }
-                let packed = pack_light_nibbles(new);
                 let bit = 1u64 << (section + 1);
                 let (mask, empty, sections) = match kind {
                     LightKind::Sky => (
@@ -1067,11 +1156,8 @@ impl IncrementalLighting {
         let count = (self.height / 16 + 2) as usize;
         let mut out = vec![[0u8; 2048]; count];
         if let Some(chunk) = self.chunks.get(&chunk) {
-            for (array, levels) in out[1..count - 1]
-                .iter_mut()
-                .zip(chunk.light(kind).as_chunks::<4096>().0.iter())
-            {
-                *array = pack_light_nibbles(levels);
+            for (section, array) in out[1..count - 1].iter_mut().enumerate() {
+                *array = chunk.pack_section(kind, section);
             }
             if self.has_skylight && kind == LightKind::Sky {
                 out[count - 1].fill(0xff);
@@ -1079,14 +1165,6 @@ impl IncrementalLighting {
         }
         out
     }
-}
-
-fn pack_light_nibbles(levels: &[u8]) -> [u8; 2048] {
-    let mut out = [0u8; 2048];
-    for (byte, pair) in out.iter_mut().zip(levels.as_chunks::<2>().0.iter()) {
-        *byte = pair[0] | (pair[1] << 4);
-    }
-    out
 }
 
 #[cfg(test)]
@@ -1120,13 +1198,12 @@ mod incremental_lighting_tests {
         for (key, chunk) in &engine.chunks {
             let rebuilt = &oracle.chunks[key];
             for (name, actual, expected) in [
-                ("block", &chunk.block, &rebuilt.block),
-                ("sky", &chunk.sky, &rebuilt.sky),
+                ("light", &chunk.light_nibbles, &rebuilt.light_nibbles),
                 ("direct sky", &chunk.direct_sky, &rebuilt.direct_sky),
             ] {
                 assert!(
                     actual == expected,
-                    "incremental {name} light diverged in {key:?}"
+                    "incremental {name} diverged in {key:?}"
                 );
             }
         }
@@ -1590,13 +1667,12 @@ mod incremental_lighting_tests {
             for (key, chunk) in &engine.chunks {
                 let rebuilt = &oracle.chunks[key];
                 for (name, actual, expected) in [
-                    ("block", &chunk.block, &rebuilt.block),
-                    ("sky", &chunk.sky, &rebuilt.sky),
+                    ("light", &chunk.light_nibbles, &rebuilt.light_nibbles),
                     ("direct sky", &chunk.direct_sky, &rebuilt.direct_sky),
                 ] {
                     assert!(
                         actual == expected,
-                        "incremental {name} light diverged in {key:?}"
+                        "incremental {name} diverged in {key:?}"
                     );
                 }
             }
@@ -1687,5 +1763,41 @@ mod incremental_lighting_tests {
             rebuild_ns / n / 1000.0,
             batch_ns / n / 1000.0,
         );
+    }
+
+    /// ULTRA-RAM lane: the per-chunk light window used to hold 967+ KiB of
+    /// heap (384 KiB of BFS patch stamps alone). The packed layout must keep a
+    /// 384-cell-tall Overworld chunk comfortably under the 450 KiB budget so a
+    /// 192-chunk live engine stays under ~60 MiB.
+    #[test]
+    fn ultra_lighting_chunk_ram_footprint_is_compact() {
+        let len = 384 * 256;
+        let mut blocks = vec![AIR; len];
+        blocks[0] = TORCH;
+        blocks[1] = STONE;
+        blocks[2] = LightBlock::with_occlusion(1, 0, FaceOcclusion::slab(Half::Bottom));
+        let chunk = LightingChunk::new(-64, 384, blocks);
+        let heap = chunk.states.capacity()
+            + chunk.occlusion_idx.capacity()
+            + chunk.direct_sky.capacity()
+            + chunk.light_nibbles.capacity()
+            + chunk.occlusions.capacity() * std::mem::size_of::<FaceOcclusion>()
+            + chunk.touched.0.capacity() * 4
+            + chunk.occlusion_ids.capacity()
+                * std::mem::size_of::<(FaceOcclusion, u8)>()
+            + chunk.occlusions_wide.capacity()
+                * std::mem::size_of::<(u32, FaceOcclusion)>();
+        assert!(
+            heap < 450 * 1024,
+            "LightingChunk heap {heap} bytes exceeds the 450 KiB budget"
+        );
+        // The packed cell state must round-trip bit-exact.
+        assert_eq!(chunk.light_block(0), TORCH);
+        assert_eq!(chunk.light_block(1), STONE);
+        assert_eq!(
+            chunk.light_block(2),
+            LightBlock::with_occlusion(1, 0, FaceOcclusion::slab(Half::Bottom))
+        );
+        assert_eq!(chunk.light_block(3), AIR);
     }
 }

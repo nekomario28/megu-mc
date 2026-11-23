@@ -9947,6 +9947,7 @@ fn perf_sky_floors_fast_matches_reference_cell_for_cell() {
     // through the live section-store/band/overlay/worldgen chain, exactly as before
     // this change.
     SKY_FLOORS_SNAPSHOT_CELLS.store(0, Ordering::Relaxed);
+    let gen_scans_before = SKY_FLOORS_GEN_SCANS.load(Ordering::Relaxed);
     SKY_FLOORS_NO_SNAPSHOT.store(true, Ordering::Relaxed);
     let reference = sky_floors_dim(dim, cx, cz, &op);
     SKY_FLOORS_NO_SNAPSHOT.store(false, Ordering::Relaxed);
@@ -9954,6 +9955,11 @@ fn perf_sky_floors_fast_matches_reference_cell_for_cell() {
         SKY_FLOORS_SNAPSHOT_CELLS.load(Ordering::Relaxed),
         0,
         "the reference pass must not have read the snapshot"
+    );
+    assert_eq!(
+        SKY_FLOORS_GEN_SCANS.load(Ordering::Relaxed),
+        gen_scans_before,
+        "the reference pass must keep paying the per-cell chain, not the one-lock scan"
     );
 
     // Drop only the floors memo: the section store and band the fast path reads
@@ -9972,6 +9978,50 @@ fn perf_sky_floors_fast_matches_reference_cell_for_cell() {
     assert!(
         SKY_FLOORS_SNAPSHOT_CELLS.load(Ordering::Relaxed) > 0,
         "the snapshot must have settled cells for the fast path to be on test"
+    );
+    assert_eq!(
+        SKY_FLOORS_GEN_SCANS.load(Ordering::Relaxed),
+        gen_scans_before,
+        "a streamed chunk's sections settle every cell — no generator lock needed"
+    );
+
+    // A neighbour that was never streamed has no published sections: the scan
+    // resolves every cell from the generator, and it must do so under a single
+    // lock while still answering exactly the per-cell chain's floors.
+    let (ucx, ucz) = (4, 4);
+    // Prime it first: the scan's own block reads populate the chunk's feature
+    // layer as a side effect, which raises the start bound a later call scans
+    // from. Prime so both passes share the bound and the populated cells —
+    // only the lock shape is on test here.
+    let _ = sky_floors_dim(dim, ucx, ucz, &op);
+    sky_floors_cache()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .map
+        .clear();
+    let gen_scans_before = SKY_FLOORS_GEN_SCANS.load(Ordering::Relaxed);
+    let gen_cells_before = SKY_FLOORS_GEN_CELLS.load(Ordering::Relaxed);
+    SKY_FLOORS_NO_SNAPSHOT.store(true, Ordering::Relaxed);
+    let reference = sky_floors_dim(dim, ucx, ucz, &op);
+    SKY_FLOORS_NO_SNAPSHOT.store(false, Ordering::Relaxed);
+    sky_floors_cache()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .map
+        .clear();
+    let fast = sky_floors_dim(dim, ucx, ucz, &op);
+    assert_eq!(
+        fast, reference,
+        "the one-lock scan must produce the per-cell scan's floors cell for cell"
+    );
+    assert_eq!(
+        SKY_FLOORS_GEN_SCANS.load(Ordering::Relaxed),
+        gen_scans_before + 1,
+        "an unstreamed chunk must take the generator lock once for the whole scan"
+    );
+    assert!(
+        SKY_FLOORS_GEN_CELLS.load(Ordering::Relaxed) > gen_cells_before,
+        "the unstreamed scan must have resolved cells against the generator"
     );
 }
 
