@@ -21,7 +21,7 @@ from protocol767 import Client
 
 
 ROOT = Path(__file__).resolve().parents[1]
-VANILLA_JAR = Path("/home/yuu/tmpx/carverfresh/server.jar")
+VANILLA_JAR = Path(os.environ.get("MEGU_VANILLA_JAR", str(Path.home() / ".cache/megu-audit/load/server.jar")))
 VANILLA_SHA1 = "59353fb40c36d304f2035d51e7d6e6baa98dc05c"
 JAVA = "/usr/lib/jvm/java-21-openjdk/bin/java"
 SECTION_COUNT = 26

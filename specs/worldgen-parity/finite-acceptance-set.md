@@ -279,9 +279,9 @@ binaryで再生成して比較した。raw: `audit/p2-1-acceptance-s04-s07-20261
 
 source `0fa6807`(`perf/worldgen-parallel`、worktree dirty 0)。port binary `target/debug/megu`
 (sha256 `7dc623bf3372e5e8d71ad6cab6b65196f2a3ba7f125862234b4371524c4ef7ca`、`cargo build --offline --locked -j6`)。
-pinned jar sha1 `59353fb40c36d304f2035d51e7d6e6baa98dc05c`(`/home/yuu/tmpx/carverfresh/server.jar`)。
+pinned jar sha1 `59353fb40c36d304f2035d51e7d6e6baa98dc05c`（ローカルの Minecraft 1.21.1 `server.jar`）。
 **`src/` は無変更**。capture はすべて `tools/structure_capture.py`(新しいレシピ)で作った。
-raw: `/home/yuu/megu-local/audit/p21t3-20261119/`、capture/dump: `/home/yuu/megu-local/captures/matrix-v3/`。
+raw / capture / dump はリポジトリ外のローカル作業ディレクトリに保存。
 
 - **レシピの再現性(§4-1〜4-4 を満たす道具の検証)**: 既存行を2件作り直し、native・port の両方が
   **byte一致**した — jungle `(74,−41)`(native.bin `77964c22…a715bf`、dump `77964c22…a715bf`、

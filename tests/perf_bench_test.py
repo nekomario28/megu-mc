@@ -140,7 +140,7 @@ class PerfBenchTest(unittest.TestCase):
         stderr = (
             "[wgprof] 8x8 chunks in 8.30s (129.7 ms/chunk)\n"
             "[wgprof] eval_c calls: 114688 (1792 per chunk)\n"
-            "[wgdump] 64 chunks -> /home/yuu/megu/target/tmp/d.bin "
+            "[wgdump] 64 chunks -> /tmp/megu/target/tmp/d.bin "
             "(25165824 bytes) in 8.273123s\n"
         )
         parsed = pb.parse_wgdump(stderr)

@@ -299,16 +299,17 @@ fn custom_slot_types_validate_counts_and_names() {
 
     // A 16-slot custom type equips every index; an empty allowlist accepts
     // any item (unrestricted slot group).
-    inv.add_slot_type("cobblemon:accessory", 16, Vec::<&str>::new()).unwrap();
+    inv.add_slot_type("companion_mod:accessory", 16, Vec::<&str>::new())
+        .unwrap();
     inv.equip(
-        "cobblemon:accessory",
+        "companion_mod:accessory",
         15,
-        AccessoryItem::new("cobblemon:friendship_band", Vec::<&str>::new()),
+        AccessoryItem::new("companion_mod:friendship_band", Vec::<&str>::new()),
     )
     .unwrap();
     assert_eq!(
-        inv.item_at("cobblemon:accessory", 15).unwrap().item_id,
-        "cobblemon:friendship_band"
+        inv.item_at("companion_mod:accessory", 15).unwrap().item_id,
+        "companion_mod:friendship_band"
     );
 }
 

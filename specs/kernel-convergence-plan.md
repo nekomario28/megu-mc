@@ -3,8 +3,7 @@
 > **状態訂正 (2026-11-18, P2-1/P2-3 監査レーンによる実読):** この文書の Part 2.2/2.3 の波計画は
 > HEAD (`03744b1`) より古い状態を記述している。**16アルゴリズム型すべてが現在ライブな dispatch 先
 > (`src/structure_pipeline.rs:226-256`) と専用 owner、 committed native oracle TSV を持つ**
-> (`evidence-dispatch.txt` 参照; 実装の棚卸しは
-> `/home/yuu/megu-local/audit/p2-1-p2-3-blueprint-20261118T050548Z/blueprint.md`)。
+> (`evidence-dispatch.txt` 参照; 実装の棚卸しはローカル監査ブループリントを参照)。
 > Kernel A/Wave 3 を「未着手」として P2-1 の規模推定に使わないこと。残る実務は
 > (a) 共通の書込側契約（`StructurePiece.placeBlock` の `SHAPE_CHECK_BLOCKS` マークが
 > template/jigsaw 経路で欠落 — Step 3レーンが対応中）、(b) 34定義中24の live-chunk 受入。

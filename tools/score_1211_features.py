@@ -42,7 +42,7 @@ NEEDS_VERIFY = "NEEDS_VERIFY"
 MANUAL_MECH = "MANUAL_MECH"
 ALL_STATUSES = (COVERED, PARTIAL, MISSING, NEEDS_VERIFY, MANUAL_MECH)
 
-DEFAULT_CSV = "/home/yuu/src/megu-fix/out/minecraft-1.21.1-features.csv"
+DEFAULT_CSV = str(Path.home() / ".cache/megu-audit/minecraft-1.21.1-features.csv")
 CSV_ENV = "MC_1211_FEATURES_CSV"
 
 PREFIXES = (

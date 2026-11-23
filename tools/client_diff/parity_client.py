@@ -38,7 +38,7 @@ OAK_PLANKS = (36, 4)
 EMPTY_STACK = (0, 0)
 SLAB_END = (3.5, 240.5, 3.5)
 JAVA = Path("/usr/lib/jvm/java-21-openjdk/bin/java")
-JAR = Path("/home/yuu/tmpx/carverfresh/server.jar")
+JAR = Path(os.environ.get("MEGU_VANILLA_JAR", str(Path.home() / ".cache/megu-audit/load/server.jar")))
 JAR_SHA1 = "59353fb40c36d304f2035d51e7d6e6baa98dc05c"
 RCON_PASS = "local-client-diff-probe"
 
