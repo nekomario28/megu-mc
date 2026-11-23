@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: LGPL-3.0-or-later OR GPL-3.0-or-later OR AGPL-3.0-or-later
 //! Real loopback proof for [`megu_proto::friend_relay`]: one
 //! [`TcpFriendRelay`] on an ephemeral `127.0.0.1:0` port, one real host
-//! tunnel and multiple real guest links exercise the whole `FRL1` path —
+//! tunnel and multiple real guest links exercise the whole `FRL2` path —
 //! `MEGU-XXXX-XXXX` invite issuance, per-stream multiplexing of genuine
 //! protocol-767 Minecraft frames in both directions with zero cross-stream
 //! leakage, the `max_guests` cap, unknown-code and wrong-secret rejections,
@@ -12,9 +12,10 @@ use std::io::{self, Read, Write};
 use std::net::{SocketAddr, TcpStream};
 use std::time::{Duration, Instant};
 
+use megu_proto::frl_auth;
 use megu_proto::friend_relay::{
     decode_packet, encode_frame, FriendPacket, InviteCode, TcpFriendRelay,
-    MAX_FRL1_FRAME_BYTES,
+    MAX_FRL2_FRAME_BYTES,
 };
 use megu_proto::wire::{write_frame, WireWriter};
 
@@ -24,16 +25,49 @@ fn loopback() -> SocketAddr {
     SocketAddr::from(([127, 0, 0, 1], 0))
 }
 
-/// One test "peer": a real blocking `TcpStream` speaking `FRL1` frames.
+/// One test "peer": a real blocking `TcpStream` speaking `FRL2` frames.
 struct Link {
     sock: TcpStream,
+    /// The `RelayHello` nonce this connection's proofs bind to.
+    nonce: [u8; 16],
 }
 
 impl Link {
-    fn dial(relay_addr: SocketAddr) -> Self {
+    fn dial(relay: &mut TcpFriendRelay, relay_addr: SocketAddr) -> Self {
         let sock = TcpStream::connect(relay_addr).unwrap();
         sock.set_nodelay(true).unwrap();
-        Self { sock }
+        // `RelayHello` is queued at accept: pump once to flush it, then read.
+        pump(relay);
+        let mut link = Self {
+            sock,
+            nonce: [0; 16],
+        };
+        match link.recv(2000) {
+            Some(FriendPacket::RelayHello { nonce }) => link.nonce = nonce,
+            other => panic!("expected RelayHello, got {other:?}"),
+        }
+        link
+    }
+
+    /// `FRL2` guest join: prove possession of `code` without sending it.
+    fn join(&mut self, code: InviteCode, guest_name: &str) {
+        let key_id = frl_auth::join_key_id(&code.as_bytes(), &self.nonce);
+        let tag = frl_auth::join_tag(&code.as_bytes(), &key_id, guest_name);
+        self.send(&FriendPacket::GuestJoin {
+            key_id,
+            guest_name: guest_name.to_owned(),
+            tag,
+        });
+    }
+
+    /// `FRL2` host revoke: the MAC proves `key` ownership under this link's
+    /// nonce; a wrong key produces a MAC that never verifies.
+    fn revoke(&mut self, code: InviteCode, key: &[u8; 16]) {
+        let mac = frl_auth::revoke_mac(key, &code.as_bytes(), &self.nonce);
+        self.send(&FriendPacket::HostRevoke {
+            invite_code: code,
+            mac,
+        });
     }
 
     fn send(&mut self, packet: &FriendPacket) {
@@ -54,7 +88,7 @@ impl Link {
             return None;
         }
         let n = u32::from_be_bytes(len) as usize;
-        if n > MAX_FRL1_FRAME_BYTES {
+        if n > MAX_FRL2_FRAME_BYTES {
             return None;
         }
         let mut body = vec![0u8; n];
@@ -111,12 +145,12 @@ fn pump(relay: &mut TcpFriendRelay) {
 
 /// Register a host tunnel and return `(link, invite_code)`.
 fn register_host(relay: &mut TcpFriendRelay, addr: SocketAddr, max_guests: u8) -> (Link, InviteCode) {
-    let mut host = Link::dial(addr);
+    let mut host = Link::dial(relay, addr);
     host.send(&FriendPacket::HostRegister {
         protocol_version: 767,
         world_name: "Loopback LAN".to_owned(),
         max_guests,
-        host_secret: HOST_SECRET,
+        session_key: HOST_SECRET,
     });
     pump(relay);
     match host.recv(2000) {
@@ -133,11 +167,8 @@ fn join_guest(
     code: InviteCode,
     name: &str,
 ) -> (Link, u32) {
-    let mut guest = Link::dial(addr);
-    guest.send(&FriendPacket::GuestJoin {
-        invite_code: code,
-        guest_name: name.to_owned(),
-    });
+    let mut guest = Link::dial(relay, addr);
+    guest.join(code, name);
     pump(relay);
     match guest.recv(2000) {
         Some(FriendPacket::GuestAccepted { stream_id }) => (guest, stream_id),
@@ -153,11 +184,8 @@ fn join_expect_reject(
     code: InviteCode,
     name: &str,
 ) -> String {
-    let mut guest = Link::dial(addr);
-    guest.send(&FriendPacket::GuestJoin {
-        invite_code: code,
-        guest_name: name.to_owned(),
-    });
+    let mut guest = Link::dial(relay, addr);
+    guest.join(code, name);
     pump(relay);
     let reason = match guest.recv(2000) {
         Some(FriendPacket::GuestRejected { reason }) => reason,
@@ -325,12 +353,9 @@ fn register_two_guests_bridge_frames_cap_and_revoke() {
         Some(FriendPacket::HeartbeatAck { nonce: 8 })
     );
 
-    // A wrong host secret revokes nothing: `ok: false`, the code lives on
-    // and bytes still flow.
-    host.send(&FriendPacket::HostRevoke {
-        invite_code: code,
-        host_secret: [0xEE; 16],
-    });
+    // A wrong session key produces a MAC that never verifies: `ok: false`,
+    // the code lives on and bytes still flow.
+    host.revoke(code, &[0xEE; 16]);
     pump(&mut relay);
     assert_eq!(host.recv(2000), Some(FriendPacket::HostRevoked { ok: false }));
     assert_eq!(relay.metrics().revoked_codes, 0);
@@ -341,12 +366,9 @@ fn register_two_guests_bridge_frames_cap_and_revoke() {
     pump(&mut relay);
     expect_data(&mut g1, s1, &pk);
 
-    // The right secret retires the session: the code dies, both live
+    // The right key retires the session: the code dies, both live
     // guests are told `StreamClose`, and a late join fails closed.
-    host.send(&FriendPacket::HostRevoke {
-        invite_code: code,
-        host_secret: HOST_SECRET,
-    });
+    host.revoke(code, &HOST_SECRET);
     pump(&mut relay);
     assert_eq!(host.recv(2000), Some(FriendPacket::HostRevoked { ok: true }));
     for (guest, stream_id) in [(&mut g1, s1), (&mut g2, s2)] {
@@ -413,11 +435,11 @@ fn foreign_stream_ids_and_garbage_fail_closed() {
 
     // Garbage on a fresh link — a bogus length prefix, foreign magic —
     // kills it silently; the relay keeps serving the survivors.
-    let mut junk = Link::dial(relay_addr);
+    let mut junk = Link::dial(&mut relay, relay_addr);
     junk.send_raw(&u32::MAX.to_be_bytes());
     pump(&mut relay);
     assert!(junk.wait_eof(2000));
-    let mut junk2 = Link::dial(relay_addr);
+    let mut junk2 = Link::dial(&mut relay, relay_addr);
     junk2.send_raw(b"\x00\x00\x00\x09NOPEnope!");
     pump(&mut relay);
     assert!(junk2.wait_eof(2000));

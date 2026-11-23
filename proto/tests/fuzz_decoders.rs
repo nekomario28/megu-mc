@@ -4,7 +4,7 @@
 //!
 //! Every input a remote peer can put on the wire — packet frames in all five
 //! phases on both builtin tables (767/1.21.1 and 777/26.3), session-driving
-//! frames, `VCR1` voice datagrams, `FRL1` friend-relay frames, invite codes
+//! frames, `VCR1` voice datagrams, `FRL2` friend-relay frames, invite codes
 //! and DNS SRV replies — is hammered with mutated, truncated, bit-flipped,
 //! length-bombed and purely random inputs. The contract under test: **zero
 //! panics and bounded memory** on every byte string, valid or hostile.
@@ -135,7 +135,7 @@ const DICTIONARY: &[&[u8]] = &[
     b"\x00\x00\x00\x00",
     b"\x00\x00\x00\x80",                     // i32be::MIN
     b"VCR1",
-    b"FRL1",
+    b"FRL2",
     b"AUD1",
     b"\x1f\x8b\x08",                         // gzip magic
     b"\x0a\x00\x00\x0a\x00\x00\x0a\x00\x00", // nested anonymous-NBT compounds
@@ -695,21 +695,23 @@ fn voice_corpus() -> Vec<Vec<u8>> {
 fn friend_corpus() -> Vec<Vec<u8>> {
     let code = InviteCode::from_bytes([0x11, 0x22, 0x33, 0x44, 0x55]);
     [
+        FriendPacket::RelayHello { nonce: [0x42; 16] },
         FriendPacket::HostRegister {
             protocol_version: 767,
             world_name: "Fuzz World".into(),
             max_guests: 8,
-            host_secret: [0x66; 16],
+            session_key: [0x66; 16],
         },
         FriendPacket::HostRegistered { invite_code: code },
         FriendPacket::HostRevoke {
             invite_code: code,
-            host_secret: [0x66; 16],
+            mac: [0x66; 32],
         },
         FriendPacket::HostRevoked { ok: false },
         FriendPacket::GuestJoin {
-            invite_code: code,
+            key_id: [0x77; 8],
             guest_name: "Steve".into(),
+            tag: [0x66; 32],
         },
         FriendPacket::GuestAccepted { stream_id: 42 },
         FriendPacket::GuestRejected {
@@ -1164,7 +1166,7 @@ fn voice_relay_decode_packet_never_panics() {
 }
 
 // ---------------------------------------------------------------------------
-// FRL1 friend-relay frames, bodies, and invite codes.
+// FRL2 friend-relay frames, bodies, and invite codes.
 // ---------------------------------------------------------------------------
 
 #[test]
@@ -1298,7 +1300,7 @@ fn corpus_exhaustive_truncation_and_bitflip_sweep() {
             }
         }
     }
-    // Same sweeps for VCR1 + FRL1 corpora.
+    // Same sweeps for VCR1 + FRL2 corpora.
     for seed in voice_corpus().iter().chain(friend_corpus().iter()) {
         for cut in 0..=seed.len() {
             let input = &seed[..cut];

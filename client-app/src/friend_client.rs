@@ -1,5 +1,10 @@
 // SPDX-License-Identifier: LGPL-3.0-or-later OR GPL-3.0-or-later OR AGPL-3.0-or-later
-//! FRL1 friend-invite transport and a loopback adapter for the TCP game client.
+//! FRL2 friend-invite transport and a loopback adapter for the TCP game client.
+//!
+//! Every link opens by reading the relay's `RelayHello` nonce; afterwards the
+//! host proves revokes with an HMAC bound to that nonce and guests join with a
+//! `key_id`/`tag` pair — the invite code and the host's session key never
+//! appear on the wire. See `megu_proto::frl_auth`.
 
 use std::collections::BTreeSet;
 use std::fmt;
@@ -10,8 +15,9 @@ use std::sync::Arc;
 use std::thread::{self, JoinHandle};
 use std::time::Duration;
 
+use megu_proto::frl_auth;
 use megu_proto::friend_relay::{
-    decode_frame, encode_frame, FriendPacket, InviteCode, MAX_FRL1_FRAME_BYTES,
+    decode_frame, encode_frame, FriendPacket, InviteCode, MAX_FRL2_FRAME_BYTES,
     MAX_STREAM_PAYLOAD_BYTES,
 };
 
@@ -20,6 +26,8 @@ const BRIDGE_POLL: Duration = Duration::from_millis(20);
 struct FramedLink {
     stream: TcpStream,
     pending: Vec<u8>,
+    /// Per-connection `RelayHello` nonce this link's `FRL2` proofs bind to.
+    nonce: [u8; 16],
 }
 
 impl FramedLink {
@@ -44,10 +52,22 @@ impl FramedLink {
                     stream
                         .set_write_timeout(Some(timeout))
                         .map_err(|e| e.to_string())?;
-                    return Ok(Self {
+                    let mut link = Self {
                         stream,
                         pending: Vec::new(),
-                    });
+                        nonce: [0; 16],
+                    };
+                    // `RelayHello` is always the first frame the relay
+                    // writes — read it before the caller builds any proofs.
+                    match link.receive_required()? {
+                        FriendPacket::RelayHello { nonce } => link.nonce = nonce,
+                        packet => {
+                            return Err(format!(
+                                "expected relay hello, got {packet:?}"
+                            ))
+                        }
+                    }
+                    return Ok(link);
                 }
                 Err(e) => last_error = Some(e),
             }
@@ -71,7 +91,7 @@ impl FramedLink {
         loop {
             if self.pending.len() >= 4 {
                 let len = u32::from_be_bytes(self.pending[..4].try_into().unwrap()) as usize;
-                if !(5..=MAX_FRL1_FRAME_BYTES).contains(&len) {
+                if !(5..=MAX_FRL2_FRAME_BYTES).contains(&len) {
                     return Err(format!("relay frame length {len} exceeds protocol bounds"));
                 }
                 if self.pending.len() >= len + 4 {
@@ -133,9 +153,12 @@ impl FriendGuestSession {
         timeout: Duration,
     ) -> Result<Self, String> {
         let mut link = FramedLink::connect(relay_addr, timeout)?;
+        let key_id = frl_auth::join_key_id(&code.as_bytes(), &link.nonce);
+        let tag = frl_auth::join_tag(&code.as_bytes(), &key_id, guest_name);
         link.send(&FriendPacket::GuestJoin {
-            invite_code: *code,
+            key_id,
             guest_name: guest_name.to_string(),
+            tag,
         })?;
         match link.receive_required()? {
             FriendPacket::GuestAccepted { stream_id } => Ok(Self {
@@ -221,7 +244,8 @@ pub enum FriendHostEvent {
 pub struct FriendHostSession {
     link: FramedLink,
     invite_code: InviteCode,
-    host_secret: [u8; 16],
+    /// MAC key for `HostRevoke` proofs — sent once inside `HostRegister`.
+    session_key: [u8; 16],
     streams: BTreeSet<u32>,
     revoked: bool,
 }
@@ -230,7 +254,7 @@ impl fmt::Debug for FriendHostSession {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("FriendHostSession")
             .field("invite_code", &self.invite_code)
-            .field("host_secret", &"[REDACTED]")
+            .field("session_key", &"[REDACTED]")
             .field("streams", &self.streams)
             .field("revoked", &self.revoked)
             .finish()
@@ -243,7 +267,7 @@ impl FriendHostSession {
         protocol_version: i32,
         world_name: &str,
         max_guests: u8,
-        host_secret: [u8; 16],
+        session_key: [u8; 16],
         timeout: Duration,
     ) -> Result<Self, String> {
         let mut link = FramedLink::connect(relay_addr, timeout)?;
@@ -251,13 +275,13 @@ impl FriendHostSession {
             protocol_version,
             world_name: world_name.to_string(),
             max_guests,
-            host_secret,
+            session_key,
         })?;
         match link.receive_required()? {
             FriendPacket::HostRegistered { invite_code } => Ok(Self {
                 link,
                 invite_code,
-                host_secret,
+                session_key,
                 streams: BTreeSet::new(),
                 revoked: false,
             }),
@@ -328,9 +352,14 @@ impl FriendHostSession {
         if self.revoked {
             return Ok(());
         }
+        let mac = frl_auth::revoke_mac(
+            &self.session_key,
+            &self.invite_code.as_bytes(),
+            &self.link.nonce,
+        );
         self.link.send(&FriendPacket::HostRevoke {
             invite_code: self.invite_code,
-            host_secret: self.host_secret,
+            mac,
         })?;
         loop {
             match self.link.receive_required()? {

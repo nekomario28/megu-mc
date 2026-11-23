@@ -27,6 +27,11 @@ pub const PROTOCOL_VERSION: u32 = megu_proto::ProtocolVersion::V1_21_1.number() 
 /// `VersionAssetPaths::resolve` honors.
 pub const VERSION_DIR_ENV: &str = "MEGU_VERSION_DIR";
 
+/// Environment fallback for the friend-relay address, used when `--relay`
+/// is not passed: `MEGU_RELAY=host:port` lets `--join-code` and in-game
+/// friend sharing work with no flag at all.
+pub const RELAY_ADDR_ENV: &str = "MEGU_RELAY";
+
 /// Parse a `--mc-version` value into the protocol the client should speak.
 /// Accepts the Minecraft release name or its numeric protocol; anything else
 /// fails closed instead of guessing a table.
@@ -1079,11 +1084,23 @@ fn parse_args_inner<S: AsRef<str>>(args: &[S], secrets: Vec<String>) -> Result<C
         }
     }
 
+    // `--relay` wins over `MEGU_RELAY`; an empty value disables it. With the
+    // env var set once, `--join-code` and in-game sharing need no flag.
+    if cfg.relay.is_none() {
+        if let Some(addr) = std::env::var_os(RELAY_ADDR_ENV) {
+            if !addr.is_empty() {
+                cfg.relay = Some(addr.to_string_lossy().into_owned());
+            }
+        }
+    }
+
     if cfg.join_code.is_some() {
         let relay = cfg
             .relay
             .as_deref()
-            .ok_or_else(|| "--join-code requires --relay <host:port>".to_string())?;
+            .ok_or_else(|| {
+                "--join-code requires --relay <host:port> or MEGU_RELAY".to_string()
+            })?;
         let (_, port) = parse_host_port(relay, 0)?;
         if !relay.contains(':') || port == 0 {
             return Err("--relay must include a nonzero port (<host:port>)".to_string());
@@ -1131,7 +1148,8 @@ LAUNCHER COMPATIBILITY FLAGS:
   --quickPlaySingleplayer <world>    Launch integrated megu server for world
   --server <host>                    Server host (alternative to quickPlayMultiplayer)
   --join-code <MEGU-XXXX-XXXX>       Join a shared world using a friend invite
-  --relay <host:port>                Relay address (required with --join-code)
+  --relay <host:port>                Friend-relay address (or set MEGU_RELAY once;
+                                   required for --join-code and world sharing)
   --port <port>                      Server port (default: 25565)
   --server-bin <path>                megu server binary for --quickPlaySingleplayer
   --seed <seed>                      World seed for a new --quickPlaySingleplayer world

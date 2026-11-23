@@ -490,8 +490,8 @@ p50/p99/mean/max latency and packets-per-second (text, or JSON with
 `--json`). Exit codes: `0` success, `1` a bind error or failed
 self-test, `2` a bad command line or a refused public bind.
 
-**Friend invite relay (`FRL1`).** A host can connect outward to a
-`FRL1` relay and share its issued invite code. Guests connect without
+**Friend invite relay (`FRL2`).** A host can connect outward to a
+`FRL2` relay and share its issued invite code. Guests connect without
 router port forwarding using the existing client flags:
 
 ```sh
@@ -499,7 +499,14 @@ megu-client --join-code MEGU-XXXX-XXXX --relay relay.example.org:24455
 ```
 
 The code must be issued by a running host/relay; the example code is a
-placeholder. `--relay` is required with `--join-code`.
+placeholder. A relay address is required with `--join-code`, supplied
+either by `--relay` or the `MEGU_RELAY` environment variable. Invite
+codes and host credentials do not travel the link in clear: guests prove
+possession of the code with a nonce-bound HMAC (`key_id`/`tag`), and
+hosts revoke with a MAC instead of resending their session key. The
+inner Minecraft stream itself is forwarded opaquely — the relay cannot
+read it, but an active MITM between peer and relay could still splice
+it; treat `FRL2` as proof-of-possession, not a tunnel cipher.
 
 **GPU backend selection.** The native client supports the following
 backend preferences. `classic-low-spec` selects the 16 KiB UBO-batched

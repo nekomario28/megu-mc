@@ -51,7 +51,7 @@ refer to modules present in this tree.
   summaries ([`crash_report`](../core/src/crash_report.rs)).
 - **`create-adapter`** — Rail topology and network operations
   ([`rail_network`](../create-adapter/src/rail_network.rs)).
-- **`proto`** — `FRL1` friend invite relay
+- **`proto`** — `FRL2` friend invite relay
   ([`friend_relay`](../proto/src/friend_relay.rs)) and `VCR1` proximity
   voice relay ([`voice_relay`](../proto/src/voice_relay.rs)).
   `ServerSession` and the version router provide protocol 767/777

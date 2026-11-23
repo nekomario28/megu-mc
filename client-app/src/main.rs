@@ -111,7 +111,7 @@ fn main() -> ExitCode {
     }
 
     // A local one-connection adapter lets the existing Minecraft Login/Play
-    // state machine use FRL1 without replacing its TCP transport internals.
+    // state machine use FRL2 without replacing its TCP transport internals.
     let friend_bridge = if let Some(code) = cfg.join_code {
         crash_reporter::set_active_stage("friend_relay");
         let relay = cfg

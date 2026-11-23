@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: LGPL-3.0-or-later OR GPL-3.0-or-later OR AGPL-3.0-or-later
 //! End-to-end tests for the `megu-friend-relay` binary: real process
 //! invocations for usage/security exits, plus a live spawned relay proving
-//! host registration, the edge host/guest caps, and bidirectional FRL1
+//! host registration, the edge host/guest caps, and bidirectional FRL2
 //! StreamData forwarding over kernel TCP.
 
 use std::io::{self, Read, Write};
@@ -9,8 +9,9 @@ use std::net::{IpAddr, Ipv4Addr, SocketAddr, TcpListener, TcpStream};
 use std::process::{Child, Command, Output, Stdio};
 use std::time::Duration;
 
+use megu_proto::frl_auth;
 use megu_proto::friend_relay::{
-    decode_packet, encode_frame, FriendPacket, InviteCode, MAX_FRL1_FRAME_BYTES,
+    decode_packet, encode_frame, FriendPacket, InviteCode, MAX_FRL2_FRAME_BYTES,
 };
 
 const BIN: &str = env!("CARGO_BIN_EXE_megu-friend-relay");
@@ -48,6 +49,8 @@ impl Drop for ChildGuard {
 
 struct Link {
     sock: TcpStream,
+    /// The `RelayHello` nonce this connection's `FRL2` proofs bind to.
+    nonce: [u8; 16],
 }
 
 impl Link {
@@ -56,7 +59,19 @@ impl Link {
         sock.set_nodelay(true)?;
         sock.set_read_timeout(Some(Duration::from_secs(3)))?;
         sock.set_write_timeout(Some(Duration::from_secs(3)))?;
-        Ok(Self { sock })
+        let mut link = Self {
+            sock,
+            nonce: [0; 16],
+        };
+        match link.recv()? {
+            FriendPacket::RelayHello { nonce } => link.nonce = nonce,
+            other => {
+                return Err(io::Error::other(format!(
+                    "expected RelayHello, got {other:?}"
+                )))
+            }
+        }
+        Ok(link)
     }
 
     fn send(&mut self, packet: &FriendPacket) -> io::Result<()> {
@@ -68,7 +83,7 @@ impl Link {
         let mut len = [0u8; 4];
         self.sock.read_exact(&mut len)?;
         let n = u32::from_be_bytes(len) as usize;
-        if !(5..=MAX_FRL1_FRAME_BYTES).contains(&n) {
+        if !(5..=MAX_FRL2_FRAME_BYTES).contains(&n) {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
                 format!("test frame length {n} outside bounds"),
@@ -112,7 +127,7 @@ fn register_host(link: &mut Link, max_guests: u8) -> InviteCode {
         protocol_version: 767,
         world_name: "CLI Test World".to_owned(),
         max_guests,
-        host_secret: HOST_SECRET,
+        session_key: HOST_SECRET,
     })
     .unwrap();
     match link.recv().unwrap() {
@@ -122,9 +137,12 @@ fn register_host(link: &mut Link, max_guests: u8) -> InviteCode {
 }
 
 fn join_guest(link: &mut Link, code: InviteCode, name: &str) -> Result<u32, String> {
+    let key_id = frl_auth::join_key_id(&code.as_bytes(), &link.nonce);
+    let tag = frl_auth::join_tag(&code.as_bytes(), &key_id, name);
     link.send(&FriendPacket::GuestJoin {
-        invite_code: code,
+        key_id,
         guest_name: name.to_owned(),
+        tag,
     })
     .unwrap();
     match link.recv().unwrap() {
@@ -242,7 +260,7 @@ fn live_relay_enforces_caps_and_forwards_frames() {
             protocol_version: 767,
             world_name: "Second Host".to_owned(),
             max_guests: 1,
-            host_secret: HOST_SECRET,
+            session_key: HOST_SECRET,
         })
         .unwrap();
     assert!(second_host.expect_closed(), "second host must be refused");

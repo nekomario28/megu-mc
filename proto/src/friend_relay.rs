@@ -1,35 +1,46 @@
 // SPDX-License-Identifier: LGPL-3.0-or-later OR GPL-3.0-or-later OR AGPL-3.0-or-later
 //! Port-forwarding-free friend invites: one human-readable `MEGU-XXXX-XXXX`
-//! code, a compact `FRL1` stream-multiplexing wire protocol and a live TCP
+//! code, a compact `FRL2` stream-multiplexing wire protocol and a live TCP
 //! relay that bridges a single host tunnel to many guest connections — the
 //! e4mc / "Play with Friends" shape in pure `std`, with zero external crates.
 //!
 //! A player opens a singleplayer or LAN world, the integrated host dials the
 //! relay outbound (no router port forwarding anywhere), registers the world
-//! under a 16-byte `host_secret`, and receives an [`InviteCode`]. Friends type
+//! under a 16-byte `session_key`, and receives an [`InviteCode`]. Friends type
 //! that code into their client; the relay admits each guest up to the host's
 //! `max_guests` cap and then multiplexes every guest's opaque Minecraft TCP
 //! bytes over the one host tunnel as `stream_id`-tagged [`FriendPacket::StreamData`]
 //! frames.
 //!
-//! ## `FRL1` wire shape
+//! ## `FRL2` wire shape
 //!
 //! Every connection — host tunnel and guest link alike — speaks the same
 //! framed protocol:
 //!
 //! ```text
-//! frame = u32be(body_len) + body          body_len in [5, MAX_FRL1_FRAME_BYTES]
-//! body  = "FRL1" + tag(1) + fields
+//! frame = u32be(body_len) + body          body_len in [5, MAX_FRL2_FRAME_BYTES]
+//! body  = "FRL2" + tag(1) + fields
 //! ```
 //!
+//! * `0x00 RelayHello`: `16 nonce` — the first frame the relay writes on any
+//!   accepted connection. The per-connection nonce binds every
+//!   authentication MAC below, so a captured proof is worthless on a later
+//!   connection.
 //! * `0x01 HostRegister`: `i32 protocol_version | string world_name |
-//!   u8 max_guests | 16 host_secret` — host tunnel opens a session.
+//!   u8 max_guests | 16 session_key` — host tunnel opens a session.
 //! * `0x02 HostRegistered`: `5 invite_code` — relay answers the issued code.
-//! * `0x03 HostRevoke`: `5 invite_code | 16 host_secret` — revoke the code and
-//!   close every guest stream on it.
-//! * `0x04 HostRevoked`: `bool ok` — `false` for an unknown code or a secret
-//!   that did not match (compared in constant time).
-//! * `0x05 GuestJoin`: `5 invite_code | string guest_name`.
+//! * `0x03 HostRevoke`: `5 invite_code | 32 mac` — revoke the code and close
+//!   every guest stream on it. `mac` is
+//!   `HMAC-SHA256(session_key, "FRL2/rev" | invite_code | nonce)` — the key
+//!   itself never travels past registration.
+//! * `0x04 HostRevoked`: `bool ok` — `false` for an unknown code or a MAC
+//!   that did not verify (compared in constant time).
+//! * `0x05 GuestJoin`: `8 key_id | string guest_name | 32 tag`. The invite
+//!   code never appears on the wire: `key_id` is
+//!   `HMAC-SHA256(invite_code, "FRL2/id" | nonce)[..8]`, a per-connection
+//!   pseudonym the relay matches against its live invites, and `tag` is
+//!   `HMAC-SHA256(invite_code, "FRL2/join" | key_id | guest_name)`, proof
+//!   the joiner actually holds the code.
 //! * `0x06 GuestAccepted`: `u32 stream_id` — the guest now owns exactly this
 //!   stream; every further frame it sends must carry it.
 //! * `0x07 GuestRejected`: `string reason` — unknown/expired code, full world,
@@ -41,6 +52,16 @@
 //! * `0x0A StreamClose`: `u32 stream_id | string reason` — either side ends a
 //!   stream (guest quit, host kick, revoke, expiry); the peer gets a copy.
 //! * `0x0B Heartbeat` / `0x0C HeartbeatAck`: `u64 nonce` echo liveness.
+//!
+//! ## What `FRL2` authentication does and does not cover
+//!
+//! `FRL1` sent the revoke credential and every invite code in clear; `FRL2`
+//! keeps both off the wire after registration and binds all proofs to a
+//! per-connection nonce. Remaining, by design: `HostRegister` still carries
+//! `session_key` once (an observer of that frame can forge this session's
+//! revokes), and `StreamData` is unauthenticated byte pipe — an *active*
+//! MITM can splice into it. Both need real transport security (TLS/QUIC),
+//! deliberately out of scope for this zero-dependency crate.
 //!
 //! The length prefix is validated **before** any allocation: an oversized or
 //! truncated frame, foreign magic, an unknown tag, invalid UTF-8 or trailing
@@ -60,7 +81,7 @@
 //! ## Layers
 //!
 //! * [`FriendPacket`] + [`encode_packet`]/[`decode_packet`] +
-//!   [`encode_frame`]/[`decode_frame`] — the `FRL1` codec.
+//!   [`encode_frame`]/[`decode_frame`] — the `FRL2` codec.
 //! * [`FriendRelayRouter`] — the sans-IO session router: host table keyed by
 //!   invite code, `max_guests` enforcement, `Instant`-TTL invite expiry (no
 //!   `SystemTime` anywhere — the caller supplies the clock), constant-time
@@ -80,27 +101,28 @@ use std::time::{Duration, Instant};
 
 use megu_core::random::Xoroshiro128pp;
 
+use crate::frl_auth;
 use crate::wire::{ProtoError, WireReader, WireWriter};
 
-/// Magic bytes every `FRL1` frame body opens with. Foreign traffic sharing a
+/// Magic bytes every `FRL2` frame body opens with. Foreign traffic sharing a
 /// listener fails closed on this check.
-pub const FRIEND_MAGIC: [u8; 4] = *b"FRL1";
+pub const FRIEND_MAGIC: [u8; 4] = *b"FRL2";
 
-/// Hard cap on one `FRL1` frame body (`"FRL1"` + tag + fields): 64 KiB. The
+/// Hard cap on one `FRL2` frame body (`"FRL2"` + tag + fields): 64 KiB. The
 /// `u32` length prefix is checked against this bound before a single payload
 /// byte is copied, so a forged prefix can never force a large allocation.
-pub const MAX_FRL1_FRAME_BYTES: usize = 64 * 1024;
+pub const MAX_FRL2_FRAME_BYTES: usize = 64 * 1024;
 
 /// Largest opaque payload a [`FriendPacket::StreamData`] may carry: the frame
 /// cap minus its 9 bytes of header (4 magic + 1 tag + 4 `stream_id`).
-pub const MAX_STREAM_PAYLOAD_BYTES: usize = MAX_FRL1_FRAME_BYTES - 9;
+pub const MAX_STREAM_PAYLOAD_BYTES: usize = MAX_FRL2_FRAME_BYTES - 9;
 
 /// Smallest legal frame body: magic + a tag byte.
-const MIN_FRL1_BODY_BYTES: usize = FRIEND_MAGIC.len() + 1;
+const MIN_FRL2_BODY_BYTES: usize = FRIEND_MAGIC.len() + 1;
 
-/// Vanilla-style UTF-16-unit cap applied to every `FRL1` string field
+/// Vanilla-style UTF-16-unit cap applied to every `FRL2` string field
 /// (`world_name`, `guest_name`, `reason`).
-const MAX_FRL1_STRING_CHARS: usize = 256;
+const MAX_FRL2_STRING_CHARS: usize = 256;
 
 /// Human-readable prefix the invite code renders as: `MEGU-XXXX-XXXX`.
 pub const INVITE_CODE_PREFIX: &str = "MEGU";
@@ -113,6 +135,7 @@ pub const DEFAULT_INVITE_TTL: Duration = Duration::from_secs(8 * 60 * 60);
 /// `I`, `L`, `O` and `U`.
 const CROCKFORD: &[u8; 32] = b"0123456789ABCDEFGHJKMNPQRSTVWXYZ";
 
+const TAG_RELAY_HELLO: u8 = 0x00;
 const TAG_HOST_REGISTER: u8 = 0x01;
 const TAG_HOST_REGISTERED: u8 = 0x02;
 const TAG_HOST_REVOKE: u8 = 0x03;
@@ -125,17 +148,6 @@ const TAG_STREAM_DATA: u8 = 0x09;
 const TAG_STREAM_CLOSE: u8 = 0x0A;
 const TAG_HEARTBEAT: u8 = 0x0B;
 const TAG_HEARTBEAT_ACK: u8 = 0x0C;
-
-/// Constant-time comparison for the 16-byte host secrets: every byte is
-/// always touched so an attacker timing `HostRevoked` replies learns nothing
-/// about how many prefix bytes were right.
-fn secret_eq(a: &[u8; 16], b: &[u8; 16]) -> bool {
-    let mut diff = 0u8;
-    for i in 0..16 {
-        diff |= a[i] ^ b[i];
-    }
-    diff == 0
-}
 
 /// A 40-bit invite code, rendered `MEGU-XXXX-XXXX` in Crockford Base32.
 ///
@@ -245,17 +257,26 @@ impl fmt::Display for InviteCode {
     }
 }
 
-/// One decoded `FRL1` frame body. `HostRegister`, `HostRevoke`, `GuestJoin`,
+/// One decoded `FRL2` frame body. `HostRegister`, `HostRevoke`, `GuestJoin`,
 /// `StreamData`, `StreamClose` and `Heartbeat` travel host/guest → relay;
-/// `HostRegistered`, `HostRevoked`, `GuestAccepted`, `GuestRejected`,
-/// `StreamOpen`, `StreamData`, `StreamClose` and `HeartbeatAck` travel relay →
-/// host/guest. `StreamData` and `StreamClose` are deliberately bidirectional:
-/// guest bytes ride to the host inside the same frame shape the host uses to
-/// answer.
+/// `RelayHello`, `HostRegistered`, `HostRevoked`, `GuestAccepted`,
+/// `GuestRejected`, `StreamOpen`, `StreamData`, `StreamClose` and
+/// `HeartbeatAck` travel relay → host/guest. `StreamData` and `StreamClose`
+/// are deliberately bidirectional: guest bytes ride to the host inside the
+/// same frame shape the host uses to answer.
 #[derive(Clone, Debug, PartialEq)]
 pub enum FriendPacket {
-    /// Host → relay: open a world-sharing session. `host_secret` is the
-    /// revoke/kick credential, compared in constant time on use.
+    /// Relay → peer: the first frame on every accepted connection. The
+    /// per-connection `nonce` binds every [`crate::frl_auth`] proof —
+    /// `HostRevoke`'s `mac` and `GuestJoin`'s `key_id`/`tag` — so a captured
+    /// proof is worthless on a later connection.
+    RelayHello {
+        /// 16-byte per-connection nonce drawn at accept time.
+        nonce: [u8; 16],
+    },
+    /// Host → relay: open a world-sharing session. `session_key` is the
+    /// HMAC key later `HostRevoke` proofs are verified against — it appears
+    /// on the wire only inside this one frame.
     HostRegister {
         /// Minecraft protocol number the host is serving (e.g. 767).
         protocol_version: i32,
@@ -263,8 +284,8 @@ pub enum FriendPacket {
         world_name: String,
         /// Maximum concurrent guest streams this session admits.
         max_guests: u8,
-        /// 16-byte capability the host later proves ownership with.
-        host_secret: [u8; 16],
+        /// 16-byte session MAC key, drawn fresh per registration.
+        session_key: [u8; 16],
     },
     /// Relay → host: the issued invite code for this session.
     HostRegistered {
@@ -272,25 +293,31 @@ pub enum FriendPacket {
         invite_code: InviteCode,
     },
     /// Host → relay: revoke `invite_code` and close every guest stream on
-    /// it. Succeeds only while `host_secret` matches in constant time.
+    /// it. Succeeds only while `mac` verifies in constant time —
+    /// see [`crate::frl_auth::revoke_mac`].
     HostRevoke {
         /// The session being revoked.
         invite_code: InviteCode,
-        /// The credential issued at `HostRegister`.
-        host_secret: [u8; 16],
+        /// `HMAC-SHA256(session_key, "FRL2/rev" | code | nonce)` proof.
+        mac: [u8; 32],
     },
     /// Relay → host: result of the latest `HostRevoke`. `false` means the
-    /// code was unknown or the secret did not match — nothing changed.
+    /// code was unknown or the MAC did not verify — nothing changed.
     HostRevoked {
         /// `true` iff the code is now revoked and its guests are closed.
         ok: bool,
     },
-    /// Guest → relay: join the world behind `invite_code`.
+    /// Guest → relay: join the world behind a `key_id`/`tag` proof. The
+    /// invite code itself never travels — see
+    /// [`crate::frl_auth::join_key_id`] and [`crate::frl_auth::join_tag`].
     GuestJoin {
-        /// The code the friend shared.
-        invite_code: InviteCode,
+        /// Per-connection pseudonym identifying the intended invite code.
+        key_id: [u8; 8],
         /// Display name forwarded to the host in `StreamOpen`.
         guest_name: String,
+        /// `HMAC-SHA256(invite_code, "FRL2/join" | key_id | guest_name)`
+        /// proof the joiner holds the code.
+        tag: [u8; 32],
     },
     /// Relay → guest: admission granted; the link now speaks exclusively on
     /// `stream_id`.
@@ -339,22 +366,22 @@ pub enum FriendPacket {
     },
 }
 
-/// Encode-side bound for `FRL1` string fields, mirroring the UTF-16-unit cap
+/// Encode-side bound for `FRL2` string fields, mirroring the UTF-16-unit cap
 /// [`WireReader::read_string`] enforces on decode.
 fn check_string(s: &str) -> Result<(), ProtoError> {
     let units: usize = s.chars().map(char::len_utf16).sum();
-    if units > MAX_FRL1_STRING_CHARS {
+    if units > MAX_FRL2_STRING_CHARS {
         return Err(ProtoError::StringTooLong {
             units,
-            max: MAX_FRL1_STRING_CHARS,
+            max: MAX_FRL2_STRING_CHARS,
         });
     }
     Ok(())
 }
 
-/// Encode one packet into an `FRL1` frame body (`"FRL1"` + tag + fields).
+/// Encode one packet into an `FRL2` frame body (`"FRL2"` + tag + fields).
 /// Fails closed — rather than truncating — when the result would exceed
-/// [`MAX_FRL1_FRAME_BYTES`] or a field exceeds its own bound.
+/// [`MAX_FRL2_FRAME_BYTES`] or a field exceeds its own bound.
 pub fn encode_packet(packet: &FriendPacket) -> Result<Vec<u8>, ProtoError> {
     let mut out = Vec::with_capacity(64);
     encode_packet_into(packet, &mut out)?;
@@ -374,56 +401,59 @@ pub fn encode_packet_into(packet: &FriendPacket, out: &mut Vec<u8>) -> Result<()
         out.truncate(start);
         return Err(e);
     }
-    if len > MAX_FRL1_FRAME_BYTES {
+    if len > MAX_FRL2_FRAME_BYTES {
         out.truncate(start);
         return Err(ProtoError::FrameTooLarge {
             length: len,
-            max: MAX_FRL1_FRAME_BYTES,
+            max: MAX_FRL2_FRAME_BYTES,
         });
     }
     Ok(())
 }
 
-/// The `FRL1` body (tag + fields) after the magic.
+/// The `FRL2` body (tag + fields) after the magic.
 fn encode_packet_body(packet: &FriendPacket, w: &mut WireWriter) -> Result<(), ProtoError> {
     match packet {
+        FriendPacket::RelayHello { nonce } => {
+            w.write_u8(TAG_RELAY_HELLO);
+            w.raw(nonce);
+        }
         FriendPacket::HostRegister {
             protocol_version,
             world_name,
             max_guests,
-            host_secret,
+            session_key,
         } => {
             check_string(world_name)?;
             w.write_u8(TAG_HOST_REGISTER);
             w.write_i32(*protocol_version);
             w.write_string(world_name);
             w.write_u8(*max_guests);
-            w.write_uuid(host_secret);
+            w.write_uuid(session_key);
         }
         FriendPacket::HostRegistered { invite_code } => {
             w.write_u8(TAG_HOST_REGISTERED);
             w.raw(&invite_code.as_bytes());
         }
-        FriendPacket::HostRevoke {
-            invite_code,
-            host_secret,
-        } => {
+        FriendPacket::HostRevoke { invite_code, mac } => {
             w.write_u8(TAG_HOST_REVOKE);
             w.raw(&invite_code.as_bytes());
-            w.write_uuid(host_secret);
+            w.raw(mac);
         }
         FriendPacket::HostRevoked { ok } => {
             w.write_u8(TAG_HOST_REVOKED);
             w.write_bool(*ok);
         }
         FriendPacket::GuestJoin {
-            invite_code,
+            key_id,
             guest_name,
+            tag,
         } => {
             check_string(guest_name)?;
             w.write_u8(TAG_GUEST_JOIN);
-            w.raw(&invite_code.as_bytes());
+            w.raw(key_id);
             w.write_string(guest_name);
+            w.raw(tag);
         }
         FriendPacket::GuestAccepted { stream_id } => {
             w.write_u8(TAG_GUEST_ACCEPTED);
@@ -475,48 +505,52 @@ fn encode_packet_body(packet: &FriendPacket, w: &mut WireWriter) -> Result<(), P
     Ok(())
 }
 
-/// Decode one `FRL1` frame body (no length prefix). Every failure mode —
+/// Decode one `FRL2` frame body (no length prefix). Every failure mode —
 /// oversize, truncation, foreign magic, unknown tag, forged length, invalid
 /// UTF-8, trailing garbage — is a [`ProtoError`], never a panic.
 pub fn decode_packet(body: &[u8]) -> Result<FriendPacket, ProtoError> {
-    if body.len() > MAX_FRL1_FRAME_BYTES {
+    if body.len() > MAX_FRL2_FRAME_BYTES {
         return Err(ProtoError::FrameTooLarge {
             length: body.len(),
-            max: MAX_FRL1_FRAME_BYTES,
+            max: MAX_FRL2_FRAME_BYTES,
         });
     }
     let mut r = WireReader::new(body);
     if r.take(FRIEND_MAGIC.len())? != FRIEND_MAGIC.as_slice() {
-        return Err(ProtoError::Malformed("not a FRL1 frame body"));
+        return Err(ProtoError::Malformed("not a FRL2 frame body"));
     }
     let packet = match r.read_u8()? {
+        TAG_RELAY_HELLO => FriendPacket::RelayHello {
+            nonce: r.take(16)?.try_into().unwrap(),
+        },
         TAG_HOST_REGISTER => FriendPacket::HostRegister {
             protocol_version: r.read_i32()?,
-            world_name: r.read_string(MAX_FRL1_STRING_CHARS)?,
+            world_name: r.read_string(MAX_FRL2_STRING_CHARS)?,
             max_guests: r.read_u8()?,
-            host_secret: r.read_uuid()?,
+            session_key: r.read_uuid()?,
         },
         TAG_HOST_REGISTERED => FriendPacket::HostRegistered {
             invite_code: InviteCode::from_bytes(r.take(5)?.try_into().unwrap()),
         },
         TAG_HOST_REVOKE => FriendPacket::HostRevoke {
             invite_code: InviteCode::from_bytes(r.take(5)?.try_into().unwrap()),
-            host_secret: r.read_uuid()?,
+            mac: r.take(32)?.try_into().unwrap(),
         },
         TAG_HOST_REVOKED => FriendPacket::HostRevoked { ok: r.read_bool()? },
         TAG_GUEST_JOIN => FriendPacket::GuestJoin {
-            invite_code: InviteCode::from_bytes(r.take(5)?.try_into().unwrap()),
-            guest_name: r.read_string(MAX_FRL1_STRING_CHARS)?,
+            key_id: r.take(8)?.try_into().unwrap(),
+            guest_name: r.read_string(MAX_FRL2_STRING_CHARS)?,
+            tag: r.take(32)?.try_into().unwrap(),
         },
         TAG_GUEST_ACCEPTED => FriendPacket::GuestAccepted {
             stream_id: r.read_u32()?,
         },
         TAG_GUEST_REJECTED => FriendPacket::GuestRejected {
-            reason: r.read_string(MAX_FRL1_STRING_CHARS)?,
+            reason: r.read_string(MAX_FRL2_STRING_CHARS)?,
         },
         TAG_STREAM_OPEN => FriendPacket::StreamOpen {
             stream_id: r.read_u32()?,
-            guest_name: r.read_string(MAX_FRL1_STRING_CHARS)?,
+            guest_name: r.read_string(MAX_FRL2_STRING_CHARS)?,
         },
         TAG_STREAM_DATA => {
             let stream_id = r.read_u32()?;
@@ -528,7 +562,7 @@ pub fn decode_packet(body: &[u8]) -> Result<FriendPacket, ProtoError> {
         }
         TAG_STREAM_CLOSE => FriendPacket::StreamClose {
             stream_id: r.read_u32()?,
-            reason: r.read_string(MAX_FRL1_STRING_CHARS)?,
+            reason: r.read_string(MAX_FRL2_STRING_CHARS)?,
         },
         TAG_HEARTBEAT => FriendPacket::Heartbeat {
             nonce: r.read_u64()?,
@@ -539,7 +573,7 @@ pub fn decode_packet(body: &[u8]) -> Result<FriendPacket, ProtoError> {
         other => {
             return Err(ProtoError::InvalidDiscriminant {
                 value: i64::from(other),
-                what: "FRL1 packet tag",
+                what: "FRL2 packet tag",
             })
         }
     };
@@ -557,10 +591,10 @@ fn next_frame_len(inbuf: &[u8]) -> Result<Option<usize>, ProtoError> {
         return Ok(None);
     }
     let len = u32::from_be_bytes(inbuf[..4].try_into().unwrap()) as usize;
-    if !(MIN_FRL1_BODY_BYTES..=MAX_FRL1_FRAME_BYTES).contains(&len) {
+    if !(MIN_FRL2_BODY_BYTES..=MAX_FRL2_FRAME_BYTES).contains(&len) {
         return Err(ProtoError::FrameTooLarge {
             length: len,
-            max: MAX_FRL1_FRAME_BYTES,
+            max: MAX_FRL2_FRAME_BYTES,
         });
     }
     if inbuf.len() < 4 + len {
@@ -569,7 +603,7 @@ fn next_frame_len(inbuf: &[u8]) -> Result<Option<usize>, ProtoError> {
     Ok(Some(4 + len))
 }
 
-/// Encode one packet as a complete wire frame: `u32be(len) + "FRL1" + tag +
+/// Encode one packet as a complete wire frame: `u32be(len) + "FRL2" + tag +
 /// fields`.
 pub fn encode_frame(packet: &FriendPacket) -> Result<Vec<u8>, ProtoError> {
     let mut out = Vec::new();
@@ -597,7 +631,7 @@ pub fn encode_frame_into(packet: &FriendPacket, out: &mut Vec<u8>) -> Result<(),
 pub fn decode_frame(frame: &[u8]) -> Result<FriendPacket, ProtoError> {
     match next_frame_len(frame)? {
         Some(total) if total == frame.len() => decode_packet(&frame[4..]),
-        Some(_) => Err(ProtoError::Malformed("trailing bytes after FRL1 frame")),
+        Some(_) => Err(ProtoError::Malformed("trailing bytes after FRL2 frame")),
         None => Err(ProtoError::UnexpectedEof {
             needed: 4,
             remaining: frame.len().saturating_sub(4),
@@ -703,8 +737,9 @@ pub struct HostSession {
     pub world_name: String,
     /// Concurrent guest cap; joins beyond it are rejected.
     pub max_guests: u8,
-    /// Revoke/kick credential, compared in constant time.
-    pub host_secret: [u8; 16],
+    /// HMAC key `HostRevoke` proofs are verified against — sent once inside
+    /// `HostRegister`, stored only in memory.
+    pub session_key: [u8; 16],
     /// When the session registered, on the caller's clock.
     pub registered_at: Instant,
     stream_ids: BTreeSet<u32>,
@@ -745,8 +780,8 @@ pub struct GuestStream {
 pub enum RevokeError {
     /// No live session is registered under the supplied code.
     UnknownCode,
-    /// The supplied `host_secret` did not match (constant-time compare).
-    BadSecret,
+    /// The supplied MAC did not verify (constant-time compare).
+    BadMac,
 }
 
 /// A session [`FriendRelayRouter::sweep_expired`] just retired: its code plus
@@ -860,15 +895,27 @@ impl FriendRelayRouter {
         }
     }
 
+    /// Draw a fresh `RelayHello` nonce for one accepted connection. Comes
+    /// from the same OS-seeded stream as invite codes — the nonce binds
+    /// `FRL2` proofs to one connection, so uniqueness is what matters.
+    pub fn take_nonce(&mut self) -> [u8; 16] {
+        let mut nonce = [0u8; 16];
+        nonce[..8].copy_from_slice(&self.rng.next_long().to_be_bytes());
+        nonce[8..].copy_from_slice(&self.rng.next_long().to_be_bytes());
+        nonce
+    }
+
     /// Register a host session and return the issued invite code. `now` is
     /// stamped as `registered_at`, the instant `invite_ttl` is measured from.
+    /// `session_key` is the HMAC key later `HostRevoke` proofs verify
+    /// against.
     pub fn register_host(
         &mut self,
         now: Instant,
         protocol_version: i32,
         world_name: &str,
         max_guests: u8,
-        host_secret: [u8; 16],
+        session_key: [u8; 16],
     ) -> InviteCode {
         let invite_code = self.draw_invite_code();
         self.hosts.insert(
@@ -878,7 +925,7 @@ impl FriendRelayRouter {
                 protocol_version,
                 world_name: world_name.to_owned(),
                 max_guests,
-                host_secret,
+                session_key,
                 registered_at: now,
                 stream_ids: BTreeSet::new(),
             },
@@ -886,22 +933,41 @@ impl FriendRelayRouter {
         invite_code
     }
 
-    /// Attempt a `GuestJoin`: admit under `code` and allocate the stream.
-    /// Order of the fail-closed rules — each bumps `rejected_joins`:
+    /// Attempt a `GuestJoin`: find the invite `key_id` pseudonymizes under
+    /// this connection's `nonce`, verify `tag`, then admit under that code
+    /// and allocate the stream. Order of the fail-closed rules — each bumps
+    /// `rejected_joins`:
     ///
-    /// 1. unknown or revoked code → `unknown invite`;
+    /// 1. `key_id` matches no live invite, or `tag` does not verify →
+    ///    `unknown invite` (one generic answer for both — a failed tag must
+    ///    not reveal that the code itself matched);
     /// 2. `invite_ttl` elapsed since registration → `invite expired`;
     /// 3. `max_guests` already reached → `world is full`.
     pub fn guest_join(
         &mut self,
         now: Instant,
-        code: &InviteCode,
+        key_id: &[u8; 8],
         guest_name: &str,
+        tag: &[u8; 32],
+        nonce: &[u8; 16],
     ) -> Result<u32, String> {
-        let Some(host) = self.hosts.get(code) else {
+        let mut matched = None;
+        for code in self.hosts.keys() {
+            if frl_auth::ct_eq(&frl_auth::join_key_id(&code.as_bytes(), nonce), key_id) {
+                matched = Some(*code);
+                break;
+            }
+        }
+        let Some(code) = matched else {
             self.rejected_joins += 1;
             return Err("unknown invite".to_owned());
         };
+        let expected = frl_auth::join_tag(&code.as_bytes(), key_id, guest_name);
+        if !frl_auth::ct_eq(&expected, tag) {
+            self.rejected_joins += 1;
+            return Err("unknown invite".to_owned());
+        }
+        let host = self.hosts.get(&code).expect("host matched above");
         if self.expired(host, now) {
             self.rejected_joins += 1;
             return Err("invite expired".to_owned());
@@ -912,7 +978,7 @@ impl FriendRelayRouter {
         }
         let stream_id = self.alloc_stream_id();
         self.hosts
-            .get_mut(code)
+            .get_mut(&code)
             .expect("host checked above")
             .stream_ids
             .insert(stream_id);
@@ -920,28 +986,30 @@ impl FriendRelayRouter {
             stream_id,
             GuestStream {
                 stream_id,
-                host_code: *code,
+                host_code: code,
                 guest_name: guest_name.to_owned(),
             },
         );
         Ok(stream_id)
     }
 
-    /// Attempt a `HostRevoke`: constant-time comparisons of the supplied
-    /// code and secret, and on success the whole session — code plus every
-    /// open guest stream — is torn down. Returns the stream ids the caller
-    /// must close.
+    /// Attempt a `HostRevoke`: constant-time verification of the supplied
+    /// MAC against this session's `session_key` and the connection `nonce`,
+    /// and on success the whole session — code plus every open guest
+    /// stream — is torn down. Returns the stream ids the caller must close.
     pub fn revoke(
         &mut self,
         code: &InviteCode,
-        host_secret: &[u8; 16],
+        mac: &[u8; 32],
+        nonce: &[u8; 16],
     ) -> Result<Vec<u32>, RevokeError> {
         let Some(host) = self.hosts.get(code) else {
             return Err(RevokeError::UnknownCode);
         };
-        let ok = host.invite_code.eq_ct(code) & secret_eq(&host.host_secret, host_secret);
+        let expected = frl_auth::revoke_mac(&host.session_key, &code.as_bytes(), nonce);
+        let ok = host.invite_code.eq_ct(code) & frl_auth::ct_eq(&expected, mac);
         if !ok {
-            return Err(RevokeError::BadSecret);
+            return Err(RevokeError::BadMac);
         }
         Ok(self.unregister_host(code).unwrap_or_default())
     }
@@ -1013,7 +1081,7 @@ impl FriendRelayRouter {
 /// What one accepted connection currently is.
 #[derive(Clone, Copy, Debug, PartialEq)]
 enum ConnRole {
-    /// `FRL1` link before `HostRegister`/`GuestJoin` identifies it.
+    /// `FRL2` link before `HostRegister`/`GuestJoin` identifies it.
     Handshake,
     /// A host tunnel carrying the multiplexed `stream_id` frames.
     Host { code: InviteCode },
@@ -1026,6 +1094,10 @@ struct RelayConn {
     role: ConnRole,
     inbuf: Vec<u8>,
     outbuf: Vec<u8>,
+    /// Per-connection nonce this link's `RelayHello` carried. Every `FRL2`
+    /// proof the peer presents (`HostRevoke.mac`, `GuestJoin.key_id`/`tag`)
+    /// is bound to it.
+    nonce: [u8; 16],
     /// Drop at the next reap point (EOF, malformed frame, isolation
     /// violation) — buffered output is discarded because the peer is gone
     /// or the link is untrusted.
@@ -1109,6 +1181,7 @@ impl TcpFriendRelay {
                     sock.set_nodelay(true)?;
                     let id = self.next_conn_id;
                     self.next_conn_id += 1;
+                    let nonce = self.router.take_nonce();
                     self.conns.insert(
                         id,
                         RelayConn {
@@ -1116,10 +1189,14 @@ impl TcpFriendRelay {
                             role: ConnRole::Handshake,
                             inbuf: Vec::new(),
                             outbuf: Vec::new(),
+                            nonce,
                             dead: false,
                             close_after_flush: false,
                         },
                     );
+                    // `RelayHello` is always the first frame the link sees:
+                    // the peer needs this nonce before it can build proofs.
+                    self.queue_packet(id, &FriendPacket::RelayHello { nonce });
                     events += 1;
                 }
                 Err(e) if e.kind() == io::ErrorKind::WouldBlock => break,
@@ -1335,8 +1412,8 @@ impl TcpFriendRelay {
     /// own, a relay-only packet type arriving from a peer, a second join —
     /// is an isolation violation and the link fails closed.
     fn dispatch(&mut self, id: u64, packet: FriendPacket, now: Instant) {
-        let role = match self.conns.get(&id) {
-            Some(c) => c.role,
+        let (role, conn_nonce) = match self.conns.get(&id) {
+            Some(c) => (c.role, c.nonce),
             None => return,
         };
         if let FriendPacket::Heartbeat { nonce } = packet {
@@ -1350,7 +1427,7 @@ impl TcpFriendRelay {
                     protocol_version,
                     world_name,
                     max_guests,
-                    host_secret,
+                    session_key,
                 },
             ) => {
                 let code = self.router.register_host(
@@ -1358,7 +1435,7 @@ impl TcpFriendRelay {
                     protocol_version,
                     &world_name,
                     max_guests,
-                    host_secret,
+                    session_key,
                 );
                 self.host_conns.insert(code, id);
                 if let Some(c) = self.conns.get_mut(&id) {
@@ -1369,12 +1446,24 @@ impl TcpFriendRelay {
             (
                 ConnRole::Handshake,
                 FriendPacket::GuestJoin {
-                    invite_code,
+                    key_id,
                     guest_name,
+                    tag,
                 },
-            ) => match self.router.guest_join(now, &invite_code, &guest_name) {
+            ) => match self
+                .router
+                .guest_join(now, &key_id, &guest_name, &tag, &conn_nonce)
+            {
                 Ok(stream_id) => {
-                    let Some(&host_id) = self.host_conns.get(&invite_code) else {
+                    // The router proved `key_id`/`tag` and resolved the
+                    // invite — the host conn is looked up through the
+                    // admitted stream's owning code.
+                    let host_code = self
+                        .router
+                        .stream(stream_id)
+                        .map(|s| s.host_code)
+                        .unwrap_or_else(|| InviteCode::from_bytes([0; 5]));
+                    let Some(&host_id) = self.host_conns.get(&host_code) else {
                         // The session exists but its tunnel is gone — the
                         // join cannot be served.
                         self.queue_packet(
@@ -1383,6 +1472,7 @@ impl TcpFriendRelay {
                                 reason: "host unavailable".to_owned(),
                             },
                         );
+                        self.router.close_stream(stream_id);
                         if let Some(c) = self.conns.get_mut(&id) {
                             c.close_after_flush = true;
                         }
@@ -1456,17 +1546,14 @@ impl TcpFriendRelay {
             }
             (
                 ConnRole::Host { code },
-                FriendPacket::HostRevoke {
-                    invite_code,
-                    host_secret,
-                },
+                FriendPacket::HostRevoke { invite_code, mac },
             ) => {
                 if invite_code != code {
                     // A tunnel may only revoke its own session.
                     self.queue_packet(id, &FriendPacket::HostRevoked { ok: false });
                     return;
                 }
-                match self.router.revoke(&invite_code, &host_secret) {
+                match self.router.revoke(&invite_code, &mac, &conn_nonce) {
                     Ok(stream_ids) => {
                         self.queue_packet(id, &FriendPacket::HostRevoked { ok: true });
                         for stream_id in stream_ids {
@@ -1558,14 +1645,35 @@ mod tests {
     use super::*;
 
     const SECRET: [u8; 16] = [0x7C; 16];
+    /// Fixed nonce for sans-IO router tests — the wire binds nonces to live
+    /// connections; the router only needs a deterministic one.
+    const NONCE: [u8; 16] = [0xA5; 16];
 
     fn fixed_code(byte: u8) -> InviteCode {
         InviteCode::from_bytes([byte; 5])
     }
 
+    /// A `GuestJoin` the way a real client builds it: `key_id`/`tag` proof
+    /// over the code and the connection nonce.
+    fn join(
+        r: &mut FriendRelayRouter,
+        now: Instant,
+        code: &InviteCode,
+        name: &str,
+    ) -> Result<u32, String> {
+        let key_id = frl_auth::join_key_id(&code.as_bytes(), &NONCE);
+        let tag = frl_auth::join_tag(&code.as_bytes(), &key_id, name);
+        r.guest_join(now, &key_id, name, &tag, &NONCE)
+    }
+
+    /// The MAC a host holding `key` would send to revoke `code`.
+    fn revoke_proof(key: &[u8; 16], code: &InviteCode) -> [u8; 32] {
+        frl_auth::revoke_mac(key, &code.as_bytes(), &NONCE)
+    }
+
     fn roundtrip(packet: FriendPacket) {
         let body = encode_packet(&packet).unwrap();
-        assert!(body.len() <= MAX_FRL1_FRAME_BYTES);
+        assert!(body.len() <= MAX_FRL2_FRAME_BYTES);
         assert_eq!(decode_packet(&body).unwrap(), packet);
         let frame = encode_frame(&packet).unwrap();
         assert_eq!(decode_frame(&frame).unwrap(), packet);
@@ -1643,20 +1751,22 @@ mod tests {
             protocol_version: 767,
             world_name: "Miku's World".to_owned(),
             max_guests: 4,
-            host_secret: SECRET,
+            session_key: SECRET,
         });
+        roundtrip(FriendPacket::RelayHello { nonce: [0x33; 16] });
         roundtrip(FriendPacket::HostRegistered {
             invite_code: fixed_code(0x5E),
         });
         roundtrip(FriendPacket::HostRevoke {
             invite_code: fixed_code(0x5E),
-            host_secret: SECRET,
+            mac: [0x5A; 32],
         });
         roundtrip(FriendPacket::HostRevoked { ok: true });
         roundtrip(FriendPacket::HostRevoked { ok: false });
         roundtrip(FriendPacket::GuestJoin {
-            invite_code: fixed_code(0x5E),
+            key_id: [0x11; 8],
             guest_name: "Teto".to_owned(),
+            tag: [0x5A; 32],
         });
         roundtrip(FriendPacket::GuestAccepted { stream_id: 7 });
         roundtrip(FriendPacket::GuestRejected {
@@ -1687,9 +1797,9 @@ mod tests {
         // Foreign magic, bare magic, unknown tag, oversize, truncation,
         // trailing garbage, forged string length, invalid UTF-8.
         assert!(decode_packet(b"NOPE.....").is_err());
-        assert!(decode_packet(b"FRL1").is_err());
-        assert!(decode_packet(b"FRL1\x99").is_err());
-        assert!(decode_packet(&vec![0u8; MAX_FRL1_FRAME_BYTES + 1]).is_err());
+        assert!(decode_packet(b"FRL2").is_err());
+        assert!(decode_packet(b"FRL2\x99").is_err());
+        assert!(decode_packet(&vec![0u8; MAX_FRL2_FRAME_BYTES + 1]).is_err());
         let frame = encode_frame(&FriendPacket::Heartbeat { nonce: 1 }).unwrap();
         assert!(decode_frame(&frame[..frame.len() - 1]).is_err());
         let mut extra = frame.clone();
@@ -1697,7 +1807,7 @@ mod tests {
         assert!(decode_frame(&extra).is_err());
         // Oversized declared length dies on the 4-byte header alone.
         let mut fat = Vec::new();
-        fat.extend_from_slice(&(MAX_FRL1_FRAME_BYTES as u32 + 1).to_be_bytes());
+        fat.extend_from_slice(&(MAX_FRL2_FRAME_BYTES as u32 + 1).to_be_bytes());
         assert!(decode_frame(&fat).is_err());
         // A GuestJoin whose declared string length exceeds the cap.
         let mut forged = Vec::new();
@@ -1723,7 +1833,7 @@ mod tests {
         .is_err());
         // And an oversized string field.
         assert!(encode_packet(&FriendPacket::GuestRejected {
-            reason: "x".repeat(MAX_FRL1_STRING_CHARS * 2),
+            reason: "x".repeat(MAX_FRL2_STRING_CHARS * 2),
         })
         .is_err());
     }
@@ -1733,17 +1843,17 @@ mod tests {
         let mut r = FriendRelayRouter::with_seed(FriendRelayConfig::default(), 0xC0DE);
         let now = Instant::now();
         let code = r.register_host(now, 767, "cap world", 2, SECRET);
-        assert_eq!(r.guest_join(now, &code, "a").unwrap(), 1);
-        assert_eq!(r.guest_join(now, &code, "b").unwrap(), 2);
+        assert_eq!(join(&mut r, now, &code, "a").unwrap(), 1);
+        assert_eq!(join(&mut r, now, &code, "b").unwrap(), 2);
         assert_eq!(
-            r.guest_join(now, &code, "c"),
+            join(&mut r, now, &code, "c"),
             Err("world is full".to_owned())
         );
         assert_eq!(r.metrics().rejected_joins, 1);
         assert_eq!(r.metrics().active_guests, 2);
         // A zero-cap host admits nobody.
         let code0 = r.register_host(now, 767, "empty", 0, SECRET);
-        assert!(r.guest_join(now, &code0, "a").is_err());
+        assert!(join(&mut r, now, &code0, "a").is_err());
     }
 
     #[test]
@@ -1756,10 +1866,10 @@ mod tests {
         );
         let t0 = Instant::now();
         let code = r.register_host(t0, 767, "short-lived", 2, SECRET);
-        assert!(r.guest_join(t0 + Duration::from_secs(59), &code, "a").is_ok());
+        assert!(join(&mut r, t0 + Duration::from_secs(59), &code, "a").is_ok());
         let t1 = t0 + Duration::from_secs(61);
         assert_eq!(
-            r.guest_join(t1, &code, "b"),
+            join(&mut r, t1, &code, "b"),
             Err("invite expired".to_owned())
         );
         // The sweep retires the session and reports the open stream.
@@ -1771,7 +1881,7 @@ mod tests {
         assert_eq!(r.metrics().revoked_codes, 1);
         // And afterwards everything fails closed.
         assert_eq!(
-            r.guest_join(t1, &code, "c"),
+            join(&mut r, t1, &code, "c"),
             Err("unknown invite".to_owned())
         );
     }
@@ -1781,28 +1891,28 @@ mod tests {
         let mut r = FriendRelayRouter::with_seed(FriendRelayConfig::default(), 0xF00D);
         let now = Instant::now();
         let code = r.register_host(now, 767, "revocables", 2, SECRET);
-        r.guest_join(now, &code, "a").unwrap();
-        r.guest_join(now, &code, "b").unwrap();
+        join(&mut r, now, &code, "a").unwrap();
+        join(&mut r, now, &code, "b").unwrap();
 
         // Wrong secret: fails closed, nothing changes.
         assert_eq!(
-            r.revoke(&code, &[0xEE; 16]),
-            Err(RevokeError::BadSecret)
+            r.revoke(&code, &revoke_proof(&[0xEE; 16], &code), &NONCE),
+            Err(RevokeError::BadMac)
         );
         assert_eq!(r.metrics().revoked_codes, 0);
         assert_eq!(r.metrics().active_guests, 2);
         // Unknown code fails a different way.
         assert_eq!(
-            r.revoke(&fixed_code(0x99), &SECRET),
+            r.revoke(&fixed_code(0x99), &[0u8; 32], &NONCE),
             Err(RevokeError::UnknownCode)
         );
         // Right secret: the session and both streams are gone.
-        let closed = r.revoke(&code, &SECRET).unwrap();
+        let closed = r.revoke(&code, &revoke_proof(&SECRET, &code), &NONCE).unwrap();
         assert_eq!(closed.len(), 2);
         assert!(r.host(&code).is_none());
         assert_eq!(r.metrics().revoked_codes, 1);
         assert_eq!(
-            r.guest_join(now, &code, "c"),
+            join(&mut r, now, &code, "c"),
             Err("unknown invite".to_owned())
         );
     }
@@ -1813,9 +1923,9 @@ mod tests {
         let now = Instant::now();
         let alpha = r.register_host(now, 767, "alpha", 2, SECRET);
         let beta = r.register_host(now, 767, "beta", 2, SECRET);
-        let s_a1 = r.guest_join(now, &alpha, "a1").unwrap();
-        let s_a2 = r.guest_join(now, &alpha, "a2").unwrap();
-        let s_b1 = r.guest_join(now, &beta, "b1").unwrap();
+        let s_a1 = join(&mut r, now, &alpha, "a1").unwrap();
+        let s_a2 = join(&mut r, now, &alpha, "a2").unwrap();
+        let s_b1 = join(&mut r, now, &beta, "b1").unwrap();
         assert_ne!(s_a1, s_a2);
         assert_ne!(s_a1, s_b1);
 
@@ -1831,7 +1941,7 @@ mod tests {
         assert_eq!(r.close_stream(s_a2), Some(alpha));
         assert_eq!(r.host(&alpha).unwrap().stream_count(), 1);
         assert!(r.stream(s_a2).is_none());
-        assert!(r.guest_join(now, &alpha, "a3").is_ok());
+        assert!(join(&mut r, now, &alpha, "a3").is_ok());
     }
 
     #[test]

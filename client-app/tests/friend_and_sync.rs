@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: LGPL-3.0-or-later OR GPL-3.0-or-later OR AGPL-3.0-or-later
-//! Live FRL1 loopback relay integration with genuine Minecraft status frames.
+//! Live FRL2 loopback relay integration with genuine Minecraft status frames.
 
 use std::net::{SocketAddr, TcpStream};
 use std::sync::atomic::{AtomicBool, Ordering};
