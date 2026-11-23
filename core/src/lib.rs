@@ -80,6 +80,16 @@
 //!   one level of `META-INF/jarjar`/`META-INF/jars` Jar-in-Jar in place, and
 //!   inflates with the pure-`std` [`zip_archive::inflate_raw_rfc1951`]
 //!   RFC 1951 decompressor under strict fail-closed caps.
+//! * [`nbt_wire`] — the canonical, zero-allocation NBT wire skipper shared by
+//!   every NBT reader in the tree: [`nbt_wire::skip_network_nbt`] for the
+//!   anonymous MC 1.20.2+ network shape (no root name),
+//!   [`nbt_wire::skip_named_nbt`] for save-file/older wire roots, and
+//!   [`nbt_wire::skip_nbt_payload`] for callers that already consumed the tag
+//!   byte. [`nbt_wire::NbtWireLimits`] bounds depth, aggregate tags, list
+//!   length and array bytes, rejects negative lengths, `TAG_List(TAG_End,
+//!   n > 0)` and every declared length larger than the remaining input, and
+//!   uses a fixed frame stack so hostile nesting cannot overflow the process
+//!   stack.
 //! * [`diff_engine`] — universal differential-computation primitives so
 //!   chunks, GPU buffers, entity state, inventories, and snapshots only
 //!   compute, store, and transmit the exact minimal delta `ΔS`: the
@@ -131,6 +141,7 @@ pub mod math;
 pub mod math_opt_engine;
 pub mod math_opt_foundation;
 pub mod morton;
+pub mod nbt_wire;
 pub mod perf_kit;
 pub mod random;
 pub mod romaji_ime;
