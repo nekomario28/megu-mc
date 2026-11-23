@@ -56,6 +56,8 @@ struct Bobber {
     dz: f64,
     age: i32,
     bit: bool,
+    /// Remaining ticks the bite dip is shown — vanilla's submerge animation.
+    dip: i32,
 }
 static BOBBERS: OnceLock<Mutex<Vec<Bobber>>> = OnceLock::new();
 fn bobbers() -> &'static Mutex<Vec<Bobber>> {

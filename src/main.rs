@@ -1256,12 +1256,57 @@ fn environment_time_tick() {
                 b.dz = 0.0;
                 if !b.bit && b.age > server_ticks(BOBBER_BITE_GT) as i32 {
                     b.bit = ((b.age as u64).wrapping_mul(2654435761) % 11) < 6;
+                    if b.bit {
+                        // vanilla FishingHook: on a bite the bobber dips, a
+                        // fishing particle burst and `entity.fishing_bobber
+                        // .splash` reach the entity's viewers. Category 6 is
+                        // vanilla's Friendly Mobs sound source.
+                        b.dip = server_ticks(6) as i32;
+                        let (bx, by, bz) = (b.x, b.y, b.z);
+                        let mut snd = Vec::new();
+                        write_varint(&mut snd, 0i64);
+                        write_str(&mut snd, "minecraft:entity.fishing_bobber.splash");
+                        snd.push(0);
+                        write_varint(&mut snd, 6i64);
+                        snd.extend_from_slice(&((bx * 8.0) as i32).to_be_bytes());
+                        snd.extend_from_slice(&((by * 8.0) as i32).to_be_bytes());
+                        snd.extend_from_slice(&((bz * 8.0) as i32).to_be_bytes());
+                        snd.extend_from_slice(&0.25f32.to_be_bytes());
+                        let pitch = 0.6 + ((b.age as u64).wrapping_mul(7919) % 80) as f32 / 100.0;
+                        snd.extend_from_slice(&pitch.to_be_bytes());
+                        snd.extend_from_slice(&0i64.to_be_bytes());
+                        broadcast_seen(b.eid, |_c| (0x68, snd.clone()));
+                        let mut part = Vec::new();
+                        part.push(0u8);
+                        part.extend_from_slice(&bx.to_be_bytes());
+                        part.extend_from_slice(&(by + 0.1).to_be_bytes());
+                        part.extend_from_slice(&bz.to_be_bytes());
+                        part.extend_from_slice(&0.2f32.to_be_bytes());
+                        part.extend_from_slice(&0.0f32.to_be_bytes());
+                        part.extend_from_slice(&0.2f32.to_be_bytes());
+                        part.extend_from_slice(&0.0f32.to_be_bytes());
+                        part.extend_from_slice(&8i32.to_be_bytes());
+                        write_varint(&mut part, 30i64); // "fishing"
+                        broadcast_seen(b.eid, |_c| (0x29, part.clone()));
+                    }
                 }
             }
-            if b.age % server_ticks(BOBBER_PACKET_GT) as i32 == 0 {
-                let (ax, ay, az, eid) = (b.x, b.y, b.z, b.eid);
+            // While the bite dip runs, the teleports report the submerged y;
+            // the last dip tick restores the surface position so the bobber
+            // visibly bobs back.
+            let mut tele_y = if b.dip > 0 {
+                b.dip -= 1;
+                Some(if b.dip == 0 { b.y } else { b.y - 0.25 })
+            } else {
+                None
+            };
+            if tele_y.is_none() && b.age % server_ticks(BOBBER_PACKET_GT) as i32 == 0 {
+                tele_y = Some(b.y);
+            }
+            if let Some(ty) = tele_y {
+                let (ax, az, eid) = (b.x, b.z, b.eid);
                 broadcast_seen(eid, |_c| {
-                    (0x70, entity_teleport(eid, ax, ay, az, 0.0, 0.0, true))
+                    (0x70, entity_teleport(eid, ax, ty, az, 0.0, 0.0, true))
                 });
             }
         }

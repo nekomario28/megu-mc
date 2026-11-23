@@ -24,17 +24,17 @@ def air_click(sequence, hand=0):
 
 
 def spawned_entity(body):
-    """Return (entity id, type id) from a clientbound add-entity packet."""
+    """Return (entity id, type id, x, y, z) from an add-entity packet."""
     reader = Reader(body)
     entity_id = reader.varint()
     reader.take(16)  # UUID
     entity_type = reader.varint()
-    reader.take(24)  # x/y/z doubles
+    x, y, z = (reader.number(">d"), reader.number(">d"), reader.number(">d"))
     reader.take(3)   # pitch/yaw/head yaw
     reader.varint()  # object data
     reader.take(6)   # velocity
     require(reader.pos == len(body), "spawn-entity-complete")
-    return entity_id, entity_type
+    return entity_id, entity_type, x, y, z
 
 
 def slot_item(body):
@@ -55,6 +55,9 @@ class FishingClient(Client):
         self.entity_id = None
         self.entities = {}
         self.slot_items = []
+        self.sound_events = []
+        self.particle_events = []
+        self.entity_positions = {}
 
     def read(self, timeout):
         packet, body = super().read(timeout)
@@ -63,10 +66,50 @@ class FishingClient(Client):
         if packet == 0x2B:
             self.entity_id = struct.unpack(">i", body[:4])[0]
         elif packet == 0x01:
-            entity_id, entity_type = spawned_entity(body)
+            entity_id, entity_type, x, y, z = spawned_entity(body)
             self.entities[entity_id] = entity_type
+            self.entity_positions.setdefault(entity_id, []).append((x, y, z))
         elif packet == 0x15:
             self.slot_items.append(slot_item(body))
+        elif packet in (0x2E, 0x2F):
+            # entity_position(_and_rotation): the wire layer rewrites absolute
+            # 0x70 teleports into i16/4096 relative moves like vanilla
+            # ServerEntity#sendChanges. Accumulate onto the last position.
+            reader = Reader(body)
+            eid = reader.varint()
+            dx, dy, dz = (reader.number(">h") / 4096.0,
+                          reader.number(">h") / 4096.0,
+                          reader.number(">h") / 4096.0)
+            if packet == 0x2F:
+                reader.take(3)
+            else:
+                reader.take(1)
+            prev = self.entity_positions.get(eid, [(0.0, 0.0, 0.0)])[-1]
+            self.entity_positions.setdefault(eid, []).append(
+                (prev[0] + dx, prev[1] + dy, prev[2] + dz))
+        elif packet == 0x68:
+            # sound_effect: holder varint (0 = inline identifier + range flag).
+            reader = Reader(body)
+            holder = reader.varint()
+            name = None
+            if holder == 0:
+                name = reader.string()
+                if reader.number("B"):
+                    reader.number(">f")
+            self.sound_events.append((holder, name))
+        elif packet == 0x29:
+            # level_particles: force u8, x/y/z f64, delta+speed f32,
+            # count i32, then the trailing particle-id varint.
+            reader = Reader(body)
+            reader.take(1 + 24 + 16)
+            reader.number(">i")
+            self.particle_events.append(reader.varint())
+        elif packet == 0x70:
+            # entity_teleport: id varint + x/y/z doubles.
+            reader = Reader(body)
+            eid = reader.varint()
+            x, y, z = reader.number(">d"), reader.number(">d"), reader.number(">d")
+            self.entity_positions.setdefault(eid, []).append((x, y, z))
         return packet, body
 
 
@@ -136,16 +179,50 @@ def live(game):
             "entity_type": BOBBER_ENTITY_TYPE,
         }
 
-        # This server currently changes the bobber's private bite flag without
-        # emitting a sound/particle or submerged position observable on wire.
-        # Wait long enough for the implemented bite window, then validate the
-        # catch from the resulting inventory correction.
-        deadline = time.monotonic() + 10.0
-        client.until(lambda *_: time.monotonic() >= deadline,
-                     "bite-window-elapsed")
-        summary["skipped"]["bite_signal"] = (
-            "server sets an internal bobber bit but emits no bite sound, "
-            "particle, or submerge movement")
+        # A bite is observable on wire three ways: the bobber's dipped
+        # teleport, a `fishing` particle burst (id 30), and the inline-named
+        # `entity.fishing_bobber.splash` sound. The bite roll opens after the
+        # 3.75s settle window. The dip must be distinguished from the flight
+        # arc: it is a y drop that happens after the bobber has already
+        # reported one stable (repeated) y.
+        def saw_dip():
+            # The dip is the only UPWARD y change in the bobber's track: the
+            # cast arc descends monotonically, the bobber then sits level, and
+            # the bite dips it -0.25 before the restore packet brings it back.
+            ys = [p[1] for p in client.entity_positions.get(bobber_id, [])]
+            return any(b - a > 0.1 for a, b in zip(ys, ys[1:]))
+
+        client.until(
+            lambda *_: saw_dip()
+            or 30 in client.particle_events
+            or any(n == "minecraft:entity.fishing_bobber.splash"
+                   for _, n in client.sound_events),
+            "bite-signal")
+        # The three signals emit on the same tick but in separate packets —
+        # drain briefly so whichever one tripped `until` doesn't gate the others.
+        drain_until = time.monotonic() + 1.5
+        while time.monotonic() < drain_until and not (
+                saw_dip()
+                and 30 in client.particle_events
+                and any(n == "minecraft:entity.fishing_bobber.splash"
+                        for _, n in client.sound_events)):
+            try:
+                client.read(min(0.2, drain_until - time.monotonic()))
+            except (TimeoutError, OSError):
+                break
+        dipped = saw_dip()
+        splash = any(n == "minecraft:entity.fishing_bobber.splash"
+                     for _, n in client.sound_events)
+        particles = 30 in client.particle_events
+        summary["stages"]["bite_signal"] = {
+            "submerge_teleport": dipped,
+            "splash_sound": splash,
+            "fishing_particles": particles,
+        }
+        if not (dipped and splash and particles):
+            summary["skipped"]["bite_signal"] = (
+                "bite landed but the wire signal was incomplete: "
+                f"dip={dipped} splash={splash} particles={particles}")
 
         before = len(client.slot_items)
         use_rod(client, 102, air_click_packet=False)
