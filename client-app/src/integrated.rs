@@ -292,6 +292,14 @@ fn prepare_world_dir(world_dir: &Path, runtime_root: &Path) -> Result<(), String
     Ok(())
 }
 
+/// Resolve `<gameDir>/mods` for the integrated singleplayer server when that
+/// directory exists, canonicalized so the child sees a valid absolute path
+/// regardless of its `current_dir(&world_dir)`.
+pub fn resolve_mods_dir(game_dir: &Path) -> Option<PathBuf> {
+    let mods = game_dir.join("mods");
+    mods.is_dir().then(|| canonicalize_best_effort(mods))
+}
+
 /// The integrated server should stream at least what the client intends to
 /// draw: the resolved view distance when a settings source or an explicit
 /// `--view-distance` supplied one, otherwise `None` (keep the server
@@ -441,6 +449,11 @@ pub fn launch(cfg: &CliConfig) -> Result<SingleplayerServer, String> {
     if let Some(seed) = cfg.seed {
         command.env("MEGU_SEED", seed.to_string());
     }
+    if env::var_os("MEGU_MODS_DIR").is_none() {
+        if let Some(mods_dir) = resolve_mods_dir(&game_dir) {
+            command.env("MEGU_MODS_DIR", mods_dir);
+        }
+    }
     // The hosted world inherits the resolved map fair-play policy:
     // LAN-opened and friend-relay worlds share this spawn path, so the
     // same MEGU_FAIR_PLAY* env vars and Xaero signal apply to all of
@@ -542,6 +555,12 @@ mod tests {
         assert!(
             !world_dir.join("datapacks").join("testpack").exists(),
             "repository test datapacks must not be linked into singleplayer worlds"
+        );
+        assert_eq!(resolve_mods_dir(&root), None);
+        fs::create_dir_all(root.join("mods")).unwrap();
+        assert_eq!(
+            resolve_mods_dir(&root),
+            Some(canonicalize_best_effort(root.join("mods")))
         );
         let _ = fs::remove_dir_all(&root);
     }
