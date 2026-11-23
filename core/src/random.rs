@@ -591,14 +591,11 @@ mod tests {
     /// The same FNV-1a fold `NextIntOracle.java` writes into the tsv: four
     /// little-endian bytes per `nextInt` result.
     fn fnv_of(results: impl Iterator<Item = i32>) -> u64 {
-        let mut h = 0xcbf29ce484222325u64;
+        let mut h = crate::hash::Fnv1a64::new();
         for x in results {
-            for by in 0..4 {
-                h ^= u64::from((x as u32 >> (8 * by)) & 0xff);
-                h = h.wrapping_mul(0x100000001b3);
-            }
+            h.update_i32(x);
         }
-        h
+        h.finish()
     }
 
     /// `tests/data/random_next_int_1211.tsv`, resolved against the repo root

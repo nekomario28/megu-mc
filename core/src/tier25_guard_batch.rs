@@ -430,36 +430,6 @@ impl Error for Tier25Error {}
 // CRC32 (IEEE 802.3 reflected — same table as state-store snapshots)
 // ---------------------------------------------------------------------------
 
-const fn crc32_table() -> [u32; 256] {
-    let mut table = [0u32; 256];
-    let mut i = 0;
-    while i < 256 {
-        let mut c = i as u32;
-        let mut k = 0;
-        while k < 8 {
-            c = if c & 1 != 0 {
-                0xEDB8_8320 ^ (c >> 1)
-            } else {
-                c >> 1
-            };
-            k += 1;
-        }
-        table[i] = c;
-        i += 1;
-    }
-    table
-}
-
-static CRC32_TABLE: [u32; 256] = crc32_table();
-
-fn crc32(bytes: &[u8]) -> u32 {
-    let mut crc = !0u32;
-    for &b in bytes {
-        crc = CRC32_TABLE[((crc ^ u32::from(b)) & 0xff) as usize] ^ (crc >> 8);
-    }
-    !crc
-}
-
 // ---------------------------------------------------------------------------
 // Big-endian cursor helpers (bounds-checked, panic-free on hostile input)
 // ---------------------------------------------------------------------------
@@ -687,7 +657,7 @@ impl TickBatchCoalescer {
         let stored_crc = u32::from_be_bytes(
             bytes[cursor..cursor + 4].try_into().expect("4-byte slice"),
         );
-        if crc32(&bytes[..cursor]) != stored_crc {
+        if crate::hash::crc32_ieee(&bytes[..cursor]) != stored_crc {
             return Err(Tier25Error::CrcMismatch);
         }
         Ok(DecodedBatchFrame {
@@ -747,7 +717,7 @@ fn encode_batch_frame(tick: u64, loader: LoaderLane, events: &[BatchEventRecord]
         push_u16(&mut out, e.payload.len() as u16);
         out.extend_from_slice(&e.payload);
     }
-    let crc = crc32(&out);
+    let crc = crate::hash::crc32_ieee(&out);
     push_u32(&mut out, crc);
     out
 }

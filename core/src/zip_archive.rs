@@ -148,6 +148,69 @@ impl From<io::Error> for ZipError {
     }
 }
 
+/// Adler-32 checksum used by zlib-wrapped Deflate streams.
+pub fn adler32(data: &[u8]) -> u32 {
+    const MOD: u32 = 65_521;
+    let (mut a, mut b) = (1u32, 0u32);
+    for chunk in data.chunks(5_552) {
+        for &byte in chunk {
+            a += u32::from(byte);
+            b += a;
+        }
+        a %= MOD;
+        b %= MOD;
+    }
+    (b << 16) | a
+}
+
+/// Wrap `data` in a zlib stream containing RFC 1951 stored blocks.
+pub fn zlib_compress_stored(data: &[u8]) -> Vec<u8> {
+    let blocks = data.len().max(1).div_ceil(65_535);
+    let mut out = Vec::with_capacity(2 + data.len() + blocks * 5 + 4);
+    out.extend_from_slice(&[0x78, 0x01]);
+    if data.is_empty() {
+        out.extend_from_slice(&[1, 0, 0, 0xff, 0xff]);
+    } else {
+        let count = data.len().div_ceil(65_535);
+        for (index, chunk) in data.chunks(65_535).enumerate() {
+            out.push(u8::from(index + 1 == count));
+            let len = chunk.len() as u16;
+            out.extend_from_slice(&len.to_le_bytes());
+            out.extend_from_slice(&(!len).to_le_bytes());
+            out.extend_from_slice(chunk);
+        }
+    }
+    out.extend_from_slice(&adler32(data).to_be_bytes());
+    out
+}
+
+/// Inflate a zlib stream, validating its header, dictionary flag and Adler-32.
+pub fn zlib_decompress_capped(input: &[u8], max_out: usize) -> Result<Vec<u8>, ZipError> {
+    if input.len() < 6 {
+        return Err(ZipError::Truncated);
+    }
+    let cmf = input[0];
+    let flg = input[1];
+    if cmf & 0x0f != 8 || cmf >> 4 > 7 || (u16::from(cmf) * 256 + u16::from(flg)) % 31 != 0 {
+        return Err(ZipError::Malformed("invalid zlib header"));
+    }
+    if flg & 0x20 != 0 {
+        return Err(ZipError::Malformed("zlib preset dictionary is unsupported"));
+    }
+    let payload_end = input.len() - 4;
+    let output = inflate_raw_rfc1951(&input[2..payload_end], max_out)?;
+    let stored = u32::from_be_bytes([
+        input[payload_end],
+        input[payload_end + 1],
+        input[payload_end + 2],
+        input[payload_end + 3],
+    ]);
+    if adler32(&output) != stored {
+        return Err(ZipError::Malformed("zlib Adler-32 mismatch"));
+    }
+    Ok(output)
+}
+
 /// Reject a ZIP entry name that could escape the archive root or confuse
 /// downstream path handling.
 ///

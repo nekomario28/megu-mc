@@ -831,7 +831,7 @@ impl FrameTimingStats {
     /// 95th-percentile frame time in milliseconds (nearest-rank); `0.0`
     /// when empty.
     pub fn frame_ms_p95(&self) -> f64 {
-        percentile(&self.frames.samples(), 95.0)
+        crate::stats::nearest_rank_percentile(&self.frames.samples(), 95.0).unwrap_or(0.0)
     }
 
     /// Mean FPS (`1000 / frame_ms_avg`); `0.0` when empty.
@@ -887,16 +887,6 @@ fn mean(samples: &[f64]) -> f64 {
 }
 
 /// Nearest-rank percentile: the smallest sample ≥ `pct`% of the window.
-fn percentile(samples: &[f64], pct: f64) -> f64 {
-    if samples.is_empty() {
-        return 0.0;
-    }
-    let mut sorted = samples.to_vec();
-    sorted.sort_by(f64::total_cmp);
-    let rank = ((sorted.len() as f64) * (pct / 100.0)).ceil() as usize;
-    sorted[rank.max(1).min(sorted.len()) - 1]
-}
-
 fn ms_to_fps(frame_ms: f64) -> f64 {
     if frame_ms <= 0.0 {
         return 0.0;

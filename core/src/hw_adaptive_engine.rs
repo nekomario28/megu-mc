@@ -1847,72 +1847,56 @@ impl PagedSectionPool {
 /// attention mask, only tiles whose bit is raised are ever visited.
 #[repr(transparent)]
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
-pub struct SparseDirtyTileMask(u64);
+pub struct SparseDirtyTileMask(crate::diff_engine::SubtileDiffMask);
 
 impl SparseDirtyTileMask {
     /// A mask with nothing dirty.
     pub const fn empty() -> Self {
-        Self(0)
+        Self(crate::diff_engine::SubtileDiffMask::new())
     }
 
     /// Wrap a raw bit pattern.
     pub const fn from_bits(bits: u64) -> Self {
-        Self(bits)
+        Self(crate::diff_engine::SubtileDiffMask::from_bits(bits))
     }
 
     /// The raw 64-bit mask.
     pub const fn bits(self) -> u64 {
-        self.0
+        self.0.bits()
     }
 
     /// `true` while no tile is dirty.
     pub const fn is_empty(self) -> bool {
-        self.0 == 0
-    }
-
-    /// Tile bit index for sub-tile coords `(tx, ty, tz)` in `0..4`.
-    const fn tile_bit(tx: u8, ty: u8, tz: u8) -> u32 {
-        ((ty as u32) << 4) | ((tz as u32) << 2) | tx as u32
+        self.0.is_empty()
     }
 
     /// Mark the `4×4×4` sub-tile containing block `(x, y, z)`.
     /// Coords outside `0..16` are ignored fail-closed. Returns `true`
     /// when a tile was marked.
     pub fn mark_block(&mut self, x: u8, y: u8, z: u8) -> bool {
-        if x >= 16 || y >= 16 || z >= 16 {
-            return false;
-        }
-        self.0 |= 1u64 << Self::tile_bit(x >> 2, y >> 2, z >> 2);
-        true
+        self.0.mark_block(x, y, z)
     }
 
     /// Mark sub-tile `(tx, ty, tz)` directly. Coords outside `0..4` are
     /// ignored fail-closed. Returns `true` when a tile was marked.
     pub fn mark_tile(&mut self, tx: u8, ty: u8, tz: u8) -> bool {
-        if tx >= 4 || ty >= 4 || tz >= 4 {
-            return false;
-        }
-        self.0 |= 1u64 << Self::tile_bit(tx, ty, tz);
-        true
+        self.0.mark_tile(tx, ty, tz)
     }
 
     /// `true` when sub-tile `(tx, ty, tz)` is dirty; `false` for
     /// out-of-range coords.
     pub fn is_tile_dirty(&self, tx: u8, ty: u8, tz: u8) -> bool {
-        if tx >= 4 || ty >= 4 || tz >= 4 {
-            return false;
-        }
-        (self.0 >> Self::tile_bit(tx, ty, tz)) & 1 == 1
+        self.0.is_tile_dirty(tx, ty, tz)
     }
 
     /// Number of dirty sub-tiles — the hardware popcount.
     pub fn dirty_count(&self) -> u32 {
-        self.0.count_ones()
+        self.0.dirty_count()
     }
 
     /// Clear every dirty bit.
     pub fn clear(&mut self) {
-        self.0 = 0;
+        self.0 = crate::diff_engine::SubtileDiffMask::new();
     }
 
     /// Visit every dirty tile exactly once in ascending bit order,
@@ -1920,14 +1904,9 @@ impl SparseDirtyTileMask {
     /// never O(64). The mask is empty once the iterator is dropped after
     /// full consumption.
     pub fn drain_dirty_tiles(&mut self) -> impl Iterator<Item = (u8, u8, u8)> + '_ {
-        let bits = &mut self.0;
-        std::iter::from_fn(move || {
-            if *bits == 0 {
-                return None;
-            }
-            let idx = bits.trailing_zeros() as u8;
-            *bits &= *bits - 1;
-            Some((idx & 3, (idx >> 4) & 3, (idx >> 2) & 3))
+        self.0.drain_dirty_subtiles().map(|index| {
+            let [x, y, z] = crate::diff_engine::SubtileDiffMask::subtile_coords(index);
+            (x, y, z)
         })
     }
 }

@@ -185,7 +185,7 @@ impl XorRleDiff {
             out.extend((0..lit).map(|i| base[lit_start + i] ^ next[lit_start + i]));
             pos = lit_start + lit;
         }
-        let crc = crc32(&out);
+        let crc = crate::hash::crc32_ieee(&out);
         out.extend_from_slice(&crc.to_be_bytes());
         Ok(Some(out))
     }
@@ -248,7 +248,7 @@ impl XorRleDiff {
             patch[body_end + 2],
             patch[body_end + 3],
         ]);
-        if crc32(&patch[..body_end]) != stored_crc {
+        if crate::hash::crc32_ieee(&patch[..body_end]) != stored_crc {
             return Err(DiffError::CrcMismatch);
         }
         let mut cursor = XOR_RLE_MAGIC.len();
@@ -365,39 +365,6 @@ fn take_varint(patch: &[u8], cursor: &mut usize, body_end: usize) -> Result<u64,
         }
         shift += 7;
     }
-}
-
-// CRC32 (IEEE 802.3 reflected — same table as `tier25_guard_batch` and the
-// state-store snapshot format).
-
-const fn crc32_table() -> [u32; 256] {
-    let mut table = [0u32; 256];
-    let mut i = 0;
-    while i < 256 {
-        let mut c = i as u32;
-        let mut k = 0;
-        while k < 8 {
-            c = if c & 1 != 0 {
-                0xEDB8_8320 ^ (c >> 1)
-            } else {
-                c >> 1
-            };
-            k += 1;
-        }
-        table[i] = c;
-        i += 1;
-    }
-    table
-}
-
-static CRC32_TABLE: [u32; 256] = crc32_table();
-
-fn crc32(bytes: &[u8]) -> u32 {
-    let mut crc = !0u32;
-    for &b in bytes {
-        crc = CRC32_TABLE[((crc ^ u32::from(b)) & 0xff) as usize] ^ (crc >> 8);
-    }
-    !crc
 }
 
 // ---------------------------------------------------------------------------
@@ -768,6 +735,22 @@ impl SubtileDiffMask {
         true
     }
 
+    /// Marks one sub-tile coordinate directly. Invalid coordinates are
+    /// ignored and return `false`.
+    pub fn mark_tile(&mut self, sx: u8, sy: u8, sz: u8) -> bool {
+        if sx >= Self::SUBTILES_PER_AXIS || sy >= Self::SUBTILES_PER_AXIS || sz >= Self::SUBTILES_PER_AXIS {
+            return false;
+        }
+        self.0 |= 1 << Self::subtile_index(sx, sy, sz);
+        true
+    }
+
+    /// Whether one sub-tile coordinate is marked.
+    pub const fn is_tile_dirty(self, sx: u8, sy: u8, sz: u8) -> bool {
+        sx < Self::SUBTILES_PER_AXIS && sy < Self::SUBTILES_PER_AXIS && sz < Self::SUBTILES_PER_AXIS
+            && self.0 & (1 << Self::subtile_index(sx, sy, sz)) != 0
+    }
+
     /// [`mark_block`](Self::mark_block) plus every sub-tile the block
     /// touches across a sub-tile boundary: for each axis where the voxel
     /// sits on a sub-tile edge (`l % 4 == 0` reaches the lower neighbor,
@@ -830,6 +813,17 @@ impl SubtileDiffMask {
     /// for `(sx, sy, sz)`.
     pub fn iter_dirty_subtiles(self) -> impl Iterator<Item = u8> {
         BitIndexIter { bits: self.0 }
+    }
+
+    /// Visits and clears each dirty sub-tile in ascending bit order.
+    pub(crate) fn drain_dirty_subtiles(&mut self) -> impl Iterator<Item = u8> + '_ {
+        let mask = self;
+        std::iter::from_fn(move || {
+            if mask.0 == 0 { return None; }
+            let index = mask.0.trailing_zeros() as u8;
+            mask.0 &= mask.0 - 1;
+            Some(index)
+        })
     }
 
     /// Clears every mark.

@@ -50,11 +50,6 @@ use std::ops::{Deref, DerefMut};
 // Fingerprinting — FNV-1a mixing with a splitmix64 avalanche finish
 // ---------------------------------------------------------------------------
 
-/// FNV-1a 64-bit offset basis.
-const FNV_OFFSET: u64 = 0xcbf2_9ce4_8422_2325;
-/// FNV-1a 64-bit prime.
-const FNV_PRIME: u64 = 0x0000_0100_0000_01b3;
-
 /// Splitmix64 finalizer constant (golden ratio `2^64 / φ`).
 const SPLITMIX_GAMMA: u64 = 0x9e37_79b9_7f4a_7c15;
 
@@ -63,12 +58,7 @@ const SPLITMIX_GAMMA: u64 = 0x9e37_79b9_7f4a_7c15;
 /// [`fingerprint_bytes`], which avalanche-finishes the result.
 #[inline]
 pub fn fnv1a64(bytes: &[u8]) -> u64 {
-    let mut h = FNV_OFFSET;
-    for &b in bytes {
-        h ^= u64::from(b);
-        h = h.wrapping_mul(FNV_PRIME);
-    }
-    h
+    crate::hash::fnv1a64(bytes)
 }
 
 /// `splitmix64` bijective avalanche — the same finalizer Java's
@@ -99,7 +89,7 @@ pub fn fingerprint_bytes(bytes: &[u8]) -> u64 {
 /// [`finish`]: Self::finish
 #[derive(Clone, Debug)]
 pub struct FingerprintBuilder {
-    h: u64,
+    h: crate::hash::Fnv1a64,
 }
 
 impl Default for FingerprintBuilder {
@@ -111,13 +101,14 @@ impl Default for FingerprintBuilder {
 impl FingerprintBuilder {
     /// Empty accumulator seeded with the FNV offset basis.
     pub const fn new() -> Self {
-        Self { h: FNV_OFFSET }
+        Self {
+            h: crate::hash::Fnv1a64::new(),
+        }
     }
 
     #[inline]
     fn byte(&mut self, b: u8) {
-        self.h ^= u64::from(b);
-        self.h = self.h.wrapping_mul(FNV_PRIME);
+        self.h.update_u8(b);
     }
 
     /// Feed the little-endian form of `v`.
@@ -193,7 +184,7 @@ impl FingerprintBuilder {
 
     /// Avalanche-finish and return the 64-bit fingerprint.
     pub fn finish(&self) -> u64 {
-        splitmix64(self.h)
+        splitmix64(self.h.value())
     }
 }
 
@@ -1037,22 +1028,10 @@ impl AdaptiveLoadGovernor {
     /// `len < GOVERNOR_WINDOW` the accepted samples occupy exactly
     /// `samples[..len]`; once the ring fills, every slot is live — so the
     /// same slice covers both cases.
-    fn sorted(&self) -> Vec<f64> {
-        let mut s = self.samples[..self.len].to_vec();
-        s.sort_unstable_by(f64::total_cmp);
-        s
-    }
-
     /// Nearest-rank percentile over the live window (`p` in `0..=100`,
     /// clamped). `None` while the window is empty.
     pub fn percentile(&self, p: f64) -> Option<f64> {
-        if self.len == 0 {
-            return None;
-        }
-        let p = if p.is_finite() { p.clamp(0.0, 100.0) } else { 0.0 };
-        let rank = ((p / 100.0) * self.len as f64).ceil() as usize;
-        let idx = rank.max(1) - 1;
-        Some(self.sorted()[idx.min(self.len - 1)])
+        crate::stats::nearest_rank_percentile(&self.samples[..self.len], p)
     }
 
     /// Median latency over the live window.

@@ -66,7 +66,7 @@ impl CrashContext {
     /// across runs and platforms.
     pub fn fingerprint(&self) -> String {
         let r = self.redacted();
-        let mut hash: u64 = 0xcbf2_9ce4_8422_2325; // FNV-1a offset basis
+        let mut hash = crate::hash::Fnv1a64::new();
         for field in [
             r.error_kind.as_str(),
             r.culprit_mod_or_module.as_str(),
@@ -74,14 +74,10 @@ impl CrashContext {
             r.detail_message.as_str(),
         ] {
             let norm = field.trim();
-            for &b in norm.as_bytes() {
-                hash ^= u64::from(b);
-                hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
-            }
-            hash ^= 0xff; // field separator
-            hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+            hash.update(norm.as_bytes());
+            hash.update_u8(0xff); // field separator
         }
-        format!("MEGU-E-{:08X}", (hash as u32))
+        format!("MEGU-E-{:08X}", (hash.finish() as u32))
     }
 
     /// Two-line operator blame: line 1 English, line 2 Japanese.

@@ -130,10 +130,13 @@
 
 #![deny(unsafe_code)]
 
+pub mod bits;
 pub mod crash_report;
 pub mod diff_engine;
 pub mod dye_and_items;
 pub mod fault_isolation;
+pub mod geom;
+pub mod hash;
 pub mod hw_adaptive_engine;
 pub mod id;
 pub mod i18n;
@@ -147,8 +150,10 @@ pub mod random;
 pub mod romaji_ime;
 pub mod server_perf_governors;
 pub mod simd_voxel;
+pub(crate) mod stats;
 pub mod sys_metrics;
 pub mod task_pool;
 pub mod tier25_guard_batch;
+pub mod varint;
 pub mod version;
 pub mod zip_archive;
