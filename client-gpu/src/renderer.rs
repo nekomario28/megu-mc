@@ -43,6 +43,9 @@ use megu_client_mesh::{
     is_megu_wgsl_pack, BackendResolution, GpuCapabilities, GpuShaderCaps, MeguWgslPack, PassKind,
     PipelineStage, RenderBackendPreference, ShaderPackSource,
 };
+use megu_core::hash::{
+    Fnv1a64, FNV1A64_OFFSET_BASIS as FNV1A_OFFSET, FNV1A64_PRIME as FNV1A_PRIME,
+};
 use megu_core::math_opt_engine::{
     morton3d_encode, morton3d_signed, projected_sphere_diameter_px,
 };
@@ -2504,6 +2507,14 @@ pub fn hard_floor_upload_budget() -> ChunkUploadBudget {
 /// inside half-space `dot(n, p) + d >= 0`. Covers NDC x/y in `[-1, 1]`
 /// and z in `[0, 1]` — the wgpu clip convention `Camera::view_projection`
 /// produces.
+///
+/// Deliberately *not* [`megu_core::geom::Frustum::from_view_proj`]: that
+/// canonical extractor assumes Gribb-Hartmann clip-Z in `[-1, 1]` (its
+/// "near" plane is `row3 + row2`, i.e. `ndc_z >= -1`) and normalizes every
+/// plane, while this pipeline needs the wgpu `[0, 1]` near plane
+/// (`clip_z >= 0` alone) unnormalized — the raw coefficients feed
+/// `SECTION_CULL_WGSL` and `box_in_frustum`, whose p-vertex contract is
+/// sign-based and must stay bit-identical.
 pub fn frustum_planes_from_view_proj(view_proj: &Mat4) -> [[f32; 4]; 6] {
     // clip = view_proj * [x, y, z, 1]; with `m[col][row]` storage the
     // coefficients of clip component `i` over world (x, y, z, 1) are
@@ -4272,9 +4283,10 @@ pub fn sky_wgsl(shader_f16: bool) -> Cow<'static, str> {
     }
 }
 
-const FNV1A_OFFSET: u64 = 0xcbf2_9ce4_8422_2325;
-const FNV1A_PRIME: u64 = 0x0000_0100_0000_01b3;
-
+// Word-wise FNV-1a step (`hash ^= word; hash *= prime`) — deliberately
+// *not* the byte-wise `megu_core::hash::fnv1a64`/`Fnv1a64` stream, so the
+// digests below stay bit-identical to their historical values. Only the
+// offset basis and prime are shared with `megu_core::hash`.
 fn fnv1a_u64(hash: &mut u64, value: u64) {
     *hash ^= value;
     *hash = hash.wrapping_mul(FNV1A_PRIME);
@@ -4593,7 +4605,10 @@ pub fn sort_regions_front_to_back(origins: &mut [[i32; 3]], camera: [f32; 3]) {
 /// normal, so a box is rejected only when it lies *entirely* outside at
 /// least one plane — six dot products, zero false negatives. This is the
 /// exact contract `SECTION_CULL_WGSL`'s `aabb_in_frustum` implements on
-/// the GPU.
+/// the GPU. The per-plane math matches
+/// [`megu_core::geom::Frustum::contains_aabb_pvertex`], but `planes` is an
+/// arbitrary-length slice (callers and tests pass single planes too), so
+/// it cannot be routed through `Frustum`'s fixed `[Plane; 6]`.
 pub fn aabb_in_frustum_pvertex(min: [f32; 3], max: [f32; 3], planes: &[[f32; 4]]) -> bool {
     let mut inside = true;
     for &[nx, ny, nz, d] in planes {
@@ -10380,17 +10395,13 @@ impl GpuRenderer {
         // Splash identity = index count + a cheap FNV-1a over its vertex
         // positions/uvs, so a changed line or moved anchor re-uploads.
         let splash_key = splash.map_or(0u64, |mesh| {
-            let mut hash = 0xcbf2_9ce4_8422_2325u64;
+            let mut hash = Fnv1a64::new();
             for v in &mesh.vertices {
                 for f in [v.position[0], v.position[1], v.uv[0], v.uv[1]] {
-                    for b in f.to_bits().to_le_bytes() {
-                        hash ^= u64::from(b);
-                        hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
-                    }
+                    hash.update(&f.to_bits().to_le_bytes());
                 }
             }
-            hash = hash.wrapping_add(mesh.indices.len() as u64);
-            hash
+            hash.finish().wrapping_add(mesh.indices.len() as u64)
         });
         let key = (logo_rect, edition_rect, splash_key);
         if self.title_branding.mesh_key == Some(key) {

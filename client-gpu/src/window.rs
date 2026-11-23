@@ -30,6 +30,7 @@ use megu_client_mesh::vanilla_plus_3d::ExtrudedMesh;
 use megu_client_mesh::vanilla_plus_nature::{NatureParticle, NatureParticleKind};
 use megu_client_mesh::vfx_engine::{ParticleDraw, ParticleOrientation, VfxFrameOutput};
 use megu_client_mesh::ChunkUploadBudget;
+use megu_core::hash::{Fnv1a64, FNV1A64_OFFSET_BASIS, FNV1A64_PRIME};
 use megu_kernel::debug_chords::{
     finish_gamemode_switcher, handle_f3_chord, DebugChordAction, DebugChordContext,
     DebugChordState, DebugTarget, F3Chord, PlayerDebugInfo,
@@ -3823,21 +3824,15 @@ fn list_saved_worlds(game_dir: Option<&std::path::Path>) -> Vec<String> {
 /// config's identity fields (`username`/`--version`/`--gameDir`) — zero
 /// `SystemTime`, stable across the whole run.
 fn splash_seed_for(config: &GpuCliConfig) -> u64 {
-    let mut hash = 0xcbf2_9ce4_8422_2325u64;
-    let mut mix = |bytes: &[u8]| {
-        for &b in bytes {
-            hash ^= u64::from(b);
-            hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
-        }
-    };
-    mix(config.username.as_bytes());
+    let mut hash = Fnv1a64::new();
+    hash.update(config.username.as_bytes());
     if let Some(id) = config.version_id.as_deref() {
-        mix(id.as_bytes());
+        hash.update_str(id);
     }
     if let Some(dir) = config.game_dir.as_deref() {
-        mix(dir.to_string_lossy().as_bytes());
+        hash.update(dir.to_string_lossy().as_bytes());
     }
-    hash
+    hash.finish()
 }
 
 /// The built-in `client-ui` title wordmark/tagline `Text` commands the
@@ -4033,10 +4028,13 @@ fn live_entity_pose(
 /// change — floats quantize to 1/64 to keep jitter from thrashing the
 /// cache.
 fn entity_pose_key(spec: EntityRigSpec, pose: &EntityPose) -> u64 {
-    let mut hash = 0xcbf2_9ce4_8422_2325u64;
+    // Word-wise FNV-1a step (`hash ^= word; hash *= prime`) — not the
+    // byte-wise `Fnv1a64` stream, kept bit-identical to the historical
+    // digest; only the offset basis and prime come from `megu_core`.
+    let mut hash = FNV1A64_OFFSET_BASIS;
     let mut mix = |value: u64| {
         hash ^= value;
-        hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+        hash = hash.wrapping_mul(FNV1A64_PRIME);
     };
     mix(u64::from(spec.entity_type_id));
     for v in [

@@ -34,6 +34,7 @@ use megu_client_mesh::{
     mesh_section, resolve_render_backend, Block, GpuCapabilities, GpuShaderCaps, GpuVendor, Layer,
     Quad, RenderBackendPreference, Section, WATER,
 };
+use megu_core::hash::Fnv1a64;
 use megu_ui::draw::{UiColor, UiCommand, UiDrawList, UiRect};
 
 /// Crate/binary name used in diagnostics.
@@ -1016,33 +1017,15 @@ pub fn select_display_presentation_policy(
 // Dirty-only UI upload key (FNV-1a over the rasterized draw list)
 // ---------------------------------------------------------------------------
 
-const FNV1A_OFFSET: u64 = 0xcbf2_9ce4_8422_2325;
-const FNV1A_PRIME: u64 = 0x0000_0100_0000_01b3;
-
-fn fnv1a_bytes(hash: &mut u64, bytes: &[u8]) {
-    for &byte in bytes {
-        *hash ^= u64::from(byte);
-        *hash = hash.wrapping_mul(FNV1A_PRIME);
-    }
+fn fnv1a_rect(hash: &mut Fnv1a64, rect: &UiRect) {
+    hash.update_i32(rect.x);
+    hash.update_i32(rect.y);
+    hash.update_u32(rect.w);
+    hash.update_u32(rect.h);
 }
 
-fn fnv1a_u32(hash: &mut u64, value: u32) {
-    fnv1a_bytes(hash, &value.to_le_bytes());
-}
-
-fn fnv1a_i32(hash: &mut u64, value: i32) {
-    fnv1a_bytes(hash, &value.to_le_bytes());
-}
-
-fn fnv1a_rect(hash: &mut u64, rect: &UiRect) {
-    fnv1a_i32(hash, rect.x);
-    fnv1a_i32(hash, rect.y);
-    fnv1a_u32(hash, rect.w);
-    fnv1a_u32(hash, rect.h);
-}
-
-fn fnv1a_color(hash: &mut u64, color: &UiColor) {
-    fnv1a_bytes(hash, &[color.r, color.g, color.b, color.a]);
+fn fnv1a_color(hash: &mut Fnv1a64, color: &UiColor) {
+    hash.update(&[color.r, color.g, color.b, color.a]);
 }
 
 /// Deterministic 64-bit FNV-1a fingerprint over everything
@@ -1053,13 +1036,13 @@ fn fnv1a_color(hash: &mut u64, color: &UiColor) {
 /// window loop can skip the CPU rasterization and the PCIe texture upload
 /// on frames where the HUD did not change.
 pub fn fingerprint_draw_list(width: u32, height: u32, list: &UiDrawList) -> u64 {
-    let mut hash = FNV1A_OFFSET;
-    fnv1a_u32(&mut hash, width);
-    fnv1a_u32(&mut hash, height);
+    let mut hash = Fnv1a64::new();
+    hash.update_u32(width);
+    hash.update_u32(height);
     for command in &list.commands {
         match command {
             UiCommand::FillRect { rect, color } => {
-                fnv1a_bytes(&mut hash, &[0]);
+                hash.update_u8(0);
                 fnv1a_rect(&mut hash, rect);
                 fnv1a_color(&mut hash, color);
             }
@@ -1068,10 +1051,10 @@ pub fn fingerprint_draw_list(width: u32, height: u32, list: &UiDrawList) -> u64 
                 color,
                 thickness,
             } => {
-                fnv1a_bytes(&mut hash, &[1]);
+                hash.update_u8(1);
                 fnv1a_rect(&mut hash, rect);
                 fnv1a_color(&mut hash, color);
-                fnv1a_u32(&mut hash, *thickness);
+                hash.update_u32(*thickness);
             }
             UiCommand::Text {
                 x,
@@ -1080,13 +1063,13 @@ pub fn fingerprint_draw_list(width: u32, height: u32, list: &UiDrawList) -> u64 
                 color,
                 text,
             } => {
-                fnv1a_bytes(&mut hash, &[2]);
-                fnv1a_i32(&mut hash, *x);
-                fnv1a_i32(&mut hash, *y);
-                fnv1a_u32(&mut hash, *scale);
+                hash.update_u8(2);
+                hash.update_i32(*x);
+                hash.update_i32(*y);
+                hash.update_u32(*scale);
                 fnv1a_color(&mut hash, color);
-                fnv1a_bytes(&mut hash, text.as_bytes());
-                fnv1a_bytes(&mut hash, &[0xff]);
+                hash.update_str(text);
+                hash.update_u8(0xff);
             }
             UiCommand::ProgressBar {
                 rect,
@@ -1095,7 +1078,7 @@ pub fn fingerprint_draw_list(width: u32, height: u32, list: &UiDrawList) -> u64 
                 back,
                 border,
             } => {
-                fnv1a_bytes(&mut hash, &[3]);
+                hash.update_u8(3);
                 fnv1a_rect(&mut hash, rect);
                 // `-0.0 == 0.0` under PartialEq but hashes differently via
                 // `to_bits`, so equal draw lists must normalize it.
@@ -1104,14 +1087,14 @@ pub fn fingerprint_draw_list(width: u32, height: u32, list: &UiDrawList) -> u64 
                 } else {
                     fraction.to_bits()
                 };
-                fnv1a_u32(&mut hash, fraction);
+                hash.update_u32(fraction);
                 fnv1a_color(&mut hash, fill);
                 fnv1a_color(&mut hash, back);
                 fnv1a_color(&mut hash, border);
             }
         }
     }
-    hash
+    hash.finish()
 }
 
 // ---------------------------------------------------------------------------
