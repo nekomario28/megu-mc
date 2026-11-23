@@ -30,10 +30,31 @@ BUILTIN_DIMENSION_TYPES = {
     "minecraft:the_nether": (0, 256, False),
     "minecraft:the_end": (0, 256, False),
 }
-WIRE_BLOCKS = json.loads((ROOT / "assets/blocks_1211.json").read_text())
-STATE_COUNT = max(b["maxStateId"] for b in WIRE_BLOCKS) + 1
-AIR_STATES = {st for b in WIRE_BLOCKS if b["name"] in ("air", "cave_air", "void_air")
-              for st in range(b["minStateId"], b["maxStateId"] + 1)}
+# assets/blocks_1211.json is generated from the pinned vanilla jar and is not in
+# the public tree, so the block tables load on first use rather than at import:
+# packet-helper unit tests (fishing_wire_test.py and friends) import this module
+# on clean-room checkouts that have no assets/ at all.
+_WIRE_DATA = None
+
+
+def _wire_data():
+    global _WIRE_DATA
+    if _WIRE_DATA is None:
+        blocks = json.loads((ROOT / "assets/blocks_1211.json").read_text())
+        state_count = max(b["maxStateId"] for b in blocks) + 1
+        air_states = {st for b in blocks
+                      if b["name"] in ("air", "cave_air", "void_air")
+                      for st in range(b["minStateId"], b["maxStateId"] + 1)}
+        _WIRE_DATA = (blocks, state_count, air_states)
+    return _WIRE_DATA
+
+
+def __getattr__(name):
+    if name in ("WIRE_BLOCKS", "STATE_COUNT", "AIR_STATES"):
+        blocks, state_count, air_states = _wire_data()
+        return {"WIRE_BLOCKS": blocks, "STATE_COUNT": state_count,
+                "AIR_STATES": air_states}[name]
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
 
 
 class ContractFailure(AssertionError):
@@ -180,12 +201,13 @@ def decode_chunk_light(body, biome_count, section_count=DEFAULT_SECTIONS, has_sk
     data = Reader(reader.take(reader.varint()))
     sections = []
     if STRICT:
+        _, state_count, air_states = _wire_data()
         for _ in range(section_count):
             non_air = data.number(">h")
             assert 0 <= non_air <= 4096
-            states = palette(data, 4096, 8, 4, STATE_COUNT)
+            states = palette(data, 4096, 8, 4, state_count)
             if STRICT:
-                assert non_air == sum(st not in AIR_STATES for st in states), "non-air section count"
+                assert non_air == sum(st not in air_states for st in states), "non-air section count"
             sections.append(states)
             palette(data, 64, 3, 1, biome_count)
         assert data.pos == len(data.data), "unparsed chunk section bytes"
