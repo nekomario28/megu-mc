@@ -87,6 +87,7 @@ python3 tests/neoforge_s4_network_test.py
 python3 tools/mod_compat_audit/test_audit.py
 python3 tests/fabric_shim_test.py
 python3 tests/client_launcher_test.py
+python3 tests/java_toolchain_test.py
 python3 tests/megu_start_test.py
 python3 tests/megu_mods_test.py
 python3 tests/megu_tui_test.py

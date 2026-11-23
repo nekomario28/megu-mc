@@ -56,7 +56,11 @@ class InstallerCrossOsTest(unittest.TestCase):
         full_env.pop("MEGU_CLIENT_BIN", None)
         full_env.pop("MEGU_CLIENT_SHA256", None)
         if env:
-            full_env.update(env)
+            for key, value in env.items():
+                if value is None:
+                    full_env.pop(key, None)
+                else:
+                    full_env[key] = value
         result = subprocess.run(command, capture_output=True, text=True,
                                 env=full_env, timeout=30)
         if check:
@@ -171,10 +175,8 @@ class InstallerCrossOsTest(unittest.TestCase):
     def test_windows_fallback_dir_without_appdata(self):
         home = self.root / "win home"
         mc_dir = home / "AppData" / "Roaming" / ".minecraft"
-        env = dict(os.environ)
-        env.pop("APPDATA", None)
         self.java("--install", os_name="Windows 11", user_home=str(home),
-                  env=env, check=True)
+                  env={"APPDATA": None}, check=True)
         self.assert_version_json(mc_dir, "megu-1.21.1")
 
     def test_macos_library_dir_no_profile_flag(self):
@@ -220,7 +222,8 @@ class InstallerCrossOsTest(unittest.TestCase):
         self.assertNotIn(b"\r", sh)
         self.assertTrue(sh.startswith(b"#!/bin/sh"))
         self.assertIn(b'"$@"', sh)
-        self.assertTrue(stat.S_IMODE(run_sh.stat().st_mode) & 0o111)
+        if os.name != "nt":
+            self.assertTrue(stat.S_IMODE(run_sh.stat().st_mode) & 0o111)
         bat = run_bat.read_bytes()
         self.assertIn(b"\r\n", bat)
         self.assertNotIn(b"\nmc", bat.replace(b"\r\n", b""))
@@ -229,9 +232,14 @@ class InstallerCrossOsTest(unittest.TestCase):
         self.assertIn("eula", readme.read_text().lower())
         # The installer must never pre-accept the EULA.
         self.assertFalse((server_dir / "eula.txt").exists())
-        refused = subprocess.run(["/bin/sh", str(run_sh)], cwd=server_dir,
-                                 capture_output=True, text=True, timeout=15,
-                                 env={"PATH": "/usr/bin:/bin", "EULA": ""})
+        if os.name == "nt":
+            refused = subprocess.run(["cmd", "/c", str(run_bat)], cwd=server_dir,
+                                     capture_output=True, text=True, timeout=15,
+                                     env={**os.environ, "EULA": ""})
+        else:
+            refused = subprocess.run(["/bin/sh", str(run_sh)], cwd=server_dir,
+                                     capture_output=True, text=True, timeout=15,
+                                     env={"PATH": "/usr/bin:/bin", "EULA": ""})
         self.assertNotEqual(refused.returncode, 0)
         self.assertIn("EULA", refused.stderr)
         self.assertFalse((server_dir / "eula.txt").exists())
@@ -246,7 +254,8 @@ class InstallerCrossOsTest(unittest.TestCase):
         staged = server_dir / "megu"
         self.assertTrue(staged.is_file())
         self.assertEqual(staged.read_bytes(), fake.read_bytes())
-        self.assertTrue(stat.S_IMODE(staged.stat().st_mode) & 0o111)
+        if os.name != "nt":
+            self.assertTrue(stat.S_IMODE(staged.stat().st_mode) & 0o111)
         exe_dir = self.root / "server exe"
         fake_exe = self.root / "fake-server.exe"
         fake_exe.write_text("MZ")
@@ -270,12 +279,14 @@ class InstallerCrossOsTest(unittest.TestCase):
 
         planted = self.root / "planted"
         planted.mkdir()
-        (planted / "run.sh").symlink_to("/etc/hostname")
-        before = Path("/etc/hostname").read_bytes()
+        sentinel = self.root / "sentinel-target"
+        sentinel.write_bytes(b"sentinel must survive the refused install\n")
+        (planted / "run.sh").symlink_to(sentinel)
         bad = self.java("--install-server", str(planted), os_name="Linux")
         self.assertEqual(bad.returncode, 2)
         self.assertIn("symlink", bad.stderr)
-        self.assertEqual(Path("/etc/hostname").read_bytes(), before)
+        self.assertEqual(sentinel.read_bytes(),
+                         b"sentinel must survive the refused install\n")
 
         bad = self.java("--install-server", str(self.root / "s1"),
                         "--server-bin", str(self.root / "missing-bin"))

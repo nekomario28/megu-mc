@@ -338,7 +338,8 @@ class MiniJreTests(unittest.TestCase):
     def test_real_jlink_version_probe(self):
         jlink = shutil.which("jlink")
         proc = subprocess.run([jlink, "--version"], capture_output=True,
-                              text=True, timeout=10, check=False)
+                              text=True, timeout=60, check=False,
+                              stdin=subprocess.DEVNULL)
         self.assertEqual(proc.returncode, 0, proc.stderr)
         self.assertRegex(proc.stdout + proc.stderr, r"\d+")
         self.assertIn(builder.detect_compress(Path(jlink)), {"zip-6", "2"})

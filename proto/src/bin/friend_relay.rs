@@ -288,6 +288,14 @@ fn serve(cli: &Cli) -> io::Result<()> {
             }
             Err(e) if e.kind() == io::ErrorKind::WouldBlock => {}
             Err(e) if e.kind() == io::ErrorKind::Interrupted => {}
+            // BSD/macOS surfaces a pending connection that was reset before
+            // accept() dequeued it as ECONNABORTED/ECONNRESET: a per-connection
+            // event that must not kill the listener itself.
+            Err(e)
+                if matches!(
+                    e.kind(),
+                    io::ErrorKind::ConnectionAborted | io::ErrorKind::ConnectionReset
+                ) => {}
             Err(e) => return Err(e),
         }
         if last_report.elapsed() >= REPORT_INTERVAL {

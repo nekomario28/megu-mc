@@ -1123,6 +1123,15 @@ impl TcpFriendRelay {
                     events += 1;
                 }
                 Err(e) if e.kind() == io::ErrorKind::WouldBlock => break,
+                Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
+                // BSD/macOS surfaces a pending connection that was reset before
+                // accept() dequeued it as ECONNABORTED/ECONNRESET: a
+                // per-connection event, not a reason to stop the relay.
+                Err(e)
+                    if matches!(
+                        e.kind(),
+                        io::ErrorKind::ConnectionAborted | io::ErrorKind::ConnectionReset
+                    ) => {}
                 Err(e) => return Err(e),
             }
         }

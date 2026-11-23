@@ -358,6 +358,7 @@ public final class Main {
             if (!Files.isRegularFile(pinnedBin)) {
                 throw new IOException("--client-bin must be an existing file: " + clientBin);
             }
+            pinnedBin = pinnedBin.toRealPath();
         } else if (selfJar.getParent() != null) {
             String gpuName = isWindows() ? "megu-client-gpu.exe" : "megu-client-gpu";
             String srvName = isWindows() ? "megu.exe" : "megu";
