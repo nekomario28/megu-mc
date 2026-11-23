@@ -73,7 +73,11 @@ impl<K: Eq + Hash + Ord + Copy> DueMachineQueue<K> {
 
     /// Append all due keys in `(due_tick, key)` order.
     pub(crate) fn drain_due_into(&mut self, now_tick: u64, out: &mut Vec<K>) {
-        if self.next_due_tick().is_none_or(|next| next > now_tick) {
+        if self
+            .due
+            .peek()
+            .is_none_or(|Reverse((next, _))| *next > now_tick)
+        {
             return;
         }
 
@@ -109,7 +113,13 @@ impl<K: Eq + Hash + Ord + Copy> DueMachineQueue<K> {
     }
 
     pub(crate) fn next_due_tick(&self) -> Option<u64> {
-        self.due.peek().map(|entry| (entry.0).0)
+        match self.due.peek() {
+            Some(Reverse((tick, key))) if self.deadlines.get(key).copied() == Some(*tick) => {
+                Some(*tick)
+            }
+            Some(_) => self.deadlines.values().copied().min(),
+            None => None,
+        }
     }
 
     fn compact_if_needed(&mut self) {
@@ -413,9 +423,11 @@ mod due_machine_tests {
     fn removal_suppresses_firing_and_churn_keeps_heap_bounded() {
         let mut queue = DueMachineQueue::new();
         queue.schedule_due(0_u32, 1_000);
+        queue.schedule_due(1, 2_000);
         queue.remove(0);
+        assert_eq!(queue.next_due_tick(), Some(2_000));
         let mut out = Vec::new();
-        queue.drain_due_into(2_000, &mut out);
+        queue.drain_due_into(1_000, &mut out);
         assert!(out.is_empty());
 
         queue.schedule_due(0, 10_000);
@@ -425,6 +437,7 @@ mod due_machine_tests {
             assert!(queue.due.len() <= queue.len() * 2 + DueMachineQueue::<u32>::COMPACTION_SLACK);
         }
         queue.remove(0);
+        queue.remove(1);
         assert!(queue.is_empty());
         assert!(queue.due.is_empty());
         queue.drain_due_into(u64::MAX, &mut out);
