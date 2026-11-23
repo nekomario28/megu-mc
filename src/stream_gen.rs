@@ -446,9 +446,8 @@ pub(crate) static STREAMGEN_FAILED: AtomicU64 = AtomicU64::new(0);
 /// Requests declined because the ticket map was full of unresolved work.
 pub(crate) static STREAMGEN_FULL: AtomicU64 = AtomicU64::new(0);
 /// Chunks a `populate` pass decorated *on the tick thread* — the stall this
-/// queue exists to remove. Incremented in `worldgen::Gen::populate_in_order`;
-/// the join-storm regression is observable as this counter climbing.
-pub(crate) static TICK_GENERATED_CHUNKS: AtomicU64 = AtomicU64::new(0);
+/// queue exists to remove. Owned by `worldgen` so the module graph stays acyclic.
+pub(crate) use crate::worldgen::TICK_GENERATED_CHUNKS;
 
 /// The profiling line, under `MEGU_STREAMGEN_PROF=1`, throttled to one per 64
 /// commits so a join burst logs its own drain rate.
@@ -497,7 +496,7 @@ mod tests {
         fn committed_order(&self) -> Vec<GenKey> {
             self.committed
                 .lock()
-                .unwrap()
+                .unwrap_or_else(|e| e.into_inner())
                 .iter()
                 .map(|(k, _)| *k)
                 .collect()
@@ -508,14 +507,14 @@ mod tests {
         type Prepared = GenKey;
         fn prepare(&self, key: GenKey) -> Result<GenKey, ()> {
             if let Some(gate) = &self.gate {
-                let mut open = gate.0.lock().unwrap();
+                let mut open = gate.0.lock().unwrap_or_else(|e| e.into_inner());
                 while !*open {
-                    open = gate.1.wait(open).unwrap();
+                    open = gate.1.wait(open).unwrap_or_else(|e| e.into_inner());
                 }
             }
             self.prepared_on
                 .lock()
-                .unwrap()
+                .unwrap_or_else(|e| e.into_inner())
                 .push((key, std::thread::current().id()));
             if self.fail_prepare.contains(&key) {
                 return Err(());
@@ -525,7 +524,7 @@ mod tests {
         fn commit(&self, key: GenKey, _prepared: GenKey) {
             self.committed
                 .lock()
-                .unwrap()
+                .unwrap_or_else(|e| e.into_inner())
                 .push((key, std::thread::current().id()));
         }
     }
@@ -551,10 +550,10 @@ mod tests {
             (0..8).map(key).collect::<Vec<_>>(),
             "commit order must equal request order even when prepares race"
         );
-        for (_, tid) in q.job.committed.lock().unwrap().iter() {
+        for (_, tid) in q.job.committed.lock().unwrap_or_else(|e| e.into_inner()).iter() {
             assert_ne!(*tid, caller, "commits must run on the committer thread");
         }
-        for (_, tid) in q.job.prepared_on.lock().unwrap().iter() {
+        for (_, tid) in q.job.prepared_on.lock().unwrap_or_else(|e| e.into_inner()).iter() {
             assert_ne!(*tid, caller, "prepares must run on worker threads");
         }
     }
@@ -610,7 +609,7 @@ mod tests {
         // The worker is parked inside the gated prepare, so nothing resolves:
         // the third request must be declined, not queued past the bound.
         assert!(q.request(key(3), 1).is_none());
-        *gate.0.lock().unwrap() = true;
+        *gate.0.lock().unwrap_or_else(|e| e.into_inner()) = true;
         gate.1.notify_all();
         assert!(a.wait());
         assert!(b.wait());

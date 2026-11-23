@@ -5,7 +5,24 @@
 // Algorithm referenced from vanilla/Pumpkin; implementation is independent.
 
 use std::collections::{HashMap, HashSet};
-use std::sync::Mutex;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Mutex, OnceLock};
+
+/// `thread::current().id()` of the game-tick thread, installed when the tick
+/// loop spawns so populate passes executing on the tick thread are measurable
+/// without an upward dependency from `worldgen` back into `main` or `stream_gen`.
+static TICK_THREAD_ID: OnceLock<std::thread::ThreadId> = OnceLock::new();
+
+/// Chunks a `populate` pass decorated *on the tick thread*.
+pub(crate) static TICK_GENERATED_CHUNKS: AtomicU64 = AtomicU64::new(0);
+
+pub(crate) fn mark_tick_thread() {
+    let _ = TICK_THREAD_ID.set(std::thread::current().id());
+}
+
+pub(crate) fn on_tick_thread() -> bool {
+    TICK_THREAD_ID.get() == Some(&std::thread::current().id())
+}
 
 use crate::block_registry::{breg, bs_parts, BReg};
 use crate::json::{jbool, jparse, J};
@@ -12924,9 +12941,8 @@ impl Gen {
         // A populate pass the tick itself executes is the stall the streamed-
         // generation queue exists to remove; counting it makes the offload
         // measurable instead of asserted.
-        if executed > 0 && crate::on_tick_thread() {
-            crate::stream_gen::TICK_GENERATED_CHUNKS
-                .fetch_add(executed as u64, std::sync::atomic::Ordering::Relaxed);
+        if executed > 0 && on_tick_thread() {
+            TICK_GENERATED_CHUNKS.fetch_add(executed as u64, Ordering::Relaxed);
         }
         let jobs = terrain_jobs();
         // A generic `FnMut` callback cannot be analysed or sent to a worker. The one driver

@@ -13952,15 +13952,6 @@ struct OpBand {
     cells: Vec<u32>,
 }
 
-/// `thread::current().id()` of the game-tick thread, installed when it is
-/// spawned. Generation queues (and the populate-pass counter) use it to prove
-/// that streamed-chunk generation no longer runs on the tick.
-static TICK_THREAD_ID: OnceLock<thread::ThreadId> = OnceLock::new();
-
-pub(crate) fn on_tick_thread() -> bool {
-    TICK_THREAD_ID.get() == Some(&thread::current().id())
-}
-
 /// Caches that describe a generator must not outlive it: `band_state` and `stored_state`
 /// answer only for bands published under the current `worldgen::generation_seq`.
 fn current_gen_seq() -> u64 {
@@ -20147,7 +20138,7 @@ fn main() {
     // the synchronous save path byte-for-byte.
     let _ = LIVE_SAVE_WORKER.set(AsyncSaveWorker::spawn());
     thread::spawn(|| {
-        let _ = TICK_THREAD_ID.set(thread::current().id());
+        worldgen::mark_tick_thread();
         // The deadline derives from the previous one, not from the sleep
         // duration, so tick work that overruns does not walk the clock later.
         // Under sustained overload the deadline is re-anchored instead of

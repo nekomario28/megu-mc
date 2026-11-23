@@ -14,7 +14,8 @@
       "effects",
       "minecart",
       "spawner",
-      "tick_persistence"
+      "tick_persistence",
+      "stream_gen"
     ],
     [
       "cached_lookup",
@@ -104,6 +105,18 @@
     [
       "main",
       "brigadier_wire"
+    ],
+    [
+      "main",
+      "stream_gen"
+    ],
+    [
+      "stream_gen",
+      "feature"
+    ],
+    [
+      "stream_gen",
+      "worldgen"
     ],
     [
       "main",
