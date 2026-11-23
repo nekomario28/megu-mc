@@ -1133,28 +1133,16 @@ fn drop_spawn_scattered(
 /// `thrower` does not join the key — `merge_drops` does not compare it.
 #[cfg(feature = "mod-suite")]
 fn drop_merge_hash(comps: &Comps, target: &Option<[u8; 16]>) -> u64 {
-    let mut h = 0xcbf2_9ce4_8422_2325u64;
-    let mut mix = |b: u8| {
-        h ^= u64::from(b);
-        h = h.wrapping_mul(0x0000_0100_0000_01B3);
-    };
+    let mut h = megu_core::hash::Fnv1a64::new();
     for (ty, data) in comps {
-        for b in ty.to_be_bytes() {
-            mix(b);
-        }
-        for &b in data {
-            mix(b);
-        }
+        h.update(&ty.to_be_bytes());
+        h.update(data);
     }
     match target {
-        Some(t) => {
-            for &b in t {
-                mix(b);
-            }
-        }
-        None => mix(0xff),
+        Some(t) => h.update(t),
+        None => h.update_u8(0xff),
     }
-    h
+    h.finish()
 }
 
 /// The merge kernel over one partitioned pool (keepers first, donors after,
@@ -1310,35 +1298,40 @@ fn drop_merge_pending() {
 }
 
 fn furnace_tick() {
-    let mut fs = furnaces().lock().unwrap_or_else(|e| e.into_inner());
-    if fs.is_empty() {
+    // The due queue's clock is the sequence of `furnace_tick` calls rather
+    // than `TICK_IDX`: a re-armed deadline must fire on the very next call even
+    // when the world tick index is frozen (unit tests step this function
+    // directly). One game tick runs exactly one `furnace_tick`, so the two
+    // clocks never disagree in production.
+    let now = FURNACE_TICK_SEQ.fetch_add(1, Ordering::Relaxed);
+    let mut due = Vec::new();
+    furnace_due_queue()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .drain_due_into(now, &mut due);
+    if due.is_empty() {
         return;
     }
-    let mut dirty_pos = FURNACE_DIRTY_SCRATCH.with(scratch_take);
-    // One region borrow for the whole loop. Acquiring the mutex per furnace was
+    let mut fs = furnaces().lock().unwrap_or_else(|e| e.into_inner());
+    // One region borrow for the whole batch. Acquiring the mutex per furnace was
     // what dominated this stage, not the set lookup itself.
     let region = region_guard();
-    let mut sleep = furnace_sleep().lock().unwrap_or_else(|e| e.into_inner());
-    for (pos, f) in fs.iter_mut() {
+    let mut dirty_pos = FURNACE_DIRTY_SCRATCH.with(scratch_take);
+    let mut rearm = Vec::new();
+    for pos in due {
+        let Some(f) = fs.get_mut(&pos) else {
+            // The furnace was removed while queued; the drained heap entry is
+            // the last trace of its cancelled deadline.
+            continue;
+        };
         if !region.is_warm(pos.1, pos.3) {
+            // A cold furnace keeps a next-tick deadline: no mutation event
+            // announces its chunk warming back up, so the deadline itself is
+            // the only thing that can make it run again.
+            rearm.push(pos);
             continue;
         }
-        // Idle-sleep probe (the BOT-HOPPER cross-apply): a furnace whose last
-        // pass proved inert — no burn, no cook progress, nothing pending — is
-        // a pure function of its three slots and the content revision, so an
-        // unchanged fingerprint skips the recipe/fuel lookups entirely. A
-        // pass that ends inert cannot have mutated the furnace, so the
-        // fingerprint taken before it is the one stored after it.
-        let mut probed = None;
-        if f.burn_left <= 0 && f.progress <= 0 && !f.dirty {
-            let fp = furnace_epoch(f, content_revision());
-            if sleep.get(pos) == Some(&fp) {
-                FURNACE_SLEEP_SKIPS.fetch_add(1, Ordering::Relaxed);
-                continue;
-            }
-            probed = Some(fp);
-        }
-        FURNACE_ACTIVE_STEPS.fetch_add(1, Ordering::Relaxed);
+        FURNACE_TICK_VISITS.fetch_add(1, Ordering::Relaxed);
         // The recipe result is only ever read behind `input.1 > 0`, so an empty
         // input skips the lookup instead of hashing an item it cannot smelt.
         let out = if f.input.1 > 0 {
@@ -1393,31 +1386,25 @@ fn furnace_tick() {
         } else if f.progress > 0 {
             f.progress -= 1;
         }
-        // The pass just proved whether the furnace is inert; record the
-        // fingerprint it was probed with (or one computed now for a furnace
-        // that never entered the gate) only while the next pass is provably
-        // a no-op.
-        if f.burn_left <= 0 && f.progress <= 0 {
-            sleep.insert(
-                *pos,
-                probed.unwrap_or_else(|| furnace_epoch(f, content_revision())),
-            );
-        } else {
-            sleep.remove(pos);
+        // A furnace that can still make progress next tick re-arms. One that
+        // ended this pass inert — no burn, no cook progress — stays out of the
+        // queue and sleeps at zero per-tick cost until a mutation wakes it.
+        if f.burn_left > 0 || f.progress > 0 {
+            rearm.push(pos);
         }
         if f.dirty {
             f.dirty = false;
-            dirty_pos.push(*pos);
+            dirty_pos.push(pos);
         }
     }
-    // Entries for positions whose furnace was removed outside the tick path
-    // can only ever make the map larger than the store; sweep then.
-    if sleep.len() > fs.len() {
-        sleep.retain(|k, _| fs.contains_key(k));
-    }
-    drop(sleep);
     drop(region);
     drop(fs);
+    if !rearm.is_empty() {
+        let mut q = furnace_due_queue().lock().unwrap_or_else(|e| e.into_inner());
+        for pos in rearm {
+            q.schedule_due(pos, now + 1);
+        }
+    }
     if dirty_pos.is_empty() {
         FURNACE_DIRTY_SCRATCH.with(|s| scratch_return(s, dirty_pos));
         return;
@@ -1538,12 +1525,12 @@ fn drop_cells() -> &'static Mutex<DropCells> {
 /// FNV-1a over the component list: order matters (`Comps` equality is a Vec
 /// compare), so this folds sequentially rather than summing.
 fn comps_fingerprint(comps: &Comps) -> u64 {
-    let mut h = 0xcbf29ce484222325u64;
+    let mut h = megu_core::hash::FNV1A64_OFFSET_BASIS;
     for (ty, data) in comps {
-        h = (h ^ (*ty as u64)).wrapping_mul(0x100000001b3);
-        h = (h ^ data.len() as u64).wrapping_mul(0x100000001b3);
+        h = (h ^ (*ty as u64)).wrapping_mul(megu_core::hash::FNV1A64_PRIME);
+        h = (h ^ data.len() as u64).wrapping_mul(megu_core::hash::FNV1A64_PRIME);
         for &b in data {
-            h = (h ^ u64::from(b)).wrapping_mul(0x100000001b3);
+            h = (h ^ u64::from(b)).wrapping_mul(megu_core::hash::FNV1A64_PRIME);
         }
     }
     h
@@ -1857,22 +1844,67 @@ thread_local! {
         const { std::cell::RefCell::new(Vec::new()) };
 }
 
-// ---------- idle furnace / brewing-stand sleep (cross-apply of BOT-HOPPER) ----------
+// ---------- event-driven furnace sleep / idle brewing-stand probe ----------
 //
-// `furnace_tick` resolves the recipe and fuel for every warm furnace on every
-// tick, and `live_brewing_tick` re-derives potion/ingredient state for every
-// stand. A settled block entity — no burn, no cook progress, no pending fuel
-// — can only be woken by a slot or content change, so a fingerprint over
-// exactly the state the pass reads proves an unchanged verdict in O(1). Like
-// the hopper probe, the fingerprint reads the live slots every visit instead
-// of trusting mutation hooks: a write from a menu click, a hopper, `/data`
-// merge or a save load lands in the fingerprint on the very next tick.
+// `furnace_tick` used to resolve the recipe and fuel for every warm furnace on
+// every tick, and `live_brewing_tick` still re-derives potion/ingredient state
+// for every stand. Furnaces now sleep in a deadline queue: a furnace is
+// visited only when a mutation wakes it or a burn/cook deadline it re-armed
+// itself comes due, so an idle farm costs zero per tick. Brewing stands keep
+// the fingerprint probe — their watched state is cheap to read live, and a
+// stand's five slots see no external writers the way furnace slots do.
 
-/// Per-position fingerprint recorded after a furnace pass proved inert.
-static FURNACE_SLEEP: OnceLock<Mutex<HashMap<DimBlockPos, u128>>> = OnceLock::new();
-fn furnace_sleep() -> &'static Mutex<HashMap<DimBlockPos, u128>> {
-    FURNACE_SLEEP.get_or_init(|| Mutex::new(HashMap::new()))
+/// Furnace deadlines: a position is visited only when it wakes itself for
+/// burn/cook progress or a mutation event makes it due early.
+static FURNACE_DUE_QUEUE: OnceLock<Mutex<tick_queue::DueMachineQueue<DimBlockPos>>> =
+    OnceLock::new();
+fn furnace_due_queue() -> &'static Mutex<tick_queue::DueMachineQueue<DimBlockPos>> {
+    FURNACE_DUE_QUEUE.get_or_init(|| Mutex::new(tick_queue::DueMachineQueue::new()))
 }
+/// One step of the queue's clock per `furnace_tick` call, so re-armed deadlines
+/// fire on the very next drain even where the world tick index is not moving.
+static FURNACE_TICK_SEQ: AtomicU64 = AtomicU64::new(0);
+/// Warm-furnace visits. The `xpoll_be_sleep` lane reads deltas on this to prove
+/// an idle furnace is never stepped.
+static FURNACE_TICK_VISITS: AtomicU64 = AtomicU64::new(0);
+
+/// A slot, timer or content write at `(dim, x, y, z)` makes the furnace due on
+/// the next `furnace_tick`. The wake is deduped by the queue, so callers may
+/// fire it unconditionally after any mutation.
+fn wake_furnace_at(dim: DimId, x: i32, y: i32, z: i32) {
+    furnace_due_queue()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .wake((dim, x, y, z), FURNACE_TICK_SEQ.load(Ordering::Relaxed));
+}
+
+/// The block entity at `(dim, x, y, z)` is gone: cancel its pending deadline so
+/// a removed furnace can never be visited again.
+fn remove_furnace_at(dim: DimId, x: i32, y: i32, z: i32) {
+    furnace_due_queue()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .remove((dim, x, y, z));
+}
+
+/// Whole-store refresh after a load, restore or content-revision bump: clear
+/// every deadline and wake each registered furnace once. Each gets one settle
+/// visit, re-arms only if it can still burn, and sleeps afterwards.
+fn rebuild_furnace_due_queue() {
+    let now = FURNACE_TICK_SEQ.load(Ordering::Relaxed);
+    let keys: Vec<DimBlockPos> = furnaces()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .keys()
+        .copied()
+        .collect();
+    let mut q = furnace_due_queue().lock().unwrap_or_else(|e| e.into_inner());
+    q.clear();
+    for key in keys {
+        q.wake(key, now);
+    }
+}
+
 /// Same for brewing stands.
 static BREWING_SLEEP: OnceLock<Mutex<HashMap<DimBlockPos, u128>>> = OnceLock::new();
 fn brewing_sleep() -> &'static Mutex<HashMap<DimBlockPos, u128>> {
@@ -1880,22 +1912,8 @@ fn brewing_sleep() -> &'static Mutex<HashMap<DimBlockPos, u128>> {
 }
 /// Visit accounting the `xpoll_be_sleep_*` tests read: full passes versus
 /// fingerprint-proven skips.
-static FURNACE_SLEEP_SKIPS: AtomicU64 = AtomicU64::new(0);
-static FURNACE_ACTIVE_STEPS: AtomicU64 = AtomicU64::new(0);
 static BREWING_SLEEP_SKIPS: AtomicU64 = AtomicU64::new(0);
 static BREWING_ACTIVE_STEPS: AtomicU64 = AtomicU64::new(0);
-
-/// The watched-state fingerprint for one furnace visit: the three slot stacks
-/// (item, count, components) plus the content revision the recipe and fuel
-/// caches already key on. `burn_left`, `progress` and `dirty` are checked
-/// live in the caller's inert gate, so they stay out of the hash and a
-/// `/data` write to them still wakes on the same tick.
-fn furnace_epoch(f: &Furnace, rev: u64) -> u128 {
-    let mut acc = mixv(rev as u128, 0x9E37_79B9_7F4A_7C15);
-    acc = mix_stack_entry(acc, 0, &f.input);
-    acc = mix_stack_entry(acc, 1, &f.fuel);
-    mix_stack_entry(acc, 2, &f.output)
-}
 
 /// The watched-state fingerprint for one brewing-stand visit: the five menu
 /// slot stacks (bottle slots carry their potion in components), the persisted
@@ -15258,28 +15276,28 @@ mod xpoll_be_sleep_tests {
     /// this lane adds.
     struct SavedBe {
         furnaces: HashMap<DimBlockPos, Furnace>,
-        fsleep: HashMap<DimBlockPos, u128>,
         stands: HashMap<DimBlockPos, LiveBrewingStand>,
         bsleep: HashMap<DimBlockPos, u128>,
-        fskips: u64,
-        fsteps: u64,
+        fvisits: u64,
         bskips: u64,
         bsteps: u64,
         region: TestChunkRegion,
     }
 
     fn save_be() -> SavedBe {
+        furnace_due_queue()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clear();
         SavedBe {
             furnaces: std::mem::take(&mut *furnaces().lock().unwrap_or_else(|e| e.into_inner())),
-            fsleep: std::mem::take(&mut *furnace_sleep().lock().unwrap_or_else(|e| e.into_inner())),
             stands: std::mem::take(
                 &mut *live_brewing_stands()
                     .lock()
                     .unwrap_or_else(|e| e.into_inner()),
             ),
             bsleep: std::mem::take(&mut *brewing_sleep().lock().unwrap_or_else(|e| e.into_inner())),
-            fskips: FURNACE_SLEEP_SKIPS.swap(0, Ordering::Relaxed),
-            fsteps: FURNACE_ACTIVE_STEPS.swap(0, Ordering::Relaxed),
+            fvisits: FURNACE_TICK_VISITS.swap(0, Ordering::Relaxed),
             bskips: BREWING_SLEEP_SKIPS.swap(0, Ordering::Relaxed),
             bsteps: BREWING_ACTIVE_STEPS.swap(0, Ordering::Relaxed),
             region: test_region(),
@@ -15288,13 +15306,15 @@ mod xpoll_be_sleep_tests {
 
     fn restore_be(saved: SavedBe) {
         *furnaces().lock().unwrap_or_else(|e| e.into_inner()) = saved.furnaces;
-        *furnace_sleep().lock().unwrap_or_else(|e| e.into_inner()) = saved.fsleep;
+        // The restored store is authoritative: deadlines the test's removed
+        // furnaces left behind are dropped and the surviving entries get a
+        // fresh settle pass.
+        rebuild_furnace_due_queue();
         *live_brewing_stands()
             .lock()
             .unwrap_or_else(|e| e.into_inner()) = saved.stands;
         *brewing_sleep().lock().unwrap_or_else(|e| e.into_inner()) = saved.bsleep;
-        FURNACE_SLEEP_SKIPS.store(saved.fskips, Ordering::Relaxed);
-        FURNACE_ACTIVE_STEPS.store(saved.fsteps, Ordering::Relaxed);
+        FURNACE_TICK_VISITS.store(saved.fvisits, Ordering::Relaxed);
         BREWING_SLEEP_SKIPS.store(saved.bskips, Ordering::Relaxed);
         BREWING_ACTIVE_STEPS.store(saved.bsteps, Ordering::Relaxed);
         set_test_region(saved.region.0, saved.region.1);
@@ -15324,11 +15344,8 @@ mod xpoll_be_sleep_tests {
         }
     }
 
-    fn furnace_counters() -> (u64, u64) {
-        (
-            FURNACE_ACTIVE_STEPS.load(Ordering::Relaxed),
-            FURNACE_SLEEP_SKIPS.load(Ordering::Relaxed),
-        )
+    fn furnace_visits() -> u64 {
+        FURNACE_TICK_VISITS.load(Ordering::Relaxed)
     }
 
     fn brewing_counters() -> (u64, u64) {
@@ -15338,16 +15355,14 @@ mod xpoll_be_sleep_tests {
         )
     }
 
-    /// 500 idle furnaces plus one cooking furnace over 20 ticks: once the
-    /// first pass proves the idle farm inert, every further visit is an O(1)
-    /// fingerprint skip while the active furnace cooks at exactly the vanilla
-    /// rate — and a fuel+input insert into one idle furnace wakes it on the
-    /// same tick.
+    /// 1,000 idle furnaces plus one cooking furnace: the settle pass visits
+    /// each once, then 50 ticks visit ONLY the cooker — the idle farm is
+    /// drained zero times, so it costs zero per tick.
     #[test]
-    fn xpoll_be_sleep_500_idle_furnaces_skip_and_wake_same_tick() {
+    fn xpoll_be_sleep_1000_idle_furnaces_zero_visits_while_one_cooks() {
         let _guard = world_guard();
         let saved = save_be();
-        let n_idle = 500usize;
+        let n_idle = 1_000usize;
         let iron = name_to_item("raw_iron").unwrap();
         let coal = name_to_item("coal").unwrap();
         let warm = warm_block_range(0, 0, 63, 63);
@@ -15355,59 +15370,211 @@ mod xpoll_be_sleep_tests {
 
         {
             let mut fs = furnaces().lock().unwrap_or_else(|e| e.into_inner());
+            // 32x32 even grid inside the 64x64 warm range; (62,140,62) is the
+            // one grid corner no idle entry can occupy.
             for i in 0..n_idle {
-                let pos = ow_block((((i % 25) * 2) as i32, 140, ((i / 25) * 2) as i32));
+                let pos = ow_block((((i % 32) * 2) as i32, 140, ((i / 32) * 2) as i32));
                 fs.insert(pos, blank_furnace());
             }
             // The one active furnace: iron + coal, cooking from tick one.
             let mut active = blank_furnace();
             active.input = (iron, 1, Vec::new());
             active.fuel = (coal, 1, Vec::new());
-            fs.insert(ow_block((46, 140, 46)), active);
+            fs.insert(ow_block((62, 140, 62)), active);
         }
-        let active_pos = ow_block((46, 140, 46));
+        let active_pos = ow_block((62, 140, 62));
+        // Model the load/insert event: every registered furnace gets one
+        // settle visit that proves the idle ones inert.
+        rebuild_furnace_due_queue();
 
         let t0 = std::time::Instant::now();
-        for _ in 0..20 {
-            furnace_tick();
-        }
-        let twenty_ticks_us = t0.elapsed().as_micros();
-        let (steps, skips) = furnace_counters();
-        // First tick every furnace runs a real pass (501 steps); afterwards
-        // the 500 idle ones skip and only the active furnace steps.
-        assert_eq!(steps, 501 + 19, "one pass per furnace, then only the cooker");
-        assert_eq!(skips, 500 * 19, "every idle furnace skips every later tick");
+        furnace_tick();
+        let settle_us = t0.elapsed().as_micros();
+        assert_eq!(
+            furnace_visits(),
+            1_001,
+            "the settle pass steps every furnace exactly once"
+        );
         {
             let fs = furnaces().lock().unwrap_or_else(|e| e.into_inner());
             let f = fs.get(&active_pos).unwrap();
-            assert_eq!(f.progress, 20, "the cooker must advance one step per tick");
-            assert_eq!(f.burn_left, server_ticks(1600) as i32 - 20);
-            assert_eq!(f.output, (0, 0, Vec::new()));
+            assert_eq!(f.progress, 1, "the cooker ignites on the settle tick");
+            assert_eq!(f.burn_left, server_ticks(1600) as i32 - 1);
         }
-
-        // Wake on a fuel+input insert, same tick: the idle victim ignites and
-        // starts cooking on the very next furnace_tick, like vanilla.
-        let victim = ow_block((0, 140, 0));
-        {
-            let mut fs = furnaces().lock().unwrap_or_else(|e| e.into_inner());
-            let f = fs.get_mut(&victim).unwrap();
-            f.input = (iron, 2, Vec::new());
-            f.fuel = (coal, 1, Vec::new());
+        // 50 further ticks: the idle thousand are never drained, only the
+        // cooker re-arms itself.
+        let t0 = std::time::Instant::now();
+        for _ in 0..50 {
+            furnace_tick();
         }
-        let (steps_w, skips_w) = furnace_counters();
-        furnace_tick();
-        let (steps_a, skips_a) = furnace_counters();
-        assert_eq!(steps_a - steps_w, 2, "victim wakes; cooker keeps stepping");
-        assert_eq!(skips_a - skips_w, 499, "the remaining idles still skip");
+        let fifty_ticks_us = t0.elapsed().as_micros();
+        assert_eq!(
+            furnace_visits(),
+            1_001 + 50,
+            "only the active furnace may be visited after the settle pass"
+        );
         {
             let fs = furnaces().lock().unwrap_or_else(|e| e.into_inner());
-            let f = fs.get(&victim).unwrap();
+            let f = fs.get(&active_pos).unwrap();
+            assert_eq!(f.progress, 51, "the cooker advances one step per tick");
+            assert_eq!(f.burn_left, server_ticks(1600) as i32 - 51);
+            assert_eq!(f.output, (0, 0, Vec::new()));
+        }
+        assert_eq!(
+            furnace_due_queue()
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .len(),
+            1,
+            "only the cooker still holds a deadline"
+        );
+        eprintln!(
+            "xpoll_be_sleep: 1000 idle + 1 active: settle={}us 50t={}us visits=1051",
+            settle_us, fifty_ticks_us
+        );
+        restore_be(saved);
+    }
+
+    /// Wake-on-event: a sleeping furnace that receives fuel + input through
+    /// `wake_furnace_at` (the hook every slot writer calls) ignites on the
+    /// next tick and completes the smelt at exactly the vanilla cook time.
+    #[test]
+    fn xpoll_be_sleep_furnace_wake_on_event_smelts_vanilla() {
+        let _guard = world_guard();
+        let saved = save_be();
+        let iron = name_to_item("raw_iron").unwrap();
+        let coal = name_to_item("coal").unwrap();
+        let warm = warm_block_range(0, 0, 15, 15);
+        set_test_region(warm.clone(), warm);
+        let pos = ow_block((4, 140, 4));
+
+        {
+            let mut fs = furnaces().lock().unwrap_or_else(|e| e.into_inner());
+            fs.insert(pos, blank_furnace());
+        }
+        rebuild_furnace_due_queue();
+        // The settle pass proves it inert and it leaves the queue.
+        furnace_tick();
+        assert_eq!(furnace_visits(), 1);
+        assert!(
+            furnace_due_queue()
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .is_empty(),
+            "an inert furnace must not stay scheduled"
+        );
+
+        // The mutation event: fuel + input land, the writer wakes it.
+        {
+            let mut fs = furnaces().lock().unwrap_or_else(|e| e.into_inner());
+            let f = fs.get_mut(&pos).unwrap();
+            f.input = (iron, 1, Vec::new());
+            f.fuel = (coal, 1, Vec::new());
+        }
+        wake_furnace_at(DimId::Overworld, 4, 140, 4);
+        let before = furnace_visits();
+        furnace_tick();
+        assert_eq!(furnace_visits() - before, 1, "the wake drains exactly once");
+        {
+            let fs = furnaces().lock().unwrap_or_else(|e| e.into_inner());
+            let f = fs.get(&pos).unwrap();
             assert_eq!(f.progress, 1, "woken furnace cooks on the wake tick");
             assert_eq!(f.burn_left, server_ticks(1600) as i32 - 1);
         }
-        eprintln!(
-            "xpoll_be_sleep: 500 idle + 1 active, 20 ticks: skips={} steps={} wall={}us",
-            skips, steps, twenty_ticks_us
+
+        // The rest of the cook is vanilla-paced self re-arming: no more wakes,
+        // exactly `server_ticks(200)` progress steps produce the ingot.
+        for _ in 0..server_ticks(200) as usize - 1 {
+            furnace_tick();
+        }
+        {
+            let fs = furnaces().lock().unwrap_or_else(|e| e.into_inner());
+            let f = fs.get(&pos).unwrap();
+            assert_eq!(
+                f.output,
+                (name_to_item("iron_ingot").unwrap(), 1, Vec::new()),
+                "the smelt completes after the vanilla cook time"
+            );
+            assert_eq!(f.input, (0, 0, Vec::new()));
+            assert!(f.xp > 0.0, "the smelt banks its experience");
+        }
+        // `burn_left` only drains while smelting, so the leftover burn keeps
+        // the furnace scheduled — the reference tick visits it every tick too.
+        let before = furnace_visits();
+        furnace_tick();
+        assert_eq!(furnace_visits() - before, 1);
+        // Clear the residual burn the way a `/data` BurnTime write does (the
+        // write path wakes it itself); the next pass proves it inert and it
+        // falls back asleep for good.
+        {
+            let mut fs = furnaces().lock().unwrap_or_else(|e| e.into_inner());
+            fs.get_mut(&pos).unwrap().burn_left = 0;
+        }
+        wake_furnace_at(DimId::Overworld, 4, 140, 4);
+        furnace_tick();
+        let before = furnace_visits();
+        furnace_tick();
+        assert_eq!(
+            furnace_visits() - before,
+            0,
+            "a fully inert furnace must leave the queue"
+        );
+        restore_be(saved);
+    }
+
+    /// Remove-on-break: cancelling the deadline along with the store entry
+    /// leaves nothing queued — later ticks never visit the ghost.
+    #[test]
+    fn xpoll_be_sleep_furnace_remove_on_break_cancels_deadline() {
+        let _guard = world_guard();
+        let saved = save_be();
+        let iron = name_to_item("raw_iron").unwrap();
+        let coal = name_to_item("coal").unwrap();
+        let warm = warm_block_range(0, 0, 15, 15);
+        set_test_region(warm.clone(), warm);
+        let pos = ow_block((4, 140, 4));
+
+        {
+            let mut fs = furnaces().lock().unwrap_or_else(|e| e.into_inner());
+            let mut active = blank_furnace();
+            active.input = (iron, 1, Vec::new());
+            active.fuel = (coal, 1, Vec::new());
+            fs.insert(pos, active);
+        }
+        rebuild_furnace_due_queue();
+        furnace_tick();
+        assert_eq!(furnace_visits(), 1);
+        assert_eq!(
+            furnace_due_queue()
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .len(),
+            1,
+            "a burning furnace re-arms itself"
+        );
+
+        // The break path removes the entry and cancels its deadline together.
+        furnaces()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(&pos);
+        remove_furnace_at(DimId::Overworld, 4, 140, 4);
+        assert!(
+            furnace_due_queue()
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .is_empty(),
+            "a broken furnace must not stay scheduled"
+        );
+
+        let before = furnace_visits();
+        for _ in 0..10 {
+            furnace_tick();
+        }
+        assert_eq!(
+            furnace_visits() - before,
+            0,
+            "no ghost visit may fire for the removed furnace"
         );
         restore_be(saved);
     }

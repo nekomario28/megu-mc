@@ -1895,6 +1895,7 @@ fn execute_write_block_data(
                 _ => return Err(unsupported()),
             }
             furnace.dirty = true;
+            wake_furnace_at(dim, x, y, z);
             return Ok(());
         }
         if key == "Items" {

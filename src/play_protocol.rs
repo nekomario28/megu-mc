@@ -14302,6 +14302,7 @@ fn handle_inner(mut s: TcpStream, live_eid: Arc<AtomicI32>) {
                                 drop(cur);
                                 drop(inv);
                                 drop(fs);
+                                wake_furnace_at(fp.0, fp.1, fp.2, fp.3);
                                 if (0..39).contains(&slot) {
                                     let mut sock = me.sock.lock().unwrap_or_else(|e| e.into_inner());
                                     for (wsl, st) in slots.iter().enumerate() {
@@ -14736,6 +14737,7 @@ fn handle_inner(mut s: TcpStream, live_eid: Arc<AtomicI32>) {
                                             hb - 6,
                                             &inv.get(&hb).cloned().unwrap_or((0, 0, Vec::new())),
                                         ); // inv hotbar window slot = 30 + (hb-36)+9?
+                                        wake_furnace_at(fp.0, fp.1, fp.2, fp.3);
                                     }
                                 } else {
                                     // inventory window: swap slot with hotbar (armor slots refuse)
@@ -15091,6 +15093,7 @@ fn handle_inner(mut s: TcpStream, live_eid: Arc<AtomicI32>) {
                                         }
                                     };
                                     resync_slot(&me, 2, slot, &cur_st);
+                                    wake_furnace_at(fp.0, fp.1, fp.2, fp.3);
                                 }
                                 continue;
                             }
@@ -19046,6 +19049,7 @@ mod p5c_live_tests {
                     fuel_cache: CachedLookup::default(),
                 },
             );
+            wake_furnace_at(dim, 0, 70, 0);
         }
         furnace_tick();
         let guard = furnaces().lock().unwrap_or_else(|e| e.into_inner());
@@ -19057,6 +19061,10 @@ mod p5c_live_tests {
         }
         drop(guard);
         furnaces().lock().unwrap_or_else(|e| e.into_inner()).clear();
+        furnace_due_queue()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clear();
         test_region_warm_remove(&(0, 0));
     }
 

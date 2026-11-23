@@ -3459,6 +3459,7 @@ fn data_sync_block_items(dim: DimId, (x, y, z): BlockPos, root: &ExecTag) {
                         f.input = slots.remove(&0).unwrap_or_default();
                         f.fuel = slots.remove(&1).unwrap_or_default();
                         f.output = slots.remove(&2).unwrap_or_default();
+                        wake_furnace_at(dim, x, y, z);
                     }
                 } else {
                     chests()
@@ -3477,6 +3478,7 @@ fn data_sync_block_items(dim: DimId, (x, y, z): BlockPos, root: &ExecTag) {
                     f.input = (0, 0, Vec::new());
                     f.fuel = (0, 0, Vec::new());
                     f.output = (0, 0, Vec::new());
+                    wake_furnace_at(dim, x, y, z);
                 }
             }
         }

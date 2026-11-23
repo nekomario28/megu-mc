@@ -2165,6 +2165,7 @@ fn game_tick_progresses_warm_furnace_and_keeps_cold_furnace_unchanged() {
     let cold_pos = (1600, 70, 1600);
     furnaces().lock().unwrap_or_else(|e| e.into_inner()).insert(ow_block(warm_pos), furnace(2));
     furnaces().lock().unwrap_or_else(|e| e.into_inner()).insert(ow_block(cold_pos), furnace(2));
+    rebuild_furnace_due_queue();
     game_tick(|_, tick| tick());
     let actual = {
         let fs = furnaces().lock().unwrap_or_else(|e| e.into_inner());
@@ -2185,6 +2186,7 @@ fn game_tick_progresses_warm_furnace_and_keeps_cold_furnace_unchanged() {
         WORLD_TIME.load(Ordering::Relaxed),
     );
     *furnaces().lock().unwrap_or_else(|e| e.into_inner()) = old_furnaces;
+    rebuild_furnace_due_queue();
     *forceloaded().lock().unwrap_or_else(|e| e.into_inner()) = old_forced;
     set_test_region(old_hot, old_warm);
     TICK.store(old_tick, Ordering::Relaxed);
@@ -3206,6 +3208,7 @@ fn profile_game_tick() {
                 furnace(if active { 64 } else { 0 }),
             );
         }
+        rebuild_furnace_due_queue();
         for _ in 0..100 {
             game_tick(|_, tick| tick());
         }

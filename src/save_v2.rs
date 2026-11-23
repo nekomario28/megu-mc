@@ -4491,6 +4491,7 @@ fn decode_world_payload(payload: &[u8]) -> Result<(), &'static str> {
                 };
                 // The legacy furnace section has no dimension byte: every entry is Overworld.
                 fs.insert((DimId::Overworld, x, y, z), fr);
+                wake_furnace_at(DimId::Overworld, x, y, z);
             }
             eprintln!("[spine] loaded {} furnaces", fs.len());
         }
@@ -5225,6 +5226,7 @@ fn decode_world_payload(payload: &[u8]) -> Result<(), &'static str> {
             let mut fs = furnaces().lock().unwrap_or_else(|e| e.into_inner());
             for (pos, fr) in dim2.furnaces {
                 fs.insert(pos, fr);
+                wake_furnace_at(pos.0, pos.1, pos.2, pos.3);
             }
         }
         {
@@ -5402,6 +5404,7 @@ fn decode_world_payload(payload: &[u8]) -> Result<(), &'static str> {
             for (key, x, y, z, furnace) in &dxt.furnaces {
                 if let Some(dim) = dxt_dim(key) {
                     fs.insert((dim, *x, *y, *z), clone_furnace_for_footer(furnace));
+                    wake_furnace_at(dim, *x, *y, *z);
                 }
             }
         }
@@ -7763,6 +7766,7 @@ fn park_evicted_chunk(dim: DimId, cx: i32, cz: i32) -> EvictedChunkArchive {
             .collect();
         for key in keys {
             if let Some(furnace) = store.remove(&key) {
+                remove_furnace_at(key.0, key.1, key.2, key.3);
                 archive.furnaces.push((key, furnace));
             }
         }
@@ -8125,6 +8129,7 @@ fn rehydrate_evicted_chunk(dim: DimId, cx: i32, cz: i32) -> bool {
                 .lock()
                 .unwrap_or_else(|e| e.into_inner())
                 .insert(pos, furnace);
+            wake_furnace_at(pos.0, pos.1, pos.2, pos.3);
         }
         for (pos, stand) in archive.brewing {
             live_brewing_stands()

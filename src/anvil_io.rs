@@ -3020,6 +3020,7 @@ fn apply_chunk_block_entities(dim: DimId, entities: &[AnvilNbt]) {
                                     fuel_cache: CachedLookup::default(),
                                 },
                             );
+                        wake_furnace_at(key.0, key.1, key.2, key.3);
                         true
                     }
                     Some(_) => {

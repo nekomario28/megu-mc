@@ -6789,6 +6789,7 @@ fn materialize_generation_payloads_inner(
                             }
                         }
                         furnace.dirty = true;
+                        wake_furnace_at(DimId::Overworld, pos.0, pos.1, pos.2);
                     }
                 }
             }
@@ -10314,6 +10315,10 @@ fn set_block_if_inner_dim(
                 );
             }
             if let Some(f) = furnaces().lock().unwrap_or_else(|e| e.into_inner()).remove(&ow_block((x, y, z))) {
+                // The block entity is gone: cancel its due-queue deadline so no
+                // ghost visit can fire for the removed furnace. The store key
+                // is Overworld-keyed like the chest/sign cleanup above.
+                remove_furnace_at(DimId::Overworld, x, y, z);
                 spill.extend(
                     [f.input.clone(), f.fuel.clone(), f.output.clone()]
                         .into_iter()
@@ -16329,8 +16334,8 @@ fn chunk_versions_3x3(dim: DimId, cx: i32, cz: i32) -> [u64; 9] {
 /// light revision — or, while light is unsettled, the 8 neighbor chunks'
 /// generated emitters in `gen`, which the fallback light arrays still read.
 fn map_chunk_sig(dim: DimId, cx: i32, cz: i32, gen: &GenSources) -> u64 {
-    const OFFSET: u64 = 0xcbf2_9ce4_8422_2325;
-    const PRIME: u64 = 0x0000_0100_0000_01b3;
+    const OFFSET: u64 = megu_core::hash::FNV1A64_OFFSET_BASIS;
+    const PRIME: u64 = megu_core::hash::FNV1A64_PRIME;
     let mut sign_acc = 0u64;
     let mut sign_count = 0u64;
     for (k, lines) in signs_in_chunk(dim, cx, cz) {
@@ -19654,11 +19659,7 @@ fn write_server_fatal_crash_report(panic_msg: &str) {
     };
     #[cfg(not(feature = "mod-suite"))]
     let (filename, body) = {
-        let mut h: u64 = 0xcbf2_9ce4_8422_2325;
-        for b in panic_msg.as_bytes() {
-            h ^= u64::from(*b);
-            h = h.wrapping_mul(0x0000_0100_0000_01b3);
-        }
+        let h: u64 = megu_core::hash::fnv1a64(panic_msg.as_bytes());
         let body = format!(
             "# Megu Server Crash Report\n\n- Subsystem: tick_thread\n- Fingerprint: {h:016x}\n- Detail: {panic_msg}\n"
         );

@@ -6,11 +6,14 @@ use super::*;
 // unchanged, which is the point: the reference is the uncached path.
 
 /// Models a datapack reload. Production only changes these mutable tables through
-/// `load_datapacks`, which bumps the revision on its single exit. A test that
-/// writes them directly must say so too, or it would be asserting that a cache
-/// observes content it has no way to know changed.
+/// `load_datapacks`, which bumps the revision on its single exit and rebuilds the
+/// furnace due queue so sleeping furnaces re-resolve under the new content. A
+/// test that writes them directly must say so too, or it would be asserting that
+/// a cache observes content it has no way to know changed. Callers must not hold
+/// the `furnaces()` lock: the rebuild reads it.
 fn pack_changed() {
     CONTENT_REVISION.fetch_add(1, Ordering::Relaxed);
+    rebuild_furnace_due_queue();
 }
 
 fn reference_tick() {
@@ -122,6 +125,9 @@ fn run(scenario: usize, tick: fn()) -> Vec<Frame> {
     let mut trace = Vec::new();
     // 160 ticks was 40s at 4TPS; the same 40s is 800 ticks at 20TPS.
     for time in 0..server_ticks(2000) as usize {
+        // `pack_changed` re-reads `furnaces()`, so it must run after the lock
+        // is released; at most one pack change fires per iteration.
+        let mut pack_dirty = false;
         {
             let mut fs = furnaces().lock().unwrap_or_else(|e| e.into_inner());
             let f = fs.get_mut(&pos).unwrap();
@@ -150,7 +156,7 @@ fn run(scenario: usize, tick: fn()) -> Vec<Frame> {
                         .lock()
                         .unwrap_or_else(|e| e.into_inner())
                         .push((Ingr::Item(diamond), gold, 2, 1.5));
-                    pack_changed();
+                    pack_dirty = true;
                 }
                 if time == server_ticks(325) as usize {
                     json_smelts().lock().unwrap_or_else(|e| e.into_inner()).clear();
@@ -160,18 +166,18 @@ fn run(scenario: usize, tick: fn()) -> Vec<Frame> {
                         2,
                         1.5,
                     ));
-                    pack_changed();
+                    pack_dirty = true;
                 }
                 if time == server_ticks(350) as usize {
                     item_tags()
                         .lock()
                         .unwrap_or_else(|e| e.into_inner())
                         .insert("test:smelt".into(), vec!["diamond".into()]);
-                    pack_changed();
+                    pack_dirty = true;
                 }
                 if time == server_ticks(425) as usize {
                     item_tags().lock().unwrap_or_else(|e| e.into_inner()).remove("test:smelt");
-                    pack_changed();
+                    pack_dirty = true;
                 }
                 if time == server_ticks(500) as usize {
                     f.input = (iron, 1, Vec::new());
@@ -180,6 +186,13 @@ fn run(scenario: usize, tick: fn()) -> Vec<Frame> {
                 }
             }
         }
+        if pack_dirty {
+            pack_changed();
+        }
+        // The direct slot writes above are what `wake_furnace_at` exists for:
+        // production writers call it at their own mutation sites, and the old
+        // full-scan tick this replaces observed every change unconditionally.
+        wake_furnace_at(pos.0, pos.1, pos.2, pos.3);
         tick();
         let fs = furnaces().lock().unwrap_or_else(|e| e.into_inner());
         let f = fs.get(&pos).unwrap();
@@ -260,6 +273,7 @@ fn nether_furnace_ticks_and_keeps_its_dimension_key() {
     furnace.input = (input, 1, Vec::new());
     furnace.fuel = (coal, 1, Vec::new());
     furnaces().lock().unwrap_or_else(|e| e.into_inner()).insert(pos, furnace);
+    wake_furnace_at(dim, 0, 70, 0);
 
     furnace_tick();
 
@@ -270,6 +284,10 @@ fn nether_furnace_ticks_and_keeps_its_dimension_key() {
     assert!(guard.get(&ow_block((0, 70, 0))).is_none());
     drop(guard);
     furnaces().lock().unwrap_or_else(|e| e.into_inner()).clear();
+    furnace_due_queue()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .clear();
     super::test_region_warm_remove(&(0, 0));
 }
 

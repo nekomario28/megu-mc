@@ -1362,33 +1362,40 @@ impl DatapackContent {
             .unwrap_or_default();
         // Recipes consult item tags while holding their own locks. Counts also
         // reads block tags under the recipe lock. Publish in that lock order.
-        let mut recipes = json_recipes().lock().unwrap_or_else(|e| e.into_inner());
-        let mut smelts = json_smelts().lock().unwrap_or_else(|e| e.into_inner());
-        let mut blocks = block_tags().lock().unwrap_or_else(|e| e.into_inner());
-        let mut items = item_tags().lock().unwrap_or_else(|e| e.into_inner());
-        let mut loot = loot_tables().lock().unwrap_or_else(|e| e.into_inner());
-        let mut loot_raw = raw_loot_tables().lock().unwrap_or_else(|e| e.into_inner());
-        let mut mob_loot = mob_loot_tables().lock().unwrap_or_else(|e| e.into_inner());
-        let mut mods = item_mods().lock().unwrap_or_else(|e| e.into_inner());
-        let mut advs = advancements().lock().unwrap_or_else(|e| e.into_inner());
-        let mut conditions = predicates().lock().unwrap_or_else(|e| e.into_inner());
-        let mut ids = recipe_ids().lock().unwrap_or_else(|e| e.into_inner());
-        let mut registry = datapack_registry().lock().unwrap_or_else(|e| e.into_inner());
-        let mut active = packs().lock().unwrap_or_else(|e| e.into_inner());
-        *recipes = self.recipes;
-        *ids = self.recipe_ids;
-        *smelts = self.smelts;
-        *blocks = block_map;
-        *items = item_map;
-        *loot = self.loot;
-        *loot_raw = self.loot_raw;
-        *mob_loot = self.mob_loot;
-        *mods = self.item_mods;
-        *advs = self.advancements;
-        *conditions = self.predicates;
-        *registry = self.registry;
-        *active = self.packs;
+        {
+            let mut recipes = json_recipes().lock().unwrap_or_else(|e| e.into_inner());
+            let mut smelts = json_smelts().lock().unwrap_or_else(|e| e.into_inner());
+            let mut blocks = block_tags().lock().unwrap_or_else(|e| e.into_inner());
+            let mut items = item_tags().lock().unwrap_or_else(|e| e.into_inner());
+            let mut loot = loot_tables().lock().unwrap_or_else(|e| e.into_inner());
+            let mut loot_raw = raw_loot_tables().lock().unwrap_or_else(|e| e.into_inner());
+            let mut mob_loot = mob_loot_tables().lock().unwrap_or_else(|e| e.into_inner());
+            let mut mods = item_mods().lock().unwrap_or_else(|e| e.into_inner());
+            let mut advs = advancements().lock().unwrap_or_else(|e| e.into_inner());
+            let mut conditions = predicates().lock().unwrap_or_else(|e| e.into_inner());
+            let mut ids = recipe_ids().lock().unwrap_or_else(|e| e.into_inner());
+            let mut registry = datapack_registry().lock().unwrap_or_else(|e| e.into_inner());
+            let mut active = packs().lock().unwrap_or_else(|e| e.into_inner());
+            *recipes = self.recipes;
+            *ids = self.recipe_ids;
+            *smelts = self.smelts;
+            *blocks = block_map;
+            *items = item_map;
+            *loot = self.loot;
+            *loot_raw = self.loot_raw;
+            *mob_loot = self.mob_loot;
+            *mods = self.item_mods;
+            *advs = self.advancements;
+            *conditions = self.predicates;
+            *registry = self.registry;
+            *active = self.packs;
+        }
         CONTENT_REVISION.fetch_add(1, Ordering::Release);
+        // A content bump can flip a sleeping furnace's smelt/fuel verdict with
+        // no slot write, so every registered furnace gets one settle visit. The
+        // rebuild runs after the publish guards drop: it takes `furnaces()`
+        // itself.
+        rebuild_furnace_due_queue();
     }
 
     fn read_entry(&mut self, pack: &mut Datapack, path: &str, body: &str) {
@@ -8801,6 +8808,7 @@ fn run_command_ctx(ctx: &CmdCtx, msg: &str, s: &mut Option<&Client>) -> String {
                             let f = fs.entry(ow_block(key)).or_insert(Furnace { input: (0,0,Vec::new()), fuel: (0,0,Vec::new()), output: (0,0,Vec::new()), burn_left: 0, progress: 0, dirty: false, xp: 0.0, recipe_cache: CachedLookup::default(), fuel_cache: CachedLookup::default() });
                             let cell = match slot { 0 => &mut f.input, 1 => &mut f.fuel, _ => &mut f.output };
                             *cell = (item, cnt, comps); f.dirty = true;
+                            wake_furnace_at(DimId::Overworld, bx, by, bz);
                         } else {
                             unpack_block_loot_if_needed(ow_block(key));
                             let mut ch = chests().lock().unwrap_or_else(|e| e.into_inner());
