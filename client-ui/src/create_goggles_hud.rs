@@ -1,0 +1,282 @@
+// SPDX-License-Identifier: LGPL-3.0-or-later OR GPL-3.0-or-later OR AGPL-3.0-or-later
+//! Create Engineer's Goggles target telemetry overlay.
+
+use crate::draw::{glyph_is_covered, palette as pal, text_width, UiColor, UiDrawList, UiRect};
+use crate::mod_i18n::UiModStrings;
+
+/// Live telemetry for the block currently inspected by Engineer's Goggles.
+#[derive(Clone, Debug, PartialEq)]
+pub struct GogglesTargetTelemetry {
+    pub block_id: String,
+    pub display_name: Option<String>,
+    /// Signed rotations per minute; the sign preserves rotation direction.
+    pub rpm: f32,
+    pub stress_impact: f32,
+    pub network_stress_used: f32,
+    pub network_stress_capacity: f32,
+    pub overstressed: bool,
+    pub processing_item: Option<String>,
+    /// Processing completion in the inclusive range `0.0..=1.0`.
+    pub processing_progress: Option<f32>,
+    /// Fluid name, current millibuckets, and capacity in millibuckets.
+    pub fluid_mb: Option<(String, u32, u32)>,
+}
+
+/// Stateless builder for the Create goggles HUD card.
+pub struct GogglesHudLayout;
+
+impl GogglesHudLayout {
+    /// Build a compact panel beside the screen center, keeping emitted
+    /// geometry inside the viewport and clear of the crosshair and hotbar.
+    pub fn build(
+        telemetry: &GogglesTargetTelemetry,
+        viewport_w: u32,
+        viewport_h: u32,
+        lang: &str,
+    ) -> UiDrawList {
+        let mut list = UiDrawList::new();
+        let scale = (viewport_h / 360)
+            .clamp(1, 4)
+            .min((viewport_w / 320).max(1));
+        if viewport_w < 96 || viewport_h < 96 {
+            return list;
+        }
+
+        let width = (viewport_w / scale) as i32;
+        let height = (viewport_h / scale) as i32;
+        let ja = lang.trim().eq_ignore_ascii_case("ja")
+            || lang.trim().replace('-', "_").eq_ignore_ascii_case("ja_jp");
+        let title = telemetry
+            .display_name
+            .as_deref()
+            .filter(|name| !name.trim().is_empty())
+            .map(str::to_owned)
+            .unwrap_or_else(|| block_title(&telemetry.block_id, lang));
+        let title = covered_text(&title);
+        let rpm = finite_or_zero(telemetry.rpm);
+        let direction = if rpm < 0.0 { "CCW" } else { "CW" };
+        let speed_line = if ja {
+            format!("スピード: {:.1} RPM {direction}", rpm.abs())
+        } else {
+            format!("Speed: {:.1} RPM {direction}", rpm.abs())
+        };
+        let used = finite_nonnegative(telemetry.network_stress_used);
+        let capacity = finite_nonnegative(telemetry.network_stress_capacity);
+        let ratio = if capacity > 0.0 { used / capacity } else { 0.0 };
+        let percent = (ratio * 100.0).round() as u32;
+        let stress_line = if ja {
+            format!("ストレス: {:.0} / {:.0} SU ({percent}%)", used, capacity)
+        } else {
+            format!("Stress: {:.0} / {:.0} SU ({percent}%)", used, capacity)
+        };
+        let impact = finite_nonnegative(telemetry.stress_impact);
+        let impact_line = if ja {
+            format!("インパクト: {impact:.0} SU")
+        } else {
+            format!("Impact: {impact:.0} SU")
+        };
+        let stress_color = if telemetry.overstressed || ratio >= 1.0 {
+            pal::DANGER
+        } else if ratio >= 0.75 {
+            pal::WARNING
+        } else {
+            pal::ACCENT
+        };
+
+        let processing = telemetry
+            .processing_item
+            .as_deref()
+            .zip(telemetry.processing_progress)
+            .map(|(item, progress)| {
+                let item = covered_text(item);
+                let progress = unit_fraction(progress);
+                let label = if ja {
+                    format!("カコウ: {item} {:.0}%", progress * 100.0)
+                } else {
+                    format!("Processing: {item} {:.0}%", progress * 100.0)
+                };
+                (label, progress)
+            });
+        let fluid = telemetry.fluid_mb.as_ref().map(|(name, current, max)| {
+            let name = covered_text(name);
+            format!("{name}: {current} / {max} mB")
+        });
+        let warning = telemetry.overstressed.then(|| {
+            if ja {
+                "カドフカ!".to_owned()
+            } else {
+                "OVERSTRESSED!".to_owned()
+            }
+        });
+
+        let mut lines = vec![title, speed_line, impact_line, stress_line];
+        if warning.is_some() {
+            lines.push(warning.clone().unwrap_or_default());
+        }
+        if let Some((label, _)) = &processing {
+            lines.push(label.clone());
+        }
+        if let Some(line) = &fluid {
+            lines.push(line.clone());
+        }
+        let row_h = 10_i32;
+        let padding_x = 6_i32;
+        let padding_y = 5_i32;
+        let max_panel_w = (width - 16).clamp(0, 288);
+        if max_panel_w < 64 {
+            return list;
+        }
+        let measured_w = lines
+            .iter()
+            .map(|line| text_width(line, 1) as i32)
+            .max()
+            .unwrap_or(0)
+            + padding_x * 2;
+        let panel_w = measured_w.clamp(96, max_panel_w);
+        let panel_h = lines.len() as i32 * row_h + padding_y * 2;
+        if panel_h > height - 8 {
+            return list;
+        }
+
+        // Keep a small gap from the center crosshair. If the right side is
+        // too narrow, put the card to its left instead.
+        let center_x = width / 2;
+        let center_y = height / 2;
+        let gap = 12_i32;
+        let margin = 4_i32;
+        let right_space = width - (center_x + gap) - margin;
+        let (panel_x, panel_w) = if right_space >= 96 {
+            (center_x + gap, panel_w.min(right_space))
+        } else {
+            (margin, panel_w.min((center_x - gap - margin).max(0)))
+        };
+        if panel_w < 64 {
+            return list;
+        }
+        let mut panel_y = center_y - panel_h / 2;
+        let hotbar_top = height - 28;
+        if panel_y + panel_h > hotbar_top {
+            panel_y = hotbar_top - panel_h;
+        }
+        panel_y = panel_y.clamp(margin, (height - margin - panel_h).max(margin));
+
+        let s = scale as i32;
+        let panel = UiRect::new(
+            panel_x * s,
+            panel_y * s,
+            (panel_w * s) as u32,
+            (panel_h * s) as u32,
+        );
+        list.fill_rect(panel, UiColor::rgba(14, 16, 22, 224));
+        list.border_rect(panel, UiColor::rgba(105, 117, 139, 240), scale);
+
+        let max_cells = ((panel_w - padding_x * 2).max(0) / 8) as usize;
+        let colors = [pal::TEXT, pal::TEXT, pal::TEXT_DIM, stress_color];
+        for (index, line) in lines.iter().enumerate() {
+            let color = if index < colors.len() {
+                colors[index]
+            } else if warning.as_deref() == Some(line.as_str()) {
+                pal::DANGER
+            } else {
+                pal::TEXT_DIM
+            };
+            let clipped = clip_text(line, max_cells);
+            list.text_str(
+                (panel_x + padding_x) * s,
+                (panel_y + padding_y + index as i32 * row_h) * s,
+                scale,
+                color,
+                &clipped,
+            );
+        }
+
+        let bar_h = 6_i32;
+        let bar_w = (panel_w - padding_x * 2).max(0);
+        let stress_bar_y = panel_y + padding_y + 4 * row_h - 1;
+        list.progress_bar(
+            UiRect::new(
+                (panel_x + padding_x) * s,
+                stress_bar_y * s,
+                (bar_w * s) as u32,
+                (bar_h * s) as u32,
+            ),
+            unit_fraction(ratio),
+            stress_color,
+            UiColor::rgba(38, 41, 48, 230),
+            UiColor::rgba(3, 4, 7, 255),
+        );
+        if let Some((_, progress)) = processing {
+            let processing_index = 4 + usize::from(warning.is_some());
+            let y = panel_y + padding_y + (processing_index as i32 + 1) * row_h - 1;
+            list.progress_bar(
+                UiRect::new(
+                    (panel_x + padding_x) * s,
+                    y * s,
+                    (bar_w * s) as u32,
+                    (bar_h * s) as u32,
+                ),
+                progress,
+                UiColor::rgb(85, 170, 220),
+                UiColor::rgba(38, 41, 48, 230),
+                UiColor::rgba(3, 4, 7, 255),
+            );
+        }
+        list
+    }
+}
+
+fn block_title(block_id: &str, lang: &str) -> String {
+    let ja = lang.trim().replace('-', "_").eq_ignore_ascii_case("ja")
+        || lang.trim().replace('-', "_").eq_ignore_ascii_case("ja_jp");
+    if ja {
+        match block_id {
+            "create:water_wheel" => return "ミズグルマ".into(),
+            "create:mechanical_press" => return "メカニカルプレス".into(),
+            "create:mechanical_mixer" => return "メカニカルミキサー".into(),
+            "create:basin" => return "バシン".into(),
+            "create:fluid_tank" => return "タンク".into(),
+            _ => {}
+        }
+    }
+    UiModStrings::default().resolve(block_id, lang)
+}
+
+fn finite_or_zero(value: f32) -> f32 {
+    if value.is_finite() {
+        value
+    } else {
+        0.0
+    }
+}
+
+fn finite_nonnegative(value: f32) -> f32 {
+    finite_or_zero(value).max(0.0)
+}
+
+fn unit_fraction(value: f32) -> f32 {
+    if value.is_finite() {
+        value.clamp(0.0, 1.0)
+    } else {
+        0.0
+    }
+}
+
+fn covered_text(text: &str) -> String {
+    text.chars()
+        .map(|c| if glyph_is_covered(c) { c } else { '?' })
+        .collect()
+}
+
+fn clip_text(text: &str, cells: usize) -> String {
+    let mut clipped = String::new();
+    let mut used = 0_u32;
+    for c in text.chars() {
+        let cell_width = crate::draw::glyph_cells(c);
+        if used + cell_width > cells as u32 {
+            break;
+        }
+        clipped.push(c);
+        used += cell_width;
+    }
+    clipped
+}
