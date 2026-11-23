@@ -18,7 +18,7 @@ use megu_client::integrated;
 use megu_client::protocol::ping_server;
 use megu_client::session::ClientSession;
 use megu_client::settings::ClientSettings;
-use megu_client::sim::run_session;
+use megu_client::sim::run_session_with_shutdown;
 
 /// Status ping gives the server ten seconds for the whole exchange —
 /// generous on a loaded loopback, short enough for an operator's patience.
@@ -141,6 +141,14 @@ fn main() -> ExitCode {
         }
     };
 
+    let shutdown = match megu_client::shutdown::install_graceful_shutdown_flag() {
+        Ok(flag) => flag,
+        Err(err) => {
+            eprintln!("megu-client: {}", cfg.redact(&err));
+            return ExitCode::FAILURE;
+        }
+    };
+
     // Real --quickPlaySingleplayer loopback: launch the integrated megu
     // server on an ephemeral port and keep the guard alive for the session.
     let mut integrated_server = None;
@@ -190,7 +198,7 @@ fn main() -> ExitCode {
     if cfg.render_png.is_some() {
         frame_pacer.begin_frame();
     }
-    match run_session(&cfg) {
+    match run_session_with_shutdown(&cfg, &shutdown) {
         Ok(summary) => {
             if cfg.render_png.is_some() {
                 frame_pacer.end_frame((summary.render_ms * 1_000.0).round() as u64);
@@ -203,6 +211,9 @@ fn main() -> ExitCode {
             ExitCode::SUCCESS
         }
         Err(err) => {
+            if shutdown.is_requested() {
+                return ExitCode::SUCCESS;
+            }
             eprintln!("megu-client: {}", cfg.redact(&err));
             ExitCode::FAILURE
         }

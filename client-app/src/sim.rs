@@ -766,6 +766,21 @@ impl SessionRunner {
 }
 
 pub fn run_session(cfg: &CliConfig) -> Result<SessionSummary, String> {
+    run_session_inner(cfg, None)
+}
+
+/// Run a session that checks `shutdown` at each bounded polling/tick boundary.
+pub fn run_session_with_shutdown(
+    cfg: &CliConfig,
+    shutdown: &crate::shutdown::ShutdownFlag,
+) -> Result<SessionSummary, String> {
+    run_session_inner(cfg, Some(shutdown))
+}
+
+fn run_session_inner(
+    cfg: &CliConfig,
+    shutdown: Option<&crate::shutdown::ShutdownFlag>,
+) -> Result<SessionSummary, String> {
     let Some((host, port)) = cfg.target_endpoint()? else {
         return Err(
             "no server target configured (pass --quickPlayMultiplayer <host[:port]> or --server <host> [--port <port>])"
@@ -848,6 +863,9 @@ pub fn run_session(cfg: &CliConfig) -> Result<SessionSummary, String> {
 
     // Phase 1: Receive JoinGame + initial spawn Teleport + initial chunk window.
     while Instant::now() < sync_deadline {
+        if shutdown.is_some_and(crate::shutdown::ShutdownFlag::is_requested) {
+            return Err("session shutdown requested".into());
+        }
         let ready = runner.play_ok
             && runner.initial_spawn_done
             && (runner.world.loaded_chunks() >= expected_window
@@ -874,6 +892,9 @@ pub fn run_session(cfg: &CliConfig) -> Result<SessionSummary, String> {
     // Phase 2: 20 Hz physics prediction + bounded greedy meshing loop.
     let tick_period = Duration::from_millis(50);
     for tick in 0..cfg.ticks {
+        if shutdown.is_some_and(crate::shutdown::ShutdownFlag::is_requested) {
+            return Err("session shutdown requested".into());
+        }
         let tick_start = Instant::now();
 
         while runner.poll_once(Duration::from_millis(1))? {}
@@ -905,6 +926,9 @@ pub fn run_session(cfg: &CliConfig) -> Result<SessionSummary, String> {
             .rebuild_dirty_bounded_ordered(16, cam, &planes)?;
 
         while let Some(rem) = tick_period.checked_sub(tick_start.elapsed()) {
+            if shutdown.is_some_and(crate::shutdown::ShutdownFlag::is_requested) {
+                return Err("session shutdown requested".into());
+            }
             if rem.is_zero() {
                 break;
             }
@@ -915,6 +939,9 @@ pub fn run_session(cfg: &CliConfig) -> Result<SessionSummary, String> {
     // Phase 3: Finish rebuilding any remaining dirty sections and drain trailing replies.
     let drain_deadline = Instant::now() + Duration::from_millis(150);
     while let Some(rem) = drain_deadline.checked_duration_since(Instant::now()) {
+        if shutdown.is_some_and(crate::shutdown::ShutdownFlag::is_requested) {
+            break;
+        }
         if rem.is_zero() {
             break;
         }

@@ -33,6 +33,7 @@
 //! ```
 
 pub mod container_screen;
+pub mod death_screen;
 pub mod draw;
 pub mod font_cjk;
 pub mod hud_widgets;
