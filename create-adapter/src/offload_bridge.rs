@@ -52,6 +52,22 @@ use mod_offload::sync_bridge::{GraphDeltaSink, MeGraphTarget, OffloadSyncBridge}
 // types without a second edge in the workspace graph.
 pub use mod_offload::sync_bridge::{BridgeError, BridgeSyncReport, ExternalGraphDelta};
 
+// The combat-motion (MOT1) and companion party-storage (PRTY) surfaces,
+// re-exported for the same single-edge reason as the sync bridge above:
+// the server wire layer names the codecs and timeline types through the
+// bridge that owns their live state.
+pub use mod_offload::combat_motion::{
+    decode_motion_trigger, encode_motion_trigger, validate_hit, ActionPhase, ActionSpec,
+    ActiveAction, ComboChain, ComboState, Hand, HitCandidate, HitShape, HitValidationVerdict,
+    MotionError, MotionTrigger, TickWindow, Vec3 as MotionVec3, MOT1_MAGIC, MOT1_PACKET_LEN,
+    MOTION_CHANNEL,
+};
+pub use mod_offload::party_storage::{
+    decode_storage, encode_storage, CompanionRecord, PlayerCompanionStorage, StorageDecodeError,
+    StorageError, StorageSlotRef, BOX_SLOTS, DEFAULT_BOX_COUNT, MAX_BOX_COUNT, PARTY_SLOTS,
+    PRTY_SCHEMA_VERSION,
+};
+
 use crate::aeronautics::RigidBodySubWorld;
 use crate::contraption_adapter::{ContraptionError, ContraptionKind, LiveContraption};
 use crate::factory::CreateFactory;
@@ -65,6 +81,10 @@ pub const MAX_ASSEMBLIES: usize = 1024;
 pub const MAX_BLOCKS_PER_ASSEMBLY: usize = 4096;
 /// Maximum simultaneously registered orbital/aeronautics 6-DOF ships.
 pub const MAX_ORBITAL_SHIPS: usize = 256;
+/// Maximum entities with a tracked combat-motion timeline.
+pub const MAX_COMBAT_MOTIONS: usize = 4096;
+/// Maximum companion/party storages attached to the bridge.
+pub const MAX_COMPANION_STORAGES: usize = 4096;
 /// Fixed orbital-ship integration step: one server tick in seconds.
 const ORBITAL_SHIP_STEP_DT: f64 = 0.05;
 /// Default per-region factory work budget, matching the main-crate bridge.
@@ -294,6 +314,15 @@ pub enum OffloadError {
     TooManyOrbitalShips { count: usize, limit: usize },
     /// Orbital ship id already registered.
     DuplicateOrbitalShip(u64),
+    /// Registration would exceed [`MAX_COMBAT_MOTIONS`].
+    TooManyCombatMotions { count: usize, limit: usize },
+    /// A combat-motion timeline rejected the step or trigger (tick
+    /// rewind, invalid spec/combo, action lock).
+    CombatMotion(MotionError),
+    /// Registration would exceed [`MAX_COMPANION_STORAGES`].
+    TooManyCompanionStorages { count: usize, limit: usize },
+    /// A `PRTY` blob failed fail-closed decoding; nothing was installed.
+    CompanionStorageDecode(StorageDecodeError),
 }
 
 /// Per-batch outcome of one [`OffloadBridge::step_tick`], in plan order.
@@ -337,6 +366,8 @@ pub struct OffloadTickReport {
     pub factory_records: usize,
     /// Orbital dimension transitions that fired this tick.
     pub orbital_transitions: usize,
+    /// Combat-motion timelines still inside a non-idle phase this tick.
+    pub combat_motions_active: usize,
     /// FNV-1a state digest after this tick — identical across worker counts.
     pub digest: u64,
 }
@@ -358,11 +389,29 @@ impl OffloadedAssembly {
     }
 }
 
+/// One entity's combat-motion state: the combo sequencing timeline plus
+/// the hit latch for the swing currently in flight.
+///
+/// The latch lives here, not inside [`ComboState`], because the kernel's
+/// [`ActiveAction::already_hit`] set is private mutation surface — the
+/// bridge validates each hit against a throwaway clone of the live action
+/// and records accepted target ids itself, resetting the set whenever a
+/// new action starts.
+#[derive(Debug)]
+struct CombatMotionEntry {
+    state: ComboState,
+    /// Target ids already hit by the in-flight action.
+    latched_hits: BTreeSet<u64>,
+}
+
 /// The offload bridge: an optional [`CreateFactory`] for kinetic/factory
 /// networks plus a capped, region-partitioned set of live contraptions,
 /// an [`OffloadSyncBridge`] feeding external/JVM graph deltas into the
-/// offload kernels, and an [`OrbitalTransitionRouter`] stepping every
-/// registered 6-DOF ship through orbital dimension transitions.
+/// offload kernels, an [`OrbitalTransitionRouter`] stepping every
+/// registered 6-DOF ship through orbital dimension transitions,
+/// server-authoritative [`combat_motion`](mod_offload::combat_motion)
+/// timelines, and companion [`party_storage`](mod_offload::party_storage)
+/// registries.
 pub struct OffloadBridge {
     factory: Option<CreateFactory>,
     assemblies: BTreeMap<u32, OffloadedAssembly>,
@@ -389,6 +438,13 @@ pub struct OffloadBridge {
     /// [`take_orbital_transitions`](Self::take_orbital_transitions) drains
     /// them (teleport intents ride out to the wire layer).
     pending_orbital_transitions: Vec<ShipDimensionTransition>,
+    /// Server-authoritative combat-motion timelines keyed by entity id —
+    /// `BTreeMap` so stepping and the digest run in canonical order.
+    combat_motions: BTreeMap<u64, CombatMotionEntry>,
+    /// Companion party + box storages keyed by owner UUID — `BTreeMap` so
+    /// the digest is canonical. Empty by default: a server that never
+    /// registers one pays nothing.
+    companion_storages: BTreeMap<[u8; 16], PlayerCompanionStorage>,
 }
 
 /// Composite [`GraphDeltaSink`] the bridge's sync path owns: kinetic,
@@ -453,6 +509,8 @@ impl OffloadBridge {
             orbital_router: OrbitalTransitionRouter::new(),
             orbital_ships: BTreeMap::new(),
             pending_orbital_transitions: Vec::new(),
+            combat_motions: BTreeMap::new(),
+            companion_storages: BTreeMap::new(),
         }
     }
 
@@ -602,6 +660,204 @@ impl OffloadBridge {
     /// for ship re-parenting and passenger teleport intents.
     pub fn take_orbital_transitions(&mut self) -> Vec<ShipDimensionTransition> {
         std::mem::take(&mut self.pending_orbital_transitions)
+    }
+
+    /// Trigger the next combo step for `entity_id` at the authoritative
+    /// server tick. The entity's [`ComboState`] is created on first use;
+    /// `chain` is the caller's action table and `speed` the server-side
+    /// attack-speed multiplier (clamped inside the kernel). A successful
+    /// trigger starts a fresh swing, so the entity's latched hit set is
+    /// cleared — a new action may hit the same targets again.
+    ///
+    /// Fails closed past [`MAX_COMBAT_MOTIONS`] or when the kernel rejects
+    /// the trigger (`TickRewind`, `ActionLocked`, invalid spec/combo).
+    pub fn trigger_combat_action(
+        &mut self,
+        entity_id: u64,
+        chain: &ComboChain,
+        now_tick: u64,
+        speed: f32,
+    ) -> Result<ActionPhase, OffloadError> {
+        if !self.combat_motions.contains_key(&entity_id)
+            && self.combat_motions.len() >= MAX_COMBAT_MOTIONS
+        {
+            return Err(OffloadError::TooManyCombatMotions {
+                count: self.combat_motions.len() + 1,
+                limit: MAX_COMBAT_MOTIONS,
+            });
+        }
+        let entry = self.combat_motions.entry(entity_id).or_insert_with(|| {
+            CombatMotionEntry {
+                state: ComboState::default(),
+                latched_hits: BTreeSet::new(),
+            }
+        });
+        let phase = entry
+            .state
+            .trigger(chain, now_tick, speed)
+            .map_err(OffloadError::CombatMotion)?
+            .phase();
+        entry.latched_hits.clear();
+        Ok(phase)
+    }
+
+    /// Advance every tracked combat-motion timeline to `now_tick` — the
+    /// same authoritative server tick [`step_tick`](Self::step_tick)
+    /// forwards. Returns how many entities are inside a non-idle phase.
+    /// Zero cost when no entity is tracked; a per-entity `TickRewind`
+    /// fails closed as [`OffloadError::CombatMotion`].
+    pub fn step_combat_motions(&mut self, now_tick: u64) -> Result<usize, OffloadError> {
+        let mut active = 0usize;
+        for entry in self.combat_motions.values_mut() {
+            let phase = entry
+                .state
+                .advance_to(now_tick)
+                .map_err(OffloadError::CombatMotion)?;
+            if phase != ActionPhase::Idle {
+                active += 1;
+            }
+        }
+        Ok(active)
+    }
+
+    /// Server-side hit validation for `attacker_id`'s in-flight action.
+    /// Untracked attackers and idle timelines fail as
+    /// [`HitValidationVerdict::OutsideActiveWindow`]; a target already
+    /// accepted this swing returns [`HitValidationVerdict::AlreadyHit`]
+    /// and everything else defers to
+    /// [`validate_hit`](mod_offload::combat_motion::validate_hit) on a
+    /// clone of the live action — accepted hits are latched bridge-side
+    /// so one sweep can never double-hit a target.
+    ///
+    /// `source`, `facing`, `candidate` and `target_action` (the target's
+    /// dodge action, if any) are authoritative server state.
+    pub fn validate_combat_hit(
+        &mut self,
+        attacker_id: u64,
+        source: MotionVec3,
+        facing: MotionVec3,
+        candidate: HitCandidate,
+        target_action: Option<&ActiveAction>,
+    ) -> HitValidationVerdict {
+        let Some(entry) = self.combat_motions.get_mut(&attacker_id) else {
+            return HitValidationVerdict::OutsideActiveWindow;
+        };
+        let Some(action) = entry.state.current() else {
+            return HitValidationVerdict::OutsideActiveWindow;
+        };
+        if entry.latched_hits.contains(&candidate.target_id) {
+            return HitValidationVerdict::AlreadyHit;
+        }
+        let mut probe = action.clone();
+        let verdict = validate_hit(&mut probe, source, facing, candidate, target_action);
+        if verdict == HitValidationVerdict::Accepted {
+            entry.latched_hits.insert(candidate.target_id);
+        }
+        verdict
+    }
+
+    /// The entity's live action snapshot — `None` when the entity is
+    /// untracked or its last action has finished (the [`ComboState`] is
+    /// retained for the combo window).
+    pub fn combat_motion(&self, entity_id: u64) -> Option<&ActiveAction> {
+        self.combat_motions
+            .get(&entity_id)
+            .and_then(|entry| entry.state.current())
+    }
+
+    /// Number of entities with a tracked combat-motion timeline.
+    pub fn combat_motion_count(&self) -> usize {
+        self.combat_motions.len()
+    }
+
+    /// Latest MOT1 wire snapshot for `entity_id` — `None` when the entity
+    /// holds no live action.
+    pub fn combat_motion_trigger(&self, entity_id: u64) -> Option<MotionTrigger> {
+        self.combat_motion(entity_id)
+            .map(|action| MotionTrigger::from_action(entity_id, action))
+    }
+
+    /// MOT1-encoded snapshot bytes — `None` when the entity holds no live
+    /// action. Encoding cannot fail here: a stored action always carries
+    /// the kernel-validated, range-clamped speed multiplier.
+    pub fn encode_combat_motion(&self, entity_id: u64) -> Option<[u8; MOT1_PACKET_LEN]> {
+        self.combat_motion_trigger(entity_id)
+            .and_then(|trigger| encode_motion_trigger(&trigger).ok())
+    }
+
+    /// Drop the entity's combat-motion timeline entirely (despawn,
+    /// logout). Returns whether a timeline existed.
+    pub fn remove_combat_motion(&mut self, entity_id: u64) -> bool {
+        self.combat_motions.remove(&entity_id).is_some()
+    }
+
+    /// Register (or replace) a player's companion party/box storage under
+    /// `owner_uuid`. Fails closed past [`MAX_COMPANION_STORAGES`] for a
+    /// new owner; replacing an existing owner never counts against the
+    /// cap.
+    pub fn register_companion_storage(
+        &mut self,
+        owner_uuid: [u8; 16],
+        storage: PlayerCompanionStorage,
+    ) -> Result<(), OffloadError> {
+        if !self.companion_storages.contains_key(&owner_uuid)
+            && self.companion_storages.len() >= MAX_COMPANION_STORAGES
+        {
+            return Err(OffloadError::TooManyCompanionStorages {
+                count: self.companion_storages.len() + 1,
+                limit: MAX_COMPANION_STORAGES,
+            });
+        }
+        self.companion_storages.insert(owner_uuid, storage);
+        Ok(())
+    }
+
+    /// Decode `bytes` as a `PRTY` blob and register it under
+    /// `owner_uuid`. Decoding is fail-closed — bad magic, a CRC mismatch,
+    /// truncation, a record invariant violation, or trailing garbage
+    /// installs nothing and keeps any existing storage untouched.
+    pub fn install_companion_storage(
+        &mut self,
+        owner_uuid: [u8; 16],
+        bytes: &[u8],
+    ) -> Result<(), OffloadError> {
+        let storage = decode_storage(bytes).map_err(OffloadError::CompanionStorageDecode)?;
+        self.register_companion_storage(owner_uuid, storage)
+    }
+
+    /// Remove and return the player's storage (logout, export, world
+    /// hand-off). `None` when no storage is registered for the owner.
+    pub fn take_companion_storage(
+        &mut self,
+        owner_uuid: &[u8; 16],
+    ) -> Option<PlayerCompanionStorage> {
+        self.companion_storages.remove(owner_uuid)
+    }
+
+    /// Read-only access to a player's companion storage.
+    pub fn companion_storage(&self, owner_uuid: &[u8; 16]) -> Option<&PlayerCompanionStorage> {
+        self.companion_storages.get(owner_uuid)
+    }
+
+    /// Mutable access to a player's companion storage — the live caller's
+    /// route for captures, slot swaps, heals and releases between ticks.
+    pub fn companion_storage_mut(
+        &mut self,
+        owner_uuid: &[u8; 16],
+    ) -> Option<&mut PlayerCompanionStorage> {
+        self.companion_storages.get_mut(owner_uuid)
+    }
+
+    /// Number of registered companion storages.
+    pub fn companion_storage_count(&self) -> usize {
+        self.companion_storages.len()
+    }
+
+    /// Canonical `PRTY` bytes for one owner's storage — the codec is
+    /// byte-deterministic, so identical state always encodes identically.
+    /// `None` when the owner has no registered storage.
+    pub fn encode_companion_storage(&self, owner_uuid: &[u8; 16]) -> Option<Vec<u8>> {
+        self.companion_storages.get(owner_uuid).map(encode_storage)
     }
 
     /// Register a live contraption under its own `id` with a stress spec.
@@ -772,6 +1028,33 @@ impl OffloadBridge {
             for v in ship.omega {
                 f.write_f64(v);
             }
+        }
+        // Combat-motion timelines: entity-id order is canonical.
+        f.write_usize(self.combat_motions.len());
+        for (entity_id, entry) in &self.combat_motions {
+            f.write_u64(*entity_id);
+            match entry.state.current() {
+                Some(action) => {
+                    f.write_bool(true);
+                    write_combat_action(&mut f, action);
+                }
+                None => {
+                    f.write_bool(false);
+                }
+            }
+            f.write_usize(entry.latched_hits.len());
+            for target in &entry.latched_hits {
+                f.write_u64(*target);
+            }
+        }
+        // Companion storages: owner-UUID order is canonical, and the
+        // PRTY codec is already byte-deterministic — folding the encoded
+        // form fingerprints every record field with zero extra codec
+        // surface.
+        f.write_usize(self.companion_storages.len());
+        for (owner_uuid, storage) in &self.companion_storages {
+            f.write_bytes(owner_uuid);
+            f.write_bytes(&encode_storage(storage));
         }
         f.finish()
     }
@@ -986,6 +1269,12 @@ impl OffloadBridge {
                 self.step_orbital_ships(ORBITAL_SHIP_STEP_DT).len();
         }
 
+        // 6. Combat-motion timelines — advance every tracked entity to
+        // the same authoritative server tick. Zero cost when empty.
+        if !self.combat_motions.is_empty() {
+            report.combat_motions_active = self.step_combat_motions(tick)?;
+        }
+
         report.batches = self
             .plan
             .batches
@@ -1084,6 +1373,7 @@ impl OffloadTickReport {
             factory_regions: 0,
             factory_records: 0,
             orbital_transitions: 0,
+            combat_motions_active: 0,
             digest: 0,
         }
     }
@@ -1105,6 +1395,76 @@ fn status_code(status: AssemblyStatus) -> u8 {
         AssemblyStatus::Overstressed => 3,
         AssemblyStatus::OverBudget => 4,
         AssemblyStatus::Halted => 5,
+    }
+}
+
+/// Deterministic fingerprint of one live combat action: spec, timeline
+/// position and the per-swing hit set, in field order — the digest never
+/// depends on `BTreeMap`/`BTreeSet` internals.
+fn write_combat_action(f: &mut FingerprintBuilder, action: &ActiveAction) {
+    let spec = action.spec();
+    f.write_u32(spec.action_id);
+    f.write_u32(spec.anticipation_ticks);
+    f.write_u32(spec.active_ticks);
+    f.write_u32(spec.recovery_ticks);
+    match spec.cancel_after_tick {
+        Some(t) => {
+            f.write_bool(true);
+            f.write_u32(t);
+        }
+        None => {
+            f.write_bool(false);
+        }
+    }
+    match spec.invulnerable_window {
+        Some(w) => {
+            f.write_bool(true);
+            f.write_u32(w.start_tick);
+            f.write_u32(w.end_tick);
+        }
+        None => {
+            f.write_bool(false);
+        }
+    }
+    f.write_u32(spec.movement_speed_factor.to_bits());
+    match spec.hit_shape {
+        HitShape::SweepArc {
+            reach,
+            half_angle_deg,
+            vertical_tolerance,
+        } => {
+            f.write_u8(0);
+            f.write_f64(reach);
+            f.write_f64(half_angle_deg);
+            f.write_f64(vertical_tolerance);
+        }
+        HitShape::ThrustCapsule { reach, radius } => {
+            f.write_u8(1);
+            f.write_f64(reach);
+            f.write_f64(radius);
+        }
+        HitShape::RadialAoe { radius } => {
+            f.write_u8(2);
+            f.write_f64(radius);
+        }
+        HitShape::ForwardCone {
+            reach,
+            half_angle_deg,
+        } => {
+            f.write_u8(3);
+            f.write_f64(reach);
+            f.write_f64(half_angle_deg);
+        }
+    }
+    f.write_u64(action.start_tick());
+    f.write_u32(action.elapsed_ticks());
+    f.write_u32(action.speed_multiplier().to_bits());
+    f.write_u8(action.hand() as u8);
+    f.write_u16(action.combo_index());
+    f.write_u8(action.phase() as u8);
+    f.write_usize(action.already_hit().len());
+    for target in action.already_hit() {
+        f.write_u64(*target);
     }
 }
 

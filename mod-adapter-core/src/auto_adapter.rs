@@ -48,15 +48,18 @@ use crate::class_mixin_scanner::{
     scan_jar_mixins_with_options, JarMixinScanReport, JarScanOptions,
 };
 use crate::culinary_adapter::{CulinaryDiscoveryStats, CulinaryRegistry};
+use crate::custom_media::{inspect_image_header, MediaFormat};
 use crate::data_loader::{
     parse_json, parse_mod_recipe_json, DataLoadError, ItemFluidIdTable, JsonValue,
     ParsedModRecipe,
 };
+use crate::dep_resolver::{plan_dep_recovery, ReloadRequirement};
 use crate::dimension_mod::{
     discover_dimension_mod_entries, DimensionModClassification, DimensionModData,
 };
 use crate::ecosystem_compat::{
-    scan_mod_jar_named, JarScanError, ModEnvironment, ModJarDescriptor,
+    scan_mod_jar_named, DualLoaderPlan, JarScanError, MissingDependency, ModEnvironment,
+    ModJarDescriptor, RUNTIME_PROVIDED_MOD_IDS,
 };
 use crate::fallback::{is_builtin_superseded_mod, REASON_SUPERSEDED};
 use crate::hard_mod_primitives::{classify_perf_or_render_mod_compat, EngineCompatDisposition};
@@ -97,6 +100,14 @@ const DEFAULT_BUNDLE_MC_RANGE: &str = "[1.21,)";
 const MAX_DATA_MEMBERS: usize = 32_768;
 const MAX_DATA_MEMBER_BYTES: u64 = 8 * 1024 * 1024;
 const MAX_DATA_SCAN_BYTES: u64 = 128 * 1024 * 1024;
+
+/// Custom-media scan budgets: at most 4096 raster members inspected and
+/// 64 MiB of decoded image payload read per JAR — a hostile archive
+/// cannot turn the media audit into an extraction bomb.
+const MAX_MEDIA_MEMBERS: usize = 4_096;
+const MAX_MEDIA_SCAN_BYTES: u64 = 64 * 1024 * 1024;
+/// How many rejected media member names one audit note may list.
+const MAX_MEDIA_REJECT_NAMES: usize = 8;
 
 /// Longest accepted scaffold `display_name` / `version` string.
 const MAX_SCAFFOLD_FIELD_CHARS: usize = 128;
@@ -457,6 +468,75 @@ fn classify_members(entries: &[crate::modpack::ZipMemberEntry], data: &mut Gener
         }
     }
     data.namespaces = namespaces.into_iter().collect();
+}
+
+/// Bounded custom-media surface scan of one listed archive: every
+/// `.png`/`.jpg`/`.jpeg` member is read under the member/byte budgets and
+/// validated through [`inspect_image_header`]'s fail-closed PNG/JPEG
+/// header + dimension checks. Valid counts and a capped reject list land
+/// in `audit_notes` — corrupt or oversize media never aborts adaptation
+/// of an otherwise valid mod.
+fn inspect_custom_media_members(
+    entries: &[crate::modpack::ZipMemberEntry],
+    jar_bytes: &[u8],
+    display: &str,
+    audit_notes: &mut Vec<String>,
+) {
+    let mut png = 0usize;
+    let mut jpeg = 0usize;
+    let mut rejected = 0usize;
+    let mut reject_names: Vec<String> = Vec::new();
+    let mut scanned = 0usize;
+    let mut bytes_read = 0u64;
+    let mut truncated = 0usize;
+    for entry in entries {
+        let lower = entry.name.to_ascii_lowercase();
+        if !(lower.ends_with(".png") || lower.ends_with(".jpg") || lower.ends_with(".jpeg")) {
+            continue;
+        }
+        if scanned >= MAX_MEDIA_MEMBERS || bytes_read >= MAX_MEDIA_SCAN_BYTES {
+            truncated += 1;
+            continue;
+        }
+        scanned += 1;
+        let outcome: Result<MediaFormat, String> = match read_zip_member(jar_bytes, entry, display) {
+            Ok(bytes) => {
+                bytes_read = bytes_read.saturating_add(bytes.len() as u64);
+                inspect_image_header(&bytes)
+                    .map(|(format, _, _)| format)
+                    .map_err(|e| e.reason().to_string())
+            }
+            Err(e) => Err(e.reason().to_string()),
+        };
+        match outcome {
+            Ok(MediaFormat::Png) => png += 1,
+            Ok(MediaFormat::Jpeg) => jpeg += 1,
+            Err(reason) => {
+                rejected += 1;
+                if reject_names.len() < MAX_MEDIA_REJECT_NAMES {
+                    reject_names.push(format!("{} ({reason})", entry.name));
+                }
+            }
+        }
+    }
+    if png + jpeg + rejected + truncated == 0 {
+        return;
+    }
+    let mut note = format!(
+        "custom media scan: {png} PNG, {jpeg} JPEG validated against the bounded header/dimension limits, {rejected} rejected"
+    );
+    if truncated > 0 {
+        note.push_str(&format!(
+            ", {truncated} media member(s) skipped past the member/byte budget"
+        ));
+    }
+    if !reject_names.is_empty() {
+        note.push_str(&format!("; rejected: {}", reject_names.join(", ")));
+        if rejected > reject_names.len() {
+            note.push_str(&format!(", plus {} more", rejected - reject_names.len()));
+        }
+    }
+    audit_notes.push(note);
 }
 
 /// Whether a `data/` member feeds [`discover_dimension_mod_entries`]:
@@ -1090,6 +1170,11 @@ pub fn auto_adapt_jar_bytes(
         ));
     }
 
+    // Custom media: validate every raster member through the bounded
+    // PNG/JPEG header inspector — corrupt or oversize payloads are
+    // counted, never fatal to an otherwise valid mod.
+    inspect_custom_media_members(&entries, jar_bytes, display, &mut audit_notes);
+
     // 8. Embedded native bundle validation.
     let mut embedded_bundle = None;
     let mut embedded_bundle_error = None;
@@ -1169,6 +1254,22 @@ pub fn auto_adapt_jar_bytes(
             "client_cosmetic_skipped: {} mixin site(s) target client-visual-only vanilla methods a dedicated server never runs — recorded, not a live-gameplay blocker",
             mixin_scan.client_cosmetic_skipped
         ));
+    }
+
+    // Hot-reload planning: the dependency resolver re-inspects the same
+    // JAR (manifest health, mixin surface, native members, and every
+    // .class method under the bounded subset VM) to decide whether
+    // dropping it into mods/ can apply without a clean restart — the
+    // verdict is advisory audit evidence, never a tier input.
+    match crate::dep_resolver::assess_hot_reload_after_add(jar_bytes) {
+        ReloadRequirement::HotReloadable { reasons } => audit_notes.push(format!(
+            "hot-reload assessment: hot-reloadable ({})",
+            reasons.join("; ")
+        )),
+        ReloadRequirement::RestartRequired { reasons } => audit_notes.push(format!(
+            "hot-reload assessment: restart required ({})",
+            reasons.join("; ")
+        )),
     }
 
     // 11. Tier synthesis.
@@ -1446,6 +1547,59 @@ pub fn auto_adapt_mods_dir(
             }
         }
         jars.push(result);
+    }
+
+    // Dependency resolution: validate every *required* dependency the
+    // adapted JARs declare against the mod ids this directory provides,
+    // then hand the missing set to the dep resolver for a verified
+    // recovery plan — Modrinth query URLs and the EN/JA operator
+    // instructions surface as report-level audit notes, exactly like the
+    // duplicate-id notes above.
+    let mut provided: BTreeSet<String> = BTreeSet::new();
+    for jar in &jars {
+        if let Some(d) = &jar.descriptor {
+            for id in &d.declared_mod_ids {
+                provided.insert(id.clone());
+            }
+            if !d.mod_id.is_empty() {
+                provided.insert(d.mod_id.clone());
+            }
+        }
+        if let Some(id) = jar.mod_id() {
+            provided.insert(id.to_string());
+        }
+    }
+    let mut missing: Vec<MissingDependency> = Vec::new();
+    for jar in &jars {
+        let Some(d) = &jar.descriptor else {
+            continue;
+        };
+        for dep in &d.dependencies {
+            if !dep.required
+                || RUNTIME_PROVIDED_MOD_IDS
+                    .iter()
+                    .any(|id| id.eq_ignore_ascii_case(&dep.mod_id))
+                || provided.contains(&dep.mod_id)
+            {
+                continue;
+            }
+            missing.push(MissingDependency {
+                mod_id: d.mod_id.clone(),
+                required_mod_id: dep.mod_id.clone(),
+                version_range: dep.version_range.clone(),
+            });
+        }
+    }
+    missing.sort_by(|a, b| (&a.mod_id, &a.required_mod_id).cmp(&(&b.mod_id, &b.required_mod_id)));
+    if !missing.is_empty() {
+        let dual_plan = DualLoaderPlan {
+            missing_dependencies: missing,
+            ..DualLoaderPlan::default()
+        };
+        let recovery = plan_dep_recovery(dir, &dual_plan, &[]);
+        for line in recovery.summary_en.lines() {
+            report_notes.push(line.to_string());
+        }
     }
     Ok(ModsDirAdaptationReport {
         dir: dir.display().to_string(),
@@ -3288,5 +3442,150 @@ mod tests {
         assert!(json.contains("megu-jar-adaptation/1"));
         assert!(json.contains("EntityDamagePre"));
         assert!(result.format_human().contains("Tier 2"));
+    }
+
+    // -------------------------------------------------------------------
+    // Lane WIRE-ADAPTER-OFFLOAD-4: custom_media + dep_resolver wiring
+    // -------------------------------------------------------------------
+
+    /// A structurally valid 1x1 PNG: signature + 13-byte IHDR + CRC slot
+    /// (the inspector reads the header only, never the CRC/pixels).
+    fn tiny_png() -> &'static [u8] {
+        &[
+            0x89, b'P', b'N', b'G', 0x0d, 0x0a, 0x1a, 0x0a, // signature
+            0x00, 0x00, 0x00, 0x0d, b'I', b'H', b'D', b'R', // IHDR len+type
+            0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x01, // 1x1
+            0x08, 0x06, 0x00, 0x00, 0x00, // depth/color/compression/filter/interlace
+            0x00, 0x00, 0x00, 0x00, // CRC (not validated)
+        ]
+    }
+
+    #[test]
+    fn custom_media_members_are_counted_in_audit_notes() {
+        let manifest = fabric_manifest("mediamod", "1.0.0", "");
+        let bytes = jar(&[
+            ("fabric.mod.json", manifest.as_bytes()),
+            (
+                "assets/mediamod/textures/painting/ok.png",
+                tiny_png(),
+            ),
+            (
+                "assets/mediamod/textures/painting/broken.png",
+                b"this is not a png".as_slice(),
+            ),
+            (
+                "assets/mediamod/textures/bad.jpg",
+                b"\xff\xd8garbage".as_slice(),
+            ),
+        ]);
+        let result = auto_adapt_jar_bytes(&bytes, "mediamod-1.0.jar", &opts())
+            .expect("media-bearing JAR adapts");
+        let note = result
+            .audit_notes
+            .iter()
+            .find(|n| n.starts_with("custom media scan:"))
+            .expect("media members produce an audit note");
+        assert!(note.contains("1 PNG"), "{note}");
+        assert!(note.contains("0 JPEG"), "{note}");
+        assert!(note.contains("2 rejected"), "{note}");
+        assert!(note.contains("broken.png"), "{note}");
+        assert!(note.contains("bad.jpg"), "{note}");
+    }
+
+    #[test]
+    fn jars_without_media_members_get_no_media_note() {
+        let result =
+            auto_adapt_jar_bytes(&bytecode_only_jar(), "javamod-9.9.jar", &opts()).unwrap();
+        assert!(!result
+            .audit_notes
+            .iter()
+            .any(|n| n.starts_with("custom media scan:")));
+    }
+
+    #[test]
+    fn hot_reload_assessment_is_recorded_per_jar() {
+        // A pure datapack has no executable surface: hot-reloadable.
+        let result =
+            auto_adapt_jar_bytes(&datapack_jar(), "tastypack-1.0.jar", &opts()).unwrap();
+        assert!(
+            result
+                .audit_notes
+                .iter()
+                .any(|n| n.starts_with("hot-reload assessment: hot-reloadable")),
+            "{:?}",
+            result.audit_notes
+        );
+        // A mixin JAR always needs a clean JVM restart.
+        let result =
+            auto_adapt_jar_bytes(&liftable_mixin_jar(), "safemod-1.0.jar", &opts()).unwrap();
+        assert!(
+            result
+                .audit_notes
+                .iter()
+                .any(|n| n.starts_with("hot-reload assessment: restart required")),
+            "{:?}",
+            result.audit_notes
+        );
+    }
+
+    #[test]
+    fn mods_dir_reports_missing_dependencies_via_dep_resolver() {
+        let dir = tmp_dir("dep-missing");
+        let needing = fabric_manifest("needymod", "1.0.0", r#","depends":{"ghostlib":">=1.0"}"#);
+        let providing = fabric_manifest("base_lib", "2.0.0", "");
+        fs::write(
+            dir.join("needymod-1.0.jar"),
+            jar(&[
+                ("fabric.mod.json", needing.as_bytes()),
+                ("data/needymod/recipes/r.json", br#"{"type":"minecraft:crafting_shapeless","ingredients":["minecraft:stick"],"result":{"id":"minecraft:torch","count":4}}"#),
+            ]),
+        )
+        .unwrap();
+        fs::write(
+            dir.join("base_lib-2.0.jar"),
+            jar(&[("fabric.mod.json", providing.as_bytes())]),
+        )
+        .unwrap();
+
+        let report = auto_adapt_mods_dir(&dir, &opts()).unwrap();
+        assert!(
+            report
+                .audit_notes
+                .iter()
+                .any(|n| n.contains("Missing mod dependencies: 1")),
+            "{:?}",
+            report.audit_notes
+        );
+        assert!(
+            report
+                .audit_notes
+                .iter()
+                .any(|n| n.contains("'ghostlib'") && n.contains("needymod")),
+            "{:?}",
+            report.audit_notes
+        );
+    }
+
+    #[test]
+    fn mods_dir_with_satisfied_dependencies_reports_none_missing() {
+        let dir = tmp_dir("dep-satisfied");
+        let needing = fabric_manifest("needymod", "1.0.0", r#","depends":{"base_lib":">=1.0"}"#);
+        let providing = fabric_manifest("base_lib", "2.0.0", "");
+        fs::write(
+            dir.join("needymod-1.0.jar"),
+            jar(&[("fabric.mod.json", needing.as_bytes())]),
+        )
+        .unwrap();
+        fs::write(
+            dir.join("base_lib-2.0.jar"),
+            jar(&[("fabric.mod.json", providing.as_bytes())]),
+        )
+        .unwrap();
+
+        let report = auto_adapt_mods_dir(&dir, &opts()).unwrap();
+        assert!(!report
+            .audit_notes
+            .iter()
+            .any(|n| n.contains("Missing mod dependencies")));
     }
 }
