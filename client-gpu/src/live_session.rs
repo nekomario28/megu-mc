@@ -16,6 +16,7 @@ use megu_client::kinetic_sync::{
 };
 use megu_client::mod_assets_meta::{
     decode_mrs1_frame, ClientModRegistry, ModMetaReport, ModTranslationTable,
+    CHANNEL_MOD_REGISTRY_SYNC,
 };
 use megu_client::online_auth::OnlineAuthOptions;
 use megu_client::protocol::{
@@ -27,7 +28,7 @@ use megu_client::protocol::{
 };
 use megu_client::render::ClientVfxHost;
 use megu_client::render_graph::GpuPipelineKind;
-use megu_client::session::{AudioStats, WorldAcousticSnapshot, CHANNEL_MOD_REGISTRY_SYNC};
+use megu_client::session::{AudioStats, WorldAcousticSnapshot};
 use megu_client::spatial_audio::{SpatialAudioPreset, SpatialSubtitleCue, SubtitleDirection};
 use megu_client::world::{BlockTable, WorldState};
 use megu_client_mesh::asset_pipeline::{CompiledAssetBundle, ResourcePackLayer};

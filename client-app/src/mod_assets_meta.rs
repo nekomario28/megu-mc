@@ -12,6 +12,9 @@ const MAX_INDEXED_ASSETS: usize = 65_535;
 const MAX_MRS_BYTES: usize = 8 * 1024 * 1024;
 const MAX_MRS_ROWS: usize = 131_072;
 
+/// Play S2C custom-payload channel carrying the `MRS1` dynamic registry frame.
+pub const CHANNEL_MOD_REGISTRY_SYNC: &str = "megu:mod_registry_sync_v1";
+
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct ModMetaReport {
     pub warnings: Vec<String>,

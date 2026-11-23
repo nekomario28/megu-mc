@@ -1730,7 +1730,9 @@ impl Drop for DecodePipeline {
 /// Repack a decoded clip into the mixer's `(mono, optional stereo)`
 /// payload — stereo assets keep L/R for the 2D bypass, everything else
 /// consumes the mono downmix.
-fn pcm_payload(pcm: &DecodedPcm) -> (Arc<Vec<f32>>, Option<Arc<Vec<[f32; 2]>>>) {
+type SharedPcmPayload = (Arc<Vec<f32>>, Option<Arc<Vec<[f32; 2]>>>);
+
+fn pcm_payload(pcm: &DecodedPcm) -> SharedPcmPayload {
     let stereo = match pcm {
         DecodedPcm::Stereo(v) => Some(Arc::new(v.clone())),
         DecodedPcm::Mono(_) => None,
