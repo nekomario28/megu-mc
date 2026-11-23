@@ -11825,7 +11825,11 @@ fn handle_inner(mut s: TcpStream, live_eid: Arc<AtomicI32>) {
                     (0, 0, 0)
                 };
                 let mut s2 = &sl[8.min(sl.len())..];
-                let face = read_varint(&mut s2).unwrap_or(1);
+                // face is a protocol i32 VarInt: sign-extend so the air-use
+                // sentinel 0xFFFFFFFF decodes to -1, not 4294967295.
+                let face = read_varint(&mut s2)
+                    .map(|v| v as u32 as i32 as i64)
+                    .unwrap_or(1);
                 // cursor (3x f32) + inside-block byte feed the placement
                 // family's click-point rules (slab absorb, door hinge).
                 let cursor = if s2.len() >= 13 {
