@@ -159,17 +159,16 @@ fn glyph_face_contains(letter_idx: usize, u: f32, v: f32) -> bool {
     const SV: f32 = 0.25; // vertical stem thickness (matches EDITION's ~10/42 px)
     const SH: f32 = 0.23; // horizontal bar thickness (matches EDITION's ~9/39 px)
     match letter_idx {
-        // M: vertical outer legs + crisp angled inner V meeting cleanly at center
+        // M: vertical outer legs + blocky squared stepped center matching `N` on the right
         0 => {
             if u <= SV || u >= 1.0 - SV {
                 return true;
             }
-            // Symmetric inward diagonal legs from top outer shoulders into center V
-            let d = (u - 0.5).abs(); // 0 at center, 0.5 at outer edges
-            // Center V bottom sits at v = 0.60, inner notch top at v = 0.30
-            let v_upper = 0.30 * (1.0 - (d / 0.28).min(1.0));
-            let v_lower = v_upper + 0.30;
-            v >= v_upper && v <= v_lower && d <= 0.30
+            // Squared stepped bridge echoing EDITION's blocky `N` & the main logo's `M`
+            let shoulder = ((0.22..=0.40).contains(&u) || (0.60..=0.78).contains(&u))
+                && (0.14..=0.40).contains(&v);
+            let center_block = (0.37..=0.63).contains(&u) && (0.34..=0.60).contains(&v);
+            shoulder || center_block
         }
         // E (fallback when EDITION's first letter cannot be isolated): exact EDITION E proportions
         1 => {
@@ -508,9 +507,21 @@ pub fn patch_edition_banner_to_megu(
     let total_w = 4.0 * glyph_w + 3.0 * letter_gap;
     let base_x = left_box.x as f32 + ((left_box.w as f32 - total_w) * 0.5).max(outline_f);
 
-    // Central vanishing-point perspective matching original `JAVA EDITION`:
+    // Central vanishing-point perspective with quadratic center falloff (`u²`):
+    // far-left `M` mirrors far-right `N` cleanly, while `E` gets only a gentle,
+    // natural lean and `G`/`U` stand nearly upright beside `EDITION`'s `E`.
     let cx_f = (width as f32) * 0.5;
-    let max_edge_lean = face_h * 0.20;
+    let max_edge_lean = face_h * 0.16;
+    let lean_at = |raw_x: f32, y_frac: f32| -> f32 {
+        let u = ((cx_f - raw_x) / cx_f).clamp(0.0, 1.0);
+        u * u * max_edge_lean * y_frac
+    };
+    let invert_lean = |sx: f32, y_frac: f32| -> f32 {
+        // Two fixed-point iterations invert `sx = raw_x + lean_at(raw_x, y_frac)` to < 0.01 px.
+        let mut rx = sx - lean_at(sx, y_frac);
+        rx = sx - lean_at(rx, y_frac);
+        rx
+    };
 
     // Blend helper for crisp stone lip shading matching EDITION.
     let blend = |a: [u8; 4], b: [u8; 4], num: u16, den: u16| -> [u8; 4] {
@@ -555,9 +566,7 @@ pub fn patch_edition_banner_to_megu(
             let y_frac = 1.0 - v;
             for hx in x_min..x_max {
                 let sx = (hx as f32 + 0.5) / ss_f;
-                // Invert `sx = raw_x + ((cx - raw_x)/cx) * max_edge_lean * y_frac`
-                let k = (max_edge_lean * y_frac) / cx_f;
-                let raw_x = (sx - max_edge_lean * y_frac) / (1.0 - k).max(0.1);
+                let raw_x = invert_lean(sx, y_frac);
                 let u = (raw_x - lx0) / glyph_w;
                 if glyph_face_contains(li, u, v) {
                     hi_face[hy * hi_w + hx] = true;
@@ -730,9 +739,8 @@ pub fn patch_edition_banner_to_megu(
         for y in y_start..y_end {
             let v = ((y as f32 - face_y0) / face_h).clamp(0.0, 1.0);
             let y_frac = 1.0 - v;
-            let k = (max_edge_lean * y_frac) / cx_f;
             for x in x_start..x_end {
-                let raw_x = (x as f32 - max_edge_lean * y_frac) / (1.0 - k).max(0.1);
+                let raw_x = invert_lean(x as f32, y_frac);
                 let src_x = e_x0 as f32 + (raw_x - dst_lx0) * scale_x;
                 if src_x < src_min_x || src_x > src_max_x {
                     continue;
