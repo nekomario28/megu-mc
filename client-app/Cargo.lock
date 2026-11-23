@@ -71,6 +71,9 @@ dependencies = [
 [[package]]
 name = "megu-client-mesh"
 version = "0.1.0"
+dependencies = [
+ "megu-core",
+]
 
 [[package]]
 name = "megu-core"
