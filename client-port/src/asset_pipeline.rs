@@ -1178,7 +1178,10 @@ fn meta_anim_frame(item: &MetaJson, frametime: u32) -> Result<AnimFrame, String>
 ///
 /// Returns `Ok(None)` when the document carries no `animation` section —
 /// the same "not animated" outcome vanilla gives a bare `.mcmeta`.
-fn animation_from_mcmeta(
+/// Resolve one `.mcmeta` text against its sibling sprite's geometry —
+/// shared by the directory loader and the zip/JAR layer loaders.
+/// `Ok(None)` means the file carries no `"animation"` section.
+pub fn animation_from_mcmeta(
     text: &str,
     frame_size: u32,
     strip_height: u32,

@@ -13,7 +13,7 @@
 
 use std::cell::UnsafeCell;
 use std::collections::{BTreeMap, VecDeque};
-use std::io::{BufWriter, Seek, SeekFrom, Write};
+use std::io::{BufWriter, Read, Seek, SeekFrom, Write};
 use std::mem::MaybeUninit;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
@@ -446,6 +446,7 @@ pub struct SubprocessSink {
     queue: Arc<PcmQueue>,
     writer_done: Arc<AtomicBool>,
     dead: Arc<AtomicBool>,
+    stderr_tail: Arc<Mutex<String>>,
     writer: Option<JoinHandle<()>>,
     finished: bool,
 }
@@ -456,13 +457,38 @@ impl SubprocessSink {
             .args(args)
             .stdin(Stdio::piped())
             .stdout(Stdio::null())
-            .stderr(Stdio::null())
+            .stderr(Stdio::piped())
             .spawn()
             .map_err(|e| format!("cannot start {prog}: {e}"))?;
         let mut stdin = child
             .stdin
             .take()
             .ok_or_else(|| format!("cannot open stdin for {prog}"))?;
+        // Drain stderr into a bounded tail buffer: when the child dies the
+        // reason it printed (e.g. `pw-cat` failing to connect to the
+        // daemon) is the only diagnostic there is.
+        let stderr_tail: Arc<Mutex<String>> = Arc::new(Mutex::new(String::new()));
+        if let Some(mut err) = child.stderr.take() {
+            let tail = stderr_tail.clone();
+            std::thread::Builder::new()
+                .name("megu-audio-stderr".to_string())
+                .spawn(move || {
+                    let mut buf = [0u8; 1024];
+                    while let Ok(n) = err.read(&mut buf) {
+                        if n == 0 {
+                            return;
+                        }
+                        if let Ok(mut t) = tail.lock() {
+                            t.push_str(&String::from_utf8_lossy(&buf[..n]));
+                            if t.len() > 4096 {
+                                let drop = t.len() - 4096;
+                                t.drain(..drop);
+                            }
+                        }
+                    }
+                })
+                .ok();
+        }
         let queue = Arc::new(PcmQueue::new(SINK_QUEUE_BYTES));
         let writer_done = Arc::new(AtomicBool::new(false));
         let dead = Arc::new(AtomicBool::new(false));
@@ -493,6 +519,7 @@ impl SubprocessSink {
             queue,
             writer_done,
             dead,
+            stderr_tail,
             writer: Some(writer),
             finished: false,
         })
@@ -511,9 +538,21 @@ impl AudioSink for SubprocessSink {
         }
         if let Some(child) = &mut self.child {
             match child.try_wait() {
-                Ok(Some(_)) => {
+                Ok(Some(status)) => {
                     self.dead.store(true, Ordering::Relaxed);
-                    return Err(format!("{} exited while streaming", self.prog));
+                    let tail = self
+                        .stderr_tail
+                        .lock()
+                        .map(|t| t.trim().to_string())
+                        .unwrap_or_default();
+                    return Err(if tail.is_empty() {
+                        format!("{} exited while streaming ({status})", self.prog)
+                    } else {
+                        format!(
+                            "{} exited while streaming ({status}): {tail}",
+                            self.prog
+                        )
+                    });
                 }
                 Ok(None) => {}
                 Err(e) => {
@@ -1224,6 +1263,19 @@ fn try_subprocess(
         .map(|s| Box::new(s) as Box<dyn AudioSink>)
 }
 
+/// The label the sink for a kind reports — lets an `auto` retry skip the
+/// backend that just died.
+fn sink_kind_label(kind: &AudioSinkKind) -> &'static str {
+    match kind {
+        AudioSinkKind::PipeWire => "pipewire",
+        AudioSinkKind::Alsa => "alsa",
+        AudioSinkKind::CoreAudio => "coreaudio",
+        AudioSinkKind::WinMm => "winmm",
+        AudioSinkKind::Null | AudioSinkKind::Off => "null",
+        _ => "unknown",
+    }
+}
+
 /// Open one native/subprocess sink candidate; `Err` text on failure so the
 /// caller can report which backends were attempted.
 fn open_native(kind: &AudioSinkKind) -> Result<Box<dyn AudioSink>, String> {
@@ -1367,6 +1419,7 @@ pub struct AudioRuntime {
     /// The deterministic mixer (event queue → voices → limited stereo).
     pub mixer: SoundMixer,
     sink: Box<dyn AudioSink>,
+    sink_kind: AudioSinkKind,
     library: Option<SoundLibrary>,
     library_tried: bool,
     assets_dir: Option<PathBuf>,
@@ -1443,6 +1496,7 @@ impl AudioRuntime {
         Self {
             mixer,
             sink,
+            sink_kind: cfg.sink.clone(),
             library: None,
             library_tried: false,
             assets_dir: cfg.assets_dir.clone(),
@@ -1733,16 +1787,39 @@ impl AudioRuntime {
             self.scratch_i16
                 .push((s.clamp(-1.0, 1.0) * 32_767.0).round() as i16);
         }
-        if self.sink.push(&self.scratch_i16).is_err() {
-            if !self.warned_null {
-                self.warned_null = true;
-                eprintln!(
-                    "megu-client audio: {} sink failed; continuing on null",
-                    self.sink.label()
-                );
-            }
+        if let Err(reason) = self.sink.push(&self.scratch_i16) {
+            let failed = self.sink.label();
+            eprintln!("megu-client audio: {failed} sink failed: {reason}");
             self.sink.finish();
-            self.sink = Box::<NullSink>::default();
+            // An `auto`-chosen subprocess dying mid-stream says nothing
+            // about the other backends — walk the remaining candidates
+            // once before going silent.
+            let mut recovered = false;
+            if self.sink_kind == AudioSinkKind::Auto {
+                for candidate in
+                    detect_available_sinks_for_os(host_os(), native_backend_available)
+                {
+                    if sink_kind_label(&candidate) == failed {
+                        continue;
+                    }
+                    if let Ok(next) = open_native(&candidate) {
+                        eprintln!(
+                            "megu-client audio: switched to {} sink",
+                            next.label()
+                        );
+                        self.sink = next;
+                        recovered = true;
+                        break;
+                    }
+                }
+            }
+            if !recovered {
+                if !self.warned_null {
+                    self.warned_null = true;
+                    eprintln!("megu-client audio: continuing on null sink");
+                }
+                self.sink = Box::<NullSink>::default();
+            }
             let _ = self.sink.push(&self.scratch_i16);
         }
         self.drain_subtitles();

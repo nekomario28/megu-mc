@@ -19,7 +19,7 @@
 use std::fmt;
 use std::path::Path;
 
-use megu_client_mesh::asset_pipeline::ResourcePackLayer;
+use megu_client_mesh::asset_pipeline::{animation_from_mcmeta, ResourcePackLayer};
 use megu_client_mesh::png_decode;
 use megu_core::zip_archive::{LazyZipIndex, ZipError};
 
@@ -262,6 +262,9 @@ fn layer_from_entries(
         name,
         ..ResourcePackLayer::default()
     };
+    // `.png.mcmeta` texts resolved once every sprite is decoded — an
+    // animation's frame size is validated against the sprite's geometry.
+    let mut pending_meta: Vec<(String, String, String)> = Vec::new();
     for entry in entries {
         let Some((ns, category, sub)) = asset_subpath(&entry.name) else {
             continue;
@@ -305,14 +308,42 @@ fn layer_from_entries(
                         }
                         Err(reason) => report.skipped.push((entry.name.clone(), reason)),
                     }
-                } else if sub.ends_with(".mcmeta") {
-                    report.skipped.push((
-                        entry.name.clone(),
-                        "zip-layer .mcmeta animations are not applied".to_owned(),
-                    ));
+                } else if let Some(stem) = sub
+                    .strip_suffix(".mcmeta")
+                    .and_then(|s| s.strip_suffix(".png").or_else(|| s.strip_suffix(".rgba")))
+                {
+                    match String::from_utf8(entry.bytes.clone()) {
+                        Ok(text) => {
+                            pending_meta.push((format!("{ns}:{stem}"), entry.name.clone(), text))
+                        }
+                        Err(_) => report
+                            .skipped
+                            .push((entry.name.clone(), "mcmeta not valid UTF-8".to_owned())),
+                    }
                 }
             }
             _ => {}
+        }
+    }
+    for (sprite_key, display, text) in pending_meta {
+        let Some(&(width, height, _)) = layer.sprites.get(&sprite_key) else {
+            report.skipped.push((
+                display,
+                format!("animation has no sibling sprite {sprite_key:?}"),
+            ));
+            continue;
+        };
+        // A (0, 0, _) sprite is an undecodable-PNG marker already counted
+        // in `skipped`; there is no strip to animate.
+        if width == 0 && height == 0 {
+            continue;
+        }
+        match animation_from_mcmeta(&text, width, height) {
+            Ok(Some(animation)) => {
+                layer.animations.insert(sprite_key, animation);
+            }
+            Ok(None) => {}
+            Err(reason) => report.skipped.push((display, reason)),
         }
     }
     layer
