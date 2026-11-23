@@ -18894,6 +18894,44 @@ fn megu_startup_banner() {
     print!("{MEGU_BANNER}");
 }
 
+/// Best-effort redacted crash report written to `crash-reports/` when the
+/// authoritative tick thread panics. Never overwrites the last good world save
+/// and never panics if the filesystem is read-only or full.
+fn write_server_fatal_crash_report(panic_msg: &str) {
+    let dir = std::path::Path::new("crash-reports");
+    if std::fs::create_dir_all(dir).is_err() {
+        return;
+    }
+    #[cfg(feature = "mod-suite")]
+    let (filename, body) = {
+        let ctx = megu_core::crash_report::CrashContext::new(
+            "tick_panic",
+            "megu-server",
+            "1.21.1",
+            panic_msg,
+        );
+        let fp = ctx.fingerprint();
+        let md = ctx.markdown_summary();
+        (format!("crash-server-{fp}.md"), md)
+    };
+    #[cfg(not(feature = "mod-suite"))]
+    let (filename, body) = {
+        let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+        for b in panic_msg.as_bytes() {
+            h ^= u64::from(*b);
+            h = h.wrapping_mul(0x0000_0100_0000_01b3);
+        }
+        let body = format!(
+            "# Megu Server Crash Report\n\n- Subsystem: tick_thread\n- Fingerprint: {h:016x}\n- Detail: {panic_msg}\n"
+        );
+        (format!("crash-server-{h:016x}.md"), body)
+    };
+    let path = dir.join(filename);
+    if std::fs::write(&path, body).is_ok() {
+        eprintln!("[FATAL] wrote crash report: {}", path.display());
+    }
+}
+
 fn main() {
     // Startup flags first, before anything reads the world, the config or a
     // socket: `--help`/`--version` return inside the parser, `--dir` relocates
@@ -20033,6 +20071,7 @@ fn main() {
             // must not replace the last good save. (The panic also poisons every
             // Mutex it held; the lock().unwrap() calls elsewhere are left as they are.)
             if let Err(msg) = connection_limits::catch_panic(|| game_tick(|_, tick| tick())) {
+                write_server_fatal_crash_report(&msg);
                 eprintln!("[FATAL] tick thread panicked: {msg}; exiting so the server restarts");
                 std::process::exit(70);
             }

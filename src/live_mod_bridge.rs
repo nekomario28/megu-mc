@@ -2439,6 +2439,51 @@ fn live_take_orbital_transitions()
         .take_orbital_transitions()
 }
 
+#[cfg(feature = "mod-suite")]
+#[allow(dead_code)]
+fn live_format_romaji_chat(raw: &str, mode: megu_core::romaji_ime::RomajiChatMode) -> String {
+    let cfg = megu_core::romaji_ime::RomajiChatConfig {
+        mode,
+        ..megu_core::romaji_ime::RomajiChatConfig::default()
+    };
+    megu_core::romaji_ime::format_romaji_chat(raw, &cfg)
+}
+
+#[cfg(feature = "mod-suite")]
+#[allow(dead_code)]
+fn live_tier25_batch_coalescer() -> &'static Mutex<megu_core::tier25_guard_batch::TickBatchCoalescer>
+{
+    static COALESCER: OnceLock<Mutex<megu_core::tier25_guard_batch::TickBatchCoalescer>> =
+        OnceLock::new();
+    COALESCER.get_or_init(|| Mutex::new(megu_core::tier25_guard_batch::TickBatchCoalescer::new()))
+}
+
+#[cfg(feature = "mod-suite")]
+#[allow(dead_code)]
+fn live_tier25_submit_guarded(
+    loader: megu_core::tier25_guard_batch::LoaderLane,
+    guard: &megu_core::tier25_guard_batch::GuardPredicate,
+    ctx: &megu_core::tier25_guard_batch::GuardEvalContext,
+    record: megu_core::tier25_guard_batch::BatchEventRecord,
+) -> Result<bool, megu_core::tier25_guard_batch::Tier25Error> {
+    live_tier25_batch_coalescer()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .submit_guarded(loader, guard, ctx, record)
+}
+
+#[cfg(feature = "mod-suite")]
+#[allow(dead_code)]
+fn live_tier25_flush_tick(
+    tick: u64,
+    loader: megu_core::tier25_guard_batch::LoaderLane,
+) -> Option<Vec<u8>> {
+    live_tier25_batch_coalescer()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .flush_tick(tick, loader)
+}
+
 // ===========================================================================
 // Tests
 // ===========================================================================
