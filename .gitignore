@@ -105,3 +105,18 @@ Thumbs.db
 /.agents/
 /.claude/
 /.cursor/
+
+# Local Mojang-derived inputs excluded from the public repository
+/datapacks/vanilla/
+/assets/block_states_1211.json
+/config_packets.bin
+/tests/data/biome_probe_1211.tsv
+/tests/data/vanilla_vectors_1211.tsv
+/tests/data/biome_probe_ties_1211.tsv
+/tests/data/random_next_int_1211.tsv
+/resourcepack.zip
+/assets/pblocks.json
+/assets/properties.json
+/assets/**/*_1211*
+/tests/data/**/*_1211*
+/evidence/**/*unit.jsonl
