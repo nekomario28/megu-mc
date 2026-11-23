@@ -83,8 +83,8 @@ cargo build --locked --release
 
 Megu は `LGPL-3.0-or-later` の完全無料 OSS です。継続的な CI 維持・実機 GPU 検証・互換検証はコミュニティの支援によって支えられています：
 
-- **個人・法人スポンサー**: **[GitHub Sponsors](https://github.com/sponsors/nekomario28)**
-- **ホスティング事業者・法人提携窓口**: `partners@megumin.tech`（**[megu.megumin.tech/#support](https://megu.megumin.tech/#support)**）
+- **個人・法人スポンサー**: **[GitHub Sponsors (`github.com/sponsors/nekomario28`)](https://github.com/sponsors/nekomario28)**
+- **ホスティング事業者・法人提携窓口**: **[partners@megumin.tech](mailto:partners@megumin.tech)**
 
 ## ライセンス
 

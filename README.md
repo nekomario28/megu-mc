@@ -84,7 +84,7 @@ See **[Contributing](CONTRIBUTING.md)** and our **[Code of Conduct](CODE_OF_COND
 Megu is 100% free and open-source software under `LGPL-3.0-or-later`. Recurring infrastructure, CI runners, and hardware testing are supported by the community:
 
 - **GitHub Sponsors**: **[github.com/sponsors/nekomario28](https://github.com/sponsors/nekomario28)**
-- **Hosting & Commercial Partnerships**: `partners@megumin.tech` (**[megu.megumin.tech/#support](https://megu.megumin.tech/#support)**)
+- **Hosting & Commercial Partnerships**: **[partners@megumin.tech](mailto:partners@megumin.tech)**
 
 ## License
 
