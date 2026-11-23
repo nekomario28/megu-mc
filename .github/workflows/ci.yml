@@ -15,7 +15,9 @@ permissions:
 jobs:
   rust:
     runs-on: ubuntu-latest
-    timeout-minutes: 20
+    timeout-minutes: 45
+    env:
+      CARGO_BUILD_JOBS: 2
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
@@ -24,10 +26,22 @@ jobs:
       - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master
         with:
           toolchain: 1.98.0
+          components: clippy
+      - uses: actions/setup-java@cf277c60eb25467037889841efdb72551f06f6c3 # v4
+        with:
+          distribution: temurin
+          java-version: '21'
       # Fast and independent of the compiler: the plan states numbers about what is left to do, and
       # a number nothing checks drifts.
-      - name: Debt is frozen at today's count, and must not grow
-        run: bash tools/debt_ratchet.sh
+      - name: Debt, provenance (zero-GL/zero-embed), TUI, 3-OS installer, workflow & website gates
+        run: |
+          bash tools/debt_ratchet.sh
+          python3 tools/provenance_check.py --strict-zero-gl
+          python3 tests/release_workflow_test.py
+          python3 tests/megu_tui_test.py
+          python3 tests/installer_cross_os_test.py
+          python3 website/check_site.py
+          node website/test_functions.mjs
       - name: Install the required dependency inspector from an immutable revision
         env:
           GXKIT_REV: d6b9ad8db4774919c8b4fb032342e53b2548b660
@@ -62,13 +76,15 @@ jobs:
           python3 tests/biome_spawn_oracle_test.py
           python3 tests/weird_sampler_oracle_test.py
           python3 tests/suite_compare_test.py
-      - name: Standalone crates (12 crates, locked)
+      - name: Standalone crates (12 crates, locked + Clippy -D warnings)
         run: |
           for d in core proto state-store server-files mod-offload mod-adapter-core create-adapter client-kernel client-port client-ui client-app; do
             echo "=== $d ==="
+            cargo clippy --manifest-path "$d/Cargo.toml" --all-targets --locked -- -D warnings
             cargo test --manifest-path "$d/Cargo.toml" --locked
           done
-          echo "=== client-gpu (check) ==="
+          echo "=== client-gpu (clippy + check) ==="
+          cargo clippy --manifest-path client-gpu/Cargo.toml --all-targets --locked -- -D warnings
           cargo check --manifest-path client-gpu/Cargo.toml --all-targets --locked
       - name: Build (locked)
         run: |
