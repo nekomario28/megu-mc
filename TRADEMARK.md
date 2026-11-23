@@ -3,7 +3,7 @@
 This document explains how you may use the **Megu** name, the Megu voxel cube logo (`website/logo.svg`), and related marks (`Megu Official`, `Megu Certified Host`, `Megu Cloud`).
 
 > **Open-source code freedom vs. trademark clarity:**  
-> The Megu (`megu`) source code is licensed under [`LGPL-3.0-or-later`](COPYING.LESSER). Nothing in this policy restricts your rights under `LGPL-3.0-or-later` to use, study, modify, self-host, or redistribute the software. Trademark rules exist solely to prevent confusion about what is official and to protect users from misleading or unauthorized commercial offerings.
+> The Megu (`megu`) source code is licensed under [`LGPL-3.0-or-later`](LICENSE). Nothing in this policy restricts your rights under `LGPL-3.0-or-later` to use, study, modify, self-host, or redistribute the software. Trademark rules exist solely to prevent confusion about what is official and to protect users from misleading or unauthorized commercial offerings.
 
 ---
 

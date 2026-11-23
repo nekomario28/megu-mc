@@ -4,7 +4,7 @@
 > **This is an inventory of facts only. It is not a legal opinion** and does not assert the license or redistribution status of any file. See §1 for development versus export contents and LICENSING.md §5 for release blockers.
 
 - 対象リビジョン / Revision: `perf/worldgen-parallel` / `main` (2026-11-20)
-- リポジトリのコード本体は `GPL-3.0-or-later OR LGPL-3.0-or-later` ([LICENSE](LICENSE), [COPYING.LESSER](COPYING.LESSER), [LICENSING.md](LICENSING.md)) です。以下の表は、**リポジトリ内にコミットされているがオリジナルのコードではないもの**(または過去に出所確認を行った資産)の一覧です。
+- リポジトリのコード本体は `LGPL-3.0-or-later` ([LICENSE](LICENSE), 付随 GPLv3 [docs/COPYING.GPL](docs/COPYING.GPL), [LICENSING.md](LICENSING.md)) です。以下の表は、**リポジトリ内にコミットされているがオリジナルのコードではないもの**(または過去に出所確認を行った資産)の一覧です。
 - 作成日 / Written: 2026-10-25 (Asia/Tokyo), 更新: 2026-11-20
 
 **出所の列の意味 / Origin column**
@@ -40,7 +40,7 @@
 
 ## 2. Rust 依存クレートのライセンス / Rust dependency licenses
 
-`cargo metadata --format-version 1 --locked --all-features` (Cargo.lock, 2026-10-25) の `license` フィールドをそのまま転記したもの。`cargo-deny` (`deny.toml`) が CI で同じ集合を検査します。`megu` 自体は `Cargo.toml` で `license = "LGPL-3.0-or-later"` を宣言しています (`COPYING.LESSER` / 付随 `LICENSE` と一致)。依存クレート 78 個に GPL / LGPL / AGPL / MPL のものはありません (LICENSING.md §2a)。
+`cargo metadata --format-version 1 --locked --all-features` (Cargo.lock, 2026-10-25) の `license` フィールドをそのまま転記したもの。`cargo-deny` (`deny.toml`) が CI で同じ集合を検査します。`megu` 自体は `Cargo.toml` で `license = "LGPL-3.0-or-later"` を宣言しています (`LICENSE` / 付随 `docs/COPYING.GPL` と一致)。依存クレート 78 個に GPL / LGPL / AGPL / MPL のものはありません (LICENSING.md §2a)。
 Copied verbatim from the `license` field of each crate's published metadata; this is what the crates declare, not an independent verification of their license texts. 78 crates (optional JNI adapters included).
 
 | crate | version | license (as declared) | 種別 |

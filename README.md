@@ -182,6 +182,6 @@ Megu のクライアント・サーバー機能はすべて **`LGPL-3.0-or-later
 
 ## ライセンスとクリーンルーム方針
 
-本プロジェクトのコードは **`LGPL-3.0-or-later`**（[LICENSE](LICENSE) / [COPYING.LESSER](COPYING.LESSER)・LGPLv3 付随の [COPYING.GPL](COPYING.GPL)・[NOTICE](NOTICE)・[LICENSING.md](LICENSING.md)）で配布されます。Fabric / NeoForge 互換レイヤ経由で実行時に読み込まれる独立した外部 Mod JAR は派生物とみなさず、コピーレフトは波及しません。
+本プロジェクトのコードは **`LGPL-3.0-or-later`**（[LICENSE](LICENSE)・LGPLv3 付随の [docs/COPYING.GPL](docs/COPYING.GPL)・[NOTICE](NOTICE)・[LICENSING.md](LICENSING.md)）で配布されます。Fabric / NeoForge 互換レイヤ経由で実行時に読み込まれる独立した外部 Mod JAR は派生物とみなさず、コピーレフトは波及しません。
 
 すべての最適化サブシステムは標準的なコンピュータグラフィックス／システムアルゴリズムに基づく **100% クリーンルームのオリジナル Rust 実装** であり、Mojang の逆コンパイルコード・アセット・PolyForm Shield・All Rights Reserved のソースコードやシェーダーは一切コピー・同梱していません。寄稿は `LGPL-3.0-or-later` 提供と DCO（`git commit -s`）を前提とします。

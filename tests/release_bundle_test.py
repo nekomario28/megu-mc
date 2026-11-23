@@ -20,9 +20,7 @@ BINARIES = (
 )
 DOCUMENTS = (
     "LICENSE",
-    "COPYING.GPL",
-    "COPYING.LESSER",
-    "COPYING.AGPL",
+    "docs/COPYING.GPL",
     "NOTICE",
     "LICENSING.md",
     "THIRD_PARTY.md",

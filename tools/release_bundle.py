@@ -20,7 +20,7 @@ Inside the tarball every member lives under the single directory
 `megu-<version>-<target>/`:
 
   <prefix>/<binary basename>                     each release binary (0755)
-  <prefix>/LICENSE, COPYING.GPL, COPYING.LESSER, COPYING.AGPL, NOTICE,
+  <prefix>/LICENSE, docs/COPYING.GPL, NOTICE,
       LICENSING.md, THIRD_PARTY.md, README.md    (0644)
   <prefix>/docs/mod-author-guide.md              (0644)
   <prefix>/tools/vanilla_data/gen_vanilla_data.sh
@@ -97,9 +97,7 @@ SUMS_NAME = "SHA256SUMS"
 
 REQUIRED_DOCS = (
     "LICENSE",
-    "COPYING.GPL",
-    "COPYING.LESSER",
-    "COPYING.AGPL",
+    "docs/COPYING.GPL",
     "NOTICE",
     "LICENSING.md",
     "THIRD_PARTY.md",

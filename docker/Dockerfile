@@ -69,7 +69,7 @@ COPY --from=builder /build/mod-adapter-core/target/release/megu-mod-check /usr/l
 
 # The same payload the release bundle ships: licence texts plus the tools a
 # public user needs (modpack pre-flight, vanilla-data regeneration).
-COPY COPYING.LESSER NOTICE LICENSING.md THIRD_PARTY.md /opt/megu/
+COPY LICENSE docs/COPYING.GPL NOTICE LICENSING.md THIRD_PARTY.md /opt/megu/
 COPY tools/mod_launcher.py /opt/megu/tools/mod_launcher.py
 COPY tools/vanilla_data/gen_vanilla_data.sh tools/vanilla_data/version_pack.py /opt/megu/tools/vanilla_data/
 COPY docker/entrypoint.sh /opt/megu/entrypoint.sh

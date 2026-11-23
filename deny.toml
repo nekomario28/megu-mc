@@ -34,14 +34,12 @@ allow = [
     "Unlicense",
     "Unicode-3.0",
     "CDLA-Permissive-2.0", # webpki-roots (Mozilla CA bundle)
-    "GPL-3.0-or-later",    # root crate megu (LICENSE)
-    "LGPL-3.0-or-later",   # root crate megu (COPYING.LESSER)
-    "AGPL-3.0-or-later",   # root crate megu (COPYING.AGPL)
+    "LGPL-3.0-or-later",   # root crate and workspace crates (LICENSE)
 ]
 confidence-threshold = 0.93
 
 # The root crate and first-party code use `LGPL-3.0-or-later` (Cargo.toml,
-# LICENSING.md, COPYING.LESSER). LICENSE carries GPLv3 terms referenced by LGPLv3.
+# LICENSING.md, LICENSE). docs/COPYING.GPL carries GPLv3 terms referenced by LGPLv3.
 # Every third-party Rust dependency in Cargo.lock is permissive
 # (MIT / Apache-2.0 / ISC / BSD-3-Clause / Zlib / 0BSD / Unlicense / Unicode-3.0 / CDLA-Permissive-2.0),
 # which is compatible with LGPL-3.0-or-later (see LICENSING.md).

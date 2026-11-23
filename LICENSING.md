@@ -1,7 +1,7 @@
 # LICENSING.md — ライセンスの選択に関する技術的整理 / Engineering notes on the licence choice
 
 > **法的助言でも法的結論でもありません。** リポジトリの中身・依存・上流の表示から読み取れる事実と、そこから言える技術的なリスクの整理です。
-> **Status (2026-11-22 更新): 本体の配布ライセンスは `LGPL-3.0-or-later` に統一されました（[LICENSE](LICENSE) / [COPYING.LESSER](COPYING.LESSER) = GNU LGPL v3.0 or later、全 16 の Cargo.toml マニフェストの `license = "LGPL-3.0-or-later"`）。LGPLv3 が要求する GPLv3 付随文として [COPYING.GPL](COPYING.GPL)（GNU GPL v3.0）を同梱します。**
+> **Status (2026-11-22 更新): 本体の配布ライセンスは `LGPL-3.0-or-later` に統一されました（[LICENSE](LICENSE) = GNU LGPL v3.0 or later、全 16 の Cargo.toml マニフェストの `license = "LGPL-3.0-or-later"`）。LGPLv3 が要求する GPLv3 付随文として [docs/COPYING.GPL](docs/COPYING.GPL)（GNU GPL v3.0）を同梱します。**
 > これにより、`MIT` / `Apache-2.0` / `BSD` / `LGPL-2.1` / `LGPL-3.0` のコード（C2ME、Lithium、NeoForge、Fabric など）と完全互換であり、LGPLv3 §2 により下流利用者は GPLv3 での利用・再配布も可能です。また、Fabric / NeoForge 互換レイヤ経由で動的ロードされる独立した外部 Mod JAR には本体のコピーレフトを波及させません。
 
 ## 1. 変更の経緯 / License evolution
@@ -12,7 +12,7 @@
 | 2026-10-26 (#23) | `Apache-2.0` を提案として設定 | `THIRD_PARTY.md` / `LICENSING.md` §5 の来歴整理を並行実施 |
 | 2026-11-19 (Stage F1) | 旧 `assets/pblocks.json`, `assets/properties.json`, `resourcepack.zip` を完全削除 (`git rm`) | `tools/provenance_check.py` で再混入を禁止、`tools/export_public_branch.sh` を整備 |
 | 2026-11-20 | 本体 `GPL-3.0-or-later` ＋ 寄稿 `LGPL-3.0-or-later OR GPL-3.0-or-later OR AGPL-3.0-or-later` | `LICENSE` (GPL-3.0), `COPYING.LESSER` (LGPL-3.0), `COPYING.AGPL` (AGPL-3.0), `Cargo.toml`, `NOTICE`, `deny.toml`, `CONTRIBUTING.md`, `README.md` を統一。さらに `git filter-repo --invert-paths` により過去全履歴から旧 `pblocks.json`, `properties.json`, `resourcepack.zip`, 不要 `*.storyboard.png`, 誤コミット `.jar`/`.class`/`.pyc` を完全抹消済み |
-| **2026-11-22 (現在)** | **本体・寄稿ともに `LGPL-3.0-or-later` 単一ライセンスに統一** | 全 16 `Cargo.toml` の `license` を `LGPL-3.0-or-later` に統一（`tools/offload_ffi_probe`・`tools/storage_bench` は新規追加、ルート・`tools/palette_bench` は `GPL-3.0-or-later` から、各クレートはトリプル表記から変更）。`tools/provenance_check.py` の `LICENSE_MANIFESTS` を全 16 マニフェストに拡張し、`README.md` / `LICENSING.md` / `CONTRIBUTING.md` / `NOTICE` を単一ライセンス表記に更新。`LICENSE` / `COPYING.LESSER` (LGPLv3) と `COPYING.GPL` (GPLv3 付随文) を同梱 |
+| **2026-11-22 (現在)** | **本体・寄稿ともに `LGPL-3.0-or-later` 単一ライセンスに統一** | 全 16 `Cargo.toml` の `license` を `LGPL-3.0-or-later` に統一（`tools/offload_ffi_probe`・`tools/storage_bench` は新規追加、ルート・`tools/palette_bench` は `GPL-3.0-or-later` から、各クレートはトリプル表記から変更）。`tools/provenance_check.py` の `LICENSE_MANIFESTS` を全 16 マニフェストに拡張し、`README.md` / `LICENSING.md` / `CONTRIBUTING.md` / `NOTICE` を単一ライセンス表記に更新。ルートは `LICENSE` (LGPLv3) のみとし、GPLv3 付随文を `docs/COPYING.GPL` に同梱 |
 
 ## 2. 互換性の分析 / Compatibility analysis
 
@@ -48,9 +48,9 @@
 
 ## 3. 単一 `LGPL-3.0-or-later` ライセンスの設計
 
-1. **本体・寄稿ともに `LGPL-3.0-or-later` に統一（[LICENSE](LICENSE) / [COPYING.LESSER](COPYING.LESSER) / [CONTRIBUTING.md](CONTRIBUTING.md)）**:
+1. **本体・寄稿ともに `LGPL-3.0-or-later` に統一（[LICENSE](LICENSE) / [CONTRIBUTING.md](CONTRIBUTING.md)）**:
    - 全ワークスペースの `Cargo.toml` は `license = "LGPL-3.0-or-later"` を宣言し、`tools/provenance_check.py` が全 16 マニフェストの `license` 宣言を常時検査します。
-   - LGPLv3 が要求する GPLv3 付随文として [COPYING.GPL](COPYING.GPL) を同梱します。
+   - LGPLv3 が要求する GPLv3 付随文として [docs/COPYING.GPL](docs/COPYING.GPL) を同梱します。
    - LGPLv3 §2 は、利用者が本ソフトウェアを GPLv3 の条件で利用・頒布することを認めており、追加の許諾なしに下流での GPLv3 利用が可能です。`or later` により将来の LGPL バージョンへの移行も可能です。
 2. **C2ME (`MIT`)・Lithium (`LGPL-3.0`)・NeoForge (`LGPL-2.1`)・Fabric (`Apache-2.0`) との完全互換と隔離原則**:
    - **C2ME (`MIT`)** や **Lithium (`LGPL-3.0`)**、**NeoForge (`LGPL-2.1`)**、**Fabric (`Apache-2.0`)** は、`LGPL-3.0-or-later` と**完全互換**です。

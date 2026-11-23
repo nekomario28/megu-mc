@@ -29,10 +29,8 @@ def check_docs(root):
     assert re.search(r'^license\s*=\s*"LGPL-3.0-or-later"$', (root / 'Cargo.toml').read_text(), re.M)
     assert re.search(r'GNU LESSER GENERAL PUBLIC LICENSE\s+Version 3',
                      (root / 'LICENSE').read_text())
-    assert re.search(r'GNU LESSER GENERAL PUBLIC LICENSE\s+Version 3',
-                     (root / 'COPYING.LESSER').read_text())
     assert re.search(r'GNU GENERAL PUBLIC LICENSE\s+Version 3',
-                     (root / 'COPYING.GPL').read_text())
+                     (root / 'docs/COPYING.GPL').read_text())
     notice = (root / 'NOTICE').read_text()
     assert 'does not contain Mojang data' not in ' '.join(notice.split())
     for name in TSVS:
