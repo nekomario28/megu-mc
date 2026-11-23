@@ -17,7 +17,11 @@ from container_wire import stack, wire_stack
 from protocol767 import ROOT, Reader, position, string, vint
 from wire_smoke import port
 
-JAVA = Path("/usr/lib/jvm/java-21-openjdk")
+ROOT_TOOLS = ROOT / "tools"
+sys.path.insert(0, str(ROOT_TOOLS))
+from java_toolchain import require_java_home, tool_path
+
+JAVA = require_java_home()
 CLASSPATH = ROOT / "compat/neoforge-events/.build/classpath.txt"
 MOD_ID = "wire_fixture"
 CHANNEL = MOD_ID + ":echo"
@@ -151,7 +155,7 @@ def compile_mod(root):
     source.write_text(MOD)
     classes = root / "classes"
     subprocess.run(
-        [str(JAVA / "bin/javac"), "--release", "21", "-proc:none", "-cp",
+        [str(tool_path(JAVA, "javac")), "--release", "21", "-proc:none", "-cp",
          CLASSPATH.read_text().strip(), "-d", str(classes), str(source)],
         check=True, timeout=30,
     )

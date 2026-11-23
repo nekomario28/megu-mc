@@ -16,6 +16,8 @@ from urllib.request import urlopen
 from zipfile import ZipFile, ZipInfo
 
 ROOT = Path(__file__).resolve().parents[2]
+sys.path.insert(0, str(ROOT / "tools"))
+from java_toolchain import require_java_home
 ADAPTER = ROOT / "compat/neoforge-events"
 SURFACE = ADAPTER / "shim-surface.json"
 SCANNER = Path("java/net/megu/neoforge/ShimCheck.java")
@@ -253,9 +255,7 @@ def main():
     parser.add_argument("--format", choices=("json", "markdown"), default="json")
     parser.add_argument("--java-home", type=Path)
     args = parser.parse_args()
-    java_home = args.java_home or Path("/usr/lib/jvm/java-21-openjdk")
-    if args.java_home is None and not java_home.is_dir() and os.environ.get("JAVA_HOME"):
-        java_home = Path(os.environ["JAVA_HOME"])
+    java_home = args.java_home or require_java_home()
     java_home = java_home.resolve()
     tmp = ROOT / "target/tmp"
     try:

@@ -145,7 +145,7 @@ class NeoForgeS1S4BoundaryTests(unittest.TestCase):
             path.write_text(content)
             paths.append(str(path))
         compiled = subprocess.run(
-            [str(JAVA / "javac"), "-J-Xmx128m", "--release", "21", "-proc:none",
+            [str(s1_fixture.tool_path(JAVA, "javac")), "-J-Xmx128m", "--release", "21", "-proc:none",
              "-cp", cls.fixture.cp, "-d", str(cls.fixture.classes), *paths],
             cwd=ROOT, env=cls.fixture.env, capture_output=True, text=True)
         if compiled.returncode:

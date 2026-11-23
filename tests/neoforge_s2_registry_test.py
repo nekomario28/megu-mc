@@ -11,7 +11,10 @@ import unittest
 
 ROOT = Path(__file__).resolve().parents[1]
 ADAPTER = ROOT / "compat/neoforge-events"
-JAVA = Path("/usr/lib/jvm/java-21-openjdk/bin")
+sys.path.insert(0, str(ROOT / "tools"))
+from java_toolchain import require_java_home, tool_path
+
+JAVA = require_java_home()
 
 MOD_A = """package s2a;
 import net.minecraft.core.registries.Registries;
@@ -258,7 +261,7 @@ class NeoForgeS2RegistryTests(unittest.TestCase):
         cls.addClassCleanup(workspace.cleanup)
         cls.root = Path(workspace.name)
         if not (ADAPTER / ".build/classpath.txt").is_file():
-            cls.checked(sys.executable, ADAPTER / "build.py", "--java-home", JAVA.parent)
+            cls.checked(sys.executable, ADAPTER / "build.py", "--java-home", JAVA)
         cls.cp = (ADAPTER / ".build/classpath.txt").read_text().strip()
         compiled = cls.root / "compiled"
         fixtures = {
@@ -279,14 +282,14 @@ class NeoForgeS2RegistryTests(unittest.TestCase):
         # Compile mod API calls against the pinned upstream NeoForge classes.
         # At runtime only the adapter's copy of the registry facade is first.
         upstream = ADAPTER / ".cache/neoforge-21.1.172-universal.jar"
-        cls.checked(JAVA / "javac", "--release", "21", "-proc:none", "-cp",
+        cls.checked(tool_path(JAVA, "javac"), "--release", "21", "-proc:none", "-cp",
                     os.pathsep.join((str(upstream), cls.cp)), "-d", compiled,
                     source("net/minecraft/world/level/ItemLike", """package net.minecraft.world.level;
 public interface ItemLike { net.minecraft.world.item.Item asItem(); }
 """),
                     *(source(name, code) for name, code in fixtures.values()))
         cls.runner = cls.root / "runner"
-        cls.checked(JAVA / "javac", "--release", "21", "-proc:none", "-cp", cls.cp,
+        cls.checked(tool_path(JAVA, "javac"), "--release", "21", "-proc:none", "-cp", cls.cp,
                     "-d", cls.runner, source("net/megu/neoforge/S2Checks", RUNNER))
 
         cls.jars = {}
@@ -315,7 +318,7 @@ public interface ItemLike { net.minecraft.world.item.Item asItem(); }
         target.parent.mkdir(parents=True)
         shutil.copyfile(compiled / (name + ".class"), target)
         jar = staging.with_suffix(".jar")
-        cls.checked(JAVA / "jar", "--create", "--file", jar, "-C", staging, ".")
+        cls.checked(tool_path(JAVA, "jar"), "--create", "--file", jar, "-C", staging, ".")
         return jar
 
     def game(self, label, *mods):
@@ -327,11 +330,11 @@ public interface ItemLike { net.minecraft.world.item.Item asItem(); }
         return game
 
     def run_boot(self, *args):
-        return self.checked(JAVA / "java", "-cp", os.pathsep.join((str(self.runner), self.cp)),
+        return self.checked(tool_path(JAVA, "java"), "-cp", os.pathsep.join((str(self.runner), self.cp)),
                             "net.megu.neoforge.S2Checks", *args)
 
     def shimcheck(self, *jars):
-        return self.run_process(JAVA / "java", "-cp", self.cp, "net.megu.neoforge.ShimCheck",
+        return self.run_process(tool_path(JAVA, "java"), "-cp", self.cp, "net.megu.neoforge.ShimCheck",
                                 "--json", "--surface", ADAPTER / "shim-surface.json", *jars)
 
     def test_shimcheck_accepts_s2_mod_jars(self):

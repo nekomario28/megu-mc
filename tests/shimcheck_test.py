@@ -12,7 +12,10 @@ import zipfile
 ROOT = Path(__file__).resolve().parents[1]
 ADAPTER = ROOT / "compat" / "neoforge-events"
 TOOL = ROOT / "tools" / "shimcheck.py"
-JAVA_HOME = Path("/usr/lib/jvm/java-21-openjdk")
+sys.path.insert(0, str(ROOT / "tools"))
+from java_toolchain import require_java_home, tool_path
+
+JAVA_HOME = require_java_home()
 
 MODS_TOML = '''modLoader="javafml"
 loaderVersion="[1,)"
@@ -264,7 +267,7 @@ public @interface Redirect { String method(); At at(); }
             destination.parent.mkdir(parents=True, exist_ok=True)
             destination.write_text(contents)
             source_paths.append(str(destination))
-        subprocess.run([str(JAVA_HOME / "bin/javac"), "-J-Xmx128m", "--release", "21", "-proc:none",
+        subprocess.run([str(tool_path(JAVA_HOME, "javac")), "-J-Xmx128m", "--release", "21", "-proc:none",
                         "-cp", cls.cp, "-d", str(cls.output), *source_paths],
                        cwd=ROOT, env=cls.env, check=True, capture_output=True)
 

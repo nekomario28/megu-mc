@@ -12,7 +12,10 @@ import zipfile
 
 ROOT = Path(__file__).resolve().parents[1]
 ADAPTER = ROOT / "compat/neoforge-events"
-JAVA = Path("/usr/lib/jvm/java-21-openjdk/bin")
+sys.path.insert(0, str(ROOT / "tools"))
+from java_toolchain import require_java_home, tool_path
+
+JAVA = require_java_home()
 MOD_TOML = '''modLoader="javafml"
 loaderVersion="[1,)"
 license="MIT"
@@ -381,7 +384,7 @@ class NeoForgeS1EventsTests(unittest.TestCase):
         cls.root = Path(cls.workspace.name)
         if not (ADAPTER / ".build/classpath.txt").is_file():
             subprocess.run([sys.executable, str(ADAPTER / "build.py"),
-                            "--java-home", str(JAVA.parent)], cwd=ROOT, env=cls.env,
+                            "--java-home", str(JAVA)], cwd=ROOT, env=cls.env,
                            capture_output=True, check=True)
         cls.cp = (ADAPTER / ".build/classpath.txt").read_text().strip()
         sources = {
@@ -399,7 +402,7 @@ class NeoForgeS1EventsTests(unittest.TestCase):
         cls.classes = cls.root / "classes"
         cls.classes.mkdir()
         compiled = subprocess.run(
-            [str(JAVA / "javac"), "-J-Xmx128m", "--release", "21", "-proc:none",
+            [str(tool_path(JAVA, "javac")), "-J-Xmx128m", "--release", "21", "-proc:none",
              "-cp", cls.cp, "-d", str(cls.classes),
              *map(str, sorted(src.rglob("*.java")))],
             cwd=ROOT, env=cls.env, capture_output=True, text=True,
@@ -423,7 +426,7 @@ class NeoForgeS1EventsTests(unittest.TestCase):
         cls.workspace.cleanup()
 
     def run_java(self, main, *args):
-        return subprocess.run([str(JAVA / "java"), "-Djava.io.tmpdir=" + str(ROOT / "target/tmp"),
+        return subprocess.run([str(tool_path(JAVA, "java")), "-Djava.io.tmpdir=" + str(ROOT / "target/tmp"),
                                "-cp", os.pathsep.join((str(self.classes), self.cp)),
                                main, *map(str, args)],
                               cwd=ROOT, env=self.env, capture_output=True, text=True, timeout=30)

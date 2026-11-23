@@ -17,6 +17,8 @@ from wire_smoke import status
 
 
 ROOT = Path(__file__).resolve().parents[1]
+JAVA_EXECUTABLE = str(Path(tempfile.gettempdir()) / "megu-test-jdk" / "bin" /
+                      ("java.exe" if os.name == "nt" else "java"))
 TOOLS = ROOT / "tools/client_launcher"
 
 
@@ -405,7 +407,7 @@ with socket.socket() as listener:
     def test_java_profile_sha256_pin_has_priority_over_environment(self):
         valid_sha256 = hashlib.sha256(self.stub.read_bytes()).hexdigest()
         result, log = self.invocation(
-            "/usr/lib/jvm/java-21-openjdk/bin/java",
+            JAVA_EXECUTABLE,
             "-Djava.io.tmpdir=" + tempfile.gettempdir(),
             "-Dmegu.clientSha256=" + valid_sha256,
             "-XX:-UsePerfData", "-jar",
@@ -417,7 +419,7 @@ with socket.socket() as listener:
         self.assertTrue(log.exists())
 
         result, log = self.invocation(
-            "/usr/lib/jvm/java-21-openjdk/bin/java",
+            JAVA_EXECUTABLE,
             "-Djava.io.tmpdir=" + tempfile.gettempdir(),
             "-Dmegu.clientSha256=" + "0" * 64,
             "-XX:-UsePerfData", "-jar",
@@ -588,7 +590,7 @@ Path(os.environ['TEST_NATIVE_LOG']).write_text(json.dumps(sys.argv[1:]))
         log = self.root / "prism-native.json"
         env = dict(os.environ, TEST_NATIVE_LOG=str(log))
         env.pop("MEGU_CLIENT_BIN", None)
-        result = subprocess.run([*command, "/usr/lib/jvm/java-21-openjdk/bin/java", "-Xmx2G",
+        result = subprocess.run([*command, JAVA_EXECUTABLE, "-Xmx2G",
                                  "-cp", "minecraft.jar", "net.minecraft.client.main.Main",
                                  "--username", "Steve", "--uuid", "test-uuid", "--accessToken",
                                  "super-secret-token", "--assetIndex", "17", "--gameDir",

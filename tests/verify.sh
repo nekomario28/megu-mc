@@ -237,7 +237,7 @@ timeout 180 python3 tests/client_vanilla_parity.py
 # --features neoforge-events plus the downloaded Java classpath, which the
 # public clean-room checkout does not ship. Where the pieces exist, gate.
 if [ -f compat/neoforge-events/.build/classpath.txt ] \
-    && [ -x /usr/lib/jvm/java-21-openjdk/bin/javac ]; then
+    && command -v javac >/dev/null 2>&1; then
   cargo build --offline --locked -j 2 --features neoforge-events \
       --message-format=json-render-diagnostics >"$build_manifest"
   neoforge_binary=$(python3 tools/cargo_executable.py <"$build_manifest")

@@ -10,7 +10,10 @@ import zipfile
 
 ROOT = Path(__file__).resolve().parents[1]
 ADAPTER = ROOT / "compat/neoforge-events"
-JAVA = Path("/usr/lib/jvm/java-21-openjdk")
+sys.path.insert(0, str(ROOT / "tools"))
+from java_toolchain import require_java_home, tool_path
+
+JAVA = require_java_home()
 METADATA = ('modLoader="javafml"\nloaderVersion="[1,)"\nlicense="MIT"\n'
             '[[mods]]\nmodId="nf5_fixture"\nversion="1.0.0"\ndisplayName="S4 fixture"\n')
 
@@ -430,7 +433,7 @@ class NeoForgeS4NetworkTests(unittest.TestCase):
         src = cls.root / f"{name}.java"
         src.write_text(source)
         compiled = cls.root / name
-        cls.checked(JAVA / "bin/javac", "--release", "21", "-proc:none", "-encoding", "UTF-8",
+        cls.checked(tool_path(JAVA, "javac"), "--release", "21", "-proc:none", "-encoding", "UTF-8",
                     "-cp", classpath or cls.classpath, "-d", compiled, src)
         jar = destination / f"{name}.jar"
         with zipfile.ZipFile(jar, "w") as archive:
@@ -464,8 +467,8 @@ class NeoForgeS4NetworkTests(unittest.TestCase):
     def test_dimension_codec_uses_exact_keys_and_rejects_unknown_worlds(self):
         source = self.root / "DimensionCheck.java"
         source.write_text(DIMENSION_CODEC)
-        self.checked(JAVA / "bin/javac", "--release", "21", "-cp", self.classpath, "-d", self.root, source)
-        self.checked(JAVA / "bin/java", "-cp", os.pathsep.join([str(self.root), self.classpath]), "DimensionCheck")
+        self.checked(tool_path(JAVA, "javac"), "--release", "21", "-cp", self.classpath, "-d", self.root, source)
+        self.checked(tool_path(JAVA, "java"), "-cp", os.pathsep.join([str(self.root), self.classpath]), "DimensionCheck")
 
     def test_rust_jni_payloads_capabilities_and_frozen_registry(self):
         output = self.checked(
@@ -482,9 +485,9 @@ class NeoForgeS4NetworkTests(unittest.TestCase):
     def test_configuration_dispatch_and_block_entity_activation_boundaries(self):
         source = self.root / "BridgeCheck.java"
         source.write_text(BRIDGE_RUNNER)
-        self.checked(JAVA / "bin/javac", "--release", "21", "-cp", self.classpath, "-d", self.root, source)
+        self.checked(tool_path(JAVA, "javac"), "--release", "21", "-cp", self.classpath, "-d", self.root, source)
         classpath = os.pathsep.join([str(self.root), self.classpath])
-        self.checked(JAVA / "bin/java", "-cp", classpath, "net.megu.neoforge.BridgeCheck", self.root)
+        self.checked(tool_path(JAVA, "java"), "-cp", classpath, "net.megu.neoforge.BridgeCheck", self.root)
 
 
 if __name__ == "__main__":

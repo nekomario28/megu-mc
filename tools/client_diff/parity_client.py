@@ -21,6 +21,9 @@ import uuid
 import zlib
 
 ROOT = Path(__file__).resolve().parents[2]
+sys.path.insert(0, str(ROOT / "tools"))
+from java_toolchain import require_java_home, tool_path  # noqa: E402
+
 sys.path.insert(0, str(ROOT / "tests"))
 from container_wire import stack, wire_stack  # noqa: E402
 from protocol767 import (Client, Reader, AIR_STATES, WIRE_BLOCKS, frame,  # noqa: E402
@@ -37,7 +40,7 @@ OAK_LOG = (132, 1)
 OAK_PLANKS = (36, 4)
 EMPTY_STACK = (0, 0)
 SLAB_END = (3.5, 240.5, 3.5)
-JAVA = Path("/usr/lib/jvm/java-21-openjdk/bin/java")
+JAVA = tool_path(require_java_home(), "java")
 JAR = Path(os.environ.get("MEGU_VANILLA_JAR", str(Path.home() / ".cache/megu-audit/load/server.jar")))
 JAR_SHA1 = "59353fb40c36d304f2035d51e7d6e6baa98dc05c"
 RCON_PASS = "local-client-diff-probe"

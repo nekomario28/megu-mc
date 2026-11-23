@@ -11,7 +11,10 @@ import zipfile
 
 ROOT = Path(__file__).resolve().parents[1]
 ADAPTER = ROOT / "compat/neoforge-events"
-JAVA = Path("/usr/lib/jvm/java-21-openjdk")
+sys.path.insert(0, str(ROOT / "tools"))
+from java_toolchain import require_java_home, tool_path
+
+JAVA = require_java_home()
 CAPACITY = 256 * 1024
 SEQUENCE = 0x8000_0000_0100_0002
 GENERATION = 0x8000_0003
@@ -293,14 +296,14 @@ class NeoForgeS3BatchTests(unittest.TestCase):
         cls.checked("rustc", "--edition=2021", "--cfg", 'feature="neoforge-events"', codec, "-o", cls.codec)
         source = cls.root / "BatchCheck.java"
         source.write_text(BATCH_RUNNER)
-        cls.checked(JAVA / "bin/javac", "--release", "21", "-cp", classpath.strip(), "-d", cls.root, source)
+        cls.checked(tool_path(JAVA, "javac"), "--release", "21", "-cp", classpath.strip(), "-d", cls.root, source)
 
     @classmethod
     def pack_mod(cls, name, source):
         src = cls.root / f"{name}.java"
         src.write_text(source)
         compiled = cls.root / name
-        cls.checked(JAVA / "bin/javac", "--release", "21", "-proc:none", "-encoding", "UTF-8",
+        cls.checked(tool_path(JAVA, "javac"), "--release", "21", "-proc:none", "-encoding", "UTF-8",
                     "-cp", (cls.root / "classpath.txt").read_text().strip(), "-d", compiled, src)
         metadata = ('modLoader="javafml"\nloaderVersion="[1,)"\nlicense="MIT"\n'
                     '[[mods]]\nmodId="nf4_fixture"\nversion="1.0.0"\ndisplayName="S3 fixture"\n')
@@ -381,7 +384,7 @@ class NeoForgeS3BatchTests(unittest.TestCase):
         response = self.root / "batch-response"
         response.unlink(missing_ok=True)
         request.write_bytes(frame(*records, header=b"S3\x01\x00"))
-        stdout = self.checked(JAVA / "bin/java", "-cp", os.pathsep.join([str(self.root), classpath]),
+        stdout = self.checked(tool_path(JAVA, "java"), "-cp", os.pathsep.join([str(self.root), classpath]),
                               "BatchCheck", self.root, request, response)
         return stdout, response
 

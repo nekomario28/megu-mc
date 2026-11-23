@@ -16,9 +16,12 @@ import urllib.request
 
 ROOT = pathlib.Path(__file__).resolve().parents[2]
 TMP = ROOT / "target" / "tmp"
-JAVA_HOME = pathlib.Path("/usr/lib/jvm/java-21-openjdk").resolve()
-JAVA = JAVA_HOME / "bin" / "java"
-JAVAC = JAVA_HOME / "bin" / "javac"
+sys.path.insert(0, str(ROOT / "tools"))
+from java_toolchain import require_java_home, tool_path
+
+JAVA_HOME = require_java_home().resolve()
+JAVA = tool_path(JAVA_HOME, "java")
+JAVAC = tool_path(JAVA_HOME, "javac")
 N_RUNS = 3
 RSS_SETTLE_SECONDS = 12
 

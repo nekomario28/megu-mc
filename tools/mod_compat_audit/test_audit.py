@@ -8,13 +8,16 @@ import sys
 import unittest
 
 HERE = Path(__file__).resolve().parent
+ROOT = HERE.parents[1]
+sys.path.insert(0, str(ROOT / "tools"))
+from java_toolchain import require_java_home
 
 
 class AuditTest(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
         result = subprocess.run(
-            [sys.executable, str(HERE / "audit.py"), "--java-home", "/usr/lib/jvm/java-21-openjdk", "--format", "json"],
+            [sys.executable, str(HERE / "audit.py"), "--java-home", str(require_java_home()), "--format", "json"],
             capture_output=True, text=True,
         )
         if result.returncode:

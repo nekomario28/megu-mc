@@ -4,13 +4,13 @@
 import argparse
 import os
 from pathlib import Path
-import shutil
 import subprocess
 import sys
 
 ROOT = Path(__file__).resolve().parents[1]
 ADAPTER = ROOT / "compat" / "neoforge-events"
 DEFAULT_SURFACE = ADAPTER / "shim-surface.json"
+from java_toolchain import resolve_java_home, tool_path
 
 
 def main() -> int:
@@ -21,17 +21,12 @@ def main() -> int:
     parser.add_argument("jars", nargs="+", type=Path, metavar="mod.jar")
     args = parser.parse_args()
 
-    java_home = args.java_home
-    if java_home is None:
-        candidates = [Path("/usr/lib/jvm/java-21-openjdk")]
-        if os.environ.get("JAVA_HOME"):
-            candidates.append(Path(os.environ["JAVA_HOME"]))
-        java_home = next((item for item in candidates if (item / "bin/java").is_file()), None)
+    java_home = args.java_home or resolve_java_home()
     if java_home is None:
         print("shimcheck: Java 21 not found (use --java-home)", file=sys.stderr)
         return 1
-    java = java_home / "bin/java"
-    javac = java_home / "bin/javac"
+    java = tool_path(java_home, "java")
+    javac = tool_path(java_home, "javac")
     if not java.is_file() or not javac.is_file():
         print(f"shimcheck: missing Java tools in {java_home}", file=sys.stderr)
         return 1

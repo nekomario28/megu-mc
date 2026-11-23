@@ -13,8 +13,11 @@ from zipfile import ZIP_DEFLATED, ZipFile, ZipInfo
 ROOT = Path(__file__).resolve().parents[1]
 ADAPTER = ROOT / "compat/fabric-probe"
 GATE = ADAPTER / "fabric_shimcheck.py"
-JAVA_HOME = Path(os.environ.get("JAVA_HOME", "/usr/lib/jvm/java-21-openjdk"))
-JAVAC = os.environ.get("JAVAC", str(JAVA_HOME / "bin/javac"))
+sys.path.insert(0, str(ROOT / "tools"))
+from java_toolchain import require_java_home, tool_path
+
+JAVA_HOME = require_java_home()
+JAVAC = os.environ.get("JAVAC", str(tool_path(JAVA_HOME, "javac")))
 
 STUBS = {
     "net/fabricmc/api/ModInitializer.java": "package net.fabricmc.api; public interface ModInitializer { void onInitialize(); }",
@@ -305,7 +308,7 @@ def runtime_checks(work, static_paths):
         return jar
 
     def run(runtime, batch, *jars, exit_code=0):
-        proc = subprocess.run([str(JAVA_HOME / "bin/java"), "-jar", str(runtime), str(GATE), batch,
+        proc = subprocess.run([str(tool_path(JAVA_HOME, "java")), "-jar", str(runtime), str(GATE), batch,
                                *map(str, jars)], capture_output=True, text=True, cwd=ROOT, timeout=60)
         assert proc.returncode == exit_code, (proc.returncode, proc.stdout, proc.stderr)
         log = [line for line in proc.stderr.splitlines() if not line.startswith("Picked up JAVA_TOOL_OPTIONS:")]

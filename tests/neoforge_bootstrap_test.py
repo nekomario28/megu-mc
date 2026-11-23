@@ -11,7 +11,10 @@ import zipfile
 
 ROOT = Path(__file__).resolve().parents[1]
 ADAPTER = ROOT / "compat/neoforge-events"
-JAVA = Path("/usr/lib/jvm/java-21-openjdk/bin")
+sys.path.insert(0, str(ROOT / "tools"))
+from java_toolchain import require_java_home, tool_path
+
+JAVA = require_java_home()
 TOML = '''modLoader="javafml"
 loaderVersion="[1,)"
 license="MIT"
@@ -223,7 +226,7 @@ class NeoForgeBootstrapTests(unittest.TestCase):
         cls.workspace = tempfile.TemporaryDirectory(prefix="neoforge-nf1-", dir=tmp)
         cls.root = Path(cls.workspace.name)
         if not (ADAPTER / ".build/classpath.txt").exists():
-            subprocess.run([sys.executable, str(ADAPTER / "build.py"), "--java-home", str(JAVA.parent)],
+            subprocess.run([sys.executable, str(ADAPTER / "build.py"), "--java-home", str(JAVA)],
                            cwd=ROOT, env=cls.env, check=True, capture_output=True)
         cls.cp = (ADAPTER / ".build/classpath.txt").read_text().strip()
         src = cls.root / "src"
@@ -233,7 +236,7 @@ class NeoForgeBootstrapTests(unittest.TestCase):
             path.write_text(source)
         cls.classes = cls.root / "classes"
         cls.classes.mkdir()
-        subprocess.run([str(JAVA / "javac"), "-J-Xmx128m", "--release", "21", "-proc:none",
+        subprocess.run([str(tool_path(JAVA, "javac")), "-J-Xmx128m", "--release", "21", "-proc:none",
                         "-cp", cls.cp, "-d", str(cls.classes),
                         *map(str, sorted(src.rglob("*.java")))],
                        cwd=ROOT, env=cls.env, capture_output=True, text=True, check=True)
@@ -261,7 +264,7 @@ class NeoForgeBootstrapTests(unittest.TestCase):
         return directory
 
     def run_java(self, name, *args):
-        result = subprocess.run([str(JAVA / "java"), "-cp", os.pathsep.join((str(self.classes), self.cp)),
+        result = subprocess.run([str(tool_path(JAVA, "java")), "-cp", os.pathsep.join((str(self.classes), self.cp)),
                                  name, *map(str, args)], cwd=self.root, env=self.env,
                                 text=True, capture_output=True, timeout=30)
         self.assertEqual(result.returncode, 0, (result.stdout, result.stderr))

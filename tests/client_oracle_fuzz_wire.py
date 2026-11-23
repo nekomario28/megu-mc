@@ -47,10 +47,11 @@ DEFAULT_CLIENT = ROOT / "client-app/target/release/megu-client"
 DEFAULT_SERVER = ROOT / "target/debug/megu"
 DEFAULT_JAR = Path(os.environ.get("MEGU_VANILLA_JAR", str(Path.home() / ".cache/megu-audit/load/server.jar")))
 JAR_SHA1 = "59353fb40c36d304f2035d51e7d6e6baa98dc05c"
-JAVA_CANDIDATES = (
-    Path("/usr/lib/jvm/java-21-openjdk/bin/java"),
-    Path("/usr/lib/jvm/default/bin/java"),
-)
+sys.path.insert(0, str(ROOT / "tools"))
+from java_toolchain import resolve_java_home, tool_path
+
+JAVA_HOME = resolve_java_home()
+JAVA_CANDIDATES = (tool_path(JAVA_HOME, "java"),) if JAVA_HOME else ()
 
 PROTOCOL = 767
 USERNAME = "OracleBot"

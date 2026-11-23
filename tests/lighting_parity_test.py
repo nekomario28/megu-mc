@@ -21,9 +21,12 @@ from protocol767 import Client
 
 
 ROOT = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(ROOT / "tools"))
+from java_toolchain import require_java_home, tool_path
+
 VANILLA_JAR = Path(os.environ.get("MEGU_VANILLA_JAR", str(Path.home() / ".cache/megu-audit/load/server.jar")))
 VANILLA_SHA1 = "59353fb40c36d304f2035d51e7d6e6baa98dc05c"
-JAVA = "/usr/lib/jvm/java-21-openjdk/bin/java"
+JAVA = str(tool_path(require_java_home(), "java"))
 SECTION_COUNT = 26
 SECTION_BYTES = 2048
 ZERO_SECTION = bytes(SECTION_BYTES)
