@@ -4674,6 +4674,7 @@ fn decode_world_payload(payload: &[u8]) -> Result<(), &'static str> {
                         dz,
                         age,
                         bit,
+                        dip: 0,
                     });
                     bump(eid, &mut mx);
                 }
