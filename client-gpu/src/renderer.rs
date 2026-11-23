@@ -10114,7 +10114,72 @@ impl GpuRenderer {
                 [0.0, 0.0, 0.0, 1.0],
             ];
 
-            // Translucent terrain (water, stained glass) through the
+            // Draw-order contract: every depth-writing opaque draw —
+            // terrain (above), opaque 6-DOF sub-worlds, instanced
+            // mechanical parts, entities/BER — lands before the first
+            // alpha-blended one, so translucent terrain water
+            // depth-tests against and blends over submerged Create
+            // water wheels, cogwheels, shafts and contraptions.
+            // Alpha-blended sub-worlds and particles follow water;
+            // debug lines draw last.
+
+            // 6-DOF sub-worlds, opaque entries (airship hulls, planets,
+            // contraptions).
+            let mut drew_opaque_subworld = false;
+            for entry in subworld_gpu.entries() {
+                if entry.index_count == 0 || entry.alpha < 0.999 {
+                    continue;
+                }
+                if !drew_opaque_subworld {
+                    pass.set_pipeline(shadow.map_or(&gpu.lit_pipeline, |s| &s.lit_color));
+                    pass.set_bind_group(0, &gpu.lit_frame_bg, &[]);
+                    drew_opaque_subworld = true;
+                }
+                let model = entry.transform.model_matrix();
+                let off = slot(model, 1.0, entry.alpha);
+                pass.set_bind_group(1, &gpu.draw_bg, &[off]);
+                pass.set_vertex_buffer(0, entry.vertex_buffer().slice(..));
+                pass.set_index_buffer(entry.index_buffer().slice(..), wgpu::IndexFormat::Uint32);
+                pass.draw_indexed(0..entry.index_count, 0, 0..1);
+            }
+            // Opaque GPU-instanced mechanical parts (Create water
+            // wheels, cogwheels, shafts, presses).
+            let mut drew_instanced = false;
+            for batch in subworld_gpu.batches() {
+                if batch.index_count == 0 || batch.instance_count == 0 {
+                    continue;
+                }
+                if !drew_instanced {
+                    pass.set_pipeline(
+                        shadow.map_or(&gpu.instanced_pipeline, |s| &s.instanced_color),
+                    );
+                    pass.set_bind_group(0, &gpu.lit_frame_bg, &[]);
+                    drew_instanced = true;
+                }
+                let model = batch.transform.model_matrix();
+                let off = slot(model, 1.0, 1.0);
+                pass.set_bind_group(1, &gpu.draw_bg, &[off]);
+                pass.set_vertex_buffer(0, batch.template_vertex_buffer().slice(..));
+                pass.set_vertex_buffer(1, batch.instance_buffer().slice(..));
+                pass.set_index_buffer(
+                    batch.template_index_buffer().slice(..),
+                    wgpu::IndexFormat::Uint32,
+                );
+                pass.draw_indexed(0..batch.index_count, 0, 0..batch.instance_count);
+                instanced_draws += 1;
+            }
+            // Opaque entities and block entities.
+            if let Some(mesh) = entity_ber {
+                pass.set_pipeline(shadow.map_or(&gpu.lit_pipeline, |s| &s.lit_color));
+                pass.set_bind_group(0, &gpu.lit_frame_bg, &[]);
+                let off = slot(identity, 1.0, 1.0);
+                pass.set_bind_group(1, &gpu.draw_bg, &[off]);
+                pass.set_vertex_buffer(0, mesh.vertices.slice(..));
+                pass.set_index_buffer(mesh.indices.slice(..), wgpu::IndexFormat::Uint32);
+                pass.draw_indexed(0..mesh.index_count, 0, 0..1);
+            }
+
+            // Translucent terrain (stained glass) through the
             // alpha-blended composite variant. Short-circuit before
             // `set_pipeline` when nothing in the world can draw here.
             let any_translucent = scene
@@ -10161,7 +10226,10 @@ impl GpuRenderer {
 
             // Dedicated water pass: decoded world-space stream through
             // `MEGU_WATER_SURFACE_WGSL` (waves, depth tint, sun/moon
-            // specular via the shadow uniform written above).
+            // specular via the shadow uniform written above). Encoded
+            // after every opaque stream so the surface depth-tests
+            // against and alpha-blends over submerged water wheels,
+            // shafts, contraptions and entities.
             if let Some(water) = water {
                 let mut pipeline_set = false;
                 for (coord, section) in live_sections.iter() {
@@ -10182,50 +10250,8 @@ impl GpuRenderer {
                 }
             }
 
-            // 6-DOF sub-worlds, opaque first (airship hulls, planets,
-            // contraptions), then instanced mechanical parts, then the
-            // alpha-blended entries (cloud shells).
-            let mut drew_opaque_subworld = false;
-            for entry in subworld_gpu.entries() {
-                if entry.index_count == 0 || entry.alpha < 0.999 {
-                    continue;
-                }
-                if !drew_opaque_subworld {
-                    pass.set_pipeline(shadow.map_or(&gpu.lit_pipeline, |s| &s.lit_color));
-                    pass.set_bind_group(0, &gpu.lit_frame_bg, &[]);
-                    drew_opaque_subworld = true;
-                }
-                let model = entry.transform.model_matrix();
-                let off = slot(model, 1.0, entry.alpha);
-                pass.set_bind_group(1, &gpu.draw_bg, &[off]);
-                pass.set_vertex_buffer(0, entry.vertex_buffer().slice(..));
-                pass.set_index_buffer(entry.index_buffer().slice(..), wgpu::IndexFormat::Uint32);
-                pass.draw_indexed(0..entry.index_count, 0, 0..1);
-            }
-            let mut drew_instanced = false;
-            for batch in subworld_gpu.batches() {
-                if batch.index_count == 0 || batch.instance_count == 0 {
-                    continue;
-                }
-                if !drew_instanced {
-                    pass.set_pipeline(
-                        shadow.map_or(&gpu.instanced_pipeline, |s| &s.instanced_color),
-                    );
-                    pass.set_bind_group(0, &gpu.lit_frame_bg, &[]);
-                    drew_instanced = true;
-                }
-                let model = batch.transform.model_matrix();
-                let off = slot(model, 1.0, 1.0);
-                pass.set_bind_group(1, &gpu.draw_bg, &[off]);
-                pass.set_vertex_buffer(0, batch.template_vertex_buffer().slice(..));
-                pass.set_vertex_buffer(1, batch.instance_buffer().slice(..));
-                pass.set_index_buffer(
-                    batch.template_index_buffer().slice(..),
-                    wgpu::IndexFormat::Uint32,
-                );
-                pass.draw_indexed(0..batch.index_count, 0, 0..batch.instance_count);
-                instanced_draws += 1;
-            }
+            // Alpha-blended sub-world entries (cloud shells, glass
+            // contraptions) — the last world geometry, over water.
             let mut drew_alpha = false;
             for entry in subworld_gpu.entries() {
                 if entry.index_count == 0 || entry.alpha >= 0.999 {
@@ -10246,15 +10272,6 @@ impl GpuRenderer {
                 pass.draw_indexed(0..entry.index_count, 0, 0..1);
             }
 
-            if let Some(mesh) = entity_ber {
-                pass.set_pipeline(shadow.map_or(&gpu.lit_pipeline, |s| &s.lit_color));
-                pass.set_bind_group(0, &gpu.lit_frame_bg, &[]);
-                let off = slot(identity, 1.0, 1.0);
-                pass.set_bind_group(1, &gpu.draw_bg, &[off]);
-                pass.set_vertex_buffer(0, mesh.vertices.slice(..));
-                pass.set_index_buffer(mesh.indices.slice(..), wgpu::IndexFormat::Uint32);
-                pass.draw_indexed(0..mesh.index_count, 0, 0..1);
-            }
             if let Some(mesh) = particles {
                 pass.set_pipeline(shadow.map_or(&gpu.lit_alpha_pipeline, |s| &s.lit_alpha_color));
                 pass.set_bind_group(0, &gpu.lit_frame_bg, &[]);
