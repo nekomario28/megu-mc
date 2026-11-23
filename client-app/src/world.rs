@@ -2,7 +2,8 @@
 //! Live Protocol 767 world cache, block-state classification, `client-port`
 //! greedy meshing + vertex packing + translucent sorting, and collision lookup.
 
-use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
+use std::hash::{Hash, Hasher};
 use std::path::{Path, PathBuf};
 use std::time::Instant;
 
@@ -28,6 +29,7 @@ use megu_kernel::{
 
 use crate::protocol::{
     bitset_get, DecodedBlockEntity, DecodedChunk, DecodedLightData, DimensionMeta, PlayEvent,
+    WireAttribute,
 };
 
 // ---------------------------------------------------------------------------
@@ -67,6 +69,17 @@ pub fn pack_vertices(quads: &[Quad]) -> Result<Vec<PackedVertex>, i32> {
     }
     out.truncate(written);
     Ok(out)
+}
+
+fn packed_vertices_digest(vertices: &[PackedVertex]) -> u64 {
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    for vertex in vertices {
+        vertex.position.hash(&mut hasher);
+        vertex.state_id.hash(&mut hasher);
+        vertex.attributes.hash(&mut hasher);
+        vertex.tint.hash(&mut hasher);
+    }
+    hasher.finish()
 }
 
 pub fn sort_translucent(quads: &[Quad], camera: [f32; 3]) -> Result<Vec<u32>, i32> {
@@ -1440,6 +1453,9 @@ pub struct TrackedEntity {
     /// `hurt_animation`/`entity_event` status 2 and counted down by
     /// [`WorldState::tick_entities`].
     pub hurt_ticks: u8,
+    /// Most recently received vanilla entity animation id (0 main hand,
+    /// 3 off hand, 4 critical, 5 magic critical); consumers can animate it.
+    pub last_animation: Option<u8>,
     /// Bitmask of equipment slot ids seen in `set_equipment` (bits 0..=7;
     /// vanilla equipment slots are a small fixed enum, higher wire ids are
     /// not representable and ignored).
@@ -1491,6 +1507,7 @@ pub struct WorldState {
     pub columns: HashMap<(i32, i32), ChunkColumn>,
     pub mesh_cache: MeshCache,
     packed_meshes: HashMap<SectionCoord, Vec<PackedVertex>>,
+    packed_mesh_digests: HashMap<SectionCoord, u64>,
     /// Monotonic per-section mesh-content revision, bumped on every mesh
     /// rebuild or translucent re-sort so `client-gpu` detects changes with
     /// one `u64` compare instead of byte-comparing `Vec<PackedVertex>`
@@ -1531,6 +1548,16 @@ pub struct WorldState {
     /// Live entities tracked from S2C entity packets, bounded by
     /// [`MAX_TRACKED_ENTITIES`].
     pub entities: BTreeMap<i32, TrackedEntity>,
+    /// Last server-synced attributes per tracked entity.
+    pub entity_attributes: BTreeMap<i32, Vec<WireAttribute>>,
+    /// Vehicle-to-passenger relationships from `set_passengers`.
+    pub passengers: BTreeMap<i32, Vec<i32>>,
+    /// Leash/entity attachment target by source entity id.
+    pub entity_links: BTreeMap<i32, i32>,
+    /// Recent block events retained for a future block-event renderer.
+    pub block_events: VecDeque<([i32; 3], u8, u8, i32)>,
+    /// Recent item pickup animations retained for a future entity animation system.
+    pub item_pickups: VecDeque<(i32, i32, i32)>,
     /// Block entities retained from chunk payloads and `block_entity_data`
     /// updates, keyed by world `[x, y, z]`, bounded by
     /// [`MAX_TRACKED_BLOCK_ENTITIES`].
@@ -1643,6 +1670,7 @@ impl WorldState {
             columns: HashMap::new(),
             mesh_cache: MeshCache::new(MissingNeighbor::Air),
             packed_meshes: HashMap::new(),
+            packed_mesh_digests: HashMap::new(),
             section_mesh_revisions: HashMap::new(),
             next_mesh_revision: 1,
             translucent_orders: HashMap::new(),
@@ -1659,6 +1687,11 @@ impl WorldState {
             metrics: MeshMetrics::default(),
             animations: WorldAnimationHost::new(),
             entities: BTreeMap::new(),
+            entity_attributes: BTreeMap::new(),
+            passengers: BTreeMap::new(),
+            entity_links: BTreeMap::new(),
+            block_events: VecDeque::new(),
+            item_pickups: VecDeque::new(),
             block_entities: BTreeMap::new(),
             world_age: 0,
             time_of_day: 0,
@@ -1675,6 +1708,11 @@ impl WorldState {
         // block-break state; the world clock (age/time/weather) persists
         // across respawns exactly like vanilla's shared `ClientLevel` data.
         self.entities.clear();
+        self.entity_attributes.clear();
+        self.passengers.clear();
+        self.entity_links.clear();
+        self.block_events.clear();
+        self.item_pickups.clear();
         self.block_entities.clear();
         self.block_destructions.clear();
         self.light_engine = light_engine_for(&self.dimension, self.registry.is_some());
@@ -1684,6 +1722,7 @@ impl WorldState {
         self.columns.clear();
         self.mesh_cache = MeshCache::new(MissingNeighbor::Air);
         self.packed_meshes.clear();
+        self.packed_mesh_digests.clear();
         self.section_mesh_revisions.clear();
         self.translucent_orders.clear();
         self.released_translucent_slots.clear();
@@ -2210,6 +2249,7 @@ impl WorldState {
     fn remove_section_mesh(&mut self, coord: SectionCoord) {
         self.mesh_cache.remove(coord);
         self.packed_meshes.remove(&coord);
+        self.packed_mesh_digests.remove(&coord);
         self.section_mesh_revisions.remove(&coord);
         self.translucent_orders.remove(&coord);
         self.released_translucent_slots.remove(&coord);
@@ -2326,6 +2366,8 @@ impl WorldState {
             .map_err(|code| format!("pack_vertices failed with ABI code {code}"))?;
         self.metrics.total_pack_us += t_pack.elapsed().as_micros() as u64;
         debug_assert_eq!(packed.len(), grouped.len() * 4);
+        self.packed_mesh_digests
+            .insert(coord, packed_vertices_digest(&packed));
         self.packed_meshes.insert(coord, packed);
 
         let local_cam = [
@@ -2415,6 +2457,11 @@ impl WorldState {
         self.packed_meshes.get(&coord).map(Vec::as_slice)
     }
 
+    /// Digest computed at pack time for the section's packed vertex bytes.
+    pub fn packed_mesh_digest(&self, coord: SectionCoord) -> Option<u64> {
+        self.packed_mesh_digests.get(&coord).copied()
+    }
+
     /// Iterate rebuilt sections as `(coord, packed 16-byte vertices)` for the
     /// software rasterizer. Four vertices per quad, corner order preserved,
     /// quads in direction-bucket grouped order.
@@ -2483,6 +2530,7 @@ impl WorldState {
         }
         let quad_bytes = self.mesh_cache.release_uploaded_opaque_cpu_mesh(coord);
         let packed_bytes = if self.mesh_cache.released_mesh_meta(coord).is_some() {
+            self.packed_mesh_digests.remove(&coord);
             self.packed_meshes
                 .remove(&coord)
                 .map_or(0, |verts| {
@@ -2590,6 +2638,7 @@ impl WorldState {
                             head_yaw_deg: clean_f32(*head_yaw),
                             on_ground: false,
                             hurt_ticks: 0,
+                            last_animation: None,
                             equipment_slots: 0,
                         },
                     );
@@ -2598,6 +2647,12 @@ impl WorldState {
             PlayEvent::RemoveEntities { eids } => {
                 for &eid in eids {
                     self.entities.remove(&eid);
+                    self.entity_attributes.remove(&eid);
+                    self.passengers.remove(&eid);
+                    self.entity_links.remove(&eid);
+                    for passengers in self.passengers.values_mut() {
+                        passengers.retain(|&passenger| passenger != eid);
+                    }
                     // A removed breaker stops cracking blocks.
                     self.block_destructions.remove(&eid);
                 }
@@ -2658,6 +2713,61 @@ impl WorldState {
                 if let Some(entity) = self.entities.get_mut(eid) {
                     entity.hurt_ticks = HURT_FLASH_TICKS;
                 }
+            }
+            PlayEvent::Animate { eid, animation } => {
+                if let Some(entity) = self.entities.get_mut(eid) {
+                    entity.last_animation = Some(*animation);
+                }
+            }
+            PlayEvent::UpdateAttributes { eid, attributes } => {
+                if self.entity_attributes.contains_key(eid)
+                    || self.entity_attributes.len() < MAX_TRACKED_ENTITIES
+                {
+                    self.entity_attributes.insert(*eid, attributes.clone());
+                }
+            }
+            PlayEvent::SetPassengers {
+                vehicle,
+                passengers,
+            } => {
+                if self.passengers.contains_key(vehicle)
+                    || self.passengers.len() < MAX_TRACKED_ENTITIES
+                {
+                    self.passengers.insert(*vehicle, passengers.clone());
+                }
+            }
+            PlayEvent::SetEntityLink {
+                source,
+                destination,
+            } => {
+                if self.entity_links.contains_key(source)
+                    || self.entity_links.len() < MAX_TRACKED_ENTITIES
+                {
+                    self.entity_links.insert(*source, *destination);
+                }
+            }
+            PlayEvent::BlockEvent {
+                pos,
+                action,
+                parameter,
+                block_type,
+            } => {
+                if self.block_events.len() == 64 {
+                    self.block_events.pop_front();
+                }
+                self.block_events
+                    .push_back((*pos, *action, *parameter, *block_type));
+            }
+            PlayEvent::TakeItemEntity {
+                item_entity,
+                player,
+                amount,
+            } => {
+                if self.item_pickups.len() == 64 {
+                    self.item_pickups.pop_front();
+                }
+                self.item_pickups
+                    .push_back((*item_entity, *player, *amount));
             }
             PlayEvent::SetEquipment { eid, entries } => {
                 if let Some(entity) = self.entities.get_mut(eid) {
