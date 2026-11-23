@@ -158,6 +158,10 @@ pub enum Screen {
     /// Title `Singleplayer` button; the host fills
     /// [`UiState::singleplayer`] from `<gameDir>/saves/`.
     Singleplayer,
+    /// Multiplayer server list + direct-connect — reached from the Title
+    /// `Multiplayer` button; the host fills [`UiState::multiplayer`] from
+    /// its server-list store (`<gameDir>/megu_servers.toml`).
+    Multiplayer,
     /// Tabbed settings; [`SettingsTab`] picks the active page.
     Settings(SettingsTab),
     /// Megu details, license, and configured project links.
@@ -178,6 +182,11 @@ pub enum Screen {
     /// [`UiState::death`], entered via [`UiState::show_death`], left via
     /// [`UiAction::PerformRespawn`] / [`UiAction::LeaveWorld`].
     Death,
+    /// Kicked/dropped connection screen (vanilla `DisconnectedScreen`):
+    /// driven by [`UiState::disconnected`], entered via
+    /// [`UiState::show_disconnected`], left via the back button
+    /// ([`WidgetId::DisconnectedBack`]) or Escape.
+    Disconnected,
     /// Pause menu.
     Pause,
     /// NotEnoughCrashes-style recovery screen after a caught crash.
@@ -1720,6 +1729,29 @@ pub enum UiAction {
     },
     /// Open the server browser / connect flow.
     StartMultiplayer,
+    /// Connect to `address:port` — the Multiplayer screen's Join button
+    /// (selected row or the direct-connect field).
+    JoinServer {
+        /// Resolved host (DNS name or IP literal; never carries a port).
+        address: String,
+        /// Server port (`1..=65535`).
+        port: u16,
+    },
+    /// Persist the Multiplayer screen's direct-connect field as a new
+    /// saved-server row in the host's server-list store.
+    SaveServer {
+        /// Display name the new row gets.
+        name: String,
+        /// Resolved host.
+        address: String,
+        /// Server port (`1..=65535`).
+        port: u16,
+    },
+    /// Remove saved-server row `index` from the host's server-list store.
+    DeleteServer {
+        /// Index into `multiplayer.servers` (store order).
+        index: usize,
+    },
     /// Show the statistics screen (owned by the app layer).
     ShowStatistics,
     /// Open a configured URL in the system browser.
@@ -1790,6 +1822,20 @@ pub enum WidgetId {
     SingleplayerBack,
     SingleplayerListUp,
     SingleplayerListDown,
+    // Multiplayer server select
+    /// A row in `multiplayer.servers`; `0` indexes the store order the
+    /// host loads.
+    MultiplayerServer(usize),
+    /// Direct-connect / quick-add `host[:port]` text field.
+    MultiplayerAddressField,
+    MultiplayerJoin,
+    MultiplayerAdd,
+    MultiplayerDelete,
+    MultiplayerListUp,
+    MultiplayerListDown,
+    MultiplayerBack,
+    // Disconnected screen
+    DisconnectedBack,
     // Settings chrome
     SettingsDone,
     SettingsAboutMegu,
@@ -1947,6 +1993,7 @@ impl WidgetId {
                 | Self::FriendsJoinField
                 | Self::SingleplayerNameField
                 | Self::SingleplayerSeedField
+                | Self::MultiplayerAddressField
         )
     }
 }
@@ -2064,6 +2111,93 @@ pub fn seed_from_text(text: &str) -> Option<i64> {
     Some(i64::from(h))
 }
 
+/// One saved-server row on [`Screen::Multiplayer`]. The host fills these
+/// from its persistent store (`megu_servers.toml`) each time the screen
+/// opens; `Multiplayer` never reads the disk itself.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct MultiplayerServerEntry {
+    /// Display name the row shows first.
+    pub name: String,
+    /// Resolved host (DNS name or IP literal; never carries a port).
+    pub address: String,
+    /// Server port.
+    pub port: u16,
+}
+
+/// The [`Screen::Multiplayer`] server select + direct-connect flow.
+///
+/// The host fills `servers` from its server-list store when the screen
+/// opens and persists changes triggered by
+/// [`UiAction::SaveServer`]/[`UiAction::DeleteServer`]; the fields are
+/// pure UI-side text the host reads back through [`UiAction::JoinServer`]
+/// / [`UiAction::SaveServer`].
+#[derive(Clone, Debug, Default)]
+pub struct MultiplayerScreenState {
+    /// Saved servers in store order.
+    pub servers: Vec<MultiplayerServerEntry>,
+    /// Highlighted row — the Join button's target when the
+    /// direct-connect field is blank.
+    pub selected: Option<usize>,
+    /// Editable direct-connect / quick-add `host[:port]` text.
+    pub address_text: String,
+    /// First visible row in `servers` when the list overflows the panel.
+    pub scroll: usize,
+    /// Last inline status/error line (invalid input, store failure) —
+    /// rendered as a banner so joins never fail silently.
+    pub status: Option<String>,
+    address_focused: bool,
+}
+
+impl MultiplayerScreenState {
+    /// `true` while the direct-connect field owns typing.
+    pub fn address_field_active(&self) -> bool {
+        self.address_focused
+    }
+}
+
+/// The [`Screen::Disconnected`] kick/disconnect reason view. The host
+/// fills it when the live session reports `SessionStatus::Disconnected`
+/// and drops the session before the screen renders.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct DisconnectedScreenState {
+    /// Banner title (e.g. `Disconnected`).
+    pub title: String,
+    /// Exact reason the server/session reported, verbatim.
+    pub reason: String,
+}
+
+/// Largest accepted direct-connect text (`"[v6]:65535"` + slack).
+const SERVER_ADDRESS_FIELD_MAX_LEN: usize = 260;
+
+/// Parse the Multiplayer direct-connect field: `host`, `host:port`, or
+/// `[v6]`/`[v6]:port`. A missing port defaults to vanilla's `25565`; a
+/// port outside `1..=65535` or an empty host rejects.
+pub fn parse_server_address(text: &str) -> Option<(String, u16)> {
+    let trimmed = text.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    if let Some(rest) = trimmed.strip_prefix('[') {
+        let (host, port_part) = rest.split_once(']')?;
+        let port = match port_part.strip_prefix(':') {
+            Some(p) => p.parse::<u16>().ok()?,
+            None if port_part.is_empty() => 25565,
+            None => return None,
+        };
+        return (!host.is_empty() && port != 0).then(|| (host.to_string(), port));
+    }
+    match trimmed.split_once(':') {
+        Some((host, port_text)) if !port_text.contains(':') => {
+            let port = port_text.parse::<u16>().ok()?;
+            (!host.is_empty() && port != 0).then(|| (host.to_string(), port))
+        }
+        // Multiple colons with no brackets: treat as a bare IPv6 literal.
+        Some(_) if trimmed.matches(':').count() > 1 => Some((trimmed.to_string(), 25565)),
+        Some(_) => None,
+        None => Some((trimmed.to_string(), 25565)),
+    }
+}
+
 /// The whole client UI state machine.
 #[derive(Clone, Debug)]
 pub struct UiState {
@@ -2114,6 +2248,10 @@ pub struct UiState {
     pub title_status: Option<String>,
     /// The [`Screen::Singleplayer`] world select & create state.
     pub singleplayer: SingleplayerState,
+    /// The [`Screen::Multiplayer`] server select & direct-connect state.
+    pub multiplayer: MultiplayerScreenState,
+    /// The [`Screen::Disconnected`] kick/drop reason data.
+    pub disconnected: DisconnectedScreenState,
 
     /// The crash being shown on [`Screen::CrashRecovery`].
     pub crash: Option<CrashContext>,
@@ -2187,6 +2325,8 @@ impl Default for UiState {
             death: crate::death_screen::DeathScreenState::default(),
             title_status: None,
             singleplayer: SingleplayerState::default(),
+            multiplayer: MultiplayerScreenState::default(),
+            disconnected: DisconnectedScreenState::default(),
             crash: None,
             crash_sent: false,
             support_url: String::new(),
@@ -2516,6 +2656,17 @@ impl UiState {
         self.death = state;
     }
 
+    /// Put the disconnected screen up with `state`: like death, the nav
+    /// stack is dropped because the connection is already gone — only
+    /// the back button (or Escape, landing on Title) leaves the screen.
+    pub fn show_disconnected(&mut self, state: DisconnectedScreenState) {
+        self.disconnected = state;
+        self.nav_stack.clear();
+        self.screen = Screen::Disconnected;
+        self.modal = None;
+        self.focus_index = None;
+    }
+
     /// Clear the death state after the server's respawn/health recovery;
     /// lands back on [`Screen::InGameHud`] when the death screen was up.
     pub fn clear_death(&mut self) {
@@ -2606,6 +2757,11 @@ impl UiState {
     /// `true` while the Singleplayer seed field owns typing.
     pub fn world_seed_field_active(&self) -> bool {
         self.singleplayer.seed_focused
+    }
+
+    /// `true` while the Multiplayer direct-connect field owns typing.
+    pub fn server_address_field_active(&self) -> bool {
+        self.multiplayer.address_focused
     }
 
     /// The displayed invite code text, or `"-"` when none is active.
@@ -2756,6 +2912,7 @@ impl UiState {
             || self.join_field_focused
             || self.singleplayer.name_focused
             || self.singleplayer.seed_focused
+            || self.multiplayer.address_focused
     }
 
     fn handle_key(&mut self, key: UiKey) -> Vec<UiAction> {
@@ -2806,6 +2963,9 @@ impl UiState {
                     self.singleplayer.new_name.pop();
                 } else if self.singleplayer.seed_focused {
                     self.singleplayer.seed_text.pop();
+                } else if self.multiplayer.address_focused {
+                    self.multiplayer.address_text.pop();
+                    self.multiplayer.status = None;
                 }
                 Vec::new()
             }
@@ -2854,6 +3014,13 @@ impl UiState {
             && self.singleplayer.seed_text.chars().count() < WORLD_SEED_FIELD_MAX_LEN
         {
             self.singleplayer.seed_text.push(c);
+        } else if self.multiplayer.address_focused
+            && (c.is_ascii_alphanumeric()
+                || matches!(c, '.' | '-' | '_' | ':' | '[' | ']'))
+            && self.multiplayer.address_text.chars().count() < SERVER_ADDRESS_FIELD_MAX_LEN
+        {
+            self.multiplayer.address_text.push(c);
+            self.multiplayer.status = None;
         }
         Vec::new()
     }
@@ -2888,6 +3055,9 @@ impl UiState {
         } else if self.singleplayer.seed_focused {
             self.unfocus_fields();
             self.try_create_world()
+        } else if self.multiplayer.address_focused {
+            self.unfocus_fields();
+            self.try_join_server()
         } else {
             Vec::new()
         }
@@ -2924,11 +3094,91 @@ impl UiState {
         }]
     }
 
+    /// Multiplayer Join (or Enter on the direct-connect field): the
+    /// typed `host[:port]` wins over the highlighted row, matching
+    /// vanilla's "type an address, press Join" flow. Bad input lands on
+    /// the inline status banner instead of failing silently.
+    fn try_join_server(&mut self) -> Vec<UiAction> {
+        let direct = self.multiplayer.address_text.trim();
+        if !direct.is_empty() {
+            return match parse_server_address(direct) {
+                Some((address, port)) => {
+                    self.multiplayer.status = None;
+                    vec![UiAction::JoinServer { address, port }]
+                }
+                None => {
+                    self.multiplayer.status = Some(
+                        tr(
+                            self.lang(),
+                            "Invalid server address",
+                            "サーバーアドレスが無効です",
+                        )
+                        .to_string(),
+                    );
+                    Vec::new()
+                }
+            };
+        }
+        match self
+            .multiplayer
+            .selected
+            .and_then(|i| self.multiplayer.servers.get(i))
+        {
+            Some(entry) => {
+                self.multiplayer.status = None;
+                vec![UiAction::JoinServer {
+                    address: entry.address.clone(),
+                    port: entry.port,
+                }]
+            }
+            None => {
+                self.multiplayer.status = Some(
+                    tr(
+                        self.lang(),
+                        "Select a server or enter an address",
+                        "サーバーかアドレスを入力してください",
+                    )
+                    .to_string(),
+                );
+                Vec::new()
+            }
+        }
+    }
+
+    /// Multiplayer Add: persist the typed `host[:port]` through the
+    /// host's store (`name` mirrors the typed text until a rename UI
+    /// exists — the row stays honest about what it connects to).
+    fn try_add_server(&mut self) -> Vec<UiAction> {
+        let direct = self.multiplayer.address_text.trim();
+        match parse_server_address(direct) {
+            Some((address, port)) => {
+                self.multiplayer.status = None;
+                vec![UiAction::SaveServer {
+                    name: direct.to_string(),
+                    address,
+                    port,
+                }]
+            }
+            None => {
+                self.multiplayer.status = Some(
+                    tr(
+                        self.lang(),
+                        "Invalid server address",
+                        "サーバーアドレスが無効です",
+                    )
+                    .to_string(),
+                );
+                Vec::new()
+            }
+        }
+    }
+
     fn unfocus_fields(&mut self) {
         self.fps_field_focused = false;
         self.join_field_focused = false;
         self.singleplayer.name_focused = false;
         self.singleplayer.seed_focused = false;
+        self.multiplayer.address_focused = false;
     }
 
     fn escape(&mut self) -> Vec<UiAction> {
@@ -2995,7 +3245,12 @@ impl UiState {
                 self.navigate(Screen::Singleplayer);
                 vec![UiAction::OpenScreen(Screen::Singleplayer)]
             }
-            WidgetId::TitleMultiplayer => vec![UiAction::StartMultiplayer],
+            WidgetId::TitleMultiplayer => {
+                self.multiplayer.scroll = 0;
+                self.multiplayer.status = None;
+                self.navigate(Screen::Multiplayer);
+                vec![UiAction::OpenScreen(Screen::Multiplayer)]
+            }
             WidgetId::TitleFriends => {
                 self.navigate(Screen::Friends);
                 vec![UiAction::OpenScreen(Screen::Friends)]
@@ -3038,6 +3293,52 @@ impl UiState {
                 let max_scroll = self.singleplayer.worlds.len().saturating_sub(1);
                 self.singleplayer.scroll = (self.singleplayer.scroll + 1).min(max_scroll);
                 Vec::new()
+            }
+
+            WidgetId::MultiplayerServer(i) => {
+                self.multiplayer.selected = (i < self.multiplayer.servers.len()).then_some(i);
+                self.multiplayer.status = None;
+                Vec::new()
+            }
+            WidgetId::MultiplayerAddressField => {
+                self.unfocus_fields();
+                self.multiplayer.address_focused = true;
+                Vec::new()
+            }
+            WidgetId::MultiplayerJoin => self.try_join_server(),
+            WidgetId::MultiplayerAdd => self.try_add_server(),
+            WidgetId::MultiplayerDelete => match self.multiplayer.selected {
+                Some(index) if index < self.multiplayer.servers.len() => {
+                    vec![UiAction::DeleteServer { index }]
+                }
+                _ => {
+                    self.multiplayer.status = Some(
+                        tr(
+                            self.lang(),
+                            "Select a server to delete",
+                            "削除するサーバーを選択してください",
+                        )
+                        .to_string(),
+                    );
+                    Vec::new()
+                }
+            },
+            WidgetId::MultiplayerListUp => {
+                self.multiplayer.scroll = self.multiplayer.scroll.saturating_sub(1);
+                Vec::new()
+            }
+            WidgetId::MultiplayerListDown => {
+                let max_scroll = self.multiplayer.servers.len().saturating_sub(1);
+                self.multiplayer.scroll = (self.multiplayer.scroll + 1).min(max_scroll);
+                Vec::new()
+            }
+            WidgetId::MultiplayerBack => {
+                self.back();
+                vec![UiAction::Back]
+            }
+            WidgetId::DisconnectedBack => {
+                self.go_title();
+                vec![UiAction::OpenScreen(Screen::Title)]
             }
             WidgetId::WebsiteLink => {
                 if self.website_url.is_empty() {

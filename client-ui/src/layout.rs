@@ -63,6 +63,7 @@ pub fn layout_screen_into(
     match state.screen {
         Screen::Title => title(&mut ctx),
         Screen::Singleplayer => singleplayer(&mut ctx),
+        Screen::Multiplayer => multiplayer(&mut ctx),
         Screen::Settings(tab) => settings(&mut ctx, tab),
         Screen::AboutMegu => about_megu(&mut ctx),
         Screen::Friends => friends(&mut ctx),
@@ -71,6 +72,7 @@ pub fn layout_screen_into(
         Screen::RecipeBrowser => embedded_recipe_browser(&mut ctx),
         Screen::InGameHud => hud(&mut ctx),
         Screen::Death => death(&mut ctx),
+        Screen::Disconnected => disconnected(&mut ctx),
         Screen::Pause => pause(&mut ctx),
         Screen::CrashRecovery => crash(&mut ctx),
     }
@@ -599,6 +601,169 @@ fn singleplayer(ctx: &mut Ctx) {
         lr(cx - 50, ctx.h - 30, 100, 20),
         tr(lang, "Back", "戻る"),
         true,
+    );
+}
+
+fn multiplayer(ctx: &mut Ctx) {
+    ctx.menu_background();
+    let lang = ctx.lang;
+    let cx = ctx.w / 2;
+
+    ctx.ctext(cx, 8, 2, pal::TEXT, tr(lang, "Play Multiplayer", "マルチプレイ"));
+
+    // Footer strip (status line + Back): like Singleplayer, widgets that
+    // would reach it are dropped instead of painting under the chrome.
+    ctx.band_top = ctx.h - 44;
+
+    let pw = 340.min(ctx.w - 8).max(40);
+    let px = cx - pw / 2;
+
+    // The direct-connect block anchors to the footer: label + field +
+    // button row = 66 logical px. The server list owns what remains.
+    let direct_h = 66;
+    let direct_top = (ctx.band_top - 4 - direct_h).max(36);
+    let list_top = 34;
+    let list_bottom = direct_top - 4;
+
+    // --- Saved servers -----------------------------------------------
+    let servers = &ctx.state.multiplayer.servers;
+    ctx.panel(px, list_top, pw, (list_bottom - list_top).max(10));
+    let row_h = 20;
+    let body_h = (list_bottom - list_top - 6).max(0);
+    let mut visible = (body_h / row_h) as usize;
+    if servers.len() > visible {
+        visible = ((body_h - 18) / row_h).max(0) as usize;
+    }
+    let scroll = ctx
+        .state
+        .multiplayer
+        .scroll
+        .min(servers.len().saturating_sub(visible));
+    if servers.is_empty() {
+        ctx.ctext(
+            cx,
+            list_top + 6,
+            1,
+            pal::TEXT_DIM,
+            tr(lang, "No saved servers", "サーバーはまだありません"),
+        );
+    }
+    let selected = ctx.state.multiplayer.selected;
+    for row in 0..visible {
+        let i = scroll + row;
+        let Some(entry) = servers.get(i) else { break };
+        let r = lr(px + 4, list_top + 4 + row as i32 * row_h, pw - 8, row_h - 2);
+        // Selected rows draw a highlight fill under the button row id.
+        if selected == Some(i) {
+            ctx.fill(r.x, r.y, r.w as i32, r.h as i32, pal::BUTTON_HOVER);
+        }
+        let label = format!("{} — {}:{}", entry.name, entry.address, entry.port);
+        ctx.btn(
+            WidgetId::MultiplayerServer(i),
+            r,
+            &hud_str(&label, ((pw - 20) / 8).max(4) as usize),
+        );
+    }
+    let py = list_top + 4 + visible as i32 * row_h;
+    if servers.len() > visible && pw >= 176 && py + 16 <= list_bottom {
+        ctx.btn(
+            WidgetId::MultiplayerListUp,
+            lr(px + 4, py, 60, 16),
+            tr(lang, "Up", "上"),
+        );
+        ctx.ctext(
+            cx,
+            py + 4,
+            1,
+            pal::TEXT_DIM,
+            &format!("{}-{}", scroll + 1, (scroll + visible).min(servers.len())),
+        );
+        ctx.btn(
+            WidgetId::MultiplayerListDown,
+            lr(px + pw - 64, py, 60, 16),
+            tr(lang, "Down", "下"),
+        );
+    }
+
+    // --- Direct connect / quick-add -----------------------------------
+    ctx.ctext(
+        cx,
+        direct_top,
+        1,
+        pal::ACCENT,
+        tr(lang, "Direct Connect", "直接接続"),
+    );
+    ctx.textfield(
+        WidgetId::MultiplayerAddressField,
+        lr(px, direct_top + 12, pw, 18),
+        &ctx.state.multiplayer.address_text,
+        ctx.state.multiplayer.address_field_active(),
+        tr(lang, "host:port", "ホスト:ポート"),
+    );
+    let bw = ((pw - 8) / 3).max(24);
+    let by = direct_top + 34;
+    ctx.btn(
+        WidgetId::MultiplayerJoin,
+        lr(px, by, bw, 18),
+        tr(lang, "Join", "参加"),
+    );
+    ctx.btn(
+        WidgetId::MultiplayerAdd,
+        lr(px + bw + 4, by, bw, 18),
+        tr(lang, "Add", "追加"),
+    );
+    ctx.btn(
+        WidgetId::MultiplayerDelete,
+        lr(px + 2 * (bw + 4), by, bw, 18),
+        tr(lang, "Delete", "削除"),
+    );
+    ctx.band_top = i32::MAX;
+
+    // Inline status (bad address, store failures, "select a server")
+    // renders right above Back — never silently dropped.
+    if let Some(status) = ctx
+        .state
+        .multiplayer
+        .status
+        .as_deref()
+        .or(ctx.state.title_status.as_deref())
+    {
+        ctx.ctext(cx, ctx.h - 41, 1, pal::WARNING, &hud_str(status, 56));
+    }
+    ctx.button_unchecked(
+        WidgetId::MultiplayerBack,
+        lr(cx - 50, ctx.h - 30, 100, 20),
+        tr(lang, "Back", "戻る"),
+        true,
+    );
+}
+
+fn disconnected(ctx: &mut Ctx) {
+    let lang = ctx.lang;
+    let cx = ctx.w / 2;
+    let state = &ctx.state.disconnected;
+
+    ctx.menu_background();
+    let ty = (ctx.h / 4).min(ctx.h.saturating_sub(16)).max(0);
+    ctx.ctext(
+        cx,
+        ty,
+        2,
+        pal::DANGER,
+        if state.title.is_empty() {
+            tr(lang, "Disconnected", "切断されました")
+        } else {
+            &state.title
+        },
+    );
+    if !state.reason.is_empty() {
+        ctx.ctext(cx, ty + 24, 1, pal::TEXT, &hud_str(&state.reason, 72));
+    }
+    let bw = 140.min(ctx.w - 12).max(24);
+    ctx.btn(
+        WidgetId::DisconnectedBack,
+        lr(cx - bw / 2, (ty + 44).min((ctx.h - 22).max(2)), bw, 20),
+        tr(lang, "Back to Title", "タイトルへ戻る"),
     );
 }
 

@@ -64,12 +64,6 @@
     },
     {
       "check": "s2c_play_event_consumption",
-      "id": "PlayEvent::ContainerSetData",
-      "priority": "P1",
-      "reason": "container_set_data drops \u2014 furnace/brewing progress bars dead"
-    },
-    {
-      "check": "s2c_play_event_consumption",
       "id": "PlayEvent::CookieRequest",
       "priority": "P2",
       "reason": "cookie_request drops \u2014 server cookie store unused"
@@ -142,21 +136,9 @@
     },
     {
       "check": "s2c_play_event_consumption",
-      "id": "PlayEvent::Ping",
-      "priority": "P1",
-      "reason": "play ping drops \u2014 no pong response; ping display dead and some servers kick on timeout"
-    },
-    {
-      "check": "s2c_play_event_consumption",
       "id": "PlayEvent::PlaceGhostRecipe",
       "priority": "P2",
       "reason": "place_ghost_recipe drops \u2014 recipe-book ghost grid unimplemented"
-    },
-    {
-      "check": "s2c_play_event_consumption",
-      "id": "PlayEvent::PlayerAbilities",
-      "priority": "P1",
-      "reason": "player_abilities drops \u2014 may-fly/instabuild flags never sync"
     },
     {
       "check": "s2c_play_event_consumption",
@@ -187,18 +169,6 @@
       "id": "PlayEvent::ResetChat",
       "priority": "P1",
       "reason": "reset_chat drops \u2014 chat reset ignored"
-    },
-    {
-      "check": "s2c_play_event_consumption",
-      "id": "PlayEvent::ResourcePackPop",
-      "priority": "P1",
-      "reason": "resource_pack_pop drops \u2014 server pack removal ignored"
-    },
-    {
-      "check": "s2c_play_event_consumption",
-      "id": "PlayEvent::ResourcePackPush",
-      "priority": "P1",
-      "reason": "resource_pack_push drops \u2014 server-sent packs never apply (may also fail pack-required servers)"
     },
     {
       "check": "s2c_play_event_consumption",

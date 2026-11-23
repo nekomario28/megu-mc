@@ -850,3 +850,76 @@ fn cli_audio_sink_accepts_native_backends_case_insensitive() {
     assert!(parse_args(&["--audio-sink", "coreaudio2"]).is_err());
     assert!(parse_args(&["--audio-sink", "wasapi"]).is_err());
 }
+
+// ---------------------------------------------------------------------------
+// C2S resource_pack: 767 + 777 wire ids and the uuid+status payload
+// ---------------------------------------------------------------------------
+
+#[test]
+fn resource_pack_response_resolves_per_version() {
+    use megu_client::protocol::encode_resource_pack;
+    use megu_proto::{PacketDir, PacketPhase, VersionRouter};
+
+    let uuid = [0xabu8; 16];
+    let (name, payload) = encode_resource_pack(uuid, 3);
+    assert_eq!(name, "resource_pack");
+    assert_eq!(&payload[..16], &uuid);
+    assert_eq!(&payload[16..], vi(3).as_slice());
+
+    let router = VersionRouter::with_v767_and_v777();
+    let t767 = router.select(767).unwrap().table().clone();
+    let t777 = router.select(777).unwrap().table().clone();
+    // Play-phase serverbound ids differ between the two versions.
+    assert_eq!(
+        t767.packet_id(PacketPhase::Play, PacketDir::Serverbound, "resource_pack"),
+        Some(0x2b)
+    );
+    assert_eq!(
+        t777.packet_id(PacketPhase::Play, PacketDir::Serverbound, "resource_pack"),
+        Some(0x32)
+    );
+    // Configuration-phase: 767 names it `resource_pack_response`,
+    // 777 names it `resource_pack` — the sender picks whichever the
+    // active table knows.
+    assert_eq!(
+        t767.packet_id(
+            PacketPhase::Configuration,
+            PacketDir::Serverbound,
+            "resource_pack_response"
+        ),
+        Some(0x06)
+    );
+    assert_eq!(
+        t767.packet_id(
+            PacketPhase::Configuration,
+            PacketDir::Serverbound,
+            "resource_pack"
+        ),
+        None
+    );
+    assert_eq!(
+        t777.packet_id(
+            PacketPhase::Configuration,
+            PacketDir::Serverbound,
+            "resource_pack"
+        ),
+        Some(0x06)
+    );
+}
+
+#[test]
+fn resource_pack_status_codes_match_vanilla_actions() {
+    use megu_client::protocol::{
+        RESOURCE_PACK_ACCEPTED, RESOURCE_PACK_DECLINED, RESOURCE_PACK_DISCARDED,
+        RESOURCE_PACK_DOWNLOADED, RESOURCE_PACK_FAILED_DOWNLOAD, RESOURCE_PACK_FAILED_RELOAD,
+        RESOURCE_PACK_INVALID_URL, RESOURCE_PACK_SUCCESSFULLY_LOADED,
+    };
+    assert_eq!(RESOURCE_PACK_SUCCESSFULLY_LOADED, 0);
+    assert_eq!(RESOURCE_PACK_DECLINED, 1);
+    assert_eq!(RESOURCE_PACK_FAILED_DOWNLOAD, 2);
+    assert_eq!(RESOURCE_PACK_ACCEPTED, 3);
+    assert_eq!(RESOURCE_PACK_DOWNLOADED, 4);
+    assert_eq!(RESOURCE_PACK_INVALID_URL, 5);
+    assert_eq!(RESOURCE_PACK_FAILED_RELOAD, 6);
+    assert_eq!(RESOURCE_PACK_DISCARDED, 7);
+}

@@ -4656,6 +4656,34 @@ pub fn encode_player_abilities(flags: u8) -> (&'static str, Vec<u8>) {
     ("player_abilities", vec![flags])
 }
 
+/// `resource_pack` action code: the pack's contents were applied.
+pub const RESOURCE_PACK_SUCCESSFULLY_LOADED: i32 = 0;
+/// `resource_pack` action code: the player declined the pack.
+pub const RESOURCE_PACK_DECLINED: i32 = 1;
+/// `resource_pack` action code: the download failed.
+pub const RESOURCE_PACK_FAILED_DOWNLOAD: i32 = 2;
+/// `resource_pack` action code: the player accepted the offer.
+pub const RESOURCE_PACK_ACCEPTED: i32 = 3;
+/// `resource_pack` action code: the download finished.
+pub const RESOURCE_PACK_DOWNLOADED: i32 = 4;
+/// `resource_pack` action code: the pushed URL was invalid.
+pub const RESOURCE_PACK_INVALID_URL: i32 = 5;
+/// `resource_pack` action code: applying the downloaded pack failed.
+pub const RESOURCE_PACK_FAILED_RELOAD: i32 = 6;
+/// `resource_pack` action code: the pack was discarded (pop echo).
+pub const RESOURCE_PACK_DISCARDED: i32 = 7;
+
+/// `resource_pack` — serverbound status answer for a `resource_pack_push`:
+/// the pack UUID followed by the vanilla action varint (1.20.3+ shape for
+/// both 767 and 777). The configuration-phase sibling carries the same
+/// payload under a different table name on 767 (`resource_pack_response`).
+pub fn encode_resource_pack(uuid: [u8; 16], status: i32) -> (&'static str, Vec<u8>) {
+    let mut p = Vec::with_capacity(21);
+    p.extend_from_slice(&uuid);
+    write_varint(&mut p, status);
+    ("resource_pack", p)
+}
+
 /// `edit_book` — writable-book page edits. `slot` is the inventory slot
 /// holding the book (vanilla bounds 0..=40); `pages` are capped at 100
 /// entries of 1024 chars; `title` is present only for signed books.
@@ -5204,6 +5232,29 @@ impl ProtocolClient {
                 Some("keep_alive") => {
                     client.send_named(PacketPhase::Configuration, "keep_alive", &body)?;
                 }
+                Some("ping") => {
+                    // Configuration-phase latency probe: echo the i32 id
+                    // back on `pong` (same payload, different table entry).
+                    client.send_named(PacketPhase::Configuration, "pong", &body)?;
+                }
+                Some("resource_pack_push") => {
+                    // Answer required/optional pushes promptly: the pack is
+                    // acknowledged rather than downloaded (see the play-phase
+                    // handler in `live_session`), so pack-required servers
+                    // never hit their response timeout.
+                    if let Ok(uuid) = WireReader::new(&body).read_uuid() {
+                        client.send_resource_pack_in(
+                            PacketPhase::Configuration,
+                            uuid,
+                            RESOURCE_PACK_ACCEPTED,
+                        )?;
+                        client.send_resource_pack_in(
+                            PacketPhase::Configuration,
+                            uuid,
+                            RESOURCE_PACK_SUCCESSFULLY_LOADED,
+                        )?;
+                    }
+                }
                 Some("disconnect") => {
                     let msg = WireReader::new(&body)
                         .read_nbt()
@@ -5684,6 +5735,46 @@ impl ProtocolClient {
     pub fn send_pong(&mut self, id: i32) -> Result<(), String> {
         let (name, payload) = encode_pong(id);
         self.send_named(PacketPhase::Play, name, &payload)
+    }
+
+    /// `resource_pack` — play-phase status answer for a
+    /// `resource_pack_push`/`resource_pack_pop` (see
+    /// [`encode_resource_pack`] for the action codes and wire shape).
+    pub fn send_resource_pack(&mut self, uuid: [u8; 16], status: i32) -> Result<(), String> {
+        self.send_resource_pack_in(PacketPhase::Play, uuid, status)
+    }
+
+    /// [`send_resource_pack`](Self::send_resource_pack) in an explicit
+    /// phase: the configuration loop answers pushed packs with the same
+    /// payload, resolved under `resource_pack` on 777 and
+    /// `resource_pack_response` on 767.
+    pub fn send_resource_pack_in(
+        &mut self,
+        phase: PacketPhase,
+        uuid: [u8; 16],
+        status: i32,
+    ) -> Result<(), String> {
+        let (_, payload) = encode_resource_pack(uuid, status);
+        let name = if self
+            .codec
+            .table()
+            .packet_id(phase, PacketDir::Serverbound, "resource_pack")
+            .is_some()
+        {
+            "resource_pack"
+        } else {
+            "resource_pack_response"
+        };
+        self.send_named(phase, name, &payload)
+    }
+
+    /// `client_information` — play-phase re-announce (render distance,
+    /// locale, ...) after the configuration-phase copy; vanilla emits
+    /// this whenever a broadcast-visible setting like view distance
+    /// changes so the server re-centers the client's chunk view.
+    pub fn send_client_information(&mut self, view_distance: i8) -> Result<(), String> {
+        let payload = build_client_information(view_distance, self.codec.capabilities());
+        self.send_named(PacketPhase::Play, "client_information", &payload)
     }
 
     /// `player_abilities` — flags byte; only bit 0x02 (flying) is honoured

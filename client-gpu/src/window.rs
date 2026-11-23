@@ -12,6 +12,7 @@ use megu_client::friend_client::{FriendGuestBridge, FriendHostSession};
 use megu_client::integrated;
 use megu_client::protocol::{encode_slot_stack, NbtValue, WireReader};
 use megu_client::render::{FrameBudgetGovernor, RenderConfig, ThrottleStage};
+use megu_client::server_list::{ServerEntry, ServerListStore};
 use megu_client::spatial_audio::SpatialAudioPreset;
 use megu_client::world::{TrackedBlockEntity, TrackedEntity};
 use megu_client::zsh_command_bar::ZshCommandBar;
@@ -47,8 +48,8 @@ use megu_ui::magic_hud::build_magic_hud_draw_list;
 use megu_ui::magic_hud::LookingAtBlockState;
 use megu_ui::state::{invite_code_display, ScoreboardState, TitleOverlayState};
 use megu_ui::state::{
-    Screen, SettingsTab, UiAction, UiInputEvent, UiKey, UiSettings, UiState, VideoPreset,
-    VisualStylePreset,
+    DisconnectedScreenState, MultiplayerScreenState, MultiplayerServerEntry, Screen, SettingsTab,
+    UiAction, UiInputEvent, UiKey, UiSettings, UiState, VideoPreset, VisualStylePreset,
 };
 use winit::application::ApplicationHandler;
 use winit::dpi::PhysicalSize;
@@ -619,6 +620,10 @@ pub struct GpuApp {
     /// Live entity + block-entity mesh staging cache (20 Hz throttle —
     /// the server tick cadence positions actually move at).
     entity_render_cache: LiveEntityRenderCache,
+    /// Timestamp of the previous physical Space press — the vanilla
+    /// ~7-tick double-jump window used by `LiveSession::toggle_flight`
+    /// (key repeats are filtered upstream, so every `Pressed` is real).
+    last_space_press: Option<Instant>,
     last_frame: Instant,
     frame_start: Instant,
     fatal: Option<String>,
@@ -690,6 +695,7 @@ impl GpuApp {
                 session_paths.clone(),
                 config.access_token.clone(),
                 config.uuid.clone(),
+                UiSettings::default().video.view_distance as i8,
             ))
         } else {
             config.connect.as_ref().map(|(host, port)| {
@@ -701,6 +707,7 @@ impl GpuApp {
                     session_paths.clone(),
                     config.access_token.clone(),
                     config.uuid.clone(),
+                    UiSettings::default().video.view_distance as i8,
                 )
             })
         };
@@ -783,6 +790,7 @@ impl GpuApp {
             particle_scratch: Vec::new(),
             live_particles_staged: false,
             entity_render_cache: LiveEntityRenderCache::default(),
+            last_space_press: None,
             last_frame: Instant::now(),
             frame_start: Instant::now(),
             fatal: None,
@@ -1094,6 +1102,9 @@ impl GpuApp {
                 if *screen == Screen::Singleplayer {
                     self.refresh_singleplayer_worlds();
                 }
+                if *screen == Screen::Multiplayer {
+                    self.refresh_multiplayer_servers();
+                }
                 self.ui.navigate(*screen);
             }
             UiAction::Back => {
@@ -1117,6 +1128,23 @@ impl GpuApp {
             UiAction::StartMultiplayer => {
                 if let Err(err) = self.join_multiplayer() {
                     self.status_line(format!("Multiplayer: {err}"));
+                }
+            }
+            UiAction::JoinServer { address, port } => {
+                self.connect_to(address.clone(), *port);
+            }
+            UiAction::SaveServer {
+                name,
+                address,
+                port,
+            } => {
+                if let Err(err) = self.save_server_entry(name, address, *port) {
+                    self.multiplayer_error(&err);
+                }
+            }
+            UiAction::DeleteServer { index } => {
+                if let Err(err) = self.delete_server_entry(*index) {
+                    self.multiplayer_error(&err);
                 }
             }
             UiAction::JoinWithCode(code) => {
@@ -1387,6 +1415,10 @@ impl GpuApp {
                 SpatialAudioPreset::Off
             };
             live.set_spatial_audio_preset(preset);
+            // Render-distance changes while connected re-announce
+            // `client_information` so the server re-centers the chunk
+            // view (no-op unless the value actually moved).
+            live.resend_client_information(video.view_distance as i8);
         }
     }
 
@@ -1483,6 +1515,7 @@ impl GpuApp {
             self.session_paths.clone(),
             self.config.access_token.clone(),
             self.config.uuid.clone(),
+            self.ui.settings.video.view_distance as i8,
         );
         // Windowed path: the dedicated real-time `AudioMixThread` owns the
         // cpal stream; gameplay code enqueues `AudioCmd`s non-blocking.
@@ -1546,6 +1579,82 @@ impl GpuApp {
     /// deterministically.
     fn refresh_singleplayer_worlds(&mut self) {
         self.ui.singleplayer.worlds = list_saved_worlds(self.config.game_dir.as_deref());
+    }
+
+    /// The Multiplayer screen's server-list store under `<gameDir>`
+    /// (`.` when `--gameDir` is unset) — loaded fresh for every refresh
+    /// and every mutation so `SaveServer`/`DeleteServer` always persist
+    /// through the store's atomic commit instead of a stale snapshot.
+    fn server_list_store(&self) -> Result<ServerListStore, String> {
+        let dir = self
+            .config
+            .game_dir
+            .clone()
+            .unwrap_or_else(|| std::path::PathBuf::from("."));
+        ServerListStore::load(dir)
+    }
+
+    /// Repopulate `ui.multiplayer.servers` from the store on screen open
+    /// and after every mutation; store failures land in the screen's
+    /// status banner rather than dropping silently.
+    fn refresh_multiplayer_servers(&mut self) {
+        let loaded = self.server_list_store();
+        let multiplayer: &mut MultiplayerScreenState = &mut self.ui.multiplayer;
+        match loaded {
+            Ok(store) => {
+                multiplayer.servers = store
+                    .entries()
+                    .iter()
+                    .map(|entry| MultiplayerServerEntry {
+                        name: entry.name.clone(),
+                        address: entry.address.clone(),
+                        port: entry.port,
+                    })
+                    .collect();
+                if multiplayer
+                    .selected
+                    .is_some_and(|index| index >= multiplayer.servers.len())
+                {
+                    multiplayer.selected = None;
+                }
+            }
+            Err(err) => {
+                multiplayer.status = Some(err.clone());
+                self.status_line(format!("Multiplayer: {err}"));
+            }
+        }
+    }
+
+    /// `UiAction::SaveServer`: append the direct-connect endpoint through
+    /// the store (validation + atomic persistence inside), then refresh
+    /// the visible rows so the UI mirrors exactly what was committed.
+    fn save_server_entry(&mut self, name: &str, address: &str, port: u16) -> Result<(), String> {
+        let mut store = self.server_list_store()?;
+        store.add(ServerEntry {
+            name: name.to_owned(),
+            address: address.to_owned(),
+            port,
+        })?;
+        self.refresh_multiplayer_servers();
+        self.ui.multiplayer.status = Some(format!("Saved {name}"));
+        Ok(())
+    }
+
+    /// `UiAction::DeleteServer`: remove row `index` through the store,
+    /// then refresh; a stale row selection clears itself on rebuild.
+    fn delete_server_entry(&mut self, index: usize) -> Result<(), String> {
+        let mut store = self.server_list_store()?;
+        let removed = store.remove(index)?;
+        self.refresh_multiplayer_servers();
+        self.ui.multiplayer.status = Some(format!("Deleted {}", removed.name));
+        Ok(())
+    }
+
+    /// Surface a server-list/store failure on the Multiplayer screen's
+    /// status banner (and the global status line for logs/chat).
+    fn multiplayer_error(&mut self, err: &str) {
+        self.ui.multiplayer.status = Some(err.to_owned());
+        self.status_line(format!("Multiplayer: {err}"));
     }
 
     /// Title Multiplayer: connect to the configured server target.
@@ -1869,6 +1978,7 @@ impl GpuApp {
             schema: &'static megu_ui::container_screen::MenuScreenSchema,
             window_id: u8,
             state_id: i32,
+            properties: std::collections::BTreeMap<i16, i16>,
         }
         let snap = self
             .live
@@ -1881,6 +1991,7 @@ impl GpuApp {
                     schema,
                     window_id,
                     state_id: open.state_id,
+                    properties: open.properties.clone(),
                 })
             });
         // Phase 2: mutate `self.container_screen` / grab state freely.
@@ -1889,6 +2000,7 @@ impl GpuApp {
                 schema,
                 window_id,
                 state_id,
+                properties,
             }) => {
                 // A server-opened window always replaces the local
                 // inventory surface.
@@ -1907,6 +2019,11 @@ impl GpuApp {
                     self.set_cursor_grab(false);
                 }
                 let screen = self.container_screen.as_mut().unwrap();
+                // `container_set_data` updates (furnace burn/cook bars,
+                // brewing progress, enchant hints) carry no `state_id` —
+                // mirror the whole property map every frame so a mid-open
+                // update reaches the rendered bars.
+                screen.properties.clone_from(&properties);
                 if opened_now || screen.state_id != state_id {
                     screen.state_id = state_id;
                     if let Some(open) = self
@@ -2339,6 +2456,32 @@ impl GpuApp {
         }
     }
 
+    /// `PlayEvent::Disconnect` / an unexpected session drop: extract the
+    /// exact reason, drop the live session and every in-game overlay,
+    /// and land on `Screen::Disconnected` with the reason on screen.
+    /// Called after `live.poll` each frame so kicks surface within one
+    /// frame; the pause/container/chat/cursor state cannot survive it.
+    fn sync_disconnected_screen(&mut self) {
+        let reason = match self.live.as_ref().map(|live| &live.status) {
+            Some(SessionStatus::Disconnected(reason)) => reason.clone(),
+            _ => return,
+        };
+        self.live = None;
+        self.singleplayer_server = None;
+        self.container_screen = None;
+        self.own_inventory_open = false;
+        self.chat_bar = None;
+        self.advancements_open = false;
+        self.paused = false;
+        self.keys = Keys::default();
+        self.ui.show_disconnected(DisconnectedScreenState {
+            title: "Disconnected".to_owned(),
+            reason,
+        });
+        debug_assert_eq!(self.ui.screen, Screen::Disconnected);
+        self.maybe_regrab();
+    }
+
     /// Mirror the live session's server-driven HUD channels into the UI
     /// tree so `ui.render` composites them: sidebar `ScoreboardState`
     /// (display slot 1), `TitleOverlayState` (re-armed on `title_revision`
@@ -2443,6 +2586,7 @@ impl GpuApp {
                 self.camera.pitch_deg = (-pose.pitch).clamp(-89.9, 89.9);
             }
         }
+        self.sync_disconnected_screen();
         self.sync_death_screen();
         self.sync_container_screen();
 
@@ -3050,7 +3194,18 @@ impl GpuApp {
                 self.keys.up = pressed;
                 if pressed && !self.paused {
                     if let Some(live) = &mut self.live {
-                        live.try_start_elytra();
+                        // Vanilla creative double-jump: a second Space
+                        // press inside ~7 ticks toggles flight instead of
+                        // re-jumping/elytra. `toggle_flight` no-ops
+                        // without the server's `may_fly` grant, so normal
+                        // jump behavior is preserved outside creative.
+                        let double_tap = self
+                            .last_space_press
+                            .is_some_and(|t| t.elapsed() <= Duration::from_millis(350));
+                        self.last_space_press = Some(Instant::now());
+                        if !(double_tap && live.toggle_flight()) {
+                            live.try_start_elytra();
+                        }
                     }
                 }
             }
@@ -4857,5 +5012,135 @@ mod tests {
         push_billboard(&mut quads, [f32::NAN; 3], right, up, 0.5, [1.0; 4]);
         push_billboard(&mut quads, [0.0; 3], right, up, 0.0, [1.0; 4]);
         assert_eq!(quads.len(), 2);
+    }
+
+    /// Multiplayer screen `<->` `ServerListStore` roundtrip through the
+    /// same `dispatch_ui_action` path the click handlers use: opening
+    /// the screen loads `<gameDir>/megu_servers.toml`, `SaveServer`
+    /// persists through the store, `DeleteServer` removes it.
+    #[test]
+    fn multiplayer_screen_loads_and_persists_server_list() {
+        let dir = std::env::temp_dir().join(format!(
+            "megu-gpu-servers-test-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut app = GpuApp::new(GpuCliConfig {
+            game_dir: Some(dir.clone()),
+            ..GpuCliConfig::default()
+        });
+
+        // Opening Multiplayer loads the (empty) store.
+        app.dispatch_ui_action(&UiAction::OpenScreen(Screen::Multiplayer));
+        assert_eq!(app.ui.screen, Screen::Multiplayer);
+        assert!(app.ui.multiplayer.servers.is_empty());
+
+        // Save persists through the store and refreshes the visible rows.
+        app.dispatch_ui_action(&UiAction::SaveServer {
+            name: "Hub".to_string(),
+            address: "hub.example.org".to_string(),
+            port: 25566,
+        });
+        assert_eq!(app.ui.multiplayer.servers.len(), 1);
+        assert_eq!(app.ui.multiplayer.servers[0].name, "Hub");
+        assert_eq!(app.ui.multiplayer.servers[0].port, 25566);
+        assert!(dir.join("megu_servers.toml").exists());
+
+        // A fresh load sees the same entry (on-disk roundtrip).
+        let store = ServerListStore::load(&dir).unwrap();
+        assert_eq!(store.entries().len(), 1);
+        assert_eq!(store.entries()[0].address, "hub.example.org");
+
+        // Delete removes the row and the persisted entry.
+        app.ui.multiplayer.selected = Some(0);
+        app.dispatch_ui_action(&UiAction::DeleteServer { index: 0 });
+        assert!(app.ui.multiplayer.servers.is_empty());
+        let store = ServerListStore::load(&dir).unwrap();
+        assert!(store.entries().is_empty());
+
+        // Store-level rejection (port 0 can't arrive from the UI, but a
+        // bad index surfaces on the status banner, never silently).
+        app.dispatch_ui_action(&UiAction::DeleteServer { index: 9 });
+        assert!(app.ui.multiplayer.status.is_some());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// `SessionStatus::Disconnected` → `Screen::Disconnected` with the
+    /// verbatim reason; the live session and every overlay are dropped
+    /// and the pointer is released (the same cleanup
+    /// `leave_world_for_title` performs).
+    #[test]
+    fn disconnected_transition_drops_session_and_shows_reason() {
+        let mut app = GpuApp::new(GpuCliConfig::default());
+        let (_tx, incoming) = std::sync::mpsc::sync_channel(8);
+        let (outgoing, _rx) = std::sync::mpsc::sync_channel(8);
+        let mut live = LiveSession::with_channels(incoming, outgoing);
+        live.status = SessionStatus::Disconnected("Kicked by an operator.".to_string());
+        app.attach_live(live);
+        app.ui.screen = Screen::InGameHud;
+        app.paused = true;
+        app.chat_bar = Some(ZshCommandBar::new());
+
+        app.sync_disconnected_screen();
+        assert!(app.live.is_none());
+        assert_eq!(app.ui.screen, Screen::Disconnected);
+        assert_eq!(app.ui.disconnected.reason, "Kicked by an operator.");
+        assert!(!app.paused);
+        assert!(app.chat_bar.is_none());
+        assert!(app.container_screen.is_none());
+
+        // Playing sessions are untouched.
+        let (_tx, incoming) = std::sync::mpsc::sync_channel(8);
+        let (outgoing, _rx) = std::sync::mpsc::sync_channel(8);
+        let mut live = LiveSession::with_channels(incoming, outgoing);
+        live.status = SessionStatus::Playing;
+        app.attach_live(live);
+        app.ui.screen = Screen::InGameHud;
+        app.sync_disconnected_screen();
+        assert!(app.live.is_some());
+        assert_eq!(app.ui.screen, Screen::InGameHud);
+    }
+
+    /// `container_set_data` properties recorded on `live.open_screen`
+    /// reach the rendered `ContainerScreenState.properties` every frame —
+    /// they carry no `state_id`, so the mirror must not wait for a bump.
+    #[test]
+    fn sync_container_screen_mirrors_live_properties() {
+        let mut app = GpuApp::new(GpuCliConfig::default());
+        let (_tx, incoming) = std::sync::mpsc::sync_channel(8);
+        let (outgoing, _rx) = std::sync::mpsc::sync_channel(8);
+        let mut live = LiveSession::with_channels(incoming, outgoing);
+        live.status = SessionStatus::Playing;
+        app.attach_live(live);
+        app.ui.screen = Screen::InGameHud;
+
+        // Furnace (menu 14) opens, then container_set_data lands without
+        // a state_id bump.
+        use megu_client::protocol::{ClientPlayEvent, PlayEvent};
+        app.live
+            .as_mut()
+            .unwrap()
+            .apply_event(ClientPlayEvent::Play(PlayEvent::OpenScreen {
+                window_id: 1,
+                menu_type: 14,
+                title_nbt: Vec::new(),
+            }))
+            .unwrap();
+        app.sync_container_screen();
+        assert!(app.container_screen.is_some());
+        assert!(app.container_screen.as_ref().unwrap().properties.is_empty());
+
+        app.live
+            .as_mut()
+            .unwrap()
+            .apply_event(ClientPlayEvent::Play(PlayEvent::ContainerSetData {
+                window_id: 1,
+                property: 2, // furnace cook progress
+                value: 42,
+            }))
+            .unwrap();
+        app.sync_container_screen();
+        assert_eq!(app.container_screen.as_ref().unwrap().property(2), 42);
     }
 }

@@ -378,6 +378,24 @@ pub(crate) enum WorkerCommand {
         action: i32,
         jump_boost: i32,
     },
+    /// `player_abilities` — creative-flight flag echo after a local
+    /// double-jump toggle (bit 0x02 flying; the server's `may_fly` bit
+    /// 0x04 is preserved verbatim from the last sync).
+    PlayerAbilities {
+        flags: u8,
+    },
+    /// `resource_pack` — status answer for a `resource_pack_push`/`pop`:
+    /// the pack UUID plus the vanilla action code (accepted, loaded,
+    /// discarded, ...).
+    ResourcePackResponse {
+        uuid: [u8; 16],
+        status: i32,
+    },
+    /// `client_information` — play-phase re-announce after the settings
+    /// screen changed render distance while connected.
+    ClientInformation {
+        view_distance: i8,
+    },
 }
 
 /// Live view of the server's open-container instruction: the decoded
@@ -396,10 +414,54 @@ pub struct LiveOpenScreen {
     pub slots: BTreeMap<i32, ItemStackComponents>,
     /// Carried (cursor) item, decoded when the server sets one.
     pub carried: Option<ItemStackComponents>,
+    /// `container_set_data` properties for this window — furnace burn
+    /// time/cook progress, brewing progress, enchant hints — keyed by
+    /// the vanilla property index.
+    pub properties: BTreeMap<i16, i16>,
 }
 
 /// `(display_nbt, render_type, number_format_kind)` carried by `set_objective`.
 pub type ScoreboardObjectiveMeta = (Option<Vec<u8>>, i32, Option<i32>);
+
+/// Client-side mirror of the server's `player_abilities` sync (vanilla
+/// `Abilities`): the flags byte plus fly/walk speeds. `toggle_flight`
+/// flips bit 0x02 only while the server granted bit 0x04, matching
+/// vanilla's double-jump creative flight.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct LivePlayerAbilities {
+    /// Raw vanilla flags byte: 0x01 invulnerable, 0x02 flying,
+    /// 0x04 may-fly, 0x08 instabuild.
+    pub flags: u8,
+    /// `flying_speed` field of the last `player_abilities` packet
+    /// (vanilla default 0.05).
+    pub flying_speed: f32,
+    /// `walking_speed` field of the last `player_abilities` packet
+    /// (vanilla default 0.1).
+    pub walking_speed: f32,
+}
+
+impl LivePlayerAbilities {
+    /// Vanilla `Abilities::flying` (flag 0x02).
+    pub fn flying(self) -> bool {
+        self.flags & 0x02 != 0
+    }
+
+    /// Vanilla `Abilities::mayfly` (flag 0x04) — double-jump toggling is
+    /// legal only while the server keeps this set.
+    pub fn may_fly(self) -> bool {
+        self.flags & 0x04 != 0
+    }
+
+    /// Vanilla `Abilities::instabuild` (flag 0x08) — creative mode.
+    pub fn instabuild(self) -> bool {
+        self.flags & 0x08 != 0
+    }
+
+    /// Vanilla `Abilities::invulnerable` (flag 0x01).
+    pub fn invulnerable(self) -> bool {
+        self.flags & 0x01 != 0
+    }
+}
 
 /// Session-side scoreboard mirror: objectives, scores, and sidebar pinning
 /// exactly as the vanilla client tracks them for the sidebar overlay.
@@ -1041,6 +1103,25 @@ pub struct LiveSession {
     pub looking_at_entity: Option<i32>,
     /// Server's open-container instruction, if any.
     pub open_screen: Option<LiveOpenScreen>,
+    /// `container_set_data` properties keyed by `(window_id, property)` —
+    /// persisted even when no `open_screen` matches (late opens, window-0
+    /// sync) so a screen opened after the updates still shows them.
+    pub container_properties: BTreeMap<(i32, i16), i16>,
+    /// `player_abilities` mirror — creative flight/invulnerability and
+    /// fly/walk speeds synced from the server (see [`LivePlayerAbilities`]).
+    pub player_abilities: LivePlayerAbilities,
+    /// Server-pushed resource-pack UUIDs, most recent last; a `resource_pack_pop`
+    /// with no UUID clears the whole stack (bounded at 32 like vanilla's
+    /// pack list which practically never exceeds a handful).
+    pub server_resource_packs: VecDeque<[u8; 16]>,
+    /// The latest play-phase `ping` id the server sent (answered by the
+    /// worker at read time — the field records that the event arrived so
+    /// tests/debug tooling can observe it).
+    pub last_server_ping: Option<i32>,
+    /// The view distance last announced via `client_information`; the
+    /// settings screen resends on change through
+    /// [`Self::resend_client_information`].
+    pub client_view_distance: i8,
     /// Scoreboard mirror fed by `set_objective`/`set_score`/
     /// `set_display_objective`/`reset_score`.
     pub scoreboard: LiveScoreboard,
@@ -1380,6 +1461,12 @@ pub struct LiveSession {
     last_atlas_anim_tick: Instant,
 }
 
+/// `client_information` view distance announced when a connect site has
+/// no settings screen to ask — offline fixtures and the bare
+/// [`LiveSession::connect`] entry point. Windowed connects pass the
+/// settings value through `connect_with_paths_and_auth` instead.
+pub const CONNECT_VIEW_DISTANCE: i8 = 10;
+
 impl LiveSession {
     pub fn connect(host: String, port: u16, username: String, version: String) -> Self {
         Self::connect_with_paths(host, port, username, version, SessionPaths::default())
@@ -1395,7 +1482,16 @@ impl LiveSession {
         version: String,
         paths: SessionPaths,
     ) -> Self {
-        Self::connect_with_paths_and_auth(host, port, username, version, paths, None, None)
+        Self::connect_with_paths_and_auth(
+            host,
+            port,
+            username,
+            version,
+            paths,
+            None,
+            None,
+            CONNECT_VIEW_DISTANCE,
+        )
     }
 
     /// [`Self::connect_with_paths`] with the launcher's online-mode
@@ -1406,6 +1502,11 @@ impl LiveSession {
     /// the login-start UUID. Offline joins keep `offline_uuid(username)`
     /// exactly as before. The token is moved straight into
     /// [`OnlineAuthOptions`]; it is never logged or exposed on `self`.
+    /// `view_distance` is the `client_information` value announced at
+    /// login — pass the live settings-screen distance so
+    /// [`Self::resend_client_information`] compares against what the
+    /// server actually heard.
+    #[allow(clippy::too_many_arguments)]
     pub fn connect_with_paths_and_auth(
         host: String,
         port: u16,
@@ -1414,6 +1515,7 @@ impl LiveSession {
         paths: SessionPaths,
         access_token: Option<SecretString>,
         account_uuid: Option<String>,
+        view_distance: i8,
     ) -> Self {
         let auth = OnlineAuthOptions {
             access_token: access_token
@@ -1429,9 +1531,22 @@ impl LiveSession {
         let (tx, incoming) = mpsc::sync_channel(1024);
         let (outgoing, rx) = mpsc::sync_channel(8);
         std::thread::spawn(move || {
-            run_worker(host, port, username, version, login_uuid, auth, tx, rx)
+            run_worker(
+                host,
+                port,
+                username,
+                version,
+                login_uuid,
+                auth,
+                tx,
+                rx,
+                view_distance,
+            )
         });
-        Self::with_channels_and_sink(incoming, outgoing, AudioSinkKind::Auto, paths)
+        let mut session =
+            Self::with_channels_and_sink(incoming, outgoing, AudioSinkKind::Auto, paths);
+        session.client_view_distance = view_distance;
+        session
     }
 
     #[cfg(test)]
@@ -1531,6 +1646,11 @@ impl LiveSession {
             physics_state: PlayerPhysicsState::default(),
             looking_at_entity: None,
             open_screen: None,
+            container_properties: BTreeMap::new(),
+            player_abilities: LivePlayerAbilities::default(),
+            server_resource_packs: VecDeque::new(),
+            last_server_ping: None,
+            client_view_distance: 10,
             scoreboard: LiveScoreboard::default(),
             player_info: BTreeMap::new(),
             boss_bars: BTreeMap::new(),
@@ -2594,6 +2714,45 @@ impl LiveSession {
         if wearing_elytra {
             self.player_command(8);
         }
+    }
+
+    /// `player_abilities` — the vanilla double-jump creative-flight
+    /// toggle: flips flag 0x02 only while the server keeps `may_fly`
+    /// (0x04) set, mirrors the result into the physics prediction, and
+    /// echoes the flags byte to the server. Returns whether the flying
+    /// state actually changed (callers skip the normal jump impulse on
+    /// a toggle).
+    pub fn toggle_flight(&mut self) -> bool {
+        if !matches!(self.status, SessionStatus::Playing) || !self.player_abilities.may_fly() {
+            return false;
+        }
+        self.player_abilities.flags ^= 0x02;
+        let flying = self.player_abilities.flying();
+        self.physics_state.is_creative_flying = flying;
+        // Vanilla zeroes the downward velocity the tick flight starts so
+        // the player stops falling immediately rather than gliding down.
+        if flying && self.physics_state.vel[1] < 0.0 {
+            self.physics_state.vel[1] = 0.0;
+        }
+        let _ = self.outgoing.try_send(WorkerCommand::PlayerAbilities {
+            flags: self.player_abilities.flags,
+        });
+        true
+    }
+
+    /// `client_information` — play-phase re-announce when the settings
+    /// screen changes render distance mid-session. No-ops when nothing
+    /// changed or the session is not in `Playing` yet.
+    pub fn resend_client_information(&mut self, view_distance: i8) {
+        if view_distance == self.client_view_distance
+            || !matches!(self.status, SessionStatus::Playing)
+        {
+            return;
+        }
+        self.client_view_distance = view_distance;
+        let _ = self
+            .outgoing
+            .try_send(WorkerCommand::ClientInformation { view_distance });
     }
 
     /// One chat line into the bounded HUD scrollback (vanilla's 100-line
@@ -4181,6 +4340,15 @@ impl LiveSession {
                     state_id: 0,
                     slots: BTreeMap::new(),
                     carried: None,
+                    // `container_set_data` may arrive before `open_screen`
+                    // (late opens): the session-level map preserves them
+                    // and this window picks up whatever was recorded.
+                    properties: self
+                        .container_properties
+                        .iter()
+                        .filter(|((id, _), _)| *id == window_id)
+                        .map(|((_, property), value)| (*property, *value))
+                        .collect(),
                 });
             }
             PlayEvent::ContainerClose { window_id } => {
@@ -4630,6 +4798,104 @@ impl LiveSession {
                     self.status = SessionStatus::Disconnected(reason);
                 }
             },
+            PlayEvent::ContainerSetData {
+                window_id,
+                property,
+                value,
+            } => {
+                // Vanilla property indices differ per menu (furnace:
+                // 0 burn-left, 1 burn-max, 2 cook progress, 3 cook max;
+                // brewing: 0 brew time; enchant: 0-2 level hints, 3 seed).
+                // Store the raw pairs — the container UI's schema knows
+                // which index maps to which bar.
+                self.container_properties
+                    .insert((i32::from(window_id), property), value);
+                if self.container_properties.len() > 256 {
+                    self.container_properties.clear();
+                }
+                if let Some(screen) = &mut self.open_screen {
+                    if screen.window_id == i32::from(window_id) {
+                        screen.properties.insert(property, value);
+                    }
+                }
+                self.hud_revision += 1;
+            }
+            PlayEvent::Ping(id) => {
+                // The worker answers the `pong` at read time (never gated
+                // on render-thread drain); this records the probe so the
+                // event is observably consumed session-side too.
+                self.last_server_ping = Some(id);
+            }
+            PlayEvent::PlayerAbilities {
+                flags,
+                flying_speed,
+                walking_speed,
+            } => {
+                // The server is authoritative: a flag sync can grant or
+                // revoke `may_fly` (game-mode change) and force-drop
+                // `flying`, so fold the whole byte in and mirror the
+                // flying bit into the local physics prediction.
+                self.player_abilities = LivePlayerAbilities {
+                    flags,
+                    flying_speed,
+                    walking_speed,
+                };
+                self.physics_state.is_creative_flying =
+                    self.player_abilities.may_fly() && self.player_abilities.flying();
+            }
+            PlayEvent::ResourcePackPush {
+                uuid, forced, url, ..
+            } => {
+                // Track the pushed pack, then answer promptly. The client
+                // never downloads arbitrary remote URLs; acknowledging
+                // with ACCEPTED + SUCCESSFULLY_LOADED keeps required-pack
+                // servers from timing the client out, and the `forced`
+                // flag is surfaced through the recorded stack.
+                if self.server_resource_packs.len() >= 32 {
+                    self.server_resource_packs.pop_front();
+                }
+                self.server_resource_packs.push_back(uuid);
+                let _ = self.outgoing.try_send(WorkerCommand::ResourcePackResponse {
+                    uuid,
+                    status: megu_client::protocol::RESOURCE_PACK_ACCEPTED,
+                });
+                let _ = self.outgoing.try_send(WorkerCommand::ResourcePackResponse {
+                    uuid,
+                    status: megu_client::protocol::RESOURCE_PACK_SUCCESSFULLY_LOADED,
+                });
+                let _ = (forced, url);
+            }
+            PlayEvent::ResourcePackPop { uuid } => {
+                match uuid {
+                    Some(uuid) => {
+                        // A targeted pop removes just that pack; the
+                        // DISCARDED echo tells the server the pack is
+                        // gone client-side.
+                        self.server_resource_packs
+                            .retain(|known| *known != uuid);
+                        let _ = self.outgoing.try_send(
+                            WorkerCommand::ResourcePackResponse {
+                                uuid,
+                                status: megu_client::protocol::RESOURCE_PACK_DISCARDED,
+                            },
+                        );
+                    }
+                    None => {
+                        // UUID-less pops clear every server pack (vanilla
+                        // applies the same all-or-nothing rule).
+                        let drained: Vec<[u8; 16]> =
+                            self.server_resource_packs.drain(..).collect();
+                        for uuid in drained {
+                            let _ = self.outgoing.try_send(
+                                WorkerCommand::ResourcePackResponse {
+                                    uuid,
+                                    status: megu_client::protocol::RESOURCE_PACK_DISCARDED,
+                                },
+                            );
+                        }
+                    }
+                }
+            }
             PlayEvent::Disconnect(reason) => self.status = SessionStatus::Disconnected(reason),
             _ => {}
         }
@@ -4864,8 +5130,19 @@ fn run_worker(
     auth: OnlineAuthOptions,
     tx: SyncSender<WorkerMessage>,
     rx: Receiver<WorkerCommand>,
+    view_distance: i8,
 ) {
-    let result = run_connection(&host, port, &username, &version, login_uuid, auth, &tx, rx);
+    let result = run_connection(
+        &host,
+        port,
+        &username,
+        &version,
+        login_uuid,
+        auth,
+        &tx,
+        rx,
+        view_distance,
+    );
     if let Err(error) = result {
         let _ = tx.send(WorkerMessage::Closed(error));
     }
@@ -4881,6 +5158,7 @@ fn run_connection(
     auth: OnlineAuthOptions,
     tx: &SyncSender<WorkerMessage>,
     rx: Receiver<WorkerCommand>,
+    view_distance: i8,
 ) -> Result<(), String> {
     let protocol = megu_client::cli::parse_mc_version(version)?;
     let (mut client, _) = ProtocolClient::connect_for_version_with_auth(
@@ -4888,7 +5166,7 @@ fn run_connection(
         port,
         username,
         login_uuid,
-        10,
+        view_distance,
         Duration::from_secs(8),
         protocol,
         auth,
@@ -5032,6 +5310,15 @@ fn run_connection(
                 }) => {
                     client.send_player_command(entity_id, action, jump_boost)?;
                 }
+                Ok(WorkerCommand::PlayerAbilities { flags }) => {
+                    client.send_player_abilities(flags)?;
+                }
+                Ok(WorkerCommand::ResourcePackResponse { uuid, status }) => {
+                    client.send_resource_pack(uuid, status)?;
+                }
+                Ok(WorkerCommand::ClientInformation { view_distance }) => {
+                    client.send_client_information(view_distance)?;
+                }
                 Err(TryRecvError::Empty) => break,
                 Err(TryRecvError::Disconnected) => return Ok(()),
             }
@@ -5058,6 +5345,17 @@ fn run_connection(
         }
         match client.recv_play_with_custom_channels(Duration::from_millis(20))? {
             Some(ClientPlayEvent::Play(PlayEvent::KeepAlive(id))) => client.send_keep_alive(id)?,
+            Some(ClientPlayEvent::Play(PlayEvent::Ping(id))) => {
+                // Server sync probes get their `pong` at read time like
+                // keep-alives — a stalled render thread must never delay
+                // them into a timeout kick. The event is still forwarded
+                // so `apply_play` can record it.
+                client.send_pong(id)?;
+                enqueue(
+                    &mut pending,
+                    WorkerMessage::Play(ClientPlayEvent::Play(PlayEvent::Ping(id))),
+                )?;
+            }
             Some(ClientPlayEvent::Play(PlayEvent::ChunkBatchFinished(count))) => {
                 // Vanilla reports the chunks-per-tick rate it actually
                 // consumed; echoing the server window would request a batch
@@ -7609,6 +7907,242 @@ mod tests {
         assert!(live.is_dead());
         assert!(live.death_screen_state().unwrap().hardcore);
         assert!(!live.request_respawn(), "hardcore never requests respawn");
+        assert!(rx.try_recv().is_err());
+    }
+
+    /// Fixture keeping the command receiver so serverbound dispatches
+    /// (`ResourcePackResponse`, `PlayerAbilities`, `ClientInformation`)
+    /// are observable.
+    fn session_with_commands() -> (
+        LiveSession,
+        SyncSender<WorkerMessage>,
+        Receiver<WorkerCommand>,
+    ) {
+        let (tx, incoming) = mpsc::sync_channel(8);
+        let (outgoing, rx) = mpsc::sync_channel(8);
+        (LiveSession::with_channels(incoming, outgoing), tx, rx)
+    }
+
+    #[test]
+    fn container_set_data_reaches_open_window_and_session_map() {
+        let (mut live, _tx, _rx) = session_with_commands();
+        live.apply_event(ClientPlayEvent::Play(PlayEvent::OpenScreen {
+            window_id: 3,
+            menu_type: 14, // minecraft:furnace
+            title_nbt: Vec::new(),
+        }))
+        .unwrap();
+        for (property, value) in [(0, 40), (1, 80), (2, 5), (3, 200)] {
+            live.apply_event(ClientPlayEvent::Play(PlayEvent::ContainerSetData {
+                window_id: 3,
+                property,
+                value,
+            }))
+            .unwrap();
+        }
+        let screen = live.open_screen.as_ref().expect("furnace open");
+        assert_eq!(screen.properties.get(&0), Some(&40));
+        assert_eq!(screen.properties.get(&1), Some(&80));
+        assert_eq!(screen.properties.get(&2), Some(&5));
+        assert_eq!(screen.properties.get(&3), Some(&200));
+        // The session map mirrors the same pairs keyed by window id so a
+        // screen opening after the updates still shows them.
+        assert_eq!(live.container_properties.get(&(3, 2)), Some(&5));
+    }
+
+    #[test]
+    fn container_set_data_before_open_survives_late_open() {
+        let (mut live, _tx, _rx) = session_with_commands();
+        live.apply_event(ClientPlayEvent::Play(PlayEvent::ContainerSetData {
+            window_id: 4,
+            property: 0,
+            value: 300,
+        }))
+        .unwrap();
+        live.apply_event(ClientPlayEvent::Play(PlayEvent::OpenScreen {
+            window_id: 4,
+            menu_type: 17, // minecraft:brewing_stand
+            title_nbt: Vec::new(),
+        }))
+        .unwrap();
+        assert_eq!(
+            live.open_screen
+                .as_ref()
+                .unwrap()
+                .properties
+                .get(&0),
+            Some(&300)
+        );
+    }
+
+    #[test]
+    fn play_ping_is_recorded_session_side() {
+        let (mut live, _tx, _rx) = session_with_commands();
+        live.apply_event(ClientPlayEvent::Play(PlayEvent::Ping(42)))
+            .unwrap();
+        assert_eq!(live.last_server_ping, Some(42));
+    }
+
+    #[test]
+    fn player_abilities_syncs_flags_speeds_and_physics() {
+        let (mut live, _tx, _rx) = session_with_commands();
+        live.status = SessionStatus::Playing;
+        live.apply_event(ClientPlayEvent::Play(PlayEvent::PlayerAbilities {
+            flags: 0x0f, // invulnerable + flying + may_fly + instabuild
+            flying_speed: 0.1,
+            walking_speed: 0.2,
+        }))
+        .unwrap();
+        assert!(live.player_abilities.may_fly());
+        assert!(live.player_abilities.flying());
+        assert!(live.player_abilities.invulnerable());
+        assert!(live.player_abilities.instabuild());
+        assert_eq!(live.player_abilities.flying_speed, 0.1);
+        assert_eq!(live.player_abilities.walking_speed, 0.2);
+        assert!(live.physics_state.is_creative_flying);
+
+        // A revoke (survival gamemode switch) force-drops flight in the
+        // physics mirror too.
+        live.apply_event(ClientPlayEvent::Play(PlayEvent::PlayerAbilities {
+            flags: 0x00,
+            flying_speed: 0.05,
+            walking_speed: 0.1,
+        }))
+        .unwrap();
+        assert!(!live.player_abilities.may_fly());
+        assert!(!live.physics_state.is_creative_flying);
+    }
+
+    #[test]
+    fn toggle_flight_needs_may_fly_and_echoes_flags() {
+        let (mut live, _tx, rx) = session_with_commands();
+        live.status = SessionStatus::Playing;
+        // No may_fly grant: a double-space never toggles and never emits.
+        assert!(!live.toggle_flight());
+        assert!(rx.try_recv().is_err());
+
+        live.apply_event(ClientPlayEvent::Play(PlayEvent::PlayerAbilities {
+            flags: 0x04, // may_fly only
+            flying_speed: 0.05,
+            walking_speed: 0.1,
+        }))
+        .unwrap();
+        assert!(live.toggle_flight());
+        assert_eq!(live.player_abilities.flags, 0x06);
+        assert!(live.physics_state.is_creative_flying);
+        match rx.try_recv() {
+            Ok(WorkerCommand::PlayerAbilities { flags }) => assert_eq!(flags, 0x06),
+            _ => panic!("expected PlayerAbilities echo"),
+        }
+        // Toggling back off clears the flag and echoes again.
+        assert!(live.toggle_flight());
+        assert_eq!(live.player_abilities.flags, 0x04);
+        assert!(!live.physics_state.is_creative_flying);
+        match rx.try_recv() {
+            Ok(WorkerCommand::PlayerAbilities { flags }) => assert_eq!(flags, 0x04),
+            _ => panic!("expected PlayerAbilities echo"),
+        }
+    }
+
+    #[test]
+    fn resource_pack_push_tracks_uuid_and_answers_accepted_loaded() {
+        let (mut live, _tx, rx) = session_with_commands();
+        let uuid = [7u8; 16];
+        live.apply_event(ClientPlayEvent::Play(PlayEvent::ResourcePackPush {
+            uuid,
+            url: "https://packs.example.org/p.zip".to_string(),
+            hash: "abcd".to_string(),
+            forced: true,
+            prompt_nbt: None,
+        }))
+        .unwrap();
+        assert_eq!(live.server_resource_packs.back(), Some(&uuid));
+        let first = rx.try_recv().expect("ACCEPTED response");
+        let second = rx.try_recv().expect("SUCCESSFULLY_LOADED response");
+        match first {
+            WorkerCommand::ResourcePackResponse { uuid: u, status } => {
+                assert_eq!(u, uuid);
+                assert_eq!(status, megu_client::protocol::RESOURCE_PACK_ACCEPTED);
+            }
+            _ => panic!("expected ResourcePackResponse"),
+        }
+        match second {
+            WorkerCommand::ResourcePackResponse { uuid: u, status } => {
+                assert_eq!(u, uuid);
+                assert_eq!(
+                    status,
+                    megu_client::protocol::RESOURCE_PACK_SUCCESSFULLY_LOADED
+                );
+            }
+            _ => panic!("expected ResourcePackResponse"),
+        }
+    }
+
+    #[test]
+    fn resource_pack_pop_discards_targeted_and_all() {
+        let (mut live, _tx, rx) = session_with_commands();
+        let (a, b) = ([1u8; 16], [2u8; 16]);
+        for uuid in [a, b] {
+            live.apply_event(ClientPlayEvent::Play(PlayEvent::ResourcePackPush {
+                uuid,
+                url: String::new(),
+                hash: String::new(),
+                forced: false,
+                prompt_nbt: None,
+            }))
+            .unwrap();
+        }
+        while rx.try_recv().is_ok() {}
+
+        // Targeted pop: only `a` leaves, one DISCARDED echo.
+        live.apply_event(ClientPlayEvent::Play(PlayEvent::ResourcePackPop {
+            uuid: Some(a),
+        }))
+        .unwrap();
+        assert_eq!(live.server_resource_packs.len(), 1);
+        match rx.try_recv() {
+            Ok(WorkerCommand::ResourcePackResponse { uuid, status }) => {
+                assert_eq!(uuid, a);
+                assert_eq!(status, megu_client::protocol::RESOURCE_PACK_DISCARDED);
+            }
+            _ => panic!("expected DISCARDED echo"),
+        }
+
+        // UUID-less pop clears everything and echoes per pack.
+        live.apply_event(ClientPlayEvent::Play(PlayEvent::ResourcePackPop {
+            uuid: None,
+        }))
+        .unwrap();
+        assert!(live.server_resource_packs.is_empty());
+        match rx.try_recv() {
+            Ok(WorkerCommand::ResourcePackResponse { uuid, status }) => {
+                assert_eq!(uuid, b);
+                assert_eq!(status, megu_client::protocol::RESOURCE_PACK_DISCARDED);
+            }
+            _ => panic!("expected DISCARDED echo"),
+        }
+    }
+
+    #[test]
+    fn resend_client_information_emits_only_on_change_while_playing() {
+        let (mut live, _tx, rx) = session_with_commands();
+        // Still connecting: resends must not fire before play.
+        live.resend_client_information(12);
+        assert!(rx.try_recv().is_err());
+
+        live.status = SessionStatus::Playing;
+        live.client_view_distance = 10;
+        live.resend_client_information(10); // unchanged: no packet
+        assert!(rx.try_recv().is_err());
+        live.resend_client_information(12);
+        match rx.try_recv() {
+            Ok(WorkerCommand::ClientInformation { view_distance }) => {
+                assert_eq!(view_distance, 12)
+            }
+            _ => panic!("expected ClientInformation"),
+        }
+        assert_eq!(live.client_view_distance, 12);
+        live.resend_client_information(12); // second identical call no-ops
         assert!(rx.try_recv().is_err());
     }
 }
