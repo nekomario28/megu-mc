@@ -424,12 +424,17 @@ pub fn decode_custom_payload_packet(body: &[u8]) -> Result<ClientCustomChannelEv
 }
 const MAX_NBT_DEPTH: usize = 64;
 const MAX_NBT_ARRAY: usize = 1_048_576;
+const MAX_NBT_TAGS: usize = 262_144;
 /// Upper bound on the section count a `level_chunk_with_light` /
 /// `light_update` packet may claim. The count derives from server-sent
 /// `dimension_type` NBT (`height / 16`), so it is attacker-controlled:
-/// 4096 sections is a 65,536-block world height, far past any real
-/// dimension, and keeps the per-section `Vec` pre-allocations bounded.
-const MAX_WORLD_SECTIONS: usize = 4096;
+/// 256 sections is a 4096-block world height, covering the 1.21.1
+/// dimension span while keeping per-section `Vec` pre-allocations bounded.
+const MAX_WORLD_SECTIONS: usize = 256;
+/// Smallest legal paletted section on the 767 wire: 2-byte block count,
+/// a 3-byte single-value block container, and a 3-byte single-value biome
+/// container.
+const MIN_WIRE_SECTION_BYTES: usize = 8;
 
 // ---------------------------------------------------------------------------
 // Wire reader / writer primitives
@@ -438,11 +443,16 @@ const MAX_WORLD_SECTIONS: usize = 4096;
 pub struct WireReader<'a> {
     data: &'a [u8],
     pos: usize,
+    remaining_tags: usize,
 }
 
 impl<'a> WireReader<'a> {
     pub fn new(data: &'a [u8]) -> Self {
-        Self { data, pos: 0 }
+        Self {
+            data,
+            pos: 0,
+            remaining_tags: MAX_NBT_TAGS,
+        }
     }
 
     pub fn remaining(&self) -> usize {
@@ -594,10 +604,44 @@ impl<'a> WireReader<'a> {
         Ok(String::from_utf8_lossy(raw).into_owned())
     }
 
+    fn consume_nbt_tag_budget(&mut self) -> Result<(), String> {
+        if self.remaining_tags == 0 {
+            return Err("NBT tag budget exceeded".to_string());
+        }
+        self.remaining_tags -= 1;
+        Ok(())
+    }
+
+    fn read_nbt_array_len(
+        &mut self,
+        element_size: usize,
+        label: &str,
+    ) -> Result<(usize, usize), String> {
+        let raw_len = self.read_i32()?;
+        if raw_len < 0 {
+            return Err(format!("negative NBT {label} length"));
+        }
+        let len = raw_len as usize;
+        if len > MAX_NBT_ARRAY {
+            return Err(format!("NBT {label} length exceeds bound"));
+        }
+        let bytes = len
+            .checked_mul(element_size)
+            .ok_or_else(|| format!("NBT {label} length overflow"))?;
+        if bytes > self.remaining() {
+            return Err(format!(
+                "NBT {label} requires {bytes} bytes, {} remain",
+                self.remaining()
+            ));
+        }
+        Ok((len, bytes))
+    }
+
     fn read_nbt_payload(&mut self, tag: u8, depth: usize) -> Result<NbtValue, String> {
         if depth >= MAX_NBT_DEPTH {
             return Err("NBT nesting depth exceeded".to_string());
         }
+        self.consume_nbt_tag_budget()?;
         match tag {
             0 => Ok(NbtValue::End),
             1 => Ok(NbtValue::Byte(self.read_u8()? as i8)),
@@ -607,12 +651,8 @@ impl<'a> WireReader<'a> {
             5 => Ok(NbtValue::Float(self.read_f32()?)),
             6 => Ok(NbtValue::Double(self.read_f64()?)),
             7 => {
-                let len = usize::try_from(self.read_i32()?)
-                    .map_err(|_| "negative NBT byte array".to_string())?;
-                if len > MAX_NBT_ARRAY {
-                    return Err("NBT byte array exceeds bound".to_string());
-                }
-                let _ = self.take(len)?;
+                let (len, bytes) = self.read_nbt_array_len(1, "byte array")?;
+                let _ = self.take(bytes)?;
                 Ok(NbtValue::ArrayLen(len))
             }
             8 => Ok(NbtValue::String(self.read_nbt_string()?)),
@@ -623,7 +663,21 @@ impl<'a> WireReader<'a> {
                 if len > MAX_NBT_ARRAY {
                     return Err("NBT list exceeds bound".to_string());
                 }
-                let mut items = Vec::with_capacity(len.min(64));
+                if elem_tag == 0 && len != 0 {
+                    return Err(format!(
+                        "NBT list declares TAG_End elements with non-zero length {len}"
+                    ));
+                }
+                if elem_tag > 12 {
+                    return Err(format!("invalid NBT list element tag {elem_tag}"));
+                }
+                if len > self.remaining() {
+                    return Err(format!(
+                        "NBT list length {len} exceeds {} remaining bytes",
+                        self.remaining()
+                    ));
+                }
+                let mut items = Vec::with_capacity(len.min(self.remaining()).min(4096));
                 for _ in 0..len {
                     items.push(self.read_nbt_payload(elem_tag, depth + 1)?);
                 }
@@ -642,21 +696,13 @@ impl<'a> WireReader<'a> {
                 }
             }
             11 => {
-                let len = usize::try_from(self.read_i32()?)
-                    .map_err(|_| "negative NBT int array".to_string())?;
-                if len > MAX_NBT_ARRAY {
-                    return Err("NBT int array exceeds bound".to_string());
-                }
-                let _ = self.take(len * 4)?;
+                let (len, bytes) = self.read_nbt_array_len(4, "int array")?;
+                let _ = self.take(bytes)?;
                 Ok(NbtValue::ArrayLen(len))
             }
             12 => {
-                let len = usize::try_from(self.read_i32()?)
-                    .map_err(|_| "negative NBT long array".to_string())?;
-                if len > MAX_NBT_ARRAY {
-                    return Err("NBT long array exceeds bound".to_string());
-                }
-                let _ = self.take(len * 8)?;
+                let (len, bytes) = self.read_nbt_array_len(8, "long array")?;
+                let _ = self.take(bytes)?;
                 Ok(NbtValue::ArrayLen(len))
             }
             other => Err(format!("unknown NBT tag {other}")),
@@ -1222,7 +1268,10 @@ pub fn decode_chunk_packet_profiled(
             let _hm_type = reader.read_varint()?;
             let longs = usize::try_from(reader.read_varint()?)
                 .map_err(|_| "negative heightmap long count".to_string())?;
-            let _ = reader.take(longs * 8)?;
+            let longs_bytes = longs
+                .checked_mul(8)
+                .ok_or_else(|| "heightmap long count overflow".to_string())?;
+            let _ = reader.take(longs_bytes)?;
         }
     } else {
         let _heightmaps = reader.read_nbt()?;
@@ -1231,6 +1280,14 @@ pub fn decode_chunk_packet_profiled(
     let data_len = usize::try_from(reader.read_varint()?)
         .map_err(|_| "negative chunk data length".to_string())?;
     let section_bytes = reader.take(data_len)?;
+    let min_section_bytes = section_count
+        .checked_mul(MIN_WIRE_SECTION_BYTES)
+        .ok_or_else(|| "chunk section count overflow".to_string())?;
+    if data_len < min_section_bytes {
+        return Err(format!(
+            "chunk section data length {data_len} is below minimum {min_section_bytes} for {section_count} sections"
+        ));
+    }
     let mut sec_reader = WireReader::new(section_bytes);
 
     let biome_direct_bits = if biome_count <= 1 {

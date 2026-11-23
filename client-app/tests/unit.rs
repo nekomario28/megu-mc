@@ -493,8 +493,8 @@ fn hostile_wire_counts_fail_closed_before_allocation() {
     assert!(decode_chunk_packet(&[], hostile_sections, 64).is_err());
     assert!(decode_update_light_packet(&[], hostile_sections, false).is_err());
     // The bound still admits real dimensions (24/96-section tests pass).
-    assert!(decode_chunk_packet(&[], 4096, 64).is_err()); // empty body, not the cap
-    let over = decode_chunk_packet(&[], 4097, 64);
+    assert!(decode_chunk_packet(&[], 256, 64).is_err()); // empty body, within cap
+    let over = decode_chunk_packet(&[], 257, 64);
     assert!(over.unwrap_err().contains("section count"));
 
     // Palette length larger than the bytes that follow can never be
