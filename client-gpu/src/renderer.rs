@@ -1260,6 +1260,10 @@ impl TransferTopologyBudget {
 /// device-local destinations only ever see DMA traffic.
 pub struct UploadStagingRing {
     slots: Vec<wgpu::Buffer>,
+    /// Slots already carrying a recorded copy in the caller's current
+    /// submission batch — re-mapping one before its copy executes would
+    /// overwrite the payload the pending copy still has to transfer.
+    slot_used: Vec<bool>,
     next: usize,
     slot_bytes: u64,
     /// Slot buffers the ring has allocated (construction +
@@ -1269,8 +1273,8 @@ pub struct UploadStagingRing {
     pub staging_ring_uploads: u64,
     /// Staged writes deferred by the per-frame DMA cap, cumulative.
     pub staging_ring_dma_defers: u64,
-    /// Map failures served by the direct `write_buffer` fallback,
-    /// cumulative (should stay at zero on a healthy device).
+    /// Map failures and same-batch slot wraps served by the direct
+    /// `write_buffer` fallback, cumulative.
     pub staging_ring_fallbacks: u64,
 }
 
@@ -1279,6 +1283,7 @@ impl UploadStagingRing {
     pub fn new(device: &wgpu::Device, budget: &TransferTopologyBudget) -> Self {
         let mut ring = Self {
             slots: Vec::new(),
+            slot_used: Vec::new(),
             next: 0,
             slot_bytes: 0,
             staging_ring_allocs: 0,
@@ -1308,9 +1313,20 @@ impl UploadStagingRing {
                 })
             })
             .collect();
+        self.slot_used = vec![false; slot_count as usize];
         self.next = 0;
         self.slot_bytes = slot_bytes;
         self.staging_ring_allocs += u64::from(slot_count);
+    }
+
+    /// Open a fresh submission batch: every slot's recorded copy from the
+    /// previous batch has executed (its encoder was submitted), so all
+    /// slots are reusable. Called once before the staged writes of a
+    /// shared `CommandEncoder` — NOT between writes, since every copy
+    /// recorded into that encoder still reads its slot at submit time.
+    pub fn begin_batch(&mut self) {
+        self.slot_used.fill(false);
+        self.next = 0;
     }
 
     /// Re-size the ring when the topology budget changes; identical
@@ -1324,10 +1340,13 @@ impl UploadStagingRing {
         self.rebuild_slots(device, slots, bytes);
     }
 
-    /// Stage `bytes` for `dst` at `dst_offset` through the next ring slot
-    /// and record the DMA copy in `encoder`. Payloads larger than a slot
-    /// grow the ring's slot size once; a failed map falls back to
-    /// `queue.write_buffer` (counted, never panics).
+    /// Stage `bytes` for `dst` at `dst_offset` through the next free ring
+    /// slot and record the DMA copy in `encoder`. Payloads larger than a
+    /// slot grow the ring's slot size once; a failed map or a batch that
+    /// out-numbers the ring falls back to `queue.write_buffer` (counted,
+    /// never panics). A slot with a recorded-but-unsubmitted copy is
+    /// never re-mapped: the pending copy still has to transfer the old
+    /// payload, so bursts past `slot_count` writes take the queue path.
     pub fn stage_copy(
         &mut self,
         device: &wgpu::Device,
@@ -1345,8 +1364,19 @@ impl UploadStagingRing {
             let slots = self.slots.len().max(1) as u32;
             self.rebuild_slots(device, slots, len.next_power_of_two());
         }
-        let index = self.next;
-        self.next = (self.next + 1) % self.slots.len();
+        let index = (self.next..self.next + self.slots.len()).find_map(|i| {
+            let index = i % self.slots.len();
+            (!self.slot_used[index]).then_some(index)
+        });
+        let Some(index) = index else {
+            // Every slot already carries an unsubmitted copy this batch:
+            // the queue's own staging preserves each payload exactly.
+            self.staging_ring_fallbacks += 1;
+            queue.write_buffer(dst, dst_offset, bytes);
+            return;
+        };
+        self.slot_used[index] = true;
+        self.next = (index + 1) % self.slots.len();
         let slot = &self.slots[index];
         let slice = slot.slice(..len);
         let (tx, rx) = std::sync::mpsc::channel();
@@ -1962,6 +1992,24 @@ pub struct GpuRenderer {
     pub gpu_indirect_draw_passes: u64,
     /// Section records submitted to the GPU cull, cumulative.
     pub gpu_indirect_sections_submitted: u64,
+    /// Retained pack scratch for [`Self::encode_gpu_indirect_cull`]'s
+    /// `SectionGpuRecord` list — `mem::take`n, refilled and returned each
+    /// indirect frame so steady frames allocate nothing.
+    gpu_indirect_record_scratch: Vec<SectionGpuRecord>,
+    /// Retained pack scratch for the matching record coords.
+    gpu_indirect_coord_scratch: Vec<SectionCoord>,
+    /// Retained scratch for the front-to-back region origin list.
+    gpu_indirect_origin_scratch: Vec<[i32; 3]>,
+    /// `queue.write_buffer` calls against the indirect
+    /// `SectionGpuRecord` buffer, cumulative — one per coalesced dirty
+    /// span, zero on frames whose record pack is unchanged.
+    pub gpu_indirect_record_uploads: u64,
+    /// `SectionGpuRecord` bytes uploaded to the indirect buffer,
+    /// cumulative.
+    pub gpu_indirect_record_bytes_uploaded: u64,
+    /// Indirect frames whose record diff was empty — the record buffer
+    /// upload was skipped entirely (0 bytes, 0 `write_buffer` calls).
+    pub gpu_indirect_record_uploads_skipped: u64,
     /// Frame-depth pyramid builds recorded after composed world passes.
     pub gpu_hiz_pyramid_builds: u64,
     /// Real frame-P95 observations fed to the upload budget through
@@ -3110,6 +3158,10 @@ struct GpuIndirectBuffers {
     capacity: usize,
     /// Record coords in args order — the test/debug readback mapping.
     record_coords: Vec<SectionCoord>,
+    /// CPU shadow of `sections` — the baseline the next frame's record
+    /// pack diffs against, so steady frames upload zero bytes and a
+    /// changed residency uploads only the coalesced dirty spans.
+    record_shadow: Vec<SectionGpuRecord>,
 }
 
 /// One region's contiguous run inside the frame's indirect args buffer.
@@ -3131,6 +3183,51 @@ struct GpuIndirectFrame {
     args: wgpu::Buffer,
     /// Per-region contiguous runs, front-to-back.
     runs: Vec<GpuIndirectRun>,
+}
+
+/// Differential `SectionGpuRecord` upload: bitwise-diff `records`
+/// against `shadow` (the bytes already in `buffer`) and `write_buffer`
+/// only the dirty indices, coalescing adjacent ones into one minimal
+/// contiguous span per call. A grown `records` dirties its tail (an
+/// empty shadow — fresh or just-reallocated buffer — collapses to a
+/// single full-slice write); a shrunk one needs no tail write because
+/// the shader reads only `count` records. Returns `(write_buffer calls,
+/// bytes uploaded)` — `(0, 0)` on a steady frame — and resyncs `shadow`
+/// to `records` either way.
+fn write_indirect_record_diff(
+    queue: &wgpu::Queue,
+    buffer: &wgpu::Buffer,
+    shadow: &mut Vec<SectionGpuRecord>,
+    records: &[SectionGpuRecord],
+) -> (u64, u64) {
+    let stride = std::mem::size_of::<SectionGpuRecord>() as u64;
+    let mut calls = 0u64;
+    let mut bytes = 0u64;
+    let mut span_start: Option<usize> = None;
+    for (i, record) in records.iter().enumerate() {
+        let dirty = shadow
+            .get(i)
+            .is_none_or(|s| bytemuck::bytes_of(s) != bytemuck::bytes_of(record));
+        if dirty {
+            if span_start.is_none() {
+                span_start = Some(i);
+            }
+        } else if let Some(start) = span_start.take() {
+            let data = bytemuck::cast_slice(&records[start..i]);
+            queue.write_buffer(buffer, start as u64 * stride, data);
+            calls += 1;
+            bytes += data.len() as u64;
+        }
+    }
+    if let Some(start) = span_start {
+        let data = bytemuck::cast_slice(&records[start..]);
+        queue.write_buffer(buffer, start as u64 * stride, data);
+        calls += 1;
+        bytes += data.len() as u64;
+    }
+    shadow.clear();
+    shadow.extend_from_slice(records);
+    (calls, bytes)
 }
 
 /// Inputs that decide whether a recorded per-cascade shadow `RenderBundle`
@@ -4818,6 +4915,12 @@ impl GpuRenderer {
             gpu_hiz_frame_vp: None,
             gpu_indirect_draw_passes: 0,
             gpu_indirect_sections_submitted: 0,
+            gpu_indirect_record_scratch: Vec::new(),
+            gpu_indirect_coord_scratch: Vec::new(),
+            gpu_indirect_origin_scratch: Vec::new(),
+            gpu_indirect_record_uploads: 0,
+            gpu_indirect_record_bytes_uploaded: 0,
+            gpu_indirect_record_uploads_skipped: 0,
             gpu_hiz_pyramid_builds: 0,
             upload_budget_p95_observations: 0,
             transfer_budget,
@@ -6334,6 +6437,9 @@ impl GpuRenderer {
             });
         let mut dma_remaining = self.transfer_budget.frame_dma_cap_bytes;
         let slab = self.transfer_budget.arena_slab_bytes as usize;
+        // One encoder spans every staged copy below: slots used by an
+        // unsubmitted copy stay out of rotation until the submit.
+        self.staging_ring.begin_batch();
         for arena in self.region_arenas.values_mut() {
             let (partial, buffers_replaced) = arena.flush_gpu(
                 &self.ctx.device,
@@ -6881,6 +6987,23 @@ impl GpuRenderer {
         self.gpu_indirect.as_ref().map(|b| &b.args)
     }
 
+    /// Test/verification readback of one region arena's vertex buffer
+    /// plus `(vertex_high_water, flushed_vertex_len, vertex_capacity)`.
+    #[doc(hidden)]
+    pub fn debug_region_arena_vertex_buffer(
+        &self,
+        origin: [i32; 3],
+    ) -> Option<(&wgpu::Buffer, u32, u32, usize)> {
+        self.region_arenas.get(&origin).map(|a| {
+            (
+                &a.vertex_buffer,
+                a.vertex_high_water,
+                a.flushed_vertex_len,
+                a.vertex_capacity,
+            )
+        })
+    }
+
     /// Grow the persistent indirect buffers to `capacity` section
     /// records (powers of two; steady-state frames never reallocate).
     fn ensure_gpu_indirect_capacity(&mut self, capacity: usize) {
@@ -6930,6 +7053,9 @@ impl GpuRenderer {
             }),
             capacity,
             record_coords: Vec::new(),
+            // A fresh (empty) shadow diffs fully dirty, so a
+            // grow-realloc uploads the whole record pack in one span.
+            record_shadow: Vec::new(),
         });
     }
 
@@ -6954,12 +7080,20 @@ impl GpuRenderer {
             return None;
         }
         let edge = EDGE as f32;
-        let mut records: Vec<SectionGpuRecord> = Vec::new();
-        let mut record_coords: Vec<SectionCoord> = Vec::new();
+        // Retained scratch: `mem::take` moves the capacity out of `self`
+        // for the duration of the pack (the loops below borrow
+        // `self.region_arenas` immutably) and the tail of the function
+        // returns it — steady frames never allocate.
+        let mut records = std::mem::take(&mut self.gpu_indirect_record_scratch);
+        let mut record_coords = std::mem::take(&mut self.gpu_indirect_coord_scratch);
+        let mut origins = std::mem::take(&mut self.gpu_indirect_origin_scratch);
+        records.clear();
+        record_coords.clear();
+        origins.clear();
+        origins.extend(self.region_arenas.keys().copied());
         let mut runs: Vec<GpuIndirectRun> = Vec::new();
-        let mut origins: Vec<[i32; 3]> = self.region_arenas.keys().copied().collect();
         sort_regions_front_to_back(&mut origins, camera_position);
-        for origin in origins {
+        for origin in origins.iter().copied() {
             let arena = &self.region_arenas[&origin];
             if arena.draw_empty() {
                 continue;
@@ -7005,6 +7139,9 @@ impl GpuRenderer {
             });
         }
         if records.is_empty() {
+            self.gpu_indirect_record_scratch = records;
+            self.gpu_indirect_coord_scratch = record_coords;
+            self.gpu_indirect_origin_scratch = origins;
             return None;
         }
         let count = records.len() as u32;
@@ -7042,13 +7179,26 @@ impl GpuRenderer {
             ],
         };
         let buffers = self.gpu_indirect.as_mut().expect("capacity ensured");
-        buffers.record_coords = record_coords;
+        buffers.record_coords.clone_from(&record_coords);
         self.ctx
             .queue
             .write_buffer(&buffers.uniforms, 0, bytemuck::bytes_of(&uniforms));
-        self.ctx
-            .queue
-            .write_buffer(&buffers.sections, 0, bytemuck::cast_slice(&records));
+        // Differential record upload: diff the pack against the shadow
+        // of the last uploaded copy — an identical frame costs zero
+        // `write_buffer` calls, a residency change costs only the
+        // coalesced dirty spans, a grow-realloc (fresh shadow) costs one
+        // full-slice write.
+        let (span_writes, span_bytes) = write_indirect_record_diff(
+            &self.ctx.queue,
+            &buffers.sections,
+            &mut buffers.record_shadow,
+            &records,
+        );
+        if span_writes == 0 {
+            self.gpu_indirect_record_uploads_skipped += 1;
+        }
+        self.gpu_indirect_record_uploads += span_writes;
+        self.gpu_indirect_record_bytes_uploaded += span_bytes;
         self.ctx
             .queue
             .write_buffer(&buffers.stats, 0, bytemuck::bytes_of(&CullStats::default()));
@@ -7064,6 +7214,9 @@ impl GpuRenderer {
             count,
         );
         self.gpu_indirect_sections_submitted += u64::from(count);
+        self.gpu_indirect_record_scratch = records;
+        self.gpu_indirect_coord_scratch = record_coords;
+        self.gpu_indirect_origin_scratch = origins;
         Some(GpuIndirectFrame {
             args: buffers.args.clone(),
             runs,
