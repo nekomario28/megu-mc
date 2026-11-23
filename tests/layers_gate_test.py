@@ -42,13 +42,19 @@ def fixture():
         yield root
 
 
-def run(root, path=None):
+def run(root, path=None, missing_inspector=False, argv=()):
     env = dict(os.environ, PYTHONDONTWRITEBYTECODE="1")
     target = Path(env.get("CARGO_TARGET_DIR", str(ROOT / "target")))
     if not target.is_absolute(): target = ROOT / target
     env["CARGO_TARGET_DIR"] = str(target / "layer-gate-tests")
+    env.pop("MEGU_DEPSGX", None)
     if path is not None: env["PATH"] = str(path)
-    result = subprocess.run([sys.executable, "tools/check_layers.py"], cwd=root, env=env,
+    # The sandbox picks an inspector the way layers_check.sh does: a depsgx on the
+    # effective PATH wins (CI's pinned venv build keeps its coverage); with none,
+    # the fixture's own check_layers.py serves in its pure-Python `inspect` mode.
+    if not missing_inspector and not shutil.which("depsgx", path=env["PATH"]):
+        env["MEGU_DEPSGX"] = str(root / "tools" / "check_layers.py")
+    result = subprocess.run([sys.executable, "tools/check_layers.py", *argv], cwd=root, env=env,
                             capture_output=True, text=True, timeout=180)
     return result.returncode, result.stdout + result.stderr
 
@@ -210,7 +216,12 @@ class LayerGateTests(unittest.TestCase):
 
     def test_missing_tool_is_not_a_skip(self):
         with fixture() as root:
-            code, output = run(root, root / "bin")
+            code, output = run(root, root / "bin", missing_inspector=True)
+            self.assertNotEqual(code, 0)
+            self.assertIn("depsgx is required", output)
+            # An explicit --depsgx that does not exist is the same failure, never a skip.
+            code, output = run(root, missing_inspector=True,
+                               argv=["--depsgx", str(root / "bin" / "depsgx")])
             self.assertNotEqual(code, 0)
             self.assertIn("depsgx is required", output)
 

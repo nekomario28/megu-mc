@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 """Fail closed on real source edges, named debt, or an inspector that cannot fail."""
+import argparse
 from collections import Counter
 import json
 import os
@@ -7,6 +8,7 @@ from pathlib import Path
 import shutil
 import subprocess
 import sys
+import types
 from rust_module_graph import ROOT, POLICY, source_graph
 
 DIR = ROOT / "evidence/foundation/module-layers"
@@ -15,8 +17,105 @@ DIR = ROOT / "evidence/foundation/module-layers"
 INSPECT_TIMEOUT = float(os.environ.get("MEGU_LAYERS_INSPECT_TIMEOUT", "180"))
 
 
+class SpecGraph:
+    """The `depsgx` module surface the three evidence specs in DIR use."""
+
+    def __init__(self, modules=(), depends=(), roots=(), layers=(), forbidden=()):
+        self.modules = [str(name) for name in modules]
+        self.depends = [tuple(edge) for edge in depends]
+        self.roots = list(roots)
+        self.layers = [list(layer) for layer in layers]
+        self.forbidden = {tuple(edge) for edge in forbidden}
+
+
+def graph_problems(graph):
+    """The findings the probe pins: every independent cycle, upward edge, forbidden edge."""
+    rank = {name: i for i, layer in enumerate(graph.layers) for name in layer}
+    adjacency = {name: set() for name in graph.modules}
+    for source, target in graph.depends:
+        adjacency.setdefault(source, set()).add(target)
+        adjacency.setdefault(target, set())
+
+    def reaches(start):
+        seen, stack = set(), [start]
+        while stack:
+            for name in adjacency.get(stack.pop(), ()):
+                if name not in seen:
+                    seen.add(name)
+                    stack.append(name)
+        return seen
+
+    forward = {name: reaches(name) for name in adjacency}
+    problems, grouped = [], set()
+    for name in sorted(adjacency):
+        if name in grouped:
+            continue
+        cycle = {other for other in adjacency
+                 if other in forward[name] and name in forward[other]}
+        if len(cycle) > 1 or name in adjacency.get(name, ()):
+            problems.append({"severity": "error", "code": "cycle", "target": min(cycle),
+                             "message": "dependency cycle " + " <-> ".join(sorted(cycle))})
+        grouped |= cycle or {name}
+    for source, target in graph.depends:
+        if (source, target) in graph.forbidden:
+            problems.append({"severity": "error", "code": "forbidden-dependency",
+                             "target": source,
+                             "message": f"{source} may not depend on {target}"})
+        if source in rank and target in rank and rank[target] < rank[source]:
+            problems.append({"severity": "error", "code": "layer-violation",
+                             "target": source,
+                             "message": f"{source} depends upward on {target}"})
+    return problems
+
+
+def inspect_spec(path):
+    """Execute one spec like `depsgx inspect` does, then analyze the graph it built."""
+    shim = types.ModuleType("depsgx")
+    shim.ModuleGraph = SpecGraph
+    namespace = {"__file__": str(path), "__name__": "__main__"}
+    previous = sys.modules.get("depsgx")
+    sys.modules["depsgx"] = shim
+    try:
+        exec(compile(path.read_text(), str(path), "exec"), namespace)
+    finally:
+        if previous is None:
+            sys.modules.pop("depsgx", None)
+        else:
+            sys.modules["depsgx"] = previous
+    graph = namespace.get("graph")
+    if not isinstance(graph, SpecGraph):
+        raise ValueError(f"{path.name} did not assign a depsgx.ModuleGraph to `graph`")
+    problems = graph_problems(graph)
+    return {"errors": len(problems), "problems": problems}
+
+
+def inspector_main(argv):
+    """Bundled fallback inspector: `check_layers.py inspect FILE --json --no-storyboard`.
+
+    A pure-Python equivalent of the pinned inspector, restricted to what this gate's
+    specs exercise. It is never self-selected: `layers_check.sh` or the operator points
+    MEGU_DEPSGX/--depsgx at it only when no depsgx build is installed.
+    """
+    parser = argparse.ArgumentParser(prog="check_layers.py inspect")
+    parser.add_argument("spec")
+    parser.add_argument("--json", action="store_true")
+    parser.add_argument("--no-storyboard", action="store_true")
+    args = parser.parse_args(argv)
+    try:
+        report = inspect_spec(Path(args.spec))
+    except Exception as error:
+        # A spec that raises or builds no graph must read as a blind inspector.
+        print(f"inspect {args.spec}: {error}", file=sys.stderr)
+        return 2
+    print(json.dumps(report))
+    return int(bool(report["errors"]))
+
+
 def inspect(executable, name):
-    result = subprocess.run([executable, "inspect", str(DIR / name), "--json", "--no-storyboard"],
+    command = [executable]
+    if executable.endswith(".py"):
+        command = [sys.executable, executable]
+    result = subprocess.run(command + ["inspect", str(DIR / name), "--json", "--no-storyboard"],
                             capture_output=True, text=True, timeout=INSPECT_TIMEOUT)
     try:
         report = json.loads(result.stdout)
@@ -41,22 +140,31 @@ def pinned_revision():
     return ""
 
 
-def find_inspector():
+def find_inspector(override=None):
     """The inspector the operator pointed at, else the one on PATH.
 
     Deliberately not a search of the host's caches: a gate that picks its own
     inspector cannot be told which one it used. `tools/layers_check.sh`, the
-    documented entry point, is where a host-local build of the pinned revision is
-    preferred; this function stays authoritative about the choice it is given.
+    documented entry point, is where a host-local build of the pinned revision -
+    or the bundled pure-Python fallback - is preferred; this function stays
+    authoritative about the choice it is given.
     """
-    explicit = os.environ.get("MEGU_DEPSGX")
+    explicit = override or os.environ.get("MEGU_DEPSGX")
     if explicit:
+        if not Path(explicit).is_file():
+            raise ValueError(
+                f"depsgx is required; the explicit inspector {explicit!r} does not exist"
+            )
         return explicit
     return shutil.which("depsgx")
 
 
 def main():
-    tool = find_inspector()
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--depsgx",
+                        help="inspector executable to use (else MEGU_DEPSGX, else PATH)")
+    args = parser.parse_args()
+    tool = find_inspector(args.depsgx)
     if not tool:
         rev = pinned_revision()
         raise ValueError(
@@ -92,6 +200,8 @@ def main():
 
 if __name__ == "__main__":
     try:
+        if sys.argv[1:2] == ["inspect"]:
+            sys.exit(inspector_main(sys.argv[2:]))
         sys.exit(main())
     except (ValueError, OSError, subprocess.TimeoutExpired) as error:
         print(f"layers check: FAIL: {error}", file=sys.stderr)

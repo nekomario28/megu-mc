@@ -14,4 +14,12 @@ if [ -z "${MEGU_DEPSGX:-}" ] && [ -x "$VENV_INSPECTOR" ]; then
   export MEGU_DEPSGX="$VENV_INSPECTOR"
 fi
 
-python3 tools/check_layers.py
+# No pinned or PATH inspector on this host: use check_layers.py's own pure-Python
+# `inspect` mode. It is still an explicit inspector choice made here, not a silent
+# in-gate fallback - check_layers.py alone keeps failing closed, and the fallback
+# must pass the same can-fail probe before the gate trusts it.
+if [ -z "${MEGU_DEPSGX:-}" ] && ! command -v depsgx >/dev/null 2>&1; then
+  export MEGU_DEPSGX="tools/check_layers.py"
+fi
+
+python3 tools/check_layers.py "$@"
