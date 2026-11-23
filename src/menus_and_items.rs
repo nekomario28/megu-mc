@@ -12822,6 +12822,7 @@ fn air_use_item(me: &Arc<Client>, held_slot: i16, seq: i64, _h: Option<i64>, eat
                     dz: yr.cos() * pr.cos() * 1.2,
                     age: 0,
                     bit: false,
+                    dip: 0,
                 };
                 fb.push(b);
                 // spawn streams via interest_tick
