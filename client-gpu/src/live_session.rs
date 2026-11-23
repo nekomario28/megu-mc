@@ -3499,6 +3499,11 @@ fn cloud_lighting_key(lighting: &CloudLighting) -> [u32; 10] {
 /// Candidate client-JAR version ids, `--version` id first: `1.21.1` stays
 /// a fallback because a launcher that omits `--version` still keeps the
 /// JAR under the well-known release dir.
+/// Candidate version-directory names under `<gameDir>/versions/` for the active
+/// session. Never falls back across different Minecraft versions: an explicit
+/// `26.3` or `megu-26.3` session only probes `26.3` directories (preventing
+/// cross-version asset/recipe mixing); only an unspecified `version_id` defaults
+/// to `"1.21.1"`.
 pub(crate) fn jar_version_ids(paths: &SessionPaths) -> Vec<String> {
     let mut ids = Vec::with_capacity(2);
     if let Some(id) = paths
@@ -3508,8 +3513,12 @@ pub(crate) fn jar_version_ids(paths: &SessionPaths) -> Vec<String> {
         .filter(|id| !id.is_empty() && !id.contains(['/', '\\', ':']))
     {
         ids.push(id.to_owned());
-    }
-    if ids.iter().all(|id| id != "1.21.1") {
+        if let Some(base) = id.strip_prefix("megu-").filter(|b| !b.is_empty()) {
+            if ids.iter().all(|x| x != base) {
+                ids.push(base.to_owned());
+            }
+        }
+    } else {
         ids.push("1.21.1".to_owned());
     }
     ids
