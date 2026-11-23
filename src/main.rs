@@ -1500,9 +1500,10 @@ fn environment_time_tick() {
         }
         __t = __prof.then(std::time::Instant::now);
         for eid in &merged {
-            xl.retain(|x| x.eid != *eid);
             broadcast_seen_destroy(*eid);
         }
+        let gone: std::collections::HashSet<i32> = merged.iter().copied().collect();
+        xl.retain(|x| !gone.contains(&x.eid));
         if let Some(t) = __t {
             tickprof::add("env/xp_destroy", t.elapsed());
         }
@@ -1510,11 +1511,11 @@ fn environment_time_tick() {
     }
     // #minecraft:tick functions run once per game tick (TICK_MS = 50ms = 20/s, the
     // vanilla rate)
-    let ticks: Vec<String> = packs()
+    let ticks: Vec<Arc<str>> = packs()
         .lock()
         .unwrap()
         .iter()
-        .flat_map(|p| p.tick.clone())
+        .flat_map(|p| p.tick.iter().cloned())
         .collect();
     for f in ticks {
         run_function(&f, None, &mut None);

@@ -1318,8 +1318,8 @@ include!("datapack.rs");
 struct Datapack {
     name: String,
     functions: HashMap<String, Vec<String>>,
-    load: Vec<String>,
-    tick: Vec<String>,
+    load: Vec<Arc<str>>,
+    tick: Vec<Arc<str>>,
 }
 static PACKS: OnceLock<Mutex<Vec<Datapack>>> = OnceLock::new();
 fn packs() -> &'static Mutex<Vec<Datapack>> {
@@ -1448,7 +1448,8 @@ impl DatapackContent {
                                             } else {
                                                 format!("minecraft:{m}")
                                             }
-                                        }),
+                                        })
+                                        .map(Arc::from),
                                 );
                             }
                         }
@@ -2288,7 +2289,7 @@ fn reload_datapacks(
         }
     }
     let count = content.packs.len();
-    let loads: Vec<String> = content
+    let loads: Vec<Arc<str>> = content
         .packs
         .iter()
         .flat_map(|pack| pack.load.iter().cloned())
