@@ -406,6 +406,53 @@ impl SubWorldRenderBank {
         self.entries.insert(entry.id, entry);
     }
 
+    /// Insert or update a rotating Create contraption — a windmill or
+    /// mechanical-bearing assembly spun `angle_rad` radians about `axis`
+    /// (the bearing's local axis, passed through
+    /// [`quat_from_axis_angle`]) and anchored at world-space `origin`.
+    /// `blocks_mesh` is the contraption's model-space lit
+    /// `(vertices, indices)` geometry, authored around the pivot.
+    ///
+    /// Cheap per-tick path: calling this every rotation tick with the
+    /// same mesh updates only the transform — geometry re-uploads only
+    /// when the mesh itself changes, so a spinning water wheel costs
+    /// zero vertex writes.
+    pub fn upsert_contraption_subworld(
+        &mut self,
+        id: u64,
+        origin: [f32; 3],
+        axis: [f32; 3],
+        angle_rad: f32,
+        blocks_mesh: &(Vec<TerrainVertex>, Vec<u32>),
+    ) {
+        let transform = SubWorldTransform {
+            position: origin,
+            quaternion: quat_from_axis_angle(axis, angle_rad),
+            scale: 1.0,
+        };
+        match self.entries.get_mut(&id) {
+            Some(entry) => {
+                entry.transform = transform;
+                if entry.vertices != blocks_mesh.0 || entry.indices != blocks_mesh.1 {
+                    entry.vertices = blocks_mesh.0.clone();
+                    entry.indices = blocks_mesh.1.clone();
+                    entry.dirty = true;
+                }
+            }
+            None => {
+                self.entries.insert(
+                    id,
+                    SubWorldRenderEntry::new(
+                        id,
+                        transform,
+                        blocks_mesh.0.clone(),
+                        blocks_mesh.1.clone(),
+                    ),
+                );
+            }
+        }
+    }
+
     /// Update an entry's transform without dirtying its geometry.
     /// Returns `false` for an unknown id.
     pub fn set_transform(&mut self, id: u64, transform: SubWorldTransform) -> bool {

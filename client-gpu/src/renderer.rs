@@ -459,6 +459,47 @@ pub enum ShaderpackAttempt {
     Fallback { notice: String },
 }
 
+/// Pipelines an external `MeguWgslPack` `gbuffers_subworld`/
+/// `gbuffers_entities`-style pass supplies for Create sub-worlds,
+/// kinetic parts and entities — built against
+/// [`CompositeGpu::pack_lit_layout`] so the module reads the exact
+/// frame/draw/environment(+atlas)/shadow-receiver uniforms the built-in
+/// `COMPOSITE_LIT_WGSL` draws see. Every slot is independently
+/// optional: whichever pipeline the device rejected keeps its built-in
+/// counterpart (`gpu.lit_pipeline`/`gpu.instanced_pipeline`/
+/// `gpu.lit_alpha_pipeline`, or `shadow.lit_color`/
+/// `shadow.instanced_color`/`shadow.lit_alpha_color` while cascades are
+/// active). `needs_shadow` records that the module declared group-3
+/// bindings — such pipelines only draw on shadow-active frames, since a
+/// shadow-free frame never binds the receiver group.
+struct PackSubworldGpu {
+    /// Pass that produced the module (`gbuffers_subworld`, ...).
+    pass_name: String,
+    /// `TerrainVertex` draws (opaque sub-worlds, entities/BER).
+    lit: Option<wgpu::RenderPipeline>,
+    /// Alpha-blended `TerrainVertex` draws (translucent sub-worlds,
+    /// particles).
+    lit_alpha: Option<wgpu::RenderPipeline>,
+    /// Shared-template instanced draws (cogwheels, water wheels,
+    /// shafts).
+    instanced: Option<wgpu::RenderPipeline>,
+    /// Module binds `@group(3)` — draw only while the shadow receiver
+    /// bind group is live.
+    needs_shadow: bool,
+}
+
+/// `gbuffers_*` program names a [`MeguWgslPack`] may dedicate to
+/// sub-worlds, kinetic parts and entities. The first Naga-clean pass the
+/// device accepts replaces the matching built-in lit pipelines; these
+/// names are excluded from terrain candidacy since they shade a
+/// different geometry class.
+const PACK_SUBWORLD_PASS_NAMES: &[&str] = &[
+    "gbuffers_subworld",
+    "gbuffers_contraption",
+    "gbuffers_entities",
+    "gbuffers_block",
+];
+
 // ---------------------------------------------------------------------------
 // The renderer
 // ---------------------------------------------------------------------------
@@ -2274,6 +2315,9 @@ pub struct GpuRenderer {
     pub tbdr_depth_discards: u64,
     /// The active shaderpack hook verdict (or `None` for built-in).
     pub shaderpack: ShaderpackAttempt,
+    /// Pack-supplied `gbuffers_*` pipelines for Create sub-worlds and
+    /// kinetic parts (`None` = built-in `COMPOSITE_LIT_WGSL` path).
+    pack_subworld: Option<PackSubworldGpu>,
     /// Latest notice line the HUD/diagnostics can display.
     pub notice: Option<String>,
 }
@@ -2434,6 +2478,16 @@ struct CompositeGpu {
     instanced_pipeline: wgpu::RenderPipeline,
     lit_frame_bg: wgpu::BindGroup,
     lit_frame_layout: wgpu::BindGroupLayout,
+    /// Shadow-receiver bind group layout (`{receiver uniform, depth
+    /// array, compare sampler}`), shared by [`ShadowGpu`] and pack
+    /// `gbuffers_*` sub-world pipelines so a pack shader binding group 3
+    /// accepts the live `shadow.receiver_bg`.
+    shadow_receiver_layout: wgpu::BindGroupLayout,
+    /// Four-group lit pipeline layout (`lit_frame`/`draw`/`env`/
+    /// `shadow_receiver`) pack `gbuffers_entities`/`gbuffers_subworld`
+    /// pipelines build against: group 3 stays unbound on shadow-free
+    /// frames and carries the live cascade receiver when active.
+    pack_lit_layout: wgpu::PipelineLayout,
     env_layout: wgpu::BindGroupLayout,
     draw_layout: wgpu::BindGroupLayout,
     draw_bg: wgpu::BindGroup,
@@ -2847,6 +2901,19 @@ pub fn subworld_caster_digest(bank: &SubWorldRenderBank) -> u64 {
         fnv1a_u64(&mut hash, batch.template_vertices.len() as u64);
         fnv1a_u64(&mut hash, batch.template_indices.len() as u64);
         fnv1a_u64(&mut hash, batch.instances.len() as u64);
+        // Per-instance placement + spin is caster geometry: a water
+        // wheel advancing `rot_uv_frame` without it would leave the
+        // shadow map frozen mid-turn.
+        for inst in &batch.instances {
+            for v in inst.pos_scale {
+                fnv1a_u32(&mut hash, v.to_bits());
+            }
+            for v in inst.rot_uv_frame {
+                fnv1a_u32(&mut hash, v.to_bits());
+            }
+            fnv1a_u32(&mut hash, inst.mesh_kind);
+            fnv1a_u32(&mut hash, inst.subworld_id);
+        }
     }
     hash
 }
@@ -3542,28 +3609,10 @@ impl ShadowGpu {
         config: CascadeConfig,
     ) -> Self {
         let device = &ctx.device;
-        let shadow_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
-            label: Some("shadow-receiver-layout"),
-            entries: &[
-                uniform_entry(0),
-                wgpu::BindGroupLayoutEntry {
-                    binding: 1,
-                    visibility: wgpu::ShaderStages::FRAGMENT,
-                    ty: wgpu::BindingType::Texture {
-                        sample_type: wgpu::TextureSampleType::Depth,
-                        view_dimension: wgpu::TextureViewDimension::D2Array,
-                        multisampled: false,
-                    },
-                    count: None,
-                },
-                wgpu::BindGroupLayoutEntry {
-                    binding: 2,
-                    visibility: wgpu::ShaderStages::FRAGMENT,
-                    ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Comparison),
-                    count: None,
-                },
-            ],
-        });
+        // Shared with `CompositeGpu`: pack `gbuffers_*` sub-world
+        // pipelines build against the same layout object, so their
+        // group-3 bindings accept `receiver_bg` directly.
+        let shadow_layout = &composite.shadow_receiver_layout;
         let caster_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
             label: Some("shadow-caster-layout"),
             entries: &[uniform_entry(0)],
@@ -3616,7 +3665,7 @@ impl ShadowGpu {
         let receiver_uniform = make_uniform("shadow-receiver-uniform");
         let receiver_bg = device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("shadow-receiver"),
-            layout: &shadow_layout,
+            layout: shadow_layout,
             entries: &[
                 wgpu::BindGroupEntry {
                     binding: 0,
@@ -3742,20 +3791,14 @@ impl ShadowGpu {
                 Some(frame_layout),
                 Some(&composite.draw_layout),
                 Some(&composite.env_layout),
-                Some(&shadow_layout),
+                Some(shadow_layout),
             ],
             immediate_size: 0,
         });
-        let lit_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
-            label: Some("shadowed-composite-lit"),
-            bind_group_layouts: &[
-                Some(&composite.lit_frame_layout),
-                Some(&composite.draw_layout),
-                Some(&composite.env_layout),
-                Some(&shadow_layout),
-            ],
-            immediate_size: 0,
-        });
+        // Same four bind-group set `CompositeGpu::pack_lit_layout`
+        // declares — reuse the shared object so pack sub-world
+        // pipelines and the built-in shadow receivers are layout-equal.
+        let lit_layout = &composite.pack_lit_layout;
         let terrain_module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("shadowed-terrain"),
             source: wgpu::ShaderSource::Wgsl(Cow::Owned(composed_shadow_wgsl(
@@ -3831,7 +3874,7 @@ impl ShadowGpu {
         );
         let lit_color = color_pipeline(
             "shadowed-lit-color",
-            &lit_layout,
+            lit_layout,
             &lit_module,
             "lit_vs",
             "lit_fs",
@@ -3842,7 +3885,7 @@ impl ShadowGpu {
         );
         let lit_alpha_color = color_pipeline(
             "shadowed-lit-alpha",
-            &lit_layout,
+            lit_layout,
             &lit_module,
             "lit_vs",
             "lit_fs",
@@ -3853,7 +3896,7 @@ impl ShadowGpu {
         );
         let instanced_color = color_pipeline(
             "shadowed-instanced-color",
-            &lit_layout,
+            lit_layout,
             &lit_module,
             "inst_vs",
             "lit_fs",
@@ -5236,6 +5279,7 @@ impl GpuRenderer {
             shaderpack: ShaderpackAttempt::Fallback {
                 notice: "built-in terrain pipeline".to_string(),
             },
+            pack_subworld: None,
             notice: None,
         }
     }
@@ -5451,6 +5495,43 @@ impl GpuRenderer {
         let lit_frame_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
             label: Some("lit-frame-layout"),
             entries: &[uniform_entry(0)],
+        });
+        // The receiver layout lives on `CompositeGpu` (not `ShadowGpu`)
+        // so pack `gbuffers_*` sub-world pipelines can share the exact
+        // layout object — a pack shader declaring group 3 then binds the
+        // live `shadow.receiver_bg` with zero re-creation.
+        let shadow_receiver_layout =
+            device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+                label: Some("shadow-receiver-layout"),
+                entries: &[
+                    uniform_entry(0),
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 1,
+                        visibility: wgpu::ShaderStages::FRAGMENT,
+                        ty: wgpu::BindingType::Texture {
+                            sample_type: wgpu::TextureSampleType::Depth,
+                            view_dimension: wgpu::TextureViewDimension::D2Array,
+                            multisampled: false,
+                        },
+                        count: None,
+                    },
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 2,
+                        visibility: wgpu::ShaderStages::FRAGMENT,
+                        ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Comparison),
+                        count: None,
+                    },
+                ],
+            });
+        let pack_lit_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: Some("pack-lit-layout"),
+            bind_group_layouts: &[
+                Some(&lit_frame_layout),
+                Some(&draw_layout),
+                Some(&env_layout),
+                Some(&shadow_receiver_layout),
+            ],
+            immediate_size: 0,
         });
 
         let terrain_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
@@ -5731,6 +5812,8 @@ impl GpuRenderer {
             instanced_pipeline,
             lit_frame_bg,
             lit_frame_layout,
+            shadow_receiver_layout,
+            pack_lit_layout,
             env_layout,
             draw_layout,
             draw_bg,
@@ -5846,6 +5929,224 @@ impl GpuRenderer {
         })
     }
 
+    /// One `wgpu::ErrorScope`-guarded pack pipeline build for the lit
+    /// sub-world path, mirroring [`Self::terrain_pipeline_from_module`]
+    /// but on the four-group [`CompositeGpu::pack_lit_layout`]: `None`
+    /// on any device rejection (bad entry points, vertex-layout
+    /// mismatch, unboundable resources) so the caller can fall back to
+    /// the built-in `COMPOSITE_LIT_WGSL` pipelines.
+    fn try_pack_lit_pipeline(
+        &self,
+        module: &wgpu::ShaderModule,
+        (vs_entry, fs_entry): (&str, &str),
+        buffers: &[Option<wgpu::VertexBufferLayout<'_>>],
+        blend: Option<wgpu::BlendState>,
+        depth_write: bool,
+        label: &str,
+    ) -> Option<wgpu::RenderPipeline> {
+        let scope = self
+            .ctx
+            .device
+            .push_error_scope(wgpu::ErrorFilter::Validation);
+        let pipeline = self
+            .ctx
+            .device
+            .create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+                label: Some(label),
+                layout: Some(&self.composite.pack_lit_layout),
+                vertex: wgpu::VertexState {
+                    module,
+                    entry_point: Some(vs_entry),
+                    compilation_options: wgpu::PipelineCompilationOptions::default(),
+                    buffers,
+                },
+                primitive: wgpu::PrimitiveState {
+                    topology: wgpu::PrimitiveTopology::TriangleList,
+                    // Lit sub-world geometry is double-sided — Create
+                    // blades and contraption shells have no guaranteed
+                    // outward winding.
+                    cull_mode: None,
+                    ..wgpu::PrimitiveState::default()
+                },
+                depth_stencil: Some(depth_state(depth_write)),
+                multisample: wgpu::MultisampleState::default(),
+                fragment: Some(wgpu::FragmentState {
+                    module,
+                    entry_point: Some(fs_entry),
+                    compilation_options: wgpu::PipelineCompilationOptions::default(),
+                    targets: &[Some(wgpu::ColorTargetState {
+                        format: self.target_format,
+                        blend,
+                        write_mask: wgpu::ColorWrites::ALL,
+                    })],
+                }),
+                multiview_mask: None,
+                cache: None,
+            });
+        match pollster::block_on(scope.pop()) {
+            None => Some(pipeline),
+            Some(_) => None,
+        }
+    }
+
+    /// Offer `pack`'s `gbuffers_subworld`/`gbuffers_entities`-style
+    /// passes to the device for the lit sub-world path: structural
+    /// validation, module creation and the opaque/alpha/instanced
+    /// pipeline builds each run inside a `wgpu::ErrorScope`. Accepted
+    /// pipelines carry the composed frame's real environment —
+    /// `CompositeEnvUniforms` sun/ambient/exposure/fog/depth-tint plus
+    /// the atlas table — and, when the module binds group 3, the live
+    /// shadow receiver (map resolution, cascade count, PCF taps, sun
+    /// color) so Create cogwheels, water wheels and contraptions shade
+    /// under the active shaderpack's sun/fog/exposure/shadow
+    /// environment instead of the flat built-in. Every rejection falls
+    /// back cleanly to `COMPOSITE_LIT_WGSL` (+ `shadow.lit_color`/
+    /// `shadow.instanced_color` while cascades are active). Returns a
+    /// `"; ..."` notice fragment for the caller's verdict line.
+    fn install_pack_subworld_passes(&mut self, pack: &MeguWgslPack) -> String {
+        self.pack_subworld = None;
+        let mut last_rejection = String::new();
+        for pass in &pack.passes {
+            if pass.stage != PipelineStage::Gbuffers
+                || pass.kind != PassKind::Graphics
+                || !PACK_SUBWORLD_PASS_NAMES.contains(&pass.name.as_str())
+            {
+                continue;
+            }
+            let info = match validate_wgsl_module(
+                &pass.wgsl_source,
+                &[WgslStage::Vertex, WgslStage::Fragment],
+            ) {
+                Ok(info) => info,
+                Err(err) => {
+                    last_rejection =
+                        format!("{}: structural validation failed: {err}", pass.name);
+                    continue;
+                }
+            };
+            let vertex_eps: Vec<&str> = info
+                .entry_points
+                .iter()
+                .filter(|(s, _)| *s == WgslStage::Vertex)
+                .map(|(_, n)| n.as_str())
+                .collect();
+            let Some(fs_entry) = info
+                .entry_points
+                .iter()
+                .find(|(s, _)| *s == WgslStage::Fragment)
+                .map(|(_, n)| n.clone())
+            else {
+                last_rejection = format!("{}: no fragment entry point", pass.name);
+                continue;
+            };
+            // `@group(3)` bindings require the live shadow receiver —
+            // gate these pipelines to shadow-active frames.
+            let needs_shadow = info.bindings.iter().any(|b| b.group >= 3);
+            let scope = self
+                .ctx
+                .device
+                .push_error_scope(wgpu::ErrorFilter::Validation);
+            let module = self
+                .ctx
+                .device
+                .create_shader_module(wgpu::ShaderModuleDescriptor {
+                    label: Some("megu-pack-subworld"),
+                    source: wgpu::ShaderSource::Wgsl(Cow::Borrowed(
+                        pass.wgsl_source.as_str(),
+                    )),
+                });
+            if pollster::block_on(scope.pop()).is_some() {
+                last_rejection = format!("{}: device rejected module", pass.name);
+                continue;
+            }
+            let lit_buffers = [Some(LIT_VERTEX_LAYOUT)];
+            let inst_buffers = [Some(LIT_VERTEX_LAYOUT), Some(PART_INSTANCE_LAYOUT)];
+            // Convention: the first vertex entry shades whole
+            // sub-worlds; a second vertex entry (when the module has
+            // one) is the instanced variant. A single-entry module
+            // serves both — the instance stream is just vertex data the
+            // shader ignores.
+            let mut lit = None;
+            for vs in &vertex_eps {
+                lit = self.try_pack_lit_pipeline(
+                    &module,
+                    (vs, &fs_entry),
+                    &lit_buffers,
+                    None,
+                    true,
+                    "megu-pack-lit",
+                );
+                if lit.is_some() {
+                    break;
+                }
+            }
+            let inst_eps: Vec<&str> = if vertex_eps.len() > 1 {
+                vertex_eps[1..]
+                    .iter()
+                    .chain(vertex_eps[..1].iter())
+                    .copied()
+                    .collect()
+            } else {
+                vertex_eps.clone()
+            };
+            let mut instanced = None;
+            for vs in &inst_eps {
+                instanced = self.try_pack_lit_pipeline(
+                    &module,
+                    (vs, &fs_entry),
+                    &inst_buffers,
+                    None,
+                    true,
+                    "megu-pack-instanced",
+                );
+                if instanced.is_some() {
+                    break;
+                }
+            }
+            let mut lit_alpha = None;
+            for vs in &vertex_eps {
+                lit_alpha = self.try_pack_lit_pipeline(
+                    &module,
+                    (vs, &fs_entry),
+                    &lit_buffers,
+                    Some(ALPHA_BLEND),
+                    false,
+                    "megu-pack-lit-alpha",
+                );
+                if lit_alpha.is_some() {
+                    break;
+                }
+            }
+            if lit.is_some() || lit_alpha.is_some() || instanced.is_some() {
+                let name = pass.name.clone();
+                self.pack_subworld = Some(PackSubworldGpu {
+                    pass_name: name.clone(),
+                    lit,
+                    lit_alpha,
+                    instanced,
+                    needs_shadow,
+                });
+                return format!(
+                    "; pass {name:?} drives Create sub-worlds + kinetic parts"
+                );
+            }
+            last_rejection = format!("{}: device rejected every lit pipeline", pass.name);
+        }
+        if last_rejection.is_empty() {
+            String::new()
+        } else {
+            format!("; sub-world passes kept built-in lit ({last_rejection})")
+        }
+    }
+
+    /// The pack `gbuffers_*` pass currently driving Create sub-worlds,
+    /// kinetic parts and entities (`gbuffers_subworld`,
+    /// `gbuffers_entities`, ...), or `None` while the built-in
+    /// `COMPOSITE_LIT_WGSL` pipelines draw them.
+    pub fn pack_subworld_pass(&self) -> Option<&str> {
+        self.pack_subworld.as_ref().map(|p| p.pass_name.as_str())
+    }
+
     /// Offer a loaded [`MeguWgslPack`] to the real device: structural
     /// validation, then module compilation + a candidate terrain pipeline
     /// inside a `wgpu::ErrorScope`. Any rejection keeps the built-in
@@ -5863,6 +6164,9 @@ impl GpuRenderer {
             self.notice = Some(notice);
             return self.shaderpack.clone();
         }
+        // Sub-world/entity passes install first: they share the lit
+        // contract, and their names stay out of terrain candidacy below.
+        let subworld_note = self.install_pack_subworld_passes(pack);
         // Try every gbuffers-stage graphics pass until one yields a pipeline
         // the device accepts with the packed-vertex layout.
         let pack_layout = self
@@ -5876,7 +6180,10 @@ impl GpuRenderer {
         let mut compiled = 0usize;
         let mut last_rejection = String::new();
         for pass in &pack.passes {
-            if pass.stage != PipelineStage::Gbuffers || pass.kind != PassKind::Graphics {
+            if pass.stage != PipelineStage::Gbuffers
+                || pass.kind != PassKind::Graphics
+                || PACK_SUBWORLD_PASS_NAMES.contains(&pass.name.as_str())
+            {
                 continue;
             }
             let info = match validate_wgsl_module(
@@ -5932,7 +6239,8 @@ impl GpuRenderer {
                     };
                     self.shaderpack = attempt.clone();
                     self.notice = Some(format!(
-                        "shaderpack {:?} active: pass {:?} drives the terrain pipeline",
+                        "shaderpack {:?} active: pass {:?} drives the terrain \
+                         pipeline{subworld_note}",
                         pack.name, pass.name
                     ));
                     return attempt;
@@ -5950,12 +6258,14 @@ impl GpuRenderer {
         }
         let notice = if last_rejection.is_empty() {
             format!(
-                "shaderpack {:?} has no gbuffers graphics pass; built-in terrain kept",
+                "shaderpack {:?} has no gbuffers graphics pass; built-in terrain \
+                 kept{subworld_note}",
                 pack.name
             )
         } else {
             format!(
-                "shaderpack {:?} fell back to built-in terrain ({last_rejection})",
+                "shaderpack {:?} fell back to built-in terrain \
+                 ({last_rejection}){subworld_note}",
                 pack.name
             )
         };
@@ -9890,6 +10200,33 @@ impl GpuRenderer {
         let sky = &self.sky;
         let water = &self.water;
         let lit_terrain = &self.lit_terrain;
+        // Pack `gbuffers_*` sub-world pipelines take over the
+        // lit/instanced draws when a `MeguWgslPack` installed them;
+        // modules binding group 3 (the shadow receiver) only run while
+        // cascades are live, so shadow-free frames keep the built-in
+        // pairs. Handles are cheap `Arc` clones — copying them here
+        // keeps the pass scope free of `self` borrows.
+        let pack_subworld = self
+            .pack_subworld
+            .as_ref()
+            .filter(|p| !p.needs_shadow || shadow.is_some());
+        let lit_opaque_pipeline = pack_subworld
+            .and_then(|p| p.lit.clone())
+            .unwrap_or_else(|| shadow.map_or(&gpu.lit_pipeline, |s| &s.lit_color).clone());
+        let instanced_pipeline = pack_subworld
+            .and_then(|p| p.instanced.clone())
+            .unwrap_or_else(|| {
+                shadow
+                    .map_or(&gpu.instanced_pipeline, |s| &s.instanced_color)
+                    .clone()
+            });
+        let lit_alpha_pipeline = pack_subworld
+            .and_then(|p| p.lit_alpha.clone())
+            .unwrap_or_else(|| {
+                shadow
+                    .map_or(&gpu.lit_alpha_pipeline, |s| &s.lit_alpha_color)
+                    .clone()
+            });
         if let Some(stable) = &self.frame_stable_shadow {
             // The dome reads only camera vectors, sun, render/celestial
             // params — all carried by the frame's stable uniform build.
@@ -10131,7 +10468,7 @@ impl GpuRenderer {
                     continue;
                 }
                 if !drew_opaque_subworld {
-                    pass.set_pipeline(shadow.map_or(&gpu.lit_pipeline, |s| &s.lit_color));
+                    pass.set_pipeline(&lit_opaque_pipeline);
                     pass.set_bind_group(0, &gpu.lit_frame_bg, &[]);
                     drew_opaque_subworld = true;
                 }
@@ -10150,9 +10487,7 @@ impl GpuRenderer {
                     continue;
                 }
                 if !drew_instanced {
-                    pass.set_pipeline(
-                        shadow.map_or(&gpu.instanced_pipeline, |s| &s.instanced_color),
-                    );
+                    pass.set_pipeline(&instanced_pipeline);
                     pass.set_bind_group(0, &gpu.lit_frame_bg, &[]);
                     drew_instanced = true;
                 }
@@ -10170,7 +10505,7 @@ impl GpuRenderer {
             }
             // Opaque entities and block entities.
             if let Some(mesh) = entity_ber {
-                pass.set_pipeline(shadow.map_or(&gpu.lit_pipeline, |s| &s.lit_color));
+                pass.set_pipeline(&lit_opaque_pipeline);
                 pass.set_bind_group(0, &gpu.lit_frame_bg, &[]);
                 let off = slot(identity, 1.0, 1.0);
                 pass.set_bind_group(1, &gpu.draw_bg, &[off]);
@@ -10258,9 +10593,7 @@ impl GpuRenderer {
                     continue;
                 }
                 if !drew_alpha {
-                    pass.set_pipeline(
-                        shadow.map_or(&gpu.lit_alpha_pipeline, |s| &s.lit_alpha_color),
-                    );
+                    pass.set_pipeline(&lit_alpha_pipeline);
                     pass.set_bind_group(0, &gpu.lit_frame_bg, &[]);
                     drew_alpha = true;
                 }
@@ -10273,7 +10606,7 @@ impl GpuRenderer {
             }
 
             if let Some(mesh) = particles {
-                pass.set_pipeline(shadow.map_or(&gpu.lit_alpha_pipeline, |s| &s.lit_alpha_color));
+                pass.set_pipeline(&lit_alpha_pipeline);
                 pass.set_bind_group(0, &gpu.lit_frame_bg, &[]);
                 pass.set_vertex_buffer(0, mesh.vertices.slice(..));
                 pass.set_index_buffer(mesh.indices.slice(..), wgpu::IndexFormat::Uint32);
