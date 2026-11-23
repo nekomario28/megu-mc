@@ -276,13 +276,18 @@ fn auto_discover_sibling(explicit: &Option<PathBuf>, stem: &str) -> Option<PathB
 const DEFAULT_RELEASE_TAG: &str = "v0.1.0-alpha.1";
 const DEFAULT_GITHUB_REPO: &str = "nekomario28/megu-mc";
 
-fn host_release_target() -> Option<(&'static str, &'static str)> {
-    match (std::env::consts::OS, std::env::consts::ARCH) {
+fn host_release_target_for(os: &str, arch: &str) -> Option<(&'static str, &'static str)> {
+    match (os, arch) {
         ("windows", "x86_64") => Some(("windows-x86_64", ".exe")),
         ("linux", "x86_64") => Some(("linux-x86_64", "")),
+        ("linux", "aarch64") => Some(("linux-arm64", "")),
         ("macos", "aarch64") => Some(("macos-arm64", "")),
         _ => None,
     }
+}
+
+fn host_release_target() -> Option<(&'static str, &'static str)> {
+    host_release_target_for(std::env::consts::OS, std::env::consts::ARCH)
 }
 
 fn parse_expected_sha256(sums_text: &str, filename: &str) -> Option<String> {
@@ -957,6 +962,27 @@ fn main() -> ExitCode {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn host_release_target_maps_supported_platforms() {
+        assert_eq!(
+            host_release_target_for("windows", "x86_64"),
+            Some(("windows-x86_64", ".exe"))
+        );
+        assert_eq!(
+            host_release_target_for("linux", "x86_64"),
+            Some(("linux-x86_64", ""))
+        );
+        assert_eq!(
+            host_release_target_for("linux", "aarch64"),
+            Some(("linux-arm64", ""))
+        );
+        assert_eq!(
+            host_release_target_for("macos", "aarch64"),
+            Some(("macos-arm64", ""))
+        );
+        assert_eq!(host_release_target_for("linux", "riscv64"), None);
+    }
 
     #[test]
     fn parser_rejects_bad_input() {

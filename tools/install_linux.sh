@@ -33,7 +33,8 @@ ARCH="$(uname -m)"
 [ "$OS" = "Linux" ] || die "this installer targets Linux (detected OS: $OS)"
 case "$ARCH" in
     x86_64|amd64) TARGET="linux-x86_64" ;;
-    *) die "unsupported Linux architecture: $ARCH (prebuilt binaries currently target x86_64)" ;;
+    aarch64|arm64) TARGET="linux-arm64" ;;
+    *) die "unsupported Linux architecture: $ARCH (supported: x86_64/amd64 -> linux-x86_64, aarch64/arm64 -> linux-arm64)" ;;
 esac
 
 need_cmd curl

@@ -58,6 +58,8 @@ jobs:
         include:
           - os: ubuntu-latest
             target: linux-x86_64
+          - os: ubuntu-24.04-arm
+            target: linux-arm64
           - os: macos-latest
             target: macos-arm64
           - os: windows-latest
@@ -218,7 +220,7 @@ jobs:
           import sys
           from pathlib import Path
 
-          targets = ('linux-x86_64', 'macos-arm64', 'windows-x86_64')
+          targets = ('linux-x86_64', 'linux-arm64', 'macos-arm64', 'windows-x86_64')
           binaries = ('megu', 'megu-client', 'megu-mod-check',
                       'megu-world-migrate', 'megu-init', 'megu-admin',
                       'megu-client-gpu', 'megu-installer')

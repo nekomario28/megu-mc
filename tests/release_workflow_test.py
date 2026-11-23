@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Static checks for the three-OS GitHub Release workflow (stdlib only)."""
+"""Static checks for the platform GitHub Release workflow (stdlib only)."""
 
 import re
 import unittest
@@ -13,7 +13,7 @@ REQUIRED_JOBS = {"preflight", "build-matrix", "docker-check", "publish-release"}
 BINARIES = (
     "megu", "megu-client", "megu-mod-check",
     "megu-world-migrate", "megu-init", "megu-admin",
-    "megu-client-gpu",
+    "megu-client-gpu", "megu-installer",
 )
 
 
@@ -98,16 +98,17 @@ class ReleaseWorkflowTest(unittest.TestCase):
         self.assertIn("python3 tests/release_workflow_test.py", preflight)
         self.assertIn("docker build -f docker/Dockerfile .", self.jobs["docker-check"])
 
-    def test_three_os_matrix_builds_every_binary(self):
+    def test_platform_matrix_builds_every_binary(self):
         job = self.jobs["build-matrix"]
         self.assertRegex(job, r"(?m)^    needs: preflight\s*$")
         for runner, target in (
             ("ubuntu-latest", "linux-x86_64"),
+            ("ubuntu-24.04-arm", "linux-arm64"),
             ("macos-latest", "macos-arm64"),
             ("windows-latest", "windows-x86_64"),
         ):
             self.assertIn(f"- os: {runner}\n            target: {target}", job)
-        self.assertEqual(len(re.findall(r"(?m)^          - os:", job)), 3)
+        self.assertEqual(len(re.findall(r"(?m)^          - os:", job)), 4)
         for manifest in (
             "client-app/Cargo.toml", "mod-adapter-core/Cargo.toml",
             "state-store/Cargo.toml", "server-files/Cargo.toml",
@@ -171,6 +172,11 @@ class ReleaseWorkflowTest(unittest.TestCase):
         job = self.jobs["publish-release"]
         self.assertIn("needs: [preflight, build-matrix, docker-check]", job)
         self.assertIn("pattern: release-*", job)
+        self.assertIn(
+            "targets = ('linux-x86_64', 'linux-arm64', 'macos-arm64', "
+            "'windows-x86_64')",
+            job,
+        )
         self.assertIn("tools/release_bundle.py', 'verify'", job)
         self.assertIn("'release-manifest.json'", job)
         self.assertIn("SHA256SUMS-all.txt", job)

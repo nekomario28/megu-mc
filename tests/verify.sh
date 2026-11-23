@@ -58,6 +58,7 @@ python3 tests/carver_diff_test.py
 python3 tests/sculk_trace_test.py
 python3 tests/sculk_gate_test.py
 python3 tests/carve_agent_build_test.py
+python3 tests/java_toolchain_test.py
 python3 tests/vanilla_java_test.py
 python3 tests/forest_stage_check_test.py
 python3 tests/container_oracle_test.py
@@ -128,6 +129,7 @@ python3 tests/client_oracle_fuzz_wire.py --self-test
 python3 tests/multiplayer_stress_wire.py --self-test
 python3 tests/client_parity_gate_test.py
 python3 tests/docker_entrypoint_test.py
+python3 tests/install_linux_test.py
 python3 tests/installer_cross_os_test.py
 python3 tests/item_interaction_audit_test.py
 python3 tests/neoforge_s1s4_boundary_test.py
