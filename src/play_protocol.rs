@@ -10821,6 +10821,10 @@ fn handle_inner(mut s: TcpStream, live_eid: Arc<AtomicI32>) {
     // Create (`mod-suite`): the current kinetic snapshot rides the same
     // play-phase 0x19 channel so late joiners see spinning wheels/shafts.
     live_create_sync_on_join(&mut s);
+    // Live mod suite (`mod-suite`): the dynamic `megu:mod_registry_sync_v1`
+    // (`MRS1`) block-state/item registry rides the same channel so clients
+    // can name modded ids from the first chunk packet. No-op on vanilla.
+    live_mod_registry_sync_on_join(&mut s);
     if let Some(rp) = resource_pack_pkt() {
         let _ = send_packet(&mut s, 0x46, rp);
     }

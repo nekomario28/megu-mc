@@ -240,6 +240,7 @@ fn live_chunk_packet_cache_invalidate(_dim: i32, _cx: i32, _cz: i32) -> usize {
 #[cfg(feature = "mod-suite")]
 use mod_adapter_core::auto_adapter::{
     auto_adapt_jar, auto_adapt_mods_dir, AdaptationTier, AutoAdaptOptions, JarAdaptationResult,
+    ModsDirAdaptationReport,
 };
 #[cfg(feature = "mod-suite")]
 use mod_adapter_core::bytecode_subset_vm::{
@@ -254,6 +255,11 @@ use mod_adapter_core::culinary_adapter::{
 use mod_adapter_core::ecosystem_compat::{
     plan_dual_loader_mods_dir, AccessoryError, AccessoryInventory, AccessoryItem, AttributeTotals,
     DualLoaderPlan,
+};
+#[cfg(feature = "mod-suite")]
+use mod_adapter_core::live_registry_bridge::{
+    DynamicBlockStateEntry, RegistryContentIndex, UnifiedModRegistryPlan,
+    MOD_REGISTRY_SYNC_CHANNEL,
 };
 #[cfg(feature = "mod-suite")]
 use mod_adapter_core::magic_primitives as lmb_magic;
@@ -299,6 +305,15 @@ const LIVE_MOD_MC_TARGET: McVersion = McVersion::V1_21_1;
 fn live_mod_flagship_ids() -> BTreeSet<String> {
     BTreeSet::from(["create".to_string()])
 }
+
+/// `MRS1` id bases for generic `MEGU_MODS_DIR` mod entries — deliberately far
+/// above the vanilla block-state table (< `DEFAULT_BASE_STATE_ID` = 26_684),
+/// Create's contiguous range from that base, and the `LIVE_CREATE_ITEM_BASE`
+/// item ids, so no two registries merged into one frame can alias an id.
+#[cfg(feature = "mod-suite")]
+const LIVE_MRS_GENERIC_BLOCK_BASE: u32 = 1_000_000;
+#[cfg(feature = "mod-suite")]
+const LIVE_MRS_GENERIC_ITEM_BASE: u32 = 2_000_000;
 
 #[cfg(all(test, feature = "mod-suite"))]
 mod live_server_perf_bridge_tests {
@@ -431,6 +446,10 @@ struct LiveModSuite {
     /// Encoded `MSY1` body for `megu:mod_sync_v1`, validated at arm time.
     mod_sync_body: Option<Vec<u8>>,
     mod_sync_root_hash: Option<[u8; 32]>,
+    /// Deterministic `MRS1` registry plan over every successfully adapted
+    /// JAR's declared blockstates/items, built once by `scan_mods_dir`.
+    /// `None` when no `mods/` scan ran or the plan rejected the content.
+    registry_plan: Option<UnifiedModRegistryPlan>,
 }
 
 #[cfg(feature = "mod-suite")]
@@ -455,6 +474,7 @@ impl LiveModSuite {
             season_sync: HashMap::new(),
             mod_sync_body: None,
             mod_sync_root_hash: None,
+            registry_plan: None,
         }
     }
 
@@ -568,6 +588,33 @@ impl LiveModSuite {
                         mixin_sites: 0,
                         skipped_client_mixins: 0,
                     });
+                }
+            }
+        }
+        // MRS1 (`megu:mod_registry_sync_v1`): fold every successfully adapted
+        // JAR's declared blockstates/items into one deterministic registry
+        // plan so joining clients learn the dynamic ids up front. A plan
+        // rejection (conflicting or oversized content) drops only the generic
+        // entries — Create's own ids are merged per-join instead.
+        let registry_jars: Vec<JarAdaptationResult> = adapted
+            .iter()
+            .filter_map(|(_, result)| result.as_ref().ok().cloned())
+            .collect();
+        if !registry_jars.is_empty() {
+            let report = ModsDirAdaptationReport {
+                dir: dir.display().to_string(),
+                jars: registry_jars,
+                non_jar_entries: 0,
+                audit_notes: Vec::new(),
+            };
+            match UnifiedModRegistryPlan::from_auto_adapt(
+                LIVE_MRS_GENERIC_BLOCK_BASE,
+                LIVE_MRS_GENERIC_ITEM_BASE,
+                &report,
+            ) {
+                Ok(plan) => self.registry_plan = Some(plan),
+                Err(error) => {
+                    eprintln!("[live-mods] MRS1 registry plan rejected: {error:?}")
                 }
             }
         }
@@ -1992,6 +2039,76 @@ fn live_mod_sync_on_join(s: &mut TcpStream) {
     );
 }
 
+/// Encode the live dynamic mod registry as one `MRS1`
+/// (`megu:mod_registry_sync_v1`) frame for a joining client: Create's armed
+/// block-state/item ids (states at `DEFAULT_BASE_STATE_ID`+, items at
+/// `LIVE_CREATE_ITEM_BASE`+) plus the generic `MEGU_MODS_DIR` registry plan
+/// built at boot. `None` when nothing modded is registered, so a vanilla or
+/// unarmed server emits zero extra packets.
+#[cfg(feature = "mod-suite")]
+fn live_mod_registry_sync_frame() -> Option<Vec<u8>> {
+    let mut block_states: Vec<DynamicBlockStateEntry> = Vec::new();
+    let mut items: BTreeMap<u32, String> = BTreeMap::new();
+
+    if live_create_enabled() {
+        if let Some(registry) = breg().and_then(|reg| reg.create_registry()) {
+            for entry in registry.states() {
+                let mut properties = entry.properties.clone();
+                properties.sort_by(|a, b| a.0.cmp(&b.0));
+                block_states.push(DynamicBlockStateEntry {
+                    state_id: entry.state_id,
+                    block_id: entry.block_id.clone(),
+                    properties,
+                });
+            }
+        }
+        for (index, (name, _)) in live_create_item_table().iter().enumerate() {
+            let id = u32::try_from(LIVE_CREATE_ITEM_BASE + index as i64).ok()?;
+            items.insert(id, name.clone());
+        }
+    }
+
+    {
+        let suite = live_mod_suite().lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(plan) = suite.registry_plan.as_ref() {
+            block_states.extend(plan.block_states.iter().cloned());
+            items.extend(plan.items.iter().map(|(id, name)| (*id, name.clone())));
+        }
+    }
+
+    if block_states.is_empty() && items.is_empty() {
+        return None;
+    }
+    block_states.sort_by_key(|entry| entry.state_id);
+    let base_block_state_id = block_states.first().map_or(0, |entry| entry.state_id);
+    let base_item_id = items.keys().next().copied().unwrap_or(0);
+    Some(
+        UnifiedModRegistryPlan {
+            base_block_state_id,
+            base_item_id,
+            block_states,
+            items,
+            content: RegistryContentIndex::default(),
+        }
+        .encode_registry_sync_frame(),
+    )
+}
+
+/// Serve the `megu:mod_registry_sync_v1` (`MRS1`) dynamic registry frame to
+/// a client that just entered play, wired next to the Create kinetic
+/// snapshot. A no-op on vanilla/unarmed servers — `None` frame, no packet.
+#[cfg(feature = "mod-suite")]
+fn live_mod_registry_sync_on_join(s: &mut TcpStream) {
+    let Some(frame) = live_mod_registry_sync_frame() else {
+        return;
+    };
+    let _ = send_packet(
+        s,
+        LIVE_MOD_S2C_CUSTOM_PAYLOAD_ID,
+        live_mod_payload_body(MOD_REGISTRY_SYNC_CHANNEL, &frame),
+    );
+}
+
 /// Evaluate the armed progression gates for a player at `biome` in
 /// `dimension` holding `player_advancements`. Creative/spectator players are
 /// always allowed, mirroring the engine contract.
@@ -3398,6 +3515,11 @@ fn live_mod_appleskin_sync(_client: &Client) {}
 #[cfg(not(feature = "mod-suite"))]
 #[inline(always)]
 fn live_mod_sync_on_join(_s: &mut TcpStream) {}
+
+/// No-op without `mod-suite`: no dynamic registry frame is ever emitted.
+#[cfg(not(feature = "mod-suite"))]
+#[inline(always)]
+fn live_mod_registry_sync_on_join(_s: &mut TcpStream) {}
 
 /// No-op without `mod-suite`: the tick hook contributes nothing.
 #[cfg(not(feature = "mod-suite"))]
@@ -5973,6 +6095,122 @@ version="3.0.0"
             LiveMagicState::default();
         fresh_suite();
         let _ = std::fs::remove_dir_all(dir);
+    }
+
+    // ---------- MRS1 dynamic registry sync ----------
+
+    /// Vanilla / unarmed: `live_mod_registry_sync_frame` must stay `None`
+    /// and the join hook must put zero bytes on the wire.
+    #[test]
+    fn wire_mods_mrs1_vanilla_emits_nothing() {
+        let _serial = WIRE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        fresh_suite();
+        LIVE_CREATE_TEST_GATE.store(2, Ordering::Relaxed);
+        assert!(
+            live_mod_registry_sync_frame().is_none(),
+            "unarmed server must not emit an MRS1 frame"
+        );
+        let (mut send, mut peer) = lmb_socket_pair();
+        live_mod_registry_sync_on_join(&mut send);
+        assert!(lmb_silent(&mut peer), "vanilla join must emit no MRS1 packet");
+        LIVE_CREATE_TEST_GATE.store(1, Ordering::Relaxed);
+    }
+
+    /// Create armed: the frame decodes under the client contract — `MRS1`
+    /// magic, IEEE CRC32 and monotonic ids are all enforced by
+    /// `decode_registry_sync_frame` — and carries the `create:*` item table.
+    /// When `breg()` is loaded with the mod extension, block states join too.
+    #[test]
+    fn wire_mods_mrs1_create_armed_frame_decodes() {
+        let _serial = WIRE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        fresh_suite();
+        LIVE_CREATE_TEST_GATE.store(1, Ordering::Relaxed);
+        let frame = live_mod_registry_sync_frame().expect("armed Create must emit MRS1");
+        assert!(frame.starts_with(b"MRS1"));
+        let synced = mod_adapter_core::live_registry_bridge::decode_registry_sync_frame(&frame)
+            .expect("server MRS1 frame must satisfy the client decoder");
+        for name in ["create:shaft", "create:wrench", "create:brass_ingot"] {
+            assert!(
+                synced.items.values().any(|n| n == name),
+                "missing create item {name}"
+            );
+        }
+        if breg()
+            .and_then(|reg| reg.create_registry())
+            .is_some()
+        {
+            assert!(
+                synced
+                    .block_states
+                    .iter()
+                    .any(|e| e.block_id == "create:shaft"),
+                "armed Create registry must sync its block states"
+            );
+            assert!(synced.block_states.iter().all(|e| {
+                e.state_id >= create_adapter::blockstates::DEFAULT_BASE_STATE_ID
+            }));
+        }
+        // The join path emits exactly one 0x19 custom_payload on the MRS1
+        // channel carrying the identical frame bytes.
+        let (mut send, mut peer) = lmb_socket_pair();
+        live_mod_registry_sync_on_join(&mut send);
+        let mut stash = Vec::new();
+        let (id, body) = lmb_read_frame(&mut peer, &mut stash).expect("mrs1 frame");
+        assert_eq!(id, LIVE_MOD_S2C_CUSTOM_PAYLOAD_ID);
+        let (channel, payload) = lmb_decode_payload(&body);
+        assert_eq!(channel, MOD_REGISTRY_SYNC_CHANNEL);
+        assert_eq!(payload, frame);
+    }
+
+    /// `MEGU_MODS_DIR` content: a scanned JAR's declared blockstates/items
+    /// land in the suite's registry plan and ride the same MRS1 frame at the
+    /// dedicated generic id bases — disjoint from Create's ranges.
+    #[test]
+    fn wire_mods_mrs1_includes_mods_dir_registry_plan() {
+        let _serial = WIRE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        fresh_suite();
+        LIVE_CREATE_TEST_GATE.store(2, Ordering::Relaxed);
+        let dir = lmb_temp_dir("mrs1");
+        let blockstates = br#"{"variants":{"axis=x,waterlogged=false":{"model":"testmod:block/rock"},"axis=y,waterlogged=false":{"model":"testmod:block/rock"}}}"#;
+        let item_model = br#"{"parent":"minecraft:item/generated"}"#;
+        let manifest = lmb_fabric_manifest("testmod");
+        let jar = lmb_test_jar(&[
+            ("fabric.mod.json", manifest.as_slice()),
+            ("assets/testmod/blockstates/rock.json", blockstates),
+            ("assets/testmod/models/item/rock.json", item_model),
+            ("assets/testmod/items/geode.json", item_model),
+        ]);
+        std::fs::write(dir.join("testmod.jar"), &jar).unwrap();
+        let mut suite = LiveModSuite::new();
+        suite.scan_mods_dir(&dir);
+        assert!(
+            suite.registry_plan.is_some(),
+            "adapted JAR must produce an MRS1 registry plan"
+        );
+        *live_mod_suite().lock().unwrap_or_else(|e| e.into_inner()) = suite;
+
+        let frame = live_mod_registry_sync_frame().expect("generic mods must emit MRS1");
+        let synced = mod_adapter_core::live_registry_bridge::decode_registry_sync_frame(&frame)
+            .expect("merged frame must satisfy the client decoder");
+        let rock = synced
+            .block_states
+            .iter()
+            .find(|e| e.block_id == "testmod:rock")
+            .expect("testmod:rock block state missing");
+        assert!(rock.state_id >= LIVE_MRS_GENERIC_BLOCK_BASE);
+        assert!(rock.properties.iter().any(|(k, v)| k == "axis" && v == "x"));
+        assert!(
+            synced.items.values().any(|n| n == "testmod:geode"),
+            "testmod:geode item missing"
+        );
+        assert!(
+            synced.items.keys().all(|id| *id >= LIVE_MRS_GENERIC_ITEM_BASE),
+            "generic item ids must stay in their dedicated range"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+        fresh_suite();
+        LIVE_CREATE_TEST_GATE.store(1, Ordering::Relaxed);
     }
 
 }

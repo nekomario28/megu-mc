@@ -58,7 +58,6 @@ mod-suite = [
     "dep:mod-adapter-core",
     "dep:create-adapter",
     "dep:mod-offload",
-    "dep:megu-core",
     "dep:megu-state-store",
 ]
 
@@ -67,7 +66,9 @@ flate2 = { version = "1.1.10", default-features = false, features = ["rust_backe
 jni = { version = "0.21.1", features = ["invocation"], optional = true }
 mod-adapter-core = { path = "mod-adapter-core", optional = true }
 create-adapter = { path = "create-adapter", optional = true }
-megu-core = { path = "core", optional = true }
+# `megu-core` is a default dependency: `worldgen`'s `bg_scope!` batches run on
+# its resident `MeguTaskPool` in every build, not only under `mod-suite`.
+megu-core = { path = "core" }
 megu-state-store = { path = "state-store", optional = true }
 mod-offload = { path = "mod-offload", optional = true }
 ureq = { version = "3.4.2", features = ["rustls"] }

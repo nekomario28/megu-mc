@@ -9643,36 +9643,64 @@ pub fn chunk_cols_scratch(
 type PrefetchedCols = Vec<((i32, i32), Option<std::sync::Arc<ChunkCols>>)>;
 
 /// The resident background task pool every scoped worldgen/feature batch shares
-/// under `mod-suite` (§1.1/§1.2 of
+/// (§1.1/§1.2 of
 /// `audit/full-multithreading-server-client-parallel-architecture-20261123.md`).
 /// `std::thread::scope` pays an OS `clone`/`join` pair per call — several per
 /// generation round — while these workers spawn once at first use and
 /// `scope_blocking` only queues jobs, the caller help-stealing instead of
 /// sleeping. Lane B (Background) is where the audit routes chunk generation
-/// and feature placement.
-#[cfg(feature = "mod-suite")]
+/// and feature placement. Available in every build: `megu-core` is a default
+/// dependency, so default and `mod-suite` builds share the same executor.
 pub(crate) fn bg_task_pool() -> &'static megu_core::task_pool::MeguTaskPool {
     static POOL: std::sync::OnceLock<megu_core::task_pool::MeguTaskPool> =
         std::sync::OnceLock::new();
     POOL.get_or_init(megu_core::task_pool::MeguTaskPool::for_host)
 }
 
-/// Run `f` in a scoped parallel batch: the resident background task pool under
-/// `mod-suite`, per-call OS threads otherwise. Both arms hand `f` a scope whose
-/// `spawn` accepts `FnOnce() + Send + 'scope`, so call sites read exactly like
-/// `std::thread::scope` and spawn identically-shaped jobs on either executor.
+/// Run `f` in a scoped parallel batch on the resident background task pool.
+/// The pool hands `f` a scope whose `spawn` accepts `FnOnce() + Send +
+/// 'scope`, so call sites read exactly like `std::thread::scope` and spawn
+/// identically-shaped jobs — minus the per-burst OS thread spawn/join.
 macro_rules! bg_scope {
     ($f:expr) => {{
-        #[cfg(feature = "mod-suite")]
         let r = $crate::worldgen::bg_task_pool()
             .scope_blocking(megu_core::task_pool::TaskLane::Background, $f);
-        #[cfg(not(feature = "mod-suite"))]
-        let r = ::std::thread::scope($f);
         r
     }};
 }
 
 pub(crate) use bg_scope;
+
+#[cfg(test)]
+mod bg_pool_tests {
+    use super::*;
+
+    /// `bg_scope!` must dispatch its batch to the resident `MeguTaskPool` in
+    /// every build — default included, not only `mod-suite`. The executed-job
+    /// counter proves the pool ran the work rather than a silent serial
+    /// fallback producing identical output (rules CV1).
+    #[test]
+    fn bg_scope_executes_on_resident_pool() {
+        let before = bg_task_pool().tasks_executed();
+        let (tx, rx) = std::sync::mpsc::channel::<u8>();
+        bg_scope!(|s| {
+            for i in 0..8u8 {
+                let tx = tx.clone();
+                s.spawn(move || {
+                    let _ = tx.send(i);
+                });
+            }
+        });
+        drop(tx);
+        let mut got: Vec<u8> = rx.iter().take(8).collect();
+        got.sort_unstable();
+        assert_eq!(got, (0..8u8).collect::<Vec<_>>());
+        assert!(
+            bg_task_pool().tasks_executed() > before,
+            "bg_scope! must run on the resident pool"
+        );
+    }
+}
 
 /// Compute `keys` with up to `workers` scratch generators, returned in the caller's order.
 /// `workers <= 1` runs inline, which is the reference path; every worker count must give
@@ -19561,8 +19589,8 @@ mod wg_tests {
     }
 
     /// Lane BETA-SERVER-MT-SCOPE: the scoped batch rides the resident background
-    /// pool under `mod-suite` and per-call OS threads otherwise; either executor
-    /// must return the serial arm's columns and rows bit-for-bit.
+    /// pool in every build; it must return the serial arm's columns and rows
+    /// bit-for-bit.
     #[test]
     fn worldgen_pool_batch_matches_serial_bit_for_bit() {
         crate::test_support::require_vanilla_data();
@@ -19586,15 +19614,13 @@ mod wg_tests {
             want_cols.push(cols_fingerprint(&mut reference, &cc));
             want_rows.push(rows);
         }
-        // `jobs = 4` keeps the batch above the serial fallback on both arms.
-        #[cfg(feature = "mod-suite")]
+        // `jobs = 4` keeps the batch above the serial fallback.
         let executed_before = bg_task_pool().tasks_executed();
         let cols = prefetch_cols_with(&data, None, &keys, 4, None);
         let got = prefetch_terrain(&data, None, &keys, &cols, lo, hi, 4, None);
         // Identical bytes are produced by the serial fallback too, so the pool
         // arm must prove it actually ran rather than silently taking the other
         // executor (rules CV1).
-        #[cfg(feature = "mod-suite")]
         assert!(
             bg_task_pool().tasks_executed() > executed_before,
             "the scoped batch ran on the resident pool"
