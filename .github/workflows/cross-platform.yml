@@ -56,6 +56,7 @@ jobs:
           PY=python3
           command -v python3 >/dev/null 2>&1 || PY=python
           "$PY" tools/provenance_check.py --strict-zero-gl
+          "$PY" tests/public_hygiene_test.py
           "$PY" tests/mini_jre_test.py
           "$PY" tests/megu_translate_test.py
           "$PY" tests/megu_tui_test.py

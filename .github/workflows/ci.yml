@@ -33,10 +33,11 @@ jobs:
           java-version: '21'
       # Fast and independent of the compiler: the plan states numbers about what is left to do, and
       # a number nothing checks drifts.
-      - name: Debt, provenance (zero-GL/zero-embed), TUI, 3-OS installer, workflow & website gates
+      - name: Debt, provenance (zero-GL/zero-embed), hygiene, TUI, 3-OS installer, workflow & website gates
         run: |
           bash tools/debt_ratchet.sh
           python3 tools/provenance_check.py --strict-zero-gl
+          python3 tests/public_hygiene_test.py
           python3 tests/release_workflow_test.py
           python3 tests/megu_tui_test.py
           python3 tests/installer_cross_os_test.py
