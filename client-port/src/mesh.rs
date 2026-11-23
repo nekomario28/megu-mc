@@ -238,6 +238,14 @@ pub(crate) fn missing_encoded(missing: MissingNeighbor) -> (u8, u8) {
     }
 }
 
+/// Spreads the four low bytes of `x` to byte positions 0, 2, 4, 6 of a `u64`,
+/// zeroing the gaps: the byte-wise interleave step of [`unpack_light_row`].
+#[inline(always)]
+fn spread_bytes4(x: u32) -> u64 {
+    let x = (u64::from(x) | (u64::from(x) << 16)) & 0x0000_ffff_0000_ffff;
+    (x | (x << 8)) & 0x00ff_00ff_00ff_00ff
+}
+
 #[inline(always)]
 pub(crate) fn unpack_light_row(
     block_light: &[u8; LIGHT_BYTES],
@@ -245,15 +253,26 @@ pub(crate) fn unpack_light_row(
     src_byte_offset: usize,
     dst: &mut [u8],
 ) {
-    let bl = &block_light[src_byte_offset..src_byte_offset + 8];
-    let sl = &sky_light[src_byte_offset..src_byte_offset + 8];
-    let out = &mut dst[..16];
-    for k in 0..8 {
-        let b = bl[k];
-        let s = sl[k];
-        out[k * 2] = (b & 0x0f) | ((s & 0x0f) << 4);
-        out[k * 2 + 1] = (b >> 4) | (s & 0xf0);
-    }
+    // Nibble-zip two packed light bytes into one combined light byte per cell:
+    // `out[2k] = lo(bl[k]) | lo(sl[k]) << 4`, `out[2k+1] = hi(bl[k]) | hi(sl[k])`.
+    // A `u64` load plus two masked shifts produces all eight bytes of each
+    // parity at once; `spread_bytes4` interleaves them into the 16 output cells.
+    let bl = u64::from_le_bytes(
+        block_light[src_byte_offset..src_byte_offset + 8]
+            .try_into()
+            .unwrap(),
+    );
+    let sl = u64::from_le_bytes(
+        sky_light[src_byte_offset..src_byte_offset + 8]
+            .try_into()
+            .unwrap(),
+    );
+    let lo = (bl & 0x0f0f_0f0f_0f0f_0f0f) | ((sl & 0x0f0f_0f0f_0f0f_0f0f) << 4);
+    let hi = ((bl >> 4) & 0x0f0f_0f0f_0f0f_0f0f) | (sl & 0xf0f0_f0f0_f0f0_f0f0);
+    let out_lo = spread_bytes4(lo as u32) | (spread_bytes4(hi as u32) << 8);
+    let out_hi = spread_bytes4((lo >> 32) as u32) | (spread_bytes4((hi >> 32) as u32) << 8);
+    dst[..8].copy_from_slice(&out_lo.to_le_bytes());
+    dst[8..16].copy_from_slice(&out_hi.to_le_bytes());
 }
 
 #[inline(always)]
@@ -310,11 +329,211 @@ pub(crate) fn transpose_16x16(src: [u16; 16]) -> [u16; 16] {
     ]
 }
 
+// ---------------------------------------------------------------------------
+// Circuit-level binary face extraction
+// ---------------------------------------------------------------------------
+//
+// Face culling runs on 64-bit occupancy bitboards. Each `u64` packs four
+// consecutive 16-block strips (one `u16` lane each), so bit `16*k + x` of a
+// word is bit `x` of strip `k`. With the per-strip masks laid out this way a
+// single `solid & !(solid >> 1)`-style expression culls 64 voxels — four whole
+// strips — per instruction instead of one strip at a time:
+//
+// * Axis-crossing neighbours (the ±Y and ±Z directions, where the occluding
+//   cell lives in the adjacent strip) reduce to `cube4 & !occ4`: one AND-NOT
+//   per four strips.
+// * In-strip neighbours (±X, where the occluding cell is the previous/next
+//   bit in the same lane) use `cube4 & !((occ4 << 1) & LANES_HIGH | border4)`
+//   and `cube4 & !((occ4 >> 1) & LANES_LOW | border4)`: the lane masks stop
+//   bits leaking across strip boundaries, and `border4` carries the one-block
+//   neighbour border (the far section's occlusion) folded into the same word.
+//
+// The extracted masks are identical to a per-strip `u16` evaluation, bit for
+// bit, so the greedy merge below sees exactly the same visible faces.
+
+/// Keeps every bit of each 16-bit lane except bit 0: used after `<< 1` so the
+/// top bit of strip `k` cannot leak into strip `k + 1`.
+const LANES_HIGH: u64 = 0xfffe_fffe_fffe_fffe;
+/// Keeps every bit of each 16-bit lane except bit 15: used after `>> 1` so the
+/// bottom bit of strip `k + 1` cannot leak into strip `k`.
+const LANES_LOW: u64 = 0x7fff_7fff_7fff_7fff;
+
+/// Packs four consecutive `u16` strip masks into one `u64` bitboard.
+#[inline(always)]
+fn pack_strips4(rows: &[u16], base: usize) -> u64 {
+    u64::from(rows[base])
+        | (u64::from(rows[base + 1]) << 16)
+        | (u64::from(rows[base + 2]) << 32)
+        | (u64::from(rows[base + 3]) << 48)
+}
+
+/// [`pack_strips4`] for strips `EDGE` apart: lanes land on `rows[base]`,
+/// `rows[base + EDGE]`, `rows[base + 2*EDGE]`, `rows[base + 3*EDGE]`.
+#[inline(always)]
+fn pack_strips4_step(rows: &[u16], base: usize) -> u64 {
+    u64::from(rows[base])
+        | (u64::from(rows[base + EDGE]) << 16)
+        | (u64::from(rows[base + 2 * EDGE]) << 32)
+        | (u64::from(rows[base + 3 * EDGE]) << 48)
+}
+
+/// Writes a packed `u64` bitboard back as four `u16` strip masks.
+#[inline(always)]
+fn store_strips4(dst: &mut [u16], base: usize, word: u64) {
+    dst[base] = word as u16;
+    dst[base + 1] = (word >> 16) as u16;
+    dst[base + 2] = (word >> 32) as u16;
+    dst[base + 3] = (word >> 48) as u16;
+}
+
+/// ORs the four lanes of a packed `u64` bitboard into a single `u16`.
+#[inline(always)]
+fn fold_strips4(word: u64) -> u16 {
+    (word | (word >> 16) | (word >> 32) | (word >> 48)) as u16
+}
+
+/// Byte-wise single-bit test packed to a `u16`: bit `i` of the result is set
+/// when `bytes[i]` has the single-bit value `bit` set. Isolates the tested
+/// bit per byte, then gathers the eight flag bytes into the top byte with one
+/// multiply — the portable `pmovmskb` for a whole border row in ~10 ops.
+#[inline(always)]
+fn bitmask16(bytes: &[u8], bit: u8) -> u16 {
+    debug_assert!(bit.is_power_of_two());
+    let lo = u64::from_le_bytes(bytes[..8].try_into().unwrap());
+    let hi = u64::from_le_bytes(bytes[8..16].try_into().unwrap());
+    let shift = bit.trailing_zeros();
+    let gather = |w: u64| -> u64 {
+        ((w >> shift) & 0x0101_0101_0101_0101).wrapping_mul(0x0102_0408_1020_4080) >> 56
+    };
+    (gather(lo) | (gather(hi) << 8)) as u16
+}
+
+/// Border row occlusion for one face direction over a contiguous 16-byte run
+/// of the padded `occ` array, as four packed strip lanes.
+#[inline(always)]
+fn border_lane4(occ: &[u8; PAD_CELLS], base: usize, step: usize, bit: u8) -> u64 {
+    let mut word = 0u64;
+    for k in 0..4 {
+        word |= u64::from(bitmask16(&occ[base + step * k..base + step * k + 16], bit)) << (16 * k);
+    }
+    word
+}
+
 pub(crate) struct InteriorScan {
     pub any_cube: bool,
     pub any_fluid: bool,
     pub any_same_state_cull: bool,
     pub any_partial_occ: bool,
+}
+
+/// The single block value shared by every cell, or `None` when the section
+/// mixes blocks. Deep-stone and ocean sections are uniform in practice; the
+/// scan exits on the first differing cell, so mixed sections pay only a few
+/// compares.
+#[inline(always)]
+fn uniform_block(blocks: &[Block; SECTION_CELLS]) -> Option<Block> {
+    let first = blocks[0];
+    blocks[1..].iter().all(|&b| b == first).then_some(first)
+}
+
+/// [`load_interior`] specialized for a section whose every cell holds `block`:
+/// the strip masks degenerate to all-ones or all-zero and the padded occ
+/// interior is a repeated byte, so no per-cell classification runs at all.
+fn load_interior_uniform(
+    block: Block,
+    block_light: &[u8; LIGHT_BYTES],
+    sky_light: &[u8; LIGHT_BYTES],
+    scratch: &mut MesherScratch,
+) -> InteriorScan {
+    let occ = encode_occ(block);
+    let any_cube = occ & CUBE_BIT != 0;
+    let any_fluid = block.fluid() != NO_FLUID;
+    let any_same_state_cull = occ & SAME_STATE_CULL != 0;
+    let any_partial_occ = {
+        let bits = occ & ALL_FACES;
+        bits != 0 && bits != ALL_FACES
+    };
+
+    scratch.cube_rows.fill(u16::from(any_cube) * u16::MAX);
+    scratch.fluid_rows.fill(u16::from(any_fluid) * u16::MAX);
+    let occ_full = u16::from((occ & ALL_FACES) == ALL_FACES) * u16::MAX;
+    for (d, rows) in scratch.occ_rows.iter_mut().enumerate() {
+        let mask = if any_partial_occ {
+            u16::from(occ & (1 << d) != 0) * u16::MAX
+        } else {
+            occ_full
+        };
+        rows.fill(mask);
+    }
+
+    if !any_cube && !any_fluid {
+        return InteriorScan {
+            any_cube,
+            any_fluid,
+            any_same_state_cull,
+            any_partial_occ,
+        };
+    }
+
+    for y in 0..EDGE {
+        let pad_y = (y + 1) * PAD_SLICE;
+        for z in 0..EDGE {
+            let pad_base = pad_y + (z + 1) * PAD_EDGE + 1;
+            scratch.occ[pad_base..pad_base + EDGE].fill(occ);
+        }
+    }
+
+    // Uniform light bytes unpack to a repeated `u16` pattern per row.
+    if block_light.iter().all(|&b| b == block_light[0])
+        && sky_light.iter().all(|&b| b == sky_light[0])
+    {
+        let bl = block_light[0];
+        let sl = sky_light[0];
+        let pattern =
+            u16::from((bl & 0x0f) | ((sl & 0x0f) << 4)) | (u16::from((bl >> 4) | (sl & 0xf0)) << 8);
+        for y in 0..EDGE {
+            let pad_y = (y + 1) * PAD_SLICE;
+            for z in 0..EDGE {
+                let pad_base = pad_y + (z + 1) * PAD_EDGE + 1;
+                let (pairs, _) = scratch.light[pad_base..pad_base + EDGE].as_chunks_mut::<2>();
+                for pair in pairs {
+                    *pair = pattern.to_le_bytes();
+                }
+            }
+        }
+    } else {
+        for y in 0..EDGE {
+            let pad_y = (y + 1) * PAD_SLICE;
+            let light_y = y * (FACE_CELLS / 2);
+            for z in 0..EDGE {
+                let pad_base = pad_y + (z + 1) * PAD_EDGE + 1;
+                unpack_light_row(
+                    block_light,
+                    sky_light,
+                    light_y + z * (EDGE / 2),
+                    &mut scratch.light[pad_base..pad_base + EDGE],
+                );
+            }
+        }
+    }
+
+    if any_fluid {
+        let encoded = encode_fluid(block);
+        for y in 0..EDGE {
+            let pad_y = (y + 1) * PAD_SLICE;
+            for z in 0..EDGE {
+                let pad_base = pad_y + (z + 1) * PAD_EDGE + 1;
+                scratch.fluid[pad_base..pad_base + EDGE].fill(encoded);
+            }
+        }
+    }
+
+    InteriorScan {
+        any_cube,
+        any_fluid,
+        any_same_state_cull,
+        any_partial_occ,
+    }
 }
 
 pub(crate) fn load_interior(
@@ -323,6 +542,9 @@ pub(crate) fn load_interior(
     sky_light: &[u8; LIGHT_BYTES],
     scratch: &mut MesherScratch,
 ) -> InteriorScan {
+    if let Some(block) = uniform_block(blocks) {
+        return load_interior_uniform(block, block_light, sky_light, scratch);
+    }
     let mut any_cube_bits = 0u16;
     let mut any_fluid_bits = 0u16;
     let mut any_same_state_cull = false;
@@ -1324,35 +1546,28 @@ fn mesh_cubes_fast<B: BorderStates, S: QuadSink>(
 
     // 0: Direction::Down (-Y)
     {
-        let mut border_occ = [0u16; EDGE];
+        // Downward border occlusion, packed four strips per word: lane z holds
+        // the below-section row's "occludes Up" mask along x.
+        let mut border4 = [0u64; 4];
         let opp_bit = Direction::Up.bit();
-        for (z, slot) in border_occ.iter_mut().enumerate() {
-            let base = (z + 1) * PAD_EDGE + 1;
-            let mut m = 0u16;
-            for x in 0..EDGE {
-                if (scratch.occ[base + x] & opp_bit) != 0 {
-                    m |= 1u16 << x;
-                }
-            }
-            *slot = m;
+        for (g, word) in border4.iter_mut().enumerate() {
+            *word = border_lane4(&scratch.occ, (4 * g + 1) * PAD_EDGE + 1, PAD_EDGE, opp_bit);
         }
+        let occ_up = scratch.occ_rows[occ_up_idx];
         for y in 0..EDGE {
             let mut vis_rows = [0u16; EDGE];
-            let mut any = 0u16;
+            let mut any = 0u64;
             let base = y * EDGE;
-            if y == 0 {
-                for (z, (&b_occ, slot)) in border_occ.iter().zip(&mut vis_rows).enumerate() {
-                    let v = scratch.cube_rows[base + z] & !b_occ;
-                    *slot = v;
-                    any |= v;
-                }
-            } else {
-                let prev = (y - 1) * EDGE;
-                for (z, slot) in vis_rows.iter_mut().enumerate() {
-                    let v = scratch.cube_rows[base + z] & !scratch.occ_rows[occ_up_idx][prev + z];
-                    *slot = v;
-                    any |= v;
-                }
+            for (g, &border) in border4.iter().enumerate() {
+                let cube4 = pack_strips4(&scratch.cube_rows, base + 4 * g);
+                let occ4 = if y == 0 {
+                    border
+                } else {
+                    pack_strips4(&occ_up, base - EDGE + 4 * g)
+                };
+                let v4 = cube4 & !occ4;
+                any |= v4;
+                store_strips4(&mut vis_rows, 4 * g, v4);
             }
             if any != 0 {
                 greedy_slice(&ctx, scratch, Direction::Down, y, vis_rows, quads);
@@ -1362,36 +1577,32 @@ fn mesh_cubes_fast<B: BorderStates, S: QuadSink>(
 
     // 1: Direction::Up (+Y)
     {
-        let mut border_occ = [0u16; EDGE];
+        let mut border4 = [0u64; 4];
         let opp_bit = Direction::Down.bit();
         let top_plane = (PAD_EDGE - 1) * PAD_SLICE;
-        for (z, slot) in border_occ.iter_mut().enumerate() {
-            let base = top_plane + (z + 1) * PAD_EDGE + 1;
-            let mut m = 0u16;
-            for x in 0..EDGE {
-                if (scratch.occ[base + x] & opp_bit) != 0 {
-                    m |= 1u16 << x;
-                }
-            }
-            *slot = m;
+        for (g, word) in border4.iter_mut().enumerate() {
+            *word = border_lane4(
+                &scratch.occ,
+                top_plane + (4 * g + 1) * PAD_EDGE + 1,
+                PAD_EDGE,
+                opp_bit,
+            );
         }
+        let occ_down = scratch.occ_rows[occ_down_idx];
         for y in 0..EDGE {
             let mut raw_vis = [0u16; EDGE];
-            let mut any = 0u16;
+            let mut any = 0u64;
             let base = y * EDGE;
-            if y == EDGE - 1 {
-                for (z, (&b_occ, slot)) in border_occ.iter().zip(&mut raw_vis).enumerate() {
-                    let v = scratch.cube_rows[base + z] & !b_occ;
-                    *slot = v;
-                    any |= v;
-                }
-            } else {
-                let next = (y + 1) * EDGE;
-                for (z, slot) in raw_vis.iter_mut().enumerate() {
-                    let v = scratch.cube_rows[base + z] & !scratch.occ_rows[occ_down_idx][next + z];
-                    *slot = v;
-                    any |= v;
-                }
+            for (g, &border) in border4.iter().enumerate() {
+                let cube4 = pack_strips4(&scratch.cube_rows, base + 4 * g);
+                let occ4 = if y == EDGE - 1 {
+                    border
+                } else {
+                    pack_strips4(&occ_down, base + EDGE + 4 * g)
+                };
+                let v4 = cube4 & !occ4;
+                any |= v4;
+                store_strips4(&mut raw_vis, 4 * g, v4);
             }
             if any != 0 {
                 let vis_rows = transpose_16x16(raw_vis);
@@ -1402,34 +1613,33 @@ fn mesh_cubes_fast<B: BorderStates, S: QuadSink>(
 
     // 2: Direction::North (-Z)
     {
-        let mut border_occ = [0u16; EDGE];
+        // North faces cull against the cell one strip south (z - 1); the
+        // border word substitutes the neighbour section's plane at z = -1.
+        let mut border4 = [0u64; 4];
         let opp_bit = Direction::South.bit();
-        for (y, slot) in border_occ.iter_mut().enumerate() {
-            let base = (y + 1) * PAD_SLICE + 1;
-            let mut m = 0u16;
-            for x in 0..EDGE {
-                if (scratch.occ[base + x] & opp_bit) != 0 {
-                    m |= 1u16 << x;
-                }
-            }
-            *slot = m;
+        for (g, word) in border4.iter_mut().enumerate() {
+            *word = border_lane4(
+                &scratch.occ,
+                (4 * g + 1) * PAD_SLICE + 1,
+                PAD_SLICE,
+                opp_bit,
+            );
         }
+        let occ_south = scratch.occ_rows[occ_south_idx];
         for z in 0..EDGE {
             let mut raw_vis = [0u16; EDGE];
-            let mut any = 0u16;
-            if z == 0 {
-                for (y, (&b_occ, slot)) in border_occ.iter().zip(&mut raw_vis).enumerate() {
-                    let v = scratch.cube_rows[y * EDGE] & !b_occ;
-                    *slot = v;
-                    any |= v;
-                }
-            } else {
-                for (y, slot) in raw_vis.iter_mut().enumerate() {
-                    let idx = y * EDGE + z;
-                    let v = scratch.cube_rows[idx] & !scratch.occ_rows[occ_south_idx][idx - 1];
-                    *slot = v;
-                    any |= v;
-                }
+            let mut any = 0u64;
+            for (g, &border) in border4.iter().enumerate() {
+                let row_base = 4 * g * EDGE + z;
+                let cube4 = pack_strips4_step(&scratch.cube_rows, row_base);
+                let occ4 = if z == 0 {
+                    border
+                } else {
+                    pack_strips4_step(&occ_south, row_base - 1)
+                };
+                let v4 = cube4 & !occ4;
+                any |= v4;
+                store_strips4(&mut raw_vis, 4 * g, v4);
             }
             if any != 0 {
                 let vis_rows = transpose_16x16(raw_vis);
@@ -1440,35 +1650,32 @@ fn mesh_cubes_fast<B: BorderStates, S: QuadSink>(
 
     // 3: Direction::South (+Z)
     {
-        let mut border_occ = [0u16; EDGE];
+        let mut border4 = [0u64; 4];
         let opp_bit = Direction::North.bit();
         let south_offset = (PAD_EDGE - 1) * PAD_EDGE + 1;
-        for (y, slot) in border_occ.iter_mut().enumerate() {
-            let base = (y + 1) * PAD_SLICE + south_offset;
-            let mut m = 0u16;
-            for x in 0..EDGE {
-                if (scratch.occ[base + x] & opp_bit) != 0 {
-                    m |= 1u16 << x;
-                }
-            }
-            *slot = m;
+        for (g, word) in border4.iter_mut().enumerate() {
+            *word = border_lane4(
+                &scratch.occ,
+                (4 * g + 1) * PAD_SLICE + south_offset,
+                PAD_SLICE,
+                opp_bit,
+            );
         }
+        let occ_north = scratch.occ_rows[occ_north_idx];
         for z in 0..EDGE {
             let mut vis_rows = [0u16; EDGE];
-            let mut any = 0u16;
-            if z == EDGE - 1 {
-                for (y, (&b_occ, slot)) in border_occ.iter().zip(&mut vis_rows).enumerate() {
-                    let v = scratch.cube_rows[y * EDGE + (EDGE - 1)] & !b_occ;
-                    *slot = v;
-                    any |= v;
-                }
-            } else {
-                for (y, slot) in vis_rows.iter_mut().enumerate() {
-                    let idx = y * EDGE + z;
-                    let v = scratch.cube_rows[idx] & !scratch.occ_rows[occ_north_idx][idx + 1];
-                    *slot = v;
-                    any |= v;
-                }
+            let mut any = 0u64;
+            for (g, &border) in border4.iter().enumerate() {
+                let row_base = 4 * g * EDGE + z;
+                let cube4 = pack_strips4_step(&scratch.cube_rows, row_base);
+                let occ4 = if z == EDGE - 1 {
+                    border
+                } else {
+                    pack_strips4_step(&occ_north, row_base + 1)
+                };
+                let v4 = cube4 & !occ4;
+                any |= v4;
+                store_strips4(&mut vis_rows, 4 * g, v4);
             }
             if any != 0 {
                 greedy_slice(&ctx, scratch, Direction::South, z, vis_rows, quads);
@@ -1478,27 +1685,37 @@ fn mesh_cubes_fast<B: BorderStates, S: QuadSink>(
 
     // 4: Direction::West (-X)
     {
+        // West faces cull in-strip: the occluder of cell x is cell x - 1, so
+        // `cube4 & !((occ_east4 << 1) & LANES_HIGH | border4)` where the lane
+        // masks stop bits crossing strip boundaries and `border4` bit 0 of
+        // lane z carries the west border cell's "occludes East" flag.
         let opp_bit = Direction::East.bit();
+        let occ_east = scratch.occ_rows[occ_east_idx];
         let mut west_by_x = [[0u16; EDGE]; EDGE];
         let mut active_x = 0u16;
-        #[allow(clippy::needless_range_loop)]
-        for y in 0..EDGE {
+        for (y, _) in scratch.cube_rows.as_chunks::<EDGE>().0.iter().enumerate() {
             let pad_y = (y + 1) * PAD_SLICE;
             let base = y * EDGE;
             let mut raw = [0u16; EDGE];
-            let mut row_any = 0u16;
-            for (z, slot) in raw.iter_mut().enumerate() {
-                let border_bit =
-                    u16::from((scratch.occ[pad_y + (z + 1) * PAD_EDGE] & opp_bit) != 0);
-                let occ_e = scratch.occ_rows[occ_east_idx][base + z];
-                let v = scratch.cube_rows[base + z] & !((occ_e << 1) | border_bit);
-                *slot = v;
-                row_any |= v;
+            let mut row_any = 0u64;
+            for g in 0..4 {
+                let mut border4 = 0u64;
+                for (k, z) in (4 * g..4 * g + 4).enumerate() {
+                    let bit =
+                        u64::from((scratch.occ[pad_y + (z + 1) * PAD_EDGE] & opp_bit) != 0);
+                    border4 |= bit << (16 * k);
+                }
+                let cube4 = pack_strips4(&scratch.cube_rows, base + 4 * g);
+                let occ4 = pack_strips4(&occ_east, base + 4 * g);
+                let v4 = cube4 & !(((occ4 << 1) & LANES_HIGH) | border4);
+                row_any |= v4;
+                store_strips4(&mut raw, 4 * g, v4);
             }
             if row_any != 0 {
-                active_x |= row_any;
+                let row_mask = fold_strips4(row_any);
+                active_x |= row_mask;
                 let t = transpose_16x16(raw);
-                let mut m = row_any;
+                let mut m = row_mask;
                 while m != 0 {
                     let x = m.trailing_zeros() as usize;
                     m &= m - 1;
@@ -1515,27 +1732,36 @@ fn mesh_cubes_fast<B: BorderStates, S: QuadSink>(
 
     // 5: Direction::East (+X)
     {
+        // East faces cull against the cell at x + 1:
+        // `cube4 & !((occ_west4 >> 1) & LANES_LOW | border4)` with the east
+        // border "occludes West" flag at bit 15 of each lane.
         let opp_bit = Direction::West.bit();
+        let occ_west = scratch.occ_rows[occ_west_idx];
         let mut east_by_x = [[0u16; EDGE]; EDGE];
         let mut active_x = 0u16;
-        #[allow(clippy::needless_range_loop)]
-        for y in 0..EDGE {
+        for (y, _) in scratch.cube_rows.as_chunks::<EDGE>().0.iter().enumerate() {
             let pad_y = (y + 1) * PAD_SLICE + (PAD_EDGE - 1);
             let base = y * EDGE;
             let mut raw = [0u16; EDGE];
-            let mut row_any = 0u16;
-            for (z, slot) in raw.iter_mut().enumerate() {
-                let border_bit =
-                    u16::from((scratch.occ[pad_y + (z + 1) * PAD_EDGE] & opp_bit) != 0);
-                let occ_w = scratch.occ_rows[occ_west_idx][base + z];
-                let v = scratch.cube_rows[base + z] & !((occ_w >> 1) | (border_bit << 15));
-                *slot = v;
-                row_any |= v;
+            let mut row_any = 0u64;
+            for g in 0..4 {
+                let mut border4 = 0u64;
+                for (k, z) in (4 * g..4 * g + 4).enumerate() {
+                    let bit =
+                        u64::from((scratch.occ[pad_y + (z + 1) * PAD_EDGE] & opp_bit) != 0);
+                    border4 |= bit << (16 * k + 15);
+                }
+                let cube4 = pack_strips4(&scratch.cube_rows, base + 4 * g);
+                let occ4 = pack_strips4(&occ_west, base + 4 * g);
+                let v4 = cube4 & !(((occ4 >> 1) & LANES_LOW) | border4);
+                row_any |= v4;
+                store_strips4(&mut raw, 4 * g, v4);
             }
             if row_any != 0 {
-                active_x |= row_any;
+                let row_mask = fold_strips4(row_any);
+                active_x |= row_mask;
                 let t = transpose_16x16(raw);
-                let mut m = row_any;
+                let mut m = row_mask;
                 while m != 0 {
                     let x = m.trailing_zeros() as usize;
                     m &= m - 1;
