@@ -10,6 +10,10 @@ use std::time::{Duration, Instant};
 use megu_client::audio_out::{
     AudioCmd, AudioCmdRing, AudioRuntime, AudioSessionConfig, AudioSinkKind,
 };
+use megu_client::kinetic_sync::{
+    decode_kinetic_sync_batch, KineticSyncRecord, CHANNEL_CREATE_KINETIC_SYNC,
+    CHANNEL_CREATE_KINETIC_UPDATE,
+};
 use megu_client::online_auth::OnlineAuthOptions;
 use megu_client::protocol::{
     decode_item_stack_components, handle_transfer_packet, offline_uuid, parse_uuid,
@@ -57,6 +61,7 @@ use megu_kernel::raycast::{
 };
 use megu_kernel::Aabb;
 use megu_kernel::CommandDispatcher;
+use megu_ui::create_goggles_hud::GogglesTargetTelemetry;
 use megu_ui::magic_hud::{CastBarState, CooldownSlotState, MagicHudState, StatusBadgeState};
 use megu_ui::state::{HudState, MiniHudPreset, UiState};
 use megu_ui::subtitle_hud::{SubtitleArrow, DEFAULT_TTL_SECS};
@@ -427,6 +432,41 @@ impl KineticPartSpec {
             subworld_id: 0,
         }
     }
+}
+
+/// Small untextured fallback rotor so wire-driven instances have renderable
+/// geometry even when no mod model template has been registered yet.
+fn kinetic_fallback_template() -> (Vec<TerrainVertex>, Vec<u32>) {
+    let mut vertices = Vec::with_capacity(16);
+    let mut indices = Vec::with_capacity(24);
+    for step in 0..4 {
+        let angle = step as f32 * std::f32::consts::FRAC_PI_2;
+        let direction = [angle.cos(), angle.sin()];
+        let perpendicular = [-direction[1], direction[0]];
+        let center = [0.5, 0.5];
+        let corners = [
+            (0.06, -0.035),
+            (0.06, 0.035),
+            (0.43, 0.035),
+            (0.43, -0.035),
+        ];
+        let base = vertices.len() as u32;
+        for (radius, side) in corners {
+            vertices.push(TerrainVertex {
+                position: [
+                    center[0] + direction[0] * radius + perpendicular[0] * side,
+                    0.62,
+                    center[1] + direction[1] * radius + perpendicular[1] * side,
+                ],
+                normal: [0.0, 1.0, 0.0],
+                albedo: [0.72, 0.48, 0.18],
+                uv: [0.0, 0.0],
+                atlas_index: u32::MAX,
+            });
+        }
+        indices.extend([base, base + 1, base + 2, base, base + 2, base + 3]);
+    }
+    (vertices, indices)
 }
 
 /// Axis-angle `(axis, radians)` → XYZ-Euler triplet matching the instanced
@@ -828,6 +868,12 @@ pub struct LiveSession {
     /// Registered kinetic parts keyed by stable part id; resolved into
     /// [`InstancedPartRecord`]s by [`Self::sync_kinetic_network_rpm`].
     kinetic_parts: BTreeMap<u32, KineticPartSpec>,
+    /// Live wire positions to their render-part ids.
+    kinetic_pos_to_id: HashMap<(i32, i32, i32), u32>,
+    /// Latest wire telemetry, keyed by world position.
+    kinetic_telemetry: HashMap<(i32, i32, i32), KineticSyncRecord>,
+    /// Live angle accumulator, independent for each wire-synchronized part.
+    kinetic_live_angles: HashMap<u32, f32>,
     /// Per-`mesh_kind` scratch record lists retained between syncs — the
     /// swap in `sync_kinetic_network_rpm` trades the fresh list for the
     /// batch's stale one, so steady-state frames allocate nothing.
@@ -1126,6 +1172,9 @@ impl LiveSession {
             last_synced_hud_revision: u64::MAX,
             hud_sync_skips: 0,
             kinetic_parts: BTreeMap::new(),
+            kinetic_pos_to_id: HashMap::new(),
+            kinetic_telemetry: HashMap::new(),
+            kinetic_live_angles: HashMap::new(),
             kinetic_scratch: BTreeMap::new(),
             kinetic_network_rpm: 0.0,
             kinetic_time_secs: 0.0,
@@ -2395,6 +2444,142 @@ impl LiveSession {
         self.kinetic_parts.len()
     }
 
+    /// Advance wire-synchronized parts by their individual RPM values.
+    /// The shared-network API above retains its historical behavior.
+    pub fn sync_kinetic_live_parts(&mut self, dt_secs: f32) {
+        let dt = if dt_secs.is_finite() {
+            dt_secs.max(0.0)
+        } else {
+            0.0
+        };
+        for (pos, id) in &self.kinetic_pos_to_id {
+            let Some(record) = self.kinetic_telemetry.get(pos) else {
+                continue;
+            };
+            let angle = self.kinetic_live_angles.entry(*id).or_insert(0.0);
+            *angle += record.speed_rpm * std::f32::consts::TAU / 60.0 * dt;
+        }
+        for records in self.kinetic_scratch.values_mut() {
+            records.clear();
+        }
+        for (id, spec) in &self.kinetic_parts {
+            let theta = self
+                .kinetic_live_angles
+                .get(id)
+                .copied()
+                .unwrap_or(spec.phase0);
+            let euler = axis_angle_to_euler_xyz(spec.axis, theta);
+            self.kinetic_scratch
+                .entry(spec.mesh_kind)
+                .or_default()
+                .push(InstancedPartRecord {
+                    pos_scale: [
+                        spec.position[0],
+                        spec.position[1],
+                        spec.position[2],
+                        spec.scale,
+                    ],
+                    rot_uv_frame: [euler[0], euler[1], euler[2], 0.0],
+                    packed_light: spec.packed_light,
+                    tint_rgba: spec.tint_rgba,
+                    mesh_kind: spec.mesh_kind,
+                    subworld_id: spec.subworld_id,
+                });
+        }
+        let scratch = &mut self.kinetic_scratch;
+        for batch in self.subworlds.batches_mut() {
+            match scratch.get_mut(&batch.mesh_kind) {
+                Some(records) if batch.instances != *records => {
+                    std::mem::swap(&mut batch.instances, records);
+                    batch.instances_dirty = true;
+                }
+                Some(_) => {}
+                None if !batch.instances.is_empty() => {
+                    batch.instances.clear();
+                    batch.instances_dirty = true;
+                }
+                None => {}
+            }
+        }
+    }
+
+    pub fn goggles_telemetry_at(&self, pos: (i32, i32, i32)) -> Option<GogglesTargetTelemetry> {
+        let record = self.kinetic_telemetry.get(&pos)?;
+        let block_id = self
+            .world
+            .get_block_state(pos.0, pos.1, pos.2)
+            .and_then(|state| self.world.blocks.state_name(state))
+            .filter(|name| !name.is_empty())
+            .unwrap_or("create:kinetic_part")
+            .to_owned();
+        Some(GogglesTargetTelemetry {
+            block_id,
+            display_name: None,
+            rpm: record.speed_rpm,
+            stress_impact: 0.0,
+            network_stress_used: record.stress_load,
+            network_stress_capacity: record.stress_capacity,
+            overstressed: record.overstressed,
+            processing_item: None,
+            processing_progress: None,
+            fluid_mb: None,
+        })
+    }
+
+    fn upsert_kinetic_record(&mut self, record: KineticSyncRecord) {
+        let pos = record.position();
+        if self.kinetic_pos_to_id.contains_key(&pos) {
+            self.kinetic_telemetry.insert(pos, record);
+            return;
+        }
+        let axis = self
+            .world
+            .get_block_state(pos.0, pos.1, pos.2)
+            .and_then(|state| self.world.blocks.state_name(state))
+            .map(|name| {
+                if name.contains("axis=x") {
+                    [1.0, 0.0, 0.0]
+                } else if name.contains("axis=z") {
+                    [0.0, 0.0, 1.0]
+                } else {
+                    [0.0, 1.0, 0.0]
+                }
+            })
+            .unwrap_or([0.0, 1.0, 0.0]);
+        if !self.subworlds.batches().any(|batch| batch.mesh_kind == 0) {
+            let (vertices, indices) = kinetic_fallback_template();
+            self.register_kinetic_template(0, vertices, indices);
+        }
+        let id = self.register_kinetic_part(KineticPartSpec::shaft(
+            0,
+            [pos.0 as f32, pos.1 as f32, pos.2 as f32],
+            axis,
+        ));
+        self.kinetic_pos_to_id.insert(pos, id);
+        self.kinetic_live_angles.insert(id, 0.0);
+        self.kinetic_telemetry.insert(pos, record);
+    }
+
+    fn evict_kinetic_part(&mut self, pos: (i32, i32, i32)) {
+        self.kinetic_telemetry.remove(&pos);
+        if let Some(id) = self.kinetic_pos_to_id.remove(&pos) {
+            self.kinetic_live_angles.remove(&id);
+            self.remove_kinetic_part(id);
+        }
+    }
+
+    fn evict_kinetic_chunk(&mut self, cx: i32, cz: i32) {
+        let positions: Vec<_> = self
+            .kinetic_pos_to_id
+            .keys()
+            .copied()
+            .filter(|(x, _, z)| x.div_euclid(16) == cx && z.div_euclid(16) == cz)
+            .collect();
+        for pos in positions {
+            self.evict_kinetic_part(pos);
+        }
+    }
+
     /// Set the shared network speed and advance it by `dt_secs`, then
     /// re-resolve every part's [`InstancedPartRecord`]. Rotation is
     /// analytic — `theta = phase0 + rpm * ratio * TAU/60 * t` — so the
@@ -2612,6 +2797,7 @@ impl LiveSession {
 
     /// Record frame timing and advance visual transitions before HUD rendering.
     pub fn record_frame_and_refresh_minihud(&mut self, frame_dt_sec: f32, ui: &mut UiState) {
+        self.sync_kinetic_live_parts(frame_dt_sec);
         let frame_us = f64::from(frame_dt_sec) * 1_000_000.0;
         let frame_ms = frame_us / 1_000.0;
         self.frame_timings.push_frame_ms(frame_ms);
@@ -2791,14 +2977,20 @@ impl LiveSession {
                 self.mark_chunk_column_dirty(cx, cz);
                 self.terrain_dirty = true;
             }
-            PlayEvent::BlockUpdate { pos, .. } => {
+            PlayEvent::BlockUpdate { pos, state_id } => {
+                if self.world.blocks.is_air(state_id) {
+                    self.evict_kinetic_part((pos[0], pos[1], pos[2]));
+                }
                 self.acoustic_world.sync_block(&self.world, pos);
                 self.audio.mixer.refresh_acoustics();
                 self.mark_block_dirty(pos);
                 self.terrain_dirty = true;
             }
             PlayEvent::SectionBlocksUpdate(changes) => {
-                for (pos, _) in &changes {
+                for (pos, state_id) in &changes {
+                    if self.world.blocks.is_air(*state_id) {
+                        self.evict_kinetic_part((pos[0], pos[1], pos[2]));
+                    }
                     self.acoustic_world.sync_block(&self.world, *pos);
                     self.mark_block_dirty(*pos);
                 }
@@ -2812,6 +3004,7 @@ impl LiveSession {
                 self.terrain_dirty = true;
             }
             PlayEvent::UnloadChunk { cx, cz } => {
+                self.evict_kinetic_chunk(cx, cz);
                 self.acoustic_world.unload_chunk(cx, cz);
                 self.audio.mixer.refresh_acoustics();
                 self.chunk_fades.forget(cx, cz);
@@ -3259,6 +3452,18 @@ impl LiveSession {
                 self.motion = Some(trigger);
             }
             ClientCustomChannelEvent::Season(sync) => self.apply_season_sync(&sync),
+            ClientCustomChannelEvent::Unknown { channel, payload }
+                if matches!(
+                    channel.as_str(),
+                    CHANNEL_CREATE_KINETIC_SYNC | CHANNEL_CREATE_KINETIC_UPDATE
+                ) =>
+            {
+                if let Ok(records) = decode_kinetic_sync_batch(&payload) {
+                    for record in records {
+                        self.upsert_kinetic_record(record);
+                    }
+                }
+            }
             ClientCustomChannelEvent::Unknown { .. } => {}
         }
         Ok(())
@@ -4440,6 +4645,51 @@ mod tests {
             live.status,
             SessionStatus::Disconnected("test disconnect".into())
         );
+    }
+
+    #[test]
+    fn kinetic_wire_parts_rotate_independently_feed_goggles_and_evict() {
+        let (mut live, tx) = session();
+        let mut payload = vec![2];
+        for (x, rpm) in [(4, 60.0_f32), (5, -30.0_f32)] {
+            for value in [0_i32, x, 64, 8] {
+                payload.extend_from_slice(&value.to_be_bytes());
+            }
+            for value in [rpm, 100.0, 45.0] {
+                payload.extend_from_slice(&value.to_be_bytes());
+            }
+            payload.push(u8::from(x == 5));
+        }
+        tx.send(WorkerMessage::Play(framed(CHANNEL_CREATE_KINETIC_SYNC, &payload)))
+            .unwrap();
+        live.poll([0.0; 3], &[]);
+        assert_eq!(live.kinetic_part_count(), 2);
+        assert_eq!(live.subworlds.batches().next().unwrap().template_vertices.len(), 16);
+        assert_eq!(live.kinetic_pos_to_id.get(&(4, 64, 8)), Some(&0));
+        assert_eq!(live.kinetic_pos_to_id.get(&(5, 64, 8)), Some(&1));
+        let first = live.goggles_telemetry_at((4, 64, 8)).unwrap();
+        let second = live.goggles_telemetry_at((5, 64, 8)).unwrap();
+        assert_eq!((first.rpm, second.rpm), (60.0, -30.0));
+        assert_eq!(second.network_stress_used, 45.0);
+        assert!(second.overstressed);
+
+        live.sync_kinetic_live_parts(1.0);
+        assert_eq!(live.subworlds.batches().next().unwrap().instances.len(), 2);
+        assert!((live.kinetic_live_angles[&0] - std::f32::consts::TAU).abs() < 1e-5);
+        assert!((live.kinetic_live_angles[&1] + std::f32::consts::PI).abs() < 1e-5);
+        live.apply_event(ClientPlayEvent::Play(PlayEvent::BlockUpdate {
+            pos: [4, 64, 8],
+            state_id: 0,
+        }))
+        .unwrap();
+        assert_eq!(live.kinetic_part_count(), 1);
+        assert!(live.goggles_telemetry_at((4, 64, 8)).is_none());
+        live.apply_event(ClientPlayEvent::Play(PlayEvent::UnloadChunk {
+            cx: 0,
+            cz: 0,
+        }))
+        .unwrap();
+        assert_eq!(live.kinetic_part_count(), 0);
     }
 
     #[test]

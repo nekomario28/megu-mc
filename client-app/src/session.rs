@@ -27,6 +27,10 @@ use std::sync::{Arc, RwLock};
 use crate::audio_qol::{AudioLimiter, SoundAdmission, SoundKey};
 use crate::cli::CliConfig;
 use crate::crash_reporter::ReportEnv;
+use crate::kinetic_sync::{
+    CHANNEL_CREATE_KINETIC_SYNC, CHANNEL_CREATE_KINETIC_UPDATE, KineticSyncRecord,
+    KineticSyncStore, decode_kinetic_sync_batch,
+};
 use crate::online_auth::OnlineAuthOptions;
 use crate::protocol::{decode_megu_custom_payload, MeguCustomPayload, SeasonWireSync};
 use crate::recovery::{ContainmentOutcome, CrashCircuitBreaker, CrashGuard, RecoveryAction};
@@ -116,6 +120,8 @@ pub struct ClientSession {
     pub crash_breaker: CrashCircuitBreaker,
     /// Latest `SSN1` season sync received on the season channel.
     pub latest_season: Option<SeasonWireSync>,
+    /// Live Create kinetic nodes and changes waiting for the GPU session.
+    kinetic_sync: KineticSyncStore,
     /// Subsystems disabled after their breaker trip.
     disabled_subsystems: BTreeSet<GuardedSubsystem>,
     /// Blame metadata for crash reports captured by [`CrashGuard`].
@@ -137,6 +143,7 @@ impl ClientSession {
             ),
             crash_breaker: CrashCircuitBreaker::new(),
             latest_season: None,
+            kinetic_sync: KineticSyncStore::default(),
             disabled_subsystems: BTreeSet::new(),
             report_env,
             crash_dir,
@@ -149,6 +156,17 @@ impl ClientSession {
     /// [`MeguCustomPayload::Season`]. Malformed frames and unrecognized
     /// channels fail closed with `false` and leave session state untouched.
     pub fn handle_megu_custom_payload(&mut self, channel: &str, data: &[u8]) -> bool {
+        if matches!(
+            channel,
+            CHANNEL_CREATE_KINETIC_SYNC | CHANNEL_CREATE_KINETIC_UPDATE
+        ) {
+            return decode_kinetic_sync_batch(data)
+                .map(|batch| {
+                    self.kinetic_sync.apply_batch(batch);
+                    true
+                })
+                .unwrap_or(false);
+        }
         match decode_megu_custom_payload(channel, data) {
             Some(MeguCustomPayload::Season(sync)) => {
                 self.latest_season = Some(sync);
@@ -157,6 +175,30 @@ impl ClientSession {
             Some(_) => true,
             None => false,
         }
+    }
+
+    /// Drain Create nodes received since the previous drain and positions
+    /// evicted by a block or chunk lifecycle event.
+    pub fn drain_kinetic_updates(&mut self) -> (Vec<KineticSyncRecord>, Vec<(i32, i32, i32)>) {
+        (
+            self.kinetic_sync.drain_updates(),
+            self.kinetic_sync.drain_removals(),
+        )
+    }
+
+    pub fn kinetic_node_at(&self, x: i32, y: i32, z: i32) -> Option<&KineticSyncRecord> {
+        self.kinetic_sync.at(x, y, z)
+    }
+
+    /// Feed a decoded block state update into the kinetic lifecycle store.
+    pub fn handle_kinetic_block_update(&mut self, pos: [i32; 3], state_is_air: bool) {
+        if state_is_air {
+            self.kinetic_sync.evict((pos[0], pos[1], pos[2]));
+        }
+    }
+
+    pub fn handle_kinetic_chunk_unload(&mut self, cx: i32, cz: i32) {
+        self.kinetic_sync.evict_chunk(cx, cz);
     }
 
     /// Evaluate the binaural mix parameters for one sound event at
@@ -1326,6 +1368,31 @@ mod tests {
         }
         assert!(!session.handle_megu_custom_payload("example:unknown", b"abc"));
         assert_eq!(session.latest_season.as_ref().unwrap().sub_season_idx, 0);
+    }
+
+    #[test]
+    fn kinetic_payload_and_lifecycle_updates_are_exposed_from_session() {
+        let mut session = session("kinetic-sync");
+        let mut payload = vec![1];
+        for value in [0_i32, 17, 64, -1] {
+            payload.extend_from_slice(&value.to_be_bytes());
+        }
+        for value in [24.0_f32, 120.0, 30.0] {
+            payload.extend_from_slice(&value.to_be_bytes());
+        }
+        payload.push(1);
+        assert!(session.handle_megu_custom_payload(CHANNEL_CREATE_KINETIC_SYNC, &payload));
+        assert_eq!(session.kinetic_node_at(17, 64, -1).unwrap().speed_rpm, 24.0);
+        let (updates, removals) = session.drain_kinetic_updates();
+        assert_eq!(updates.len(), 1);
+        assert!(removals.is_empty());
+        session.handle_kinetic_block_update([17, 64, -1], true);
+        assert!(session.kinetic_node_at(17, 64, -1).is_none());
+        assert_eq!(session.drain_kinetic_updates().1, vec![(17, 64, -1)]);
+
+        assert!(session.handle_megu_custom_payload(CHANNEL_CREATE_KINETIC_UPDATE, &payload));
+        session.handle_kinetic_chunk_unload(1, -1);
+        assert_eq!(session.drain_kinetic_updates().1, vec![(17, 64, -1)]);
     }
 
     #[test]
