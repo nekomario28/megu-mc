@@ -553,10 +553,12 @@ fn installer_fails_closed_on_traversal_bad_version_and_symlink_targets() {
     {
         let planted = scratch.path().join("planted");
         std::fs::create_dir(&planted).unwrap();
-        std::os::unix::fs::symlink("/etc/hostname", planted.join("run.sh")).unwrap();
-        let before = std::fs::read("/etc/hostname").unwrap();
+        let victim = scratch.path().join("victim.txt");
+        std::fs::write(&victim, b"do-not-overwrite\n").unwrap();
+        std::os::unix::fs::symlink(&victim, planted.join("run.sh")).unwrap();
+        let before = std::fs::read(&victim).unwrap();
         assert!(installer::install_server(&planted, &ServerInstallOptions::default()).is_err());
-        assert_eq!(std::fs::read("/etc/hostname").unwrap(), before);
+        assert_eq!(std::fs::read(&victim).unwrap(), before);
     }
 
     // Staged inputs must exist, be files and not be symlinks.

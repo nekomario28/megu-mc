@@ -21,7 +21,7 @@ use std::error::Error;
 use std::fmt;
 use std::fs;
 use std::io::{self, Read};
-use std::path::{Component, Path, PathBuf};
+use std::path::{Component, Path, PathBuf, Prefix};
 
 const MAX_ENTRIES: usize = 250_000;
 const MAX_PATH_BYTES: usize = 4_096;
@@ -259,7 +259,13 @@ fn check_path(path: &Path) -> Result<(), InteropError> {
                 }
             }
             Component::CurDir => {}
-            Component::ParentDir | Component::Prefix(_) => {
+            Component::Prefix(prefix) => match prefix.kind() {
+                Prefix::Disk(_) | Prefix::VerbatimDisk(_) => cursor.push(part.as_os_str()),
+                _ => {
+                    return Err(unsafe_path(path, "parent traversal or unsupported prefix"));
+                }
+            },
+            Component::ParentDir => {
                 return Err(unsafe_path(path, "parent traversal or unsupported prefix"));
             }
         }
