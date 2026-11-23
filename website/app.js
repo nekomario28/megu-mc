@@ -2749,8 +2749,19 @@
       btn.setAttribute("href", st.asset.url);
       var label = DOWNLOAD_OS_LABEL[st.os] || "";
       btn.textContent = label
-        ? (ja ? label + " 版をダウンロード" : "Download for " + label)
-        : (ja ? "ダウンロード" : "Download");
+        ? (ja ? label + " 版インストーラを入手" : "Download for " + label)
+        : (ja ? "インストーラを入手" : "Download Installer");
+    }
+    var mrpackBtn = $("dl-mrpack-btn");
+    if (mrpackBtn && Array.isArray(st.assets)) {
+      for (var m = 0; m < st.assets.length; m++) {
+        var ma = st.assets[m];
+        if (ma && ma.kind === "mrpack" && typeof ma.url === "string" &&
+            ma.url.indexOf("https://github.com/") === 0) {
+          mrpackBtn.setAttribute("href", ma.url);
+          break;
+        }
+      }
     }
   }
 

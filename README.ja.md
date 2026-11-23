@@ -24,52 +24,17 @@ Megu は、Minecraft: Java Edition 1.21.1 互換を目指す **100% クリーン
 
 ---
 
-## クイックスタート
+## クイックスタート（3 つの導入方法から 1 つ選ぶだけ）
 
-**[GitHub Releases](https://github.com/nekomario28/megu-mc/releases)** または **[megu.megumin.tech](https://megu.megumin.tech/)** からお使いの OS 向けファイルをダウンロードしてください。
+**[GitHub Releases](https://github.com/nekomario28/megu-mc/releases)** または **[megu.megumin.tech](https://megu.megumin.tech/)** から、お使いの環境に合わせて **どれか 1 つ** を選んでください：
 
-### 1. クライアント導入（公式ランチャー / Prism Launcher）
+| プレイスタイル | 導入手順 |
+|---|---|
+| **① 公式ランチャー / 単体クライアント**<br>*(Windows / Linux / macOS)* | **Windows**: **`megu-installer-windows-x86_64.exe`** をダウンロードしてダブルクリック（Java 不要）。<br>**Linux**: `curl -fsSL https://raw.githubusercontent.com/nekomario28/megu-mc/main/tools/install_linux.sh \| sh` を 1 行実行。<br>**macOS**: **`megu-installer-macos-arm64`**（または `.tar.gz` 内の `./megu-installer`）を実行。 |
+| **② Prism Launcher / Modrinth App** | **`megu-1.21.1.mrpack`** をダウンロードしてランチャーにドラッグ＆ドロップ（または `megu-installer prism` を実行）。 |
+| **③ 専用サーバー (`megu`)** | OS 向けアーカイブを展開し、サーバーフォルダ初期化 → `eula.txt` 同意（`eula=true`）→ 起動：<br>`./megu-installer server --dir ./megu-server`<br>`cd ./megu-server && ./megu --port 25565` |
 
-#### Windows（`.exe` 単体・Java 不要）
-`megu-installer-windows-x86_64.exe` をダウンロード（または `megu-v0.1.0-alpha.1-windows-x86_64.tar.gz` を展開）して実行します：
-
-```powershell
-# エクスプローラーで megu-installer.exe をダブルクリック、または PowerShell で実行：
-.\megu-installer.exe
-
-# Prism Launcher 用インスタンスを作成する場合：
-.\megu-installer.exe prism
-```
-
-#### Linux（1 行インストーラ または 単体バイナリ）
-```sh
-# Linux 自動インストーラ（SHA-256 検証・~/.local への配置・ランチャー登録を自動実行）：
-curl -fsSL https://raw.githubusercontent.com/nekomario28/megu-mc/main/tools/install_linux.sh | sh
-
-# またはリリースアーカイブ展開後に単体バイナリを実行：
-./megu-installer
-```
-
-#### macOS（Apple Silicon）
-```sh
-# リリースアーカイブを展開して実行：
-./megu-installer
-```
-
-※ 同じフォルダ内に `megu-client-gpu`（`.exe`）や `megu-bootstrapper.jar` がある場合は、追加の CLI オプションなしで自動検出・登録されます。
-
-### 2. サーバー起動
-
-```sh
-# サーバーフォルダを初期化（eula.txt は既定で eula=false、run.sh / run.bat を生成）
-./megu-installer server --dir ./megu-server
-
-# eula.txt を確認・同意（eula=true）したうえで起動（既定バインド: 127.0.0.1）
-cd ./megu-server
-./megu --port 25565
-```
-
-ローカル以外へ公開する前の設定は [運用ガイド](docs/operator-guide.md) と [SECURITY_NOTES.md](SECURITY_NOTES.md) を参照してください。
+ローカル（`127.0.0.1`）以外へサーバーを公開する前の設定は [運用ガイド](docs/operator-guide.md) と [SECURITY_NOTES.md](SECURITY_NOTES.md) を参照してください。
 
 ---
 

@@ -30,8 +30,9 @@ const TEST_TAG = /(^|[-.])(test|ci|dryrun|dev)([-.\d]|$)/i;
 // Only real user-downloadable distribution artifacts count toward
 // totals and appear in the assets array.
 const DISTRIBUTION_EXTENSIONS = [
-  ".exe", ".jar", ".zip", ".tar.gz", ".mrpack", ".dmg", ".appimage",
+  ".exe", ".jar", ".zip", ".tar.gz", ".mrpack", ".dmg", ".appimage", ".sh",
 ];
+const STANDALONE_INSTALLER_BIN = /^megu-installer-(?:linux|macos|windows)-[a-z0-9_.-]+$/i;
 
 // Checksum, signature, SBOM and manifest files are metadata, not
 // downloads — excluded even though their extensions never match the
@@ -50,7 +51,7 @@ function assetOs(name) {
   if (/(?:macos|darwin|osx|\.dmg$)/i.test(name)) {
     return "macos";
   }
-  if (/(?:linux|\.appimage$)/i.test(name)) {
+  if (/(?:linux|\.appimage$|\.sh$)/i.test(name)) {
     return "linux";
   }
   return "";
@@ -68,7 +69,7 @@ function classifyAsset(name) {
   if (n.endsWith(".jar")) {
     return "installer_jar";
   }
-  if (n.includes("installer") || n.includes("setup") ||
+  if (n.includes("installer") || n.includes("install-") || n.includes("setup") ||
       n.includes("bootstrapper") || n.endsWith(".exe") ||
       n.endsWith(".msi") || n.endsWith(".dmg")) {
     return "installer_" + (os || "windows");
@@ -84,7 +85,8 @@ function isDistributionAsset(name) {
   if (!n || METADATA_ASSET.test(n)) {
     return false;
   }
-  return DISTRIBUTION_EXTENSIONS.some((ext) => n.endsWith(ext));
+  return DISTRIBUTION_EXTENSIONS.some((ext) => n.endsWith(ext)) ||
+    STANDALONE_INSTALLER_BIN.test(n);
 }
 
 // Structured, fail-closed view of one release's downloadable assets:

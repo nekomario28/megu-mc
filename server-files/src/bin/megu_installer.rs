@@ -270,6 +270,103 @@ fn auto_discover_sibling(explicit: &Option<PathBuf>, stem: &str) -> Option<PathB
     auto_discover_sibling_in(explicit, stem, &dirs)
 }
 
+const DEFAULT_RELEASE_TAG: &str = "v0.1.0-alpha.1";
+const DEFAULT_GITHUB_REPO: &str = "nekomario28/megu-mc";
+
+fn host_release_target() -> Option<(&'static str, &'static str)> {
+    match (std::env::consts::OS, std::env::consts::ARCH) {
+        ("windows", "x86_64") => Some(("windows-x86_64", ".exe")),
+        ("linux", "x86_64") => Some(("linux-x86_64", "")),
+        ("macos", "aarch64") => Some(("macos-arm64", "")),
+        _ => None,
+    }
+}
+
+fn parse_expected_sha256(sums_text: &str, filename: &str) -> Option<String> {
+    for line in sums_text.lines() {
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        let mut parts = trimmed.split_whitespace();
+        let digest = parts.next()?;
+        let name = parts.next()?.trim_start_matches('*');
+        if name == filename {
+            return installer::normalize_sha256_hex(digest).ok();
+        }
+    }
+    None
+}
+
+/// When `megu-installer` is run as a standalone downloaded executable (no local
+/// sibling `megu-client-gpu` / `megu-bootstrapper.jar` next to it) against the
+/// real OS default directory, automatically fetch and verify the release bundle
+/// from GitHub Releases into `<base_dir>/megu-runtime/`.
+fn auto_fetch_release_bundle(base_dir: & std::path::Path) -> Option<PathBuf> {
+    if std::env::var_os("MEGU_NO_AUTO_FETCH").is_some() {
+        return None;
+    }
+    let (target, suffix) = host_release_target()?;
+    let tag = std::env::var("MEGU_RELEASE_TAG").unwrap_or_else(|_| DEFAULT_RELEASE_TAG.to_owned());
+    let repo = std::env::var("MEGU_GITHUB_REPO").unwrap_or_else(|_| DEFAULT_GITHUB_REPO.to_owned());
+    let runtime_dir = base_dir.join("megu-runtime");
+    let bundle_dir = runtime_dir.join(format!("megu-{tag}-{target}"));
+    let client_name = format!("megu-client-gpu{suffix}");
+    let jar_path = bundle_dir.join("megu-bootstrapper.jar");
+    if bundle_dir.join(&client_name).is_file() && jar_path.is_file() {
+        return Some(bundle_dir);
+    }
+    std::fs::create_dir_all(&runtime_dir).ok()?;
+    let base_url = format!("https://github.com/{repo}/releases/download/{tag}");
+    let archive_name = format!("megu-{tag}-{target}.tar.gz");
+    let sums_path = runtime_dir.join("SHA256SUMS-all.txt");
+    let archive_path = runtime_dir.join(&archive_name);
+    let dl_jar_path = runtime_dir.join("megu-bootstrapper.jar");
+
+    eprintln!("[megu-installer] Downloading Megu {tag} ({target}) from GitHub Releases...");
+    for (remote, local) in [
+        ("SHA256SUMS-all.txt", &sums_path),
+        (archive_name.as_str(), &archive_path),
+        ("megu-bootstrapper.jar", &dl_jar_path),
+    ] {
+        let url = format!("{base_url}/{remote}");
+        let status = std::process::Command::new("curl")
+            .args(["-fsSL", &url, "-o"])
+            .arg(local)
+            .status()
+            .ok()?;
+        if !status.success() {
+            return None;
+        }
+    }
+    let sums_text = std::fs::read_to_string(&sums_path).ok()?;
+    for (fname, path) in [
+        (archive_name.as_str(), &archive_path),
+        ("megu-bootstrapper.jar", &dl_jar_path),
+    ] {
+        let expected = parse_expected_sha256(&sums_text, fname)?;
+        let actual = installer::sha256_file(path).ok()?;
+        if actual != expected {
+            eprintln!("[megu-installer] SHA-256 mismatch for {fname}");
+            let _ = std::fs::remove_file(path);
+            return None;
+        }
+    }
+    let status = std::process::Command::new("tar")
+        .arg("-xzf")
+        .arg(&archive_path)
+        .arg("-C")
+        .arg(&runtime_dir)
+        .status()
+        .ok()?;
+    if !status.success() || !bundle_dir.is_dir() {
+        return None;
+    }
+    let _ = std::fs::copy(&dl_jar_path, &jar_path);
+    let _ = std::fs::remove_file(&archive_path);
+    Some(bundle_dir)
+}
+
 fn run(cli: &Cli) -> std::io::Result<()> {
     match cli.command {
         Command::Client => {
@@ -277,10 +374,35 @@ fn run(cli: &Cli) -> std::io::Result<()> {
                 Some(dir) => dir.clone(),
                 None => installer::detect_minecraft_dir()?,
             };
+            let mut bootstrap_jar =
+                auto_discover_sibling(&cli.bootstrap_jar, "megu-bootstrapper.jar");
+            let mut client_bin = auto_discover_sibling(&cli.client_bin, "megu-client-gpu");
+            if cli.minecraft_dir.is_none()
+                && !cli.no_profile
+                && (bootstrap_jar.is_none() || client_bin.is_none())
+            {
+                if let Some(fetched_dir) = auto_fetch_release_bundle(&mc_dir) {
+                    let dirs = vec![fetched_dir];
+                    if bootstrap_jar.is_none() {
+                        bootstrap_jar = auto_discover_sibling_in(
+                            &cli.bootstrap_jar,
+                            "megu-bootstrapper.jar",
+                            &dirs,
+                        );
+                    }
+                    if client_bin.is_none() {
+                        client_bin = auto_discover_sibling_in(
+                            &cli.client_bin,
+                            "megu-client-gpu",
+                            &dirs,
+                        );
+                    }
+                }
+            }
             let options = ClientInstallOptions {
                 mc_version: cli.mc_version,
-                bootstrap_jar: auto_discover_sibling(&cli.bootstrap_jar, "megu-bootstrapper.jar"),
-                client_bin: auto_discover_sibling(&cli.client_bin, "megu-client-gpu"),
+                bootstrap_jar,
+                client_bin,
                 client_sha256: cli.client_sha256.clone(),
             };
             let report = installer::install_client(
@@ -297,10 +419,32 @@ fn run(cli: &Cli) -> std::io::Result<()> {
                 Some(dir) => dir.clone(),
                 None => installer::detect_prism_instances_dir()?,
             };
+            let mut bootstrap_jar =
+                auto_discover_sibling(&cli.bootstrap_jar, "megu-bootstrapper.jar");
+            let mut client_bin = auto_discover_sibling(&cli.client_bin, "megu-client-gpu");
+            if cli.instances_dir.is_none() && (bootstrap_jar.is_none() || client_bin.is_none()) {
+                if let Some(fetched_dir) = auto_fetch_release_bundle(&instances) {
+                    let dirs = vec![fetched_dir];
+                    if bootstrap_jar.is_none() {
+                        bootstrap_jar = auto_discover_sibling_in(
+                            &cli.bootstrap_jar,
+                            "megu-bootstrapper.jar",
+                            &dirs,
+                        );
+                    }
+                    if client_bin.is_none() {
+                        client_bin = auto_discover_sibling_in(
+                            &cli.client_bin,
+                            "megu-client-gpu",
+                            &dirs,
+                        );
+                    }
+                }
+            }
             let options = ClientInstallOptions {
                 mc_version: cli.mc_version,
-                bootstrap_jar: auto_discover_sibling(&cli.bootstrap_jar, "megu-bootstrapper.jar"),
-                client_bin: auto_discover_sibling(&cli.client_bin, "megu-client-gpu"),
+                bootstrap_jar,
+                client_bin,
                 client_sha256: cli.client_sha256.clone(),
             };
             let report = installer::install_prism(&instances, &options)?;

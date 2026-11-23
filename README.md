@@ -24,52 +24,17 @@ Megu is a **100% clean-room Rust server and native GPU client (Vulkan / DX12 / M
 
 ---
 
-## Quick Start
+## Quick Start (Choose 1 Way to Install)
 
-Download the installer or archive for your OS from **[GitHub Releases](https://github.com/nekomario28/megu-mc/releases)** or **[megu.megumin.tech](https://megu.megumin.tech/)**.
+Download from **[GitHub Releases](https://github.com/nekomario28/megu-mc/releases)** or **[megu.megumin.tech](https://megu.megumin.tech/)** — pick the option that matches how you play:
 
-### 1. Client Installation (Official Launcher / Prism Launcher)
+| How You Play | What to Do |
+|---|---|
+| **① Official Launcher / Standalone Client**<br>*(Windows / Linux / macOS)* | **Windows**: Download & double-click **`megu-installer-windows-x86_64.exe`** (no Java needed).<br>**Linux**: Run `curl -fsSL https://raw.githubusercontent.com/nekomario28/megu-mc/main/tools/install_linux.sh \| sh`<br>**macOS**: Run `./megu-installer-macos-arm64` (or `./megu-installer` from the macOS `.tar.gz`). |
+| **② Prism Launcher / Modrinth App** | Download **`megu-1.21.1.mrpack`** and drag & drop it into Modrinth App or Prism Launcher (or run `megu-installer prism`). |
+| **③ Dedicated Server (`megu`)** | Extract the release archive for your OS, initialize a server folder, accept `eula.txt`, and start:<br>`./megu-installer server --dir ./megu-server`<br>`cd ./megu-server && ./megu --port 25565` |
 
-#### Windows (`.exe` — No Java required)
-Download `megu-installer-windows-x86_64.exe` (or extract `megu-v0.1.0-alpha.1-windows-x86_64.tar.gz`) and run:
-
-```powershell
-# Double-click megu-installer.exe in Explorer, or run in PowerShell:
-.\megu-installer.exe
-
-# Or create a Prism Launcher instance:
-.\megu-installer.exe prism
-```
-
-#### Linux (One-liner or native binary)
-```sh
-# Automatic Linux installer (verifies SHA-256, installs to ~/.local, registers profile):
-curl -fsSL https://raw.githubusercontent.com/nekomario28/megu-mc/main/tools/install_linux.sh | sh
-
-# Or run the standalone binary from the release archive:
-./megu-installer
-```
-
-#### macOS (Apple Silicon)
-```sh
-# Extract the macOS archive and run:
-./megu-installer
-```
-
-*(When `megu-client-gpu` and `megu-bootstrapper.jar` are in the same folder as `megu-installer`, they are detected and wired automatically without extra flags.)*
-
-### 2. Dedicated Server
-
-```sh
-# Initialize a server directory (creates eula.txt with eula=false, run.sh / run.bat)
-./megu-installer server --dir ./megu-server
-
-# Review and accept eula.txt (eula=true), then start the server (default bind: 127.0.0.1)
-cd ./megu-server
-./megu --port 25565
-```
-
-See the [Operator Guide](docs/operator-guide.md) and [SECURITY_NOTES.md](SECURITY_NOTES.md) before exposing a server outside localhost.
+See the [Operator Guide](docs/operator-guide.md) and [SECURITY_NOTES.md](SECURITY_NOTES.md) before exposing a dedicated server outside `127.0.0.1`.
 
 ---
 
