@@ -76,7 +76,7 @@ cargo test --locked <test_filter>
 
 ## ライセンス
 
-- **本体ライセンスおよび寄稿コード**: `LGPL-3.0-or-later`（[COPYING.LESSER](COPYING.LESSER)）。全ワークスペースの `Cargo.toml` の `license` フィールドも `LGPL-3.0-or-later` です。LGPLv3 が要求する GPLv3 付随文として [LICENSE](LICENSE) を同梱しています。
+- **本体ライセンスおよび寄稿コード**: `LGPL-3.0-or-later`（[LICENSE](LICENSE) / [COPYING.LESSER](COPYING.LESSER)）。全ワークスペースの `Cargo.toml` の `license` フィールドも `LGPL-3.0-or-later` です。LGPLv3 が要求する GPLv3 付随文として [COPYING.GPL](COPYING.GPL) を同梱しています。
 - LGPLv3 §2 により、下流の利用者は本ソフトウェアを GPLv3 の条件で利用・再配布できます。`MIT` / `Apache-2.0` / `BSD` / `LGPL-2.1` / `LGPL-3.0` のコード（C2ME、Lithium、NeoForge、Fabric など）と完全互換であり、実行時に動的ロードされる独立した外部 Mod JAR は派生物とみなさないためコピーレフトは波及しません。
 - 自分が書いた、または `LGPL-3.0-or-later` でライセンスする権利のあるコードだけを提出してください。
 - ライセンスの技術的整理は [LICENSING.md](LICENSING.md)、ファイルごとの出所は [THIRD_PARTY.md](THIRD_PARTY.md)。
@@ -84,5 +84,5 @@ cargo test --locked <test_filter>
 
 ## English summary
 
-The project is distributed under `LGPL-3.0-or-later` ([COPYING.LESSER](COPYING.LESSER), with the GPLv3 text in [LICENSE](LICENSE) as the LGPLv3-required companion), and contributed code is provided under `LGPL-3.0-or-later`; LGPLv3 section 2 lets downstream users take the work under GPLv3. Commits must be signed off (`git commit -s`, DCO 1.1).
+The project is distributed under `LGPL-3.0-or-later` ([LICENSE](LICENSE) / [COPYING.LESSER](COPYING.LESSER), with the GPLv3 text in [COPYING.GPL](COPYING.GPL) as the LGPLv3-required companion), and contributed code is provided under `LGPL-3.0-or-later`; LGPLv3 section 2 lets downstream users take the work under GPLv3. Commits must be signed off (`git commit -s`, DCO 1.1).
 When referencing or adapting permissive or LGPL-3.0 projects (such as C2ME under MIT or Lithium under LGPL-3.0), record attribution in [THIRD_PARTY.md](THIRD_PARTY.md) and [NOTICE](NOTICE), and avoid mixing third-party `GPL-3.0-only` or `AGPL-3.0-only` code directly into first-party files so they remain distributable under `LGPL-3.0-or-later`. Do not add Mojang-derived data, mappings, or third-party jars. Run `python3 tools/dev_check.py`, `bash tools/layers_check.sh`, `bash tools/debt_ratchet.sh`, and `python3 tools/provenance_check.py` before opening a PR.

@@ -20,6 +20,7 @@ BINARIES = (
 )
 DOCUMENTS = (
     "LICENSE",
+    "COPYING.GPL",
     "COPYING.LESSER",
     "COPYING.AGPL",
     "NOTICE",
@@ -88,10 +89,8 @@ def test_five_binary_bundle():
             "--sums", first / "SHA256SUMS")
 
         manifest = json.loads(manifest_path.read_text())
-        assert manifest["license"] == "GPL-3.0-or-later"
-        assert manifest["subcrate_license"] == (
-            "LGPL-3.0-or-later OR GPL-3.0-or-later OR AGPL-3.0-or-later"
-        )
+        assert manifest["license"] == "LGPL-3.0-or-later"
+        assert manifest["subcrate_license"] == "LGPL-3.0-or-later"
         expected = {f"{PREFIX}/{name}" for name in (*BINARIES, *DOCUMENTS, *TOOLS)}
         records = {item["path"]: item for item in manifest["files"]}
         assert set(records) == expected, sorted(set(records) ^ expected)

@@ -20,7 +20,7 @@ Inside the tarball every member lives under the single directory
 `megu-<version>-<target>/`:
 
   <prefix>/<binary basename>                     each release binary (0755)
-  <prefix>/LICENSE, COPYING.LESSER, COPYING.AGPL, NOTICE,
+  <prefix>/LICENSE, COPYING.GPL, COPYING.LESSER, COPYING.AGPL, NOTICE,
       LICENSING.md, THIRD_PARTY.md, README.md    (0644)
   <prefix>/docs/mod-author-guide.md              (0644)
   <prefix>/tools/vanilla_data/gen_vanilla_data.sh
@@ -89,14 +89,15 @@ ROOT = Path(__file__).resolve().parent.parent
 FORMAT = 1
 PRODUCT = "megu"
 MC_TARGETS = ["1.21.1", "26.3"]
-LICENSE_ID = "GPL-3.0-or-later"
-SUBCRATE_LICENSE = "LGPL-3.0-or-later OR GPL-3.0-or-later OR AGPL-3.0-or-later"
+LICENSE_ID = "LGPL-3.0-or-later"
+SUBCRATE_LICENSE = "LGPL-3.0-or-later"
 
 MANIFEST_NAME = "release-manifest.json"
 SUMS_NAME = "SHA256SUMS"
 
 REQUIRED_DOCS = (
     "LICENSE",
+    "COPYING.GPL",
     "COPYING.LESSER",
     "COPYING.AGPL",
     "NOTICE",

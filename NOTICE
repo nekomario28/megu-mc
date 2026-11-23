@@ -1,10 +1,10 @@
 megu
 Copyright 2026 nekomario28 and Megu contributors
 
-COPYING.LESSER (GNU Lesser GPL v3.0 or later) and Cargo.toml (`license = "LGPL-3.0-or-later"`) specify
-`LGPL-3.0-or-later` as the distribution license of megu: all first-party code is provided under
-`LGPL-3.0-or-later`. LGPLv3 requires the GPLv3 license text as a companion, so LICENSE (GNU GPL v3.0)
-is included alongside COPYING.LESSER, and LGPLv3 section 2 permits downstream users to convey the
+LICENSE / COPYING.LESSER (GNU Lesser GPL v3.0 or later) and Cargo.toml (`license = "LGPL-3.0-or-later"`)
+specify `LGPL-3.0-or-later` as the distribution license of megu: all first-party code is provided under
+`LGPL-3.0-or-later`. LGPLv3 requires the GPLv3 license text as a companion, so COPYING.GPL (GNU GPL v3.0)
+is included alongside LICENSE and COPYING.LESSER, and LGPLv3 section 2 permits downstream users to convey the
 work under GPLv3. Independent third-party Mod JARs loaded at runtime via the Fabric/NeoForge
 compatibility layer remain under their own licenses. This file records attributions for third-party
 material that is committed in this repository, and lists the components that are fetched or supplied

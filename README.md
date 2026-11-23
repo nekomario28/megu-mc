@@ -1,7 +1,7 @@
 # Megu (`megu-mc`)
 
 > Clean-room Rust engine & native GPU client targeting **Minecraft: Java Edition 1.21.1** (Protocol 767; secondary target 26.3).
-> **Official Site**: [megu.megumin.tech](https://megu.megumin.tech/) · **License**: `LGPL-3.0-or-later` · **Status**: `v0.1.0-alpha.1`
+> **Official Site**: [megu.megumin.tech](https://megu.megumin.tech/) · **License**: `LGPL-3.0-or-later` · **Status**: `v0.1.0-alpha.1` · **Sponsor**: [GitHub Sponsors](https://github.com/sponsors/nekomario28)
 
 Minecraft: Java Edition 1.21.1（Protocol 767）互換を目指す、**100% クリーンルームの Rust 製サーバー＆ネイティブ GPU クライアント（純 Vulkan / DX12 / Metal・OpenGL 依存ゼロ）** です。
 バニラ挙動の忠実な再現を最優先にしつつ、低 RAM・低 CPU・高速起動・安全な Mod 互換（データ駆動＋有界 JVM 委譲境界）を両立することを目指しています。
@@ -173,8 +173,15 @@ MEGU_PORT=25699 cargo run --locked
 - 設計原則・セキュリティ: [DESIGN.md](DESIGN.md) / [SECURITY.md](SECURITY.md) / [SECURITY_NOTES.md](SECURITY_NOTES.md)
 - ライセンス・出所・商標: [LICENSING.md](LICENSING.md) / [THIRD_PARTY.md](THIRD_PARTY.md) / [NOTICE](NOTICE) / [TRADEMARK.md](TRADEMARK.md)
 
+## 開発支援・法人提携
+
+Megu のクライアント・サーバー機能はすべて **`LGPL-3.0-or-later`** の完全無料 OSS として提供します。
+
+- **個人・法人スポンサー**: [GitHub Sponsors](https://github.com/sponsors/nekomario28)（検証用ハードウェア・CI 維持・1.21.1 互換検証の継続に充てられます）
+- **ホスティング事業者・イベント・法人窓口**: `partners@megumin.tech`（詳細は [megu.megumin.tech/#support](https://megu.megumin.tech/#support) および [TRADEMARK.md](TRADEMARK.md) を参照）
+
 ## ライセンスとクリーンルーム方針
 
-本プロジェクトのコードは **`LGPL-3.0-or-later`**（[COPYING.LESSER](COPYING.LESSER)・LGPLv3 付随の [LICENSE](LICENSE)・[NOTICE](NOTICE)・[LICENSING.md](LICENSING.md)）で配布されます。Fabric / NeoForge 互換レイヤ経由で実行時に読み込まれる独立した外部 Mod JAR は派生物とみなさず、コピーレフトは波及しません。
+本プロジェクトのコードは **`LGPL-3.0-or-later`**（[LICENSE](LICENSE) / [COPYING.LESSER](COPYING.LESSER)・LGPLv3 付随の [COPYING.GPL](COPYING.GPL)・[NOTICE](NOTICE)・[LICENSING.md](LICENSING.md)）で配布されます。Fabric / NeoForge 互換レイヤ経由で実行時に読み込まれる独立した外部 Mod JAR は派生物とみなさず、コピーレフトは波及しません。
 
 すべての最適化サブシステムは標準的なコンピュータグラフィックス／システムアルゴリズムに基づく **100% クリーンルームのオリジナル Rust 実装** であり、Mojang の逆コンパイルコード・アセット・PolyForm Shield・All Rights Reserved のソースコードやシェーダーは一切コピー・同梱していません。寄稿は `LGPL-3.0-or-later` 提供と DCO（`git commit -s`）を前提とします。
