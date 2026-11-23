@@ -24,7 +24,7 @@
     },
     {
       "module": "state-store/src/audit_log.rs",
-      "reason": "Append-only audit log staged for operator tooling; not yet wired into the store",
+      "reason": "Append-only audit log consumed by the world_migrate bin (audit-excluded src/bin path) and staged for the live server block-mutation tap; no lib consumer yet",
       "date": "2026-11-23"
     },
     {
@@ -33,23 +33,8 @@
       "date": "2026-11-23"
     },
     {
-      "module": "server-files/src/claims_wire.rs",
-      "reason": "Claims codec staged for the land-claim surface; no live endpoint yet",
-      "date": "2026-11-23"
-    },
-    {
       "module": "server-files/src/installer.rs",
-      "reason": "Installer-side file layout staged for the launcher bundle; consumed by packaging, not by a crate path the audit sees",
-      "date": "2026-11-23"
-    },
-    {
-      "module": "server-files/src/mods_dir.rs",
-      "reason": "mods/ directory watcher staged for the mod loader; not yet wired into main",
-      "date": "2026-11-23"
-    },
-    {
-      "module": "server-files/src/pack_loader.rs",
-      "reason": "Datapack/resource loader staged alongside mods_dir; no live consumer yet",
+      "reason": "Installer lanes consumed by server-files/src/bin/megu_installer.rs — a src/bin path the audit excludes by design; no lib consumer exists or is needed",
       "date": "2026-11-23"
     },
     {

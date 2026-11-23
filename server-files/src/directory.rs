@@ -16,6 +16,8 @@ use crate::lists::{
     BanEntry, BannedIps, BannedPlayers, OpsList, Whitelist, BANNED_IPS_FILE, BANNED_PLAYERS_FILE,
     OPS_FILE, WHITELIST_FILE,
 };
+use crate::mods_dir::{scan_mods_folder, ModsFolderScan};
+use crate::pack_loader::{load_validated_pack_dir, LoadedPack, PackLoadError};
 use crate::properties::{ServerProperties, PROPERTIES_FILE};
 use crate::usercache::{UserCache, USERCACHE_FILE};
 use megu_core::version::TargetVersion;
@@ -202,6 +204,42 @@ impl ServerDirectory {
     /// properties instead of re-reading the file.
     pub fn ensure_standard_folders(&self) -> io::Result<StandardLayoutReport> {
         ensure_standard_folders_at(&self.root, &self.properties.level_name())
+    }
+
+    /// Scan `<root>/mods/` through the launcher-grade
+    /// [`crate::mods_dir::scan_mods_folder`]: every entry accounted for as
+    /// an active `.jar` or a typed [`crate::mods_dir::ModsDirSkipReason`].
+    /// `mc_version` enables the optional `<mc_version>/` subfolder
+    /// convention; pass `None` for a version-agnostic listing.
+    pub fn scan_mods(&self, mc_version: Option<&str>) -> io::Result<ModsFolderScan> {
+        scan_mods_folder(&self.root.join("mods"), mc_version)
+    }
+
+    /// `<level-name>/datapacks` for the loaded world — `world/datapacks`
+    /// under Vanilla's default `level-name`. Fails closed on a
+    /// `level-name` that would escape the server root, like
+    /// [`ensure_standard_folders`].
+    pub fn world_datapacks_dir(&self) -> io::Result<PathBuf> {
+        Ok(self
+            .root
+            .join(validated_level_path(&self.properties.level_name())?)
+            .join("datapacks"))
+    }
+
+    /// Load one datapack directory out of [`Self::world_datapacks_dir`]
+    /// through [`crate::pack_loader::load_validated_pack_dir`]. `name`
+    /// must be a single plain path component — anything else fails closed
+    /// before any filesystem access.
+    pub fn load_world_datapack(&self, name: &str) -> Result<LoadedPack, PackLoadError> {
+        let rel = Path::new(name);
+        if rel.components().count() != 1
+            || !matches!(rel.components().next(), Some(std::path::Component::Normal(_)))
+        {
+            return Err(PackLoadError::InvalidPack(format!(
+                "datapack name must be a single path component: {name:?}"
+            )));
+        }
+        load_validated_pack_dir(&self.world_datapacks_dir()?.join(name))
     }
 }
 

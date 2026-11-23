@@ -30,6 +30,7 @@
 //!   `InvalidData`, never a half-loaded world.
 
 use crate::atomic::write_atomic;
+use crate::claims_wire::{build_delta_batches, build_dimension_sync_batches, ClaimsWireBatch};
 use crate::json::{self, Json};
 use megu_core::id::ResourceLocation;
 use std::collections::{BTreeMap, BTreeSet};
@@ -619,6 +620,33 @@ impl ClaimsWorld {
     /// Drain the sync queue; the next delta still continues `revision`.
     pub fn drain_deltas(&mut self) -> Vec<ClaimsSyncDelta> {
         std::mem::take(&mut self.deltas)
+    }
+
+    /// The pending deltas folded into [`ClaimsWireBatch`]es by
+    /// [`crate::claims_wire::build_delta_batches`] — the per-dimension,
+    /// revision-ranged payloads the claims sync channels carry. Pure
+    /// grouping; encoding is the caller's step through
+    /// [`crate::claims_wire::encode_claims_batch`].
+    pub fn pending_wire_batches(&self) -> Vec<ClaimsWireBatch> {
+        build_delta_batches(self.pending_deltas())
+    }
+
+    /// Drain the sync queue and return it as wire batches in one step —
+    /// the play loop's per-tick claims-sync flush.
+    pub fn drain_wire_batches(&mut self) -> Vec<ClaimsWireBatch> {
+        build_delta_batches(&self.drain_deltas())
+    }
+
+    /// A full snapshot of one dimension's claims as wire batches, via
+    /// [`crate::claims_wire::build_dimension_sync_batches`] — what a client
+    /// that just subscribed (or lost the feed) needs first. `max_per_batch`
+    /// is clamped to the codec's cap; an invalid dimension yields none.
+    pub fn dimension_wire_batches(
+        &self,
+        dimension: &str,
+        max_per_batch: usize,
+    ) -> Vec<ClaimsWireBatch> {
+        build_dimension_sync_batches(self, dimension, max_per_batch)
     }
 
     // -------------------------------------------------------------- config
