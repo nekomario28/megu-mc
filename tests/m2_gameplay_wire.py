@@ -10,7 +10,7 @@ import tempfile
 import time
 
 from container_wire import stack, wire_stack
-from protocol767 import Client, ContractFailure, Reader, local_server, position, require, vint
+from protocol767 import Client, ContractFailure, Reader, local_server, position, require, string, vint
 
 os.environ["MEGU_ALLOW_PLAYER_ADMIN_COMMANDS"] = "1"
 os.environ.setdefault("MC_PROBE_DEADLINE", "30")
@@ -76,7 +76,8 @@ class M2Client(Client):
 
 
 def command(client, text):
-    client.chat("/" + text)
+    # Serverbound chat_command (0x04) — plain chat is relayed, not executed.
+    client.send(0x04, string(text.lstrip("/")))
     time.sleep(0.16)  # Keep below the chat spam throttle.
 
 

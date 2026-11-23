@@ -563,7 +563,10 @@ class Client:
         # Probes over slower worldgen can raise the bound; tests keep 10s.
         deadline = time.monotonic() + float(os.environ.get("MC_PROBE_DEADLINE", "10"))
         try:
-            for _ in range(2048):
+            # Vanilla entity tracking streams a relative-move packet per tick
+            # per visible entity, so a long wait can legitimately pass thousands
+            # of packets. The bound stays finite to catch a server that floods.
+            for _ in range(16384):
                 remaining = deadline - time.monotonic()
                 if remaining <= 0:
                     raise TimeoutError("response deadline")

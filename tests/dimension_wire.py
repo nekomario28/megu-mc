@@ -18,7 +18,7 @@ import sys
 import tempfile
 import time
 
-from protocol767 import Client, ContractFailure, local_server, parse_respawn, require
+from protocol767 import Client, ContractFailure, local_server, parse_respawn, require, string
 
 # The wire fixture drives the server as a player. This opt-in exists for local
 # compatibility testing, and the commands below are exactly the cross-dimension ones S4 adds.
@@ -26,8 +26,18 @@ os.environ["MEGU_ALLOW_PLAYER_ADMIN_COMMANDS"] = "1"
 os.environ.setdefault("MC_PROBE_DEADLINE", "30")
 
 
-def square(cx, cz):
-    return {(cx + x, cz + z) for x in range(-2, 3) for z in range(-2, 3)}
+def square(cx, cz, view=2):
+    # Vanilla 1.21.1 `ChunkTrackingView.Positioned`: the tracked window is a
+    # rounded square — a (2d+3)² bounding box with the four far corners cut,
+    # so d=2 delivers 45 chunks (rows 5,7,7,7,7,7,5), not a Chebyshev 25.
+    out = set()
+    for dx in range(-(view + 1), view + 2):
+        for dz in range(-(view + 1), view + 2):
+            ax, az = max(0, abs(dx) - 1), max(0, abs(dz) - 1)
+            lo, hi = min(ax, az), max(0, max(ax, az) - 1)
+            if lo * lo + hi * hi < view * view:
+                out.add((cx + dx, cz + dz))
+    return out
 
 
 def block_of(pos):
@@ -52,9 +62,8 @@ def await_respawn(client, dim_name, center):
 
 
 def command(client, text):
-    # protocol767's chat() sends a chat_message, and the server only treats it as a
-    # command when the text starts with '/'.
-    client.chat("/" + text.lstrip("/"))
+    # Serverbound chat_command (0x04): plain chat is relayed, not executed.
+    client.send(0x04, string(text.lstrip("/")))
     time.sleep(0.15)  # chat throttle drains 1 score / 50 ms; keep well under the kick line
 
 

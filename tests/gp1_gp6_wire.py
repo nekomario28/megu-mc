@@ -7,7 +7,7 @@ import struct
 import sys
 import time
 
-from protocol767 import Client, Reader, local_server, require, vint
+from protocol767 import Client, Reader, local_server, require, string, vint
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -76,7 +76,8 @@ class MobClient(Client):
         time.sleep(max(0.0, self.last_command + 1.0 - time.monotonic()))
         self.last_command = time.monotonic()
         before = len(self.messages)
-        self.chat("/" + command)
+        # Serverbound chat_command (0x04): plain chat is relayed, not executed.
+        self.send(0x04, string(command.lstrip("/")))
         if message:
             self.until(lambda *_: any(message in reply for reply in self.messages[before:]),
                        "command-" + command)

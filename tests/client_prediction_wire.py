@@ -19,7 +19,7 @@ import time
 
 from protocol767 import (AIR_STATES, Client, ContractFailure, Reader, ROOT,
                          WIRE_BLOCKS, decode_chunk, frame, local_server, parse_respawn,
-                         position, require, vint)
+                         position, require, string, vint)
 
 
 os.environ["MEGU_ALLOW_PLAYER_ADMIN_COMMANDS"] = "1"
@@ -124,8 +124,16 @@ class PredictionClient(Client):
 
 
 def chunk_window(center):
+    """Expected window for view=2: vanilla's rounded-square tracking region
+    (45 chunks — rows 5,7,7,7,7,7,5), matching ChunkWindow::contains."""
     cx, cz = math.floor(center[0] / 16), math.floor(center[2] / 16)
-    return {(cx + dx, cz + dz) for dx in range(-2, 3) for dz in range(-2, 3)}
+
+    def inside(dx, dz):
+        dx, dz = max(abs(dx) - 1, 0), max(abs(dz) - 1, 0)
+        return min(dx, dz) ** 2 + max(max(dx, dz) - 1, 0) ** 2 < 4
+
+    return {(cx + dx, cz + dz)
+            for dx in range(-4, 5) for dz in range(-4, 5) if inside(dx, dz)}
 
 
 def require_layout(client, layout):
@@ -138,7 +146,7 @@ def inspect_chunks(client, layout=OVERWORLD):
     _, _, _, count, skylight = layout
     if client.pos is None:
         client.until(lambda *_: client.pos is not None, "initial-position-sync")
-    client.until_chunks(chunk_window(client.pos), "complete-25-chunk-window")
+    client.until_chunks(chunk_window(client.pos), "complete-vanilla-chunk-window")
     # Independently re-decode raw 0x27 packets with protocol767's 1.21.1
     # PalettedContainer implementation (64-bit words, no cross-word entries).
     for coord, raw in client.raw_chunk.items():
@@ -228,7 +236,9 @@ class Predictor:
 
 
 def chat_command(client, command):
-    client.chat("/" + command)
+    # Serverbound chat_command (0x04): the command text without its slash.
+    # Plain chat (0x06) is relayed verbatim — vanilla does not execute it.
+    client.send(0x04, string(command))
     time.sleep(0.18)  # Avoid the server's chat spam throttle.
 
 
@@ -275,6 +285,9 @@ def await_authority(observer, entity_id, expected, grounded):
 
 
 def verify_prediction(actor, observer, actor_predictor, observer_predictor, east=0.0):
+    # MovementFloodGuard drops the 11th move packet a client sends within one
+    # server tick; the send/ack bounce below can otherwise outpace it.
+    time.sleep(0.055)
     predicted, grounded = actor_predictor.step(east)
     independent, independent_ground = observer_predictor.step(east)
     require(predicted == independent and grounded == independent_ground,
@@ -319,6 +332,8 @@ def decode_single_water_update(actor, cell):
     x, _, z = cell
     coord = (x // 16, z // 16)
     probe = copy.copy(actor)
+    probe.name = f"{actor.name}-probe"
+    probe.compression_threshold = -1
     probe.chunks = {coord: [list(section) for section in actor.chunks[coord]]}
     probe.updates = []
     require(probe.block(*cell) == STONE_STATE, "single-update-before-water")

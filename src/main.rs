@@ -9435,8 +9435,9 @@ fn apply_queued_block_updates() {
     // cell and `clicked + face` to the acting client at the end of every
     // use_on; they precede the dirty-cell batch like vanilla's tail sends.
     for c in client_snapshot() {
-        let resend = c.use_on_resend.lock().unwrap_or_else(|e| e.into_inner()).take();
-        if let Some((dim, rx, ry, rz, rface)) = resend {
+        if let Some((dim, rx, ry, rz, rface)) =
+            c.use_on_resend.lock().unwrap_or_else(|e| e.into_inner()).take()
+        {
             let (fx, fy, fz) = FACE_OFF[(rface.clamp(0, 5)) as usize];
             for (px, py, pz) in [(rx, ry, rz), (rx + fx, ry + fy, rz + fz)] {
                 let mut p = Vec::with_capacity(13);

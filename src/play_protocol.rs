@@ -1125,6 +1125,10 @@ struct TrackedWirePose {
     pose: EntityWirePose,
     interval: u64,
     last_sent_tick: Option<u64>,
+    /// Evaluations since the last absolute sync; vanilla teleports past 400.
+    delay: u16,
+    /// Evaluations while tracked; every 60th forces a position emit.
+    tick_count: u64,
 }
 
 #[derive(Clone, Copy, PartialEq)]
@@ -1156,28 +1160,6 @@ impl EntityWirePose {
         })
     }
 
-    fn relative_packet(self, eid: i32, next: Self) -> Option<(i64, Vec<u8>)> {
-        let delta = connection_limits::relative_move_delta(self.pos, next.pos)?;
-        let rotation = (next.yaw, next.pitch);
-        let rotated = (self.yaw, self.pitch) != rotation;
-        let grounded = next.on_ground?;
-        if delta == [0; 3] && rotated {
-            Some((
-                0x30,
-                connection_limits::entity_rotation(eid, next.yaw, next.pitch, grounded),
-            ))
-        } else {
-            Some((
-                if rotated { 0x2f } else { 0x2e },
-                connection_limits::entity_relative_move(
-                    eid,
-                    delta,
-                    rotated.then_some(rotation),
-                    grounded,
-                ),
-            ))
-        }
-    }
 }
 
 impl PlayWireState {
@@ -1202,6 +1184,8 @@ impl PlayWireState {
                 pose,
                 interval,
                 last_sent_tick: None,
+                delay: 0,
+                tick_count: 0,
             },
         );
     }
@@ -1228,10 +1212,73 @@ impl PlayWireState {
                 {
                     return false;
                 }
-                if let Some(packet) = previous.pose.relative_packet(eid, next) {
-                    (*id, *payload) = packet;
+                previous.delay = previous.delay.saturating_add(1);
+                previous.tick_count = previous.tick_count.saturating_add(1);
+                // Vanilla 1.21.1 ServerEntity#sendChanges: an absolute teleport
+                // heals an out-of-i16 delta, an on-ground flip, and more than
+                // 400 evaluations without one. A spawn-seeded baseline carries
+                // no on_ground, so it cannot "flip".
+                let ground_flipped = next
+                    .on_ground
+                    .is_some_and(|n| previous.pose.on_ground.is_some_and(|g| g != n));
+                let delta = connection_limits::relative_move_delta(previous.pose.pos, next.pos);
+                if previous.delay > 400 || ground_flipped || delta.is_none()
+                {
+                    previous.pose = next;
+                    previous.delay = 0;
+                    previous.last_sent_tick = Some(tick);
+                    return true;
                 }
-                previous.pose = next;
+                let delta = delta.unwrap();
+                // Position "changed" past the vanilla constant or on the
+                // 60th-evaluation forced resync (vanilla ServerEntity
+                // tickCount); rotation on a quantized byte change.
+                let len_sqr: f64 = (0..3).map(|i| {
+                    let d = next.pos[i] - previous.pose.pos[i];
+                    d * d
+                }).sum();
+                let pos_changed =
+                    len_sqr >= 7.629_394_531_25e-6 || previous.tick_count % 60 == 0;
+                let rot_changed =
+                    (previous.pose.yaw, previous.pose.pitch) != (next.yaw, next.pitch);
+                let grounded = next.on_ground.unwrap_or(false);
+                (*id, *payload) = match (pos_changed, rot_changed) {
+                    (true, true) => (
+                        0x2f,
+                        connection_limits::entity_relative_move(
+                            eid,
+                            delta,
+                            Some((next.yaw, next.pitch)),
+                            grounded,
+                        ),
+                    ),
+                    (true, false) => (
+                        0x2e,
+                        connection_limits::entity_relative_move(eid, delta, None, grounded),
+                    ),
+                    (false, true) => (
+                        0x30,
+                        connection_limits::entity_rotation(
+                            eid,
+                            next.yaw,
+                            next.pitch,
+                            grounded,
+                        ),
+                    ),
+                    // Unchanged: vanilla sends no movement packet this tick.
+                    (false, false) => return false,
+                };
+                // Only fields the packet actually carried advance the
+                // baseline; an unsent position stays outstanding against the
+                // last-sent value (vanilla VecDeltaCodec semantics).
+                if pos_changed {
+                    previous.pose.pos = next.pos;
+                }
+                if rot_changed {
+                    previous.pose.yaw = next.yaw;
+                    previous.pose.pitch = next.pitch;
+                }
+                previous.pose.on_ground = next.on_ground;
                 previous.last_sent_tick = Some(tick);
             }
             0x42 => {
@@ -1328,7 +1375,8 @@ fn send_packet(s: &mut TcpStream, mut id: i64, mut payload: Vec<u8>) -> std::io:
     let mut send = true;
     let (compression, queued) = SOCKET_WIRE.get().and_then(|states| {
         let mut states = states.lock().unwrap_or_else(|e| e.into_inner());
-        let state = states.get_mut(&socket_key(s))?;
+        let key = socket_key(s);
+        let state = states.get_mut(&key)?;
         if let Some(play) = &mut state.play {
             send = play.update_packet(&mut id, &mut payload, TICK_IDX.load(Ordering::Relaxed));
         }
@@ -1413,7 +1461,8 @@ fn write_frame(s: &mut TcpStream, body: &[u8], compression: Option<usize>) -> st
     // the same produce-order serialization, including direct frame writers.
     let queued = SOCKET_WIRE.get().and_then(|states| {
         let states = states.lock().unwrap_or_else(|e| e.into_inner());
-        let state = states.get(&socket_key(s))?;
+        let key = socket_key(s);
+        let state = states.get(&key)?;
         if state.tx_queue.is_some() {
             queue_play_frame(state, Arc::from(encoded_frame(body, compression)))
         } else {
@@ -1443,7 +1492,8 @@ fn write_frame(s: &mut TcpStream, body: &[u8], compression: Option<usize>) -> st
 fn write_raw_frame(s: &mut TcpStream, frame: &[u8]) -> std::io::Result<()> {
     let queued = SOCKET_WIRE.get().and_then(|states| {
         let states = states.lock().unwrap_or_else(|e| e.into_inner());
-        let state = states.get(&socket_key(s))?;
+        let key = socket_key(s);
+        let state = states.get(&key)?;
         queue_play_frame(state, Arc::from(frame))
     });
     if let Some(result) = queued {
@@ -1528,7 +1578,8 @@ fn send_broadcast_frame(
     let mut rewritten: Option<Vec<u8>> = None;
     let (compression, queued) = SOCKET_WIRE.get().and_then(|states| {
         let mut states = states.lock().unwrap_or_else(|e| e.into_inner());
-        let state = states.get_mut(&socket_key(s))?;
+        let key = socket_key(s);
+        let state = states.get_mut(&key)?;
         if let Some(play) = &mut state.play {
             let mut wire_id = id;
             let mut scratch = payload.to_vec();
@@ -15428,7 +15479,37 @@ mod connection_limits_wire_tests {
             Some((0x2e, vec![77, 0x10, 0, 0, 0, 0, 0, 0]))
         );
         assert_eq!(update(&mut play, 30, 2.0), None);
-        assert!(update(&mut play, 31, 2.0).is_some());
+        // Vanilla sends nothing for an unchanged pose even past the update
+        // interval — the old rewrite emitted a zero-delta Pos packet.
+        assert_eq!(update(&mut play, 31, 2.0), None);
+    }
+
+    #[test]
+    fn entity_movement_follows_vanilla_sendchanges_rules() {
+        let mut play = PlayWireState::default();
+        let eid = 78;
+        play.remember_spawn(&spawn_typed_pkt(eid, 4, 0.0, 70.0, 0.0));
+        let update = |play: &mut PlayWireState, tick, x, g| {
+            let mut id = 0x70;
+            let mut payload = entity_teleport(eid, x, 70.0, 0.0, 0.0, 0.0, g);
+            play.update_packet(&mut id, &mut payload, tick)
+                .then_some((id, payload))
+        };
+        // Sub-threshold motion alone sends nothing but stays outstanding.
+        assert_eq!(update(&mut play, 1, 0.001, false), None);
+        // Crossing the vanilla lenSqr threshold emits a Pos relative move.
+        assert_eq!(update(&mut play, 2, 0.01, false).unwrap().0, 0x2e);
+        // An on-ground flip is a teleport, not a relative packet.
+        assert_eq!(update(&mut play, 3, 0.01, true).unwrap().0, 0x70);
+        // The 60th tracked evaluation resyncs position even when unmoved.
+        play.poses.get_mut(&eid).unwrap().tick_count = 59;
+        assert_eq!(update(&mut play, 60, 0.01, true).unwrap().0, 0x2e);
+        // More than 400 evaluations without an absolute sync force one. The
+        // pose must differ to reach the delay check past the pacing gate.
+        play.poses.get_mut(&eid).unwrap().delay = 401;
+        assert_eq!(update(&mut play, 61, 0.02, true).unwrap().0, 0x70);
+        // A delta outside the i16 window teleports rather than wrapping.
+        assert_eq!(update(&mut play, 62, 9.0, true).unwrap().0, 0x70);
     }
 
     #[test]
