@@ -21,6 +21,10 @@ path = "src/bin/server_init.rs"
 name = "megu-init"
 path = "src/bin/megu_init.rs"
 
+[[bin]]
+name = "megu-installer"
+path = "src/bin/megu_installer.rs"
+
 # Standalone manifest: the root `[profile.release]` is not inherited, so the
 # shipped binary opts into full optimisation, LTO and symbol stripping itself.
 [profile.release]

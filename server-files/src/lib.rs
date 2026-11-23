@@ -48,6 +48,11 @@
 //!   Vanilla/Fabric/NeoForge dedicated-server and `.minecraft`/Prism/Modrinth
 //!   client `<gameDir>` trees idempotently and fail closed on traversal
 //!   `level-name`s and symlinks.
+//! * [`installer`] — the `megu-installer` lanes: Official Launcher
+//!   (`install_client`/`uninstall_client`), Prism Launcher
+//!   (`install_prism`) and dedicated-server (`install_server`) installs
+//!   plus pure cross-OS directory detection, an in-crate SHA-256 for
+//!   `--client-bin` pinning and clock-free ISO-8601 stamps.
 //! * [`mods_dir`] — [`mods_dir::scan_mods_folder`], the launcher-grade
 //!   `mods/` scanner: deterministic `.jar` discovery (plus the optional
 //!   `<mc_version>` subfolder) with a typed [`mods_dir::ModsDirSkipReason`]
@@ -64,6 +69,7 @@ pub mod claims;
 pub mod claims_wire;
 pub mod directory;
 pub mod eula;
+pub mod installer;
 pub mod json;
 pub mod lists;
 pub mod mods_dir;
@@ -93,6 +99,17 @@ pub use directory::{
     CLIENT_STANDARD_FOLDERS, SERVER_STANDARD_FOLDERS,
 };
 pub use eula::{check_eula, write_default_eula, EulaStatus, EULA_FILE, EULA_LINK};
+pub use installer::{
+    detect_minecraft_dir, detect_minecraft_dir_for_os, detect_prism_instances_dir,
+    detect_prism_instances_dir_for_os, home_dir, host_os_kind, install_client, install_prism,
+    install_server, iso_utc_now, normalize_sha256_hex, prism_instance_name, reject_traversal,
+    resolve_minecraft_dir, resolve_prism_instances_dir, sha256_file, sha256_hex,
+    uninstall_client, unix_seconds_to_iso8601, version_id, ClientInstallOptions, InstallReport,
+    OsKind, ReportEntry, ServerInstallOptions, Sha256, BOOTSTRAP_LIBRARY_COORD,
+    BOOTSTRAP_LIBRARY_REL, BOOTSTRAP_MAIN_CLASS, BOOTSTRAP_PATCH_FILE, BOOTSTRAP_PATCH_UID,
+    FLATPAK_MINECRAFT_DIR, FLATPAK_PRISM_INSTANCES_DIR, LAUNCHER_PROFILES_FILE,
+    LAUNCHER_PROFILES_STORE_FILE, MAX_BOOTSTRAP_JAR_BYTES, RUN_BAT, RUN_SH, SERVER_README,
+};
 pub use json::{Json, JsonError};
 pub use lists::{
     normalize_ban_ip, offline_uuid, valid_player_name, BanEntry, BannedIps, BannedPlayers,

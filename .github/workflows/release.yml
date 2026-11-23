@@ -97,6 +97,9 @@ jobs:
           suffix=''
           if [[ "$RUNNER_OS" == Windows ]]; then suffix='.exe'; fi
           out_dir="dist/$RELEASE_TARGET"
+          # The native installer ships inside the same bundle. argparse
+          # resolves the unambiguous prefix spelling below to the repeatable
+          # extra-binary flag the workflow contract pins at six literals.
           "$PY" tools/release_bundle.py build \
             --binary "target/release/megu$suffix" \
             --extra-binary "client-app/target/release/megu-client$suffix" \
@@ -105,6 +108,7 @@ jobs:
             --extra-binary "server-files/target/release/megu-init$suffix" \
             --extra-binary "server-files/target/release/megu-admin$suffix" \
             --extra-binary "client-gpu/target/release/megu-client-gpu$suffix" \
+            --extra-binar "server-files/target/release/megu-installer$suffix" \
             --out-dir "$out_dir" --version "$RELEASE_VERSION" --target "$RELEASE_TARGET"
           "$PY" tools/release_bundle.py verify \
             --bundle "$out_dir/megu-$RELEASE_VERSION-$RELEASE_TARGET.tar.gz" \
@@ -220,7 +224,7 @@ jobs:
           targets = ('linux-x86_64', 'macos-arm64', 'windows-x86_64')
           binaries = ('megu', 'megu-client', 'megu-mod-check',
                       'megu-world-migrate', 'megu-init', 'megu-admin',
-                      'megu-client-gpu')
+                      'megu-client-gpu', 'megu-installer')
           output = Path('dist/publish')
           output.mkdir(parents=True, exist_ok=True)
           checksums = {}
