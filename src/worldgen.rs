@@ -8868,7 +8868,7 @@ fn drain_generated_ticks(queue: &Mutex<PendingGeneratedTicks>) -> Vec<GeneratedT
 
 /// Drain the active world's leaf queue without waiting for the worldgen lock.
 pub fn take_generated_leaf_ticks() -> Vec<GeneratedTick> {
-    let queues = GEN_TICK_QUEUES.lock().unwrap().clone();
+    let queues = GEN_TICK_QUEUES.lock().unwrap_or_else(|e| e.into_inner()).clone();
     queues.map_or_else(Vec::new, |q| drain_generated_ticks(&q.leaves))
 }
 
@@ -9276,7 +9276,7 @@ fn install(dimension: DimId, seed: u64, res: fn(&str) -> Option<u32>, activate: 
         ACTIVE_DIM.store(dimension.index() as u8, std::sync::atomic::Ordering::Relaxed);
         // The runtime drains the *active* world's generated ticks through these handles, and
         // the tick thread must not queue behind generation to get them.
-        *GEN_TICK_QUEUES.lock().unwrap() = Some(ticks);
+        *GEN_TICK_QUEUES.lock().unwrap_or_else(|e| e.into_inner()) = Some(ticks);
         GEN_READY.store(true, std::sync::atomic::Ordering::Relaxed);
         GEN_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     }

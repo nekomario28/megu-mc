@@ -952,7 +952,8 @@ fn decode_packet(
 }
 
 /// The ceiling an *inflated* play frame may occupy, from `/megu policy set
-/// max_frame_mib <2..=32>`. The wire prefix still cannot describe more than
+/// max_frame_mib <2..=8>` — vanilla's CompressionDecoder absolute maximum.
+/// The wire prefix still cannot describe more than
 /// vanilla's three-byte VarInt bound — this governs the decompressed payload
 /// only, so raising it admits modded frames whose compressed bodies stay
 /// small. The default `2` lands exactly on `ingress_guard::MAX_PLAY_FRAME`.

@@ -280,6 +280,9 @@ fn v5_shared_quad_index_rotation_parity_and_staging_ring_zero_steady_allocs() {
     });
     let payload = vec![0x5Au8; 4096];
     for i in 0..20 {
+        // Each iteration's encoder is its own submission batch: the previous
+        // batch's copies submitted last pass, so the slots are reusable.
+        ring.begin_batch();
         let mut encoder = ctx
             .device
             .create_command_encoder(&wgpu::CommandEncoderDescriptor {

@@ -335,6 +335,31 @@ def audit(root):
     }
 
 
+def load_tolerated_unwired(path):
+    """Read the tolerated-unwired allowlist: documented exceptions every
+    strict run still fails on beyond, plus a stale-entry check so wired
+    modules cannot keep a dead exemption."""
+    doc = json.loads(Path(path).read_text())
+    entries = doc.get("entries")
+    if not isinstance(entries, list):
+        raise ValueError("tolerated-unwired file must contain an 'entries' list")
+    out = {}
+    for index, entry in enumerate(entries):
+        if not isinstance(entry, dict) or "module" not in entry or "reason" not in entry:
+            raise ValueError(f"tolerated-unwired entry #{index} needs module and reason")
+        out[entry["module"]] = entry["reason"]
+    return out
+
+
+def apply_tolerated_unwired(report, tolerated):
+    """Split the unwired modules into tolerated and new, and flag tolerated
+    entries whose module is wired again (stale exemptions must be dropped)."""
+    unwired = {m["module"] for m in report["modules"] if m["status"] == "unwired"}
+    report["unwired_new"] = sorted(unwired - tolerated.keys())
+    report["unwired_stale_tolerated"] = sorted(m for m in tolerated if m not in unwired)
+    return report
+
+
 def is_av_test_path(rel):
     parts = Path(rel).parts
     if "tests" in parts[:-1]:
@@ -585,6 +610,8 @@ def main():
                         help="AV feature list (default <root>/tools/wiring_audit_features.json)")
     parser.add_argument("--av-allowlist", type=Path, default=None,
                         help="AV allowlist (default <root>/tools/wiring_audit_allowlist.json)")
+    parser.add_argument("--tolerated-unwired", type=Path, default=None,
+                        help="JSON list of documented unwired modules --strict still tolerates")
     args = parser.parse_args()
     root = args.root.resolve()
     if not (root / "src").is_dir():
@@ -607,13 +634,26 @@ def main():
             return 1
         return 0
     report = audit(root)
+    if args.tolerated_unwired:
+        try:
+            tolerated = load_tolerated_unwired(args.tolerated_unwired)
+        except (OSError, ValueError) as exc:
+            parser.error(str(exc))
+        apply_tolerated_unwired(report, tolerated)
     if args.format == "json":
         print(json.dumps(report, indent=2))
     else:
         print_text(report)
+        for module in report.get("unwired_new", ()):
+            print(f"UNWIRED-NEW module {module}: not in the tolerated list")
+        for module in report.get("unwired_stale_tolerated", ()):
+            print(f"STALE-TOLERATED module {module}: wired now — drop the exemption")
     summary = report["summary"]
+    unwired_blocking = (report["unwired_new"] if args.tolerated_unwired
+                        else summary["modules_unwired"])
+    stale_blocking = report.get("unwired_stale_tolerated", []) if args.tolerated_unwired else []
     if not args.report_only and (
-        (args.strict and (summary["modules_unwired"] or summary["contracts_pending"]))
+        (args.strict and (unwired_blocking or stale_blocking or summary["contracts_pending"]))
         or (args.strict_contracts and summary["contracts_pending"])
     ):
         return 1

@@ -270,6 +270,15 @@ static MOBS: OnceLock<Mutex<Vec<Arc<Mob>>>> = OnceLock::new();
 fn mobs() -> &'static Mutex<Vec<Arc<Mob>>> {
     MOBS.get_or_init(|| Mutex::new(Vec::new()))
 }
+
+/// Reclaim the backing store of a per-tick accretion Vec after a sweep left
+/// it nearly empty: a one-time spike would otherwise pin its peak capacity
+/// for the process's life. O(1) check, occasional realloc.
+fn shrink_if_sparse<T>(v: &mut Vec<T>) {
+    if v.capacity() > 256 && v.len() * 4 < v.capacity() {
+        v.shrink_to(v.len().max(64));
+    }
+}
 static SHEARED: OnceLock<Mutex<std::collections::HashSet<i32>>> = OnceLock::new();
 fn sheared() -> &'static Mutex<std::collections::HashSet<i32>> {
     SHEARED.get_or_init(|| Mutex::new(std::collections::HashSet::new()))
@@ -1481,6 +1490,7 @@ fn environment_time_tick() {
         if let Some(t) = __t {
             tickprof::add("env/xp_destroy", t.elapsed());
         }
+        shrink_if_sparse(&mut xl);
     }
     // #minecraft:tick functions run once per game tick (TICK_MS = 50ms = 20/s, the
     // vanilla rate)
@@ -2598,6 +2608,7 @@ fn remove_live_mob(eid: i32) -> Option<(Arc<Mob>, Option<LiveMobState>)> {
     let index = mobs.iter().position(|mob| mob.eid == eid)?;
     let state = live_mob_states().lock().unwrap_or_else(|e| e.into_inner()).remove(&eid);
     let mob = mobs.remove(index);
+    shrink_if_sparse(&mut mobs);
     drop(mobs);
     if mob.etype == 21 {
         remove_command_minecart(eid);
@@ -9850,23 +9861,28 @@ fn set_block_if_inner_dim(
 }
 
 /// The Overworld event registration of `set_block_if_inner_dim`: every write
-/// keeps the hopper/water/lava sets and queues matching the stored state. No
-/// registration cap anywhere — a sleeping hopper costs nothing between
-/// probes, so registration must never starve it into never ticking again.
+/// keeps the hopper/water/lava sets and queues matching the stored state.
+/// The sets are capped at `DIM_SCHEDULED_CAP`: a sleeping hopper must never
+/// starve, but an edit flood must not grow the index into an OOM surface —
+/// past the bound the block still lands, it just is not tick-scheduled.
 fn register_overworld_scheduled(x: i32, y: i32, z: i32, st: u32, native_fluid_controlled: bool) {
     let mut hh = hoppers().lock().unwrap_or_else(|e| e.into_inner());
     if (9225..=9234).contains(&st) {
-        hh.insert((x, y, z));
-        hopper_queue().lock().unwrap_or_else(|e| e.into_inner()).schedule((x, y, z), 1);
+        if hh.len() < DIM_SCHEDULED_CAP || hh.contains(&(x, y, z)) {
+            hh.insert((x, y, z));
+            hopper_queue().lock().unwrap_or_else(|e| e.into_inner()).schedule((x, y, z), 1);
+        }
     } else {
         hh.remove(&(x, y, z));
     }
     drop(hh);
     let mut wtr = waters().lock().unwrap_or_else(|e| e.into_inner());
     if (80..=95).contains(&st) {
-        wtr.insert((x, y, z));
-        if !native_fluid_controlled {
-            water_queue().lock().unwrap_or_else(|e| e.into_inner()).schedule((x, y, z), 1);
+        if wtr.len() < DIM_SCHEDULED_CAP || wtr.contains(&(x, y, z)) {
+            wtr.insert((x, y, z));
+            if !native_fluid_controlled {
+                water_queue().lock().unwrap_or_else(|e| e.into_inner()).schedule((x, y, z), 1);
+            }
         }
     } else {
         wtr.remove(&(x, y, z));
@@ -9874,9 +9890,11 @@ fn register_overworld_scheduled(x: i32, y: i32, z: i32, st: u32, native_fluid_co
     drop(wtr);
     let mut lv = lavas().lock().unwrap_or_else(|e| e.into_inner());
     if (96..=111).contains(&st) {
-        lv.insert((x, y, z));
-        if !native_fluid_controlled {
-            lava_queue().lock().unwrap_or_else(|e| e.into_inner()).schedule((x, y, z), 1);
+        if lv.len() < DIM_SCHEDULED_CAP || lv.contains(&(x, y, z)) {
+            lv.insert((x, y, z));
+            if !native_fluid_controlled {
+                lava_queue().lock().unwrap_or_else(|e| e.into_inner()).schedule((x, y, z), 1);
+            }
         }
     } else {
         lv.remove(&(x, y, z));
@@ -10041,12 +10059,19 @@ fn dim_queue_due(queues: &Mutex<HashMap<DimId, tick_queue::TickQueue>>, dim: Dim
 /// Register or drop one non-Overworld write with the event-driven tick
 /// registries — the `set_block_if_dim_edit` twin of the Overworld
 /// registration inside `set_block_if_inner_dim`.
+/// Each registry is capped: every unique coordinate costs a HashSet entry
+/// forever, so an edit flood must not turn the index into an OOM surface.
+/// At the cap the block still lands — it just is not tick-scheduled.
+const DIM_SCHEDULED_CAP: usize = 1 << 18;
+
 fn register_dim_scheduled(dim: DimId, x: i32, y: i32, z: i32, st: u32) {
     {
         let mut hh = dim_hoppers().lock().unwrap_or_else(|e| e.into_inner());
         if (9225..=9234).contains(&st) {
-            hh.insert((dim, x, y, z));
-            dim_queue_schedule(dim_hopper_queues(), dim, (x, y, z), 1);
+            if hh.len() < DIM_SCHEDULED_CAP || hh.contains(&(dim, x, y, z)) {
+                hh.insert((dim, x, y, z));
+                dim_queue_schedule(dim_hopper_queues(), dim, (x, y, z), 1);
+            }
         } else {
             hh.remove(&(dim, x, y, z));
         }
@@ -10054,8 +10079,10 @@ fn register_dim_scheduled(dim: DimId, x: i32, y: i32, z: i32, st: u32) {
     {
         let mut wtr = dim_waters().lock().unwrap_or_else(|e| e.into_inner());
         if (80..=95).contains(&st) {
-            wtr.insert((dim, x, y, z));
-            dim_queue_schedule(dim_water_queues(), dim, (x, y, z), 1);
+            if wtr.len() < DIM_SCHEDULED_CAP || wtr.contains(&(dim, x, y, z)) {
+                wtr.insert((dim, x, y, z));
+                dim_queue_schedule(dim_water_queues(), dim, (x, y, z), 1);
+            }
         } else {
             wtr.remove(&(dim, x, y, z));
         }
@@ -10063,8 +10090,10 @@ fn register_dim_scheduled(dim: DimId, x: i32, y: i32, z: i32, st: u32) {
     {
         let mut lv = dim_lavas().lock().unwrap_or_else(|e| e.into_inner());
         if (96..=111).contains(&st) {
-            lv.insert((dim, x, y, z));
-            dim_queue_schedule(dim_lava_queues(), dim, (x, y, z), 1);
+            if lv.len() < DIM_SCHEDULED_CAP || lv.contains(&(dim, x, y, z)) {
+                lv.insert((dim, x, y, z));
+                dim_queue_schedule(dim_lava_queues(), dim, (x, y, z), 1);
+            }
         } else {
             lv.remove(&(dim, x, y, z));
         }
@@ -23253,8 +23282,8 @@ mod w3_live_wire_tests {
         live_server_policy()
             .lock()
             .unwrap_or_else(|e| e.into_inner())
-            .max_frame_mib = 16;
-        assert_eq!(live_play_frame_bound(), (16usize << 20) - 1);
+            .max_frame_mib = 8;
+        assert_eq!(live_play_frame_bound(), (8usize << 20) - 1);
         live_server_policy()
             .lock()
             .unwrap_or_else(|e| e.into_inner())

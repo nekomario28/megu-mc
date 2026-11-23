@@ -120,3 +120,4 @@ Thumbs.db
 /assets/**/*_1211*
 /tests/data/**/*_1211*
 /evidence/**/*unit.jsonl
+tools/palette_bench/target/

@@ -1,0 +1,71 @@
+{
+  "version": 1,
+  "comment": "Documented unwired modules tolerated by `wiring_audit.py --strict --tolerated-unwired`. A module landing a real consumer must drop its entry — the run fails on stale exemptions.",
+  "entries": [
+    {
+      "module": "proto/src/channel_router.rs",
+      "reason": "CustomPayload ChannelFirewall staged for the server play loop (protocol 767/777); consumed by tests until the live handler lands",
+      "date": "2026-11-23"
+    },
+    {
+      "module": "proto/src/resolver.rs",
+      "reason": "Session resolver staged for the friend-relay path; no live consumer yet",
+      "date": "2026-11-23"
+    },
+    {
+      "module": "proto/src/session.rs",
+      "reason": "Relay session state staged alongside resolver; no live consumer yet",
+      "date": "2026-11-23"
+    },
+    {
+      "module": "proto/src/voice_relay.rs",
+      "reason": "Voice relay protocol staged for the friend-relay binary; not yet driven",
+      "date": "2026-11-23"
+    },
+    {
+      "module": "state-store/src/audit_log.rs",
+      "reason": "Append-only audit log staged for operator tooling; not yet wired into the store",
+      "date": "2026-11-23"
+    },
+    {
+      "module": "state-store/src/world_interop.rs",
+      "reason": "Region/anvil interop staged for the sharded store cutover (H10); the store itself is not yet the world backend",
+      "date": "2026-11-23"
+    },
+    {
+      "module": "server-files/src/claims_wire.rs",
+      "reason": "Claims codec staged for the land-claim surface; no live endpoint yet",
+      "date": "2026-11-23"
+    },
+    {
+      "module": "server-files/src/installer.rs",
+      "reason": "Installer-side file layout staged for the launcher bundle; consumed by packaging, not by a crate path the audit sees",
+      "date": "2026-11-23"
+    },
+    {
+      "module": "server-files/src/mods_dir.rs",
+      "reason": "mods/ directory watcher staged for the mod loader; not yet wired into main",
+      "date": "2026-11-23"
+    },
+    {
+      "module": "server-files/src/pack_loader.rs",
+      "reason": "Datapack/resource loader staged alongside mods_dir; no live consumer yet",
+      "date": "2026-11-23"
+    },
+    {
+      "module": "mod-offload/src/ffi.rs",
+      "reason": "C ABI boundary consumed via include/megu_mod_offload.h by non-Rust callers — invisible to the Rust consumer graph by design",
+      "date": "2026-11-23"
+    },
+    {
+      "module": "client-port/src/world.rs",
+      "reason": "WorldState facade staged for the embedding-friendly client split; client-app uses its own world module today",
+      "date": "2026-11-23"
+    },
+    {
+      "module": "client-kernel/src/ffi.rs",
+      "reason": "C ABI boundary consumed via the public header by non-Rust callers — invisible to the Rust consumer graph by design",
+      "date": "2026-11-23"
+    }
+  ]
+}

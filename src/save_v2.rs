@@ -43,8 +43,8 @@ static POS_STORE: Registry<String, DimPosRot> = OnceLock::new();
 /// fields. Both the logout write and the periodic world save call this, so a test can prove
 /// the persisted dimension comes from `Client::dim` rather than a hard-coded Overworld.
 fn client_dim_pos(c: &Client) -> DimPosRot {
-    let dim = c.dim.lock().unwrap();
-    let p = *c.pos.lock().unwrap();
+    let dim = c.dim.lock().unwrap_or_else(|e| e.into_inner());
+    let p = *c.pos.lock().unwrap_or_else(|e| e.into_inner());
     (*dim, p.0, p.1, p.2, p.3, p.4)
 }
 fn pos_store() -> &'static LockedMap<String, DimPosRot> {
@@ -104,7 +104,7 @@ fn saved_players() -> &'static LockedMap<[u8; 16], PlayerSave> {
 }
 
 fn saved_value<T: Copy>(value: &Mutex<T>) -> T {
-    *value.lock().unwrap()
+    *value.lock().unwrap_or_else(|e| e.into_inner())
 }
 
 impl PlayerSave {
@@ -1399,7 +1399,7 @@ fn read_dim_overlay(
 }
 
 fn apply_dim_overlay(chunks: HashMap<DimChunkKey, HashMap<u32, u32>>) {
-    let mut world = world().lock().unwrap();
+    let mut world = world().lock().unwrap_or_else(|e| e.into_inner());
     for (key @ (dim, cx, cz), edits) in chunks {
         world.entry(key).or_default().extend(edits);
         // Only Overworld edits can invalidate the Overworld band/section caches.

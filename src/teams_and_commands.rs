@@ -4326,8 +4326,11 @@ impl LiveServerPolicy {
                 .to_owned();
             }
             "max_frame_mib" => {
+                // Vanilla's CompressionDecoder rejects past 8 MiB inflated —
+                // no compatible client can legitimately send more, so the
+                // knob may only widen the strict 2 MiB default up to that.
                 let mib = match value.parse::<u32>() {
-                    Ok(mib) if (2..=32).contains(&mib) => mib,
+                    Ok(mib) if (2..=8).contains(&mib) => mib,
                     _ => return Err(policy_invalid_value(key, value)),
                 };
                 self.max_frame_mib = mib;
@@ -9168,7 +9171,7 @@ mod policy_cmd_tests {
                 "/megu policy set player_radar_scope party_only",
                 "player_radar_scope = party_only",
             ),
-            ("/megu policy set max_frame_mib 16", "max_frame_mib = 16"),
+            ("/megu policy set max_frame_mib 8", "max_frame_mib = 8"),
             (
                 "/megu policy set allow_mob_radar false",
                 "allow_mob_radar = false",
@@ -9184,7 +9187,7 @@ mod policy_cmd_tests {
             ("cut_all", "sneak_only"),
             ("minimap_mode", "fair_play"),
             ("player_radar_scope", "party_only"),
-            ("max_frame_mib", "16"),
+            ("max_frame_mib", "8"),
             ("allow_mob_radar", "false"),
             ("xp_merge_mode", "aggressive"),
         ] {
@@ -9195,7 +9198,7 @@ mod policy_cmd_tests {
         }
         let list = policy_run(&ctx, "/megu policy list");
         assert!(list.contains("cut_all = sneak_only"), "{list}");
-        assert!(list.contains("max_frame_mib = 16"), "{list}");
+        assert!(list.contains("max_frame_mib = 8"), "{list}");
         assert_eq!(
             policy_run(&ctx, "/megu policy reset"),
             "All server policies reset to defaults"

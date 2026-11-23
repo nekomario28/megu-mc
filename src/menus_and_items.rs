@@ -2319,8 +2319,8 @@ fn drop_tick() {
     }
     __t = __prof.then(std::time::Instant::now);
     for (deid, c) in taken {
-        let selected = *c.held.lock().unwrap();
-        let creative = *c.gm.lock().unwrap() == 1;
+        let selected = *c.held.lock().unwrap_or_else(|e| e.into_inner());
+        let creative = *c.gm.lock().unwrap_or_else(|e| e.into_inner()) == 1;
         let spectator = c.is_spectator();
         let alive = *c.hp.lock().unwrap_or_else(|e| e.into_inner()) > 0.0;
         let player_aabb = c.touch_aabb();
@@ -2479,6 +2479,7 @@ fn drop_tick() {
         if let Some(t) = __t {
             tickprof::add("drops/merge_destroy", t.elapsed());
         }
+        shrink_if_sparse(&mut dp);
     }
 }
 

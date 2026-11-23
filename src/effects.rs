@@ -492,11 +492,6 @@ pub(super) fn tick_effects(c: &Client) {
     }
 }
 
-// The anti-xray unit shares this module: root `mod` declarations belong to
-// `main.rs` alone, so the lane's new file is included the same way the
-// main-adjacent units are.
-include!("antixray.rs");
-
 #[cfg(test)]
 mod tests {
     use super::*;

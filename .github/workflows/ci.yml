@@ -88,9 +88,9 @@ jobs:
             cargo clippy --manifest-path "$d/Cargo.toml" --all-targets --locked -- -D warnings
             cargo test --manifest-path "$d/Cargo.toml" --locked
           done
-          echo "=== client-gpu (clippy + check) ==="
+          echo "=== client-gpu (clippy + test) ==="
           cargo clippy --manifest-path client-gpu/Cargo.toml --all-targets --locked -- -D warnings
-          cargo check --manifest-path client-gpu/Cargo.toml --all-targets --locked
+          cargo test --manifest-path client-gpu/Cargo.toml --locked
       - name: Build (locked)
         run: |
           cargo build --locked --message-format=json-render-diagnostics > build-artifacts.json

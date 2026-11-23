@@ -114,8 +114,23 @@ python3 tests/modloader_parity_audit_test.py
 python3 tools/modloader_parity_audit.py --format text --strict --min-overall-pct 100
 python3 tests/vanilla_live_diff_test.py
 python3 tests/wiring_audit_test.py
+# The module-wiring audit is a real gate, not a report: strict fails on any
+# unwired module outside the documented tolerated list (and on a tolerated
+# entry whose module got wired — the exemption must be dropped).
+python3 tools/wiring_audit.py --strict --tolerated-unwired tools/wiring_audit_unwired.json
 python3 tests/live_parity_e2e_wire.py --self-test
 python3 tests/mod_suite_live_wire.py --self-test
+python3 tests/client_oracle_fuzz_wire.py --self-test
+python3 tests/multiplayer_stress_wire.py --self-test
+python3 tests/client_parity_gate_test.py
+python3 tests/docker_entrypoint_test.py
+python3 tests/installer_cross_os_test.py
+python3 tests/item_interaction_audit_test.py
+python3 tests/neoforge_s1s4_boundary_test.py
+python3 tests/public_hygiene_test.py
+python3 tests/score_1211_features_test.py
+python3 tests/v767_total_parity_audit_test.py
+python3 tests/wiring_audit_av_test.py
 python3 website/check_site.py
 python3 tests/verify_gate_coverage_test.py
 
@@ -214,6 +229,18 @@ timeout 180 python3 tests/client_inventory_pickup_wire.py --binary "$binary"
 timeout 180 python3 tests/client_kernel_wire.py "$binary"
 timeout 180 python3 tests/client_mesh_wire.py
 timeout 180 python3 tests/client_vanilla_parity.py
+# The NeoForge live-wire gate needs a mod-suite-free binary built with
+# --features neoforge-events plus the downloaded Java classpath, which the
+# public clean-room checkout does not ship. Where the pieces exist, gate.
+if [ -f compat/neoforge-events/.build/classpath.txt ] \
+    && [ -x /usr/lib/jvm/java-21-openjdk/bin/javac ]; then
+  cargo build --offline --locked -j 2 --features neoforge-events \
+      --message-format=json-render-diagnostics >"$build_manifest"
+  neoforge_binary=$(python3 tools/cargo_executable.py <"$build_manifest")
+  timeout 240 python3 tests/neoforge_live_server_wire.py "$neoforge_binary"
+else
+  echo "neoforge_live_server_wire: skipped (classpath.txt or javac absent)"
+fi
 
 echo "== adapter checks"
 cargo check --offline --locked -j 2 --features fabric-probe
