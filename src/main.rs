@@ -8513,7 +8513,8 @@ fn ticked_chunks() -> Vec<(i32, i32)> {
 }
 
 /// Sections a random tick may land in for this chunk: the ones it has edits in, plus the
-/// band around its surface, which is where placed blocks sit.
+/// band around its surface, which is where placed blocks sit. Uses published `SECTION_STORE`
+/// columns directly when available so the 20 TPS tick thread never stalls on `worldgen::chunk_cols`.
 fn ticked_sections(cx: i32, cz: i32) -> Vec<i32> {
     let mut out: Vec<i32> = Vec::new();
     if let Some(c) = world().lock().unwrap_or_else(|e| e.into_inner()).get(&(DimId::Overworld, cx, cz)) {
@@ -8521,9 +8522,25 @@ fn ticked_sections(cx: i32, cz: i32) -> Vec<i32> {
             out.push(((*idx >> 8) as i32 + MIN_Y) >> 4);
         }
     }
-    let surface = height_at(cx * 16 + 8, cz * 16 + 8);
-    out.push((surface - 16) >> 4);
-    out.push((surface + 4) >> 4);
+    let surface_sy = {
+        let store = section_store().lock().unwrap_or_else(|e| e.into_inner());
+        store.map.get(&(DimId::Overworld, cx, cz)).map(|col| {
+            col.iter()
+                .enumerate()
+                .rev()
+                .find(|(_, sec)| sec.as_ref().is_some_and(|s| s.non_air() > 0))
+                .map(|(i, _)| (MIN_Y >> 4) + i as i32)
+                .unwrap_or(0)
+        })
+    };
+    if let Some(sy) = surface_sy {
+        out.push(sy - 1);
+        out.push(sy);
+    } else {
+        let surface = height_at(cx * 16 + 8, cz * 16 + 8);
+        out.push((surface - 16) >> 4);
+        out.push((surface + 4) >> 4);
+    }
     out.sort_unstable();
     out.dedup();
     out
@@ -8542,7 +8559,28 @@ fn random_tick_pass() {
     let Some(reg) = crate::block_registry::breg() else {
         return;
     };
+    // Only random-tick chunks that are already materialized in `SECTION_STORE` or carry
+    // player/world edits in `WORLD` (when worldgen is enabled), matching Vanilla's invariant
+    // that random ticks never synchronously generate unloaded frontier chunks on the tick thread.
+    let wg_on = worldgen::enabled();
     for (cx, cz) in ticked_chunks() {
+        if wg_on {
+            let key = (DimId::Overworld, cx, cz);
+            let has_sections = section_store()
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .map
+                .contains_key(&key);
+            if !has_sections {
+                let has_edits = world()
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .contains_key(&key);
+                if !has_edits {
+                    continue;
+                }
+            }
+        }
         for sy in ticked_sections(cx, cz) {
             for _ in 0..speed {
                 let x = cx * 16 + world_rng::next_below(16) as i32;
@@ -8564,7 +8602,7 @@ fn on_random_tick(reg: &crate::block_registry::BReg, x: i32, y: i32, z: i32) {
 }
 
 fn on_random_tick_dim(reg: &crate::block_registry::BReg, dim: DimId, x: i32, y: i32, z: i32) {
-    let st = block_at_dim(dim, x, y, z);
+    let st = block_at_cached_dim(dim, x, y, z);
     // Two cheap rejections cover the overwhelming share of sampled cells — air is
     // most of the volume and stone is most of the rest — so a string lookup runs
     // only for cells that might actually tick.
@@ -8605,7 +8643,7 @@ fn on_random_tick_dim(reg: &crate::block_registry::BReg, dim: DimId, x: i32, y: 
 /// rules that want block light — ice melt, snow accumulation, fire spread —
 /// read the emissions of the written state instead.
 fn random_tick_block_light(reg: &crate::block_registry::BReg, dim: DimId, x: i32, y: i32, z: i32) -> u8 {
-    let mut light = reg.luminance_of(block_at_dim(dim, x, y, z));
+    let mut light = reg.luminance_of(block_at_cached_dim(dim, x, y, z));
     for (dx, dy, dz) in [
         (1, 0, 0),
         (-1, 0, 0),
@@ -8614,7 +8652,7 @@ fn random_tick_block_light(reg: &crate::block_registry::BReg, dim: DimId, x: i32
         (0, 0, 1),
         (0, 0, -1),
     ] {
-        let n = reg.luminance_of(block_at_dim(dim, x + dx, y + dy, z + dz));
+        let n = reg.luminance_of(block_at_cached_dim(dim, x + dx, y + dy, z + dz));
         light = light.max(n.saturating_sub(1));
     }
     light
