@@ -29,7 +29,8 @@ class FishingWireHelperTests(unittest.TestCase):
         body = (vint(321) + bytes(range(16)) + vint(129)
                 + struct.pack(">ddd", 1.25, 64.0, -2.5) + bytes(3)
                 + vint(0) + bytes(6))
-        self.assertEqual(fishing.spawned_entity(body), (321, 129))
+        self.assertEqual(fishing.spawned_entity(body),
+                         (321, 129, 1.25, 64.0, -2.5))
 
     def test_set_slot_item_decoder(self):
         body = bytes([0]) + vint(4) + struct.pack(">h", 37)
