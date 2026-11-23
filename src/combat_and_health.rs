@@ -886,7 +886,6 @@ fn damage_shield_attempts(me: &Arc<Client>, attempts: i64) {
 /// Which charge produced a wind burst — a thrown `WindCharge` item or the
 /// Breeze's own `BreezeWindCharge` projectile.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
-#[cfg_attr(not(test), allow(dead_code))]
 enum WindChargeKind {
     Player,
     Breeze,
@@ -895,7 +894,6 @@ enum WindChargeKind {
 /// The `Level.explode` arguments each charge supplies, plus the direct-hit
 /// damage its `onHitEntity` pays (the burst itself always deals 0).
 #[derive(Clone, Copy, Debug)]
-#[cfg_attr(not(test), allow(dead_code))]
 struct WindChargeProfile {
     /// Explosion power; the launch reach is `radius * 2` (vanilla `hurtEntities`
     /// scans `power * 2`).
@@ -903,11 +901,11 @@ struct WindChargeProfile {
     /// `AdvancedExplosionDamageCalculator.getKnockbackMultiplier`.
     knockback_multiplier: f64,
     /// `onHitEntity` damage.
-    #[cfg_attr(not(megu_vanilla_data), allow(dead_code))]
+        #[cfg_attr(not(megu_vanilla_data), allow(dead_code))]
+    #[cfg_attr(not(test), allow(dead_code))]
     direct_hit_damage: f32,
 }
 
-#[cfg_attr(not(test), allow(dead_code))]
 fn wind_charge_profile(kind: WindChargeKind) -> WindChargeProfile {
     match kind {
         // `coh` (`WindCharge`): explode power 1.2, `Optional.of(1.22f)` in the
@@ -933,7 +931,6 @@ fn wind_charge_profile(kind: WindChargeKind) -> WindChargeProfile {
 /// knockback resistance, applied along the normalized direction to the
 /// target's eye as an additive delta velocity. Vanilla skips entities at the
 /// exact burst center; non-finite inputs scrub to `None`.
-#[cfg_attr(not(test), allow(dead_code))]
 fn evaluate_wind_charge_burst(
     kind: WindChargeKind,
     impact: [f64; 3],
@@ -975,7 +972,6 @@ fn evaluate_wind_charge_burst(
 /// The wind-burst fall-distance reset: vanilla records the burst's Y so the
 /// mace combo only counts the drop below it ("accumulates fall damage only
 /// when falling below the Y level where the wind burst hit").
-#[cfg_attr(not(test), allow(dead_code))]
 fn wind_charge_reset_fall(c: &Client, burst_y: f64) {
     if burst_y.is_finite() {
         *c.fall_from.lock().unwrap_or_else(|e| e.into_inner()) = burst_y;
@@ -986,7 +982,6 @@ fn wind_charge_reset_fall(c: &Client, burst_y: f64) {
 /// fence gates flip `open`; levers flip `powered`; buttons press (the redstone
 /// pass schedules the vanilla release); bells ring. Blocks held by a redstone
 /// signal and the iron variants never move. Returns whether it triggered.
-#[cfg_attr(not(test), allow(dead_code))]
 fn wind_charge_trigger_at(dim: DimId, x: i32, y: i32, z: i32) -> bool {
     let Some(reg) = breg() else {
         return false;
@@ -1043,7 +1038,6 @@ fn wind_charge_trigger_at(dim: DimId, x: i32, y: i32, z: i32) -> bool {
 }
 
 /// The TRIGGER pass over the burst's block radius.
-#[cfg_attr(not(test), allow(dead_code))]
 fn wind_charge_trigger_blocks(dim: DimId, impact: [f64; 3], radius: f64) -> usize {
     if !impact.iter().all(|v| v.is_finite()) || !radius.is_finite() {
         return 0;
@@ -1072,7 +1066,6 @@ fn wind_charge_trigger_blocks(dim: DimId, impact: [f64; 3], radius: f64) -> usiz
 /// edge plays the stored note — the vanilla `NoteBlock.neighborChanged` the
 /// wind-burst toggle provokes. A played note also refreshes every allay in
 /// the vanilla hearing radius.
-#[cfg_attr(not(test), allow(dead_code))]
 fn wind_charge_note_neighbors(dim: DimId, x: i32, y: i32, z: i32) {
     let Some(reg) = breg() else {
         return;
@@ -1140,7 +1133,6 @@ fn wind_charge_note_neighbors(dim: DimId, x: i32, y: i32, z: i32) {
 /// Applies a wind-charge burst: launches entities (`hurtEntities`), resets the
 /// thrower's fall distance to the burst Y, fires the TRIGGER block pass and
 /// broadcasts the burst. `thrower_eid` is the charge's owner (-1 when none).
-#[cfg_attr(not(test), allow(dead_code))]
 fn wind_charge_burst(dim: DimId, kind: WindChargeKind, impact: [f64; 3], thrower_eid: i32) {
     let profile = wind_charge_profile(kind);
     for c in client_snapshot() {
@@ -1333,7 +1325,6 @@ fn firework_explode(x: f64, y: f64, z: f64, explosions: i64) {
 }
 
 /// Per-mob age for `wind_charge`/`breeze_wind_charge` projectile entities.
-#[cfg_attr(not(test), allow(dead_code))]
 fn wind_charge_ages() -> &'static Mutex<HashMap<i32, u16>> {
     static AGES: OnceLock<Mutex<HashMap<i32, u16>>> = OnceLock::new();
     AGES.get_or_init(|| Mutex::new(HashMap::new()))
@@ -1343,7 +1334,6 @@ fn wind_charge_ages() -> &'static Mutex<HashMap<i32, u16>> {
 /// `/summon` or a spawn egg live in the mob store: they are entities, not AI
 /// mobs, and the generic velocity pass already moves them. Burst each charge
 /// on the first solid-block contact or after its vanilla 200-tick lifetime.
-#[cfg_attr(not(test), allow(dead_code))]
 fn wind_charge_projectile_step() {
     let player_charge = name_to_etype("wind_charge");
     let breeze_charge = name_to_etype("breeze_wind_charge");
@@ -1400,8 +1390,8 @@ fn shield_raised_ticks(c: &Client) -> u64 {
 }
 
 /// The spin-attack window a Riptide launch armed for `eid`, in game ticks.
-#[cfg_attr(not(test), allow(dead_code))]
 #[cfg_attr(not(megu_vanilla_data), allow(dead_code))]
+#[cfg_attr(not(test), allow(dead_code))]
 fn spin_attack_ticks_left(eid: i32) -> u64 {
     let now = TICK_IDX.load(Ordering::Relaxed);
     riptide_spin()
@@ -1556,8 +1546,7 @@ fn apply_shield_disable(c: &Client) {
 enum TotemDamageKind {
     Ordinary,
     Void,
-    #[cfg_attr(not(test), allow(dead_code))]
-    #[cfg_attr(not(megu_vanilla_data), allow(dead_code))]
+        #[cfg_attr(not(megu_vanilla_data), allow(dead_code))]
     Kill,
 }
 

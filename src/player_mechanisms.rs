@@ -772,12 +772,13 @@ fn sweeping_attack(
     ];
     let dx = attacker_position[0] - target_center[0];
     let dz = attacker_position[2] - target_center[2];
+    let search_box = target_box.inflate(1.0, 0.25);
     let eligible = attack_strength >= 0.9
         && on_ground
         && !sprinting
         && !critical
         && dx * dx + dz * dz <= 9.0
-        && target_box.inflate(1.0, 0.25).intersects(candidate_box);
+        && sweeping_target_in_range(search_box, candidate_box);
     SweepAttack {
         eligible,
         damage: if eligible {
@@ -785,11 +786,10 @@ fn sweeping_attack(
         } else {
             0.0
         },
-        search_box: target_box.inflate(1.0, 0.25),
+        search_box,
     }
 }
 
-#[cfg_attr(not(test), allow(dead_code))]
 fn sweeping_target_in_range(search_box: PlayerAabb, candidate_box: PlayerAabb) -> bool {
     search_box.intersects(candidate_box)
 }
