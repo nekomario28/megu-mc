@@ -1,6 +1,6 @@
 {
   "version": 1,
-  "comment": "Documented unwired modules tolerated by `wiring_audit.py --strict --tolerated-unwired`. A module landing a real consumer must drop its entry — the run fails on stale exemptions.",
+  "comment": "Documented unwired modules tolerated by `wiring_audit.py --strict --tolerated-unwired`. A module landing a real consumer must drop its entry \u2014 the run fails on stale exemptions.",
   "entries": [
     {
       "module": "proto/src/channel_router.rs",
@@ -34,13 +34,18 @@
     },
     {
       "module": "server-files/src/installer.rs",
-      "reason": "Installer lanes consumed by server-files/src/bin/megu_installer.rs — a src/bin path the audit excludes by design; no lib consumer exists or is needed",
+      "reason": "Installer lanes consumed by server-files/src/bin/megu_installer.rs \u2014 a src/bin path the audit excludes by design; no lib consumer exists or is needed",
       "date": "2026-11-23"
     },
     {
       "module": "mod-offload/src/ffi.rs",
-      "reason": "C ABI boundary consumed via include/megu_mod_offload.h by non-Rust callers — invisible to the Rust consumer graph by design",
+      "reason": "C ABI boundary consumed via include/megu_mod_offload.h by non-Rust callers \u2014 invisible to the Rust consumer graph by design",
       "date": "2026-11-23"
+    },
+    {
+      "module": "mod-adapter-core/src/live_registry_bridge.rs",
+      "reason": "MRS1 mod-registry sync frame staged for the live registry-sync wire; no production consumer yet",
+      "date": "2026-11-24"
     },
     {
       "module": "client-port/src/world.rs",
@@ -49,8 +54,13 @@
     },
     {
       "module": "client-kernel/src/ffi.rs",
-      "reason": "C ABI boundary consumed via the public header by non-Rust callers — invisible to the Rust consumer graph by design",
+      "reason": "C ABI boundary consumed via the public header by non-Rust callers \u2014 invisible to the Rust consumer graph by design",
       "date": "2026-11-23"
+    },
+    {
+      "module": "client-app/src/server_list.rs",
+      "reason": "Multiplayer server-browser persistence staged for the client session UI; consumer wiring is in flight",
+      "date": "2026-11-24"
     }
   ]
 }

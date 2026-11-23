@@ -153,7 +153,7 @@ Windows `.exe` 名（`megu-client-gpu.exe` 等）も `--gameDir` /
 ### 2.2 GitHub Releases（一次配布）
 
 [.github/workflows/release.yml](../.github/workflows/release.yml) が
-既に 6 バイナリのクロスプラットフォームビルドとアーカイブ検証を持つ。
+既に 8 バイナリのクロスプラットフォームビルドとアーカイブ検証を持つ。
 公開時の成果物セット:
 
 | Platform | Artifact | 備考 |
@@ -170,8 +170,10 @@ Windows `.exe` 名（`megu-client-gpu.exe` 等）も `--gameDir` /
   `megu-<ver>.cdx.json` として添付する（サプライチェーン透明性、
   `deny.toml` の advisory 情報と整合）。
 - Companion binaries（`megu-client`, `megu-mod-check`,
-  `megu-world-migrate`, `megu-init`, `client-gpu`）は
+  `megu-world-migrate`, `megu-init`, `megu-admin`,
+  `megu-client-gpu`, `megu-installer`）は
   `--extra-binary` で同一 tarball に同梱する（H18 で対応済み）。
+  ※同梱 8 バイナリの削減ポリシーは zero-bloat 監査 #4 の未決事項。
 - コンテナイメージ `megu:<ver>` は GHCR (`ghcr.io/<owner>/megu`)
   へ push。Docker Hub は学生アカウントでも可だが GHCR が無料・連携が楽。
 
@@ -329,8 +331,11 @@ Donation is optional and does not affect features or roadmap.
 - [ ] `bash tests/verify.sh` — 全ゲート PASS
       （`--without-mutations` は mutation campaign のみ skip、
       他は全て実行される）
-- [ ] `python3 tools/wiring_audit.py --strict` — **17/17 wiring contracts
-      wired, 0 pending**（現状 16/17 wired・1 pending を解消してからタグ）
+- [ ] `python3 tools/wiring_audit.py --strict --tolerated-unwired
+      tools/wiring_audit_unwired.json` — **17/17 wiring contracts wired,
+      0 pending** は達成済み。残る条件は unwired モジュールが全て
+      tolerated list 内であること（staged モジュールの新規 unwired
+      または consumer 着地による stale exemption で fail しないこと）
 - [ ] `python3 tests/vanilla_live_diff_test.py` — live oracle **18/18 MATCH**
 - [ ] Clippy 全クレート 0 warnings（[release-checklist.md §1](release-checklist.md) の
       standalone loop、`-D warnings`）

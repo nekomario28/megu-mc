@@ -194,10 +194,12 @@ the final candidate SHA.
   the 1.21.1 data from their own server.jar with
   [tools/vanilla_data/gen_vanilla_data.sh](../tools/vanilla_data/gen_vanilla_data.sh);
   say so plainly - it is the clean-room story, not a defect.
-- Licence texts ship in the payload: `LICENSE`, `COPYING.LESSER`,
-  `COPYING.AGPL`, `NOTICE`, [LICENSING.md](../LICENSING.md) and
-  [THIRD_PARTY.md](../THIRD_PARTY.md). LICENSING.md §5 still applies to the
-  export.
+- Licence texts ship in the payload: `LICENSE`, `docs/COPYING.GPL` (the
+  LGPLv3-required GPLv3 companion), `NOTICE`, `README.md`,
+  [LICENSING.md](../LICENSING.md), [THIRD_PARTY.md](../THIRD_PARTY.md) and
+  [docs/mod-author-guide.md](mod-author-guide.md) — the `REQUIRED_DOCS` list in
+  [tools/release_bundle.py](../tools/release_bundle.py) is the authority.
+  LICENSING.md §5 still applies to the export.
 - Point operators at [SECURITY_NOTES.md](../SECURITY_NOTES.md) for the
   bind/allowlist posture; in the image the published port, not the bind
   address, decides exposure.
@@ -222,10 +224,10 @@ the final candidate SHA.
   shaders are bundled; live third-party server/modpack shader visual fidelity
   and end-to-end compatibility remain unverified.
 - The [release workflow](../.github/workflows/release.yml) builds and verifies
-  six release binaries across Linux, macOS and Windows, including archive
-  manifest/checksum verification. The `client-gpu` binary is separate from
-  that six-binary release matrix. A passing workflow definition does not
-  replace same-SHA release-candidate execution evidence.
+  eight release binaries (`megu` plus seven companion binaries, including
+  `megu-client-gpu` via `--extra-binary`) across Linux, macOS and Windows,
+  including archive manifest/checksum verification. A passing workflow
+  definition does not replace same-SHA release-candidate execution evidence.
 
 ## 8. Phase 2 / 3 / 4 Alpha ship gates
 

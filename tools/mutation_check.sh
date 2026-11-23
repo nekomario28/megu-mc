@@ -1169,22 +1169,26 @@ check "a footer that frames no body is refused by both of its consumers" \
   '    if false {' \
   tick_persistence::tests::a_footer_that_frames_no_body_is_refused_by_both_consumers
 
+# The config session now records the client's view distance at exactly one
+# site (`ConfigLink`), whichever side of the known-packs exchange the client
+# information packet arrives on. The two wire windows share the anchor; each
+# still proves its own gate against the same store.
 check "configuration information before known packs reaches chunk streaming" \
-  src/play_protocol.rs '                client_view = v;
-            }
-            Some((0x07, _))' \
-  '                let _ = v;
-            }
-            Some((0x07, _))' \
+  src/play_protocol.rs '            Some(v) => {
+                link.client_view = v;
+                ConfigPoll::Serviced' \
+  '            Some(v) => {
+                let _ = v;
+                ConfigPoll::Serviced' \
   tests/client_settings_wire.py 'client settings wire: FAIL config-early-window'
 
 check "configuration information after known packs reaches chunk streaming" \
-  src/play_protocol.rs '                client_view = v;
-            }
-            Some((0x03, _))' \
-  '                let _ = v;
-            }
-            Some((0x03, _))' \
+  src/play_protocol.rs '            Some(v) => {
+                link.client_view = v;
+                ConfigPoll::Serviced' \
+  '            Some(v) => {
+                let _ = v;
+                ConfigPoll::Serviced' \
   tests/client_settings_wire.py 'client settings wire: FAIL config-late-window'
 
 check "play information reaches the live chunk window" \
@@ -1200,8 +1204,10 @@ check "breaking changes server state, not only the predicted wire update" \
     note_block_update_dim(dim, x, y, z, 0);' \
   tests/gameplay_wire.py 'gameplay wire: FAIL fresh-reader-block'
 check "chat returns the actual sender and message" \
-  src/play_protocol.rs '            let system_payload = system_chat(&format!("<{}> {}", me.name, m));' \
-  '            let system_payload = system_chat(&format!("<{}> {}", me.name, ""));' \
+  src/play_protocol.rs '            let disguised_frame =
+                encode_disguised_chat_0x1e(&chat_nbt(m), live_chat_type_index(), &me.name);' \
+  '            let disguised_frame =
+                encode_disguised_chat_0x1e(&chat_nbt(""), live_chat_type_index(), &me.name);' \
   tests/gameplay_wire.py 'gameplay wire: FAIL chat-echo'
 
 check "light arrays agree with their section masks" \
