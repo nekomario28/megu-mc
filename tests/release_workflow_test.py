@@ -119,7 +119,11 @@ class ReleaseWorkflowTest(unittest.TestCase):
         self.assertIn("--manifest-path client-gpu/Cargo.toml --bin megu-client-gpu", job)
         self.assertIn("tools/release_bundle.py build", job)
         self.assertIn("tools/release_bundle.py verify", job)
-        self.assertEqual(job.count("--extra-binary"), 6)
+        self.assertEqual(job.count("--extra-binary"), 7)
+        self.assertIn(
+            '--extra-binary "server-files/target/release/megu-installer$suffix"',
+            job,
+        )
         for binary in BINARIES:
             self.assertIn(f"release/{binary}$suffix", job)
         self.assertIn("if-no-files-found: error", job)
