@@ -60,6 +60,17 @@ REQUIRED_CONFIG_KEYS = (
     "customDomain",
 )
 
+RELEASE_TARGETS = {
+    "linux-x86_64": "megu-installer-linux-x86_64",
+    "linux-arm64": "megu-installer-linux-arm64",
+    "linux-x86_64-musl": "megu-installer-linux-x86_64-musl",
+    "linux-arm64-musl": "megu-installer-linux-arm64-musl",
+    "macos-arm64": "megu-installer-macos-arm64",
+    "macos-x86_64": "megu-installer-macos-x86_64",
+    "windows-x86_64": "megu-installer-windows-x86_64.exe",
+    "windows-arm64": "megu-installer-windows-arm64.exe",
+}
+
 # Removed-asset names that must never reappear anywhere in website/. Built
 # piecewise so this scanner does not trip over its own source.
 FORBIDDEN_NAMES = (
@@ -251,15 +262,43 @@ def check_site_config_keys():
     else:
         client_panel = markup[client_start:client_end]
         base = "https://github.com/nekomario28/megu-mc/releases/latest/download/"
-        for filename in (
-            "megu-installer-windows-x86_64.exe",
-            "megu-installer-linux-x86_64",
-            "megu-installer-macos-arm64",
-            "megu-1.21.1.mrpack",
-            "megu-prism-1.21.1.zip",
-        ):
+        for filename in (*RELEASE_TARGETS.values(),
+                         "megu-1.21.1.mrpack",
+                         "megu-prism-1.21.1.zip"):
             if f'href="{base}{filename}"' not in client_panel:
                 findings.append(f"player downloads are missing direct link for {filename}")
+        for target, filename in RELEASE_TARGETS.items():
+            expected = (f'href="{base}{filename}" data-release-target="{target}"')
+            if expected not in client_panel:
+                findings.append(
+                    f"player download mapping for {target} must link to {filename}")
+        target_attrs = re.findall(r'data-release-target="([^"]+)"', client_panel)
+        if len(target_attrs) != len(RELEASE_TARGETS) or set(target_attrs) != set(RELEASE_TARGETS):
+            findings.append(
+                "player downloads must expose each of the 8 release targets exactly once")
+        for requirement in (
+            "Windows requires Windows 10/11",
+            "macOS requires macOS 11 or later",
+            "Alpine and other musl Linux",
+            "Debian, Ubuntu, Fedora, Arch, NixOS, Void",
+        ):
+            if requirement not in client_panel:
+                findings.append(f"player downloads are missing platform requirement: {requirement}")
+        workflow = (ROOT / ".github/workflows/release.yml")
+        if not workflow.is_file():
+            findings.append("release workflow is missing; cannot validate target names")
+        else:
+            release_workflow = workflow.read_text(encoding="utf-8")
+            if "megu-installer-{target}{suffix}" not in release_workflow:
+                findings.append(
+                    "release workflow no longer builds the standalone installer names")
+            if "megu-{os.environ[\"RELEASE_VERSION\"]}-{target}.tar.gz" not in release_workflow:
+                findings.append("release workflow archive naming contract changed")
+            workflow_targets = set(re.findall(r"^\s+target: (linux-[^\s]+|macos-[^\s]+|windows-[^\s]+)$",
+                                              release_workflow, re.M))
+            if workflow_targets != set(RELEASE_TARGETS):
+                findings.append(
+                    "website release target list does not match .github/workflows/release.yml")
         if "curl -fsSL https://raw.githubusercontent.com/nekomario28/megu-mc/main/tools/install_linux.sh | sh" not in client_panel:
             findings.append("player downloads are missing the Linux one-line installer")
     for required in (

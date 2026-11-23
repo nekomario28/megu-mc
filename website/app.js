@@ -2668,42 +2668,71 @@
 
   // -- Latest release pill + OS-aware download links -----------------------
 
-  var DOWNLOAD_OS_LABEL = { windows: "Windows", macos: "macOS", linux: "Linux" };
+  var DOWNLOAD_TARGET_LABEL = {
+    "windows-x86_64": "Windows x64",
+    "windows-arm64": "Windows ARM64",
+    "macos-arm64": "macOS Apple Silicon",
+    "macos-x86_64": "macOS Intel",
+    "linux-x86_64": "Linux x86_64 (glibc)",
+    "linux-arm64": "Linux ARM64 (glibc)",
+    "linux-x86_64-musl": "Linux x86_64 (musl)",
+    "linux-arm64-musl": "Linux ARM64 (musl)",
+  };
 
   // Client-side OS detection from the least-spoofable hints available —
   // purely local, no tracking, no cookies.
-  function detectOs() {
+  function detectTarget(hints) {
     var platform = "";
     try {
       platform = (root.navigator && root.navigator.userAgentData &&
         root.navigator.userAgentData.platform) || "";
     } catch (_) {}
+    var arch = String((hints && hints.architecture) ||
+      (root.navigator && root.navigator.platform) ||
+      (root.navigator && root.navigator.userAgent) || "").toLowerCase();
     var probe = String(platform ||
       (root.navigator &&
         (root.navigator.platform || root.navigator.userAgent)) ||
       "").toLowerCase();
+    var arm = /arm|aarch64/.test(arch);
     if (probe.indexOf("win") !== -1) {
-      return "windows";
+      return arm ? "windows-arm64" : "windows-x86_64";
     }
     if (probe.indexOf("mac") !== -1 || probe.indexOf("darwin") !== -1) {
-      return "macos";
+      return arm ? "macos-arm64" : "macos-x86_64";
     }
     if (probe.indexOf("linux") !== -1 || probe.indexOf("x11") !== -1) {
-      return "linux";
+      // Browser APIs cannot reliably identify glibc versus musl. Default to
+      // glibc and keep both musl builds visible as explicit choices.
+      return arm ? "linux-arm64" : "linux-x86_64";
     }
     return "";
   }
 
-  // Pick the best download asset for this visitor's OS. The cross-platform
+  // Pick the best download asset for this visitor's OS and architecture. The cross-platform
   // bootstrapper JAR and Prism/mrpack packs are the graceful fallback when
   // no native installer exists; URLs are re-validated against the GitHub
   // origin even though /api/latest already fails closed.
-  function pickReleaseAsset(assets, os) {
+  function pickReleaseAsset(assets, target) {
     if (!Array.isArray(assets)) {
       return null;
     }
-    var kinds = (os ? ["installer_" + os, "bundle_" + os] : [])
-      .concat(["installer_jar", "prism_zip", "mrpack"]);
+    var expectedName = target
+      ? "megu-installer-" + target + (target.indexOf("windows-") === 0 ? ".exe" : "")
+      : "";
+    if (expectedName) {
+      for (var e = 0; e < assets.length; e++) {
+        var exact = assets[e];
+        if (exact && exact.name === expectedName &&
+            typeof exact.url === "string" &&
+            exact.url.indexOf("https://github.com/") === 0) {
+          return exact;
+        }
+      }
+    }
+    // A coarse OS-only kind can be the wrong CPU architecture. If the exact
+    // target asset is absent, use only architecture-neutral fallbacks.
+    var kinds = ["installer_jar", "prism_zip", "mrpack"];
     for (var k = 0; k < kinds.length; k++) {
       for (var i = 0; i < assets.length; i++) {
         var a = assets[i];
@@ -2747,9 +2776,9 @@
     var btn = $("dl-client-btn");
     if (btn && st.asset) {
       btn.setAttribute("href", st.asset.url);
-      var label = DOWNLOAD_OS_LABEL[st.os] || "";
+      var label = DOWNLOAD_TARGET_LABEL[st.target] || "";
       btn.textContent = label
-        ? (ja ? label + " 版インストーラを入手" : "Download for " + label)
+        ? (ja ? label + " インストーラーを入手" : "Download for " + label)
         : (ja ? "インストーラを入手" : "Download Installer");
     }
     var mrpackBtn = $("dl-mrpack-btn");
@@ -2790,18 +2819,34 @@
         if (!version || version.length > 48) {
           return;
         }
-        var os = detectOs();
+        var target = detectTarget();
         latestRelease = {
           version: version,
           htmlUrl: typeof data.html_url === "string" &&
             data.html_url.indexOf("https://github.com/") === 0
             ? data.html_url : "",
-          os: os,
-          asset: pickReleaseAsset(data.assets, os),
+          target: target,
+          assets: data.assets,
+          asset: pickReleaseAsset(data.assets, target),
           totalDownloads: Number.isFinite(data.total_downloads) &&
             data.total_downloads > 0 ? Math.floor(data.total_downloads) : 0,
         };
         renderLatestRelease();
+        var uaData = root.navigator && root.navigator.userAgentData;
+        if (uaData && typeof uaData.getHighEntropyValues === "function") {
+          uaData.getHighEntropyValues(["architecture", "bitness"])
+            .then(function (hints) {
+              var refinedTarget = detectTarget(hints);
+              if (latestRelease && refinedTarget &&
+                  refinedTarget !== latestRelease.target) {
+                latestRelease.target = refinedTarget;
+                latestRelease.asset = pickReleaseAsset(
+                  latestRelease.assets, refinedTarget);
+                renderLatestRelease();
+              }
+            })
+            .catch(function () {});
+        }
       })
       .catch(function () {
         // Stay gracefully hidden when offline or before first release.

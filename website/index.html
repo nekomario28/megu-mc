@@ -149,7 +149,7 @@
                 </div>
                 <h3 data-i18n="dl_client_title">1. Official Launcher &amp; Standalone Client</h3>
                 <p data-i18n="dl_client_body">
-                  megu-installer needs no Java and supports GUI (double-click or megu-installer gui) and CLI modes. It registers Megu 1.21.1 in the Official Launcher and stages the native wgpu client.
+                  megu-installer needs no Java and supports GUI (double-click or megu-installer gui) and CLI modes. It registers Megu 1.21.1 in the Official Launcher and stages the native wgpu client. Windows requires Windows 10/11; macOS requires macOS 11 or later.
                 </p>
                 <div class="dl-meta-row">
                   <span class="dl-chip">1.21.1</span>
@@ -157,15 +157,26 @@
                   <span class="dl-chip" id="download-count" hidden></span>
                 </div>
                 <div class="dl-actions">
-                  <a class="btn primary" id="dl-client-btn" href="https://github.com/nekomario28/megu-mc/releases/latest/download/megu-installer-windows-x86_64.exe"
-                     target="_blank" rel="noopener noreferrer" data-i18n="dl_releases_btn">Windows x64 (.exe)</a>
-                  <a class="btn" href="https://github.com/nekomario28/megu-mc/releases/latest/download/megu-installer-linux-x86_64"
-                     target="_blank" rel="noopener noreferrer" data-i18n="dl_linux_installer_btn">Linux x86_64</a>
-                  <a class="btn" href="https://github.com/nekomario28/megu-mc/releases/latest/download/megu-installer-macos-arm64"
-                     target="_blank" rel="noopener noreferrer" data-i18n="dl_macos_installer_btn">macOS arm64</a>
+                  <a class="btn primary" id="dl-client-btn" href="https://github.com/nekomario28/megu-mc/releases"
+                     target="_blank" rel="noopener noreferrer" data-i18n="dl_releases_btn">Recommended installer</a>
                   <a class="btn" href="https://github.com/nekomario28/megu-mc/releases"
                      data-cfg-href="releasesUrl" target="_blank" rel="noopener noreferrer" data-i18n="dl_all_releases_btn">All OS Archives</a>
                 </div>
+                <h4 data-i18n="dl_targets_title">All 8 native installer targets</h4>
+                <table class="data-table" id="release-targets">
+                  <thead><tr><th data-i18n="dl_target_platform">Platform</th><th data-i18n="dl_target_notes">Notes</th><th data-i18n="dl_target_download">Download</th></tr></thead>
+                  <tbody>
+                    <tr><td>Linux x86_64 (glibc)</td><td data-i18n="dl_linux_glibc_note">Debian, Ubuntu, Fedora, Arch, NixOS, Void</td><td><a href="https://github.com/nekomario28/megu-mc/releases/latest/download/megu-installer-linux-x86_64" data-release-target="linux-x86_64" target="_blank" rel="noopener noreferrer">Download</a></td></tr>
+                    <tr><td>Linux ARM64 (glibc)</td><td data-i18n="dl_linux_arm_glibc_note">64-bit ARM Linux</td><td><a href="https://github.com/nekomario28/megu-mc/releases/latest/download/megu-installer-linux-arm64" data-release-target="linux-arm64" target="_blank" rel="noopener noreferrer">Download</a></td></tr>
+                    <tr><td>Linux x86_64 (musl)</td><td data-i18n="dl_linux_musl_note">Alpine and other musl Linux</td><td><a href="https://github.com/nekomario28/megu-mc/releases/latest/download/megu-installer-linux-x86_64-musl" data-release-target="linux-x86_64-musl" target="_blank" rel="noopener noreferrer">Download</a></td></tr>
+                    <tr><td>Linux ARM64 (musl)</td><td data-i18n="dl_linux_arm_musl_note">64-bit ARM musl Linux</td><td><a href="https://github.com/nekomario28/megu-mc/releases/latest/download/megu-installer-linux-arm64-musl" data-release-target="linux-arm64-musl" target="_blank" rel="noopener noreferrer">Download</a></td></tr>
+                    <tr><td>macOS Apple Silicon (arm64)</td><td data-i18n="dl_macos_note">macOS 11 or later</td><td><a href="https://github.com/nekomario28/megu-mc/releases/latest/download/megu-installer-macos-arm64" data-release-target="macos-arm64" target="_blank" rel="noopener noreferrer">Download</a></td></tr>
+                    <tr><td>macOS Intel (x86_64)</td><td data-i18n="dl_macos_note">macOS 11 or later</td><td><a href="https://github.com/nekomario28/megu-mc/releases/latest/download/megu-installer-macos-x86_64" data-release-target="macos-x86_64" target="_blank" rel="noopener noreferrer">Download</a></td></tr>
+                    <tr><td>Windows x64</td><td data-i18n="dl_windows_note">Windows 10/11 · Intel/AMD 64-bit</td><td><a href="https://github.com/nekomario28/megu-mc/releases/latest/download/megu-installer-windows-x86_64.exe" data-release-target="windows-x86_64" target="_blank" rel="noopener noreferrer">Download (.exe)</a></td></tr>
+                    <tr><td>Windows ARM64</td><td data-i18n="dl_windows_arm_note">Windows 11 · Snapdragon ARM64</td><td><a href="https://github.com/nekomario28/megu-mc/releases/latest/download/megu-installer-windows-arm64.exe" data-release-target="windows-arm64" target="_blank" rel="noopener noreferrer">Download (.exe)</a></td></tr>
+                  </tbody>
+                </table>
+                <p class="section-note" data-i18n="dl_targets_caveat">Linux architecture is detected locally; choose the musl build for Alpine/musl systems. Linux distribution names indicate likely libc families and are not a compatibility guarantee.</p>
                 <pre class="code"><button class="copy-btn" type="button">copy</button><code># Linux 1-line automatic install:
 curl -fsSL https://raw.githubusercontent.com/nekomario28/megu-mc/main/tools/install_linux.sh | sh</code></pre>
               </div>
@@ -738,11 +749,23 @@ megu-client --ping localhost:25565</code></pre>
       dl_tab_dev: "Mod 作者・MDK",
       dl_tab_dev_sub: "JAR 検査 · ネイティブ雛形",
       dl_client_title: "1. 公式ランチャー＆単体クライアント（1 クリック導入）",
-      dl_client_body: "megu-installer は Java 不要で、GUI（ダブルクリックまたは megu-installer gui）と CLI の両方に対応します。公式ランチャーへの Megu 1.21.1 プロファイル登録とネイティブ wgpu クライアント配置を自動で行います。",
-      dl_releases_btn: "Windows x64（.exe）",
+      dl_client_body: "megu-installer は Java 不要で、GUI（ダブルクリックまたは megu-installer gui）と CLI の両方に対応します。公式ランチャーへの Megu 1.21.1 プロファイル登録とネイティブ wgpu クライアント配置を自動で行います。Windows は Windows 10/11、macOS は macOS 11 以降が必要です。",
+      dl_releases_btn: "この端末向けの推奨版",
       dl_linux_installer_btn: "Linux x86_64",
       dl_macos_installer_btn: "macOS arm64",
       dl_all_releases_btn: "全 OS アーカイブ一覧",
+      dl_targets_title: "ネイティブインストーラー 8 種",
+      dl_target_platform: "プラットフォーム",
+      dl_target_notes: "補足",
+      dl_target_download: "ダウンロード",
+      dl_linux_glibc_note: "Debian、Ubuntu、Fedora、Arch、NixOS、Void",
+      dl_linux_arm_glibc_note: "64-bit ARM Linux",
+      dl_linux_musl_note: "Alpine など musl Linux",
+      dl_linux_arm_musl_note: "64-bit ARM musl Linux",
+      dl_macos_note: "macOS 11 以降",
+      dl_windows_note: "Windows 10/11 · Intel/AMD 64-bit",
+      dl_windows_arm_note: "Windows 11 · Snapdragon ARM64",
+      dl_targets_caveat: "Linux の CPU アーキテクチャは端末内で判定します。Alpine/musl では musl 版を選んでください。Linux ディストリビューション名は libc 系統の目安であり、互換性を保証するものではありません。",
       dl_mrpack_btn: "Modrinth App（.mrpack）",
       dl_prism_zip_btn: "Prism Launcher（.zip）",
       dl_check_pack_btn: "手元の Modpack を事前診断",
