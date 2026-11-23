@@ -23,9 +23,12 @@
 //!   tick deduplicate by position and skip raycasts for cells that are
 //!   already air.
 //! * [`MegaBlastPlan`] slices a huge [`BlastResult`] into per-tick
-//!   concentric rings bounded by `max_blocks_per_tick`, groups block
-//!   updates per 16x16x16 [`SectionBlocksUpdate`] packet and pre-coalesces
-//!   drops into <= [`MAX_STACK_SIZE`] item stacks via
+//!   concentric rings (ring `r` = block centers `r..r+1` from the origin,
+//!   innermost first, ascending coordinates inside a ring) bounded by
+//!   `max_blocks_per_tick` — [`MEGA_BLAST_MAX_PER_TICK`] names the 16k
+//!   block threshold above which a server should slice — groups block
+//!   updates per 16x16x16 [`SectionBlocksUpdate`] packet and
+//!   pre-coalesces drops into <= [`MAX_STACK_SIZE`] item stacks via
 //!   [`coalesce_item_counts`], conserving every dropped item.
 //!
 //! Safety: powers are scrubbed through [`scrub_power`] (`NaN`/infinite ->
@@ -67,6 +70,10 @@ pub const BLAST_REACH_FACTOR: f64 = 1.75;
 pub const BLAST_BOUNDS_MARGIN: i64 = 2;
 /// Hard cap on cached blast volume; exceeding it is an error, never an OOM.
 pub const MAX_CACHE_CELLS: usize = 6_000_000;
+/// Maximum block removals one tick of a [`MegaBlastPlan`] may apply. A
+/// blast affecting more cells than this must drain over multiple ticks so
+/// a single 50 ms tick never stalls; smaller blasts may be applied whole.
+pub const MEGA_BLAST_MAX_PER_TICK: usize = 16_384;
 /// Vanilla item stack ceiling used by [`coalesce_item_counts`].
 pub const MAX_STACK_SIZE: u32 = 64;
 /// Per-ray step cap; unreachable for finite powers (each step drains >=
@@ -410,6 +417,12 @@ pub struct BlastResult {
 }
 
 impl BlastResult {
+    /// Build a [`MegaBlastPlan`] draining this blast across ticks in
+    /// concentric rings of at most `max_blocks_per_tick` removals each.
+    pub fn plan(&self, max_blocks_per_tick: usize) -> MegaBlastPlan {
+        MegaBlastPlan::new(self, max_blocks_per_tick)
+    }
+
     /// Empty result for scrubbed-away inputs (non-finite origin, zero power).
     fn empty(origin: [f64; 3], power: f32) -> Self {
         Self {
@@ -627,6 +640,10 @@ pub struct SectionBlocksUpdate {
 pub struct BlockRemoval {
     /// World block position.
     pub pos: [i32; 3],
+    /// Concentric shell index: `floor` of the Euclidean distance from the
+    /// explosion origin to the block center. Rings drain innermost first,
+    /// so `ring` is non-decreasing across a whole plan.
+    pub ring: u32,
     /// Destroyed block id.
     pub block_id: u32,
     /// Ray intensity that destroyed it.
@@ -638,8 +655,16 @@ pub struct BlockRemoval {
 pub struct BlastTickSlice {
     /// Zero-based tick index this slice belongs to.
     pub tick_index: u64,
-    /// Removals applied this tick, in concentric-ring order.
+    /// Removals applied this tick, in concentric-ring order (ascending
+    /// `ring`, then ascending `pos` inside each ring).
     pub removals: Vec<BlockRemoval>,
+    /// Innermost ring this slice touches (`removals[0].ring`).
+    pub first_ring: u32,
+    /// Outermost ring this slice touches (`removals.last().ring`). A ring
+    /// larger than the tick budget splits across slices, so the next
+    /// slice's `first_ring` may equal this slice's `last_ring` but is
+    /// never smaller.
+    pub last_ring: u32,
     /// Block updates grouped per section for compact packets.
     pub section_updates: Vec<SectionBlocksUpdate>,
     /// Coalesced item drops spawned this tick.
@@ -653,21 +678,24 @@ pub struct BlastTickSlice {
 #[derive(Clone, Copy, Debug)]
 struct PlannedRemoval {
     pos: [i32; 3],
-    dist2: f64,
+    ring: u32,
     intensity: f32,
     cell: BlastCell,
 }
 
-/// Progressive executor for huge blasts: pre-sorts the destroyed set into
-/// concentric rings around the origin and releases at most
-/// `max_blocks_per_tick` removals per [`Self::next_slice`] call, so even a
-/// power-64 mega-TNT never freezes a tick.
+/// Progressive executor for huge blasts: buckets the destroyed set into
+/// discrete concentric rings around the origin — ring `r` holds every
+/// block whose center sits `r..r+1` blocks away — sorts each ring by
+/// block position, and releases at most `max_blocks_per_tick` removals
+/// per [`Self::next_slice`] call, so even a power-64 mega-TNT never
+/// freezes a tick.
 #[derive(Clone, Debug)]
 pub struct MegaBlastPlan {
     center: [f64; 3],
     removals: Vec<PlannedRemoval>,
     cursor: usize,
     budget: usize,
+    ring_count: usize,
     stack_size: u32,
 }
 
@@ -684,27 +712,52 @@ impl MegaBlastPlan {
                 let dx = f64::from(c.pos[0]) + 0.5 - center[0];
                 let dy = f64::from(c.pos[1]) + 0.5 - center[1];
                 let dz = f64::from(c.pos[2]) + 0.5 - center[2];
+                let dist2 = dx * dx + dy * dy + dz * dz;
                 PlannedRemoval {
                     pos: c.pos,
-                    dist2: dx * dx + dy * dy + dz * dz,
+                    // Shell index: floor of the Euclidean distance. `as`
+                    // saturates at `u32::MAX` for absurd coordinates, which
+                    // still lands the cell in the outermost ring.
+                    ring: dist2.sqrt() as u32,
                     intensity: c.intensity,
                     cell: c.cell,
                 }
             })
             .collect();
-        // Concentric rings: nearest first, deterministic position tiebreak.
-        removals.sort_by(|a, b| {
-            a.dist2
-                .total_cmp(&b.dist2)
-                .then_with(|| a.pos.cmp(&b.pos))
-        });
+        // Concentric rings innermost first, deterministic coordinate
+        // order inside each ring.
+        removals.sort_by_key(|r| (r.ring, r.pos));
+        // Distinct rings seen, counting only transitions (the vec is
+        // already ring-sorted).
+        let ring_count = removals
+            .windows(2)
+            .filter(|pair| pair[0].ring != pair[1].ring)
+            .count()
+            + usize::from(!removals.is_empty());
         Self {
             center,
             removals,
             cursor: 0,
             budget: max_blocks_per_tick.max(1),
+            ring_count,
             stack_size: MAX_STACK_SIZE,
         }
+    }
+
+    /// Whether `result` is large enough to require multi-tick draining:
+    /// strictly more affected cells than [`MEGA_BLAST_MAX_PER_TICK`].
+    pub fn needs_slicing(result: &BlastResult) -> bool {
+        result.cells.len() > MEGA_BLAST_MAX_PER_TICK
+    }
+
+    /// Number of distinct concentric rings the plan covers.
+    pub fn ring_count(&self) -> usize {
+        self.ring_count
+    }
+
+    /// Per-tick removal bound the plan was built with.
+    pub fn budget(&self) -> usize {
+        self.budget
     }
 
     /// Total removals planned.
@@ -742,6 +795,7 @@ impl MegaBlastPlan {
         for r in slice {
             removals.push(BlockRemoval {
                 pos: r.pos,
+                ring: r.ring,
                 block_id: r.cell.block_id,
                 intensity: r.intensity,
             });
@@ -775,6 +829,8 @@ impl MegaBlastPlan {
         self.cursor = end;
         Some(BlastTickSlice {
             tick_index,
+            first_ring: slice.first().map(|r| r.ring).unwrap_or(0),
+            last_ring: slice.last().map(|r| r.ring).unwrap_or(0),
             removals,
             section_updates,
             drops: coalesce_item_counts(drops, self.stack_size),

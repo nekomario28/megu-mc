@@ -28,8 +28,8 @@ pub use explosion_batch::{
     ExplosionBatch, ExplosionError, ItemStack, MegaBlastPlan, SectionBlockUpdate,
     SectionBlocksUpdate, AffectedCell, XorShift64,
     BLAST_BOUNDS_MARGIN, BLAST_REACH_FACTOR, BLOCK_COST_BASE, FLAG_INDESTRUCTIBLE,
-    MAX_BLAST_POWER, MAX_CACHE_CELLS, MAX_RAY_STEPS, MAX_STACK_SIZE, RAY_GRID, RAY_POWER_MIN,
-    RAY_POWER_RANGE, RAY_STEP, RAY_SURFACE_CELLS, STEP_DRAIN, TNT_POWER,
+    MAX_BLAST_POWER, MAX_CACHE_CELLS, MAX_RAY_STEPS, MAX_STACK_SIZE, MEGA_BLAST_MAX_PER_TICK,
+    RAY_GRID, RAY_POWER_MIN, RAY_POWER_RANGE, RAY_STEP, RAY_SURFACE_CELLS, STEP_DRAIN, TNT_POWER,
 };
 pub use sync_bridge::{
     BridgeError, BridgeFailure, BridgeSyncReport, ExternalGraphDelta, GraphDeltaSink,

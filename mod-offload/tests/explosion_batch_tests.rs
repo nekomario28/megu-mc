@@ -7,10 +7,10 @@ use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::time::Instant;
 
 use mod_offload::explosion_batch::{
-    blast_bounds, coalesce_item_counts, scrub_power, BlastCell, BlastResult, BlastWorld,
-    ExplosionBatch, ExplosionError, ItemStack, MegaBlastPlan, XorShift64, BLOCK_COST_BASE,
-    MAX_BLAST_POWER, MAX_RAY_STEPS, RAY_GRID, RAY_POWER_MIN, RAY_POWER_RANGE, RAY_STEP, STEP_DRAIN,
-    TNT_POWER,
+    blast_bounds, coalesce_item_counts, scrub_power, AffectedCell, BlastCell, BlastResult,
+    BlastStats, BlastWorld, ExplosionBatch, ExplosionError, ItemStack, MegaBlastPlan, XorShift64,
+    BLOCK_COST_BASE, MAX_BLAST_POWER, MAX_RAY_STEPS, MEGA_BLAST_MAX_PER_TICK, RAY_GRID,
+    RAY_POWER_MIN, RAY_POWER_RANGE, RAY_STEP, STEP_DRAIN, TNT_POWER,
 };
 
 type World = HashMap<(i32, i32, i32), BlastCell>;
@@ -202,7 +202,19 @@ fn drain_plans(
     let mut max_slice = 0usize;
     for result in results {
         let mut plan = MegaBlastPlan::new(result, budget);
+        let mut last_ring = 0u32;
+        let mut first = true;
         while let Some(slice) = plan.next_slice() {
+            assert_eq!(slice.first_ring, slice.removals[0].ring);
+            assert_eq!(slice.last_ring, slice.removals.last().unwrap().ring);
+            for removal in &slice.removals {
+                if first {
+                    first = false;
+                } else {
+                    assert!(removal.ring >= last_ring, "rings must be innermost first");
+                }
+                last_ring = removal.ring;
+            }
             removals += slice.removals.len();
             max_slice = max_slice.max(slice.removals.len());
             sections += slice.section_updates.len();
@@ -420,9 +432,19 @@ fn modded_mega_tnt_power_32_slices_smoothly_across_ticks() {
     let mut conserved = 0u64;
     let mut max_stack = 0u32;
     let mut section_updates = 0usize;
+    let mut last_ring = 0u32;
+    let mut first_removal = true;
     while let Some(slice) = plan.next_slice() {
         slices += 1;
         assert!(slice.removals.len() <= 4096, "tick budget exceeded");
+        for removal in &slice.removals {
+            if first_removal {
+                first_removal = false;
+            } else {
+                assert!(removal.ring >= last_ring, "rings must be innermost first");
+            }
+            last_ring = removal.ring;
+        }
         assert_eq!(slice.done, last_done + slice.removals.len());
         assert!(slice.done > last_done);
         last_done = slice.done;
@@ -507,4 +529,410 @@ fn coalesce_item_counts_conserves_and_chunks() {
     let one = coalesce_item_counts([(1u32, 5u32)], 0);
     assert_eq!(conserved_items(&one), 5);
     assert!(one.iter().all(|s| s.count == 1));
+}
+
+// ---------- M32: deterministic multi-tick ring-sliced MegaBlastPlan ----------
+
+/// Hand-built `BlastResult`: every position a destructible solid, engine
+/// untouched, so ring geometry can be asserted exactly.
+fn synthetic_result(origin: [f64; 3], positions: &[[i32; 3]]) -> BlastResult {
+    let mut cells: Vec<AffectedCell> = positions
+        .iter()
+        .map(|&pos| AffectedCell {
+            pos,
+            intensity: 1.0,
+            cell: STONE,
+        })
+        .collect();
+    cells.sort_by_key(|c| c.pos);
+    BlastResult {
+        origin,
+        power: TNT_POWER,
+        bounds: ([i64::MIN; 3], [i64::MAX; 3]),
+        cells,
+        stats: BlastStats::default(),
+    }
+}
+
+/// Ring index the plan assigns: floor of block-center distance to origin.
+fn expected_ring(origin: [f64; 3], pos: [i32; 3]) -> u32 {
+    let dx = f64::from(pos[0]) + 0.5 - origin[0];
+    let dy = f64::from(pos[1]) + 0.5 - origin[1];
+    let dz = f64::from(pos[2]) + 0.5 - origin[2];
+    (dx * dx + dy * dy + dz * dz).sqrt() as u32
+}
+
+/// Flat `(ring, pos)` drain sequence plus per-slice ring boundaries.
+struct DrainTrace {
+    seq: Vec<(u32, [i32; 3])>,
+    slice_bounds: Vec<(u32, u32)>,
+}
+
+/// Drain a plan into its full removal order and ring-span per slice.
+fn drain_positions(plan: &mut MegaBlastPlan) -> DrainTrace {
+    let mut trace = DrainTrace {
+        seq: Vec::new(),
+        slice_bounds: Vec::new(),
+    };
+    while let Some(slice) = plan.next_slice() {
+        trace.slice_bounds.push((slice.first_ring, slice.last_ring));
+        trace
+            .seq
+            .extend(slice.removals.iter().map(|r| (r.ring, r.pos)));
+    }
+    trace
+}
+
+#[test]
+fn mega_blast_plan_rings_innermost_first_with_coordinate_order() {
+    let origin = [0.5, 0.5, 0.5];
+    // Hand-picked cells spanning rings 0..=10, listed here in shuffled
+    // order to prove the plan sorts rather than trusting input order.
+    let positions = [
+        [-10, 0, 0],  // ring 10
+        [1, 1, 0],    // ring 1
+        [0, 0, 0],    // ring 0
+        [2, 2, 2],    // ring 2
+        [-1, 0, 0],   // ring 1
+        [3, 3, 0],    // ring 4
+        [1, 0, 0],    // ring 1
+        [1, 1, 1],    // ring 1
+        [2, 0, 0],    // ring 2
+        [0, 2, 0],    // ring 2
+        [0, 0, 2],    // ring 2
+        [5, -4, 2],   // ring 6
+        [-2, -2, -1], // ring 3
+        [0, -1, 0],   // ring 1
+        [4, 0, 0],    // ring 4
+        [0, 4, 0],    // ring 4
+        [3, 0, -1],   // ring 3
+        [-3, 0, 0],   // ring 3
+        [0, 0, -3],   // ring 3
+        [6, 6, 6],    // ring 9
+        [7, 0, 0],    // ring 7
+        [0, 0, 7],    // ring 7
+        [-1, -1, -1], // ring 2
+        [1, -1, 0],   // ring 1
+    ];
+    let result = synthetic_result(origin, &positions);
+    assert_eq!(result.cells.len(), positions.len());
+
+    // Budget 5 forces slices that split individual rings.
+    let mut plan = MegaBlastPlan::new(&result, 5);
+    assert_eq!(plan.budget(), 5);
+    assert_eq!(plan.total(), positions.len());
+    assert!(!MegaBlastPlan::needs_slicing(&result));
+
+    let expected_rings: BTreeSet<u32> = positions
+        .iter()
+        .map(|&p| expected_ring(origin, p))
+        .collect();
+    assert_eq!(plan.ring_count(), expected_rings.len());
+
+    let trace = drain_positions(&mut plan);
+    let seq = trace.seq;
+    assert_eq!(seq.len(), positions.len());
+    assert!(plan.is_complete());
+
+    // Innermost rings first: the ring sequence is non-decreasing, starts
+    // at ring 0, ends at the outermost ring, and every removal carries
+    // the ring its distance implies.
+    assert_eq!(seq[0].0, 0, "first removal must be the innermost ring");
+    assert_eq!(seq[0].1, [0, 0, 0]);
+    assert_eq!(
+        seq.last().unwrap().0,
+        *expected_rings.iter().next_back().unwrap()
+    );
+    for (i, &(ring, pos)) in seq.iter().enumerate() {
+        assert_eq!(ring, expected_ring(origin, pos), "ring label at index {i}");
+        if i > 0 {
+            assert!(ring >= seq[i - 1].0, "ring regression at index {i}");
+        }
+    }
+    // Deterministic coordinate order inside each ring: positions are
+    // strictly increasing within every same-ring run.
+    for run in seq.chunk_by(|a, b| a.0 == b.0) {
+        for pair in run.windows(2) {
+            assert!(pair[0].1 < pair[1].1, "coordinate order inside a ring");
+        }
+    }
+    // Slices never revisit a completed ring.
+    for pair in trace.slice_bounds.windows(2) {
+        assert!(pair[1].0 >= pair[0].1, "slice ring bounds regressed");
+    }
+    // The drained set is exactly the destroyed set.
+    let drained: BTreeSet<[i32; 3]> = seq.iter().map(|&(_, p)| p).collect();
+    let planned: BTreeSet<[i32; 3]> = positions.iter().copied().collect();
+    assert_eq!(drained, planned);
+}
+
+#[test]
+fn mega_blast_plan_oversized_ring_splits_across_ticks_deterministically() {
+    // A full shell of blocks at distance [10, 11) in the y=0 plane:
+    // one ring larger than the per-tick budget.
+    let origin = [0.5, 0.5, 0.5];
+    let positions: Vec<[i32; 3]> = (-12..=12)
+        .flat_map(|x| (-12..=12).map(move |z| [x, 0, z]))
+        .filter(|&p| expected_ring(origin, p) == 10)
+        .collect();
+    assert!(positions.len() > 8, "shell must hold several blocks");
+    let result = synthetic_result(origin, &positions);
+
+    let mut plan = MegaBlastPlan::new(&result, 8);
+    assert_eq!(plan.ring_count(), 1);
+    let mut slices = Vec::new();
+    while let Some(slice) = plan.next_slice() {
+        assert_eq!(slice.first_ring, 10);
+        assert_eq!(slice.last_ring, 10);
+        assert!(slice.removals.len() <= 8);
+        slices.push(slice);
+    }
+    assert_eq!(slices.len(), positions.len().div_ceil(8));
+    // The concatenated run stays in strict coordinate order even where a
+    // slice boundary cut the ring in two.
+    let seq: Vec<[i32; 3]> = slices
+        .iter()
+        .flat_map(|s| s.removals.iter().map(|r| r.pos))
+        .collect();
+    for pair in seq.windows(2) {
+        assert!(pair[0] < pair[1]);
+    }
+    let drained: BTreeSet<[i32; 3]> = seq.iter().copied().collect();
+    assert_eq!(drained, positions.iter().copied().collect());
+    // tick_index counts slices from zero.
+    for (i, slice) in slices.iter().enumerate() {
+        assert_eq!(slice.tick_index, i as u64);
+    }
+
+    // Determinism: a plan built from a differently-ordered result emits
+    // the identical sequence.
+    let mut reversed = positions.clone();
+    reversed.reverse();
+    let rerun = synthetic_result(origin, &reversed);
+    let mut plan2 = MegaBlastPlan::new(&rerun, 8);
+    let seq2 = drain_positions(&mut plan2).seq;
+    let seq1: Vec<(u32, [i32; 3])> = seq.iter().map(|&p| (10, p)).collect();
+    assert_eq!(seq1, seq2, "ring drain order must be deterministic");
+}
+
+#[test]
+fn mega_blast_plan_budget_edges_and_empty_plan() {
+    // Empty result: complete immediately, no slice ever emitted.
+    let empty = synthetic_result([0.5, 0.5, 0.5], &[]);
+    let mut plan = MegaBlastPlan::new(&empty, 16);
+    assert!(plan.is_complete());
+    assert_eq!(plan.total(), 0);
+    assert_eq!(plan.ring_count(), 0);
+    assert_eq!(plan.progress(), (0, 0));
+    assert!(plan.next_slice().is_none());
+    assert!(!MegaBlastPlan::needs_slicing(&empty));
+
+    let cells = synthetic_result(
+        [0.5, 0.5, 0.5],
+        &[
+            [0, 0, 0],
+            [1, 0, 0],
+            [2, 0, 0],
+            [3, 0, 0],
+            [4, 0, 0],
+            [5, 0, 0],
+        ],
+    );
+
+    // Budget 0 clamps to one removal per tick.
+    let mut plan = MegaBlastPlan::new(&cells, 0);
+    assert_eq!(plan.budget(), 1);
+    let mut count = 0usize;
+    while let Some(slice) = plan.next_slice() {
+        assert_eq!(slice.removals.len(), 1);
+        count += 1;
+    }
+    assert_eq!(count, 6);
+
+    // Budget >= total emits exactly one slice; done == total.
+    let mut plan = cells.plan(64);
+    let slice = plan.next_slice().expect("one slice");
+    assert_eq!(slice.removals.len(), 6);
+    assert_eq!(slice.done, 6);
+    assert_eq!(slice.total, 6);
+    assert_eq!(slice.tick_index, 0);
+    assert!(plan.next_slice().is_none());
+
+    // Exact budget multiple drains in whole slices.
+    let mut plan = cells.plan(3);
+    let slices = plan.drain();
+    assert_eq!(slices.len(), 2);
+    assert!(slices.iter().all(|s| s.removals.len() == 3));
+    assert_eq!(slices[1].done, 6);
+}
+
+#[test]
+fn mega_blast_plan_needs_slicing_threshold_boundary() {
+    let origin = [0.5, 0.5, 0.5];
+    let positions: Vec<[i32; 3]> = (0..MEGA_BLAST_MAX_PER_TICK + 1)
+        .map(|i| [i as i32, 0, 0])
+        .collect();
+    let at_limit = synthetic_result(origin, &positions[..MEGA_BLAST_MAX_PER_TICK]);
+    let over_limit = synthetic_result(origin, &positions);
+    assert!(!MegaBlastPlan::needs_slicing(&at_limit));
+    assert!(MegaBlastPlan::needs_slicing(&over_limit));
+    assert_eq!(MEGA_BLAST_MAX_PER_TICK, 16_384);
+}
+
+#[test]
+fn mega_blast_plan_section_updates_pack_signed_block_coords() {
+    // Cells spanning section boundaries on both sides of zero — signed
+    // division must route them to the right section and local slot.
+    let positions = [
+        [-17, -5, 33],
+        [-16, 0, 0],
+        [-1, -1, -1],
+        [0, 0, 0],
+        [15, 15, 15],
+        [16, 0, 0],
+        [31, -9, -40],
+    ];
+    let result = synthetic_result([0.5, 0.5, 0.5], &positions);
+    let mut plan = MegaBlastPlan::new(&result, 64);
+    let slice = plan.next_slice().expect("one slice");
+
+    // One packed update per removal; every update clears to air.
+    let total_updates: usize = slice.section_updates.iter().map(|s| s.updates.len()).sum();
+    assert_eq!(total_updates, positions.len());
+    // Sections sorted by coordinate; updates sorted by packed position.
+    let sections: Vec<[i32; 3]> = slice.section_updates.iter().map(|s| s.section).collect();
+    let mut sorted_sections = sections.clone();
+    sorted_sections.sort();
+    assert_eq!(sections, sorted_sections);
+    for section_update in &slice.section_updates {
+        let packed: Vec<u16> = section_update
+            .updates
+            .iter()
+            .map(|u| u.packed_pos)
+            .collect();
+        let mut sorted = packed.clone();
+        sorted.sort();
+        assert_eq!(packed, sorted);
+        for update in &section_update.updates {
+            assert_eq!(update.block_id, 0, "removal writes air");
+        }
+    }
+    // Every removal round-trips through its section update: section =
+    // div_euclid(16), packed local = x | z<<4 | y<<8 of rem_euclid(16).
+    let mut seen: BTreeSet<[i32; 3]> = BTreeSet::new();
+    for section_update in &slice.section_updates {
+        for update in &section_update.updates {
+            let p = update.packed_pos;
+            let (lx, lz, ly) = (
+                i32::from(p & 15),
+                i32::from((p >> 4) & 15),
+                i32::from(p >> 8),
+            );
+            let pos = [
+                section_update.section[0] * 16 + lx,
+                section_update.section[1] * 16 + ly,
+                section_update.section[2] * 16 + lz,
+            ];
+            seen.insert(pos);
+        }
+    }
+    let expected: BTreeSet<[i32; 3]> = positions.iter().copied().collect();
+    assert_eq!(seen, expected);
+    // Spot-check one negative-section packing: [-17,-5,33] -> section
+    // [-2,-1,2], local (15,11,1) -> packed 15 | 1<<4 | 11<<8.
+    let entry = slice
+        .section_updates
+        .iter()
+        .find(|s| s.section == [-2, -1, 2])
+        .expect("negative section present");
+    assert!(entry
+        .updates
+        .iter()
+        .any(|u| u.packed_pos == (15 | (1 << 4) | (11 << 8))));
+}
+
+#[test]
+fn mega_blast_plan_over_16k_blocks_drains_bounded_multi_tick_slices() {
+    // A solid dirt world served by a closure `BlastBlockSource` — no
+    // giant map needed for a >16k-cell crater.
+    let dirt_cube = |x: i32, y: i32, z: i32| -> BlastCell {
+        if (-72..=72).contains(&x) && (8..=136).contains(&y) && (-72..=72).contains(&z) {
+            DIRT
+        } else {
+            AIR
+        }
+    };
+    let origin = [0.5, 72.0, 0.5];
+    let mut batch = ExplosionBatch::new();
+    let result = batch
+        .blast(&dirt_cube, origin, 40.0, 0x4D32_0001)
+        .expect("power-40 blast fits the cache");
+
+    // The M32 trigger: strictly more than 16,384 affected blocks.
+    assert!(
+        result.cells.len() > MEGA_BLAST_MAX_PER_TICK,
+        "test blast must exceed the >16k threshold, got {}",
+        result.cells.len()
+    );
+    assert!(MegaBlastPlan::needs_slicing(&result));
+
+    let mut plan = MegaBlastPlan::new(&result, MEGA_BLAST_MAX_PER_TICK);
+    assert_eq!(plan.budget(), MEGA_BLAST_MAX_PER_TICK);
+    let mut slices = 0usize;
+    let mut last_done = 0usize;
+    let mut last_ring = 0u32;
+    let mut conserved = 0u64;
+    let mut seen: BTreeSet<[i32; 3]> = BTreeSet::new();
+    while let Some(slice) = plan.next_slice() {
+        slices += 1;
+        // Bounded block budget per tick slice.
+        assert!(
+            slice.removals.len() <= MEGA_BLAST_MAX_PER_TICK,
+            "tick slice exceeded the >16k budget"
+        );
+        assert_eq!(slice.done, last_done + slice.removals.len());
+        last_done = slice.done;
+        // Innermost rings first, deterministic coordinate order inside.
+        for removal in &slice.removals {
+            assert!(
+                removal.ring >= last_ring,
+                "ring regression: {} < {}",
+                removal.ring,
+                last_ring
+            );
+            last_ring = removal.ring;
+            seen.insert(removal.pos);
+        }
+        for stack in &slice.drops {
+            assert!(stack.count <= 64);
+            conserved += u64::from(stack.count);
+        }
+    }
+    assert!(plan.is_complete());
+    assert!(slices >= 2, "a >16k blast must span multiple ticks");
+    assert_eq!(last_done, plan.total());
+    assert_eq!(
+        slices,
+        plan.total().div_ceil(MEGA_BLAST_MAX_PER_TICK),
+        "one tick slice per budget chunk"
+    );
+    // First slice starts at the innermost ring (the origin cell itself
+    // is destroyed by every ray leaving it).
+    let mut replay = result.plan(MEGA_BLAST_MAX_PER_TICK);
+    assert_eq!(replay.next_slice().unwrap().first_ring, 0);
+    // Full coverage: every destroyed cell was scheduled exactly once.
+    let expected: BTreeSet<[i32; 3]> = result.cells.iter().map(|c| c.pos).collect();
+    assert_eq!(seen, expected);
+    // Every dropped item is conserved through per-tick coalescing.
+    let expected_total: u64 = expected_drops(std::slice::from_ref(&result)).values().sum();
+    assert_eq!(conserved, expected_total);
+    assert!(conserved > u64::from(MEGA_BLAST_MAX_PER_TICK as u32));
+
+    // Below the threshold the same API reports a single-tick blast — a
+    // real sub-16k crater, not an empty result.
+    let small = batch
+        .blast(&dirt_cube, [0.5, 100.0, 0.5], TNT_POWER, 0x4D32_0002)
+        .expect("small blast");
+    assert!(!small.cells.is_empty());
+    assert!(!MegaBlastPlan::needs_slicing(&small));
 }
