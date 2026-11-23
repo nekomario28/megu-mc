@@ -562,7 +562,7 @@ pub fn split_compiled_bundle(
 /// Namespaced block name of a block-state id — the kernel registry when
 /// loaded, else the `BlockTable`'s per-state names (empty in builtin
 /// fallback mode, so no names resolve there).
-fn state_block_name<'a>(world: &'a WorldState, state: u32) -> Option<&'a str> {
+fn state_block_name(world: &WorldState, state: u32) -> Option<&str> {
     if let Some(registry) = &world.registry {
         registry.state_name(state).ok()
     } else {

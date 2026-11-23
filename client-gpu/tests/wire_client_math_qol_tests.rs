@@ -393,6 +393,30 @@ fn write_stone_light_pack() -> std::path::PathBuf {
         ]"#,
     )
     .expect("write blocks.json");
+    // Write a matching 2-state `block_state_facts.bin` (6 bytes per state) so
+    // `Registry::from_version_dir` never falls back to a host-installed
+    // 26k-state `assets/block_state_facts_1211.bin` when present locally.
+    const FACT_IS_AIR: u8 = 1;
+    const FACT_BLOCKS_MOTION: u8 = 1 << 2;
+    const FACT_CAN_OCCLUDE: u8 = 1 << 3;
+    const FACT_SOLID_RENDER: u8 = 1 << 4;
+    const FACT_FLUID_EMPTY: u8 = 1 << 7;
+    let facts: [u8; 12] = [
+        FACT_IS_AIR | FACT_FLUID_EMPTY,
+        0,
+        0,
+        0,
+        0,
+        0,
+        FACT_SOLID_RENDER | FACT_CAN_OCCLUDE | FACT_BLOCKS_MOTION,
+        15,
+        0x3f,
+        0,
+        0,
+        0,
+    ];
+    std::fs::write(dir.join("block_state_facts.bin"), facts)
+        .expect("write block_state_facts.bin");
     dir
 }
 
