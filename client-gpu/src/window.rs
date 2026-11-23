@@ -2110,6 +2110,7 @@ impl GpuApp {
         }
         let (w, h) = (active.size.width.max(1), active.size.height.max(1));
 
+        let mut goggles_draw: Option<UiDrawList> = None;
         if let Some(live) = &mut self.live {
             active.renderer.set_player_position(self.camera.position);
             if live.terrain_full_sync {
@@ -2138,6 +2139,7 @@ impl GpuApp {
             // `HudState` clone entirely (`live.hud_sync_skips` counts hits).
             live.sync_hud_to(&mut self.ui.hud);
             live.record_frame_and_refresh_minihud(dt, &mut self.ui);
+            live.set_ui_locale(self.ui.settings.locale.code());
             let feed = live.hud_feed();
             Self::apply_live_hud(
                 &mut self.ui,
@@ -2146,6 +2148,26 @@ impl GpuApp {
                 dt,
                 &feed,
             );
+            // Engineer's-Goggles card: when the crosshair rests on a
+            // kinetic-synced Create block, build the live telemetry
+            // panel (RPM, Stress SU, overstressed warning, processing
+            // bar) for compositing into this frame's HUD overlay.
+            goggles_draw = if self.ui.screen == Screen::InGameHud {
+                live.looking_at_block
+                    .as_ref()
+                    .map(|(pos, _)| *pos)
+                    .and_then(|pos| live.goggles_telemetry_at((pos[0], pos[1], pos[2])))
+                    .map(|telemetry| {
+                        megu_ui::create_goggles_hud::GogglesHudLayout::build(
+                            &telemetry,
+                            w,
+                            h,
+                            self.ui.settings.locale.code(),
+                        )
+                    })
+            } else {
+                None
+            };
             if live.asset_bundle_pending_upload {
                 // Dropping the CPU pixel payloads is part of the upload:
                 // after this call VRAM owns the sole copy of the atlas and
@@ -2288,6 +2310,12 @@ impl GpuApp {
                     .commands
                     .extend(build_magic_hud_draw_list(&live.magic, w, h).commands);
             }
+        }
+        // Live goggles telemetry composites beside the crosshair on the
+        // in-game HUD only (hidden behind menus/containers by the
+        // `Screen::InGameHud` gate where `goggles_draw` was produced).
+        if let Some(goggles) = goggles_draw {
+            draw_list.commands.extend(goggles.commands);
         }
         // Server-driven container screen draws above the HUD.
         if let Some(screen) = &self.container_screen {

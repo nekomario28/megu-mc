@@ -14,6 +14,9 @@ use megu_client::kinetic_sync::{
     decode_kinetic_sync_batch, KineticSyncRecord, CHANNEL_CREATE_KINETIC_SYNC,
     CHANNEL_CREATE_KINETIC_UPDATE,
 };
+use megu_client::mod_assets_meta::{
+    decode_mrs1_frame, ClientModRegistry, ModMetaReport, ModTranslationTable,
+};
 use megu_client::online_auth::OnlineAuthOptions;
 use megu_client::protocol::{
     decode_item_stack_components, handle_transfer_packet, offline_uuid, parse_uuid,
@@ -24,7 +27,7 @@ use megu_client::protocol::{
 };
 use megu_client::render::ClientVfxHost;
 use megu_client::render_graph::GpuPipelineKind;
-use megu_client::session::{AudioStats, WorldAcousticSnapshot};
+use megu_client::session::{AudioStats, WorldAcousticSnapshot, CHANNEL_MOD_REGISTRY_SYNC};
 use megu_client::spatial_audio::{SpatialAudioPreset, SpatialSubtitleCue, SubtitleDirection};
 use megu_client::world::{BlockTable, WorldState};
 use megu_client_mesh::asset_pipeline::{CompiledAssetBundle, ResourcePackLayer};
@@ -80,7 +83,7 @@ use crate::atmosphere::{
     CLOUD_RENDER_ALPHA,
 };
 use crate::subworld_render::{
-    quat_from_axis_angle, InstancedPartBatch, InstancedPartRecord, SubWorldRenderBank,
+    box_mesh, quat_from_axis_angle, InstancedPartBatch, InstancedPartRecord, SubWorldRenderBank,
     SubWorldRenderEntry, SubWorldTransform, TerrainVertex,
 };
 use crate::SecretString;
@@ -434,38 +437,271 @@ impl KineticPartSpec {
     }
 }
 
-/// Small untextured fallback rotor so wire-driven instances have renderable
-/// geometry even when no mod model template has been registered yet.
-fn kinetic_fallback_template() -> (Vec<TerrainVertex>, Vec<u32>) {
-    let mut vertices = Vec::with_capacity(16);
-    let mut indices = Vec::with_capacity(24);
-    for step in 0..4 {
-        let angle = step as f32 * std::f32::consts::FRAC_PI_2;
-        let direction = [angle.cos(), angle.sin()];
-        let perpendicular = [-direction[1], direction[0]];
-        let center = [0.5, 0.5];
-        let corners = [
-            (0.06, -0.035),
-            (0.06, 0.035),
-            (0.43, 0.035),
-            (0.43, -0.035),
-        ];
-        let base = vertices.len() as u32;
-        for (radius, side) in corners {
-            vertices.push(TerrainVertex {
-                position: [
-                    center[0] + direction[0] * radius + perpendicular[0] * side,
-                    0.62,
-                    center[1] + direction[1] * radius + perpendicular[1] * side,
-                ],
-                normal: [0.0, 1.0, 0.0],
-                albedo: [0.72, 0.48, 0.18],
-                uv: [0.0, 0.0],
-                atlas_index: u32::MAX,
-            });
+/// Create kinetic block families that get their own procedural 3D
+/// template instead of the generic rotor.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum KineticMeshFamily {
+    /// `create:shaft` — narrow 4×16×4 axle rod.
+    Shaft,
+    /// `create:cogwheel` — axle plus toothed gear rim and spokes.
+    Cogwheel,
+    /// `create:large_cogwheel` — wider 24-unit toothed ring and spokes.
+    LargeCogwheel,
+    /// `create:water_wheel` — hub plus eight radial wooden paddles.
+    WaterWheel,
+    /// `create:large_water_wheel` — same paddled build at a wider reach.
+    LargeWaterWheel,
+    /// `create:mechanical_press` — axle, piston shaft and head plate.
+    MechanicalPress,
+    /// Unknown Create addon kinetic blocks — clean shaft+hub rotor.
+    GenericRotor,
+}
+
+impl KineticMeshFamily {
+    /// Map a block name (`create:shaft`, optionally `[state]`-suffixed)
+    /// to its template family; unknown names fall back to the rotor.
+    fn from_block_name(name: &str) -> Self {
+        let tail = name.rsplit(':').next().unwrap_or(name);
+        let base = tail.split('[').next().unwrap_or(tail);
+        match base {
+            "shaft" => Self::Shaft,
+            "cogwheel" => Self::Cogwheel,
+            "large_cogwheel" => Self::LargeCogwheel,
+            "water_wheel" => Self::WaterWheel,
+            "large_water_wheel" => Self::LargeWaterWheel,
+            "mechanical_press" => Self::MechanicalPress,
+            _ => Self::GenericRotor,
         }
-        indices.extend([base, base + 1, base + 2, base, base + 2, base + 3]);
     }
+
+    /// Stable family index folded into the template `mesh_kind`.
+    fn index(self) -> u32 {
+        match self {
+            Self::Shaft => 0,
+            Self::Cogwheel => 1,
+            Self::LargeCogwheel => 2,
+            Self::WaterWheel => 3,
+            Self::LargeWaterWheel => 4,
+            Self::MechanicalPress => 5,
+            Self::GenericRotor => 6,
+        }
+    }
+}
+
+/// Dominant cardinal the part spins around — the axis the template is
+/// reoriented onto after being authored along +Y.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum KineticAxis {
+    X,
+    Y,
+    Z,
+}
+
+impl KineticAxis {
+    fn dominant(axis: [f32; 3]) -> Self {
+        if axis[0].abs() > axis[1].abs() && axis[0].abs() > axis[2].abs() {
+            Self::X
+        } else if axis[2].abs() > axis[1].abs() {
+            Self::Z
+        } else {
+            Self::Y
+        }
+    }
+
+    /// Axis slot folded into the `mesh_kind` (`family * 4 + slot`) so a
+    /// shaft along X and the same shaft along Z keep separate templates.
+    fn slot(self) -> u32 {
+        match self {
+            Self::X => 0,
+            Self::Y => 1,
+            Self::Z => 2,
+        }
+    }
+}
+
+/// One pixel of Create's 16px-per-block model space, in blocks.
+const KPX: f32 = 1.0 / 16.0;
+/// Andesite-alloy metal tone used by shafts, cogs and press parts.
+const KINETIC_METAL: [f32; 3] = [0.55, 0.52, 0.48];
+/// Darker steel tone for piston shafts and press heads.
+const KINETIC_DARK_METAL: [f32; 3] = [0.38, 0.36, 0.40];
+/// Spruce-plank wood tone for water-wheel paddles and hubs.
+const KINETIC_WOOD: [f32; 3] = [0.56, 0.40, 0.22];
+
+/// Append an axis-aligned box (pixel units, pivot-centered) rotated
+/// `yaw` radians about +Y to a template under construction.
+fn kinetic_push_box(
+    vertices: &mut Vec<TerrainVertex>,
+    indices: &mut Vec<u32>,
+    min: [f32; 3],
+    max: [f32; 3],
+    yaw: f32,
+    albedo: [f32; 3],
+) {
+    let (mut part_vertices, part_indices) = box_mesh(
+        [min[0] * KPX, min[1] * KPX, min[2] * KPX],
+        [max[0] * KPX, max[1] * KPX, max[2] * KPX],
+        albedo,
+    );
+    if yaw != 0.0 {
+        let (sin, cos) = yaw.sin_cos();
+        for vertex in &mut part_vertices {
+            let [x, y, z] = vertex.position;
+            vertex.position = [x * cos + z * sin, y, z * cos - x * sin];
+            let [nx, ny, nz] = vertex.normal;
+            vertex.normal = [nx * cos + nz * sin, ny, nz * cos - nx * sin];
+        }
+    }
+    let base = vertices.len() as u32;
+    vertices.extend(part_vertices);
+    indices.extend(part_indices.into_iter().map(|index| index + base));
+}
+
+/// Reorient a canonical (+Y-axis) template so its spin axis lands on
+/// `axis`: +Y maps onto +X or +Z while the pivot stays at the origin.
+fn kinetic_orient_to_axis(vertices: &mut [TerrainVertex], axis: KineticAxis) {
+    let orient: fn([f32; 3]) -> [f32; 3] = match axis {
+        KineticAxis::Y => return,
+        // Rotation -90° about Z sends +Y to +X.
+        KineticAxis::X => |[x, y, z]| [y, -x, z],
+        // Rotation +90° about X sends +Y to +Z.
+        KineticAxis::Z => |[x, y, z]| [x, -z, y],
+    };
+    for vertex in vertices {
+        vertex.position = orient(vertex.position);
+        vertex.normal = orient(vertex.normal);
+    }
+}
+
+/// Procedural 3D template for one Create kinetic family, authored
+/// pivot-centered (block center = origin) along the +Y spin axis and
+/// then reoriented onto `axis`. Sizes follow Create's 16px-per-block
+/// model space: a `4×16×4` shaft is a ¼-block rod spanning the block.
+fn kinetic_template(
+    family: KineticMeshFamily,
+    axis: KineticAxis,
+) -> (Vec<TerrainVertex>, Vec<u32>) {
+    let mut vertices = Vec::new();
+    let mut indices = Vec::new();
+    // The narrow 4×16×4 axle rod every family shares.
+    kinetic_push_box(
+        &mut vertices,
+        &mut indices,
+        [-2.0, -8.0, -2.0],
+        [2.0, 8.0, 2.0],
+        0.0,
+        KINETIC_METAL,
+    );
+    match family {
+        KineticMeshFamily::Shaft => {}
+        KineticMeshFamily::Cogwheel | KineticMeshFamily::LargeCogwheel => {
+            let (steps, rim, tooth) = if family == KineticMeshFamily::Cogwheel {
+                (8_u32, 5.5_f32, 8.0_f32)
+            } else {
+                (12_u32, 9.5_f32, 12.0_f32)
+            };
+            for step in 0..steps {
+                let yaw = step as f32 * std::f32::consts::TAU / steps as f32;
+                // Rim segment hugging the wheel's circumference.
+                kinetic_push_box(
+                    &mut vertices,
+                    &mut indices,
+                    [rim - 1.5, -1.0, -2.0],
+                    [rim + 1.5, 1.0, 2.0],
+                    yaw,
+                    KINETIC_METAL,
+                );
+                // Tooth protruding past the rim face.
+                kinetic_push_box(
+                    &mut vertices,
+                    &mut indices,
+                    [tooth - 1.5, -1.5, -1.0],
+                    [tooth + 1.5, 1.5, 1.0],
+                    yaw,
+                    KINETIC_METAL,
+                );
+            }
+            // Four spokes tying the axle to the rim.
+            for step in 0..4 {
+                let yaw = step as f32 * std::f32::consts::FRAC_PI_2;
+                kinetic_push_box(
+                    &mut vertices,
+                    &mut indices,
+                    [1.0, -0.75, -0.75],
+                    [rim - 0.5, 0.75, 0.75],
+                    yaw,
+                    KINETIC_METAL,
+                );
+            }
+        }
+        KineticMeshFamily::WaterWheel | KineticMeshFamily::LargeWaterWheel => {
+            let (reach, half_width) = if family == KineticMeshFamily::WaterWheel {
+                (7.5_f32, 2.0_f32)
+            } else {
+                (13.5, 3.0)
+            };
+            // Squared hub the paddles bolt onto.
+            kinetic_push_box(
+                &mut vertices,
+                &mut indices,
+                [-3.0, -2.0, -3.0],
+                [3.0, 2.0, 3.0],
+                0.0,
+                KINETIC_WOOD,
+            );
+            for step in 0..8 {
+                let yaw = step as f32 * std::f32::consts::FRAC_PI_4;
+                kinetic_push_box(
+                    &mut vertices,
+                    &mut indices,
+                    [2.5, -0.75, -half_width],
+                    [reach, 0.75, half_width],
+                    yaw,
+                    KINETIC_WOOD,
+                );
+            }
+        }
+        KineticMeshFamily::MechanicalPress => {
+            // Vertical piston shaft below the spinning axle.
+            kinetic_push_box(
+                &mut vertices,
+                &mut indices,
+                [-1.5, -6.0, -1.5],
+                [1.5, -2.0, 1.5],
+                0.0,
+                KINETIC_DARK_METAL,
+            );
+            // Press head plate at the block's bottom face.
+            kinetic_push_box(
+                &mut vertices,
+                &mut indices,
+                [-5.0, -8.0, -5.0],
+                [5.0, -6.0, 5.0],
+                0.0,
+                KINETIC_DARK_METAL,
+            );
+        }
+        KineticMeshFamily::GenericRotor => {
+            // Squared hub plus a single marker blade so rotation reads.
+            kinetic_push_box(
+                &mut vertices,
+                &mut indices,
+                [-3.0, -2.0, -3.0],
+                [3.0, 2.0, 3.0],
+                0.0,
+                KINETIC_METAL,
+            );
+            kinetic_push_box(
+                &mut vertices,
+                &mut indices,
+                [2.0, -0.75, -0.5],
+                [6.0, 0.75, 0.5],
+                0.0,
+                KINETIC_METAL,
+            );
+        }
+    }
+    kinetic_orient_to_axis(&mut vertices, axis);
     (vertices, indices)
 }
 
@@ -561,13 +797,22 @@ pub fn split_compiled_bundle(
 
 /// Namespaced block name of a block-state id — the kernel registry when
 /// loaded, else the `BlockTable`'s per-state names (empty in builtin
-/// fallback mode, so no names resolve there).
-fn state_block_name(world: &WorldState, state: u32) -> Option<&str> {
+/// fallback mode, so no names resolve there). Dynamic mod block-state
+/// ids at or past the vanilla table resolve through the synced `MRS1`
+/// `ClientModRegistry` when one is present.
+fn state_block_name<'a>(
+    world: &'a WorldState,
+    mod_registry: Option<&'a ClientModRegistry>,
+    state: u32,
+) -> Option<&'a str> {
     if let Some(registry) = &world.registry {
-        registry.state_name(state).ok()
-    } else {
-        world.blocks.state_name(state)
+        if let Ok(name) = registry.state_name(state) {
+            return Some(name);
+        }
+    } else if let Some(name) = world.blocks.state_name(state) {
+        return Some(name);
     }
+    mod_registry.and_then(|registry| registry.block_state_name(state))
 }
 
 /// The atlas sprite id standing in for a whole block: the `particle`
@@ -618,13 +863,14 @@ fn representative_texture(
 /// per-state properties).
 fn state_sprite_assignments(
     world: &WorldState,
+    mod_registry: Option<&ClientModRegistry>,
     meta: &CompiledAssetMeta,
     renderer: &GpuRenderer,
 ) -> Vec<(u32, String)> {
     let mut out = Vec::new();
     let mut per_block: HashMap<&str, Option<String>> = HashMap::new();
     for state in 0..world.state_count as u32 {
-        let Some(block) = state_block_name(world, state) else {
+        let Some(block) = state_block_name(world, mod_registry, state) else {
             continue;
         };
         let texture = per_block.entry(block).or_insert_with(|| {
@@ -887,6 +1133,19 @@ pub struct LiveSession {
     next_kinetic_part_id: u32,
     pub vanilla_plus_cfg: VanillaPlusPipelineConfig,
     pub nature_mod_registry: NatureModRegistry,
+    /// Latest `megu:mod_registry_sync_v1` (`MRS1`) frame — maps dynamic
+    /// block-state ids (at/past the vanilla table) and item ids to their
+    /// real `namespace:name`s for the goggles HUD and looking-at overlay.
+    pub mod_registry: Option<ClientModRegistry>,
+    /// `MRS1` frames that failed to decode (diagnostics parity with
+    /// `vfx_rejected`/`animation_rejected`).
+    pub mod_registry_rejected: u64,
+    /// Mod-JAR `assets/*/lang` translation table loaded for `ui_locale`;
+    /// `None` until first use so connect stays lazy.
+    mod_translations: Option<ModTranslationTable>,
+    /// UI locale code the window pushes (`settings.locale.code()`),
+    /// normalized the way `ModTranslationTable::load` expects.
+    ui_locale: String,
     /// The latest decoded `SSN1` season sync, or `None` before the first
     /// `megu:season_v1` frame (and on seasonless dimensions).
     pub latest_season: Option<SeasonWireSync>,
@@ -1181,6 +1440,10 @@ impl LiveSession {
             next_kinetic_part_id: 0,
             vanilla_plus_cfg: VanillaPlusPipelineConfig::default(),
             nature_mod_registry: NatureModRegistry::default(),
+            mod_registry: None,
+            mod_registry_rejected: 0,
+            mod_translations: None,
+            ui_locale: "en_us".to_owned(),
             latest_season: None,
             season_ambience: SeasonAmbienceInput::default(),
             nature_ambience: NatureAmbienceState::default(),
@@ -2098,14 +2361,14 @@ impl LiveSession {
 
     /// Registry name for the block state at `pos` (e.g. `minecraft:oak_log`),
     /// falling back to the raw state id when the pack registry is absent.
+    /// Dynamic mod state ids resolve their real `namespace:block` through
+    /// the synced `MRS1` registry.
     fn block_name_at(&self, pos: [i32; 3]) -> String {
         self.world
             .get_block_state(pos[0], pos[1], pos[2])
             .map(|state| {
-                self.world
-                    .registry
-                    .as_ref()
-                    .and_then(|registry| registry.state_name(state).ok().map(str::to_string))
+                state_block_name(&self.world, self.mod_registry.as_ref(), state)
+                    .map(str::to_string)
                     .unwrap_or_else(|| format!("minecraft:state_{state}"))
             })
             .unwrap_or_else(|| "minecraft:air".to_string())
@@ -2221,7 +2484,12 @@ impl LiveSession {
                     // sprite through `atlas_states`; without this table
                     // every quad falls back to its palette colour and no
                     // `.mcmeta` frame ever reaches the screen.
-                    let assignments = state_sprite_assignments(&self.world, meta, renderer);
+                    let assignments = state_sprite_assignments(
+                        &self.world,
+                        self.mod_registry.as_ref(),
+                        meta,
+                        renderer,
+                    );
                     let refs: Vec<(u32, &str)> = assignments
                         .iter()
                         .map(|(id, sprite)| (*id, sprite.as_str()))
@@ -2503,18 +2771,75 @@ impl LiveSession {
         }
     }
 
-    pub fn goggles_telemetry_at(&self, pos: (i32, i32, i32)) -> Option<GogglesTargetTelemetry> {
-        let record = self.kinetic_telemetry.get(&pos)?;
-        let block_id = self
-            .world
-            .get_block_state(pos.0, pos.1, pos.2)
-            .and_then(|state| self.world.blocks.state_name(state))
-            .filter(|name| !name.is_empty())
-            .unwrap_or("create:kinetic_part")
-            .to_owned();
+    /// Push the active UI locale (`settings.locale.code()`) into the
+    /// session so mod display names resolve in the player's language.
+    /// A change marks the translation table stale; the next lookup
+    /// reloads it for the new locale.
+    pub fn set_ui_locale(&mut self, locale: &str) {
+        let normalized = locale.trim().replace('-', "_").to_ascii_lowercase();
+        if normalized.is_empty() || normalized == self.ui_locale {
+            return;
+        }
+        self.ui_locale = normalized;
+        self.mod_translations = None;
+    }
+
+    /// Lazily load `ModTranslationTable` for `ui_locale` from the session
+    /// `game_dir`'s mod JARs (bounded: `MAX_ARCHIVES`/`MAX_LANG_BYTES`
+    /// inside the loader). Skips silently when no `game_dir` is set.
+    fn ensure_mod_translations(&mut self) {
+        if self
+            .mod_translations
+            .as_ref()
+            .is_some_and(|table| table.locale() == self.ui_locale)
+        {
+            return;
+        }
+        let Some(game_dir) = self.session_paths.game_dir.clone() else {
+            return;
+        };
+        let mut report = ModMetaReport::default();
+        let table = ModTranslationTable::load(&game_dir, &self.ui_locale, &mut report);
+        for warning in report.warnings {
+            eprintln!("megu-client mod meta: {warning}");
+        }
+        self.mod_translations = Some(table);
+    }
+
+    /// Live Create goggles telemetry for the kinetic part at `pos`.
+    /// Dynamic mod block-state ids resolve their real `namespace:block`
+    /// through the `MRS1` registry, and their `display_name` comes from
+    /// the loaded mod lang table (`ui_locale`, English fallback).
+    pub fn goggles_telemetry_at(&mut self, pos: (i32, i32, i32)) -> Option<GogglesTargetTelemetry> {
+        let record = self.kinetic_telemetry.get(&pos)?.clone();
+        let state = self.world.get_block_state(pos.0, pos.1, pos.2);
+        let resolved = state.and_then(|state| {
+            state_block_name(&self.world, self.mod_registry.as_ref(), state)
+                .filter(|name| !name.is_empty())
+                .map(|name| (state, name))
+        });
+        let (block_id, dynamic) = resolved
+            .map(|(state, name)| {
+                let vanilla = if let Some(registry) = &self.world.registry {
+                    registry.state_name(state).ok()
+                } else {
+                    self.world.blocks.state_name(state)
+                };
+                (name.to_owned(), vanilla.is_none())
+            })
+            .unwrap_or_else(|| ("create:kinetic_part".to_owned(), false));
+        let display_name = if dynamic {
+            self.ensure_mod_translations();
+            self.mod_translations
+                .as_ref()
+                .map(|table| table.translate_block(&block_id))
+                .filter(|name| !name.is_empty())
+        } else {
+            None
+        };
         Some(GogglesTargetTelemetry {
             block_id,
-            display_name: None,
+            display_name,
             rpm: record.speed_rpm,
             stress_impact: 0.0,
             network_stress_used: record.stress_load,
@@ -2532,27 +2857,50 @@ impl LiveSession {
             self.kinetic_telemetry.insert(pos, record);
             return;
         }
-        let axis = self
-            .world
-            .get_block_state(pos.0, pos.1, pos.2)
-            .and_then(|state| self.world.blocks.state_name(state))
-            .map(|name| {
-                if name.contains("axis=x") {
+        let state = self.world.get_block_state(pos.0, pos.1, pos.2);
+        let block_name = state.and_then(|state| {
+            state_block_name(&self.world, self.mod_registry.as_ref(), state)
+        });
+        // Axis: the MRS1 property map is authoritative for dynamic ids;
+        // `axis=` in a property-suffixed state name is the vanilla cue.
+        let axis = state
+            .and_then(|state| {
+                self.mod_registry
+                    .as_ref()
+                    .and_then(|registry| registry.block_state(state))
+                    .and_then(|block| block.properties.get("axis"))
+            })
+            .map(|axis| {
+                if axis == "x" {
                     [1.0, 0.0, 0.0]
-                } else if name.contains("axis=z") {
+                } else if axis == "z" {
                     [0.0, 0.0, 1.0]
                 } else {
                     [0.0, 1.0, 0.0]
                 }
             })
+            .or_else(|| {
+                block_name.map(|name| {
+                    if name.contains("axis=x") {
+                        [1.0, 0.0, 0.0]
+                    } else if name.contains("axis=z") {
+                        [0.0, 0.0, 1.0]
+                    } else {
+                        [0.0, 1.0, 0.0]
+                    }
+                })
+            })
             .unwrap_or([0.0, 1.0, 0.0]);
-        if !self.subworlds.batches().any(|batch| batch.mesh_kind == 0) {
-            let (vertices, indices) = kinetic_fallback_template();
-            self.register_kinetic_template(0, vertices, indices);
-        }
+        let family = KineticMeshFamily::from_block_name(block_name.unwrap_or_default());
+        let dominant = KineticAxis::dominant(axis);
+        let mesh_kind = family.index() * 4 + dominant.slot();
+        let (vertices, indices) = kinetic_template(family, dominant);
+        self.register_kinetic_template(mesh_kind, vertices, indices);
+        // Pivot-centered templates spin about the block center, so the
+        // instance origin is `pos + 0.5`, not the block corner.
         let id = self.register_kinetic_part(KineticPartSpec::shaft(
-            0,
-            [pos.0 as f32, pos.1 as f32, pos.2 as f32],
+            mesh_kind,
+            [pos.0 as f32 + 0.5, pos.1 as f32 + 0.5, pos.2 as f32 + 0.5],
             axis,
         ));
         self.kinetic_pos_to_id.insert(pos, id);
@@ -3462,6 +3810,14 @@ impl LiveSession {
                     for record in records {
                         self.upsert_kinetic_record(record);
                     }
+                }
+            }
+            ClientCustomChannelEvent::Unknown { channel, payload }
+                if channel.as_str() == CHANNEL_MOD_REGISTRY_SYNC =>
+            {
+                match decode_mrs1_frame(&payload) {
+                    Ok(registry) => self.mod_registry = Some(registry),
+                    Err(_) => self.mod_registry_rejected += 1,
                 }
             }
             ClientCustomChannelEvent::Unknown { .. } => {}
@@ -4664,7 +5020,12 @@ mod tests {
             .unwrap();
         live.poll([0.0; 3], &[]);
         assert_eq!(live.kinetic_part_count(), 2);
-        assert_eq!(live.subworlds.batches().next().unwrap().template_vertices.len(), 16);
+        // No world block state under the parts: both register the generic
+        // rotor template (axle + hub + marker blade = 3 boxes = 72 verts)
+        // keyed `family 6 * 4 + axis Y slot 1`.
+        let batch = live.subworlds.batches().next().unwrap();
+        assert_eq!(batch.mesh_kind, 25);
+        assert_eq!(batch.template_vertices.len(), 72);
         assert_eq!(live.kinetic_pos_to_id.get(&(4, 64, 8)), Some(&0));
         assert_eq!(live.kinetic_pos_to_id.get(&(5, 64, 8)), Some(&1));
         let first = live.goggles_telemetry_at((4, 64, 8)).unwrap();
@@ -4690,6 +5051,314 @@ mod tests {
         }))
         .unwrap();
         assert_eq!(live.kinetic_part_count(), 0);
+    }
+
+    fn mrs1_frame() -> Vec<u8> {
+        fn crc32(bytes: &[u8]) -> u32 {
+            let mut crc = !0u32;
+            for &byte in bytes {
+                crc ^= u32::from(byte);
+                for _ in 0..8 {
+                    let mask = 0u32.wrapping_sub(crc & 1);
+                    crc = (crc >> 1) ^ (0xEDB8_8320 & mask);
+                }
+            }
+            !crc
+        }
+        let mut frame = b"MRS1".to_vec();
+        frame.extend_from_slice(&1u16.to_be_bytes());
+        frame.extend_from_slice(&40u32.to_be_bytes()); // base_block_state_id
+        frame.extend_from_slice(&9_000u32.to_be_bytes()); // base_item_id
+        frame.extend_from_slice(&2u32.to_be_bytes()); // block state count
+        for (id, name, axis) in [
+            (40_u32, "create:water_wheel", "x"),
+            (41_u32, "create:shaft", "y"),
+        ] {
+            frame.extend_from_slice(&id.to_be_bytes());
+            frame.extend_from_slice(&(name.len() as u16).to_be_bytes());
+            frame.extend_from_slice(name.as_bytes());
+            frame.extend_from_slice(&1u16.to_be_bytes());
+            for s in ["axis", axis] {
+                frame.extend_from_slice(&(s.len() as u16).to_be_bytes());
+                frame.extend_from_slice(s.as_bytes());
+            }
+        }
+        frame.extend_from_slice(&1u32.to_be_bytes()); // item count
+        frame.extend_from_slice(&9_000u32.to_be_bytes());
+        let item = "create:wrench";
+        frame.extend_from_slice(&(item.len() as u16).to_be_bytes());
+        frame.extend_from_slice(item.as_bytes());
+        let crc = crc32(&frame);
+        frame.extend_from_slice(&crc.to_be_bytes());
+        frame
+    }
+
+    fn template_bounds(vertices: &[TerrainVertex]) -> ([f32; 3], [f32; 3]) {
+        let mut min = [f32::INFINITY; 3];
+        let mut max = [f32::NEG_INFINITY; 3];
+        for vertex in vertices {
+            for axis in 0..3 {
+                min[axis] = min[axis].min(vertex.position[axis]);
+                max[axis] = max[axis].max(vertex.position[axis]);
+            }
+        }
+        (min, max)
+    }
+
+    #[test]
+    fn kinetic_templates_are_family_and_axis_specific() {
+        let (shaft_vertices, shaft_indices) =
+            kinetic_template(KineticMeshFamily::Shaft, KineticAxis::Y);
+        // 4×16×4 axle: one box, a full-block tall rod ¼-block wide.
+        assert_eq!(shaft_vertices.len(), 24);
+        assert_eq!(shaft_indices.len(), 36);
+        let (min, max) = template_bounds(&shaft_vertices);
+        assert!((max[1] - min[1] - 1.0).abs() < 1e-6);
+        assert!((max[0] - min[0] - 0.25).abs() < 1e-6);
+        assert!((max[2] - min[2] - 0.25).abs() < 1e-6);
+
+        // The same shaft reoriented onto X keeps its long extent along X.
+        let (shaft_x, _) = kinetic_template(KineticMeshFamily::Shaft, KineticAxis::X);
+        let (min, max) = template_bounds(&shaft_x);
+        assert!((max[0] - min[0] - 1.0).abs() < 1e-6);
+        assert!((max[1] - min[1] - 0.25).abs() < 1e-6);
+
+        // Cogwheel: axle + 8 rim segments + 8 teeth + 4 spokes.
+        let (cog_vertices, _) = kinetic_template(KineticMeshFamily::Cogwheel, KineticAxis::Y);
+        assert_eq!(cog_vertices.len(), (1 + 8 + 8 + 4) * 24);
+        // Large cogwheel spins a wider ring: 12 rim + 12 tooth + 4 spoke.
+        let (large_vertices, _) =
+            kinetic_template(KineticMeshFamily::LargeCogwheel, KineticAxis::Y);
+        assert_eq!(large_vertices.len(), (1 + 12 + 12 + 4) * 24);
+        let (_, cog_max) = template_bounds(&cog_vertices);
+        let (_, large_max) = template_bounds(&large_vertices);
+        assert!(large_max[0] > cog_max[0]);
+
+        // Water wheels: axle + hub + 8 paddles; the large reaches wider.
+        let (wheel_vertices, _) = kinetic_template(KineticMeshFamily::WaterWheel, KineticAxis::Z);
+        assert_eq!(wheel_vertices.len(), (1 + 1 + 8) * 24);
+        let (_, wheel_max) = template_bounds(&wheel_vertices);
+        // Z orientation: the axle runs along Z while the paddles radiate
+        // across the wheel's XY plane (reach ~7.5px ≈ 0.47 blocks).
+        assert!(wheel_max[0] > 0.4 && wheel_max[1] > 0.4);
+        let (big_wheel, _) =
+            kinetic_template(KineticMeshFamily::LargeWaterWheel, KineticAxis::Z);
+        let (_, big_max) = template_bounds(&big_wheel);
+        assert!(big_max[0] > wheel_max[0]);
+
+        // Press: axle + piston shaft + head plate; the plate sits at the
+        // block's bottom face and the family maps cleanly by name.
+        let (press, _) = kinetic_template(KineticMeshFamily::MechanicalPress, KineticAxis::Y);
+        assert_eq!(press.len(), 3 * 24);
+        let (press_min, _) = template_bounds(&press);
+        assert!((press_min[1] + 0.5).abs() < 1e-6);
+        assert_eq!(
+            KineticMeshFamily::from_block_name("create:large_cogwheel[axis=x]"),
+            KineticMeshFamily::LargeCogwheel
+        );
+        assert_eq!(
+            KineticMeshFamily::from_block_name("create:basin"),
+            KineticMeshFamily::GenericRotor
+        );
+        // Unknown addon parts get the clean shaft+hub rotor: 3 boxes,
+        // pivot-centered so the part spins instead of orbiting a corner.
+        let (rotor, _) = kinetic_template(KineticMeshFamily::GenericRotor, KineticAxis::Y);
+        assert_eq!(rotor.len(), 3 * 24);
+        let (rotor_min, rotor_max) = template_bounds(&rotor);
+        for axis in 0..3 {
+            assert!(rotor_min[axis] < 0.0 && rotor_max[axis] > 0.0);
+        }
+    }
+
+    #[test]
+    fn mrs1_frame_updates_registry_and_counts_rejects() {
+        let (mut live, _tx) = session();
+        assert!(live.mod_registry.is_none());
+        live.apply_event(framed(CHANNEL_MOD_REGISTRY_SYNC, &mrs1_frame()))
+            .unwrap();
+        let registry = live.mod_registry.as_ref().unwrap();
+        assert_eq!(registry.base_block_state_id, 40);
+        assert_eq!(registry.block_state_name(40), Some("create:water_wheel"));
+        assert_eq!(registry.item_name(9_000), Some("create:wrench"));
+
+        let mut bad = mrs1_frame();
+        let last = bad.len() - 1;
+        bad[last] ^= 0xFF;
+        live.apply_event(framed(CHANNEL_MOD_REGISTRY_SYNC, &bad))
+            .unwrap();
+        assert_eq!(live.mod_registry_rejected, 1);
+        // The rejected frame never clobbers the stored registry.
+        assert_eq!(
+            live.mod_registry.as_ref().unwrap().block_state_name(40),
+            Some("create:water_wheel")
+        );
+    }
+
+    #[test]
+    fn dynamic_blocks_drive_family_templates_and_goggles_names() {
+        let (mut live, _tx) = session();
+        let body = decoded_frame(0x27, &stone_chunk());
+        let chunk = decode_chunk_packet(&body, 24, 64).unwrap();
+        live.apply_event(ClientPlayEvent::Play(PlayEvent::ChunkData(Box::new(chunk))))
+            .unwrap();
+        live.apply_event(framed(CHANNEL_MOD_REGISTRY_SYNC, &mrs1_frame()))
+            .unwrap();
+        // Dynamic mod block states: water wheel on X, shaft on Y.
+        for (pos, state_id) in [([7, 64, 3], 40_u32), ([8, 64, 3], 41_u32)] {
+            live.apply_event(ClientPlayEvent::Play(PlayEvent::BlockUpdate {
+                pos,
+                state_id,
+            }))
+            .unwrap();
+        }
+        let mut payload = vec![2];
+        for (x, rpm) in [(7, 32.0_f32), (8, 16.0)] {
+            for value in [0_i32, x, 64, 3] {
+                payload.extend_from_slice(&value.to_be_bytes());
+            }
+            for value in [rpm, 100.0, 20.0] {
+                payload.extend_from_slice(&value.to_be_bytes());
+            }
+            payload.push(0);
+        }
+        live.apply_event(framed(CHANNEL_CREATE_KINETIC_SYNC, &payload))
+            .unwrap();
+
+        // The block name picks the family and the MRS1 `axis` property
+        // the template orientation: water wheel on X is kind 3*4+0=12,
+        // shaft on Y is kind 0*4+1=1.
+        let kinds: BTreeMap<u32, usize> = live
+            .subworlds
+            .batches()
+            .map(|batch| (batch.mesh_kind, batch.template_vertices.len()))
+            .collect();
+        assert_eq!(kinds.get(&12), Some(&240));
+        assert_eq!(kinds.get(&1), Some(&24));
+        let mut specs: Vec<_> = live.kinetic_parts.values().collect();
+        specs.sort_by_key(|spec| spec.mesh_kind);
+        assert_eq!(specs[0].axis, [0.0, 1.0, 0.0]);
+        assert_eq!(specs[0].position, [8.5, 64.5, 3.5]);
+        assert_eq!(specs[1].axis, [1.0, 0.0, 0.0]);
+        assert_eq!(specs[1].position, [7.5, 64.5, 3.5]);
+
+        // Goggles resolve the real mod block name off the dynamic id.
+        let telemetry = live.goggles_telemetry_at((7, 64, 3)).unwrap();
+        assert_eq!(telemetry.block_id, "create:water_wheel");
+        assert_eq!(telemetry.rpm, 32.0);
+    }
+
+    fn write_test_jar(path: &std::path::Path, entries: &[(&str, &[u8])]) {
+        use std::io::{Seek, Write};
+        let mut file = std::fs::File::create(path).expect("create jar");
+        let mut central = Vec::new();
+        for (name, data) in entries {
+            let offset = file.stream_position().expect("position") as u32;
+            let name_bytes = name.as_bytes();
+            let crc = megu_client::zip_entries::crc32(data);
+            let mut local = Vec::new();
+            local.extend_from_slice(&0x0403_4b50u32.to_le_bytes());
+            local.extend_from_slice(&20u16.to_le_bytes());
+            local.extend_from_slice(&0u16.to_le_bytes());
+            local.extend_from_slice(&0u16.to_le_bytes());
+            local.extend_from_slice(&[0; 4]);
+            local.extend_from_slice(&crc.to_le_bytes());
+            local.extend_from_slice(&(data.len() as u32).to_le_bytes());
+            local.extend_from_slice(&(data.len() as u32).to_le_bytes());
+            local.extend_from_slice(&(name_bytes.len() as u16).to_le_bytes());
+            local.extend_from_slice(&0u16.to_le_bytes());
+            local.extend_from_slice(name_bytes);
+            local.extend_from_slice(data);
+            file.write_all(&local).expect("write entry");
+            central.extend_from_slice(&0x0201_4b50u32.to_le_bytes());
+            central.extend_from_slice(&20u16.to_le_bytes());
+            central.extend_from_slice(&20u16.to_le_bytes());
+            central.extend_from_slice(&0u16.to_le_bytes());
+            central.extend_from_slice(&0u16.to_le_bytes());
+            central.extend_from_slice(&[0; 4]);
+            central.extend_from_slice(&crc.to_le_bytes());
+            central.extend_from_slice(&(data.len() as u32).to_le_bytes());
+            central.extend_from_slice(&(data.len() as u32).to_le_bytes());
+            central.extend_from_slice(&(name_bytes.len() as u16).to_le_bytes());
+            central.extend_from_slice(&0u16.to_le_bytes());
+            central.extend_from_slice(&0u16.to_le_bytes());
+            central.extend_from_slice(&0u16.to_le_bytes());
+            central.extend_from_slice(&0u16.to_le_bytes());
+            central.extend_from_slice(&0u32.to_le_bytes());
+            central.extend_from_slice(&offset.to_le_bytes());
+            central.extend_from_slice(name_bytes);
+        }
+        let cd_offset = file.stream_position().expect("position") as u32;
+        file.write_all(&central).expect("write directory");
+        let count = entries.len() as u16;
+        let mut end = Vec::new();
+        end.extend_from_slice(&0x0605_4b50u32.to_le_bytes());
+        end.extend_from_slice(&0u16.to_le_bytes());
+        end.extend_from_slice(&0u16.to_le_bytes());
+        end.extend_from_slice(&count.to_le_bytes());
+        end.extend_from_slice(&count.to_le_bytes());
+        end.extend_from_slice(&(central.len() as u32).to_le_bytes());
+        end.extend_from_slice(&cd_offset.to_le_bytes());
+        end.extend_from_slice(&0u16.to_le_bytes());
+        file.write_all(&end).expect("write end record");
+    }
+
+    #[test]
+    fn goggles_display_name_uses_loaded_mod_lang_table() {
+        let dir = std::env::temp_dir().join(format!(
+            "megu-live-mrs1-{}-{}",
+            std::process::id(),
+            40_u32
+        ));
+        std::fs::create_dir_all(dir.join("mods")).expect("create mod dir");
+        write_test_jar(
+            &dir.join("mods/00-create.jar"),
+            &[
+                (
+                    "assets/create/lang/en_us.json",
+                    br#"{"block.create.water_wheel":"Water Wheel"}"#,
+                ),
+                (
+                    "assets/create/lang/ja_jp.json",
+                    "{\"block.create.water_wheel\":\"水車\"}".as_bytes(),
+                ),
+            ],
+        );
+        let mut live = LiveSession::offline_with_paths(SessionPaths {
+            game_dir: Some(dir.clone()),
+            ..SessionPaths::default()
+        });
+        live.set_ui_locale("ja-JP");
+        let body = decoded_frame(0x27, &stone_chunk());
+        let chunk = decode_chunk_packet(&body, 24, 64).unwrap();
+        live.apply_event(ClientPlayEvent::Play(PlayEvent::ChunkData(Box::new(chunk))))
+            .unwrap();
+        live.apply_event(framed(CHANNEL_MOD_REGISTRY_SYNC, &mrs1_frame()))
+            .unwrap();
+        live.apply_event(ClientPlayEvent::Play(PlayEvent::BlockUpdate {
+            pos: [7, 64, 3],
+            state_id: 40,
+        }))
+        .unwrap();
+        let mut payload = vec![1];
+        for value in [0_i32, 7, 64, 3] {
+            payload.extend_from_slice(&value.to_be_bytes());
+        }
+        for value in [64.0_f32, 100.0, 20.0] {
+            payload.extend_from_slice(&value.to_be_bytes());
+        }
+        payload.push(0);
+        live.apply_event(framed(CHANNEL_CREATE_KINETIC_SYNC, &payload))
+            .unwrap();
+
+        let telemetry = live.goggles_telemetry_at((7, 64, 3)).unwrap();
+        assert_eq!(telemetry.block_id, "create:water_wheel");
+        assert_eq!(telemetry.display_name.as_deref(), Some("水車"));
+        // The Japanese table sticks to the resolved locale; switching the
+        // UI locale back marks it stale so the next lookup reloads.
+        live.set_ui_locale("en_us");
+        let telemetry = live.goggles_telemetry_at((7, 64, 3)).unwrap();
+        assert_eq!(telemetry.display_name.as_deref(), Some("Water Wheel"));
+        std::fs::remove_dir_all(&dir).expect("remove temp dir");
     }
 
     #[test]
