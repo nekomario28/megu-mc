@@ -174,6 +174,10 @@ pub enum Screen {
     RecipeBrowser,
     /// In-game HUD (hotbar, vitals, bossbars, chat, tab list).
     InGameHud,
+    /// Death & respawn screen (vanilla `DeathScreen`): driven by
+    /// [`UiState::death`], entered via [`UiState::show_death`], left via
+    /// [`UiAction::PerformRespawn`] / [`UiAction::LeaveWorld`].
+    Death,
     /// Pause menu.
     Pause,
     /// NotEnoughCrashes-style recovery screen after a caught crash.
@@ -1738,6 +1742,15 @@ pub enum UiAction {
     DeclineModSync,
     /// Player explicitly confirmed `"Send OK?"` on the crash screen.
     SubmitCrashReport,
+    /// Death-screen `Respawn` click: the host sends the play-phase
+    /// `client_command` packet with action `0` (`PERFORM_RESPAWN`) and
+    /// keeps [`Screen::Death`] up until the server's `respawn` /
+    /// `set_health` recovery clears [`UiState::death`].
+    PerformRespawn,
+    /// Death-screen `Title Screen` click (also the only live escape on
+    /// hardcore deaths): the host drops the live session and lands on
+    /// [`Screen::Title`].
+    LeaveWorld,
     /// The integrated Mods & Packs screen produced a host action (apply
     /// staged toggles, open the mods folder, fetch deps, ...). `Close`
     /// and `OpenUrl` are flattened into [`UiAction::Back`] /
@@ -1876,6 +1889,9 @@ pub enum WidgetId {
     RecipeBrowserDone,
     // In-game HUD (present only while a crafting conflict is active)
     CraftConflictNext,
+    // Death screen
+    DeathRespawn,
+    DeathTitleScreen,
 }
 
 impl WidgetId {
@@ -2087,6 +2103,9 @@ pub struct UiState {
 
     /// HUD data the game fills per frame.
     pub hud: HudState,
+    /// Death-screen data the live session fills on `player_combat_kill` /
+    /// `set_health(<=0)`; rendered while [`Screen::Death`] is up.
+    pub death: crate::death_screen::DeathScreenState,
 
     /// Last status line the host reported (join failures, invite
     /// results, ...). Rendered on [`Screen::Title`] and
@@ -2165,6 +2184,7 @@ impl Default for UiState {
             missing_mod_deps: Vec::new(),
             mod_sync_decision: None,
             hud: HudState::default(),
+            death: crate::death_screen::DeathScreenState::default(),
             title_status: None,
             singleplayer: SingleplayerState::default(),
             crash: None,
@@ -2476,6 +2496,34 @@ impl UiState {
         self.crash = Some(ctx);
         self.crash_sent = false;
         self.navigate(Screen::CrashRecovery);
+    }
+
+    /// Put the death screen up with `state`: the nav stack is dropped
+    /// because death is a leaf the host alone resolves (vanilla's
+    /// `DeathScreen` has no back path), and `Escape` stays inert.
+    pub fn show_death(&mut self, state: crate::death_screen::DeathScreenState) {
+        self.death = state;
+        self.nav_stack.clear();
+        self.screen = Screen::Death;
+        self.modal = None;
+        self.focus_index = None;
+    }
+
+    /// Refresh the displayed death data while [`Screen::Death`] is up
+    /// (e.g. the server-side cooldown ticked or the cause packet landed
+    /// a frame after `set_health(0)` did).
+    pub fn update_death(&mut self, state: crate::death_screen::DeathScreenState) {
+        self.death = state;
+    }
+
+    /// Clear the death state after the server's respawn/health recovery;
+    /// lands back on [`Screen::InGameHud`] when the death screen was up.
+    pub fn clear_death(&mut self) {
+        self.death = crate::death_screen::DeathScreenState::default();
+        if self.screen == Screen::Death {
+            self.screen = Screen::InGameHud;
+            self.focus_index = None;
+        }
     }
 
     /// Open the integrated Mods & Packs screen — the Title
@@ -2888,7 +2936,9 @@ impl UiState {
             return Vec::new(); // modal dismissed only
         }
         match self.screen {
-            Screen::Title | Screen::CrashRecovery => Vec::new(),
+            // Death is absorbing: vanilla's DeathScreen ignores Escape —
+            // only the Respawn/Title buttons (or server recovery) leave it.
+            Screen::Title | Screen::CrashRecovery | Screen::Death => Vec::new(),
             Screen::InGameHud => {
                 self.navigate(Screen::Pause);
                 vec![UiAction::OpenScreen(Screen::Pause)]
@@ -3157,6 +3207,21 @@ impl UiState {
             WidgetId::CrashReturnTitle => {
                 self.go_title();
                 vec![UiAction::OpenScreen(Screen::Title)]
+            }
+
+            WidgetId::DeathRespawn => {
+                // The layout only emits a live region when
+                // `can_respawn()` holds; re-check here so a stale focus
+                // activation can never send a hardcore/cooldown request.
+                if self.death.can_respawn() {
+                    vec![UiAction::PerformRespawn]
+                } else {
+                    Vec::new()
+                }
+            }
+            WidgetId::DeathTitleScreen => {
+                self.go_title();
+                vec![UiAction::LeaveWorld]
             }
             WidgetId::ModalOk => match self.modal {
                 Some(UiModal::ConfirmSendCrashReport) => {

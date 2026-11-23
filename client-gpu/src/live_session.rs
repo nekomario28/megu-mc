@@ -28,7 +28,7 @@ use megu_client::protocol::{
 };
 use megu_client::render::ClientVfxHost;
 use megu_client::render_graph::GpuPipelineKind;
-use megu_client::session::{AudioStats, WorldAcousticSnapshot};
+use megu_client::session::{AudioStats, DeathLoopState, WorldAcousticSnapshot};
 use megu_client::spatial_audio::{SpatialAudioPreset, SpatialSubtitleCue, SubtitleDirection};
 use megu_client::world::{BlockTable, WorldState};
 use megu_client_mesh::asset_pipeline::{CompiledAssetBundle, ResourcePackLayer};
@@ -66,6 +66,7 @@ use megu_kernel::raycast::{
 use megu_kernel::Aabb;
 use megu_kernel::CommandDispatcher;
 use megu_ui::create_goggles_hud::GogglesTargetTelemetry;
+use megu_ui::death_screen::DeathScreenState;
 use megu_ui::magic_hud::{CastBarState, CooldownSlotState, MagicHudState, StatusBadgeState};
 use megu_ui::state::{HudState, MiniHudPreset, UiState};
 use megu_ui::subtitle_hud::{SubtitleArrow, DEFAULT_TTL_SECS};
@@ -189,7 +190,9 @@ pub struct PlayerMovement {
     pub jump: bool,
 }
 
-enum WorkerMessage {
+// `Play` is the hot variant; boxing it would put an allocation on every frame.
+#[allow(clippy::large_enum_variant)]
+pub(crate) enum WorkerMessage {
     Connected,
     Play(ClientPlayEvent),
     Sound(WireSoundEvent),
@@ -267,7 +270,7 @@ pub struct AssetDiscovery {
     pub zip_entries_seen: usize,
 }
 
-enum WorkerCommand {
+pub(crate) enum WorkerCommand {
     Movement(PlayerMovement),
     /// `chat`/`chat_command` — the worker splits on a leading `/` exactly
     /// like vanilla's chat screen.
@@ -331,6 +334,9 @@ enum WorkerCommand {
         recipe: String,
         make_all: bool,
     },
+    /// `client_command` — the play-phase command packet the death
+    /// screen's Respawn button sends: action `0` (`PERFORM_RESPAWN`).
+    ClientCommand { action: i32 },
 }
 
 /// Live view of the server's open-container instruction: the decoded
@@ -993,6 +999,11 @@ pub struct LiveSession {
     /// set; `complete_suggestions` feeds chat autocomplete while typing.
     pub commands: CommandDispatcher,
     player_entity_id: Option<i32>,
+    /// Death & respawn loop state — `player_combat_kill` /
+    /// `set_health(<=0)` mark death, `respawn`/`set_health(>0)` clear it,
+    /// and the window reads this to drive `Screen::Death` plus the
+    /// input lock.
+    pub death: DeathLoopState,
     pub hud: HudState,
     pub magic: MagicHudState,
     pub vfx: ClientVfxHost,
@@ -1258,7 +1269,7 @@ impl LiveSession {
     }
 
     #[cfg(test)]
-    fn with_channels(
+    pub(crate) fn with_channels(
         incoming: Receiver<WorkerMessage>,
         outgoing: SyncSender<WorkerCommand>,
     ) -> Self {
@@ -1381,6 +1392,7 @@ impl LiveSession {
             asset_discovery: AssetDiscovery::default(),
             commands: seeded_command_dispatcher(),
             player_entity_id: None,
+            death: DeathLoopState::default(),
             hud: HudState::default(),
             magic: MagicHudState::default(),
             vfx,
@@ -1925,7 +1937,10 @@ impl LiveSession {
     }
 
     pub fn send_movement(&mut self, movement: PlayerMovement) {
-        if !matches!(self.status, SessionStatus::Playing) || self.pose.is_none() {
+        if !matches!(self.status, SessionStatus::Playing)
+            || self.pose.is_none()
+            || self.death.is_dead()
+        {
             return;
         }
         if let Some(previous) = self.pose {
@@ -2012,6 +2027,44 @@ impl LiveSession {
     /// `swing` — arm-swing animation for `hand`.
     pub fn swing(&mut self, hand: i32) {
         let _ = self.outgoing.try_send(WorkerCommand::Swing { hand });
+    }
+
+    /// `true` while the local player is dead — the window locks gameplay
+    /// input and shows `Screen::Death` on this.
+    pub fn is_dead(&self) -> bool {
+        self.death.is_dead()
+    }
+
+    /// Snapshot for `Screen::Death` while dead (`None` while alive) —
+    /// cause text, hardcore flag, and the XP-total "Score" line straight
+    /// from the [`DeathLoopState`].
+    pub fn death_screen_state(&self) -> Option<DeathScreenState> {
+        self.death.is_dead().then(|| DeathScreenState {
+            cause_message: self.death.cause_message().map(str::to_owned),
+            score: self.death.score(),
+            hardcore: self.death.hardcore(),
+            // The server does not gate respawn; the tracker's own
+            // pending flag prevents request spam instead.
+            respawn_cooldown_ticks: 0,
+        })
+    }
+
+    /// Death-screen `Respawn` click: queue `client_command(0)` —
+    /// `PERFORM_RESPAWN` on the wire — when the tracker says a request
+    /// is legitimate (dead, non-hardcore, none pending). Returns `true`
+    /// only when the worker queue accepted it; the screen stays up until
+    /// the server's `respawn`/`set_health(>0)` clears `death`.
+    pub fn request_respawn(&mut self) -> bool {
+        if !matches!(self.status, SessionStatus::Playing) || !self.death.can_request_respawn() {
+            return false;
+        }
+        match self.outgoing.try_send(WorkerCommand::ClientCommand { action: 0 }) {
+            Ok(()) => {
+                self.death.note_respawn_sent();
+                true
+            }
+            Err(_) => false,
+        }
     }
 
     /// `container_click` — one window transaction; `changed`/`carried` are
@@ -2129,7 +2182,7 @@ impl LiveSession {
         yaw: f32,
         pitch: f32,
     ) -> Option<PlayerPose> {
-        if !matches!(self.status, SessionStatus::Playing) {
+        if !matches!(self.status, SessionStatus::Playing) || self.death.is_dead() {
             return None;
         }
         let base = self.pose.unwrap_or(PlayerPose {
@@ -3304,10 +3357,19 @@ impl LiveSession {
         // entities, time/weather, break overlays) is owned by
         // `WorldState::apply_play_event`; session-side concerns stay below.
         self.world.apply_play_event(&event)?;
+        // The death tracker sees every play event: `player_combat_kill` /
+        // `set_health(<=0)` mark death, `respawn`/`set_health(>0)` and the
+        // next `login` clear it.
+        self.death.apply(&event);
         match event {
             PlayEvent::JoinGame { entity_id, .. } => {
                 self.player_entity_id = Some(entity_id);
                 self.reset_dimension();
+            }
+            PlayEvent::PlayerCombatKill { .. } => {
+                // `death.apply` above already folded the kill into the
+                // death loop (dead + cause + victim id); the UI sync
+                // turns it into `Screen::Death`.
             }
             PlayEvent::Respawn { .. } => self.reset_dimension(),
             PlayEvent::Teleport(teleport) => {
@@ -3592,6 +3654,13 @@ impl LiveSession {
             PlayEvent::SetHealth { health, food, .. } => {
                 self.hud.health = health;
                 self.hud.hunger = food.clamp(0, 20) as u8;
+                self.hud_revision += 1;
+            }
+            PlayEvent::SetExperience { bar, level, .. } => {
+                // `total` already fed the death screen's Score line via
+                // `death.apply`; the HUD wants bar progress + level.
+                self.hud.xp_progress = bar.clamp(0.0, 1.0);
+                self.hud.xp_level = level.max(0) as u32;
                 self.hud_revision += 1;
             }
             PlayEvent::SystemChat { text, overlay } => {
@@ -4119,6 +4188,9 @@ fn run_connection(
                     make_all,
                 }) => {
                     client.send_place_recipe(window_id, &recipe, make_all)?;
+                }
+                Ok(WorkerCommand::ClientCommand { action }) => {
+                    client.send_client_command(action)?;
                 }
                 Err(TryRecvError::Empty) => break,
                 Err(TryRecvError::Disconnected) => return Ok(()),
@@ -6168,5 +6240,145 @@ mod tests {
             jar_version_ids(&paths(Some("megu-26.3"))),
             vec!["megu-26.3", "26.3"]
         );
+    }
+
+    /// Anonymous-NBT `{"text":"..."}` — the same component shape the
+    /// `player_combat_kill` message field carries on the wire.
+    fn death_message_nbt(text: &str) -> Vec<u8> {
+        let mut v = vec![10u8]; // TAG_Compound
+        v.push(8); // TAG_String
+        v.extend_from_slice(&4u16.to_be_bytes());
+        v.extend_from_slice(b"text");
+        v.extend_from_slice(&(text.len() as u16).to_be_bytes());
+        v.extend_from_slice(text.as_bytes());
+        v.push(0);
+        v
+    }
+
+    /// The session half of the death loop: `set_health(0)` marks dead
+    /// even with no kill packet (the fallback), the kill packet fills
+    /// the death screen's cause/score fields, movement+prediction lock
+    /// while dead, `request_respawn` queues `client_command(0)`, and
+    /// `respawn`/`set_health(>0)` recovery restores the alive path.
+    #[test]
+    fn death_loop_drives_screen_snapshot_and_respawn_command() {
+        let (tx, incoming) = mpsc::sync_channel(8);
+        let (outgoing, rx) = mpsc::sync_channel(8);
+        let _ = tx;
+        let mut live = LiveSession::with_channels(incoming, outgoing);
+        live.status = SessionStatus::Playing;
+        live.pose = Some(PlayerPose {
+            feet: [1.0, 64.0, 1.0],
+            yaw: 0.0,
+            pitch: 0.0,
+        });
+        let move_cmd = |feet| PlayerMovement {
+            pose: PlayerPose {
+                feet,
+                yaw: 0.0,
+                pitch: 0.0,
+            },
+            strafe: 0.0,
+            forward: 1.0,
+            jump: false,
+        };
+
+        // Alive: movement reaches the worker queue.
+        live.send_movement(move_cmd([1.0, 64.0, 2.0]));
+        assert!(matches!(rx.recv().unwrap(), WorkerCommand::Movement(_)));
+
+        // Zero health without a kill packet: the fallback marks death.
+        live.apply_event(ClientPlayEvent::Play(PlayEvent::SetHealth {
+            health: 0.0,
+            food: 19,
+            saturation: 4.5,
+        }))
+        .unwrap();
+        assert!(live.is_dead());
+        assert!(live.death_screen_state().unwrap().cause_message.is_none());
+
+        // Gameplay input is locked while dead: neither movement packets
+        // nor physics prediction advance.
+        live.send_movement(move_cmd([1.0, 64.0, 3.0]));
+        assert!(rx.try_recv().is_err(), "dead player must not move");
+        assert!(live
+            .predict_movement(0.0, 1.0, false, false, false, 0.0, 0.0)
+            .is_none());
+
+        // The kill packet enriches the snapshot with the death message.
+        live.apply_event(ClientPlayEvent::Play(PlayEvent::PlayerCombatKill {
+            player_id: 11,
+            message_nbt: death_message_nbt("Tester was slain by Creeper"),
+        }))
+        .unwrap();
+        let state = live.death_screen_state().unwrap();
+        assert_eq!(
+            state.cause_message.as_deref(),
+            Some("Tester was slain by Creeper")
+        );
+        assert!(!state.hardcore);
+
+        // Respawn click -> `client_command(0)`; the pending flag blocks a
+        // duplicate request until the server acknowledges.
+        assert!(live.request_respawn());
+        assert!(matches!(
+            rx.recv().unwrap(),
+            WorkerCommand::ClientCommand { action: 0 }
+        ));
+        assert!(live.death.respawn_pending());
+        assert!(!live.request_respawn(), "pending request must not resend");
+
+        // Server recovery: respawn + positive health clear the loop.
+        live.apply_event(ClientPlayEvent::Play(PlayEvent::Respawn {
+            dimension: DimensionMeta::default(),
+        }))
+        .unwrap();
+        live.apply_event(ClientPlayEvent::Play(PlayEvent::SetHealth {
+            health: 20.0,
+            food: 20,
+            saturation: 5.0,
+        }))
+        .unwrap();
+        assert!(!live.is_dead());
+        assert!(live.death_screen_state().is_none());
+
+        // `Respawn` drops the pose like vanilla (position re-arrives via
+        // the follow-up teleport), then movement flows again once alive.
+        live.pose = Some(PlayerPose {
+            feet: [8.0, 70.0, 8.0],
+            yaw: 45.0,
+            pitch: -10.0,
+        });
+        live.send_movement(move_cmd([1.0, 64.0, 4.0]));
+        assert!(matches!(rx.recv().unwrap(), WorkerCommand::Movement(_)));
+    }
+
+    /// A `JoinGame` with `hardcore` set makes the death screen
+    /// spectate-only: `death_screen_state` reports the flag and
+    /// `request_respawn` is refused outright.
+    #[test]
+    fn hardcore_death_refuses_respawn_request() {
+        let (tx, incoming) = mpsc::sync_channel(8);
+        let (outgoing, rx) = mpsc::sync_channel(8);
+        let _ = tx;
+        let mut live = LiveSession::with_channels(incoming, outgoing);
+        live.status = SessionStatus::Playing;
+
+        live.apply_event(ClientPlayEvent::Play(PlayEvent::JoinGame {
+            entity_id: 11,
+            dimension: DimensionMeta::default(),
+            hardcore: true,
+        }))
+        .unwrap();
+        live.apply_event(ClientPlayEvent::Play(PlayEvent::SetHealth {
+            health: 0.0,
+            food: 20,
+            saturation: 5.0,
+        }))
+        .unwrap();
+        assert!(live.is_dead());
+        assert!(live.death_screen_state().unwrap().hardcore);
+        assert!(!live.request_respawn(), "hardcore never requests respawn");
+        assert!(rx.try_recv().is_err());
     }
 }

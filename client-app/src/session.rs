@@ -32,7 +32,9 @@ use crate::kinetic_sync::{
     KineticSyncStore, decode_kinetic_sync_batch,
 };
 use crate::online_auth::OnlineAuthOptions;
-use crate::protocol::{decode_megu_custom_payload, MeguCustomPayload, SeasonWireSync};
+use crate::protocol::{
+    decode_megu_custom_payload, MeguCustomPayload, PlayEvent, SeasonWireSync, WireReader,
+};
 use crate::recovery::{ContainmentOutcome, CrashCircuitBreaker, CrashGuard, RecoveryAction};
 use crate::sound_assets::{normalize_sound_name, sound_name_hash};
 use crate::spatial_audio::{
@@ -1297,6 +1299,141 @@ impl VoxelAcousticWorld for WorldAcousticSnapshot {
                     + x.rem_euclid(16) as usize]
             });
         AcousticMaterial::from_class(MaterialClass::from_code(class))
+    }
+}
+
+/// Session-side death & respawn tracking driven by decoded
+/// [`PlayEvent`]s — the single source of truth both the headless
+/// [`crate::sim::SessionRunner`] loop and `client-gpu`'s `LiveSession`
+/// feed the UI from.
+///
+/// The wire sequence for a death is either `player_combat_kill` (S2C
+/// `0x3c` on 767 — the dying player's entity id plus the death message
+/// as an anonymous-NBT text component) or, when the server skips the
+/// combat packet, `set_health` with `health <= 0.0` — the fallback the
+/// tracker treats as authoritative. Recovery arrives as `respawn`
+/// followed by `set_health` with `health > 0.0`; either packet clears
+/// the dead state. The tracker also keeps `login.is_hardcore` (from
+/// [`PlayEvent::JoinGame`]), the XP `total` the death screen shows as
+/// "Score", and whether a `client_command` `PERFORM_RESPAWN` request is
+/// still unacknowledged.
+#[derive(Clone, Debug, Default)]
+pub struct DeathLoopState {
+    dead: bool,
+    hardcore: bool,
+    /// Victim entity id the `player_combat_kill` packet carried — the
+    /// server reports the dying player here; the killer name rides
+    /// inside the death message text itself.
+    killed_entity_id: Option<i32>,
+    /// Plain-text death message extracted from the NBT text component.
+    cause_message: Option<String>,
+    /// A `client_command(PERFORM_RESPAWN)` was sent but no
+    /// `respawn`/`set_health(>0)` recovery arrived yet.
+    respawn_pending: bool,
+    /// Total `PERFORM_RESPAWN` requests sent this session (test/diag).
+    respawn_requests: u64,
+    /// XP `total` from `set_experience` — vanilla's death screen
+    /// "Score:" line.
+    score: i32,
+}
+
+impl DeathLoopState {
+    /// Fold one decoded play event into the death state.
+    pub fn apply(&mut self, event: &PlayEvent) {
+        match event {
+            PlayEvent::JoinGame { hardcore, .. } => {
+                *self = Self {
+                    hardcore: *hardcore,
+                    ..Self::default()
+                };
+            }
+            PlayEvent::PlayerCombatKill {
+                player_id,
+                message_nbt,
+            } => {
+                self.dead = true;
+                self.killed_entity_id = Some(*player_id);
+                // A fresh kill message re-arms the respawn request: a
+                // pending one acknowledged nothing if we are dead again.
+                self.respawn_pending = false;
+                let text = WireReader::new(message_nbt)
+                    .read_nbt()
+                    .map(|v| v.extract_text())
+                    .unwrap_or_default();
+                self.cause_message = (!text.is_empty()).then_some(text);
+            }
+            PlayEvent::SetHealth { health, .. } => {
+                if *health <= 0.0 {
+                    // `set_health(<=0)` is the death fallback for servers
+                    // that never send `player_combat_kill` (e.g. Megu
+                    // under `showDeathMessages false`).
+                    self.dead = true;
+                    self.respawn_pending = false;
+                } else {
+                    self.clear_death();
+                }
+            }
+            PlayEvent::Respawn { .. } => self.clear_death(),
+            PlayEvent::SetExperience { total, .. } => self.score = *total,
+            _ => {}
+        }
+    }
+
+    fn clear_death(&mut self) {
+        self.dead = false;
+        self.respawn_pending = false;
+        self.cause_message = None;
+        self.killed_entity_id = None;
+    }
+
+    /// `true` while the local player is dead (kill packet seen or
+    /// `health <= 0.0`, not yet recovered).
+    pub fn is_dead(&self) -> bool {
+        self.dead
+    }
+
+    /// `true` for a hardcore session — the death screen offers
+    /// spectate/title only, never `PERFORM_RESPAWN`.
+    pub fn hardcore(&self) -> bool {
+        self.hardcore
+    }
+
+    /// Entity id the kill packet blamed (the dying player's own id).
+    pub fn killed_entity_id(&self) -> Option<i32> {
+        self.killed_entity_id
+    }
+
+    /// Plain-text death message for the screen's cause line.
+    pub fn cause_message(&self) -> Option<&str> {
+        self.cause_message.as_deref()
+    }
+
+    /// `true` once a respawn request is in flight until recovery clears it.
+    pub fn respawn_pending(&self) -> bool {
+        self.respawn_pending
+    }
+
+    /// Number of `PERFORM_RESPAWN` requests this tracker recorded.
+    pub fn respawn_requests(&self) -> u64 {
+        self.respawn_requests
+    }
+
+    /// XP total surfaced as the death screen's "Score" line.
+    pub fn score(&self) -> i32 {
+        self.score
+    }
+
+    /// Whether a `PERFORM_RESPAWN` request is legitimate right now
+    /// (dead, non-hardcore, not already pending).
+    pub fn can_request_respawn(&self) -> bool {
+        self.dead && !self.hardcore && !self.respawn_pending
+    }
+
+    /// Record that the host dispatched a `client_command(0)`; the
+    /// pending flag holds until `respawn`/`set_health(>0)` clears it.
+    pub fn note_respawn_sent(&mut self) {
+        self.respawn_pending = true;
+        self.respawn_requests += 1;
     }
 }
 

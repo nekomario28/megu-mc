@@ -70,6 +70,7 @@ pub fn layout_screen_into(
         Screen::ModMenu => embedded_mod_menu(&mut ctx),
         Screen::RecipeBrowser => embedded_recipe_browser(&mut ctx),
         Screen::InGameHud => hud(&mut ctx),
+        Screen::Death => death(&mut ctx),
         Screen::Pause => pause(&mut ctx),
         Screen::CrashRecovery => crash(&mut ctx),
     }
@@ -2812,6 +2813,74 @@ fn pause(ctx: &mut Ctx) {
             WidgetId::PauseReportBug,
             lr(ctx.w - 96, ctx.h - 26, 92, 18),
             tr(lang, "Report Bug", "バグ報告"),
+        );
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Death & respawn (vanilla DeathScreen)
+// ---------------------------------------------------------------------------
+
+fn death(ctx: &mut Ctx) {
+    let lang = ctx.lang;
+    let cx = ctx.w / 2;
+    let state = &ctx.state.death;
+
+    // Vanilla tints the frozen world translucent red under the widgets.
+    ctx.fill(0, 0, ctx.w, ctx.h, pal::OVERLAY_DIM);
+    ctx.fill(0, 0, ctx.w, ctx.h, UiColor::rgba(140, 0, 0, 80));
+
+    let (title_en, title_ja) = if state.hardcore {
+        ("Game over!", "ゲームオーバー")
+    } else {
+        // ja: the death kanji (死亡) sit outside the built-in atlas, so
+        // the hiragana form stands in — vanilla's message minus tofu.
+        ("You died!", "しにました")
+    };
+    let ty = (ctx.h / 4).min(ctx.h.saturating_sub(16)).max(0);
+    ctx.ctext(cx, ty, 2, pal::DANGER, tr(lang, title_en, title_ja));
+
+    let mut y = ty + 24;
+    if let Some(cause) = state
+        .cause_message
+        .as_deref()
+        .filter(|cause| !cause.is_empty())
+    {
+        ctx.ctext(cx, y, 1, pal::TEXT, cause);
+        y += 12;
+    }
+    ctx.ctext(
+        cx,
+        y,
+        1,
+        pal::TEXT_DIM,
+        &format!("{}: {}", tr(lang, "Score", "スコア"), state.score),
+    );
+
+    // Buttons below the score line, clamped into the viewport like the
+    // pause stack. Hardcore shows vanilla's single centered "Title
+    // Screen" — there is no respawn to offer and we implement no
+    // spectate mode, so a dead "Spectate World" button would lie.
+    let by = (y + 16).min((ctx.h - 22).max(2));
+    if state.hardcore {
+        let bw = 140.min(ctx.w - 12).max(24);
+        ctx.btn(
+            WidgetId::DeathTitleScreen,
+            lr(cx - bw / 2, by, bw, 20),
+            tr(lang, "Title Screen", "タイトル画面へ"),
+        );
+    } else {
+        let bw = 110.min((ctx.w - 12) / 2).max(24);
+        ctx.button(
+            WidgetId::DeathRespawn,
+            lr(cx - bw - 2, by, bw, 20),
+            tr(lang, "Respawn", "リスポーン"),
+            state.can_respawn(),
+        );
+        ctx.btn(
+            WidgetId::DeathTitleScreen,
+            lr(cx + 2, by, bw, 20),
+            tr(lang, "Title Screen", "タイトル画面へ"),
         );
     }
 }

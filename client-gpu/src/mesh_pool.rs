@@ -821,7 +821,7 @@ mod tests {
     /// is unchanged by compact extraction.
     #[test]
     fn compact_splat_matches_legacy_grid_and_verdicts_bit_exact() {
-        let mut rng = Rng(0x485A5F_5241_4D45);
+        let mut rng = Rng(0x0048_5A5F_5241_4D45);
         let view_projs = [
             test_view_proj(1.0, 0.5),
             test_view_proj(0.25, 1.0),

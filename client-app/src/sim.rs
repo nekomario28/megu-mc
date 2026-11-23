@@ -617,6 +617,11 @@ struct SessionRunner {
     keep_alives: u64,
     health: f32,
     food: i32,
+    /// Death & respawn loop state — gates the tick loop's movement
+    /// packets and drives the headless `PERFORM_RESPAWN` auto-request.
+    death: crate::session::DeathLoopState,
+    /// Ticks until an unacknowledged respawn request is retried.
+    death_retry: u32,
     /// `system_chat` packets seen this session — retained so a live session
     /// can surface chat/decoded-component coverage in diagnostics.
     system_chats: u64,
@@ -625,10 +630,15 @@ struct SessionRunner {
 
 impl SessionRunner {
     fn handle_event(&mut self, event: PlayEvent) -> Result<(), String> {
+        // The death tracker sees every play event first: `JoinGame`
+        // seeds `hardcore`, `player_combat_kill`/`set_health(<=0)` mark
+        // death, and `respawn`/`set_health(>0)` clear it.
+        self.death.apply(&event);
         match event {
             PlayEvent::JoinGame {
                 entity_id,
                 dimension,
+                ..
             } => {
                 self.entity_id = entity_id;
                 self.play_ok = true;
@@ -834,6 +844,8 @@ fn run_session_inner(
         keep_alives: 0,
         health: 20.0,
         food: 20,
+        death: crate::session::DeathLoopState::default(),
+        death_retry: 0,
         system_chats: 0,
         last_chunk_at: None,
     };
@@ -902,7 +914,21 @@ fn run_session_inner(
         let input = script_input(cfg.script, tick, runner.player.on_ground);
         let outcome = runner.player.step(&runner.world, input)?;
 
-        if cfg.script == ScriptMode::Survey {
+        if runner.death.is_dead() {
+            // Vanilla sends no movement while dead. The headless runner
+            // stands in for the DeathScreen's Respawn button: issue
+            // `client_command(PERFORM_RESPAWN)` once — hardcore deaths
+            // never request (vanilla offers no respawn there) — and
+            // retry slowly while the server leaves it unacknowledged.
+            if runner.death.can_request_respawn()
+                || (runner.death.respawn_pending() && runner.death_retry == 0)
+            {
+                runner.client.send_perform_respawn()?;
+                runner.death.note_respawn_sent();
+                runner.death_retry = 40;
+            }
+            runner.death_retry = runner.death_retry.saturating_sub(1);
+        } else if cfg.script == ScriptMode::Survey {
             runner.client.send_player_position_rotation(
                 outcome.pos[0],
                 outcome.pos[1],

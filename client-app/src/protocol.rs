@@ -1512,6 +1512,9 @@ pub enum PlayEvent {
     JoinGame {
         entity_id: i32,
         dimension: DimensionMeta,
+        /// `login.is_hardcore` — the death screen switches to the
+        /// hardcore "Game over!" / spectate-only variant on this.
+        hardcore: bool,
     },
     Respawn {
         dimension: DimensionMeta,
@@ -2225,6 +2228,8 @@ pub struct EquipmentEntry {
 }
 
 /// Opt-in play receiver result with decoded clientbound custom payloads.
+// `Play` is the hot variant; boxing it would put an allocation on every frame.
+#[allow(clippy::large_enum_variant)]
 #[derive(Clone, Debug)]
 pub enum ClientPlayEvent {
     Play(PlayEvent),
@@ -4221,6 +4226,15 @@ pub fn encode_use_item_on(
     ("use_item_on", p)
 }
 
+/// `client_command` — the play-phase server-bound command the death
+/// screen rides on (C2S `0x09` on 767): action `0` = `PERFORM_RESPAWN`,
+/// action `1` = `REQUEST_STATS`. The body is a single VarInt action.
+pub fn encode_client_command(action: i32) -> (&'static str, Vec<u8>) {
+    let mut p = Vec::with_capacity(5);
+    write_varint(&mut p, action);
+    ("client_command", p)
+}
+
 /// `use_item` — use item in air. `yaw`/`pitch` are the player look angles.
 pub fn encode_use_item(hand: i32, sequence: i32, yaw: f32, pitch: f32) -> (&'static str, Vec<u8>) {
     let mut p = Vec::with_capacity(15);
@@ -5372,6 +5386,20 @@ impl ProtocolClient {
         self.send_named(PacketPhase::Play, name, &payload)
     }
 
+    /// `client_command` — play-phase command varint (`0` = perform
+    /// respawn, `1` = request stats); resolves to C2S `0x09` on 767 and
+    /// `0x0c` on 777 via the packet table.
+    pub fn send_client_command(&mut self, action: i32) -> Result<(), String> {
+        let (name, payload) = encode_client_command(action);
+        self.send_named(PacketPhase::Play, name, &payload)
+    }
+
+    /// Death-screen `Respawn` button: `client_command` with the
+    /// `PERFORM_RESPAWN` action (`0`).
+    pub fn send_perform_respawn(&mut self) -> Result<(), String> {
+        self.send_client_command(0)
+    }
+
     /// `edit_book` — writable-book edits on the stack in `slot`.
     pub fn send_edit_book(
         &mut self,
@@ -5711,7 +5739,7 @@ impl ProtocolClient {
             Some("login") => {
                 let mut r = WireReader::new(body);
                 let entity_id = r.read_i32()?;
-                let _is_hardcore = r.read_bool()?;
+                let is_hardcore = r.read_bool()?;
                 let dim_count = usize::try_from(r.read_varint()?)
                     .map_err(|_| "negative dimension count".to_string())?;
                 for _ in 0..dim_count {
@@ -5733,6 +5761,7 @@ impl ProtocolClient {
                 Ok(PlayEvent::JoinGame {
                     entity_id,
                     dimension,
+                    hardcore: is_hardcore,
                 })
             }
             Some("respawn") => {

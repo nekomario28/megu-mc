@@ -57,6 +57,12 @@ fn all_screens(ui: &mut UiState) -> Vec<Screen> {
     ui.mod_menu = demo_mod_menu();
     ui.recipe_browser = demo_recipe_browser();
     ui.singleplayer.worlds = vec!["First World".into(), "Second World".into()];
+    ui.death = megu_client_ui::death_screen::DeathScreenState {
+        cause_message: Some("Tester was slain by Creeper".to_string()),
+        score: 340,
+        hardcore: false,
+        respawn_cooldown_ticks: 0,
+    };
     vec![
         Screen::Title,
         Screen::Singleplayer,
@@ -72,6 +78,7 @@ fn all_screens(ui: &mut UiState) -> Vec<Screen> {
         Screen::ModMenu,
         Screen::RecipeBrowser,
         Screen::InGameHud,
+        Screen::Death,
         Screen::Pause,
         Screen::CrashRecovery,
     ]
@@ -1739,4 +1746,117 @@ fn unifont_loader_fails_closed_on_bad_input() {
     // Oversized whole input (bound is 8 MiB).
     let huge = "0041:0000000018242442427E424242420000\n".repeat(300_000);
     assert!(GlyphAtlas::load_unifont_hex(&huge).is_err());
+}
+
+// ---------------------------------------------------------------------------
+// Death & respawn screen
+// ---------------------------------------------------------------------------
+
+/// The full UI half of the death loop: `show_death` puts the leaf up,
+/// Escape is inert, `Respawn` emits `UiAction::PerformRespawn` (the
+/// screen stays up for the host's server-recovery sync to clear), and
+/// `Title Screen` emits `UiAction::LeaveWorld` + lands on Title.
+#[test]
+fn death_screen_respawn_and_title_flow() {
+    use megu_client_ui::death_screen::DeathScreenState;
+
+    let mut ui = UiState::new();
+    ui.navigate(Screen::InGameHud);
+    ui.show_death(DeathScreenState {
+        cause_message: Some("Tester was slain by Creeper".to_string()),
+        score: 340,
+        hardcore: false,
+        respawn_cooldown_ticks: 0,
+    });
+    assert_eq!(ui.screen, Screen::Death);
+
+    // The death leaf is absorbing: Escape neither navigates nor emits.
+    let actions = ui.handle_input(UiInputEvent::KeyPressed(UiKey::Escape));
+    assert!(actions.is_empty());
+    assert_eq!(ui.screen, Screen::Death);
+
+    ui.render(1280, 720);
+    let respawn = ui
+        .hit_regions
+        .iter()
+        .find(|r| r.id == WidgetId::DeathRespawn)
+        .copied()
+        .expect("respawn button region");
+    let actions = ui.handle_input(UiInputEvent::Click {
+        x: respawn.rect.x + 2,
+        y: respawn.rect.y + 2,
+    });
+    assert_eq!(actions, vec![UiAction::PerformRespawn]);
+    // Still dead: only the host's respawn/health recovery clears it.
+    assert_eq!(ui.screen, Screen::Death);
+
+    let title = ui
+        .hit_regions
+        .iter()
+        .find(|r| r.id == WidgetId::DeathTitleScreen)
+        .copied()
+        .expect("title button region");
+    let actions = ui.handle_input(UiInputEvent::Click {
+        x: title.rect.x + 2,
+        y: title.rect.y + 2,
+    });
+    assert_eq!(actions, vec![UiAction::LeaveWorld]);
+    assert_eq!(ui.screen, Screen::Title);
+}
+
+/// Hardcore deaths are spectate-only: the respawn button renders
+/// disabled (no hit region at all) so no `PERFORM_RESPAWN` can leak,
+/// and `Title Screen` is the only live control.
+#[test]
+fn death_screen_hardcore_disables_respawn() {
+    use megu_client_ui::death_screen::DeathScreenState;
+
+    let mut ui = UiState::new();
+    ui.show_death(DeathScreenState {
+        hardcore: true,
+        ..DeathScreenState::default()
+    });
+    ui.render(1280, 720);
+    assert!(
+        !ui.hit_regions.iter().any(|r| r.id == WidgetId::DeathRespawn),
+        "hardcore death must not offer a live respawn button"
+    );
+    assert!(
+        ui.hit_regions
+            .iter()
+            .any(|r| r.id == WidgetId::DeathTitleScreen),
+        "hardcore death keeps the Title Screen escape"
+    );
+
+    // Same guarantee while the respawn cooldown ticks.
+    let mut ui = UiState::new();
+    ui.show_death(DeathScreenState {
+        respawn_cooldown_ticks: 5,
+        ..DeathScreenState::default()
+    });
+    ui.render(1280, 720);
+    assert!(
+        !ui.hit_regions.iter().any(|r| r.id == WidgetId::DeathRespawn),
+        "cooldown must disable the respawn button"
+    );
+    ui.update_death(DeathScreenState::default());
+    ui.render(1280, 720);
+    assert!(
+        ui.hit_regions.iter().any(|r| r.id == WidgetId::DeathRespawn),
+        "expired cooldown re-enables respawn"
+    );
+}
+
+/// `clear_death` lands back on the HUD — the exact transition the window
+/// drives when the server's `respawn`/`set_health(>0)` arrives.
+#[test]
+fn death_screen_clear_returns_to_hud() {
+    use megu_client_ui::death_screen::DeathScreenState;
+
+    let mut ui = UiState::new();
+    ui.show_death(DeathScreenState::default());
+    assert_eq!(ui.screen, Screen::Death);
+    ui.clear_death();
+    assert_eq!(ui.screen, Screen::InGameHud);
+    assert!(ui.death.cause_message.is_none());
 }

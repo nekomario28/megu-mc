@@ -1729,6 +1729,7 @@ fn protocol777_chunk_blockupdate_chat_disconnect_render_e2e() {
             PlayEvent::JoinGame {
                 entity_id,
                 dimension,
+                ..
             } => {
                 assert_eq!(entity_id, 11);
                 assert_eq!(dimension.section_count(), 24);
@@ -2104,4 +2105,347 @@ fn cli_ping_flag_parses_and_marks_session_action() {
     let cfg = parse_args(&["--ping=example.org:1234"]).unwrap();
     assert_eq!(cfg.ping.as_deref(), Some("example.org:1234"));
     assert!(parse_args(&["--ping"]).is_err());
+}
+
+// ---------------------------------------------------------------------------
+// Lane: death & respawn vertical loop (Protocol 767)
+// ---------------------------------------------------------------------------
+
+/// `client_command` encode: the death screen's `PERFORM_RESPAWN` is a
+/// single VarInt `0` body under the canonical packet name.
+#[test]
+fn client_command_perform_respawn_wire_bytes() {
+    let (name, payload) = megu_client::protocol::encode_client_command(0);
+    assert_eq!(name, "client_command");
+    assert_eq!(payload, vec![0x00], "PERFORM_RESPAWN is VarInt action 0");
+    let (name, payload) = megu_client::protocol::encode_client_command(1);
+    assert_eq!(name, "client_command");
+    assert_eq!(payload, vec![0x01], "REQUEST_STATS is VarInt action 1");
+}
+
+/// Death-tracker unit coverage on decoded events (no socket):
+/// `JoinGame.hardcore` seeds the flag, `player_combat_kill` and the
+/// `set_health(<=0)` fallback mark death, `respawn`/`set_health(>0)`
+/// clear it, and `set_experience` feeds the Score line.
+#[test]
+fn death_loop_state_tracks_kill_health_and_recovery() {
+    use megu_client::session::DeathLoopState;
+
+    let mut death = DeathLoopState::default();
+    assert!(!death.is_dead());
+
+    death.apply(&PlayEvent::JoinGame {
+        entity_id: 11,
+        dimension: DimensionMeta::default(),
+        hardcore: false,
+    });
+    assert!(!death.hardcore());
+
+    death.apply(&PlayEvent::SetExperience {
+        bar: 0.5,
+        level: 12,
+        total: 340,
+    });
+    assert_eq!(death.score(), 340);
+
+    // Fallback path first: a zero-health update with no kill packet in
+    // sight still marks the player dead (showDeathMessages-off servers).
+    death.apply(&PlayEvent::SetHealth {
+        health: 0.0,
+        food: 19,
+        saturation: 4.5,
+    });
+    assert!(death.is_dead(), "set_health(0.0) must mark death");
+    assert!(death.cause_message().is_none());
+    assert!(death.can_request_respawn());
+
+    // The kill packet enriches the state: victim id + plain-text cause.
+    let mut kill_nbt = vec![10u8]; // TAG_Compound
+    kill_nbt.push(8); // TAG_String
+    kill_nbt.extend_from_slice(&4u16.to_be_bytes());
+    kill_nbt.extend_from_slice(b"text");
+    let msg = "Tester was slain by Creeper";
+    kill_nbt.extend_from_slice(&(msg.len() as u16).to_be_bytes());
+    kill_nbt.extend_from_slice(msg.as_bytes());
+    kill_nbt.push(0);
+    death.apply(&PlayEvent::PlayerCombatKill {
+        player_id: 11,
+        message_nbt: kill_nbt,
+    });
+    assert!(death.is_dead());
+    assert_eq!(death.killed_entity_id(), Some(11));
+    assert_eq!(death.cause_message(), Some(msg));
+
+    death.note_respawn_sent();
+    assert!(death.respawn_pending());
+    assert!(!death.can_request_respawn());
+    assert_eq!(death.respawn_requests(), 1);
+
+    // Recovery via respawn clears everything.
+    death.apply(&PlayEvent::Respawn {
+        dimension: DimensionMeta::default(),
+    });
+    assert!(!death.is_dead());
+    assert!(!death.respawn_pending());
+    assert!(death.cause_message().is_none());
+
+    // ...and via positive health without a respawn packet.
+    death.apply(&PlayEvent::SetHealth {
+        health: 0.0,
+        food: 19,
+        saturation: 4.5,
+    });
+    assert!(death.is_dead());
+    death.apply(&PlayEvent::SetHealth {
+        health: 20.0,
+        food: 20,
+        saturation: 5.0,
+    });
+    assert!(!death.is_dead(), "positive health clears death");
+
+    // Hardcore join: respawn is never legitimate.
+    death.apply(&PlayEvent::JoinGame {
+        entity_id: 11,
+        dimension: DimensionMeta::default(),
+        hardcore: true,
+    });
+    death.apply(&PlayEvent::SetHealth {
+        health: 0.0,
+        food: 20,
+        saturation: 5.0,
+    });
+    assert!(death.is_dead());
+    assert!(!death.can_request_respawn(), "hardcore never respawns");
+}
+
+/// Mock 767 server running the whole death loop on the wire: play
+/// `login` -> `set_experience` -> `set_health(0.0)` ->
+/// `player_combat_kill` (0x3c, anonymous-NBT message) <- client's
+/// `client_command` (0x09, VarInt 0) -> `respawn` (0x47) ->
+/// `set_health(20.0)`. Packet ids come from the builtin 767 table —
+/// `0x3b` is `player_combat_enter` (empty body); the kill packet is
+/// `0x3c`.
+#[test]
+fn protocol767_death_respawn_loop_mock_server() {
+    use megu_client::session::DeathLoopState;
+    use megu_proto::{PacketDir, PacketPhase, ProtocolTable};
+
+    let t767 = ProtocolTable::v767_builtin();
+    let s2c = |name: &'static str| {
+        t767
+            .packet_id(PacketPhase::Play, PacketDir::Clientbound, name)
+            .unwrap() as i32
+    };
+    let c2s = |name: &'static str| {
+        t767
+            .packet_id(PacketPhase::Play, PacketDir::Serverbound, name)
+            .unwrap() as i32
+    };
+    let login_pid = s2c("login");
+    let kill_pid = s2c("player_combat_kill");
+    let respawn_pid = s2c("respawn");
+    let set_xp_pid = s2c("set_experience");
+    let set_health_pid = s2c("set_health");
+    let disconnect_pid = s2c("disconnect");
+    let client_command_pid = c2s("client_command");
+    assert_eq!(login_pid, 0x2b);
+    assert_eq!(s2c("player_combat_enter"), 0x3b);
+    assert_eq!(kill_pid, 0x3c);
+    assert_eq!(respawn_pid, 0x47);
+    assert_eq!(set_xp_pid, 0x5c);
+    assert_eq!(set_health_pid, 0x5d);
+    assert_eq!(client_command_pid, 0x09);
+
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind loopback");
+    let port = listener.local_addr().unwrap().port();
+
+    let server = thread::spawn(move || {
+        let (mut sock, _) = listener.accept().expect("accept");
+        sock.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+        let send = |sock: &mut std::net::TcpStream, pid: i32, body: &[u8]| {
+            sock.write_all(&encode_packet(pid, body, None)).unwrap();
+        };
+
+        // Handshake + Login Start -> Login Success -> Login Ack.
+        let (pid, _) = read_mock_frame(&mut sock);
+        assert_eq!(pid, 0x00);
+        let (pid, _) = read_mock_frame(&mut sock);
+        assert_eq!(pid, 0x00);
+        let mut ls = Vec::new();
+        ls.extend_from_slice(&offline_uuid("Tester"));
+        write_string(&mut ls, "Tester");
+        write_varint(&mut ls, 0);
+        ls.push(0);
+        send(&mut sock, 0x02, &ls);
+        let (pid, _) = read_mock_frame(&mut sock);
+        assert_eq!(pid, 0x03);
+
+        // Configuration: keep_alive echo, known_packs, finish ack.
+        send(&mut sock, 0x04, &42i64.to_be_bytes());
+        let (pid, ka) = read_mock_frame(&mut sock);
+        assert_eq!(pid, 0x04);
+        assert_eq!(ka, 42i64.to_be_bytes());
+        let mut kp = Vec::new();
+        write_varint(&mut kp, 0);
+        send(&mut sock, 0x0e, &kp);
+        let (pid, _) = read_mock_frame(&mut sock);
+        assert_eq!(pid, 0x00); // client_information
+        let (pid, _) = read_mock_frame(&mut sock);
+        assert_eq!(pid, 0x07); // select_known_packs
+        send(&mut sock, 0x03, &[]);
+        let (pid, _) = read_mock_frame(&mut sock);
+        assert_eq!(pid, 0x03); // finish_configuration ack
+
+        // Play login (0x2b): entity 11, non-hardcore, one overworld.
+        let mut jg = Vec::new();
+        jg.extend_from_slice(&11i32.to_be_bytes());
+        jg.push(0); // hardcore = false
+        write_varint(&mut jg, 1);
+        write_string(&mut jg, "minecraft:overworld");
+        write_varint(&mut jg, 20); // max players
+        write_varint(&mut jg, 8); // view distance
+        write_varint(&mut jg, 8); // simulation distance
+        jg.push(0); // reduced debug
+        jg.push(0); // show death screen
+        jg.push(0); // limited crafting
+        write_varint(&mut jg, 0); // dimension type id
+        write_string(&mut jg, "minecraft:overworld");
+        jg.extend_from_slice(&0i64.to_be_bytes()); // hashed seed
+        jg.push(0); // game mode: survival
+        jg.push(0); // previous game mode
+        jg.push(0); // debug
+        jg.push(0); // flat
+        jg.push(0); // last death location absent
+        write_varint(&mut jg, 0); // portal cooldown
+        jg.push(0); // enforces secure chat
+        send(&mut sock, login_pid, &jg);
+
+        // XP total 340 (the death screen's Score line).
+        let mut xp = Vec::new();
+        xp.extend_from_slice(&0.5f32.to_be_bytes());
+        write_varint(&mut xp, 12); // level
+        write_varint(&mut xp, 340); // total
+        send(&mut sock, set_xp_pid, &xp);
+
+        // Lethal set_health first (the showDeathMessages-off fallback),
+        // then the kill packet with the death message.
+        let mut sh = Vec::new();
+        sh.extend_from_slice(&0.0f32.to_be_bytes());
+        write_varint(&mut sh, 19); // food
+        sh.extend_from_slice(&4.5f32.to_be_bytes());
+        send(&mut sock, set_health_pid, &sh);
+
+        let mut kill = Vec::new();
+        write_varint(&mut kill, 11); // victim entity id
+        kill.extend_from_slice(&nbt_text_component("Tester was slain by Creeper"));
+        send(&mut sock, kill_pid, &kill);
+
+        // The client answers the death screen's Respawn with
+        // `client_command` 0x09 carrying VarInt action 0.
+        let (pid, body) = read_mock_frame(&mut sock);
+        assert_eq!(pid, client_command_pid, "expected client_command 0x09");
+        assert_eq!(body, vec![0x00], "PERFORM_RESPAWN is VarInt action 0");
+
+        // Recovery: respawn into overworld + full health.
+        let mut rs = Vec::new();
+        write_varint(&mut rs, 0); // dimension type id
+        write_string(&mut rs, "minecraft:overworld");
+        rs.extend_from_slice(&0i64.to_be_bytes()); // hashed seed
+        rs.push(0); // game mode
+        rs.push(0); // previous game mode
+        rs.push(0); // debug
+        rs.push(0); // flat
+        rs.push(0); // last death location absent
+        write_varint(&mut rs, 0); // portal cooldown
+        rs.push(0); // data kept: none
+        send(&mut sock, respawn_pid, &rs);
+
+        let mut hp = Vec::new();
+        hp.extend_from_slice(&20.0f32.to_be_bytes());
+        write_varint(&mut hp, 20);
+        hp.extend_from_slice(&5.0f32.to_be_bytes());
+        send(&mut sock, set_health_pid, &hp);
+
+        send(&mut sock, disconnect_pid, &nbt_text_component("bye"));
+    });
+
+    let (mut cli, report) = ProtocolClient::connect(
+        "127.0.0.1",
+        port,
+        "Tester",
+        offline_uuid("Tester"),
+        2,
+        Duration::from_secs(5),
+    )
+    .expect("connect");
+    assert!(report.login_ok && report.config_ok);
+
+    let mut death = DeathLoopState::default();
+    let mut phase = 0u8; // 0 login, 1 dead, 2 kill seen, 3 recovered
+    while phase < 3 {
+        let event = cli
+            .recv_play(Duration::from_secs(5))
+            .unwrap()
+            .expect("mock server keeps sending");
+        death.apply(&event);
+        match event {
+            PlayEvent::JoinGame {
+                entity_id,
+                hardcore,
+                ..
+            } => {
+                assert_eq!(entity_id, 11);
+                assert!(!hardcore);
+                assert!(!death.is_dead());
+            }
+            PlayEvent::SetExperience { total, .. } => {
+                assert_eq!(total, 340);
+                assert_eq!(death.score(), 340);
+            }
+            PlayEvent::SetHealth { health, .. } => {
+                if health <= 0.0 {
+                    // Fallback fired before the kill packet arrived.
+                    assert!(death.is_dead());
+                    assert!(death.cause_message().is_none());
+                    phase = 1;
+                } else {
+                    assert!(!death.is_dead(), "positive health clears death");
+                    assert!(!death.respawn_pending());
+                    phase = 3;
+                }
+            }
+            PlayEvent::PlayerCombatKill {
+                player_id,
+                message_nbt,
+            } => {
+                assert_eq!(phase, 1, "kill lands after set_health(0)");
+                assert_eq!(player_id, 11);
+                assert!(death.is_dead());
+                assert_eq!(
+                    death.cause_message(),
+                    Some("Tester was slain by Creeper")
+                );
+                assert_eq!(death.killed_entity_id(), Some(11));
+                // NBT bytes themselves also decode standalone.
+                let text = WireReader::new(&message_nbt)
+                    .read_nbt()
+                    .unwrap()
+                    .extract_text();
+                assert_eq!(text, "Tester was slain by Creeper");
+                // Respawn click: dead + non-hardcore + nothing pending.
+                assert!(death.can_request_respawn());
+                cli.send_perform_respawn().unwrap();
+                death.note_respawn_sent();
+                assert!(death.respawn_pending());
+                assert_eq!(death.respawn_requests(), 1);
+                phase = 2;
+            }
+            PlayEvent::Respawn { .. } => {
+                assert_eq!(phase, 2);
+                assert!(!death.is_dead(), "respawn packet clears death");
+            }
+            other => panic!("unexpected play event: {other:?}"),
+        }
+    }
+    server.join().unwrap();
 }

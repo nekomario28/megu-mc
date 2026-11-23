@@ -920,9 +920,39 @@ impl GpuApp {
                 }
             }
             UiAction::SubmitCrashReport => self.handle_submit_crash_report(),
+            UiAction::PerformRespawn => {
+                // The death screen stays up until the server's
+                // respawn/health recovery clears `live.death`; only the
+                // packet dispatch happens here. A refused request
+                // surfaces on the status line instead of failing silent.
+                let sent = self
+                    .live
+                    .as_mut()
+                    .is_some_and(|live| live.request_respawn());
+                if !sent {
+                    self.status_line("Respawn: request not available");
+                }
+            }
+            UiAction::LeaveWorld => self.leave_world_for_title(),
             UiAction::RecipeBrowser(action) => self.dispatch_recipe_browser_action(action),
             _ => {}
         }
+    }
+
+    /// Death-screen `Title Screen` button (also the only escape on
+    /// hardcore deaths): drop the live session — and the integrated
+    /// `megu` child when it hosted the world — plus every in-game
+    /// overlay. The UI already navigated to `Screen::Title` inside
+    /// `activate`.
+    fn leave_world_for_title(&mut self) {
+        self.live = None;
+        self.singleplayer_server = None;
+        self.container_screen = None;
+        self.chat_bar = None;
+        self.advancements_open = false;
+        self.paused = false;
+        self.keys = Keys::default();
+        self.maybe_regrab();
     }
 
     /// Persist a redacted local crash report on explicit user confirmation from
@@ -1957,6 +1987,39 @@ impl GpuApp {
         }
     }
 
+    /// Death loop: `player_combat_kill`/`set_health(<=0)` flipped
+    /// `live.death` dead -> put the death screen up (refreshing the
+    /// cause/score line while it stays up); `respawn`/`set_health(>0)`
+    /// clears it back onto the HUD. The screen replaces
+    /// pause/inventory/chat overlays — those belong to the living
+    /// player. Called from `render_frame` before the occlusion
+    /// early-return so a hidden frame can never miss the transition.
+    fn sync_death_screen(&mut self) {
+        let Some(live) = &mut self.live else {
+            return;
+        };
+        match live.death_screen_state() {
+            Some(state) => {
+                if self.ui.screen == Screen::Death {
+                    self.ui.update_death(state);
+                } else {
+                    self.ui.show_death(state);
+                    self.paused = false;
+                    self.container_screen = None;
+                    self.chat_bar = None;
+                    self.advancements_open = false;
+                    self.keys = Keys::default();
+                    self.maybe_regrab();
+                }
+            }
+            None if self.ui.screen == Screen::Death => {
+                self.ui.clear_death();
+                self.maybe_regrab();
+            }
+            None => {}
+        }
+    }
+
     /// Mirror the live session's server-driven HUD channels into the UI
     /// tree so `ui.render` composites them: sidebar `ScoreboardState`
     /// (display slot 1), `TitleOverlayState` (re-armed on `title_revision`
@@ -2061,10 +2124,14 @@ impl GpuApp {
                 self.camera.pitch_deg = (-pose.pitch).clamp(-89.9, 89.9);
             }
         }
+        self.sync_death_screen();
         self.sync_container_screen();
 
-        // Camera movement only applies while unpaused and grabbed.
-        if !self.paused {
+        let player_dead = self.live.as_ref().is_some_and(|live| live.is_dead());
+        // Camera movement only applies while unpaused and alive — a dead
+        // player keeps its death pose until the server's respawn teleport
+        // lands via `camera_sync`.
+        if !self.paused && !player_dead {
             self.camera.apply_move(self.keys.move_input(), dt.min(0.1));
         }
         self.camera_controller
@@ -3443,5 +3510,134 @@ mod tests {
         // Steady state resumes skipping.
         assert!(!cache.should_upload(1920, 1080, 0xbbbb));
         assert_eq!(cache.ui_uploads_skipped, 1);
+    }
+
+    /// The window half of the death loop, driven through the same
+    /// `sync_death_screen`/`dispatch_ui_action` path `render_frame` and
+    /// the event handlers use: kill packet -> `Screen::Death` -> Respawn
+    /// click -> `client_command(0)` queued -> server recovery -> HUD.
+    #[test]
+    fn death_to_respawn_drives_screen_death_then_hud() {
+        use megu_client::protocol::{ClientPlayEvent, DimensionMeta, PlayEvent};
+
+        let mut app = GpuApp::new(GpuCliConfig::default());
+        // A real outgoing channel pair: the receiver end must stay alive
+        // or `request_respawn`'s `try_send` fails as disconnected.
+        let (_tx, incoming) = std::sync::mpsc::sync_channel(8);
+        let (outgoing, _rx) = std::sync::mpsc::sync_channel(8);
+        let mut live = LiveSession::with_channels(incoming, outgoing);
+        live.status = SessionStatus::Playing;
+        live.pose = Some(PlayerPose {
+            feet: [0.0; 3],
+            yaw: 0.0,
+            pitch: 0.0,
+        });
+        app.attach_live(live);
+        app.ui.screen = Screen::InGameHud;
+
+        // Anonymous-NBT `{"text":"..."}` — the kill packet's message.
+        let mut kill_nbt = vec![10u8, 8];
+        kill_nbt.extend_from_slice(&4u16.to_be_bytes());
+        kill_nbt.extend_from_slice(b"text");
+        let msg = "Tester was slain by Creeper";
+        kill_nbt.extend_from_slice(&(msg.len() as u16).to_be_bytes());
+        kill_nbt.extend_from_slice(msg.as_bytes());
+        kill_nbt.push(0);
+        app.live
+            .as_mut()
+            .unwrap()
+            .apply_event(ClientPlayEvent::Play(PlayEvent::PlayerCombatKill {
+                player_id: 11,
+                message_nbt: kill_nbt,
+            }))
+            .unwrap();
+
+        // The per-frame sync turns death into Screen::Death with the
+        // decoded cause; the cursor policy un-grabs (not InGameHud).
+        app.sync_death_screen();
+        assert_eq!(app.ui.screen, Screen::Death);
+        assert_eq!(app.ui.death.cause_message.as_deref(), Some(msg));
+        assert!(!app.wants_cursor_grab());
+        assert!(app.ui_wants_input());
+
+        // Respawn click -> UiAction::PerformRespawn -> the host queues
+        // `client_command(0)` (`respawn_pending` proves dispatch; the
+        // WorkerCommand variant itself is covered in live_session tests).
+        app.ui.render(1280, 720);
+        let region = app
+            .ui
+            .hit_regions
+            .iter()
+            .find(|r| r.id == megu_ui::state::WidgetId::DeathRespawn)
+            .copied()
+            .expect("respawn button region");
+        let actions = app.ui.handle_input(UiInputEvent::Click {
+            x: region.rect.x + 2,
+            y: region.rect.y + 2,
+        });
+        assert_eq!(actions, vec![UiAction::PerformRespawn]);
+        for action in &actions {
+            app.dispatch_ui_action(action);
+        }
+        assert!(
+            app.live.as_ref().unwrap().death.respawn_pending(),
+            "PerformRespawn dispatch must queue the packet"
+        );
+        // Still dead — nothing marked the player alive yet.
+        app.sync_death_screen();
+        assert_eq!(app.ui.screen, Screen::Death);
+
+        // Server recovery clears death; the next sync returns to the HUD.
+        app.live
+            .as_mut()
+            .unwrap()
+            .apply_event(ClientPlayEvent::Play(PlayEvent::Respawn {
+                dimension: DimensionMeta::default(),
+            }))
+            .unwrap();
+        app.live
+            .as_mut()
+            .unwrap()
+            .apply_event(ClientPlayEvent::Play(PlayEvent::SetHealth {
+                health: 20.0,
+                food: 20,
+                saturation: 5.0,
+            }))
+            .unwrap();
+        app.sync_death_screen();
+        assert_eq!(app.ui.screen, Screen::InGameHud);
+        assert!(app.ui.death.cause_message.is_none());
+    }
+
+    /// `Title Screen` on the death leaf drops the live session — the
+    /// `LeaveWorld` action's whole job.
+    #[test]
+    fn death_screen_title_button_leaves_world() {
+        let mut app = GpuApp::new(GpuCliConfig::default());
+        let mut live = LiveSession::offline_with_null_audio();
+        live.status = SessionStatus::Playing;
+        app.attach_live(live);
+        app.ui.show_death(megu_ui::death_screen::DeathScreenState::default());
+
+        // The real click path: the widget emits `LeaveWorld` while the
+        // state machine navigates to Title; dispatch drops the session.
+        app.ui.render(1280, 720);
+        let region = app
+            .ui
+            .hit_regions
+            .iter()
+            .find(|r| r.id == megu_ui::state::WidgetId::DeathTitleScreen)
+            .copied()
+            .expect("title button region");
+        let actions = app.ui.handle_input(UiInputEvent::Click {
+            x: region.rect.x + 2,
+            y: region.rect.y + 2,
+        });
+        assert_eq!(actions, vec![UiAction::LeaveWorld]);
+        for action in &actions {
+            app.dispatch_ui_action(action);
+        }
+        assert!(app.live.is_none(), "LeaveWorld must drop the session");
+        assert_eq!(app.ui.screen, Screen::Title);
     }
 }

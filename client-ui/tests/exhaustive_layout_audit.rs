@@ -389,6 +389,7 @@ fn all_screens(ui: &mut UiState) -> Vec<Screen> {
         Screen::ModMenu,
         Screen::RecipeBrowser,
         Screen::InGameHud,
+        Screen::Death,
         Screen::Pause,
         Screen::CrashRecovery,
     ]);
@@ -787,6 +788,7 @@ fn every_screen_escapes_to_a_safe_place() {
         Screen::ModMenu,
         Screen::RecipeBrowser,
         Screen::InGameHud,
+        Screen::Death,
         Screen::Pause,
         Screen::CrashRecovery,
     ] {
@@ -802,8 +804,9 @@ fn every_screen_escapes_to_a_safe_place() {
         match screen {
             // In-game Escape opens the pause menu.
             Screen::InGameHud => assert_eq!(ui.screen, Screen::Pause),
-            // Pause and Title are absorbing states for Escape.
-            Screen::Pause | Screen::Title | Screen::CrashRecovery => {}
+            // Pause, Title, and Death are absorbing states for Escape
+            // (vanilla's DeathScreen has no back path).
+            Screen::Pause | Screen::Title | Screen::CrashRecovery | Screen::Death => {}
             // Every menu Escape backs out to Title.
             _ => assert_eq!(
                 ui.screen,
@@ -834,6 +837,10 @@ fn every_screen_has_back_or_close_widget() {
         ),
         (&[WidgetId::PauseBackToGame], Screen::Pause),
         (&[WidgetId::CrashReturnTitle], Screen::CrashRecovery),
+        (
+            &[WidgetId::DeathRespawn, WidgetId::DeathTitleScreen],
+            Screen::Death,
+        ),
     ];
     for &(w, h) in &SIZES {
         for (ids, screen) in back_widgets {

@@ -62,19 +62,7 @@
       "priority": "P2",
       "reason": "legacy subtitle rows never fed \u2014 subtitle_hud (fed via refresh_subtitle_hud) is the live channel"
     },
-    {
-      "check": "hud_state_writers",
-      "id": "HudState::xp_level",
-      "priority": "P0",
-      "reason": "set_experience is also unwired \u2014 XP level never reaches the HUD"
-    },
-    {
-      "check": "hud_state_writers",
-      "id": "HudState::xp_progress",
-      "priority": "P0",
-      "reason": "set_experience is also unwired \u2014 XP progress bar never fills"
-    },
-    {
+            {
       "check": "s2c_play_event_consumption",
       "id": "PlayEvent::AwardStats",
       "priority": "P2",
@@ -260,13 +248,7 @@
       "priority": "P1",
       "reason": "player_combat_enter drops \u2014 combat-window start ignored"
     },
-    {
-      "check": "s2c_play_event_consumption",
-      "id": "PlayEvent::PlayerCombatKill",
-      "priority": "P0",
-      "reason": "player_combat_kill is the vanilla death-screen trigger \u2014 dropped; DeathScreenState is also unwired"
-    },
-    {
+        {
       "check": "s2c_play_event_consumption",
       "id": "PlayEvent::PlayerLookAt",
       "priority": "P2",
@@ -380,13 +362,7 @@
       "priority": "P0",
       "reason": "set_entity_data drops \u2014 entity metadata (custom names, sneaking, glowing, pose) never applied"
     },
-    {
-      "check": "s2c_play_event_consumption",
-      "id": "PlayEvent::SetExperience",
-      "priority": "P0",
-      "reason": "set_experience drops \u2014 XP bar/level never update (HudState xp fields also unwired)"
-    },
-    {
+        {
       "check": "s2c_play_event_consumption",
       "id": "PlayEvent::SetPlayerTeam",
       "priority": "P1",
@@ -440,13 +416,7 @@
       "priority": "P1",
       "reason": "update_mob_effect drops \u2014 potion/status effects never shown"
     },
-    {
-      "check": "screen_state_reachability",
-      "id": "DeathScreenState",
-      "priority": "P0",
-      "reason": "dead screen \u2014 never referenced from client-gpu and player_combat_kill (its trigger) is also dropped"
-    },
-    {
+        {
       "check": "screen_state_reachability",
       "id": "Screen::AboutMegu",
       "priority": "P2",
