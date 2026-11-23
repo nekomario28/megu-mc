@@ -674,6 +674,45 @@ fn decodes_award_stats_server_data_chunks_biomes() {
 // ---------------------------------------------------------------------------
 
 #[test]
+fn clientbound_play_gap_decoders_cover_entity_tick_chat_and_ui_events() {
+    assert!(matches!(decode("animate", &cat(&[&vi(42), &[0]])), PlayEvent::Animate { eid: 42, animation: 0 }));
+    assert!(matches!(decode("set_chunk_cache_radius", &vi(12)), PlayEvent::SetChunkCacheRadius(12)));
+    assert!(matches!(decode("set_simulation_distance", &vi(8)), PlayEvent::SetSimulationDistance(8)));
+    assert!(matches!(decode("ticking_state", &cat(&[&be_f32(10.0), &[1]])), PlayEvent::TickingState { tick_rate: 10.0, frozen: true }));
+    assert!(matches!(decode("ticking_step", &vi(3)), PlayEvent::TickingStep { steps: 3 }));
+    assert!(matches!(decode("set_entity_link", &cat(&[&vi(4), &vi(5)])), PlayEvent::SetEntityLink { source: 4, destination: 5 }));
+    let mut attributes = cat(&[&vi(42), &vi(1), &vi(5), &be_f64(20.0), &vi(1)]);
+    attributes.extend([1u8; 16]);
+    attributes.extend(be_f64(1.5));
+    attributes.extend(vi(0));
+    assert!(matches!(decode("update_attributes", &attributes), PlayEvent::UpdateAttributes { eid: 42, attributes } if attributes[0].attribute == 5 && attributes[0].base == 20.0 && attributes[0].modifiers[0].amount == 1.5));
+    assert!(matches!(decode("cookie_request", &s("minecraft:settings")), PlayEvent::CookieRequest(key) if key == "minecraft:settings"));
+    let mut cookie = s("minecraft:settings");
+    cookie.extend(vi(2));
+    cookie.extend([0xaa, 0xbb]);
+    assert!(matches!(decode("store_cookie", &cookie), PlayEvent::StoreCookie { key, payload } if key == "minecraft:settings" && payload == [0xaa, 0xbb]));
+    assert!(matches!(decode("set_passengers", &cat(&[&vi(7), &vi(2), &vi(8), &vi(9)])), PlayEvent::SetPassengers { vehicle: 7, passengers } if passengers == [8, 9]));
+    assert!(matches!(decode("take_item_entity", &cat(&[&vi(11), &vi(12), &vi(2)])), PlayEvent::TakeItemEntity { item_entity: 11, player: 12, amount: 2 }));
+    assert!(matches!(decode("command_suggestions", &cat(&[&vi(3), &vi(1), &vi(2), &vi(1), &s("help"), &[0]])), PlayEvent::CommandSuggestions { transaction_id: 3, start: 1, length: 2, matches } if matches[0].text == "help"));
+
+    let mut chat = vec![7; 16];
+    chat.extend_from_slice(&vi(0));
+    chat.push(0);
+    chat.extend_from_slice(&s("hello"));
+    chat.extend_from_slice(&be_i64(123));
+    chat.extend_from_slice(&be_i64(456));
+    chat.extend_from_slice(&vi(0));
+    chat.extend_from_slice(&[0, 0, 0]);
+    chat.push(0);
+    chat.extend_from_slice(&vi(0));
+    chat.extend_from_slice(&vi(1));
+    chat.extend_from_slice(&chat_text_nbt("sender"));
+    chat.push(0);
+    assert!(matches!(decode("player_chat", &chat), PlayEvent::PlayerChat { text, .. } if text == "hello"));
+    assert!(matches!(decode("delete_chat", &vi(6)), PlayEvent::DeleteChat { message_index: Some(5), signature: None }));
+}
+
+#[test]
 fn new_s2c_decoders_fail_closed_on_truncation_and_hostile_counts() {
     let bodies: &[(&str, Vec<u8>)] = &[
         ("pong_response", be_i64(1).to_vec()),

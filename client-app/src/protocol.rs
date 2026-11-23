@@ -1857,6 +1857,127 @@ pub enum PlayEvent {
         new_diameter: f64,
         lerp_ms: i64,
     },
+    SetBorderWarningDelay {
+        warning_time: i32,
+    },
+    SetBorderWarningDistance {
+        warning_blocks: i32,
+    },
+    Animate {
+        eid: i32,
+        animation: u8,
+    },
+    BlockEvent {
+        pos: [i32; 3],
+        action: u8,
+        parameter: u8,
+        block_type: i32,
+    },
+    SetDefaultSpawnPosition {
+        pos: [i32; 3],
+        angle: f32,
+    },
+    SetChunkCacheRadius(i32),
+    SetSimulationDistance(i32),
+    TickingState {
+        tick_rate: f32,
+        frozen: bool,
+    },
+    TickingStep {
+        steps: i32,
+    },
+    MoveVehicle {
+        x: f64,
+        y: f64,
+        z: f64,
+        yaw: f32,
+        pitch: f32,
+    },
+    SetPassengers {
+        vehicle: i32,
+        passengers: Vec<i32>,
+    },
+    SetEntityLink {
+        source: i32,
+        destination: i32,
+    },
+    TakeItemEntity {
+        item_entity: i32,
+        player: i32,
+        amount: i32,
+    },
+    UpdateAttributes {
+        eid: i32,
+        attributes: Vec<WireAttribute>,
+    },
+    SetCamera {
+        eid: i32,
+    },
+    OpenBook {
+        hand: u8,
+    },
+    OpenSignEditor {
+        pos: [i32; 3],
+        front_side: bool,
+    },
+    TabList {
+        header_nbt: Vec<u8>,
+        footer_nbt: Vec<u8>,
+    },
+    CommandSuggestions {
+        transaction_id: i32,
+        start: i32,
+        length: i32,
+        matches: Vec<WireSuggestion>,
+    },
+    PlayerChat {
+        sender: [u8; 16],
+        index: i32,
+        signature: Option<[u8; 256]>,
+        text: String,
+        nbt_bytes: Vec<u8>,
+    },
+    DisguisedChat {
+        text: String,
+        nbt_bytes: Vec<u8>,
+    },
+    ChatCompletions {
+        action: i32,
+        entries: Vec<String>,
+    },
+    Ping(i32),
+    CookieRequest(String),
+    PlaceGhostRecipe {
+        window_id: u8,
+        recipe: String,
+    },
+    TagQuery {
+        transaction_id: i32,
+        nbt_bytes: Vec<u8>,
+    },
+    SetProjectilePower {
+        eid: i32,
+        acceleration: f64,
+    },
+    CustomReportDetails(Vec<(String, String)>),
+    ServerLinks(Vec<WireServerLink>),
+    BlockChangedAck(i32),
+    ChangeDifficulty { difficulty: u8, locked: bool },
+    ClearTitles,
+    Cooldown { item: i32, ticks: i32 },
+    PlayerAbilities { flags: u8, flying_speed: f32, walking_speed: f32 },
+    PlayerCombatEnd { duration: i32 },
+    PlayerCombatEnter,
+    PlayerCombatKill { player_id: i32, message_nbt: Vec<u8> },
+    ResourcePackPop { uuid: Option<[u8; 16]> },
+    ResourcePackPush { uuid: [u8; 16], url: String, hash: String, forced: bool, prompt_nbt: Option<Vec<u8>> },
+    SetCarriedItem(i16),
+    StoreCookie { key: String, payload: Vec<u8> },
+    ResetChat,
+    DeleteChat {
+        message_index: Option<i32>,
+        signature: Option<[u8; 256]>,
+    },
     /// `set_player_team` — scoreboard-team create/remove/update/membership.
     SetPlayerTeam {
         name: String,
@@ -1929,6 +2050,40 @@ pub enum PlayEvent {
     },
     Disconnect(String),
     Other(i32),
+}
+
+#[derive(Clone, Debug)]
+pub struct WireAttribute {
+    pub attribute: i32,
+    pub base: f64,
+    pub modifiers: Vec<WireAttributeModifier>,
+}
+
+#[derive(Clone, Debug)]
+pub struct WireAttributeModifier {
+    pub uuid: [u8; 16],
+    pub amount: f64,
+    pub operation: i32,
+}
+
+#[derive(Clone, Debug)]
+pub struct WireSuggestion {
+    pub text: String,
+    pub tooltip_nbt: Option<Vec<u8>>,
+}
+
+#[derive(Clone, Debug)]
+pub struct WireServerLink {
+    pub label: Option<i32>,
+    pub custom_label_nbt: Option<Vec<u8>>,
+    pub url: String,
+}
+
+#[derive(Clone, Debug)]
+pub struct ChatLogEntry {
+    pub index: Option<i32>,
+    pub signature: Option<[u8; 256]>,
+    pub text: String,
 }
 
 /// Parameter block of `set_player_team` modes 0 (create) and 2 (update).
@@ -2674,9 +2829,7 @@ pub struct ItemStackComponents {
 ///
 /// Returns the decoded patch plus the number of bytes consumed, so callers
 /// walking a `container_set_content` slot array can advance per slot.
-pub fn decode_item_stack_components(
-    wire: &[u8],
-) -> Result<(ItemStackComponents, usize), String> {
+pub fn decode_item_stack_components(wire: &[u8]) -> Result<(ItemStackComponents, usize), String> {
     const MALFORMED: &str = "malformed item stack component patch";
     let mut p = 0usize;
     let cnt = slot_varint(wire, &mut p).ok_or(MALFORMED)?;
@@ -2837,8 +2990,8 @@ fn read_wire_advancement(r: &mut WireReader<'_>) -> Result<WireAdvancement, Stri
     } else {
         None
     };
-    let nreq = usize::try_from(r.read_varint()?)
-        .map_err(|_| "negative requirement count".to_string())?;
+    let nreq =
+        usize::try_from(r.read_varint()?).map_err(|_| "negative requirement count".to_string())?;
     if nreq > r.remaining() {
         return Err("requirement count exceeds remaining input".into());
     }
@@ -3233,7 +3386,9 @@ pub fn decode_extended_play_event(name: &str, body: &[u8]) -> Result<Option<Play
             let actions = r.read_u8()?;
             let count = r.read_varint()?;
             if !(0..=1024).contains(&count) {
-                return Err(format!("player_info_update entry count {count} out of range"));
+                return Err(format!(
+                    "player_info_update entry count {count} out of range"
+                ));
             }
             let mut entries = Vec::with_capacity(count as usize & 0xff);
             for _ in 0..count {
@@ -3382,9 +3537,7 @@ pub fn decode_extended_play_event(name: &str, body: &[u8]) -> Result<Option<Play
             stay: r.read_i32()?,
             fade_out: r.read_i32()?,
         },
-        "pong_response" => PlayEvent::PongResponse {
-            id: r.read_i64()?,
-        },
+        "pong_response" => PlayEvent::PongResponse { id: r.read_i64()? },
         "initialize_border" => PlayEvent::InitializeBorder {
             x: r.read_f64()?,
             z: r.read_f64()?,
@@ -3407,6 +3560,329 @@ pub fn decode_extended_play_event(name: &str, body: &[u8]) -> Result<Option<Play
             new_diameter: r.read_f64()?,
             lerp_ms: r.read_varlong()?,
         },
+        "set_border_warning_delay" => PlayEvent::SetBorderWarningDelay {
+            warning_time: r.read_varint()?,
+        },
+        "set_border_warning_distance" => PlayEvent::SetBorderWarningDistance {
+            warning_blocks: r.read_varint()?,
+        },
+        "animate" => PlayEvent::Animate {
+            eid: r.read_varint()?,
+            animation: r.read_u8()?,
+        },
+        "block_event" => PlayEvent::BlockEvent {
+            pos: r.read_position()?,
+            action: r.read_u8()?,
+            parameter: r.read_u8()?,
+            block_type: r.read_varint()?,
+        },
+        "set_default_spawn_position" => PlayEvent::SetDefaultSpawnPosition {
+            pos: r.read_position()?,
+            angle: r.read_f32()?,
+        },
+        "set_chunk_cache_radius" => PlayEvent::SetChunkCacheRadius(r.read_varint()?),
+        "set_simulation_distance" => PlayEvent::SetSimulationDistance(r.read_varint()?),
+        "ticking_state" => PlayEvent::TickingState {
+            tick_rate: r.read_f32()?,
+            frozen: r.read_bool()?,
+        },
+        "ticking_step" => {
+            let steps = r.read_varint()?;
+            if steps < 0 {
+                return Err("negative ticking step count".into());
+            }
+            PlayEvent::TickingStep { steps }
+        }
+        "move_vehicle" => PlayEvent::MoveVehicle {
+            x: r.read_f64()?,
+            y: r.read_f64()?,
+            z: r.read_f64()?,
+            yaw: r.read_f32()?,
+            pitch: r.read_f32()?,
+        },
+        "set_passengers" => {
+            let vehicle = r.read_varint()?;
+            let count = usize::try_from(r.read_varint()?)
+                .map_err(|_| "negative passenger count".to_string())?;
+            if count > r.remaining() {
+                return Err("passenger count exceeds remaining input".into());
+            }
+            let mut passengers = Vec::with_capacity(count.min(256));
+            for _ in 0..count {
+                passengers.push(r.read_varint()?);
+            }
+            PlayEvent::SetPassengers {
+                vehicle,
+                passengers,
+            }
+        }
+        "set_entity_link" => PlayEvent::SetEntityLink {
+            source: r.read_varint()?,
+            destination: r.read_varint()?,
+        },
+        "take_item_entity" => PlayEvent::TakeItemEntity {
+            item_entity: r.read_varint()?,
+            player: r.read_varint()?,
+            amount: r.read_varint()?,
+        },
+        "set_camera" => PlayEvent::SetCamera {
+            eid: r.read_varint()?,
+        },
+        "open_book" => {
+            let hand = r.read_varint()?;
+            if !(0..=1).contains(&hand) {
+                return Err("invalid hand in open_book".into());
+            }
+            PlayEvent::OpenBook { hand: hand as u8 }
+        }
+        "open_sign_editor" => PlayEvent::OpenSignEditor {
+            pos: r.read_position()?,
+            front_side: r.read_bool()?,
+        },
+        "tab_list" => PlayEvent::TabList {
+            header_nbt: read_nbt_raw(&mut r)?.to_vec(),
+            footer_nbt: read_nbt_raw(&mut r)?.to_vec(),
+        },
+        "update_attributes" => {
+            let eid = r.read_varint()?;
+            let count = usize::try_from(r.read_varint()?)
+                .map_err(|_| "negative attribute count".to_string())?;
+            if count > r.remaining() / 9 {
+                return Err("attribute count exceeds remaining input".into());
+            }
+            let mut attributes = Vec::with_capacity(count.min(128));
+            for _ in 0..count {
+                let attribute = r.read_varint()?;
+                let base = r.read_f64()?;
+                let modifier_count = usize::try_from(r.read_varint()?)
+                    .map_err(|_| "negative attribute modifier count".to_string())?;
+                if modifier_count > r.remaining() / 25 {
+                    return Err("attribute modifier count exceeds remaining input".into());
+                }
+                let mut modifiers = Vec::with_capacity(modifier_count.min(64));
+                for _ in 0..modifier_count {
+                    let uuid = r.read_uuid()?;
+                    let amount = r.read_f64()?;
+                    let operation = r.read_varint()?;
+                    if !(0..=2).contains(&operation) {
+                        return Err("invalid attribute modifier operation".into());
+                    }
+                    modifiers.push(WireAttributeModifier {
+                        uuid,
+                        amount,
+                        operation,
+                    });
+                }
+                attributes.push(WireAttribute {
+                    attribute,
+                    base,
+                    modifiers,
+                });
+            }
+            PlayEvent::UpdateAttributes { eid, attributes }
+        }
+        "command_suggestions" => {
+            let transaction_id = r.read_varint()?;
+            let start = r.read_varint()?;
+            let length = r.read_varint()?;
+            let count = usize::try_from(r.read_varint()?)
+                .map_err(|_| "negative command suggestion count".to_string())?;
+            if count > r.remaining() / 2 {
+                return Err("command suggestion count exceeds remaining input".into());
+            }
+            let mut matches = Vec::with_capacity(count.min(1024));
+            for _ in 0..count {
+                let text = r.read_string(32767)?;
+                let tooltip_nbt = if r.read_bool()? {
+                    Some(read_nbt_raw(&mut r)?.to_vec())
+                } else {
+                    None
+                };
+                matches.push(WireSuggestion { text, tooltip_nbt });
+            }
+            PlayEvent::CommandSuggestions {
+                transaction_id,
+                start,
+                length,
+                matches,
+            }
+        }
+        "ping" => PlayEvent::Ping(r.read_i32()?),
+        "cookie_request" => PlayEvent::CookieRequest(r.read_string(32767)?),
+        "place_ghost_recipe" => PlayEvent::PlaceGhostRecipe {
+            window_id: r.read_u8()?,
+            recipe: r.read_string(32767)?,
+        },
+        "tag_query" => {
+            let transaction_id = r.read_varint()?;
+            let nbt_bytes = if r.rest().first() == Some(&0) {
+                r.read_u8()?;
+                Vec::new()
+            } else {
+                read_nbt_raw(&mut r)?.to_vec()
+            };
+            PlayEvent::TagQuery {
+                transaction_id,
+                nbt_bytes,
+            }
+        }
+        "set_projectile_power" => PlayEvent::SetProjectilePower {
+            eid: r.read_varint()?,
+            acceleration: r.read_f64()?,
+        },
+        "custom_report_details" => {
+            let count = usize::try_from(r.read_varint()?)
+                .map_err(|_| "negative report detail count".to_string())?;
+            if count > r.remaining() / 2 {
+                return Err("report detail count exceeds remaining input".into());
+            }
+            let mut details = Vec::with_capacity(count.min(64));
+            for _ in 0..count {
+                details.push((r.read_string(64)?, r.read_string(1024)?));
+            }
+            PlayEvent::CustomReportDetails(details)
+        }
+        "server_links" => {
+            let count = usize::try_from(r.read_varint()?)
+                .map_err(|_| "negative server link count".to_string())?;
+            if count > r.remaining() / 2 {
+                return Err("server link count exceeds remaining input".into());
+            }
+            let mut links = Vec::with_capacity(count.min(64));
+            for _ in 0..count {
+                let (label, custom_label_nbt) = match r.read_u8()? {
+                    0 => (None, Some(read_nbt_raw(&mut r)?.to_vec())),
+                    1 => (Some(r.read_varint()?), None),
+                    _ => return Err("invalid server link label kind".into()),
+                };
+                let url = r.read_string(2048)?;
+                links.push(WireServerLink {
+                    label,
+                    custom_label_nbt,
+                    url,
+                });
+            }
+            PlayEvent::ServerLinks(links)
+        }
+        "block_changed_ack" => PlayEvent::BlockChangedAck(r.read_varint()?),
+        "change_difficulty" => PlayEvent::ChangeDifficulty { difficulty: r.read_u8()?, locked: r.read_bool()? },
+        "clear_titles" => PlayEvent::ClearTitles,
+        "cooldown" => PlayEvent::Cooldown { item: r.read_varint()?, ticks: r.read_varint()? },
+        "player_abilities" => PlayEvent::PlayerAbilities {
+            flags: r.read_u8()?,
+            flying_speed: r.read_f32()?,
+            walking_speed: r.read_f32()?,
+        },
+        "player_combat_end" => PlayEvent::PlayerCombatEnd { duration: r.read_varint()? },
+        "player_combat_enter" => PlayEvent::PlayerCombatEnter,
+        "player_combat_kill" => PlayEvent::PlayerCombatKill {
+            player_id: r.read_varint()?,
+            message_nbt: read_nbt_raw(&mut r)?.to_vec(),
+        },
+        "resource_pack_pop" => PlayEvent::ResourcePackPop {
+            uuid: if r.read_bool()? { Some(r.read_uuid()?) } else { None },
+        },
+        "resource_pack_push" => PlayEvent::ResourcePackPush {
+            uuid: r.read_uuid()?,
+            url: r.read_string(32767)?,
+            hash: r.read_string(40)?,
+            forced: r.read_bool()?,
+            prompt_nbt: if r.read_bool()? { Some(read_nbt_raw(&mut r)?.to_vec()) } else { None },
+        },
+        "set_carried_item" => PlayEvent::SetCarriedItem(r.read_i16()?),
+        "store_cookie" => {
+            let key = r.read_string(32767)?;
+            let len = usize::try_from(r.read_varint()?)
+                .map_err(|_| "negative cookie payload length".to_string())?;
+            if len > 5120 { return Err("cookie payload exceeds 5 KiB".into()); }
+            PlayEvent::StoreCookie { key, payload: r.take(len)?.to_vec() }
+        }
+        "custom_chat_completions" => {
+            let action = r.read_varint()?;
+            if !(0..=2).contains(&action) {
+                return Err("invalid chat completions action".into());
+            }
+            let count = usize::try_from(r.read_varint()?)
+                .map_err(|_| "negative chat completion count".to_string())?;
+            if count > r.remaining() {
+                return Err("chat completion count exceeds remaining input".into());
+            }
+            let mut entries = Vec::with_capacity(count.min(1024));
+            for _ in 0..count {
+                entries.push(r.read_string(32767)?);
+            }
+            PlayEvent::ChatCompletions { action, entries }
+        }
+        "reset_chat" => PlayEvent::ResetChat,
+        "delete_chat" => {
+            let encoded_index = r.read_varint()?;
+            if encoded_index < 0 {
+                return Err("negative delete-chat index".into());
+            }
+            if encoded_index == 0 {
+                let signature = r.take(256)?.try_into().unwrap();
+                PlayEvent::DeleteChat {
+                    message_index: None,
+                    signature: Some(signature),
+                }
+            } else {
+                PlayEvent::DeleteChat {
+                    message_index: Some(encoded_index - 1),
+                    signature: None,
+                }
+            }
+        }
+        "disguised_chat" => {
+            let nbt_bytes = read_nbt_raw(&mut r)?.to_vec();
+            let text = WireReader::new(&nbt_bytes)
+                .read_nbt()
+                .map(|v| v.extract_text())
+                .unwrap_or_default();
+            let _chat_type = r.read_varint()?;
+            let _sender_name = read_nbt_raw(&mut r)?;
+            if r.read_bool()? {
+                let _target_name = read_nbt_raw(&mut r)?;
+            }
+            PlayEvent::DisguisedChat { text, nbt_bytes }
+        }
+        "player_chat" => {
+            let sender = r.read_uuid()?;
+            let index = r.read_varint()?;
+            let signature = if r.read_bool()? {
+                Some(r.take(256)?.try_into().unwrap())
+            } else {
+                None
+            };
+            let message = r.read_string(32767)?;
+            let _timestamp = r.read_i64()?;
+            let _salt = r.read_i64()?;
+            let _last_seen_offset = r.read_varint()?;
+            r.take(3)?; // fixed 20-bit acknowledgement bitset
+            if r.read_bool()? {
+                let _unsigned_content = read_nbt_raw(&mut r)?;
+            }
+            let filter_type = r.read_varint()?;
+            match filter_type {
+                0 | 1 => {}
+                2 => {
+                    let _filter = r.read_bitset(64)?;
+                }
+                _ => return Err("invalid chat filter type".into()),
+            }
+            let _chat_type = r.read_varint()?;
+            let sender_name = read_nbt_raw(&mut r)?;
+            let mut nbt_bytes = sender_name.to_vec();
+            if r.read_bool()? {
+                nbt_bytes.extend_from_slice(read_nbt_raw(&mut r)?);
+            }
+            PlayEvent::PlayerChat {
+                sender,
+                index,
+                signature,
+                text: message,
+                nbt_bytes,
+            }
+        }
         "set_player_team" => {
             let name = r.read_string(32767)?;
             let mode = r.read_u8()?;
@@ -3651,8 +4127,8 @@ pub fn decode_extended_play_event(name: &str, body: &[u8]) -> Result<Option<Play
             },
         },
         "award_stats" => {
-            let count = usize::try_from(r.read_varint()?)
-                .map_err(|_| "negative stat count".to_string())?;
+            let count =
+                usize::try_from(r.read_varint()?).map_err(|_| "negative stat count".to_string())?;
             // Each entry is three varints — at least three bytes.
             if count > r.remaining() / 3 {
                 return Err("stat count exceeds remaining input".into());
@@ -3930,11 +4406,7 @@ pub fn encode_set_command_block(
     p.extend_from_slice(&pack_position(pos).to_be_bytes());
     write_string(&mut p, command);
     write_varint(&mut p, mode);
-    p.push(
-        (u8::from(track_output))
-            | (u8::from(conditional) << 1)
-            | (u8::from(automatic) << 2),
-    );
+    p.push((u8::from(track_output)) | (u8::from(conditional) << 1) | (u8::from(automatic) << 2));
     ("set_command_block", p)
 }
 
@@ -3978,11 +4450,7 @@ pub fn encode_select_trade(index: i32) -> (&'static str, Vec<u8>) {
 /// `place_recipe` — recipe-book "place recipe" request: `window_id` is the
 /// open container id, `recipe` the recipe identifier, `make_all` requests
 /// the shift-click (fill-all) variant.
-pub fn encode_place_recipe(
-    window_id: u8,
-    recipe: &str,
-    make_all: bool,
-) -> (&'static str, Vec<u8>) {
+pub fn encode_place_recipe(window_id: u8, recipe: &str, make_all: bool) -> (&'static str, Vec<u8>) {
     let mut p = Vec::with_capacity(8 + recipe.len());
     p.push(window_id);
     write_string(&mut p, recipe);
@@ -4100,6 +4568,27 @@ pub struct ProtocolClient {
     /// Decoded `system_chat` NBT payloads, retained bounded for consumers
     /// needing the raw component (see [`WireChatEvent`]).
     pub chat_events: VecDeque<WireChatEvent>,
+    /// Plain text from incoming system/player/disguised chat, retained for a
+    /// future chat surface. The client currently has no in-game chat UI.
+    pub chat_log: VecDeque<ChatLogEntry>,
+    pub tick_rate: f32,
+    pub is_frozen: bool,
+    pub ticking_steps: u64,
+    pub requested_view_distance: Option<i32>,
+    pub simulation_distance: Option<i32>,
+    pub default_spawn_position: Option<([i32; 3], f32)>,
+    pub border_warning_delay: Option<i32>,
+    pub border_warning_distance: Option<i32>,
+    pub move_vehicle_pose: Option<([f64; 3], [f32; 2])>,
+    pub command_completions: Vec<String>,
+    pub latest_command_suggestions: Option<PlayEvent>,
+    /// Bounded events for UI surfaces that are not implemented yet.
+    pub pending_ui_events: VecDeque<PlayEvent>,
+    pub cookies: HashMap<String, Vec<u8>>,
+    pub difficulty: Option<(u8, bool)>,
+    pub player_abilities: Option<(u8, f32, f32)>,
+    pub selected_hotbar_slot: Option<i16>,
+    pub item_cooldowns: HashMap<i32, i32>,
     /// Live audio output pipeline — installed from the session audio
     /// config when one is configured (see
     /// [`crate::audio_out::install_session_audio_config`]); `None` when
@@ -4143,6 +4632,24 @@ impl ProtocolClient {
             sound_events: VecDeque::new(),
             stop_sound_events: VecDeque::new(),
             chat_events: VecDeque::new(),
+            chat_log: VecDeque::new(),
+            tick_rate: 20.0,
+            is_frozen: false,
+            ticking_steps: 0,
+            requested_view_distance: None,
+            simulation_distance: None,
+            default_spawn_position: None,
+            border_warning_delay: None,
+            border_warning_distance: None,
+            move_vehicle_pose: None,
+            command_completions: Vec::new(),
+            latest_command_suggestions: None,
+            pending_ui_events: VecDeque::new(),
+            cookies: HashMap::new(),
+            difficulty: None,
+            player_abilities: None,
+            selected_hotbar_slot: None,
+            item_cooldowns: HashMap::new(),
             audio: crate::audio_out::session_audio_config()
                 .filter(crate::audio_out::AudioRuntime::enabled)
                 .map(|cfg| crate::audio_out::AudioRuntime::new(&cfg)),
@@ -4385,6 +4892,9 @@ impl ProtocolClient {
                 return Err("configuration timed out waiting for server".to_string());
             };
             match client.s2c_name(PacketPhase::Configuration, pid).as_deref() {
+                Some("reset_chat") => {
+                    client.chat_log.clear();
+                }
                 // Cookie Request — or the legacy 8-byte keepalive fallback on
                 // pid 0x00 in the 767 table.
                 Some("cookie_request") => {
@@ -4506,7 +5016,9 @@ impl ProtocolClient {
         }
         if let Some(names) = sound_names {
             if let Some(rt) = &mut self.audio {
-                rt.set_sound_event_registry(crate::sound_assets::SoundEventRegistry::from_names(names));
+                rt.set_sound_event_registry(crate::sound_assets::SoundEventRegistry::from_names(
+                    names,
+                ));
             }
         }
         Ok(())
@@ -4583,7 +5095,11 @@ impl ProtocolClient {
             join.as_ref(),
             &mut rng,
         )?;
-        self.send_named(PacketPhase::Login, "encryption_response", &plan.response_body)?;
+        self.send_named(
+            PacketPhase::Login,
+            "encryption_response",
+            &plan.response_body,
+        )?;
         self.cipher_tx = Some(Aes128Cfb8::new(&plan.shared_secret, &plan.shared_secret));
         self.cipher_rx = Some(Aes128Cfb8::new(&plan.shared_secret, &plan.shared_secret));
         Ok(())
@@ -4646,6 +5162,21 @@ impl ProtocolClient {
 
     pub fn send_keep_alive(&mut self, id: i64) -> Result<(), String> {
         self.send_named(PacketPhase::Play, "keep_alive", &id.to_be_bytes())
+    }
+
+    /// Reply to a Play `cookie_request` with the stored value when present.
+    pub fn send_cookie_response(&mut self, key: &str) -> Result<(), String> {
+        let mut body = Vec::new();
+        write_string(&mut body, key);
+        match self.cookies.get(key) {
+            Some(payload) => {
+                body.push(1);
+                write_varint(&mut body, payload.len() as i32);
+                body.extend_from_slice(payload);
+            }
+            None => body.push(0),
+        }
+        self.send_named(PacketPhase::Play, "cookie_response", &body)
     }
 
     /// `player_input` in the active version's shape: 767's float impulse +
@@ -4965,7 +5496,9 @@ impl ProtocolClient {
             return Ok(None);
         };
         self.pump_audio();
-        self.decode_play_event(pid, &body).map(Some)
+        let event = self.decode_play_event(pid, &body)?;
+        self.record_play_state(&event);
+        Ok(Some(event))
     }
 
     /// Opt-in receiver for custom channels alongside ordinary play packets.
@@ -4984,9 +5517,141 @@ impl ProtocolClient {
                 .map(ClientPlayEvent::CustomChannel)
                 .map(Some);
         }
-        self.decode_play_event(pid, &body)
-            .map(ClientPlayEvent::Play)
-            .map(Some)
+        let event = self.decode_play_event(pid, &body)?;
+        self.record_play_state(&event);
+        Ok(Some(ClientPlayEvent::Play(event)))
+    }
+
+    fn record_play_state(&mut self, event: &PlayEvent) {
+        match event {
+            PlayEvent::SystemChat { text, .. } | PlayEvent::DisguisedChat { text, .. } => {
+                if self.chat_log.len() >= 256 {
+                    self.chat_log.pop_front();
+                }
+                self.chat_log.push_back(ChatLogEntry {
+                    index: None,
+                    signature: None,
+                    text: text.clone(),
+                });
+            }
+            PlayEvent::PlayerChat {
+                index,
+                signature,
+                text,
+                ..
+            } => {
+                if self.chat_log.len() >= 256 {
+                    self.chat_log.pop_front();
+                }
+                self.chat_log.push_back(ChatLogEntry {
+                    index: Some(*index),
+                    signature: *signature,
+                    text: text.clone(),
+                });
+            }
+            PlayEvent::TickingState { tick_rate, frozen } => {
+                self.tick_rate = *tick_rate;
+                self.is_frozen = *frozen;
+            }
+            PlayEvent::TickingStep { steps } => {
+                self.ticking_steps = self.ticking_steps.saturating_add(*steps as u64);
+            }
+            PlayEvent::SetChunkCacheRadius(radius) => self.requested_view_distance = Some(*radius),
+            PlayEvent::SetSimulationDistance(distance) => {
+                self.simulation_distance = Some(*distance)
+            }
+            PlayEvent::SetDefaultSpawnPosition { pos, angle } => {
+                self.default_spawn_position = Some((*pos, *angle));
+            }
+            PlayEvent::SetBorderWarningDelay { warning_time } => {
+                self.border_warning_delay = Some(*warning_time);
+            }
+            PlayEvent::SetBorderWarningDistance { warning_blocks } => {
+                self.border_warning_distance = Some(*warning_blocks);
+            }
+            PlayEvent::MoveVehicle {
+                x,
+                y,
+                z,
+                yaw,
+                pitch,
+            } => {
+                self.move_vehicle_pose = Some(([*x, *y, *z], [*yaw, *pitch]));
+            }
+            PlayEvent::ChatCompletions { action, entries } => match action {
+                0 => {
+                    for entry in entries {
+                        if self.command_completions.len() >= 1024 {
+                            break;
+                        }
+                        if !self.command_completions.contains(entry) {
+                            self.command_completions.push(entry.clone());
+                        }
+                    }
+                }
+                1 => self
+                    .command_completions
+                    .retain(|entry| !entries.contains(entry)),
+                2 => self.command_completions.clone_from(entries),
+                _ => {}
+            },
+            PlayEvent::CommandSuggestions { .. } => {
+                self.latest_command_suggestions = Some(event.clone());
+            }
+            PlayEvent::StoreCookie { key, payload } => {
+                if payload.len() <= 5120 && (self.cookies.contains_key(key) || self.cookies.len() < 256) {
+                    self.cookies.insert(key.clone(), payload.clone());
+                }
+            }
+            PlayEvent::ChangeDifficulty { difficulty, locked } => {
+                self.difficulty = Some((*difficulty, *locked));
+            }
+            PlayEvent::PlayerAbilities { flags, flying_speed, walking_speed } => {
+                self.player_abilities = Some((*flags, *flying_speed, *walking_speed));
+            }
+            PlayEvent::SetCarriedItem(slot) => self.selected_hotbar_slot = Some(*slot),
+            PlayEvent::Cooldown { item, ticks } => {
+                if self.item_cooldowns.contains_key(item) || self.item_cooldowns.len() < 512 {
+                    self.item_cooldowns.insert(*item, *ticks);
+                }
+            }
+            PlayEvent::ResetChat => self.chat_log.clear(),
+            PlayEvent::DeleteChat {
+                message_index,
+                signature,
+            } => {
+                if let Some(index) = message_index {
+                    self.chat_log.retain(|entry| entry.index != Some(*index));
+                } else if let Some(signature) = signature {
+                    self.chat_log
+                        .retain(|entry| entry.signature.as_ref() != Some(signature));
+                }
+            }
+            PlayEvent::SetCamera { .. }
+            | PlayEvent::OpenBook { .. }
+            | PlayEvent::OpenSignEditor { .. }
+            | PlayEvent::TabList { .. }
+            | PlayEvent::PlaceGhostRecipe { .. }
+            | PlayEvent::TagQuery { .. }
+            | PlayEvent::SetProjectilePower { .. }
+            | PlayEvent::CustomReportDetails(_)
+            | PlayEvent::ServerLinks(_)
+            | PlayEvent::BlockChangedAck(_)
+            | PlayEvent::ClearTitles
+            | PlayEvent::PlayerCombatEnd { .. }
+            | PlayEvent::PlayerCombatEnter
+            | PlayEvent::PlayerCombatKill { .. }
+            | PlayEvent::ResourcePackPop { .. }
+            | PlayEvent::ResourcePackPush { .. }
+            | PlayEvent::PlayerInfoRemove { .. }
+            | PlayEvent::PlayerLookAt { .. } => {
+                if self.pending_ui_events.len() == 128 {
+                    self.pending_ui_events.pop_front();
+                }
+                self.pending_ui_events.push_back(event.clone());
+            }
+            _ => {}
+        }
     }
 
     /// Retain one decoded sound event bounded for non-audio consumers and
@@ -5297,10 +5962,7 @@ impl ProtocolClient {
     }
 }
 
-fn build_client_information(
-    view_distance: i8,
-    caps: &megu_proto::VersionCapabilities,
-) -> Vec<u8> {
+fn build_client_information(view_distance: i8, caps: &megu_proto::VersionCapabilities) -> Vec<u8> {
     let mut out = Vec::with_capacity(18);
     write_string(&mut out, "en_us");
     out.push(view_distance as u8);
