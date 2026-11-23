@@ -517,7 +517,7 @@ fn datapack_reload_replaces_caches_and_replays_the_load_hook() {
                 .lock()
                 .unwrap_or_else(|e| e.into_inner())
                 .iter()
-                .any(|pack| pack.tick == ["test:on_tick"]),
+                .any(|pack| pack.tick == vec![Arc::<str>::from("test:on_tick")]),
             present
         );
     };

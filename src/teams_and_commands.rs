@@ -10273,7 +10273,11 @@ mod vanilla_cmdblk_tests {
             pack.functions["zz:hello"],
             vec!["say hello".to_owned(), "time add 1".to_owned()]
         );
-        assert_eq!(pack.tick, vec!["zz:hello".to_owned()], "tick tag hook loaded");
+        assert_eq!(
+            pack.tick,
+            vec![Arc::<str>::from("zz:hello")],
+            "tick tag hook loaded"
+        );
         let registry = datapack_registry().lock().unwrap_or_else(|e| e.into_inner());
         assert_eq!(
             registry.tags["item"]["zz:probe"],

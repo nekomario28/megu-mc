@@ -976,7 +976,7 @@ def check_js_unit():
         result = subprocess.run(
             [node, harness_path],
             env={
-                "PATH": __import__("os").environ.get("PATH", ""),
+                **__import__("os").environ,
                 "APP_JS": str(app_js),
                 "SITE_CONFIG_JS": str(cfg_js),
             },
