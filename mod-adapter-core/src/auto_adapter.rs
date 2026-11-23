@@ -56,7 +56,8 @@ use crate::data_loader::{
 };
 use crate::dep_resolver::{plan_dep_recovery, ReloadRequirement};
 use crate::dimension_mod::{
-    discover_dimension_mod_entries, DimensionModClassification, DimensionModData,
+    builtin_dimension_mod_profiles, discover_dimension_mod_entries, DimensionModClassification,
+    DimensionModData,
 };
 use crate::ecosystem_compat::{
     scan_mod_jar_named, DualLoaderPlan, JarScanError, MissingDependency, ModEnvironment,
@@ -941,10 +942,20 @@ fn skipped_result(
 /// document carrying the mod id and its declared Minecraft range (or
 /// [`DEFAULT_BUNDLE_MC_RANGE`] when undeclared) — either way packaged
 /// with the real [`ModDataBundle`] the generic data extraction pass
-/// lifted out of the JAR. The bundle schema is a closed gameplay-
-/// mechanics contract (portals, barriers, regions, creatures, channels,
-/// spells, statuses, rituals), so a synthesized document stays
-/// section-empty on purpose; the deterministic declared-entity metadata
+/// lifted out of the JAR.
+///
+/// `portals` is the one bundle section parsed `data/` can synthesize:
+/// the crate's builtin dimension-mod reference profiles declare the
+/// portal mechanics of the well-known dimension mods, and a JAR that
+/// ships one of those mods' `dimension/` entries provably carries that
+/// dimension's content — the same discovery gate the dimension runtime
+/// bridge applies to environment profiles. Only rules whose `target_dim`
+/// the JAR declares are emitted. Every other section (progression
+/// barriers, biome regions, creatures, channels, spells, statuses,
+/// rituals) has no parsed-data source and stays empty: the bundle schema
+/// is a closed gameplay-mechanics contract (portals, barriers, regions,
+/// creatures, channels, spells, statuses, rituals) with no
+/// declared-entity fields, so the deterministic declared-entity metadata
 /// — blocks/blockstate properties, models, items, recipes, tags, loot
 /// tables, dimensions, data maps, biome modifiers — rides in the
 /// companion [`ModDataBundle`], never silently dropped.
@@ -970,10 +981,33 @@ fn synthesize_bundle(
         let mc_version_range = descriptor
             .and_then(|d| d.declared_mc_range.as_ref().map(|r| r.declared().to_string()))
             .unwrap_or_else(|| DEFAULT_BUNDLE_MC_RANGE.to_string());
+        let discovered: BTreeSet<&str> = data
+            .dimensions
+            .dimensions
+            .iter()
+            .map(|d| d.id.as_str())
+            .collect();
+        let mut portals = Vec::new();
+        for profile in builtin_dimension_mod_profiles() {
+            if !profile
+                .dimensions
+                .iter()
+                .any(|d| discovered.contains(d.id.as_str()))
+            {
+                continue;
+            }
+            portals.extend(
+                profile
+                    .portal_rules
+                    .iter()
+                    .filter(|rule| discovered.contains(rule.target_dim.as_str()))
+                    .cloned(),
+            );
+        }
         let bundle = DeclarativeModBundle {
             mod_id: mod_id.to_string(),
             mc_version_range,
-            portals: Vec::new(),
+            portals,
             progression_barriers: Vec::new(),
             biome_regions: Vec::new(),
             creatures: Vec::new(),
@@ -1579,6 +1613,12 @@ pub fn auto_adapt_jar_bytes(
                     "synthesized {BUNDLE_SCHEMA} for mod id '{}' (mc_version_range '{}')",
                     syn.bundle.mod_id, syn.bundle.mc_version_range
                 ));
+                if !syn.bundle.portals.is_empty() {
+                    audit_notes.push(format!(
+                        "synthesized {} portal rule(s) from builtin dimension-mod reference profiles, gated by the JAR's discovered dimension ids",
+                        syn.bundle.portals.len()
+                    ));
+                }
                 data_bundle = syn.data;
                 (AdaptationTier::NativeBundle, Some(syn.bundle))
             }
@@ -3293,6 +3333,23 @@ mod tests {
         ])
     }
 
+    /// A JAR shipping The Aether's 1.21.1 dimension entries — realistic
+    /// `dimension_type`/`dimension` JSON, no embedded bundle, no bytecode.
+    fn aether_dimension_jar() -> Vec<u8> {
+        let manifest = fabric_manifest("aether", "1.0.0", "");
+        jar(&[
+            ("fabric.mod.json", manifest.as_bytes()),
+            (
+                "data/aether/dimension_type/the_aether.json",
+                br#"{"min_y":0,"height":384,"has_skylight":true,"has_ceiling":false,"ultrawarm":false,"natural":true,"bed_works":false,"respawn_anchor_works":true,"ambient_light":0.5,"effects":"minecraft:overworld","coordinate_scale":1.0}"#,
+            ),
+            (
+                "data/aether/dimension/the_aether.json",
+                br#"{"type":"aether:the_aether","generator":{"type":"minecraft:noise","settings":"aether:aether","biome_source":{"type":"minecraft:multi_noise","biomes":[]}}}"#,
+            ),
+        ])
+    }
+
     fn client_only_jar() -> Vec<u8> {
         let manifest =
             br#"{"schemaVersion":1,"id":"clientmod","version":"1.0","environment":"client"}"#;
@@ -3511,6 +3568,48 @@ mod tests {
         let dims = result.dimensions.unwrap();
         assert!(dims.is_dimension_mod());
         assert!(dims.is_pure_data_driven());
+        // `dimmod:mydim` matches no builtin dimension profile, so the
+        // synthesized bundle keeps an empty portal section.
+        assert!(result.bundle.unwrap().portals.is_empty());
+    }
+
+    #[test]
+    fn synthesized_bundle_gains_profile_portals_for_dimension_mods() {
+        // A JAR shipping The Aether's dimension entries but no embedded
+        // bundle: the manifest stub gains the curated aether portal
+        // rule — gated by the parsed `aether:the_aether` dimension id —
+        // while every other gameplay section stays empty and the parsed
+        // dimension content still rides in `data_bundle`.
+        let result = auto_adapt_jar_bytes(&aether_dimension_jar(), "aether-1.0.0.jar", &opts())
+            .expect("aether dimension JAR adapts");
+        assert_eq!(result.tier, AdaptationTier::NativeBundle, "{:?}", result.blockers);
+        let bundle = result.bundle.as_ref().expect("native jar emits a bundle");
+        assert_eq!(bundle.mod_id, "aether");
+        assert_eq!(bundle.portals.len(), 1, "{:?}", bundle.portals);
+        assert_eq!(bundle.portals[0].name, "aether:the_aether_portal");
+        assert_eq!(bundle.portals[0].target_dim, "aether:the_aether");
+        assert!(bundle.progression_barriers.is_empty());
+        assert!(bundle.biome_regions.is_empty());
+        assert!(bundle.creatures.is_empty());
+        assert!(bundle.custom_channels.is_empty());
+        assert!(bundle.spells.is_empty());
+        assert!(bundle.custom_statuses.is_empty());
+        assert!(bundle.rituals.is_empty());
+        // The synthesized document round-trips the strict schema.
+        let reparsed = DeclarativeModBundle::from_json(&bundle.to_json())
+            .expect("synthesized bundle validates");
+        assert_eq!(reparsed.portals.len(), 1);
+        // The parsed dimension content flows through untouched.
+        assert!(result
+            .data_bundle
+            .dimensions
+            .dimensions
+            .iter()
+            .any(|d| d.id == "aether:the_aether"));
+        assert!(result
+            .audit_notes
+            .iter()
+            .any(|n| n.contains("portal rule(s)")));
     }
 
     #[test]
