@@ -174,6 +174,7 @@ pub mod ecosystem_compat;
 pub mod fallback;
 pub mod hard_mod_primitives;
 pub mod intermediary_map;
+pub mod live_registry_bridge;
 pub mod loader_extensions;
 pub mod magic_primitives;
 pub mod mine_cut_all;
