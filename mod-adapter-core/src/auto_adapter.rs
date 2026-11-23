@@ -44,14 +44,15 @@ use std::path::{Path, PathBuf};
 
 use megu_core::id::ResourceLocation;
 
+use crate::blockstates::PropertyDef;
 use crate::class_mixin_scanner::{
     scan_jar_mixins_with_options, JarMixinScanReport, JarScanOptions,
 };
 use crate::culinary_adapter::{CulinaryDiscoveryStats, CulinaryRegistry};
 use crate::custom_media::{inspect_image_header, MediaFormat};
 use crate::data_loader::{
-    parse_json, parse_mod_recipe_json, DataLoadError, ItemFluidIdTable, JsonValue,
-    ParsedModRecipe,
+    blockstate_properties, parse_json, parse_mod_recipe_json, DataLoadError,
+    ItemFluidIdTable, JsonValue, ParsedModRecipe,
 };
 use crate::dep_resolver::{plan_dep_recovery, ReloadRequirement};
 use crate::dimension_mod::{
@@ -173,8 +174,8 @@ impl AdaptationTier {
     }
 }
 
-/// Generic `data/` and bytecode surface of one JAR — the raw counts the
-/// tier synthesizer and the report consume.
+/// Generic `data/` + declared `assets/` + bytecode surface of one JAR —
+/// the raw counts the tier synthesizer and the report consume.
 #[derive(Clone, Debug, Default)]
 pub struct GenericDataSummary {
     /// Every `data/<ns>/` namespace, sorted.
@@ -191,6 +192,13 @@ pub struct GenericDataSummary {
     pub loot_table_files: usize,
     /// Remaining `data/<ns>/**.json` files outside the named categories.
     pub other_data_files: usize,
+    /// `assets/<ns>/blockstates/*.json` files.
+    pub blockstate_files: usize,
+    /// `assets/<ns>/models/**.json` files.
+    pub model_files: usize,
+    /// `assets/<ns>/items/**.json` files (post-1.21.1 client item
+    /// definitions).
+    pub item_files: usize,
     /// `.class` members — the JAR's Java bytecode surface.
     pub java_class_members: usize,
     /// `*.mixins.json` mixin configs found at the archive root or nested.
@@ -199,12 +207,14 @@ pub struct GenericDataSummary {
     pub embedded_bundle: bool,
 }
 
-/// The real parsed generic `data/` content of one mod JAR — the six
-/// 1.21.1 data families [`extract_mod_data`] lifts for ANY namespace:
-/// recipes, tags, loot tables, dimensions + dimension types, NeoForge
-/// 1.21.1 data maps, and NeoForge 1.21.1 biome modifiers. Every entry is
-/// recorded under the JAR's own `data/<ns>` namespace with zero hardcoded
-/// mod ids.
+/// The real parsed generic `data/` and declared `assets/` content of one
+/// mod JAR — the six 1.21.1 data families [`extract_mod_data`] lifts for
+/// ANY namespace (recipes, tags, loot tables, dimensions + dimension
+/// types, NeoForge 1.21.1 data maps, and NeoForge 1.21.1 biome
+/// modifiers), plus the `assets/` declaration families that pin down
+/// which blocks/items the mod ships: blockstate property tables, model
+/// ids, and item ids. Every entry is recorded under the JAR's own
+/// namespace with zero hardcoded mod ids.
 ///
 /// Extraction is fail-closed: a corrupted archive or unsafe member path
 /// aborts with a hard error, while a member that survives the bounded
@@ -233,14 +243,28 @@ pub struct ModDataBundle {
     pub data_maps: DataMapRegistry,
     /// `data/<ns>/neoforge/biome_modifier/**.json` parsed documents.
     pub biome_modifiers: Vec<BiomeModifier>,
-    /// `data/` members that matched a recognized family but failed to
-    /// parse, recorded as `"path (reason)"` — never silently dropped.
+    /// `assets/<ns>/blockstates/**.json` → `ns:path` → declared blockstate
+    /// property table, parsed by the same `variants`/`multipart` rules
+    /// [`crate::data_loader::blockstate_properties`] applies. Presence of
+    /// an entry (even with no properties) confirms the block exists.
+    pub blockstates: BTreeMap<String, Vec<PropertyDef>>,
+    /// `assets/<ns>/models/**.json` → `ns:path` — every model id the JAR
+    /// declares, `block/` and `item/` stems retained.
+    pub models: BTreeSet<String>,
+    /// `assets/<ns>/models/item/**.json` and `assets/<ns>/items/**.json`
+    /// → `ns:path` — the item ids the JAR declares a model or client
+    /// definition for.
+    pub items: BTreeSet<String>,
+    /// `data/` and `assets/` members that matched a recognized family but
+    /// failed to parse, recorded as `"path (reason)"` — never silently
+    /// dropped.
     pub rejected_members: Vec<String>,
 }
 
 /// The artifact [`synthesize_bundle`] produces for a native JAR: the
 /// validated `megu-mod-bundle/1` document packaged together with the
-/// real [`ModDataBundle`] extracted from the JAR's `data/` members.
+/// real [`ModDataBundle`] extracted from the JAR's `data/` and `assets/`
+/// members.
 #[derive(Clone, Debug)]
 pub struct SynthesizedBundle {
     /// The validated bundle document.
@@ -281,11 +305,11 @@ pub struct JarAdaptationResult {
     pub culinary: Option<CulinaryDiscoveryStats>,
     /// Dimension-mod data discovery — `None` when skipped early.
     pub dimensions: Option<DimensionModData>,
-    /// Generic `data/` + bytecode surface counts.
+    /// Generic `data/`/`assets/` + bytecode surface counts.
     pub data: GenericDataSummary,
-    /// The real parsed `data/` content extracted from the JAR — empty
-    /// only when the JAR was skipped before generic discovery ran or held
-    /// no `data/` members at all.
+    /// The real parsed `data/` and declared `assets/` content extracted
+    /// from the JAR — empty only when the JAR was skipped before generic
+    /// discovery ran or held no `data/`/`assets/` members at all.
     pub data_bundle: ModDataBundle,
     /// The validated `megu-mod-bundle/1` document — `Some` iff the
     /// tier is [`AdaptationTier::NativeBundle`].
@@ -445,12 +469,24 @@ fn classify_members(entries: &[crate::modpack::ZipMemberEntry], data: &mut Gener
             data.embedded_bundle = true;
             continue;
         }
-        let Some(rest) = name.strip_prefix("data/") else {
-            continue;
-        };
         if !name.ends_with(".json") {
             continue;
         }
+        if let Some(rest) = name.strip_prefix("assets/") {
+            let Some((_, rest)) = rest.split_once('/') else {
+                continue;
+            };
+            match rest.split('/').next().unwrap_or("") {
+                "blockstates" => data.blockstate_files += 1,
+                "models" => data.model_files += 1,
+                "items" => data.item_files += 1,
+                _ => {}
+            }
+            continue;
+        }
+        let Some(rest) = name.strip_prefix("data/") else {
+            continue;
+        };
         let Some((ns, rest)) = rest.split_once('/') else {
             continue;
         };
@@ -586,6 +622,25 @@ fn data_member_wanted(name: &str) -> bool {
     data_map_key_for_path(name).is_some() || biome_modifier_id_for_path(name).is_some()
 }
 
+/// Whether an `assets/<ns>/**.json` member feeds one of the declared
+/// asset families [`extract_mod_data`] lifts — `blockstates`, `models`,
+/// and `items` — and therefore earns a bounded read.
+fn asset_member_wanted(name: &str) -> bool {
+    let Some(rest) = name.strip_prefix("assets/") else {
+        return false;
+    };
+    if !name.ends_with(".json") {
+        return false;
+    }
+    let Some((_, rest)) = rest.split_once('/') else {
+        return false;
+    };
+    let Some((category, _)) = rest.split_once('/') else {
+        return false;
+    };
+    matches!(category, "blockstates" | "models" | "items")
+}
+
 fn data_load_error_message(e: &DataLoadError) -> &str {
     match e {
         DataLoadError::Io(m) | DataLoadError::Json(m) | DataLoadError::Zip(m) => m,
@@ -596,16 +651,22 @@ fn reject_member(bundle: &mut ModDataBundle, name: &str, reason: impl std::fmt::
     bundle.rejected_members.push(format!("{name} ({reason})"));
 }
 
-/// Extract the six 1.21.1 generic `data/` families from one mod JAR for
-/// ANY namespace — the real parsed content [`synthesize_bundle`]
-/// packages into the native artifact.
+/// Extract the six 1.21.1 generic `data/` families plus the declared
+/// `assets/` families from one mod JAR for ANY namespace — the real
+/// parsed content [`synthesize_bundle`] packages into the native
+/// artifact.
 ///
 /// Every `data/<ns>/(recipe|recipes|tags|tag|loot_table|loot_tables|
 /// dimension|dimension_type|worldgen|data_maps|neoforge/data_maps|
 /// neoforge/biome_modifier)/**.json` member is read through the crate's
 /// bounded ZIP reader (Stored and Deflate members, per-member and total
 /// byte budgets) and parsed by its family's real parser — nothing is
-/// faked, nothing is keyed on a hardcoded mod id.
+/// faked, nothing is keyed on a hardcoded mod id. Every
+/// `assets/<ns>/(blockstates|models|items)/**.json` member is read under
+/// the same budgets and recorded as declared ids (`models`, `items`) or
+/// parsed into its blockstate property table (`blockstates`), so the
+/// adapted output carries the blocks/items a data-driven mod ships even
+/// when no declarative bundle JSON exists.
 ///
 /// Fail-closed like the rest of the pipeline: a corrupt archive, an
 /// unsafe (traversal) member path, or a member the bounded reader
@@ -634,7 +695,7 @@ pub fn extract_mod_data(jar_bytes: &[u8], display: &str) -> Result<ModDataBundle
     for entry in &entries {
         let name = entry.name.as_str();
         validate_member_name(name).map_err(|why| format!("{display}: {why}: {name}"))?;
-        if !data_member_wanted(name) {
+        if !data_member_wanted(name) && !asset_member_wanted(name) {
             continue;
         }
         let bytes = read_zip_member(jar_bytes, entry, display)
@@ -650,6 +711,59 @@ pub fn extract_mod_data(jar_bytes: &[u8], display: &str) -> Result<ModDataBundle
             .ok_or_else(|| format!("{display}: data scan byte budget overflow"))?;
         if extracted > MAX_DATA_SCAN_BYTES {
             return Err(format!("{display}: data scan byte budget exceeded"));
+        }
+        if let Some((ns, rest)) = name
+            .strip_prefix("assets/")
+            .and_then(|rest| rest.split_once('/'))
+        {
+            if !ns.is_empty() {
+                let stem = rest.strip_suffix(".json").unwrap_or(rest);
+                match rest.split('/').next().unwrap_or("") {
+                    "blockstates" => {
+                        let Some(stem) = stem.strip_prefix("blockstates/") else {
+                            continue;
+                        };
+                        match parse_json(&bytes) {
+                            Err(e) => reject_member(
+                                &mut out,
+                                name,
+                                format!("unparseable: {}", data_load_error_message(&e)),
+                            ),
+                            Ok(doc) => match blockstate_properties(&doc) {
+                                Some(props) => {
+                                    out.blockstates.insert(format!("{ns}:{stem}"), props);
+                                }
+                                None => reject_member(
+                                    &mut out,
+                                    name,
+                                    "no 'variants' or 'multipart' blockstate form",
+                                ),
+                            },
+                        }
+                    }
+                    "models" => {
+                        let Some(stem) = stem.strip_prefix("models/") else {
+                            continue;
+                        };
+                        out.models.insert(format!("{ns}:{stem}"));
+                        if let Some(item) = stem.strip_prefix("item/") {
+                            if !item.is_empty() {
+                                out.items.insert(format!("{ns}:{item}"));
+                            }
+                        }
+                    }
+                    "items" => {
+                        let Some(stem) = stem.strip_prefix("items/") else {
+                            continue;
+                        };
+                        if !stem.is_empty() {
+                            out.items.insert(format!("{ns}:{stem}"));
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            continue;
         }
         let Some((ns, rest)) = name
             .strip_prefix("data/")
@@ -823,11 +937,17 @@ fn skipped_result(
 }
 
 /// Build the native adaptation artifact for a JAR: the embedded bundle
-/// verbatim when present, otherwise a synthesized empty-section
-/// `megu-mod-bundle/1` document carrying the mod id and its declared
-/// Minecraft range (or [`DEFAULT_BUNDLE_MC_RANGE`] when undeclared) —
-/// either way packaged with the real [`ModDataBundle`] the generic data
-/// extraction pass lifted out of the JAR.
+/// verbatim when present, otherwise a synthesized `megu-mod-bundle/1`
+/// document carrying the mod id and its declared Minecraft range (or
+/// [`DEFAULT_BUNDLE_MC_RANGE`] when undeclared) — either way packaged
+/// with the real [`ModDataBundle`] the generic data extraction pass
+/// lifted out of the JAR. The bundle schema is a closed gameplay-
+/// mechanics contract (portals, barriers, regions, creatures, channels,
+/// spells, statuses, rituals), so a synthesized document stays
+/// section-empty on purpose; the deterministic declared-entity metadata
+/// — blocks/blockstate properties, models, items, recipes, tags, loot
+/// tables, dimensions, data maps, biome modifiers — rides in the
+/// companion [`ModDataBundle`], never silently dropped.
 fn synthesize_bundle(
     embedded: Option<DeclarativeModBundle>,
     descriptor: Option<&ModJarDescriptor>,
@@ -1134,10 +1254,13 @@ pub fn auto_adapt_jar_bytes(
             + data_bundle.dimensions.dimensions.len()
             + data_bundle.dimensions.dimension_types.len()
             + data_bundle.data_maps.keys().len()
-            + data_bundle.biome_modifiers.len();
+            + data_bundle.biome_modifiers.len()
+            + data_bundle.blockstates.len()
+            + data_bundle.models.len()
+            + data_bundle.items.len();
         if extracted_families > 0 || !data_bundle.rejected_members.is_empty() {
             audit_notes.push(format!(
-                "generic data extraction: {} recipe(s), {} tag(s), {} loot table(s), {} dimension(s), {} dimension type(s), {} NeoForge data map(s), {} biome modifier(s), {} rejected member(s)",
+                "generic data extraction: {} recipe(s), {} tag(s), {} loot table(s), {} dimension(s), {} dimension type(s), {} NeoForge data map(s), {} biome modifier(s), {} blockstate(s), {} model(s), {} item(s), {} rejected member(s)",
                 data_bundle.recipes.len(),
                 data_bundle.tags.len(),
                 data_bundle.loot_tables.len(),
@@ -1145,6 +1268,9 @@ pub fn auto_adapt_jar_bytes(
                 data_bundle.dimensions.dimension_types.len(),
                 data_bundle.data_maps.keys().len(),
                 data_bundle.biome_modifiers.len(),
+                data_bundle.blockstates.len(),
+                data_bundle.models.len(),
+                data_bundle.items.len(),
                 data_bundle.rejected_members.len(),
             ));
         }
@@ -2022,6 +2148,21 @@ fn json_data_summary(out: &mut String, level: usize, data: &GenericDataSummary) 
     jf_u64(
         out,
         level + 1,
+        "blockstate_files",
+        data.blockstate_files as u64,
+        true,
+    );
+    jf_u64(
+        out,
+        level + 1,
+        "model_files",
+        data.model_files as u64,
+        true,
+    );
+    jf_u64(out, level + 1, "item_files", data.item_files as u64, true);
+    jf_u64(
+        out,
+        level + 1,
         "java_class_members",
         data.java_class_members as u64,
         true,
@@ -2044,7 +2185,8 @@ fn json_data_summary(out: &mut String, level: usize, data: &GenericDataSummary) 
 }
 
 /// The `"data_bundle"` section: per-family id lists for the real parsed
-/// generic `data/` content [`extract_mod_data`] lifted out of the JAR.
+/// generic `data/` content and declared `assets/` content
+/// [`extract_mod_data`] lifted out of the JAR.
 fn json_data_bundle(out: &mut String, level: usize, data: &ModDataBundle) {
     use std::fmt::Write;
     let _ = writeln!(out, "{:width$}\"data_bundle\": {{", "", width = level * 2);
@@ -2119,6 +2261,27 @@ fn json_data_bundle(out: &mut String, level: usize, data: &ModDataBundle) {
             .iter()
             .map(|m| m.id.clone())
             .collect::<Vec<_>>(),
+        true,
+    );
+    jf_str_list(
+        out,
+        level + 1,
+        "blockstates",
+        &data.blockstates.keys().cloned().collect::<Vec<_>>(),
+        true,
+    );
+    jf_str_list(
+        out,
+        level + 1,
+        "models",
+        &data.models.iter().cloned().collect::<Vec<_>>(),
+        true,
+    );
+    jf_str_list(
+        out,
+        level + 1,
+        "items",
+        &data.items.iter().cloned().collect::<Vec<_>>(),
         true,
     );
     jf_str_list(out, level + 1, "rejected_members", &data.rejected_members, false);
@@ -2450,17 +2613,23 @@ fn format_adapt_human(result: &JarAdaptationResult) -> String {
         + db.dimensions.dimensions.len()
         + db.dimensions.dimension_types.len()
         + db.data_maps.keys().len()
-        + db.biome_modifiers.len();
+        + db.biome_modifiers.len()
+        + db.blockstates.len()
+        + db.models.len()
+        + db.items.len();
     if extracted > 0 || !db.rejected_members.is_empty() {
         let _ = writeln!(
             out,
-            "  extracted: {} recipe(s), {} tag(s), {} loot table(s), {} dimension document(s), {} data map(s), {} biome modifier(s), {} rejected member(s)",
+            "  extracted: {} recipe(s), {} tag(s), {} loot table(s), {} dimension document(s), {} data map(s), {} biome modifier(s), {} blockstate(s), {} model(s), {} item(s), {} rejected member(s)",
             db.recipes.len(),
             db.tags.len(),
             db.loot_tables.len(),
             db.dimensions.dimensions.len() + db.dimensions.dimension_types.len(),
             db.data_maps.keys().len(),
             db.biome_modifiers.len(),
+            db.blockstates.len(),
+            db.models.len(),
+            db.items.len(),
             db.rejected_members.len(),
         );
     }
@@ -2974,6 +3143,48 @@ mod tests {
         ])
     }
 
+    /// Data-driven block/item mod: `assets/` blockstates + models + a
+    /// client item definition plus `data/` recipe/tag — no bundle JSON,
+    /// no bytecode.
+    fn data_driven_assets_jar() -> Vec<u8> {
+        let manifest = fabric_manifest("gemmod", "1.0.0", "");
+        jar(&[
+            ("fabric.mod.json", manifest.as_bytes()),
+            (
+                "assets/gemmod/blockstates/gem_block.json",
+                br#"{"variants":{"axis=x":{"model":"gemmod:block/gem_block"},"axis=y":{"model":"gemmod:block/gem_block"},"axis=z":{"model":"gemmod:block/gem_block"}}}"#,
+            ),
+            (
+                "assets/gemmod/blockstates/gem_ore.json",
+                br#"{"multipart":[{"when":{"facing":"north|south|up"},"apply":{"model":"gemmod:block/gem_ore"}}]}"#,
+            ),
+            (
+                "assets/gemmod/blockstates/broken.json",
+                b"{not json".as_slice(),
+            ),
+            (
+                "assets/gemmod/models/block/gem_block.json",
+                br#"{"parent":"minecraft:block/cube_all","textures":{"all":"gemmod:block/gem_block"}}"#,
+            ),
+            (
+                "assets/gemmod/models/item/gem_block.json",
+                br#"{"parent":"gemmod:block/gem_block"}"#,
+            ),
+            (
+                "assets/gemmod/items/gem_wand.json",
+                br#"{"model":{"type":"minecraft:model","model":"gemmod:item/gem_wand"}}"#,
+            ),
+            (
+                "data/gemmod/recipes/gem_block.json",
+                br#"{"type":"minecraft:crafting_shaped","ingredients":["gemmod:raw_gem"],"result":{"id":"gemmod:gem_block","count":1}}"#,
+            ),
+            (
+                "data/gemmod/tags/items/gems.json",
+                br#"{"values":["gemmod:raw_gem","gemmod:gem_block"]}"#,
+            ),
+        ])
+    }
+
     /// Culinary mod: Fabric manifest + a `*:cooking` recipe + an item tag.
     fn culinary_jar() -> Vec<u8> {
         let manifest = fabric_manifest("tastymod", "1.2.3", "");
@@ -3172,6 +3383,66 @@ mod tests {
         assert_eq!(result.data.recipe_files, 1);
         assert_eq!(result.data.tag_files, 1);
         assert_eq!(result.data.java_class_members, 0);
+    }
+
+    #[test]
+    fn data_driven_assets_populate_the_synthesized_artifact() {
+        // A JAR with no bundle JSON and no bytecode still ships real
+        // declared-entity metadata; the adapted artifact records it
+        // instead of surfacing an empty manifest stub.
+        let result =
+            auto_adapt_jar_bytes(&data_driven_assets_jar(), "gemmod-1.0.0.jar", &opts())
+                .expect("data-driven assets JAR adapts");
+        assert_eq!(result.tier, AdaptationTier::NativeBundle, "{:?}", result.blockers);
+        let bundle = result.bundle.as_ref().expect("native jar emits a bundle");
+        assert_eq!(bundle.mod_id, "gemmod");
+        DeclarativeModBundle::from_json(&bundle.to_json()).expect("bundle validates");
+
+        // The classified surface counted every declared asset family.
+        assert_eq!(result.data.blockstate_files, 3);
+        assert_eq!(result.data.model_files, 2);
+        assert_eq!(result.data.item_files, 1);
+
+        // The real parsed content: blockstate property tables, declared
+        // model and item ids, the recipe and the tag.
+        let db = &result.data_bundle;
+        assert_eq!(
+            db.blockstates.get("gemmod:gem_block"),
+            Some(&vec![PropertyDef::new("axis", &["x", "y", "z"])])
+        );
+        assert_eq!(
+            db.blockstates.get("gemmod:gem_ore"),
+            Some(&vec![PropertyDef::new("facing", &["north", "south", "up"])])
+        );
+        assert!(db.models.contains("gemmod:block/gem_block"));
+        assert!(db.models.contains("gemmod:item/gem_block"));
+        assert_eq!(
+            db.items.iter().cloned().collect::<Vec<_>>(),
+            vec![
+                "gemmod:gem_block".to_string(),
+                "gemmod:gem_wand".to_string()
+            ]
+        );
+        assert_eq!(db.recipes.len(), 1);
+        assert_eq!(db.recipes[0].name, "gemmod:gem_block");
+        assert_eq!(db.tags.len(), 1);
+        // The corrupt blockstate member is recorded, never silently
+        // dropped.
+        assert_eq!(db.rejected_members.len(), 1);
+        assert!(db.rejected_members[0].contains("blockstates/broken.json"));
+
+        // The deterministic report and audit trail surface the declared
+        // entity lists too.
+        let json = result.to_json();
+        crate::data_loader::parse_json(json.as_bytes()).expect("result JSON parses");
+        for key in ["\"blockstates\"", "\"models\"", "\"items\""] {
+            assert!(json.contains(key), "report missing {key}");
+        }
+        assert!(json.contains("gemmod:gem_block"));
+        assert!(result
+            .audit_notes
+            .iter()
+            .any(|n| n.contains("2 blockstate(s)") && n.contains("2 model(s)")));
     }
 
     #[test]

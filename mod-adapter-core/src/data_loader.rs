@@ -354,6 +354,14 @@ fn ingest_entry(
 /// only when the file is not a blockstate object at all.
 fn parse_blockstate_properties(bytes: &[u8]) -> Option<Vec<PropertyDef>> {
     let root = parse_json(bytes).ok()?;
+    blockstate_properties(&root)
+}
+
+/// [`parse_blockstate_properties`] over an already-parsed [`JsonValue`]
+/// root — the shared AST form the auto-adapter's `assets/` extraction
+/// reuses after its own bounded read. Returns `None` only when the
+/// document is not a blockstate object at all.
+pub fn blockstate_properties(root: &JsonValue) -> Option<Vec<PropertyDef>> {
     let obj = root.as_object()?;
     let mut props: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
     let mut seen_form = false;
