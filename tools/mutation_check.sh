@@ -1445,10 +1445,10 @@ check "a full nearby player does not monopolize the drop" \
 
 check "the pickup tick forwards infinite materials to inventory insertion" \
   src/menus_and_items.rs '    for (deid, c) in taken {
-        let selected = *c.held.lock().unwrap();
-        let creative = *c.gm.lock().unwrap() == 1;' \
+        let selected = *c.held.lock().unwrap_or_else(|e| e.into_inner());
+        let creative = *c.gm.lock().unwrap_or_else(|e| e.into_inner()) == 1;' \
   '    for (deid, c) in taken {
-        let selected = *c.held.lock().unwrap();
+        let selected = *c.held.lock().unwrap_or_else(|e| e.into_inner());
         let creative = false;' \
   pickup_tick_tries_the_next_player_but_never_inserts_a_stale_stack
 
@@ -1915,16 +1915,16 @@ check "independent generators cannot share generated tick queues" \
   worldgen::wg_tests::generated_ticks_belong_to_their_generator
 
 check "runtime drains the published generator queues" \
-  src/worldgen.rs '        *GEN_TICK_QUEUES.lock().unwrap() = Some(ticks);' \
-  '        *GEN_TICK_QUEUES.lock().unwrap() = None;' \
+  src/worldgen.rs '        *GEN_TICK_QUEUES.lock().unwrap_or_else(|e| e.into_inner()) = Some(ticks);' \
+  '        *GEN_TICK_QUEUES.lock().unwrap_or_else(|e| e.into_inner()) = None;' \
   worldgen::wg_tests::runtime_drains_only_published_ticks_without_the_gen_lock
 
 check "runtime tick drain does not wait for the generation lock" \
   src/worldgen.rs 'pub fn take_generated_leaf_ticks() -> Vec<GeneratedTick> {
-    let queues = GEN_TICK_QUEUES.lock().unwrap().clone();' \
+    let queues = GEN_TICK_QUEUES.lock().unwrap_or_else(|e| e.into_inner()).clone();' \
   'pub fn take_generated_leaf_ticks() -> Vec<GeneratedTick> {
     let _guard = gen_lock();
-    let queues = GEN_TICK_QUEUES.lock().unwrap().clone();' \
+    let queues = GEN_TICK_QUEUES.lock().unwrap_or_else(|e| e.into_inner()).clone();' \
   worldgen::wg_tests::runtime_drains_only_published_ticks_without_the_gen_lock
 
 check "generated handoff retains native negative suborders" \
@@ -3948,11 +3948,11 @@ check "p2_3_s4_portal_horizontal_scaling" \
   tick_tests::p2_3_s4_portal_scaling_clamps_y_and_the_arrival_guard_blocks_bounce
 
 check "p2_3_s4_logout_saves_the_live_dimension" \
-  src/save_v2.rs '    let dim = c.dim.lock().unwrap();
-    let p = *c.pos.lock().unwrap();
+  src/save_v2.rs '    let dim = c.dim.lock().unwrap_or_else(|e| e.into_inner());
+    let p = *c.pos.lock().unwrap_or_else(|e| e.into_inner());
     (*dim, p.0, p.1, p.2, p.3, p.4)' \
-  '    let _dim = c.dim.lock().unwrap();
-    let p = *c.pos.lock().unwrap();
+  '    let _dim = c.dim.lock().unwrap_or_else(|e| e.into_inner());
+    let p = *c.pos.lock().unwrap_or_else(|e| e.into_inner());
     (DimId::Overworld, p.0, p.1, p.2, p.3, p.4)' \
   tick_tests::p2_3_s4_logout_persists_the_clients_live_dimension
 

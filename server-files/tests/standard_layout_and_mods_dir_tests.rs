@@ -24,7 +24,7 @@ impl Scratch {
             NEXT_DIR.fetch_add(1, Ordering::Relaxed)
         ));
         std::fs::create_dir_all(&root).unwrap();
-        Self(root)
+        Self(std::fs::canonicalize(&root).unwrap())
     }
 
     fn path(&self, rel: &str) -> PathBuf {

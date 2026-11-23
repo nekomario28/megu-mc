@@ -24,7 +24,7 @@ impl TestDir {
             DIR_COUNTER.fetch_add(1, Ordering::Relaxed)
         ));
         std::fs::create_dir_all(&dir).unwrap();
-        Self(dir)
+        Self(std::fs::canonicalize(&dir).unwrap())
     }
 
     fn path(&self, name: &str) -> PathBuf {

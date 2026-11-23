@@ -381,7 +381,7 @@ fn scratch_dir(tag: &str) -> PathBuf {
         std::process::id()
     ));
     std::fs::create_dir_all(&dir).unwrap();
-    dir
+    std::fs::canonicalize(&dir).unwrap()
 }
 
 fn write_file(path: &PathBuf, bytes: &[u8]) {
