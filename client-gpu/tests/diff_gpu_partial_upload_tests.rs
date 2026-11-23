@@ -145,7 +145,7 @@ fn read_buffer(
 // ---------------------------------------------------------------------------
 
 #[test]
-fn rx7800_gpu_indirect_diff_uploads_zero_bytes_steady_and_partial_span_on_single_edit() {
+fn gpu_indirect_diff_uploads_zero_bytes_steady_and_partial_span_on_single_edit() {
     let Some(ctx) = try_gpu() else {
         return;
     };

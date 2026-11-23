@@ -173,7 +173,7 @@ fn read_buffer(
 // ---------------------------------------------------------------------------
 
 #[test]
-fn rx7800_gpu_indirect_draw_matches_direct_render_pixels_and_builds_hiz_pyramid() {
+fn gpu_indirect_draw_matches_direct_render_pixels_and_builds_hiz_pyramid() {
     let Some(ctx) = try_gpu() else {
         return;
     };

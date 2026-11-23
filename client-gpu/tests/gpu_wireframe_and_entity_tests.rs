@@ -3,7 +3,7 @@
 
 use megu_client_gpu::atmosphere::{AtmosphereParams, BiomeAtmosphereBlender, ChunkFadeTracker};
 use megu_client_gpu::renderer::{
-    probe_adapters, request_gpu_device, ComposedFrame, GpuRenderer, MAX_DEBUG_LINES,
+    request_gpu_device, ComposedFrame, GpuRenderer, MAX_DEBUG_LINES,
     OFFSCREEN_FORMAT,
 };
 use megu_client_gpu::subworld_render::{SubWorldRenderBank, DEBUG_LINE_WGSL};
@@ -45,7 +45,7 @@ fn render(renderer: &mut GpuRenderer, camera: &Camera) -> Vec<u8> {
 }
 
 #[test]
-fn rx7800_xt_debug_lines_entities_ber_particles_readback() {
+fn gpu_debug_lines_entities_ber_particles_readback() {
     let module = wgsl::parse_str(DEBUG_LINE_WGSL).unwrap_or_else(|error| {
         panic!("debug line WGSL: {}", error.emit_to_string(DEBUG_LINE_WGSL))
     });
@@ -53,27 +53,23 @@ fn rx7800_xt_debug_lines_entities_ber_particles_readback() {
         .validate(&module)
         .expect("debug-line naga validation");
 
-    let adapters = probe_adapters(RenderBackendPreference::Auto);
-    if !adapters.iter().any(|adapter| {
-        adapter.vendor_id == 0x1002 && adapter.name.contains("7800")
-    }) {
-        eprintln!("SKIP RX 7800 XT integration: required AMD adapter is unavailable");
-        return;
-    }
-    let ctx = request_gpu_device(RenderBackendPreference::Auto, None, None)
-        .expect("RX 7800 XT GPU device");
+    let ctx = match request_gpu_device(RenderBackendPreference::Auto, None, None) {
+        Ok(ctx) => ctx,
+        Err(err) => {
+            eprintln!("SKIP GPU readback integration: no wgpu adapter available ({err})");
+            return;
+        }
+    };
     eprintln!(
         "GPU wireframe and entities on {} vendor {:04x}",
         ctx.report.name, ctx.report.vendor_id
     );
-    assert_eq!(ctx.report.vendor_id, 0x1002, "RX 7800 XT AMD GPU required");
-    assert!(ctx.report.name.contains("7800"), "RX 7800 XT GPU required");
 
     let mut renderer = GpuRenderer::new(ctx, OFFSCREEN_FORMAT);
     assert_eq!(
         renderer.set_shadow_quality(BuiltinShadowQuality::Low),
         BuiltinShadowQuality::Low,
-        "RX 7800 XT must accept the CSM shadowed lit pipeline"
+        "adapter must accept the CSM shadowed lit pipeline"
     );
     let camera = Camera {
         position: [8.0, 3.3, 20.0],
