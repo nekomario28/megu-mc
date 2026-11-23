@@ -2268,16 +2268,74 @@ fn live_create_is_water(st: u32) -> bool {
     })
 }
 
+/// `create:pressing` — a powered `create:mechanical_press` two blocks above
+/// a depot or basin. `(input_item, output_item)` names resolved once at
+/// arm-time through the real item tables.
+#[cfg(feature = "mod-suite")]
+const LIVE_CREATE_PRESSING: &[(&str, &str)] = &[
+    ("minecraft:iron_ingot", "create:iron_sheet"),
+    ("minecraft:gold_ingot", "create:gold_sheet"),
+    ("minecraft:copper_ingot", "create:copper_sheet"),
+    ("create:brass_ingot", "create:brass_sheet"),
+];
+
+/// `create:mixing` — a powered `create:mechanical_mixer` two blocks above a
+/// basin. `(&input_items, output_item)`.
+#[cfg(feature = "mod-suite")]
+const LIVE_CREATE_MIXING: &[(&[&str], &str)] = &[
+    (
+        &["minecraft:copper_ingot", "create:zinc_ingot"],
+        "create:brass_ingot",
+    ),
+    (
+        &["minecraft:andesite", "minecraft:iron_nugget"],
+        "create:andesite_alloy",
+    ),
+];
+
+/// Processing duration in ticks at `REFERENCE_RPM` — progress accrues in
+/// rpm·tick units so a faster shaft finishes proportionally sooner.
+#[cfg(feature = "mod-suite")]
+const LIVE_CREATE_PROCESS_TICKS: u32 = 40;
+
+/// One resolved processing recipe: an input multiset -> one output item.
+#[cfg(feature = "mod-suite")]
+struct LiveCreateRecipe {
+    inputs: Vec<i64>,
+    output: i64,
+    base_ticks: u32,
+}
+
+/// Items resting on a depot or inside a basin. `progress` accrues
+/// rpm·ticks while a powered press/mixer two blocks above can match a
+/// recipe against `items`; `active` pins the accruing recipe (`0..` =
+/// `pressing`, `0x100..` = `mixing`) so a changed match restarts cleanly.
+#[cfg(feature = "mod-suite")]
+#[derive(Default)]
+struct LiveCreateHeld {
+    items: Vec<i64>,
+    progress: f64,
+    active: Option<u16>,
+}
+
 /// Live `CreateFactory` bound to the server world. `placed` mirrors every
 /// Create block currently in the world (the authoritative set for
 /// persistence); `dormant` marks the subset — water wheels with no adjacent
 /// water — that are placed but intentionally NOT registered in the kinetic
-/// graph so they contribute no RPM until flow arrives.
+/// graph so they contribute no RPM until flow arrives. `held` is the
+/// depot/basin item slot state persisted beside `placed`; `belt_machines`
+/// maps belt blocks onto their lazily-registered `SleepingTransport`
+/// machine ids.
 #[cfg(feature = "mod-suite")]
 struct LiveCreateRuntime {
     factory: create_adapter::factory::CreateFactory,
     placed: std::collections::BTreeMap<create_adapter::factory::DimBlockPos, u32>,
     dormant: std::collections::BTreeSet<create_adapter::factory::DimBlockPos>,
+    held: std::collections::BTreeMap<create_adapter::factory::DimBlockPos, LiveCreateHeld>,
+    belt_machines: std::collections::BTreeMap<create_adapter::factory::DimBlockPos, u32>,
+    next_machine_id: u32,
+    pressing: Vec<LiveCreateRecipe>,
+    mixing: Vec<LiveCreateRecipe>,
     /// Number of non-empty kinetic batches drained since boot (test hook).
     kinetic_batches_emitted: u64,
 }
@@ -2303,6 +2361,32 @@ fn live_create_runtime_init() -> Option<LiveCreateRuntime> {
         factory: create_adapter::factory::CreateFactory::new(registry),
         placed: std::collections::BTreeMap::new(),
         dormant: std::collections::BTreeSet::new(),
+        held: std::collections::BTreeMap::new(),
+        belt_machines: std::collections::BTreeMap::new(),
+        next_machine_id: 1,
+        pressing: LIVE_CREATE_PRESSING
+            .iter()
+            .filter_map(|&(input, output)| {
+                Some(LiveCreateRecipe {
+                    inputs: vec![name_to_item(input)?],
+                    output: name_to_item(output)?,
+                    base_ticks: LIVE_CREATE_PROCESS_TICKS,
+                })
+            })
+            .collect(),
+        mixing: LIVE_CREATE_MIXING
+            .iter()
+            .filter_map(|&(inputs, output)| {
+                Some(LiveCreateRecipe {
+                    inputs: inputs
+                        .iter()
+                        .map(|&n| name_to_item(n))
+                        .collect::<Option<_>>()?,
+                    output: name_to_item(output)?,
+                    base_ticks: LIVE_CREATE_PROCESS_TICKS,
+                })
+            })
+            .collect(),
         kinetic_batches_emitted: 0,
     })
 }
@@ -2359,8 +2443,29 @@ impl LiveCreateRuntime {
         if !self.is_create_state(st) {
             self.placed.remove(&pos);
             self.dormant.remove(&pos);
+            self.held.remove(&pos);
+            self.belt_machines.remove(&pos);
             let _ = self.factory.remove_block(pos);
             return;
+        }
+        // The block keeps its cell: drop slot/machine state the new state
+        // can no longer own (e.g. a depot swapped for a shaft).
+        match self
+            .factory
+            .registry()
+            .block_def_for_state(st)
+            .map(|def| def.id.as_str())
+        {
+            Some("create:depot" | "create:basin") => {
+                self.belt_machines.remove(&pos);
+            }
+            Some("create:mechanical_belt") => {
+                self.held.remove(&pos);
+            }
+            _ => {
+                self.held.remove(&pos);
+                self.belt_machines.remove(&pos);
+            }
         }
         let active = !self.is_water_wheel(st) || self.adjacent_water(pos);
         if active
@@ -2407,8 +2512,11 @@ impl LiveCreateRuntime {
 
     /// Rebuild the whole runtime from saved entries (`load_entries` is only
     /// reached after the world overlay is applied, so `adjacent_water`
-    /// already sees the restored fluids).
-    fn load_entries(&mut self, entries: Vec<(FactoryPos, u32)>) {
+    /// already sees the restored fluids). Each entry carries the items
+    /// resting on the cell at save time; they are re-seated only when the
+    /// restored block is still a depot/basin, otherwise dropped — in-flight
+    /// progress is intentionally not saved.
+    fn load_entries(&mut self, entries: Vec<(FactoryPos, u32, Vec<i64>)>) {
         self.factory = create_adapter::factory::CreateFactory::new(
             create_adapter::blockstates::core_create_registry(
                 create_adapter::blockstates::DEFAULT_BASE_STATE_ID,
@@ -2416,8 +2524,136 @@ impl LiveCreateRuntime {
         );
         self.placed.clear();
         self.dormant.clear();
-        for (pos, st) in entries {
+        self.held.clear();
+        self.belt_machines.clear();
+        self.next_machine_id = 1;
+        for (pos, st, items) in entries {
             self.sync_cell(pos, st);
+            if items.is_empty() {
+                continue;
+            }
+            let cap = match self
+                .factory
+                .registry()
+                .block_def_for_state(st)
+                .map(|def| def.id.as_str())
+            {
+                Some("create:depot") => 1,
+                Some("create:basin") => 9,
+                _ => continue,
+            };
+            let mut held = LiveCreateHeld::default();
+            held.items = items.into_iter().take(cap).collect();
+            self.held.insert(pos, held);
+        }
+    }
+
+    /// Lazily register the `SleepingTransport` machine behind a belt block
+    /// and return its region-local id. The traversal delay scales
+    /// inversely with the belt's solved RPM (floor 8 rpm -> 8 ticks).
+    fn belt_machine(&mut self, pos: FactoryPos) -> u32 {
+        if let Some(&id) = self.belt_machines.get(&pos) {
+            return id;
+        }
+        let id = self.next_machine_id;
+        self.next_machine_id = self.next_machine_id.saturating_add(1).max(1);
+        let rpm = self
+            .factory
+            .kinetic_solution(pos)
+            .map(|sol| sol.speed.abs())
+            .unwrap_or(0.0);
+        let delay = (64.0 / rpm.max(8.0)).round().clamp(1.0, 64.0) as u64;
+        let _ = self.factory.add_belt_segment(pos, id, 1, delay);
+        self.belt_machines.insert(pos, id);
+        id
+    }
+
+    /// Active processing pass, run once per `live_create_tick` before the
+    /// factory steps: every depot/basin holding items looks for a powered
+    /// `create:mechanical_press` (depot or basin) or `create:mechanical_mixer`
+    /// (basin only) two blocks above and accrues `rpm` progress. Reaching
+    /// `base_ticks * REFERENCE_RPM` consumes the recipe inputs and leaves
+    /// the product in the same slot — deterministic and proportional to
+    /// the solved speed.
+    fn tick_processing(&mut self) {
+        if self.held.is_empty() {
+            return;
+        }
+        let positions: Vec<FactoryPos> = self.held.keys().copied().collect();
+        for pos in positions {
+            let Some(&st) = self.placed.get(&pos) else {
+                self.held.remove(&pos);
+                continue;
+            };
+            let basin = self
+                .factory
+                .registry()
+                .block_def_for_state(st)
+                .is_some_and(|def| def.id == "create:basin");
+            let depot = !basin
+                && self
+                    .factory
+                    .registry()
+                    .block_def_for_state(st)
+                    .is_some_and(|def| def.id == "create:depot");
+            if !basin && !depot {
+                self.held.remove(&pos);
+                continue;
+            }
+            let proc_pos = pos.offset(0, 2, 0);
+            let Some(&pst) = self.placed.get(&proc_pos) else {
+                continue;
+            };
+            let Some(pdef) = self.factory.registry().block_def_for_state(pst) else {
+                continue;
+            };
+            let mixer = basin && pdef.id == "create:mechanical_mixer";
+            if pdef.id != "create:mechanical_press" && !mixer {
+                continue;
+            }
+            let Some(sol) = self.factory.kinetic_solution(proc_pos) else {
+                continue;
+            };
+            if !matches!(
+                sol.status,
+                mod_offload::kinetic_graph::NetworkStatus::Running
+            ) || sol.speed.abs() < 1e-6
+            {
+                continue;
+            }
+            let rpm = sol.speed.abs();
+            let recipes = if mixer { &self.mixing } else { &self.pressing };
+            let Some(slot) = self.held.get_mut(&pos) else {
+                continue;
+            };
+            let Some((idx, recipe)) = recipes
+                .iter()
+                .enumerate()
+                .find(|(_, r)| r.inputs.iter().all(|need| slot.items.contains(need)))
+            else {
+                slot.progress = 0.0;
+                slot.active = None;
+                continue;
+            };
+            let key = idx as u16 + if mixer { 0x100 } else { 0 };
+            if slot.active != Some(key) {
+                slot.active = Some(key);
+                slot.progress = 0.0;
+            }
+            slot.progress += rpm;
+            let need = f64::from(recipe.base_ticks)
+                * f64::from(mod_offload::recipe_processor::REFERENCE_RPM);
+            if slot.progress < need {
+                continue;
+            }
+            for input in &recipe.inputs {
+                if let Some(at) = slot.items.iter().position(|item| item == input) {
+                    slot.items.remove(at);
+                }
+            }
+            slot.items.push(recipe.output);
+            slot.progress = 0.0;
+            slot.active = None;
         }
     }
 
@@ -2632,6 +2868,137 @@ fn live_create_wrench_rotate(pos: FactoryPos, clicked: u32) -> Option<u32> {
     .flatten()
 }
 
+/// Right-click on a tracked `create:depot`, `create:mechanical_belt` or
+/// `create:basin` without the wrench. A held item inserts one unit into the
+/// machine's item slot (depot 1, basin 9, belt input 1) and the caller
+/// consumes it like a placement; an empty hand — or any sneak-click —
+/// pulls the stored or processed item back through the vanilla
+/// `Inventory.add` pickup path. Returns `false` when the click is not
+/// handled so the normal placement/interaction flow still runs.
+#[cfg(feature = "mod-suite")]
+fn live_create_interact_block(
+    me: &Client,
+    dim: DimId,
+    x: i32,
+    y: i32,
+    z: i32,
+    clicked: u32,
+    held_slot: i16,
+) -> bool {
+    if !live_create_enabled() || *me.gm.lock().unwrap_or_else(|e| e.into_inner()) == 3 {
+        return false;
+    }
+    let held_item = me
+        .inv
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .get(&(36 + held_slot))
+        .map(|s| s.0)
+        .unwrap_or(0);
+    if live_create_item_name(held_item) == Some("create:wrench") {
+        return false;
+    }
+    let sneaking = *me.sneaking.lock().unwrap_or_else(|e| e.into_inner());
+    let pos = FactoryPos::new(dim.raw() as i32, x, y, z);
+    enum LiveCreateInteract {
+        Inserted,
+        Gave(Vec<(i16, Stack)>),
+    }
+    let Some(outcome) = live_create_with(|rt| {
+        if rt.placed.get(&pos).copied() != Some(clicked) {
+            return None;
+        }
+        let id = rt.factory.registry().block_def_for_state(clicked)?.id.as_str();
+        let belt = id == "create:mechanical_belt";
+        let depot = id == "create:depot";
+        let basin = id == "create:basin";
+        if !belt && !depot && !basin {
+            return None;
+        }
+        if held_item != 0 && !sneaking {
+            if belt {
+                let machine = rt.belt_machine(pos);
+                let item = u32::try_from(held_item).ok()?;
+                rt.factory.insert_belt_item(pos, machine, item).ok()?;
+            } else {
+                let cap = if depot { 1 } else { 9 };
+                if rt.held.get(&pos).is_some_and(|s| s.items.len() >= cap) {
+                    return None;
+                }
+                let slot = rt.held.entry(pos).or_default();
+                slot.items.push(held_item);
+                slot.progress = 0.0;
+                slot.active = None;
+            }
+            return Some(LiveCreateInteract::Inserted);
+        }
+        // Retrieval: extract first, then `Inventory.add`; a full inventory
+        // re-seats the item so a failed grab never deletes it.
+        let item: i64 = if belt {
+            let machine = *rt.belt_machines.get(&pos)?;
+            rt.factory
+                .scheduler_mut()
+                .region_mut(pos.region_key())
+                .extract_output(machine)
+                .ok()?
+                .map(i64::from)?
+        } else {
+            rt.held.get_mut(&pos)?.items.pop()?
+        };
+        let mut inv = me.inv.lock().unwrap_or_else(|e| e.into_inner());
+        let selected = *me.held.lock().unwrap_or_else(|e| e.into_inner());
+        let creative = *me.gm.lock().unwrap_or_else(|e| e.into_inner()) == 1;
+        let before = inv.clone();
+        let mut source = (item, 1u8, Vec::new());
+        let accepted = pickup_into_inventory(&mut inv, selected, creative, &mut source);
+        if !accepted || source.1 != 0 {
+            if belt {
+                if let (Some(&machine), Ok(item)) =
+                    (rt.belt_machines.get(&pos), u32::try_from(item))
+                {
+                    let _ = rt.factory.insert_belt_item(pos, machine, item);
+                }
+            } else if let Some(slot) = rt.held.get_mut(&pos) {
+                slot.items.push(item);
+            }
+            return None;
+        }
+        if !belt && rt.held.get(&pos).is_some_and(|h| h.items.is_empty()) {
+            rt.held.remove(&pos);
+        }
+        let changed: Vec<(i16, Stack)> = (5..=45)
+            .filter_map(|slot| {
+                inv.get(&slot)
+                    .filter(|st| before.get(&slot) != Some(st))
+                    .map(|st| (slot, st.clone()))
+            })
+            .collect();
+        Some(LiveCreateInteract::Gave(changed))
+    })
+    .flatten() else {
+        return false;
+    };
+    match outcome {
+        LiveCreateInteract::Inserted => {
+            ac_consume_placed_item(me, held_slot);
+        }
+        LiveCreateInteract::Gave(changed) => {
+            for (slot, st) in changed {
+                let mut p = vec![0u8];
+                write_varint(&mut p, i64::from(inv_state_next(me)));
+                p.extend_from_slice(&slot.to_be_bytes());
+                p.extend_from_slice(&slot_wire(&st));
+                let _ = send_packet(
+                    &mut me.sock.lock().unwrap_or_else(|e| e.into_inner()),
+                    0x15,
+                    p,
+                );
+            }
+        }
+    }
+    true
+}
+
 /// The tick-half without the socket write — step the factory once, drain
 /// the coalesced `KineticUpdateTag` batch (only changed nodes; the
 /// fingerprint gate suppresses idle churn), and encode it for the wire.
@@ -2643,6 +3010,7 @@ fn live_create_tick_body() -> Option<Vec<u8>> {
     }
     let tick = TICK_IDX.load(Ordering::Relaxed);
     live_create_with(|rt| {
+        rt.tick_processing();
         let _ = rt.factory.step_tick(tick, 1_024, None);
         let mut drained = Vec::new();
         rt.factory.drain_update_batch_into(&mut drained);
@@ -2698,16 +3066,22 @@ fn live_create_sync_on_join(s: &mut TcpStream) {
 
 // ---- create_factory.bin sidecar ------------------------------------------
 //
-// Format (`MCF1`): magic(4) + VarInt entry_count + per entry
-// [ i32be dim | i32be x | i32be y | i32be z | VarStr canonical ], then a
+// Format (`MCF2`): magic(4) + VarInt entry_count + per entry
+// [ i32be dim | i32be x | i32be y | i32be z | VarStr canonical
+// | VarInt held_count | held_count x VarStr item_name ], then a
 // big-endian u32 FNV-1a checksum over every preceding byte. `canonical` is
 // `BlockRegistry::encode_canonical(state_id)` — e.g.
 // `create:shaft[axis=x,waterlogged=false]` — so the sidecar survives table
 // reordering; on load each entry is re-decoded through
-// `decode_canonical`. Any malformed tail fails the load closed.
+// `decode_canonical`. `item_name` is the `item_to_name` form of an item
+// resting on a depot/basin (processing progress is not saved). `MCF1`
+// files — the same layout without the item tail — still decode with empty
+// item lists. Any malformed tail fails the load closed.
 
 #[cfg(feature = "mod-suite")]
-const LIVE_CREATE_SIDECAR_MAGIC: &[u8; 4] = b"MCF1";
+const LIVE_CREATE_SIDECAR_MAGIC: &[u8; 4] = b"MCF2";
+#[cfg(feature = "mod-suite")]
+const LIVE_CREATE_SIDECAR_MAGIC_V1: &[u8; 4] = b"MCF1";
 #[cfg(feature = "mod-suite")]
 const LIVE_CREATE_SIDECAR_FILE: &str = "create_factory.bin";
 
@@ -2742,6 +3116,20 @@ fn live_create_serialize() -> Option<Vec<u8>> {
             out.extend_from_slice(&pos.z.to_be_bytes());
             let canon = registry.encode_canonical(*st).unwrap_or_default();
             write_str(&mut out, canon);
+            let names: Vec<&'static str> = rt
+                .held
+                .get(pos)
+                .map(|held| {
+                    held.items
+                        .iter()
+                        .filter_map(|item| item_to_name(*item))
+                        .collect()
+                })
+                .unwrap_or_default();
+            write_varint(&mut out, names.len() as i64);
+            for name in names {
+                write_str(&mut out, name);
+            }
         }
         let sum = live_create_fnv32(&out);
         out.extend_from_slice(&sum.to_be_bytes());
@@ -2749,15 +3137,18 @@ fn live_create_serialize() -> Option<Vec<u8>> {
     })
 }
 
-/// Decode + validate the sidecar into `(pos, state_id)` entries. Every
-/// malformed tail — bad magic, bad checksum, truncation, unknown canonical,
-/// impossible count — is `Err` so `load_world_in` fails closed.
+/// Decode + validate the sidecar into `(pos, state_id, held_items)`
+/// entries. `MCF1` entries carry no item tail and decode with an empty
+/// list. Every malformed tail — bad magic, bad checksum, truncation,
+/// unknown canonical or item name, impossible count — is `Err` so
+/// `load_world_in` fails closed.
 #[cfg(feature = "mod-suite")]
 fn live_create_decode_sidecar(
     raw: &[u8],
-) -> Result<Vec<(FactoryPos, u32)>, &'static str> {
+) -> Result<Vec<(FactoryPos, u32, Vec<i64>)>, &'static str> {
     const ERR: &str = "corrupt create factory save";
-    if raw.len() < 9 || raw[..4] != *LIVE_CREATE_SIDECAR_MAGIC {
+    let v2 = raw.len() >= 4 && raw[..4] == *LIVE_CREATE_SIDECAR_MAGIC;
+    if raw.len() < 9 || !(v2 || raw[..4] == *LIVE_CREATE_SIDECAR_MAGIC_V1) {
         return Err(ERR);
     }
     let (body, check) = raw.split_at(raw.len() - 4);
@@ -2790,7 +3181,24 @@ fn live_create_decode_sidecar(
         let canon = std::str::from_utf8(&rest[..strlen as usize]).map_err(|_| ERR)?;
         rest = &rest[strlen as usize..];
         let st = registry.decode_canonical(canon).ok_or(ERR)?;
-        entries.push((FactoryPos::new(dim, x, y, z), st));
+        let mut items = Vec::new();
+        if v2 {
+            let item_count = read_varint(&mut rest).ok_or(ERR)?;
+            if !(0..=64).contains(&item_count) {
+                return Err(ERR);
+            }
+            for _ in 0..item_count {
+                let slen = read_varint(&mut rest).ok_or(ERR)?;
+                if !(0..=256).contains(&slen) || rest.len() < slen as usize {
+                    return Err(ERR);
+                }
+                let name =
+                    std::str::from_utf8(&rest[..slen as usize]).map_err(|_| ERR)?;
+                rest = &rest[slen as usize..];
+                items.push(name_to_item(name).ok_or(ERR)?);
+            }
+        }
+        entries.push((FactoryPos::new(dim, x, y, z), st, items));
     }
     if !rest.is_empty() {
         return Err(ERR);
@@ -2826,6 +3234,21 @@ fn live_create_on_block_set(_dim: DimId, _x: i32, _y: i32, _z: i32, _old: u32, _
 #[allow(dead_code)]
 #[inline(always)]
 fn live_create_wrench_use(
+    _me: &Client,
+    _dim: DimId,
+    _x: i32,
+    _y: i32,
+    _z: i32,
+    _clicked: u32,
+    _held_slot: i16,
+) -> bool {
+    false
+}
+
+#[cfg(not(feature = "mod-suite"))]
+#[allow(dead_code)]
+#[inline(always)]
+fn live_create_interact_block(
     _me: &Client,
     _dim: DimId,
     _x: i32,
@@ -4141,7 +4564,7 @@ mod wire_mods_tests {
 
     /// A fresh client/server `TcpStream` pair: `send` is the end the server
     /// writes to, `peer` reads exactly those bytes.
-    fn lmb_socket_pair() -> (TcpStream, TcpStream) {
+    pub(crate) fn lmb_socket_pair() -> (TcpStream, TcpStream) {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let addr = listener.local_addr().unwrap();
         let send = TcpStream::connect(addr).unwrap();
@@ -4151,7 +4574,7 @@ mod wire_mods_tests {
 
     // ---------- loopback client fixture (same shape as play_protocol's) ----------
 
-    fn lmb_client(name: &str, eid: i32) -> (Arc<Client>, std::net::TcpStream) {
+    pub(crate) fn lmb_client(name: &str, eid: i32) -> (Arc<Client>, std::net::TcpStream) {
         let (stream, peer) = lmb_socket_pair();
         let me = Arc::new(Client {
             eid,
@@ -5618,6 +6041,8 @@ mod live_create_tests {
     const W3: (i32, i32, i32) = (9_000_000, 80, 200);
     const W4: (i32, i32, i32) = (9_000_000, 80, 300);
     const W5: (i32, i32, i32) = (9_000_000, 80, 400);
+    const W6: (i32, i32, i32) = (9_000_008, 80, 500);
+    const W7: (i32, i32, i32) = (9_000_000, 80, 600);
 
     fn pos_of(c: (i32, i32, i32)) -> FactoryPos {
         FactoryPos::new(DimId::Overworld.raw() as i32, c.0, c.1, c.2)
@@ -5636,6 +6061,25 @@ mod live_create_tests {
         // The belt alias resolves to the mechanical_belt block.
         let belt = live_create_resolve_item("create:belt").expect("belt item");
         assert_eq!(live_create_item_block_name(belt), Some("create:mechanical_belt"));
+        // Processed material items resolve through the same tables but
+        // never place a block.
+        for item in [
+            "create:iron_sheet",
+            "create:gold_sheet",
+            "create:copper_sheet",
+            "create:brass_sheet",
+            "create:andesite_alloy",
+            "create:brass_ingot",
+            "create:zinc_ingot",
+        ] {
+            let id = live_create_resolve_item(item).unwrap_or_else(|| {
+                panic!("missing item for {item}")
+            });
+            assert_eq!(live_create_item_name(id), Some(item));
+            assert_eq!(live_create_item_block_name(id), None);
+            assert_eq!(name_to_item(item), Some(id));
+            assert_eq!(item_to_name(id), Some(item));
+        }
         for block in [
             "create:water_wheel",
             "create:cogwheel",
@@ -5832,7 +6276,8 @@ mod live_create_tests {
         let bytes = live_create_serialize().expect("armed runtime serializes");
         let entries = live_create_decode_sidecar(&bytes).expect("sidecar decodes");
         assert_eq!(entries.len(), 1);
-        assert_eq!(entries[0], (pos_of(W3), wheel));
+        assert_eq!((entries[0].0, entries[0].1), (pos_of(W3), wheel));
+        assert!(entries[0].2.is_empty());
 
         // Rebuild into a fresh runtime and confirm the graph re-solves.
         live_create_with(|rt| rt.load_entries(entries.clone()));
@@ -5872,6 +6317,235 @@ mod live_create_tests {
 
         clear(sx, sy, sz);
         clear(sx + 1, sy, sz);
+    }
+
+    /// Drive `live_create_tick_body` for up to `max` game ticks, returning
+    /// early once `done` observes its condition inside the runtime.
+    fn step_until(max: u64, done: impl Fn(&mut LiveCreateRuntime) -> bool) -> bool {
+        let base = TICK_IDX.load(Ordering::Relaxed);
+        for i in 1..=max {
+            TICK_IDX.store(base + i, Ordering::Relaxed);
+            let _ = live_create_tick_body();
+            if live_create_with(&done).unwrap_or(false) {
+                return true;
+            }
+        }
+        false
+    }
+
+    #[test]
+    fn create_depot_right_click_press_and_retrieve() {
+        let _g = world_guard();
+        arm();
+        let (wx, wy, wz) = W6;
+        // water -> water_wheel(x) -> shaft(x) -> press(facing=east -> axis
+        // X); the depot sits two blocks below the press head.
+        let water = (wx + 1, wy, wz);
+        let shaft = (wx - 1, wy, wz);
+        let press = (wx - 2, wy, wz);
+        let depot = (wx - 2, wy - 2, wz);
+        for c in [water, shaft, press, depot] {
+            clear(c.0, c.1, c.2);
+        }
+        clear(wx, wy, wz);
+        put(DimId::Overworld, water.0, water.1, water.2, TEST_WATER);
+        put(DimId::Overworld, wx, wy, wz, state_of("create:water_wheel", &[("axis", "x")]));
+        put(DimId::Overworld, shaft.0, shaft.1, shaft.2, state_of("create:shaft", &[("axis", "x")]));
+        put(
+            DimId::Overworld,
+            press.0,
+            press.1,
+            press.2,
+            state_of("create:mechanical_press", &[("facing", "east")]),
+        );
+        let depot_st = state_of("create:depot", &[]);
+        put(DimId::Overworld, depot.0, depot.1, depot.2, depot_st);
+        let depot_pos = pos_of(depot);
+        live_create_with(|rt| {
+            let sol = rt
+                .factory
+                .kinetic_solution(pos_of(press))
+                .expect("press in graph");
+            assert!(
+                matches!(
+                    sol.status,
+                    mod_offload::kinetic_graph::NetworkStatus::Running
+                ),
+                "press must be powered, got {:?}",
+                sol.status
+            );
+        });
+
+        let (me, _peer) = wire_mods_tests::lmb_client("create_p2b_depot", 977_410);
+        ac_test_set_player_preset(&me.name, AcPreset::Standard);
+        let iron = name_to_item("minecraft:iron_ingot").expect("iron item");
+        me.inv
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(36, (iron, 4, Vec::new()));
+        *me.held.lock().unwrap_or_else(|e| e.into_inner()) = 0;
+
+        // Right-click inserts one ingot onto the depot and consumes it.
+        assert!(live_create_interact_block(
+            &me,
+            DimId::Overworld,
+            depot.0,
+            depot.1,
+            depot.2,
+            depot_st,
+            0
+        ));
+        assert_eq!(
+            me.inv
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .get(&36)
+                .map(|s| s.1),
+            Some(3),
+            "insertion consumes one held item"
+        );
+        live_create_with(|rt| {
+            assert_eq!(
+                rt.held.get(&depot_pos).map(|h| h.items.as_slice()),
+                Some(&[iron][..])
+            );
+        });
+        // The depot's single slot is occupied: a second insert is refused.
+        assert!(!live_create_interact_block(
+            &me,
+            DimId::Overworld,
+            depot.0,
+            depot.1,
+            depot.2,
+            depot_st,
+            0
+        ));
+
+        // A powered press two blocks above converts the ingot at a rate
+        // proportional to RPM; the sheet stays on the depot.
+        let sheet = name_to_item("create:iron_sheet").expect("sheet item");
+        assert!(
+            step_until(600, |rt| rt
+                .held
+                .get(&depot_pos)
+                .is_some_and(|h| h.items.as_slice() == [sheet])),
+            "press never produced create:iron_sheet"
+        );
+
+        // Persistence: the processed item rides the sidecar entry.
+        let bytes = live_create_serialize().expect("serialize");
+        let entries = live_create_decode_sidecar(&bytes).expect("decode");
+        let entry = entries.iter().find(|(p, _, _)| *p == depot_pos).unwrap();
+        assert_eq!(entry.2, vec![sheet]);
+        live_create_with(|rt| rt.load_entries(entries));
+        live_create_with(|rt| {
+            assert_eq!(
+                rt.held.get(&depot_pos).map(|h| h.items.as_slice()),
+                Some(&[sheet][..]),
+                "held item must survive a save/load roundtrip"
+            );
+        });
+
+        // Empty-handed right-click returns the sheet to the inventory.
+        me.inv
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(&36);
+        assert!(live_create_interact_block(
+            &me,
+            DimId::Overworld,
+            depot.0,
+            depot.1,
+            depot.2,
+            depot_st,
+            0
+        ));
+        assert_eq!(
+            me.inv
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .get(&36)
+                .map(|s| (s.0, s.1)),
+            Some((sheet, 1))
+        );
+        live_create_with(|rt| assert!(rt.held.get(&depot_pos).is_none_or(|h| h.items.is_empty())));
+        // Nothing left to take: empty hand on an empty depot is unhandled.
+        me.inv
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(&36);
+        assert!(!live_create_interact_block(
+            &me,
+            DimId::Overworld,
+            depot.0,
+            depot.1,
+            depot.2,
+            depot_st,
+            0
+        ));
+
+        for c in [water, shaft, press, depot] {
+            clear(c.0, c.1, c.2);
+        }
+        clear(wx, wy, wz);
+    }
+
+    #[test]
+    fn create_belt_insert_transport_and_retrieve() {
+        let _g = world_guard();
+        arm();
+        let (bx, by, bz) = W7;
+        clear(bx, by, bz);
+        let belt_st = state_of("create:mechanical_belt", &[("facing", "north")]);
+        put(DimId::Overworld, bx, by, bz, belt_st);
+        let belt_pos = pos_of(W7);
+
+        let (me, _peer) = wire_mods_tests::lmb_client("create_p2b_belt", 977_411);
+        ac_test_set_player_preset(&me.name, AcPreset::Standard);
+        let iron = name_to_item("minecraft:iron_ingot").expect("iron item");
+        me.inv
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(36, (iron, 2, Vec::new()));
+
+        // Insert one ingot onto the belt's transport machine.
+        assert!(live_create_interact_block(&me, DimId::Overworld, bx, by, bz, belt_st, 0));
+        assert_eq!(
+            me.inv
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .get(&36)
+                .map(|s| s.1),
+            Some(1)
+        );
+        live_create_with(|rt| assert!(rt.belt_machines.contains_key(&belt_pos)));
+
+        // After the traversal delay the item reaches the machine output.
+        let machine = live_create_with(|rt| rt.belt_machines[&belt_pos]).unwrap();
+        assert!(step_until(200, |rt| rt
+            .factory
+            .scheduler()
+            .region(belt_pos.region_key())
+            .is_some_and(|r| r.transport().machine(machine).is_some_and(
+                |m| m.output_items == 1
+            ))));
+
+        // Empty-handed click collects it back into the inventory.
+        me.inv
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(&36);
+        assert!(live_create_interact_block(&me, DimId::Overworld, bx, by, bz, belt_st, 0));
+        assert_eq!(
+            me.inv
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .get(&36)
+                .map(|s| (s.0, s.1)),
+            Some((iron, 1))
+        );
+
+        clear(bx, by, bz);
     }
 
     #[test]

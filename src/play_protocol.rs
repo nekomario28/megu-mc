@@ -11169,6 +11169,16 @@ fn handle_inner(mut s: TcpStream, live_eid: Arc<AtomicI32>) {
                     let _ = send_packet(&mut socket, 0x05, ack(seq));
                     continue;
                 }
+                // `create:depot`/`create:mechanical_belt`/`create:basin`
+                // (`mod-suite`): right-click inserts one held item into the
+                // machine slot; empty-handed or sneak-clicking pulls the
+                // stored/processed item back into the inventory.
+                #[cfg(feature = "mod-suite")]
+                if live_create_interact_block(&me, dim, x, y, z, clicked, held_slot) {
+                    let mut socket = me.sock.lock().unwrap_or_else(|e| e.into_inner());
+                    let _ = send_packet(&mut socket, 0x05, ack(seq));
+                    continue;
+                }
                 let place = |pos: BlockPos, state| {
                     // MEGA-W2 §3.1: claim/spawn protection on the placement
                     // target — the predicate is authoritative and a denied

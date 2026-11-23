@@ -84,6 +84,19 @@ pub(crate) fn live_create_item_table() -> &'static [(String, Option<String>)] {
             Some("create:mechanical_belt".to_string()),
         ));
         items.push(("create:wrench".to_string(), None));
+        // Processed material items: press/mixer outputs and mixing inputs.
+        // `None` like the wrench — they never place a block.
+        for item in [
+            "create:andesite_alloy",
+            "create:brass_ingot",
+            "create:brass_sheet",
+            "create:copper_sheet",
+            "create:gold_sheet",
+            "create:iron_sheet",
+            "create:zinc_ingot",
+        ] {
+            items.push((item.to_string(), None));
+        }
         items.sort();
         items
     })
