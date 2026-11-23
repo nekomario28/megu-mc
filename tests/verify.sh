@@ -134,6 +134,11 @@ python3 tests/client_parity_gate_test.py
 # and is not explicitly waived in specs/client-vertical-wiring-waivers.json.
 python3 tests/client_vertical_wiring_audit_test.py
 python3 tools/client_vertical_wiring_audit.py
+# The optimization hot-path wiring audit is a real gate, not a report: every
+# CPU/GPU/server optimization must keep a named non-test production call
+# site — a call that retreats into #[cfg(test)] or a comment fails here.
+python3 tests/opt_wiring_audit_test.py
+python3 tools/opt_wiring_audit.py
 python3 tests/docker_entrypoint_test.py
 python3 tests/install_linux_test.py
 python3 tests/installer_cross_os_test.py
