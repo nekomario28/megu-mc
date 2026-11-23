@@ -47,7 +47,10 @@ impl Drop for SingleplayerServer {
                 .stdout(Stdio::null())
                 .stderr(Stdio::null())
                 .status();
-            let deadline = Instant::now() + Duration::from_secs(3);
+            // Give the server up to 10s to finish `save_world()` and exit
+            // cleanly on SIGTERM before falling back to SIGKILL (fast exits
+            // still return on the first 25 ms poll with zero extra delay).
+            let deadline = Instant::now() + Duration::from_secs(10);
             loop {
                 match self.child.try_wait() {
                     Ok(Some(_)) | Err(_) => return,
