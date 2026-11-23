@@ -191,6 +191,39 @@ fn glyph_face_contains(letter_idx: usize, u: f32, v: f32) -> bool {
     }
 }
 
+/// Bilinearly sample an RGBA image at floating-point coordinates (clamped transparent outside).
+fn sample_rgba_bilinear(rgba: &[u8], width: u32, height: u32, x: f32, y: f32) -> [f32; 4] {
+    let x0 = x.floor() as i32;
+    let y0 = y.floor() as i32;
+    let fx = x - x0 as f32;
+    let fy = y - y0 as f32;
+    let fetch = |ix: i32, iy: i32| -> [f32; 4] {
+        if ix < 0 || iy < 0 || ix >= width as i32 || iy >= height as i32 {
+            return [0.0; 4];
+        }
+        let i = (iy as u32 * width + ix as u32) as usize * 4;
+        let a = f32::from(rgba[i + 3]) / 255.0;
+        // Premultiplied alpha avoids dark fringes when interpolating near transparent edges.
+        [
+            f32::from(rgba[i]) * a,
+            f32::from(rgba[i + 1]) * a,
+            f32::from(rgba[i + 2]) * a,
+            a,
+        ]
+    };
+    let c00 = fetch(x0, y0);
+    let c10 = fetch(x0 + 1, y0);
+    let c01 = fetch(x0, y0 + 1);
+    let c11 = fetch(x0 + 1, y0 + 1);
+    let mut out = [0.0f32; 4];
+    for k in 0..4 {
+        let top = c00[k] * (1.0 - fx) + c10[k] * fx;
+        let bot = c01[k] * (1.0 - fx) + c11[k] * fx;
+        out[k] = top * (1.0 - fy) + bot * fy;
+    }
+    out
+}
+
 /// Locate the first isolated letter (`E`) inside `EDITION` (`right_box`) using
 /// bright-face columns so we can reuse the real anti-aliased `E` glyph verbatim.
 fn find_first_right_letter_span(
@@ -688,58 +721,59 @@ pub fn patch_edition_banner_to_megu(
         }
     }
 
-    // Pass 4: Reuse the REAL stone `E` directly from `EDITION` (`right_box`)
-    // into slot #1 of `MEGU` via exact 1:1 pixel copy (zero blur, zero warp,
-    // 100% identical sharpness to the untouched right-hand `EDITION` word).
+    // Pass 4: Reuse the REAL anti-aliased stone `E` directly from `EDITION`
+    // into slot #1 of `MEGU`, bilinearly perspective-warped to slot #1's exact
+    // central vanishing-point angle!
     if let (Some((e_x0, e_x1)), Some(src)) = (reused_e_span, src_snapshot.as_deref()) {
+        let e_src_w = (e_x1 - e_x0 + 1) as f32;
         let pad = outline_f.ceil() as i32;
-        let src_start = (e_x0 as i32 - pad).max(0);
-        let src_end = (e_x1 as i32 + pad).min(width as i32 - 1);
-        let src_span_w = src_end - src_start + 1;
-        let dst_lx0 = (base_x + 1.0 * (glyph_w + letter_gap)).round() as i32;
-        let dst_start = dst_lx0 + ((glyph_w.round() as i32) - (e_x1 as i32 - e_x0 as i32 + 1)) / 2
-            - pad;
+        let src_min_x = (e_x0 as i32 - pad).max(0) as f32;
+        let src_max_x = (e_x1 as i32 + pad).min(width as i32 - 1) as f32;
+        let dst_lx0 = base_x + 1.0 * (glyph_w + letter_gap);
+        let scale_x = e_src_w / glyph_w;
         let y_start = right_box.y as i32;
         let y_end = (right_box.y + right_box.h) as i32;
+        let x_start = ((dst_lx0 - outline_f - 2.0).floor() as i32).max(0);
+        let x_end = ((dst_lx0 + glyph_w + max_edge_lean + outline_f + 2.0).ceil() as i32)
+            .min(x_limit as i32);
         for y in y_start..y_end {
-            for dx in 0..src_span_w {
-                let sx = src_start + dx;
-                let tx = dst_start + dx;
-                if tx < 0 || tx >= x_limit as i32 {
+            let v = ((y as f32 - face_y0) / face_h).clamp(0.0, 1.0);
+            let y_frac = 1.0 - v;
+            for x in x_start..x_end {
+                let raw_x = invert_lean(x as f32, y_frac);
+                let src_x = e_x0 as f32 + (raw_x - dst_lx0) * scale_x;
+                if src_x < src_min_x || src_x > src_max_x {
                     continue;
                 }
-                let si = (y as u32 * width + sx as u32) as usize * 4;
-                let sa = src[si + 3];
-                if sa == 0 {
-                    continue;
-                }
-                if sa == 255 {
-                    painter.put(tx, y, [src[si], src[si + 1], src[si + 2], 255]);
-                } else {
-                    let di = (y as u32 * width + tx as u32) as usize * 4;
-                    let s_a = f32::from(sa) / 255.0;
-                    let d_a = f32::from(painter.rgba[di + 3]) / 255.0;
-                    let out_a = s_a + d_a * (1.0 - s_a);
+                let s = sample_rgba_bilinear(src, width, height, src_x, y as f32);
+                if s[3] > 0.02 {
+                    let a_u8 = (s[3] * 255.0).round().clamp(0.0, 255.0) as u8;
+                    let r_u8 = (s[0] / s[3]).round().clamp(0.0, 255.0) as u8;
+                    let g_u8 = (s[1] / s[3]).round().clamp(0.0, 255.0) as u8;
+                    let b_u8 = (s[2] / s[3]).round().clamp(0.0, 255.0) as u8;
+                    // Alpha-over onto painter buffer so soft outer AA blends cleanly.
+                    let i = (y as u32 * width + x as u32) as usize * 4;
+                    let dst_a = f32::from(painter.rgba[i + 3]) / 255.0;
+                    let out_a = s[3] + dst_a * (1.0 - s[3]);
                     if out_a > 0.001 {
-                        let cr = (f32::from(src[si]) * s_a
-                            + f32::from(painter.rgba[di]) * d_a * (1.0 - s_a))
-                            / out_a;
-                        let cg = (f32::from(src[si + 1]) * s_a
-                            + f32::from(painter.rgba[di + 1]) * d_a * (1.0 - s_a))
-                            / out_a;
-                        let cb = (f32::from(src[si + 2]) * s_a
-                            + f32::from(painter.rgba[di + 2]) * d_a * (1.0 - s_a))
-                            / out_a;
+                        let cr = (s[0] + f32::from(painter.rgba[i]) * dst_a * (1.0 - s[3])) / out_a;
+                        let cg =
+                            (s[1] + f32::from(painter.rgba[i + 1]) * dst_a * (1.0 - s[3])) / out_a;
+                        let cb =
+                            (s[2] + f32::from(painter.rgba[i + 2]) * dst_a * (1.0 - s[3])) / out_a;
+                        let oa = (out_a * 255.0).round().clamp(0.0, 255.0) as u8;
                         painter.put(
-                            tx,
+                            x,
                             y,
                             [
                                 cr.round().clamp(0.0, 255.0) as u8,
                                 cg.round().clamp(0.0, 255.0) as u8,
                                 cb.round().clamp(0.0, 255.0) as u8,
-                                (out_a * 255.0).round().clamp(0.0, 255.0) as u8,
+                                oa.max(a_u8),
                             ],
                         );
+                    } else {
+                        painter.put(x, y, [r_u8, g_u8, b_u8, a_u8]);
                     }
                 }
             }
