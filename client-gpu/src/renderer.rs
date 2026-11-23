@@ -39,6 +39,10 @@ use megu_client_mesh::{
     is_megu_wgsl_pack, BackendResolution, GpuCapabilities, GpuShaderCaps, MeguWgslPack, PassKind,
     PipelineStage, RenderBackendPreference, ShaderPackSource,
 };
+use megu_core::math_opt_engine::{
+    morton3d_encode, morton3d_signed, projected_sphere_diameter_px,
+};
+use megu_core::math_opt_foundation::{LipschitzTileClassifier, TileSignDecision};
 use megu_kernel::debug_chords::DebugLine;
 use megu_kernel::entity_interp::{evaluate_sky_and_fog, SkyFogInput, SkyFogOutput};
 use megu_ui::draw::{font_atlas_rgba, UiMesh, FONT_ATLAS_HEIGHT, FONT_ATLAS_WIDTH};
@@ -1515,6 +1519,10 @@ fn region_caster_wgsl(caster_source: &str) -> String {
 struct CullCacheKey {
     camera_section: (i32, i32, i32),
     view_proj_bits: [u32; 16],
+    /// Sub-pixel rejection depends on the vertical focal length in
+    /// pixels — an identical `view_proj` at a different render height
+    /// culls differently, so the key carries the bit pattern.
+    focal_y_bits: u32,
     world_revision: u64,
     hiz_revision: u64,
 }
@@ -1899,6 +1907,8 @@ pub struct GpuRenderer {
     cull_cache_key: Option<CullCacheKey>,
     /// Hi-Z culled count associated with `cull_result`.
     cull_hiz_count: u64,
+    /// Sub-pixel fast-reject count associated with `cull_result`.
+    cull_subpixel_count: u64,
     /// Composed frames that reused the cached cull result verbatim.
     pub cull_cache_hits: u64,
     /// Instanced `draw_indexed` calls the most recent composed pass
@@ -2010,6 +2020,10 @@ pub struct GpuRenderer {
     pub hiz_frames_updated: u64,
     /// Sections culled by the Hi-Z pyramid, cumulative.
     pub hiz_culled_sections: u64,
+    /// Sections dropped by the O(1) sub-pixel fast reject
+    /// (`is_subpixel_section` → `projected_sphere_diameter_px`),
+    /// cumulative — proves the closed-form projection runs live.
+    pub subpixel_culled_sections: u64,
     /// Non-empty (section, direction-bucket) draws skipped by the facing
     /// mask before GPU submission, cumulative.
     pub direction_buckets_skipped: u64,
@@ -2953,29 +2967,108 @@ pub fn aabb_in_frustum_pvertex(min: [f32; 3], max: [f32; 3], planes: &[[f32; 4]]
     inside
 }
 
-/// 21-bits-per-lane 3D Morton (Z-order) code. The sign-folded unsigned
-/// lanes preserve i32 ordering into the code's top 63 bits; interleaving
-/// keeps spatial neighbours adjacent — the locality-preserving
-/// tie-breaker inside one camera-distance ring.
+/// 21-bits-per-lane 3D Morton (Z-order) code — a thin re-export of the
+/// canonical `megu_core::math_opt_engine::morton3d_encode` SWAR spread,
+/// kept under the historical name for embedders. Interleaving keeps
+/// spatial neighbours adjacent — the locality-preserving tie-breaker
+/// inside one camera-distance ring.
 pub fn morton3d(x: u32, y: u32, z: u32) -> u64 {
-    fn spread(mut v: u64) -> u64 {
-        v &= 0x1f_ffff;
-        v = (v | (v << 32)) & 0x001f_0000_0000_ffff;
-        v = (v | (v << 16)) & 0x001f_0000_ff00_00ff;
-        v = (v | (v << 8)) & 0x100f_00f0_0f00_f00f;
-        v = (v | (v << 4)) & 0x10c3_0c30_c30c_30c3;
-        (v | (v << 2)) & 0x1249_2492_4924_9249
-    }
-    spread(u64::from(x)) | (spread(u64::from(y)) << 1) | (spread(u64::from(z)) << 2)
+    morton3d_encode(x, y, z)
 }
 
-/// Morton key for a section coordinate: `x ^ 0x8000_0000` folds the
-/// sign into unsigned space, and the LOW 21 bits feed [`morton3d`] —
-/// every section coord in ±2^20 (±16.7M blocks) maps distinctly (beyond
-/// that the lane wraps; Z-order is a locality hash, not a comparator).
+/// Morton key for a signed section coordinate via the canonical
+/// `megu_core::math_opt_engine::morton3d_signed`: each axis clamps to
+/// `[-2^20, 2^20 - 1]` and biases by `+2^20`, so every section coord in
+/// ±2^20 (±16.7M blocks) maps distinctly and out-of-range coords
+/// saturate at the edge instead of wrapping (Z-order is a locality
+/// hash, not a comparator).
 pub fn section_morton_key(coord: SectionCoord) -> u64 {
-    let lane = |v: i32| ((v as u32) ^ 0x8000_0000) & 0x1f_ffff;
-    morton3d(lane(coord.0), lane(coord.1), lane(coord.2))
+    morton3d_signed(coord.0, coord.1, coord.2)
+}
+
+/// Vertical focal length in pixels for `camera` over a `height_px`-tall
+/// viewport: `f_y = h / (2·tan(fov_y/2))` — the exact `focal_y_px`
+/// argument [`projected_sphere_diameter_px`] expects, matching
+/// `Camera::projection_matrix`'s `cot(fov_y/2)` scaled to pixels.
+/// Non-finite inputs yield a non-finite focal, which the projection
+/// helper fails closed to `INFINITY` (never culls).
+fn camera_focal_y_px(camera: &crate::Camera, height_px: u32) -> f32 {
+    let f = 1.0 / (camera.fov_deg.to_radians() * 0.5).tan();
+    height_px as f32 * 0.5 * f
+}
+
+/// O(1) fast reject for a `EDGE`-sized section whose perspective
+/// silhouette falls under half a pixel — it cannot cover any sample
+/// point, so skipping it loses no visible fragment. Uses the
+/// Mara–McGuire 2013 closed-form [`projected_sphere_diameter_px`]:
+/// the silhouette diameter depends only on `‖c_view‖`, so the
+/// world-space distance is passed head-on (the helper's
+/// camera-inside → `INFINITY` contract still prevents a false reject).
+pub fn is_subpixel_section(
+    camera_position: [f32; 3],
+    aabb_min: [f32; 3],
+    focal_y_px: f32,
+) -> bool {
+    const SUBPIXEL_THRESHOLD_PX: f32 = 0.5;
+    let half = EDGE as f32 * 0.5;
+    let center = [
+        aabb_min[0] + half,
+        aabb_min[1] + half,
+        aabb_min[2] + half,
+    ];
+    let distance = (0..3)
+        .map(|i| (center[i] - camera_position[i]) * (center[i] - camera_position[i]))
+        .sum::<f32>()
+        .sqrt();
+    // Bounding sphere of the EDGE³ box: half the space diagonal.
+    let radius = half * 3.0_f32.sqrt();
+    projected_sphere_diameter_px([0.0, 0.0, distance], radius, focal_y_px)
+        < SUBPIXEL_THRESHOLD_PX
+}
+
+/// Conservative whole-tile frustum decision driven by
+/// [`LipschitzTileClassifier`]: each plane's signed distance
+/// `n·p + d` is a linear field with Lipschitz constant `‖n‖`, so one
+/// centre sample proves a box "strictly outside" (cull) or "strictly
+/// inside" (that plane can never reject it). The Euclidean Lipschitz
+/// radius is looser than the exact per-axis support, so a uniform
+/// verdict is always safe — only a mixed plane falls through to the
+/// exact p-vertex sweep over the un-decided subset.
+pub fn section_frustum_visible(min: [f32; 3], planes: &[[f32; 4]]) -> bool {
+    let half = EDGE as f64 * 0.5;
+    let center = [
+        f64::from(min[0]) + half,
+        f64::from(min[1]) + half,
+        f64::from(min[2]) + half,
+    ];
+    let half_extents = [half; 3];
+    let mut mixed = [[0.0f32; 4]; 8];
+    let mut mixed_count = 0usize;
+    for &[nx, ny, nz, d] in planes {
+        if mixed_count >= mixed.len() {
+            break;
+        }
+        let center_value = f64::from(nx) * center[0]
+            + f64::from(ny) * center[1]
+            + f64::from(nz) * center[2]
+            + f64::from(d);
+        let bound = f64::from(nx.mul_add(nx, ny.mul_add(ny, nz * nz)).sqrt());
+        match LipschitzTileClassifier::classify_subtile_lipschitz(
+            center_value,
+            bound,
+            half_extents,
+        ) {
+            // Strictly outside this plane — provably invisible.
+            TileSignDecision::UniformNegative => return false,
+            // Strictly inside — this plane can never cull the box.
+            TileSignDecision::UniformPositive => {}
+            TileSignDecision::MixedRequiresEvaluation => {
+                mixed[mixed_count] = [nx, ny, nz, d];
+                mixed_count += 1;
+            }
+        }
+    }
+    mixed_count == 0 || box_in_frustum(min, &mixed[..mixed_count])
 }
 
 /// Opaque submission order for one section: the quantized radial
@@ -4042,6 +4135,9 @@ struct ComposedWorldTarget<'a> {
     chunk_fades: &'a ChunkFadeTracker,
     /// Camera position — seeds the [`GraphCuller`] search's camera section.
     camera_position: [f32; 3],
+    /// Vertical focal length in pixels over `size` — the sub-pixel
+    /// fast reject's `projected_sphere_diameter_px` argument.
+    focal_y_px: f32,
     /// Authoritative server clock — the water pass derives its
     /// `ShadowUniforms` fallback (sun/moon direction, day phase) from it.
     world_time_ticks: u64,
@@ -4704,6 +4800,7 @@ impl GpuRenderer {
             cull_graph_scratch: HashSet::new(),
             cull_cache_key: None,
             cull_hiz_count: 0,
+            cull_subpixel_count: 0,
             cull_cache_hits: 0,
             instanced_kinetic_draws: 0,
             region_arenas: BTreeMap::new(),
@@ -4744,6 +4841,7 @@ impl GpuRenderer {
             bg_mesh_jobs_completed: 0,
             hiz_frames_updated: 0,
             hiz_culled_sections: 0,
+            subpixel_culled_sections: 0,
             direction_buckets_skipped: 0,
             region_arena_draws: 0,
             bind_group_switches_saved: 0,
@@ -6426,7 +6524,12 @@ impl GpuRenderer {
     /// (`cull_cache_hits += 1`); a miss refills the retained
     /// `cull_result`/`cull_graph_scratch` buffers instead of allocating
     /// fresh `HashSet`s every frame.
-    fn cull_live_sections(&mut self, view_proj: &Mat4, camera_position: [f32; 3]) {
+    fn cull_live_sections(
+        &mut self,
+        view_proj: &Mat4,
+        camera_position: [f32; 3],
+        focal_y_px: f32,
+    ) {
         let camera_section = SectionCoord(
             (camera_position[0] / EDGE as f32).floor() as i32,
             (camera_position[1] / EDGE as f32).floor() as i32,
@@ -6439,12 +6542,14 @@ impl GpuRenderer {
         let key = CullCacheKey {
             camera_section: (camera_section.0, camera_section.1, camera_section.2),
             view_proj_bits,
+            focal_y_bits: focal_y_px.to_bits(),
             world_revision: self.cull_world_revision,
             hiz_revision: self.hiz_revision,
         };
         if self.cull_cache_key == Some(key) {
             self.cull_cache_hits += 1;
             self.hiz_culled_sections += self.cull_hiz_count;
+            self.subpixel_culled_sections += self.cull_subpixel_count;
             return;
         }
         // Miss: refill the retained sets (steady frames keep their
@@ -6452,6 +6557,7 @@ impl GpuRenderer {
         let mut culled = std::mem::take(&mut self.cull_result);
         culled.clear();
         let mut hiz_culled = 0u64;
+        let mut subpixel_culled = 0u64;
         if !self.live_sections.is_empty() {
             let planes = frustum_planes_from_view_proj(view_proj);
             // One graph-culler BFS per frame over the mirrored visibility
@@ -6489,6 +6595,16 @@ impl GpuRenderer {
                     coord.1 as f32 * EDGE as f32,
                     coord.2 as f32 * EDGE as f32,
                 ];
+                // O(1) sub-pixel reject ahead of every other test: a
+                // section whose bounding sphere projects under half a
+                // pixel covers no sample point — cheaper than Hi-Z or
+                // frustum work, and a distance-only check can never
+                // false-cull a near or camera-enclosing section.
+                if is_subpixel_section(camera_position, min, focal_y_px) {
+                    culled.insert(*coord);
+                    subpixel_culled += 1;
+                    continue;
+                }
                 // Hi-Z runs before graph/frustum culling: a view-matched
                 // pyramid only reports occlusion the previous frame's
                 // drawn occluders prove, so a depth-culled section stays
@@ -6508,7 +6624,12 @@ impl GpuRenderer {
                 let visible = if self.section_graphs.contains_key(coord) {
                     graph_visible.is_some_and(|set| set.contains(coord))
                 } else {
-                    box_in_frustum(min, &planes)
+                    // The Lipschitz uniform-tile sweep proves strictly
+                    // inside/outside planes from one centre sample and
+                    // leaves only mixed planes to the exact p-vertex
+                    // test — same verdict as `box_in_frustum`, fewer
+                    // support-point evaluations away from boundaries.
+                    section_frustum_visible(min, &planes)
                 };
                 if !visible {
                     culled.insert(*coord);
@@ -6517,7 +6638,9 @@ impl GpuRenderer {
             self.cull_graph_scratch = graph_scratch;
         }
         self.hiz_culled_sections += hiz_culled;
+        self.subpixel_culled_sections += subpixel_culled;
         self.cull_hiz_count = hiz_culled;
+        self.cull_subpixel_count = subpixel_culled;
         self.cull_cache_key = Some(key);
         self.cull_result = culled;
     }
@@ -7616,6 +7739,7 @@ impl GpuRenderer {
                     clear_rgb,
                     chunk_fades,
                     camera_position: camera.position,
+                    focal_y_px: camera_focal_y_px(&camera, world_h),
                     world_time_ticks,
                 },
             );
@@ -7630,6 +7754,7 @@ impl GpuRenderer {
                     clear_rgb,
                     chunk_fades,
                     camera_position: camera.position,
+                    focal_y_px: camera_focal_y_px(&camera, height),
                     world_time_ticks,
                 },
             );
@@ -8918,6 +9043,7 @@ impl GpuRenderer {
             clear_rgb,
             chunk_fades,
             camera_position,
+            focal_y_px,
             world_time_ticks,
         } = *target;
         self.ensure_depth(width, height);
@@ -8943,7 +9069,7 @@ impl GpuRenderer {
                 .write_buffer(&water.uniform, 0, &shadow_uniform_bytes(&uniforms));
         }
         self.begin_render_upload_frame();
-        self.cull_live_sections(&view_proj, camera_position);
+        self.cull_live_sections(&view_proj, camera_position, focal_y_px);
         self.culled_sections += self.cull_result.len() as u64;
         self.last_frame_culled_sections = self.cull_result.len();
         // Hand the drawn occluder set to the worker pool while the GPU
@@ -9533,6 +9659,7 @@ impl GpuRenderer {
                     clear_rgb,
                     chunk_fades: frame.chunk_fades,
                     camera_position: camera.position,
+                    focal_y_px: camera_focal_y_px(camera, world_h),
                     world_time_ticks: frame.world_time_ticks,
                 },
             );
@@ -9548,6 +9675,7 @@ impl GpuRenderer {
                     clear_rgb,
                     chunk_fades: frame.chunk_fades,
                     camera_position: camera.position,
+                    focal_y_px: camera_focal_y_px(camera, height),
                     world_time_ticks: frame.world_time_ticks,
                 },
             );

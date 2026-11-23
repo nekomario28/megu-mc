@@ -9,6 +9,8 @@
 
 use std::collections::{BTreeSet, VecDeque};
 
+use megu_kernel::command::CommandDispatcher;
+
 /// Maximum number of submitted command lines retained by the bar.
 pub const COMMAND_HISTORY_CAPACITY: usize = 200;
 /// Maximum number of ranked completion candidates returned at once.
@@ -1215,7 +1217,24 @@ impl ZshCommandBar {
         let mut candidates = Vec::new();
         match target.context {
             CompletionContext::Commands => {
+                // The kernel `command` dispatcher is the authoritative
+                // literal filter — `complete_suggestions` against the same
+                // vanilla seed `LiveSession` feeds its wire path answers
+                // exactly the command names the session would complete,
+                // and the bar layers its badge/humanized presentation over
+                // that live set. An empty accepted set (no literal prefix
+                // match — e.g. a fuzzy subsequence query like `tm`) keeps
+                // the unfiltered spec list so the fzf-style ranker still
+                // owns those keystrokes; a dispatcher error does the same.
+                let accepted = command_completion_filter(&target.query)
+                    .filter(|accepted| !accepted.is_empty());
                 for &(name, _, _) in COMMAND_SPECS {
+                    if let Some(accepted) = &accepted {
+                        let literal = name.trim_start_matches('/');
+                        if !accepted.iter().any(|item| item == literal) {
+                            continue;
+                        }
+                    }
                     let id = format!("command/{}", name.trim_start_matches('/'));
                     candidates.push(
                         CompletionCandidate::new(
@@ -2773,6 +2792,26 @@ fn floor_char_boundary(input: &str, mut cursor: usize) -> usize {
 /// answers the same names the bar highlights.
 pub fn vanilla_command_names() -> impl Iterator<Item = &'static str> {
     COMMAND_SPECS.iter().map(|(_, name, _)| *name)
+}
+
+/// Seed a kernel [`CommandDispatcher`] with the same vanilla literal set
+/// `LiveSession` installs and return the literals its
+/// `complete_suggestions` accepts for `query` — the text after the
+/// leading `/`, matching the wire path's strip convention. `None` on a
+/// dispatcher error (caller keeps the unfiltered spec list);
+/// `Some(vec![])` means the wire path genuinely offers nothing.
+fn command_completion_filter(query: &str) -> Option<Vec<String>> {
+    let mut dispatcher = CommandDispatcher::new();
+    for name in vanilla_command_names() {
+        dispatcher.register_literal(name).ok()?;
+    }
+    let input = query.trim_start_matches('/');
+    let suggestions = dispatcher.complete_suggestions(input, input.len()).ok()?;
+    let mut accepted = Vec::with_capacity(suggestions.len());
+    for index in 0..suggestions.len() {
+        accepted.push(suggestions.get(index)?.to_string());
+    }
+    Some(accepted)
 }
 
 static COMMAND_SPECS: &[(&str, &str, &str)] = &[

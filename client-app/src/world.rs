@@ -20,9 +20,10 @@ use megu_kernel::skeletal_anim::{
     parse_jpm_model, AnimationClip, AnimationController, AnimationError, BoneMask, LoopMode,
     SkeletonRig, MAX_CLIPS,
 };
+use megu_kernel::occlusion_table::{CoalescedLightQueue, QueuedLightEdit};
 use megu_kernel::{
-    Aabb, FluidCell, FluidKind, LightEdit, LightEngine, LightFact, LightUpdateMultiWord,
-    PalettedSection, Registry, STATE_COUNT,
+    Aabb, FluidCell, FluidKind, LightEngine, LightFact, LightUpdateMultiWord, PalettedSection,
+    Registry, STATE_COUNT,
 };
 
 use crate::protocol::{
@@ -1482,6 +1483,11 @@ pub struct WorldState {
     /// Incremental light engine fed by local block edits; only present when
     /// the registry loaded and the dimension fits the engine window.
     light_engine: Option<LightEngine>,
+    /// Tick-local, last-write-wins coalescer (`occlusion_table`) for the
+    /// light edits block changes queue: a `SectionBlocksUpdate` batch
+    /// drains as one `apply_edits_multi_word` call per touched chunk
+    /// instead of one engine call per edit.
+    light_queue: CoalescedLightQueue,
     pub columns: HashMap<(i32, i32), ChunkColumn>,
     pub mesh_cache: MeshCache,
     packed_meshes: HashMap<SectionCoord, Vec<PackedVertex>>,
@@ -1633,6 +1639,7 @@ impl WorldState {
             registry,
             state_count,
             light_engine,
+            light_queue: CoalescedLightQueue::new(),
             columns: HashMap::new(),
             mesh_cache: MeshCache::new(MissingNeighbor::Air),
             packed_meshes: HashMap::new(),
@@ -1671,6 +1678,9 @@ impl WorldState {
         self.block_entities.clear();
         self.block_destructions.clear();
         self.light_engine = light_engine_for(&self.dimension, self.registry.is_some());
+        // A dimension change discards any edits queued against the old
+        // world — the fresh engine has no columns for them to apply to.
+        self.light_queue = CoalescedLightQueue::new();
         self.columns.clear();
         self.mesh_cache = MeshCache::new(MissingNeighbor::Air);
         self.packed_meshes.clear();
@@ -1825,40 +1835,56 @@ impl WorldState {
         let _ = engine.load_chunk(cx, cz, &cells);
     }
 
-    /// Apply one local block edit to the incremental light engine and push the
-    /// resulting 2048-byte sky/block arrays into the stored sections + mesh
-    /// cache. No-op when the engine or registry is unavailable or the edited
-    /// chunk was never loaded into the engine.
-    fn apply_local_light_edit(&mut self, x: i32, y: i32, z: i32, state_id: u32) {
-        let fact = match self
+    /// Enqueue one local block edit's light change into the tick-local
+    /// [`CoalescedLightQueue`]. Unknown states are dropped here exactly as
+    /// the former per-edit path dropped them; the queue drains through
+    /// [`Self::flush_light_queue`] into the same engine + write-back path.
+    fn queue_local_light_edit(&mut self, x: i32, y: i32, z: i32, state_id: u32) {
+        if self
             .registry
             .as_ref()
-            .and_then(|registry| registry.facts(state_id).ok())
+            .is_some_and(|registry| registry.facts(state_id).is_ok())
         {
-            Some(fact) => fact,
-            None => return,
-        };
-        let edit = LightEdit {
-            x,
-            y,
-            z,
-            fact: LightFact {
-                opacity: fact.opacity,
-                emission: fact.luminance,
-                occlusion: fact.face_occlusion,
-            },
-        };
-        let update = {
-            let Some(engine) = self.light_engine.as_mut() else {
-                return;
+            self.light_queue.push(QueuedLightEdit {
+                x,
+                y,
+                z,
+                state_id,
+            });
+        }
+    }
+
+    /// Drain the coalesced queue into the incremental light engine and push
+    /// the resulting 2048-byte sky/block arrays into the stored sections +
+    /// mesh cache — one `apply_edits_multi_word` call per touched chunk via
+    /// `ChunkLightBatch::to_light_edits` rather than one call per edit.
+    /// No-op when the engine or registry is unavailable.
+    fn flush_light_queue(&mut self) {
+        // `drain` runs even without an engine so stranded edits cannot
+        // accumulate across packets.
+        let batches = self.light_queue.drain();
+        if batches.is_empty() || self.light_engine.is_none() {
+            return;
+        }
+        for batch in &batches {
+            let edits = match self
+                .registry
+                .as_ref()
+                .map(|registry| batch.to_light_edits(registry))
+            {
+                Some(Ok(edits)) => edits,
+                _ => continue,
             };
-            match engine.apply_edits_multi_word(&[edit]) {
-                Ok(update) => update,
-                Err(_) => return,
-            }
-        };
-        self.local_light_edits += 1;
-        self.apply_local_light_update(update);
+            let update = {
+                let engine = self.light_engine.as_mut().expect("checked above");
+                match engine.apply_edits_multi_word(&edits) {
+                    Ok(update) => update,
+                    Err(_) => continue,
+                }
+            };
+            self.local_light_edits += edits.len() as u64;
+            self.apply_local_light_update(update);
+        }
     }
 
     /// Write engine-produced light sections back into `StoredSection`s and
@@ -2002,7 +2028,25 @@ impl WorldState {
         Ok(())
     }
 
+    /// Batched form of [`Self::apply_block_update`] for
+    /// `SectionBlocksUpdate` packets: every edit lands in the coalesced
+    /// light queue last-write-wins, then drains once — one engine call
+    /// per touched chunk instead of one call per edit.
+    fn apply_block_updates(&mut self, updates: &[([i32; 3], u32)]) -> Result<(), String> {
+        let result = updates
+            .iter()
+            .try_for_each(|&(pos, state_id)| self.apply_block_update_inner(pos, state_id));
+        self.flush_light_queue();
+        result
+    }
+
     pub fn apply_block_update(&mut self, pos: [i32; 3], state_id: u32) -> Result<(), String> {
+        let result = self.apply_block_update_inner(pos, state_id);
+        self.flush_light_queue();
+        result
+    }
+
+    fn apply_block_update_inner(&mut self, pos: [i32; 3], state_id: u32) -> Result<(), String> {
         self.block_updates += 1;
         let [x, y, z] = pos;
         // Widen before adding: `min_y`/`height` are server-controlled i32s.
@@ -2067,7 +2111,7 @@ impl WorldState {
             let mesh_sec = sec.to_compressed_mesh_section(&self.blocks);
             self.set_section_visibility(coord, face_visibility_of(&mesh_sec.blocks), true);
         }
-        self.apply_local_light_edit(x, y, z, clamped);
+        self.queue_local_light_edit(x, y, z, clamped);
         Ok(())
     }
 
@@ -2508,9 +2552,7 @@ impl WorldState {
                 self.apply_block_update(*pos, *state_id)?;
             }
             PlayEvent::SectionBlocksUpdate(updates) => {
-                for (pos, state_id) in updates {
-                    self.apply_block_update(*pos, *state_id)?;
-                }
+                self.apply_block_updates(updates)?;
             }
             PlayEvent::UnloadChunk { cx, cz } => self.unload_chunk(*cx, *cz),
             PlayEvent::AddEntity {

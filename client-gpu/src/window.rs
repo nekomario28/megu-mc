@@ -2217,9 +2217,13 @@ impl GpuApp {
         // Live P95 feedback edge: the session's real measured
         // frame-time window feeds the renderer's adaptive upload-budget
         // controller — `upload_budget_p95_observations` counts each
-        // observation so the loop is provably live, not dead code.
+        // observation so the loop is provably live, not dead code. The
+        // Jain–Chlamtac P² streaming P95 is the primary source once its
+        // five markers bootstrap; the ring-window P95 covers startup.
         if let (Some(live), Some(active)) = (&self.live, &mut self.active) {
-            let p95_ms = live.frame_timings.frame_ms_p95();
+            let p95_ms = live
+                .p95_frame_ms()
+                .unwrap_or_else(|| live.frame_timings.frame_ms_p95());
             if p95_ms.is_finite() && p95_ms > 0.0 {
                 active.renderer.observe_frame_p95_ms(p95_ms);
             }

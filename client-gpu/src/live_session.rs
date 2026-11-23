@@ -46,7 +46,13 @@ use megu_client_mesh::SectionCoord;
 use megu_kernel::player_physics::{
     step_player_physics, PlayerInputState, PlayerPhysicsState, SurfaceKind,
 };
-use megu_kernel::raycast::{raycast_blocks, raycast_entities, FluidClipMode, RayBlockShapes};
+use megu_kernel::qol_gameplay::{
+    evaluate_looking_at_hud, HarvestTool, LookingAtBlock, LookingAtEntity, LookingAtHudInfo,
+    LookingAtTarget,
+};
+use megu_kernel::raycast::{
+    raycast_blocks, raycast_entities, EntityRayHit, FluidClipMode, RayBlockShapes, RayHit,
+};
 use megu_kernel::Aabb;
 use megu_kernel::CommandDispatcher;
 use megu_ui::magic_hud::{CastBarState, CooldownSlotState, MagicHudState, StatusBadgeState};
@@ -57,6 +63,10 @@ use megu_ui::subtitle_hud::{SubtitleArrow, DEFAULT_TTL_SECS};
 // `live_session::{hw_adaptive_engine,sys_metrics}` paths while the crate
 // compiles the canonical `megu-core` sources exactly once.
 pub use megu_core::{hw_adaptive_engine, sys_metrics};
+
+use megu_core::math_opt_engine::{
+    DiscountedUcbAutotuner, P2QuantileEstimator, PidBudgetController,
+};
 
 use crate::atmosphere::{
     voxel_clouds_to_geometry, AtmosphereParams, BiomeAtmosphereBlender, ChunkFadeTracker,
@@ -552,6 +562,10 @@ pub struct LiveSession {
     /// Block under the crosshair ray as `(block_pos, registry_name)` —
     /// the Jade-style looking-at overlay's live feed.
     pub looking_at_block: Option<([i32; 3], String)>,
+    /// The kernel `qol_gameplay` projection of the live crosshair
+    /// target — name, mod badge and detail lines refreshed every frame
+    /// alongside `looking_at_block`/`looking_at_entity`.
+    pub looking_at_hud: Option<LookingAtHudInfo>,
     /// `set_action_bar_text` raw anonymous-NBT action-bar line.
     pub actionbar_nbt: Option<Vec<u8>>,
     /// Validated `transfer` reconnect target, if the server issued one.
@@ -668,6 +682,25 @@ pub struct LiveSession {
     /// Counted `kernel_autotuner.observe_sample` feeds — proves the
     /// feedback loop actually executes live, not just exists.
     autotuner_sample_count: u64,
+    /// Jain–Chlamtac `P²` streaming frame-time quantiles (136 bytes
+    /// each, zero heap): P95 feeds the anti-windup budget PID and the
+    /// window's upload-budget edge; P99 is the live 1%-low telemetry.
+    frame_p2_p95: P2QuantileEstimator,
+    frame_p2_p99: P2QuantileEstimator,
+    /// Anti-windup PID regulating the per-poll mesh-rebuild budget
+    /// scale toward a 60 FPS-class frame time from the streaming P95.
+    pid_budget: PidBudgetController,
+    /// Latest PID output in `[0.05, 1.0]`; `1.0` until the P² P95
+    /// bootstraps its five markers. `mesh_rebuild_budget` multiplies
+    /// by this.
+    budget_scale: f64,
+    /// Garivier–Moulines discounted-UCB bandit over the four
+    /// render/mesh timing regimes `(kernel_mode << 1) | is_mesh` — fed
+    /// the same real samples the `KernelAutotuner` sees so a regime
+    /// switch (scene density, thermal) is detectable live.
+    ducb: DiscountedUcbAutotuner<4>,
+    /// Counted `ducb.observe` feeds alongside `autotuner_sample_count`.
+    ducb_sample_count: u64,
     /// Unified optimization policy resolved from the detected profile
     /// (refreshed by [`Self::apply_compute_strategy`]); the renderer
     /// consumes its `chunk_mesh`/`gpu_cull`/`shadow` projections.
@@ -933,6 +966,7 @@ impl LiveSession {
             subtitle_text: None,
             title_revision: 0,
             looking_at_block: None,
+            looking_at_hud: None,
             actionbar_nbt: None,
             pending_transfer: None,
             use_item_sequence: 0,
@@ -983,6 +1017,12 @@ impl LiveSession {
             sys_sample_count: 0,
             kernel_autotuner,
             autotuner_sample_count: 0,
+            frame_p2_p95: P2QuantileEstimator::new(0.95),
+            frame_p2_p99: P2QuantileEstimator::new(0.99),
+            pid_budget: PidBudgetController::new(1_000.0 / 60.0),
+            budget_scale: 1.0,
+            ducb: DiscountedUcbAutotuner::new(),
+            ducb_sample_count: 0,
             unified_plan,
             domain_hints,
             compute_strategy_apply_count: 0,
@@ -1441,6 +1481,8 @@ impl LiveSession {
                         (rebuild_start.elapsed().as_nanos().min(u64::MAX as u128) as u64).max(1);
                     let mode = self.kernel_autotuner.selected_mode();
                     self.kernel_autotuner.observe_sample(mode, elapsed_ns);
+                    self.ducb.observe(ducb_arm(mode, true), elapsed_ns);
+                    self.ducb_sample_count += 1;
                     self.autotuner_sample_count += 1;
                 }
             }
@@ -1743,6 +1785,14 @@ impl LiveSession {
     /// Entity under the crosshair ray (vanilla 4.5-block attack reach,
     /// matching `GameRenderer.pick` entity hit testing).
     pub fn crosshair_entity(&self) -> Option<(i32, f64)> {
+        self.crosshair_entity_hit()
+            .map(|hit| (hit.entity_id, hit.distance))
+    }
+
+    /// Full [`EntityRayHit`] behind [`Self::crosshair_entity`] — the
+    /// `qol_gameplay` looking-at projection needs the hit record, not
+    /// just the id/distance pair.
+    fn crosshair_entity_hit(&self) -> Option<EntityRayHit> {
         let pose = self.pose?;
         let eye = [pose.feet[0], pose.feet[1] + 1.62, pose.feet[2]];
         let yaw = f64::from(pose.yaw).to_radians();
@@ -1778,7 +1828,7 @@ impl LiveSession {
                 },
             ));
         }
-        raycast_entities(eye, direction, 4.5, &targets).map(|hit| (hit.entity_id, hit.distance))
+        raycast_entities(eye, direction, 4.5, &targets)
     }
 
     /// Block under the crosshair ray (`raycast_blocks`, vanilla 4.5-block
@@ -1787,6 +1837,14 @@ impl LiveSession {
     /// shape; the face/distance stay honest while exact per-block outline
     /// shapes are out of scope.
     pub fn crosshair_block(&self) -> Option<([i32; 3], f64)> {
+        self.crosshair_block_hit()
+            .map(|hit| (hit.block_pos, hit.distance))
+    }
+
+    /// Full [`RayHit`] behind [`Self::crosshair_block`] — the
+    /// `qol_gameplay` looking-at projection consumes the face and
+    /// cursor-in-block detail too.
+    fn crosshair_block_hit(&self) -> Option<RayHit> {
         let pose = self.pose?;
         let eye = [pose.feet[0], pose.feet[1] + 1.62, pose.feet[2]];
         let yaw = f64::from(pose.yaw).to_radians();
@@ -1813,7 +1871,78 @@ impl LiveSession {
                 },
             },
         )
-        .map(|hit| (hit.block_pos, hit.distance))
+    }
+
+    /// Refresh the crosshair targets plus the `qol_gameplay`
+    /// looking-at HUD projection for this frame.
+    fn refresh_looking_at(&mut self) {
+        let entity_hit = self.crosshair_entity_hit();
+        let block_hit = self.crosshair_block_hit();
+        self.looking_at_entity = entity_hit.map(|hit| hit.entity_id);
+        self.looking_at_block = block_hit
+            .map(|hit| (hit.block_pos, self.block_name_at(hit.block_pos)));
+        self.looking_at_hud = self.evaluate_looking_at(entity_hit, block_hit);
+    }
+
+    /// Run `megu_kernel::qol_gameplay::evaluate_looking_at_hud` over the
+    /// live crosshair target — the entity wins only when strictly nearer,
+    /// matching the vanilla pick order. Block detail lines carry the real
+    /// break-progress fraction when a tracked destruction covers the
+    /// block; harvest-tool hints come from the registry id's material
+    /// family, and crop/container/furnace lines stay absent while the
+    /// session does not mirror those properties.
+    fn evaluate_looking_at(
+        &self,
+        entity_hit: Option<EntityRayHit>,
+        block_hit: Option<RayHit>,
+    ) -> Option<LookingAtHudInfo> {
+        let entity_first = match (entity_hit, block_hit) {
+            (Some(entity), Some(block)) => entity.distance < block.distance,
+            (Some(_), None) => true,
+            _ => false,
+        };
+        if entity_first {
+            let hit = entity_hit?;
+            let tracked = self.world.entities.get(&hit.entity_id)?;
+            let type_id = format!("minecraft:entity_{}", tracked.entity_type);
+            return evaluate_looking_at_hud(
+                LookingAtTarget::Entity(LookingAtEntity {
+                    hit,
+                    entity_type_id: &type_id,
+                    display_name: None,
+                    health: None,
+                    max_health: None,
+                    armor: None,
+                    owner: None,
+                    tamed: None,
+                    mod_namespace: None,
+                }),
+                None,
+            );
+        }
+        let hit = block_hit?;
+        let name = self.block_name_at(hit.block_pos);
+        let break_progress = self
+            .world
+            .block_destructions
+            .values()
+            .find(|progress| progress.pos == hit.block_pos)
+            .map(|progress| f32::from(progress.stage.min(10)) / 10.0);
+        evaluate_looking_at_hud(
+            LookingAtTarget::Block(LookingAtBlock {
+                hit,
+                block_id: &name,
+                display_name: None,
+                properties: &[],
+                harvestable: None,
+                preferred_tool: preferred_harvest_tool(&name),
+                break_progress,
+                crop_growth: None,
+                container_fill: None,
+                furnace_progress: None,
+            }),
+            None,
+        )
     }
 
     /// Registry name for the block state at `pos` (e.g. `minecraft:oak_log`),
@@ -2243,13 +2372,17 @@ impl LiveSession {
     pub fn mesh_rebuild_budget(&self) -> usize {
         const BASE_POLL_MESH_BUDGET: usize = 24;
         const MAX_FOREGROUND_SCALE: u32 = 2;
-        (BASE_POLL_MESH_BUDGET
+        let base = BASE_POLL_MESH_BUDGET
             * self
                 .compute_strategy
                 .workers
                 .foreground_threads
-                .clamp(1, MAX_FOREGROUND_SCALE) as usize)
-            .min(self.governor_rebuild_cap)
+                .clamp(1, MAX_FOREGROUND_SCALE) as usize;
+        // The anti-windup PID's live scale (1.0 until the P² P95
+        // bootstraps, shrinking under sustained frame-time pressure)
+        // throttles the foreground rebuild allowance.
+        let scaled = (base as f64 * self.budget_scale).ceil() as usize;
+        scaled.max(1).min(self.governor_rebuild_cap)
     }
 
     /// Push this session's connect-time [`ComputeStrategy`] into
@@ -2313,6 +2446,34 @@ impl LiveSession {
         self.autotuner_sample_count
     }
 
+    /// Streaming P² P95 of live frame times (ms) — `None` until five
+    /// valid samples bootstrap the five-marker estimate.
+    pub fn p95_frame_ms(&self) -> Option<f64> {
+        self.frame_p2_p95.estimate()
+    }
+
+    /// Streaming P² P99 of live frame times (ms) — the 1%-low edge.
+    pub fn p99_frame_ms(&self) -> Option<f64> {
+        self.frame_p2_p99.estimate()
+    }
+
+    /// The anti-windup PID's current budget scale multiplying
+    /// [`Self::mesh_rebuild_budget`] (`1.0` pre-bootstrap).
+    pub fn frame_budget_scale(&self) -> f64 {
+        self.budget_scale
+    }
+
+    /// The discounted-UCB bandit's current arm over the four
+    /// `(kernel_mode << 1) | is_mesh` render/mesh regimes.
+    pub fn ducb_selected_arm(&self) -> usize {
+        self.ducb.select_arm()
+    }
+
+    /// Counted `ducb.observe` feeds — frame-time and mesh-batch samples.
+    pub fn ducb_samples(&self) -> u64 {
+        self.ducb_sample_count
+    }
+
     /// The current [`UnifiedOptimizationPlan`] (refreshed by
     /// [`Self::apply_compute_strategy`]).
     pub fn unified_optimization_plan(&self) -> &UnifiedOptimizationPlan {
@@ -2328,23 +2489,35 @@ impl LiveSession {
     /// Record frame timing and advance visual transitions before HUD rendering.
     pub fn record_frame_and_refresh_minihud(&mut self, frame_dt_sec: f32, ui: &mut UiState) {
         let frame_us = f64::from(frame_dt_sec) * 1_000_000.0;
-        self.frame_timings.push_frame_ms(frame_us / 1_000.0);
+        let frame_ms = frame_us / 1_000.0;
+        self.frame_timings.push_frame_ms(frame_ms);
+        // P² streaming quantiles over the live frame stream: P95 prices
+        // the budget PID and the window's upload edge, P99 is the
+        // 1%-low telemetry — O(1) memory, no heap per sample.
+        self.frame_p2_p95.observe(frame_ms);
+        self.frame_p2_p99.observe(frame_ms);
         // Feed the adaptive kernel autotuner real frame-time feedback; the
         // controller discards out-of-range samples itself.
         let frame_ns = (f64::from(frame_dt_sec) * 1_000_000_000.0) as u64;
         let kernel_mode = self.kernel_autotuner.selected_mode();
         self.kernel_autotuner.observe_sample(kernel_mode, frame_ns);
         self.autotuner_sample_count += 1;
+        // The discounted-UCB bandit tracks the same real sample on its
+        // render-regime arm so a kernel that turned slow is detected.
+        self.ducb.observe(ducb_arm(kernel_mode, false), frame_ns);
+        self.ducb_sample_count += 1;
+        // Anti-windup PID consumes the streaming P95 once the five-marker
+        // bootstrap lands; `mesh_rebuild_budget` multiplies by the scale.
+        if let Some(p95_ms) = self.frame_p2_p95.estimate() {
+            self.budget_scale = self.pid_budget.update(p95_ms);
+        }
         if frame_dt_sec.is_finite() && frame_dt_sec > 0.0 {
             self.mini_hud_sys_accum_ms += frame_dt_sec * 1_000.0;
         }
         self.chunk_fades.tick(frame_dt_sec);
         self.atmosphere_blender.advance(frame_dt_sec);
         self.refresh_subtitle_hud(frame_dt_sec, &mut ui.hud);
-        self.looking_at_entity = self.crosshair_entity().map(|(eid, _)| eid);
-        self.looking_at_block = self
-            .crosshair_block()
-            .map(|(pos, _)| (pos, self.block_name_at(pos)));
+        self.refresh_looking_at();
         self.ensure_asset_bundle();
         self.refresh_voxel_clouds();
 
@@ -3476,6 +3649,140 @@ fn seeded_command_dispatcher() -> CommandDispatcher {
         let _ = dispatcher.register_literal(name);
     }
     dispatcher
+}
+
+/// Map the live kernel-autotuner mode plus the measurement path onto
+/// one of the four D-UCB regime arms: bit 1 is `ComputeKernelMode`, bit
+/// 0 marks a mesh-batch (vs render-frame) sample.
+fn ducb_arm(mode: ComputeKernelMode, mesh_batch: bool) -> usize {
+    let mode_bit = match mode {
+        ComputeKernelMode::LutBatch => 0usize,
+        ComputeKernelMode::RecomputeSwar => 1,
+    };
+    (mode_bit << 1) | usize::from(mesh_batch)
+}
+
+/// Best-effort harvest-tool family from a registry block id — the
+/// looking-at HUD's tool hint while the session does not mirror block
+/// material/destroy-time metadata. Ordered so the more specific
+/// material families win over shared substrings (`sandstone` is
+/// pickaxe-class, `iron_door` pickaxe over axe).
+fn preferred_harvest_tool(block_id: &str) -> Option<HarvestTool> {
+    let path = block_id.rsplit(':').next().unwrap_or(block_id);
+    const PICKAXE: &[&str] = &[
+        "stone",
+        "ore",
+        "deepslate",
+        "cobblestone",
+        "netherrack",
+        "blackstone",
+        "basalt",
+        "andesite",
+        "diorite",
+        "granite",
+        "brick",
+        "furnace",
+        "rail",
+        "obsidian",
+        "ancient_debris",
+        "concrete",
+        "terracotta",
+        "iron",
+        "gold",
+        "copper",
+        "diamond",
+        "emerald",
+        "lapis",
+        "quartz",
+        "redstone",
+        "amethyst",
+        "calcite",
+        "tuff",
+        "dripstone",
+        "netherite",
+        "lodestone",
+        "anvil",
+        "bell",
+        "cauldron",
+        "hopper",
+        "smoker",
+        "blast_furnace",
+        "grindstone",
+        "stonecutter",
+        "lantern",
+        "chain",
+        "ice",
+        "packed_ice",
+        "blue_ice",
+        "packed_mud",
+        "magma",
+        "prismarine",
+        "purpur",
+        "end_stone",
+        "nylium",
+    ];
+    const AXE: &[&str] = &[
+        "log", "wood", "planks", "stem", "hyphae", "fence", "door", "chest", "barrel", "ladder",
+        "sign", "banner", "bed", "bookshelf", "jukebox", "note_block", "crafting_table",
+        "cartography_table", "fletching_table", "smithing_table", "loom", "composter", "beehive",
+        "pumpkin", "melon", "bamboo",
+    ];
+    const SHOVEL: &[&str] = &[
+        "dirt",
+        "grass_block",
+        "sand",
+        "gravel",
+        "clay",
+        "snow",
+        "soul_sand",
+        "soul_soil",
+        "mud",
+        "podzol",
+        "mycelium",
+        "farmland",
+        "dirt_path",
+        "coarse_dirt",
+        "rooted_dirt",
+        "powder_snow",
+        "concrete_powder",
+    ];
+    const HOE: &[&str] = &[
+        "leaves",
+        "hay_block",
+        "moss",
+        "sculk",
+        "nether_wart_block",
+        "warped_wart_block",
+        "sponge",
+        "shroomlight",
+        "dried_kelp_block",
+        "target",
+    ];
+    // Exact substrings that would otherwise hit the wrong family —
+    // `concrete_powder` is shovel-class inside `concrete`'s pickaxe
+    // match, and `ender_chest` is pickaxe-class inside `chest`'s axe.
+    const OVERRIDES: &[(&str, HarvestTool)] = &[
+        ("concrete_powder", HarvestTool::Shovel),
+        ("ender_chest", HarvestTool::Pickaxe),
+    ];
+    for (keyword, tool) in OVERRIDES {
+        if path.contains(keyword) {
+            return Some(*tool);
+        }
+    }
+    // Pickaxe first so shared substrings (`sandstone`, `redstone_ore`,
+    // `iron_door`) resolve to their vanilla-correct tool family.
+    for (family, tool) in [
+        (PICKAXE, HarvestTool::Pickaxe),
+        (AXE, HarvestTool::Axe),
+        (SHOVEL, HarvestTool::Shovel),
+        (HOE, HarvestTool::Hoe),
+    ] {
+        if family.iter().any(|keyword| path.contains(keyword)) {
+            return Some(tool);
+        }
+    }
+    None
 }
 
 /// Resolve the vanilla `SurfaceKind` for the block at `pos`, consulting the

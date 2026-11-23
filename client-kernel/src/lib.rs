@@ -7,7 +7,7 @@
 #[allow(clippy::all)]
 #[path = "../../src/brigadier.rs"]
 mod brigadier;
-mod command;
+pub mod command;
 pub mod debug_chords;
 pub mod entity_interp;
 mod ffi;
