@@ -60,27 +60,211 @@ fn zlib_level() -> u32 {
     })
 }
 
+// ------------------------------------------------------ zlib scratch state
+
+/// Retention cap for a thread's scratch buffers. A pathological packet (one
+/// enormous broadcast, say) must not pin its peak output for the life of the
+/// thread: anything larger is released on the next call, so the steady-state
+/// cost of the pool is a chunk-frame-sized buffer, not the historical peak.
+const ZLIB_SCRATCH_RETAIN_CAP: usize = 512 * 1024;
+
+/// One thread's reusable deflate state plus its output buffer.
+///
+/// Every compressed frame used to build a fresh `Compress` — allocating and
+/// initialising the ~256 KiB deflate window/hash tables — and a fresh output
+/// `Vec`, per packet, for both chunk-cache misses and broadcast fanout
+/// encoding. Level 1 on a 40 KiB chunk produces ~8 KiB, so the tables dwarf
+/// the payload and the buffer is worth retaining.
+///
+/// `miniz_oxide`'s `reset()` still clears its window/hash tables (the same
+/// memset a fresh allocation pays), so the win here is structural rather than
+/// the memset: no per-packet allocator round-trip, no free, and no first-touch
+/// page faults on a fresh 256 KiB block — plus one retained output buffer
+/// instead of one allocate/grow/free per frame.
+///
+/// Output is byte-identical to the `ZlibEncoder` this replaced: `reset()`
+/// restores the initial dictionary and Huffman state, so a reused stream and a
+/// fresh one emit the same bytes for the same input and level (pinned by
+/// `zlib_scratch_matches_a_fresh_encoder_byte_for_byte`).
+struct ZlibCompressScratch {
+    /// Level the cached stream was built for. The server picks one level per
+    /// process (`zlib_level()`), so this only rebuilds under test.
+    level: u32,
+    deflate: flate2::Compress,
+    /// Retained zlib output. Only the bytes written by the most recent
+    /// `compress_at` are live: it clears the buffer before deflating.
+    out: Vec<u8>,
+}
+
+impl ZlibCompressScratch {
+    fn new(level: u32) -> Self {
+        Self {
+            level,
+            deflate: flate2::Compress::new(flate2::Compression::new(level), true),
+            out: Vec::new(),
+        }
+    }
+
+    /// Make room for `spare` bytes past the current length without touching
+    /// the bytes already there.
+    fn reserve_spare(&mut self, spare: usize) {
+        let wanted = self.out.len().saturating_add(spare);
+        if wanted > self.out.capacity() {
+            self.out.reserve_exact(wanted - self.out.len());
+        }
+    }
+
+    /// Release a buffer a previous spike left oversized.
+    fn trim(&mut self) {
+        if self.out.capacity() > ZLIB_SCRATCH_RETAIN_CAP {
+            self.out = Vec::new();
+        }
+    }
+
+    /// A complete zlib stream (header, deflate blocks, Adler-32 trailer) for
+    /// `input` at `level`, written into the retained buffer.
+    fn compress_at(&mut self, level: u32, input: &[u8]) -> &[u8] {
+        use flate2::{FlushCompress, Status};
+
+        self.trim();
+        if self.level != level {
+            self.level = level;
+            self.deflate = flate2::Compress::new(flate2::Compression::new(level), true);
+        }
+        // Reusing the state means resetting it: `total_in`/`total_out` restart
+        // at zero and the previous packet leaves nothing behind in the stream.
+        self.deflate.reset();
+        self.out.clear();
+        // Deflate's worst case is a few bytes per 16 KiB block plus a short
+        // header, so this covers every packet in a single call.
+        self.reserve_spare(input.len() + (input.len() >> 12) + 64);
+        let mut fed = 0usize;
+        loop {
+            if self.out.len() == self.out.capacity() {
+                let grow = self.out.capacity().max(1024);
+                self.reserve_spare(grow);
+            }
+            let before = (fed, self.out.len());
+            let status = self
+                .deflate
+                .compress_vec(&input[fed..], &mut self.out, FlushCompress::Finish)
+                .expect("deflating into a Vec cannot fail");
+            fed = usize::try_from(self.deflate.total_in())
+                .unwrap_or(input.len())
+                .min(input.len());
+            if status == Status::StreamEnd {
+                break;
+            }
+            assert!(
+                (fed, self.out.len()) != before,
+                "deflate stalled: no input consumed and no output produced"
+            );
+        }
+        debug_assert_eq!(fed, input.len(), "the whole packet was compressed");
+        debug_assert_eq!(self.deflate.total_out(), self.out.len() as u64);
+        &self.out
+    }
+}
+
+/// One thread's reusable inflate state plus its output buffer; the receive
+/// side of the same trade as `ZlibCompressScratch`.
+struct ZlibDecompressScratch {
+    inflate: flate2::Decompress,
+    out: Vec<u8>,
+}
+
+impl ZlibDecompressScratch {
+    fn new() -> Self {
+        Self {
+            inflate: flate2::Decompress::new(true),
+            out: Vec::new(),
+        }
+    }
+
+    fn reserve_spare(&mut self, spare: usize) {
+        let wanted = self.out.len().saturating_add(spare);
+        if wanted > self.out.capacity() {
+            self.out.reserve_exact(wanted - self.out.len());
+        }
+    }
+
+    fn trim(&mut self) {
+        if self.out.capacity() > ZLIB_SCRATCH_RETAIN_CAP {
+            self.out = Vec::new();
+        }
+    }
+
+    /// Inflate `body`, requiring exactly `length` bytes out and every input
+    /// byte consumed. Those two checks are the fail-closed guards the caller's
+    /// bomb and forged-length tests stand on, so they stay part of the decode
+    /// rather than the caller: a stream that decodes longer than it claims, or
+    /// leaves trailing bytes, is an error and never a truncation.
+    fn inflate_exact(&mut self, body: &[u8], length: usize) -> Result<Vec<u8>, String> {
+        use flate2::{FlushDecompress, Status};
+
+        self.trim();
+        self.inflate.reset(true);
+        self.out.clear();
+        // One byte of slack: an over-long stream has somewhere to land and is
+        // then caught by the length check instead of being silently cut short.
+        self.reserve_spare(length.saturating_add(1));
+        let status = self
+            .inflate
+            .decompress_vec(body, &mut self.out, FlushDecompress::Finish)
+            .map_err(|e| format!("invalid zlib data: {e}"))?;
+        if status != Status::StreamEnd
+            || self.inflate.total_out() != length as u64
+            || self.inflate.total_in() != body.len() as u64
+        {
+            return Err("zlib stream does not match the frame length".into());
+        }
+        Ok(self.out[..length].to_vec())
+    }
+}
+
+thread_local! {
+    /// Per-thread, not a `Mutex`: frames are compressed on `game_tick` and on
+    /// every per-client writer thread, so a shared lock would serialize what
+    /// the pool is meant to make cheap.
+    static ZLIB_COMPRESS: std::cell::RefCell<ZlibCompressScratch> =
+        std::cell::RefCell::new(ZlibCompressScratch::new(zlib_level()));
+    static ZLIB_DECOMPRESS: std::cell::RefCell<ZlibDecompressScratch> =
+        std::cell::RefCell::new(ZlibDecompressScratch::new());
+}
+
+/// Run `f` with this thread's deflate scratch. A nested call (this module
+/// never makes one) builds a local state instead of panicking on the borrow.
+fn with_zlib_scratch<R>(f: impl FnOnce(&mut ZlibCompressScratch) -> R) -> R {
+    ZLIB_COMPRESS.with(|cell| match cell.try_borrow_mut() {
+        Ok(mut scratch) => f(&mut scratch),
+        Err(_) => f(&mut ZlibCompressScratch::new(zlib_level())),
+    })
+}
+
+/// The inflate counterpart of `with_zlib_scratch`.
+fn with_zlib_inflate<R>(f: impl FnOnce(&mut ZlibDecompressScratch) -> R) -> R {
+    ZLIB_DECOMPRESS.with(|cell| match cell.try_borrow_mut() {
+        Ok(mut scratch) => f(&mut scratch),
+        Err(_) => f(&mut ZlibDecompressScratch::new()),
+    })
+}
+
 /// Frame a packet (including its packet ID) after compression is enabled.
 pub(crate) fn encode_compressed_frame(raw: &[u8], threshold: usize) -> Vec<u8> {
-    use std::io::Write;
-
-    // One body buffer for both paths; the zlib stream is appended to it in
-    // place instead of round-tripping through the encoder's own Vec, then the
-    // outer length is prepended in a single allocation.
+    // One body buffer for both paths; the zlib stream is appended to it from
+    // the thread's scratch state, then the outer length is prepended in a
+    // single allocation. Every compressed frame on this path — chunk-cache
+    // misses (`ChunkPacketCache`), per-broadcast arms (`SharedBroadcastFrame`)
+    // and uncached sends (`ChunkPacketCache::frame_uncached`) — lands in the
+    // same per-thread deflate state.
     let mut body = Vec::with_capacity(raw.len() + 8);
     if raw.len() < threshold {
         crate::write_varint(&mut body, 0);
         body.extend_from_slice(raw);
     } else {
         crate::write_varint(&mut body, raw.len() as i64);
-        let mut encoder = flate2::write::ZlibEncoder::new(
-            &mut body,
-            flate2::Compression::new(zlib_level()),
-        );
-        encoder
-            .write_all(raw)
-            .expect("writing to a Vec cannot fail");
-        encoder.finish().expect("writing to a Vec cannot fail");
+        let level = zlib_level();
+        with_zlib_scratch(|scratch| body.extend_from_slice(scratch.compress_at(level, raw)));
     }
     let mut frame = Vec::with_capacity(body.len() + 5);
     crate::write_varint(&mut frame, body.len() as i64);
@@ -94,8 +278,6 @@ pub(crate) fn decode_compressed_frame(
     threshold: usize,
     max_uncompressed: usize,
 ) -> Result<Vec<u8>, String> {
-    use flate2::{Decompress, FlushDecompress, Status};
-
     let length = crate::read_protocol_i32(&mut body)
         .and_then(|n| usize::try_from(n).ok())
         .ok_or("invalid data length")?;
@@ -108,19 +290,7 @@ pub(crate) fn decode_compressed_frame(
     if length < threshold || length > max_uncompressed {
         return Err("invalid compressed packet length".into());
     }
-    let mut decoder = Decompress::new(true);
-    let mut decoded = vec![0; length + 1];
-    let status = decoder
-        .decompress(body, &mut decoded, FlushDecompress::Finish)
-        .map_err(|e| format!("invalid zlib data: {e}"))?;
-    if status != Status::StreamEnd
-        || decoder.total_out() != length as u64
-        || decoder.total_in() != body.len() as u64
-    {
-        return Err("zlib stream does not match the frame length".into());
-    }
-    decoded.truncate(length);
-    Ok(decoded)
+    with_zlib_inflate(|scratch| scratch.inflate_exact(body, length))
 }
 
 /// VecDeltaCodec subtracts separately rounded 1/4096-block positions.
@@ -1562,6 +1732,279 @@ mod tests {
         let mut trailing = body.to_vec();
         trailing.push(0);
         assert!(decode_compressed_frame(&trailing, 6, 100).is_err());
+    }
+
+    // ------------------------------------------------- zlib scratch reusage
+
+    /// Deterministic bytes that resist deflate, so the "incompressible" case is
+    /// reproducible instead of a real RNG draw.
+    fn pseudo_random(len: usize, seed: u32) -> Vec<u8> {
+        let mut state = seed | 1;
+        (0..len)
+            .map(|_| {
+                state = state.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+                (state >> 24) as u8
+            })
+            .collect()
+    }
+
+    /// zlib's Adler-32, the checksum a stream's trailer carries.
+    fn adler32(data: &[u8]) -> u32 {
+        let (mut a, mut b) = (1u32, 0u32);
+        for &byte in data {
+            a = (a + u32::from(byte)) % 65_521;
+            b = (b + a) % 65_521;
+        }
+        (b << 16) | a
+    }
+
+    /// A stream is only accepted by a conforming client when the header names
+    /// deflate with a 32 KiB window, its FCHECK bits make the header divisible
+    /// by 31, and the trailer is Adler-32 over the plain input. Check all three,
+    /// so "valid zlib" is measured rather than assumed from a round trip.
+    fn assert_valid_zlib_stream(stream: &[u8], plain: &[u8]) {
+        assert!(
+            stream.len() >= 6,
+            "a zlib stream has a header and a trailer"
+        );
+        assert_eq!(stream[0], 0x78, "deflate, 32 KiB window (CMF)");
+        let header = (u16::from(stream[0]) << 8) | u16::from(stream[1]);
+        assert_eq!(header % 31, 0, "FCHECK makes the header divisible by 31");
+        let trailer = u32::from_be_bytes(
+            stream[stream.len() - 4..]
+                .try_into()
+                .expect("four trailer bytes"),
+        );
+        assert_eq!(trailer, adler32(plain), "Adler-32 trailer covers the input");
+    }
+
+    #[test]
+    fn zlib_scratch_matches_a_fresh_encoder_byte_for_byte() {
+        use std::io::Write as _;
+
+        // Wire compatibility: a reused `Compress` after `reset()` must emit
+        // exactly what the per-packet `ZlibEncoder` this replaced emitted, at
+        // every level `MEGU_ZLIB_LEVEL` can select.
+        let mut chunk = Vec::new();
+        for i in 0..10_240u32 {
+            chunk.extend_from_slice(&[b'a' + (i % 26) as u8, (i >> 8) as u8]);
+        }
+        for level in 1..=9u32 {
+            for raw in [&[][..], b"\x01hello".as_slice(), chunk.as_slice()] {
+                let mut fresh = Vec::new();
+                let mut encoder =
+                    flate2::write::ZlibEncoder::new(&mut fresh, flate2::Compression::new(level));
+                encoder
+                    .write_all(raw)
+                    .expect("writing to a Vec cannot fail");
+                encoder.finish().expect("writing to a Vec cannot fail");
+                let reused = with_zlib_scratch(|scratch| scratch.compress_at(level, raw).to_vec());
+                assert_eq!(reused, fresh, "level {level}, {} plain bytes", raw.len());
+                assert_valid_zlib_stream(&reused, raw);
+            }
+        }
+    }
+
+    #[test]
+    fn zlib_scratch_round_trips_every_payload_shape_and_threshold() {
+        let repetitive = vec![0x5a_u8; 40 * 1024];
+        let random = pseudo_random(40 * 1024, 0x1234_5678);
+        let tiny = pseudo_random(37, 7);
+        let payloads: [&[u8]; 5] = [&[], b"\x01hello", &tiny, &repetitive, &random];
+        for raw in payloads {
+            for threshold in [0usize, 1, 37, 256, 4096, 1 << 20] {
+                // An empty payload under a 0 threshold is the one shape the
+                // wire form cannot express: `varint(0)` is the uncompressed
+                // marker, so an empty compressed body would be read as plain.
+                // Pre-existing and unreachable (a packet always has an id).
+                if raw.is_empty() && threshold == 0 {
+                    continue;
+                }
+                let frame = encode_compressed_frame(raw, threshold);
+                let mut body = frame.as_slice();
+                let length = crate::read_protocol_i32(&mut body).expect("outer length") as usize;
+                assert_eq!(length, body.len(), "outer frame length is exact");
+                let mut inner = body;
+                let data_len = crate::read_protocol_i32(&mut inner).expect("data length");
+                let decoded =
+                    decode_compressed_frame(body, threshold, 1 << 20).unwrap_or_else(|e| {
+                        panic!("{} bytes at threshold {threshold}: {e}", raw.len())
+                    });
+                assert_eq!(decoded, raw, "{} bytes at threshold {threshold}", raw.len());
+                if raw.len() >= threshold {
+                    assert_eq!(data_len as usize, raw.len(), "compressed path taken");
+                    assert_valid_zlib_stream(inner, raw);
+                } else {
+                    assert_eq!(data_len, 0, "below threshold sends a 0 data length");
+                    assert_eq!(inner, raw, "below threshold sends the plain bytes");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn zlib_scratch_reuses_one_buffer_without_stale_bytes() {
+        let first = vec![b'A'; 40 * 1024];
+        let second: Vec<u8> = (0..32 * 1024).map(|i| (i % 251) as u8).collect();
+
+        let (cap0, ptr0, bytes0) = with_zlib_scratch(|scratch| {
+            let bytes = scratch.compress_at(1, &first).to_vec();
+            (scratch.out.capacity(), scratch.out.as_ptr(), bytes)
+        });
+        // A differently sized packet in between must not leak a tail into the
+        // next stream and must not reallocate the buffer.
+        let (cap1, ptr1, bytes1) = with_zlib_scratch(|scratch| {
+            let bytes = scratch.compress_at(1, &second).to_vec();
+            (scratch.out.capacity(), scratch.out.as_ptr(), bytes)
+        });
+        let (cap2, ptr2, bytes2) = with_zlib_scratch(|scratch| {
+            let bytes = scratch.compress_at(1, &first).to_vec();
+            (scratch.out.capacity(), scratch.out.as_ptr(), bytes)
+        });
+        assert_eq!(
+            bytes0, bytes2,
+            "the same input compresses to the same bytes"
+        );
+        assert_valid_zlib_stream(&bytes0, &first);
+        assert_valid_zlib_stream(&bytes1, &second);
+        assert_eq!((cap1, ptr1), (cap0, ptr0), "the output buffer was reused");
+        assert_eq!(
+            (cap2, ptr2),
+            (cap0, ptr0),
+            "a smaller packet does not reallocate it either"
+        );
+        assert!(
+            cap0 <= ZLIB_SCRATCH_RETAIN_CAP,
+            "steady state stays under the retention cap: {cap0}"
+        );
+
+        // The reused stream still decodes to exactly its own packet.
+        let mut body = Vec::new();
+        crate::write_varint(&mut body, second.len() as i64);
+        body.extend_from_slice(&bytes1);
+        assert_eq!(decode_compressed_frame(&body, 1, 1 << 20).unwrap(), second);
+    }
+
+    #[test]
+    fn zlib_scratch_releases_an_oversized_spike_buffer() {
+        let spike = pseudo_random(2 * 1024 * 1024, 0xabcd_ef01);
+        let spike_cap = with_zlib_scratch(|scratch| {
+            let bytes = scratch.compress_at(1, &spike);
+            assert_valid_zlib_stream(bytes, &spike);
+            scratch.out.capacity()
+        });
+        assert!(
+            spike_cap > ZLIB_SCRATCH_RETAIN_CAP,
+            "an incompressible 2 MiB packet needs more than the cap: {spike_cap}"
+        );
+        let (cap, len, ptr) = with_zlib_scratch(|scratch| {
+            let bytes = scratch.compress_at(1, b"\x01hello");
+            assert_valid_zlib_stream(bytes, b"\x01hello");
+            (
+                scratch.out.capacity(),
+                scratch.out.len(),
+                scratch.out.as_ptr(),
+            )
+        });
+        assert!(
+            cap <= ZLIB_SCRATCH_RETAIN_CAP,
+            "the spike's buffer was released: {cap}"
+        );
+        assert!(len < 64, "only the next packet lives in it: {len}");
+        let ptr_again = with_zlib_scratch(|scratch| {
+            scratch.compress_at(1, b"\x01hello");
+            scratch.out.as_ptr()
+        });
+        assert_eq!(ptr_again, ptr, "the replacement buffer is reused from here");
+    }
+
+    #[test]
+    fn zlib_scratch_inflate_reuses_state_and_keeps_fail_closed_guards() {
+        let plain = vec![b'q'; 12 * 1024];
+        let mut body = Vec::new();
+        crate::write_varint(&mut body, plain.len() as i64);
+        with_zlib_scratch(|scratch| {
+            body.extend_from_slice(scratch.compress_at(1, &plain));
+        });
+
+        // Decoding repeatedly proves the cached inflate was reset: a stale
+        // `total_in` would trip the trailing-byte guard on the second call.
+        for _ in 0..4 {
+            assert_eq!(decode_compressed_frame(&body, 256, 1 << 20).unwrap(), plain);
+        }
+
+        // A stream longer than the data length claims — a bomb in miniature.
+        let mut bomb = Vec::new();
+        crate::write_varint(&mut bomb, 4096);
+        with_zlib_scratch(|scratch| bomb.extend_from_slice(scratch.compress_at(1, &plain)));
+        assert!(decode_compressed_frame(&bomb, 1, 1 << 20).is_err());
+
+        // Trailing bytes after a complete stream.
+        let mut trailing = body.clone();
+        trailing.push(0);
+        assert!(decode_compressed_frame(&trailing, 256, 1 << 20).is_err());
+
+        // A truncated stream leaves nothing behind for the next packet.
+        assert!(decode_compressed_frame(&body[..body.len() - 1], 256, 1 << 20).is_err());
+        assert_eq!(decode_compressed_frame(&body, 256, 1 << 20).unwrap(), plain);
+    }
+
+    #[test]
+    fn zlib_scratch_is_shared_by_chunk_cache_and_broadcast_paths() {
+        let payload: Vec<u8> = (0..40 * 1024).map(|i| (i % 251) as u8).collect();
+
+        // A chunk-cache miss compresses first and sizes the retained buffer.
+        let mut cache = ChunkPacketCache::new();
+        let key = (crate::DimId::Overworld, 4, -7, false);
+        cache.insert(1, key, 9, Vec::new(), payload.clone());
+        let (cached, _) = cache.frame(1, key, 9, Some(256)).unwrap();
+        let (cap, ptr) = with_zlib_scratch(|s| (s.out.capacity(), s.out.as_ptr()));
+
+        // Every other in-file encoder takes the same thread-local state.
+        let uncached = ChunkPacketCache::frame_uncached(&payload, Some(256));
+        assert_eq!(
+            with_zlib_scratch(|s| (s.out.capacity(), s.out.as_ptr())),
+            (cap, ptr),
+            "an uncached send reused the chunk-cache buffer"
+        );
+        let mut shared = SharedBroadcastFrame::new(0x27, &payload);
+        let broadcast = shared.frame_for(Some(256));
+        assert_eq!(
+            with_zlib_scratch(|s| (s.out.capacity(), s.out.as_ptr())),
+            (cap, ptr),
+            "the broadcast fanout reused the same buffer"
+        );
+
+        assert_eq!(&*broadcast, &*uncached, "identical bytes from both paths");
+        assert_eq!(&*cached, &*broadcast, "the cache stores the same frame");
+        let mut body = cached.as_slice();
+        crate::read_protocol_i32(&mut body).expect("outer length");
+        let decoded = decode_compressed_frame(body, 256, 1 << 20).unwrap();
+        assert_eq!(&decoded[1..], &payload[..], "the frame holds the payload");
+    }
+
+    #[test]
+    fn zlib_scratch_is_per_thread_and_never_crosses_payloads() {
+        let handles: Vec<_> = (0..8u8)
+            .map(|lane| {
+                std::thread::spawn(move || {
+                    let payload = vec![lane; 1024 * (usize::from(lane) + 1)];
+                    for _ in 0..20 {
+                        let frame = encode_compressed_frame(&payload, 256);
+                        let mut body = frame.as_slice();
+                        crate::read_protocol_i32(&mut body).expect("outer length");
+                        assert_eq!(
+                            decode_compressed_frame(body, 256, 1 << 20).expect("valid frame"),
+                            payload,
+                            "lane {lane} round-trips its own payload"
+                        );
+                    }
+                })
+            })
+            .collect();
+        for handle in handles {
+            handle.join().expect("worker thread finished");
+        }
     }
 
     #[test]
