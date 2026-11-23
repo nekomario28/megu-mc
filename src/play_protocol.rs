@@ -536,7 +536,7 @@ pub fn broadcast_play_delete_chat(target: PlayChatDeletion<'_>) {
     let Some((_, payload)) = encode_play_delete_chat(target) else {
         return;
     };
-    broadcast(-1, |_c| (0x1c, payload.clone()));
+    broadcast_packet(-1, 0x1c, &payload);
 }
 
 /// `start_configuration` (0x69): kicks off the optional mid-play reconfigure
@@ -585,7 +585,7 @@ fn broadcast_entity_sound(eid: i32, identifier: &str, source: u32) {
     ) else {
         return;
     };
-    broadcast_seen(eid, |_c| (0x67, payload.clone()));
+    broadcast_seen_packet(eid, 0x67, &payload);
 }
 
 /// Window ids for the horse screen reuse the interactive-menu space (4..=100)
@@ -810,7 +810,7 @@ fn play_content_revision_sync() {
         return;
     }
     let payload = update_tags_wire_payload();
-    broadcast(-1, |_c| (0x78, payload.clone()));
+    broadcast_packet(-1, 0x78, &payload);
 }
 
 /// `chunks_biomes` (0x0e) data for one chunk: per-section biome paletted
@@ -874,7 +874,7 @@ fn biome_override_sync_tick() {
         for (cx, cz) in chunks {
             let data = chunk_biome_data(dim, cx, cz, &cells);
             let (_packet, payload) = encode_play_chunks_biomes(&[(cx, cz, data.as_slice())]);
-            broadcast_chunk_dim(dim, cx, cz, |_c| (0x0e, payload.clone()));
+            broadcast_chunk_dim_packet(dim, cx, cz, 0x0e, &payload);
         }
     }
 }
@@ -906,6 +906,27 @@ fn read_before(s: &mut TcpStream, mut out: &mut [u8], deadline: Instant) -> Opti
 }
 fn read_packet(s: &mut TcpStream, deadline: Instant) -> Option<(i64, Vec<u8>)> {
     read_login_frame(s, deadline, None)
+}
+
+/// Read a pre-play packet only after charging it against the connection's
+/// packet budget. Rejected packets are consumed and skipped; a sustained flood
+/// ends the connection through the same two-second policy as play traffic.
+fn read_preplay_frame(
+    s: &mut TcpStream,
+    deadline: Instant,
+    compression: Option<usize>,
+    rate: &mut connection_limits::PacketRateLimit,
+) -> Option<(i64, Vec<u8>)> {
+    loop {
+        let packet = read_login_frame(s, deadline, compression)?;
+        let now = Instant::now();
+        if rate.allow(now) {
+            return Some(packet);
+        }
+        if rate.should_disconnect(now) {
+            return None;
+        }
+    }
 }
 
 fn read_login_frame(
@@ -2168,6 +2189,50 @@ fn fanout_shared_in<F, P>(
     }
 }
 
+/// Fan out one already-built payload without cloning it for each recipient.
+/// The broadcast frame cache still handles each wire compression class once.
+fn fanout_packet_in<P>(
+    audience: &[Arc<Client>],
+    interested: P,
+    id: i64,
+    packet: &[u8],
+    shared: &mut Option<BroadcastFrameCache>,
+) where
+    P: Fn(&Client) -> bool,
+{
+    for c in audience.iter() {
+        if !interested(c) {
+            continue;
+        }
+        if let Ok(mut w) = c.sock.lock() {
+            let _ = send_broadcast_frame(&mut w, shared, id, packet);
+        }
+    }
+}
+
+fn broadcast_packet(me_eid: i32, id: i64, packet: &[u8]) {
+    let audience = client_snapshot();
+    let mut shared = None;
+    fanout_packet_in(&audience, |c| c.eid != me_eid, id, packet, &mut shared);
+}
+
+fn broadcast_seen_packet(eid: i32, id: i64, packet: &[u8]) {
+    broadcast_seen_ex_packet(eid, 0, id, packet)
+}
+
+fn broadcast_seen_ex_packet(eid: i32, excl: i32, id: i64, packet: &[u8]) {
+    let audience = client_snapshot();
+    let mut shared = None;
+    for client in audience.iter().filter(|c| c.eid != excl) {
+        let seen = client.seen.lock().unwrap_or_else(|e| e.into_inner());
+        if seen.contains(&eid) {
+            if let Ok(mut socket) = client.sock.lock() {
+                let _ = send_broadcast_frame(&mut socket, &mut shared, id, packet);
+            }
+        }
+    }
+}
+
 fn broadcast<F: Fn(&Client) -> (i64, Vec<u8>)>(me_eid: i32, mk: F) {
     broadcast_in(&client_snapshot(), me_eid, mk)
 }
@@ -2342,7 +2407,7 @@ fn sleep_meta_pkt(eid: i32, sleeping: bool, bed: (i32, i32, i32)) -> Vec<u8> {
 
 fn broadcast_sleep_pose(me: &Client, sleeping: bool, bed: (i32, i32, i32)) {
     let pkt = sleep_meta_pkt(me.eid, sleeping, bed);
-    broadcast_seen(me.eid, |_c| (0x58, pkt.clone()));
+    broadcast_seen_packet(me.eid, 0x58, &pkt);
 }
 
 /// Wake the player if they are in a bed: clear the state and restore the pose
@@ -2382,7 +2447,7 @@ fn skip_night() {
             let _ = send_packet(&mut w, 0x22, rain.clone());
         }
         let line = system_chat(&format!("{} slept through the night", sleeper.name));
-        broadcast(-1, |_c| (0x6c, line.clone()));
+        broadcast_packet(-1, 0x6c, &line);
     }
 }
 
@@ -3280,13 +3345,14 @@ fn finish_block_break_one(me: &Arc<Client>, dim: DimId, x: i32, y: i32, z: i32, 
                     *p
                 };
                 let snd = sound_pkt_named("entity.item.break", pxx, pyy + 1.0, pzz);
-                broadcast_near(
+                broadcast_near_packet(
                     *me.dim.lock().unwrap_or_else(|e| e.into_inner()),
                     pxx,
                     pyy + 1.0,
                     pzz,
                     -1,
-                    |_c| (0x68, snd.clone()),
+                    0x68,
+                    &snd,
                 );
             }
             held_slot_resync(me);
@@ -3687,9 +3753,28 @@ fn broadcast_chunk_dim_in<F: Fn(&Client) -> (i64, Vec<u8>)>(
         }
     }
 }
+fn broadcast_chunk_dim_packet(dim: DimId, cx: i32, cz: i32, id: i64, packet: &[u8]) {
+    let audience = client_snapshot();
+    let mut shared = None;
+    for client in audience {
+        let chunks = client.chunks.lock().unwrap_or_else(|e| e.into_inner());
+        if !chunks.contains(&(cx, cz)) {
+            continue;
+        }
+        let Ok(mut socket) = client.sock.lock() else {
+            continue;
+        };
+        if *client.dim.lock().unwrap_or_else(|e| e.into_inner()) != dim {
+            continue;
+        }
+        if send_broadcast_frame(&mut socket, &mut shared, id, packet).is_err() {
+            let _ = socket.shutdown(std::net::Shutdown::Both);
+        }
+    }
+}
 fn broadcast_seen_destroy(eid: i32) {
     let p = remove_entities_payload(&[eid]);
-    broadcast_seen(eid, |_c| (0x42, p.clone()));
+    broadcast_seen_packet(eid, 0x42, &p);
 }
 // LOCK ORDER: these helpers acquire clients() internally — never call
 // while holding clients().lock() (self-deadlock; hit twice: v1.56
@@ -3760,6 +3845,34 @@ fn broadcast_near_in<F: Fn(&Client) -> (i64, Vec<u8>)>(
         }
         if let Ok(mut socket) = client.sock.lock() {
             let _ = send_broadcast_frame(&mut socket, &mut shared, id, &packet);
+        }
+    }
+}
+
+fn broadcast_near_packet(
+    dim: DimId,
+    x: f64,
+    y: f64,
+    z: f64,
+    me_eid: i32,
+    id: i64,
+    packet: &[u8],
+) {
+    let audience = client_snapshot();
+    let Some(radius) = connection_limits::broadcast_radius(id, packet) else {
+        return;
+    };
+    let mut shared = None;
+    for client in audience.iter().filter(|c| c.eid != me_eid) {
+        if *client.dim.lock().unwrap_or_else(|e| e.into_inner()) != dim {
+            continue;
+        }
+        let (px, py, pz, ..) = *client.pos.lock().unwrap_or_else(|e| e.into_inner());
+        if !connection_limits::within_broadcast_range(px, py, pz, x, y, z, radius) {
+            continue;
+        }
+        if let Ok(mut socket) = client.sock.lock() {
+            let _ = send_broadcast_frame(&mut socket, &mut shared, id, packet);
         }
     }
 }
@@ -5829,7 +5942,7 @@ fn c2s_apply_lock_difficulty(me: &Client, locked: bool) -> bool {
     }
     DIFFICULTY_LOCKED.store(locked as u8, Ordering::Relaxed);
     let packet = vec![DIFFICULTY.load(Ordering::Relaxed), locked as u8];
-    broadcast(-1, |_c| (0x0b, packet.clone()));
+    broadcast_packet(-1, 0x0b, &packet);
     true
 }
 
@@ -5893,7 +6006,7 @@ fn end_portal_spawn_sound(dim: DimId, x: f64, y: f64, z: f64) {
     p.extend_from_slice(&1.0f32.to_be_bytes());
     p.extend_from_slice(&0i64.to_be_bytes());
     if gamerule_live_value("globalSoundEvents") != 0 {
-        broadcast(-1, |_c| (0x68, p.clone()));
+        broadcast_packet(-1, 0x68, &p);
         return;
     }
     for c in client_snapshot() {
@@ -8090,7 +8203,7 @@ fn drop_player_items_on_death(player: &Arc<Client>) {
         );
         let _ = send_packet(&mut w, 0x22, ge);
     }
-    broadcast_seen_ex(player.eid, player.eid, |_c| (0x1f, death_evt.clone()));
+    broadcast_seen_ex_packet(player.eid, player.eid, 0x1f, &death_evt);
     // `enderPearlsVanishOnDeath`: the dying owner's in-flight pearls die with
     // them — before keepInventory decides the inventory's fate, exactly like
     // vanilla `LivingEntity.die`'s pearl cleanup.
@@ -8383,7 +8496,11 @@ fn offline_public_bind_check(
 /// Plugin Response (`0x02`) verified through `verify_velocity_forwarding`.
 /// The `data` of both plugin messages is the remaining frame bytes, not a
 /// length-prefixed array.
-fn velocity_login(s: &mut TcpStream, deadline: Instant) -> Result<VelocityForwardedPlayer, String> {
+fn velocity_login(
+    s: &mut TcpStream,
+    deadline: Instant,
+    rate: &mut connection_limits::PacketRateLimit,
+) -> Result<VelocityForwardedPlayer, String> {
     const FORWARDING_MESSAGE_ID: i64 = 0;
     let mut body = Vec::new();
     write_varint(&mut body, FORWARDING_MESSAGE_ID);
@@ -8391,7 +8508,7 @@ fn velocity_login(s: &mut TcpStream, deadline: Instant) -> Result<VelocityForwar
     // Velocity reads the max modern-forwarding version it may answer with.
     body.push(VELOCITY_FORWARDING_VERSION_MAX as u8);
     send_packet(s, 0x04, body).map_err(|e| format!("plugin request write failed: {e}"))?;
-    let (id, resp) = read_login_frame(s, deadline, None)
+    let (id, resp) = read_preplay_frame(s, deadline, None, rate)
         .ok_or_else(|| "client left before the plugin response".to_string())?;
     if id != 0x02 {
         return Err(format!("expected plugin response 0x02, got packet {id:#04x}"));
@@ -8425,6 +8542,7 @@ fn online_login(
     name: &str,
     peer: &str,
     deadline: Instant,
+    rate: &mut connection_limits::PacketRateLimit,
 ) -> Result<MojangJoinedProfile, String> {
     let auth = online_auth_provider()
         .ok_or_else(|| "online mode needs a keypair/session provider".to_string())?;
@@ -8436,7 +8554,7 @@ fn online_login(
         encode_encryption_request("", &key_der, &token, true),
     )
     .map_err(|e| format!("encryption request write failed: {e}"))?;
-    let (id, body) = read_login_frame(s, deadline, None)
+    let (id, body) = read_preplay_frame(s, deadline, None, rate)
         .ok_or_else(|| "client left before the encryption response".to_string())?;
     if id != LOGIN_ENCRYPTION_RESPONSE_ID {
         return Err(format!("expected encryption response 0x01, got packet {id:#04x}"));
@@ -8635,7 +8753,7 @@ fn try_mount_vehicle(me: &Arc<Client>, target: i32) -> bool {
     }
     ac_note_carried_motion(me.eid, [off[0], off[1], off[2]]);
     let packet = mounts().lock().unwrap_or_else(|e| e.into_inner()).registry.encode_set_passengers(target);
-    broadcast_seen(target, |_c| (0x5f, packet.clone()));
+    broadcast_seen_packet(target, 0x5f, &packet);
     true
 }
 
@@ -8762,7 +8880,7 @@ fn step_live_vehicle(me: &Arc<Client>, pkt: &MoveVehiclePacket) {
         );
     }
     let packet = entity_teleport(vehicle, step.pos[0], step.pos[1], step.pos[2], pkt.yaw, pkt.pitch, true);
-    broadcast_seen(vehicle, |_c| (0x70, packet.clone()));
+    broadcast_seen_packet(vehicle, 0x70, &packet);
 }
 
 /// The vehicle a passenger eid is riding, per the live mount graph.
@@ -8791,7 +8909,7 @@ fn player_dismount(me: &Arc<Client>, reposition: bool) {
         *p = (at[0], at[1], at[2], yaw, pitch, ground);
     }
     let packet = mounts().lock().unwrap_or_else(|e| e.into_inner()).registry.encode_set_passengers(vehicle);
-    broadcast_seen(vehicle, |_c| (0x5f, packet.clone()));
+    broadcast_seen_packet(vehicle, 0x5f, &packet);
 }
 
 /// Entity teardown for the mount graph (`Entity.remove`/`die` plus player
@@ -8836,7 +8954,7 @@ fn live_mount_forget(eid: i32) {
     updated.dedup();
     for vehicle in updated {
         let packet = mounts().lock().unwrap_or_else(|e| e.into_inner()).registry.encode_set_passengers(vehicle);
-        broadcast_seen(vehicle, |_c| (0x5f, packet.clone()));
+    broadcast_seen_packet(vehicle, 0x5f, &packet);
     }
 }
 
@@ -8897,7 +9015,7 @@ fn live_chat_relay(me: &Arc<Client>, env: &ChatMessageEnvelope, m: &str, verdict
             let _ = read_varint(&mut body);
             let payload = body.to_vec();
             let _ = send_packet(&mut me.sock.lock().unwrap_or_else(|e| e.into_inner()), 0x39, payload.clone());
-            broadcast(me.eid, |_c| (0x39, payload.clone()));
+            broadcast_packet(me.eid, 0x39, &payload);
         }
         ChatVerdict::Disguised => {
             let session_eids: HashSet<i32> = chat_sessions()
@@ -9380,7 +9498,10 @@ fn handle_inner(mut s: TcpStream, live_eid: Arc<AtomicI32>) {
     s.set_write_timeout(Some(Duration::from_secs(10))).ok();
     // One wall-clock budget for handshake, login and configuration together.
     let login_deadline = Instant::now() + connection_limits::login_timeout();
-    let (id, hs) = match read_packet(&mut s, login_deadline) {
+    // This budget spans handshake, login and configuration, rather than
+    // starting only after the client reaches play state.
+    let mut preplay_rate = connection_limits::PacketRateLimit::new(Instant::now());
+    let (id, hs) = match read_preplay_frame(&mut s, login_deadline, None, &mut preplay_rate) {
         Some(x) => x,
         None => return,
     };
@@ -9400,7 +9521,7 @@ fn handle_inner(mut s: TcpStream, live_eid: Arc<AtomicI32>) {
         return;
     }
     if next == 1 {
-        if let Some((0, _)) = read_packet(&mut s, login_deadline) {
+        if let Some((0, _)) = read_preplay_frame(&mut s, login_deadline, None, &mut preplay_rate) {
             let online_players: Vec<(String, [u8; 16])> = clients()
                 .lock()
                 .unwrap_or_else(|e| e.into_inner())
@@ -9414,7 +9535,7 @@ fn handle_inner(mut s: TcpStream, live_eid: Arc<AtomicI32>) {
             write_str(&mut pl, &json);
             let _ = send_packet(&mut s, 0, pl);
         }
-        if let Some((1, ping)) = read_packet(&mut s, login_deadline) {
+        if let Some((1, ping)) = read_preplay_frame(&mut s, login_deadline, None, &mut preplay_rate) {
             let _ = send_packet(&mut s, 1, ping);
         }
         return;
@@ -9423,7 +9544,7 @@ fn handle_inner(mut s: TcpStream, live_eid: Arc<AtomicI32>) {
         return;
     }
     // ---- login ----
-    let (lid, lbody) = match read_packet(&mut s, login_deadline) {
+    let (lid, lbody) = match read_preplay_frame(&mut s, login_deadline, None, &mut preplay_rate) {
         Some(x) => x,
         None => return,
     };
@@ -9441,7 +9562,7 @@ fn handle_inner(mut s: TcpStream, live_eid: Arc<AtomicI32>) {
     // privilege decision below may then trust the UUID, not just the claimed name.
     let mut authenticated = false;
     if velocity_forwarding_enabled() {
-        match velocity_login(&mut s, login_deadline) {
+        match velocity_login(&mut s, login_deadline, &mut preplay_rate) {
             Ok(fwd) => {
                 eprintln!("[spine] {peer} forwarded {} as {}", fwd.forwarded_ip, fwd.username);
                 peer = fwd.forwarded_ip;
@@ -9457,7 +9578,7 @@ fn handle_inner(mut s: TcpStream, live_eid: Arc<AtomicI32>) {
             }
         }
     } else if online_mode_enabled() {
-        match online_login(&mut s, &name, &peer, login_deadline) {
+        match online_login(&mut s, &name, &peer, login_deadline, &mut preplay_rate) {
             Ok(profile) => {
                 uuid = profile.uuid;
                 name = profile.name;
@@ -9544,7 +9665,7 @@ fn handle_inner(mut s: TcpStream, live_eid: Arc<AtomicI32>) {
     if send_packet(&mut s, 2, ls).is_err() {
         return;
     }
-    match read_login_frame(&mut s, login_deadline, compression) {
+    match read_preplay_frame(&mut s, login_deadline, compression, &mut preplay_rate) {
         Some((3, _)) => {}
         _ => return,
     }
@@ -9566,7 +9687,7 @@ fn handle_inner(mut s: TcpStream, live_eid: Arc<AtomicI32>) {
     let t0 = Instant::now();
     let mut got_selpacks = false;
     while Instant::now() - t0 < Duration::from_secs(15) {
-        match read_login_frame(&mut s, login_deadline, compression) {
+        match read_preplay_frame(&mut s, login_deadline, compression, &mut preplay_rate) {
             Some((0x00, b)) => {
                 let Some(v) = client_info_view_distance(&b) else {
                     return;
@@ -9602,7 +9723,7 @@ fn handle_inner(mut s: TcpStream, live_eid: Arc<AtomicI32>) {
         if Instant::now() - t0 > Duration::from_secs(15) {
             return;
         }
-        match read_login_frame(&mut s, login_deadline, compression) {
+        match read_preplay_frame(&mut s, login_deadline, compression, &mut preplay_rate) {
             Some((0x00, b)) => {
                 let Some(v) = client_info_view_distance(&b) else {
                     return;
@@ -10083,7 +10204,7 @@ fn handle_inner(mut s: TcpStream, live_eid: Arc<AtomicI32>) {
                 encode_set_equipment_changes(me.eid, &last_equipment, &equipment_now)
             {
                 last_equipment = equipment_now;
-                broadcast_seen(me.eid, |_c| (0x5b, packet.clone()));
+                broadcast_seen_packet(me.eid, 0x5b, &packet);
             }
         }
         use connection_limits::KeepaliveAction;
@@ -10440,7 +10561,7 @@ fn handle_inner(mut s: TcpStream, live_eid: Arc<AtomicI32>) {
                             },
                         );
                         p.push(0xff);
-                        broadcast_seen(me.eid, |_c| (0x58, p.clone()));
+                        broadcast_seen_packet(me.eid, 0x58, &p);
                     }
                 }
             }
@@ -10679,13 +10800,14 @@ fn handle_inner(mut s: TcpStream, live_eid: Arc<AtomicI32>) {
                             // vanilla: firing a bow/crossbow wears it
                             if damage_held(&me) {
                                 let snd = sound_pkt_named("entity.item.break", x, y + 1.0, z);
-                                broadcast_near(
+                                broadcast_near_packet(
                                     *me.dim.lock().unwrap_or_else(|e| e.into_inner()),
                                     x,
                                     y + 1.0,
                                     z,
                                     -1,
-                                    |_c| (0x68, snd.clone()),
+                                    0x68,
+                                    &snd,
                                 );
                             }
                             {
@@ -12125,13 +12247,14 @@ fn handle_inner(mut s: TcpStream, live_eid: Arc<AtomicI32>) {
                                         };
                                         let snd =
                                             sound_pkt_named("entity.item.break", pxx, pyy, pzz);
-                                        broadcast_near(
+                                        broadcast_near_packet(
                                             *me.dim.lock().unwrap_or_else(|e| e.into_inner()),
                                             pxx,
                                             pyy,
                                             pzz,
                                             -1,
-                                            |_c| (0x68, snd.clone()),
+                                            0x68,
+                                            &snd,
                                         );
                                     }
                                     held_slot_resync(&me);
@@ -12184,7 +12307,7 @@ fn handle_inner(mut s: TcpStream, live_eid: Arc<AtomicI32>) {
                         }
                         if let Some((veid, vname, hh, hurt_yaw)) = found {
                             let hurt_pkt = hurt_anim_yaw(veid, hurt_yaw);
-                            broadcast_seen_ex(veid, veid, |_c| (0x24, hurt_pkt.clone()));
+                            broadcast_seen_ex_packet(veid, veid, 0x24, &hurt_pkt);
                             if hh <= 0.0 {
                                 let victim = {
                                     clients().lock().unwrap_or_else(|e| e.into_inner()).iter().find(|c| c.eid == veid).cloned()
@@ -12198,7 +12321,7 @@ fn handle_inner(mut s: TcpStream, live_eid: Arc<AtomicI32>) {
                                         vname, me.name
                                     );
                                     let line = system_chat(&message);
-                                    broadcast(-1, |_c| (0x6c, line.clone()));
+                                    broadcast_packet(-1, 0x6c, &line);
                                     // vanilla `ServerPlayer.die`: under
                                     // showDeathMessages the combat tracker's
                                     // death message also rides
@@ -12413,13 +12536,14 @@ fn handle_inner(mut s: TcpStream, live_eid: Arc<AtomicI32>) {
                                         *p
                                     };
                                     let snd = sound_pkt_named("entity.item.break", pxx, pyy, pzz);
-                                    broadcast_near(
+                                    broadcast_near_packet(
                                         *me.dim.lock().unwrap_or_else(|e| e.into_inner()),
                                         pxx,
                                         pyy,
                                         pzz,
                                         -1,
-                                        |_c| (0x68, snd.clone()),
+                                        0x68,
+                                        &snd,
                                     );
                                 }
                                 held_slot_resync(&me);
@@ -12434,7 +12558,7 @@ fn handle_inner(mut s: TcpStream, live_eid: Arc<AtomicI32>) {
                                 let ha = hurt_anim(m.eid);
                                 let _ =
                                     send_packet(&mut me.sock.lock().unwrap_or_else(|e| e.into_inner()), 0x24, ha.clone());
-                                broadcast_seen_ex(me.eid, me.eid, |_c| (0x24, ha.clone()));
+                                broadcast_seen_ex_packet(me.eid, me.eid, 0x24, &ha);
                                 // knockback away from attacker
                                 let (pp, mp) = (
                                     {
@@ -12456,7 +12580,7 @@ fn handle_inner(mut s: TcpStream, live_eid: Arc<AtomicI32>) {
                                     2800,
                                     (kz * 3200.0) as i16,
                                 );
-                                broadcast_seen(m.eid, |_c| (0x5a, vp.clone()));
+                                broadcast_seen_packet(m.eid, 0x5a, &vp);
                                 // vanilla: sprint attacks add knockback and reset the sprint
                                 let sprint_hit = *me.sprinting.lock().unwrap_or_else(|e| e.into_inner());
                                 if sprint_hit {
@@ -12472,7 +12596,7 @@ fn handle_inner(mut s: TcpStream, live_eid: Arc<AtomicI32>) {
                                     p.2 = nz;
                                 }
                                 let tp = entity_teleport(m.eid, nx, mp.1, nz, mp.3, mp.4, true);
-                                broadcast_seen(m.eid, |_c| (0x70, tp.clone()));
+                                broadcast_seen_packet(m.eid, 0x70, &tp);
                             }
                         }
                     }
@@ -12496,7 +12620,7 @@ fn handle_inner(mut s: TcpStream, live_eid: Arc<AtomicI32>) {
                         if GR_SHOW_DEATH_MESSAGES.load(Ordering::Relaxed) != 0 {
                             let line =
                                 system_chat(&format!("{} was slain by {}", mn, me.name));
-                            broadcast(-1, |_c| (0x6c, line.clone()));
+                            broadcast_packet(-1, 0x6c, &line);
                         }
                         let Some((mob, state)) = remove_live_mob(deid) else { continue };
                         let burn_kill = *mob.fire_ticks.lock().unwrap_or_else(|e| e.into_inner()) > 0;
@@ -14479,7 +14603,7 @@ fn disconnect_cleanup(me_cleanup: &Arc<Client>, peer: &str) {
         let mut p = Vec::new();
         write_varint(&mut p, 1);
         p.extend_from_slice(&me_cleanup.uuid);
-        broadcast(me_cleanup.eid, |_c| (0x3d, p.clone()));
+        broadcast_packet(me_cleanup.eid, 0x3d, &p);
         // The last online client list is empty: the snapshot above is the
         // world's final live state, and an idle server's periodic autosave
         // may never run again (the liveness floor counts online clients).
@@ -14667,7 +14791,7 @@ fn pet_collar_or_parrot_interact(client: &Client, target: i32, slot: i16) -> boo
             broadcast_seen(target, |_| (0x58, live_mob_metadata(target, 17, 0, flags)));
             let mut packet = target.to_be_bytes().to_vec();
             packet.push(if tamed { 7 } else { 6 });
-            broadcast_seen(target, |_| (0x1f, packet.clone()));
+            broadcast_seen_packet(target, 0x1f, &packet);
         }
         Some(PetInteract::Sitting(sitting)) => {
             let flags = u8::from(sitting) | 4;
@@ -19967,7 +20091,7 @@ mod bot_net2_tests {
         let audience = [a.clone(), b.clone(), plain.clone()];
 
         let mut shared = None;
-        fanout_shared_in(&audience, |_| true, |_c| (0x27, payload.clone()), &mut shared);
+        fanout_packet_in(&audience, |_| true, 0x27, &payload, &mut shared);
         let cache = shared.expect("a delivered broadcast builds the cache");
         assert_eq!(
             cache.frame.encode_count(),
@@ -20004,7 +20128,7 @@ mod bot_net2_tests {
         // broadcast_in: everyone except the named sender — three recipients.
         let audience = [a.clone(), b.clone(), c.clone()];
         let mut shared = None;
-        fanout_shared_in(&audience, |c| c.eid != 11, |_c| (0x6c, payload.clone()), &mut shared);
+        fanout_packet_in(&audience, |c| c.eid != 11, 0x6c, &payload, &mut shared);
 
         assert_eq!(drained(&mut ra).len(), 0, "the excluded sender gets nothing");
         assert_eq!(
