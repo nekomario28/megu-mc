@@ -979,6 +979,22 @@ impl ResourcePackModelStack {
             }
         }
     }
+
+    /// The model's `parent`-merged `textures` map with every `#alias`
+    /// resolved to a concrete texture id — what [`bake_model_with_uvlock`]
+    /// consults per face, exposed so callers that only need a sprite name
+    /// (e.g. a per-block display texture) pay no quad bake.
+    pub fn resolved_textures(
+        &self,
+        model_id: &str,
+    ) -> Result<BTreeMap<String, String>, ModelError> {
+        let resolved = self.resolve(model_id)?;
+        let mut textures = BTreeMap::new();
+        for (key, value) in &resolved.textures {
+            textures.insert(key.clone(), Self::resolve_texture(&resolved.textures, value)?);
+        }
+        Ok(textures)
+    }
 }
 
 /// The merged view of one model id after pack overlay + `parent` merge.
@@ -1764,6 +1780,73 @@ pub mod blockstate {
                 })
             }
         }
+    }
+
+    /// A synthetic `property -> value` map that lets
+    /// [`resolve_blockstate`]/[`bake_blockstate`] produce a concrete model
+    /// for `def` when no real block state is available — the client-side
+    /// registry names blocks per state id but does not retain each state's
+    /// properties, so a per-block display texture needs stand-in values.
+    ///
+    /// Every key any selector references must be *present* or `eval`
+    /// fails closed. For `"variants"` defs the first entry's own
+    /// constraints are used verbatim (guaranteeing that entry matches)
+    /// and keys referenced only by later entries get `""` — a value no
+    /// constraint equals, so they evaluate false instead of erroring.
+    /// For `"multipart"` defs each condition key gets its first
+    /// positively listed value, and keys that appear only negated get
+    /// `""`, which satisfies the negation.
+    pub fn representative_props(def: &BlockStateDef) -> BTreeMap<String, String> {
+        let mut props = BTreeMap::new();
+        for (index, entry) in def.variants.iter().enumerate() {
+            for (key, value) in &entry.constraints {
+                props.entry(key.clone()).or_insert_with(|| {
+                    if index == 0 {
+                        value.clone()
+                    } else {
+                        String::new()
+                    }
+                });
+            }
+        }
+        // First pass: keys a condition asserts positively win their first
+        // listed value, so `when` selectors actually apply. Negated-only
+        // keys fill in afterwards.
+        fn condition_values<'a>(
+            condition: &'a Condition,
+            positives: &mut BTreeMap<&'a str, &'a str>,
+            all: &mut std::collections::BTreeSet<&'a str>,
+        ) {
+            match condition {
+                Condition::Any => {}
+                Condition::KeyValue {
+                    key,
+                    values,
+                    negated,
+                } => {
+                    all.insert(key.as_str());
+                    if !negated {
+                        positives.entry(key.as_str()).or_insert(values[0].as_str());
+                    }
+                }
+                Condition::All(conditions) | Condition::AnyOf(conditions) => {
+                    for condition in conditions {
+                        condition_values(condition, positives, all);
+                    }
+                }
+            }
+        }
+        let mut positives = BTreeMap::new();
+        let mut all_keys = std::collections::BTreeSet::new();
+        for selector in &def.multipart {
+            condition_values(&selector.condition, &mut positives, &mut all_keys);
+        }
+        for key in all_keys {
+            props
+                .entry(key.to_owned())
+                .or_insert_with(|| positives.get(key).copied().unwrap_or_default().to_owned());
+        }
+        props
     }
 
     /// Parses a `"variants"` key: comma-separated `prop=value` segments.

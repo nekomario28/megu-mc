@@ -1293,6 +1293,30 @@ impl SpriteAnimation {
         let last = self.frames.len() - 1;
         (last, 0, 0.0)
     }
+
+    /// The `atlas_rects` `SpriteFrame` pair that samples this animation at
+    /// `tick`, derived from `tile` (the packed sprite's whole-strip
+    /// [`AtlasTileRect`]):
+    ///
+    /// * `rect` — `(u0, v0, u_scale, v_scale)` of the active strip slot in
+    ///   normalized atlas space. `v_scale` is `tile.v_scale /
+    ///   strip_frames`, so `rect.xy + fract(uv) * rect.zw` samples exactly
+    ///   one `frame_size`-tall slot while tiled faces still wrap inside it.
+    /// * `aux` — `(v0 of the next slot, blend_alpha, 0, 0)` for shaders
+    ///   implementing `interpolate`: `mix(cur, next, aux.y)`. `blend_alpha`
+    ///   is always `0.0` for non-interpolated animations, which callers may
+    ///   use to skip the second sample.
+    pub fn rect_pair_at_tick(&self, tile: &AtlasTileRect, tick: u64) -> ([f32; 4], [f32; 4]) {
+        let (cur, next, blend) = self.active_frame_at_tick(tick);
+        // Slots stack top-to-bottom, so slot `i`'s window starts
+        // `i` frame-heights below the strip's top edge.
+        let frame_v = tile.v_scale / self.strip_frames as f32;
+        let slot_top = |i: usize| tile.v0 + self.frames[i].index as f32 * frame_v;
+        (
+            [tile.u0, slot_top(cur), tile.u_scale, frame_v],
+            [slot_top(next), blend, 0.0, 0.0],
+        )
+    }
 }
 
 // ---------------------------------------------------------------------------

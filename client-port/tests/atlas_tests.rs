@@ -361,6 +361,67 @@ fn animation_tables_fail_closed() {
     ));
 }
 
+#[test]
+fn rect_pair_at_tick_advances_frame_window_and_blends() {
+    // 16x64 strip (4 slots) packed so the whole-strip tile covers
+    // u = [0.25, 0.375), v = [0, 1) — each slot window is 0.25 of V.
+    let tile = AtlasTileRect {
+        u0: 0.25,
+        v0: 0.0,
+        u_scale: 0.125,
+        v_scale: 1.0,
+        texel_u: 1.0 / 128.0,
+        texel_v: 1.0 / 64.0,
+    };
+
+    let anim = SpriteAnimation::strip(16, 64, 2, true).unwrap();
+    let (rect, aux) = anim.rect_pair_at_tick(&tile, 0);
+    assert_rect_eq(rect, [0.25, 0.0, 0.125, 0.25]);
+    assert_rect_eq(aux, [0.25, 0.0, 0.0, 0.0]);
+
+    // Mid-way through slot 1's duration: window sits on slot 1 and the
+    // aux pair points at slot 2's top edge with a 0.5 blend.
+    let (rect, aux) = anim.rect_pair_at_tick(&tile, 3);
+    assert_rect_eq(rect, [0.25, 0.25, 0.125, 0.25]);
+    assert_f32_eq(aux[0], 0.5);
+    assert_f32_eq(aux[1], 0.5);
+
+    // The last slot blends cyclically back into slot 0's top edge.
+    let (rect, aux) = anim.rect_pair_at_tick(&tile, 7);
+    assert_rect_eq(rect, [0.25, 0.75, 0.125, 0.25]);
+    assert_f32_eq(aux[0], 0.0);
+    assert_f32_eq(aux[1], 0.5);
+
+    // Ticks wrap by `total_ticks` (8): 10 == 2 -> slot 1, blend 0.
+    let (rect, aux) = anim.rect_pair_at_tick(&tile, 10);
+    assert_rect_eq(rect, [0.25, 0.25, 0.125, 0.25]);
+    assert_f32_eq(aux[1], 0.0);
+
+    // Non-interpolated playback still slides the window; the blend
+    // factor stays zero so shaders skip the second fetch.
+    let still = SpriteAnimation::strip(16, 64, 1, false).unwrap();
+    let (rect, aux) = still.rect_pair_at_tick(&tile, 2);
+    assert_rect_eq(rect, [0.25, 0.5, 0.125, 0.25]);
+    assert_f32_eq(aux[0], 0.75);
+    assert_f32_eq(aux[1], 0.0);
+
+    // Custom tables: `.index` names the strip slot, so the window
+    // follows the playback order, not the slot order.
+    let custom = SpriteAnimation::with_frames(
+        16,
+        64,
+        vec![
+            AnimFrame { index: 2, ticks: 1 },
+            AnimFrame { index: 0, ticks: 1 },
+        ],
+        false,
+    )
+    .unwrap();
+    let (rect, aux) = custom.rect_pair_at_tick(&tile, 0);
+    assert_rect_eq(rect, [0.25, 0.5, 0.125, 0.25]);
+    assert_f32_eq(aux[0], 0.0);
+}
+
 // ---------------------------------------------------------------------------
 // Baked-quad UV remapping + biome tint
 // ---------------------------------------------------------------------------

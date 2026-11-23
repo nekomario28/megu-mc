@@ -2116,7 +2116,14 @@ struct ShadowSection {
     biome_tint: vec3<f32>,
     biome_tint_strength: f32,
 };
-struct AtlasRects { rects: array<vec4<f32>> };
+// One slot per atlas sprite: `rect` is the active `.mcmeta` frame window
+// (whole-strip rect for static sprites) and `anim` carries the next
+// slot's top edge plus the `interpolate` blend factor.
+struct SpriteFrame {
+    rect: vec4<f32>,
+    anim: vec4<f32>,
+};
+struct AtlasRects { rects: array<SpriteFrame> };
 struct AtlasStates { sprites: array<u32> };
 @group(0) @binding(0) var<uniform> shadow: ShadowUniforms;
 @group(1) @binding(1) var<uniform> section: ShadowSection;
@@ -2202,9 +2209,19 @@ fn sample_atlas_alpha(sprite_id: u32, uv: vec2<f32>) -> f32 {
     if (mapped >= arrayLength(&atlas_rects.rects)) {
         return 1.0;
     }
-    let rect = atlas_rects.rects[mapped];
-    return textureSampleLevel(atlas_tex, atlas_sampler,
+    let frame = atlas_rects.rects[mapped];
+    let rect = frame.rect;
+    var alpha = textureSampleLevel(atlas_tex, atlas_sampler,
         rect.xy + fract(uv) * rect.zw, 0.0).a;
+    // Interpolated `.mcmeta` sprites blend the next strip slot's alpha so
+    // the cutout mask matches the frame the colour pass renders.
+    if (frame.anim.y > 0.0) {
+        let next = textureSampleLevel(atlas_tex, atlas_sampler,
+            vec2<f32>(rect.x + fract(uv.x) * rect.z,
+                      frame.anim.x + fract(uv.y) * rect.w), 0.0).a;
+        alpha = mix(alpha, next, frame.anim.y);
+    }
+    return alpha;
 }
 
 @fragment

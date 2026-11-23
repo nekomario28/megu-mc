@@ -2,7 +2,7 @@
 //! Asynchronous live Protocol 767/777 session and renderer-facing world state.
 //! Socket operations happen on a worker thread; `poll` never performs I/O.
 
-use std::collections::{BTreeMap, BTreeSet, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
 use std::path::PathBuf;
 use std::sync::mpsc::{self, Receiver, SyncSender, TryRecvError, TrySendError};
 use std::time::{Duration, Instant};
@@ -30,7 +30,9 @@ use megu_client_mesh::entity_rig::{classify_entity_rig, EntityRigSpec};
 use megu_client_mesh::mesher::{
     BlockVisualEnhancementResult, BlockVisualInput, VanillaPlusPipelineConfig,
 };
-use megu_client_mesh::model_baker::blockstate::BlockStateDef;
+use megu_client_mesh::model_baker::blockstate::{
+    self, BlockStateDef, BlockStateResolution,
+};
 use megu_client_mesh::model_baker::ResourcePackModelStack;
 use megu_client_mesh::tactile_effects::{
     compute_environment_audio_hint, evaluate_night_sky_drama, CameraMicroOffset,
@@ -517,6 +519,86 @@ pub fn split_compiled_bundle(
     (meta, PendingAtlasPixels { atlas, mipmaps })
 }
 
+/// Namespaced block name of a block-state id — the kernel registry when
+/// loaded, else the `BlockTable`'s per-state names (empty in builtin
+/// fallback mode, so no names resolve there).
+fn state_block_name<'a>(world: &'a WorldState, state: u32) -> Option<&'a str> {
+    if let Some(registry) = &world.registry {
+        registry.state_name(state).ok()
+    } else {
+        world.blocks.state_name(state)
+    }
+}
+
+/// The atlas sprite id standing in for a whole block: the `particle`
+/// texture of the model `block`'s blockstate resolves to under synthetic
+/// representative props — vanilla's own stand-in for a block's look, and
+/// the finest granularity the packed-vertex path (one sprite per state
+/// id) can express. Candidates fall through `all`/`side`/`up`/`front`/
+/// `top` then any resolved texture; `has_sprite` filters to ids actually
+/// packed in the atlas so one missing texture cannot fail the whole
+/// state table upload.
+fn representative_texture(
+    meta: &CompiledAssetMeta,
+    block: &str,
+    has_sprite: &dyn Fn(&str) -> bool,
+) -> Option<String> {
+    let def = meta
+        .blockstates
+        .get(block)
+        .or_else(|| meta.blockstates.get(&format!("minecraft:{block}")))?;
+    let props = blockstate::representative_props(def);
+    let specs = match blockstate::resolve_blockstate(def, &props, [0, 0, 0]).ok()? {
+        BlockStateResolution::Variant(variant) => vec![variant],
+        BlockStateResolution::Multipart(variants) => variants,
+    };
+    for spec in &specs {
+        let Ok(textures) = meta.model_stack.resolved_textures(&spec.model) else {
+            continue;
+        };
+        for key in ["particle", "all", "side", "up", "front", "top"] {
+            match textures.get(key) {
+                Some(texture) if has_sprite(texture) => return Some(texture.clone()),
+                _ => {}
+            }
+        }
+        for texture in textures.values() {
+            if has_sprite(texture) {
+                return Some(texture.clone());
+            }
+        }
+    }
+    None
+}
+
+/// Every registered block-state id mapped to its block's representative
+/// atlas sprite — the data [`GpuRenderer::set_block_state_sprites`]
+/// uploads. Blocks are resolved once and the result shared across their
+/// state ids (the kernel registry names blocks per id but retains no
+/// per-state properties).
+fn state_sprite_assignments(
+    world: &WorldState,
+    meta: &CompiledAssetMeta,
+    renderer: &GpuRenderer,
+) -> Vec<(u32, String)> {
+    let mut out = Vec::new();
+    let mut per_block: HashMap<&str, Option<String>> = HashMap::new();
+    for state in 0..world.state_count as u32 {
+        let Some(block) = state_block_name(world, state) else {
+            continue;
+        };
+        let texture = per_block.entry(block).or_insert_with(|| {
+            representative_texture(meta, block, &|name| {
+                renderer.atlas_sprite_index(name).is_some()
+            })
+        });
+        if let Some(texture) = texture {
+            out.push((state, texture.clone()));
+        }
+    }
+    out
+}
+
 /// Owns UI-facing world data on the event-loop thread. The worker owns its socket.
 pub struct LiveSession {
     incoming: Receiver<WorkerMessage>,
@@ -806,6 +888,13 @@ pub struct LiveSession {
     last_motion_delta: [f64; 2],
     last_vfx_tick: Instant,
     last_animation_tick: Instant,
+    /// Client-side wall-clock seconds driving `.mcmeta` sprite animation.
+    /// Vanilla reticks `TextureManager` once per client tick (50 ms)
+    /// regardless of server `time_of_day`, so this runs off `poll`'s own
+    /// heartbeat rather than `world_time_ticks` (which wraps at 24 000
+    /// and follows server `set_time` jumps).
+    atlas_anim_clock: f64,
+    last_atlas_anim_tick: Instant,
 }
 
 impl LiveSession {
@@ -1060,6 +1149,8 @@ impl LiveSession {
             last_motion_delta: [0.0; 2],
             last_vfx_tick: Instant::now(),
             last_animation_tick: Instant::now(),
+            atlas_anim_clock: 0.0,
+            last_atlas_anim_tick: Instant::now(),
         }
     }
 
@@ -1144,6 +1235,13 @@ impl LiveSession {
     /// `world_time_ticks` and the tactile/eclipse systems all key off it.
     pub fn world_time_ticks(&self) -> u64 {
         self.world.time_of_day.rem_euclid(24_000) as u64
+    }
+
+    /// Whole game ticks elapsed on the client-side `.mcmeta` animation
+    /// clock (20 ticks per wall-clock second) — the value
+    /// `GpuRenderer::tick_atlas_animations` consumes each frame.
+    pub fn atlas_anim_tick(&self) -> u64 {
+        (self.atlas_anim_clock * 20.0) as u64
     }
 
     /// Current VFX1 dynamic colored lights for the frame's light UBO.
@@ -1506,6 +1604,10 @@ impl LiveSession {
             if let Err(error) = self.world.advance_animations(animation_dt.min(0.1)) {
                 self.status = SessionStatus::Disconnected(format!("animation: {error:?}"));
             }
+            self.atlas_anim_clock += now
+                .duration_since(self.last_atlas_anim_tick)
+                .as_secs_f64();
+            self.last_atlas_anim_tick = now;
         }
     }
 
@@ -2063,8 +2165,30 @@ impl LiveSession {
             self.asset_bundle_pending_upload = false;
             return true;
         };
-        if let Err(err) = renderer.upload_block_atlas(&pixels.atlas, &pixels.mipmaps) {
-            eprintln!("megu-client assets: atlas upload failed: {err}");
+        match renderer.upload_block_atlas(&pixels.atlas, &pixels.mipmaps) {
+            Ok(()) => {
+                if let Some(meta) = &self.atlas_meta {
+                    // The packed-terrain shader resolves `state_id` ->
+                    // sprite through `atlas_states`; without this table
+                    // every quad falls back to its palette colour and no
+                    // `.mcmeta` frame ever reaches the screen.
+                    let assignments = state_sprite_assignments(&self.world, meta, renderer);
+                    let refs: Vec<(u32, &str)> = assignments
+                        .iter()
+                        .map(|(id, sprite)| (*id, sprite.as_str()))
+                        .collect();
+                    if let Err(err) = renderer.set_block_state_sprites(&refs) {
+                        eprintln!("megu-client assets: state sprite table failed: {err}");
+                    }
+                    let animated =
+                        renderer.set_atlas_animations(&meta.animations, self.atlas_anim_tick());
+                    eprintln!(
+                        "megu-client assets: {} state sprites bound, {animated} animated",
+                        assignments.len()
+                    );
+                }
+            }
+            Err(err) => eprintln!("megu-client assets: atlas upload failed: {err}"),
         }
         self.asset_bundle_pending_upload = false;
         self.pending_atlas_pixels.is_none()

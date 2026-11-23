@@ -2120,6 +2120,10 @@ impl GpuApp {
                 // stays resident).
                 live.upload_pending_atlas(&mut active.renderer);
             }
+            // `.mcmeta` playback: one `SpriteFrame` rewrite per animated
+            // sprite, and only when the client-side 20 Hz clock advanced
+            // inside `poll` — steady frames cost one compare.
+            active.renderer.tick_atlas_animations(live.atlas_anim_tick());
             active.renderer.sync_subworlds(&mut live.subworlds);
             // First live frame on the windowed path: hand the sink to the
             // dedicated real-time `AudioMixThread` so gameplay code

@@ -13,7 +13,7 @@ use megu_client_gpu::subworld_render::{
     COMPOSITE_TERRAIN_WGSL,
 };
 use megu_client_gpu::{build_demo_scene, mat4_mul_vec4, Camera, DemoScene};
-use megu_client_mesh::atlas::{build_mipmaps_linear, AtlasBuilder, PaddingMode};
+use megu_client_mesh::atlas::{build_mipmaps_linear, AtlasBuilder, PaddingMode, SpriteAnimation};
 use megu_client_mesh::builtin_shadow_wgsl::{
     BuiltinShadowQuality, RenderScalePreset, BUILTIN_SHADOW_SHADERS, MEGU_SHADOW_CASTERS_WGSL,
     MEGU_SHADOW_DEPTH_WGSL,
@@ -280,5 +280,127 @@ fn gpu_atlas_uv_tiling_extrusion_and_cascaded_shadow_pixels() {
     assert!(
         high_luma + 4.0 < off_luma,
         "High CSM did not darken the shadowed floor"
+    );
+}
+
+/// `.mcmeta` playback end-to-end: `set_atlas_animations` +
+/// `tick_atlas_animations` rewrite the sprite's `SpriteFrame` slot, and
+/// the same geometry re-rendered afterwards samples the advanced strip
+/// window — no re-mesh, no atlas re-upload.
+#[test]
+fn gpu_atlas_mcmeta_playback_advances_and_blends() {
+    let adapters = probe_adapters(RenderBackendPreference::Auto);
+    if adapters.is_empty() {
+        eprintln!("SKIP mcmeta readback: no GPU adapter");
+        return;
+    }
+    let ctx = request_gpu_device(RenderBackendPreference::Auto, None, None)
+        .expect("adapter was present but device request failed");
+    let mut renderer = GpuRenderer::new(ctx, OFFSCREEN_FORMAT);
+    renderer.set_render_scale(RenderScalePreset::Native100);
+
+    // 16x32 two-slot strip: top slot red, bottom slot blue; plus one
+    // static sprite so the table covers a non-animated slot too.
+    let mut strip = Vec::with_capacity(16 * 32 * 4);
+    for y in 0..32u32 {
+        let px = if y < 16 { [255, 0, 0, 255] } else { [0, 0, 255, 255] };
+        for _ in 0..16 {
+            strip.extend_from_slice(&px);
+        }
+    }
+    let mut builder = AtlasBuilder::for_blocks();
+    builder.set_padding(2).unwrap();
+    builder.add("anim_strip", 16, 32, strip).unwrap();
+    builder
+        .add("green", 16, 16, [0, 255, 0, 255].repeat(16 * 16))
+        .unwrap();
+    let atlas = builder.build().unwrap();
+    let mips = build_mipmaps_linear(&atlas, atlas.max_mip_levels(), None).unwrap();
+    renderer.upload_block_atlas(&atlas, &mips).unwrap();
+    let sprite = renderer
+        .atlas_sprite_index("anim_strip")
+        .expect("strip sprite index");
+
+    let mut animations = std::collections::BTreeMap::new();
+    animations.insert(
+        "anim_strip".to_string(),
+        SpriteAnimation::strip(16, 32, 1, false).unwrap(),
+    );
+    assert_eq!(renderer.set_atlas_animations(&animations, 0), 1);
+
+    let extruded = ExtrudedMesh {
+        quads: vec![ExtrudedQuad {
+            positions: [
+                [5.0, 7.0, 15.0],
+                [10.0, 7.0, 15.0],
+                [10.0, 12.0, 15.0],
+                [5.0, 12.0, 15.0],
+            ],
+            normal: [0.0, 0.0, 1.0],
+            uv: [[0.0, 0.0], [1.0, 0.0], [1.0, 1.0], [0.0, 1.0]],
+            tint_index: -1,
+        }],
+    };
+    let (mut vertices, indices) = extruded_mesh_to_geometry(&extruded, |_| [1.0; 3]);
+    for vertex in &mut vertices {
+        vertex.atlas_index = sprite;
+    }
+    let mut bank = SubWorldRenderBank::new();
+    bank.upsert(SubWorldRenderEntry::new(
+        7,
+        SubWorldTransform::IDENTITY,
+        vertices,
+        indices,
+    ));
+    renderer.upload_scene(&DemoScene::default()).unwrap();
+    let camera = Camera {
+        position: [8.0, 15.0, 25.0],
+        yaw_deg: 0.0,
+        pitch_deg: -20.0,
+        far: 96.0,
+        ..Camera::default()
+    };
+    let (width, height) = (384, 256);
+    let counts = |pixels: &[u8]| {
+        let mut red = 0usize;
+        let mut blue = 0usize;
+        let mut mixed = 0usize;
+        for rgb in pixels.as_chunks::<4>().0.iter().map(|pixel| &pixel[..3]) {
+            let (r, g, b) = (u16::from(rgb[0]), u16::from(rgb[1]), u16::from(rgb[2]));
+            if r > 60 && r > b * 2 && r > g * 2 {
+                red += 1;
+            } else if b > 60 && b > r * 2 && b > g * 2 {
+                blue += 1;
+            } else if r > 40 && b > 40 && r > g * 2 && b > g * 2 {
+                mixed += 1;
+            }
+        }
+        (red, blue, mixed)
+    };
+
+    // Tick 0 -> slot 0 (red); tick 1 -> slot 1 (blue); tick 2 wraps red.
+    let frame0 = counts(&composed_rgba(&mut renderer, &mut bank, &camera, width, height, 1));
+    renderer.tick_atlas_animations(1);
+    let frame1 = counts(&composed_rgba(&mut renderer, &mut bank, &camera, width, height, 2));
+    renderer.tick_atlas_animations(2);
+    let frame2 = counts(&composed_rgba(&mut renderer, &mut bank, &camera, width, height, 3));
+    eprintln!("mcmeta readback: t0 {frame0:?}, t1 {frame1:?}, t2 {frame2:?}");
+    assert!(frame0.0 > 60, "tick 0 did not sample the red slot: {frame0:?}");
+    assert!(frame1.1 > 60, "tick 1 did not sample the blue slot: {frame1:?}");
+    assert!(frame2.0 > 60, "tick 2 did not wrap back to red: {frame2:?}");
+
+    // `interpolate: true` with a 2-tick frametime blends slot 0 into
+    // slot 1 halfway through: the sampled texel keeps red and blue.
+    animations.insert(
+        "anim_strip".to_string(),
+        SpriteAnimation::strip(16, 32, 2, true).unwrap(),
+    );
+    renderer.set_atlas_animations(&animations, 0);
+    renderer.tick_atlas_animations(1);
+    let blended = counts(&composed_rgba(&mut renderer, &mut bank, &camera, width, height, 4));
+    eprintln!("mcmeta blend readback: {blended:?}");
+    assert!(
+        blended.2 > 60,
+        "interpolated tick did not blend red and blue slots: {blended:?}"
     );
 }

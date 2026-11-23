@@ -1060,7 +1060,14 @@ struct DynamicLights {
 @group(1) @binding(0) var<uniform> draw: DrawUniforms;
 @group(2) @binding(0) var<uniform> env: EnvUniforms;
 @group(2) @binding(1) var<uniform> dyn_lights: DynamicLights;
-struct AtlasRects { rects: array<vec4<f32>> };
+// One slot per atlas sprite: `rect` is the active `.mcmeta` frame window
+// (whole-strip rect for static sprites) and `anim` carries the next
+// slot's top edge plus the `interpolate` blend factor.
+struct SpriteFrame {
+    rect: vec4<f32>,
+    anim: vec4<f32>,
+};
+struct AtlasRects { rects: array<SpriteFrame> };
 @group(2) @binding(2) var atlas_tex: texture_2d<f32>;
 @group(2) @binding(3) var atlas_sampler: sampler;
 @group(2) @binding(4) var<storage, read> atlas_rects: AtlasRects;
@@ -1083,6 +1090,7 @@ struct TerrainFragment {
     @location(4) uv: vec2<f32>,
     @location(5) @interpolate(flat) atlas_rect: vec4<f32>,
     @location(6) fog: f32,
+    @location(7) @interpolate(flat) atlas_anim: vec4<f32>,
 };
 
 const FACE_SHADE = array<f32, 6>(0.45, 1.0, 0.75, 0.85, 0.7, 0.95);
@@ -1135,26 +1143,41 @@ fn tiled_uv(p: vec3<f32>, direction: u32) -> vec2<f32> {
 // Per-quad sprite lookup hoisted into the vertex stage: one `atlas_states`
 // + `atlas_rects` fetch per vertex replaces two storage reads per pixel.
 // A zero-area rect encodes the out-of-range fallback (`vec3(1.0)`).
-fn atlas_rect_for(state_id: u32) -> vec4<f32> {
+fn atlas_frame_for(state_id: u32) -> SpriteFrame {
     if state_id >= arrayLength(&atlas_states.sprites) {
-        return vec4<f32>(0.0);
+        return SpriteFrame(vec4<f32>(0.0), vec4<f32>(0.0));
     }
     let sprite_id = atlas_states.sprites[state_id];
     if sprite_id >= arrayLength(&atlas_rects.rects) {
-        return vec4<f32>(0.0);
+        return SpriteFrame(vec4<f32>(0.0), vec4<f32>(0.0));
     }
     return atlas_rects.rects[sprite_id];
 }
 
-fn atlas_sample_rect(rect: vec4<f32>, uv: vec2<f32>) -> vec3<f32> {
+// `anim` is (next slot's v0, interpolate blend): the second fetch only
+// runs for `.mcmeta` sprites mid-transition, so static terrain stays a
+// single texture fetch.
+fn atlas_sample_rect(rect: vec4<f32>, anim: vec4<f32>, uv: vec2<f32>) -> vec3<f32> {
     if rect.z <= 0.0 || rect.w <= 0.0 {
         return vec3<f32>(1.0);
     }
-    return textureSampleGrad(
+    let duv_dx = dpdx(uv) * rect.zw;
+    let duv_dy = dpdy(uv) * rect.zw;
+    let cur = textureSampleGrad(
         atlas_tex, atlas_sampler,
         rect.xy + fract(uv) * rect.zw,
-        dpdx(uv) * rect.zw, dpdy(uv) * rect.zw,
+        duv_dx, duv_dy,
     ).rgb;
+    if anim.y <= 0.0 {
+        return cur;
+    }
+    let next = textureSampleGrad(
+        atlas_tex, atlas_sampler,
+        vec2<f32>(rect.x + fract(uv.x) * rect.z,
+                  anim.x + fract(uv.y) * rect.w),
+        duv_dx, duv_dy,
+    ).rgb;
+    return mix(cur, next, anim.y);
 }
 
 // Fog share the vertex stage computes once per vertex; the fragment stage
@@ -1212,7 +1235,9 @@ fn terrain_vs(in: TerrainVertex) -> TerrainFragment {
     out.albedo = albedo * shade;
     out.illum = shade;
     out.uv = tiled_uv(vec3<f32>(lx, ly, lz), direction);
-    out.atlas_rect = atlas_rect_for(in.state_id);
+    let sprite = atlas_frame_for(in.state_id);
+    out.atlas_rect = sprite.rect;
+    out.atlas_anim = sprite.anim;
     out.fog = fog_factor_at(world);
     return out;
 }
@@ -1233,6 +1258,7 @@ struct TranslucentFragment {
     @location(4) uv: vec2<f32>,
     @location(5) @interpolate(flat) atlas_rect: vec4<f32>,
     @location(6) fog: f32,
+    @location(7) @interpolate(flat) atlas_anim: vec4<f32>,
 };
 
 @vertex
@@ -1278,7 +1304,9 @@ fn terrain_translucent_vs(in: TranslucentVertex) -> TranslucentFragment {
     out.albedo = albedo * shade;
     out.alpha = alpha;
     out.uv = tiled_uv(vec3<f32>(lx, ly, lz), direction);
-    out.atlas_rect = atlas_rect_for(in.state_id);
+    let sprite = atlas_frame_for(in.state_id);
+    out.atlas_rect = sprite.rect;
+    out.atlas_anim = sprite.anim;
     out.fog = fog_factor_at(world);
     return out;
 }
@@ -1286,7 +1314,7 @@ fn terrain_translucent_vs(in: TranslucentVertex) -> TranslucentFragment {
 @fragment
 fn terrain_fs(in: TerrainFragment) -> @location(0) vec4<f32> {
     let n = normalize(in.normal);
-    let texel = atlas_sample_rect(in.atlas_rect, in.uv);
+    let texel = atlas_sample_rect(in.atlas_rect, in.atlas_anim, in.uv);
     var color = in.albedo;
     let surface = in.albedo * texel;
     color *= texel;
@@ -1312,7 +1340,7 @@ fn terrain_fs(in: TerrainFragment) -> @location(0) vec4<f32> {
 @fragment
 fn terrain_translucent_fs(in: TranslucentFragment) -> @location(0) vec4<f32> {
     let n = normalize(in.normal);
-    let surface = in.albedo * atlas_sample_rect(in.atlas_rect, in.uv);
+    let surface = in.albedo * atlas_sample_rect(in.atlas_rect, in.atlas_anim, in.uv);
     var color = surface;
     let count = min(dyn_lights.light_count.x, 64u);
     for (var i = 0u; i < count; i = i + 1u) {
@@ -1383,7 +1411,13 @@ struct DynamicLights {
 @group(1) @binding(0) var<uniform> draw: DrawUniforms;
 @group(2) @binding(0) var<uniform> env: EnvUniforms;
 @group(2) @binding(1) var<uniform> dyn_lights: DynamicLights;
-struct AtlasRects { rects: array<vec4<f32>> };
+// Same `SpriteFrame` layout the packed-terrain module declares: `rect` is
+// the active `.mcmeta` frame window, `anim` the next slot's v0 + blend.
+struct SpriteFrame {
+    rect: vec4<f32>,
+    anim: vec4<f32>,
+};
+struct AtlasRects { rects: array<SpriteFrame> };
 @group(2) @binding(2) var atlas_tex: texture_2d<f32>;
 @group(2) @binding(3) var atlas_sampler: sampler;
 @group(2) @binding(4) var<storage, read> atlas_rects: AtlasRects;
@@ -1417,12 +1451,25 @@ fn atlas_sample(sprite_id: u32, uv: vec2<f32>) -> vec3<f32> {
     if sprite_id >= arrayLength(&atlas_rects.rects) {
         return vec3<f32>(1.0);
     }
-    let rect = atlas_rects.rects[sprite_id];
-    return textureSampleGrad(
+    let frame = atlas_rects.rects[sprite_id];
+    let rect = frame.rect;
+    let duv_dx = dpdx(uv) * rect.zw;
+    let duv_dy = dpdy(uv) * rect.zw;
+    let cur = textureSampleGrad(
         atlas_tex, atlas_sampler,
         rect.xy + fract(uv) * rect.zw,
-        dpdx(uv) * rect.zw, dpdy(uv) * rect.zw,
+        duv_dx, duv_dy,
     ).rgb;
+    if frame.anim.y <= 0.0 {
+        return cur;
+    }
+    let next = textureSampleGrad(
+        atlas_tex, atlas_sampler,
+        vec2<f32>(rect.x + fract(uv.x) * rect.z,
+                  frame.anim.x + fract(uv.y) * rect.w),
+        duv_dx, duv_dy,
+    ).rgb;
+    return mix(cur, next, frame.anim.y);
 }
 
 fn filmic(color: vec3<f32>) -> vec3<f32> {

@@ -16,7 +16,7 @@ use megu_client::shaders::{
     validate_wgsl_module, WgslStage, TERRAIN_OPAQUE_WGSL, TERRAIN_TRANSLUCENT_WGSL,
 };
 use megu_client::world::WorldState;
-use megu_client_mesh::atlas::{AtlasMip, PackedAtlas};
+use megu_client_mesh::atlas::{AtlasMip, AtlasTileRect, PackedAtlas, SpriteAnimation};
 use megu_client_mesh::ber_instancing::{VanillaParticleQuad, VanillaParticleWorld};
 use megu_client_mesh::builtin_shadow_wgsl::{
     build_shadow_uniforms_celestial, compute_cascade_splits, compute_sun_direction,
@@ -2454,9 +2454,54 @@ struct AtlasGpu {
     _texture: wgpu::Texture,
     view: wgpu::TextureView,
     sampler: wgpu::Sampler,
+    /// `SpriteFrame` table: 32 bytes per sprite — `rect` is the sampling
+    /// window currently bound for the sprite, `anim` the `(next v0,
+    /// blend)` pair `.mcmeta` playback rewrites each animation tick.
     rects: wgpu::Buffer,
     state_sprites: wgpu::Buffer,
     sprite_indices: HashMap<String, u32>,
+    /// Whole-strip tile rect per sprite index — the base each animated
+    /// frame window is cut from.
+    tiles: Vec<AtlasTileRect>,
+    /// Sprites carrying a `.mcmeta` playback table.
+    animated: Vec<AnimatedSprite>,
+    /// The `.mcmeta` clock value last written into `rects`, so steady
+    /// frames cost one compare and no buffer writes.
+    anim_tick: Option<u64>,
+}
+
+/// One atlas sprite with a `.mcmeta` playback table — the unit
+/// [`GpuRenderer::tick_atlas_animations`] rewrites per tick.
+struct AnimatedSprite {
+    /// Sprite index: the pair lives at `rects[index]` in `SpriteFrame`
+    /// units (byte offset `index * 32`).
+    index: u32,
+    /// Whole-strip rect the frame windows are cut from.
+    tile: AtlasTileRect,
+    animation: SpriteAnimation,
+}
+
+/// Byte stride of one sprite's `SpriteFrame` slot in the `atlas_rects`
+/// table (a `rect` vec4 plus the `anim` aux vec4).
+const ATLAS_SPRITE_FRAME_BYTES: u64 = 32;
+
+/// Sprite-index resolution shared by `atlas_sprite_index`,
+/// `set_block_state_sprites` and `set_atlas_animations`, mirroring
+/// `PackedAtlas::tile_rect`'s lookup: exact name, then the path part of a
+/// `namespace:path` id, then a `minecraft:`-prefixed guess.
+fn sprite_index_of(indices: &HashMap<String, u32>, name: &str) -> Option<u32> {
+    if let Some(&index) = indices.get(name) {
+        return Some(index);
+    }
+    if let Some((_, path)) = name.split_once(':') {
+        if let Some(&index) = indices.get(path) {
+            return Some(index);
+        }
+    }
+    if !name.contains(':') {
+        return indices.get(&format!("minecraft:{name}")).copied();
+    }
+    None
 }
 
 impl AtlasGpu {
@@ -4331,9 +4376,12 @@ impl GpuRenderer {
         &self.ctx
     }
 
-    /// Sorted-by-name sprite index for lit geometry's `atlas_index`.
+    /// Sprite index for lit geometry's `atlas_index` and the
+    /// state→sprite table. Resolves like `PackedAtlas::tile_rect`: exact
+    /// name first, then the path part of a `namespace:path` id, then a
+    /// `minecraft:`-prefixed guess.
     pub fn atlas_sprite_index(&self, name: &str) -> Option<u32> {
-        self.composite.atlas.sprite_indices.get(name).copied()
+        sprite_index_of(&self.composite.atlas.sprite_indices, name)
     }
 
     /// Replace the GPU atlas and its sprite rectangle table atomically.
@@ -4371,13 +4419,19 @@ impl GpuRenderer {
             }
         }
         let mut rects = Vec::<[f32; 4]>::new();
+        let mut tiles = Vec::new();
         let mut sprite_indices = HashMap::new();
         for name in atlas.placements.keys() {
             let tile = atlas
                 .tile_rect(name)
                 .ok_or_else(|| format!("missing tile: {name}"))?;
-            sprite_indices.insert(name.clone(), rects.len() as u32);
+            sprite_indices.insert(name.clone(), tiles.len() as u32);
+            tiles.push(tile);
+            // `SpriteFrame` slot: whole-strip rect plus a zeroed `anim`
+            // aux — `set_atlas_animations` later narrows animated sprites
+            // to their current frame window.
             rects.push([tile.u0, tile.v0, tile.u_scale, tile.v_scale]);
+            rects.push([0.0; 4]);
         }
         if rects.is_empty() {
             return Err("atlas must contain at least one sprite".into());
@@ -4460,6 +4514,9 @@ impl GpuRenderer {
             rects: rects_buffer,
             state_sprites,
             sprite_indices,
+            tiles,
+            animated: Vec::new(),
+            anim_tick: None,
         };
         let bind_group = gpu_atlas.bind_group(device, &self.composite);
         self.composite.atlas = gpu_atlas;
@@ -4480,8 +4537,7 @@ impl GpuRenderer {
         }
         let mut states = vec![u32::MAX; (max_id as usize) + 1];
         for &(id, sprite) in assignments {
-            states[id as usize] = *sprite_indices
-                .get(sprite)
+            states[id as usize] = sprite_index_of(sprite_indices, sprite)
                 .ok_or_else(|| format!("unknown atlas sprite: {sprite}"))?;
         }
         let state_sprites = self.ctx.device.create_buffer(&wgpu::BufferDescriptor {
@@ -4499,6 +4555,61 @@ impl GpuRenderer {
             .atlas
             .bind_group(&self.ctx.device, &self.composite);
         Ok(())
+    }
+
+    /// Register `.mcmeta` playback tables for the uploaded atlas and write
+    /// each animated sprite's `SpriteFrame` pair at `tick`. Sprites with no
+    /// table keep the static whole-strip rect written at upload. Call again
+    /// after `upload_block_atlas` — a new atlas resets the table. Returns
+    /// the number of sprites that animate.
+    pub fn set_atlas_animations(
+        &mut self,
+        animations: &BTreeMap<String, SpriteAnimation>,
+        tick: u64,
+    ) -> usize {
+        let mut animated = Vec::new();
+        for (name, animation) in animations {
+            let Some(index) = sprite_index_of(&self.composite.atlas.sprite_indices, name) else {
+                continue;
+            };
+            let entry = AnimatedSprite {
+                index,
+                tile: self.composite.atlas.tiles[index as usize],
+                animation: animation.clone(),
+            };
+            let (rect, aux) = entry.animation.rect_pair_at_tick(&entry.tile, tick);
+            self.ctx.queue.write_buffer(
+                &self.composite.atlas.rects,
+                u64::from(index) * ATLAS_SPRITE_FRAME_BYTES,
+                bytemuck::cast_slice(&[rect, aux]),
+            );
+            animated.push(entry);
+        }
+        animated.sort_by_key(|entry| entry.index);
+        let count = animated.len();
+        self.composite.atlas.animated = animated;
+        self.composite.atlas.anim_tick = Some(tick);
+        count
+    }
+
+    /// Advance every registered `.mcmeta` animation to `tick`: one 32-byte
+    /// `SpriteFrame` rewrite per animated sprite. Costs a single compare
+    /// while `tick` repeats the value already in the table, so calling at
+    /// render rate is free when the animation clock has not advanced.
+    pub fn tick_atlas_animations(&mut self, tick: u64) {
+        if self.composite.atlas.anim_tick == Some(tick) {
+            return;
+        }
+        self.composite.atlas.anim_tick = Some(tick);
+        let atlas = &self.composite.atlas;
+        for entry in &atlas.animated {
+            let (rect, aux) = entry.animation.rect_pair_at_tick(&entry.tile, tick);
+            self.ctx.queue.write_buffer(
+                &atlas.rects,
+                u64::from(entry.index) * ATLAS_SPRITE_FRAME_BYTES,
+                bytemuck::cast_slice(&[rect, aux]),
+            );
+        }
     }
 
     /// Build all pipelines against `target_format` on `ctx`.
@@ -5313,13 +5424,15 @@ impl GpuRenderer {
                 // Bindings 4-5 are visible to the vertex stage too: the
                 // composed terrain shaders hoist the per-quad atlas
                 // state/rect lookup into `terrain_vs`/`terrain_translucent_vs`.
+                // Binding 4 elements are `SpriteFrame` pairs (32 B), not
+                // bare rects — the layout min size must match the WGSL.
                 wgpu::BindGroupLayoutEntry {
                     binding: 4,
                     visibility: wgpu::ShaderStages::VERTEX_FRAGMENT,
                     ty: wgpu::BindingType::Buffer {
                         ty: wgpu::BufferBindingType::Storage { read_only: true },
                         has_dynamic_offset: false,
-                        min_binding_size: wgpu::BufferSize::new(16),
+                        min_binding_size: wgpu::BufferSize::new(ATLAS_SPRITE_FRAME_BYTES),
                     },
                     count: None,
                 },
@@ -5527,14 +5640,14 @@ impl GpuRenderer {
         );
         let atlas_rects = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("block-atlas-fallback-rect"),
-            size: 16,
+            size: ATLAS_SPRITE_FRAME_BYTES,
             usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
         });
         ctx.queue.write_buffer(
             &atlas_rects,
             0,
-            bytemuck::cast_slice(&[[0.0f32, 0.0, 1.0, 1.0]]),
+            bytemuck::cast_slice(&[[0.0f32, 0.0, 1.0, 1.0], [0.0; 4]]),
         );
         let state_sprites = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("block-atlas-empty-state-lookup"),
@@ -5556,6 +5669,9 @@ impl GpuRenderer {
             rects: atlas_rects,
             state_sprites,
             sprite_indices: HashMap::new(),
+            tiles: Vec::new(),
+            animated: Vec::new(),
+            anim_tick: None,
         };
         let env_bg = device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("composite-env-bind-group"),
