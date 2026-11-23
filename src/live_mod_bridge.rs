@@ -2484,6 +2484,66 @@ fn live_tier25_flush_tick(
         .flush_tick(tick, loader)
 }
 
+#[cfg(feature = "mod-suite")]
+struct ServerMathOptRuntime {
+    plan: megu_core::hw_adaptive_engine::UnifiedOptimizationPlan,
+    roofline: megu_core::math_opt_engine::RooflineModel,
+    mspt_p95: megu_core::math_opt_engine::P2QuantileEstimator,
+    mspt_p99: megu_core::math_opt_engine::P2QuantileEstimator,
+    pid_budget: megu_core::math_opt_engine::PidBudgetController,
+    budget_scale: f64,
+    ticks_observed: u64,
+}
+
+#[cfg(feature = "mod-suite")]
+fn live_server_opt_runtime() -> &'static Mutex<ServerMathOptRuntime> {
+    static OPT: OnceLock<Mutex<ServerMathOptRuntime>> = OnceLock::new();
+    OPT.get_or_init(|| {
+        let profile = megu_core::hw_adaptive_engine::detect_universal_hardware_profile();
+        let plan = megu_core::hw_adaptive_engine::build_unified_optimization_plan(&profile, None);
+        let roofline = plan.roofline_model();
+        Mutex::new(ServerMathOptRuntime {
+            plan,
+            roofline,
+            mspt_p95: megu_core::math_opt_engine::P2QuantileEstimator::new(0.95),
+            mspt_p99: megu_core::math_opt_engine::P2QuantileEstimator::new(0.99),
+            pid_budget: megu_core::math_opt_engine::PidBudgetController::new(50.0),
+            budget_scale: 1.0,
+            ticks_observed: 0,
+        })
+    })
+}
+
+#[cfg(feature = "mod-suite")]
+fn live_observe_server_tick_mspt(mspt: f64) {
+    if let Ok(mut rt) = live_server_opt_runtime().try_lock() {
+        rt.mspt_p95.observe(mspt);
+        rt.mspt_p99.observe(mspt);
+        let p95 = rt.mspt_p95.estimate().unwrap_or(mspt);
+        rt.budget_scale = rt.pid_budget.update(p95);
+        rt.ticks_observed = rt.ticks_observed.saturating_add(1);
+    }
+}
+
+#[cfg(not(feature = "mod-suite"))]
+#[inline]
+fn live_observe_server_tick_mspt(_mspt: f64) {}
+
+#[cfg(feature = "mod-suite")]
+#[allow(dead_code)]
+fn live_server_opt_summary() -> (f64, f64, f64, f64, usize) {
+    let rt = live_server_opt_runtime()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    (
+        rt.mspt_p95.estimate().unwrap_or(0.0),
+        rt.mspt_p99.estimate().unwrap_or(0.0),
+        rt.budget_scale,
+        rt.roofline.ridge_intensity,
+        rt.plan.compute.workers.background_threads as usize,
+    )
+}
+
 // ===========================================================================
 // Tests
 // ===========================================================================

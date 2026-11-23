@@ -18755,6 +18755,7 @@ fn game_tick(mut step: impl FnMut(&'static str, fn())) {
         .unwrap_or_else(|e| e.into_inner())
         .record_tick_us(wire_us);
     ac_note_server_tick_ms(wire_us / 1000);
+    live_observe_server_tick_mspt(f64::from(wire_us) / 1000.0);
     // §5.2③ tick-end WAL batch: the tick's coalesced block edits land as one
     // contiguous write + one flush instead of one fsync per edit. No-op when
     // the tick touched no journaled blocks.
