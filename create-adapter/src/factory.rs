@@ -172,6 +172,7 @@ pub struct CreateFactory {
     registry: CreateBlockRegistry,
     scheduler: RegionScheduler,
     active_regions: BTreeSet<RegionKey>,
+    active_regions_last_tick: usize,
     next_node_id: u32,
     kinetics: HashMap<DimBlockPos, PlacedKinetic>,
     kinetic_edges: BTreeMap<(DimBlockPos, DimBlockPos), f64>,
@@ -207,6 +208,7 @@ impl CreateFactory {
             registry,
             scheduler: RegionScheduler::default(),
             active_regions: BTreeSet::new(),
+            active_regions_last_tick: 0,
             next_node_id: 1,
             kinetics: HashMap::new(),
             kinetic_edges: BTreeMap::new(),
@@ -281,6 +283,19 @@ impl CreateFactory {
     /// provably empty — the measurable "idle regions cost O(1)" counter.
     pub fn idle_export_skips(&self) -> u64 {
         self.idle_export_skips
+    }
+
+    /// Active factory regions parked until a mutation or scheduled deadline.
+    pub fn sleeping_regions(&self) -> usize {
+        self.active_regions
+            .iter()
+            .filter(|&&key| self.scheduler.is_sleeping(key))
+            .count()
+    }
+
+    /// Regions advanced during the most recent factory tick.
+    pub fn active_regions_last_tick(&self) -> usize {
+        self.active_regions_last_tick
     }
 
     pub fn kinetic_solution(&self, pos: DimBlockPos) -> Option<Solution> {
@@ -526,14 +541,39 @@ impl CreateFactory {
         max_steps_per_region: usize,
         max_us_per_region: Option<u64>,
     ) -> Result<Vec<RegionStepOutput>, TransportError> {
+        let due_count = self
+            .scheduler
+            .runnable_region_count_for(&self.active_regions, tick);
+        let workers = if due_count >= 2 { 4 } else { 1 };
+        self.step_tick_parallel(tick, max_steps_per_region, max_us_per_region, workers)
+    }
+
+    /// Advance factory regions using deterministic per-region parallelism.
+    /// Worker counts are capped at four; region stepping and output merging
+    /// remain in sorted `(dimension, rx, rz)` order.
+    pub fn step_tick_parallel(
+        &mut self,
+        tick: u64,
+        max_steps_per_region: usize,
+        max_us_per_region: Option<u64>,
+        max_workers: usize,
+    ) -> Result<Vec<RegionStepOutput>, TransportError> {
         let budget = RegionBudget {
             max_steps: max_steps_per_region,
             max_time: max_us_per_region.map(Duration::from_micros),
         };
         let mut outputs = Vec::new();
-        for &key in &self.active_regions {
+        let stepped = self.scheduler.advance_active_parallel_for(
+            &self.active_regions,
+            tick,
+            budget,
+            max_workers.clamp(1, 4),
+        );
+        self.idle_export_skips += self.active_regions.len().saturating_sub(stepped.len()) as u64;
+        self.active_regions_last_tick = stepped.len();
+        for (key, result) in stepped {
+            let report = result?;
             let region = self.scheduler.region_mut(key);
-            let report = region.advance_to(tick, budget)?;
             // `advance_to` pushes one batch record per processed work unit
             // and `output_blocked` only fires when the queue was full, so
             // `processed == 0` with no pending residue means the export
@@ -568,6 +608,7 @@ impl CreateFactory {
                     s5_frame: self.export_scratch[..batch.bytes].to_vec(),
                 });
             }
+            self.scheduler.refresh_region_sleep(key);
         }
         Ok(outputs)
     }
@@ -906,6 +947,254 @@ mod tests {
         assert!(produced > 0);
         for tick in 41..=48 {
             assert!(factory.step_tick(tick, 4, None).unwrap().is_empty());
+        }
+    }
+
+    #[test]
+    fn one_item_wakes_only_its_region_after_one_hundred_regions_sleep() {
+        let mut factory = CreateFactory::new(core_create_registry(DEFAULT_BASE_STATE_ID));
+        let mut target = None;
+        for index in 0..100 {
+            let rx = index % 10;
+            let rz = index / 10;
+            let pos = DimBlockPos::new(0, rx * 32, 64, rz * 32);
+            factory.add_belt_segment(pos, 1, 4, 1).unwrap();
+            factory.add_belt_segment(pos, 2, 4, 1).unwrap();
+            factory.link_belt(pos, 1, Some(2)).unwrap();
+            if rx == 5 && rz == 7 {
+                target = Some(pos);
+            }
+        }
+        let target = target.expect("target region is among the 100 belt regions");
+
+        assert!(factory.step_tick(1, 16, None).unwrap().is_empty());
+        assert_eq!(factory.active_regions_last_tick(), 100);
+        assert_eq!(factory.sleeping_regions(), 100);
+        assert!(factory.step_tick(2, 16, None).unwrap().is_empty());
+        assert_eq!(factory.active_regions_last_tick(), 0);
+
+        factory.insert_belt_item(target, 1, 0x51ee_0001).unwrap();
+        let outputs = factory.step_tick(3, 16, None).unwrap();
+        assert_eq!(factory.active_regions_last_tick(), 1);
+        assert!(outputs
+            .iter()
+            .all(|output| output.region == target.region_key()));
+        assert_eq!(factory.sleeping_regions(), 100);
+        let outputs = factory.step_tick(4, 16, None).unwrap();
+        assert_eq!(factory.active_regions_last_tick(), 1);
+        assert!(outputs
+            .iter()
+            .all(|output| output.region == target.region_key()));
+        assert_eq!(
+            factory
+                .scheduler_mut()
+                .region_mut(target.region_key())
+                .extract_output(2),
+            Ok(Some(0x51ee_0001))
+        );
+    }
+
+    #[test]
+    fn sixteen_region_serial_and_parallel_runs_are_bit_identical() {
+        fn build_world() -> (CreateFactory, Vec<(RegionKey, DimBlockPos, DimBlockPos)>) {
+            let registry = core_create_registry(DEFAULT_BASE_STATE_ID);
+            let wheel = registry
+                .with_property(
+                    registry.default_state("create:water_wheel").unwrap(),
+                    "axis",
+                    "z",
+                )
+                .unwrap();
+            let press = registry
+                .with_property(
+                    registry.default_state("create:mechanical_press").unwrap(),
+                    "facing",
+                    "north",
+                )
+                .unwrap();
+            let gearbox = registry
+                .with_property(
+                    registry.default_state("create:gearbox").unwrap(),
+                    "axis",
+                    "x",
+                )
+                .unwrap();
+            let mixer = registry.default_state("create:mechanical_mixer").unwrap();
+            let mut factory = CreateFactory::new(registry);
+            let input_a = Resource {
+                kind: ResourceKind::Item,
+                id: 11,
+            };
+            let output_a = Resource {
+                kind: ResourceKind::Item,
+                id: 12,
+            };
+            let input_b = Resource {
+                kind: ResourceKind::Item,
+                id: 13,
+            };
+            let output_b = Resource {
+                kind: ResourceKind::Item,
+                id: 14,
+            };
+            let recipe_a = Recipe {
+                id: 100,
+                base_ticks: 20,
+                inputs: vec![Stack {
+                    resource: input_a,
+                    amount: 1,
+                }],
+                outputs: vec![Stack {
+                    resource: output_a,
+                    amount: 1,
+                }],
+            };
+            let recipe_b = Recipe {
+                id: 101,
+                base_ticks: 24,
+                inputs: vec![Stack {
+                    resource: input_b,
+                    amount: 1,
+                }],
+                outputs: vec![Stack {
+                    resource: output_b,
+                    amount: 1,
+                }],
+            };
+            let mut regions = Vec::new();
+            for index in 0..16 {
+                let rx = index % 4;
+                let rz = index / 4;
+                let base = DimBlockPos::new(0, rx * 32, 64, rz * 32);
+                let press_pos = base.offset(0, 0, 2);
+                let mixer_pos = base.offset(0, 1, 0);
+                let wheel_pos = base.offset(0, 0, 1);
+                factory.place_block(base, gearbox);
+                factory.place_block(wheel_pos, wheel);
+                factory.place_block(press_pos, press);
+                factory.place_block(mixer_pos, mixer);
+                factory
+                    .add_processor(press_pos, 20, 8, 8, vec![recipe_a.clone()])
+                    .unwrap();
+                factory
+                    .add_processor(mixer_pos, 21, 8, 8, vec![recipe_b.clone()])
+                    .unwrap();
+                factory
+                    .insert_processor_ingredient(
+                        press_pos,
+                        20,
+                        Stack {
+                            resource: input_a,
+                            amount: 1,
+                        },
+                    )
+                    .unwrap();
+                factory
+                    .insert_processor_ingredient(
+                        mixer_pos,
+                        21,
+                        Stack {
+                            resource: input_b,
+                            amount: 1,
+                        },
+                    )
+                    .unwrap();
+                factory.add_belt_segment(base, 1, 4, 2).unwrap();
+                factory.add_belt_segment(base, 2, 4, 2).unwrap();
+                factory.link_belt(base, 1, Some(2)).unwrap();
+                factory
+                    .insert_belt_item(base, 1, 0x7000 + index as u32)
+                    .unwrap();
+                let tank_a = base.offset(3, 0, 0);
+                let tank_b = base.offset(4, 0, 0);
+                factory.add_fluid_tank(tank_a, 30, 8000).unwrap();
+                factory.add_fluid_tank(tank_b, 31, 8000).unwrap();
+                factory.link_fluid_tanks(tank_a, 30, 31, Some(0)).unwrap();
+                factory.insert_fluid(tank_a, 30, 50, 4000).unwrap();
+                regions.push((base.region_key(), press_pos, mixer_pos));
+            }
+            (factory, regions)
+        }
+
+        let (mut serial, regions) = build_world();
+        let (mut parallel, parallel_regions) = build_world();
+        assert_eq!(regions, parallel_regions);
+        let mut serial_trace = Vec::new();
+        let mut parallel_trace = Vec::new();
+        for tick in 1..=200 {
+            for (factory, trace, workers) in [
+                (&mut serial, &mut serial_trace, 1),
+                (&mut parallel, &mut parallel_trace, 4),
+            ] {
+                for output in factory
+                    .step_tick_parallel(tick, 1024, None, workers)
+                    .unwrap()
+                {
+                    trace.push((output.region, output.report, output.batch, output.s5_frame));
+                }
+            }
+        }
+        assert_eq!(serial_trace, parallel_trace);
+
+        for ((region, press_pos, mixer_pos), (_, parallel_press_pos, parallel_mixer_pos)) in
+            regions.iter().zip(&parallel_regions)
+        {
+            let left = serial.scheduler().region(*region).unwrap();
+            let right = parallel.scheduler().region(*region).unwrap();
+            let left_solution = serial.kinetic_solution(*press_pos).unwrap();
+            let right_solution = parallel.kinetic_solution(*parallel_press_pos).unwrap();
+            assert_eq!(left_solution.component, right_solution.component);
+            assert_eq!(
+                left_solution.capacity.to_bits(),
+                right_solution.capacity.to_bits()
+            );
+            assert_eq!(left_solution.load.to_bits(), right_solution.load.to_bits());
+            assert_eq!(
+                left_solution.speed.to_bits(),
+                right_solution.speed.to_bits()
+            );
+            assert_eq!(left_solution.status, right_solution.status);
+            let left_mixer = serial.kinetic_solution(*mixer_pos).unwrap();
+            let right_mixer = parallel.kinetic_solution(*parallel_mixer_pos).unwrap();
+            assert_eq!(left_mixer.speed.to_bits(), right_mixer.speed.to_bits());
+            assert_eq!(left_mixer.status, right_mixer.status);
+            assert_eq!(left.fluid().tank(30), right.fluid().tank(30));
+            assert_eq!(left.fluid().tank(31), right.fluid().tank(31));
+        }
+
+        for (_, press_pos, mixer_pos) in &regions {
+            for factory in [&mut serial, &mut parallel] {
+                for (pos, machine_id, resource_id) in [(*press_pos, 20, 12), (*mixer_pos, 21, 14)] {
+                    assert_eq!(
+                        factory
+                            .extract_processor_product(
+                                pos,
+                                machine_id,
+                                Stack {
+                                    resource: Resource {
+                                        kind: ResourceKind::Item,
+                                        id: resource_id,
+                                    },
+                                    amount: 1,
+                                },
+                            )
+                            .unwrap(),
+                        1
+                    );
+                }
+            }
+        }
+        for ((region, _, _), (parallel_region, _, _)) in regions.iter().zip(&parallel_regions) {
+            assert_eq!(region, parallel_region);
+            for factory in [&mut serial, &mut parallel] {
+                assert_eq!(
+                    factory
+                        .scheduler_mut()
+                        .region_mut(*region)
+                        .extract_output(2),
+                    Ok(Some(0x7000 + region.x as u32 + 4 * region.z as u32))
+                );
+            }
         }
     }
 

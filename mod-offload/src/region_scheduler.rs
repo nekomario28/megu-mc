@@ -4,7 +4,7 @@
 //! Fluid edits and transport/recipe wakes are scheduled work. Kinetic topology
 //! and contraption edits are synchronous.
 
-use std::collections::{BTreeMap, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::panic::{self, AssertUnwindSafe};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc;
@@ -109,6 +109,11 @@ pub struct BatchReport {
 pub struct RegionScheduler {
     regions: BTreeMap<RegionKey, Region>,
     pool: Option<WorkerPool>,
+    sleeping: BTreeMap<RegionKey, Option<u64>>,
+    awake: BTreeSet<RegionKey>,
+    deadlines: BTreeSet<(u64, RegionKey)>,
+    active_regions_last_tick: usize,
+    last_tick: Option<u64>,
 }
 
 impl RegionScheduler {
@@ -118,7 +123,100 @@ impl RegionScheduler {
 
     /// Obtain a region's independent kernels, clock, work budget and output queue.
     pub fn region_mut(&mut self, key: RegionKey) -> &mut Region {
-        self.regions.entry(key).or_insert_with(|| Region::new(key))
+        self.wake_region(key);
+        self.regions.entry(key).or_insert_with(|| Region::new(key));
+        self.awake.insert(key);
+        let region = self.regions.get_mut(&key).expect("region was inserted");
+        if let Some(tick) = self.last_tick {
+            region.advance_idle_clock_to(tick);
+        }
+        region
+    }
+
+    /// Wake a region after an external event. Calling [`region_mut`](Self::region_mut)
+    /// does this automatically; this method is useful when an owner queues an
+    /// event through a retained region handle.
+    pub fn wake_region(&mut self, key: RegionKey) {
+        if let Some(due) = self.sleeping.remove(&key).flatten() {
+            self.deadlines.remove(&(due, key));
+        }
+        if self.regions.contains_key(&key) {
+            self.awake.insert(key);
+        }
+    }
+
+    /// Number of regions currently parked until an external mutation or a
+    /// scheduled deadline.
+    pub fn sleeping_regions(&self) -> usize {
+        self.sleeping.len()
+    }
+
+    pub fn is_sleeping(&self, key: RegionKey) -> bool {
+        self.sleeping.contains_key(&key)
+    }
+
+    /// Number of regions actually advanced by the most recent active round.
+    pub fn active_regions_last_tick(&self) -> usize {
+        self.active_regions_last_tick
+    }
+
+    /// Number of awake regions plus sleeping regions whose deadline is due.
+    pub fn runnable_region_count(&self, tick: u64) -> usize {
+        self.awake.len()
+            + self
+                .deadlines
+                .range(
+                    ..=(
+                        tick,
+                        RegionKey {
+                            dimension: i32::MAX,
+                            x: i32::MAX,
+                            y: i32::MAX,
+                            z: i32::MAX,
+                        },
+                    ),
+                )
+                .count()
+    }
+
+    pub fn runnable_region_count_for(&self, keys: &BTreeSet<RegionKey>, tick: u64) -> usize {
+        let awake = self.awake.iter().filter(|key| keys.contains(key)).count();
+        let due = self
+            .deadlines
+            .range(
+                ..=(
+                    tick,
+                    RegionKey {
+                        dimension: i32::MAX,
+                        x: i32::MAX,
+                        y: i32::MAX,
+                        z: i32::MAX,
+                    },
+                ),
+            )
+            .filter(|(_, key)| keys.contains(key))
+            .count();
+        awake + due
+    }
+
+    /// Refresh a region after the caller has drained its output queue. Idle
+    /// regions park immediately; scheduled work parks with its next deadline.
+    pub fn refresh_region_sleep(&mut self, key: RegionKey) {
+        self.awake.remove(&key);
+        if let Some(due) = self.sleeping.remove(&key).flatten() {
+            self.deadlines.remove(&(due, key));
+        }
+        let Some(region) = self.regions.get(&key) else {
+            return;
+        };
+        if region.is_idle() {
+            self.sleeping.insert(key, None);
+        } else if let Some(due) = region.next_due_tick() {
+            self.sleeping.insert(key, Some(due));
+            self.deadlines.insert((due, key));
+        } else {
+            self.awake.insert(key);
+        }
     }
 
     /// Region keys present, in deterministic sorted order.
@@ -142,23 +240,148 @@ impl RegionScheduler {
         budget: RegionBudget,
         threads: usize,
     ) -> Vec<(RegionKey, Result<RegionReport, TransportError>)> {
-        let workers = threads.max(1).min(self.regions.len().max(1));
-        // Most idle and small servers have a single active region. Avoid the
-        // pool hand-off on that tick path.
-        if workers == 1 {
-            return self
-                .regions
-                .iter_mut()
-                .map(|(&key, region)| (key, region.advance_to(tick, budget)))
+        let keys = self.regions.keys().copied().collect();
+        let results = self.advance_keys(tick, budget, threads, keys);
+        self.active_regions_last_tick = results.len();
+        self.record_tick(tick);
+        for (key, result) in &results {
+            if result.is_ok() {
+                self.refresh_region_sleep(*key);
+            }
+        }
+        results
+    }
+
+    /// Advance awake regions and sleeping regions with due deadlines. Region
+    /// results are returned in `(dimension, rx, rz)` key order independent of
+    /// worker scheduling. A region with a future deadline remains parked until
+    /// that deadline; `region_mut` wakes it immediately on mutation.
+    pub fn advance_active_parallel(
+        &mut self,
+        tick: u64,
+        budget: RegionBudget,
+        threads: usize,
+    ) -> Vec<(RegionKey, Result<RegionReport, TransportError>)> {
+        if self.last_tick.is_some_and(|current| tick < current) {
+            let keys: BTreeSet<_> = self.regions.keys().copied().collect();
+            return self.advance_active_parallel_for(&keys, tick, budget, threads);
+        }
+        let mut keys = self.awake.clone();
+        keys.extend(
+            self.deadlines
+                .range(
+                    ..=(
+                        tick,
+                        RegionKey {
+                            dimension: i32::MAX,
+                            x: i32::MAX,
+                            y: i32::MAX,
+                            z: i32::MAX,
+                        },
+                    ),
+                )
+                .map(|(_, key)| *key),
+        );
+        self.advance_active_parallel_for(&keys, tick, budget, threads)
+    }
+
+    /// The keyed form of [`advance_active_parallel`](Self::advance_active_parallel),
+    /// for owners that expose only a subset of scheduler regions as active.
+    pub fn advance_active_parallel_for(
+        &mut self,
+        keys: &BTreeSet<RegionKey>,
+        tick: u64,
+        budget: RegionBudget,
+        threads: usize,
+    ) -> Vec<(RegionKey, Result<RegionReport, TransportError>)> {
+        if let Some(current) = self.last_tick.filter(|&current| tick < current) {
+            self.active_regions_last_tick = 0;
+            return keys
+                .iter()
+                .filter(|key| self.regions.contains_key(key))
+                .map(|&key| {
+                    (
+                        key,
+                        Err(TransportError::TimeWentBackwards {
+                            current,
+                            requested: tick,
+                        }),
+                    )
+                })
                 .collect();
+        }
+        let mut selected: BTreeSet<_> = self
+            .awake
+            .iter()
+            .filter(|key| keys.contains(key))
+            .copied()
+            .collect();
+        selected.extend(
+            self.deadlines
+                .range(
+                    ..=(
+                        tick,
+                        RegionKey {
+                            dimension: i32::MAX,
+                            x: i32::MAX,
+                            y: i32::MAX,
+                            z: i32::MAX,
+                        },
+                    ),
+                )
+                .map(|(_, key)| *key)
+                .filter(|key| keys.contains(key)),
+        );
+        let keys: Vec<_> = selected.into_iter().collect();
+        let results = self.advance_keys(tick, budget, threads, keys);
+        self.active_regions_last_tick = results.len();
+        self.record_tick(tick);
+        for (key, result) in &results {
+            if result.is_ok() {
+                self.refresh_region_sleep(*key);
+            }
+        }
+        results
+    }
+
+    fn record_tick(&mut self, tick: u64) {
+        if self.last_tick.is_none_or(|previous| tick >= previous) {
+            self.last_tick = Some(tick);
+        }
+    }
+
+    fn advance_keys(
+        &mut self,
+        tick: u64,
+        budget: RegionBudget,
+        threads: usize,
+        keys: Vec<RegionKey>,
+    ) -> Vec<(RegionKey, Result<RegionReport, TransportError>)> {
+        if keys.is_empty() {
+            return Vec::new();
+        }
+        let workers = threads.max(1).min(self.regions.len().max(1));
+        let workers = workers.min(keys.len());
+        if workers == 1 {
+            let mut results = Vec::with_capacity(keys.len());
+            for key in keys {
+                let result = self
+                    .regions
+                    .get_mut(&key)
+                    .expect("scheduled region exists")
+                    .advance_to(tick, budget);
+                results.push((key, result));
+            }
+            return results;
         }
         let pool = self.pool.get_or_insert_with(WorkerPool::new);
         pool.ensure_workers(workers);
-        let job_count = self.regions.len();
+        let job_count = keys.len();
         let (reply_tx, reply_rx) = mpsc::channel();
         {
             let mut jobs = mutex_lock(&pool.shared.jobs);
-            for (key, region) in std::mem::take(&mut self.regions) {
+            for key in keys {
+                let region = self.regions.remove(&key).expect("scheduled region exists");
                 jobs.push_back(RegionJob {
                     key,
                     region,
@@ -209,13 +432,13 @@ impl RegionScheduler {
             for job in jobs.drain(..) {
                 restored.insert(job.key, job.region);
             }
-            self.regions = restored;
+            self.regions.extend(restored);
             panic!(
                 "mod-offload worker pool lost {} region(s)",
                 job_count - received
             );
         }
-        self.regions = restored;
+        self.regions.extend(restored);
         if let Some(payload) = first_panic {
             panic::resume_unwind(payload);
         }
@@ -428,6 +651,30 @@ impl Region {
         &self.fluid
     }
 
+    /// Earliest scheduled transport, recipe, or fluid work for this region.
+    /// Fluid dirtiness is due at the region's current logical tick.
+    pub fn next_due_tick(&self) -> Option<u64> {
+        self.next_work().map(|(tick, _)| tick)
+    }
+
+    /// Whether this region has no scheduled work, fluid dirtiness, generated
+    /// fluid deltas, or unexported output. Mutating through a scheduler's
+    /// `region_mut` wakes its region before the mutation is applied.
+    pub fn is_idle(&self) -> bool {
+        self.next_work().is_none()
+            && self.fluid_cursor == self.fluid_updates.len()
+            && self.batch.is_empty()
+    }
+
+    fn advance_idle_clock_to(&mut self, tick: u64) {
+        if self.next_due_tick().is_none_or(|due| due >= tick)
+            && self.transport.check_time(tick).is_ok()
+        {
+            self.transport.advance_clock_to(tick);
+            self.recipes.advance_idle_to(tick);
+        }
+    }
+
     pub fn add_tank(&mut self, id: u32, capacity: u32, elevation: i32) -> Result<(), FluidError> {
         self.fluid.add_tank(id, capacity, elevation)
     }
@@ -634,6 +881,10 @@ impl BatchQueue {
             pending_bytes: 0,
             sequence: 0,
         }
+    }
+
+    fn is_empty(&self) -> bool {
+        self.pending.is_empty()
     }
 
     pub(crate) fn check_room(&self, payload_len: usize) -> Result<(), BatchError> {

@@ -122,6 +122,94 @@ fn independent_scheduler_threads_progress_while_one_output_queue_stays_full() {
     blocked.join().unwrap();
 }
 
+#[test]
+fn active_scheduler_parks_idle_regions_and_wakes_only_mutated_region() {
+    let keys: Vec<_> = (0..100)
+        .map(|index| RegionKey {
+            dimension: 0,
+            x: index,
+            y: 0,
+            z: 0,
+        })
+        .collect();
+    let mut scheduler = RegionScheduler::default();
+    for &key in &keys {
+        scheduler
+            .region_mut(key)
+            .add_machine(MACHINE, 2, 1)
+            .unwrap();
+    }
+
+    let first = scheduler.advance_active_parallel(1, BUDGET, 4);
+    assert_eq!(first.len(), 100);
+    assert_eq!(scheduler.sleeping_regions(), 100);
+    assert!(scheduler.advance_active_parallel(2, BUDGET, 4).is_empty());
+    assert_eq!(scheduler.active_regions_last_tick(), 0);
+
+    let target = keys[57];
+    scheduler
+        .region_mut(target)
+        .insert_item(MACHINE, 0xfeed_beef)
+        .unwrap();
+    let resumed = scheduler.advance_active_parallel(2, BUDGET, 4);
+    assert_eq!(resumed.len(), 1);
+    assert_eq!(resumed[0].0, target);
+    assert_eq!(resumed[0].1.unwrap().processed, 0);
+    assert_eq!(scheduler.active_regions_last_tick(), 1);
+    assert_eq!(scheduler.sleeping_regions(), 100);
+    let due = scheduler.advance_active_parallel(3, BUDGET, 4);
+    assert_eq!(due.len(), 1);
+    assert_eq!(due[0].1.unwrap().processed, 1);
+    let mut frame = vec![0; MAX_BATCH_BYTES];
+    scheduler
+        .region_mut(target)
+        .export_into(&mut frame, usize::MAX)
+        .unwrap();
+    scheduler.refresh_region_sleep(target);
+    assert_eq!(scheduler.sleeping_regions(), 100);
+    assert!(scheduler.advance_active_parallel(3, BUDGET, 4).is_empty());
+    assert_eq!(scheduler.active_regions_last_tick(), 0);
+    let rewound = scheduler.advance_active_parallel(2, BUDGET, 4);
+    assert_eq!(rewound.len(), 100);
+    assert!(matches!(
+        rewound[0].1,
+        Err(TransportError::TimeWentBackwards {
+            current: 3,
+            requested: 2
+        })
+    ));
+}
+
+#[test]
+fn active_scheduler_parks_until_the_next_deadline() {
+    let key = RegionKey {
+        dimension: 0,
+        x: 4,
+        y: 0,
+        z: 9,
+    };
+    let mut scheduler = RegionScheduler::default();
+    let region = scheduler.region_mut(key);
+    region.add_machine(MACHINE, 2, 3).unwrap();
+    region.insert_item(MACHINE, 73).unwrap();
+
+    assert_eq!(scheduler.advance_active_parallel(1, BUDGET, 2).len(), 1);
+    assert_eq!(scheduler.sleeping_regions(), 1);
+    assert!(scheduler.advance_active_parallel(2, BUDGET, 2).is_empty());
+    assert_eq!(scheduler.active_regions_last_tick(), 0);
+
+    let due = scheduler.advance_active_parallel(3, BUDGET, 2);
+    assert_eq!(due.len(), 1);
+    assert_eq!(due[0].1.unwrap().processed, 1);
+    let mut frame = vec![0; MAX_BATCH_BYTES];
+    scheduler
+        .region_mut(key)
+        .export_into(&mut frame, usize::MAX)
+        .unwrap();
+    scheduler.refresh_region_sleep(key);
+    assert_eq!(scheduler.sleeping_regions(), 1);
+}
+
 fn run_peer(peer: i32, start: &Barrier) {
     let key = RegionKey {
         dimension: peer % 2,
