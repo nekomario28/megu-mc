@@ -371,9 +371,18 @@ fn all_screens(ui: &mut UiState) -> Vec<Screen> {
     ui.report_url = "https://example.invalid/report".into();
     ui.active_shaderpack_name = "A Shaderpack With A Long Name".into();
     ui.active_shaderpack_profile = "Insane++".into();
+    ui.title_status =
+        Some("Singleplayer \"Old World\": megu server exited during startup".into());
+    ui.singleplayer.worlds = (0..24)
+        .map(|i| format!("World {i:02}"))
+        .chain(std::iter::once(
+            "A World With A Rather Long Folder Name".to_string(),
+        ))
+        .collect();
     let mut screens: Vec<Screen> = ALL_TABS.iter().map(|t| Screen::Settings(*t)).collect();
     screens.extend([
         Screen::Title,
+        Screen::Singleplayer,
         Screen::AboutMegu,
         Screen::Friends,
         Screen::ModSyncConsent,

@@ -137,6 +137,9 @@ pub struct GpuCliConfig {
     /// `--server-bin <path>` — explicit `megu` binary for the
     /// integrated singleplayer server.
     pub server_bin: Option<PathBuf>,
+    /// `--seed <n>` — world seed forwarded to the integrated
+    /// singleplayer server as `MEGU_SEED` (new worlds only).
+    pub seed: Option<i64>,
     /// `--relay <host:port>` — friend-invite relay (`JoinWithCode`
     /// dispatches a [`megu_client::friend_client::FriendGuestBridge`]
     /// to it).
@@ -193,6 +196,7 @@ impl Default for GpuCliConfig {
             quick_play_path: None,
             quick_play_realms: None,
             server_bin: None,
+            seed: None,
             relay: None,
             width: None,
             height: None,
@@ -324,9 +328,10 @@ pub fn parse_gpu_args<S: AsRef<str>>(args: &[S]) -> Result<GpuCliConfig, String>
             "--relay" => cfg.relay = Some(take_value(&mut i)?),
             "--server-bin" => cfg.server_bin = Some(PathBuf::from(take_value(&mut i)?)),
             "--seed" => {
-                // Accepted for integrated-server parity with the headless
-                // client; the windowed path currently spawns default seeds.
-                let _ = take_value(&mut i)?;
+                let raw = take_value(&mut i)?;
+                cfg.seed = Some(raw.parse::<i64>().map_err(|_| {
+                    format!("--seed: expected a signed 64-bit integer, got {raw:?}")
+                })?);
             }
             // Launcher/loader flags with no GPU-session meaning; accepting
             // them keeps the real argv surface crash-free.
@@ -392,6 +397,7 @@ pub fn gpu_help_text() -> String {
          \x20   --vsync <on|off|mailbox>    presentation mode (default: on)\n\
          \x20   --relay <host:port>         friend-invite relay for invite-code joins\n\
          \x20   --server-bin <path>         explicit megu binary for singleplayer\n\
+         \x20   --seed <n>                  world seed for a new singleplayer world\n\
          \x20   -h, --help                  print this help\n\
          \x20   -V, --version               print the version\n\
          \n\
@@ -1287,6 +1293,17 @@ pub fn negotiate_pipeline(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn seed_flag_parses_signed_i64_and_rejects_garbage() {
+        let cfg = parse_gpu_args(&["--seed", "-42"]).expect("--seed -42");
+        assert_eq!(cfg.seed, Some(-42));
+        let cfg = parse_gpu_args(&["--seed=9223372036854775807"]).expect("--seed=max");
+        assert_eq!(cfg.seed, Some(i64::MAX));
+        assert_eq!(parse_gpu_args::<&str>(&[]).unwrap().seed, None);
+        assert!(parse_gpu_args(&["--seed", "notanum"]).is_err());
+        assert!(parse_gpu_args(&["--seed"]).is_err());
+    }
 
     #[test]
     fn alpha_mode_prefers_opaque_for_direct_scanout() {

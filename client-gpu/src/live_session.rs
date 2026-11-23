@@ -3583,7 +3583,7 @@ fn run_connection(
                 // Vanilla reports the chunks-per-tick rate it actually
                 // consumed; echoing the server window would request a batch
                 // larger than the render side can absorb during join.
-                client.send_chunk_batch_received((count.max(1).min(10)) as f32)?;
+                client.send_chunk_batch_received((count.clamp(1, 10)) as f32)?;
             }
             Some(ClientPlayEvent::Play(PlayEvent::Teleport(ref teleport))) => {
                 let previous_pose = last_input.map(|movement: PlayerMovement| movement.pose);

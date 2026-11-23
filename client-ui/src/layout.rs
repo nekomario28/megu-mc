@@ -62,6 +62,7 @@ pub fn layout_screen_into(
     };
     match state.screen {
         Screen::Title => title(&mut ctx),
+        Screen::Singleplayer => singleplayer(&mut ctx),
         Screen::Settings(tab) => settings(&mut ctx, tab),
         Screen::AboutMegu => about_megu(&mut ctx),
         Screen::Friends => friends(&mut ctx),
@@ -466,7 +467,138 @@ fn title(ctx: &mut Ctx) {
     };
     ctx.text(4, ctx.h - 12, 1, pal::TEXT_DIM, version);
 
+    // Host-reported status/errors stay visible on the menu — a failed
+    // singleplayer launch or multiplayer join never reads as a no-op.
+    if let Some(status) = &ctx.state.title_status {
+        ctx.ctext(cx, ctx.h - 24, 1, pal::WARNING, &hud_str(status, 56));
+    }
+
     boot_badge(ctx, 106);
+}
+
+// ---------------------------------------------------------------------------
+// Singleplayer: world select + Create New World
+// ---------------------------------------------------------------------------
+
+fn singleplayer(ctx: &mut Ctx) {
+    ctx.menu_background();
+    let lang = ctx.lang;
+    let cx = ctx.w / 2;
+
+    ctx.ctext(cx, 8, 2, pal::TEXT, tr(lang, "Select World", "ワールドを選択"));
+
+    // Reserve the footer strip (status line + Back): list and create
+    // widgets that would reach it are dropped by the helpers instead of
+    // painting under the chrome.
+    ctx.band_top = ctx.h - 44;
+
+    let pw = 340.min(ctx.w - 8).max(40);
+    let px = cx - pw / 2;
+
+    // The create block anchors to the footer: label + name field + seed
+    // field + button = 78 logical px. The world list owns what remains.
+    let create_h = 78;
+    let create_top = (ctx.band_top - 4 - create_h).max(36);
+    let list_top = 34;
+    let list_bottom = create_top - 4;
+
+    // --- Saved worlds ------------------------------------------------
+    let worlds = &ctx.state.singleplayer.worlds;
+    ctx.panel(px, list_top, pw, (list_bottom - list_top).max(10));
+    let row_h = 20;
+    // Overflow reserves a one-row pager strip at the panel's bottom.
+    let body_h = (list_bottom - list_top - 6).max(0);
+    let mut visible = (body_h / row_h) as usize;
+    if worlds.len() > visible {
+        visible = ((body_h - 18) / row_h).max(0) as usize;
+    }
+    let scroll = ctx
+        .state
+        .singleplayer
+        .scroll
+        .min(worlds.len().saturating_sub(visible));
+    if worlds.is_empty() {
+        ctx.ctext(
+            cx,
+            list_top + 6,
+            1,
+            pal::TEXT_DIM,
+            tr(lang, "No saved worlds yet", "ワールドはまだありません"),
+        );
+    }
+    for row in 0..visible {
+        let i = scroll + row;
+        let Some(name) = worlds.get(i) else { break };
+        ctx.btn(
+            WidgetId::SingleplayerWorld(i),
+            lr(px + 4, list_top + 4 + row as i32 * row_h, pw - 8, row_h - 2),
+            &hud_str(name, ((pw - 20) / 8).max(4) as usize),
+        );
+    }
+    // The pager needs real width (Up + Down + the range label) and a
+    // full strip inside the list area; otherwise it is dropped — the
+    // rows themselves stay clickable at any size.
+    let py = list_top + 4 + visible as i32 * row_h;
+    if worlds.len() > visible && pw >= 176 && py + 16 <= list_bottom {
+        ctx.btn(
+            WidgetId::SingleplayerListUp,
+            lr(px + 4, py, 60, 16),
+            tr(lang, "Up", "上"),
+        );
+        ctx.ctext(
+            cx,
+            py + 4,
+            1,
+            pal::TEXT_DIM,
+            &format!("{}-{}", scroll + 1, (scroll + visible).min(worlds.len())),
+        );
+        ctx.btn(
+            WidgetId::SingleplayerListDown,
+            lr(px + pw - 64, py, 60, 16),
+            tr(lang, "Down", "下"),
+        );
+    }
+
+    // --- Create New World --------------------------------------------
+    ctx.ctext(
+        cx,
+        create_top,
+        1,
+        pal::ACCENT,
+        tr(lang, "Create New World", "新しいワールド"),
+    );
+    ctx.textfield(
+        WidgetId::SingleplayerNameField,
+        lr(px, create_top + 12, pw, 18),
+        &ctx.state.singleplayer.new_name,
+        ctx.state.world_name_field_active(),
+        tr(lang, "World Name", "ワールド名"),
+    );
+    ctx.textfield(
+        WidgetId::SingleplayerSeedField,
+        lr(px, create_top + 34, pw, 18),
+        &ctx.state.singleplayer.seed_text,
+        ctx.state.world_seed_field_active(),
+        tr(lang, "Seed (optional)", "シード（オプション）"),
+    );
+    ctx.btn(
+        WidgetId::SingleplayerCreate,
+        lr(px, create_top + 56, pw, 18),
+        tr(lang, "Create & Play", "作成してプレイ"),
+    );
+    ctx.band_top = i32::MAX;
+
+    // Status/errors (failed launches, validation rejections) render
+    // right above Back — never silently dropped.
+    if let Some(status) = &ctx.state.title_status {
+        ctx.ctext(cx, ctx.h - 41, 1, pal::WARNING, &hud_str(status, 56));
+    }
+    ctx.button_unchecked(
+        WidgetId::SingleplayerBack,
+        lr(cx - 50, ctx.h - 30, 100, 20),
+        tr(lang, "Back", "戻る"),
+        true,
+    );
 }
 
 /// The compact `Boot: N ms` telemetry badge on Title/About. Emitted

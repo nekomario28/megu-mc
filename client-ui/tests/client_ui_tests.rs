@@ -56,8 +56,10 @@ fn all_screens(ui: &mut UiState) -> Vec<Screen> {
     ));
     ui.mod_menu = demo_mod_menu();
     ui.recipe_browser = demo_recipe_browser();
+    ui.singleplayer.worlds = vec!["First World".into(), "Second World".into()];
     vec![
         Screen::Title,
+        Screen::Singleplayer,
         Screen::Settings(SettingsTab::Video),
         Screen::Settings(SettingsTab::Audio),
         Screen::Settings(SettingsTab::Shaders),

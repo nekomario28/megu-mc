@@ -154,6 +154,10 @@ pub enum Screen {
     /// Mods & Packs / Settings / Quit (+ quiet optional corner links).
     #[default]
     Title,
+    /// Singleplayer world select + "Create New World" — reached from the
+    /// Title `Singleplayer` button; the host fills
+    /// [`UiState::singleplayer`] from `<gameDir>/saves/`.
+    Singleplayer,
     /// Tabbed settings; [`SettingsTab`] picks the active page.
     Settings(SettingsTab),
     /// Megu details, license, and configured project links.
@@ -1701,6 +1705,15 @@ pub enum UiAction {
     QuitGame,
     /// Start a singleplayer world.
     StartSingleplayer,
+    /// Launch the named singleplayer world — a world-list row click
+    /// (`seed: None`) or "Create & Play" (`seed` parsed from the seed
+    /// field). The host validates `name` with `validate_world_name`.
+    PlayWorld {
+        /// World folder name under `<gameDir>/saves/`.
+        name: String,
+        /// Optional seed for a newly created world (`None` = default).
+        seed: Option<i64>,
+    },
     /// Open the server browser / connect flow.
     StartMultiplayer,
     /// Show the statistics screen (owned by the app layer).
@@ -1754,6 +1767,16 @@ pub enum WidgetId {
     SupportLink,
     ContributeLink,
     ReportLink,
+    // Singleplayer world select
+    /// A row in the discovered-worlds list; `0` indexes
+    /// `singleplayer.worlds`.
+    SingleplayerWorld(usize),
+    SingleplayerNameField,
+    SingleplayerSeedField,
+    SingleplayerCreate,
+    SingleplayerBack,
+    SingleplayerListUp,
+    SingleplayerListDown,
     // Settings chrome
     SettingsDone,
     SettingsAboutMegu,
@@ -1902,7 +1925,13 @@ impl WidgetId {
 
     /// `true` for editable text fields (typing routes to them).
     pub const fn is_text_field(self) -> bool {
-        matches!(self, Self::VideoFpsField | Self::FriendsJoinField)
+        matches!(
+            self,
+            Self::VideoFpsField
+                | Self::FriendsJoinField
+                | Self::SingleplayerNameField
+                | Self::SingleplayerSeedField
+        )
     }
 }
 
@@ -1957,8 +1986,67 @@ pub enum UiModal {
 const FPS_FIELD_MAX_LEN: usize = 4;
 /// Largest accepted join field text (`"MEGU-XXXX-XXXX"` + slack).
 const JOIN_FIELD_MAX_LEN: usize = 14;
+/// Largest accepted world-name field text on [`Screen::Singleplayer`].
+const WORLD_NAME_FIELD_MAX_LEN: usize = 64;
+/// Largest accepted seed field text on [`Screen::Singleplayer`].
+const WORLD_SEED_FIELD_MAX_LEN: usize = 64;
 /// Crash report preview cap: 4 KiB of already-redacted markdown.
 pub const CRASH_PREVIEW_MAX_BYTES: usize = 4096;
+
+/// The [`Screen::Singleplayer`] world select & "Create New World" flow.
+///
+/// The host fills `worlds` from `<gameDir>/saves/` (sorted
+/// deterministically) each time the screen opens; the fields are pure
+/// UI-side text the host reads back through [`UiAction::PlayWorld`].
+#[derive(Clone, Debug)]
+pub struct SingleplayerState {
+    /// Discovered world folder names, sorted deterministically.
+    pub worlds: Vec<String>,
+    /// Editable "World Name" text for a new world (default `"New World"`).
+    pub new_name: String,
+    /// Editable "Seed" text: blank = server default, a signed integer is
+    /// used verbatim, anything else maps through Java's
+    /// `String.hashCode()` — the same string-seed mapping vanilla world
+    /// creation applies (see [`seed_from_text`]).
+    pub seed_text: String,
+    /// First visible row in `worlds` when the list overflows the panel.
+    pub scroll: usize,
+    name_focused: bool,
+    seed_focused: bool,
+}
+
+impl Default for SingleplayerState {
+    fn default() -> Self {
+        Self {
+            worlds: Vec::new(),
+            new_name: "New World".to_string(),
+            seed_text: String::new(),
+            scroll: 0,
+            name_focused: false,
+            seed_focused: false,
+        }
+    }
+}
+
+/// Resolve the optional seed field to a launch seed: blank (or
+/// whitespace-only) is `None` — the server default — a signed integer
+/// parses verbatim, and any other text maps through Java's
+/// `String.hashCode()` semantics (UTF-16 code units, `h = 31*h + u`),
+/// the same string-to-seed rule vanilla world creation uses.
+pub fn seed_from_text(text: &str) -> Option<i64> {
+    let trimmed = text.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    if let Ok(v) = trimmed.parse::<i64>() {
+        return Some(v);
+    }
+    let mut h: i32 = 0;
+    for u in trimmed.encode_utf16() {
+        h = h.wrapping_mul(31).wrapping_add(i32::from(u));
+    }
+    Some(i64::from(h))
+}
 
 /// The whole client UI state machine.
 #[derive(Clone, Debug)]
@@ -1999,6 +2087,14 @@ pub struct UiState {
 
     /// HUD data the game fills per frame.
     pub hud: HudState,
+
+    /// Last status line the host reported (join failures, invite
+    /// results, ...). Rendered on [`Screen::Title`] and
+    /// [`Screen::Singleplayer`] so errors never fail silently; the HUD
+    /// shows the same text through `hud.chat_lines` in game.
+    pub title_status: Option<String>,
+    /// The [`Screen::Singleplayer`] world select & create state.
+    pub singleplayer: SingleplayerState,
 
     /// The crash being shown on [`Screen::CrashRecovery`].
     pub crash: Option<CrashContext>,
@@ -2069,6 +2165,8 @@ impl Default for UiState {
             missing_mod_deps: Vec::new(),
             mod_sync_decision: None,
             hud: HudState::default(),
+            title_status: None,
+            singleplayer: SingleplayerState::default(),
             crash: None,
             crash_sent: false,
             support_url: String::new(),
@@ -2452,6 +2550,16 @@ impl UiState {
         self.join_field_focused
     }
 
+    /// `true` while the Singleplayer world-name field owns typing.
+    pub fn world_name_field_active(&self) -> bool {
+        self.singleplayer.name_focused
+    }
+
+    /// `true` while the Singleplayer seed field owns typing.
+    pub fn world_seed_field_active(&self) -> bool {
+        self.singleplayer.seed_focused
+    }
+
     /// The displayed invite code text, or `"-"` when none is active.
     pub fn invite_display(&self) -> String {
         self.active_invite
@@ -2594,9 +2702,17 @@ impl UiState {
         self.activate(region.id, x, y, region.rect)
     }
 
+    /// `true` while any editable text field owns typing.
+    fn any_field_focused(&self) -> bool {
+        self.fps_field_focused
+            || self.join_field_focused
+            || self.singleplayer.name_focused
+            || self.singleplayer.seed_focused
+    }
+
     fn handle_key(&mut self, key: UiKey) -> Vec<UiAction> {
         // While a text field owns typing, most keys feed the field.
-        if self.fps_field_focused || self.join_field_focused {
+        if self.any_field_focused() {
             return self.handle_key_in_field(key);
         }
         match key {
@@ -2638,6 +2754,10 @@ impl UiState {
                 } else if self.join_field_focused {
                     self.join_code_text.pop();
                     self.join_error = false;
+                } else if self.singleplayer.name_focused {
+                    self.singleplayer.new_name.pop();
+                } else if self.singleplayer.seed_focused {
+                    self.singleplayer.seed_text.pop();
                 }
                 Vec::new()
             }
@@ -2654,8 +2774,7 @@ impl UiState {
         // Ctrl+Z / Ctrl+Y arrive as control characters when no text
         // field owns typing: session undo/redo on the settings screen.
         if self.modal.is_none()
-            && !self.fps_field_focused
-            && !self.join_field_focused
+            && !self.any_field_focused()
             && matches!(self.screen, Screen::Settings(_))
         {
             match c {
@@ -2669,12 +2788,24 @@ impl UiState {
                 self.fps_field_text.push(c);
                 self.fps_field_error = false;
             }
-        } else if self.join_field_focused
-            && (c.is_ascii_alphanumeric() || c == '-')
-            && self.join_code_text.len() < JOIN_FIELD_MAX_LEN
+        } else if self.join_field_focused {
+            if (c.is_ascii_alphanumeric() || c == '-')
+                && self.join_code_text.len() < JOIN_FIELD_MAX_LEN
+            {
+                self.join_code_text.push(c.to_ascii_uppercase());
+                self.join_error = false;
+            }
+        } else if self.singleplayer.name_focused {
+            if !c.is_control()
+                && self.singleplayer.new_name.chars().count() < WORLD_NAME_FIELD_MAX_LEN
+            {
+                self.singleplayer.new_name.push(c);
+            }
+        } else if self.singleplayer.seed_focused
+            && !c.is_control()
+            && self.singleplayer.seed_text.chars().count() < WORLD_SEED_FIELD_MAX_LEN
         {
-            self.join_code_text.push(c.to_ascii_uppercase());
-            self.join_error = false;
+            self.singleplayer.seed_text.push(c);
         }
         Vec::new()
     }
@@ -2700,6 +2831,15 @@ impl UiState {
         } else if self.join_field_focused {
             self.unfocus_fields();
             self.try_join()
+        } else if self.singleplayer.name_focused {
+            // Form flow: Enter in the name field steps down to the seed
+            // field instead of launching half-typed input.
+            self.singleplayer.name_focused = false;
+            self.singleplayer.seed_focused = true;
+            Vec::new()
+        } else if self.singleplayer.seed_focused {
+            self.unfocus_fields();
+            self.try_create_world()
         } else {
             Vec::new()
         }
@@ -2718,9 +2858,29 @@ impl UiState {
         }
     }
 
+    /// "Create & Play" (or Enter on the seed field): the name the field
+    /// shows trimmed — an empty field falls back to the `"New World"`
+    /// default — plus the parsed seed. The host re-checks the name with
+    /// `validate_world_name` and reports failures through the visible
+    /// `title_status` line, so nothing here fails silently.
+    fn try_create_world(&mut self) -> Vec<UiAction> {
+        let trimmed = self.singleplayer.new_name.trim();
+        let name = if trimmed.is_empty() {
+            "New World".to_string()
+        } else {
+            trimmed.to_string()
+        };
+        vec![UiAction::PlayWorld {
+            name,
+            seed: seed_from_text(&self.singleplayer.seed_text),
+        }]
+    }
+
     fn unfocus_fields(&mut self) {
         self.fps_field_focused = false;
         self.join_field_focused = false;
+        self.singleplayer.name_focused = false;
+        self.singleplayer.seed_focused = false;
     }
 
     fn escape(&mut self) -> Vec<UiAction> {
@@ -2780,7 +2940,11 @@ impl UiState {
     /// Click-activation dispatch: `x`/`y` matter for sliders.
     fn activate(&mut self, id: WidgetId, x: i32, _y: i32, rect: UiRect) -> Vec<UiAction> {
         match id {
-            WidgetId::TitleSingleplayer => vec![UiAction::StartSingleplayer],
+            WidgetId::TitleSingleplayer => {
+                self.singleplayer.scroll = 0;
+                self.navigate(Screen::Singleplayer);
+                vec![UiAction::OpenScreen(Screen::Singleplayer)]
+            }
             WidgetId::TitleMultiplayer => vec![UiAction::StartMultiplayer],
             WidgetId::TitleFriends => {
                 self.navigate(Screen::Friends);
@@ -2793,6 +2957,38 @@ impl UiState {
                 vec![UiAction::OpenScreen(s)]
             }
             WidgetId::TitleQuit => vec![UiAction::QuitGame],
+
+            WidgetId::SingleplayerWorld(i) => match self.singleplayer.worlds.get(i) {
+                Some(name) => vec![UiAction::PlayWorld {
+                    name: name.clone(),
+                    seed: None,
+                }],
+                None => Vec::new(),
+            },
+            WidgetId::SingleplayerNameField => {
+                self.unfocus_fields();
+                self.singleplayer.name_focused = true;
+                Vec::new()
+            }
+            WidgetId::SingleplayerSeedField => {
+                self.unfocus_fields();
+                self.singleplayer.seed_focused = true;
+                Vec::new()
+            }
+            WidgetId::SingleplayerCreate => self.try_create_world(),
+            WidgetId::SingleplayerBack => {
+                self.back();
+                vec![UiAction::Back]
+            }
+            WidgetId::SingleplayerListUp => {
+                self.singleplayer.scroll = self.singleplayer.scroll.saturating_sub(1);
+                Vec::new()
+            }
+            WidgetId::SingleplayerListDown => {
+                let max_scroll = self.singleplayer.worlds.len().saturating_sub(1);
+                self.singleplayer.scroll = (self.singleplayer.scroll + 1).min(max_scroll);
+                Vec::new()
+            }
             WidgetId::WebsiteLink => {
                 if self.website_url.is_empty() {
                     Vec::new()

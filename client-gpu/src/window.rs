@@ -743,6 +743,7 @@ impl GpuApp {
             Some(jar) => crate::title_branding::load_title_branding_from_jar(&jar, &mod_jars),
             None => TitleBrandingAssets::fallback(),
         };
+        app.refresh_singleplayer_worlds();
         app
     }
 
@@ -841,7 +842,12 @@ impl GpuApp {
     /// inside `apply_ui_action` instead — it owns `event_loop.exit()`.
     pub fn dispatch_ui_action(&mut self, action: &UiAction) {
         match action {
-            UiAction::OpenScreen(screen) => self.ui.navigate(*screen),
+            UiAction::OpenScreen(screen) => {
+                if *screen == Screen::Singleplayer {
+                    self.refresh_singleplayer_worlds();
+                }
+                self.ui.navigate(*screen);
+            }
             UiAction::Back => {
                 self.ui
                     .handle_input(UiInputEvent::KeyPressed(UiKey::Escape));
@@ -853,6 +859,11 @@ impl GpuApp {
             UiAction::StartSingleplayer => {
                 if let Err(err) = self.start_singleplayer() {
                     self.status_line(format!("Singleplayer: {err}"));
+                }
+            }
+            UiAction::PlayWorld { name, seed } => {
+                if let Err(err) = self.start_singleplayer_world(name, *seed) {
+                    self.status_line(format!("Singleplayer {name:?}: {err}"));
                 }
             }
             UiAction::StartMultiplayer => {
@@ -1157,9 +1168,13 @@ impl GpuApp {
     }
 
     /// A user-visible status line for actions that can't silently no-op:
-    /// the message lands in chat both offline and live.
+    /// the message lands in chat both offline and live, is mirrored to
+    /// stderr, and stays visible on the Title/Singleplayer screens via
+    /// `ui.title_status` (their layouts never read `hud.chat_lines`).
     fn status_line(&mut self, message: impl Into<String>) {
         let message = message.into();
+        eprintln!("[{}] {message}", crate::CLIENT_GPU_NAME);
+        self.ui.title_status = Some(message.clone());
         self.debug_messages.push(message.clone());
         if self.debug_messages.len() > 100 {
             let excess = self.debug_messages.len() - 100;
@@ -1214,6 +1229,7 @@ impl GpuApp {
         cli.quick_play_singleplayer = Some(world.to_owned());
         cli.server_bin = config.server_bin.clone();
         cli.game_dir = config.game_dir.clone();
+        cli.seed = config.seed;
         integrated::launch(&cli)
     }
 
@@ -1225,11 +1241,28 @@ impl GpuApp {
             .quick_play_singleplayer
             .clone()
             .unwrap_or_else(|| "New World".to_owned());
-        let server = Self::launch_singleplayer(&self.config, &world)?;
+        self.start_singleplayer_world(&world, None)
+    }
+
+    /// Singleplayer world-select/"Create & Play": launch the integrated
+    /// server for `world` (fail-closed `validate_world_name` inside
+    /// `integrated::launch`), honoring the UI seed when given and
+    /// falling back to `--seed` otherwise, then connect to it.
+    fn start_singleplayer_world(&mut self, world: &str, seed: Option<i64>) -> Result<(), String> {
+        let mut config = self.config.clone();
+        config.seed = seed.or(config.seed);
+        let server = Self::launch_singleplayer(&config, world)?;
         let addr = server.addr();
         self.singleplayer_server = Some(server);
         self.connect_to(addr.ip().to_string(), addr.port());
         Ok(())
+    }
+
+    /// Refresh the Singleplayer screen's world list from
+    /// `<gameDir>/saves/` (`.` when `--gameDir` is unset), sorted
+    /// deterministically.
+    fn refresh_singleplayer_worlds(&mut self) {
+        self.ui.singleplayer.worlds = list_saved_worlds(self.config.game_dir.as_deref());
     }
 
     /// Title Multiplayer: connect to the configured server target.
@@ -2328,7 +2361,6 @@ impl GpuApp {
                     {
                         let dev = &active.renderer.gpu().device;
                         let queue = &active.renderer.gpu().queue;
-                        let (w, h) = (w as u32, h as u32);
                         let row = w * 4;
                         let padded = row.div_ceil(256) * 256;
                         let buf = dev.create_buffer(&wgpu::BufferDescriptor {
@@ -3072,6 +3104,32 @@ impl ApplicationHandler for GpuApp {
     }
 }
 
+/// World folder names under `<gameDir>/saves/` — the Singleplayer
+/// screen's world list. `game_dir` defaults to `.` like the launcher's
+/// `--gameDir` fallback; missing/unreadable `saves/` yields an empty
+/// list (the "Create New World" path still works). Sorted by name for
+/// deterministic presentation.
+fn list_saved_worlds(game_dir: Option<&std::path::Path>) -> Vec<String> {
+    let saves = game_dir
+        .unwrap_or_else(|| std::path::Path::new("."))
+        .join("saves");
+    let mut worlds: Vec<String> = match std::fs::read_dir(&saves) {
+        Ok(entries) => entries
+            .filter_map(|entry| entry.ok())
+            .filter(|entry| {
+                entry
+                    .file_type()
+                    .map(|kind| kind.is_dir())
+                    .unwrap_or(false)
+            })
+            .filter_map(|entry| entry.file_name().into_string().ok())
+            .collect(),
+        Err(_) => Vec::new(),
+    };
+    worlds.sort();
+    worlds
+}
+
 /// Deterministic per-session splash seed: FNV-1a over the launch
 /// config's identity fields (`username`/`--version`/`--gameDir`) — zero
 /// `SystemTime`, stable across the whole run.
@@ -3261,6 +3319,74 @@ mod tests {
         assert!(!body.contains("/home/alice"), "home path must be redacted");
         assert!(!body.contains("192.168.1.9"), "IP must be redacted");
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn list_saved_worlds_lists_only_directories_sorted() {
+        let dir = std::env::temp_dir().join(format!(
+            "megu-gpu-saves-test-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        let saves = dir.join("saves");
+        std::fs::create_dir_all(saves.join("Beta World")).unwrap();
+        std::fs::create_dir_all(saves.join("alpha world")).unwrap();
+        std::fs::write(saves.join("options.txt"), b"not a world").unwrap();
+
+        assert_eq!(
+            list_saved_worlds(Some(&dir)),
+            vec!["Beta World".to_string(), "alpha world".to_string()]
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+
+        // A missing saves/ dir yields an empty list, never a panic.
+        assert!(list_saved_worlds(Some(&dir)).is_empty());
+    }
+
+    #[test]
+    fn singleplayer_screen_populates_worlds_from_game_dir() {
+        let dir = std::env::temp_dir().join(format!(
+            "megu-gpu-sp-worlds-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("saves").join("Test World")).unwrap();
+
+        let mut app = GpuApp::new(GpuCliConfig {
+            game_dir: Some(dir.clone()),
+            ..GpuCliConfig::default()
+        });
+        assert_eq!(app.ui.singleplayer.worlds, vec!["Test World".to_string()]);
+
+        app.dispatch_ui_action(&UiAction::OpenScreen(Screen::Singleplayer));
+        assert_eq!(app.ui.screen, Screen::Singleplayer);
+        assert_eq!(app.ui.singleplayer.worlds, vec!["Test World".to_string()]);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn play_world_launch_failure_surfaces_visible_status() {
+        let mut app = GpuApp::new(GpuCliConfig {
+            server_bin: Some(std::path::PathBuf::from(
+                "/nonexistent/megu-integrated",
+            )),
+            ..GpuCliConfig::default()
+        });
+        app.dispatch_ui_action(&UiAction::PlayWorld {
+            name: "New World".to_string(),
+            seed: Some(7),
+        });
+        // The failure is visible on Title/Singleplayer screens, not just
+        // the HUD chat line those screens never draw (BUG-SP2).
+        let status = app.ui.title_status.as_deref().unwrap_or_default();
+        assert!(
+            status.contains("Singleplayer") && status.contains("New World"),
+            "title_status did not capture the failure: {status:?}"
+        );
+        assert!(app
+            .status_messages()
+            .iter()
+            .any(|m| m.contains("Singleplayer")));
     }
 
     #[test]
