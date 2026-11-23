@@ -162,6 +162,10 @@ if os.environ.get("FAKE_EMPTY_OVERLAY"):
 elif not os.environ.get("FAKE_NO_OVERLAY"):
     overlay.write_bytes(b"SED1" + b"\\x00" * 64)
 
+if (os.environ.get("MEGU_ENABLE_CREATE") == "1"
+        and not os.environ.get("FAKE_NO_CREATE_SIDECAR")):
+    (world_dir / "create_factory.bin").write_bytes(b"MCF1\\x00\\x00\\x00\\x00\\x00")
+
 print(json.dumps({"status": "ok", "play_ok": True, "chunks_loaded": 81}))
 sys.exit(int(os.environ.get("FAKE_EXIT_CODE", "0")))
 """
@@ -409,6 +413,44 @@ class UnitSyntheticJar(unittest.TestCase):
         raw = z.decompress(data[idat_at + 4:idat_at + 4 + length])
         self.assertEqual(len(raw), 5)  # filter byte + 1 RGBA pixel
 
+    def test_create_jar_has_required_neoforge_and_create_resources(self):
+        jar = gate.build_synthetic_create_jar(self.base / "create_e2e.jar")
+        self.assertTrue(zipfile.is_zipfile(jar))
+        with zipfile.ZipFile(jar) as archive:
+            names = set(archive.namelist())
+            for wanted in (
+                    "META-INF/neoforge.mods.toml",
+                    "assets/create/blockstates/shaft.json",
+                    "assets/create/textures/block/shaft.png",
+                    "assets/create/lang/ja_jp.json"):
+                self.assertIn(wanted, names)
+            import tomllib
+            manifest = tomllib.loads(
+                archive.read("META-INF/neoforge.mods.toml").decode())
+            self.assertEqual(manifest["mods"][0]["modId"], "create_e2e")
+            blockstate = json.loads(
+                archive.read("assets/create/blockstates/shaft.json"))
+            self.assertIn("axis=x", blockstate["variants"])
+            self.assertTrue(archive.read(
+                "assets/create/textures/block/shaft.png").startswith(
+                    b"\x89PNG\r\n\x1a\n"))
+            lang = json.loads(archive.read("assets/create/lang/ja_jp.json"))
+            self.assertEqual(lang["block.create.shaft"], "シャフト")
+
+    def test_gpu_probe_receives_modded_game_dir(self):
+        gpu = self.base / "fake-gpu"
+        gpu.write_text(
+            "#!/usr/bin/env python3\n"
+            "import sys\n"
+            "assert sys.argv[1:] == ['--headless-probe', '--gameDir', "
+            + repr(str(self.base / "game")) + "]\n")
+        gpu.chmod(0o755)
+        result = gate.run_gpu_probe(
+            gpu, self.base, timeout=5,
+            game_dir=self.base / "game")
+        self.assertEqual(result.exit_code, 0, result.stderr_lines)
+        self.assertEqual(result.cmd[-2:], ["--gameDir", str(self.base / "game")])
+
 
 class MockHarness(unittest.TestCase):
     """Drive the full gate against the fake client; prove checks go red."""
@@ -457,13 +499,42 @@ class MockHarness(unittest.TestCase):
         self.set_fake(FAKE_LIVEMODS=(
             "[live-mods] auto-adapt: synthesized megu-mod-bundle/1 for mod "
             "id 'e2emod' (mc_version_range '[1.21,1.22)')\n"
+            "[live-mods] native bundle create_e2e (create_e2e.jar): 0 portals, "
+            "0 progression barriers, 0 regions, 0 creatures, 0 channels\n"
             "[live-mods] 1 jar(s): 0 auto-skipped, 1 native-bundle, "
             "0 tier2-shim, 0 tier3\n"))
         code, out = run_gate(*self.argv(mode="modded"))
         self.assertEqual(code, 0, out)
         self.assertIn("C5", out)
+        self.assertIn("C6", out)
         # The synthetic JAR really landed in the temp mods dir.
         self.assertIn("e2e_test_mod.jar", out)
+        self.assertIn("create_e2e.jar", out)
+
+    def test_create_runtime_without_sidecar_fails(self):
+        self.set_fake(
+            FAKE_NO_CREATE_SIDECAR="1",
+            FAKE_LIVEMODS=(
+                "[live-mods] native bundle create_e2e (create_e2e.jar): "
+                "0 portals, 0 progression barriers, 0 regions, 0 creatures, "
+                "0 channels\n[live-mods] 2 jar(s): 0 auto-skipped, "
+                "2 native-bundle, 0 tier2-shim, 0 tier3\n"))
+        code, out = run_gate(*self.argv(mode="modded"))
+        self.assertEqual(code, 1, out)
+        self.assertIn("Create was not observably armed", out)
+
+    def test_create_stderr_error_fails(self):
+        self.set_fake(
+            FAKE_EXTRA_STDERR=str(self.base / "stderr-errors.txt"),
+            FAKE_LIVEMODS=(
+                "[live-mods] native bundle create_e2e (create_e2e.jar): "
+                "0 portals, 0 progression barriers, 0 regions, 0 creatures, "
+                "0 channels\n[live-mods] 2 jar(s): 0 auto-skipped, "
+                "2 native-bundle, 0 tier2-shim, 0 tier3\n"))
+        (self.base / "stderr-errors.txt").write_text("[ERROR] synthetic startup failure\n")
+        code, out = run_gate(*self.argv(mode="modded"))
+        self.assertEqual(code, 1, out)
+        self.assertIn("stderr error(s)", out)
 
     def test_mod_jar_silently_ignored_fails(self):
         self.set_fake()  # no FAKE_LIVEMODS lines at all

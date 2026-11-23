@@ -13,6 +13,7 @@ player uses, and fails closed on the failure modes the unit tests missed:
 * pre-join chunk stalls (``MEGU_CHUNK_PROFILE=1`` ``band lookups=0`` shape)
 * ``unsupported fluid shape`` runtime errors (``minecraft:glow_lichen``)
 * ``MEGU_MODS_DIR`` not forwarded to the integrated server
+* Create not armed/saved, live mobs absent, or GPU headless-probe failing
 
 Standard library only, Python 3.9+. Never touches the network: the client
 talks to its own integrated loopback server.
@@ -34,6 +35,9 @@ Checks
   C5  Synthetic mod JAR end-to-end — ``<gameDir>/mods/e2e_test_mod.jar`` is
       discovered by the live mod scan (``[live-mods]`` report) instead of
       being silently ignored.
+  C6  Create live runtime — a synthetic Create-family JAR arms and persists
+      the Create runtime across restart while mobs are observed; an optional
+      GPU headless probe accepts that same modded ``--gameDir``.
   G1  GPU client probe — ``megu-client-gpu --headless-probe`` exits 0 when
       ``--gpu-client-bin`` is given.
 
@@ -69,6 +73,8 @@ WORLD_NAME = "E2EWorld"
 USERNAME = "E2EGate"
 MOD_JAR_NAME = "e2e_test_mod.jar"
 MOD_ID = "e2emod"
+CREATE_E2E_JAR_NAME = "create_e2e.jar"
+CREATE_E2E_MOD_ID = "create_e2e"
 
 # Repository test datapacks that must never reach a player world. Keep this
 # list aligned with datapacks/ minus the generated vanilla pack.
@@ -400,6 +406,29 @@ def build_synthetic_mod_jar(path, mod_id=MOD_ID):
     return path
 
 
+def build_synthetic_create_jar(path):
+    """Write a tiny valid NeoForge JAR with the Create resource paths C6
+    exercises. The filename intentionally contains ``create`` because the
+    server's Create gate recognizes Create-family JAR names."""
+    manifest = SYNTHETIC_MOD_MANIFEST.format(mod_id=CREATE_E2E_MOD_ID)
+    members = {
+        "META-INF/neoforge.mods.toml": manifest.encode("utf-8"),
+        "assets/create/blockstates/shaft.json": json.dumps(
+            {"variants": {"axis=x": {"model": "create:block/shaft"}}},
+            sort_keys=True).encode("utf-8"),
+        "assets/create/textures/block/shaft.png": png_1x1(),
+        "assets/create/lang/ja_jp.json": json.dumps(
+            {"block.create.shaft": "シャフト"}, ensure_ascii=False,
+            sort_keys=True).encode("utf-8"),
+    }
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with zipfile.ZipFile(path, "w", compression=zipfile.ZIP_DEFLATED) as archive:
+        for name, payload in sorted(members.items()):
+            archive.writestr(name, payload)
+    return path
+
+
 # --------------------------------------------------------------------------
 # Session runner
 # --------------------------------------------------------------------------
@@ -425,6 +454,8 @@ class SessionResult:
     overlay_exists: bool = False
     overlay_bytes: int = 0
     overlay_waited: bool = False
+    create_factory_bytes: int = 0
+    create_factory_valid: bool = False
 
     def combined_lines(self):
         return self.stderr_lines + self.stdout_text.splitlines()
@@ -568,14 +599,23 @@ def run_session(*, label, mode, client_bin, server_bin_arg, run_cwd, game_dir,
             result.overlay_bytes = overlay.stat().st_size
         except OSError:
             pass
+    try:
+        create_factory = (world_dir / "create_factory.bin").read_bytes()
+        result.create_factory_bytes = len(create_factory)
+        result.create_factory_valid = (
+            len(create_factory) >= 9 and create_factory[:4] == b"MCF1")
+    except OSError:
+        pass
     return result
 
 
-def run_gpu_probe(gpu_bin, run_cwd, timeout, env_extra=None):
+def run_gpu_probe(gpu_bin, run_cwd, timeout, env_extra=None, game_dir=None):
     """`megu-client-gpu --headless-probe`: adapters enumerate and exit 0
     even on headless machines. Returns a SessionResult-shaped record."""
     result = SessionResult(label="gpu-probe", mode="gpu")
     cmd = [str(gpu_bin), "--headless-probe"]
+    if game_dir is not None:
+        cmd += ["--gameDir", str(game_dir)]
     result.cmd = cmd
     result.cwd = str(run_cwd)
     t0 = time.monotonic()
@@ -753,6 +793,70 @@ def check_mod_jar(session, jar_path):
     return check
 
 
+def check_create_live(first, restart, create_jar, gpu_probe=None):
+    """C6 — Create arms in the live integrated server and survives reload;
+    require observed mobs and optionally check the GPU probe with this gameDir."""
+    check = CheckResult(cid="C6", title="Create live runtime & mob spawn")
+    check.metrics["create_jar"] = str(create_jar)
+    check.note(f"Create-family JAR under test: {create_jar}")
+    check.metrics["gpu_probe_with_modded_game_dir"] = gpu_probe is not None
+    create_errors = re.compile(r"\b(?:ERROR|FATAL|PANIC)\b", re.IGNORECASE)
+    for label, session in (("first", first), ("restart", restart)):
+        lines = session.combined_lines()
+        check.metrics[f"stderr_lines_{label}"] = len(session.stderr_lines)
+        errors = [line for line in session.stderr_lines if create_errors.search(line)]
+        check.metrics[f"stderr_errors_{label}"] = len(errors)
+        if errors:
+            check.fail(f"{label} boot has stderr error(s): " + " | ".join(errors))
+        if session.spawn_error:
+            check.fail(f"{label} client spawn failed: {session.spawn_error}")
+        if session.exit_code != 0:
+            check.fail(f"{label} client exit {session.exit_code}")
+        if not session.join_seen:
+            check.fail(f"{label} integrated session never joined")
+        if session.session_timed_out:
+            check.fail(f"{label} integrated session timed out")
+        for _, needle, line in find_forbidden(lines):
+            check.fail(f"{label} stderr '{needle}': {line.strip()}")
+        overlay = Path(session.world_dir) / "world_overlay.bin"
+        check.metrics[f"world_overlay_bytes_{label}"] = session.overlay_bytes
+        if not session.overlay_exists or session.overlay_bytes <= 0 or not overlay.is_file():
+            check.fail(f"{label} world_overlay.bin missing or empty after disconnect")
+        check.metrics[f"create_factory_bytes_{label}"] = session.create_factory_bytes
+        if not session.create_factory_valid:
+            check.fail(f"{label} Create runtime sidecar missing or invalid; Create was not observably armed")
+        mods_report = parse_live_mods_report(lines)
+        check.metrics[f"live_mods_report_{label}"] = mods_report
+        if mods_report is None or mods_report.get("jars", 0) < 1:
+            check.fail(f"{label} server did not report scanning the gameDir mods directory")
+        if (CREATE_E2E_JAR_NAME not in "\n".join(lines)
+                and CREATE_E2E_MOD_ID not in "\n".join(lines)):
+            check.fail(f"{label} live mod scan did not identify {CREATE_E2E_JAR_NAME}")
+    mobs = first.chunkprof.get("mobs_last")
+    check.metrics["mobs_last"] = mobs
+    if mobs is None or mobs <= 0:
+        check.fail(f"no live mobs observed in status output (mobs={mobs})")
+    else:
+        check.note("live mob count observed using MEGU_DEBUG_SEED_MOBS=1; this verifies entity spawn/reporting, not natural spawn selection")
+        check.note("modded sessions run at least 120 client ticks to capture the periodic mob status line")
+    if gpu_probe is not None:
+        check.metrics["gpu_probe_exit_code"] = gpu_probe.exit_code
+        check.metrics["gpu_probe_stderr_lines"] = len(gpu_probe.stderr_lines)
+        if gpu_probe.spawn_error:
+            check.fail(f"GPU probe spawn failed: {gpu_probe.spawn_error}")
+        if gpu_probe.session_timed_out or gpu_probe.exit_code != 0:
+            check.fail(f"GPU --headless-probe with modded --gameDir failed (exit {gpu_probe.exit_code})")
+        gpu_errors = [line for line in gpu_probe.stderr_lines if create_errors.search(line)]
+        if gpu_errors:
+            check.fail("GPU probe stderr error(s): " + " | ".join(gpu_errors))
+        if check.status == "pass":
+            check.note("GPU headless probe accepted the modded gameDir and exited cleanly; this probe does not load rendered mod assets")
+    else:
+        check.note("GPU probe not run because --gpu-client-bin was not supplied")
+    check.note("Create arm is evidenced by a valid MCF1 sidecar on both saves; restart join with Create enabled verifies sidecar reload")
+    return check
+
+
 def check_gpu_probe(result):
     """G1 — megu-client-gpu --headless-probe exits cleanly."""
     check = CheckResult(cid="G1", title="GPU client headless probe")
@@ -810,9 +914,12 @@ class Gate:
             "chunkprof": s.chunkprof,
             "client_summary": s.client_summary,
             "stderr_tail": s.stderr_lines[-40:],
+            "stderr_line_count": len(s.stderr_lines),
             "world_dir": s.world_dir,
             "overlay_exists": s.overlay_exists,
             "overlay_bytes": s.overlay_bytes,
+            "create_factory_bytes": s.create_factory_bytes,
+            "create_factory_valid": s.create_factory_valid,
         }
 
     def print_table(self, out):
@@ -863,8 +970,10 @@ def _run_mode(gate, mode, base_dir, cfg):
     mods_dir = game_dir / "mods"
     if mode == "modded":
         jar = build_synthetic_mod_jar(mods_dir / MOD_JAR_NAME)
+        create_jar = build_synthetic_create_jar(mods_dir / CREATE_E2E_JAR_NAME)
     else:
         jar = None
+        create_jar = None
 
     rel_arg = relative_server_arg(cfg["server_bin"], cfg["run_cwd"])
     abs_arg = str(cfg["server_bin"])
@@ -873,10 +982,13 @@ def _run_mode(gate, mode, base_dir, cfg):
         label=f"{mode}/launch-relative", mode=mode,
         client_bin=cfg["client_bin"], server_bin_arg=rel_arg,
         run_cwd=cfg["run_cwd"], game_dir=game_dir, world=cfg["world"],
-        username=cfg["username"], ticks=cfg["ticks"],
+        username=cfg["username"],
+        ticks=max(cfg["ticks"], 120) if mode == "modded" else cfg["ticks"],
         view_distance=cfg["view_distance"], seed=cfg["seed"],
         join_timeout=cfg["join_timeout"], exit_timeout=cfg["exit_timeout"],
-        save_timeout=cfg["save_timeout"])
+        save_timeout=cfg["save_timeout"],
+        env_extra=({"MEGU_ENABLE_CREATE": "1",
+                    "MEGU_DEBUG_SEED_MOBS": "1"} if mode == "modded" else None))
     gate.sessions.append(first)
 
     c1 = gate.add(check_bootstrap(first, cfg["runtime_root"]))
@@ -892,16 +1004,27 @@ def _run_mode(gate, mode, base_dir, cfg):
         label=f"{mode}/restart-absolute", mode=mode,
         client_bin=cfg["client_bin"], server_bin_arg=abs_arg,
         run_cwd=cfg["run_cwd"], game_dir=game_dir, world=cfg["world"],
-        username=cfg["username"], ticks=cfg["ticks"],
+        username=cfg["username"],
+        ticks=max(cfg["ticks"], 120) if mode == "modded" else cfg["ticks"],
         view_distance=cfg["view_distance"], seed=cfg["seed"],
         join_timeout=cfg["join_timeout"], exit_timeout=cfg["exit_timeout"],
-        save_timeout=cfg["save_timeout"])
+        save_timeout=cfg["save_timeout"],
+        env_extra=({"MEGU_ENABLE_CREATE": "1",
+                    "MEGU_DEBUG_SEED_MOBS": "1"} if mode == "modded" else None))
     gate.sessions.append(restart)
     c4 = gate.add(check_persistence(first, restart))
     c4.title += f" [{mode}]"
     c3r = gate.add(check_stderr_gate(restart))
     c3r.cid = "C3r"
     c3r.title += f" (restart) [{mode}]"
+    if mode == "modded":
+        gpu_probe = None
+        if cfg["gpu_client_bin"] is not None:
+            gpu_probe = run_gpu_probe(
+                cfg["gpu_client_bin"], cfg["run_cwd"], timeout=60.0,
+                game_dir=game_dir)
+            gate.sessions.append(gpu_probe)
+        gate.add(check_create_live(first, restart, create_jar, gpu_probe))
 
 
 def parse_args(argv=None):
@@ -1045,8 +1168,11 @@ def main(argv=None):
         for mode in modes:
             _run_mode(gate, mode, base_dir, cfg)
         if gpu_bin is not None:
-            probe = run_gpu_probe(gpu_bin, run_cwd, timeout=60.0)
-            gate.sessions.append(probe)
+            probe = next((s for s in gate.sessions
+                          if s.label == "gpu-probe" and s.mode == "gpu"), None)
+            if probe is None:
+                probe = run_gpu_probe(gpu_bin, run_cwd, timeout=60.0)
+                gate.sessions.append(probe)
             gate.add(check_gpu_probe(probe))
     finally:
         if args.keep_tmp:
