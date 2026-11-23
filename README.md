@@ -1,110 +1,180 @@
-# megu
+# Megu (`megu-mc`)
 
-Minecraft Java 1.21.1（protocol 767）向けの実験的なRustサーバーです。小規模・低負荷の世界で、観測できる挙動を保ちながら計算量を減らし、必要な既存Modを接続できるかを試しています。**互換性・軽量性・任意Mod対応は未達で、完成品でも、vanillaより軽いと確認済みの製品でもありません。**
+> Clean-room Rust engine & native GPU client targeting **Minecraft: Java Edition 1.21.1** (Protocol 767; secondary target 26.3).
+> **Official Site**: [megu.megumin.tech](https://megu.megumin.tech/) · **License**: `LGPL-3.0-or-later` · **Status**: `v0.1.0-alpha.1`
 
-## 何ができて、何ではないか
+Minecraft: Java Edition 1.21.1（Protocol 767）互換を目指す、**100% クリーンルームの Rust 製サーバー＆ネイティブ GPU クライアント（純 Vulkan / DX12 / Metal・OpenGL 依存ゼロ）** です。
+バニラ挙動の忠実な再現を最優先にしつつ、低 RAM・低 CPU・高速起動・安全な Mod 互換（データ駆動＋有界 JVM 委譲境界）を両立することを目指しています。
 
-| 限られた範囲で確認していること | まだ確認していないこと |
+> **重要（Alpha 版の前提）**: Megu は現在 `v0.1.0-alpha.1` です。任意の複雑な Java/Mixin Mod をネイティブ実行できる完成品ではなく、未実装機能・Tier 3（有界 JVM 委譲）境界が残っています。詳細は下の「できること・境界」と [specs/ROADMAP.md](specs/ROADMAP.md) を参照してください。
+>
+> *Not an official Minecraft product. Not approved by or associated with Mojang or Microsoft.*（[TRADEMARK.md](TRADEMARK.md)）
+
+---
+
+## 主な特徴（`v0.1.0-alpha.1` 実測・検証済み）
+
+- **1.21.1 バニラ互換（Protocol 767）**:
+  - C2S 58/58・S2C 124/124・Gamerules 51/51・コマンドルート 89/89・エンティティ 130/130
+  - 対公式 Vanilla 1.21.1 ライブ差分オラクル: `vanilla_live_diff.py --strict` **18/18 MATCH**、サバイバル/クリエイティブ **7/7 PASS**、ブロック形状＆レッドストーン **11/11 PASS**
+- **軽量サーバー＋外部ゼロ負荷 TUI**:
+  - 起動〜待ち受け **~1.0 秒**・アイドル RAM **`~62 MiB`**・4 スレッド
+  - 3 倍省メモリ `LightingChunk`・`SECTION_STORE` 優先キャッシュ・オーバーレイ差分保存・Tick 末合流 WAL・SHA-256 重複排除バックアップ
+  - 外部プロセス型ダッシュボード [tools/megu_tui.py](tools/megu_tui.py)（TPS/MSPT 固定スケール配色・CPU%・スレッド数・`ms/ch`・ダーティフレーム抑止でアイドル描画負荷 ~0%）
+- **純 `wgpu` ネイティブ GPU クライアント（`megu-client-gpu`・OpenGL 依存 0）**:
+  - Linux **Vulkan** / Windows **DX12 & Vulkan** / macOS **Metal**（GL/GLES/EGL/WGL クレート 0）
+  - GPU 主導 `multi_draw_indexed_indirect`＋インエンコーダ GPU Hi-Z 深度ピラミッド＋定常フレーム 0 B 差分転送
+  - 手元 `1.21.1.jar` からのオンメモリ読込（一時展開 0 B・テクスチャ/音源/言語/スプラッシュ＋`MEGU EDITION` タイトル合成）
+  - 組込レシピ＆解説ブラウザ（JEI/EMI/JER/Ponder 風：`R`/`U`/`W` ホットキー・`+` 自動配置・Mod JAR/データパック自動読込）
+- **論文ベース数理最適化＆汎用差分基盤（`megu-core`）**:
+  - `DiscountedUcbAutotuner`（Garivier & Moulines, ALT 2011）・`P2QuantileEstimator`（Jain & Chlamtac, CACM 1985・ゼロヒープ P95/P99）・`RooflineModel`（Williams–Waterman–Patterson, CACM 2009）・アンチワインドアップ PID・3D Morton・Mara–McGuire 解析球投影・`XorRleDiff`（`XDF1`＋CRC32）をサーバー／クライアント双方で共有
+- **汎用 Mod 互換＆フェイルクローズ静的検査**:
+  - Fabric / NeoForge 共存レジストリ（`DualLoaderHost`）・データ駆動レシピ/タグ/ルート/ディメンション取込
+  - 非実行型バイトコード静的検査（危険なプロセス実行・ネイティブロード・`Unsafe`・JNDI・動的コードはハード隔離、直接ネットワーク/制限付き Foreign Linker はサンドボックス警告分離）
+- **らくらく導入（公式ランチャー・Prism・サーバー）**:
+  - Java 不要・単体ネイティブインストーラ **`megu-installer`（Windows 版 `megu-installer.exe`・~530 KiB）**
+  - ダブルクリック GUI/CLI 対応 **`megu-bootstrapper.jar`（23 KiB）**・Prism 用 `.zip`・Modrinth 用 `.mrpack`
+
+---
+
+## 参考ベンチマーク実測（Alpha・条件明記）
+
+### サーバー：対公式 Vanilla 1.21.1 `server.jar`（`WARM=1` 20 秒移動ビューア・seed 0・view 4 / sim 5・90 チャンク移動・PGO なし）
+
+| サーバー | CPU (s) | `ms/chunk` | RAM (RSS) | OS スレッド | 送信パケット | 配信チャンク |
+|---|---:|---:|---:|---:|---:|---:|
+| Vanilla 1.21.1 (`server.jar`) | `3.470s` | `21.16` | `1,141.1 MiB` | `64` | `2,798` | `164` |
+| **Megu (`v0.1.0-alpha.1`)** | **`1.680s`** | **`12.44`** | **`280.4 MiB`** | **`6`** | **`791`** | `135` |
+
+> **正直な注記**: 両サーバーとも同じ 90 チャンク移動ドライバを使用していますが、配信チャンク総数（164 vs 135）および実装済みバニラ機能の範囲が異なるため、完全同一作業の比較ではありません。
+
+### クライアント：実機 AMD Radeon RX 7800 XT（純 Vulkan・720p・GPU 間接描画＋Hi-Z）
+
+| 描画距離（クライアント既定 `12`・範囲 `6..=32`） | チャンク列 / セクション | 受信＋照明（`O(N)` 増分） | メッシュ生成 | 平均 FPS | 1% Low（P99） | クライアント RSS |
+|---|---:|---:|---:|---:|---:|---:|
+| `view = 8` | 289 / 578 | `446.8 ms`（`1.55 ms/ch`） | `9.1 ms` | **`1,839 FPS`** | **`1,125 FPS`** | `193.6 MiB` |
+| **`view = 12`（既定）** | 625 / 1,250 | `955.1 ms`（`1.53 ms/ch`） | `22.9 ms` | **`1,025 FPS`** | **`655 FPS`** | `347.5 MiB` |
+| `view = 16` | 1,089 / 2,178 | `1,659.9 ms`（`1.52 ms/ch`） | `47.9 ms` | **`619 FPS`** | **`489 FPS`** | `555.7 MiB` |
+
+---
+
+## できること・まだできないこと（正直な境界）
+
+| 確認済み（`v0.1.0-alpha.1`） | まだ未完了・対象外 |
 |---|---|
-| 固定したseed・chunk・生成stageでのworldgen照合（対象fixtureのみ） | 全seed・全biome・全構造物・全dimensionの一致 |
-| CLI経由の接続・操作の検査 | 画面を含むM2セッション全体の一致 |
-| 限られたFabric／NeoForge契約（Seed Protect等） | 任意のModの互換 |
-| 固定条件での計測 | vanillaより軽いという証明、20TPSの証明 |
+| 1.21.1 ライブ差分 18/18・サバイバル 7/7・レッドストーン 11/11 | 全バイオーム・全構造物・全エンティティ AI の 100% 完全網羅 |
+| データ駆動 Mod（レシピ・タグ・ルート・ディメンション・静的検査） | 任意の複雑 Java / Mixin Mod の無条件ネイティブ実行（Tier 3 境界あり） |
+| 実機 RX 7800 XT 純 Vulkan 描画・GPU 間接描画＋Hi-Z・音響・UI | すべての OptiFine/Iris 外部シェーダーパックの完全再現 |
+| Win / macOS / Linux 3 OS ビルド＆インストーラ検証 | 大規模マルチプレイヤー長期稼働・全 OS 実機 GPU 網羅検証 |
 
-現在の状態・限界・次の順序は [specs/README.md](specs/README.md) と [specs/ROADMAP.md](specs/ROADMAP.md) が正本です。このREADMEには状態表を複製しません。
+---
 
-## 実装されている構成（Alpha）
+## クイックスタート
 
-ルートのサーバーパッケージとは別に、以下の **12 standalone crates** を管理しています。`tests/verify.sh` は各 crate の `cargo test --offline --locked` を実行します。Clippy の警告ゼロは別途リリース対象の各 crate で確認してください。
-
-| crate | 主な役割 |
-|---|---|
-| `core` | クラッシュの指紋・機密情報の伏せ字化・汎用 `perf_kit` |
-| `proto` | セッション、プロトコル、招待・音声リレー |
-| `state-store` | ワールド保存、Anvil 検査、監査ログ |
-| `server-files` | サーバー初期化、パケットキャッシュ |
-| `mod-offload` | Mod 処理の分離・委譲契約 |
-| `mod-adapter-core` | Mod の静的検査、限定 `.class` VM、互換アダプター |
-| `create-adapter` | Create 系の動力・線路モデル |
-| `client-port` | メッシュ、3D モデルベイク、テクスチャアトラス、Hi-Z、外部シェーダー計画 |
-| `client-kernel` | クライアント側レジストリ、エンティティ補間 |
-| `client-app` | クライアント CLI、描画パイプライン、フレーム制御、音量制限 |
-| `client-ui` | 純 Rust の UI 状態・レイアウト・描画リスト・ソフトウェア描画 |
-| `client-gpu` | 隔離 `winit` + `wgpu` 実ウィンドウ GPU クライアント |
-
-現時点で利用できる実装面は次の通りです。
-
-- OP レベル 4 の `/megu policy list|get|set|reset` が、マップの **5 項目**（`minimap_mode`、`allow_cave_map`、`allow_mob_radar`、`player_radar_scope`、`allow_waypoint_teleport`）を制御します。`player_radar_scope=party_only` を選べます。MineAll/CutAll は初期値 `off` の opt-in です。
-- 死亡時の元スロット復帰は opt-in のピックアップ処理とテストが存在します。通常の運用コマンドから有効化する配線は未完成です。
-- `mod-adapter-core` に制限付き `.class` バイトコード検証・実行 VM があります。侵襲的な Java Mod は Tier 3 の境界で判定し、必要な場合のみ `tools/build_mini_jre.py` で手元の JDK から小型の委譲用 JRE を作れます。任意の Mod の動作は保証しません。
-- クライアント側に 3D モデルベイカー、アトラス、Hi-Z、WGSL シェーダー、RenderGraph、純 Rust `client-ui` とヘッドレスのソフトウェアラスタライザがあります。FPS 上限は `10..=2000` または `Unlimited`、`FrameBudgetPacer` はフレームごとの処理量を制御します。音量の上限を制御するリミッターも実装されています。
-- Linux / macOS / Windows を対象とした移植可能な構成です。実ウィンドウを持つ `winit` + `wgpu` バックエンドは Alpha 後の作業、実際の第三者 Modpack による E2E 検証は Wave 3 の対象です。各 OS での実機検証状況は [リリースチェックリスト](docs/release-checklist.md) に従って確認します。
-- Cloudflare Pages Functions に `POST /api/report`（最大 4 KiB、機密文字列を伏せ字化する GitHub Issue リレー）と `GET /api/latest` があります。運用には設定と秘密情報の登録が必要です（[運用ガイド](docs/operator-guide.md)）。
-
-## Collaborator クイックスタート（3 コマンド）
-
-前提は Rust 1.98.0（[rust-toolchain.toml](rust-toolchain.toml) で固定）、Python 3、Java 21（NeoForge / Fabric 互換テスト用）です。開発ブランチ（`main` / `perf/worldgen-parallel`）にはテスト用の vanilla データが同梱されているため、clone 直後に以下の 3 ステップで開発・検証を開始できます：
+### プレイヤー向け（公式ランチャー / Prism Launcher）
+[GitHub Releases](https://github.com/nekomario28/megu-mc/releases) または [megu.megumin.tech](https://megu.megumin.tech/) から導入ツールを取得します：
 
 ```sh
-# 1. ツールチェーンとローカル入力の診断（数秒）
+# 1. 公式ランチャーへ導入（Java 不要の単体バイナリ・Windows は megu-installer.exe）
+./megu-installer client --mc-version 1.21.1 --client-bin ./megu-client-gpu --bootstrap-jar ./megu-bootstrapper.jar
+
+# 2. Prism Launcher インスタンスを 1 発生成
+./megu-installer prism --mc-version 1.21.1 --client-bin ./megu-client-gpu
+
+# 3. あるいは 23 KiB の GUI/CLI インストーラ JAR をダブルクリック / 実行
+java -jar megu-bootstrapper.jar
+```
+
+### サーバー運用者向け
+```sh
+# 標準 7 フォルダ・run.sh / run.bat・eula.txt (eula=false) を初期化
+./megu-installer server --dir ./megu-server --server-bin ./megu
+
+# eula.txt の内容を確認し、同意する場合のみ eula=true にして起動
+cd ./megu-server
+./megu --port 25565
+# または外部 TUI ダッシュボード付きで起動（サーバー Tick 負荷 0）
+python3 tools/megu_tui.py -- ./megu --port 25565
+```
+
+> 既定のバインド先は `127.0.0.1` です。外部公開前の設定は [SECURITY_NOTES.md](SECURITY_NOTES.md) と [docs/operator-guide.md](docs/operator-guide.md) を参照してください。初回起動時に `server.toml` が生成され、`MEGU_*` 環境変数が常に優先されます。
+
+### 開発者・コントリビュータ向け
+前提：Rust 1.98.0（[rust-toolchain.toml](rust-toolchain.toml) 固定）・Python 3・Java 21（互換テスト用）。
+
+```sh
+# 1. ツールチェーンとローカル入力の診断
 python3 tools/dev_check.py
 
-# 2. アーキテクチャ層・技術的負債・来歴（Provenance）ゲートの検証
-bash tools/layers_check.sh && bash tools/debt_ratchet.sh && python3 tools/provenance_check.py
+# 2. クリーン公開ツリーでは手元の 1.21.1 server.jar から検証データをローカル生成（公開リポには含まれません）
+bash tools/vanilla_data/gen_vanilla_data.sh --jar /path/to/1.21.1-server.jar --fetch-fabric-mappings --accept-eula
 
-# 3. ビルド・単体テスト・サーバー起動
+# 3. 層違反・負債・来歴（Zero-GL / Zero-Embed）・衛生ゲート検証
+bash tools/layers_check.sh && bash tools/debt_ratchet.sh && python3 tools/provenance_check.py --strict-zero-gl && python3 tests/public_hygiene_test.py
+
+# 4. テスト＆サーバー起動
 cargo test --locked -- --test-threads=1
 MEGU_PORT=25699 cargo run --locked
 ```
 
-> **Note**: `tools/export_public_branch.sh` で生成されたクリーンエクスポート環境（Mojang 由来データを含まないツリー）から始める場合は、ステップ 1 の後に手元の 1.21.1 `server.jar` から 1 コマンドでデータを再生成できます：
-> `bash tools/vanilla_data/gen_vanilla_data.sh --jar /path/to/1.21.1-server.jar --fetch-fabric-mappings --accept-eula`
+> **Note**: クリーンな公開スナップショットの生成手順は `tools/export_public_branch.sh`（および [docs/development.md](docs/development.md)）を参照してください。
 
-通常のゲームlistenerは `127.0.0.1` にbindし、セーブはカレントディレクトリの `world_overlay.bin` に書きます。外部ネットワークに公開しないでください（[SECURITY_NOTES.md](SECURITY_NOTES.md)）。データの種類、生成手順、テストの段階（T0 → T1 → T2）は [開発ガイド](docs/development.md) にまとめています。
+---
 
-設定ファイルは任意です。初回起動時にカレントディレクトリへ短い `server.toml` を書き出します（`MEGU_CONFIG` で場所を変更可）。`[server]` の各キーは既存の `MEGU_*` 環境変数に対応し、環境変数が常に優先されます。`[anticheat]` は on/off の 4 項目です: `enabled`（移動・落下・設置チェックの on/off）、`antixray`（埋まったバニラ鉱石＋`#c:ores`/`#forge:ores` 等の Mod 鉱石・チェスト・埋没 BlockEntity NBT を隠す）、`antifullbright`（密閉された地下空洞の光を送らない。クライアントのガンマ/フルブライト自体はサーバーからは止められません）、`check_ops`（`true` で OP も検査対象）。しきい値はプレイヤーの属性・エフェクト・エンチャント・Mod ブロック輸送からサーバー側で毎回自動計算し（`src/anticheat.rs`）、違反は引き戻し・取り消しのみでキックしません。クリエイティブ・スペクテイターは常に対象外で、サバイバル復帰時は短い猶予が付きます。非バニラコマンドは追加せず、既存のバニラ `/reload` で `server.toml` と Mod タグも自然に再読込されます。環境変数 `MEGU_ANTICHEAT=off` でも無効化できます。
+## リリースロードマップ（SemVer 方針）
 
-## 導入・周辺ツール（Alpha）
+マイナーバージョンを急いで上げず、**`0.1.0` のプレリリース段階を着実に積み上げて 1.21.1 実用版を仕上げてから `0.2.0` へ進む方針** です：
 
-- **1 コマンド導入**: `python3 tools/megu_start.py --dir ./server [--modpack pack.mrpack] [--accept-eula]`（`[]` 内は任意）。ローカルサーバーの初期設定と起動を補助します。`--accept-eula` は EULA に同意した場合のみ指定してください。`--modpack` は事前検査用で、Mod の自動ダウンロード・導入はしません。
-- **任意のローカル Mod 翻訳**: `python3 tools/megu_translate.py --mods-dir ./mods --out ./megu-auto-lang-ja_jp.zip`。欠けている日本語訳から、ローカルで個人利用するためのクライアント用リソースパックをオンデマンド生成します。ローカルの翻訳 API が必要で、既定の接続先は `127.0.0.1` のループバックのみです。外部 API への接続は `--allow-remote-llm` による明示的な許可が必要です。
-- **JVM 不要の Mod 検査**: `megu-mod-check --scan-mods-dir ./mods` で `mods/` 内の JAR を静的検査し、互換性経路を分類します。任意の Mod が動作する保証ではありません。
-- **ワールド操作**: `megu-world-migrate` は `inspect-anvil`、`migrate-level`、`audit-query`、`rollback`、`pregen-plan` を提供します。`pregen-plan` は事前生成の計画のみを行います。
-- **クライアント CLI**: `megu-client` は `--ping <host:port>`、`--join-code <code> --relay <host:port>`、`--gpu-backend classic-low-spec`、`--background-fps <0..240>` を提供します。
-- **Mod 統合の検証**: `cargo check --offline --locked --features mod-suite` で `mod-suite` feature を有効にしたビルドを検査できます。
+| マイルストーン | 主な目標 |
+|---|---|
+| **`v0.1.0-alpha.1`**（現行） | 1.21.1 サーバー基盤・18/18 ライブ差分一致・純 `wgpu` GPU クライアント・`megu-installer`・TUI・汎用 Mod/レシピ/静的検査基盤の初回公開 |
+| **`v0.1.0-alpha.2`** | 実 1.21.1 クライアント 30 分プレイテスト由来のエッジケース修正・Create/ATM10 系（Flywheel/Ponder 依存・汎用 Mixin リフト拡充）・同一チャンク数条件でのベンチマーク整備・Docker 検証 |
+| **`v0.1.0-beta.1`** | リポジトリ構造整理（`crates/`・Workspace・`src/main.rs` モジュール分割）・サーバー/クライアント物理＆NBT 共通化・インストーラ GUI 洗練・Cloudflare Pages 運用安定化 |
+| **`v0.1.0`** | Minecraft 1.21.1 サバイバル＆主要 Modpack の日常利用を安定達成した初回安定版 |
+| **`v0.2.0`** | Minecraft `26.3` 完全パリティ・マルチバージョン共存・高度なシェーダーパック／Flywheel 互換の拡充 |
 
-## 軽量化 Mod について（プレイヤー・運用者向け）
+---
 
-- 描画カリング・ライティング・パレット圧縮・並列チャンク処理・遠景 LOD など、既存の軽量化 Mod と同じ分野の Rust 実装があります。`Sodium` / `Embeddium` / `Lithium` / `Starlight` / `FerriteCore` / `ModernFix` / `EntityCulling` / `Distant Horizons` と機能・性能が同等であることは検証されていません。
-- `megu-mod-check` の事前検査では、組み込みの置換対象として登録された軽量化 Mod の ID をスキップ対象に分類します。それ以外のコンテンツ Mod の動作可否は個別の互換性検査・実行検証に依存します（対象一覧と仕組み: [ux-and-builtin-optimizations.md](specs/client-fork/ux-and-builtin-optimizations.md)）。
-- スキップ対象の分類は事前検査の挙動です。上記 Mod 群の公式同梱・提携・コード移植は行っていません（詳細は下の「クリーンルーム実装と設計上の先行技術」を参照）。
+## アーキテクチャ（13 クレート構成）
 
-## どこから読むか
+ルートのサーバーバイナリ（`megu`）に加え、12 の独立クレートを厳格な層契約（`tools/layers_check.sh`）で分離しています：
 
-- 参加する・並列作業の担当境界: [CONTRIBUTING.md](CONTRIBUTING.md) → [開発ガイド](docs/development.md)
-- Mod・シェーダーの作者向け: [Mod・シェーダー開発者ガイド](docs/mod-author-guide.md)
-- 現在の作業と未解決事項: [specs/README.md](specs/README.md)
-- 目標と合格条件: [specs/PLAN.md](specs/PLAN.md) / 次の順序: [specs/ROADMAP.md](specs/ROADMAP.md)
-- 設計原則と比較の規律: [DESIGN.md](DESIGN.md)
-- 測定値・再現条件: [evidence/](evidence/)
-- 診断・固定具の道具: [tools/README.md](tools/README.md)
-- ライセンスと出所: [LICENSING.md](LICENSING.md) / [THIRD_PARTY.md](THIRD_PARTY.md)
-- セキュリティ: [SECURITY.md](SECURITY.md) / [SECURITY_NOTES.md](SECURITY_NOTES.md)
+| クレート | 主な役割 |
+|---|---|
+| `core` (`megu-core`) | 共通葉クレート（外部依存 0）：`hw_adaptive_engine`・`math_opt_engine`・`diff_engine`・`crash_report`・`zip_archive`・`romaji_ime`・`tier25_guard_batch` |
+| `proto` (`megu-proto`) | Protocol 767 パケット・セッション・`VCR1` 音声リレー・フレンドリレー |
+| `state-store` (`megu-state-store`) | Anvil 検査・マイグレーション（`megu-world-migrate`）・増分セーブ・CAS スナップショット・監査ログ |
+| `server-files` (`megu-server-files`) | サーバー初期化（`megu-init`）・管理（`megu-admin`）・単体ネイティブインストーラ（`megu-installer`） |
+| `mod-offload` | Mod 演算委譲契約（`MOT1` 戦闘モーション・`PRTY` コンパニオン保管・C-ABI FFI） |
+| `mod-adapter-core` | 非実行型 JAR 静的セキュリティ検査・`DualLoaderHost`・限定 `.class` VM・`megu-mod-check` |
+| `create-adapter` | Create 系キネティクス・軌道遷移・オフロードブリッジ |
+| `client-kernel` (`megu-kernel`) | サーバーと共通の `lighting.rs`・物理・レジストリ・補間・QoL Looking-At |
+| `client-port` (`megu-client-mesh`) | メッシュ生成・3D モデルベイク・アトラス・Hi-Z・サブタイル差分キャッシュ・外部シェーダー計画 |
+| `client-ui` (`megu-client-ui`) | 純 Rust UI・設定・レシピ/Ponder ブラウザ・クラッシュ確認モーダル |
+| `client-app` (`megu-client`) | クライアント CLI・セッション・オーディオミキサ＆リミッター・クラッシュレポーター |
+| `client-gpu` (`megu-client-gpu`) | 純 `wgpu` 実ウィンドウ GPU クライアント（Vulkan / DX12 / Metal・0 GL） |
 
-## ライセンスとデータ
+---
 
-コード本体は **`LGPL-3.0-or-later`**（[COPYING.LESSER](COPYING.LESSER) と、LGPLv3 が要求する GPLv3 付随文の [LICENSE](LICENSE)、[NOTICE](NOTICE)、[LICENSING.md](LICENSING.md)）で配布されています。寄稿コードも `LGPL-3.0-or-later` で提供され、LGPLv3 §2 により下流は GPLv3 として利用・再配布できます。`MIT` / `Apache-2.0` / `BSD` / `LGPL-2.1` / `LGPL-3.0` のコード（C2ME、Lithium、NeoForge、Fabric など）と完全互換です。Fabric / NeoForge 互換レイヤ経由で動的ロードされる独立した外部 Mod JAR は派生物とみなさず、コピーレフトは波及しません。
+## 周辺ツール・セキュリティ・プライバシー
 
-貢献の条件は、寄稿コードの `LGPL-3.0-or-later` での提供、DCO の `Signed-off-by`（`git commit -s`）、Mojang 逆コンパイルコードや第三者 JAR を混入させないことです。詳細は [CONTRIBUTING.md](CONTRIBUTING.md) を参照してください。
+- **OP 運用ポリシー**: `/megu policy list|get|set|reset`（フェアプレイマップ 5 項目・MineAll/CutAll 既定 `off`）
+- **Mod 静的検査**: `megu-mod-check --scan-mods-dir ./mods`（JVM 不要・危険な実行/ネイティブロード/`Unsafe`/JNDI をハード隔離）
+- **ローカル Mod 自動翻訳（任意）**: `python3 tools/megu_translate.py --mods-dir ./mods --out ./megu-auto-lang-ja_jp.zip`（既定 `127.0.0.1` のみ、外部 API は `--allow-remote-llm` 明示必須）
+- **クラッシュ報告**: 既定 `Ask`（同意確認なしに送信しない・ホームパス/IP/トークン自動秘匿・4 KiB 上限・`Off` で完全停止）
+- **組み込み最適化と既存 Mod**: 描画カリング・増分ライティング・パレット圧縮・並列チャンク処理・LOD 等のクリーンルーム実装を内蔵しています。`megu-mod-check` は重複する軽量化 Mod を事前分類しますが、第三者 Mod の公式同梱・コード移植は一切行っていません（詳細: [ux-and-builtin-optimizations.md](specs/client-fork/ux-and-builtin-optimizations.md)）。
 
-## クリーンルーム実装と設計上の先行技術（Prior Art）
+## ドキュメント案内
 
-本リポジトリの最適化サブシステムはすべて、標準的なコンピュータグラフィックス／システム系アルゴリズムに基づく **100% クリーンルームのオリジナル Rust 実装**です。該当するサブシステム:
+- 参加ガイド・DCO: [CONTRIBUTING.md](CONTRIBUTING.md) / [開発ガイド](docs/development.md)
+- 運用・配布: [運用ガイド](docs/operator-guide.md) / [リリースチェックリスト](docs/release-checklist.md) / [配布計画](docs/RELEASE_AND_DISTRIBUTION_PLAN.md)
+- Mod・シェーダー作者向け: [docs/mod-author-guide.md](docs/mod-author-guide.md)
+- 仕様・ロードマップ: [specs/README.md](specs/README.md) / [specs/PLAN.md](specs/PLAN.md) / [specs/ROADMAP.md](specs/ROADMAP.md)
+- 設計原則・セキュリティ: [DESIGN.md](DESIGN.md) / [SECURITY.md](SECURITY.md) / [SECURITY_NOTES.md](SECURITY_NOTES.md)
+- ライセンス・出所・商標: [LICENSING.md](LICENSING.md) / [THIRD_PARTY.md](THIRD_PARTY.md) / [NOTICE](NOTICE) / [TRADEMARK.md](TRADEMARK.md)
 
-- **フラスタムカリング＋グラフオクルージョンカリング**（セクション視界グラフと方向単調 BFS — `client-port/src/cull.rs` / `visibility.rs` / `culler.rs`）
-- **方向別フェースバケッティング**（7方向バケットのバックフェースカリング — `client-port/src/mesh.rs`）
-- **マルチドローレンダリージョン**（8×4×8 セクション共有アリーナ — `client-port/src/region.rs`）
-- **階層的 LOD**（粗カラムサマリ — `client-port/src/lod.rs`）
-- **依存 DAG 並列スケジューリング**（`populate_parallel`）、**インクリメンタルライティング**（`src/lighting.rs`）、**パレット化ストレージ**（`src/paletted.rs`）
+## ライセンスとクリーンルーム方針
 
-**PolyForm Shield**（例: Sodium 0.6+）や **All Rights Reserved**（例: OptiFine）、その他いかなる第三者 Mod からも、**ソースコード・シェーダー・アセットを一切コピー・移植していません**。`MIT` / `Apache-2.0` / `BSD` / `MPL-2.0` / `LGPL-3.0-or-later` 系のコードとはライセンス互換ですが、PolyForm Shield や ARR のコードは GPL/LGPL/AGPL 系と互換でないため、参照・コピー・移植の対象から常時除外しています。歴史的経緯で `specs/client-fork/sodium-culling-architecture.md` というファイル名が残っていますが、リンク維持のための名前であり、中身は上記のクリーンルーム設計です。詳細な境界は [LICENSING.md](LICENSING.md) を参照してください。
+本プロジェクトのコードは **`LGPL-3.0-or-later`**（[COPYING.LESSER](COPYING.LESSER)・LGPLv3 付随の [LICENSE](LICENSE)・[NOTICE](NOTICE)・[LICENSING.md](LICENSING.md)）で配布されます。Fabric / NeoForge 互換レイヤ経由で実行時に読み込まれる独立した外部 Mod JAR は派生物とみなさず、コピーレフトは波及しません。
+
+すべての最適化サブシステムは標準的なコンピュータグラフィックス／システムアルゴリズムに基づく **100% クリーンルームのオリジナル Rust 実装** であり、Mojang の逆コンパイルコード・アセット・PolyForm Shield・All Rights Reserved のソースコードやシェーダーは一切コピー・同梱していません。寄稿は `LGPL-3.0-or-later` 提供と DCO（`git commit -s`）を前提とします。
