@@ -480,6 +480,121 @@ pub enum ExtendedSimdTier {
     Scalar,
 }
 
+/// CPU vendor recognized from `/proc/cpuinfo` implementer ids, x86
+/// `vendor_id` strings, or SoC brand strings such as "Snapdragon".
+/// `Unknown` means no classification evidence was found at all;
+/// `Other` means cpuinfo existed but matched no known vendor.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum CpuVendor {
+    /// Qualcomm — Kryo, Oryon (Snapdragon X Elite / X Plus) and every
+    /// mobile big.LITTLE part. ARM implementer `0x51`.
+    Qualcomm,
+    /// Arm Ltd itself — Neoverse server parts. Implementer `0x41`.
+    Arm,
+    /// Apple Silicon. Implementer `0x61` (and the only sane value on
+    /// macOS aarch64).
+    Apple,
+    /// Samsung Exynos. Implementer `0x53`.
+    Samsung,
+    /// NVIDIA. Implementer `0x4e`.
+    Nvidia,
+    /// Intel — x86 `vendor_id : GenuineIntel` or implementer `0x69`.
+    Intel,
+    /// AMD — x86 `vendor_id : AuthenticAMD`.
+    Amd,
+    /// A recognized cpuinfo blob whose vendor is not in the map.
+    Other,
+    /// No cpuinfo evidence at all (non-Linux hosts, restricted kernels).
+    Unknown,
+}
+
+/// ARM MIDR implementer code → vendor. Only codes with a stable,
+/// well-known owner are mapped; everything else degrades to `Other`.
+fn cpu_vendor_for_arm_implementer(code: u32) -> Option<CpuVendor> {
+    match code {
+        0x41 => Some(CpuVendor::Arm),
+        0x4e => Some(CpuVendor::Nvidia),
+        0x51 => Some(CpuVendor::Qualcomm),
+        0x53 => Some(CpuVendor::Samsung),
+        0x61 => Some(CpuVendor::Apple),
+        0x69 => Some(CpuVendor::Intel),
+        _ => None,
+    }
+}
+
+/// Classify a `/proc/cpuinfo` blob. Pure and total: empty input yields
+/// [`CpuVendor::Unknown`], unrecognized content yields [`CpuVendor::Other`].
+///
+/// Brand strings win over implementer ids — a Snapdragon X Elite reports
+/// both `CPU implementer : 0x51` and a "Snapdragon"/"Qualcomm" model
+/// string, and either alone is sufficient evidence.
+pub fn classify_cpu_vendor(cpuinfo: &str) -> CpuVendor {
+    if cpuinfo.trim().is_empty() {
+        return CpuVendor::Unknown;
+    }
+    let mut implementer: Option<u32> = None;
+    let mut vendor_id: Option<&str> = None;
+    let mut brand_qualcomm = false;
+    for line in cpuinfo.lines() {
+        let Some((key, value)) = line.split_once(':') else {
+            continue;
+        };
+        let key = key.trim();
+        let value = value.trim();
+        if key.eq_ignore_ascii_case("cpu implementer") {
+            implementer = implementer.or_else(|| {
+                u32::from_str_radix(value.trim_start_matches("0x").trim_start_matches("0X"), 16)
+                    .ok()
+            });
+        } else if key.eq_ignore_ascii_case("vendor_id") {
+            vendor_id = vendor_id.or(Some(value));
+        } else if matches!(
+            key.to_ascii_lowercase().as_str(),
+            "hardware" | "model name" | "processor" | "cpu"
+        ) {
+            let v = value.to_ascii_lowercase();
+            if v.contains("qualcomm") || v.contains("snapdragon") {
+                brand_qualcomm = true;
+            }
+        }
+    }
+    if brand_qualcomm {
+        return CpuVendor::Qualcomm;
+    }
+    if let Some(code) = implementer {
+        if let Some(vendor) = cpu_vendor_for_arm_implementer(code) {
+            return vendor;
+        }
+    }
+    if let Some(id) = vendor_id {
+        return match id {
+            "GenuineIntel" => CpuVendor::Intel,
+            "AuthenticAMD" => CpuVendor::Amd,
+            _ => CpuVendor::Other,
+        };
+    }
+    CpuVendor::Other
+}
+
+/// Probe the CPU vendor. Linux reads `/proc/cpuinfo`; macOS aarch64 is
+/// definitionally Apple; everything else degrades to `Unknown`.
+#[cfg(target_os = "linux")]
+fn detect_cpu_vendor() -> CpuVendor {
+    fs::read_to_string("/proc/cpuinfo")
+        .map(|text| classify_cpu_vendor(&text))
+        .unwrap_or(CpuVendor::Unknown)
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+fn detect_cpu_vendor() -> CpuVendor {
+    CpuVendor::Apple
+}
+
+#[cfg(not(any(target_os = "linux", all(target_os = "macos", target_arch = "aarch64"))))]
+fn detect_cpu_vendor() -> CpuVendor {
+    CpuVendor::Unknown
+}
+
 /// Independent, caller-overridable hardware hints. The legacy `base` retains
 /// its exact public representation and dispatch behavior.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -496,6 +611,9 @@ pub struct UniversalHardwareProfile {
     pub power_profile: PowerThermalProfile,
     pub storage_io: StorageIoClass,
     pub extended_simd: ExtendedSimdTier,
+    /// SoC vendor recognized from cpuinfo brand strings / ARM implementer
+    /// ids — [`CpuVendor::Qualcomm`] covers Kryo and Oryon (Snapdragon).
+    pub cpu_vendor: CpuVendor,
 }
 
 #[cfg(target_os = "linux")]
@@ -1003,6 +1121,7 @@ pub fn detect_universal_hardware_profile() -> UniversalHardwareProfile {
         power_profile,
         storage_io,
         extended_simd: detect_extended_simd(),
+        cpu_vendor: detect_cpu_vendor(),
     }
 }
 
@@ -1926,6 +2045,13 @@ const REVERSAL_DOT: f64 = -0.25;
 /// Entries must be *strictly* ahead of the motion vector.
 const FORWARD_CONE_MIN_COS: f64 = 0.25;
 
+/// Absolute queue bound: four maximal emission batches. One update can
+/// emit at most `(2·MAX_VIEW_DISTANCE + 1)²` candidates regardless of
+/// `max_speculative`, so this keeps retention bounded even when a caller
+/// passes `usize::MAX`.
+const MAX_QUEUE_ENTRIES: usize =
+    4 * (2 * MAX_VIEW_DISTANCE as usize + 1) * (2 * MAX_VIEW_DISTANCE as usize + 1);
+
 /// Lifecycle of one speculative chunk entry.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum SpeculativeState {
@@ -2120,8 +2246,13 @@ impl SpeculativeChunkPrefetcher {
             });
         }
 
-        // Bounded retention: never let stale entries outgrow four batches.
-        let cap = max_speculative.max(1).saturating_mul(4);
+        // Bounded retention: never let stale entries outgrow four batches,
+        // and never let a huge `max_speculative` turn the bound into
+        // `usize::MAX` — per-batch emission is capped by the cone size.
+        let cap = max_speculative
+            .max(1)
+            .saturating_mul(4)
+            .min(MAX_QUEUE_ENTRIES);
         while self.queue.len() > cap {
             self.queue.pop_front();
         }

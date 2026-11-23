@@ -604,13 +604,16 @@ impl RooflineModel {
     /// Pure and total — every profile yields a finite model.
     pub fn from_profile(profile: &UniversalHardwareProfile) -> Self {
         let cores = match profile.core_layout {
-            CoreHeterogeneity::Uniform { cores } => f64::from(cores.max(1)),
+            CoreHeterogeneity::Uniform { cores } => f64::from(cores),
             // E-cores count at half weight: they widen throughput but do
             // not set the achievable per-kernel compute ceiling.
             CoreHeterogeneity::Hybrid { p_cores, e_cores } => {
                 f64::from(p_cores) + 0.5 * f64::from(e_cores)
             }
-        };
+        }
+        // A degenerate `Hybrid { 0, 0 }` profile still yields a finite,
+        // nonzero compute ceiling instead of a zero peak / infinite ridge.
+        .max(1.0);
         let peak_gflops =
             cores * flops_per_cycle(profile.extended_simd) * clock_ghz(profile.power_profile);
         let bandwidth_gbs = bandwidth_gbs(profile.gpu_paradigm);

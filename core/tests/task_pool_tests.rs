@@ -7,9 +7,9 @@ use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
 use megu_core::hw_adaptive_engine::{
-    CacheDomainTopology, CoreHeterogeneity, ExtendedSimdTier, GpuComputeParadigm, HostHardwareCaps,
-    MemoryFootprintClass, MemoryTopology, PowerThermalProfile, SimdKernelTier, StorageIoClass,
-    UniversalHardwareProfile,
+    CacheDomainTopology, CoreHeterogeneity, CpuVendor, ExtendedSimdTier, GpuComputeParadigm,
+    HostHardwareCaps, MemoryFootprintClass, MemoryTopology, PowerThermalProfile, SimdKernelTier,
+    StorageIoClass, UniversalHardwareProfile,
 };
 use megu_core::task_pool::{MeguTaskPool, PoolTopologyConfig, TaskLane};
 
@@ -214,6 +214,7 @@ fn profile(logical_cores: u32, core_layout: CoreHeterogeneity) -> UniversalHardw
         power_profile: PowerThermalProfile::ServerHeadless,
         storage_io: StorageIoClass::SataSsd,
         extended_simd: ExtendedSimdTier::Scalar,
+        cpu_vendor: CpuVendor::Other,
     }
 }
 
@@ -319,4 +320,40 @@ fn task_pool_p5_two_core_lowspec_topology_never_overallocates_or_deadlocks() {
     results.sort_unstable();
     assert_eq!(results, vec![(3, 5); 4]);
     assert!(pool.tasks_executed() >= 4 + 4 * (3 + 5));
+}
+
+#[test]
+fn task_pool_snapdragon_big_little_and_uniform_oryon_topologies() {
+    // Snapdragon X Elite / X Plus class parts: Lane A pins to the P
+    // cluster (minus one core kept free for the caller) and Lane B soaks
+    // the E cluster — 12 logical cores never oversubscribe.
+    let hybrid = profile(
+        12,
+        CoreHeterogeneity::Hybrid {
+            p_cores: 4,
+            e_cores: 8,
+        },
+    );
+    assert_eq!(
+        PoolTopologyConfig::from_hardware_profile(&hybrid),
+        PoolTopologyConfig::new(3, 8)
+    );
+
+    // Uniform-capacity Oryon parts take the linear uniform scaling path.
+    let uniform = profile(12, CoreHeterogeneity::Uniform { cores: 12 });
+    assert_eq!(
+        PoolTopologyConfig::from_hardware_profile(&uniform),
+        PoolTopologyConfig::new(9, 3)
+    );
+
+    // A real pool built from the hybrid topology runs scoped work on
+    // both lanes without starving either.
+    let pool = MeguTaskPool::new(PoolTopologyConfig::from_hardware_profile(&hybrid));
+    assert_eq!(pool.interactive_threads(), 3);
+    assert_eq!(pool.background_threads(), 8);
+    let hits = Arc::new(AtomicUsize::new(0));
+    pool.par_for_each(TaskLane::Interactive, &[0u64; 64], |_, _| {
+        hits.fetch_add(1, Ordering::Relaxed);
+    });
+    assert_eq!(hits.load(Ordering::Relaxed), 64);
 }

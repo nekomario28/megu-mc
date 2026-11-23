@@ -412,6 +412,8 @@ pub enum GpuBackend {
     Intel,
     /// NVIDIA (PCI vendor `0x10de`).
     Nvidia,
+    /// Qualcomm — Adreno parts on Snapdragon SoCs (PCI vendor `0x5143`).
+    Qualcomm,
     /// Any other DRM device — virtio, simpledrm, unknown vendors.
     #[default]
     DrmOther,
@@ -445,6 +447,7 @@ pub fn gpu_backend_for_vendor(vendor_id: &str) -> GpuBackend {
         "1002" | "1022" => GpuBackend::Amd,
         "8086" => GpuBackend::Intel,
         "10de" => GpuBackend::Nvidia,
+        "5143" => GpuBackend::Qualcomm,
         _ => GpuBackend::DrmOther,
     }
 }
@@ -485,6 +488,7 @@ pub fn parse_drm_gpu_metrics(
         GpuBackend::Amd => "AMD",
         GpuBackend::Intel => "Intel",
         GpuBackend::Nvidia => "NVIDIA",
+        GpuBackend::Qualcomm => "Qualcomm",
         GpuBackend::DrmOther => {
             if driver.is_empty() {
                 "DRM"

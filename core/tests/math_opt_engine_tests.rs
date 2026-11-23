@@ -3,8 +3,8 @@
 //! `megu_core::math_opt_engine`'s four mathematical engines.
 
 use megu_core::hw_adaptive_engine::{
-    build_unified_optimization_plan, CacheDomainTopology, CoreHeterogeneity, ExtendedSimdTier,
-    GpuComputeParadigm, HostHardwareCaps, MemoryFootprintClass, MemoryTopology,
+    build_unified_optimization_plan, CacheDomainTopology, CoreHeterogeneity, CpuVendor,
+    ExtendedSimdTier, GpuComputeParadigm, HostHardwareCaps, MemoryFootprintClass, MemoryTopology,
     PowerThermalProfile, SimdKernelTier, StorageIoClass, UniversalHardwareProfile,
 };
 use megu_core::math_opt_engine::{
@@ -81,6 +81,7 @@ fn profile(
         power_profile,
         storage_io: StorageIoClass::NvmeFastRandom,
         extended_simd,
+        cpu_vendor: CpuVendor::Other,
     }
 }
 

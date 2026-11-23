@@ -2,14 +2,15 @@
 //! Unit, parity and live-host tests for `megu_core::hw_adaptive_engine`.
 
 use megu_core::hw_adaptive_engine::{
-    build_unified_optimization_plan, detect_host_hardware_caps, detect_universal_hardware_profile,
-    max_nibble_arrays_adaptive, max_nibble_arrays_tiered, select_compute_strategy,
-    CacheDomainTopology, CacheStrategy, ComputeKernelMode, ComputeStrategy, CoreAffinityHint,
-    CoreHeterogeneity, DomainKind, ExtendedSimdTier, GpuComputeParadigm, HostHardwareCaps,
-    KernelAutotuner, MemoryFootprintClass, MemoryTopology, MemoryTransferStrategy, PagePoolError,
-    PagedSectionPool, PowerThermalProfile, QuantizedVoxelVertex, SimdKernelTier,
-    SparseDirtyTileMask, SpeculativeChunkPrefetcher, SpeculativeState, StorageIoClass,
-    UniversalHardwareProfile, L3_LARGE_KIB, L3_MEDIUM_KIB, LIGHT_BUFFER_BYTES, PAGE_SIZE,
+    build_unified_optimization_plan, classify_cpu_vendor, detect_host_hardware_caps,
+    detect_universal_hardware_profile, max_nibble_arrays_adaptive, max_nibble_arrays_tiered,
+    select_compute_strategy, CacheDomainTopology, CacheStrategy, ComputeKernelMode,
+    ComputeStrategy, CoreAffinityHint, CoreHeterogeneity, CpuVendor, DomainKind, ExtendedSimdTier,
+    GpuComputeParadigm, HostHardwareCaps, KernelAutotuner, MemoryFootprintClass, MemoryTopology,
+    MemoryTransferStrategy, PagePoolError, PagedSectionPool, PowerThermalProfile,
+    QuantizedVoxelVertex, SimdKernelTier, SparseDirtyTileMask, SpeculativeChunkPrefetcher,
+    SpeculativeState, StorageIoClass, UniversalHardwareProfile, L3_LARGE_KIB, L3_MEDIUM_KIB,
+    LIGHT_BUFFER_BYTES, PAGE_SIZE,
 };
 
 /// Deterministic per-nibble reference implementation every optimized path
@@ -62,6 +63,7 @@ fn synthetic_desktop() -> UniversalHardwareProfile {
         power_profile: PowerThermalProfile::AcDesktop,
         storage_io: StorageIoClass::NvmeFastRandom,
         extended_simd: ExtendedSimdTier::Avx2,
+        cpu_vendor: CpuVendor::Amd,
     }
 }
 
@@ -1035,4 +1037,379 @@ fn fx6_shadow_procedural3d_and_vfx_domains_route_through_unified_plan() {
     assert!(shadow.worker_threads >= 1);
     assert!(p3d.worker_threads >= 1);
     assert!(vfx.worker_threads >= 1);
+}
+
+// ===========================================================================
+// Legacy low-spec & mobile-SoC profiles: Core 2 Duo, single core, Snapdragon
+// ===========================================================================
+
+const ALL_DOMAINS: [DomainKind; 9] = [
+    DomainKind::Worldgen,
+    DomainKind::Lighting,
+    DomainKind::Meshing,
+    DomainKind::PhysicsAndContraptions,
+    DomainKind::NetworkBroadcast,
+    DomainKind::SpatialAudio,
+    DomainKind::ShadowRendering,
+    DomainKind::Procedural3dAndBer,
+    DomainKind::VfxAndAtmosphere,
+];
+
+/// Exercise every public helper a low-spec host can reach: strategy
+/// resolution, domain fan-out, roofline classification, autotuner
+/// feedback and the packed-nibble kernels. Any panic, underflow or zero
+/// budget fails the test.
+fn assert_low_spec_plan_is_sane(plan: &megu_core::hw_adaptive_engine::UnifiedOptimizationPlan) {
+    assert!(plan.compute.workers.foreground_threads >= 1);
+    assert!(plan.compute.workers.background_threads >= 1);
+    assert!(
+        plan.compute.workers.foreground_threads + plan.compute.workers.background_threads
+            <= plan.profile.base.logical_cores.max(2)
+    );
+    for domain in ALL_DOMAINS {
+        let specialized = plan.for_domain(domain);
+        assert!(
+            specialized.worker_threads >= 1,
+            "{domain:?} got zero workers"
+        );
+        assert!(
+            specialized.worker_threads <= plan.profile.base.logical_cores.max(1),
+            "{domain:?} oversubscribed"
+        );
+        assert!(
+            specialized.pool_budget_pages > 0,
+            "{domain:?} zero pool budget"
+        );
+        assert!(specialized.tile_edge_chunks >= 1);
+    }
+    let roofline = plan.roofline_model();
+    assert!(roofline.peak_gflops.is_finite() && roofline.peak_gflops > 0.0);
+    assert!(roofline.bandwidth_gbs > 0.0);
+    let verdict = roofline.classify_kernel(8.0, 64.0);
+    assert!(verdict.attainable_gflops().is_finite());
+    let _ = roofline.recommended_strategy(8.0, 64.0);
+}
+
+#[test]
+fn core2duo_profiles_never_starve_panic_or_oversubscribe() {
+    // Core 2 Duo class: 2 logical cores, SSE2 only (no SSE4.2/POPCNT/AVX),
+    // 2–4 GiB RAM, spinning rust or a cheap SSD, typically a discrete GPU.
+    for total_ram_mib in [2048u64, 4096] {
+        for storage_io in [StorageIoClass::HddOrSlowSd, StorageIoClass::SataSsd] {
+            let mut duo = synthetic_desktop();
+            duo.base = caps(
+                2,
+                512, // tiny L2/L3 — FlashAttention-style recompute tier
+                false,
+                SimdKernelTier::Scalar, // SSE2-only part: scalar SWAR path
+                MemoryTopology::DiscreteVram,
+            );
+            duo.core_layout = CoreHeterogeneity::Uniform { cores: 2 };
+            duo.total_ram_mib = total_ram_mib;
+            duo.memory_class = MemoryFootprintClass::Constrained;
+            duo.gpu_paradigm = GpuComputeParadigm::DiscretePcieHighBw;
+            duo.power_profile = PowerThermalProfile::AcDesktop;
+            duo.storage_io = storage_io;
+            duo.extended_simd = ExtendedSimdTier::Scalar;
+            duo.cpu_vendor = CpuVendor::Intel;
+
+            // Legacy entry point: exactly one foreground + one background
+            // worker on two cores — never zero, never thrashing.
+            let strategy = select_compute_strategy(&duo.base);
+            assert_eq!(strategy.simd, SimdKernelTier::Scalar);
+            assert_eq!(strategy.workers.foreground_threads, 1);
+            assert_eq!(strategy.workers.background_threads, 1);
+            assert_eq!(strategy.cache, CacheStrategy::FlashRecomputeStream);
+            assert_eq!(strategy.chunk_batch_edge(), 1);
+
+            let plan = build_unified_optimization_plan(&duo, None);
+            // Constrained RAM forces the recompute kernel regardless of L3.
+            assert_eq!(plan.compute.cache, CacheStrategy::FlashRecomputeStream);
+            assert_eq!(plan.kernel_mode, ComputeKernelMode::RecomputeSwar);
+            assert_eq!(
+                plan.memory_transfer,
+                MemoryTransferStrategy::DiscreteStagedArena
+            );
+            assert_low_spec_plan_is_sane(&plan);
+
+            let worldgen = plan.for_domain(DomainKind::Worldgen);
+            assert_eq!(worldgen.pool_budget_pages, 256);
+            assert_eq!(worldgen.pool_budget_pages * PAGE_SIZE, 1024 * 1024);
+            assert_eq!(
+                worldgen.coalesce_background_bursts,
+                storage_io == StorageIoClass::HddOrSlowSd
+            );
+
+            // Scalar (SSE2-safe) kernel output is bit-exact vs reference.
+            let (a, b) = deterministic_buffers();
+            let reference = reference_nibble_max(&a, &b);
+            assert_eq!(
+                max_nibble_arrays_tiered(&a, &b, SimdKernelTier::Scalar, false),
+                reference
+            );
+            assert_eq!(max_nibble_arrays_adaptive(&a, &b, &strategy), reference);
+
+            // Autotuner feedback on the constrained tier cannot panic or
+            // produce a zero/invalid scale path.
+            let mut tuner = KernelAutotuner::new(plan.kernel_mode);
+            for i in 0..16u64 {
+                tuner.observe_sample(plan.kernel_mode, 1_000 + i);
+                tuner.observe_sample(
+                    match plan.kernel_mode {
+                        ComputeKernelMode::LutBatch => ComputeKernelMode::RecomputeSwar,
+                        ComputeKernelMode::RecomputeSwar => ComputeKernelMode::LutBatch,
+                    },
+                    900 + i,
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn single_core_low_ram_extreme_fallback_stays_positive() {
+    // Absolute floor: 1 core, 1 GiB, scalar-only, headless slow storage.
+    let mut tiny = synthetic_desktop();
+    tiny.base = caps(
+        1,
+        0,
+        false,
+        SimdKernelTier::Scalar,
+        MemoryTopology::UnifiedUma,
+    );
+    tiny.core_layout = CoreHeterogeneity::Uniform { cores: 1 };
+    tiny.total_ram_mib = 1024;
+    tiny.memory_class = MemoryFootprintClass::Constrained;
+    tiny.gpu_paradigm = GpuComputeParadigm::HeadlessNoGpu;
+    tiny.power_profile = PowerThermalProfile::ServerHeadless;
+    tiny.storage_io = StorageIoClass::HddOrSlowSd;
+    tiny.extended_simd = ExtendedSimdTier::Scalar;
+    tiny.cpu_vendor = CpuVendor::Other;
+
+    let strategy = select_compute_strategy(&tiny.base);
+    assert_eq!(strategy.workers.foreground_threads, 1);
+    assert!(strategy.workers.background_threads >= 1);
+
+    let plan = build_unified_optimization_plan(&tiny, None);
+    assert_low_spec_plan_is_sane(&plan);
+    for domain in ALL_DOMAINS {
+        assert_eq!(plan.for_domain(domain).worker_threads, 1);
+    }
+
+    // Every helper still answers on the degenerate profile.
+    let (a, b) = deterministic_buffers();
+    assert_eq!(
+        max_nibble_arrays_tiered(&a, &b, SimdKernelTier::Scalar, true),
+        reference_nibble_max(&a, &b)
+    );
+    let mut mask = SparseDirtyTileMask::empty();
+    mask.mark_block(3, 3, 3);
+    assert_eq!(mask.dirty_count(), 1);
+    let mut prefetcher = SpeculativeChunkPrefetcher::new();
+    assert!(
+        prefetcher
+            .update(0.0, 0.0, 1.0, 0.0, 4, 8, |_, _| false)
+            .len()
+            <= 8
+    );
+    let mut pool = PagedSectionPool::new();
+    let mut handle = pool.alloc_uniform(0x00);
+    assert!(pool.write_byte_cow(&mut handle, 0, 0x01).is_ok());
+    assert!(pool.release(&mut handle));
+}
+
+#[test]
+fn snapdragon_arm64_profiles_get_neon_uma_high_tier() {
+    // Snapdragon X Elite / X Plus class: 12 logical cores in a
+    // big.LITTLE-style cpu_capacity layout, 16–32 GiB LPDDR5X, Adreno
+    // tile-based GPU on unified memory, NVMe storage.
+    for total_ram_mib in [16 * 1024u64, 32 * 1024] {
+        let mut snap = synthetic_desktop();
+        snap.base = caps(
+            12,
+            16 * 1024, // shared L3 slice visible to cpu0
+            true,      // cpu_capacity marks P/E clusters
+            SimdKernelTier::Neon,
+            MemoryTopology::UnifiedUma,
+        );
+        snap.l2_per_core_kib = 1024;
+        snap.cache_line_bytes = 64;
+        snap.cache_domains = CacheDomainTopology::SingleSharedLlc;
+        snap.core_layout = CoreHeterogeneity::Hybrid {
+            p_cores: 4,
+            e_cores: 8,
+        };
+        snap.total_ram_mib = total_ram_mib;
+        snap.memory_class = MemoryFootprintClass::Abundant;
+        snap.gpu_paradigm = GpuComputeParadigm::TileBasedTbdr;
+        snap.power_profile = PowerThermalProfile::BatteryLaptop;
+        snap.storage_io = StorageIoClass::NvmeFastRandom;
+        snap.extended_simd = ExtendedSimdTier::Neon;
+        snap.cpu_vendor = CpuVendor::Qualcomm;
+
+        let strategy = select_compute_strategy(&snap.base);
+        assert_eq!(strategy.simd, SimdKernelTier::Neon);
+        // Hybrid 12-core part: half the cores soak background work.
+        assert_eq!(strategy.workers.foreground_threads, 6);
+        assert_eq!(strategy.workers.background_threads, 6);
+
+        let plan = build_unified_optimization_plan(&snap, None);
+        assert_eq!(plan.compute.simd, SimdKernelTier::Neon);
+        assert_eq!(
+            plan.memory_transfer,
+            MemoryTransferStrategy::UnifiedZeroCopy
+        );
+        // 16 MiB L3 → BalancedTile: LUT-resident, two-column batches.
+        assert_eq!(plan.compute.cache, CacheStrategy::BalancedTile);
+        assert_eq!(plan.compute.chunk_batch_edge(), 2);
+        assert_eq!(plan.kernel_mode, ComputeKernelMode::LutBatch);
+        assert_low_spec_plan_is_sane(&plan);
+
+        // Critical domains pin to the P-cluster, throughput domains to E.
+        let lighting = plan.for_domain(DomainKind::Lighting);
+        let worldgen = plan.for_domain(DomainKind::Worldgen);
+        assert_eq!(lighting.core_affinity, CoreAffinityHint::Performance);
+        assert_eq!(worldgen.core_affinity, CoreAffinityHint::Efficiency);
+        assert_eq!(lighting.worker_threads, 4);
+        assert_eq!(worldgen.worker_threads, 8);
+        assert!(!lighting.pin_to_primary_llc_domain);
+        assert!(worldgen.coalesce_background_bursts); // battery profile
+        assert!(lighting.use_lut_over_recompute);
+        assert_eq!(worldgen.pool_budget_pages, 8_192);
+
+        // NEON-tier kernel output is bit-exact vs the scalar reference.
+        let (a, b) = deterministic_buffers();
+        let reference = reference_nibble_max(&a, &b);
+        assert_eq!(
+            max_nibble_arrays_tiered(&a, &b, SimdKernelTier::Neon, false),
+            reference
+        );
+        assert_eq!(
+            max_nibble_arrays_tiered(&a, &b, SimdKernelTier::Neon, true),
+            reference
+        );
+        assert_eq!(max_nibble_arrays_adaptive(&a, &b, &strategy), reference);
+
+        // Roofline model is finite and compute-positive on ARM64 NEON.
+        let roofline = plan.roofline_model();
+        assert!(roofline.peak_gflops > 0.0 && roofline.peak_gflops.is_finite());
+        assert!(roofline.ridge_intensity.is_finite() && roofline.ridge_intensity > 0.0);
+    }
+}
+
+#[test]
+fn snapdragon_uniform_oryon_layout_still_scales() {
+    // Some Snapdragon parts expose a uniform cpu_capacity — the plan must
+    // not depend on big.LITTLE being detected.
+    let mut snap = synthetic_desktop();
+    snap.base = caps(
+        12,
+        8 * 1024,
+        false,
+        SimdKernelTier::Neon,
+        MemoryTopology::UnifiedUma,
+    );
+    snap.core_layout = CoreHeterogeneity::Uniform { cores: 12 };
+    snap.total_ram_mib = 16 * 1024;
+    snap.memory_class = MemoryFootprintClass::Abundant;
+    snap.gpu_paradigm = GpuComputeParadigm::TileBasedTbdr;
+    snap.storage_io = StorageIoClass::NvmeFastRandom;
+    snap.extended_simd = ExtendedSimdTier::Neon;
+    snap.cpu_vendor = CpuVendor::Qualcomm;
+
+    let strategy = select_compute_strategy(&snap.base);
+    // Uniform 12 cores: a quarter to background.
+    assert_eq!(strategy.workers.background_threads, 3);
+    assert_eq!(strategy.workers.foreground_threads, 9);
+    let plan = build_unified_optimization_plan(&snap, None);
+    assert_eq!(plan.for_domain(DomainKind::Lighting).worker_threads, 9);
+    assert_eq!(plan.for_domain(DomainKind::Worldgen).worker_threads, 3);
+    assert_low_spec_plan_is_sane(&plan);
+}
+
+#[test]
+fn cpu_vendor_classification_recognizes_snapdragon_and_falls_back() {
+    // Empty / unreadable cpuinfo.
+    assert_eq!(classify_cpu_vendor(""), CpuVendor::Unknown);
+    assert_eq!(classify_cpu_vendor("   \n\t\n"), CpuVendor::Unknown);
+
+    // Snapdragon X Elite / X Plus: implementer 0x51 alone is enough.
+    assert_eq!(
+        classify_cpu_vendor("processor\t: 0\nCPU implementer\t: 0x51\nCPU part\t: 0x001\n"),
+        CpuVendor::Qualcomm
+    );
+    // Brand strings alone are also sufficient (Kryo/Oryon marketing names).
+    assert_eq!(
+        classify_cpu_vendor("Hardware\t: Qualcomm Technologies, Inc. SM8550\n"),
+        CpuVendor::Qualcomm
+    );
+    assert_eq!(
+        classify_cpu_vendor("model name\t: Snapdragon X Elite\n"),
+        CpuVendor::Qualcomm
+    );
+    assert_eq!(
+        classify_cpu_vendor("Processor\t: Qualcomm Kryo 485 Gold\n"),
+        CpuVendor::Qualcomm
+    );
+
+    // Other ARM implementers.
+    assert_eq!(
+        classify_cpu_vendor("CPU implementer\t: 0x41\n"),
+        CpuVendor::Arm
+    );
+    assert_eq!(
+        classify_cpu_vendor("CPU implementer\t: 0x61\n"),
+        CpuVendor::Apple
+    );
+    assert_eq!(
+        classify_cpu_vendor("CPU implementer\t: 0x53\n"),
+        CpuVendor::Samsung
+    );
+    assert_eq!(
+        classify_cpu_vendor("CPU implementer\t: 0x4e\n"),
+        CpuVendor::Nvidia
+    );
+
+    // x86 vendor_id strings.
+    assert_eq!(
+        classify_cpu_vendor("vendor_id\t: GenuineIntel\nmodel name\t: Intel Core2 Duo\n"),
+        CpuVendor::Intel
+    );
+    assert_eq!(
+        classify_cpu_vendor("vendor_id\t: AuthenticAMD\n"),
+        CpuVendor::Amd
+    );
+
+    // Unrecognized but non-empty cpuinfo degrades to Other, never panics.
+    assert_eq!(
+        classify_cpu_vendor("garbage with no colons"),
+        CpuVendor::Other
+    );
+    assert_eq!(
+        classify_cpu_vendor("CPU implementer\t: 0xc0\n"),
+        CpuVendor::Other
+    );
+    assert_eq!(
+        classify_cpu_vendor("vendor_id\t: SomethingElse\n"),
+        CpuVendor::Other
+    );
+}
+
+#[test]
+fn prefetch_queue_stays_bounded_when_speculative_cap_is_huge() {
+    // `usize::MAX` as the per-batch cap must not turn the four-batch
+    // retention bound into usize::MAX: the queue is clamped by the
+    // maximum forward-cone size instead.
+    let mut p = SpeculativeChunkPrefetcher::new();
+    for i in 0..64u32 {
+        // Alternating headings force a generation bump each update, so
+        // stale entries pile up exactly like a zig-zagging player.
+        let dir = if i % 2 == 0 { 1.0 } else { -1.0 };
+        p.update(0.0, 0.0, dir, 0.0, 32, usize::MAX, |_, _| false);
+    }
+    let queued = p.entries().count();
+    // 4 batches x (2*32+1)^2 cone cells = 16_900 hard ceiling.
+    assert!(queued <= 16_900, "queue grew to {queued}");
+    // Pending entries still resolve correctly after the clamp.
+    assert!(p.pending_count() <= queued);
 }

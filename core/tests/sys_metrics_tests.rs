@@ -220,6 +220,7 @@ fn gpu_backend_maps_pci_vendors() {
     assert_eq!(gpu_backend_for_vendor("0x1002"), GpuBackend::Amd);
     assert_eq!(gpu_backend_for_vendor("0x8086"), GpuBackend::Intel);
     assert_eq!(gpu_backend_for_vendor("0x10de"), GpuBackend::Nvidia);
+    assert_eq!(gpu_backend_for_vendor("0x5143"), GpuBackend::Qualcomm);
     assert_eq!(gpu_backend_for_vendor("0x1af4"), GpuBackend::DrmOther);
     assert_eq!(gpu_backend_for_vendor(""), GpuBackend::DrmOther);
 }
