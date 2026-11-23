@@ -3217,9 +3217,17 @@ struct GpuIndirectBuffers {
     /// pack diffs against, so steady frames upload zero bytes and a
     /// changed residency uploads only the coalesced dirty spans.
     record_shadow: Vec<SectionGpuRecord>,
+    /// Cached pack key & runs so steady frames skip region sorting, per-region
+    /// slot Vec allocs, repacking, and shadow diffing completely.
+    packed_world_revision: u64,
+    packed_camera_section: [i32; 3],
+    packed_morton: bool,
+    cached_runs: Vec<GpuIndirectRun>,
+    cached_count: u32,
 }
 
 /// One region's contiguous run inside the frame's indirect args buffer.
+#[derive(Clone, Copy)]
 struct GpuIndirectRun {
     /// `region_arenas` key — picks the vertex buffer and bind group.
     origin: [i32; 3],
@@ -6543,6 +6551,7 @@ impl GpuRenderer {
         let slab = self.transfer_budget.arena_slab_bytes as usize;
         // One encoder spans every staged copy below: slots used by an
         // unsubmitted copy stay out of rotation until the submit.
+        let mut any_partial = false;
         self.staging_ring.begin_batch();
         for arena in self.region_arenas.values_mut() {
             let (partial, buffers_replaced) = arena.flush_gpu(
@@ -6554,6 +6563,7 @@ impl GpuRenderer {
                 slab,
             );
             self.region_partial_uploads += u64::from(partial);
+            any_partial |= partial > 0;
             replaced |= buffers_replaced;
         }
         self.ctx.queue.submit([encoder.finish()]);
@@ -6576,10 +6586,10 @@ impl GpuRenderer {
         if self.ensure_shared_quad_index_capacity() {
             replaced = true;
         }
-        if replaced {
-            // The recorded opaque-terrain bundle still references the
-            // retired buffers — the cull revision is the bundle key's
-            // residency term, so bumping it forces a re-record.
+        if replaced || any_partial {
+            // Either a retired arena buffer was replaced or a pending slot
+            // finished staging onto the GPU — bump the residency revision so
+            // render bundles and the GPU-indirect pack cache observe it.
             self.cull_world_revision += 1;
         }
     }
@@ -7160,6 +7170,11 @@ impl GpuRenderer {
             // A fresh (empty) shadow diffs fully dirty, so a
             // grow-realloc uploads the whole record pack in one span.
             record_shadow: Vec::new(),
+            packed_world_revision: u64::MAX,
+            packed_camera_section: [i32::MIN; 3],
+            packed_morton: false,
+            cached_runs: Vec::new(),
+            cached_count: 0,
         });
     }
 
@@ -7184,6 +7199,82 @@ impl GpuRenderer {
             return None;
         }
         let edge = EDGE as f32;
+        let cam_section = [
+            (camera_position[0] / edge).floor() as i32,
+            (camera_position[1] / edge).floor() as i32,
+            (camera_position[2] / edge).floor() as i32,
+        ];
+        // Steady-residency fast path: when neither arena residency nor camera
+        // section nor sort policy changed, reuse the already-uploaded GPU
+        // `SectionGpuRecord` buffer & runs directly — 0 Vec allocs, 0 sorts,
+        // 0 record-shadow memcmp, and 0 `sections` write_buffer bytes!
+        let fast_hit = self.gpu_indirect.as_ref().is_some_and(|b| {
+            b.cached_count > 0
+                && b.packed_world_revision == self.cull_world_revision
+                && b.packed_camera_section == cam_section
+                && b.packed_morton == self.morton_order_enabled
+        });
+        if fast_hit {
+            let count = self.gpu_indirect.as_ref().expect("fast hit").cached_count;
+            let occlusion_armed = self
+                .gpu_hiz
+                .as_ref()
+                .is_some_and(|hiz| hiz.pyramid_ready())
+                && self.gpu_hiz_frame_vp == Some(*view_proj);
+            let (depth_w, depth_h) = self.depth_size;
+            let (hiz_w, hiz_h, mip_count) = {
+                let culler = self.gpu_hiz_culler(depth_w, depth_h);
+                (
+                    culler.resolution().0,
+                    culler.resolution().1,
+                    culler.mip_count(),
+                )
+            };
+            let uniforms = CullUniforms {
+                view_proj: *view_proj,
+                planes: frustum_planes_from_view_proj(view_proj),
+                camera_pos: [
+                    camera_position[0],
+                    camera_position[1],
+                    camera_position[2],
+                    0.0,
+                ],
+                params: [
+                    hiz_w as f32,
+                    hiz_h as f32,
+                    if occlusion_armed {
+                        mip_count as f32
+                    } else {
+                        0.0
+                    },
+                    count as f32,
+                ],
+            };
+            let buffers = self.gpu_indirect.as_mut().expect("fast hit");
+            self.ctx
+                .queue
+                .write_buffer(&buffers.uniforms, 0, bytemuck::bytes_of(&uniforms));
+            self.ctx
+                .queue
+                .write_buffer(&buffers.stats, 0, bytemuck::bytes_of(&CullStats::default()));
+            self.gpu_indirect_record_uploads_skipped += 1;
+            let culler = self.gpu_hiz.as_mut().expect("created above");
+            culler.cull_sections_into_indirect_buffer(
+                &self.ctx.device,
+                encoder,
+                &buffers.uniforms,
+                &buffers.sections,
+                &buffers.args,
+                &buffers.stats,
+                &buffers.masks,
+                count,
+            );
+            self.gpu_indirect_sections_submitted += u64::from(count);
+            return Some(GpuIndirectFrame {
+                args: buffers.args.clone(),
+                runs: buffers.cached_runs.clone(),
+            });
+        }
         // Retained scratch: `mem::take` moves the capacity out of `self`
         // for the duration of the pack (the loops below borrow
         // `self.region_arenas` immutably) and the tail of the function
@@ -7217,6 +7308,10 @@ impl GpuRenderer {
                 slots.sort_by_key(|&(coord, _)| {
                     opaque_section_sort_key(coord, camera_position)
                 });
+            } else {
+                // Deterministic Morton order avoids spurious HashMap-order
+                // diffs when `morton_order_enabled` is off.
+                slots.sort_by_key(|&(coord, _)| section_morton_key(coord));
             }
             let first = records.len() as u32;
             for (coord, slot) in slots {
@@ -7318,6 +7413,12 @@ impl GpuRenderer {
             count,
         );
         self.gpu_indirect_sections_submitted += u64::from(count);
+        let buffers = self.gpu_indirect.as_mut().expect("capacity ensured");
+        buffers.packed_world_revision = self.cull_world_revision;
+        buffers.packed_camera_section = cam_section;
+        buffers.packed_morton = self.morton_order_enabled;
+        buffers.cached_runs.clone_from(&runs);
+        buffers.cached_count = count;
         self.gpu_indirect_record_scratch = records;
         self.gpu_indirect_coord_scratch = record_coords;
         self.gpu_indirect_origin_scratch = origins;
