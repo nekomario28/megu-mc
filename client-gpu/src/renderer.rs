@@ -4027,7 +4027,7 @@ impl ShadowGpu {
         let billboard_color = composite.billboard.as_ref().map(|_| {
             color_pipeline(
                 "shadowed-billboard",
-                &lit_layout,
+                lit_layout,
                 &lit_module,
                 "billboard_vs",
                 "lit_fs",

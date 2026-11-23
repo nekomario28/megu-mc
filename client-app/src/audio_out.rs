@@ -58,6 +58,12 @@ pub trait AudioSink: Send {
     fn push(&mut self, pcm: &[i16]) -> Result<(), String>;
     /// Short backend label for diagnostics (`"pipewire"`, `"wav"`, ...).
     fn label(&self) -> &'static str;
+    /// Whether missed mix deadlines can starve a time-sensitive output.
+    /// Buffered native audio backends use the default; sinks that discard or
+    /// persist samples can opt out of device-underrun accounting.
+    fn requires_realtime_cadence(&self) -> bool {
+        true
+    }
     /// Finalize output (patch WAV headers, close the child stdin and reap).
     /// Idempotent; also invoked from `Drop`.
     fn finish(&mut self) {}
@@ -271,6 +277,9 @@ impl AudioSink for NullSink {
     }
     fn label(&self) -> &'static str {
         "null"
+    }
+    fn requires_realtime_cadence(&self) -> bool {
+        false
     }
 }
 
@@ -2916,6 +2925,10 @@ impl AudioMixCore {
         }
     }
 
+    fn requires_realtime_cadence(&self) -> bool {
+        self.sink.requires_realtime_cadence()
+    }
+
     /// Drain pending ring commands, mix exactly one 128-frame block
     /// (2D bypass + 3D spatialized voices + shared FDN tail + limiter),
     /// and write it to the sink. Deterministic — no clock reads — so unit
@@ -3314,7 +3327,7 @@ impl AudioMixThread {
             let now = Instant::now();
             let starved = (now.saturating_duration_since(next_due).as_nanos()
                 / period_nanos) as u64;
-            if starved > UNDERRUN_GRACE_BLOCKS {
+            if core.requires_realtime_cadence() && starved > UNDERRUN_GRACE_BLOCKS {
                 telemetry
                     .underruns
                     .fetch_add(starved - UNDERRUN_GRACE_BLOCKS, Ordering::Relaxed);

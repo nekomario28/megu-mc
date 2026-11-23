@@ -73,7 +73,10 @@ fn corrupt_or_unsafe_server_lists_fail_closed() {
         .expect("write malformed fixture");
     assert!(ServerListStore::load(&dir.0).is_err());
 
-    assert!(ServerListStore::load(dir.0.join(".."))
+    // Preserve the raw traversal spelling. On Windows, PathBuf::join("..")
+    // can normalize it away when the temp path uses the `\\?\` prefix.
+    let traversal = PathBuf::from(format!("{}\\..", dir.0.display()));
+    assert!(ServerListStore::load(traversal)
         .expect_err("parent traversal must be rejected")
         .contains("parent traversal"));
 

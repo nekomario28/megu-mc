@@ -179,6 +179,19 @@ fn validate_text(label: &str, value: &str, max_bytes: usize) -> Result<(), Strin
 }
 
 fn validate_path_components(path: &Path) -> Result<(), String> {
+    // `Path::components` follows the host platform's path grammar. In
+    // particular, Windows verbatim paths (`\\\\?\\C:\\...`) can be
+    // normalized by PathBuf operations before components are exposed. Scan
+    // the original spelling with both separator forms first so traversal is
+    // rejected consistently for native and verbatim paths.
+    if path
+        .as_os_str()
+        .to_string_lossy()
+        .split(['/', '\\'])
+        .any(|component| component == "..")
+    {
+        return Err("game directory path cannot contain parent traversal".into());
+    }
     for component in path.components() {
         if matches!(component, Component::ParentDir) {
             return Err("game directory path cannot contain parent traversal".into());
@@ -393,4 +406,27 @@ fn atomic_write(path: &Path, bytes: &[u8]) -> Result<(), String> {
         let _ = directory.sync_all();
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod path_validation_tests {
+    use super::validate_path_components;
+    use std::path::Path;
+
+    #[test]
+    fn parent_traversal_is_rejected_for_native_and_windows_verbatim_spellings() {
+        for path in [
+            "safe/../outside",
+            r"safe\..\outside",
+            r"\\?\C:\safe\..\outside",
+            r"\\?\UNC\server\share\safe\..\outside",
+        ] {
+            assert!(
+                validate_path_components(Path::new(path))
+                    .expect_err("parent traversal must fail closed")
+                    .contains("parent traversal"),
+                "accepted traversal path {path:?}"
+            );
+        }
+    }
 }
