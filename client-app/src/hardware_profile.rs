@@ -6,13 +6,15 @@
 //!
 //! * Pure parsers — [`parse_meminfo_total_kib`], [`parse_cache_size_kib`],
 //!   [`parse_pci_id`], [`parse_sysctl_memsize_mib`],
-//!   [`parse_sysctl_l3_cache_kib`], [`classify_macos_cpu_brand`], and
+//!   [`parse_sysctl_l3_cache_kib`], [`classify_macos_cpu_brand`],
+//!   [`classify_linux_drm_uevent`], and
 //!   [`classify_gpu`] turn `/proc` + `/sys` + `sysctl` text into
 //!   typed values. They never read files themselves.
 //! * [`probe_host_hardware`] — a read-only host probe that feeds those
 //!   parsers from `/proc/meminfo`,
 //!   `/sys/devices/system/cpu/cpu0/cache/index*/{level,size}`, and
-//!   `/sys/class/drm/card*/device/{vendor,device}` on Linux, from
+//!   `/sys/class/drm/card*/device/{vendor,device}` (with a `uevent`
+//!   fallback for ARM64 platform GPUs that carry no PCI ids) on Linux, from
 //!   `sysctl -n hw.memsize` / `hw.l3cachesize` /
 //!   `machdep.cpu.brand_string` on macOS, and from the Win32
 //!   `GlobalMemoryStatusEx` kernel32 call on Windows. On hosts with no
@@ -43,6 +45,16 @@ pub const PCI_VENDOR_AMD: u16 = 0x1002;
 pub const PCI_VENDOR_INTEL: u16 = 0x8086;
 /// Microsoft Basic Display Adapter / software display device.
 pub const PCI_VENDOR_MICROSOFT: u16 = 0x1414;
+/// Qualcomm PCI vendor id (`PCI\VEN_5143`). Windows ARM64 Snapdragon
+/// laptops more often report `ACPI\VEN_QCOM` (or the `4D4F4351`
+/// little-endian "QCOM" encoding); both fold onto this id.
+pub const PCI_VENDOR_QUALCOMM: u16 = 0x5143;
+/// ARM Ltd. PCI vendor id (PCIe-attached Mali; platform Mali is detected
+/// through the DRM uevent instead).
+pub const PCI_VENDOR_ARM: u16 = 0x13b5;
+/// Broadcom PCI vendor id (Raspberry Pi VideoCore reports as a platform
+/// device, but keep the PCI id mapped for completeness).
+pub const PCI_VENDOR_BROADCOM: u16 = 0x14e4;
 
 /// Coarse GPU class the auto-tuner reasons about. Finer distinctions
 /// (exact model, driver) deliberately stay out of scope — only what the
@@ -66,6 +78,17 @@ pub enum GpuVendorClass {
     AmdDedicated,
     /// Apple Silicon unified-memory GPU (probe fallback on macOS).
     AppleSilicon,
+    /// Qualcomm Snapdragon Adreno tile-based GPU — Windows ARM64
+    /// (`ACPI\VEN_QCOM` / `PCI\VEN_5143`, Snapdragon X Elite/Plus/8cx)
+    /// and Linux ARM64 (`DRIVER=msm` / `qcom,adreno` compatible,
+    /// Freedreno/Turnip).
+    QualcommAdreno,
+    /// ARM Mali tile-based GPU on a Linux platform device
+    /// (`DRIVER=panfrost`/`panthor`, `arm,mali` compatible).
+    ArmMali,
+    /// Broadcom VideoCore tile-based GPU (Raspberry Pi `DRIVER=v3d`/`vc4`,
+    /// `brcm,*-v3d`/`vc4` compatible).
+    BroadcomVideocore,
     /// A GPU device exists but its vendor id is unrecognized.
     #[default]
     Unknown,
@@ -227,13 +250,20 @@ pub fn parse_windows_display_device_id(device_id: &str, device_string: &str) -> 
     let mut vendor_id = None;
     let mut device_id_value = None;
     for component in device_id.split(['&', '\\', '#']) {
-        if let Some(value) = component
+        if let Some(rest) = component
             .get(..4)
             .filter(|prefix| prefix.eq_ignore_ascii_case("VEN_"))
             .and_then(|_| component.get(4..))
-            .and_then(|hex| u16::from_str_radix(hex, 16).ok())
         {
-            vendor_id = Some(value);
+            // Snapdragon Windows ARM64 devices report ACPI ids rather
+            // than PCI: `VEN_QCOM` and the `4D4F4351` little-endian
+            // "QCOM" encoding are not 16-bit hex, so map them onto
+            // Qualcomm's real PCI vendor id explicitly.
+            if rest.eq_ignore_ascii_case("qcom") || rest.eq_ignore_ascii_case("4d4f4351") {
+                vendor_id = Some(PCI_VENDOR_QUALCOMM);
+            } else if let Ok(value) = u16::from_str_radix(rest, 16) {
+                vendor_id = Some(value);
+            }
         }
         if let Some(value) = component
             .get(..4)
@@ -242,6 +272,17 @@ pub fn parse_windows_display_device_id(device_id: &str, device_string: &str) -> 
             .and_then(|hex| u16::from_str_radix(hex, 16).ok())
         {
             device_id_value = Some(value);
+        }
+        // Compact ACPI PNP id form (`ACPI\QCOM0D0A`): vendor prefix plus
+        // a 4-hex-digit device part, no `VEN_`/`DEV_` separators.
+        if let Some(dev) = component
+            .get(..4)
+            .filter(|prefix| prefix.eq_ignore_ascii_case("QCOM"))
+            .and_then(|_| component.get(4..))
+            .and_then(|hex| u16::from_str_radix(hex, 16).ok())
+        {
+            vendor_id = Some(PCI_VENDOR_QUALCOMM);
+            device_id_value = Some(dev);
         }
     }
     if let Some(vendor) = vendor_id {
@@ -256,6 +297,8 @@ pub fn parse_windows_display_device_id(device_id: &str, device_string: &str) -> 
         PCI_VENDOR_AMD
     } else if name.contains("intel") {
         PCI_VENDOR_INTEL
+    } else if name.contains("qualcomm") || name.contains("adreno") || name.contains("snapdragon") {
+        PCI_VENDOR_QUALCOMM
     } else {
         return None;
     };
@@ -312,6 +355,9 @@ pub fn classify_gpu(vendor_id: Option<u16>, device_id: Option<u16>) -> GpuVendor
         Some(PCI_VENDOR_MICROSOFT) => GpuVendorClass::NoneSoftware,
         Some(PCI_VENDOR_NVIDIA) => GpuVendorClass::NvidiaDedicated,
         Some(PCI_VENDOR_AMD) => GpuVendorClass::AmdDedicated,
+        Some(PCI_VENDOR_QUALCOMM) => GpuVendorClass::QualcommAdreno,
+        Some(PCI_VENDOR_ARM) => GpuVendorClass::ArmMali,
+        Some(PCI_VENDOR_BROADCOM) => GpuVendorClass::BroadcomVideocore,
         Some(PCI_VENDOR_INTEL) => device_id
             .map(classify_intel_device)
             // A vendor id with no device file still means an Intel GPU;
@@ -347,6 +393,45 @@ pub fn classify_intel_device(device_id: u16) -> GpuVendorClass {
     }
 }
 
+/// Classify a Linux DRM device's `uevent` file when the PCI
+/// `vendor`/`device` ids are absent — the common case on ARM64
+/// DeviceTree laptops and SBCs, where the GPU is a platform device.
+/// Recognizes Qualcomm Adreno (`DRIVER=msm`, `qcom,adreno` DeviceTree
+/// compatibles/modaliases — Freedreno/Turnip on Snapdragon laptops),
+/// ARM Mali (`DRIVER=panfrost`/`panthor`, `arm,mali` compatibles), and
+/// Raspberry Pi VideoCore (`DRIVER=v3d`/`vc4`, `brcm,*-v3d`/`vc4`
+/// compatibles). Returns [`GpuVendorClass::Unknown`] when no marker
+/// matches.
+pub fn classify_linux_drm_uevent(uevent: &str) -> GpuVendorClass {
+    for line in uevent.to_ascii_lowercase().lines() {
+        let Some((key, value)) = line.split_once('=') else {
+            continue;
+        };
+        match key.trim() {
+            "driver" => match value.trim() {
+                "msm" | "msm_drm" => return GpuVendorClass::QualcommAdreno,
+                "panfrost" | "panthor" => return GpuVendorClass::ArmMali,
+                "v3d" | "vc4" => return GpuVendorClass::BroadcomVideocore,
+                _ => {}
+            },
+            _ => {
+                // OF_COMPATIBLE_*/OF_*/MODALIAS lines carry
+                // `vendor,device` tokens like `qcom,adreno-740.0`.
+                if value.contains("qcom,adreno") {
+                    return GpuVendorClass::QualcommAdreno;
+                }
+                if value.contains("arm,mali") {
+                    return GpuVendorClass::ArmMali;
+                }
+                if value.contains("brcm,") && (value.contains("v3d") || value.contains("vc4")) {
+                    return GpuVendorClass::BroadcomVideocore;
+                }
+            }
+        }
+    }
+    GpuVendorClass::Unknown
+}
+
 /// Selection rank used when a host exposes several DRM cards: dedicated
 /// silicon wins over integrated so hybrid laptops tune for the fast GPU.
 fn gpu_class_rank(class: GpuVendorClass) -> u8 {
@@ -354,9 +439,11 @@ fn gpu_class_rank(class: GpuVendorClass) -> u8 {
         GpuVendorClass::NvidiaDedicated
         | GpuVendorClass::AmdDedicated
         | GpuVendorClass::IntelArc => 4,
-        GpuVendorClass::AppleSilicon => 3,
-        GpuVendorClass::IntelModernIntegrated | GpuVendorClass::Unknown => 2,
-        GpuVendorClass::IntelLegacyIntegrated => 1,
+        GpuVendorClass::AppleSilicon | GpuVendorClass::QualcommAdreno => 3,
+        GpuVendorClass::IntelModernIntegrated
+        | GpuVendorClass::ArmMali
+        | GpuVendorClass::Unknown => 2,
+        GpuVendorClass::IntelLegacyIntegrated | GpuVendorClass::BroadcomVideocore => 1,
         GpuVendorClass::NoneSoftware => 0,
     }
 }
@@ -382,6 +469,9 @@ pub fn probe_host_hardware() -> HostHardwareProfile {
         GpuVendorClass::IntelLegacyIntegrated
             | GpuVendorClass::IntelModernIntegrated
             | GpuVendorClass::AppleSilicon
+            | GpuVendorClass::QualcommAdreno
+            | GpuVendorClass::ArmMali
+            | GpuVendorClass::BroadcomVideocore
     );
     // Integrated/unified GPUs have no real VRAM counter; estimate the
     // carve conservatively at a quarter of RAM capped at 4 GiB.
@@ -554,7 +644,18 @@ fn probe_gpu() -> (GpuVendorClass, u32) {
             let device = std::fs::read_to_string(device_dir.join("device"))
                 .ok()
                 .and_then(|s| parse_pci_id(&s));
-            let candidate = classify_gpu(vendor, device);
+            let mut candidate = classify_gpu(vendor, device);
+            if matches!(candidate, GpuVendorClass::Unknown) {
+                // ARM64 platform/DT GPUs (Snapdragon `msm`, Mali, Pi
+                // VideoCore) carry no PCI id files; the uevent's
+                // DRIVER=/OF_COMPATIBLE_*/MODALIAS lines name them.
+                if let Ok(uevent) = std::fs::read_to_string(device_dir.join("uevent")) {
+                    let from_uevent = classify_linux_drm_uevent(&uevent);
+                    if !matches!(from_uevent, GpuVendorClass::Unknown) {
+                        candidate = from_uevent;
+                    }
+                }
+            }
             if class.is_none()
                 || class.is_some_and(|best| gpu_class_rank(candidate) > gpu_class_rank(best))
             {
@@ -694,7 +795,10 @@ fn recommend_chunk_cache_mib(hw: &HostHardwareProfile) -> u32 {
 /// (pure wgpu Vulkan 1.1 / DX12 / Metal core); NVIDIA/AMD/Intel Arc run `Auto` so
 /// capability negotiation can reach the mesh-shader pipeline;
 /// Apple Silicon takes `ComputeIndirect` (no `VK_EXT_mesh_shader` on
-/// Metal-class hardware). Everything else negotiates `Auto`.
+/// Metal-class hardware). Snapdragon Adreno, ARM Mali, and VideoCore are
+/// real tile-based GPUs — `Auto` lets them negotiate DX12 on Windows
+/// ARM64 or Vulkan (Turnip/panvk/v3dv) on Linux ARM64 rather than being
+/// throttled onto the software path. Everything else negotiates `Auto`.
 ///
 /// Budgets stay lean on low-spec/no-GPU hardware, widen on X3D-class
 /// machines (32+ GiB RAM, 32+ MiB L3, dedicated GPU), and always clamp
@@ -718,8 +822,13 @@ pub fn recommend_tuning(hw: &HostHardwareProfile) -> HardwareTuningPlan {
     let (mut view_distance, mut lod_radius_chunks, mut max_rebuilds_per_frame) = match hw.gpu_class
     {
         GpuVendorClass::NoneSoftware => (6u8, 0u16, 2u8),
-        GpuVendorClass::IntelLegacyIntegrated => (8, 32, 2),
-        GpuVendorClass::IntelModernIntegrated | GpuVendorClass::Unknown => (10, 48, 4),
+        GpuVendorClass::IntelLegacyIntegrated | GpuVendorClass::BroadcomVideocore => (8, 32, 2),
+        GpuVendorClass::IntelModernIntegrated
+        | GpuVendorClass::ArmMali
+        | GpuVendorClass::Unknown => (10, 48, 4),
+        // Snapdragon Adreno (X1-85/X1-45/7xx/6xx) is a strong tile-based
+        // iGPU: a notch below Apple Silicon, well above legacy parts.
+        GpuVendorClass::QualcommAdreno => (14, 64, 6),
         GpuVendorClass::AppleSilicon => (16, 64, 6),
         GpuVendorClass::NvidiaDedicated
         | GpuVendorClass::AmdDedicated

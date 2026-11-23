@@ -11,10 +11,10 @@ use std::path::PathBuf;
 
 use megu_client::cli::parse_args;
 use megu_client::hardware_profile::{
-    classify_gpu, classify_intel_device, classify_macos_cpu_brand, parse_cache_size_kib,
-    parse_meminfo_total_kib, parse_pci_id, parse_sysctl_l3_cache_kib, parse_sysctl_memsize_mib,
-    parse_windows_display_device_id, probe_host_hardware, recommend_tuning, GpuVendorClass,
-    HostHardwareProfile, LocalLlmRecommendation,
+    classify_gpu, classify_intel_device, classify_linux_drm_uevent, classify_macos_cpu_brand,
+    parse_cache_size_kib, parse_meminfo_total_kib, parse_pci_id, parse_sysctl_l3_cache_kib,
+    parse_sysctl_memsize_mib, parse_windows_display_device_id, probe_host_hardware,
+    recommend_tuning, GpuVendorClass, HostHardwareProfile, LocalLlmRecommendation,
 };
 use megu_client::render::RenderConfig;
 use megu_client::settings::{
@@ -40,6 +40,9 @@ fn profile(
             GpuVendorClass::IntelLegacyIntegrated
                 | GpuVendorClass::IntelModernIntegrated
                 | GpuVendorClass::AppleSilicon
+                | GpuVendorClass::QualcommAdreno
+                | GpuVendorClass::ArmMali
+                | GpuVendorClass::BroadcomVideocore
         ),
     }
 }
@@ -206,6 +209,146 @@ fn windows_display_device_parser_classifies_vendor_and_software_adapters() {
         parse_windows_display_device_id("ROOT\\UNKNOWN", "Unknown"),
         None
     );
+}
+
+#[test]
+fn windows_display_device_parser_classifies_qualcomm_adreno() {
+    // Snapdragon X Elite: ACPI id + adapter name.
+    assert_eq!(
+        parse_windows_display_device_id(
+            r"ACPI\VEN_QCOM&DEV_0D0A",
+            "Qualcomm(R) Adreno(TM) X1-85 GPU",
+        ),
+        Some((0x5143, 0x0d0a))
+    );
+    // Snapdragon X Plus / 8cx-class ACPI ids.
+    assert_eq!(
+        parse_windows_display_device_id(
+            r"ACPI\VEN_QCOM&DEV_363F&SUBSYS_12345678",
+            "Qualcomm(R) Adreno(TM) X1-45 GPU",
+        ),
+        Some((0x5143, 0x363f))
+    );
+    // Qualcomm PCI id form.
+    assert_eq!(
+        parse_windows_display_device_id(
+            r"PCI\VEN_5143&DEV_0001&SUBSYS_00010000",
+            "Qualcomm(R) Adreno(TM) 690 GPU",
+        ),
+        Some((0x5143, 0x0001))
+    );
+    // The 4D4F4351 ("QCOM" little-endian) ACPI vendor encoding.
+    assert_eq!(
+        parse_windows_display_device_id(r"ACPI\VEN_4D4F4351&DEV_0001", "Adreno"),
+        Some((0x5143, 0x0001))
+    );
+    // Compact ACPI PNP id without VEN_/DEV_ separators.
+    assert_eq!(
+        parse_windows_display_device_id(r"ACPI\QCOM0D0A", "Qualcomm Adreno"),
+        Some((0x5143, 0x0d0a))
+    );
+    // Adapter name alone still identifies the vendor.
+    for adapter_name in [
+        "Qualcomm(R) Adreno(TM) X1-85 GPU",
+        "Qualcomm(R) Adreno(TM) 690 GPU",
+        "Adreno 750",
+        "Snapdragon X Elite",
+    ] {
+        assert_eq!(
+            parse_windows_display_device_id("", adapter_name),
+            Some((0x5143, 0)),
+            "{adapter_name}"
+        );
+    }
+    // Every Qualcomm id lands on the Adreno class — never Unknown or
+    // NoneSoftware.
+    for (device_id, name) in [
+        (
+            r"ACPI\VEN_QCOM&DEV_0D0A",
+            "Qualcomm(R) Adreno(TM) X1-85 GPU",
+        ),
+        (r"PCI\VEN_5143&DEV_0001", "Qualcomm(R) Adreno(TM) 690 GPU"),
+        (r"ACPI\QCOM363F", "Qualcomm(R) Adreno(TM) X1-45 GPU"),
+        ("", "Qualcomm(R) Adreno(TM) X1-85 GPU"),
+    ] {
+        let (vendor, device) = parse_windows_display_device_id(device_id, name)
+            .unwrap_or_else(|| panic!("unparsed: {device_id} / {name}"));
+        assert_eq!(
+            classify_gpu(Some(vendor), Some(device)),
+            GpuVendorClass::QualcommAdreno,
+            "{device_id} / {name}"
+        );
+    }
+}
+
+#[test]
+fn linux_drm_uevent_classifies_arm64_platform_gpus() {
+    // Snapdragon X Elite laptop: platform/DT device, no PCI ids. The
+    // DRIVER= line alone is decisive; compatibles/modalias agree.
+    let snapdragon_uevent = "\
+DRIVER=msm
+OF_NAME=gpu
+OF_FULLNAME=/soc@0/display-subsystem@ae00000/gpu@3d00000
+OF_COMPATIBLE_0=qcom,adreno-740.0
+OF_COMPATIBLE_1=qcom,adreno
+MODALIAS=of:NgpuT(NULL)Cqcom,adreno-740.0Cqcom,adreno
+";
+    assert_eq!(
+        classify_linux_drm_uevent(snapdragon_uevent),
+        GpuVendorClass::QualcommAdreno
+    );
+    // DRIVER=msm alone is enough (no compatibles bound yet).
+    assert_eq!(
+        classify_linux_drm_uevent("DRIVER=msm\n"),
+        GpuVendorClass::QualcommAdreno
+    );
+    // A modalias-only uevent still identifies the Adreno GPU.
+    assert_eq!(
+        classify_linux_drm_uevent("MODALIAS=of:NgpuT(NULL)Cqcom,adreno\n"),
+        GpuVendorClass::QualcommAdreno
+    );
+    // ARM Mali via panthor (newer) and panfrost (older) drivers.
+    assert_eq!(
+        classify_linux_drm_uevent(
+            "DRIVER=panthor\nOF_COMPATIBLE_0=arm,mali-g610\nOF_COMPATIBLE_1=arm,mali\n"
+        ),
+        GpuVendorClass::ArmMali
+    );
+    assert_eq!(
+        classify_linux_drm_uevent("DRIVER=panfrost\n"),
+        GpuVendorClass::ArmMali
+    );
+    assert_eq!(
+        classify_linux_drm_uevent("MODALIAS=of:NgpuT(NULL)Carm,mali-g52\n"),
+        GpuVendorClass::ArmMali
+    );
+    // Raspberry Pi VideoCore via v3d (Pi 4/5 3D block) and vc4.
+    assert_eq!(
+        classify_linux_drm_uevent(
+            "DRIVER=v3d\nOF_COMPATIBLE_0=brcm,2712-v3d\nMODALIAS=of:NgpuT(NULL)Cbrcm,2712-v3d\n"
+        ),
+        GpuVendorClass::BroadcomVideocore
+    );
+    assert_eq!(
+        classify_linux_drm_uevent("DRIVER=vc4\n"),
+        GpuVendorClass::BroadcomVideocore
+    );
+    // Unrelated drivers and empty input stay Unknown (the PCI path owns
+    // amdgpu/nouveau/i915 hosts).
+    for text in [
+        "DRIVER=amdgpu\nPCI_ID=1002:744C\n",
+        "DRIVER=i915\n",
+        "DRIVER=nouveau\n",
+        "DRIVER=\n",
+        "",
+        "no equals signs at all\n",
+    ] {
+        assert_eq!(
+            classify_linux_drm_uevent(text),
+            GpuVendorClass::Unknown,
+            "{text:?}"
+        );
+    }
 }
 
 #[test]
@@ -446,6 +589,51 @@ fn tuning_unknown_gpu_keeps_auto_backend_and_balanced_distance() {
     assert_eq!(plan.view_distance, 10);
     assert_eq!(plan.lod_radius_chunks, 48);
     assert_eq!(plan.max_rebuilds_per_frame, 4);
+}
+
+#[test]
+fn tuning_snapdragon_adreno_gets_strong_balanced_plan() {
+    // Snapdragon X Elite: 12-core, 32 GiB unified memory, Adreno X1-85.
+    let hw = profile(
+        12,
+        8 * 1024,
+        32 * 1024,
+        GpuVendorClass::QualcommAdreno,
+        8 * 1024,
+    );
+    assert!(hw.shared_system_ram);
+    let plan = recommend_tuning(&hw);
+    // A real tile-based GPU — DX12 on Windows ARM64, Turnip Vulkan on
+    // Linux ARM64 — negotiated through Auto, never the software path.
+    assert_eq!(plan.gpu_backend, RenderBackendPreference::Auto);
+    assert_eq!(plan.worker_threads, 11);
+    // 32 GiB tier (2048) shaved a quarter for shared memory; the small
+    // L3 blocks the X3D bonus.
+    assert_eq!(plan.chunk_cache_budget_mib, 1536);
+    assert_eq!(plan.view_distance, 14);
+    assert_eq!(plan.lod_radius_chunks, 64);
+    assert_eq!(plan.max_rebuilds_per_frame, 6);
+    assert_eq!(plan.local_llm, LocalLlmRecommendation::LargeLocalAllowed);
+}
+
+#[test]
+fn tuning_mobile_tile_gpus_stay_on_real_gpu_path() {
+    // ARM Mali and VideoCore are real integrated/tile GPUs: they keep
+    // the Auto backend and integrated budgets — never the software tier.
+    for (gpu, view_distance) in [
+        (GpuVendorClass::ArmMali, 10u8),
+        (GpuVendorClass::BroadcomVideocore, 8),
+    ] {
+        let hw = profile(8, 8 * 1024, 16 * 1024, gpu, 4 * 1024);
+        assert!(hw.shared_system_ram, "{gpu:?}");
+        let plan = recommend_tuning(&hw);
+        assert_eq!(plan.gpu_backend, RenderBackendPreference::Auto, "{gpu:?}");
+        assert_eq!(plan.view_distance, view_distance, "{gpu:?}");
+        assert!(plan.lod_radius_chunks > 0, "{gpu:?}");
+        assert!(plan.max_rebuilds_per_frame >= 2, "{gpu:?}");
+        // 16 GiB tier (1024) shaved a quarter for shared memory.
+        assert_eq!(plan.chunk_cache_budget_mib, 768, "{gpu:?}");
+    }
 }
 
 #[test]
