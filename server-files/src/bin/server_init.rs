@@ -124,6 +124,12 @@ const DEFAULT_BAN_SOURCE: &str = "megu-init";
 /// legacy subcommands, which is why usage text must come from argv[0] rather
 /// than a constant.
 fn prog_name() -> String {
+    if let Ok(name) = std::env::var("MEGU_ADMIN_PROG_NAME") {
+        let name = name.trim();
+        if !name.is_empty() && !name.contains('/') && !name.contains('\\') {
+            return name.to_owned();
+        }
+    }
     std::env::args()
         .next()
         .as_deref()
@@ -1682,9 +1688,10 @@ fn cmd_claims(dir: &Path, action: &ClaimsAction, json: bool) -> Result<(), CliEr
 
 // --------------------------------------------------------------------- main
 
-fn main() -> ExitCode {
+/// The admin implementation shared by `megu-init` (in-process) and the thin
+/// `megu-admin` shim. `args` excludes argv[0].
+pub fn run(args: Vec<String>) -> ExitCode {
     let prog = prog_name();
-    let args: Vec<String> = std::env::args().skip(1).collect();
     let command = match parse_command(&args) {
         Ok(c) => c,
         Err(e) => {
@@ -1762,4 +1769,36 @@ fn main() -> ExitCode {
             ExitCode::from(e.code)
         }
     }
+}
+
+/// `megu-admin` is a compatibility shim: the implementation lives in
+/// `megu-init` so the release archive carries one server-files admin binary
+/// plus this tiny launcher instead of two full copies.
+fn megu_admin_shim() -> ExitCode {
+    let mut init = match std::env::current_exe() {
+        Ok(path) => path,
+        Err(err) => {
+            eprintln!("megu-admin: could not locate megu-init: {err}");
+            return ExitCode::FAILURE;
+        }
+    };
+    init.set_file_name(format!("megu-init{}", std::env::consts::EXE_SUFFIX));
+    let args: Vec<_> = std::env::args_os().skip(1).collect();
+    match std::process::Command::new(&init)
+        .arg("admin")
+        .args(args)
+        .env("MEGU_ADMIN_PROG_NAME", "megu-admin")
+        .status()
+    {
+        Ok(status) => ExitCode::from(status.code().unwrap_or(1) as u8),
+        Err(err) => {
+            eprintln!("megu-admin: could not run {}: {err}", init.display());
+            ExitCode::FAILURE
+        }
+    }
+}
+
+#[allow(dead_code)]
+fn main() -> ExitCode {
+    megu_admin_shim()
 }

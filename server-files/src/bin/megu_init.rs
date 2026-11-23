@@ -10,7 +10,11 @@ use megu_server_files::{
 use std::fs::{self, OpenOptions};
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
-use std::process::{Command, ExitCode};
+use std::process::ExitCode;
+
+#[allow(dead_code)]
+#[path = "server_init.rs"]
+mod admin;
 
 const HELP: &str = "megu-init — create a Minecraft server directory\n\
 \n\
@@ -368,15 +372,7 @@ fn legacy_command(args: &[String]) -> Option<ExitCode> {
     ) {
         return None;
     }
-    let mut binary = std::env::current_exe().ok()?;
-    binary.set_file_name(format!("megu-admin{}", std::env::consts::EXE_SUFFIX));
-    Some(match Command::new(&binary).args(args).status() {
-        Ok(status) => ExitCode::from(status.code().unwrap_or(1) as u8),
-        Err(err) => {
-            eprintln!("megu-init: could not run {}: {err}", binary.display());
-            ExitCode::FAILURE
-        }
-    })
+    Some(admin::run(args.to_vec()))
 }
 
 fn main() -> ExitCode {
@@ -384,6 +380,9 @@ fn main() -> ExitCode {
     if matches!(args.as_slice(), [flag] if flag == "--help" || flag == "-h") {
         print!("{HELP}");
         return ExitCode::SUCCESS;
+    }
+    if args.first().map(String::as_str) == Some("admin") {
+        return admin::run(args[1..].to_vec());
     }
     if let Some(code) = legacy_command(&args) {
         return code;
