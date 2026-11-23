@@ -2712,21 +2712,49 @@ fn save_v2_panics_abort_the_boundary_and_corruption_cannot_apply_the_new_state()
     assert_eq!(overlay_block(2, 64, 3), None);
     assert_eq!(saved_value(&WORLD_SPAWN_PITCH), 15.0);
 
-    // Inject a panic in a real dependency of snapshot capture. The writer
-    // must never run and the ownership guard must be available again.
-    assert!(thread::spawn(|| {
-        let _pitch = WORLD_SPAWN_PITCH.lock().unwrap_or_else(|e| e.into_inner());
-        panic!("snapshot fixture");
-    })
-    .join()
-    .is_err());
+    // `saved_value` is poison-tolerant, so a poisoned spawn-pitch mutex no
+    // longer stands in for a capture panic: capture reads right through it.
+    // Trip a real encode assert inside `save_world_into` instead — the
+    // advancement footer refuses more than ADV_MAX_PLAYERS grants, and the
+    // panic must be contained by the capture boundary before the writer runs.
+    let old_grants = std::mem::take(&mut *adv_done().lock().unwrap_or_else(|e| e.into_inner()));
+    {
+        let mut grants = adv_done().lock().unwrap_or_else(|e| e.into_inner());
+        for i in 0..=ADV_MAX_PLAYERS {
+            grants.insert(format!("boundary-{i}"), [format!("adv-{i}")].into_iter().collect());
+        }
+    }
     assert_eq!(
         save_world_guarded(|_| panic!("writer was called")),
         Err("world snapshot panicked".into())
     );
+    // The boundary released the ownership guard and the writer never ran.
     assert!(SAVE_LOCK.try_lock().is_ok());
-    WORLD_SPAWN_PITCH.clear_poison();
+    assert!(SAVE_WRITER.try_lock().is_ok());
+    *adv_done().lock().unwrap_or_else(|e| e.into_inner()) = old_grants;
     save_world_guarded(|_| Ok(())).unwrap();
+
+    // A panic while flushing the snapshot is contained by the same boundary:
+    // it reports the write stage instead of escaping into the tick loop.
+    assert_eq!(
+        save_world_guarded(|_| panic!("writer panicked")),
+        Err("world save write panicked".into())
+    );
+    assert!(SAVE_LOCK.try_lock().is_ok());
+    assert!(SAVE_WRITER.try_lock().is_ok());
+    save_world_guarded(|_| Ok(())).unwrap();
+
+    // Poison tolerance is respected on both sides: a mutex poisoned by a
+    // panicking stranger neither fails the save nor turns the load boundary
+    // into a panic report.
+    assert!(thread::spawn(|| {
+        let _pitch = WORLD_SPAWN_PITCH.lock().unwrap_or_else(|e| e.into_inner());
+        panic!("pitch fixture");
+    })
+    .join()
+    .is_err());
+    save_world_guarded(|_| Ok(())).unwrap();
+    WORLD_SPAWN_PITCH.clear_poison();
 
     assert!(thread::spawn(|| {
         let _world = world().write_all();
@@ -2734,7 +2762,7 @@ fn save_v2_panics_abort_the_boundary_and_corruption_cannot_apply_the_new_state()
     })
     .join()
     .is_err());
-    assert_eq!(load_world_from(&[0]), Err("world load panicked"));
+    assert_ne!(load_world_from(&[0]), Err("world load panicked"));
     world().clear_poison();
     load_world_from(&[0]).unwrap();
 }

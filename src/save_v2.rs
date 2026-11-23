@@ -1817,7 +1817,13 @@ fn save_world_guarded(
             Ok(WorldSaveSnapshot::capture())
         })
     })?;
-    write(snapshot)
+    // The writer runs outside the world guard but inside the same panic
+    // boundary: a panic while flushing must fail closed like a capture panic,
+    // never escape into the tick loop or shutdown path.
+    match persistence_boundary("world save write panicked", || Ok(write(snapshot))) {
+        Ok(result) => result,
+        Err(message) => Err(message.into()),
+    }
 }
 
 struct WorldSaveSnapshot {

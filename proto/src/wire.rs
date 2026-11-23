@@ -37,6 +37,12 @@ const MAX_NBT_BYTES: usize = 2 * 1024 * 1024;
 /// Maximum NBT nesting depth, same bound the existing decoders use.
 const MAX_NBT_DEPTH: usize = 32;
 
+/// Total values one anonymous-NBT skip may visit. Every non-End element
+/// consumes at least one wire byte, so this only binds payloads far larger
+/// than [`MAX_NBT_BYTES`] — it exists so a hostile buffer cannot amplify a
+/// small declaration into unbounded skip iterations.
+const MAX_NBT_SKIPPED_TAGS: usize = 1 << 22;
+
 /// Every wire-level failure. The variants carry enough context to log a useful
 /// rejection without ever exposing or panicking on attacker-controlled sizes.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -460,11 +466,14 @@ impl<'a> WireReader<'a> {
     ///
     /// `nbt_skip` enforces the same shape and bounds as the server's
     /// `nbt_wire_skip`: tag bytes 0..=12, byte/int/long arrays capped at
-    /// 1<<24 elements, lists at 1<<20, depth at [`MAX_NBT_DEPTH`].
+    /// 1<<24 elements, lists at 1<<20 with non-empty payloads only, depth at
+    /// [`MAX_NBT_DEPTH`], and a total skipped-tag budget of
+    /// [`MAX_NBT_SKIPPED_TAGS`].
     pub fn read_anonymous_nbt(&mut self) -> Result<&'a [u8], ProtoError> {
         let start = self.pos;
         let tag = self.read_u8()?;
-        nbt_skip_value(self.buf, &mut self.pos, tag, 0)?;
+        let mut budget = MAX_NBT_SKIPPED_TAGS;
+        nbt_skip_value(self.buf, &mut self.pos, tag, 0, &mut budget)?;
         if self.pos - start > MAX_NBT_BYTES {
             return Err(ProtoError::LengthOutOfBounds {
                 length: self.pos - start,
@@ -507,10 +516,21 @@ fn nbt_be(data: &[u8], pos: &mut usize, width: usize) -> Result<u32, ProtoError>
 }
 
 /// Skip the payload of a value whose tag byte is `tag`. `pos` indexes `data`.
-fn nbt_skip_value(data: &[u8], pos: &mut usize, tag: u8, depth: usize) -> Result<(), ProtoError> {
+/// `budget` bounds the total number of values visited across the whole skip.
+fn nbt_skip_value(
+    data: &[u8],
+    pos: &mut usize,
+    tag: u8,
+    depth: usize,
+    budget: &mut usize,
+) -> Result<(), ProtoError> {
     if depth > MAX_NBT_DEPTH {
         return Err(ProtoError::Malformed("NBT nesting too deep"));
     }
+    if *budget == 0 {
+        return Err(ProtoError::Malformed("NBT skip budget exhausted"));
+    }
+    *budget -= 1;
     match tag {
         0 => Ok(()),
         1 => nbt_take(data, pos, 1),
@@ -548,8 +568,21 @@ fn nbt_skip_value(data: &[u8], pos: &mut usize, tag: u8, depth: usize) -> Result
                     max: 1 << 20,
                 });
             }
+            if elem == 0 {
+                // TAG_End elements carry no payload, so a non-empty list of
+                // them would spin `n` no-op iterations per 8 wire bytes.
+                if n != 0 {
+                    return Err(ProtoError::Malformed("NBT list of TAG_End elements"));
+                }
+                return Ok(());
+            }
+            // Every non-End element occupies at least one payload byte, so a
+            // length beyond the remaining span can never be satisfied.
+            if n > data.len() - *pos {
+                return Err(ProtoError::Malformed("NBT list length exceeds input"));
+            }
             for _ in 0..n {
-                nbt_skip_value(data, pos, elem, depth + 1)?;
+                nbt_skip_value(data, pos, elem, depth + 1, budget)?;
             }
             Ok(())
         }
@@ -566,7 +599,7 @@ fn nbt_skip_value(data: &[u8], pos: &mut usize, tag: u8, depth: usize) -> Result
             }
             let name_len = nbt_be(data, pos, 2)? as usize;
             nbt_take(data, pos, name_len)?;
-            nbt_skip_value(data, pos, child, depth + 1)?;
+            nbt_skip_value(data, pos, child, depth + 1, budget)?;
         },
         _ => Err(ProtoError::InvalidDiscriminant {
             value: i64::from(tag),
@@ -1113,5 +1146,33 @@ mod tests {
         let forged = [7u8, 0x7f, 0xff, 0xff, 0xff];
         let mut r = WireReader::new(&forged);
         assert!(r.read_anonymous_nbt().is_err());
+    }
+
+    #[test]
+    fn anonymous_nbt_rejects_amplified_list_declarations() {
+        // {"x": TAG_LIST(TAG_End, 1_048_576)}: the element tag carries no
+        // payload, so the old skipper spun a million no-op iterations per
+        // 8 wire bytes. It must fail immediately instead.
+        // Compound entries are tag-then-name: {"x": LIST(End, 1<<20)}.
+        let mut nbt = vec![10u8, 9, 0, 1, b'x'];
+        // list elem=End, len=1<<20
+        nbt.extend_from_slice(&[0, 0x00, 0x10, 0x00, 0x00]);
+        nbt.push(0);
+        let start = std::time::Instant::now();
+        let mut r = WireReader::new(&nbt);
+        assert!(r.read_anonymous_nbt().is_err());
+        assert!(start.elapsed() < std::time::Duration::from_millis(100));
+
+        // A non-End list whose length exceeds the remaining input fails
+        // before iterating: one payload byte cannot hold 100 byte elements.
+        let mut nbt = vec![9, 1, 0, 0, 0, 100];
+        nbt.push(1);
+        let mut r = WireReader::new(&nbt);
+        assert!(r.read_anonymous_nbt().is_err());
+
+        // An empty TAG_End-element list is the legal empty-list encoding.
+        let nbt = [9, 0, 0, 0, 0, 0];
+        let mut r = WireReader::new(&nbt);
+        assert_eq!(r.read_anonymous_nbt().unwrap(), &nbt[..]);
     }
 }
