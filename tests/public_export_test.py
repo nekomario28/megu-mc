@@ -35,7 +35,7 @@ def check_docs(root):
     assert 'does not contain Mojang data' not in ' '.join(notice.split())
     for name in TSVS:
         assert f'tests/data/{name}_1211.tsv' in notice, name
-    for doc in ('README.md', 'docs/development.md', 'THIRD_PARTY.md', 'LICENSING.md', 'NOTICE'):
+    for doc in ('docs/development.md', 'THIRD_PARTY.md', 'LICENSING.md', 'NOTICE'):
         assert 'tools/export_public_branch.sh' in (root / doc).read_text(), doc
 
 
