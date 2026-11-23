@@ -1,0 +1,510 @@
+{
+  "version": 1,
+  "comment": "Documented vertical-slice wiring gaps tolerated by tools/client_vertical_wiring_audit.py. Every entry is a half-wired gameplay feature: P0 = core vanilla path broken, P1 = real feature gap, P2 = unused/low-priority channel. The gate fails on any NEW unwired item; an entry whose item becomes wired is reported as a stale waiver and must be removed.",
+  "waivers": [
+    {
+      "check": "hud_state_writers",
+      "id": "HudState::absorption",
+      "priority": "P1",
+      "reason": "absorption hearts never written \u2014 no producer decodes it yet"
+    },
+    {
+      "check": "hud_state_writers",
+      "id": "HudState::air",
+      "priority": "P1",
+      "reason": "air supply never written \u2014 drowning bubbles never show"
+    },
+    {
+      "check": "hud_state_writers",
+      "id": "HudState::armor",
+      "priority": "P1",
+      "reason": "armor value never written \u2014 armor row always empty"
+    },
+    {
+      "check": "hud_state_writers",
+      "id": "HudState::bossbars",
+      "priority": "P0",
+      "reason": "LiveSession decodes boss_event into live.boss_bars but nothing ever copies them into hud.bossbars \u2014 boss bars never render"
+    },
+    {
+      "check": "hud_state_writers",
+      "id": "HudState::crafting_conflict",
+      "priority": "P2",
+      "reason": "recipe-conflict switcher has no producer yet \u2014 modded-only QoL overlay"
+    },
+    {
+      "check": "hud_state_writers",
+      "id": "HudState::hotbar",
+      "priority": "P0",
+      "reason": "hotbar slot contents never written \u2014 hotbar shows empty slots regardless of inventory"
+    },
+    {
+      "check": "hud_state_writers",
+      "id": "HudState::magic",
+      "priority": "P2",
+      "reason": "shadowed field: the magic HUD draws from LiveSession.magic via build_magic_hud_draw_list; hud.magic is never fed"
+    },
+    {
+      "check": "hud_state_writers",
+      "id": "HudState::offhand",
+      "priority": "P1",
+      "reason": "offhand slot label never written"
+    },
+    {
+      "check": "hud_state_writers",
+      "id": "HudState::players",
+      "priority": "P1",
+      "reason": "player_info/tab-list entries tracked but never copied into hud.players \u2014 tab list empty"
+    },
+    {
+      "check": "hud_state_writers",
+      "id": "HudState::subtitles",
+      "priority": "P2",
+      "reason": "legacy subtitle rows never fed \u2014 subtitle_hud (fed via refresh_subtitle_hud) is the live channel"
+    },
+    {
+      "check": "hud_state_writers",
+      "id": "HudState::xp_level",
+      "priority": "P0",
+      "reason": "set_experience is also unwired \u2014 XP level never reaches the HUD"
+    },
+    {
+      "check": "hud_state_writers",
+      "id": "HudState::xp_progress",
+      "priority": "P0",
+      "reason": "set_experience is also unwired \u2014 XP progress bar never fills"
+    },
+    {
+      "check": "s2c_play_event_consumption",
+      "id": "PlayEvent::AwardStats",
+      "priority": "P2",
+      "reason": "award_stats drops \u2014 statistics counters ignored"
+    },
+    {
+      "check": "s2c_play_event_consumption",
+      "id": "PlayEvent::BlockChangedAck",
+      "priority": "P1",
+      "reason": "block_changed_ack drops \u2014 dig/place sequence acknowledgements ignored (dig lane correctness)"
+    },
+    {
+      "check": "s2c_play_event_consumption",
+      "id": "PlayEvent::ChangeDifficulty",
+      "priority": "P2",
+      "reason": "change_difficulty drops \u2014 difficulty display only"
+    },
+    {
+      "check": "s2c_play_event_consumption",
+      "id": "PlayEvent::ChatCompletions",
+      "priority": "P1",
+      "reason": "chat_completions drops \u2014 chat completion lists ignored"
+    },
+    {
+      "check": "s2c_play_event_consumption",
+      "id": "PlayEvent::ChunkBatchStart",
+      "priority": "P2",
+      "reason": "chunk_batch_start drops \u2014 informational batch marker; batch decode still works"
+    },
+    {
+      "check": "s2c_play_event_consumption",
+      "id": "PlayEvent::ChunksBiomes",
+      "priority": "P0",
+      "reason": "chunks_biomes drops \u2014 chunk biome data never applied; grass/water/sky colors wrong"
+    },
+    {
+      "check": "s2c_play_event_consumption",
+      "id": "PlayEvent::ClearTitles",
+      "priority": "P1",
+      "reason": "clear_titles drops \u2014 titles/subtitles persist past server clears"
+    },
+    {
+      "check": "s2c_play_event_consumption",
+      "id": "PlayEvent::CommandSuggestions",
+      "priority": "P1",
+      "reason": "command_suggestions drops \u2014 tab-completion never populates"
+    },
+    {
+      "check": "s2c_play_event_consumption",
+      "id": "PlayEvent::ContainerSetData",
+      "priority": "P1",
+      "reason": "container_set_data drops \u2014 furnace/brewing progress bars dead"
+    },
+    {
+      "check": "s2c_play_event_consumption",
+      "id": "PlayEvent::CookieRequest",
+      "priority": "P2",
+      "reason": "cookie_request drops \u2014 server cookie store unused"
+    },
+    {
+      "check": "s2c_play_event_consumption",
+      "id": "PlayEvent::Cooldown",
+      "priority": "P1",
+      "reason": "cooldown drops \u2014 item cooldown overlay never shows"
+    },
+    {
+      "check": "s2c_play_event_consumption",
+      "id": "PlayEvent::CustomReportDetails",
+      "priority": "P2",
+      "reason": "custom_report_details drops \u2014 crash-report payload unused"
+    },
+    {
+      "check": "s2c_play_event_consumption",
+      "id": "PlayEvent::DamageEvent",
+      "priority": "P0",
+      "reason": "damage_event drops \u2014 no damage direction/source feedback"
+    },
+    {
+      "check": "s2c_play_event_consumption",
+      "id": "PlayEvent::DeleteChat",
+      "priority": "P1",
+      "reason": "delete_chat drops \u2014 server-retracted messages stay visible"
+    },
+    {
+      "check": "s2c_play_event_consumption",
+      "id": "PlayEvent::DisguisedChat",
+      "priority": "P0",
+      "reason": "disguised_chat (unsigned/system-styled chat) decoded then dropped \u2014 chat gap"
+    },
+    {
+      "check": "s2c_play_event_consumption",
+      "id": "PlayEvent::HorseScreenOpen",
+      "priority": "P2",
+      "reason": "horse_screen_open drops \u2014 horse inventory screen unimplemented"
+    },
+    {
+      "check": "s2c_play_event_consumption",
+      "id": "PlayEvent::InitializeBorder",
+      "priority": "P2",
+      "reason": "initialize_border drops \u2014 world border state ignored"
+    },
+    {
+      "check": "s2c_play_event_consumption",
+      "id": "PlayEvent::LevelEvent",
+      "priority": "P0",
+      "reason": "level_event drops \u2014 vanilla block-break particles/effect events (e.g. 2001) never render"
+    },
+    {
+      "check": "s2c_play_event_consumption",
+      "id": "PlayEvent::LevelParticles",
+      "priority": "P0",
+      "reason": "level_particles drops \u2014 no particle spawns at all"
+    },
+    {
+      "check": "s2c_play_event_consumption",
+      "id": "PlayEvent::MapItemData",
+      "priority": "P1",
+      "reason": "map_item_data drops \u2014 map items render blank"
+    },
+    {
+      "check": "s2c_play_event_consumption",
+      "id": "PlayEvent::MerchantOffers",
+      "priority": "P1",
+      "reason": "merchant_offers drops \u2014 villager trade list never populated"
+    },
+    {
+      "check": "s2c_play_event_consumption",
+      "id": "PlayEvent::MoveVehicle",
+      "priority": "P1",
+      "reason": "move_vehicle drops \u2014 ridden-entity position never syncs"
+    },
+    {
+      "check": "s2c_play_event_consumption",
+      "id": "PlayEvent::OpenBook",
+      "priority": "P2",
+      "reason": "open_book drops \u2014 book GUI unimplemented"
+    },
+    {
+      "check": "s2c_play_event_consumption",
+      "id": "PlayEvent::OpenSignEditor",
+      "priority": "P1",
+      "reason": "open_sign_editor drops \u2014 sign edit UI never opens"
+    },
+    {
+      "check": "s2c_play_event_consumption",
+      "id": "PlayEvent::Other",
+      "priority": "P2",
+      "reason": "catch-all variant for undecoded packet ids \u2014 intentionally unhandled"
+    },
+    {
+      "check": "s2c_play_event_consumption",
+      "id": "PlayEvent::Ping",
+      "priority": "P1",
+      "reason": "play ping drops \u2014 no pong response; ping display dead and some servers kick on timeout"
+    },
+    {
+      "check": "s2c_play_event_consumption",
+      "id": "PlayEvent::PlaceGhostRecipe",
+      "priority": "P2",
+      "reason": "place_ghost_recipe drops \u2014 recipe-book ghost grid unimplemented"
+    },
+    {
+      "check": "s2c_play_event_consumption",
+      "id": "PlayEvent::PlayerAbilities",
+      "priority": "P1",
+      "reason": "player_abilities drops \u2014 may-fly/instabuild flags never sync"
+    },
+    {
+      "check": "s2c_play_event_consumption",
+      "id": "PlayEvent::PlayerChat",
+      "priority": "P0",
+      "reason": "player_chat messages from other players are decoded then dropped in `_ => {}` \u2014 multiplayer chat is invisible"
+    },
+    {
+      "check": "s2c_play_event_consumption",
+      "id": "PlayEvent::PlayerCombatEnd",
+      "priority": "P1",
+      "reason": "player_combat_end drops \u2014 combat-window end ignored"
+    },
+    {
+      "check": "s2c_play_event_consumption",
+      "id": "PlayEvent::PlayerCombatEnter",
+      "priority": "P1",
+      "reason": "player_combat_enter drops \u2014 combat-window start ignored"
+    },
+    {
+      "check": "s2c_play_event_consumption",
+      "id": "PlayEvent::PlayerCombatKill",
+      "priority": "P0",
+      "reason": "player_combat_kill is the vanilla death-screen trigger \u2014 dropped; DeathScreenState is also unwired"
+    },
+    {
+      "check": "s2c_play_event_consumption",
+      "id": "PlayEvent::PlayerLookAt",
+      "priority": "P2",
+      "reason": "player_look_at drops \u2014 cinematic face-target ignored"
+    },
+    {
+      "check": "s2c_play_event_consumption",
+      "id": "PlayEvent::PongResponse",
+      "priority": "P2",
+      "reason": "pong_response drops \u2014 client-initiated ping reply unused"
+    },
+    {
+      "check": "s2c_play_event_consumption",
+      "id": "PlayEvent::RemoveMobEffect",
+      "priority": "P1",
+      "reason": "remove_mob_effect drops \u2014 expired status effects stay visible"
+    },
+    {
+      "check": "s2c_play_event_consumption",
+      "id": "PlayEvent::ResetChat",
+      "priority": "P1",
+      "reason": "reset_chat drops \u2014 chat reset ignored"
+    },
+    {
+      "check": "s2c_play_event_consumption",
+      "id": "PlayEvent::ResourcePackPop",
+      "priority": "P1",
+      "reason": "resource_pack_pop drops \u2014 server pack removal ignored"
+    },
+    {
+      "check": "s2c_play_event_consumption",
+      "id": "PlayEvent::ResourcePackPush",
+      "priority": "P1",
+      "reason": "resource_pack_push drops \u2014 server-sent packs never apply (may also fail pack-required servers)"
+    },
+    {
+      "check": "s2c_play_event_consumption",
+      "id": "PlayEvent::ServerData",
+      "priority": "P2",
+      "reason": "server_data drops \u2014 MOTD/favicon push unused"
+    },
+    {
+      "check": "s2c_play_event_consumption",
+      "id": "PlayEvent::ServerLinks",
+      "priority": "P2",
+      "reason": "server_links drops \u2014 server-provided link list unused"
+    },
+    {
+      "check": "s2c_play_event_consumption",
+      "id": "PlayEvent::SetBorderCenter",
+      "priority": "P2",
+      "reason": "set_border_center drops \u2014 world border"
+    },
+    {
+      "check": "s2c_play_event_consumption",
+      "id": "PlayEvent::SetBorderLerpSize",
+      "priority": "P2",
+      "reason": "set_border_lerp_size drops \u2014 world border"
+    },
+    {
+      "check": "s2c_play_event_consumption",
+      "id": "PlayEvent::SetBorderSize",
+      "priority": "P2",
+      "reason": "set_border_size drops \u2014 world border"
+    },
+    {
+      "check": "s2c_play_event_consumption",
+      "id": "PlayEvent::SetBorderWarningDelay",
+      "priority": "P2",
+      "reason": "set_border_warning_delay drops \u2014 world border warning"
+    },
+    {
+      "check": "s2c_play_event_consumption",
+      "id": "PlayEvent::SetBorderWarningDistance",
+      "priority": "P2",
+      "reason": "set_border_warning_distance drops \u2014 world border warning"
+    },
+    {
+      "check": "s2c_play_event_consumption",
+      "id": "PlayEvent::SetCamera",
+      "priority": "P1",
+      "reason": "set_camera drops \u2014 spectator/mob camera switching dead"
+    },
+    {
+      "check": "s2c_play_event_consumption",
+      "id": "PlayEvent::SetCarriedItem",
+      "priority": "P0",
+      "reason": "set_carried_item drops \u2014 server-driven hotbar slot selection ignored (hotbar sync)"
+    },
+    {
+      "check": "s2c_play_event_consumption",
+      "id": "PlayEvent::SetCenterChunk",
+      "priority": "P1",
+      "reason": "set_center_chunk drops \u2014 client chunk-view centre never follows the server"
+    },
+    {
+      "check": "s2c_play_event_consumption",
+      "id": "PlayEvent::SetChunkCacheRadius",
+      "priority": "P2",
+      "reason": "set_chunk_cache_radius drops \u2014 view-radius hint unused"
+    },
+    {
+      "check": "s2c_play_event_consumption",
+      "id": "PlayEvent::SetDefaultSpawnPosition",
+      "priority": "P2",
+      "reason": "set_default_spawn_position drops \u2014 compass spawn target unused"
+    },
+    {
+      "check": "s2c_play_event_consumption",
+      "id": "PlayEvent::SetEntityData",
+      "priority": "P0",
+      "reason": "set_entity_data drops \u2014 entity metadata (custom names, sneaking, glowing, pose) never applied"
+    },
+    {
+      "check": "s2c_play_event_consumption",
+      "id": "PlayEvent::SetExperience",
+      "priority": "P0",
+      "reason": "set_experience drops \u2014 XP bar/level never update (HudState xp fields also unwired)"
+    },
+    {
+      "check": "s2c_play_event_consumption",
+      "id": "PlayEvent::SetPlayerTeam",
+      "priority": "P1",
+      "reason": "set_player_team drops \u2014 teams, nametag colours and collision rules ignored"
+    },
+    {
+      "check": "s2c_play_event_consumption",
+      "id": "PlayEvent::SetProjectilePower",
+      "priority": "P2",
+      "reason": "set_projectile_power drops \u2014 wind-burst charge acceleration unused"
+    },
+    {
+      "check": "s2c_play_event_consumption",
+      "id": "PlayEvent::SetSimulationDistance",
+      "priority": "P2",
+      "reason": "set_simulation_distance drops \u2014 simulation-distance hint unused"
+    },
+    {
+      "check": "s2c_play_event_consumption",
+      "id": "PlayEvent::StoreCookie",
+      "priority": "P2",
+      "reason": "store_cookie drops \u2014 server cookie store unused"
+    },
+    {
+      "check": "s2c_play_event_consumption",
+      "id": "PlayEvent::TabList",
+      "priority": "P1",
+      "reason": "tab_list drops \u2014 tab-list header/footer never update"
+    },
+    {
+      "check": "s2c_play_event_consumption",
+      "id": "PlayEvent::TagQuery",
+      "priority": "P2",
+      "reason": "tag_query drops \u2014 command-block NBT query reply unused"
+    },
+    {
+      "check": "s2c_play_event_consumption",
+      "id": "PlayEvent::TickingState",
+      "priority": "P2",
+      "reason": "ticking_state drops \u2014 server tick-rate display unused"
+    },
+    {
+      "check": "s2c_play_event_consumption",
+      "id": "PlayEvent::TickingStep",
+      "priority": "P2",
+      "reason": "ticking_step drops \u2014 frozen-tick stepping unused"
+    },
+    {
+      "check": "s2c_play_event_consumption",
+      "id": "PlayEvent::UpdateMobEffect",
+      "priority": "P1",
+      "reason": "update_mob_effect drops \u2014 potion/status effects never shown"
+    },
+    {
+      "check": "screen_state_reachability",
+      "id": "DeathScreenState",
+      "priority": "P0",
+      "reason": "dead screen \u2014 never referenced from client-gpu and player_combat_kill (its trigger) is also dropped"
+    },
+    {
+      "check": "screen_state_reachability",
+      "id": "Screen::AboutMegu",
+      "priority": "P2",
+      "reason": "reached only via client-ui-internal UiAction::OpenScreen (title AboutMegu button); never named by the host"
+    },
+    {
+      "check": "screen_state_reachability",
+      "id": "Screen::CrashRecovery",
+      "priority": "P1",
+      "reason": "unreachable \u2014 UiState::show_crash is never invoked from client-gpu, so the recovery screen can never appear"
+    },
+    {
+      "check": "screen_state_reachability",
+      "id": "Screen::Friends",
+      "priority": "P2",
+      "reason": "reached only via client-ui-internal OpenScreen dispatch (title/pause buttons); never named by the host"
+    },
+    {
+      "check": "screen_state_reachability",
+      "id": "Screen::ModMenu",
+      "priority": "P2",
+      "reason": "reached via UiState::open_mod_menu from internal widget ids; variant never named by the host"
+    },
+    {
+      "check": "screen_state_reachability",
+      "id": "Screen::ModSyncConsent",
+      "priority": "P1",
+      "reason": "unreachable \u2014 nothing navigates to it and pending_mod_sync is never populated; the consent gate is dead code"
+    },
+    {
+      "check": "screen_state_reachability",
+      "id": "Screen::RecipeBrowser",
+      "priority": "P2",
+      "reason": "reached via ui.open_recipe_browser() from window.rs \u2014 method-level wiring, variant never named in client-gpu"
+    },
+    {
+      "check": "screen_state_reachability",
+      "id": "ShaderPackScreenState",
+      "priority": "P2",
+      "reason": "owned by UiState::shader_packs and drawn through Screen::Settings(SettingsTab::Shaders); the type name never appears in client-gpu"
+    },
+    {
+      "check": "worker_command_producers",
+      "id": "WorkerCommand::Swing",
+      "priority": "P0",
+      "reason": "swing() has no non-test caller \u2014 left-click never sends the arm-swing packet (attack/dig lane)"
+    },
+    {
+      "check": "worker_command_producers",
+      "id": "WorkerCommand::UseItem",
+      "priority": "P0",
+      "reason": "use_item() has no non-test caller \u2014 right-click in air (eat/bow/shield) never reaches the worker"
+    },
+    {
+      "check": "worker_command_producers",
+      "id": "WorkerCommand::UseItemOn",
+      "priority": "P0",
+      "reason": "use_item_on() has no non-test caller \u2014 block place/interact never reaches the worker (dig/place lane)"
+    }
+  ]
+}

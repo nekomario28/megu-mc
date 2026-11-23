@@ -48,6 +48,8 @@ jobs:
             python3 tests/live_playability_e2e_test.py
           fi
           python3 tests/megu_tui_test.py
+          python3 tests/client_vertical_wiring_audit_test.py
+          python3 tools/client_vertical_wiring_audit.py
           python3 tests/verify_gate_coverage_test.py
           python3 tests/installer_cross_os_test.py
           python3 website/check_site.py
