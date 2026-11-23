@@ -64,9 +64,11 @@ done
 # regenerates instead of redistributing. Collect first so removing a directory
 # cannot confuse the traversal.
 generated=()
-while IFS= read -r -d '' path; do generated+=("$path"); done \
-    < <(find assets tests/data -name '*_1211*' -print0)
-((${#generated[@]})) || die 'no generated *_1211* artifacts found to strip'
+for dir in assets tests/data; do
+    [[ -d $dir ]] || continue
+    while IFS= read -r -d '' path; do generated+=("$path"); done \
+        < <(find "$dir" -name '*_1211*' -print0)
+done
 for path in "${generated[@]}"; do rm -rf -- "$path"; done
 # Strip raw local systemd journal dumps (`*unit.jsonl`) from public exports so
 # host paths and invocation IDs never enter the public source tree.

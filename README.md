@@ -21,20 +21,34 @@ Megu is a free, open-source, clean-room Rust server and pure-`wgpu` native GPU c
 
 ## How To (Players)
 
-Go to the **[Downloads page](https://megu.megumin.tech/#download)** or **[GitHub Releases](https://github.com/nekomario28/megu-mc/releases/latest)**:
+Choose **one** category below from the **[Downloads page](https://megu.megumin.tech/#downloads)** or **[GitHub Releases](https://github.com/nekomario28/megu-mc/releases/latest)** (ordered from most popular):
 
-- **Official Launcher (Windows / Linux / macOS)**:
-  - **Windows (`.exe`, no Java needed)**: Download and run **[`megu-installer-windows-x86_64.exe`](https://github.com/nekomario28/megu-mc/releases/latest/download/megu-installer-windows-x86_64.exe)**.
-  - **Linux (Standard `~/.minecraft` & Flatpak)**: Run `curl -fsSL https://raw.githubusercontent.com/nekomario28/megu-mc/main/tools/install_linux.sh | sh` (or run **[`megu-installer-linux-x86_64`](https://github.com/nekomario28/megu-mc/releases/latest/download/megu-installer-linux-x86_64)**).
-  - **macOS (Apple Silicon)**: Download and run **[`megu-installer-macos-arm64`](https://github.com/nekomario28/megu-mc/releases/latest/download/megu-installer-macos-arm64)**.
-  - **Java GUI Installer (NeoForge / Fabric style, all OSes)**: Download **[`megu-bootstrapper.jar`](https://github.com/nekomario28/megu-mc/releases/latest/download/megu-bootstrapper.jar)** and double-click it (or run `java -jar megu-bootstrapper.jar`).
-  - Then open the Minecraft Launcher, select the **Megu (1.21.1)** profile, and click **Play**!
-- **Prism Launcher / Modrinth App**:
-  - Download **[`megu-1.21.1.mrpack`](https://github.com/nekomario28/megu-mc/releases/latest/download/megu-1.21.1.mrpack)** and drag & drop it directly into your launcher (or run `megu-installer prism`).
+### 1. Official Launcher &amp; Standalone Client (`megu-installer` — GUI / CLI, No Java Needed)
 
-## How To (Server Admins)
+Automatically downloads/stages `megu-client-gpu` into `<minecraft_dir>/bin/` and registers the **Megu (1.21.1)** profile in the Official Minecraft Launcher (run with `gui` / `--gui` for the graphical dialog, or default 1-click install):
 
-Download the release archive for your OS from **[GitHub Releases](https://github.com/nekomario28/megu-mc/releases/latest)**, initialize a server directory, accept `eula.txt`, and start `megu`:
+| OS | File / Command | Description |
+| :--- | :--- | :--- |
+| **Windows (x86_64)** | **[`megu-installer-windows-x86_64.exe`](https://github.com/nekomario28/megu-mc/releases/latest/download/megu-installer-windows-x86_64.exe)** | Standalone `.exe` installer (`%APPDATA%\.minecraft` &amp; Microsoft Store Launcher; run `megu-installer-windows-x86_64.exe gui` for GUI mode) |
+| **Linux (x86_64)** | `curl -fsSL https://raw.githubusercontent.com/nekomario28/megu-mc/main/tools/install_linux.sh \| sh`<br>*(or **[`megu-installer-linux-x86_64`](https://github.com/nekomario28/megu-mc/releases/latest/download/megu-installer-linux-x86_64)**)* | Auto-detects standard `~/.minecraft` and Flatpak (`~/.var/app/com.mojang.Minecraft/.minecraft`) |
+| **macOS (Apple Silicon)** | **[`megu-installer-macos-arm64`](https://github.com/nekomario28/megu-mc/releases/latest/download/megu-installer-macos-arm64)** | Standalone native installer for `~/Library/Application Support/minecraft` |
+
+### 2. Modrinth App &amp; Prism Launcher (Modpack / Instance Import)
+
+| Launcher | File / Command | Description |
+| :--- | :--- | :--- |
+| **Modrinth App / Prism Launcher** | **[`megu-1.21.1.mrpack`](https://github.com/nekomario28/megu-mc/releases/latest/download/megu-1.21.1.mrpack)** | Standard Modrinth `.mrpack` modpack — drag &amp; drop directly into your launcher |
+| **Prism Launcher (Native ZIP)** | **[`megu-prism-1.21.1.zip`](https://github.com/nekomario28/megu-mc/releases/latest/download/megu-prism-1.21.1.zip)** | Pre-configured Prism instance archive (or generate locally via `megu-installer prism`) |
+
+## How To (Server Admins &amp; Full CLI Suite)
+
+Download the full platform archive (`megu-<version>-<os>.tar.gz`, bundling `megu` dedicated server, `megu-client-gpu`, `megu-installer`, `megu-mod-check`, `megu-world-migrate`, `megu-init`, and `megu-admin`) from **[GitHub Releases](https://github.com/nekomario28/megu-mc/releases/latest)**:
+
+| OS | Full Archive | Included Binaries |
+| :--- | :--- | :--- |
+| **Windows (x86_64)** | **[`megu-v0.1.0-alpha.1-windows-x86_64.tar.gz`](https://github.com/nekomario28/megu-mc/releases/latest/download/megu-v0.1.0-alpha.1-windows-x86_64.tar.gz)** | `megu.exe` (Server), `megu-client-gpu.exe` (GPU Client), `megu-installer.exe`, `megu-mod-check.exe`, `megu-world-migrate.exe`, `megu-init.exe`, `megu-admin.exe` |
+| **Linux (x86_64)** | **[`megu-v0.1.0-alpha.1-linux-x86_64.tar.gz`](https://github.com/nekomario28/megu-mc/releases/latest/download/megu-v0.1.0-alpha.1-linux-x86_64.tar.gz)** | `megu` (Server), `megu-client-gpu` (GPU Client), `megu-installer`, `megu-mod-check`, `megu-world-migrate`, `megu-init`, `megu-admin` |
+| **macOS (Apple Silicon)** | **[`megu-v0.1.0-alpha.1-macos-arm64.tar.gz`](https://github.com/nekomario28/megu-mc/releases/latest/download/megu-v0.1.0-alpha.1-macos-arm64.tar.gz)** | `megu` (Server), `megu-client-gpu` (GPU Client), `megu-installer`, `megu-mod-check`, `megu-world-migrate`, `megu-init`, `megu-admin` |
 
 ```sh
 ./megu-installer server --dir ./megu-server

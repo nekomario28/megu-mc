@@ -32,13 +32,9 @@ def iso_utc_now():
 def build_jar(out_dir):
     with tempfile.TemporaryDirectory(prefix="megu-javac-") as build:
         compiled = Path(build)
-        sources = [str(ROOT / "Main.java")]
-        gui = ROOT / "InstallerGui.java"
-        if gui.is_file():
-            sources.append(str(gui))
         subprocess.run(["javac", f"-J-Djava.io.tmpdir={tempfile.gettempdir()}",
                         "--release", "21", "-d", str(compiled),
-                        *sources], check=True)
+                        str(ROOT / "Main.java")], check=True)
         entries = [("META-INF/MANIFEST.MF",
                     b"Manifest-Version: 1.0\r\nMain-Class: net.megu.launcher.Main\r\n\r\n")]
         entries.extend((str(path.relative_to(compiled)).replace("\\", "/"), path.read_bytes())

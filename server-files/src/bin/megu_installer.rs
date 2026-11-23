@@ -22,13 +22,14 @@ use std::process::ExitCode;
 const HELP: &str = "megu-installer — install Megu like the Fabric/NeoForge installers, no Java needed\n\
 \n\
 USAGE:\n\
-    megu-installer [client] [--minecraft-dir <dir>] [--mc-version 1.21.1|26.3]\n\
+    megu-installer [client|gui] [--minecraft-dir <dir>] [--mc-version 1.21.1|26.3]\n\
                    [--client-bin <path>] [--client-sha256 <hex>] [--bootstrap-jar <jar>]\n\
                    [--no-profile] [--json]\n\
     megu-installer prism [--instances-dir <dir>] [--mc-version 1.21.1|26.3]\n\
                    [--client-bin <path>] [--client-sha256 <hex>] [--bootstrap-jar <jar>] [--json]\n\
     megu-installer server --dir <dir> [--mc-version 1.21.1|26.3] [--server-bin <path>] [--json]\n\
     megu-installer uninstall [--minecraft-dir <dir>] [--mc-version 1.21.1|26.3] [--no-profile] [--json]\n\
+    megu-installer --gui\n\
     megu-installer -h | --help\n\
     megu-installer --version\n\
 \n\
@@ -38,6 +39,8 @@ COMMANDS:\n\
                 stages the bootstrapper library, and registers a\n\
                 \"Megu (<mc>)\" profile in launcher_profiles.json (plus the\n\
                 Windows Store profile file when present, with a .bak backup).\n\
+    gui         Open the native graphical installer dialog (Official Launcher,\n\
+                Prism Launcher, Dedicated Server, or Uninstall).\n\
     prism       Create a Megu-<mc> Prism Launcher instance: instance.cfg,\n\
                 mmc-pack.json, the standard .minecraft client folders, an\n\
                 optional bootstrapper patch, and an optional native\n\
@@ -537,6 +540,337 @@ fn run(cli: &Cli) -> std::io::Result<()> {
     }
 }
 
+fn parse_gui_selection(raw: &str) -> Result<Option<Cli>, String> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() || trimmed == "CANCEL" {
+        return Ok(None);
+    }
+    let mut parts = trimmed.splitn(3, '|');
+    let mode = parts.next().unwrap_or("client").trim();
+    let ver_str = parts.next().unwrap_or("1.21.1").trim();
+    let target_dir = parts.next().unwrap_or("").trim();
+    let mc_version = TargetVersion::parse(ver_str)
+        .ok_or_else(|| format!("unsupported --mc-version: {ver_str}"))?;
+    let path_opt = if target_dir.is_empty() {
+        None
+    } else {
+        Some(PathBuf::from(target_dir))
+    };
+    let cli = match mode {
+        "client" => Cli {
+            command: Command::Client,
+            minecraft_dir: path_opt,
+            instances_dir: None,
+            dir: None,
+            mc_version,
+            client_bin: None,
+            client_sha256: None,
+            bootstrap_jar: None,
+            server_bin: None,
+            no_profile: false,
+            json: false,
+        },
+        "prism" => Cli {
+            command: Command::Prism,
+            minecraft_dir: None,
+            instances_dir: path_opt,
+            dir: None,
+            mc_version,
+            client_bin: None,
+            client_sha256: None,
+            bootstrap_jar: None,
+            server_bin: None,
+            no_profile: false,
+            json: false,
+        },
+        "server" => Cli {
+            command: Command::Server,
+            minecraft_dir: None,
+            instances_dir: None,
+            dir: Some(path_opt.unwrap_or_else(|| PathBuf::from("./megu-server"))),
+            mc_version,
+            client_bin: None,
+            client_sha256: None,
+            bootstrap_jar: None,
+            server_bin: None,
+            no_profile: false,
+            json: false,
+        },
+        "uninstall" => Cli {
+            command: Command::Uninstall,
+            minecraft_dir: path_opt,
+            instances_dir: None,
+            dir: None,
+            mc_version,
+            client_bin: None,
+            client_sha256: None,
+            bootstrap_jar: None,
+            server_bin: None,
+            no_profile: false,
+            json: false,
+        },
+        other => return Err(format!("unknown GUI mode: {other}")),
+    };
+    Ok(Some(cli))
+}
+
+const TKINTER_GUI_SCRIPT: &str = r#"
+import sys, tkinter as tk
+from tkinter import ttk, filedialog
+
+mc_dir, prism_dir, srv_dir = sys.argv[1], sys.argv[2], sys.argv[3]
+root = tk.Tk()
+root.title("Megu Installer")
+root.geometry("500x320")
+root.resizable(False, False)
+
+pad = {"padx": 14, "pady": 6}
+ttk.Label(root, text="Megu — Native Rust + wgpu Installer", font=("Sans", 12, "bold")).pack(anchor="w", padx=14, pady=(14, 4))
+
+mode_var = tk.StringVar(value="client")
+ver_var = tk.StringVar(value="1.21.1")
+dir_var = tk.StringVar(value=mc_dir)
+
+def on_mode_change():
+    m = mode_var.get()
+    if m in ("client", "uninstall"):
+        dir_var.set(mc_dir)
+    elif m == "prism":
+        dir_var.set(prism_dir)
+    elif m == "server":
+        dir_var.set(srv_dir)
+
+modes = [
+    ("Official Launcher — Client Profile (Recommended)", "client"),
+    ("Prism Launcher — Create Instance", "prism"),
+    ("Dedicated Server — Initialize Server Folder", "server"),
+    ("Uninstall from Official Launcher", "uninstall"),
+]
+frame_m = ttk.Frame(root)
+frame_m.pack(fill="x", **pad)
+for label, val in modes:
+    ttk.Radiobutton(frame_m, text=label, variable=mode_var, value=val, command=on_mode_change).pack(anchor="w", pady=2)
+
+frame_v = ttk.Frame(root)
+frame_v.pack(fill="x", **pad)
+ttk.Label(frame_v, text="Minecraft version:").pack(side="left")
+ttk.Combobox(frame_v, textvariable=ver_var, values=("1.21.1", "26.3"), state="readonly", width=10).pack(side="left", padx=8)
+
+frame_d = ttk.Frame(root)
+frame_d.pack(fill="x", **pad)
+ttk.Entry(frame_d, textvariable=dir_var, width=46).pack(side="left", fill="x", expand=True)
+def browse():
+    p = filedialog.askdirectory(initialdir=dir_var.get() or ".")
+    if p:
+        dir_var.set(p)
+ttk.Button(frame_d, text="Browse...", command=browse).pack(side="left", padx=(6, 0))
+
+result = ["CANCEL"]
+def do_ok():
+    result[0] = f"{mode_var.get()}|{ver_var.get()}|{dir_var.get()}"
+    root.destroy()
+def do_cancel():
+    root.destroy()
+
+frame_b = ttk.Frame(root)
+frame_b.pack(fill="x", padx=14, pady=12)
+ttk.Button(frame_b, text="Cancel", command=do_cancel).pack(side="right", padx=(6, 0))
+ttk.Button(frame_b, text="Install", command=do_ok).pack(side="right")
+root.mainloop()
+print(result[0])
+"#;
+
+const POWERSHELL_GUI_SCRIPT: &str = r#"
+Add-Type -AssemblyName System.Windows.Forms
+Add-Type -AssemblyName System.Drawing
+$mcDir = $args[0]; $prismDir = $args[1]; $srvDir = $args[2]
+$form = New-Object System.Windows.Forms.Form
+$form.Text = "Megu Installer"
+$form.Size = New-Object System.Drawing.Size(500, 330)
+$form.StartPosition = "CenterScreen"
+$form.FormBorderStyle = "FixedDialog"
+$form.MaximizeBox = $false
+
+$lbl = New-Object System.Windows.Forms.Label
+$lbl.Text = "Megu — Native Rust + wgpu Installer"
+$lbl.Font = New-Object System.Drawing.Font("Segoe UI", 11, [System.Drawing.FontStyle]::Bold)
+$lbl.Location = New-Object System.Drawing.Point(16, 14)
+$lbl.AutoSize = $true
+$form.Controls.Add($lbl)
+
+$rbClient = New-Object System.Windows.Forms.RadioButton
+$rbClient.Text = "Official Launcher — Client Profile (Recommended)"
+$rbClient.Location = New-Object System.Drawing.Point(20, 46)
+$rbClient.AutoSize = $true; $rbClient.Checked = $true
+$form.Controls.Add($rbClient)
+
+$rbPrism = New-Object System.Windows.Forms.RadioButton
+$rbPrism.Text = "Prism Launcher — Create Instance"
+$rbPrism.Location = New-Object System.Drawing.Point(20, 72)
+$rbPrism.AutoSize = $true
+$form.Controls.Add($rbPrism)
+
+$rbServer = New-Object System.Windows.Forms.RadioButton
+$rbServer.Text = "Dedicated Server — Initialize Server Folder"
+$rbServer.Location = New-Object System.Drawing.Point(20, 98)
+$rbServer.AutoSize = $true
+$form.Controls.Add($rbServer)
+
+$rbUninstall = New-Object System.Windows.Forms.RadioButton
+$rbUninstall.Text = "Uninstall from Official Launcher"
+$rbUninstall.Location = New-Object System.Drawing.Point(20, 124)
+$rbUninstall.AutoSize = $true
+$form.Controls.Add($rbUninstall)
+
+$lblVer = New-Object System.Windows.Forms.Label
+$lblVer.Text = "Minecraft version:"
+$lblVer.Location = New-Object System.Drawing.Point(20, 160)
+$lblVer.AutoSize = $true
+$form.Controls.Add($lblVer)
+
+$cmbVer = New-Object System.Windows.Forms.ComboBox
+$cmbVer.Location = New-Object System.Drawing.Point(145, 156)
+$cmbVer.Width = 100
+$cmbVer.DropDownStyle = "DropDownList"
+[void]$cmbVer.Items.Add("1.21.1")
+[void]$cmbVer.Items.Add("26.3")
+$cmbVer.SelectedIndex = 0
+$form.Controls.Add($cmbVer)
+
+$txtDir = New-Object System.Windows.Forms.TextBox
+$txtDir.Location = New-Object System.Drawing.Point(20, 196)
+$txtDir.Width = 360
+$txtDir.Text = $mcDir
+$form.Controls.Add($txtDir)
+
+$rbClient.Add_CheckedChanged({ if ($rbClient.Checked) { $txtDir.Text = $mcDir } })
+$rbUninstall.Add_CheckedChanged({ if ($rbUninstall.Checked) { $txtDir.Text = $mcDir } })
+$rbPrism.Add_CheckedChanged({ if ($rbPrism.Checked) { $txtDir.Text = $prismDir } })
+$rbServer.Add_CheckedChanged({ if ($rbServer.Checked) { $txtDir.Text = $srvDir } })
+
+$btnBrowse = New-Object System.Windows.Forms.Button
+$btnBrowse.Text = "Browse..."
+$btnBrowse.Location = New-Object System.Drawing.Point(388, 194)
+$btnBrowse.Width = 80
+$btnBrowse.Add_Click({
+    $fbd = New-Object System.Windows.Forms.FolderBrowserDialog
+    $fbd.SelectedPath = $txtDir.Text
+    if ($fbd.ShowDialog() -eq "OK") { $txtDir.Text = $fbd.SelectedPath }
+})
+$form.Controls.Add($btnBrowse)
+
+$btnOk = New-Object System.Windows.Forms.Button
+$btnOk.Text = "Install"
+$btnOk.Location = New-Object System.Drawing.Point(300, 245)
+$btnOk.DialogResult = [System.Windows.Forms.DialogResult]::OK
+$form.AcceptButton = $btnOk
+$form.Controls.Add($btnOk)
+
+$btnCancel = New-Object System.Windows.Forms.Button
+$btnCancel.Text = "Cancel"
+$btnCancel.Location = New-Object System.Drawing.Point(388, 245)
+$btnCancel.DialogResult = [System.Windows.Forms.DialogResult]::Cancel
+$form.CancelButton = $btnCancel
+$form.Controls.Add($btnCancel)
+
+if ($form.ShowDialog() -eq [System.Windows.Forms.DialogResult]::OK) {
+    $m = if ($rbPrism.Checked) { "prism" } elseif ($rbServer.Checked) { "server" } elseif ($rbUninstall.Checked) { "uninstall" } else { "client" }
+    Write-Output "$m|$($cmbVer.SelectedItem)|$($txtDir.Text)"
+} else {
+    Write-Output "CANCEL"
+}
+"#;
+
+fn launch_gui_dialog() -> Result<Option<Cli>, String> {
+    let mc_dir = installer::detect_minecraft_dir()
+        .unwrap_or_else(|_| PathBuf::from(".minecraft"))
+        .display()
+        .to_string();
+    let prism_dir = installer::detect_prism_instances_dir()
+        .unwrap_or_else(|_| PathBuf::from("instances"))
+        .display()
+        .to_string();
+    let srv_dir = std::env::current_dir()
+        .unwrap_or_else(|_| PathBuf::from("."))
+        .join("megu-server")
+        .display()
+        .to_string();
+
+    if cfg!(windows) {
+        if let Ok(out) = std::process::Command::new("powershell")
+            .args([
+                "-NoProfile",
+                "-STA",
+                "-Command",
+                POWERSHELL_GUI_SCRIPT,
+                &mc_dir,
+                &prism_dir,
+                &srv_dir,
+            ])
+            .output()
+        {
+            if out.status.success() {
+                return parse_gui_selection(&String::from_utf8_lossy(&out.stdout));
+            }
+        }
+    }
+
+    for py in ["python3", "python"] {
+        if let Ok(out) = std::process::Command::new(py)
+            .args(["-c", TKINTER_GUI_SCRIPT, &mc_dir, &prism_dir, &srv_dir])
+            .output()
+        {
+            if out.status.success() {
+                return parse_gui_selection(&String::from_utf8_lossy(&out.stdout));
+            }
+        }
+    }
+
+    Err("no GUI toolkit available (use CLI flags such as `megu-installer client`)".into())
+}
+
+fn should_autolaunch_gui() -> bool {
+    if std::env::var_os("MEGU_HEADLESS").is_some() || std::env::var_os("CI").is_some() {
+        return false;
+    }
+    if std::env::var_os("MEGU_GUI").is_some() {
+        return true;
+    }
+    if cfg!(windows) || cfg!(target_os = "macos") {
+        return true;
+    }
+    std::env::var_os("DISPLAY").is_some() || std::env::var_os("WAYLAND_DISPLAY").is_some()
+}
+
+fn show_gui_message(title: &str, message: &str, is_error: bool) {
+    if cfg!(windows) {
+        let icon = if is_error { "Error" } else { "Information" };
+        let _ = std::process::Command::new("powershell")
+            .args([
+                "-NoProfile",
+                "-STA",
+                "-Command",
+                "Add-Type -AssemblyName System.Windows.Forms; [System.Windows.Forms.MessageBox]::Show($args[1], $args[0], 'OK', $args[2]) | Out-Null",
+                title,
+                message,
+                icon,
+            ])
+            .status();
+        return;
+    }
+    let py_script = "import sys, tkinter as tk; from tkinter import messagebox; r=tk.Tk(); r.withdraw(); (messagebox.showerror if sys.argv[3]=='1' else messagebox.showinfo)(sys.argv[1], sys.argv[2]); r.destroy()";
+    for py in ["python3", "python"] {
+        if let Ok(st) = std::process::Command::new(py)
+            .args(["-c", py_script, title, message, if is_error { "1" } else { "0" }])
+            .status()
+        {
+            if st.success() {
+                return;
+            }
+        }
+    }
+}
+
 fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().skip(1).collect();
     if matches!(args.as_slice(), [flag] if flag == "--help" || flag == "-h") {
@@ -546,6 +880,63 @@ fn main() -> ExitCode {
     if matches!(args.as_slice(), [flag] if flag == "--version" || flag == "-V") {
         println!("{VERSION}");
         return ExitCode::SUCCESS;
+    }
+    if matches!(args.as_slice(), [flag] if flag == "gui" || flag == "--gui") {
+        match launch_gui_dialog() {
+            Ok(Some(cli)) => match run(&cli) {
+                Ok(()) => {
+                    show_gui_message(
+                        "Megu Installer",
+                        &format!(
+                            "Successfully executed '{}' for Minecraft {}.",
+                            cli.command.name(),
+                            cli.mc_version.id()
+                        ),
+                        false,
+                    );
+                    return ExitCode::SUCCESS;
+                }
+                Err(err) => {
+                    let msg = format!("Installation failed: {err}");
+                    show_gui_message("Megu Installer — Error", &msg, true);
+                    eprintln!("megu-installer: {err}");
+                    return ExitCode::FAILURE;
+                }
+            },
+            Ok(None) => return ExitCode::SUCCESS,
+            Err(err) => {
+                eprintln!("megu-installer: {err}");
+                return ExitCode::FAILURE;
+            }
+        }
+    }
+    if args.is_empty() && should_autolaunch_gui() {
+        match launch_gui_dialog() {
+            Ok(Some(cli)) => match run(&cli) {
+                Ok(()) => {
+                    show_gui_message(
+                        "Megu Installer",
+                        &format!(
+                            "Successfully executed '{}' for Minecraft {}.",
+                            cli.command.name(),
+                            cli.mc_version.id()
+                        ),
+                        false,
+                    );
+                    return ExitCode::SUCCESS;
+                }
+                Err(err) => {
+                    let msg = format!("Installation failed: {err}");
+                    show_gui_message("Megu Installer — Error", &msg, true);
+                    eprintln!("megu-installer: {err}");
+                    return ExitCode::FAILURE;
+                }
+            },
+            Ok(None) => return ExitCode::SUCCESS,
+            Err(_) => {
+                // Fall back seamlessly to CLI client install when no GUI toolkit is available.
+            }
+        }
     }
     let cli = match parse(&args) {
         Ok(cli) => cli,
@@ -586,6 +977,16 @@ mod tests {
         // Bare `megu-installer` installs for the Official Launcher too.
         let cli = parse(&args(&[])).unwrap();
         assert_eq!(cli.command, Command::Client);
+
+        assert!(parse_gui_selection("CANCEL").unwrap().is_none());
+        let g = parse_gui_selection("client|1.21.1|/tmp/mc").unwrap().unwrap();
+        assert_eq!(g.command, Command::Client);
+        assert_eq!(g.mc_version, TargetVersion::V1_21_1);
+        assert_eq!(g.minecraft_dir, Some(PathBuf::from("/tmp/mc")));
+        let g2 = parse_gui_selection("server|26.3|/tmp/srv").unwrap().unwrap();
+        assert_eq!(g2.command, Command::Server);
+        assert_eq!(g2.mc_version, TargetVersion::V26_3);
+        assert_eq!(g2.dir, Some(PathBuf::from("/tmp/srv")));
     }
 
     #[test]

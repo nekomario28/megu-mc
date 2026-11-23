@@ -254,8 +254,6 @@ jobs:
                   inst_out = output / f'megu-installer-{target}{suffix}'
                   inst_out.write_bytes(tf.extractfile(inst_member).read())
                   inst_out.chmod(0o755)
-          shutil.copyfile('tools/install_linux.sh', output / 'megu-install-linux.sh')
-          (output / 'megu-install-linux.sh').chmod(0o755)
           for artifact in sorted(output.iterdir()):
               if artifact.is_file() and artifact.name != 'SHA256SUMS-all.txt':
                   checksums[artifact.name] = hashlib.sha256(artifact.read_bytes()).hexdigest()

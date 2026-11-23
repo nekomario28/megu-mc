@@ -21,20 +21,34 @@ Megu は、省メモリ・高速起動・OpenGL 依存ゼロを目指して設�
 
 ## 使い方（プレイヤー向け）
 
-**[ダウンロードページ](https://megu.megumin.tech/#download)** または **[GitHub Releases](https://github.com/nekomario28/megu-mc/releases/latest)** から導入します：
+**[ダウンロードページ](https://megu.megumin.tech/#downloads)** または **[GitHub Releases](https://github.com/nekomario28/megu-mc/releases/latest)** から、プレイスタイルに合わせて **以下のカテゴリのどれか 1 つ** を選んで導入します（よく使われる順）：
 
-- **公式ランチャーで遊ぶ（Windows / Linux / macOS）**:
-  - **Windows（`.exe` 単体・Java 不要）**: **[`megu-installer-windows-x86_64.exe`](https://github.com/nekomario28/megu-mc/releases/latest/download/megu-installer-windows-x86_64.exe)** をダウンロードして実行します。
-  - **Linux（通常版 `~/.minecraft` ＆ Flatpak 版自動対応）**: `curl -fsSL https://raw.githubusercontent.com/nekomario28/megu-mc/main/tools/install_linux.sh | sh` を実行します（または **[`megu-installer-linux-x86_64`](https://github.com/nekomario28/megu-mc/releases/latest/download/megu-installer-linux-x86_64)** を実行）。
-  - **macOS (Apple Silicon)**: **[`megu-installer-macos-arm64`](https://github.com/nekomario28/megu-mc/releases/latest/download/megu-installer-macos-arm64)** をダウンロードして実行します。
-  - **Java GUI インストーラ（NeoForge / Fabric と同じ `.jar` 方式・全 OS 共通）**: **[`megu-bootstrapper.jar`](https://github.com/nekomario28/megu-mc/releases/latest/download/megu-bootstrapper.jar)** をダブルクリック（または `java -jar megu-bootstrapper.jar`）して「Install client」を押すことでも導入できます。
-  - 導入後、公式ランチャーを起動して **Megu (1.21.1)** プロファイルを選んでプレイしてください！
-- **Prism Launcher / Modrinth App で遊ぶ**:
-  - **[`megu-1.21.1.mrpack`](https://github.com/nekomario28/megu-mc/releases/latest/download/megu-1.21.1.mrpack)** をダウンロードし、ランチャー画面へドラッグ＆ドロップするだけです（または `megu-installer prism` を実行）。
+### 1. 公式ランチャー＆単体クライアント導入（`megu-installer` — GUI / CLI 両対応・Java 不要）
 
-## 使い方（サーバー管理者向け）
+ネイティブ GPU クライアント（`megu-client-gpu`）を `<minecraft_dir>/bin/` へ自動配置し、公式 Minecraft ランチャーに **Megu (1.21.1)** プロファイルを登録します（`gui` / `--gui` 引数で GUI 画面、引数なしで 1 クリック自動導入）：
 
-**[GitHub Releases](https://github.com/nekomario28/megu-mc/releases/latest)** からお使いの OS 用アーカイブを展開し、サーバーフォルダを初期化して起動します：
+| OS | ファイル名 / コマンド | 説明 |
+| :--- | :--- | :--- |
+| **Windows (x86_64)** | **[`megu-installer-windows-x86_64.exe`](https://github.com/nekomario28/megu-mc/releases/latest/download/megu-installer-windows-x86_64.exe)** | Java 不要の単体 `.exe` インストーラ（通常版 `%APPDATA%\.minecraft` ＆ Microsoft Store 版に自動対応。`megu-installer-windows-x86_64.exe gui` で GUI 起動） |
+| **Linux (x86_64)** | `curl -fsSL https://raw.githubusercontent.com/nekomario28/megu-mc/main/tools/install_linux.sh \| sh`<br>*(または **[`megu-installer-linux-x86_64`](https://github.com/nekomario28/megu-mc/releases/latest/download/megu-installer-linux-x86_64)**)* | 通常版 `~/.minecraft` と Flatpak 版（`~/.var/app/com.mojang.Minecraft/.minecraft`）を自動判別して導入 |
+| **macOS (Apple Silicon)** | **[`megu-installer-macos-arm64`](https://github.com/nekomario28/megu-mc/releases/latest/download/megu-installer-macos-arm64)** | `~/Library/Application Support/minecraft` 向け単体ネイティブインストーラ |
+
+### 2. Modrinth App / Prism Launcher 導入（Modpack・インスタンス形式）
+
+| ランチャー | ファイル名 / コマンド | 説明 |
+| :--- | :--- | :--- |
+| **Modrinth App / Prism Launcher** | **[`megu-1.21.1.mrpack`](https://github.com/nekomario28/megu-mc/releases/latest/download/megu-1.21.1.mrpack)** | 標準 Modrinth `.mrpack` パッケージ — ランチャー画面へドラッグ＆ドロップするだけで導入 |
+| **Prism Launcher（ネイティブ ZIP）** | **[`megu-prism-1.21.1.zip`](https://github.com/nekomario28/megu-mc/releases/latest/download/megu-prism-1.21.1.zip)** | Prism 用インスタンス ZIP（または `megu-installer prism` でローカル自動生成） |
+
+## 使い方（サーバー管理者・全 CLI ツール一式）
+
+専用サーバー `megu`・GPU クライアント `megu-client-gpu`・各種 CLI ツール一式を同梱した OS 別フルアーカイブ（`megu-<version>-<os>.tar.gz`）を **[GitHub Releases](https://github.com/nekomario28/megu-mc/releases/latest)** から取得します：
+
+| OS | フルアーカイブ名 | 同梱バイナリ一覧 |
+| :--- | :--- | :--- |
+| **Windows (x86_64)** | **[`megu-v0.1.0-alpha.1-windows-x86_64.tar.gz`](https://github.com/nekomario28/megu-mc/releases/latest/download/megu-v0.1.0-alpha.1-windows-x86_64.tar.gz)** | `megu.exe`（サーバー）, `megu-client-gpu.exe`（GPU クライアント）, `megu-installer.exe`, `megu-mod-check.exe`, `megu-world-migrate.exe`, `megu-init.exe`, `megu-admin.exe` |
+| **Linux (x86_64)** | **[`megu-v0.1.0-alpha.1-linux-x86_64.tar.gz`](https://github.com/nekomario28/megu-mc/releases/latest/download/megu-v0.1.0-alpha.1-linux-x86_64.tar.gz)** | `megu`（サーバー）, `megu-client-gpu`（GPU クライアント）, `megu-installer`, `megu-mod-check`, `megu-world-migrate`, `megu-init`, `megu-admin` |
+| **macOS (Apple Silicon)** | **[`megu-v0.1.0-alpha.1-macos-arm64.tar.gz`](https://github.com/nekomario28/megu-mc/releases/latest/download/megu-v0.1.0-alpha.1-macos-arm64.tar.gz)** | `megu`（サーバー）, `megu-client-gpu`（GPU クライアント）, `megu-installer`, `megu-mod-check`, `megu-world-migrate`, `megu-init`, `megu-admin` |
 
 ```sh
 ./megu-installer server --dir ./megu-server

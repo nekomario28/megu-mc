@@ -88,10 +88,6 @@ public final class Main {
 
     private static int run(String[] args) {
         if (args.length == 0) {
-            if (!"1".equals(System.getenv("MEGU_HEADLESS"))
-                    && !java.awt.GraphicsEnvironment.isHeadless()) {
-                return InstallerGui.show();
-            }
             return runSelfInstall(null, "1.21.1", true, null, null);
         }
         if ("--megu-integrated-watch".equals(args[0])) {
@@ -404,97 +400,6 @@ public final class Main {
             updateProfilesFiles(mcDir, versionId, "Megu (" + mcVersion + ")", false);
         }
         return "Installed " + versionId + " into " + mcDir;
-    }
-
-    /**
-     * Used by the interactive Swing GUI ("Install client", like neoforge-installer.jar):
-     * if {@code <mcDir>/bin/megu-client-gpu(.exe)} is not yet staged and no sibling
-     * binary sits next to the JAR, automatically download and SHA-256-verify the
-     * matching OS release bundle from GitHub Releases into {@code <mcDir>/bin/}.
-     */
-    static String installClientFromGui(Path mcDir, String mcVersion, boolean writeProfile)
-            throws IOException {
-        String gpuName = isWindows() ? "megu-client-gpu.exe" : "megu-client-gpu";
-        String srvName = isWindows() ? "megu.exe" : "megu";
-        Path binDir = mcDir.resolve("bin");
-        Path stagedGpu = binDir.resolve(gpuName);
-        Path selfJar = selfJarPath();
-        boolean hasSibling = selfJar != null && selfJar.getParent() != null
-                && Files.isRegularFile(selfJar.getParent().resolve(gpuName));
-        if (!hasSibling && !Files.isRegularFile(stagedGpu)
-                && System.getenv("MEGU_NO_AUTO_FETCH") == null) {
-            fetchReleaseBinariesInto(mcDir, binDir, gpuName, srvName);
-        }
-        String pin = Files.isRegularFile(stagedGpu)
-                ? stagedGpu.toAbsolutePath().normalize().toString() : null;
-        return installClient(mcDir, mcVersion, writeProfile, pin, null);
-    }
-
-    private static void fetchReleaseBinariesInto(Path mcDir, Path binDir,
-            String gpuName, String srvName) throws IOException {
-        String os = System.getProperty("os.name", "").toLowerCase(Locale.ROOT);
-        String arch = System.getProperty("os.arch", "").toLowerCase(Locale.ROOT);
-        String target;
-        if (os.contains("win") && (arch.contains("64") || arch.contains("amd64"))) {
-            target = "windows-x86_64";
-        } else if (os.contains("mac") && (arch.contains("aarch64") || arch.contains("arm"))) {
-            target = "macos-arm64";
-        } else if (os.contains("linux") && (arch.contains("64") || arch.contains("amd64"))) {
-            target = "linux-x86_64";
-        } else {
-            return;
-        }
-        String tag = System.getenv().getOrDefault("MEGU_RELEASE_TAG", "v0.1.0-alpha.1");
-        String repo = System.getenv().getOrDefault("MEGU_GITHUB_REPO", "nekomario28/megu-mc");
-        String archive = "megu-" + tag + "-" + target + ".tar.gz";
-        String baseUrl = "https://github.com/" + repo + "/releases/download/" + tag;
-        Path work = mcDir.resolve("megu-runtime");
-        Files.createDirectories(work);
-        Path sumsFile = work.resolve("SHA256SUMS-all.txt");
-        Path tarFile = work.resolve(archive);
-        try {
-            if (!runCurl(baseUrl + "/SHA256SUMS-all.txt", sumsFile)
-                    || !runCurl(baseUrl + "/" + archive, tarFile)) {
-                return;
-            }
-            String expected = null;
-            for (String line : Files.readAllLines(sumsFile, StandardCharsets.UTF_8)) {
-                String[] parts = line.trim().split("\\s+", 2);
-                if (parts.length == 2 && parts[1].replace("*", "").equals(archive)) {
-                    expected = parts[0];
-                    break;
-                }
-            }
-            if (expected == null) {
-                return;
-            }
-            verifySha256(tarFile, expected);
-            Process tar = new ProcessBuilder("tar", "-xzf", tarFile.toString(), "-C", work.toString())
-                    .start();
-            if (tar.waitFor() != 0) {
-                return;
-            }
-            Path extracted = work.resolve("megu-" + tag + "-" + target);
-            Files.createDirectories(binDir);
-            for (String bin : List.of(gpuName, srvName)) {
-                Path src = extracted.resolve(bin);
-                if (Files.isRegularFile(src) && !Files.isSymbolicLink(src)) {
-                    Path dst = binDir.resolve(bin);
-                    refuseSymlink(dst);
-                    Files.copy(src, dst, StandardCopyOption.REPLACE_EXISTING);
-                    makeExecutable(dst);
-                }
-            }
-        } catch (InterruptedException error) {
-            Thread.currentThread().interrupt();
-        } finally {
-            Files.deleteIfExists(tarFile);
-        }
-    }
-
-    private static boolean runCurl(String url, Path dest) throws IOException, InterruptedException {
-        Process p = new ProcessBuilder("curl", "-fsSL", url, "-o", dest.toString()).start();
-        return p.waitFor() == 0 && Files.isRegularFile(dest);
     }
 
     /** Removes our version directory and launcher profile entry, preserving all other profiles. */
