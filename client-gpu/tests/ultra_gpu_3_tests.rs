@@ -5,11 +5,11 @@
 //!   composed frames replay the terrain + UI `RenderBundle`s, skip
 //!   unchanged UBO writes, and install sections through partial
 //!   region-arena `queue.write_buffer`s.
-//! * `ultra_cpu_ram_drop_lazy_shadow_and_16b_region_vertex_parity` —
+//! * `ultra_cpu_ram_drop_lazy_shadow_and_12b_region_vertex_parity` —
 //!   opaque CPU vertex/index copies are freed after install, the shadow
 //!   map stays unallocated while quality is `Off` and allocates lazily
-//!   once enabled, and region arenas draw through the 16-byte
-//!   `PackedVertex` layout deterministically.
+//!   once enabled, and region arenas draw through the 12-byte
+//!   `CompactVoxelVertex` layout deterministically.
 //! * `ultra_pure_wgpu_primary_no_gl_jit_latelatch_and_governor_stages` —
 //!   `ClassicLowSpec` never selects GL/SECONDARY, capped pacing pins
 //!   `desired_maximum_frame_latency` to 1, and the
@@ -227,10 +227,10 @@ fn ultra_render_bundle_and_ubo_skip_execute_on_real_gpu() {
 /// §2 — opaque CPU vertex/index copies are freed after install
 /// (`cpu_opaque_bytes_freed`), the shadow map stays `None` while the
 /// quality is `Off` and allocates lazily once enabled, and the arena
-/// region pipeline draws through a 16-byte `PackedVertex` with
-/// deterministic output.
+/// region pipeline draws through the 12-byte `CompactVoxelVertex`
+/// stream with deterministic output.
 #[test]
-fn ultra_cpu_ram_drop_lazy_shadow_and_16b_region_vertex_parity() {
+fn ultra_cpu_ram_drop_lazy_shadow_and_12b_region_vertex_parity() {
     assert_eq!(
         std::mem::size_of::<PackedVertex>(),
         16,
@@ -266,14 +266,27 @@ fn ultra_cpu_ram_drop_lazy_shadow_and_16b_region_vertex_parity() {
         renderer.cpu_opaque_bytes_freed, renderer.region_arena_draws
     );
     // The offline world produces direction-bucketed sections, so arena
-    // draws must have been emitted through the 16-byte layout.
+    // draws must have been emitted through the compact 12-byte layout.
     assert!(
         renderer.region_arena_draws >= 1,
-        "region arenas must draw through PackedVertex: {}",
+        "region arenas must draw through CompactVoxelVertex: {}",
         renderer.region_arena_draws,
     );
 
-    // 16-byte layout renders deterministically: two identical frames
+    // Post-upload the resident set keeps only the Hi-Z position stream
+    // (4 B per quad word) plus translucent sort tails — never the
+    // 16-byte `PackedVertex` mesh or order copies. Retention must be at
+    // most a quarter of the released payload for this all-opaque world.
+    let retained = renderer.retained_cpu_mesh_bytes();
+    let released = renderer.cpu_mesh_bytes_freed + renderer.cpu_opaque_bytes_freed;
+    assert!(released > 0, "uploads must have released CPU payloads");
+    assert!(
+        retained * 4 <= released,
+        "retained CPU mesh bytes must stay minimal after upload: \
+         retained={retained} released={released}"
+    );
+
+    // 12-byte layout renders deterministically: two identical frames
     // agree byte-for-byte.
     let a = render_live_frame(&mut renderer, &mut live, &camera, &blender, &tracker);
     let b = render_live_frame(&mut renderer, &mut live, &camera, &blender, &tracker);

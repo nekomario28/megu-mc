@@ -388,27 +388,26 @@ fn gpu_indirect_diff_uploads_zero_bytes_steady_and_partial_span_on_single_edit()
         args[new_index].instance_count, 1,
         "the GPU cull must keep the arriving section — it is inside the frustum"
     );
-    let indirect_vb = indirect
+    let (indirect_vb, indirect_high_water, _, _) = indirect
         .debug_region_arena_vertex_buffer([-8, 0, -8])
-        .expect("new region arena")
-        .0
-        .clone();
-    let fresh_vb = fresh
+        .expect("new region arena");
+    let (fresh_vb, fresh_high_water, _, _) = fresh
         .debug_region_arena_vertex_buffer([-8, 0, -8])
-        .expect("new region arena")
-        .0
-        .clone();
+        .expect("new region arena");
+    assert_eq!(indirect_high_water, fresh_high_water);
+    // 12-byte `CompactVoxelVertex` records: cover the whole staged stream.
+    let vertex_bytes = u64::from(indirect_high_water) * 12;
     let indirect_vb_bytes = read_buffer(
         &indirect.gpu().device,
         &indirect.gpu().queue,
-        &indirect_vb,
-        24 * 16,
+        indirect_vb,
+        vertex_bytes,
     );
     let fresh_vb_bytes = read_buffer(
         &fresh.gpu().device,
         &fresh.gpu().queue,
-        &fresh_vb,
-        24 * 16,
+        fresh_vb,
+        vertex_bytes,
     );
     assert_eq!(
         indirect_vb_bytes, fresh_vb_bytes,

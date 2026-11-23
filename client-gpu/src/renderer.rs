@@ -27,6 +27,10 @@ use megu_client_mesh::builtin_shadow_wgsl::{
     MEGU_SPATIAL_SHARPEN_WGSL, MEGU_STAINED_GLASS_SHADOW_COLOR_WGSL, MEGU_TERRAIN_LIT_WGSL,
     MEGU_WATER_SURFACE_WGSL,
 };
+use megu_client_mesh::compact_vertex::{
+    CompactVoxelVertex, COMPACT_VERTEX_MAX_EDGE, COMPACT_VERTEX_MAX_STATE_ID,
+    COMPACT_VERTEX_MAX_TINT, COMPACT_VERTEX_MAX_Y_FIXED, COMPACT_VERTEX_WGSL_UNPACK,
+};
 use megu_client_mesh::ffi::PackedVertex;
 use megu_client_mesh::vanilla_plus_3d::ExtrudedMesh;
 use megu_client_mesh::vfx_engine::DynamicColoredLight;
@@ -57,7 +61,8 @@ use crate::live_session::hw_adaptive_engine::{
 use crate::live_session::{ExternalSectionsDelta, LiveSession};
 use crate::mat4_mul;
 use crate::mesh_pool::{
-    compute_opaque_bucket_ranges, HiZSplatSection, MeshJob, MeshJobPool, MeshResult,
+    build_hiz_stream, compute_opaque_bucket_ranges, HiZSplatSection,
+    MeshJob, MeshJobPool, MeshResult,
 };
 use crate::subworld_render::{
     pack_particle_billboard, CompositeDrawUniforms, CompositeEnvUniforms, DebugLineVertex,
@@ -440,7 +445,7 @@ pub struct SectionUniforms {
     pub biome_tint_strength: f32,
 }
 
-const TERRAIN_ATTRS: [wgpu::VertexAttribute; 4] = [
+const TERRAIN_ATTRS: [wgpu::VertexAttribute; 3] = [
     wgpu::VertexAttribute {
         format: wgpu::VertexFormat::Uint32,
         offset: 0,
@@ -456,16 +461,16 @@ const TERRAIN_ATTRS: [wgpu::VertexAttribute; 4] = [
         offset: 8,
         shader_location: 2,
     },
-    wgpu::VertexAttribute {
-        format: wgpu::VertexFormat::Uint32,
-        offset: 12,
-        shader_location: 3,
-    },
 ];
 
-/// 16-byte `PackedVertex` stride -> `@location(0..3)` `u32` inputs.
+/// 12-byte `CompactVoxelVertex` stride -> `@location(0..2)` `u32` inputs —
+/// the terrain pipelines' shared fetch format (`-25%` VRAM and vertex
+/// fetch bandwidth vs the 16-byte `PackedVertex`). External shaderpack
+/// modules authored against the old four-word input are rewritten to it
+/// by [`compact_pack_terrain_wgsl`]; only packs without a matching
+/// vertex input fall back to the built-in pipeline.
 pub const TERRAIN_VERTEX_LAYOUT: wgpu::VertexBufferLayout<'static> = wgpu::VertexBufferLayout {
-    array_stride: std::mem::size_of::<PackedVertex>() as wgpu::BufferAddress,
+    array_stride: std::mem::size_of::<CompactVoxelVertex>() as wgpu::BufferAddress,
     step_mode: wgpu::VertexStepMode::Vertex,
     attributes: &TERRAIN_ATTRS,
 };
@@ -477,12 +482,699 @@ pub const TERRAIN_VERTEX_LAYOUT: wgpu::VertexBufferLayout<'static> = wgpu::Verte
 /// byte (quad extents/corner, dead on the GPU) is cleared and reused —
 /// and the section-local `position` word keeps all 25 coordinate bits
 /// (including the 1/1024 `ly` precision) 100% untouched.
-fn region_section_word(origin: [i32; 3], coord: SectionCoord) -> u32 {
+#[doc(hidden)]
+pub fn region_section_word(origin: [i32; 3], coord: SectionCoord) -> u32 {
     let sx = (coord.0 - origin[0]) as u32;
     let sy = (coord.1 - origin[1]) as u32;
     let sz = (coord.2 - origin[2]) as u32;
     (sx | (sy << 3) | (sz << 5)) << 24
 }
+
+// ---------------------------------------------------------------------------
+// 12-byte `CompactVoxelVertex` terrain stream (16B -> 12B upload format)
+// ---------------------------------------------------------------------------
+
+/// Region-arena variant of [`COMPACT_VERTEX_WGSL_UNPACK`]. The arena's
+/// opaque streams draw through the canonical shared index buffer, so the
+/// quad extents + corner index in compact-attribute bits 20-29 are dead
+/// on the GPU; [`RegionArena::insert`] writes the section-in-region word
+/// `sx | sy<<3 | sz<<5` into bits 20-27 instead, and this decode lifts it
+/// back into `attributes` bits 24-31 — the exact slot the 16-byte stream
+/// carried (`let sec = attributes >> 24u`).
+const COMPACT_VERTEX_WGSL_UNPACK_REGION: &str = r#"
+fn unpack_compact_voxel_vertex_region(input: CompactVoxelVertexInput) -> PackedVoxelVertexWords {
+    let pos_index = input.word0 & 0x7fffffu;
+    let attr_lo = input.word0 >> 23u;
+    let attr_hi = input.word1 & 0x1fffffu;
+    let attr = attr_lo | (attr_hi << 9u);
+
+    let y_fixed = pos_index / 289u;
+    let rem = pos_index - y_fixed * 289u;
+    let z = rem / 17u;
+    let x = rem - z * 17u;
+
+    var out: PackedVoxelVertexWords;
+    out.position = x | (z << 5u) | (y_fixed << 10u);
+    out.state_id = ((input.word1 >> 21u) & 0x7ffu) | ((input.word2 & 0xffu) << 11u);
+    out.attributes = (attr & 0xfffffu) | (((attr >> 20u) & 0xffu) << 24u);
+    out.tint = input.word2 >> 8u;
+    return out;
+}
+"#;
+
+/// One 16-byte `PackedVertex` WGSL input struct to rewrite for the
+/// 12-byte compact stream: the struct name, the parameter name its
+/// vertex entries bind, and the original `@location` field names in
+/// order. Field 3 is `tint` for terrain, `sway_kind` for the cutout
+/// caster — both alias the packed tint word's slot in the upload stream.
+struct PackedVertexInputSpec {
+    input_struct: &'static str,
+    param: &'static str,
+    fields: [&'static str; 4],
+}
+
+const PACKED_VERTEX_INPUT_SPECS: &[PackedVertexInputSpec] = &[
+    PackedVertexInputSpec {
+        input_struct: "TerrainVertex",
+        param: "in",
+        fields: ["packed_pos", "state_id", "attributes", "tint"],
+    },
+    PackedVertexInputSpec {
+        input_struct: "TranslucentVertex",
+        param: "in",
+        fields: ["packed_pos", "state_id", "attributes", "tint"],
+    },
+    PackedVertexInputSpec {
+        input_struct: "CutoutInput",
+        param: "input",
+        fields: ["packed_pos", "state_id", "attributes", "sway_kind"],
+    },
+];
+
+/// Rewrite a built-in packed-terrain WGSL module for the 12-byte
+/// `CompactVoxelVertex` stream: every four-word vertex-input struct
+/// becomes `word0..2`, each consuming vertex entry unpacks through the
+/// exact `client-port` bit layout and rebinds a `<Struct>Packed` record
+/// with the original field names so every decode body stays
+/// byte-identical, and the unpack code is appended. `region_opaque_fn`
+/// names the one entry that consumes region-arena vertices — it unpacks
+/// through the section-word variant instead. Panics on anchor drift,
+/// matching `region_opaque_wgsl`: a silently wrong layout is worse than
+/// a loud build failure.
+pub fn compact_terrain_wgsl(source: &str, region_opaque_fn: Option<&str>) -> String {
+    let mut out = source.to_string();
+    for spec in PACKED_VERTEX_INPUT_SPECS {
+        // Struct bodies may interleave field comments (`CutoutInput`
+        // documents `sway_kind`), so match the record by brace range and
+        // verify each `@location` line individually.
+        let open = format!("struct {} {{", spec.input_struct);
+        let Some(struct_at) = out.find(&open) else {
+            continue;
+        };
+        let Some(close_rel) = out[struct_at..].find("};") else {
+            panic!("compact WGSL: {} body unterminated", spec.input_struct);
+        };
+        for (loc, field) in spec.fields.iter().enumerate() {
+            let attr = format!("@location({loc}) {field}: u32");
+            assert!(
+                out[struct_at..struct_at + close_rel].contains(&attr),
+                "compact WGSL: {} lost {attr}",
+                spec.input_struct
+            );
+        }
+        out.replace_range(
+            struct_at..struct_at + close_rel + 2,
+            &format!(
+                "struct {} {{\n    @location(0) word0: u32,\n    @location(1) word1: u32,\n    @location(2) word2: u32,\n}};\n\nstruct {}Packed {{\n    {}: u32,\n    {}: u32,\n    {}: u32,\n    {}: u32,\n}};",
+                spec.input_struct,
+                spec.input_struct,
+                spec.fields[0],
+                spec.fields[1],
+                spec.fields[2],
+                spec.fields[3]
+            ),
+        );
+        // Inject the unpack + rebind at the top of every vertex entry
+        // taking `(param: Struct)`. Entries' `cv_packed` rebinds share the
+        // name — each fn body is a fresh scope.
+        let signature = format!("({}: {})", spec.param, spec.input_struct);
+        let mut injected = 0u32;
+        let mut search = 0usize;
+        while let Some(rel) = out[search..].find(&signature) {
+            let sig_open = search + rel;
+            search = sig_open + signature.len();
+            let name_start = out[..sig_open]
+                .rfind(|c: char| !(c.is_alphanumeric() || c == '_'))
+                .map_or(0, |index| index + 1);
+            if !out[..name_start].trim_end().ends_with("fn") {
+                continue;
+            }
+            let fn_name = &out[name_start..sig_open];
+            let unpack = if region_opaque_fn == Some(fn_name) {
+                "unpack_compact_voxel_vertex_region"
+            } else {
+                "unpack_compact_voxel_vertex"
+            };
+            let Some(brace_rel) = out[sig_open..].find('{') else {
+                break;
+            };
+            let insert_at = sig_open + brace_rel + 1;
+            let injection = format!(
+                "\n    let pv_words = {unpack}(CompactVoxelVertexInput({p}.word0, {p}.word1, {p}.word2));\n    let cv_packed = {s}Packed(pv_words.position, pv_words.state_id, pv_words.attributes, pv_words.tint);",
+                p = spec.param,
+                s = spec.input_struct,
+            );
+            out.insert_str(insert_at, &injection);
+            search = insert_at + injection.len();
+            injected += 1;
+        }
+        assert!(
+            injected > 0,
+            "compact WGSL: no vertex entry consumes {}",
+            spec.input_struct
+        );
+    }
+    // Rebind every original field access to the unpacked words — fragment
+    // inputs declare none of these names, so each pattern only occurs in
+    // a rewritten vertex body.
+    for spec in PACKED_VERTEX_INPUT_SPECS {
+        for field in spec.fields {
+            out = out.replace(
+                &format!("{}.{field}", spec.param),
+                &format!("cv_packed.{field}"),
+            );
+        }
+    }
+    out.push('\n');
+    out.push_str(COMPACT_VERTEX_WGSL_UNPACK);
+    if region_opaque_fn.is_some() {
+        out.push_str(COMPACT_VERTEX_WGSL_UNPACK_REGION);
+    }
+    // Anchor verification: the compact stream is only correct when an
+    // unpack bound every rewritten entry and no 16-byte field access
+    // survived.
+    assert!(
+        out.contains("unpack_compact_voxel_vertex(CompactVoxelVertexInput(")
+            || out.contains("unpack_compact_voxel_vertex_region(CompactVoxelVertexInput("),
+        "compact WGSL lost its vertex unpack"
+    );
+    for spec in PACKED_VERTEX_INPUT_SPECS {
+        for field in spec.fields {
+            assert!(
+                !out.contains(&format!("{}.{field}", spec.param)),
+                "compact WGSL kept a 16-byte field access: {}.{field}",
+                spec.param
+            );
+        }
+    }
+    out
+}
+
+/// A pack-authored vertex-input struct that matches the 16-byte
+/// `PackedVertex` upload contract: exactly four `u32` fields at
+/// `@location(0..3)` under arbitrary names. `fields` lists
+/// `(location, field_name)` in declaration order.
+struct PackInputStruct {
+    name: String,
+    fields: Vec<(u32, String)>,
+}
+
+/// A pack `@vertex` entry whose parameters carry the four packed words
+/// as free `@location(0..3) name: u32` arguments instead of a struct.
+struct PackFreeEntry {
+    name: String,
+    params: Vec<(u32, String)>,
+}
+
+/// `PackedVoxelVertexWords` field each `@location` index feeds — the
+/// semantic contract every packed-terrain input shares regardless of
+/// the names a pack (or the built-in modules) chose.
+const PACK_WORD_BY_LOCATION: [&str; 4] = ["position", "state_id", "attributes", "tint"];
+
+/// Offset of the `)` matching the `(` at `open`, tracking nested parens
+/// (attributes like `@location(0)` inside a parameter list).
+fn paren_close(source: &str, open: usize) -> Option<usize> {
+    let mut depth = 0i32;
+    for (index, ch) in source[open..].char_indices() {
+        match ch {
+            '(' => depth += 1,
+            ')' => {
+                depth -= 1;
+                if depth == 0 {
+                    return Some(open + index);
+                }
+            }
+            _ => {}
+        }
+    }
+    None
+}
+
+/// Parse the body of `struct <name> { body }` at `open..close` in
+/// `source`: qualifies when every member is a `@location(k) <ident>:
+/// u32` field and the locations are exactly `{0, 1, 2, 3}` — the
+/// four-word packed-terrain contract under any naming. Bodies carrying
+/// other member kinds or extra locations cannot be fed by the compact
+/// stream and are left for the device to reject.
+fn pack_input_struct(source: &str, name: &str) -> Option<PackInputStruct> {
+    let open = source.find(&format!("struct {name} {{"))?;
+    let close_rel = source[open..].find("};")?;
+    let body = &source[open..open + close_rel];
+    let brace = body.find('{')?;
+    let body = &body[brace + 1..];
+    let mut fields: Vec<(u32, String, usize, usize)> = Vec::new();
+    let mut cursor = 0usize;
+    while let Some(rel) = body[cursor..].find("@location(") {
+        let at = cursor + rel;
+        let after = at + "@location(".len();
+        let digits_end = body[after..]
+            .find(|c: char| !c.is_ascii_digit())
+            .map_or(after, |d| after + d);
+        let loc: u32 = body[after..digits_end].parse().ok()?;
+        let mut rest = digits_end;
+        rest += body[rest..].find(')')? + 1;
+        rest += body[rest..].find(|c: char| !c.is_whitespace())?;
+        let name_end = body[rest..]
+            .find(|c: char| !(c.is_alphanumeric() || c == '_'))
+            .map_or(body.len(), |e| rest + e);
+        let field = body[rest..name_end].to_string();
+        rest = name_end + body[name_end..].find(':')? + 1;
+        rest += body[rest..].find(|c: char| !c.is_whitespace())?;
+        let type_end = body[rest..]
+            .find(|c: char| !(c.is_alphanumeric() || c == '_'))
+            .map_or(body.len(), |e| rest + e);
+        if &body[rest..type_end] != "u32" {
+            return None;
+        }
+        fields.push((loc, field, at, type_end));
+        cursor = type_end;
+    }
+    // Nothing but the four matched fields, `//` comments, and
+    // `,`/`;`/whitespace may remain — any other member breaks the match.
+    let mut residue = String::with_capacity(body.len());
+    let mut last = 0usize;
+    for (_, _, at, end) in &fields {
+        residue.push_str(&body[last..*at]);
+        last = *end;
+    }
+    residue.push_str(&body[last..]);
+    for line in residue.lines() {
+        let line = line.split("//").next().unwrap_or("");
+        if line.trim_matches(|c: char| c.is_whitespace() || c == ',' || c == ';').is_empty() {
+            continue;
+        }
+        return None;
+    }
+    let mut by_loc: Vec<u32> = fields.iter().map(|f| f.0).collect();
+    by_loc.sort_unstable();
+    if by_loc != [0, 1, 2, 3] {
+        return None;
+    }
+    Some(PackInputStruct {
+        name: name.to_string(),
+        fields: fields
+            .into_iter()
+            .map(|(loc, field, _, _)| (loc, field))
+            .collect(),
+    })
+}
+
+/// Discover every `@vertex` entry in `source` and classify its terrain
+/// input: a struct param whose record matches the four-word contract,
+/// or free `@location(0..3) u32` params. Returns the qualifying struct
+/// specs (deduped by name) and the free-param entries.
+fn pack_vertex_inputs(source: &str) -> (Vec<PackInputStruct>, Vec<PackFreeEntry>) {
+    let mut structs: Vec<PackInputStruct> = Vec::new();
+    let mut frees: Vec<PackFreeEntry> = Vec::new();
+    let mut cursor = 0usize;
+    while let Some(rel) = source[cursor..].find("@vertex") {
+        let mut at = cursor + rel + "@vertex".len();
+        let Some(fn_rel) = source[at..].find("fn ") else {
+            break;
+        };
+        at += fn_rel + 3;
+        // A different attribute sitting between `@vertex` and `fn` means
+        // this function is not the vertex entry — skip it.
+        if source[cursor + rel + "@vertex".len()..at - 3].contains('@') {
+            cursor = at;
+            continue;
+        }
+        at += source[at..].find(|c: char| !c.is_whitespace()).unwrap_or(0);
+        let name_end = source[at..]
+            .find(|c: char| !(c.is_alphanumeric() || c == '_'))
+            .map_or(at, |e| at + e);
+        let fn_name = &source[at..name_end];
+        let Some(paren_rel) = source[name_end..].find('(') else {
+            cursor = name_end;
+            continue;
+        };
+        let paren = name_end + paren_rel;
+        let Some(close_abs) = paren_close(source, paren) else {
+            cursor = paren;
+            continue;
+        };
+        let params_src = &source[paren + 1..close_abs];
+        let mut free: Vec<(u32, String)> = Vec::new();
+        for param in params_src.split(',') {
+            let param = param.trim();
+            if let Some((decl, type_name)) = param.split_once(':') {
+                let decl = decl.trim();
+                let type_name = type_name.trim();
+                if let Some(loc_open) = decl.find("@location(") {
+                    let digits = &decl[loc_open + "@location(".len()..];
+                    let loc: u32 = digits
+                        .split(|c: char| !c.is_ascii_digit())
+                        .next()
+                        .and_then(|d| d.parse().ok())
+                        .unwrap_or(u32::MAX);
+                    let name = decl[loc_open..]
+                        .split(')')
+                        .nth(1)
+                        .unwrap_or("")
+                        .trim()
+                        .to_string();
+                    if type_name == "u32" && loc < 4 && !name.is_empty() {
+                        free.push((loc, name));
+                    }
+                } else if type_name
+                    .chars()
+                    .all(|c| c.is_alphanumeric() || c == '_')
+                    && !type_name.is_empty()
+                    && structs.iter().all(|s: &PackInputStruct| s.name != type_name)
+                {
+                    if let Some(spec) = pack_input_struct(source, type_name) {
+                        structs.push(spec);
+                    }
+                }
+            }
+        }
+        let mut locs: Vec<u32> = free.iter().map(|f| f.0).collect();
+        locs.sort_unstable();
+        if locs == [0, 1, 2, 3] {
+            frees.push(PackFreeEntry {
+                name: fn_name.to_string(),
+                params: free,
+            });
+        }
+        cursor = close_abs;
+    }
+    (structs, frees)
+}
+
+/// Rewrite a shaderpack-authored WGSL module for the 12-byte
+/// `CompactVoxelVertex` stream — the pack-facing twin of
+/// [`compact_terrain_wgsl`], generic over the pack's own struct/field
+/// naming. Every vertex input matching the four-word packed contract is
+/// rebuilt from `word0..2` through the canonical unpack, so pack shader
+/// bodies keep reading the same four logical words they were authored
+/// against. Modules without a matching vertex input pass through
+/// unchanged and the device rejects them exactly as before — the
+/// fallback path stays the safety net.
+pub fn compact_pack_terrain_wgsl(source: &str) -> String {
+    let (structs, frees) = pack_vertex_inputs(source);
+    if structs.is_empty() && frees.is_empty() {
+        return source.to_string();
+    }
+    let mut out = source.to_string();
+    for spec in &structs {
+        let open = format!("struct {} {{", spec.name);
+        let Some(struct_at) = out.find(&open) else {
+            continue;
+        };
+        let Some(close_rel) = out[struct_at..].find("};") else {
+            continue;
+        };
+        // `<Struct>Packed` keeps the original field names in declaration
+        // order; the constructor binds each field to the unpack word its
+        // `@location` index carries.
+        let mut packed_fields = String::new();
+        let mut ctor_args = String::new();
+        for (loc, field) in &spec.fields {
+            packed_fields.push_str(&format!("    {field}: u32,\n"));
+            ctor_args.push_str(&format!("pv_words.{}, ", PACK_WORD_BY_LOCATION[*loc as usize]));
+        }
+        let ctor_args = ctor_args.trim_end_matches(", ");
+        out.replace_range(
+            struct_at..struct_at + close_rel + 2,
+            &format!(
+                "struct {} {{\n    @location(0) word0: u32,\n    @location(1) word1: u32,\n    @location(2) word2: u32,\n}};\n\nstruct {}Packed {{\n{packed_fields}}};",
+                spec.name, spec.name
+            ),
+        );
+        // Inject the unpack + rebind at the top of every entry taking a
+        // `<param>: <Struct>` argument, then rebind `param.field` within
+        // that entry's body only — a fragment entry reusing the same
+        // parameter name must not see `cv_packed`.
+        let signature_suffix = format!(": {})", spec.name);
+        let mut search = 0usize;
+        while let Some(rel) = out[search..].find(&signature_suffix) {
+            let sig_close = search + rel;
+            search = sig_close + signature_suffix.len();
+            // Walk back over balanced parens (attributes like
+            // `@location(`/`@builtin(` may precede the typed param) to
+            // the enclosing parameter list.
+            let mut depth = 0i32;
+            let mut param_open_rel = 0usize;
+            let mut found_open = false;
+            for (index, ch) in out[..sig_close].char_indices().rev() {
+                match ch {
+                    ')' => depth += 1,
+                    '(' => {
+                        if depth == 0 {
+                            param_open_rel = index;
+                            found_open = true;
+                            break;
+                        }
+                        depth -= 1;
+                    }
+                    _ => {}
+                }
+            }
+            if !found_open {
+                continue;
+            }
+            let params_src = &out[param_open_rel + 1..sig_close];
+            let decl = params_src.split(',').next_back().unwrap_or("").trim();
+            let param = decl
+                .rsplit(')')
+                .next()
+                .unwrap_or(decl)
+                .trim()
+                .to_string();
+            if param.is_empty()
+                || !param
+                    .chars()
+                    .all(|c| c.is_alphanumeric() || c == '_')
+            {
+                continue;
+            }
+            let name_start = out[..param_open_rel]
+                .rfind(|c: char| !(c.is_alphanumeric() || c == '_'))
+                .map_or(0, |index| index + 1);
+            if !out[..name_start].trim_end().ends_with("fn") {
+                continue;
+            }
+            let Some(brace_rel) = out[sig_close..].find('{') else {
+                break;
+            };
+            let insert_at = sig_close + brace_rel + 1;
+            let injection = format!(
+                "\n    let pv_words = unpack_compact_voxel_vertex(CompactVoxelVertexInput({p}.word0, {p}.word1, {p}.word2));\n    let cv_packed = {s}Packed({ctor_args});",
+                p = param,
+                s = spec.name,
+            );
+            out.insert_str(insert_at, &injection);
+            // Rebind original field accesses inside this entry's body.
+            let body_start = insert_at + injection.len();
+            let mut depth = 1i32;
+            let mut body_end = body_start;
+            for (index, ch) in out[body_start..].char_indices() {
+                match ch {
+                    '{' => depth += 1,
+                    '}' => {
+                        depth -= 1;
+                        if depth == 0 {
+                            body_end = body_start + index;
+                            break;
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            let mut body = out[body_start..body_end].to_string();
+            for (_, field) in &spec.fields {
+                let needle = format!("{param}.{field}");
+                let mut rebuilt = String::with_capacity(body.len());
+                let mut cursor = 0usize;
+                while let Some(at) = body[cursor..].find(&needle) {
+                    let abs = cursor + at;
+                    let left_ok = abs == 0
+                        || !body[..abs]
+                            .chars()
+                            .last()
+                            .is_some_and(|c| c.is_alphanumeric() || c == '_');
+                    rebuilt.push_str(&body[cursor..abs]);
+                    if left_ok {
+                        rebuilt.push_str(&format!("cv_packed.{field}"));
+                    } else {
+                        rebuilt.push_str(&needle);
+                    }
+                    cursor = abs + needle.len();
+                }
+                rebuilt.push_str(&body[cursor..]);
+                body = rebuilt;
+            }
+            out.replace_range(body_start..body_end, &body);
+            search = body_start + body.len();
+        }
+    }
+    for entry in &frees {
+        let needle = format!("fn {}(", entry.name);
+        let Some(fn_at) = out.find(&needle) else {
+            continue;
+        };
+        let paren = fn_at + needle.len() - 1;
+        let Some(close_abs) = paren_close(out.as_str(), paren) else {
+            continue;
+        };
+        let params_src = &out[paren + 1..close_abs];
+        let matched: Vec<&str> = entry
+            .params
+            .iter()
+            .map(|(loc, name)| {
+                params_src
+                    .split(',')
+                    .map(str::trim)
+                    .find(|p| {
+                        p.starts_with(&format!("@location({loc})"))
+                            && p.ends_with(&format!("{name}: u32"))
+                    })
+                    .unwrap_or("")
+            })
+            .collect();
+        if matched.iter().any(|m| m.is_empty()) {
+            continue;
+        }
+        let kept: Vec<&str> = params_src
+            .split(',')
+            .map(str::trim)
+            .filter(|p| !p.is_empty() && !matched.contains(p))
+            .collect();
+        let mut new_params =
+            String::from("@location(0) word0: u32, @location(1) word1: u32, @location(2) word2: u32");
+        for p in kept {
+            new_params.push_str(", ");
+            new_params.push_str(p);
+        }
+        out.replace_range(paren + 1..close_abs, &new_params);
+        let Some(brace_rel) = out[paren..].find('{') else {
+            continue;
+        };
+        let insert_at = paren + brace_rel + 1;
+        let mut injection = String::from(
+            "\n    let pv_words = unpack_compact_voxel_vertex(CompactVoxelVertexInput(word0, word1, word2));",
+        );
+        for (loc, name) in &entry.params {
+            injection.push_str(&format!(
+                "\n    let {name} = pv_words.{};",
+                PACK_WORD_BY_LOCATION[*loc as usize]
+            ));
+        }
+        out.insert_str(insert_at, &injection);
+    }
+    out.push('\n');
+    out.push_str(COMPACT_VERTEX_WGSL_UNPACK);
+    out
+}
+
+/// The shadow-caster module (`MEGU_SHADOW_DEPTH_WGSL` +
+/// `MEGU_SHADOW_CASTERS_WGSL`) for the compact stream: `vs_terrain`'s
+/// free `@location` parameter becomes `word0..2`, the body rebinds
+/// `packed_pos` from the unpack, and — for the region pipeline — the
+/// section-in-region word folds into the integer decode exactly as
+/// `region_caster_wgsl` did for the 16-byte stream. `vs_lit`/`vs_inst`
+/// keep their typed layouts untouched.
+pub fn compact_caster_wgsl(region: bool) -> String {
+    let source = format!("{MEGU_SHADOW_DEPTH_WGSL}\n{MEGU_SHADOW_CASTERS_WGSL}");
+    let unpack = if region {
+        "unpack_compact_voxel_vertex_region"
+    } else {
+        "unpack_compact_voxel_vertex"
+    };
+    let mut out = source.replacen(
+        "fn vs_terrain(@location(0) packed_pos: u32) -> @builtin(position) vec4<f32> {",
+        &format!(
+            "fn vs_terrain(@location(0) word0: u32, @location(1) word1: u32, @location(2) word2: u32) -> @builtin(position) vec4<f32> {{\n    let pv_words = {unpack}(CompactVoxelVertexInput(word0, word1, word2));\n    let packed_pos = pv_words.position;"
+        ),
+        1,
+    );
+    assert!(
+        out.contains("fn vs_terrain(@location(0) word0: u32"),
+        "compact caster anchor missing"
+    );
+    if region {
+        out = out.replacen(
+            "let local = vec3<f32>(f32(packed_pos & 31u),\n        f32(packed_pos >> 10u) / 1024.0, f32((packed_pos >> 5u) & 31u));",
+            "let sec = pv_words.attributes >> 24u;\n    let local = vec3<f32>(f32(packed_pos & 31u) + f32((sec & 7u) * 16u),\n        f32((packed_pos >> 10u) + ((sec >> 3u) & 3u) * 16384u) / 1024.0, f32((packed_pos >> 5u) & 31u) + f32(sec >> 5u) * 16.0);",
+            1,
+        );
+        assert!(
+            out.contains("let sec = pv_words.attributes >> 24u;"),
+            "region caster anchor missing"
+        );
+    }
+    out.push_str(COMPACT_VERTEX_WGSL_UNPACK);
+    if region {
+        out.push_str(COMPACT_VERTEX_WGSL_UNPACK_REGION);
+    }
+    out
+}
+
+/// `true` when `vertex` fits the compact section-local domain for the
+/// region arena — identical to [`CompactVoxelVertex::is_representable`]
+/// minus the quad-extent fields (the arena's canonical index stream
+/// makes width/height/corner dead on the GPU, and their compact bits
+/// carry the section-in-region word instead).
+#[doc(hidden)]
+pub fn compact_arena_representable(vertex: &PackedVertex) -> bool {
+    let position = vertex.position;
+    position & 0xc000_0000 == 0
+        && position & 0x1f <= COMPACT_VERTEX_MAX_EDGE
+        && (position >> 5) & 0x1f <= COMPACT_VERTEX_MAX_EDGE
+        && (position >> 10) & 0x000f_ffff <= COMPACT_VERTEX_MAX_Y_FIXED
+        && vertex.state_id <= COMPACT_VERTEX_MAX_STATE_ID
+        && vertex.tint <= COMPACT_VERTEX_MAX_TINT
+}
+
+/// Serialize `vertex` into the region-arena's compact record: the
+/// standard 12-byte layout except compact-attribute bits 20-27 carry
+/// `section_word >> 4` (the section-in-region byte moved out of the
+/// packed attributes' top byte). `COMPACT_VERTEX_WGSL_UNPACK_REGION`
+/// lifts them back into `attributes` bits 24-31.
+#[doc(hidden)]
+pub fn compact_arena_words(vertex: &PackedVertex, section_word: u32) -> [u32; 3] {
+    let x = vertex.position & 0x1f;
+    let z = (vertex.position >> 5) & 0x1f;
+    let y_fixed = (vertex.position >> 10) & 0x000f_ffff;
+    let position_index = x + 17 * (z + 17 * y_fixed);
+    let attr = (vertex.attributes & 0xf_ffff) | (section_word >> 4);
+    [
+        position_index | ((attr & 0x1ff) << 23),
+        ((attr >> 9) & 0x1f_ffff) | ((vertex.state_id & 0x7ff) << 21),
+        ((vertex.state_id >> 11) & 0xff) | (vertex.tint << 8),
+    ]
+}
+
+/// Serialize a quad-aligned `PackedVertex` stream into the 12-byte
+/// compact byte layout inside the retained `scratch` — zero allocation
+/// once the buffer reaches steady-state capacity. A quad containing an
+/// unrepresentable vertex writes four zeroed vertices (a degenerate,
+/// invisible quad) instead of silently truncating bits the format
+/// cannot express; the caller accumulates the count in
+/// `compact_unrepresentable_quads` so the domain check stays observable.
+#[doc(hidden)]
+pub fn stage_compact_verts(scratch: &mut Vec<u8>, verts: &[PackedVertex]) -> u64 {
+    scratch.clear();
+    scratch.reserve(verts.len() * REGION_VERTEX_BYTES);
+    let mut bad_quads = 0u64;
+    for quad in verts.chunks(4) {
+        if quad.iter().all(CompactVoxelVertex::is_representable) {
+            for vertex in quad {
+                let compact = CompactVoxelVertex::from_packed(vertex);
+                scratch.extend_from_slice(&compact.word0.to_ne_bytes());
+                scratch.extend_from_slice(&compact.word1.to_ne_bytes());
+                scratch.extend_from_slice(&compact.word2.to_ne_bytes());
+            }
+        } else {
+            bad_quads += 1;
+            scratch.extend_from_slice(&[0u8; REGION_VERTEX_BYTES * 4]);
+        }
+    }
+    bad_quads
+}
+
+/// Byte stride of one arena vertex record (12-byte `CompactVoxelVertex`).
+const REGION_VERTEX_BYTES: usize = std::mem::size_of::<CompactVoxelVertex>();
 
 const DEPTH_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Depth32Float;
 /// Offscreen/UI-framebuffer pixel format.
@@ -839,10 +1531,27 @@ pub fn section_geometry(
 }
 
 struct LiveTerrainSection {
-    /// Grouped packed quads, shared with speculative worker jobs and the
-    /// Hi-Z splat inputs (`Arc` avoids re-cloning per job).
-    packed: Arc<[PackedVertex]>,
-    order: Arc<[u32]>,
+    /// Content digest + quad count of the uploaded packed mesh. The
+    /// mesh's CPU copy is released right after install, so dedup and the
+    /// order sweep compare digests instead of bytes.
+    packed_digest: u64,
+    packed_quads: u32,
+    /// Digest + length of the uploaded translucent order — the camera
+    /// re-sort sweep detects a changed order without retaining it.
+    order_digest: u64,
+    order_len: u32,
+    /// Hi-Z occluder stream: the packed `position` word of every opaque
+    /// quad vertex, extracted at install. It is all the splat worker
+    /// ever read, so the mesh copy no longer stays resident for Hi-Z.
+    hiz_positions: Arc<[u32]>,
+    /// `(first_quad, quad_count)` per direction bucket inside
+    /// `hiz_positions` (quad units); `None` splats the whole stream.
+    hiz_ranges: Option<[(u32, u32); DIRECTION_BUCKETS]>,
+    /// Translucent+water quads in packed order, and each quad's index in
+    /// the original packed stream — the only CPU data an order-only
+    /// re-sort rebuild needs once the full mesh copy is released.
+    tail: Arc<[PackedVertex]>,
+    tail_indices: Arc<[u32]>,
     /// Per-section geometry streams. Opaque buffers are the shared dummy
     /// pair when `arena` routes the section into a region arena.
     terrain: TerrainBuffers,
@@ -854,13 +1563,28 @@ struct LiveTerrainSection {
     /// stream; `Some` whenever the world published [`DirectionBuckets`],
     /// so the per-section fallback path can bucket-cull too.
     opaque_bucket_ranges: Option<[(u32, u32); DIRECTION_BUCKETS]>,
-    /// Quad-level direction buckets of `packed`, for the Hi-Z splat job.
-    buckets: Option<DirectionBuckets>,
     /// Containing region origin when the opaque stream lives in
     /// [`GpuRenderer::region_arenas`].
     arena: Option<[i32; 3]>,
     _uniform: wgpu::Buffer,
     bind_group: wgpu::BindGroup,
+}
+
+impl LiveTerrainSection {
+    /// Whether the resident upload already holds exactly this content —
+    /// digest compare because the payload itself was released post-upload.
+    fn matches_upload(
+        &self,
+        packed_digest: u64,
+        packed_len: usize,
+        order_digest: u64,
+        order_len: usize,
+    ) -> bool {
+        self.packed_digest == packed_digest
+            && self.packed_quads as usize == packed_len / 4
+            && self.order_digest == order_digest
+            && self.order_len as usize == order_len
+    }
 }
 
 /// CPU-side record of a section mesh queued for GPU upload. The render
@@ -888,9 +1612,10 @@ impl PendingSectionUpload {
         buckets: Option<DirectionBuckets>,
     ) -> Self {
         // `section_geometry` emits at most one output vertex per packed
-        // vertex (16 B each) and six u32 indices per quad (~6 B per packed
-        // vertex); the slack covers the section uniform/bind-group work.
-        let upload_bytes = packed.len() * (std::mem::size_of::<PackedVertex>() + 6) + 256;
+        // vertex (12 B compact each) and six u32 indices per quad (~6 B
+        // per packed vertex); the slack covers the section
+        // uniform/bind-group work.
+        let upload_bytes = packed.len() * (REGION_VERTEX_BYTES + 6) + 256;
         let cost_us = 32 + upload_bytes as u64 / 256;
         Self {
             packed,
@@ -960,6 +1685,33 @@ pub struct ExternalSectionMesh {
     /// drops the entry once the world publishes its own (newer)
     /// artifacts, handing residency back to the world payload.
     pub world_revision: u64,
+    /// Quad count of `packed`, kept after the CPU payload is released so
+    /// resident dedup and telemetry still know the stream size.
+    pub packed_quads: u32,
+    /// Digest + length of `order`, kept after release for the same
+    /// reason.
+    pub order_digest: u64,
+    pub order_len: u32,
+    /// `packed`/`order` were dropped after their GPU upload completed —
+    /// the payload can always be re-meshed from chunk data, and requeue
+    /// paths must check this flag before reading either field.
+    pub cpu_released: bool,
+}
+
+impl ExternalSectionMesh {
+    /// Drop the CPU vertex/order copies once their GPU upload finished;
+    /// returns the freed byte count for telemetry.
+    pub fn release_cpu_payload(&mut self) -> usize {
+        if self.cpu_released {
+            return 0;
+        }
+        let freed = self.packed.len() * std::mem::size_of::<PackedVertex>()
+            + self.order.len() * std::mem::size_of::<u32>();
+        self.packed = Arc::from([]);
+        self.order = Arc::from([]);
+        self.cpu_released = true;
+        freed
+    }
 }
 
 /// Floor check for an [`ExternalSectionMesh`] entry inside the renderer:
@@ -984,6 +1736,120 @@ pub fn external_packed_digest(vertices: &[PackedVertex]) -> u64 {
         vertex.tint.hash(&mut hasher);
     }
     hasher.finish()
+}
+
+/// Digest of a translucent order stream — the same `DefaultHasher`
+/// discipline [`external_packed_digest`] uses, so resident order state
+/// lives as `digest + len` once the CPU copy is released post-upload.
+pub fn translucent_order_digest(order: &[u32]) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    for index in order {
+        index.hash(&mut hasher);
+    }
+    hasher.finish()
+}
+
+/// Retained translucent+water quads in packed order plus each quad's
+/// index in the original packed stream — the only CPU data an order-only
+/// re-sort rebuild needs once the full mesh copy is released.
+fn build_translucent_tail(packed: &[PackedVertex]) -> (Vec<PackedVertex>, Vec<u32>) {
+    let mut tail = Vec::new();
+    let mut indices = Vec::new();
+    for (quad_index, quad) in packed.as_chunks::<4>().0.iter().enumerate() {
+        let (layer, fluid) = packed_layer_fluid(quad[0].attributes);
+        if layer == 2 || (layer == 3 && fluid == 1) {
+            indices.push(quad_index as u32);
+            tail.extend_from_slice(quad);
+        }
+    }
+    (tail, indices)
+}
+
+/// Translucent + water streams rebuilt for a new camera sort order from
+/// the retained tail — `section_geometry`'s second half with the full
+/// packed mesh no longer needed. `order` indexes the original packed
+/// quad stream; `tail_indices` maps each index to its retained quad.
+/// Any index miss, duplicate, or coverage mismatch falls back to the
+/// stored tail order — the same mesh-order fallback `section_geometry`
+/// applies. `None` when the section never had a translucent tail.
+struct TailStreams {
+    translucent: Vec<PackedVertex>,
+    translucent_indices: Vec<u32>,
+    water: Vec<WaterVertex>,
+    water_indices: Vec<u32>,
+}
+
+fn reorder_tail_streams(
+    tail: &[PackedVertex],
+    tail_indices: &[u32],
+    order: &[u32],
+    origin_blocks: [f32; 3],
+) -> Option<TailStreams> {
+    if tail.is_empty() {
+        return None;
+    }
+    let position_of: HashMap<u32, usize> = tail_indices
+        .iter()
+        .copied()
+        .enumerate()
+        .map(|(slot, index)| (index, slot))
+        .collect();
+    let mut ordered: Vec<&[PackedVertex]> = Vec::with_capacity(order.len());
+    let mut seen = HashSet::new();
+    let mut valid = true;
+    for &index in order {
+        match position_of.get(&index) {
+            Some(&slot) if seen.insert(index) => {
+                ordered.push(&tail[slot * 4..slot * 4 + 4]);
+            }
+            _ => {
+                valid = false;
+                break;
+            }
+        }
+    }
+    if !valid || ordered.len() != tail_indices.len() {
+        ordered = tail
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .map(|quad| quad.as_slice())
+            .collect();
+    }
+    let mut out = TailStreams {
+        translucent: Vec::new(),
+        translucent_indices: Vec::new(),
+        water: Vec::new(),
+        water_indices: Vec::new(),
+    };
+    for quad in ordered {
+        let (layer, fluid) = packed_layer_fluid(quad[0].attributes);
+        if layer == 3 && fluid == 1 {
+            let base = out.water.len() as u32;
+            for vertex in quad {
+                let local = decode_packed_local(vertex.position);
+                let sky_light = ((vertex.attributes >> 9) & 0xf) as f32 / 15.0;
+                out.water.push(WaterVertex {
+                    position: [
+                        origin_blocks[0] + local[0],
+                        origin_blocks[1] + local[1],
+                        origin_blocks[2] + local[2],
+                    ],
+                    depth_hint: (1.0 - sky_light).clamp(0.0, 1.0),
+                });
+            }
+            let corners = if quad[0].attributes & (1 << 17) == 0 {
+                [0, 1, 2, 0, 2, 3]
+            } else {
+                [0, 1, 3, 1, 2, 3]
+            };
+            out.water_indices.extend(corners.map(|c| base + c));
+        } else if layer == 2 {
+            append_live_quad(&mut out.translucent, &mut out.translucent_indices, quad);
+        }
+    }
+    Some(out)
 }
 
 /// Speculative `section_geometry` output produced by the mesh worker pool
@@ -1024,8 +1890,8 @@ struct ArenaDrawRecord {
 }
 
 /// Shared vertex arena over one 8x4x8-section region (the
-/// [`RenderRegions`] grid): 16-byte `PackedVertex` streams upload into
-/// one vertex buffer through the persistent [`UploadStagingRing`] as
+/// [`RenderRegions`] grid): 12-byte `CompactVoxelVertex` streams upload
+/// into one vertex buffer through the persistent [`UploadStagingRing`] as
 /// slot-range DMA copies (no CPU-side vertex copy is retained), and the
 /// single global shared quad index buffer serves every direction-bucket
 /// draw positionally — no per-region index buffer, index rebuild, or
@@ -1184,37 +2050,46 @@ impl RegionArena {
         offset
     }
 
-    /// Insert or replace `coord`'s opaque stream: the 16-byte
-    /// `PackedVertex` payload serializes straight into a staged partial
-    /// write at the slot's byte offset (each vertex's `attributes` gains
-    /// the section-in-region word in its free top byte). The slot draws
-    /// through the shared quad index buffer — no local index stream is
-    /// retained anywhere.
+    /// Insert or replace `coord`'s opaque stream: the 12-byte
+    /// `CompactVoxelVertex` payload serializes straight into a staged
+    /// partial write at the slot's byte offset. The section-in-region
+    /// word rides in compact-attribute bits 20-27 — quad extents and
+    /// the corner index are dead on the GPU since the slot draws through
+    /// the shared quad index buffer (`COMPACT_VERTEX_WGSL_UNPACK_REGION`
+    /// lifts them back into `attributes` bits 24-31). A quad outside the
+    /// compact section-local domain stages as four zeroed vertices — a
+    /// degenerate, invisible quad — rather than truncating bits the
+    /// format cannot express; returns how many quads fell outside.
     fn insert(
         &mut self,
         coord: SectionCoord,
         vertices: &[PackedVertex],
         section_word: u32,
         bucket_ranges: [(u32, u32); DIRECTION_BUCKETS],
-    ) {
+    ) -> u64 {
         if let Some(old) = self.slots.remove(&coord) {
             self.release_vertices(old.vertex_offset, old.vertex_count);
         }
         let vertex_count = vertices.len() as u32;
         let vertex_offset = self.alloc_vertices(vertex_count);
-        let mut bytes = Vec::with_capacity(std::mem::size_of_val(vertices));
-        for v in vertices {
-            bytes.extend_from_slice(&v.position.to_ne_bytes());
-            bytes.extend_from_slice(&v.state_id.to_ne_bytes());
-            // Clear — not OR — the top attribute byte: quad extents and
-            // the corner index live there but no shader or post-pack
-            // consumer reads them; the slot needs all 8 bits for the
-            // section-in-region word.
-            bytes.extend_from_slice(&((v.attributes & 0x00ff_ffff) | section_word).to_ne_bytes());
-            bytes.extend_from_slice(&v.tint.to_ne_bytes());
+        let mut bytes = Vec::with_capacity(vertices.len() * REGION_VERTEX_BYTES);
+        let mut bad_quads = 0u64;
+        for quad in vertices.chunks(4) {
+            if quad.iter().all(compact_arena_representable) {
+                for vertex in quad {
+                    for word in compact_arena_words(vertex, section_word) {
+                        bytes.extend_from_slice(&word.to_ne_bytes());
+                    }
+                }
+            } else {
+                bad_quads += 1;
+                bytes.extend_from_slice(&[0u8; REGION_VERTEX_BYTES * 4]);
+            }
         }
-        self.pending_vertex_writes
-            .insert(coord, (u64::from(vertex_offset) * 16, bytes));
+        self.pending_vertex_writes.insert(
+            coord,
+            (u64::from(vertex_offset) * REGION_VERTEX_BYTES as u64, bytes),
+        );
         self.slots.insert(
             coord,
             ArenaSlot {
@@ -1226,6 +2101,7 @@ impl RegionArena {
         self.vertex_dirty = true;
         self.index_dirty = true;
         self.empty_frames = 0;
+        bad_quads
     }
 
     /// Drop `coord`'s slab if present; empties retire their region after
@@ -1312,12 +2188,13 @@ impl RegionArena {
         let mut buffers_replaced = false;
         let mut staged = 0u32;
         if self.vertex_dirty {
+            let stride = REGION_VERTEX_BYTES as u64;
             let needed = self.vertex_high_water as usize;
             if needed > self.vertex_capacity {
-                let live_bytes = u64::from(self.flushed_vertex_len) * 16;
+                let live_bytes = u64::from(self.flushed_vertex_len) * stride;
                 let slab = slab_vertex_bytes.max(64);
-                let cap_bytes = (needed * 16).max(slab).next_multiple_of(slab);
-                self.vertex_capacity = cap_bytes / 16;
+                let cap_bytes = (needed * REGION_VERTEX_BYTES).max(slab).next_multiple_of(slab);
+                self.vertex_capacity = cap_bytes / REGION_VERTEX_BYTES;
                 let new_buffer = device.create_buffer(&wgpu::BufferDescriptor {
                     label: Some("region-arena-vertices"),
                     size: cap_bytes as u64,
@@ -1360,7 +2237,7 @@ impl RegionArena {
                     bytes,
                 );
                 self.flushed_vertex_len =
-                    self.flushed_vertex_len.max((byte_offset + len) as u32 / 16);
+                    self.flushed_vertex_len.max((byte_offset + len) as u32 / stride as u32);
                 committed.push(coord);
                 staged += 1;
             }
@@ -1692,8 +2569,9 @@ fn section_draw_mask(min: [f32; 3], camera: [f32; 3]) -> u8 {
 }
 
 /// Rewrite the section-local opaque vertex decode of `source` (one of
-/// the built-in terrain WGSL modules) so the same 16-byte `PackedVertex`
-/// stream draws region-arena geometry: the section-in-region offset
+/// the compact-transformed built-in terrain WGSL modules) so the same
+/// 12-byte `CompactVoxelVertex` stream draws region-arena geometry: the
+/// section-in-region offset
 /// lives in `attributes` bits 24-31 (`sx | sy<<3 | sz<<5`, written by
 /// [`RegionArena::insert`] via [`region_section_word`]) and is folded
 /// into the integer part of the coordinate decode — `lx`/`lz` gain
@@ -1703,40 +2581,18 @@ fn section_draw_mask(min: [f32; 3], camera: [f32; 3]) -> u8 {
 /// translucent entry keeps its own section-local decode, so fragment
 /// stages and every other entry stay byte-identical. Panics on anchor
 /// drift: a silently wrong layout is worse than a loud build failure.
-fn region_opaque_wgsl(source: &str) -> String {
+pub fn region_opaque_wgsl(source: &str) -> String {
     let out = source.replacen(
-        "let lx = f32(in.packed_pos & 0x1fu);\n    let lz = f32((in.packed_pos >> 5u) & 0x1fu);\n    let ly = f32(in.packed_pos >> 10u) / 1024.0;",
-        "let sec = in.attributes >> 24u;\n    let lx = f32(in.packed_pos & 0x1fu) + f32((sec & 0x7u) * 16u);\n    let lz = f32((in.packed_pos >> 5u) & 0x1fu) + f32((sec >> 5u) * 16u);\n    let ly = f32((in.packed_pos >> 10u) + ((sec >> 3u) & 0x3u) * 16384u) / 1024.0;",
+        "let lx = f32(cv_packed.packed_pos & 0x1fu);\n    let lz = f32((cv_packed.packed_pos >> 5u) & 0x1fu);\n    let ly = f32(cv_packed.packed_pos >> 10u) / 1024.0;",
+        "let sec = cv_packed.attributes >> 24u;\n    let lx = f32(cv_packed.packed_pos & 0x1fu) + f32((sec & 0x7u) * 16u);\n    let lz = f32((cv_packed.packed_pos >> 5u) & 0x1fu) + f32((sec >> 5u) * 16u);\n    let ly = f32((cv_packed.packed_pos >> 10u) + ((sec >> 3u) & 0x3u) * 16384u) / 1024.0;",
         1,
     );
     for anchor in [
-        "let sec = in.attributes >> 24u;",
+        "let sec = cv_packed.attributes >> 24u;",
         "section.origin + vec3<f32>(lx, ly, lz)",
     ] {
         assert!(out.contains(anchor), "region WGSL anchor missing: {anchor}");
     }
-    out
-}
-
-/// Same transform for the shadow-caster module's `vs_terrain` entry:
-/// `attributes` joins `packed_pos` so the section-in-region offset in
-/// its top byte can shift the region-local position by whole sections.
-fn region_caster_wgsl(caster_source: &str) -> String {
-    let out = caster_source
-        .replacen(
-            "fn vs_terrain(@location(0) packed_pos: u32)",
-            "fn vs_terrain(@location(0) packed_pos: u32, @location(2) attributes: u32)",
-            1,
-        )
-        .replacen(
-            "let local = vec3<f32>(f32(packed_pos & 31u),\n        f32(packed_pos >> 10u) / 1024.0, f32((packed_pos >> 5u) & 31u));",
-            "let sec = attributes >> 24u;\n    let local = vec3<f32>(f32(packed_pos & 31u) + f32((sec & 7u) * 16u),\n        f32((packed_pos >> 10u) + ((sec >> 3u) & 3u) * 16384u) / 1024.0, f32((packed_pos >> 5u) & 31u) + f32(sec >> 5u) * 16.0);",
-            1,
-        );
-    assert!(
-        out.contains("fn vs_terrain(@location(0) packed_pos: u32, @location(2) attributes: u32)"),
-        "region caster anchor missing"
-    );
     out
 }
 
@@ -2342,10 +3198,10 @@ pub struct GpuRenderer {
     pub staging_ring_allocs: u64,
     /// Staged writes the per-frame DMA cap deferred, cumulative.
     pub staging_ring_dma_defers: u64,
-    /// Shared 16-byte vertex buffer for arena-resident sections (their
+    /// Shared empty vertex buffer for arena-resident sections (their
     /// opaque geometry lives in the region arena).
     empty_vertex_buffer: wgpu::Buffer,
-    /// Shared 16-byte index buffer for arena-resident sections.
+    /// Shared empty index buffer for arena-resident sections.
     empty_index_buffer: wgpu::Buffer,
     /// Bounded worker pool speculatively building section geometry and
     /// the live Hi-Z pyramid (`mesh_worker_threads` sized).
@@ -2423,6 +3279,20 @@ pub struct GpuRenderer {
     /// (region slots serialize straight into staged partial writes, and
     /// per-section opaque geometry drops after buffer creation).
     pub cpu_opaque_bytes_freed: u64,
+    /// Reused scratch for `PackedVertex` → 12-byte compact staging —
+    /// steady-state uploads allocate nothing.
+    compact_vertex_bytes: Vec<u8>,
+    /// Quads that fell outside the compact section-local domain and
+    /// uploaded as degenerate zero vertices, cumulative.
+    pub compact_unrepresentable_quads: u64,
+    /// CPU mesh bytes the resident set would have pinned before the
+    /// post-upload lifetime drop — full packed mesh + translucent order
+    /// per installed section, plus released external payloads —
+    /// cumulative.
+    pub cpu_mesh_bytes_freed: u64,
+    /// Order-only translucent rewrites applied to resident GPU buffers
+    /// (no full re-upload), cumulative.
+    pub translucent_order_rewrites: u64,
     /// Byte mirrors of the last frame/env/lights uniform uploads for
     /// the skip-on-unchanged dedup.
     last_frame_ubo_bytes: Vec<u8>,
@@ -4269,16 +5139,13 @@ impl ShadowGpu {
                 ],
                 immediate_size: 0,
             });
-        let caster_source = format!("{MEGU_SHADOW_DEPTH_WGSL}\n{MEGU_SHADOW_CASTERS_WGSL}");
         let caster_module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("shadow-caster-module"),
-            source: wgpu::ShaderSource::Wgsl(Cow::Owned(caster_source)),
+            source: wgpu::ShaderSource::Wgsl(Cow::Owned(compact_caster_wgsl(false))),
         });
         let caster_region_module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("shadow-caster-region-module"),
-            source: wgpu::ShaderSource::Wgsl(Cow::Owned(region_caster_wgsl(&format!(
-                "{MEGU_SHADOW_DEPTH_WGSL}\n{MEGU_SHADOW_CASTERS_WGSL}"
-            )))),
+            source: wgpu::ShaderSource::Wgsl(Cow::Owned(compact_caster_wgsl(true))),
         });
         let depth_pipeline =
             |label,
@@ -4357,14 +5224,17 @@ impl ShadowGpu {
         let terrain_module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("shadowed-terrain"),
             source: wgpu::ShaderSource::Wgsl(Cow::Owned(composed_shadow_wgsl(
-                &terrain_wgsl(ctx.report.shader_f16),
+                &compact_terrain_wgsl(&terrain_wgsl(ctx.report.shader_f16), None),
                 true,
             ))),
         });
         let terrain_region_module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("shadowed-terrain-region"),
             source: wgpu::ShaderSource::Wgsl(Cow::Owned(composed_shadow_wgsl(
-                &region_opaque_wgsl(&terrain_wgsl(ctx.report.shader_f16)),
+                &region_opaque_wgsl(&compact_terrain_wgsl(
+                    &terrain_wgsl(ctx.report.shader_f16),
+                    Some("terrain_vs"),
+                )),
                 true,
             ))),
         });
@@ -4608,7 +5478,10 @@ impl ShadowGpu {
             });
             let module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
                 label: Some("shadow-cutout-depth"),
-                source: wgpu::ShaderSource::Wgsl(MEGU_SHADOW_CUTOUT_DEPTH_WGSL.into()),
+                source: wgpu::ShaderSource::Wgsl(Cow::Owned(compact_terrain_wgsl(
+                    MEGU_SHADOW_CUTOUT_DEPTH_WGSL,
+                    None,
+                ))),
             });
             let pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
                 label: Some("shadow-cutout-depth"),
@@ -5807,6 +6680,10 @@ impl GpuRenderer {
             ubo_writes_skipped: 0,
             region_partial_uploads: 0,
             cpu_opaque_bytes_freed: 0,
+            compact_vertex_bytes: Vec::new(),
+            compact_unrepresentable_quads: 0,
+            cpu_mesh_bytes_freed: 0,
+            translucent_order_rewrites: 0,
             last_frame_ubo_bytes: Vec::new(),
             last_env_ubo_bytes: Vec::new(),
             last_lights_ubo_bytes: Vec::new(),
@@ -6261,12 +7138,18 @@ impl GpuRenderer {
 
         let terrain_module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("composite-terrain"),
-            source: wgpu::ShaderSource::Wgsl(terrain_wgsl(ctx.report.shader_f16)),
+            source: wgpu::ShaderSource::Wgsl(Cow::Owned(compact_terrain_wgsl(
+                &terrain_wgsl(ctx.report.shader_f16),
+                None,
+            ))),
         });
         let terrain_region_module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("composite-terrain-region"),
             source: wgpu::ShaderSource::Wgsl(Cow::Owned(region_opaque_wgsl(
-                &terrain_wgsl(ctx.report.shader_f16),
+                &compact_terrain_wgsl(
+                    &terrain_wgsl(ctx.report.shader_f16),
+                    Some("terrain_vs"),
+                ),
             ))),
         });
         let lit_module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
@@ -6597,7 +7480,7 @@ impl GpuRenderer {
         };
         let module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some(label),
-            source: wgpu::ShaderSource::Wgsl(Cow::Borrowed(source)),
+            source: wgpu::ShaderSource::Wgsl(Cow::Owned(compact_terrain_wgsl(source, None))),
         });
         let (vs_entry, fs_entry) = if translucent {
             ("terrain_translucent_vs", "terrain_translucent_fs")
@@ -6617,8 +7500,8 @@ impl GpuRenderer {
     }
 
     /// The simple-path region variant: `TERRAIN_OPAQUE_WGSL` with the
-    /// section-in-region offset decode substituted in (same 16-byte
-    /// [`TERRAIN_VERTEX_LAYOUT`] stream as the per-section path).
+    /// section-in-region offset decode substituted in (same 12-byte
+    /// compact [`TERRAIN_VERTEX_LAYOUT`] stream as the per-section path).
     fn build_terrain_region_pipeline(
         device: &wgpu::Device,
         layout: &wgpu::PipelineLayout,
@@ -6626,7 +7509,9 @@ impl GpuRenderer {
     ) -> wgpu::RenderPipeline {
         let module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("terrain-region-opaque"),
-            source: wgpu::ShaderSource::Wgsl(Cow::Owned(region_opaque_wgsl(TERRAIN_OPAQUE_WGSL))),
+            source: wgpu::ShaderSource::Wgsl(Cow::Owned(region_opaque_wgsl(
+                &compact_terrain_wgsl(TERRAIN_OPAQUE_WGSL, Some("terrain_opaque_vs")),
+            ))),
         });
         Self::terrain_pipeline_from_module(
             device,
@@ -6924,7 +7809,11 @@ impl GpuRenderer {
         // contract, and their names stay out of terrain candidacy below.
         let subworld_note = self.install_pack_subworld_passes(pack);
         // Try every gbuffers-stage graphics pass until one yields a pipeline
-        // the device accepts with the packed-vertex layout.
+        // the device accepts with the packed-vertex layout. Pack sources are
+        // authored against the 16-byte four-word vertex contract;
+        // `compact_pack_terrain_wgsl` rewrites that input to the 12-byte
+        // compact stream the terrain buffers now carry (unmatched modules
+        // pass through and the device rejects them into fallback as before).
         let pack_layout = self
             .ctx
             .device
@@ -6942,8 +7831,9 @@ impl GpuRenderer {
             {
                 continue;
             }
+            let wgsl = compact_pack_terrain_wgsl(&pass.wgsl_source);
             let info = match validate_wgsl_module(
-                &pass.wgsl_source,
+                &wgsl,
                 &[WgslStage::Vertex, WgslStage::Fragment],
             ) {
                 Ok(info) => info,
@@ -6961,7 +7851,7 @@ impl GpuRenderer {
                 .device
                 .create_shader_module(wgpu::ShaderModuleDescriptor {
                     label: Some("megu-wgsl-pack"),
-                    source: wgpu::ShaderSource::Wgsl(Cow::Borrowed(pass.wgsl_source.as_str())),
+                    source: wgpu::ShaderSource::Wgsl(Cow::Owned(wgsl)),
                 });
             // The pack's own entry-point names drive the pipeline.
             let name_of = |stage| {
@@ -7077,24 +7967,15 @@ impl GpuRenderer {
         let buffers = TerrainBuffers {
             opaque_index_count: opaque_idx.len() as u32,
             translucent_index_count: translucent_idx.len() as u32,
-            opaque_vertices: vertex_buffer(
-                &self.ctx.device,
-                &self.ctx.queue,
-                "opaque-verts",
-                &opaque_verts,
-            ),
+            opaque_vertices: self.compact_vertex_buffer("opaque-verts", &opaque_verts),
             opaque_indices: index_buffer(
                 &self.ctx.device,
                 &self.ctx.queue,
                 "opaque-idx",
                 &opaque_idx,
             ),
-            translucent_vertices: vertex_buffer(
-                &self.ctx.device,
-                &self.ctx.queue,
-                "translucent-verts",
-                &translucent_verts,
-            ),
+            translucent_vertices: self
+                .compact_vertex_buffer("translucent-verts", &translucent_verts),
             translucent_indices: index_buffer(
                 &self.ctx.device,
                 &self.ctx.queue,
@@ -7127,6 +8008,10 @@ impl GpuRenderer {
             return;
         }
         if self.external_sections_rev.is_none() {
+            // First attach — also every device loss / surface re-create:
+            // sections whose CPU payloads were released post-upload can't
+            // mirror, so the session re-dirties them for the mesh lanes.
+            live.requeue_cpu_released_sections();
             // First attach: the delta stream predates this renderer —
             // mirror the map wholesale and discard pending events.
             self.external_sections
@@ -7163,6 +8048,7 @@ impl GpuRenderer {
             .retain(|coord, _| external_section_valid(world, *coord));
         self.live_sections.retain(|coord, section| {
             let keep = world.packed_mesh(*coord).is_some()
+                || world.released_mesh_meta(*coord).is_some()
                 || self.external_sections.contains_key(coord);
             if !keep {
                 removed.push((*coord, section.arena));
@@ -7170,7 +8056,9 @@ impl GpuRenderer {
             keep
         });
         self.pending_uploads.retain(|coord, _| {
-            world.packed_mesh(*coord).is_some() || self.external_sections.contains_key(coord)
+            world.packed_mesh(*coord).is_some()
+                || world.released_mesh_meta(*coord).is_some()
+                || self.external_sections.contains_key(coord)
         });
         self.section_graphs.clear();
         self.section_graphs.extend(world.section_graphs());
@@ -7240,10 +8128,11 @@ impl GpuRenderer {
         let packed_digest = world
             .packed_mesh_digest(coord)
             .expect("packed mesh digest accompanies every packed section");
+        let order_digest = translucent_order_digest(order);
         let up_to_date = match self.pending_uploads.get(&coord) {
             Some(pending) => pending.matches(packed, packed_digest, order),
             None => self.live_sections.get(&coord).is_some_and(|existing| {
-                existing.packed.as_ref() == packed && existing.order.as_ref() == order
+                existing.matches_upload(packed_digest, packed.len(), order_digest, order.len())
             }),
         };
         if up_to_date {
@@ -7273,19 +8162,28 @@ impl GpuRenderer {
     /// Queue an [`ExternalSectionMesh`] payload for upload — the
     /// externally-meshed analogue of [`Self::queue_live_section_upload`].
     /// Same dedup semantics: skipped when the pending queue or the
-    /// resident section already holds this exact payload.
+    /// resident section already holds this exact payload. An entry whose
+    /// CPU payload was released after its upload (`cpu_released`) is
+    /// already GPU-resident by definition and is never requeued.
     fn queue_external_section_upload(
         &mut self,
         coord: SectionCoord,
         external: &ExternalSectionMesh,
     ) -> bool {
+        if external.cpu_released {
+            return false;
+        }
         let up_to_date = match self.pending_uploads.get(&coord) {
             Some(pending) => {
                 pending.matches(&external.packed, external.digest, &external.order)
             }
             None => self.live_sections.get(&coord).is_some_and(|existing| {
-                existing.packed.as_ref() == external.packed.as_ref()
-                    && existing.order.as_ref() == external.order.as_ref()
+                existing.matches_upload(
+                    external.digest,
+                    external.packed_quads as usize * 4,
+                    external.order_digest,
+                    external.order_len as usize,
+                )
             }),
         };
         if up_to_date {
@@ -7345,6 +8243,14 @@ impl GpuRenderer {
                     scheduled +=
                         usize::from(self.queue_external_section_upload(coord, &external));
                 }
+                None if world.released_mesh_meta(coord).is_some() => {
+                    // The world released this section's CPU copy after
+                    // its upload — the resident GPU copy stays
+                    // authoritative; only the camera re-sort may have
+                    // moved the translucent order since.
+                    let order = world.translucent_order(coord).unwrap_or(&[]);
+                    self.refresh_resident_translucent_order(coord, order);
+                }
                 None => {
                     self.external_sections.remove(&coord);
                     self.pending_uploads.remove(&coord);
@@ -7379,7 +8285,10 @@ impl GpuRenderer {
         }
         // The camera-driven translucent re-sort can rewrite orders for
         // sections no event marked; sweep residents cheaply (opaque-only
-        // sections have empty orders and skip on length alone).
+        // sections have empty orders and skip on length alone). Resident
+        // sections retain a tail stream, so a changed order rewrites the
+        // translucent/water buffers in place instead of re-uploading the
+        // whole section.
         if order_sweep {
             let mut stale: Vec<SectionCoord> = Vec::new();
             for (coord, section) in self.live_sections.iter() {
@@ -7387,11 +8296,19 @@ impl GpuRenderer {
                     continue;
                 }
                 let order = world.translucent_order(*coord).unwrap_or(&[]);
-                if section.order.as_ref() != order {
+                if section.order_digest != translucent_order_digest(order)
+                    || section.order_len as usize != order.len()
+                {
                     stale.push(*coord);
                 }
             }
             for coord in stale {
+                let order = world.translucent_order(coord).unwrap_or(&[]);
+                if self.refresh_resident_translucent_order(coord, order) {
+                    continue;
+                }
+                // The retained tail could not rebuild the streams — fall
+                // back to a full re-upload while the world publishes one.
                 let Some(packed) = world.packed_mesh(coord) else {
                     if self.external_sections.contains_key(&coord)
                         && external_section_valid(world, coord)
@@ -7413,7 +8330,6 @@ impl GpuRenderer {
                     self.section_graphs.remove(&coord);
                     continue;
                 };
-                let order = world.translucent_order(coord).unwrap_or(&[]);
                 scheduled +=
                     usize::from(self.queue_live_section_upload(world, coord, packed, order));
             }
@@ -7445,8 +8361,9 @@ impl GpuRenderer {
     fn install_live_section(
         &mut self,
         coord: SectionCoord,
-        packed: &Arc<[PackedVertex]>,
-        order: &Arc<[u32]>,
+        packed: &[PackedVertex],
+        packed_digest: u64,
+        order: &[u32],
         buckets: Option<DirectionBuckets>,
     ) {
         let origin = [
@@ -7458,8 +8375,10 @@ impl GpuRenderer {
         let opaque_bucket_ranges = buckets.map(|b| compute_opaque_bucket_ranges(packed, b));
         self.install_live_section_geometry(
             coord,
-            packed.clone(),
-            order.clone(),
+            packed,
+            packed_digest,
+            translucent_order_digest(order),
+            order.len() as u32,
             buckets,
             opaque_bucket_ranges,
             geometry,
@@ -7467,13 +8386,17 @@ impl GpuRenderer {
     }
 
     /// The install body shared by the inline path and worker-built
-    /// geometry results.
+    /// geometry results. `packed`/`order` are only borrowed — after the
+    /// buffers land, residency keeps digests, the Hi-Z occluder stream
+    /// and the translucent tail instead of the full CPU copy.
     #[allow(clippy::too_many_arguments)]
     fn install_live_section_geometry(
         &mut self,
         coord: SectionCoord,
-        packed: Arc<[PackedVertex]>,
-        order: Arc<[u32]>,
+        packed: &[PackedVertex],
+        packed_digest: u64,
+        order_digest: u64,
+        order_len: u32,
         buckets: Option<DirectionBuckets>,
         opaque_bucket_ranges: Option<[(u32, u32); DIRECTION_BUCKETS]>,
         mut geometry: LiveSectionGeometry,
@@ -7511,12 +8434,14 @@ impl GpuRenderer {
                     self.region_arenas.insert(origin, arena);
                 }
                 if let Some(arena) = self.region_arenas.get_mut(&origin) {
-                    // The 16-byte stream serializes straight into the staged
-                    // partial write — no CPU vertex copy is retained per
-                    // section (previously a 24-byte `RegionVertex` Vec sat
-                    // resident in the arena for its whole lifetime).
-                    arena.insert(coord, &geometry.opaque, section_word, ranges);
-                    self.cpu_opaque_bytes_freed += (geometry.opaque.len() * 16) as u64;
+                    // The 12-byte compact stream serializes straight into
+                    // the staged partial write — no CPU vertex copy is
+                    // retained per section.
+                    self.compact_unrepresentable_quads +=
+                        arena.insert(coord, &geometry.opaque, section_word, ranges);
+                    self.cpu_opaque_bytes_freed += (geometry.opaque.len()
+                        * std::mem::size_of::<PackedVertex>())
+                        as u64;
                 }
                 origin
             });
@@ -7534,12 +8459,7 @@ impl GpuRenderer {
             // (draw sites bind `self.shared_quad_index_buffer` live so a
             // growth realloc never leaves a stale slice bound).
             (
-                vertex_buffer(
-                    &self.ctx.device,
-                    &self.ctx.queue,
-                    "live-opaque-verts",
-                    &geometry.opaque,
-                ),
+                self.compact_vertex_buffer("live-opaque-verts", &geometry.opaque),
                 self.empty_index_buffer.clone(),
                 opaque_index_total,
             )
@@ -7556,12 +8476,7 @@ impl GpuRenderer {
             )
         } else {
             (
-                vertex_buffer(
-                    &self.ctx.device,
-                    &self.ctx.queue,
-                    "live-translucent-verts",
-                    &geometry.translucent,
-                ),
+                self.compact_vertex_buffer("live-translucent-verts", &geometry.translucent),
                 index_buffer(
                     &self.ctx.device,
                     &self.ctx.queue,
@@ -7668,24 +8583,109 @@ impl GpuRenderer {
                 });
             (uniform, bind_group)
         };
+        // Post-upload retention: the full packed mesh + order leave the
+        // CPU; what stays is exactly what later passes need — digests for
+        // dedup/sweep, the positions-only occluder stream for Hi-Z, and
+        // the translucent tail for order-only rebuilds.
+        let (hiz_positions, hiz_ranges) = build_hiz_stream(packed, buckets);
+        let (tail, tail_indices) = build_translucent_tail(packed);
         self.live_sections.insert(
             coord,
             LiveTerrainSection {
-                packed,
-                order,
+                packed_digest,
+                packed_quads: (packed.len() / 4) as u32,
+                order_digest,
+                order_len,
+                hiz_positions: hiz_positions.into(),
+                hiz_ranges,
+                tail: tail.into(),
+                tail_indices: tail_indices.into(),
                 terrain,
                 opaque_index_total,
                 opaque_bucket_ranges,
-                buckets,
                 arena: arena_origin,
                 _uniform: uniform,
                 bind_group,
             },
         );
+        // Telemetry: bytes the resident set would have pinned before the
+        // CPU-lifetime drop — full packed mesh + order per section.
+        self.cpu_mesh_bytes_freed += (std::mem::size_of_val(packed)
+            + order_len as usize * std::mem::size_of::<u32>()) as u64;
+        // The renderer-side external mirror no longer needs its CPU copy
+        // either once this upload is resident; the session's own copy is
+        // released via `take_uploaded_section_coords` downstream.
+        if let Some(external) = self.external_sections.get_mut(&coord) {
+            self.cpu_mesh_bytes_freed += external.release_cpu_payload() as u64;
+        }
         // Occluders changed: the installed pyramid (if any) is stale.
         self.invalidate_hiz();
         self.cull_world_revision += 1;
         self.uploaded_section_coords.push(coord);
+    }
+
+    /// Rewrite a resident section's translucent + water streams for a
+    /// new camera sort order, using only the retained tail. The streams
+    /// are order-invariant in size, so `write_buffer` replaces their
+    /// bytes under the same buffer objects; a tail that cannot rebuild
+    /// (missing section, no tail) returns `false` and the caller falls
+    /// back to a full re-upload.
+    fn refresh_resident_translucent_order(&mut self, coord: SectionCoord, order: &[u32]) -> bool {
+        let Some(section) = self.live_sections.get(&coord) else {
+            return false;
+        };
+        let origin = [
+            coord.0 as f32 * 16.0,
+            coord.1 as f32 * 16.0,
+            coord.2 as f32 * 16.0,
+        ];
+        let Some(streams) =
+            reorder_tail_streams(&section.tail, &section.tail_indices, order, origin)
+        else {
+            return false;
+        };
+        let translucent_count = streams.translucent_indices.len() as u32;
+        let water_count = streams.water_indices.len() as u32;
+        if translucent_count != section.terrain.translucent_index_count
+            || water_count != section.terrain.water_index_count
+        {
+            return false;
+        }
+        self.translucent_order_rewrites += 1;
+        let mut bytes = std::mem::take(&mut self.compact_vertex_bytes);
+        self.compact_unrepresentable_quads +=
+            stage_compact_verts(&mut bytes, &streams.translucent);
+        let section = self
+            .live_sections
+            .get_mut(&coord)
+            .expect("section checked above");
+        let queue = &self.ctx.queue;
+        if translucent_count != 0 {
+            queue.write_buffer(&section.terrain.translucent_vertices, 0, &bytes);
+            queue.write_buffer(
+                &section.terrain.translucent_indices,
+                0,
+                bytemuck::cast_slice(&streams.translucent_indices),
+            );
+        }
+        if water_count != 0 {
+            queue.write_buffer(
+                &section.terrain.water_vertices,
+                0,
+                bytemuck::cast_slice(&streams.water),
+            );
+            queue.write_buffer(
+                &section.terrain.water_indices,
+                0,
+                bytemuck::cast_slice(&streams.water_indices),
+            );
+        }
+        section.order_digest = translucent_order_digest(order);
+        section.order_len = order.len() as u32;
+        self.compact_vertex_bytes = bytes;
+        self.cull_world_revision += 1;
+        self.shadow_cache.invalidate();
+        true
     }
 
     /// Coords whose latest mesh finished the VRAM upload this session —
@@ -7693,6 +8693,55 @@ impl GpuRenderer {
     /// CPU copies (`release_uploaded_section_cpu_copies`).
     pub fn take_uploaded_section_coords(&mut self) -> Vec<SectionCoord> {
         std::mem::take(&mut self.uploaded_section_coords)
+    }
+
+    /// Serialize `verts` into the 12-byte `CompactVoxelVertex` stream and
+    /// upload it as a vertex buffer, reusing `compact_vertex_bytes`
+    /// scratch — steady-state uploads allocate nothing for staging.
+    /// Unrepresentable quads land as degenerate zeros and accumulate in
+    /// [`Self::compact_unrepresentable_quads`].
+    fn compact_vertex_buffer(&mut self, label: &str, verts: &[PackedVertex]) -> wgpu::Buffer {
+        let mut bytes = std::mem::take(&mut self.compact_vertex_bytes);
+        self.compact_unrepresentable_quads += stage_compact_verts(&mut bytes, verts);
+        let buffer = self.ctx.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some(label),
+            size: (bytes.len() as u64).max(16),
+            usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        if !bytes.is_empty() {
+            self.ctx.queue.write_buffer(&buffer, 0, &bytes);
+        }
+        self.compact_vertex_bytes = bytes;
+        buffer
+    }
+
+    /// CPU mesh bytes the renderer still retains: per-section Hi-Z
+    /// occluder words + translucent tails (what later passes actually
+    /// read), pending-upload payloads, and unreleased external copies.
+    /// The post-upload drop's verification surface — after installs
+    /// finish this holds only the minimal retained streams.
+    pub fn retained_cpu_mesh_bytes(&self) -> u64 {
+        let vertex = std::mem::size_of::<PackedVertex>();
+        let mut bytes = 0u64;
+        for section in self.live_sections.values() {
+            bytes += (section.hiz_positions.len() * 4
+                + section.tail.len() * vertex
+                + section.tail_indices.len() * 4) as u64;
+        }
+        for pending in self.pending_uploads.values() {
+            bytes += (pending.packed.len() * vertex + pending.order.len() * 4) as u64;
+        }
+        for done in self.completed_geometry.values() {
+            bytes += (done.packed.len() * vertex) as u64;
+        }
+        for external in self.external_sections.values() {
+            bytes += (external.packed.len() * vertex + external.order.len() * 4) as u64;
+        }
+        for section in &self.hiz_splat_scratch {
+            bytes += (section.positions.len() * 4) as u64;
+        }
+        bytes
     }
 
     /// Drop the worker-built pyramid when terrain residency shifts; an
@@ -7805,8 +8854,8 @@ impl GpuRenderer {
             ];
             sections.push(HiZSplatSection {
                 origin: min,
-                packed: section.packed.clone(),
-                buckets: section.buckets,
+                positions: section.hiz_positions.clone(),
+                bucket_ranges: section.hiz_ranges,
                 draw_mask: section_draw_mask(min, camera_position),
             });
         }
@@ -8038,8 +9087,10 @@ impl GpuRenderer {
             match completed {
                 Some(done) => self.install_live_section_geometry(
                     coord,
-                    pending.packed,
-                    pending.order,
+                    &pending.packed,
+                    pending.packed_digest,
+                    translucent_order_digest(&pending.order),
+                    pending.order.len() as u32,
                     pending.buckets,
                     done.opaque_bucket_ranges,
                     done.geometry,
@@ -8047,6 +9098,7 @@ impl GpuRenderer {
                 None => self.install_live_section(
                     coord,
                     &pending.packed,
+                    pending.packed_digest,
                     &pending.order,
                     pending.buckets,
                 ),
@@ -11889,36 +12941,10 @@ fn uniform_entry(binding: u32) -> wgpu::BindGroupLayoutEntry {
     }
 }
 
-fn vertex_buffer(
-    device: &wgpu::Device,
-    queue: &wgpu::Queue,
-    label: &str,
-    verts: &[PackedVertex],
-) -> wgpu::Buffer {
-    let buffer = device.create_buffer(&wgpu::BufferDescriptor {
-        label: Some(label),
-        size: std::mem::size_of_val(verts).max(16) as u64,
-        usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
-        mapped_at_creation: false,
-    });
-    if !verts.is_empty() {
-        // PackedVertex mirrors the C header's four native-endian u32s; it has
-        // no Pod impl, so serialize the fields explicitly.
-        let mut bytes = Vec::with_capacity(std::mem::size_of_val(verts));
-        for v in verts {
-            bytes.extend_from_slice(&v.position.to_ne_bytes());
-            bytes.extend_from_slice(&v.state_id.to_ne_bytes());
-            bytes.extend_from_slice(&v.attributes.to_ne_bytes());
-            bytes.extend_from_slice(&v.tint.to_ne_bytes());
-        }
-        queue.write_buffer(&buffer, 0, &bytes);
-    }
-    buffer
-}
-
 /// Generic `bytemuck::Pod` vertex upload — used by the decoded
 /// `WaterVertex`/`LitTerrainVertex`/`StainedCasterVertex` streams
-/// (`PackedVertex` keeps its manual u32 serialization above).
+/// (`PackedVertex` uploads go through the compact staging path — it has
+/// no `Pod` impl and serializes to three u32 words explicitly).
 fn typed_vertex_buffer<T: bytemuck::Pod>(
     device: &wgpu::Device,
     queue: &wgpu::Queue,

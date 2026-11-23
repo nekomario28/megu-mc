@@ -62,15 +62,16 @@ const MAX_WORKERS: usize = 8;
 pub struct HiZSplatSection {
     /// World-space minimum corner (`coord * 16`).
     pub origin: [f32; 3],
-    /// Grouped packed quads (shared with the resident section record).
-    /// The worker reads only the `position`/`attributes` words it needs
-    /// during extraction and drops this handle before rasterizing, so a
+    /// Packed `position` word of every opaque quad vertex, extracted at
+    /// install — the only vertex data the splat worker ever reads, so
+    /// the section's full CPU mesh copy is released post-upload. The
+    /// worker drops this handle once its quads are extracted, so a
     /// queued job pins the buffer only until a worker picks it up.
-    pub packed: Arc<[PackedVertex]>,
-    /// Direction-bucket quad ranges of `packed`, when the world published
-    /// them. `None` splats the whole stream (matching the unbucketed draw
-    /// fallback).
-    pub buckets: Option<DirectionBuckets>,
+    pub positions: Arc<[u32]>,
+    /// `(first_quad, quad_count)` per direction bucket inside
+    /// `positions`, when the world published buckets. `None` splats the
+    /// whole stream (matching the unbucketed draw fallback).
+    pub bucket_ranges: Option<[(u32, u32); DIRECTION_BUCKETS]>,
     /// Buckets the frame's facing cull kept (bit per bucket); masked-out
     /// direction buckets are not drawn and therefore not occluders.
     pub draw_mask: u8,
@@ -390,6 +391,54 @@ impl SectionMeshLane {
     }
 }
 
+/// The Hi-Z splat worker only reads each opaque quad's packed `position`
+/// word — extracting it at install lets the full packed mesh leave the
+/// CPU right after upload. Translucent quads never occlude and are
+/// dropped here. With `DirectionBuckets` the stream is emitted
+/// bucket-major so every bucket's `(first_quad, quad_count)` span is
+/// contiguous and disjoint — a masked bucket's quads can never leak into
+/// a drawn neighbour's span (the interleaved translucent quads would
+/// have compacted the ranges into each other). Quads outside every
+/// bucket range are dropped exactly as the old per-bucket iteration
+/// skipped them. `None` keeps the original packed order.
+pub fn build_hiz_stream(
+    packed: &[PackedVertex],
+    buckets: Option<DirectionBuckets>,
+) -> (Vec<u32>, Option<[(u32, u32); DIRECTION_BUCKETS]>) {
+    let quad_total = packed.len() / 4;
+    let mut positions = Vec::with_capacity(quad_total * 4);
+    let Some(b) = buckets else {
+        for quad in packed.as_chunks::<4>().0.iter() {
+            if packed_quad_translucent(quad[0].attributes) {
+                continue;
+            }
+            for vertex in quad {
+                positions.push(vertex.position);
+            }
+        }
+        return (positions, None);
+    };
+    let mut ranges = [(0u32, 0u32); DIRECTION_BUCKETS];
+    for bucket in 0..DIRECTION_BUCKETS {
+        let first = (positions.len() / 4) as u32;
+        let begin = b.offset[bucket] as usize;
+        let end = begin
+            .saturating_add(b.count[bucket] as usize)
+            .min(quad_total);
+        for quad_index in begin.min(end)..end {
+            let quad = &packed[quad_index * 4..quad_index * 4 + 4];
+            if packed_quad_translucent(quad[0].attributes) {
+                continue;
+            }
+            for vertex in quad {
+                positions.push(vertex.position);
+            }
+        }
+        ranges[bucket] = (first, (positions.len() / 4 - first as usize) as u32);
+    }
+    (positions, Some(ranges))
+}
+
 /// One extracted occluder quad: the four packed `position` words and
 /// nothing else. Every other `PackedVertex` field (and every translucent
 /// quad) is discarded at extraction, so the raster pass streams 16 bytes
@@ -447,33 +496,36 @@ fn build_hiz_pyramid(
 }
 
 /// Extract every splat-eligible quad of `sections` into `scratch.quads`:
-/// bucket ranges filtered by `draw_mask`, translucent quads skipped —
-/// exactly the set the inline splat used to walk. Draining the section
-/// list drops each `packed` handle as soon as its quads are read, so a
-/// `HiZDepth` job pins vertex buffers only until extraction finishes,
-/// not through rasterization and the channel round-trip back — and the
+/// bucket ranges filtered by `draw_mask` — exactly the set the inline
+/// splat used to walk (the positions-only stream already excludes
+/// translucent quads, which never occlude). Draining the section list
+/// drops each `positions` handle as soon as its quads are read, so a
+/// `HiZDepth` job pins the buffer only until extraction finishes, not
+/// through rasterization and the channel round-trip back — and the
 /// emptied `Vec` keeps its capacity for the renderer's next job.
 fn extract_splat_quads(sections: &mut Vec<HiZSplatSection>, scratch: &mut HiZScratch) {
     scratch.quads.clear();
     scratch.spans.clear();
     for section in sections.drain(..) {
         let first = scratch.quads.len();
-        let quad_total = section.packed.len() / 4;
-        match section.buckets {
-            Some(buckets) => {
-                for bucket in 0..DIRECTION_BUCKETS {
+        let quad_total = section.positions.len() / 4;
+        match section.bucket_ranges {
+            Some(ranges) => {
+                for (bucket, &(first, count)) in ranges.iter().enumerate() {
                     if section.draw_mask >> bucket & 1 == 0 {
                         continue;
                     }
                     extract_quad_range(
-                        &section.packed,
-                        buckets.offset[bucket] as usize,
-                        (buckets.count[bucket] as usize).min(quad_total),
+                        &section.positions,
+                        first as usize,
+                        count as usize,
                         &mut scratch.quads,
                     );
                 }
             }
-            None => extract_quad_range(&section.packed, 0, quad_total, &mut scratch.quads),
+            None => {
+                extract_quad_range(&section.positions, 0, quad_total, &mut scratch.quads)
+            }
         }
         if scratch.quads.len() > first {
             scratch.spans.push(SplatSpan {
@@ -485,28 +537,19 @@ fn extract_splat_quads(sections: &mut Vec<HiZSplatSection>, scratch: &mut HiZScr
     }
 }
 
-/// Copy the opaque quads of `packed[quad_start..+quad_count]` into `out`,
-/// with the same range clamp and translucent skip the inline splat used
-/// (blended quads never occlude).
+/// Copy the quads of `positions[quad_start..+quad_count]` into `out`,
+/// with the same range clamp the inline splat used.
 fn extract_quad_range(
-    packed: &[PackedVertex],
+    positions: &[u32],
     quad_start: usize,
     quad_count: usize,
     out: &mut Vec<SplatQuad>,
 ) {
-    let quad_end = (quad_start.saturating_add(quad_count)).min(packed.len() / 4);
+    let quad_end = (quad_start.saturating_add(quad_count)).min(positions.len() / 4);
     for quad_index in quad_start.min(quad_end)..quad_end {
-        let quad = &packed[quad_index * 4..quad_index * 4 + 4];
-        if packed_quad_translucent(quad[0].attributes) {
-            continue;
-        }
+        let quad = &positions[quad_index * 4..quad_index * 4 + 4];
         out.push(SplatQuad {
-            positions: [
-                quad[0].position,
-                quad[1].position,
-                quad[2].position,
-                quad[3].position,
-            ],
+            positions: [quad[0], quad[1], quad[2], quad[3]],
         });
     }
 }
@@ -599,19 +642,30 @@ fn splat_quad(
 mod tests {
     use super::*;
 
+    /// One scene section in the pre-refactor input shape — raw packed
+    /// quads + `DirectionBuckets` — so the golden reference below still
+    /// exercises the old extraction semantics (bucket ranges over the
+    /// full packed stream with the translucent skip inside).
+    struct SceneEntry {
+        origin: [f32; 3],
+        quads: Vec<[PackedVertex; 4]>,
+        buckets: Option<DirectionBuckets>,
+        draw_mask: u8,
+    }
+
     /// The pre-refactor splat, copied verbatim as the golden reference:
     /// if the compact extraction changes which quads are drawn or what
     /// depth they claim, this grid diverges.
-    fn legacy_depth_grid(view_proj: &Mat4, sections: &[HiZSplatSection]) -> Vec<f32> {
+    fn legacy_depth_grid(view_proj: &Mat4, entries: &[SceneEntry]) -> Vec<f32> {
         let (width, height) = (HIZ_PYRAMID_WIDTH as usize, HIZ_PYRAMID_HEIGHT as usize);
         let mut depth = vec![1.0f32; width * height];
         let rows = view_proj_row_major(view_proj);
-        for section in sections {
-            let quad_total = section.packed.len() / 4;
-            match section.buckets {
+        for entry in entries {
+            let quad_total = entry.quads.len();
+            match entry.buckets {
                 Some(buckets) => {
                     for bucket in 0..DIRECTION_BUCKETS {
-                        if section.draw_mask >> bucket & 1 == 0 {
+                        if entry.draw_mask >> bucket & 1 == 0 {
                             continue;
                         }
                         legacy_splat_quad_range(
@@ -619,14 +673,14 @@ mod tests {
                             width,
                             height,
                             &rows,
-                            section,
+                            entry,
                             buckets.offset[bucket] as usize,
                             (buckets.count[bucket] as usize).min(quad_total),
                         );
                     }
                 }
                 None => legacy_splat_quad_range(
-                    &mut depth, width, height, &rows, section, 0, quad_total,
+                    &mut depth, width, height, &rows, entry, 0, quad_total,
                 ),
             }
         }
@@ -638,17 +692,17 @@ mod tests {
         width: usize,
         height: usize,
         rows: &[[f32; 4]; 4],
-        section: &HiZSplatSection,
+        entry: &SceneEntry,
         quad_start: usize,
         quad_count: usize,
     ) {
-        let quad_end = (quad_start.saturating_add(quad_count)).min(section.packed.len() / 4);
+        let quad_end = (quad_start.saturating_add(quad_count)).min(entry.quads.len());
         for quad_index in quad_start.min(quad_end)..quad_end {
-            let quad = &section.packed[quad_index * 4..quad_index * 4 + 4];
+            let quad = &entry.quads[quad_index];
             if packed_quad_translucent(quad[0].attributes) {
                 continue;
             }
-            legacy_splat_quad(depth, width, height, rows, section.origin, quad);
+            legacy_splat_quad(depth, width, height, rows, entry.origin, quad);
         }
     }
 
@@ -812,10 +866,11 @@ mod tests {
         draw_mask: u8,
     ) -> HiZSplatSection {
         let packed: Vec<PackedVertex> = quads.iter().flatten().copied().collect();
+        let (positions, bucket_ranges) = build_hiz_stream(&packed, buckets);
         HiZSplatSection {
             origin,
-            packed: packed.into(),
-            buckets,
+            positions: positions.into(),
+            bucket_ranges,
             draw_mask,
         }
     }
@@ -825,8 +880,8 @@ mod tests {
             .iter()
             .map(|s| HiZSplatSection {
                 origin: s.origin,
-                packed: Arc::clone(&s.packed),
-                buckets: s.buckets,
+                positions: Arc::clone(&s.positions),
+                bucket_ranges: s.bucket_ranges,
                 draw_mask: s.draw_mask,
             })
             .collect()
@@ -862,9 +917,10 @@ mod tests {
     /// A mixed scene exercising every splat branch: bucketed/unbucketed
     /// sections, masked buckets, translucent + water quads, empty
     /// sections, out-of-range bucket spans, and quads crossing the near
-    /// plane / sitting behind the camera.
-    fn random_scene(rng: &mut Rng) -> Vec<HiZSplatSection> {
-        let mut sections = Vec::new();
+    /// plane / sitting behind the camera. Returned in the legacy input
+    /// shape; the compact sections derive from the same quads.
+    fn random_scene(rng: &mut Rng) -> Vec<SceneEntry> {
+        let mut entries = Vec::new();
         for _ in 0..10 {
             let origin = [
                 (rng.below(5) as f32 - 2.0) * 32.0,
@@ -909,37 +965,41 @@ mod tests {
                     (1 + rng.below(127)) as u8,
                 ),
             };
-            sections.push(make_section(origin, &quads, buckets, draw_mask));
+            entries.push(SceneEntry { origin, quads, buckets, draw_mask });
         }
         // Empty section: contributes no span on either path.
-        sections.push(make_section([0.0, 0.0, 32.0], &[], None, 0xff));
+        entries.push(SceneEntry {
+            origin: [0.0, 0.0, 32.0],
+            quads: Vec::new(),
+            buckets: None,
+            draw_mask: 0xff,
+        });
         // Out-of-range bucket offsets/counts must clamp identically.
-        let quads = [xy_quad(0.0, 0.0, 16.0, 16.0, 8.0, OPAQUE)];
-        sections.push(make_section(
-            [0.0, 0.0, 24.0],
-            &quads,
-            Some(buckets_with_counts([0, 0, u32::MAX, 3, 0, 1, 0])),
-            0xff,
-        ));
+        entries.push(SceneEntry {
+            origin: [0.0, 0.0, 24.0],
+            quads: vec![xy_quad(0.0, 0.0, 16.0, 16.0, 8.0, OPAQUE)],
+            buckets: Some(buckets_with_counts([0, 0, u32::MAX, 3, 0, 1, 0])),
+            draw_mask: 0xff,
+        });
         // Quads crossing the near plane and fully behind the camera:
         // dropped corner-for-corner by both paths.
-        sections.push(make_section(
-            [0.0, 0.0, -8.0],
-            &[
+        entries.push(SceneEntry {
+            origin: [0.0, 0.0, -8.0],
+            quads: vec![
                 xy_quad(0.0, 0.0, 16.0, 16.0, 8.0, OPAQUE),
                 xy_quad(0.0, 0.0, 16.0, 16.0, 4.0, OPAQUE),
                 xy_quad(0.0, 0.0, 16.0, 16.0, 0.0, OPAQUE),
             ],
-            None,
-            0xff,
-        ));
-        sections.push(make_section(
-            [-16.0, -16.0, -40.0],
-            &[xy_quad(0.0, 0.0, 16.0, 16.0, 8.0, OPAQUE)],
-            None,
-            0xff,
-        ));
-        sections
+            buckets: None,
+            draw_mask: 0xff,
+        });
+        entries.push(SceneEntry {
+            origin: [-16.0, -16.0, -40.0],
+            quads: vec![xy_quad(0.0, 0.0, 16.0, 16.0, 8.0, OPAQUE)],
+            buckets: None,
+            draw_mask: 0xff,
+        });
+        entries
     }
 
     /// Bit-identical depth grid + every mip + identical cull verdicts on
@@ -956,8 +1016,12 @@ mod tests {
         for (case, vp) in view_projs.iter().enumerate() {
             let scene = random_scene(&mut rng);
             let legacy = legacy_depth_grid(vp, &scene);
+            let mut sections: Vec<HiZSplatSection> = scene
+                .iter()
+                .map(|e| make_section(e.origin, &e.quads, e.buckets, e.draw_mask))
+                .collect();
             let mut scratch = HiZScratch::default();
-            let pyramid = build_hiz_pyramid(vp, &mut clone_sections(&scene), &mut scratch)
+            let pyramid = build_hiz_pyramid(vp, &mut sections, &mut scratch)
                 .expect("pyramid builds");
             assert_eq!(
                 scratch.depth, legacy,
@@ -1059,12 +1123,21 @@ mod tests {
     fn pooled_scratch_survives_jobs_without_realloc() {
         let mut rng = Rng(0xBEEF_CAFE);
         let vp = test_view_proj(1.0, 0.5);
-        let big = random_scene(&mut rng);
+        let big: Vec<HiZSplatSection> = random_scene(&mut rng)
+            .iter()
+            .map(|e| make_section(e.origin, &e.quads, e.buckets, e.draw_mask))
+            .collect();
+        let small_entry = SceneEntry {
+            origin: [-8.0, -8.0, 4.0],
+            quads: vec![xy_quad(0.0, 0.0, 16.0, 16.0, 1.0, OPAQUE)],
+            buckets: None,
+            draw_mask: 0xff,
+        };
         let small = vec![make_section(
-            [-8.0, -8.0, 4.0],
-            &[xy_quad(0.0, 0.0, 16.0, 16.0, 1.0, OPAQUE)],
-            None,
-            0xff,
+            small_entry.origin,
+            &small_entry.quads,
+            small_entry.buckets,
+            small_entry.draw_mask,
         )];
         let mut scratch = HiZScratch::default();
         let _ = build_hiz_pyramid(&vp, &mut clone_sections(&big), &mut scratch);
@@ -1085,14 +1158,14 @@ mod tests {
         assert_eq!(scratch.spans.capacity(), spans_cap);
         // Correct, not a stale replay: the small scene's grid matches the
         // legacy reference computed independently.
-        let legacy = legacy_depth_grid(&vp, &small);
+        let legacy = legacy_depth_grid(&vp, std::slice::from_ref(&small_entry));
         assert_eq!(scratch.depth, legacy);
         let rows = view_proj_row_major(&vp);
         assert!(pyramid.cull_world_aabb(&rows, [-2.0, -2.0, 40.0], [2.0, 2.0, 44.0]));
     }
 
     fn next_result(pool: &MeshJobPool) -> MeshResult {
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
         loop {
             let mut out = None;
             pool.drain(|result| out = Some(result));
@@ -1100,30 +1173,31 @@ mod tests {
                 return result;
             }
             assert!(std::time::Instant::now() < deadline, "pool result timed out");
-            std::thread::yield_now();
+            // Sleep, not yield: under the full test harness many tests
+            // wait on their own pools at once — busy-yielding waiters can
+            // starve the single worker thread past the deadline.
+            std::thread::sleep(std::time::Duration::from_millis(1));
         }
     }
 
     /// End-to-end through a real worker: the job builds the same
     /// occlusion verdict the inline path would, and the worker releases
-    /// the vertex-buffer `Arc` before the result lands — nothing keeps
-    /// `packed` RAM alive past extraction.
+    /// the occluder-stream `Arc` before the result lands — nothing keeps
+    /// `positions` alive past extraction.
     #[test]
     fn hiz_depth_job_releases_vertex_buffers_and_matches_verdict() {
         let pool = MeshJobPool::new(2);
         let vp = test_view_proj(1.0, 0.5);
-        let packed: Arc<[PackedVertex]> = xy_quad(0.0, 0.0, 16.0, 16.0, 1.0, OPAQUE)
-            .into_iter()
-            .collect();
-        let weak = Arc::downgrade(&packed);
+        let section = make_section(
+            [-8.0, -8.0, 4.0],
+            &[xy_quad(0.0, 0.0, 16.0, 16.0, 1.0, OPAQUE)],
+            None,
+            0xff,
+        );
+        let weak = Arc::downgrade(&section.positions);
         assert!(pool.try_submit(MeshJob::HiZDepth {
             view_proj: vp,
-            sections: vec![HiZSplatSection {
-                origin: [-8.0, -8.0, 4.0],
-                packed,
-                buckets: None,
-                draw_mask: 0xff,
-            }],
+            sections: vec![section],
         }));
         let MeshResult::HiZDepth {
             view_proj,
@@ -1170,14 +1244,27 @@ mod tests {
             sections: occluder(20.0),
         }));
         let rows = view_proj_row_major(&vp);
-        let MeshResult::HiZDepth { pyramid, .. } = next_result(&pool) else {
-            panic!("expected HiZDepth result");
-        };
-        let near = pyramid.expect("first pyramid");
-        let MeshResult::HiZDepth { pyramid, .. } = next_result(&pool) else {
-            panic!("expected HiZDepth result");
-        };
-        let far = pyramid.expect("second pyramid");
+        // Drain until both results arrive — `next_result` keeps only the
+        // last queued result per drain, so two back-to-back calls could
+        // swallow the first pyramid when the worker outruns the test.
+        let mut pyramids = Vec::new();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+        while pyramids.len() < 2 {
+            pool.drain(|result| {
+                let MeshResult::HiZDepth { pyramid, .. } = result else {
+                    panic!("expected HiZDepth result");
+                };
+                pyramids.push(pyramid);
+            });
+            assert!(
+                std::time::Instant::now() < deadline,
+                "pool result timed out"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+        let mut pyramids = pyramids.into_iter();
+        let near = pyramids.next().unwrap().expect("first pyramid");
+        let far = pyramids.next().unwrap().expect("second pyramid");
         // Wall at z=5 claims 0.9 depth; wall at z=21 claims ~0.976.
         assert!(near.cull_world_aabb(&rows, [-2.0, -2.0, 40.0], [2.0, 2.0, 44.0]));
         assert!(far.cull_world_aabb(&rows, [-2.0, -2.0, 40.0], [2.0, 2.0, 44.0]));

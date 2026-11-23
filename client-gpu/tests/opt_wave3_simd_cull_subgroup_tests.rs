@@ -23,8 +23,8 @@ use megu_client_gpu::gpu_hiz::{
 use megu_client_gpu::live_session::LiveSession;
 use megu_client_gpu::renderer::{
     apply_external_sections_delta, frustum_planes_from_view_proj, probe_adapters,
-    request_gpu_device, section_frustum_visible, ExternalSectionMesh, GpuRenderer,
-    OFFSCREEN_FORMAT,
+    request_gpu_device, section_frustum_visible, translucent_order_digest,
+    ExternalSectionMesh, GpuRenderer, OFFSCREEN_FORMAT,
 };
 use megu_client_gpu::Camera;
 use megu_client_mesh::ffi::PackedVertex;
@@ -480,12 +480,18 @@ fn chunk_body(cz: i32) -> Vec<u8> {
 // ---------------------------------------------------------------------------
 
 fn ext_mesh(tag: u32) -> ExternalSectionMesh {
+    let packed: Arc<[PackedVertex]> = Arc::from(vec![PackedVertex {
+        position: tag,
+        ..PackedVertex::default()
+    }]);
+    let order: Arc<[u32]> = Arc::from(vec![0u32]);
     ExternalSectionMesh {
-        packed: Arc::from(vec![PackedVertex {
-            position: tag,
-            ..PackedVertex::default()
-        }]),
-        order: Arc::from(vec![0u32]),
+        packed_quads: packed.len() as u32 / 4,
+        order_digest: translucent_order_digest(&order),
+        order_len: order.len() as u32,
+        cpu_released: false,
+        packed,
+        order,
         buckets: None,
         digest: u64::from(tag),
         content_epoch: 1,

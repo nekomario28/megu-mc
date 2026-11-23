@@ -100,7 +100,9 @@ use hw_adaptive_engine::{
 use sys_metrics::{sample_host_metrics, CpuSampler, FrameTimingStats};
 
 use crate::mesh_pool::{MeshJob, MeshJobPool, MeshResult, SectionMeshLane};
-use crate::renderer::{external_packed_digest, ExternalSectionMesh, GpuRenderer};
+use crate::renderer::{
+    external_packed_digest, translucent_order_digest, ExternalSectionMesh, GpuRenderer,
+};
 
 /// Sections per poll the priority-0 lane may rebuild inline, nearest
 /// first — bounded so digging/placing reflects this same frame while a
@@ -1266,6 +1268,11 @@ pub struct LiveSession {
     /// per coord, so the drain carries each touched section exactly once
     /// no matter how many mutations landed between frames.
     external_section_delta: ExternalSectionsDelta,
+    /// World-side coords whose CPU mesh copies were released after VRAM
+    /// upload. A fresh renderer (device loss / surface re-create) owns no
+    /// GPU copy of them, so [`Self::requeue_cpu_released_sections`]
+    /// re-dirties the set and the mesh lanes rebuild the payloads.
+    cpu_released_world_coords: BTreeSet<SectionCoord>,
     /// Lazily-spawned worker pool for `MeshJob::SectionMesh` bulk
     /// meshing — created only when a dirty tail actually exceeds the
     /// inline rebuild budget, so quiet or headless sessions never pay a
@@ -1738,6 +1745,7 @@ impl LiveSession {
             external_sections: BTreeMap::new(),
             external_sections_rev: 0,
             external_section_delta: ExternalSectionsDelta::default(),
+            cpu_released_world_coords: BTreeSet::new(),
             section_mesh_workers: None,
             section_mesh_lane: SectionMeshLane::default(),
             offthread_candidates: BTreeSet::new(),
@@ -1930,11 +1938,58 @@ impl LiveSession {
 
     /// Drain the sections whose meshes finished VRAM upload and release
     /// their CPU copies — keeps `WorldState::packed_mesh_count()` at the
-    /// working-set bound (V2) instead of growing with residency.
+    /// working-set bound (V2) instead of growing with residency. The same
+    /// drain drops session-side `ExternalSectionMesh` payloads and
+    /// records released world coords so a renderer recreation can
+    /// requeue them for re-meshing.
     pub fn release_uploaded_cpu_copies(&mut self, renderer: &mut GpuRenderer) {
         for coord in renderer.take_uploaded_section_coords() {
             self.world.release_uploaded_section_cpu_copies(coord);
+            if self.world.released_mesh_meta(coord).is_some() {
+                self.cpu_released_world_coords.insert(coord);
+            } else {
+                self.cpu_released_world_coords.remove(&coord);
+            }
+            if let Some(external) = self.external_sections.get_mut(&coord) {
+                external.release_cpu_payload();
+            }
         }
+    }
+
+    /// A fresh `GpuRenderer` (device loss / surface re-create) holds none
+    /// of the VRAM copies: every section whose CPU payload was released
+    /// post-upload must be re-meshed from chunk data. Re-dirty the
+    /// world-side released coords through `MeshCache` (which makes
+    /// `mesh()` report `None` again, so the mesh lanes treat the section
+    /// as unmeshed) and drop released `ExternalSectionMesh` payloads so
+    /// the lane rebuilds them instead of mirroring empty buffers.
+    /// Returns the number of sections requeued.
+    pub fn requeue_cpu_released_sections(&mut self) -> usize {
+        let mut requeued = 0usize;
+        for coord in std::mem::take(&mut self.cpu_released_world_coords) {
+            if self.world.mesh_cache.mark_dirty(coord) {
+                self.mark_offthread_coord(coord);
+                requeued += 1;
+            }
+        }
+        let released_external: Vec<SectionCoord> = self
+            .external_sections
+            .iter()
+            .filter(|(_, external)| external.cpu_released)
+            .map(|(coord, _)| *coord)
+            .collect();
+        for coord in released_external {
+            self.external_sections.remove(&coord);
+            self.mark_external_removed(coord);
+            if self.world.mesh_cache.mark_dirty(coord) {
+                self.mark_offthread_coord(coord);
+                requeued += 1;
+            }
+        }
+        if requeued > 0 {
+            self.terrain_dirty = true;
+        }
+        requeued
     }
 
     /// Install a new spatial-audio quality tier on the caller-side mixer,
@@ -2588,9 +2643,14 @@ impl LiveSession {
         let buckets = DirectionBuckets { offset, count };
         let content_epoch = self.section_mesh_lane.epoch_of(coord);
         let digest = external_packed_digest(&packed);
+        let order_digest = translucent_order_digest(&order);
         self.insert_external_section(
             coord,
             ExternalSectionMesh {
+                packed_quads: packed.len() as u32 / 4,
+                order_digest,
+                order_len: order.len() as u32,
+                cpu_released: false,
                 packed: packed.into(),
                 order: order.into(),
                 buckets: Some(buckets),
@@ -6759,7 +6819,7 @@ mod tests {
         for (name, data) in entries {
             let offset = file.stream_position().expect("position") as u32;
             let name_bytes = name.as_bytes();
-            let crc = megu_client::zip_entries::crc32(data);
+            let crc = megu_core::hash::crc32_ieee(data);
             let mut local = Vec::new();
             local.extend_from_slice(&0x0403_4b50u32.to_le_bytes());
             local.extend_from_slice(&20u16.to_le_bytes());
