@@ -11,7 +11,11 @@
 //!   and the install falls back to computing inline.
 //! * [`MeshJob::HiZDepth`] — conservatively software-projects the opaque
 //!   quads the current frame actually drew onto a coarse depth grid and
-//!   builds a [`HiZPyramid`] the next frame's culling consults.
+//!   builds a [`HiZPyramid`] the next frame's culling consults. The worker
+//!   first extracts the only vertex data the splat consumes — each drawn
+//!   opaque quad's four packed `position` words — into a pooled compact
+//!   stream, so the full [`PackedVertex`] buffers are released before
+//!   rasterization instead of being pinned through it.
 //!
 //! The pool is a bounded `mpsc::sync_channel` work queue shared by a small
 //! fixed set of threads. Submission is non-blocking (`try_send`): a full
@@ -48,6 +52,9 @@ pub struct HiZSplatSection {
     /// World-space minimum corner (`coord * 16`).
     pub origin: [f32; 3],
     /// Grouped packed quads (shared with the resident section record).
+    /// The worker reads only the `position`/`attributes` words it needs
+    /// during extraction and drops this handle before rasterizing, so a
+    /// queued job pins the buffer only until a worker picks it up.
     pub packed: Arc<[PackedVertex]>,
     /// Direction-bucket quad ranges of `packed`, when the world published
     /// them. `None` splats the whole stream (matching the unbucketed draw
@@ -174,6 +181,10 @@ impl Drop for MeshJobPool {
 }
 
 fn worker_loop(job_rx: Arc<Mutex<Receiver<MeshJob>>>, result_tx: SyncSender<MeshResult>) {
+    // Retained Hi-Z scratch: the depth grid and compact occluder stream
+    // stay allocated across jobs, so steady-state frames never allocate
+    // on the worker.
+    let mut hiz_scratch = HiZScratch::default();
     loop {
         let job = {
             let rx = job_rx.lock().unwrap_or_else(|e| e.into_inner());
@@ -182,13 +193,13 @@ fn worker_loop(job_rx: Arc<Mutex<Receiver<MeshJob>>>, result_tx: SyncSender<Mesh
         let Ok(job) = job else {
             return;
         };
-        if result_tx.send(execute(job)).is_err() {
+        if result_tx.send(execute(job, &mut hiz_scratch)).is_err() {
             return;
         }
     }
 }
 
-fn execute(job: MeshJob) -> MeshResult {
+fn execute(job: MeshJob, hiz_scratch: &mut HiZScratch) -> MeshResult {
     match job {
         MeshJob::SectionGeometry {
             coord,
@@ -215,7 +226,7 @@ fn execute(job: MeshJob) -> MeshResult {
             sections,
         } => MeshResult::HiZDepth {
             view_proj,
-            pyramid: build_hiz_pyramid(&view_proj, &sections),
+            pyramid: build_hiz_pyramid(&view_proj, sections, hiz_scratch),
         },
     }
 }
@@ -254,17 +265,73 @@ pub fn compute_opaque_bucket_ranges(
     ranges
 }
 
+/// One extracted occluder quad: the four packed `position` words and
+/// nothing else. Every other `PackedVertex` field (and every translucent
+/// quad) is discarded at extraction, so the raster pass streams 16 bytes
+/// per quad instead of the 64-byte vertex stride.
+struct SplatQuad {
+    positions: [u32; 4],
+}
+
+/// `(origin, quads range)` of one contributing section — the raster pass
+/// walks [`HiZScratch::quads`] span by span, mirroring the old
+/// per-section iteration order.
+struct SplatSpan {
+    origin: [f32; 3],
+    start: usize,
+    end: usize,
+}
+
+/// Per-worker retained buffers for [`MeshJob::HiZDepth`] jobs. The depth
+/// grid and the compact occluder stream persist across jobs, so a
+/// steady-state frame allocates nothing on the worker — previously every
+/// job allocated a fresh `vec![1.0; width * height]` grid.
+#[derive(Default)]
+struct HiZScratch {
+    /// `HIZ_PYRAMID_WIDTH * HIZ_PYRAMID_HEIGHT` max-occluder texels,
+    /// refilled to `1.0` (farthest = no occluder) before each splat.
+    depth: Vec<f32>,
+    /// Compact drawn-opaque quad stream the raster pass consumes.
+    quads: Vec<SplatQuad>,
+    /// One entry per section that contributed at least one quad.
+    spans: Vec<SplatSpan>,
+}
+
 /// Project every drawn opaque quad of `sections` onto a coarse
 /// max-occluder depth grid and wrap it in a [`HiZPyramid`]. Conservative
 /// by construction: a texel is only claimed when the projected quad covers
 /// its center with margin, the claimed depth is the quad's *far* corner
 /// (never nearer than the true surface), and quads that clip the near
 /// plane are dropped rather than approximated.
-fn build_hiz_pyramid(view_proj: &Mat4, sections: &[HiZSplatSection]) -> Option<HiZPyramid> {
+fn build_hiz_pyramid(
+    view_proj: &Mat4,
+    sections: Vec<HiZSplatSection>,
+    scratch: &mut HiZScratch,
+) -> Option<HiZPyramid> {
     let (width, height) = (HIZ_PYRAMID_WIDTH as usize, HIZ_PYRAMID_HEIGHT as usize);
-    let mut depth = vec![1.0f32; width * height];
+    extract_splat_quads(sections, scratch);
+    scratch.depth.clear();
+    scratch.depth.resize(width * height, 1.0);
     let rows = view_proj_row_major(view_proj);
+    for span in &scratch.spans {
+        for quad in &scratch.quads[span.start..span.end] {
+            splat_quad(&mut scratch.depth, width, height, &rows, span.origin, quad);
+        }
+    }
+    HiZPyramid::from_depth_buffer(width, height, &scratch.depth).ok()
+}
+
+/// Extract every splat-eligible quad of `sections` into `scratch.quads`:
+/// bucket ranges filtered by `draw_mask`, translucent quads skipped —
+/// exactly the set the inline splat used to walk. Consuming the section
+/// list drops each `packed` handle as soon as its quads are read, so a
+/// `HiZDepth` job pins vertex buffers only until extraction finishes,
+/// not through rasterization and the channel round-trip back.
+fn extract_splat_quads(sections: Vec<HiZSplatSection>, scratch: &mut HiZScratch) {
+    scratch.quads.clear();
+    scratch.spans.clear();
     for section in sections {
+        let first = scratch.quads.len();
         let quad_total = section.packed.len() / 4;
         match section.buckets {
             Some(buckets) => {
@@ -272,41 +339,49 @@ fn build_hiz_pyramid(view_proj: &Mat4, sections: &[HiZSplatSection]) -> Option<H
                     if section.draw_mask >> bucket & 1 == 0 {
                         continue;
                     }
-                    splat_quad_range(
-                        &mut depth,
-                        width,
-                        height,
-                        &rows,
-                        section,
+                    extract_quad_range(
+                        &section.packed,
                         buckets.offset[bucket] as usize,
                         (buckets.count[bucket] as usize).min(quad_total),
+                        &mut scratch.quads,
                     );
                 }
             }
-            None => splat_quad_range(&mut depth, width, height, &rows, section, 0, quad_total),
+            None => extract_quad_range(&section.packed, 0, quad_total, &mut scratch.quads),
+        }
+        if scratch.quads.len() > first {
+            scratch.spans.push(SplatSpan {
+                origin: section.origin,
+                start: first,
+                end: scratch.quads.len(),
+            });
         }
     }
-    HiZPyramid::from_depth_buffer(width, height, &depth).ok()
 }
 
-/// Rasterize the `quad_start..+quad_count` quads of `section.packed` into
-/// `depth`, skipping translucent quads (they blend rather than occlude).
-fn splat_quad_range(
-    depth: &mut [f32],
-    width: usize,
-    height: usize,
-    rows: &[[f32; 4]; 4],
-    section: &HiZSplatSection,
+/// Copy the opaque quads of `packed[quad_start..+quad_count]` into `out`,
+/// with the same range clamp and translucent skip the inline splat used
+/// (blended quads never occlude).
+fn extract_quad_range(
+    packed: &[PackedVertex],
     quad_start: usize,
     quad_count: usize,
+    out: &mut Vec<SplatQuad>,
 ) {
-    let quad_end = (quad_start.saturating_add(quad_count)).min(section.packed.len() / 4);
+    let quad_end = (quad_start.saturating_add(quad_count)).min(packed.len() / 4);
     for quad_index in quad_start.min(quad_end)..quad_end {
-        let quad = &section.packed[quad_index * 4..quad_index * 4 + 4];
+        let quad = &packed[quad_index * 4..quad_index * 4 + 4];
         if packed_quad_translucent(quad[0].attributes) {
             continue;
         }
-        splat_quad(depth, width, height, rows, section.origin, quad);
+        out.push(SplatQuad {
+            positions: [
+                quad[0].position,
+                quad[1].position,
+                quad[2].position,
+                quad[3].position,
+            ],
+        });
     }
 }
 
@@ -320,7 +395,7 @@ fn splat_quad(
     height: usize,
     rows: &[[f32; 4]; 4],
     origin: [f32; 3],
-    quad: &[PackedVertex],
+    quad: &SplatQuad,
 ) {
     // Texel-space inset for the point-in-quad test: keeps texels whose
     // centers sit on the quad edge (ambiguous under rasterizer fill rules)
@@ -329,11 +404,11 @@ fn splat_quad(
     let mut px = [0.0f32; 4];
     let mut py = [0.0f32; 4];
     let mut far_z = 0.0f32;
-    for (corner, vertex) in quad.iter().enumerate() {
+    for (corner, &position) in quad.positions.iter().enumerate() {
         // The same decode the terrain vertex shader runs.
-        let lx = (vertex.position & 31) as f32;
-        let lz = ((vertex.position >> 5) & 31) as f32;
-        let ly = (vertex.position >> 10) as f32 / 1024.0;
+        let lx = (position & 31) as f32;
+        let lz = ((position >> 5) & 31) as f32;
+        let ly = (position >> 10) as f32 / 1024.0;
         let world = [origin[0] + lx, origin[1] + ly, origin[2] + lz];
         let clip = [
             rows[0][0] * world[0] + rows[0][1] * world[1] + rows[0][2] * world[2] + rows[0][3],
@@ -391,5 +466,657 @@ fn splat_quad(
                 *texel = texel.min(far_z);
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The pre-refactor splat, copied verbatim as the golden reference:
+    /// if the compact extraction changes which quads are drawn or what
+    /// depth they claim, this grid diverges.
+    fn legacy_depth_grid(view_proj: &Mat4, sections: &[HiZSplatSection]) -> Vec<f32> {
+        let (width, height) = (HIZ_PYRAMID_WIDTH as usize, HIZ_PYRAMID_HEIGHT as usize);
+        let mut depth = vec![1.0f32; width * height];
+        let rows = view_proj_row_major(view_proj);
+        for section in sections {
+            let quad_total = section.packed.len() / 4;
+            match section.buckets {
+                Some(buckets) => {
+                    for bucket in 0..DIRECTION_BUCKETS {
+                        if section.draw_mask >> bucket & 1 == 0 {
+                            continue;
+                        }
+                        legacy_splat_quad_range(
+                            &mut depth,
+                            width,
+                            height,
+                            &rows,
+                            section,
+                            buckets.offset[bucket] as usize,
+                            (buckets.count[bucket] as usize).min(quad_total),
+                        );
+                    }
+                }
+                None => legacy_splat_quad_range(
+                    &mut depth, width, height, &rows, section, 0, quad_total,
+                ),
+            }
+        }
+        depth
+    }
+
+    fn legacy_splat_quad_range(
+        depth: &mut [f32],
+        width: usize,
+        height: usize,
+        rows: &[[f32; 4]; 4],
+        section: &HiZSplatSection,
+        quad_start: usize,
+        quad_count: usize,
+    ) {
+        let quad_end = (quad_start.saturating_add(quad_count)).min(section.packed.len() / 4);
+        for quad_index in quad_start.min(quad_end)..quad_end {
+            let quad = &section.packed[quad_index * 4..quad_index * 4 + 4];
+            if packed_quad_translucent(quad[0].attributes) {
+                continue;
+            }
+            legacy_splat_quad(depth, width, height, rows, section.origin, quad);
+        }
+    }
+
+    fn legacy_splat_quad(
+        depth: &mut [f32],
+        width: usize,
+        height: usize,
+        rows: &[[f32; 4]; 4],
+        origin: [f32; 3],
+        quad: &[PackedVertex],
+    ) {
+        const INSIDE_MARGIN: f32 = 0.02;
+        let mut px = [0.0f32; 4];
+        let mut py = [0.0f32; 4];
+        let mut far_z = 0.0f32;
+        for (corner, vertex) in quad.iter().enumerate() {
+            let lx = (vertex.position & 31) as f32;
+            let lz = ((vertex.position >> 5) & 31) as f32;
+            let ly = (vertex.position >> 10) as f32 / 1024.0;
+            let world = [origin[0] + lx, origin[1] + ly, origin[2] + lz];
+            let clip = [
+                rows[0][0] * world[0] + rows[0][1] * world[1] + rows[0][2] * world[2]
+                    + rows[0][3],
+                rows[1][0] * world[0] + rows[1][1] * world[1] + rows[1][2] * world[2]
+                    + rows[1][3],
+                rows[2][0] * world[0] + rows[2][1] * world[1] + rows[2][2] * world[2]
+                    + rows[2][3],
+                rows[3][0] * world[0] + rows[3][1] * world[1] + rows[3][2] * world[2]
+                    + rows[3][3],
+            ];
+            let w = clip[3];
+            if !w.is_finite() || w <= 0.0 {
+                return;
+            }
+            let ndc = [clip[0] / w, clip[1] / w, clip[2] / w];
+            if !ndc.iter().all(|v| v.is_finite()) {
+                return;
+            }
+            px[corner] = (ndc[0] * 0.5 + 0.5) * width as f32;
+            py[corner] = (ndc[1] * 0.5 + 0.5) * height as f32;
+            far_z = far_z.max(ndc[2]);
+        }
+        if !(0.0..=1.0).contains(&far_z) {
+            return;
+        }
+        let min_x = px.iter().fold(f32::INFINITY, |a, &b| a.min(b));
+        let max_x = px.iter().fold(f32::NEG_INFINITY, |a, &b| a.max(b));
+        let min_y = py.iter().fold(f32::INFINITY, |a, &b| a.min(b));
+        let max_y = py.iter().fold(f32::NEG_INFINITY, |a, &b| a.max(b));
+        let x0 = (min_x.floor() as i32).clamp(0, width as i32);
+        let x1 = (max_x.ceil() as i32).clamp(0, width as i32);
+        let y0 = (min_y.floor() as i32).clamp(0, height as i32);
+        let y1 = (max_y.ceil() as i32).clamp(0, height as i32);
+        for ty in y0..y1 {
+            let cy = ty as f32 + 0.5;
+            for tx in x0..x1 {
+                let cx = tx as f32 + 0.5;
+                let mut all_pos = true;
+                let mut all_neg = true;
+                for edge in 0..4 {
+                    let (ax, ay) = (px[edge], py[edge]);
+                    let (bx, by) = (px[(edge + 1) % 4], py[(edge + 1) % 4]);
+                    let (ex, ey) = (bx - ax, by - ay);
+                    let len = (ex * ex + ey * ey).sqrt().max(1.0e-6);
+                    let dist = (ex * (cy - ay) - ey * (cx - ax)) / len;
+                    all_pos &= dist > INSIDE_MARGIN;
+                    all_neg &= dist < -INSIDE_MARGIN;
+                }
+                if all_pos || all_neg {
+                    let texel = &mut depth[ty as usize * width + tx as usize];
+                    *texel = texel.min(far_z);
+                }
+            }
+        }
+    }
+
+    /// xorshift64 — deterministic scene generation without extra deps.
+    struct Rng(u64);
+
+    impl Rng {
+        fn next_u64(&mut self) -> u64 {
+            let mut x = self.0;
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            self.0 = x;
+            x
+        }
+
+        fn below(&mut self, n: usize) -> usize {
+            (self.next_u64() % n as u64) as usize
+        }
+
+        fn range_f32(&mut self, lo: f32, hi: f32) -> f32 {
+            let unit = (self.next_u64() >> 40) as f32 / (1u64 << 24) as f32;
+            lo + (hi - lo) * unit
+        }
+    }
+
+    /// `clip = [scale*x, scale*y, z - near, z]` — perspective looking
+    /// down +z from the origin, wgpu-style `z_ndc` in `[0, 1)` for
+    /// `z > near`.
+    fn test_view_proj(scale: f32, near: f32) -> Mat4 {
+        let mut m: Mat4 = [[0.0; 4]; 4];
+        m[0][0] = scale;
+        m[1][1] = scale;
+        m[2][2] = 1.0;
+        m[3][2] = -near;
+        m[2][3] = 1.0;
+        m
+    }
+
+    /// Pack a vertex the way the mesher does: integer `x`/`z`, `y` in
+    /// 1/1024 fixed point.
+    fn vertex(x: f32, y: f32, z: f32, attributes: u32) -> PackedVertex {
+        PackedVertex {
+            position: (x as u32) | ((z as u32) << 5) | (((y * 1024.0) as u32) << 10),
+            attributes,
+            ..PackedVertex::default()
+        }
+    }
+
+    const OPAQUE: u32 = 0;
+    const TRANSLUCENT: u32 = 2 << 13;
+    const WATER: u32 = (3 << 13) | (1 << 15);
+
+    /// Flat quad in the local x/y plane (the -z/+z face shape).
+    fn xy_quad(x0: f32, y0: f32, x1: f32, y1: f32, z: f32, attr: u32) -> [PackedVertex; 4] {
+        [
+            vertex(x0, y0, z, attr),
+            vertex(x1, y0, z, attr),
+            vertex(x1, y1, z, attr),
+            vertex(x0, y1, z, attr),
+        ]
+    }
+
+    /// Flat quad in the local z/y plane (the -x/+x face shape).
+    fn zy_quad(z0: f32, y0: f32, z1: f32, y1: f32, x: f32, attr: u32) -> [PackedVertex; 4] {
+        [
+            vertex(x, y0, z0, attr),
+            vertex(x, y0, z1, attr),
+            vertex(x, y1, z1, attr),
+            vertex(x, y1, z0, attr),
+        ]
+    }
+
+    /// Flat quad in the local x/z plane (the -y/+y face shape).
+    fn xz_quad(x0: f32, z0: f32, x1: f32, z1: f32, y: f32, attr: u32) -> [PackedVertex; 4] {
+        [
+            vertex(x0, y, z0, attr),
+            vertex(x1, y, z0, attr),
+            vertex(x1, y, z1, attr),
+            vertex(x0, y, z1, attr),
+        ]
+    }
+
+    fn make_section(
+        origin: [f32; 3],
+        quads: &[[PackedVertex; 4]],
+        buckets: Option<DirectionBuckets>,
+        draw_mask: u8,
+    ) -> HiZSplatSection {
+        let packed: Vec<PackedVertex> = quads.iter().flatten().copied().collect();
+        HiZSplatSection {
+            origin,
+            packed: packed.into(),
+            buckets,
+            draw_mask,
+        }
+    }
+
+    fn clone_sections(sections: &[HiZSplatSection]) -> Vec<HiZSplatSection> {
+        sections
+            .iter()
+            .map(|s| HiZSplatSection {
+                origin: s.origin,
+                packed: Arc::clone(&s.packed),
+                buckets: s.buckets,
+                draw_mask: s.draw_mask,
+            })
+            .collect()
+    }
+
+    /// Contiguous bucket ranges covering `quad_count` quads, with
+    /// `counts` taken verbatim (so callers can forge out-of-range spans).
+    fn buckets_with_counts(counts: [u32; DIRECTION_BUCKETS]) -> DirectionBuckets {
+        let mut buckets = DirectionBuckets {
+            offset: [0; DIRECTION_BUCKETS],
+            count: counts,
+        };
+        let mut next = 0u32;
+        for (offset, &count) in buckets.offset.iter_mut().zip(&counts) {
+            *offset = next;
+            next = next.saturating_add(count);
+        }
+        buckets
+    }
+
+    fn random_buckets(rng: &mut Rng, quad_count: usize) -> DirectionBuckets {
+        let mut counts = [0u32; DIRECTION_BUCKETS];
+        let mut remaining = quad_count as u32;
+        for count in counts.iter_mut().take(DIRECTION_BUCKETS - 1) {
+            let take = rng.below(remaining as usize + 1) as u32;
+            *count = take;
+            remaining -= take;
+        }
+        counts[DIRECTION_BUCKETS - 1] = remaining;
+        buckets_with_counts(counts)
+    }
+
+    /// A mixed scene exercising every splat branch: bucketed/unbucketed
+    /// sections, masked buckets, translucent + water quads, empty
+    /// sections, out-of-range bucket spans, and quads crossing the near
+    /// plane / sitting behind the camera.
+    fn random_scene(rng: &mut Rng) -> Vec<HiZSplatSection> {
+        let mut sections = Vec::new();
+        for _ in 0..10 {
+            let origin = [
+                (rng.below(5) as f32 - 2.0) * 32.0,
+                (rng.below(4) as f32 - 2.0) * 16.0,
+                4.0 + rng.below(5) as f32 * 16.0,
+            ];
+            let quad_count = 4 + rng.below(80);
+            let mut quads = Vec::with_capacity(quad_count);
+            for _ in 0..quad_count {
+                let attr = match rng.below(12) {
+                    0 => TRANSLUCENT,
+                    1 => WATER,
+                    _ => OPAQUE,
+                };
+                // Mostly 1-block face quads; every eighth quad spans the
+                // whole section so the grid definitely claims texels.
+                let quad = if rng.below(8) == 0 {
+                    match rng.below(3) {
+                        0 => xy_quad(0.0, 0.0, 16.0, 16.0, rng.below(16) as f32, attr),
+                        1 => zy_quad(0.0, 0.0, 16.0, 16.0, rng.below(16) as f32, attr),
+                        _ => xz_quad(0.0, 0.0, 16.0, 16.0, rng.below(64) as f32 / 4.0, attr),
+                    }
+                } else {
+                    let (x0, z0, y) = (
+                        rng.below(15) as f32,
+                        rng.below(15) as f32,
+                        rng.below(64) as f32 / 4.0,
+                    );
+                    match rng.below(3) {
+                        0 => xy_quad(x0, y, x0 + 1.0, (y + 1.0).min(16.0), z0, attr),
+                        1 => zy_quad(z0, y, z0 + 1.0, (y + 1.0).min(16.0), x0, attr),
+                        _ => xz_quad(x0, z0, x0 + 1.0, z0 + 1.0, y, attr),
+                    }
+                };
+                quads.push(quad);
+            }
+            let (buckets, draw_mask) = match rng.below(4) {
+                0 => (None, 0xff),
+                1 => (Some(random_buckets(rng, quad_count)), 0xff),
+                _ => (
+                    Some(random_buckets(rng, quad_count)),
+                    (1 + rng.below(127)) as u8,
+                ),
+            };
+            sections.push(make_section(origin, &quads, buckets, draw_mask));
+        }
+        // Empty section: contributes no span on either path.
+        sections.push(make_section([0.0, 0.0, 32.0], &[], None, 0xff));
+        // Out-of-range bucket offsets/counts must clamp identically.
+        let quads = [xy_quad(0.0, 0.0, 16.0, 16.0, 8.0, OPAQUE)];
+        sections.push(make_section(
+            [0.0, 0.0, 24.0],
+            &quads,
+            Some(buckets_with_counts([0, 0, u32::MAX, 3, 0, 1, 0])),
+            0xff,
+        ));
+        // Quads crossing the near plane and fully behind the camera:
+        // dropped corner-for-corner by both paths.
+        sections.push(make_section(
+            [0.0, 0.0, -8.0],
+            &[
+                xy_quad(0.0, 0.0, 16.0, 16.0, 8.0, OPAQUE),
+                xy_quad(0.0, 0.0, 16.0, 16.0, 4.0, OPAQUE),
+                xy_quad(0.0, 0.0, 16.0, 16.0, 0.0, OPAQUE),
+            ],
+            None,
+            0xff,
+        ));
+        sections.push(make_section(
+            [-16.0, -16.0, -40.0],
+            &[xy_quad(0.0, 0.0, 16.0, 16.0, 8.0, OPAQUE)],
+            None,
+            0xff,
+        ));
+        sections
+    }
+
+    /// Bit-identical depth grid + every mip + identical cull verdicts on
+    /// an AABB battery: the observable culling output (the visible set)
+    /// is unchanged by compact extraction.
+    #[test]
+    fn compact_splat_matches_legacy_grid_and_verdicts_bit_exact() {
+        let mut rng = Rng(0x485A5F_5241_4D45);
+        let view_projs = [
+            test_view_proj(1.0, 0.5),
+            test_view_proj(0.25, 1.0),
+            test_view_proj(2.5, 0.05),
+        ];
+        for (case, vp) in view_projs.iter().enumerate() {
+            let scene = random_scene(&mut rng);
+            let legacy = legacy_depth_grid(vp, &scene);
+            let mut scratch = HiZScratch::default();
+            let pyramid = build_hiz_pyramid(vp, clone_sections(&scene), &mut scratch)
+                .expect("pyramid builds");
+            assert_eq!(
+                scratch.depth, legacy,
+                "case {case}: compact splat grid diverged from legacy"
+            );
+            let legacy_pyramid = HiZPyramid::from_depth_buffer(
+                HIZ_PYRAMID_WIDTH as usize,
+                HIZ_PYRAMID_HEIGHT as usize,
+                &legacy,
+            )
+            .expect("legacy pyramid");
+            assert_eq!(legacy_pyramid.mip_count(), pyramid.mip_count());
+            for level in 0..legacy_pyramid.mip_count() {
+                assert_eq!(
+                    legacy_pyramid.mip(level),
+                    pyramid.mip(level),
+                    "case {case} mip {level} diverged"
+                );
+            }
+            let rows = view_proj_row_major(vp);
+            for _ in 0..512 {
+                let min = [
+                    rng.range_f32(-96.0, 96.0),
+                    rng.range_f32(-48.0, 48.0),
+                    rng.range_f32(-32.0, 220.0),
+                ];
+                let max = [
+                    min[0] + rng.range_f32(1.0, 40.0),
+                    min[1] + rng.range_f32(1.0, 40.0),
+                    min[2] + rng.range_f32(1.0, 40.0),
+                ];
+                assert_eq!(
+                    legacy_pyramid.cull_world_aabb(&rows, min, max),
+                    pyramid.cull_world_aabb(&rows, min, max),
+                    "case {case}: cull verdict differs at {min:?}..{max:?}"
+                );
+            }
+        }
+    }
+
+    /// Known-answer contract: a full-screen occluder culls sections
+    /// strictly behind it and nothing else — the visible set the
+    /// renderer consumes.
+    #[test]
+    fn occluder_wall_produces_expected_visible_set() {
+        let vp = test_view_proj(1.0, 0.5);
+        // Full-section face quad: origin -8 + local [0,16] → world
+        // [-8,8] in x/y, local z 1 + origin z 4 → world z = 5.
+        let wall = make_section(
+            [-8.0, -8.0, 4.0],
+            &[xy_quad(0.0, 0.0, 16.0, 16.0, 1.0, OPAQUE)],
+            None,
+            0xff,
+        );
+        let mut scratch = HiZScratch::default();
+        let pyramid = build_hiz_pyramid(&vp, vec![wall], &mut scratch).expect("pyramid");
+        // The wall covers every texel at ndc z = (5 - 0.5) / 5.
+        let expected = (5.0f32 - 0.5) / 5.0;
+        assert!(
+            scratch.depth.iter().all(|&d| d == expected),
+            "every texel claims the wall depth {expected}"
+        );
+        let rows = view_proj_row_major(&vp);
+        assert!(pyramid.cull_world_aabb(&rows, [-2.0, -2.0, 40.0], [2.0, 2.0, 44.0]));
+        // Nearer than the wall: never culled.
+        assert!(!pyramid.cull_world_aabb(&rows, [-2.0, -2.0, 1.0], [2.0, 2.0, 3.0]));
+        // Behind the camera: never culled.
+        assert!(!pyramid.cull_world_aabb(&rows, [-2.0, -2.0, -30.0], [2.0, 2.0, -20.0]));
+    }
+
+    /// Masked-out buckets and translucent quads must contribute nothing:
+    /// the grid stays `1.0`, so no AABB can ever report occluded.
+    #[test]
+    fn masked_buckets_and_translucent_quads_never_splat() {
+        let vp = test_view_proj(1.0, 0.5);
+        let quads = [
+            xy_quad(0.0, 0.0, 16.0, 16.0, 8.0, OPAQUE),       // bucket 0 (masked)
+            xy_quad(0.0, 0.0, 16.0, 16.0, 9.0, TRANSLUCENT),  // translucent
+            xy_quad(0.0, 0.0, 16.0, 16.0, 10.0, WATER),       // water
+        ];
+        let sections = vec![make_section(
+            [-8.0, -8.0, 8.0],
+            &quads,
+            Some(buckets_with_counts([1, 0, 1, 1, 0, 0, 0])),
+            // Only buckets 1 and 4 draw — both empty of opaque quads.
+            (1 << 1) | (1 << 4),
+        )];
+        let mut scratch = HiZScratch::default();
+        let pyramid = build_hiz_pyramid(&vp, sections, &mut scratch).expect("pyramid");
+        assert!(scratch.depth.iter().all(|&d| d == 1.0));
+        let rows = view_proj_row_major(&vp);
+        assert!(!pyramid.cull_world_aabb(&rows, [-2.0, -2.0, 60.0], [2.0, 2.0, 64.0]));
+    }
+
+    /// The pooled scratch keeps its capacity across jobs and the second
+    /// build still produces the correct grid — pooling never replays
+    /// stale state.
+    #[test]
+    fn pooled_scratch_survives_jobs_without_realloc() {
+        let mut rng = Rng(0xBEEF_CAFE);
+        let vp = test_view_proj(1.0, 0.5);
+        let big = random_scene(&mut rng);
+        let small = vec![make_section(
+            [-8.0, -8.0, 4.0],
+            &[xy_quad(0.0, 0.0, 16.0, 16.0, 1.0, OPAQUE)],
+            None,
+            0xff,
+        )];
+        let mut scratch = HiZScratch::default();
+        let _ = build_hiz_pyramid(&vp, clone_sections(&big), &mut scratch);
+        let (depth_cap, quads_cap, spans_cap) = (
+            scratch.depth.capacity(),
+            scratch.quads.capacity(),
+            scratch.spans.capacity(),
+        );
+        assert_eq!(
+            scratch.depth.len(),
+            (HIZ_PYRAMID_WIDTH * HIZ_PYRAMID_HEIGHT) as usize
+        );
+        assert!(quads_cap > 0, "first job populated the compact stream");
+        let pyramid =
+            build_hiz_pyramid(&vp, clone_sections(&small), &mut scratch).expect("pyramid");
+        assert_eq!(scratch.depth.capacity(), depth_cap);
+        assert_eq!(scratch.quads.capacity(), quads_cap);
+        assert_eq!(scratch.spans.capacity(), spans_cap);
+        // Correct, not a stale replay: the small scene's grid matches the
+        // legacy reference computed independently.
+        let legacy = legacy_depth_grid(&vp, &small);
+        assert_eq!(scratch.depth, legacy);
+        let rows = view_proj_row_major(&vp);
+        assert!(pyramid.cull_world_aabb(&rows, [-2.0, -2.0, 40.0], [2.0, 2.0, 44.0]));
+    }
+
+    fn next_result(pool: &MeshJobPool) -> MeshResult {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+        loop {
+            let mut out = None;
+            pool.drain(|result| out = Some(result));
+            if let Some(result) = out {
+                return result;
+            }
+            assert!(std::time::Instant::now() < deadline, "pool result timed out");
+            std::thread::yield_now();
+        }
+    }
+
+    /// End-to-end through a real worker: the job builds the same
+    /// occlusion verdict the inline path would, and the worker releases
+    /// the vertex-buffer `Arc` before the result lands — nothing keeps
+    /// `packed` RAM alive past extraction.
+    #[test]
+    fn hiz_depth_job_releases_vertex_buffers_and_matches_verdict() {
+        let pool = MeshJobPool::new(2);
+        let vp = test_view_proj(1.0, 0.5);
+        let packed: Arc<[PackedVertex]> = xy_quad(0.0, 0.0, 16.0, 16.0, 1.0, OPAQUE)
+            .into_iter()
+            .collect();
+        let weak = Arc::downgrade(&packed);
+        assert!(pool.try_submit(MeshJob::HiZDepth {
+            view_proj: vp,
+            sections: vec![HiZSplatSection {
+                origin: [-8.0, -8.0, 4.0],
+                packed,
+                buckets: None,
+                draw_mask: 0xff,
+            }],
+        }));
+        let MeshResult::HiZDepth { view_proj, pyramid } = next_result(&pool) else {
+            panic!("expected HiZDepth result");
+        };
+        assert_eq!(view_proj, vp);
+        let pyramid = pyramid.expect("pyramid built");
+        let rows = view_proj_row_major(&vp);
+        assert!(pyramid.cull_world_aabb(&rows, [-2.0, -2.0, 40.0], [2.0, 2.0, 44.0]));
+        assert!(
+            weak.upgrade().is_none(),
+            "the finished job must not retain the vertex buffer"
+        );
+    }
+
+    /// Two consecutive Hi-Z jobs on one pool: the second reuses the
+    /// worker's scratch and still produces an independent, correct
+    /// pyramid.
+    #[test]
+    fn consecutive_hiz_jobs_stay_independent() {
+        let pool = MeshJobPool::new(1);
+        let vp = test_view_proj(1.0, 0.5);
+        let occluder = |z_offset: f32| {
+            vec![make_section(
+                [-8.0, -8.0, z_offset],
+                &[xy_quad(0.0, 0.0, 16.0, 16.0, 1.0, OPAQUE)],
+                None,
+                0xff,
+            )]
+        };
+        assert!(pool.try_submit(MeshJob::HiZDepth {
+            view_proj: vp,
+            sections: occluder(4.0),
+        }));
+        assert!(pool.try_submit(MeshJob::HiZDepth {
+            view_proj: vp,
+            sections: occluder(20.0),
+        }));
+        let rows = view_proj_row_major(&vp);
+        let MeshResult::HiZDepth { pyramid, .. } = next_result(&pool) else {
+            panic!("expected HiZDepth result");
+        };
+        let near = pyramid.expect("first pyramid");
+        let MeshResult::HiZDepth { pyramid, .. } = next_result(&pool) else {
+            panic!("expected HiZDepth result");
+        };
+        let far = pyramid.expect("second pyramid");
+        // Wall at z=5 claims 0.9 depth; wall at z=21 claims ~0.976.
+        assert!(near.cull_world_aabb(&rows, [-2.0, -2.0, 40.0], [2.0, 2.0, 44.0]));
+        assert!(far.cull_world_aabb(&rows, [-2.0, -2.0, 40.0], [2.0, 2.0, 44.0]));
+        // A z=8 AABB sits behind the z=5 wall (nearest ndc 0.9375 > 0.9 →
+        // culled) but in front of the z=21 wall (0.9375 < 0.976 → kept).
+        // Opposite verdicts prove the second job did not replay the first.
+        assert!(near.cull_world_aabb(&rows, [-1.0, -1.0, 8.0], [1.0, 1.0, 10.0]));
+        assert!(!far.cull_world_aabb(&rows, [-1.0, -1.0, 8.0], [1.0, 1.0, 10.0]));
+    }
+
+    /// The `SectionGeometry` arm is untouched but shares `execute` —
+    /// smoke-test its round-trip through the same pool.
+    #[test]
+    fn section_geometry_job_still_round_trips() {
+        let pool = MeshJobPool::new(1);
+        let packed: Arc<[PackedVertex]> = xy_quad(0.0, 0.0, 16.0, 16.0, 1.0, OPAQUE)
+            .into_iter()
+            .collect();
+        let order: Arc<[u32]> = vec![0u32].into();
+        let coord = SectionCoord(1, 2, 3);
+        assert!(pool.try_submit(MeshJob::SectionGeometry {
+            coord,
+            packed: Arc::clone(&packed),
+            order,
+            buckets: Some(buckets_with_counts([1, 0, 0, 0, 0, 0, 0])),
+        }));
+        let MeshResult::SectionGeometry {
+            coord: done,
+            packed: echoed,
+            opaque_bucket_ranges,
+            ..
+        } = next_result(&pool)
+        else {
+            panic!("expected SectionGeometry result");
+        };
+        assert_eq!(done, coord);
+        assert!(Arc::ptr_eq(&echoed, &packed));
+        let ranges = opaque_bucket_ranges.expect("bucketed mesh reports ranges");
+        assert_eq!(ranges[0], (0, 6), "one opaque quad → six indices");
+        assert_eq!(&ranges[1..], &[(6, 0); DIRECTION_BUCKETS - 1][..]);
+    }
+
+    #[test]
+    fn translucent_decode_matches_layer_and_fluid_bits() {
+        for layer in 0..4u32 {
+            for fluid in 0..4u32 {
+                let attr = (layer << 13) | (fluid << 15);
+                assert_eq!(
+                    packed_quad_translucent(attr),
+                    layer == 2 || (layer == 3 && fluid == 1),
+                    "layer {layer} fluid {fluid}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn bucket_ranges_count_opaque_only() {
+        // Bucket 0: 1 opaque + 1 translucent; bucket 2: 2 opaque.
+        let quads = [
+            xy_quad(0.0, 0.0, 1.0, 1.0, 8.0, OPAQUE),
+            xy_quad(0.0, 0.0, 1.0, 1.0, 8.0, TRANSLUCENT),
+            xy_quad(0.0, 0.0, 1.0, 1.0, 8.0, OPAQUE),
+            xy_quad(0.0, 0.0, 1.0, 1.0, 8.0, WATER),
+        ];
+        let packed: Vec<PackedVertex> = quads.iter().flatten().copied().collect();
+        let ranges = compute_opaque_bucket_ranges(
+            &packed,
+            buckets_with_counts([2, 0, 2, 0, 0, 0, 0]),
+        );
+        assert_eq!(
+            ranges,
+            [(0, 6), (6, 0), (6, 6), (12, 0), (12, 0), (12, 0), (12, 0)]
+        );
     }
 }
