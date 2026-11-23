@@ -50,6 +50,9 @@ jobs:
           python3 tests/megu_tui_test.py
           python3 tests/client_vertical_wiring_audit_test.py
           python3 tools/client_vertical_wiring_audit.py
+          python3 tests/opt_wiring_audit_test.py
+          python3 tools/opt_wiring_audit.py
+          python3 tests/java_toolchain_test.py
           python3 tests/verify_gate_coverage_test.py
           python3 tests/installer_cross_os_test.py
           python3 website/check_site.py
