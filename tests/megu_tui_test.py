@@ -273,7 +273,7 @@ class DemoFrameCliTest(unittest.TestCase):
         merged.update(env or {})
         return subprocess.run(
             [sys.executable, str(TOOL)] + argv,
-            input=input_text, capture_output=True, text=True,
+            input=input_text, capture_output=True, text=True, encoding="utf-8",
             timeout=30, env=merged)
 
     def test_demo_frame_piped_has_no_ansi(self):

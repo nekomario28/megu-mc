@@ -12,7 +12,11 @@ struct TestDir(PathBuf);
 
 impl TestDir {
     fn new() -> Self {
-        let path = std::env::temp_dir().join(format!(
+        // macOS exposes the temporary directory through `/var`, which is a
+        // symlink to `/private/var`. Use its canonical path so the fixture
+        // exercises symlinks inside the game directory rather than that OS alias.
+        let temp_dir = fs::canonicalize(std::env::temp_dir()).expect("canonicalize temp dir");
+        let path = temp_dir.join(format!(
             "megu-lifecycle-contract-{}-{}",
             std::process::id(),
             TEMP_SEQUENCE.fetch_add(1, Ordering::Relaxed)

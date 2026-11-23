@@ -3691,14 +3691,8 @@ check "chest_contract_3d_barrel_toggles_open_without_lid_event" \
   tick_tests::chest_contract_3d_barrel_toggles_open_property_without_block_event
 
 check "chest_contract_3d_dry_chest_is_solid_for_fluid" \
-  src/main.rs '            || matches!(
-                reg.name_of(st),
-                "minecraft:chest" | "minecraft:trapped_chest" | "minecraft:ender_chest"
-            )' \
-  '            || matches!(
-                reg.name_of(st),
-                "minecraft:ender_chest"
-            )' \
+  src/main.rs 'else if fluid_washes_away(reg, st) {' \
+  'else if true {' \
   tick_tests::chest_contract_3d_waterlogged_double_chest_schedules_and_spreads_without_dry_partner_error
 
 check "chest_contract_3d_ender_chest_counts_anchor_openers" \
@@ -3908,8 +3902,8 @@ check "p2_3_s3_block_light_anchors_at_dimension_light_min_y" \
 # A band read that answers from the Overworld's key makes a Nether write invisible to its own
 # band (and lets an Overworld cell answer for it) at the same (cx, cz).
 check "p2_3_s3_band_cache_is_keyed_by_dimension" \
-  src/main.rs '    let band = op_bands().lock().unwrap_or_else(|e| e.into_inner()).get((dim, cx, cz))?;' \
-  '    let band = op_bands().lock().unwrap_or_else(|e| e.into_inner()).get((DimId::Overworld, cx, cz))?;' \
+  src/main.rs 'let band = self.map.get(&key).map(|(_, b)| b.clone());' \
+  'let band = self.map.get(&(DimId::Overworld, key.1, key.2)).map(|(_, b)| b.clone());' \
   tick_tests::p2_3_s3_chunk_caches_isolate_dimensions_on_same_coords
 
 # P2-3-S4: the dimension a client is in has to reach the wire id, the 0x47 payload, the
