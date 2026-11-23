@@ -3193,7 +3193,10 @@ impl UiState {
             }
             WidgetId::PauseSaveQuit => {
                 self.go_title();
-                vec![UiAction::OpenScreen(Screen::Title)]
+                // `LeaveWorld` tears the live session down before the
+                // title screen lands — like `DeathTitleScreen`, leaving
+                // world must drop the connection, not leak it.
+                vec![UiAction::LeaveWorld]
             }
 
             WidgetId::CrashSendReport => {

@@ -1022,9 +1022,11 @@ fn escape_navigation_and_pause() {
     assert_eq!(acts, vec![UiAction::OpenScreen(Screen::Pause)]);
     assert_eq!(ui.screen, Screen::Pause);
 
-    // Save & Quit returns to title.
+    // Save & Quit leaves the world (the host drops the session and the
+    // state machine lands on Title — the same `LeaveWorld` action the
+    // death screen's Title button emits).
     let acts = click(&mut ui, WidgetId::PauseSaveQuit, w, h);
-    assert_eq!(acts, vec![UiAction::OpenScreen(Screen::Title)]);
+    assert_eq!(acts, vec![UiAction::LeaveWorld]);
     assert_eq!(ui.screen, Screen::Title);
 }
 

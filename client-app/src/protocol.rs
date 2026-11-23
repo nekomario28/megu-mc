@@ -2803,6 +2803,217 @@ fn slot_skip_extent(b: &[u8], start: usize) -> Option<usize> {
     Some(p)
 }
 
+/// One scalar `set_entity_data` metadata record value, keyed by serializer
+/// type in [`parse_entity_metadata`]'s `(index, type, value)` triples.
+/// Payloads the client does not model surface as
+/// [`EntityMetaValue::Skipped`] — the walker still advances over them so
+/// later scalars stay reachable.
+#[derive(Clone, Debug, PartialEq)]
+pub enum EntityMetaValue {
+    Byte(u8),
+    VarInt(i32),
+    Float(f32),
+    Text(String),
+    OptionalText(Option<String>),
+    Bool(bool),
+    /// Raw `Slot` wire bytes (item-entity stacks decode via
+    /// [`decode_item_stack_components`]).
+    Slot(Vec<u8>),
+    /// Recognized-but-unmodeled payload; the walker skipped it.
+    Skipped,
+}
+
+/// Walk one `set_entity_data` entry list (`index u8` / `type VarInt` /
+/// value records terminated by `0xFF`) into scalar
+/// [`EntityMetaValue`] triples. Fail-closed like the rest of the wire
+/// layer: a truncated record or a serializer type with an unbounded
+/// payload (particles) ends the walk and returns the entries decoded so
+/// far — partial metadata still beats a full desync.
+pub fn parse_entity_metadata(raw: &[u8]) -> Vec<(u8, i32, EntityMetaValue)> {
+    let mut out = Vec::new();
+    let mut p = 0usize;
+    while let Some(&index) = raw.get(p) {
+        if index == 0xFF {
+            break;
+        }
+        p += 1;
+        let Some(ty) = slot_varint(raw, &mut p).and_then(|v| i32::try_from(v).ok()) else {
+            break;
+        };
+        let value = match ty {
+            // byte
+            0 => {
+                let Some(&b) = raw.get(p) else { break };
+                p += 1;
+                EntityMetaValue::Byte(b)
+            }
+            // varint
+            1 => {
+                let Some(v) = slot_varint(raw, &mut p).and_then(|v| i32::try_from(v).ok())
+                else {
+                    break;
+                };
+                EntityMetaValue::VarInt(v)
+            }
+            // varlong
+            2 => {
+                if slot_varint(raw, &mut p).is_none() {
+                    break;
+                }
+                EntityMetaValue::Skipped
+            }
+            // float
+            3 => {
+                let Some(bytes) = raw.get(p..p + 4) else { break };
+                p += 4;
+                EntityMetaValue::Float(f32::from_be_bytes(bytes.try_into().unwrap_or_default()))
+            }
+            // string
+            4 => {
+                let Some(len) =
+                    slot_varint(raw, &mut p).and_then(|v| usize::try_from(v).ok())
+                else {
+                    break;
+                };
+                let Some(bytes) = raw.get(p..p + len) else { break };
+                let text = String::from_utf8_lossy(bytes).into_owned();
+                p += len;
+                EntityMetaValue::Text(text)
+            }
+            // text component (NBT)
+            5 => {
+                let start = p;
+                if slot_nbt(raw, &mut p).is_none() {
+                    break;
+                }
+                let text = WireReader::new(&raw[start..p])
+                    .read_nbt()
+                    .map(|v| v.extract_text())
+                    .unwrap_or_default();
+                EntityMetaValue::Text(text)
+            }
+            // optional text component (bool + NBT)
+            6 => {
+                let Some(&present) = raw.get(p) else { break };
+                p += 1;
+                if present == 0 {
+                    EntityMetaValue::OptionalText(None)
+                } else {
+                    let start = p;
+                    if slot_nbt(raw, &mut p).is_none() {
+                        break;
+                    }
+                    let text = WireReader::new(&raw[start..p])
+                        .read_nbt()
+                        .map(|v| v.extract_text())
+                        .unwrap_or_default();
+                    EntityMetaValue::OptionalText(Some(text))
+                }
+            }
+            // item stack (Slot)
+            7 => {
+                let Some(end) = slot_skip_extent(raw, p) else { break };
+                let bytes = raw[p..end].to_vec();
+                p = end;
+                EntityMetaValue::Slot(bytes)
+            }
+            // boolean
+            8 => {
+                let Some(&b) = raw.get(p) else { break };
+                p += 1;
+                EntityMetaValue::Bool(b != 0)
+            }
+            // rotations (3 x f32)
+            9 => {
+                if raw.get(p..p + 12).is_none() {
+                    break;
+                }
+                p += 12;
+                EntityMetaValue::Skipped
+            }
+            // block position (packed i64)
+            10 => {
+                if raw.get(p..p + 8).is_none() {
+                    break;
+                }
+                p += 8;
+                EntityMetaValue::Skipped
+            }
+            // optional block position (bool + i64)
+            11 => {
+                let Some(&present) = raw.get(p) else { break };
+                p += 1;
+                if present != 0 {
+                    if raw.get(p..p + 8).is_none() {
+                        break;
+                    }
+                    p += 8;
+                }
+                EntityMetaValue::Skipped
+            }
+            // direction / optional-unsigned-int / pose / variant ids —
+            // all plain VarInts
+            12 | 14 | 15 | 20 | 21 | 22 | 23 | 24 | 26 | 27 | 28 => {
+                let Some(v) = slot_varint(raw, &mut p).and_then(|v| i32::try_from(v).ok())
+                else {
+                    break;
+                };
+                EntityMetaValue::VarInt(v)
+            }
+            // optional living-entity reference (bool + uuid)
+            13 => {
+                let Some(&present) = raw.get(p) else { break };
+                p += 1;
+                if present != 0 {
+                    if raw.get(p..p + 16).is_none() {
+                        break;
+                    }
+                    p += 16;
+                }
+                EntityMetaValue::Skipped
+            }
+            // compound tag (NBT)
+            16 => {
+                if slot_nbt(raw, &mut p).is_none() {
+                    break;
+                }
+                EntityMetaValue::Skipped
+            }
+            // optional global position (bool + string + i64)
+            25 => {
+                let Some(&present) = raw.get(p) else { break };
+                p += 1;
+                if present != 0 {
+                    let Some(len) =
+                        slot_varint(raw, &mut p).and_then(|v| usize::try_from(v).ok())
+                    else {
+                        break;
+                    };
+                    if raw.get(p..p + len + 8).is_none() {
+                        break;
+                    }
+                    p += len + 8;
+                }
+                EntityMetaValue::Skipped
+            }
+            // vector3 (3 x f32) / quaternion (4 x f32)
+            29 | 30 => {
+                let len = if ty == 29 { 12 } else { 16 };
+                if raw.get(p..p + len).is_none() {
+                    break;
+                }
+                p += len;
+                EntityMetaValue::Skipped
+            }
+            // particles (17/18) and anything newer carry payloads that
+            // cannot be bounded generically — keep what was decoded.
+            _ => break,
+        };
+        out.push((index, ty, value));
+    }
+    out
+}
+
 /// One added `Slot` component: the verified 767 `data_component_type` id
 /// plus its exact wire payload bytes (boundary recovered by the
 /// `slot_component` walker, retained raw for consumers).
@@ -4288,6 +4499,66 @@ pub fn encode_interact_use(target: i32, hand: i32, sneaking: bool) -> (&'static 
     ("interact", p)
 }
 
+/// `interact` with `mouse` = 2 — interact-at the target entity at the
+/// exact crosshair hit position `at` (absolute world coordinates) with
+/// `hand`.
+pub fn encode_interact_at(
+    target: i32,
+    at: [f32; 3],
+    hand: i32,
+    sneaking: bool,
+) -> (&'static str, Vec<u8>) {
+    let mut p = Vec::with_capacity(21);
+    write_varint(&mut p, target);
+    write_varint(&mut p, 2); // mouse: interact_at
+    p.extend_from_slice(&at[0].to_be_bytes());
+    p.extend_from_slice(&at[1].to_be_bytes());
+    p.extend_from_slice(&at[2].to_be_bytes());
+    write_varint(&mut p, hand);
+    p.push(u8::from(sneaking));
+    ("interact", p)
+}
+
+/// Unified `interact` encoder: `action` 0 = interact (right-click,
+/// `hand`), 1 = attack, 2 = interact-at (`at` = absolute hit position,
+/// `hand`). Actions 1/2 keep `hand`/`at` unused per the vanilla layout.
+pub fn encode_interact(
+    target: i32,
+    action: i32,
+    at: Option<[f32; 3]>,
+    hand: i32,
+    sneaking: bool,
+) -> (&'static str, Vec<u8>) {
+    match action {
+        1 => encode_interact_attack(target, sneaking),
+        2 => encode_interact_at(target, at.unwrap_or([0.0; 3]), hand, sneaking),
+        _ => encode_interact_use(target, hand, sneaking),
+    }
+}
+
+/// `set_carried_item` — held hotbar slot (0..=8) echo so the server can
+/// attribute dig/attack/use packets to the right stack.
+pub fn encode_set_carried_item(slot: i32) -> (&'static str, Vec<u8>) {
+    ("set_carried_item", (slot as i16).to_be_bytes().to_vec())
+}
+
+/// `player_command` — entity action ids (vanilla
+/// `ServerboundPlayerCommandPacket`): 0 start-sneak, 1 stop-sneak,
+/// 2 leave-bed, 3 start-sprint, 4 stop-sprint, 5 start-horse-jump,
+/// 6 stop-horse-jump, 7 open-vehicle-inventory, 8 start-flying-elytra.
+/// `jump_boost` rides the horse-jump actions (`0` elsewhere).
+pub fn encode_player_command(
+    entity_id: i32,
+    action: i32,
+    jump_boost: i32,
+) -> (&'static str, Vec<u8>) {
+    let mut p = Vec::with_capacity(15);
+    write_varint(&mut p, entity_id);
+    write_varint(&mut p, action);
+    write_varint(&mut p, jump_boost);
+    ("player_command", p)
+}
+
 /// Encode one minimal `Slot` payload for [`encode_container_click`]: an empty
 /// slot (`count = 0`) or a component-free stack (`count`, `item_id`).
 pub fn encode_slot_stack(item_id: i32, count: i32) -> Vec<u8> {
@@ -5364,6 +5635,42 @@ impl ProtocolClient {
         sequence: i32,
     ) -> Result<(), String> {
         let (name, payload) = encode_use_item_on(hand, pos, face, hit, inside, sequence);
+        self.send_named(PacketPhase::Play, name, &payload)
+    }
+
+    /// `interact` — entity interaction dispatcher: `action` 1 = attack
+    /// (left-click), 0 = interact, 2 = interact-at (`at` = absolute hit
+    /// position). `hand` rides the 0/2 actions; `sneaking` is the
+    /// secondary-action flag on every variant.
+    pub fn send_interact(
+        &mut self,
+        target: i32,
+        action: i32,
+        at: Option<[f32; 3]>,
+        hand: i32,
+        sneaking: bool,
+    ) -> Result<(), String> {
+        let (name, payload) = encode_interact(target, action, at, hand, sneaking);
+        self.send_named(PacketPhase::Play, name, &payload)
+    }
+
+    /// `set_carried_item` — held hotbar slot (0..=8) sync after the local
+    /// selection changes (`ServerboundSetCarriedItemPacket` short).
+    pub fn send_set_carried_item(&mut self, slot: i32) -> Result<(), String> {
+        let (name, payload) = encode_set_carried_item(slot);
+        self.send_named(PacketPhase::Play, name, &payload)
+    }
+
+    /// `player_command` — sneak/sprint/elytra/vehicle entity action for
+    /// `entity_id` (`ServerboundPlayerCommandPacket`; `jump_boost` only
+    /// rides the horse-jump actions, `0` elsewhere).
+    pub fn send_player_command(
+        &mut self,
+        entity_id: i32,
+        action: i32,
+        jump_boost: i32,
+    ) -> Result<(), String> {
+        let (name, payload) = encode_player_command(entity_id, action, jump_boost);
         self.send_named(PacketPhase::Play, name, &payload)
     }
 

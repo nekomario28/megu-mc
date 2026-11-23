@@ -1305,3 +1305,132 @@ fn protocol_version_constant_is_767() {
     assert_eq!(PROTOCOL_767, ProtocolVersion::V1_21_1.number());
     assert_eq!(PROTOCOL_767, 767);
 }
+
+// ---------------------------------------------------------------------------
+// P0 gameplay C2S: interact / set_carried_item / player_command + metadata
+// ---------------------------------------------------------------------------
+
+use megu_client::protocol::{
+    encode_interact, encode_interact_at, encode_player_command, encode_set_carried_item,
+    parse_entity_metadata, EntityMetaValue,
+};
+
+fn v777_table() -> megu_proto::ProtocolTable {
+    VersionRouter::with_v767_and_v777()
+        .select(ProtocolVersion::V26_3.number())
+        .expect("select v777")
+        .table()
+        .clone()
+}
+
+#[test]
+fn encodes_interact_dispatcher_variants() {
+    // action 1 = attack: target + type + sneaking only.
+    let (name, body) = encode_interact(42, 1, None, 0, true);
+    assert_eq!(name, "interact");
+    let mut r = WireReader::new(&body);
+    assert_eq!(r.read_varint().unwrap(), 42);
+    assert_eq!(r.read_varint().unwrap(), 1);
+    assert!(r.read_bool().unwrap());
+    assert_eq!(r.remaining(), 0);
+
+    // action 0 = interact/use: target + type + hand + sneaking.
+    let (name, body) = encode_interact(42, 0, None, 1, false);
+    assert_eq!(name, "interact");
+    let mut r = WireReader::new(&body);
+    assert_eq!(r.read_varint().unwrap(), 42);
+    assert_eq!(r.read_varint().unwrap(), 0);
+    assert_eq!(r.read_varint().unwrap(), 1);
+    assert!(!r.read_bool().unwrap());
+    assert_eq!(r.remaining(), 0);
+
+    // action 2 = interact_at: target + type + xyz + hand + sneaking.
+    let (name, body) = encode_interact(7, 2, Some([1.5, 2.0, -0.5]), 0, true);
+    assert_eq!(name, "interact");
+    let mut r = WireReader::new(&body);
+    assert_eq!(r.read_varint().unwrap(), 7);
+    assert_eq!(r.read_varint().unwrap(), 2);
+    assert_eq!(r.read_f32().unwrap(), 1.5);
+    assert_eq!(r.read_f32().unwrap(), 2.0);
+    assert_eq!(r.read_f32().unwrap(), -0.5);
+    assert_eq!(r.read_varint().unwrap(), 0);
+    assert!(r.read_bool().unwrap());
+    assert_eq!(r.remaining(), 0);
+
+    // Direct interact_at encoder carries the same layout.
+    let (_, direct) = encode_interact_at(7, [1.5, 2.0, -0.5], 0, true);
+    assert_eq!(body, direct);
+}
+
+#[test]
+fn encodes_set_carried_item_and_player_command() {
+    // `set_carried_item`: a bare big-endian i16 hotbar slot.
+    let (name, body) = encode_set_carried_item(4);
+    assert_eq!(name, "set_carried_item");
+    assert_eq!(body, vec![0x00, 0x04]);
+
+    // `player_command`: entity id + action + horse jump boost varints.
+    let (name, body) = encode_player_command(1000, 8, 0);
+    assert_eq!(name, "player_command");
+    let mut r = WireReader::new(&body);
+    assert_eq!(r.read_varint().unwrap(), 1000);
+    assert_eq!(r.read_varint().unwrap(), 8);
+    assert_eq!(r.read_varint().unwrap(), 0);
+    assert_eq!(r.remaining(), 0);
+}
+
+#[test]
+fn c2s_names_resolve_in_both_version_tables() {
+    let v767: &[(&str, u32)] = &[
+        ("interact", 0x16),
+        ("player_command", 0x25),
+        ("set_carried_item", 0x2f),
+    ];
+    for (name, expected) in v767 {
+        assert_eq!(
+            v767_table().packet_id(PacketPhase::Play, PacketDir::Serverbound, name),
+            Some(*expected),
+            "wrong v767 id for {name}"
+        );
+    }
+    let v777: &[(&str, u32)] = &[
+        ("interact", 0x1a),
+        ("player_command", 0x2a),
+        ("set_carried_item", 0x36),
+    ];
+    for (name, expected) in v777 {
+        assert_eq!(
+            v777_table().packet_id(PacketPhase::Play, PacketDir::Serverbound, name),
+            Some(*expected),
+            "wrong v777 id for {name}"
+        );
+    }
+}
+
+#[test]
+fn parse_entity_metadata_decodes_scalars_and_stops_at_terminator() {
+    // index 0 byte 0x02 (sneaking), index 1 varint air, 0xFF terminator.
+    let raw = cat(&[&[0x00, 0x00, 0x02], &[0x01, 0x01], &vi(300), &[0xFF, 0x99]]);
+    let entries = parse_entity_metadata(&raw);
+    assert_eq!(entries.len(), 2);
+    assert!(matches!(
+        entries[0],
+        (0, 0, EntityMetaValue::Byte(0x02))
+    ));
+    assert!(matches!(
+        entries[1],
+        (1, 1, EntityMetaValue::VarInt(300))
+    ));
+}
+
+#[test]
+fn parse_entity_metadata_fail_closed_on_truncation() {
+    // Truncated record mid-value returns the entries decoded so far.
+    let raw = cat(&[&[0x00, 0x00, 0x01], &[0x09, 0x03]]);
+    let entries = parse_entity_metadata(&raw);
+    assert_eq!(entries.len(), 1);
+    assert!(matches!(entries[0], (0, 0, EntityMetaValue::Byte(0x01))));
+    // Empty and bare-terminator inputs are no-ops, not panics.
+    assert!(parse_entity_metadata(&[]).is_empty());
+    assert!(parse_entity_metadata(&[0xFF]).is_empty());
+}

@@ -45,7 +45,9 @@ use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop};
 use winit::keyboard::{KeyCode, PhysicalKey};
 use winit::window::{CursorGrabMode, Window, WindowAttributes, WindowId};
 
-use crate::live_session::{LiveSession, PlayerMovement, PlayerPose, SessionPaths, SessionStatus};
+use crate::live_session::{
+    CrosshairPick, LiveSession, PlayerMovement, PlayerPose, SessionPaths, SessionStatus,
+};
 use crate::renderer::{request_gpu_device, GpuRenderer};
 use crate::title_branding::{title_branding_sources, TitleBrandingAssets};
 use crate::{
@@ -1744,6 +1746,68 @@ impl GpuApp {
 
     /// Route a press/release to the open container screen when one is up.
     /// Returns `true` when the event was consumed by the screen.
+    /// Grabbed in-game world clicks — vanilla `startAttack`/`startUseItem`
+    /// crosshair dispatch: an entity hit wins only when nearer than the
+    /// traced block, then dig/interact falls back to block/air.
+    fn world_mouse_input(&mut self, state: ElementState, button: MouseButton) {
+        if self.ui_wants_input() {
+            return;
+        }
+        let Some(live) = &mut self.live else { return };
+        if live.is_dead() {
+            return;
+        }
+        match (button, state) {
+            (MouseButton::Left, ElementState::Pressed) => {
+                match live.crosshair_pick() {
+                    Some(CrosshairPick::Entity(hit)) => {
+                        live.attack_entity(hit.entity_id);
+                    }
+                    Some(CrosshairPick::Block(hit)) => {
+                        live.dig_start(hit.block_pos, hit.face as i8);
+                    }
+                    None => {}
+                }
+                live.swing(0);
+            }
+            (MouseButton::Left, ElementState::Released) => {
+                // Releasing mid-dig aborts at the current target, like
+                // vanilla's `continueDestroy` key-release path.
+                if let Some(CrosshairPick::Block(hit)) = live.crosshair_pick() {
+                    live.dig_abort(hit.block_pos, hit.face as i8);
+                }
+            }
+            (MouseButton::Right, ElementState::Pressed) => {
+                match live.crosshair_pick() {
+                    Some(CrosshairPick::Entity(hit)) => {
+                        live.interact_entity(
+                            hit.entity_id,
+                            Some([
+                                hit.hit_pos[0] as f32,
+                                hit.hit_pos[1] as f32,
+                                hit.hit_pos[2] as f32,
+                            ]),
+                        );
+                    }
+                    Some(CrosshairPick::Block(hit)) => {
+                        live.use_item_on(
+                            0,
+                            hit.block_pos,
+                            i32::from(hit.face as u8),
+                            hit.cursor_in_block,
+                            hit.inside,
+                        );
+                    }
+                    None => {
+                        live.use_item(0);
+                    }
+                }
+                live.swing(0);
+            }
+            _ => {}
+        }
+    }
+
     fn container_mouse_input(&mut self, state: ElementState, button: MouseButton) -> bool {
         let Some(screen) = &mut self.container_screen else {
             return false;
@@ -2152,6 +2216,7 @@ impl GpuApp {
                 strafe: if self.paused { 0.0 } else { input.strafe },
                 forward: if self.paused { 0.0 } else { input.forward },
                 jump: !self.paused && input.vertical > 0.0,
+                sneak: !self.paused && self.keys.down,
             });
         }
 
@@ -2671,9 +2736,38 @@ impl GpuApp {
             KeyCode::KeyS => self.keys.back = pressed,
             KeyCode::KeyA => self.keys.left = pressed,
             KeyCode::KeyD => self.keys.right = pressed,
-            KeyCode::Space => self.keys.up = pressed,
-            KeyCode::ShiftLeft | KeyCode::ShiftRight => self.keys.down = pressed,
-            KeyCode::ControlLeft | KeyCode::ControlRight => self.keys.sprint = pressed,
+            KeyCode::Space => {
+                self.keys.up = pressed;
+                if pressed && !self.paused {
+                    if let Some(live) = &mut self.live {
+                        live.try_start_elytra();
+                    }
+                }
+            }
+            KeyCode::ShiftLeft | KeyCode::ShiftRight => {
+                // Sneak transitions ride `player_command` (0 start /
+                // 1 stop) — emitted once per edge, not per frame.
+                if pressed != self.keys.down {
+                    self.keys.down = pressed;
+                    if !self.paused {
+                        if let Some(live) = &mut self.live {
+                            live.player_command(if pressed { 0 } else { 1 });
+                        }
+                    }
+                }
+            }
+            KeyCode::ControlLeft | KeyCode::ControlRight => {
+                // Sprint transitions ride `player_command` (3 start /
+                // 4 stop) — emitted once per edge.
+                if pressed != self.keys.sprint {
+                    self.keys.sprint = pressed;
+                    if !self.paused {
+                        if let Some(live) = &mut self.live {
+                            live.player_command(if pressed { 3 } else { 4 });
+                        }
+                    }
+                }
+            }
             KeyCode::KeyC => self.camera_controller.set_zoomed(pressed && !self.paused),
             KeyCode::F5 if pressed && !self.paused => {
                 self.camera_controller.cycle_mode();
@@ -2772,6 +2866,7 @@ impl GpuApp {
                 if let Some(live) = &mut self.live {
                     live.hud.selected_slot = usize::from(slot);
                     live.hud_revision += 1;
+                    live.set_carried_item(i32::from(slot));
                 }
             }
             WindowInputEvent::SetTabListVisible(visible) => {
@@ -3087,6 +3182,10 @@ impl ApplicationHandler for GpuApp {
                 }
                 if self.container_screen.is_some() {
                     self.container_mouse_input(state, button);
+                } else if self.cursor_grabbed && !self.paused {
+                    // Grabbed in-game clicks: crosshair dig/place/attack
+                    // dispatch into the live session.
+                    self.world_mouse_input(state, button);
                 } else if state == ElementState::Pressed && button == MouseButton::Left {
                     if self.ui_wants_input() {
                         let (x, y) = self.mouse_pos;
@@ -3096,6 +3195,24 @@ impl ApplicationHandler for GpuApp {
                         }
                     } else {
                         self.maybe_regrab();
+                    }
+                }
+            }
+            WindowEvent::MouseWheel { delta, .. } => {
+                // Grabbed scroll cycles the held hotbar slot (vanilla
+                // `mouseScrolling$scrollHotbar`).
+                if self.cursor_grabbed && !self.paused && self.live.is_some() {
+                    let lines = match delta {
+                        winit::event::MouseScrollDelta::LineDelta(_, y) => y,
+                        winit::event::MouseScrollDelta::PixelDelta(pos) => {
+                            (pos.y / 40.0) as f32
+                        }
+                    };
+                    let steps = lines.round() as i32;
+                    if steps != 0 {
+                        let current = i32::from(self.input_router.active_hotbar_slot);
+                        let next = (current - steps).rem_euclid(9) as u8;
+                        self.apply_window_input(WindowInputEvent::SelectHotbar(next));
                     }
                 }
             }
@@ -3639,5 +3756,176 @@ mod tests {
         }
         assert!(app.live.is_none(), "LeaveWorld must drop the session");
         assert_eq!(app.ui.screen, Screen::Title);
+    }
+
+    /// Pause-menu `Save and Quit to Title` must drop the live session the
+    /// same way — the leak this fixes let the socket survive to Title.
+    #[test]
+    fn pause_save_quit_leaves_world() {
+        let mut app = GpuApp::new(GpuCliConfig::default());
+        let mut live = LiveSession::offline_with_null_audio();
+        live.status = SessionStatus::Playing;
+        app.attach_live(live);
+        app.ui.navigate(Screen::Pause);
+
+        app.ui.render(1280, 720);
+        let region = app
+            .ui
+            .hit_regions
+            .iter()
+            .find(|r| r.id == megu_ui::state::WidgetId::PauseSaveQuit)
+            .copied()
+            .expect("save & quit region");
+        let actions = app.ui.handle_input(UiInputEvent::Click {
+            x: region.rect.x + 2,
+            y: region.rect.y + 2,
+        });
+        assert_eq!(actions, vec![UiAction::LeaveWorld]);
+        for action in &actions {
+            app.dispatch_ui_action(action);
+        }
+        assert!(app.live.is_none(), "Save & Quit must drop the session");
+        assert_eq!(app.ui.screen, Screen::Title);
+    }
+
+    /// Grabbed in-game clicks dispatch the vanilla crosshair order:
+    /// entity-nearer-than-block -> `interact` attack/`interact_at`, then
+    /// `swing`; air right-click falls back to `use_item`.
+    #[test]
+    fn grabbed_world_clicks_dispatch_attack_and_interact() {
+        use crate::live_session::WorkerCommand;
+        use megu_client::protocol::{ClientPlayEvent, DimensionMeta, PlayEvent};
+
+        let (tx, incoming) = std::sync::mpsc::sync_channel(8);
+        let (outgoing, rx) = std::sync::mpsc::sync_channel(16);
+        let _ = tx;
+        let mut live = LiveSession::with_channels(incoming, outgoing);
+        live.status = SessionStatus::Playing;
+        live.apply_event(ClientPlayEvent::Play(PlayEvent::JoinGame {
+            entity_id: 11,
+            dimension: DimensionMeta::default(),
+            hardcore: false,
+        }))
+        .unwrap();
+        live.pose = Some(PlayerPose {
+            feet: [0.0, 64.0, 0.0],
+            yaw: 0.0,
+            pitch: 0.0,
+        });
+        live.apply_event(ClientPlayEvent::Play(PlayEvent::AddEntity {
+            eid: 42,
+            uuid: [3; 16],
+            entity_type: 124,
+            x: 0.0,
+            y: 64.0,
+            z: 3.0,
+            pitch: 0.0,
+            yaw: 0.0,
+            head_yaw: 0.0,
+            data: 0,
+            vx: 0.0,
+            vy: 0.0,
+            vz: 0.0,
+        }))
+        .unwrap();
+        let mut app = GpuApp::new(GpuCliConfig::default());
+        app.attach_live(live);
+        app.ui.navigate(Screen::InGameHud);
+
+        // Left click on the entity ahead: attack + swing.
+        app.world_mouse_input(ElementState::Pressed, MouseButton::Left);
+        // Right click on it: interact_at (hit position) + swing.
+        app.world_mouse_input(ElementState::Pressed, MouseButton::Right);
+
+        let mut commands = Vec::new();
+        while let Ok(cmd) = rx.try_recv() {
+            commands.push(cmd);
+        }
+        assert!(
+            commands.iter().any(|c| matches!(
+                c,
+                WorkerCommand::Interact {
+                    target: 42,
+                    action: 1,
+                    ..
+                }
+            )),
+            "left click on an entity must enqueue attack"
+        );
+        assert!(commands.iter().any(|c| matches!(
+            c,
+            WorkerCommand::Interact {
+                target: 42,
+                action: 2,
+                at: Some(_),
+                ..
+            }
+        )));
+        assert_eq!(
+            commands
+                .iter()
+                .filter(|c| matches!(c, WorkerCommand::Swing { hand: 0 }))
+                .count(),
+            2,
+            "each click pairs with a main-hand swing"
+        );
+
+        // Off-entity right click on air falls back to `use_item`.
+        app.live
+            .as_mut()
+            .unwrap()
+            .apply_event(ClientPlayEvent::Play(PlayEvent::RemoveEntities {
+                eids: vec![42],
+            }))
+            .unwrap();
+        app.world_mouse_input(ElementState::Pressed, MouseButton::Right);
+        let mut commands = Vec::new();
+        while let Ok(cmd) = rx.try_recv() {
+            commands.push(cmd);
+        }
+        assert!(
+            commands
+                .iter()
+                .any(|c| matches!(c, WorkerCommand::UseItem { .. })),
+            "air right-click must enqueue use_item"
+        );
+
+        // Dead players send nothing.
+        app.live
+            .as_mut()
+            .unwrap()
+            .apply_event(ClientPlayEvent::Play(PlayEvent::SetHealth {
+                health: 0.0,
+                food: 20,
+                saturation: 5.0,
+            }))
+            .unwrap();
+        app.world_mouse_input(ElementState::Pressed, MouseButton::Right);
+        assert!(
+            rx.try_recv().is_err(),
+            "dead player input must not reach the wire"
+        );
+    }
+
+    /// Hotbar slot keys (and the scroll handler that reuses the same
+    /// event) echo the held slot to the server.
+    #[test]
+    fn hotbar_selection_sends_set_carried_item() {
+        use crate::live_session::WorkerCommand;
+
+        let (tx, incoming) = std::sync::mpsc::sync_channel(8);
+        let (outgoing, rx) = std::sync::mpsc::sync_channel(8);
+        let _ = tx;
+        let mut live = LiveSession::with_channels(incoming, outgoing);
+        live.status = SessionStatus::Playing;
+        let mut app = GpuApp::new(GpuCliConfig::default());
+        app.attach_live(live);
+
+        app.dispatch_input(WindowInputEvent::SelectHotbar(5));
+        assert_eq!(app.ui.hud.selected_slot, 5);
+        assert!(
+            matches!(rx.try_recv(), Ok(WorkerCommand::SetCarriedItem { slot: 5 })),
+            "slot change must echo set_carried_item to the server"
+        );
     }
 }

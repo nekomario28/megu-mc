@@ -4,39 +4,9 @@
   "waivers": [
     {
       "check": "hud_state_writers",
-      "id": "HudState::absorption",
-      "priority": "P1",
-      "reason": "absorption hearts never written \u2014 no producer decodes it yet"
-    },
-    {
-      "check": "hud_state_writers",
-      "id": "HudState::air",
-      "priority": "P1",
-      "reason": "air supply never written \u2014 drowning bubbles never show"
-    },
-    {
-      "check": "hud_state_writers",
-      "id": "HudState::armor",
-      "priority": "P1",
-      "reason": "armor value never written \u2014 armor row always empty"
-    },
-    {
-      "check": "hud_state_writers",
-      "id": "HudState::bossbars",
-      "priority": "P0",
-      "reason": "LiveSession decodes boss_event into live.boss_bars but nothing ever copies them into hud.bossbars \u2014 boss bars never render"
-    },
-    {
-      "check": "hud_state_writers",
       "id": "HudState::crafting_conflict",
       "priority": "P2",
       "reason": "recipe-conflict switcher has no producer yet \u2014 modded-only QoL overlay"
-    },
-    {
-      "check": "hud_state_writers",
-      "id": "HudState::hotbar",
-      "priority": "P0",
-      "reason": "hotbar slot contents never written \u2014 hotbar shows empty slots regardless of inventory"
     },
     {
       "check": "hud_state_writers",
@@ -46,23 +16,11 @@
     },
     {
       "check": "hud_state_writers",
-      "id": "HudState::offhand",
-      "priority": "P1",
-      "reason": "offhand slot label never written"
-    },
-    {
-      "check": "hud_state_writers",
-      "id": "HudState::players",
-      "priority": "P1",
-      "reason": "player_info/tab-list entries tracked but never copied into hud.players \u2014 tab list empty"
-    },
-    {
-      "check": "hud_state_writers",
       "id": "HudState::subtitles",
       "priority": "P2",
       "reason": "legacy subtitle rows never fed \u2014 subtitle_hud (fed via refresh_subtitle_hud) is the live channel"
     },
-            {
+    {
       "check": "s2c_play_event_consumption",
       "id": "PlayEvent::AwardStats",
       "priority": "P2",
@@ -91,12 +49,6 @@
       "id": "PlayEvent::ChunkBatchStart",
       "priority": "P2",
       "reason": "chunk_batch_start drops \u2014 informational batch marker; batch decode still works"
-    },
-    {
-      "check": "s2c_play_event_consumption",
-      "id": "PlayEvent::ChunksBiomes",
-      "priority": "P0",
-      "reason": "chunks_biomes drops \u2014 chunk biome data never applied; grass/water/sky colors wrong"
     },
     {
       "check": "s2c_play_event_consumption",
@@ -136,21 +88,9 @@
     },
     {
       "check": "s2c_play_event_consumption",
-      "id": "PlayEvent::DamageEvent",
-      "priority": "P0",
-      "reason": "damage_event drops \u2014 no damage direction/source feedback"
-    },
-    {
-      "check": "s2c_play_event_consumption",
       "id": "PlayEvent::DeleteChat",
       "priority": "P1",
       "reason": "delete_chat drops \u2014 server-retracted messages stay visible"
-    },
-    {
-      "check": "s2c_play_event_consumption",
-      "id": "PlayEvent::DisguisedChat",
-      "priority": "P0",
-      "reason": "disguised_chat (unsigned/system-styled chat) decoded then dropped \u2014 chat gap"
     },
     {
       "check": "s2c_play_event_consumption",
@@ -163,18 +103,6 @@
       "id": "PlayEvent::InitializeBorder",
       "priority": "P2",
       "reason": "initialize_border drops \u2014 world border state ignored"
-    },
-    {
-      "check": "s2c_play_event_consumption",
-      "id": "PlayEvent::LevelEvent",
-      "priority": "P0",
-      "reason": "level_event drops \u2014 vanilla block-break particles/effect events (e.g. 2001) never render"
-    },
-    {
-      "check": "s2c_play_event_consumption",
-      "id": "PlayEvent::LevelParticles",
-      "priority": "P0",
-      "reason": "level_particles drops \u2014 no particle spawns at all"
     },
     {
       "check": "s2c_play_event_consumption",
@@ -232,12 +160,6 @@
     },
     {
       "check": "s2c_play_event_consumption",
-      "id": "PlayEvent::PlayerChat",
-      "priority": "P0",
-      "reason": "player_chat messages from other players are decoded then dropped in `_ => {}` \u2014 multiplayer chat is invisible"
-    },
-    {
-      "check": "s2c_play_event_consumption",
       "id": "PlayEvent::PlayerCombatEnd",
       "priority": "P1",
       "reason": "player_combat_end drops \u2014 combat-window end ignored"
@@ -248,7 +170,7 @@
       "priority": "P1",
       "reason": "player_combat_enter drops \u2014 combat-window start ignored"
     },
-        {
+    {
       "check": "s2c_play_event_consumption",
       "id": "PlayEvent::PlayerLookAt",
       "priority": "P2",
@@ -259,12 +181,6 @@
       "id": "PlayEvent::PongResponse",
       "priority": "P2",
       "reason": "pong_response drops \u2014 client-initiated ping reply unused"
-    },
-    {
-      "check": "s2c_play_event_consumption",
-      "id": "PlayEvent::RemoveMobEffect",
-      "priority": "P1",
-      "reason": "remove_mob_effect drops \u2014 expired status effects stay visible"
     },
     {
       "check": "s2c_play_event_consumption",
@@ -334,12 +250,6 @@
     },
     {
       "check": "s2c_play_event_consumption",
-      "id": "PlayEvent::SetCarriedItem",
-      "priority": "P0",
-      "reason": "set_carried_item drops \u2014 server-driven hotbar slot selection ignored (hotbar sync)"
-    },
-    {
-      "check": "s2c_play_event_consumption",
       "id": "PlayEvent::SetCenterChunk",
       "priority": "P1",
       "reason": "set_center_chunk drops \u2014 client chunk-view centre never follows the server"
@@ -357,12 +267,6 @@
       "reason": "set_default_spawn_position drops \u2014 compass spawn target unused"
     },
     {
-      "check": "s2c_play_event_consumption",
-      "id": "PlayEvent::SetEntityData",
-      "priority": "P0",
-      "reason": "set_entity_data drops \u2014 entity metadata (custom names, sneaking, glowing, pose) never applied"
-    },
-        {
       "check": "s2c_play_event_consumption",
       "id": "PlayEvent::SetPlayerTeam",
       "priority": "P1",
@@ -411,12 +315,6 @@
       "reason": "ticking_step drops \u2014 frozen-tick stepping unused"
     },
     {
-      "check": "s2c_play_event_consumption",
-      "id": "PlayEvent::UpdateMobEffect",
-      "priority": "P1",
-      "reason": "update_mob_effect drops \u2014 potion/status effects never shown"
-    },
-        {
       "check": "screen_state_reachability",
       "id": "Screen::AboutMegu",
       "priority": "P2",
@@ -457,24 +355,6 @@
       "id": "ShaderPackScreenState",
       "priority": "P2",
       "reason": "owned by UiState::shader_packs and drawn through Screen::Settings(SettingsTab::Shaders); the type name never appears in client-gpu"
-    },
-    {
-      "check": "worker_command_producers",
-      "id": "WorkerCommand::Swing",
-      "priority": "P0",
-      "reason": "swing() has no non-test caller \u2014 left-click never sends the arm-swing packet (attack/dig lane)"
-    },
-    {
-      "check": "worker_command_producers",
-      "id": "WorkerCommand::UseItem",
-      "priority": "P0",
-      "reason": "use_item() has no non-test caller \u2014 right-click in air (eat/bow/shield) never reaches the worker"
-    },
-    {
-      "check": "worker_command_producers",
-      "id": "WorkerCommand::UseItemOn",
-      "priority": "P0",
-      "reason": "use_item_on() has no non-test caller \u2014 block place/interact never reaches the worker (dig/place lane)"
     }
   ]
 }

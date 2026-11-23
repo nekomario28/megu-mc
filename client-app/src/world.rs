@@ -28,8 +28,8 @@ use megu_kernel::{
 };
 
 use crate::protocol::{
-    bitset_get, DecodedBlockEntity, DecodedChunk, DecodedLightData, DimensionMeta, PlayEvent,
-    WireAttribute,
+    bitset_get, decode_paletted_container, ChunkBiomeData, DecodedBlockEntity, DecodedChunk,
+    DecodedLightData, DimensionMeta, PlayEvent, WireAttribute, WireReader,
 };
 
 // ---------------------------------------------------------------------------
@@ -933,6 +933,10 @@ pub struct StoredSection {
     pub palette: PalettedSection,
     pub block_light: [u8; LIGHT_BYTES],
     pub sky_light: [u8; LIGHT_BYTES],
+    /// Biome registry ids for the section's 4×4×4 cells (y, z, x order)
+    /// — patched in place by `chunks_biomes` and seeded from
+    /// `level_chunk_with_light`.
+    pub biomes: [u32; 64],
     pub has_non_air: bool,
 }
 
@@ -966,6 +970,7 @@ impl StoredSection {
             palette,
             block_light,
             sky_light,
+            biomes: [0; 64],
             has_non_air,
         })
     }
@@ -1484,6 +1489,24 @@ pub struct BlockBreakProgress {
     pub stage: u8,
 }
 
+/// One `level_particles` spawn request — the vanilla particle emitter
+/// parameters (drained by the particle stage, capped at 256 records).
+#[derive(Clone, Copy, Debug)]
+pub struct LevelParticleSpawn {
+    /// Palette particle id.
+    pub particle_id: i32,
+    /// `true` = visible beyond the normal 32-block particle range.
+    pub long_distance: bool,
+    /// Spawn position.
+    pub pos: [f64; 3],
+    /// Per-axis spread (each `0..=` block radius).
+    pub offset: [f32; 3],
+    /// Particle velocity scale.
+    pub max_speed: f32,
+    /// Spawn count (`0` = the vanilla single directional burst).
+    pub count: i32,
+}
+
 pub struct WorldState {
     pub dimension: DimensionMeta,
     pub blocks: BlockTable,
@@ -1556,6 +1579,13 @@ pub struct WorldState {
     pub entity_links: BTreeMap<i32, i32>,
     /// Recent block events retained for a future block-event renderer.
     pub block_events: VecDeque<([i32; 3], u8, u8, i32)>,
+    /// Recent `level_event` records `(event, pos, data)` — the vanilla
+    /// effect channel (block-break particles 2001, sounds, ...) kept
+    /// bounded for the effect renderer like [`Self::block_events`].
+    pub level_events: VecDeque<(i32, [i32; 3], i32)>,
+    /// Recent `level_particles` spawn records kept bounded the
+    /// same way; the particle stage drains them when it lands.
+    pub level_particles: VecDeque<LevelParticleSpawn>,
     /// Recent item pickup animations retained for a future entity animation system.
     pub item_pickups: VecDeque<(i32, i32, i32)>,
     /// Block entities retained from chunk payloads and `block_entity_data`
@@ -1691,6 +1721,8 @@ impl WorldState {
             passengers: BTreeMap::new(),
             entity_links: BTreeMap::new(),
             block_events: VecDeque::new(),
+            level_events: VecDeque::new(),
+            level_particles: VecDeque::new(),
             item_pickups: VecDeque::new(),
             block_entities: BTreeMap::new(),
             world_age: 0,
@@ -1712,6 +1744,8 @@ impl WorldState {
         self.passengers.clear();
         self.entity_links.clear();
         self.block_events.clear();
+        self.level_events.clear();
+        self.level_particles.clear();
         self.item_pickups.clear();
         self.block_entities.clear();
         self.block_destructions.clear();
@@ -1805,8 +1839,9 @@ impl WorldState {
         for (idx, sec) in decoded.sections.iter().enumerate() {
             let sky = sky_per_section[idx].unwrap_or(default_sky);
             let blk = block_per_section[idx].unwrap_or([0u8; LIGHT_BYTES]);
-            let stored =
+            let mut stored =
                 StoredSection::from_states(&sec.states, blk, sky, &self.blocks, self.state_count)?;
+            stored.biomes = sec.biomes;
             let coord = SectionCoord(decoded.cx, min_sy + idx as i32, decoded.cz);
             if stored.has_non_air {
                 let mesh_sec = stored.to_compressed_mesh_section(&self.blocks);
@@ -2714,6 +2749,13 @@ impl WorldState {
                     entity.hurt_ticks = HURT_FLASH_TICKS;
                 }
             }
+            // `damage_event` (1.19.4+) reports the same hurt the legacy
+            // `hurt_animation` carried — flash the victim identically.
+            PlayEvent::DamageEvent { eid, .. } => {
+                if let Some(entity) = self.entities.get_mut(eid) {
+                    entity.hurt_ticks = HURT_FLASH_TICKS;
+                }
+            }
             PlayEvent::Animate { eid, animation } => {
                 if let Some(entity) = self.entities.get_mut(eid) {
                     entity.last_animation = Some(*animation);
@@ -2798,9 +2840,75 @@ impl WorldState {
                 kind,
                 nbt_bytes,
             } => self.apply_block_entity_data(*pos, *kind, nbt_bytes),
+            PlayEvent::LevelEvent {
+                event, pos, data, ..
+            } => {
+                if self.level_events.len() == 64 {
+                    self.level_events.pop_front();
+                }
+                self.level_events.push_back((*event, *pos, *data));
+            }
+            PlayEvent::LevelParticles {
+                particle_id,
+                long_distance,
+                x,
+                y,
+                z,
+                offset_x,
+                offset_y,
+                offset_z,
+                max_speed,
+                count,
+                ..
+            } => {
+                if self.level_particles.len() == 256 {
+                    self.level_particles.pop_front();
+                }
+                self.level_particles.push_back(LevelParticleSpawn {
+                    particle_id: *particle_id,
+                    long_distance: *long_distance,
+                    pos: [*x, *y, *z],
+                    offset: [*offset_x, *offset_y, *offset_z],
+                    max_speed: *max_speed,
+                    count: *count,
+                });
+            }
+            // `chunks_biomes` — per-column biome paletted containers
+            // patched into the stored sections; columns that left the
+            // view distance simply have nothing to patch.
+            PlayEvent::ChunksBiomes { chunks } => self.apply_chunks_biomes(chunks),
             _ => {}
         }
         Ok(())
+    }
+
+    /// `chunks_biomes`: decode each column's stream of 64-cell biome
+    /// paletted containers (one per stored section, bottom-up) and patch
+    /// the matching `StoredSection::biomes` in place. A malformed or
+    /// truncated payload stops at the last good section — the packet is
+    /// a cosmetic color hint, never worth a desync.
+    fn apply_chunks_biomes(&mut self, chunks: &[ChunkBiomeData]) {
+        // v767 negotiates a 64-entry vanilla biome registry; the direct
+        // palette width follows the same ceil-log2 rule the chunk codec
+        // uses (`decode_chunk_packet_profiled`).
+        let direct_bits = (usize::BITS - 63usize.leading_zeros()) as u8;
+        for chunk in chunks {
+            let Some(column) = self.columns.get_mut(&(chunk.cx, chunk.cz)) else {
+                continue;
+            };
+            let mut reader = WireReader::new(&chunk.data);
+            for section in &mut column.sections {
+                if reader.remaining() == 0 {
+                    break;
+                }
+                let Ok(biomes) =
+                    decode_paletted_container(&mut reader, 64, 3, 1, direct_bits)
+                else {
+                    break;
+                };
+                section.biomes.copy_from_slice(&biomes[..64]);
+            }
+        }
     }
 
     /// Relative-move family (`move_entity_pos`, `move_entity_pos_rot`,

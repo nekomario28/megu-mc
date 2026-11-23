@@ -20,11 +20,11 @@ use megu_client::mod_assets_meta::{
 };
 use megu_client::online_auth::OnlineAuthOptions;
 use megu_client::protocol::{
-    decode_item_stack_components, handle_transfer_packet, offline_uuid, parse_uuid,
-    ClientCustomChannelEvent, ClientPlayEvent, DecodedMagicCastState, DecodedMagicSync,
-    DecodedMotionTrigger, DimensionMeta, ItemStackComponents, PlayEvent, PlayerInfoUpdateEntry,
-    ProtocolClient, SeasonWireSync, TeleportSync, TransferTarget, WireReader, WireSoundEvent,
-    WireStopSound,
+    decode_item_stack_components, handle_transfer_packet, offline_uuid, parse_entity_metadata,
+    parse_uuid, ClientCustomChannelEvent, ClientPlayEvent, DecodedMagicCastState, DecodedMagicSync,
+    DecodedMotionTrigger, DimensionMeta, EntityMetaValue, ItemStackComponents, PlayEvent,
+    PlayerInfoUpdateEntry, ProtocolClient, SeasonWireSync, TeleportSync, TransferTarget,
+    WireReader, WireSoundEvent, WireStopSound,
 };
 use megu_client::render::ClientVfxHost;
 use megu_client::render_graph::GpuPipelineKind;
@@ -188,6 +188,10 @@ pub struct PlayerMovement {
     pub strafe: f32,
     pub forward: f32,
     pub jump: bool,
+    /// Sneak key state — rides `player_input`'s shift bit (which doubles
+    /// as the dismount flag while riding) and `interact`'s
+    /// secondary-action flag.
+    pub sneak: bool,
 }
 
 // `Play` is the hot variant; boxing it would put an allocation on every frame.
@@ -337,6 +341,24 @@ pub(crate) enum WorkerCommand {
     /// `client_command` — the play-phase command packet the death
     /// screen's Respawn button sends: action `0` (`PERFORM_RESPAWN`).
     ClientCommand { action: i32 },
+    /// `interact` — entity interaction: `action` 0 = interact, 1 =
+    /// attack, 2 = interact-at (`at` = absolute crosshair hit position).
+    Interact {
+        target: i32,
+        action: i32,
+        at: Option<[f32; 3]>,
+        hand: i32,
+        sneaking: bool,
+    },
+    /// `set_carried_item` — held hotbar slot echo after a slot change.
+    SetCarriedItem { slot: i32 },
+    /// `player_command` — sneak/sprint/elytra/vehicle entity action for
+    /// the local player's entity id (`jump_boost` for horse jumps).
+    PlayerCommand {
+        entity_id: i32,
+        action: i32,
+        jump_boost: i32,
+    },
 }
 
 /// Live view of the server's open-container instruction: the decoded
@@ -381,6 +403,58 @@ pub struct LiveBossBar {
     /// Action-dependent payload (title/health/color/dividers/flags) kept
     /// raw for the boss-bar renderer.
     pub raw_payload: Vec<u8>,
+    /// Decoded plain-text title (actions 0 add / 3 update-name carry the
+    /// NBT component).
+    pub title: String,
+    /// Fill fraction 0..=1 (actions 0 add / 2 update-health).
+    pub health: f32,
+}
+
+/// Per-entity scalar metadata surfaced from `set_entity_data` via
+/// [`parse_entity_metadata`] — shared flags, air, custom name, pose,
+/// living health, item-entity stacks and player absorption hearts.
+#[derive(Clone, Debug, Default)]
+pub struct LiveEntityMeta {
+    /// Shared flags byte at index 0 (0x01 on-fire, 0x02 sneaking, 0x08
+    /// sprinting, 0x40 glowing, 0x80 fall-flying).
+    pub flags: Option<u8>,
+    /// Index-1 air supply (vanilla default 300 = full).
+    pub air: Option<i32>,
+    /// Index-2 custom name — plain text of the optional component.
+    pub custom_name: Option<String>,
+    /// Index-3 custom-name-visible flag.
+    pub name_visible: Option<bool>,
+    /// Index-6 pose id.
+    pub pose: Option<i32>,
+    /// Index-9 living-entity health float when a float record lands
+    /// there.
+    pub living_health: Option<f32>,
+    /// Index-14 player additional-hearts float — the HUD absorption row.
+    pub absorption: Option<f32>,
+    /// Index-8 item-entity stack decoded through
+    /// [`decode_item_stack_components`].
+    pub item_stack: Option<ItemStackComponents>,
+}
+
+/// One active mob-effect instance on a tracked entity
+/// (`update_mob_effect` / `remove_mob_effect`).
+#[derive(Clone, Copy, Debug)]
+pub struct LiveMobEffect {
+    pub amplifier: i32,
+    /// Remaining ticks (`-1` = infinite until removed).
+    pub duration: i32,
+    /// Vanilla flag byte (ambient 0x01, particles 0x02, icon 0x04).
+    pub flags: u8,
+}
+
+/// The vanilla crosshair pick (`GameRenderer.pick`): entity hits win
+/// only when strictly nearer than the traced block.
+#[derive(Clone, Copy, Debug)]
+pub enum CrosshairPick {
+    /// Entity within attack/interact reach (ray hit + distance).
+    Entity(EntityRayHit),
+    /// Block face under the crosshair (dig/use hit record).
+    Block(RayHit),
 }
 
 /// Owned snapshot of the server-driven HUD channels handed to the window's
@@ -908,6 +982,16 @@ pub struct LiveSession {
     /// Decoded equipment patches per `(entity_id, equipment_slot)` from
     /// `set_equipment`, decoded through `decode_item_stack_components`.
     entity_equipment: BTreeMap<(i32, u8), ItemStackComponents>,
+    /// Scalar metadata surfaced per entity from `set_entity_data`
+    /// (`parse_entity_metadata`) — flags, air, custom name, pose, health,
+    /// absorption and item-entity stacks.
+    pub entity_metadata: BTreeMap<i32, LiveEntityMeta>,
+    /// Active mob effects per entity from `update_mob_effect` /
+    /// `remove_mob_effect` (bounded per entity).
+    pub mob_effects: BTreeMap<i32, BTreeMap<i32, LiveMobEffect>>,
+    /// Latest sneak key state mirrored from [`PlayerMovement::sneak`] —
+    /// feeds `interact`'s secondary-action flag.
+    pub sneaking: bool,
     /// Local-movement physics mirror advanced by [`Self::predict_movement`]
     /// (sneak edge prevention runs inside `step_player_physics`).
     physics_state: PlayerPhysicsState,
@@ -1359,6 +1443,9 @@ impl LiveSession {
             entity_positions: BTreeMap::new(),
             entity_rigs: BTreeMap::new(),
             entity_equipment: BTreeMap::new(),
+            entity_metadata: BTreeMap::new(),
+            mob_effects: BTreeMap::new(),
+            sneaking: false,
             physics_state: PlayerPhysicsState::default(),
             looking_at_entity: None,
             open_screen: None,
@@ -1949,6 +2036,7 @@ impl LiveSession {
                 movement.pose.feet[2] - previous.feet[2],
             ];
         }
+        self.sneaking = movement.sneak;
         self.pose = Some(movement.pose);
         self.update_audio_listener();
         self.refresh_prefetcher();
@@ -2027,6 +2115,192 @@ impl LiveSession {
     /// `swing` — arm-swing animation for `hand`.
     pub fn swing(&mut self, hand: i32) {
         let _ = self.outgoing.try_send(WorkerCommand::Swing { hand });
+    }
+
+    /// `interact` attack — left-click hit on `entity_id` (vanilla action
+    /// 1); pairs with [`Self::swing`] exactly like vanilla's
+    /// `attack()` dispatch.
+    pub fn attack_entity(&mut self, entity_id: i32) {
+        let _ = self.outgoing.try_send(WorkerCommand::Interact {
+            target: entity_id,
+            action: 1,
+            at: None,
+            hand: 0,
+            sneaking: self.sneaking,
+        });
+    }
+
+    /// `interact` use — right-click on `entity_id`; `at` is the absolute
+    /// crosshair hit position (vanilla `interact_at`, action 2 — falls
+    /// back to plain `interact` without a hit point).
+    pub fn interact_entity(&mut self, entity_id: i32, at: Option<[f32; 3]>) {
+        let _ = self.outgoing.try_send(WorkerCommand::Interact {
+            target: entity_id,
+            action: if at.is_some() { 2 } else { 0 },
+            at,
+            hand: 0,
+            sneaking: self.sneaking,
+        });
+    }
+
+    /// `player_action` dig statuses at `pos`/`face` — 0 start, 1 abort,
+    /// 2 finish (the `face` id is the raycast `BlockHitFace` ordinal,
+    /// matching vanilla `Direction` 0..=5).
+    fn player_action(&mut self, status: i32, pos: [i32; 3], face: i8) {
+        self.use_item_sequence = self.use_item_sequence.wrapping_add(1);
+        let _ = self.outgoing.try_send(WorkerCommand::PlayerAction {
+            status,
+            pos,
+            face,
+            sequence: self.use_item_sequence,
+        });
+    }
+
+    /// `START_DESTROY_BLOCK` — left-click on a diggable block.
+    pub fn dig_start(&mut self, pos: [i32; 3], face: i8) {
+        self.player_action(0, pos, face);
+    }
+
+    /// `ABORT_DESTROY_BLOCK` — release/retarget mid-dig.
+    pub fn dig_abort(&mut self, pos: [i32; 3], face: i8) {
+        self.player_action(1, pos, face);
+    }
+
+    /// `STOP_DESTROY_BLOCK` — the dig completed (server broke the block).
+    pub fn dig_finish(&mut self, pos: [i32; 3], face: i8) {
+        self.player_action(2, pos, face);
+    }
+
+    /// `set_carried_item` — tell the server which hotbar slot (0..=8) is
+    /// held after a local selection change.
+    pub fn set_carried_item(&mut self, slot: i32) {
+        let _ = self
+            .outgoing
+            .try_send(WorkerCommand::SetCarriedItem { slot });
+    }
+
+    /// `player_command` — entity action id (0 start-sneak, 1 stop-sneak,
+    /// 3 start-sprint, 4 stop-sprint, 8 start-flying-elytra). Needs the
+    /// player entity id from `login` — no-ops until that lands.
+    pub fn player_command(&mut self, action: i32) {
+        let Some(entity_id) = self.player_entity_id else {
+            return;
+        };
+        let _ = self.outgoing.try_send(WorkerCommand::PlayerCommand {
+            entity_id,
+            action,
+            jump_boost: 0,
+        });
+    }
+
+    /// `START_FLYING_WITH_ELYTRA` — the vanilla mid-air jump press: sent
+    /// only while airborne, not already gliding, and with an elytra in
+    /// the chest armor slot (window-0 container slot 6).
+    pub fn try_start_elytra(&mut self) {
+        if !matches!(self.status, SessionStatus::Playing)
+            || self.death.is_dead()
+            || self.physics_state.on_ground
+            || self.physics_state.elytra_flying
+        {
+            return;
+        }
+        let wearing_elytra = self
+            .player_inventory
+            .get(&6)
+            .filter(|stack| stack.item_id > 0 && stack.count > 0)
+            .is_some_and(|stack| {
+                crate::recipe_ingest::item_name_for_id(stack.item_id as u32)
+                    .ends_with("elytra")
+            });
+        if wearing_elytra {
+            self.player_command(8);
+        }
+    }
+
+    /// One chat line into the bounded HUD scrollback (vanilla's 100-line
+      /// cap — oldest evicted first).
+    fn push_chat_line(&mut self, line: String) {
+        self.hud.chat_lines.push(line);
+        if self.hud.chat_lines.len() > 100 {
+            self.hud.chat_lines.remove(0);
+        }
+        self.hud_revision += 1;
+    }
+
+    /// Mirror the tab-list roster into `hud.players` (name + ping rows
+    /// the hold-Tab overlay renders; `listed = false` entries hide like
+    /// vanilla).
+    fn sync_hud_players(&mut self) {
+        let mut players: Vec<(String, u16)> = self
+            .player_info
+            .values()
+            .filter(|entry| entry.listed != Some(false))
+            .map(|entry| {
+                let name = entry
+                    .display_name_nbt
+                    .as_deref()
+                    .and_then(nbt_text)
+                    .or_else(|| entry.name.clone())
+                    .unwrap_or_else(|| uuid_label(&entry.uuid));
+                (
+                    name,
+                    entry.latency.unwrap_or(0).clamp(0, i32::from(u16::MAX)) as u16,
+                )
+            })
+            .collect();
+        players.sort_by_key(|a| a.0.to_lowercase());
+        self.hud.players = players;
+    }
+
+    /// Mirror the decoded boss bars into `hud.bossbars` (`(title,
+    /// fraction)` rows the HUD draws top-of-screen).
+    fn sync_hud_bossbars(&mut self) {
+        self.hud.bossbars = self
+            .boss_bars
+            .values()
+            .map(|bar| (bar.title.clone(), bar.health.clamp(0.0, 1.0)))
+            .collect();
+    }
+
+    /// Mirror the window-0 player inventory into `hud.hotbar` /
+    /// `hud.offhand` / `hud.armor` (container slots 36..45 hotbar, 45
+    /// offhand, 5..9 armor — vanilla `InventoryMenu` layout).
+    fn sync_hud_inventory(&mut self) {
+        let name_of = |inventory: &BTreeMap<i32, ItemStackComponents>, slot: i32| {
+            inventory
+                .get(&slot)
+                .filter(|stack| stack.item_id > 0 && stack.count > 0)
+                .map(|stack| {
+                    crate::recipe_ingest::item_name_for_id(stack.item_id as u32)
+                })
+        };
+        let hotbar =
+            std::array::from_fn(|index| name_of(&self.player_inventory, 36 + index as i32));
+        let offhand = name_of(&self.player_inventory, 45);
+        let armor = (5..9)
+            .map(|slot| {
+                armor_points_for(name_of(&self.player_inventory, slot).as_deref())
+            })
+            .sum::<u32>()
+            .min(255) as u8;
+        self.hud.hotbar = hotbar;
+        self.hud.offhand = offhand;
+        self.hud.armor = armor;
+    }
+
+    /// The vanilla crosshair pick — entity hits win only when strictly
+    /// nearer than the traced block (`GameRenderer.pick` order).
+    pub fn crosshair_pick(&self) -> Option<CrosshairPick> {
+        match (self.crosshair_entity_hit(), self.crosshair_block_hit()) {
+            (Some(entity), Some(block)) => Some(if entity.distance < block.distance {
+                CrosshairPick::Entity(entity)
+            } else {
+                CrosshairPick::Block(block)
+            }),
+            (Some(entity), None) => Some(CrosshairPick::Entity(entity)),
+            (None, Some(block)) => Some(CrosshairPick::Block(block)),
+            (None, None) => None,
+        }
     }
 
     /// `true` while the local player is dead — the window locks gameplay
@@ -3448,6 +3722,8 @@ impl LiveSession {
                     self.entity_positions.remove(eid);
                     self.entity_rigs.remove(eid);
                     self.entity_equipment.retain(|(e, _), _| e != eid);
+                    self.entity_metadata.remove(eid);
+                    self.mob_effects.remove(eid);
                 }
             }
             PlayEvent::MoveEntityPos { eid, .. }
@@ -3523,6 +3799,7 @@ impl LiveSession {
                             self.player_carried = Some(carried);
                         }
                     }
+                    self.sync_hud_inventory();
                 } else if let Some(screen) = &mut self.open_screen {
                     if screen.window_id == i32::from(window_id) {
                         screen.state_id = state_id;
@@ -3569,6 +3846,7 @@ impl LiveSession {
                             self.player_inventory.remove(&i32::from(slot));
                         }
                     }
+                    self.sync_hud_inventory();
                 } else if let Some(screen) = &mut self.open_screen {
                     if screen.window_id == i32::from(window_id) {
                         screen.state_id = state_id;
@@ -3679,6 +3957,110 @@ impl LiveSession {
                 self.actionbar_nbt = Some(nbt_bytes);
                 self.hud_revision += 1;
             }
+            PlayEvent::PlayerChat { sender, text, .. } => {
+                // Vanilla renders `<sender> message` for the default
+                // chat type; the display name wins when the tab list
+                // has one for this sender UUID.
+                let name = self
+                    .player_info
+                    .get(&sender)
+                    .and_then(|entry| {
+                        entry
+                            .display_name_nbt
+                            .as_deref()
+                            .and_then(nbt_text)
+                            .or_else(|| entry.name.clone())
+                    })
+                    .unwrap_or_else(|| uuid_label(&sender));
+                self.push_chat_line(format!("<{name}> {text}"));
+                self.chat_message = Some(text);
+            }
+            PlayEvent::DisguisedChat { text, .. } => {
+                // The sender is already baked into the undecorated text
+                // (team/system chat type) — show it verbatim.
+                self.push_chat_line(text.clone());
+                self.chat_message = Some(text);
+            }
+            PlayEvent::SetCarriedItem(slot) => {
+                // Server-forced held-item correction (`set_carried_item`
+                // S2C) — mirror it into the hotbar highlight.
+                let slot = i32::from(slot);
+                if (0..9).contains(&slot) {
+                    self.hud.selected_slot = slot as usize;
+                    self.hud_revision += 1;
+                }
+            }
+            PlayEvent::SetEntityData { eid, raw_entries } => {
+                let meta = self.entity_metadata.entry(eid).or_default();
+                for (index, _ty, value) in parse_entity_metadata(&raw_entries) {
+                    match (index, value) {
+                        (0, EntityMetaValue::Byte(flags)) => meta.flags = Some(flags),
+                        (1, EntityMetaValue::VarInt(air)) => meta.air = Some(air),
+                        (2, EntityMetaValue::OptionalText(Some(name)))
+                        | (2, EntityMetaValue::Text(name)) => {
+                            meta.custom_name = Some(name);
+                        }
+                        (2, EntityMetaValue::OptionalText(None)) => {
+                            meta.custom_name = None;
+                        }
+                        (3, EntityMetaValue::Bool(visible)) => {
+                            meta.name_visible = Some(visible);
+                        }
+                        (6, EntityMetaValue::VarInt(pose)) => meta.pose = Some(pose),
+                        (8, EntityMetaValue::Slot(bytes)) => {
+                            meta.item_stack =
+                                decode_item_stack_components(&bytes)
+                                    .ok()
+                                    .map(|(stack, _)| stack);
+                        }
+                        (9, EntityMetaValue::Float(health)) => {
+                            meta.living_health = Some(health);
+                        }
+                        (14, EntityMetaValue::Float(absorption)) => {
+                            meta.absorption = Some(absorption);
+                        }
+                        _ => {}
+                    }
+                }
+                // The local player's index-1 air supply drives the HUD
+                // bubble row; index-14 extra hearts drive absorption.
+                if Some(eid) == self.player_entity_id {
+                    if let Some(air) = self.entity_metadata.get(&eid).and_then(|m| m.air)
+                    {
+                        self.hud.air = air.clamp(0, 300) as u16;
+                    }
+                    if let Some(absorption) =
+                        self.entity_metadata.get(&eid).and_then(|m| m.absorption)
+                    {
+                        self.hud.absorption = absorption.max(0.0);
+                    }
+                }
+                self.hud_revision += 1;
+            }
+            PlayEvent::UpdateMobEffect {
+                eid,
+                effect_id,
+                amplifier,
+                duration,
+                flags,
+            } => {
+                let effects = self.mob_effects.entry(eid).or_default();
+                if effects.len() < 32 || effects.contains_key(&effect_id) {
+                    effects.insert(
+                        effect_id,
+                        LiveMobEffect {
+                            amplifier,
+                            duration,
+                            flags,
+                        },
+                    );
+                }
+            }
+            PlayEvent::RemoveMobEffect { eid, effect_id } => {
+                if let Some(effects) = self.mob_effects.get_mut(&eid) {
+                    effects.remove(&effect_id);
+                }
+            }
             PlayEvent::SetTitle {
                 fade_in,
                 stay,
@@ -3708,14 +4090,20 @@ impl LiveSession {
                 if action == 1 {
                     self.boss_bars.remove(&uuid);
                 } else {
-                    self.boss_bars.insert(
-                        uuid,
-                        LiveBossBar {
+                    let bar = self
+                        .boss_bars
+                        .entry(uuid)
+                        .or_insert_with(|| LiveBossBar {
                             action,
-                            raw_payload,
-                        },
-                    );
+                            raw_payload: Vec::new(),
+                            title: String::new(),
+                            health: 1.0,
+                        });
+                    bar.action = action;
+                    decode_boss_event_payload(bar, &raw_payload);
+                    bar.raw_payload = raw_payload;
                 }
+                self.sync_hud_bossbars();
                 self.hud_revision += 1;
             }
             PlayEvent::PlayerInfo { actions, entries } => {
@@ -3752,12 +4140,14 @@ impl LiveSession {
                         entry.display_name_nbt = update.display_name_nbt.clone();
                     }
                 }
+                self.sync_hud_players();
                 self.hud_revision += 1;
             }
             PlayEvent::PlayerInfoRemove { uuids } => {
                 for uuid in &uuids {
                     self.player_info.remove(uuid);
                 }
+                self.sync_hud_players();
                 self.hud_revision += 1;
             }
             PlayEvent::SetObjective {
@@ -3827,6 +4217,8 @@ impl LiveSession {
         self.acoustic_world.reset_dimension(&self.world);
         self.audio.mixer.refresh_acoustics();
         self.entity_positions.clear();
+        self.entity_metadata.clear();
+        self.mob_effects.clear();
         self.terrain_dirty = true;
         // Every resident coordinate may vanish — a full reconcile is the
         // only honest answer before dirty tracking resumes.
@@ -4192,6 +4584,25 @@ fn run_connection(
                 Ok(WorkerCommand::ClientCommand { action }) => {
                     client.send_client_command(action)?;
                 }
+                Ok(WorkerCommand::Interact {
+                    target,
+                    action,
+                    at,
+                    hand,
+                    sneaking,
+                }) => {
+                    client.send_interact(target, action, at, hand, sneaking)?;
+                }
+                Ok(WorkerCommand::SetCarriedItem { slot }) => {
+                    client.send_set_carried_item(slot)?;
+                }
+                Ok(WorkerCommand::PlayerCommand {
+                    entity_id,
+                    action,
+                    jump_boost,
+                }) => {
+                    client.send_player_command(entity_id, action, jump_boost)?;
+                }
                 Err(TryRecvError::Empty) => break,
                 Err(TryRecvError::Disconnected) => return Ok(()),
             }
@@ -4207,7 +4618,12 @@ fn run_connection(
                     pose.pitch,
                     false,
                 )?;
-                client.send_player_input(input.strafe, input.forward, input.jump, false)?;
+                client.send_player_input(
+                    input.strafe,
+                    input.forward,
+                    input.jump,
+                    input.sneak,
+                )?;
             }
             last_send = Instant::now();
         }
@@ -4240,6 +4656,7 @@ fn run_connection(
                     strafe: 0.0,
                     forward: 0.0,
                     jump: false,
+                    sneak: false,
                 });
             }
             Some(ClientPlayEvent::Play(PlayEvent::Disconnect(reason))) => return Err(reason),
@@ -4445,6 +4862,85 @@ fn nbt_text(nbt_bytes: &[u8]) -> Option<String> {
     (!text.is_empty()).then_some(text)
 }
 
+/// Short stable label for a player-info entry that arrived without a
+/// profile name (vanilla shows nothing, but an unlabelled row is worse).
+fn uuid_label(uuid: &[u8; 16]) -> String {
+    format!(
+        "{:02x}{:02x}{:02x}{:02x}-{:02x}{:02x}-{:02x}{:02x}",
+        uuid[0],
+        uuid[1],
+        uuid[2],
+        uuid[3],
+        uuid[4],
+        uuid[5],
+        uuid[6],
+        uuid[7],
+    )
+}
+
+/// Pull the boss-bar fields the HUD needs out of a `boss_event`
+/// action payload (add = title component + f32 health + color +
+/// division + flags; update-health = f32; update-name = component).
+fn decode_boss_event_payload(bar: &mut LiveBossBar, payload: &[u8]) {
+    let mut r = WireReader::new(payload);
+    match bar.action {
+        0 => {
+            if let Some(title) = r.read_nbt().ok().and_then(|nbt| {
+                let text = nbt.extract_text();
+                (!text.is_empty()).then_some(text)
+            }) {
+                bar.title = title;
+            }
+            if let Ok(health) = r.read_f32() {
+                bar.health = health.clamp(0.0, 1.0);
+            }
+        }
+        2 => {
+            if let Ok(health) = r.read_f32() {
+                bar.health = health.clamp(0.0, 1.0);
+            }
+        }
+        3 => {
+            if let Some(title) = r.read_nbt().ok().and_then(|nbt| {
+                let text = nbt.extract_text();
+                (!text.is_empty()).then_some(text)
+            }) {
+                bar.title = title;
+            }
+        }
+        _ => {}
+    }
+}
+
+/// Vanilla `ArmorMaterials` defense points for one equipped armor item
+/// (helmet/chest/leg/boot rows 5..9 of the window-0 container; HUD
+/// renders them as half-icons).
+fn armor_points_for(item_name: Option<&str>) -> u32 {
+    let Some(name) = item_name else { return 0 };
+    let (material, slot) = if let Some(m) = name.strip_suffix("_helmet") {
+        (m, 0usize)
+    } else if let Some(m) = name.strip_suffix("_chestplate") {
+        (m, 1)
+    } else if let Some(m) = name.strip_suffix("_leggings") {
+        (m, 2)
+    } else if let Some(m) = name.strip_suffix("_boots") {
+        (m, 3)
+    } else {
+        return u32::from(name.ends_with("turtle_shell")) * 2;
+    };
+    let material = material.rsplit("minecraft:").next().unwrap_or(material);
+    // (helmet, chestplate, leggings, boots) — vanilla ArmorMaterials.
+    let row: [u32; 4] = match material {
+        "leather" => [1, 3, 2, 1],
+        "golden" => [2, 5, 3, 1],
+        "chainmail" => [2, 5, 4, 1],
+        "iron" => [2, 6, 5, 2],
+        "diamond" | "netherite" => [3, 8, 6, 3],
+        _ => return 0,
+    };
+    row[slot]
+}
+
 /// Seed the session command dispatcher with the vanilla command-name set
 /// (`zsh_command_bar`'s `COMMAND_SPECS`) so `complete_suggestions` answers
 /// the same literals the bar highlights before any `declare_commands`.
@@ -4642,8 +5138,9 @@ mod tests {
     use crate::Camera;
     use megu_client::protocol::{
         decode_chunk_packet, decode_custom_payload_packet, decode_packet_body, encode_packet,
-        DecodedMotionPhase, EquipmentEntry, WireReader, CHANNEL_ANIM_V1, CHANNEL_MAGIC_V1,
-        CHANNEL_MOTION_V1, CHANNEL_SEASON_V1, CHANNEL_VFX_V1, SSN1_MAGIC, SSN1_VERSION,
+        write_varint, DecodedMotionPhase, EquipmentEntry, WireReader, CHANNEL_ANIM_V1,
+        CHANNEL_MAGIC_V1, CHANNEL_MOTION_V1, CHANNEL_SEASON_V1, CHANNEL_VFX_V1, SSN1_MAGIC,
+        SSN1_VERSION,
     };
     use megu_client_mesh::tactile_effects::{
         FluidEntryBody, TactileParticleKind, TactilePreset,
@@ -5949,6 +6446,276 @@ mod tests {
         assert_eq!(live.actionbar_nbt.as_deref(), Some(&[9, 9][..]));
     }
 
+    /// Chat, roster, boss bars, inventory and held-slot packets must all
+    /// land in the HUD channels the window copies each frame — the P0
+    /// "half-wired" gap the vertical audit counts.
+    #[test]
+    fn play_events_feed_hud_chat_players_bossbars_and_inventory() {
+        let (mut live, _tx) = session();
+        let uuid = [9u8; 16];
+
+        // Tab roster -> hud.players.
+        live.apply_event(ClientPlayEvent::Play(PlayEvent::PlayerInfo {
+            actions: 0x19,
+            entries: vec![PlayerInfoUpdateEntry {
+                uuid,
+                name: Some("Alex".into()),
+                properties: Vec::new(),
+                chat_session: None,
+                game_mode: None,
+                listed: Some(true),
+                latency: Some(17),
+                display_name_nbt: None,
+            }],
+        }))
+        .unwrap();
+        assert_eq!(live.hud.players, vec![("Alex".to_string(), 17u16)]);
+
+        // PlayerChat renders `<sender> text`; DisguisedChat verbatim.
+        live.apply_event(ClientPlayEvent::Play(PlayEvent::PlayerChat {
+            sender: uuid,
+            index: 0,
+            signature: None,
+            text: "hello".into(),
+            nbt_bytes: Vec::new(),
+        }))
+        .unwrap();
+        live.apply_event(ClientPlayEvent::Play(PlayEvent::DisguisedChat {
+            text: "<Alex> disguised".into(),
+            nbt_bytes: Vec::new(),
+        }))
+        .unwrap();
+        assert!(
+            live.hud.chat_lines.iter().any(|l| l == "<Alex> hello"),
+            "player chat must name the roster sender: {:?}",
+            live.hud.chat_lines
+        );
+        assert!(live
+            .hud
+            .chat_lines
+            .iter()
+            .any(|l| l == "<Alex> disguised"));
+
+        // Boss bar add: title NBT + f32 health + color + division + flags.
+        let mut boss_payload = death_message_nbt("Boss");
+        boss_payload.extend_from_slice(&0.5f32.to_be_bytes());
+        boss_payload.extend_from_slice(&[0, 0, 0]);
+        live.apply_event(ClientPlayEvent::Play(PlayEvent::BossEvent {
+            uuid,
+            action: 0,
+            raw_payload: boss_payload,
+        }))
+        .unwrap();
+        assert_eq!(
+            live.hud.bossbars,
+            vec![("Boss".to_string(), 0.5)],
+            "boss bar title/health must reach the HUD rows"
+        );
+        live.apply_event(ClientPlayEvent::Play(PlayEvent::BossEvent {
+            uuid,
+            action: 2,
+            raw_payload: 0.25f32.to_be_bytes().to_vec(),
+        }))
+        .unwrap();
+        assert_eq!(live.hud.bossbars[0].1, 0.25);
+
+        // Window-0 inventory: hotbar slot 36 = torch (291), offhand slot
+        // 45 = shield (1162), chest slot 6 = diamond chestplate (869).
+        let stack = |count: u8, id: i32| {
+            let mut v = vec![count];
+            let mut id_bytes = Vec::new();
+            write_varint(&mut id_bytes, id);
+            v.extend_from_slice(&id_bytes);
+            v.extend_from_slice(&[0, 0]);
+            v
+        };
+        let mut slots = Vec::new();
+        for index in 0..46 {
+            match index {
+                6 => slots.extend(stack(1, 869)),
+                36 => slots.extend(stack(3, 291)),
+                45 => slots.extend(stack(1, 1162)),
+                _ => slots.push(0),
+            }
+        }
+        slots.push(0); // carried
+        live.apply_event(ClientPlayEvent::Play(PlayEvent::ContainerSetContent {
+            window_id: 0,
+            state_id: 7,
+            slot_count: 46,
+            raw_payload: slots,
+        }))
+        .unwrap();
+        assert_eq!(
+            live.hud.hotbar[0].as_deref(),
+            Some("minecraft:torch"),
+            "hotbar slot 36 must feed hud.hotbar[0]: {:?}",
+            live.hud.hotbar
+        );
+        assert_eq!(live.hud.offhand.as_deref(), Some("minecraft:shield"));
+        assert_eq!(live.hud.armor, 8, "diamond chestplate = 8 defense");
+
+        // Server-forced held slot -> hud.selected_slot.
+        live.apply_event(ClientPlayEvent::Play(PlayEvent::SetCarriedItem(3)))
+            .unwrap();
+        assert_eq!(live.hud.selected_slot, 3);
+
+        // The local player's index-1 air + index-14 absorption metadata
+        // drive the HUD bubble/heart rows.
+        live.apply_event(ClientPlayEvent::Play(PlayEvent::JoinGame {
+            entity_id: 11,
+            dimension: DimensionMeta::default(),
+            hardcore: false,
+        }))
+        .unwrap();
+        let mut meta = vec![0x00, 0x00, 0x02]; // index 0 byte: sneaking flag
+        meta.extend_from_slice(&[0x01, 0x01]); // index 1 varint air
+        meta.extend_from_slice(&[0xAC, 0x02]); // varint 300
+        meta.push(0x0E); // index 14 float absorption
+        meta.push(0x03);
+        meta.extend_from_slice(&6.0f32.to_be_bytes());
+        meta.push(0xFF);
+        live.apply_event(ClientPlayEvent::Play(PlayEvent::SetEntityData {
+            eid: 11,
+            raw_entries: meta,
+        }))
+        .unwrap();
+        assert_eq!(live.hud.air, 300);
+        assert_eq!(live.hud.absorption, 6.0);
+        let stored = &live.entity_metadata[&11];
+        assert_eq!(stored.flags, Some(0x02));
+        assert_eq!(stored.air, Some(300));
+        assert_eq!(stored.absorption, Some(6.0));
+
+        // Mob-effect add/remove lands in the per-entity effect map.
+        live.apply_event(ClientPlayEvent::Play(PlayEvent::UpdateMobEffect {
+            eid: 11,
+            effect_id: 10,
+            amplifier: 1,
+            duration: 200,
+            flags: 0x02,
+        }))
+        .unwrap();
+        assert_eq!(live.mob_effects[&11][&10].duration, 200);
+        live.apply_event(ClientPlayEvent::Play(PlayEvent::RemoveMobEffect {
+            eid: 11,
+            effect_id: 10,
+        }))
+        .unwrap();
+        assert!(live.mob_effects[&11].is_empty());
+    }
+
+    /// Every gameplay `LiveSession` producer must enqueue its
+    /// `WorkerCommand` — the window's dig/place/attack/hotbar/sneak
+    /// dispatch rides on these.
+    #[test]
+    fn gameplay_producers_enqueue_worker_commands() {
+        let (_tx, incoming) = mpsc::sync_channel(8);
+        let (outgoing, rx) = mpsc::sync_channel(16);
+        let mut live = LiveSession::with_channels(incoming, outgoing);
+        live.status = SessionStatus::Playing;
+        live.apply_event(ClientPlayEvent::Play(PlayEvent::JoinGame {
+            entity_id: 11,
+            dimension: DimensionMeta::default(),
+            hardcore: false,
+        }))
+        .unwrap();
+        // JoinGame -> reset_dimension clears the pose; re-set after join.
+        live.pose = Some(PlayerPose {
+            feet: [1.0, 64.0, 1.0],
+            yaw: 90.0,
+            pitch: -10.0,
+        });
+        live.sneaking = true;
+
+        live.attack_entity(42);
+        live.interact_entity(42, Some([1.0, 2.0, 3.0]));
+        live.dig_start([10, 64, -3], 1);
+        live.dig_abort([10, 64, -3], 1);
+        live.dig_finish([10, 64, -3], 1);
+        live.set_carried_item(4);
+        live.player_command(0); // start sneak
+        live.player_command(3); // start sprint
+        live.use_item(0);
+        live.use_item_on(0, [10, 64, -3], 1, [0.5, 0.0, 0.5], false);
+        live.swing(0);
+
+        let mut commands = Vec::new();
+        while let Ok(cmd) = rx.try_recv() {
+            commands.push(cmd);
+        }
+        assert!(
+            commands.iter().any(|c| matches!(
+                c,
+                WorkerCommand::Interact {
+                    target: 42,
+                    action: 1,
+                    sneaking: true,
+                    ..
+                }
+            )),
+            "attack must enqueue Interact action 1"
+        );
+        assert!(commands.iter().any(|c| matches!(
+            c,
+            WorkerCommand::Interact {
+                target: 42,
+                action: 2,
+                at: Some(_),
+                ..
+            }
+        )));
+        for status in [0, 1, 2] {
+            assert!(
+                commands.iter().any(|c| matches!(
+                    c,
+                    WorkerCommand::PlayerAction { status: s, .. } if *s == status
+                )),
+                "dig status {status} missing"
+            );
+        }
+        assert!(commands
+            .iter()
+            .any(|c| matches!(c, WorkerCommand::SetCarriedItem { slot: 4 })));
+        for action in [0, 3] {
+            assert!(commands.iter().any(|c| matches!(
+                c,
+                WorkerCommand::PlayerCommand {
+                    entity_id: 11,
+                    action: a,
+                    ..
+                } if *a == action
+            )));
+        }
+        assert!(commands
+            .iter()
+            .any(|c| matches!(c, WorkerCommand::UseItem { .. })));
+        assert!(commands
+            .iter()
+            .any(|c| matches!(c, WorkerCommand::UseItemOn { .. })));
+        assert!(commands
+            .iter()
+            .any(|c| matches!(c, WorkerCommand::Swing { hand: 0 })));
+
+        // Movement carries the sneak bit through to `player_input`.
+        live.send_movement(PlayerMovement {
+            pose: PlayerPose {
+                feet: [1.0, 64.0, 2.0],
+                yaw: 0.0,
+                pitch: 0.0,
+            },
+            strafe: 0.0,
+            forward: 1.0,
+            jump: false,
+            sneak: true,
+        });
+        assert!(live.sneaking);
+        let Ok(WorkerCommand::Movement(m)) = rx.try_recv() else {
+            panic!("expected Movement command");
+        };
+        assert!(m.sneak);
+    }
+
     #[test]
     fn play_events_drive_screens_equipment_rigs_and_transfers() {
         let (mut live, _tx) = session();
@@ -6281,6 +7048,7 @@ mod tests {
             strafe: 0.0,
             forward: 1.0,
             jump: false,
+            sneak: false,
         };
 
         // Alive: movement reaches the worker queue.
