@@ -1,7 +1,13 @@
 //! Bounded background worker pool for section geometry and Hi-Z builds.
 //!
-//! Two job kinds run off the render thread:
+//! Three job kinds run off the render thread:
 //!
+//! * [`MeshJob::SectionMesh`] — full section meshing: greedily meshes a
+//!   [`SectionMeshInput`] snapshot (center section plus its 26 neighbors,
+//!   `Arc`-cloned so the snapshot is immutable) into a packed
+//!   [`BuiltSectionMesh`]. [`SectionMeshLane`] tracks the per-coord
+//!   submission revision on the render thread — a result whose section
+//!   re-dirtied after the snapshot is dropped instead of installed.
 //! * [`MeshJob::SectionGeometry`] — speculatively converts a queued
 //!   [`PackedVertex`] stream into [`LiveSectionGeometry`] and its
 //!   direction-bucket index ranges, so the upload-admission drain on the
@@ -28,8 +34,13 @@ use std::sync::mpsc::{sync_channel, Receiver, SyncSender};
 use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
 
+use std::collections::HashMap;
+
 use megu_client_mesh::ffi::PackedVertex;
-use megu_client_mesh::{DirectionBuckets, HiZPyramid, SectionCoord, DIRECTION_BUCKETS};
+use megu_client_mesh::{
+    build_and_pack_section_mesh, BuiltSectionMesh, DirectionBuckets, HiZPyramid, SectionCoord,
+    SectionMeshInput, DIRECTION_BUCKETS,
+};
 
 use crate::renderer::{section_geometry, view_proj_row_major, LiveSectionGeometry};
 use crate::Mat4;
@@ -67,6 +78,11 @@ pub struct HiZSplatSection {
 
 /// A unit of off-thread work.
 pub enum MeshJob {
+    /// Mesh one dirty section's voxel snapshot into a packed, upload-ready
+    /// [`BuiltSectionMesh`]. The input's `revision` is the
+    /// [`SectionMeshLane`] epoch recorded at submission; the drain drops
+    /// results whose epoch moved on.
+    SectionMesh { input: SectionMeshInput },
     /// Convert a queued packed mesh into upload-ready geometry.
     SectionGeometry {
         coord: SectionCoord,
@@ -85,6 +101,8 @@ pub enum MeshJob {
 
 /// A completed off-thread result.
 pub enum MeshResult {
+    /// The packed mesh one `SectionMesh` job produced.
+    SectionMesh { built: BuiltSectionMesh },
     /// `section_geometry` + bucket ranges for one queued section.
     SectionGeometry {
         coord: SectionCoord,
@@ -201,6 +219,9 @@ fn worker_loop(job_rx: Arc<Mutex<Receiver<MeshJob>>>, result_tx: SyncSender<Mesh
 
 fn execute(job: MeshJob, hiz_scratch: &mut HiZScratch) -> MeshResult {
     match job {
+        MeshJob::SectionMesh { input } => MeshResult::SectionMesh {
+            built: build_and_pack_section_mesh(&input),
+        },
         MeshJob::SectionGeometry {
             coord,
             packed,
@@ -263,6 +284,103 @@ pub fn compute_opaque_bucket_ranges(
         *range = (first, opaque_indices - first);
     }
     ranges
+}
+
+/// Render-thread bookkeeping for [`MeshJob::SectionMesh`] fan-out. Every
+/// dirty mark bumps the section's *content epoch*; a submission records the
+/// epoch it snapshotted as the job's revision. A completed result is
+/// accepted only while it is still the in-flight submission *and* no newer
+/// dirty mark landed meanwhile — one map lookup, no channel state needed.
+///
+/// Epoch `0` is the never-touched value: [`Self::mark_dirty`] bumps to `1`
+/// on first contact, so an unsubmitted coord never collides with a real
+/// revision.
+#[derive(Default)]
+pub struct SectionMeshLane {
+    /// Per-coord content epoch: the number of dirty marks (block edits,
+    /// chunk inserts/unloads, light updates, neighbor invalidations —
+    /// every call site shares the same mark helpers) a section received.
+    /// Wrapping would need `u64::MAX` edits to one section — unreachable.
+    epochs: HashMap<SectionCoord, u64>,
+    /// `coord -> epoch` of every submitted-but-not-yet-drained job.
+    /// Two jobs for the same coord are never simultaneously in flight: a
+    /// resubmission bumps the in-flight revision and the earlier result
+    /// drops as stale.
+    in_flight: HashMap<SectionCoord, u64>,
+}
+
+impl SectionMeshLane {
+    /// Record one content change for `coord` (the section may or may not
+    /// end up in the submission set — epoch bumps are cheaper than
+    /// checking eligibility first).
+    pub fn mark_dirty(&mut self, coord: SectionCoord) {
+        let epoch = self.epochs.entry(coord).or_insert(0);
+        *epoch = epoch.wrapping_add(1);
+    }
+
+    /// Drop tracking for a section that left the loaded set (unload,
+    /// eviction, dimension reset). Any still-in-flight job completes and
+    /// gets dropped by [`Self::accept`] — its epoch can no longer match.
+    pub fn remove(&mut self, coord: SectionCoord) {
+        self.epochs.remove(&coord);
+        self.in_flight.remove(&coord);
+    }
+
+    /// Clear all tracking (dimension reset / full resync).
+    pub fn clear(&mut self) {
+        self.epochs.clear();
+        self.in_flight.clear();
+    }
+
+    /// `true` when no `SectionMesh` job for `coord` is currently in
+    /// flight — the caller may snapshot and submit it.
+    pub fn can_submit(&self, coord: SectionCoord) -> bool {
+        !self.in_flight.contains_key(&coord)
+    }
+
+    /// The content epoch last recorded for `coord` (`0` = never marked).
+    /// External payload producers stamp this on their output so the drain
+    /// can drop entries a later dirty mark superseded.
+    pub fn epoch_of(&self, coord: SectionCoord) -> u64 {
+        self.epochs.get(&coord).copied().unwrap_or(0)
+    }
+
+    /// The revision a new submission for `coord` would carry — the value
+    /// [`Self::note_submitted`] records. Read it before snapshotting so
+    /// the snapshot's revision and the in-flight marker cannot diverge.
+    pub fn pending_revision(&self, coord: SectionCoord) -> u64 {
+        self.epoch_of(coord) + 1
+    }
+
+    /// Record a submission and return the revision the snapshot must
+    /// carry: the epoch current at submission time. `+1` keeps revision
+    /// `0` reserved for the never-marked state.
+    pub fn note_submitted(&mut self, coord: SectionCoord) -> u64 {
+        let revision = self.epochs.get(&coord).copied().unwrap_or(0) + 1;
+        self.in_flight.insert(coord, revision);
+        revision
+    }
+
+    /// Result gate: `true` only when `built` is still the in-flight
+    /// submission for its coord *and* the content epoch did not advance
+    /// after its snapshot was taken — i.e. no later edit invalidated the
+    /// meshed data. Accepted results consume their in-flight slot; stale
+    /// ones keep the newer in-flight marker (or leave the slot clear for
+    /// a resubmission the caller decides to make).
+    pub fn accept(&mut self, built: &BuiltSectionMesh) -> bool {
+        if self.in_flight.get(&built.coord) != Some(&built.revision) {
+            return false;
+        }
+        let epoch = self.epochs.get(&built.coord).copied().unwrap_or(0) + 1;
+        if epoch != built.revision {
+            // The section re-dirtied after the snapshot: this result is
+            // stale — free the slot so the new content gets resubmitted.
+            self.in_flight.remove(&built.coord);
+            return false;
+        }
+        self.in_flight.remove(&built.coord);
+        true
+    }
 }
 
 /// One extracted occluder quad: the four packed `position` words and

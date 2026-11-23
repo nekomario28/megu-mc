@@ -2500,6 +2500,13 @@ impl GpuApp {
         let mut goggles_draw: Option<UiDrawList> = None;
         if let Some(live) = &mut self.live {
             active.renderer.set_player_position(self.camera.position);
+            // Off-thread/priority-0 mesh payloads the session published
+            // this poll ride the reconcile below — the renderer treats
+            // them as authoritative until the world derives its own.
+            active
+                .renderer
+                .external_sections
+                .clone_from(&live.external_sections);
             if live.terrain_full_sync {
                 // First sync / dimension change: full reconcile once.
                 active.renderer.update_live_terrain(&live.world);

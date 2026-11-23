@@ -122,6 +122,12 @@ pub struct AdapterReport {
     pub resolution: BackendResolution,
     pub shader_caps: GpuShaderCaps,
     pub limits: wgpu::Limits,
+    /// The adapter advertises `wgpu::Features::SHADER_F16` — WGSL
+    /// `enable f16;` half-precision shaders are grantable on this device.
+    pub shader_f16: bool,
+    /// The adapter advertises `wgpu::Features::SUBGROUP` — fragment/
+    /// compute subgroup ops are grantable on this device.
+    pub subgroup_ops: bool,
 }
 
 /// Enumerate real adapters for `pref` (no display required). Returns an empty
@@ -157,6 +163,8 @@ pub fn adapter_report(adapter: &wgpu::Adapter, pref: RenderBackendPreference) ->
         device_id: info.device,
         driver: info.driver.clone(),
         driver_info: info.driver_info.clone(),
+        shader_f16: features.contains(wgpu::Features::SHADER_F16),
+        subgroup_ops: features.contains(wgpu::Features::SUBGROUP),
     }
 }
 
@@ -166,7 +174,7 @@ pub fn format_adapter_report(report: &AdapterReport, index: usize) -> String {
         "adapter {index}: {:?} {:?} \"{}\" (vendor {:#06x} device {:#06x})\n\
          \x20   driver: {} {}\n\
          \x20   mesh shader: {} (max out vtx {}, prim {})\n\
-         \x20   compute: {} | indirect-count: {}\n\
+         \x20   compute: {} | indirect-count: {} | f16: {} | subgroup: {}\n\
          \x20   limits: max_tex {}px, bind_groups {}, storage_buf {}B, \
          color_attachments {}, compute_wg/dim {}\n\
          \x20   -> pipeline: {}",
@@ -182,6 +190,8 @@ pub fn format_adapter_report(report: &AdapterReport, index: usize) -> String {
         report.caps.max_mesh_output_primitives,
         report.caps.supports_compute_shaders,
         report.caps.supports_multi_draw_indirect_count,
+        report.shader_f16,
+        report.subgroup_ops,
         report.limits.max_texture_dimension_2d,
         report.limits.max_bind_groups,
         report.limits.max_storage_buffer_binding_size,
@@ -267,9 +277,15 @@ pub fn request_gpu_device(
             crate::CLIENT_GPU_NAME, report.name
         );
     }
+    // Opportunistic feature request: `SHADER_F16` unlocks the
+    // `enable f16;` half-precision fragment variants, `SUBGROUP` the
+    // subgroup-op shaders — requested only when the adapter advertises
+    // them, so adapters without either see an unchanged feature set and
+    // device creation can never fail on these bits.
+    let required_features = optional_device_features(adapter.features());
     let (device, queue) = pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor {
         label: Some("megu-client-gpu"),
-        required_features: wgpu::Features::empty(),
+        required_features,
         // The adapter's own limits, clamped to sane engine ceilings:
         // guaranteed grantable, and low-spec adapters keep their clamped
         // ceilings instead of the inflated `Limits::default()` a
@@ -365,6 +381,16 @@ pub fn clamp_requested_limits(limits: wgpu::Limits) -> wgpu::Limits {
 /// device creation), clamped to sane engine ceilings.
 pub fn negotiated_device_limits(adapter: &wgpu::Adapter) -> wgpu::Limits {
     clamp_requested_limits(adapter.limits())
+}
+
+/// Optional device features the renderer opportunistically requests:
+/// `SHADER_F16` (the `enable f16;` fragment variants selected by
+/// [`terrain_wgsl`]/[`sky_wgsl`]) and `SUBGROUP` (subgroup-op shaders).
+/// The result is `supported` intersected with that set — a bit the
+/// adapter does not advertise is never requested, so `request_device`
+/// stays infallible on adapters lacking either feature.
+pub fn optional_device_features(supported: wgpu::Features) -> wgpu::Features {
+    supported & (wgpu::Features::SHADER_F16 | wgpu::Features::SUBGROUP)
 }
 
 /// Depth-store policy for the final world pass. Tile-based deferred
@@ -880,6 +906,61 @@ impl PendingSectionUpload {
             && self.packed.as_ref() == packed
             && self.order.as_ref() == order
     }
+}
+
+/// A section upload payload produced outside `WorldState::packed_meshes`
+/// — the off-thread `MeshJob::SectionMesh` lane (opaque-bucketed packed
+/// stream + translucent tail) and the priority-0 same-frame lane share
+/// this shape. The renderer treats entries as authoritative for their
+/// coord until `WorldState` publishes the section itself; the packed
+/// layout is what [`section_geometry`] consumes regardless of provenance.
+#[derive(Clone)]
+pub struct ExternalSectionMesh {
+    /// Packed 16-byte vertices: opaque quads first (already
+    /// diagonal-normalized for the shared index buffer), then the
+    /// translucent/water tail [`Self::order`] indexes into.
+    pub packed: Arc<[PackedVertex]>,
+    /// Back-to-front translucent order into `packed` quad indices.
+    pub order: Arc<[u32]>,
+    /// Opaque-quad direction buckets over `packed`'s opaque head, when
+    /// the producer grouped them (`Some` for both live producers).
+    pub buckets: Option<DirectionBuckets>,
+    /// Content digest used for pending-upload dedup; produced by the
+    /// lane's own hasher (the world digest map has no entry for
+    /// externally-meshed sections).
+    pub digest: u64,
+    /// `SectionMeshLane` content epoch at build time — the session drops
+    /// the entry as soon as another dirty mark lands on the section, so
+    /// the renderer can trust the snapshot it receives.
+    pub content_epoch: u64,
+    /// `WorldState::section_mesh_revision` at build time — the session
+    /// drops the entry once the world publishes its own (newer)
+    /// artifacts, handing residency back to the world payload.
+    pub world_revision: u64,
+}
+
+/// Floor check for an [`ExternalSectionMesh`] entry inside the renderer:
+/// the section's voxels are still loaded. Freshness against world
+/// publishes and re-dirtied content is the producer lane's job —
+/// `LiveSession` prunes `external_sections` by `content_epoch` +
+/// `world_revision` every poll before the window copies the map in.
+pub fn external_section_valid(world: &WorldState, coord: SectionCoord) -> bool {
+    world.mesh_cache.section(coord).is_some()
+}
+
+/// Content digest of an externally-produced packed stream — the same
+/// `DefaultHasher` field order `WorldState`'s `packed_vertices_digest`
+/// uses, so identical payloads hash identically regardless of producer.
+pub fn external_packed_digest(vertices: &[PackedVertex]) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    for vertex in vertices {
+        vertex.position.hash(&mut hasher);
+        vertex.state_id.hash(&mut hasher);
+        vertex.attributes.hash(&mut hasher);
+        vertex.tint.hash(&mut hasher);
+    }
+    hasher.finish()
 }
 
 /// Speculative `section_geometry` output produced by the mesh worker pool
@@ -2044,6 +2125,12 @@ pub struct GpuRenderer {
     /// budget admission on a rendered frame. `BTreeMap` keeps the drain
     /// order deterministic.
     pending_uploads: BTreeMap<SectionCoord, PendingSectionUpload>,
+    /// Snapshot of [`LiveSession::external_sections`] the window copies in
+    /// before each reconcile: upload payloads the off-thread/priority-0
+    /// mesh lanes produced for sections `WorldState` has not published
+    /// yet. An entry is authoritative while its coord is still loaded and
+    /// has no `packed_meshes` entry; the world publish retires it.
+    pub external_sections: BTreeMap<SectionCoord, ExternalSectionMesh>,
     /// Visibility graphs mirrored from the world on the last
     /// [`Self::update_live_terrain`] pass; feeds the composed frame's
     /// [`GraphCuller`] search. Empty until the first terrain sync.
@@ -3019,6 +3106,227 @@ pub fn composed_shadow_wgsl(source: &str, terrain: bool) -> String {
     format!("{shader}\n{MEGU_SHADOW_SAMPLING_WGSL}")
 }
 
+// ---------------------------------------------------------------------------
+// SHADER_F16 half-precision fragment variants (capability-gated)
+// ---------------------------------------------------------------------------
+
+/// `enable f16;` replacement for `COMPOSITE_TERRAIN_WGSL`'s two fragment
+/// entry points. The 64 point-light accumulate — the per-pixel ALU hot
+/// path — runs on `vec3<f16>` accumulators: deltas are computed in `f32`
+/// (world coordinates never leave full precision) then clamped into the
+/// finite `f16` range so an extreme coordinate can never feed `inf` into
+/// the half-precision dot products. Every delta beyond ±32000 contributes
+/// zero either way — real light radii are orders of magnitude smaller —
+/// so the clamp is a no-op for reachable geometry. Vertex inputs, varyings,
+/// fog mixes and the filmic shoulder stay `f32`.
+const TERRAIN_FRAGMENT_F16_WGSL: &str = r#"
+@fragment
+fn terrain_fs(in: TerrainFragment) -> @location(0) vec4<f32> {
+    let n = normalize(in.normal);
+    let texel = atlas_sample_rect(in.atlas_rect, in.atlas_anim, in.uv);
+    var color = in.albedo;
+    let surface = in.albedo * texel;
+    color *= texel;
+    let count = min(dyn_lights.light_count.x, 64u);
+    var light16 = vec3<f16>(0.0);
+    let n16 = vec3<f16>(n);
+    let surface16 = vec3<f16>(surface);
+    for (var i = 0u; i < count; i = i + 1u) {
+        let pl = dyn_lights.lights[i];
+        let d16 = vec3<f16>(clamp(
+            pl.position_radius.xyz - in.world,
+            vec3<f32>(-32000.0),
+            vec3<f32>(32000.0),
+        ));
+        let radius = f16(max(pl.position_radius.w, 0.01));
+        let dist_sq = max(dot(d16, d16), f16(0.0001));
+        let dist = sqrt(dist_sq);
+        let falloff = pow(max(f16(1.0) - dist / radius, f16(0.0)), f16(2.0));
+        let diffuse = max(dot(n16, d16 / dist), f16(0.0));
+        light16 += surface16 * vec3<f16>(pl.color_intensity.xyz)
+            * f16(pl.color_intensity.w) * diffuse * falloff;
+    }
+    color += vec3<f32>(light16);
+    color = mix(color, color * env.depth_tint.rgb, env.depth_tint.w);
+    color = mix(color, frame.fog_color, in.fog);
+    let fade = clamp(draw.params.x, 0.0, 1.0);
+    color = mix(frame.fog_color, color, fade);
+    return vec4<f32>(filmic(color), 1.0);
+}
+
+@fragment
+fn terrain_translucent_fs(in: TranslucentFragment) -> @location(0) vec4<f32> {
+    let n = normalize(in.normal);
+    let surface = in.albedo * atlas_sample_rect(in.atlas_rect, in.atlas_anim, in.uv);
+    var color = surface;
+    let count = min(dyn_lights.light_count.x, 64u);
+    var light16 = vec3<f16>(0.0);
+    let n16 = vec3<f16>(n);
+    let surface16 = vec3<f16>(surface);
+    for (var i = 0u; i < count; i = i + 1u) {
+        let pl = dyn_lights.lights[i];
+        let d16 = vec3<f16>(clamp(
+            pl.position_radius.xyz - in.world,
+            vec3<f32>(-32000.0),
+            vec3<f32>(32000.0),
+        ));
+        let radius = f16(max(pl.position_radius.w, 0.01));
+        let dist_sq = max(dot(d16, d16), f16(0.0001));
+        let dist = sqrt(dist_sq);
+        let falloff = pow(max(f16(1.0) - dist / radius, f16(0.0)), f16(2.0));
+        let diffuse = max(dot(n16, d16 / dist), f16(0.0));
+        light16 += surface16 * vec3<f16>(pl.color_intensity.xyz)
+            * f16(pl.color_intensity.w) * diffuse * falloff;
+    }
+    color += vec3<f32>(light16);
+    color = mix(color, color * env.depth_tint.rgb, env.depth_tint.w);
+    let fog_smooth = in.fog * in.fog * (3.0 - 2.0 * in.fog);
+    color = mix(color, frame.fog_color, fog_smooth);
+    let fade = clamp(draw.params.x, 0.0, 1.0);
+    color = mix(frame.fog_color, color, fade);
+    return vec4<f32>(filmic(color), in.alpha * (1.0 - 0.35 * fog_smooth) * fade);
+}
+"#;
+
+/// `enable f16;` replacement for `MEGU_SKY_ATMOSPHERE_WGSL`'s `fs_main`:
+/// every `vec3` color mix/add accumulates on `vec3<f16>` — the dome
+/// gradient, scattering terms, cloud cells, star field, sun/moon discs
+/// and the eclipse corona are all bounded `0..4` color space where half
+/// precision is visually lossless. View direction, `mu`, cell hashing,
+/// disc smoothsteps and the `pow260` corona exponent stay `f32` — the
+/// scalar precision-critical weights — and the gamma encode returns to
+/// `f32` for the swapchain attachment.
+const SKY_FRAGMENT_F16_WGSL: &str = r#"
+@fragment
+fn fs_main(input: SkyOutput) -> @location(0) vec4<f32> {
+    let view = normalize(shadow.camera_forward.xyz
+                         + shadow.camera_right.xyz * input.ndc.x * shadow.camera_right.w
+                         + shadow.camera_up.xyz * input.ndc.y * shadow.camera_up.w);
+    let sun = normalize(shadow.sun_direction.xyz);
+    let mu = clamp(dot(view, sun), -1.0, 1.0);
+    let horizon = pow3(1.0 - abs(view.y));
+    let day = smoothstep(-0.12, 0.12, sun.y);
+    // Tasogare: ai-iro above, restrained akane by the horizon.
+    let twilight = 1.0 - smoothstep(0.0, 0.28, abs(sun.y));
+    let night = vec3<f16>(0.006, 0.014, 0.034);
+    let zenith = mix(mix(night, vec3<f16>(0.06, 0.20, 0.46), f16(day)),
+                     vec3<f16>(0.025, 0.040, 0.13), f16(twilight * 0.85));
+    let pale = mix(mix(vec3<f16>(0.02, 0.035, 0.08),
+                       vec3<f16>(0.39, 0.55, 0.74), f16(day)),
+                   vec3<f16>(0.19, 0.18, 0.27), f16(twilight * 0.72));
+    var color = mix(zenith, pale, f16(clamp(horizon * 0.85, 0.0, 1.0)));
+    if (shadow.render_params.x >= 2.0) {
+        let rayleigh = (1.0 + mu * mu) * 0.75;
+        let mie_g = 0.72;
+        let denom = max(1.0 + mie_g * mie_g - 2.0 * mie_g * mu, 0.01);
+        let mie = (1.0 - mie_g * mie_g) / (denom * sqrt(denom));
+        color += vec3<f16>(0.025, 0.072, 0.15)
+                 * f16(rayleigh * day * (1.0 - twilight * 0.65));
+        color += vec3<f16>(0.10, 0.075, 0.045) * f16(mie * day * 0.1);
+        // Blocky voxel clouds drifting on the dome stay faithful to the
+        // voxel world instead of adding a smooth billboard layer.
+        if (view.y > 0.04 && view.y < 0.75) {
+            let drift = shadow.render_params.y * 6.2831853 * 0.006;
+            let uv = view.xz / (view.y + 0.28) * 0.35 + vec2<f32>(drift, 0.0);
+            let cell = floor(uv * 7.0);
+            let roll = fract(sin(dot(cell, vec2<f32>(17.13, 91.77))) * 31313.7);
+            if (roll > 0.72) {
+                let fade = smoothstep(0.04, 0.18, view.y)
+                    * (1.0 - smoothstep(0.45, 0.75, view.y));
+                let lit = mix(mix(vec3<f16>(0.10, 0.12, 0.19),
+                                  vec3<f16>(0.82, 0.82, 0.86), f16(day)),
+                              vec3<f16>(0.28, 0.24, 0.30), f16(twilight * 0.7));
+                color = mix(color, lit, f16(fade * 0.55));
+            }
+        }
+    }
+    let toward_sun = pow4(max(mu, 0.0));
+    // Asa-moya lends the twilight horizon a moist, low-contrast veil.
+    color = mix(color, vec3<f16>(0.24, 0.21, 0.23), f16(twilight * horizon * 0.16));
+    color += vec3<f16>(0.42, 0.17, 0.10) * f16(twilight * horizon * toward_sun);
+    // A solar eclipse dims the whole dome with the occluded disc.
+    color *= f16(1.0 - shadow.celestial_params.w * 0.55);
+    // Crisp pixel stars: chunky direction cells, no smooth sparkle noise.
+    if (shadow.celestial_params.x > 0.001 && view.y > 0.02) {
+        let cell = floor(view * 42.0);
+        let roll = fract(sin(dot(cell, vec3<f32>(12.99, 78.23, 37.72)))
+                         * 43758.55);
+        if (roll > 0.996) {
+            let bright = (roll - 0.996) / 0.004;
+            color += vec3<f16>(0.90, 0.93, 1.0)
+                     * f16(bright * shadow.celestial_params.x * 0.85);
+        }
+    }
+    let sun_disc = smoothstep(0.9998, 0.99998, mu);
+    let moon_disc = smoothstep(0.99984, 0.99996, dot(view, -sun));
+    color += vec3<f16>(3.2, 2.55, 1.65)
+             * f16(day * sun_disc * (1.0 - shadow.celestial_params.w));
+    // The eclipse corona appears as a pale ring once the disc is covered.
+    if (shadow.celestial_params.y > 0.001) {
+        let ring = pow260(max(mu, 0.0));
+        color += vec3<f16>(1.0, 0.92, 0.78)
+                 * f16(ring * shadow.celestial_params.y * 1.6);
+    }
+    color += vec3<f16>(0.55, 0.67, 0.88)
+             * f16((1.0 - day) * moon_disc * (1.0 - shadow.celestial_params.w * 0.4));
+    return vec4<f32>(pow(max(vec3<f32>(color), vec3<f32>(0.0)),
+                         vec3<f32>(1.0 / 2.2)), 1.0);
+}
+"#;
+
+/// `COMPOSITE_TERRAIN_WGSL` with `enable f16;` and half-precision fragment
+/// bodies — spliced at the first `@fragment` entry so the shared prefix
+/// (uniforms, vertex shaders, helpers) is inherited verbatim and stays
+/// strictly `f32`.
+pub fn terrain_wgsl_f16() -> String {
+    const ANCHOR: &str = "@fragment\nfn terrain_fs(in: TerrainFragment)";
+    let split = COMPOSITE_TERRAIN_WGSL
+        .find(ANCHOR)
+        .expect("COMPOSITE_TERRAIN_WGSL fragment anchor missing");
+    format!(
+        "enable f16;\n{}{}",
+        &COMPOSITE_TERRAIN_WGSL[..split],
+        TERRAIN_FRAGMENT_F16_WGSL
+    )
+}
+
+/// `MEGU_SKY_ATMOSPHERE_WGSL` with `enable f16;` and the half-precision
+/// `fs_main` — spliced the same way at its single fragment entry.
+pub fn sky_wgsl_f16() -> String {
+    const ANCHOR: &str = "@fragment\nfn fs_main(input: SkyOutput)";
+    let split = MEGU_SKY_ATMOSPHERE_WGSL
+        .find(ANCHOR)
+        .expect("MEGU_SKY_ATMOSPHERE_WGSL fragment anchor missing");
+    format!(
+        "enable f16;\n{}{}",
+        &MEGU_SKY_ATMOSPHERE_WGSL[..split],
+        SKY_FRAGMENT_F16_WGSL
+    )
+}
+
+/// Capability-gated terrain WGSL: the `enable f16;` fragment variant when
+/// the device granted `SHADER_F16` ([`AdapterReport::shader_f16`]), the
+/// baseline `f32` module everywhere else. Both branches feed the same
+/// pipeline signature — vertex buffers, varyings and outputs are
+/// identical — so the fallback is a pure module swap.
+pub fn terrain_wgsl(shader_f16: bool) -> Cow<'static, str> {
+    if shader_f16 {
+        Cow::Owned(terrain_wgsl_f16())
+    } else {
+        Cow::Borrowed(COMPOSITE_TERRAIN_WGSL)
+    }
+}
+
+/// Capability-gated sky/atmosphere WGSL under the same gate as
+/// [`terrain_wgsl`].
+pub fn sky_wgsl(shader_f16: bool) -> Cow<'static, str> {
+    if shader_f16 {
+        Cow::Owned(sky_wgsl_f16())
+    } else {
+        Cow::Borrowed(MEGU_SKY_ATMOSPHERE_WGSL)
+    }
+}
+
 const FNV1A_OFFSET: u64 = 0xcbf2_9ce4_8422_2325;
 const FNV1A_PRIME: u64 = 0x0000_0100_0000_01b3;
 
@@ -3974,14 +4282,14 @@ impl ShadowGpu {
         let terrain_module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("shadowed-terrain"),
             source: wgpu::ShaderSource::Wgsl(Cow::Owned(composed_shadow_wgsl(
-                COMPOSITE_TERRAIN_WGSL,
+                &terrain_wgsl(ctx.report.shader_f16),
                 true,
             ))),
         });
         let terrain_region_module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("shadowed-terrain-region"),
             source: wgpu::ShaderSource::Wgsl(Cow::Owned(composed_shadow_wgsl(
-                &region_opaque_wgsl(COMPOSITE_TERRAIN_WGSL),
+                &region_opaque_wgsl(&terrain_wgsl(ctx.report.shader_f16)),
                 true,
             ))),
         });
@@ -4461,7 +4769,7 @@ impl SkyGpu {
             .device
             .create_shader_module(wgpu::ShaderModuleDescriptor {
                 label: Some("sky-atmosphere"),
-                source: wgpu::ShaderSource::Wgsl(MEGU_SKY_ATMOSPHERE_WGSL.into()),
+                source: wgpu::ShaderSource::Wgsl(sky_wgsl(ctx.report.shader_f16)),
             });
         let layout = ctx
             .device
@@ -5341,6 +5649,7 @@ impl GpuRenderer {
             live_sections: HashMap::new(),
             upload_budget,
             pending_uploads: BTreeMap::new(),
+            external_sections: BTreeMap::new(),
             section_graphs: HashMap::new(),
             hiz_pyramid: None,
             hiz_source_vp: None,
@@ -5869,12 +6178,12 @@ impl GpuRenderer {
 
         let terrain_module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("composite-terrain"),
-            source: wgpu::ShaderSource::Wgsl(Cow::Borrowed(COMPOSITE_TERRAIN_WGSL)),
+            source: wgpu::ShaderSource::Wgsl(terrain_wgsl(ctx.report.shader_f16)),
         });
         let terrain_region_module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("composite-terrain-region"),
             source: wgpu::ShaderSource::Wgsl(Cow::Owned(region_opaque_wgsl(
-                COMPOSITE_TERRAIN_WGSL,
+                &terrain_wgsl(ctx.report.shader_f16),
             ))),
         });
         let lit_module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
@@ -6733,15 +7042,23 @@ impl GpuRenderer {
     pub fn update_live_terrain(&mut self, world: &WorldState) -> usize {
         let mut scheduled = 0;
         let mut removed: Vec<(SectionCoord, Option<[i32; 3]>)> = Vec::new();
+        // Externally-meshed sections (off-thread/priority-0 lanes) stay
+        // resident and pending-uploaded while the world holds their voxels
+        // but has not published its own packed mesh yet; unload or world
+        // publish retires them like any other missing coord.
+        self.external_sections
+            .retain(|coord, _| external_section_valid(world, *coord));
         self.live_sections.retain(|coord, section| {
-            let keep = world.packed_mesh(*coord).is_some();
+            let keep = world.packed_mesh(*coord).is_some()
+                || self.external_sections.contains_key(coord);
             if !keep {
                 removed.push((*coord, section.arena));
             }
             keep
         });
-        self.pending_uploads
-            .retain(|coord, _| world.packed_mesh(*coord).is_some());
+        self.pending_uploads.retain(|coord, _| {
+            world.packed_mesh(*coord).is_some() || self.external_sections.contains_key(coord)
+        });
         self.section_graphs.clear();
         self.section_graphs.extend(world.section_graphs());
         // Order-independent stamp of the mirrored graph set — a graph-only
@@ -6762,6 +7079,14 @@ impl GpuRenderer {
         for (coord, packed) in world.packed_meshes() {
             let order = world.translucent_order(coord).unwrap_or(&[]);
             scheduled += usize::from(self.queue_live_section_upload(world, coord, packed, order));
+        }
+        let externals: Vec<(SectionCoord, ExternalSectionMesh)> = self
+            .external_sections
+            .iter()
+            .map(|(coord, ext)| (*coord, ext.clone()))
+            .collect();
+        for (coord, external) in &externals {
+            scheduled += usize::from(self.queue_external_section_upload(*coord, external));
         }
         if scheduled > 0 {
             self.shadow_cache.invalidate();
@@ -6832,6 +7157,49 @@ impl GpuRenderer {
         true
     }
 
+    /// Queue an [`ExternalSectionMesh`] payload for upload — the
+    /// externally-meshed analogue of [`Self::queue_live_section_upload`].
+    /// Same dedup semantics: skipped when the pending queue or the
+    /// resident section already holds this exact payload.
+    fn queue_external_section_upload(
+        &mut self,
+        coord: SectionCoord,
+        external: &ExternalSectionMesh,
+    ) -> bool {
+        let up_to_date = match self.pending_uploads.get(&coord) {
+            Some(pending) => {
+                pending.matches(&external.packed, external.digest, &external.order)
+            }
+            None => self.live_sections.get(&coord).is_some_and(|existing| {
+                existing.packed.as_ref() == external.packed.as_ref()
+                    && existing.order.as_ref() == external.order.as_ref()
+            }),
+        };
+        if up_to_date {
+            return false;
+        }
+        self.pending_uploads.insert(
+            coord,
+            PendingSectionUpload::new(
+                external.packed.clone(),
+                external.digest,
+                external.order.clone(),
+                external.buckets,
+            ),
+        );
+        // Same speculative geometry prefetch the world path submits —
+        // the external stream feeds `section_geometry` identically.
+        if self.mesh_pool.try_submit(MeshJob::SectionGeometry {
+            coord,
+            packed: external.packed.clone(),
+            order: external.order.clone(),
+            buckets: external.buckets,
+        }) {
+            self.bg_mesh_jobs_submitted += 1;
+        }
+        true
+    }
+
     /// O(1) dirty-coordinate reconcile: the live session marks candidate
     /// sections per play event (column events mark the column and its
     /// four lateral neighbors, block edits mark the section and its six
@@ -6854,7 +7222,18 @@ impl GpuRenderer {
         let mut removed_any = false;
         for &coord in dirty {
             match world.packed_mesh(coord) {
+                None if self.external_sections.contains_key(&coord)
+                    && external_section_valid(world, coord) =>
+                {
+                    // Externally-meshed section still authoritative —
+                    // the event that marked it dirty may already be
+                    // reflected in the lane's payload.
+                    let external = self.external_sections[&coord].clone();
+                    scheduled +=
+                        usize::from(self.queue_external_section_upload(coord, &external));
+                }
                 None => {
+                    self.external_sections.remove(&coord);
                     self.pending_uploads.remove(&coord);
                     self.completed_geometry.remove(&coord);
                     if let Some(section) = self.live_sections.remove(&coord) {
@@ -6869,9 +7248,19 @@ impl GpuRenderer {
                     self.section_graphs.remove(&coord);
                 }
                 Some(packed) => {
-                    let order = world.translucent_order(coord).unwrap_or(&[]);
-                    scheduled +=
-                        usize::from(self.queue_live_section_upload(world, coord, packed, order));
+                    if let Some(external) = self.external_sections.get(&coord).cloned() {
+                        // The session's external entry is only present
+                        // while it is fresher than the world payload —
+                        // queue it over the stale world mesh.
+                        scheduled += usize::from(
+                            self.queue_external_section_upload(coord, &external),
+                        );
+                    } else {
+                        let order = world.translucent_order(coord).unwrap_or(&[]);
+                        scheduled += usize::from(
+                            self.queue_live_section_upload(world, coord, packed, order),
+                        );
+                    }
                 }
             }
         }
@@ -6881,7 +7270,7 @@ impl GpuRenderer {
         if order_sweep {
             let mut stale: Vec<SectionCoord> = Vec::new();
             for (coord, section) in self.live_sections.iter() {
-                if dirty.contains(coord) {
+                if dirty.contains(coord) || self.external_sections.contains_key(coord) {
                     continue;
                 }
                 let order = world.translucent_order(*coord).unwrap_or(&[]);
@@ -6891,6 +7280,14 @@ impl GpuRenderer {
             }
             for coord in stale {
                 let Some(packed) = world.packed_mesh(coord) else {
+                    if self.external_sections.contains_key(&coord)
+                        && external_section_valid(world, coord)
+                    {
+                        // No world-side order exists for external payloads;
+                        // the lane's order is already the freshest.
+                        continue;
+                    }
+                    self.external_sections.remove(&coord);
                     if let Some(section) = self.live_sections.remove(&coord) {
                         removed_any = true;
                         if let Some(origin) = section.arena {
@@ -7204,6 +7601,13 @@ impl GpuRenderer {
         self.mesh_pool.drain(|result| results.push(result));
         for result in results {
             match result {
+                MeshResult::SectionMesh { built } => {
+                    // The session's own pool drains `SectionMesh` through
+                    // its revision-checked lane; this pool only receives
+                    // SectionGeometry/HiZDepth work, so a stray result can
+                    // only mean it bypassed the lane's stale check — drop.
+                    let _ = built;
+                }
                 MeshResult::SectionGeometry {
                     coord,
                     packed,
@@ -8930,7 +9334,10 @@ impl GpuRenderer {
                     view: self.depth_view.as_ref().expect("depth ensured"),
                     depth_ops: Some(wgpu::Operations {
                         load: wgpu::LoadOp::Clear(1.0),
-                        store: wgpu::StoreOp::Store,
+                        // Same transient-depth policy as the composed pass:
+                        // TBDR keeps the tile on-chip when no Hi-Z or
+                        // post pass consumes it afterwards.
+                        store: self.depth_store_op(),
                     }),
                     stencil_ops: None,
                 }),

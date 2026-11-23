@@ -18,8 +18,8 @@
 pub mod atmosphere;
 pub mod gpu_hiz;
 pub mod live_session;
+pub mod mesh_pool;
 pub mod recipe_ingest;
-mod mesh_pool;
 pub mod renderer;
 pub mod subworld_render;
 pub mod title_branding;

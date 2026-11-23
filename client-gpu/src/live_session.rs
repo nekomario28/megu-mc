@@ -30,7 +30,7 @@ use megu_client::render::ClientVfxHost;
 use megu_client::render_graph::GpuPipelineKind;
 use megu_client::session::{AudioStats, DeathLoopState, WorldAcousticSnapshot};
 use megu_client::spatial_audio::{SpatialAudioPreset, SpatialSubtitleCue, SubtitleDirection};
-use megu_client::world::{BlockTable, WorldState};
+use megu_client::world::{pack_vertices, sort_translucent, BlockTable, WorldState};
 use megu_client_mesh::asset_pipeline::{CompiledAssetBundle, ResourcePackLayer};
 use megu_client_mesh::atlas::{AtlasMip, PackedAtlas, SpriteAnimation, SpritePlacement};
 use megu_client_mesh::builtin_shadow_wgsl::BuiltinShadowQuality;
@@ -52,7 +52,9 @@ use megu_client_mesh::vanilla_plus_nature::{
     CloudLighting, NatureAmbienceEnv, NatureAmbienceState, NatureModRegistry, SeasonAmbienceInput,
     CLOUD_CELL_BLOCKS, CLOUD_SCROLL_BLOCKS_PER_TICK,
 };
-use megu_client_mesh::SectionCoord;
+use megu_client_mesh::{
+    box_in_frustum, BuiltSectionMesh, DirectionBuckets, SectionCoord, DIRECTION_BUCKETS,
+};
 use megu_kernel::player_physics::{
     step_player_physics, PlayerInputState, PlayerPhysicsState, SurfaceKind,
 };
@@ -97,7 +99,24 @@ use hw_adaptive_engine::{
 };
 use sys_metrics::{sample_host_metrics, CpuSampler, FrameTimingStats};
 
-use crate::renderer::GpuRenderer;
+use crate::mesh_pool::{MeshJob, MeshJobPool, MeshResult, SectionMeshLane};
+use crate::renderer::{external_packed_digest, ExternalSectionMesh, GpuRenderer};
+
+/// Sections per poll the priority-0 lane may rebuild inline, nearest
+/// first — bounded so digging/placing reflects this same frame while a
+/// near-field burst still defers the rest to the normal lanes.
+const PRIORITY_ZERO_INLINE_MAX: usize = 2;
+
+/// Degenerate frustum the priority-0 lane passes to the ordered rebuild:
+/// `box_in_frustum` tests `nx·p + ny·p + nz·p + d >= 0`, so a single
+/// zero-normal plane with `d = 1` passes every section box and the
+/// queue key degenerates to pure camera distance.
+const ALL_INCLUSIVE_PLANES: [[f32; 4]; 1] = [[0.0, 0.0, 0.0, 1.0]];
+
+/// `MeshJob::SectionMesh` submissions per poll. Bounded so a reconnect
+/// or stream-in burst cannot flood the worker queue ahead of the inline
+/// lane; unsent candidates retry next poll.
+const OFFTHREAD_SUBMIT_MAX: usize = 8;
 
 const PREFETCH_VIEW_DISTANCE: u32 = 8;
 const PREFETCH_MAX_CHUNKS: usize = 16;
@@ -1109,6 +1128,37 @@ pub struct LiveSession {
     /// resident-section orders may have changed outside the dirty set —
     /// the renderer runs its cheap order sweep on the next sync.
     pub terrain_order_sweep: bool,
+    /// Upload payloads the off-thread `MeshJob::SectionMesh` lane and the
+    /// same-frame priority-0 lane produced for sections `WorldState` has
+    /// not re-derived yet. `window.rs` snapshots this into
+    /// `GpuRenderer::external_sections` ahead of every terrain reconcile;
+    /// entries are pruned each poll once their `content_epoch` or
+    /// `world_revision` moves on.
+    pub external_sections: BTreeMap<SectionCoord, ExternalSectionMesh>,
+    /// Lazily-spawned worker pool for `MeshJob::SectionMesh` bulk
+    /// meshing — created only when a dirty tail actually exceeds the
+    /// inline rebuild budget, so quiet or headless sessions never pay a
+    /// thread.
+    section_mesh_workers: Option<MeshJobPool>,
+    /// `(coord, epoch)` bookkeeping deduplicating in-flight `SectionMesh`
+    /// jobs and dropping results a newer dirty mark superseded.
+    section_mesh_lane: SectionMeshLane,
+    /// Off-thread lane candidates: coords the play events marked dirty
+    /// that are still unmeshed and loaded. Pruned by
+    /// [`Self::submit_offthread_sections`] each poll.
+    offthread_candidates: BTreeSet<SectionCoord>,
+    /// `MeshJob::SectionMesh` jobs accepted by the worker queue,
+    /// cumulative — proves the off-thread lane submits live.
+    pub offthread_mesh_submitted: u64,
+    /// `SectionMesh` results the drain accepted and published into
+    /// [`Self::external_sections`], cumulative.
+    pub offthread_mesh_completed: u64,
+    /// `SectionMesh` results dropped because their section re-dirtied
+    /// after the snapshot (stale revision), cumulative.
+    pub offthread_mesh_stale: u64,
+    /// Sections the priority-0 near-player lane rebuilt inline this
+    /// session — the 0-frame-latency block-edit path.
+    pub priority_zero_meshes: u64,
     /// Frame-budget governor override on [`Self::mesh_rebuild_budget`]
     /// (`usize::MAX` = unlimited): window.rs clamps it live per
     /// [`ThrottleStage`].
@@ -1492,6 +1542,14 @@ impl LiveSession {
             // renderer needs one legacy full reconcile to establish it.
             terrain_full_sync: true,
             terrain_order_sweep: false,
+            external_sections: BTreeMap::new(),
+            section_mesh_workers: None,
+            section_mesh_lane: SectionMeshLane::default(),
+            offthread_candidates: BTreeSet::new(),
+            offthread_mesh_submitted: 0,
+            offthread_mesh_completed: 0,
+            offthread_mesh_stale: 0,
+            priority_zero_meshes: 0,
             governor_rebuild_cap: usize::MAX,
             ordered_rebuilds_count: 0,
             vfx_admitted: 0,
@@ -1979,6 +2037,26 @@ impl LiveSession {
         {
             self.terrain_order_sweep = true;
         }
+        // Off-thread SectionMesh completions from previous polls: accepted
+        // results publish into `external_sections`, stale ones (the
+        // section re-dirtied after its snapshot) drop.
+        self.drain_offthread_sections(camera_position);
+        // Priority-0 lane: a degenerate all-inclusive frustum plane set
+        // collapses the ordered rebuild's queue key to pure distance, so
+        // the nearest one or two dirty sections rebuild inline — and get
+        // their world artifacts derived — this same frame, even when a
+        // block edit landed behind the camera.
+        match self.world.rebuild_dirty_bounded_ordered(
+            PRIORITY_ZERO_INLINE_MAX,
+            camera_position,
+            &ALL_INCLUSIVE_PLANES,
+        ) {
+            Ok(rebuilt) => self.priority_zero_meshes += rebuilt as u64,
+            Err(error) if !matches!(self.status, SessionStatus::Disconnected(_)) => {
+                self.status = SessionStatus::Disconnected(format!("mesh: {error}"));
+            }
+            Err(_) => {}
+        }
         let rebuild_start = Instant::now();
         match self.world.rebuild_dirty_bounded_ordered(
             self.mesh_rebuild_budget(),
@@ -2007,6 +2085,11 @@ impl LiveSession {
             }
             Err(_) => {}
         }
+        // Bulk/streaming tail: sections still dirty after the inline
+        // budget get `Arc`-snapshotted into `MeshJob::SectionMesh`
+        // workers — bounded non-blocking submissions, so a saturated
+        // queue simply leaves the rest to the inline lane next poll.
+        self.submit_offthread_sections(camera_position, frustum_planes);
         if !matches!(self.status, SessionStatus::Disconnected(_)) {
             let now = Instant::now();
             let elapsed_ticks = (now.duration_since(self.last_vfx_tick).as_millis() / 50).min(4);
@@ -2042,6 +2125,163 @@ impl LiveSession {
                 .as_secs_f64();
             self.last_atlas_anim_tick = now;
         }
+    }
+
+    /// Prune [`Self::external_sections`]: an entry stays authoritative
+    /// only while its section is still loaded, no newer dirty mark
+    /// landed since the payload was produced (`content_epoch`), and the
+    /// world has not derived its own artifacts since (`world_revision`).
+    /// Dropped entries hand residency back to the world payload — the
+    /// byte-identical priority-0 payloads dedup through
+    /// `PendingSectionUpload::matches` without a re-upload.
+    fn prune_external_sections(&mut self) {
+        let world = &self.world;
+        let lane = &self.section_mesh_lane;
+        self.external_sections.retain(|coord, external| {
+            world.mesh_cache.section(*coord).is_some()
+                && lane.epoch_of(*coord) == external.content_epoch
+                && world.section_mesh_revision(*coord).unwrap_or(0) == external.world_revision
+        });
+    }
+
+    /// Drain `MeshJob::SectionMesh` completions without blocking: each
+    /// accepted result (still the in-flight submission, content epoch
+    /// current, world payload not yet published) becomes an
+    /// [`ExternalSectionMesh`] the next renderer reconcile uploads.
+    /// Anything else — re-dirtied sections, superseded submissions,
+    /// raced inline rebuilds, unloads — is dropped as stale.
+    fn drain_offthread_sections(&mut self, camera_position: [f32; 3]) {
+        self.prune_external_sections();
+        let mut results = Vec::new();
+        if let Some(workers) = &self.section_mesh_workers {
+            workers.drain(|result| results.push(result));
+        }
+        for result in results {
+            let MeshResult::SectionMesh { built } = result else {
+                continue;
+            };
+            if !self.section_mesh_lane.accept(&built) {
+                self.offthread_mesh_stale += 1;
+                continue;
+            }
+            // Installed or not, this snapshot is consumed: only a later
+            // dirty mark makes the coord a submission candidate again.
+            self.offthread_candidates.remove(&built.coord);
+            // An inline rebuild or an unload raced the worker — the
+            // authoritative paths already covered the coord.
+            if self.world.packed_mesh(built.coord).is_some()
+                || self.world.mesh_cache.section(built.coord).is_none()
+            {
+                continue;
+            }
+            self.offthread_mesh_completed += 1;
+            self.install_built_external(built, camera_position);
+        }
+    }
+
+    /// Snapshot still-dirty candidate sections beyond this poll's inline
+    /// reach and submit bounded `MeshJob::SectionMesh` work. Ordering
+    /// mirrors `MeshCache::rebuild_dirty_ordered` (in-frustum first, then
+    /// nearest) so the most valuable tail lands earliest; `try_send`
+    /// backpressure leaves saturated leftovers to the inline lane.
+    fn submit_offthread_sections(
+        &mut self,
+        camera_position: [f32; 3],
+        frustum_planes: &[[f32; 4]],
+    ) {
+        if self.offthread_candidates.is_empty() {
+            return;
+        }
+        // Drop coords already meshed inline (priority-0 or the budgeted
+        // drain) or unloaded; what remains mirrors the cache's dirty set.
+        let world = &self.world;
+        self.offthread_candidates.retain(|coord| {
+            world.mesh_cache.section(*coord).is_some()
+                && world.mesh_cache.mesh(*coord).is_none()
+        });
+        if self.offthread_candidates.is_empty() {
+            return;
+        }
+        let threads = self.compute_strategy.workers.background_threads;
+        let mut order: Vec<SectionCoord> =
+            self.offthread_candidates.iter().copied().collect();
+        order.sort_by_key(|&coord| offthread_queue_key(coord, camera_position, frustum_planes));
+        let mut submitted = 0usize;
+        for coord in order {
+            if submitted >= OFFTHREAD_SUBMIT_MAX {
+                break;
+            }
+            if !self.section_mesh_lane.can_submit(coord) {
+                continue;
+            }
+            let revision = self.section_mesh_lane.pending_revision(coord);
+            let Some(input) = self.world.mesh_cache.snapshot_section_input(coord, revision)
+            else {
+                continue;
+            };
+            let workers = self
+                .section_mesh_workers
+                .get_or_insert_with(|| MeshJobPool::new(threads));
+            if workers.try_submit(MeshJob::SectionMesh { input }) {
+                debug_assert_eq!(self.section_mesh_lane.note_submitted(coord), revision);
+                self.offthread_mesh_submitted += 1;
+                submitted += 1;
+            }
+        }
+    }
+
+    /// Publish a worker-built mesh as an [`ExternalSectionMesh`]: the
+    /// opaque packed head plus the translucent tail re-packed and sorted
+    /// back-to-front — the same stream `section_geometry` consumes from
+    /// the world path, with opaque-only direction buckets recovered from
+    /// the worker's vertex ranges.
+    fn install_built_external(&mut self, built: BuiltSectionMesh, camera_position: [f32; 3]) {
+        let coord = built.coord;
+        let opaque_quads = built.opaque_packed.len() as u32 / 4;
+        let mut packed = built.opaque_packed;
+        if let Ok(tail) = pack_vertices(&built.translucent_quads) {
+            packed.extend_from_slice(&tail);
+        }
+        let local_cam = [
+            camera_position[0] - (coord.0 * 16) as f32,
+            camera_position[1] - (coord.1 * 16) as f32,
+            camera_position[2] - (coord.2 * 16) as f32,
+        ];
+        // The sort returns indices into the translucent tail; offset by
+        // the opaque quad count so they index the combined `packed`.
+        let order = sort_translucent(&built.translucent_quads, local_cam)
+            .map(|sorted| {
+                sorted
+                    .into_iter()
+                    .map(|index| index + opaque_quads)
+                    .collect::<Vec<u32>>()
+            })
+            .unwrap_or_default();
+        // `opaque_bucket_ranges` are four-vertex spans over the opaque
+        // head — divide by the vertex stride to recover the quad buckets
+        // `DirectionBuckets` consumers index with.
+        let mut offset = [0u32; DIRECTION_BUCKETS];
+        let mut count = [0u32; DIRECTION_BUCKETS];
+        for (bucket, range) in built.opaque_bucket_ranges.iter().enumerate() {
+            offset[bucket] = range.0 / 4;
+            count[bucket] = range.1 / 4;
+        }
+        let buckets = DirectionBuckets { offset, count };
+        let content_epoch = self.section_mesh_lane.epoch_of(coord);
+        let digest = external_packed_digest(&packed);
+        self.external_sections.insert(
+            coord,
+            ExternalSectionMesh {
+                packed: packed.into(),
+                order: order.into(),
+                buckets: Some(buckets),
+                digest,
+                content_epoch,
+                world_revision: self.world.section_mesh_revision(coord).unwrap_or(0),
+            },
+        );
+        self.dirty_terrain_coords.insert(coord);
+        self.terrain_dirty = true;
     }
 
     pub fn send_movement(&mut self, movement: PlayerMovement) {
@@ -3631,6 +3871,15 @@ impl LiveSession {
         }
     }
 
+    /// Record a terrain-dirty mark for `coord` in the reconcile set, the
+    /// off-thread lane's content epoch (invalidating any in-flight
+    /// `SectionMesh` snapshot) and the submission candidate set.
+    fn mark_offthread_coord(&mut self, coord: SectionCoord) {
+        self.dirty_terrain_coords.insert(coord);
+        self.section_mesh_lane.mark_dirty(coord);
+        self.offthread_candidates.insert(coord);
+    }
+
     /// Mark every section of chunk column `(cx, cz)` — plus the four
     /// lateral neighbor columns — for renderer re-evaluation. `MeshCache`
     /// only invalidates a neighbor when a shared boundary actually
@@ -3642,8 +3891,7 @@ impl LiveSession {
         let section_count = self.world.dimension.section_count() as i32;
         for (dx, dz) in [(0, 0), (1, 0), (-1, 0), (0, 1), (0, -1)] {
             for sy in min_sy..min_sy + section_count {
-                self.dirty_terrain_coords
-                    .insert(SectionCoord(cx + dx, sy, cz + dz));
+                self.mark_offthread_coord(SectionCoord(cx + dx, sy, cz + dz));
             }
         }
     }
@@ -3657,7 +3905,7 @@ impl LiveSession {
             pos[1].div_euclid(16),
             pos[2].div_euclid(16),
         );
-        self.dirty_terrain_coords.insert(section);
+        self.mark_offthread_coord(section);
         for (dx, dy, dz) in [
             (1, 0, 0),
             (-1, 0, 0),
@@ -3666,7 +3914,7 @@ impl LiveSession {
             (0, 0, 1),
             (0, 0, -1),
         ] {
-            self.dirty_terrain_coords.insert(SectionCoord(
+            self.mark_offthread_coord(SectionCoord(
                 section.0 + dx,
                 section.1 + dy,
                 section.2 + dz,
@@ -3742,6 +3990,15 @@ impl LiveSession {
                 self.audio.mixer.refresh_acoustics();
                 self.chunk_fades.forget(cx, cz);
                 self.refresh_prefetcher();
+                // The unloaded column's own sections leave tracking
+                // entirely — in-flight SectionMesh results drain as stale.
+                let min_sy = self.world.dimension.min_section_y();
+                for sy in min_sy..min_sy + self.world.dimension.section_count() as i32 {
+                    let coord = SectionCoord(cx, sy, cz);
+                    self.section_mesh_lane.remove(coord);
+                    self.offthread_candidates.remove(&coord);
+                    self.external_sections.remove(&coord);
+                }
                 self.mark_chunk_column_dirty(cx, cz);
                 self.terrain_dirty = true;
             }
@@ -4272,6 +4529,12 @@ impl LiveSession {
         // only honest answer before dirty tracking resumes.
         self.terrain_full_sync = true;
         self.dirty_terrain_coords.clear();
+        // The off-thread lane's epochs, candidates and published payloads
+        // all reference the old dimension's sections — drop them wholesale
+        // (in-flight jobs finish and drain as stale/unloaded).
+        self.external_sections.clear();
+        self.offthread_candidates.clear();
+        self.section_mesh_lane.clear();
         self.pose = None;
         self.last_motion_delta = [0.0; 2];
         self.chunk_fades = ChunkFadeTracker::new();
@@ -4998,6 +5261,39 @@ fn seeded_command_dispatcher() -> CommandDispatcher {
         let _ = dispatcher.register_literal(name);
     }
     dispatcher
+}
+
+/// Priority order for off-thread `SectionMesh` submissions — mirrors
+/// `MeshCache::rebuild_dirty_ordered`'s queue key: in-frustum sections
+/// first, then nearest section-box distance (bit pattern, `Ord`-safe).
+fn offthread_queue_key(
+    coord: SectionCoord,
+    camera: [f32; 3],
+    planes: &[[f32; 4]],
+) -> (bool, u64) {
+    const EDGE: f32 = 16.0;
+    let min = [
+        coord.0 as f32 * EDGE,
+        coord.1 as f32 * EDGE,
+        coord.2 as f32 * EDGE,
+    ];
+    let mut dist2 = 0.0f32;
+    for (axis, &p) in camera.iter().enumerate() {
+        let lo = min[axis];
+        let hi = lo + EDGE;
+        let gap = if p < lo {
+            lo - p
+        } else if p > hi {
+            p - hi
+        } else {
+            0.0
+        };
+        dist2 += gap * gap;
+    }
+    (
+        !box_in_frustum(min, planes),
+        dist2.max(0.0).to_bits() as u64,
+    )
 }
 
 /// Map the live kernel-autotuner mode plus the measurement path onto
