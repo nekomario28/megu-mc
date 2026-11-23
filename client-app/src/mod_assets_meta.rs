@@ -228,20 +228,47 @@ pub struct ModBlockState {
 pub struct ClientModRegistry {
     pub base_block_state_id: u32,
     pub base_item_id: u32,
-    blocks: Vec<ModBlockState>,
-    items: Vec<String>,
+    blocks: BTreeMap<u32, ModBlockState>,
+    items: BTreeMap<u32, String>,
+}
+
+fn mrs1_crc32(bytes: &[u8]) -> u32 {
+    let mut crc = !0u32;
+    for &byte in bytes {
+        crc ^= u32::from(byte);
+        for _ in 0..8 {
+            let mask = 0u32.wrapping_sub(crc & 1);
+            crc = (crc >> 1) ^ (0xEDB8_8320 & mask);
+        }
+    }
+    !crc
 }
 
 impl ClientModRegistry {
-    /// Decode MRS1: magic, version u16, bases u32/u32, block count u32, then
-    /// each block as UTF-8 name, u16 property count and UTF-8 key/value pairs;
-    /// item count u32 followed by UTF-8 names. Strings use u16 byte lengths.
+    /// Decode MRS1 matching `mod_adapter_core::live_registry_bridge::encode_registry_sync_frame`:
+    /// magic (`MRS1`), version `u16` (1), `base_block_state_id` (`u32`), `base_item_id` (`u32`),
+    /// block count (`u32`), then each block as monotonic `state_id` (`u32`), UTF-8 `block_id`,
+    /// `u16` property count and UTF-8 key/value pairs; item count (`u32`) followed by monotonic
+    /// `item_id` (`u32`) and UTF-8 item name; trailing IEEE CRC32 (`u32`, big-endian).
+    /// All integers are big-endian and strings use `u16` byte lengths.
     pub fn decode_mrs1_frame(frame: &[u8]) -> Result<Self, String> {
         if frame.len() > MAX_MRS_BYTES {
             return Err("MRS1 frame exceeds byte budget".into());
         }
+        if frame.len() < 4 + 2 + 4 + 4 + 4 + 4 + 4 {
+            return Err("truncated MRS1 frame".into());
+        }
+        let payload_len = frame.len() - 4;
+        let expected_crc = u32::from_be_bytes(
+            frame[payload_len..]
+                .try_into()
+                .map_err(|_| "truncated MRS1 crc32")?,
+        );
+        if mrs1_crc32(&frame[..payload_len]) != expected_crc {
+            return Err("MRS1 crc32 mismatch".into());
+        }
         let mut r = Reader {
-            bytes: frame,
+            bytes: &frame[..payload_len],
             pos: 0,
         };
         if r.take(4)? != b"MRS1" {
@@ -253,8 +280,16 @@ impl ClientModRegistry {
         let base_block_state_id = r.u32()?;
         let base_item_id = r.u32()?;
         let block_count = r.count()?;
-        let mut blocks = Vec::with_capacity(block_count);
+        let mut blocks = BTreeMap::new();
+        let mut prev_state_id = None;
         for _ in 0..block_count {
+            let state_id = r.u32()?;
+            if state_id < base_block_state_id
+                || prev_state_id.is_some_and(|prev| state_id <= prev)
+            {
+                return Err("non-monotonic MRS1 block state id".into());
+            }
+            prev_state_id = Some(state_id);
             let name = r.string()?;
             let property_count = usize::from(r.u16()?);
             if property_count > 4096 {
@@ -268,14 +303,20 @@ impl ClientModRegistry {
                     return Err("duplicate MRS1 property".into());
                 }
             }
-            blocks.push(ModBlockState { name, properties });
+            blocks.insert(state_id, ModBlockState { name, properties });
         }
         let item_count = r.count()?;
-        let mut items = Vec::with_capacity(item_count);
+        let mut items = BTreeMap::new();
+        let mut prev_item_id = None;
         for _ in 0..item_count {
-            items.push(r.string()?);
+            let item_id = r.u32()?;
+            if item_id < base_item_id || prev_item_id.is_some_and(|prev| item_id <= prev) {
+                return Err("non-monotonic MRS1 item id".into());
+            }
+            prev_item_id = Some(item_id);
+            items.insert(item_id, r.string()?);
         }
-        if r.pos != frame.len() {
+        if r.pos != payload_len {
             return Err("trailing bytes in MRS1 frame".into());
         }
         Ok(Self {
@@ -286,18 +327,13 @@ impl ClientModRegistry {
         })
     }
     pub fn block_state_name(&self, id: u32) -> Option<&str> {
-        id.checked_sub(self.base_block_state_id)
-            .and_then(|n| self.blocks.get(n as usize))
-            .map(|b| b.name.as_str())
+        self.blocks.get(&id).map(|b| b.name.as_str())
     }
     pub fn block_state(&self, id: u32) -> Option<&ModBlockState> {
-        id.checked_sub(self.base_block_state_id)
-            .and_then(|n| self.blocks.get(n as usize))
+        self.blocks.get(&id)
     }
     pub fn item_name(&self, id: u32) -> Option<&str> {
-        id.checked_sub(self.base_item_id)
-            .and_then(|n| self.items.get(n as usize))
-            .map(String::as_str)
+        self.items.get(&id).map(String::as_str)
     }
 }
 
@@ -572,6 +608,7 @@ mod tests {
         frame.extend_from_slice(&40u32.to_be_bytes());
         frame.extend_from_slice(&70u32.to_be_bytes());
         frame.extend_from_slice(&1u32.to_be_bytes());
+        frame.extend_from_slice(&40u32.to_be_bytes());
         let block_name = "create:wheel";
         frame.extend_from_slice(&(block_name.len() as u16).to_be_bytes());
         frame.extend_from_slice(block_name.as_bytes());
@@ -581,9 +618,12 @@ mod tests {
             frame.extend_from_slice(s.as_bytes());
         }
         frame.extend_from_slice(&1u32.to_be_bytes());
+        frame.extend_from_slice(&70u32.to_be_bytes());
         let item = "create:wrench";
         frame.extend_from_slice(&(item.len() as u16).to_be_bytes());
         frame.extend_from_slice(item.as_bytes());
+        let crc = mrs1_crc32(&frame);
+        frame.extend_from_slice(&crc.to_be_bytes());
         let registry = decode_mrs1_frame(&frame).expect("valid frame");
         assert_eq!(registry.block_state_name(40), Some("create:wheel"));
         assert_eq!(
@@ -597,9 +637,16 @@ mod tests {
         for bad in [&b"NOPE"[..], &frame[..frame.len() - 1]] {
             assert!(decode_mrs1_frame(bad).is_err());
         }
-        let mut wrong_version = frame;
+        let mut wrong_version = frame[..frame.len() - 4].to_vec();
         wrong_version[4] = 0;
         wrong_version[5] = 2;
+        let bad_ver_crc = mrs1_crc32(&wrong_version);
+        wrong_version.extend_from_slice(&bad_ver_crc.to_be_bytes());
         assert!(decode_mrs1_frame(&wrong_version).is_err());
+        // Corrupt CRC must fail closed.
+        let mut bad_crc = frame;
+        let last = bad_crc.len() - 1;
+        bad_crc[last] ^= 0xFF;
+        assert!(decode_mrs1_frame(&bad_crc).is_err());
     }
 }
