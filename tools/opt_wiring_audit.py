@@ -44,12 +44,22 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 WINDOW_RS = "client-gpu/src/window.rs"
 RENDERER_RS = "client-gpu/src/renderer.rs"
 LIVE_SESSION_RS = "client-gpu/src/live_session.rs"
+SUBWORLD_RENDER_RS = "client-gpu/src/subworld_render.rs"
 MESH_RS = "client-port/src/mesh.rs"
 SIMD_VOXEL_RS = "core/src/simd_voxel.rs"
 WORLDGEN_RS = "src/worldgen.rs"
 GENERATION_MATH_RS = "src/generation_math.rs"
 PLAY_PROTOCOL_RS = "src/play_protocol.rs"
 MAIN_RS = "src/main.rs"
+CONNECTION_LIMITS_RS = "src/connection_limits.rs"
+LIVE_MOD_BRIDGE_RS = "src/live_mod_bridge.rs"
+PROTO_WIRE_RS = "proto/src/wire.rs"
+WORLD_INTEROP_RS = "state-store/src/world_interop.rs"
+REGION_SCHEDULER_RS = "mod-offload/src/region_scheduler.rs"
+FACTORY_RS = "create-adapter/src/factory.rs"
+GZIP_RS = "client-kernel/src/gzip.rs"
+PACK_LOADER_RS = "server-files/src/pack_loader.rs"
+ANVIL_INSPECT_RS = "state-store/src/anvil_inspect.rs"
 
 # ---------------------------------------------------------------------------
 # Rust source masking — mirrors tools/client_vertical_wiring_audit.py so
@@ -502,6 +512,170 @@ CHECKS = [
      "summary": "tick_workers mob plan/env offload on server tick",
      "file": MAIN_RS,
      "requirements": [_c(r"\btick_workers\s*::")]},
+    # -- Wave 4/5 client rendering ---------------------------------------
+    {"id": "opt-ao-lut-branchless-shading",
+     "summary": "branchless L1 AO LUT (AO_LUT) live in mesh shading",
+     "file": MESH_RS,
+     "requirements": [
+         _c(r"\bAO_LUT\s*\["),
+         _call("shade_fast"),
+     ]},
+    {"id": "opt-subworld-lit-wgsl-f16",
+     "summary": "f16 64-light lit shader variant (lit_wgsl_f16) wired",
+     "file": SUBWORLD_RENDER_RS,
+     "requirements": [
+         _call("lit_wgsl_f16"),
+         _c(r"\bLIT_FRAGMENT_F16_WGSL\b"),
+     ]},
+    {"id": "opt-renderer-lit-wgsl-f16-consumer",
+     "summary": "renderer selects lit_wgsl by the SHADER_F16 capability",
+     "file": RENDERER_RS,
+     "requirements": [
+         _call("lit_wgsl"),
+         _c(r"\bshader_f16\b"),
+     ]},
+    {"id": "opt-terrain-vertex-packed-32b",
+     "summary": "32B TerrainVertex packed normal/albedo codec live",
+     "file": SUBWORLD_RENDER_RS,
+     "requirements": [
+         _call("pack_normal_octahedral"),
+         _call("unpack_normal_octahedral"),
+         _call("pack_albedo_unorm8x4"),
+         _call("unpack_albedo_unorm8x4"),
+         _c(r"size_of\s*::<\s*TerrainVertex\s*>\s*\(\s*\)\s*==\s*32"),
+     ]},
+    # -- Client math / feedback wiring (L7) -------------------------------
+    {"id": "opt-kernel-challenger-probe",
+     "summary": "KernelAutotuner challenger probing (dispatch_kernel_mode)",
+     "file": LIVE_SESSION_RS,
+     "requirements": [_call("dispatch_kernel_mode")]},
+    {"id": "opt-ducb-select-arm",
+     "summary": "DiscountedUcbAutotuner select_arm consumed each poll",
+     "file": LIVE_SESSION_RS,
+     "requirements": [_call("select_arm")]},
+    {"id": "opt-prefetch-boost-map",
+     "summary": "SpeculativeChunkPrefetcher boost map consumed in drain",
+     "file": LIVE_SESSION_RS,
+     "requirements": [_call("prefetch_boost_map")]},
+    {"id": "opt-frame-timing-push-tick",
+     "summary": "FrameTimingStats push_tick telemetry producer live",
+     "file": LIVE_SESSION_RS,
+     "requirements": [_call("push_tick")]},
+    # -- Server perf ------------------------------------------------------
+    {"id": "opt-sharded-chunks",
+     "summary": "64-shard cache-line RwLock chunk maps (ShardedChunks)",
+     "file": MAIN_RS,
+     "requirements": [
+         _c(r"struct\s+ShardedChunks"),
+         _c(r"ShardedChunks\s*::\s*new"),
+         _call("chunk_shard_of"),
+         _c(r"MAP_SHARDS\s*:\s*usize\s*=\s*64"),
+     ]},
+    {"id": "opt-refresh-hot-sig-skip",
+     "summary": "O(1) idle refresh_hot skip via HotSig signature",
+     "file": MAIN_RS,
+     "requirements": [
+         _c(r"struct\s+HotSig"),
+         _c(r"sig\s*:\s*Option\s*<\s*HotSig"),
+         _c(r"sig\.warm_radius\s*==\s*warm_radius"),
+         _c(r"sig\.centers\s*==\s*centers"),
+         _c(r"sig\.forced\s*==\s*forced_set"),
+         _c(r"\bHOT_REBUILDS\b"),
+     ]},
+    {"id": "opt-zlib-scratch-pool",
+     "summary": "per-thread ZlibCompress/DecompressScratch in encode/decode",
+     "file": CONNECTION_LIMITS_RS,
+     "requirements": [
+         _c(r"struct\s+ZlibCompressScratch"),
+         _c(r"struct\s+ZlibDecompressScratch"),
+         _call("with_zlib_scratch"),
+         _call("with_zlib_inflate"),
+         _call("compress_at"),
+         _call("inflate_exact"),
+     ]},
+    {"id": "opt-live-server-budget-scale",
+     "summary": "LIVE_SERVER_BUDGET_SCALE PID mirror + getter live",
+     "file": LIVE_MOD_BRIDGE_RS,
+     "requirements": [
+         _c(r"\bLIVE_SERVER_BUDGET_SCALE\b"),
+         _c(r"LIVE_SERVER_BUDGET_SCALE\s*\.\s*store"),
+         _c(r"fn\s+live_server_budget_scale"),
+     ]},
+    {"id": "opt-scaled-tick-budget",
+     "summary": "live_scaled_tick_budget sheds interest burst by PID scale",
+     "file": PLAY_PROTOCOL_RS,
+     "requirements": [
+         _call("live_scaled_tick_budget"),
+         _call("live_server_budget_scale"),
+     ]},
+    # -- Canonical DoS-proof NBT wire skipper ------------------------------
+    {"id": "opt-nbt-wire-skip-play",
+     "summary": "play_protocol NBT skipping delegates to megu_core::nbt_wire",
+     "file": PLAY_PROTOCOL_RS,
+     "requirements": [
+         _call("nbt_wire_skip"),
+         _call("nbt_wire_value"),
+         _call("skip_nbt_payload"),
+     ]},
+    {"id": "opt-nbt-wire-skip-proto",
+     "summary": "proto wire reader uses canonical skip_nbt_payload",
+     "file": PROTO_WIRE_RS,
+     "requirements": [_call("skip_nbt_payload")]},
+    {"id": "opt-nbt-wire-skip-world-interop",
+     "summary": "world_interop raw-NBT skipper uses canonical skip_nbt_payload",
+     "file": WORLD_INTEROP_RS,
+     "requirements": [_call("skip_nbt_payload")]},
+    # -- Resident task pool / parallel region stepping ---------------------
+    {"id": "opt-bg-task-pool",
+     "summary": "resident MeguTaskPool bg_scope! dispatch in every build",
+     "file": WORLDGEN_RS,
+     "requirements": [
+         _c(r"\bMeguTaskPool\b"),
+         _c(r"\bbg_task_pool\b"),
+         _c(r"bg_scope!\s*\("),
+     ]},
+    {"id": "opt-bg-pool-prefetch-consumers",
+     "summary": "main.rs terrain prefetch consumes the bg pool batch API",
+     "file": MAIN_RS,
+     "requirements": [
+         _call("prefetch_cols_with"),
+         _call("prefetch_terrain"),
+     ]},
+    {"id": "opt-awake-region-parallel-step",
+     "summary": "selective awake+due region parallel step with idle sleep",
+     "file": REGION_SCHEDULER_RS,
+     "requirements": [
+         _call("advance_active_parallel_for"),
+         _call("refresh_region_sleep"),
+         _c(r"\bWorkerPool\b"),
+         _c(r"\bawake\b"),
+         _c(r"\bsleeping\b"),
+     ]},
+    {"id": "opt-create-factory-parallel-step",
+     "summary": "CreateFactory step_tick_parallel -> advance_active_parallel_for",
+     "file": FACTORY_RS,
+     "requirements": [
+         _call("advance_active_parallel_for"),
+         _call("step_tick_parallel"),
+         _c(r"\bidle_export_skips\b"),
+     ]},
+    {"id": "opt-create-factory-server-step",
+     "summary": "server live_create tick steps CreateFactory regions",
+     "file": LIVE_MOD_BRIDGE_RS,
+     "requirements": [_call("step_tick")]},
+    # -- Canonical core inflate ------------------------------------------------
+    {"id": "opt-gzip-core-inflate",
+     "summary": "client-kernel gzip uses inflate_raw_rfc1951_with_consumed",
+     "file": GZIP_RS,
+     "requirements": [_call("inflate_raw_rfc1951_with_consumed")]},
+    {"id": "opt-pack-loader-core-inflate",
+     "summary": "server-files pack loader uses inflate_raw_rfc1951_with_consumed",
+     "file": PACK_LOADER_RS,
+     "requirements": [_call("inflate_raw_rfc1951_with_consumed")]},
+    {"id": "opt-anvil-inspect-core-inflate",
+     "summary": "state-store anvil inspector uses inflate_raw_rfc1951_with_consumed",
+     "file": ANVIL_INSPECT_RS,
+     "requirements": [_call("inflate_raw_rfc1951_with_consumed")]},
 ]
 
 CHECK_IDS = [check["id"] for check in CHECKS]
