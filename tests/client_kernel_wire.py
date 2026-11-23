@@ -143,7 +143,7 @@ def wait_block(client, cell, state, packet, label):
 def setblock(client, cell, name):
     x, y, z = cell
     chat_command(client, f"setblock {x} {y} {z} minecraft:{name}")
-    wait_block(client, cell, BLOCKS[name], 0x49, f"setblock-0x49:{cell}:{name}")
+    wait_block(client, cell, BLOCKS[name], 0x09, f"setblock-0x09:{cell}:{name}")
 
 
 def use_block(client, cell, sequence):
@@ -162,7 +162,7 @@ def snapshot(actor, game, name, cell):
 
 
 def exercise_barrel(actor, game, cell):
-    # This server sends block edits in 0x49, and barrel opener changes in 0x09.
+    # Single-cell edits arrive in 0x09 block_update; multi-cell section batches in 0x49.
     setblock(actor, cell, "barrel")
     closed = BLOCKS["barrel"]
     # For this barrel's facing, the open=true state precedes open=false.
@@ -199,7 +199,7 @@ def exercise_dry(move, game, x, y, z):
     wall = (x + 2, y, z)
     set_creative_stone(actor)
     use_block(actor, (wall[0], y - 1, z), 81)
-    wait_block(actor, wall, STONE, 0x49, "place-stone-0x49")
+    wait_block(actor, wall, STONE, 0x09, "place-stone-0x09")
     snapshot(actor, game, "PlacedStone", wall)
 
     for _ in range(6):
@@ -209,7 +209,7 @@ def exercise_dry(move, game, x, y, z):
             "walk-stops-at-placed-wall")
 
     actor.send(0x24, vint(0) + position(*wall) + bytes([1]) + vint(82))
-    wait_block(actor, wall, BLOCKS["air"], 0x49, "break-stone-0x49")
+    wait_block(actor, wall, BLOCKS["air"], 0x09, "break-stone-0x09")
     snapshot(actor, game, "BrokenStone", wall)
 
     sprint(actor, move.observer, True)
@@ -320,7 +320,7 @@ def exercise_wire(game, kernel):
             )
         unexpected = len(actor.position_syncs) + len(observer.position_syncs) - 2
         require(unexpected == 0, f"unexpected-0x40-resyncs:{unexpected}")
-        require(actor.update_counts[0x09] == 2, "two-live-barrel-state-updates")
+        require(actor.update_counts[0x09] >= 4, "live-single-cell-updates")
         print(f"protocol=767 chunks={len(actor.palettes)} sections={actor.initial_sections} "
               f"palette_widths={sorted(actor.wire_widths)} live_0x09={actor.update_counts[0x09]} "
               f"live_0x49_cells={actor.update_counts[0x49]}")
