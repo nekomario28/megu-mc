@@ -17,7 +17,8 @@ use megu_client_gpu::renderer::{
     probe_adapters, request_gpu_device, ComposedFrame, GpuRenderer, RendererError, OFFSCREEN_FORMAT,
 };
 use megu_client_gpu::subworld_render::{
-    box_mesh, quat_from_axis_angle, CompositeDrawUniforms, InstancedPartBatch, InstancedPartRecord,
+    box_mesh, lit_wgsl, lit_wgsl_f16, pack_normal_octahedral, quat_from_axis_angle,
+    unpack_normal_octahedral, CompositeDrawUniforms, InstancedPartBatch, InstancedPartRecord,
     SubWorldRenderBank, SubWorldRenderEntry, SubWorldTransform, TerrainVertex, COMPOSITE_LIT_WGSL,
     COMPOSITE_TERRAIN_WGSL, DRAW_UNIFORM_STRIDE,
 };
@@ -429,8 +430,8 @@ fn assert_geometry_finite(verts: &[TerrainVertex], idx: &[u32], ctx: &str) {
         assert!(
             v.position
                 .iter()
-                .chain(v.normal.iter())
-                .chain(v.albedo.iter())
+                .chain(v.normal().iter())
+                .chain(v.albedo().iter())
                 .all(|c| c.is_finite()),
             "{ctx}: vertex {i} not finite: {v:?}"
         );
@@ -459,7 +460,7 @@ fn cloud_and_planet_geometry_is_finite_and_non_empty() {
     // Every emitted vertex albedo comes from the cloud lighting table.
     assert!(verts
         .iter()
-        .all(|v| v.albedo.iter().all(|c| (0.0..=1.05).contains(c))));
+        .all(|v| v.albedo().iter().all(|c| (0.0..=1.05).contains(c))));
 
     let planet = PlanetSkyBody {
         id: "ad_astra:earth".to_string(),
@@ -585,6 +586,112 @@ fn composite_wgsl_modules_validate_with_naga() {
     ] {
         assert!(has_entry_point(&lit, stage, name), "lit module lost {name}");
     }
+}
+
+// ---------------------------------------------------------------------------
+// Packed 32-byte TerrainVertex ABI + f32/f16 subworld module variants
+// ---------------------------------------------------------------------------
+
+#[test]
+fn terrain_vertex_is_32_bytes_and_packs_accurately() {
+    assert_eq!(
+        std::mem::size_of::<TerrainVertex>(),
+        32,
+        "TerrainVertex must stay a 32-byte vertex record"
+    );
+
+    // Full-precision fields survive the round-trip bit-identically.
+    let v = TerrainVertex::new(
+        [1.25, -64.5, 4096.75],
+        [0.267_261_24, 0.534_522_5, -0.801_783_7],
+        [0.9, 0.45, 0.1],
+        [0.125, 15.9375],
+        0xABCD_EF01,
+    );
+    assert_eq!(v.position, [1.25, -64.5, 4096.75]);
+    assert_eq!(v.uv, [0.125, 15.9375]);
+    assert_eq!(v.atlas_index, 0xABCD_EF01);
+
+    // Octahedral normal round-trips inside the unorm16 quantization
+    // budget (~1e-4 of a unit axis at these magnitudes).
+    for normal in [
+        [0.0, 1.0, 0.0],
+        [1.0, 0.0, 0.0],
+        [0.0, 0.0, -1.0],
+        [0.267_261_24, 0.534_522_5, -0.801_783_7],
+        [-0.577_350_26, -0.577_350_26, 0.577_350_26],
+    ] {
+        let decoded = unpack_normal_octahedral(pack_normal_octahedral(normal));
+        for (a, b) in normal.iter().zip(decoded.iter()) {
+            assert!(
+                (a - b).abs() < 2.0e-3,
+                "octahedral round-trip drifted: {normal:?} -> {decoded:?}"
+            );
+        }
+        let len = (decoded[0] * decoded[0]
+            + decoded[1] * decoded[1]
+            + decoded[2] * decoded[2])
+            .sqrt();
+        assert!((len - 1.0).abs() < 1.0e-4, "decoded normal not unit: {decoded:?}");
+    }
+    let v = TerrainVertex::new([0.0; 3], [0.0; 3], [0.0; 3], [0.0; 2], 0);
+    let n = v.normal();
+    assert!(
+        (n[0]).abs() < 1.0e-3 && (n[1] - 1.0).abs() < 1.0e-3 && n[2].abs() < 1.0e-3,
+        "degenerate normal packs +Y within quantization: {n:?}"
+    );
+
+    // unorm8x3 albedo quantizes to byte steps; non-finite fails to 0.
+    let v = TerrainVertex::new([0.0; 3], [0.0, 1.0, 0.0], [1.0, 0.5, 0.0], [0.0; 2], 0);
+    let albedo = v.albedo();
+    assert_eq!(albedo[0], 1.0);
+    assert!((albedo[1] - 128.0 / 255.0).abs() < 1.0e-6);
+    assert_eq!(albedo[2], 0.0);
+    let mut v = TerrainVertex::new(
+        [0.0; 3],
+        [0.0, 1.0, 0.0],
+        [2.0, f32::NAN, -1.0],
+        [0.0; 2],
+        0,
+    );
+    assert_eq!(v.albedo(), [1.0, 0.0, 0.0]);
+    // The flags byte rides along untouched by rgb repacks.
+    v.set_material_flags(0x5A);
+    assert_eq!(v.material_flags(), 0x5A);
+    v.set_albedo([0.25, 0.5, 0.75]);
+    assert_eq!(v.material_flags(), 0x5A);
+}
+
+#[test]
+fn subworld_lit_wgsl_validates_in_both_f32_and_f16_variants() {
+    // Baseline f32 module — every adapter must run it.
+    let f32_module = compile_and_validate("lit_wgsl(false)", lit_wgsl(false).as_ref());
+    let f16_source = lit_wgsl_f16();
+    assert!(
+        f16_source.starts_with("enable f16;"),
+        "the f16 variant must open with the capability enable"
+    );
+    let f16_module = compile_and_validate("lit_wgsl_f16", &f16_source);
+    let has_entry_point = |m: &wgpu::naga::Module, stage: ShaderStage, name: &str| {
+        m.entry_points
+            .iter()
+            .any(|ep| ep.stage == stage && ep.name == name)
+    };
+    for module in [&f32_module, &f16_module] {
+        for (stage, name) in [
+            (ShaderStage::Vertex, "lit_vs"),
+            (ShaderStage::Vertex, "inst_vs"),
+            (ShaderStage::Fragment, "lit_fs"),
+        ] {
+            assert!(has_entry_point(module, stage, name), "module lost {name}");
+        }
+    }
+    // `lit_wgsl` is a pure capability gate: f16 granted → owned f16
+    // module, otherwise the shared borrowed f32 constant.
+    assert!(matches!(lit_wgsl(true), std::borrow::Cow::Owned(_)));
+    assert!(matches!(lit_wgsl(false), std::borrow::Cow::Borrowed(_)));
+    assert_eq!(lit_wgsl(true).as_ref(), f16_source.as_str());
+    assert_eq!(lit_wgsl(false).as_ref(), COMPOSITE_LIT_WGSL);
 }
 
 // ---------------------------------------------------------------------------
@@ -955,11 +1062,11 @@ fn voxel_cloud_geometry_sanitizes_lighting_and_degenerate_cells() {
     assert_eq!(indices.len(), 36);
     for v in &verts {
         assert!(
-            v.albedo
+            v.albedo()
                 .iter()
                 .all(|c| c.is_finite() && (0.0..=1.0).contains(c)),
             "cloud albedo escaped bounds: {:?}",
-            v.albedo
+            v.albedo()
         );
     }
 }
@@ -984,7 +1091,7 @@ fn extruded_mesh_to_geometry_skips_non_finite_quads_and_bounds_albedo() {
     let (verts, indices) = extruded_mesh_to_geometry(&mesh, |_| [2.0, -1.0, f32::NAN]);
     assert_eq!(verts.len(), 4, "non-finite quad must be skipped");
     assert_eq!(indices.len(), 6);
-    assert_eq!(verts[0].albedo, [1.0, 0.0, 0.0]);
+    assert_eq!(verts[0].albedo(), [1.0, 0.0, 0.0]);
 }
 
 #[test]

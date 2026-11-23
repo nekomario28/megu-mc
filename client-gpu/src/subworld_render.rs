@@ -17,6 +17,7 @@
 //! and VFX1 colored point lights, and `TerrainVertex` sub-world/cloud/planet
 //! geometry transformed by a per-draw `view_proj * model` uniform.
 
+use std::borrow::Cow;
 use std::collections::BTreeMap;
 
 use bytemuck::{Pod, Zeroable};
@@ -31,21 +32,166 @@ use crate::{mat4_mul, Mat4};
 // ---------------------------------------------------------------------------
 
 /// World-space lit vertex for sub-worlds, voxel clouds, and cubic
-/// planets/suns. 48 bytes; bound as `@location(0..2, 7..8)` inputs in
-/// [`COMPOSITE_LIT_WGSL`].
+/// planets/suns. 32 bytes — down from the original 48 — cutting vertex
+/// bandwidth and VRAM per lit vertex by a third; bound as
+/// `@location(0..2, 7..8)` inputs in [`COMPOSITE_LIT_WGSL`].
+///
+/// `position`/`uv` keep full `f32` precision (any quantization error
+/// there is a silhouette seam or a texture swim, both pixel-visible);
+/// `normal`/`albedo` pack into one `u32` each because lighting tolerates
+/// byte-precision direction and color error far below display
+/// quantization.
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Default, PartialEq, Pod, Zeroable)]
 pub struct TerrainVertex {
     /// Position in the draw's model space (blocks).
     pub position: [f32; 3],
-    /// Unit outward normal in model space.
-    pub normal: [f32; 3],
-    /// Linear-ish albedo `0.0..=1.0` per channel.
-    pub albedo: [f32; 3],
+    /// Unit outward normal in model space, octahedral-encoded into two
+    /// `unorm16` lanes (`x` in bits 0..16, `y` in bits 16..32).
+    /// [`pack_normal_octahedral`]/[`unpack_normal_octahedral`] round-trip
+    /// it; the vertex shader's `unpack_oct_normal` decodes the same
+    /// words.
+    pub packed_normal: u32,
+    /// Linear-ish albedo `0.0..=1.0` per channel as `unorm8x3` rgb
+    /// (bytes 0..3), plus a material-flags byte (bits 24..32) reserved
+    /// for cutout/emissive tagging — `0` today.
+    pub packed_albedo: u32,
     /// Original unwrapped sprite UV, including fractional texel geometry.
     pub uv: [f32; 2],
     /// Index into the uploaded atlas rectangle table. `u32::MAX` is untextured.
     pub atlas_index: u32,
+}
+
+const _: () = assert!(
+    std::mem::size_of::<TerrainVertex>() == 32,
+    "TerrainVertex must stay 32 bytes"
+);
+
+impl TerrainVertex {
+    /// Full-precision constructor: quantizes `normal`/`albedo` into their
+    /// packed GPU words. Non-finite inputs fail closed — a non-finite or
+    /// zero normal packs as `+Y`, non-finite albedo channels as `0`.
+    pub fn new(
+        position: [f32; 3],
+        normal: [f32; 3],
+        albedo: [f32; 3],
+        uv: [f32; 2],
+        atlas_index: u32,
+    ) -> Self {
+        Self {
+            position,
+            packed_normal: pack_normal_octahedral(normal),
+            packed_albedo: pack_albedo_unorm8x4(albedo, 0),
+            uv,
+            atlas_index,
+        }
+    }
+
+    /// Unpacked unit model-space normal (`+Y` when `packed_normal` is a
+    /// degenerate word).
+    pub fn normal(&self) -> [f32; 3] {
+        unpack_normal_octahedral(self.packed_normal)
+    }
+
+    /// Re-pack `normal` into `packed_normal` (the read-modify-write path
+    /// the CPU-side vertex reorientation helpers take).
+    pub fn set_normal(&mut self, normal: [f32; 3]) {
+        self.packed_normal = pack_normal_octahedral(normal);
+    }
+
+    /// Unpacked `0.0..=1.0` albedo rgb.
+    pub fn albedo(&self) -> [f32; 3] {
+        unpack_albedo_unorm8x4(self.packed_albedo)
+    }
+
+    /// Re-pack `albedo` into `packed_albedo`, preserving the reserved
+    /// material-flags byte.
+    pub fn set_albedo(&mut self, albedo: [f32; 3]) {
+        self.packed_albedo = pack_albedo_unorm8x4(albedo, self.material_flags());
+    }
+
+    /// Reserved material-flags byte (`packed_albedo` bits 24..32).
+    pub fn material_flags(&self) -> u8 {
+        (self.packed_albedo >> 24) as u8
+    }
+
+    /// Write the material-flags byte, preserving packed rgb.
+    pub fn set_material_flags(&mut self, flags: u8) {
+        self.packed_albedo =
+            (self.packed_albedo & 0x00ff_ffff) | (u32::from(flags) << 24);
+    }
+}
+
+/// Octahedral-encode a (not necessarily unit) direction into two
+/// `unorm16` lanes packed in one `u32`. The lower hemisphere folds onto
+/// the upper octahedron face; degenerate inputs pack as `+Y`. Quantizing
+/// at 16 bits per axis keeps the worst-case angular error near 3e-5 rad —
+/// two orders of magnitude below `snorm8`.
+pub fn pack_normal_octahedral(normal: [f32; 3]) -> u32 {
+    let len = (normal[0] * normal[0] + normal[1] * normal[1] + normal[2] * normal[2]).sqrt();
+    let (x, y, z) = if len.is_finite() && len > 1.0e-12 {
+        (normal[0] / len, normal[1] / len, normal[2] / len)
+    } else {
+        (0.0, 1.0, 0.0)
+    };
+    // Project onto the octahedron: divide by the L1 norm, then fold the
+    // lower hemisphere over the diagonal edges.
+    let inv_l1 = (x.abs() + y.abs() + z.abs()).recip();
+    let (mut ex, mut ey) = (x * inv_l1, y * inv_l1);
+    if z < 0.0 {
+        let sx = if ex >= 0.0 { 1.0 } else { -1.0 };
+        let sy = if ey >= 0.0 { 1.0 } else { -1.0 };
+        let folded = ((1.0 - ey.abs()) * sx, (1.0 - ex.abs()) * sy);
+        ex = folded.0;
+        ey = folded.1;
+    }
+    let quantize = |v: f32| -> u32 {
+        ((v.clamp(-1.0, 1.0) * 0.5 + 0.5) * 65535.0).round() as u32 & 0xffff
+    };
+    quantize(ex) | (quantize(ey) << 16)
+}
+
+/// Inverse of [`pack_normal_octahedral`]: decode the two `unorm16` lanes,
+/// unfold the lower hemisphere, and renormalize. A degenerate decoded
+/// vector returns `+Y` so a zeroed vertex still shades sanely.
+pub fn unpack_normal_octahedral(packed: u32) -> [f32; 3] {
+    let ex = (packed & 0xffff) as f32 * (2.0 / 65535.0) - 1.0;
+    let ey = (packed >> 16) as f32 * (2.0 / 65535.0) - 1.0;
+    let mut n = [ex, ey, 1.0 - ex.abs() - ey.abs()];
+    let t = (-n[2]).max(0.0);
+    n[0] += if n[0] >= 0.0 { -t } else { t };
+    n[1] += if n[1] >= 0.0 { -t } else { t };
+    let len = (n[0] * n[0] + n[1] * n[1] + n[2] * n[2]).sqrt();
+    if len.is_finite() && len > 1.0e-12 {
+        [n[0] / len, n[1] / len, n[2] / len]
+    } else {
+        [0.0, 1.0, 0.0]
+    }
+}
+
+/// `unorm8x3` rgb + flags byte (bits 24..32) — the CPU twin of the
+/// vertex shader's `unpack_unorm8_albedo`.
+fn pack_albedo_unorm8x4(albedo: [f32; 3], flags: u8) -> u32 {
+    let quantize = |v: f32| -> u32 {
+        if v.is_finite() {
+            (v.clamp(0.0, 1.0) * 255.0).round() as u32
+        } else {
+            0
+        }
+    };
+    quantize(albedo[0])
+        | (quantize(albedo[1]) << 8)
+        | (quantize(albedo[2]) << 16)
+        | (u32::from(flags) << 24)
+}
+
+/// Unpack the `unorm8x3` albedo bytes of `packed_albedo`.
+fn unpack_albedo_unorm8x4(packed: u32) -> [f32; 3] {
+    [
+        (packed & 0xff) as f32 / 255.0,
+        ((packed >> 8) & 0xff) as f32 / 255.0,
+        ((packed >> 16) & 0xff) as f32 / 255.0,
+    ]
 }
 
 const LIT_VERTEX_ATTRS: [wgpu::VertexAttribute; 5] = [
@@ -55,23 +201,23 @@ const LIT_VERTEX_ATTRS: [wgpu::VertexAttribute; 5] = [
         shader_location: 0,
     },
     wgpu::VertexAttribute {
-        format: wgpu::VertexFormat::Float32x3,
+        format: wgpu::VertexFormat::Uint32,
         offset: 12,
         shader_location: 1,
     },
     wgpu::VertexAttribute {
-        format: wgpu::VertexFormat::Float32x3,
-        offset: 24,
+        format: wgpu::VertexFormat::Uint32,
+        offset: 16,
         shader_location: 2,
     },
     wgpu::VertexAttribute {
         format: wgpu::VertexFormat::Float32x2,
-        offset: 36,
+        offset: 20,
         shader_location: 7,
     },
     wgpu::VertexAttribute {
         format: wgpu::VertexFormat::Uint32,
-        offset: 44,
+        offset: 28,
         shader_location: 8,
     },
 ];
@@ -1230,13 +1376,13 @@ pub fn box_mesh(min: [f32; 3], max: [f32; 3], albedo: [f32; 3]) -> (Vec<TerrainV
     for (normal, corners) in faces {
         let base = vertices.len() as u32;
         for (corner, position) in corners.into_iter().enumerate() {
-            vertices.push(TerrainVertex {
+            vertices.push(TerrainVertex::new(
                 position,
                 normal,
                 albedo,
-                uv: [[0.0, 0.0], [0.0, 1.0], [1.0, 1.0], [1.0, 0.0]][corner],
-                atlas_index: u32::MAX,
-            });
+                [[0.0, 0.0], [0.0, 1.0], [1.0, 1.0], [1.0, 0.0]][corner],
+                u32::MAX,
+            ));
         }
         indices.extend([base, base + 1, base + 2, base, base + 2, base + 3]);
     }
@@ -1667,8 +1813,8 @@ struct AtlasRects { rects: array<SpriteFrame> };
 
 struct LitVertex {
     @location(0) position: vec3<f32>,
-    @location(1) normal: vec3<f32>,
-    @location(2) albedo: vec3<f32>,
+    @location(1) packed_normal: u32,
+    @location(2) packed_albedo: u32,
     @location(7) uv: vec2<f32>,
     @location(8) atlas_index: u32,
 };
@@ -1762,6 +1908,30 @@ fn tint_rgb(tint: u32) -> vec3<f32> {
     );
 }
 
+// Octahedral `unorm16x2` normal decode — the exact inverse of the
+// CPU-side `pack_normal_octahedral`: biased unorm16 lanes, lower-
+// hemisphere unfold over the diagonal edges, then renormalize.
+fn unpack_oct_normal(packed: u32) -> vec3<f32> {
+    let ex = f32(packed & 0xffffu) * (2.0 / 65535.0) - 1.0;
+    let ey = f32(packed >> 16u) * (2.0 / 65535.0) - 1.0;
+    var n = vec3<f32>(ex, ey, 1.0 - abs(ex) - abs(ey));
+    let t = max(-n.z, 0.0);
+    n.x += select(t, -t, n.x >= 0.0);
+    n.y += select(t, -t, n.y >= 0.0);
+    return normalize(n);
+}
+
+// `unorm8x3` albedo bytes — the vertex shader's twin of the CPU-side
+// `pack_albedo_unorm8x4` (byte 3 is a material-flags byte the shading
+// model does not consume yet).
+fn unpack_unorm8_albedo(packed: u32) -> vec3<f32> {
+    return vec3<f32>(
+        f32(packed & 0xffu) / 255.0,
+        f32((packed >> 8u) & 0xffu) / 255.0,
+        f32((packed >> 16u) & 0xffu) / 255.0,
+    );
+}
+
 fn lit_emit(
     clip: vec4<f32>,
     world: vec3<f32>,
@@ -1787,12 +1957,12 @@ fn lit_emit(
 @vertex
 fn lit_vs(in: LitVertex) -> LitFragment {
     let world = (draw.model * vec4<f32>(in.position, 1.0)).xyz;
-    let nrm = normalize((draw.model * vec4<f32>(in.normal, 0.0)).xyz);
+    let nrm = normalize((draw.model * vec4<f32>(unpack_oct_normal(in.packed_normal), 0.0)).xyz);
     return lit_emit(
         draw.mvp * vec4<f32>(in.position, 1.0),
         world,
         nrm,
-        in.albedo,
+        unpack_unorm8_albedo(in.packed_albedo),
         0.0,
         in.uv,
         in.atlas_index,
@@ -1803,13 +1973,13 @@ fn lit_vs(in: LitVertex) -> LitFragment {
 @vertex
 fn inst_vs(in: LitVertex, inst: PartInstance) -> LitFragment {
     let local = rotate_euler(in.position * inst.pos_scale.w, inst.rot.xyz);
-    let nrm = rotate_euler(in.normal, inst.rot.xyz);
+    let nrm = rotate_euler(unpack_oct_normal(in.packed_normal), inst.rot.xyz);
     let base = inst.pos_scale.xyz + local;
     let world = (draw.model * vec4<f32>(base, 1.0)).xyz;
     let n_world = normalize((draw.model * vec4<f32>(nrm, 0.0)).xyz);
     let light = f32(max(inst.light_tint.x & 0xfu, (inst.light_tint.x >> 4u) & 0xfu))
         / 15.0;
-    let albedo = in.albedo * tint_rgb(inst.light_tint.y);
+    let albedo = unpack_unorm8_albedo(in.packed_albedo) * tint_rgb(inst.light_tint.y);
     return lit_emit(
         draw.mvp * vec4<f32>(base, 1.0),
         world,
@@ -1876,3 +2046,90 @@ fn lit_fs(in: LitFragment) -> @location(0) vec4<f32> {
     return vec4<f32>(filmic(color), draw.params.y * fade * in.alpha);
 }
 ";
+
+/// `enable f16;` replacement for `COMPOSITE_LIT_WGSL`'s `lit_fs` — the
+/// same half-precision contract `TERRAIN_FRAGMENT_F16_WGSL` applies to
+/// the composed-terrain module: the 64 point-light accumulate
+/// (the per-pixel ALU hot path) runs on `vec3<f16>` accumulators while
+/// light deltas are computed in `f32` and clamped into finite `f16`
+/// range, so an extreme coordinate can never feed `inf` into the
+/// half-precision dot products. Vertex inputs, varyings, ambient/sun
+/// terms, fog mixes and the filmic shoulder stay `f32`; the
+/// `light += vec3<f32>(env.sun.w) * ...` line is kept byte-identical so
+/// the shadow-sampling splice in
+/// [`crate::renderer::composed_shadow_wgsl`] matches both variants.
+const LIT_FRAGMENT_F16_WGSL: &str = r#"
+@fragment
+fn lit_fs(in: LitFragment) -> @location(0) vec4<f32> {
+    let n = normalize(in.normal);
+    let surface = in.albedo * atlas_sample(in.atlas_index, in.uv);
+    var light = env.ambient.rgb * mix(0.55, 1.0, n.y * 0.5 + 0.5)
+        * env.ambient.w;
+    light += vec3<f32>(env.sun.w) * max(dot(n, normalize(env.sun.xyz)), 0.0);
+    light += vec3<f32>(in.light_add);
+    var color = surface * light;
+    let count = min(dyn_lights.light_count.x, 64u);
+    var light16 = vec3<f16>(0.0);
+    let n16 = vec3<f16>(n);
+    let surface16 = vec3<f16>(surface);
+    for (var i = 0u; i < count; i = i + 1u) {
+        let pl = dyn_lights.lights[i];
+        let d16 = vec3<f16>(clamp(
+            pl.position_radius.xyz - in.world,
+            vec3<f32>(-32000.0),
+            vec3<f32>(32000.0),
+        ));
+        let radius = f16(max(pl.position_radius.w, 0.01));
+        let dist_sq = max(dot(d16, d16), f16(0.0001));
+        let dist = sqrt(dist_sq);
+        let falloff = pow(max(f16(1.0) - dist / radius, f16(0.0)), f16(2.0));
+        let diffuse = max(dot(n16, d16 / dist), f16(0.0));
+        light16 += surface16 * vec3<f16>(pl.color_intensity.xyz)
+            * f16(pl.color_intensity.w) * diffuse * falloff;
+    }
+    color += vec3<f32>(light16);
+    color = mix(color, color * env.depth_tint.rgb, env.depth_tint.w);
+    let dist = distance(in.world, frame.camera_pos);
+    let linear = clamp(
+        (dist - frame.fog_start) / max(frame.fog_end - frame.fog_start, 0.001),
+        0.0,
+        1.0,
+    );
+    let expo = 1.0 - exp(-dist * env.atmo.x);
+    color = mix(color, frame.fog_color, clamp(max(linear, expo), 0.0, 1.0));
+    let fade = clamp(draw.params.x, 0.0, 1.0);
+    color = mix(frame.fog_color, color, fade);
+    return vec4<f32>(filmic(color), draw.params.y * fade * in.alpha);
+}
+"#;
+
+/// `COMPOSITE_LIT_WGSL` with `enable f16;` and the half-precision `lit_fs`
+/// — spliced at the fragment entry so the shared prefix (uniforms, the
+/// packed-vertex decoders, all three vertex stages, helpers) is inherited
+/// verbatim and stays strictly `f32`.
+pub fn lit_wgsl_f16() -> String {
+    const ANCHOR: &str = "@fragment\nfn lit_fs(in: LitFragment)";
+    let split = COMPOSITE_LIT_WGSL
+        .find(ANCHOR)
+        .expect("COMPOSITE_LIT_WGSL fragment anchor missing");
+    format!(
+        "enable f16;\n{}{}",
+        &COMPOSITE_LIT_WGSL[..split],
+        LIT_FRAGMENT_F16_WGSL
+    )
+}
+
+/// Capability-gated sub-world lit WGSL, the same gate
+/// [`crate::renderer::terrain_wgsl`] applies to the terrain module: the
+/// `enable f16;` fragment variant when the device granted `SHADER_F16`
+/// ([`crate::renderer::AdapterReport::shader_f16`]), the baseline `f32`
+/// module everywhere else. Both branches feed the same pipeline
+/// signature — vertex buffers, varyings and outputs are identical — so
+/// the fallback is a pure module swap.
+pub fn lit_wgsl(shader_f16: bool) -> Cow<'static, str> {
+    if shader_f16 {
+        Cow::Owned(lit_wgsl_f16())
+    } else {
+        Cow::Borrowed(COMPOSITE_LIT_WGSL)
+    }
+}

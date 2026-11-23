@@ -119,8 +119,8 @@ struct EnvUniforms {
 
 struct LitVertex {
     @location(0) position: vec3<f32>,
-    @location(1) normal: vec3<f32>,
-    @location(2) albedo: vec3<f32>,
+    @location(1) packed_normal: u32,
+    @location(2) packed_albedo: u32,
     @location(7) uv: vec2<f32>,
     @location(8) atlas_index: u32,
 };
@@ -150,26 +150,44 @@ fn rotate_euler(p: vec3<f32>, rot: vec3<f32>) -> vec3<f32> {
     return v;
 }
 
+fn unpack_oct_normal(packed: u32) -> vec3<f32> {
+    let ex = f32(packed & 0xffffu) * (2.0 / 65535.0) - 1.0;
+    let ey = f32(packed >> 16u) * (2.0 / 65535.0) - 1.0;
+    var n = vec3<f32>(ex, ey, 1.0 - abs(ex) - abs(ey));
+    let t = max(-n.z, 0.0);
+    n.x += select(t, -t, n.x >= 0.0);
+    n.y += select(t, -t, n.y >= 0.0);
+    return normalize(n);
+}
+
+fn unpack_unorm8_albedo(packed: u32) -> vec3<f32> {
+    return vec3<f32>(
+        f32(packed & 0xffu) / 255.0,
+        f32((packed >> 8u) & 0xffu) / 255.0,
+        f32((packed >> 16u) & 0xffu) / 255.0,
+    );
+}
+
 @vertex
 fn pack_subworld_vs(in: LitVertex) -> PackFrag {
     var out: PackFrag;
     out.clip = draw.mvp * vec4<f32>(in.position, 1.0);
     out.world = (draw.model * vec4<f32>(in.position, 1.0)).xyz;
-    out.normal = normalize((draw.model * vec4<f32>(in.normal, 0.0)).xyz);
-    out.albedo = in.albedo;
+    out.normal = normalize((draw.model * vec4<f32>(unpack_oct_normal(in.packed_normal), 0.0)).xyz);
+    out.albedo = unpack_unorm8_albedo(in.packed_albedo);
     return out;
 }
 
 @vertex
 fn pack_subworld_inst_vs(in: LitVertex, inst: PartInstance) -> PackFrag {
     let local = rotate_euler(in.position * inst.pos_scale.w, inst.rot.xyz);
-    let nrm = rotate_euler(in.normal, inst.rot.xyz);
+    let nrm = rotate_euler(unpack_oct_normal(in.packed_normal), inst.rot.xyz);
     let base = inst.pos_scale.xyz + local;
     var out: PackFrag;
     out.clip = draw.mvp * vec4<f32>(base, 1.0);
     out.world = (draw.model * vec4<f32>(base, 1.0)).xyz;
     out.normal = normalize((draw.model * vec4<f32>(nrm, 0.0)).xyz);
-    out.albedo = in.albedo;
+    out.albedo = unpack_unorm8_albedo(in.packed_albedo);
     return out;
 }
 

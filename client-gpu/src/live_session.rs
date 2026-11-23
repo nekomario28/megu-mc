@@ -95,7 +95,7 @@ use hw_adaptive_engine::{
     build_unified_optimization_plan, detect_host_hardware_caps,
     detect_universal_hardware_profile, select_compute_strategy, ComputeKernelMode,
     ComputeStrategy, DomainKind, DomainSpecializationPlan, HostHardwareCaps, KernelAutotuner,
-    PagedSectionPool, SpeculativeChunkPrefetcher, UnifiedOptimizationPlan,
+    PagedSectionPool, SpeculativeChunkPrefetcher, SpeculativeState, UnifiedOptimizationPlan,
 };
 use sys_metrics::{sample_host_metrics, CpuSampler, FrameTimingStats};
 
@@ -120,6 +120,24 @@ const OFFTHREAD_SUBMIT_MAX: usize = 8;
 
 const PREFETCH_VIEW_DISTANCE: u32 = 8;
 const PREFETCH_MAX_CHUNKS: usize = 16;
+
+/// Camera-distance subtraction (in blocks) applied per prefetcher
+/// priority rank when the off-thread dirty-section drain orders
+/// candidates: the best forward-cone bet (rank 0) reads `4 * 16 = 64`
+/// blocks closer, the weakest a quarter-block further per rank, so the
+/// speculative heading can reorder the queue but can never starve a
+/// frustum hit behind it. Bounded — the boost cannot exceed
+/// `PREFETCH_MAX_CHUNKS * PREFETCH_BOOST_BLOCKS_PER_RANK`.
+const PREFETCH_BOOST_BLOCKS_PER_RANK: f32 = 4.0;
+
+/// Kernel challenger probe cadence: one poll in
+/// [`KERNEL_PROBE_INTERVAL_POLLS`] dispatches under the alternate
+/// [`ComputeKernelMode`], so [`KernelAutotuner::observe_sample`]
+/// measures a real challenger timing instead of resampling the
+/// incumbent's own clock forever — the 61-poll period is coprime with
+/// the 60 Hz frame cadence and the 50 ms tick cadence so the probe
+/// lands on a different pipeline phase each round.
+const KERNEL_PROBE_INTERVAL_POLLS: u64 = 61;
 
 /// Minimum accumulated frame time between `sample_host_metrics` calls while
 /// the mini-HUD is enabled. The `/proc` + DRM sysfs reads are throttled to
@@ -710,8 +728,8 @@ fn kinetic_push_box(
         for vertex in &mut part_vertices {
             let [x, y, z] = vertex.position;
             vertex.position = [x * cos + z * sin, y, z * cos - x * sin];
-            let [nx, ny, nz] = vertex.normal;
-            vertex.normal = [nx * cos + nz * sin, ny, nz * cos - nx * sin];
+            let [nx, ny, nz] = vertex.normal();
+            vertex.set_normal([nx * cos + nz * sin, ny, nz * cos - nx * sin]);
         }
     }
     let base = vertices.len() as u32;
@@ -731,7 +749,7 @@ fn kinetic_orient_to_axis(vertices: &mut [TerrainVertex], axis: KineticAxis) {
     };
     for vertex in vertices {
         vertex.position = orient(vertex.position);
-        vertex.normal = orient(vertex.normal);
+        vertex.set_normal(orient(vertex.normal()));
     }
 }
 
@@ -1309,6 +1327,19 @@ pub struct LiveSession {
     /// Counted `kernel_autotuner.observe_sample` feeds — proves the
     /// feedback loop actually executes live, not just exists.
     autotuner_sample_count: u64,
+    /// Polls elapsed since the last kernel challenger probe; reaching
+    /// [`KERNEL_PROBE_INTERVAL_POLLS`] arms one poll under the
+    /// alternate [`ComputeKernelMode`].
+    kernel_probe_polls: u64,
+    /// The kernel mode this poll actually dispatches under —
+    /// `kernel_autotuner.selected_mode()` on ordinary polls, the
+    /// challenger mode during a probe. `observe_sample` credits the
+    /// executed mode, never the incumbent by default, so challenger
+    /// observations can actually flip `selected`.
+    executed_kernel_mode: ComputeKernelMode,
+    /// Counted challenger-probe dispatches — proves the probe loop
+    /// executes live, not just exists.
+    kernel_probe_count: u64,
     /// Jain–Chlamtac `P²` streaming frame-time quantiles (136 bytes
     /// each, zero heap): P95 feeds the anti-windup budget PID and the
     /// window's upload-budget edge; P99 is the live 1%-low telemetry.
@@ -1321,11 +1352,18 @@ pub struct LiveSession {
     /// bootstraps its five markers. `mesh_rebuild_budget` multiplies
     /// by this.
     budget_scale: f64,
-    /// Garivier–Moulines discounted-UCB bandit over the four
-    /// render/mesh timing regimes `(kernel_mode << 1) | is_mesh` — fed
-    /// the same real samples the `KernelAutotuner` sees so a regime
-    /// switch (scene density, thermal) is detectable live.
+    /// Garivier–Moulines discounted-UCB bandit over four background
+    /// mesh-drain profiles (`ducb_submit_cap` arm → off-thread
+    /// submission cap). [`Self::poll`] consumes `select_arm` live each
+    /// poll, executes that profile's drain bound, and credits the arm
+    /// with the real frame/mesh timings it produced — so the bandit
+    /// prices profiles by measured outcome and re-explores them when a
+    /// regime switch (scene density, thermal) decays the stale winner.
     ducb: DiscountedUcbAutotuner<4>,
+    /// The drain-profile arm [`Self::poll`] is executing this poll —
+    /// `ducb.select_arm()` consumed live, then fed the timings that
+    /// profile produced.
+    ducb_arm_selected: usize,
     /// Counted `ducb.observe` feeds alongside `autotuner_sample_count`.
     ducb_sample_count: u64,
     /// Unified optimization policy resolved from the detected profile
@@ -1596,6 +1634,9 @@ impl LiveSession {
             } else {
                 ComputeKernelMode::RecomputeSwar
             });
+        // The session dispatches under the seeded mode until the first
+        // challenger probe flips `executed_kernel_mode` for one poll.
+        let seeded_kernel_mode = kernel_autotuner.selected_mode();
         // The unified plan + client domain projections are resolved once
         // at connect and refreshed on every `apply_compute_strategy` push.
         let unified_plan = build_unified_optimization_plan(
@@ -1723,11 +1764,15 @@ impl LiveSession {
             sys_sample_count: 0,
             kernel_autotuner,
             autotuner_sample_count: 0,
+            kernel_probe_polls: 0,
+            executed_kernel_mode: seeded_kernel_mode,
+            kernel_probe_count: 0,
             frame_p2_p95: P2QuantileEstimator::new(0.95),
             frame_p2_p99: P2QuantileEstimator::new(0.99),
             pid_budget: PidBudgetController::new(1_000.0 / 60.0),
             budget_scale: 1.0,
             ducb: DiscountedUcbAutotuner::new(),
+            ducb_arm_selected: 0,
             ducb_sample_count: 0,
             unified_plan,
             domain_hints,
@@ -2149,6 +2194,13 @@ impl LiveSession {
     /// dirty-mesh drain so visible nearby sections mesh first — an empty
     /// slice degrades to pure distance ordering.
     pub fn poll(&mut self, camera_position: [f32; 3], frustum_planes: &[[f32; 4]]) {
+        // Arm the adaptive dispatch decisions before any timed work this
+        // poll: the D-UCB bandit picks the background drain profile it
+        // will be scored on, and the probe cadence may dispatch the
+        // challenger kernel mode so `observe_sample` measures a real
+        // challenger timing — not another sample of the incumbent.
+        self.ducb_arm_selected = self.ducb.select_arm();
+        let kernel_mode = self.dispatch_kernel_mode();
         for _ in 0..32 {
             match self.incoming.try_recv() {
                 Ok(WorkerMessage::Connected) => self.status = SessionStatus::Playing,
@@ -2225,11 +2277,14 @@ impl LiveSession {
                     // into the kernel autotuner — a real timed edge, not
                     // a synthetic sample (`max(1)` guards a sub-ns clock
                     // so `observe_sample` never discards it as empty).
+                    // The sample credits the mode the poll actually
+                    // dispatched under — incumbent or probed challenger —
+                    // and the D-UCB arm whose drain profile ran it.
                     let elapsed_ns =
                         (rebuild_start.elapsed().as_nanos().min(u64::MAX as u128) as u64).max(1);
-                    let mode = self.kernel_autotuner.selected_mode();
-                    self.kernel_autotuner.observe_sample(mode, elapsed_ns);
-                    self.ducb.observe(ducb_arm(mode, true), elapsed_ns);
+                    self.kernel_autotuner
+                        .observe_sample(kernel_mode, elapsed_ns);
+                    self.ducb.observe(self.ducb_arm_selected, elapsed_ns);
                     self.ducb_sample_count += 1;
                     self.autotuner_sample_count += 1;
                 }
@@ -2259,6 +2314,10 @@ impl LiveSession {
             let tactile_active = self.tactile_sim.config().preset.is_active()
                 || !self.tactile_sim.is_empty();
             for _ in 0..elapsed_ticks {
+                // Time each client sim-tick step so the MiniHUD's MSPT/TPS
+                // segments get a live reading — `FrameTimingStats::push_tick`
+                // is the only producer of the tick ring it samples.
+                let tick_start = Instant::now();
                 self.vfx.tick();
                 if ambience_active {
                     self.step_nature_ambience(0.05);
@@ -2267,6 +2326,7 @@ impl LiveSession {
                     self.tactile_sim.step(0.05);
                 }
                 self.world.tick_entities();
+                self.frame_timings.push_tick(tick_start.elapsed());
             }
             self.last_vfx_tick = now;
             let animation_dt = now.duration_since(self.last_animation_tick).as_secs_f32();
@@ -2443,10 +2503,31 @@ impl LiveSession {
         let threads = self.compute_strategy.workers.background_threads;
         let mut order: Vec<SectionCoord> =
             self.offthread_candidates.iter().copied().collect();
-        order.sort_by_key(|&coord| offthread_queue_key(coord, camera_position, frustum_planes));
+        // Speculative prefetcher consumption: pending forward-cone bets
+        // subtract a bounded, rank-scaled distance from the queue key so
+        // sections along the predicted heading drain earlier. Stale
+        // (`CanceledStale`) generations and out-of-cone sections get
+        // nothing — the sort stays `(in-frustum, distance)` otherwise.
+        let prefetch_boosts = self.prefetch_boost_map();
+        order.sort_by_key(|&coord| {
+            let (outside, dist2_bits) =
+                offthread_queue_key(coord, camera_position, frustum_planes);
+            let dist2 = f32::from_bits(dist2_bits as u32);
+            let boost = prefetch_boosts
+                .get(&(coord.0, coord.2))
+                .copied()
+                .unwrap_or(0.0);
+            let boosted = (dist2.sqrt() - boost).max(0.0);
+            (outside, (boosted * boosted).to_bits() as u64)
+        });
+        // The D-UCB bandit's selected drain profile bounds this poll's
+        // submissions: conservative through burst, all bounded by
+        // `ducb_submit_cap` so a saturated queue still leaves the tail
+        // to the inline lane next poll.
+        let submit_cap = ducb_submit_cap(self.ducb_arm_selected);
         let mut submitted = 0usize;
         for coord in order {
-            if submitted >= OFFTHREAD_SUBMIT_MAX {
+            if submitted >= submit_cap {
                 break;
             }
             if !self.section_mesh_lane.can_submit(coord) {
@@ -3283,6 +3364,56 @@ impl LiveSession {
         );
     }
 
+    /// Pick the kernel mode this poll dispatches under: the autotuner's
+    /// `selected` on ordinary polls, the alternate mode once every
+    /// [`KERNEL_PROBE_INTERVAL_POLLS`] polls. The challenger probe is
+    /// what lets `observe_sample` enter its challenger-evaluation block
+    /// at all — feeding it only `selected_mode()` kept every challenger
+    /// statistic at zero samples forever. The dispatched mode is
+    /// recorded in `executed_kernel_mode` so the frame-time feed in
+    /// `record_frame_and_refresh_minihud` credits the same arm the poll
+    /// ran.
+    fn dispatch_kernel_mode(&mut self) -> ComputeKernelMode {
+        self.kernel_probe_polls = self.kernel_probe_polls.wrapping_add(1);
+        let mode = if self.kernel_probe_polls >= KERNEL_PROBE_INTERVAL_POLLS {
+            self.kernel_probe_polls = 0;
+            self.kernel_probe_count = self.kernel_probe_count.wrapping_add(1);
+            match self.kernel_autotuner.selected_mode() {
+                ComputeKernelMode::LutBatch => ComputeKernelMode::RecomputeSwar,
+                ComputeKernelMode::RecomputeSwar => ComputeKernelMode::LutBatch,
+            }
+        } else {
+            self.kernel_autotuner.selected_mode()
+        };
+        self.executed_kernel_mode = mode;
+        mode
+    }
+
+    /// Pending [`SpeculativeChunkPrefetcher`] bets as
+    /// `(chunk_x, chunk_z) -> camera-distance boost in blocks`, the
+    /// consumption side of `prefetcher.entries()` the dirty-section
+    /// drain applies: sections on the predicted movement heading read
+    /// up to `PREFETCH_MAX_CHUNKS * PREFETCH_BOOST_BLOCKS_PER_RANK`
+    /// blocks closer in the queue ordering, scaled by the entry's own
+    /// priority rank. `CanceledStale` entries and duplicate bets resolve
+    /// to the strongest surviving boost.
+    fn prefetch_boost_map(&self) -> BTreeMap<(i32, i32), f32> {
+        let mut boosts: BTreeMap<(i32, i32), f32> = BTreeMap::new();
+        for entry in self.prefetcher.entries() {
+            if !matches!(entry.state, SpeculativeState::Pending) {
+                continue;
+            }
+            let rank = entry.priority.min(PREFETCH_MAX_CHUNKS as u32) as usize;
+            let boost =
+                (PREFETCH_MAX_CHUNKS - rank) as f32 * PREFETCH_BOOST_BLOCKS_PER_RANK;
+            boosts
+                .entry((entry.cx, entry.cz))
+                .and_modify(|b| *b = b.max(boost))
+                .or_insert(boost);
+        }
+        boosts
+    }
+
     fn update_audio_listener(&mut self) {
         if let Some(pose) = self.pose {
             // Dedicated mix thread: stream the pose over the lock-free
@@ -3932,6 +4063,17 @@ impl LiveSession {
         // bootstraps, shrinking under sustained frame-time pressure)
         // throttles the foreground rebuild allowance.
         let scaled = (base as f64 * self.budget_scale).ceil() as usize;
+        // The dispatched kernel mode is a real scheduling knob, not just
+        // a label: `LutBatch` is the coalesced-batch profile — the full
+        // scaled budget rebuilds inline this poll — while
+        // `RecomputeSwar` is the low-latency streaming profile — a
+        // bounded inline slice with the tail handed to the off-thread
+        // lane, the same trade the recompute-vs-table choice makes in
+        // the kernel itself.
+        let scaled = match self.executed_kernel_mode {
+            ComputeKernelMode::LutBatch => scaled,
+            ComputeKernelMode::RecomputeSwar => (scaled / 4).max(1),
+        };
         scaled.max(1).min(self.governor_rebuild_cap)
     }
 
@@ -3984,6 +4126,27 @@ impl LiveSession {
         self.kernel_autotuner.selected_mode()
     }
 
+    /// The kernel mode the current/last poll actually dispatched under —
+    /// `selected_mode()` on ordinary polls, the challenger mode on
+    /// probe polls. Differs from [`Self::active_kernel_mode`] exactly
+    /// when a challenger measurement is in flight.
+    pub fn executed_kernel_mode(&self) -> ComputeKernelMode {
+        self.executed_kernel_mode
+    }
+
+    /// Counted challenger-probe dispatches — how many polls have run
+    /// under the alternate kernel mode for real measurement.
+    pub fn kernel_probe_count(&self) -> u64 {
+        self.kernel_probe_count
+    }
+
+    /// The `MeshJob::SectionMesh` submission cap the selected drain
+    /// profile applies this poll — the runtime knob `select_arm`
+    /// actually steers.
+    pub fn offthread_submit_cap(&self) -> usize {
+        ducb_submit_cap(self.ducb_arm_selected)
+    }
+
     /// Autotuner state for diagnostics/tests.
     pub fn kernel_autotuner(&self) -> &KernelAutotuner {
         &self.kernel_autotuner
@@ -4013,10 +4176,11 @@ impl LiveSession {
         self.budget_scale
     }
 
-    /// The discounted-UCB bandit's current arm over the four
-    /// `(kernel_mode << 1) | is_mesh` render/mesh regimes.
+    /// The discounted-UCB drain-profile arm the current/last poll
+    /// executed — `ducb.select_arm()` consumed live on the scheduling
+    /// loop, then fed the timings that profile produced.
     pub fn ducb_selected_arm(&self) -> usize {
-        self.ducb.select_arm()
+        self.ducb_arm_selected
     }
 
     /// Counted `ducb.observe` feeds — frame-time and mesh-batch samples.
@@ -4048,14 +4212,17 @@ impl LiveSession {
         self.frame_p2_p95.observe(frame_ms);
         self.frame_p2_p99.observe(frame_ms);
         // Feed the adaptive kernel autotuner real frame-time feedback; the
-        // controller discards out-of-range samples itself.
+        // controller discards out-of-range samples itself. The sample
+        // credits the mode the poll actually dispatched under — during a
+        // challenger probe that is the probed arm, not the incumbent.
         let frame_ns = (f64::from(frame_dt_sec) * 1_000_000_000.0) as u64;
-        let kernel_mode = self.kernel_autotuner.selected_mode();
+        let kernel_mode = self.executed_kernel_mode;
         self.kernel_autotuner.observe_sample(kernel_mode, frame_ns);
         self.autotuner_sample_count += 1;
-        // The discounted-UCB bandit tracks the same real sample on its
-        // render-regime arm so a kernel that turned slow is detected.
-        self.ducb.observe(ducb_arm(kernel_mode, false), frame_ns);
+        // The discounted-UCB bandit prices the drain profile this poll
+        // actually ran — `select_arm` in `poll` picked it, this frame's
+        // measured cost scores it.
+        self.ducb.observe(self.ducb_arm_selected, frame_ns);
         self.ducb_sample_count += 1;
         // Anti-windup PID consumes the streaming P95 once the five-marker
         // bootstrap lands; `mesh_rebuild_budget` multiplies by the scale.
@@ -4094,6 +4261,8 @@ impl LiveSession {
         let hud = &mut ui.hud.mini_hud_data;
         hud.fps = telemetry.fps;
         hud.fps_one_percent_low = telemetry.fps_one_percent_low;
+        hud.mspt = telemetry.mspt;
+        hud.tps = telemetry.tps;
         hud.ram_used_mib = telemetry.ram_used_mib;
         hud.ram_total_mib = telemetry.ram_total_mib;
         hud.cpu_percent = telemetry.cpu_percent;
@@ -5712,15 +5881,21 @@ fn offthread_queue_key(
     )
 }
 
-/// Map the live kernel-autotuner mode plus the measurement path onto
-/// one of the four D-UCB regime arms: bit 1 is `ComputeKernelMode`, bit
-/// 0 marks a mesh-batch (vs render-frame) sample.
-fn ducb_arm(mode: ComputeKernelMode, mesh_batch: bool) -> usize {
-    let mode_bit = match mode {
-        ComputeKernelMode::LutBatch => 0usize,
-        ComputeKernelMode::RecomputeSwar => 1,
-    };
-    (mode_bit << 1) | usize::from(mesh_batch)
+/// The off-thread `MeshJob::SectionMesh` submission cap the
+/// [`DiscountedUcbAutotuner`] drain-profile `arm` applies for a poll —
+/// the production consumption of `select_arm`: arm 0 is the
+/// conservative profile (quarter-rate background drain, lightest
+/// main-thread burst), arm 1 the balanced default
+/// ([`OFFTHREAD_SUBMIT_MAX`]), arms 2 and 3 the aggressive and burst
+/// profiles. Bounded at `4×` the steady cap so a runaway bandit can
+/// never flood the worker queue ahead of the inline lane.
+const fn ducb_submit_cap(arm: usize) -> usize {
+    match arm {
+        0 => OFFTHREAD_SUBMIT_MAX / 4,
+        1 => OFFTHREAD_SUBMIT_MAX,
+        2 => OFFTHREAD_SUBMIT_MAX * 2,
+        _ => OFFTHREAD_SUBMIT_MAX * 4,
+    }
 }
 
 /// Best-effort harvest-tool family from a registry block id — the
@@ -8144,5 +8319,146 @@ mod tests {
         assert_eq!(live.client_view_distance, 12);
         live.resend_client_information(12); // second identical call no-ops
         assert!(rx.try_recv().is_err());
+    }
+
+    // ------------------------------------------------------------------
+    // L7 math/feedback wiring proofs: challenger probing, drain-profile
+    // steering, prefetch boost, and live tick telemetry.
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn kernel_probe_dispatches_challenger_and_switches_on_real_timings() {
+        let (mut live, _tx) = session();
+        let selected = live.active_kernel_mode();
+        let challenger = match selected {
+            ComputeKernelMode::LutBatch => ComputeKernelMode::RecomputeSwar,
+            ComputeKernelMode::RecomputeSwar => ComputeKernelMode::LutBatch,
+        };
+
+        // Ordinary polls dispatch the incumbent mode.
+        for _ in 0..KERNEL_PROBE_INTERVAL_POLLS - 1 {
+            assert_eq!(live.dispatch_kernel_mode(), selected);
+        }
+        assert_eq!(live.kernel_probe_count(), 0);
+        // Every interval-th poll arms a single challenger dispatch so the
+        // non-selected arm receives real measurements.
+        assert_eq!(live.dispatch_kernel_mode(), challenger);
+        assert_eq!(live.executed_kernel_mode(), challenger);
+        assert_eq!(live.kernel_probe_count(), 1);
+        assert_eq!(live.dispatch_kernel_mode(), selected);
+        assert_eq!(live.executed_kernel_mode(), selected);
+
+        // The switch can only ever happen because probes feed challenger
+        // timings: consistently faster challenger samples flip the
+        // selection after four qualifying observations.
+        for _ in 0..8 {
+            live.kernel_autotuner.observe_sample(selected, 20_000_000);
+            live.kernel_autotuner.observe_sample(challenger, 2_000_000);
+        }
+        assert_eq!(
+            live.active_kernel_mode(),
+            challenger,
+            "consistently faster challenger timings must flip selected_mode"
+        );
+    }
+
+    #[test]
+    fn executed_kernel_mode_drives_rebuild_budget_profile() {
+        let (mut live, _tx) = session();
+        live.executed_kernel_mode = ComputeKernelMode::LutBatch;
+        let batched = live.mesh_rebuild_budget();
+        live.executed_kernel_mode = ComputeKernelMode::RecomputeSwar;
+        let streaming = live.mesh_rebuild_budget();
+        assert!(batched >= 1 && streaming >= 1);
+        assert!(
+            streaming < batched,
+            "RecomputeSwar = low-latency slice: {streaming} < {batched}"
+        );
+    }
+
+    #[test]
+    fn poll_consumes_ducb_select_arm_as_drain_profile() {
+        let (mut live, _tx) = session();
+        let mut ui = megu_ui::state::UiState::new();
+        // Untried arms win lowest-first; each poll selects the next arm
+        // and the submit cap follows the selected drain profile.
+        let mut caps = Vec::new();
+        for _ in 0..4 {
+            live.poll([8.0, 20.0, 24.0], &[]);
+            caps.push((live.ducb_selected_arm(), live.offthread_submit_cap()));
+            live.record_frame_and_refresh_minihud(1.0 / 60.0, &mut ui);
+        }
+        assert_eq!(
+            caps,
+            vec![(0, 2), (1, 8), (2, 16), (3, 32)],
+            "select_arm must steer the off-thread submission cap each poll"
+        );
+    }
+
+    #[test]
+    fn prefetch_boost_map_prioritizes_predicted_heading_cone() {
+        let (mut live, _tx) = session();
+        live.pose = Some(PlayerPose {
+            feet: [0.0, 70.0, 0.0],
+            yaw: 0.0,
+            pitch: 0.0,
+        });
+        live.last_motion_delta = [4.0, 0.0]; // moving +X
+        live.refresh_prefetcher();
+        let boosts = live.prefetch_boost_map();
+        assert!(
+            !boosts.is_empty(),
+            "a clear heading must emit forward-cone prefetch entries"
+        );
+        assert!(
+            boosts.keys().all(|&(cx, _)| cx > 0),
+            "every boosted chunk lies in the +X heading cone: {boosts:?}"
+        );
+        let max_boost = boosts.values().copied().fold(0.0f32, f32::max);
+        assert!(
+            max_boost > 0.0
+                && max_boost <= PREFETCH_MAX_CHUNKS as f32 * PREFETCH_BOOST_BLOCKS_PER_RANK,
+            "boosts stay bounded, got {max_boost}"
+        );
+
+        // A heading reversal cancels the stale entries and emits the new
+        // cone only — stale generations never produce a boost.
+        live.last_motion_delta = [-4.0, 0.0];
+        live.refresh_prefetcher();
+        let boosted = live.prefetch_boost_map();
+        assert!(
+            boosted.keys().all(|&(cx, _)| cx < 0),
+            "after reversal every boost must point -X: {boosted:?}"
+        );
+    }
+
+    #[test]
+    fn live_ticks_feed_mspt_and_tps_telemetry() {
+        let (mut live, _tx) = session();
+        assert_eq!(live.frame_timings.tick_count(), 0);
+
+        live.last_vfx_tick = Instant::now() - Duration::from_millis(150);
+        live.poll([8.0, 20.0, 24.0], &[]);
+        assert!(
+            live.frame_timings.tick_count() > 0,
+            "poll must push one tick sample per elapsed 50 ms step"
+        );
+        assert!(
+            live.frame_timings.mspt_avg() > 0.0,
+            "recorded tick durations must average above zero"
+        );
+        assert!(
+            live.frame_timings.tps_avg() > 0.0,
+            "a live mspt gives a positive TPS estimate"
+        );
+
+        // The samples must flow into the MiniHUD copy path as well.
+        let mut ui = megu_ui::state::UiState::new();
+        ui.settings.qol.mini_hud.enabled = true;
+        live.record_frame_and_refresh_minihud(1.0 / 60.0, &mut ui);
+        assert!(
+            ui.hud.mini_hud_data.mspt.is_some() && ui.hud.mini_hud_data.tps.is_some(),
+            "live tick samples must reach MiniHUD mspt/tps"
+        );
     }
 }

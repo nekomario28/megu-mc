@@ -62,7 +62,7 @@ use crate::mesh_pool::{
 use crate::subworld_render::{
     pack_particle_billboard, CompositeDrawUniforms, CompositeEnvUniforms, DebugLineVertex,
     ParticleBillboardPack, ParticleInstance, SubWorldGpuCache, SubWorldRenderBank, TerrainVertex,
-    VfxLightsGpu, COMPOSITE_LIT_WGSL, COMPOSITE_TERRAIN_WGSL, DEBUG_LINE_VERTEX_LAYOUT,
+    lit_wgsl, VfxLightsGpu, COMPOSITE_TERRAIN_WGSL, DEBUG_LINE_VERTEX_LAYOUT,
     DEBUG_LINE_WGSL, DRAW_UNIFORM_STRIDE, LIT_VERTEX_LAYOUT, PARTICLE_BILLBOARD_CORNERS,
     PARTICLE_BILLBOARD_INDICES, PARTICLE_INSTANCE_LAYOUT, PARTICLE_QUAD_LAYOUT,
     PART_INSTANCE_LAYOUT,
@@ -2756,13 +2756,13 @@ fn append_dynamic_quad(
     }
     let base = vertices.len() as u32;
     for corner in 0..4 {
-        vertices.push(TerrainVertex {
-            position: positions[corner],
+        vertices.push(TerrainVertex::new(
+            positions[corner],
             normal,
-            albedo: tint.map(|v| v.clamp(0.0, 1.0)),
-            uv: uv[corner],
-            atlas_index: u32::MAX,
-        });
+            tint.map(|v| v.clamp(0.0, 1.0)),
+            uv[corner],
+            u32::MAX,
+        ));
     }
     indices.extend_from_slice(&[base, base + 1, base + 2, base, base + 2, base + 3]);
     true
@@ -4371,7 +4371,7 @@ impl ShadowGpu {
         let lit_module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("shadowed-lit"),
             source: wgpu::ShaderSource::Wgsl(Cow::Owned(composed_shadow_wgsl(
-                COMPOSITE_LIT_WGSL,
+                lit_wgsl(ctx.report.shader_f16).as_ref(),
                 false,
             ))),
         });
@@ -6271,7 +6271,7 @@ impl GpuRenderer {
         });
         let lit_module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("composite-lit"),
-            source: wgpu::ShaderSource::Wgsl(Cow::Borrowed(COMPOSITE_LIT_WGSL)),
+            source: wgpu::ShaderSource::Wgsl(lit_wgsl(ctx.report.shader_f16)),
         });
 
         let composite_pipeline =

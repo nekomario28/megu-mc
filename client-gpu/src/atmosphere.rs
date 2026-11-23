@@ -509,13 +509,13 @@ pub fn voxel_clouds_to_geometry(
             ];
             let base = vertices.len() as u32;
             for (corner, &position) in corners.iter().enumerate() {
-                vertices.push(TerrainVertex {
+                vertices.push(TerrainVertex::new(
                     position,
-                    normal: *normal,
+                    *normal,
                     albedo,
-                    uv: [[0.0, 0.0], [0.0, 1.0], [1.0, 1.0], [1.0, 0.0]][corner],
-                    atlas_index: u32::MAX,
-                });
+                    [[0.0, 0.0], [0.0, 1.0], [1.0, 1.0], [1.0, 0.0]][corner],
+                    u32::MAX,
+                ));
             }
             indices.extend([base, base + 1, base + 2, base, base + 2, base + 3]);
         }
@@ -556,15 +556,15 @@ pub fn extruded_mesh_to_geometry(
         });
         let base = vertices.len() as u32;
         for (&position, &uv) in quad.positions.iter().zip(quad.uv.iter()) {
-            vertices.push(TerrainVertex {
+            vertices.push(TerrainVertex::new(
                 position,
-                normal: quad.normal,
+                quad.normal,
                 albedo,
                 uv,
                 // ExtrudedMesh has UVs but no texture identifier. Callers
                 // can select a sprite on the returned vertices.
-                atlas_index: u32::MAX,
-            });
+                u32::MAX,
+            ));
         }
         indices.extend([base, base + 1, base + 2, base, base + 2, base + 3]);
     }
