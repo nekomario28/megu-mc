@@ -588,7 +588,12 @@ mod entity_spatial_tests {
         let mut budget = ChunkSendBudget::new(2);
         for chunk in [(0, 0), (1, 0), (-1, 0), (0, 1), (5, 5), (1, 0)] { budget.enqueue(chunk); }
         assert_eq!(budget.drain_tick((0, 0), 1, (1.0, 0.0)), vec![(0, 0), (1, 0)]);
-        assert_eq!(budget.drain_tick((1, 0), 1, (1.0, 0.0)), vec![(0, 1)]);
+        // The scheduling cull retains the documented radius+1 bounding
+        // window; (-1, 0) is still inside it after moving the center to (1, 0).
+        assert_eq!(
+            budget.drain_tick((1, 0), 1, (1.0, 0.0)),
+            vec![(0, 1), (-1, 0)]
+        );
         assert!(budget.drain_tick((1, 0), 1, (1.0, 0.0)).is_empty());
     }
 

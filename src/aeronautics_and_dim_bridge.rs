@@ -72,6 +72,18 @@ fn register_hidden_block_names(names: impl IntoIterator<Item = impl AsRef<str>>)
                 state_ids.push(st);
             }
         }
+    } else {
+        // Clean-room exports omit the generated full state registry. Keep
+        // anti-xray useful for vanilla blocks whose canonical default state
+        // IDs are still available through the checked-in name table. Modded
+        // names remain recorded by the owning bridge until their registry is
+        // available; `name_to_state` returns None for those names.
+        state_ids.extend(
+            wanted
+                .iter()
+                .filter(|name| name.starts_with("minecraft:"))
+                .filter_map(|name| name_to_state(name)),
+        );
     }
     if let Ok(offload) = mod_offload_bridge().lock() {
         for name in &wanted {

@@ -647,6 +647,16 @@ impl ModOffloadBridge {
     /// world edits committed into the live world through the CAS path, and the
     /// exact carry grants into anti-cheat.
     fn step_tick(&mut self, tick: u64) -> BridgeTickOutput {
+        self.step_tick_with_actor_query(tick, None)
+    }
+
+    /// Actor-query injection keeps the bridge integration test hermetic when
+    /// the generated vanilla registry is absent from a clean-room checkout.
+    fn step_tick_with_actor_query(
+        &mut self,
+        tick: u64,
+        actor_query: Option<&dyn ContraptionWorldQuery>,
+    ) -> BridgeTickOutput {
         self.ticks_stepped += 1;
         let mut out = BridgeTickOutput::default();
 
@@ -693,7 +703,10 @@ impl ModOffloadBridge {
         for id in self.offload.assembly_ids().collect::<Vec<_>>() {
             let Some(report) = self.with_contraption(id, |contraption| {
                 let dim = contraption.dim;
-                contraption.step_actors(&LiveModWorldQuery { dim })
+                match actor_query {
+                    Some(query) => contraption.step_actors(query),
+                    None => contraption.step_actors(&LiveModWorldQuery { dim }),
+                }
             }) else {
                 continue;
             };
@@ -1870,6 +1883,17 @@ mod mod_offload_bridge_tests {
     #[test]
     fn mega_w3_offload_bridge_applies_contraption_world_edits_and_steps_parallel_deterministically()
     {
+        struct StoneTargets(Vec<[i32; 3]>);
+        impl ContraptionWorldQuery for StoneTargets {
+            fn cell_at(&self, pos: [i32; 3]) -> ActorCell {
+                if self.0.contains(&pos) {
+                    ActorCell::block("minecraft:stone", true)
+                } else {
+                    ActorCell::air()
+                }
+            }
+        }
+
         let _w = world_guard();
         let reg = core_create_registry(DEFAULT_BASE_STATE_ID);
         let shaft = reg.default_state("create:shaft").unwrap();
@@ -1887,6 +1911,7 @@ mod mod_offload_bridge_tests {
         ];
         let targets: Vec<[i32; 3]> =
             anchors.iter().map(|a| [a[0] - 1, a[1], a[2]]).collect();
+        let actor_query = StoneTargets(targets.clone());
         let plant = |targets: &[[i32; 3]]| {
             for &t in targets {
                 let old = block_at_dim(dim, t[0], t[1], t[2]);
@@ -1929,7 +1954,7 @@ mod mod_offload_bridge_tests {
         // Serial pass: the drill edits must reach the live world — nothing is
         // discarded any more.
         let mut serial = build(1);
-        let out = serial.step_tick(1);
+        let out = serial.step_tick_with_actor_query(1, Some(&actor_query));
         assert!(out.error.is_none(), "offload step refused: {:?}", out.error);
         assert_eq!(out.world_block_edits.len(), 3);
         assert_eq!(serial.world_block_edits_applied, 3);
@@ -1945,7 +1970,7 @@ mod mod_offload_bridge_tests {
         // exact same edit stream and digest.
         plant(&targets);
         let mut parallel = build(8);
-        let par_out = parallel.step_tick(1);
+        let par_out = parallel.step_tick_with_actor_query(1, Some(&actor_query));
         assert!(par_out.error.is_none(), "offload step refused: {:?}", par_out.error);
         assert_eq!(par_out.world_block_edits, out.world_block_edits);
         assert_eq!(par_out.digest, out.digest);

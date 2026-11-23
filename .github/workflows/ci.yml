@@ -142,7 +142,7 @@ jobs:
           cargo check --locked --features neoforge-events
           cargo check --locked --features create-offload
           cargo check --locked --features mod-suite
-          cargo test --locked --features mod-suite,create-offload --bin megu --no-run
+          cargo test --locked --features mod-suite,create-offload --bin megu -- --test-threads=1
           cargo build --locked --features mod-suite,create-offload --bin megu
           cargo build --locked --manifest-path mod-adapter-core/Cargo.toml --bin megu-mod-check
           cargo build --locked --manifest-path client-app/Cargo.toml --bin megu-client
