@@ -16,7 +16,7 @@ pub(crate) trait World {
 
 /// Placement family used by `NaturalSpawner` when checking a generated creature.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) enum CreaturePlacement { Ground, Water, Air }
+pub(crate) enum CreaturePlacement { Ground, Water, Lava, Air }
 
 #[derive(Clone, Debug, PartialEq)]
 pub(crate) struct CreatureSpawnerData {
@@ -28,9 +28,10 @@ pub(crate) struct CreatureSpawnerData {
 
 /// World queries needed by the initial chunk-generation creature pass.
 pub(crate) trait ChunkGenerationWorld {
-    fn spawn_y(&mut self, x: i32, z: i32) -> i32;
+    fn spawn_y(&mut self, kind: &str, x: i32, z: i32) -> i32;
     fn ground_spawnable(&mut self, kind: &str, pos: Pos) -> bool;
     fn water_spawnable(&mut self, kind: &str, pos: Pos) -> bool;
+    fn lava_spawnable(&mut self, kind: &str, pos: Pos) -> bool;
     fn air_spawnable(&mut self, kind: &str, pos: Pos) -> bool;
     fn add_creature(&mut self, kind: &str, pos: Pos);
 }
@@ -41,6 +42,7 @@ fn creature_placement(kind: &str) -> CreaturePlacement {
         | "minecraft:pufferfish" | "minecraft:squid" | "minecraft:glow_squid"
         | "minecraft:dolphin" | "minecraft:turtle" | "minecraft:axolotl"
         | "minecraft:guardian" | "minecraft:elder_guardian" => CreaturePlacement::Water,
+        "minecraft:strider" => CreaturePlacement::Lava,
         "minecraft:bat" | "minecraft:parrot" => CreaturePlacement::Air,
         _ => CreaturePlacement::Ground,
     }
@@ -83,10 +85,11 @@ pub(crate) fn spawn_mobs_for_chunk_generation(
         for _ in 0..count {
             x += random.next_bound(5) - 2;
             z += random.next_bound(5) - 2;
-            let pos = (x, world.spawn_y(x, z), z);
+            let pos = (x, world.spawn_y(&entry.kind, x, z), z);
             let accepted = match creature_placement(&entry.kind) {
                 CreaturePlacement::Ground => world.ground_spawnable(&entry.kind, pos),
                 CreaturePlacement::Water => world.water_spawnable(&entry.kind, pos),
+                CreaturePlacement::Lava => world.lava_spawnable(&entry.kind, pos),
                 CreaturePlacement::Air => world.air_spawnable(&entry.kind, pos),
             };
             if accepted { world.add_creature(&entry.kind, pos); }

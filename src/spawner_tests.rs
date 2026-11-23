@@ -10,12 +10,15 @@ struct ChunkCreatureScene {
 }
 
 impl ChunkGenerationWorld for ChunkCreatureScene {
-    fn spawn_y(&mut self, _: i32, _: i32) -> i32 { 72 }
+    fn spawn_y(&mut self, _: &str, _: i32, _: i32) -> i32 { 72 }
     fn ground_spawnable(&mut self, kind: &str, pos: Pos) -> bool {
         self.checks.push((CreaturePlacement::Ground, kind.to_owned(), pos)); self.accept
     }
     fn water_spawnable(&mut self, kind: &str, pos: Pos) -> bool {
         self.checks.push((CreaturePlacement::Water, kind.to_owned(), pos)); self.accept
+    }
+    fn lava_spawnable(&mut self, kind: &str, pos: Pos) -> bool {
+        self.checks.push((CreaturePlacement::Lava, kind.to_owned(), pos)); self.accept
     }
     fn air_spawnable(&mut self, kind: &str, pos: Pos) -> bool {
         self.checks.push((CreaturePlacement::Air, kind.to_owned(), pos)); self.accept
@@ -70,6 +73,62 @@ fn chunk_generation_creature_probability_gates_and_checks_ground_placement() {
     assert!(!rejected.checks.is_empty());
     assert!(rejected.checks.iter().all(|(family, _, _)| *family == CreaturePlacement::Ground));
     assert!(rejected.spawned.is_empty());
+}
+
+#[test]
+fn chunk_generation_spawns_nether_creature_table_and_keeps_end_monsters_out() {
+    let _guard = crate::world_guard();
+    let nether_spawners = |biome: &str, category: &str| {
+        assert_eq!(category, "creature");
+        assert_eq!(biome, "minecraft:nether_wastes");
+        vec![CreatureSpawnerData {
+            kind: "minecraft:strider".to_owned(),
+            min_count: 1,
+            max_count: 2,
+            weight: 60,
+        }]
+    };
+    let mut nether = ChunkCreatureScene { accept: true, ..Default::default() };
+    let seed = seed_passing(0.9);
+    let mut rng = Lcg::new(seed);
+    let mut serial_reference = ChunkCreatureScene { accept: true, ..Default::default() };
+    let mut reference_rng = Lcg::new(seed);
+    spawn_mobs_for_chunk_generation(
+        -3, 5, "minecraft:nether_wastes", Some(0.9), nether_spawners, &mut nether, &mut rng,
+    );
+    spawn_mobs_for_chunk_generation(
+        -3,
+        5,
+        "minecraft:nether_wastes",
+        Some(0.9),
+        nether_spawners,
+        &mut serial_reference,
+        &mut reference_rng,
+    );
+    assert!(!nether.spawned.is_empty());
+    assert_eq!(nether.spawned, serial_reference.spawned);
+    assert_eq!(nether.checks, serial_reference.checks);
+    assert_eq!(rng.state48(), reference_rng.state48());
+    assert!(nether.spawned.iter().all(|(kind, _)| kind == "minecraft:strider"));
+    assert!(!nether.checks.is_empty());
+    assert!(nether.checks.iter().all(|(placement, kind, _)| {
+        *placement == CreaturePlacement::Lava && kind == "minecraft:strider"
+    }));
+
+    // Vanilla 1.21.1 `the_end` has no CREATURE entries. Its Endermen are in
+    // MONSTER, which spawnMobsForChunkGeneration does not query.
+    let end_spawners = |biome: &str, category: &str| {
+        assert_eq!(biome, "minecraft:the_end");
+        assert_eq!(category, "creature");
+        Vec::new()
+    };
+    let mut end = ChunkCreatureScene { accept: true, ..Default::default() };
+    let mut end_rng = Lcg::new(seed_passing(0.9));
+    spawn_mobs_for_chunk_generation(
+        7, -2, "minecraft:the_end", Some(0.9), end_spawners, &mut end, &mut end_rng,
+    );
+    assert!(end.spawned.is_empty());
+    assert!(end.checks.is_empty());
 }
 
 fn compound(values: impl IntoIterator<Item = (&'static str, Tag)>) -> Tag {

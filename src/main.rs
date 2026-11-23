@@ -2052,7 +2052,20 @@ struct LiveChunkGenWorld {
 }
 
 impl spawner::ChunkGenerationWorld for LiveChunkGenWorld {
-    fn spawn_y(&mut self, x: i32, z: i32) -> i32 {
+    fn spawn_y(&mut self, kind: &str, x: i32, z: i32) -> i32 {
+        if kind == "minecraft:strider" {
+            if let Some(lava) = breg().and_then(|reg| {
+                let state = reg.state_of("minecraft:lava", None);
+                (reg.name_of(state) == "minecraft:lava").then_some(state)
+            }) {
+                let top = self.dim.min_y() + self.dim.height();
+                if let Some(y) = (self.dim.min_y()..top).rev().find(|&y| {
+                    block_at_dim(self.dim, x, y, z) == lava
+                }) {
+                    return y;
+                }
+            }
+        }
         let base = if self.dim == DimId::Overworld {
             breg()
                 .and_then(|reg| find_passive_ground_y(reg, x, z))
@@ -2102,6 +2115,12 @@ impl spawner::ChunkGenerationWorld for LiveChunkGenWorld {
     fn water_spawnable(&mut self, _kind: &str, pos: (i32, i32, i32)) -> bool {
         breg().is_some_and(|reg| {
             reg.name_of(block_at_dim(self.dim, pos.0, pos.1, pos.2)) == "minecraft:water"
+        })
+    }
+
+    fn lava_spawnable(&mut self, _kind: &str, pos: (i32, i32, i32)) -> bool {
+        breg().is_some_and(|reg| {
+            reg.name_of(block_at_dim(self.dim, pos.0, pos.1, pos.2)) == "minecraft:lava"
         })
     }
 
@@ -2177,24 +2196,39 @@ fn live_chunkgen_run(dim: DimId, cx: i32, cz: i32, probability: Option<f32>) -> 
     true
 }
 
-/// First-visit creature herds for the Overworld chunks players can see. Each
-/// chunk runs `spawn_mobs_for_chunk_generation` once; `doMobSpawning` gates
-/// the pass inside `live_chunkgen_run`.
+/// First-visit creature herds for visible chunks in each vanilla dimension.
+/// Each dimension+chunk runs `spawn_mobs_for_chunk_generation` once;
+/// `doMobSpawning` gates the pass inside `live_chunkgen_run`.
 fn spawn_chunkgen_creatures(_tick: u64) {
-    let mut chunks = HashSet::new();
+    let mut overworld_chunks = HashSet::new();
+    let mut other_dimension_chunks: HashMap<DimId, HashSet<(i32, i32)>> = HashMap::new();
     for client in client_snapshot() {
-        if client.is_spectator() || *client.dim.lock().unwrap_or_else(|e| e.into_inner()) != DimId::Overworld {
+        if client.is_spectator() {
             continue;
         }
+        let dim = *client.dim.lock().unwrap_or_else(|e| e.into_inner());
         let (x, _, z, ..) = *client.pos.lock().unwrap_or_else(|e| e.into_inner());
+        let chunks = if dim == DimId::Overworld {
+            &mut overworld_chunks
+        } else {
+            other_dimension_chunks.entry(dim).or_default()
+        };
         extend_chunk_square(
-            &mut chunks,
+            chunks,
             ((x.floor() as i32).div_euclid(16), (z.floor() as i32).div_euclid(16)),
             4,
         );
     }
-    for (cx, cz) in chunks {
+    // Keep the historical Overworld iteration and per-chunk path intact.
+    for (cx, cz) in overworld_chunks {
         live_chunkgen_visit(DimId::Overworld, cx, cz);
+    }
+    for dim in [DimId::Nether, DimId::End] {
+        if let Some(chunks) = other_dimension_chunks.remove(&dim) {
+            for (cx, cz) in chunks {
+                live_chunkgen_visit(dim, cx, cz);
+            }
+        }
     }
 }
 
