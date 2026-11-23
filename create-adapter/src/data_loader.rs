@@ -42,22 +42,33 @@ pub enum CreateRecipeKind {
 
 impl CreateRecipeKind {
     pub fn from_type_str(value: &str) -> Option<Self> {
-        match value {
-            "create:pressing" => Some(Self::Pressing),
-            "create:mixing" => Some(Self::Mixing),
-            "create:milling" => Some(Self::Milling),
-            "create:crushing" => Some(Self::Crushing),
-            "create:cutting" => Some(Self::Cutting),
-            "create:compacting" => Some(Self::Compacting),
-            "create:splashing" => Some(Self::Splashing),
-            "create:haunting" => Some(Self::Haunting),
-            "create:filling" => Some(Self::Filling),
-            "create:emptying" => Some(Self::Emptying),
-            "create:deploying" => Some(Self::Deploying),
-            "create:item_application" => Some(Self::ItemApplication),
-            "create:sandpaper_polishing" => Some(Self::SandpaperPolishing),
-            "create:mechanical_crafting" => Some(Self::MechanicalCrafting),
-            "create:sequenced_assembly" => Some(Self::SequencedAssembly),
+        let (namespace, path) = value.split_once(':')?;
+        // Create's standard processing serializers are reused by third-party
+        // addons under their own namespaces. Only the serializer path is
+        // fixed; a valid namespace must still be present.
+        if namespace.is_empty()
+            || !namespace
+                .bytes()
+                .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b"_.-".contains(&b))
+        {
+            return None;
+        }
+        match path {
+            "pressing" => Some(Self::Pressing),
+            "mixing" => Some(Self::Mixing),
+            "milling" => Some(Self::Milling),
+            "crushing" => Some(Self::Crushing),
+            "cutting" => Some(Self::Cutting),
+            "compacting" => Some(Self::Compacting),
+            "splashing" => Some(Self::Splashing),
+            "haunting" => Some(Self::Haunting),
+            "filling" => Some(Self::Filling),
+            "emptying" => Some(Self::Emptying),
+            "deploying" => Some(Self::Deploying),
+            "item_application" => Some(Self::ItemApplication),
+            "sandpaper_polishing" => Some(Self::SandpaperPolishing),
+            "mechanical_crafting" => Some(Self::MechanicalCrafting),
+            "sequenced_assembly" => Some(Self::SequencedAssembly),
             _ => None,
         }
     }
@@ -278,7 +289,7 @@ pub(crate) fn load_mod_data_from_zip(
     Ok((data, scanned))
 }
 
-/// `create:mechanical_crafting` recipes declare `key`/`pattern`/`result`
+/// `<namespace>:mechanical_crafting` recipes declare `key`/`pattern`/`result`
 /// instead of `ingredients`, so the universal [`parse_mod_recipe_json`]
 /// shape check drops them. Recover them here by folding pattern-symbol
 /// usage into input stacks, mirroring the generic parser's item/tag
@@ -292,14 +303,13 @@ fn recover_grid_recipes(
         let parts: Vec<&str> = entry_name.split('/').collect();
         if parts.len() < 4
             || parts[0] != "data"
-            || parts[1] != "create"
             || (parts[2] != "recipe" && parts[2] != "recipes")
         {
             continue;
         }
         let stem = parts[3..].join("/");
         let stem = stem.strip_suffix(".json").unwrap_or(&stem);
-        let name = format!("create:{stem}");
+        let name = format!("{}:{stem}", parts[1]);
         if data.recipes.iter().any(|r| r.name == name) {
             continue;
         }
@@ -307,9 +317,11 @@ fn recover_grid_recipes(
         let Some(obj) = root.as_object() else {
             continue;
         };
-        let recipe_type = obj.get("type").and_then(JsonValue::as_str);
+        let Some(recipe_type) = obj.get("type").and_then(JsonValue::as_str) else {
+            continue;
+        };
         if !matches!(
-            recipe_type.and_then(CreateRecipeKind::from_type_str),
+            CreateRecipeKind::from_type_str(recipe_type),
             Some(CreateRecipeKind::MechanicalCrafting)
         ) {
             continue;
@@ -325,7 +337,7 @@ fn recover_grid_recipes(
             .map_or(0, |id| id + 1);
         data.recipes.push(ParsedModRecipe {
             name,
-            recipe_type: "create:mechanical_crafting".into(),
+            recipe_type: recipe_type.into(),
             recipe: Recipe { id: next_id, ..recipe },
         });
     }
@@ -423,22 +435,32 @@ pub fn load_from_directory(
     ids: &mut ItemFluidIdTable,
 ) -> Result<LoadedCreateData, DataLoadError> {
     let mut data = load_mod_directory(root, ids)?;
-    recover_grid_recipes(&collect_create_recipe_files(root), &mut data, ids)?;
+    recover_grid_recipes(&collect_recipe_files(root), &mut data, ids)?;
     Ok(filter_create_data(data))
 }
 
-/// Read `data/create/recipe(s)/**` payloads from a datapack directory so
+/// Read `data/<namespace>/recipe(s)/**` payloads from a datapack directory so
 /// [`recover_grid_recipes`] can apply the same JAR-parity fixups.
-fn collect_create_recipe_files(root: &Path) -> Vec<(String, Vec<u8>)> {
+fn collect_recipe_files(root: &Path) -> Vec<(String, Vec<u8>)> {
     let mut out = Vec::new();
-    for category in ["recipe", "recipes"] {
-        let dir = root.join("data").join("create").join(category);
-        collect_recipe_dir(&dir, &dir, &mut out);
+    if let Ok(namespaces) = std::fs::read_dir(root.join("data")) {
+        for entry in namespaces.flatten() {
+            if !entry.file_type().is_ok_and(|kind| kind.is_dir()) {
+                continue;
+            }
+            let namespace = entry.file_name().to_string_lossy().into_owned();
+            for category in ["recipe", "recipes"] {
+                let dir = entry.path().join(category);
+                let prefix = format!("data/{namespace}/{category}");
+                collect_recipe_dir(&dir, &dir, &prefix, &mut out);
+            }
+        }
     }
+    out.sort_by(|a, b| a.0.cmp(&b.0));
     out
 }
 
-fn collect_recipe_dir(dir: &Path, base: &Path, out: &mut Vec<(String, Vec<u8>)>) {
+fn collect_recipe_dir(dir: &Path, base: &Path, prefix: &str, out: &mut Vec<(String, Vec<u8>)>) {
     let Ok(entries) = std::fs::read_dir(dir) else {
         return;
     };
@@ -448,11 +470,11 @@ fn collect_recipe_dir(dir: &Path, base: &Path, out: &mut Vec<(String, Vec<u8>)>)
             continue;
         };
         if kind.is_dir() {
-            collect_recipe_dir(&path, base, out);
+            collect_recipe_dir(&path, base, prefix, out);
         } else if kind.is_file() && path.extension().is_some_and(|ext| ext == "json") {
             if let (Ok(rel), Ok(payload)) = (path.strip_prefix(base), std::fs::read(&path)) {
                 out.push((
-                    format!("data/create/recipe/{}", rel.to_string_lossy().replace('\\', "/")),
+                    format!("{prefix}/{}", rel.to_string_lossy().replace('\\', "/")),
                     payload,
                 ));
             }

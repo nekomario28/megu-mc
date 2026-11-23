@@ -1620,9 +1620,14 @@ impl CreateAddonProfile {
                 profile.kinetic_sources.push(KineticSourceSpec {
                     id,
                     base_rpm: json_f64(o, "rpm").unwrap_or(32.0) as i32,
-                    stress_capacity: json_f64(o, "capacity").unwrap_or(512.0),
+                    stress_capacity: json_f64(o, "capacity")
+                        .or_else(|| json_f64(o, "stress_capacity"))
+                        .unwrap_or(512.0),
                     axis: axis_from_name(
-                        o.get("axis").and_then(JsonValue::as_str).unwrap_or("y"),
+                        o.get("axis")
+                            .or_else(|| o.get("facing"))
+                            .and_then(JsonValue::as_str)
+                            .unwrap_or("y"),
                     ),
                 });
             }
@@ -1635,7 +1640,9 @@ impl CreateAddonProfile {
                 let o = json_obj(item, "kinetic_consumers entry")?;
                 profile.kinetic_consumers.push(KineticConsumerSpec {
                     id: json_str(o, "id")?.to_string(),
-                    stress_impact: json_f64(o, "impact").unwrap_or(4.0),
+                    stress_impact: json_f64(o, "impact")
+                        .or_else(|| json_f64(o, "stress_impact"))
+                        .unwrap_or(4.0),
                     min_rpm: json_f64(o, "min_rpm").unwrap_or(0.0),
                 });
             }
@@ -2063,8 +2070,8 @@ pub fn discover_create_addon_profile(mod_id: &str, data: &LoadedModData) -> Crea
 
     let mut classes: BTreeMap<String, DiscoveredClass> = BTreeMap::new();
     // Seed from every blockstate file under this namespace.
-    for id in profile.block_properties.keys() {
-        classes.insert(id.clone(), classify_path(id_path(id)));
+    for (id, properties) in &profile.block_properties {
+        classes.insert(id.clone(), classify_properties(properties, id_path(id)));
     }
     // Fold in tag members: `data/<ns>/tags/block/*.json` and `tags/blocks/*`.
     for (tag, members) in &data.tags {
@@ -2079,7 +2086,11 @@ pub fn discover_create_addon_profile(mod_id: &str, data: &LoadedModData) -> Crea
             if !member.starts_with(&format!("{mod_id}:")) {
                 continue;
             }
-            let member_class = classify_path(id_path(member));
+            let member_class = profile
+                .block_properties
+                .get(member)
+                .map(|props| classify_properties(props, id_path(member)))
+                .unwrap_or_else(|| classify_path(id_path(member)));
             // A classifying tag (e.g. `<ns>:propellers`) is curated addon
             // intent and beats the bare name heuristic; a generic tag name
             // falls back to the member's own name class.
@@ -2094,18 +2105,23 @@ pub fn discover_create_addon_profile(mod_id: &str, data: &LoadedModData) -> Crea
 
     let mut spec = PropulsionSpec::aeronautics_default();
     for (id, class) in classes {
+        let props = profile.block_properties.get(&id).map(Vec::as_slice).unwrap_or(&[]);
         match class {
             DiscoveredClass::Source => {
                 profile.kinetic_sources.push(KineticSourceSpec {
                     id,
-                    base_rpm: 64,
-                    stress_capacity: 512.0,
-                    axis: Axis::Y,
+                    base_rpm: single_property_value(props, "rpm")
+                        .and_then(|value| value.parse::<i32>().ok())
+                        .filter(|&rpm| rpm > 0)
+                        .unwrap_or(64),
+                    stress_capacity: positive_property_f64(props, "stress_capacity")
+                        .unwrap_or(512.0),
+                    axis: property_axis(props).unwrap_or(Axis::Y),
                 });
             }
             DiscoveredClass::Consumer => profile.kinetic_consumers.push(KineticConsumerSpec {
                 id,
-                stress_impact: 4.0,
+                stress_impact: positive_property_f64(props, "stress_impact").unwrap_or(4.0),
                 min_rpm: 1.0,
             }),
             DiscoveredClass::Processor => {
@@ -2120,7 +2136,7 @@ pub fn discover_create_addon_profile(mod_id: &str, data: &LoadedModData) -> Crea
                     .collect();
                 profile.kinetic_consumers.push(KineticConsumerSpec {
                     id: id.clone(),
-                    stress_impact: 4.0,
+                    stress_impact: positive_property_f64(props, "stress_impact").unwrap_or(4.0),
                     min_rpm: 1.0,
                 });
                 if !recipe_types.is_empty() {
@@ -2132,7 +2148,7 @@ pub fn discover_create_addon_profile(mod_id: &str, data: &LoadedModData) -> Crea
                 profile.offload.blocks.push(BlockDef {
                     id: id.clone(),
                     properties: Vec::new(),
-                    load_factor: 4.0,
+                    load_factor: positive_property_f64(props, "stress_impact").unwrap_or(4.0),
                     capacity_factor: 0.0,
                     role: UniversalBlockRole::Processor,
                 });
@@ -2238,6 +2254,51 @@ pub fn discover_create_addon_profile(mod_id: &str, data: &LoadedModData) -> Crea
 
 fn id_path(id: &str) -> &str {
     id.split_once(':').map(|(_, p)| p).unwrap_or(id)
+}
+
+/// Kinetic property values are usable as fixed simulation coefficients only
+/// when the blockstate declares exactly one value. Variable speed/stress
+/// properties remain in the registry for state conversion without guessing a
+/// single coefficient from one arbitrary state.
+fn single_property_value<'a>(props: &'a [PropertyDef], name: &str) -> Option<&'a str> {
+    props
+        .iter()
+        .find(|prop| prop.name == name && prop.values.len() == 1)
+        .map(|prop| prop.values[0].as_str())
+}
+
+fn positive_property_f64(props: &[PropertyDef], name: &str) -> Option<f64> {
+    single_property_value(props, name)
+        .and_then(|value| value.parse::<f64>().ok())
+        .filter(|value| value.is_finite() && *value > 0.0)
+}
+
+fn property_axis(props: &[PropertyDef]) -> Option<Axis> {
+    single_property_value(props, "axis")
+        .and_then(Axis::from_name)
+        .or_else(|| match single_property_value(props, "facing")? {
+            "east" | "west" => Some(Axis::X),
+            "up" | "down" => Some(Axis::Y),
+            "north" | "south" => Some(Axis::Z),
+            _ => None,
+        })
+}
+
+fn classify_properties(props: &[PropertyDef], path: &str) -> DiscoveredClass {
+    let name_class = classify_path(path);
+    if positive_property_f64(props, "stress_capacity").is_some()
+        || single_property_value(props, "rpm")
+            .and_then(|value| value.parse::<i32>().ok())
+            .is_some_and(|rpm| rpm > 0)
+    {
+        DiscoveredClass::Source
+    } else if positive_property_f64(props, "stress_impact").is_some()
+        && name_class == DiscoveredClass::Decorative
+    {
+        DiscoveredClass::Consumer
+    } else {
+        name_class
+    }
 }
 
 /// Match an addon recipe type path to its processing block path by Create's
@@ -2567,7 +2628,11 @@ fn json_f64(obj: &BTreeMap<String, JsonValue>, key: &str) -> Option<f64> {
 }
 
 fn axis_from_name(name: &str) -> Axis {
-    Axis::from_name(name).unwrap_or(Axis::Y)
+    Axis::from_name(name).unwrap_or(match name {
+        "east" | "west" => Axis::X,
+        "north" | "south" => Axis::Z,
+        _ => Axis::Y,
+    })
 }
 
 // ---------------------------------------------------------------------------
