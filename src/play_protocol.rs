@@ -7555,7 +7555,10 @@ fn tick_portal(me: &Arc<Client>, view: i32) -> bool {
     if *me.in_portal.lock().unwrap_or_else(|e| e.into_inner()) {
         return false; // arrival guard: wait until the player leaves the portal block
     }
-    *me.in_portal.lock().unwrap_or_else(|e| e.into_inner()) = true;
+    // `in_portal` is set only by `enter_portal` — it is the arrival guard, not
+    // a "seen portal" latch. Setting it on detection would short-circuit the
+    // delay branch below on every later call, so a nonzero survival delay
+    // could never complete.
     let creative = *me.gm.lock().unwrap_or_else(|e| e.into_inner()) != 0;
     // `playersNetherPortalDefaultDelay` (survival, 80 GT = 4 s) and
     // `playersNetherPortalCreativeDelay` (creative/spectator, 1 GT ≈ instant)
@@ -11076,12 +11079,10 @@ fn handle_inner(mut s: TcpStream, live_eid: Arc<AtomicI32>) {
                     drop(p);
                     drop(teleport);
                     landing::player_move(&me, prev_gnd);
-                    // P2-3-S4: standing in a portal resps the dimension switch. The guard
-                    // lives on the player, so arriving in a destination portal does not
-                    // immediately trigger the return trip.
-                    if tick_portal(&me, view) {
-                        continue;
-                    }
+                    // Portal waits advance on the game tick (vanilla
+                    // `handleInsidePortal`), not on movement packets — a player
+                    // standing still in a portal must still transit, and a
+                    // single caller keeps the arrival guard race-free.
                     // A vertical move inside the same chunk window still crosses the
                     // occlusion hysteresis (descending into a cave); the lane flip
                     // re-sends held chunks in the new lane. The window pump below

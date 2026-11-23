@@ -1147,6 +1147,20 @@ fn environment_time_tick() {
             tickprof::add("env/effects_loop", t.elapsed());
         }
     }
+    // Portal waits advance on the game tick like vanilla `handleInsidePortal`:
+    // a player standing still inside a portal block must still complete the
+    // survival delay and switch dimensions — movement packets only feed the
+    // position the check reads.
+    {
+        let __tloop = __prof.then(std::time::Instant::now);
+        for c in env_clients.iter() {
+            let view = *c.view.lock().unwrap_or_else(|e| e.into_inner());
+            tick_portal(c, view);
+        }
+        if let Some(t) = __tloop {
+            tickprof::add("env/portal_wait", t.elapsed());
+        }
+    }
     {
         if let Some(t) = __t {
             tickprof::add("env/plates", t.elapsed());
