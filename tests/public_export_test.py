@@ -139,9 +139,18 @@ def test_export(from_worktree):
                      'website/app.js', 'website/style.css',
                      'website/check_site.py'):
             assert (out / path).is_file(), path
-        # No generated (*_1211*) or local-state (world_overlay*.bin*) artifact may
-        # be left anywhere in the exported tree.
-        generated = [p for p in out.rglob('*_1211*') if '.git' not in p.parts]
+        # No generated (*_1211*) data asset or local-state (world_overlay*.bin*)
+        # artifact may be left in the exported tree. First-party Python/doc
+        # tooling outside assets/ and tests/data/ (e.g. score_1211_features.py)
+        # is clean-room source code, not generated data.
+        generated = [
+            p for p in out.rglob('*_1211*')
+            if '.git' not in p.parts and (
+                p.relative_to(out).parts[:1] == ('assets',)
+                or p.relative_to(out).parts[:2] == ('tests', 'data')
+                or p.suffix not in ('.py', '.md')
+            )
+        ]
         assert not generated, generated[:5]
         assert not list(out.rglob('world_overlay*.bin*')), 'world_overlay artifact exported'
         check_docs(out)
