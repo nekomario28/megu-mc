@@ -1094,19 +1094,14 @@ const DWAL_HEADER_LEN: usize = 16;
 /// Smallest possible frame: header + crc32(4).
 const DWAL_FRAME_MIN: usize = DWAL_HEADER_LEN + 4;
 
-/// Reflected IEEE 802.3 CRC-32 (poly 0xEDB88320) over every part in order.
-/// Table-free: frames are small and rare next to a full world save.
+/// Reflected IEEE 802.3 CRC-32 (poly 0xEDB88320) over every part in order,
+/// via the canonical table-driven primitive. `crc32_ieee_update` takes and
+/// returns finalized CRCs, so folding the parts in order is identical to
+/// hashing their concatenation.
 fn crc32_ieee_parts(parts: &[&[u8]]) -> u32 {
-    let mut crc = 0xffff_ffffu32;
-    for part in parts {
-        for &byte in part.iter() {
-            crc ^= u32::from(byte);
-            for _ in 0..8 {
-                crc = (crc >> 1) ^ (0xedb8_8320 & 0u32.wrapping_sub(crc & 1));
-            }
-        }
-    }
-    !crc
+    parts.iter().fold(0u32, |crc, part| {
+        megu_core::hash::crc32_ieee_update(crc, part)
+    })
 }
 
 /// Reject `..`, NUL and control characters in operator-controlled data paths so

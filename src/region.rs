@@ -30,27 +30,6 @@
 // output bit. Two equal trees always fingerprint equal; a single flipped
 // payload bit changes the fingerprint with overwhelming probability.
 
-const ANVIL_FNV_OFFSET: u64 = 0xcbf2_9ce4_8422_2325;
-const ANVIL_FNV_PRIME: u64 = 0x0000_0100_0000_01b3;
-
-fn anvil_fnv_mix(h: &mut u64, byte: u8) {
-    *h = (*h ^ u64::from(byte)).wrapping_mul(ANVIL_FNV_PRIME);
-}
-
-fn anvil_fnv_bytes(h: &mut u64, bytes: &[u8]) {
-    for &b in bytes {
-        anvil_fnv_mix(h, b);
-    }
-}
-
-fn anvil_fnv_u32(h: &mut u64, v: u32) {
-    anvil_fnv_bytes(h, &v.to_be_bytes());
-}
-
-fn anvil_fnv_u64(h: &mut u64, v: u64) {
-    anvil_fnv_bytes(h, &v.to_be_bytes());
-}
-
 /// Splitmix64 avalanche: decorrelates the FNV state into every output bit.
 fn anvil_fingerprint_final(mut z: u64) -> u64 {
     z = (z ^ (z >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
@@ -58,53 +37,56 @@ fn anvil_fingerprint_final(mut z: u64) -> u64 {
     z ^ (z >> 31)
 }
 
-fn anvil_nbt_fingerprint_into(tag: &AnvilNbt, h: &mut u64) {
-    anvil_fnv_mix(h, tag.id());
+fn anvil_nbt_fingerprint_into(tag: &AnvilNbt, h: &mut megu_core::hash::Fnv1a64) {
+    // Lengths and integers feed in big-endian order, the same order the NBT
+    // wire itself carries; `Fnv1a64::update_*` helpers are little-endian, so
+    // every integer goes through `update` on `to_be_bytes` explicitly.
+    h.update_u8(tag.id());
     match tag {
         AnvilNbt::End => {}
-        AnvilNbt::Byte(v) => anvil_fnv_mix(h, *v as u8),
-        AnvilNbt::Short(v) => anvil_fnv_bytes(h, &v.to_be_bytes()),
-        AnvilNbt::Int(v) => anvil_fnv_bytes(h, &v.to_be_bytes()),
-        AnvilNbt::Long(v) => anvil_fnv_u64(h, *v as u64),
-        AnvilNbt::Float(v) => anvil_fnv_u32(h, *v),
-        AnvilNbt::Double(v) => anvil_fnv_u64(h, *v),
+        AnvilNbt::Byte(v) => h.update_u8(*v as u8),
+        AnvilNbt::Short(v) => h.update(&v.to_be_bytes()),
+        AnvilNbt::Int(v) => h.update(&v.to_be_bytes()),
+        AnvilNbt::Long(v) => h.update(&v.to_be_bytes()),
+        AnvilNbt::Float(v) => h.update(&v.to_be_bytes()),
+        AnvilNbt::Double(v) => h.update(&v.to_be_bytes()),
         AnvilNbt::ByteArray(v) => {
-            anvil_fnv_u32(h, v.len() as u32);
-            anvil_fnv_bytes(h, v);
+            h.update(&(v.len() as u32).to_be_bytes());
+            h.update(v);
         }
         AnvilNbt::String(s) => {
-            anvil_fnv_u32(h, s.0.len() as u32);
+            h.update(&(s.0.len() as u32).to_be_bytes());
             for &unit in &s.0 {
-                anvil_fnv_bytes(h, &unit.to_be_bytes());
+                h.update(&unit.to_be_bytes());
             }
         }
         AnvilNbt::List(kind, items) => {
-            anvil_fnv_mix(h, *kind);
-            anvil_fnv_u32(h, items.len() as u32);
+            h.update_u8(*kind);
+            h.update(&(items.len() as u32).to_be_bytes());
             for item in items {
                 anvil_nbt_fingerprint_into(item, h);
             }
         }
         AnvilNbt::Compound(fields) => {
-            anvil_fnv_u32(h, fields.len() as u32);
+            h.update(&(fields.len() as u32).to_be_bytes());
             for (key, value) in fields {
-                anvil_fnv_u32(h, key.0.len() as u32);
+                h.update(&(key.0.len() as u32).to_be_bytes());
                 for &unit in &key.0 {
-                    anvil_fnv_bytes(h, &unit.to_be_bytes());
+                    h.update(&unit.to_be_bytes());
                 }
                 anvil_nbt_fingerprint_into(value, h);
             }
         }
         AnvilNbt::IntArray(v) => {
-            anvil_fnv_u32(h, v.len() as u32);
+            h.update(&(v.len() as u32).to_be_bytes());
             for &x in v {
-                anvil_fnv_bytes(h, &x.to_be_bytes());
+                h.update(&x.to_be_bytes());
             }
         }
         AnvilNbt::LongArray(v) => {
-            anvil_fnv_u32(h, v.len() as u32);
+            h.update(&(v.len() as u32).to_be_bytes());
             for &x in v {
-                anvil_fnv_u64(h, x as u64);
+                h.update(&x.to_be_bytes());
             }
         }
     }
@@ -114,18 +96,16 @@ fn anvil_nbt_fingerprint_into(tag: &AnvilNbt, h: &mut u64) {
 /// `anvil_persisted_hashes` compares a would-be save against.
 #[allow(dead_code)]
 fn anvil_nbt_fingerprint(tag: &AnvilNbt) -> u64 {
-    let mut h = ANVIL_FNV_OFFSET;
+    let mut h = megu_core::hash::Fnv1a64::new();
     anvil_nbt_fingerprint_into(tag, &mut h);
-    anvil_fingerprint_final(h)
+    anvil_fingerprint_final(h.finish())
 }
 
 /// The same fingerprint over an already-serialized byte payload (a gzip
 /// member, a framed file) — for callers whose content arrives as bytes.
 #[allow(dead_code)]
 fn anvil_bytes_fingerprint(bytes: &[u8]) -> u64 {
-    let mut h = ANVIL_FNV_OFFSET;
-    anvil_fnv_bytes(&mut h, bytes);
-    anvil_fingerprint_final(h)
+    anvil_fingerprint_final(megu_core::hash::fnv1a64(bytes))
 }
 
 /// The identity of one persisted chunk record: world directory + dimension +

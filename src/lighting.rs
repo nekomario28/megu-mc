@@ -448,15 +448,16 @@ impl LightingChunk {
     }
 
     /// One section of one light kind, packed low-nibble-first exactly as the
-    /// wire carries it. Snapshot entries and update payloads share this form.
+    /// wire carries it — the canonical [`megu_core::bits::LightArray`]
+    /// layout. Snapshot entries and update payloads share this form.
     fn pack_section(&self, kind: LightKind, section: usize) -> [u8; 2048] {
         let base = section << 12;
-        let mut out = [0u8; 2048];
-        for (j, byte) in out.iter_mut().enumerate() {
+        let mut out = megu_core::bits::LightArray::new_zero();
+        for (j, byte) in out.as_bytes_mut().iter_mut().enumerate() {
             *byte = self.light_at(kind, base + j * 2)
                 | (self.light_at(kind, base + j * 2 + 1) << 4);
         }
-        out
+        *out.as_bytes()
     }
 
     fn store(&mut self, kind: LightKind, index: usize, level: u8, key: Chunk, snap: &mut SnapLog) {
@@ -985,6 +986,25 @@ impl IncrementalLighting {
                 }
             }
         }
+        // Visit the patch in section-local Z-order: the darken and reseed
+        // passes below would otherwise walk cells in arbitrary BFS order, so
+        // a Morton walk keeps `set_level`/`cell` lookups spatially local.
+        // The passes are order-free — darkening is idempotent and reseeding
+        // reads only settled, non-patch boundary light — so this reorders
+        // work, never results.
+        patch.sort_unstable_by_key(|&p| {
+            let (cx, cz) = p.chunk();
+            (
+                cx,
+                cz,
+                (p.y - self.min_y) >> 4,
+                megu_core::morton::morton3_encode_u4(
+                    (p.x & 15) as u8,
+                    (p.y & 15) as u8,
+                    (p.z & 15) as u8,
+                ),
+            )
+        });
         // Darkening first is essential when an emitter is removed or opacity
         // rises. The surviving external boundary remains valid at distance 15.
         for &p in patch.iter() {
@@ -1113,7 +1133,9 @@ impl IncrementalLighting {
                         &mut update.block_sections,
                     ),
                 };
-                if packed.iter().all(|v| *v == 0) {
+                // The canonical `LightArray` owns the same 2048 packed bytes;
+                // its all-zero check is the wire's empty-mask predicate.
+                if megu_core::bits::LightArray::from_bytes(packed).is_all_zero() {
                     *empty |= bit;
                 } else {
                     *mask |= bit;

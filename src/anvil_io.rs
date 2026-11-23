@@ -284,6 +284,16 @@ fn anvil_bits_for(len: usize, min_bits: u8) -> u8 {
 }
 fn anvil_pack_longs(values: &[u64], bits: u8) -> Vec<i64> {
     debug_assert!((1..=32).contains(&bits));
+    if bits <= 16 {
+        // Canonical non-straddling pack: entries under 17 bits feed through
+        // the shared u16 implementation without loss.
+        let mask = (1u64 << bits) - 1;
+        let values: Vec<u16> = values.iter().map(|&v| (v & mask) as u16).collect();
+        return megu_core::bits::pack_from_u16(&values, bits)
+            .into_iter()
+            .map(|w| w as i64)
+            .collect();
+    }
     let bits = bits as usize;
     let per = 64 / bits;
     let mask = (1u64 << bits) - 1;
@@ -297,14 +307,22 @@ fn anvil_unpack_longs(data: &[i64], bits: u8, count: usize) -> Result<Vec<u64>, 
     if !(1..=32).contains(&bits) {
         return Err(format!("invalid packed-array width {bits}"));
     }
-    let bits = bits as usize;
-    let per = 64 / bits;
+    let per = 64 / bits as usize;
     if data.len() < count.div_ceil(per) {
         return Err(format!(
             "packed array truncated: {} longs for {count} {bits}-bit entries",
             data.len()
         ));
     }
+    if bits <= 16 {
+        // Canonical non-straddling unpack (the 4-bit arm reaches the SIMD
+        // nibble expander); entries under 17 bits read back losslessly.
+        let words: Vec<u64> = data.iter().map(|&w| w as u64).collect();
+        let mut out = vec![0u16; count];
+        megu_core::bits::unpack_to_u16(&words, bits, count, &mut out);
+        return Ok(out.into_iter().map(u64::from).collect());
+    }
+    let bits = bits as usize;
     let mask = (1u64 << bits) - 1;
     Ok((0..count)
         .map(|i| ((data[i / per] as u64) >> ((i % per) * bits)) & mask)
@@ -4752,4 +4770,113 @@ mod anvil_io_tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+}
+
+#[cfg(test)]
+mod anvil_bit_packing_tests {
+    use super::*;
+
+    /// The pre-migration non-straddling loop, kept as the reference that
+    /// pins `anvil_pack_longs`/`anvil_unpack_longs` to identical words on
+    /// every supported width — including the >16 fallback path.
+    fn ref_pack(values: &[u64], bits: u8) -> Vec<i64> {
+        let per = 64 / bits as usize;
+        let mask = (1u64 << bits) - 1;
+        let mut words = vec![0u64; values.len().div_ceil(per)];
+        for (i, &v) in values.iter().enumerate() {
+            words[i / per] |= (v & mask) << ((i % per) * bits as usize);
+        }
+        words.into_iter().map(|w| w as i64).collect()
+    }
+
+    #[test]
+    fn anvil_canonical_pack_unpack_matches_reference_all_widths() {
+        let mut values = vec![0u64; 4096];
+        let mut s = 0x243f_6a88_85a3_08d3u64;
+        for bits in 1u8..=32 {
+            for v in &mut values {
+                s ^= s << 13;
+                s ^= s >> 7;
+                s ^= s << 17;
+                *v = s % (1u64 << bits);
+            }
+            let words = anvil_pack_longs(&values, bits);
+            assert_eq!(
+                words,
+                ref_pack(&values, bits),
+                "bits={bits} packed words differ"
+            );
+            let round = anvil_unpack_longs(&words, bits, 4096).expect("unpack");
+            assert_eq!(round, values, "bits={bits} unpack mismatch");
+            // Spare cells in the last word read back zero, matching the
+            // reference: 4100 values leave room for extras in the tail word.
+            let mut padded = values.clone();
+            padded.extend_from_slice(&[0, 0, 0, 0]);
+            let padded_words = anvil_pack_longs(&padded, bits);
+            let extra = anvil_unpack_longs(&padded_words, bits, 4100).expect("unpack spare");
+            assert_eq!(extra, padded);
+        }
+    }
+
+    #[test]
+    fn anvil_canonical_unpack_still_rejects_bad_widths_and_truncation() {
+        let words = vec![0i64; 64];
+        assert!(anvil_unpack_longs(&words, 0, 8).is_err());
+        assert!(anvil_unpack_longs(&words, 33, 8).is_err());
+        assert!(anvil_unpack_longs(&words[..1], 15, 4096).is_err());
+        assert!(anvil_unpack_longs(&words[..1], 20, 4096).is_err());
+        let empty: Vec<i64> = Vec::new();
+        assert!(anvil_unpack_longs(&empty, 4, 1).is_err());
+    }
+
+    /// The pre-migration FNV-1a-64 loop — the canonical `Fnv1a64`/`fnv1a64`
+    /// calls must agree with it on every byte.
+    fn ref_fnv1a(bytes: &[u8]) -> u64 {
+        let mut h = 0xcbf2_9ce4_8422_2325u64;
+        for &b in bytes {
+            h = (h ^ u64::from(b)).wrapping_mul(0x0000_0100_0000_01b3);
+        }
+        h
+    }
+
+    #[test]
+    fn anvil_fingerprints_match_fnv1a_reference_stream() {
+        for payload in [&b""[..], b"a", b"level.dat", &[0xffu8; 257][..]] {
+            assert_eq!(
+                anvil_bytes_fingerprint(payload),
+                anvil_fingerprint_final(ref_fnv1a(payload)),
+                "byte fingerprint for {payload:?}"
+            );
+        }
+        // A small compound: tag id 10, one field "abc" -> Int(7). The byte
+        // stream below is exactly what the pre-migration traversal fed the
+        // hash — tag ids, big-endian lengths, UTF-16 key units, then values.
+        let mut fields = std::collections::BTreeMap::new();
+        fields.insert(crate::nbt::NbtString::text("abc"), AnvilNbt::Int(7));
+        let tag = AnvilNbt::Compound(fields);
+        let mut stream = vec![10u8];
+        stream.extend_from_slice(&1u32.to_be_bytes());
+        stream.extend_from_slice(&3u32.to_be_bytes());
+        for unit in "abc".encode_utf16() {
+            stream.extend_from_slice(&unit.to_be_bytes());
+        }
+        stream.push(3);
+        stream.extend_from_slice(&7i32.to_be_bytes());
+        assert_eq!(
+            anvil_nbt_fingerprint(&tag),
+            anvil_fingerprint_final(ref_fnv1a(&stream)),
+        );
+        // A list feeds element kind, big-endian length, then each tag.
+        let tag = AnvilNbt::List(3, vec![AnvilNbt::Int(-1), AnvilNbt::Int(2)]);
+        let mut stream = vec![9u8, 3];
+        stream.extend_from_slice(&2u32.to_be_bytes());
+        stream.push(3);
+        stream.extend_from_slice(&(-1i32).to_be_bytes());
+        stream.push(3);
+        stream.extend_from_slice(&2i32.to_be_bytes());
+        assert_eq!(
+            anvil_nbt_fingerprint(&tag),
+            anvil_fingerprint_final(ref_fnv1a(&stream)),
+        );
+    }
 }

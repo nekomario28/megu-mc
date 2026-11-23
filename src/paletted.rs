@@ -44,87 +44,9 @@ pub(crate) const fn is_air_state(st: u32) -> bool {
     matches!(st, 0 | 12958 | 12959)
 }
 
-#[inline]
-const fn words_for_bits(bits: u8) -> usize {
-    match bits {
-        4 => 256,
-        5 => 342,
-        6 => 410,
-        7 => 456,
-        8 => 512,
-        15 => 1024,
-        _ => unreachable!(),
-    }
-}
-
-#[inline(always)]
-fn packed_get<const BITS: usize>(words: &[u64], idx: usize) -> u32 {
-    let per = const { 64 / BITS };
-    let word_idx = idx / per;
-    let slot = idx % per;
-    let mask = const { (1u64 << BITS) - 1 };
-    ((words[word_idx] >> (slot * BITS)) & mask) as u32
-}
-
-#[inline(always)]
-fn packed_set<const BITS: usize>(words: &mut [u64], idx: usize, val: u64) {
-    let per = const { 64 / BITS };
-    let word_idx = idx / per;
-    let slot = idx % per;
-    let shift = slot * BITS;
-    let mask = const { (1u64 << BITS) - 1 };
-    words[word_idx] = (words[word_idx] & !(mask << shift)) | ((val & mask) << shift);
-}
-
-#[inline]
-fn indirect_get_word(bits: u8, words: &[u64], idx: usize) -> usize {
-    match bits {
-        4 => packed_get::<4>(words, idx) as usize,
-        5 => packed_get::<5>(words, idx) as usize,
-        6 => packed_get::<6>(words, idx) as usize,
-        7 => packed_get::<7>(words, idx) as usize,
-        8 => packed_get::<8>(words, idx) as usize,
-        other => unreachable!("invalid indirect palette bits {other}"),
-    }
-}
-
-#[inline]
-fn indirect_set_word(bits: u8, words: &mut [u64], idx: usize, val: u64) {
-    match bits {
-        4 => packed_set::<4>(words, idx, val),
-        5 => packed_set::<5>(words, idx, val),
-        6 => packed_set::<6>(words, idx, val),
-        7 => packed_set::<7>(words, idx, val),
-        8 => packed_set::<8>(words, idx, val),
-        other => unreachable!("invalid indirect palette bits {other}"),
-    }
-}
-
-fn pack_indices_const<const BITS: usize>(indices: &[u8; 4096]) -> Box<[u64]> {
-    let per = const { 64 / BITS };
-    let word_count = const { 4096usize.div_ceil(64 / BITS) };
-    let mut words = vec![0u64; word_count].into_boxed_slice();
-    for (w, chunk) in indices.chunks(per).enumerate() {
-        let mut word = 0u64;
-        for (i, &idx) in chunk.iter().enumerate() {
-            word |= (idx as u64) << (i * BITS);
-        }
-        words[w] = word;
-    }
-    words
-}
-
-fn unpack_all_const<const BITS: usize>(words: &[u64], out: &mut [u8; 4096]) {
-    let per = const { 64 / BITS };
-    let mask = const { (1u64 << BITS) - 1 };
-    for (w, chunk) in out.chunks_mut(per).enumerate() {
-        let mut word = words[w];
-        for dst in chunk.iter_mut() {
-            *dst = (word & mask) as u8;
-            word >>= BITS;
-        }
-    }
-}
+/// Canonical non-straddling accessors: `megu_core::bits` covers every width
+/// `1..=16`, so there is no per-width dispatch to keep in sync — and its
+/// 4-bit bulk unpack reaches the SIMD nibble expander automatically.
 
 /// Decode the packed cells in `[start, end)` into `dst` (length `end - start`).
 /// A word holds `64 / bits` cells and never straddles, so each word emits its
@@ -153,35 +75,18 @@ fn decode_cells<F: Fn(u32) -> u32>(
 }
 
 fn grow_indirect_words(old_bits: u8, old_words: &[u64], new_bits: u8) -> Box<[u64]> {
-    let mut indices = [0u8; 4096];
-    match old_bits {
-        4 => unpack_all_const::<4>(old_words, &mut indices),
-        5 => unpack_all_const::<5>(old_words, &mut indices),
-        6 => unpack_all_const::<6>(old_words, &mut indices),
-        7 => unpack_all_const::<7>(old_words, &mut indices),
-        other => unreachable!("cannot grow from indirect bits {other}"),
-    }
-    match new_bits {
-        5 => pack_indices_const::<5>(&indices),
-        6 => pack_indices_const::<6>(&indices),
-        7 => pack_indices_const::<7>(&indices),
-        8 => pack_indices_const::<8>(&indices),
-        other => unreachable!("cannot grow to indirect bits {other}"),
-    }
+    let mut indices = [0u16; 4096];
+    megu_core::bits::unpack_to_u16(old_words, old_bits, 4096, &mut indices);
+    megu_core::bits::pack_from_u16(&indices, new_bits).into_boxed_slice()
 }
 
 fn promote_indirect8_to_direct(entries: &[u32], old_words: &[u64]) -> Box<[u64]> {
-    let mut indices = [0u8; 4096];
-    unpack_all_const::<8>(old_words, &mut indices);
-    let mut words = vec![0u64; 1024].into_boxed_slice();
-    for (w, chunk) in indices.as_chunks::<4>().0.iter().enumerate() {
-        let mut word = 0u64;
-        for (j, &idx) in chunk.iter().enumerate() {
-            word |= ((entries[idx as usize] as u64) & 0x7fff) << (j * 15);
-        }
-        words[w] = word;
+    let mut values = [0u16; 4096];
+    megu_core::bits::unpack_to_u16(old_words, 8, 4096, &mut values);
+    for v in &mut values {
+        *v = (entries[*v as usize] & 0x7fff) as u16;
     }
-    words
+    megu_core::bits::pack_from_u16(&values, 15).into_boxed_slice()
 }
 
 fn uniform_words(words: &[u64], bits: u8, val: u64) -> bool {
@@ -230,7 +135,7 @@ impl PalettedSection {
         let start = row * uniform.len();
         let i = start + states[start..].iter().position(|&st| st != first).unwrap();
 
-        let mut indices = [0u8; 4096];
+        let mut indices = [0u16; 4096];
         let mut entries = [0u32; 256];
         entries[0] = first;
         let mut entries_len = 1usize;
@@ -239,7 +144,7 @@ impl PalettedSection {
         table[hash_state(first)] = (first as u64) | (1u64 << 32);
 
         let mut prev_st = first;
-        let mut prev_idx = 0u8;
+        let mut prev_idx = 0u16;
         let mut overflow_direct = false;
 
         for idx in i..4096 {
@@ -258,14 +163,14 @@ impl PalettedSection {
                             overflow_direct = true;
                             break 0;
                         }
-                        let new_idx = entries_len as u8;
+                        let new_idx = entries_len as u16;
                         entries[entries_len] = st;
                         entries_len += 1;
                         table[h] = (st as u64) | (((new_idx as u64) + 1) << 32);
                         break new_idx;
                     }
                     if (slot as u32) == st {
-                        break ((slot >> 32) - 1) as u8;
+                        break ((slot >> 32) - 1) as u16;
                     }
                     h = (h + 1) & 511;
                 };
@@ -281,14 +186,7 @@ impl PalettedSection {
 
         if !overflow_direct {
             let bits = ((usize::BITS - (entries_len - 1).leading_zeros()) as u8).max(4);
-            let words = match bits {
-                4 => pack_indices_const::<4>(&indices),
-                5 => pack_indices_const::<5>(&indices),
-                6 => pack_indices_const::<6>(&indices),
-                7 => pack_indices_const::<7>(&indices),
-                8 => pack_indices_const::<8>(&indices),
-                _ => unreachable!(),
-            };
+            let words = megu_core::bits::pack_from_u16(&indices, bits).into_boxed_slice();
             let entries_box = entries[..entries_len].to_vec().into_boxed_slice();
             let mut all_opaque = true;
             let mut has_hidden = false;
@@ -309,22 +207,19 @@ impl PalettedSection {
             };
         }
 
-        let mut words = vec![0u64; 1024].into_boxed_slice();
+        let mut values = [0u16; 4096];
         let mut non_air = 0u16;
         let mut all_opaque = true;
         let mut has_hidden = false;
-        for (w, chunk) in states.as_chunks::<4>().0.iter().enumerate() {
-            let mut word = 0u64;
-            for (j, &st) in chunk.iter().enumerate() {
-                if !is_air_state(st) {
-                    non_air += 1;
-                }
-                all_opaque &= is_opaque(st);
-                has_hidden |= is_hidden(st);
-                word |= ((st as u64) & 0x7fff) << (j * 15);
+        for (j, &st) in states.iter().enumerate() {
+            if !is_air_state(st) {
+                non_air += 1;
             }
-            words[w] = word;
+            all_opaque &= is_opaque(st);
+            has_hidden |= is_hidden(st);
+            values[j] = (st & 0x7fff) as u16;
         }
+        let words = megu_core::bits::pack_from_u16(&values, 15).into_boxed_slice();
         Self {
             states: SectionPalette::Direct { words },
             non_air,
@@ -356,8 +251,10 @@ impl PalettedSection {
                 bits,
                 entries,
                 words,
-            } => entries[indirect_get_word(*bits, words, idx)],
-            SectionPalette::Direct { words } => packed_get::<15>(words, idx),
+            } => entries[megu_core::bits::get(words, *bits, idx).unwrap_or(0) as usize],
+            SectionPalette::Direct { words } => {
+                megu_core::bits::get(words, 15, idx).unwrap_or(0)
+            }
         }
     }
 
@@ -385,8 +282,10 @@ impl PalettedSection {
         match &mut self.states {
             SectionPalette::Single(cur) => {
                 let cur = *cur;
-                let mut words = vec![0u64; words_for_bits(4)].into_boxed_slice();
-                packed_set::<4>(&mut words, idx, 1);
+                let mut words =
+                    vec![0u64; megu_core::bits::long_count(4, 4096)].into_boxed_slice();
+                let wrote = megu_core::bits::set(&mut words, 4, idx, 1);
+                debug_assert!(wrote);
                 self.states = SectionPalette::Indirect {
                     bits: 4,
                     entries: Box::new([cur, st]),
@@ -402,7 +301,8 @@ impl PalettedSection {
                 words,
             } => {
                 if let Some(pal_idx) = entries.iter().position(|&e| e == st) {
-                    indirect_set_word(*bits, words, idx, pal_idx as u64);
+                    let wrote = megu_core::bits::set(words, *bits, idx, pal_idx as u32);
+                    debug_assert!(wrote);
                 } else {
                     let new_idx = entries.len();
                     if new_idx < (1usize << *bits) {
@@ -410,7 +310,8 @@ impl PalettedSection {
                         next.extend_from_slice(entries);
                         next.push(st);
                         *entries = next.into_boxed_slice();
-                        indirect_set_word(*bits, words, idx, new_idx as u64);
+                        let wrote = megu_core::bits::set(words, *bits, idx, new_idx as u32);
+                        debug_assert!(wrote);
                     } else if *bits < 8 {
                         let new_bits = *bits + 1;
                         let mut new_words = grow_indirect_words(*bits, words, new_bits);
@@ -419,17 +320,21 @@ impl PalettedSection {
                         next.push(st);
                         *entries = next.into_boxed_slice();
                         *bits = new_bits;
-                        indirect_set_word(new_bits, &mut new_words, idx, new_idx as u64);
+                        let wrote =
+                            megu_core::bits::set(&mut new_words, new_bits, idx, new_idx as u32);
+                        debug_assert!(wrote);
                         *words = new_words;
                     } else {
                         let mut new_words = promote_indirect8_to_direct(entries, words);
-                        packed_set::<15>(&mut new_words, idx, st as u64);
+                        let wrote = megu_core::bits::set(&mut new_words, 15, idx, st & 0x7fff);
+                        debug_assert!(wrote);
                         self.states = SectionPalette::Direct { words: new_words };
                     }
                 }
             }
             SectionPalette::Direct { words } => {
-                packed_set::<15>(words, idx, st as u64);
+                let wrote = megu_core::bits::set(words, 15, idx, st & 0x7fff);
+                debug_assert!(wrote);
             }
         }
         if !is_opaque(st) {
@@ -462,20 +367,13 @@ impl PalettedSection {
                 if !any_non_opaque {
                     return true;
                 }
-                let mut indices = [0u8; 4096];
-                match *bits {
-                    4 => unpack_all_const::<4>(words, &mut indices),
-                    5 => unpack_all_const::<5>(words, &mut indices),
-                    6 => unpack_all_const::<6>(words, &mut indices),
-                    7 => unpack_all_const::<7>(words, &mut indices),
-                    8 => unpack_all_const::<8>(words, &mut indices),
-                    other => unreachable!("invalid indirect palette bits {other}"),
-                }
+                let mut indices = [0u16; 4096];
+                megu_core::bits::unpack_to_u16(words, *bits, 4096, &mut indices);
                 indices.iter().all(|&p| opaque_map[p as usize])
             }
             SectionPalette::Direct { words } => {
                 for cell in 0..4096 {
-                    if !is_opaque(packed_get::<15>(words, cell)) {
+                    if !is_opaque(megu_core::bits::get(words, 15, cell).unwrap_or(0)) {
                         return false;
                     }
                 }
@@ -502,20 +400,13 @@ impl PalettedSection {
                 if !any_hidden {
                     return false;
                 }
-                let mut indices = [0u8; 4096];
-                match *bits {
-                    4 => unpack_all_const::<4>(words, &mut indices),
-                    5 => unpack_all_const::<5>(words, &mut indices),
-                    6 => unpack_all_const::<6>(words, &mut indices),
-                    7 => unpack_all_const::<7>(words, &mut indices),
-                    8 => unpack_all_const::<8>(words, &mut indices),
-                    other => unreachable!("invalid indirect palette bits {other}"),
-                }
+                let mut indices = [0u16; 4096];
+                megu_core::bits::unpack_to_u16(words, *bits, 4096, &mut indices);
                 indices.iter().any(|&p| hidden_map[p as usize])
             }
             SectionPalette::Direct { words } => {
                 for cell in 0..4096 {
-                    if is_hidden(packed_get::<15>(words, cell)) {
+                    if is_hidden(megu_core::bits::get(words, 15, cell).unwrap_or(0)) {
                         return true;
                     }
                 }
@@ -553,7 +444,7 @@ impl PalettedSection {
                 entries,
                 words,
             } => {
-                let p0 = indirect_get_word(*bits, words, 0);
+                let p0 = megu_core::bits::get(words, *bits, 0).unwrap_or(0) as usize;
                 if uniform_words(words, *bits, p0 as u64) {
                     Some(entries[p0])
                 } else {
@@ -561,7 +452,7 @@ impl PalettedSection {
                 }
             }
             SectionPalette::Direct { words } => {
-                let first = packed_get::<15>(words, 0) as u64;
+                let first = megu_core::bits::get(words, 15, 0).unwrap_or(0) as u64;
                 if uniform_words(words, 15, first) {
                     Some(first as u32)
                 } else {
@@ -613,7 +504,18 @@ impl PalettedSection {
                 entries,
                 words,
             } => {
-                decode_cells(*bits, words, |i| entries[i as usize], 0, 4096, out);
+                if *bits == 4 {
+                    // The canonical unpack's 4-bit arm reaches the SIMD
+                    // nibble expander; one palette pass maps indices to
+                    // states afterwards.
+                    let mut indices = [0u16; 4096];
+                    megu_core::bits::unpack_to_u16(words, 4, 4096, &mut indices);
+                    for (cell, &idx) in out.iter_mut().zip(indices.iter()) {
+                        *cell = entries[idx as usize];
+                    }
+                } else {
+                    decode_cells(*bits, words, |i| entries[i as usize], 0, 4096, out);
+                }
             }
             SectionPalette::Direct { words } => {
                 decode_cells(15, words, |i| i, 0, 4096, out);
@@ -647,14 +549,32 @@ impl PalettedSection {
             } => {
                 for ly in ly0..ly0 + ly_count {
                     let row = (ly - ly0) * 256;
-                    decode_cells(
-                        *bits,
-                        words,
-                        |i| entries[i as usize],
-                        ly << 8,
-                        (ly << 8) + 256,
-                        &mut dst[row..row + 256],
-                    );
+                    if *bits == 4 {
+                        // A row is 16 aligned words at 4 bits, so each row
+                        // unpacks through the canonical SIMD nibble path
+                        // before the palette map.
+                        let mut indices = [0u16; 256];
+                        megu_core::bits::unpack_to_u16(
+                            &words[ly * 16..ly * 16 + 16],
+                            4,
+                            256,
+                            &mut indices,
+                        );
+                        for (cell, &idx) in
+                            dst[row..row + 256].iter_mut().zip(indices.iter())
+                        {
+                            *cell = entries[idx as usize];
+                        }
+                    } else {
+                        decode_cells(
+                            *bits,
+                            words,
+                            |i| entries[i as usize],
+                            ly << 8,
+                            (ly << 8) + 256,
+                            &mut dst[row..row + 256],
+                        );
+                    }
                 }
             }
             SectionPalette::Direct { words } => {
@@ -1377,5 +1297,135 @@ mod paletted_tests {
             packed_ns / n,
             packed_ns / n * nether_secs as f64 / 1000.0,
         );
+    }
+}
+
+#[cfg(test)]
+mod paletted_canonical_tests {
+    use super::*;
+
+    /// The pre-migration non-straddling pack loop, kept as the reference
+    /// that pins `megu_core::bits::pack_from_u16`/`unpack_to_u16` to
+    /// identical words.
+    fn ref_pack(values: &[u16], bits: u8) -> Vec<u64> {
+        let per = 64 / bits as usize;
+        let mask = (1u64 << bits) - 1;
+        let mut words = vec![0u64; values.len().div_ceil(per)];
+        for (i, &v) in values.iter().enumerate() {
+            words[i / per] |= (u64::from(v) & mask) << ((i % per) * bits as usize);
+        }
+        words
+    }
+
+    #[test]
+    fn canonical_pack_unpack_matches_reference_words() {
+        let mut values = [0u16; 4096];
+        let mut s = 0x9e37_79b9_7f4a_7c15u64;
+        for bits in [4u8, 5, 6, 7, 8, 15] {
+            for v in &mut values {
+                s ^= s << 13;
+                s ^= s >> 7;
+                s ^= s << 17;
+                *v = (s % (1u64 << bits)) as u16;
+            }
+            let words = megu_core::bits::pack_from_u16(&values, bits);
+            assert_eq!(words, ref_pack(&values, bits), "bits={bits} packed words");
+            let mut round = [0u16; 4096];
+            megu_core::bits::unpack_to_u16(&words, bits, 4096, &mut round);
+            assert_eq!(round, values, "bits={bits} unpack");
+            for i in 0..64 {
+                assert_eq!(
+                    megu_core::bits::get(&words, bits, i),
+                    Some(u32::from(values[i])),
+                    "bits={bits} cell={i}"
+                );
+                let mut rewritten = words.clone();
+                assert!(megu_core::bits::set(
+                    &mut rewritten,
+                    bits,
+                    i,
+                    u32::from(values[i])
+                ));
+                assert_eq!(rewritten, words, "bits={bits} set cell={i}");
+            }
+        }
+    }
+
+    fn check_section(sec: &PalettedSection, states: &[u32; 4096], biomes: &[i64; 64]) {
+        for (i, &st) in states.iter().enumerate() {
+            assert_eq!(sec.get(i), st, "cell {i}");
+        }
+        let mut out = [0u32; 4096];
+        sec.unpack_into(&mut out);
+        assert_eq!(&out, states, "unpack_into");
+        let mut rows = [0u32; 4096];
+        for ly in 0..16 {
+            sec.copy_y_slice(ly, 1, &mut rows[ly * 256..ly * 256 + 256]);
+        }
+        assert_eq!(&rows, states, "copy_y_slice");
+        let mut wire = Vec::new();
+        sec.write_wire(biomes, &mut wire);
+        assert_eq!(wire, section_encode(states, biomes), "wire bytes");
+    }
+
+    #[test]
+    fn paletted_canonical_round_trip_and_wire_identity() {
+        let is_opaque = |_: u32| false;
+        let is_hidden = |_: u32| false;
+        let biomes: [i64; 64] = std::array::from_fn(|i| (i % 7) as i64);
+        let mut states = [0u32; 4096];
+        let sec = PalettedSection::pack(&states, &is_opaque, &is_hidden);
+        assert_eq!(sec.palette_bits(), 0);
+        assert_eq!(sec.is_uniform(), Some(0));
+
+        // Four-bit palette (<=16 distinct, non-uniform): get/set/unpack and
+        // copy_y_slice all take the canonical SIMD nibble path.
+        for (i, st) in states.iter_mut().enumerate() {
+            *st = (i % 9 + 1) as u32;
+        }
+        let sec = PalettedSection::pack(&states, &is_opaque, &is_hidden);
+        assert_eq!(sec.palette_bits(), 4);
+        check_section(&sec, &states, &biomes);
+
+        // Eight-bit palette exercises the non-4 sliced row decoder.
+        for (i, st) in states.iter_mut().enumerate() {
+            *st = (i % 200 + 1) as u32;
+        }
+        let sec = PalettedSection::pack(&states, &is_opaque, &is_hidden);
+        assert_eq!(sec.palette_bits(), 8);
+        check_section(&sec, &states, &biomes);
+
+        // >256 distinct states promote to the 15-bit direct map.
+        for (i, st) in states.iter_mut().enumerate() {
+            *st = (i % 300 + 1) as u32;
+        }
+        let sec = PalettedSection::pack(&states, &is_opaque, &is_hidden);
+        assert_eq!(sec.palette_bits(), 15);
+        check_section(&sec, &states, &biomes);
+    }
+
+    #[test]
+    fn paletted_canonical_set_growth_walks_every_width_boundary() {
+        let is_opaque = |_: u32| false;
+        let is_hidden = |_: u32| false;
+        let mut sec = PalettedSection::pack(&[0u32; 4096], &is_opaque, &is_hidden);
+        // 300 distinct states force Single -> 4 -> 5 -> 6 -> 7 -> 8 -> Direct
+        // through the canonical grow/promote helpers.
+        let mut expected = [0u32; 4096];
+        for (i, slot) in expected.iter_mut().enumerate() {
+            let st = (i % 300 + 1) as u32;
+            *slot = st;
+            sec.set(i, st, &is_opaque, &is_hidden);
+        }
+        assert_eq!(sec.palette_bits(), 15);
+        let mut out = [0u32; 4096];
+        sec.unpack_into(&mut out);
+        assert_eq!(out, expected);
+        for (i, &st) in expected.iter().enumerate() {
+            assert_eq!(sec.get(i), st, "cell {i}");
+        }
+        let mut rows = [0u32; 512];
+        sec.copy_y_slice(3, 2, &mut rows);
+        assert_eq!(&rows[..], &expected[3 * 256..5 * 256]);
     }
 }

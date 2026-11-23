@@ -717,21 +717,14 @@ impl Gs4QueryHandler {
     /// deterministic per handler, different per issue, always a positive
     /// decimal string like vanilla's integer tokens.
     fn mint_token(&self, ip: std::net::IpAddr) -> i32 {
-        let mut h: u64 = 0xcbf2_9ce4_8422_2325;
-        let mut mix = |b: u8| {
-            h = (h ^ u64::from(b)).wrapping_mul(0x0000_0100_0000_01b3);
-        };
-        for b in self.salt.to_be_bytes() {
-            mix(b);
-        }
+        let mut h = megu_core::hash::Fnv1a64::new();
+        h.update(&self.salt.to_be_bytes());
         match ip {
-            std::net::IpAddr::V4(v4) => v4.octets().into_iter().for_each(&mut mix),
-            std::net::IpAddr::V6(v6) => v6.octets().into_iter().for_each(&mut mix),
+            std::net::IpAddr::V4(v4) => h.update(&v4.octets()),
+            std::net::IpAddr::V6(v6) => h.update(&v6.octets()),
         }
-        for b in self.issued.to_be_bytes() {
-            mix(b);
-        }
-        (h & 0x7fff_ffff) as i32
+        h.update(&self.issued.to_be_bytes());
+        (h.finish() & 0x7fff_ffff) as i32
     }
 
     /// The stored token for `ip` is honoured while it is younger than the TTL
@@ -2110,16 +2103,12 @@ impl WatchdogVerdict {
             Self::Warning { stall_ms } => ("warning", stall_ms),
             Self::CriticalStall { stall_ms } => ("critical", stall_ms),
         };
-        let mut h: u64 = 0xcbf2_9ce4_8422_2325;
-        for b in severity
-            .bytes()
-            .chain(stall_ms.to_be_bytes())
-        {
-            h = (h ^ u64::from(b)).wrapping_mul(0x0000_0100_0000_01b3);
-        }
+        let mut h = megu_core::hash::Fnv1a64::new();
+        h.update(severity.as_bytes());
+        h.update(&stall_ms.to_be_bytes());
         Some(format!(
             "MEGU-E-{:08X} tick watchdog stall {}ms severity={severity}",
-            h as u32, stall_ms
+            h.finish() as u32, stall_ms
         ))
     }
 }

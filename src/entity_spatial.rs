@@ -20,6 +20,7 @@ struct SpatialEntity {
 #[derive(Default)]
 struct SpatialScratch {
     seen: Vec<u32>,
+    cells_order: Vec<(i32, i32)>,
     stamp: u32,
 }
 
@@ -159,6 +160,7 @@ fn with_spatial_query_scratch<R>(
             let pool = &mut *pool;
             let result = f(&mut pool.query_scratch, &mut pool.query_out);
             bound_spatial_vec(&mut pool.query_scratch.seen);
+            bound_spatial_vec(&mut pool.query_scratch.cells_order);
             bound_spatial_vec(&mut pool.query_out);
             result
         }
@@ -191,68 +193,88 @@ impl EntitySpatialGrid {
     fn from_entities(entities: Vec<SpatialEntity>) -> Self {
         // Pass 1: per-chunk entity counts. The single `cells` map holds
         // `(0, count)` — range start in the first field, write cursor in the
-        // second — so the separate `counts` map disappears.
+        // second — so the separate `counts` map disappears. The canonical
+        // non-air-mask kernel marks the slots whose AABB is finite, so pass
+        // 2 walks live slots by draining set bits instead of re-running
+        // four float checks per entity.
         let (mut cells, mut cell_entries) = spatial_pool_take_cells();
         cells.clear();
         let mut total_entries = 0usize;
+        let mut occupancy = Vec::with_capacity(entities.len().div_ceil(64));
 
-        for ent in &entities {
-            if !ent.aabb.min_x.is_finite()
-                || !ent.aabb.max_x.is_finite()
-                || !ent.aabb.min_z.is_finite()
-                || !ent.aabb.max_z.is_finite()
-            {
-                continue;
-            }
-            let cx0 = spatial_chunk_coord(ent.aabb.min_x);
-            let cx1 = spatial_chunk_coord(ent.aabb.max_x);
-            let cz0 = spatial_chunk_coord(ent.aabb.min_z);
-            let cz1 = spatial_chunk_coord(ent.aabb.max_z);
-            if cx1.saturating_sub(cx0) > 16 || cz1.saturating_sub(cz0) > 16 {
-                continue;
-            }
-            for cx in cx0..=cx1 {
-                for cz in cz0..=cz1 {
-                    cells.entry((cx, cz)).or_insert((0, 0)).1 += 1;
-                    total_entries += 1;
+        for block in entities.chunks(64) {
+            let mut states = [0u16; 64];
+            for (i, ent) in block.iter().enumerate() {
+                let finite = ent.aabb.min_x.is_finite()
+                    && ent.aabb.max_x.is_finite()
+                    && ent.aabb.min_z.is_finite()
+                    && ent.aabb.max_z.is_finite();
+                states[i] = u16::from(finite);
+                if !finite {
+                    continue;
+                }
+                let cx0 = spatial_chunk_coord(ent.aabb.min_x);
+                let cx1 = spatial_chunk_coord(ent.aabb.max_x);
+                let cz0 = spatial_chunk_coord(ent.aabb.min_z);
+                let cz1 = spatial_chunk_coord(ent.aabb.max_z);
+                if cx1.saturating_sub(cx0) > 16 || cz1.saturating_sub(cz0) > 16 {
+                    continue;
+                }
+                for cx in cx0..=cx1 {
+                    for cz in cz0..=cz1 {
+                        cells.entry((cx, cz)).or_insert((0, 0)).1 += 1;
+                        total_entries += 1;
+                    }
                 }
             }
+            occupancy.push(megu_core::simd_voxel::build_non_air_bitmask_64(&states));
         }
 
         // Conversion pass: `(0, count)` becomes `(start, start)` — the range
-        // start in the first field and the cursor in the second.
+        // start in the first field and the cursor in the second. Ranges are
+        // assigned in chunk Z-order instead of hash order so a multi-cell
+        // query touches `cell_entries` spans that sit next to each other.
+        let mut order: Vec<(i32, i32)> = cells.keys().copied().collect();
+        order.sort_unstable_by_key(|&(cx, cz)| {
+            (
+                megu_core::morton::morton2_encode_i16(cx as i16, cz as i16),
+                cx,
+                cz,
+            )
+        });
         let mut offset = 0u32;
-        for value in cells.values_mut() {
+        for key in order {
+            let value = cells.get_mut(&key).unwrap();
             let count = value.1;
             value.0 = offset;
             value.1 = offset;
             offset += count;
         }
 
-        // Pass 2: fill `cell_entries` through the per-cell cursors. After the
+        // Pass 2: fill `cell_entries` through the per-cell cursors, walking
+        // the occupancy mask's set bits in ascending slot order. After the
         // pass each value reads `(start, start + count)` — the query range.
         cell_entries.clear();
         cell_entries.resize(total_entries, 0);
-        for (slot, ent) in entities.iter().enumerate() {
-            if !ent.aabb.min_x.is_finite()
-                || !ent.aabb.max_x.is_finite()
-                || !ent.aabb.min_z.is_finite()
-                || !ent.aabb.max_z.is_finite()
-            {
-                continue;
-            }
-            let cx0 = spatial_chunk_coord(ent.aabb.min_x);
-            let cx1 = spatial_chunk_coord(ent.aabb.max_x);
-            let cz0 = spatial_chunk_coord(ent.aabb.min_z);
-            let cz1 = spatial_chunk_coord(ent.aabb.max_z);
-            if cx1.saturating_sub(cx0) > 16 || cz1.saturating_sub(cz0) > 16 {
-                continue;
-            }
-            for cx in cx0..=cx1 {
-                for cz in cz0..=cz1 {
-                    if let Some(cursor) = cells.get_mut(&(cx, cz)) {
-                        cell_entries[cursor.1 as usize] = slot as u32;
-                        cursor.1 += 1;
+        for (block_idx, &mask) in occupancy.iter().enumerate() {
+            let mut mask = mask;
+            while mask != 0 {
+                let slot = block_idx * 64 + mask.trailing_zeros() as usize;
+                mask &= mask - 1;
+                let ent = &entities[slot];
+                let cx0 = spatial_chunk_coord(ent.aabb.min_x);
+                let cx1 = spatial_chunk_coord(ent.aabb.max_x);
+                let cz0 = spatial_chunk_coord(ent.aabb.min_z);
+                let cz1 = spatial_chunk_coord(ent.aabb.max_z);
+                if cx1.saturating_sub(cx0) > 16 || cz1.saturating_sub(cz0) > 16 {
+                    continue;
+                }
+                for cx in cx0..=cx1 {
+                    for cz in cz0..=cz1 {
+                        if let Some(cursor) = cells.get_mut(&(cx, cz)) {
+                            cell_entries[cursor.1 as usize] = slot as u32;
+                            cursor.1 += 1;
+                        }
                     }
                 }
             }
@@ -346,19 +368,28 @@ impl EntitySpatialGrid {
         }
         scratch.ensure_len(self.entities.len());
         let stamp = scratch.next_stamp();
-        for cx in cx0..=cx1 {
-            for cz in cz0..=cz1 {
-                if let Some(&(start, end)) = self.cells.get(&(cx, cz)) {
-                    for &slot in &self.cell_entries[start as usize..end as usize] {
-                        let slot_idx = slot as usize;
-                        if scratch.seen[slot_idx] == stamp {
-                            continue;
-                        }
-                        scratch.seen[slot_idx] = stamp;
-                        let ent = &self.entities[slot_idx];
-                        if ent.eid != exclude_eid && ent.aabb.intersects(aabb) {
-                            out.push(slot);
-                        }
+        // `cell_entries` is laid out in chunk Z-order, so visit the query
+        // window in that same order: each hit reads a contiguous span and
+        // consecutive cells sit consecutively in the array.
+        scratch.cells_order.clear();
+        scratch.cells_order.extend(
+            (cx0..=cx1).flat_map(|cx| (cz0..=cz1).map(move |cz| (cx, cz))),
+        );
+        scratch.cells_order.sort_unstable_by_key(|&(cx, cz)| {
+            megu_core::morton::morton2_encode_i16(cx as i16, cz as i16)
+        });
+        for i in 0..scratch.cells_order.len() {
+            let (cx, cz) = scratch.cells_order[i];
+            if let Some(&(start, end)) = self.cells.get(&(cx, cz)) {
+                for &slot in &self.cell_entries[start as usize..end as usize] {
+                    let slot_idx = slot as usize;
+                    if scratch.seen[slot_idx] == stamp {
+                        continue;
+                    }
+                    scratch.seen[slot_idx] = stamp;
+                    let ent = &self.entities[slot_idx];
+                    if ent.eid != exclude_eid && ent.aabb.intersects(aabb) {
+                        out.push(slot);
                     }
                 }
             }
@@ -410,22 +441,28 @@ impl EntitySpatialGrid {
         }
         scratch.ensure_len(self.entities.len());
         let stamp = scratch.next_stamp();
-        for cx in cx0..=cx1 {
-            for cz in cz0..=cz1 {
-                if let Some(&(start, end)) = self.cells.get(&(cx, cz)) {
-                    for &slot in &self.cell_entries[start as usize..end as usize] {
-                        let slot_idx = slot as usize;
-                        if scratch.seen[slot_idx] == stamp {
-                            continue;
-                        }
-                        scratch.seen[slot_idx] = stamp;
-                        let ent = &self.entities[slot_idx];
-                        if ent.eid != exclude_eid {
-                            let dx = ent.x - x;
-                            let dz = ent.z - z;
-                            if dx * dx + dz * dz < r_sq {
-                                out.push(slot);
-                            }
+        scratch.cells_order.clear();
+        scratch.cells_order.extend(
+            (cx0..=cx1).flat_map(|cx| (cz0..=cz1).map(move |cz| (cx, cz))),
+        );
+        scratch.cells_order.sort_unstable_by_key(|&(cx, cz)| {
+            megu_core::morton::morton2_encode_i16(cx as i16, cz as i16)
+        });
+        for i in 0..scratch.cells_order.len() {
+            let (cx, cz) = scratch.cells_order[i];
+            if let Some(&(start, end)) = self.cells.get(&(cx, cz)) {
+                for &slot in &self.cell_entries[start as usize..end as usize] {
+                    let slot_idx = slot as usize;
+                    if scratch.seen[slot_idx] == stamp {
+                        continue;
+                    }
+                    scratch.seen[slot_idx] = stamp;
+                    let ent = &self.entities[slot_idx];
+                    if ent.eid != exclude_eid {
+                        let dx = ent.x - x;
+                        let dz = ent.z - z;
+                        if dx * dx + dz * dz < r_sq {
+                            out.push(slot);
                         }
                     }
                 }
@@ -1019,5 +1056,34 @@ mod entity_spatial_tests {
             expected.iter().flatten().copied().collect::<Vec<u32>>(),
             "rebuilt-grid queries must match the first grid's results"
         );
+    }
+
+    #[test]
+    fn entity_spatial_grid_skips_non_finite_aabbs_via_occupancy_mask() {
+        // A non-finite AABB never lands in a cell; the occupancy mask must
+        // carry its slot as zero so pass 2 skips it outright.
+        let mut entities: Vec<SpatialEntity> = (0..70usize)
+            .map(|i| make_test_entity(i, i as i32 + 1, i as f64 - 32.0, 64.0, 0.0, 0.9, 1.4))
+            .collect();
+        entities[7].aabb.min_x = f64::NAN;
+        entities[33].aabb.max_z = f64::INFINITY;
+        entities[69].aabb.min_z = f64::NEG_INFINITY;
+        let grid = EntitySpatialGrid::from_entities(entities.clone());
+
+        let mut scratch = SpatialScratch::default();
+        let mut hits = Vec::new();
+        // A window covering every entity must surface every live slot in
+        // ascending order and none of the masked ones.
+        grid.query_aabb_into(
+            EntityAabb::from_min_max([-512.0, -512.0, -512.0], [512.0, 512.0, 512.0]),
+            -1,
+            &mut scratch,
+            &mut hits,
+        );
+        let live: Vec<u32> = (0..70u32).filter(|s| ![7, 33, 69].contains(s)).collect();
+        assert_eq!(hits, live, "masked slots must not reach queries");
+        for &slot in &hits {
+            assert_eq!(grid.entities[slot as usize].aabb.min_x.is_finite(), true);
+        }
     }
 }
