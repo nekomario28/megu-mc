@@ -250,7 +250,7 @@ pub struct AssetDiscovery {
     pub jar_path: Option<PathBuf>,
     /// Decoded block/item sprites contributed by the JAR.
     pub jar_textures: usize,
-    /// Resource-pack layers contributed (dir or zip), in priority order.
+    /// Resource-pack layers contributed (mod JAR, dir or zip), in priority order.
     pub pack_sources: Vec<String>,
     /// Per-entry/per-source failures recorded instead of silently dropped.
     pub notes: Vec<String>,
@@ -2106,7 +2106,7 @@ impl LiveSession {
 
     /// Compile the asset bundle once. Layer order is lowest-to-highest
     /// priority (last layer wins): the vanilla client JAR at
-    /// `<gameDir>/versions/<version>/<version>.jar` first, then every
+    /// `<gameDir>/versions/<version>/<version>.jar` first, then `mods/*.jar`, then every
     /// `options.txt`-configured pack from `resourcepacks/` (dir or `.zip`),
     /// then the explicit `MEGU_RESOURCE_PACK_DIR` override.
     /// `CompiledAssetBundle::build` produces the gutter-padded block atlas
@@ -3583,7 +3583,7 @@ fn run_connection(
                 // Vanilla reports the chunks-per-tick rate it actually
                 // consumed; echoing the server window would request a batch
                 // larger than the render side can absorb during join.
-                client.send_chunk_batch_received((count.clamp(1, 10)) as f32)?;
+                client.send_chunk_batch_received(count.clamp(1, 10) as f32)?;
             }
             Some(ClientPlayEvent::Play(PlayEvent::Teleport(ref teleport))) => {
                 let previous_pose = last_input.map(|movement: PlayerMovement| movement.pose);
@@ -3676,7 +3676,8 @@ pub(crate) fn jar_version_ids(paths: &SessionPaths) -> Vec<String> {
 }
 
 /// Resolve the full texture layer stack for a session: the vanilla client
-/// JAR (`<gameDir>/versions/<id>/<id>.jar`) as the base layer, then every
+/// JAR (`<gameDir>/versions/<id>/<id>.jar`) as the base layer, then sorted
+/// `mods/*.jar` assets, then every
 /// pack `options.txt` enables inside `resourcepacks/` (dir or `.zip`), then
 /// the explicit `MEGU_RESOURCE_PACK_DIR` override on top. Returns the
 /// layers in lowest-to-highest priority order, an [`AssetDiscovery`] report
@@ -3718,6 +3719,16 @@ pub fn discover_asset_layers(
                 }
             }
         }
+        let (mod_layers, mod_report) =
+            crate::vanilla_jar::load_mod_jar_layers(&game_dir.join("mods"));
+        report.zip_entries_seen += mod_report.entries_seen;
+        for path in mod_report.loaded {
+            report.pack_sources.push(path.display().to_string());
+        }
+        for (path, err) in mod_report.rejected {
+            report.notes.push(format!("mod JAR {} skipped: {err}", path.display()));
+        }
+        layers.extend(mod_layers);
     }
 
     // `options.txt`-configured packs, vanilla order: the file lists them

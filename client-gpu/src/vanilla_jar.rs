@@ -17,7 +17,7 @@
 //! keeps its own copy rather than widening another crate's API).
 
 use std::fmt;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use megu_client_mesh::asset_pipeline::{animation_from_mcmeta, ResourcePackLayer};
 use megu_client_mesh::png_decode;
@@ -31,6 +31,9 @@ pub const MAX_ARCHIVE_ENTRIES: usize = 50_000;
 pub const MAX_UNPACKED_BYTES: u64 = 256 * 1024 * 1024;
 /// Per-entry uncompressed cap (matches the asset pipeline's pack-file cap).
 pub const MAX_ENTRY_BYTES: u64 = 8 * 1024 * 1024;
+/// Cap the number of JARs and their aggregate materialized asset bytes.
+pub const MAX_MOD_JARS: usize = 256;
+pub const MAX_MOD_ASSET_BYTES: u64 = MAX_UNPACKED_BYTES;
 
 /// Why a JAR/pack read failed — every variant is a fail-closed stop, never
 /// a silent partial load.
@@ -74,6 +77,14 @@ pub struct JarReadReport {
     /// `(entry, reason)` for every selected entry that was rejected —
     /// path, size or decode failure.
     pub skipped: Vec<(String, String)>,
+}
+
+/// Per-JAR success/failure ledger for deterministic mod asset discovery.
+#[derive(Debug, Default)]
+pub struct ModJarLoadReport {
+    pub loaded: Vec<PathBuf>,
+    pub rejected: Vec<(PathBuf, JarError)>,
+    pub entries_seen: usize,
 }
 
 /// One decompressed archive member selected by the caller's filter.
@@ -122,7 +133,20 @@ pub fn read_selected_entries(
     path: &Path,
     select: impl Fn(&str) -> bool,
 ) -> Result<(Vec<JarEntry>, JarReadReport), JarError> {
+    let size = std::fs::metadata(path).map_err(|e| JarError::Io {
+        reason: format!("cannot stat {}: {e}", path.display()),
+    })?.len();
+    if size > MAX_ARCHIVE_BYTES {
+        return Err(JarError::BudgetExceeded {
+            reason: format!("archive size {size} exceeds {MAX_ARCHIVE_BYTES}"),
+        });
+    }
     let index = LazyZipIndex::open_all(path).map_err(|e| zip_to_jar(path, e))?;
+    if index.entries().len() > MAX_ARCHIVE_ENTRIES {
+        return Err(JarError::BudgetExceeded {
+            reason: format!("archive has {} entries (cap {MAX_ARCHIVE_ENTRIES})", index.entries().len()),
+        });
+    }
     let mut report = JarReadReport {
         entries_seen: index.entries().len(),
         ..JarReadReport::default()
@@ -201,18 +225,6 @@ fn zip_to_jar(path: &Path, e: ZipError) -> JarError {
     }
 }
 
-fn texture_subpath(name: &str, dirs: &[&str]) -> Option<(String, String)> {
-    let rest = name.strip_prefix("assets/")?;
-    let (ns, tail) = rest.split_once('/')?;
-    let tail = tail.strip_prefix("textures/")?;
-    let (dir, sub) = tail.split_once('/')?;
-    if dirs.contains(&dir) && !sub.is_empty() {
-        Some((ns.to_owned(), sub.to_owned()))
-    } else {
-        None
-    }
-}
-
 /// `assets/<ns>/<category>/<sub>` -> (`ns`, `category`, `sub`).
 fn asset_subpath(name: &str) -> Option<(String, String, String)> {
     let rest = name.strip_prefix("assets/")?;
@@ -222,6 +234,114 @@ fn asset_subpath(name: &str) -> Option<(String, String, String)> {
         return None;
     }
     Some((ns.to_owned(), category.to_owned(), sub.to_owned()))
+}
+
+fn valid_mod_namespace(ns: &str) -> bool {
+    !ns.is_empty()
+        && ns != "."
+        && ns != ".."
+        && ns.bytes().all(|b| b.is_ascii_alphanumeric() || matches!(b, b'_' | b'-' | b'.'))
+}
+
+fn is_mod_asset(name: &str) -> bool {
+    let Some((ns, category, sub)) = asset_subpath(name) else {
+        return false;
+    };
+    if !valid_mod_namespace(&ns) {
+        return false;
+    }
+    match category.as_str() {
+        "blockstates" => sub.ends_with(".json"),
+        "models" => (sub.starts_with("block/") || sub.starts_with("item/")) && sub.ends_with(".json"),
+        "textures" => (sub.starts_with("block/") || sub.starts_with("item/"))
+            && (sub.ends_with(".png") || sub.ends_with(".png.mcmeta")),
+        "lang" => sub.ends_with(".json"),
+        _ => false,
+    }
+}
+
+/// Load regular `mods/*.jar` entries by filename, isolating corrupt JARs.
+/// Later JARs override earlier JARs, and user packs override all mod layers.
+pub fn load_mod_jar_layers(mods_dir: &Path) -> (Vec<ResourcePackLayer>, ModJarLoadReport) {
+    let mut layers = Vec::new();
+    let mut report = ModJarLoadReport::default();
+    let dir = match std::fs::read_dir(mods_dir) {
+        Ok(dir) => dir,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return (layers, report),
+        Err(err) => {
+            report.rejected.push((mods_dir.to_path_buf(), JarError::Io {
+                reason: err.to_string(),
+            }));
+            return (layers, report);
+        }
+    };
+    let mut jars = Vec::new();
+    for entry in dir {
+        match entry {
+            Ok(entry) if entry.path().extension().is_some_and(|e| e == "jar") => {
+                match entry.file_type() {
+                    Ok(ty) if ty.is_file() => jars.push(entry.path()),
+                    Ok(_) => report.rejected.push((entry.path(), JarError::Unsupported {
+                        reason: "mod JAR must be a regular file".to_owned(),
+                    })),
+                    Err(err) => report.rejected.push((entry.path(), JarError::Io {
+                        reason: err.to_string(),
+                    })),
+                }
+            }
+            Ok(_) => {}
+            Err(err) => report.rejected.push((mods_dir.to_path_buf(), JarError::Io {
+                reason: err.to_string(),
+            })),
+        }
+    }
+    jars.sort();
+    let mut total_assets = 0u64;
+    for (index, jar) in jars.into_iter().enumerate() {
+        if index >= MAX_MOD_JARS {
+            report.rejected.push((jar, JarError::BudgetExceeded {
+                reason: format!("more than {MAX_MOD_JARS} mod JARs"),
+            }));
+            continue;
+        }
+        let result = read_selected_entries(&jar, is_mod_asset).and_then(|(entries, mut read_report)| {
+            report.entries_seen += read_report.entries_seen;
+            if let Some((name, reason)) = read_report.skipped.first() {
+                return Err(JarError::Malformed {
+                    reason: format!("{name}: {reason}"),
+                });
+            }
+            let unpacked = entries.iter().map(|entry| entry.bytes.len() as u64).sum::<u64>();
+            if unpacked > MAX_MOD_ASSET_BYTES.saturating_sub(total_assets) {
+                return Err(JarError::BudgetExceeded {
+                    reason: format!("aggregate mod assets exceed {MAX_MOD_ASSET_BYTES} bytes"),
+                });
+            }
+            let layer = layer_from_entries(jar.file_name().unwrap_or_default().to_string_lossy().into_owned(), &entries, &mut read_report);
+            if let Some((name, reason)) = read_report.skipped.first() {
+                return Err(JarError::Malformed {
+                    reason: format!("{name}: {reason}"),
+                });
+            }
+            let decoded = layer.sprites.values().map(|(_, _, rgba)| rgba.len() as u64).sum::<u64>();
+            let charge = unpacked.saturating_add(decoded);
+            if charge > MAX_MOD_ASSET_BYTES.saturating_sub(total_assets) {
+                return Err(JarError::BudgetExceeded {
+                    reason: format!("aggregate decoded mod assets exceed {MAX_MOD_ASSET_BYTES} bytes"),
+                });
+            }
+            total_assets += charge;
+            Ok(layer)
+        });
+        match result {
+            Ok(layer) => {
+                report.loaded.push(jar);
+                layers.push(layer);
+            }
+            Err(err) => report.rejected.push((jar, err)),
+        }
+    }
+    (layers, report)
 }
 
 /// Decode the `.rgba` sprite format (`u32le width`, `u32le height`,
@@ -349,18 +469,14 @@ fn layer_from_entries(
     layer
 }
 
-/// Read the vanilla client JAR at `jar_path` and build the
-/// [`ResourcePackLayer`] of `textures/block/**.png` + `textures/item/**.png`
-/// sprites it contains (any `assets/<ns>` namespace, `minecraft:` in
-/// practice). Non-texture assets — sounds, lang, shaders — are ignored at
-/// the filter stage and never decompressed.
+/// Read the vanilla client JAR at `jar_path` and build its blockstates,
+/// block/item models and sprites. Mod models frequently inherit a vanilla
+/// parent such as `minecraft:block/cube_all`, which must be available in
+/// the same model stack for their texture references to resolve.
 pub fn vanilla_jar_texture_layer(
     jar_path: &Path,
 ) -> Result<(ResourcePackLayer, JarReadReport), JarError> {
-    let (entries, mut report) = read_selected_entries(jar_path, |name| {
-        texture_subpath(name, &["block", "item"])
-            .is_some_and(|(_, sub)| sub.ends_with(".png") || sub.ends_with(".png.mcmeta"))
-    })?;
+    let (entries, mut report) = read_selected_entries(jar_path, is_mod_asset)?;
     let name = jar_path
         .file_name()
         .and_then(|n| n.to_str())
@@ -445,6 +561,136 @@ pub fn configured_resource_packs(game_dir: &Path) -> Vec<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use megu_client_mesh::asset_pipeline::CompiledAssetBundle;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    static NEXT_TEMP_DIR: AtomicUsize = AtomicUsize::new(0);
+
+    fn test_dir(label: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "megu-mod-{label}-{}-{}",
+            std::process::id(),
+            NEXT_TEMP_DIR.fetch_add(1, Ordering::Relaxed),
+        ));
+        std::fs::create_dir_all(&dir).expect("test directory created");
+        dir
+    }
+
+    // One valid 1x1 RGBA PNG with the non-fallback pixel [66,160,208,255].
+    const CREATE_PNG: [u8; 70] = [
+        137, 80, 78, 71, 13, 10, 26, 10, 0, 0, 0, 13, 73, 72, 68, 82,
+        0, 0, 0, 1, 0, 0, 0, 1, 8, 6, 0, 0, 0, 31, 21, 196,
+        137, 0, 0, 0, 13, 73, 68, 65, 84, 120, 156, 99, 112, 90, 112,
+        225, 63, 0, 5, 140, 2, 178, 39, 213, 187, 120, 0, 0, 0,
+        0, 73, 69, 78, 68, 174, 66, 96, 130,
+    ];
+
+    fn create_jar(model: &[u8]) -> Vec<u8> {
+        stored_zip(&[
+            ("assets/create/blockstates/andesite_casing.json", br#"{"variants":{"":{"model":"create:block/andesite_casing"}}}"#),
+            ("assets/create/models/block/andesite_casing.json", model),
+            ("assets/create/textures/block/andesite_casing.png", &CREATE_PNG),
+            ("assets/create/lang/en_us.json", br#"{"block.create.andesite_casing":"Andesite Casing"}"#),
+            ("META-INF/MANIFEST.MF", b"mod metadata"),
+        ])
+    }
+
+    #[test]
+    fn mod_jars_layer_in_filename_order_and_render_create_texture() {
+        let root = test_dir("create");
+        let mods = root.join("mods");
+        std::fs::create_dir_all(&mods).unwrap();
+        let model = br##"{"loader":"create:kinetic","render_type":"cutout","textures":{"particle":"create:block/andesite_casing"}}"##;
+        std::fs::write(mods.join("z-create-test.jar"), create_jar(model)).unwrap();
+        std::fs::write(mods.join("a-create-test.jar"), create_jar(model)).unwrap();
+        let vanilla_path = root.join("vanilla.jar");
+        std::fs::write(&vanilla_path, stored_zip(&[
+            ("assets/minecraft/textures/block/stone.png", &CREATE_PNG),
+        ])).unwrap();
+        let (vanilla, _) = vanilla_jar_texture_layer(&vanilla_path).unwrap();
+        let (layers, report) = load_mod_jar_layers(&mods);
+        assert_eq!(report.loaded.len(), 2);
+        assert!(report.rejected.is_empty(), "{:?}", report.rejected);
+        assert_eq!(report.loaded[0].file_name().unwrap(), "a-create-test.jar");
+        assert_eq!(report.loaded[1].file_name().unwrap(), "z-create-test.jar");
+        assert_eq!(layers[0].blockstates.len(), 1);
+        assert_eq!(layers[0].models.len(), 1);
+        assert_eq!(layers[0].sprites.len(), 1);
+        let bundle = CompiledAssetBundle::build(&[vanilla, layers[0].clone(), layers[1].clone()])
+            .expect("mod and vanilla bundle");
+        assert!(bundle.atlas.placement("minecraft:block/stone").is_some());
+        let quads = bundle.bake_block_with_uvs("create:andesite_casing", &[], [0, 0, 0])
+            .expect("Create loader fallback geometry");
+        assert_eq!(quads.len(), 6);
+        assert!(quads.iter().all(|quad| quad.texture == "create:block/andesite_casing"));
+        let p = bundle.atlas.placement("create:block/andesite_casing").unwrap();
+        let offset = ((p.y * bundle.atlas.width + p.x) * 4) as usize;
+        assert_eq!(&bundle.atlas.rgba[offset..offset + 4], &[66, 160, 208, 255]);
+        // Later user resource packs retain priority over the mod's texture.
+        let mut override_layer = ResourcePackLayer::default();
+        override_layer.sprites.insert("create:block/andesite_casing".into(),
+            (1, 1, vec![10, 20, 30, 255]));
+        let overridden = CompiledAssetBundle::build(&[layers[1].clone(), override_layer]).unwrap();
+        let p = overridden.atlas.placement("create:block/andesite_casing").unwrap();
+        let offset = ((p.y * overridden.atlas.width + p.x) * 4) as usize;
+        assert_eq!(&overridden.atlas.rgba[offset..offset + 4], &[10, 20, 30, 255]);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn mod_model_inherits_geometry_from_vanilla_client_jar() {
+        let root = test_dir("parent");
+        let mods = root.join("mods");
+        std::fs::create_dir_all(&mods).unwrap();
+        std::fs::write(mods.join("create-test.jar"), create_jar(
+            br##"{"parent":"minecraft:block/cube_all","textures":{"all":"create:block/andesite_casing"}}"##,
+        )).unwrap();
+        let vanilla_path = root.join("vanilla.jar");
+        std::fs::write(&vanilla_path, stored_zip(&[
+            ("assets/minecraft/models/block/cube_all.json", br##"{"elements":[{"from":[0,0,0],"to":[16,16,16],"faces":{"down":{"texture":"#all"},"up":{"texture":"#all"},"north":{"texture":"#all"},"south":{"texture":"#all"},"west":{"texture":"#all"},"east":{"texture":"#all"}}}]}"##),
+        ])).unwrap();
+        let (vanilla, _) = vanilla_jar_texture_layer(&vanilla_path).unwrap();
+        assert!(vanilla.models.contains_key("minecraft:block/cube_all"));
+        let (mods, report) = load_mod_jar_layers(&mods);
+        assert!(report.rejected.is_empty(), "{:?}", report.rejected);
+        let bundle = CompiledAssetBundle::build(&[vanilla, mods[0].clone()]).unwrap();
+        let quads = bundle.bake_block_with_uvs("create:andesite_casing", &[], [0, 0, 0]).unwrap();
+        assert_eq!(quads.len(), 6);
+        assert!(quads.iter().all(|quad| quad.texture == "create:block/andesite_casing"));
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn corrupt_unsafe_and_oversized_mod_jars_do_not_break_vanilla() {
+        let root = test_dir("hostile");
+        let mods = root.join("mods");
+        std::fs::create_dir_all(&mods).unwrap();
+        std::fs::write(mods.join("a-corrupt.jar"), b"not a zip").unwrap();
+        std::fs::write(mods.join("b-traversal.jar"), stored_zip(&[
+            ("assets/create/models/../block/bad.json", b"{}"),
+        ])).unwrap();
+        let mut huge = stored_zip(&[
+            ("assets/create/textures/block/bad.png", b"x"),
+        ]);
+        let cd_offset = huge.windows(4).position(|window| window == b"PK\x01\x02").unwrap();
+        huge[cd_offset + 24..cd_offset + 28]
+            .copy_from_slice(&((MAX_ENTRY_BYTES + 1) as u32).to_le_bytes());
+        std::fs::write(mods.join("c-oversized.jar"), huge).unwrap();
+        std::fs::write(mods.join("z-good.jar"), create_jar(
+            br##"{"textures":{"all":"create:block/andesite_casing"},"elements":[{"from":[0,0,0],"to":[16,16,16],"faces":{"north":{"texture":"#all"}}}]}"##,
+        )).unwrap();
+        let (layers, report) = load_mod_jar_layers(&mods);
+        assert_eq!(report.rejected.len(), 3, "{:?}", report.rejected);
+        assert_eq!(report.loaded.len(), 1);
+        assert_eq!(layers.len(), 1);
+        let mut vanilla = ResourcePackLayer::default();
+        vanilla.sprites.insert("minecraft:block/stone".into(),
+            (1, 1, vec![100, 120, 140, 255]));
+        let bundle = CompiledAssetBundle::build(&[vanilla, layers[0].clone()]).unwrap();
+        assert!(bundle.atlas.placement("minecraft:block/stone").is_some());
+        assert!(bundle.atlas.placement("create:block/andesite_casing").is_some());
+        std::fs::remove_dir_all(root).unwrap();
+    }
 
     /// Minimal stored-ZIP writer for unit tests (no compression needed to
     /// prove the reader's structure handling).

@@ -627,13 +627,32 @@ impl CompiledAssetBundle {
         let mut blockstates: BTreeMap<String, BlockStateDef> = BTreeMap::new();
         let mut sprites: BTreeMap<String, (u32, u32, Vec<u8>)> = BTreeMap::new();
         let mut animations: BTreeMap<String, SpriteAnimation> = BTreeMap::new();
+        let mut custom_loader_ids = BTreeMap::new();
 
         for layer in layers {
             let mut models = BTreeMap::new();
             for (id, text) in &layer.models {
                 match RawModelJson::parse(text) {
                     Ok(model) => {
-                        models.insert(normalize_asset_id(id), model);
+                        let id = normalize_asset_id(id);
+                        // Unknown Forge/NeoForge keys are accepted by RawModelJson.
+                        // Track custom loaders for a geometric fallback after
+                        // all model parents and resource-pack overrides exist.
+                        let loader = text.contains("\"loader\"")
+                            && parse_meta_json(text)
+                                .ok()
+                                .and_then(|json| {
+                                    json.as_object().map(|map| {
+                                        matches!(map.get("loader"), Some(MetaJson::Str(_)))
+                                    })
+                                })
+                                .unwrap_or(false);
+                        if loader {
+                            custom_loader_ids.insert(id.clone(), ());
+                        } else {
+                            custom_loader_ids.remove(&id);
+                        }
+                        models.insert(id, model);
                     }
                     Err(err) => skipped_errors.push((id.clone(), err.to_string())),
                 }
@@ -653,6 +672,42 @@ impl CompiledAssetBundle {
             for (id, animation) in &layer.animations {
                 animations.insert(normalize_asset_id(id), animation.clone());
             }
+        }
+
+        // Custom kinetic loaders can supply their mesh at runtime. If a
+        // regular parent/elements chain already bakes, preserve its geometry.
+        // Otherwise render an explicitly approximate, textured full cube.
+        // Only a sprite actually supplied by the pack can trigger fallback.
+        let mut fallback_models = BTreeMap::new();
+        for id in custom_loader_ids.keys() {
+            if bake_model_with_uvlock(&model_stack, id, 0, 0, false)
+                .is_ok_and(|baked| !baked.quads.is_empty())
+            {
+                continue;
+            }
+            let Some(model) = model_stack.get(id) else {
+                continue;
+            };
+            if model.elements.as_ref().is_some_and(|elements| !elements.is_empty()) {
+                continue;
+            }
+            let texture = ["all", "side", "particle", "texture", "0"]
+                .into_iter()
+                .filter_map(|key| model.textures.get(key))
+                .chain(model.textures.values())
+                .filter(|name| !name.starts_with('#'))
+                .find(|name| sprites.contains_key(&normalize_asset_id(name)));
+            let Some(texture) = texture else {
+                continue;
+            };
+            let mut fallback = RawModelJson::parse(
+                r##"{"elements":[{"from":[0,0,0],"to":[16,16,16],"faces":{"down":{"texture":"#all"},"up":{"texture":"#all"},"north":{"texture":"#all"},"south":{"texture":"#all"},"west":{"texture":"#all"},"east":{"texture":"#all"}}}]}"##,
+            ).expect("static fallback cube JSON is valid");
+            fallback.textures.insert("all".to_owned(), normalize_asset_id(texture));
+            fallback_models.insert(id.clone(), fallback);
+        }
+        if !fallback_models.is_empty() {
+            model_stack.push_pack(fallback_models);
         }
 
         let mut builder = AtlasBuilder::for_blocks();
@@ -793,17 +848,10 @@ fn normalize_asset_id(raw: &str) -> String {
     }
 }
 
-/// Lookup mirroring `PackedAtlas`'s sprite resolution: exact key, then the
-/// path part of a `namespace:path` id, then a `minecraft:`-prefixed guess
-/// for namespace-less ids.
+/// Look up exact namespaced ids, defaulting bare names to `minecraft:`.
 fn find_named<'a, T>(map: &'a BTreeMap<String, T>, name: &str) -> Option<&'a T> {
     if let Some(value) = map.get(name) {
         return Some(value);
-    }
-    if let Some((_, path)) = name.split_once(':') {
-        if let Some(value) = map.get(path) {
-            return Some(value);
-        }
     }
     if !name.contains(':') {
         return map.get(&format!("minecraft:{name}"));
