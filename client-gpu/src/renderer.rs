@@ -794,6 +794,7 @@ struct LiveTerrainSection {
 /// ends before the deferred GPU work runs.
 struct PendingSectionUpload {
     packed: Arc<[PackedVertex]>,
+    packed_digest: u64,
     order: Arc<[u32]>,
     /// Direction buckets mirrored at queue time — they decide whether the
     /// admitted section routes into a region arena or per-section buffers.
@@ -807,6 +808,7 @@ struct PendingSectionUpload {
 impl PendingSectionUpload {
     fn new(
         packed: Arc<[PackedVertex]>,
+        packed_digest: u64,
         order: Arc<[u32]>,
         buckets: Option<DirectionBuckets>,
     ) -> Self {
@@ -817,6 +819,7 @@ impl PendingSectionUpload {
         let cost_us = 32 + upload_bytes as u64 / 256;
         Self {
             packed,
+            packed_digest,
             order,
             buckets,
             upload_bytes,
@@ -824,8 +827,10 @@ impl PendingSectionUpload {
         }
     }
 
-    fn matches(&self, packed: &[PackedVertex], order: &[u32]) -> bool {
-        self.packed.as_ref() == packed && self.order.as_ref() == order
+    fn matches(&self, packed: &[PackedVertex], packed_digest: u64, order: &[u32]) -> bool {
+        self.packed_digest == packed_digest
+            && self.packed.as_ref() == packed
+            && self.order.as_ref() == order
     }
 }
 
@@ -6746,8 +6751,11 @@ impl GpuRenderer {
         packed: &[PackedVertex],
         order: &[u32],
     ) -> bool {
+        let packed_digest = world
+            .packed_mesh_digest(coord)
+            .expect("packed mesh digest accompanies every packed section");
         let up_to_date = match self.pending_uploads.get(&coord) {
-            Some(pending) => pending.matches(packed, order),
+            Some(pending) => pending.matches(packed, packed_digest, order),
             None => self.live_sections.get(&coord).is_some_and(|existing| {
                 existing.packed.as_ref() == packed && existing.order.as_ref() == order
             }),
@@ -6760,7 +6768,7 @@ impl GpuRenderer {
         let buckets = world.direction_buckets(coord);
         self.pending_uploads.insert(
             coord,
-            PendingSectionUpload::new(packed.clone(), order.clone(), buckets),
+            PendingSectionUpload::new(packed.clone(), packed_digest, order.clone(), buckets),
         );
         // Speculative geometry build off the render thread: the drain
         // prefers this result when the worker finishes before the
