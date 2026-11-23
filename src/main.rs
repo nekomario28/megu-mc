@@ -14018,8 +14018,19 @@ impl BandCache {
     }
 
     fn get(&mut self, key: (DimId, i32, i32)) -> Option<std::sync::Arc<OpBand>> {
+        let __t = chunkprof::enabled().then(std::time::Instant::now);
         self.sync_generation();
-        self.map.get(&key).map(|(_, b)| b.clone())
+        let band = self.map.get(&key).map(|(_, b)| b.clone());
+        if let Some(t) = __t {
+            chunkprof::BAND_N.fetch_add(1, Ordering::Relaxed);
+            chunkprof::add(&chunkprof::BAND_NS, t);
+            if band.is_some() {
+                chunkprof::BAND_HITS.fetch_add(1, Ordering::Relaxed);
+            } else {
+                chunkprof::BAND_COLS_MISS.fetch_add(1, Ordering::Relaxed);
+            }
+        }
+        band
     }
 
     /// Insert (or replace) and evict the oldest entry when the bound is passed.
@@ -14238,8 +14249,8 @@ fn band_state_dim(dim: DimId, x: i32, y: i32, z: i32) -> Option<u32> {
     // for an unpopulated chunk that includes its population), so it only pays when the
     // reader wants thousands of cells from that chunk — which is `chunk_data`, and it
     // installs the band from states it already has (`install_band_rows`).
-    let band = op_bands().lock().unwrap_or_else(|e| e.into_inner()).get((dim, cx, cz))?;
-    band.get(y, (x & 15) as usize, (z & 15) as usize)
+    let band = op_bands().lock().unwrap_or_else(|e| e.into_inner()).get((dim, cx, cz));
+    band.and_then(|band| band.get(y, (x & 15) as usize, (z & 15) as usize))
 }
 
 /// Opacity of the world block at `(x, y, z)` without one locked terrain evaluation per
@@ -14276,9 +14287,13 @@ fn install_band_rows(dim: DimId, cx: i32, cz: i32, sy: i32, sec: &PalettedSectio
     if breg().is_none() {
         return;
     }
+    let __tr = chunkprof::enabled().then(std::time::Instant::now);
     let Some((y0, y1)) = band_range(dim, cx, cz) else {
         return;
     };
+    if let Some(t) = __tr {
+        chunkprof::add(&chunkprof::BAND_RANGE_NS, t);
+    }
     if sy + 15 < y0 || sy > y1 {
         return;
     }
@@ -14295,6 +14310,9 @@ fn install_band_rows(dim: DimId, cx: i32, cz: i32, sy: i32, sec: &PalettedSectio
                 cells: vec![0u32; rows << 8],
             }),
         );
+        if chunkprof::enabled() {
+            chunkprof::BAND_NEW.fetch_add(1, Ordering::Relaxed);
+        }
     }
     let Some((_, slot)) = bands.map.get_mut(&(dim, cx, cz)) else {
         return;
@@ -14309,11 +14327,16 @@ fn install_band_rows(dim: DimId, cx: i32, cz: i32, sy: i32, sec: &PalettedSectio
     // `copy_y_slice` fills a uniform section with one `fill` and otherwise unpacks only
     // the rows the band overlaps, so neither shape needs a 4096-cell scan here.
     let mut rows = [0u32; 4096];
+    let __ts = chunkprof::enabled().then(std::time::Instant::now);
     sec.copy_y_slice(ly0, count, &mut rows[..count * 256]);
     for ly in ly0..=ly1 {
         let dst = ((sy + ly as i32 - band.y0) as usize) << 8;
         let src = (ly - ly0) * 256;
         band.cells[dst..dst + 256].copy_from_slice(&rows[src..src + 256]);
+    }
+    if let Some(t) = __ts {
+        chunkprof::add(&chunkprof::BAND_SEC_NS, t);
+        chunkprof::BAND_CELLS.fetch_add((count * 256) as u64, Ordering::Relaxed);
     }
 }
 
@@ -17354,6 +17377,7 @@ pub(crate) mod chunkprof {
     pub(super) static BLOCK_AT: AtomicU64 = AtomicU64::new(0);
     pub(super) static BLOCK_AT_MISS: AtomicU64 = AtomicU64::new(0);
     pub(super) static BAND_N: AtomicU64 = AtomicU64::new(0);
+    pub(super) static BAND_HITS: AtomicU64 = AtomicU64::new(0);
     pub(super) static BAND_CELLS: AtomicU64 = AtomicU64::new(0);
     pub(super) static BAND_NS: AtomicU64 = AtomicU64::new(0);
     pub(super) static BAND_NEW: AtomicU64 = AtomicU64::new(0);
@@ -17409,14 +17433,15 @@ pub(crate) mod chunkprof {
             BLOCK_AT_MISS.load(Ordering::Relaxed) as f64 / n as f64
         );
         eprintln!(
-            "CHUNKPROF   band lookups={:.0} new={:.1} build={:.2}ms cells={:.0} (per new={:.2}ms)",
+            "CHUNKPROF   band lookups={:.0} hits={:.0} misses={:.0} lookup={:.2}ms new={:.1} range={:.2}ms rows={:.2}ms cells={:.0}",
             BAND_N.load(Ordering::Relaxed) as f64 / n as f64,
-            BAND_NEW.load(Ordering::Relaxed) as f64 / n as f64,
+            BAND_HITS.load(Ordering::Relaxed) as f64 / n as f64,
+            BAND_COLS_MISS.load(Ordering::Relaxed) as f64 / n as f64,
             BAND_NS.load(Ordering::Relaxed) as f64 / 1e6 / n as f64,
-            BAND_CELLS.load(Ordering::Relaxed) as f64 / n as f64,
-            BAND_NS.load(Ordering::Relaxed) as f64
-                / 1e6
-                / BAND_NEW.load(Ordering::Relaxed).max(1) as f64
+            BAND_NEW.load(Ordering::Relaxed) as f64 / n as f64,
+            BAND_RANGE_NS.load(Ordering::Relaxed) as f64 / 1e6 / n as f64,
+            BAND_SEC_NS.load(Ordering::Relaxed) as f64 / 1e6 / n as f64,
+            BAND_CELLS.load(Ordering::Relaxed) as f64 / n as f64
         );
         let new = BAND_NEW.load(Ordering::Relaxed).max(1) as f64;
         eprintln!(

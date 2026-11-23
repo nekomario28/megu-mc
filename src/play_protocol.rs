@@ -4537,6 +4537,12 @@ impl ChunkWindow {
     }
 
     fn contains(self, (x, z): (i32, i32)) -> bool {
+        // Login's initial radius-zero window is the spawn chunk and its 3x3 ring.
+        // Negotiated player views are clamped to at least two.
+        if self.radius == 0 {
+            return (i64::from(x) - i64::from(self.center.0)).abs() <= 1
+                && (i64::from(z) - i64::from(self.center.1)).abs() <= 1;
+        }
         // Vanilla 1.21.1 `ChunkTrackingView.Positioned`: the tracked region
         // is a rounded square, not a Chebyshev square — for view distance d
         // the bounding box is (2d+3)² with the four far corners cut, so
@@ -4569,6 +4575,13 @@ impl ChunkWindow {
             .flat_map(move |x| (cz.saturating_sub(r)..=cz.saturating_add(r)).map(move |z| (x, z)))
             .filter(move |c| self.contains(*c) && !sent.contains(c))
     }
+}
+
+/// The login path sends only the spawn chunk and its immediate ring before the
+/// teleport handshake. The configured view distance is filled by the ordinary
+/// chunk delivery loop after the player is registered.
+fn initial_chunk_window(x: f64, z: f64) -> ChunkWindow {
+    ChunkWindow::at(x, z, 0)
 }
 
 /// Replace the full light lists from map_chunk's cached payload with sparse
@@ -9669,7 +9682,7 @@ fn handle_inner(mut s: TcpStream, live_eid: Arc<AtomicI32>) {
     let mut view = client_view.clamp(2, SERVER_VIEW_DISTANCE);
     let mut chunk_ack = connection_limits::chunk_feedback(window_batch(view));
     let mut chunk_delivery = connection_limits::ChunkDelivery::default();
-    let initial_window = ChunkWindow::at(sx, sz, view);
+    let initial_window = initial_chunk_window(sx, sz);
     // vanilla: a returning player resumes where they logged out — the chunk window,
     // spawn teleport and authoritative pos all agree. The dimension was read above,
     // before Join Game, and is threaded through the first stream as well. The join
@@ -15062,6 +15075,14 @@ fn resource_pack_status_disconnects(status: Option<i64>) -> bool {
 #[cfg(test)]
 mod connection_slot_tests {
     use super::*;
+    #[test]
+    fn initial_chunk_window_is_the_spawn_chunk_and_immediate_ring() {
+        let window = initial_chunk_window(8.0, 8.0);
+        assert_eq!(window.radius, 0);
+        assert_eq!(window.center, (0, 0));
+        assert_eq!(window_batch(window.radius), 9);
+    }
+
     #[test]
     fn panic_does_not_leak_connection_slot() {
         let count = AtomicUsize::new(1);
