@@ -56,14 +56,24 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - os: ubuntu-latest
+          - os: ubuntu-22.04
             target: linux-x86_64
-          - os: ubuntu-24.04-arm
+            rust_target: ''
+          - os: ubuntu-22.04
+            target: linux-x86_64-musl
+            rust_target: x86_64-unknown-linux-musl
+          - os: ubuntu-22.04-arm
             target: linux-arm64
+            rust_target: ''
+          - os: ubuntu-22.04-arm
+            target: linux-arm64-musl
+            rust_target: aarch64-unknown-linux-musl
           - os: macos-latest
             target: macos-arm64
+            rust_target: ''
           - os: windows-latest
             target: windows-x86_64
+            rust_target: ''
     runs-on: ${{ matrix.os }}
     timeout-minutes: 60
     steps:
@@ -73,42 +83,77 @@ jobs:
       - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master
         with:
           toolchain: 1.98.0
+      - name: Install musl target toolchain
+        if: matrix.rust_target
+        shell: bash
+        env:
+          RUST_TARGET: ${{ matrix.rust_target }}
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y musl-tools
+          rustup target add "${{ matrix.rust_target }}"
+          # cc-rs (ring) looks for <arch>-linux-musl-gcc; musl-tools ships
+          # musl-gcc, so expose the prefixed name it expects.
+          arch="${RUST_TARGET%%-*}"
+          sudo ln -sf "$(command -v musl-gcc)" "/usr/local/bin/${arch}-linux-musl-gcc"
+          sudo ln -sf "$(command -v ar)" "/usr/local/bin/${arch}-linux-musl-ar"
       - name: Build server and standalone release binaries (locked)
         shell: bash
+        env:
+          RUST_TARGET: ${{ matrix.rust_target }}
         run: |
-          cargo build --locked --release --features mod-suite,create-offload --bin megu
-          cargo build --locked --release --manifest-path client-app/Cargo.toml --bin megu-client
-          cargo build --locked --release --manifest-path mod-adapter-core/Cargo.toml --bin megu-mod-check
-          cargo build --locked --release --manifest-path state-store/Cargo.toml --bin megu-world-migrate
-          cargo build --locked --release --manifest-path server-files/Cargo.toml --bins
-          cargo build --locked --release --manifest-path client-gpu/Cargo.toml --bin megu-client-gpu
+          if [[ -n "$RUST_TARGET" ]]; then
+            cargo build --locked --release --features mod-suite,create-offload --bin megu --target "$RUST_TARGET"
+            cargo build --locked --release --manifest-path server-files/Cargo.toml --bin megu-installer --target "$RUST_TARGET"
+          else
+            cargo build --locked --release --features mod-suite,create-offload --bin megu
+            cargo build --locked --release --manifest-path client-app/Cargo.toml --bin megu-client
+            cargo build --locked --release --manifest-path mod-adapter-core/Cargo.toml --bin megu-mod-check
+            cargo build --locked --release --manifest-path state-store/Cargo.toml --bin megu-world-migrate
+            cargo build --locked --release --manifest-path server-files/Cargo.toml --bins
+            cargo build --locked --release --manifest-path client-gpu/Cargo.toml --bin megu-client-gpu
+          fi
       - name: Smoke test megu-client-gpu headless probe
         shell: bash
+        env:
+          RUST_TARGET: ${{ matrix.rust_target }}
         run: |
           suffix=''
           if [[ "$RUNNER_OS" == Windows ]]; then suffix='.exe'; fi
-          "client-gpu/target/release/megu-client-gpu$suffix" --headless-probe
+          probe="client-gpu/target/release/megu-client-gpu$suffix"
+          if [[ -n "$RUST_TARGET" ]]; then
+            probe="client-gpu/target/$RUST_TARGET/release/megu-client-gpu$suffix"
+          fi
+          if [[ -f "$probe" ]]; then "$probe" --headless-probe; fi
       - name: Package and verify release archive
         shell: bash
         env:
           RELEASE_VERSION: ${{ needs.preflight.outputs.version }}
           RELEASE_TARGET: ${{ matrix.target }}
+          RUST_TARGET: ${{ matrix.rust_target }}
         run: |
           PY=python3
           command -v python3 >/dev/null 2>&1 || PY=python
           suffix=''
           if [[ "$RUNNER_OS" == Windows ]]; then suffix='.exe'; fi
           out_dir="dist/$RELEASE_TARGET"
-          "$PY" tools/release_bundle.py build \
-            --binary "target/release/megu$suffix" \
-            --extra-binary "client-app/target/release/megu-client$suffix" \
-            --extra-binary "mod-adapter-core/target/release/megu-mod-check$suffix" \
-            --extra-binary "state-store/target/release/megu-world-migrate$suffix" \
-            --extra-binary "server-files/target/release/megu-init$suffix" \
-            --extra-binary "server-files/target/release/megu-admin$suffix" \
-            --extra-binary "client-gpu/target/release/megu-client-gpu$suffix" \
-            --extra-binary "server-files/target/release/megu-installer$suffix" \
-            --out-dir "$out_dir" --version "$RELEASE_VERSION" --target "$RELEASE_TARGET"
+          if [[ -n "$RUST_TARGET" ]]; then
+            "$PY" tools/release_bundle.py build \
+              --binary "target/$RUST_TARGET/release/megu$suffix" \
+              --extra-binary "server-files/target/$RUST_TARGET/release/megu-installer$suffix" \
+              --out-dir "$out_dir" --version "$RELEASE_VERSION" --target "$RELEASE_TARGET"
+          else
+            "$PY" tools/release_bundle.py build \
+              --binary "target/release/megu$suffix" \
+              --extra-binary "client-app/target/release/megu-client$suffix" \
+              --extra-binary "mod-adapter-core/target/release/megu-mod-check$suffix" \
+              --extra-binary "state-store/target/release/megu-world-migrate$suffix" \
+              --extra-binary "server-files/target/release/megu-init$suffix" \
+              --extra-binary "server-files/target/release/megu-admin$suffix" \
+              --extra-binary "client-gpu/target/release/megu-client-gpu$suffix" \
+              --extra-binary "server-files/target/release/megu-installer$suffix" \
+              --out-dir "$out_dir" --version "$RELEASE_VERSION" --target "$RELEASE_TARGET"
+          fi
           "$PY" tools/release_bundle.py verify \
             --bundle "$out_dir/megu-$RELEASE_VERSION-$RELEASE_TARGET.tar.gz" \
             --manifest "$out_dir/release-manifest.json" \
@@ -220,10 +265,12 @@ jobs:
           import sys
           from pathlib import Path
 
-          targets = ('linux-x86_64', 'linux-arm64', 'macos-arm64', 'windows-x86_64')
+          targets = ('linux-x86_64', 'linux-x86_64-musl', 'linux-arm64',
+                     'linux-arm64-musl', 'macos-arm64', 'windows-x86_64')
           binaries = ('megu', 'megu-client', 'megu-mod-check',
                       'megu-world-migrate', 'megu-init', 'megu-admin',
                       'megu-client-gpu', 'megu-installer')
+          musl_binaries = ('megu', 'megu-installer')
           output = Path('dist/publish')
           output.mkdir(parents=True, exist_ok=True)
           checksums = {}
@@ -243,7 +290,8 @@ jobs:
               suffix = '.exe' if target.startswith('windows-') else ''
               members = {entry['path'].rsplit('/', 1)[-1]
                          for entry in metadata['files']}
-              missing = {name + suffix for name in binaries} - members
+              expected = musl_binaries if target.endswith('-musl') else binaries
+              missing = {name + suffix for name in expected} - members
               if missing:
                   raise SystemExit(f'{target} missing release binaries: {sorted(missing)}')
               for source, filename in ((archive, archive.name),

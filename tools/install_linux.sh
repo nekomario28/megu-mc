@@ -7,6 +7,12 @@
 # Usage:
 #   curl -fsSL https://raw.githubusercontent.com/nekomario28/megu-mc/main/tools/install_linux.sh | sh
 #   sh tools/install_linux.sh [client|prism|server --dir <path>|uninstall|--binaries-only]
+#
+# Environment:
+#   MEGU_TARGET         Override the detected release target (e.g. linux-x86_64-musl)
+#   MEGU_VERSION        Release tag to install (default: v0.1.0-alpha.1)
+#   MEGU_GITHUB_REPO    owner/repo override (default: nekomario28/megu-mc)
+#   MEGU_RELEASE_BASE_URL  Full base URL override for mirrors
 
 set -eu
 
@@ -28,16 +34,58 @@ need_cmd() {
     command -v "$1" >/dev/null 2>&1 || die "required command not found: $1"
 }
 
+# http_get <url> <output>: fetch a URL with curl when available, otherwise
+# wget (BusyBox wget on Alpine supports `-q -O <file> <url>`). Fails only when
+# neither tool exists or the download itself fails.
+http_get() {
+    _url="$1"
+    _out="$2"
+    if command -v curl >/dev/null 2>&1; then
+        curl -fsSL "$_url" -o "$_out" && return 0
+    fi
+    if command -v wget >/dev/null 2>&1; then
+        wget -q -O "$_out" "$_url" && return 0
+    fi
+    return 1
+}
+
+is_musl() {
+    if command -v ldd >/dev/null 2>&1; then
+        if ldd --version 2>&1 | grep -qi musl; then
+            return 0
+        fi
+    fi
+    for _libc in /lib/ld-musl-*.so.1 /usr/lib/ld-musl-*.so.1 /lib/libc.musl-*.so.1; do
+        if [ -e "$_libc" ]; then
+            return 0
+        fi
+    done
+    return 1
+}
+
 OS="$(uname -s)"
 ARCH="$(uname -m)"
 [ "$OS" = "Linux" ] || die "this installer targets Linux (detected OS: $OS)"
-case "$ARCH" in
-    x86_64|amd64) TARGET="linux-x86_64" ;;
-    aarch64|arm64) TARGET="linux-arm64" ;;
-    *) die "unsupported Linux architecture: $ARCH (supported: x86_64/amd64 -> linux-x86_64, aarch64/arm64 -> linux-arm64)" ;;
-esac
 
-need_cmd curl
+if [ -n "${MEGU_TARGET:-}" ]; then
+    TARGET="$MEGU_TARGET"
+else
+    LIBC="gnu"
+    if is_musl; then LIBC="musl"; fi
+    case "$ARCH" in
+        x86_64|amd64)
+            if [ "$LIBC" = "musl" ]; then TARGET="linux-x86_64-musl"; else TARGET="linux-x86_64"; fi
+            ;;
+        aarch64|arm64)
+            if [ "$LIBC" = "musl" ]; then TARGET="linux-arm64-musl"; else TARGET="linux-arm64"; fi
+            ;;
+        *) die "unsupported Linux architecture: $ARCH (supported: x86_64/amd64 -> linux-x86_64 or linux-x86_64-musl, aarch64/arm64 -> linux-arm64 or linux-arm64-musl; override with MEGU_TARGET)" ;;
+    esac
+fi
+
+if ! command -v curl >/dev/null 2>&1 && ! command -v wget >/dev/null 2>&1; then
+    die "neither curl nor wget found; install one to download the release (e.g. apk add wget on Alpine)"
+fi
 need_cmd tar
 need_cmd sha256sum
 need_cmd mktemp
@@ -55,9 +103,9 @@ cleanup() {
 trap cleanup EXIT INT TERM
 
 say "Downloading Megu ${VERSION} (${TARGET}) from ${BASE_URL} ..."
-curl -fsSL "${BASE_URL}/${SUMS}" -o "${WORK}/${SUMS}"
-curl -fsSL "${BASE_URL}/${ARCHIVE}" -o "${WORK}/${ARCHIVE}"
-curl -fsSL "${BASE_URL}/${JAR}" -o "${WORK}/${JAR}"
+http_get "${BASE_URL}/${SUMS}" "${WORK}/${SUMS}" || die "download failed: ${BASE_URL}/${SUMS}"
+http_get "${BASE_URL}/${ARCHIVE}" "${WORK}/${ARCHIVE}" || die "download failed: ${BASE_URL}/${ARCHIVE}"
+http_get "${BASE_URL}/${JAR}" "${WORK}/${JAR}" || die "download failed: ${BASE_URL}/${JAR}"
 
 say "Verifying SHA-256 checksums ..."
 grep -E "  (${ARCHIVE}|${JAR})\$" "${WORK}/${SUMS}" > "${WORK}/check.sums" \

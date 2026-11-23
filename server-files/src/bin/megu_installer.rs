@@ -276,18 +276,31 @@ fn auto_discover_sibling(explicit: &Option<PathBuf>, stem: &str) -> Option<PathB
 const DEFAULT_RELEASE_TAG: &str = "v0.1.0-alpha.1";
 const DEFAULT_GITHUB_REPO: &str = "nekomario28/megu-mc";
 
-fn host_release_target_for(os: &str, arch: &str) -> Option<(&'static str, &'static str)> {
-    match (os, arch) {
-        ("windows", "x86_64") => Some(("windows-x86_64", ".exe")),
-        ("linux", "x86_64") => Some(("linux-x86_64", "")),
-        ("linux", "aarch64") => Some(("linux-arm64", "")),
-        ("macos", "aarch64") => Some(("macos-arm64", "")),
+fn host_release_target_for(
+    os: &str,
+    arch: &str,
+    env: &str,
+) -> Option<(&'static str, &'static str)> {
+    match (os, arch, env) {
+        ("windows", "x86_64", _) => Some(("windows-x86_64", ".exe")),
+        ("linux", "x86_64", "musl") => Some(("linux-x86_64-musl", "")),
+        ("linux", "aarch64", "musl") => Some(("linux-arm64-musl", "")),
+        ("linux", "x86_64", _) => Some(("linux-x86_64", "")),
+        ("linux", "aarch64", _) => Some(("linux-arm64", "")),
+        ("macos", "aarch64", _) => Some(("macos-arm64", "")),
         _ => None,
     }
 }
 
 fn host_release_target() -> Option<(&'static str, &'static str)> {
-    host_release_target_for(std::env::consts::OS, std::env::consts::ARCH)
+    // `target_env` is "musl" only for `*-linux-musl` builds; every other
+    // target reports a non-musl value ("" or "gnu") and takes the glibc lane.
+    let env = if cfg!(target_env = "musl") {
+        "musl"
+    } else {
+        ""
+    };
+    host_release_target_for(std::env::consts::OS, std::env::consts::ARCH, env)
 }
 
 fn parse_expected_sha256(sums_text: &str, filename: &str) -> Option<String> {
@@ -306,6 +319,29 @@ fn parse_expected_sha256(sums_text: &str, filename: &str) -> Option<String> {
     None
 }
 
+/// Download `url` to `dest`, preferring curl and falling back to wget so
+/// minimal distros (Alpine, Void musl) that ship only BusyBox wget still work.
+fn download_release_file(url: &str, dest: &std::path::Path) -> Option<()> {
+    let curl_ok = std::process::Command::new("curl")
+        .args(["-fsSL", url, "-o"])
+        .arg(dest)
+        .status()
+        .map(|status| status.success())
+        .unwrap_or(false);
+    if curl_ok {
+        return Some(());
+    }
+    let wget_ok = std::process::Command::new("wget")
+        .arg("-q")
+        .arg("-O")
+        .arg(dest)
+        .arg(url)
+        .status()
+        .map(|status| status.success())
+        .unwrap_or(false);
+    wget_ok.then_some(())
+}
+
 /// When `megu-installer` is run as a standalone downloaded executable (no local
 /// sibling `megu-client-gpu` / `megu-bootstrapper.jar` next to it) against the
 /// real OS default directory, automatically fetch and verify the release bundle
@@ -321,7 +357,13 @@ fn auto_fetch_release_bundle(base_dir: & std::path::Path) -> Option<PathBuf> {
     let bundle_dir = runtime_dir.join(format!("megu-{tag}-{target}"));
     let client_name = format!("megu-client-gpu{suffix}");
     let jar_path = bundle_dir.join("megu-bootstrapper.jar");
-    if bundle_dir.join(&client_name).is_file() && jar_path.is_file() {
+    // The musl bundles ship only the server and this installer (no
+    // megu-client-gpu), so a complete musl fetch is recognised by the jar alone.
+    let server_only = target.ends_with("-musl");
+    let bundle_complete = bundle_dir.is_dir()
+        && jar_path.is_file()
+        && (server_only || bundle_dir.join(&client_name).is_file());
+    if bundle_complete {
         return Some(bundle_dir);
     }
     std::fs::create_dir_all(&runtime_dir).ok()?;
@@ -338,14 +380,7 @@ fn auto_fetch_release_bundle(base_dir: & std::path::Path) -> Option<PathBuf> {
         ("megu-bootstrapper.jar", &dl_jar_path),
     ] {
         let url = format!("{base_url}/{remote}");
-        let status = std::process::Command::new("curl")
-            .args(["-fsSL", &url, "-o"])
-            .arg(local)
-            .status()
-            .ok()?;
-        if !status.success() {
-            return None;
-        }
+        download_release_file(&url, local)?;
     }
     let sums_text = std::fs::read_to_string(&sums_path).ok()?;
     for (fname, path) in [
@@ -966,22 +1001,31 @@ mod tests {
     #[test]
     fn host_release_target_maps_supported_platforms() {
         assert_eq!(
-            host_release_target_for("windows", "x86_64"),
+            host_release_target_for("windows", "x86_64", ""),
             Some(("windows-x86_64", ".exe"))
         );
         assert_eq!(
-            host_release_target_for("linux", "x86_64"),
+            host_release_target_for("linux", "x86_64", "gnu"),
             Some(("linux-x86_64", ""))
         );
         assert_eq!(
-            host_release_target_for("linux", "aarch64"),
+            host_release_target_for("linux", "x86_64", "musl"),
+            Some(("linux-x86_64-musl", ""))
+        );
+        assert_eq!(
+            host_release_target_for("linux", "aarch64", "gnu"),
             Some(("linux-arm64", ""))
         );
         assert_eq!(
-            host_release_target_for("macos", "aarch64"),
+            host_release_target_for("linux", "aarch64", "musl"),
+            Some(("linux-arm64-musl", ""))
+        );
+        assert_eq!(
+            host_release_target_for("macos", "aarch64", ""),
             Some(("macos-arm64", ""))
         );
-        assert_eq!(host_release_target_for("linux", "riscv64"), None);
+        assert_eq!(host_release_target_for("linux", "riscv64", "gnu"), None);
+        assert_eq!(host_release_target_for("linux", "riscv64", "musl"), None);
     }
 
     #[test]
