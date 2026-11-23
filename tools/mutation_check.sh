@@ -3908,8 +3908,12 @@ check "p2_3_s3_block_light_anchors_at_dimension_light_min_y" \
 # A band read that answers from the Overworld's key makes a Nether write invisible to its own
 # band (and lets an Overworld cell answer for it) at the same (cx, cz).
 check "p2_3_s3_band_cache_is_keyed_by_dimension" \
-  src/main.rs 'let band = self.map.get(&key).map(|(_, b)| b.clone());' \
-  'let band = self.map.get(&(DimId::Overworld, key.1, key.2)).map(|(_, b)| b.clone());' \
+  src/main.rs 'fn band_for(dim: DimId, cx: i32, cz: i32) -> Option<std::sync::Arc<OpBand>> {
+    op_bands().get((dim, cx, cz))
+}' \
+  'fn band_for(dim: DimId, cx: i32, cz: i32) -> Option<std::sync::Arc<OpBand>> {
+    op_bands().get((DimId::Overworld, cx, cz))
+}' \
   tick_tests::p2_3_s3_chunk_caches_isolate_dimensions_on_same_coords
 
 # P2-3-S4: the dimension a client is in has to reach the wire id, the 0x47 payload, the
