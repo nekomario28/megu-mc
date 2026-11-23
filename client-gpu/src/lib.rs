@@ -22,6 +22,7 @@ pub mod recipe_ingest;
 mod mesh_pool;
 pub mod renderer;
 pub mod subworld_render;
+pub mod title_branding;
 pub mod vanilla_jar;
 pub mod window;
 

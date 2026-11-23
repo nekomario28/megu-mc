@@ -1807,6 +1807,55 @@ struct UiQuadGpu {
     index_count: u32,
 }
 
+/// One uploaded title-branding texture (wordmark or patched
+/// `MEGU EDITION` strip) plus its `UI_QUAD_WGSL`-compatible bind group:
+/// the shared screen-size uniform, the texture view and the shared
+/// nearest-neighbor UI sampler.
+struct BrandingQuadGpu {
+    /// Kept alive for its view; the bind group borrows no CPU pixels.
+    _texture: wgpu::Texture,
+    bind_group: wgpu::BindGroup,
+}
+
+/// GPU side of the runtime `MEGU EDITION` title branding: up to two
+/// textured quads (wordmark + patched edition strip) drawn through the
+/// `ui_quad` pipeline with their own bind groups, plus the yellow splash
+/// tessellated against the shared font atlas. Everything is uploaded
+/// once at boot — steady frames only rewrite the tiny vertex buffers
+/// when the window size actually changes.
+struct TitleBrandingGpu {
+    /// Clone of the `ui_quad` layout (`0` uniform, `1` texture,
+    /// `2` sampler) so each banner texture can own a bind group.
+    layout: wgpu::BindGroupLayout,
+    logo: Option<BrandingQuadGpu>,
+    edition: Option<BrandingQuadGpu>,
+    /// Fixed 8-vertex buffer: logo quad at vertices 0..4, edition at
+    /// 4..8, both uv 0..1 with white vertex color.
+    vertices: wgpu::Buffer,
+    /// Fixed `[0,1,2,0,2,3, 4,5,6,4,6,7]` — logo draws `0..6`, edition
+    /// `6..12`.
+    indices: wgpu::Buffer,
+    /// Draw gates set by [`GpuRenderer::update_title_branding`].
+    logo_draw: bool,
+    edition_draw: bool,
+    /// Grow-only splash glyph buffers (tessellated `UiMesh` vertices —
+    /// sampled against the font atlas through `ui_quad`'s bind group).
+    splash_vertices: wgpu::Buffer,
+    splash_indices: wgpu::Buffer,
+    splash_vertex_capacity: u64,
+    splash_index_capacity: u64,
+    splash_index_count: u32,
+    /// Last uploaded `(logo_rect, edition_rect, splash hash)` — skips
+    /// buffer rewrites when the title layout did not move.
+    mesh_key: Option<TitleBrandMeshKey>,
+    /// Scratch converting `UiVertex` into the Pod vertex layout.
+    vertex_scratch: Vec<UiQuadVertex>,
+}
+
+/// Layout key for [`TitleBrandingGpu::mesh_key`]: the two banner
+/// destination rects plus a content hash of the splash glyph mesh.
+type TitleBrandMeshKey = (Option<[f32; 4]>, Option<[f32; 4]>, u64);
+
 /// Pod mirror of `megu_ui::draw::UiVertex` (pixel-space position,
 /// atlas uv, straight-alpha color): 32 bytes, bound at locations 0-2.
 #[repr(C)]
@@ -1869,11 +1918,17 @@ pub struct GpuRenderer {
     /// uploaded as small vertex/index buffers instead of a per-frame
     /// `w*h*4` CPU raster + texture write.
     ui_quad: UiQuadGpu,
+    /// Runtime `MEGU EDITION` title branding quads + splash, drawn in
+    /// the UI overlay pass only on the title screen.
+    title_branding: TitleBrandingGpu,
     /// Scratch converting `UiVertex` into the Pod vertex layout — retained
     /// so identical-size frames never reallocate.
     ui_quad_vertex_scratch: Vec<UiQuadVertex>,
     /// Composed frames that drew the UI via the GPU quad pipeline.
     pub ui_gpu_quad_frames: u64,
+    /// Composed frames that also drew the `MEGU EDITION` title branding
+    /// quads or splash — zero off the title screen.
+    pub title_branding_frames: u64,
     /// Frames that wrote a CPU-rasterized RGBA framebuffer texture
     /// ([`Self::update_ui_framebuffer`]); the live window path keeps this
     /// at zero once the quad pipeline carries the UI.
@@ -4730,6 +4785,53 @@ impl GpuRenderer {
             index_capacity: 4096,
             index_count: 0,
         };
+        // Runtime `MEGU EDITION` title branding: two quads (wordmark +
+        // edition strip) reusing the `ui_quad` pipeline with their own
+        // texture bind groups, plus grow-only splash glyph buffers drawn
+        // against the shared font atlas.
+        let title_branding_vertices = ctx.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("title-branding-vertices"),
+            size: 8 * 32,
+            usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        let title_branding_indices = ctx.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("title-branding-indices"),
+            size: 48,
+            usage: wgpu::BufferUsages::INDEX | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        ctx.queue.write_buffer(
+            &title_branding_indices,
+            0,
+            bytemuck::cast_slice(&[0u32, 1, 2, 0, 2, 3, 4, 5, 6, 4, 6, 7]),
+        );
+        let title_branding = TitleBrandingGpu {
+            layout: ui_quad_layout.clone(),
+            logo: None,
+            edition: None,
+            vertices: title_branding_vertices,
+            indices: title_branding_indices,
+            logo_draw: false,
+            edition_draw: false,
+            splash_vertices: ctx.device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some("title-splash-vertices"),
+                size: 4096,
+                usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
+                mapped_at_creation: false,
+            }),
+            splash_indices: ctx.device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some("title-splash-indices"),
+                size: 4096,
+                usage: wgpu::BufferUsages::INDEX | wgpu::BufferUsages::COPY_DST,
+                mapped_at_creation: false,
+            }),
+            splash_vertex_capacity: 4096,
+            splash_index_capacity: 4096,
+            splash_index_count: 0,
+            mesh_key: None,
+            vertex_scratch: Vec::new(),
+        };
         let composite = Self::build_composite(&ctx, target_format, &frame_layout, &frame_ubo);
         // Shared stand-in uniform + bind group for sections the composed
         // pass never draws directly (arena-resident opaque with no
@@ -4874,8 +4976,10 @@ impl GpuRenderer {
             ui_sampler,
             ui_size: (0, 0),
             ui_quad,
+            title_branding,
             ui_quad_vertex_scratch: Vec::new(),
             ui_gpu_quad_frames: 0,
+            title_branding_frames: 0,
             ui_cpu_raster_uploads: 0,
             depth_texture: None,
             depth_view: None,
@@ -7594,6 +7698,257 @@ impl GpuRenderer {
         self.ui_bundle_key = Some(key);
     }
 
+    // -------------------------------------------------------------------
+    // Runtime `MEGU EDITION` title branding
+    // -------------------------------------------------------------------
+
+    /// Upload one banner RGBA image as a `UI_QUAD_WGSL`-bound texture:
+    /// the shared screen-size uniform, the new texture view and the
+    /// shared nearest UI sampler. Malformed CPU payloads (dimension or
+    /// byte-count mismatch) fail closed to `None` — no GPU state.
+    fn upload_brand_texture(
+        &self,
+        image: &crate::title_branding::RgbaImage,
+        label: &str,
+    ) -> Option<BrandingQuadGpu> {
+        let expected = image.width as usize * image.height as usize * 4;
+        if image.width == 0 || image.height == 0 || image.rgba.len() != expected {
+            return None;
+        }
+        let texture = self.ctx.device.create_texture(&wgpu::TextureDescriptor {
+            label: Some(label),
+            size: wgpu::Extent3d {
+                width: image.width,
+                height: image.height,
+                depth_or_array_layers: 1,
+            },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: wgpu::TextureFormat::Rgba8Unorm,
+            usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+            view_formats: &[],
+        });
+        self.ctx.queue.write_texture(
+            wgpu::TexelCopyTextureInfo {
+                texture: &texture,
+                mip_level: 0,
+                origin: wgpu::Origin3d::ZERO,
+                aspect: wgpu::TextureAspect::All,
+            },
+            &image.rgba,
+            wgpu::TexelCopyBufferLayout {
+                offset: 0,
+                bytes_per_row: Some(image.width * 4),
+                rows_per_image: Some(image.height),
+            },
+            wgpu::Extent3d {
+                width: image.width,
+                height: image.height,
+                depth_or_array_layers: 1,
+            },
+        );
+        let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
+        let bind_group = self.ctx.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some(label),
+            layout: &self.title_branding.layout,
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: self.ui_quad.uniform.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: wgpu::BindingResource::TextureView(&view),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 2,
+                    resource: wgpu::BindingResource::Sampler(&self.ui_sampler),
+                },
+            ],
+        });
+        Some(BrandingQuadGpu {
+            _texture: texture,
+            bind_group,
+        })
+    }
+
+    /// Install (or replace) the title-screen banner textures: the JAR's
+    /// `minecraft.png` wordmark and the `edition.png` strip already
+    /// patched in memory to `MEGU EDITION`. `None` disables that quad.
+    /// One-time PCIe upload at boot — steady frames touch nothing here.
+    pub fn set_title_branding(
+        &mut self,
+        logo: Option<&crate::title_branding::RgbaImage>,
+        edition: Option<&crate::title_branding::RgbaImage>,
+    ) {
+        self.title_branding.logo =
+            logo.and_then(|img| self.upload_brand_texture(img, "title-branding-logo"));
+        self.title_branding.edition =
+            edition.and_then(|img| self.upload_brand_texture(img, "title-branding-edition"));
+        // Texture identity changed: re-check the draw gates on the next
+        // `update_title_branding` even if the rects did not move.
+        self.title_branding.mesh_key = None;
+    }
+
+    /// Per-frame title layout: destination rects in UI pixel space for
+    /// the logo and edition quads, plus the tessellated splash glyph
+    /// mesh (sampled against the font atlas). `None` hides a quad; all
+    /// `None` keeps the branding pass fully silent off the title screen.
+    /// Rewrites the small vertex/index buffers only when the layout key
+    /// moved — steady title frames rewrite nothing.
+    pub fn update_title_branding(
+        &mut self,
+        logo_rect: Option<[f32; 4]>,
+        edition_rect: Option<[f32; 4]>,
+        splash: Option<&UiMesh>,
+    ) {
+        // Splash identity = index count + a cheap FNV-1a over its vertex
+        // positions/uvs, so a changed line or moved anchor re-uploads.
+        let splash_key = splash.map_or(0u64, |mesh| {
+            let mut hash = 0xcbf2_9ce4_8422_2325u64;
+            for v in &mesh.vertices {
+                for f in [v.position[0], v.position[1], v.uv[0], v.uv[1]] {
+                    for b in f.to_bits().to_le_bytes() {
+                        hash ^= u64::from(b);
+                        hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+                    }
+                }
+            }
+            hash = hash.wrapping_add(mesh.indices.len() as u64);
+            hash
+        });
+        let key = (logo_rect, edition_rect, splash_key);
+        if self.title_branding.mesh_key == Some(key) {
+            return;
+        }
+        self.title_branding.mesh_key = Some(key);
+        self.title_branding.logo_draw =
+            logo_rect.is_some() && self.title_branding.logo.is_some();
+        self.title_branding.edition_draw =
+            edition_rect.is_some() && self.title_branding.edition.is_some();
+
+        // Fixed 8-vertex buffer: logo quad at 0..4, edition at 4..8.
+        // Absent quads write degenerate (never-drawn) zero verts.
+        let mut verts = [UiQuadVertex::default(); 8];
+        for (slot, rect) in [logo_rect, edition_rect].into_iter().enumerate() {
+            let Some([x, y, w, h]) = rect else {
+                continue;
+            };
+            let (l, t, r, b) = (x, y, x + w, y + h);
+            verts[slot * 4] = UiQuadVertex {
+                position: [l, t],
+                uv: [0.0, 0.0],
+                color: [1.0; 4],
+            };
+            verts[slot * 4 + 1] = UiQuadVertex {
+                position: [l, b],
+                uv: [0.0, 1.0],
+                color: [1.0; 4],
+            };
+            verts[slot * 4 + 2] = UiQuadVertex {
+                position: [r, b],
+                uv: [1.0, 1.0],
+                color: [1.0; 4],
+            };
+            verts[slot * 4 + 3] = UiQuadVertex {
+                position: [r, t],
+                uv: [1.0, 0.0],
+                color: [1.0; 4],
+            };
+        }
+        self.ctx.queue.write_buffer(
+            &self.title_branding.vertices,
+            0,
+            bytemuck::cast_slice(&verts),
+        );
+
+        // Splash glyph mesh into the grow-only buffers (same pattern as
+        // `update_ui_mesh`).
+        let branding = &mut self.title_branding;
+        branding.splash_index_count = splash.map_or(0, |m| m.indices.len() as u32);
+        branding.vertex_scratch.clear();
+        if let Some(mesh) = splash {
+            branding
+                .vertex_scratch
+                .extend(mesh.vertices.iter().map(|v| UiQuadVertex {
+                    position: v.position,
+                    uv: v.uv,
+                    color: v.color,
+                }));
+            let vbytes = (branding.vertex_scratch.len() * 32) as u64;
+            if vbytes > branding.splash_vertex_capacity {
+                branding.splash_vertex_capacity = vbytes * 2;
+                branding.splash_vertices =
+                    self.ctx.device.create_buffer(&wgpu::BufferDescriptor {
+                        label: Some("title-splash-vertices"),
+                        size: branding.splash_vertex_capacity,
+                        usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
+                        mapped_at_creation: false,
+                    });
+            }
+            let ibytes = (mesh.indices.len() * 4) as u64;
+            if ibytes > branding.splash_index_capacity {
+                branding.splash_index_capacity = ibytes * 2;
+                branding.splash_indices =
+                    self.ctx.device.create_buffer(&wgpu::BufferDescriptor {
+                        label: Some("title-splash-indices"),
+                        size: branding.splash_index_capacity,
+                        usage: wgpu::BufferUsages::INDEX | wgpu::BufferUsages::COPY_DST,
+                        mapped_at_creation: false,
+                    });
+            }
+            self.ctx.queue.write_buffer(
+                &branding.splash_vertices,
+                0,
+                bytemuck::cast_slice(&branding.vertex_scratch),
+            );
+            self.ctx
+                .queue
+                .write_buffer(&branding.splash_indices, 0, bytemuck::cast_slice(&mesh.indices));
+        }
+    }
+
+    /// `true` when a title-branding draw is armed (banner quads or the
+    /// splash mesh) — the UI overlay pass opens for either UI quads or
+    /// this.
+    fn title_branding_pending(&self) -> bool {
+        let b = &self.title_branding;
+        b.logo_draw || b.edition_draw || b.splash_index_count > 0
+    }
+
+    /// Draw the title branding into `pass` after the UI quads: the
+    /// wordmark and `MEGU EDITION` strips with their own texture bind
+    /// groups, then the splash glyphs through `ui_quad`'s font-atlas
+    /// bind group — all through the same `UI_QUAD_WGSL` pipeline.
+    fn draw_title_branding(&self, pass: &mut wgpu::RenderPass<'_>) {
+        let b = &self.title_branding;
+        if !self.title_branding_pending() {
+            return;
+        }
+        pass.set_pipeline(&self.ui_quad.pipeline);
+        pass.set_vertex_buffer(0, b.vertices.slice(..));
+        pass.set_index_buffer(b.indices.slice(..), wgpu::IndexFormat::Uint32);
+        if b.logo_draw {
+            if let Some(quad) = &b.logo {
+                pass.set_bind_group(0, Some(&quad.bind_group), &[]);
+                pass.draw_indexed(0..6, 0, 0..1);
+            }
+        }
+        if b.edition_draw {
+            if let Some(quad) = &b.edition {
+                pass.set_bind_group(0, Some(&quad.bind_group), &[]);
+                pass.draw_indexed(6..12, 0, 0..1);
+            }
+        }
+        if b.splash_index_count > 0 {
+            pass.set_bind_group(0, Some(&self.ui_quad.bind_group), &[]);
+            pass.set_vertex_buffer(0, b.splash_vertices.slice(..));
+            pass.set_index_buffer(b.splash_indices.slice(..), wgpu::IndexFormat::Uint32);
+            pass.draw_indexed(0..b.splash_index_count, 0, 0..1);
+        }
+    }
+
     /// Encode one frame into `view`: sky clear + opaque + translucent +
     /// (optional) UI blit. `sky` supplies the clear color.
     pub fn render_to_view(
@@ -7762,8 +8117,10 @@ impl GpuRenderer {
         // Second pass: the UI overlay — tessellated GPU quads when
         // `update_ui_mesh` installed a mesh, else the legacy CPU-blit
         // framebuffer (no depth attachment; both pipelines are depthless).
+        // The `MEGU EDITION` title branding rides the same pass after the
+        // UI quads so banners + the splash sit above the screen widgets.
         let mut drew_quad_ui = false;
-        if self.ui_quad.index_count > 0 {
+        if self.ui_quad.index_count > 0 || self.title_branding_pending() {
             let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                 label: Some("ui-overlay"),
                 color_attachments: &[Some(wgpu::RenderPassColorAttachment {
@@ -7780,8 +8137,14 @@ impl GpuRenderer {
                 occlusion_query_set: None,
                 multiview_mask: None,
             });
-            self.draw_ui_quads(&mut pass);
-            drew_quad_ui = true;
+            if self.ui_quad.index_count > 0 {
+                self.draw_ui_quads(&mut pass);
+                drew_quad_ui = true;
+            }
+            if self.title_branding_pending() {
+                self.draw_title_branding(&mut pass);
+                self.title_branding_frames += 1;
+            }
         } else if let Some(ui_bind_group) = &self.ui_bind_group {
             let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                 label: Some("ui-overlay"),
@@ -9835,8 +10198,9 @@ impl GpuRenderer {
         }
         // UI overlay at native resolution: tessellated GPU quads when
         // `update_ui_mesh` installed a mesh, else the legacy CPU-blit.
+        // The `MEGU EDITION` title branding draws in the same pass.
         let mut drew_quad_ui = false;
-        if self.ui_quad.index_count > 0 {
+        if self.ui_quad.index_count > 0 || self.title_branding_pending() {
             let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                 label: Some("ui-overlay"),
                 color_attachments: &[Some(wgpu::RenderPassColorAttachment {
@@ -9853,8 +10217,14 @@ impl GpuRenderer {
                 occlusion_query_set: None,
                 multiview_mask: None,
             });
-            self.draw_ui_quads(&mut pass);
-            drew_quad_ui = true;
+            if self.ui_quad.index_count > 0 {
+                self.draw_ui_quads(&mut pass);
+                drew_quad_ui = true;
+            }
+            if self.title_branding_pending() {
+                self.draw_title_branding(&mut pass);
+                self.title_branding_frames += 1;
+            }
         } else if let Some(ui_bind_group) = &self.ui_bind_group {
             let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                 label: Some("ui-overlay"),

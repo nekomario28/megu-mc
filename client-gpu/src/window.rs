@@ -26,7 +26,7 @@ use megu_ui::container_screen::{
     SlotKind, UiItemStack,
 };
 use megu_ui::draw::tessellate_draw_list;
-use megu_ui::draw::{UiColor, UiRect};
+use megu_ui::draw::{text_width, UiColor, UiCommand, UiDrawList, UiRect};
 use megu_ui::hud_widgets::ScoreboardEntry;
 use megu_ui::recipe_browser::{
     BrowserTab, DetailMode, ItemEntry, RecipeBrowserAction, RecipeBrowserState,
@@ -47,6 +47,7 @@ use winit::window::{CursorGrabMode, Window, WindowAttributes, WindowId};
 
 use crate::live_session::{LiveSession, PlayerMovement, PlayerPose, SessionPaths, SessionStatus};
 use crate::renderer::{request_gpu_device, GpuRenderer};
+use crate::title_branding::{title_branding_sources, TitleBrandingAssets};
 use crate::{
     build_demo_scene, detect_display_server_kind, fingerprint_draw_list, preferred_alpha_mode,
     present_mode_for, select_display_presentation_policy, Camera, DisplayPresentationPolicy,
@@ -544,6 +545,14 @@ pub struct GpuApp {
     /// Boot-time recipe-browser ingest report (mod JARs + vanilla client
     /// JAR + datapacks); empty when no `--gameDir` was supplied.
     recipe_ingest: crate::recipe_ingest::IngestReport,
+    /// Clean-room runtime `MEGU EDITION` title branding (wordmark +
+    /// patched edition strip, merged splash pool) loaded once at boot —
+    /// the built-in splash set with no banner when no local client JAR
+    /// is discoverable.
+    title_branding: TitleBrandingAssets,
+    /// Session-deterministic splash pick seed (FNV-1a over the launch
+    /// config — never `SystemTime`).
+    splash_seed: u64,
     /// Integrated `megu` server guard while a singleplayer world runs.
     singleplayer_server: Option<integrated::SingleplayerServer>,
     /// Friend-relay host session while an invite code is live.
@@ -646,6 +655,7 @@ impl GpuApp {
             pitch_deg: -18.0,
             ..Camera::default()
         };
+        let splash_seed = splash_seed_for(&config);
         let mut ui = UiState::new();
         apply_megu_default_links(&mut ui);
         ui.settings.video.vsync = render_config.vsync;
@@ -685,6 +695,8 @@ impl GpuApp {
             inventory_sort: InventorySortState::default(),
             session_paths,
             recipe_ingest: crate::recipe_ingest::IngestReport::default(),
+            title_branding: TitleBrandingAssets::fallback(),
+            splash_seed,
             singleplayer_server,
             friend_host: None,
             friend_bridge: None,
@@ -721,6 +733,16 @@ impl GpuApp {
             let summary = app.recipe_ingest.summary_line();
             app.status_line(summary);
         }
+        // Runtime `MEGU EDITION` title branding: when the launcher paths
+        // resolve a local client JAR, its `minecraft.png`/`edition.png`/
+        // `splashes.txt` are read in memory through the lazy ZIP index —
+        // the edition strip patched to `MEGU` — and mod JARs contribute
+        // their own splash pools. Zero temp files, graceful fallback.
+        let (jar, mod_jars) = title_branding_sources(&app.session_paths);
+        app.title_branding = match jar {
+            Some(jar) => crate::title_branding::load_title_branding_from_jar(&jar, &mod_jars),
+            None => TitleBrandingAssets::fallback(),
+        };
         app
     }
 
@@ -772,6 +794,19 @@ impl GpuApp {
     /// focused detail) — read-only view for host code and tests.
     pub fn recipe_browser(&self) -> &RecipeBrowserState {
         &self.ui.recipe_browser
+    }
+
+    /// Runtime `MEGU EDITION` title branding assets loaded at boot —
+    /// [`TitleBrandingAssets::fallback`] state (built-in splashes, no
+    /// banner) when no local client JAR was discoverable.
+    pub fn title_branding(&self) -> &TitleBrandingAssets {
+        &self.title_branding
+    }
+
+    /// The session-deterministic title splash line from the merged
+    /// pool (local JAR + mod JARs + built-in Megu set).
+    pub fn active_splash(&self) -> &str {
+        self.title_branding.select_splash(self.splash_seed)
     }
 
     /// Boot-time mod/vanilla/datapack ingest report (see
@@ -1474,6 +1509,15 @@ impl GpuApp {
             .surface
             .configure(&active.renderer.gpu().device, &config);
         self.baseline_upload_budget = Some(active.renderer.upload_budget().clone());
+        // One-time PCIe upload of the runtime `MEGU EDITION` banner
+        // textures (wordmark + patched edition strip); the CPU copies
+        // stay resident in `title_branding` for a later surface loss.
+        if self.title_branding.has_banner() {
+            active.renderer.set_title_branding(
+                self.title_branding.logo.as_ref(),
+                self.title_branding.edition.as_ref(),
+            );
+        }
         if self.live.is_none() {
             let scene = build_demo_scene(self.camera.position);
             active
@@ -2159,6 +2203,44 @@ impl GpuApp {
                 })
         };
         let mut draw_list = self.ui.render(w, h);
+        // Runtime `MEGU EDITION` title branding: with the local JAR's
+        // wordmark + patched edition strip GPU-resident, the banner
+        // replaces the built-in wordmark text commands and the session's
+        // yellow splash joins the title screen.
+        let mut brand_logo_rect = None;
+        let mut brand_edition_rect = None;
+        let mut brand_splash_mesh = None;
+        if self.ui.screen == Screen::Title && self.title_branding.has_banner() {
+            draw_list.commands.retain(|c| !is_builtin_title_text(c));
+            if let (Some(logo), Some(edition)) = (
+                self.title_branding.logo.as_ref(),
+                self.title_branding.edition.as_ref(),
+            ) {
+                let layout = crate::title_branding::title_brand_layout(
+                    w,
+                    h,
+                    (logo.width, logo.height),
+                    (edition.width, edition.height),
+                );
+                brand_logo_rect = Some(layout.logo_rect);
+                brand_edition_rect = Some(layout.edition_rect);
+                let splash = self.title_branding.select_splash(self.splash_seed);
+                let mut splash_list = UiDrawList::new();
+                splash_list.text(
+                    layout.splash_anchor_x - text_width(splash, 1) as i32,
+                    layout.splash_y,
+                    1,
+                    UiColor::rgb(255, 255, 0),
+                    splash,
+                );
+                brand_splash_mesh = Some(tessellate_draw_list(w, h, &splash_list));
+            }
+        }
+        active.renderer.update_title_branding(
+            brand_logo_rect,
+            brand_edition_rect,
+            brand_splash_mesh.as_ref(),
+        );
         if let Some(live) = &self.live {
             if !live.magic.is_empty() {
                 draw_list
@@ -2851,6 +2933,42 @@ impl ApplicationHandler for GpuApp {
         }
         event_loop.set_control_flow(ControlFlow::Poll);
     }
+}
+
+/// Deterministic per-session splash seed: FNV-1a over the launch
+/// config's identity fields (`username`/`--version`/`--gameDir`) — zero
+/// `SystemTime`, stable across the whole run.
+fn splash_seed_for(config: &GpuCliConfig) -> u64 {
+    let mut hash = 0xcbf2_9ce4_8422_2325u64;
+    let mut mix = |bytes: &[u8]| {
+        for &b in bytes {
+            hash ^= u64::from(b);
+            hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+        }
+    };
+    mix(config.username.as_bytes());
+    if let Some(id) = config.version_id.as_deref() {
+        mix(id.as_bytes());
+    }
+    if let Some(dir) = config.game_dir.as_deref() {
+        mix(dir.to_string_lossy().as_bytes());
+    }
+    hash
+}
+
+/// The built-in `client-ui` title wordmark/tagline `Text` commands the
+/// GPU banner replaces while the local JAR supplies real branding.
+/// Matched by payload (never position) so a client-ui layout change
+/// degrades to "both drawn", never to a panic.
+fn is_builtin_title_text(command: &UiCommand) -> bool {
+    matches!(
+        command,
+        UiCommand::Text { scale, text, .. }
+            if (*scale == 3 && text == "MEGU")
+                || (*scale == 1
+                    && (text == "clean-room native client"
+                        || text == "クリーンルーム ネイティブクライアント"))
+    )
 }
 
 pub const MEGU_WEBSITE_URL: &str = "https://megu.megumin.tech/";
