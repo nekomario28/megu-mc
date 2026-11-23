@@ -38,9 +38,9 @@ final class InstallerGui {
         JCheckBox profile = new JCheckBox("Create launcher profile", true);
         JButton installClient = new JButton("Install client");
         JButton uninstall = new JButton("Uninstall");
-        installClient.addActionListener(e -> run(status, () -> Main.installClient(
+        installClient.addActionListener(e -> run(status, () -> Main.installClientFromGui(
                 Path.of(clientDir.getText().trim()), (String) version.getSelectedItem(),
-                profile.isSelected(), null, null)));
+                profile.isSelected())));
         uninstall.addActionListener(e -> run(status, () -> Main.uninstallClient(
                 Path.of(clientDir.getText().trim()), (String) version.getSelectedItem(),
                 profile.isSelected())));

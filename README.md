@@ -24,9 +24,11 @@ Megu is a free, open-source, clean-room Rust server and pure-`wgpu` native GPU c
 Go to the **[Downloads page](https://megu.megumin.tech/#download)** or **[GitHub Releases](https://github.com/nekomario28/megu-mc/releases/latest)**:
 
 - **Official Launcher (Windows / Linux / macOS)**:
-  - **Windows**: Download **[`megu-installer-windows-x86_64.exe`](https://github.com/nekomario28/megu-mc/releases/latest/download/megu-installer-windows-x86_64.exe)** and run it (no Java required). Select the **Megu (1.21.1)** profile in your Minecraft Launcher and play!
-  - **Linux**: Run `curl -fsSL https://raw.githubusercontent.com/nekomario28/megu-mc/main/tools/install_linux.sh | sh`
-  - **macOS (Apple Silicon)**: Download and run **[`megu-installer-macos-arm64`](https://github.com/nekomario28/megu-mc/releases/latest/download/megu-installer-macos-arm64)**
+  - **Windows (`.exe`, no Java needed)**: Download and run **[`megu-installer-windows-x86_64.exe`](https://github.com/nekomario28/megu-mc/releases/latest/download/megu-installer-windows-x86_64.exe)**.
+  - **Linux (Standard `~/.minecraft` & Flatpak)**: Run `curl -fsSL https://raw.githubusercontent.com/nekomario28/megu-mc/main/tools/install_linux.sh | sh` (or run **[`megu-installer-linux-x86_64`](https://github.com/nekomario28/megu-mc/releases/latest/download/megu-installer-linux-x86_64)**).
+  - **macOS (Apple Silicon)**: Download and run **[`megu-installer-macos-arm64`](https://github.com/nekomario28/megu-mc/releases/latest/download/megu-installer-macos-arm64)**.
+  - **Java GUI Installer (NeoForge / Fabric style, all OSes)**: Download **[`megu-bootstrapper.jar`](https://github.com/nekomario28/megu-mc/releases/latest/download/megu-bootstrapper.jar)** and double-click it (or run `java -jar megu-bootstrapper.jar`).
+  - Then open the Minecraft Launcher, select the **Megu (1.21.1)** profile, and click **Play**!
 - **Prism Launcher / Modrinth App**:
   - Download **[`megu-1.21.1.mrpack`](https://github.com/nekomario28/megu-mc/releases/latest/download/megu-1.21.1.mrpack)** and drag & drop it directly into your launcher (or run `megu-installer prism`).
 

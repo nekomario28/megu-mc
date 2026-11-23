@@ -24,9 +24,11 @@ Megu は、省メモリ・高速起動・OpenGL 依存ゼロを目指して設�
 **[ダウンロードページ](https://megu.megumin.tech/#download)** または **[GitHub Releases](https://github.com/nekomario28/megu-mc/releases/latest)** から導入します：
 
 - **公式ランチャーで遊ぶ（Windows / Linux / macOS）**:
-  - **Windows**: **[`megu-installer-windows-x86_64.exe`](https://github.com/nekomario28/megu-mc/releases/latest/download/megu-installer-windows-x86_64.exe)** をダウンロードして実行します（Java 不要）。公式ランチャーに **Megu (1.21.1)** プロファイルが自動登録されます。
-  - **Linux**: `curl -fsSL https://raw.githubusercontent.com/nekomario28/megu-mc/main/tools/install_linux.sh | sh` を実行します。
+  - **Windows（`.exe` 単体・Java 不要）**: **[`megu-installer-windows-x86_64.exe`](https://github.com/nekomario28/megu-mc/releases/latest/download/megu-installer-windows-x86_64.exe)** をダウンロードして実行します。
+  - **Linux（通常版 `~/.minecraft` ＆ Flatpak 版自動対応）**: `curl -fsSL https://raw.githubusercontent.com/nekomario28/megu-mc/main/tools/install_linux.sh | sh` を実行します（または **[`megu-installer-linux-x86_64`](https://github.com/nekomario28/megu-mc/releases/latest/download/megu-installer-linux-x86_64)** を実行）。
   - **macOS (Apple Silicon)**: **[`megu-installer-macos-arm64`](https://github.com/nekomario28/megu-mc/releases/latest/download/megu-installer-macos-arm64)** をダウンロードして実行します。
+  - **Java GUI インストーラ（NeoForge / Fabric と同じ `.jar` 方式・全 OS 共通）**: **[`megu-bootstrapper.jar`](https://github.com/nekomario28/megu-mc/releases/latest/download/megu-bootstrapper.jar)** をダブルクリック（または `java -jar megu-bootstrapper.jar`）して「Install client」を押すことでも導入できます。
+  - 導入後、公式ランチャーを起動して **Megu (1.21.1)** プロファイルを選んでプレイしてください！
 - **Prism Launcher / Modrinth App で遊ぶ**:
   - **[`megu-1.21.1.mrpack`](https://github.com/nekomario28/megu-mc/releases/latest/download/megu-1.21.1.mrpack)** をダウンロードし、ランチャー画面へドラッグ＆ドロップするだけです（または `megu-installer prism` を実行）。
 

@@ -367,6 +367,58 @@ fn auto_fetch_release_bundle(base_dir: & std::path::Path) -> Option<PathBuf> {
     Some(bundle_dir)
 }
 
+/// Stage `megu-client-gpu(.exe)` and sibling `megu(.exe)` into `<mc_dir>/bin/`
+/// so the Official Launcher (including Flatpak on Linux, macOS Dock, and
+/// Windows Store Launcher) and integrated singleplayer always find them inside
+/// `--gameDir/bin/` even after the user cleans their `Downloads` folder.
+fn stage_into_mc_bin_dir(mc_dir: &std::path::Path, client_bin: &PathBuf) -> Option<PathBuf> {
+    let bin_dir = mc_dir.join("bin");
+    std::fs::create_dir_all(&bin_dir).ok()?;
+    let file_name = client_bin.file_name()?;
+    let dest_client = bin_dir.join(file_name);
+    if client_bin != &dest_client {
+        if std::fs::symlink_metadata(&dest_client)
+            .map(|m| m.file_type().is_symlink())
+            .unwrap_or(false)
+        {
+            return None;
+        }
+        std::fs::copy(client_bin, &dest_client).ok()?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            if let Ok(meta) = std::fs::metadata(&dest_client) {
+                let mut perms = meta.permissions();
+                perms.set_mode(0o755);
+                let _ = std::fs::set_permissions(&dest_client, perms);
+            }
+        }
+    }
+    if let Some(parent) = client_bin.parent() {
+        let srv_name = if cfg!(windows) { "megu.exe" } else { "megu" };
+        let sibling_srv = parent.join(srv_name);
+        let dest_srv = bin_dir.join(srv_name);
+        if sibling_srv.is_file()
+            && sibling_srv != dest_srv
+            && !std::fs::symlink_metadata(&dest_srv)
+                .map(|m| m.file_type().is_symlink())
+                .unwrap_or(false)
+        {
+            let _ = std::fs::copy(&sibling_srv, &dest_srv);
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                if let Ok(meta) = std::fs::metadata(&dest_srv) {
+                    let mut perms = meta.permissions();
+                    perms.set_mode(0o755);
+                    let _ = std::fs::set_permissions(&dest_srv, perms);
+                }
+            }
+        }
+    }
+    Some(dest_client)
+}
+
 fn run(cli: &Cli) -> std::io::Result<()> {
     match cli.command {
         Command::Client => {
@@ -396,6 +448,13 @@ fn run(cli: &Cli) -> std::io::Result<()> {
                             "megu-client-gpu",
                             &dirs,
                         );
+                    }
+                }
+            }
+            if cli.minecraft_dir.is_none() && !cli.no_profile {
+                if let Some(ref src_client) = client_bin {
+                    if let Some(staged) = stage_into_mc_bin_dir(&mc_dir, src_client) {
+                        client_bin = Some(staged);
                     }
                 }
             }

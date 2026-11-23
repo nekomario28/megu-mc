@@ -88,11 +88,20 @@ if [ "$#" -eq 0 ]; then
     set -- client
 fi
 
-if [ -d "${HOME}/.minecraft" ] || [ "$1" != "client" ]; then
-    say "Running: megu-installer $*"
-    "${BUNDLE_DIR}/megu-installer" "$@"
-else
-    say "Note: ~/.minecraft was not found yet. Run '${BIN_DIR}/megu-installer' after initializing the Official Launcher, or '${BIN_DIR}/megu-installer prism' for Prism Launcher."
+# Detect standard ~/.minecraft or Flatpak ~/.var/app/com.mojang.Minecraft/.minecraft
+MC_DIR="${HOME}/.minecraft"
+if [ ! -d "$MC_DIR" ] && [ -d "${HOME}/.var/app/com.mojang.Minecraft/.minecraft" ]; then
+    MC_DIR="${HOME}/.var/app/com.mojang.Minecraft/.minecraft"
 fi
 
-say "Complete! Ensure ${BIN_DIR} is in your PATH."
+if [ "$1" = "client" ]; then
+    mkdir -p "${MC_DIR}/bin"
+    cp -f "${BUNDLE_DIR}/megu-client-gpu" "${MC_DIR}/bin/megu-client-gpu"
+    cp -f "${BUNDLE_DIR}/megu" "${MC_DIR}/bin/megu"
+    chmod 0755 "${MC_DIR}/bin/megu-client-gpu" "${MC_DIR}/bin/megu"
+fi
+
+say "Running: megu-installer $*"
+"${BUNDLE_DIR}/megu-installer" "$@"
+
+say "Complete! Open the Minecraft Launcher and select 'Megu (1.21.1)'."
