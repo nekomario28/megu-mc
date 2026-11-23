@@ -3745,7 +3745,7 @@ fn run_world_border_command(ctx: &CmdCtx, args: &[&str]) -> String {
     let feedback = match result {
         Ok(result) => {
             if let Some((id, body)) = result.packet {
-                broadcast(-1, |_| (id, body.clone()));
+                broadcast_packet(-1, id, &body);
             }
             result.feedback
         }
@@ -3857,7 +3857,7 @@ fn broadcast_score(board: &ScoreboardEngine, owner: &str, objective: &str) {
     }
     if let Some(score) = board.get(owner, objective) {
         let (id, body) = encode_scoreboard_score(owner, objective, score, None, None);
-        broadcast(-1, |_| (id, body.clone()));
+        broadcast_packet(-1, id, &body);
     }
 }
 
@@ -4003,7 +4003,7 @@ fn apply_scoreboard_command(board: &mut ScoreboardEngine, args: &[&str]) -> Resu
             for (index, slot) in prior_display.iter().enumerate() {
                 if slot.as_deref() == Some(*name) {
                     let (_, body) = encode_scoreboard_display(SCOREBOARD_SLOTS[index], None);
-                    broadcast(-1, |_| (0x57, body.clone()));
+                    broadcast_packet(-1, 0x57, &body);
                 }
             }
             encode_scoreboard_objective(ScoreboardObjectivePacket::Remove(name))
@@ -4019,13 +4019,13 @@ fn apply_scoreboard_command(board: &mut ScoreboardEngine, args: &[&str]) -> Resu
                     let (id, body) = encode_scoreboard_objective(
                         ScoreboardObjectivePacket::Create(objective, None),
                     );
-                    broadcast(-1, |_| (id, body.clone()));
+                    broadcast_packet(-1, id, &body);
                     if let Some(scores) = board.scores.get(name) {
                         for (owner, score) in scores {
                             let (id, body) = encode_scoreboard_score(
                                 owner, name, score.value, None, None,
                             );
-                            broadcast(-1, |_| (id, body.clone()));
+                            broadcast_packet(-1, id, &body);
                         }
                     }
                 }
@@ -4054,7 +4054,7 @@ fn apply_scoreboard_command(board: &mut ScoreboardEngine, args: &[&str]) -> Resu
         }
         _ => return Ok(reply),
     };
-    broadcast(-1, |_| (packet.0, packet.1.clone()));
+    broadcast_packet(-1, packet.0, &packet.1);
     Ok(reply)
 }
 
@@ -5279,7 +5279,7 @@ fn adv_event(pname: &str, event: &str, etype: Option<i64>) {
             .unwrap_or(id.clone());
         if GR_ANNOUNCE_ADVANCEMENTS.load(Ordering::Relaxed) != 0 {
             let line = system_chat(&format!("{} has made the advancement [{}]", pname, t));
-            broadcast(-1, |_c| (0x6c, line.clone()));
+            broadcast_packet(-1, 0x6c, &line);
         }
     }
 }
@@ -8270,7 +8270,7 @@ fn run_command_ctx(ctx: &CmdCtx, msg: &str, s: &mut Option<&Client>) -> String {
         "say" => {
             let line = format!("[Server] {}", args.join(" "));
             let pl = system_chat(&line);
-            broadcast(-1, |_c| (0x6c, pl.clone()));
+            broadcast_packet(-1, 0x6c, &pl);
             return String::new();
         }
         "me" => {
@@ -8279,7 +8279,7 @@ fn run_command_ctx(ctx: &CmdCtx, msg: &str, s: &mut Option<&Client>) -> String {
             }
             let sender = me.map(|client| client.name.as_str()).unwrap_or("Server");
             let payload = system_chat(&format!("* {sender} {}", args.join(" ")));
-            broadcast(-1, |_c| (0x6c, payload.clone()));
+            broadcast_packet(-1, 0x6c, &payload);
             return String::new();
         }
         "msg" | "tell" | "w" => {

@@ -3066,6 +3066,7 @@ fn interest_tick() {
 fn broadcast_block_destroy(cls: &[Arc<Client>], dim: DimId, pos: (i32, i32, i32), breaker: i32, stage: i8) {
     let (_, payload) = encode_play_block_destruction(breaker, pos, stage);
     let (x, y, z) = pos;
+    let mut shared = None;
     for c in cls {
         if c.eid == breaker || *c.dim.lock().unwrap_or_else(|e| e.into_inner()) != dim {
             continue;
@@ -3073,11 +3074,9 @@ fn broadcast_block_destroy(cls: &[Arc<Client>], dim: DimId, pos: (i32, i32, i32)
         let (px, py, pz, ..) = *c.pos.lock().unwrap_or_else(|e| e.into_inner());
         let (dx, dy, dz) = (px - x as f64 - 0.5, py - y as f64 - 0.5, pz - z as f64 - 0.5);
         if dx * dx + dy * dy + dz * dz <= 32.0 * 32.0 {
-            let _ = send_packet(
-                &mut c.sock.lock().unwrap_or_else(|e| e.into_inner()),
-                0x06,
-                payload.clone(),
-            );
+            if let Ok(mut w) = c.sock.lock() {
+                let _ = send_broadcast_frame(&mut w, &mut shared, 0x06, &payload);
+            }
         }
     }
 }
@@ -9678,7 +9677,7 @@ fn live_chat_relay(me: &Arc<Client>, env: &ChatMessageEnvelope, m: &str, verdict
             let _ = read_varint(&mut disguised_body);
             let disguised_payload = disguised_body.to_vec();
             let _ = send_packet(&mut me.sock.lock().unwrap_or_else(|e| e.into_inner()), 0x1e, disguised_payload.clone());
-            broadcast(me.eid, |_| (0x1e, disguised_payload.clone()));
+            broadcast_packet(me.eid, 0x1e, &disguised_payload);
         }
     }
 }
@@ -15243,11 +15242,11 @@ fn disconnect_cleanup(me_cleanup: &Arc<Client>, peer: &str) {
         let mut p = Vec::new();
         write_varint(&mut p, 1);
         p.extend_from_slice(&me_cleanup.uuid);
-        broadcast(me_cleanup.eid, |_| (0x3d, p.clone()));
+        broadcast_packet(me_cleanup.eid, 0x3d, &p);
         // `PlayerList.remove` also drops the name from everyone's completion
         // set — the `custom_chat_completions` remove complement to the join add.
         let (_, gone_name) = encode_play_custom_chat_completions(1, &[me_cleanup.name.clone()]);
-        broadcast(me_cleanup.eid, |_| (0x18, gone_name.clone()));
+        broadcast_packet(me_cleanup.eid, 0x18, &gone_name);
         // The last online client list is empty: the snapshot above is the
         // world's final live state, and an idle server's periodic autosave
         // may never run again (the liveness floor counts online clients).
