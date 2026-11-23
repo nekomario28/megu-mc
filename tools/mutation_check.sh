@@ -801,8 +801,8 @@ check "a falling block does not move in a cold chunk" \
             }' \
   a_falling_entity_stops_moving_when_its_chunk_goes_cold
 check "a save carries the falling entities it reloads" \
-  src/save_v2.rs '    write_varint(&mut *f, in_flight.len() as i64);' \
-  '    write_varint(&mut *f, 0i64);' \
+  src/save_v2.rs '    megu_core::varint::write_varlong_i64(in_flight.len() as i64, &mut *f);' \
+  '    megu_core::varint::write_varlong_i64(0i64, &mut *f);' \
   a_support_placed_under_a_falling_entity_is_landed_on
 
 check "a knockout and a save in one tick conserve the column" \
@@ -3497,8 +3497,12 @@ check "clamped_normal's int clamp keeps min_inclusive and max_inclusive apart" \
 
 # PalettedSection (M3 Slice P2a): non-straddling u64 packing/unpacking, Single fast path, and Direct 15-bit masking.
 check "paletted_read_shift_matches_pack_layout" \
-  src/paletted.rs '    ((words[word_idx] >> (slot * BITS)) & mask) as u32' \
-  '    ((words[word_idx] >> (slot * BITS + 1)) & mask) as u32' \
+  src/paletted.rs '            SectionPalette::Direct { words } => {
+                megu_core::bits::get(words, 15, idx).unwrap_or(0)
+            }' \
+  '            SectionPalette::Direct { words } => {
+                megu_core::bits::get(words, 14, idx).unwrap_or(0)
+            }' \
   paletted_tests::paletted_exact_bit_transitions_and_wire_identity
 
 check "paletted_single_returns_stored_state" \
@@ -3507,8 +3511,8 @@ check "paletted_single_returns_stored_state" \
   paletted_tests::paletted_single_variants_and_non_air_air_ids
 
 check "paletted_direct_keeps_all_15_bits" \
-  src/paletted.rs '                word |= ((st as u64) & 0x7fff) << (j * 15);' \
-  '                word |= ((st as u64) & 0x3fff) << (j * 15);' \
+  src/paletted.rs '            values[j] = (st & 0x7fff) as u16;' \
+  '            values[j] = (st & 0x3fff) as u16;' \
   paletted_tests::paletted_exact_bit_transitions_and_wire_identity
 
 # Entity collision + step-up (M2 Gameplay Slice 4a): 1.21.1 Entity.collide / collideWithShapes / BlockCollisions.

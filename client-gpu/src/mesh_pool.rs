@@ -419,7 +419,7 @@ pub fn build_hiz_stream(
         return (positions, None);
     };
     let mut ranges = [(0u32, 0u32); DIRECTION_BUCKETS];
-    for bucket in 0..DIRECTION_BUCKETS {
+    for (bucket, range) in ranges.iter_mut().enumerate() {
         let first = (positions.len() / 4) as u32;
         let begin = b.offset[bucket] as usize;
         let end = begin
@@ -434,7 +434,7 @@ pub fn build_hiz_stream(
                 positions.push(vertex.position);
             }
         }
-        ranges[bucket] = (first, (positions.len() / 4 - first as usize) as u32);
+        *range = (first, (positions.len() / 4 - first as usize) as u32);
     }
     (positions, Some(ranges))
 }
