@@ -2666,16 +2666,104 @@
     reader.readAsArrayBuffer(file);
   }
 
+  // -- Latest release pill + OS-aware download links -----------------------
+
+  var DOWNLOAD_OS_LABEL = { windows: "Windows", macos: "macOS", linux: "Linux" };
+
+  // Client-side OS detection from the least-spoofable hints available —
+  // purely local, no tracking, no cookies.
+  function detectOs() {
+    var platform = "";
+    try {
+      platform = (root.navigator && root.navigator.userAgentData &&
+        root.navigator.userAgentData.platform) || "";
+    } catch (_) {}
+    var probe = String(platform ||
+      (root.navigator &&
+        (root.navigator.platform || root.navigator.userAgent)) ||
+      "").toLowerCase();
+    if (probe.indexOf("win") !== -1) {
+      return "windows";
+    }
+    if (probe.indexOf("mac") !== -1 || probe.indexOf("darwin") !== -1) {
+      return "macos";
+    }
+    if (probe.indexOf("linux") !== -1 || probe.indexOf("x11") !== -1) {
+      return "linux";
+    }
+    return "";
+  }
+
+  // Pick the best download asset for this visitor's OS. The cross-platform
+  // bootstrapper JAR and Prism/mrpack packs are the graceful fallback when
+  // no native installer exists; URLs are re-validated against the GitHub
+  // origin even though /api/latest already fails closed.
+  function pickReleaseAsset(assets, os) {
+    if (!Array.isArray(assets)) {
+      return null;
+    }
+    var kinds = (os ? ["installer_" + os, "bundle_" + os] : [])
+      .concat(["installer_jar", "prism_zip", "mrpack"]);
+    for (var k = 0; k < kinds.length; k++) {
+      for (var i = 0; i < assets.length; i++) {
+        var a = assets[i];
+        if (a && a.kind === kinds[k] && typeof a.url === "string" &&
+            a.url.indexOf("https://github.com/") === 0) {
+          return a;
+        }
+      }
+    }
+    return null;
+  }
+
+  var latestRelease = null; // {version, htmlUrl, os, asset, totalDownloads}
+
+  function renderLatestRelease() {
+    var st = latestRelease;
+    if (!st) {
+      return;
+    }
+    var ja = document.documentElement.lang === "ja";
+
+    var pill = $("latest-release-pill");
+    if (pill) {
+      pill.textContent = st.version;
+      pill.setAttribute("href",
+        (st.asset && st.asset.url) || st.htmlUrl || CFG.releasesUrl);
+      pill.removeAttribute("hidden");
+    }
+
+    var counter = $("download-count");
+    if (counter) {
+      if (st.totalDownloads > 0) {
+        var n = st.totalDownloads.toLocaleString("en-US");
+        counter.textContent = ja ? n + " ダウンロード" : n + " downloads";
+        counter.removeAttribute("hidden");
+      } else {
+        counter.setAttribute("hidden", "");
+      }
+    }
+
+    var btn = $("dl-client-btn");
+    if (btn && st.asset) {
+      btn.setAttribute("href", st.asset.url);
+      var label = DOWNLOAD_OS_LABEL[st.os] || "";
+      btn.textContent = label
+        ? (ja ? label + " 版をダウンロード" : "Download for " + label)
+        : (ja ? "ダウンロード" : "Download");
+    }
+  }
+
   function bindLatestRelease() {
     var pill = $("latest-release-pill");
     if (!pill || typeof fetch !== "function") {
       return;
     }
-    var cfg = siteConfig();
-    var endpoint = typeof cfg.latestApiUrl === "string" ? cfg.latestApiUrl.trim() : "";
+    var endpoint = typeof CFG.latestApiUrl === "string" ? CFG.latestApiUrl.trim() : "";
     if (!endpoint) {
       return;
     }
+    document.addEventListener("megu:languagechange", renderLatestRelease);
     fetch(endpoint, { headers: { accept: "application/json" } })
       .then(function (res) {
         if (!res || !res.ok) {
@@ -2691,12 +2779,18 @@
         if (!version || version.length > 48) {
           return;
         }
-        pill.textContent = version;
-        if (typeof data.html_url === "string" &&
-            data.html_url.indexOf("https://github.com/") === 0) {
-          pill.setAttribute("href", data.html_url);
-        }
-        pill.removeAttribute("hidden");
+        var os = detectOs();
+        latestRelease = {
+          version: version,
+          htmlUrl: typeof data.html_url === "string" &&
+            data.html_url.indexOf("https://github.com/") === 0
+            ? data.html_url : "",
+          os: os,
+          asset: pickReleaseAsset(data.assets, os),
+          totalDownloads: Number.isFinite(data.total_downloads) &&
+            data.total_downloads > 0 ? Math.floor(data.total_downloads) : 0,
+        };
+        renderLatestRelease();
       })
       .catch(function () {
         // Stay gracefully hidden when offline or before first release.

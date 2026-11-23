@@ -686,6 +686,214 @@ await test("onRequestGet /api/latest fails closed on upstream errors", async () 
   }
 });
 
+// ------------------------------------------------- /api/latest telemetry
+
+function releaseFixture(overrides = {}) {
+  return {
+    draft: false,
+    prerelease: false,
+    tag_name: "v1.0.0",
+    published_at: "2026-11-20T10:00:00Z",
+    html_url: "https://github.com/o/r/releases/tag/v1.0.0",
+    assets: [],
+    ...overrides,
+  };
+}
+
+function assetFixture(name, download_count, url) {
+  return {
+    name,
+    size: 1024,
+    download_count,
+    browser_download_url: url ||
+      `https://github.com/o/r/releases/download/v1.0.0/${name}`,
+  };
+}
+
+// Mock both release endpoints: `latest` is served at /releases/latest
+// (latestStatus when null, 404 by default) and `releases` at the list
+// endpoint queried for per-release download telemetry.
+function mockLatestFetch({ latest = null, latestStatus = 404, releases = [] }) {
+  const realFetch = globalThis.fetch;
+  globalThis.fetch = async (url) => {
+    const u = String(url);
+    if (u.endsWith("/releases/latest")) {
+      if (latest === null) {
+        return new Response("Not Found", { status: latestStatus });
+      }
+      return new Response(JSON.stringify(latest), {
+        status: 200, headers: { "content-type": "application/json" } });
+    }
+    if (u.includes("/releases")) {
+      return new Response(JSON.stringify(releases), {
+        status: 200, headers: { "content-type": "application/json" } });
+    }
+    return new Response("unmocked " + u, { status: 500 });
+  };
+  return () => { globalThis.fetch = realFetch; };
+}
+
+function latestContext() {
+  return {
+    request: new Request("https://megu.example/api/latest"),
+    env: { GITHUB_REPO: "o/r" },
+  };
+}
+
+await test("onRequestGet /api/latest never counts metadata, drafts or test tags", async () => {
+  const restore = mockLatestFetch({
+    releases: [
+      releaseFixture({
+        tag_name: "v1.0.0",
+        assets: [
+          assetFixture("megu-installer.exe", 100),
+          assetFixture("megu-bootstrapper.jar", 50),
+          assetFixture("SHA256SUMS", 900),
+          assetFixture("release-manifest.json", 800),
+          assetFixture("megu.sbom.json", 700),
+          assetFixture("megu-installer.exe.sig", 600),
+          assetFixture("megu-installer.exe.sha256", 500),
+          assetFixture("megu-installer.exe.asc", 400),
+          assetFixture("README.txt", 300),
+          assetFixture("CHANGELOG.md", 200),
+        ],
+      }),
+      releaseFixture({
+        draft: true, tag_name: "v1.0.1-rc",
+        assets: [assetFixture("megu-installer.exe", 9999)],
+      }),
+      releaseFixture({
+        tag_name: "v0.9.9-test",
+        assets: [assetFixture("megu-installer.exe", 9999)],
+      }),
+      releaseFixture({
+        tag_name: "v0.9.8-ci.3",
+        assets: [assetFixture("megu-installer.exe", 9999)],
+      }),
+      releaseFixture({
+        tag_name: "v0.9.7-dryrun",
+        assets: [assetFixture("megu-installer.exe", 9999)],
+      }),
+      releaseFixture({
+        tag_name: "v0.9.6.dev",
+        assets: [assetFixture("megu-installer.exe", 9999)],
+      }),
+      releaseFixture({
+        tag_name: "v0.9.5",
+        assets: [
+          assetFixture("megu-server-linux-x86_64.tar.gz", 25),
+          assetFixture("notes.txt", 888),
+        ],
+      }),
+    ],
+  });
+  try {
+    const res = await latest.onRequestGet(latestContext());
+    assert.equal(res.status, 200);
+    assert.equal(res.headers.get("cache-control"), "public, max-age=600");
+    const j = await res.json();
+    assert.equal(j.ok, true);
+    assert.equal(j.version, "v1.0.0");
+    // 100 (.exe) + 50 (.jar) + 25 (.tar.gz from the older release) —
+    // checksums, signatures, SBOMs, manifests, drafts and test/ci/dryrun/
+    // dev tags contribute nothing.
+    assert.equal(j.total_downloads, 175);
+    assert.equal(j.release_downloads, 150);
+    assert.deepEqual(j.assets.map(a => a.name),
+      ["megu-installer.exe", "megu-bootstrapper.jar"]);
+    assert.ok(j.assets.every(a => a.url.startsWith("https://github.com/")));
+  } finally {
+    restore();
+  }
+});
+
+await test("onRequestGet /api/latest classifies kinds and fails closed on non-GitHub URLs", async () => {
+  const restore = mockLatestFetch({
+    releases: [
+      releaseFixture({
+        tag_name: "v2.0.0",
+        assets: [
+          assetFixture("megu-installer.exe", 100),
+          assetFixture("megu-installer.dmg", 40),
+          assetFixture("megu-bootstrapper.jar", 30),
+          assetFixture("megu-prism-1.21.1.zip", 20),
+          assetFixture("megu-1.21.1.mrpack", 15),
+          assetFixture("megu-server-linux-x86_64.tar.gz", 10),
+          assetFixture("megu-x86_64.AppImage", 5),
+          assetFixture("megu-symbols.zip", 2),
+          assetFixture("megu-stealer.exe", 7777,
+            "https://evil-cdn.example/megu-stealer.exe"),
+          assetFixture("megu-relative.exe", 7777,
+            "/o/r/releases/download/v2.0.0/megu-relative.exe"),
+        ],
+      }),
+    ],
+  });
+  try {
+    const res = await latest.onRequestGet(latestContext());
+    assert.equal(res.status, 200);
+    const j = await res.json();
+    assert.equal(j.version, "v2.0.0");
+    assert.equal(j.total_downloads, 222);
+    assert.equal(j.release_downloads, 222);
+    const kinds = {};
+    for (const a of j.assets) {
+      kinds[a.name] = a.kind;
+      assert.equal(typeof a.size, "number");
+      assert.equal(typeof a.download_count, "number");
+      assert.ok(a.url.startsWith("https://github.com/"), a.name);
+    }
+    assert.equal(j.assets.length, 8);
+    assert.equal(kinds["megu-installer.exe"], "installer_windows");
+    assert.equal(kinds["megu-installer.dmg"], "installer_macos");
+    assert.equal(kinds["megu-bootstrapper.jar"], "installer_jar");
+    assert.equal(kinds["megu-prism-1.21.1.zip"], "prism_zip");
+    assert.equal(kinds["megu-1.21.1.mrpack"], "mrpack");
+    assert.equal(kinds["megu-server-linux-x86_64.tar.gz"], "bundle_linux");
+    assert.equal(kinds["megu-x86_64.AppImage"], "bundle_linux");
+    assert.equal(kinds["megu-symbols.zip"], "other");
+  } finally {
+    restore();
+  }
+});
+
+await test("onRequestGet /api/latest prefers stable latest and sums every eligible release", async () => {
+  const restore = mockLatestFetch({
+    latest: releaseFixture({ tag_name: "v1.0.0" }),
+    releases: [
+      releaseFixture({
+        tag_name: "v1.1.0-alpha.1",
+        prerelease: true,
+        published_at: "2026-11-22T09:00:00Z",
+        html_url: "https://github.com/o/r/releases/tag/v1.1.0-alpha.1",
+        assets: [assetFixture("megu-installer.exe", 7)],
+      }),
+      releaseFixture({
+        tag_name: "v1.0.0",
+        assets: [
+          assetFixture("megu-installer.exe", 100),
+          assetFixture("megu-bootstrapper.jar", 23),
+        ],
+      }),
+    ],
+  });
+  try {
+    const res = await latest.onRequestGet(latestContext());
+    assert.equal(res.status, 200);
+    const j = await res.json();
+    // The stable /releases/latest wins over the newer alpha, while the
+    // alpha's real downloads still count toward the total.
+    assert.equal(j.version, "v1.0.0");
+    assert.equal(j.prerelease, undefined);
+    assert.equal(j.release_downloads, 123);
+    assert.equal(j.total_downloads, 130);
+    assert.deepEqual(j.assets.map(a => a.name),
+      ["megu-installer.exe", "megu-bootstrapper.jar"]);
+  } finally {
+    restore();
+  }
+});
+
 // ---------------------------------------------------------------- summary
 
 console.log(`\n${passed} passed, ${failed} failed`);
