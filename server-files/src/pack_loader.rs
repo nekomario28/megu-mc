@@ -487,14 +487,7 @@ fn extract_member(bytes: &[u8], entry: &IndexedMember) -> Result<Vec<u8>, PackLo
 }
 
 fn crc32(data: &[u8]) -> u32 {
-    let mut crc = !0u32;
-    for &byte in data {
-        crc ^= u32::from(byte);
-        for _ in 0..8 {
-            crc = (crc >> 1) ^ if crc & 1 != 0 { 0xedb8_8320 } else { 0 };
-        }
-    }
-    !crc
+    megu_core::hash::crc32_ieee(data)
 }
 
 // The byte-bounded DEFLATE implementation is shared algorithmically with the

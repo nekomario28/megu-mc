@@ -497,74 +497,26 @@ impl<'a> RawNbtCursor<'a> {
         Ok(usize::from(u16::from_be_bytes(bytes)))
     }
 
-    fn count(&mut self) -> Result<usize, InteropError> {
-        let bytes: [u8; 4] = self
-            .take(4)?
-            .try_into()
-            .map_err(|_| InteropError::InvalidDocument("invalid NBT array size"))?;
-        usize::try_from(i32::from_be_bytes(bytes))
-            .map_err(|_| InteropError::InvalidDocument("negative NBT array size"))
-    }
 
     fn skip_payload(&mut self, id: u8, depth: usize) -> Result<(), InteropError> {
-        if depth > NBT_DEPTH_CAP {
-            return Err(InteropError::InvalidDocument("raw NBT exceeds nesting cap"));
-        }
-        match id {
-            1 => {
-                self.take(1)?;
-            }
-            2 => {
-                self.take(2)?;
-            }
-            3 | 5 => {
-                self.take(4)?;
-            }
-            4 | 6 => {
-                self.take(8)?;
-            }
-            7 | 11 | 12 => {
-                let count = self.count()?;
-                let width = match id {
-                    7 => 1,
-                    11 => 4,
-                    _ => 8,
-                };
-                let size = count
-                    .checked_mul(width)
-                    .ok_or(InteropError::InvalidDocument("NBT array size overflow"))?;
-                self.take(size)?;
-            }
-            8 => {
-                let size = self.u16()?;
-                self.take(size)?;
-            }
-            9 => {
-                let kind = self.u8()?;
-                let count = self.count()?;
-                if kind > 12 || (kind == 0 && count != 0) {
-                    return Err(InteropError::InvalidDocument("invalid NBT list type"));
-                }
-                for _ in 0..count {
-                    self.skip_payload(kind, depth + 1)?;
-                }
-            }
-            10 => loop {
-                let kind = self.u8()?;
-                if kind == 0 {
-                    break;
-                }
-                if kind > 12 {
-                    return Err(InteropError::InvalidDocument("invalid NBT compound tag"));
-                }
-                let size = self.u16()?;
-                self.take(size)?;
-                self.skip_payload(kind, depth + 1)?;
-            },
-            _ => return Err(InteropError::InvalidDocument("invalid raw NBT tag")),
-        }
-        Ok(())
-    }
+    if depth > NBT_DEPTH_CAP { return Err(InteropError::InvalidDocument("raw NBT exceeds nesting cap")); }
+    let limits = megu_core::nbt_wire::NbtWireLimits {
+        max_depth: NBT_DEPTH_CAP - depth + 1,
+        max_tags: NBT_SIZE_CAP,
+        max_list_len: NBT_SIZE_CAP,
+        max_array_bytes: NBT_SIZE_CAP,
+    };
+    let remaining = self.bytes.get(self.pos..).ok_or(InteropError::InvalidDocument("truncated raw NBT tag"))?;
+    let consumed = megu_core::nbt_wire::skip_nbt_payload(id, remaining, limits).map_err(|error| match error {
+        megu_core::nbt_wire::NbtWireError::DepthExceeded { .. } => InteropError::InvalidDocument("raw NBT exceeds nesting cap"),
+        megu_core::nbt_wire::NbtWireError::NegativeLength { .. } => InteropError::InvalidDocument("negative NBT array size"),
+        megu_core::nbt_wire::NbtWireError::LengthOverflow { .. } => InteropError::InvalidDocument("NBT array size overflow"),
+        megu_core::nbt_wire::NbtWireError::InvalidEmptyElementList { .. } => InteropError::InvalidDocument("invalid NBT list type"),
+        _ => InteropError::InvalidDocument("invalid raw NBT tag"),
+    })?;
+    self.take(consumed)?;
+    Ok(())
+}
 }
 
 struct RawNbtField<'a> {

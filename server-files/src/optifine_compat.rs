@@ -913,7 +913,7 @@ fn resolve_submodels(
 }
 
 pub fn model_fingerprint(model: &ResolvedEntityModel) -> u64 {
-    let mut hash = 0xcbf2_9ce4_8422_2325u64;
+    let mut hash = megu_core::hash::FNV1A64_OFFSET_BASIS;
     hash_option_string(&mut hash, model.texture.as_deref());
     hash_u32(&mut hash, model.texture_size[0]);
     hash_u32(&mut hash, model.texture_size[1]);
@@ -946,10 +946,9 @@ pub fn model_fingerprint(model: &ResolvedEntityModel) -> u64 {
 }
 
 fn hash_bytes(hash: &mut u64, bytes: &[u8]) {
-    for byte in bytes {
-        *hash ^= u64::from(*byte);
-        *hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
-    }
+    let mut state = megu_core::hash::Fnv1a64::with_seed(*hash);
+    state.update(bytes);
+    *hash = state.value();
 }
 
 fn hash_u64(hash: &mut u64, value: u64) {

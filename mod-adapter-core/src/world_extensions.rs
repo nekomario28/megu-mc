@@ -495,28 +495,9 @@ fn ray_aabb(origin: [f64; 3], dir: [f64; 3], min: [f64; 3], max: [f64; 3], max_t
 // Bounded delegate wire contracts (CGD1 / EAD1)
 // ===========================================================================
 
-/// IEEE 802 CRC-32 (same polynomial Java's `java.util.zip.CRC32` uses), kept
-/// private — the wire formats depend on its exact semantics.
-const CRC_TABLE: [u32; 256] = {
-    let mut table = [0; 256];
-    let mut i = 0;
-    while i < table.len() {
-        let mut crc = i as u32;
-        let mut bit = 0;
-        while bit < 8 {
-            crc = (crc >> 1) ^ if crc & 1 == 1 { 0xedb8_8320 } else { 0 };
-            bit += 1;
-        }
-        table[i] = crc;
-        i += 1;
-    }
-    table
-};
-
+/// IEEE 802 CRC-32 delegated to the shared canonical primitive.
 fn crc32(data: &[u8]) -> u32 {
-    !data.iter().fold(!0, |crc, byte| {
-        (crc >> 8) ^ CRC_TABLE[((crc as u8) ^ byte) as usize]
-    })
+    megu_core::hash::crc32_ieee(data)
 }
 
 /// `magic + crc32(body) + body` frame; `None` on any corruption, truncation,
@@ -1432,10 +1413,5 @@ fn mix64(mut z: u64) -> u64 {
 }
 
 fn fnv1a64(text: &str) -> u64 {
-    let mut h = 0xcbf2_9ce4_8422_2325u64;
-    for &b in text.as_bytes() {
-        h ^= u64::from(b);
-        h = h.wrapping_mul(0x0000_0100_0000_01b3);
-    }
-    h
+    megu_core::hash::fnv1a64_str(text)
 }

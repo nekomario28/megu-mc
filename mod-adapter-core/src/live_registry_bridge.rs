@@ -432,15 +432,7 @@ fn encoded_frame_len(plan: &UnifiedModRegistryPlan) -> Option<usize> {
 }
 
 fn crc32(bytes: &[u8]) -> u32 {
-    let mut crc = !0u32;
-    for &byte in bytes {
-        crc ^= u32::from(byte);
-        for _ in 0..8 {
-            let mask = 0u32.wrapping_sub(crc & 1);
-            crc = (crc >> 1) ^ (0xEDB8_8320 & mask);
-        }
-    }
-    !crc
+    megu_core::hash::crc32_ieee(bytes)
 }
 
 struct Reader<'a> {

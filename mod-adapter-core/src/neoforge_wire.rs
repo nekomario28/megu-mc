@@ -18,34 +18,16 @@ pub const CONFIG_REGISTRY_DATA_PACKET_ID: u8 = 0x07;
 pub const MAX_REGISTRY_DATA_NAME_LEN: usize = 32_767;
 
 /// Protocol 767 VarInt encoder.
-pub fn write_varint(out: &mut Vec<u8>, mut value: u32) {
-    loop {
-        let mut byte = (value & 0x7F) as u8;
-        value >>= 7;
-        if value != 0 {
-            byte |= 0x80;
-        }
-        out.push(byte);
-        if value == 0 {
-            break;
-        }
-    }
+pub fn write_varint(out: &mut Vec<u8>, value: u32) {
+    megu_core::varint::write_varint_i32(value as i32, out);
 }
 
 /// Protocol 767 VarInt decoder with strict 5-byte bound.
 pub fn read_varint(bytes: &[u8], cursor: &mut usize) -> Option<u32> {
-    let mut result = 0u32;
-    let mut shift = 0u32;
-    for _ in 0..5 {
-        let byte = *bytes.get(*cursor)?;
-        *cursor += 1;
-        result |= u32::from(byte & 0x7F) << shift;
-        if byte & 0x80 == 0 {
-            return Some(result);
-        }
-        shift += 7;
-    }
-    None
+    let tail = bytes.get(*cursor..)?;
+    let (value, consumed) = megu_core::varint::read_varint_i32(tail).ok()?;
+    *cursor = cursor.checked_add(consumed)?;
+    Some(value as u32)
 }
 
 /// Protocol 767 UTF-8 string encoder (`VarInt(len) + utf8 bytes`).

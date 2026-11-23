@@ -323,16 +323,9 @@ pub enum ConflictUiVisibility {
 /// each slot's item id with a separator byte so `["ab","c"]` and
 /// `["a","bc"]` differ. Used to key the per-grid preference memory.
 pub fn recipe_grid_signature(slots: &[&str]) -> u64 {
-    let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
-    for slot in slots {
-        for &b in slot.as_bytes() {
-            hash ^= u64::from(b);
-            hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
-        }
-        hash ^= 0xff;
-        hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
-    }
-    hash
+    let mut hash = megu_core::hash::Fnv1a64::new();
+    for slot in slots { hash.update(slot.as_bytes()); hash.update_u8(0xff); }
+    hash.value()
 }
 
 fn recipe_sort_key(c: &RecipeCandidate) -> (bool, &str) {

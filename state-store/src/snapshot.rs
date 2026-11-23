@@ -137,36 +137,9 @@ impl Error for SnapshotError {}
 
 // ------------------------------------------------------------------ CRC32
 
-/// IEEE 802.3 reflected CRC32 (the Ethernet/`zlib` polynomial), built at
-/// compile time — pure `std`, no table crate.
-const fn crc32_table() -> [u32; 256] {
-    let mut table = [0u32; 256];
-    let mut i = 0;
-    while i < 256 {
-        let mut c = i as u32;
-        let mut k = 0;
-        while k < 8 {
-            c = if c & 1 != 0 {
-                0xEDB8_8320 ^ (c >> 1)
-            } else {
-                c >> 1
-            };
-            k += 1;
-        }
-        table[i] = c;
-        i += 1;
-    }
-    table
-}
-
-static CRC32_TABLE: [u32; 256] = crc32_table();
-
+/// IEEE 802.3 reflected CRC32 delegated to the shared canonical primitive.
 fn crc32(bytes: &[u8]) -> u32 {
-    let mut crc = !0u32;
-    for &b in bytes {
-        crc = CRC32_TABLE[((crc ^ u32::from(b)) & 0xff) as usize] ^ (crc >> 8);
-    }
-    !crc
+    megu_core::hash::crc32_ieee(bytes)
 }
 
 // ----------------------------------------------------------------- encode

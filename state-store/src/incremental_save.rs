@@ -20,23 +20,11 @@ use std::hash::Hash;
 use std::io;
 use std::path::{Path, PathBuf};
 
-const FNV_OFFSET: u64 = 0xcbf2_9ce4_8422_2325;
-const FNV_PRIME: u64 = 0x0000_0100_0000_01b3;
-
-fn splitmix64(mut z: u64) -> u64 {
-    z = (z ^ (z >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
-    z = (z ^ (z >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
-    z ^ (z >> 31)
-}
 
 /// Deterministic 64-bit content fingerprint of a serialized payload. The
 /// persisted-hash skip compares this value, never the bytes themselves.
 pub fn content_fingerprint(bytes: &[u8]) -> u64 {
-    let mut h = FNV_OFFSET;
-    for &b in bytes {
-        h = (h ^ u64::from(b)).wrapping_mul(FNV_PRIME);
-    }
-    splitmix64(h)
+    megu_core::perf_kit::fingerprint_bytes(bytes)
 }
 
 /// Per-tick drain caps for [`IncrementalSaveQueue`]. A single queued item

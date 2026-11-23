@@ -308,16 +308,7 @@ fn put_str(out: &mut Vec<u8>, field: &'static str, s: &str) -> Result<(), Claims
 /// Protocol VarInt: unsigned LEB128 of the 32-bit two's-complement form —
 /// the same framing `FriendlyByteBuf` writes.
 fn put_varint(out: &mut Vec<u8>, value: i32) {
-    let mut rest = value as u32;
-    loop {
-        let byte = (rest & 0x7f) as u8;
-        rest >>= 7;
-        if rest == 0 {
-            out.push(byte);
-            return;
-        }
-        out.push(byte | 0x80);
-    }
+    megu_core::varint::write_varint_i32(value, out);
 }
 
 fn check_identifier(field: &'static str, value: &str) -> Result<(), ClaimsWireError> {
@@ -496,19 +487,24 @@ impl<'a> Reader<'a> {
     /// Protocol VarInt: at most five bytes, the last carrying ≤4 payload
     /// bits.
     fn varint(&mut self) -> Result<i32, ClaimsWireError> {
-        let mut value = 0u32;
-        for index in 0..5 {
-            let byte = self.u8()?;
-            if index == 4 && byte > 0x0f {
-                return Err(ClaimsWireError::VarIntTooLong);
+        let tail = self
+            .bytes
+            .get(self.cursor..)
+            .ok_or(ClaimsWireError::VarIntTooLong)?;
+        match megu_core::varint::read_varint_i32(tail) {
+            Ok((value, consumed)) => {
+                self.cursor += consumed;
+                Ok(value)
             }
-            value |= ((byte & 0x7f) as u32) << (7 * index);
-            if byte & 0x80 == 0 {
-                return Ok(value as i32);
+            Err(megu_core::varint::VarIntError::UnexpectedEof) => {
+                Err(ClaimsWireError::Truncated {
+                    needed: 1,
+                    remaining: 0,
+                })
             }
+            Err(_) => Err(ClaimsWireError::VarIntTooLong),
         }
-        Err(ClaimsWireError::VarIntTooLong)
-    }
+}
 
     /// A `u16be` length-prefixed UTF-8 string. The cap is checked *before*
     /// the body is touched, so a hostile length yields `StringTooLong`

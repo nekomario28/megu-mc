@@ -230,15 +230,8 @@ impl MapFairPlayConfig {
 /// (world name, dimension path, or seed text). FNV-1a 64 folded into the
 /// positive `i32` range; the `0` outcome is remapped to `1`.
 pub fn derive_world_level_id(world_key: &str) -> i32 {
-    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
-    for &b in world_key.as_bytes() {
-        h ^= u64::from(b);
-        h = h.wrapping_mul(0x0000_0100_0000_01b3);
-    }
-    match (h & 0x7fff_ffff) as i32 {
-        0 => 1,
-        v => v,
-    }
+    let hash = megu_core::hash::fnv1a64(world_key.as_bytes());
+    match (hash & 0x7fff_ffff) as i32 { 0 => 1, value => value }
 }
 
 /// One plugin-channel payload to send to a client.
