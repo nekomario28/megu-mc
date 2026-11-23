@@ -266,6 +266,20 @@ fn encode_play_player_combat_kill(player_id: i32, message: &str) -> (i64, Vec<u8
     (0x3c, out)
 }
 
+/// `custom_chat_completions` (`0x18`): `action` is 0 add / 1 remove / 2 set,
+/// followed by a list of strings. Vanilla's `PlayerList` uses it to track the
+/// online-name completion set: the joiner gets `add` for every online name
+/// and everyone else gets `add` for the new name; a departure removes it.
+fn encode_play_custom_chat_completions(action: i64, entries: &[String]) -> (i64, Vec<u8>) {
+    let mut out = Vec::new();
+    write_varint(&mut out, action);
+    write_varint(&mut out, entries.len() as i64);
+    for entry in entries {
+        write_str(&mut out, entry);
+    }
+    (0x18, out)
+}
+
 #[allow(dead_code)]
 fn encode_play_player_look_at(
     source_anchor: u8,
@@ -738,11 +752,11 @@ fn tag_biome_wire_id(name: &str) -> Option<i32> {
         .and_then(|i| i32::try_from(i).ok())
 }
 
-/// The tag map `update_tags` (0x78) carries: every `datapack_registry`
-/// category whose members resolve to a live registry id, keyed by the wire
-/// registry name. Categories without a resolver are left out so clients keep
+/// The resolved `(wire registry, [(tag, member ids)])` map the datapack
+/// registry publishes: every category whose members resolve to a live
+/// registry id. Categories without a resolver are left out so clients keep
 /// their registry-baseline tags — the wire format only carries ids.
-fn update_tags_wire_payload() -> Vec<u8> {
+fn update_tags_wire_map() -> Vec<(String, Vec<(String, Vec<i32>)>)> {
     let categories: Vec<(String, Vec<String>)> = {
         let registry = datapack_registry()
             .lock()
@@ -777,6 +791,13 @@ fn update_tags_wire_payload() -> Vec<u8> {
             tags.push((tag, entries));
         }
     }
+    registries
+}
+
+/// The tag map `update_tags` (0x78) carries, encoded for the play-phase
+/// datapack resend.
+fn update_tags_wire_payload() -> Vec<u8> {
+    let registries = update_tags_wire_map();
     let tag_vecs: Vec<Vec<PlayTag<'_>>> = registries
         .iter()
         .map(|(_, tags)| {
@@ -799,9 +820,117 @@ fn update_tags_wire_payload() -> Vec<u8> {
     encode_play_update_tags(&wire).1
 }
 
+/// Decoded `(wire registry, [(tag, member ids)])` form of one `update_tags`
+/// body (packet id already consumed). `None` on any malformed field — a
+/// captured packet is authoritative input, never partially applied.
+fn update_tags_wire_decode(
+    mut input: &[u8],
+) -> Option<Vec<(String, Vec<(String, Vec<i32>)>)>> {
+    let count = read_protocol_i32(&mut input)?;
+    if !(0..=64).contains(&count) {
+        return None;
+    }
+    let mut registries = Vec::with_capacity(count as usize);
+    for _ in 0..count {
+        let name = registry_wire_name(&mut input)?.to_string();
+        let tag_count = read_protocol_i32(&mut input)?;
+        if !(0..=4096).contains(&tag_count) {
+            return None;
+        }
+        let mut tags = Vec::with_capacity(tag_count as usize);
+        for _ in 0..tag_count {
+            let tag = registry_wire_name(&mut input)?.to_string();
+            let member_count = read_protocol_i32(&mut input)?;
+            if !(0..=0x100000).contains(&member_count) {
+                return None;
+            }
+            let mut members = Vec::with_capacity(member_count.min(4096) as usize);
+            for _ in 0..member_count {
+                members.push(read_protocol_i32(&mut input)?);
+            }
+            tags.push((tag, members));
+        }
+        registries.push((name, tags));
+    }
+    input.is_empty().then_some(registries)
+}
+
+/// Merge the datapack tag map into a baseline tag map: every resolved
+/// datapack tag is unioned into the matching registry (the store keeps raw
+/// member lists without `replace` flags, so vanilla's `replace:false` append
+/// semantics are the honest merge), and registries the baseline never carried
+/// are appended.
+fn merge_update_tags_baseline(
+    mut baseline: Vec<(String, Vec<(String, Vec<i32>)>)>,
+    overlay: Vec<(String, Vec<(String, Vec<i32>)>)>,
+) -> Vec<(String, Vec<(String, Vec<i32>)>)> {
+    for (reg_name, tags) in overlay {
+        let Some((_, base_tags)) = baseline.iter_mut().find(|(n, _)| *n == reg_name) else {
+            baseline.push((reg_name, tags));
+            continue;
+        };
+        for (tag, members) in tags {
+            match base_tags.iter_mut().find(|(t, _)| *t == tag) {
+                Some((_, base_members)) => {
+                    for id in members {
+                        if !base_members.contains(&id) {
+                            base_members.push(id);
+                        }
+                    }
+                }
+                None => base_tags.push((tag, members)),
+            }
+        }
+    }
+    baseline
+}
+
+/// The captured `update_tags` (`0x0d`) predates every datapack load: merge
+/// the live server-side tag map into it so the configuration phase publishes
+/// the same tags a mid-play `update_tags` resend would, the way vanilla's
+/// tag-task output is always the current map.
+fn config_tags_merge(config: &mut [(i64, Vec<u8>)]) {
+    let overlay = update_tags_wire_map();
+    if overlay.is_empty() {
+        return;
+    }
+    for (id, packet) in config.iter_mut() {
+        if *id != 0x0d {
+            continue;
+        }
+        let mut body = &packet[..];
+        if read_varint(&mut body) != Some(0x0d) {
+            continue;
+        }
+        let Some(baseline) = update_tags_wire_decode(body) else {
+            continue;
+        };
+        let merged = merge_update_tags_baseline(baseline, overlay.clone());
+        let mut merged_wire = Vec::new();
+        write_varint(&mut merged_wire, 0x0d);
+        write_varint(&mut merged_wire, merged.len() as i64);
+        for (name, tags) in &merged {
+            write_str(&mut merged_wire, name);
+            write_varint(&mut merged_wire, tags.len() as i64);
+            for (tag, members) in tags {
+                write_str(&mut merged_wire, tag);
+                write_varint(&mut merged_wire, members.len() as i64);
+                for member in members {
+                    write_varint(&mut merged_wire, i64::from(*member));
+                }
+            }
+        }
+        *packet = merged_wire;
+    }
+}
+
 /// `/reload` and `/datapack` publishes bump `content_revision`; the first tick
 /// after an observed bump re-sends the resolved tag map, matching vanilla
 /// `reloadPlayerResources` pushing `update_tags` to every play client.
+/// A bump that carries synced-registry content cannot be delivered that way —
+/// registry data only exists on the wire inside the configuration phase — so
+/// vanilla's mid-play `start_configuration` re-entry is used instead: each
+/// connection's handler is marked and runs the exchange on its next pass.
 fn play_content_revision_sync() {
     static SEEN: AtomicU64 = AtomicU64::new(u64::MAX);
     let revision = content_revision();
@@ -809,8 +938,32 @@ fn play_content_revision_sync() {
     if last == u64::MAX || last == revision {
         return;
     }
+    if config_registry_overlays_present() {
+        let mut pending = reconfigure_pending().lock().unwrap_or_else(|e| e.into_inner());
+        for c in clients().lock().unwrap_or_else(|e| e.into_inner()).iter() {
+            pending.insert(c.eid);
+        }
+        return;
+    }
     let payload = update_tags_wire_payload();
     broadcast_packet(-1, 0x78, &payload);
+}
+
+/// Entity ids whose connection handler should run the mid-play
+/// `start_configuration` exchange: marked by `play_content_revision_sync` when
+/// a content revision carries registry content, consumed at the head of the
+/// per-connection play loop.
+fn reconfigure_pending() -> &'static Mutex<HashSet<i32>> {
+    static PENDING: OnceLock<Mutex<HashSet<i32>>> = OnceLock::new();
+    PENDING.get_or_init(Mutex::default)
+}
+
+/// Whether the enabled datapacks contribute any synced-registry entries — the
+/// content only the configuration phase can deliver to a client.
+fn config_registry_overlays_present() -> bool {
+    load_registry_overlays(std::path::Path::new(DATAPACK_DIRECTORY))
+        .map(|overlays| !overlays.is_empty())
+        .unwrap_or(false)
 }
 
 /// `chunks_biomes` (0x0e) data for one chunk: per-section biome paletted
@@ -4444,6 +4597,7 @@ fn load_config_packets() -> Vec<(i64, Vec<u8>)> {
         Err(error) => eprintln!("[spine] unable to load datapack registries: {error}"),
     }
     append_custom_dimension_types(&mut config);
+    config_tags_merge(&mut config);
     config
 }
 
@@ -4625,6 +4779,501 @@ fn client_info_view_distance(body: &[u8]) -> Option<i32> {
         return None;
     } // filtering and server listings
     Some(view)
+}
+
+/// Per-connection configuration-phase link state. Vanilla runs the
+/// configuration stage under the same `CommonListenerCookie` keep-alive
+/// machinery the play loop uses; `ConfigLink` carries that state plus the
+/// answers that arrive while the phase is open (a late client-information
+/// view distance, a resource-pack status, a pong, a stored cookie) so the
+/// join and reconfigure paths can merge them into the play-phase stores
+/// afterwards.
+struct ConfigLink {
+    keepalive: connection_limits::KeepaliveState,
+    next_keepalive_id: i64,
+    client_view: i32,
+    /// Latest resource-pack status the client reported; when a pack was
+    /// pushed the finish packet is held until a *terminal* one (loaded,
+    /// declined, failed download, invalid url or failed reload) lands,
+    /// matching `ServerResourcePackConfigurationTask` ordering.
+    rp_status: Option<i64>,
+    last_pong: Option<i32>,
+    cookies: HashMap<String, Option<Vec<u8>>>,
+}
+
+impl ConfigLink {
+    fn new(client_view: i32) -> Self {
+        Self {
+            keepalive: connection_limits::KeepaliveState::new(Instant::now()),
+            next_keepalive_id: 1,
+            client_view,
+            rp_status: None,
+            last_pong: None,
+            cookies: HashMap::new(),
+        }
+    }
+}
+
+/// Configuration `disconnect` (`0x02`): the reason is a network-NBT chat
+/// component — unlike the login-phase JSON string — exactly like play `0x1d`.
+fn send_config_disconnect(s: &mut TcpStream, compression: Option<usize>, reason: &str) {
+    let mut pkt = Vec::new();
+    write_varint(&mut pkt, 0x02);
+    pkt.extend_from_slice(&chat_nbt(reason));
+    let _ = write_frame(s, &pkt, compression);
+}
+
+/// The configuration keep-alive pair vanilla issues on `KEEPALIVE_INTERVAL`:
+/// `keep_alive` (`0x04`, the outstanding i64) plus `ping` (`0x05`, the same
+/// value truncated to i32) so the client answers both probes.
+fn send_config_keepalive(
+    s: &mut TcpStream,
+    compression: Option<usize>,
+    id: i64,
+) -> std::io::Result<()> {
+    let mut pkt = Vec::new();
+    write_varint(&mut pkt, 0x04);
+    pkt.extend_from_slice(&id.to_be_bytes());
+    write_frame(s, &pkt, compression)?;
+    let mut pkt = Vec::new();
+    write_varint(&mut pkt, 0x05);
+    pkt.extend_from_slice(&(id as i32).to_be_bytes());
+    write_frame(s, &pkt, compression)
+}
+
+/// Configuration `reset_chat` (`0x06`): no body — the client drops its chat
+/// chain, which is why a mid-play `start_configuration` re-entry also clears
+/// `chat_sessions`/`chat_ack_offsets` server-side.
+fn send_config_reset_chat(s: &mut TcpStream, compression: Option<usize>) -> std::io::Result<()> {
+    let mut pkt = Vec::new();
+    write_varint(&mut pkt, 0x06);
+    write_frame(s, &pkt, compression)
+}
+
+/// One keep-alive cadence pass inside a configuration wait loop: on a due
+/// interval with no pending challenge the `0x04`/`0x05` pair goes out; an
+/// unanswered challenge that ages past the interval ends the phase with a
+/// vanilla `Timed out` disconnect.
+fn config_keepalive_tick(
+    s: &mut TcpStream,
+    compression: Option<usize>,
+    link: &mut ConfigLink,
+) -> bool {
+    use connection_limits::KeepaliveAction;
+    match link.keepalive.tick(Instant::now(), link.next_keepalive_id) {
+        KeepaliveAction::Send(id) => {
+            if send_config_keepalive(s, compression, id).is_err() {
+                return false;
+            }
+            link.next_keepalive_id = link.next_keepalive_id.wrapping_add(1);
+            true
+        }
+        KeepaliveAction::TimedOut => {
+            send_config_disconnect(s, compression, "Timed out");
+            false
+        }
+        KeepaliveAction::Wait => true,
+    }
+}
+
+/// One polled configuration read's verdict for the wait loops: `Frame` is a
+/// packet the current stage is waiting on, `Serviced` means the async surface
+/// was handled inline (keep waiting), `Abort` means the connection is over
+/// (EOF, rate-limit or a sent disconnect).
+enum ConfigPoll {
+    Frame(i64),
+    Serviced,
+    Abort,
+}
+
+/// Poll one inbound frame during configuration. Keep-alive answers (`0x04`)
+/// are checked against the outstanding challenge, pongs (`0x05`) are
+/// recorded, client-information (`0x00`) re-reads the requested view
+/// distance, cookie responses (`0x01`) land on the pre-entity store, and
+/// resource-pack responses (`0x06`) apply the required/stale-pack policy —
+/// including the `remove_resource_pack` (`0x08`, uuid omitted = pop all) a
+/// client with an old pack needs when this server advertises none. The ids a
+/// stage waits on (`0x07` select_known_packs, `0x03` finish ack) pass through
+/// as `Frame`.
+fn config_next_frame(
+    s: &mut TcpStream,
+    rx: &mut RxBuf,
+    compression: Option<usize>,
+    rate: &mut connection_limits::PacketRateLimit,
+    link: &mut ConfigLink,
+) -> ConfigPoll {
+    let (id, b) = match rx.next(s) {
+        RxOut::Closed => return ConfigPoll::Abort,
+        RxOut::Idle => {
+            return if config_keepalive_tick(s, compression, link) {
+                ConfigPoll::Serviced
+            } else {
+                ConfigPoll::Abort
+            };
+        }
+        RxOut::Frame(id, b) => (id, b),
+    };
+    let received = Instant::now();
+    if !rate.allow(received) {
+        if rate.should_disconnect(received) {
+            send_config_disconnect(s, compression, "Packet rate limit exceeded");
+            return ConfigPoll::Abort;
+        }
+        return ConfigPoll::Serviced;
+    }
+    match id {
+        0x00 => match client_info_view_distance(&b) {
+            Some(v) => {
+                link.client_view = v;
+                ConfigPoll::Serviced
+            }
+            None => {
+                send_config_disconnect(s, compression, "Invalid client information");
+                ConfigPoll::Abort
+            }
+        },
+        0x01 => {
+            if let Some((key, payload)) = decode_cookie_response(&b) {
+                link.cookies.insert(key, payload);
+            }
+            ConfigPoll::Serviced
+        }
+        0x04 => {
+            if link.keepalive.reply(received, &b) {
+                ConfigPoll::Serviced
+            } else {
+                send_config_disconnect(s, compression, "Timed out");
+                ConfigPoll::Abort
+            }
+        }
+        0x05 => {
+            if let Some(pong) = decode_pong(&b) {
+                link.last_pong = Some(pong);
+            }
+            ConfigPoll::Serviced
+        }
+        0x06 => {
+            let mut p = &b[..];
+            link.rp_status = read_varint(&mut p);
+            if pack_info().is_none() && link.rp_status.is_some() {
+                let mut pkt = Vec::new();
+                write_varint(&mut pkt, 0x08);
+                pkt.push(0);
+                let _ = write_frame(s, &pkt, compression);
+            }
+            if resource_pack_status_disconnects(link.rp_status) {
+                send_config_disconnect(
+                    s,
+                    compression,
+                    "This server requires the configured resource pack.",
+                );
+                return ConfigPoll::Abort;
+            }
+            ConfigPoll::Serviced
+        }
+        _ => ConfigPoll::Frame(id),
+    }
+}
+
+/// `MEGU_SERVER_LINKS`/`MEGU_REPORT_DETAILS` in their configuration-phase
+/// slots: vanilla writes `server_links` (`0x10`) and `custom_report_details`
+/// (`0x0f`) immediately after the brand custom-payload, before
+/// `feature_flags`. The bodies are shared with the play-phase refresh the
+/// post-join burst sends.
+fn send_config_links_and_reports(s: &mut TcpStream, compression: Option<usize>) {
+    if let Ok(links) = std::env::var("MEGU_SERVER_LINKS") {
+        // The post-join burst's convention: `builtin:<id>=<url>` or
+        // `<text>=<url>`; text labels ride the same `text_component_nbt`.
+        let mut parsed: Vec<(Option<u32>, Option<Vec<u8>>, &str)> = Vec::new();
+        for entry in links.split(';').map(str::trim).filter(|e| !e.is_empty()) {
+            let Some((label, url)) = entry.split_once('=') else {
+                continue;
+            };
+            if let Some(builtin) = label
+                .strip_prefix("builtin:")
+                .and_then(|v| v.trim().parse::<u32>().ok())
+            {
+                parsed.push((Some(builtin), None, url));
+            } else {
+                parsed.push((None, Some(text_component_nbt(label)), url));
+            }
+        }
+        if !parsed.is_empty() {
+            let wire: Vec<(PlayServerLinkLabel<'_>, &str)> = parsed
+                .iter()
+                .filter_map(|(builtin, custom, url)| match (builtin, custom) {
+                    (Some(builtin), _) => Some((PlayServerLinkLabel::BuiltIn(*builtin), *url)),
+                    (_, Some(nbt)) => Some((PlayServerLinkLabel::Custom(nbt.as_slice()), *url)),
+                    _ => None,
+                })
+                .collect();
+            let (_, payload) = encode_play_server_links(&wire);
+            let mut pkt = Vec::new();
+            write_varint(&mut pkt, 0x10);
+            pkt.extend_from_slice(&payload);
+            let _ = write_frame(s, &pkt, compression);
+        }
+    }
+    if let Ok(details) = std::env::var("MEGU_REPORT_DETAILS") {
+        let entries: Vec<(&str, &str)> = details
+            .split(';')
+            .filter_map(|e| e.split_once('='))
+            .collect();
+        if !entries.is_empty() {
+            let (_, payload) = encode_play_custom_report_details(&entries);
+            let mut pkt = Vec::new();
+            write_varint(&mut pkt, 0x0f);
+            pkt.extend_from_slice(&payload);
+            let _ = write_frame(s, &pkt, compression);
+        }
+    }
+}
+
+/// The opt-in session packets vanilla delivers through the configuration
+/// task queue: `store_cookie` (`0x0a`), `cookie_request` (`0x00`) and
+/// `resource_pack_push` (`0x09`) — the same `MEGU_*`-gated features the
+/// post-join burst refreshes. Returns true when a resource pack went out,
+/// in which case the caller holds the finish until a terminal `0x06`
+/// status arrives.
+fn send_config_cookie_and_pack(s: &mut TcpStream, compression: Option<usize>) -> bool {
+    if let Ok(list) = std::env::var("MEGU_STORE_COOKIE") {
+        for pair in list.split(';').map(str::trim).filter(|p| !p.is_empty()) {
+            let Some((key, value)) = pair.split_once('=') else {
+                continue;
+            };
+            let Some((_, payload)) = encode_play_store_cookie(key, value.as_bytes()) else {
+                continue;
+            };
+            let mut pkt = Vec::new();
+            write_varint(&mut pkt, 0x0a);
+            pkt.extend_from_slice(&payload);
+            let _ = write_frame(s, &pkt, compression);
+        }
+    }
+    if let Ok(list) = std::env::var("MEGU_COOKIE_REQUEST") {
+        for key in list.split(';').map(str::trim).filter(|k| !k.is_empty()) {
+            let (_, payload) = encode_play_cookie_request(key);
+            let mut pkt = Vec::new();
+            write_varint(&mut pkt, 0x00);
+            pkt.extend_from_slice(&payload);
+            let _ = write_frame(s, &pkt, compression);
+        }
+    }
+    let mut pushed = false;
+    if let Some(payload) = resource_pack_pkt() {
+        let mut pkt = Vec::new();
+        write_varint(&mut pkt, 0x09);
+        pkt.extend_from_slice(&payload);
+        let _ = write_frame(s, &pkt, compression);
+        pushed = true;
+    }
+    pushed
+}
+
+/// The full configuration exchange shared by initial login and the mid-play
+/// `start_configuration` re-entry: replay the captured stream up to
+/// `select_known_packs`, wait for the client's `0x07` answer, send the rest
+/// plus the operator session packets, then `finish_configuration` (`0x03`)
+/// and its acknowledgement. Throughout, the `ConfigLink` keep-alive cadence,
+/// pong/cookie/pack-response servicing and rate limiting run inline — the
+/// phase is connection management, not a bare replay.
+fn run_config_exchange(
+    s: &mut TcpStream,
+    rx: &mut RxBuf,
+    cfg: &[(i64, Vec<u8>)],
+    compression: Option<usize>,
+    rate: &mut connection_limits::PacketRateLimit,
+    link: &mut ConfigLink,
+    reset_chat_chain: bool,
+) -> bool {
+    for (pid, pkt) in cfg {
+        if write_frame(s, pkt, compression).is_err() {
+            return false;
+        }
+        if *pid == 0x01 {
+            // Vanilla's order: brand, then server_links/report_details,
+            // then feature_flags and the task queue.
+            send_config_links_and_reports(s, compression);
+        }
+        if *pid == 0x0e {
+            break;
+        }
+    }
+    if !cfg.iter().any(|(id, _)| *id == 0x0e) {
+        return false;
+    }
+    s.set_read_timeout(Some(Duration::from_millis(250))).ok();
+    let t0 = Instant::now();
+    let mut got_selpacks = false;
+    while t0.elapsed() < Duration::from_secs(15) {
+        match config_next_frame(s, rx, compression, rate, link) {
+            ConfigPoll::Frame(0x07) => {
+                got_selpacks = true;
+                break;
+            }
+            ConfigPoll::Frame(..) | ConfigPoll::Serviced => continue,
+            ConfigPoll::Abort => return false,
+        }
+    }
+    if !got_selpacks {
+        return false;
+    }
+    for (pid, pkt) in cfg {
+        if matches!(*pid, 0x01 | 0x0c | 0x0e | 0x03) {
+            continue;
+        }
+        if write_frame(s, pkt, compression).is_err() {
+            return false;
+        }
+    }
+    if reset_chat_chain {
+        if send_config_reset_chat(s, compression).is_err() {
+            return false;
+        }
+    }
+    let pack_pushed = send_config_cookie_and_pack(s, compression);
+    if pack_pushed {
+        // `ServerResourcePackConfigurationTask`: the task queue — and with it
+        // the finish — waits for a terminal pack status. A client that never
+        // answers is reaped by the keep-alive timeout.
+        let t0 = Instant::now();
+        while !matches!(link.rp_status, Some(0 | 1 | 2 | 5 | 6)) {
+            if t0.elapsed() > Duration::from_secs(60) {
+                return false;
+            }
+            match config_next_frame(s, rx, compression, rate, link) {
+                ConfigPoll::Abort => return false,
+                _ => continue,
+            }
+        }
+    }
+    let mut fin = Vec::new();
+    write_varint(&mut fin, 0x03);
+    if write_frame(s, &fin, compression).is_err() {
+        return false;
+    }
+    let t0 = Instant::now();
+    loop {
+        if t0.elapsed() > Duration::from_secs(15) {
+            return false;
+        }
+        match config_next_frame(s, rx, compression, rate, link) {
+            ConfigPoll::Frame(0x03) => return true,
+            ConfigPoll::Frame(..) | ConfigPoll::Serviced => continue,
+            ConfigPoll::Abort => return false,
+        }
+    }
+}
+
+/// Mid-play `start_configuration` (`0x69`): the registry-resync lane. Vanilla
+/// re-enters the configuration phase when synced content has to reach a live
+/// client; the client answers with play `0x0c` and the phase repeats. Here,
+/// `play_content_revision_sync` marks connections whose content revision
+/// carries registry data and this drives the exchange on the owning thread:
+/// send `0x69`, wait for the ack, take the player off the online list while
+/// their client decodes configuration frames (play-phase traffic mid-flip is
+/// a desync — the same reason vanilla `removePlayerFromWorld`s first), run
+/// the shared config engine, then rejoin through the respawn+chunk+teleport
+/// lane the dimension switch uses. The other clients' world view is kept:
+/// the player entity never leaves their screens, matching the tab entry that
+/// stays listed.
+fn play_reconfigure_exchange(
+    me: &Arc<Client>,
+    s: &mut TcpStream,
+    rx: &mut RxBuf,
+    compression: Option<usize>,
+    rate: &mut connection_limits::PacketRateLimit,
+    view: &mut i32,
+) -> bool {
+    let mut start = Vec::new();
+    write_varint(&mut start, 0x69);
+    if write_frame(s, &start, compression).is_err() {
+        return false;
+    }
+    clients()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .retain(|c| c.eid != me.eid);
+    s.set_read_timeout(Some(Duration::from_millis(250))).ok();
+    let t0 = Instant::now();
+    loop {
+        if t0.elapsed() > Duration::from_secs(15) {
+            return false;
+        }
+        match rx.next(s) {
+            RxOut::Closed => return false,
+            RxOut::Idle => continue,
+            RxOut::Frame(0x0c, _) => break,
+            // Play packets that crossed the flip are legal to drop; the
+            // client's `0x0c` is the only awaited answer.
+            RxOut::Frame(..) => continue,
+        }
+    }
+    reconfigure_acked()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .insert(me.eid);
+    // The chat chain does not survive a phase re-entry: `reset_chat` inside
+    // the exchange tells the client, and the server-side session state goes
+    // with it — a fresh `chat_session_update` arrives after the rejoin.
+    chat_sessions()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .remove(&me.eid);
+    chat_ack_offsets()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .remove(&me.eid);
+    let cfg = load_config_packets();
+    let mut link = ConfigLink::new(*view);
+    if !run_config_exchange(s, rx, &cfg, compression, rate, &mut link, true) {
+        return false;
+    }
+    // Configuration-phase answers merge into the play stores: a resent
+    // client-information view distance, cookie responses, a pong probe.
+    if link.client_view != *view {
+        *view = link.client_view;
+        *me.view.lock().unwrap_or_else(|e| e.into_inner()) = link.client_view;
+    }
+    if !link.cookies.is_empty() {
+        client_cookies()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .entry(me.eid)
+            .or_default()
+            .extend(link.cookies);
+    }
+    if let Some(pong) = link.last_pong {
+        last_client_pongs()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(me.eid, pong);
+    }
+    // Rejoin `returnToWorld`-style: rebuild the tab list both ways (the
+    // re-entering client's list was reset by the phase flip), refresh the
+    // name-completion sets, then let the respawn+chunk+teleport lane rebuild
+    // the world view.
+    {
+        let mut cls = clients().lock().unwrap_or_else(|e| e.into_inner());
+        let pi = player_info_add(&me);
+        let mut names: Vec<String> = cls.iter().map(|c| c.name.clone()).collect();
+        names.push(me.name.clone());
+        let (_, all_names) = encode_play_custom_chat_completions(0, &names);
+        let _ = send_packet(&mut me.sock.lock().unwrap_or_else(|e| e.into_inner()), 0x18, all_names);
+        let (_, joined_name) = encode_play_custom_chat_completions(0, &[me.name.clone()]);
+        for c in cls.iter() {
+            let _ = send_packet(&mut me.sock.lock().unwrap_or_else(|e| e.into_inner()), 0x3e, player_info_add(c));
+            let _ = send_packet(&mut c.sock.lock().unwrap_or_else(|e| e.into_inner()), 0x3e, pi.clone());
+            let _ = send_packet(&mut c.sock.lock().unwrap_or_else(|e| e.into_inner()), 0x18, joined_name.clone());
+        }
+        cls.push(me.clone());
+    }
+    let (dim, pos) = (
+        *me.dim.lock().unwrap_or_else(|e| e.into_inner()),
+        *me.pos.lock().unwrap_or_else(|e| e.into_inner()),
+    );
+    switch_client_dimension(me, dim, (pos.0, pos.1, pos.2, pos.3, pos.4), *view);
+    true
 }
 
 /// The number of chunks the current view window can hold: the exact count of
@@ -9018,35 +9667,18 @@ fn live_chat_relay(me: &Arc<Client>, env: &ChatMessageEnvelope, m: &str, verdict
             broadcast_packet(me.eid, 0x39, &payload);
         }
         ChatVerdict::Disguised => {
-            let session_eids: HashSet<i32> = chat_sessions()
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
-                .keys()
-                .copied()
-                .collect();
-            let player_frame = encode_player_chat_0x39(
-                env,
-                next_chat_message_index(),
-                Some(&chat_nbt(m)),
-                live_chat_type_index(),
-                &me.name,
-            );
-            let mut player_body = player_frame.as_slice();
-            let _ = read_varint(&mut player_body);
-            let player_payload = player_body.to_vec();
-            let system_payload = system_chat(&format!("<{}> {}", me.name, m));
-            if session_eids.contains(&me.eid) {
-                let _ = send_packet(&mut me.sock.lock().unwrap_or_else(|e| e.into_inner()), 0x39, player_payload.clone());
-            } else {
-                let _ = send_packet(&mut me.sock.lock().unwrap_or_else(|e| e.into_inner()), 0x6c, system_payload.clone());
-            }
-            broadcast(me.eid, |c| {
-                if session_eids.contains(&c.eid) {
-                    (0x39, player_payload.clone())
-                } else {
-                    (0x6c, system_payload.clone())
-                }
-            });
+            // `S2C_DISGUISED_CHAT_767` (`0x1e`): the unsigned relay — plain
+            // content, the chat-type index and the sender's display name. It
+            // carries no signature state, so every recipient takes the same
+            // frame regardless of chat-session enrollment (vanilla uses it
+            // for the /me /say /msg surfaces).
+            let disguised_frame =
+                encode_disguised_chat_0x1e(&chat_nbt(m), live_chat_type_index(), &me.name);
+            let mut disguised_body = disguised_frame.as_slice();
+            let _ = read_varint(&mut disguised_body);
+            let disguised_payload = disguised_body.to_vec();
+            let _ = send_packet(&mut me.sock.lock().unwrap_or_else(|e| e.into_inner()), 0x1e, disguised_payload.clone());
+            broadcast(me.eid, |_| (0x1e, disguised_payload.clone()));
         }
     }
 }
@@ -9434,6 +10066,10 @@ fn forget_per_eid_state(eid: i32) {
     seen_advancement_state().lock().unwrap_or_else(|e| e.into_inner()).remove(&eid);
     combat_sessions().lock().unwrap_or_else(|e| e.into_inner()).remove(&eid);
     reconfigure_acked().lock().unwrap_or_else(|e| e.into_inner()).remove(&eid);
+    reconfigure_pending()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .remove(&eid);
     // A disconnecting player drops both sides of `ServerPlayer.camera`: the
     // entry naming their own view and any spectator still watching them.
     {
@@ -9672,69 +10308,17 @@ fn handle_inner(mut s: TcpStream, live_eid: Arc<AtomicI32>) {
     // ---- config ----
     let mut client_view: i32 = 8;
     let cfg = load_config_packets();
-    for (pid, pkt) in &cfg {
-        if write_frame(&mut s, pkt, compression).is_err() {
-            return;
-        }
-        if *pid == 0x0e {
-            break;
-        }
-    }
-    if !cfg.iter().any(|(id, _)| *id == 0x0e) {
+    // The phase runs on the shared exchange: the captured stream replays up
+    // to `select_known_packs`, the `0x07`/`0x03` answers are awaited while the
+    // `ConfigLink` keep-alive cadence, pong/cookie/pack-response servicing
+    // and rate limiting run inline — vanilla's configuration listener, not a
+    // bare replay. `rx` buffers partial frames across the poll timeouts.
+    let mut rx = RxBuf::new(compression);
+    let mut link = ConfigLink::new(client_view);
+    if !run_config_exchange(&mut s, &mut rx, &cfg, compression, &mut preplay_rate, &mut link, false) {
         return;
     }
-    s.set_read_timeout(Some(Duration::from_millis(200))).ok();
-    let t0 = Instant::now();
-    let mut got_selpacks = false;
-    while Instant::now() - t0 < Duration::from_secs(15) {
-        match read_preplay_frame(&mut s, login_deadline, compression, &mut preplay_rate) {
-            Some((0x00, b)) => {
-                let Some(v) = client_info_view_distance(&b) else {
-                    return;
-                };
-                client_view = v;
-            }
-            Some((0x07, _)) => {
-                got_selpacks = true;
-                break;
-            }
-            Some(_) => continue,
-            // EOF, malformed length or the login deadline: the client is gone.
-            // `continue` here spun at 100% CPU, since read_packet fails at once.
-            None => return,
-        }
-    }
-    if !got_selpacks {
-        return;
-    }
-    for (pid, pkt) in &cfg {
-        if matches!(*pid, 0x01 | 0x0c | 0x0e | 0x03) {
-            continue;
-        }
-        if write_frame(&mut s, pkt, compression).is_err() {
-            return;
-        }
-    }
-    if send_packet(&mut s, 0x03, vec![]).is_err() {
-        return;
-    }
-    let t0 = Instant::now();
-    loop {
-        if Instant::now() - t0 > Duration::from_secs(15) {
-            return;
-        }
-        match read_preplay_frame(&mut s, login_deadline, compression, &mut preplay_rate) {
-            Some((0x00, b)) => {
-                let Some(v) = client_info_view_distance(&b) else {
-                    return;
-                };
-                client_view = v;
-            }
-            Some((0x03, _)) => break,
-            Some(_) => continue,
-            None => return,
-        }
-    }
+    client_view = link.client_view;
     // ---- play ----
     // P2-3-S4: read the saved dimension BEFORE 0x2b so Join Game and the first chunk
     // window both name the world the player actually logged out in. The 0x2b payload and
@@ -10116,6 +10700,15 @@ fn handle_inner(mut s: TcpStream, live_eid: Arc<AtomicI32>) {
             }
         }
         cls.push(me.clone());
+        // Vanilla `PlayerList.placeNewPlayer` chat completions: the joiner
+        // gets `add` for every online name, everyone else `add` for theirs.
+        let names: Vec<String> = cls.iter().map(|c| c.name.clone()).collect();
+        let (_, all_names) = encode_play_custom_chat_completions(0, &names);
+        let _ = send_packet(&mut me.sock.lock().unwrap_or_else(|e| e.into_inner()), 0x18, all_names);
+        let (_, joined_name) = encode_play_custom_chat_completions(0, &[me.name.clone()]);
+        for c in cls.iter().filter(|c| c.eid != me.eid) {
+            let _ = send_packet(&mut c.sock.lock().unwrap_or_else(|e| e.into_inner()), 0x18, joined_name.clone());
+        }
         for (id, bar) in bars.iter().filter(|(_, bar)| bar.shown_to(&me)) {
             let _ = send_packet(&mut me.sock.lock().unwrap_or_else(|e| e.into_inner()), 0x0a, bossbar_pkt(id, 0, Some(bar)));
         }
@@ -10139,6 +10732,21 @@ fn handle_inner(mut s: TcpStream, live_eid: Arc<AtomicI32>) {
     {
         let iv = me.inv.lock().unwrap_or_else(|e| e.into_inner());
         *me.armor_pts.lock().unwrap_or_else(|e| e.into_inner()) = armor_pts_of(&iv);
+    }
+    // Answers that landed during the configuration phase carry over: a
+    // requested cookie response keyed by name and a pong probe keyed by eid,
+    // matching how the play-phase `0x11`/`0x27` handlers store them.
+    if !link.cookies.is_empty() {
+        client_cookies()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(me.eid, std::mem::take(&mut link.cookies));
+    }
+    if let Some(pong) = link.last_pong {
+        last_client_pongs()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(me.eid, pong);
     }
     send_attrs(&me);
     // echo restored inventory slots so the client sees them
@@ -10188,7 +10796,10 @@ fn handle_inner(mut s: TcpStream, live_eid: Arc<AtomicI32>) {
     // diffs the live view and ships one sparse SetEquipment.
     let mut last_equipment = player_equipment(&me);
 
-    let mut rx = RxBuf::new(compression);
+    // Reuse the configuration-phase reader: a pipelining client can already
+    // have play packets buffered behind its `0x03` finish acknowledgement,
+    // and a fresh buffer would silently drop them.
+    let mut rx = rx;
     // Play-state packet inactivity is tracked separately from the keep-alive deadline.
     let mut last_rx = Instant::now();
     let mut chat_throttle = connection_limits::ChatThrottle::new(Instant::now());
@@ -10264,6 +10875,25 @@ fn handle_inner(mut s: TcpStream, live_eid: Arc<AtomicI32>) {
                 me.name
             );
             break 'conn;
+        }
+        // A datapack publish that carries synced-registry content re-enters
+        // the configuration phase mid-play (`0x69`), the same lane vanilla's
+        // `startConfiguration` re-entry takes.
+        if reconfigure_pending()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(&me.eid)
+        {
+            eprintln!("[spine] {} re-entering configuration after content revision", me.name);
+            if !play_reconfigure_exchange(&me, &mut s, &mut rx, compression, &mut packet_rate, &mut view) {
+                break 'conn;
+            }
+            // Vanilla's fresh common listener restarts the keep-alive clock on
+            // re-entry; the exchange just consumed every in-flight answer.
+            keepalive = connection_limits::KeepaliveState::new(Instant::now());
+            keepalive_sent_at = None;
+            last_rx = Instant::now();
+            read_timeout = None;
         }
         let (pid, b) = match rx.next(&mut s) {
             RxOut::Closed => break 'conn,
@@ -14613,7 +15243,11 @@ fn disconnect_cleanup(me_cleanup: &Arc<Client>, peer: &str) {
         let mut p = Vec::new();
         write_varint(&mut p, 1);
         p.extend_from_slice(&me_cleanup.uuid);
-        broadcast_packet(me_cleanup.eid, 0x3d, &p);
+        broadcast(me_cleanup.eid, |_| (0x3d, p.clone()));
+        // `PlayerList.remove` also drops the name from everyone's completion
+        // set — the `custom_chat_completions` remove complement to the join add.
+        let (_, gone_name) = encode_play_custom_chat_completions(1, &[me_cleanup.name.clone()]);
+        broadcast(me_cleanup.eid, |_| (0x18, gone_name.clone()));
         // The last online client list is empty: the snapshot above is the
         // world's final live state, and an idle server's periodic autosave
         // may never run again (the liveness floor counts online clients).
@@ -16553,6 +17187,63 @@ mod w3_tests {
             assert!(Instant::now() < deadline, "finite look never applied");
             std::thread::sleep(Duration::from_millis(5));
         }
+        drop(cli);
+        let _ = server.join();
+    }
+
+    /// Mid-play `start_configuration` (`0x69`): marking the connection's eid
+    /// pending runs the whole vanilla re-entry — `0x69`, the play-phase
+    /// `0x0c` ack, a fresh configuration replay (`0x0e` → `0x07`, finish →
+    /// `0x03`), then the respawn+teleport rejoin lane.
+    #[test]
+    #[cfg(megu_vanilla_data)]
+    fn w3_mid_play_start_configuration_replays_config_and_rejoins() {
+        let _guard = world_guard();
+        let (mut cli, server, me) = w3_connect("W3Reconfig", [0x58u8; 16]);
+        reconfigure_pending()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(me.eid);
+        let deadline = Instant::now() + Duration::from_secs(15);
+        loop {
+            let (pid, _) = read_packet(&mut cli, deadline).expect("start_configuration frame");
+            if pid == 0x69 {
+                break;
+            }
+        }
+        send_packet(&mut cli, 0x0c, vec![]).unwrap();
+        loop {
+            let (pid, _) = read_packet(&mut cli, deadline).expect("config replay frames");
+            if pid == 0x0e {
+                let mut kp = Vec::new();
+                write_varint(&mut kp, 0);
+                send_packet(&mut cli, 0x07, kp).unwrap();
+            } else if pid == 0x03 {
+                send_packet(&mut cli, 0x03, vec![]).unwrap();
+                break;
+            }
+        }
+        let mut respawned = false;
+        loop {
+            let (pid, body) = read_packet(&mut cli, deadline).expect("rejoin frames");
+            match pid {
+                0x47 => respawned = true,
+                0x40 => {
+                    send_packet(&mut cli, 0x00, body[33..].to_vec()).unwrap();
+                    assert!(respawned, "the teleport confirm follows the respawn");
+                    break;
+                }
+                _ => continue,
+            }
+        }
+        assert!(
+            clients()
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .iter()
+                .any(|c| c.eid == me.eid),
+            "rejoined client is back on the online list"
+        );
         drop(cli);
         let _ = server.join();
     }
@@ -18629,15 +19320,16 @@ mod p5c_live_tests {
             .expect("signed envelope must pass admission");
         let (id, _) = read_frame(&mut recv_peer).expect("receiver must get a chat frame");
         assert_eq!(id, S2C_PLAYER_CHAT_767, "signed chat must relay as 0x39");
-        // Offline mode allows the unsigned envelope through; a recipient with
-        // no chat session sees it as `0x6c` System Chat (#132 session path).
+        // Offline mode allows the unsigned envelope through; it relays as the
+        // protocol-767 `0x1e` Disguised Chat, which carries no signature state
+        // and so needs no session on the receiving side.
         live_chat_message(&sender, &w1_chat_body("w1 plain", false), &mut throttle)
             .expect("unsigned offline envelope must pass admission");
         let (id, _) = read_frame(&mut recv_peer).expect("receiver must get a chat frame");
-        assert_eq!(id, 0x6c, "unsigned chat to a session-less client relays as 0x6c");
+        assert_eq!(id, 0x1e, "unsigned chat to a session-less client relays as 0x1e");
         // A recipient that established a chat session via `chat_session_update`
-        // gets the vanilla unsigned `0x39` Player Chat (null signature +
-        // unsigned display content) instead.
+        // gets the same frame: session enrollment is irrelevant to the
+        // unsigned relay.
         chat_sessions().lock().unwrap_or_else(|e| e.into_inner()).insert(
             recv.eid,
             ChatSessionMeta {
@@ -18650,7 +19342,7 @@ mod p5c_live_tests {
         live_chat_message(&sender, &w1_chat_body("w1 session", false), &mut throttle)
             .expect("unsigned offline envelope must pass admission");
         let (id, _) = read_frame(&mut recv_peer).expect("receiver must get a chat frame");
-        assert_eq!(id, S2C_PLAYER_CHAT_767, "unsigned chat to a session client relays as 0x39");
+        assert_eq!(id, 0x1e, "unsigned chat to a session client relays as 0x1e");
         chat_sessions().lock().unwrap_or_else(|e| e.into_inner()).remove(&recv.eid);
     }
 
@@ -18673,7 +19365,7 @@ mod p5c_live_tests {
         live_chat_message(&sender, &w1_chat_body("/not_a_command", false), &mut throttle)
             .expect("slash-prefixed chat must pass admission");
         let (id, body) = read_frame(&mut receiver_peer).expect("receiver must get a chat frame");
-        assert_eq!(id, 0x6c, "slash-prefixed text must be system chat for session-less recipient");
+        assert_eq!(id, 0x1e, "slash-prefixed text must be disguised chat for a session-less recipient");
         assert!(body.windows(b"/not_a_command".len()).any(|part| part == b"/not_a_command"));
     }
 
@@ -21341,6 +22033,10 @@ mod security_hardening_tests {
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .insert(eid);
+        reconfigure_pending()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(eid);
         beacon_menu_anchors()
             .lock()
             .unwrap_or_else(|e| e.into_inner())
@@ -21411,6 +22107,12 @@ mod security_hardening_tests {
         );
         assert!(
             !reconfigure_acked()
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .contains(&eid)
+        );
+        assert!(
+            !reconfigure_pending()
                 .lock()
                 .unwrap_or_else(|e| e.into_inner())
                 .contains(&eid)
@@ -21883,6 +22585,88 @@ mod gap_s2c_18_tests {
         want.push(2);
         want.extend_from_slice(b"42");
         assert_eq!(payload, want);
+    }
+
+    #[test]
+    fn gap_s2c_18_custom_chat_completions_layout() {
+        let (id, payload) = encode_play_custom_chat_completions(0, &["Steve".to_string(), "Alex".to_string()]);
+        assert_eq!(id, 0x18);
+        assert_eq!(payload, vec![0, 2, 5, b'S', b't', b'e', b'v', b'e', 4, b'A', b'l', b'e', b'x']);
+        let (id, payload) = encode_play_custom_chat_completions(1, &["Steve".to_string()]);
+        assert_eq!(id, 0x18);
+        assert_eq!(payload, vec![1, 1, 5, b'S', b't', b'e', b'v', b'e']);
+    }
+
+    #[test]
+    fn gap_s2c_18_update_tags_decode_merge_round_trip() {
+        // One registry, one tag, members [1, 2].
+        let mut body = Vec::new();
+        write_varint(&mut body, 1);
+        write_str(&mut body, "minecraft:block");
+        write_varint(&mut body, 1);
+        write_str(&mut body, "minecraft:mineable/axe");
+        write_varint(&mut body, 2);
+        write_varint(&mut body, 1);
+        write_varint(&mut body, 2);
+        let decoded = update_tags_wire_decode(&body).expect("valid update_tags body");
+        assert_eq!(decoded.len(), 1);
+        assert_eq!(decoded[0].0, "minecraft:block");
+        assert_eq!(decoded[0].1, vec![("minecraft:mineable/axe".to_string(), vec![1, 2])]);
+        let merged = merge_update_tags_baseline(
+            decoded,
+            vec![(
+                "minecraft:block".to_string(),
+                vec![
+                    ("minecraft:mineable/axe".to_string(), vec![2, 3]),
+                    ("minecraft:custom".to_string(), vec![9]),
+                ],
+            )],
+        );
+        // Same-tag members union without duplicates; new tags append.
+        assert_eq!(
+            merged[0].1,
+            vec![
+                ("minecraft:mineable/axe".to_string(), vec![1, 2, 3]),
+                ("minecraft:custom".to_string(), vec![9]),
+            ]
+        );
+    }
+
+    #[test]
+    fn gap_s2c_18_config_tags_merge_reaches_the_captured_update_tags() {
+        let _guard = world_guard();
+        let Some(mut config) = captured_config_packets() else {
+            return; // the blob is absent in data-less builds
+        };
+        // Seed a datapack tag the capture cannot already carry.
+        let sentinel = "megu_test:sentinel_tag";
+        {
+            let mut registry = datapack_registry().lock().unwrap_or_else(|e| e.into_inner());
+            registry
+                .tags
+                .entry("block".to_string())
+                .or_default()
+                .insert(sentinel.to_string(), vec!["minecraft:stone".to_string()]);
+        }
+        config_tags_merge(&mut config);
+        datapack_registry()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .tags
+            .get_mut("block")
+            .map(|m| m.remove(sentinel));
+        let merged_packet = config
+            .iter()
+            .find(|(id, _)| *id == 0x0d)
+            .map(|(_, p)| p.clone())
+            .expect("captured update_tags packet");
+        let mut body = &merged_packet[..];
+        assert_eq!(read_varint(&mut body), Some(0x0d));
+        let merged = update_tags_wire_decode(body).expect("merged update_tags decodes");
+        let has_sentinel = merged
+            .iter()
+            .any(|(_, tags)| tags.iter().any(|(tag, _)| tag == sentinel));
+        assert!(has_sentinel, "datapack tag merged into the config update_tags");
     }
 
     #[test]
