@@ -107,17 +107,20 @@ class ReleaseWorkflowTest(unittest.TestCase):
             ("ubuntu-22.04-arm", "linux-arm64"),
             ("ubuntu-22.04-arm", "linux-arm64-musl"),
             ("macos-latest", "macos-arm64"),
+            ("macos-latest", "macos-x86_64"),
             ("windows-latest", "windows-x86_64"),
+            ("windows-11-arm", "windows-arm64"),
         ):
             self.assertIn(f"- os: {runner}\n            target: {target}", job)
-        self.assertEqual(len(re.findall(r"(?m)^          - os:", job)), 6)
+        self.assertEqual(len(re.findall(r"(?m)^          - os:", job)), 8)
         for manifest in (
             "client-app/Cargo.toml", "mod-adapter-core/Cargo.toml",
             "state-store/Cargo.toml", "server-files/Cargo.toml",
             "client-gpu/Cargo.toml",
         ):
             self.assertIn(manifest, job)
-        # Six glibc/macos/windows builds plus the two-command musl branch.
+        # Six full builds (glibc/macos/windows, incl. the x86_64 cross lane)
+        # plus the two-command musl branch.
         self.assertEqual(job.count("cargo build --locked --release"), 8)
         self.assertIn("--manifest-path server-files/Cargo.toml --bins", job)
         self.assertIn("--manifest-path client-gpu/Cargo.toml --bin megu-client-gpu", job)
@@ -126,11 +129,12 @@ class ReleaseWorkflowTest(unittest.TestCase):
         # Seven glibc extras plus the single musl installer extra-binary.
         self.assertEqual(job.count("--extra-binary"), 8)
         self.assertIn(
-            '--extra-binary "server-files/target/release/megu-installer$suffix"',
+            '--extra-binary "server-files/target/$rel_dir/megu-installer$suffix"',
             job,
         )
+        self.assertIn('$rel_dir', job)
         for binary in BINARIES:
-            self.assertIn(f"release/{binary}$suffix", job)
+            self.assertIn(f"/{binary}$suffix", job)
         self.assertIn("if-no-files-found: error", job)
         self.assertIn(
             "cargo build --locked --release --features mod-suite,create-offload --bin megu",
@@ -145,6 +149,10 @@ class ReleaseWorkflowTest(unittest.TestCase):
         self.assertIn("linux-musl-gcc", job)
         self.assertIn("x86_64-unknown-linux-musl", job)
         self.assertIn("aarch64-unknown-linux-musl", job)
+        # The musl toolchain step must not run on non-Ubuntu runners.
+        self.assertIn("if: matrix.kind == 'musl'", job)
+        self.assertIn("if: matrix.kind == 'cross'", job)
+        self.assertIn("rustup target add", job)
         self.assertIn(
             'cargo build --locked --release --features mod-suite,create-offload'
             ' --bin megu --target "$RUST_TARGET"',
@@ -160,6 +168,21 @@ class ReleaseWorkflowTest(unittest.TestCase):
         # glibc runners moved to the 2.35 baseline for Debian 12+ compatibility.
         self.assertNotIn("ubuntu-latest\n            target: linux", job)
         self.assertNotIn("ubuntu-24.04-arm", job)
+
+    def test_macos_deployment_target_and_extended_platforms(self):
+        job = self.jobs["build-matrix"]
+        # macOS binaries must target macOS 11 Big Sur or dyld refuses them
+        # on anything older than the runner's SDK default.
+        self.assertIn('MACOSX_DEPLOYMENT_TARGET: "11.0"', job)
+        self.assertIn("x86_64-apple-darwin", job)
+        self.assertIn("target: macos-x86_64", job)
+        self.assertIn("target: windows-arm64", job)
+        self.assertIn("windows-11-arm", job)
+        # The cross-compiled x86_64 probe cannot run on an ARM64 runner.
+        self.assertIn('RUNNER_ARCH" != "X64', job)
+        publish = self.jobs["publish-release"]
+        for target in ("macos-x86_64", "windows-arm64"):
+            self.assertIn(target, publish)
 
     def test_publish_release_includes_bootstrapper_bundles_and_sbom(self):
         job = self.jobs["publish-release"]
@@ -183,7 +206,7 @@ class ReleaseWorkflowTest(unittest.TestCase):
         )
         self.assertIn('if [[ -f "$probe" ]]', job)
         self.assertIn(
-            '--extra-binary "client-gpu/target/release/megu-client-gpu$suffix"',
+            '--extra-binary "client-gpu/target/$rel_dir/megu-client-gpu$suffix"',
             job,
         )
         self.assertIn("'megu-client-gpu'", self.jobs["publish-release"])
@@ -206,9 +229,18 @@ class ReleaseWorkflowTest(unittest.TestCase):
             job,
         )
         self.assertIn(
-            "'linux-arm64-musl', 'macos-arm64', 'windows-x86_64')",
+            "'linux-arm64-musl', 'macos-arm64', 'macos-x86_64',",
             job,
         )
+        self.assertIn(
+            "'windows-x86_64', 'windows-arm64')",
+            job,
+        )
+        for target in (
+            "linux-x86_64", "linux-x86_64-musl", "linux-arm64", "linux-arm64-musl",
+            "macos-arm64", "macos-x86_64", "windows-x86_64", "windows-arm64",
+        ):
+            self.assertIn(f"'{target}'", job)
         self.assertIn("musl_binaries = ('megu', 'megu-installer')", job)
         self.assertIn("target.endswith('-musl')", job)
         self.assertIn("tools/release_bundle.py', 'verify'", job)

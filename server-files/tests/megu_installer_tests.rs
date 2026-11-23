@@ -683,3 +683,31 @@ fn cli_help_version_json_and_usage_errors() {
     let out = run_installer(&["uninstall", "--client-bin", "x"]);
     assert_eq!(out.status.code(), Some(2));
 }
+
+/// A failed auto-download must say why on stderr instead of silently
+/// returning `None`. Point MEGU_GITHUB_REPO at a repo that cannot serve a
+/// release so curl/wget fail deterministically (offline hosts fail the same
+/// way), then check the installer still completes the local install.
+#[cfg(unix)]
+#[test]
+fn cli_auto_fetch_failure_logs_reason_and_install_continues() {
+    let scratch = Scratch::new();
+    let home = scratch.path().join("home");
+    let work = scratch.path().join("work");
+    std::fs::create_dir_all(&home).unwrap();
+    std::fs::create_dir_all(&work).unwrap();
+    let out = Command::new(env!("CARGO_BIN_EXE_megu-installer"))
+        .args(["client"])
+        .current_dir(&work)
+        .env("HOME", &home)
+        .env("MEGU_GITHUB_REPO", "megu-test/no-such-repo-release-test")
+        .env_remove("MEGU_NO_AUTO_FETCH")
+        .output()
+        .expect("run megu-installer");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("Auto-download skipped: failed to download"),
+        "{stderr}"
+    );
+    assert!(out.status.success(), "{stderr}");
+}

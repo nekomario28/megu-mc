@@ -59,21 +59,35 @@ jobs:
           - os: ubuntu-22.04
             target: linux-x86_64
             rust_target: ''
+            kind: native
           - os: ubuntu-22.04
             target: linux-x86_64-musl
             rust_target: x86_64-unknown-linux-musl
+            kind: musl
           - os: ubuntu-22.04-arm
             target: linux-arm64
             rust_target: ''
+            kind: native
           - os: ubuntu-22.04-arm
             target: linux-arm64-musl
             rust_target: aarch64-unknown-linux-musl
+            kind: musl
           - os: macos-latest
             target: macos-arm64
             rust_target: ''
+            kind: native
+          - os: macos-latest
+            target: macos-x86_64
+            rust_target: x86_64-apple-darwin
+            kind: cross
           - os: windows-latest
             target: windows-x86_64
             rust_target: ''
+            kind: native
+          - os: windows-11-arm
+            target: windows-arm64
+            rust_target: ''
+            kind: native
     runs-on: ${{ matrix.os }}
     timeout-minutes: 60
     steps:
@@ -84,7 +98,7 @@ jobs:
         with:
           toolchain: 1.98.0
       - name: Install musl target toolchain
-        if: matrix.rust_target
+        if: matrix.kind == 'musl'
         shell: bash
         env:
           RUST_TARGET: ${{ matrix.rust_target }}
@@ -97,15 +111,27 @@ jobs:
           arch="${RUST_TARGET%%-*}"
           sudo ln -sf "$(command -v musl-gcc)" "/usr/local/bin/${arch}-linux-musl-gcc"
           sudo ln -sf "$(command -v ar)" "/usr/local/bin/${arch}-linux-musl-ar"
+      - name: Install cross-compilation Rust target
+        if: matrix.kind == 'cross'
+        shell: bash
+        run: rustup target add "${{ matrix.rust_target }}"
       - name: Build server and standalone release binaries (locked)
         shell: bash
         env:
           RUST_TARGET: ${{ matrix.rust_target }}
+          # macOS 11 Big Sur is the oldest supported host OS: without an
+          # explicit deployment target the SDK default (the runner's macOS
+          # version) makes the binaries refuse to launch on older systems.
+          MACOSX_DEPLOYMENT_TARGET: "11.0"
         run: |
-          if [[ -n "$RUST_TARGET" ]]; then
+          if [[ "$RUST_TARGET" == *-musl ]]; then
             cargo build --locked --release --features mod-suite,create-offload --bin megu --target "$RUST_TARGET"
             cargo build --locked --release --manifest-path server-files/Cargo.toml --bin megu-installer --target "$RUST_TARGET"
           else
+            # CARGO_BUILD_TARGET applies --target to every crate build below
+            # without touching the per-crate command lines (empty for native
+            # runners such as macos-latest arm64 and windows-11-arm).
+            if [[ -n "$RUST_TARGET" ]]; then export CARGO_BUILD_TARGET="$RUST_TARGET"; fi
             cargo build --locked --release --features mod-suite,create-offload --bin megu
             cargo build --locked --release --manifest-path client-app/Cargo.toml --bin megu-client
             cargo build --locked --release --manifest-path mod-adapter-core/Cargo.toml --bin megu-mod-check
@@ -124,7 +150,14 @@ jobs:
           if [[ -n "$RUST_TARGET" ]]; then
             probe="client-gpu/target/$RUST_TARGET/release/megu-client-gpu$suffix"
           fi
-          if [[ -f "$probe" ]]; then "$probe" --headless-probe; fi
+          if [[ -f "$probe" ]]; then
+            # A cross-compiled probe (x86_64 macOS on an ARM64 runner) cannot
+            # execute natively; skip it there instead of failing the job.
+            run_probe=1
+            if [[ "$RUST_TARGET" == x86_64-* && "$RUNNER_ARCH" != "X64" ]]; then run_probe=0; fi
+            if [[ "$RUST_TARGET" == aarch64-* && "$RUNNER_ARCH" != "ARM64" ]]; then run_probe=0; fi
+            if [[ "$run_probe" == 1 ]]; then "$probe" --headless-probe; fi
+          fi
       - name: Package and verify release archive
         shell: bash
         env:
@@ -137,21 +170,25 @@ jobs:
           suffix=''
           if [[ "$RUNNER_OS" == Windows ]]; then suffix='.exe'; fi
           out_dir="dist/$RELEASE_TARGET"
-          if [[ -n "$RUST_TARGET" ]]; then
+          if [[ "$RUST_TARGET" == *-musl ]]; then
             "$PY" tools/release_bundle.py build \
               --binary "target/$RUST_TARGET/release/megu$suffix" \
               --extra-binary "server-files/target/$RUST_TARGET/release/megu-installer$suffix" \
               --out-dir "$out_dir" --version "$RELEASE_VERSION" --target "$RELEASE_TARGET"
           else
+            # Cross builds (--target via CARGO_BUILD_TARGET) land under
+            # target/<triple>/release; native builds use target/release.
+            rel_dir='release'
+            if [[ -n "$RUST_TARGET" ]]; then rel_dir="$RUST_TARGET/release"; fi
             "$PY" tools/release_bundle.py build \
-              --binary "target/release/megu$suffix" \
-              --extra-binary "client-app/target/release/megu-client$suffix" \
-              --extra-binary "mod-adapter-core/target/release/megu-mod-check$suffix" \
-              --extra-binary "state-store/target/release/megu-world-migrate$suffix" \
-              --extra-binary "server-files/target/release/megu-init$suffix" \
-              --extra-binary "server-files/target/release/megu-admin$suffix" \
-              --extra-binary "client-gpu/target/release/megu-client-gpu$suffix" \
-              --extra-binary "server-files/target/release/megu-installer$suffix" \
+              --binary "target/$rel_dir/megu$suffix" \
+              --extra-binary "client-app/target/$rel_dir/megu-client$suffix" \
+              --extra-binary "mod-adapter-core/target/$rel_dir/megu-mod-check$suffix" \
+              --extra-binary "state-store/target/$rel_dir/megu-world-migrate$suffix" \
+              --extra-binary "server-files/target/$rel_dir/megu-init$suffix" \
+              --extra-binary "server-files/target/$rel_dir/megu-admin$suffix" \
+              --extra-binary "client-gpu/target/$rel_dir/megu-client-gpu$suffix" \
+              --extra-binary "server-files/target/$rel_dir/megu-installer$suffix" \
               --out-dir "$out_dir" --version "$RELEASE_VERSION" --target "$RELEASE_TARGET"
           fi
           "$PY" tools/release_bundle.py verify \
@@ -266,7 +303,8 @@ jobs:
           from pathlib import Path
 
           targets = ('linux-x86_64', 'linux-x86_64-musl', 'linux-arm64',
-                     'linux-arm64-musl', 'macos-arm64', 'windows-x86_64')
+                     'linux-arm64-musl', 'macos-arm64', 'macos-x86_64',
+                     'windows-x86_64', 'windows-arm64')
           binaries = ('megu', 'megu-client', 'megu-mod-check',
                       'megu-world-migrate', 'megu-init', 'megu-admin',
                       'megu-client-gpu', 'megu-installer')

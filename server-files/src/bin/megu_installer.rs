@@ -283,11 +283,13 @@ fn host_release_target_for(
 ) -> Option<(&'static str, &'static str)> {
     match (os, arch, env) {
         ("windows", "x86_64", _) => Some(("windows-x86_64", ".exe")),
+        ("windows", "aarch64", _) => Some(("windows-arm64", ".exe")),
         ("linux", "x86_64", "musl") => Some(("linux-x86_64-musl", "")),
         ("linux", "aarch64", "musl") => Some(("linux-arm64-musl", "")),
         ("linux", "x86_64", _) => Some(("linux-x86_64", "")),
         ("linux", "aarch64", _) => Some(("linux-arm64", "")),
         ("macos", "aarch64", _) => Some(("macos-arm64", "")),
+        ("macos", "x86_64", _) => Some(("macos-x86_64", "")),
         _ => None,
     }
 }
@@ -350,7 +352,14 @@ fn auto_fetch_release_bundle(base_dir: & std::path::Path) -> Option<PathBuf> {
     if std::env::var_os("MEGU_NO_AUTO_FETCH").is_some() {
         return None;
     }
-    let (target, suffix) = host_release_target()?;
+    let Some((target, suffix)) = host_release_target() else {
+        eprintln!(
+            "[megu-installer] Auto-download skipped: no GitHub Release bundle for {}/{}",
+            std::env::consts::OS,
+            std::env::consts::ARCH
+        );
+        return None;
+    };
     let tag = std::env::var("MEGU_RELEASE_TAG").unwrap_or_else(|_| DEFAULT_RELEASE_TAG.to_owned());
     let repo = std::env::var("MEGU_GITHUB_REPO").unwrap_or_else(|_| DEFAULT_GITHUB_REPO.to_owned());
     let runtime_dir = base_dir.join("megu-runtime");
@@ -366,7 +375,13 @@ fn auto_fetch_release_bundle(base_dir: & std::path::Path) -> Option<PathBuf> {
     if bundle_complete {
         return Some(bundle_dir);
     }
-    std::fs::create_dir_all(&runtime_dir).ok()?;
+    if let Err(err) = std::fs::create_dir_all(&runtime_dir) {
+        eprintln!(
+            "[megu-installer] Auto-download skipped: cannot create {}: {err}",
+            runtime_dir.display()
+        );
+        return None;
+    }
     let base_url = format!("https://github.com/{repo}/releases/download/{tag}");
     let archive_name = format!("megu-{tag}-{target}.tar.gz");
     let sums_path = runtime_dir.join("SHA256SUMS-all.txt");
@@ -380,29 +395,72 @@ fn auto_fetch_release_bundle(base_dir: & std::path::Path) -> Option<PathBuf> {
         ("megu-bootstrapper.jar", &dl_jar_path),
     ] {
         let url = format!("{base_url}/{remote}");
-        download_release_file(&url, local)?;
+        if download_release_file(&url, local).is_none() {
+            eprintln!(
+                "[megu-installer] Auto-download skipped: failed to download {url} \
+                 (install curl or wget and check network access, or set \
+                 MEGU_NO_AUTO_FETCH=1 to disable auto-download)"
+            );
+            return None;
+        }
     }
-    let sums_text = std::fs::read_to_string(&sums_path).ok()?;
+    let sums_text = match std::fs::read_to_string(&sums_path) {
+        Ok(text) => text,
+        Err(err) => {
+            eprintln!(
+                "[megu-installer] Auto-download skipped: cannot read {}: {err}",
+                sums_path.display()
+            );
+            return None;
+        }
+    };
     for (fname, path) in [
         (archive_name.as_str(), &archive_path),
         ("megu-bootstrapper.jar", &dl_jar_path),
     ] {
-        let expected = parse_expected_sha256(&sums_text, fname)?;
-        let actual = installer::sha256_file(path).ok()?;
+        let Some(expected) = parse_expected_sha256(&sums_text, fname) else {
+            eprintln!(
+                "[megu-installer] Auto-download skipped: SHA256SUMS-all.txt has no entry for {fname}"
+            );
+            return None;
+        };
+        let actual = match installer::sha256_file(path) {
+            Ok(digest) => digest,
+            Err(err) => {
+                eprintln!(
+                    "[megu-installer] Auto-download skipped: cannot hash {}: {err}",
+                    path.display()
+                );
+                return None;
+            }
+        };
         if actual != expected {
             eprintln!("[megu-installer] SHA-256 mismatch for {fname}");
             let _ = std::fs::remove_file(path);
             return None;
         }
     }
-    let status = std::process::Command::new("tar")
+    let status = match std::process::Command::new("tar")
         .arg("-xzf")
         .arg(&archive_path)
         .arg("-C")
         .arg(&runtime_dir)
         .status()
-        .ok()?;
+    {
+        Ok(status) => status,
+        Err(err) => {
+            eprintln!(
+                "[megu-installer] Auto-download skipped: cannot run tar: {err} \
+                 (install tar or set MEGU_NO_AUTO_FETCH=1 to disable auto-download)"
+            );
+            return None;
+        }
+    };
     if !status.success() || !bundle_dir.is_dir() {
+        eprintln!(
+            "[megu-installer] Auto-download skipped: tar failed to extract {archive_name} into {}",
+            runtime_dir.display()
+        );
         return None;
     }
     let _ = std::fs::copy(&dl_jar_path, &jar_path);
@@ -1023,6 +1081,14 @@ mod tests {
         assert_eq!(
             host_release_target_for("macos", "aarch64", ""),
             Some(("macos-arm64", ""))
+        );
+        assert_eq!(
+            host_release_target_for("macos", "x86_64", ""),
+            Some(("macos-x86_64", ""))
+        );
+        assert_eq!(
+            host_release_target_for("windows", "aarch64", ""),
+            Some(("windows-arm64", ".exe"))
         );
         assert_eq!(host_release_target_for("linux", "riscv64", "gnu"), None);
         assert_eq!(host_release_target_for("linux", "riscv64", "musl"), None);
