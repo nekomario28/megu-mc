@@ -33,6 +33,7 @@ mod ingress_guard;
 mod json;
 mod stream_gen;
 mod tick_stats;
+mod tick_workers;
 mod trace_env;
 mod tree;
 mod world_rng;
@@ -5610,6 +5611,19 @@ fn live_mob_tick_dimension(
     // still gets its AI tick; at the baseline range this check never runs.
     let activation = current_load_budget().entity_activation_range;
     let activation_sq = (activation as f64) * (activation as f64);
+    // H9/H10/H11: the pure per-mob probes (block/fluid/env reads, the pet
+    // teleport search, player targeting) go to the tick worker pool; every
+    // mutation below still runs on this thread in the same order.
+    let mut plans = crate::tick_workers::mob_plans(
+        dim,
+        mobs_snap,
+        players,
+        dead_by_cramming,
+        hot,
+        day,
+        hostile,
+        activation,
+    );
     for (mob_idx, m) in mobs_snap.iter().enumerate() {
         if dead_by_cramming[mob_idx] {
             continue;
@@ -5643,6 +5657,10 @@ fn live_mob_tick_dimension(
         if spec.max_health <= 0.0 {
             continue;
         }
+        // Consume this mob's worker plan iff it still describes the mob's
+        // position and the world epoch it was computed against; a stale or
+        // missing plan falls back to the same inline probes serial used.
+        let mut plan = plans.take_valid(mob_idx, (mp.0, mp.1, mp.2));
         // Vanilla `TamableAnimal` follow: a standing tamed wolf/cat more than
         // 12 blocks behind its owner teleports onto a safe floor next to them
         // rather than being left behind. The owner must be online and in the
@@ -5665,13 +5683,22 @@ fn live_mob_tick_dimension(
                     .iter()
                     .find_map(|p| (p.dim == dim && p.client.uuid == owner).then_some(p.pos))
                 {
-                    if let Some((tx, ty, tz)) = pet_follow_teleport_step(
-                        dim,
-                        owner_pos,
-                        (mp.0, mp.1, mp.2),
-                        sitting,
-                        |d, x, y, z| reg.blocks_motion(block_at_cached_dim(d, x, y, z)),
-                    ) {
+                    let teleport = plan
+                        .as_ref()
+                        .filter(|_| plans.epoch_fresh())
+                        .and_then(|p| {
+                            p.pet.filter(|pp| pp.state == pet_state).map(|pp| pp.teleport)
+                        })
+                        .unwrap_or_else(|| {
+                            pet_follow_teleport_step(
+                                dim,
+                                owner_pos,
+                                (mp.0, mp.1, mp.2),
+                                sitting,
+                                |d, x, y, z| reg.blocks_motion(block_at_cached_dim(d, x, y, z)),
+                            )
+                        });
+                    if let Some((tx, ty, tz)) = teleport {
                         let (yaw, pitch) = (mp.3, mp.4);
                         *mp = (tx, ty, tz, yaw, pitch);
                         drop(mp);
@@ -5688,18 +5715,15 @@ fn live_mob_tick_dimension(
             }
         }
         let [bx, by, bz] = [mp.0, mp.1, mp.2].map(|value| value.floor() as i32);
-        let feet_state = block_at_cached_dim(dim, bx, by, bz);
-        let (in_water, in_lava) = if dim == DimId::Overworld {
-            (
-                mob_in_water(m.etype, mp.0, mp.1, mp.2),
-                mob_in_lava(m.etype, mp.0, mp.1, mp.2),
-            )
-        } else {
-            (
-                reg.has_water(feet_state),
-                reg.fluid_name(feet_state) == "minecraft:lava",
-            )
-        };
+        let mob_env = crate::tick_workers::env_or(
+            plan.as_ref().filter(|_| plans.epoch_fresh()),
+            dim,
+            reg,
+            m.etype,
+            (mp.0, mp.1, mp.2),
+        );
+        let feet_state = mob_env.feet_state;
+        let (in_water, in_lava) = (mob_env.in_water, mob_env.in_lava);
         if in_water {
             *m.fire_ticks.lock().unwrap_or_else(|e| e.into_inner()) = 0;
         }
@@ -5717,15 +5741,21 @@ fn live_mob_tick_dimension(
         } else {
             m.vel.lock().unwrap_or_else(|e| e.into_inner()).fill(0.0);
         }
-        let submerged =
-            dim == DimId::Overworld && mob_drowning_submerged(m.etype, mp.0, mp.1, mp.2);
+        let submerged = dim == DimId::Overworld
+            && mob_env.submerged_or(plans.epoch_fresh(), (mp.0, mp.1, mp.2), || {
+                mob_drowning_submerged(m.etype, mp.0, mp.1, mp.2)
+            });
         let mut damage = 0.0;
         if tick.is_multiple_of(server_ticks(10)) {
             if m.etype != 31
                 && if dim == DimId::Overworld {
-                    mob_cell_solid(mp.0, mp.1 + 1.0, mp.2)
+                    mob_env.cell_solid_or(plans.epoch_fresh(), (mp.0, mp.1, mp.2), || {
+                        mob_cell_solid(mp.0, mp.1 + 1.0, mp.2)
+                    })
                 } else {
-                    reg.blocks_motion(block_at_cached_dim(dim, bx, by + 1, bz))
+                    reg.blocks_motion(mob_env.above_or(plans.epoch_fresh(), || {
+                        block_at_cached_dim(dim, bx, by + 1, bz)
+                    }))
                 }
             {
                 damage += 1.0;
@@ -5754,7 +5784,9 @@ fn live_mob_tick_dimension(
             // brightness above 0.5 — water and rain take the light to 0 here.
             // Skeletons and phantoms share the family predicates; zombies use
             // the same rule written inline (they have no dedicated helper).
-            let sky_visible = by + 1 >= height_at(bx, bz) && block_at_cached(bx, by + 2, bz) == 0;
+            let sky_visible = mob_env.sky_visible_or(plans.epoch_fresh(), by, || {
+                by + 1 >= height_at(bx, bz) && block_at_cached(bx, by + 2, bz) == 0
+            });
             let sky_light = if in_water || raining { 0.0 } else { 1.0 };
             let sun_burn = match m.etype {
                 91 => skeleton_burns_in_sun(day, sky_visible, sky_light, false),
@@ -5816,23 +5848,6 @@ fn live_mob_tick_dimension(
         let position = (mp.0, mp.1, mp.2);
         let pos = [mp.0, mp.1, mp.2];
         drop(mp);
-        let distance = |player: &&LiveMobPlayer<'_>| entity_distance_sq(position, player.pos);
-        let local = || players.iter().filter(|player| player.dim == dim);
-        let nearest = local()
-            .filter(|p| !p.client.is_spectator())
-            .min_by(|a, b| distance(a).total_cmp(&distance(b)));
-        let target = local()
-            .filter(|p| p.attackable && hostile && distance(p) <= 64.0f64.powi(2))
-            .min_by(|a, b| distance(a).total_cmp(&distance(b)));
-        let target = if matches!(
-            m.etype,
-            8 | 23 | 29 | 31 | 35 | 45 | 50 | 76 | 80 | 91 | 116 | 118 | 119 | 124 | 100 | 16
-                | 27 | 33 | 54 | 88 | 102
-        ) {
-            target
-        } else {
-            None
-        };
         // `HurtByTargetGoal` provocation is the shared aggro memory; recent
         // hurt keeps any of these families hostile regardless of daylight.
         let provoked = m
@@ -5841,77 +5856,28 @@ fn live_mob_tick_dimension(
             .unwrap_or_else(|e| e.into_inner())
             .elapsed()
             < Duration::from_secs(10);
-        let target = if provoked {
-            target
-        } else {
-            match m.etype {
-                // `Spider` targets only in darkness (or when provoked): sky
-                // light 15 by day above ground, 0 anywhere shaded.
-                100 if !spider_is_hostile(
-                    day,
-                    if day && by + 1 >= height_at(bx, bz) { 15 } else { 0 },
-                    false,
-                ) =>
-                {
-                    None
-                }
-                // `DrownedGoToWaterGoal`: an unprovoked drowned shelters under
-                // water in daylight instead of pursuing.
-                27 if drowned_should_hide_in_water(day, in_water) => None,
-                // `EnderMan.isLookingAtMe` is the only unprovoked aggro path:
-                // a staring player's look cone must land on the enderman's
-                // head with clear line of sight (pumpkins break the stare).
-                33 => {
-                    let enderman_eye = [pos[0], pos[1] + f64::from(spec.eye_height), pos[2]];
-                    let stared = players.iter().any(|p| {
-                        if p.dim != dim || !p.attackable {
-                            return false;
-                        }
-                        let (px, py, pz, pyaw, ppitch, ..) =
-                            *p.client.pos.lock().unwrap_or_else(|e| e.into_inner());
-                        if entity_distance_sq(position, (px, py, pz)) > 64.0f64.powi(2) {
-                            return false;
-                        }
-                        let yaw = f64::from(pyaw).to_radians();
-                        let pitch = f64::from(ppitch).to_radians();
-                        let player_eye = [px, py + 1.62, pz];
-                        let player_look = [
-                            -yaw.sin() * pitch.cos(),
-                            -pitch.sin(),
-                            yaw.cos() * pitch.cos(),
-                        ];
-                        let head = p
-                            .client
-                            .inv
-                            .lock()
-                            .unwrap_or_else(|e| e.into_inner())
-                            .get(&5)
-                            .and_then(|stack| item_to_name(stack.0).map(str::to_owned))
-                            .unwrap_or_default();
-                        enderman_stared_at(
-                            player_eye,
-                            player_look,
-                            enderman_eye,
-                            &head,
-                            live_mob_block_hit(dim, reg, player_eye, enderman_eye).is_none(),
-                        )
-                    });
-                    if stared { target } else { None }
-                }
-                _ => target,
-            }
-        };
-        let perception = target.map(|target| {
-            let mut p = target.perceive();
-            p.line_of_sight = live_mob_block_hit(
-                dim,
-                reg,
-                [pos[0], pos[1] + f64::from(spec.eye_height), pos[2]],
-                [p.position.0, p.position.1 + 1.62, p.position.2],
-            )
-            .is_none();
-            p
-        });
+        // The pure targeting scan (nearest/attackable player pick, spider and
+        // drowned daylight rules, the enderman stare, LOS ray, tempting look)
+        // lives in `tick_workers::compute_targeting` — reuse the worker plan
+        // iff its recorded inputs still hold, else compute the same scan inline.
+        let targeting = plans.targeting(
+            plan.as_mut().and_then(|p| p.targeting.take()),
+            provoked,
+            position,
+            (bx, by, bz),
+            &mob_env,
+            m.etype,
+            spec.eye_height,
+            dim,
+            reg,
+            day,
+            hostile,
+        );
+        let nearest = targeting.nearest.map(|i| &players[i]);
+        let target = targeting.target.map(|i| &players[i]);
+        let perception = targeting.perception;
+        let look = targeting.look.map(|i| &players[i]);
+        let distance = |player: &&LiveMobPlayer<'_>| entity_distance_sq(position, player.pos);
 
         // MEGA-W2 §3.1 CrowdTickGuard: physics, fluid travel, damage,
         // cramming and the combat checks above already ran at full rate —
@@ -5950,7 +5916,8 @@ fn live_mob_tick_dimension(
                     hp,
                     max_hp: spec.max_health,
                     in_water,
-                    in_rain: raining && by + 1 >= height_at(bx, bz),
+                    in_rain: raining
+                        && by + 1 >= mob_env.sky_height_or(plans.epoch_fresh(), || height_at(bx, bz)),
                     on_fire: reg.name_of(feet_state) == "minecraft:fire",
                     nearest_target: target.zip(perception).map(|(target, seen)| {
                         MobTargetSnapshot {
@@ -5984,7 +5951,8 @@ fn live_mob_tick_dimension(
         if m.etype == 87
             && dim == DimId::Overworld
             && sheared().lock().unwrap_or_else(|e| e.into_inner()).contains(&m.eid)
-            && block_at(bx, by - 1, bz) == name_to_state("grass_block").unwrap_or(u32::MAX)
+            && mob_env.below_or(plans.epoch_fresh(), || block_at(bx, by - 1, bz))
+                == name_to_state("grass_block").unwrap_or(u32::MAX)
             && ((m.eid as u64).wrapping_mul(1103515245) ^ tick)
                 .is_multiple_of(MOB_SPAWN_CHANCE_DENOMINATOR)
         {
@@ -6033,21 +6001,6 @@ fn live_mob_tick_dimension(
             }
         }
 
-        let tempting = match m.etype {
-            19 => Some(853),
-            22 | 87 => Some(854),
-            77 => Some(1097),
-            _ => None,
-        };
-        let look = tempting
-            .and_then(|item| {
-                local()
-                    .filter(|p| {
-                        p.held_item == Some(item) && !p.client.is_spectator() && distance(p) < 100.0
-                    })
-                    .min_by(|a, b| distance(a).total_cmp(&distance(b)))
-            })
-            .or(nearest);
         let goal_ctx = GoalContext {
             position,
             width: spec.width,

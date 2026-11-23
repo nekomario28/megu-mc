@@ -12,7 +12,7 @@ layers = [
     # The wire format is the tree's first consumer: it reads brigadier and nothing else, and
     # nothing below it may read it back.
     ["brigadier_wire"],
-    ["chest_loot", "java_compat", "landing", "effects", "minecart", "spawner", "tick_persistence", "stream_gen"],
+    ["chest_loot", "java_compat", "landing", "effects", "minecart", "spawner", "tick_persistence", "stream_gen", "tick_workers"],
     ["cached_lookup", "world_rng", "tick_queue", "landing_types", "flowing_fluid", "scheduled_ticks"],
     ["feature", "structure_template"],
     ["tree", "mineshaft"],
@@ -38,6 +38,7 @@ graph = d.ModuleGraph(
         ("java_compat", "landing_types"),
         ("tick_persistence", "scheduled_ticks"),
         ("stream_gen", "feature"), ("stream_gen", "worldgen"),
+        ("tick_workers", "block_registry"), ("tick_workers", "worldgen"),
         ("generated_content", "nbt"),
         ("structure_placement", "generation_math"),
         ("mineshaft_layout", "generation_math"),

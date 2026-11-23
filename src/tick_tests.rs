@@ -10398,3 +10398,223 @@ fn sign_edit_distance_uses_eight_block_squared_limit() {
     assert!(crate::sign_edit_in_range((0.5, 64.5, 0.5), 8, 64, 0));
     assert!(!crate::sign_edit_in_range((0.5, 64.5, 0.5), 9, 64, 0));
 }
+
+/// The observable per-mob state `mob_tick` is allowed to change, in `mobs()`
+/// order. `Instant` fields (`hurt_at`, `last_hit`) are wall-clock and excluded;
+/// everything else must be bit-identical between a serial run and a parallel
+/// run of the same fixture.
+type MobObs = (i32, i64, [f64; 5], f32, i32, i32, i32, i32, Option<u64>, [f64; 3]);
+fn mob_tick_observables() -> Vec<MobObs> {
+    mobs()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .iter()
+        .map(|m| {
+            let p = *m.pos.lock().unwrap_or_else(|e| e.into_inner());
+            (
+                m.eid,
+                m.etype,
+                [p.0, p.1, p.2, f64::from(p.3), f64::from(p.4)],
+                *m.hp.lock().unwrap_or_else(|e| e.into_inner()),
+                *m.fire_ticks.lock().unwrap_or_else(|e| e.into_inner()),
+                *m.air.lock().unwrap_or_else(|e| e.into_inner()),
+                *m.love.lock().unwrap_or_else(|e| e.into_inner()),
+                *m.fuse.lock().unwrap_or_else(|e| e.into_inner()),
+                *m.last_hurt_tick.lock().unwrap_or_else(|e| e.into_inner()),
+                *m.vel.lock().unwrap_or_else(|e| e.into_inner()),
+            )
+        })
+        .collect()
+}
+
+fn world_overlay_observables() -> Vec<(DimChunkKey, u32, u32)> {
+    let mut out = Vec::new();
+    for (key, cells) in world().lock().unwrap_or_else(|e| e.into_inner()).iter() {
+        for (cell, state) in cells {
+            out.push((*key, *cell, *state));
+        }
+    }
+    out.sort();
+    out
+}
+
+/// H9/H10/H11 regression: the worker-pool path must leave a world that is
+/// bit-identical to the serial path — same mob positions/hp/timers, same block
+/// writes, same xp drops, same AI-state map, same RNG position — while
+/// `TICKPAR_COMPUTED` proves the plans really were produced off the tick
+/// thread. Every mob in the fixture exercises a different plan field: the pig
+/// and blaze take fluid travel, the zombie targets (attackable pick + LOS ray
+/// + melee), the enderman exercises the stare scan, the wolf takes the pet
+/// teleport, the sheared sheep reads the block below, and the cow reads the
+/// tempting item off the player's hand.
+#[test]
+fn tick_parallel_mob_tick_matches_serial_observably() {
+    let _guard = world_guard();
+    crate::test_support::require_vanilla_data();
+    set_level_ultra_warm(false);
+
+    type RunObs = (
+        Vec<MobObs>,
+        Vec<(DimChunkKey, u32, u32)>,
+        Vec<(i32, f64, f64, f64, i16, i32)>,
+        usize,
+        Vec<i32>,
+        u64,
+    );
+    let run = |parallel: bool| -> RunObs {
+        let _fixture = Travel4dWorld::take();
+        // Same starting stores, same seed, same eid counter — anything not
+        // reset here is either untouched by mob_tick or covered by the fixture.
+        LIVE_MOB_AI.with(|ai| ai.borrow_mut().clear());
+        live_mob_states()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clear();
+        w1_live_mob_ai()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clear();
+        live_mob_projectiles()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clear();
+        w1_evoker_fangs()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clear();
+        mob_custom_names()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clear();
+        sitting_cats()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clear();
+        sheared()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clear();
+        xps().lock().unwrap_or_else(|e| e.into_inner()).clear();
+        drops().lock().unwrap_or_else(|e| e.into_inner()).clear();
+        NEXT_EID.store(9_000, Ordering::Relaxed);
+        world_rng::seed(0x5EED_5EED);
+        DIFFICULTY.store(2, Ordering::Relaxed);
+        RAINING.store(0, Ordering::Relaxed);
+        TICK.store(server_ticks(10), Ordering::Relaxed);
+        WORLD_TIME.store(14000, Ordering::Relaxed);
+        crate::tick_workers::set_parallel_override(Some(parallel));
+
+        let grass = name_to_state("grass_block").unwrap();
+        let lava = name_to_state("lava").unwrap();
+        for x in 0..24 {
+            for z in 0..24 {
+                set_block(x, 63, z, grass);
+            }
+        }
+        for y in 64..=66 {
+            set_block(2, y, 2, 80); // water column
+        }
+        set_block(12, 64, 12, lava);
+
+        let (dummy, _rx) = client_pair();
+        // Facing +x, toward the enderman: yaw -90 makes the look vector +x.
+        *dummy.pos.lock().unwrap_or_else(|e| e.into_inner()) =
+            (8.5, 64.0, 8.5, -90.0, 0.0, true);
+        dummy
+            .inv
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(36, (name_to_item("wheat").unwrap(), 1, Vec::new()));
+        let client = Arc::new(dummy);
+        *clients().lock().unwrap_or_else(|e| e.into_inner()) = vec![client.clone()];
+
+        let fixture: Vec<Arc<Mob>> = vec![
+            test_mob(9_101, 22, (6.5, 64.0, 6.5), 10.0), // cow, tempted by wheat
+            test_mob(9_102, 87, (9.5, 64.0, 9.5), 8.0),  // sheep on grass
+            test_mob(9_103, 124, (11.5, 64.0, 10.5), 20.0), // zombie targets player
+            test_mob(9_104, 33, (20.5, 64.0, 8.5), 40.0),   // enderman in look cone
+            test_mob(9_105, 8, (12.5, 65.0, 12.5), 20.0),   // blaze in lava
+            test_mob(9_106, 122, (24.5, 64.0, 24.5), 8.0),  // wolf, owner >12 away
+            test_mob(9_107, 19, (2.5, 65.0, 2.5), 10.0),    // pig in water
+        ];
+        mobs()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .extend(fixture.iter().cloned());
+        let mut wolf_state = LiveMobState::new(122);
+        if let Some(MobBehaviorState::Wolf(pet)) = &mut wolf_state.behavior {
+            pet.owner = Some(client.uuid);
+            pet.sitting = false;
+        }
+        live_mob_states()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(9_106, wolf_state);
+        sheared()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(9_102);
+        refresh_hot();
+
+        for _ in 0..12 {
+            mob_tick();
+        }
+
+        let xp_obs: Vec<(i32, f64, f64, f64, i16, i32)> = xps()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .iter()
+            .map(|x| (x.eid, x.x, x.y, x.z, x.val, x.age))
+            .collect();
+        let state_keys: Vec<i32> = {
+            let mut keys: Vec<i32> = live_mob_states()
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .keys()
+                .copied()
+                .collect();
+            keys.sort_unstable();
+            keys
+        };
+        (
+            mob_tick_observables(),
+            world_overlay_observables(),
+            xp_obs,
+            drops().lock().unwrap_or_else(|e| e.into_inner()).len(),
+            state_keys,
+            world_rng::saved_state(),
+        )
+    };
+
+    let serial = run(false);
+    // A concurrent test's `set_block`/world activation bumps the world epoch
+    // and can stale one whole batch — the window is dispatch→commit per tick,
+    // so one unlucky collision must not flake the proof. If plans still never
+    // commit fresh across four runs (48 ticks), that is a real regression.
+    let mut attempts = 0;
+    let (parallel, computed_delta, fresh_delta) = loop {
+        let c0 = crate::tick_workers::TICKPAR_COMPUTED.load(Ordering::Relaxed);
+        let f0 = crate::tick_workers::TICKPAR_FRESH.load(Ordering::Relaxed);
+        let parallel = run(true);
+        let cd = crate::tick_workers::TICKPAR_COMPUTED.load(Ordering::Relaxed) - c0;
+        let fd = crate::tick_workers::TICKPAR_FRESH.load(Ordering::Relaxed) - f0;
+        attempts += 1;
+        if (cd > 0 && fd > 0) || attempts >= 4 {
+            break (parallel, cd, fd);
+        }
+    };
+    crate::tick_workers::set_parallel_override(None);
+
+    assert_eq!(
+        serial, parallel,
+        "parallel mob_tick diverged from serial observables"
+    );
+    assert!(
+        computed_delta > 0,
+        "no plans were computed on the worker pool — the parallel path did not run"
+    );
+    assert!(
+        fresh_delta > 0,
+        "no worker plan was consumed — commits never trusted a plan"
+    );
+}
