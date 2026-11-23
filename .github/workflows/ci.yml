@@ -36,6 +36,7 @@ jobs:
       - name: Debt, provenance (zero-GL/zero-embed), hygiene, TUI, 3-OS installer, workflow & website gates
         run: |
           bash tools/debt_ratchet.sh
+          bash tools/clippy_ratchet.sh
           python3 tools/provenance_check.py --strict-zero-gl
           python3 tests/public_hygiene_test.py
           python3 tests/release_workflow_test.py

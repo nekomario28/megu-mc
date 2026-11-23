@@ -140,6 +140,7 @@ bash tools/layers_check.sh || exit 1
 
 echo "== debt ratchet"
 bash tools/debt_ratchet.sh || exit 1
+bash tools/clippy_ratchet.sh || exit 1
 
 # The trap is installed before the first stage that writes a standalone crate's target, so a red
 # standalone crate does not leave its target behind for the next run to build against.
