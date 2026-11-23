@@ -8888,12 +8888,13 @@ fn run_command_ctx(ctx: &CmdCtx, msg: &str, s: &mut Option<&Client>) -> String {
                 return "usage: /title <targets> title|subtitle|actionbar|times|clear|reset ...".into();
             };
             let targets = resolve_selector(sel, me);
-            let send_to = |packet: i64, payload: &Vec<u8>| -> usize {
+            let send_to = |packet: i64, payload: &[u8]| -> usize {
                 let mut n = 0;
+                let mut shared = None;
                 for e in &targets {
                     let found = clients().lock().unwrap_or_else(|e| e.into_inner()).iter().find(|c2| c2.eid.to_string() == *e).cloned();
                     if let Some(c2) = found {
-                        if let Ok(mut w) = c2.sock.lock() { let _ = send_packet(&mut w, packet, payload.clone()); n += 1; }
+                        if let Ok(mut w) = c2.sock.lock() { let _ = send_broadcast_frame(&mut w, &mut shared, packet, payload); n += 1; }
                     }
                 }
                 n
