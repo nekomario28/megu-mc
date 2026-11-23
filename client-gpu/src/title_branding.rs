@@ -148,109 +148,156 @@ const MIN_BANNER_H: u32 = 8;
 const MAX_BANNER_W: u32 = 4096;
 const MAX_BANNER_H: u32 = 1024;
 
-/// Clean-room 5×7 pixel-art font for `M E G U` — bit `c` of each row byte
-/// marks glyph cell `c` (0 = leftmost of 5).
-const GLYPH_ROWS: usize = 7;
-const GLYPH_COLS: usize = 5;
+/// Clean-room 8×9 chunky 3D-blocky pixel-art glyphs for `M E G U` matching the
+/// bold squared proportions of the `EDITION` stone lettering. Bit `c` of each
+/// row byte marks glyph column `c` (`0` = leftmost of 8).
+const GLYPH_ROWS: usize = 9;
+const GLYPH_COLS: usize = 8;
 const MEGU_GLYPHS: [[u8; GLYPH_ROWS]; 4] = [
-    // M
+    // M (chunky vertical legs + crisp center V matching the blocky logo aesthetic)
     [
-        0b10001, 0b11011, 0b10101, 0b10101, 0b10001, 0b10001, 0b10001,
+        0b11000011,
+        0b11100111,
+        0b11111111,
+        0b11011011,
+        0b11011011,
+        0b11000011,
+        0b11000011,
+        0b11000011,
+        0b11000011,
     ],
-    // E
+    // E (exact squared bars matching the adjacent `E` in EDITION)
     [
-        0b11111, 0b00001, 0b00001, 0b01111, 0b00001, 0b00001, 0b11111,
+        0b11111111,
+        0b11111111,
+        0b00000011,
+        0b01111111,
+        0b01111111,
+        0b00000011,
+        0b00000011,
+        0b11111111,
+        0b11111111,
     ],
-    // G
+    // G (crisp squared outer corners matching EDITION's D/O geometry)
     [
-        0b11110, 0b00001, 0b00001, 0b10111, 0b10001, 0b10001, 0b01110,
+        0b11111111,
+        0b11111111,
+        0b00000011,
+        0b00000011,
+        0b11110011,
+        0b11110011,
+        0b11000011,
+        0b11111111,
+        0b11111111,
     ],
-    // U
+    // U (crisp squared bowl matching EDITION's D/O/N weight)
     [
-        0b10001, 0b10001, 0b10001, 0b10001, 0b10001, 0b10001, 0b01110,
+        0b11000011,
+        0b11000011,
+        0b11000011,
+        0b11000011,
+        0b11000011,
+        0b11000011,
+        0b11000011,
+        0b11111111,
+        0b11111111,
     ],
 ];
-/// Advance per letter: 5 glyph columns + 1 spacing column (`MEGU` spans
-/// `4 * 6 - 1 = 23` cells).
-const LETTER_ADVANCE: u32 = (GLYPH_COLS as u32) + 1;
-/// Total `MEGU` cell width at scale 1.
-const MEGU_CELL_W: u32 = 4 * LETTER_ADVANCE - 1;
-
-/// Quick luma for palette ranking (deterministic, no float).
+/// Quick luma for palette ranking (deterministic, no float, range 0..=2550).
 fn luma(px: &[u8]) -> u32 {
     u32::from(px[0]) * 3 + u32::from(px[1]) * 6 + u32::from(px[2])
 }
 
-/// Fill/highlight/outline/shadow RGBA sampled from the untouched
-/// `EDITION` glyphs.
+/// Fill/highlight/bevel/outline RGBA sampled from the untouched `EDITION`
+/// glyphs by luma band so black outlines can never steal `fill`.
 #[derive(Clone, Copy, Debug)]
 struct GlyphPalette {
     fill: [u8; 4],
     highlight: [u8; 4],
+    bevel: [u8; 4],
     outline: [u8; 4],
-    shadow: [u8; 4],
 }
 
-/// Sample the right `EDITION` word: fully-opaque texels vote for `fill`
-/// (mode), the brightest becomes `highlight`, the darkest `outline`;
-/// semi-transparent texels (the drop shadow, alpha below opaque) vote
-/// for `shadow` — falling back to a softened `outline` when the source
-/// casts none.
+/// Sample the right `EDITION` word across four luma bands:
+/// * `outline`: darkest opaque pixels (`luma < 250`, e.g. `#000000`)
+/// * `bevel`: mid-dark 3D stone underside (`250 <= luma < 1200`, e.g. `#3D3938`)
+/// * `fill`: mode of bright stone face pixels (`luma >= 1200`, e.g. `#D0C5C0`)
+/// * `highlight`: brightest stone rim pixel (falling back to slightly lifted `fill`)
 fn sample_palette(rgba: &[u8], width: u32, box_: PatchRect) -> Result<GlyphPalette, String> {
     let mut counts: Vec<([u8; 4], u32)> = Vec::new();
     for y in box_.y..box_.y + box_.h {
         for x in box_.x..box_.x + box_.w {
             let i = (y * width + x) as usize * 4;
             let px = &rgba[i..i + 4];
-            if px[3] == 0 {
+            if px[3] < 200 {
                 continue;
             }
-            let key = [px[0], px[1], px[2], px[3]];
+            let key = [px[0], px[1], px[2], 255];
             match counts.iter_mut().find(|(c, _)| *c == key) {
                 Some((_, n)) => *n += 1,
                 None => counts.push((key, 1)),
             }
         }
     }
-    let (mut fill, mut fill_votes) = ([0u8; 4], 0u32);
-    let (mut highlight, mut hi_luma) = ([0u8; 4], 0u32);
-    let (mut outline, mut lo_luma) = ([0u8; 4], u32::MAX);
-    let (mut shadow, mut shadow_votes) = ([0u8; 4], 0u32);
-    let mut opaque_px = 0u64;
-    for (c, n) in counts {
-        if c[3] >= 224 {
-            opaque_px += u64::from(n);
-            if n > fill_votes {
-                fill_votes = n;
-                fill = c;
-            }
-            let l = luma(&c);
-            if l > hi_luma {
-                hi_luma = l;
-                highlight = c;
-            }
-            if l < lo_luma {
-                lo_luma = l;
-                outline = c;
-            }
-        } else if n > shadow_votes {
-            shadow_votes = n;
-            shadow = c;
-        }
-    }
-    if opaque_px == 0 {
+    if counts.is_empty() {
         return Err("right word has no opaque glyph pixels to sample".to_owned());
     }
-    if shadow_votes == 0 {
-        // No explicit drop shadow in the source: reuse the outline at a
-        // softened alpha so `MEGU` still casts like `EDITION` would.
-        shadow = [outline[0], outline[1], outline[2], outline[3].min(160)];
+
+    let mut outline = [0u8, 0, 0, 255];
+    let mut lo_luma = u32::MAX;
+    let mut highlight = [255u8; 4];
+    let mut hi_luma = 0u32;
+    let mut fill_best = ([208u8, 197, 192, 255], 0u32);
+    let mut bevel_best = ([61u8, 57, 56, 255], 0u32);
+    let mut overall_bright = ([208u8, 197, 192, 255], 0u32);
+
+    for (c, n) in counts {
+        let l = luma(&c);
+        if l < lo_luma {
+            lo_luma = l;
+            outline = c;
+        }
+        if l > hi_luma {
+            hi_luma = l;
+            highlight = c;
+        }
+        if l >= 1200 {
+            if n > fill_best.1 {
+                fill_best = (c, n);
+            }
+        } else if l >= 250 && n > bevel_best.1 {
+            bevel_best = (c, n);
+        }
+        if l > 250 && n > overall_bright.1 {
+            overall_bright = (c, n);
+        }
     }
+
+    let fill = if fill_best.1 > 0 {
+        fill_best.0
+    } else if overall_bright.1 > 0 {
+        overall_bright.0
+    } else {
+        highlight
+    };
+    let bevel = if bevel_best.1 > 0 {
+        bevel_best.0
+    } else {
+        // Synthetic two-tone fixture without explicit 3D underside: derive a
+        // clean darker stone shade (~35% of face brightness).
+        [
+            (u16::from(fill[0]) * 35 / 100) as u8,
+            (u16::from(fill[1]) * 35 / 100) as u8,
+            (u16::from(fill[2]) * 35 / 100) as u8,
+            255,
+        ]
+    };
+
     Ok(GlyphPalette {
         fill,
         highlight,
+        bevel,
         outline,
-        shadow,
     })
 }
 
@@ -272,14 +319,6 @@ impl Painter<'_> {
         let i = (y as u32 * self.width + x as u32) as usize * 4;
         self.rgba[i..i + 4].copy_from_slice(&color);
         self.writes += 1;
-    }
-
-    fn fill(&mut self, x: i32, y: i32, w: i32, h: i32, color: [u8; 4]) {
-        for dy in 0..h {
-            for dx in 0..w {
-                self.put(x + dx, y + dy, color);
-            }
-        }
     }
 }
 
@@ -374,22 +413,12 @@ pub fn patch_edition_banner_to_megu(
     let right_box = word_box(gap_end as u32, last as u32);
     let palette = sample_palette(rgba, width, right_box)?;
 
-    // Pixel scale for the 5×7 font: the right word's ink height covers
-    // roughly 7 glyph rows + outline + shadow (≈9 rows), with the
-    // `+4` rounding real HD banners up instead of shrinking them.
-    let mut s = ((right_box.h + 4) / 9).max(1);
-    // `MEGU` must stay left of the word gap; shrink until it fits the
-    // cleared word's own span (plus one letter-spacing of slack).
-    let span = (gap_start - first) as u32;
-    while s > 1 && MEGU_CELL_W * s > span + LETTER_ADVANCE {
-        s -= 1;
-    }
-
+    let x_limit = gap_end as u32 - 1;
     let mut painter = Painter {
         rgba,
         width,
         height,
-        x_limit: gap_end as u32 - 1,
+        x_limit,
         writes: 0,
     };
 
@@ -404,37 +433,125 @@ pub fn patch_edition_banner_to_megu(
         }
     }
 
-    // Baseline harmony: the new glyph bottom sits on the right word's
-    // real glyph bottom — its last ink row minus the shadow offset.
-    let baseline = right_box.y + right_box.h - 1 - s.min(right_box.h - 1);
-    let y0 = baseline as i32 - (GLYPH_ROWS as i32 * s as i32) + 1;
-    let font_w = MEGU_CELL_W * s;
-    let x0 = left_box.x + left_box.w.saturating_sub(font_w) / 2;
+    // Measure exact 3D stone proportions directly from `right_box.h`:
+    //   - outer black border: ~7% of total height (4 px at 512x64, 1 px at 128x16)
+    //   - 3D downward extrusion underside: ~14% of total height (8 px at 512x64)
+    //   - stone front face fills the remaining ~72% between top border and bevel
+    let outline_px = ((right_box.h + 7) / 14).max(1) as i32;
+    let bevel_px = ((right_box.h * 15) / 100).max(1) as i32;
+    let face_y0 = right_box.y as i32 + outline_px;
+    let face_h = (right_box.h as i32 - 2 * outline_px - bevel_px).max(GLYPH_ROWS as i32);
 
-    // Rasterize M-E-G-U: drop shadow (+s,+s), then a one-cell dark
-    // outline ring, then the fill with a top-edge highlight. A mild
-    // italic slant (total `s` px, top leaning right) echoes the
-    // `EDITION` word's lean.
-    let slant = s as i32;
+    // Lay out `M E G U` across `left_box` with crisp inter-letter spacing so
+    // the outer border never collides between letters or into `EDITION`.
+    let avail_w = (left_box.w as i32 - 2 * outline_px).max(4 * GLYPH_COLS as i32);
+    let letter_gap = ((right_box.h / 10).max(2) as i32).min(avail_w / 10);
+    let glyph_w = ((avail_w - 3 * letter_gap) / 4).max(GLYPH_COLS as i32);
+    let total_w = 4 * glyph_w + 3 * letter_gap;
+    let base_x = left_box.x as i32 + ((left_box.w as i32 - total_w) / 2).max(outline_px);
+
+    // Build exact per-pixel front-face mask in the left region (`x_limit x height`),
+    // then derive the 3D underside (`bevel_mask`) and outer border (`outline_mask`)
+    // cleanly in separate passes so borders never overwrite letter interiors!
+    let mw = x_limit as usize;
+    let mh = height as usize;
+    let mut face_mask = vec![false; mw * mh];
+
     for (li, glyph) in MEGU_GLYPHS.iter().enumerate() {
-        let lx = x0 as i32 + (li as u32 * LETTER_ADVANCE * s) as i32;
-        for r in 0..GLYPH_ROWS {
-            let xoff = ((GLYPH_ROWS - 1 - r) as i32 * slant) / (GLYPH_ROWS - 1) as i32;
-            for c in 0..GLYPH_COLS {
+        let lx0 = base_x + li as i32 * (glyph_w + letter_gap);
+        // Subtle inward perspective lean mirroring EDITION's right-side slant:
+        // leftmost `M` leans gently right, tapering smoothly to vertical `U`.
+        let max_lean = ((glyph_w / 9).max(0)) * (3 - li as i32) / 3;
+        for py in 0..face_h {
+            let r = ((py as usize) * GLYPH_ROWS) / (face_h as usize);
+            let lean = (max_lean * (face_h - 1 - py)) / (face_h.max(2) - 1);
+            let y = face_y0 + py;
+            if y < 0 || y >= mh as i32 {
+                continue;
+            }
+            for px in 0..glyph_w {
+                let c = ((px as usize) * GLYPH_COLS) / (glyph_w as usize);
                 if glyph[r] & (1 << c) == 0 {
                     continue;
                 }
-                let px = lx + xoff + (c as u32 * s) as i32;
-                let py = y0 + (r as u32 * s) as i32;
-                let sz = s as i32;
-                painter.fill(px + sz, py + sz, sz, sz, palette.shadow);
-                painter.fill(px - sz, py - sz, 3 * sz, 3 * sz, palette.outline);
-                painter.fill(px, py, sz, sz, palette.fill);
-                // Top-edge cells catch the sampled highlight.
-                let above_set = r > 0 && glyph[r - 1] & (1 << c) != 0;
-                if !above_set {
-                    painter.fill(px, py, sz, s.div_ceil(2).max(1) as i32, palette.highlight);
+                let x = lx0 + px + lean;
+                if x >= 0 && x < mw as i32 {
+                    face_mask[y as usize * mw + x as usize] = true;
                 }
+            }
+        }
+    }
+
+    // Pass 1: 3D extruded stone underside (`bevel_mask`), shifted downward from
+    // `face_mask` by `1..=bevel_px` (only where not covered by the front face).
+    let mut bevel_mask = vec![false; mw * mh];
+    for y in 0..mh {
+        for x in 0..mw {
+            if !face_mask[y * mw + x] {
+                continue;
+            }
+            for step in 1..=bevel_px as usize {
+                let by = y + step;
+                if by < mh && !face_mask[by * mw + x] {
+                    bevel_mask[by * mw + x] = true;
+                }
+            }
+        }
+    }
+
+    // Pass 2: Outer black border via crisp squared (Chebyshev) dilation of
+    // `face_mask | bevel_mask`, matching EDITION's sharp 90-degree corners.
+    let mut outline_mask = vec![false; mw * mh];
+    for y in 0..mh as i32 {
+        for x in 0..mw as i32 {
+            let idx = y as usize * mw + x as usize;
+            if !face_mask[idx] && !bevel_mask[idx] {
+                continue;
+            }
+            for dy in -outline_px..=outline_px {
+                let ny = y + dy;
+                if ny < 0 || ny >= mh as i32 {
+                    continue;
+                }
+                for dx in -outline_px..=outline_px {
+                    let nx = x + dx;
+                    if nx >= 0 && nx < mw as i32 {
+                        outline_mask[ny as usize * mw + nx as usize] = true;
+                    }
+                }
+            }
+        }
+    }
+
+    // Pass 3: Paint back-to-front: outline -> 3D stone underside -> bright stone
+    // front face + crisp 1-px highlight rim where face meets underside bevel.
+    for y in 0..mh {
+        for x in 0..mw {
+            let idx = y * mw + x;
+            if outline_mask[idx] && !bevel_mask[idx] && !face_mask[idx] {
+                painter.put(x as i32, y as i32, palette.outline);
+            }
+        }
+    }
+    for y in 0..mh {
+        for x in 0..mw {
+            let idx = y * mw + x;
+            if bevel_mask[idx] {
+                painter.put(x as i32, y as i32, palette.bevel);
+            }
+        }
+    }
+    for y in 0..mh {
+        for x in 0..mw {
+            let idx = y * mw + x;
+            if face_mask[idx] {
+                let above_bevel = y + 1 < mh && bevel_mask[(y + 1) * mw + x];
+                let color = if above_bevel {
+                    palette.highlight
+                } else {
+                    palette.fill
+                };
+                painter.put(x as i32, y as i32, color);
             }
         }
     }
