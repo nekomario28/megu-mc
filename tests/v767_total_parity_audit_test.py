@@ -89,6 +89,7 @@ def fixture(root, *, duplicate_packet=False, commented_handler=False):
         server_code = '''
             fn handle_inner() {
                 match pid { 0x01 => { handle_chat(); }, _ => {} }
+                emit();
             }
             fn emit() { send_packet(socket, 0x02, vec![]); }
         '''
@@ -186,6 +187,91 @@ class AuthorityTests(unittest.TestCase):
             }
         '''
         self.assertEqual(AUDIT._send_ids(source), {5, 9})
+
+    def emission(self, text, phase="Play", producer=False, consts=None):
+        ids, _ = AUDIT._emission_ids(
+            AUDIT.rust_code(text), phase, consts or {}, producer)
+        return {number for _, number in ids}
+
+    def test_packet_tuple_sinks_are_detected(self):
+        source = '''
+            fn seen(eid: i64) {
+                broadcast_seen(eid, |_c| (0x70, entity_teleport(eid)));
+                fanout_in(audience, |_| (0x08, body.clone()));
+                broadcast(-1, move |_c| (0x75, pk.clone()));
+                (*id, *payload) = match (pos, rot) {
+                    (true, true) => (0x2f, move_pos_rot(eid)),
+                    (true, false) => (0x2e, move_pos(eid)),
+                    _ => return,
+                };
+            }
+        '''
+        self.assertEqual(self.emission(source), {0x08, 0x2e, 0x2f, 0x70, 0x75})
+
+    def test_non_packet_tuples_and_patterns_are_rejected(self):
+        source = '''
+            fn data(inv: &mut Map, frame: &mut Frame) {
+                inv.insert(k, (908, c - 1, Vec::new()));
+                specs.push((0, "allay", 0.35));
+                queue.insert(36 + held_slot, (908, cnt - 1, _hc));
+                if let Some((0x1e, b)) = frame.next() { handle(b); }
+                match packet {
+                    Some((0x5e, body)) => deliver(body),
+                    _ => {}
+                }
+                let (id, body) = produce();
+                (x, y) = swapped;
+            }
+        '''
+        self.assertEqual(self.emission(source), set())
+
+    def test_frame_write_varint_and_send_closure_forms(self):
+        source = '''
+            const CLIENTBOUND_COMMANDS: i64 = 0x11;
+            fn emit(sock: &mut TcpStream, targets: &[i32]) {
+                let framed = frame(0x6d, &payload);
+                write_raw_frame(sock, &framed);
+                let mut body = Vec::new();
+                write_varint(&mut body, 0x27);
+                write_varint(&mut body, 512);
+                send_packet(sock, i64::from(CLIENTBOUND_COMMANDS), commands_payload(level));
+                let send_to = |packet: i64, payload: &Vec<u8>| -> usize {
+                    let mut n = 0;
+                    for e in targets { let _ = send_packet(sock, packet, payload.clone()); n += 1; }
+                    n
+                };
+                send_to(0x0f, &vec![1u8]);
+                let pkt_id: i64 = match mode { "title" => 0x65, _ => 0x4c };
+                send_to(pkt_id, &payload);
+            }
+        '''
+        expected = {0x0f, 0x11, 0x27, 0x4c, 0x65, 0x6d}
+        self.assertEqual(
+            self.emission(source, consts={"CLIENTBOUND_COMMANDS": 0x11}),
+            expected)
+        # The const-declared packet id also resolves through the crate table.
+        self.assertEqual(self.emission(source) - {0x11}, expected - {0x11})
+
+    def test_uncalled_and_dead_helpers_do_not_count(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            fixture(root)
+            write(root, "src/extra.rs", '''
+                pub fn dead_emit(s: &mut TcpStream) { send_packet(s, 0x18, vec![]); }
+                #[allow(dead_code)]
+                fn live_encode() -> (i64, Vec<u8>) { (0x19, Vec::new()) }
+                fn caller(c: &Client) { broadcast(-1, |_c| live_encode()); }
+            ''')
+            write(root, "src/play_protocol.rs", '''
+                fn handle_inner() {
+                    match pid { 0x01 => { handle_chat(); }, _ => {} }
+                    caller(&me);
+                }
+            ''')
+            c2s, sent = AUDIT._server_packets(
+                root, (root / "src/play_protocol.rs").read_text(), "")
+            self.assertIn(("Play", 0x19), sent)
+            self.assertNotIn(("Play", 0x18), sent)
 
     def test_unknown_natural_spawn_dispatch_entity_is_rejected(self):
         with tempfile.TemporaryDirectory() as directory:

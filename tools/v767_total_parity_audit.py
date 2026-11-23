@@ -147,6 +147,14 @@ def rust_code(source, keep_strings=False):
             elif not parens and not brackets and token == ";":
                 item_end = pos + 1
                 break
+            elif not parens and not brackets and token == ",":
+                # A cfg(test) field/variant ends at the comma, leaving the
+                # enclosing item's closing brace intact.
+                item_end = pos + 1
+                break
+            elif not parens and not brackets and token == "}":
+                item_end = pos
+                break
         _blank(comments, attr.start(), item_end)
         _blank(code, attr.start(), item_end)
     return "".join(comments if keep_strings else code)
@@ -300,26 +308,33 @@ def _literal_arms(source, match_expression, kind="name"):
     return values
 
 
+def _split_arguments(code, opening):
+    """Top-level comma-separated arguments of the call starting at `(` opening."""
+    end = _brace_end(code, opening, "(", ")")
+    stack = []
+    arguments = []
+    argument_start = opening + 1
+    for position in range(opening, end):
+        token = code[position]
+        if token in "([{":
+            stack.append(token)
+        elif token in ")]}":
+            if stack:
+                stack.pop()
+        elif token == "," and stack == ["("]:
+            arguments.append(code[argument_start:position].strip())
+            argument_start = position + 1
+    arguments.append(code[argument_start:end - 1].strip())
+    if arguments and not arguments[-1]:
+        arguments.pop()
+    return arguments
+
+
 def _send_ids(source):
     code = rust_code(source)
     ids = set()
     for match in re.finditer(r'\bsend_packet\s*\(', code):
-        opening = match.end() - 1
-        end = _brace_end(code, opening, "(", ")")
-        stack = []
-        arguments = []
-        argument_start = opening + 1
-        for position in range(opening, end):
-            token = code[position]
-            if token in "([{":
-                stack.append(token)
-            elif token in ")]}":
-                if stack:
-                    stack.pop()
-            elif token == "," and stack == ["("]:
-                arguments.append(code[argument_start:position].strip())
-                argument_start = position + 1
-        arguments.append(code[argument_start:end - 1].strip())
+        arguments = _split_arguments(code, match.end() - 1)
         if len(arguments) >= 3 and re.fullmatch(INTEGER, arguments[1]):
             ids.add(_number(arguments[1]))
     return ids
@@ -359,6 +374,390 @@ def _client_packets(source):
     return client_sends, client_receives
 
 
+# Whole files included only under cfg(test), plus the cfg(test)-gated helper
+# module, hold no production emissions.
+SRC_TEST_FILE = re.compile(r'(?:_tests|test_support)\.rs$')
+CONST_DECL = re.compile(r'\bconst\s+([A-Za-z_]\w*)\s*:\s*'
+                        r'(?:i64|i32|u32|u16|u8|i16|i8|usize|isize)\s*=\s*('
+                        + INTEGER + r')\s*;')
+FUNCTION = re.compile(r'\bfn\s+([A-Za-z_]\w*)\s*(?:<[^;{}]*>)?\s*\(')
+ITEM_SCOPE = re.compile(r'\b(?:impl|trait|mod|struct|enum|union)\b[^;{}=()]*\{')
+# Tokens that mark a function as packet-linked: a socket sink, a fanout
+# producer, or the crate's (id, payload) tuple currency.
+SINK_TOKENS = (
+    "send_packet", "broadcast", "fanout", "SharedBroadcastFrame",
+    "BroadcastFrameCache", "frame_for", "queue_play_frame", "write_frame",
+    "write_raw_frame", "encoded_frame", "(i64, Vec<u8>)", "(i64,Vec<u8>)",
+    "id: &mut i64",
+)
+PRODUCER_RETURN = re.compile(
+    r'->\s*(?:Option\s*<\s*)?(?:\(\s*i64\s*,\s*Vec\s*<|\w*Packet\b)')
+# Packet tuples are `(id, payload)` with a non-literal payload; `Some(`/pattern
+# contexts are rejected separately.
+TUPLE_ID = re.compile(r'\(\s*(' + INTEGER + r'|[A-Za-z_]\w*(?:::\w+)*)\s*,\s*([^\s,])')
+WRAPPED_TUPLE = re.compile(r'(?:Some|Ok|Err)\s*\(\s*$')
+PATTERN_TAIL = re.compile(r'=(?:>|[^=>])')
+# Names that identify a non-Play phase; anything else defaults to Play.
+NAME_PHASES = (
+    ("play", "Play"),
+    ("login", "Login"),
+    ("status", "Status"),
+    ("handshake", "Handshake"),
+    ("config", "Configuration"),
+)
+PHASE_OVERRIDES = {
+    "negotiate_compression": "Login",
+    "read_login_frame": "Login",
+}
+# The outgoing config packet blob is mutated in place by helpers keyed on the
+# packet id they filter, so id/pid comparisons inside config-context code are
+# Configuration emission evidence.
+CONFIG_CONTEXT = re.compile(r'\b(?:captured_config_packets|load_config_packets)\s*\(')
+CONFIG_PARAM = re.compile(r'\b(?:config|cfg)\s*:')
+
+
+def _dead_annotated(code, position):
+    """The item at `position` carries a dead_code allowance.
+
+    Walks the contiguous `#[...]`/`#![...]` attribute block immediately before
+    the item; `dead_code` covers `#[allow(dead_code)]` and cfg_attr forms.
+    """
+    cursor = position
+    while True:
+        cursor = len(code[:cursor].rstrip())
+        if cursor == 0 or code[cursor - 1] != "]":
+            return False
+        open_bracket = -1
+        depth = 0
+        for index in range(cursor - 1, -1, -1):
+            char = code[index]
+            if char == "]":
+                depth += 1
+            elif char == "[":
+                depth -= 1
+                if depth == 0:
+                    open_bracket = index
+                    break
+        if open_bracket < 1 or code[open_bracket - 1] != "#":
+            return False
+        if "dead_code" in code[open_bracket:cursor]:
+            return True
+        cursor = open_bracket - 1
+
+
+def _file_allows_dead(code):
+    """A module-level `#![allow(dead_code)]`-style attribute covers the file."""
+    head = code[:2000]
+    return any("dead_code" in match for match in re.findall(r'#!\[[^\]]*\]', head))
+
+
+def _crate_functions(code):
+    """(name, decl_start, body_start, body_end) for every fn with a body."""
+    functions = []
+    for found in FUNCTION.finditer(code):
+        params_open = found.end() - 1
+        params_end = _brace_end(code, params_open, "(", ")")
+        position = params_end
+        parens = 0
+        body_start = -1
+        while position < len(code):
+            char = code[position]
+            if char == "(":
+                parens += 1
+            elif char == ")":
+                parens -= 1
+            elif parens == 0 and char == "{":
+                body_start = position
+                break
+            elif parens == 0 and char == ";":
+                break
+            position += 1
+        if body_start == -1:
+            continue
+        functions.append((found.group(1), found.start(), body_start,
+                          _brace_end(code, body_start)))
+    return functions
+
+
+def _item_spans(code):
+    """(decl_start, body_end) for brace-bodied impl/trait/mod/struct items."""
+    spans = []
+    for found in ITEM_SCOPE.finditer(code):
+        opening = found.end() - 1
+        spans.append((found.start(), _brace_end(code, opening)))
+    return spans
+
+
+def _resolve_id(expression, consts):
+    """Resolve a packet-id expression: literal, cast, from(), or const path."""
+    expr = expression.strip()
+    wrapped = re.fullmatch(r'(?:i64|i32|u32|u16|u8|i16|i8|usize|isize)::from\s*\((.*)\)', expr, re.S)
+    if wrapped:
+        expr = wrapped.group(1).strip()
+    cast = re.fullmatch(r'(.*?)\s+as\s+(?:i64|i32|u32|u16|u8|i16|i8|usize|isize)', expr, re.S)
+    if cast:
+        expr = cast.group(1).strip()
+    if re.fullmatch(INTEGER, expr):
+        return _number(expr)
+    name = expr.rsplit("::", 1)[-1].strip()
+    if re.fullmatch(r'[A-Za-z_]\w*', name):
+        return consts.get(name)
+    return None
+
+
+def _phase_for(name, signature, body):
+    """Best-effort phase attribution for an emission helper."""
+    if name in PHASE_OVERRIDES:
+        return PHASE_OVERRIDES[name]
+    for token, phase in NAME_PHASES:
+        if token in name:
+            return phase
+    if CONFIG_CONTEXT.search(body) or CONFIG_PARAM.search(signature):
+        return "Configuration"
+    return "Play"
+
+
+def _match_bound_ids(text, arg_name, phase):
+    """Packet ids bound to `arg_name` by `let name = match .. => 0xNN` arms."""
+    ids = set()
+    binding = re.search(r'\blet\s+(?:mut\s+)?' + re.escape(arg_name)
+                        + r"\s*(?::\s*[\w&']+\s*)?=\s*match\b", text)
+    if binding:
+        for arm in re.finditer(r'=>\s*(0x[0-9a-fA-F]+)\s*[,}]',
+                               text[binding.end():binding.end() + 4000]):
+            ids.add((phase, _number(arm.group(1))))
+    return ids
+
+
+def _arg_ids(text, expression, consts, phase):
+    """Resolve a packet-id argument, falling back to match-bound variables."""
+    ids = set()
+    value = _resolve_id(expression, consts)
+    if value is not None:
+        ids.add((phase, value))
+    elif re.fullmatch(r'[A-Za-z_]\w*', expression.strip()):
+        ids.update(_match_bound_ids(text, expression.strip(), phase))
+    return ids
+
+
+def _emission_ids(text, phase, consts, producer):
+    """(phase, id) pairs a stripped code region emits plus PlayName evidence."""
+    ids = set()
+    names = set()
+    for match in re.finditer(r'\bsend_packet\s*\(', text):
+        arguments = _split_arguments(text, match.end() - 1)
+        if len(arguments) >= 3:
+            ids.update(_arg_ids(text, arguments[1], consts, phase))
+    for match in re.finditer(r'\bSharedBroadcastFrame::new\s*\(', text):
+        arguments = _split_arguments(text, match.end() - 1)
+        if arguments:
+            value = _resolve_id(arguments[0], consts)
+            if value is not None:
+                ids.add((phase, value))
+    for match in re.finditer(r'\bbroadcast_frame\s*\(', text):
+        arguments = _split_arguments(text, match.end() - 1)
+        if len(arguments) >= 2:
+            value = _resolve_id(arguments[1], consts)
+            if value is not None:
+                ids.add((phase, value))
+    # The crate's whole-packet framer is `fn frame(packet_id, payload)`; the
+    # two-argument form with a resolvable first argument names the packet.
+    for match in re.finditer(r'(?<![.\w])frame\s*\(', text):
+        arguments = _split_arguments(text, match.end() - 1)
+        if len(arguments) == 2:
+            value = _resolve_id(arguments[0], consts)
+            if value is not None:
+                ids.add((phase, value))
+    for match in TUPLE_ID.finditer(text):
+        token = match.group(1)
+        if re.fullmatch(INTEGER, token):
+            value = _number(token)
+        else:
+            value = consts.get(token.rsplit("::", 1)[-1])
+            if value is None:
+                continue
+        # Packet tuples are exactly `(id, payload)`; wider tuples are data.
+        arguments = _split_arguments(text, match.start())
+        if len(arguments) != 2 or arguments[0].strip() != token:
+            continue
+        echar = match.group(2)
+        # Payload position must be an expression, not a literal or closure.
+        if not (echar.isalpha() or echar == "_" or echar in "([{&"):
+            continue
+        word = re.match(r'[A-Za-z_]\w*', text[match.start(2):])
+        if word is None or word.group() in ("_", "true", "false"):
+            continue
+        # Some((id, b))-style destructuring is a pattern, not an emission —
+        # except in producer functions returning Option<(i64, Vec<u8>)>.
+        if not producer and WRAPPED_TUPLE.search(text[:match.start()]):
+            continue
+        # `(id, x) =>` / `(id, x) =` puts the tuple in pattern position.
+        tail = text[_brace_end(text, match.start(), "(", ")"):].lstrip()
+        if PATTERN_TAIL.match(tail):
+            continue
+        ids.add((phase, value))
+    # `write_varint(&mut buf, id)` as a fresh buffer's first write places the
+    # packet id at offset zero of a frame body.
+    for match in re.finditer(
+            r'\blet\s+mut\s+(\w+)\s*=\s*'
+            r'(?:Vec::new\s*\(|Vec::with_capacity\s*\(|vec!\s*\[)', text):
+        name = re.escape(match.group(1))
+        rest = text[match.end():]
+        first = re.search(
+            r'write_varint\s*\(\s*&mut\s*' + name + r'\s*,\s*([^,)]+)'
+            + r'|' + name + r'\s*\.\s*(?:push|extend_from_slice|insert|append)\s*\(',
+            rest)
+        if first is None or first.group(1) is None:
+            continue
+        arg = first.group(1).strip()
+        # Only a hex literal at offset zero names a packet id; a named const
+        # in this position is usually a message or tag id inside the payload.
+        if arg.startswith("0x"):
+            value = _resolve_id(arg, consts)
+            if value is not None:
+                ids.add((phase, value))
+    # A closure bound here whose body calls send_packet sends its first
+    # argument as the packet id (`let send_to = |packet, payload| ...`).
+    for match in re.finditer(r'\b(?:let\s+)?(\w+)\s*=\s*(?:move\s+)?\|[^|]*\|', text):
+        name = match.group(1)
+        position = match.end()
+        brace = text.find("{", position)
+        semicolon = text.find(";", position)
+        if brace != -1 and (semicolon == -1 or brace < semicolon):
+            body_end = _brace_end(text, brace)
+        elif semicolon != -1:
+            body_end = semicolon
+        else:
+            body_end = len(text)
+        if "send_packet" not in text[match.end():body_end]:
+            continue
+        for call in re.finditer(r'(?<![.\w])' + re.escape(name) + r'\s*\(', text):
+            if match.start() <= call.start() < body_end:
+                continue
+            arguments = _split_arguments(text, call.end() - 1)
+            if arguments:
+                ids.update(_arg_ids(text, arguments[0], consts, phase))
+    if producer:
+        # `(id, out)` producers bind `id` by match arms or build a packet blob
+        # whose first byte is the id; the literal sits in arm/vec-tail position.
+        for match in re.finditer(r'(?:=>|;|\{)\s*(0x[0-9a-fA-F]+)\s*\}', text):
+            ids.add((phase, _number(match.group(1))))
+        for match in re.finditer(r'=>\s*(0x[0-9a-fA-F]+)\s*,', text):
+            ids.add((phase, _number(match.group(1))))
+        for match in re.finditer(r'\[\s*(0x[0-9a-fA-F]+)\s*[,)\]]', text):
+            ids.add((phase, _number(match.group(1))))
+    if phase == "Configuration":
+        # `*id == 0xNN`/`matches!(*pid, ..)` on the outgoing config packet
+        # stream is a direct reference to a packet this server serializes.
+        for match in re.finditer(r'\b\*?(?:id|pid)\s*[=!]=\s*(' + INTEGER + r')', text):
+            ids.add((phase, _number(match.group(1))))
+        for match in re.finditer(r'\bmatches!\s*\(\s*\*?(?:id|pid)\s*,([^)]*)\)', text):
+            ids.update((phase, _number(token))
+                       for token in re.findall(INTEGER, match.group(1)))
+    for match in re.finditer(r'\bencode_play_([a-z0-9_]+)\s*\(', text):
+        if re.search(r'\bfn\s*$', text[:match.start()]):
+            continue
+        names.add(match.group(1))
+    return ids, names
+
+
+def _scan_region(text, phase, consts):
+    """Emission ids in a handle_inner phase region; always packet-linked."""
+    return _emission_ids(text, phase, consts, producer=False)
+
+
+def _crate_emissions(root):
+    """Union of S2C (phase, id) evidence and PlayName calls across src/*.rs."""
+    src_dir = Path(root) / "src"
+    files = []
+    consts = {}
+    for index, path in enumerate(sorted(src_dir.glob("*.rs"))):
+        if not path.is_file() or SRC_TEST_FILE.search(path.name):
+            continue
+        code = rust_code(path.read_text(encoding="utf-8"))
+        for found in CONST_DECL.finditer(code):
+            consts[found.group(1)] = _number(found.group(2))
+        functions = []
+        item_spans = _item_spans(code)
+        file_dead = _file_allows_dead(code)
+        for name, decl, body_start, body_end in _crate_functions(code):
+            enclosing = [decl0 for decl0, end in item_spans if decl0 < decl < end]
+            dead = file_dead or _dead_annotated(code, decl) or any(
+                _dead_annotated(code, item) for item in enclosing)
+            signature = code[decl:body_start]
+            functions.append({
+                "name": name, "decl": decl, "body": (body_start, body_end),
+                "dead": dead, "signature": signature,
+            })
+        files.append({"code": code, "dead": file_dead, "functions": functions})
+    names = {fn["name"] for file in files for fn in file["functions"]}
+    edges = {}
+    for file_index, file in enumerate(files):
+        for fn in file["functions"]:
+            body = file["code"][fn["body"][0]:fn["body"][1]]
+            edges[(file_index, fn["decl"])] = {
+                name for name in re.findall(r'\b[A-Za-z_]\w*', body)
+                if name in names and name != fn["name"]
+            }
+    # Roots are the entry points plus anything referenced from top-level
+    # items: static dispatch tables and const fn-pointer arrays bind helpers
+    # without a call expression in a function body.
+    alive = {"main", "handle_inner"}
+    for file in files:
+        masked = list(file["code"])
+        for fn in file["functions"]:
+            _blank(masked, fn["decl"], fn["body"][1])
+        alive.update(name for name in re.findall(r'\b[A-Za-z_]\w*', "".join(masked))
+                     if name in names)
+    queue = list(alive)
+    while queue:
+        name = queue.pop()
+        for file_index, file in enumerate(files):
+            for fn in file["functions"]:
+                if fn["name"] != name:
+                    continue
+                for callee in edges[(file_index, fn["decl"])]:
+                    if callee not in alive:
+                        alive.add(callee)
+                        queue.append(callee)
+    sent = set()
+    for file_index, file in enumerate(files):
+        code = file["code"]
+        masked = list(code)
+        for fn in file["functions"]:
+            _blank(masked, fn["decl"], fn["body"][1])
+            if fn["name"] == "handle_inner":
+                continue  # phases handled by the handle_inner region scan
+            if fn["name"] not in alive:
+                continue
+            body_chars = list(code[fn["body"][0]:fn["body"][1]])
+            # Mask dead nested function bodies inside the live body.
+            for other in file["functions"]:
+                if other["name"] in alive or other["decl"] == fn["decl"]:
+                    continue
+                if fn["body"][0] < other["decl"] < fn["body"][1]:
+                    _blank(body_chars, other["decl"] - fn["body"][0],
+                           other["body"][1] - fn["body"][0])
+            body = "".join(body_chars)
+            signature = fn["signature"]
+            producer = bool(PRODUCER_RETURN.search(signature))
+            gated = producer or any(token in signature + body for token in SINK_TOKENS)
+            if not gated:
+                continue
+            phase = _phase_for(fn["name"], signature, body)
+            ids, found_names = _emission_ids(signature + body, phase, consts, producer)
+            sent.update(ids)
+            sent.update(("PlayName", found) for found in found_names)
+        # Top-level items (statics, consts, mod bodies) get the same scan when
+        # they sit in packet-linked context.
+        text = "".join(masked)
+        if any(token in text for token in SINK_TOKENS):
+            ids, found_names = _emission_ids(text, "Play", consts, producer=False)
+            sent.update(ids)
+            sent.update(("PlayName", found) for found in found_names)
+    return sent
+
+
 def _server_packets(root, source, main_source):
     code = rust_code(source)
     handle = _function(source, "handle_inner")
@@ -379,6 +778,15 @@ def _server_packets(root, source, main_source):
     for number in re.findall(r'\bSome\s*\(\s*\(\s*(' + INTEGER + r')\s*,', rust_code(config)):
         c2s.add(("Configuration", _number(number)))
 
+    # Broadened scan: emissions across every production src/*.rs file, keeping
+    # handle_inner's per-phase regions separate so serverbound match arms do
+    # not masquerade as clientbound sends.
+    consts = {}
+    for path in sorted((Path(root) / "src").glob("*.rs")):
+        if path.is_file() and not SRC_TEST_FILE.search(path.name):
+            file_code = rust_code(path.read_text(encoding="utf-8"))
+            for found in CONST_DECL.finditer(file_code):
+                consts[found.group(1)] = _number(found.group(2))
     sent = set()
     for number in _send_ids(status):
         sent.add(("Status", number))
@@ -386,30 +794,17 @@ def _server_packets(root, source, main_source):
         sent.add(("Login", number))
     for number in _send_ids(config):
         sent.add(("Configuration", number))
-    # Other methods in play_protocol.rs, and the post-config part of handle_inner.
-    body_start = code.find("fn handle_inner(")
-    if body_start != -1:
-        opening = code.find("{", body_start)
-        handle_end = _brace_end(code, opening)
-        prefix = source[:body_start]
-        suffix = source[handle_end:]
-        within_play = handle.split("let player_uuid", 1)[-1]
-    else:
-        prefix, suffix, within_play = source, "", ""
-    for number in _send_ids(prefix) | _send_ids(suffix) | _send_ids(within_play) | _send_ids(main_source):
-        sent.add(("Play", number))
-    # Phase-specific helper writers are called from production paths.
+    within_play = handle.split("let player_uuid", 1)[-1] if handle else ""
+    for phase, region in (("Status", status), ("Login", login),
+                          ("Configuration", config), ("Play", within_play)):
+        ids, found_names = _scan_region(rust_code(region), phase, consts)
+        sent.update(ids)
+        sent.update(("PlayName", found) for found in found_names)
+    sent.update(_crate_emissions(root))
     if re.search(r'\bnegotiate_compression\s*\(', rust_code(handle)) and re.search(r'\bsend_packet\s*\(\s*s\s*,\s*0x03\s*,', code):
         sent.add(("Login", 3))
     if re.search(r'\blogin_disconnect\s*\(', rust_code(handle)):
         sent.add(("Login", 0))
-    # The config stream is dynamic. Attribute only IDs seen in concrete
-    # production writes, leaving captured file contents unverified.
-    for found in re.finditer(r'\bencode_play_([a-z0-9_]+)\s*\(', code):
-        name = found.group(1)
-        if code[max(0, found.start() - 4):found.start()].strip().endswith("fn"):
-            continue
-        sent.add(("PlayName", name))
     return c2s, sent
 
 
