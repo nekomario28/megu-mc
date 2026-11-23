@@ -4,6 +4,8 @@ use std::collections::{BTreeSet, HashMap, HashSet, VecDeque};
 use std::ops::Range;
 use std::sync::Arc;
 
+use megu_core::diff_engine::SubtileDiffMask;
+
 use crate::cull::box_in_frustum;
 use crate::packed::{depth_key, is_translucent, pack_quad, PackedVertex};
 use crate::upload_budget::ChunkUploadBudget;
@@ -314,6 +316,12 @@ pub struct MeshCache {
     sections: HashMap<SectionCoord, Arc<CompressedSection>>,
     meshes: HashMap<SectionCoord, Vec<Quad>>,
     dirty: BTreeSet<SectionCoord>,
+    /// Exact `4³`-sub-tile dirty locality for each coordinate in `dirty`:
+    /// single-block edits keep their 1–8 sub-tile footprint instead of
+    /// degrading to a whole-section remesh. Invariant: an entry exists for
+    /// every coordinate in `dirty`; [`SubtileDiffMask::ALL`] marks paths
+    /// whose dirty extent is the whole section.
+    subtile_masks: HashMap<SectionCoord, SubtileDiffMask>,
     /// FIFO queue of coordinates whose mesh was rebuilt or re-sorted and not
     /// yet collected through `take_dirty_mesh_coords`. `rebuilt_pending`
     /// deduplicates so each coordinate appears at most once.
@@ -337,6 +345,7 @@ impl Default for MeshCache {
             sections: HashMap::new(),
             meshes: HashMap::new(),
             dirty: BTreeSet::new(),
+            subtile_masks: HashMap::new(),
             rebuilt: VecDeque::new(),
             rebuilt_pending: HashSet::new(),
             released_meta: HashMap::new(),
@@ -373,7 +382,11 @@ impl MeshCache {
         if old.is_some_and(|old| **old == section) {
             return false;
         }
+        // Inlined `mark_dirty_full`: `old` keeps `self.sections` borrowed
+        // for the boundary compare below, so the whole-self helper cannot
+        // run until it is dropped — field writes stay disjoint.
         self.dirty.insert(coord);
+        self.subtile_masks.insert(coord, SubtileDiffMask::ALL);
         for (neighbor, offset) in coord.neighbors() {
             if self.sections.contains_key(&neighbor)
                 && boundary(offset).any(|[x, y, z]| {
@@ -382,6 +395,7 @@ impl MeshCache {
                 })
             {
                 self.dirty.insert(neighbor);
+                self.subtile_masks.insert(neighbor, SubtileDiffMask::ALL);
             }
         }
         self.sections.insert(coord, Arc::new(section));
@@ -394,6 +408,7 @@ impl MeshCache {
         };
         self.meshes.remove(&coord);
         self.dirty.remove(&coord);
+        self.subtile_masks.remove(&coord);
         self.released_meta.remove(&coord);
         if self.rebuilt_pending.remove(&coord) {
             self.rebuilt.retain(|&queued| queued != coord);
@@ -402,7 +417,7 @@ impl MeshCache {
             if self.sections.contains_key(&neighbor)
                 && boundary(offset).any(|[x, y, z]| old.get(x, y, z) != self.missing.sample())
             {
-                self.dirty.insert(neighbor);
+                self.mark_dirty_full(neighbor);
             }
         }
         true
@@ -424,6 +439,10 @@ impl MeshCache {
             return false;
         }
         self.dirty.insert(coord);
+        self.subtile_masks
+            .entry(coord)
+            .or_insert(SubtileDiffMask::EMPTY)
+            .mark_block_with_neighbors(x as u8, y as u8, z as u8);
         for (neighbor, offset) in coord.neighbors() {
             if self.sections.contains_key(&neighbor)
                 && offset
@@ -432,9 +451,80 @@ impl MeshCache {
                     .all(|(side, i)| boundary_range(side).contains(&i))
             {
                 self.dirty.insert(neighbor);
+                // The cell of `neighbor` face-adjacent to the edited cell:
+                // `local - 15 * offset` lands on the neighbor's boundary.
+                // Only its own sub-tile can change culling.
+                let nlocal = [
+                    (x as i32 - 15 * offset[0]) as u8,
+                    (y as i32 - 15 * offset[1]) as u8,
+                    (z as i32 - 15 * offset[2]) as u8,
+                ];
+                self.subtile_masks
+                    .entry(neighbor)
+                    .or_insert(SubtileDiffMask::EMPTY)
+                    .mark_block(nlocal[0], nlocal[1], nlocal[2]);
             }
         }
         true
+    }
+
+    /// Marks `coord` dirty with the whole-section extent
+    /// ([`SubtileDiffMask::ALL`]) — the conservative form every bulk path
+    /// uses. Returns `false` when the section is not loaded.
+    pub fn mark_dirty(&mut self, coord: SectionCoord) -> bool {
+        if !self.sections.contains_key(&coord) {
+            return false;
+        }
+        self.mark_dirty_full(coord);
+        true
+    }
+
+    /// Marks `coord` dirty with the exact sub-tile footprint of the block
+    /// edit at local voxel `(lx, ly, lz)`: the sub-tile containing the
+    /// block plus, for each axis where the block sits on a sub-tile
+    /// boundary, the face-adjacent sub-tile (`1–8` of 64 instead of all
+    /// 64). ORs into any mask already recorded for the section, so a
+    /// coordinate already fully dirty stays fully dirty. Returns `false`
+    /// when the section is not loaded or a coordinate is outside `0..16`.
+    pub fn mark_block_dirty(&mut self, coord: SectionCoord, lx: u8, ly: u8, lz: u8) -> bool {
+        if lx >= EDGE as u8 || ly >= EDGE as u8 || lz >= EDGE as u8 {
+            return false;
+        }
+        if !self.sections.contains_key(&coord) {
+            return false;
+        }
+        self.dirty.insert(coord);
+        self.subtile_masks
+            .entry(coord)
+            .or_insert(SubtileDiffMask::EMPTY)
+            .mark_block_with_neighbors(lx, ly, lz);
+        true
+    }
+
+    /// Drains the recorded [`SubtileDiffMask`] for `coord`: the exact
+    /// `4³`-sub-tile dirty footprint accumulated since the section was
+    /// last clean, or [`SubtileDiffMask::ALL`] when the section is dirty
+    /// with no finer locality on record. Returns
+    /// [`SubtileDiffMask::EMPTY`] for clean/unknown coordinates. The
+    /// coordinate stays in the dirty set — the rebuild paths own its
+    /// removal — so a mask consumed early is not re-accumulated unless a
+    /// new edit arrives before the rebuild runs.
+    pub fn take_section_subtile_mask(&mut self, coord: SectionCoord) -> SubtileDiffMask {
+        self.subtile_masks.remove(&coord).unwrap_or_else(|| {
+            if self.dirty.contains(&coord) {
+                SubtileDiffMask::ALL
+            } else {
+                SubtileDiffMask::EMPTY
+            }
+        })
+    }
+
+    /// Shared whole-section dirty mark: inserts `coord` into `dirty` and
+    /// records [`SubtileDiffMask::ALL`] so `take_section_subtile_mask`
+    /// never reports stale partial locality after a bulk change.
+    fn mark_dirty_full(&mut self, coord: SectionCoord) {
+        self.dirty.insert(coord);
+        self.subtile_masks.insert(coord, SubtileDiffMask::ALL);
     }
 
     /// A clean mesh, including an empty slice for a clean empty section.
@@ -512,6 +602,7 @@ impl MeshCache {
             let Some(coord) = self.dirty.pop_first() else {
                 break;
             };
+            self.subtile_masks.remove(&coord);
             let mesh = self.build(coord);
             self.meshes.insert(coord, mesh);
             self.released_meta.remove(&coord);
@@ -567,6 +658,7 @@ impl MeshCache {
                 continue;
             }
             self.dirty.remove(&coord);
+            self.subtile_masks.remove(&coord);
             self.meshes.insert(coord, mesh);
             self.released_meta.remove(&coord);
             self.note_rebuilt(coord);
@@ -602,6 +694,7 @@ impl MeshCache {
         let mut rebuilt = Vec::new();
         for (_, coord) in near.into_iter().take(max_near) {
             self.dirty.remove(&coord);
+            self.subtile_masks.remove(&coord);
             let mesh = self.build(coord);
             self.meshes.insert(coord, mesh);
             self.released_meta.remove(&coord);
@@ -1025,5 +1118,73 @@ mod tests {
         assert!(cache.translucent_resort_due([5.0, 8.0, 8.0]));
         assert!(cache.resort_translucent([5.0, 8.0, 8.0]).is_empty());
         assert_eq!(cache.meshes[&coord][0], near_quad);
+    }
+
+    #[test]
+    fn subtile_mask_keeps_exact_block_edit_locality_and_full_marks_all() {
+        let mut cache = MeshCache::default();
+        let coord = SectionCoord(0, 0, 0);
+        cache.insert(coord, Section::filled(Block::AIR, Light::new(0, 15)));
+        cache.rebuild_dirty(usize::MAX);
+        assert_eq!(
+            cache.take_section_subtile_mask(coord),
+            SubtileDiffMask::EMPTY
+        );
+
+        // Interior voxel (5, 5, 5) -> exactly 1 sub-tile, not all 64.
+        assert!(cache.mark_block_dirty(coord, 5, 5, 5));
+        let mask = cache.take_section_subtile_mask(coord);
+        assert_eq!(mask.dirty_count(), 1);
+        assert_eq!(mask.dirty_bounds(), Some(([4, 4, 4], [7, 7, 7])));
+
+        // Sub-tile boundary voxel (3, 5, 5) -> its own sub-tile plus the
+        // face-adjacent one across x: exactly 2.
+        assert!(cache.mark_block_dirty(coord, 3, 5, 5));
+        let mask = cache.take_section_subtile_mask(coord);
+        assert_eq!(mask.dirty_count(), 2);
+        assert_eq!(mask.dirty_bounds(), Some(([0, 4, 4], [7, 7, 7])));
+
+        // A corner voxel on all three sub-tile boundaries marks 8.
+        assert!(cache.mark_block_dirty(coord, 3, 3, 3));
+        assert_eq!(cache.take_section_subtile_mask(coord).dirty_count(), 8);
+
+        // Rejected calls dirty nothing; `coord` stays pending from the
+        // earlier marks until a rebuild clears it.
+        assert!(!cache.mark_block_dirty(coord, 16, 0, 0));
+        assert!(!cache.mark_block_dirty(SectionCoord(9, 9, 9), 0, 0, 0));
+        assert!(cache.dirty.contains(&coord));
+        cache.rebuild_dirty(usize::MAX);
+        assert_eq!(
+            cache.take_section_subtile_mask(coord),
+            SubtileDiffMask::EMPTY
+        );
+
+        // set_cell wires the same precise tracking: an interior edit plus
+        // a section-boundary edit accumulate exact sub-tiles, and the
+        // neighbor section only marks the one facing the edited cell.
+        let neighbor = SectionCoord(-1, 0, 0);
+        cache.insert(neighbor, Section::filled(Block::AIR, Light::new(0, 15)));
+        cache.rebuild_dirty(usize::MAX);
+        let stone = Block::opaque_cube(7);
+        assert!(cache.set_cell(coord, [5, 5, 5], stone, Light::new(0, 15)));
+        assert!(cache.set_cell(coord, [0, 9, 9], stone, Light::new(0, 15)));
+        let mask = cache.take_section_subtile_mask(coord);
+        assert_eq!(mask.dirty_count(), 2);
+        let nmask = cache.take_section_subtile_mask(neighbor);
+        assert_eq!(nmask.dirty_count(), 1);
+        assert_eq!(nmask.dirty_bounds(), Some(([12, 8, 8], [15, 11, 11])));
+
+        // Whole-section invalidation reports all 64 sub-tiles.
+        assert!(cache.mark_dirty(coord));
+        assert_eq!(cache.take_section_subtile_mask(coord), SubtileDiffMask::ALL);
+        assert!(!cache.mark_dirty(SectionCoord(9, 9, 9)));
+
+        // Rebuilding drains both the dirty set and the recorded masks.
+        cache.mark_block_dirty(coord, 1, 1, 1);
+        cache.rebuild_dirty(usize::MAX);
+        assert_eq!(
+            cache.take_section_subtile_mask(coord),
+            SubtileDiffMask::EMPTY
+        );
     }
 }

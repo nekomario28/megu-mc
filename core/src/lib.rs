@@ -80,6 +80,15 @@
 //!   one level of `META-INF/jarjar`/`META-INF/jars` Jar-in-Jar in place, and
 //!   inflates with the pure-`std` [`zip_archive::inflate_raw_rfc1951`]
 //!   RFC 1951 decompressor under strict fail-closed caps.
+//! * [`diff_engine`] — universal differential-computation primitives so
+//!   chunks, GPU buffers, entity state, inventories, and snapshots only
+//!   compute, store, and transmit the exact minimal delta `ΔS`: the
+//!   [`diff_engine::XorRleDiff`] CRC32-checked `XDF1` skip/literal XOR
+//!   codec (zero-alloc `Ok(None)` on identical buffers), the
+//!   [`diff_engine::DirtySlotTracker`] shadow-copy span coalescer for flat
+//!   GPU/inventory arrays, the [`diff_engine::SubtileDiffMask`] 64-bit
+//!   `4³` sub-tile locality mask for `16³` voxel sections, and the
+//!   [`diff_engine::FieldDiffBitset`] zero-alloc 64-field dirty tracker.
 //! * [`math_opt_engine`] — four paper-backed, allocation-free mathematical
 //!   engines: a [`math_opt_engine::DiscountedUcbAutotuner`] Discounted-UCB
 //!   non-stationary bandit (Garivier & Moulines 2011) that detects kernel
@@ -95,6 +104,7 @@
 #![deny(unsafe_code)]
 
 pub mod crash_report;
+pub mod diff_engine;
 pub mod dye_and_items;
 pub mod fault_isolation;
 pub mod hw_adaptive_engine;

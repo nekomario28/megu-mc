@@ -8,6 +8,13 @@ description = "Standalone protocol-767 voxel section mesher for megu"
 [lib]
 crate-type = ["rlib", "cdylib"]
 
+# Zero external dependencies by contract: `megu-core` is the in-repo leaf
+# crate (also zero-dependency) that owns the shared `diff_engine`
+# primitives `cache.rs` wires into its dirty tracking — still no crates.io
+# dependencies.
+[dependencies]
+megu_core = { package = "megu-core", path = "../core" }
+
 [profile.release]
 opt-level = 3
 lto = true
