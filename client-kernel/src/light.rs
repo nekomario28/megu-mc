@@ -48,11 +48,15 @@ pub(crate) mod owner {
             for (block, fact) in blocks.iter_mut().zip(cells) {
                 *block = fact.block()?;
             }
-            self.chunks.insert(
-                (cx, cz),
-                LightingChunk::new(self.min_y, self.height, blocks),
-            );
-            self.rebuild();
+            if !self.chunks.contains_key(&(cx, cz)) {
+                self.insert_chunks_incremental(vec![((cx, cz), blocks)]);
+            } else {
+                self.chunks.insert(
+                    (cx, cz),
+                    LightingChunk::new(self.min_y, self.height, blocks),
+                );
+                self.rebuild();
+            }
             Ok(())
         }
 
