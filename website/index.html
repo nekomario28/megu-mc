@@ -149,7 +149,7 @@
                 </div>
                 <h3 data-i18n="dl_client_title">1. Official Launcher &amp; Standalone Client</h3>
                 <p data-i18n="dl_client_body">
-                  Zero-Java native installer (.exe on Windows, 1-liner or binary on Linux &amp; macOS). Registers the Megu 1.21.1 profile in the Official Launcher and stages the pure-wgpu Vulkan / DX12 / Metal client automatically.
+                  megu-installer needs no Java and supports GUI (double-click or megu-installer gui) and CLI modes. It registers Megu 1.21.1 in the Official Launcher and stages the native wgpu client.
                 </p>
                 <div class="dl-meta-row">
                   <span class="dl-chip">1.21.1</span>
@@ -157,8 +157,12 @@
                   <span class="dl-chip" id="download-count" hidden></span>
                 </div>
                 <div class="dl-actions">
-                  <a class="btn primary" id="dl-client-btn" href="https://github.com/nekomario28/megu-mc/releases"
-                     data-cfg-href="releasesUrl" target="_blank" rel="noopener noreferrer" data-i18n="dl_releases_btn">Download Installer</a>
+                  <a class="btn primary" id="dl-client-btn" href="https://github.com/nekomario28/megu-mc/releases/latest/download/megu-installer-windows-x86_64.exe"
+                     target="_blank" rel="noopener noreferrer" data-i18n="dl_releases_btn">Windows x64 (.exe)</a>
+                  <a class="btn" href="https://github.com/nekomario28/megu-mc/releases/latest/download/megu-installer-linux-x86_64"
+                     target="_blank" rel="noopener noreferrer" data-i18n="dl_linux_installer_btn">Linux x86_64</a>
+                  <a class="btn" href="https://github.com/nekomario28/megu-mc/releases/latest/download/megu-installer-macos-arm64"
+                     target="_blank" rel="noopener noreferrer" data-i18n="dl_macos_installer_btn">macOS arm64</a>
                   <a class="btn" href="https://github.com/nekomario28/megu-mc/releases"
                      data-cfg-href="releasesUrl" target="_blank" rel="noopener noreferrer" data-i18n="dl_all_releases_btn">All OS Archives</a>
                 </div>
@@ -171,11 +175,13 @@ curl -fsSL https://raw.githubusercontent.com/nekomario28/megu-mc/main/tools/inst
                 </div>
                 <h3 data-i18n="dl_client_src_title">2. Import as Modpack (.mrpack / .zip)</h3>
                 <p data-i18n="dl_client_src_body">
-                  Using Prism Launcher or Modrinth App? Drag and drop megu-1.21.1.mrpack directly into your launcher, or run megu-installer prism.
+                  Import megu-1.21.1.mrpack into Modrinth App or megu-prism-1.21.1.zip into Prism Launcher. You can also run megu-installer prism.
                 </p>
                 <div class="dl-actions">
                   <a class="btn primary" id="dl-mrpack-btn" href="https://github.com/nekomario28/megu-mc/releases/latest/download/megu-1.21.1.mrpack"
-                     target="_blank" rel="noopener noreferrer" data-i18n="dl_mrpack_btn">Download .mrpack (1.21.1)</a>
+                     target="_blank" rel="noopener noreferrer" data-i18n="dl_mrpack_btn">Modrinth App (.mrpack)</a>
+                  <a class="btn" href="https://github.com/nekomario28/megu-mc/releases/latest/download/megu-prism-1.21.1.zip"
+                     target="_blank" rel="noopener noreferrer" data-i18n="dl_prism_zip_btn">Prism Launcher (.zip)</a>
                   <a class="btn" href="#checker" data-i18n="dl_check_pack_btn">Pre-flight your Modpack</a>
                 </div>
                 <pre class="code"><button class="copy-btn" type="button">copy</button><code># Or generate a Prism instance via the native installer:
@@ -732,14 +738,17 @@ megu-client --ping localhost:25565</code></pre>
       dl_tab_dev: "Mod 作者・MDK",
       dl_tab_dev_sub: "JAR 検査 · ネイティブ雛形",
       dl_client_title: "1. 公式ランチャー＆単体クライアント（1 クリック導入）",
-      dl_client_body: "Java 不要の単体インストーラ（Windows は .exe、Linux / macOS は 1 行コマンドまたは単体バイナリ）。公式ランチャーへの Megu 1.21.1 プロファイル登録と純 wgpu クライアント配置を自動で行います。",
-      dl_releases_btn: "インストーラを入手",
+      dl_client_body: "megu-installer は Java 不要で、GUI（ダブルクリックまたは megu-installer gui）と CLI の両方に対応します。公式ランチャーへの Megu 1.21.1 プロファイル登録とネイティブ wgpu クライアント配置を自動で行います。",
+      dl_releases_btn: "Windows x64（.exe）",
+      dl_linux_installer_btn: "Linux x86_64",
+      dl_macos_installer_btn: "macOS arm64",
       dl_all_releases_btn: "全 OS アーカイブ一覧",
-      dl_mrpack_btn: ".mrpack を入手 (1.21.1)",
+      dl_mrpack_btn: "Modrinth App（.mrpack）",
+      dl_prism_zip_btn: "Prism Launcher（.zip）",
       dl_check_pack_btn: "手元の Modpack を事前診断",
       dl_source_badge: "Modrinth App · Prism Launcher",
       dl_client_src_title: "2. Modpack として 1 発インポート（.mrpack / .zip）",
-      dl_client_src_body: "Prism Launcher や Modrinth App をお使いの場合は、megu-1.21.1.mrpack をランチャーへドラッグ＆ドロップするか、megu-installer prism を実行するだけです。",
+      dl_client_src_body: "Modrinth App には megu-1.21.1.mrpack、Prism Launcher には megu-prism-1.21.1.zip をインポートしてください。megu-installer prism でも導入できます。",
       dl_server_title: "Megu 専用サーバー（megu）",
       dl_server_body: "1.21.1 対応の単体 Rust バイナリ。online-mode AES-CFB8 認証、Velocity Modern Forwarding、RCON、非同期バックアップを搭載しています。",
       dl_server_btn: "サーバーバイナリを入手",

@@ -244,6 +244,24 @@ def check_site_config_keys():
         r'data-i18n(?:-placeholder|-aria-label)?="([a-z0-9_]+)"', markup))
     for key in sorted(referenced - keys):
         findings.append(f"index.html is missing JA copy for '{key}'")
+    client_start = markup.find('id="panel-client"')
+    client_end = markup.find('id="panel-server"')
+    if client_start == -1 or client_end <= client_start:
+        findings.append("index.html is missing the player download panel")
+    else:
+        client_panel = markup[client_start:client_end]
+        base = "https://github.com/nekomario28/megu-mc/releases/latest/download/"
+        for filename in (
+            "megu-installer-windows-x86_64.exe",
+            "megu-installer-linux-x86_64",
+            "megu-installer-macos-arm64",
+            "megu-1.21.1.mrpack",
+            "megu-prism-1.21.1.zip",
+        ):
+            if f'href="{base}{filename}"' not in client_panel:
+                findings.append(f"player downloads are missing direct link for {filename}")
+        if "curl -fsSL https://raw.githubusercontent.com/nekomario28/megu-mc/main/tools/install_linux.sh | sh" not in client_panel:
+            findings.append("player downloads are missing the Linux one-line installer")
     for required in (
         "Runs 100% locally in your browser — nothing is uploaded.",
         "ブラウザ内で完結します — ファイルは一切送信されません。",
