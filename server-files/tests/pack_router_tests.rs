@@ -469,6 +469,13 @@ fn rfc1951_fixed_and_dynamic_huffman_blocks_are_verified() {
         &replace_raw_deflate("shaders/main.fsh", dynamic_source.as_bytes(), &corrupt),
         PackThreatKind::EncryptedOrUnsupportedArchive,
     );
+
+    let mut trailing = dynamic.to_vec();
+    trailing.extend_from_slice(&[0xaa, 0xbb]);
+    assert_threat(
+        &replace_raw_deflate("shaders/main.fsh", dynamic_source.as_bytes(), &trailing),
+        PackThreatKind::EncryptedOrUnsupportedArchive,
+    );
 }
 
 #[test]

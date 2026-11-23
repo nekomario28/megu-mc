@@ -46,6 +46,20 @@ use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
 use std::hash::Hash;
 use std::ops::{Deref, DerefMut};
 
+/// Nearest-rank percentile from an already sorted integer sample slice.
+///
+/// Percentiles are clamped to `0..=100`; an empty slice returns `None`.
+/// This keeps integer latency summaries exact without converting nanoseconds
+/// to floating point.
+pub fn nearest_rank_percentile_sorted_u64(sorted: &[u64], percentile: u64) -> Option<u64> {
+    if sorted.is_empty() {
+        return None;
+    }
+    let p = percentile.min(100) as usize;
+    let rank = (sorted.len() / 100) * p + (sorted.len() % 100 * p).div_ceil(100);
+    Some(sorted[rank.max(1) - 1])
+}
+
 // ---------------------------------------------------------------------------
 // Fingerprinting — FNV-1a mixing with a splitmix64 avalanche finish
 // ---------------------------------------------------------------------------

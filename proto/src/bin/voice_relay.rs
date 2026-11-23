@@ -360,16 +360,6 @@ impl BenchReport {
     }
 }
 
-/// Nearest-rank percentile over a sorted sample set.
-fn percentile(sorted: &[u64], p: u64) -> u64 {
-    if sorted.is_empty() {
-        return 0;
-    }
-    let n = sorted.len() as u64;
-    let rank = (p * n).div_ceil(100);
-    sorted[(rank.max(1) - 1) as usize]
-}
-
 /// Build the synthetic bench table: 32 authenticated players, a third in
 /// each dimension, scattered over a +/-30 block square so some pairs fall
 /// inside the earshot radii and some outside.
@@ -430,8 +420,10 @@ fn run_bench(config: &VoiceRelayConfig, frames: u64) -> BenchReport {
         rejected,
         deliveries,
         elapsed,
-        p50_ns: percentile(&latencies, 50),
-        p99_ns: percentile(&latencies, 99),
+        p50_ns: megu_core::perf_kit::nearest_rank_percentile_sorted_u64(&latencies, 50)
+            .unwrap_or(0),
+        p99_ns: megu_core::perf_kit::nearest_rank_percentile_sorted_u64(&latencies, 99)
+            .unwrap_or(0),
         mean_ns: (sum / latencies.len().max(1) as u128) as u64,
         max_ns: *latencies.last().unwrap_or(&0),
     }

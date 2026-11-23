@@ -478,6 +478,19 @@ fn inflate_codes(
 /// Huffman tables, invalid back-references, and any output beyond the cap —
 /// the bomb-cap guard for untrusted archives.
 pub fn inflate_raw_rfc1951(src: &[u8], max_out: usize) -> Result<Vec<u8>, ZipError> {
+    inflate_raw_rfc1951_with_consumed(src, max_out).map(|(out, _)| out)
+}
+
+/// Decompress one raw RFC 1951 Deflate stream and return its exact byte extent.
+///
+/// `compressed_bytes_consumed` ends immediately after the final DEFLATE block,
+/// rounded up to the next byte boundary. Any following bytes are left for the
+/// caller to validate (for example a gzip trailer or another gzip member).
+/// Output is strictly bounded by `max_out`.
+pub fn inflate_raw_rfc1951_with_consumed(
+    src: &[u8],
+    max_out: usize,
+) -> Result<(Vec<u8>, usize), ZipError> {
     let mut reader = BitReader::new(src);
     let mut out = Vec::new();
     loop {
@@ -510,8 +523,67 @@ pub fn inflate_raw_rfc1951(src: &[u8], max_out: usize) -> Result<Vec<u8>, ZipErr
             _ => return Err(ZipError::Inflate("reserved block type")),
         }
         if bfinal != 0 {
-            return Ok(out);
+            // `pos` counts bytes fetched into the reader, including any full
+            // unread bytes prefetched by a multi-bit read. Drop those full
+            // bytes from the boundary, while the remaining partial byte is
+            // consumed as final-block padding.
+            let consumed = reader.pos - (reader.bitcnt / 8) as usize;
+            return Ok((out, consumed));
         }
+    }
+}
+
+#[cfg(test)]
+mod inflate_consumed_tests {
+    use super::{inflate_raw_rfc1951_with_consumed, ZipError};
+
+    #[test]
+    fn reports_exact_stored_and_fixed_stream_boundaries() {
+        let stored = [1, 3, 0, 0xfc, 0xff, b'a', b'b', b'c'];
+        assert_eq!(
+            inflate_raw_rfc1951_with_consumed(&stored, 3).unwrap(),
+            (b"abc".to_vec(), stored.len())
+        );
+
+        // Raw fixed-Huffman DEFLATE for "hello".
+        let fixed = [0xcb, 0x48, 0xcd, 0xc9, 0xc9, 0x07, 0x00];
+        assert_eq!(
+            inflate_raw_rfc1951_with_consumed(&fixed, 5).unwrap(),
+            (b"hello".to_vec(), fixed.len())
+        );
+    }
+
+    #[test]
+    fn reports_dynamic_stream_boundary_before_trailing_or_concatenated_data() {
+        let dynamic = [
+            43, 201, 72, 85, 40, 44, 205, 76, 206, 86, 72, 42, 202, 47, 207, 83, 72, 203, 175,
+            80, 200, 42, 205, 45, 40, 86, 200, 47, 75, 45, 82, 40, 1, 74, 231, 36, 86, 85, 42,
+            164, 228, 167, 131, 57, 163, 106, 71, 213, 142, 170, 37, 95, 45, 0,
+        ];
+        let expected = b"the quick brown fox jumps over the lazy dog ".repeat(20);
+        let mut trailing = dynamic.to_vec();
+        trailing.extend_from_slice(&[0xaa, 0xbb]);
+        assert_eq!(
+            inflate_raw_rfc1951_with_consumed(&trailing, expected.len()).unwrap(),
+            (expected, dynamic.len())
+        );
+
+        let fixed = [0xcb, 0x48, 0xcd, 0xc9, 0xc9, 0x07, 0x00];
+        let mut concatenated = fixed.to_vec();
+        concatenated.extend_from_slice(&dynamic);
+        assert_eq!(
+            inflate_raw_rfc1951_with_consumed(&concatenated, 5).unwrap(),
+            (b"hello".to_vec(), fixed.len())
+        );
+    }
+
+    #[test]
+    fn consumed_api_keeps_the_output_bomb_cap_strict() {
+        let bomb = [0xcb, 0x48, 0xcd, 0xc9, 0xc9, 0x07, 0x00];
+        assert!(matches!(
+            inflate_raw_rfc1951_with_consumed(&bomb, 4),
+            Err(ZipError::OutputCapExceeded)
+        ));
     }
 }
 

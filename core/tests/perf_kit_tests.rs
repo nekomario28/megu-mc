@@ -2,9 +2,9 @@
 //! Unit and stress tests for `megu_core::perf_kit`.
 
 use megu_core::perf_kit::{
-    fingerprint_bytes, fnv1a64, splitmix64, AdaptiveLoadGovernor, BoundedScratchVec,
-    CoalescedDeltaBatch, DirtyFingerprintGate, EventWakeWheel, FingerprintBuilder,
-    TickBudgetQueue, GOVERNOR_WINDOW,
+    fingerprint_bytes, fnv1a64, nearest_rank_percentile_sorted_u64, splitmix64,
+    AdaptiveLoadGovernor, BoundedScratchVec, CoalescedDeltaBatch, DirtyFingerprintGate,
+    EventWakeWheel, FingerprintBuilder, TickBudgetQueue, GOVERNOR_WINDOW,
 };
 
 // ---------------------------------------------------------------------------
@@ -464,6 +464,17 @@ fn governor_reports_exact_nearest_rank_percentiles() {
     assert_eq!(g.p99(), Some(99.0));
     assert_eq!(g.percentile(100.0), Some(100.0));
     assert_eq!(g.percentile(0.0), Some(1.0));
+}
+
+#[test]
+fn sorted_integer_percentiles_match_nearest_rank_boundaries() {
+    let samples: Vec<u64> = (1..=100).collect();
+    assert_eq!(nearest_rank_percentile_sorted_u64(&[], 50), None);
+    assert_eq!(nearest_rank_percentile_sorted_u64(&samples, 0), Some(1));
+    assert_eq!(nearest_rank_percentile_sorted_u64(&samples, 50), Some(50));
+    assert_eq!(nearest_rank_percentile_sorted_u64(&samples, 99), Some(99));
+    assert_eq!(nearest_rank_percentile_sorted_u64(&samples, 100), Some(100));
+    assert_eq!(nearest_rank_percentile_sorted_u64(&samples, 101), Some(100));
 }
 
 #[test]

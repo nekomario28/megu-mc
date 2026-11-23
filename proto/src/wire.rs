@@ -34,15 +34,6 @@ pub const MAX_EXTENDED_FRAME_BYTES: usize = 32 * 1024 * 1024;
 /// (configuration registry entries, components). Matches the client reader.
 const MAX_NBT_BYTES: usize = 2 * 1024 * 1024;
 
-/// Maximum NBT nesting depth, same bound the existing decoders use.
-const MAX_NBT_DEPTH: usize = 32;
-
-/// Total values one anonymous-NBT skip may visit. Every non-End element
-/// consumes at least one wire byte, so this only binds payloads far larger
-/// than [`MAX_NBT_BYTES`] — it exists so a hostile buffer cannot amplify a
-/// small declaration into unbounded skip iterations.
-const MAX_NBT_SKIPPED_TAGS: usize = 1 << 22;
-
 /// Every wire-level failure. The variants carry enough context to log a useful
 /// rejection without ever exposing or panicking on attacker-controlled sizes.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -345,43 +336,59 @@ impl<'a> WireReader<'a> {
     /// four bits — a stricter bound than vanilla's "five bytes then give up",
     /// which silently accepts non-canonical encodings.
     pub fn read_varint(&mut self) -> Result<i32, ProtoError> {
-        let mut value = 0u32;
-        for i in 0..5 {
-            let byte = self.read_u8()?;
-            if i == 4 && byte & 0xf0 != 0 {
-                return Err(if byte & 0x80 != 0 {
+        let input = &self.buf[self.pos..];
+        match megu_core::varint::read_varint_i32(input) {
+            Ok((value, consumed)) => {
+                self.pos += consumed;
+                Ok(value)
+            }
+            Err(megu_core::varint::VarIntError::UnexpectedEof) => {
+                self.pos = self.buf.len();
+                Err(ProtoError::UnexpectedEof {
+                    needed: 1,
+                    remaining: 0,
+                })
+            }
+            Err(megu_core::varint::VarIntError::TooLong) => {
+                let fifth = input.get(4).copied().unwrap_or(0x80);
+                self.pos = (self.pos + input.len().min(5)).min(self.buf.len());
+                Err(if fifth & 0x80 != 0 {
                     ProtoError::VarIntTooLong
                 } else {
                     ProtoError::VarIntOverflow
-                });
+                })
             }
-            value |= u32::from(byte & 0x7f) << (7 * i);
-            if byte & 0x80 == 0 {
-                return Ok(value as i32);
-            }
+            Err(_) => unreachable!("integer decoder only returns integer errors"),
         }
-        Err(ProtoError::VarIntTooLong)
     }
 
     /// Protocol VarLong: up to ten bytes decoded as the low 64 bits of an
     /// `i64`, with the same strict bound on the final byte.
     pub fn read_varlong(&mut self) -> Result<i64, ProtoError> {
-        let mut value = 0u64;
-        for i in 0..10 {
-            let byte = self.read_u8()?;
-            if i == 9 && byte & 0xfe != 0 {
-                return Err(if byte & 0x80 != 0 {
+        let input = &self.buf[self.pos..];
+        match megu_core::varint::read_varlong_i64(input) {
+            Ok((value, consumed)) => {
+                self.pos += consumed;
+                Ok(value)
+            }
+            Err(megu_core::varint::VarIntError::UnexpectedEof) => {
+                self.pos = self.buf.len();
+                Err(ProtoError::UnexpectedEof {
+                    needed: 1,
+                    remaining: 0,
+                })
+            }
+            Err(megu_core::varint::VarIntError::TooLong) => {
+                let tenth = input.get(9).copied().unwrap_or(0x80);
+                self.pos = (self.pos + input.len().min(10)).min(self.buf.len());
+                Err(if tenth & 0x80 != 0 {
                     ProtoError::VarLongTooLong
                 } else {
                     ProtoError::VarLongOverflow
-                });
+                })
             }
-            value |= u64::from(byte & 0x7f) << (7 * i);
-            if byte & 0x80 == 0 {
-                return Ok(value as i64);
-            }
+            Err(_) => unreachable!("integer decoder only returns integer errors"),
         }
-        Err(ProtoError::VarLongTooLong)
     }
 
     /// VarInt that must be non-negative, for lengths and counts.
@@ -472,8 +479,18 @@ impl<'a> WireReader<'a> {
     pub fn read_anonymous_nbt(&mut self) -> Result<&'a [u8], ProtoError> {
         let start = self.pos;
         let tag = self.read_u8()?;
-        let mut budget = MAX_NBT_SKIPPED_TAGS;
-        nbt_skip_value(self.buf, &mut self.pos, tag, 0, &mut budget)?;
+        let consumed = megu_core::nbt_wire::skip_nbt_payload(
+            tag,
+            &self.buf[self.pos..],
+            megu_core::nbt_wire::NbtWireLimits {
+                max_depth: 32,
+                max_tags: 1 << 22,
+                max_list_len: 1 << 20,
+                max_array_bytes: usize::MAX,
+            },
+        )
+        .map_err(|_| ProtoError::Malformed("invalid anonymous NBT payload"))?;
+        self.take(consumed)?;
         if self.pos - start > MAX_NBT_BYTES {
             return Err(ProtoError::LengthOutOfBounds {
                 length: self.pos - start,
@@ -481,130 +498,6 @@ impl<'a> WireReader<'a> {
             });
         }
         Ok(&self.buf[start..self.pos])
-    }
-}
-
-/// Advance `pos` by `n`, failing on overflow or overrun.
-fn nbt_take(data: &[u8], pos: &mut usize, n: usize) -> Result<(), ProtoError> {
-    let end = pos
-        .checked_add(n)
-        .ok_or(ProtoError::Malformed("NBT length overflow"))?;
-    if end > data.len() {
-        return Err(ProtoError::UnexpectedEof {
-            needed: n,
-            remaining: data.len() - *pos,
-        });
-    }
-    *pos = end;
-    Ok(())
-}
-
-/// Read a big-endian unsigned of `width` bytes.
-fn nbt_be(data: &[u8], pos: &mut usize, width: usize) -> Result<u32, ProtoError> {
-    if data.len() - *pos < width {
-        return Err(ProtoError::UnexpectedEof {
-            needed: width,
-            remaining: data.len() - *pos,
-        });
-    }
-    let mut v = 0u32;
-    for &b in &data[*pos..*pos + width] {
-        v = (v << 8) | u32::from(b);
-    }
-    *pos += width;
-    Ok(v)
-}
-
-/// Skip the payload of a value whose tag byte is `tag`. `pos` indexes `data`.
-/// `budget` bounds the total number of values visited across the whole skip.
-fn nbt_skip_value(
-    data: &[u8],
-    pos: &mut usize,
-    tag: u8,
-    depth: usize,
-    budget: &mut usize,
-) -> Result<(), ProtoError> {
-    if depth > MAX_NBT_DEPTH {
-        return Err(ProtoError::Malformed("NBT nesting too deep"));
-    }
-    if *budget == 0 {
-        return Err(ProtoError::Malformed("NBT skip budget exhausted"));
-    }
-    *budget -= 1;
-    match tag {
-        0 => Ok(()),
-        1 => nbt_take(data, pos, 1),
-        2 => nbt_take(data, pos, 2),
-        3 | 5 => nbt_take(data, pos, 4),
-        4 | 6 => nbt_take(data, pos, 8),
-        7 | 11 | 12 => {
-            let width = if tag == 7 { 1 } else if tag == 11 { 4 } else { 8 };
-            let n = nbt_be(data, pos, 4)? as usize;
-            if n > (1 << 24) {
-                return Err(ProtoError::LengthOutOfBounds {
-                    length: n,
-                    max: 1 << 24,
-                });
-            }
-            nbt_take(data, pos, n.saturating_mul(width))
-        }
-        8 => {
-            let n = nbt_be(data, pos, 2)? as usize;
-            nbt_take(data, pos, n)
-        }
-        9 => {
-            if *pos >= data.len() {
-                return Err(ProtoError::UnexpectedEof {
-                    needed: 1,
-                    remaining: 0,
-                });
-            }
-            let elem = data[*pos];
-            *pos += 1;
-            let n = nbt_be(data, pos, 4)? as usize;
-            if n > (1 << 20) {
-                return Err(ProtoError::LengthOutOfBounds {
-                    length: n,
-                    max: 1 << 20,
-                });
-            }
-            if elem == 0 {
-                // TAG_End elements carry no payload, so a non-empty list of
-                // them would spin `n` no-op iterations per 8 wire bytes.
-                if n != 0 {
-                    return Err(ProtoError::Malformed("NBT list of TAG_End elements"));
-                }
-                return Ok(());
-            }
-            // Every non-End element occupies at least one payload byte, so a
-            // length beyond the remaining span can never be satisfied.
-            if n > data.len() - *pos {
-                return Err(ProtoError::Malformed("NBT list length exceeds input"));
-            }
-            for _ in 0..n {
-                nbt_skip_value(data, pos, elem, depth + 1, budget)?;
-            }
-            Ok(())
-        }
-        10 => loop {
-            let Some(&child) = data.get(*pos) else {
-                return Err(ProtoError::UnexpectedEof {
-                    needed: 1,
-                    remaining: 0,
-                });
-            };
-            *pos += 1;
-            if child == 0 {
-                return Ok(());
-            }
-            let name_len = nbt_be(data, pos, 2)? as usize;
-            nbt_take(data, pos, name_len)?;
-            nbt_skip_value(data, pos, child, depth + 1, budget)?;
-        },
-        _ => Err(ProtoError::InvalidDiscriminant {
-            value: i64::from(tag),
-            what: "NBT tag",
-        }),
     }
 }
 
@@ -756,68 +649,23 @@ impl WireWriter {
 /// [`WireWriter::write_varint`] emits, 1–5 bytes of 7-bit groups.
 #[inline]
 pub const fn varint_len(v: i32) -> usize {
-    let mut v = v as u32;
-    let mut len = 1;
-    while v >= 0x80 {
-        v >>= 7;
-        len += 1;
-    }
-    len
+    megu_core::varint::varint_i32_len(v)
 }
 
 /// Canonical encoded length of `v` as a VarLong — 1–10 bytes of 7-bit groups.
 #[inline]
 pub const fn varlong_len(v: i64) -> usize {
-    let mut v = v as u64;
-    let mut len = 1;
-    while v >= 0x80 {
-        v >>= 7;
-        len += 1;
-    }
-    len
+    megu_core::varint::varlong_i64_len(v)
 }
 
-/// Append `v`'s VarInt encoding to `out`. The bytes are staged on the stack so
-/// the whole encoding lands in one reserve-and-copy instead of up to five
-/// individually bounds-checked pushes.
+/// Append `v`'s VarInt encoding to `out`.
 pub fn write_varint_into(out: &mut Vec<u8>, v: i32) {
-    let mut v = v as u32;
-    let mut buf = [0u8; 5];
-    let mut len = 0;
-    loop {
-        let mut b = (v & 0x7f) as u8;
-        v >>= 7;
-        if v != 0 {
-            b |= 0x80;
-        }
-        buf[len] = b;
-        len += 1;
-        if v == 0 {
-            break;
-        }
-    }
-    out.extend_from_slice(&buf[..len]);
+    megu_core::varint::write_varint_i32(v, out);
 }
 
-/// Append `v`'s VarLong encoding to `out`, same staged-copy scheme as
-/// [`write_varint_into`].
+/// Append `v`'s VarLong encoding to `out`.
 pub fn write_varlong_into(out: &mut Vec<u8>, v: i64) {
-    let mut v = v as u64;
-    let mut buf = [0u8; 10];
-    let mut len = 0;
-    loop {
-        let mut b = (v & 0x7f) as u8;
-        v >>= 7;
-        if v != 0 {
-            b |= 0x80;
-        }
-        buf[len] = b;
-        len += 1;
-        if v == 0 {
-            break;
-        }
-    }
-    out.extend_from_slice(&buf[..len]);
+    megu_core::varint::write_varlong_i64(v, out);
 }
 
 /// Write the protocol frame `VarInt(len(body)) + VarInt(id) + payload`, where
@@ -956,6 +804,11 @@ mod tests {
         let overlong = [0x80, 0x80, 0x80, 0x80, 0x80, 0x01];
         assert!(matches!(
             WireReader::new(&overlong).read_varint(),
+            Err(ProtoError::VarIntTooLong)
+        ));
+        // A terminated but non-canonical short encoding is rejected too.
+        assert!(matches!(
+            WireReader::new(&[0x80, 0x00]).read_varint(),
             Err(ProtoError::VarIntTooLong)
         ));
         // Fifth byte 0x7f has no continuation bit but overflows 32 bits.
