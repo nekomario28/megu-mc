@@ -416,6 +416,9 @@ struct LiveModSuite {
     auto_adapted: Vec<AutoAdaptedModSummary>,
     /// Verified Tier 2 event bindings, keyed by the source mod id.
     lifted_hooks: Vec<(String, LiftedBinding)>,
+    /// Per-standard-hook dispatch counters — proof a registered binding
+    /// actually fired on a live path (diagnostics + tests).
+    hook_fires: BTreeMap<StandardEventHook, u64>,
     /// Validated merged Fabric + NeoForge server-side manifest table.
     dual_loader: DualLoaderPlan,
     /// Methods verified against the restricted JVM opcode and host-call sets.
@@ -461,6 +464,7 @@ impl LiveModSuite {
             unified: UnifiedModRuntime::default(),
             auto_adapted: Vec::new(),
             lifted_hooks: Vec::new(),
+            hook_fires: BTreeMap::new(),
             dual_loader: DualLoaderPlan::default(),
             damage_hooks: Vec::new(),
             culinary: CulinaryRegistry::new(),
@@ -476,6 +480,12 @@ impl LiveModSuite {
             mod_sync_root_hash: None,
             registry_plan: None,
         }
+    }
+
+    /// Record one live dispatch of `hook` — every binding subscribed to it
+    /// just observed the event.
+    fn note_hook_fired(&mut self, hook: StandardEventHook) {
+        *self.hook_fires.entry(hook).or_default() += 1;
     }
 
     /// `*.jar` members of `dir`, in sorted basename order (deterministic scan
@@ -1240,6 +1250,32 @@ fn live_mod_suite() -> &'static Mutex<LiveModSuite> {
     SUITE.get_or_init(|| Mutex::new(LiveModSuite::new()))
 }
 
+/// Lock-free "a mod event hook might fire" gate consulted by every live
+/// dispatch site: vanilla and zero-mod servers pay exactly one relaxed
+/// atomic load. Refreshed whenever the process-wide suite is (re)installed
+/// — `live_mod_suite_boot` in production, `fresh_suite`/suite installs in
+/// tests — so a stale `true` can only cost one suite-lock re-check, never a
+/// missed hook.
+#[cfg(feature = "mod-suite")]
+static HAS_LIVE_MOD_HOOKS: AtomicBool = AtomicBool::new(false);
+
+/// Whether the armed suite can produce any event-hook work: lifted Mixin
+/// bindings or verified `onDamage` handlers.
+#[cfg(feature = "mod-suite")]
+fn live_mod_suite_has_hooks(suite: &LiveModSuite) -> bool {
+    suite.active && (!suite.lifted_hooks.is_empty() || !suite.damage_hooks.is_empty())
+}
+
+/// Recompute [`HAS_LIVE_MOD_HOOKS`] from the installed suite.
+#[cfg(feature = "mod-suite")]
+fn live_mod_refresh_hook_gate() {
+    let armed = {
+        let suite = live_mod_suite().lock().unwrap_or_else(|e| e.into_inner());
+        live_mod_suite_has_hooks(&suite)
+    };
+    HAS_LIVE_MOD_HOOKS.store(armed, Ordering::Relaxed);
+}
+
 /// Snapshot of the automatically registered native mod bundles.
 #[cfg(feature = "mod-suite")]
 #[allow(dead_code)]
@@ -1276,6 +1312,7 @@ fn live_mod_dispatch_hook(hook: StandardEventHook) -> Vec<(String, LiftedBinding
 #[cfg(feature = "mod-suite")]
 struct LiveModDamageHost {
     damage: f32,
+    cancelled: bool,
 }
 
 #[cfg(feature = "mod-suite")]
@@ -1291,6 +1328,17 @@ impl SubsetVmHost for LiveModDamageHost {
                 self.damage = *value;
                 Ok(None)
             }
+            (HostCallKind::EventCancel, [VmValue::Ref(1)]) => {
+                self.cancelled = true;
+                Ok(None)
+            }
+            (HostCallKind::EventIsCanceled, [VmValue::Ref(1)]) => {
+                Ok(Some(VmValue::Int(i32::from(self.cancelled))))
+            }
+            (HostCallKind::EventSetCanceled, [VmValue::Ref(1), VmValue::Int(value)]) => {
+                self.cancelled = *value != 0;
+                Ok(None)
+            }
             _ => Err(VmError::HostError(
                 "unsupported damage event host call".into(),
             )),
@@ -1300,25 +1348,78 @@ impl SubsetVmHost for LiveModDamageHost {
 
 /// Evaluate preverified onDamage methods in deterministic scan order, with
 /// an independent fuel budget and atomic damage update per invocation.
+/// Returns the (possibly rewritten) damage plus the sticky cancel flag —
+/// `event.cancel()`/`event.setCanceled(true)` in any handler cancels the
+/// whole hit.
 #[cfg(feature = "mod-suite")]
-#[allow(dead_code)]
-fn live_mod_eval_damage_hooks(initial_damage: f32) -> f32 {
+fn live_mod_eval_damage_event(initial_damage: f32) -> (f32, bool) {
     if !initial_damage.is_finite() || initial_damage < 0.0 {
-        return initial_damage;
+        return (initial_damage, false);
     }
     let suite = live_mod_suite().lock().unwrap_or_else(|e| e.into_inner());
-    if !suite.active {
-        return initial_damage;
+    if !suite.active || suite.damage_hooks.is_empty() {
+        return (initial_damage, false);
     }
     let mut damage = initial_damage;
+    let mut cancelled = false;
     for method in &suite.damage_hooks {
-        let mut host = LiveModDamageHost { damage };
+        let mut host = LiveModDamageHost {
+            damage,
+            cancelled,
+        };
         match execute_verified_method(method, &[VmValue::Ref(1)], &mut host, DEFAULT_FUEL) {
-            Ok(_) => damage = host.damage,
+            Ok(_) => {
+                damage = host.damage;
+                cancelled |= host.cancelled;
+            }
             Err(error) => eprintln!("[live-mods] damage hook execution rejected: {error}"),
         }
     }
-    damage
+    (damage, cancelled)
+}
+
+/// Damage-only view of [`live_mod_eval_damage_event`] kept for the existing
+/// callers/tests: the rewritten amount, cancel flag dropped.
+#[cfg(feature = "mod-suite")]
+#[allow(dead_code)]
+fn live_mod_eval_damage_hooks(initial_damage: f32) -> f32 {
+    live_mod_eval_damage_event(initial_damage).0
+}
+
+/// Fire one standard event hook for every lifted binding subscribed to it
+/// and record the dispatch in the suite. Returns the number of bindings
+/// that observed the event; `0` means nothing is armed for `hook`. Callers
+/// on hot paths gate this behind [`HAS_LIVE_MOD_HOOKS`] first.
+#[cfg(feature = "mod-suite")]
+fn live_mod_fire_hook(hook: StandardEventHook) -> usize {
+    let bindings = live_mod_dispatch_hook(hook);
+    if bindings.is_empty() {
+        return 0;
+    }
+    live_mod_suite()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .note_hook_fired(hook);
+    bindings.len()
+}
+
+/// Pre-damage dispatch wired into the real damage-application paths in
+/// `combat_and_health.rs` (the `Entity.hurt` HEAD equivalent): fires the
+/// lifted `EntityDamagePre` bindings, then runs the verified `onDamage`
+/// handlers which may rewrite the amount (`event.setDamage`) or cancel the
+/// hit (`event.cancel`). `Some(amount)` applies `amount`; `None` cancels —
+/// vanilla and zero-mod servers pay exactly one relaxed atomic load.
+#[cfg(feature = "mod-suite")]
+fn live_mod_entity_damage_pre(amount: f32) -> Option<f32> {
+    if !HAS_LIVE_MOD_HOOKS.load(Ordering::Relaxed) {
+        return Some(amount);
+    }
+    live_mod_fire_hook(StandardEventHook::EntityDamagePre);
+    let (damage, cancelled) = live_mod_eval_damage_event(amount);
+    if cancelled {
+        return None;
+    }
+    Some(damage)
 }
 
 /// Install an updated pot snapshot after an inventory, heat, or block event.
@@ -1938,6 +2039,7 @@ fn live_mod_suite_boot() {
     }
     suite.active = true;
     *live_mod_suite().lock().unwrap_or_else(|e| e.into_inner()) = suite;
+    live_mod_refresh_hook_gate();
 }
 
 /// Per-tick AppleSkin QoL sync, wired from `game_tick` next to the vanilla
@@ -1990,6 +2092,13 @@ fn live_mod_appleskin_sync(client: &Client) {
 /// independently of the optional AppleSkin suite and expired on disconnect.
 #[cfg(feature = "mod-suite")]
 fn live_mod_tick() {
+    // Registered `ServerTickPre` bindings observe the tick head behind the
+    // same one-atomic gate as damage dispatch; cooking pots advance on
+    // their armed deadlines (empty scheduler = no work).
+    if HAS_LIVE_MOD_HOOKS.load(Ordering::Relaxed) {
+        live_mod_fire_hook(StandardEventHook::ServerTickPre);
+    }
+    let _completed = live_mod_tick_cooking_pots(TICK_IDX.load(Ordering::Relaxed));
     let players = clients().lock().unwrap_or_else(|e| e.into_inner()).clone();
     let connected: HashSet<[u8; 16]> = players.iter().map(|client| client.uuid).collect();
     {
@@ -2017,6 +2126,9 @@ fn live_mod_tick() {
             }
         }
         live_mod_appleskin_sync(client);
+    }
+    if HAS_LIVE_MOD_HOOKS.load(Ordering::Relaxed) {
+        live_mod_fire_hook(StandardEventHook::ServerTickPost);
     }
 }
 
@@ -2386,14 +2498,14 @@ fn live_create_is_water(st: u32) -> bool {
 }
 
 /// `create:pressing` — a powered `create:mechanical_press` two blocks above
-/// a depot or basin. `(input_item, output_item)` names resolved once at
-/// arm-time through the real item tables.
+/// a depot or basin. `(&input_items, output_item)` names resolved once at
+/// arm-time through the real item tables into generic `Recipe`/`Stack`s.
 #[cfg(feature = "mod-suite")]
-const LIVE_CREATE_PRESSING: &[(&str, &str)] = &[
-    ("minecraft:iron_ingot", "create:iron_sheet"),
-    ("minecraft:gold_ingot", "create:gold_sheet"),
-    ("minecraft:copper_ingot", "create:copper_sheet"),
-    ("create:brass_ingot", "create:brass_sheet"),
+const LIVE_CREATE_PRESSING: &[(&[&str], &str)] = &[
+    (&["minecraft:iron_ingot"], "create:iron_sheet"),
+    (&["minecraft:gold_ingot"], "create:gold_sheet"),
+    (&["minecraft:copper_ingot"], "create:copper_sheet"),
+    (&["create:brass_ingot"], "create:brass_sheet"),
 ];
 
 /// `create:mixing` — a powered `create:mechanical_mixer` two blocks above a
@@ -2415,12 +2527,47 @@ const LIVE_CREATE_MIXING: &[(&[&str], &str)] = &[
 #[cfg(feature = "mod-suite")]
 const LIVE_CREATE_PROCESS_TICKS: u32 = 40;
 
-/// One resolved processing recipe: an input multiset -> one output item.
+/// Resolve an item name into the generic `mod_offload::recipe_processor`
+/// stack type — live presses/mixers and `CreateFactory` processors share
+/// the one recipe model, so resolved recipes drop straight into
+/// `CreateFactory::add_processor` as well as the held-slot matcher.
 #[cfg(feature = "mod-suite")]
-struct LiveCreateRecipe {
-    inputs: Vec<i64>,
-    output: i64,
-    base_ticks: u32,
+fn live_create_item_stack(
+    name: &str,
+    amount: u32,
+) -> Option<mod_offload::recipe_processor::Stack> {
+    Some(mod_offload::recipe_processor::Stack {
+        resource: mod_offload::recipe_processor::Resource {
+            kind: mod_offload::recipe_processor::ResourceKind::Item,
+            id: u32::try_from(name_to_item(name)?).ok()?,
+        },
+        amount,
+    })
+}
+
+/// One resolved generic recipe (`Recipe`/`Stack` from `recipe_processor`)
+/// per table entry; `id` keeps pressing and mixing key spaces disjoint for
+/// the `active` recipe pin on [`LiveCreateHeld`].
+#[cfg(feature = "mod-suite")]
+fn live_create_recipes(
+    table: &[(&[&str], &str)],
+    id_base: u32,
+) -> Vec<mod_offload::recipe_processor::Recipe> {
+    table
+        .iter()
+        .enumerate()
+        .filter_map(|(idx, &(inputs, output))| {
+            Some(mod_offload::recipe_processor::Recipe {
+                id: id_base + idx as u32,
+                base_ticks: LIVE_CREATE_PROCESS_TICKS,
+                inputs: inputs
+                    .iter()
+                    .map(|&n| live_create_item_stack(n, 1))
+                    .collect::<Option<_>>()?,
+                outputs: vec![live_create_item_stack(output, 1)?],
+            })
+        })
+        .collect()
 }
 
 /// Items resting on a depot or inside a basin. `progress` accrues
@@ -2451,8 +2598,8 @@ struct LiveCreateRuntime {
     held: std::collections::BTreeMap<create_adapter::factory::DimBlockPos, LiveCreateHeld>,
     belt_machines: std::collections::BTreeMap<create_adapter::factory::DimBlockPos, u32>,
     next_machine_id: u32,
-    pressing: Vec<LiveCreateRecipe>,
-    mixing: Vec<LiveCreateRecipe>,
+    pressing: Vec<mod_offload::recipe_processor::Recipe>,
+    mixing: Vec<mod_offload::recipe_processor::Recipe>,
     /// Number of non-empty kinetic batches drained since boot (test hook).
     kinetic_batches_emitted: u64,
 }
@@ -2481,29 +2628,8 @@ fn live_create_runtime_init() -> Option<LiveCreateRuntime> {
         held: std::collections::BTreeMap::new(),
         belt_machines: std::collections::BTreeMap::new(),
         next_machine_id: 1,
-        pressing: LIVE_CREATE_PRESSING
-            .iter()
-            .filter_map(|&(input, output)| {
-                Some(LiveCreateRecipe {
-                    inputs: vec![name_to_item(input)?],
-                    output: name_to_item(output)?,
-                    base_ticks: LIVE_CREATE_PROCESS_TICKS,
-                })
-            })
-            .collect(),
-        mixing: LIVE_CREATE_MIXING
-            .iter()
-            .filter_map(|&(inputs, output)| {
-                Some(LiveCreateRecipe {
-                    inputs: inputs
-                        .iter()
-                        .map(|&n| name_to_item(n))
-                        .collect::<Option<_>>()?,
-                    output: name_to_item(output)?,
-                    base_ticks: LIVE_CREATE_PROCESS_TICKS,
-                })
-            })
-            .collect(),
+        pressing: live_create_recipes(LIVE_CREATE_PRESSING, 0),
+        mixing: live_create_recipes(LIVE_CREATE_MIXING, 0x100),
         kinetic_batches_emitted: 0,
     })
 }
@@ -2743,16 +2869,27 @@ impl LiveCreateRuntime {
             let Some(slot) = self.held.get_mut(&pos) else {
                 continue;
             };
-            let Some((idx, recipe)) = recipes
-                .iter()
-                .enumerate()
-                .find(|(_, r)| r.inputs.iter().all(|need| slot.items.contains(need)))
-            else {
+            // Generic `Recipe` match: every input `Stack` must be covered by
+            // `slot.items` (item ids stored as `i64`), honoring `amount`.
+            let count_item = |items: &[i64], stack: &mod_offload::recipe_processor::Stack| {
+                items
+                    .iter()
+                    .filter(|item| {
+                        stack.resource.kind == mod_offload::recipe_processor::ResourceKind::Item
+                            && u32::try_from(**item).ok() == Some(stack.resource.id)
+                    })
+                    .count()
+            };
+            let Some(recipe) = recipes.iter().find(|r| {
+                r.inputs
+                    .iter()
+                    .all(|need| count_item(&slot.items, need) >= need.amount as usize)
+            }) else {
                 slot.progress = 0.0;
                 slot.active = None;
                 continue;
             };
-            let key = idx as u16 + if mixer { 0x100 } else { 0 };
+            let key = recipe.id as u16;
             if slot.active != Some(key) {
                 slot.active = Some(key);
                 slot.progress = 0.0;
@@ -2764,11 +2901,21 @@ impl LiveCreateRuntime {
                 continue;
             }
             for input in &recipe.inputs {
-                if let Some(at) = slot.items.iter().position(|item| item == input) {
-                    slot.items.remove(at);
+                for _ in 0..input.amount {
+                    if let Some(at) = slot.items.iter().position(|item| {
+                        u32::try_from(*item).ok() == Some(input.resource.id)
+                    }) {
+                        slot.items.remove(at);
+                    }
                 }
             }
-            slot.items.push(recipe.output);
+            for output in &recipe.outputs {
+                if output.resource.kind == mod_offload::recipe_processor::ResourceKind::Item {
+                    for _ in 0..output.amount {
+                        slot.items.push(i64::from(output.resource.id));
+                    }
+                }
+            }
             slot.progress = 0.0;
             slot.active = None;
         }
@@ -3116,6 +3263,13 @@ fn live_create_interact_block(
     true
 }
 
+/// Per-region per-tick wall-clock budget handed to
+/// `CreateFactory::step_tick`, shed by the server mspt governor
+/// (`live_server_budget_scale`) under load — idle regions never consume it
+/// at all thanks to the factory's sleep bookkeeping.
+#[cfg(feature = "mod-suite")]
+const LIVE_CREATE_REGION_BUDGET_US: u32 = 2_000;
+
 /// The tick-half without the socket write — step the factory once, drain
 /// the coalesced `KineticUpdateTag` batch (only changed nodes; the
 /// fingerprint gate suppresses idle churn), and encode it for the wire.
@@ -3126,9 +3280,12 @@ fn live_create_tick_body() -> Option<Vec<u8>> {
         return None;
     }
     let tick = TICK_IDX.load(Ordering::Relaxed);
+    let budget_us = ((f64::from(LIVE_CREATE_REGION_BUDGET_US)
+        * f64::from(live_server_budget_scale()))
+        .max(1.0)) as u64;
     live_create_with(|rt| {
         rt.tick_processing();
-        let _ = rt.factory.step_tick(tick, 1_024, None);
+        let _ = rt.factory.step_tick(tick, 1_024, Some(budget_us));
         let mut drained = Vec::new();
         rt.factory.drain_update_batch_into(&mut drained);
         if drained.is_empty() {
@@ -3531,6 +3688,15 @@ fn live_mod_registry_sync_on_join(_s: &mut TcpStream) {}
 #[cfg(not(feature = "mod-suite"))]
 #[inline(always)]
 fn live_mod_tick() {}
+
+/// Pass-through without `mod-suite`: no mod damage hooks exist, so the hit
+/// applies exactly as vanilla computed it.
+#[cfg(not(feature = "mod-suite"))]
+#[allow(dead_code)]
+#[inline(always)]
+fn live_mod_entity_damage_pre(amount: f32) -> Option<f32> {
+    Some(amount)
+}
 
 /// `Allowed` without `mod-suite`: no barrier engine exists to consult.
 #[cfg(not(feature = "mod-suite"))]
@@ -4201,6 +4367,7 @@ mod wire_mods_tests {
 
     fn fresh_suite() {
         *live_mod_suite().lock().unwrap_or_else(|e| e.into_inner()) = LiveModSuite::new();
+        live_mod_refresh_hook_gate();
     }
 
     // ---------- JVM .class file builder (same shape as mixin_jar_scan) ----------
@@ -5777,10 +5944,227 @@ version="3.0.0"
         assert_eq!(suite.damage_hooks.len(), 1);
         suite.active = true;
         *live_mod_suite().lock().unwrap_or_else(|e| e.into_inner()) = suite;
+        live_mod_refresh_hook_gate();
         assert_eq!(live_mod_eval_damage_hooks(14.0), 7.0);
         assert_eq!(live_mod_eval_damage_hooks(6.0), 6.0);
         assert!(live_mod_eval_damage_hooks(f32::NAN).is_nan());
         let _ = std::fs::remove_dir_all(dir);
+    }
+
+    // ---------- live EntityDamagePre dispatch ----------
+
+    /// `example/DamageHook.onDamage` bytecode: `event.setDamage(
+    /// event.getDamage() * 0.5)` when the hit exceeds 10 — observes and
+    /// rewrites, never cancels.
+    fn lmb_halve_damage_class() -> Vec<u8> {
+        use mod_adapter_core::bytecode_subset_vm::testkit::{ClassAssembler, MethodSpec};
+        let mut asm = ClassAssembler::new("example/DamageHook");
+        let get = asm.cp.method_ref("megu/api/Event", "getDamage", "()F");
+        let set = asm.cp.method_ref("megu/api/Event", "setDamage", "(F)V");
+        let ten = asm.cp.float(10.0);
+        let half = asm.cp.float(0.5);
+        let code = vec![
+            0x2a, 0xb6, (get >> 8) as u8, get as u8, 0x12, ten as u8, 0x95, 0x9e, 0, 14, 0x2a,
+            0x2a, 0xb6, (get >> 8) as u8, get as u8, 0x12, half as u8, 0x6a, 0xb6, (set >> 8)
+            as u8, set as u8, 0xb1,
+        ];
+        asm.finish(&[MethodSpec::new(
+            "onDamage",
+            "(Lmegu/api/Event;)V",
+            4,
+            1,
+            code,
+        )])
+    }
+
+    /// `example/CancelDamage.onDamage` bytecode: `event.cancel()`.
+    fn lmb_cancel_damage_class() -> Vec<u8> {
+        use mod_adapter_core::bytecode_subset_vm::testkit::{ClassAssembler, MethodSpec};
+        let mut asm = ClassAssembler::new("example/CancelDamage");
+        let cancel = asm.cp.method_ref("megu/api/Event", "cancel", "()V");
+        let code = vec![0x2a, 0xb6, (cancel >> 8) as u8, cancel as u8, 0xb1];
+        asm.finish(&[MethodSpec::new(
+            "onDamage",
+            "(Lmegu/api/Event;)V",
+            2,
+            1,
+            code,
+        )])
+    }
+
+    /// A jar carrying BOTH a liftable `LivingEntity#hurt` HEAD inject (fires
+    /// `EntityDamagePre`) and the given verified `onDamage` class — the
+    /// combined fixture proving the real production dispatch path, not
+    /// just the VM evaluator.
+    fn lmb_damage_dispatch_jar(damage_class: &[u8]) -> Vec<u8> {
+        let mixin_class = build_class(
+            "com/dmgmod/mixin/DamageMixin",
+            vec![mixin(vec![(
+                "value",
+                Ev::Arr(vec![ev_cls("net/minecraft/world/entity/LivingEntity")]),
+            )])],
+            vec![meth(
+                "onHurt",
+                vec![ann(
+                    INJECT,
+                    vec![
+                        ("method", ev_s("hurt")),
+                        ("at", at("HEAD")),
+                        ("cancellable", Ev::Z(true)),
+                    ],
+                    true,
+                )],
+            )],
+        );
+        let config = r#"{"required":true,"package":"com.dmgmod.mixin","mixins":["DamageMixin"]}"#;
+        let manifest = lmb_fabric_manifest("dmgmod");
+        lmb_test_jar(&[
+            ("fabric.mod.json", manifest.as_slice()),
+            ("test.mixins.json", config.as_bytes()),
+            ("com/dmgmod/mixin/DamageMixin.class", mixin_class.as_slice()),
+            ("example/DamageHook.class", damage_class),
+        ])
+    }
+
+    /// Install a scanned damage-dispatch jar as the armed suite.
+    fn lmb_arm_damage_dispatch(jar: &[u8]) {
+        let dir = lmb_temp_dir("damage-dispatch");
+        std::fs::write(dir.join("dmgmod-1.jar"), jar).unwrap();
+        let mut suite = LiveModSuite::new();
+        suite.scan_mods_dir(&dir);
+        suite.active = true;
+        *live_mod_suite().lock().unwrap_or_else(|e| e.into_inner()) = suite;
+        live_mod_refresh_hook_gate();
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn w_mod_live_damage_pre_passthrough_without_hooks_is_vanilla() {
+        let _world = crate::world_guard();
+        let _serial = WIRE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        fresh_suite();
+        // No suite, no hooks: the fast gate is clear and the amount passes
+        // through untouched — identical to a build without mod-suite.
+        assert!(!HAS_LIVE_MOD_HOOKS.load(Ordering::Relaxed));
+        assert_eq!(live_mod_entity_damage_pre(9.5), Some(9.5));
+        let (client, _rx) = crate::effect_tests::client_pair();
+        let client = std::sync::Arc::new(client);
+        assert!(live_mob_damage_player(
+            &client,
+            [1.0, 64.0, 1.0],
+            10.0,
+            None,
+            None
+        ));
+        assert_eq!(*client.hp.lock().unwrap_or_else(|e| e.into_inner()), 10.0);
+    }
+
+    #[test]
+    fn w_mod_live_damage_pre_binding_and_hook_observe_rewrite_cancel() {
+        let _world = crate::world_guard();
+        let _serial = WIRE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        fresh_suite();
+
+        // Rewriting handler + EntityDamagePre binding armed.
+        lmb_arm_damage_dispatch(&lmb_damage_dispatch_jar(&lmb_halve_damage_class()));
+        {
+            let suite = live_mod_suite().lock().unwrap_or_else(|e| e.into_inner());
+            assert_eq!(suite.lifted_hooks.len(), 1);
+            assert_eq!(suite.damage_hooks.len(), 1);
+        }
+        assert!(HAS_LIVE_MOD_HOOKS.load(Ordering::Relaxed));
+
+        // Direct path: binding fires (counter proves dispatch), handler
+        // observes 14 -> halves to 7; 6 stays 6.
+        assert_eq!(live_mod_entity_damage_pre(14.0), Some(7.0));
+        assert_eq!(live_mod_entity_damage_pre(6.0), Some(6.0));
+        {
+            let suite = live_mod_suite().lock().unwrap_or_else(|e| e.into_inner());
+            assert_eq!(
+                suite.hook_fires.get(&StandardEventHook::EntityDamagePre),
+                Some(&2)
+            );
+        }
+
+        // Real damage path: a 14-damage mob hit lands as 7 hp damage.
+        let (client, _rx) = crate::effect_tests::client_pair();
+        let client = std::sync::Arc::new(client);
+        assert!(live_mob_damage_player(
+            &client,
+            [1.0, 64.0, 1.0],
+            14.0,
+            None,
+            None
+        ));
+        assert_eq!(*client.hp.lock().unwrap_or_else(|e| e.into_inner()), 13.0);
+        {
+            let suite = live_mod_suite().lock().unwrap_or_else(|e| e.into_inner());
+            assert_eq!(
+                suite.hook_fires.get(&StandardEventHook::EntityDamagePre),
+                Some(&3)
+            );
+        }
+
+        // Cancelling handler: same dispatch path returns None and the real
+        // damage path refuses the hit outright — hp untouched.
+        lmb_arm_damage_dispatch(&lmb_damage_dispatch_jar(&lmb_cancel_damage_class()));
+        assert_eq!(live_mod_entity_damage_pre(9.0), None);
+        let (client, _rx) = crate::effect_tests::client_pair();
+        let client = std::sync::Arc::new(client);
+        assert!(!live_mob_damage_player(
+            &client,
+            [1.0, 64.0, 1.0],
+            9.0,
+            None,
+            None
+        ));
+        assert_eq!(*client.hp.lock().unwrap_or_else(|e| e.into_inner()), 20.0);
+
+        fresh_suite();
+    }
+
+    #[test]
+    fn w_mod_live_tick_hooks_fire_on_server_tick_path() {
+        let _world = crate::world_guard();
+        let _serial = WIRE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        fresh_suite();
+
+        // Zero hooks: the real tick path dispatches nothing.
+        live_mod_tick();
+        {
+            let suite = live_mod_suite().lock().unwrap_or_else(|e| e.into_inner());
+            assert!(suite.hook_fires.is_empty());
+        }
+
+        // A liftable `ServerLevel#tick` HEAD inject binds ServerTickPre;
+        // the production `live_mod_tick` must actually dispatch it.
+        let dir = lmb_temp_dir("tick-dispatch");
+        std::fs::write(
+            dir.join("tickmod-1.jar"),
+            lmb_inject_jar(
+                "com/tickmod",
+                "net/minecraft/server/level/ServerLevel",
+                "tick",
+            ),
+        )
+        .unwrap();
+        let mut suite = LiveModSuite::new();
+        suite.scan_mods_dir(&dir);
+        suite.active = true;
+        *live_mod_suite().lock().unwrap_or_else(|e| e.into_inner()) = suite;
+        live_mod_refresh_hook_gate();
+        let _ = std::fs::remove_dir_all(dir);
+
+        live_mod_tick();
+        {
+            let suite = live_mod_suite().lock().unwrap_or_else(|e| e.into_inner());
+            assert_eq!(
+                suite.hook_fires.get(&StandardEventHook::ServerTickPre),
+                Some(&1),
+                "registered tick binding must fire on the real tick path"
+            );
+        }
+        fresh_suite();
     }
 
     #[test]
@@ -5811,6 +6195,7 @@ version="3.0.0"
         assert!(suite.culinary_stats.cutting_recipes >= 2);
         suite.active = true;
         *live_mod_suite().lock().unwrap_or_else(|e| e.into_inner()) = suite;
+        live_mod_refresh_hook_gate();
 
         let key = (DimId::Overworld, 10, 64, -3);
         let mut pot = CookingPotState::new();
@@ -5946,6 +6331,7 @@ version="3.0.0"
         suite.scan_mods_dir(&dir);
         suite.active = true;
         *live_mod_suite().lock().unwrap_or_else(|e| e.into_inner()) = suite;
+        live_mod_refresh_hook_gate();
 
         // Heated pot with carrot + bowl completes the scanned recipe on its deadline.
         let key = (DimId::Overworld, 30, 64, 30);
@@ -6216,6 +6602,7 @@ version="3.0.0"
             "adapted JAR must produce an MRS1 registry plan"
         );
         *live_mod_suite().lock().unwrap_or_else(|e| e.into_inner()) = suite;
+        live_mod_refresh_hook_gate();
 
         let frame = live_mod_registry_sync_frame().expect("generic mods must emit MRS1");
         let synced = mod_adapter_core::live_registry_bridge::decode_registry_sync_frame(&frame)
@@ -6307,6 +6694,7 @@ mod live_create_tests {
     const W5: (i32, i32, i32) = (9_000_000, 80, 400);
     const W6: (i32, i32, i32) = (9_000_008, 80, 500);
     const W7: (i32, i32, i32) = (9_000_000, 80, 600);
+    const W8: (i32, i32, i32) = (9_000_000, 80, 700);
 
     fn pos_of(c: (i32, i32, i32)) -> FactoryPos {
         FactoryPos::new(DimId::Overworld.raw() as i32, c.0, c.1, c.2)
@@ -6924,5 +7312,73 @@ mod live_create_tests {
         assert!(!reg.is_replaceable(shaft));
         // Vanilla states are untouched by the extension.
         assert_eq!(reg.name_of(0), "minecraft:air");
+    }
+
+    /// Regression: `live_create_tick_body` must drive the factory through
+    /// `CreateFactory::step_tick`'s parallel region stepping and idle-sleep
+    /// bookkeeping — not just drain kinetic tags. A placed network creates
+    /// a real region; once it goes idle the scheduler parks it and later
+    /// ticks skip it entirely (counted in `idle_export_skips`).
+    #[test]
+    fn create_factory_parallel_step_and_idle_sleep_are_wired() {
+        let _g = world_guard();
+        arm();
+        let (wx, wy, wz) = W8;
+        // water -> water_wheel(x) -> shaft(x): one kinetic region, no items.
+        let water = (wx + 1, wy, wz);
+        let shaft = (wx - 1, wy, wz);
+        for c in [water, shaft] {
+            clear(c.0, c.1, c.2);
+        }
+        clear(wx, wy, wz);
+        put(DimId::Overworld, water.0, water.1, water.2, TEST_WATER);
+        put(
+            DimId::Overworld,
+            wx,
+            wy,
+            wz,
+            state_of("create:water_wheel", &[("axis", "x")]),
+        );
+        put(
+            DimId::Overworld,
+            shaft.0,
+            shaft.1,
+            shaft.2,
+            state_of("create:shaft", &[("axis", "x")]),
+        );
+
+        // First live tick: the region is stepped through step_tick.
+        let _ = live_create_tick_body();
+        live_create_with(|rt| {
+            assert!(
+                rt.factory.active_regions_last_tick() >= 1
+                    || rt.factory.sleeping_regions() >= 1,
+                "step_tick must step or park the placed region"
+            );
+        });
+
+        // Idle region parks: subsequent ticks skip it entirely and count
+        // the skipped exports — proof the sleep path is live, not
+        // decorative. (`active_regions_last_tick` can transiently report
+        // scheduler error results if a concurrent test rewinds the shared
+        // tick clock, so the counters are the stable signal.)
+        for _ in 0..4 {
+            let _ = live_create_tick_body();
+        }
+        live_create_with(|rt| {
+            assert!(
+                rt.factory.sleeping_regions() >= 1,
+                "idle region must be parked asleep"
+            );
+            assert!(
+                rt.factory.idle_export_skips() > 0,
+                "skipped idle exports must be counted"
+            );
+        });
+
+        for c in [water, shaft] {
+            clear(c.0, c.1, c.2);
+        }
+        clear(wx, wy, wz);
     }
 }

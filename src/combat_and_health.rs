@@ -1297,6 +1297,11 @@ fn firework_explode(x: f64, y: f64, z: f64, explosions: i64) {
         let dd = ((px - x).powi(2) + (py - y).powi(2) + (pz - z).powi(2)).sqrt();
         if dd < 5.0 && *cl.gm.lock().unwrap_or_else(|e| e.into_inner()) != 1 {
             let raw = ((5.0 - dd) * (f64::from(power) / 5.0)) as f32;
+            // Mod-suite `EntityDamagePre`: a cancelled/rewritten hit skips
+            // or reshapes this player's share of the blast.
+            let Some(raw) = live_mod_entity_damage_pre(raw) else {
+                continue;
+            };
             let Some((accepted, _)) = damage_after_invulnerability(&cl, raw) else {
                 continue;
             };
@@ -1320,8 +1325,12 @@ fn firework_explode(x: f64, y: f64, z: f64, explosions: i64) {
         let (mx, my, mz, ..) = *mob.pos.lock().unwrap_or_else(|e| e.into_inner());
         let dd = ((mx - x).powi(2) + (my - y).powi(2) + (mz - z).powi(2)).sqrt();
         if dd < 5.0 {
+            // Mod-suite `EntityDamagePre` for blast-damaged mobs.
+            let Some(dmg) = live_mod_entity_damage_pre(power * (5.0 - dd) as f32) else {
+                continue;
+            };
             let mut hp = mob.hp.lock().unwrap_or_else(|e| e.into_inner());
-            *hp = (*hp - power * (5.0 - dd) as f32 / 5.0).max(0.0);
+            *hp = (*hp - dmg).max(0.0);
         }
     }
 }
@@ -2779,11 +2788,25 @@ fn arrow_tick() {
                             dead.push(eid);
                             break;
                         }
+                        // Mod-suite `EntityDamagePre` for the struck mob: a
+                        // cancelled hit is consumed like any other impact
+                        // but deals nothing.
+                        let Some(dmg) = live_mod_entity_damage_pre(a.dmg) else {
+                            if a.pierce > 0 {
+                                a.pierce -= 1;
+                                a.last_hit = m.eid;
+                            } else if a.kind == 1 && a.loy > 0 {
+                                returning.insert(eid);
+                            } else {
+                                dead.push(eid);
+                            }
+                            break 'outer;
+                        };
                         *m.hurt_at.lock().unwrap_or_else(|e| e.into_inner()) = Instant::now();
                         *m.last_hurt_tick.lock().unwrap_or_else(|e| e.into_inner()) =
                             Some(TICK_IDX.load(Ordering::Relaxed));
                         let mut h = m.hp.lock().unwrap_or_else(|e| e.into_inner());
-                        *h -= a.dmg;
+                        *h -= dmg;
                         let dh = *h;
                         drop(h);
                         if a.fire > 0 && !mob_fire_immune(m.etype) {
@@ -2979,6 +3002,11 @@ fn arrow_tick() {
             if *c.gm.lock().unwrap_or_else(|e| e.into_inner()) == 1 {
                 continue;
             }
+            // Mod-suite `EntityDamagePre` for the struck player: a cancelled
+            // hit skips this victim entirely.
+            let Some(admg) = live_mod_entity_damage_pre(admg) else {
+                continue;
+            };
             // the evaluator's raise clock already tracks `blocking` — a lowered
             // shield reports 0 raised ticks, below the warmup gate
             let eval = evaluate_shield_block(&shield_hit_ctx(c, [ax, 0.0, az], admg));
@@ -3752,6 +3780,11 @@ fn explode_at(ex: f64, ey: f64, ez: f64, power: f64) {
         let dd = ((px - ex).powi(2) + (py - ey).powi(2) + (pz - ez).powi(2)).sqrt();
         if dd < power * 1.5 && *cl.gm.lock().unwrap_or_else(|e| e.into_inner()) != 1 {
             let raw = ((power * 1.5 - dd) * 3.0) as f32;
+            // Mod-suite `EntityDamagePre`: a cancelled/rewritten hit skips
+            // or reshapes this player's share of the blast.
+            let Some(raw) = live_mod_entity_damage_pre(raw) else {
+                continue;
+            };
             let Some((accepted, _)) = damage_after_invulnerability(&cl, raw) else {
                 continue;
             };
@@ -3847,6 +3880,13 @@ fn live_mob_damage_player(
     if !matches!(*player.gm.lock().unwrap_or_else(|e| e.into_inner()), 0 | 2) || *player.hp.lock().unwrap_or_else(|e| e.into_inner()) <= 0.0 {
         return false;
     }
+    // Mod-suite `EntityDamagePre` (the `Entity.hurt` HEAD equivalent): lifted
+    // Mixin bindings observe the hit and verified `onDamage` handlers may
+    // rewrite the amount or cancel it outright before the shield gate.
+    // `None` = cancelled; zero-mod builds pay one relaxed atomic load.
+    let Some(damage) = live_mod_entity_damage_pre(damage) else {
+        return false;
+    };
     if protection_kind == Some(0) {
         // Vanilla `isDamageSourceBlocked`: raise warmup, 180° attacker arc and
         // the running disable cooldown all gate the block before durability.
