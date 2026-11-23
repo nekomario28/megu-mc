@@ -1838,7 +1838,7 @@ impl<W: TemplateWorld> FluidTickTarget for W {
 
 /// The `level` property of a fluid state, 0 when the state does not carry one (a waterlogged
 /// non-fluid keeps a source fluid).
-fn fluid_level(reg: &BReg, state: u32) -> u8 {
+pub(crate) fn fluid_level(reg: &BReg, state: u32) -> u8 {
     reg.get_prop(state, "level")
         .and_then(|v| v.parse::<u8>().ok())
         .unwrap_or(0)

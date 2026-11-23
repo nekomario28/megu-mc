@@ -8175,6 +8175,11 @@ fn save_live_player_snapshot(
         }
     }
     saved.insert(player.uuid, snapshot);
+    // The snapshot joins the save payload through `saved_players`: a dirty
+    // mark is owed or the next save pass would skip it. The periodic
+    // autosave's liveness floor only counts clients still online, so the
+    // disconnect flush in `disconnect_cleanup` relies on this bump.
+    note_world_persist_dirty();
 }
 
 // ---------- W3 live protocol wiring ----------
@@ -14434,6 +14439,7 @@ fn disconnect_cleanup(me_cleanup: &Arc<Client>, peer: &str) {
         }
         let mut cls = clients().lock().unwrap_or_else(|e| e.into_inner());
         cls.retain(|c| c.eid != me_cleanup.eid);
+        let last_client_left = cls.is_empty();
         drop(cls);
         *me_cleanup.sleeping.lock().unwrap_or_else(|e| e.into_inner()) = None;
         forget_per_eid_state(me_cleanup.eid);
@@ -14449,6 +14455,15 @@ fn disconnect_cleanup(me_cleanup: &Arc<Client>, peer: &str) {
         write_varint(&mut p, 1);
         p.extend_from_slice(&me_cleanup.uuid);
         broadcast(me_cleanup.eid, |_c| (0x3d, p.clone()));
+        // The last online client list is empty: the snapshot above is the
+        // world's final live state, and an idle server's periodic autosave
+        // may never run again (the liveness floor counts online clients).
+        // Flush through the same gated path as the periodic pass — after the
+        // `clients()` lock was released, so snapshot+write never holds it
+        // across disk I/O.
+        if last_client_left {
+            autosave_world();
+        }
     }
 }
 

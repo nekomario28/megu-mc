@@ -18,8 +18,9 @@ fn fluid_washes_away(reg: &crate::block_registry::BReg, state: u32) -> bool {
     if reg.is_air(state) || reg.get_prop(state, "waterlogged").is_some() {
         return false;
     }
+    let name = reg.name_of(state);
     if matches!(
-        reg.name_of(state),
+        name,
         "minecraft:ladder"
             | "minecraft:sugar_cane"
             | "minecraft:bubble_column"
@@ -30,6 +31,35 @@ fn fluid_washes_away(reg: &crate::block_registry::BReg, state: u32) -> bool {
     ) || reg.in_tag(state, "minecraft:signs")
     {
         return false;
+    }
+    // The non-waterloggable 1.21.1 blocks a fluid spread destroys outright —
+    // cave plants, vines, carpets, webs and redstone parts. Named explicitly
+    // so a state whose collision metadata does not report an empty shape
+    // still classifies `Passable` instead of stalling the spring tick.
+    if matches!(
+        name,
+        "minecraft:vine"
+            | "minecraft:cave_vines"
+            | "minecraft:cave_vines_plant"
+            | "minecraft:weeping_vines"
+            | "minecraft:weeping_vines_plant"
+            | "minecraft:twisting_vines"
+            | "minecraft:twisting_vines_plant"
+            | "minecraft:spore_blossom"
+            | "minecraft:moss_carpet"
+            | "minecraft:pink_petals"
+            | "minecraft:cobweb"
+            | "minecraft:redstone_wire"
+            | "minecraft:lever"
+            | "minecraft:tripwire"
+            | "minecraft:tripwire_hook"
+            | "minecraft:dead_bush"
+            | "minecraft:fern"
+            | "minecraft:large_fern"
+            | "minecraft:short_grass"
+            | "minecraft:tall_grass"
+    ) {
+        return true;
     }
     reg.is_collision_empty(state) && !reg.blocks_motion(state)
 }

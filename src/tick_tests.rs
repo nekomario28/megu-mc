@@ -1070,6 +1070,208 @@ fn world_mechanisms_fluid_wash_away_excludes_waterloggable_hosts() {
         assert_eq!(reg.get_prop(wet, "waterlogged").as_deref(), Some("true"));
         assert!(!fluid_washes_away(reg, wet));
     }
+    for name in [
+        "minecraft:vine",
+        "minecraft:cave_vines",
+        "minecraft:cave_vines_plant",
+        "minecraft:weeping_vines",
+        "minecraft:weeping_vines_plant",
+        "minecraft:twisting_vines",
+        "minecraft:twisting_vines_plant",
+        "minecraft:spore_blossom",
+        "minecraft:moss_carpet",
+        "minecraft:pink_petals",
+        "minecraft:cobweb",
+        "minecraft:redstone_wire",
+        "minecraft:lever",
+        "minecraft:tripwire",
+        "minecraft:tripwire_hook",
+        "minecraft:dead_bush",
+        "minecraft:fern",
+        "minecraft:large_fern",
+        "minecraft:short_grass",
+        "minecraft:tall_grass",
+    ] {
+        assert!(
+            fluid_washes_away(reg, reg.state_of(name, None)),
+            "water must wash away {name}"
+        );
+    }
+}
+
+/// BUG-SP6: `FluidReader` classifies every cell the way `Cell`'s contract
+/// defines it, so a deferred spring tick next to cave blocks can never stall
+/// on `unsupported fluid shape`.
+#[cfg(megu_vanilla_data)]
+#[test]
+fn fluid_reader_classifies_waterloggable_washaway_and_solid_cells() {
+    let _guard = world_guard();
+    crate::test_support::require_vanilla_data();
+    let _snapshot = WorldSnapshot::take();
+    let reg = crate::block_registry::breg().unwrap();
+    let stone = reg.state_of("minecraft:stone", None);
+    {
+        // A closed stone chamber, so a classification never silently
+        // consults unspecified generated terrain as a fixture input.
+        let mut world = world().lock().unwrap_or_else(|e| e.into_inner());
+        let chunk = world.entry((DimId::Overworld, 12, 12)).or_default();
+        for y in 200..=204 {
+            for z in 200..=204 {
+                for x in 200..=204 {
+                    chunk.insert(local_idx(x, y, z), stone);
+                }
+            }
+        }
+    }
+    let cell_at = |pos: BlockPos, state: u32| {
+        world()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .entry((DimId::Overworld, pos.0 >> 4, pos.2 >> 4))
+            .or_default()
+            .insert(local_idx(pos.0, pos.1, pos.2), state);
+        flowing_fluid::Reader::cell(&mut FluidReader, pos)
+    };
+    let p = (202, 202, 202);
+    // Hosts and shaped solids a spread cannot enter — the dry-chest
+    // contract: `SimpleWaterloggedBlock` is `canHoldFluid`'s first branch,
+    // and this machine does not model `placeLiquid`, so a dry host is Solid.
+    for name in [
+        "minecraft:glow_lichen",
+        "minecraft:sculk_vein",
+        "minecraft:rail",
+        "minecraft:powered_rail",
+        "minecraft:detector_rail",
+        "minecraft:activator_rail",
+        "minecraft:oak_sign",
+        "minecraft:ladder",
+        "minecraft:amethyst_cluster",
+        "minecraft:small_amethyst_bud",
+        "minecraft:medium_amethyst_bud",
+        "minecraft:large_amethyst_bud",
+        "minecraft:pointed_dripstone",
+        "minecraft:small_dripleaf",
+        "minecraft:big_dripleaf",
+        "minecraft:big_dripleaf_stem",
+        "minecraft:hanging_roots",
+        "minecraft:chain",
+        "minecraft:lantern",
+        "minecraft:glass_pane",
+        "minecraft:iron_bars",
+        "minecraft:oak_fence",
+        "minecraft:cobblestone_wall",
+        "minecraft:oak_slab",
+        "minecraft:oak_stairs",
+        "minecraft:oak_door",
+        "minecraft:oak_trapdoor",
+        "minecraft:chest",
+    ] {
+        assert_eq!(
+            cell_at(p, reg.state_of(name, None)),
+            Ok(flowing_fluid::Cell::Solid),
+            "{name} is a waterloggable host a spread cannot enter"
+        );
+    }
+    // The same host already waterlogged reads as the source water it
+    // carries — `getFluidState`, not the block shape, answers.
+    let wet_rail = reg.with_prop(reg.state_of("minecraft:rail", None), "waterlogged", "true");
+    assert_eq!(
+        cell_at(p, wet_rail),
+        Ok(flowing_fluid::Cell::Fluid(flowing_fluid::Fluid {
+            kind: flowing_fluid::Kind::Water,
+            level: 0,
+        })),
+        "a waterlogged rail is a water source cell"
+    );
+    // Always-submerged water plants are source water too.
+    for name in [
+        "minecraft:kelp",
+        "minecraft:kelp_plant",
+        "minecraft:seagrass",
+        "minecraft:tall_seagrass",
+        "minecraft:bubble_column",
+    ] {
+        assert_eq!(
+            cell_at(p, reg.state_of(name, None)),
+            Ok(flowing_fluid::Cell::Fluid(flowing_fluid::Fluid {
+                kind: flowing_fluid::Kind::Water,
+                level: 0,
+            })),
+            "{name} carries source water"
+        );
+    }
+    // Non-waterloggable cells a spread destroys are Passable.
+    for name in [
+        "minecraft:vine",
+        "minecraft:cave_vines",
+        "minecraft:weeping_vines",
+        "minecraft:twisting_vines",
+        "minecraft:spore_blossom",
+        "minecraft:moss_carpet",
+        "minecraft:pink_petals",
+        "minecraft:cobweb",
+        "minecraft:redstone_wire",
+        "minecraft:lever",
+        "minecraft:tripwire",
+        "minecraft:tripwire_hook",
+        "minecraft:dead_bush",
+        "minecraft:fern",
+        "minecraft:short_grass",
+        "minecraft:tall_grass",
+        "minecraft:torch",
+    ] {
+        assert_eq!(
+            cell_at(p, reg.state_of(name, None)),
+            Ok(flowing_fluid::Cell::Passable),
+            "water washes away {name}"
+        );
+    }
+    // Non-waterloggable cells a spread cannot enter are Solid — translucent
+    // full blocks, shaped solids and the refused families, none of which may
+    // reach the unsupported-shape error.
+    for name in [
+        "minecraft:glass",
+        "minecraft:tinted_glass",
+        "minecraft:white_stained_glass",
+        "minecraft:ice",
+        "minecraft:packed_ice",
+        "minecraft:blue_ice",
+        "minecraft:oak_leaves",
+        "minecraft:cactus",
+        "minecraft:bamboo",
+        "minecraft:sugar_cane",
+        "minecraft:nether_portal",
+        "minecraft:end_portal",
+        "minecraft:end_gateway",
+        "minecraft:structure_void",
+        "minecraft:spawner",
+        "minecraft:glowstone",
+        "minecraft:sea_lantern",
+        "minecraft:beacon",
+        "minecraft:barrier",
+    ] {
+        assert_eq!(
+            cell_at(p, reg.state_of(name, None)),
+            Ok(flowing_fluid::Cell::Solid),
+            "{name} is solid to a spreading fluid"
+        );
+    }
+    // End to end: a water source beside a glow-lichen-covered wall produces a
+    // plan, not a deferred unsupported-shape error.
+    let source = (201, 202, 202);
+    let _ = cell_at(source, 80);
+    let _ = cell_at(p, reg.state_of("minecraft:glow_lichen", None));
+    assert!(
+        flowing_fluid::tick(
+            &mut FluidReader,
+            source,
+            flowing_fluid::Kind::Water,
+            true,
+            true,
+        )
+        .is_ok(),
+        "a spring tick beside glow lichen must not report an unsupported fluid shape"
+    );
 }
 
 #[cfg(megu_vanilla_data)]

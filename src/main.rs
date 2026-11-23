@@ -8418,29 +8418,44 @@ impl flowing_fluid::Reader for FluidReader {
         if let Some(f) = fluid_from_block(st) {
             return Ok(flowing_fluid::Cell::Fluid(f));
         }
-        if waterlogged_source(st) {
-            return Ok(flowing_fluid::Cell::Fluid(flowing_fluid::Fluid {
-                kind: flowing_fluid::Kind::Water,
-                level: 0,
-            }));
-        }
         let reg = crate::block_registry::breg().ok_or("missing block registry")?;
+        // `getFluidState` on every non-LiquidBlock cell: a waterlogged host
+        // (rail, sign, slab, chest, glow lichen, sculk vein...) or an
+        // always-submerged plant (kelp, seagrass, bubble column) reads as the
+        // source water it carries — none of those states has a `level`
+        // property, so `fluid_level` reports the source they are. This is the
+        // same answer `FluidTickTarget::fluid_cell` gives the generation pass.
+        match reg.fluid_name(st) {
+            "minecraft:water" | "minecraft:flowing_water" => {
+                return Ok(flowing_fluid::Cell::Fluid(flowing_fluid::Fluid {
+                    kind: flowing_fluid::Kind::Water,
+                    level: structure_template::fluid_level(reg, st),
+                }));
+            }
+            "minecraft:lava" | "minecraft:flowing_lava" => {
+                return Ok(flowing_fluid::Cell::Fluid(flowing_fluid::Fluid {
+                    kind: flowing_fluid::Kind::Lava,
+                    level: structure_template::fluid_level(reg, st),
+                }));
+            }
+            _ => {}
+        }
         if reg.is_air(st) {
             Ok(flowing_fluid::Cell::Air)
         } else if fluid_washes_away(reg, st) {
             Ok(flowing_fluid::Cell::Passable)
-        } else if reg.is_solid_render(st)
-            || matches!(
-                reg.name_of(st),
-                "minecraft:chest" | "minecraft:trapped_chest" | "minecraft:ender_chest"
-            )
-        {
-            Ok(flowing_fluid::Cell::Solid)
         } else {
-            Err(format!(
-                "unsupported fluid shape {} at {pos:?}",
-                reg.name_of(st)
-            ))
+            // Every cell left cannot admit a spread, which is `Cell::Solid`'s
+            // contract: a waterlogged-capable host `canHoldFluid` would enter
+            // only through `placeLiquid` (which this machine does not model,
+            // so the dry host keeps its cell — the dry-chest contract), a
+            // `canHoldFluid`-refused family (signs, ladder, sugar cane,
+            // portals, structure void) blocks entry outright, and a non-empty
+            // partial collision shape stays Solid because its pass-through
+            // answer is geometric. Full and translucent blocks (stone, glass,
+            // ice, leaves, cactus, chests) land here too, so no state can
+            // report an unsupported fluid shape.
+            Ok(flowing_fluid::Cell::Solid)
         }
     }
     fn unsupported_contact(&mut self, pos: BlockPos) -> String {
@@ -17612,7 +17627,8 @@ fn live_save_worker() -> Option<&'static AsyncSaveWorker> {
 // Every mutation the save payload serializes bumps `WORLD_PERSIST_DIRTY_EPOCH`
 // once: committed overlay block writes (the three `dwal_note_block_set` call
 // sites every block path funnels through), gamerule stores
-// (`gamerule_atomic_store`), and the per-autosave liveness pass in
+// (`gamerule_atomic_store`), `saved_players` writes
+// (`save_live_player_snapshot`), and the per-autosave liveness pass in
 // `environment_time_tick` for state whose write paths live outside this file
 // (players, mobs, item drops, projectiles, falling blocks, crop ages).
 // `LAST_SAVED_EPOCH` records the highest dirty epoch a completed (or durably
@@ -22660,6 +22676,90 @@ mod ultra_disk_5_tests {
         backup_last_digests().lock().unwrap_or_else(|e| e.into_inner()).clear();
         LAST_BACKUP_ROTATE_TICK.store(0, Ordering::Relaxed);
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// BUG-SP3: the last player leaving is the world's final live snapshot.
+    /// `save_live_player_snapshot` must mark the world dirty and the teardown
+    /// must flush a save while `clients()` is empty — a 25-second session
+    /// ends before the 600-tick periodic pass ever runs.
+    #[test]
+    fn ultra_disk_5_last_client_disconnect_flushes_world_save() {
+        let _guard = world_guard();
+        d5_dwal_disarm();
+        let overlay = std::path::PathBuf::from(WORLD_FILE);
+        let pre_existing = overlay.exists();
+        let before = std::fs::read(&overlay).ok();
+
+        // Baseline the epoch pair: a periodic pass would now skip, so the
+        // only dirty mark in play is the one the disconnect snapshot makes.
+        LAST_SAVED_EPOCH.store(
+            WORLD_PERSIST_DIRTY_EPOCH.load(Ordering::Acquire),
+            Ordering::Release,
+        );
+        let baseline = LAST_SAVED_EPOCH.load(Ordering::Acquire);
+
+        let uuid = [0x5du8; 16];
+        let (mut client, _peer) = effect_tests::client_pair();
+        client.eid = 97_531;
+        client.uuid = uuid;
+        client.name = "sp3-save-test".into();
+        let me = Arc::new(client);
+        clients()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .push(me.clone());
+
+        disconnect_cleanup(&me, "127.0.0.1:test");
+
+        assert!(
+            clients()
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .iter()
+                .all(|c| c.eid != me.eid),
+            "teardown removed the client"
+        );
+        assert!(
+            saved_players()
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .contains_key(&uuid),
+            "the disconnect snapshot reached saved_players"
+        );
+        assert!(
+            LAST_SAVED_EPOCH.load(Ordering::Acquire) > baseline,
+            "the disconnect flush covered the snapshot's dirty mark"
+        );
+        assert!(overlay.exists(), "the disconnect flush wrote {WORLD_FILE}");
+        if let Some(before) = &before {
+            assert_ne!(
+                *before,
+                std::fs::read(&overlay).unwrap(),
+                "the disconnect flush rewrote the overlay payload"
+            );
+        }
+
+        // Leave nothing behind: the player's stores, the overlay file (only
+        // when this test created it) and a re-baselined epoch pair.
+        saved_players()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(&uuid);
+        inv_store()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove("sp3-save-test");
+        pos_store()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove("sp3-save-test");
+        if !pre_existing {
+            remove_world_save(&overlay).unwrap();
+        }
+        LAST_SAVED_EPOCH.store(
+            WORLD_PERSIST_DIRTY_EPOCH.load(Ordering::Acquire),
+            Ordering::Release,
+        );
     }
 }
 
