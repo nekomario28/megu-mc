@@ -546,6 +546,11 @@ const LOAD_RECOVER_MS: f64 = 32.0;
 /// Inside the 38..=48 warning band only the background stages engage.
 const LOAD_WARN_MS: f64 = 38.0;
 const LOAD_WARN_STAGE_MAX: u8 = 2;
+/// One tick this far past the target (3× the 50 ms budget) is a burst the
+/// ~15-tick EWMA cannot answer in time — a player join streaming
+/// worldgen+encode inside the tick measures ~1.9 s. Jump straight to the
+/// background-starvation band instead of escalating one stage per tick.
+const LOAD_CATASTROPHE_MS: f64 = 150.0;
 
 /// Always-on throttle: feed it one tick's work and read the budget back. No
 /// knobs, no wall clock — the caller passes `Duration`s.
@@ -577,7 +582,9 @@ impl AutoLoadBalancer {
             self.primed = true;
             ms
         };
-        if self.ewma_ms > LOAD_OVERLOAD_MS {
+        if ms > LOAD_CATASTROPHE_MS {
+            self.stage = self.stage.max(LOAD_WARN_STAGE_MAX);
+        } else if self.ewma_ms > LOAD_OVERLOAD_MS {
             self.stage = (self.stage + 1).min(LOAD_STAGE_MAX);
         } else if self.ewma_ms > LOAD_WARN_MS {
             if self.stage < LOAD_WARN_STAGE_MAX {
@@ -1260,6 +1267,30 @@ mod operator_ux_tests {
             }
         }
         assert_eq!(bal.budget(), LoadBudget::FULL);
+    }
+
+    #[test]
+    fn auto_load_balancer_catastrophic_tick_jumps_to_background_band() {
+        let mut bal = AutoLoadBalancer::new();
+        for _ in 0..10 {
+            bal.observe(Duration::from_millis(20));
+        }
+        // A single ~1.9 s join-storm tick: the EWMA barely moves, but the
+        // stage must engage the background-starvation band immediately
+        // instead of climbing one stage per tick for ~15 ticks.
+        let bud = bal.observe(Duration::from_millis(1900));
+        assert_eq!(bal.stage(), LOAD_WARN_STAGE_MAX);
+        assert!(bud.chunk_send_scale < 1.0);
+        assert!(bud.mob_spawn_scale < 1.0);
+        // The visible stages stay untouched by one freak tick.
+        assert_eq!(bud.entity_activation_range, 32);
+        assert_eq!(bud.extra_view_trim, 0);
+        // The burst keeps the EWMA over 48 ms for a while — the stage may
+        // still climb during the tail — but healthy ticks recover it fully.
+        for _ in 0..80 {
+            bal.observe(Duration::from_millis(20));
+        }
+        assert_eq!(bal.stage(), 0);
     }
 
     // ------------------------------------------------------ GS4 query ----
