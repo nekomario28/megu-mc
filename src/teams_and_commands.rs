@@ -1360,7 +1360,7 @@ fn locate_poi_nearest(
 ) -> Option<LocateHit> {
     let poi = p3b_ns(poi);
     let reg = block_registry::breg()?;
-    let w = world().lock().unwrap_or_else(|e| e.into_inner());
+    let w = world().read_all();
     let mut best: Option<(i32, i32, i32, i64)> = None;
     for (&(d, cx, cz), cells) in w.iter() {
         if d != dim {
@@ -6684,12 +6684,11 @@ mod teams_and_commands_tests {
         }
         let _guard = world_guard();
         // Overlay restore on any path: a panic must not leak the seeded blocks.
-        let saved_world = std::mem::take(&mut *world().lock().unwrap_or_else(|e| e.into_inner()));
+        let saved_world = world().take_all();
         struct RestoreWorld(HashMap<DimChunkKey, HashMap<u32, u32>>);
         impl std::ops::Drop for RestoreWorld {
             fn drop(&mut self) {
-                *world().lock().unwrap_or_else(|e| e.into_inner()) =
-                    std::mem::take(&mut self.0);
+                world().restore_all(std::mem::take(&mut self.0));
             }
         }
         let _restore = RestoreWorld(saved_world);

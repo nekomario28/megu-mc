@@ -261,7 +261,7 @@ struct Loaded {
 }
 
 fn round_trip(legacy_tail: Option<&[u8; 4]>, mob_air: i32, drop_age: i32) -> Loaded {
-    let old_world = std::mem::take(&mut *world().lock().unwrap_or_else(|e| e.into_inner()));
+    let old_world = world().take_all();
     let old_drops = std::mem::take(&mut *drops().lock().unwrap_or_else(|e| e.into_inner()));
     let old_mobs = std::mem::take(&mut *mobs().lock().unwrap_or_else(|e| e.into_inner()));
     let old_time = WORLD_TIME.swap(555, Ordering::Relaxed);
@@ -269,8 +269,7 @@ fn round_trip(legacy_tail: Option<&[u8; 4]>, mob_air: i32, drop_age: i32) -> Loa
     let old_rng = world_rng::saved_state();
     forceloaded().lock().unwrap_or_else(|e| e.into_inner()).insert((0, 0));
     world()
-        .lock()
-        .unwrap()
+        .write(&(DimId::Overworld, 0, 0))
         .entry((DimId::Overworld, 0, 0))
         .or_default()
         .insert(0x0000_0004, 4);
@@ -305,7 +304,7 @@ fn round_trip(legacy_tail: Option<&[u8; 4]>, mob_air: i32, drop_age: i32) -> Loa
     let mut payload = Vec::new();
     save_world_into(&mut payload);
     let loaded = {
-        *world().lock().unwrap_or_else(|e| e.into_inner()) = HashMap::new();
+        world().clear();
         *forceloaded().lock().unwrap_or_else(|e| e.into_inner()) = HashSet::new();
         *drops().lock().unwrap_or_else(|e| e.into_inner()) = Vec::new();
         *mobs().lock().unwrap_or_else(|e| e.into_inner()) = Vec::new();
@@ -333,7 +332,7 @@ fn round_trip(legacy_tail: Option<&[u8; 4]>, mob_air: i32, drop_age: i32) -> Loa
             .map(|d| (d.age, d.item, d.cnt, d.comps.clone()));
         let m = mobs().lock().unwrap_or_else(|e| e.into_inner()).first().cloned();
         Loaded {
-            chunks: world().lock().unwrap_or_else(|e| e.into_inner()).len(),
+            chunks: world().len(),
             forced: forceloaded().lock().unwrap_or_else(|e| e.into_inner()).len(),
             world_time: WORLD_TIME.load(Ordering::Relaxed),
             drops: drops().lock().unwrap_or_else(|e| e.into_inner()).len(),
@@ -347,7 +346,7 @@ fn round_trip(legacy_tail: Option<&[u8; 4]>, mob_air: i32, drop_age: i32) -> Loa
             mob_air: m.as_ref().map(|m| *m.air.lock().unwrap_or_else(|e| e.into_inner())).unwrap_or(-1),
         }
     };
-    *world().lock().unwrap_or_else(|e| e.into_inner()) = old_world;
+    world().restore_all(old_world);
     *forceloaded().lock().unwrap_or_else(|e| e.into_inner()) = old_forced_chunk;
     *drops().lock().unwrap_or_else(|e| e.into_inner()) = old_drops;
     *mobs().lock().unwrap_or_else(|e| e.into_inner()) = old_mobs;
@@ -666,7 +665,7 @@ fn the_falling_entities_survive_a_save_and_load_round_trip() {
         return;
     }
     let _g = world_guard();
-    let old_world = world().lock().unwrap_or_else(|e| e.into_inner()).clone();
+    let old_world = world().snapshot();
     let old_falling = std::mem::take(&mut *falling().lock().unwrap_or_else(|e| e.into_inner()));
 
     falling().lock().unwrap_or_else(|e| e.into_inner()).extend([
@@ -723,7 +722,7 @@ fn the_falling_entities_survive_a_save_and_load_round_trip() {
         "NEXT_EID must clear the loaded ids"
     );
 
-    *world().lock().unwrap_or_else(|e| e.into_inner()) = old_world;
+    world().restore_all(old_world);
     *falling().lock().unwrap_or_else(|e| e.into_inner()) = old_falling;
 }
 
@@ -735,7 +734,7 @@ fn a_legacy_fal1_save_converts_its_blocks_to_entities() {
         return;
     }
     let _g = world_guard();
-    let old_world = world().lock().unwrap_or_else(|e| e.into_inner()).clone();
+    let old_world = world().snapshot();
     let old_falling = std::mem::take(&mut *falling().lock().unwrap_or_else(|e| e.into_inner()));
 
     let sand = name_to_state("sand").unwrap();
@@ -752,7 +751,7 @@ fn a_legacy_fal1_save_converts_its_blocks_to_entities() {
     payload.extend_from_slice(&100i32.to_be_bytes());
     payload.extend_from_slice(&2i32.to_be_bytes());
 
-    world().lock().unwrap_or_else(|e| e.into_inner()).clear();
+    world().clear();
     falling().lock().unwrap_or_else(|e| e.into_inner()).clear();
     load_world_from(&payload).unwrap();
 
@@ -763,8 +762,7 @@ fn a_legacy_fal1_save_converts_its_blocks_to_entities() {
     );
     assert_eq!(
         world()
-            .lock()
-            .unwrap()
+            .read(&(DimId::Overworld, 0, 0))
             .get(&(DimId::Overworld, 0, 0))
             .and_then(|c| c.get(&local_idx(1, 100, 2)))
             .copied(),
@@ -779,7 +777,7 @@ fn a_legacy_fal1_save_converts_its_blocks_to_entities() {
         "at the cell center"
     );
 
-    *world().lock().unwrap_or_else(|e| e.into_inner()) = old_world;
+    world().restore_all(old_world);
     *falling().lock().unwrap_or_else(|e| e.into_inner()) = old_falling;
 }
 
@@ -789,7 +787,7 @@ fn the_world_rng_stream_continues_across_a_save_and_load_round_trip() {
         return;
     }
     let _g = world_guard();
-    let old_world = world().lock().unwrap_or_else(|e| e.into_inner()).clone();
+    let old_world = world().snapshot();
     let old_rng = world_rng::saved_state();
 
     world_rng::seed(4242);
@@ -815,7 +813,7 @@ fn the_world_rng_stream_continues_across_a_save_and_load_round_trip() {
         "the reloaded stream must continue from the saved state, not restart"
     );
 
-    *world().lock().unwrap_or_else(|e| e.into_inner()) = old_world;
+    world().restore_all(old_world);
     world_rng::restore(old_rng);
 }
 
@@ -872,7 +870,7 @@ fn furnace_and_sign_round_trip_keeps_only_live_owners() {
         .any(|&(dim, x, y, z, _)| dim == DimId::Overworld && (x, y, z) == broken_sign));
     let mut payload = Vec::new();
     save_world_into(&mut payload);
-    world().lock().unwrap_or_else(|e| e.into_inner()).clear();
+    world().clear();
     furnaces().lock().unwrap_or_else(|e| e.into_inner()).clear();
     signs().lock().unwrap_or_else(|e| e.into_inner()).clear();
     drops().lock().unwrap_or_else(|e| e.into_inner()).clear();
@@ -908,7 +906,7 @@ fn dro1_round_trip_preserves_drop_target_and_thrower_uuids() {
         return;
     }
     let _world_guard = world_guard();
-    let old_world = std::mem::take(&mut *world().lock().unwrap_or_else(|e| e.into_inner()));
+    let old_world = world().take_all();
     let old_drops = std::mem::take(&mut *drops().lock().unwrap_or_else(|e| e.into_inner()));
     let old_mobs = std::mem::take(&mut *mobs().lock().unwrap_or_else(|e| e.into_inner()));
     let old_time = WORLD_TIME.swap(555, Ordering::Relaxed);
@@ -994,7 +992,7 @@ fn dro1_round_trip_preserves_drop_target_and_thrower_uuids() {
         .copy_from_slice(&0u64.to_be_bytes());
     let corrupt_err = load_world_from(&bad).is_err();
 
-    *world().lock().unwrap_or_else(|e| e.into_inner()) = old_world;
+    world().restore_all(old_world);
     *drops().lock().unwrap_or_else(|e| e.into_inner()) = old_drops;
     *mobs().lock().unwrap_or_else(|e| e.into_inner()) = old_mobs;
     WORLD_TIME.store(old_time, Ordering::Relaxed);
@@ -1065,7 +1063,7 @@ fn p2_3_s2a_one_cell_in_three_dimensions_stays_independent() {
     test_support::require_vanilla_data();
     let _world_guard = world_guard();
     p2_3_s2a_init_generators();
-    let old_world = std::mem::take(&mut *world().lock().unwrap_or_else(|e| e.into_inner()));
+    let old_world = world().take_all();
 
     let cell = (5, 100, 7);
     let states = p2_3_s2a_states();
@@ -1112,7 +1110,7 @@ fn p2_3_s2a_one_cell_in_three_dimensions_stays_independent() {
         );
     }
 
-    *world().lock().unwrap_or_else(|e| e.into_inner()) = old_world;
+    world().restore_all(old_world);
     assert!(worldgen::init(0, name_to_state), "leave the Overworld active");
 }
 
@@ -1130,7 +1128,7 @@ fn p2_3_s2a_legacy_overworld_save_and_dim_overlay_tables_round_trip() {
     test_support::require_vanilla_data();
     let _world_guard = world_guard();
     p2_3_s2a_init_generators();
-    let old_world = std::mem::take(&mut *world().lock().unwrap_or_else(|e| e.into_inner()));
+    let old_world = world().take_all();
 
     let cell = (5, 100, 7);
     let states = p2_3_s2a_states();
@@ -1151,8 +1149,7 @@ fn p2_3_s2a_legacy_overworld_save_and_dim_overlay_tables_round_trip() {
     // The same save with the other two dimensions' edits removed. Byte equality is the claim:
     // a companion dimension must not reach the legacy file at all.
     world()
-        .lock()
-        .unwrap()
+        .write_all()
         .retain(|key, _| key.0 == DimId::Overworld);
     let mut without_dims = Vec::new();
     save_world_into(&mut without_dims);
@@ -1162,7 +1159,7 @@ fn p2_3_s2a_legacy_overworld_save_and_dim_overlay_tables_round_trip() {
     );
 
     // It loads as the Overworld's chunks and nothing else.
-    world().lock().unwrap_or_else(|e| e.into_inner()).clear();
+    world().clear();
     load_world_from(&with_dims).unwrap();
     assert_eq!(
         overlay_block_dim(DimId::Overworld, cell.0, cell.1, cell.2),
@@ -1170,7 +1167,7 @@ fn p2_3_s2a_legacy_overworld_save_and_dim_overlay_tables_round_trip() {
         "a legacy (cx, cz) chunk loads into the Overworld"
     );
     {
-        let w = world().lock().unwrap_or_else(|e| e.into_inner());
+        let w = world().read_all();
         assert!(
             w.keys().all(|key| key.0 == DimId::Overworld),
             "the legacy file carries no other dimension: {:?}",
@@ -1197,10 +1194,7 @@ fn p2_3_s2a_legacy_overworld_save_and_dim_overlay_tables_round_trip() {
             1,
             "{dim:?}: one edited chunk"
         );
-        world()
-            .lock()
-            .unwrap()
-            .remove(&(*dim, cell.0 >> 4, cell.2 >> 4));
+        world().remove(&(*dim, cell.0 >> 4, cell.2 >> 4));
         assert_eq!(
             overlay_block_dim(*dim, cell.0, cell.1, cell.2),
             None,
@@ -1220,12 +1214,12 @@ fn p2_3_s2a_legacy_overworld_save_and_dim_overlay_tables_round_trip() {
     }
 
     // A dimension with no edits writes no chunks, which is what makes its file removable.
-    world().lock().unwrap_or_else(|e| e.into_inner()).clear();
+    world().clear();
     let mut empty = Vec::new();
     assert_eq!(save_dim_overlay_into(DimId::Nether, &mut empty), 0);
     assert_eq!(empty, vec![0], "an empty table is a zero count and nothing else");
 
-    *world().lock().unwrap_or_else(|e| e.into_inner()) = old_world;
+    world().restore_all(old_world);
     assert!(worldgen::init(0, name_to_state), "leave the Overworld active");
 }
 
@@ -1243,7 +1237,7 @@ fn p2_3_s2a_companion_dim_files_are_written_loaded_and_removed_when_empty() {
     test_support::require_vanilla_data();
     let _world_guard = world_guard();
     p2_3_s2a_init_generators();
-    let old_world = std::mem::take(&mut *world().lock().unwrap_or_else(|e| e.into_inner()));
+    let old_world = world().take_all();
     let dir = std::env::temp_dir().join(format!("megu-p2_3_s2a-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir).expect("scratch save directory");
@@ -1264,7 +1258,7 @@ fn p2_3_s2a_companion_dim_files_are_written_loaded_and_removed_when_empty() {
     }
 
     // Every dimension comes back from disk, into its own dimension.
-    world().lock().unwrap_or_else(|e| e.into_inner()).clear();
+    world().clear();
     load_world_in(&dir).expect("load the scratch save");
     for (dim, st) in states {
         assert_eq!(
@@ -1278,8 +1272,7 @@ fn p2_3_s2a_companion_dim_files_are_written_loaded_and_removed_when_empty() {
     // A dimension whose last edit is undone loses its file: an Overworld-only server must not
     // accumulate companions, and a stale companion would resurrect the edit on the next load.
     world()
-        .lock()
-        .unwrap()
+        .write_all()
         .retain(|key, _| key.0 == DimId::Overworld);
     save_world_guarded_in(&dir);
     for dim in [DimId::Nether, DimId::End] {
@@ -1292,14 +1285,14 @@ fn p2_3_s2a_companion_dim_files_are_written_loaded_and_removed_when_empty() {
     assert!(file(DimId::Overworld).is_file(), "the legacy file stays");
 
     // And the reload no longer invents them.
-    world().lock().unwrap_or_else(|e| e.into_inner()).clear();
+    world().clear();
     load_world_in(&dir).expect("reload the scratch save");
     for dim in [DimId::Nether, DimId::End] {
         assert_eq!(overlay_block_dim(dim, cell.0, cell.1, cell.2), None);
     }
 
     let _ = std::fs::remove_dir_all(&dir);
-    *world().lock().unwrap_or_else(|e| e.into_inner()) = old_world;
+    world().restore_all(old_world);
     assert!(worldgen::init(0, name_to_state), "leave the Overworld active");
 }
 
@@ -1710,7 +1703,7 @@ fn p2_3_s2b_chests_furnaces_and_crops_stay_isolated_per_dimension_and_round_trip
     let old_chests = std::mem::take(&mut *chests().lock().unwrap_or_else(|e| e.into_inner()));
     let old_furnaces = std::mem::take(&mut *furnaces().lock().unwrap_or_else(|e| e.into_inner()));
     let old_crops = std::mem::take(&mut *crops().lock().unwrap_or_else(|e| e.into_inner()));
-    let old_world = std::mem::take(&mut *world().lock().unwrap_or_else(|e| e.into_inner()));
+    let old_world = world().take_all();
     let old_loot = std::mem::take(&mut *pending_block_loot().lock().unwrap_or_else(|e| e.into_inner()));
     let old_rng = world_rng::saved_state();
 
@@ -1746,8 +1739,7 @@ fn p2_3_s2b_chests_furnaces_and_crops_stay_isolated_per_dimension_and_round_trip
     // The Overworld's crop age also lives in its overlay: there is no legacy crop section, so a
     // legacy load rebuilds it from the block state.
     world()
-        .lock()
-        .unwrap()
+        .write(&(DimId::Overworld, pos.0 >> 4, pos.2 >> 4))
         .entry((DimId::Overworld, pos.0 >> 4, pos.2 >> 4))
         .or_default()
         .insert(local_idx(pos.0, pos.1, pos.2), 4278);
@@ -1772,7 +1764,7 @@ fn p2_3_s2b_chests_furnaces_and_crops_stay_isolated_per_dimension_and_round_trip
     chests().lock().unwrap_or_else(|e| e.into_inner()).clear();
     furnaces().lock().unwrap_or_else(|e| e.into_inner()).clear();
     crops().lock().unwrap_or_else(|e| e.into_inner()).clear();
-    world().lock().unwrap_or_else(|e| e.into_inner()).clear();
+    world().clear();
     load_world_from(&payload).unwrap();
 
     assert_eq!(chests().lock().unwrap_or_else(|e| e.into_inner()).len(), 4);
@@ -1806,7 +1798,7 @@ fn p2_3_s2b_chests_furnaces_and_crops_stay_isolated_per_dimension_and_round_trip
     *chests().lock().unwrap_or_else(|e| e.into_inner()) = old_chests;
     *furnaces().lock().unwrap_or_else(|e| e.into_inner()) = old_furnaces;
     *crops().lock().unwrap_or_else(|e| e.into_inner()) = old_crops;
-    *world().lock().unwrap_or_else(|e| e.into_inner()) = old_world;
+    world().restore_all(old_world);
     *pending_block_loot().lock().unwrap_or_else(|e| e.into_inner()) = old_loot;
 }
 
@@ -1822,7 +1814,7 @@ fn p2_3_s2b_overworld_only_save_emits_no_dim2_footer_and_legacy_loads_as_overwor
     let old_chests = std::mem::take(&mut *chests().lock().unwrap_or_else(|e| e.into_inner()));
     let old_furnaces = std::mem::take(&mut *furnaces().lock().unwrap_or_else(|e| e.into_inner()));
     let old_crops = std::mem::take(&mut *crops().lock().unwrap_or_else(|e| e.into_inner()));
-    let old_world = std::mem::take(&mut *world().lock().unwrap_or_else(|e| e.into_inner()));
+    let old_world = world().take_all();
     let old_rng = world_rng::saved_state();
     let pos = (8, 70, 9);
     let iron = name_to_item("iron_ingot").unwrap();
@@ -1850,8 +1842,7 @@ fn p2_3_s2b_overworld_only_save_emits_no_dim2_footer_and_legacy_loads_as_overwor
         crops().lock().unwrap_or_else(|e| e.into_inner()).insert(key, 3);
     }
     world()
-        .lock()
-        .unwrap()
+        .write(&(DimId::Overworld, pos.0 >> 4, pos.2 >> 4))
         .entry((DimId::Overworld, pos.0 >> 4, pos.2 >> 4))
         .or_default()
         .insert(local_idx(pos.0, pos.1, pos.2), 4281);
@@ -1894,7 +1885,7 @@ fn p2_3_s2b_overworld_only_save_emits_no_dim2_footer_and_legacy_loads_as_overwor
     chests().lock().unwrap_or_else(|e| e.into_inner()).clear();
     furnaces().lock().unwrap_or_else(|e| e.into_inner()).clear();
     crops().lock().unwrap_or_else(|e| e.into_inner()).clear();
-    world().lock().unwrap_or_else(|e| e.into_inner()).clear();
+    world().clear();
     load_world_from(&overworld_only).unwrap();
     let ow = ow_block(pos);
     assert_eq!(chests().lock().unwrap_or_else(|e| e.into_inner()).len(), 1);
@@ -1906,7 +1897,7 @@ fn p2_3_s2b_overworld_only_save_emits_no_dim2_footer_and_legacy_loads_as_overwor
     *chests().lock().unwrap_or_else(|e| e.into_inner()) = old_chests;
     *furnaces().lock().unwrap_or_else(|e| e.into_inner()) = old_furnaces;
     *crops().lock().unwrap_or_else(|e| e.into_inner()) = old_crops;
-    *world().lock().unwrap_or_else(|e| e.into_inner()) = old_world;
+    world().restore_all(old_world);
 }
 
 /// P2-3-S2b: the DIM2 footer is the trust boundary for another dimension's containers. It must
@@ -2125,7 +2116,7 @@ fn save_v2_item_components_survive_restart_in_player_and_chest() {
     let old_players = std::mem::take(&mut *saved_players().lock().unwrap_or_else(|e| e.into_inner()));
     let old_pos = std::mem::take(&mut *pos_store().lock().unwrap_or_else(|e| e.into_inner()));
     let old_clients = std::mem::take(&mut *clients().lock().unwrap_or_else(|e| e.into_inner()));
-    let old_world = std::mem::take(&mut *world().lock().unwrap_or_else(|e| e.into_inner()));
+    let old_world = world().take_all();
     let old_rng = world_rng::saved_state();
 
     let sword = name_to_item("diamond_sword").unwrap();
@@ -2207,7 +2198,7 @@ fn save_v2_item_components_survive_restart_in_player_and_chest() {
     drop(ch);
 
     world_rng::restore(old_rng);
-    *world().lock().unwrap_or_else(|e| e.into_inner()) = old_world;
+    world().restore_all(old_world);
     *clients().lock().unwrap_or_else(|e| e.into_inner()) = old_clients;
     *inv_store().lock().unwrap_or_else(|e| e.into_inner()) = old_inv;
     *chests().lock().unwrap_or_else(|e| e.into_inner()) = old_chests;
@@ -2677,7 +2668,7 @@ fn save_v2_releases_world_ownership_before_writing_and_keeps_previous_file_on_fa
         // A world transition must be able to run before the captured bytes
         // are flushed. Its edit belongs to the next save.
         assert!(SAVE_LOCK.try_lock().is_ok());
-        assert!(world().try_lock().is_ok());
+        assert!(world().try_write_all().is_some());
         set_block(2, 64, 3, 8);
         snapshot.write(&dir)
     })
@@ -2689,7 +2680,7 @@ fn save_v2_releases_world_ownership_before_writing_and_keeps_previous_file_on_fa
     assert_eq!(std::fs::read(&path).unwrap(), original);
     std::fs::remove_dir(&temp).unwrap();
 
-    world().lock().unwrap_or_else(|e| e.into_inner()).clear();
+    world().clear();
     load_world_in(&dir).unwrap();
     assert_eq!(overlay_block(2, 64, 3), Some(4));
     set_block(2, 64, 3, 8);
@@ -2699,7 +2690,7 @@ fn save_v2_releases_world_ownership_before_writing_and_keeps_previous_file_on_fa
         std::fs::read(dir.join(format!("{WORLD_FILE}.bak"))).unwrap(),
         original
     );
-    world().lock().unwrap_or_else(|e| e.into_inner()).clear();
+    world().clear();
     load_world_in(&dir).unwrap();
     assert_eq!(overlay_block(2, 64, 3), Some(8));
     std::fs::remove_dir_all(dir).unwrap();
@@ -2716,7 +2707,7 @@ fn save_v2_panics_abort_the_boundary_and_corruption_cannot_apply_the_new_state()
     save_world_into(&mut payload);
     let frame = full_state_frame(&payload);
     payload[frame.start..frame.start + 4].copy_from_slice(&f32::NAN.to_be_bytes());
-    world().lock().unwrap_or_else(|e| e.into_inner()).clear();
+    world().clear();
     assert_eq!(load_world_from(&payload), Err("non-finite save float"));
     assert_eq!(overlay_block(2, 64, 3), None);
     assert_eq!(saved_value(&WORLD_SPAWN_PITCH), 15.0);
@@ -2738,7 +2729,7 @@ fn save_v2_panics_abort_the_boundary_and_corruption_cannot_apply_the_new_state()
     save_world_guarded(|_| Ok(())).unwrap();
 
     assert!(thread::spawn(|| {
-        let _world = world().lock().unwrap_or_else(|e| e.into_inner());
+        let _world = world().write_all();
         panic!("loader fixture");
     })
     .join()
@@ -2754,21 +2745,18 @@ fn save_v2_rejects_a_truncated_companion_before_publishing_any_of_its_edits() {
         return;
     }
     let mut payload = Vec::new();
-    world()
-        .lock()
-        .unwrap()
-        .insert((DimId::Nether, 0, 0), [(3, 501)].into());
+    world().insert((DimId::Nether, 0, 0), [(3, 501)].into());
     assert_eq!(save_dim_overlay_into(DimId::Nether, &mut payload), 1);
-    world().lock().unwrap_or_else(|e| e.into_inner()).clear();
+    world().clear();
     for cut in 0..payload.len() {
         assert!(
             load_dim_overlay_from(DimId::Nether, &payload[..cut]).is_err(),
             "cut={cut}"
         );
-        assert!(world().lock().unwrap_or_else(|e| e.into_inner()).is_empty());
+        assert!(world().is_empty());
     }
     load_dim_overlay_from(DimId::Nether, &payload).unwrap();
-    assert_eq!(world().lock().unwrap_or_else(|e| e.into_inner())[&(DimId::Nether, 0, 0)][&3], 501);
+    assert_eq!(world().read(&(DimId::Nether, 0, 0))[&(DimId::Nether, 0, 0)][&3], 501);
 }
 
 #[cfg(megu_vanilla_data)]
@@ -2779,7 +2767,7 @@ fn save_v2_live_block_entities_round_trip_all_families() {
         return;
     }
     let _world_guard = world_guard();
-    let old_world = std::mem::take(&mut *world().lock().unwrap_or_else(|e| e.into_inner()));
+    let old_world = world().take_all();
     let old_store = std::mem::take(&mut *live_block_entities().lock().unwrap_or_else(|e| e.into_inner()));
     let old_drops = std::mem::take(&mut *drops().lock().unwrap_or_else(|e| e.into_inner()));
     let old_rng = world_rng::saved_state();
@@ -2866,7 +2854,7 @@ fn save_v2_live_block_entities_round_trip_all_families() {
         })
         .collect();
 
-    *world().lock().unwrap_or_else(|e| e.into_inner()) = old_world;
+    world().restore_all(old_world);
     *live_block_entities().lock().unwrap_or_else(|e| e.into_inner()) = old_store;
     *drops().lock().unwrap_or_else(|e| e.into_inner()) = old_drops;
     world_rng::restore(old_rng);

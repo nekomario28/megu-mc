@@ -2678,7 +2678,7 @@ fn live_golem_formation_tick(tick: u64) {
     let Some(reg) = crate::block_registry::breg() else { return };
     let clients = client_snapshot();
     let mut candidates = HashSet::new();
-    let overlay = world().lock().unwrap_or_else(|e| e.into_inner());
+    let overlay = world().read_all();
     for client in clients.iter().filter(|c| !c.is_spectator()) {
         let (dim, x, y, z, ..) = client_dim_pos(client);
         let (cx, cy, cz) = (x.floor() as i32, y.floor() as i32, z.floor() as i32);

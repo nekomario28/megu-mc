@@ -522,14 +522,14 @@ mod entity_collision_tests {
     impl TestWorldSnapshot {
         fn take() -> Self {
             Self {
-                world: std::mem::take(&mut *world().lock().unwrap_or_else(|e| e.into_inner())),
+                world: world().take_all(),
             }
         }
     }
 
     impl std::ops::Drop for TestWorldSnapshot {
         fn drop(&mut self) {
-            *world().lock().unwrap_or_else(|e| e.into_inner()) = std::mem::take(&mut self.world);
+            world().restore_all(std::mem::take(&mut self.world));
         }
     }
 

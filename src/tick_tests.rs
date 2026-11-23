@@ -370,7 +370,7 @@ fn gp2_mismatched_mob_dimension_footer_does_not_apply_overlay() {
         load_world_from(&payload),
         Err("mob dimension count does not match mob records")
     );
-    assert!(!world().lock().unwrap_or_else(|e| e.into_inner()).contains_key(&chunk));
+    assert!(!world().contains_key(&chunk));
 }
 
 #[cfg(megu_vanilla_data)]
@@ -769,7 +769,7 @@ struct WorldSnapshot {
 impl WorldSnapshot {
     fn take() -> WorldSnapshot {
         WorldSnapshot {
-            world: std::mem::take(&mut *world().lock().unwrap_or_else(|e| e.into_inner())),
+            world: world().take_all(),
             falling: std::mem::take(&mut *falling().lock().unwrap_or_else(|e| e.into_inner())),
             drops: std::mem::take(&mut *drops().lock().unwrap_or_else(|e| e.into_inner())),
             clients: std::mem::take(&mut *clients().lock().unwrap_or_else(|e| e.into_inner())),
@@ -798,7 +798,7 @@ impl std::ops::Drop for WorldSnapshot {
         // Poison-tolerant: an assertion that fails while holding one of these mutexes poisons it, and
         // `unwrap()` here would panic inside a destructor -- a double panic aborts the whole test
         // binary and skips the restore, the opposite of what this guard is for.
-        *world().lock().unwrap_or_else(|e| e.into_inner()) = std::mem::take(&mut self.world);
+        world().restore_all(std::mem::take(&mut self.world));
         *falling().lock().unwrap_or_else(|e| e.into_inner()) = std::mem::take(&mut self.falling);
         *drops().lock().unwrap_or_else(|e| e.into_inner()) = std::mem::take(&mut self.drops);
         *clients().lock().unwrap_or_else(|e| e.into_inner()) = std::mem::take(&mut self.clients);
@@ -999,7 +999,7 @@ fn waterlogged_source_flows_on_fifth_game_tick_without_replacing_its_block() {
     {
         // Explicit closed chamber, so FluidReader never silently consults
         // unspecified generated terrain as a fixture input.
-        let mut world = world().lock().unwrap_or_else(|e| e.into_inner());
+        let mut world = world().write(&(DimId::Overworld, 0, 0));
         let chunk = world.entry((DimId::Overworld, 0, 0)).or_default();
         for y in 210..=212 {
             for z in 2..=10 {
@@ -1113,7 +1113,7 @@ fn fluid_reader_classifies_waterloggable_washaway_and_solid_cells() {
     {
         // A closed stone chamber, so a classification never silently
         // consults unspecified generated terrain as a fixture input.
-        let mut world = world().lock().unwrap_or_else(|e| e.into_inner());
+        let mut world = world().write(&(DimId::Overworld, 12, 12));
         let chunk = world.entry((DimId::Overworld, 12, 12)).or_default();
         for y in 200..=204 {
             for z in 200..=204 {
@@ -1125,8 +1125,7 @@ fn fluid_reader_classifies_waterloggable_washaway_and_solid_cells() {
     }
     let cell_at = |pos: BlockPos, state: u32| {
         world()
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
+            .write(&(DimId::Overworld, pos.0 >> 4, pos.2 >> 4))
             .entry((DimId::Overworld, pos.0 >> 4, pos.2 >> 4))
             .or_default()
             .insert(local_idx(pos.0, pos.1, pos.2), state);
@@ -1294,7 +1293,7 @@ fn world_mechanisms_generated_fluids_cross_chunk_borders_on_their_tick_deadlines
         let source = (origin_x, 217, 5);
         let target = (origin_x + 1, 217, 5);
         {
-            let mut chunks = world().lock().unwrap_or_else(|e| e.into_inner());
+            let mut chunks = world().write_all();
             chunks.clear();
             for x in origin_x - 3..=origin_x + 4 {
                 for z in 2i32..=8 {
@@ -2338,6 +2337,208 @@ fn region_membership_matches_hot_plus_skirt_across_input_changes() {
 }
 
 #[test]
+fn refresh_hot_skips_rebuild_while_inputs_are_unchanged() {
+    let _world_guard = world_guard();
+    let old_clients = std::mem::take(&mut *clients().lock().unwrap_or_else(|e| e.into_inner()));
+    let old_actors = std::mem::take(&mut *actors().lock().unwrap_or_else(|e| e.into_inner()));
+    let old_forced = std::mem::take(&mut *forceloaded().lock().unwrap_or_else(|e| e.into_inner()));
+    let (old_hot, old_warm) = test_region();
+    // `set_test_region` invalidates the stored signature, so the first refresh
+    // after it must rebuild — that is the baseline the skip is measured from.
+    set_test_region(old_hot.clone(), old_warm.clone());
+
+    HOT_REBUILDS.store(0, Ordering::Relaxed);
+    refresh_hot();
+    assert_eq!(HOT_REBUILDS.load(Ordering::Relaxed), 1, "an invalidated signature rebuilds once");
+    refresh_hot();
+    refresh_hot();
+    assert_eq!(
+        HOT_REBUILDS.load(Ordering::Relaxed),
+        1,
+        "idle ticks with unchanged chunks, forceloads and radius skip the rebuild"
+    );
+
+    actors().lock().unwrap_or_else(|e| e.into_inner()).insert(
+        "mover".into(),
+        Arc::new(Actor {
+            name: "mover".into(),
+            eid: 4242,
+            pos: Mutex::new((0.5, 70.0, 0.5)),
+            look: Mutex::new(None),
+            action: Mutex::new(""),
+            held: Mutex::new((0, 0, Vec::new())),
+            inv: Mutex::new(HashMap::new()),
+        }),
+    );
+    refresh_hot();
+    assert_eq!(
+        HOT_REBUILDS.load(Ordering::Relaxed),
+        2,
+        "a new observer chunk triggers exactly one rebuild"
+    );
+    refresh_hot();
+    assert_eq!(HOT_REBUILDS.load(Ordering::Relaxed), 2, "still idle after the join");
+
+    // A move inside the same chunk is not a signature change; crossing the
+    // boundary at x=16 is.
+    *actors().lock().unwrap_or_else(|e| e.into_inner())["mover"]
+        .pos.lock().unwrap_or_else(|e| e.into_inner()) = (8.5, 70.0, 8.5);
+    refresh_hot();
+    assert_eq!(
+        HOT_REBUILDS.load(Ordering::Relaxed),
+        2,
+        "a move within the same chunk does not rebuild"
+    );
+    *actors().lock().unwrap_or_else(|e| e.into_inner())["mover"]
+        .pos.lock().unwrap_or_else(|e| e.into_inner()) = (16.5, 70.0, 0.5);
+    refresh_hot();
+    assert_eq!(
+        HOT_REBUILDS.load(Ordering::Relaxed),
+        3,
+        "crossing a chunk boundary rebuilds immediately"
+    );
+
+    forceloaded().lock().unwrap_or_else(|e| e.into_inner()).insert((9, -9));
+    refresh_hot();
+    assert_eq!(
+        HOT_REBUILDS.load(Ordering::Relaxed),
+        4,
+        "a new forceloaded chunk rebuilds immediately"
+    );
+    forceloaded().lock().unwrap_or_else(|e| e.into_inner()).remove(&(9, -9));
+    refresh_hot();
+    assert_eq!(
+        HOT_REBUILDS.load(Ordering::Relaxed),
+        5,
+        "releasing a forceloaded chunk rebuilds immediately"
+    );
+
+    *clients().lock().unwrap_or_else(|e| e.into_inner()) = old_clients;
+    *actors().lock().unwrap_or_else(|e| e.into_inner()) = old_actors;
+    *forceloaded().lock().unwrap_or_else(|e| e.into_inner()) = old_forced;
+    set_test_region(old_hot, old_warm);
+}
+
+#[test]
+fn sharded_world_read_write_parity_across_dimensions_and_chunk_edges() {
+    let _world_guard = world_guard();
+    let saved = world().take_all();
+    world().clear();
+
+    // Same cell in three dimensions, plus cells straddling every chunk edge:
+    // (0,0,0) and (-1,*,*) sit in different chunks, as do (15,*) and (16,*).
+    let stone = 42u32;
+    for (dim, x, y, z) in [
+        (DimId::Overworld, 0, 70, 0),
+        (DimId::Nether, 0, 70, 0),
+        (DimId::End, 0, 70, 0),
+        (DimId::Overworld, -1, 70, 0),
+        (DimId::Overworld, 15, 70, 15),
+        (DimId::Overworld, 16, 70, 16),
+        (DimId::Nether, -1, 70, -1),
+    ] {
+        let key = (dim, x >> 4, z >> 4);
+        world()
+            .write(&key)
+            .entry(key)
+            .or_default()
+            .insert(local_idx(x, y, z), stone + y as u32);
+    }
+    // Read-after-write through the same per-shard readers `overlay_block_dim`
+    // uses: every key answers only its own cells.
+    for (dim, x, y, z) in [
+        (DimId::Overworld, 0, 70, 0),
+        (DimId::Nether, 0, 70, 0),
+        (DimId::End, 0, 70, 0),
+        (DimId::Overworld, -1, 70, 0),
+        (DimId::Overworld, 15, 70, 15),
+        (DimId::Overworld, 16, 70, 16),
+        (DimId::Nether, -1, 70, -1),
+    ] {
+        let key = (dim, x >> 4, z >> 4);
+        assert_eq!(
+            world().read(&key).get(&key).and_then(|c| c.get(&local_idx(x, y, z))).copied(),
+            Some(stone + y as u32),
+            "{dim:?} ({x},{y},{z})"
+        );
+        assert_eq!(overlay_block_dim(dim, x, y, z), Some(stone + y as u32));
+    }
+    // Edge cells stay in their own chunk: x=-1 must not leak into chunk (0,0),
+    // and the Nether's (-1,-1) must not leak into the Overworld's.
+    assert!(
+        !world()
+            .read(&(DimId::Overworld, 0, 0))
+            .get(&(DimId::Overworld, 0, 0))
+            .is_some_and(|c| c.contains_key(&local_idx(-1, 70, 0))),
+        "x=-1 lives in chunk (-1,0), not (0,0)"
+    );
+    assert!(!world().contains_key(&(DimId::Overworld, -1, -1)));
+    assert_eq!(world().len(), 6, "only the six distinct chunk keys exist");
+    let whole = world().snapshot();
+    assert_eq!(whole.len(), 6);
+    world().restore_all(saved);
+}
+
+#[test]
+fn sharded_world_concurrent_readers_writers_no_races_no_deadlock() {
+    let _world_guard = world_guard();
+    let saved = world().take_all();
+    world().clear();
+
+    const LANES: i32 = 8;
+    const ITERS: i32 = 64;
+    let mut handles = Vec::new();
+    // Writers: each owns a stripe of chunks, so every write lands on a
+    // different shard lane than most of the others.
+    for lane in 0..LANES {
+        handles.push(std::thread::spawn(move || {
+            for i in 0..ITERS {
+                let key = (DimId::Overworld, lane * 4, i);
+                world()
+                    .write(&key)
+                    .entry(key)
+                    .or_default()
+                    .insert(i as u32, (lane * 1000 + i) as u32);
+                assert_eq!(
+                    world().read(&key).get(&key).and_then(|c| c.get(&(i as u32))).copied(),
+                    Some((lane * 1000 + i) as u32),
+                    "read-after-write on the writer's own chunk"
+                );
+            }
+        }));
+    }
+    // Readers: shared read locks on per-key shards plus whole-map reads that
+    // take every shard in index order — the deadlock-shape the ordering rule
+    // exists for.
+    for lane in 0..LANES {
+        handles.push(std::thread::spawn(move || {
+            for i in 0..ITERS {
+                let key = (DimId::Overworld, lane * 4, i);
+                let _ = world().read(&key).get(&key).map(HashMap::len);
+                let _ = world().len();
+                let _ = world().snapshot();
+            }
+        }));
+    }
+    for handle in handles {
+        handle.join().expect("no panic and no deadlock");
+    }
+
+    // Every writer's last write to each of its chunks survived.
+    for lane in 0..LANES {
+        for i in 0..ITERS {
+            let key = (DimId::Overworld, lane * 4, i);
+            assert_eq!(
+                world().read(&key).get(&key).and_then(|c| c.get(&(i as u32))).copied(),
+                Some((lane * 1000 + i) as u32),
+                "lane {lane} iter {i}"
+            );
+        }
+    }
+    world().restore_all(saved);
+}
+
+#[test]
 fn cadence_owner_keeps_world_clock_at_vanilla_rate() {
     let _world_guard = world_guard();
     let _snapshot = WorldSnapshot::take();
@@ -3202,7 +3403,7 @@ fn water_spread_trace_is_stable_across_the_scheduler_migration() {
     for _ in 0..40 {
         game_tick(|_, tick| tick());
         let mut cells: Vec<(i32, i32, i32, u32)> = {
-            let w = world().lock().unwrap_or_else(|e| e.into_inner());
+            let w = world().read_all();
             let mut v = Vec::new();
             for (&(_dim, cx, cz), c) in w.iter() {
                 for (idx, st) in c.iter() {
@@ -4243,7 +4444,7 @@ fn a_save_concurrent_with_falling_conserves_every_block() {
     let saved = snapshots_store.lock().unwrap_or_else(|e| e.into_inner()).clone();
     assert!(!saved.is_empty(), "the saver stored a snapshot");
     for (i, snap) in saved.iter().enumerate() {
-        world().lock().unwrap_or_else(|e| e.into_inner()).clear();
+        world().clear();
         falling().lock().unwrap_or_else(|e| e.into_inner()).clear();
         drops().lock().unwrap_or_else(|e| e.into_inner()).clear();
         load_world_from(snap).unwrap();
@@ -4373,7 +4574,7 @@ fn a_saved_below_world_drop_is_not_duplicated() {
     let saved = snapshots_store.lock().unwrap_or_else(|e| e.into_inner()).clone();
     assert!(!saved.is_empty(), "the saver stored a snapshot");
     for (i, snap) in saved.iter().enumerate() {
-        world().lock().unwrap_or_else(|e| e.into_inner()).clear();
+        world().clear();
         falling().lock().unwrap_or_else(|e| e.into_inner()).clear();
         drops().lock().unwrap_or_else(|e| e.into_inner()).clear();
         load_world_from(snap).unwrap();
@@ -4757,7 +4958,7 @@ fn placing_unsupported_sand_queues_air_not_a_ghost() {
     let _snap = WorldSnapshot::take();
     let old_falling = std::mem::take(&mut *falling().lock().unwrap_or_else(|e| e.into_inner()));
     let old_forced = std::mem::take(&mut *forceloaded().lock().unwrap_or_else(|e| e.into_inner()));
-    let old_world = world().lock().unwrap_or_else(|e| e.into_inner()).clone();
+    let old_world = world().snapshot();
     pending_blocks().lock().unwrap_or_else(|e| e.into_inner()).clear();
     let (oh, ow) = test_region();
     let mut warm = ow.clone();
@@ -4787,7 +4988,7 @@ fn placing_unsupported_sand_queues_air_not_a_ghost() {
     for (yy, st) in original {
         set_block(x, yy, z, st);
     }
-    *world().lock().unwrap_or_else(|e| e.into_inner()) = old_world;
+    world().restore_all(old_world);
     *falling().lock().unwrap_or_else(|e| e.into_inner()) = old_falling;
     *forceloaded().lock().unwrap_or_else(|e| e.into_inner()) = old_forced;
     set_test_region(oh, ow);
@@ -4937,7 +5138,7 @@ fn a_broken_chest_leaves_no_orphan_entry_across_a_save_and_load() {
     );
     let mut payload = Vec::new();
     save_world_into(&mut payload);
-    world().lock().unwrap_or_else(|e| e.into_inner()).clear();
+    world().clear();
     chests().lock().unwrap_or_else(|e| e.into_inner()).clear();
     drops().lock().unwrap_or_else(|e| e.into_inner()).clear();
     load_world_from(&payload).unwrap();
@@ -5101,7 +5302,7 @@ fn a_support_placed_under_a_falling_entity_is_landed_on() {
         let _save = SAVE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         save_world_into(&mut buf);
     }
-    world().lock().unwrap_or_else(|e| e.into_inner()).clear();
+    world().clear();
     falling().lock().unwrap_or_else(|e| e.into_inner()).clear();
     drops().lock().unwrap_or_else(|e| e.into_inner()).clear();
     load_world_from(&buf).unwrap();
@@ -5142,7 +5343,7 @@ fn a_knockout_and_a_save_in_the_same_tick_conserve_the_block() {
     let stone = name_to_state("stone").expect("stone must exist");
     let (x, z, base, height) = (5, 5, 150, 3);
     for _ in 0..4 {
-        world().lock().unwrap_or_else(|e| e.into_inner()).clear();
+        world().clear();
         falling().lock().unwrap_or_else(|e| e.into_inner()).clear();
         drops().lock().unwrap_or_else(|e| e.into_inner()).clear();
         for y in base - 1..=base + height + 4 {
@@ -5166,7 +5367,7 @@ fn a_knockout_and_a_save_in_the_same_tick_conserve_the_block() {
             let _save = SAVE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
             save_world_into(&mut buf);
         }
-        world().lock().unwrap_or_else(|e| e.into_inner()).clear();
+        world().clear();
         falling().lock().unwrap_or_else(|e| e.into_inner()).clear();
         drops().lock().unwrap_or_else(|e| e.into_inner()).clear();
         load_world_from(&buf).unwrap();
@@ -5317,7 +5518,7 @@ fn a_save_during_entity_conversion_has_no_duplicate_drop() {
         save_world_into(&mut after);
     }
     for (name, snap) in [("mid-flight", &mid), ("after conversion", &after)] {
-        world().lock().unwrap_or_else(|e| e.into_inner()).clear();
+        world().clear();
         falling().lock().unwrap_or_else(|e| e.into_inner()).clear();
         drops().lock().unwrap_or_else(|e| e.into_inner()).clear();
         load_world_from(snap).unwrap();
@@ -5906,7 +6107,7 @@ fn gp2_nightly_placement_respects_support_and_entity_collision() {
     let mut failures = Vec::new();
     for (name, seed, changes, expected) in cases {
         {
-            let mut world = world().lock().unwrap_or_else(|e| e.into_inner());
+            let mut world = world().write_all();
             for (dx, y, state) in platform.into_iter().chain(changes.iter().copied()) {
                 let bx = x + dx;
                 world
@@ -6785,7 +6986,7 @@ fn a_saved_snapshot_never_holds_an_unbooked_gravity_block() {
     let reg = crate::block_registry::breg().unwrap();
     let snapshots = snaps.lock().unwrap_or_else(|e| e.into_inner()).clone();
     for (i, snap) in snapshots.iter().enumerate() {
-        world().lock().unwrap_or_else(|e| e.into_inner()).clear();
+        world().clear();
         falling().lock().unwrap_or_else(|e| e.into_inner()).clear();
         drops().lock().unwrap_or_else(|e| e.into_inner()).clear();
         *block_ticks().lock().unwrap_or_else(|e| e.into_inner()) = scheduled_ticks::ScheduledTicks::new();
@@ -6798,8 +6999,7 @@ fn a_saved_snapshot_never_holds_an_unbooked_gravity_block() {
             .map(|t| t.pos)
             .collect();
         let cells: Vec<_> = world()
-            .lock()
-            .unwrap()
+            .read_all()
             .iter()
             .flat_map(|(&(_dim, cx, cz), cells)| {
                 cells.iter().map(move |(&idx, &st)| {
@@ -7421,7 +7621,7 @@ fn chest_pairing_states_and_contents_survive_a_save_and_load() {
     }
     let mut payload = Vec::new();
     save_world_into(&mut payload);
-    world().lock().unwrap_or_else(|e| e.into_inner()).clear();
+    world().clear();
     chests().lock().unwrap_or_else(|e| e.into_inner()).clear();
     drops().lock().unwrap_or_else(|e| e.into_inner()).clear();
     load_world_from(&payload).unwrap();
@@ -8077,7 +8277,7 @@ fn the_tick_preserves_the_saved_world_payload_byte_for_byte() {
         );
         let mut payload = Vec::new();
         save_world_into(&mut payload);
-        let overlay = world().lock().unwrap_or_else(|e| e.into_inner()).len();
+        let overlay = world().len();
         let mut state: Vec<String> = Vec::new();
         for x in xps().lock().unwrap_or_else(|e| e.into_inner()).iter() {
             state.push(format!("orb {} {} {} {} {} {}", x.eid, x.x, x.y, x.z, x.val, x.age));
@@ -8466,7 +8666,7 @@ fn chest_contract_3d_waterlogged_double_chest_schedules_and_spreads_without_dry_
 
     // Build an enclosed chamber inside chunk (6, 3) around (100, 170, 56).
     {
-        let mut w = world().lock().unwrap_or_else(|e| e.into_inner());
+        let mut w = world().write(&(DimId::Overworld, 6, 3));
         let chunk = w.entry((DimId::Overworld, 6, 3)).or_default();
         for y in 169..=171 {
             for z in 54..=59 {
@@ -8720,7 +8920,7 @@ struct Travel4dWorld {
 impl Travel4dWorld {
     fn take() -> Self {
         Self {
-            world: std::mem::take(&mut *world().lock().unwrap_or_else(|e| e.into_inner())),
+            world: world().take_all(),
             mobs: std::mem::take(&mut *mobs().lock().unwrap_or_else(|e| e.into_inner())),
             region: std::mem::take(&mut *region().lock().unwrap_or_else(|e| e.into_inner())),
             clients: std::mem::take(&mut *clients().lock().unwrap_or_else(|e| e.into_inner())),
@@ -8739,7 +8939,7 @@ impl std::ops::Drop for Travel4dWorld {
         *clients().lock().unwrap_or_else(|e| e.into_inner()) = std::mem::take(&mut self.clients);
         *region().lock().unwrap_or_else(|e| e.into_inner()) = std::mem::take(&mut self.region);
         *mobs().lock().unwrap_or_else(|e| e.into_inner()) = std::mem::take(&mut self.mobs);
-        *world().lock().unwrap_or_else(|e| e.into_inner()) = std::mem::take(&mut self.world);
+        world().restore_all(std::mem::take(&mut self.world));
     }
 }
 
@@ -9700,17 +9900,15 @@ fn p2_3_s3_nether_and_end_block_light_anchors_at_light_min_y_minus_16() {
     assert!(worldgen::init_dim(DimId::End, 0, crate::name_to_state));
     let glowstone = name_to_state("glowstone").expect("glowstone in the pinned registry");
     let ow_band_keys = op_bands()
-        .lock()
-        .unwrap()
         .map
         .keys()
+        .iter()
         .filter(|k| k.0 == DimId::Overworld)
         .count();
     let ow_section_keys = section_store()
-        .lock()
-        .unwrap()
         .map
         .keys()
+        .iter()
         .filter(|k| k.0 == DimId::Overworld)
         .count();
 
@@ -9765,10 +9963,9 @@ fn p2_3_s3_nether_and_end_block_light_anchors_at_light_min_y_minus_16() {
     }
     assert_eq!(
         op_bands()
-            .lock()
-            .unwrap()
             .map
             .keys()
+            .iter()
             .filter(|k| k.0 == DimId::Overworld)
             .count(),
         ow_band_keys,
@@ -9776,10 +9973,9 @@ fn p2_3_s3_nether_and_end_block_light_anchors_at_light_min_y_minus_16() {
     );
     assert_eq!(
         section_store()
-            .lock()
-            .unwrap()
             .map
             .keys()
+            .iter()
             .filter(|k| k.0 == DimId::Overworld)
             .count(),
         ow_section_keys,
@@ -9849,15 +10045,18 @@ fn p2_3_s3_chunk_caches_isolate_dimensions_on_same_coords() {
     assert_eq!(opacity_windowed_dim(DimId::Overworld, x, y, z), 15);
     assert_eq!(opacity_windowed_dim(DimId::End, x, y, z), 0);
 
-    let store = section_store().lock().unwrap_or_else(|e| e.into_inner());
+    let store = section_store();
     for (dim, sections) in [
         (DimId::Overworld, 24),
         (DimId::Nether, 16),
         (DimId::End, 16),
     ] {
+        let key = (dim, 0, 0);
         let slots = store
             .map
-            .get(&(dim, 0, 0))
+            .read(&key)
+            .get(&key)
+            .cloned()
             .unwrap_or_else(|| panic!("{dim:?}: no section store slot at (0,0)"));
         assert_eq!(slots.len(), sections, "{dim:?}: section store window");
     }
@@ -10429,7 +10628,7 @@ fn mob_tick_observables() -> Vec<MobObs> {
 
 fn world_overlay_observables() -> Vec<(DimChunkKey, u32, u32)> {
     let mut out = Vec::new();
-    for (key, cells) in world().lock().unwrap_or_else(|e| e.into_inner()).iter() {
+    for (key, cells) in world().read_all().iter() {
         for (cell, state) in cells {
             out.push((*key, *cell, *state));
         }

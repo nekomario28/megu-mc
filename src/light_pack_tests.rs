@@ -224,7 +224,7 @@ fn update_light_packet_sends_block_light_only() {
 fn a_removed_generated_emitter_stops_lighting() {
     crate::test_support::require_vanilla_data();
     let _g = world_guard();
-    let old_world = world().lock().unwrap_or_else(|e| e.into_inner()).clone();
+    let old_world = world().snapshot();
     let mut gen = GenSources::new();
     gen.insert((0, 0), vec![((5, 70, 7), 15)]);
     let nib = |secs: &[[u8; 2048]], y: i32, lx: usize, lz: usize| -> u8 {
@@ -241,8 +241,7 @@ fn a_removed_generated_emitter_stops_lighting() {
     assert_eq!(nib(&lit, 70, 5, 7), 15, "the generated emitter lights");
     // The player breaks it: an explicit air override at the cell, as set_block records.
     world()
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
+        .write(&(DimId::Overworld, 0, 0))
         .entry((DimId::Overworld, 0, 0))
         .or_default()
         .insert(local_idx(5, 70, 7), 0);
@@ -254,8 +253,7 @@ fn a_removed_generated_emitter_stops_lighting() {
     );
     // Removing the edit re-exposes the cached generated emitter, which must light again.
     world()
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
+        .write(&(DimId::Overworld, 0, 0))
         .entry((DimId::Overworld, 0, 0))
         .or_default()
         .remove(&local_idx(5, 70, 7));
@@ -265,5 +263,5 @@ fn a_removed_generated_emitter_stops_lighting() {
         15,
         "removing the overlay re-exposes the generated emitter"
     );
-    *world().lock().unwrap_or_else(|e| e.into_inner()) = old_world;
+    world().restore_all(old_world);
 }

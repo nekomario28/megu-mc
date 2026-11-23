@@ -20982,7 +20982,7 @@ mod p8a_parity_protocol_tests {
             let key = (dim, x >> 4, z >> 4);
             let cell = local_idx(x, y, z);
             let prev = {
-                let mut w = world().lock().unwrap_or_else(|e| e.into_inner());
+                let mut w = world().write(&key);
                 let chunk = w.entry(key).or_default();
                 let prev = chunk.get(&cell).copied();
                 chunk.insert(cell, st);
@@ -20993,7 +20993,7 @@ mod p8a_parity_protocol_tests {
     }
     impl std::ops::Drop for DimCells {
         fn drop(&mut self) {
-            let mut w = world().lock().unwrap_or_else(|e| e.into_inner());
+            let mut w = world().write_all();
             for (dim, x, y, z, prev) in self.0.drain(..).rev() {
                 if let Some(chunk) = w.get_mut(&(dim, x >> 4, z >> 4)) {
                     match prev {
@@ -21406,7 +21406,7 @@ mod bot_net2_tests {
                         .lock()
                         .unwrap_or_else(|e| e.into_inner()),
                 ),
-                world: std::mem::take(&mut *world().lock().unwrap_or_else(|e| e.into_inner())),
+                world: world().take_all(),
                 region: std::mem::take(
                     &mut *region().lock().unwrap_or_else(|e| e.into_inner()),
                 ),
@@ -21442,8 +21442,7 @@ mod bot_net2_tests {
             *live_mob_states()
                 .lock()
                 .unwrap_or_else(|e| e.into_inner()) = std::mem::take(&mut self.states);
-            *world().lock().unwrap_or_else(|e| e.into_inner()) =
-                std::mem::take(&mut self.world);
+            world().restore_all(std::mem::take(&mut self.world));
             *region().lock().unwrap_or_else(|e| e.into_inner()) =
                 std::mem::take(&mut self.region);
             *forceloaded()
@@ -21607,8 +21606,7 @@ mod bot_net2_tests {
         set_block_dim(DimId::Overworld, 800, 64, 800, stone); // chunk (50, 50)
         let overlay_len = || {
             world()
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
+                .read(&(DimId::Overworld, 50, 50))
                 .get(&(DimId::Overworld, 50, 50))
                 .map_or(0, |chunk| chunk.len())
         };

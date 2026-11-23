@@ -8,7 +8,7 @@ use crate::worldgen::DimId;
 use std::collections::{HashMap, HashSet};
 use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
-use std::sync::{Mutex, OnceLock};
+use std::sync::{Mutex, OnceLock, RwLock, RwLockReadGuard, RwLockWriteGuard};
 use std::thread;
 use std::time::{Duration, Instant};
 mod cached_lookup;
@@ -705,7 +705,7 @@ fn environment_time_tick() {
             mobs().lock().unwrap_or_else(|e| e.into_inner()).len(), drops().lock().unwrap_or_else(|e| e.into_inner()).len(), xps().lock().unwrap_or_else(|e| e.into_inner()).len(),
             arrows().lock().unwrap_or_else(|e| e.into_inner()).len(), bobbers().lock().unwrap_or_else(|e| e.into_inner()).len(), pearls().lock().unwrap_or_else(|e| e.into_inner()).len(),
             primed().lock().unwrap_or_else(|e| e.into_inner()).len(), chests().lock().unwrap_or_else(|e| e.into_inner()).len(), furnaces().lock().unwrap_or_else(|e| e.into_inner()).len(),
-            crops().lock().unwrap_or_else(|e| e.into_inner()).len(), world().lock().unwrap_or_else(|e| e.into_inner()).len(), inv_store().lock().unwrap_or_else(|e| e.into_inner()).len(),
+            crops().lock().unwrap_or_else(|e| e.into_inner()).len(), world().len(), inv_store().lock().unwrap_or_else(|e| e.into_inner()).len(),
             clients().lock().unwrap_or_else(|e| e.into_inner()).len());
     });
     // weather: occasional rain
@@ -2150,7 +2150,7 @@ impl spawner::ChunkGenerationWorld for LiveChunkGenWorld {
         };
         // An edited solid block above the generated surface is the standing
         // point, while foliage and partial vegetation do not hide the ground.
-        let world = timed_world();
+        let world = timed_world_read(&(self.dim, x >> 4, z >> 4));
         let reg = breg();
         world
             .get(&(self.dim, x >> 4, z >> 4))
@@ -6166,7 +6166,7 @@ fn live_mob_breed(mob: &Mob, mate: &Mob, dim: DimId, a: (f64, f64, f64), b: (f64
 
 // ---------- world ----------
 // overlay edits: (dim,cx,cz) -> { packed_local_idx -> blockstate }
-static WORLD: Registry<DimChunkKey, HashMap<u32, u32>> = OnceLock::new();
+static WORLD: OnceLock<ShardedChunks<HashMap<u32, u32>>> = OnceLock::new();
 /// Wait/hold split for the two locks the tick thread and the connection thread share.
 ///
 /// The tick profile put 10.8 ms of an 11.4 ms tick body in `environment`, a step that
@@ -6198,14 +6198,18 @@ pub(crate) mod lockprof {
 }
 
 /// A guard that records how long its acquisition waited and how long it was held.
-struct TimedGuard<T: 'static> {
-    guard: std::sync::MutexGuard<'static, T>,
+/// Lock-profiling wrapper over whatever guard a store hands out —
+/// `MutexGuard` for the single-lock registries, `RwLockReadGuard` for a
+/// world shard — so wait/hold accounting does not care which lock type the
+/// hot path is on.
+struct TimedGuard<G: std::ops::Deref + 'static> {
+    guard: G,
     waited: Option<u64>,
     held_since: Option<std::time::Instant>,
     which: u8, // 0 = world, 1 = region
 }
 
-impl<T: 'static> std::ops::Drop for TimedGuard<T> {
+impl<G: std::ops::Deref + 'static> std::ops::Drop for TimedGuard<G> {
     fn drop(&mut self) {
         use std::sync::atomic::Ordering;
         let (Some(waited), Some(since)) = (self.waited, self.held_since) else {
@@ -6224,22 +6228,24 @@ impl<T: 'static> std::ops::Drop for TimedGuard<T> {
     }
 }
 
-impl<T: 'static> std::ops::Deref for TimedGuard<T> {
-    type Target = T;
+impl<G: std::ops::Deref + 'static> std::ops::Deref for TimedGuard<G> {
+    type Target = G::Target;
     fn deref(&self) -> &Self::Target {
         &self.guard
     }
 }
-impl<T: 'static> std::ops::DerefMut for TimedGuard<T> {
+impl<G: std::ops::DerefMut + 'static> std::ops::DerefMut for TimedGuard<G> {
     fn deref_mut(&mut self) -> &mut Self::Target {
         &mut self.guard
     }
 }
 
-fn timed_world() -> TimedGuard<HashMap<DimChunkKey, HashMap<u32, u32>>> {
+fn timed_world_read(
+    key: &DimChunkKey,
+) -> TimedGuard<RwLockReadGuard<'static, HashMap<DimChunkKey, HashMap<u32, u32>>>> {
     let prof = lockprof::enabled();
     let t = prof.then(std::time::Instant::now);
-    let guard = world().lock().unwrap_or_else(|e| e.into_inner());
+    let guard = world().read(key);
     TimedGuard {
         guard,
         waited: t.map(|t| t.elapsed().as_nanos() as u64),
@@ -6248,7 +6254,302 @@ fn timed_world() -> TimedGuard<HashMap<DimChunkKey, HashMap<u32, u32>>> {
     }
 }
 
-fn timed_region() -> TimedGuard<Region> {
+/// Independent lock domains a `ShardedChunks` spreads its entries across.
+///
+/// 64 keeps the shard count a power of two (the index is a hash mask) while
+/// being far wider than any realistic concurrent-reader count: the tick
+/// thread, mob workers, connection threads, the light worker and the
+/// stream_gen committer almost never wait on the same domain.
+const MAP_SHARDS: usize = 64;
+
+/// One lock domain of a `ShardedChunks`.
+///
+/// `repr(align(128))` pads the shard so its lock word occupies a cache line of
+/// its own — 128 covers the 128-byte lines Apple Silicon uses, and a 64-byte
+/// x86 line still holds exactly one lock word. Without it, a write lock on
+/// one shard would invalidate the line a neighbouring shard's readers are
+/// hammering, re-creating the global-mutex contention the sharding removed.
+#[repr(align(128))]
+struct Shard<T> {
+    lock: RwLock<T>,
+}
+
+/// Shard index for a chunk key: a multiplicative mix of `(dim, cx, cz)` so
+/// adjacent chunks — the common neighbour scans — land on different locks.
+#[inline]
+fn chunk_shard_of(key: &DimChunkKey) -> usize {
+    let (dim, cx, cz) = *key;
+    let mut h = (cx as u32 as u64)
+        .wrapping_mul(0x9E37_79B9_7F4A_7C15)
+        .rotate_left(31)
+        ^ (cz as u32 as u64).wrapping_mul(0xC2B2_AE3D_27D4_EB4F)
+        ^ (dim.raw() as u64).wrapping_mul(0x1656_67B1_9E37_79F9);
+    h = h.wrapping_mul(0xFF51_AFD7_ED55_8CCD);
+    h ^= h >> 33;
+    (h as usize) & (MAP_SHARDS - 1)
+}
+
+/// Read guards over every shard, taken in index order.
+///
+/// This is the consistent whole-map view the old single `Mutex` gave callers
+/// that iterate or copy the world overlay: every shard stays readable, and a
+/// writer anywhere waits. Acquired in index order, and only ever *after* a
+/// caller that holds no shard locks, so it cannot deadlock against a per-key
+/// `read`/`write`.
+struct ShardsRead<'a, V> {
+    guards: [RwLockReadGuard<'a, HashMap<DimChunkKey, V>>; MAP_SHARDS],
+}
+
+impl<V> ShardsRead<'_, V> {
+    fn get(&self, key: &DimChunkKey) -> Option<&V> {
+        self.guards[chunk_shard_of(key)].get(key)
+    }
+    fn contains_key(&self, key: &DimChunkKey) -> bool {
+        self.get(key).is_some()
+    }
+    fn len(&self) -> usize {
+        self.guards.iter().map(|g| g.len()).sum()
+    }
+    fn is_empty(&self) -> bool {
+        self.guards.iter().all(|g| g.is_empty())
+    }
+    fn iter(&self) -> impl Iterator<Item = (&DimChunkKey, &V)> + '_ {
+        self.guards.iter().flat_map(|g| g.iter())
+    }
+    fn keys(&self) -> impl Iterator<Item = &DimChunkKey> + '_ {
+        self.guards.iter().flat_map(|g| g.keys())
+    }
+    /// Owned copy of the union — the `guard.clone()` analogue for the
+    /// whole-map view.
+    fn to_map(&self) -> HashMap<DimChunkKey, V>
+    where
+        V: Clone,
+    {
+        self.iter().map(|(k, v)| (*k, v.clone())).collect()
+    }
+}
+
+/// Write guards over every shard, taken in index order. The union view a
+/// whole-map mutation (bulk fixture write, snapshot restore) needs.
+struct ShardsWrite<'a, V> {
+    guards: [RwLockWriteGuard<'a, HashMap<DimChunkKey, V>>; MAP_SHARDS],
+}
+
+impl<V> ShardsWrite<'_, V> {
+    fn get(&self, key: &DimChunkKey) -> Option<&V> {
+        self.guards[chunk_shard_of(key)].get(key)
+    }
+    fn get_mut(&mut self, key: &DimChunkKey) -> Option<&mut V> {
+        self.guards[chunk_shard_of(key)].get_mut(key)
+    }
+    fn contains_key(&self, key: &DimChunkKey) -> bool {
+        self.get(key).is_some()
+    }
+    fn entry(
+        &mut self,
+        key: DimChunkKey,
+    ) -> std::collections::hash_map::Entry<'_, DimChunkKey, V> {
+        self.guards[chunk_shard_of(&key)].entry(key)
+    }
+    fn insert(&mut self, key: DimChunkKey, value: V) -> Option<V> {
+        self.guards[chunk_shard_of(&key)].insert(key, value)
+    }
+    fn remove(&mut self, key: &DimChunkKey) -> Option<V> {
+        self.guards[chunk_shard_of(&key)].remove(key)
+    }
+    fn len(&self) -> usize {
+        self.guards.iter().map(|g| g.len()).sum()
+    }
+    fn clear(&mut self) {
+        for g in self.guards.iter_mut() {
+            g.clear();
+        }
+    }
+    fn retain(&mut self, mut f: impl FnMut(&DimChunkKey, &mut V) -> bool) {
+        for g in self.guards.iter_mut() {
+            g.retain(&mut f);
+        }
+    }
+    fn iter(&self) -> impl Iterator<Item = (&DimChunkKey, &V)> + '_ {
+        self.guards.iter().flat_map(|g| g.iter())
+    }
+    fn keys(&self) -> impl Iterator<Item = &DimChunkKey> + '_ {
+        self.guards.iter().flat_map(|g| g.keys())
+    }
+    fn drain_into(&mut self, out: &mut HashMap<DimChunkKey, V>) {
+        for g in self.guards.iter_mut() {
+            out.extend(g.drain());
+        }
+    }
+    fn restore(&mut self, map: HashMap<DimChunkKey, V>) {
+        self.clear();
+        for (key, value) in map {
+            self.insert(key, value);
+        }
+    }
+}
+
+/// A `DimChunkKey`-keyed map whose entries live behind 64 independent
+/// `RwLock`s instead of one global `Mutex`.
+///
+/// A single-chunk `read`/`write` touches only the shard that owns the key, so
+/// concurrent readers of different chunks share read locks in parallel and a
+/// writer stalls only readers of *its* shard — the contention profile that
+/// the tick thread, mob workers, connection threads, the light worker and
+/// the stream_gen committer need on the per-cell block-read path. Whole-map
+/// consumers (`read_all`/`write_all` and the snapshot helpers) take every
+/// shard in index order, which preserves the serialised view the single
+/// mutex provided.
+struct ShardedChunks<V> {
+    shards: Box<[Shard<HashMap<DimChunkKey, V>>; MAP_SHARDS]>,
+}
+
+impl<V> ShardedChunks<V> {
+    fn new() -> Self {
+        Self {
+            shards: Box::new(std::array::from_fn(|_| Shard {
+                lock: RwLock::new(HashMap::new()),
+            })),
+        }
+    }
+
+    /// Shared read guard for the shard that owns `key`.
+    fn read(&self, key: &DimChunkKey) -> RwLockReadGuard<'_, HashMap<DimChunkKey, V>> {
+        self.shards[chunk_shard_of(key)]
+            .lock
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// Exclusive write guard for the shard that owns `key`.
+    fn write(&self, key: &DimChunkKey) -> RwLockWriteGuard<'_, HashMap<DimChunkKey, V>> {
+        self.shards[chunk_shard_of(key)]
+            .lock
+            .write()
+            .unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// Read-lock every shard, in index order, for a consistent whole-map view.
+    fn read_all(&self) -> ShardsRead<'_, V> {
+        ShardsRead {
+            guards: std::array::from_fn(|i| {
+                self.shards[i].lock.read().unwrap_or_else(|e| e.into_inner())
+            }),
+        }
+    }
+
+    /// Write-lock every shard, in index order, for a whole-map mutation.
+    fn write_all(&self) -> ShardsWrite<'_, V> {
+        ShardsWrite {
+            guards: std::array::from_fn(|i| {
+                self.shards[i].lock.write().unwrap_or_else(|e| e.into_inner())
+            }),
+        }
+    }
+
+    /// `Mutex::try_lock`'s whole-map analogue: `None` when any shard is
+    /// currently held, the guards otherwise. Acquired in index order and
+    /// released immediately on the first busy shard, so it cannot deadlock.
+    #[allow(dead_code)]
+    fn try_write_all(&self) -> Option<ShardsWrite<'_, V>> {
+        let mut guards: Vec<RwLockWriteGuard<'_, HashMap<DimChunkKey, V>>> =
+            Vec::with_capacity(MAP_SHARDS);
+        for shard in self.shards.iter() {
+            match shard.lock.try_write() {
+                Ok(guard) => guards.push(guard),
+                Err(_) => return None,
+            }
+        }
+        Some(ShardsWrite {
+            guards: guards.try_into().ok()?,
+        })
+    }
+
+    fn len(&self) -> usize {
+        self.shards
+            .iter()
+            .map(|s| s.lock.read().unwrap_or_else(|e| e.into_inner()).len())
+            .sum()
+    }
+
+    fn is_empty(&self) -> bool {
+        self.shards.iter().all(|s| {
+            s.lock
+                .read()
+                .unwrap_or_else(|e| e.into_inner())
+                .is_empty()
+        })
+    }
+
+    /// `HashMap::get` on one key, cloning the value out under a read lock.
+    fn get_cloned(&self, key: &DimChunkKey) -> Option<V>
+    where
+        V: Clone,
+    {
+        self.read(key).get(key).cloned()
+    }
+
+    fn contains_key(&self, key: &DimChunkKey) -> bool {
+        self.read(key).contains_key(key)
+    }
+
+    fn insert(&self, key: DimChunkKey, value: V) -> Option<V> {
+        self.write(&key).insert(key, value)
+    }
+
+    fn remove(&self, key: &DimChunkKey) -> Option<V> {
+        self.write(&key).remove(key)
+    }
+
+    /// Every key in the map, under per-shard read locks.
+    fn keys(&self) -> Vec<DimChunkKey> {
+        let mut out = Vec::new();
+        for s in self.shards.iter() {
+            out.extend(s.lock.read().unwrap_or_else(|e| e.into_inner()).keys());
+        }
+        out
+    }
+
+    /// An owned copy of the whole map, taken under one consistent read view.
+    fn snapshot(&self) -> HashMap<DimChunkKey, V>
+    where
+        V: Clone,
+    {
+        let all = self.read_all();
+        let mut out = HashMap::with_capacity(all.len());
+        out.extend(all.iter().map(|(k, v)| (*k, v.clone())));
+        out
+    }
+
+    /// `std::mem::take` on the whole map: drain every shard into one map.
+    fn take_all(&self) -> HashMap<DimChunkKey, V> {
+        let mut all = self.write_all();
+        let mut out = HashMap::with_capacity(all.len());
+        all.drain_into(&mut out);
+        out
+    }
+
+    /// Replace the whole map with `map` under write locks on every shard.
+    fn restore_all(&self, map: HashMap<DimChunkKey, V>) {
+        self.write_all().restore(map);
+    }
+
+    /// Remove every entry, under write locks on every shard.
+    fn clear(&self) {
+        self.write_all().clear();
+    }
+
+    /// Clear poison on every shard lock — `Mutex::clear_poison`'s
+    /// whole-store analogue for the tests that deliberately panic with a
+    /// guard held.
+    fn clear_poison(&self) {
+        for shard in self.shards.iter() {
+            shard.lock.clear_poison();
+        }
+    }
+}
+
+fn timed_region() -> TimedGuard<std::sync::MutexGuard<'static, Region>> {
     let prof = lockprof::enabled();
     let t = prof.then(std::time::Instant::now);
     let guard = region().lock().unwrap_or_else(|e| e.into_inner());
@@ -6260,8 +6561,8 @@ fn timed_region() -> TimedGuard<Region> {
     }
 }
 
-fn world() -> &'static LockedMap<DimChunkKey, HashMap<u32, u32>> {
-    WORLD.get_or_init(|| Mutex::new(HashMap::new()))
+fn world() -> &'static ShardedChunks<HashMap<u32, u32>> {
+    WORLD.get_or_init(ShardedChunks::new)
 }
 
 /// The Overworld's edits for one chunk, from a held `WORLD` guard.
@@ -6495,10 +6796,10 @@ fn materialize_generation_payloads_inner(
                 // The one-shot flag cannot reconstruct this block after cache
                 // eviction. Preserve it in the world, but never undo a user edit.
                 let state = name_to_state("spawner").unwrap();
+                let key = (DimId::Overworld, pos.0 >> 4, pos.2 >> 4);
                 let actual = *world()
-                    .lock()
-                    .unwrap()
-                    .entry((DimId::Overworld, pos.0 >> 4, pos.2 >> 4))
+                    .write(&key)
+                    .entry(key)
                     .or_default()
                     .entry(local_idx(pos.0, pos.1, pos.2))
                     .or_insert(state);
@@ -6513,10 +6814,10 @@ fn materialize_generation_payloads_inner(
             }
             crate::generation_payload::GenerationPayload::SpawnerEntity(entity_id) => {
                 let state = name_to_state("spawner").unwrap();
+                let key = (DimId::Overworld, pos.0 >> 4, pos.2 >> 4);
                 let actual = *world()
-                    .lock()
-                    .unwrap()
-                    .entry((DimId::Overworld, pos.0 >> 4, pos.2 >> 4))
+                    .write(&key)
+                    .entry(key)
                     .or_default()
                     .entry(local_idx(pos.0, pos.1, pos.2))
                     .or_insert(state);
@@ -7828,10 +8129,28 @@ fn refresh_hidden_neighbors_dim(dim: DimId, x: i32, y: i32, z: i32) {
 /// cost. And no caller can observe the region changing between two membership
 /// tests inside one tick, because only `refresh_hot` writes it and it runs
 /// first.
+/// The inputs `refresh_hot` last built `hot`/`warm` from: the forceloaded
+/// chunk set, every observer's chunk coordinate, and the load-scaled warm
+/// radius. An unchanged signature means the rebuild would produce the two
+/// sets the `Region` already holds, so it is skipped: identical output with
+/// no expansion work. The signature is the inputs themselves — exact set
+/// equality, not a hash — so a player crossing a chunk boundary or a
+/// forceload change can never collide into a skipped rebuild.
+#[derive(Clone, PartialEq, Eq)]
+struct HotSig {
+    forced: HashSet<(i32, i32)>,
+    centers: HashSet<(i32, i32)>,
+    warm_radius: i32,
+}
+
 #[derive(Default)]
 pub struct Region {
     hot: HashSet<(i32, i32)>,
     warm: HashSet<(i32, i32)>,
+    /// `None` until the first `refresh_hot`, and reset to `None` by every
+    /// path that writes `hot`/`warm` directly (test fixtures, diagnostics):
+    /// the next refresh must rebuild rather than trust the stored signature.
+    sig: Option<HotSig>,
 }
 impl Region {
     fn is_hot(&self, x: i32, z: i32) -> bool {
@@ -7847,7 +8166,7 @@ fn region() -> &'static Mutex<Region> {
 }
 /// Borrow the region for the duration of one loop. This is the shape a per-item
 /// membership test in a hot loop should use.
-fn region_guard() -> TimedGuard<Region> {
+fn region_guard() -> TimedGuard<std::sync::MutexGuard<'static, Region>> {
     timed_region()
 }
 fn scheduled_tick_chunks() -> HashSet<(i32, i32)> {
@@ -7875,11 +8194,24 @@ fn extend_chunk_square(chunks: &mut HashSet<(i32, i32)>, (cx, cz): (i32, i32), r
         }
     }
 }
+/// How many times `refresh_hot` actually rebuilt the region sets. The tick
+/// calls it every tick; on a still server nearly every call is a signature
+/// match and this counter does not move.
+static HOT_REBUILDS: AtomicU64 = AtomicU64::new(0);
+
 fn refresh_hot() {
     // collect without holding the hot lock: is_hot callers may hold pos
     // locks, so hot must never block on pos underneath itself.
-    let mut h = forceloaded().lock().unwrap_or_else(|e| e.into_inner()).clone();
-    let forced: Vec<_> = h.iter().copied().collect();
+    let forced_set: HashSet<(i32, i32)> = forceloaded()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .iter()
+        .copied()
+        .collect();
+    // `h` becomes `hot` after the centre expansions; the signature needs the
+    // forceloaded set as it was before that dilation.
+    let mut h = forced_set.clone();
+    let forced: Vec<_> = forced_set.iter().copied().collect();
     let mut centers = HashSet::new();
     for c in clients().lock().unwrap_or_else(|e| e.into_inner()).iter() {
         let p = *c.pos.lock().unwrap_or_else(|e| e.into_inner());
@@ -7903,6 +8235,21 @@ fn refresh_hot() {
     let budget = current_load_budget();
     let warm_radius =
         ((8.0 * budget.chunk_send_scale).round() as i32 - budget.extra_view_trim).max(5);
+    // An idle tick rebuilds the same two sets the region already holds:
+    // nobody moved across a chunk boundary, no chunk was forceloaded or
+    // released, and the load budget did not move the warm ring. Skip the
+    // rebuild — the membership answers are already the ones it would give.
+    {
+        let r = region().lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(sig) = &r.sig {
+            if sig.warm_radius == warm_radius
+                && sig.centers == centers
+                && sig.forced == forced_set
+            {
+                return;
+            }
+        }
+    }
     let warm_cells = ((2 * warm_radius + 1) * (2 * warm_radius + 1)) as usize;
     let skirt = warm_radius - 5;
     let skirt_cells = ((2 * skirt + 1) * (2 * skirt + 1)) as usize;
@@ -7921,7 +8268,7 @@ fn refresh_hot() {
         for center in forced {
             extend_chunk_square(&mut w, center, 3);
         }
-        for center in centers {
+        for &center in &centers {
             extend_chunk_square(&mut w, center, warm_radius);
         }
     } else {
@@ -7936,6 +8283,12 @@ fn refresh_hot() {
     let mut r = region().lock().unwrap_or_else(|e| e.into_inner());
     r.hot = h;
     r.warm = w;
+    r.sig = Some(HotSig {
+        forced: forced_set,
+        centers,
+        warm_radius,
+    });
+    HOT_REBUILDS.fetch_add(1, Ordering::Relaxed);
 }
 // warm ring: block-level systems tick, entities/projectiles stay frozen —
 // the vanilla lazy-chunk analogue (blocks progress, entities don't). The production paths call
@@ -8031,14 +8384,13 @@ fn schedule_leaf_neighbors(x: i32, y: i32, z: i32, changed_state: u32) {
 /// `block_state_at` (the primitive `base_state` uses) supplies the generated state.
 fn read_states_batched(positions: &[(i32, i32, i32)]) -> Vec<u32> {
     let mut overlays: HashMap<(i32, i32), HashMap<u32, u32>> = HashMap::new();
-    {
-        let w = world().lock().unwrap_or_else(|e| e.into_inner());
-        for &(x, _, z) in positions {
-            let key = (x >> 4, z >> 4);
-            if let std::collections::hash_map::Entry::Vacant(e) = overlays.entry(key) {
-                if let Some(col) = overworld_edits(&w, key.0, key.1) {
-                    e.insert(col.clone());
-                }
+    for &(x, _, z) in positions {
+        let key = (x >> 4, z >> 4);
+        if let std::collections::hash_map::Entry::Vacant(e) = overlays.entry(key) {
+            if let Some(col) =
+                overworld_edits(&world().read(&(DimId::Overworld, key.0, key.1)), key.0, key.1)
+            {
+                e.insert(col.clone());
             }
         }
     }
@@ -8053,7 +8405,7 @@ fn read_states_batched(positions: &[(i32, i32, i32)]) -> Vec<u32> {
     if !worldgen::enabled() {
         unresolved.extend(0..positions.len());
     } else {
-        let mut bands = op_bands().lock().unwrap_or_else(|e| e.into_inner());
+        let bands = op_bands();
         let mut per_chunk: HashMap<(i32, i32), Option<std::sync::Arc<OpBand>>> = HashMap::new();
         for (i, &(x, y, z)) in positions.iter().enumerate() {
             let key = (x >> 4, z >> 4);
@@ -8716,14 +9068,15 @@ fn ticked_chunks() -> Vec<(i32, i32)> {
 /// columns directly when available so the 20 TPS tick thread never stalls on `worldgen::chunk_cols`.
 fn ticked_sections(cx: i32, cz: i32) -> Vec<i32> {
     let mut out: Vec<i32> = Vec::new();
-    if let Some(c) = world().lock().unwrap_or_else(|e| e.into_inner()).get(&(DimId::Overworld, cx, cz)) {
+    if let Some(c) = world().read(&(DimId::Overworld, cx, cz)).get(&(DimId::Overworld, cx, cz)) {
         for idx in c.keys() {
             out.push(((*idx >> 8) as i32 + MIN_Y) >> 4);
         }
     }
     let surface_sy = {
-        let store = section_store().lock().unwrap_or_else(|e| e.into_inner());
-        store.map.get(&(DimId::Overworld, cx, cz)).map(|col| {
+        let store = section_store();
+        let key = (DimId::Overworld, cx, cz);
+        store.map.read(&key).get(&key).map(|col| {
             col.iter()
                 .enumerate()
                 .rev()
@@ -8765,16 +9118,9 @@ fn random_tick_pass() {
     for (cx, cz) in ticked_chunks() {
         if wg_on {
             let key = (DimId::Overworld, cx, cz);
-            let has_sections = section_store()
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
-                .map
-                .contains_key(&key);
+            let has_sections = section_store().map.read(&key).contains_key(&key);
             if !has_sections {
-                let has_edits = world()
-                    .lock()
-                    .unwrap_or_else(|e| e.into_inner())
-                    .contains_key(&key);
+                let has_edits = world().read(&key).contains_key(&key);
                 if !has_edits {
                     continue;
                 }
@@ -9708,8 +10054,7 @@ fn local_idx(x: i32, y: i32, z: i32) -> u32 {
 /// 19.5 ms of a tick, for 12 entity positions, none of which was on a plate.
 fn overlay_block_dim(dim: DimId, x: i32, y: i32, z: i32) -> Option<u32> {
     world()
-        .lock()
-        .unwrap()
+        .read(&(dim, x >> 4, z >> 4))
         .get(&(dim, x >> 4, z >> 4))
         .and_then(|c| c.get(&local_idx(x, y, z)).copied())
 }
@@ -9774,7 +10119,7 @@ fn base_state_dim(dim: DimId, x: i32, y: i32, z: i32) -> u32 {
 }
 
 fn block_at_dim(dim: DimId, x: i32, y: i32, z: i32) -> u32 {
-    let w = timed_world();
+    let w = timed_world_read(&(dim, x >> 4, z >> 4));
     let hit = w
         .get(&(dim, x >> 4, z >> 4))
         .and_then(|c| c.get(&local_idx(x, y, z)).copied());
@@ -9861,8 +10206,9 @@ fn set_block_if_inner_dim(
     if y.checked_sub(MIN_Y).is_none() {
         return false;
     }
-    let mut w = world().lock().unwrap_or_else(|e| e.into_inner());
-    let c = w.entry((dim, x >> 4, z >> 4)).or_default();
+    let key = (dim, x >> 4, z >> 4);
+    let mut w = world().write(&key);
+    let c = w.entry(key).or_default();
     let old = c
         .get(&local_idx(x, y, z))
         .copied()
@@ -10107,8 +10453,8 @@ fn set_block_if_dim_edit(
     }
     let base = dim_base_state(dim, x, y, z).unwrap_or(0);
     let cell = local_idx(x, y, z);
-    let mut w = world().lock().unwrap_or_else(|e| e.into_inner());
     let key: DimChunkKey = (dim, x >> 4, z >> 4);
+    let mut w = world().write(&key);
     let c = w.entry(key).or_default();
     let old = c.get(&cell).copied().unwrap_or(base);
     if expected.is_some_and(|value| old != value) {
@@ -10754,7 +11100,7 @@ fn set_blocks_bulk_dim(dim: DimId, edits: &[(i32, i32, i32, u32)]) -> usize {
                 continue;
             }
             {
-                let mut w = world().lock().unwrap_or_else(|e| e.into_inner());
+                let mut w = world().write(&(dim, cx, cz));
                 let c = w.entry((dim, cx, cz)).or_default();
                 for &(x, y, z, st, cell, base) in &prepared {
                     let old = c.get(&cell).copied().unwrap_or(base);
@@ -10771,8 +11117,8 @@ fn set_blocks_bulk_dim(dim: DimId, edits: &[(i32, i32, i32, u32)]) -> usize {
             // One band lock for the column's whole edit set: the band is the
             // same write-through view `band_patch_dim` patches per cell.
             {
-                let mut bands = op_bands().lock().unwrap_or_else(|e| e.into_inner());
-                if let Some((_, slot)) = bands.map.get_mut(&(dim, cx, cz)) {
+                let mut bands = op_bands().map.write(&(dim, cx, cz));
+                if let Some((_, slot)) = bands.get_mut(&(dim, cx, cz)) {
                     let band = std::sync::Arc::make_mut(slot);
                     for &(x, y, z, st, _, _) in &prepared {
                         if y >= band.y0 && y <= band.y1 {
@@ -10801,8 +11147,8 @@ fn set_blocks_bulk_dim(dim: DimId, edits: &[(i32, i32, i32, u32)]) -> usize {
                     let hidden = HiddenSet::new();
                     let is_opaque = |s: u32| reg.is_some_and(|r| r.opacity_of(s) == 15);
                     let is_hid = |s: u32| hidden.contains(s);
-                    let mut store = section_store().lock().unwrap_or_else(|e| e.into_inner());
-                    if let Some(sections) = store.map.get_mut(&(dim, cx, cz)) {
+                    let mut store = section_store().map.write(&(dim, cx, cz));
+                    if let Some(sections) = store.get_mut(&(dim, cx, cz)) {
                         for (idx, edits) in &by_section {
                             if let Some(sec) = sections.get_mut(*idx).and_then(|s| s.as_mut()) {
                                 let sec = std::sync::Arc::make_mut(sec);
@@ -11062,11 +11408,12 @@ fn redstone_component(reg: &BReg, state: u32) -> bool {
 fn nearby_redstone(reg: &BReg, dim: DimId, RsPos(x, y, z): RsPos) -> bool {
     // Live devices are in the edit overlay. Check that small neighborhood
     // before asking the generator for conductor and support states.
-    let edits = world().lock().unwrap_or_else(|e| e.into_inner());
     for dx in -2..=2 {
         for dz in -2..=2 {
             let (x, z) = (x + dx, z + dz);
-            if let Some(chunk) = edits.get(&(dim, x >> 4, z >> 4)) {
+            let key = (dim, x >> 4, z >> 4);
+            let edits = world().read(&key);
+            if let Some(chunk) = edits.get(&key) {
                 if (-2..=2).any(|dy| {
                     chunk
                         .get(&local_idx(x, y + dy, z))
@@ -13743,7 +14090,7 @@ fn block_light_sections_dim(dim: DimId, cx: i32, cz: i32, gen: &GenSources) -> V
     let mut sources: Vec<((i32, i32, i32), u8)> = Vec::new();
     let mut w: HashMap<(DimId, i32, i32), HashMap<u32, u32>> = HashMap::new();
     {
-        let guard = world().lock().unwrap_or_else(|e| e.into_inner());
+        let guard = world().read_all();
         // Generated light sources for this chunk and the eight neighbours (recorded by
         // `chunk_data` as each was streamed). `block_light_sections_from` clips them to the
         // search area, so an emitter across a border lights this chunk exactly as if it were
@@ -14166,39 +14513,41 @@ impl OpBand {
 /// lookup — and the scheduled-tick pass asks for ~28,000 cells per tick, so the lookup
 /// alone was most of its 12.5 ms. A `HashMap` makes it a hash hit; the `order` deque only
 /// exists for the bound.
-struct BandCache {
-    map: HashMap<(DimId, i32, i32), (u64, std::sync::Arc<OpBand>)>,
-    order: std::collections::VecDeque<(DimId, i32, i32)>,
-    generation: u64,
+struct BandStore {
+    /// The cached bands, sharded by `(dim, cx, cz)`: `band_for` resolves from
+    /// a shared read lock on the owning shard instead of the single mutex
+    /// that used to sit behind every `block_at_cached` miss.
+    map: ShardedChunks<(u64, std::sync::Arc<OpBand>)>,
+    /// Insertion order for the 256-entry bound; only `put` mutates it, and it
+    /// is the one lock a put holds while it takes a shard write lock — `order`
+    /// then shard, always in that order.
+    order: Mutex<std::collections::VecDeque<(DimId, i32, i32)>>,
+    /// `worldgen::generation_seq` the entries belong to: a reader rules a
+    /// stale band out with one atomic load, and the map itself is cleared on
+    /// the next `put` (the old `sync_generation` dropped the same entries —
+    /// a stale entry is unreadable either way, so the clear is hygiene, not
+    /// correctness).
+    generation: AtomicU64,
 }
 
-static OP_BANDS: OnceLock<Mutex<BandCache>> = OnceLock::new();
+static OP_BANDS: OnceLock<BandStore> = OnceLock::new();
 
-fn op_bands() -> &'static Mutex<BandCache> {
-    OP_BANDS.get_or_init(|| {
-        Mutex::new(BandCache {
-            map: HashMap::new(),
-            order: std::collections::VecDeque::new(),
-            generation: current_gen_seq(),
-        })
+fn op_bands() -> &'static BandStore {
+    OP_BANDS.get_or_init(|| BandStore {
+        map: ShardedChunks::new(),
+        order: Mutex::new(std::collections::VecDeque::new()),
+        generation: AtomicU64::new(current_gen_seq()),
     })
 }
 
-impl BandCache {
-    /// Drop everything if the generator has been replaced since the last entry was stored.
-    fn sync_generation(&mut self) {
-        let seq = current_gen_seq();
-        if self.generation != seq {
-            self.map.clear();
-            self.order.clear();
-            self.generation = seq;
-        }
-    }
-
-    fn get(&mut self, key: (DimId, i32, i32)) -> Option<std::sync::Arc<OpBand>> {
+impl BandStore {
+    fn get(&self, key: (DimId, i32, i32)) -> Option<std::sync::Arc<OpBand>> {
         let __t = chunkprof::enabled().then(std::time::Instant::now);
-        self.sync_generation();
-        let band = self.map.get(&key).map(|(_, b)| b.clone());
+        let band = if self.generation.load(Ordering::Relaxed) == current_gen_seq() {
+            self.map.read(&key).get(&key).map(|(_, b)| b.clone())
+        } else {
+            None
+        };
         if let Some(t) = __t {
             chunkprof::BAND_N.fetch_add(1, Ordering::Relaxed);
             chunkprof::add(&chunkprof::BAND_NS, t);
@@ -14212,15 +14561,31 @@ impl BandCache {
     }
 
     /// Insert (or replace) and evict the oldest entry when the bound is passed.
-    fn put(&mut self, key: (DimId, i32, i32), version: u64, band: std::sync::Arc<OpBand>) {
-        if self.map.insert(key, (version, band)).is_none() {
-            self.order.push_back(key);
+    fn put(&self, key: (DimId, i32, i32), version: u64, band: std::sync::Arc<OpBand>) {
+        let mut order = self.order.lock().unwrap_or_else(|e| e.into_inner());
+        let seq = current_gen_seq();
+        if self.generation.swap(seq, Ordering::Relaxed) != seq {
+            self.map.clear();
+            order.clear();
         }
-        while self.order.len() > 256 {
-            if let Some(old) = self.order.pop_front() {
-                self.map.remove(&old);
+        if self.map.write(&key).insert(key, (version, band)).is_none() {
+            order.push_back(key);
+        }
+        while order.len() > 256 {
+            if let Some(old) = order.pop_front() {
+                self.map.write(&old).remove(&old);
             }
         }
+    }
+
+    /// Drop every cached band: the test-only cold start
+    /// `clear_chunk_caches_for_tests` asks for.
+    fn clear(&self) {
+        self.map.clear();
+        self.order
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clear();
     }
 }
 
@@ -14236,21 +14601,68 @@ impl BandCache {
 type PublishedColumn = Vec<Option<std::sync::Arc<PalettedSection>>>;
 
 struct SectionStore {
-    map: HashMap<DimChunkKey, PublishedColumn>,
-    order: std::collections::VecDeque<DimChunkKey>,
-    generation: u64,
+    /// The published columns, sharded by `(dim, cx, cz)`: a `stored_state` or
+    /// `take_published` read takes a shared lock on one shard instead of
+    /// queueing behind every other thread's section access.
+    map: ShardedChunks<PublishedColumn>,
+    /// Insertion order for the 32-column bound. Only `publish_section`
+    /// mutates it, and it is the one lock a publish holds while it takes a
+    /// shard write lock — `order` then shard, always in that order, so the
+    /// pairing cannot cycle against a shard-only reader or patcher.
+    order: Mutex<std::collections::VecDeque<DimChunkKey>>,
+    /// `worldgen::generation_seq` the store's contents belong to. Atomic so a
+    /// reader can rule out stale columns without taking `order`.
+    generation: AtomicU64,
 }
 
-static SECTION_STORE: std::sync::OnceLock<Mutex<SectionStore>> = std::sync::OnceLock::new();
+static SECTION_STORE: std::sync::OnceLock<SectionStore> = std::sync::OnceLock::new();
 
-fn section_store() -> &'static Mutex<SectionStore> {
-    SECTION_STORE.get_or_init(|| {
-        Mutex::new(SectionStore {
-            map: HashMap::new(),
-            order: std::collections::VecDeque::new(),
-            generation: current_gen_seq(),
-        })
+fn section_store() -> &'static SectionStore {
+    SECTION_STORE.get_or_init(|| SectionStore {
+        map: ShardedChunks::new(),
+        order: Mutex::new(std::collections::VecDeque::new()),
+        generation: AtomicU64::new(current_gen_seq()),
     })
+}
+
+impl SectionStore {
+    /// Drop every published column: the test-only cold start
+    /// `clear_chunk_caches_for_tests` asks for. `generation` is left alone —
+    /// it names the generator the store was filled under, not a cache line.
+    fn clear(&self) {
+        self.map.clear();
+        self.order
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clear();
+    }
+
+    /// Remove a column from the map and its slot in the eviction order.
+    #[cfg(test)]
+    fn remove_column(&self, key: &DimChunkKey) -> Option<PublishedColumn> {
+        self.order
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .retain(|k| k != key);
+        self.map.remove(key)
+    }
+
+    /// Re-seat a column a test removed with `remove_column`: back in the map
+    /// and at the newest end of the eviction order.
+    #[cfg(test)]
+    fn insert_column(&self, key: DimChunkKey, column: PublishedColumn) {
+        self.map.insert(key, column);
+        self.order
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .push_back(key);
+    }
+}
+
+/// The current-generation test every store reader shares: contents published
+/// under a replaced generator must not answer for the new one.
+fn store_is_current(store: &SectionStore) -> bool {
+    store.generation.load(Ordering::Relaxed) == current_gen_seq()
 }
 
 /// `(world min_y, section count)` for a dimension. The vanilla windows are the same
@@ -14294,26 +14706,29 @@ fn publish_section(dim: DimId, cx: i32, cz: i32, sy: i32, sec: std::sync::Arc<Pa
     let Some(idx) = section_index_dim(dim, sy) else {
         return;
     };
-    let mut store = section_store().lock().unwrap_or_else(|e| e.into_inner());
+    let store = section_store();
+    let mut order = store.order.lock().unwrap_or_else(|e| e.into_inner());
     let seq = current_gen_seq();
-    if store.generation != seq {
+    if store.generation.swap(seq, Ordering::Relaxed) != seq {
         store.map.clear();
-        store.order.clear();
-        store.generation = seq;
+        order.clear();
     }
     let key = (dim, cx, cz);
-    if let std::collections::hash_map::Entry::Vacant(vacant) = store.map.entry(key) {
-        let (_, count) = section_window(dim);
-        vacant.insert((0..count).map(|_| None).collect());
-        store.order.push_back(key);
-        while store.order.len() > 32 {
-            if let Some(old) = store.order.pop_front() {
-                store.map.remove(&old);
-            }
+    {
+        let mut map = store.map.write(&key);
+        if let std::collections::hash_map::Entry::Vacant(vacant) = map.entry(key) {
+            let (_, count) = section_window(dim);
+            vacant.insert((0..count).map(|_| None).collect());
+            order.push_back(key);
+        }
+        if let Some(sections) = map.get_mut(&key) {
+            sections[idx] = Some(sec);
         }
     }
-    if let Some(sections) = store.map.get_mut(&key) {
-        sections[idx] = Some(sec);
+    while order.len() > 32 {
+        if let Some(old) = order.pop_front() {
+            store.map.write(&old).remove(&old);
+        }
     }
 }
 
@@ -14323,11 +14738,16 @@ fn publish_section(dim: DimId, cx: i32, cz: i32, sy: i32, sec: std::sync::Arc<Pa
 /// can publish and encode the same section without a 16 KB copy.
 fn take_published(dim: DimId, cx: i32, cz: i32, sy: i32) -> Option<std::sync::Arc<PalettedSection>> {
     let idx = section_index_dim(dim, sy)?;
-    let store = section_store().lock().unwrap_or_else(|e| e.into_inner());
-    if store.generation != current_gen_seq() {
+    let store = section_store();
+    if !store_is_current(store) {
         return None;
     }
-    store.map.get(&(dim, cx, cz))?.get(idx)?.clone()
+    store
+        .map
+        .read(&(dim, cx, cz))
+        .get(&(dim, cx, cz))?
+        .get(idx)?
+        .clone()
 }
 
 /// Is this section already published? The ring prefetch asks before computing, so a section
@@ -14336,12 +14756,13 @@ fn has_section(dim: DimId, cx: i32, cz: i32, sy: i32) -> bool {
     let Some(idx) = section_index_dim(dim, sy) else {
         return false;
     };
-    let store = section_store().lock().unwrap_or_else(|e| e.into_inner());
-    if store.generation != current_gen_seq() {
+    let store = section_store();
+    if !store_is_current(store) {
         return false;
     }
     store
         .map
+        .read(&(dim, cx, cz))
         .get(&(dim, cx, cz))
         .is_some_and(|s| s[idx].is_some())
 }
@@ -14349,25 +14770,32 @@ fn has_section(dim: DimId, cx: i32, cz: i32, sy: i32) -> bool {
 /// The published section as a shared handle, for a scan that reads many of its cells.
 fn stored_section(dim: DimId, cx: i32, cz: i32, sy: i32) -> Option<std::sync::Arc<PalettedSection>> {
     let idx = section_index_dim(dim, sy)?;
-    let store = section_store().lock().unwrap_or_else(|e| e.into_inner());
-    if store.generation != current_gen_seq() {
+    let store = section_store();
+    if !store_is_current(store) {
         return None;
     }
-    store.map.get(&(dim, cx, cz))?.get(idx)?.clone()
+    store
+        .map
+        .read(&(dim, cx, cz))
+        .get(&(dim, cx, cz))?
+        .get(idx)?
+        .clone()
 }
 
 /// The surface band for a chunk in `dim`, if installed and current.
 fn band_for(dim: DimId, cx: i32, cz: i32) -> Option<std::sync::Arc<OpBand>> {
-    op_bands().lock().unwrap_or_else(|e| e.into_inner()).get((dim, cx, cz))
+    op_bands().get((dim, cx, cz))
 }
 
 fn stored_state(dim: DimId, x: i32, y: i32, z: i32) -> Option<u32> {
     let idx = section_index_dim(dim, y & !15)?;
-    let store = section_store().lock().unwrap_or_else(|e| e.into_inner());
-    if store.generation != current_gen_seq() {
+    let store = section_store();
+    if !store_is_current(store) {
         return None;
     }
-    let sections = store.map.get(&(dim, x >> 4, z >> 4))?;
+    let key = (dim, x >> 4, z >> 4);
+    let sections = store.map.read(&key);
+    let sections = sections.get(&key)?;
     Some(
         sections[idx].as_ref()?.get(
             (((y & 15) as usize) << 8) | (((z & 15) as usize) << 4) | ((x & 15) as usize),
@@ -14383,8 +14811,9 @@ fn store_patch(dim: DimId, x: i32, y: i32, z: i32, st: u32) {
     let hidden = HiddenSet::new();
     let is_opaque = |s: u32| reg.is_some_and(|r| r.opacity_of(s) == 15);
     let is_hid = |s: u32| hidden.contains(s);
-    let mut store = section_store().lock().unwrap_or_else(|e| e.into_inner());
-    let Some(sections) = store.map.get_mut(&(dim, x >> 4, z >> 4)) else {
+    let key = (dim, x >> 4, z >> 4);
+    let mut store = section_store().map.write(&key);
+    let Some(sections) = store.get_mut(&key) else {
         return;
     };
     let Some(sec) = sections[idx].as_mut() else {
@@ -14400,8 +14829,9 @@ fn store_patch(dim: DimId, x: i32, y: i32, z: i32, st: u32) {
 
 fn band_patch_dim(dim: DimId, x: i32, y: i32, z: i32, st: u32) {
     let (cx, cz) = (x >> 4, z >> 4);
-    let mut bands = op_bands().lock().unwrap_or_else(|e| e.into_inner());
-    let Some((_, slot)) = bands.map.get_mut(&(dim, cx, cz)) else {
+    let key = (dim, cx, cz);
+    let mut bands = op_bands().map.write(&key);
+    let Some((_, slot)) = bands.get_mut(&key) else {
         return;
     };
     let band = std::sync::Arc::make_mut(slot);
@@ -14427,7 +14857,7 @@ fn band_state_dim(dim: DimId, x: i32, y: i32, z: i32) -> Option<u32> {
     // for an unpopulated chunk that includes its population), so it only pays when the
     // reader wants thousands of cells from that chunk — which is `chunk_data`, and it
     // installs the band from states it already has (`install_band_rows`).
-    let band = op_bands().lock().unwrap_or_else(|e| e.into_inner()).get((dim, cx, cz));
+    let band = op_bands().get((dim, cx, cz));
     band.and_then(|band| band.get(y, (x & 15) as usize, (z & 15) as usize))
 }
 
@@ -14476,7 +14906,7 @@ fn install_band_rows(dim: DimId, cx: i32, cz: i32, sy: i32, sec: &PalettedSectio
         return;
     }
     let epoch = chunk_version_dim(dim, cx, cz);
-    let mut bands = op_bands().lock().unwrap_or_else(|e| e.into_inner());
+    let bands = op_bands();
     if bands.get((dim, cx, cz)).is_none() {
         let rows = (y1 - y0 + 1) as usize;
         bands.put(
@@ -14492,7 +14922,8 @@ fn install_band_rows(dim: DimId, cx: i32, cz: i32, sy: i32, sec: &PalettedSectio
             chunkprof::BAND_NEW.fetch_add(1, Ordering::Relaxed);
         }
     }
-    let Some((_, slot)) = bands.map.get_mut(&(dim, cx, cz)) else {
+    let mut slot_guard = bands.map.write(&(dim, cx, cz));
+    let Some((_, slot)) = slot_guard.get_mut(&(dim, cx, cz)) else {
         return;
     };
     let band = std::sync::Arc::make_mut(slot);
@@ -14524,8 +14955,9 @@ fn overlay_band(dim: DimId, cx: i32, cz: i32) {
     if crate::block_registry::breg().is_none() {
         return;
     }
-    let mut bands = op_bands().lock().unwrap_or_else(|e| e.into_inner());
-    let Some((_, slot)) = bands.map.get_mut(&(dim, cx, cz)) else {
+    let key = (dim, cx, cz);
+    let mut bands = op_bands().map.write(&key);
+    let Some((_, slot)) = bands.get_mut(&key) else {
         return;
     };
     let band = std::sync::Arc::make_mut(slot);
@@ -14533,7 +14965,7 @@ fn overlay_band(dim: DimId, cx: i32, cz: i32) {
     // Copy the edits, then apply them: the guard would otherwise be held while the band
     // rows are written, and the tick thread reads `world()` every tick.
     let col: Vec<(u32, u32)> = {
-        let w = world().lock().unwrap_or_else(|e| e.into_inner());
+        let w = world().read(&(dim, cx, cz));
         match w.get(&(dim, cx, cz)) {
             Some(c) => c.iter().map(|(k, v)| (*k, *v)).collect(),
             None => {
@@ -14889,15 +15321,15 @@ impl SkyFloorCells {
             return None;
         }
         let sections = {
-            let store = section_store().lock().unwrap_or_else(|e| e.into_inner());
-            if store.generation == current_gen_seq() {
-                store.map.get(&(dim, cx, cz)).cloned()
+            let store = section_store();
+            if store_is_current(store) {
+                store.map.get_cloned(&(dim, cx, cz))
             } else {
                 None
             }
         };
         let band = band_for(dim, cx, cz);
-        let overlay = timed_world()
+        let overlay = timed_world_read(&(dim, cx, cz))
             .get(&(dim, cx, cz))
             .cloned()
             .unwrap_or_default();
@@ -15304,7 +15736,7 @@ fn chunk_data_lane(
     // keyed by `(cx, cz)` alone, which is why every caller passes the Overworld today; S3 is what
     // gives those caches a dimension.
     let overlay: HashMap<u32, u32> = {
-        let w = world().lock().unwrap_or_else(|e| e.into_inner());
+        let w = world().read(&(dim, cx, cz));
         w.get(&(dim, cx, cz)).cloned().unwrap_or_default()
     };
     if let Some(t) = __to {
@@ -15970,10 +16402,8 @@ fn map_chunk_sig(dim: DimId, cx: i32, cz: i32, gen: &GenSources) -> u64 {
 fn clear_chunk_caches_for_tests() {
     map_chunk_cache().lock().unwrap_or_else(|e| e.into_inner()).map.clear();
     map_chunk_cache().lock().unwrap_or_else(|e| e.into_inner()).order.clear();
-    op_bands().lock().unwrap_or_else(|e| e.into_inner()).map.clear();
-    op_bands().lock().unwrap_or_else(|e| e.into_inner()).order.clear();
-    section_store().lock().unwrap_or_else(|e| e.into_inner()).map.clear();
-    section_store().lock().unwrap_or_else(|e| e.into_inner()).order.clear();
+    op_bands().clear();
+    section_store().clear();
     sky_floors_cache().lock().unwrap_or_else(|e| e.into_inner()).map.clear();
     sky_floors_cache().lock().unwrap_or_else(|e| e.into_inner()).order.clear();
     *live_light_cache().lock().unwrap_or_else(|e| e.into_inner()) = LiveLightCache::default();
@@ -16095,7 +16525,7 @@ fn build_map_chunk_lane(
         .unwrap_or([i32::MIN; 256]);
         let mut edit_tops = [i32::MIN; 256];
         if let Some(reg) = breg() {
-            let w = timed_world();
+            let w = timed_world_read(&(dim, cx, cz));
             if let Some(edits) = w.get(&(dim, cx, cz)) {
                 for (&cell, &st) in edits {
                     if reg.heightmap_counts(st, HeightmapKind::WorldSurface) {
@@ -16751,8 +17181,7 @@ fn pre_edit_light_chunk(
     previous: &HashMap<Position, LightBlock>,
 ) -> Vec<LightBlock> {
     let overlay = world()
-        .lock()
-        .unwrap()
+        .read(&(dim, cx, cz))
         .get(&(dim, cx, cz))
         .cloned()
         .unwrap_or_default();
@@ -19875,6 +20304,7 @@ fn main() {
                     let mut region = region().lock().unwrap_or_else(|e| e.into_inner());
                     region.hot = warm.clone();
                     region.warm = warm;
+                    region.sig = None;
                 }
                 let fluid_seeds = std::env::var("MEGU_WG_DIAG_FLUID_SEEDS").ok();
                 let fluid_native =
@@ -19942,9 +20372,9 @@ fn main() {
                 if std::env::var("MEGU_WG_DIAG_SAVE_WORLD").as_deref() == Ok("1") {
                     save_world();
                 }
-                let edits = world().lock().unwrap_or_else(|e| e.into_inner());
                 for dz in 0..n {
                     for dx in 0..n {
+                        let edits = world().read(&(DimId::Overworld, ox + dx, oz + dz));
                         if let Some(chunk) = overworld_edits(&edits, ox + dx, oz + dz) {
                             for (&index, &state) in chunk {
                                 assert!(
@@ -20509,18 +20939,25 @@ pub fn set_test_region(hot: HashSet<(i32, i32)>, warm: HashSet<(i32, i32)>) {
     let mut r = region().lock().unwrap_or_else(|e| e.into_inner());
     r.hot = hot;
     r.warm = warm;
+    r.sig = None;
 }
 #[cfg(test)]
 pub fn set_test_region_warm(warm: HashSet<(i32, i32)>) {
-    region().lock().unwrap_or_else(|e| e.into_inner()).warm = warm;
+    let mut r = region().lock().unwrap_or_else(|e| e.into_inner());
+    r.warm = warm;
+    r.sig = None;
 }
 #[cfg(test)]
 pub fn test_region_warm_insert(c: (i32, i32)) {
-    region().lock().unwrap_or_else(|e| e.into_inner()).warm.insert(c);
+    let mut r = region().lock().unwrap_or_else(|e| e.into_inner());
+    r.warm.insert(c);
+    r.sig = None;
 }
 #[cfg(test)]
 pub fn test_region_warm_remove(c: &(i32, i32)) {
-    region().lock().unwrap_or_else(|e| e.into_inner()).warm.remove(c);
+    let mut r = region().lock().unwrap_or_else(|e| e.into_inner());
+    r.warm.remove(c);
+    r.sig = None;
 }
 
 // Hold across setup, tick execution and restoration of shared world fixtures.
@@ -20651,7 +21088,7 @@ mod mineshaft_runtime_tests {
     impl RuntimeSnapshot {
         fn take() -> Self {
             Self {
-                world: std::mem::take(&mut *world().lock().unwrap_or_else(|e| e.into_inner())),
+                world: world().take_all(),
                 chests: std::mem::take(&mut *chests().lock().unwrap_or_else(|e| e.into_inner())),
                 pending_block_loot: std::mem::take(&mut *pending_block_loot().lock().unwrap_or_else(|e| e.into_inner())),
                 drops: std::mem::take(&mut *drops().lock().unwrap_or_else(|e| e.into_inner())),
@@ -20686,7 +21123,7 @@ mod mineshaft_runtime_tests {
 
     impl std::ops::Drop for RuntimeSnapshot {
         fn drop(&mut self) {
-            *world().lock().unwrap_or_else(|e| e.into_inner()) = std::mem::take(&mut self.world);
+            world().restore_all(std::mem::take(&mut self.world));
             *chests().lock().unwrap_or_else(|e| e.into_inner()) = std::mem::take(&mut self.chests);
             *pending_block_loot().lock().unwrap_or_else(|e| e.into_inner()) =
                 std::mem::take(&mut self.pending_block_loot);
@@ -22750,7 +23187,7 @@ mod wire_ops_tests {
 
         // Crash: journal handle gone, the overlay edit lost with it.
         wire_ops_dwal_disarm();
-        wire_lock(world()).remove(&chunk_key);
+        world().remove(&chunk_key);
         assert!(overlay_block_dim(dim, x, y, z).is_none());
 
         // Boot recovery replays the journaled edit into the live overlay.
@@ -22778,7 +23215,7 @@ mod wire_ops_tests {
         // Leave nothing behind: journal off, env cleared, cells dropped.
         wire_ops_dwal_disarm();
         std::env::remove_var("MEGU_WAL_PATH");
-        wire_lock(world()).remove(&chunk_key);
+        world().remove(&chunk_key);
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -22888,7 +23325,7 @@ mod ultra_disk_5_tests {
 
         // Leave nothing behind: the edit's cell drops and the epoch pair is
         // re-baselined so later tests are not forced through a save.
-        d5_lock(world()).remove(&chunk_key);
+        world().remove(&chunk_key);
         LAST_SAVED_EPOCH.store(
             WORLD_PERSIST_DIRTY_EPOCH.load(Ordering::Acquire),
             Ordering::Release,
@@ -23172,7 +23609,7 @@ mod p8a_parity_tests {
             let key = (dim, x >> 4, z >> 4);
             let cell = local_idx(x, y, z);
             let prev = {
-                let mut w = p8a_lock(world());
+                let mut w = world().write(&key);
                 let chunk = w.entry(key).or_default();
                 let prev = chunk.get(&cell).copied();
                 chunk.insert(cell, st);
@@ -23183,7 +23620,7 @@ mod p8a_parity_tests {
     }
     impl std::ops::Drop for DimCells {
         fn drop(&mut self) {
-            let mut w = p8a_lock(world());
+            let mut w = world().write_all();
             for (dim, x, y, z, prev) in self.0.drain(..).rev() {
                 if let Some(chunk) = w.get_mut(&(dim, x >> 4, z >> 4)) {
                     match prev {
@@ -23438,7 +23875,7 @@ mod w3_live_wire_tests {
             let key = (dim, x >> 4, z >> 4);
             let cell = local_idx(x, y, z);
             let prev = {
-                let mut w = world().lock().unwrap_or_else(|e| e.into_inner());
+                let mut w = world().write(&key);
                 let chunk = w.entry(key).or_default();
                 let prev = chunk.get(&cell).copied();
                 chunk.insert(cell, st);
@@ -23449,9 +23886,10 @@ mod w3_live_wire_tests {
     }
     impl std::ops::Drop for LiveCells {
         fn drop(&mut self) {
-            let mut w = world().lock().unwrap_or_else(|e| e.into_inner());
             for (dim, x, y, z, prev) in self.0.drain(..).rev() {
-                if let Some(chunk) = w.get_mut(&(dim, x >> 4, z >> 4)) {
+                let key = (dim, x >> 4, z >> 4);
+                let mut w = world().write(&key);
+                if let Some(chunk) = w.get_mut(&key) {
                     match prev {
                         Some(st) => {
                             chunk.insert(local_idx(x, y, z), st);
@@ -24260,12 +24698,8 @@ mod mega_w2_tests {
         let dim = DimId::Overworld;
         let (cx, cz) = (1234, 5678); // far from any generated anchor chunk
         let key = (dim, cx, cz);
-        let saved_world = world().lock().unwrap_or_else(|e| e.into_inner()).remove(&key);
-        let saved_sections = {
-            let mut store = section_store().lock().unwrap_or_else(|e| e.into_inner());
-            store.order.retain(|k| *k != key);
-            store.map.remove(&key)
-        };
+        let saved_world = world().write(&key).remove(&key);
+        let saved_sections = section_store().remove_column(&key);
         // A block that never occurs in generated terrain, so every edit is a
         // genuine state change on every cell.
         let stone = reg.state_of("minecraft:diamond_block", None);
@@ -24296,7 +24730,7 @@ mod mega_w2_tests {
             "512 blocks in one chunk bump the version once, not 512 times"
         );
         {
-            let w = world().lock().unwrap_or_else(|e| e.into_inner());
+            let w = world().read(&key);
             let col = w.get(&key).expect("WORLD overlay column exists");
             for z in 0..16 {
                 for x in 0..16 {
@@ -24308,8 +24742,8 @@ mod mega_w2_tests {
             }
         }
         {
-            let store = section_store().lock().unwrap_or_else(|e| e.into_inner());
-            let sections = store.map.get(&key).expect("SECTION_STORE column");
+            let store = section_store().map.read(&key);
+            let sections = store.get(&key).expect("SECTION_STORE column");
             for (sy, cell_y) in [(0usize, 0usize), (16, 0)] {
                 let idx = section_index_dim(dim, sy as i32).unwrap();
                 let sec = sections[idx].as_ref().expect("patched section");
@@ -24329,14 +24763,12 @@ mod mega_w2_tests {
             "apply_queued_block_updates drained the per-section 0x49 batches"
         );
         // Restore.
-        world().lock().unwrap_or_else(|e| e.into_inner()).remove(&key);
+        world().write(&key).remove(&key);
         if let Some(v) = saved_world {
-            world().lock().unwrap_or_else(|e| e.into_inner()).insert(key, v);
+            world().write(&key).insert(key, v);
         }
         if let Some(v) = saved_sections {
-            let mut store = section_store().lock().unwrap_or_else(|e| e.into_inner());
-            store.map.insert(key, v);
-            store.order.push_back(key);
+            section_store().insert_column(key, v);
         }
     }
 

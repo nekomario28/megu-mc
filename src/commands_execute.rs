@@ -752,16 +752,16 @@ fn execute_chunk_loaded(dim: DimId, x: i32, z: i32) -> bool {
     region_guard().is_warm(x, z)
         || forceloaded().lock().unwrap_or_else(|e| e.into_inner()).contains(&chunk)
         || world()
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
+            .read(&(dim, chunk.0, chunk.1))
             .get(&(dim, chunk.0, chunk.1))
             .is_some_and(|cells| !cells.is_empty())
         || band_for(dim, chunk.0, chunk.1).is_some()
         || {
-            let store = section_store().lock().unwrap_or_else(|e| e.into_inner());
-            store.generation == current_gen_seq()
+            let store = section_store();
+            store_is_current(store)
                 && store
                     .map
+                    .read(&(dim, chunk.0, chunk.1))
                     .get(&(dim, chunk.0, chunk.1))
                     .is_some_and(|sections| sections.iter().any(Option::is_some))
         }

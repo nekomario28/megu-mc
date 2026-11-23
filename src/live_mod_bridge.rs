@@ -6249,14 +6249,12 @@ mod live_create_tests {
     /// real write hook so the test exercises the same path as `set_block`.
     fn put(dim: DimId, x: i32, y: i32, z: i32, st: u32) {
         let old = world()
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
+            .read(&(dim, x >> 4, z >> 4))
             .get(&(dim, x >> 4, z >> 4))
             .and_then(|m| m.get(&local_idx(x, y, z)).copied())
             .unwrap_or(0);
         world()
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
+            .write(&(dim, x >> 4, z >> 4))
             .entry((dim, x >> 4, z >> 4))
             .or_default()
             .insert(local_idx(x, y, z), st);

@@ -1425,7 +1425,7 @@ fn apply_anvil_import(report: &AnvilImportReport) {
         anvil_apply_level_dat(level);
     }
     {
-        let mut w = world().lock().unwrap_or_else(|e| e.into_inner());
+        let mut w = world().write_all();
         for chunk in &report.chunks {
             w.entry((chunk.dim, chunk.cx, chunk.cz))
                 .or_default()
@@ -1642,7 +1642,7 @@ fn export_anvil_world_with_options(
     let timestamp = (border_now_ms() / 1000).min(u64::from(u32::MAX)) as u32;
     // Snapshot the overlay once: no `world()` borrow crosses a worldgen call.
     let snapshot: HashMap<DimChunkKey, HashMap<u32, u32>> =
-        world().lock().unwrap_or_else(|e| e.into_inner()).clone();
+        world().snapshot();
     let mut by_region: std::collections::BTreeMap<(DimId, i32, i32), Vec<(i32, i32)>> =
         Default::default();
     for &(dim, cx, cz) in snapshot.keys() {
@@ -2420,7 +2420,7 @@ fn live_anvil_save_dir(dir: &std::path::Path) -> Result<AnvilSaveSummary, String
     let timestamp = (border_now_ms() / 1000).min(u64::from(u32::MAX)) as u32;
     // Snapshot the overlay once: no `world()` borrow crosses a worldgen call.
     let snapshot: HashMap<DimChunkKey, HashMap<u32, u32>> =
-        world().lock().unwrap_or_else(|e| e.into_inner()).clone();
+        world().snapshot();
     let mut by_region: std::collections::BTreeMap<(DimId, i32, i32), Vec<(i32, i32)>> =
         Default::default();
     for &(dim, cx, cz) in snapshot.keys() {
@@ -2544,8 +2544,7 @@ struct AnvilIncrementalSaveSummary {
 #[allow(dead_code)] // The autosave tick hook is wired by the tick lane.
 fn live_anvil_save_tick(dir: &std::path::Path) -> Result<AnvilIncrementalSaveSummary, String> {
     let snapshot: HashMap<DimChunkKey, usize> = world()
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
+        .read_all()
         .iter()
         .filter(|(&(dim, _, _), _)| anvil_dim_region_dir(dim).is_some())
         .map(|(key, edits)| (*key, edits.len()))
@@ -2864,10 +2863,7 @@ fn flush_single_chunk_to_anvil_dir_outcome(
         AnvilRegion::default()
     };
     let overlay = world()
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
-        .get(&(dim, cx, cz))
-        .cloned()
+        .get_cloned(&(dim, cx, cz))
         .unwrap_or_default();
     let flushed = overlay.len();
     let chunk = AnvilChunk {
@@ -3078,7 +3074,7 @@ fn reload_single_chunk_from_anvil_dir(
     };
     let chunk = anvil_chunk_from_nbt(&record.nbt, (cx, cz))?;
     let edits = anvil_chunk_edits(&chunk, dim);
-    let mut w = world().lock().unwrap_or_else(|e| e.into_inner());
+    let mut w = world().write(&(dim, cx, cz));
     if edits.is_empty() {
         w.remove(&(dim, cx, cz));
     } else {
@@ -3553,7 +3549,7 @@ mod anvil_io_tests {
 
     impl AnvilWorldFixture {
         fn capture(sign_keys: &[SignKey]) -> Self {
-            let w = world().lock().unwrap_or_else(|e| e.into_inner());
+            let w = world().read_all();
             let s = signs().lock().unwrap_or_else(|e| e.into_inner());
             Self {
                 seed: WORLD_SEED.load(Ordering::Relaxed),
@@ -3573,7 +3569,7 @@ mod anvil_io_tests {
                 rule_regen: GR_NATURAL_REGEN.load(Ordering::Relaxed),
                 rule_loot: GR_MOB_LOOT.load(Ordering::Relaxed),
                 rule_cram: GR_MAX_ENTITY_CRAMMING.load(Ordering::Relaxed),
-                world_snapshot: w.clone(),
+                world_snapshot: w.to_map(),
                 entities: anvil_block_entities().lock().unwrap_or_else(|e| e.into_inner()).clone(),
                 sign_entries: sign_keys.iter().map(|&k| (k, s.get(&k).cloned())).collect(),
             }
@@ -3603,7 +3599,7 @@ mod anvil_io_tests {
             GR_NATURAL_REGEN.store(self.rule_regen, Ordering::Relaxed);
             GR_MOB_LOOT.store(self.rule_loot, Ordering::Relaxed);
             GR_MAX_ENTITY_CRAMMING.store(self.rule_cram, Ordering::Relaxed);
-            *world().lock().unwrap_or_else(|e| e.into_inner()) = std::mem::take(&mut self.world_snapshot);
+            world().restore_all(std::mem::take(&mut self.world_snapshot));
             *anvil_block_entities().lock().unwrap_or_else(|e| e.into_inner()) = std::mem::take(&mut self.entities);
             let mut s = signs().lock().unwrap_or_else(|e| e.into_inner());
             for (key, entry) in self.sign_entries.drain(..) {
@@ -3636,7 +3632,7 @@ mod anvil_io_tests {
         {
             // Replace the whole overlay (restored by the fixture) so the export
             // reports exactly the chunks this test planted.
-            let mut w = world().lock().unwrap_or_else(|e| e.into_inner());
+            let mut w = world().write_all();
             w.clear();
             let mut ow_chunk = HashMap::new();
             ow_chunk.insert(local_idx(1, 70, 2), grass);
@@ -3950,7 +3946,7 @@ mod anvil_io_tests {
         let _fixture = AnvilWorldFixture::capture(&[]);
         let stone = name_to_state("stone").expect("stone state");
         {
-            let mut w = world().lock().unwrap_or_else(|e| e.into_inner());
+            let mut w = world().write_all();
             w.clear();
             w.insert(key, HashMap::from([(local_idx(1, 70, 2), stone)]));
         }
@@ -3999,7 +3995,7 @@ mod anvil_io_tests {
         let _fixture = AnvilWorldFixture::capture(&[]);
         let stone = name_to_state("stone").expect("stone state");
         {
-            let mut w = world().lock().unwrap_or_else(|e| e.into_inner());
+            let mut w = world().write_all();
             w.clear();
             w.insert(key, HashMap::from([(local_idx(1, 70, 2), stone)]));
         }
@@ -4092,7 +4088,7 @@ mod anvil_io_tests {
         let netherrack = name_to_state("netherrack").expect("netherrack state");
         let end_stone = name_to_state("end_stone").expect("end_stone state");
         {
-            let mut w = world().lock().unwrap_or_else(|e| e.into_inner());
+            let mut w = world().write_all();
             w.clear();
             // Negative chunk coords exercise the r.-1.0 / r.0.-1 naming too.
             w.insert(
@@ -4128,7 +4124,7 @@ mod anvil_io_tests {
         }
 
         // Wipe live state, then the load must bring it all back.
-        world().lock().unwrap_or_else(|e| e.into_inner()).clear();
+        world().clear();
         WORLD_SEED.store(0, Ordering::Relaxed);
         *WORLD_SPAWN.lock().unwrap_or_else(|e| e.into_inner()) = (0.5, 0.0, 0.5, 0.0);
         WORLD_TIME.store(0, Ordering::Relaxed);
@@ -4177,7 +4173,7 @@ mod anvil_io_tests {
         let _fixture = AnvilWorldFixture::capture(&[]);
         let stone = name_to_state("stone").expect("stone state");
         {
-            let mut w = world().lock().unwrap_or_else(|e| e.into_inner());
+            let mut w = world().write_all();
             w.clear();
             w.insert(
                 (DimId::Overworld, 0i32, 0i32),
@@ -4216,7 +4212,7 @@ mod anvil_io_tests {
         let stone = name_to_state("stone").expect("stone state");
         let dirt = name_to_state("dirt").expect("dirt state");
         {
-            let mut w = world().lock().unwrap_or_else(|e| e.into_inner());
+            let mut w = world().write_all();
             w.clear();
             w.insert(
                 (DimId::Overworld, 0i32, 0i32),
@@ -4233,7 +4229,7 @@ mod anvil_io_tests {
         // Chunk (1,0) is clean this cycle — dropped from the overlay — while
         // chunk (0,0) gains a new edit. The merge must keep (1,0)'s record.
         {
-            let mut w = world().lock().unwrap_or_else(|e| e.into_inner());
+            let mut w = world().write_all();
             w.remove(&(DimId::Overworld, 1, 0));
             w.get_mut(&(DimId::Overworld, 0, 0))
                 .unwrap()
@@ -4259,7 +4255,7 @@ mod anvil_io_tests {
         // An mca-bearing directory without level.dat is still world data: a
         // load imports the chunks instead of reinitializing over them.
         std::fs::remove_file(dir.join("level.dat")).unwrap();
-        world().lock().unwrap_or_else(|e| e.into_inner()).clear();
+        world().clear();
         let load = live_anvil_load_dir(&dir).unwrap();
         assert!(!load.initialized, "region data alone means this is not fresh");
         assert!(!load.level_loaded);
@@ -4462,7 +4458,7 @@ mod anvil_io_tests {
         let dirt = name_to_state("dirt").expect("dirt state");
         let key = (DimId::Overworld, 0i32, 0i32);
         {
-            let mut w = world().lock().unwrap_or_else(|e| e.into_inner());
+            let mut w = world().write_all();
             w.clear();
             w.insert(key, HashMap::from([(local_idx(1, 70, 2), stone)]));
         }
@@ -4489,7 +4485,7 @@ mod anvil_io_tests {
 
         // A single changed block breaks the fingerprint and persists cleanly.
         {
-            let mut w = world().lock().unwrap_or_else(|e| e.into_inner());
+            let mut w = world().write(&key);
             w.get_mut(&key)
                 .unwrap()
                 .insert(local_idx(5, 71, 5), dirt);
@@ -4592,7 +4588,7 @@ mod anvil_io_tests {
         let _fixture = AnvilWorldFixture::capture(&[]);
         let stone = name_to_state("stone").expect("stone state");
         {
-            let mut w = world().lock().unwrap_or_else(|e| e.into_inner());
+            let mut w = world().write_all();
             w.clear();
             for cx in 0..2i32 {
                 w.insert(

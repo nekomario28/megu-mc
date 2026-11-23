@@ -1260,7 +1260,7 @@ fn rebuild_derived_indexes() {
         .get()
         .map(|owner| owner.lock().unwrap_or_else(|e| e.into_inner()).owned.clone())
         .unwrap_or_default();
-    let w = world().lock().unwrap_or_else(|e| e.into_inner());
+    let w = world().read_all();
     let mut wtr = waters().lock().unwrap_or_else(|e| e.into_inner());
     let mut hh = hoppers().lock().unwrap_or_else(|e| e.into_inner());
     let mut cg = crops().lock().unwrap_or_else(|e| e.into_inner());
@@ -1358,7 +1358,7 @@ fn world_save_dir() -> std::path::PathBuf {
 /// file, and one reader for both, so "the Overworld's table" and "the same format for another
 /// dimension" cannot drift into two formats.
 fn save_dim_overlay_into(dim: DimId, f: &mut Vec<u8>) -> usize {
-    let w = world().lock().unwrap_or_else(|e| e.into_inner());
+    let w = world().read_all();
     let chunks: Vec<(&DimChunkKey, &HashMap<u32, u32>)> =
         w.iter().filter(|(key, _)| key.0 == dim).collect();
     let count = chunks.len();
@@ -1399,7 +1399,7 @@ fn read_dim_overlay(
 }
 
 fn apply_dim_overlay(chunks: HashMap<DimChunkKey, HashMap<u32, u32>>) {
-    let mut world = world().lock().unwrap_or_else(|e| e.into_inner());
+    let mut world = world().write_all();
     for (key @ (dim, cx, cz), edits) in chunks {
         world.entry(key).or_default().extend(edits);
         // Only Overworld edits can invalidate the Overworld band/section caches.
@@ -5066,8 +5066,7 @@ fn decode_world_payload(payload: &[u8]) -> Result<(), &'static str> {
             // would leave a generated block where the migrating block used to be. Record air
             // explicitly: the block is now the entity, not whatever terrain is underneath it.
             world()
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
+                .write(&(DimId::Overworld, fx >> 4, fz >> 4))
                 .entry((DimId::Overworld, fx >> 4, fz >> 4))
                 .or_default()
                 .insert(local_idx(fx, fy, fz), 0);
@@ -5460,7 +5459,7 @@ fn decode_world_payload(payload: &[u8]) -> Result<(), &'static str> {
     apply_mod_bridge_trailers(mof1, aer1)?;
     eprintln!(
         "[spine] loaded {} dirty chunks",
-        world().lock().unwrap_or_else(|e| e.into_inner()).len()
+        world().len()
     );
     rebuild_derived_indexes();
     Ok(())
@@ -7436,12 +7435,7 @@ fn live_chunk_has_records(dim: DimId, cx: i32, cz: i32) -> bool {
 /// store record, and the entities parked in it.
 #[allow(dead_code)]
 fn live_resident_chunks() -> HashSet<DimChunkKey> {
-    let mut out: HashSet<DimChunkKey> = world()
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
-        .keys()
-        .copied()
-        .collect();
+    let mut out: HashSet<DimChunkKey> = world().keys().into_iter().collect();
     let block_chunk = |&(d, x, _, z): &DimBlockPos| (d, x >> 4, z >> 4);
     out.extend(
         chests()
@@ -7537,8 +7531,6 @@ fn park_evicted_chunk(dim: DimId, cx: i32, cz: i32) -> EvictedChunkArchive {
     let in_chunk = |x: i32, z: i32| x >> 4 == cx && z >> 4 == cz;
     let mut archive = EvictedChunkArchive {
         edits: world()
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
             .remove(&(dim, cx, cz))
             .unwrap_or_default(),
         ..EvictedChunkArchive::default()
@@ -7663,16 +7655,8 @@ fn park_evicted_chunk(dim: DimId, cx: i32, cz: i32) -> EvictedChunkArchive {
         .lock()
         .unwrap_or_else(|e| e.into_inner())
         .remove(&(dim, cx, cz));
-    op_bands()
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
-        .map
-        .remove(&(dim, cx, cz));
-    section_store()
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
-        .map
-        .remove(&(dim, cx, cz));
+    op_bands().map.remove(&(dim, cx, cz));
+    section_store().map.remove(&(dim, cx, cz));
     archive
 }
 
@@ -7789,8 +7773,7 @@ fn unload_unticketed_chunk_overlays(
             // The flush reads the live stores, so it runs before the drain;
             // a failed write leaves the chunk resident and loses nothing.
             let dirty = world()
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
+                .read(&(dim, cx, cz))
                 .get(&(dim, cx, cz))
                 .is_some_and(|edits| !edits.is_empty())
                 || live_chunk_has_records(dim, cx, cz);
@@ -7925,10 +7908,7 @@ fn rehydrate_evicted_chunk(dim: DimId, cx: i32, cz: i32) -> bool {
     };
     with_save_guard(|| {
         if !archive.edits.is_empty() {
-            world()
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
-                .insert((dim, cx, cz), archive.edits);
+            world().insert((dim, cx, cz), archive.edits);
         }
         for (pos, slots) in archive.chests {
             chests()
@@ -8075,18 +8055,16 @@ mod p8b4_issue105_tests {
 
     fn p8b4_overlay_len(key: DimChunkKey) -> usize {
         world()
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
+            .read(&key)
             .get(&key)
             .map_or(0, HashMap::len)
     }
 
     fn p8b4_total_overlay_cells() -> usize {
         world()
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .values()
-            .map(HashMap::len)
+            .read_all()
+            .iter()
+            .map(|(_, cells)| cells.len())
             .sum()
     }
 

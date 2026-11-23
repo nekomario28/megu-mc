@@ -7937,7 +7937,7 @@ impl LiveBlockEntityStore {
             })
             .collect::<HashSet<_>>();
         let placements = {
-            let edits = world().lock().unwrap_or_else(|e| e.into_inner());
+            let edits = world().read_all();
             if first_scan {
                 changed.extend(edits.keys().copied());
             }

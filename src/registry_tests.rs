@@ -1483,7 +1483,7 @@ fn light_scene_fingerprint() -> (usize, usize, u32, u32, Vec<u8>) {
         .iter()
         .map(|sec| sec.iter().fold(0u8, |acc, b| acc ^ b))
         .collect();
-    let chunks = world().lock().unwrap_or_else(|e| e.into_inner()).len();
+    let chunks = world().len();
     let floors = sky_floors_cache().lock().unwrap_or_else(|e| e.into_inner()).len();
     let marker = block_at(1, 250, 1);
     let tunnel = block_at(4, 7, 2);
@@ -1623,7 +1623,7 @@ fn a_panicking_scene_fixture_leaves_nothing_to_restore() {
         "marker={} tunnel={} chunks={}",
         block_at(1, 250, 1),
         block_at(4, 7, 2),
-        world().lock().unwrap_or_else(|e| e.into_inner()).len()
+        world().len()
     ));
     panic!("the fixture panicked after writing to the shared scene");
 }
@@ -3658,7 +3658,7 @@ fn dynamic_dim_save_roundtrip_survives_slot_reordering() {
     assert_eq!(first_a.index(), 3);
     assert_eq!(first_z.index(), 4);
     // An edit and a logout position in the higher-slotted dimension.
-    world().lock().unwrap_or_else(|e| e.into_inner()).insert(
+    world().insert(
         (first_z, 2, -3),
         HashMap::from([(local_idx(2, -16, 3), 17u32)]),
     );
@@ -3673,7 +3673,7 @@ fn dynamic_dim_save_roundtrip_survives_slot_reordering() {
         "a custom-dimension save carries the named DXT1 footer"
     );
     // Restart: the registry rebuilds in a different slot order.
-    world().lock().unwrap_or_else(|e| e.into_inner()).clear();
+    world().clear();
     pos_store().lock().unwrap_or_else(|e| e.into_inner()).clear();
     worldgen::reset_dimension_registry();
     let reversed = dynamic_dim_entries(&[
@@ -3692,8 +3692,7 @@ fn dynamic_dim_save_roundtrip_survives_slot_reordering() {
     // Named persistence lands the edit on the same dimension despite the new slot.
     assert!(
         world()
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
+            .read(&(second_z, 2, -3))
             .get(&(second_z, 2, -3))
             .is_some_and(|edits| edits.get(&local_idx(2, -16, 3)) == Some(&17)),
         "the chunk edit resolves to zz:z_dim's new slot"
@@ -3703,7 +3702,7 @@ fn dynamic_dim_save_roundtrip_survives_slot_reordering() {
         Some(second_z),
         "the logout dimension resolves by name"
     );
-    world().lock().unwrap_or_else(|e| e.into_inner()).clear();
+    world().clear();
     pos_store().lock().unwrap_or_else(|e| e.into_inner()).clear();
     worldgen::reset_dimension_registry();
 }

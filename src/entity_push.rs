@@ -378,7 +378,7 @@ mod entity_push_tests {
     impl PushTestWorldSnapshot {
         fn take() -> Self {
             Self {
-                world: std::mem::take(&mut *world().lock().unwrap_or_else(|e| e.into_inner())),
+                world: world().take_all(),
                 mobs: std::mem::take(&mut *mobs().lock().unwrap_or_else(|e| e.into_inner())),
                 drops: std::mem::take(&mut *drops().lock().unwrap_or_else(|e| e.into_inner())),
                 region: std::mem::take(&mut *region().lock().unwrap_or_else(|e| e.into_inner())),
@@ -399,7 +399,7 @@ mod entity_push_tests {
             *region().lock().unwrap_or_else(|e| e.into_inner()) = std::mem::take(&mut self.region);
             *drops().lock().unwrap_or_else(|e| e.into_inner()) = std::mem::take(&mut self.drops);
             *mobs().lock().unwrap_or_else(|e| e.into_inner()) = std::mem::take(&mut self.mobs);
-            *world().lock().unwrap_or_else(|e| e.into_inner()) = std::mem::take(&mut self.world);
+            world().restore_all(std::mem::take(&mut self.world));
         }
     }
 

@@ -580,8 +580,7 @@ fn queued_generation_payloads_never_take_the_save_lock_on_a_cell_read() {
         .contains_key(&(7, 20, 7)));
     let p = (8, 20, 7);
     crate::world()
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
+        .write(&(crate::worldgen::DimId::Overworld, 0, 0))
         .entry((crate::worldgen::DimId::Overworld, 0, 0))
         .or_default()
         .insert(crate::local_idx(p.0, p.1, p.2), 0);

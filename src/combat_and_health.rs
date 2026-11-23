@@ -6394,7 +6394,7 @@ mod mega_scale_t1t3_tests {
         fn take() -> Self {
             let tile_drops = GR_DO_TILE_DROPS.swap(1, Ordering::Relaxed);
             Self {
-                world: std::mem::take(&mut *world().lock().unwrap_or_else(|e| e.into_inner())),
+                world: world().take_all(),
                 primed: std::mem::take(&mut *primed().lock().unwrap_or_else(|e| e.into_inner())),
                 drops: std::mem::take(&mut *drops().lock().unwrap_or_else(|e| e.into_inner())),
                 drop_pending: std::mem::take(
@@ -6424,7 +6424,7 @@ mod mega_scale_t1t3_tests {
 
     impl std::ops::Drop for MegaWorld {
         fn drop(&mut self) {
-            *world().lock().unwrap_or_else(|e| e.into_inner()) = std::mem::take(&mut self.world);
+            world().restore_all(std::mem::take(&mut self.world));
             *primed().lock().unwrap_or_else(|e| e.into_inner()) = std::mem::take(&mut self.primed);
             *drops().lock().unwrap_or_else(|e| e.into_inner()) = std::mem::take(&mut self.drops);
             *drop_pending().lock().unwrap_or_else(|e| e.into_inner()) =
@@ -6451,7 +6451,7 @@ mod mega_scale_t1t3_tests {
     /// bypassing `set_block` so explicit entries — including air — stay in the
     /// overlay and `block_at` never evaluates worldgen inside the blast bounds.
     fn fill_cube(at: (i32, i32, i32), half: i32, st: u32) {
-        let mut w = world().lock().unwrap_or_else(|e| e.into_inner());
+        let mut w = world().write_all();
         for x in at.0 - half..=at.0 + half {
             for z in at.2 - half..=at.2 + half {
                 let c = w.entry((DimId::Overworld, x >> 4, z >> 4)).or_default();
@@ -6465,7 +6465,7 @@ mod mega_scale_t1t3_tests {
     /// Count cells still holding `st` inside the same cube, reading the overlay
     /// under one lock (a destroyed cell reads `Some(0)` or no entry at all).
     fn count_in_cube(at: (i32, i32, i32), half: i32, st: u32) -> usize {
-        let w = world().lock().unwrap_or_else(|e| e.into_inner());
+        let w = world().read_all();
         let mut n = 0usize;
         for x in at.0 - half..=at.0 + half {
             for z in at.2 - half..=at.2 + half {
