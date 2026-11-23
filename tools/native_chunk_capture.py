@@ -40,10 +40,16 @@ def main():
     ap.add_argument("cx", type=int)
     ap.add_argument("cz", type=int)
     ap.add_argument("--preset", default="overworld", choices=sorted(PRESET_WINDOW))
+    ap.add_argument("--min-y", type=int, help="Override the preset's window base y (e.g. the Nether's 0..256 dimension window instead of its 0..128 noise window)")
+    ap.add_argument("--height", type=int, help="Override the preset's window height")
     ap.add_argument("--out", required=True)
     args = ap.parse_args()
 
     min_y, height = PRESET_WINDOW[args.preset]
+    if args.min_y is not None:
+        min_y = args.min_y
+    if args.height is not None:
+        height = args.height
     world = chunk_triage.resolve_dimension_world(Path(args.world), preset=args.preset)
     chunk = chunk_triage.load_native_chunk(
         world, args.cx, args.cz, min_y_override=min_y, height_override=height
