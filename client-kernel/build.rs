@@ -31,16 +31,28 @@ fn main() {
     };
 
     let main = source("main");
-    let protocol = source("play_protocol");
-    let varint = between(&protocol, "\nfn write_varint(", "\nfn write_str(");
     let palette_src = source("paletted");
     let palette = split(&palette_src, "    pub(crate) fn write_wire(").0;
     let palette_helpers = between(
         &palette_src,
-        "\n/// VarInt byte count",
+        "\n/// Append `words` big-endian",
         "\npub(crate) fn run_paletted_bench(",
     );
-    emit("palette.rs", format!("{varint}\n{palette}}}\n{palette_helpers}\n"));
+    let varint_len = r#"
+#[inline]
+fn varint_len_u64(value: u64) -> usize {
+    megu_core::varint::varint_i32_len(value as i32)
+}
+"#;
+    let varint = r#"
+fn write_varint(out: &mut Vec<u8>, value: i64) {
+    megu_core::varint::write_varint_i32(value as i32, out);
+}
+"#;
+    emit(
+        "palette.rs",
+        format!("{varint}\n{palette}}}\n{varint_len}\n{palette_helpers}\n"),
+    );
 
     let nbt = source("nbt");
     let (read, gzip) = split(&nbt, "\npub(crate) fn read_gzip(");

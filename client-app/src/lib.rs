@@ -2,10 +2,6 @@
 //! Standalone native Minecraft 1.21.1 (Protocol 767) client library combining
 //! `megu-kernel` and `megu-client-mesh`.
 
-// `core/src/crash_report.rs` is `#[path]`-included by `crash_reporter` and
-// refers to `crate::hash`; alias the canonical module so it resolves here.
-use megu_core::hash;
-
 pub mod audio_out;
 pub mod audio_qol;
 pub mod cli;
@@ -34,3 +30,5 @@ pub mod spatial_audio;
 pub mod world;
 pub mod zip_entries;
 pub mod zsh_command_bar;
+
+pub use megu_core::crash_report;

@@ -6,8 +6,8 @@
 //! framing that core intentionally does not cover.
 
 use crate::Error;
-use Error::{ByteBudget, InvalidGzip};
 use megu_core::zip_archive::ZipError;
+use Error::{ByteBudget, InvalidGzip};
 
 pub(crate) fn decode(mut input: &[u8], budget: usize) -> Result<Vec<u8>, Error> {
     if input.is_empty() {
@@ -76,25 +76,8 @@ fn map_inflate(e: ZipError) -> Error {
 /// followed by the 8-byte trailer and any subsequent members). Returns the
 /// member bytes and the exact byte length of the deflate stream.
 ///
-/// `inflate_raw_rfc1951` reports only the output, not the consumed input
-/// length, so the stream end is found by binary search: every prefix shorter
-/// than the real stream is truncated, and every prefix at least as long
-/// decodes identically because trailing bytes are ignored. The predicate is
-/// therefore monotone and the first successful prefix length is exactly the
-/// deflate byte count (the final partial byte's padding is discarded by the
-/// gzip trailer alignment).
+/// The core decoder reports the exact number of bytes consumed, leaving the
+/// gzip trailer and subsequent members untouched.
 fn inflate_member(payload: &[u8], max_out: usize) -> Result<(Vec<u8>, usize), Error> {
-    let member = megu_core::zip_archive::inflate_raw_rfc1951(payload, max_out)
-        .map_err(map_inflate)?;
-    let mut lo = 1usize;
-    let mut hi = payload.len();
-    while lo < hi {
-        let mid = lo + (hi - lo) / 2;
-        if megu_core::zip_archive::inflate_raw_rfc1951(&payload[..mid], max_out).is_ok() {
-            hi = mid;
-        } else {
-            lo = mid + 1;
-        }
-    }
-    Ok((member, lo))
+    megu_core::zip_archive::inflate_raw_rfc1951_with_consumed(payload, max_out).map_err(map_inflate)
 }

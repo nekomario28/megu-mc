@@ -26,11 +26,8 @@
 //! body cap, `kind` `"crash"|"bug"`, `MEGU-E-XXXXXXXX` fingerprints, and a
 //! JSON receipt carrying `issue_url` / `receipt_id` / `duplicate`.
 //!
-//! `client-app` is pinned to `std`-only manifests, so the canonical
-//! `megu-core` crash-report implementation (fingerprinting +
-//! redaction) is compiled in-tree via `#[path]` rather than duplicated.
-//! The code below is byte-for-byte the same source `megu-core` ships,
-//! so fingerprints always match the core definition.
+//! Fingerprinting and redaction use the canonical implementation from
+//! `megu-core`.
 
 use std::collections::HashSet;
 use std::error::Error;
@@ -44,15 +41,7 @@ use std::process::{Command, Stdio};
 use std::sync::Mutex;
 use std::time::Duration;
 
-// The canonical implementation is compiled in place (no Cargo.toml
-// change): `#[path]` mounts the core source file as a private submodule.
-// Not every helper it exposes is used here, and the module is private, so
-// dead_code is allowed rather than letting the shared file go stale.
-#[allow(dead_code)]
-#[path = "../../core/src/crash_report.rs"]
-mod core_crash_report;
-
-pub use core_crash_report::{redact_sensitive, CrashContext};
+pub use megu_core::crash_report::{redact_sensitive, CrashContext};
 
 // --- Contract constants, mirrored from website/functions/api/report.js ---
 
