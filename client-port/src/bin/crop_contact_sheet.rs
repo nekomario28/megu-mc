@@ -564,18 +564,6 @@ fn png_encode(rgb: &[u8], w: usize, h: usize) -> Vec<u8> {
 // Hashing + entry point
 // ---------------------------------------------------------------------------
 
-/// FNV-1a 64-bit — same constants as `vanilla_plus_3d::mesh_fingerprint`.
-fn fnv1a64(bytes: &[u8]) -> u64 {
-    const OFFSET: u64 = 0xcbf2_9ce4_8422_2325;
-    const PRIME: u64 = 0x0000_0100_0000_01b3;
-    let mut h = OFFSET;
-    for &b in bytes {
-        h ^= b as u64;
-        h = h.wrapping_mul(PRIME);
-    }
-    h
-}
-
 fn out_path() -> String {
     let mut out = "target/tmp/crop_ore_contact_sheet.png".to_string();
     let mut args = std::env::args().skip(1);
@@ -635,7 +623,7 @@ fn main() {
             cell.label, cell.quads, cell.fingerprint
         );
     }
-    println!("pixel_hash=0x{:016x}", fnv1a64(&img.px));
+    println!("pixel_hash=0x{:016x}", megu_core::perf_kit::fnv1a64(&img.px));
     println!("size={}x{}", img.w, img.h);
     println!("png_bytes={}", png.len());
     println!("out={}", out);

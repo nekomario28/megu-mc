@@ -2050,27 +2050,19 @@ impl VanillaPlus3dAtlasCache {
 /// `tint_index` — the stable pin used by golden-hash tests to detect any
 /// drift in generated crop or relief geometry.
 pub fn mesh_fingerprint(mesh: &ExtrudedMesh) -> u64 {
-    const OFFSET: u64 = 0xcbf2_9ce4_8422_2325;
-    const PRIME: u64 = 0x0000_0100_0000_01b3;
-    let mut h = OFFSET;
-    let mut feed = |bytes: &[u8]| {
-        for &b in bytes {
-            h ^= b as u64;
-            h = h.wrapping_mul(PRIME);
-        }
-    };
+    let mut buf = Vec::with_capacity(mesh.quads.len() * 100);
     for q in &mesh.quads {
         for p in &q.positions {
             for &c in p {
-                feed(&c.to_bits().to_ne_bytes());
+                buf.extend_from_slice(&c.to_bits().to_ne_bytes());
             }
         }
         for uv in &q.uv {
             for &c in uv {
-                feed(&c.to_bits().to_ne_bytes());
+                buf.extend_from_slice(&c.to_bits().to_ne_bytes());
             }
         }
-        feed(&q.tint_index.to_ne_bytes());
+        buf.extend_from_slice(&q.tint_index.to_ne_bytes());
     }
-    h
+    megu_core::perf_kit::fnv1a64(&buf)
 }

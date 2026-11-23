@@ -964,14 +964,8 @@ pub fn build_entity_from_cem_boxes(
 /// Stable FNV-1a hash of ordered quad topology, floating-point bits, UVs,
 /// normals, and tint. Uses no platform hasher or timing information.
 pub fn entity_mesh_fingerprint(mesh: &ExtrudedMesh) -> u64 {
-    let mut hash = 0xcbf2_9ce4_8422_2325_u64;
-    let mut feed = |bytes: &[u8]| {
-        for &byte in bytes {
-            hash ^= u64::from(byte);
-            hash = hash.wrapping_mul(0x100_0000_01b3);
-        }
-    };
-    feed(&(mesh.quads.len() as u64).to_le_bytes());
+    let mut buf = Vec::with_capacity(mesh.quads.len() * 100);
+    buf.extend_from_slice(&(mesh.quads.len() as u64).to_le_bytes());
     for quad in &mesh.quads {
         for value in quad
             .positions
@@ -980,9 +974,9 @@ pub fn entity_mesh_fingerprint(mesh: &ExtrudedMesh) -> u64 {
             .chain(quad.normal.iter())
             .chain(quad.uv.iter().flatten())
         {
-            feed(&value.to_bits().to_le_bytes());
+            buf.extend_from_slice(&value.to_bits().to_le_bytes());
         }
-        feed(&quad.tint_index.to_le_bytes());
+        buf.extend_from_slice(&quad.tint_index.to_le_bytes());
     }
-    hash
+    megu_core::perf_kit::fnv1a64(&buf)
 }

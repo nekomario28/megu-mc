@@ -145,16 +145,15 @@ impl FaceVisibility {
         let mut visited = [0u64; WORDS];
         let mut any_open = false;
         let mut any_closed = false;
+        let mut states = [0u16; WORD_BITS];
         for (w, word) in visited.iter_mut().enumerate() {
-            let mut m = 0u64;
             for (i, &block) in blocks[w * WORD_BITS..(w + 1) * WORD_BITS]
                 .iter()
                 .enumerate()
             {
-                if blocks_sight(block) {
-                    m |= 1 << i;
-                }
+                states[i] = u16::from(blocks_sight(block));
             }
+            let m = megu_core::simd_voxel::build_non_air_bitmask_64(&states);
             *word = m;
             any_closed |= m != 0;
             any_open |= m != u64::MAX;

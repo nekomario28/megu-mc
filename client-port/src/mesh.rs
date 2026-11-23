@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: LGPL-3.0-or-later OR GPL-3.0-or-later OR AGPL-3.0-or-later
 
 use std::cell::RefCell;
+use std::sync::OnceLock;
 
 use crate::section::{
     Block, Direction, Light, MissingNeighbor, Sample, SectionView, ALL_FACES, CUTOUT, EDGE,
@@ -244,6 +245,50 @@ pub(crate) fn missing_encoded(missing: MissingNeighbor) -> (u8, u8) {
 fn spread_bytes4(x: u32) -> u64 {
     let x = (u64::from(x) | (u64::from(x) << 16)) & 0x0000_ffff_0000_ffff;
     (x | (x << 8)) & 0x00ff_00ff_00ff_00ff
+}
+
+/// Resolved once: the adaptive kernel's tier/LUT choice is fixed per host.
+fn light_merge_strategy() -> &'static megu_core::hw_adaptive_engine::ComputeStrategy {
+    static STRATEGY: OnceLock<megu_core::hw_adaptive_engine::ComputeStrategy> = OnceLock::new();
+    STRATEGY.get_or_init(|| {
+        megu_core::hw_adaptive_engine::select_compute_strategy(
+            &megu_core::hw_adaptive_engine::detect_host_hardware_caps(),
+        )
+    })
+}
+
+/// Nibble-unpack every interior row of `scratch.light`. The kernel's
+/// per-nibble max packs each cell's `max(block, sky)` light: a zero merged
+/// byte proves both cells it covers are fully dark, so fully dark rows skip
+/// their unpack and zero-fill directly.
+fn fill_light_rows(
+    block_light: &[u8; LIGHT_BYTES],
+    sky_light: &[u8; LIGHT_BYTES],
+    scratch: &mut MesherScratch,
+) {
+    let merged = megu_core::hw_adaptive_engine::max_nibble_arrays_adaptive(
+        block_light,
+        sky_light,
+        light_merge_strategy(),
+    );
+    for y in 0..EDGE {
+        let pad_y = (y + 1) * PAD_SLICE;
+        let light_y = y * (FACE_CELLS / 2);
+        for z in 0..EDGE {
+            let pad_base = pad_y + (z + 1) * PAD_EDGE + 1;
+            let src = light_y + z * (EDGE / 2);
+            if merged[src..src + EDGE / 2].iter().all(|&b| b == 0) {
+                scratch.light[pad_base..pad_base + EDGE].fill(0);
+            } else {
+                unpack_light_row(
+                    block_light,
+                    sky_light,
+                    src,
+                    &mut scratch.light[pad_base..pad_base + EDGE],
+                );
+            }
+        }
+    }
 }
 
 #[inline(always)]
@@ -502,19 +547,7 @@ fn load_interior_uniform(
             }
         }
     } else {
-        for y in 0..EDGE {
-            let pad_y = (y + 1) * PAD_SLICE;
-            let light_y = y * (FACE_CELLS / 2);
-            for z in 0..EDGE {
-                let pad_base = pad_y + (z + 1) * PAD_EDGE + 1;
-                unpack_light_row(
-                    block_light,
-                    sky_light,
-                    light_y + z * (EDGE / 2),
-                    &mut scratch.light[pad_base..pad_base + EDGE],
-                );
-            }
-        }
+        fill_light_rows(block_light, sky_light, scratch);
     }
 
     if any_fluid {
@@ -663,19 +696,7 @@ pub(crate) fn load_interior(
         };
     }
 
-    for y in 0..EDGE {
-        let pad_y = (y + 1) * PAD_SLICE;
-        let light_y = y * (FACE_CELLS / 2);
-        for z in 0..EDGE {
-            let pad_base = pad_y + (z + 1) * PAD_EDGE + 1;
-            unpack_light_row(
-                block_light,
-                sky_light,
-                light_y + z * (EDGE / 2),
-                &mut scratch.light[pad_base..pad_base + EDGE],
-            );
-        }
-    }
+    fill_light_rows(block_light, sky_light, scratch);
 
     if any_fluid {
         for y in 0..EDGE {
@@ -1367,10 +1388,27 @@ fn greedy_slice<B: BorderStates, S: QuadSink>(
         }
     }
     if adj == 0 {
+        // Every emitted quad is 1x1: only the u-axis corner component varies
+        // within a row, so build a per-row template and stamp `u` per face.
+        let (u_ax, v_ax) = direction.tangents();
+        let axis = direction.axis();
+        let pos_step = i32::from(direction.step() > 0);
+        // When u maps to the Y axis (North/East) the template must not fold in
+        // y_offset: the original order is `(u + cu) + y_offset`, so y_offset is
+        // added only after stamping `u` to keep float rounding identical.
+        let tpl_y_off = if u_ax == 1 { 0.0 } else { y_offset };
         for (v, &vis_row) in vis_rows.iter().enumerate() {
             let mut row = vis_row;
             if row == 0 {
                 continue;
+            }
+            let mut tpl = [[0.0f32; 3]; 4];
+            for (c, &(cu, cv)) in CORNERS.iter().enumerate() {
+                let mut q = [0i32; 3];
+                q[axis] = slice as i32 + pos_step;
+                q[u_ax] = cu;
+                q[v_ax] = v as i32 + cv;
+                tpl[c] = [q[0] as f32, q[1] as f32 + tpl_y_off, q[2] as f32];
             }
             let pad_row = pad_origin + v as isize * pad_v;
             let sec_row = sec_origin + v * sec_v;
@@ -1412,15 +1450,45 @@ fn greedy_slice<B: BorderStates, S: QuadSink>(
                 // SAFETY: slice, u, v in 0..16 guarantees pad_idx is an interior padded cell (1..=16)^3.
                 let shade_bits =
                     unsafe { shade_fast(occ, light, pad_idx, pad_step, pad_u, pad_v, opp_bit) };
-                let face = PackedFace::new(
-                    block.state_id,
-                    if tinted { block.tint } else { 0 },
-                    layer,
-                    if tinted { QUAD_TINTED } else { 0 },
-                    shade_bits,
-                );
-                let origin = position(slice, u, v, direction);
-                quads.push(face.quad(direction, rectangle_y(origin, direction, 1, 1, y_offset)));
+                let mut positions = tpl;
+                let uf = u as f32;
+                for c in positions.iter_mut() {
+                    c[u_ax] += uf;
+                }
+                if u_ax == 1 {
+                    for c in positions.iter_mut() {
+                        c[1] += y_offset;
+                    }
+                }
+                let tint = if tinted { block.tint } else { 0 };
+                let flags = if tinted { QUAD_TINTED } else { 0 };
+                let f0 = shade_bits & 0xfff;
+                let flat = ((shade_bits >> 12) & 0xfff) == f0
+                    && ((shade_bits >> 24) & 0xfff) == f0
+                    && ((shade_bits >> 36) & 0xfff) == f0;
+                if flat {
+                    let l = shade_bits as u8;
+                    let ao = ((shade_bits >> 8) & 3) as u8;
+                    quads.push(Quad {
+                        positions,
+                        direction,
+                        state_id: block.state_id,
+                        tint,
+                        flow: [0.0; 2],
+                        ao: [ao; 4],
+                        block_light: [l & 15; 4],
+                        sky_light: [l >> 4; 4],
+                        face_light: Light(((shade_bits >> 48) & 0xff) as u8),
+                        layer,
+                        diagonal: 0,
+                        fluid_kind: NO_FLUID,
+                        flags,
+                        reserved: 0,
+                    });
+                } else {
+                    let face = PackedFace::new(block.state_id, tint, layer, flags, shade_bits);
+                    quads.push(face.quad(direction, positions));
+                }
             }
         }
         return;

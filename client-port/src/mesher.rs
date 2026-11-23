@@ -559,22 +559,9 @@ fn auto_crop_spec(input: &BlockVisualInput) -> Option<Crop3dSpec> {
         archetype: archetype.into(),
         stage: decision.stage,
         max_stage: decision.max_stage,
-        seed: fnv1a64(input.block_id.as_bytes()),
+        seed: megu_core::perf_kit::fnv1a64(input.block_id.as_bytes()),
         block_pos: input.block_pos,
     })
-}
-
-/// FNV-1a 64-bit hash over raw bytes — the same offset/prime pair as
-/// [`crop_archetype::decision_fingerprint`], applied to the block id.
-fn fnv1a64(bytes: &[u8]) -> u64 {
-    const OFFSET: u64 = 0xcbf2_9ce4_8422_2325;
-    const PRIME: u64 = 0x0000_0100_0000_01b3;
-    let mut h = OFFSET;
-    for &b in bytes {
-        h ^= b as u64;
-        h = h.wrapping_mul(PRIME);
-    }
-    h
 }
 
 /// Crop-field `#` grid for farmed crops, the diagonal flower cross for

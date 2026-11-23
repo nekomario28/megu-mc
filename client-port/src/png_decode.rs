@@ -575,6 +575,9 @@ fn expand_to_rgba(png: &ParsedPng, raw: &[u8]) -> Result<Vec<u8>, PngDecodeError
     let height = png.height as usize;
     let row_bytes = png.row_bytes()?;
     let mut out = Vec::with_capacity(width * height * 4);
+    // Scratch for the 4-bit indexed path's SIMD unpack (identity palette).
+    let mut packed_words: Vec<u64> = Vec::new();
+    let mut idx16: Vec<u16> = Vec::new();
     // tRNS interpretations, computed once.
     let trns_gray = png
         .trns
@@ -622,22 +625,63 @@ fn expand_to_rgba(png: &ParsedPng, raw: &[u8]) -> Result<Vec<u8>, PngDecodeError
             3 => {
                 let depth = usize::from(png.bit_depth);
                 let mask = (1u16 << depth) - 1;
-                for x in 0..width {
-                    let bitpos = x * depth;
-                    let byte = row[bitpos / 8];
-                    let shift = 8 - depth - (bitpos % 8);
-                    let index = usize::from((u16::from(byte) >> shift) & mask);
-                    let rgb = *png
-                        .palette
-                        .get(index)
-                        .ok_or_else(|| bad(format!("palette index {index} out of range")))?;
-                    let alpha = png
-                        .trns
-                        .as_ref()
-                        .and_then(|t| t.get(index))
-                        .copied()
-                        .unwrap_or(u8::MAX);
-                    out.extend_from_slice(&[rgb[0], rgb[1], rgb[2], alpha]);
+                if depth == 4 {
+                    // PNG packs pixel pairs most-significant nibble first, so
+                    // each little-endian byte gather is nibble-swapped to give
+                    // the kernel its low-nibble-first order. The identity
+                    // palette renders the kernel's out-of-range clamp inert:
+                    // `idx16[x]` holds the raw index and the bounds check
+                    // below still rejects out-of-range entries.
+                    const IDENTITY: [u16; 16] = [
+                        0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15,
+                    ];
+                    packed_words.clear();
+                    packed_words.extend(row.chunks(8).map(|chunk| {
+                        let mut w = 0u64;
+                        for (i, &b) in chunk.iter().enumerate() {
+                            w |= u64::from(b) << (8 * i);
+                        }
+                        ((w >> 4) & 0x0f0f_0f0f_0f0f_0f0f)
+                            | ((w << 4) & 0xf0f0_f0f0_f0f0_f0f0)
+                    }));
+                    idx16.resize(width, 0);
+                    megu_core::simd_voxel::unpack_palette_4bit_to_u16(
+                        &packed_words,
+                        &IDENTITY,
+                        &mut idx16,
+                    );
+                    for &index in &idx16 {
+                        let index = usize::from(index);
+                        let rgb = *png
+                            .palette
+                            .get(index)
+                            .ok_or_else(|| bad(format!("palette index {index} out of range")))?;
+                        let alpha = png
+                            .trns
+                            .as_ref()
+                            .and_then(|t| t.get(index))
+                            .copied()
+                            .unwrap_or(u8::MAX);
+                        out.extend_from_slice(&[rgb[0], rgb[1], rgb[2], alpha]);
+                    }
+                } else {
+                    for x in 0..width {
+                        let bitpos = x * depth;
+                        let byte = row[bitpos / 8];
+                        let shift = 8 - depth - (bitpos % 8);
+                        let index = usize::from((u16::from(byte) >> shift) & mask);
+                        let rgb = *png
+                            .palette
+                            .get(index)
+                            .ok_or_else(|| bad(format!("palette index {index} out of range")))?;
+                        let alpha = png
+                            .trns
+                            .as_ref()
+                            .and_then(|t| t.get(index))
+                            .copied()
+                            .unwrap_or(u8::MAX);
+                        out.extend_from_slice(&[rgb[0], rgb[1], rgb[2], alpha]);
+                    }
                 }
             }
             4 => {

@@ -795,17 +795,9 @@ pub fn classify(input: &CropInput) -> CropDecision {
 /// fixed order so identical decisions hash identically and any drift in
 /// gate, archetype, confidence, stage or reasons flips the value.
 pub fn decision_fingerprint(d: &CropDecision) -> u64 {
-    const FNV_OFFSET: u64 = 0xcbf2_9ce4_8422_2325;
-    const FNV_PRIME: u64 = 0x0000_0100_0000_01b3;
-    let mut h = FNV_OFFSET;
-    let mut feed = |bytes: &[u8]| {
-        for &b in bytes {
-            h ^= b as u64;
-            h = h.wrapping_mul(FNV_PRIME);
-        }
-    };
-    feed(&[d.is_crop as u8, d.confidence, d.stage, d.max_stage]);
-    feed(&[d.archetype.map_or(0, |a| a as u8 + 1)]);
-    feed(&d.reasons.to_le_bytes());
-    h
+    let mut buf = [0u8; 9];
+    buf[..4].copy_from_slice(&[d.is_crop as u8, d.confidence, d.stage, d.max_stage]);
+    buf[4] = d.archetype.map_or(0, |a| a as u8 + 1);
+    buf[5..].copy_from_slice(&d.reasons.to_le_bytes());
+    megu_core::perf_kit::fnv1a64(&buf)
 }
