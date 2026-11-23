@@ -873,8 +873,49 @@ impl GpuApp {
                     self.status_line(format!("Open link: {err}"));
                 }
             }
+            UiAction::SubmitCrashReport => self.handle_submit_crash_report(),
             UiAction::RecipeBrowser(action) => self.dispatch_recipe_browser_action(action),
             _ => {}
+        }
+    }
+
+    /// Persist a redacted local crash report on explicit user confirmation from
+    /// the CrashRecovery screen, strictly honoring `settings.qol.crash_report_mode`.
+    fn handle_submit_crash_report(&mut self) {
+        if self.ui.settings.qol.crash_report_mode == megu_ui::state::CrashReportMode::Off {
+            self.status_line("Crash reporting is off (nothing saved or sent)");
+            return;
+        }
+        let (kind_label, summary) = self
+            .ui
+            .crash
+            .as_ref()
+            .map(|c| (c.error_kind.clone(), c.detail_message.clone()))
+            .unwrap_or_else(|| ("crash_recovery".to_string(), "client crash".to_string()));
+        let crash_dir = self
+            .config
+            .game_dir
+            .as_deref()
+            .map(|dir| dir.join("crash-reports"))
+            .unwrap_or_else(|| std::path::PathBuf::from("crash-reports"));
+        let mut env = megu_client::crash_reporter::ReportEnv::detect();
+        env.mc_version = self.config.mc_version.clone();
+        env.engine_version = format!("{} {}", crate::CLIENT_GPU_NAME, env!("CARGO_PKG_VERSION"));
+        env.subsystem = Some("client-gpu".to_string());
+        let report = megu_client::crash_reporter::capture_panic_context(
+            &env,
+            megu_client::crash_reporter::ReportKind::Crash,
+            &kind_label,
+            &summary,
+            None,
+        );
+        match megu_client::crash_reporter::write_local_report(&crash_dir, &report) {
+            Ok(path) => self.status_line(format!(
+                "Redacted crash report saved: {} (fp {})",
+                path.display(),
+                report.fingerprint
+            )),
+            Err(err) => self.status_line(format!("Crash report save failed: {err}")),
         }
     }
 
@@ -2922,6 +2963,49 @@ mod tests {
                 .any(|h| h.id == megu_ui::state::WidgetId::ReportLink),
             "ReportLink stays accessible even when show_support_links=false"
         );
+    }
+
+    #[test]
+    fn submit_crash_report_honors_off_mode_and_writes_redacted_local_report() {
+        let dir = std::env::temp_dir().join(format!(
+            "megu-gpu-crash-test-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let cfg = GpuCliConfig {
+            game_dir: Some(dir.clone()),
+            ..GpuCliConfig::default()
+        };
+        let mut app = GpuApp::new(cfg);
+        app.ui.crash = Some(megu_core::crash_report::CrashContext {
+            error_kind: "panic".to_string(),
+            culprit_mod_or_module: "client-gpu".to_string(),
+            mc_version: "1.21.1".to_string(),
+            detail_message: "panic at /home/alice/secret with 192.168.1.9".to_string(),
+        });
+
+        // Mode Off: writes nothing.
+        app.ui.settings.qol.crash_report_mode = megu_ui::state::CrashReportMode::Off;
+        app.handle_submit_crash_report();
+        assert!(
+            !dir.join("crash-reports").exists(),
+            "CrashReportMode::Off must not create crash-reports/"
+        );
+
+        // Mode Ask (after explicit UI confirmation emits SubmitCrashReport): writes redacted report.
+        app.ui.settings.qol.crash_report_mode = megu_ui::state::CrashReportMode::Ask;
+        app.handle_submit_crash_report();
+        let reports: Vec<_> = std::fs::read_dir(dir.join("crash-reports"))
+            .expect("crash-reports dir created")
+            .filter_map(Result::ok)
+            .collect();
+        assert_eq!(reports.len(), 1);
+        let body = std::fs::read_to_string(reports[0].path()).unwrap();
+        assert!(!body.contains("/home/alice"), "home path must be redacted");
+        assert!(!body.contains("192.168.1.9"), "IP must be redacted");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

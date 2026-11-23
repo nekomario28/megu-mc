@@ -31,6 +31,17 @@ fn main() -> ExitCode {
         return headless_probe(cfg.gpu_backend);
     }
 
+    let crash_dir = cfg
+        .game_dir
+        .as_deref()
+        .map(|dir| std::path::Path::new(dir).join("crash-reports"))
+        .unwrap_or_else(|| std::path::PathBuf::from("crash-reports"));
+    let mut env = megu_client::crash_reporter::ReportEnv::detect();
+    env.mc_version = cfg.mc_version.clone();
+    env.engine_version = format!("{CLIENT_GPU_NAME} {}", env!("CARGO_PKG_VERSION"));
+    env.subsystem = Some("client-gpu".to_string());
+    megu_client::crash_reporter::install_panic_hook(crash_dir, env);
+
     if let Some((host, port)) = &cfg.connect {
         if !cfg.offline_demo {
             println!(
