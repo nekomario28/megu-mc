@@ -10,6 +10,7 @@ pub mod builtin_shadow_wgsl;
 mod cache;
 pub mod classic_ores;
 mod column;
+pub mod compact_vertex;
 pub mod crop_archetype;
 mod cull;
 mod culler;
@@ -58,6 +59,11 @@ pub use ber_instancing::{
 pub use cache::{
     build_and_pack_section_mesh, BuiltSectionMesh, MeshCache, ReleasedMeshMeta, SectionCoord,
     SectionMeshInput, DEFAULT_RESORT_THRESHOLD, PRIORITY_ZERO_NEAR_RADIUS_BLOCKS,
+};
+pub use compact_vertex::{
+    pack_vertices_compact, try_pack_vertices_compact, CompactVoxelVertex,
+    COMPACT_VERTEX_MAX_EDGE, COMPACT_VERTEX_MAX_STATE_ID, COMPACT_VERTEX_MAX_TINT,
+    COMPACT_VERTEX_MAX_Y_FIXED, COMPACT_VERTEX_WGSL_UNPACK,
 };
 pub use cull::{box_facing_mask, box_in_frustum, SectionVis};
 pub use culler::{through_bit, CullResult, GraphCuller, SectionGraph, THROUGH_ALL};
