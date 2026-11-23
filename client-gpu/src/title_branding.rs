@@ -148,61 +148,113 @@ const MIN_BANNER_H: u32 = 8;
 const MAX_BANNER_W: u32 = 4096;
 const MAX_BANNER_H: u32 = 1024;
 
-/// Clean-room 8×9 chunky 3D-blocky pixel-art glyphs for `M E G U` matching the
-/// bold squared proportions of the `EDITION` stone lettering. Bit `c` of each
-/// row byte marks glyph column `c` (`0` = leftmost of 8).
-const GLYPH_ROWS: usize = 9;
-const GLYPH_COLS: usize = 8;
-const MEGU_GLYPHS: [[u8; GLYPH_ROWS]; 4] = [
-    // M (chunky vertical legs + crisp center V matching the blocky logo aesthetic)
-    [
-        0b11000011,
-        0b11100111,
-        0b11111111,
-        0b11011011,
-        0b11011011,
-        0b11000011,
-        0b11000011,
-        0b11000011,
-        0b11000011,
-    ],
-    // E (exact squared bars matching the adjacent `E` in EDITION)
-    [
-        0b11111111,
-        0b11111111,
-        0b00000011,
-        0b01111111,
-        0b01111111,
-        0b00000011,
-        0b00000011,
-        0b11111111,
-        0b11111111,
-    ],
-    // G (crisp squared outer corners matching EDITION's D/O geometry)
-    [
-        0b11111111,
-        0b11111111,
-        0b00000011,
-        0b00000011,
-        0b11110011,
-        0b11110011,
-        0b11000011,
-        0b11111111,
-        0b11111111,
-    ],
-    // U (crisp squared bowl matching EDITION's D/O/N weight)
-    [
-        0b11000011,
-        0b11000011,
-        0b11000011,
-        0b11000011,
-        0b11000011,
-        0b11000011,
-        0b11000011,
-        0b11111111,
-        0b11111111,
-    ],
-];
+/// Continuous normalized (`u, v in [0.0, 1.0]`) vector-stroke membership test
+/// for clean-room `M`, `E` (fallback), `G`, `U` matching `EDITION`'s exact
+/// stroke weight (`sv ≈ 0.25`, `sh ≈ 0.23`) so 4×4 supersampling produces
+/// smooth anti-aliased slanted edges indistinguishable from `EDITION`.
+fn glyph_face_contains(letter_idx: usize, u: f32, v: f32) -> bool {
+    if !(0.0..=1.0).contains(&u) || !(0.0..=1.0).contains(&v) {
+        return false;
+    }
+    const SV: f32 = 0.25; // vertical stem thickness (matches EDITION's ~10/42 px)
+    const SH: f32 = 0.23; // horizontal bar thickness (matches EDITION's ~9/39 px)
+    match letter_idx {
+        // M: vertical outer legs + crisp angled inner V meeting cleanly at center
+        0 => {
+            if u <= SV || u >= 1.0 - SV {
+                return true;
+            }
+            // Symmetric inward diagonal legs from top outer shoulders into center V
+            let d = (u - 0.5).abs(); // 0 at center, 0.5 at outer edges
+            // Center V bottom sits at v = 0.60, inner notch top at v = 0.30
+            let v_upper = 0.30 * (1.0 - (d / 0.28).min(1.0));
+            let v_lower = v_upper + 0.30;
+            v >= v_upper && v <= v_lower && d <= 0.30
+        }
+        // E (fallback when EDITION's first letter cannot be isolated): exact EDITION E proportions
+        1 => {
+            u <= SV
+                || v <= SH
+                || v >= 1.0 - SH
+                || ((0.5 - SH * 0.5)..=(0.5 + SH * 0.5)).contains(&v) && u <= 0.88
+        }
+        // G: exact EDITION squared outer frame with clean upper-right gap + bold inner hook
+        2 => {
+            u <= SV
+                || v <= SH
+                || v >= 1.0 - SH
+                || (u >= 1.0 - SV && v >= 0.45)
+                || (u >= 0.48 && (0.45..=(0.45 + SH)).contains(&v))
+        }
+        // U: exact EDITION squared outer legs + bottom bar
+        3 => u <= SV || u >= 1.0 - SV || v >= 1.0 - SH,
+        _ => false,
+    }
+}
+
+/// Bilinearly sample an RGBA image at floating-point coordinates (clamped transparent outside).
+fn sample_rgba_bilinear(rgba: &[u8], width: u32, height: u32, x: f32, y: f32) -> [f32; 4] {
+    let x0 = x.floor() as i32;
+    let y0 = y.floor() as i32;
+    let fx = x - x0 as f32;
+    let fy = y - y0 as f32;
+    let fetch = |ix: i32, iy: i32| -> [f32; 4] {
+        if ix < 0 || iy < 0 || ix >= width as i32 || iy >= height as i32 {
+            return [0.0; 4];
+        }
+        let i = (iy as u32 * width + ix as u32) as usize * 4;
+        let a = f32::from(rgba[i + 3]) / 255.0;
+        // Premultiplied alpha avoids dark fringes when interpolating near transparent edges.
+        [
+            f32::from(rgba[i]) * a,
+            f32::from(rgba[i + 1]) * a,
+            f32::from(rgba[i + 2]) * a,
+            a,
+        ]
+    };
+    let c00 = fetch(x0, y0);
+    let c10 = fetch(x0 + 1, y0);
+    let c01 = fetch(x0, y0 + 1);
+    let c11 = fetch(x0 + 1, y0 + 1);
+    let mut out = [0.0f32; 4];
+    for k in 0..4 {
+        let top = c00[k] * (1.0 - fx) + c10[k] * fx;
+        let bot = c01[k] * (1.0 - fx) + c11[k] * fx;
+        out[k] = top * (1.0 - fy) + bot * fy;
+    }
+    out
+}
+
+/// Locate the first isolated letter (`E`) inside `EDITION` (`right_box`) using
+/// bright-face columns so we can reuse the real anti-aliased `E` glyph verbatim.
+fn find_first_right_letter_span(
+    rgba: &[u8],
+    width: u32,
+    right_box: PatchRect,
+) -> Option<(u32, u32)> {
+    let mut x0 = None;
+    let mut x1 = None;
+    for x in right_box.x..right_box.x + right_box.w {
+        let has_bright = (right_box.y..right_box.y + right_box.h).any(|y| {
+            let i = (y * width + x) as usize * 4;
+            rgba[i + 3] >= 200 && luma(&rgba[i..i + 4]) >= 1000
+        });
+        if has_bright {
+            x0.get_or_insert(x);
+            x1 = Some(x);
+        } else if x0.is_some() {
+            break;
+        }
+    }
+    let (a, b) = (x0?, x1?);
+    let letter_w = b - a + 1;
+    // Must be a genuine single letter (not the entire right_box solid bar).
+    if letter_w >= 8 && letter_w * 3 < right_box.w * 2 {
+        Some((a, b))
+    } else {
+        None
+    }
+}
 /// Quick luma for palette ranking (deterministic, no float, range 0..=2550).
 fn luma(px: &[u8]) -> u32 {
     u32::from(px[0]) * 3 + u32::from(px[1]) * 6 + u32::from(px[2])
@@ -412,6 +464,15 @@ pub fn patch_edition_banner_to_megu(
     let left_box = word_box(first as u32, gap_start as u32 - 1);
     let right_box = word_box(gap_end as u32, last as u32);
     let palette = sample_palette(rgba, width, right_box)?;
+    let reused_e_span = find_first_right_letter_span(rgba, width, right_box);
+
+    // Snapshot untouched source RGBA (used purely read-only to copy/warp the
+    // real `E` from `EDITION` into slot #1 of `MEGU`).
+    let src_snapshot = if reused_e_span.is_some() {
+        Some(rgba.to_vec())
+    } else {
+        None
+    };
 
     let x_limit = gap_end as u32 - 1;
     let mut painter = Painter {
@@ -433,111 +494,25 @@ pub fn patch_edition_banner_to_megu(
         }
     }
 
-    // Measure exact 3D stone proportions directly from `right_box.h`:
-    //   - outer black border: ~7% of total height (4 px at 512x64, 1 px at 128x16)
-    //   - 3D downward extrusion underside: ~14% of total height (8 px at 512x64)
-    //   - stone front face fills the remaining ~72% between top border and bevel
-    let outline_px = ((right_box.h + 7) / 14).max(1) as i32;
-    let bevel_px = ((right_box.h * 15) / 100).max(1) as i32;
-    let face_y0 = right_box.y as i32 + outline_px;
-    let face_h = (right_box.h as i32 - 2 * outline_px - bevel_px).max(GLYPH_ROWS as i32);
+    // Exact 3D stone proportions measured directly from `right_box.h`:
+    let outline_f = ((right_box.h as f32) / 14.5).max(1.0);
+    let outline_px = outline_f.round() as i32;
+    let bevel_f = ((right_box.h as f32) * 0.145).max(1.0);
+    let face_y0 = right_box.y as f32 + outline_f;
+    let face_h = (right_box.h as f32 - 2.0 * outline_f - bevel_f).max(6.0);
 
-    // Lay out `M E G U` across `left_box` with crisp inter-letter spacing so
-    // the outer border never collides between letters or into `EDITION`.
-    let avail_w = (left_box.w as i32 - 2 * outline_px).max(4 * GLYPH_COLS as i32);
-    let letter_gap = ((right_box.h / 10).max(2) as i32).min(avail_w / 10);
-    let glyph_w = ((avail_w - 3 * letter_gap) / 4).max(GLYPH_COLS as i32);
-    let total_w = 4 * glyph_w + 3 * letter_gap;
-    let base_x = left_box.x as i32 + ((left_box.w as i32 - total_w) / 2).max(outline_px);
+    // Match `EDITION`'s exact letter width (`~42 px` at 512x64) and inter-letter gap.
+    let avail_w = (left_box.w as f32 - 2.0 * outline_f).max(16.0);
+    let letter_gap = ((right_box.h as f32) * 0.11).clamp(1.5, avail_w * 0.08);
+    let glyph_w = ((avail_w - 3.0 * letter_gap) / 4.0).max(4.0);
+    let total_w = 4.0 * glyph_w + 3.0 * letter_gap;
+    let base_x = left_box.x as f32 + ((left_box.w as f32 - total_w) * 0.5).max(outline_f);
 
     // Central vanishing-point perspective matching original `JAVA EDITION`:
-    // every column leans inward toward banner center `cx = width / 2`, so the
-    // leftmost `M` mirrors the rightmost `N` of `EDITION` (~21% of face height
-    // top lean at the outer edge, tapering linearly to ~0 at center), and the
-    // 3D extrusion pulls downward + slightly inward toward `cx`.
     let cx_f = (width as f32) * 0.5;
-    let max_edge_lean = (face_h as f32) * 0.22;
+    let max_edge_lean = face_h * 0.20;
 
-    let mw = x_limit as usize;
-    let mh = height as usize;
-    let mut face_mask = vec![false; mw * mh];
-
-    for (li, glyph) in MEGU_GLYPHS.iter().enumerate() {
-        let lx0 = base_x + li as i32 * (glyph_w + letter_gap);
-        for py in 0..face_h {
-            let r = ((py as usize) * GLYPH_ROWS) / (face_h as usize);
-            let y_frac = (face_h - 1 - py) as f32 / (face_h.max(2) - 1) as f32;
-            let y = face_y0 + py;
-            if y < 0 || y >= mh as i32 {
-                continue;
-            }
-            for px in 0..glyph_w {
-                let c = ((px as usize) * GLYPH_COLS) / (glyph_w as usize);
-                if glyph[r] & (1 << c) == 0 {
-                    continue;
-                }
-                let raw_x = lx0 + px;
-                let u = ((cx_f - raw_x as f32) / cx_f).clamp(0.0, 1.0);
-                let lean = (u * max_edge_lean * y_frac).round() as i32;
-                let x = raw_x + lean;
-                if x >= 0 && x < mw as i32 {
-                    face_mask[y as usize * mw + x as usize] = true;
-                }
-            }
-        }
-    }
-
-    // Pass 1: 3D extruded stone underside (`bevel_mask`) pulling downward and
-    // subtly inward toward the center vanishing point, matching `JAVA`'s 3D
-    // right-facing side wall and bottom extrusion.
-    let mut bevel_mask = vec![false; mw * mh];
-    for y in 0..mh {
-        for x in 0..mw {
-            if !face_mask[y * mw + x] {
-                continue;
-            }
-            let u = ((cx_f - x as f32) / cx_f).clamp(0.0, 1.0);
-            for step in 1..=bevel_px as usize {
-                let by = y + step;
-                let dx = (u * 0.42 * step as f32).round() as usize;
-                let bx = x + dx;
-                if by < mh && bx < mw && !face_mask[by * mw + bx] {
-                    bevel_mask[by * mw + bx] = true;
-                }
-                // Also fill straight-down column so thin angled edges stay watertight.
-                if by < mh && !face_mask[by * mw + x] {
-                    bevel_mask[by * mw + x] = true;
-                }
-            }
-        }
-    }
-
-    // Pass 2: Outer black border via crisp squared (Chebyshev) dilation of
-    // `face_mask | bevel_mask`, matching EDITION's sharp 90-degree corners.
-    let mut outline_mask = vec![false; mw * mh];
-    for y in 0..mh as i32 {
-        for x in 0..mw as i32 {
-            let idx = y as usize * mw + x as usize;
-            if !face_mask[idx] && !bevel_mask[idx] {
-                continue;
-            }
-            for dy in -outline_px..=outline_px {
-                let ny = y + dy;
-                if ny < 0 || ny >= mh as i32 {
-                    continue;
-                }
-                for dx in -outline_px..=outline_px {
-                    let nx = x + dx;
-                    if nx >= 0 && nx < mw as i32 {
-                        outline_mask[ny as usize * mw + nx as usize] = true;
-                    }
-                }
-            }
-        }
-    }
-
-    // Blend helper for subtle 1-px top-rim and face-to-bevel lip transitions
-    // matching EDITION's real anti-aliased stone lip shading.
+    // Blend helper for crisp stone lip shading matching EDITION.
     let blend = |a: [u8; 4], b: [u8; 4], num: u16, den: u16| -> [u8; 4] {
         [
             ((u16::from(a[0]) * (den - num) + u16::from(b[0]) * num) / den) as u8,
@@ -546,51 +521,257 @@ pub fn patch_edition_banner_to_megu(
             255,
         ]
     };
-    let top_edge_shade = blend(palette.fill, palette.bevel, 15, 100);
-    let bevel_lip_shade = blend(palette.fill, palette.bevel, 45, 100);
+    let top_edge_shade = blend(palette.fill, palette.bevel, 14, 100);
+    let bevel_lip_shade = blend(palette.fill, palette.bevel, 44, 100);
 
-    // Pass 3: Paint back-to-front: outline -> 3D stone underside (with 1-px
-    // lip blend right below the bright rim) -> bright stone front face (with
-    // subtle top edge shading & bright bottom bevel rim matching EDITION).
-    for y in 0..mh {
-        for x in 0..mw {
-            let idx = y * mw + x;
-            if outline_mask[idx] && !bevel_mask[idx] && !face_mask[idx] {
-                painter.put(x as i32, y as i32, palette.outline);
+    // 4×4 supersampled smooth anti-aliased rasterizer for M, (E fallback), G, U!
+    // Working on a 4x grid gives smooth slanted edges, crisp squared outlines,
+    // exact 3D inward extrusion, and anti-aliased transitions matching EDITION.
+    const SS: usize = 4;
+    let ss_f = SS as f32;
+    let mw = x_limit as usize;
+    let mh = height as usize;
+    let hi_w = mw * SS;
+    let hi_h = mh * SS;
+    let mut hi_face = vec![false; hi_w * hi_h];
+
+    let skip_e = reused_e_span.is_some();
+    for li in 0..4usize {
+        if li == 1 && skip_e {
+            continue;
+        }
+        let lx0 = base_x + li as f32 * (glyph_w + letter_gap);
+        // Bounding hi-res box with generous lean padding
+        let y_min = ((face_y0 - 1.0).max(0.0) * ss_f) as usize;
+        let y_max = (((face_y0 + face_h + 1.0) * ss_f).ceil() as usize).min(hi_h);
+        let x_min = ((lx0 - 2.0).max(0.0) * ss_f) as usize;
+        let x_max = (((lx0 + glyph_w + max_edge_lean + 2.0) * ss_f).ceil() as usize).min(hi_w);
+        for hy in y_min..y_max {
+            let sy = (hy as f32 + 0.5) / ss_f;
+            let v = (sy - face_y0) / face_h;
+            if !(0.0..=1.0).contains(&v) {
+                continue;
+            }
+            let y_frac = 1.0 - v;
+            for hx in x_min..x_max {
+                let sx = (hx as f32 + 0.5) / ss_f;
+                // Invert `sx = raw_x + ((cx - raw_x)/cx) * max_edge_lean * y_frac`
+                let k = (max_edge_lean * y_frac) / cx_f;
+                let raw_x = (sx - max_edge_lean * y_frac) / (1.0 - k).max(0.1);
+                let u = (raw_x - lx0) / glyph_w;
+                if glyph_face_contains(li, u, v) {
+                    hi_face[hy * hi_w + hx] = true;
+                }
             }
         }
     }
-    for y in 0..mh {
-        for x in 0..mw {
-            let idx = y * mw + x;
-            if bevel_mask[idx] {
-                let just_below_face = y > 0 && face_mask[(y - 1) * mw + x];
-                let color = if just_below_face && bevel_px >= 4 {
-                    bevel_lip_shade
-                } else {
-                    palette.bevel
-                };
-                painter.put(x as i32, y as i32, color);
+
+    // Pass 1 (4× grid): 3D extruded stone underside pulling down + inward toward `cx`.
+    let hi_bevel_steps = (bevel_f * ss_f).round().max(1.0) as usize;
+    let mut hi_bevel = vec![false; hi_w * hi_h];
+    for hy in 0..hi_h {
+        for hx in 0..hi_w {
+            if !hi_face[hy * hi_w + hx] {
+                continue;
+            }
+            let sx = (hx as f32 + 0.5) / ss_f;
+            let u_center = ((cx_f - sx) / cx_f).clamp(0.0, 1.0);
+            for step in 1..=hi_bevel_steps {
+                let by = hy + step;
+                if by >= hi_h {
+                    break;
+                }
+                let bx = hx + (u_center * 0.36 * step as f32).round() as usize;
+                if bx < hi_w && !hi_face[by * hi_w + bx] {
+                    hi_bevel[by * hi_w + bx] = true;
+                }
+                if !hi_face[by * hi_w + hx] {
+                    hi_bevel[by * hi_w + hx] = true;
+                }
             }
         }
     }
+
+    // Pass 2 (4× grid): Crisp squared outer border via separable 1D box dilation (O(W*H)!).
+    let hi_rad = (outline_f * ss_f).round().max(1.0) as isize;
+    let mut hi_horiz = vec![false; hi_w * hi_h];
+    for hy in 0..hi_h {
+        let row_off = hy * hi_w;
+        let mut count = 0i32;
+        for hx in 0..hi_w {
+            let add_x = hx as isize + hi_rad;
+            if add_x < hi_w as isize {
+                let idx = row_off + add_x as usize;
+                if hi_face[idx] || hi_bevel[idx] {
+                    count += 1;
+                }
+            }
+            if hx == 0 {
+                for init_x in 0..=(hi_rad.min(hi_w as isize - 1)) {
+                    let idx = row_off + init_x as usize;
+                    if hi_face[idx] || hi_bevel[idx] {
+                        count += 1;
+                    }
+                }
+                if add_x < hi_w as isize {
+                    let idx = row_off + add_x as usize;
+                    if hi_face[idx] || hi_bevel[idx] {
+                        count -= 1;
+                    }
+                }
+            }
+            let rem_x = hx as isize - hi_rad - 1;
+            if rem_x >= 0 {
+                let idx = row_off + rem_x as usize;
+                if hi_face[idx] || hi_bevel[idx] {
+                    count -= 1;
+                }
+            }
+            hi_horiz[row_off + hx] = count > 0;
+        }
+    }
+    let mut hi_outline = vec![false; hi_w * hi_h];
+    for hx in 0..hi_w {
+        let mut count = 0i32;
+        for hy in 0..hi_h {
+            if hy == 0 {
+                for init_y in 0..=(hi_rad.min(hi_h as isize - 1)) {
+                    if hi_horiz[init_y as usize * hi_w + hx] {
+                        count += 1;
+                    }
+                }
+            } else {
+                let add_y = hy as isize + hi_rad;
+                if add_y < hi_h as isize && hi_horiz[add_y as usize * hi_w + hx] {
+                    count += 1;
+                }
+                let rem_y = hy as isize - hi_rad - 1;
+                if rem_y >= 0 && hi_horiz[rem_y as usize * hi_w + hx] {
+                    count -= 1;
+                }
+            }
+            hi_outline[hy * hi_w + hx] = count > 0;
+        }
+    }
+
+    // Pass 3: Downsample 4×4 subpixels with premultiplied RGBA averaging -> butter-smooth edges!
+    let lip_thresh = SS;
     for y in 0..mh {
         for x in 0..mw {
-            let idx = y * mw + x;
-            if face_mask[idx] {
-                let above_bevel = y + 1 < mh && bevel_mask[(y + 1) * mw + x];
-                let top_edge = y == 0 || !face_mask[(y - 1) * mw + x];
-                let color = if above_bevel {
-                    palette.highlight
-                } else if top_edge && bevel_px >= 4 {
-                    top_edge_shade
-                } else {
-                    palette.fill
-                };
-                painter.put(x as i32, y as i32, color);
+            let mut acc_r = 0.0f32;
+            let mut acc_g = 0.0f32;
+            let mut acc_b = 0.0f32;
+            let mut acc_a = 0.0f32;
+            for sy in 0..SS {
+                let hy = y * SS + sy;
+                for sx in 0..SS {
+                    let hx = x * SS + sx;
+                    let idx = hy * hi_w + hx;
+                    let col = if hi_face[idx] {
+                        let above_bevel =
+                            hy + lip_thresh < hi_h && hi_bevel[(hy + lip_thresh) * hi_w + hx];
+                        let near_top = hy < lip_thresh || !hi_face[(hy - lip_thresh) * hi_w + hx];
+                        if above_bevel {
+                            Some(palette.highlight)
+                        } else if near_top && bevel_f >= 3.5 {
+                            Some(top_edge_shade)
+                        } else {
+                            Some(palette.fill)
+                        }
+                    } else if hi_bevel[idx] {
+                        let just_below_face =
+                            hy >= lip_thresh && hi_face[(hy - lip_thresh) * hi_w + hx];
+                        if just_below_face && bevel_f >= 3.5 {
+                            Some(bevel_lip_shade)
+                        } else {
+                            Some(palette.bevel)
+                        }
+                    } else if hi_outline[idx] {
+                        Some(palette.outline)
+                    } else {
+                        None
+                    };
+                    if let Some(c) = col {
+                        acc_r += f32::from(c[0]);
+                        acc_g += f32::from(c[1]);
+                        acc_b += f32::from(c[2]);
+                        acc_a += 1.0;
+                    }
+                }
+            }
+            if acc_a > 0.0 {
+                let samples = (SS * SS) as f32;
+                let a_out = ((acc_a / samples) * 255.0).round().clamp(0.0, 255.0) as u8;
+                if a_out > 0 {
+                    let r_out = (acc_r / acc_a).round().clamp(0.0, 255.0) as u8;
+                    let g_out = (acc_g / acc_a).round().clamp(0.0, 255.0) as u8;
+                    let b_out = (acc_b / acc_a).round().clamp(0.0, 255.0) as u8;
+                    painter.put(x as i32, y as i32, [r_out, g_out, b_out, a_out]);
+                }
             }
         }
     }
+
+    // Pass 4: Reuse the REAL anti-aliased stone `E` directly from `EDITION`
+    // into slot #1 of `MEGU`, bilinearly perspective-warped to slot #1's exact
+    // central vanishing-point angle!
+    if let (Some((e_x0, e_x1)), Some(src)) = (reused_e_span, src_snapshot.as_deref()) {
+        let e_src_w = (e_x1 - e_x0 + 1) as f32;
+        let pad = outline_f.ceil() as i32;
+        let src_min_x = (e_x0 as i32 - pad).max(0) as f32;
+        let src_max_x = (e_x1 as i32 + pad).min(width as i32 - 1) as f32;
+        let dst_lx0 = base_x + 1.0 * (glyph_w + letter_gap);
+        let scale_x = e_src_w / glyph_w;
+        let y_start = right_box.y as i32;
+        let y_end = (right_box.y + right_box.h) as i32;
+        let x_start = ((dst_lx0 - outline_f - 2.0).floor() as i32).max(0);
+        let x_end = ((dst_lx0 + glyph_w + max_edge_lean + outline_f + 2.0).ceil() as i32)
+            .min(x_limit as i32);
+        for y in y_start..y_end {
+            let v = ((y as f32 - face_y0) / face_h).clamp(0.0, 1.0);
+            let y_frac = 1.0 - v;
+            let k = (max_edge_lean * y_frac) / cx_f;
+            for x in x_start..x_end {
+                let raw_x = (x as f32 - max_edge_lean * y_frac) / (1.0 - k).max(0.1);
+                let src_x = e_x0 as f32 + (raw_x - dst_lx0) * scale_x;
+                if src_x < src_min_x || src_x > src_max_x {
+                    continue;
+                }
+                let s = sample_rgba_bilinear(src, width, height, src_x, y as f32);
+                if s[3] > 0.02 {
+                    let a_u8 = (s[3] * 255.0).round().clamp(0.0, 255.0) as u8;
+                    let r_u8 = (s[0] / s[3]).round().clamp(0.0, 255.0) as u8;
+                    let g_u8 = (s[1] / s[3]).round().clamp(0.0, 255.0) as u8;
+                    let b_u8 = (s[2] / s[3]).round().clamp(0.0, 255.0) as u8;
+                    // Alpha-over onto painter buffer so soft outer AA blends cleanly.
+                    let i = (y as u32 * width + x as u32) as usize * 4;
+                    let dst_a = f32::from(painter.rgba[i + 3]) / 255.0;
+                    let out_a = s[3] + dst_a * (1.0 - s[3]);
+                    if out_a > 0.001 {
+                        let cr = (s[0] + f32::from(painter.rgba[i]) * dst_a * (1.0 - s[3])) / out_a;
+                        let cg =
+                            (s[1] + f32::from(painter.rgba[i + 1]) * dst_a * (1.0 - s[3])) / out_a;
+                        let cb =
+                            (s[2] + f32::from(painter.rgba[i + 2]) * dst_a * (1.0 - s[3])) / out_a;
+                        let oa = (out_a * 255.0).round().clamp(0.0, 255.0) as u8;
+                        painter.put(
+                            x,
+                            y,
+                            [
+                                cr.round().clamp(0.0, 255.0) as u8,
+                                cg.round().clamp(0.0, 255.0) as u8,
+                                cb.round().clamp(0.0, 255.0) as u8,
+                                oa.max(a_u8),
+                            ],
+                        );
+                    } else {
+                        painter.put(x, y, [r_u8, g_u8, b_u8, a_u8]);
+                    }
+                }
+            }
+        }
+    }
+    let _ = outline_px;
 
     Ok(EditionPatchReport {
         width,
