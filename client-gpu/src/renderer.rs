@@ -54,6 +54,7 @@ use crate::live_session::hw_adaptive_engine::{
     detect_universal_hardware_profile, select_compute_strategy, ComputeStrategy,
     GpuComputeParadigm, MemoryFootprintClass, MemoryTransferStrategy,
 };
+use crate::live_session::{ExternalSectionsDelta, LiveSession};
 use crate::mat4_mul;
 use crate::mesh_pool::{
     compute_opaque_bucket_ranges, HiZSplatSection, MeshJob, MeshJobPool, MeshResult,
@@ -908,6 +909,28 @@ impl PendingSectionUpload {
     }
 }
 
+/// Apply a drained [`ExternalSectionsDelta`] to a renderer-side
+/// `external_sections` mirror: `cleared` first, then removals, then
+/// upserts cloned out of the live map. Only touched coords clone —
+/// steady frames reach this path never (the revision gate skips them).
+pub fn apply_external_sections_delta(
+    target: &mut BTreeMap<SectionCoord, ExternalSectionMesh>,
+    delta: &ExternalSectionsDelta,
+    source: &BTreeMap<SectionCoord, ExternalSectionMesh>,
+) {
+    if delta.cleared {
+        target.clear();
+    }
+    for coord in &delta.removals {
+        target.remove(coord);
+    }
+    for coord in &delta.upserts {
+        if let Some(mesh) = source.get(coord) {
+            target.insert(*coord, mesh.clone());
+        }
+    }
+}
+
 /// A section upload payload produced outside `WorldState::packed_meshes`
 /// — the off-thread `MeshJob::SectionMesh` lane (opaque-bucketed packed
 /// stream + translucent tail) and the priority-0 same-frame lane share
@@ -1717,6 +1740,32 @@ fn region_caster_wgsl(caster_source: &str) -> String {
     out
 }
 
+/// Retained structure-of-arrays section bounds for the SIMD batch
+/// frustum cull — [`GpuRenderer::cull_live_sections`] resyncs them only
+/// when `cull_world_revision` moves (zero repacking on camera-only
+/// frames) and feeds them to
+/// `megu_core::simd_voxel::batch_aabb_frustum_cull_soa`, which culls 16
+/// sections/op on AVX-512, 8 on AVX2, 4 on NEON, 1 on scalar.
+#[derive(Default)]
+struct CullSectionSoa {
+    /// `cull_world_revision` the arrays mirror — `None` until the first
+    /// sync (an initial `0` would alias the pristine world revision).
+    revision: Option<u64>,
+    /// Drawable-section coords, index-parallel with the bound arrays.
+    coords: Vec<SectionCoord>,
+    min_x: Vec<f32>,
+    min_y: Vec<f32>,
+    min_z: Vec<f32>,
+    max_x: Vec<f32>,
+    max_y: Vec<f32>,
+    max_z: Vec<f32>,
+    /// Bit `i`: `coords[i]` was already rejected before the frustum
+    /// verdict (the sub-pixel fast path) — parallel word mask.
+    pre_culled: Vec<u64>,
+    /// Packed per-section visibility words the kernel writes per frame.
+    visible_bits: Vec<u64>,
+}
+
 /// Inputs that decide [`GpuRenderer::cull_live_sections`]: the camera's
 /// containing section (the [`GraphCuller`] BFS root), the view-projection
 /// bit pattern (frustum planes + Hi-Z view-match), the live-section
@@ -2131,6 +2180,26 @@ pub struct GpuRenderer {
     /// yet. An entry is authoritative while its coord is still loaded and
     /// has no `packed_meshes` entry; the world publish retires it.
     pub external_sections: BTreeMap<SectionCoord, ExternalSectionMesh>,
+    /// `LiveSession::external_sections_rev` the mirror is synced to —
+    /// `None` until the first [`Self::sync_external_sections_from`]
+    /// (a fresh attach mirrors the full map once).
+    external_sections_rev: Option<u64>,
+    /// Full `external_sections` mirrors (first attach / defensive
+    /// fallback), cumulative — must stay ≤ 1 per renderer lifetime in
+    /// steady sessions.
+    pub external_section_full_syncs: u64,
+    /// Delta applies (only changed coords cloned), cumulative.
+    pub external_section_delta_syncs: u64,
+    /// Frames the revision gate skipped the sync outright, cumulative.
+    pub external_section_sync_skips: u64,
+    /// Retained Hi-Z splat section list: `mem::take`n into each
+    /// `MeshJob::HiZDepth`, drained on the worker and returned via
+    /// `MeshResult::HiZDepth::sections` — capacity survives the
+    /// round-trip so steady frames allocate nothing.
+    hiz_splat_scratch: Vec<HiZSplatSection>,
+    /// Worker-returned splat buffers recycled into `hiz_splat_scratch`,
+    /// cumulative — proves the capacity round-trip executes live.
+    pub hiz_splat_recycled: u64,
     /// Visibility graphs mirrored from the world on the last
     /// [`Self::update_live_terrain`] pass; feeds the composed frame's
     /// [`GraphCuller`] search. Empty until the first terrain sync.
@@ -2170,6 +2239,12 @@ pub struct GpuRenderer {
     /// Retained scratch for the graph-culler visible set — cleared and
     /// refilled on cache misses instead of a fresh `HashSet` each frame.
     cull_graph_scratch: HashSet<SectionCoord>,
+    /// Retained SoA bounds + bitmasks for the SIMD batch frustum cull —
+    /// resynced lazily on `cull_world_revision` changes only.
+    cull_soa: CullSectionSoa,
+    /// SoA bound-array rebuilds, cumulative — proves the resync stays
+    /// revision-gated (steady camera frames never repack).
+    pub cull_soa_resyncs: u64,
     /// Inputs that produced `cull_result`: unchanged inputs reuse the
     /// cached set directly (`cull_cache_hits += 1`, ~0 µs).
     cull_cache_key: Option<CullCacheKey>,
@@ -5650,6 +5725,12 @@ impl GpuRenderer {
             upload_budget,
             pending_uploads: BTreeMap::new(),
             external_sections: BTreeMap::new(),
+            external_sections_rev: None,
+            external_section_full_syncs: 0,
+            external_section_delta_syncs: 0,
+            external_section_sync_skips: 0,
+            hiz_splat_scratch: Vec::new(),
+            hiz_splat_recycled: 0,
             section_graphs: HashMap::new(),
             hiz_pyramid: None,
             hiz_source_vp: None,
@@ -5660,6 +5741,8 @@ impl GpuRenderer {
             cull_graphs_stamp: 0,
             cull_result: HashSet::new(),
             cull_graph_scratch: HashSet::new(),
+            cull_soa: CullSectionSoa::default(),
+            cull_soa_resyncs: 0,
             cull_cache_key: None,
             cull_hiz_count: 0,
             cull_subpixel_count: 0,
@@ -7031,6 +7114,36 @@ impl GpuRenderer {
         Ok(())
     }
 
+    /// Sync [`Self::external_sections`] from a live session's
+    /// `external_sections_rev` + delta stream — the zero-clone path that
+    /// replaces the old per-frame `BTreeMap::clone_from`. Steady frames
+    /// (no external-mesh completion/removal since the last call) return
+    /// after a single revision compare; dirty frames clone only the
+    /// touched coords via [`apply_external_sections_delta`]. A fresh
+    /// renderer mirrors the full map exactly once, then tracks deltas.
+    pub fn sync_external_sections_from(&mut self, live: &mut LiveSession) {
+        if self.external_sections_rev == Some(live.external_sections_rev) {
+            self.external_section_sync_skips += 1;
+            return;
+        }
+        if self.external_sections_rev.is_none() {
+            // First attach: the delta stream predates this renderer —
+            // mirror the map wholesale and discard pending events.
+            self.external_sections
+                .clone_from(&live.external_sections);
+            live.discard_external_sections_delta();
+            self.external_section_full_syncs += 1;
+        } else if let Some(delta) = live.take_external_sections_delta() {
+            apply_external_sections_delta(
+                &mut self.external_sections,
+                &delta,
+                &live.external_sections,
+            );
+            self.external_section_delta_syncs += 1;
+        }
+        self.external_sections_rev = Some(live.external_sections_rev);
+    }
+
     /// Reconcile the resident section set with `world` and queue changed
     /// sections for upload. GPU buffer creation is deferred to the render
     /// loop's [`ChunkUploadBudget`]-gated drain so a chunk burst spreads
@@ -7624,7 +7737,18 @@ impl GpuRenderer {
                         },
                     );
                 }
-                MeshResult::HiZDepth { view_proj, pyramid } => {
+                MeshResult::HiZDepth {
+                    view_proj,
+                    pyramid,
+                    sections,
+                } => {
+                    // The worker drained the list during quad extraction —
+                    // recycle the emptied buffer as the next job's scratch
+                    // when it carries more capacity than what's parked.
+                    if sections.capacity() > self.hiz_splat_scratch.capacity() {
+                        self.hiz_splat_scratch = sections;
+                        self.hiz_splat_recycled += 1;
+                    }
                     // `hiz_dirty` means residency moved after the job was
                     // submitted — its pyramid may still hold occluders that
                     // no longer exist, so drop it and let the next frame
@@ -7665,7 +7789,11 @@ impl GpuRenderer {
         {
             return;
         }
-        let mut sections = Vec::with_capacity(self.live_sections.len());
+        // Retained scratch: `mem::take` moves the capacity into the job;
+        // the worker drains the list and returns it in the result, so
+        // steady frames never reallocate the splat section vector.
+        let mut sections = std::mem::take(&mut self.hiz_splat_scratch);
+        sections.clear();
         for (coord, section) in &self.live_sections {
             if self.cull_result.contains(coord) || section.opaque_index_total == 0 {
                 continue;
@@ -7688,6 +7816,8 @@ impl GpuRenderer {
         }) {
             self.hiz_dirty = false;
         }
+        // A saturated queue drops the job and its buffer with it — the
+        // scratch simply reallocates on the next frame's submission.
     }
 
     /// Grow the shared quad index buffer past the largest referenced
@@ -8003,53 +8133,141 @@ impl GpuRenderer {
                     .as_ref()
                     .map(|_| view_proj_row_major(view_proj)),
             };
-            for (coord, section) in self.live_sections.iter() {
-                if section.opaque_index_total == 0 && section.terrain.translucent_index_count == 0 {
-                    continue;
-                }
-                let min = [
-                    coord.0 as f32 * EDGE as f32,
-                    coord.1 as f32 * EDGE as f32,
-                    coord.2 as f32 * EDGE as f32,
-                ];
-                // O(1) sub-pixel reject ahead of every other test: a
-                // section whose bounding sphere projects under half a
-                // pixel covers no sample point — cheaper than Hi-Z or
-                // frustum work, and a distance-only check can never
-                // false-cull a near or camera-enclosing section.
-                if is_subpixel_section(camera_position, min, focal_y_px) {
-                    culled.insert(*coord);
-                    subpixel_culled += 1;
-                    continue;
-                }
-                // Hi-Z runs before graph/frustum culling: a view-matched
-                // pyramid only reports occlusion the previous frame's
-                // drawn occluders prove, so a depth-culled section stays
-                // culled regardless of which conservative test fires first.
-                if let (Some(hiz), Some(rows)) = (&self.hiz_pyramid, &hiz_rows) {
-                    let max = [
-                        min[0] + EDGE as f32,
-                        min[1] + EDGE as f32,
-                        min[2] + EDGE as f32,
-                    ];
-                    if hiz.cull_world_aabb(rows, min, max) {
-                        culled.insert(*coord);
-                        hiz_culled += 1;
+            // Revision-gated SoA resync: only a residency change repacks
+            // the retained bounds — a camera-only frame reuses them
+            // verbatim (zero allocation, zero map walk).
+            if self.cull_soa.revision != Some(self.cull_world_revision) {
+                let edge = EDGE as f32;
+                let soa = &mut self.cull_soa;
+                soa.coords.clear();
+                soa.min_x.clear();
+                soa.min_y.clear();
+                soa.min_z.clear();
+                soa.max_x.clear();
+                soa.max_y.clear();
+                soa.max_z.clear();
+                for (coord, section) in self.live_sections.iter() {
+                    if section.opaque_index_total == 0
+                        && section.terrain.translucent_index_count == 0
+                    {
                         continue;
                     }
+                    let min = [
+                        coord.0 as f32 * edge,
+                        coord.1 as f32 * edge,
+                        coord.2 as f32 * edge,
+                    ];
+                    soa.coords.push(*coord);
+                    soa.min_x.push(min[0]);
+                    soa.min_y.push(min[1]);
+                    soa.min_z.push(min[2]);
+                    soa.max_x.push(min[0] + edge);
+                    soa.max_y.push(min[1] + edge);
+                    soa.max_z.push(min[2] + edge);
                 }
-                let visible = if self.section_graphs.contains_key(coord) {
-                    graph_visible.is_some_and(|set| set.contains(coord))
+                soa.revision = Some(self.cull_world_revision);
+                self.cull_soa_resyncs += 1;
+            }
+            let hiz_pyramid = self.hiz_pyramid.as_ref();
+            let section_graphs = &self.section_graphs;
+            let soa = &mut self.cull_soa;
+            let n = soa.coords.len();
+            let words = n.div_ceil(64);
+            soa.pre_culled.clear();
+            soa.pre_culled.resize(words, 0);
+            // O(1) sub-pixel reject ahead of every other test — same
+            // precedence as the old loop: a section whose bounding sphere
+            // projects under half a pixel covers no sample point, and a
+            // distance-only check can never false-cull a near or
+            // camera-enclosing section.
+            for i in 0..n {
+                let min = [soa.min_x[i], soa.min_y[i], soa.min_z[i]];
+                if is_subpixel_section(camera_position, min, focal_y_px) {
+                    soa.pre_culled[i / 64] |= 1_u64 << (i % 64);
+                    culled.insert(soa.coords[i]);
+                    subpixel_culled += 1;
+                }
+            }
+            // The SIMD batch frustum cull — 16 sections/op on AVX-512,
+            // 8 on AVX2, 4 on NEON, 1 on scalar — replacing the old
+            // per-section `section_frustum_visible` calls. The kernel's
+            // positive-vertex verdict is bit-identical (same planes,
+            // same min/max bounds).
+            soa.visible_bits.clear();
+            soa.visible_bits.resize(words, 0);
+            megu_core::simd_voxel::batch_aabb_frustum_cull_soa(
+                &soa.min_x,
+                &soa.min_y,
+                &soa.min_z,
+                &soa.max_x,
+                &soa.max_y,
+                &soa.max_z,
+                &planes,
+                &mut soa.visible_bits,
+            );
+            // Hi-Z runs before the frustum verdict — same precedence as
+            // the old per-section loop, so a view-matched pyramid's
+            // occlusion report and the `hiz_culled` accounting stay
+            // bit-identical (a rejected lane never reaches the
+            // graph/frustum check at all). `pre_culled` doubles as the
+            // hiz-rejected mask after this pass.
+            if let (Some(hiz), Some(rows)) = (hiz_pyramid, &hiz_rows) {
+                for w in 0..words {
+                    let rem = n - w * 64;
+                    let valid = if rem >= 64 {
+                        u64::MAX
+                    } else {
+                        (1_u64 << rem) - 1
+                    };
+                    let mut pending = !soa.pre_culled[w] & valid;
+                    while pending != 0 {
+                        let i = w * 64 + pending.trailing_zeros() as usize;
+                        pending &= pending - 1;
+                        if hiz.cull_world_aabb(
+                            rows,
+                            [soa.min_x[i], soa.min_y[i], soa.min_z[i]],
+                            [soa.max_x[i], soa.max_y[i], soa.max_z[i]],
+                        ) {
+                            soa.pre_culled[w] |= 1_u64 << (i % 64);
+                            culled.insert(soa.coords[i]);
+                            hiz_culled += 1;
+                        }
+                    }
+                }
+            }
+            for w in 0..words {
+                let rem = n - w * 64;
+                let valid = if rem >= 64 {
+                    u64::MAX
                 } else {
-                    // The Lipschitz uniform-tile sweep proves strictly
-                    // inside/outside planes from one centre sample and
-                    // leaves only mixed planes to the exact p-vertex
-                    // test — same verdict as `box_in_frustum`, fewer
-                    // support-point evaluations away from boundaries.
-                    section_frustum_visible(min, &planes)
+                    (1_u64 << rem) - 1
                 };
-                if !visible {
-                    culled.insert(*coord);
+                // Frustum survivors: walk only set bits via trailing_zeros.
+                let mut survivors = soa.visible_bits[w] & !soa.pre_culled[w];
+                while survivors != 0 {
+                    let i = w * 64 + survivors.trailing_zeros() as usize;
+                    survivors &= survivors - 1;
+                    let coord = soa.coords[i];
+                    if section_graphs.contains_key(&coord)
+                        && !graph_visible.is_some_and(|set| set.contains(&coord))
+                    {
+                        // Graph-covered coords take the BFS verdict, not
+                        // the frustum bit.
+                        culled.insert(coord);
+                    }
+                }
+                // Rejected lanes cull outright — except graph-covered
+                // coords the BFS still proves visible.
+                let mut rejected = !soa.visible_bits[w] & !soa.pre_culled[w] & valid;
+                while rejected != 0 {
+                    let i = w * 64 + rejected.trailing_zeros() as usize;
+                    rejected &= rejected - 1;
+                    let coord = soa.coords[i];
+                    if !(section_graphs.contains_key(&coord)
+                        && graph_visible.is_some_and(|set| set.contains(&coord)))
+                    {
+                        culled.insert(coord);
+                    }
                 }
             }
             self.cull_graph_scratch = graph_scratch;
@@ -8736,6 +8954,12 @@ impl GpuRenderer {
 
     pub fn live_section_count(&self) -> usize {
         self.live_sections.len()
+    }
+
+    /// The coords the most recent CPU cull recompute (or cache hit)
+    /// marked invisible — the same set the composed pass skips.
+    pub fn culled_sections(&self) -> &HashSet<SectionCoord> {
+        &self.cull_result
     }
 
     /// Update the `section` uniform (world origin + biome tint).

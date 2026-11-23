@@ -118,6 +118,10 @@ pub enum MeshResult {
     HiZDepth {
         view_proj: Mat4,
         pyramid: Option<HiZPyramid>,
+        /// The job's section list, drained empty during quad extraction
+        /// but returned with its capacity intact — the renderer recycles
+        /// it as the next frame's splat scratch instead of allocating.
+        sections: Vec<HiZSplatSection>,
     },
 }
 
@@ -244,10 +248,13 @@ fn execute(job: MeshJob, hiz_scratch: &mut HiZScratch) -> MeshResult {
         }
         MeshJob::HiZDepth {
             view_proj,
-            sections,
+            mut sections,
         } => MeshResult::HiZDepth {
             view_proj,
-            pyramid: build_hiz_pyramid(&view_proj, sections, hiz_scratch),
+            pyramid: build_hiz_pyramid(&view_proj, &mut sections, hiz_scratch),
+            // `extract_splat_quads` drained the list — the emptied buffer
+            // rides back so the render thread reuses its capacity.
+            sections,
         },
     }
 }
@@ -423,7 +430,7 @@ struct HiZScratch {
 /// plane are dropped rather than approximated.
 fn build_hiz_pyramid(
     view_proj: &Mat4,
-    sections: Vec<HiZSplatSection>,
+    sections: &mut Vec<HiZSplatSection>,
     scratch: &mut HiZScratch,
 ) -> Option<HiZPyramid> {
     let (width, height) = (HIZ_PYRAMID_WIDTH as usize, HIZ_PYRAMID_HEIGHT as usize);
@@ -441,14 +448,15 @@ fn build_hiz_pyramid(
 
 /// Extract every splat-eligible quad of `sections` into `scratch.quads`:
 /// bucket ranges filtered by `draw_mask`, translucent quads skipped —
-/// exactly the set the inline splat used to walk. Consuming the section
+/// exactly the set the inline splat used to walk. Draining the section
 /// list drops each `packed` handle as soon as its quads are read, so a
 /// `HiZDepth` job pins vertex buffers only until extraction finishes,
-/// not through rasterization and the channel round-trip back.
-fn extract_splat_quads(sections: Vec<HiZSplatSection>, scratch: &mut HiZScratch) {
+/// not through rasterization and the channel round-trip back — and the
+/// emptied `Vec` keeps its capacity for the renderer's next job.
+fn extract_splat_quads(sections: &mut Vec<HiZSplatSection>, scratch: &mut HiZScratch) {
     scratch.quads.clear();
     scratch.spans.clear();
-    for section in sections {
+    for section in sections.drain(..) {
         let first = scratch.quads.len();
         let quad_total = section.packed.len() / 4;
         match section.buckets {
@@ -949,7 +957,7 @@ mod tests {
             let scene = random_scene(&mut rng);
             let legacy = legacy_depth_grid(vp, &scene);
             let mut scratch = HiZScratch::default();
-            let pyramid = build_hiz_pyramid(vp, clone_sections(&scene), &mut scratch)
+            let pyramid = build_hiz_pyramid(vp, &mut clone_sections(&scene), &mut scratch)
                 .expect("pyramid builds");
             assert_eq!(
                 scratch.depth, legacy,
@@ -1005,7 +1013,7 @@ mod tests {
             0xff,
         );
         let mut scratch = HiZScratch::default();
-        let pyramid = build_hiz_pyramid(&vp, vec![wall], &mut scratch).expect("pyramid");
+        let pyramid = build_hiz_pyramid(&vp, &mut vec![wall], &mut scratch).expect("pyramid");
         // The wall covers every texel at ndc z = (5 - 0.5) / 5.
         let expected = (5.0f32 - 0.5) / 5.0;
         assert!(
@@ -1030,7 +1038,7 @@ mod tests {
             xy_quad(0.0, 0.0, 16.0, 16.0, 9.0, TRANSLUCENT),  // translucent
             xy_quad(0.0, 0.0, 16.0, 16.0, 10.0, WATER),       // water
         ];
-        let sections = vec![make_section(
+        let mut sections = vec![make_section(
             [-8.0, -8.0, 8.0],
             &quads,
             Some(buckets_with_counts([1, 0, 1, 1, 0, 0, 0])),
@@ -1038,7 +1046,7 @@ mod tests {
             (1 << 1) | (1 << 4),
         )];
         let mut scratch = HiZScratch::default();
-        let pyramid = build_hiz_pyramid(&vp, sections, &mut scratch).expect("pyramid");
+        let pyramid = build_hiz_pyramid(&vp, &mut sections, &mut scratch).expect("pyramid");
         assert!(scratch.depth.iter().all(|&d| d == 1.0));
         let rows = view_proj_row_major(&vp);
         assert!(!pyramid.cull_world_aabb(&rows, [-2.0, -2.0, 60.0], [2.0, 2.0, 64.0]));
@@ -1059,7 +1067,7 @@ mod tests {
             0xff,
         )];
         let mut scratch = HiZScratch::default();
-        let _ = build_hiz_pyramid(&vp, clone_sections(&big), &mut scratch);
+        let _ = build_hiz_pyramid(&vp, &mut clone_sections(&big), &mut scratch);
         let (depth_cap, quads_cap, spans_cap) = (
             scratch.depth.capacity(),
             scratch.quads.capacity(),
@@ -1071,7 +1079,7 @@ mod tests {
         );
         assert!(quads_cap > 0, "first job populated the compact stream");
         let pyramid =
-            build_hiz_pyramid(&vp, clone_sections(&small), &mut scratch).expect("pyramid");
+            build_hiz_pyramid(&vp, &mut clone_sections(&small), &mut scratch).expect("pyramid");
         assert_eq!(scratch.depth.capacity(), depth_cap);
         assert_eq!(scratch.quads.capacity(), quads_cap);
         assert_eq!(scratch.spans.capacity(), spans_cap);
@@ -1117,10 +1125,18 @@ mod tests {
                 draw_mask: 0xff,
             }],
         }));
-        let MeshResult::HiZDepth { view_proj, pyramid } = next_result(&pool) else {
+        let MeshResult::HiZDepth {
+            view_proj,
+            pyramid,
+            sections,
+        } = next_result(&pool) else {
             panic!("expected HiZDepth result");
         };
         assert_eq!(view_proj, vp);
+        assert!(
+            sections.is_empty() && sections.capacity() >= 1,
+            "the result returns the drained section list for scratch reuse"
+        );
         let pyramid = pyramid.expect("pyramid built");
         let rows = view_proj_row_major(&vp);
         assert!(pyramid.cull_world_aabb(&rows, [-2.0, -2.0, 40.0], [2.0, 2.0, 44.0]));

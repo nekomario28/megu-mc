@@ -268,6 +268,104 @@ fn cs_cull(@builtin(global_invocation_id) id: vec3<u32>) {
 }
 "#;
 
+/// Subgroup cull entry point: same cull verdicts and buffer writes as
+/// [`SECTION_CULL_WGSL`]'s `cs_cull`, but the three stat counters are
+/// subgroup-reduced (`subgroupAdd`) so only the first active lane of each
+/// wave — Wave64 on AMD GCN/RDNA, Wave32 on RDNA, Warp32 on NVIDIA, the
+/// Xe subgroup on Intel — issues the global `atomicAdd`. VRAM atomic
+/// contention drops by the subgroup width (32x–64x) instead of scaling
+/// with section count. `subgroupBroadcastFirst(lane)` elects the single
+/// accumulating lane (`subgroupElect()` is the WGSL-standard spelling —
+/// Naga 30 lowers `subgroupBroadcastFirst`, which is the identical
+/// "lowest active lane" predicate).
+const SECTION_CULL_SUBGROUP_ENTRY: &str = r#"@compute @workgroup_size(64)
+fn cs_cull(@builtin(global_invocation_id) id: vec3<u32>,
+           @builtin(subgroup_invocation_id) lane: u32) {
+    let index = id.x;
+    var frustum_cull = 0u;
+    var hiz_cull = 0u;
+    var visible = 0u;
+    if (index < u32(u.params.w)) {
+        let section = sections[index];
+        let lo = section.aabb_min.xyz;
+        let hi = section.aabb_max.xyz;
+        let mask = section_draw_mask(lo, u.camera_pos.xyz);
+        out_masks[index] = mask;
+        var instance_count = 0u;
+        if (!aabb_in_frustum(lo, hi)) {
+            frustum_cull = 1u;
+        } else if (hiz_occluded(lo, hi)) {
+            hiz_cull = 1u;
+        } else {
+            instance_count = 1u;
+            visible = 1u;
+        }
+        out_args[index] = IndirectArgs(
+            section.index_count,
+            instance_count,
+            section.first_index,
+            section.base_vertex,
+            section.first_instance);
+    }
+    // One ballot-free reduce per counter: every active lane contributes
+    // its 0/1 verdict; the elected lane adds the wave totals — at most
+    // three atomics per subgroup no matter how many sections it held.
+    let frustum_sum = subgroupAdd(frustum_cull);
+    let hiz_sum = subgroupAdd(hiz_cull);
+    let visible_sum = subgroupAdd(visible);
+    if (lane == subgroupBroadcastFirst(lane)) {
+        if (frustum_sum > 0u) {
+            atomicAdd(&out_stats.frustum_culled, frustum_sum);
+        }
+        if (hiz_sum > 0u) {
+            atomicAdd(&out_stats.hiz_culled, hiz_sum);
+        }
+        if (visible_sum > 0u) {
+            atomicAdd(&out_stats.visible_count, visible_sum);
+        }
+    }
+}
+"#;
+
+/// Subgroup variant of [`SECTION_CULL_WGSL`]: the shared prefix
+/// (structs, bindings, `aabb_in_frustum`, `section_draw_mask`,
+/// `hiz_occluded`) is inherited verbatim — spliced at the compute entry
+/// point so the two shaders can never drift apart — and only the
+/// stats-accumulation tail differs. Requires `wgpu::Features::SUBGROUP`;
+/// use [`section_cull_wgsl`] for the capability-gated selection.
+///
+/// No `enable subgroups;` directive: in Naga 30 the WGSL `subgroups`
+/// enable-extension is still unimplemented (its parser reports
+/// `EnableExtensionNotYetImplemented`, tracking wgpu#5555). wgpu gates
+/// subgroup built-ins entirely through `Features::SUBGROUP` /
+/// `Capabilities::SUBGROUP` validation instead — the feature grant IS
+/// the enable mechanism on this toolchain, so the module compiles only
+/// where subgroup ops are legal anyway.
+pub fn section_cull_subgroup_wgsl() -> String {
+    const ANCHOR: &str = "@compute @workgroup_size(64)\nfn cs_cull";
+    let split = SECTION_CULL_WGSL
+        .find(ANCHOR)
+        .expect("SECTION_CULL_WGSL entry anchor missing");
+    format!(
+        "{}{}",
+        &SECTION_CULL_WGSL[..split],
+        SECTION_CULL_SUBGROUP_ENTRY
+    )
+}
+
+/// Capability-gated section-cull WGSL: the subgroup-reduced module when
+/// the device granted `wgpu::Features::SUBGROUP`
+/// ([`AdapterReport::subgroup_ops`]), the per-invocation-atomic baseline
+/// everywhere else. Both modules share the same bind layout and
+/// `cs_cull` signature — the swap is a pure pipeline choice.
+pub fn section_cull_wgsl(subgroups: bool) -> std::borrow::Cow<'static, str> {
+    if subgroups {
+        std::borrow::Cow::Owned(section_cull_subgroup_wgsl())
+    } else {
+        std::borrow::Cow::Borrowed(SECTION_CULL_WGSL)
+    }
+}
+
 /// POD mirror of the WGSL `CullUniforms` (192 bytes).
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Default, Pod, Zeroable)]
@@ -353,6 +451,10 @@ pub struct GpuHizCuller {
     float_to_mip0: wgpu::ComputePipeline,
     downsample: wgpu::ComputePipeline,
     cull: wgpu::ComputePipeline,
+    /// Subgroup-reduced cull pipeline — `Some` only when the device
+    /// granted `wgpu::Features::SUBGROUP`, so [`Self::encode_cull`]
+    /// falls back to `cull` unchanged elsewhere.
+    cull_subgroup: Option<wgpu::ComputePipeline>,
     /// `true` once any `build_*` method has written the pyramid — the
     /// renderer's cull path refuses to depth-cull an unbuilt (zeroed =
     /// nearest-depth) pyramid so it can never produce false culls.
@@ -361,6 +463,9 @@ pub struct GpuHizCuller {
     pub hiz_build_dispatches: u64,
     /// Section-cull dispatches issued.
     pub cull_dispatches: u64,
+    /// Section-cull dispatches through the subgroup-reduced pipeline —
+    /// proves the capability-gated path executes live when granted.
+    pub subgroup_cull_dispatches: u64,
 }
 
 impl GpuHizCuller {
@@ -524,6 +629,20 @@ impl GpuHizCuller {
             label: Some("gpu-section-cull"),
             source: wgpu::ShaderSource::Wgsl(SECTION_CULL_WGSL.into()),
         });
+        // Subgroup-reduced stats accumulation: compiled only when the
+        // device granted SUBGROUP — the capability check is the feature
+        // gate (`AdapterReport::subgroup_ops` probed the same bit).
+        let cull_subgroup_module = device
+            .features()
+            .contains(wgpu::Features::SUBGROUP)
+            .then(|| {
+                device.create_shader_module(wgpu::ShaderModuleDescriptor {
+                    label: Some("gpu-section-cull-subgroup"),
+                    source: wgpu::ShaderSource::Wgsl(
+                        section_cull_subgroup_wgsl().into(),
+                    ),
+                })
+            });
         let pipeline = |layout: &wgpu::BindGroupLayout, module: &wgpu::ShaderModule, ep: &str| {
             let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
                 label: Some("gpu-hiz-pipeline-layout"),
@@ -543,6 +662,9 @@ impl GpuHizCuller {
         let float_to_mip0 = pipeline(&float_src_layout, &downsample_module, "cs_r32_to_mip0");
         let downsample = pipeline(&float_src_layout, &downsample_module, "cs_downsample");
         let cull = pipeline(&cull_layout, &cull_module, "cs_cull");
+        let cull_subgroup = cull_subgroup_module
+            .as_ref()
+            .map(|module| pipeline(&cull_layout, module, "cs_cull"));
         Self {
             pyramid,
             pyramid_view,
@@ -557,9 +679,11 @@ impl GpuHizCuller {
             float_to_mip0,
             downsample,
             cull,
+            cull_subgroup,
             pyramid_ready: false,
             hiz_build_dispatches: 0,
             cull_dispatches: 0,
+            subgroup_cull_dispatches: 0,
         }
     }
 
@@ -579,6 +703,13 @@ impl GpuHizCuller {
     /// Pyramid mip count.
     pub fn mip_count(&self) -> u32 {
         self.mip_count
+    }
+
+    /// Whether [`Self::encode_cull`] dispatches the subgroup-reduced
+    /// pipeline — `true` only on devices that granted
+    /// `wgpu::Features::SUBGROUP` at creation.
+    pub fn subgroup_cull_active(&self) -> bool {
+        self.cull_subgroup.is_some()
     }
 
     /// The `R32Float` pyramid texture (readback/inspection).
@@ -764,11 +895,15 @@ impl GpuHizCuller {
                 label: Some("gpu-section-cull"),
                 timestamp_writes: None,
             });
-            pass.set_pipeline(&self.cull);
+            // Capability-gated at construction: SUBGROUP devices run the
+            // subgroup-reduced module (1 atomicAdd per counter per wave),
+            // everything else keeps the per-invocation atomic path.
+            pass.set_pipeline(self.cull_subgroup.as_ref().unwrap_or(&self.cull));
             pass.set_bind_group(0, &bind_group, &[]);
             pass.dispatch_workgroups(count.div_ceil(64), 1, 1);
         }
         self.cull_dispatches += 1;
+        self.subgroup_cull_dispatches += u64::from(self.cull_subgroup.is_some());
     }
 
     /// Lane `GPU-INDIRECT-AND-OPT-WIRE` entry point — identical to

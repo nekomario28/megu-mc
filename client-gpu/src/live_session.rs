@@ -985,6 +985,29 @@ fn state_sprite_assignments(
     out
 }
 
+/// Per-coord `external_sections` changes pending renderer delivery —
+/// the delta queue that lets `window.rs` mirror the map without
+/// cloning it every frame. Apply order is `cleared` first (a wholesale
+/// reset, e.g. dimension change), then `removals`, then `upserts`
+/// re-read from the live map so the mirror always lands the freshest
+/// payload regardless of how many times a coord churned between drains.
+#[derive(Default)]
+pub struct ExternalSectionsDelta {
+    /// The map was cleared since the last drain — wipe the mirror first.
+    pub cleared: bool,
+    /// Coords inserted or replaced since the last drain.
+    pub upserts: BTreeSet<SectionCoord>,
+    /// Coords removed since the last drain.
+    pub removals: BTreeSet<SectionCoord>,
+}
+
+impl ExternalSectionsDelta {
+    /// `true` when the drain carries no change — the renderer skips it.
+    pub fn is_empty(&self) -> bool {
+        !self.cleared && self.upserts.is_empty() && self.removals.is_empty()
+    }
+}
+
 /// Owns UI-facing world data on the event-loop thread. The worker owns its socket.
 pub struct LiveSession {
     incoming: Receiver<WorkerMessage>,
@@ -1135,6 +1158,15 @@ pub struct LiveSession {
     /// entries are pruned each poll once their `content_epoch` or
     /// `world_revision` moves on.
     pub external_sections: BTreeMap<SectionCoord, ExternalSectionMesh>,
+    /// Revision bumped on every `external_sections` mutation — the
+    /// renderer mirror compares it against its synced revision and
+    /// skips the delivery outright on steady frames (zero map clones).
+    pub external_sections_rev: u64,
+    /// Renderer-bound per-coord changes accumulated since the last
+    /// [`Self::take_external_sections_delta`] drain — latest write wins
+    /// per coord, so the drain carries each touched section exactly once
+    /// no matter how many mutations landed between frames.
+    external_section_delta: ExternalSectionsDelta,
     /// Lazily-spawned worker pool for `MeshJob::SectionMesh` bulk
     /// meshing — created only when a dirty tail actually exceeds the
     /// inline rebuild budget, so quiet or headless sessions never pay a
@@ -1543,6 +1575,8 @@ impl LiveSession {
             terrain_full_sync: true,
             terrain_order_sweep: false,
             external_sections: BTreeMap::new(),
+            external_sections_rev: 0,
+            external_section_delta: ExternalSectionsDelta::default(),
             section_mesh_workers: None,
             section_mesh_lane: SectionMeshLane::default(),
             offthread_candidates: BTreeSet::new(),
@@ -2127,6 +2161,81 @@ impl LiveSession {
         }
     }
 
+    /// Record an `external_sections` insert/replace for the renderer
+    /// delta stream and bump the revision the sync gates on.
+    fn mark_external_upsert(&mut self, coord: SectionCoord) {
+        self.external_sections_rev = self.external_sections_rev.wrapping_add(1);
+        self.external_section_delta.removals.remove(&coord);
+        self.external_section_delta.upserts.insert(coord);
+    }
+
+    /// Record an `external_sections` removal — latest write wins, so a
+    /// previously-queued upsert for the same coord is superseded.
+    fn mark_external_removed(&mut self, coord: SectionCoord) {
+        self.external_sections_rev = self.external_sections_rev.wrapping_add(1);
+        self.external_section_delta.upserts.remove(&coord);
+        self.external_section_delta.removals.insert(coord);
+    }
+
+    /// Record a wholesale `external_sections` clear — supersedes every
+    /// queued per-coord change before it.
+    fn mark_external_cleared(&mut self) {
+        self.external_sections_rev = self.external_sections_rev.wrapping_add(1);
+        self.external_section_delta.upserts.clear();
+        self.external_section_delta.removals.clear();
+        self.external_section_delta.cleared = true;
+    }
+
+    /// Insert or replace an external section payload, recording the
+    /// renderer-bound delta in the same step — the single write path
+    /// every producer (worker drain, priority-0 lane, tests) takes.
+    pub fn insert_external_section(
+        &mut self,
+        coord: SectionCoord,
+        mesh: ExternalSectionMesh,
+    ) -> Option<ExternalSectionMesh> {
+        self.mark_external_upsert(coord);
+        self.external_sections.insert(coord, mesh)
+    }
+
+    /// Remove an external section payload, recording the renderer-bound
+    /// removal only when an entry actually existed.
+    pub fn remove_external_section(
+        &mut self,
+        coord: SectionCoord,
+    ) -> Option<ExternalSectionMesh> {
+        let removed = self.external_sections.remove(&coord);
+        if removed.is_some() {
+            self.mark_external_removed(coord);
+        }
+        removed
+    }
+
+    /// Drop every external section payload and mark the delta stream
+    /// cleared — dimension resets route here so the renderer mirror
+    /// wipes in the same order the map did.
+    pub fn clear_external_sections(&mut self) {
+        self.external_sections.clear();
+        self.mark_external_cleared();
+    }
+
+    /// Drain the accumulated renderer-bound delta — `None` when nothing
+    /// changed since the last drain (the steady-frame case the renderer
+    /// short-circuits on: no clone, no walk, no alloc).
+    pub fn take_external_sections_delta(&mut self) -> Option<ExternalSectionsDelta> {
+        if self.external_section_delta.is_empty() {
+            return None;
+        }
+        Some(std::mem::take(&mut self.external_section_delta))
+    }
+
+    /// Drop the pending delta stream — the caller mirrored the full map
+    /// instead (fresh renderer attach), so replaying stale per-coord
+    /// changes afterwards would be a no-op anyway.
+    pub fn discard_external_sections_delta(&mut self) {
+        self.external_section_delta = ExternalSectionsDelta::default();
+    }
+
     /// Prune [`Self::external_sections`]: an entry stays authoritative
     /// only while its section is still loaded, no newer dirty mark
     /// landed since the payload was produced (`content_epoch`), and the
@@ -2137,11 +2246,20 @@ impl LiveSession {
     fn prune_external_sections(&mut self) {
         let world = &self.world;
         let lane = &self.section_mesh_lane;
+        let mut pruned = Vec::new();
         self.external_sections.retain(|coord, external| {
-            world.mesh_cache.section(*coord).is_some()
+            let keep = world.mesh_cache.section(*coord).is_some()
                 && lane.epoch_of(*coord) == external.content_epoch
-                && world.section_mesh_revision(*coord).unwrap_or(0) == external.world_revision
+                && world.section_mesh_revision(*coord).unwrap_or(0) == external.world_revision;
+            if !keep {
+                pruned.push(*coord);
+            }
+            keep
         });
+        for coord in pruned {
+            // `retain` already dropped the entry — record the removal.
+            self.mark_external_removed(coord);
+        }
     }
 
     /// Drain `MeshJob::SectionMesh` completions without blocking: each
@@ -2269,7 +2387,7 @@ impl LiveSession {
         let buckets = DirectionBuckets { offset, count };
         let content_epoch = self.section_mesh_lane.epoch_of(coord);
         let digest = external_packed_digest(&packed);
-        self.external_sections.insert(
+        self.insert_external_section(
             coord,
             ExternalSectionMesh {
                 packed: packed.into(),
@@ -3997,7 +4115,7 @@ impl LiveSession {
                     let coord = SectionCoord(cx, sy, cz);
                     self.section_mesh_lane.remove(coord);
                     self.offthread_candidates.remove(&coord);
-                    self.external_sections.remove(&coord);
+                    self.remove_external_section(coord);
                 }
                 self.mark_chunk_column_dirty(cx, cz);
                 self.terrain_dirty = true;
@@ -4532,7 +4650,7 @@ impl LiveSession {
         // The off-thread lane's epochs, candidates and published payloads
         // all reference the old dimension's sections — drop them wholesale
         // (in-flight jobs finish and drain as stale/unloaded).
-        self.external_sections.clear();
+        self.clear_external_sections();
         self.offthread_candidates.clear();
         self.section_mesh_lane.clear();
         self.pose = None;

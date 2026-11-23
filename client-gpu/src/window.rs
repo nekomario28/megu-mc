@@ -2502,11 +2502,10 @@ impl GpuApp {
             active.renderer.set_player_position(self.camera.position);
             // Off-thread/priority-0 mesh payloads the session published
             // this poll ride the reconcile below — the renderer treats
-            // them as authoritative until the world derives its own.
-            active
-                .renderer
-                .external_sections
-                .clone_from(&live.external_sections);
+            // them as authoritative until the world derives its own. The
+            // revision-gated delta sync replaces the old full-map clone:
+            // steady frames compare one u64 and apply nothing.
+            active.renderer.sync_external_sections_from(live);
             if live.terrain_full_sync {
                 // First sync / dimension change: full reconcile once.
                 active.renderer.update_live_terrain(&live.world);
