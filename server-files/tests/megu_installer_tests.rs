@@ -398,7 +398,10 @@ fn prism_instance_install_creates_valid_cfg_mmc_pack_and_standard_client_folders
         .lines()
         .find(|l| l.starts_with("WrapperCommand="))
         .expect("WrapperCommand set");
-    assert!(wrapper_line.contains("bin/megu-client"), "{wrapper_line}");
+    assert!(
+        wrapper_line.contains("bin/megu-client") || wrapper_line.contains(r"bin\megu-client"),
+        "{wrapper_line}"
+    );
     let mmc = read_json(&wrap_instance.join("mmc-pack.json"));
     let components = get(&mmc, "components").as_array().unwrap();
     assert_eq!(components.len(), 1);
@@ -607,9 +610,12 @@ fn installer_fails_closed_on_traversal_bad_version_and_symlink_targets() {
     std::fs::create_dir_all(&mc_dir).unwrap();
     #[cfg(unix)]
     {
-        std::os::unix::fs::symlink("/etc/hostname", mc_dir.join(LAUNCHER_PROFILES_FILE)).unwrap();
+        let victim_profiles = scratch.path().join("victim-profiles.json");
+        std::fs::write(&victim_profiles, b"{}\n").unwrap();
+        let before = std::fs::read(&victim_profiles).unwrap();
+        std::os::unix::fs::symlink(&victim_profiles, mc_dir.join(LAUNCHER_PROFILES_FILE)).unwrap();
         assert!(installer::install_client(&mc_dir, &client_options(), true, NOW).is_err());
-        assert_eq!(std::fs::read("/etc/hostname").unwrap(), before_hostname());
+        assert_eq!(std::fs::read(&victim_profiles).unwrap(), before);
     }
 
     // A symlinked versions directory fails closed instead of being followed.
@@ -631,10 +637,6 @@ fn installer_fails_closed_on_traversal_bad_version_and_symlink_targets() {
     let mut bad_sha = client_options();
     bad_sha.client_sha256 = Some("not-hex".to_owned());
     assert!(installer::install_client(&scratch.path().join("mc4"), &bad_sha, false, NOW).is_err());
-}
-
-fn before_hostname() -> Vec<u8> {
-    std::fs::read("/etc/hostname").unwrap()
 }
 
 #[test]
