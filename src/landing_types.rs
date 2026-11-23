@@ -798,17 +798,12 @@ mod s3_tests {
 pub(crate) fn build_config_registry_sync_packets(
     snapshot: &ModRegistrySnapshot,
 ) -> Result<Vec<Vec<u8>>, &'static str> {
-    fn varint(out: &mut Vec<u8>, mut value: usize) {
-        while value >= 128 {
-            out.push((value as u8 & 127) | 128);
-            value >>= 7;
-        }
-        out.push(value as u8);
+    fn varint(out: &mut Vec<u8>, value: usize) {
+        megu_core::varint::write_varlong_i64(value as i64, out);
     }
 
     fn string(out: &mut Vec<u8>, value: &str) {
-        varint(out, value.len());
-        out.extend_from_slice(value.as_bytes());
+        megu_core::varint::write_mc_string(value, out);
     }
 
     let (blocks, items) = snapshot.entries.split_at(

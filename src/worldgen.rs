@@ -9583,9 +9583,9 @@ pub fn with_gen<R>(f: impl FnOnce(&mut Gen) -> R) -> Option<R> {
 pub(crate) fn cols_fingerprint(g: &mut Gen, cc: &ChunkCols) -> u64 {
     fn mix(h: &mut u64, v: u64) {
         *h ^= v;
-        *h = h.wrapping_mul(0x100_0000_01b3);
+        *h = h.wrapping_mul(megu_core::hash::FNV1A64_PRIME);
     }
-    let mut h = 0xcbf2_9ce4_8422_2325u64;
+    let mut h = megu_core::hash::FNV1A64_OFFSET_BASIS;
     for &s in &cc.surf {
         mix(&mut h, s as u64);
     }
@@ -21164,11 +21164,11 @@ mod wg_tests {
             }
         }
         cells.sort();
-        let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+        let mut h: u64 = megu_core::hash::FNV1A64_OFFSET_BASIS;
         for (x, y, z, st) in &cells {
             for v in [*x as u64, *y as u64, *z as u64, *st as u64] {
                 h ^= v;
-                h = h.wrapping_mul(0x100_0000_01b3);
+                h = h.wrapping_mul(megu_core::hash::FNV1A64_PRIME);
             }
         }
         (cells.len(), h)
@@ -21203,7 +21203,7 @@ mod wg_tests {
         evict_feature_buckets(&mut g, 400);
         assert_eq!(
             chunk_override_digest(&g, 6, 7),
-            (0, 0xcbf2_9ce4_8422_2325),
+            (0, megu_core::hash::FNV1A64_OFFSET_BASIS),
             "the 384 bound really dropped this chunk's block output"
         );
         // Same entry point, same schedule, same inputs: the stage reproduces itself.

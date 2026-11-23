@@ -2460,14 +2460,11 @@ mod next_int_vs_vanilla_tests {
 
     #[cfg_attr(not(megu_vanilla_data), allow(dead_code))]
     fn fnv_of(results: impl Iterator<Item = i32>) -> u64 {
-        let mut h = 0xcbf29ce484222325u64;
+        let mut h = megu_core::hash::Fnv1a64::new();
         for x in results {
-            for by in 0..4 {
-                h ^= u64::from((x as u32 >> (8 * by)) & 0xff);
-                h = h.wrapping_mul(0x100000001b3);
-            }
+            h.update_i32(x);
         }
-        h
+        h.finish()
     }
 
     #[test]

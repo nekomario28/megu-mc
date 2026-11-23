@@ -1096,15 +1096,17 @@ mod entity_push_tests {
     }
 
     fn read_varint_from_stream(s: &mut TcpStream) -> i64 {
-        let mut val = 0i64;
-        for shift in 0..5 {
+        let mut buf = Vec::with_capacity(5);
+        for _ in 0..5 {
             let mut b = [0u8; 1];
             std::io::Read::read_exact(s, &mut b).unwrap();
-            val |= ((b[0] & 0x7f) as i64) << (7 * shift);
+            buf.push(b[0]);
             if b[0] & 0x80 == 0 {
-                return val;
+                break;
             }
         }
-        val
+        megu_core::varint::read_varint_i32(&buf)
+            .map(|(v, _)| i64::from(v as u32))
+            .unwrap_or(0)
     }
 }

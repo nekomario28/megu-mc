@@ -1,19 +1,9 @@
 // ---------- varint / wire ----------
 fn read_varint(b: &mut &[u8]) -> Option<i64> {
-    let mut v = 0i64;
-    let mut i = 0;
-    loop {
-        if b.is_empty() || i > 9 {
-            return None;
-        }
-        let byte = b[0];
-        *b = &b[1..];
-        v |= ((byte & 0x7f) as i64) << (7 * i);
-        if byte & 0x80 == 0 {
-            return Some(v);
-        }
-        i += 1;
-    }
+    let input = *b;
+    let (v, n) = megu_core::varint::read_varlong_i64(input).ok()?;
+    *b = &input[n..];
+    Some(v)
 }
 /// Protocol VarInt is at most five bytes; the save reader also supports wider values.
 fn read_protocol_i32(b: &mut &[u8]) -> Option<i32> {
@@ -25,28 +15,15 @@ fn read_protocol_i32(b: &mut &[u8]) -> Option<i32> {
     Some(value as u32 as i32)
 }
 fn write_varint(out: &mut Vec<u8>, v: i64) {
-    // i32-range negatives encode as VarInt (5-byte u32 LEB128); wider as VarLong.
-    // (arithmetic `>>=` on a negative i64 loops forever -> unbounded Vec growth)
-    let mut v = if v < 0 && v >= i32::MIN as i64 {
-        v as u32 as u64
+    // i32-range values encode as VarInt (5-byte u32 LEB128); wider as VarLong.
+    if v >= i32::MIN as i64 && v <= i32::MAX as i64 {
+        megu_core::varint::write_varint_i32(v as i32, out);
     } else {
-        v as u64
-    };
-    loop {
-        let mut b = (v & 0x7f) as u8;
-        v >>= 7;
-        if v != 0 {
-            b |= 0x80
-        }
-        out.push(b);
-        if v == 0 {
-            break;
-        }
+        megu_core::varint::write_varlong_i64(v, out);
     }
 }
 fn write_str(out: &mut Vec<u8>, s: &str) {
-    write_varint(out, s.len() as i64);
-    out.extend_from_slice(s.as_bytes());
+    megu_core::varint::write_mc_string(s, out);
 }
 fn write_pos(out: &mut Vec<u8>, x: i32, y: i32, z: i32) {
     let v = ((x as i64 & 0x3ffffff) << 38) | ((z as i64 & 0x3ffffff) << 12) | (y as i64 & 0xfff);
@@ -4349,16 +4326,9 @@ fn spawn_typed_pkt(eid: i32, etype: i64, x: f64, y: f64, z: f64) -> Vec<u8> {
 }
 
 fn read_varint_at(b: &[u8], p: usize) -> (i64, usize) {
-    let mut r: i64 = 0;
-    let mut i = 0;
-    loop {
-        let byte = b[p + i];
-        r |= ((byte & 0x7f) as i64) << (7 * i);
-        if byte & 0x80 == 0 {
-            return (r, p + i + 1);
-        }
-        i += 1;
-    }
+    let (v, n) = megu_core::varint::read_varlong_i64(&b[p..])
+        .expect("read_varint_at: malformed varint");
+    (v, p + n)
 }
 
 fn velocity_pkt(eid: i32, vx: i16, vy: i16, vz: i16) -> Vec<u8> {
@@ -5648,7 +5618,7 @@ fn cull_chunk_light(packet: &mut Vec<u8>, dim: DimId) {
     };
     // VarInt-coded `long[]` length; every count here stays under 128 except a
     // very tall dimension's array counts.
-    let varint_len = |v: usize| ((usize::BITS - v.leading_zeros()) as usize).div_ceil(7).max(1);
+    let varint_len = |v: usize| megu_core::varint::varlong_i64_len(v as i64);
     // two full bitsets, two empty ones, the two array-count VarInts, then the
     // two counted array lists.
     let suffix_size = 2 * (1 + 8 * words)
@@ -5759,7 +5729,7 @@ fn chunk_packet_cache() -> &'static Mutex<connection_limits::ChunkPacketCache> {
 
 /// FNV-1a combine step, matching `map_chunk_sig`'s combiner.
 fn chunk_packet_mix(h: u64, v: u64) -> u64 {
-    (h ^ v).wrapping_mul(0x0000_0100_0000_01b3)
+    (h ^ v).wrapping_mul(megu_core::hash::FNV1A64_PRIME)
 }
 
 /// The revision a shared `0x27` frame is gated on: every input the sent bytes
@@ -5773,7 +5743,7 @@ fn chunk_packet_revision(
     sig: u64,
     block_entities: &[ChunkBlockEntity],
 ) -> u64 {
-    let mut h = 0xcbf2_9ce4_8422_2325u64;
+    let mut h = megu_core::hash::FNV1A64_OFFSET_BASIS;
     for &v in versions {
         h = chunk_packet_mix(h, v);
     }
@@ -6154,29 +6124,15 @@ impl<'a> C2sReader<'a> {
     }
     /// Java `readVarInt`: LEB128, at most five payload bytes, u32 envelope.
     fn varint(&mut self) -> Option<i64> {
-        let mut v = 0u64;
-        for i in 0..5 {
-            let byte = *self.data.get(self.p)?;
-            self.p += 1;
-            v |= ((byte & 0x7f) as u64) << (7 * i);
-            if byte & 0x80 == 0 {
-                return Some(v as i64);
-            }
-        }
-        None
+        let (v, used) = megu_core::varint::read_varint_i32(&self.data[self.p..]).ok()?;
+        self.p += used;
+        Some(i64::from(v as u32))
     }
     /// Java `readVarLong`: same LEB128 body, up to ten payload bytes.
     fn varlong(&mut self) -> Option<i64> {
-        let mut v = 0u64;
-        for i in 0..10 {
-            let byte = *self.data.get(self.p)?;
-            self.p += 1;
-            v |= ((byte & 0x7f) as u64) << (7 * i);
-            if byte & 0x80 == 0 {
-                return Some(v as i64);
-            }
-        }
-        None
+        let (v, used) = megu_core::varint::read_varlong_i64(&self.data[self.p..]).ok()?;
+        self.p += used;
+        Some(v)
     }
     /// `FriendlyByteBuf.readUtf(max)`: VarInt length bounded at `max * 4`
     /// bytes, then at most `max` decoded chars of strict UTF-8.
@@ -22375,16 +22331,18 @@ mod security_hardening_tests {
 
     /// Read a VarInt length off the peer socket; `None` on timeout/EOF.
     fn sec_varint(stream: &mut TcpStream) -> Option<i64> {
-        let mut out = 0i64;
-        for i in 0..5 {
+        let mut buf = Vec::with_capacity(5);
+        for _ in 0..5 {
             let mut b = [0u8; 1];
             std::io::Read::read_exact(stream, &mut b).ok()?;
-            out |= i64::from(b[0] & 0x7f) << (i * 7);
+            buf.push(b[0]);
             if b[0] & 0x80 == 0 {
-                return Some(out);
+                break;
             }
         }
-        None
+        megu_core::varint::read_varint_i32(&buf)
+            .ok()
+            .map(|(v, _)| i64::from(v as u32))
     }
 
     /// Every `(packet id, body-after-id)` buffered on the peer socket.

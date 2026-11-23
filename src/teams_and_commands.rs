@@ -321,25 +321,15 @@ impl<'a> P3bReader<'a> {
         Some(body)
     }
     fn varint(&mut self) -> Option<i64> {
-        let mut v = 0i64;
-        for i in 0..5 {
-            let byte = *self.data.get(self.p)?;
-            self.p += 1;
-            v |= ((byte & 0x7f) as i64) << (7 * i);
-            if byte & 0x80 == 0 {
-                return Some(v as u32 as i64);
-            }
-        }
-        None
+        let (v, used) = megu_core::varint::read_varint_i32(&self.data[self.p..]).ok()?;
+        self.p += used;
+        Some(i64::from(v as u32))
     }
     fn utf(&mut self) -> Option<String> {
-        let len = self.varint()?;
-        if !(0..=(1 << 20)).contains(&len) {
-            return None;
-        }
-        let bytes = self.data.get(self.p..self.p + len as usize)?;
-        self.p += len as usize;
-        std::str::from_utf8(bytes).ok().map(str::to_owned)
+        let data = self.data;
+        let (s, used) = megu_core::varint::read_mc_string(&data[self.p..], 1 << 20).ok()?;
+        self.p += used;
+        Some(s.to_owned())
     }
     /// Extract the `text` member of one anonymousNbt component: a compound
     /// holding `{"text": s}` (what the encoder emits) or a bare TAG_String.
@@ -6340,12 +6330,11 @@ struct SetCommandMinecartUpdate {
 /// packets — VarInt length, hard cap, strict UTF-8, fail closed.
 #[allow(dead_code)]
 fn command_block_wire_string(r: &mut P3bReader<'_>) -> Option<String> {
-    let len = r.varint()?;
-    if !(0..=COMMAND_BLOCK_COMMAND_MAX as i64).contains(&len) {
-        return None;
-    }
-    let body = r.bytes(len as usize)?;
-    std::str::from_utf8(body).ok().map(str::to_owned)
+    let data = r.data;
+    let (s, used) =
+        megu_core::varint::read_mc_string(&data[r.p..], COMMAND_BLOCK_COMMAND_MAX).ok()?;
+    r.p += used;
+    Some(s.to_owned())
 }
 
 /// Vanilla `BlockPos` packed-i64 layout: `x << 38 | z << 12 | y`, the y field
@@ -6874,16 +6863,18 @@ mod p3_parity_tests {
     }
 
     fn p3_frame_varint(r: &mut TcpStream) -> Option<(i64, usize)> {
-        let mut value = 0i64;
-        for i in 0..5 {
+        let mut buf = Vec::with_capacity(5);
+        for _ in 0..5 {
             let mut b = [0u8; 1];
             r.read_exact(&mut b).ok()?;
-            value |= ((b[0] & 0x7f) as i64) << (7 * i);
+            buf.push(b[0]);
             if b[0] & 0x80 == 0 {
-                return Some((value, i + 1));
+                break;
             }
         }
-        None
+        megu_core::varint::read_varint_i32(&buf)
+            .ok()
+            .map(|(v, n)| (i64::from(v as u32), n))
     }
 
     /// One uncompressed frame: varint length, varint packet id, payload.
@@ -7794,16 +7785,18 @@ mod p6d_parity_tests {
     }
 
     fn p6d_frame_varint(r: &mut TcpStream) -> Option<(i64, usize)> {
-        let mut value = 0i64;
-        for i in 0..5 {
+        let mut buf = Vec::with_capacity(5);
+        for _ in 0..5 {
             let mut b = [0u8; 1];
             r.read_exact(&mut b).ok()?;
-            value |= ((b[0] & 0x7f) as i64) << (7 * i);
+            buf.push(b[0]);
             if b[0] & 0x80 == 0 {
-                return Some((value, i + 1));
+                break;
             }
         }
-        None
+        megu_core::varint::read_varint_i32(&buf)
+            .ok()
+            .map(|(v, n)| (i64::from(v as u32), n))
     }
 
     /// One uncompressed frame: varint length, varint packet id, payload.
@@ -8373,16 +8366,18 @@ mod p8c_parity_tests {
     }
 
     fn p8c_frame_varint(r: &mut TcpStream) -> Option<(i64, usize)> {
-        let mut value = 0i64;
-        for i in 0..5 {
+        let mut buf = Vec::with_capacity(5);
+        for _ in 0..5 {
             let mut b = [0u8; 1];
             r.read_exact(&mut b).ok()?;
-            value |= ((b[0] & 0x7f) as i64) << (7 * i);
+            buf.push(b[0]);
             if b[0] & 0x80 == 0 {
-                return Some((value, i + 1));
+                break;
             }
         }
-        None
+        megu_core::varint::read_varint_i32(&buf)
+            .ok()
+            .map(|(v, n)| (i64::from(v as u32), n))
     }
 
     /// One uncompressed frame: varint length, varint packet id, payload.
@@ -9991,18 +9986,7 @@ mod vanilla_cmdblk_tests {
     }
 
     fn wire_varint(v: i64, out: &mut Vec<u8>) {
-        let mut v = v as u32;
-        loop {
-            let mut b = (v & 0x7f) as u8;
-            v >>= 7;
-            if v != 0 {
-                b |= 0x80;
-            }
-            out.push(b);
-            if v == 0 {
-                break;
-            }
-        }
+        megu_core::varint::write_varint_i32(v as i32, out);
     }
 
     fn pack_block_pos(x: i32, y: i32, z: i32) -> i64 {

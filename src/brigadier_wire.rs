@@ -221,19 +221,10 @@ impl std::error::Error for WireError {}
 // ---------------------------------------------------------------------------------------
 
 /// Protocol VarInt: unsigned LEB128 of the 32-bit two's complement form, so a negative number
-/// is always five bytes. This mirrors `main.rs::write_varint`, which this module must not reach
-/// into: the module is offline-testable and its own bytes are the contract.
+/// is always five bytes. The canonical codec lives in `megu_core::varint`; this module must
+/// not reach into `main.rs`: it is offline-testable and its own bytes are the contract.
 fn write_varint(out: &mut Vec<u8>, value: i32) {
-    let mut rest = value as u32;
-    loop {
-        let byte = (rest & 0x7f) as u8;
-        rest >>= 7;
-        if rest == 0 {
-            out.push(byte);
-            return;
-        }
-        out.push(byte | 0x80);
-    }
+    megu_core::varint::write_varint_i32(value, out);
 }
 
 /// `FriendlyByteBuf.writeUtf`: the byte length as a VarInt, then the bytes, capped in characters.
@@ -299,18 +290,21 @@ impl<'a> WireReader<'a> {
 
     /// Protocol VarInt: at most five bytes, the last of which carries no more than four bits.
     fn read_varint(&mut self) -> Result<i32, WireError> {
-        let mut value = 0u32;
-        for index in 0..5 {
-            let byte = self.take(1)?[0];
-            if index == 4 && byte > 0x0f {
-                return Err(WireError::VarIntTooLong);
+        let bytes = self.bytes;
+        match megu_core::varint::read_varint_i32(&bytes[self.cursor..]) {
+            Ok((value, used)) => {
+                self.cursor += used;
+                Ok(value)
             }
-            value |= ((byte & 0x7f) as u32) << (7 * index);
-            if byte & 0x80 == 0 {
-                return Ok(value as i32);
+            Err(megu_core::varint::VarIntError::UnexpectedEof) => {
+                self.cursor = self.bytes.len();
+                Err(WireError::Truncated {
+                    needed: 1,
+                    remaining: 0,
+                })
             }
+            Err(_) => Err(WireError::VarIntTooLong),
         }
-        Err(WireError::VarIntTooLong)
     }
 
     fn read_utf(&mut self, maximum: usize, field: &'static str) -> Result<String, WireError> {

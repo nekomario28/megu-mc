@@ -4688,10 +4688,11 @@ fn bossbars() -> &'static Mutex<HashMap<String, Bossbar>> {
 }
 fn bossbar_uuid(id: &str) -> [u8; 16] {
     // stable uuid: double FNV-ish hash of the id string
-    let mut a: u64 = 0xcbf29ce484222325;
+    let mut ha = megu_core::hash::Fnv1a64::new();
+    ha.update_str(id);
+    let a = ha.finish();
     let mut b: u64 = 0x9e3779b97f4a7c15;
     for ch in id.bytes() {
-        a = (a ^ ch as u64).wrapping_mul(0x100000001b3);
         b = (b ^ ch as u64).wrapping_mul(0xc6a4a7935bd1e995);
     }
     let mut u = [0u8; 16];
@@ -4943,12 +4944,7 @@ static TICK_ADV_INDEX: Mutex<TickAdvIndex> = Mutex::new(TickAdvIndex {
 /// from the index the way `len()` would. `0` for an empty map.
 fn adv_key_fingerprint(advs: &HashMap<String, Advancement>) -> u64 {
     advs.keys().fold(0u64, |acc, id| {
-        acc ^ id
-            .as_bytes()
-            .iter()
-            .fold(0xcbf2_9ce4_8422_2325u64, |h, &b| {
-                (h ^ b as u64).wrapping_mul(0x0000_0100_0000_01b3)
-            })
+        acc ^ megu_core::hash::fnv1a64_str(id)
     })
 }
 
@@ -10447,16 +10443,18 @@ mod issue225_parity_tests {
     /// One uncompressed frame: varint length, varint packet id, payload.
     fn c225_frame(r: &mut TcpStream) -> Option<(i64, Vec<u8>)> {
         let varint = |r: &mut TcpStream| -> Option<(i64, usize)> {
-            let mut value = 0i64;
-            for i in 0..5 {
+            let mut buf = Vec::with_capacity(5);
+            for _ in 0..5 {
                 let mut b = [0u8; 1];
                 r.read_exact(&mut b).ok()?;
-                value |= i64::from(b[0] & 0x7f) << (7 * i);
+                buf.push(b[0]);
                 if b[0] & 0x80 == 0 {
-                    return Some((value, i + 1));
+                    break;
                 }
             }
-            None
+            megu_core::varint::read_varint_i32(&buf)
+                .ok()
+                .map(|(v, n)| (i64::from(v as u32), n))
         };
         let (len, _) = varint(r)?;
         let (id, used) = varint(r)?;

@@ -2001,14 +2001,12 @@ mod mob_ai_tests {
         // FNV-1a of one PascalCase PathType name plus newline per raw state ID.
         // Captured from 1.21.1 WalkNodeEvaluator.getPathTypeFromState with vanilla tags bound.
         assert_eq!(registry.state_count(), 26_684);
-        let mut digest = 0xcbf29ce484222325_u64;
+        let mut digest = megu_core::hash::Fnv1a64::new();
         for state in 0..registry.state_count() as u32 {
             let path_type = classify_block_state_path_type(registry, state);
-            for byte in format!("{path_type:?}\n").bytes() {
-                digest = (digest ^ u64::from(byte)).wrapping_mul(0x100000001b3);
-            }
+            digest.update_str(&format!("{path_type:?}\n"));
         }
-        assert_eq!(digest, 0x54a74560ce1a30cc);
+        assert_eq!(digest.finish(), 0x54a74560ce1a30cc);
     }
 
     #[test]
