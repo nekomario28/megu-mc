@@ -62,7 +62,10 @@ fn fx3_shadow_wgsl_has_blend_guard_vogel_const_no_loop_trig_and_region_light_mas
     assert!(sampling.contains("dot(n, shadow_caster_direction()) <= 0.0"));
     // Compile-time Vogel disk replaces per-tap sqrt/trigonometry.
     assert!(sampling.contains("const VOGEL_16 = array<vec2<f32>, 16>"));
+    assert!(sampling.contains("const SHADOW_ROTATIONS = array<vec2<f32>, 8>"));
     assert!(sampling.contains("VOGEL_16[i] * disk_scale"));
+    assert!(sampling.contains("disk_rot * (VOGEL_16[i] * disk_scale)"));
+    assert!(sampling.contains("shadow_cascade_visibility(world, n, layer + 1u, disk_rot)"));
     assert!(sampling.contains("inverseSqrt(f32(taps))"));
     assert!(!sampling.contains("sqrt((f32(i)"));
     assert!(!sampling.contains("cos("));
@@ -82,6 +85,7 @@ fn fx3_shadow_wgsl_has_blend_guard_vogel_const_no_loop_trig_and_region_light_mas
     assert!(terrain.contains("inverseSqrt(f32(taps))"));
     // Caster-backface early-out in the cascade sampler.
     assert!(terrain.contains("dot(normal, caster) <= 0.0"));
+    assert!(terrain.contains("if (cascade_count > 0u && shadow_strength > 0.0)"));
     // u64 capability-mask walk over the fixed 64-light binding.
     for needle in [
         "light_mask_prefix",

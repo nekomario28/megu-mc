@@ -1287,6 +1287,19 @@ const VOGEL_16 = array<vec2<f32>, 16>(
     vec2<f32>(-0.1264883130788803, -0.9760894775390625)
 );
 
+// Eight precomputed rotation directions keep this shared shader free of
+// per-fragment trigonometry while varying the disk orientation by position.
+const SHADOW_ROTATIONS = array<vec2<f32>, 8>(
+    vec2<f32>(1.0, 0.0),
+    vec2<f32>(0.70710677, 0.70710677),
+    vec2<f32>(0.0, 1.0),
+    vec2<f32>(-0.70710677, 0.70710677),
+    vec2<f32>(-1.0, 0.0),
+    vec2<f32>(-0.70710677, -0.70710677),
+    vec2<f32>(0.0, -1.0),
+    vec2<f32>(0.70710677, -0.70710677)
+);
+
 // Day casts from the sun, night casts from the real moon at -sun — the
 // shadow map stays live through the whole day cycle instead of disabling
 // at dusk. The caller fades the horizon handover via |sun.y|.
@@ -1295,7 +1308,8 @@ fn shadow_caster_direction() -> vec3<f32> {
     return select(-sun, sun, sun.y >= 0.0);
 }
 
-fn shadow_cascade_visibility(world: vec3<f32>, n: vec3<f32>, layer: u32) -> f32 {
+fn shadow_cascade_visibility(world: vec3<f32>, n: vec3<f32>, layer: u32,
+                             disk_rot: mat2x2<f32>) -> f32 {
     let caster = shadow_caster_direction();
     let incidence = clamp(dot(n, caster), 0.0, 1.0);
     let receiver = world + n * (0.015 + 0.05 * (1.0 - incidence));
@@ -1313,7 +1327,7 @@ fn shadow_cascade_visibility(world: vec3<f32>, n: vec3<f32>, layer: u32) -> f32 
     let disk_scale = 4.0 * inverseSqrt(f32(taps)) * 1.7 / resolution;
     var visibility = 0.0;
     for (var i = 0u; i < taps; i = i + 1u) {
-        let offset = VOGEL_16[i] * disk_scale;
+        let offset = disk_rot * (VOGEL_16[i] * disk_scale);
         visibility += textureSampleCompareLevel(shadow_depth, shadow_compare,
             uv + offset, i32(layer), clip.z - bias);
     }
@@ -1331,12 +1345,18 @@ fn shadow_visibility(world: vec3<f32>, n: vec3<f32>) -> f32 {
     // active caster — the sun by day, the moon at -sun by night — is
     // self-shadowed by its own block, so no shadow tap is ever needed.
     if (dot(n, shadow_caster_direction()) <= 0.0) { return 0.0; }
+    // Interleaved-gradient hash chooses a fixed 45-degree rotation once
+    // per fragment, even when a cascade blend needs two PCF evaluations.
+    let hash = fract(52.9829189 * fract(dot(world.xz,
+                                          vec2<f32>(0.06711056, 0.00583715))));
+    let axis = SHADOW_ROTATIONS[u32(hash * 8.0)];
+    let disk_rot = mat2x2<f32>(axis, vec2<f32>(-axis.y, axis.x));
     let distance_along_view = dot(world - shadow.camera_position.xyz,
                                     shadow.camera_forward.xyz);
     var layer = 0u;
     if (count > 1u && distance_along_view > shadow.cascade_splits.x) { layer = 1u; }
     if (count > 2u && distance_along_view > shadow.cascade_splits.y) { layer = 2u; }
-    var visibility = shadow_cascade_visibility(world, n, layer);
+    var visibility = shadow_cascade_visibility(world, n, layer, disk_rot);
     if (layer + 1u < count) {
         var start = 0.1;
         if (layer > 0u) {
@@ -1349,7 +1369,7 @@ fn shadow_visibility(world: vec3<f32>, n: vec3<f32>) -> f32 {
         // cascade PCF only runs inside the ~8% blend band.
         if (blend > 0.001) {
             visibility = mix(visibility,
-                shadow_cascade_visibility(world, n, layer + 1u), blend);
+                shadow_cascade_visibility(world, n, layer + 1u, disk_rot), blend);
         }
     }
     return mix(1.0, visibility, horizon_fade);
@@ -1612,7 +1632,9 @@ fn fs_main(input: TerrainOutput) -> @location(0) vec4<f32> {
     let view_distance = length(view_offset);
     let view_depth = dot(view_offset, shadow.camera_forward.xyz);
     let cascade_count = u32(shadow.shadow_params.y);
-    if (cascade_count > 0u) {
+    // At the caster handover the blend is zero, so skip all PCF work.
+    let shadow_strength = smoothstep(0.02, 0.08, abs(shadow.sun_direction.y));
+    if (cascade_count > 0u && shadow_strength > 0.0) {
         var layer = 0u;
         if (cascade_count > 1u && view_depth > shadow.cascade_splits.x) {
             layer = 1u;
@@ -1623,8 +1645,7 @@ fn fs_main(input: TerrainOutput) -> @location(0) vec4<f32> {
         visibility = sample_cascade(input.world_position, normal, layer);
         // The sun->moon caster handover fades shadow strength across the
         // horizon so the flip never pops a hard edge.
-        visibility = mix(1.0, visibility,
-                         smoothstep(0.02, 0.08, abs(shadow.sun_direction.y)));
+        visibility = mix(1.0, visibility, shadow_strength);
     }
     // A1: vertex sky/block light drive the physical cave light model.
     let sky_light = clamp(input.sky_block_light.x, 0.0, 15.0);
