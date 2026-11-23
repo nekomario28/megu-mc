@@ -59,9 +59,11 @@ use crate::mesh_pool::{
     compute_opaque_bucket_ranges, HiZSplatSection, MeshJob, MeshJobPool, MeshResult,
 };
 use crate::subworld_render::{
-    CompositeDrawUniforms, CompositeEnvUniforms, DebugLineVertex, SubWorldGpuCache,
-    SubWorldRenderBank, TerrainVertex, VfxLightsGpu, COMPOSITE_LIT_WGSL, COMPOSITE_TERRAIN_WGSL,
-    DEBUG_LINE_VERTEX_LAYOUT, DEBUG_LINE_WGSL, DRAW_UNIFORM_STRIDE, LIT_VERTEX_LAYOUT,
+    pack_particle_billboard, CompositeDrawUniforms, CompositeEnvUniforms, DebugLineVertex,
+    ParticleBillboardPack, ParticleInstance, SubWorldGpuCache, SubWorldRenderBank, TerrainVertex,
+    VfxLightsGpu, COMPOSITE_LIT_WGSL, COMPOSITE_TERRAIN_WGSL, DEBUG_LINE_VERTEX_LAYOUT,
+    DEBUG_LINE_WGSL, DRAW_UNIFORM_STRIDE, LIT_VERTEX_LAYOUT, PARTICLE_BILLBOARD_CORNERS,
+    PARTICLE_BILLBOARD_INDICES, PARTICLE_INSTANCE_LAYOUT, PARTICLE_QUAD_LAYOUT,
     PART_INSTANCE_LAYOUT,
 };
 use crate::{
@@ -2226,6 +2228,24 @@ pub struct GpuRenderer {
     entity_ber: Option<DynamicGeometryRing>,
     particles: Option<DynamicGeometryRing>,
     particle_alphas: Vec<f32>,
+    /// Instanced billboard path: per-frame `ParticleInstance` records
+    /// staged into `particle_instances` — replaces the CPU quad staging
+    /// whenever `particle_instancing` is on.
+    particle_instances: Option<ParticleInstanceRing>,
+    particle_instance_scratch: Vec<ParticleInstance>,
+    /// `true` when the billboard pipeline exists and instancing is
+    /// enabled — [`Self::set_particle_instancing_enabled`] can force the
+    /// CPU quad path for parity testing or pathological adapters.
+    particle_instancing: bool,
+    /// `ParticleInstance` records written to the billboard ring
+    /// (cumulative — the per-frame bound is `MAX_DYNAMIC_QUADS`).
+    pub particle_instance_uploads: u64,
+    /// Input quads/particles dropped by the `MAX_DYNAMIC_QUADS`
+    /// per-frame upload bound (cumulative, both paths).
+    pub particle_instances_capped: u64,
+    /// `set_particle_*` calls routed through the CPU quad path — forced
+    /// fallback plus quads outside the instanced bilinear model.
+    pub particle_cpu_fallbacks: u64,
     /// Steady frames served from already-allocated dynamic-geometry
     /// ring buffers (`stage_dynamic_geometry` reuse hits).
     pub dynamic_ring_reuses: u64,
@@ -2430,6 +2450,76 @@ fn dynamic_geometry_digest(ring: &Option<DynamicGeometryRing>) -> u64 {
     hash
 }
 
+/// Grow-only per-instance buffer for GPU-expanded particle billboards —
+/// the instanced counterpart of [`DynamicGeometryRing`]. One
+/// `queue.write_buffer` of [`ParticleInstance`] records per frame; a
+/// single indexed draw expands the static unit quad per instance.
+struct ParticleInstanceRing {
+    buffer: wgpu::Buffer,
+    capacity: usize,
+    /// Instance count staged for the current frame (`0` = nothing drawn).
+    count: u32,
+}
+
+/// Upload `instances` into the billboard ring under the same
+/// allocate-once/write-in-place contract as [`stage_dynamic_geometry`].
+/// Returns `(buffer_allocs, ring_reuses)` for the shared dynamic-geometry
+/// counters.
+fn stage_particle_instances(
+    ctx: &GpuDevice,
+    ring: &mut Option<ParticleInstanceRing>,
+    instances: &[ParticleInstance],
+) -> (u64, u64) {
+    if instances.is_empty() {
+        if let Some(r) = ring.as_mut() {
+            r.count = 0;
+        }
+        return (0, 0);
+    }
+    let allocated = match ring.as_mut() {
+        Some(r) if r.capacity >= instances.len() => false,
+        slot => {
+            let capacity = instances
+                .len()
+                .max(slot.as_ref().map_or(256, |r| r.capacity * 2));
+            let buffer = ctx.device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some("particle-billboard-instances"),
+                size: (capacity * std::mem::size_of::<ParticleInstance>()) as u64,
+                usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
+                mapped_at_creation: false,
+            });
+            *ring = Some(ParticleInstanceRing {
+                buffer,
+                capacity,
+                count: 0,
+            });
+            true
+        }
+    };
+    let r = ring.as_mut().expect("ring ensured above");
+    ctx.queue
+        .write_buffer(&r.buffer, 0, bytemuck::cast_slice(instances));
+    r.count = instances.len() as u32;
+    if allocated {
+        (1, 0)
+    } else {
+        (0, 1)
+    }
+}
+
+/// Digest of the staged billboard instance ring — the instanced twin of
+/// [`dynamic_geometry_digest`] for the per-cascade shadow bundle key.
+fn particle_instance_digest(ring: &Option<ParticleInstanceRing>) -> u64 {
+    let mut hash = 0u64;
+    if let Some(r) = ring {
+        hash ^= u64::from(r.count) << 1;
+        hash = hash
+            .wrapping_mul(0x100_0000_01b3)
+            .wrapping_add(r.capacity as u64);
+    }
+    hash
+}
+
 fn append_dynamic_quad(
     vertices: &mut Vec<TerrainVertex>,
     indices: &mut Vec<u32>,
@@ -2463,6 +2553,28 @@ fn append_dynamic_quad(
     true
 }
 
+/// GPU state for instanced particle billboards: the alpha-blended lit
+/// pipeline (same blend/depth contract as `lit_alpha_pipeline`), the
+/// static unit-quad vertex/index pair the vertex shader expands with
+/// each instance's billboard axes, and nothing else — per-particle data
+/// lives in the renderer's grow-only [`ParticleInstanceRing`].
+struct ParticleBillboardGpu {
+    pipeline: wgpu::RenderPipeline,
+    quad_vertices: wgpu::Buffer,
+    quad_indices: wgpu::Buffer,
+}
+
+/// Minimum device limits the instanced billboard path needs beyond what
+/// every wgpu backend already guarantees: two vertex streams (unit quad
+/// + instance ring), eight attribute slots, and a 76-byte stride.
+fn particle_instancing_supported(device: &wgpu::Device) -> bool {
+    let limits = device.limits();
+    limits.max_vertex_buffers >= 2
+        && limits.max_vertex_attributes >= 8
+        && limits.max_vertex_buffer_array_stride
+            >= std::mem::size_of::<ParticleInstance>() as u32
+}
+
 /// GPU state for the composed pass: the fade/light-aware terrain pipeline,
 /// the lit `TerrainVertex` pipelines (opaque + alpha), the instanced-part
 /// pipeline, the dynamic-offset draw-uniform pool, and the shared
@@ -2476,6 +2588,10 @@ struct CompositeGpu {
     lit_pipeline: wgpu::RenderPipeline,
     lit_alpha_pipeline: wgpu::RenderPipeline,
     instanced_pipeline: wgpu::RenderPipeline,
+    /// Instanced particle billboard state — `None` when the device's
+    /// limits cannot run the two-stream draw (`set_particle_billboards`
+    /// then keeps the CPU-staged quad path).
+    billboard: Option<ParticleBillboardGpu>,
     lit_frame_bg: wgpu::BindGroup,
     lit_frame_layout: wgpu::BindGroupLayout,
     /// Shadow-receiver bind group layout (`{receiver uniform, depth
@@ -2745,6 +2861,9 @@ struct ShadowGpu {
     lit_color: wgpu::RenderPipeline,
     lit_alpha_color: wgpu::RenderPipeline,
     instanced_color: wgpu::RenderPipeline,
+    /// Shadow-sampling `billboard_vs` variant — `Some` exactly when the
+    /// composite billboard pipeline exists.
+    billboard_color: Option<wgpu::RenderPipeline>,
     /// Epoch bumped every time `draw_ubo`/`draw_bg` are rebuilt —
     /// recorded cascade bundles bake dynamic offsets into the pool and
     /// must re-record after a resize.
@@ -3905,6 +4024,22 @@ impl ShadowGpu {
             true,
             None,
         );
+        let billboard_color = composite.billboard.as_ref().map(|_| {
+            color_pipeline(
+                "shadowed-billboard",
+                &lit_layout,
+                &lit_module,
+                "billboard_vs",
+                "lit_fs",
+                &[
+                    Some(PARTICLE_QUAD_LAYOUT),
+                    Some(PARTICLE_INSTANCE_LAYOUT),
+                ],
+                Some(ALPHA_BLEND),
+                false,
+                None,
+            )
+        });
         Self {
             config,
             caster_layout,
@@ -3928,6 +4063,7 @@ impl ShadowGpu {
             lit_color,
             lit_alpha_color,
             instanced_color,
+            billboard_color,
             draw_pool_epoch: 0,
             cascade_bundles: [None, None, None],
             cutout: None,
@@ -4995,6 +5131,7 @@ impl GpuRenderer {
             vertex_scratch: Vec::new(),
         };
         let composite = Self::build_composite(&ctx, target_format, &frame_layout, &frame_ubo);
+        let particle_instancing = composite.billboard.is_some();
         // Shared stand-in uniform + bind group for sections the composed
         // pass never draws directly (arena-resident opaque with no
         // translucent stream) — one allocation total, not one per section.
@@ -5238,6 +5375,12 @@ impl GpuRenderer {
             entity_ber: None,
             particles: None,
             particle_alphas: Vec::new(),
+            particle_instances: None,
+            particle_instance_scratch: Vec::new(),
+            particle_instancing,
+            particle_instance_uploads: 0,
+            particle_instances_capped: 0,
+            particle_cpu_fallbacks: 0,
             dynamic_ring_reuses: 0,
             dynamic_buffer_allocs: 0,
             subworld_gpu: SubWorldGpuCache::new(),
@@ -5363,10 +5506,46 @@ impl GpuRenderer {
     }
 
     /// Upload precomputed camera-facing particle quads with individual alpha.
+    ///
+    /// When [`Self::particle_instancing`] is on, each quad packs into one
+    /// 76-byte [`ParticleInstance`] — center, half-edge axes (the
+    /// billboard right/up scaled by half extent), affine UV basis and
+    /// tint+alpha — staged into the grow-only instance ring, so the
+    /// vertex shader expands the static unit quad instead of the CPU
+    /// uploading four corners + six indices per particle. Quads outside
+    /// the bilinear model (`ParticleBillboardPack::CpuOnly`), or every
+    /// quad when instancing is off, take the original CPU staging path
+    /// with identical output, ordering and blending.
     pub fn set_particle_billboards(&mut self, quads: &[VanillaParticleQuad]) {
+        self.particle_alphas.clear();
+        self.particle_instance_scratch.clear();
+        self.particle_instances_capped +=
+            quads.len().saturating_sub(MAX_DYNAMIC_QUADS) as u64;
+        if self.particle_instancing {
+            let mut cpu_only = false;
+            for quad in quads.iter().take(MAX_DYNAMIC_QUADS) {
+                match pack_particle_billboard(quad) {
+                    ParticleBillboardPack::Skip => {}
+                    ParticleBillboardPack::Instanced(instance) => {
+                        self.particle_instance_scratch.push(instance);
+                    }
+                    ParticleBillboardPack::CpuOnly => cpu_only = true,
+                }
+            }
+            if !cpu_only {
+                self.stage_billboard_scratch();
+                return;
+            }
+            self.particle_cpu_fallbacks += 1;
+            self.particle_instance_scratch.clear();
+        } else {
+            self.particle_cpu_fallbacks += 1;
+        }
+        if let Some(r) = self.particle_instances.as_mut() {
+            r.count = 0;
+        }
         let mut vertices = Vec::new();
         let mut indices = Vec::new();
-        self.particle_alphas.clear();
         for quad in quads.iter().take(MAX_DYNAMIC_QUADS) {
             if !quad.color.iter().all(|v| v.is_finite()) {
                 continue;
@@ -5409,13 +5588,99 @@ impl GpuRenderer {
     }
 
     /// Convert the Vanilla particle simulation to camera-facing quads.
+    ///
+    /// The instanced branch packs each live particle's center +
+    /// [`VanillaParticle::billboard_half_size`] ×
+    /// [`VanillaParticleWorld::billboard_axes`] straight into
+    /// [`ParticleInstance`] records — no intermediate
+    /// `VanillaParticleQuad` expansion at all.
     pub fn set_particle_world(
         &mut self,
         world: &VanillaParticleWorld,
         camera_right: [f32; 3],
         camera_up: [f32; 3],
     ) {
+        if self.particle_instancing {
+            self.particle_alphas.clear();
+            self.particle_instance_scratch.clear();
+            let (right, up) = VanillaParticleWorld::billboard_axes(camera_right, camera_up);
+            let particles = world.particles();
+            self.particle_instances_capped +=
+                particles.len().saturating_sub(MAX_DYNAMIC_QUADS) as u64;
+            for particle in particles.iter().take(MAX_DYNAMIC_QUADS) {
+                let size = particle.billboard_half_size();
+                if !particle.pos.iter().all(|v| v.is_finite())
+                    || !particle.color.iter().all(|v| v.is_finite())
+                    || !size.is_finite()
+                {
+                    continue;
+                }
+                self.particle_instance_scratch.push(ParticleInstance {
+                    center: particle.pos,
+                    axis_u: right.map(|r| r * size),
+                    axis_v: up.map(|u| u * size),
+                    // `billboard_quads`' unit-square UV basis.
+                    uv_origin: [0.0, 1.0],
+                    uv_du: [1.0, 0.0],
+                    uv_dv: [0.0, -1.0],
+                    color: particle.color.map(|c| c.clamp(0.0, 1.0)),
+                });
+            }
+            self.stage_billboard_scratch();
+            return;
+        }
         self.set_particle_billboards(&world.billboard_quads(camera_right, camera_up));
+    }
+
+    /// Enable/disable the instanced billboard path (default: on when the
+    /// device limits allow it — see `particle_instancing_supported`).
+    /// `false` forces the CPU-staged quad path; output, ordering and
+    /// blending are identical either way. Enabling on a device whose
+    /// limits could not build the billboard pipeline is a no-op.
+    pub fn set_particle_instancing_enabled(&mut self, enabled: bool) {
+        self.particle_instancing = enabled && self.composite.billboard.is_some();
+    }
+
+    /// Finish an instanced `set_particle_*` call: park the CPU ring's
+    /// draw count, upload the scratch into the billboard instance ring,
+    /// and fold the ring stats into the shared dynamic-geometry counters.
+    fn stage_billboard_scratch(&mut self) {
+        if let Some(r) = self.particles.as_mut() {
+            r.index_count = 0;
+        }
+        self.particle_instance_uploads += self.particle_instance_scratch.len() as u64;
+        let (allocs, reuses) = stage_particle_instances(
+            &self.ctx,
+            &mut self.particle_instances,
+            &self.particle_instance_scratch,
+        );
+        self.dynamic_buffer_allocs += allocs;
+        self.dynamic_ring_reuses += reuses;
+    }
+
+    /// The [`ParticleInstance`] records staged for the current frame —
+    /// non-empty only on the instanced path (the CPU quad path leaves it
+    /// cleared). Exposed for tests and diagnostics.
+    pub fn staged_particle_instances(&self) -> &[ParticleInstance] {
+        &self.particle_instance_scratch
+    }
+
+    /// Whether the instanced billboard path is currently active —
+    /// `false` means `set_particle_*` calls stage CPU quads instead.
+    pub fn particle_instancing_enabled(&self) -> bool {
+        self.particle_instancing
+    }
+
+    /// Draw-uniform slots the particle stream takes this frame — one
+    /// slot for a live instanced billboard draw, or one per staged quad
+    /// on the CPU path.
+    fn particle_draw_slots(&self) -> usize {
+        if let Some(r) = self.particle_instances.as_ref() {
+            if r.count > 0 {
+                return 1;
+            }
+        }
+        self.particle_alphas.len()
     }
 
     /// Build the composed-pass pipelines and shared uniforms. Group layout:
@@ -5665,6 +5930,51 @@ impl GpuRenderer {
             true,
             None,
         );
+        let billboard = if particle_instancing_supported(device) {
+            let pipeline = composite_pipeline(
+                "composite-billboard",
+                &lit_layout,
+                &lit_module,
+                "billboard_vs",
+                "lit_fs",
+                &[
+                    Some(PARTICLE_QUAD_LAYOUT),
+                    Some(PARTICLE_INSTANCE_LAYOUT),
+                ],
+                Some(ALPHA_BLEND),
+                false,
+                None,
+            );
+            let quad_vertices = device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some("particle-billboard-quad"),
+                size: std::mem::size_of_val(&PARTICLE_BILLBOARD_CORNERS) as u64,
+                usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
+                mapped_at_creation: false,
+            });
+            ctx.queue.write_buffer(
+                &quad_vertices,
+                0,
+                bytemuck::cast_slice(&PARTICLE_BILLBOARD_CORNERS),
+            );
+            let quad_indices = device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some("particle-billboard-quad-indices"),
+                size: std::mem::size_of_val(&PARTICLE_BILLBOARD_INDICES) as u64,
+                usage: wgpu::BufferUsages::INDEX | wgpu::BufferUsages::COPY_DST,
+                mapped_at_creation: false,
+            });
+            ctx.queue.write_buffer(
+                &quad_indices,
+                0,
+                bytemuck::cast_slice(&PARTICLE_BILLBOARD_INDICES),
+            );
+            Some(ParticleBillboardGpu {
+                pipeline,
+                quad_vertices,
+                quad_indices,
+            })
+        } else {
+            None
+        };
 
         let lit_frame_bg = device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("lit-frame-bind-group"),
@@ -5810,6 +6120,7 @@ impl GpuRenderer {
             lit_pipeline,
             lit_alpha_pipeline,
             instanced_pipeline,
+            billboard,
             lit_frame_bg,
             lit_frame_layout,
             shadow_receiver_layout,
@@ -8755,7 +9066,7 @@ impl GpuRenderer {
             + self.subworld_gpu.entry_count()
             + self.subworld_gpu.batch_count()
             + usize::from(self.entity_ber.is_some())
-            + self.particle_alphas.len();
+            + self.particle_draw_slots();
         self.ensure_draw_capacity(draws.max(8));
         let clear_rgb = [
             atmo.sky_horizon_rgb[0].max(atmo.fog_rgb[0] * 0.8),
@@ -9279,6 +9590,7 @@ impl GpuRenderer {
         }
         fnv1a_u64(&mut casters, dynamic_geometry_digest(&self.entity_ber));
         fnv1a_u64(&mut casters, dynamic_geometry_digest(&self.particles));
+        fnv1a_u64(&mut casters, particle_instance_digest(&self.particle_instances));
         // Buffer replacement under identical content — the epoch covers
         // every sync that touched real GPU objects.
         fnv1a_u64(&mut casters, self.subworld_gpu_epoch);
@@ -10192,6 +10504,7 @@ impl GpuRenderer {
         let subworld_gpu = &self.subworld_gpu;
         let entity_ber = &self.entity_ber;
         let particles = &self.particles;
+        let particle_instances = &self.particle_instances;
         let particle_alphas = &self.particle_alphas;
         let debug_lines = &self.debug_lines;
         let debug_line_pipeline = &self.debug_line_pipeline;
@@ -10605,6 +10918,32 @@ impl GpuRenderer {
                 pass.draw_indexed(0..entry.index_count, 0, 0..1);
             }
 
+            // GPU-instanced billboards: one indexed draw expands the
+            // static unit quad per staged `ParticleInstance` — the VS
+            // rebuilds each quad's corners from its center + billboard
+            // axes and `lit_fs` blends `color.a` exactly like the old
+            // per-draw uniform alpha did.
+            if let Some(ring) = particle_instances {
+                if ring.count > 0 {
+                    if let Some(billboards) = gpu.billboard.as_ref() {
+                        pass.set_pipeline(
+                            shadow
+                                .and_then(|s| s.billboard_color.as_ref())
+                                .unwrap_or(&billboards.pipeline),
+                        );
+                        pass.set_bind_group(0, &gpu.lit_frame_bg, &[]);
+                        let off = slot(identity, 1.0, 1.0);
+                        pass.set_bind_group(1, &gpu.draw_bg, &[off]);
+                        pass.set_vertex_buffer(0, billboards.quad_vertices.slice(..));
+                        pass.set_vertex_buffer(1, ring.buffer.slice(..));
+                        pass.set_index_buffer(
+                            billboards.quad_indices.slice(..),
+                            wgpu::IndexFormat::Uint32,
+                        );
+                        pass.draw_indexed(0..6, 0, 0..ring.count);
+                    }
+                }
+            }
             if let Some(mesh) = particles {
                 pass.set_pipeline(&lit_alpha_pipeline);
                 pass.set_bind_group(0, &gpu.lit_frame_bg, &[]);
@@ -10694,7 +11033,7 @@ impl GpuRenderer {
             + self.subworld_gpu.entry_count()
             + self.subworld_gpu.batch_count()
             + usize::from(self.entity_ber.is_some())
-            + self.particle_alphas.len();
+            + self.particle_draw_slots();
         self.ensure_draw_capacity(draw_count.max(8));
 
         // The world pass renders into the scaled target (or straight into

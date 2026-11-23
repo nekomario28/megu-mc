@@ -1225,6 +1225,17 @@ pub struct VanillaParticleQuad {
     pub color: [f32; 4],
 }
 
+impl VanillaParticle {
+    /// Age-scaled billboard half-size in blocks — the identical factor
+    /// [`VanillaParticleWorld::billboard_quads`] multiplies the camera axes by.
+    /// GPU-instanced paths pack this per particle instead of four expanded
+    /// corners.
+    pub fn billboard_half_size(&self) -> f32 {
+        let remaining = (1.0 - self.age_secs / self.max_age_secs).clamp(0.0, 1.0);
+        self.kind.radius() * (0.25 + 0.75 * remaining)
+    }
+}
+
 /// FIFO particle pool. Identical calls produce identical meshes and states.
 /// The oldest live particle is evicted when a spawn exceeds the fixed cap.
 #[derive(Clone, Debug, Default, PartialEq)]
@@ -1341,13 +1352,14 @@ impl VanillaParticleWorld {
         });
     }
 
-    /// Build screen-facing quads in oldest-to-newest spawn order. Degenerate
-    /// camera axes use world-space fallbacks; non-finite quads are omitted.
-    pub fn billboard_quads(
-        &self,
+    /// Orthonormalized billboard basis `(right, up)` — the exact axes
+    /// [`Self::billboard_quads`] expands corners with. GPU-instanced
+    /// particle paths scale these per particle instead of materializing
+    /// the four world-space corners on the CPU.
+    pub fn billboard_axes(
         camera_right: [f32; 3],
         camera_up: [f32; 3],
-    ) -> Vec<VanillaParticleQuad> {
+    ) -> ([f32; 3], [f32; 3]) {
         let right = particle_normalize(camera_right).unwrap_or([1.0, 0.0, 0.0]);
         let up_dot = particle_dot(right, camera_up);
         let orthogonal_up = [
@@ -1369,10 +1381,20 @@ impl VanillaParticleWorld {
             ])
             .unwrap_or([0.0, 1.0, 0.0])
         });
+        (right, up)
+    }
+
+    /// Build screen-facing quads in oldest-to-newest spawn order. Degenerate
+    /// camera axes use world-space fallbacks; non-finite quads are omitted.
+    pub fn billboard_quads(
+        &self,
+        camera_right: [f32; 3],
+        camera_up: [f32; 3],
+    ) -> Vec<VanillaParticleQuad> {
+        let (right, up) = Self::billboard_axes(camera_right, camera_up);
         let mut quads = Vec::with_capacity(self.particles.len());
         for particle in &self.particles {
-            let remaining = (1.0 - particle.age_secs / particle.max_age_secs).clamp(0.0, 1.0);
-            let size = particle.kind.radius() * (0.25 + 0.75 * remaining);
+            let size = particle.billboard_half_size();
             let corners = [(-1.0, -1.0), (1.0, -1.0), (1.0, 1.0), (-1.0, 1.0)];
             let positions = corners.map(|(x, y)| {
                 [

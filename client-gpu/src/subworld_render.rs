@@ -20,6 +20,7 @@
 use std::collections::BTreeMap;
 
 use bytemuck::{Pod, Zeroable};
+use megu_client_mesh::ber_instancing::VanillaParticleQuad;
 use megu_client_mesh::builtin_shadow_wgsl::VfxLightUniforms;
 use megu_client_mesh::BerInstanceData;
 
@@ -344,6 +345,201 @@ pub const PART_INSTANCE_LAYOUT: wgpu::VertexBufferLayout<'static> = wgpu::Vertex
     step_mode: wgpu::VertexStepMode::Instance,
     attributes: &PART_INSTANCE_ATTRS,
 };
+
+// ---------------------------------------------------------------------------
+// GPU-instanced particle billboards
+// ---------------------------------------------------------------------------
+
+/// Static unit-quad corners the billboard vertex shader expands per
+/// instance — same order `VanillaParticleWorld::billboard_quads` emits
+/// (`(-1,-1) (1,-1) (1,1) (-1,1)`, CCW).
+pub const PARTICLE_BILLBOARD_CORNERS: [[f32; 2]; 4] =
+    [[-1.0, -1.0], [1.0, -1.0], [1.0, 1.0], [-1.0, 1.0]];
+
+/// Triangle list for the billboard unit quad — identical winding to
+/// `append_dynamic_quad`'s `[base, base+1, base+2, base, base+2, base+3]`.
+pub const PARTICLE_BILLBOARD_INDICES: [u32; 6] = [0, 1, 2, 0, 2, 3];
+
+/// One particle's billboard record (76 B — replaces the 216 B of
+/// CPU-expanded quad vertices+indices the old path uploaded per particle).
+/// `axis_u`/`axis_v` are the quad's half-edge vectors: for a
+/// camera-facing quad they are the view right/up scaled by the half
+/// extents, so the vertex shader's
+/// `center + corner.x*axis_u + corner.y*axis_v` reproduces the original
+/// CPU-expanded corner positions. `VanillaParticleQuad` carries no
+/// explicit rotation field — in-plane rotation and shear are baked into
+/// the axis vectors.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Pod, Zeroable)]
+pub struct ParticleInstance {
+    /// World-space quad center.
+    pub center: [f32; 3],
+    /// Half-edge toward the quad's +u corners (camera-right × half-width
+    /// for screen-facing billboards).
+    pub axis_u: [f32; 3],
+    /// Half-edge toward the +v corners (camera-up × half-height).
+    pub axis_v: [f32; 3],
+    /// Affine UV basis — `uv = uv_origin + c.x*uv_du + c.y*uv_dv` with `c`
+    /// the unit corner coordinate `(corner + 1) / 2`. Reproduces any
+    /// per-corner `[[f32; 2]; 4]` assignment exactly.
+    pub uv_origin: [f32; 2],
+    pub uv_du: [f32; 2],
+    pub uv_dv: [f32; 2],
+    /// `rgb` albedo tint; `a` is the per-particle alpha the CPU path
+    /// pushed through per-draw dynamic-offset uniform slots.
+    pub color: [f32; 4],
+}
+
+/// `corner` slot for the billboard unit quad (buffer 0).
+const PARTICLE_QUAD_ATTRS: [wgpu::VertexAttribute; 1] = [wgpu::VertexAttribute {
+    format: wgpu::VertexFormat::Float32x2,
+    offset: 0,
+    shader_location: 0,
+}];
+
+/// Static unit-quad stream (buffer slot 0 of the billboard pipeline).
+pub const PARTICLE_QUAD_LAYOUT: wgpu::VertexBufferLayout<'static> =
+    wgpu::VertexBufferLayout {
+        array_stride: std::mem::size_of::<[f32; 2]>() as wgpu::BufferAddress,
+        step_mode: wgpu::VertexStepMode::Vertex,
+        attributes: &PARTICLE_QUAD_ATTRS,
+    };
+
+/// `@location(1..7)` mirror of [`ParticleInstance`].
+const PARTICLE_INSTANCE_ATTRS: [wgpu::VertexAttribute; 7] = [
+    wgpu::VertexAttribute {
+        format: wgpu::VertexFormat::Float32x3,
+        offset: 0,
+        shader_location: 1,
+    },
+    wgpu::VertexAttribute {
+        format: wgpu::VertexFormat::Float32x3,
+        offset: 12,
+        shader_location: 2,
+    },
+    wgpu::VertexAttribute {
+        format: wgpu::VertexFormat::Float32x3,
+        offset: 24,
+        shader_location: 3,
+    },
+    wgpu::VertexAttribute {
+        format: wgpu::VertexFormat::Float32x2,
+        offset: 36,
+        shader_location: 4,
+    },
+    wgpu::VertexAttribute {
+        format: wgpu::VertexFormat::Float32x2,
+        offset: 44,
+        shader_location: 5,
+    },
+    wgpu::VertexAttribute {
+        format: wgpu::VertexFormat::Float32x2,
+        offset: 52,
+        shader_location: 6,
+    },
+    wgpu::VertexAttribute {
+        format: wgpu::VertexFormat::Float32x4,
+        offset: 60,
+        shader_location: 7,
+    },
+];
+
+/// Per-instance billboard stream (buffer slot 1 of the billboard pipeline).
+pub const PARTICLE_INSTANCE_LAYOUT: wgpu::VertexBufferLayout<'static> =
+    wgpu::VertexBufferLayout {
+        array_stride: std::mem::size_of::<ParticleInstance>() as wgpu::BufferAddress,
+        step_mode: wgpu::VertexStepMode::Instance,
+        attributes: &PARTICLE_INSTANCE_ATTRS,
+    };
+
+/// How one CPU-expanded `VanillaParticleQuad` packs for the instanced
+/// billboard path.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum ParticleBillboardPack {
+    /// Not renderable on either path — non-finite fields or a degenerate
+    /// quad, the same inputs `set_particle_billboards` already skips.
+    Skip,
+    /// Packed billboard instance.
+    Instanced(ParticleInstance),
+    /// Renderable but outside the bilinear-billboard model
+    /// (non-parallelogram positions or non-affine UV corners). The caller
+    /// must route the whole call through the CPU quad path so draw order
+    /// and output stay identical.
+    CpuOnly,
+}
+
+/// Pack one CPU-expanded `VanillaParticleQuad` into a [`ParticleInstance`].
+/// Mirrors the skip conditions of the `TerrainVertex` staging path:
+/// non-finite color, degenerate quad, or non-finite positions/UVs are
+/// dropped; quads outside the parallelogram/affine-UV model report
+/// [`ParticleBillboardPack::CpuOnly`].
+pub fn pack_particle_billboard(quad: &VanillaParticleQuad) -> ParticleBillboardPack {
+    if !quad.color.iter().all(|v| v.is_finite()) {
+        return ParticleBillboardPack::Skip;
+    }
+    let p = &quad.positions;
+    let u = [
+        p[1][0] - p[0][0],
+        p[1][1] - p[0][1],
+        p[1][2] - p[0][2],
+    ];
+    let v = [
+        p[3][0] - p[0][0],
+        p[3][1] - p[0][1],
+        p[3][2] - p[0][2],
+    ];
+    let n = [
+        u[1] * v[2] - u[2] * v[1],
+        u[2] * v[0] - u[0] * v[2],
+        u[0] * v[1] - u[1] * v[0],
+    ];
+    let length = (n[0] * n[0] + n[1] * n[1] + n[2] * n[2]).sqrt();
+    if !length.is_finite() || length <= f32::EPSILON {
+        return ParticleBillboardPack::Skip;
+    }
+    if !p
+        .iter()
+        .flatten()
+        .chain(quad.uv.iter().flatten())
+        .all(|value| value.is_finite())
+    {
+        return ParticleBillboardPack::Skip;
+    }
+    let uv_du = [quad.uv[1][0] - quad.uv[0][0], quad.uv[1][1] - quad.uv[0][1]];
+    let uv_dv = [quad.uv[3][0] - quad.uv[0][0], quad.uv[3][1] - quad.uv[0][1]];
+    let edge_len = (u[0] * u[0] + u[1] * u[1] + u[2] * u[2]).sqrt()
+        + (v[0] * v[0] + v[1] * v[1] + v[2] * v[2]).sqrt()
+        + 1e-3;
+    let pos_dev = (p[2][0] - (p[0][0] + u[0] + v[0]))
+        .abs()
+        .max((p[2][1] - (p[0][1] + u[1] + v[1])).abs())
+        .max((p[2][2] - (p[0][2] + u[2] + v[2])).abs());
+    let uv_len = uv_du[0].abs() + uv_du[1].abs() + uv_dv[0].abs() + uv_dv[1].abs() + 1e-3;
+    let uv_dev = (quad.uv[2][0] - (quad.uv[0][0] + uv_du[0] + uv_dv[0]))
+        .abs()
+        .max((quad.uv[2][1] - (quad.uv[0][1] + uv_du[1] + uv_dv[1])).abs());
+    if pos_dev > 1e-4 * edge_len || uv_dev > 1e-4 * uv_len {
+        return ParticleBillboardPack::CpuOnly;
+    }
+    ParticleBillboardPack::Instanced(ParticleInstance {
+        center: [
+            (p[0][0] + p[2][0]) * 0.5,
+            (p[0][1] + p[2][1]) * 0.5,
+            (p[0][2] + p[2][2]) * 0.5,
+        ],
+        axis_u: [u[0] * 0.5, u[1] * 0.5, u[2] * 0.5],
+        axis_v: [v[0] * 0.5, v[1] * 0.5, v[2] * 0.5],
+        uv_origin: quad.uv[0],
+        uv_du,
+        uv_dv,
+        color: [
+            quad.color[0].clamp(0.0, 1.0),
+            quad.color[1].clamp(0.0, 1.0),
+            quad.color[2].clamp(0.0, 1.0),
+            quad.color[3].clamp(0.0, 1.0),
+        ],
+    })
+}
 
 /// One shared-template instanced batch: every record draws the same
 /// `template` mesh, so a thousand cogwheels cost one draw call.
@@ -1492,6 +1688,25 @@ struct LitFragment {
     @location(3) light_add: f32,
     @location(4) uv: vec2<f32>,
     @location(5) @interpolate(flat) atlas_index: u32,
+    @location(6) alpha: f32,
+};
+
+// GPU-instanced particle billboards: a static unit quad (slot 0) plus
+// per-instance center/axis records (slot 1). The VS expands corners with
+// the quad's billboard axes — the camera right/up vectors the producer
+// scaled by half extent — so no world positions are built on the CPU.
+struct BillboardQuadVertex {
+    @location(0) corner: vec2<f32>,
+};
+
+struct BillboardInstance {
+    @location(1) center: vec3<f32>,
+    @location(2) axis_u: vec3<f32>,
+    @location(3) axis_v: vec3<f32>,
+    @location(4) uv_origin: vec2<f32>,
+    @location(5) uv_du: vec2<f32>,
+    @location(6) uv_dv: vec2<f32>,
+    @location(7) color: vec4<f32>,
 };
 
 fn atlas_sample(sprite_id: u32, uv: vec2<f32>) -> vec3<f32> {
@@ -1555,6 +1770,7 @@ fn lit_emit(
     light_add: f32,
     uv: vec2<f32>,
     atlas_index: u32,
+    alpha: f32,
 ) -> LitFragment {
     var out: LitFragment;
     out.clip = clip;
@@ -1564,6 +1780,7 @@ fn lit_emit(
     out.light_add = light_add;
     out.uv = uv;
     out.atlas_index = atlas_index;
+    out.alpha = alpha;
     return out;
 }
 
@@ -1579,6 +1796,7 @@ fn lit_vs(in: LitVertex) -> LitFragment {
         0.0,
         in.uv,
         in.atlas_index,
+        1.0,
     );
 }
 
@@ -1600,6 +1818,26 @@ fn inst_vs(in: LitVertex, inst: PartInstance) -> LitFragment {
         max(light, 0.25),
         in.uv,
         in.atlas_index,
+        1.0,
+    );
+}
+
+@vertex
+fn billboard_vs(quad: BillboardQuadVertex, inst: BillboardInstance) -> LitFragment {
+    let c = quad.corner * vec2<f32>(0.5) + vec2<f32>(0.5);
+    let base = inst.center + quad.corner.x * inst.axis_u + quad.corner.y * inst.axis_v;
+    let world = (draw.model * vec4<f32>(base, 1.0)).xyz;
+    let n = cross(inst.axis_u, inst.axis_v);
+    let nrm = normalize((draw.model * vec4<f32>(n, 0.0)).xyz);
+    return lit_emit(
+        draw.mvp * vec4<f32>(base, 1.0),
+        world,
+        nrm,
+        inst.color.rgb,
+        0.0,
+        inst.uv_origin + c.x * inst.uv_du + c.y * inst.uv_dv,
+        0xFFFFFFFFu,
+        inst.color.a,
     );
 }
 
@@ -1635,6 +1873,6 @@ fn lit_fs(in: LitFragment) -> @location(0) vec4<f32> {
     color = mix(color, frame.fog_color, clamp(max(linear, expo), 0.0, 1.0));
     let fade = clamp(draw.params.x, 0.0, 1.0);
     color = mix(frame.fog_color, color, fade);
-    return vec4<f32>(filmic(color), draw.params.y * fade);
+    return vec4<f32>(filmic(color), draw.params.y * fade * in.alpha);
 }
 ";
