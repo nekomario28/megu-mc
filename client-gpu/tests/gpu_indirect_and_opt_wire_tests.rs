@@ -23,7 +23,8 @@ use megu_client_gpu::renderer::{
     opaque_section_sort_key, probe_adapters, request_gpu_device,
     section_morton_key, GpuDevice, GpuRenderer, OFFSCREEN_FORMAT,
 };
-use megu_client_gpu::Camera;
+use megu_client_gpu::window::GpuApp;
+use megu_client_gpu::{Camera, GpuCliConfig};
 use megu_client_mesh::{box_in_frustum, RenderBackendPreference, SectionCoord, EDGE};
 use megu_ui::state::UiState;
 
@@ -474,4 +475,50 @@ fn live_session_feeds_kernel_autotuner_and_upload_budget_p95_feedback() {
         "measured frame P95 must feed the upload budget, got {}",
         renderer.upload_budget_p95_observations()
     );
+}
+
+// ---------------------------------------------------------------------------
+// C2 — live-session attach activates the compute strategy once
+// ---------------------------------------------------------------------------
+
+/// `attach_live`/`connect_to` arm the pending flag; the first live frame
+/// pushes the session's `ComputeStrategy` exactly once per renderer and
+/// the indirect gate matches `indirect_execution_supported()` and the
+/// unified plan — fail-closed on adapters without indirect+compute.
+#[test]
+fn attach_arms_strategy_and_first_live_frame_pushes_once() {
+    let mut app = GpuApp::new(GpuCliConfig::default());
+    app.attach_live(LiveSession::offline_with_null_audio());
+    assert!(
+        app.live_strategy_pending(),
+        "attach must arm the compute-strategy push"
+    );
+
+    let Some(ctx) = try_gpu() else {
+        return;
+    };
+    let mut renderer = GpuRenderer::new(ctx, OFFSCREEN_FORMAT);
+    assert_eq!(renderer.compute_strategy_apply_count(), 0);
+
+    app.push_pending_compute_strategy(&mut renderer);
+    assert!(!app.live_strategy_pending());
+    assert_eq!(renderer.compute_strategy_apply_count(), 1);
+    let hints = *app.live().as_ref().unwrap().domain_hints();
+    assert_eq!(
+        renderer.gpu_indirect_enabled,
+        renderer.indirect_execution_supported() && !hints.gpu_cull.prefer_single_pass_gpu,
+        "indirect must engage only on capable adapters the plan allows"
+    );
+
+    // Later frames are free: the flag stays cleared and the renderer is
+    // not re-negotiated.
+    app.push_pending_compute_strategy(&mut renderer);
+    assert_eq!(renderer.compute_strategy_apply_count(), 1);
+
+    // A re-attached session re-arms — the next live frame pushes onto
+    // the same renderer (device hand-off/re-attach ordering).
+    app.attach_live(LiveSession::offline_with_null_audio());
+    assert!(app.live_strategy_pending());
+    app.push_pending_compute_strategy(&mut renderer);
+    assert_eq!(renderer.compute_strategy_apply_count(), 2);
 }

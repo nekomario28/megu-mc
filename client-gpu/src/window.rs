@@ -10,12 +10,24 @@ use crate::live_session::LiveHudFeed;
 use megu_client::audio_qol::{ZoomState, DEFAULT_ZOOM_SMOOTHING_RATE};
 use megu_client::friend_client::{FriendGuestBridge, FriendHostSession};
 use megu_client::integrated;
-use megu_client::protocol::encode_slot_stack;
+use megu_client::protocol::{encode_slot_stack, NbtValue, WireReader};
 use megu_client::render::{FrameBudgetGovernor, RenderConfig, ThrottleStage};
 use megu_client::spatial_audio::SpatialAudioPreset;
+use megu_client::world::{TrackedBlockEntity, TrackedEntity};
 use megu_client::zsh_command_bar::ZshCommandBar;
+use megu_client_mesh::ber_instancing::{
+    build_ber_mesh, VanillaBerFacing, VanillaBerKind, VanillaBerState, VanillaParticleQuad,
+    VanillaParticleWorld,
+};
 use megu_client_mesh::builtin_shadow_wgsl::{BuiltinShadowQuality, RenderScalePreset};
-use megu_client_mesh::tactile_effects::{TactileEffectsConfig, TactilePreset};
+use megu_client_mesh::entity_rig::{build_entity_rig_mesh, EntityPose, EntityRigSpec};
+use megu_client_mesh::mesher::classify_vanilla_ber;
+use megu_client_mesh::tactile_effects::{
+    TactileEffectsConfig, TactileParticle, TactileParticleKind, TactilePreset,
+};
+use megu_client_mesh::vanilla_plus_3d::ExtrudedMesh;
+use megu_client_mesh::vanilla_plus_nature::{NatureParticle, NatureParticleKind};
+use megu_client_mesh::vfx_engine::{ParticleDraw, ParticleOrientation, VfxFrameOutput};
 use megu_client_mesh::ChunkUploadBudget;
 use megu_kernel::debug_chords::{
     finish_gamemode_switcher, handle_f3_chord, DebugChordAction, DebugChordContext,
@@ -67,6 +79,11 @@ const OCCLUDED_TICK: Duration = Duration::from_millis(50);
 /// 10 Hz, and a stable actionbar keeps the draw-list fingerprint — and
 /// therefore the UI mesh upload — quiet on steady frames.
 const F3_REFRESH: Duration = Duration::from_millis(100);
+/// Live entity/BER mesh rebuild cadence — the server mutates tracked
+/// entity state at 20 Hz, so faster rebuilds re-mesh identical poses.
+const LIVE_ENTITY_REFRESH: Duration = Duration::from_millis(50);
+/// Stable dispatch slots mirroring the 12 [`VanillaBerKind`] families.
+const BER_KIND_SLOTS: usize = 12;
 
 const THIRD_PERSON_DISTANCE: f32 = 4.0;
 const SPRINT_FOV_BOOST: f32 = 0.10;
@@ -584,9 +601,56 @@ pub struct GpuApp {
     /// immediately before `render_frame` derives the view camera — the
     /// late-latch: input sampled as close to the draw as possible.
     pending_mouse_delta: (f64, f64),
+    /// Armed whenever a session attaches: the next live frame on any
+    /// `GpuRenderer` that has not seen a full strategy push applies the
+    /// session's connect-time `ComputeStrategy` (GPU indirect/Hi-Z/MDI
+    /// on capable adapters, fail-closed elsewhere).
+    live_strategy_pending: bool,
+    /// Pooled HUD draw list — `UiState::render_into` refills it in place
+    /// so steady frames allocate nothing (text payloads recycle inside
+    /// the list).
+    ui_draw_list: UiDrawList,
+    /// Per-frame live-particle staging scratch (tactile + ambience + VFX1
+    /// billboards) — cleared and refilled only while particles exist.
+    particle_scratch: Vec<VanillaParticleQuad>,
+    /// `true` while the renderer's particle ring holds a non-empty
+    /// upload — an all-clear frame stages `[]` once, then stays free.
+    live_particles_staged: bool,
+    /// Live entity + block-entity mesh staging cache (20 Hz throttle —
+    /// the server tick cadence positions actually move at).
+    entity_render_cache: LiveEntityRenderCache,
     last_frame: Instant,
     frame_start: Instant,
     fatal: Option<String>,
+}
+
+/// Live entity + block-entity render cache: rig meshes keyed by entity
+/// id + pose fingerprint, one canonical template per BER family, and the
+/// throttle/staging bookkeeping that keeps uploads off the hot path.
+struct LiveEntityRenderCache {
+    /// Pose-fingerprint-keyed rig meshes; rebuilt only when an entity's
+    /// spec or pose actually changes.
+    entity_meshes: std::collections::HashMap<i32, (u64, ExtrudedMesh)>,
+    /// Canonical template per [`VanillaBerKind`] — the default states are
+    /// per-kind constants, so every placed block entity of a family
+    /// shares one mesh.
+    ber_meshes: [Option<ExtrudedMesh>; BER_KIND_SLOTS],
+    /// Earliest next rebuild instant (20 Hz — the server tick cadence).
+    next_refresh: Option<Instant>,
+    /// `true` while the renderer's entity/BER ring holds a non-empty
+    /// upload — a fully empty world still clears the ring once.
+    staged: bool,
+}
+
+impl Default for LiveEntityRenderCache {
+    fn default() -> Self {
+        Self {
+            entity_meshes: std::collections::HashMap::new(),
+            ber_meshes: std::array::from_fn(|_| None),
+            next_refresh: None,
+            staged: false,
+        }
+    }
 }
 
 impl GpuApp {
@@ -714,6 +778,11 @@ impl GpuApp {
             baseline_upload_budget: None,
             f3_text: None,
             pending_mouse_delta: (0.0, 0.0),
+            live_strategy_pending: true,
+            ui_draw_list: UiDrawList::new(),
+            particle_scratch: Vec::new(),
+            live_particles_staged: false,
+            entity_render_cache: LiveEntityRenderCache::default(),
             last_frame: Instant::now(),
             frame_start: Instant::now(),
             fatal: None,
@@ -832,6 +901,183 @@ impl GpuApp {
     /// mirrors the network path fills.
     pub fn attach_live(&mut self, live: LiveSession) {
         self.live = Some(live);
+        self.on_live_attached();
+    }
+
+    /// One-time per-attach wiring shared by `connect_to`/`attach_live`:
+    /// arms the compute-strategy push the next live frame performs and
+    /// replays the client-side debug log into the session's chat mirror —
+    /// `sync_hud_to` replaces `ui.hud.chat_lines` wholesale on every HUD
+    /// revision, so the log lives in `live.hud` where the sync carries it.
+    fn on_live_attached(&mut self) {
+        self.live_strategy_pending = true;
+        let Some(live) = &mut self.live else {
+            return;
+        };
+        live.hud
+            .chat_lines
+            .extend(self.debug_messages.iter().cloned());
+        if live.hud.chat_lines.len() > 100 {
+            let excess = live.hud.chat_lines.len() - 100;
+            live.hud.chat_lines.drain(..excess);
+        }
+        live.hud_revision += 1;
+    }
+
+    /// Push the session's connect-time `ComputeStrategy` onto this
+    /// renderer the first time it draws a live frame —
+    /// `on_live_attached` arms `live_strategy_pending` and a fresh
+    /// `ActiveWindow` re-arms it, so device re-creation re-applies
+    /// uploads/workers/indirect policy. The strategy itself fails
+    /// closed: GPU indirect/Hi-Z/MDI engage only when
+    /// `indirect_execution_supported()` and the unified plan allow it.
+    #[doc(hidden)]
+    pub fn ensure_live_compute_strategy(
+        live: &mut LiveSession,
+        pending: &mut bool,
+        renderer: &mut GpuRenderer,
+    ) {
+        if !*pending {
+            return;
+        }
+        *pending = false;
+        live.apply_compute_strategy(renderer);
+    }
+
+    /// `true` while the next live frame will push the compute strategy —
+    /// armed by `on_live_attached` and every fresh `ActiveWindow`.
+    #[doc(hidden)]
+    pub fn live_strategy_pending(&self) -> bool {
+        self.live_strategy_pending
+    }
+
+    /// Drive the pending strategy push for the attached session (test +
+    /// headless-hook entry point; the render loop calls
+    /// [`Self::ensure_live_compute_strategy`] directly so it can borrow
+    /// the fields disjointly).
+    #[doc(hidden)]
+    pub fn push_pending_compute_strategy(&mut self, renderer: &mut GpuRenderer) {
+        let pending = &mut self.live_strategy_pending;
+        if let Some(live) = &mut self.live {
+            Self::ensure_live_compute_strategy(live, pending, renderer);
+        }
+    }
+
+    /// Rebuild the live entity + block-entity draw set: articulated rig
+    /// meshes keyed by entity id + pose fingerprint (rebuilt only when
+    /// the spec or pose actually changes), plus one canonical template
+    /// per BER family placed at each tracked block-entity position.
+    /// Throttled by the caller to the 20 Hz server cadence; an empty
+    /// world costs only the two map scans and clears a stale upload
+    /// exactly once.
+    fn refresh_live_entity_and_ber(
+        live: &LiveSession,
+        cache: &mut LiveEntityRenderCache,
+        renderer: &mut GpuRenderer,
+    ) {
+        cache
+            .entity_meshes
+            .retain(|eid, _| live.entity_rig(*eid).is_some());
+        // Pass 1 mutates the caches (new/pose-changed meshes only); pass
+        // 2 then borrows them immutably to assemble the draw list — the
+        // renderer consumes `&ExtrudedMesh` refs so no mesh is cloned.
+        let mut entity_refs: Vec<(i32, [f32; 3], [f32; 3])> = Vec::new();
+        for (eid, spec, pos, tracked) in live.entity_render_entries() {
+            let pose = live_entity_pose(live, eid, tracked);
+            let key = entity_pose_key(spec, &pose);
+            if cache
+                .entity_meshes
+                .get(&eid)
+                .is_none_or(|(k, _)| *k != key)
+            {
+                cache
+                    .entity_meshes
+                    .insert(eid, (key, build_entity_rig_mesh(spec, pose)));
+            }
+            entity_refs.push((
+                eid,
+                [pos[0] as f32, pos[1] as f32, pos[2] as f32],
+                live_entity_tint(spec, tracked),
+            ));
+        }
+        let mut ber_refs: Vec<(usize, [f32; 3], [f32; 3])> = Vec::new();
+        for (block_pos, be) in &live.world.block_entities {
+            let Some(kind) = classify_tracked_block_entity(be) else {
+                continue;
+            };
+            let slot = ber_kind_slot(kind);
+            if cache.ber_meshes[slot].is_none() {
+                cache.ber_meshes[slot] =
+                    Some(build_ber_mesh(kind, default_vanilla_ber_state(kind)));
+            }
+            ber_refs.push((
+                slot,
+                [
+                    block_pos[0] as f32,
+                    block_pos[1] as f32,
+                    block_pos[2] as f32,
+                ],
+                vanilla_ber_base_color_f32(kind),
+            ));
+        }
+        let mut meshes: Vec<(&ExtrudedMesh, [f32; 3], [f32; 3])> =
+            Vec::with_capacity(entity_refs.len() + ber_refs.len());
+        for (eid, origin, tint) in entity_refs {
+            if let Some((_, mesh)) = cache.entity_meshes.get(&eid) {
+                meshes.push((mesh, origin, tint));
+            }
+        }
+        for (slot, origin, tint) in ber_refs {
+            if let Some(mesh) = cache.ber_meshes[slot].as_ref() {
+                meshes.push((mesh, origin, tint));
+            }
+        }
+        if meshes.is_empty() {
+            if cache.staged {
+                renderer.set_entity_and_ber_meshes(Vec::new());
+                cache.staged = false;
+            }
+            return;
+        }
+        cache.staged = true;
+        renderer.set_entity_and_ber_meshes(meshes);
+    }
+
+    /// Expand every live particle system (tactile sim, nature ambience,
+    /// VFX1 particles) into camera-facing [`VanillaParticleQuad`]s in
+    /// `scratch`, then stage them via
+    /// [`GpuRenderer::set_particle_billboards`]. All systems empty ⇒ the
+    /// ring is cleared exactly once and subsequent frames cost a few
+    /// `is_empty` checks — zero wasted CPU when particles are off.
+    fn stage_live_particles(
+        live: &LiveSession,
+        frame: &VfxFrameOutput,
+        camera: &Camera,
+        scratch: &mut Vec<VanillaParticleQuad>,
+        staged: &mut bool,
+        renderer: &mut GpuRenderer,
+    ) {
+        scratch.clear();
+        let (right, up) =
+            VanillaParticleWorld::billboard_axes(camera.right_vector(), camera.up_vector());
+        for particle in live.tactile_sim().particles() {
+            push_tactile_particle(scratch, particle, right, up);
+        }
+        for particle in live.nature_ambience.particles() {
+            push_nature_particle(scratch, particle, right, up);
+        }
+        for particle in &frame.particles {
+            push_vfx_particle(scratch, particle, right, up, camera.forward_vector());
+        }
+        if scratch.is_empty() {
+            if *staged {
+                renderer.set_particle_billboards(&[]);
+                *staged = false;
+            }
+            return;
+        }
+        *staged = true;
+        renderer.set_particle_billboards(scratch);
     }
 
     /// Drive one [`WindowInputEvent`] through the same handler `handle_key`
@@ -1219,6 +1465,10 @@ impl GpuApp {
         }
         if let Some(live) = &mut self.live {
             live.hud.chat_lines.push(message);
+            if live.hud.chat_lines.len() > 100 {
+                let excess = live.hud.chat_lines.len() - 100;
+                live.hud.chat_lines.drain(..excess);
+            }
             live.hud_revision += 1;
         }
     }
@@ -1244,6 +1494,7 @@ impl GpuApp {
         // threads overflows their stack, and headless/test sessions keep
         // the synchronous `pump()` path by design.
         self.live = Some(live);
+        self.on_live_attached();
         self.ui.screen = Screen::InGameHud;
         self.ui.hud = megu_ui::state::HudState::default();
         self.paused = false;
@@ -1595,6 +1846,10 @@ impl GpuApp {
         if let Some(path) = &self.config.shader_pack {
             active.renderer.load_shaderpack(path);
         }
+        // Fresh `GpuRenderer` (first `resumed`, device loss, surface
+        // re-create): re-arm the compute-strategy push so the next live
+        // frame re-applies indirect/Hi-Z/MDI policy to the new device.
+        self.live_strategy_pending = true;
         self.active = Some(active);
         let settings = self.ui.settings.clone();
         self.apply_settings(&settings);
@@ -2312,6 +2567,35 @@ impl GpuApp {
             // inside `poll` — steady frames cost one compare.
             active.renderer.tick_atlas_animations(live.atlas_anim_tick());
             active.renderer.sync_subworlds(&mut live.subworlds);
+            // First live frame on this renderer (attach order or
+            // surface/device re-creation): push the session's
+            // connect-time `ComputeStrategy`. `apply_compute_strategy`
+            // engages GPU indirect/Hi-Z/MDI only where the adapter
+            // proves indirect+compute support and the unified plan
+            // allows it; everything else fails closed to the
+            // classic/bundle path.
+            Self::ensure_live_compute_strategy(
+                live,
+                &mut self.live_strategy_pending,
+                &mut active.renderer,
+            );
+            // Live entities + block-entity meshes ride the dynamic ring;
+            // re-staged at most at the 20 Hz cadence the server actually
+            // mutates tracked state, skipped outright while nothing is
+            // renderable.
+            if self
+                .entity_render_cache
+                .next_refresh
+                .is_none_or(|t| frame_begin >= t)
+            {
+                self.entity_render_cache.next_refresh =
+                    Some(frame_begin + LIVE_ENTITY_REFRESH);
+                Self::refresh_live_entity_and_ber(
+                    live,
+                    &mut self.entity_render_cache,
+                    &mut active.renderer,
+                );
+            }
             // First live frame on the windowed path: hand the sink to the
             // dedicated real-time `AudioMixThread` so gameplay code
             // submits `AudioCmd`s non-blocking (headless/test sessions
@@ -2344,10 +2628,11 @@ impl GpuApp {
                 0.0,
                 live.world.rain_level > 0.0,
             );
-            self.ui
-                .hud
-                .chat_lines
-                .extend(self.debug_messages.iter().cloned());
+            // Chat/debug lines already live in `live.hud` (chat packets,
+            // `status_line`, debug-chord feedback) and `sync_hud_to`
+            // mirrors them into `ui.hud` on revision bumps — re-extending
+            // `debug_messages` here every frame was an unbounded
+            // duplication at render rate.
         }
 
         // HUD/diagnostics through the real client-ui state machine. The
@@ -2397,7 +2682,13 @@ impl GpuApp {
                     SessionStatus::Disconnected(reason) => format!("Disconnected: {reason}"),
                 })
         };
-        let mut draw_list = self.ui.render(w, h);
+        // Pooled draw list (C4): `render_into` clears + refills
+        // `self.ui_draw_list` in place so steady frames allocate
+        // nothing (text payloads recycle inside the list). The command
+        // stream is identical to `self.ui.render(w, h)` — the
+        // fingerprint below feeds the same dirty-check either way.
+        self.ui.render_into(w, h, &mut self.ui_draw_list);
+        let draw_list = &mut self.ui_draw_list;
         // Runtime `MEGU EDITION` title branding: with the local JAR's
         // wordmark + patched edition strip GPU-resident, the banner
         // replaces the built-in wordmark text commands and the session's
@@ -2451,23 +2742,23 @@ impl GpuApp {
         }
         // Server-driven container screen draws above the HUD.
         if let Some(screen) = &self.container_screen {
-            screen.render(w as f32, h as f32, &mut draw_list);
+            screen.render(w as f32, h as f32, draw_list);
         }
         if self.advancements_open {
             Self::render_advancements_overlay(
                 self.live.as_ref(),
                 w as i32,
                 h as i32,
-                &mut draw_list,
+                draw_list,
             );
         }
         // Dirty-only upload: unchanged HUD frames skip even the quad
         // tessellation; changed frames upload only the small dynamic
         // vertex/index buffers — never a `w*h*4` CPU raster + texture
         // write (`renderer.ui_cpu_raster_uploads` stays at zero).
-        let fingerprint = fingerprint_draw_list(w, h, &draw_list);
+        let fingerprint = fingerprint_draw_list(w, h, draw_list);
         if self.ui_cache.should_upload(w, h, fingerprint) {
-            let mesh = tessellate_draw_list(w, h, &draw_list);
+            let mesh = tessellate_draw_list(w, h, draw_list);
             active.renderer.update_ui_mesh(w, h, &mesh);
         }
         let render_camera = self.camera_controller.view_camera(&self.camera);
@@ -2482,7 +2773,20 @@ impl GpuApp {
                     .create_view(&wgpu::TextureViewDescriptor::default());
                 match &self.live {
                     Some(live) => {
-                        let lights = live.dynamic_colored_lights();
+                        // One `frame_output` snapshot feeds both the
+                        // light UBO (`dynamic_colored_lights` did the
+                        // same call and discarded the rest) and the
+                        // particle staging below.
+                        let vfx_frame =
+                            live.vfx.frame_output(render_camera.forward_vector());
+                        Self::stage_live_particles(
+                            live,
+                            &vfx_frame,
+                            &render_camera,
+                            &mut self.particle_scratch,
+                            &mut self.live_particles_staged,
+                            &mut active.renderer,
+                        );
                         active.renderer.render_to_view_with_env(
                             &view,
                             w,
@@ -2491,7 +2795,7 @@ impl GpuApp {
                             &live.atmosphere_blender,
                             &live.chunk_fades,
                             live.world_time_ticks(),
-                            &lights,
+                            &vfx_frame.lights,
                         );
                     }
                     None => active.renderer.render_to_view(&view, w, h, &sky),
@@ -2831,13 +3135,19 @@ impl GpuApp {
                 self.show_diagnostics = self.input_router.debug_chords.show_debug_overlay;
                 match action {
                     DebugChordAction::ChatFeedback(message) => {
-                        if self.live.is_none() {
+                        if let Some(live) = &mut self.live {
+                            live.hud.chat_lines.push(message.clone());
+                            live.hud_revision += 1;
+                        } else {
                             self.ui.hud.chat_lines.push(message.clone());
                         }
                         self.debug_messages.push(message);
                     }
                     DebugChordAction::HelpLines(lines) => {
-                        if self.live.is_none() {
+                        if let Some(live) = &mut self.live {
+                            live.hud.chat_lines.extend(lines.iter().cloned());
+                            live.hud_revision += 1;
+                        } else {
                             self.ui.hud.chat_lines.extend(lines.iter().cloned());
                         }
                         self.debug_messages.extend(lines);
@@ -2856,9 +3166,15 @@ impl GpuApp {
                     let excess = self.debug_messages.len() - 100;
                     self.debug_messages.drain(..excess);
                 }
-                if self.live.is_none() && self.ui.hud.chat_lines.len() > 100 {
+                if self.ui.hud.chat_lines.len() > 100 {
                     let excess = self.ui.hud.chat_lines.len() - 100;
                     self.ui.hud.chat_lines.drain(..excess);
+                }
+                if let Some(live) = &mut self.live {
+                    if live.hud.chat_lines.len() > 100 {
+                        let excess = live.hud.chat_lines.len() - 100;
+                        live.hud.chat_lines.drain(..excess);
+                    }
                 }
             }
             WindowInputEvent::SelectHotbar(slot) => {
@@ -3382,6 +3698,445 @@ pub const MEGU_WEBSITE_URL: &str = "https://megu.megumin.tech/";
 pub const MEGU_SUPPORT_URL: &str = "https://megu.megumin.tech/#support";
 pub const MEGU_CONTRIBUTE_URL: &str = "https://github.com/nekomario28/megu-mc";
 pub const MEGU_REPORT_URL: &str = "https://megu.megumin.tech/";
+
+// ---------------------------------------------------------------------------
+// Live entity/BER + particle staging helpers
+// ---------------------------------------------------------------------------
+
+/// Stable dispatch slot per [`VanillaBerKind`] for the template cache.
+fn ber_kind_slot(kind: VanillaBerKind) -> usize {
+    match kind {
+        VanillaBerKind::Chest => 0,
+        VanillaBerKind::Sign => 1,
+        VanillaBerKind::Banner => 2,
+        VanillaBerKind::Beacon => 3,
+        VanillaBerKind::Bed => 4,
+        VanillaBerKind::Skull => 5,
+        VanillaBerKind::ItemFrame => 6,
+        VanillaBerKind::Campfire => 7,
+        VanillaBerKind::BrewingStand => 8,
+        VanillaBerKind::Lectern => 9,
+        VanillaBerKind::DecoratedPot => 10,
+        VanillaBerKind::ShulkerBox => 11,
+    }
+}
+
+/// Classify a tracked block entity for the BER pass: the NBT `id`
+/// string is authoritative (chunk payloads carry it), falling back to
+/// the protocol-767 `BuiltInRegistries.BLOCK_ENTITY_TYPE` wire id when
+/// the payload omits it (bare `block_entity_data` updates).
+fn classify_tracked_block_entity(be: &TrackedBlockEntity) -> Option<VanillaBerKind> {
+    if let Ok(NbtValue::Compound(map)) = WireReader::new(&be.nbt_bytes).read_nbt() {
+        if let Some(NbtValue::String(id)) = map.get("id") {
+            if let Some(kind) = classify_vanilla_ber(id) {
+                return Some(kind);
+            }
+        }
+    }
+    ber_kind_for_wire_id(be.kind)
+}
+
+/// Wire-id fallback — `BuiltInRegistries.BLOCK_ENTITY_TYPE` ids in
+/// 1.21.1 for the renderable families (the same numbering the server's
+/// `live_block_entity_wire_id` pins: sign=7, beacon=14, lectern=29,
+/// campfire=32, decorated_pot=40). Item frames are entities, not block
+/// entities, so that family only ever arrives via the NBT name path.
+fn ber_kind_for_wire_id(kind: i32) -> Option<VanillaBerKind> {
+    Some(match kind {
+        1..=3 => VanillaBerKind::Chest,
+        7 | 8 => VanillaBerKind::Sign,
+        19 => VanillaBerKind::Banner,
+        14 => VanillaBerKind::Beacon,
+        24 => VanillaBerKind::Bed,
+        15 => VanillaBerKind::Skull,
+        32 => VanillaBerKind::Campfire,
+        11 => VanillaBerKind::BrewingStand,
+        29 => VanillaBerKind::Lectern,
+        40 => VanillaBerKind::DecoratedPot,
+        23 => VanillaBerKind::ShulkerBox,
+        _ => return None,
+    })
+}
+
+/// Canonical idle state per BER family — the same defaults the software
+/// renderer's `default_vanilla_ber_state` uses, so block entities look
+/// identical across the two paths.
+fn default_vanilla_ber_state(kind: VanillaBerKind) -> VanillaBerState {
+    match kind {
+        VanillaBerKind::Chest => VanillaBerState::Chest {
+            lid_open: 0.0,
+            double: false,
+            facing: VanillaBerFacing::South,
+        },
+        VanillaBerKind::Sign => VanillaBerState::Sign {
+            wall: false,
+            hanging: false,
+            glowing: false,
+            facing_yaw: 0.0,
+        },
+        VanillaBerKind::Banner => VanillaBerState::Banner {
+            wall: false,
+            sway_rad: 0.0,
+            facing_yaw: 0.0,
+        },
+        VanillaBerKind::Beacon => VanillaBerState::Beacon {
+            beam_height: 8.0,
+            active: true,
+            rgb: [0.35, 0.6, 1.0],
+        },
+        VanillaBerKind::Bed => VanillaBerState::Bed {
+            is_head: false,
+            facing: VanillaBerFacing::South,
+        },
+        VanillaBerKind::Skull => VanillaBerState::Skull {
+            wall: false,
+            yaw_deg: 0.0,
+        },
+        VanillaBerKind::ItemFrame => VanillaBerState::ItemFrame {
+            facing: VanillaBerFacing::South,
+            glow: false,
+            rotation: 0,
+        },
+        VanillaBerKind::Campfire => VanillaBerState::Campfire {
+            lit: true,
+            item_count: 2,
+        },
+        VanillaBerKind::BrewingStand => VanillaBerState::BrewingStand {
+            bottle_mask: 0b111,
+        },
+        VanillaBerKind::Lectern => VanillaBerState::Lectern {
+            has_book: false,
+            facing: VanillaBerFacing::South,
+        },
+        VanillaBerKind::DecoratedPot => VanillaBerState::DecoratedPot {
+            facing: VanillaBerFacing::South,
+            wobble: 0.0,
+        },
+        VanillaBerKind::ShulkerBox => VanillaBerState::ShulkerBox {
+            open_progress: 0.0,
+            facing: VanillaBerFacing::South,
+        },
+    }
+}
+
+/// Deterministic albedo per BER family — the software renderer's
+/// `vanilla_ber_base_color` byte palette in `0..=1` tint form.
+fn vanilla_ber_base_color_f32(kind: VanillaBerKind) -> [f32; 3] {
+    let [r, g, b]: [u8; 3] = match kind {
+        VanillaBerKind::Chest => [162, 116, 63],
+        VanillaBerKind::Sign => [172, 134, 82],
+        VanillaBerKind::Banner => [196, 62, 62],
+        VanillaBerKind::Beacon => [214, 214, 214],
+        VanillaBerKind::Bed => [178, 58, 58],
+        VanillaBerKind::Skull => [216, 216, 208],
+        VanillaBerKind::ItemFrame => [146, 104, 58],
+        VanillaBerKind::Campfire => [104, 72, 48],
+        VanillaBerKind::BrewingStand => [88, 70, 108],
+        VanillaBerKind::Lectern => [138, 98, 58],
+        VanillaBerKind::DecoratedPot => [168, 138, 108],
+        VanillaBerKind::ShulkerBox => [138, 92, 158],
+    };
+    [
+        f32::from(r) / 255.0,
+        f32::from(g) / 255.0,
+        f32::from(b) / 255.0,
+    ]
+}
+
+/// Pose for one live entity: relative head yaw from the tracked packet
+/// state, hurt flash while `hurt_ticks` is hot, and the metadata-driven
+/// body poses vanilla exposes (`sneak`/`swim`/`elytra`).
+fn live_entity_pose(
+    live: &LiveSession,
+    entity_id: i32,
+    tracked: Option<&TrackedEntity>,
+) -> EntityPose {
+    let mut pose = EntityPose {
+        head_yaw_deg: tracked.map_or(0.0, |t| t.head_yaw_deg - t.yaw_deg),
+        head_pitch_deg: tracked.map_or(0.0, |t| t.pitch_deg),
+        hurt_flash: tracked.is_some_and(|t| t.hurt_ticks > 0),
+        ..EntityPose::default()
+    };
+    if let Some(meta) = live.entity_metadata.get(&entity_id) {
+        // Vanilla pose ids: 1 fall-flying, 3 swimming, 5 sneaking; the
+        // shared flags byte keeps the sneak/elytra bits too.
+        pose.swimming = meta.pose == Some(3);
+        pose.sneaking = meta.pose == Some(5) || meta.flags.is_some_and(|f| f & 0x02 != 0);
+        pose.elytra_flying =
+            meta.pose == Some(1) || meta.flags.is_some_and(|f| f & 0x80 != 0);
+    }
+    pose
+}
+
+/// Fingerprint of `(spec, pose)` so rig meshes rebuild only on real
+/// change — floats quantize to 1/64 to keep jitter from thrashing the
+/// cache.
+fn entity_pose_key(spec: EntityRigSpec, pose: &EntityPose) -> u64 {
+    let mut hash = 0xcbf2_9ce4_8422_2325u64;
+    let mut mix = |value: u64| {
+        hash ^= value;
+        hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+    };
+    mix(u64::from(spec.entity_type_id));
+    for v in [
+        pose.limb_swing,
+        pose.limb_swing_amount,
+        pose.head_yaw_deg,
+        pose.head_pitch_deg,
+        pose.swing_progress,
+        pose.age_ticks,
+    ] {
+        mix((f64::from(v) * 64.0).round() as i64 as u64);
+    }
+    mix(u64::from(pose.sneaking)
+        | u64::from(pose.swimming) << 1
+        | u64::from(pose.elytra_flying) << 2
+        | u64::from(pose.hurt_flash) << 3
+        | u64::from(pose.baby) << 4
+        | u64::from(pose.enable_skin_3d_layers) << 5);
+    hash
+}
+
+/// Per-entity tint: hurt flash overrides, otherwise the golden-ratio
+/// hue keyed on the rig's type id (the same convention the software
+/// renderer uses for its entity palette).
+fn live_entity_tint(spec: EntityRigSpec, tracked: Option<&TrackedEntity>) -> [f32; 3] {
+    if tracked.is_some_and(|t| t.hurt_ticks > 0) {
+        return [1.0, 0.45, 0.45];
+    }
+    let hue = (f64::from(spec.entity_type_id) * 0.618_033_988_749_895).fract() as f32;
+    hsv_to_rgb_f32(hue, 0.5, 0.85)
+}
+
+/// `hsv_to_rgb` for `0..=1` float inputs.
+fn hsv_to_rgb_f32(h: f32, s: f32, v: f32) -> [f32; 3] {
+    let i = (h * 6.0).floor() as i32;
+    let f = h * 6.0 - i as f32;
+    let p = v * (1.0 - s);
+    let q = v * (1.0 - f * s);
+    let t = v * (1.0 - (1.0 - f) * s);
+    let (r, g, b) = match i.rem_euclid(6) {
+        0 => (v, t, p),
+        1 => (q, v, p),
+        2 => (p, v, t),
+        3 => (p, q, v),
+        4 => (t, p, v),
+        _ => (v, p, q),
+    };
+    [r, g, b]
+}
+
+/// Push one quad — center + two half-edge vectors — in the corner order
+/// and unit-square UV basis [`VanillaParticleWorld::billboard_quads`]
+/// emits, so instanced packing (`pack_particle_billboard`) accepts it.
+/// `axis_u`/`axis_v` may be any parallelogram edges: camera billboards,
+/// flat ground rings, or velocity-stretched streaks.
+fn push_particle_quad(
+    quads: &mut Vec<VanillaParticleQuad>,
+    pos: [f32; 3],
+    axis_u: [f32; 3],
+    axis_v: [f32; 3],
+    color: [f32; 4],
+) {
+    if !pos.iter().all(|v| v.is_finite()) || !color.iter().all(|v| v.is_finite()) {
+        return;
+    }
+    let positions = [
+        [
+            pos[0] - axis_u[0] - axis_v[0],
+            pos[1] - axis_u[1] - axis_v[1],
+            pos[2] - axis_u[2] - axis_v[2],
+        ],
+        [
+            pos[0] + axis_u[0] - axis_v[0],
+            pos[1] + axis_u[1] - axis_v[1],
+            pos[2] + axis_u[2] - axis_v[2],
+        ],
+        [
+            pos[0] + axis_u[0] + axis_v[0],
+            pos[1] + axis_u[1] + axis_v[1],
+            pos[2] + axis_u[2] + axis_v[2],
+        ],
+        [
+            pos[0] - axis_u[0] + axis_v[0],
+            pos[1] - axis_u[1] + axis_v[1],
+            pos[2] - axis_u[2] + axis_v[2],
+        ],
+    ];
+    if positions.iter().flatten().all(|v| v.is_finite()) {
+        quads.push(VanillaParticleQuad {
+            kind: megu_client_mesh::ber_instancing::VanillaParticleKind::PotionSwirl,
+            positions,
+            uv: [[0.0, 1.0], [1.0, 1.0], [1.0, 0.0], [0.0, 0.0]],
+            color,
+        });
+    }
+}
+
+/// Camera-facing quad for a point particle of half-size `half`.
+fn push_billboard(
+    quads: &mut Vec<VanillaParticleQuad>,
+    pos: [f32; 3],
+    right: [f32; 3],
+    up: [f32; 3],
+    half: f32,
+    color: [f32; 4],
+) {
+    if !half.is_finite() || half <= 0.0 {
+        return;
+    }
+    push_particle_quad(
+        quads,
+        pos,
+        right.map(|r| r * half),
+        up.map(|u| u * half),
+        color,
+    );
+}
+
+/// Horizontal quad lying on the XZ plane (water ripples, dust rings,
+/// ground decals).
+fn push_flat_ring(
+    quads: &mut Vec<VanillaParticleQuad>,
+    pos: [f32; 3],
+    half: f32,
+    color: [f32; 4],
+) {
+    if !half.is_finite() || half <= 0.0 {
+        return;
+    }
+    push_particle_quad(quads, pos, [half, 0.0, 0.0], [0.0, 0.0, half], color);
+}
+
+/// Tactile sim particle → quad. `size` is the sim's radius; ring kinds
+/// lie flat on XZ (they expand on water/ground surfaces), everything
+/// else is a camera billboard.
+fn push_tactile_particle(
+    quads: &mut Vec<VanillaParticleQuad>,
+    particle: &TactileParticle,
+    right: [f32; 3],
+    up: [f32; 3],
+) {
+    let half = particle.size.max(0.005);
+    let flat = matches!(
+        particle.kind,
+        TactileParticleKind::WaterRippleRing { .. }
+            | TactileParticleKind::BubblePopRing { .. }
+            | TactileParticleKind::LandingDustRing { .. }
+            | TactileParticleKind::DripLandingRing { .. }
+            | TactileParticleKind::ShockRing { .. }
+    );
+    if flat {
+        push_flat_ring(quads, particle.pos, half, particle.rgba);
+    } else {
+        push_billboard(quads, particle.pos, right, up, half, particle.rgba);
+    }
+}
+
+fn push_nature_particle(
+    quads: &mut Vec<VanillaParticleQuad>,
+    particle: &NatureParticle,
+    right: [f32; 3],
+    up: [f32; 3],
+) {
+    // Gentle tail fade so expiring particles do not pop; the sim owns
+    // TTL expiry either way.
+    let life = (particle.age_sec / particle.ttl_sec.max(1e-3)).clamp(0.0, 1.0);
+    let fade = 1.0 - life * life;
+    let (mut color, half, flat) = match particle.kind {
+        NatureParticleKind::FallingLeaf { rgb, .. } => {
+            ([rgb[0], rgb[1], rgb[2], 0.85], 0.05, false)
+        }
+        NatureParticleKind::SakuraPetal { rgb, .. } => {
+            ([rgb[0], rgb[1], rgb[2], 0.85], 0.045, false)
+        }
+        NatureParticleKind::Firefly { glow_rgb, .. } => {
+            ([glow_rgb[0], glow_rgb[1], glow_rgb[2], 0.9], 0.03, false)
+        }
+        NatureParticleKind::RainRipple { radius, max_radius } => {
+            let alpha = 0.45 * (1.0 - radius / max_radius.max(1e-3)).clamp(0.0, 1.0);
+            ([0.70, 0.82, 0.95, alpha], radius.max(0.01), true)
+        }
+        NatureParticleKind::WaterfallMist { alpha } => {
+            ([0.9, 0.93, 1.0, alpha.clamp(0.0, 1.0) * 0.6], 0.15, false)
+        }
+        NatureParticleKind::SnowMote { .. } => ([0.92, 0.95, 1.0, 0.8], 0.03, false),
+    };
+    color[3] *= fade;
+    if flat {
+        push_flat_ring(quads, particle.pos, half, color);
+    } else {
+        push_billboard(quads, particle.pos, right, up, half, color);
+    }
+}
+
+/// VFX1 `ParticleDraw` → quad honoring the recorded orientation:
+/// camera billboards apply the in-plane `rotation`, velocity-stretched
+/// particles become streaks along their motion, and flat decals lie on
+/// XZ. `AxisAligned` has no fixed axis stored on the draw, so it shares
+/// the camera billboard path.
+fn push_vfx_particle(
+    quads: &mut Vec<VanillaParticleQuad>,
+    particle: &ParticleDraw,
+    right: [f32; 3],
+    up: [f32; 3],
+    forward: [f32; 3],
+) {
+    let half = particle.size.max(0.005);
+    match particle.orientation {
+        ParticleOrientation::FlatGroundDecal => {
+            push_flat_ring(quads, particle.pos, half, particle.rgba);
+        }
+        ParticleOrientation::VelocityStretched => {
+            let speed = (particle.velocity[0] * particle.velocity[0]
+                + particle.velocity[1] * particle.velocity[1]
+                + particle.velocity[2] * particle.velocity[2])
+            .sqrt();
+            if speed > 1e-4 {
+                // Streak axis along the velocity (longer when faster);
+                // the cross axis stays as camera-perpendicular as the
+                // motion allows.
+                let axis_u = particle
+                    .velocity
+                    .map(|v| v / speed * (half + speed * 0.5));
+                let cx = axis_u[1] * forward[2] - axis_u[2] * forward[1];
+                let cy = axis_u[2] * forward[0] - axis_u[0] * forward[2];
+                let cz = axis_u[0] * forward[1] - axis_u[1] * forward[0];
+                let len = (cx * cx + cy * cy + cz * cz).sqrt();
+                let axis_v = if len > 1e-6 {
+                    [cx / len * half, cy / len * half, cz / len * half]
+                } else {
+                    up.map(|u| u * half)
+                };
+                push_particle_quad(quads, particle.pos, axis_u, axis_v, particle.rgba);
+            } else {
+                push_billboard(quads, particle.pos, right, up, half, particle.rgba);
+            }
+        }
+        _ => {
+            // CameraBillboard + AxisAligned: rotate the billboard axes
+            // in-plane by `rotation`.
+            let (sin, cos) = particle.rotation.sin_cos();
+            let r2 = [
+                right[0] * cos + up[0] * sin,
+                right[1] * cos + up[1] * sin,
+                right[2] * cos + up[2] * sin,
+            ];
+            let u2 = [
+                up[0] * cos - right[0] * sin,
+                up[1] * cos - right[1] * sin,
+                up[2] * cos - right[2] * sin,
+            ];
+            push_particle_quad(
+                quads,
+                particle.pos,
+                r2.map(|v| v * half),
+                u2.map(|v| v * half),
+                particle.rgba,
+            );
+        }
+    }
+}
 
 /// Populate the official Megu links on a windowed [`UiState`] without
 /// altering [`UiState::default`] (which stays URL-empty for `client-ui` tests).
@@ -3927,5 +4682,174 @@ mod tests {
             matches!(rx.try_recv(), Ok(WorkerCommand::SetCarriedItem { slot: 5 })),
             "slot change must echo set_carried_item to the server"
         );
+    }
+
+    /// C3 regression: debug-chord chat lands in `live.hud` once, the
+    /// per-frame HUD sync mirrors it wholesale, and repeated "frames"
+    /// never duplicate or grow the line list past the 100-line cap.
+    #[test]
+    fn chat_lines_bounded_and_never_duplicated_across_frames() {
+        let mut app = GpuApp::new(GpuCliConfig::default());
+        app.attach_live(LiveSession::offline_with_null_audio());
+        for i in 0..140 {
+            app.dispatch_input(WindowInputEvent::DebugChord(
+                DebugChordAction::ChatFeedback(format!("line {i}")),
+            ));
+        }
+        // Simulate 300 rendered frames worth of HUD syncs.
+        for _ in 0..300 {
+            app.live
+                .as_mut()
+                .unwrap()
+                .sync_hud_to(&mut app.ui.hud);
+        }
+        assert!(
+            app.ui.hud.chat_lines.len() <= 100,
+            "chat_lines must stay bounded, got {}",
+            app.ui.hud.chat_lines.len()
+        );
+        assert_eq!(
+            app.ui
+                .hud
+                .chat_lines
+                .iter()
+                .filter(|l| l.as_str() == "line 139")
+                .count(),
+            1,
+            "each chat line must appear exactly once no matter how many frames render"
+        );
+        assert!(
+            app.ui.hud.chat_lines.iter().all(|l| l.starts_with("line ")),
+            "no stale/duplicated lines may ride along: {:?}",
+            app.ui.hud.chat_lines
+        );
+    }
+
+    /// C3: the offline (no live session) path keeps the same bound.
+    #[test]
+    fn offline_chat_lines_stay_bounded() {
+        let mut app = GpuApp::new(GpuCliConfig::default());
+        for i in 0..140 {
+            app.dispatch_input(WindowInputEvent::DebugChord(
+                DebugChordAction::ChatFeedback(format!("line {i}")),
+            ));
+        }
+        assert!(app.ui.hud.chat_lines.len() <= 100);
+        assert_eq!(app.debug_messages.len(), 100);
+        assert_eq!(app.ui.hud.chat_lines.first().map(String::as_str), Some("line 40"));
+    }
+
+    /// C3: attaching a session replays the pre-connect debug log into
+    /// `live.hud` exactly once — the HUD mirror then owns the lines.
+    #[test]
+    fn attach_live_replays_debug_log_once() {
+        let mut app = GpuApp::new(GpuCliConfig::default());
+        app.dispatch_input(WindowInputEvent::DebugChord(
+            DebugChordAction::ChatFeedback("pre-connect".to_owned()),
+        ));
+        app.attach_live(LiveSession::offline_with_null_audio());
+        let live = app.live.as_ref().unwrap();
+        assert_eq!(
+            live.hud
+                .chat_lines
+                .iter()
+                .filter(|l| l.as_str() == "pre-connect")
+                .count(),
+            1
+        );
+        assert!(app.live_strategy_pending());
+    }
+
+    /// C5: wire-id fallback maps the 1.21.1
+    /// `BuiltInRegistries.BLOCK_ENTITY_TYPE` ids for the renderable
+    /// families and rejects the rest (spawner=9 has no BER mesh).
+    #[test]
+    fn block_entity_wire_ids_map_to_ber_families() {
+        let be = |kind: i32| TrackedBlockEntity {
+            kind,
+            nbt_bytes: Vec::new(),
+        };
+        assert_eq!(
+            classify_tracked_block_entity(&be(1)),
+            Some(VanillaBerKind::Chest)
+        );
+        assert_eq!(
+            classify_tracked_block_entity(&be(7)),
+            Some(VanillaBerKind::Sign)
+        );
+        assert_eq!(
+            classify_tracked_block_entity(&be(14)),
+            Some(VanillaBerKind::Beacon)
+        );
+        assert_eq!(
+            classify_tracked_block_entity(&be(32)),
+            Some(VanillaBerKind::Campfire)
+        );
+        assert_eq!(
+            classify_tracked_block_entity(&be(40)),
+            Some(VanillaBerKind::DecoratedPot)
+        );
+        assert_eq!(classify_tracked_block_entity(&be(9)), None);
+        assert_eq!(classify_tracked_block_entity(&be(0)), None);
+    }
+
+    /// C5: the pose fingerprint changes on real pose deltas but ignores
+    /// sub-quantization jitter, so rig meshes are not rebuilt per frame.
+    #[test]
+    fn entity_pose_key_detects_only_real_pose_changes() {
+        let spec = megu_client_mesh::entity_rig::classify_entity_rig(114) // zombie
+            .expect("zombie rig spec");
+        let base = EntityPose::default();
+        let key = entity_pose_key(spec, &base);
+        let jitter = EntityPose {
+            head_yaw_deg: 0.005, // < 1/64 quantization step
+            ..EntityPose::default()
+        };
+        assert_eq!(entity_pose_key(spec, &jitter), key);
+        let turned = EntityPose {
+            head_yaw_deg: 45.0,
+            ..EntityPose::default()
+        };
+        assert_ne!(entity_pose_key(spec, &turned), key);
+        let sneaking = EntityPose {
+            sneaking: true,
+            ..EntityPose::default()
+        };
+        assert_ne!(entity_pose_key(spec, &sneaking), key);
+    }
+
+    /// C5: quads pushed for live particles are axis-consistent
+    /// parallelograms — the shape `pack_particle_billboard` requires for
+    /// the instanced path — and degenerate input is skipped.
+    #[test]
+    fn particle_quad_push_builds_valid_parallelograms() {
+        let mut quads = Vec::new();
+        let right = [1.0, 0.0, 0.0];
+        let up = [0.0, 1.0, 0.0];
+        push_billboard(&mut quads, [1.0, 2.0, 3.0], right, up, 0.5, [1.0; 4]);
+        push_flat_ring(&mut quads, [0.0, 0.0, 0.0], 0.25, [0.5, 0.5, 0.5, 1.0]);
+        assert_eq!(quads.len(), 2);
+        let quad = &quads[0];
+        let u = [
+            quad.positions[1][0] - quad.positions[0][0],
+            quad.positions[1][1] - quad.positions[0][1],
+            quad.positions[1][2] - quad.positions[0][2],
+        ];
+        let v = [
+            quad.positions[3][0] - quad.positions[0][0],
+            quad.positions[3][1] - quad.positions[0][1],
+            quad.positions[3][2] - quad.positions[0][2],
+        ];
+        for axis in 0..3 {
+            let expected = quad.positions[0][axis] + u[axis] + v[axis];
+            assert!(
+                (quad.positions[2][axis] - expected).abs() < 1e-5,
+                "corner 2 must close the parallelogram on axis {axis}"
+            );
+        }
+        // Degenerate/NaN input is dropped, not staged.
+        push_billboard(&mut quads, [f32::NAN; 3], right, up, 0.5, [1.0; 4]);
+        push_billboard(&mut quads, [0.0; 3], right, up, 0.0, [1.0; 4]);
+        assert_eq!(quads.len(), 2);
     }
 }

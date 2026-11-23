@@ -530,6 +530,12 @@ impl Camera {
         normalize(cross(self.forward_vector(), [0.0, 1.0, 0.0]))
     }
 
+    /// Unit up direction — the view matrix's `u` row (cross of right
+    /// with forward).
+    pub fn up_vector(&self) -> [f32; 3] {
+        cross(self.right_vector(), self.forward_vector())
+    }
+
     /// World-to-view matrix (column-major for WGSL upload).
     pub fn view_matrix(&self) -> Mat4 {
         let f = self.forward_vector();

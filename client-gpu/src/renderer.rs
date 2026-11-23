@@ -235,13 +235,38 @@ pub fn request_gpu_device(
         compatible_surface,
         apply_limit_buckets: true,
     };
-    let adapter = pollster::block_on(instance.request_adapter(&options)).map_err(|e| {
-        RendererError::NoAdapter(format!(
-            "request_adapter for backends {:?}: {e}",
-            wgpu_backends_for(pref)
-        ))
-    })?;
+    // Legacy hosts (Core 2 Duo-era iGPUs, Windows boxes with no DX12 or
+    // Vulkan driver) can fail hardware enumeration outright: retry once
+    // with the fallback adapter enabled — Microsoft WARP on Windows, the
+    // platform's software rasterizer elsewhere — so the client still
+    // boots and renders, just slowly.
+    let adapter = match pollster::block_on(instance.request_adapter(&options)) {
+        Ok(adapter) => adapter,
+        Err(hardware_err) => {
+            let fallback_options = wgpu::RequestAdapterOptions {
+                force_fallback_adapter: true,
+                ..options
+            };
+            match pollster::block_on(instance.request_adapter(&fallback_options)) {
+                Ok(adapter) => adapter,
+                Err(fallback_err) => {
+                    return Err(RendererError::NoAdapter(no_adapter_message(
+                        wgpu_backends_for(pref),
+                        &hardware_err,
+                        &fallback_err,
+                    )));
+                }
+            }
+        }
+    };
     let report = adapter_report(&adapter, pref);
+    if adapter_is_software_fallback(report.device_type) {
+        eprintln!(
+            "{}: running on a software fallback adapter ({}); \
+             expect reduced frame rates",
+            crate::CLIENT_GPU_NAME, report.name
+        );
+    }
     let (device, queue) = pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor {
         label: Some("megu-client-gpu"),
         required_features: wgpu::Features::empty(),
@@ -260,6 +285,29 @@ pub fn request_gpu_device(
         queue,
         report,
     })
+}
+
+/// Error text when neither the hardware pass nor the software-fallback
+/// retry produced an adapter — kept as a named function so the fallback
+/// policy's failure surface is unit-testable without a GPU.
+fn no_adapter_message(
+    backends: wgpu::Backends,
+    hardware_err: &dyn std::fmt::Display,
+    fallback_err: &dyn std::fmt::Display,
+) -> String {
+    format!(
+        "request_adapter for backends {backends:?} found no hardware adapter \
+         ({hardware_err}) and the software fallback retry also failed \
+         ({fallback_err}); install a Vulkan/DX12/Metal-capable GPU driver \
+         or update the OS to enable its software rasterizer"
+    )
+}
+
+/// `true` when `device_type` is a CPU rasterizer (Microsoft WARP via
+/// `force_fallback_adapter`, or a lavapipe/llvmpipe device the platform
+/// offered anyway) — the session warns once at adapter negotiation.
+fn adapter_is_software_fallback(device_type: wgpu::DeviceType) -> bool {
+    device_type == wgpu::DeviceType::Cpu
 }
 
 /// Clamp a `wgpu::Limits` request to the ceilings the renderer actually
@@ -11274,4 +11322,40 @@ fn index_buffer(
         queue.write_buffer(&buffer, 0, bytemuck::cast_slice(indices));
     }
     buffer
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The fallback policy's failure surface: when hardware enumeration
+    /// AND the software-fallback retry both fail, `NoAdapter` names both
+    /// errors and tells the user what would fix it.
+    #[test]
+    fn no_adapter_message_reports_both_attempts_and_a_fix() {
+        let msg = no_adapter_message(
+            wgpu::Backends::VULKAN | wgpu::Backends::DX12,
+            &"no hardware adapter".to_string(),
+            &"no software rasterizer".to_string(),
+        );
+        assert!(msg.contains("no hardware adapter"), "{msg}");
+        assert!(msg.contains("no software rasterizer"), "{msg}");
+        assert!(msg.contains("Vulkan/DX12/Metal"), "{msg}");
+        assert!(msg.contains("software rasterizer"), "{msg}");
+    }
+
+    /// Only CPU-class adapters trigger the software-fallback warning;
+    /// real hardware classes stay silent.
+    #[test]
+    fn software_fallback_detection_is_cpu_only() {
+        assert!(adapter_is_software_fallback(wgpu::DeviceType::Cpu));
+        for device_type in [
+            wgpu::DeviceType::DiscreteGpu,
+            wgpu::DeviceType::IntegratedGpu,
+            wgpu::DeviceType::VirtualGpu,
+            wgpu::DeviceType::Other,
+        ] {
+            assert!(!adapter_is_software_fallback(device_type), "{device_type:?}");
+        }
+    }
 }

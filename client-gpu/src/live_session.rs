@@ -1813,15 +1813,21 @@ impl LiveSession {
         enclosed_wall_ratio: f32,
         is_raining: bool,
     ) {
-        if let Some(pose) = self.pose {
-            self.tactile_sim.wetness_mut().set_position([
-                pose.feet[0] as f32,
-                pose.feet[1] as f32,
-                pose.feet[2] as f32,
-            ]);
+        // Wetness tracking only feeds drip particles: skip it (and the
+        // particle-aging it performs) once the tactile preset is off and
+        // no particles remain to drain — camera/audio evaluation below
+        // is independent and keeps running.
+        if self.tactile_sim.config().preset.is_active() || !self.tactile_sim.is_empty() {
+            if let Some(pose) = self.pose {
+                self.tactile_sim.wetness_mut().set_position([
+                    pose.feet[0] as f32,
+                    pose.feet[1] as f32,
+                    pose.feet[2] as f32,
+                ]);
+            }
+            self.tactile_sim
+                .step_with_wetness(dt_sec, is_submerged || is_raining);
         }
-        self.tactile_sim
-            .step_with_wetness(dt_sec, is_submerged || is_raining);
 
         let (strafe_vel, vertical_vel) = self.tactile_camera_velocities(dt_sec);
         let landing = self.tactile_landing_impulse;
@@ -2005,10 +2011,25 @@ impl LiveSession {
             let now = Instant::now();
             let elapsed_ticks = (now.duration_since(self.last_vfx_tick).as_millis() / 50).min(4);
             self.nature_env.origin = camera_position;
+            // Idle-sim gating: with the ambience/tactile presets off and no
+            // live particles left to age out, the 20 Hz sim steps do nothing
+            // observable — skip them so idle sessions burn zero CPU. While a
+            // preset is on, or particles are still draining, the step runs
+            // every tick exactly as before.
+            let ambience_active = (self.vanilla_plus_cfg.nature.enabled
+                && self.vanilla_plus_cfg.nature.nature_ambience)
+                || !self.nature_ambience.particles().is_empty();
+            let tactile_active = self.tactile_sim.config().preset.is_active()
+                || !self.tactile_sim.is_empty();
             for _ in 0..elapsed_ticks {
                 self.vfx.tick();
-                self.step_nature_ambience(0.05);
-                self.tactile_sim.step(0.05);
+                if ambience_active {
+                    self.step_nature_ambience(0.05);
+                }
+                if tactile_active {
+                    self.tactile_sim.step(0.05);
+                }
+                self.world.tick_entities();
             }
             self.last_vfx_tick = now;
             let animation_dt = now.duration_since(self.last_animation_tick).as_secs_f32();
@@ -2439,6 +2460,33 @@ impl LiveSession {
     /// The classified rig for a tracked entity (set on `add_entity`).
     pub fn entity_rig(&self, entity_id: i32) -> Option<&EntityRigSpec> {
         self.entity_rigs.get(&entity_id)
+    }
+
+    /// Iterate renderable live entities — every tracked entity that has a
+    /// rig classification — as `(entity_id, rig spec, world feet position,
+    /// tracked packet state)`. Positions prefer the `entity_positions`
+    /// mirror the audio listener uses, falling back to the entity
+    /// tracker's own accumulated `pos`. `tracked` is `None` only for a
+    /// rigged entity the tracker has not mirrored yet (or already
+    /// dropped); callers render it with the default pose.
+    pub fn entity_render_entries(
+        &self,
+    ) -> impl Iterator<
+        Item = (
+            i32,
+            EntityRigSpec,
+            [f64; 3],
+            Option<&megu_client::world::TrackedEntity>,
+        ),
+    > + '_ {
+        self.entity_rigs.iter().filter_map(|(eid, spec)| {
+            let pos = self
+                .entity_positions
+                .get(eid)
+                .copied()
+                .or_else(|| self.world.entities.get(eid).map(|tracked| tracked.pos))?;
+            Some((*eid, *spec, pos, self.world.entities.get(eid)))
+        })
     }
 
     /// Local-movement prediction against live world collision: mirrors
