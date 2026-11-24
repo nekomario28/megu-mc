@@ -42,6 +42,7 @@
 //! # assert_eq!(rgba.len(), 1280 * 720 * 4);
 //! ```
 
+pub mod conflict_widget;
 pub mod container_screen;
 pub mod create_goggles_hud;
 pub mod death_screen;
@@ -53,6 +54,7 @@ pub mod layout;
 pub mod magic_hud;
 pub mod mod_i18n;
 pub mod mod_menu;
+pub mod mod_sync_ui;
 pub mod qol_helpers;
 pub mod recipe_browser;
 pub mod shader_screen;
