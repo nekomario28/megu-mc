@@ -2,6 +2,7 @@
 
 #![deny(unsafe_code, unsafe_op_in_unsafe_fn)]
 
+pub mod auto_optimizer;
 pub mod combat_motion;
 pub mod contraption;
 pub mod entity_spatial;
@@ -16,6 +17,13 @@ pub mod region_scheduler;
 pub mod sleeping_transport;
 pub mod sync_bridge;
 
+pub use auto_optimizer::{
+    fingerprint_128, fingerprint_item_slots, pack_machine_key, AdaptivePollBackoff,
+    AutoBulkSectionBatcher, AutoDeltaCoalescer, AutoRecipeMemoizer, BackoffStats,
+    BulkBatchStats, BulkCellWrite, BulkSectionBatch, CoalesceStats, DistanceTier,
+    EmitDecision, MemoStats, SectionKey, BACKOFF_LADDER, DEFAULT_MEMO_CAPACITY,
+    MAX_COALESCE_SOURCES, MAX_TRACKED_MACHINES, SECTION_VOLUME, UNCHANGED_TICKS_PER_STEP,
+};
 pub use entity_spatial::{
     evaluate_mob_targets_uncached, merge_item_stacks, merge_xp_orbs, solve_collisions_spatial,
     tick_confined_ai, AiTickInput, AiTickResult, ChunkSensorBroadPhase, CollisionResult,
