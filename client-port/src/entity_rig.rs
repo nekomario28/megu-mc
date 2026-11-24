@@ -1278,6 +1278,493 @@ pub fn build_entity_from_cem_boxes(
     }
 }
 
+// ---------------------------------------------------------------------------
+// Colossal articulated rigs (dragon / sea serpent)
+// ---------------------------------------------------------------------------
+
+/// Standalone colossal rig families. These are intentionally separate from
+/// [`EntityRigArchetype`]: they are built on demand by mod/content callers via
+/// [`build_colossal_rig_mesh`] and never participate in the 130-entity
+/// protocol classification, so no existing match arm or golden fingerprint
+/// is affected.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum ColossalRigKind {
+    /// Articulated winged dragon / wyvern: horned head, four legs, spiked
+    /// tail, and two multi-segment flapping wings.
+    WingedDragon,
+    /// Undulating sea serpent / hydra: fanged head, dorsal crest, forked tail.
+    SeaSerpent,
+}
+
+impl ColossalRigKind {
+    /// Suggested `(primary, accent)` sRGB palettes per family.
+    pub const fn palette(self) -> ([u8; 3], [u8; 3]) {
+        match self {
+            Self::WingedDragon => ([178, 42, 46], [240, 178, 60]),
+            Self::SeaSerpent => ([28, 92, 112], [90, 200, 190]),
+        }
+    }
+}
+
+/// Encode an sRGB triple as an [`ExtrudedQuad::tint_index`] albedo. The high
+/// flag bit keeps dark colors above the `0xFF` material-tag threshold; the
+/// renderer masks each channel with `0xFF`, so the flag is ignored on decode.
+fn colossal_tint(rgb: [u8; 3]) -> i32 {
+    0x0100_0000 | (i32::from(rgb[0]) << 16) | (i32::from(rgb[1]) << 8) | i32::from(rgb[2])
+}
+
+/// Outward-CCW face table shared by [`emit_colossal_box`]. Identical winding
+/// and vertex ordering to `emit_box`, so rotated boxes stay outward-facing.
+const COLOSSAL_FACES: [[usize; 4]; 6] = [
+    [0, 4, 6, 2],
+    [5, 1, 3, 7],
+    [4, 0, 1, 5],
+    [2, 6, 7, 3],
+    [1, 0, 2, 3],
+    [4, 5, 7, 6],
+];
+
+/// Emit one articulated box for a colossal rig. `pivot`, `center`, and `size`
+/// are in unit (unscaled) entity-local space; `rotation` is radians applied
+/// about `pivot` via the shared X-then-Y-then-Z [`rotate`] convention.
+/// Everything is multiplied by `stage_scale` so Stage 1 hatchlings through
+/// Stage 5 adults share one template.
+#[allow(clippy::too_many_arguments)]
+fn emit_colossal_box(
+    mesh: &mut ExtrudedMesh,
+    stage_scale: f32,
+    pivot: [f32; 3],
+    center: [f32; 3],
+    size: [f32; 3],
+    rotation: [f32; 3],
+    tint_index: i32,
+) {
+    if mesh.quads.len() + 6 > MAX_UPGRADE_QUADS {
+        return;
+    }
+    let half = size.map(|v| v * 0.5 * stage_scale);
+    if half.iter().any(|v| !v.is_finite() || *v <= 0.0) {
+        return;
+    }
+    let center = center.map(|v| v * stage_scale);
+    let pivot = pivot.map(|v| v * stage_scale);
+    let lo = [
+        center[0] - half[0],
+        center[1] - half[1],
+        center[2] - half[2],
+    ];
+    let hi = [
+        center[0] + half[0],
+        center[1] + half[1],
+        center[2] + half[2],
+    ];
+    let vertices = [
+        [lo[0], lo[1], lo[2]],
+        [hi[0], lo[1], lo[2]],
+        [lo[0], hi[1], lo[2]],
+        [hi[0], hi[1], lo[2]],
+        [lo[0], lo[1], hi[2]],
+        [hi[0], lo[1], hi[2]],
+        [lo[0], hi[1], hi[2]],
+        [hi[0], hi[1], hi[2]],
+    ];
+    let uv = [[0.0, 1.0], [1.0, 1.0], [1.0, 0.0], [0.0, 0.0]];
+    for indices in COLOSSAL_FACES {
+        let mut positions = [[0.0; 3]; 4];
+        for (dest, index) in positions.iter_mut().zip(indices) {
+            let original = vertices[index];
+            let relative = [
+                original[0] - pivot[0],
+                original[1] - pivot[1],
+                original[2] - pivot[2],
+            ];
+            let animated = rotate(relative, rotation);
+            *dest = [
+                pivot[0] + animated[0],
+                pivot[1] + animated[1],
+                pivot[2] + animated[2],
+            ];
+        }
+        if let Some(normal) = outward_normal(&positions) {
+            if positions.iter().flatten().all(|v| v.is_finite()) {
+                mesh.quads.push(ExtrudedQuad {
+                    positions,
+                    normal,
+                    uv,
+                    tint_index,
+                });
+            }
+        }
+    }
+}
+
+/// Winged dragon / wyvern template. Unit space: front is -Z, feet at y = 0,
+/// origin centered horizontally. `stage_scale` is applied inside
+/// [`emit_colossal_box`].
+fn build_winged_dragon(
+    mesh: &mut ExtrudedMesh,
+    s: f32,
+    pose: EntityPose,
+    primary: i32,
+    accent: i32,
+) {
+    let stride = pose.limb_swing.cos() * pose.limb_swing_amount * 0.55;
+    let head_pitch = pose.head_pitch_deg.to_radians();
+    let head_yaw = pose.head_yaw_deg.to_radians();
+
+    // Elongated torso plus a lighter belly plate.
+    emit_colossal_box(
+        mesh,
+        s,
+        [0.0, 1.05, 0.4],
+        [0.0, 1.05, 0.4],
+        [1.2, 1.0, 3.4],
+        [0.0; 3],
+        primary,
+    );
+    emit_colossal_box(
+        mesh,
+        s,
+        [0.0, 0.6, 0.4],
+        [0.0, 0.6, 0.4],
+        [0.85, 0.14, 3.2],
+        [0.0; 3],
+        accent,
+    );
+
+    // Three-segment neck rising toward the horned head.
+    for (pivot, center, size, pitch) in [
+        ([0.0, 1.5, -1.2], [0.0, 1.72, -1.5], [0.6, 0.7, 0.8], -0.55),
+        ([0.0, 1.9, -1.75], [0.0, 2.1, -2.0], [0.55, 0.62, 0.7], -0.6),
+        ([0.0, 2.35, -2.2], [0.0, 2.5, -2.45], [0.5, 0.55, 0.6], -0.65),
+    ] {
+        emit_colossal_box(mesh, s, pivot, center, size, [pitch, 0.0, 0.0], primary);
+    }
+
+    // Head, snout, and jaw share the head yaw/pitch articulation.
+    let head_pivot = [0.0, 2.62, -2.6];
+    let head_rot = [head_pitch - 0.1, head_yaw, 0.0];
+    emit_colossal_box(
+        mesh,
+        s,
+        head_pivot,
+        [0.0, 2.78, -2.75],
+        [0.58, 0.52, 0.85],
+        head_rot,
+        primary,
+    );
+    emit_colossal_box(
+        mesh,
+        s,
+        head_pivot,
+        [0.0, 2.7, -3.25],
+        [0.4, 0.34, 0.55],
+        head_rot,
+        primary,
+    );
+    emit_colossal_box(
+        mesh,
+        s,
+        [0.0, 2.58, -2.7],
+        [0.0, 2.52, -3.0],
+        [0.44, 0.18, 0.7],
+        [head_pitch + 0.4, head_yaw, 0.0],
+        accent,
+    );
+    for side in [-1.0_f32, 1.0] {
+        emit_colossal_box(
+            mesh,
+            s,
+            [side * 0.2, 3.0, -2.5],
+            [side * 0.2, 3.0, -2.5],
+            [0.12, 0.45, 0.14],
+            [0.7, 0.0, -side * 0.25],
+            accent,
+        );
+    }
+
+    // Four sturdy legs; diagonal pairs swing in opposition.
+    for (side, z, phase) in [
+        (-1.0_f32, -1.0_f32, 0.0_f32),
+        (1.0, -1.0, PI),
+        (-1.0, 1.5, PI),
+        (1.0, 1.5, 0.0),
+    ] {
+        let hip = [side * 0.55, 1.0, z];
+        let swing = (pose.limb_swing + phase).cos() * stride;
+        for (center, size) in [
+            ([side * 0.55, 0.72, z], [0.45, 0.62, 0.55]),
+            ([side * 0.6, 0.32, z + 0.05], [0.36, 0.5, 0.45]),
+            ([side * 0.6, 0.09, z - 0.08], [0.4, 0.18, 0.6]),
+        ] {
+            emit_colossal_box(
+                mesh,
+                s,
+                hip,
+                center,
+                size,
+                [swing, 0.0, 0.0],
+                primary,
+            );
+        }
+    }
+
+    // Four-segment tapering tail with per-segment sinusoidal sway.
+    for i in 0..4 {
+        let f = i as f32;
+        let radius = 0.4 * (1.0 - f * 0.16);
+        let y = 1.15 + f * 0.18 - f * f * 0.02;
+        let z = 2.15 + f * 0.85;
+        let pivot = if i == 0 {
+            [0.0, 1.15, 2.15]
+        } else {
+            [0.0, 1.15 + (f - 1.0) * 0.18 - (f - 1.0) * (f - 1.0) * 0.02, z - 0.85]
+        };
+        let sway = (pose.limb_swing - f * 0.55).sin() * 0.14 * (f + 1.0) * 0.45;
+        emit_colossal_box(
+            mesh,
+            s,
+            pivot,
+            [0.0, y, z + 0.45],
+            [radius * 2.0, radius * 2.0, 0.95],
+            [0.06 * f, sway, 0.0],
+            primary,
+        );
+        emit_colossal_box(
+            mesh,
+            s,
+            [0.0, y, z + 0.35],
+            [0.0, y + radius + 0.1, z + 0.3],
+            [0.12, 0.28, 0.22],
+            [-0.2, 0.0, 0.0],
+            accent,
+        );
+    }
+
+    // Dorsal spikes along the torso.
+    for z in [-1.0, -0.2, 0.6, 1.4] {
+        emit_colossal_box(
+            mesh,
+            s,
+            [0.0, 1.58, z],
+            [0.0, 1.58, z],
+            [0.16, 0.4, 0.2],
+            [-0.15, 0.0, 0.0],
+            accent,
+        );
+    }
+
+    // Two multi-segment wings: inner arm + swept membrane + wingtip.
+    let flap = pose.limb_swing.sin() * pose.limb_swing_amount * 0.9
+        + pose.limb_swing.cos() * pose.limb_swing_amount * 0.15;
+    let fold = if pose.swimming || pose.elytra_flying {
+        1.1
+    } else {
+        0.0
+    };
+    for side in [-1.0_f32, 1.0] {
+        let shoulder = [side * 0.62, 1.5, -0.7];
+        let inner_rot = [0.0, -side * 0.18, side * (flap * 0.45 + fold * 0.3)];
+        emit_colossal_box(
+            mesh,
+            s,
+            shoulder,
+            [side * 1.45, 1.52, -0.55],
+            [1.7, 0.2, 0.5],
+            inner_rot,
+            primary,
+        );
+        emit_colossal_box(
+            mesh,
+            s,
+            [side * 1.45, 1.64, -0.6],
+            [side * 1.45, 1.64, -0.6],
+            [1.6, 0.06, 0.12],
+            inner_rot,
+            accent,
+        );
+        let elbow = [side * 2.15, 1.5, -0.85];
+        let mid_rot = [0.0, -side * 0.42, side * (flap * 0.9 + fold * 0.7)];
+        emit_colossal_box(
+            mesh,
+            s,
+            elbow,
+            [side * 3.3, 1.42, -0.35],
+            [2.4, 0.09, 1.5],
+            mid_rot,
+            accent,
+        );
+        let tip_pivot = [side * 4.3, 1.4, -0.15];
+        let tip_rot = [0.0, -side * 0.6, side * (flap * 1.15 + fold * 0.9)];
+        emit_colossal_box(
+            mesh,
+            s,
+            tip_pivot,
+            [side * 4.9, 1.38, 0.45],
+            [1.5, 0.08, 1.0],
+            tip_rot,
+            accent,
+        );
+        emit_colossal_box(
+            mesh,
+            s,
+            [side * 5.4, 1.36, 0.75],
+            [side * 5.4, 1.36, 0.75],
+            [0.5, 0.07, 0.35],
+            tip_rot,
+            accent,
+        );
+    }
+}
+
+/// Sea serpent / hydra template. Unit space: head toward -Z, body floats
+/// around y = 0.8 so the silhouette stays near the origin, `stage_scale`
+/// applied inside [`emit_colossal_box`].
+fn build_sea_serpent(
+    mesh: &mut ExtrudedMesh,
+    s: f32,
+    pose: EntityPose,
+    primary: i32,
+    accent: i32,
+) {
+    let head_pitch = pose.head_pitch_deg.to_radians();
+    let head_yaw = pose.head_yaw_deg.to_radians();
+    let head_rot = [head_pitch - 0.05, head_yaw, 0.0];
+
+    // Fanged aquatic head with crest and jaw.
+    let head_pivot = [0.0, 0.85, -2.7];
+    emit_colossal_box(
+        mesh,
+        s,
+        head_pivot,
+        [0.0, 0.85, -2.95],
+        [0.75, 0.65, 1.0],
+        head_rot,
+        primary,
+    );
+    emit_colossal_box(
+        mesh,
+        s,
+        head_pivot,
+        [0.0, 0.78, -3.55],
+        [0.5, 0.4, 0.6],
+        head_rot,
+        primary,
+    );
+    emit_colossal_box(
+        mesh,
+        s,
+        [0.0, 0.62, -2.85],
+        [0.0, 0.55, -3.3],
+        [0.55, 0.16, 0.7],
+        [head_pitch + 0.3, head_yaw, 0.0],
+        accent,
+    );
+    for side in [-1.0_f32, 1.0] {
+        emit_colossal_box(
+            mesh,
+            s,
+            [side * 0.14, 0.52, -3.45],
+            [side * 0.14, 0.52, -3.45],
+            [0.07, 0.22, 0.07],
+            head_rot,
+            accent,
+        );
+        emit_colossal_box(
+            mesh,
+            s,
+            [side * 0.42, 0.72, -2.55],
+            [side * 0.62, 0.68, -2.5],
+            [0.5, 0.06, 0.35],
+            [head_pitch, head_yaw, side * 0.5],
+            accent,
+        );
+    }
+    emit_colossal_box(
+        mesh,
+        s,
+        [0.0, 1.22, -2.9],
+        [0.0, 1.22, -2.9],
+        [0.12, 0.4, 0.7],
+        [0.0, head_yaw, 0.0],
+        accent,
+    );
+
+    // Eight undulating body segments: lateral/vertical sine wave whose
+    // amplitude and phase lag grow toward the tail.
+    for i in 0..8 {
+        let f = i as f32;
+        let phase = pose.limb_swing - f * 0.65;
+        let lat = phase.sin() * (0.12 + f * 0.13);
+        let vert = phase.cos() * (0.06 + f * 0.05);
+        let radius = 0.55 - f * 0.045;
+        let z = -1.9 + f * 0.8;
+        let center = [lat, 0.8 + vert, z];
+        let sway = phase.cos() * 0.15;
+        emit_colossal_box(
+            mesh,
+            s,
+            center,
+            center,
+            [radius * 2.0, radius * 1.8, 0.85],
+            [0.0, sway, 0.0],
+            primary,
+        );
+        // Dorsal fin crest along the mid-body segments.
+        if (1..=6).contains(&i) {
+            emit_colossal_box(
+                mesh,
+                s,
+                center,
+                [lat, 0.8 + vert + radius * 0.9 + 0.12, z],
+                [0.1, 0.3 + f * 0.04, 0.4],
+                [0.0, sway, 0.0],
+                accent,
+            );
+        }
+    }
+
+    // Forked tail fin: two accent blades angled into a V at the tip.
+    let tail_z = -1.9 + 7.0 * 0.8 + 0.5;
+    let tail_y = 0.8 + (pose.limb_swing - 7.0 * 0.65).cos() * (0.06 + 7.0 * 0.05);
+    for (dy, pitch) in [(0.45, -0.5), (-0.4, 0.5)] {
+        emit_colossal_box(
+            mesh,
+            s,
+            [0.0, tail_y, tail_z - 0.3],
+            [0.0, tail_y + dy, tail_z + 0.5],
+            [0.1, 1.0, 0.6],
+            [pitch, 0.0, 0.0],
+            accent,
+        );
+    }
+}
+
+/// Build a deterministic articulated colossal voxel mesh (dragon or sea
+/// serpent) for mod/content callers. `stage_scale` selects the growth stage:
+/// it is sanitized and clamped to `0.35..=3.0` (Stage 1 hatchling through
+/// Stage 5 colossal adult); non-finite input collapses to the minimum.
+/// `primary_rgb`/`accent_rgb` are packed into quad tint indices so the
+/// renderer resolves them as sRGB albedo tints.
+pub fn build_colossal_rig_mesh(
+    kind: ColossalRigKind,
+    pose: EntityPose,
+    stage_scale: f32,
+    primary_rgb: [u8; 3],
+    accent_rgb: [u8; 3],
+) -> ExtrudedMesh {
+    let s = finite_or_zero(stage_scale).clamp(0.35, 3.0);
+    let pose = pose.sanitized();
+    let primary = colossal_tint(primary_rgb);
+    let accent = colossal_tint(accent_rgb);
+    let mut mesh = ExtrudedMesh::new();
+    match kind {
+        ColossalRigKind::WingedDragon => build_winged_dragon(&mut mesh, s, pose, primary, accent),
+        ColossalRigKind::SeaSerpent => build_sea_serpent(&mut mesh, s, pose, primary, accent),
+    }
+    mesh
+}
+
 /// Stable FNV-1a hash of ordered quad topology, floating-point bits, UVs,
 /// normals, and tint. Uses no platform hasher or timing information.
 pub fn entity_mesh_fingerprint(mesh: &ExtrudedMesh) -> u64 {
@@ -1503,6 +1990,165 @@ mod tests {
             let mesh = build_entity_rig_mesh(spec, EntityPose::default());
             assert_eq!(mesh.quads.len(), quads, "id {id}");
             assert_valid_mesh(&mesh);
+        }
+    }
+}
+#[cfg(test)]
+mod colossal_rig_tests {
+    use std::f32::consts::FRAC_PI_2;
+
+    use super::*;
+
+    fn verify_colossal_mesh(mesh: &ExtrudedMesh) {
+        assert!(!mesh.quads.is_empty());
+        for quad in &mesh.quads {
+            assert!(quad.positions.iter().flatten().all(|v| v.is_finite()));
+            assert!(quad.normal.iter().all(|v| v.is_finite()));
+            assert!(quad
+                .uv
+                .iter()
+                .flatten()
+                .all(|v| v.is_finite() && (0.0..=1.0).contains(v)));
+            let [a, b, c, _] = quad.positions;
+            let x = [b[0] - a[0], b[1] - a[1], b[2] - a[2]];
+            let y = [c[0] - a[0], c[1] - a[1], c[2] - a[2]];
+            let cross = [
+                x[1] * y[2] - x[2] * y[1],
+                x[2] * y[0] - x[0] * y[2],
+                x[0] * y[1] - x[1] * y[0],
+            ];
+            let dot = cross
+                .iter()
+                .zip(quad.normal)
+                .map(|(a, b)| a * b)
+                .sum::<f32>();
+            assert!(dot > 0.0, "colossal quad is not outward CCW");
+        }
+    }
+
+    fn bbox_extent(mesh: &ExtrudedMesh) -> f32 {
+        let mut lo = [f32::INFINITY; 3];
+        let mut hi = [f32::NEG_INFINITY; 3];
+        for quad in &mesh.quads {
+            for p in &quad.positions {
+                for axis in 0..3 {
+                    lo[axis] = lo[axis].min(p[axis]);
+                    hi[axis] = hi[axis].max(p[axis]);
+                }
+            }
+        }
+        (0..3)
+            .map(|axis| hi[axis] - lo[axis])
+            .fold(0.0_f32, f32::max)
+    }
+
+    #[test]
+    fn colossal_rigs_produce_valid_meshes_at_stage_bounds() {
+        for kind in [ColossalRigKind::WingedDragon, ColossalRigKind::SeaSerpent] {
+            for scale in [0.4_f32, 2.2] {
+                let mesh = build_colossal_rig_mesh(
+                    kind,
+                    EntityPose::default(),
+                    scale,
+                    kind.palette().0,
+                    kind.palette().1,
+                );
+                verify_colossal_mesh(&mesh);
+            }
+            let hatchling = build_colossal_rig_mesh(
+                kind,
+                EntityPose::default(),
+                0.4,
+                kind.palette().0,
+                kind.palette().1,
+            );
+            let adult = build_colossal_rig_mesh(
+                kind,
+                EntityPose::default(),
+                2.2,
+                kind.palette().0,
+                kind.palette().1,
+            );
+            assert!(
+                bbox_extent(&adult) > bbox_extent(&hatchling),
+                "{kind:?} stage 5 must be strictly larger than stage 1"
+            );
+        }
+    }
+
+    #[test]
+    fn colossal_limb_swing_drives_wing_flap_and_serpent_undulation() {
+        for kind in [ColossalRigKind::WingedDragon, ColossalRigKind::SeaSerpent] {
+            let base = EntityPose {
+                limb_swing_amount: 1.0,
+                ..EntityPose::default()
+            };
+            let a = build_colossal_rig_mesh(kind, base, 1.0, [200, 30, 30], [240, 200, 60]);
+            let b = build_colossal_rig_mesh(
+                kind,
+                EntityPose {
+                    limb_swing: FRAC_PI_2,
+                    ..base
+                },
+                1.0,
+                [200, 30, 30],
+                [240, 200, 60],
+            );
+            assert_ne!(
+                entity_mesh_fingerprint(&a),
+                entity_mesh_fingerprint(&b),
+                "{kind:?} limb_swing must change the mesh"
+            );
+            verify_colossal_mesh(&b);
+        }
+    }
+
+    #[test]
+    fn colossal_head_pose_and_palette_are_deterministic() {
+        let kind = ColossalRigKind::WingedDragon;
+        let pose = EntityPose {
+            head_yaw_deg: 35.0,
+            head_pitch_deg: -15.0,
+            limb_swing_amount: 0.8,
+            limb_swing: 1.1,
+            ..EntityPose::default()
+        };
+        let a = build_colossal_rig_mesh(kind, pose, 1.5, [10, 20, 30], [200, 210, 220]);
+        let b = build_colossal_rig_mesh(kind, pose, 1.5, [10, 20, 30], [200, 210, 220]);
+        assert_eq!(entity_mesh_fingerprint(&a), entity_mesh_fingerprint(&b));
+        let untinted = build_colossal_rig_mesh(kind, pose, 1.5, [0, 0, 0], [0, 0, 0]);
+        assert_ne!(entity_mesh_fingerprint(&a), entity_mesh_fingerprint(&untinted));
+        verify_colossal_mesh(&a);
+        verify_colossal_mesh(&untinted);
+    }
+
+    #[test]
+    fn colossal_stage_scale_sanitizes_non_finite_and_nonpositive() {
+        for kind in [ColossalRigKind::WingedDragon, ColossalRigKind::SeaSerpent] {
+            for scale in [f32::NAN, f32::INFINITY, 0.0, -2.5, f32::NEG_INFINITY] {
+                let mesh =
+                    build_colossal_rig_mesh(kind, EntityPose::default(), scale, [1, 2, 3], [4, 5, 6]);
+                verify_colossal_mesh(&mesh);
+            }
+            // Clamped floor: NaN and zero both land on the 0.35 minimum.
+            let floor_a = build_colossal_rig_mesh(
+                kind,
+                EntityPose::default(),
+                f32::NAN,
+                kind.palette().0,
+                kind.palette().1,
+            );
+            let floor_b = build_colossal_rig_mesh(
+                kind,
+                EntityPose::default(),
+                0.35,
+                kind.palette().0,
+                kind.palette().1,
+            );
+            assert_eq!(
+                entity_mesh_fingerprint(&floor_a),
+                entity_mesh_fingerprint(&floor_b)
+            );
         }
     }
 }
