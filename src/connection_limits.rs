@@ -509,6 +509,33 @@ mod chunk_delivery_tests {
             .next_batch(new, &sent, 0.0, &feedback, 22)
             .is_empty());
     }
+
+    #[test]
+    fn view_expansion_during_initial_ack_wait_preserves_pending_chunks() {
+        let mut delivery = ChunkDelivery::default();
+        let mut feedback = chunk_feedback(9);
+        feedback.acknowledge(&9.0f32.to_be_bytes()).unwrap();
+        let initial_window = ChunkWindow::at(0.0, 0.0, 0);
+        let mut sent = HashSet::new();
+        let initial = delivery.next_batch(initial_window, &sent, 0.0, &feedback, 1);
+        assert_eq!(initial.len(), 9);
+        sent.extend(initial.iter().copied());
+        feedback.sent_batch(Instant::now(), initial.len());
+        assert!(feedback.awaiting());
+
+        let expanded_window = ChunkWindow::at(0.0, 0.0, 2);
+        set_chunk_feedback_window(&mut feedback, 45);
+        assert!(delivery
+            .next_batch(expanded_window, &sent, 0.0, &feedback, 2)
+            .is_empty());
+        assert!(delivery.has_pending(), "the ACK gate retains queued work");
+
+        feedback.acknowledge(&45.0f32.to_be_bytes()).unwrap();
+        let expanded = delivery.next_batch(expanded_window, &sent, 0.0, &feedback, 3);
+        assert_eq!(expanded.len(), 36);
+        assert!(expanded.iter().all(|chunk| expanded_window.contains(*chunk)));
+        assert!(expanded.iter().all(|chunk| !sent.contains(chunk)));
+    }
 }
 
 // -------------------------------------------------------- chunk packet frames

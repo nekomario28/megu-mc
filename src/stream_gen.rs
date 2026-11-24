@@ -626,4 +626,47 @@ mod tests {
         assert!(t2.wait());
         assert_eq!(q.job.committed_order().len(), 2);
     }
+
+    #[test]
+    fn eight_clients_progress_past_the_initial_window_without_batch_starvation() {
+        const CLIENTS: usize = 8;
+        const CHUNKS_PER_CLIENT: usize = 45;
+        const LOOKAHEAD: usize = 4;
+
+        let q = Arc::new(Queue::new(TestJob::new(), 4, 512));
+        let start = Arc::new(std::sync::Barrier::new(CLIENTS));
+        let mut clients = Vec::new();
+        for client in 0..CLIENTS {
+            let q = Arc::clone(&q);
+            let start = Arc::clone(&start);
+            clients.push(std::thread::spawn(move || {
+                let mut completed = 0;
+                start.wait();
+                while completed < CHUNKS_PER_CLIENT {
+                    let end = (completed + LOOKAHEAD).min(CHUNKS_PER_CLIENT);
+                    let tickets: Vec<_> = (completed..end)
+                        .map(|index| {
+                            let x = (client * 100 + index) as i32;
+                            q.request((DimId::Overworld, x, 0), 1)
+                                .expect("test queue has capacity")
+                        })
+                        .collect();
+                    for ticket in tickets {
+                        assert!(ticket.wait());
+                    }
+                    completed = end;
+                }
+                completed
+            }));
+        }
+        for client in clients {
+            assert_eq!(client.join().expect("client thread completes"), CHUNKS_PER_CLIENT);
+        }
+        let committed = q.job.committed_order();
+        for client in 0..CLIENTS {
+            for index in 0..CHUNKS_PER_CLIENT {
+                assert!(committed.contains(&key((client * 100 + index) as i32)));
+            }
+        }
+    }
 }

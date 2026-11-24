@@ -1989,11 +1989,8 @@ impl Client {
         if let Some(queue) = queue {
             queue.close();
         }
-        if let Some(writer) = writer {
-            if writer.join().is_err() {
-                eprintln!("[spine] {} writer panicked", self.name);
-            }
-        }
+        let socket = self.sock.lock().unwrap_or_else(|e| e.into_inner());
+        shutdown_and_join_writer(&socket, writer, &self.name);
     }
 
     fn is_spectator(&self) -> bool {
@@ -5993,36 +5990,30 @@ fn stream_chunks(
     if let Some(round) = delivery_round {
         let _ = worldgen::with_gen(|g| g.starts_round = Some(round));
     }
-    // Hand the batch's generation to the bounded worker pool before the send
-    // loop: workers build the pure terrain half off-lock and a single committer
-    // runs populate + the section fill in request order, so `pop_done`, staged
-    // payloads and generated ticks land exactly as the serial path produced
-    // them. This thread then only waits on the chunk it is about to encode —
-    // the generation for the rest of the batch proceeds on the workers while
-    // it does. A declined ticket (`None`) is a chunk the pool did not accept;
-    // it keeps the original inline path. Spectators are excluded on purpose:
-    // `spectatorsGenerateChunks` false must never ticket fresh worldgen.
-    let tickets: Vec<Option<stream_gen::Ticket>> = if allow_generate {
-        news.iter()
-            .map(|&(cx, cz)| stream_gen::request(dim, cx, cz))
-            .collect()
-    } else {
-        news.iter().map(|_| None).collect()
-    };
+    // Keep only one terrain group queued per client. Enqueueing an entire
+    // delivery batch lets an early client's outer rings sit ahead of every
+    // later client's initial window in stream_gen's ordered commit lane.
+    // Group-sized lookahead still overlaps terrain preparation with encoding,
+    // while giving other connection threads a chance to enqueue closer chunks.
     // The terrain rows stop one section below the dimension's own ceiling: a Nether/End
     // window is 0..256 (16 sections), not the Overworld's -64..320.
     let (lo, hi) = (dim.min_y(), dim.min_y() + dim.height() - 16);
     let compression = socket_compression(s);
     let mut failed = false;
-    'delivery: for (chunk_group, ticket_group) in news
-        .chunks(terrain_group(delivery_workers))
-        .zip(tickets.chunks(terrain_group(delivery_workers)))
-    {
+    'delivery: for chunk_group in news.chunks(terrain_group(delivery_workers)) {
+        let ticket_group: Vec<Option<stream_gen::Ticket>> = if allow_generate {
+            chunk_group
+                .iter()
+                .map(|&(cx, cz)| stream_gen::request(dim, cx, cz))
+                .collect()
+        } else {
+            chunk_group.iter().map(|_| None).collect()
+        };
         // A queued chunk carries its own terrain prefetch inside the worker job,
         // so the group prefetch only covers the chunks the pool declined.
         let uncovered: Vec<(i32, i32)> = chunk_group
             .iter()
-            .zip(ticket_group)
+            .zip(&ticket_group)
             .filter(|(_, t)| t.is_none())
             .map(|(&c, _)| c)
             .collect();
@@ -6032,7 +6023,7 @@ fn stream_chunks(
         if conn_prof() && __pfe > Duration::from_millis(50) {
             eprintln!("[conn-prof] prefetch_terrain {:?}", __pfe);
         }
-        for ((cx, cz), ticket) in chunk_group.iter().zip(ticket_group) {
+        for ((cx, cz), ticket) in chunk_group.iter().zip(&ticket_group) {
             if let Some(ticket) = ticket {
                 // A false wait means the worker could not generate it; the
                 // frame builder's own `ensure_populated` covers that chunk
@@ -9110,15 +9101,53 @@ fn disconnect_all_clients(reason: &str) {
         let mut socket = client.sock.lock().unwrap_or_else(|error| error.into_inner());
         play_disconnect(&mut socket, reason);
     }
-    // Send all Disconnect frames first so the per-client writer threads can
-    // drain concurrently; shutting down before they drain loses the message.
+    // Close every queue before waiting on any writer. The short per-socket
+    // write deadline lets queued Disconnect frames drain for healthy peers and
+    // bounds a blocked write before its writer is joined.
+    let mut writers = Vec::with_capacity(connected.len());
     for client in &connected {
-        client.close_play_writer();
+        let key = {
+            let socket = client.sock.lock().unwrap_or_else(|error| error.into_inner());
+            socket_key(&socket)
+        };
+        let (queue, writer) = {
+            let mut states = socket_wire().lock().unwrap_or_else(|error| error.into_inner());
+            match states.get_mut(&key) {
+                Some(state) => (state.tx_queue.clone(), state.tx_writer.take()),
+                None => (None, None),
+            }
+        };
+        if let Some(queue) = queue {
+            queue.close();
+        }
+        writers.push((client, writer));
     }
-    for client in connected {
+    for (client, writer) in writers {
         let socket = client.sock.lock().unwrap_or_else(|error| error.into_inner());
+        shutdown_and_join_writer(&socket, writer, &client.name);
+    }
+}
+
+fn shutdown_and_join_writer(
+    socket: &TcpStream,
+    writer: Option<std::thread::JoinHandle<()>>,
+    name: &str,
+) {
+    // `set_write_timeout` applies to the writer's cloned descriptor as well.
+    // If the socket cannot accept the deadline, shutdown first so join still
+    // cannot wait forever on a peer that stopped reading.
+    if socket
+        .set_write_timeout(Some(Duration::from_millis(100)))
+        .is_err()
+    {
         let _ = socket.shutdown(std::net::Shutdown::Both);
     }
+    if let Some(writer) = writer {
+        if writer.join().is_err() {
+            eprintln!("[spine] {name} writer panicked");
+        }
+    }
+    let _ = socket.shutdown(std::net::Shutdown::Both);
 }
 /// One line per refused connection, at most one per second so a flood cannot
 /// turn the log itself into the denial of service.
@@ -16224,6 +16253,29 @@ mod connection_slot_tests {
         });
         assert!(result.is_err());
         assert_eq!(count.load(Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn stalled_writer_is_interrupted_before_join() {
+        use std::io::Write as _;
+        use std::net::TcpListener;
+
+        let listener = TcpListener::bind(("127.0.0.1", 0)).expect("bind test peer");
+        let socket = TcpStream::connect(listener.local_addr().expect("listener address"))
+            .expect("connect test peer");
+        let (_peer, _) = listener.accept().expect("accept test peer");
+        let writer_socket = socket.try_clone().expect("clone writer socket");
+        let writer = std::thread::spawn(move || {
+            let payload = vec![0; 1024 * 1024];
+            let mut stream = writer_socket;
+            while stream.write_all(&payload).is_ok() {}
+        });
+        let started = Instant::now();
+        shutdown_and_join_writer(&socket, Some(writer), "test");
+        assert!(
+            started.elapsed() < Duration::from_secs(1),
+            "socket shutdown must release a blocked writer promptly"
+        );
     }
 }
 
