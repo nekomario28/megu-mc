@@ -78,18 +78,14 @@ fn timeline(total_ms: u32) -> StartupTimeline {
 fn visual_style_preset_ordering_labels_and_default() {
     assert_eq!(
         VisualStylePreset::ALL,
-        [
-            VisualStylePreset::Vanilla,
-            VisualStylePreset::MeguNaturalLight,
-            VisualStylePreset::MeguNatural
-        ]
+        [VisualStylePreset::Vanilla, VisualStylePreset::MeguNatural]
     );
     assert_eq!(VisualStylePreset::default(), VisualStylePreset::Vanilla);
 
     // Cycles forward and wraps cleanly; no jargon anywhere in labels.
     assert_eq!(
         VisualStylePreset::Vanilla.next(),
-        VisualStylePreset::MeguNaturalLight
+        VisualStylePreset::MeguNatural
     );
     assert_eq!(
         VisualStylePreset::MeguNatural.next(),
@@ -99,22 +95,8 @@ fn visual_style_preset_ordering_labels_and_default() {
         VisualStylePreset::Vanilla.step(-1),
         VisualStylePreset::MeguNatural
     );
-    assert_eq!(
-        VisualStylePreset::Vanilla.label(UiLang::En),
-        "Vanilla (Lightest)"
-    );
-    assert_eq!(
-        VisualStylePreset::Vanilla.label(UiLang::Ja),
-        "Vanilla (最軽量)"
-    );
-    assert_eq!(
-        VisualStylePreset::MeguNaturalLight.label(UiLang::En),
-        "Megu Natural (Light)"
-    );
-    assert_eq!(
-        VisualStylePreset::MeguNaturalLight.label(UiLang::Ja),
-        "Megu Natural (軽量)"
-    );
+    assert_eq!(VisualStylePreset::Vanilla.label(UiLang::En), "Vanilla");
+    assert_eq!(VisualStylePreset::Vanilla.label(UiLang::Ja), "Vanilla");
     assert_eq!(
         VisualStylePreset::MeguNatural.label(UiLang::En),
         "Megu Natural"
@@ -224,8 +206,6 @@ fn experience_toggles_default_off_and_flip_two_way() {
 
     // Preset cycles through the ordered stops from the same tab.
     click(&mut ui, WidgetId::TabShaders, 1280, 720);
-    click(&mut ui, WidgetId::VisualPreset, 1280, 720);
-    assert_eq!(ui.settings.visual.preset, VisualStylePreset::MeguNaturalLight);
     click(&mut ui, WidgetId::VisualPreset, 1280, 720);
     assert_eq!(ui.settings.visual.preset, VisualStylePreset::MeguNatural);
     click(&mut ui, WidgetId::VisualPreset, 1280, 720);

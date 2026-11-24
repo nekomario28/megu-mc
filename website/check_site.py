@@ -435,7 +435,7 @@ def check_seo_metadata():
 
     required_meta = {
         ("property", "og:type"): "website",
-        ("property", "og:site_name"): "Megu (megu)",
+        ("property", "og:site_name"): "Megu",
         ("property", "og:title"): None,
         ("property", "og:description"): None,
         ("property", "og:url"): CANONICAL_URL,
@@ -468,7 +468,7 @@ def check_seo_metadata():
         findings.append("index.html has no parseable SoftwareApplication JSON-LD")
     else:
         expected_fields = {
-            "name": "Megu (megu)",
+            "name": "Megu",
             "applicationCategory": "GameApplication",
             "operatingSystem": "Linux, Windows, macOS",
             "license": "https://www.gnu.org/licenses/lgpl-3.0.html",

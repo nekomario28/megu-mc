@@ -2877,17 +2877,15 @@ impl LiveSession {
     /// through the universal `client-port` resolver, intensity-modulated
     /// via [`evaluate_modulated_intensity`], sorted nearest-first to
     /// `camera` and truncated to [`MAX_DYNAMIC_LIGHTS`].
-    /// Returns an empty `Vec` while the world-effects pack is off
-    /// (`settings.visual.world_effects` -> `nature.enabled`), so the
-    /// settings' Off switch emits zero held/entity dynamic lights.
+    /// The Video tab `Dynamic Lights` toggle gates this at the call
+    /// site (`video.dynamic_lights`), not here — World Effects owns the
+    /// nature ambience (leaves/ripples/splashes), never the torch and
+    /// entity lights.
     pub fn collect_dynamic_lights(
         &self,
         camera: [f32; 3],
     ) -> Vec<megu_client_mesh::vfx_engine::DynamicColoredLight> {
         use megu_client_mesh::vfx_engine::DynamicColoredLight;
-        if !self.vanilla_plus_cfg.nature.enabled {
-            return Vec::new();
-        }
         let tick_time_sec = self.world_time_ticks() as f32 / 20.0;
         let mut candidates: Vec<(f32, DynamicColoredLight)> = Vec::new();
         let mut push = |pos: [f32; 3], emitter: ResolvedLightEmitter, phase: f32| {
@@ -3312,13 +3310,10 @@ impl LiveSession {
     /// floor inside the probe depth) emit nothing. It complements the
     /// sun/moon cascade pass so mobs stay grounded indoors, under
     /// clouds and on `Shadows: Off/Feather`. Empty while the
-    /// world-effects pack is off (`nature.enabled`), matching the
-    /// dynamic-light gate.
+    /// `entity_shadows` gate is off — the Video tab `Shadows` toggle
+    /// owns it at the call site, never World Effects.
     pub fn entity_contact_shadow_quads(&self) -> Vec<EntityContactShadowQuad> {
         let mut out = Vec::new();
-        if !self.vanilla_plus_cfg.nature.enabled {
-            return out;
-        }
         for (eid, rig, pos, _tracked) in self.entity_render_entries() {
             // Item drops, projectiles and vehicles/boats/frame hooks
             // stay shadow-free — only standing creature rigs ground.
@@ -11722,10 +11717,9 @@ mod tests {
         live.player_inventory
             .insert(36, stack(item_id("minecraft:torch")));
 
-        // world_effects Off -> zero held/entity lights.
-        assert!(live.collect_dynamic_lights([8.0, 64.0, 8.0]).is_empty());
-
-        live.vanilla_plus_cfg.nature.enabled = true;
+        // World Effects (nature pack) no longer gates torch/entity
+        // lights — the Video `Dynamic Lights` toggle owns the switch at
+        // the call site — so a held torch lights even with it off.
         let lights = live.collect_dynamic_lights([8.0, 64.0, 8.0]);
         assert_eq!(lights.len(), 1);
         let torch = &lights[0];

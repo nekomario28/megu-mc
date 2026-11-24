@@ -107,7 +107,7 @@ use crate::{
 };
 
 /// Window title.
-pub const WINDOW_TITLE: &str = "megu";
+pub const WINDOW_TITLE: &str = "Megu 1.21.1";
 
 /// Event-loop wake interval while the surface is occluded: slow enough for
 /// zero-GPU sleep, fast enough to keep a live session's network pump alive.
@@ -543,9 +543,7 @@ fn cloud_deck_mode(preset: VisualStylePreset, clouds: CloudMode) -> CloudDeckMod
         CloudMode::Off => CloudDeckMode::Off,
         CloudMode::Fast => CloudDeckMode::Vanilla,
         CloudMode::Fancy => match preset {
-            VisualStylePreset::MeguNatural | VisualStylePreset::MeguNaturalLight => {
-                CloudDeckMode::Hybrid
-            }
+            VisualStylePreset::MeguNatural => CloudDeckMode::Hybrid,
             VisualStylePreset::Vanilla => CloudDeckMode::Vanilla,
         },
     }
@@ -1045,6 +1043,15 @@ impl GpuApp {
                 startup_status.push(format!("{}: {warning}", settings_path.display()));
             }
         } else if !settings_path.exists() {
+            // True first launch — no `megu-client.toml` anywhere: seed
+            // the probed hardware recommendation under the possible
+            // `options.txt` import. The file itself is only ever
+            // written by the explicit save path, never here, and an
+            // existing user TOML always wins untouched.
+            megu_client::hardware_profile::recommend_tuning(
+                &megu_client::hardware_profile::probe_host_hardware(),
+            )
+            .apply_to(&mut persisted_settings);
             let options_path = settings_path
                 .parent()
                 .unwrap_or_else(|| std::path::Path::new("."))
@@ -1602,10 +1609,7 @@ impl GpuApp {
         // each quad samples world light at its centroid through the same
         // `sample_live_entity_light` closure the rigs use, gated on the
         // `entity_shadows` settings key.
-        cache.contact_shadow_quads.clear();
-        cache
-            .contact_shadow_quads
-            .extend(staged_contact_shadow_quads(live, entity_shadows));
+        stage_contact_shadow_quads(live, entity_shadows, &mut cache.contact_shadow_quads);
         let mut ber_refs: Vec<(usize, [f32; 3], [f32; 3])> = Vec::new();
         for (block_pos, be) in &live.world.block_entities {
             let Some(kind) = classify_tracked_block_entity(be) else {
@@ -2156,11 +2160,18 @@ impl GpuApp {
                 }
                 self.active_shaderpack_path = desired_shaderpack;
             }
+            // Realistic shadows ride the Megu Natural style only, and
+            // only while a shadow consumer is on: the dedicated
+            // `Shadows` toggle or the local shadow-light gameplay opt-in.
+            // The adaptive frame-time governor can still force `Off`
+            // under load on top of this player-facing quality.
             let shadow_quality = match settings.visual.preset {
-                VisualStylePreset::Vanilla | VisualStylePreset::MeguNaturalLight => {
-                    BuiltinShadowQuality::Off
+                VisualStylePreset::MeguNatural
+                    if video.entity_shadows || video.directional_shadow_gameplay =>
+                {
+                    BuiltinShadowQuality::Natural
                 }
-                VisualStylePreset::MeguNatural => BuiltinShadowQuality::Natural,
+                _ => BuiltinShadowQuality::Off,
             };
             self.user_shadow_quality = shadow_quality;
             active.renderer.set_shadow_quality(shadow_quality);
@@ -4757,11 +4768,10 @@ impl GpuApp {
                     live,
                     &mut self.entity_render_cache,
                     &mut active.renderer,
-                    // `entity_shadows` is a file-only `ClientSettings`
-                    // key (no Video widget owns it), so the persisted
-                    // mirror is the live gate; `enchantment_glint` reads
-                    // the real Video toggle like the 2D path does.
-                    self.persisted_settings.entity_shadows,
+                    // `entity_shadows` is the Video tab `Shadows`
+                    // toggle — read it live like `enchantment_glint`
+                    // does on the 2D path.
+                    self.ui.settings.video.entity_shadows,
                     self.ui.settings.video.enchantment_glint,
                 );
             }
@@ -4798,7 +4808,9 @@ impl GpuApp {
         // F3 string refreshes at 10 Hz (`F3_REFRESH`): steady frames reuse
         // the cached line, which also keeps the draw-list fingerprint
         // stable so the UI mesh rebuild stays skipped.
-        self.ui.hud.actionbar = if self.show_diagnostics {
+        // Actionbar/F3 mirror: compare-before-write plus `clone_from`
+        // buffer reuse keeps unchanged text allocation-free every frame.
+        if self.show_diagnostics {
             let stale = self
                 .f3_text
                 .as_ref()
@@ -4828,19 +4840,33 @@ impl GpuApp {
                     Instant::now(),
                 ));
             }
-            self.f3_text
+            let text = self
+                .f3_text
                 .as_ref()
-                .map(|(text, _)| text.clone())
-                .unwrap_or_default()
+                .map(|(text, _)| text.as_str())
+                .unwrap_or_default();
+            if self.ui.hud.actionbar != text {
+                self.ui.hud.actionbar = text.to_owned();
+            }
         } else {
-            self.live
-                .as_ref()
-                .map_or_else(String::new, |live| match &live.status {
-                    SessionStatus::Connecting => "Connecting to server...".to_owned(),
-                    SessionStatus::Playing => live.hud.actionbar.clone(),
-                    SessionStatus::Disconnected(reason) => format!("Disconnected: {reason}"),
-                })
-        };
+            match self.live.as_ref().map(|live| &live.status) {
+                Some(SessionStatus::Playing) => {
+                    let actionbar = &self.live.as_ref().expect("status read").hud.actionbar;
+                    if self.ui.hud.actionbar != *actionbar {
+                        self.ui.hud.actionbar.clone_from(actionbar);
+                    }
+                }
+                Some(SessionStatus::Connecting) => {
+                    if self.ui.hud.actionbar != "Connecting to server..." {
+                        self.ui.hud.actionbar = "Connecting to server...".to_owned();
+                    }
+                }
+                Some(SessionStatus::Disconnected(reason)) => {
+                    self.ui.hud.actionbar = format!("Disconnected: {reason}");
+                }
+                None => self.ui.hud.actionbar.clear(),
+            }
+        }
         // Chat-bar mirror lands after `sync_hud_to` (which clones
         // `live.hud` wholesale) and before the draw list rebuild — the
         // input strip + suggestion popup read it this frame.
@@ -6472,6 +6498,12 @@ fn apply_client_settings_to_ui(src: &ClientSettings, ui: &mut UiSettings) {
     ui.video.background_fps = src.background_fps_limit;
     ui.video.vsync = src.vsync;
     ui.video.smooth_lighting = src.smooth_lighting;
+    ui.video.clouds = match src.clouds {
+        CloudMode::Off => megu_ui::state::CloudSetting::Off,
+        CloudMode::Fast => megu_ui::state::CloudSetting::Fast,
+        CloudMode::Fancy => megu_ui::state::CloudSetting::Fancy,
+    };
+    ui.video.entity_shadows = src.entity_shadows;
     ui.video.comfort_exposure = src.comfort_exposure;
     ui.video.dynamic_lights = src.dynamic_lights;
     ui.video.enchantment_glint = src.enchantment_glint;
@@ -6611,8 +6643,8 @@ fn ui_gpu_backend(backend: GpuBackend) -> megu_client_mesh::RenderBackendPrefere
 
 /// Overlay the UI-visible settings onto `base` (the last loaded file
 /// state): every widget-owned key writes back, and file-only fields
-/// (`shader_pack`, `shader_profile`, `report_endpoint`, `particles`,
-/// `clouds`, `entity_shadows`) survive untouched.
+/// (`shader_pack`, `shader_profile`, `report_endpoint`, `particles`)
+/// survive untouched.
 fn ui_to_client_settings(ui: &UiSettings, base: &ClientSettings) -> ClientSettings {
     let mut out = base.clone();
     out.shaders_enabled = ui.shader_quick.shaders_enabled;
@@ -6678,6 +6710,12 @@ fn ui_to_client_settings(ui: &UiSettings, base: &ClientSettings) -> ClientSettin
     out.background_fps_limit = ui.video.background_fps;
     out.vsync = ui.video.vsync;
     out.smooth_lighting = ui.video.smooth_lighting;
+    out.clouds = match ui.video.clouds {
+        megu_ui::state::CloudSetting::Off => CloudMode::Off,
+        megu_ui::state::CloudSetting::Fast => CloudMode::Fast,
+        megu_ui::state::CloudSetting::Fancy => CloudMode::Fancy,
+    };
+    out.entity_shadows = ui.video.entity_shadows;
     out.comfort_exposure = ui.video.comfort_exposure;
     out.dynamic_lights = ui.video.dynamic_lights;
     out.enchantment_glint = ui.video.enchantment_glint;
@@ -6746,7 +6784,7 @@ fn is_builtin_title_text(command: &UiCommand) -> bool {
     matches!(
         command,
         UiCommand::Text { scale, text, .. }
-            if (*scale == 3 && text == "MEGU")
+            if (*scale == 3 && text == "MINECRAFT")
                 || (*scale == 1
                     && (text == "clean-room native client"
                         || text == "クリーンルーム ネイティブクライアント"))
@@ -6756,7 +6794,7 @@ fn is_builtin_title_text(command: &UiCommand) -> bool {
 pub const MEGU_WEBSITE_URL: &str = "https://megu.megumin.tech/";
 pub const MEGU_SUPPORT_URL: &str = "https://megu.megumin.tech/#support";
 pub const MEGU_CONTRIBUTE_URL: &str = "https://github.com/nekomario28/megu-mc";
-pub const MEGU_REPORT_URL: &str = "https://megu.megumin.tech/";
+pub const MEGU_REPORT_URL: &str = "https://megu.megumin.tech/#report";
 
 // ---------------------------------------------------------------------------
 // Live entity/BER + particle staging helpers
@@ -7139,17 +7177,20 @@ fn unrigged_entity_fallbacks(
 /// grounded-mob quads converted for the entity/BER lit list, or empty
 /// while the `entity_shadows` gate is off so the toggle kills every
 /// contact shadow the same refresh it flips.
-fn staged_contact_shadow_quads(
+fn stage_contact_shadow_quads(
     live: &LiveSession,
     enabled: bool,
-) -> Vec<(ExtrudedMesh, [f32; 3])> {
+    out: &mut Vec<(ExtrudedMesh, [f32; 3])>,
+) {
+    out.clear();
     if !enabled {
-        return Vec::new();
+        return;
     }
-    live.entity_contact_shadow_quads()
-        .into_iter()
-        .map(contact_shadow_quad_mesh)
-        .collect()
+    out.extend(
+        live.entity_contact_shadow_quads()
+            .into_iter()
+            .map(contact_shadow_quad_mesh),
+    );
 }
 
 /// Convert one live [`EntityContactShadowQuad`] into entity/BER staging
@@ -7556,7 +7597,7 @@ mod tests {
             app.ui.contribute_url,
             "https://github.com/nekomario28/megu-mc"
         );
-        assert_eq!(app.ui.report_url, "https://megu.megumin.tech/");
+        assert_eq!(app.ui.report_url, "https://megu.megumin.tech/#report");
         assert_eq!(app.ui.screen, Screen::Title);
         assert!(app.ui.settings.qol.show_support_links);
 
@@ -7577,7 +7618,7 @@ mod tests {
             ),
             (
                 megu_ui::state::WidgetId::ReportLink,
-                "https://megu.megumin.tech/",
+                "https://megu.megumin.tech/#report",
             ),
         ] {
             let hit = app
@@ -9360,11 +9401,13 @@ mod tests {
         window_test_add_entity(&mut live, 30, 124, [0.0, 64.0, 0.0]);
         window_test_add_entity(&mut live, 31, 58, [2.0, 64.0, 0.0]);
 
+        let mut staged = Vec::new();
+        stage_contact_shadow_quads(&live, false, &mut staged);
         assert!(
-            staged_contact_shadow_quads(&live, false).is_empty(),
+            staged.is_empty(),
             "disabled gate must stage zero shadow quads"
         );
-        let staged = staged_contact_shadow_quads(&live, true);
+        stage_contact_shadow_quads(&live, true, &mut staged);
         assert_eq!(staged.len(), 1, "only the grounded mob shadows");
         let (mesh, tint) = &staged[0];
         assert_eq!(mesh.quads.len(), 1);
@@ -9378,7 +9421,8 @@ mod tests {
             );
         }
         // Toggling off mid-flight clears the staged list next refresh.
-        assert!(staged_contact_shadow_quads(&live, false).is_empty());
+        stage_contact_shadow_quads(&live, false, &mut staged);
+        assert!(staged.is_empty());
     }
 
     /// The `enchantment_glint` toggle decides whether a staged entity's
@@ -9604,12 +9648,10 @@ mod tests {
             cloud_deck_mode(VisualStylePreset::Vanilla, CloudMode::Off),
             CloudDeckMode::Off
         );
-        // Megu Natural styles: Fancy unlocks the hybrid decks, Fast
+        // Megu Natural style: Fancy unlocks the hybrid decks, Fast
         // stays one lightweight greedy deck, Off stays empty.
-        for preset in [
-            VisualStylePreset::MeguNaturalLight,
-            VisualStylePreset::MeguNatural,
-        ] {
+        {
+            let preset = VisualStylePreset::MeguNatural;
             assert_eq!(
                 cloud_deck_mode(preset, CloudMode::Fancy),
                 CloudDeckMode::Hybrid,

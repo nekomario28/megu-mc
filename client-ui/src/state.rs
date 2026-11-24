@@ -348,6 +348,42 @@ pub fn detect_host_total_ram_mib() -> u32 {
         .unwrap_or(DEFAULT_HOST_TOTAL_RAM_MIB)
 }
 
+/// Cloud draw mode (mirrors `ClientSettings.clouds` / vanilla
+/// `options.txt` `clouds`): `Off` draws nothing, `Fast` keeps the single
+/// vanilla deck, `Fancy` allows the richer layered decks under the Megu
+/// visual styles.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum CloudSetting {
+    /// No cloud decks.
+    Off,
+    /// Single vanilla cubic deck.
+    Fast,
+    /// Full deck detail (default).
+    #[default]
+    Fancy,
+}
+
+impl CloudSetting {
+    /// All values in cycle order.
+    pub const ALL: [Self; 3] = [Self::Off, Self::Fast, Self::Fancy];
+
+    pub fn next(self) -> Self {
+        let i = Self::ALL.iter().position(|c| *c == self).unwrap_or(0);
+        Self::ALL[(i + 1) % Self::ALL.len()]
+    }
+
+    pub fn label(self, lang: UiLang) -> &'static str {
+        match (self, lang) {
+            (Self::Off, UiLang::En) => "Off",
+            (Self::Off, UiLang::Ja) => "オフ",
+            (Self::Fast, UiLang::En) => "Fast",
+            (Self::Fast, UiLang::Ja) => "高速",
+            (Self::Fancy, UiLang::En) => "Fancy",
+            (Self::Fancy, UiLang::Ja) => "描画優先",
+        }
+    }
+}
+
 /// Video settings page state.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct VideoSettings {
@@ -362,6 +398,11 @@ pub struct VideoSettings {
     pub background_fps: u16,
     pub vsync: bool,
     pub smooth_lighting: bool,
+    /// Cloud deck detail (`Off`/`Fast`/`Fancy`, default `Fancy`).
+    pub clouds: CloudSetting,
+    /// Entity contact shadows + realistic shadow rendering switch
+    /// (`Shadows`, default `true`; the `Fast` preset drops it).
+    pub entity_shadows: bool,
     /// Eye-comfort exposure limiter (soft glow instead of glare on
     /// snow/sand/stacked torches). Default `true`.
     pub comfort_exposure: bool,
@@ -408,6 +449,8 @@ impl Default for VideoSettings {
             background_fps: 15,
             vsync: true,
             smooth_lighting: true,
+            clouds: CloudSetting::Fancy,
+            entity_shadows: true,
             comfort_exposure: true,
             dynamic_lights: true,
             enchantment_glint: true,
@@ -842,15 +885,13 @@ pub enum VisualStylePreset {
     /// Pure vanilla rendering — nothing extra drawn (default).
     #[default]
     Vanilla,
-    /// Megu Natural with no shadowmaps — fast even on Intel Celeron/iGPU.
-    MeguNaturalLight,
     /// Full Megu lighting, shadows, reflections, and atmosphere.
     MeguNatural,
 }
 
 impl VisualStylePreset {
     /// All presets in their fixed cycle order.
-    pub const ALL: [Self; 3] = [Self::Vanilla, Self::MeguNaturalLight, Self::MeguNatural];
+    pub const ALL: [Self; 2] = [Self::Vanilla, Self::MeguNatural];
 
     pub fn next(self) -> Self {
         self.step(1)
@@ -864,10 +905,7 @@ impl VisualStylePreset {
 
     pub const fn label(self, lang: UiLang) -> &'static str {
         match (self, lang) {
-            (Self::Vanilla, UiLang::En) => "Vanilla (Lightest)",
-            (Self::Vanilla, UiLang::Ja) => "Vanilla (最軽量)",
-            (Self::MeguNaturalLight, UiLang::En) => "Megu Natural (Light)",
-            (Self::MeguNaturalLight, UiLang::Ja) => "Megu Natural (軽量)",
+            (Self::Vanilla, _) => "Vanilla",
             (Self::MeguNatural, _) => "Megu Natural",
         }
     }
@@ -1222,6 +1260,8 @@ pub enum SettingKey {
     VideoBackgroundFps,
     VideoVsync,
     VideoSmoothLighting,
+    VideoClouds,
+    VideoEntityShadows,
     VideoComfortExposure,
     VideoDynamicLights,
     VideoEnchantmentGlint,
@@ -1309,6 +1349,10 @@ impl SettingsTransaction {
             K::VideoBackgroundFps => current.video.background_fps == opened.video.background_fps,
             K::VideoVsync => current.video.vsync == opened.video.vsync,
             K::VideoSmoothLighting => current.video.smooth_lighting == opened.video.smooth_lighting,
+            K::VideoClouds => current.video.clouds == opened.video.clouds,
+            K::VideoEntityShadows => {
+                current.video.entity_shadows == opened.video.entity_shadows
+            }
             K::VideoComfortExposure => {
                 current.video.comfort_exposure == opened.video.comfort_exposure
             }
@@ -1433,6 +1477,10 @@ impl SettingsTransaction {
             K::VideoBackgroundFps => current.video.background_fps = opened.video.background_fps,
             K::VideoVsync => current.video.vsync = opened.video.vsync,
             K::VideoSmoothLighting => current.video.smooth_lighting = opened.video.smooth_lighting,
+            K::VideoClouds => current.video.clouds = opened.video.clouds,
+            K::VideoEntityShadows => {
+                current.video.entity_shadows = opened.video.entity_shadows
+            }
             K::VideoComfortExposure => {
                 current.video.comfort_exposure = opened.video.comfort_exposure
             }
@@ -2386,6 +2434,8 @@ pub enum WidgetId {
     VideoBackgroundFps,
     VideoVsync,
     VideoSmoothLighting,
+    VideoClouds,
+    VideoEntityShadows,
     VideoComfortExposure,
     VideoDynamicLights,
     VideoEnchantmentGlint,
@@ -2527,6 +2577,8 @@ impl WidgetId {
                 | Self::VideoBackgroundFps
                 | Self::VideoVsync
                 | Self::VideoSmoothLighting
+                | Self::VideoClouds
+                | Self::VideoEntityShadows
                 | Self::VideoRamBudget
                 | Self::QolBuiltin(_)
                 | Self::MiniHudSegment(_)
@@ -4704,6 +4756,16 @@ impl UiState {
             }
             WidgetId::VideoSmoothLighting => {
                 v.smooth_lighting = !v.smooth_lighting;
+                v.preset = VideoPreset::Custom;
+                true
+            }
+            WidgetId::VideoClouds => {
+                v.clouds = v.clouds.next();
+                v.preset = VideoPreset::Custom;
+                true
+            }
+            WidgetId::VideoEntityShadows => {
+                v.entity_shadows = !v.entity_shadows;
                 v.preset = VideoPreset::Custom;
                 true
             }

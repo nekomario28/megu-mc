@@ -2211,6 +2211,19 @@
     }
 
     $("feedback-open").addEventListener("click", openModal);
+
+    function openFromHash() {
+      if (
+        overlay.hidden &&
+        (window.location.hash === "#report" ||
+          window.location.hash === "#feedback")
+      ) {
+        openModal();
+      }
+    }
+    openFromHash();
+    window.addEventListener("hashchange", openFromHash);
+
     $("feedback-close").addEventListener("click", closeModal);
     overlay.addEventListener("click", function (ev) {
       if (ev.target === overlay) {

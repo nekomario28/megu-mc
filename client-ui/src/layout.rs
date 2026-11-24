@@ -413,7 +413,7 @@ fn title(ctx: &mut Ctx) {
     let lang = ctx.lang;
     let cx = ctx.w / 2;
 
-    ctx.ctext(cx, 34, 3, pal::TEXT, "MEGU");
+    ctx.ctext(cx, 34, 3, pal::TEXT, "MINECRAFT");
     ctx.ctext(cx, 62, 1, pal::TEXT_DIM, "MEGU EDITION");
 
     let bw = 200.min(ctx.w - 8).max(24);
@@ -494,14 +494,7 @@ fn title(ctx: &mut Ctx) {
             tr(lang, "Website", "公式サイト"),
         );
     }
-    let full_version = "megu client-ui 0.1.0 - zero-dep pure Rust";
-    let short_version = "megu client-ui 0.1.0";
-    let version = if text_width(full_version, 1) as i32 + 8 <= ctx.w {
-        full_version
-    } else {
-        short_version
-    };
-    ctx.text(4, ctx.h - 12, 1, pal::TEXT_DIM, version);
+    ctx.text(4, ctx.h - 12, 1, pal::TEXT_DIM, "Megu 1.21.1");
 
     // Host-reported status/errors stay visible on the menu — a failed
     // singleplayer launch or multiplayer join never reads as a no-op.
@@ -1151,28 +1144,15 @@ fn about_megu(ctx: &mut Ctx) {
         75,
         1,
         pal::TEXT,
-        tr(
-            lang,
-            "Pure-Rust clean-room client UI",
-            "純Rust・クリーンルーム実装のクライアントUI",
-        ),
+        tr(lang, "Minecraft 1.21.1 Client", "Minecraft 1.21.1 クライアント"),
     );
     ctx.ctext(
         cx,
-        93,
+        105,
         1,
         pal::TEXT_DIM,
-        tr(lang, "Independently implemented", "独立した実装"),
+        tr(lang, "License: LGPL-3.0-or-later", "ライセンス: LGPL-3.0-or-later"),
     );
-    ctx.ctext(cx, 115, 1, pal::TEXT_DIM, "Licenses (SPDX, choose one)");
-    ctx.ctext(
-        cx,
-        128,
-        1,
-        pal::TEXT,
-        "LGPL-3.0-or-later / GPL-3.0-or-later",
-    );
-    ctx.ctext(cx, 141, 1, pal::TEXT, "AGPL-3.0-or-later");
 
     // The two link rows need the Back button at h-30 to clear them;
     // below ~216 logical px the screen collapses to text + Back only.
@@ -1345,10 +1325,9 @@ fn shaders_tab(ctx: &mut Ctx, y0: i32) {
         WidgetId::VisualCameraMotion,
         lr(x, y0 + 196, 320, 20),
         &format!(
-            "{}: {} ({})",
+            "{}: {}",
             tr(lang, "Camera Motion", "カメラの微揺れ"),
-            onoff(vs.camera_micro_motion),
-            tr(lang, "opt-in", "オプトイン")
+            onoff(vs.camera_micro_motion)
         ),
     );
     ctx.dirty_dot(SettingKey::CameraMicroMotion, x + 326, y0 + 202);
@@ -1369,6 +1348,16 @@ fn video_tab(ctx: &mut Ctx, y0: i32) {
     let bw = 312;
     let step = if ctx.h < 300 { 22 } else { 24 };
     let vy = |i: i32| y0 + i * step;
+    let pair = |ctx: &mut Ctx,
+                i: i32,
+                col: i32,
+                id: WidgetId,
+                key: SettingKey,
+                label: &str| {
+        let bx = lx + col * 160;
+        ctx.btn(id, lr(bx, vy(i), 150, 20), label);
+        ctx.dirty_dot(key, bx + 154, vy(i) + 6);
+    };
 
     let (x, y) = (lx, vy(0));
     ctx.btn(
@@ -1393,28 +1382,101 @@ fn video_tab(ctx: &mut Ctx, y0: i32) {
     );
     ctx.dirty_dot(SettingKey::VideoViewDistance, x + bw + 6, y + 6);
 
-    let (x, y) = (lx, vy(2));
-    ctx.btn(
+    pair(
+        ctx,
+        2,
+        0,
+        WidgetId::VideoFullscreen,
+        SettingKey::DisplayFullscreen,
+        &format!(
+            "{}: {}",
+            tr(lang, "Fullscreen", "フルスクリーン"),
+            onoff(ctx.state.settings.fullscreen)
+        ),
+    );
+    let scale = if ctx.state.settings.gui_scale == 0 {
+        tr(lang, "Auto", "自動").to_string()
+    } else {
+        ctx.state.settings.gui_scale.to_string()
+    };
+    pair(
+        ctx,
+        2,
+        1,
+        WidgetId::VideoGuiScale,
+        SettingKey::DisplayGuiScale,
+        &format!("{}: {scale}", tr(lang, "GUI Scale", "GUIサイズ")),
+    );
+
+    pair(
+        ctx,
+        3,
+        0,
+        WidgetId::VideoGamma,
+        SettingKey::DisplayGamma,
+        &format!(
+            "{}: {}%",
+            tr(lang, "Brightness", "明るさ"),
+            ctx.state.settings.gamma_pct
+        ),
+    );
+    pair(
+        ctx,
+        3,
+        1,
+        WidgetId::VideoClouds,
+        SettingKey::VideoClouds,
+        &format!(
+            "{}: {}",
+            tr(lang, "Clouds", "雲"),
+            v.clouds.label(lang)
+        ),
+    );
+
+    pair(
+        ctx,
+        4,
+        0,
         WidgetId::VideoLod,
-        lr(x, y, bw, 20),
+        SettingKey::VideoLod,
         &format!("{}: {}", tr(lang, "Distant LOD", "遠景LOD"), v.lod.label()),
     );
-    ctx.dirty_dot(SettingKey::VideoLod, x + bw + 6, y + 6);
-
-    let (x, y) = (lx, vy(3));
-    ctx.btn(
+    pair(
+        ctx,
+        4,
+        1,
         WidgetId::VideoGpuBackend,
-        lr(x, y, bw, 20),
+        SettingKey::VideoGpuBackend,
         &format!(
             "{}: {}",
             tr(lang, "GPU Backend", "GPUバックエンド"),
             v.gpu_backend.label()
         ),
     );
-    ctx.dirty_dot(SettingKey::VideoGpuBackend, x + bw + 6, y + 6);
+
+    pair(
+        ctx,
+        5,
+        0,
+        WidgetId::VideoVsync,
+        SettingKey::VideoVsync,
+        &format!("VSync: {}", onoff(v.vsync)),
+    );
+    pair(
+        ctx,
+        5,
+        1,
+        WidgetId::VideoSmoothLighting,
+        SettingKey::VideoSmoothLighting,
+        &format!(
+            "{}: {}",
+            tr(lang, "Smooth Lighting", "スムースライティング"),
+            onoff(v.smooth_lighting)
+        ),
+    );
 
     // FPS cap: slider + custom numeric field on the same row (no overlap).
-    let (x, y) = (lx, vy(4));
+    let (x, y) = (lx, vy(6));
     let frac = v.fps_step_index() as f32 / (FPS_CAP_STEPS.len() - 1) as f32;
     ctx.slider(
         WidgetId::VideoFpsSlider,
@@ -1440,7 +1502,7 @@ fn video_tab(ctx: &mut Ctx, y0: i32) {
         );
     }
 
-    let (x, y) = (lx, vy(5));
+    let (x, y) = (lx, vy(7));
     let bg_label = if v.background_fps == 0 {
         tr(lang, "Off", "オフ").to_string()
     } else {
@@ -1456,26 +1518,6 @@ fn video_tab(ctx: &mut Ctx, y0: i32) {
         ),
     );
     ctx.dirty_dot(SettingKey::VideoBackgroundFps, x + bw + 6, y + 6);
-
-    let (x, y) = (lx, vy(6));
-    ctx.btn(
-        WidgetId::VideoVsync,
-        lr(x, y, bw, 20),
-        &format!("VSync: {}", onoff(v.vsync)),
-    );
-    ctx.dirty_dot(SettingKey::VideoVsync, x + bw + 6, y + 6);
-
-    let (x, y) = (lx, vy(7));
-    ctx.btn(
-        WidgetId::VideoSmoothLighting,
-        lr(x, y, bw, 20),
-        &format!(
-            "{}: {}",
-            tr(lang, "Smooth Lighting", "スムースライティング"),
-            onoff(v.smooth_lighting)
-        ),
-    );
-    ctx.dirty_dot(SettingKey::VideoSmoothLighting, x + bw + 6, y + 6);
 
     // Host-RAM cache budget: free 512-MiB slider steps from Auto (0) up
     // to the detected host total — no artificial ceiling. The runtime's
@@ -1494,20 +1536,27 @@ fn video_tab(ctx: &mut Ctx, y0: i32) {
     );
     ctx.dirty_dot(SettingKey::VideoRamBudget, x + bw + 6, y + 6);
 
-    // --- Lighting & shadow gameplay (right column) ---------------------
-    let lighting: [(WidgetId, SettingKey, &str, &str, bool); 6] = [
+    // --- Lighting & world-scoped toggles (right column) ----------------
+    let lighting: [(WidgetId, SettingKey, &str, &str, bool); 5] = [
+        (
+            WidgetId::VideoEntityShadows,
+            SettingKey::VideoEntityShadows,
+            "Shadows",
+            "影",
+            v.entity_shadows,
+        ),
         (
             WidgetId::VideoComfortExposure,
             SettingKey::VideoComfortExposure,
             "Eye-Comfort Exposure",
-            "まぶしさを抑制（ソフトグロー）",
+            "まぶしさを抑制",
             v.comfort_exposure,
         ),
         (
             WidgetId::VideoDynamicLights,
             SettingKey::VideoDynamicLights,
-            "Dynamic Lights (All & Mods)",
-            "動くライト（全Mod対応）",
+            "Dynamic Lights",
+            "動くライト",
             v.dynamic_lights,
         ),
         (
@@ -1524,20 +1573,6 @@ fn video_tab(ctx: &mut Ctx, y0: i32) {
             "間接バウンスライト",
             v.indirect_light_bounce,
         ),
-        (
-            WidgetId::VideoDirectionalShadowGameplay,
-            SettingKey::VideoDirectionalShadowGameplay,
-            "Shadow Light Gameplay (Local)",
-            "シャドウゲームプレイ（ローカル/ホスト）",
-            v.directional_shadow_gameplay,
-        ),
-        (
-            WidgetId::VideoLazyCatchupGameplay,
-            SettingKey::VideoLazyCatchupGameplay,
-            "Unloaded Catch-Up (Local)",
-            "チャンクローダー不要の追いつき（ローカル）",
-            v.lazy_catchup_gameplay,
-        ),
     ];
     ctx.text(rx, vy(0), 1, pal::ACCENT, tr(lang, "LIGHTING", "ライティング"));
     for (i, (id, key, en, ja, on)) in lighting.iter().enumerate() {
@@ -1549,50 +1584,83 @@ fn video_tab(ctx: &mut Ctx, y0: i32) {
         );
         ctx.dirty_dot(*key, x + bw + 6, y + 6);
     }
+    ctx.text(
+        rx,
+        vy(6),
+        1,
+        pal::ACCENT,
+        tr(lang, "WORLD (LOCAL)", "ワールド（ローカル）"),
+    );
+    let world: [(WidgetId, SettingKey, &str, &str, bool); 2] = [
+        (
+            WidgetId::VideoDirectionalShadowGameplay,
+            SettingKey::VideoDirectionalShadowGameplay,
+            "Shadow Light Gameplay",
+            "シャドウゲームプレイ",
+            v.directional_shadow_gameplay,
+        ),
+        (
+            WidgetId::VideoLazyCatchupGameplay,
+            SettingKey::VideoLazyCatchupGameplay,
+            "Unloaded Catch-Up",
+            "追いつき処理",
+            v.lazy_catchup_gameplay,
+        ),
+    ];
+    for (i, (id, key, en, ja, on)) in world.iter().enumerate() {
+        let (x, y) = (rx, vy(i as i32 + 7));
+        ctx.btn(
+            *id,
+            lr(x, y, bw, 20),
+            &format!("{}: {}", tr(lang, en, ja), onoff(*on)),
+        );
+        ctx.dirty_dot(*key, x + bw + 6, y + 6);
+    }
     // Scope hint for the opt-in gameplay toggles: local/hosted worlds
     // only — remote servers keep their own host settings.
     ctx.text(
         rx,
-        vy(7) + 2,
+        vy(9) + 2,
         1,
         pal::TEXT_DIM,
         tr(
             lang,
-            "Gameplay toggles: Singleplayer / Friends Host worlds; remote servers use host settings",
-            "ゲームプレイ設定はシングルプレイとフレンドホストのワールドのみ。リモートサーバーはホスト設定です",
+            "Local & Friends Host worlds only; remote servers use host settings",
+            "ローカル・フレンドホストのワールドのみ。リモートはホスト設定",
         ),
     );
 }
 
 fn controls_tab(ctx: &mut Ctx, y0: i32) {
-    const LABELS: [&str; 17] = [
-        "Forward",
-        "Back",
-        "Left",
-        "Right",
-        "Jump",
-        "Sneak",
-        "Sprint",
-        "Inventory",
-        "Drop",
-        "Swap Offhand",
-        "Chat",
-        "Command",
-        "Zoom",
-        "Camera Toggle",
-        "Fullscreen",
-        "Advancements",
-        "Sort Inventory",
+    let lang = ctx.lang;
+    const LABELS: [(&str, &str); 17] = [
+        ("Forward", "前進"),
+        ("Back", "後退"),
+        ("Left", "左"),
+        ("Right", "右"),
+        ("Jump", "ジャンプ"),
+        ("Sneak", "スニーク"),
+        ("Sprint", "ダッシュ"),
+        ("Inventory", "インベントリ"),
+        ("Drop", "ドロップ"),
+        ("Swap Offhand", "オフハンド切り替え"),
+        ("Chat", "チャット"),
+        ("Command", "コマンド"),
+        ("Zoom", "ズーム"),
+        ("Camera Toggle", "カメラ切り替え"),
+        ("Fullscreen", "フルスクリーン"),
+        ("Advancements", "進捗"),
+        ("Sort Inventory", "インベントリ整理"),
     ];
     let panel_x = (ctx.w - 340).max(4) / 2;
-    for (index, label) in LABELS.iter().enumerate() {
+    for (index, (en, ja)) in LABELS.iter().enumerate() {
         let column = (index / 9) as i32;
         let row_index = (index % 9) as i32;
         let x = panel_x + column * 174;
         let y = y0 + row_index * 22;
-        ctx.text(x, y + 4, 1, pal::TEXT, label);
+        ctx.text(x, y + 4, 1, pal::TEXT, tr(lang, en, ja));
         let binding = if ctx.state.capturing_key_binding == Some(index) {
-            "Press any key…"
+            tr(lang, "Press any key…", "キーを押してください…")
         } else {
             ctx.state.settings.keys.get(index).unwrap_or("-")
         };
@@ -1601,73 +1669,28 @@ fn controls_tab(ctx: &mut Ctx, y0: i32) {
 
     let y = y0 + 9 * 22;
     let left = panel_x;
-    let right = panel_x + 174;
-    ctx.btn(
-        WidgetId::VideoFullscreen,
-        lr(left, y, 168, 18),
-        &format!("Fullscreen: {}", onoff(ctx.state.settings.fullscreen)),
-    );
     ctx.btn(
         WidgetId::VideoInvertY,
-        lr(right, y, 168, 18),
-        &format!("Invert Y: {}", onoff(ctx.state.settings.mouse_invert_y)),
-    );
-    ctx.btn(
-        WidgetId::VideoGamma,
-        lr(left, y + 22, 168, 18),
-        &format!("Brightness: {}%", ctx.state.settings.gamma_pct),
-    );
-    let scale = if ctx.state.settings.gui_scale == 0 {
-        "Auto".to_owned()
-    } else {
-        ctx.state.settings.gui_scale.to_string()
-    };
-    ctx.btn(
-        WidgetId::VideoGuiScale,
-        lr(right, y + 22, 168, 18),
-        &format!("GUI Scale: {scale}"),
-    );
-    let toggles = [
-        ("Looking-at HUD", ctx.state.settings.qol_looking_at_hud),
-        ("Mouse tweaks", ctx.state.settings.qol_mouse_tweaks),
-        ("Inventory sort", ctx.state.settings.qol_inventory_sort),
-        (
-            "Zsh command suggestions",
-            ctx.state.settings.zsh_command_bar,
+        lr(left, y, 168, 18),
+        &format!(
+            "{}: {}",
+            tr(lang, "Invert Y", "Y軸反転"),
+            onoff(ctx.state.settings.mouse_invert_y)
         ),
-    ];
-    for (index, (label, enabled)) in toggles.into_iter().enumerate() {
-        let column = (index % 2) as i32;
-        let row_index = (index / 2) as i32;
-        ctx.btn(
-            WidgetId::QolBuiltin(index),
-            lr(left + column * 174, y + 48 + row_index * 22, 168, 18),
-            &format!("{label}: {}", onoff(enabled)),
-        );
-    }
-    let mini = &ctx.state.settings.qol.mini_hud;
-    let segments = [
-        ("FPS", mini.show_fps),
-        ("Coords", mini.show_coords),
-        ("Biome", mini.show_biome),
-        ("Facing", mini.show_facing),
-        ("Ping", mini.show_ping),
-        ("TPS/MSPT", mini.show_mspt_tps),
-        ("Light", mini.show_light_level),
-        ("Chunks", mini.show_chunks_entities),
-        ("Memory", mini.show_ram),
-    ];
-    for (index, (label, enabled)) in segments.into_iter().enumerate() {
-        let column = (index % 3) as i32;
-        let row_index = (index / 3) as i32;
-        ctx.btn(
-            WidgetId::MiniHudSegment(index),
-            lr(left + column * 116, y + 96 + row_index * 18, 112, 16),
-            &format!("{label}: {}", onoff(enabled)),
-        );
-    }
+    );
+    ctx.dirty_dot(SettingKey::DisplayInvertY, left + 174, y + 5);
     if ctx.state.capturing_key_binding.is_some() {
-        ctx.text(left, y + 96, 1, pal::ACCENT, "Press any key…  Esc cancels");
+        ctx.text(
+            left,
+            y + 26,
+            1,
+            pal::ACCENT,
+            tr(
+                lang,
+                "Press any key…  Esc cancels",
+                "キーを押してください… (Escでキャンセル)",
+            ),
+        );
     }
 }
 
@@ -1679,31 +1702,31 @@ fn audio_tab(ctx: &mut Ctx, y0: i32) {
         (
             WidgetId::AudioMaster,
             SettingKey::AudioMaster,
-            "Master Volume",
+            tr(lang, "Master Volume", "マスター音量"),
             a.master,
         ),
         (
             WidgetId::AudioMusic,
             SettingKey::AudioMusic,
-            "Music",
+            tr(lang, "Music", "BGM"),
             a.music,
         ),
         (
             WidgetId::AudioBlocks,
             SettingKey::AudioBlocks,
-            "Blocks",
+            tr(lang, "Blocks", "ブロック"),
             a.blocks,
         ),
         (
             WidgetId::AudioHostile,
             SettingKey::AudioHostile,
-            "Hostile Mobs",
+            tr(lang, "Hostile Mobs", "敵モブ"),
             a.hostile,
         ),
         (
             WidgetId::AudioFriendly,
             SettingKey::AudioFriendly,
-            "Friendly Mobs",
+            tr(lang, "Friendly Mobs", "友好モブ"),
             a.friendly,
         ),
         (
@@ -1715,7 +1738,7 @@ fn audio_tab(ctx: &mut Ctx, y0: i32) {
         (
             WidgetId::AudioMaxConcurrent,
             SettingKey::AudioMaxConcurrentSameSound,
-            "Same-Sound Coalescing",
+            tr(lang, "Same-Sound Limit", "重複音の制限"),
             a.max_concurrent_same_sound,
         ),
     ];
@@ -1958,6 +1981,85 @@ fn qol_tab(ctx: &mut Ctx, y0: i32) {
     );
     ctx.dirty_dot(SettingKey::QolShowSupportLinks, x + 326, qy(7) + (bh - 8) / 2);
 
+    // -- Built-in helper toggles (relocated from the Controls tab) ----
+    pair(
+        ctx,
+        8,
+        0,
+        WidgetId::QolBuiltin(0),
+        SettingKey::QolLookingAtHud,
+        &format!(
+            "{}: {}",
+            tr(lang, "Looking-at HUD", "注視HUD"),
+            onoff(ctx.state.settings.qol_looking_at_hud)
+        ),
+    );
+    pair(
+        ctx,
+        8,
+        1,
+        WidgetId::QolBuiltin(1),
+        SettingKey::QolMouseTweaks,
+        &format!(
+            "{}: {}",
+            tr(lang, "Mouse Tweaks", "マウス操作補助"),
+            onoff(ctx.state.settings.qol_mouse_tweaks)
+        ),
+    );
+    pair(
+        ctx,
+        9,
+        0,
+        WidgetId::QolBuiltin(2),
+        SettingKey::QolInventorySort,
+        &format!(
+            "{}: {}",
+            tr(lang, "Inventory Sort", "インベントリ整理"),
+            onoff(ctx.state.settings.qol_inventory_sort)
+        ),
+    );
+    pair(
+        ctx,
+        9,
+        1,
+        WidgetId::QolBuiltin(3),
+        SettingKey::ZshCommandBar,
+        &format!(
+            "{}: {}",
+            tr(lang, "Command Hints", "コマンド補完"),
+            onoff(ctx.state.settings.zsh_command_bar)
+        ),
+    );
+
+    // MiniHUD segment chips: only meaningful while MiniHUD itself is
+    // on — hidden (not greyed) when the preset is Off so the conflict
+    // table keeps its space.
+    let mini = &q.mini_hud;
+    let mut conflict_row = 10;
+    if mini.enabled {
+        let segments = [
+            ("FPS", mini.show_fps),
+            ("Coords", mini.show_coords),
+            ("Biome", mini.show_biome),
+            ("Facing", mini.show_facing),
+            ("Ping", mini.show_ping),
+            ("TPS/MSPT", mini.show_mspt_tps),
+            ("Light", mini.show_light_level),
+            ("Chunks", mini.show_chunks_entities),
+            ("Memory", mini.show_ram),
+        ];
+        for (index, (label, enabled)) in segments.iter().enumerate() {
+            let column = (index % 3) as i32;
+            let row_index = (index / 3) as i32;
+            ctx.btn(
+                WidgetId::MiniHudSegment(index),
+                lr(x + column * 108, qy(10 + row_index), 104, bh),
+                &format!("{label}: {}", onoff(*enabled)),
+            );
+        }
+        conflict_row = 13;
+    }
+
     // -- Controls: keybind conflict highlighting ---------------------
     let conflicts = crate::qol_helpers::detect_keybind_conflicts(&ctx.state.keybinds);
     let flagged = crate::qol_helpers::conflicted_bind_indices(&conflicts);
@@ -1966,7 +2068,7 @@ fn qol_tab(ctx: &mut Ctx, y0: i32) {
     // (red when a row collides more than once, amber otherwise), then
     // the unflagged table — two display-only columns clipped by the
     // footer band like every other row.
-    if qy(8) + 10 <= ctx.band_top {
+    if qy(conflict_row) + 10 <= ctx.band_top {
         let header = if conflicts.is_empty() {
             tr(lang, "Controls - no conflicts", "操作 — 重複なし").to_string()
         } else {
@@ -1979,7 +2081,7 @@ fn qol_tab(ctx: &mut Ctx, y0: i32) {
         };
         ctx.ctext(
             ctx.w / 2,
-            qy(10) + 2,
+            qy(conflict_row) + 2,
             1,
             if conflicts.is_empty() {
                 pal::ACCENT
@@ -1994,7 +2096,7 @@ fn qol_tab(ctx: &mut Ctx, y0: i32) {
         (0..ctx.state.keybinds.entries.len()).filter(|i| !flagged.contains(i)),
     );
     for (row_i, chunk) in order.chunks(2).enumerate() {
-        let y = qy(9) + row_i as i32 * 10;
+        let y = qy(conflict_row + 1) + row_i as i32 * 10;
         if y + 10 > ctx.band_top {
             break;
         }
@@ -2673,7 +2775,7 @@ fn mod_sync_prompt(ctx: &mut Ctx) {
     ctx.menu_background();
     let lang = ctx.lang;
     let cx = ctx.w / 2;
-    ctx.ctext(cx, 8, 2, pal::TEXT, tr(lang, "Mod mismatch", "Mod mismatch"));
+    ctx.ctext(cx, 8, 2, pal::TEXT, tr(lang, "Mod Mismatch", "Modの不一致"));
     ctx.hud_text(cx - 190, 30, 1, pal::TEXT_DIM, &ctx.state.mod_sync_prompt.server_address, 48);
     let pw = 400.min(ctx.w - 8).max(40);
     let px = cx - pw / 2;

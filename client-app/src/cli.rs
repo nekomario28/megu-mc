@@ -457,6 +457,17 @@ impl CliConfig {
     /// the `megu-client.toml` auto-load, kept separate so tests can
     /// point it at a scratch directory.
     pub fn resolve_client_settings_from(&mut self, auto_dir: &Path) -> Result<Vec<String>, String> {
+        self.resolve_client_settings_inner(auto_dir, None)
+    }
+
+    /// [`CliConfig::resolve_client_settings_from`] with an injectable
+    /// host probe: `Some(profile)` skips the live [`probe_host_hardware`]
+    /// call so tests stay deterministic.
+    fn resolve_client_settings_inner(
+        &mut self,
+        auto_dir: &Path,
+        hardware_profile: Option<crate::hardware_profile::HostHardwareProfile>,
+    ) -> Result<Vec<String>, String> {
         let mut warnings = Vec::new();
         let mut source_present = self.preset.is_some();
         let mut settings = self
@@ -464,19 +475,23 @@ impl CliConfig {
             .map(ClientSettings::from_preset)
             .unwrap_or_default();
 
-        // `--auto-tune` seeds the base from the probed host hardware BEFORE
-        // the settings file, the options.txt import, and explicit flags are
-        // overlaid, so every manual value always wins over the
-        // recommendation.
-        if self.auto_tune {
-            recommend_tuning(&probe_host_hardware()).apply_to(&mut settings);
-            source_present = true;
-        }
-
         let file_path = self.settings_path.clone().or_else(|| {
             let auto = auto_dir.join(SETTINGS_FILE_NAME);
             auto.is_file().then_some(auto)
         });
+
+        // `--auto-tune` — and any true first launch with no user TOML or
+        // `--preset` base — seeds the base from the probed host hardware
+        // BEFORE the settings file, the options.txt import, and explicit
+        // flags are overlaid, so every manual value always wins over the
+        // recommendation. An existing `megu-client.toml` suppresses the
+        // automatic seed entirely; it is never rewritten.
+        if self.auto_tune || (file_path.is_none() && self.preset.is_none()) {
+            let profile = hardware_profile.unwrap_or_else(probe_host_hardware);
+            recommend_tuning(&profile).apply_to(&mut settings);
+            source_present = true;
+        }
+
         if let Some(path) = file_path {
             match std::fs::read_to_string(&path) {
                 Ok(text) => {
@@ -1372,20 +1387,81 @@ mod tests {
     }
 
     #[test]
-    fn missing_settings_file_defaults_silently() {
+    fn missing_settings_file_seeds_hardware_tuning() {
         let dir = scratch_dir("no-file");
         let mut cfg = parse_args::<&str>(&[]).unwrap();
         let warnings = cfg.resolve_client_settings_from(&dir).unwrap();
         assert!(warnings.is_empty());
-        assert_eq!(cfg.client_settings, ClientSettings::default());
-        // No source => the session default view distance is untouched.
-        assert_eq!(cfg.view_distance, 2);
-        assert!(!cfg.settings_source_present);
+        // First launch: no user TOML anywhere => the probed hardware
+        // recommendation seeds the base. On every host the plan marks
+        // the preset `Fast` (lean) or `Custom` (tuned), never the
+        // `Balanced` stock default.
+        assert_ne!(cfg.client_settings.preset, QualityPreset::Balanced);
+        assert_eq!(cfg.view_distance, cfg.client_settings.view_distance as i8);
+        assert!(cfg.settings_source_present);
 
         // An explicitly named file that does not exist is a hard error.
         let mut cfg = parse_args(&["--settings", "definitely-missing.toml"]).unwrap();
         let err = cfg.resolve_client_settings_from(&dir).unwrap_err();
         assert!(err.contains("cannot read"), "unexpected error: {err}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn first_launch_lean_profile_seeds_fast_defaults() {
+        use crate::hardware_profile::{GpuVendorClass, HostHardwareProfile};
+        // Integrated legacy GPU + 4 GiB: the lean tier.
+        let lean = HostHardwareProfile {
+            logical_cpus: 4,
+            l3_cache_kib: 0,
+            total_ram_mib: 4 * 1024,
+            gpu_class: GpuVendorClass::IntelLegacyIntegrated,
+            estimated_vram_mib: 0,
+            shared_system_ram: true,
+        };
+
+        // No user config anywhere -> the lean plan seeds the `Fast`
+        // preset's light defaults.
+        let dir = scratch_dir("first-launch-lean");
+        let mut cfg = parse_args::<&str>(&[]).unwrap();
+        cfg.resolve_client_settings_inner(&dir, Some(lean)).unwrap();
+        let s = &cfg.client_settings;
+        assert_eq!(s.preset, QualityPreset::Fast);
+        assert!(!s.entity_shadows);
+        assert_eq!(s.clouds, CloudMode::Fast);
+        assert!(!s.smooth_lighting);
+        assert_eq!(s.gpu_backend, RenderBackendPreference::ClassicLowSpec);
+        assert!(s.view_distance <= 8);
+        let _ = std::fs::remove_dir_all(&dir);
+
+        // An existing user TOML suppresses the auto-seed entirely — its
+        // keys win over both the recommendation and the stock defaults,
+        // and keys it does not define keep the `Balanced` defaults.
+        let dir = scratch_dir("first-launch-toml");
+        write_file(
+            &dir,
+            SETTINGS_FILE_NAME,
+            "view_distance = 20\nentity_shadows = false\n",
+        );
+        let mut cfg = parse_args::<&str>(&[]).unwrap();
+        cfg.resolve_client_settings_inner(&dir, Some(lean)).unwrap();
+        let s = &cfg.client_settings;
+        assert_eq!(s.view_distance, 20);
+        assert!(!s.entity_shadows);
+        assert_eq!(s.clouds, CloudMode::Fancy);
+        assert!(s.smooth_lighting);
+        let _ = std::fs::remove_dir_all(&dir);
+
+        // `--auto-tune` still seeds UNDER an existing TOML: the file's
+        // keys override the recommendation wherever it speaks.
+        let dir = scratch_dir("auto-tune-under-file");
+        write_file(&dir, SETTINGS_FILE_NAME, "view_distance = 20\n");
+        let mut cfg = parse_args(&["--auto-tune"]).unwrap();
+        cfg.resolve_client_settings_inner(&dir, Some(lean)).unwrap();
+        let s = &cfg.client_settings;
+        assert_eq!(s.view_distance, 20);
+        assert!(!s.entity_shadows);
+        assert_eq!(s.clouds, CloudMode::Fast);
         let _ = std::fs::remove_dir_all(&dir);
     }
 

@@ -152,16 +152,34 @@ pub struct HardwareTuningPlan {
     pub lod_radius_chunks: u16,
     /// Dirty-section rebuilds allowed per frame.
     pub max_rebuilds_per_frame: u8,
+    /// Suggested quality preset: `Fast` on lean hosts (integrated GPUs,
+    /// tile-based parts, or under 8 GiB RAM), `Custom` elsewhere — the
+    /// tuned mix itself is never expressible as a stock preset.
+    pub quality_preset: QualityPreset,
     /// Opt-in local translation-model tier.
     pub local_llm: LocalLlmRecommendation,
 }
 
 impl HardwareTuningPlan {
     /// Seed `settings` with this plan's player-visible fields
-    /// (`gpu_backend`, `view_distance`, `distant_horizon`) and mark the
-    /// preset `Custom`. Apply *before* any TOML/options.txt/CLI overlay so
-    /// explicit user values always win over the recommendation.
+    /// (`gpu_backend`, `view_distance`, `distant_horizon`, the quality
+    /// preset and its visual profile). Apply *before* any
+    /// TOML/options.txt/CLI overlay so explicit user values always win
+    /// over the recommendation.
     pub fn apply_to(&self, settings: &mut ClientSettings) {
+        if self.quality_preset != QualityPreset::Custom {
+            // Lean tier: seed the whole `Fast` visual profile so clouds,
+            // particles, smooth lighting and entity shadows agree with
+            // the preset the UI will display.
+            let base = ClientSettings::from_preset(self.quality_preset);
+            settings.preset = self.quality_preset;
+            settings.clouds = base.clouds;
+            settings.particles = base.particles;
+            settings.smooth_lighting = base.smooth_lighting;
+            settings.entity_shadows = base.entity_shadows;
+        } else {
+            settings.preset = QualityPreset::Custom;
+        }
         settings.gpu_backend = self.gpu_backend;
         settings.view_distance = self
             .view_distance
@@ -173,7 +191,6 @@ impl HardwareTuningPlan {
         } else {
             DistantHorizon::Far
         };
-        settings.preset = QualityPreset::Custom;
     }
 }
 
@@ -855,6 +872,26 @@ pub fn recommend_tuning(hw: &HostHardwareProfile) -> HardwareTuningPlan {
         max_rebuilds_per_frame = max_rebuilds_per_frame.min(2);
     }
 
+    // Lean tier: integrated/tile-based parts and RAM-starved hosts get
+    // the `Fast` preset's light visual profile (`entity_shadows` off,
+    // `Fast` clouds, no smooth lighting). Apple Silicon and dedicated
+    // cards — and genuinely unknown hardware — keep the richer default;
+    // `0` RAM (unprobed host) stays conservative like the RAM clamps.
+    let lean = matches!(
+        hw.gpu_class,
+        GpuVendorClass::NoneSoftware
+            | GpuVendorClass::IntelLegacyIntegrated
+            | GpuVendorClass::IntelModernIntegrated
+            | GpuVendorClass::QualcommAdreno
+            | GpuVendorClass::ArmMali
+            | GpuVendorClass::BroadcomVideocore
+    ) || hw.total_ram_mib < 8 * GIB_MIB;
+    let quality_preset = if lean {
+        QualityPreset::Fast
+    } else {
+        QualityPreset::Custom
+    };
+
     HardwareTuningPlan {
         gpu_backend,
         worker_threads: recommend_worker_threads(hw.logical_cpus),
@@ -862,6 +899,7 @@ pub fn recommend_tuning(hw: &HostHardwareProfile) -> HardwareTuningPlan {
         view_distance,
         lod_radius_chunks,
         max_rebuilds_per_frame,
+        quality_preset,
         local_llm: recommend_llm_tier(hw),
     }
 }

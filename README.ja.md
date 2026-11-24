@@ -4,7 +4,7 @@
   <p><strong>Minecraft: Java Edition 1.21.1 向け クリーンルーム Rust サーバー＆ネイティブ GPU クライアント（Vulkan / DX12 / Metal）</strong></p>
   <p>
     <a href="https://github.com/nekomario28/megu-mc/releases"><img src="https://img.shields.io/github/v/release/nekomario28/megu-mc?include_prereleases&label=release&color=e05d44" alt="Latest Release"></a>
-    <a href="https://megu.megumin.tech/"><img src="https://img.shields.io/badge/minecraft-1.21.1%20(Protocol%20767)-2ea44f" alt="Minecraft 1.21.1"></a>
+    <a href="https://megu.megumin.tech/"><img src="https://img.shields.io/badge/minecraft-1.21.1-2ea44f" alt="Minecraft 1.21.1"></a>
     <a href="LICENSE"><img src="https://img.shields.io/badge/license-LGPL--3.0--or--later-blue" alt="License: LGPL-3.0-or-later"></a>
     <a href="https://github.com/sponsors/nekomario28"><img src="https://img.shields.io/github/sponsors/nekomario28?label=Sponsors&color=db61a2" alt="GitHub Sponsors"></a>
   </p>

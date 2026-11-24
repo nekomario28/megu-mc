@@ -355,7 +355,7 @@ fn title_links_respect_support_preference_and_report_is_always_accessible() {
             .commands
             .iter()
             .find_map(|cmd| match cmd {
-                UiCommand::Text { y, text, .. } if text.starts_with("megu client-ui") => Some(*y),
+                UiCommand::Text { y, text, .. } if text.starts_with("Megu 1.") => Some(*y),
                 _ => None,
             })
             .expect("version label");
