@@ -1477,6 +1477,23 @@ fn video_tab(ctx: &mut Ctx, y0: i32) {
     );
     ctx.dirty_dot(SettingKey::VideoSmoothLighting, x + bw + 6, y + 6);
 
+    // Host-RAM cache budget: free 512-MiB slider steps from Auto (0) up
+    // to the detected host total — no artificial ceiling. The runtime's
+    // live OOM guard trims distant caches early when the OS runs low, so
+    // even a maxed-out cap can never get the process killed.
+    let (x, y) = (lx, vy(8));
+    ctx.slider(
+        WidgetId::VideoRamBudget,
+        lr(x, y, bw, 20),
+        v.ram_budget_frac(),
+        &format!(
+            "{}: {}",
+            tr(lang, "Host RAM Budget", "ホストRAM上限"),
+            v.ram_budget_label(lang)
+        ),
+    );
+    ctx.dirty_dot(SettingKey::VideoRamBudget, x + bw + 6, y + 6);
+
     // --- Lighting & shadow gameplay (right column) ---------------------
     let lighting: [(WidgetId, SettingKey, &str, &str, bool); 6] = [
         (
@@ -1692,7 +1709,7 @@ fn audio_tab(ctx: &mut Ctx, y0: i32) {
         (
             WidgetId::AudioMaxVolumeCap,
             SettingKey::AudioMaxVolumeCap,
-            "Max-Volume Limiter",
+            tr(lang, "Loud Sound Limiter", "音量ガード"),
             a.max_volume_cap,
         ),
         (
@@ -1711,6 +1728,10 @@ fn audio_tab(ctx: &mut Ctx, y0: i32) {
         };
         let label = if *id == WidgetId::AudioMaxConcurrent {
             format!("{name}: {val}/tick")
+        } else if *id == WidgetId::AudioMaxVolumeCap {
+            // Intuitive dB readout (OFF/Muted/Gentle/Medium/Strong)
+            // instead of a bare percent.
+            format!("{name}: {}", a.max_volume_cap_label(lang))
         } else {
             format!("{name}: {val}%")
         };

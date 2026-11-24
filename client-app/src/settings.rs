@@ -563,6 +563,13 @@ pub struct ClientSettings {
     /// throttling entirely, `1..=240` caps background frames. Defaults to
     /// [`DEFAULT_BACKGROUND_FPS_LIMIT`].
     pub background_fps_limit: u16,
+    /// Free host-RAM cache budget in MiB (`ram_budget_mib`): `0` = Auto
+    /// lets the runtime pick a sane share of the detected host RAM;
+    /// `> 0` caps how much RAM the chunk/asset caches may hold. The live
+    /// OOM guard trims distant caches early whenever host available RAM
+    /// drops low, so a high cap can never get the process OOM-killed —
+    /// the budget never pre-allocates anything.
+    pub ram_budget_mib: u32,
     /// GPU pipeline selection: `auto` negotiates from hardware
     /// capabilities, `classic-low-spec` pins the minimal-hardware path for
     /// legacy Intel integrated GPUs (pure wgpu Vulkan 1.1 / DX12 / Metal core).
@@ -653,6 +660,7 @@ impl ClientSettings {
             vsync: true,
             max_fps: None,
             background_fps_limit: DEFAULT_BACKGROUND_FPS_LIMIT,
+            ram_budget_mib: 0,
             gpu_backend: RenderBackendPreference::Auto,
             shader_pack: None,
             shaders_enabled: false,
@@ -794,6 +802,7 @@ impl ClientSettings {
              vsync = {}\n\
              max_fps = {}\n\
              background_fps_limit = {}\n\
+             ram_budget_mib = {}\n\
              gpu_backend = \"{}\"\n\
              fullscreen = {}\n\
              mouse_invert_y = {}\n\
@@ -850,6 +859,7 @@ impl ClientSettings {
             self.vsync,
             max_fps,
             self.background_fps_limit,
+            self.ram_budget_mib,
             self.gpu_backend.as_str(),
             self.fullscreen,
             self.mouse_invert_y,
@@ -949,6 +959,7 @@ impl ClientSettings {
                 "background_fps_limit" => {
                     self.background_fps_limit = parsed.background_fps_limit;
                 }
+                "ram_budget_mib" => self.ram_budget_mib = parsed.ram_budget_mib,
                 "gpu_backend" => self.gpu_backend = parsed.gpu_backend,
                 "fullscreen" => self.fullscreen = parsed.fullscreen,
                 "mouse_invert_y" => self.mouse_invert_y = parsed.mouse_invert_y,
@@ -1308,6 +1319,17 @@ impl ClientSettings {
                             clamp_i64(v, 0, i64::from(MAX_BACKGROUND_FPS), key, &mut warnings)
                                 as u16;
                         seen.push("background_fps_limit");
+                    }
+                    Err(_) => invalid(&mut warnings),
+                },
+                "ram_budget_mib" => match value.parse::<i64>() {
+                    Ok(v) => {
+                        // `0` = Auto; anything above clamps to u32::MAX —
+                        // the live OOM guard, not this cap, is the real
+                        // protection against host memory exhaustion.
+                        settings.ram_budget_mib =
+                            clamp_u32(v, 0, i64::from(u32::MAX), key, &mut warnings);
+                        seen.push("ram_budget_mib");
                     }
                     Err(_) => invalid(&mut warnings),
                 },
@@ -2043,6 +2065,7 @@ mod tests {
             vsync: false,
             max_fps: Some(144),
             background_fps_limit: 45,
+            ram_budget_mib: 6144,
             gpu_backend: RenderBackendPreference::ClassicLowSpec,
             shader_pack: Some("shaderpacks/Complementary.zip".to_owned()),
             shaders_enabled: true,
@@ -2160,6 +2183,25 @@ mod tests {
         let (parsed, warnings) = ClientSettings::from_toml("[qol]\nauto_reconnect = \"yes\"\n");
         assert!(!parsed.seamless_qol.auto_reconnect);
         assert!(!warnings.is_empty());
+    }
+
+    #[test]
+    fn ram_budget_mib_defaults_auto_and_overlays_cleanly() {
+        // Files written before the key existed stay valid and read Auto.
+        let (s, warnings) = ClientSettings::from_toml("view_distance = 20\n");
+        assert_eq!(s.ram_budget_mib, 0);
+        assert!(warnings.is_empty());
+
+        // Explicit budgets parse, clamp, and overlay via apply_toml.
+        let (s, warnings) = ClientSettings::from_toml("ram_budget_mib = 4096\n");
+        assert_eq!(s.ram_budget_mib, 4096);
+        assert!(warnings.is_empty(), "{warnings:?}");
+        let (s, warnings) = ClientSettings::from_toml("ram_budget_mib = -4\n");
+        assert_eq!(s.ram_budget_mib, 0);
+        assert!(!warnings.is_empty());
+        let mut s = ClientSettings::default();
+        s.apply_toml("ram_budget_mib = 2048\n");
+        assert_eq!(s.ram_budget_mib, 2048);
     }
 
     #[test]

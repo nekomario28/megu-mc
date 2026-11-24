@@ -50,6 +50,7 @@ use megu_client_mesh::vanilla_plus_3d::{ExtrudedMesh, ExtrudedQuad};
 use megu_client_mesh::vanilla_plus_nature::{NatureParticle, NatureParticleKind};
 use megu_client_mesh::vfx_engine::{ParticleDraw, ParticleOrientation, VfxFrameOutput};
 use megu_core::hash::{FNV1A64_OFFSET_BASIS, FNV1A64_PRIME, Fnv1a64};
+use megu_core::sys_metrics::{CpuSampler, HostMetricsSnapshot, sample_host_metrics};
 use megu_kernel::debug_chords::{
     DebugChordAction, DebugChordContext, DebugChordState, DebugTarget, F3Chord, PlayerDebugInfo,
     finish_gamemode_switcher, handle_f3_chord,
@@ -845,6 +846,13 @@ pub struct GpuApp {
     /// Renderer upload budget captured at init; `TrimRebuilds` swaps in a
     /// 1-section / 32 KiB cap and `Full` restores this baseline.
     baseline_upload_budget: Option<ChunkUploadBudget>,
+    /// Throttled host-RAM probe feeding the live OOM guard
+    /// (`UiSettings.video.ram_budget_mib`): `sample_host_metrics` is
+    /// fail-safe — unsupported platforms simply report `None` fields
+    /// and the guard idles.
+    host_ram_probe: CpuSampler,
+    /// Frame-time accumulator gating the ~2 Hz host-metrics resample.
+    host_ram_sample_accum_ms: f32,
     /// Latest F3 diagnostic string and when it was built — refreshed at
     /// most every `F3_REFRESH` so steady frames never re-format it.
     f3_text: Option<(String, Instant)>,
@@ -929,6 +937,65 @@ impl Default for LiveEntityRenderCache {
             next_refresh: None,
             staged: false,
         }
+    }
+}
+
+/// Milliseconds between host-RAM guard samples (~2 Hz — cheap enough to
+/// ride the frame accumulator, fast enough to beat the OOM killer).
+const HOST_RAM_GUARD_INTERVAL_MS: f32 = 500.0;
+
+/// Host-memory pressure verdict for one [`HostMetricsSnapshot`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum HostRamPressure {
+    /// Comfortable headroom: no shedding.
+    Clear,
+    /// Available RAM under the reserve floor, or the process RSS over
+    /// its budget: shed the `>view_distance+2` chunk fringe.
+    Trim,
+    /// Available RAM under half the reserve (or a 256 MiB absolute
+    /// floor): pull the keep radius in so only the immediate surround
+    /// stays resident.
+    Emergency,
+}
+
+/// Classify one host snapshot against the RAM budget. `budget_mib == 0`
+/// is Auto: the runtime's sane share is a quarter of host RAM clamped
+/// to `[1 GiB, 8 GiB]`. The guard never pre-allocates and never trusts
+/// the cap — pressure is judged on *available* host RAM plus the
+/// process RSS, so a user who slides the cap to the host total still
+/// gets protection.
+fn host_ram_pressure(
+    snap: &HostMetricsSnapshot,
+    budget_mib: u32,
+    host_total_mib: u32,
+) -> HostRamPressure {
+    let Some(available) = snap.mem_available_mib else {
+        return HostRamPressure::Clear;
+    };
+    let total_mib = snap
+        .mem_total_mib
+        .map(|mib| mib.min(u64::from(u32::MAX)))
+        .unwrap_or(u64::from(host_total_mib.max(1)));
+    // Proportional reserve: 10% of host RAM clamped to [512 MiB, 4 GiB]
+    // — small machines keep a real floor, big ones are not forced to
+    // hold tens of GiB idle.
+    let reserve_mib = (total_mib / 10).clamp(512, 4096);
+    if available < 256 || available * 2 < reserve_mib {
+        return HostRamPressure::Emergency;
+    }
+    let budget_mib = if budget_mib == 0 {
+        // Auto share: quarter of host RAM, clamped to a sane band.
+        (total_mib / 4).clamp(1024, 8192).min(u64::from(u32::MAX)) as u32
+    } else {
+        budget_mib
+    };
+    let rss_over_budget = snap
+        .process_rss_mib
+        .is_some_and(|rss| rss > u64::from(budget_mib));
+    if available < reserve_mib || rss_over_budget {
+        HostRamPressure::Trim
+    } else {
+        HostRamPressure::Clear
     }
 }
 
@@ -1114,6 +1181,8 @@ impl GpuApp {
             user_shadow_quality: BuiltinShadowQuality::Off,
             user_render_scale: RenderScalePreset::Native100,
             baseline_upload_budget: None,
+            host_ram_probe: CpuSampler::new(),
+            host_ram_sample_accum_ms: 0.0,
             f3_text: None,
             pending_mouse_delta: (0.0, 0.0),
             last_subworld_helm: None,
@@ -4444,6 +4513,11 @@ impl GpuApp {
             self.seamless_portal
                 .set_current_atmosphere(atmo.sky_horizon_rgb, atmo.fog_rgb);
         }
+        // Live OOM guard (`ram_budget_mib`): ~2 Hz host-RAM resample that
+        // sheds distant chunk columns early when the OS runs low — runs
+        // even while occluded so a minimized client still protects
+        // itself, and never pre-allocates anything.
+        self.poll_host_ram_guard(dt * 1000.0);
         // Forward this frame's drained MSP1 payloads into the seamless
         // dimension-transfer state machine so live server prefetch hints
         // and commit transfers drive the zero-loading-screen crossfade.
@@ -5129,6 +5203,50 @@ impl GpuApp {
             }
         }
         self.apply_governor_stage(stage);
+    }
+
+    /// Live OOM guard driven by the `ram_budget_mib` setting: resample
+    /// host memory at ~2 Hz and, when available RAM drops under the
+    /// reserve floor (or the process outgrows its budget), shed distant
+    /// chunk columns early — RAM-only eviction, chunks re-stream on
+    /// demand — so the kernel OOM killer never picks Megu even when the
+    /// user slides the cap to the host total.
+    fn poll_host_ram_guard(&mut self, dt_ms: f32) {
+        self.host_ram_sample_accum_ms += dt_ms.max(0.0);
+        if self.host_ram_sample_accum_ms < HOST_RAM_GUARD_INTERVAL_MS {
+            return;
+        }
+        self.host_ram_sample_accum_ms = 0.0;
+        let snap = sample_host_metrics(&mut self.host_ram_probe);
+        let budget_mib = self.ui.settings.video.ram_budget_mib;
+        let host_total_mib = self.ui.settings.video.host_total_ram_mib;
+        let pressure = host_ram_pressure(&snap, budget_mib, host_total_mib);
+        if pressure == HostRamPressure::Clear {
+            return;
+        }
+        let Some(live) = self.live.as_mut() else {
+            return;
+        };
+        let center_x = (self.camera.position[0] / 16.0).floor() as i32;
+        let center_z = (self.camera.position[2] / 16.0).floor() as i32;
+        let view = i32::from(live.client_view_distance.clamp(6, 32));
+        // Normal pressure sheds only the `>view_distance+2` fringe (the
+        // same hysteresis band vanilla keeps); emergency pressure pulls
+        // the keep radius in a few chunks so the nearest surround stays.
+        let effective_view = if pressure == HostRamPressure::Emergency {
+            view.saturating_sub(4).max(2)
+        } else {
+            view
+        };
+        live.world
+            .evict_far_chunks(center_x, center_z, effective_view);
+        if pressure == HostRamPressure::Emergency {
+            // CPU-side mesh copies VRAM already owns are the cheapest
+            // RAM to give back under real duress.
+            if let Some(active) = self.active.as_mut() {
+                live.release_uploaded_cpu_copies(&mut active.renderer);
+            }
+        }
     }
 
     /// Apply the governor's throttle stage live: `Full` restores the
@@ -6337,6 +6455,10 @@ fn apply_client_settings_to_ui(src: &ClientSettings, ui: &mut UiSettings) {
     ui.video.indirect_light_bounce = src.indirect_light_bounce;
     ui.video.directional_shadow_gameplay = src.directional_shadow_gameplay;
     ui.video.lazy_catchup_gameplay = src.lazy_catchup_gameplay;
+    ui.video.ram_budget_mib = src.ram_budget_mib;
+    // Refresh the detected host-RAM bound so the budget slider always
+    // reflects the real machine, not a stale boot-time probe.
+    ui.video.host_total_ram_mib = megu_ui::state::detect_host_total_ram_mib();
     ui.audio.master = src.volume_master;
     ui.audio.music = src.volume_music;
     ui.audio.blocks = src.volume_blocks;
@@ -6539,6 +6661,7 @@ fn ui_to_client_settings(ui: &UiSettings, base: &ClientSettings) -> ClientSettin
     out.indirect_light_bounce = ui.video.indirect_light_bounce;
     out.directional_shadow_gameplay = ui.video.directional_shadow_gameplay;
     out.lazy_catchup_gameplay = ui.video.lazy_catchup_gameplay;
+    out.ram_budget_mib = ui.video.ram_budget_mib;
     out.volume_master = ui.audio.master;
     out.volume_music = ui.audio.music;
     out.volume_blocks = ui.audio.blocks;
@@ -7572,6 +7695,62 @@ mod tests {
             app.status_messages()
                 .iter()
                 .any(|m| m.contains("Singleplayer"))
+        );
+    }
+
+    #[test]
+    fn host_ram_pressure_trims_on_low_available_and_ignores_missing_data() {
+        let snap = |total: Option<u64>, avail: Option<u64>, rss: Option<u64>| {
+            HostMetricsSnapshot {
+                mem_total_mib: total,
+                mem_available_mib: avail,
+                process_rss_mib: rss,
+                ..HostMetricsSnapshot::default()
+            }
+        };
+        // No memory data at all -> the guard idles (fail-safe).
+        assert_eq!(
+            host_ram_pressure(&HostMetricsSnapshot::default(), 0, 8192),
+            HostRamPressure::Clear
+        );
+        // Comfortable headroom on an 8 GiB host -> Clear.
+        assert_eq!(
+            host_ram_pressure(&snap(Some(8192), Some(6000), Some(1500)), 0, 8192),
+            HostRamPressure::Clear
+        );
+        // Available under the 10% reserve (800 MiB) -> Trim.
+        assert_eq!(
+            host_ram_pressure(&snap(Some(8192), Some(700), Some(1500)), 0, 8192),
+            HostRamPressure::Trim
+        );
+        // Under half the reserve (or the 256 MiB floor) -> Emergency,
+        // even with a huge user cap — the cap never disables the guard.
+        assert_eq!(
+            host_ram_pressure(&snap(Some(8192), Some(300), Some(1500)), u32::MAX, 8192),
+            HostRamPressure::Emergency
+        );
+        assert_eq!(
+            host_ram_pressure(&snap(Some(8192), Some(200), Some(1500)), 0, 8192),
+            HostRamPressure::Emergency
+        );
+        // Auto budget = total/4 clamped [1 GiB, 8 GiB]: RSS over it -> Trim.
+        assert_eq!(
+            host_ram_pressure(&snap(Some(8192), Some(6000), Some(3000)), 0, 8192),
+            HostRamPressure::Trim
+        );
+        // A user cap above the Auto share trims sooner; below it, later.
+        assert_eq!(
+            host_ram_pressure(&snap(Some(8192), Some(6000), Some(2500)), 2048, 8192),
+            HostRamPressure::Trim
+        );
+        assert_eq!(
+            host_ram_pressure(&snap(Some(8192), Some(6000), Some(2500)), 4096, 8192),
+            HostRamPressure::Clear
+        );
+        // Missing total falls back to the UI-detected host total.
+        assert_eq!(
+            host_ram_pressure(&snap(None, Some(6000), Some(9000)), 0, 8192),
+            HostRamPressure::Trim
         );
     }
 

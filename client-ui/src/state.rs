@@ -25,7 +25,7 @@
 
 use megu_core::crash_report::CrashContext;
 use megu_core::i18n::{ALL_BUILTIN_LOCALES, BuiltinLocale, I18nCatalog, UiTextKey};
-use megu_core::sys_metrics::{MiniHudConfig, MiniHudData};
+use megu_core::sys_metrics::{CpuSampler, MiniHudConfig, MiniHudData, sample_host_metrics};
 
 use crate::draw::UiRect;
 use crate::layout;
@@ -327,6 +327,26 @@ pub const MAX_CHAT_HISTORY: usize = 5000;
 /// Sound-coalescing cap bounds.
 pub const MIN_CONCURRENT_SAME_SOUND: u8 = 1;
 pub const MAX_CONCURRENT_SAME_SOUND: u8 = 32;
+/// Host-RAM cache-budget slider step (MiB). `0` on the setting is `Auto`;
+/// every other stop adds one step up to the detected host total — there
+/// is deliberately no artificial ceiling below it.
+pub const RAM_BUDGET_STEP_MIB: u32 = 512;
+/// Fallback total host RAM (MiB) when `megu_core::sys_metrics` cannot
+/// detect it (tests, unknown platforms).
+pub const DEFAULT_HOST_TOTAL_RAM_MIB: u32 = 8192;
+
+/// Total host RAM in MiB via `megu_core::sys_metrics`, falling back to
+/// [`DEFAULT_HOST_TOTAL_RAM_MIB`] when the platform probe reports
+/// nothing. The probe is fail-safe: it never panics and simply yields
+/// `None` fields on unsupported platforms.
+pub fn detect_host_total_ram_mib() -> u32 {
+    let mut probe = CpuSampler::new();
+    sample_host_metrics(&mut probe)
+        .mem_total_mib
+        .and_then(|mib| u32::try_from(mib).ok())
+        .filter(|&mib| mib > 0)
+        .unwrap_or(DEFAULT_HOST_TOTAL_RAM_MIB)
+}
 
 /// Video settings page state.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -363,6 +383,18 @@ pub struct VideoSettings {
     /// chunk stays unloaded). Remote servers keep their host settings.
     /// Default `false`.
     pub lazy_catchup_gameplay: bool,
+    /// Free host-RAM cache budget in MiB (`ram_budget_mib`): `0` = Auto
+    /// lets the runtime pick a sane share of the detected host RAM;
+    /// `> 0` caps how much RAM the chunk/asset caches may hold. The live
+    /// OOM guard trims distant caches early whenever host available RAM
+    /// drops low, so a high cap can never get the process OOM-killed —
+    /// the budget never pre-allocates anything.
+    pub ram_budget_mib: u32,
+    /// Detected total host RAM in MiB — populated from
+    /// [`detect_host_total_ram_mib`] ([`DEFAULT_HOST_TOTAL_RAM_MIB`]
+    /// fallback). Bounds the [`Self::ram_budget_mib`] slider; not a
+    /// persisted setting.
+    pub host_total_ram_mib: u32,
 }
 
 impl Default for VideoSettings {
@@ -382,6 +414,8 @@ impl Default for VideoSettings {
             indirect_light_bounce: true,
             directional_shadow_gameplay: false,
             lazy_catchup_gameplay: false,
+            ram_budget_mib: 0,
+            host_total_ram_mib: detect_host_total_ram_mib(),
         }
     }
 }
@@ -415,6 +449,66 @@ impl VideoSettings {
             self.fps_cap.to_string()
         }
     }
+
+    /// Slider fraction `0.0..=1.0` for [`Self::ram_budget_mib`]: `0`
+    /// (Auto) sits at the left edge, the detected host total at `1.0`.
+    pub fn ram_budget_frac(&self) -> f32 {
+        let host = self.host_total_ram_mib.max(1) as f32;
+        (self.ram_budget_mib as f32 / host).clamp(0.0, 1.0)
+    }
+
+    /// Snap a slider fraction `0.0..=1.0` onto the
+    /// [`RAM_BUDGET_STEP_MIB`] stop grid (`0` stays Auto); the result is
+    /// clamped to `0..=host_total_ram_mib`.
+    pub fn set_ram_budget_frac(&mut self, frac: f32) {
+        let host = self.host_total_ram_mib.max(1);
+        let raw = (frac.clamp(0.0, 1.0) * host as f32).round() as u32;
+        let steps = (f64::from(raw) / f64::from(RAM_BUDGET_STEP_MIB)).round() as u32;
+        self.ram_budget_mib = steps
+            .saturating_mul(RAM_BUDGET_STEP_MIB)
+            .min(host);
+    }
+
+    /// Arrow-key/click step for [`Self::ram_budget_mib`]: `dir` moves one
+    /// [`RAM_BUDGET_STEP_MIB`] stop; `0` (Auto) is the bottom stop and
+    /// the detected host total the top one.
+    pub fn ram_budget_step(&self, dir: i32) -> u32 {
+        let host = self.host_total_ram_mib.max(1);
+        let max_index = i64::from(host.div_ceil(RAM_BUDGET_STEP_MIB));
+        let index = if self.ram_budget_mib == 0 {
+            0
+        } else {
+            i64::from(self.ram_budget_mib.div_ceil(RAM_BUDGET_STEP_MIB))
+        };
+        let next = (index + i64::from(dir)).clamp(0, max_index);
+        if next <= 0 {
+            0
+        } else {
+            (next as u32)
+                .saturating_mul(RAM_BUDGET_STEP_MIB)
+                .min(host)
+        }
+    }
+
+    /// Human-readable budget readout: `Auto` at `0`, otherwise the size
+    /// in GB (MiB below 1 GiB), suffixed with an OS-RAM caution only
+    /// when the budget exceeds 80% of the detected host total.
+    pub fn ram_budget_label(&self, lang: UiLang) -> String {
+        let mib = self.ram_budget_mib;
+        if mib == 0 {
+            return tr(lang, "Auto", "自動（おすすめ）").to_string();
+        }
+        let size = if mib < 1024 {
+            format!("{mib} MiB")
+        } else {
+            format!("{:.1} GB", f64::from(mib) / 1024.0)
+        };
+        if u64::from(mib) * 100 > u64::from(self.host_total_ram_mib.max(1)) * 80 {
+            format!("{size}{}", tr(lang, " (! OS RAM)", " (! OS RAM不足)"))
+        } else {
+            size
+        }
+    }
 }
 
 /// Audio settings page state (volumes in percent `0..=100`).
@@ -442,6 +536,30 @@ impl Default for AudioSettings {
             max_volume_cap: 85,
             max_concurrent_same_sound: 4,
         }
+    }
+}
+
+impl AudioSettings {
+    /// Intuitive readout for the loud-sound limiter: `OFF` at `100`,
+    /// `Muted` at `0`, otherwise a Gentle/Medium/Strong band label with
+    /// the equivalent attenuation in dB (`20·log10(cap)`), so the slider
+    /// shows *how much* the guard turns loud sounds down instead of a
+    /// bare percent.
+    pub fn max_volume_cap_label(&self, lang: UiLang) -> String {
+        let cap = self.max_volume_cap.min(100);
+        if cap == 100 {
+            return tr(lang, "OFF (No Limit)", "OFF（制限なし）").to_string();
+        }
+        if cap == 0 {
+            return tr(lang, "Muted", "ミュート").to_string();
+        }
+        let (en, ja) = match cap {
+            80..=99 => ("Gentle", "軽"),
+            60..=79 => ("Medium", "中"),
+            _ => ("Strong", "重"),
+        };
+        let db = 20.0 * (f32::from(cap) / 100.0).log10();
+        format!("{} ({db:.1} dB)", tr(lang, en, ja))
     }
 }
 
@@ -1110,6 +1228,7 @@ pub enum SettingKey {
     VideoIndirectLightBounce,
     VideoDirectionalShadowGameplay,
     VideoLazyCatchupGameplay,
+    VideoRamBudget,
     DisplayFullscreen,
     DisplayInvertY,
     DisplayGamma,
@@ -1210,6 +1329,7 @@ impl SettingsTransaction {
             K::VideoLazyCatchupGameplay => {
                 current.video.lazy_catchup_gameplay == opened.video.lazy_catchup_gameplay
             }
+            K::VideoRamBudget => current.video.ram_budget_mib == opened.video.ram_budget_mib,
             K::DisplayFullscreen => current.fullscreen == opened.fullscreen,
             K::DisplayInvertY => current.mouse_invert_y == opened.mouse_invert_y,
             K::DisplayGamma => current.gamma_pct == opened.gamma_pct,
@@ -1333,6 +1453,7 @@ impl SettingsTransaction {
             K::VideoLazyCatchupGameplay => {
                 current.video.lazy_catchup_gameplay = opened.video.lazy_catchup_gameplay
             }
+            K::VideoRamBudget => current.video.ram_budget_mib = opened.video.ram_budget_mib,
             K::DisplayFullscreen => current.fullscreen = opened.fullscreen,
             K::DisplayInvertY => current.mouse_invert_y = opened.mouse_invert_y,
             K::DisplayGamma => current.gamma_pct = opened.gamma_pct,
@@ -2271,6 +2392,7 @@ pub enum WidgetId {
     VideoIndirectLightBounce,
     VideoDirectionalShadowGameplay,
     VideoLazyCatchupGameplay,
+    VideoRamBudget,
     // Settings session toolbar (mistake-proof undo/redo/discard/reset)
     SettingsUndo,
     SettingsRedo,
@@ -2405,6 +2527,7 @@ impl WidgetId {
                 | Self::VideoBackgroundFps
                 | Self::VideoVsync
                 | Self::VideoSmoothLighting
+                | Self::VideoRamBudget
                 | Self::QolBuiltin(_)
                 | Self::MiniHudSegment(_)
                 | Self::ShadersEnabled
@@ -4246,6 +4369,19 @@ impl UiState {
                     .min(FPS_CAP_STEPS.len() - 1);
                 self.set_fps_step(idx)
             }
+            WidgetId::VideoRamBudget => {
+                // Map click x onto the 512-MiB stop grid (0 = Auto).
+                let frac = ((x - rect.x) as f32 / rect.w.max(1) as f32).clamp(0.0, 1.0);
+                let prior = self.settings.clone();
+                self.settings.video.set_ram_budget_frac(frac);
+                self.settings.video.preset = VideoPreset::Custom;
+                if self.settings == prior {
+                    Vec::new()
+                } else {
+                    self.push_settings_undo(prior);
+                    vec![UiAction::SettingsChanged]
+                }
+            }
             WidgetId::VideoFpsField => {
                 self.fps_field_focused = true;
                 self.join_field_focused = false;
@@ -4600,6 +4736,16 @@ impl UiState {
                 v.lazy_catchup_gameplay = !v.lazy_catchup_gameplay;
                 v.preset = VideoPreset::Custom;
                 true
+            }
+            WidgetId::VideoRamBudget => {
+                let next = v.ram_budget_step(dir);
+                if next == v.ram_budget_mib {
+                    false
+                } else {
+                    v.ram_budget_mib = next;
+                    v.preset = VideoPreset::Custom;
+                    true
+                }
             }
             WidgetId::VideoFullscreen => {
                 *fullscreen = !*fullscreen;
