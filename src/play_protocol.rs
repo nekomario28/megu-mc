@@ -8304,6 +8304,23 @@ fn nether_portal_target(dim: DimId, bx: i32, by: i32, bz: i32) -> Option<(DimId,
     Some((ndim, nx.floor() as i32, ny.floor() as i32, nz.floor() as i32))
 }
 
+/// `ClientboundGameEventPacket.WIN_GAME` (event id 4): param 1.0 rolls the
+/// credits on the player's first exit from the End, 0.0 on every later one.
+/// Vanilla stores the flag as `seenCredits`/`wonGame` on the player; this port
+/// keys it on the session eid, same shape as the gateway cooldown map.
+fn send_win_game_event(me: &Client) {
+    static END_WINS: Registry<i32, ()> = OnceLock::new();
+    let first = END_WINS
+        .get_or_init(|| Mutex::new(HashMap::new()))
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .insert(me.eid, ())
+        .is_none();
+    let mut ge = vec![4u8];
+    ge.extend_from_slice(&(if first { 1.0f32 } else { 0.0f32 }).to_be_bytes());
+    let _ = send_packet(&mut me.sock.lock().unwrap_or_else(|e| e.into_inner()), 0x22, ge);
+}
+
 /// Complete one portal trip. `st` is the block the player stood in, which decides whether
 /// this is an Overworld<->Nether trip (1:8 horizontal scaling) or an End trip.
 #[allow(clippy::too_many_arguments)]
@@ -8324,22 +8341,16 @@ fn enter_portal(
     let (lx, ly, lz) = *me.lastp.lock().unwrap_or_else(|e| e.into_inner());
     let entry_vel = [px - lx, py - ly, pz - lz];
     let (target_dim, landing) = if is_end_portal_state(st) {
-        if dim == DimId::Overworld {
+        if dim != DimId::End {
+            // `EndPortalBlock.getPortalDestination`: every dimension that is
+            // not the End — Overworld *and* Nether — enters the End. The old
+            // `== Overworld` arm routed a Nether entry back to spawn.
             materialize_end_spawn();
-            // Void-proof arrival: the entry velocity is clamped onto the
-            // 5x5 obsidian platform so a fast entry can never carry the
-            // player off the edge into the Void.
-            let plan = megu_server_files::custom_portal::compute_safe_gravity_flip_landing(
-                entry_vel,
-                [100.5, 49.0, 0.5],
-                2.5,
-                true,
-            );
-            let landing = (
-                plan.landing_pos[0],
-                plan.landing_pos[1],
-                plan.landing_pos[2],
-            );
+            // The fixed arrival on the materialised platform: (100.5, 49.0,
+            // 0.5) is the spawn point `resolve_portal_destination` pins — a
+            // fast entry cannot carry the player off the edge into the Void,
+            // and `switch_client_dimension` re-bases `fall_from` here.
+            let landing = (100.5, 49.0, 0.5);
             switch_client_dimension(
                 me,
                 DimId::End,
@@ -8357,6 +8368,9 @@ fn enter_portal(
                 (sdim, pos.0, pos.1, pos.2)
             };
             switch_client_dimension(me, sdim, (sx, sy, sz, yaw, pitch), view);
+            // Leaving the End through the portal triggers vanilla's WIN_GAME:
+            // 1.0 rolls the credits the first time, 0.0 on later exits.
+            send_win_game_event(me);
             (sdim, (sx, sy, sz))
         }
     } else {
@@ -21924,6 +21938,273 @@ mod p5c_live_tests {
                 "doMobSpawning=false gates the spawn even on a hit roll"
             );
             GR_MOB_SPAWNING.store(1, Ordering::Relaxed);
+        }
+
+        /// Drains `peer` of every pending frame into `(id, body)` pairs.
+        /// Unlike `read_frame` it parses the whole buffered stream, so
+        /// coalesced packets are not dropped.
+        fn drain_packets(peer: &mut std::net::TcpStream) -> Vec<(i64, Vec<u8>)> {
+            use std::io::Read;
+            peer.set_read_timeout(Some(Duration::from_millis(250))).ok();
+            let mut raw = Vec::new();
+            let mut chunk = [0u8; 8192];
+            let mut quiet = 0u8;
+            while quiet < 3 {
+                match peer.read(&mut chunk) {
+                    Ok(0) => break,
+                    Ok(n) => {
+                        raw.extend_from_slice(&chunk[..n]);
+                        quiet = 0;
+                    }
+                    Err(_) => quiet += 1,
+                }
+            }
+            let mut out = Vec::new();
+            let mut s = raw.as_slice();
+            while let Some(len) = read_varint(&mut s) {
+                if len < 0 || len as usize > s.len() {
+                    break;
+                }
+                let mut body = &s[..len as usize];
+                s = &s[len as usize..];
+                let Some(id) = read_varint(&mut body) else {
+                    break;
+                };
+                out.push((id, body.to_vec()));
+            }
+            out
+        }
+
+        /// The WIN_GAME (GameEvent id 4) parameters on the wire, in order.
+        fn win_game_events(peer: &mut std::net::TcpStream) -> Vec<f32> {
+            drain_packets(peer)
+                .iter()
+                .filter(|(id, body)| *id == 0x22 && body.len() == 5 && body[0] == 4)
+                .map(|(_, body)| f32::from_be_bytes(body[1..5].try_into().unwrap()))
+                .collect()
+        }
+
+        /// `EndPortalBlock.getPortalDestination`: an end portal entered from
+        /// the Nether still targets the End — the obsidian platform at
+        /// (100, 48, 0), arrival (100.5, 49.0, 0.5), `fall_from` re-based at
+        /// the landing so the trip carries no fall debt.
+        #[test]
+        fn vanilla_end_portal_nether_entry_lands_on_platform() {
+            crate::test_support::require_vanilla_data();
+            let _guard = world_guard();
+            let _rules = Rules::take(&[
+                "playersNetherPortalDefaultDelay",
+                "playersNetherPortalCreativeDelay",
+            ]);
+            _rules.set("playersNetherPortalDefaultDelay", 0);
+            let (me, _peer) = loopback_client("vanillaendportin", 0x7a10);
+            *me.dim.lock().unwrap_or_else(|e| e.into_inner()) = DimId::Nether;
+            *me.pos.lock().unwrap_or_else(|e| e.into_inner()) =
+                (0.5, 65.0, 0.5, 0.0, 0.0, true);
+            *me.lastp.lock().unwrap_or_else(|e| e.into_inner()) = (0.5, 65.0, 0.5);
+            let mut cells = DimCells::new();
+            cells.set(DimId::Nether, 0, 65, 0, END_PORTAL_STATE);
+            // Register the platform region for restore: materialise_end_spawn
+            // writes real End cells during the trip.
+            for dx in -2..=2 {
+                for dz in -2..=2 {
+                    for y in 48..=51 {
+                        let st = block_at_dim(DimId::End, 100 + dx, y, dz);
+                        cells.set(DimId::End, 100 + dx, y, dz, st);
+                    }
+                }
+            }
+            assert!(tick_portal(&me, 2), "a live end portal in the Nether warps");
+            assert_eq!(*me.dim.lock().unwrap_or_else(|e| e.into_inner()), DimId::End);
+            let p = *me.pos.lock().unwrap_or_else(|e| e.into_inner());
+            assert_eq!(
+                (p.0, p.1, p.2),
+                (100.5, 49.0, 0.5),
+                "platform arrival, got {p:?}"
+            );
+            assert_eq!(
+                *me.fall_from.lock().unwrap_or_else(|e| e.into_inner()),
+                49.0,
+                "fall_from re-bases at the platform"
+            );
+            assert_eq!(
+                block_at_dim(DimId::End, 100, 48, 0),
+                name_to_state("obsidian").unwrap(),
+                "the obsidian platform materialised"
+            );
+        }
+
+        /// The exit arm: an End-dweller returns to the respawn point (or world
+        /// spawn), `fall_from` re-bases at the arrival y, and the wire carries
+        /// `GameEvent` WIN_GAME — 1.0 on the first exit, 0.0 on later ones.
+        #[test]
+        fn vanilla_end_portal_exit_win_game_and_fall_reset() {
+            crate::test_support::require_vanilla_data();
+            let _guard = world_guard();
+            let _rules = Rules::take(&[
+                "playersNetherPortalDefaultDelay",
+                "playersNetherPortalCreativeDelay",
+            ]);
+            _rules.set("playersNetherPortalDefaultDelay", 0);
+            let (me, mut peer) = loopback_client("vanillaendportout", 0x7a11);
+            *me.dim.lock().unwrap_or_else(|e| e.into_inner()) = DimId::End;
+            *me.pos.lock().unwrap_or_else(|e| e.into_inner()) =
+                (5.5, 61.0, 5.5, 0.0, 0.0, true);
+            *me.lastp.lock().unwrap_or_else(|e| e.into_inner()) = (5.5, 61.0, 5.5);
+            *me.spawn_dim.lock().unwrap_or_else(|e| e.into_inner()) = DimId::Overworld;
+            *me.spawn_pt.lock().unwrap_or_else(|e| e.into_inner()) =
+                Some((10.5, 66.0, -20.5, 0.0));
+            *me.fall_from.lock().unwrap_or_else(|e| e.into_inner()) = 300.0;
+            let mut cells = DimCells::new();
+            cells.set(DimId::End, 5, 61, 5, END_PORTAL_STATE);
+            assert!(tick_portal(&me, 2), "the exit portal warps");
+            assert_eq!(
+                *me.dim.lock().unwrap_or_else(|e| e.into_inner()),
+                DimId::Overworld
+            );
+            let p = *me.pos.lock().unwrap_or_else(|e| e.into_inner());
+            assert_eq!(
+                (p.0, p.1, p.2),
+                (10.5, 66.0, -20.5),
+                "respawn arrival, got {p:?}"
+            );
+            assert_eq!(
+                *me.fall_from.lock().unwrap_or_else(|e| e.into_inner()),
+                66.0,
+                "fall_from re-bases at the respawn y"
+            );
+            assert_eq!(
+                win_game_events(&mut peer),
+                vec![1.0],
+                "the first exit carries WIN_GAME param 1.0 — the credits roll"
+            );
+
+            // A second exit carries param 0.0 — no credits again.
+            *me.dim.lock().unwrap_or_else(|e| e.into_inner()) = DimId::End;
+            *me.pos.lock().unwrap_or_else(|e| e.into_inner()) =
+                (5.5, 61.0, 5.5, 0.0, 0.0, true);
+            *me.lastp.lock().unwrap_or_else(|e| e.into_inner()) = (5.5, 61.0, 5.5);
+            *me.in_portal.lock().unwrap_or_else(|e| e.into_inner()) = false;
+            *me.portal_at.lock().unwrap_or_else(|e| e.into_inner()) = None;
+            assert!(tick_portal(&me, 2), "the second exit warps");
+            assert_eq!(
+                win_game_events(&mut peer),
+                vec![0.0],
+                "later exits carry WIN_GAME param 0.0"
+            );
+        }
+
+        /// `end_top_solid` finds the column's top safe landing — a solid,
+        /// non-liquid block with two air cells above. A column with a real top
+        /// lands the exit at top+1 instead of the void pad; an `end_gateway`
+        /// beam cell disqualifies the floor below it and the pad takes the exit.
+        #[test]
+        fn vanilla_end_gateway_exit_lands_on_top_solid() {
+            crate::test_support::require_vanilla_data();
+            let _guard = world_guard();
+            let mut cells = DimCells::new();
+            let end_stone = name_to_state("end_stone").unwrap();
+            // The column the (100,60,50) gateway's ray exits on, ~1024 out.
+            let len = (100.0f64 * 100.0 + 50.0f64 * 50.0).sqrt().max(1.0);
+            let ex = (100.0 / len * 1024.0).round() as i32;
+            let ez = (50.0 / len * 1024.0).round() as i32;
+            // Clear the whole column so generated islands cannot leak a top.
+            for y in DimId::End.min_y()..DimId::End.min_y() + DimId::End.height() {
+                cells.set(DimId::End, ex, y, ez, 0);
+            }
+            cells.set(DimId::End, ex, 70, ez, end_stone);
+            let (_, ey, _) = end_gateway_exit_pos((100, 60, 50));
+            assert_eq!(ey, 71.0, "the exit lands on the top solid, got {ey}");
+            // An end_gateway beam cell is not a landing: the floor below it
+            // loses its air-above cells and the void pad takes the exit.
+            cells.set(DimId::End, ex, 71, ez, 12514);
+            let (_, ey2, _) = end_gateway_exit_pos((100, 60, 50));
+            assert_eq!(ey2, 66.0, "a gateway cell is no floor — the pad takes it");
+            assert_eq!(
+                block_at_dim(DimId::End, ex, 65, ez),
+                end_stone,
+                "the pad materialised at y=65"
+            );
+        }
+
+        /// `ChorusFruitItem.finishUsingItem` live: eating the fruit in the End
+        /// teleports inside the dimension (never the Overworld `surface_y`),
+        /// re-bases `fall_from`, arms the 20-tick cooldown on the wire, and a
+        /// second eat inside the cooldown does nothing.
+        #[test]
+        fn vanilla_chorus_fruit_teleports_inside_the_end() {
+            crate::test_support::require_vanilla_data();
+            let _guard = world_guard();
+            let (me, mut peer) = loopback_client("vanillachorus1", 0x7a12);
+            let fruit = name_to_item("chorus_fruit").unwrap();
+            me.inv
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .insert(36, (fruit, 1, Vec::new()));
+            *me.dim.lock().unwrap_or_else(|e| e.into_inner()) = DimId::End;
+            *me.pos.lock().unwrap_or_else(|e| e.into_inner()) =
+                (100.5, 62.0, 0.5, 0.0, 0.0, true);
+            *me.fall_from.lock().unwrap_or_else(|e| e.into_inner()) = 140.0;
+            // A 17x17 end_stone island at y=60 under the player: every +-8
+            // roll lands on it with feet at y=61.
+            let mut cells = DimCells::new();
+            let end_stone = name_to_state("end_stone").unwrap();
+            for x in 92..=108 {
+                for z in -8..=8 {
+                    cells.set(DimId::End, x, 60, z, end_stone);
+                    for y in 61..=72 {
+                        cells.set(DimId::End, x, y, z, 0);
+                    }
+                }
+            }
+            chorus_cd()
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .remove(&me.eid);
+            air_use_item(&me, 0, 0, None, true);
+            let p = *me.pos.lock().unwrap_or_else(|e| e.into_inner());
+            assert_eq!(p.1, 61.0, "the roll stands on the island, got {p:?}");
+            assert!(
+                (p.0 - 100.5).abs() <= 8.5 && (p.2 - 0.5).abs() <= 8.5,
+                "the hop stays inside +-8 blocks, got {p:?}"
+            );
+            assert_eq!(*me.dim.lock().unwrap_or_else(|e| e.into_inner()), DimId::End);
+            assert_eq!(
+                *me.fall_from.lock().unwrap_or_else(|e| e.into_inner()),
+                61.0,
+                "fall_from re-bases at the landing"
+            );
+            // The wire carries the 20-tick SetCooldown for the fruit.
+            let cooldown = drain_packets(&mut peer).iter().any(|(id, body)| {
+                if *id != 0x17 {
+                    return false;
+                }
+                let mut b = body.as_slice();
+                read_varint(&mut b) == Some(fruit) && read_varint(&mut b) == Some(20)
+            });
+            assert!(cooldown, "the 20-tick cooldown packet rides the wire");
+            // Inside the cooldown a second fruit does nothing.
+            me.inv
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .insert(36, (fruit, 1, Vec::new()));
+            let before = *me.pos.lock().unwrap_or_else(|e| e.into_inner());
+            air_use_item(&me, 0, 0, None, true);
+            let after = *me.pos.lock().unwrap_or_else(|e| e.into_inner());
+            assert_eq!(
+                (before.0, before.1, before.2),
+                (after.0, after.1, after.2),
+                "a cooling-down fruit cannot teleport"
+            );
+            assert_eq!(
+                me.inv
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .get(&36)
+                    .map(|s| s.1),
+                Some(1),
+                "the blocked eat keeps the fruit"
+            );
         }
     }
 
