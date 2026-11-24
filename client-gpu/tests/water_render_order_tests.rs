@@ -36,12 +36,12 @@ fn composed_pass_draw_order_contract() {
     let body = composed_world_body();
     // One unique anchor line per draw phase, in source order.
     let opaque_terrain = position(&body, "encode_opaque_terrain(");
-    let opaque_subworld = position(&body, "|| entry.alpha < 0.999 {");
+    let opaque_subworld = position(&body, "pass.set_pipeline(&lit_opaque_pipeline);");
     let instanced_parts = position(&body, "for batch in subworld_gpu.batches() {");
     let entity_ber = position(&body, "if let Some(mesh) = entity_ber {");
     let translucent_terrain = position(&body, "pass.set_pipeline(&gpu.terrain_alpha_pipeline);");
     let water = position(&body, "pass.set_pipeline(&water.pipeline);");
-    let alpha_subworld = position(&body, "|| entry.alpha >= 0.999 {");
+    let alpha_subworld = position(&body, "pass.set_pipeline(&lit_alpha_pipeline);");
     let particles = position(&body, "if let Some(mesh) = particles {");
     let debug_lines = position(&body, "if let Some((buffer, count)) = debug_lines {");
 
