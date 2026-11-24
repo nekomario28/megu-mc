@@ -5173,7 +5173,7 @@ mod tests {
                         assert!(
                             ALLOWED_LATIN
                                 .iter()
-                                .any(|allowed| word.contains(allowed) || allowed.contains(&word)),
+                                .any(|allowed| word.contains(allowed) || allowed.contains(word)),
                             "{name} {w}x{h} JA label has untranslated word \
                              {word:?} in {text:?}"
                         );

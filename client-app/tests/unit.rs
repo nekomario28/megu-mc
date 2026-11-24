@@ -1067,8 +1067,13 @@ fn cli_gpu_backend_flag_flows_into_render_config() {
     let config = RenderConfig::from_settings(&cfg.client_settings);
     assert_eq!(config.gpu_backend, RenderBackendPreference::ClassicLowSpec);
 
-    // Default settings keep Auto end-to-end.
-    let mut cfg = parse_args(&["--headless".to_string()]).expect("default parse");
+    // Default settings (with explicit preset to avoid host-hardware auto-tune variance) keep Auto end-to-end.
+    let mut cfg = parse_args(&[
+        "--headless".to_string(),
+        "--preset".to_string(),
+        "balanced".to_string(),
+    ])
+    .expect("default parse");
     cfg.resolve_client_settings_from(Path::new(".")).unwrap();
     assert_eq!(
         cfg.client_settings.gpu_backend,

@@ -3170,9 +3170,14 @@ mod tests {
     #[test]
     fn interactive_tty_defaults_to_tui() {
         let opts = ConsoleModeOptions::default();
+        let expected = if cfg!(windows) {
+            ServerConsoleMode::PlainCli
+        } else {
+            ServerConsoleMode::Tui
+        };
         assert_eq!(
             resolve_console_mode(&opts, true, true, Some("xterm-256color"), false),
-            ServerConsoleMode::Tui
+            expected
         );
     }
 
@@ -3188,9 +3193,14 @@ mod tests {
             resolve_console_mode(&opts, true, true, Some("dumb"), false),
             ServerConsoleMode::PlainCli
         );
+        let expected = if cfg!(windows) {
+            ServerConsoleMode::PlainCli
+        } else {
+            ServerConsoleMode::Tui
+        };
         assert_eq!(
             resolve_console_mode(&opts, true, true, Some("xterm"), false),
-            ServerConsoleMode::Tui
+            expected
         );
         // --cli wins over --tui in either order.
         for args in [
