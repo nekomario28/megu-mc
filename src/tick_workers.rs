@@ -118,8 +118,7 @@ fn mob_batch_size() -> usize {
     }
 }
 
-#[cfg(test)]
-#[cfg_attr(not(megu_vanilla_data), allow(dead_code))]
+#[cfg(all(test, megu_vanilla_data))]
 fn set_mob_batch_override(v: Option<usize>) {
     MOB_BATCH_OVERRIDE.store(v.map(|n| n as i64).unwrap_or(-1), Ordering::Relaxed);
 }
