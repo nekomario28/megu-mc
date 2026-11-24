@@ -18,7 +18,15 @@
 //!   `max_claims`/`max_forceloads` quotas, party membership/ally access
 //!   groups, the OpenPAC over-limit restriction (an owner whose count
 //!   exceeds their current limit loses party/ally access until back under),
-//!   and cross-border piston/fluid grief protection.
+//!   and cross-border grief protection: pistons, fluids, fire, lightning,
+//!   explosions, projectiles, contraptions, dispensers/hoppers, vehicles,
+//!   and mob/boss griefing. A [`ClaimPermissionSet`] matrix gives
+//!   `everyone_else` (`自分以外の全員`) plus per-player overrides granular
+//!   control over every player who ever joined (`known_players`).
+//! * [`OrganicClaimPolicy`] — an optional, zero-pay-to-win claim cost
+//!   economy: play time, advancements and boss defeats mint claim points,
+//!   and chunk price floats with contiguity and nearby foreign-claim
+//!   density.
 //! * [`exec_openpac_command`] — the `/oclaims`, `/oparties`, `/opac` and
 //!   `/opm` dispatcher.
 //! * [`ClaimsSyncDelta`] — a monotonic `revision`-stamped feed minimap and
@@ -138,6 +146,125 @@ impl fmt::Display for SubClaimId {
     }
 }
 
+/// A player the world has seen at least once — the claim UI's roster for
+/// 1-click per-player permission editing, including players who are
+/// offline or have never been trusted.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct KnownPlayerRecord {
+    /// Last seen display name (updated on every sighting).
+    pub name: String,
+    /// First join tick the player was recorded at.
+    pub first_seen_tick: u64,
+    /// Most recent sighting tick.
+    pub last_seen_tick: u64,
+}
+
+/// What a player may do inside a claim — the granular permission matrix
+/// behind `everyone_else` and `player_overrides` on
+/// [`ClaimProtectionConfig`]. Every field is an independent allow, so a
+/// claim UI can offer one toggle per row, per known player or for
+/// "everyone else".
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct ClaimPermissionSet {
+    /// Break blocks inside the claim.
+    pub block_break: bool,
+    /// Place blocks inside the claim.
+    pub block_place: bool,
+    /// Open containers: chests, barrels, shulkers, hoppers, mod machines.
+    pub containers: bool,
+    /// Use doors, trapdoors, fence gates, buttons, levers, pressure plates.
+    pub redstone_and_doors: bool,
+    /// Right-click/leash/shear/milk/ride/name entities: armor stands, item
+    /// frames, villagers, pets, buckets, nametags.
+    pub entity_interact: bool,
+    /// Attack or shoot animals, villagers, pets and other entities inside.
+    pub entity_damage: bool,
+    /// Pick up or drop items inside the claim.
+    pub item_pickup_drop: bool,
+    /// Teleport in: ender pearls, chorus fruit, modded blinks.
+    pub teleport_in: bool,
+}
+
+impl ClaimPermissionSet {
+    /// Everything denied — the starting point for a stranger.
+    pub fn denied_all() -> Self {
+        Self::default()
+    }
+
+    /// A tourist: doors/redstone and item pickup, nothing else.
+    pub fn visitor() -> Self {
+        Self {
+            redstone_and_doors: true,
+            item_pickup_drop: true,
+            ..Self::denied_all()
+        }
+    }
+
+    /// Full access — what the owner and trusted party members get.
+    pub fn trusted_builder() -> Self {
+        Self {
+            block_break: true,
+            block_place: true,
+            containers: true,
+            redstone_and_doors: true,
+            entity_interact: true,
+            entity_damage: true,
+            item_pickup_drop: true,
+            teleport_in: true,
+        }
+    }
+
+    /// Chest/inventory access only.
+    pub fn container_only() -> Self {
+        Self {
+            containers: true,
+            ..Self::denied_all()
+        }
+    }
+
+    /// Field-wise OR — folds the `protect_*`-derived outsider floor into
+    /// `everyone_else` so permissive legacy flags keep working.
+    fn union(self, other: Self) -> Self {
+        Self {
+            block_break: self.block_break || other.block_break,
+            block_place: self.block_place || other.block_place,
+            containers: self.containers || other.containers,
+            redstone_and_doors: self.redstone_and_doors || other.redstone_and_doors,
+            entity_interact: self.entity_interact || other.entity_interact,
+            entity_damage: self.entity_damage || other.entity_damage,
+            item_pickup_drop: self.item_pickup_drop || other.item_pickup_drop,
+            teleport_in: self.teleport_in || other.teleport_in,
+        }
+    }
+
+    fn allows(&self, slot: PermSlot) -> bool {
+        match slot {
+            PermSlot::BlockBreak => self.block_break,
+            PermSlot::BlockPlace => self.block_place,
+            PermSlot::Containers => self.containers,
+            PermSlot::RedstoneAndDoors => self.redstone_and_doors,
+            PermSlot::EntityInteract => self.entity_interact,
+            PermSlot::EntityDamage => self.entity_damage,
+            PermSlot::EntityPush => self.entity_interact || self.entity_damage,
+        }
+    }
+}
+
+/// One row of [`ClaimPermissionSet`], so `check_action` can name an
+/// action's required permission without stringly keys. `EntityPush` covers
+/// both the "touch" and "hurt" forms of displacement (body-push, fishing
+/// rod, knockback).
+#[derive(Clone, Copy)]
+enum PermSlot {
+    BlockBreak,
+    BlockPlace,
+    Containers,
+    RedstoneAndDoors,
+    EntityInteract,
+    EntityDamage,
+    EntityPush,
+}
+
 // ------------------------------------------------------------------- model
 
 /// Who a claim belongs to.
@@ -235,8 +362,9 @@ impl Party {
 }
 
 /// Per-owner, per-sub-claim protection policy — the fields OpenPAC's player
-/// claims config and FTB Chunks' team config both carry.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+/// claims config and FTB Chunks' team config both carry, plus the granular
+/// permission matrix and cross-border grief guards.
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ClaimProtectionConfig {
     /// Block break/place by outsiders.
     pub protect_blocks: bool,
@@ -250,6 +378,33 @@ pub struct ClaimProtectionConfig {
     pub protect_piston_border: bool,
     /// Fluids flowing across the claim border.
     pub protect_fluid_border: bool,
+    /// Right-clicking/leashing/shearing entities (armor stands, item
+    /// frames, villagers, pets) inside the claim.
+    pub protect_entity_interact: bool,
+    /// Projectiles (arrows, tridents, potions, mod spells) fired from
+    /// outside the claim landing inside it.
+    pub protect_projectiles_border: bool,
+    /// Fire spread and lightning (including Channeling tridents) crossing
+    /// the claim border.
+    pub protect_fire_and_lightning: bool,
+    /// Mob and boss griefing (endermen, ravagers, withers, colossal
+    /// dragons, modded mobs) inside or into the claim.
+    pub protect_mob_and_boss_grief: bool,
+    /// Modded contraptions/machines (drills, ploughs, quarries) crossing
+    /// the claim border.
+    pub protect_contraption_border: bool,
+    /// Dispensers dumping fluid/items or hoppers siphoning inventories
+    /// across the claim border.
+    pub protect_dispenser_hopper_border: bool,
+    /// Boats, minecarts and modded vehicles pushed/placed across the claim
+    /// border (including forced-boarding kidnaps).
+    pub protect_vehicle_border: bool,
+    /// Outsiders body-pushing, fishing-rod pulling or knockback-displacing
+    /// entities inside the claim.
+    pub protect_entity_push: bool,
+    /// Outsiders luring mobs out of the claim with tempt items (wheat,
+    /// carrots, seeds, modded bait).
+    pub protect_entity_lure: bool,
     /// Members of the owner's party may act inside the claim.
     pub allow_party_members: bool,
     /// Members of allied parties may act inside the claim.
@@ -260,10 +415,27 @@ pub struct ClaimProtectionConfig {
     pub max_claims: usize,
     /// Forceload quota for this `(owner, sub-claim)` pair.
     pub max_forceloads: usize,
+    /// What everyone other than the owner, their party members, allies and
+    /// explicitly overridden players may do — the "everyone else"
+    /// (`自分以外の全員`) row of the permission matrix. The resolved
+    /// permission is `everyone_else` OR the floor implied by disabled
+    /// `protect_*` flags, so a permissive flag never behaves stricter.
+    pub everyone_else: ClaimPermissionSet,
+    /// `uuid -> permissions` — explicit per-player overrides, checked
+    /// before party/ally trust and `everyone_else`, so one friend can be
+    /// trusted fully or one specific player blocked outright.
+    pub player_overrides: BTreeMap<String, ClaimPermissionSet>,
+    /// Minimap overlay color `0xRRGGBB`; `0` means "auto" — a
+    /// deterministic owner-hashed color (see
+    /// [`ClaimsWorld::claim_display_color`]).
+    pub display_color_rgb: u32,
+    /// Optional minimap label for this `(owner, sub-claim)` region.
+    pub display_label: Option<String>,
 }
 
 impl Default for ClaimProtectionConfig {
-    /// The permissive-but-protected default a fresh player starts with.
+    /// The permissive-but-protected default a fresh player starts with:
+    /// every guard on, outsiders denied everything, no overrides.
     fn default() -> Self {
         Self {
             protect_blocks: true,
@@ -272,11 +444,24 @@ impl Default for ClaimProtectionConfig {
             protect_explosions: true,
             protect_piston_border: true,
             protect_fluid_border: true,
+            protect_entity_interact: true,
+            protect_projectiles_border: true,
+            protect_fire_and_lightning: true,
+            protect_mob_and_boss_grief: true,
+            protect_contraption_border: true,
+            protect_dispenser_hopper_border: true,
+            protect_vehicle_border: true,
+            protect_entity_push: true,
+            protect_entity_lure: true,
             allow_party_members: true,
             allow_allies: false,
             offline_forceload: false,
             max_claims: 500,
             max_forceloads: 25,
+            everyone_else: ClaimPermissionSet::denied_all(),
+            player_overrides: BTreeMap::new(),
+            display_color_rgb: 0,
+            display_label: None,
         }
     }
 }
@@ -305,12 +490,69 @@ pub enum ClaimAction {
     BlockPlace,
     ContainerInteract,
     EntityAttack,
+    /// Right-clicking, leashing, shearing, milking, riding or naming an
+    /// entity inside the claim: armor stands, item frames, villagers,
+    /// pets, nametags, buckets.
+    EntityInteract,
+    /// Using a door, trapdoor, fence gate, button, lever or pressure plate.
+    RedstoneOrDoorInteract,
+    /// Body-pushing, fishing-rod pulling or knockback-displacing an entity
+    /// inside the claim (the classic "shove the villager out" grief).
+    EntityPushOrDisplace,
+    /// Luring a mob inside the claim with tempt food/items so its follow
+    /// AI walks it out across the border.
+    EntityTemptOrLure,
     /// An explosion originating anywhere; no actor.
     Explosion,
     /// A piston in the given source chunk moving blocks into the target.
     PistonFrom(ClaimChunkKey),
     /// Fluid in the given source chunk flowing into the target.
     FluidFrom(ClaimChunkKey),
+    /// Fire ignited in the source chunk spreading into the target.
+    FireSpreadFrom(ClaimChunkKey),
+    /// Lightning (including Channeling tridents) called down in the source
+    /// chunk striking inside the target.
+    LightningFrom(ClaimChunkKey),
+    /// An explosion whose blast originates in `source` and reaches into
+    /// the target: TNT cannons, creepers, end crystals, respawn anchors,
+    /// beds. `actor_uuid` is who lit it, when known.
+    ExplosionFrom {
+        source: ClaimChunkKey,
+        actor_uuid: Option<String>,
+    },
+    /// A projectile fired from `source` landing in the target: arrows,
+    /// tridents, splash/lingering potions, wind charges, mod spells.
+    /// Denied unless the shooter holds `entity_damage`/`block_break`
+    /// permission in the target claim.
+    ProjectileFrom {
+        source: ClaimChunkKey,
+        shooter_uuid: Option<String>,
+    },
+    /// A mob or boss griefing inside, or into, the target: endermen,
+    /// ravagers, withers, colossal dragons breathing fire/ice/lightning or
+    /// smashing blocks, or any modded mob. `source` is where the mob is,
+    /// when known; `is_boss_or_dragon` marks boss-class actors.
+    MobOrBossGrief {
+        source: Option<ClaimChunkKey>,
+        is_boss_or_dragon: bool,
+    },
+    /// A modded contraption or machine (drill, plough, quarry) based in
+    /// `source` reaching into the target. `owner_uuid` is who built it,
+    /// when known.
+    ContraptionOrMachineFrom {
+        source: ClaimChunkKey,
+        owner_uuid: Option<String>,
+    },
+    /// A dispenser or hopper in `source` dumping fluid/items into, or
+    /// siphoning inventories out of, the target.
+    DispenserOrHopperFrom(ClaimChunkKey),
+    /// A boat, minecart or modded vehicle pushed/placed from `source` into
+    /// the target, or an actor in `source` forcing an entity to board one
+    /// (vehicle kidnap). `actor_uuid` is who moved it, when known.
+    VehicleEnterOrInject {
+        source: ClaimChunkKey,
+        actor_uuid: Option<String>,
+    },
 }
 
 /// Why a [`ClaimAction`] was refused.
@@ -322,6 +564,16 @@ pub enum DenyReason {
     ExplosionsProtected,
     PistonBorderProtected,
     FluidBorderProtected,
+    EntityInteractProtected,
+    RedstoneOrDoorProtected,
+    EntityPushProtected,
+    EntityLureProtected,
+    ProjectilesBorderProtected,
+    FireAndLightningProtected,
+    MobOrBossGriefProtected,
+    ContraptionBorderProtected,
+    DispenserHopperBorderProtected,
+    VehicleBorderProtected,
     /// Server claim: admins only.
     ServerClaim,
     /// Expired claim: admins only.
@@ -340,6 +592,28 @@ impl fmt::Display for DenyReason {
             Self::ExplosionsProtected => "this claim protects against explosions",
             Self::PistonBorderProtected => "pistons cannot reach across this claim's border",
             Self::FluidBorderProtected => "fluids cannot flow across this claim's border",
+            Self::EntityInteractProtected => "this claim protects entity interaction",
+            Self::RedstoneOrDoorProtected => {
+                "this claim protects doors and redstone components"
+            }
+            Self::EntityPushProtected => "entities cannot be pushed out of this claim",
+            Self::EntityLureProtected => "entities cannot be lured out of this claim",
+            Self::ProjectilesBorderProtected => {
+                "projectiles cannot cross this claim's border"
+            }
+            Self::FireAndLightningProtected => {
+                "fire and lightning cannot cross this claim's border"
+            }
+            Self::MobOrBossGriefProtected => "mobs and bosses cannot grief this claim",
+            Self::ContraptionBorderProtected => {
+                "contraptions and machines cannot cross this claim's border"
+            }
+            Self::DispenserHopperBorderProtected => {
+                "dispensers and hoppers cannot reach across this claim's border"
+            }
+            Self::VehicleBorderProtected => {
+                "vehicles cannot cross this claim's border"
+            }
             Self::ServerClaim => "server claim: admins only",
             Self::ExpiredClaim => "expired claim: admins only",
             Self::OwnerOverLimit => {
@@ -409,6 +683,9 @@ pub enum ClaimsError {
     AlreadyAllied,
     /// The other party is not an ally.
     NotAllied,
+    /// The dimension is not open to player claims under the world's
+    /// allowed-claim-dimensions policy (admins/server claims still work).
+    DimensionNotClaimable(String),
 }
 
 impl fmt::Display for ClaimsError {
@@ -440,6 +717,9 @@ impl fmt::Display for ClaimsError {
             Self::InvalidTarget => write!(f, "invalid target"),
             Self::AlreadyAllied => write!(f, "already allied"),
             Self::NotAllied => write!(f, "not allied"),
+            Self::DimensionNotClaimable(d) => {
+                write!(f, "dimension {d:?} is not claimable")
+            }
         }
     }
 }
@@ -491,6 +771,15 @@ pub struct ClaimsWorld {
     default_config: ClaimProtectionConfig,
     /// Server admins: bypass claim protection and own server/expired claims.
     admins: BTreeSet<String>,
+    /// `uuid -> {name, first/last seen}` for every player who has ever
+    /// joined — the claim UI's roster for 1-click permission editing.
+    known_players: BTreeMap<String, KnownPlayerRecord>,
+    /// Dimensions players may claim in; `None` = unrestricted (the
+    /// historical default, so existing worlds keep their semantics).
+    /// Admin takeovers and server claims are exempt.
+    allowed_claim_dimensions: Option<BTreeSet<String>>,
+    /// How player claims are priced.
+    claim_cost_mode: ClaimCostMode,
     revision: u64,
     deltas: Vec<ClaimsSyncDelta>,
     next_party_id: u64,
@@ -500,6 +789,191 @@ impl Default for ClaimsWorld {
     fn default() -> Self {
         Self::new()
     }
+}
+
+/// How player claims are priced.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum ClaimCostMode {
+    /// The historical quota model: `max_claims` chunks per `(owner, sub)`,
+    /// nothing else to pay. The default, so existing behavior is exact.
+    #[default]
+    FreeQuota,
+    /// [`OrganicClaimPolicy`]-priced claims: chunks cost organic points
+    /// earned by playing, with a fluid contiguity/density curve.
+    OrganicFluid,
+}
+
+impl ClaimCostMode {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::FreeQuota => "free_quota",
+            Self::OrganicFluid => "organic_fluid",
+        }
+    }
+
+    fn parse(s: &str) -> Option<Self> {
+        Some(match s {
+            "free_quota" => Self::FreeQuota,
+            "organic_fluid" => Self::OrganicFluid,
+            _ => return None,
+        })
+    }
+}
+
+/// The tuning knobs of the organic claim economy — a fluid, zero-pay-to-win
+/// territory progression where land value comes from adjacency and local
+/// crowding rather than purchases.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct OrganicClaimPolicy {
+    /// Chunks each player may claim for free — the starter plot for the
+    /// first chest/crafting table. `0` disables the freebie entirely.
+    pub starter_free_chunks: usize,
+    /// Base price of one chunk in organic points.
+    pub base_chunk_cost: u64,
+    /// Price multiplier, in basis points (`10_000` = `1.00×`), when the new
+    /// chunk is edge-adjacent to the owner's existing claim.
+    pub contiguous_multiplier_bps: u32,
+    /// Price multiplier, in basis points (`22_500` = `2.25×`), when the new
+    /// chunk is a disconnected island — discourages scatter-claiming.
+    pub island_multiplier_bps: u32,
+    /// Density surcharge per foreign claim within 3 chunks, in basis
+    /// points (`1_500` = `+15%` each) — fluid land value near crowded
+    /// hubs, cheap claims out on the frontier.
+    pub density_step_bps: u32,
+    /// Density multiplier cap, in basis points (`30_000` = `3.0×`), so
+    /// prices stay attainable.
+    pub max_density_multiplier_bps: u32,
+    /// Points minted per hour played (`72_000` ticks).
+    pub points_per_hour_played: u64,
+    /// Points minted per advancement earned.
+    pub points_per_advancement: u64,
+    /// Points minted per boss defeated.
+    pub points_per_boss_defeat: u64,
+}
+
+impl Default for OrganicClaimPolicy {
+    /// Balanced survival defaults: one free starter chunk, `2.25×` island
+    /// penalty, `+15%`-per-foreign-chunk density capped at `3.0×`.
+    fn default() -> Self {
+        Self {
+            starter_free_chunks: 1,
+            base_chunk_cost: 100,
+            contiguous_multiplier_bps: 10_000,
+            island_multiplier_bps: 22_500,
+            density_step_bps: 1_500,
+            max_density_multiplier_bps: 30_000,
+            points_per_hour_played: 120,
+            points_per_advancement: 60,
+            points_per_boss_defeat: 250,
+        }
+    }
+}
+
+/// The deterministic quote for claiming one chunk under the organic
+/// economy — every input that went into `cost_points` is reported so the
+/// UI can explain the price.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct OrganicCostQuote {
+    /// Final chunk price in organic points (`0` while starter-free).
+    pub cost_points: u64,
+    /// The owner is still inside their free starter allowance.
+    pub is_starter_free: bool,
+    /// The chunk shares an edge with an existing claim of the same owner.
+    pub is_contiguous: bool,
+    /// Foreign-owned claims within a 3-chunk Chebyshev radius.
+    pub nearby_foreign_claims: usize,
+    /// The applied density multiplier in basis points, after the cap.
+    pub density_multiplier_bps: u32,
+}
+
+/// One full hour of play in ticks (`20 tps * 60 s * 60`).
+const TICKS_PER_HOUR: u64 = 20 * 60 * 60;
+
+/// The deterministic price of `owner_uuid` claiming `key` under `policy`.
+/// Pure: reads the world, touches nothing.
+pub fn compute_organic_chunk_cost(
+    world: &ClaimsWorld,
+    owner_uuid: &str,
+    key: &ClaimChunkKey,
+    policy: &OrganicClaimPolicy,
+) -> OrganicCostQuote {
+    let okey = player_key(owner_uuid);
+    let owned: usize = world
+        .index
+        .iter()
+        .filter(|((o, _), _)| o == &okey)
+        .map(|(_, chunks)| chunks.len())
+        .sum();
+    let is_starter_free = owned < policy.starter_free_chunks;
+    let is_contiguous = [(1_i32, 0_i32), (-1, 0), (0, 1), (0, -1)]
+        .iter()
+        .any(|(dx, dz)| {
+            let nk = ClaimChunkKey {
+                dimension: key.dimension.clone(),
+                cx: key.cx + dx,
+                cz: key.cz + dz,
+            };
+            world
+                .claims
+                .get(&nk)
+                .map(|c| owner_key(&c.owner) == okey)
+                .unwrap_or(false)
+        });
+    let nearby_foreign_claims = world
+        .claims
+        .iter()
+        .filter(|(k2, c)| {
+            k2.dimension == key.dimension
+                && owner_key(&c.owner) != okey
+                && k2.cx.abs_diff(key.cx) <= 3
+                && k2.cz.abs_diff(key.cz) <= 3
+        })
+        .count();
+    let density_multiplier_bps = 10_000_u32
+        .saturating_add(
+            policy
+                .density_step_bps
+                .saturating_mul(nearby_foreign_claims as u32),
+        )
+        .min(policy.max_density_multiplier_bps)
+        .max(10_000);
+    let multiplier_bps = if is_contiguous {
+        policy.contiguous_multiplier_bps
+    } else {
+        policy.island_multiplier_bps
+    };
+    let cost_points = if is_starter_free {
+        0
+    } else {
+        let cost = u128::from(policy.base_chunk_cost)
+            * u128::from(multiplier_bps)
+            * u128::from(density_multiplier_bps)
+            / 10_000
+            / 10_000;
+        u64::try_from(cost).unwrap_or(u64::MAX)
+    };
+    OrganicCostQuote {
+        cost_points,
+        is_starter_free,
+        is_contiguous,
+        nearby_foreign_claims,
+        density_multiplier_bps,
+    }
+}
+
+/// The organic points a player has earned: whole hours played plus
+/// advancements plus boss defeats. Saturating — budget arithmetic can
+/// never wrap.
+pub fn compute_organic_budget(
+    played_ticks: u64,
+    advancements: u64,
+    bosses_defeated: u64,
+    policy: &OrganicClaimPolicy,
+) -> u64 {
+    (played_ticks / TICKS_PER_HOUR)
+        .saturating_mul(policy.points_per_hour_played)
+        .saturating_add(advancements.saturating_mul(policy.points_per_advancement))
+        .saturating_add(bosses_defeated.saturating_mul(policy.points_per_boss_defeat))
 }
 
 /// The index/config key for a claim owner.
@@ -524,6 +998,27 @@ fn color_for(seed: &str) -> u32 {
     h & 0x00ff_ffff
 }
 
+/// The access outsiders retain purely because a `protect_*` master switch
+/// is off — folded into resolved permission sets so disabling a flag never
+/// behaves stricter than it did before the permission matrix existed.
+fn outsider_floor(c: &ClaimProtectionConfig) -> ClaimPermissionSet {
+    ClaimPermissionSet {
+        block_break: !c.protect_blocks,
+        block_place: !c.protect_blocks,
+        containers: !c.protect_containers,
+        redstone_and_doors: !c.protect_blocks,
+        entity_interact: !c.protect_entity_interact,
+        entity_damage: !c.protect_entities,
+        item_pickup_drop: false,
+        teleport_in: false,
+    }
+}
+
+/// The dimensions [`ClaimsWorld::new_survival_default`] opens to player
+/// claims: Overworld only, so Nether fortresses, End islands and mod
+/// dimensions cannot be monopolized.
+pub const DEFAULT_SURVIVAL_CLAIM_DIMENSIONS: &[&str] = &["minecraft:overworld"];
+
 impl ClaimsWorld {
     pub fn new() -> Self {
         Self {
@@ -534,10 +1029,27 @@ impl ClaimsWorld {
             configs: BTreeMap::new(),
             default_config: ClaimProtectionConfig::default(),
             admins: BTreeSet::new(),
+            known_players: BTreeMap::new(),
+            allowed_claim_dimensions: None,
+            claim_cost_mode: ClaimCostMode::FreeQuota,
             revision: 0,
             deltas: Vec::new(),
             next_party_id: 1,
         }
+    }
+
+    /// A survival-world world: like [`Self::new`] but player claims are
+    /// restricted to [`DEFAULT_SURVIVAL_CLAIM_DIMENSIONS`]. Admin takeovers
+    /// and server claims still work in any dimension.
+    pub fn new_survival_default() -> Self {
+        let mut w = Self::new();
+        w.allowed_claim_dimensions = Some(
+            DEFAULT_SURVIVAL_CLAIM_DIMENSIONS
+                .iter()
+                .map(|s| (*s).to_owned())
+                .collect(),
+        );
+        w
     }
 
     // ------------------------------------------------------------- queries
@@ -649,6 +1161,148 @@ impl ClaimsWorld {
         build_dimension_sync_batches(self, dimension, max_per_batch)
     }
 
+    /// Record that `uuid` (display name `name`) was seen at `tick`. The
+    /// first sighting fixes `first_seen_tick`; later calls refresh the
+    /// name and `last_seen_tick` — deterministic even if callers feed
+    /// ticks out of order (min/max merge).
+    pub fn record_player_seen(&mut self, uuid: &str, name: &str, tick: u64) {
+        match self.known_players.get_mut(uuid) {
+            Some(rec) => {
+                rec.name = name.to_owned();
+                rec.first_seen_tick = rec.first_seen_tick.min(tick);
+                rec.last_seen_tick = rec.last_seen_tick.max(tick);
+            }
+            None => {
+                self.known_players.insert(
+                    uuid.to_owned(),
+                    KnownPlayerRecord {
+                        name: name.to_owned(),
+                        first_seen_tick: tick,
+                        last_seen_tick: tick,
+                    },
+                );
+            }
+        }
+    }
+
+    /// Every player who has ever joined, in UUID order — the roster a
+    /// claim UI lists for 1-click per-player permission editing.
+    pub fn known_players(&self) -> &BTreeMap<String, KnownPlayerRecord> {
+        &self.known_players
+    }
+
+    /// The dimensions players may claim in (`None` = unrestricted).
+    pub fn allowed_claim_dimensions(&self) -> Option<&BTreeSet<String>> {
+        self.allowed_claim_dimensions.as_ref()
+    }
+
+    /// Restrict player claims to `dims` (`Some`) or lift the restriction
+    /// (`None`). Dimension strings are normalized like [`ClaimChunkKey`]
+    /// ids; invalid input is an error, never silently dropped. Admin
+    /// takeovers and server claims ignore this list.
+    pub fn set_allowed_claim_dimensions(
+        &mut self,
+        dims: Option<BTreeSet<String>>,
+    ) -> Result<(), ClaimsError> {
+        let normalized = dims
+            .map(|set| {
+                set.iter()
+                    .map(|d| {
+                        ResourceLocation::parse(d)
+                            .map(|r| r.to_string())
+                            .map_err(|e| ClaimsError::InvalidDimension(e.to_string()))
+                    })
+                    .collect::<Result<BTreeSet<String>, _>>()
+            })
+            .transpose()?;
+        self.allowed_claim_dimensions = normalized;
+        Ok(())
+    }
+
+    /// How player claims are priced.
+    pub fn claim_cost_mode(&self) -> ClaimCostMode {
+        self.claim_cost_mode
+    }
+
+    pub fn set_claim_cost_mode(&mut self, mode: ClaimCostMode) {
+        self.claim_cost_mode = mode;
+    }
+
+    // ------------------------------------------------- permission matrix
+
+    /// Grant `target_player_uuid` an explicit permission set inside
+    /// `owner_uuid`'s `sub` claims — checked before party/ally trust and
+    /// `everyone_else`.
+    pub fn set_player_permission_override(
+        &mut self,
+        owner_uuid: &str,
+        sub: &SubClaimId,
+        target_player_uuid: &str,
+        perms: ClaimPermissionSet,
+    ) {
+        self.protection_config_mut(owner_uuid, sub)
+            .player_overrides
+            .insert(target_player_uuid.to_owned(), perms);
+    }
+
+    /// Remove `target_player_uuid`'s explicit override; party/ally and
+    /// `everyone_else` rules apply again.
+    pub fn clear_player_permission_override(
+        &mut self,
+        owner_uuid: &str,
+        sub: &SubClaimId,
+        target_player_uuid: &str,
+    ) {
+        self.protection_config_mut(owner_uuid, sub)
+            .player_overrides
+            .remove(target_player_uuid);
+    }
+
+    /// Replace the "everyone else" (`自分以外の全員`) permission row for
+    /// `owner_uuid`'s `sub` claims.
+    pub fn set_everyone_else_permissions(
+        &mut self,
+        owner_uuid: &str,
+        sub: &SubClaimId,
+        perms: ClaimPermissionSet,
+    ) {
+        self.protection_config_mut(owner_uuid, sub).everyone_else = perms;
+    }
+
+    /// The permission set `actor_uuid` effectively holds inside
+    /// `owner_uuid`'s `sub` claims: full access for the owner/admins, an
+    /// explicit override when one exists, full access for party members
+    /// and allies (suspended while the owner is over their claim limit),
+    /// else `everyone_else` widened by any permissive `protect_*` flags.
+    pub fn effective_permissions_for(
+        &self,
+        owner_uuid: &str,
+        sub: &SubClaimId,
+        actor_uuid: &str,
+    ) -> ClaimPermissionSet {
+        let okey = player_key(owner_uuid);
+        let cfg = self.effective_config(&okey, sub.as_str());
+        self.perm_set_for(&okey, sub.as_str(), &cfg, actor_uuid)
+    }
+
+    /// The minimap overlay color for `owner_uuid`'s `sub` claims:
+    /// `display_color_rgb` when set (nonzero), else the party color while
+    /// the owner is in a party, else a deterministic owner-hashed color.
+    pub fn claim_display_color(&self, owner_uuid: &str, sub: &SubClaimId) -> u32 {
+        let cfg = self.effective_config(&player_key(owner_uuid), sub.as_str());
+        if cfg.display_color_rgb != 0 {
+            cfg.display_color_rgb
+        } else {
+            self.claim_color(owner_uuid)
+        }
+    }
+
+    /// The minimap label for `owner_uuid`'s `sub` claims, if any.
+    pub fn claim_display_label(&self, owner_uuid: &str, sub: &SubClaimId) -> Option<String> {
+        self.effective_config(&player_key(owner_uuid), sub.as_str())
+            .display_label
+    }
+
     // -------------------------------------------------------------- config
 
     /// The fallback policy for owners without a per-owner entry.
@@ -714,12 +1368,12 @@ impl ClaimsWorld {
                         .get(&(okey.to_owned(), DEFAULT_SUB_CLAIM.to_owned()))
                 }
             })
-            .copied()
+            .cloned()
             .unwrap_or_else(|| {
                 if okey == "server" {
                     ClaimProtectionConfig::server()
                 } else {
-                    self.default_config
+                    self.default_config.clone()
                 }
             })
     }
@@ -750,6 +1404,13 @@ impl ClaimsWorld {
         sub: &SubClaimId,
     ) -> Result<(), ClaimsError> {
         let actor_key = player_key(actor_uuid);
+        if !actor_is_admin {
+            if let Some(dims) = &self.allowed_claim_dimensions {
+                if !dims.contains(&key.dimension) {
+                    return Err(ClaimsError::DimensionNotClaimable(key.dimension.clone()));
+                }
+            }
+        }
         if let Some(existing) = self.claims.get(&key) {
             let ekey = owner_key(&existing.owner);
             if ekey == actor_key {
@@ -967,8 +1628,87 @@ impl ClaimsWorld {
         let okey = owner_key(&claim.owner);
         let cfg = self.effective_config(&okey, &claim.sub_claim);
         match &action {
-            ClaimAction::PistonFrom(src) => return self.border_decision(&okey, &cfg, src, true),
-            ClaimAction::FluidFrom(src) => return self.border_decision(&okey, &cfg, src, false),
+            ClaimAction::PistonFrom(src) => {
+                return self.border_decision(
+                    &okey,
+                    src,
+                    cfg.protect_piston_border,
+                    DenyReason::PistonBorderProtected,
+                );
+            }
+            ClaimAction::FluidFrom(src) => {
+                return self.border_decision(
+                    &okey,
+                    src,
+                    cfg.protect_fluid_border,
+                    DenyReason::FluidBorderProtected,
+                );
+            }
+            ClaimAction::FireSpreadFrom(src) | ClaimAction::LightningFrom(src) => {
+                return self.border_decision(
+                    &okey,
+                    src,
+                    cfg.protect_fire_and_lightning,
+                    DenyReason::FireAndLightningProtected,
+                );
+            }
+            ClaimAction::DispenserOrHopperFrom(src) => {
+                return self.border_decision(
+                    &okey,
+                    src,
+                    cfg.protect_dispenser_hopper_border,
+                    DenyReason::DispenserHopperBorderProtected,
+                );
+            }
+            ClaimAction::ContraptionOrMachineFrom { source, owner_uuid } => {
+                return self.contraption_decision(&okey, &cfg, source, owner_uuid.as_deref());
+            }
+            ClaimAction::ProjectileFrom {
+                source,
+                shooter_uuid,
+            } => {
+                return self.projectile_decision(
+                    &okey,
+                    &claim.sub_claim,
+                    &cfg,
+                    source,
+                    shooter_uuid.as_deref(),
+                );
+            }
+            ClaimAction::ExplosionFrom {
+                source,
+                actor_uuid: cause,
+            } => {
+                return self.explosion_decision(
+                    &okey,
+                    &claim.sub_claim,
+                    &cfg,
+                    source,
+                    cause.as_deref(),
+                );
+            }
+            ClaimAction::VehicleEnterOrInject {
+                source,
+                actor_uuid: driver,
+            } => {
+                return self.vehicle_decision(
+                    &okey,
+                    &claim.sub_claim,
+                    &cfg,
+                    source,
+                    driver.as_deref(),
+                );
+            }
+            ClaimAction::MobOrBossGrief { .. } => {
+                // Mobs carry no player rights — the `source` chunk is
+                // provenance for reporting, not a trust grant, so a boss
+                // already inside the claim is covered too.
+                return if cfg.protect_mob_and_boss_grief {
+                    ClaimDecision::Denied(DenyReason::MobOrBossGriefProtected)
+                } else {
+                    ClaimDecision::Allowed
+                };
+            }
             ClaimAction::Explosion => {
                 return if cfg.protect_explosions {
                     ClaimDecision::Denied(DenyReason::ExplosionsProtected)
@@ -978,58 +1718,127 @@ impl ClaimsWorld {
             }
             _ => {}
         }
-        let (protected, reason) = match action {
-            ClaimAction::BlockBreak | ClaimAction::BlockPlace => {
-                (cfg.protect_blocks, DenyReason::BlocksProtected)
+        let (slot, protected, reason) = match action {
+            ClaimAction::BlockBreak => {
+                (PermSlot::BlockBreak, cfg.protect_blocks, DenyReason::BlocksProtected)
             }
-            ClaimAction::ContainerInteract => {
-                (cfg.protect_containers, DenyReason::ContainersProtected)
+            ClaimAction::BlockPlace => {
+                (PermSlot::BlockPlace, cfg.protect_blocks, DenyReason::BlocksProtected)
             }
-            ClaimAction::EntityAttack => (cfg.protect_entities, DenyReason::EntitiesProtected),
+            ClaimAction::ContainerInteract => (
+                PermSlot::Containers,
+                cfg.protect_containers,
+                DenyReason::ContainersProtected,
+            ),
+            ClaimAction::EntityAttack => (
+                PermSlot::EntityDamage,
+                cfg.protect_entities,
+                DenyReason::EntitiesProtected,
+            ),
+            ClaimAction::EntityInteract => (
+                PermSlot::EntityInteract,
+                cfg.protect_entity_interact,
+                DenyReason::EntityInteractProtected,
+            ),
+            ClaimAction::RedstoneOrDoorInteract => (
+                PermSlot::RedstoneAndDoors,
+                cfg.protect_blocks,
+                DenyReason::RedstoneOrDoorProtected,
+            ),
+            ClaimAction::EntityPushOrDisplace => (
+                PermSlot::EntityPush,
+                cfg.protect_entity_push,
+                DenyReason::EntityPushProtected,
+            ),
+            ClaimAction::EntityTemptOrLure => (
+                PermSlot::EntityInteract,
+                cfg.protect_entity_lure,
+                DenyReason::EntityLureProtected,
+            ),
             _ => unreachable!(),
         };
-        if !protected {
-            return ClaimDecision::Allowed;
-        }
         let actor = actor_uuid.unwrap_or("");
         let is_admin = self.admins.contains(actor);
-        match &claim.owner {
-            ClaimOwner::Server => {
-                if is_admin {
-                    ClaimDecision::Allowed
-                } else {
-                    ClaimDecision::Denied(DenyReason::ServerClaim)
-                }
+        if let ClaimOwner::Player(owner) = &claim.owner {
+            if actor == owner || is_admin {
+                return ClaimDecision::Allowed;
             }
-            ClaimOwner::Expired(_) => {
-                if is_admin {
-                    ClaimDecision::Allowed
-                } else {
-                    ClaimDecision::Denied(DenyReason::ExpiredClaim)
-                }
-            }
-            ClaimOwner::Player(owner) => {
-                if actor == owner || is_admin {
-                    return ClaimDecision::Allowed;
-                }
-                let trusted = (cfg.allow_party_members && self.shares_party(owner, actor))
-                    || (cfg.allow_allies && self.allied(owner, actor));
-                if self.index_count(&okey, &claim.sub_claim) > cfg.max_claims {
-                    // Over-limit: trusted access is suspended; outsiders were
-                    // denied anyway, with the action's own reason.
-                    return if trusted {
-                        ClaimDecision::Denied(DenyReason::OwnerOverLimit)
-                    } else {
-                        ClaimDecision::Denied(reason)
-                    };
-                }
-                if trusted {
+            // An explicit per-player override beats every other rule, so a
+            // blocked party member stays blocked and a trusted friend keeps
+            // access even where `everyone_else` is denied.
+            if let Some(perms) = cfg.player_overrides.get(actor) {
+                return if perms.allows(slot) {
                     ClaimDecision::Allowed
                 } else {
                     ClaimDecision::Denied(reason)
+                };
+            }
+            let trusted = (cfg.allow_party_members && self.shares_party(owner, actor))
+                || (cfg.allow_allies && self.allied(owner, actor));
+            if trusted && self.index_count(&okey, &claim.sub_claim) > cfg.max_claims {
+                // Over-limit: trusted access is suspended; outsiders take
+                // the everyone_else/flag path below.
+                return ClaimDecision::Denied(DenyReason::OwnerOverLimit);
+            }
+            if trusted || !protected || cfg.everyone_else.allows(slot) {
+                ClaimDecision::Allowed
+            } else {
+                ClaimDecision::Denied(reason)
+            }
+        } else {
+            if !protected || cfg.everyone_else.allows(slot) {
+                return ClaimDecision::Allowed;
+            }
+            match &claim.owner {
+                ClaimOwner::Server => {
+                    if is_admin {
+                        ClaimDecision::Allowed
+                    } else {
+                        ClaimDecision::Denied(DenyReason::ServerClaim)
+                    }
                 }
+                ClaimOwner::Expired(_) => {
+                    if is_admin {
+                        ClaimDecision::Allowed
+                    } else {
+                        ClaimDecision::Denied(DenyReason::ExpiredClaim)
+                    }
+                }
+                ClaimOwner::Player(_) => unreachable!(),
             }
         }
+    }
+
+    /// The permission set `actor` effectively holds inside `okey`'s `sub`
+    /// claims — the single resolver behind
+    /// [`ClaimsWorld::effective_permissions_for`] and the actor checks in
+    /// the cross-border decisions.
+    fn perm_set_for(
+        &self,
+        okey: &str,
+        sub: &str,
+        cfg: &ClaimProtectionConfig,
+        actor: &str,
+    ) -> ClaimPermissionSet {
+        let Some(owner) = okey.strip_prefix("player:") else {
+            return if self.admins.contains(actor) {
+                ClaimPermissionSet::trusted_builder()
+            } else {
+                cfg.everyone_else.union(outsider_floor(cfg))
+            };
+        };
+        if actor == owner || self.admins.contains(actor) {
+            return ClaimPermissionSet::trusted_builder();
+        }
+        if let Some(perms) = cfg.player_overrides.get(actor) {
+            return *perms;
+        }
+        let trusted = (cfg.allow_party_members && self.shares_party(owner, actor))
+            || (cfg.allow_allies && self.allied(owner, actor));
+        if trusted && self.index_count(okey, sub) <= cfg.max_claims {
+            return ClaimPermissionSet::trusted_builder();
+        }
+        cfg.everyone_else.union(outsider_floor(cfg))
     }
 
     /// Cross-border rule: movement is allowed while source and target share
@@ -1038,28 +1847,122 @@ impl ClaimsWorld {
     fn border_decision(
         &self,
         target_okey: &str,
-        cfg: &ClaimProtectionConfig,
         src: &ClaimChunkKey,
-        piston: bool,
+        protected: bool,
+        reason: DenyReason,
     ) -> ClaimDecision {
-        let same_owner = self
-            .claims
+        if self.source_same_owner(target_okey, src) || !protected {
+            ClaimDecision::Allowed
+        } else {
+            ClaimDecision::Denied(reason)
+        }
+    }
+
+    /// `src`'s claim has the same owner key as the target (wilderness or a
+    /// foreign claim does not).
+    fn source_same_owner(&self, target_okey: &str, src: &ClaimChunkKey) -> bool {
+        self.claims
             .get(src)
             .map(|c| owner_key(&c.owner) == *target_okey)
+            .unwrap_or(false)
+    }
+
+    /// Modded contraption/quarry rule: same-owner source, or a machine
+    /// whose `owner_uuid` is the claim owner, may cross; anything else is
+    /// blocked while `protect_contraption_border` holds.
+    fn contraption_decision(
+        &self,
+        target_okey: &str,
+        cfg: &ClaimProtectionConfig,
+        src: &ClaimChunkKey,
+        owner_uuid: Option<&str>,
+    ) -> ClaimDecision {
+        let own_machine = owner_uuid
+            .map(|u| player_key(u) == *target_okey)
             .unwrap_or(false);
-        if same_owner {
+        if self.source_same_owner(target_okey, src)
+            || own_machine
+            || !cfg.protect_contraption_border
+        {
+            ClaimDecision::Allowed
+        } else {
+            ClaimDecision::Denied(DenyReason::ContraptionBorderProtected)
+        }
+    }
+
+    /// Projectile rule: a shot fired from a same-owner chunk always lands;
+    /// otherwise the shooter needs `entity_damage` or `block_break`
+    /// permission in the target claim while `protect_projectiles_border`
+    /// holds.
+    fn projectile_decision(
+        &self,
+        target_okey: &str,
+        sub: &str,
+        cfg: &ClaimProtectionConfig,
+        src: &ClaimChunkKey,
+        shooter_uuid: Option<&str>,
+    ) -> ClaimDecision {
+        if self.source_same_owner(target_okey, src) || !cfg.protect_projectiles_border {
             return ClaimDecision::Allowed;
         }
-        let (protected, reason) = if piston {
-            (cfg.protect_piston_border, DenyReason::PistonBorderProtected)
-        } else {
-            (cfg.protect_fluid_border, DenyReason::FluidBorderProtected)
-        };
-        if protected {
-            ClaimDecision::Denied(reason)
-        } else {
-            ClaimDecision::Allowed
+        if let Some(shooter) = shooter_uuid {
+            let perms = self.perm_set_for(target_okey, sub, cfg, shooter);
+            if perms.entity_damage || perms.block_break {
+                return ClaimDecision::Allowed;
+            }
         }
+        ClaimDecision::Denied(DenyReason::ProjectilesBorderProtected)
+    }
+
+    /// Explosion rule: a blast from a same-owner chunk (or one the
+    /// credited actor could have caused there by hand — they hold
+    /// `entity_damage`/`block_break` permission) is allowed; anything else
+    /// is blocked while `protect_explosions` holds.
+    fn explosion_decision(
+        &self,
+        target_okey: &str,
+        sub: &str,
+        cfg: &ClaimProtectionConfig,
+        src: &ClaimChunkKey,
+        actor_uuid: Option<&str>,
+    ) -> ClaimDecision {
+        if self.source_same_owner(target_okey, src) || !cfg.protect_explosions {
+            return ClaimDecision::Allowed;
+        }
+        if let Some(actor) = actor_uuid {
+            let perms = self.perm_set_for(target_okey, sub, cfg, actor);
+            if perms.entity_damage || perms.block_break {
+                return ClaimDecision::Allowed;
+            }
+        }
+        ClaimDecision::Denied(DenyReason::ExplosionsProtected)
+    }
+
+    /// Vehicle rule: a boat/minecart/modded vehicle may enter from a
+    /// same-owner chunk, or when the moving actor holds `entity_interact`
+    /// permission (owner, trusted, overridden or explicitly allowed in
+    /// `everyone_else`); anything else is blocked while
+    /// `protect_vehicle_border` holds.
+    fn vehicle_decision(
+        &self,
+        target_okey: &str,
+        sub: &str,
+        cfg: &ClaimProtectionConfig,
+        src: &ClaimChunkKey,
+        actor_uuid: Option<&str>,
+    ) -> ClaimDecision {
+        if self.source_same_owner(target_okey, src) || !cfg.protect_vehicle_border {
+            return ClaimDecision::Allowed;
+        }
+        if let Some(actor) = actor_uuid {
+            if self
+                .perm_set_for(target_okey, sub, cfg, actor)
+                .entity_interact
+            {
+                return ClaimDecision::Allowed;
+            }
+        }
+        ClaimDecision::Denied(DenyReason::VehicleBorderProtected)
     }
 
     // ------------------------------------------------------------ parties
@@ -1149,27 +2052,43 @@ impl ClaimsWorld {
         Ok(pid)
     }
 
-    /// Leave the party. The owner leaving disbands it — every member is
-    /// released and pending invites die with the party.
+    /// Leave the party. The leaver keeps every chunk they personally own —
+    /// parties are an umbrella over individual ownership, never a merger —
+    /// and instantly loses party access to the remaining members' claims.
+    ///
+    /// When the leader leaves with members remaining, ownership of the
+    /// party itself passes to the highest-ranked remaining member (ties
+    /// broken by lowest UUID, deterministically); when the last member
+    /// leaves, the party dissolves and pending invites die with it.
     pub fn leave_party(&mut self, player_uuid: &str) -> Result<(), ClaimsError> {
         let pid = self
             .member_party
             .get(player_uuid)
             .cloned()
             .ok_or(ClaimsError::NotInParty)?;
-        let is_owner = self.parties[&pid].owner_uuid == player_uuid;
-        if is_owner {
-            let party = self.parties.remove(&pid).unwrap();
-            for uuid in party.members.keys() {
-                self.member_party.remove(uuid);
-            }
-        } else {
-            self.parties
-                .get_mut(&pid)
-                .unwrap()
-                .members
-                .remove(player_uuid);
-            self.member_party.remove(player_uuid);
+        let (is_empty, successor) = {
+            let party = self.parties.get_mut(&pid).unwrap();
+            party.members.remove(player_uuid);
+            let successor = if party.owner_uuid == player_uuid && !party.members.is_empty() {
+                party
+                    .members
+                    .iter()
+                    .max_by(|(ua, ra), (ub, rb)| {
+                        ra.level().cmp(&rb.level()).then(ub.cmp(ua))
+                    })
+                    .map(|(u, _)| u.clone())
+            } else {
+                None
+            };
+            (party.members.is_empty(), successor)
+        };
+        self.member_party.remove(player_uuid);
+        if is_empty {
+            self.parties.remove(&pid);
+        } else if let Some(next) = successor {
+            let party = self.parties.get_mut(&pid).unwrap();
+            party.owner_uuid = next.clone();
+            party.members.insert(next, PartyRank::Owner);
         }
         Ok(())
     }
@@ -1454,7 +2373,25 @@ impl ClaimsWorld {
             .iter()
             .map(|a| Json::String(a.clone()))
             .collect();
-        Json::Object(vec![
+        let known_players: Vec<Json> = self
+            .known_players
+            .iter()
+            .map(|(u, r)| {
+                Json::Object(vec![
+                    ("uuid".to_owned(), Json::String(u.clone())),
+                    ("name".to_owned(), Json::String(r.name.clone())),
+                    (
+                        "firstSeenTick".to_owned(),
+                        Json::Number(r.first_seen_tick as f64),
+                    ),
+                    (
+                        "lastSeenTick".to_owned(),
+                        Json::Number(r.last_seen_tick as f64),
+                    ),
+                ])
+            })
+            .collect();
+        let mut doc = vec![
             ("revision".to_owned(), Json::Number(self.revision as f64)),
             (
                 "nextPartyId".to_owned(),
@@ -1462,13 +2399,24 @@ impl ClaimsWorld {
             ),
             ("admins".to_owned(), Json::Array(admins)),
             (
+                "claimCostMode".to_owned(),
+                Json::String(self.claim_cost_mode.as_str().to_owned()),
+            ),
+            (
                 "defaultConfig".to_owned(),
                 config_to_json(&self.default_config),
             ),
             ("configs".to_owned(), Json::Array(configs)),
             ("claims".to_owned(), Json::Array(claims)),
-        ])
-        .to_json_string()
+            ("knownPlayers".to_owned(), Json::Array(known_players)),
+        ];
+        if let Some(dims) = &self.allowed_claim_dimensions {
+            doc.push((
+                "allowedClaimDimensions".to_owned(),
+                Json::Array(dims.iter().map(|d| Json::String(d.clone())).collect()),
+            ));
+        }
+        Json::Object(doc).to_json_string()
     }
 
     fn parties_json(&self) -> String {
@@ -1519,6 +2467,44 @@ impl ClaimsWorld {
         self.next_party_id = j_u64(&doc, "nextPartyId", ctx)?.unwrap_or(1).max(1);
         if let Some(d) = doc.get("defaultConfig") {
             self.default_config = config_from_json(d, ctx)?;
+        }
+        match doc.get("claimCostMode") {
+            None | Some(Json::Null) => {}
+            Some(Json::String(s)) => {
+                self.claim_cost_mode = ClaimCostMode::parse(s)
+                    .ok_or_else(|| inv(ctx, format!("bad \"claimCostMode\" {s:?}")))?;
+            }
+            Some(_) => return Err(inv(ctx, "\"claimCostMode\" must be a string")),
+        }
+        match doc.get("allowedClaimDimensions") {
+            None | Some(Json::Null) => {}
+            Some(Json::Array(items)) => {
+                let mut dims = BTreeSet::new();
+                for item in items {
+                    let Json::String(d) = item else {
+                        return Err(inv(ctx, "\"allowedClaimDimensions\" must hold strings"));
+                    };
+                    let dim = ResourceLocation::parse(d)
+                        .map_err(|e| inv(ctx, e.to_string()))?;
+                    dims.insert(dim.to_string());
+                }
+                self.allowed_claim_dimensions = Some(dims);
+            }
+            Some(_) => {
+                return Err(inv(ctx, "\"allowedClaimDimensions\" must be an array"));
+            }
+        }
+        if let Some(items) = j_arr(&doc, "knownPlayers", ctx)? {
+            for item in items {
+                let uuid = j_str(item, "uuid", ctx)?.to_owned();
+                let name = j_str(item, "name", ctx)?.to_owned();
+                let rec = KnownPlayerRecord {
+                    name,
+                    first_seen_tick: j_u64(item, "firstSeenTick", ctx)?.unwrap_or(0),
+                    last_seen_tick: j_u64(item, "lastSeenTick", ctx)?.unwrap_or(0),
+                };
+                self.known_players.insert(uuid, rec);
+            }
         }
         for admin in j_arr(&doc, "admins", ctx)?.unwrap_or(&[]) {
             let Json::String(a) = admin else {
@@ -1963,7 +2949,10 @@ fn cmd_opm(
 fn config_dump(c: &ClaimProtectionConfig) -> String {
     format!(
         "protectBlocks={} protectContainers={} protectEntities={} protectExplosions={} \
-         protectPistonBorder={} protectFluidBorder={} allowPartyMembers={} allowAllies={} \
+         protectPistonBorder={} protectFluidBorder={} protectEntityInteract={} \
+         protectProjectilesBorder={} protectFireAndLightning={} protectMobAndBossGrief={} \
+         protectContraptionBorder={} protectDispenserHopperBorder={} protectVehicleBorder={} \
+         protectEntityPush={} protectEntityLure={} allowPartyMembers={} allowAllies={} \
          offlineForceload={} maxClaims={} maxForceloads={}",
         c.protect_blocks,
         c.protect_containers,
@@ -1971,6 +2960,15 @@ fn config_dump(c: &ClaimProtectionConfig) -> String {
         c.protect_explosions,
         c.protect_piston_border,
         c.protect_fluid_border,
+        c.protect_entity_interact,
+        c.protect_projectiles_border,
+        c.protect_fire_and_lightning,
+        c.protect_mob_and_boss_grief,
+        c.protect_contraption_border,
+        c.protect_dispenser_hopper_border,
+        c.protect_vehicle_border,
+        c.protect_entity_push,
+        c.protect_entity_lure,
         c.allow_party_members,
         c.allow_allies,
         c.offline_forceload,
@@ -2005,6 +3003,17 @@ fn config_set(cfg: &mut ClaimProtectionConfig, key: &str, value: &str) -> Result
         "protectexplosions" => cfg.protect_explosions = boolean(value)?,
         "protectpistonborder" => cfg.protect_piston_border = boolean(value)?,
         "protectfluidborder" => cfg.protect_fluid_border = boolean(value)?,
+        "protectentityinteract" => cfg.protect_entity_interact = boolean(value)?,
+        "protectprojectilesborder" => cfg.protect_projectiles_border = boolean(value)?,
+        "protectfireandlightning" => cfg.protect_fire_and_lightning = boolean(value)?,
+        "protectmobandbossgrief" => cfg.protect_mob_and_boss_grief = boolean(value)?,
+        "protectcontraptionborder" => cfg.protect_contraption_border = boolean(value)?,
+        "protectdispenserhopperborder" => {
+            cfg.protect_dispenser_hopper_border = boolean(value)?
+        }
+        "protectvehicleborder" => cfg.protect_vehicle_border = boolean(value)?,
+        "protectentitypush" => cfg.protect_entity_push = boolean(value)?,
+        "protectentitylure" => cfg.protect_entity_lure = boolean(value)?,
         "allowpartymembers" => cfg.allow_party_members = boolean(value)?,
         "allowallies" => cfg.allow_allies = boolean(value)?,
         "offlineforceload" => cfg.offline_forceload = boolean(value)?,
@@ -2092,7 +3101,7 @@ fn owner_from_json(v: &Json, ctx: &str) -> io::Result<ClaimOwner> {
 }
 
 fn config_to_json(c: &ClaimProtectionConfig) -> Json {
-    Json::Object(vec![
+    let mut pairs = vec![
         ("protectBlocks".to_owned(), Json::Bool(c.protect_blocks)),
         (
             "protectContainers".to_owned(),
@@ -2112,6 +3121,42 @@ fn config_to_json(c: &ClaimProtectionConfig) -> Json {
             Json::Bool(c.protect_fluid_border),
         ),
         (
+            "protectEntityInteract".to_owned(),
+            Json::Bool(c.protect_entity_interact),
+        ),
+        (
+            "protectProjectilesBorder".to_owned(),
+            Json::Bool(c.protect_projectiles_border),
+        ),
+        (
+            "protectFireAndLightning".to_owned(),
+            Json::Bool(c.protect_fire_and_lightning),
+        ),
+        (
+            "protectMobAndBossGrief".to_owned(),
+            Json::Bool(c.protect_mob_and_boss_grief),
+        ),
+        (
+            "protectContraptionBorder".to_owned(),
+            Json::Bool(c.protect_contraption_border),
+        ),
+        (
+            "protectDispenserHopperBorder".to_owned(),
+            Json::Bool(c.protect_dispenser_hopper_border),
+        ),
+        (
+            "protectVehicleBorder".to_owned(),
+            Json::Bool(c.protect_vehicle_border),
+        ),
+        (
+            "protectEntityPush".to_owned(),
+            Json::Bool(c.protect_entity_push),
+        ),
+        (
+            "protectEntityLure".to_owned(),
+            Json::Bool(c.protect_entity_lure),
+        ),
+        (
             "allowPartyMembers".to_owned(),
             Json::Bool(c.allow_party_members),
         ),
@@ -2125,7 +3170,78 @@ fn config_to_json(c: &ClaimProtectionConfig) -> Json {
             "maxForceloads".to_owned(),
             Json::Number(c.max_forceloads as f64),
         ),
+        (
+            "everyoneElse".to_owned(),
+            perm_set_to_json(&c.everyone_else),
+        ),
+        (
+            "playerOverrides".to_owned(),
+            Json::Object(
+                c.player_overrides
+                    .iter()
+                    .map(|(u, p)| (u.clone(), perm_set_to_json(p)))
+                    .collect(),
+            ),
+        ),
+        (
+            "displayColorRgb".to_owned(),
+            Json::Number(f64::from(c.display_color_rgb)),
+        ),
+    ];
+    if let Some(label) = &c.display_label {
+        pairs.push(("displayLabel".to_owned(), Json::String(label.clone())));
+    }
+    Json::Object(pairs)
+}
+
+fn perm_set_to_json(p: &ClaimPermissionSet) -> Json {
+    Json::Object(vec![
+        ("blockBreak".to_owned(), Json::Bool(p.block_break)),
+        ("blockPlace".to_owned(), Json::Bool(p.block_place)),
+        ("containers".to_owned(), Json::Bool(p.containers)),
+        (
+            "redstoneAndDoors".to_owned(),
+            Json::Bool(p.redstone_and_doors),
+        ),
+        ("entityInteract".to_owned(), Json::Bool(p.entity_interact)),
+        ("entityDamage".to_owned(), Json::Bool(p.entity_damage)),
+        ("itemPickupDrop".to_owned(), Json::Bool(p.item_pickup_drop)),
+        ("teleportIn".to_owned(), Json::Bool(p.teleport_in)),
     ])
+}
+
+/// Strict types, lenient presence — a stored row that predates a new
+/// permission still parses, defaulting to denied.
+fn perm_set_from_json(v: &Json, ctx: &str) -> io::Result<ClaimPermissionSet> {
+    let Json::Object(_) = v else {
+        return Err(inv(ctx, "permission set must be a JSON object"));
+    };
+    let mut p = ClaimPermissionSet::denied_all();
+    if let Some(b) = j_bool(v, "blockBreak", ctx)? {
+        p.block_break = b;
+    }
+    if let Some(b) = j_bool(v, "blockPlace", ctx)? {
+        p.block_place = b;
+    }
+    if let Some(b) = j_bool(v, "containers", ctx)? {
+        p.containers = b;
+    }
+    if let Some(b) = j_bool(v, "redstoneAndDoors", ctx)? {
+        p.redstone_and_doors = b;
+    }
+    if let Some(b) = j_bool(v, "entityInteract", ctx)? {
+        p.entity_interact = b;
+    }
+    if let Some(b) = j_bool(v, "entityDamage", ctx)? {
+        p.entity_damage = b;
+    }
+    if let Some(b) = j_bool(v, "itemPickupDrop", ctx)? {
+        p.item_pickup_drop = b;
+    }
+    if let Some(b) = j_bool(v, "teleportIn", ctx)? {
+        p.teleport_in = b;
+    }
+    Ok(p)
 }
 
 /// Strict types, lenient presence: every key that is there must have the
@@ -2162,11 +3278,62 @@ fn config_from_json(v: &Json, ctx: &str) -> io::Result<ClaimProtectionConfig> {
     if let Some(b) = j_bool(v, "offlineForceload", ctx)? {
         c.offline_forceload = b;
     }
+    if let Some(b) = j_bool(v, "protectEntityInteract", ctx)? {
+        c.protect_entity_interact = b;
+    }
+    if let Some(b) = j_bool(v, "protectProjectilesBorder", ctx)? {
+        c.protect_projectiles_border = b;
+    }
+    if let Some(b) = j_bool(v, "protectFireAndLightning", ctx)? {
+        c.protect_fire_and_lightning = b;
+    }
+    if let Some(b) = j_bool(v, "protectMobAndBossGrief", ctx)? {
+        c.protect_mob_and_boss_grief = b;
+    }
+    if let Some(b) = j_bool(v, "protectContraptionBorder", ctx)? {
+        c.protect_contraption_border = b;
+    }
+    if let Some(b) = j_bool(v, "protectDispenserHopperBorder", ctx)? {
+        c.protect_dispenser_hopper_border = b;
+    }
+    if let Some(b) = j_bool(v, "protectVehicleBorder", ctx)? {
+        c.protect_vehicle_border = b;
+    }
+    if let Some(b) = j_bool(v, "protectEntityPush", ctx)? {
+        c.protect_entity_push = b;
+    }
+    if let Some(b) = j_bool(v, "protectEntityLure", ctx)? {
+        c.protect_entity_lure = b;
+    }
     if let Some(n) = j_u64(v, "maxClaims", ctx)? {
         c.max_claims = usize::try_from(n).map_err(|_| inv(ctx, "maxClaims too large"))?;
     }
     if let Some(n) = j_u64(v, "maxForceloads", ctx)? {
         c.max_forceloads = usize::try_from(n).map_err(|_| inv(ctx, "maxForceloads too large"))?;
+    }
+    if let Some(e) = v.get("everyoneElse") {
+        c.everyone_else = perm_set_from_json(e, ctx)?;
+    }
+    match v.get("playerOverrides") {
+        None | Some(Json::Null) => {}
+        Some(Json::Object(rows)) => {
+            for (uuid, perms) in rows {
+                c.player_overrides
+                    .insert(uuid.clone(), perm_set_from_json(perms, ctx)?);
+            }
+        }
+        Some(_) => return Err(inv(ctx, "\"playerOverrides\" must be an object")),
+    }
+    if let Some(n) = j_u64(v, "displayColorRgb", ctx)? {
+        if n > 0x00ff_ffff {
+            return Err(inv(ctx, "\"displayColorRgb\" out of range"));
+        }
+        c.display_color_rgb = n as u32;
+    }
+    match v.get("displayLabel") {
+        None | Some(Json::Null) => {}
+        Some(Json::String(s)) => c.display_label = Some(s.clone()),
+        Some(_) => return Err(inv(ctx, "\"displayLabel\" must be a string")),
     }
     Ok(c)
 }
@@ -2495,8 +3662,14 @@ mod tests {
         );
         w.kick_member(&owner, &officer).unwrap();
         assert!(w.party_of(&officer).is_none());
-        // Owner leaving disbands.
+        // The owner leaving hands leadership to the highest-ranked member
+        // left behind (member is Moderator here); the last one out
+        // dissolves the party.
         w.leave_party(&owner).unwrap();
+        assert!(w.party_of(&owner).is_none());
+        assert_eq!(w.parties()[&pid].owner_uuid, member);
+        assert_eq!(w.parties()[&pid].rank_of(&member), Some(PartyRank::Owner));
+        w.leave_party(&member).unwrap();
         assert!(w.party_of(&member).is_none());
         assert_eq!(w.parties().len(), 0);
 
@@ -2850,5 +4023,841 @@ mod tests {
             w.claim_chunk(&a, k("overworld", 1, 0), &main),
             Err(ClaimsError::AlreadyClaimed)
         );
+    }
+
+    #[test]
+    fn known_players_and_per_player_permission_matrix() {
+        let mut w = ClaimsWorld::new();
+        let (owner, friend, foe, stranger) = (uuid(1), uuid(2), uuid(3), uuid(4));
+        let main = main_sub();
+
+        // The roster records every player who ever joined; re-sightings
+        // refresh the name and stretch the seen-tick window.
+        w.record_player_seen(&owner, "Owner", 10);
+        w.record_player_seen(&friend, "Friend", 20);
+        w.record_player_seen(&friend, "FriendRenamed", 30);
+        w.record_player_seen(&foe, "Foe", 5);
+        assert_eq!(w.known_players().len(), 3);
+        let rec = &w.known_players()[&friend];
+        assert_eq!(rec.name, "FriendRenamed");
+        assert_eq!(rec.first_seen_tick, 20);
+        assert_eq!(rec.last_seen_tick, 30);
+
+        let home = k("overworld", 0, 0);
+        w.claim_chunk(&owner, home.clone(), &main).unwrap();
+        assert_eq!(
+            w.check_action(&home, Some(&stranger), ClaimAction::BlockBreak),
+            ClaimDecision::Denied(DenyReason::BlocksProtected)
+        );
+
+        // 1-click grant: the friend alone may build and open containers.
+        w.set_player_permission_override(
+            &owner,
+            &main,
+            &friend,
+            ClaimPermissionSet {
+                block_break: true,
+                block_place: true,
+                containers: true,
+                ..ClaimPermissionSet::denied_all()
+            },
+        );
+        assert_eq!(
+            w.check_action(&home, Some(&friend), ClaimAction::BlockBreak),
+            ClaimDecision::Allowed
+        );
+        assert_eq!(
+            w.check_action(&home, Some(&friend), ClaimAction::ContainerInteract),
+            ClaimDecision::Allowed
+        );
+        // Permissions not granted stay denied.
+        assert_eq!(
+            w.check_action(&home, Some(&friend), ClaimAction::EntityAttack),
+            ClaimDecision::Denied(DenyReason::EntitiesProtected)
+        );
+        // The override governs completely: no block_place bit -> denied
+        // even when the flag would have allowed it.
+        w.protection_config_mut(&owner, &main).protect_blocks = false;
+        assert_eq!(
+            w.check_action(&home, Some(&stranger), ClaimAction::BlockBreak),
+            ClaimDecision::Allowed
+        );
+        w.protection_config_mut(&owner, &main).protect_blocks = true;
+
+        // everyone_else: visitors may open doors and pick up items, nothing
+        // else.
+        w.set_everyone_else_permissions(&owner, &main, ClaimPermissionSet::visitor());
+        assert_eq!(
+            w.check_action(&home, Some(&stranger), ClaimAction::RedstoneOrDoorInteract),
+            ClaimDecision::Allowed
+        );
+        assert_eq!(
+            w.check_action(&home, Some(&stranger), ClaimAction::BlockBreak),
+            ClaimDecision::Denied(DenyReason::BlocksProtected)
+        );
+
+        // Party members are trusted — but an explicit override still wins,
+        // so one specific player can be blocked even while their party
+        // keeps access.
+        let _pid = w.create_party(&owner, "Crew").unwrap();
+        w.invite_player(&owner, &foe).unwrap();
+        w.accept_invite(&foe, None).unwrap();
+        assert_eq!(
+            w.check_action(&home, Some(&foe), ClaimAction::BlockBreak),
+            ClaimDecision::Allowed
+        );
+        w.set_player_permission_override(&owner, &main, &foe, ClaimPermissionSet::denied_all());
+        assert_eq!(
+            w.check_action(&home, Some(&foe), ClaimAction::BlockBreak),
+            ClaimDecision::Denied(DenyReason::BlocksProtected)
+        );
+        w.clear_player_permission_override(&owner, &main, &foe);
+        assert_eq!(
+            w.check_action(&home, Some(&foe), ClaimAction::BlockBreak),
+            ClaimDecision::Allowed
+        );
+
+        // effective_permissions_for mirrors check_action's resolution.
+        let eff = w.effective_permissions_for(&owner, &main, &friend);
+        assert!(eff.block_break && eff.containers && !eff.entity_damage);
+        let eff = w.effective_permissions_for(&owner, &main, &stranger);
+        assert!(eff.redstone_and_doors && eff.item_pickup_drop && !eff.block_break);
+        assert_eq!(
+            w.effective_permissions_for(&owner, &main, &owner),
+            ClaimPermissionSet::trusted_builder()
+        );
+        // The 1-click presets compose sanely.
+        assert_eq!(ClaimPermissionSet::denied_all(), ClaimPermissionSet::default());
+        assert!(ClaimPermissionSet::container_only().containers);
+        assert!(!ClaimPermissionSet::container_only().block_break);
+        assert!(ClaimPermissionSet::trusted_builder().teleport_in);
+    }
+
+    #[test]
+    fn entity_interact_push_and_lure_protection() {
+        let mut w = ClaimsWorld::new();
+        let (owner, outsider, guest) = (uuid(1), uuid(2), uuid(3));
+        let main = main_sub();
+        let home = k("overworld", 0, 0);
+        w.claim_chunk(&owner, home.clone(), &main).unwrap();
+
+        // Armor stands, item frames, shearing/leashing/milking pets: all
+        // denied to outsiders, allowed for the owner.
+        for action in [
+            ClaimAction::EntityInteract,
+            ClaimAction::EntityPushOrDisplace,
+            ClaimAction::EntityTemptOrLure,
+        ] {
+            assert_eq!(
+                w.check_action(&home, Some(&owner), action.clone()),
+                ClaimDecision::Allowed,
+                "{action:?}"
+            );
+        }
+        assert_eq!(
+            w.check_action(&home, Some(&outsider), ClaimAction::EntityInteract),
+            ClaimDecision::Denied(DenyReason::EntityInteractProtected)
+        );
+        // Body-push / fishing-rod / knockback displacement: zero movement
+        // for outsiders.
+        assert_eq!(
+            w.check_action(&home, Some(&outsider), ClaimAction::EntityPushOrDisplace),
+            ClaimDecision::Denied(DenyReason::EntityPushProtected)
+        );
+        // Wheat/carrot/seeds lure: tempt AI ignores the outsider.
+        assert_eq!(
+            w.check_action(&home, Some(&outsider), ClaimAction::EntityTemptOrLure),
+            ClaimDecision::Denied(DenyReason::EntityLureProtected)
+        );
+
+        // A player granted entity_interact can push, lure, shear and ride.
+        w.set_player_permission_override(
+            &owner,
+            &main,
+            &guest,
+            ClaimPermissionSet {
+                entity_interact: true,
+                ..ClaimPermissionSet::denied_all()
+            },
+        );
+        for action in [
+            ClaimAction::EntityInteract,
+            ClaimAction::EntityPushOrDisplace,
+            ClaimAction::EntityTemptOrLure,
+        ] {
+            assert_eq!(
+                w.check_action(&home, Some(&guest), action.clone()),
+                ClaimDecision::Allowed,
+                "{action:?}"
+            );
+        }
+        // entity_damage alone also allows displacement (hurt-push), but
+        // not tempting or touching.
+        w.set_player_permission_override(
+            &owner,
+            &main,
+            &guest,
+            ClaimPermissionSet {
+                entity_damage: true,
+                ..ClaimPermissionSet::denied_all()
+            },
+        );
+        assert_eq!(
+            w.check_action(&home, Some(&guest), ClaimAction::EntityPushOrDisplace),
+            ClaimDecision::Allowed
+        );
+        assert_eq!(
+            w.check_action(&home, Some(&guest), ClaimAction::EntityInteract),
+            ClaimDecision::Denied(DenyReason::EntityInteractProtected)
+        );
+
+        // Flags off open the actions to everyone.
+        w.clear_player_permission_override(&owner, &main, &guest);
+        w.protection_config_mut(&owner, &main).protect_entity_lure = false;
+        w.protection_config_mut(&owner, &main).protect_entity_push = false;
+        assert_eq!(
+            w.check_action(&home, Some(&outsider), ClaimAction::EntityTemptOrLure),
+            ClaimDecision::Allowed
+        );
+        assert_eq!(
+            w.check_action(&home, Some(&outsider), ClaimAction::EntityPushOrDisplace),
+            ClaimDecision::Allowed
+        );
+        // Interact is still protected by its own flag.
+        assert_eq!(
+            w.check_action(&home, Some(&outsider), ClaimAction::EntityInteract),
+            ClaimDecision::Denied(DenyReason::EntityInteractProtected)
+        );
+    }
+
+    #[test]
+    fn cross_border_grief_protection_suite() {
+        let mut w = ClaimsWorld::new();
+        let (a, b) = (uuid(1), uuid(2));
+        let main = main_sub();
+        let a_home = k("overworld", 0, 0);
+        let a_annex = k("overworld", 1, 0);
+        let b_home = k("overworld", 2, 0);
+        let wild = k("overworld", 3, 0);
+        w.claim_chunk(&a, a_home.clone(), &main).unwrap();
+        w.claim_chunk(&a, a_annex.clone(), &main).unwrap();
+        w.claim_chunk(&b, b_home.clone(), &main).unwrap();
+
+        // --- projectiles: outsider bow/trident/potion shots are denied;
+        //     the owner (or anyone with damage/build permission) may shoot
+        //     in, and same-owner chunks always allow the flight path.
+        for shooter in [Some(b.clone()), None] {
+            assert_eq!(
+                w.check_action(
+                    &a_home,
+                    None,
+                    ClaimAction::ProjectileFrom {
+                        source: wild.clone(),
+                        shooter_uuid: shooter.clone(),
+                    }
+                ),
+                ClaimDecision::Denied(DenyReason::ProjectilesBorderProtected),
+                "{shooter:?}"
+            );
+        }
+        assert_eq!(
+            w.check_action(
+                &a_home,
+                None,
+                ClaimAction::ProjectileFrom {
+                    source: b_home.clone(),
+                    shooter_uuid: Some(b.clone()),
+                }
+            ),
+            ClaimDecision::Denied(DenyReason::ProjectilesBorderProtected)
+        );
+        assert_eq!(
+            w.check_action(
+                &a_home,
+                None,
+                ClaimAction::ProjectileFrom {
+                    source: wild.clone(),
+                    shooter_uuid: Some(a.clone()),
+                }
+            ),
+            ClaimDecision::Allowed
+        );
+        assert_eq!(
+            w.check_action(
+                &a_home,
+                None,
+                ClaimAction::ProjectileFrom {
+                    source: a_annex.clone(),
+                    shooter_uuid: Some(b.clone()),
+                }
+            ),
+            ClaimDecision::Allowed
+        );
+        // A friend with entity_damage may also shoot in.
+        w.set_player_permission_override(
+            &a,
+            &main,
+            &b,
+            ClaimPermissionSet {
+                entity_damage: true,
+                ..ClaimPermissionSet::denied_all()
+            },
+        );
+        assert_eq!(
+            w.check_action(
+                &a_home,
+                None,
+                ClaimAction::ProjectileFrom {
+                    source: wild.clone(),
+                    shooter_uuid: Some(b.clone()),
+                }
+            ),
+            ClaimDecision::Allowed
+        );
+        w.clear_player_permission_override(&a, &main, &b);
+
+        // --- fire and lightning crossing the border.
+        for action in [
+            ClaimAction::FireSpreadFrom(wild.clone()),
+            ClaimAction::LightningFrom(wild.clone()),
+            ClaimAction::FireSpreadFrom(b_home.clone()),
+            ClaimAction::LightningFrom(b_home.clone()),
+        ] {
+            assert_eq!(
+                w.check_action(&a_home, None, action.clone()),
+                ClaimDecision::Denied(DenyReason::FireAndLightningProtected),
+                "{action:?}"
+            );
+        }
+        assert_eq!(
+            w.check_action(&a_home, None, ClaimAction::FireSpreadFrom(a_annex.clone())),
+            ClaimDecision::Allowed
+        );
+        // --- explosions: outsider TNT cannons and creepers are denied;
+        //     the owner's own blast inside their land is fine.
+        assert_eq!(
+            w.check_action(
+                &a_home,
+                None,
+                ClaimAction::ExplosionFrom {
+                    source: wild.clone(),
+                    actor_uuid: None,
+                }
+            ),
+            ClaimDecision::Denied(DenyReason::ExplosionsProtected)
+        );
+        assert_eq!(
+            w.check_action(
+                &a_home,
+                None,
+                ClaimAction::ExplosionFrom {
+                    source: b_home.clone(),
+                    actor_uuid: Some(b.clone()),
+                }
+            ),
+            ClaimDecision::Denied(DenyReason::ExplosionsProtected)
+        );
+        assert_eq!(
+            w.check_action(
+                &a_home,
+                None,
+                ClaimAction::ExplosionFrom {
+                    source: a_annex.clone(),
+                    actor_uuid: Some(a.clone()),
+                }
+            ),
+            ClaimDecision::Allowed
+        );
+        // --- mob and boss grief: endermen, ravagers, withers, colossal
+        //     dragons — inside or across the border, all denied.
+        for (src, boss) in [
+            (None, true),
+            (Some(wild.clone()), true),
+            (Some(b_home.clone()), false),
+            (None, false),
+        ] {
+            assert_eq!(
+                w.check_action(
+                    &a_home,
+                    None,
+                    ClaimAction::MobOrBossGrief {
+                        source: src,
+                        is_boss_or_dragon: boss,
+                    }
+                ),
+                ClaimDecision::Denied(DenyReason::MobOrBossGriefProtected),
+                "boss={boss}"
+            );
+        }
+        // --- modded contraptions/quarries crossing the border.
+        assert_eq!(
+            w.check_action(
+                &a_home,
+                None,
+                ClaimAction::ContraptionOrMachineFrom {
+                    source: b_home.clone(),
+                    owner_uuid: Some(b.clone()),
+                }
+            ),
+            ClaimDecision::Denied(DenyReason::ContraptionBorderProtected)
+        );
+        assert_eq!(
+            w.check_action(
+                &a_home,
+                None,
+                ClaimAction::ContraptionOrMachineFrom {
+                    source: a_annex.clone(),
+                    owner_uuid: Some(a.clone()),
+                }
+            ),
+            ClaimDecision::Allowed
+        );
+        // The owner's own machine parked in the wilderness may reach in.
+        assert_eq!(
+            w.check_action(
+                &a_home,
+                None,
+                ClaimAction::ContraptionOrMachineFrom {
+                    source: wild.clone(),
+                    owner_uuid: Some(a.clone()),
+                }
+            ),
+            ClaimDecision::Allowed
+        );
+        // --- dispensers dumping fluid and hoppers siphoning chests.
+        assert_eq!(
+            w.check_action(&a_home, None, ClaimAction::DispenserOrHopperFrom(b_home)),
+            ClaimDecision::Denied(DenyReason::DispenserHopperBorderProtected)
+        );
+        assert_eq!(
+            w.check_action(&a_home, None, ClaimAction::DispenserOrHopperFrom(wild)),
+            ClaimDecision::Denied(DenyReason::DispenserHopperBorderProtected)
+        );
+        assert_eq!(
+            w.check_action(&a_home, None, ClaimAction::DispenserOrHopperFrom(a_annex)),
+            ClaimDecision::Allowed
+        );
+
+        // Flipping each flag off opens that border — per claim, as
+        // configured.
+        w.protection_config_mut(&a, &main).protect_fire_and_lightning = false;
+        assert_eq!(
+            w.check_action(&a_home, None, ClaimAction::FireSpreadFrom(k("overworld", 9, 9))),
+            ClaimDecision::Allowed
+        );
+        w.protection_config_mut(&a, &main).protect_mob_and_boss_grief = false;
+        assert_eq!(
+            w.check_action(
+                &a_home,
+                None,
+                ClaimAction::MobOrBossGrief {
+                    source: None,
+                    is_boss_or_dragon: true,
+                }
+            ),
+            ClaimDecision::Allowed
+        );
+    }
+
+    #[test]
+    fn cross_border_vehicle_injection_protection() {
+        let mut w = ClaimsWorld::new();
+        let (a, b, guest) = (uuid(1), uuid(2), uuid(3));
+        let main = main_sub();
+        let a_home = k("overworld", 0, 0);
+        let a_annex = k("overworld", 1, 0);
+        let wild = k("overworld", 3, 0);
+        w.claim_chunk(&a, a_home.clone(), &main).unwrap();
+        w.claim_chunk(&a, a_annex.clone(), &main).unwrap();
+
+        // An outsider pushing a boat/minecart in to kidnap a villager:
+        // denied, from wilderness or their own claim alike.
+        assert_eq!(
+            w.check_action(
+                &a_home,
+                None,
+                ClaimAction::VehicleEnterOrInject {
+                    source: wild.clone(),
+                    actor_uuid: Some(b.clone()),
+                }
+            ),
+            ClaimDecision::Denied(DenyReason::VehicleBorderProtected)
+        );
+        // The owner driving their own cart in, a guest holding
+        // entity_interact permission, and same-owner chunks: all fine.
+        for (src, actor) in [
+            (wild.clone(), Some(a.clone())),
+            (a_annex.clone(), Some(b.clone())),
+            (a_annex.clone(), None),
+        ] {
+            assert_eq!(
+                w.check_action(
+                    &a_home,
+                    None,
+                    ClaimAction::VehicleEnterOrInject {
+                        source: src,
+                        actor_uuid: actor.clone(),
+                    }
+                ),
+                ClaimDecision::Allowed,
+                "{actor:?}"
+            );
+        }
+        w.set_player_permission_override(
+            &a,
+            &main,
+            &guest,
+            ClaimPermissionSet {
+                entity_interact: true,
+                ..ClaimPermissionSet::denied_all()
+            },
+        );
+        assert_eq!(
+            w.check_action(
+                &a_home,
+                None,
+                ClaimAction::VehicleEnterOrInject {
+                    source: wild.clone(),
+                    actor_uuid: Some(guest.clone()),
+                }
+            ),
+            ClaimDecision::Allowed
+        );
+        // No actor information at all: still protected.
+        assert_eq!(
+            w.check_action(
+                &a_home,
+                None,
+                ClaimAction::VehicleEnterOrInject {
+                    source: wild.clone(),
+                    actor_uuid: None,
+                }
+            ),
+            ClaimDecision::Denied(DenyReason::VehicleBorderProtected)
+        );
+        // Flag off: the border opens.
+        w.protection_config_mut(&a, &main).protect_vehicle_border = false;
+        assert_eq!(
+            w.check_action(
+                &a_home,
+                None,
+                ClaimAction::VehicleEnterOrInject {
+                    source: wild,
+                    actor_uuid: Some(b),
+                }
+            ),
+            ClaimDecision::Allowed
+        );
+    }
+
+    #[test]
+    fn organic_claim_economy_quotes() {
+        let mut w = ClaimsWorld::new();
+        let (a, b) = (uuid(1), uuid(2));
+        let main = main_sub();
+        let policy = OrganicClaimPolicy::default();
+        assert_eq!(policy.starter_free_chunks, 1);
+        assert_eq!(w.claim_cost_mode(), ClaimCostMode::FreeQuota);
+
+        // The first chunk is the free starter plot.
+        let first = k("overworld", 0, 0);
+        let q0 = compute_organic_chunk_cost(&w, &a, &first, &policy);
+        assert!(q0.is_starter_free);
+        assert_eq!(q0.cost_points, 0);
+        w.claim_chunk(&a, first, &main).unwrap();
+
+        // The second chunk, edge-adjacent to the starter: 1.00x = 100.
+        let q = compute_organic_chunk_cost(&w, &a, &k("overworld", 1, 0), &policy);
+        assert!(!q.is_starter_free);
+        assert!(q.is_contiguous);
+        assert_eq!(q.nearby_foreign_claims, 0);
+        assert_eq!(q.density_multiplier_bps, 10_000);
+        assert_eq!(q.cost_points, 100);
+
+        // A disconnected island pays the 2.25x scatter penalty.
+        let qi = compute_organic_chunk_cost(&w, &a, &k("overworld", 40, 40), &policy);
+        assert!(!qi.is_contiguous);
+        assert_eq!(qi.cost_points, 225);
+
+        // Fluid density: a foreign claim cluster raises land value toward
+        // the 3.0x cap while staying cheap on the frontier.
+        let hub = k("overworld", 10, 0);
+        w.claim_chunk(&a, k("overworld", 9, 0), &main).unwrap(); // adjacency
+        for cz in -3..=0 {
+            w.claim_chunk(&b, k("overworld", 12, cz), &main).unwrap();
+        }
+        let q = compute_organic_chunk_cost(&w, &a, &hub, &policy);
+        assert!(q.is_contiguous);
+        assert_eq!(q.nearby_foreign_claims, 4);
+        assert_eq!(q.density_multiplier_bps, 16_000); // +15% * 4
+        assert_eq!(q.cost_points, 160);
+        // Ten more foreign claims inside the radius saturate the cap.
+        for cz in 1..=3 {
+            w.claim_chunk(&b, k("overworld", 12, cz), &main).unwrap();
+        }
+        for cz in -3..=3 {
+            w.claim_chunk(&b, k("overworld", 13, cz), &main).unwrap();
+        }
+        let q = compute_organic_chunk_cost(&w, &a, &hub, &policy);
+        assert_eq!(q.nearby_foreign_claims, 14);
+        assert_eq!(q.density_multiplier_bps, 30_000);
+        assert_eq!(q.cost_points, 300);
+        // An island in a crowded hub compounds both multipliers: only 8
+        // of the foreign claims sit within its radius, so density is
+        // 2.2x and the island pays 100 * 2.25 * 2.2.
+        let q = compute_organic_chunk_cost(&w, &a, &k("overworld", 11, 3), &policy);
+        assert!(!q.is_contiguous);
+        assert_eq!(q.nearby_foreign_claims, 8);
+        assert_eq!(q.density_multiplier_bps, 22_000);
+        assert_eq!(q.cost_points, 495);
+        // Out on the frontier the same player still pays base price.
+        w.claim_chunk(&a, k("overworld", 50, 50), &main).unwrap();
+        let q = compute_organic_chunk_cost(&w, &a, &k("overworld", 51, 50), &policy);
+        assert!(q.is_contiguous);
+        assert_eq!(q.nearby_foreign_claims, 0);
+        assert_eq!(q.cost_points, 100);
+
+        // Budgets grow deterministically with playtime, advancements and
+        // boss defeats; sub-hour playtime mints nothing.
+        assert_eq!(compute_organic_budget(71_999, 0, 0, &policy), 0);
+        assert_eq!(compute_organic_budget(72_000, 0, 0, &policy), 120);
+        assert_eq!(compute_organic_budget(72_000, 3, 1, &policy), 120 + 180 + 250);
+        assert_eq!(compute_organic_budget(144_000, 0, 2, &policy), 240 + 500);
+    }
+
+    #[test]
+    fn party_umbrella_lifecycle_keeps_individual_ownership() {
+        let mut w = ClaimsWorld::new();
+        let (owner, member, third) = (uuid(1), uuid(2), uuid(3));
+        let main = main_sub();
+        let a_home = k("overworld", 0, 0);
+        let b_home = k("overworld", 5, 0);
+        w.claim_chunk(&owner, a_home.clone(), &main).unwrap();
+        w.claim_chunk(&member, b_home.clone(), &main).unwrap();
+
+        // JOIN: ownership never merges — the member keeps 100% of their
+        // chunks and gains the owner's configured party access. Claims
+        // made while in the party take the party's minimap color.
+        let pid = w.create_party(&owner, "Umbrella").unwrap();
+        w.invite_player(&owner, &member).unwrap();
+        w.accept_invite(&member, Some(&pid)).unwrap();
+        assert_eq!(
+            w.claim_at(&b_home).unwrap().owner,
+            ClaimOwner::Player(member.clone())
+        );
+        assert_eq!(
+            w.claim_at(&a_home).unwrap().owner,
+            ClaimOwner::Player(owner.clone())
+        );
+        assert_eq!(
+            w.check_action(&a_home, Some(&member), ClaimAction::BlockBreak),
+            ClaimDecision::Allowed
+        );
+        let party_color = w.parties()[&pid].color_rgb;
+        let new_chunk = k("overworld", 1, 0);
+        w.claim_chunk(&owner, new_chunk.clone(), &main).unwrap();
+        assert_eq!(w.claim_at(&new_chunk).unwrap().color_rgb, party_color);
+        assert_eq!(w.claim_display_color(&owner, &main), party_color);
+
+        // KICK: the kicked member keeps every chunk and instantly loses
+        // party access — and the party instantly loses access to theirs.
+        w.kick_member(&owner, &member).unwrap();
+        assert_eq!(
+            w.claim_at(&b_home).unwrap().owner,
+            ClaimOwner::Player(member.clone())
+        );
+        assert_eq!(
+            w.check_action(&a_home, Some(&member), ClaimAction::BlockBreak),
+            ClaimDecision::Denied(DenyReason::BlocksProtected)
+        );
+        assert_eq!(
+            w.check_action(&b_home, Some(&owner), ClaimAction::BlockBreak),
+            ClaimDecision::Denied(DenyReason::BlocksProtected)
+        );
+
+        // LEADER LEAVES with members remaining: leadership transfers to
+        // the highest-ranked member instead of stranding the party.
+        w.invite_player(&owner, &member).unwrap();
+        w.accept_invite(&member, None).unwrap();
+        w.invite_player(&owner, &third).unwrap();
+        w.accept_invite(&third, None).unwrap();
+        w.set_rank(&owner, &member, PartyRank::Moderator).unwrap();
+        w.leave_party(&owner).unwrap();
+        let party = &w.parties()[&pid];
+        assert_eq!(party.owner_uuid, member); // Moderator beats Member
+        assert_eq!(party.rank_of(&member), Some(PartyRank::Owner));
+        assert_eq!(party.rank_of(&third), Some(PartyRank::Member));
+        // The ex-leader loses party access to members' chunks instantly;
+        // the new leader's chunks stay open to the remaining member.
+        assert_eq!(
+            w.check_action(&b_home, Some(&owner), ClaimAction::BlockBreak),
+            ClaimDecision::Denied(DenyReason::BlocksProtected)
+        );
+        assert_eq!(
+            w.check_action(&b_home, Some(&third), ClaimAction::BlockBreak),
+            ClaimDecision::Allowed
+        );
+        // Succession chains; the last member out dissolves the party.
+        w.leave_party(&member).unwrap();
+        assert_eq!(w.parties()[&pid].owner_uuid, third);
+        w.leave_party(&third).unwrap();
+        assert!(w.parties().is_empty());
+        assert!(w.party_of(&third).is_none());
+        // Everyone's chunks are still theirs.
+        assert_eq!(
+            w.claim_at(&b_home).unwrap().owner,
+            ClaimOwner::Player(member)
+        );
+        assert_eq!(
+            w.claim_at(&a_home).unwrap().owner,
+            ClaimOwner::Player(owner)
+        );
+    }
+
+    #[test]
+    fn survival_default_restricts_claim_dimensions() {
+        let mut w = ClaimsWorld::new_survival_default();
+        let (a, admin) = (uuid(1), uuid(9));
+        w.set_admin(admin.as_str(), true);
+        let main = main_sub();
+
+        w.claim_chunk(&a, k("overworld", 0, 0), &main).unwrap();
+        for dim in ["the_nether", "the_end", "aeronautics:space"] {
+            let key = ClaimChunkKey::new(dim, 0, 0).unwrap();
+            assert_eq!(
+                w.claim_chunk(&a, key, &main),
+                Err(ClaimsError::DimensionNotClaimable(
+                    ResourceLocation::parse(dim).unwrap().to_string()
+                )),
+                "{dim}"
+            );
+        }
+        // Admin takeovers and server claims work in any dimension —
+        // spawn protection and portal rooms are still possible.
+        w.claim_chunk_as(&admin, true, k("the_nether", 0, 0), &main)
+            .unwrap();
+        w.claim_server_chunk(true, k("the_end", 0, 0), &main).unwrap();
+
+        // A server can opt more dimensions back in — or lift the
+        // restriction entirely.
+        w.set_allowed_claim_dimensions(Some(
+            ["overworld", "the_nether"]
+                .iter()
+                .map(|s| (*s).to_owned())
+                .collect(),
+        ))
+        .unwrap();
+        // The setter normalizes ids like ClaimChunkKey does.
+        assert!(w
+            .allowed_claim_dimensions()
+            .unwrap()
+            .contains("minecraft:the_nether"));
+        w.claim_chunk(&a, k("the_nether", 1, 0), &main).unwrap();
+        w.set_allowed_claim_dimensions(None).unwrap();
+        w.claim_chunk(&a, k("the_end", 1, 0), &main).unwrap();
+        assert!(w
+            .set_allowed_claim_dimensions(Some(
+                ["bad dim"].iter().map(|s| (*s).to_owned()).collect()
+            ))
+            .is_err());
+
+        // ClaimsWorld::new() stays unrestricted for compatibility.
+        let mut open = ClaimsWorld::new();
+        assert!(open.allowed_claim_dimensions().is_none());
+        open.claim_chunk(&a, k("the_nether", 2, 2), &main).unwrap();
+    }
+
+    #[test]
+    fn permission_matrix_metadata_and_policy_persist() {
+        let dir = tmp_dir("matrix");
+        let mut w = ClaimsWorld::new_survival_default();
+        let (a, b) = (uuid(1), uuid(2));
+        let main = main_sub();
+        w.record_player_seen(&a, "Alice", 100);
+        w.record_player_seen(&b, "Bob", 200);
+        w.claim_chunk(&a, k("overworld", 0, 0), &main).unwrap();
+        w.set_everyone_else_permissions(&a, &main, ClaimPermissionSet::visitor());
+        w.set_player_permission_override(
+            &a,
+            &main,
+            &b,
+            ClaimPermissionSet::trusted_builder(),
+        );
+        {
+            let cfg = w.protection_config_mut(&a, &main);
+            cfg.protect_mob_and_boss_grief = false;
+            cfg.protect_entity_push = true;
+            cfg.display_color_rgb = 0x0000_aaff;
+            cfg.display_label = Some("Base".to_owned());
+        }
+        w.set_claim_cost_mode(ClaimCostMode::OrganicFluid);
+
+        w.save_to_dir(&dir).unwrap();
+        let bytes_claims = std::fs::read_to_string(dir.join(CLAIMS_FILE)).unwrap();
+        let back = ClaimsWorld::load_from_dir(&dir).unwrap();
+
+        // Everything new survives the round trip.
+        assert_eq!(back.known_players(), w.known_players());
+        assert_eq!(back.claim_cost_mode(), ClaimCostMode::OrganicFluid);
+        assert_eq!(
+            back.allowed_claim_dimensions()
+                .unwrap()
+                .iter()
+                .map(String::as_str)
+                .collect::<Vec<_>>(),
+            ["minecraft:overworld"]
+        );
+        let bc = back.protection_config(&a, &main);
+        assert_eq!(bc.everyone_else, ClaimPermissionSet::visitor());
+        assert_eq!(
+            bc.player_overrides.get(&b),
+            Some(&ClaimPermissionSet::trusted_builder())
+        );
+        assert!(!bc.protect_mob_and_boss_grief && bc.protect_entity_push);
+        assert_eq!(bc.display_color_rgb, 0x0000_aaff);
+        assert_eq!(bc.display_label.as_deref(), Some("Base"));
+        assert_eq!(back.claim_display_color(&a, &main), 0x0000_aaff);
+        assert_eq!(back.claim_display_label(&a, &main).as_deref(), Some("Base"));
+        assert_eq!(
+            back.effective_permissions_for(&a, &main, &b),
+            ClaimPermissionSet::trusted_builder()
+        );
+
+        // Saving again is byte-deterministic.
+        back.save_to_dir(&dir).unwrap();
+        assert_eq!(
+            std::fs::read_to_string(dir.join(CLAIMS_FILE)).unwrap(),
+            bytes_claims
+        );
+
+        // A legacy file with none of the new keys loads cleanly and keeps
+        // the safe defaults; a legacy permissive flag still grants access.
+        std::fs::write(
+            dir.join(CLAIMS_FILE),
+            r#"{"revision":1,"nextPartyId":1,"admins":[],
+                "defaultConfig":{"protectBlocks":true,"protectContainers":false},
+                "configs":[],"claims":[]}"#,
+        )
+        .unwrap();
+        std::fs::write(dir.join(PARTIES_FILE), r#"{"parties":[]}"#).unwrap();
+        let legacy = ClaimsWorld::load_from_dir(&dir).unwrap();
+        let dc = legacy.default_config();
+        assert!(dc.protect_entity_interact);
+        assert!(dc.protect_projectiles_border);
+        assert!(dc.protect_fire_and_lightning);
+        assert!(dc.protect_mob_and_boss_grief);
+        assert!(dc.protect_contraption_border);
+        assert!(dc.protect_dispenser_hopper_border);
+        assert!(dc.protect_vehicle_border);
+        assert!(dc.protect_entity_push);
+        assert!(dc.protect_entity_lure);
+        assert_eq!(dc.everyone_else, ClaimPermissionSet::denied_all());
+        assert!(dc.player_overrides.is_empty());
+        assert_eq!(dc.display_color_rgb, 0);
+        assert_eq!(dc.display_label, None);
+        assert!(legacy.known_players().is_empty());
+        assert_eq!(legacy.claim_cost_mode(), ClaimCostMode::FreeQuota);
+        assert!(legacy.allowed_claim_dimensions().is_none());
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
