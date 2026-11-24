@@ -27,3 +27,4 @@ pub mod neoforge_wire;
 pub mod offload_bridge;
 pub mod orbital;
 pub mod rail_network;
+pub mod schematic;

@@ -223,7 +223,7 @@ mod tests {
         let mut block_names: Vec<String> =
             create_reg.blocks().iter().map(|b| b.id.clone()).collect();
         block_names.extend(uni.registry().blocks().iter().map(|b| b.id.clone()));
-        assert_eq!(block_names.len(), 36);
+        assert_eq!(block_names.len(), 41);
         let block_body = build_config_registry_data_0x07("minecraft:block", &block_names).unwrap();
         assert_eq!(block_body[0], CONFIG_REGISTRY_DATA_PACKET_ID);
         assert_eq!(

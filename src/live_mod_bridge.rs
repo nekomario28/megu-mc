@@ -453,6 +453,36 @@ struct LiveModSuite {
     /// JAR's declared blockstates/items, built once by `scan_mods_dir`.
     /// `None` when no `mods/` scan ran or the plan rejected the content.
     registry_plan: Option<UnifiedModRegistryPlan>,
+    /// Content generation for the MRS1-synced registry inputs, bumped by
+    /// `scan_mods_dir` — the only production writer of `registry_plan`.
+    /// Folded into the join-frame cache key so a join after a rescan never
+    /// replays a stale registry.
+    registry_revision: u64,
+    /// One cached `MRS1` frame keyed by the registry inputs it was built
+    /// from. `None` until the first join builds it, and after any
+    /// invalidation — subsequent joins hand the same `Arc` back in O(1).
+    mrs1_cache: Option<Mrs1FrameCache>,
+}
+
+/// The inputs one `MRS1` frame is a pure function of: the suite's registry
+/// revision, whether Create is armed, and the shape of every contributing
+/// table. Cheap to recompute — comparing this key is the whole cache-hit
+/// cost.
+#[cfg(feature = "mod-suite")]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct Mrs1FrameKey {
+    registry_revision: u64,
+    create_enabled: bool,
+    create_state_count: usize,
+    plan_state_count: usize,
+    plan_item_count: usize,
+}
+
+#[cfg(feature = "mod-suite")]
+#[derive(Clone, Debug)]
+struct Mrs1FrameCache {
+    key: Mrs1FrameKey,
+    frame: Option<Arc<[u8]>>,
 }
 
 #[cfg(feature = "mod-suite")]
@@ -479,6 +509,8 @@ impl LiveModSuite {
             mod_sync_body: None,
             mod_sync_root_hash: None,
             registry_plan: None,
+            registry_revision: 0,
+            mrs1_cache: None,
         }
     }
 
@@ -691,6 +723,11 @@ impl LiveModSuite {
             );
         }
         self.dual_loader = plan;
+        // The scan may have changed every MRS1 input — `registry_plan`,
+        // dual-loader content, adapted JAR tables — so the join-frame cache
+        // must rebuild before the next client sees it.
+        self.registry_revision = self.registry_revision.wrapping_add(1);
+        self.mrs1_cache = None;
         self.log_boot_report(jars.len());
     }
 
@@ -2157,8 +2194,14 @@ fn live_mod_sync_on_join(s: &mut TcpStream) {
 /// `LIVE_CREATE_ITEM_BASE`+) plus the generic `MEGU_MODS_DIR` registry plan
 /// built at boot. `None` when nothing modded is registered, so a vanilla or
 /// unarmed server emits zero extra packets.
+///
+/// The encoded frame is cached inside the suite keyed by `Mrs1FrameKey` —
+/// registry revision plus the shape of every contributing table — so repeat
+/// joins hand back the same `Arc` instead of re-sorting and re-encoding the
+/// whole registry. `scan_mods_dir` bumps `registry_revision` and drops the
+/// cache, so a content change forces exactly one rebuild.
 #[cfg(feature = "mod-suite")]
-fn live_mod_registry_sync_frame() -> Option<Vec<u8>> {
+fn live_mod_registry_sync_frame() -> Option<Arc<[u8]>> {
     let mut block_states: Vec<DynamicBlockStateEntry> = Vec::new();
     let mut items: BTreeMap<u32, String> = BTreeMap::new();
 
@@ -2180,30 +2223,54 @@ fn live_mod_registry_sync_frame() -> Option<Vec<u8>> {
         }
     }
 
-    {
-        let suite = live_mod_suite().lock().unwrap_or_else(|e| e.into_inner());
-        if let Some(plan) = suite.registry_plan.as_ref() {
-            block_states.extend(plan.block_states.iter().cloned());
-            items.extend(plan.items.iter().map(|(id, name)| (*id, name.clone())));
+    let mut suite = live_mod_suite().lock().unwrap_or_else(|e| e.into_inner());
+    let key = Mrs1FrameKey {
+        registry_revision: suite.registry_revision,
+        create_enabled: live_create_enabled(),
+        create_state_count: block_states.len(),
+        plan_state_count: suite
+            .registry_plan
+            .as_ref()
+            .map_or(0, |plan| plan.block_states.len()),
+        plan_item_count: suite
+            .registry_plan
+            .as_ref()
+            .map_or(0, |plan| plan.items.len()),
+    };
+    if let Some(cache) = suite.mrs1_cache.as_ref() {
+        if cache.key == key {
+            return cache.frame.clone();
         }
     }
 
-    if block_states.is_empty() && items.is_empty() {
-        return None;
+    if let Some(plan) = suite.registry_plan.as_ref() {
+        block_states.extend(plan.block_states.iter().cloned());
+        items.extend(plan.items.iter().map(|(id, name)| (*id, name.clone())));
     }
-    block_states.sort_by_key(|entry| entry.state_id);
-    let base_block_state_id = block_states.first().map_or(0, |entry| entry.state_id);
-    let base_item_id = items.keys().next().copied().unwrap_or(0);
-    Some(
-        UnifiedModRegistryPlan {
-            base_block_state_id,
-            base_item_id,
-            block_states,
-            items,
-            content: RegistryContentIndex::default(),
-        }
-        .encode_registry_sync_frame(),
-    )
+
+    let frame = if block_states.is_empty() && items.is_empty() {
+        None
+    } else {
+        block_states.sort_by_key(|entry| entry.state_id);
+        let base_block_state_id = block_states.first().map_or(0, |entry| entry.state_id);
+        let base_item_id = items.keys().next().copied().unwrap_or(0);
+        Some(
+            UnifiedModRegistryPlan {
+                base_block_state_id,
+                base_item_id,
+                block_states,
+                items,
+                content: RegistryContentIndex::default(),
+            }
+            .encode_registry_sync_frame()
+            .into(),
+        )
+    };
+    suite.mrs1_cache = Some(Mrs1FrameCache {
+        key,
+        frame: frame.clone(),
+    });
+    frame
 }
 
 /// Serve the `megu:mod_registry_sync_v1` (`MRS1`) dynamic registry frame to
@@ -2691,21 +2758,89 @@ struct LiveCreateHeld {
     active: Option<u16>,
 }
 
+/// The item-transport contract one tracked Create block carries through
+/// the live `SleepingTransport` layer. Belts, chutes and funnels move
+/// items between cells; depots and basins are the terminal slots the rest
+/// of the runtime (`held`, pressing/mixing) already understands.
+#[cfg(feature = "mod-suite")]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum LiveDuctKind {
+    Belt,
+    Chute,
+    Funnel,
+    BeltFunnel,
+    Depot,
+    Basin,
+}
+
+#[cfg(feature = "mod-suite")]
+impl LiveDuctKind {
+    /// `SleepingTransport` machine capacity for this duct — input and
+    /// output FIFOs each hold at most this many item ids. Depot mirrors
+    /// its single display slot; basin its nine.
+    fn capacity(self) -> u32 {
+        match self {
+            Self::Belt => 1,
+            Self::Chute => 4,
+            Self::Funnel | Self::BeltFunnel | Self::Depot => 1,
+            Self::Basin => 9,
+        }
+    }
+
+    /// Capacity of the `held` slot overlay — only depot/basin own one.
+    fn held_capacity(self) -> usize {
+        match self {
+            Self::Basin => 9,
+            _ => 1,
+        }
+    }
+}
+
+/// Map a Create block id onto its [`LiveDuctKind`], or `None` for blocks
+/// that carry no item transport (kinetics, casings, processors).
+#[cfg(feature = "mod-suite")]
+fn live_duct_kind(block_id: &str) -> Option<LiveDuctKind> {
+    Some(match block_id {
+        "create:belt" => LiveDuctKind::Belt,
+        "create:chute" => LiveDuctKind::Chute,
+        "create:andesite_funnel" | "create:brass_funnel" => LiveDuctKind::Funnel,
+        "create:andesite_belt_funnel" | "create:brass_belt_funnel" => LiveDuctKind::BeltFunnel,
+        "create:depot" => LiveDuctKind::Depot,
+        "create:basin" => LiveDuctKind::Basin,
+        _ => return None,
+    })
+}
+
+/// `(dx, dy, dz)` for a `facing` property value — all six directions so
+/// chutes, funnels and belts share one mapping.
+#[cfg(feature = "mod-suite")]
+fn live_facing_offset(facing: &str) -> Option<(i32, i32, i32)> {
+    Some(match facing {
+        "north" => (0, 0, -1),
+        "south" => (0, 0, 1),
+        "east" => (1, 0, 0),
+        "west" => (-1, 0, 0),
+        "up" => (0, 1, 0),
+        "down" => (0, -1, 0),
+        _ => return None,
+    })
+}
+
 /// Live `CreateFactory` bound to the server world. `placed` mirrors every
 /// Create block currently in the world (the authoritative set for
 /// persistence); `dormant` marks the subset — water wheels with no adjacent
 /// water — that are placed but intentionally NOT registered in the kinetic
 /// graph so they contribute no RPM until flow arrives. `held` is the
-/// depot/basin item slot state persisted beside `placed`; `belt_machines`
-/// maps belt blocks onto their lazily-registered `SleepingTransport`
-/// machine ids.
+/// depot/basin item slot state persisted beside `placed`; `duct_machines`
+/// maps every item-transport cell (belt, chute, funnels, depot, basin) onto
+/// its lazily-registered `SleepingTransport` machine id.
 #[cfg(feature = "mod-suite")]
 struct LiveCreateRuntime {
     factory: create_adapter::factory::CreateFactory,
     placed: std::collections::BTreeMap<create_adapter::factory::DimBlockPos, u32>,
     dormant: std::collections::BTreeSet<create_adapter::factory::DimBlockPos>,
     held: std::collections::BTreeMap<create_adapter::factory::DimBlockPos, LiveCreateHeld>,
-    belt_machines: std::collections::BTreeMap<create_adapter::factory::DimBlockPos, u32>,
+    duct_machines: std::collections::BTreeMap<create_adapter::factory::DimBlockPos, u32>,
     next_machine_id: u32,
     pressing: Vec<mod_offload::recipe_processor::Recipe>,
     mixing: Vec<mod_offload::recipe_processor::Recipe>,
@@ -2735,7 +2870,7 @@ fn live_create_runtime_init() -> Option<LiveCreateRuntime> {
         placed: std::collections::BTreeMap::new(),
         dormant: std::collections::BTreeSet::new(),
         held: std::collections::BTreeMap::new(),
-        belt_machines: std::collections::BTreeMap::new(),
+        duct_machines: std::collections::BTreeMap::new(),
         next_machine_id: 1,
         pressing: live_create_recipes(LIVE_CREATE_PRESSING, 0),
         mixing: live_create_recipes(LIVE_CREATE_MIXING, 0x100),
@@ -2793,30 +2928,38 @@ impl LiveCreateRuntime {
     /// node); everything else registers directly.
     fn sync_cell(&mut self, pos: FactoryPos, st: u32) {
         if !self.is_create_state(st) {
+            // Unlink the orphaned machine so upstream ducts stop routing
+            // into a cell that no longer accepts items.
+            if let Some(&id) = self.duct_machines.get(&pos) {
+                let _ = self.factory.link_belt(pos, id, None);
+            }
             self.placed.remove(&pos);
             self.dormant.remove(&pos);
             self.held.remove(&pos);
-            self.belt_machines.remove(&pos);
+            self.duct_machines.remove(&pos);
             let _ = self.factory.remove_block(pos);
             return;
         }
         // The block keeps its cell: drop slot/machine state the new state
-        // can no longer own (e.g. a depot swapped for a shaft).
+        // can no longer own (e.g. a depot swapped for a shaft). Every duct
+        // keeps its lazily-registered machine; only depot/basin own `held`
+        // slots.
         match self
             .factory
             .registry()
             .block_def_for_state(st)
             .map(|def| def.id.as_str())
         {
-            Some("create:depot" | "create:basin") => {
-                self.belt_machines.remove(&pos);
-            }
-            Some("create:belt") => {
+            Some("create:depot" | "create:basin") => {}
+            Some(id) if live_duct_kind(id).is_some() => {
                 self.held.remove(&pos);
             }
             _ => {
                 self.held.remove(&pos);
-                self.belt_machines.remove(&pos);
+                if let Some(&id) = self.duct_machines.get(&pos) {
+                    let _ = self.factory.link_belt(pos, id, None);
+                }
+                self.duct_machines.remove(&pos);
             }
         }
         let active = !self.is_water_wheel(st) || self.adjacent_water(pos);
@@ -2833,6 +2976,13 @@ impl LiveCreateRuntime {
             self.dormant.remove(&pos);
             self.placed.insert(pos, st);
             let _ = self.factory.place_block(pos, st);
+            // Every duct cell owns a transport machine from placement on:
+            // links are only meaningful while the target machine exists,
+            // and funnels need their staging input registered before their
+            // pull cycle can run.
+            if self.duct_kind_at(pos).is_some() {
+                let _ = self.duct_machine(pos);
+            }
         } else {
             let _ = self.factory.remove_block(pos);
             self.placed.insert(pos, st);
@@ -2877,7 +3027,7 @@ impl LiveCreateRuntime {
         self.placed.clear();
         self.dormant.clear();
         self.held.clear();
-        self.belt_machines.clear();
+        self.duct_machines.clear();
         self.next_machine_id = 1;
         for (pos, st, items) in entries {
             self.sync_cell(pos, st);
@@ -2900,24 +3050,278 @@ impl LiveCreateRuntime {
         }
     }
 
-    /// Lazily register the `SleepingTransport` machine behind a belt block
-    /// and return its region-local id. The traversal delay scales
-    /// inversely with the belt's solved RPM (floor 8 rpm -> 8 ticks).
-    fn belt_machine(&mut self, pos: FactoryPos) -> u32 {
-        if let Some(&id) = self.belt_machines.get(&pos) {
-            return id;
+    /// Which `SleepingTransport` machine carries the duct cell at `pos` —
+    /// `None` when the cell holds no duct.
+    fn duct_kind_at(&self, pos: FactoryPos) -> Option<LiveDuctKind> {
+        let st = *self.placed.get(&pos)?;
+        let def = self.factory.registry().block_def_for_state(st)?;
+        live_duct_kind(def.id.as_str())
+    }
+
+    /// The `MachineState` of the registered duct machine at `pos`, when the
+    /// machine exists.
+    fn duct_machine_state(
+        &self,
+        pos: FactoryPos,
+    ) -> Option<mod_offload::sleeping_transport::MachineState> {
+        let &id = self.duct_machines.get(&pos)?;
+        self.factory
+            .scheduler()
+            .region(pos.region_key())?
+            .transport()
+            .machine(id)
+    }
+
+    /// Lazily register the `SleepingTransport` machine behind a duct block
+    /// and return its region-local id. Belts scale their traversal delay
+    /// inversely with the solved RPM (floor 8 rpm -> 8 ticks); every other
+    /// duct moves items on a fixed short cadence.
+    fn duct_machine(&mut self, pos: FactoryPos) -> Option<u32> {
+        if let Some(&id) = self.duct_machines.get(&pos) {
+            return Some(id);
         }
+        let kind = self.duct_kind_at(pos)?;
+        let delay = if kind == LiveDuctKind::Belt {
+            let rpm = self
+                .factory
+                .kinetic_solution(pos)
+                .map(|sol| sol.speed.abs())
+                .unwrap_or(0.0);
+            (64.0 / rpm.max(8.0)).round().clamp(1.0, 64.0) as u64
+        } else {
+            2
+        };
         let id = self.next_machine_id;
         self.next_machine_id = self.next_machine_id.saturating_add(1).max(1);
-        let rpm = self
-            .factory
-            .kinetic_solution(pos)
-            .map(|sol| sol.speed.abs())
-            .unwrap_or(0.0);
-        let delay = (64.0 / rpm.max(8.0)).round().clamp(1.0, 64.0) as u64;
-        let _ = self.factory.add_belt_segment(pos, id, 1, delay);
-        self.belt_machines.insert(pos, id);
-        id
+        self.factory
+            .add_belt_segment(pos, id, kind.capacity(), delay)
+            .ok()?;
+        self.duct_machines.insert(pos, id);
+        Some(id)
+    }
+
+    /// The cell `pos`'s duct pushes items toward under the live topology,
+    /// or `None` for sinks, blocked ducts and powered-off funnels. The
+    /// target must itself be a duct cell — the machine it owns is what the
+    /// `SleepingTransport` link actually points at.
+    fn duct_downstream_pos(&self, pos: FactoryPos, st: u32) -> Option<FactoryPos> {
+        let def = self.factory.registry().block_def_for_state(st)?;
+        let kind = live_duct_kind(def.id.as_str())?;
+        let entry = self.factory.registry().state(st)?;
+        if entry.property("powered") == Some("true") {
+            return None;
+        }
+        let facing = entry
+            .property("facing")
+            .and_then(live_facing_offset);
+        let extracting = entry.property("extracting") == Some("true");
+        let target = match kind {
+            // Belts run items toward their horizontal `facing` direction.
+            LiveDuctKind::Belt => {
+                let d = facing?;
+                pos.offset(d.0, d.1, d.2)
+            }
+            // Chutes are gravity ducts: straight down into the duct below.
+            LiveDuctKind::Chute => pos.offset(0, -1, 0),
+            // Insert-mode funnels push out of the mouth (`facing`); in
+            // extracting mode staged items ride back into the attached
+            // container (the cell behind the mouth).
+            LiveDuctKind::Funnel => {
+                let d = facing?;
+                if extracting {
+                    pos.offset(-d.0, -d.1, -d.2)
+                } else {
+                    pos.offset(d.0, d.1, d.2)
+                }
+            }
+            // Belt funnels sit one cell over their belt. Insert mode drops
+            // onto the belt below; extracting mode serves the container the
+            // mouth points at.
+            LiveDuctKind::BeltFunnel => {
+                if extracting {
+                    let d = facing?;
+                    pos.offset(d.0, d.1, d.2)
+                } else {
+                    pos.offset(0, -1, 0)
+                }
+            }
+            LiveDuctKind::Depot | LiveDuctKind::Basin => return None,
+        };
+        self.duct_kind_at(target)?;
+        Some(target)
+    }
+
+    /// Re-point every registered duct machine's downstream at the machine
+    /// owning its desired target cell. Links are recomputed each tick so
+    /// belt-facing changes, fresh placements and removed cells all take
+    /// effect without an explicit rewire pass; `set_downstream` is a no-op
+    /// when the link already matches. Cross-region and contested targets
+    /// (one upstream per machine) are skipped fail-soft — items stall in
+    /// the source's output FIFO instead of vanishing.
+    fn relink_ducts(&mut self) {
+        if self.duct_machines.is_empty() {
+            return;
+        }
+        let sources: Vec<FactoryPos> = self.duct_machines.keys().copied().collect();
+        for pos in sources {
+            let desired = self
+                .placed
+                .get(&pos)
+                .copied()
+                .and_then(|st| self.duct_downstream_pos(pos, st))
+                .filter(|dst| dst.region_key() == pos.region_key())
+                .and_then(|dst| self.duct_machine(dst));
+            let Some(from) = self.duct_machines.get(&pos).copied() else {
+                continue;
+            };
+            let _ = self.factory.link_belt(pos, from, desired);
+        }
+    }
+
+    /// Settle pass run after each transport advance: depot/basin machine
+    /// outputs drain into their `held` slot (capacity-bounded, so full
+    /// slots backpressure the machine), then funnels pull one item each
+    /// from their source cell into their staging input — the downstream
+    /// link carries it onward from there.
+    fn drain_ducts(&mut self) {
+        if self.duct_machines.is_empty() {
+            return;
+        }
+        let positions: Vec<FactoryPos> = self.duct_machines.keys().copied().collect();
+        for pos in positions {
+            let Some(kind) = self.duct_kind_at(pos) else {
+                continue;
+            };
+            match kind {
+                LiveDuctKind::Depot | LiveDuctKind::Basin => {
+                    let cap = kind.held_capacity();
+                    let Some(&machine) = self.duct_machines.get(&pos) else {
+                        continue;
+                    };
+                    loop {
+                        let filled = self.held.get(&pos).map_or(0, |h| h.items.len());
+                        if filled >= cap {
+                            break;
+                        }
+                        match self
+                            .factory
+                            .scheduler_mut()
+                            .region_mut(pos.region_key())
+                            .extract_output(machine)
+                        {
+                            Ok(Some(item)) => {
+                                self.held
+                                    .entry(pos)
+                                    .or_default()
+                                    .items
+                                    .push(i64::from(item));
+                            }
+                            _ => break,
+                        }
+                    }
+                }
+                LiveDuctKind::Funnel | LiveDuctKind::BeltFunnel => {
+                    self.funnel_pull(pos, kind);
+                }
+                _ => {}
+            }
+        }
+    }
+
+    /// One funnel transfer cycle at `pos`: when the funnel's staging input
+    /// is free, pull a single item out of its source cell — a depot/basin
+    /// `held` slot or an upstream duct's output FIFO — and queue it into
+    /// the funnel machine, whose downstream link completes the hop.
+    /// Extracting funnels pull from the block the mouth faces (belt
+    /// funnels: the belt below) toward the attached container; inserting
+    /// funnels pull from the attached container (belt funnels: the faced
+    /// one) toward the mouth / the belt below.
+    fn funnel_pull(&mut self, pos: FactoryPos, kind: LiveDuctKind) {
+        let Some(st) = self.placed.get(&pos).copied() else {
+            return;
+        };
+        let Some(entry) = self.factory.registry().state(st) else {
+            return;
+        };
+        if entry.property("powered") == Some("true") {
+            return;
+        }
+        let extracting = entry.property("extracting") == Some("true");
+        let Some(d) = entry.property("facing").and_then(live_facing_offset) else {
+            return;
+        };
+        let (src, dst) = match kind {
+            LiveDuctKind::Funnel => {
+                let front = pos.offset(d.0, d.1, d.2);
+                let back = pos.offset(-d.0, -d.1, -d.2);
+                if extracting { (front, back) } else { (back, front) }
+            }
+            LiveDuctKind::BeltFunnel => {
+                let belt = pos.offset(0, -1, 0);
+                if self.duct_kind_at(belt) != Some(LiveDuctKind::Belt) {
+                    return;
+                }
+                let served = pos.offset(d.0, d.1, d.2);
+                if extracting { (belt, served) } else { (served, belt) }
+            }
+            _ => return,
+        };
+        // The destination must be a duct the staging machine can link into;
+        // anything else means the funnel ejects into open air, which this
+        // model leaves staged in its output FIFO for manual pickup.
+        if self.duct_kind_at(dst).is_none() {
+            return;
+        }
+        let Some(&funnel_id) = self.duct_machines.get(&pos) else {
+            return;
+        };
+        if self
+            .duct_machine_state(pos)
+            .is_none_or(|m| m.input_items != 0)
+        {
+            return;
+        }
+        let src_kind = self.duct_kind_at(src);
+        let item: Option<i64> = match src_kind {
+            Some(LiveDuctKind::Depot | LiveDuctKind::Basin) => self
+                .held
+                .get_mut(&src)
+                .and_then(|h| h.items.pop()),
+            Some(_) => self
+                .duct_machines
+                .get(&src)
+                .copied()
+                .and_then(|id| {
+                    self.factory
+                        .scheduler_mut()
+                        .region_mut(src.region_key())
+                        .extract_output(id)
+                        .ok()
+                        .flatten()
+                })
+                .map(i64::from),
+            None => None,
+        };
+        let Some(item) = item else {
+            return;
+        };
+        if matches!(src_kind, Some(LiveDuctKind::Depot | LiveDuctKind::Basin))
+            && self.held.get(&src).is_some_and(|h| h.items.is_empty())
+        {
+            self.held.remove(&src);
+        }
+        match u32::try_from(item) {
+            Ok(item) => {
+                let _ = self.factory.insert_belt_item(pos, funnel_id, item);
+            }
+            Err(_) => {
+                // Transport item ids are u32; an out-of-range slot entry
+                // returns to its source instead of silently disappearing.
+                if matches!(src_kind, Some(LiveDuctKind::Depot | LiveDuctKind::Basin)) {
+                    self.held.entry(src).or_default().items.push(item);
+                }
+            }
+        }
     }
 
     /// Active processing pass, run once per `live_create_tick` before the
@@ -3241,13 +3645,15 @@ fn live_create_wrench_rotate(pos: FactoryPos, clicked: u32) -> Option<u32> {
     .flatten()
 }
 
-/// Right-click on a tracked `create:depot`, `create:belt` or
-/// `create:basin` without the wrench. A held item inserts one unit into the
-/// machine's item slot (depot 1, basin 9, belt input 1) and the caller
-/// consumes it like a placement; an empty hand — or any sneak-click —
-/// pulls the stored or processed item back through the vanilla
-/// `Inventory.add` pickup path. Returns `false` when the click is not
-/// handled so the normal placement/interaction flow still runs.
+/// Right-click on a tracked duct cell — `create:depot`, `create:belt`,
+/// `create:basin`, `create:chute` or any `create:*funnel` — without the
+/// wrench. A held item inserts one unit into the machine's item slot
+/// (depot 1, basin 9, belt/chute/funnel machine inputs per
+/// [`LiveDuctKind::capacity`]) and the caller consumes it like a
+/// placement; an empty hand — or any sneak-click — pulls the stored or
+/// processed item back through the vanilla `Inventory.add` pickup path.
+/// Returns `false` when the click is not handled so the normal
+/// placement/interaction flow still runs.
 #[cfg(feature = "mod-suite")]
 fn live_create_interact_block(
     me: &Client,
@@ -3282,41 +3688,42 @@ fn live_create_interact_block(
             return None;
         }
         let id = rt.factory.registry().block_def_for_state(clicked)?.id.as_str();
-        let belt = id == "create:belt";
-        let depot = id == "create:depot";
-        let basin = id == "create:basin";
-        if !belt && !depot && !basin {
+        let Some(kind) = live_duct_kind(id) else {
             return None;
-        }
+        };
+        let slot_kind = matches!(kind, LiveDuctKind::Depot | LiveDuctKind::Basin);
         if held_item != 0 && !sneaking {
-            if belt {
-                let machine = rt.belt_machine(pos);
-                let item = u32::try_from(held_item).ok()?;
-                rt.factory.insert_belt_item(pos, machine, item).ok()?;
-            } else {
-                let cap = if depot { 1 } else { 9 };
-                if rt.held.get(&pos).is_some_and(|s| s.items.len() >= cap) {
+            if slot_kind {
+                if rt
+                    .held
+                    .get(&pos)
+                    .is_some_and(|s| s.items.len() >= kind.held_capacity())
+                {
                     return None;
                 }
                 let slot = rt.held.entry(pos).or_default();
                 slot.items.push(held_item);
                 slot.progress = 0.0;
                 slot.active = None;
+            } else {
+                let machine = rt.duct_machine(pos)?;
+                let item = u32::try_from(held_item).ok()?;
+                rt.factory.insert_belt_item(pos, machine, item).ok()?;
             }
             return Some(LiveCreateInteract::Inserted);
         }
         // Retrieval: extract first, then `Inventory.add`; a full inventory
         // re-seats the item so a failed grab never deletes it.
-        let item: i64 = if belt {
-            let machine = *rt.belt_machines.get(&pos)?;
+        let item: i64 = if slot_kind {
+            rt.held.get_mut(&pos)?.items.pop()?
+        } else {
+            let machine = *rt.duct_machines.get(&pos)?;
             rt.factory
                 .scheduler_mut()
                 .region_mut(pos.region_key())
                 .extract_output(machine)
                 .ok()?
                 .map(i64::from)?
-        } else {
-            rt.held.get_mut(&pos)?.items.pop()?
         };
         let mut inv = me.inv.lock().unwrap_or_else(|e| e.into_inner());
         let selected = *me.held.lock().unwrap_or_else(|e| e.into_inner());
@@ -3325,18 +3732,18 @@ fn live_create_interact_block(
         let mut source = (item, 1u8, Vec::new());
         let accepted = pickup_into_inventory(&mut inv, selected, creative, &mut source);
         if !accepted || source.1 != 0 {
-            if belt {
-                if let (Some(&machine), Ok(item)) =
-                    (rt.belt_machines.get(&pos), u32::try_from(item))
-                {
-                    let _ = rt.factory.insert_belt_item(pos, machine, item);
+            if slot_kind {
+                if let Some(slot) = rt.held.get_mut(&pos) {
+                    slot.items.push(item);
                 }
-            } else if let Some(slot) = rt.held.get_mut(&pos) {
-                slot.items.push(item);
+            } else if let (Some(&machine), Ok(item)) =
+                (rt.duct_machines.get(&pos), u32::try_from(item))
+            {
+                let _ = rt.factory.insert_belt_item(pos, machine, item);
             }
             return None;
         }
-        if !belt && rt.held.get(&pos).is_some_and(|h| h.items.is_empty()) {
+        if slot_kind && rt.held.get(&pos).is_some_and(|h| h.items.is_empty()) {
             rt.held.remove(&pos);
         }
         let changed: Vec<(i16, Stack)> = (5..=45)
@@ -3372,6 +3779,110 @@ fn live_create_interact_block(
     true
 }
 
+/// Drop one `item` onto the duct cell at `(x, y, z)` — the shared
+/// non-interaction entry point for thrown items, scripted feeds and the
+/// schematic end-to-end path. Depot/basin land in their `held` slot;
+/// every other duct queues into its `SleepingTransport` machine input so
+/// links and funnel pulls carry it onward. `false` when the cell holds no
+/// duct, is full, or the item id is out of range.
+#[cfg(feature = "mod-suite")]
+#[allow(dead_code)]
+fn live_create_duct_insert(dim: DimId, x: i32, y: i32, z: i32, item: i64) -> bool {
+    live_create_with(|rt| {
+        let pos = FactoryPos::new(dim.raw() as i32, x, y, z);
+        let kind = rt.duct_kind_at(pos)?;
+        match kind {
+            LiveDuctKind::Depot | LiveDuctKind::Basin => {
+                if rt
+                    .held
+                    .get(&pos)
+                    .is_some_and(|h| h.items.len() >= kind.held_capacity())
+                {
+                    return None;
+                }
+                let slot = rt.held.entry(pos).or_default();
+                slot.items.push(item);
+                slot.progress = 0.0;
+                slot.active = None;
+            }
+            _ => {
+                let machine = rt.duct_machine(pos)?;
+                let item = u32::try_from(item).ok()?;
+                rt.factory.insert_belt_item(pos, machine, item).ok()?;
+            }
+        }
+        Some(())
+    })
+    .flatten()
+    .is_some()
+}
+
+/// Place one `.nbt` structure — the format Structure Blocks write and
+/// Create ships for its Ponder/showcase factories — at `origin` inside any
+/// dimension. Each palette entry resolves once through `state_from_arg`
+/// (canonical `name[k=v]` spelling), so vanilla, Create-catalog and
+/// `MEGU_MODS_DIR` JAR blocks all land through one path; every write goes
+/// through `set_block_if_dim`, which fires `live_create_on_block_set` and
+/// thereby arms the Create runtime exactly like a player-driven edit.
+/// Fails closed: a malformed or over-cap schematic rejects before any
+/// world write.
+#[cfg(feature = "mod-suite")]
+#[allow(dead_code)]
+fn live_place_nbt_schematic_in_dim(
+    dim: DimId,
+    origin: (i32, i32, i32),
+    nbt_bytes: &[u8],
+) -> Result<create_adapter::schematic::SchematicPlacementReport, String> {
+    let structure = create_adapter::schematic::parse_nbt_schematic(nbt_bytes)
+        .map_err(|err| err.to_string())?;
+    let resolved: Vec<Option<u32>> = structure
+        .palette
+        .iter()
+        .map(|entry| state_from_arg(&entry.canonical))
+        .collect();
+    let mut report = create_adapter::schematic::SchematicPlacementReport {
+        unresolved_palette_entries: resolved.iter().filter(|st| st.is_none()).count(),
+        ..Default::default()
+    };
+    let [sx, sy, sz] = structure.size;
+    let mut placed_positions: Vec<FactoryPos> = Vec::new();
+    for block in &structure.blocks {
+        // Structure-relative cells must stay inside the declared bounds —
+        // an out-of-range `pos` is a malformed file, not a valid placement.
+        let [px, py, pz] = block.pos;
+        if px < 0 || py < 0 || pz < 0 || px >= sx || py >= sy || pz >= sz {
+            report.skipped_blocks += 1;
+            continue;
+        }
+        let (Some(wx), Some(wy), Some(wz)) = (
+            origin.0.checked_add(px),
+            origin.1.checked_add(py),
+            origin.2.checked_add(pz),
+        ) else {
+            report.skipped_blocks += 1;
+            continue;
+        };
+        let Some(st) = resolved[block.state] else {
+            report.skipped_blocks += 1;
+            continue;
+        };
+        if set_block_if_dim(dim, wx, wy, wz, st, None) {
+            report.placed_blocks += 1;
+            placed_positions.push(FactoryPos::new(dim.raw() as i32, wx, wy, wz));
+        } else {
+            report.skipped_blocks += 1;
+        }
+    }
+    report.kinetic_nodes_armed = live_create_with(|rt| {
+        placed_positions
+            .iter()
+            .filter(|pos| rt.placed.contains_key(pos) && !rt.dormant.contains(*pos))
+            .count()
+    })
+    .unwrap_or(0);
+    Ok(report)
+}
+
 /// Per-region per-tick wall-clock budget handed to
 /// `CreateFactory::step_tick`, shed by the server mspt governor
 /// (`live_server_budget_scale`) under load — idle regions never consume it
@@ -3394,7 +3905,12 @@ fn live_create_tick_body() -> Option<Vec<u8>> {
         .max(1.0)) as u64;
     live_create_with(|rt| {
         rt.tick_processing();
+        // Item flow: links follow live topology before the transport
+        // advance, then staged outputs settle into depot/basin slots and
+        // funnels pull their next unit.
+        rt.relink_ducts();
         let _ = rt.factory.step_tick(tick, 1_024, Some(budget_us));
+        rt.drain_ducts();
         let mut drained = Vec::new();
         rt.factory.drain_update_batch_into(&mut drained);
         if drained.is_empty() {
@@ -6718,7 +7234,48 @@ version="3.0.0"
         assert_eq!(id, LIVE_MOD_S2C_CUSTOM_PAYLOAD_ID);
         let (channel, payload) = lmb_decode_payload(&body);
         assert_eq!(channel, MOD_REGISTRY_SYNC_CHANNEL);
-        assert_eq!(payload, frame);
+        assert_eq!(payload.as_slice(), &frame[..]);
+    }
+
+    /// The encoded `MRS1` frame is cached per registry revision: repeated
+    /// joins get the same `Arc` (zero re-encode), and a rescan — which
+    /// bumps `registry_revision` — forces exactly one rebuild that still
+    /// produces byte-identical bytes for unchanged inputs.
+    #[test]
+    fn wire_mods_mrs1_frame_is_cached_and_rescan_rebuilds() {
+        let _serial = WIRE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        fresh_suite();
+        LIVE_CREATE_TEST_GATE.store(1, Ordering::Relaxed);
+        let first = live_mod_registry_sync_frame().expect("armed Create must emit MRS1");
+        let second = live_mod_registry_sync_frame().expect("cache hit must emit MRS1");
+        assert!(
+            Arc::ptr_eq(&first, &second),
+            "repeat joins must share one encoded frame"
+        );
+
+        // A real rescan of a scanned dir is the only production
+        // invalidation path — drive it rather than poking fields.
+        let dir = lmb_temp_dir("mrs1-rescan");
+        {
+            let mut suite = live_mod_suite().lock().unwrap_or_else(|e| e.into_inner());
+            suite.scan_mods_dir(&dir);
+        }
+        let third = live_mod_registry_sync_frame().expect("post-rescan join must emit MRS1");
+        assert!(
+            !Arc::ptr_eq(&first, &third),
+            "registry revision bump must rebuild the frame"
+        );
+        assert_eq!(
+            &first[..],
+            &third[..],
+            "unchanged inputs must rebuild byte-identical bytes"
+        );
+        let fourth = live_mod_registry_sync_frame().expect("second post-rescan join");
+        assert!(Arc::ptr_eq(&third, &fourth), "rebuilt frame must cache again");
+
+        let _ = std::fs::remove_dir_all(&dir);
+        fresh_suite();
+        LIVE_CREATE_TEST_GATE.store(1, Ordering::Relaxed);
     }
 
     /// `MEGU_MODS_DIR` content: a scanned JAR's declared blockstates/items
@@ -7528,10 +8085,10 @@ mod live_create_tests {
                 .map(|s| s.1),
             Some(1)
         );
-        live_create_with(|rt| assert!(rt.belt_machines.contains_key(&belt_pos)));
+        live_create_with(|rt| assert!(rt.duct_machines.contains_key(&belt_pos)));
 
         // After the traversal delay the item reaches the machine output.
-        let machine = live_create_with(|rt| rt.belt_machines[&belt_pos]).unwrap();
+        let machine = live_create_with(|rt| rt.duct_machines[&belt_pos]).unwrap();
         assert!(step_until(200, |rt| rt
             .factory
             .scheduler()
@@ -7723,5 +8280,298 @@ mod live_create_tests {
             clear(c.0, c.1, c.2);
         }
         clear(wx, wy, wz);
+    }
+
+    // ---------- .nbt schematic placement + end-to-end duct flow ----------
+
+    fn nbt_name(out: &mut Vec<u8>, name: &str) {
+        out.extend_from_slice(&(name.len() as u16).to_be_bytes());
+        out.extend_from_slice(name.as_bytes());
+    }
+
+    fn nbt_str(name: &str, value: &str) -> Vec<u8> {
+        let mut t = vec![8];
+        nbt_name(&mut t, name);
+        t.extend_from_slice(&(value.len() as u16).to_be_bytes());
+        t.extend_from_slice(value.as_bytes());
+        t
+    }
+
+    fn nbt_int(name: &str, value: i32) -> Vec<u8> {
+        let mut t = vec![3];
+        nbt_name(&mut t, name);
+        t.extend_from_slice(&value.to_be_bytes());
+        t
+    }
+
+    /// `name: [x, y, z]` as a `TAG_List` of three `TAG_Int` — the spelling
+    /// Structure Blocks write for `size`/`pos`.
+    fn nbt_int3(name: &str, v: [i32; 3]) -> Vec<u8> {
+        let mut t = vec![9];
+        nbt_name(&mut t, name);
+        t.push(3);
+        t.extend_from_slice(&3i32.to_be_bytes());
+        for n in v {
+            t.extend_from_slice(&n.to_be_bytes());
+        }
+        t
+    }
+
+    /// `TAG_Compound` payload (named children + `TAG_End`) without a
+    /// tag/name header — the shape list elements and the root take.
+    fn nbt_compound_payload(fields: Vec<Vec<u8>>) -> Vec<u8> {
+        let mut p = Vec::new();
+        for f in fields {
+            p.extend_from_slice(&f);
+        }
+        p.push(0);
+        p
+    }
+
+    fn nbt_named_compound(name: &str, fields: Vec<Vec<u8>>) -> Vec<u8> {
+        let mut t = vec![10];
+        nbt_name(&mut t, name);
+        t.extend_from_slice(&nbt_compound_payload(fields));
+        t
+    }
+
+    fn nbt_list(name: &str, elem_tag: u8, items: Vec<Vec<u8>>) -> Vec<u8> {
+        let mut t = vec![9];
+        nbt_name(&mut t, name);
+        t.push(elem_tag);
+        t.extend_from_slice(&(items.len() as i32).to_be_bytes());
+        for i in items {
+            t.extend_from_slice(&i);
+        }
+        t
+    }
+
+    /// One structure-block `.nbt` document: `size`, a `palette` of
+    /// `(Name, partial Properties)` entries, and `blocks` of
+    /// `(pos, state-index)` pairs.
+    fn structure_nbt(
+        size: [i32; 3],
+        palette: &[(&str, &[(&str, &str)])],
+        blocks: &[([i32; 3], usize)],
+    ) -> Vec<u8> {
+        let mut root = nbt_int3("size", size);
+        let pal: Vec<Vec<u8>> = palette
+            .iter()
+            .map(|(id, props)| {
+                let mut fields = vec![nbt_str("Name", id)];
+                if !props.is_empty() {
+                    fields.push(nbt_named_compound(
+                        "Properties",
+                        props.iter().map(|(k, v)| nbt_str(k, v)).collect(),
+                    ));
+                }
+                nbt_compound_payload(fields)
+            })
+            .collect();
+        root.extend_from_slice(&nbt_list("palette", 10, pal));
+        let bl: Vec<Vec<u8>> = blocks
+            .iter()
+            .map(|(pos, state)| {
+                nbt_compound_payload(vec![
+                    nbt_int3("pos", *pos),
+                    nbt_int("state", *state as i32),
+                ])
+            })
+            .collect();
+        root.extend_from_slice(&nbt_list("blocks", 10, bl));
+        let mut out = vec![10, 0, 0];
+        out.extend_from_slice(&root);
+        out.push(0);
+        out
+    }
+
+    /// Single-member RFC 1952 gzip wrapper around stored deflate blocks —
+    /// real framing so the loader exercises its full header/inflate/
+    /// CRC32-trailer path.
+    fn gzip_stored(data: &[u8]) -> Vec<u8> {
+        let mut out = vec![0x1f, 0x8b, 8, 0, 0, 0, 0, 0, 0, 0xff];
+        let mut chunks = data.chunks(0xffff).peekable();
+        if chunks.peek().is_none() {
+            out.extend_from_slice(&[1, 0, 0, 0xff, 0xff]);
+        }
+        while let Some(chunk) = chunks.next() {
+            let len = chunk.len() as u16;
+            out.push(u8::from(chunks.peek().is_none()));
+            out.extend_from_slice(&len.to_le_bytes());
+            out.extend_from_slice(&(!len).to_le_bytes());
+            out.extend_from_slice(chunk);
+        }
+        out.extend_from_slice(&megu_core::hash::crc32_ieee(data).to_le_bytes());
+        out.extend_from_slice(&(data.len() as u32).to_le_bytes());
+        out
+    }
+
+    const W9: (i32, i32, i32) = (9_000_000, 80, 1_100);
+    const W10: (i32, i32, i32) = (9_000_000, 80, 1_200);
+
+    /// End-to-end: a gzipped `.nbt` Create factory — creative motor ->
+    /// shaft -> mechanical press over a depot fed by chute -> andesite
+    /// funnel -> two belts — is placed through
+    /// `live_place_nbt_schematic_in_dim`, then an iron ingot dropped into
+    /// the chute rides the whole duct chain and lands on the depot as a
+    /// pressed `create:iron_sheet`.
+    #[test]
+    fn create_nbt_schematic_duct_chain_presses_iron() {
+        let _g = world_guard();
+        arm();
+        let (ox, oy, oz) = W9;
+        let cells: [[i32; 3]; 10] = [
+            [0, 1, 0], // chute
+            [0, 0, 0], // funnel (insert mode: staged items push out east)
+            [1, 0, 0], // belt
+            [2, 0, 0], // belt
+            [3, 0, 0], // depot
+            [4, 0, 0], // brass casing (decorative)
+            [4, 1, 0], // andesite casing (decorative)
+            [1, 2, 0], // creative motor
+            [2, 2, 0], // shaft
+            [3, 2, 0], // mechanical press (2 over the depot)
+        ];
+        for [dx, dy, dz] in cells {
+            clear(ox + dx, oy + dy, oz + dz);
+        }
+        let nbt = structure_nbt(
+            [5, 3, 1],
+            &[
+                ("create:chute", &[("facing", "east")]),
+                (
+                    "create:andesite_funnel",
+                    &[("extracting", "false"), ("facing", "east")],
+                ),
+                ("create:belt", &[("facing", "east")]),
+                ("create:depot", &[]),
+                ("create:brass_casing", &[]),
+                ("create:andesite_casing", &[]),
+                ("create:creative_motor", &[("facing", "east")]),
+                ("create:shaft", &[("axis", "x")]),
+                ("create:mechanical_press", &[("facing", "east")]),
+            ],
+            &[
+                (cells[0], 0),
+                (cells[1], 1),
+                (cells[2], 2),
+                (cells[3], 2),
+                (cells[4], 3),
+                (cells[5], 4),
+                (cells[6], 5),
+                (cells[7], 6),
+                (cells[8], 7),
+                (cells[9], 8),
+            ],
+        );
+        let report = live_place_nbt_schematic_in_dim(
+            DimId::Overworld,
+            (ox, oy, oz),
+            &gzip_stored(&nbt),
+        )
+        .expect("schematic must place");
+        assert_eq!(report.placed_blocks, 10);
+        assert_eq!(report.unresolved_palette_entries, 0);
+        assert_eq!(report.skipped_blocks, 0);
+        assert_eq!(
+            report.kinetic_nodes_armed, 10,
+            "every Create cell must register in the live runtime"
+        );
+
+        // The placed press must be a Running node on the motor's network.
+        let press_pos = pos_of((ox + 3, oy + 2, oz));
+        live_create_with(|rt| {
+            let sol = rt
+                .factory
+                .kinetic_solution(press_pos)
+                .expect("press registers in the kinetic graph");
+            assert!(
+                matches!(
+                    sol.status,
+                    mod_offload::kinetic_graph::NetworkStatus::Running
+                ),
+                "press must be powered, got {:?}",
+                sol.status
+            );
+        });
+
+        // Drop one ingot into the chute and let the duct chain carry it.
+        let iron = name_to_item("minecraft:iron_ingot").expect("iron item");
+        assert!(live_create_duct_insert(DimId::Overworld, ox, oy + 1, oz, iron));
+        let depot_pos = pos_of((ox + 3, oy, oz));
+        let sheet = name_to_item("create:iron_sheet").expect("sheet item");
+        assert!(
+            step_until(2_000, |rt| rt
+                .held
+                .get(&depot_pos)
+                .is_some_and(|h| h.items.as_slice() == [sheet])),
+            "iron must flow chute -> funnel -> belts -> depot and press to a sheet"
+        );
+
+        for [dx, dy, dz] in cells {
+            clear(ox + dx, oy + dy, oz + dz);
+        }
+    }
+
+    /// The extracting pull path: a belt dead-ending into air accumulates
+    /// items in its output FIFO; a `create:brass_funnel` facing the belt
+    /// with `extracting=true` pulls one per cycle into the depot attached
+    /// behind it.
+    #[test]
+    fn create_extracting_funnel_pulls_belt_end_into_depot() {
+        let _g = world_guard();
+        arm();
+        let (ox, oy, oz) = W10;
+        let belt = (ox, oy, oz);
+        let funnel = (ox + 1, oy, oz);
+        let depot = (ox + 2, oy, oz);
+        for c in [belt, funnel, depot] {
+            clear(c.0, c.1, c.2);
+        }
+        put(
+            DimId::Overworld,
+            belt.0,
+            belt.1,
+            belt.2,
+            state_of("create:belt", &[("facing", "north")]),
+        );
+        put(
+            DimId::Overworld,
+            funnel.0,
+            funnel.1,
+            funnel.2,
+            state_of(
+                "create:brass_funnel",
+                &[("facing", "west"), ("extracting", "true")],
+            ),
+        );
+        put(
+            DimId::Overworld,
+            depot.0,
+            depot.1,
+            depot.2,
+            state_of("create:depot", &[]),
+        );
+
+        let iron = name_to_item("minecraft:iron_ingot").expect("iron item");
+        assert!(live_create_duct_insert(
+            DimId::Overworld,
+            belt.0,
+            belt.1,
+            belt.2,
+            iron
+        ));
+        let depot_pos = pos_of(depot);
+        assert!(
+            step_until(200, |rt| rt
+                .held
+                .get(&depot_pos)
+                .is_some_and(|h| h.items.as_slice() == [iron])),
+            "extracting funnel must pull the belt-end item into the depot"
+        );
+
+        for c in [belt, funnel, depot] {
+            clear(c.0, c.1, c.2);
+        }
     }
 }

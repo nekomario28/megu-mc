@@ -46,7 +46,7 @@ pub fn core_create_block_aliases() -> Vec<(String, String)> {
     )]
 }
 
-/// Build the default core Create 1.21.1 block catalog (24 blocks).
+/// Build the default core Create 1.21.1 block catalog (29 blocks).
 pub fn core_create_registry(base_state_id: u32) -> CreateBlockRegistry {
     BlockRegistry::build_with_aliases(
         base_state_id,
@@ -56,8 +56,11 @@ pub fn core_create_registry(base_state_id: u32) -> CreateBlockRegistry {
     .expect("built-in Create catalog must be valid")
 }
 
-/// Built-in Create 1.21.1 core block catalog (24 blocks covering kinetics,
-/// belts/chutes, processing, fluids, and contraption anchors).
+/// Built-in Create 1.21.1 core block catalog (29 blocks covering kinetics,
+/// belts/chutes/funnels, processing, fluids, casings, and contraption
+/// anchors). The list is append-only: shipped save/MCF2 sidecars and MRS1
+/// frames key states by the index this order assigns, so new entries always
+/// land at the end.
 pub fn core_create_block_defs() -> Vec<BlockDef<CreateBlockRole>> {
     let axis = || PropertyDef::new("axis", &["x", "y", "z"]);
     let facing_all =
@@ -65,6 +68,7 @@ pub fn core_create_block_defs() -> Vec<BlockDef<CreateBlockRole>> {
     let facing_horiz = || PropertyDef::new("facing", &["north", "south", "east", "west"]);
     let waterlogged = || PropertyDef::new("waterlogged", &["false", "true"]);
     let powered = || PropertyDef::new("powered", &["false", "true"]);
+    let extracting = || PropertyDef::new("extracting", &["false", "true"]);
 
     vec![
         BlockDef {
@@ -171,11 +175,7 @@ pub fn core_create_block_defs() -> Vec<BlockDef<CreateBlockRole>> {
         },
         BlockDef {
             id: "create:andesite_funnel".into(),
-            properties: vec![
-                facing_all(),
-                PropertyDef::new("extracting", &["false", "true"]),
-                powered(),
-            ],
+            properties: vec![facing_all(), extracting(), powered()],
             load_factor: 0.0,
             capacity_factor: 0.0,
             role: CreateBlockRole::Transport,
@@ -275,6 +275,46 @@ pub fn core_create_block_defs() -> Vec<BlockDef<CreateBlockRole>> {
             capacity_factor: 0.0,
             role: CreateBlockRole::Sensor,
         },
+        // Append-only tail (C2): belt funnels + brass funnel + casings —
+        // Ponder/showcase schematics ship all of them, and the live item
+        // flow wires every `Transport`-role duct.
+        BlockDef {
+            // Sits on a belt edge; `facing` is the horizontal direction the
+            // funnel's mouth opens toward.
+            id: "create:andesite_belt_funnel".into(),
+            properties: vec![facing_horiz(), extracting(), powered()],
+            load_factor: 0.0,
+            capacity_factor: 0.0,
+            role: CreateBlockRole::Transport,
+        },
+        BlockDef {
+            id: "create:brass_belt_funnel".into(),
+            properties: vec![facing_horiz(), extracting(), powered()],
+            load_factor: 0.0,
+            capacity_factor: 0.0,
+            role: CreateBlockRole::Transport,
+        },
+        BlockDef {
+            id: "create:brass_funnel".into(),
+            properties: vec![facing_all(), extracting(), powered()],
+            load_factor: 0.0,
+            capacity_factor: 0.0,
+            role: CreateBlockRole::Transport,
+        },
+        BlockDef {
+            id: "create:andesite_casing".into(),
+            properties: vec![],
+            load_factor: 0.0,
+            capacity_factor: 0.0,
+            role: CreateBlockRole::Decorative,
+        },
+        BlockDef {
+            id: "create:brass_casing".into(),
+            properties: vec![],
+            load_factor: 0.0,
+            capacity_factor: 0.0,
+            role: CreateBlockRole::Decorative,
+        },
     ]
 }
 
@@ -285,7 +325,7 @@ mod tests {
     #[test]
     fn cartesian_expansion_and_save_v2_remapping_survive_reorder() {
         let base = core_create_registry(DEFAULT_BASE_STATE_ID);
-        assert_eq!(base.block_count(), 24);
+        assert_eq!(base.block_count(), 29);
         let shaft_default = base.default_state("create:shaft").unwrap();
         assert_eq!(
             base.encode_canonical(shaft_default),
