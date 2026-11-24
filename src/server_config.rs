@@ -161,6 +161,10 @@ fn server_config_parse(text: &str) -> (ServerConfigDoc, Vec<String>) {
     let mut doc: ServerConfigDoc = BTreeMap::new();
     let mut warnings = Vec::new();
     let mut table = String::new();
+    // `[[name]]` array-of-tables entries are flattened into `name#0`, `name#1`,
+    // … synthetic tables — the flat `BTreeMap<table, keys>` document shape
+    // stays, and consumers iterate the numbered range in order.
+    let mut array_counts: BTreeMap<String, usize> = BTreeMap::new();
     let mut pending: Option<(usize, String)> = None; // multi-line array being joined
     for (index, raw) in text.lines().enumerate() {
         let line_no = index + 1;
@@ -177,6 +181,21 @@ fn server_config_parse(text: &str) -> (ServerConfigDoc, Vec<String>) {
             continue;
         }
         if line.starts_with('[') && !line.contains('=') {
+            if let Some(inner) = line
+                .strip_prefix("[[")
+                .and_then(|l| l.strip_suffix("]]"))
+            {
+                let base = inner.trim();
+                if base.is_empty() || base.starts_with('[') {
+                    warnings.push(format!("line {line_no}: cannot read table header `{line}`"));
+                } else {
+                    let count = array_counts.entry(base.to_owned()).or_insert(0);
+                    table = format!("{base}#{count}");
+                    *count += 1;
+                    doc.entry(table.clone()).or_default();
+                }
+                continue;
+            }
             match line.strip_prefix('[').and_then(|l| l.strip_suffix(']')) {
                 Some(name) if !name.trim().is_empty() && !name.starts_with('[') => {
                     table = name.trim().to_owned();
@@ -548,6 +567,9 @@ const SERVER_CONFIG_KEYS: &[(&str, &str)] = &[
     ("target_version", "MEGU_TARGET_VERSION"),
     ("target_mc_version", "MEGU_MC_VERSION"),
     ("version_pack_dir", "MEGU_VERSION_DIR"),
+    // Vanilla `op-permission-level` — the level a fresh `/op` grants. The
+    // properties layer exports the same variable for `op-permission-level`.
+    ("op_permission_level", "MEGU_OP_PERMISSION_LEVEL"),
 ];
 
 /// `[anticheat]` keys: the ones in the default file, then old ones that still work
@@ -613,6 +635,13 @@ fn server_config_unknown_keys(doc: &ServerConfigDoc) -> Vec<String> {
         let known: Vec<&str> = match table.as_str() {
             "server" => SERVER_CONFIG_KEYS.iter().map(|(k, _)| *k).collect(),
             "anticheat" => SERVER_CONFIG_ANTICHEAT_KEYS.to_vec(),
+            "lifecycle" => vec!["idle_sleep_secs", "idle_shutdown_secs"],
+            "remote_control" => vec!["enabled", "bind_addr", "admin_token", "start_only_token"],
+            "servers" => vec!["fallback"],
+            _ if table.starts_with("servers.") => vec!["host", "port"],
+            _ if table.starts_with("worlds#") => {
+                vec!["id", "generator", "seed", "pvp", "gamemode", "spawn"]
+            }
             _ => {
                 out.push(format!("unknown table [{table}]"));
                 continue;
@@ -697,6 +726,9 @@ fn server_config_boot() -> ServerConfigDoc {
     }
     eprintln!("[config] {}", ops.summary());
     let _ = RUNTIME_OPS.set(ops);
+    for w in apply_operator_tables(&doc) {
+        eprintln!("[config] {}: {w} (skipped)", path.display());
+    }
     doc
 }
 
@@ -709,6 +741,199 @@ fn server_config_reread() -> Result<(ServerConfigDoc, Vec<String>), String> {
     let (doc, mut warnings) = server_config_parse(&text);
     warnings.extend(server_config_unknown_keys(&doc));
     Ok((doc, warnings))
+}
+
+// ----------------------------------------------------- operator tables ----
+
+/// `[lifecycle]` — the sleep/shutdown policy for an empty server. `None` when
+/// the table is absent; the loop that owns `ServerLifecycleController` reads
+/// this once at startup.
+#[allow(dead_code)] // consumed by the supervisor loop owned by the main.rs lane
+pub(crate) struct LifecycleBootConfig {
+    /// Seconds with zero players before the world saves and the server
+    /// hibernates (`sleeping_motd` + `RejectLogin` wake).
+    pub idle_sleep_secs: u64,
+    /// Seconds with zero players before the server exits instead — when set,
+    /// it wins over hibernation.
+    pub idle_shutdown_secs: Option<u64>,
+}
+
+/// `[remote_control]` — the loopback admin page's bind and tokens. `None`
+/// when `enabled` is absent or not true.
+#[allow(dead_code)] // consumed by the remote-control listener owned by the main.rs lane
+pub(crate) struct RemoteControlBootConfig {
+    pub bind_addr: String,
+    pub admin_token: String,
+    pub start_only_token: Option<String>,
+}
+
+/// What the operator tables resolved to at boot.
+#[allow(dead_code)] // fields are read by the lanes that own the supervisor and the admin listener
+pub(crate) struct OperatorTablesConfig {
+    pub lifecycle: Option<LifecycleBootConfig>,
+    pub remote_control: Option<RemoteControlBootConfig>,
+}
+
+static OPERATOR_TABLES: OnceLock<OperatorTablesConfig> = OnceLock::new();
+
+/// The boot-resolved `[lifecycle]`/`[remote_control]` pair — empty before
+/// `server_config_boot` runs or when neither table is present.
+#[allow(dead_code)]
+pub(crate) fn operator_tables() -> &'static OperatorTablesConfig {
+    OPERATOR_TABLES.get_or_init(|| OperatorTablesConfig {
+        lifecycle: None,
+        remote_control: None,
+    })
+}
+
+fn cfg_table_str<'a>(table: &'a BTreeMap<String, ServerConfigValue>, key: &str) -> Option<&'a str> {
+    match table.get(key) {
+        Some(ServerConfigValue::Str(s)) => Some(s.as_str()),
+        _ => None,
+    }
+}
+
+fn cfg_table_i64(table: &BTreeMap<String, ServerConfigValue>, key: &str) -> Option<i64> {
+    match table.get(key) {
+        Some(ServerConfigValue::Int(i)) => Some(*i),
+        _ => None,
+    }
+}
+
+fn cfg_table_bool(table: &BTreeMap<String, ServerConfigValue>, key: &str) -> Option<bool> {
+    match table.get(key) {
+        Some(ServerConfigValue::Bool(b)) => Some(*b),
+        _ => None,
+    }
+}
+
+/// Wire the `[servers]`, `[[worlds]]`, `[lifecycle]` and `[remote_control]`
+/// tables into the live registries the commands read. Problems are reported
+/// like the other config warnings — a bad entry is skipped, never fatal.
+fn apply_operator_tables(doc: &ServerConfigDoc) -> Vec<String> {
+    let mut warnings = Vec::new();
+    // [servers.<name>] hub directory + [servers] fallback.
+    {
+        let mut directory = hub_directory().lock().unwrap_or_else(|e| e.into_inner());
+        for (table, keys) in doc {
+            let Some(name) = table.strip_prefix("servers.") else {
+                continue;
+            };
+            match (cfg_table_str(keys, "host"), cfg_table_i64(keys, "port")) {
+                (Some(host), Some(port)) => {
+                    if let Err(e) = directory.add_server(name, host, port.clamp(0, u16::MAX as i64) as u16)
+                    {
+                        warnings.push(format!("[{table}] {e}"));
+                    }
+                }
+                _ => warnings.push(format!("[{table}] needs a `host` string and a `port` integer")),
+            }
+        }
+        if let Some(servers) = doc.get("servers") {
+            if let Some(fallback) = cfg_table_str(servers, "fallback") {
+                if let Err(e) = directory.set_fallback(fallback) {
+                    warnings.push(format!("[servers] {e}"));
+                }
+            }
+        }
+    }
+    // [[worlds]] — each entry becomes a managed world plus its live
+    // `megu:<id>` dimension registration.
+    for (table, keys) in doc {
+        if !table.starts_with("worlds#") {
+            continue;
+        }
+        let Some(id) = cfg_table_str(keys, "id").map(str::to_owned) else {
+            warnings.push(format!("[{table}] needs an `id` string"));
+            continue;
+        };
+        let generator = match cfg_table_str(keys, "generator").unwrap_or("overworld") {
+            "overworld" => WorldGenerator::Overworld,
+            "flat" => WorldGenerator::Flat,
+            "void" => WorldGenerator::Void,
+            other => {
+                warnings.push(format!(
+                    "[{table}] unknown generator {other:?}; expected overworld|flat|void"
+                ));
+                continue;
+            }
+        };
+        let spawn: [f64; 3] = match keys.get("spawn") {
+            Some(ServerConfigValue::Array(items)) if items.len() == 3 => {
+                let mut out = [0.0; 3];
+                let mut ok = true;
+                for (i, item) in items.iter().enumerate() {
+                    match item {
+                        ServerConfigValue::Int(n) => out[i] = *n as f64,
+                        ServerConfigValue::Float(f) => out[i] = *f,
+                        _ => ok = false,
+                    }
+                }
+                if !ok {
+                    warnings.push(format!("[{table}] `spawn` entries must be numbers"));
+                    continue;
+                }
+                out
+            }
+            Some(_) => {
+                warnings.push(format!("[{table}] `spawn` must be `[x, y, z]`"));
+                continue;
+            }
+            None => [0.5, 64.0, 0.5],
+        };
+        if let Err(e) = register_managed_world_dimension(&id, generator) {
+            warnings.push(format!("[{table}] {e}"));
+            continue;
+        }
+        let world = ManagedWorld {
+            id: id.clone(),
+            generator,
+            seed: cfg_table_i64(keys, "seed")
+                .map(|v| v as u64)
+                .unwrap_or_else(|| WORLD_SEED.load(Ordering::Relaxed)),
+            pvp: cfg_table_bool(keys, "pvp").unwrap_or_else(live_pvp_enabled),
+            default_gamemode: match cfg_table_str(keys, "gamemode").unwrap_or("survival") {
+                "creative" => WorldGameMode::Creative,
+                "adventure" => WorldGameMode::Adventure,
+                "spectator" => WorldGameMode::Spectator,
+                _ => WorldGameMode::Survival,
+            },
+            spawn,
+        };
+        if let Err(e) = managed_worlds()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .add(world)
+        {
+            warnings.push(format!("[{table}] {e}"));
+        }
+    }
+    // [lifecycle] / [remote_control] — parked for the lanes that own the
+    // supervisor loop and the admin listener.
+    let lifecycle = doc.get("lifecycle").map(|keys| LifecycleBootConfig {
+        idle_sleep_secs: cfg_table_i64(keys, "idle_sleep_secs")
+            .map(|v| v.max(0) as u64)
+            .unwrap_or(300),
+        idle_shutdown_secs: cfg_table_i64(keys, "idle_shutdown_secs").map(|v| v.max(0) as u64),
+    });
+    let remote_control = doc
+        .get("remote_control")
+        .filter(|keys| cfg_table_bool(keys, "enabled").unwrap_or(false))
+        .and_then(|keys| {
+            let admin_token = cfg_table_str(keys, "admin_token")?.to_owned();
+            Some(RemoteControlBootConfig {
+                bind_addr: cfg_table_str(keys, "bind_addr")
+                    .unwrap_or("127.0.0.1:25575")
+                    .to_owned(),
+                admin_token,
+                start_only_token: cfg_table_str(keys, "start_only_token").map(str::to_owned),
+            })
+        });
+    let _ = OPERATOR_TABLES.set(OperatorTablesConfig {
+        lifecycle,
+        remote_control,
+    });
+    warnings
 }
 
 // ---------- production ops knobs ----------
@@ -1259,7 +1484,7 @@ mod server_config_tests {
         let props = server_properties_parse(
             "# vanilla comment\n\
              ! also a comment\n\
-             server-port=25599\n\
+             server-port=25565\n\
              server-ip=\n\
              motd=A\\: escaped server\\nline two\n\
              max-players: 5\n\
@@ -1270,7 +1495,7 @@ mod server_config_tests {
              escaped\\=key=v\n\
              unicode=\\u00e9\n",
         );
-        assert_eq!(props["server-port"], "25599");
+        assert_eq!(props["server-port"], "25565");
         assert_eq!(props["motd"], "A: escaped server\nline two");
         assert_eq!(props["max-players"], "5");
         assert_eq!(props["escaped=key"], "v");
@@ -1544,5 +1769,113 @@ mod server_config_tests {
         let c = RuntimeOpsConfig::from_doc(&doc, |_| None);
         assert_eq!(c.target_version, "1.21.1");
         assert!(c.notes.iter().any(|n| n.contains("must be a string")));
+    }
+}
+
+#[cfg(test)]
+mod admin_wire_config_tests {
+    use super::*;
+
+    /// The listen-port default is 25565 everywhere: `server.toml` parses it,
+    /// exports `MEGU_PORT` and the properties layer accepts it too.
+    #[test]
+    fn port_25565_is_the_default_across_layers() {
+        let (doc, warnings) = server_config_parse("[server]\nport = 25565\n");
+        assert!(warnings.is_empty(), "{warnings:?}");
+        let env = server_config_server_env(&doc, |_| false);
+        assert!(env.contains(&("MEGU_PORT", "25565".to_owned())));
+        let props = server_properties_parse("server-port=25565\n");
+        let env = server_properties_env(&props, |_| false);
+        assert!(env.contains(&("MEGU_PORT", "25565".to_owned())));
+    }
+
+    /// `[[worlds]]` array-of-tables flatten into `worlds#N`, `[servers.<name>]`
+    /// dotted tables and `[lifecycle]`/`[remote_control]` parse, and the
+    /// unknown-key check accepts them.
+    #[test]
+    fn operator_tables_parse_without_unknown_key_warnings() {
+        let text = r#"
+[servers]
+fallback = "lobby"
+
+[servers.lobby]
+host = "127.0.0.1"
+port = 25566
+
+[servers.game]
+host = "10.0.0.5"
+port = 25567
+
+[[worlds]]
+id = "farm"
+generator = "flat"
+pvp = false
+spawn = [0.5, 64.0, 8.5]
+
+[[worlds]]
+id = "voidlab"
+generator = "void"
+
+[lifecycle]
+idle_sleep_secs = 120
+idle_shutdown_secs = 3600
+
+[remote_control]
+enabled = true
+bind_addr = "127.0.0.1:25575"
+admin_token = "secret"
+"#;
+        let (doc, warnings) = server_config_parse(text);
+        assert!(warnings.is_empty(), "{warnings:?}");
+        assert!(doc.contains_key("servers"));
+        assert!(doc.contains_key("servers.lobby"));
+        assert!(doc.contains_key("servers.game"));
+        assert!(doc.contains_key("worlds#0"));
+        assert!(doc.contains_key("worlds#1"));
+        assert_eq!(
+            doc["worlds#0"]["id"],
+            ServerConfigValue::Str("farm".to_owned())
+        );
+        assert_eq!(
+            doc["worlds#1"]["generator"],
+            ServerConfigValue::Str("void".to_owned())
+        );
+        assert!(server_config_unknown_keys(&doc).is_empty());
+
+        let notes = apply_operator_tables(&doc);
+        assert!(notes.is_empty(), "{notes:?}");
+        let directory = hub_directory().lock().unwrap_or_else(|e| e.into_inner());
+        assert_eq!(directory.resolve("lobby"), Some(("127.0.0.1", 25566)));
+        assert_eq!(
+            directory.fallback().map(|(n, h, p)| (n.to_owned(), h.to_owned(), p)),
+            Some(("lobby".to_owned(), "127.0.0.1".to_owned(), 25566))
+        );
+        drop(directory);
+        let worlds = managed_worlds().lock().unwrap_or_else(|e| e.into_inner());
+        let farm = worlds.get("farm").expect("farm world applied");
+        assert_eq!(farm.spawn, [0.5, 64.0, 8.5]);
+        assert!(!farm.pvp);
+        drop(worlds);
+        assert!(DimId::parse_dimension_id("megu:farm").is_some());
+        assert!(DimId::parse_dimension_id("megu:voidlab").is_some());
+
+        let tables = operator_tables();
+        let lifecycle = tables.lifecycle.as_ref().expect("[lifecycle] resolved");
+        assert_eq!(lifecycle.idle_sleep_secs, 120);
+        assert_eq!(lifecycle.idle_shutdown_secs, Some(3600));
+        let rc = tables
+            .remote_control
+            .as_ref()
+            .expect("enabled [remote_control] resolves");
+        assert_eq!(rc.bind_addr, "127.0.0.1:25575");
+        assert_eq!(rc.admin_token, "secret");
+
+        let mut directory = hub_directory().lock().unwrap_or_else(|e| e.into_inner());
+        directory.remove_server("lobby");
+        directory.remove_server("game");
+        drop(directory);
+        let mut worlds = managed_worlds().lock().unwrap_or_else(|e| e.into_inner());
+        worlds.remove("farm");
+        worlds.remove("voidlab");
     }
 }

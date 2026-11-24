@@ -5714,7 +5714,7 @@ fn command_usage(name: &str) -> String {
         "locate" => "/locate structure|biome|poi <id>",
         "loot" => "/loot spawn|give|insert|replace <target> <source>",
         "me" => "/me <action>",
-        "megu" => "/megu policy list|get <key>|set <key> <value>|reset|audit [player] [radius]|rollback <player> <radius> [max_blocks]|claim here|unclaim|trust <player>|untrust <player>|info|admin-unclaim|spawn-radius <n>|backup plan|status|metrics",
+        "megu" => "/megu policy list|get <key>|set <key> <value>|reset|audit [player] [radius]|rollback <player> <radius> [max_blocks]|claim here|unclaim|trust <player>|untrust <player>|info|admin-unclaim|spawn-radius <n>|backup plan|status|metrics|mod add|remove|list|snapshot|restart",
         "msg" | "tell" | "w" => "/msg <player> <message>",
         "op" => "/op <player>",
         "pardon" => "/pardon <player>",
@@ -5737,6 +5737,8 @@ fn command_usage(name: &str) -> String {
         "schedule" => "/schedule function <id> <time>[t|s|d] [append|replace] | /schedule clear [<id>]",
         "scoreboard" => "/scoreboard objectives add|remove|list|setdisplay|modify | players set|add|remove|reset|get|list|enable|operation",
         "seed" => "no arguments; print the world seed",
+        "server" => "/server [<name>] — list hub servers or transfer to one",
+        "hub" => "no arguments; transfer to the hub server",
         "setblock" => "/setblock <x> <y> <z> <block> [replace|destroy|keep]",
         "setidletimeout" => "/setidletimeout <minutes>",
         "setworldspawn" => "/setworldspawn [x y z] [angle]",
@@ -5759,6 +5761,7 @@ fn command_usage(name: &str) -> String {
         "weather" => "/weather clear|rain|thunder [<duration>]",
         "whitelist" => "/whitelist on|off|list|add|remove|reload [<player>]",
         "worldborder" => "/worldborder center|add|set|damage|get|warning|buffer ...",
+        "world" => "/world list | create <name> [overworld|flat|void] | tp <name> | setspawn [<name>]",
         "?" => "/? [<command>]",
         _ => return "Unknown command or insufficient permissions".into(),
     };
@@ -5897,38 +5900,15 @@ fn set_difficulty(difficulty: u8) {
 
 #[cfg(test)]
 fn read_operators(path: &std::path::Path) -> std::io::Result<Operators> {
-    let text = match std::fs::read_to_string(path) {
-        Ok(text) => text,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Operators::new()),
-        Err(error) => return Err(error),
-    };
-    let invalid = || {
-        std::io::Error::new(
-            std::io::ErrorKind::InvalidData,
-            "expected a JSON array of player names",
-        )
-    };
-    let entries = text
-        .trim()
-        .strip_prefix('[')
-        .and_then(|s| s.strip_suffix(']'))
-        .ok_or_else(invalid)?
-        .trim();
-    if entries.is_empty() {
-        return Ok(Operators::new());
-    }
-    entries
-        .split(',')
-        .map(|entry| {
-            let name = entry
-                .trim()
-                .strip_prefix('"')
-                .and_then(|s| s.strip_suffix('"'))
-                .filter(|s| valid_player_name(s))
-                .ok_or_else(invalid)?;
-            Ok(name.to_ascii_lowercase())
-        })
-        .collect()
+    // `set_operator` writes the Vanilla object schema; `OpsRegistry::load`
+    // still reads the legacy flat name array the old fixtures used.
+    OpsRegistry::load(path).map(|registry| {
+        registry
+            .entries
+            .iter()
+            .map(|entry| entry.name.to_ascii_lowercase())
+            .collect()
+    })
 }
 
 fn load_operators(path: &std::path::Path) -> std::io::Result<()> {
@@ -5966,6 +5946,15 @@ fn set_operator(path: &std::path::Path, name: &str, enable: bool) -> std::io::Re
     if !changed {
         return Ok(false);
     }
+    // The file is the Vanilla `ops.json` object schema, so the body comes from
+    // the registry — a `/op` grants `op-permission-level`, not a hard 4.
+    let mut registry = ops_registry().lock().unwrap_or_else(|e| e.into_inner());
+    let mut proposed_registry = registry.clone();
+    if enable {
+        proposed_registry.set(&name, live_op_permission_level(), false);
+    } else {
+        proposed_registry.remove(&name);
+    }
     let temp = path.with_extension(format!(
         "json.{}.{}.tmp",
         std::process::id(),
@@ -5975,26 +5964,15 @@ fn set_operator(path: &std::path::Path, name: &str, enable: bool) -> std::io::Re
         .write(true)
         .create_new(true)
         .open(&temp)?;
-    let body = proposed
-        .iter()
-        .map(|name| format!("\"{name}\""))
-        .collect::<Vec<_>>()
-        .join(", ");
-    let written = writeln!(file, "[{body}]").and_then(|_| file.sync_all());
+    let written = writeln!(file, "{}", ops_registry_json(&proposed_registry))
+        .and_then(|_| file.sync_all());
     drop(file);
     if let Err(error) = written.and_then(|_| std::fs::rename(&temp, path)) {
         let _ = std::fs::remove_file(&temp);
         return Err(error);
     }
     *operators = proposed;
-    {
-        let mut registry = ops_registry().lock().unwrap_or_else(|e| e.into_inner());
-        if enable {
-            registry.set(&name, 4, false);
-        } else {
-            registry.remove(&name);
-        }
-    }
+    *registry = proposed_registry;
     Ok(true)
 }
 
@@ -6347,6 +6325,10 @@ fn native_command_dispatcher(
         register(literal(name).then(message()));
     }
     register(literal("trigger").then(args("arguments")));
+    // `/server`/`/hub` stay dispatch-only at level 0 — the advertised
+    // player-level tree is pinned by `brigadier_play_tree_and_completion_
+    // respect_permissions`, and the hub commands parse through the
+    // dispatch fallthrough like `/megu claim` does.
     if level < 2 {
         return dispatcher;
     }
@@ -6533,7 +6515,7 @@ fn native_command_dispatcher(
     ] {
         register_at_level(name, literal(name).then(args("arguments")));
     }
-    for name in ["clear", "gamerule", "setworldspawn", "spawnpoint"] {
+    for name in ["clear", "gamerule", "setworldspawn", "spawnpoint", "world"] {
         register_at_level(name, done(name).then(args("arguments")));
     }
     // Vanilla's `/transfer` literal sits at level 3; `/profile` is the owner
@@ -6564,7 +6546,11 @@ fn native_command_dispatcher(
         .then(done("rollback").then(args("arguments")))
         .then(done("claim").then(args("arguments")))
         .then(done("backup").then(args("arguments")))
-        .then(done("metrics")));
+        .then(done("metrics"))
+        .then(done("mod").then(args("arguments")))
+        .then(done("status"))
+        .then(done("snapshot"))
+        .then(done("restart")));
     }
     // P8c cluster-C owner commands; `required_permission_level` already maps
     // all four to 4, so `register_at_level` advertises them at level 4 only.
@@ -8267,6 +8253,444 @@ mod aero_command_tests {
     }
 }
 
+// ------------------------------------------------------------ ADMIN-WIRE ----
+
+/// `survival-mods.json` — the Survival Moderator roster `/megu mod` manages and
+/// the command gate consults. Persisted next to `ops.json`, names lowercased
+/// like `OPERATORS`.
+const SURVIVAL_MODS_FILE: &str = "survival-mods.json";
+
+/// Where the roster lives: `MEGU_SURVIVAL_MODS_FILE`, else `survival-mods.json`
+/// in the working directory (where `ops.json` sits).
+fn survival_mods_path() -> std::path::PathBuf {
+    std::env::var_os("MEGU_SURVIVAL_MODS_FILE")
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|| std::path::PathBuf::from(SURVIVAL_MODS_FILE))
+}
+
+fn survival_mods() -> &'static Mutex<SurvivalModRegistry> {
+    static MODS: OnceLock<Mutex<SurvivalModRegistry>> = OnceLock::new();
+    MODS.get_or_init(|| {
+        Mutex::new(
+            SurvivalModRegistry::load_json(&survival_mods_path()).unwrap_or_else(|error| {
+                eprintln!("[spine] could not load {SURVIVAL_MODS_FILE}: {error}");
+                SurvivalModRegistry::new()
+            }),
+        )
+    })
+}
+
+fn save_survival_mods() {
+    let registry = survival_mods().lock().unwrap_or_else(|e| e.into_inner());
+    if let Err(error) = registry.save_json(&survival_mods_path()) {
+        eprintln!("[spine] could not write {SURVIVAL_MODS_FILE}: {error}");
+    }
+}
+
+/// `[servers]` hub directory — `/server`, `/hub` and the shutdown fallback all
+/// resolve through it; `server_config_boot` fills it.
+fn hub_directory() -> &'static Mutex<HubServerDirectory> {
+    static DIRECTORY: OnceLock<Mutex<HubServerDirectory>> = OnceLock::new();
+    DIRECTORY.get_or_init(|| Mutex::new(HubServerDirectory::new()))
+}
+
+/// `[[worlds]]` managed extra worlds — `/world` and the boot config apply.
+fn managed_worlds() -> &'static Mutex<MultiWorldRegistry> {
+    static WORLDS: OnceLock<Mutex<MultiWorldRegistry>> = OnceLock::new();
+    WORLDS.get_or_init(|| Mutex::new(MultiWorldRegistry::new()))
+}
+
+/// Vanilla 1.20.5+ `ClientboundTransferPacket` (0x73): hand a connected client
+/// a new `host:port` to reconnect to. The connection keeps running until the
+/// client leaves — the same semantics the `/transfer` command already uses.
+fn transfer_client_to(client: &Client, host: &str, port: u16) {
+    let _ = send_packet(
+        &mut client.sock.lock().unwrap_or_else(|e| e.into_inner()),
+        TRANSFER_PACKET_ID,
+        transfer_packet(host, port),
+    );
+}
+
+/// Move every online player to the `[servers] fallback` hub before a shutdown
+/// or restart drops their sockets. A no-op without a configured fallback.
+fn transfer_all_to_fallback() {
+    let fallback = hub_directory()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .fallback()
+        .map(|(name, host, port)| (name.to_owned(), host.to_owned(), port));
+    let Some((_name, host, port)) = fallback else { return };
+    for client in client_snapshot() {
+        transfer_client_to(&client, &host, port);
+    }
+}
+
+/// `/megu status`: the one-screen operator summary — live TPS, MSPT p50/p95,
+/// players, chunks, RSS, world/hub/survival-mod counts — plus the chunk
+/// hotspot report `ChunkHotspotQuarantine` keeps.
+fn megu_status_report() -> String {
+    let perf = live_hotspot_profiler()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .summary(0);
+    let health = operator_health_snapshot();
+    let hub_servers = hub_directory()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .len();
+    let survival = survival_mods()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .len();
+    let summary = OperatorStatusSummary {
+        tps: perf.tps,
+        mspt_p50: perf.mspt_p50,
+        mspt_p95: perf.mspt_p95,
+        players_online: health.players_online,
+        players_max: health.players_max,
+        loaded_chunks: health.loaded_chunks,
+        rss_mb: memory_usage_mb(),
+        active_worlds: DimId::all_registered().len(),
+        hub_servers,
+        survival_mods: survival,
+    };
+    format!(
+        "{}\n{}",
+        format_operator_status_summary(&summary),
+        chunk_hotspot_quarantine().format_hotspot_report()
+    )
+}
+
+/// `/megu mod add|remove|list` — the Survival Moderator roster behind
+/// `survival-mods.json`. Level 4 only; the role itself never reaches this.
+fn run_megu_mod_command(level: u8, args: &[&str]) -> String {
+    if level < 4 {
+        return P8C_DENIED.into();
+    }
+    match args {
+        ["add", name] if valid_player_name(name) => {
+            let key = name.to_ascii_lowercase();
+            if !survival_mods()
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .add(&key)
+            {
+                return format!("{key} is already a Survival Moderator");
+            }
+            save_survival_mods();
+            format!("Added {key} as a Survival Moderator")
+        }
+        ["remove", name] if valid_player_name(name) => {
+            let key = name.to_ascii_lowercase();
+            if !survival_mods()
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .remove(&key)
+            {
+                return format!("{key} is not a Survival Moderator");
+            }
+            save_survival_mods();
+            format!("Removed {key} from Survival Moderators")
+        }
+        ["list"] => {
+            let registry = survival_mods().lock().unwrap_or_else(|e| e.into_inner());
+            if registry.is_empty() {
+                "No Survival Moderators".into()
+            } else {
+                let names = registry.names().collect::<Vec<_>>().join(", ");
+                format!("Survival Moderators ({}): {names}", registry.len())
+            }
+        }
+        _ => "usage: /megu mod add|remove <player> | /megu mod list".into(),
+    }
+}
+
+/// The OPS-ADMIN-BUILTIN `/megu` root with the ADMIN-WIRE subcommands wired in:
+/// `mod`, `status`, `snapshot`, `restart`. A Survival Moderator (level < 4)
+/// reaches only the read-only `audit` and `status` its allowlist granted.
+fn run_megu_command_admin_wired(
+    ctx: &CmdCtx,
+    level: u8,
+    args: &[&str],
+    survival_mod: bool,
+) -> String {
+    if survival_mod && level < 4 {
+        return match args.first().copied() {
+            Some("audit") => run_megu_audit(ctx, 4, &args[1..]),
+            Some("status") => megu_status_report(),
+            _ => P8C_DENIED.into(),
+        };
+    }
+    match args.first().copied() {
+        Some("mod") => run_megu_mod_command(level, &args[1..]),
+        Some("status") => {
+            if level < 4 {
+                P8C_DENIED.into()
+            } else {
+                megu_status_report()
+            }
+        }
+        Some("snapshot") => {
+            if level < 4 {
+                return P8C_DENIED.into();
+            }
+            shutdown_world_save();
+            "World snapshot saved".into()
+        }
+        Some("restart") => {
+            if level < 4 {
+                return P8C_DENIED.into();
+            }
+            shutdown_world_save();
+            std::thread::spawn(|| {
+                std::thread::sleep(Duration::from_millis(150)); // flush reply
+                transfer_all_to_fallback();
+                stop_lan_announcer();
+                disconnect_all_clients("Server restarting");
+                std::thread::sleep(Duration::from_millis(100));
+                #[cfg(feature = "neoforge-events")]
+                if let Some(runtime) = java_compat::NEOFORGE.get() {
+                    runtime.cleanup_staged_mods();
+                }
+                // Exit 42: the supervisor reads it as "restart", distinct from
+                // /stop's 0.
+                std::process::exit(MEGU_RESTART_EXIT_CODE);
+            });
+            "Restarting the server".into()
+        }
+        _ => run_megu_command(ctx, level, args),
+    }
+}
+
+/// `/server [<name>]` — list the hub directory or transfer the caller to a
+/// named server. Player-facing (level 0), like BungeeCord's `/server`.
+fn run_server_directory_command(me: Option<&Arc<Client>>, args: &[&str]) -> String {
+    match args {
+        [] => {
+            let directory = hub_directory().lock().unwrap_or_else(|e| e.into_inner());
+            if directory.servers.is_empty() {
+                "No servers are configured".into()
+            } else {
+                let names = directory
+                    .servers
+                    .iter()
+                    .map(|(name, entry)| format!("{name} ({}:{})", entry.host, entry.port))
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                format!("Servers: {names}")
+            }
+        }
+        [name] => {
+            let resolved = hub_directory()
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .resolve(name)
+                .map(|(host, port)| (host.to_owned(), port));
+            let Some((host, port)) = resolved else {
+                return format!("Unknown server: {name}");
+            };
+            match me {
+                Some(client) => {
+                    transfer_client_to(client, &host, port);
+                    format!("Transferring to {name} ({host}:{port})")
+                }
+                None => format!("{name} is at {host}:{port}"),
+            }
+        }
+        _ => command_usage("server"),
+    }
+}
+
+/// `/hub` — transfer the caller to the `[servers] fallback` server.
+fn run_hub_command(me: Option<&Arc<Client>>) -> String {
+    let fallback = hub_directory()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .fallback()
+        .map(|(name, host, port)| (name.to_owned(), host.to_owned(), port));
+    let Some((name, host, port)) = fallback else {
+        return "No hub server is configured".into();
+    };
+    match me {
+        Some(client) => {
+            transfer_client_to(client, &host, port);
+            format!("Transferring to hub ({host}:{port})")
+        }
+        None => format!("Hub {name} is at {host}:{port}"),
+    }
+}
+
+/// Register `megu:<id>` as a live custom dimension, the datapack registrar
+/// path an imported `dimensions/megu/<id>` tree takes — fed the synthetic
+/// `dimension_type`/`dimension` JSON bodies the chosen generator needs.
+fn register_managed_world_dimension(id: &str, generator: WorldGenerator) -> Result<(), String> {
+    let key = format!("megu:{id}");
+    if DimId::parse_dimension_id(&key).is_some() {
+        return Ok(());
+    }
+    let generator_json = match generator {
+        WorldGenerator::Overworld => {
+            "{\"type\":\"minecraft:noise\",\"settings\":\"minecraft:overworld\"}".to_string()
+        }
+        WorldGenerator::Flat => "{\"type\":\"minecraft:flat\",\"settings\":{\"layers\":[{\"block\":\"minecraft:bedrock\",\"height\":1},{\"block\":\"minecraft:dirt\",\"height\":2},{\"block\":\"minecraft:grass_block\",\"height\":1}],\"biome\":\"minecraft:plains\"}}".to_string(),
+        // `minecraft:debug` parses to the all-air Void generator; the
+        // Nether/End presets have no managed generator yet and ride the same
+        // honest fallback.
+        WorldGenerator::Void | WorldGenerator::Nether | WorldGenerator::End => {
+            "{\"type\":\"minecraft:debug\"}".to_string()
+        }
+    };
+    let files = vec![
+        (
+            format!("data/megu/dimension_type/{id}.json"),
+            "{\"min_y\":-64,\"height\":384}".to_string(),
+        ),
+        (
+            format!("data/megu/dimension/{id}.json"),
+            format!("{{\"type\":\"megu:{id}\",\"generator\":{generator_json}}}"),
+        ),
+    ];
+    let sources = [worldgen::DatapackDimensionSource::Entries(files)];
+    worldgen::register_datapack_dimensions(&sources, name_to_state)
+        .map_err(|e| format!("could not register dimension {key}: {e}"))?;
+    Ok(())
+}
+
+fn managed_world_spawn(ctx: &CmdCtx) -> [f64; 3] {
+    [ctx.x, ctx.y, ctx.z]
+}
+
+/// `/world list|create <name> [overworld|flat|void]|tp <name>|setspawn [<name>]`
+/// — the `[[worlds]]` managed-world surface, level 2 (gamemaster) like every
+/// other world-mutating cheat.
+fn run_world_command(ctx: &CmdCtx, args: &[&str]) -> String {
+    match args {
+        ["list"] => {
+            let worlds = managed_worlds().lock().unwrap_or_else(|e| e.into_inner());
+            if worlds.len() == 0 {
+                return "No managed worlds".into();
+            }
+            let list = worlds
+                .iter()
+                .map(|w| {
+                    format!(
+                        "{} ({}, spawn {:.1} {:.1} {:.1})",
+                        w.id,
+                        world_generator_name(w.generator),
+                        w.spawn[0],
+                        w.spawn[1],
+                        w.spawn[2]
+                    )
+                })
+                .collect::<Vec<_>>()
+                .join(", ");
+            format!("Managed worlds ({}): {list}", worlds.len())
+        }
+        ["create", name] | ["create", name, _] => {
+            let generator = match args.get(2).copied().unwrap_or("overworld") {
+                "overworld" => WorldGenerator::Overworld,
+                "flat" => WorldGenerator::Flat,
+                "void" => WorldGenerator::Void,
+                other => {
+                    return format!("unknown generator {other:?}; expected overworld|flat|void")
+                }
+            };
+            if let Err(e) = register_managed_world_dimension(name, generator) {
+                return e;
+            }
+            let world = ManagedWorld {
+                id: name.to_string(),
+                generator,
+                seed: WORLD_SEED.load(Ordering::Relaxed),
+                pvp: live_pvp_enabled(),
+                default_gamemode: WorldGameMode::Survival,
+                spawn: [0.5, 64.0, 0.5],
+            };
+            match managed_worlds()
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .add(world)
+            {
+                Ok(()) => format!(
+                    "Created world {name} ({})",
+                    world_generator_name(generator)
+                ),
+                Err(e) => e,
+            }
+        }
+        ["tp", name] => {
+            let world = {
+                let worlds = managed_worlds().lock().unwrap_or_else(|e| e.into_inner());
+                worlds
+                    .get(*name)
+                    .map(|w| (w.id.clone(), w.generator, w.spawn))
+            };
+            let Some((id, generator, spawn)) = world else {
+                return format!("Unknown world: {name}");
+            };
+            if let Err(e) = register_managed_world_dimension(&id, generator) {
+                return e;
+            }
+            let Some(dim) = DimId::parse_dimension_id(&format!("megu:{id}")) else {
+                return format!("Dimension megu:{id} is not registered");
+            };
+            match &ctx.me {
+                Some(client) => {
+                    let view = (*client.view.lock().unwrap_or_else(|e| e.into_inner()))
+                        .clamp(2, live_view_distance());
+                    switch_client_dimension(
+                        client,
+                        dim,
+                        (spawn[0], spawn[1], spawn[2], 0.0, 0.0),
+                        view,
+                    );
+                    format!("Teleported to world {id}")
+                }
+                None => "A player is required for /world tp".into(),
+            }
+        }
+        ["setspawn"] | ["setspawn", _] => {
+            // Without a name the managed world the caller stands in wins;
+            // console execution needs the explicit form.
+            let id: Option<String> = match args.get(1) {
+                Some(name) => Some(name.to_string()),
+                None => ctx.me.as_ref().and_then(|client| {
+                    let dim = *client.dim.lock().unwrap_or_else(|e| e.into_inner());
+                    let managed = managed_worlds().lock().unwrap_or_else(|e| e.into_inner());
+                    let found = managed
+                        .iter()
+                        .find(|w| DimId::parse_dimension_id(&format!("megu:{}", w.id)) == Some(dim))
+                        .map(|w| w.id.clone());
+                    found
+                }),
+            };
+            let Some(id) = id else {
+                return "usage: /world setspawn <name>".into();
+            };
+            let mut worlds = managed_worlds().lock().unwrap_or_else(|e| e.into_inner());
+            let Some(world) = worlds.worlds.get_mut(&id) else {
+                return format!("Unknown world: {id}");
+            };
+            world.spawn = managed_world_spawn(ctx);
+            format!(
+                "Set spawn of {id} to {:.1} {:.1} {:.1}",
+                world.spawn[0], world.spawn[1], world.spawn[2]
+            )
+        }
+        _ => "usage: /world list | create <name> [overworld|flat|void] | tp <name> | setspawn [<name>]".into(),
+    }
+}
+
+fn world_generator_name(generator: WorldGenerator) -> &'static str {
+    match generator {
+        WorldGenerator::Overworld => "overworld",
+        WorldGenerator::Flat => "flat",
+        WorldGenerator::Void => "void",
+        WorldGenerator::Nether => "nether",
+        WorldGenerator::End => "end",
+    }
+}
+
 fn run_command_ctx(ctx: &CmdCtx, msg: &str, s: &mut Option<&Client>) -> String {
     let me = ctx.me.as_ref();
     let Some(input) = msg.strip_prefix('/') else { return "Expected a command starting with /".into() };
@@ -8287,9 +8711,23 @@ fn run_command_ctx(ctx: &CmdCtx, msg: &str, s: &mut Option<&Client>) -> String {
     // players at their ops.json level. `command_allowed_for_player` keeps the
     // argument-aware level-0 exceptions (e.g. `/time query`) on top.
     let level = command_permission_level(me);
+    // A Survival Moderator (the zero-cheat roster `/megu mod` manages) carries
+    // the allowlist grant on top of their Vanilla level: `/kick`, `/ban`,
+    // read-only `/megu audit|status` — while every admin and cheat command
+    // stays refused.
+    let survival_mod = me.is_some_and(|client| {
+        survival_mods()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .contains(&client.name.to_ascii_lowercase())
+    });
+    let survival_mod_allowed = survival_mod
+        && !command_allowed_for_source(cmd, level)
+        && survival_mod_allows_command(input);
     if !command_allowed_for_source(cmd, level)
         && !command_allowed_for_player(cmd, &args)
         && !mod_command_permitted(cmd, level)
+        && !survival_mod_allowed
     {
         let reply = "You do not have permission to run that command";
         if let Some(client) = s {
@@ -8686,6 +9124,7 @@ fn run_command_ctx(ctx: &CmdCtx, msg: &str, s: &mut Option<&Client>) -> String {
             shutdown_world_save();
             std::thread::spawn(|| {
                 std::thread::sleep(Duration::from_millis(150)); // flush reply
+                transfer_all_to_fallback();
                 stop_lan_announcer();
                 disconnect_all_clients("Server closed");
                 std::thread::sleep(Duration::from_millis(100));
@@ -9420,7 +9859,10 @@ fn run_command_ctx(ctx: &CmdCtx, msg: &str, s: &mut Option<&Client>) -> String {
         "profile" => run_profile_command(level, &args),
         // OPS-ADMIN-BUILTIN: `/megu` fans out to policy/audit/rollback/claim/
         // backup/metrics; the handler re-checks `level` per subcommand.
-        "megu" => run_megu_command(ctx, level, &args),
+        "megu" => run_megu_command_admin_wired(ctx, level, &args, survival_mod),
+        "server" => run_server_directory_command(me, &args),
+        "hub" => run_hub_command(me),
+        "world" => run_world_command(ctx, &args),
         "aero" => {
             #[cfg(feature = "create-offload")]
             { run_aero_command(ctx, &args) }
@@ -11614,5 +12056,253 @@ mod issue225_parity_tests {
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .remove(&format!("e:{persistent}"));
+    }
+}
+
+#[cfg(test)]
+mod admin_wire_tests {
+    use super::*;
+
+    fn aw_ctx(me: Option<Arc<Client>>) -> CmdCtx {
+        CmdCtx {
+            me,
+            x: 0.5,
+            y: 16.0,
+            z: 0.5,
+        }
+    }
+
+    /// The Survival-Moderator allowlist itself: moderation commands pass,
+    /// cheats and `/megu` writes never do.
+    #[test]
+    fn survival_mod_allowlist_boundary() {
+        for input in [
+            "/kick Steve",
+            "ban Steve",
+            "pardon Steve",
+            "ban-ip 1.2.3.4",
+            "pardon-ip 1.2.3.4",
+            "banlist",
+            "whitelist list",
+            "say hello",
+            "list",
+            "megu audit",
+            "megu status",
+            "/megu audit Steve 64",
+        ] {
+            assert!(survival_mod_allows_command(input), "{input}");
+        }
+        for input in [
+            "megu",
+            "megu rollback Steve 10",
+            "megu claim here",
+            "megu snapshot",
+            "megu restart",
+            "megu policy list",
+            "give Steve diamond",
+            "gamemode creative",
+            "tp 0 64 0",
+            "teleport 0 64 0",
+            "fill 0 0 0 1 1 1 stone",
+            "setblock 0 64 0 stone",
+            "op Steve",
+            "deop Steve",
+            "stop",
+            "world create x",
+        ] {
+            assert!(!survival_mod_allows_command(input), "{input}");
+        }
+    }
+
+    /// The gate in `run_command_ctx`: a Survival Moderator at Vanilla level 0
+    /// reaches the allowlist and nothing else.
+    #[test]
+    fn survival_mod_gate_allows_moderation_and_refuses_cheats() {
+        let _guard = world_guard();
+        let (mut client, _socket) = effect_tests::client_pair();
+        client.name = "aw_mod".to_string();
+        let me = Arc::new(client);
+        let ctx = aw_ctx(Some(me.clone()));
+        let mut s = Some(me.as_ref() as &Client);
+        let run = |ctx: &CmdCtx, msg: &str, s: &mut Option<&Client>| {
+            run_command_ctx(ctx, msg, s)
+        };
+
+        // The roster name decides the grant — without it the same commands
+        // stay refused.
+        let denied = run(&ctx, "/kick aw_target", &mut s);
+        assert!(denied.contains("permission"), "{denied}");
+        survival_mods()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .add("aw_mod");
+
+        for msg in [
+            "/kick aw_target",
+            "/ban aw_target",
+            "/pardon aw_target",
+            "/banlist",
+            "/whitelist list",
+            "/say hello",
+            "/list",
+            "/megu audit",
+            "/megu status",
+        ] {
+            let reply = run(&ctx, msg, &mut s);
+            assert!(!reply.contains("permission"), "{msg} -> {reply}");
+        }
+        assert!(
+            run(&ctx, "/megu status", &mut s).contains("TPS:"),
+            "status carries the operator summary"
+        );
+
+        for msg in [
+            "/megu rollback aw_target 10",
+            "/megu claim here",
+            "/megu snapshot",
+            "/megu restart",
+            "/give aw_mod diamond",
+            "/gamemode creative",
+            "/tp 0 64 0",
+            "/fill 0 0 0 1 1 1 stone",
+            "/setblock 0 64 0 stone",
+            "/op aw_mod",
+            "/world create noway",
+            "/stop",
+        ] {
+            let reply = run(&ctx, msg, &mut s);
+            assert!(reply.contains("permission"), "{msg} -> {reply}");
+        }
+
+        survival_mods()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove("aw_mod");
+        let denied = run(&ctx, "/kick aw_target", &mut s);
+        assert!(denied.contains("permission"), "{denied}");
+    }
+
+    /// `/megu mod` roster management persists to the configured file and the
+    /// grant disappears with `remove`.
+    #[test]
+    fn megu_mod_roster_persists_and_gates() {
+        let _guard = world_guard();
+        let dir = std::env::temp_dir().join(format!("megu-mods-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("survival-mods.json");
+        let previous_env = std::env::var_os("MEGU_SURVIVAL_MODS_FILE");
+        std::env::set_var("MEGU_SURVIVAL_MODS_FILE", &file);
+        survival_mods()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove("aw_modx");
+
+        let ctx = aw_ctx(None);
+        let reply = run_command_ctx(&ctx, "/megu mod add Aw_ModX", &mut None);
+        assert_eq!(reply, "Added aw_modx as a Survival Moderator");
+        assert!(file.exists(), "the roster file was written");
+        let loaded = SurvivalModRegistry::load_json(&file).unwrap();
+        assert!(loaded.contains("aw_modx"));
+
+        let reply = run_command_ctx(&ctx, "/megu mod add aw_modx", &mut None);
+        assert!(reply.contains("already a Survival Moderator"), "{reply}");
+        let reply = run_command_ctx(&ctx, "/megu mod list", &mut None);
+        assert!(reply.contains("aw_modx"), "{reply}");
+        let reply = run_command_ctx(&ctx, "/megu mod remove aw_modx", &mut None);
+        assert!(reply.contains("Removed aw_modx"), "{reply}");
+        let reply = run_command_ctx(&ctx, "/megu mod remove aw_modx", &mut None);
+        assert!(reply.contains("not a Survival Moderator"), "{reply}");
+
+        match previous_env {
+            Some(v) => std::env::set_var("MEGU_SURVIVAL_MODS_FILE", v),
+            None => std::env::remove_var("MEGU_SURVIVAL_MODS_FILE"),
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// `/server`, `/hub` and `/world` on the console path: directory resolve,
+    /// fallback transfer target and managed-world create/list/tp/setspawn.
+    #[test]
+    fn hub_directory_and_world_commands() {
+        let _guard = world_guard();
+        let ctx = aw_ctx(None);
+        {
+            let mut directory = hub_directory().lock().unwrap_or_else(|e| e.into_inner());
+            directory.add_server("aw_hub", "127.0.0.1", 25566).unwrap();
+            directory.set_fallback("aw_hub").unwrap();
+        }
+        let reply = run_command_ctx(&ctx, "/server", &mut None);
+        assert!(reply.contains("aw_hub"), "{reply}");
+        let reply = run_command_ctx(&ctx, "/server aw_hub", &mut None);
+        assert!(reply.contains("127.0.0.1:25566"), "{reply}");
+        let reply = run_command_ctx(&ctx, "/server ghost", &mut None);
+        assert!(reply.contains("Unknown server"), "{reply}");
+        let reply = run_command_ctx(&ctx, "/hub", &mut None);
+        assert!(reply.contains("aw_hub"), "{reply}");
+
+        let reply = run_command_ctx(&ctx, "/world create aw_world flat", &mut None);
+        assert_eq!(reply, "Created world aw_world (flat)");
+        assert!(DimId::parse_dimension_id("megu:aw_world").is_some());
+        let reply = run_command_ctx(&ctx, "/world list", &mut None);
+        assert!(reply.contains("aw_world"), "{reply}");
+        let reply = run_command_ctx(&ctx, "/world tp aw_world", &mut None);
+        assert!(reply.contains("player"), "{reply}");
+        let reply = run_command_ctx(&ctx, "/world setspawn aw_world", &mut None);
+        assert!(reply.contains("Set spawn of aw_world"), "{reply}");
+        let reply = run_command_ctx(&ctx, "/world create aw_world", &mut None);
+        assert!(reply.contains("already registered"), "{reply}");
+
+        managed_worlds()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove("aw_world");
+        let mut directory = hub_directory().lock().unwrap_or_else(|e| e.into_inner());
+        directory.remove_server("aw_hub");
+    }
+
+    /// `/megu status` carries the live operator summary and the hotspot
+    /// report; `/megu snapshot` saves through the same path `/stop` uses.
+    #[test]
+    fn megu_status_carries_summary_and_hotspots() {
+        let ctx = aw_ctx(None);
+        let reply = run_command_ctx(&ctx, "/megu status", &mut None);
+        assert!(reply.contains("TPS:"), "{reply}");
+        assert!(reply.contains("MSPT"), "{reply}");
+        assert!(reply.contains("Survival mods:"), "{reply}");
+    }
+
+    /// `/op` writes Vanilla `ops.json` object entries honoring
+    /// `op-permission-level` instead of the legacy flat name array at 4.
+    #[test]
+    fn op_writes_vanilla_object_entries_with_permission_level() {
+        let _guard = world_guard();
+        let dir = std::env::temp_dir().join(format!("megu-ops-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("ops.json");
+        let previous_level = std::env::var_os("MEGU_OP_PERMISSION_LEVEL");
+        let previous_ops = OPERATORS.lock().unwrap_or_else(|e| e.into_inner()).clone();
+        let previous_registry = ops_registry().lock().unwrap_or_else(|e| e.into_inner()).clone();
+        std::env::set_var("MEGU_OP_PERMISSION_LEVEL", "3");
+
+        set_operator(&path, "Aw_Op", true).unwrap();
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert!(text.contains("\"name\": \"aw_op\""), "{text}");
+        assert!(text.contains("\"level\": 3"), "{text}");
+        assert!(text.contains("\"bypassesPlayerLimit\": false"), "{text}");
+
+        let registry = OpsRegistry::load(&path).unwrap();
+        let entry = registry.entries.iter().find(|e| e.name == "aw_op").unwrap();
+        assert_eq!(entry.level, 3);
+
+        set_operator(&path, "aw_op", false).unwrap();
+        assert!(OpsRegistry::load(&path).unwrap().entries.is_empty());
+
+        match previous_level {
+            Some(v) => std::env::set_var("MEGU_OP_PERMISSION_LEVEL", v),
+            None => std::env::remove_var("MEGU_OP_PERMISSION_LEVEL"),
+        }
+        *OPERATORS.lock().unwrap_or_else(|e| e.into_inner()) = previous_ops;
+        *ops_registry().lock().unwrap_or_else(|e| e.into_inner()) = previous_registry;
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

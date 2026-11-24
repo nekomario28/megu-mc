@@ -337,7 +337,8 @@ fn ops_registry_json(registry: &OpsRegistry) -> String {
 #[allow(dead_code)]
 pub(crate) fn required_permission_level(cmd: &str) -> u8 {
     match cmd {
-        "help" | "list" | "me" | "msg" | "tell" | "w" | "teammsg" | "tm" | "trigger" => 0,
+        "help" | "list" | "me" | "msg" | "tell" | "w" | "teammsg" | "tm" | "trigger" | "server"
+        | "hub" => 0,
         "kick" | "ban" | "ban-ip" | "banlist" | "pardon" | "pardon-ip" | "op" | "deop"
         | "whitelist" | "setidletimeout" | "tick" => 3,
         "stop" | "save-all" | "save" | "save-on" | "save-off" | "debug" | "jfr" | "perf"
@@ -350,6 +351,19 @@ pub(crate) fn required_permission_level(cmd: &str) -> u8 {
 #[allow(dead_code)]
 pub(crate) fn command_allowed_at_level(cmd: &str, level: u8) -> bool {
     level >= required_permission_level(cmd)
+}
+
+/// Vanilla `op-permission-level` (server.properties, default `4`): the level a
+/// fresh `/op` grants. `MEGU_OP_PERMISSION_LEVEL` carries the parsed value —
+/// `[server] op_permission_level` and a dropped-in `server.properties` both
+/// seed it; an unset or unparseable value keeps Vanilla's `4`. The write
+/// clamps to `1..=4` like Vanilla's settings screen does.
+pub(crate) fn live_op_permission_level() -> u8 {
+    std::env::var("MEGU_OP_PERMISSION_LEVEL")
+        .ok()
+        .and_then(|v| v.trim().parse::<i64>().ok())
+        .map(|v| v.clamp(1, 4) as u8)
+        .unwrap_or(4)
 }
 
 // --------------------------------------------------------------- ban files
@@ -2311,6 +2325,40 @@ mod server_ops_tests {
                     "{file} still contains an unrecovered lock acquisition `{needle}`"
                 );
             }
+        }
+    }
+}
+
+#[cfg(test)]
+mod admin_wire_ops_tests {
+    use super::*;
+
+    /// `/server` and `/hub` are player-facing hub transfer commands — level 0
+    /// like `/help`; `/world` keeps the default gamemaster level 2.
+    #[test]
+    fn hub_commands_are_player_level_world_is_gamemaster() {
+        assert_eq!(required_permission_level("server"), 0);
+        assert_eq!(required_permission_level("hub"), 0);
+        assert_eq!(required_permission_level("world"), 2);
+        assert!(command_allowed_at_level("server", 0));
+        assert!(command_allowed_at_level("hub", 0));
+        assert!(!command_allowed_at_level("world", 0));
+    }
+
+    /// `op-permission-level` reads `MEGU_OP_PERMISSION_LEVEL` clamped to
+    /// Vanilla's `1..=4`; unset keeps the `4` default.
+    #[test]
+    fn op_permission_level_clamps_and_defaults() {
+        let previous = std::env::var_os("MEGU_OP_PERMISSION_LEVEL");
+        std::env::remove_var("MEGU_OP_PERMISSION_LEVEL");
+        assert_eq!(live_op_permission_level(), 4);
+        for (raw, want) in [("1", 1u8), ("2", 2), ("4", 4), ("9", 4), ("0", 1), ("bad", 4)] {
+            std::env::set_var("MEGU_OP_PERMISSION_LEVEL", raw);
+            assert_eq!(live_op_permission_level(), want, "{raw}");
+        }
+        match previous {
+            Some(v) => std::env::set_var("MEGU_OP_PERMISSION_LEVEL", v),
+            None => std::env::remove_var("MEGU_OP_PERMISSION_LEVEL"),
         }
     }
 }

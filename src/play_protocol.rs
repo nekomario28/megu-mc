@@ -10351,12 +10351,15 @@ fn place_live_recipe(me: &Arc<Client>, place: &PlaceRecipe) {
     if recipe.needs_3x3 && !grid_is_3x3 {
         return;
     }
-    if !recipe_books()
+    // `GameRules.RULE_DO_LIMITED_CRAFTING`: the unlock check only gates the
+    // ghost-placement when the gamerule is on — off means every recipe the
+    // server knows may lay out, matching `ServerRecipeBook` semantics.
+    let unlocked = recipe_books()
         .lock()
         .unwrap()
         .get(&me.uuid)
-        .is_some_and(|book| book.is_unlocked(&place.recipe_id))
-    {
+        .is_some_and(|book| book.is_unlocked(&place.recipe_id));
+    if !eval_limited_crafting_allowed(do_limited_crafting_enabled(), unlocked) {
         return;
     }
     let dim = if grid_is_3x3 { 3usize } else { 2 };
@@ -10799,7 +10802,14 @@ fn handle_inner(mut s: TcpStream, live_eid: Arc<AtomicI32>) {
         .or_else(|| pos_store().lock().unwrap_or_else(|e| e.into_inner()).get(&name).copied())
         .unwrap_or_else(|| {
             let w = *WORLD_SPAWN.lock().unwrap_or_else(|e| e.into_inner());
-            (DimId::Overworld, w.0, w.1, w.2, w.3, 0.0)
+            // `spawnRadius`: a first join scatters inside the radius square
+            // around world spawn instead of landing on the exact point.
+            let [bx, by, bz] = resolve_world_spawn_pos(
+                [w.0.floor() as i32, w.1.floor() as i32, w.2.floor() as i32],
+                spawn_radius_blocks(),
+                world_rng::next_u64(),
+            );
+            (DimId::Overworld, bx as f64 + 0.5, by as f64, bz as f64 + 0.5, w.3, 0.0)
         });
     let player_eid = NEXT_EID.fetch_add(1, Ordering::SeqCst);
     let initial_gm = saved_player
@@ -12969,7 +12979,18 @@ fn handle_inner(mut s: TcpStream, live_eid: Arc<AtomicI32>) {
                     break 'conn;
                 }
             }
-            0x12 => custom_payload_c2s(&me, &b),
+            0x12 => {
+                // A1-SERVER: the airship helm channel is a Create-offload
+                // subworld input, not a mod payload — dispatch it before the
+                // generic register/lod handler sees it.
+                #[cfg(feature = "create-offload")]
+                let helm = aeronautics_helm_payload_c2s(&me, &b);
+                #[cfg(not(feature = "create-offload"))]
+                let helm = false;
+                if !helm {
+                    custom_payload_c2s(&me, &b);
+                }
+            }
             0x16 => {
                 // use_entity: attack mobs
                 let mut sl = &b[..];
@@ -13098,6 +13119,12 @@ fn handle_inner(mut s: TcpStream, live_eid: Arc<AtomicI32>) {
                         continue;
                     }
                     if pet_collar_or_parrot_interact(&me, target, 36 + held_slot) {
+                        continue;
+                    }
+                    // `IronGolem`/`SnowGolem`/`Allay` `mobInteract` — ingot
+                    // repair, pumpkin shear, and the allay's sample give/take
+                    // ride the same lane as the pet paths.
+                    if utility_mob_interact(&me, target, 36 + held_slot) {
                         continue;
                     }
                     if live_mob_interact(&me, target, 36 + held_slot) {
@@ -13911,7 +13938,20 @@ fn handle_inner(mut s: TcpStream, live_eid: Arc<AtomicI32>) {
                         let point = *me.spawn_pt.lock().unwrap_or_else(|e| e.into_inner());
                         match point {
                             Some(point) => (*sdim, point),
-                            None => (DimId::Overworld, *WORLD_SPAWN.lock().unwrap_or_else(|e| e.into_inner())),
+                            None => {
+                                // `spawnRadius`: a bedless respawn scatters
+                                // inside the radius square around world spawn.
+                                let w = *WORLD_SPAWN.lock().unwrap_or_else(|e| e.into_inner());
+                                let [bx, by, bz] = resolve_world_spawn_pos(
+                                    [w.0.floor() as i32, w.1.floor() as i32, w.2.floor() as i32],
+                                    spawn_radius_blocks(),
+                                    world_rng::next_u64(),
+                                );
+                                (
+                                    DimId::Overworld,
+                                    (bx as f64 + 0.5, by as f64, bz as f64 + 0.5, w.3),
+                                )
+                            }
                         }
                     };
                     switch_client_dimension(&me, sdim, (rx, ry, rz, yaw, 0.0), view);
@@ -15914,6 +15954,146 @@ enum PetInteract {
     Collar { etype: i64, color: u8 },
     ParrotFed { tamed: bool, sitting: bool },
     Sitting(bool),
+}
+
+/// C2S `megu:subworld_helm_v1` — one 29-byte `SubWorldHelmInput` applied to the
+/// addressed live airship through the Create-offload bridge. Returns `true`
+/// when the payload was on the helm channel (consumed — malformed frames too,
+/// so a bad packet never falls through to the mod-payload handler), `false`
+/// for every other channel.
+#[cfg(feature = "create-offload")]
+fn aeronautics_helm_payload_c2s(client: &Client, body: &[u8]) -> bool {
+    let mut sl = body;
+    let Some(len) = read_protocol_i32(&mut sl).and_then(|n| usize::try_from(n).ok()) else {
+        return false;
+    };
+    if len > sl.len() {
+        return false;
+    }
+    let (channel, payload) = sl.split_at(len);
+    if channel != b"megu:subworld_helm_v1" {
+        return false;
+    }
+    match SubWorldHelmInput::decode(payload) {
+        Ok(input) => {
+            if let Err(error) = aeronautics_bridge_apply_helm_input(client.eid as u32, &input) {
+                eprintln!("[aero] helm input from {}: {error}", client.name);
+            }
+        }
+        Err(error) => eprintln!("[aero] bad helm frame from {}: {error}", client.name),
+    }
+    true
+}
+
+/// S2C 0x58 EntityData carrying a living mob's `DATA_HEALTH_ID` — entity data
+/// index 8, Float serializer — after the allay/golem interactions move `hp`.
+fn mob_health_metadata(eid: i32, hp: f32) -> Vec<u8> {
+    let mut packet = Vec::new();
+    write_varint(&mut packet, i64::from(eid));
+    packet.push(8); // LivingEntity DATA_HEALTH_ID
+    packet.push(3); // EntityDataSerializers.FLOAT
+    packet.extend_from_slice(&hp.to_be_bytes());
+    packet.push(0xff);
+    packet
+}
+
+/// Consume exactly one of the stack in inventory `slot` and echo the slot back
+/// to the owner — the same container 0x15 resync the bucket path uses.
+fn consume_held_one(me: &Arc<Client>, slot: i16) {
+    {
+        let mut inv = me.inv.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some((item, count, comps)) = inv.get(&slot).cloned() {
+            if count > 1 {
+                inv.insert(slot, (item, count - 1, comps));
+            } else {
+                inv.remove(&slot);
+            }
+        }
+    }
+    held_slot_resync(me);
+}
+
+/// Push an allay's current main hand to every tracker: the live
+/// `EntityEquipment` row gets the sample the mob now holds (empty after a
+/// take) and the 0x5b SetEquipment broadcast rebuilds the hand client-side.
+fn sync_allay_equipment(target: i32, stack: Stack) {
+    let packet = {
+        let mut equipment = mob_equipment().lock().unwrap_or_else(|e| e.into_inner());
+        let eq = equipment.entry(target).or_insert_with(|| {
+            default_mob_equipment("allay", DIFFICULTY.load(Ordering::Relaxed), 0)
+        });
+        eq.set(EquipmentSlot::MainHand, stack);
+        encode_set_equipment(target, eq)
+    };
+    broadcast_seen(target, move |_| (0x5b, packet.clone()));
+}
+
+/// `Mob.mobInteract` for the utility trio: iron golem ingot repair, snow golem
+/// pumpkin shear and allay sample give/take. `villager_raid_interact_mob`
+/// decides; this applies the inventory and wire consequences — held-stack
+/// consume/damage plus the slot echo, the interaction sound, the health
+/// metadata a healed golem owes watchers, and the equipment packet an allay's
+/// hand needs. Returns `true` when the click was consumed.
+fn utility_mob_interact(me: &Arc<Client>, target: i32, slot: i16) -> bool {
+    if *me.gm.lock().unwrap_or_else(|e| e.into_inner()) == 3 {
+        return false;
+    }
+    let held: Option<Stack> = me
+        .inv
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .get(&slot)
+        .cloned();
+    let held_name = held
+        .as_ref()
+        .and_then(|st| item_to_name(st.0))
+        .unwrap_or("air");
+    let mob_kind = mobs()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .iter()
+        .find(|m| m.eid == target)
+        .and_then(|m| entity_spec_by_id(m.etype))
+        .map(|spec| spec.name);
+    let Some(kind) = mob_kind else { return false };
+    let dim = *me.dim.lock().unwrap_or_else(|e| e.into_inner());
+    let Some(outcome) = villager_raid_interact_mob(dim, target, kind, held_name, me.eid) else {
+        return false;
+    };
+    match outcome {
+        MobInteractOutcome::IronGolemRepaired { hp_after } => {
+            consume_held_one(me, slot);
+            broadcast_entity_sound(target, "minecraft:entity.iron_golem.repair", 6);
+            let meta = mob_health_metadata(target, hp_after);
+            broadcast_seen(target, move |_| (0x58, meta.clone()));
+        }
+        MobInteractOutcome::SnowGolemSheared => {
+            damage_inv_slot(me, slot);
+            held_slot_resync(me);
+            broadcast_entity_sound(target, "minecraft:entity.snow_golem.shear", 6);
+            // `SnowGolem` entity data index 16 byte — bit 0 = pumpkin. The
+            // shear dropped it, so watchers see the bare golem.
+            broadcast_seen(target, |_| (0x58, live_mob_metadata(target, 16, 0, 0)));
+        }
+        MobInteractOutcome::AllayItemGiven => {
+            let sample = held
+                .map(|(item, _, comps)| (item, 1, comps))
+                .unwrap_or((0, 0, Vec::new()));
+            consume_held_one(me, slot);
+            broadcast_entity_sound(target, "minecraft:entity.allay.item_given", 6);
+            sync_allay_equipment(target, sample);
+        }
+        MobInteractOutcome::AllayItemTaken(stack) => {
+            me.inv
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .insert(slot, stack);
+            held_slot_resync(me);
+            broadcast_entity_sound(target, "minecraft:entity.allay.item_taken", 6);
+            sync_allay_equipment(target, (0, 0, Vec::new()));
+        }
+    }
+    true
 }
 
 fn pet_collar_or_parrot_interact(client: &Client, target: i32, slot: i16) -> bool {
@@ -18274,7 +18454,7 @@ mod fix_tame_rejoin_tests {
             );
     }
 
-    fn fx_spawn_mob(etype: i64, pos: (f64, f64, f64)) -> Arc<Mob> {
+    pub(crate) fn fx_spawn_mob(etype: i64, pos: (f64, f64, f64)) -> Arc<Mob> {
         let eid = NEXT_EID.fetch_add(1, Ordering::SeqCst);
         let mob = Arc::new(Mob {
             dim: DimId::Overworld,
@@ -22091,7 +22271,7 @@ mod parity_58_c2s_tests {
 
     /// A loopback client like the other wire tests: `me.sock` is the server
     /// end, the returned peer reads the bytes the server wrote.
-    fn p58_client(name: &str, eid: i32) -> (Arc<Client>, std::net::TcpStream) {
+    pub(crate) fn p58_client(name: &str, eid: i32) -> (Arc<Client>, std::net::TcpStream) {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let addr = listener.local_addr().unwrap();
         let stream = std::net::TcpStream::connect(addr).unwrap();
@@ -23807,5 +23987,112 @@ mod interest_sync_tests {
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .contains(&77));
+    }
+}
+
+#[cfg(test)]
+mod admin_wire_play_tests {
+    use super::*;
+
+    /// A C2S `CustomPayload` on `megu:subworld_helm_v1` decodes the 29-byte
+    /// `SubWorldHelmInput` and is consumed; every other channel falls through.
+    #[cfg(feature = "create-offload")]
+    #[test]
+    fn helm_custom_payload_dispatches_to_the_bridge() {
+        let (client, _peer) = parity_58_c2s_tests::p58_client("helm_tester", 991001);
+        let mut body = Vec::new();
+        write_varint(&mut body, i64::from("megu:subworld_helm_v1".len() as i32));
+        body.extend_from_slice(b"megu:subworld_helm_v1");
+        // A disassemble=0 frame for a subworld that does not exist still lands
+        // on the bridge — the handler consumes it and reports the error.
+        let input = SubWorldHelmInput {
+            subworld_id: 7,
+            throttle: 0.5,
+            pitch: 0.0,
+            yaw: 0.0,
+            roll: 0.0,
+            buoyancy_delta: 0.0,
+            disassemble: false,
+        };
+        let mut packet = body.clone();
+        packet.extend_from_slice(&input.encode().unwrap());
+        assert!(aeronautics_helm_payload_c2s(&client, &packet));
+
+        // Malformed frames on the channel are consumed too — they never fall
+        // through to the generic mod-payload handler.
+        let mut bad = body.clone();
+        bad.extend_from_slice(&[0u8; 4]);
+        assert!(aeronautics_helm_payload_c2s(&client, &bad));
+
+        // A different channel is not touched.
+        let mut other = Vec::new();
+        write_varint(&mut other, i64::from("minecraft:brand".len() as i32));
+        other.extend_from_slice(b"minecraft:brand");
+        assert!(!aeronautics_helm_payload_c2s(&client, &other));
+        // A non-varint-leading body is not a custom payload frame.
+        assert!(!aeronautics_helm_payload_c2s(&client, &[0xff, 0xff]));
+    }
+
+    /// `villager_raid_interact_mob` through `utility_mob_interact`: an iron
+    /// ingot repairs the golem +25 HP (cap 100) and the held stack shrinks.
+    #[test]
+    fn utility_mob_interact_repairs_iron_golem() {
+        let _guard = world_guard();
+        let etype = name_to_etype("iron_golem").expect("iron_golem in registry");
+        let mob = fix_tame_rejoin_tests::fx_spawn_mob(etype, (0.5, 65.0, 0.5));
+        *mob.hp.lock().unwrap_or_else(|e| e.into_inner()) = 10.0;
+        let (me, _peer) = parity_58_c2s_tests::p58_client("aw_golem", 991002);
+        let ingot = name_to_item("iron_ingot").expect("iron_ingot");
+        me.inv
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(36, (ingot, 2, Vec::new()));
+
+        assert!(utility_mob_interact(&me, mob.eid, 36));
+        let hp = *mob.hp.lock().unwrap_or_else(|e| e.into_inner());
+        assert!((hp - 35.0).abs() < 1e-6, "hp {hp}");
+        let left = me.inv.lock().unwrap_or_else(|e| e.into_inner()).get(&36).cloned();
+        assert_eq!(left.map(|st| st.1), Some(1), "one ingot consumed");
+
+        // A full-health golem takes no repair — the click is not consumed.
+        *mob.hp.lock().unwrap_or_else(|e| e.into_inner()) = 100.0;
+        me.inv
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(36, (ingot, 1, Vec::new()));
+        assert!(!utility_mob_interact(&me, mob.eid, 36));
+
+        mobs()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .retain(|m| m.eid != mob.eid);
+        live_mob_states()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(&mob.eid);
+    }
+
+    /// `spawnRadius`: the gamerule feeds `spawn_radius_blocks` live, and the
+    /// scatter helper never leaves the radius square.
+    #[test]
+    fn spawn_radius_scatter_obeys_the_live_gamerule() {
+        let _guard = world_guard();
+        let mut rules = command_gamerules().lock().unwrap_or_else(|e| e.into_inner());
+        let previous = rules.insert("spawnRadius", 6);
+        drop(rules);
+
+        assert_eq!(spawn_radius_blocks(), 6);
+        for _ in 0..64 {
+            let [x, y, z] = resolve_world_spawn_pos([100, 70, -40], spawn_radius_blocks(), world_rng::next_u64());
+            assert!((x - 100).abs() <= 6, "x {x}");
+            assert_eq!(y, 70);
+            assert!((z - -40).abs() <= 6, "z {z}");
+        }
+
+        let mut rules = command_gamerules().lock().unwrap_or_else(|e| e.into_inner());
+        match previous {
+            Some(v) => rules.insert("spawnRadius", v),
+            None => rules.remove("spawnRadius"),
+        };
     }
 }
