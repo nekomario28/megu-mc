@@ -1725,6 +1725,34 @@ pub enum PlayEvent {
         pos: [i32; 3],
         stage: i8,
     },
+    /// `explode` — blast effect: centre, per-block destruction records,
+    /// local-player knockback, interaction kind, emitter particle ids and
+    /// the explosion sound-event holder.
+    Explosion {
+        x: f64,
+        y: f64,
+        z: f64,
+        /// Blast strength (`radius`).
+        power: f32,
+        /// `(dx, dy, dz)` byte offsets of destroyed blocks, relative to
+        /// `floor(x, y, z)` — capped by the packet bounds and
+        /// [`MAX_EXPLOSION_RECORDS`].
+        records: Vec<[i8; 3]>,
+        /// Knockback delta applied to the local player's motion.
+        knockback: [f32; 3],
+        /// `block_interaction` enum ordinal (0 keep, 1 destroy,
+        /// 2 destroy-with-decay, 3 trigger).
+        block_interaction: i32,
+        /// Small explosion emitter `ParticleOptions` id (payload-free
+        /// kinds only — see the `explode` decoder).
+        small_particle_id: i32,
+        /// Large explosion emitter `ParticleOptions` id.
+        large_particle_id: i32,
+        /// Explosion sound event: inline holder name or `sound_event`
+        /// registry id.
+        sound_name: Option<String>,
+        sound_id: Option<u32>,
+    },
     /// `block_entity_data` — block-entity NBT update; `nbt_bytes` is empty
     /// when the packet carries the absent-NBT marker (`0x00`).
     BlockEntityData {
@@ -2277,6 +2305,33 @@ pub enum ClientPlayEvent {
 // NBT goes through the depth/array-bounded `WireReader::read_nbt`, and `Slot`
 // payloads are skipped by a fail-closed walker that mirrors the server-side
 // `slot_read_*` family in `src/menus_and_items.rs`.
+
+/// `explode` block-destruction records are byte offsets; vanilla blasts
+/// stay under a few hundred but the wire count is unbounded, so the
+/// decoder caps it like the other collection fields (a malicious count
+/// can never drive an allocation or a per-block apply storm).
+pub const MAX_EXPLOSION_RECORDS: usize = 1 << 16;
+
+/// Decode the `explosion_sound` `Holder<SoundEvent>` trailer of an
+/// `explode` body: `0` = inline name (followed by the optional
+/// fixed-range pair), `>0` = `sound_event` registry id minus one. The
+/// field sits after two `ParticleOptions` whose payload-carrying kinds
+/// vanilla never emits here, so a misaligned or truncated holder
+/// degrades to `None` rather than failing the packet.
+fn decode_explosion_sound(r: &mut WireReader<'_>) -> (Option<String>, Option<u32>) {
+    let Ok(holder) = r.read_varint() else {
+        return (None, None);
+    };
+    if holder == 0 {
+        let name = r.read_string(256).ok();
+        if name.is_some() && matches!(r.read_bool(), Ok(true)) {
+            let _ = r.read_f32();
+        }
+        (name, None)
+    } else {
+        (None, u32::try_from(holder - 1).ok())
+    }
+}
 
 /// Wire angle byte -> degrees (`byte * 360 / 256`, signed).
 fn wire_angle(byte: i8) -> f32 {
@@ -3518,6 +3573,45 @@ pub fn decode_extended_play_event(name: &str, body: &[u8]) -> Result<Option<Play
                 breaker_eid,
                 pos,
                 stage,
+            }
+        }
+        "explode" => {
+            let x = r.read_f64()?;
+            let y = r.read_f64()?;
+            let z = r.read_f64()?;
+            let power = r.read_f32()?;
+            let record_count = usize::try_from(r.read_varint()?)
+                .map_err(|_| "negative explosion record count".to_string())?;
+            if record_count > MAX_EXPLOSION_RECORDS || record_count > r.remaining() / 3 {
+                return Err(format!(
+                    "explosion record count {record_count} exceeds {} remaining bytes",
+                    r.remaining()
+                ));
+            }
+            let mut records = Vec::with_capacity(record_count);
+            for _ in 0..record_count {
+                records.push([r.read_i8()?, r.read_i8()?, r.read_i8()?]);
+            }
+            let knockback = [r.read_f32()?, r.read_f32()?, r.read_f32()?];
+            let block_interaction = r.read_varint()?;
+            // `ParticleOptions` ids: vanilla only ever sends payload-free
+            // emitters in this packet (`poof`, `explosion`,
+            // `explosion_emitter`, `gust*`), so each id is a bare varint.
+            let small_particle_id = r.read_varint()?;
+            let large_particle_id = r.read_varint()?;
+            let (sound_name, sound_id) = decode_explosion_sound(&mut r);
+            PlayEvent::Explosion {
+                x,
+                y,
+                z,
+                power,
+                records,
+                knockback,
+                block_interaction,
+                small_particle_id,
+                large_particle_id,
+                sound_name,
+                sound_id,
             }
         }
         "block_entity_data" => {
@@ -7176,5 +7270,90 @@ mod tests {
             None
         );
         assert_eq!(decode_megu_custom_payload(CHANNEL_MAGIC_V1, b"BAD!"), None);
+    }
+
+    /// `explode`: centre + strength + byte-offset records + knockback +
+    /// block-interaction + two payload-free `ParticleOptions` ids + the
+    /// `Holder<SoundEvent>` trailer all decode; a count the body cannot
+    /// hold fails closed instead of driving an allocation.
+    #[test]
+    fn explode_decodes_records_knockback_and_sound_holder() {
+        let mut body = Vec::new();
+        body.extend_from_slice(&8.5f64.to_be_bytes());
+        body.extend_from_slice(&65.0f64.to_be_bytes());
+        body.extend_from_slice(&(-3.25f64).to_be_bytes());
+        body.extend_from_slice(&4.0f32.to_be_bytes());
+        write_varint(&mut body, 2); // record count
+        body.extend_from_slice(&[0u8, 1, (-1i8) as u8]);
+        body.extend_from_slice(&[2, (-3i8) as u8, 4]);
+        for v in [0.5f32, 1.0, -0.25] {
+            body.extend_from_slice(&v.to_be_bytes());
+        }
+        write_varint(&mut body, 1); // block_interaction: destroy
+        write_varint(&mut body, 33); // small ParticleOptions id
+        write_varint(&mut body, 37); // large ParticleOptions id
+        // Inline sound holder (id 0) + name + no fixed range.
+        write_varint(&mut body, 0);
+        write_varint(&mut body, "minecraft:entity.generic.explode".len() as i32);
+        body.extend_from_slice(b"minecraft:entity.generic.explode");
+        body.push(0);
+
+        let event = decode_extended_play_event("explode", &body)
+            .unwrap()
+            .expect("explode decodes");
+        let PlayEvent::Explosion {
+            x,
+            y,
+            z,
+            power,
+            records,
+            knockback,
+            block_interaction,
+            small_particle_id,
+            large_particle_id,
+            sound_name,
+            sound_id,
+        } = event
+        else {
+            panic!("expected Explosion, got {event:?}");
+        };
+        assert_eq!((x, y, z), (8.5, 65.0, -3.25));
+        assert_eq!(power, 4.0);
+        assert_eq!(records, vec![[0, 1, -1], [2, -3, 4]]);
+        assert_eq!(knockback, [0.5, 1.0, -0.25]);
+        assert_eq!(block_interaction, 1);
+        assert_eq!(small_particle_id, 33);
+        assert_eq!(large_particle_id, 37);
+        assert_eq!(
+            sound_name.as_deref(),
+            Some("minecraft:entity.generic.explode")
+        );
+        assert_eq!(sound_id, None);
+
+        // Registry-id holder (>0) surfaces as `sound_id` minus one.
+        let mut reg = body.clone();
+        // Drop the holder trailer: flag + 32 name bytes + name-len +
+        // holder varints = 35 bytes.
+        reg.truncate(reg.len() - 35);
+        write_varint(&mut reg, 42); // registry id 42 -> sound_id 41
+        let event = decode_extended_play_event("explode", &reg)
+            .unwrap()
+            .expect("registry holder decodes");
+        let PlayEvent::Explosion {
+            sound_name,
+            sound_id,
+            ..
+        } = event
+        else {
+            panic!("expected Explosion, got {event:?}");
+        };
+        assert_eq!(sound_name, None);
+        assert_eq!(sound_id, Some(41));
+
+        // A record count beyond the body's bytes fails closed.
+        let mut bad = Vec::new();
+        bad.extend_from_slice(&[0u8; 28]); // x,y,z + power
+        write_varint(&mut bad, 1000);
+        assert!(decode_extended_play_event("explode", &bad).is_err());
     }
 }

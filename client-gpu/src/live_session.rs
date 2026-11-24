@@ -997,6 +997,177 @@ fn state_block_name<'a>(
     mod_registry.and_then(|registry| registry.block_state_name(state))
 }
 
+// Vanilla `game_event` ids beyond the weather quad `world.rs` already
+// mirrors (1/2/7/8). The session layer owns the mode flip, the win and
+// demo events, the respawn-screen flag, and the player-source stingers.
+const GAME_EVENT_NO_RESPAWN_BLOCK: u8 = 0;
+const GAME_EVENT_CHANGE_GAME_MODE: u8 = 3;
+const GAME_EVENT_WIN_GAME: u8 = 4;
+const GAME_EVENT_DEMO: u8 = 5;
+const GAME_EVENT_ARROW_HIT_PLAYER: u8 = 6;
+const GAME_EVENT_PUFFERFISH_STING: u8 = 9;
+const GAME_EVENT_ELDER_GUARDIAN_APPEARANCE: u8 = 10;
+const GAME_EVENT_ENABLE_RESPAWN_SCREEN: u8 = 11;
+
+/// Chat hint text for the `game_event` id-5 demo event values (vanilla
+/// `DemoMode` steps; the intro value `0` opens a screen this client has
+/// no surface for, so it gets a line instead).
+fn demo_hint_line(value: i32) -> Option<&'static str> {
+    Some(match value {
+        0 => "Demo mode: this world is a trial",
+        101 => "Demo: use W, A, S and D to move around",
+        102 => "Demo: move the mouse to look around",
+        103 => "Demo: press Space to jump",
+        104 => "Demo: press E to open the inventory",
+        _ => return None,
+    })
+}
+
+/// `level_event` id → `(sound name, source category, volume, pitch)` —
+/// the sound half of vanilla `LevelEventHandler`. Category follows the
+/// vanilla source table (4 blocks, 5 hostile, 6 neutral, 7 players);
+/// the block-break id `2001` is handled separately by the caller since
+/// its `data` field carries a block-state id.
+fn level_event_sound(event: i32, _data: i32) -> Option<(&'static str, i32, f32, f32)> {
+    Some(match event {
+        1000 => ("minecraft:block.dispenser.dispense", 4, 1.0, 1.0),
+        1001 => ("minecraft:block.dispenser.fail", 4, 1.0, 1.0),
+        1002 => ("minecraft:block.dispenser.launch", 4, 1.0, 1.0),
+        1003 => ("minecraft:entity.endereye.launch", 6, 1.0, 1.0),
+        1004 => ("minecraft:entity.firework_rocket.launch", 8, 1.0, 1.0),
+        1005 => ("minecraft:block.iron_door.open", 4, 1.0, 1.0),
+        1006 => ("minecraft:block.wooden_door.open", 4, 1.0, 1.0),
+        1007 => ("minecraft:block.wooden_trapdoor.open", 4, 1.0, 1.0),
+        1008 => ("minecraft:block.fence_gate.open", 4, 1.0, 1.0),
+        1009 => ("minecraft:block.fire.extinguish", 4, 1.0, 1.0),
+        1011 => ("minecraft:block.iron_door.close", 4, 1.0, 1.0),
+        1012 => ("minecraft:block.wooden_door.close", 4, 1.0, 1.0),
+        1013 => ("minecraft:block.wooden_trapdoor.close", 4, 1.0, 1.0),
+        1014 => ("minecraft:block.fence_gate.close", 4, 1.0, 1.0),
+        1015 => ("minecraft:entity.ghast.warn", 5, 1.0, 1.0),
+        1016 => ("minecraft:entity.ghast.shoot", 5, 1.0, 1.0),
+        1017 => ("minecraft:entity.ender_dragon.shoot", 5, 1.0, 1.0),
+        1018 => ("minecraft:entity.blaze.shoot", 5, 1.0, 1.0),
+        1019 => ("minecraft:entity.zombie.attack_wooden_door", 5, 1.0, 1.0),
+        1020 => ("minecraft:entity.zombie.attack_iron_door", 5, 1.0, 1.0),
+        1021 => ("minecraft:entity.zombie.break_wooden_door", 5, 1.0, 1.0),
+        1022 => ("minecraft:entity.wither.break_block", 5, 1.0, 1.0),
+        1023 => ("minecraft:entity.wither.shoot", 5, 1.0, 1.0),
+        1024 => ("minecraft:entity.bat.takeoff", 6, 1.0, 1.0),
+        1025 => ("minecraft:entity.zombie.infect", 5, 1.0, 1.0),
+        1026 => ("minecraft:entity.zombie_villager.converted", 6, 1.0, 1.0),
+        1027 => ("minecraft:entity.ender_dragon.death", 5, 1.0, 1.0),
+        1028 => ("minecraft:block.anvil.destroy", 4, 1.0, 1.0),
+        1029 => ("minecraft:block.anvil.use", 4, 1.0, 1.0),
+        1030 => ("minecraft:block.anvil.land", 4, 1.0, 1.0),
+        1031 => ("minecraft:block.portal.travel", 7, 1.0, 1.0),
+        1032 => ("minecraft:block.chorus_flower.grow", 4, 1.0, 1.0),
+        1033 => ("minecraft:block.chorus_flower.death", 4, 1.0, 1.0),
+        1034 => ("minecraft:block.brewing_stand.brew", 4, 1.0, 1.0),
+        1035 => ("minecraft:block.iron_trapdoor.open", 4, 1.0, 1.0),
+        1036 => ("minecraft:block.iron_trapdoor.close", 4, 1.0, 1.0),
+        1039 => ("minecraft:entity.phantom.bite", 5, 1.0, 1.0),
+        1041 => ("minecraft:entity.zombie.converted_to_drowned", 5, 1.0, 1.0),
+        1042 => ("minecraft:block.grindstone.use", 4, 1.0, 1.0),
+        1043 => ("minecraft:item.book.page_turn", 6, 1.0, 1.0),
+        1044 => ("minecraft:block.smithing_table.use", 4, 1.0, 1.0),
+        1047 => ("minecraft:item.bone_meal.use", 4, 1.0, 1.0),
+        1501 => ("minecraft:block.lava.extinguish", 4, 1.0, 1.0),
+        1502 => ("minecraft:block.redstone_torch.burnout", 4, 1.0, 1.0),
+        1503 => ("minecraft:block.end_portal_frame.fill", 4, 1.0, 1.0),
+        2002 => ("minecraft:entity.splash_potion.break", 6, 1.0, 1.0),
+        2003 => ("minecraft:entity.endereye.death", 6, 1.0, 1.0),
+        2008 => ("minecraft:entity.dragon_fireball.explode", 5, 1.0, 1.0),
+        _ => return None,
+    })
+}
+
+/// `block_event` → block-family sound resolved against the *live*
+/// block name at the event position (the wire's raw `block_type` id is
+/// registry-dependent, so the placed block wins). Vanilla actions:
+/// piston extend/retract (0/1), note block play (0), bell ring (1),
+/// container open/close (action 1, `parameter` = viewer count).
+fn block_event_sound(name: &str, action: u8, parameter: u8) -> Option<&'static str> {
+    let short = name.rsplit(':').next().unwrap_or(name);
+    let open = parameter > 0;
+    match (short, action) {
+        ("piston" | "sticky_piston", 0) => Some("minecraft:block.piston.extend"),
+        ("piston" | "sticky_piston", 1) => Some("minecraft:block.piston.contract"),
+        ("note_block", 0) => Some("minecraft:block.note_block.harp"),
+        ("bell", 1) => Some("minecraft:block.bell.use"),
+        ("barrel", 1) => Some(if open {
+            "minecraft:block.barrel.open"
+        } else {
+            "minecraft:block.barrel.close"
+        }),
+        ("ender_chest", 1) => Some(if open {
+            "minecraft:block.ender_chest.open"
+        } else {
+            "minecraft:block.ender_chest.close"
+        }),
+        ("chest" | "trapped_chest", 1) => Some(if open {
+            "minecraft:block.chest.open"
+        } else {
+            "minecraft:block.chest.close"
+        }),
+        (short, 1) if short.ends_with("shulker_box") => Some(if open {
+            "minecraft:block.shulker_box.open"
+        } else {
+            "minecraft:block.shulker_box.close"
+        }),
+        _ => None,
+    }
+}
+
+/// Best-effort block-family `break` sound for `level_event` 2001 — the
+/// packet carries only a block-state id, so the family is inferred from
+/// the registry name like the data-driven `SoundType` table does.
+fn break_sound_for_block(name: &str) -> &'static str {
+    let short = name.rsplit(':').next().unwrap_or(name);
+    if short.contains("glass")
+        || short.contains("amethyst")
+        || short == "ice"
+        || short.ends_with("_ice")
+    {
+        "minecraft:block.glass.break"
+    } else if short.contains("leaves") || short.contains("vine") || short.contains("sapling") {
+        "minecraft:block.grass.break"
+    } else if short.contains("wool") || short.contains("carpet") {
+        "minecraft:block.wool.break"
+    } else if short.contains("gravel") {
+        "minecraft:block.gravel.break"
+    } else if short.contains("snow") {
+        "minecraft:block.snow.break"
+    } else if short.contains("slime") || short.contains("honeycomb") {
+        "minecraft:block.slime_block.break"
+    } else if short.contains("sand") && !short.contains("sandstone") {
+        "minecraft:block.sand.break"
+    } else if short.contains("log")
+        || short.contains("stem")
+        || short.contains("planks")
+        || short.contains("wood")
+        || short.contains("fence")
+        || short.contains("door")
+        || short.contains("trapdoor")
+        || short.contains("chest")
+        || short.contains("barrel")
+        || short.contains("sign")
+        || short.contains("ladder")
+        || short.contains("torch")
+    {
+        "minecraft:block.wood.break"
+    } else if short.contains("dirt")
+        || short.contains("grass_block")
+        || short.contains("farmland")
+        || short.contains("mud")
+        || short.contains("soil")
+    {
+        "minecraft:block.gravel.break"
+    } else {
+        "minecraft:block.stone.break"
+    }
+}
+
 /// The atlas sprite id standing in for a whole block: the `particle`
 /// texture of the model `block`'s blockstate resolves to under synthetic
 /// representative props — vanilla's own stand-in for a block's look, and
@@ -1231,6 +1402,19 @@ pub struct LiveSession {
     /// and the window reads this to drive `Screen::Death` plus the
     /// input lock.
     pub death: DeathLoopState,
+    /// Local player game mode mirrored from `game_event` id 3
+    /// (`change_game_mode`): 0 survival, 1 creative, 2 adventure,
+    /// 3 spectator. Drives the HUD vitals gate (`hud.game_mode`).
+    pub game_mode: i32,
+    /// `game_event` id 11 (`enable_respawn_screen`): `false` is
+    /// vanilla's immediate respawn — the death screen never opens and
+    /// `PERFORM_RESPAWN` re-requests automatically on death.
+    pub respawn_screen_enabled: bool,
+    /// `game_event` id 4 (`win_game`) with `value != 0` asks the client
+    /// to roll credits before the respawn. Recorded for the future
+    /// credits surface; cleared on `respawn`/`login` via
+    /// [`Self::reset_dimension`].
+    pub pending_end_credits: bool,
     pub hud: HudState,
     pub magic: MagicHudState,
     pub vfx: ClientVfxHost,
@@ -1730,6 +1914,9 @@ impl LiveSession {
             commands: seeded_command_dispatcher(),
             player_entity_id: None,
             death: DeathLoopState::default(),
+            game_mode: 0,
+            respawn_screen_enabled: true,
+            pending_end_credits: false,
             hud: HudState::default(),
             magic: MagicHudState::default(),
             vfx,
@@ -4437,6 +4624,12 @@ impl LiveSession {
         // `set_health(<=0)` mark death, `respawn`/`set_health(>0)` and the
         // next `login` clear it.
         self.death.apply(&event);
+        // `game_event` id 11 with value 0 is vanilla's immediate
+        // respawn: the moment death lands the client re-requests
+        // `PERFORM_RESPAWN` — no death screen, no click.
+        if self.death.is_dead() && !self.respawn_screen_enabled {
+            self.request_respawn();
+        }
         match event {
             PlayEvent::JoinGame { entity_id, .. } => {
                 self.player_entity_id = Some(entity_id);
@@ -4774,6 +4967,7 @@ impl LiveSession {
                 self.hud_revision += 1;
             }
             PlayEvent::SetActionBarText { nbt_bytes } => {
+                self.hud.actionbar = nbt_text(&nbt_bytes).unwrap_or_default();
                 self.actionbar_nbt = Some(nbt_bytes);
                 self.hud_revision += 1;
             }
@@ -4901,6 +5095,20 @@ impl LiveSession {
                 self.subtitle_text_nbt = Some(nbt_bytes);
                 self.title_revision += 1;
                 self.hud_revision += 1;
+            }
+            PlayEvent::ClearTitles => {
+                // `clear_titles` hides the live overlay immediately; the
+                // stored fade/stay defaults stay armed for the next
+                // `set_title_text`.
+                self.title_text = None;
+                self.subtitle_text = None;
+                self.title_text_nbt = None;
+                self.subtitle_text_nbt = None;
+                self.title_revision += 1;
+                self.hud_revision += 1;
+            }
+            PlayEvent::GameEvent { event, value } => {
+                self.apply_game_event(event, value);
             }
             PlayEvent::BossEvent {
                 uuid,
@@ -5125,15 +5333,339 @@ impl LiveSession {
                     }
                 }
             }
+            PlayEvent::Explosion {
+                x,
+                y,
+                z,
+                power,
+                records,
+                knockback,
+                sound_name,
+                sound_id,
+                ..
+            } => {
+                // Knockback delta applies to the local player's motion
+                // like vanilla's `setDeltaMovement` on the packet.
+                for (v, k) in self.physics_state.vel.iter_mut().zip(knockback.iter()) {
+                    *v += f64::from(*k);
+                }
+                // `apply_play_event` already wrote the destruction
+                // records into the world as air; mark every touched
+                // section (plus face neighbours) for mesh rebuild and
+                // re-sync acoustics once per touched chunk column.
+                let base = [
+                    x.floor() as i32,
+                    y.floor() as i32,
+                    z.floor() as i32,
+                ];
+                let mut touched = BTreeSet::new();
+                for r in &records {
+                    let pos = [
+                        base[0] + i32::from(r[0]),
+                        base[1] + i32::from(r[1]),
+                        base[2] + i32::from(r[2]),
+                    ];
+                    self.evict_kinetic_part((pos[0], pos[1], pos[2]));
+                    self.mark_block_dirty(pos);
+                    touched.insert((pos[0].div_euclid(16), pos[2].div_euclid(16)));
+                }
+                for (cx, cz) in touched {
+                    self.acoustic_world.sync_chunk(&self.world, cx, cz);
+                }
+                if !records.is_empty() {
+                    self.audio.mixer.refresh_acoustics();
+                    self.terrain_dirty = true;
+                }
+                // Camera kick: the landing-dip impulse doubles as a
+                // bounded shake — the micro-physics clamps keep even a
+                // charged-creeper blast inside its `0.14`-block cap.
+                let kick = if power.is_finite() {
+                    power.clamp(0.0, 8.0) * 2.0
+                } else {
+                    0.0
+                };
+                self.tactile_landing_impulse = self.tactile_landing_impulse.max(kick);
+                // Vanilla plays the packet's `explosion_sound` holder on
+                // the BLOCKS source at volume 4.0 with pitch wandering
+                // `0.6..0.8` — the mid stays deterministic here.
+                let center = [x as f32, y as f32, z as f32];
+                match (sound_name, sound_id) {
+                    (Some(name), _) => self.emit_effect_sound(&name, 4, 4.0, 0.7, center),
+                    (None, Some(id)) => self.emit_registry_sound(id, 4, 4.0, 0.7, center),
+                    (None, None) => self.emit_effect_sound(
+                        "minecraft:entity.generic.explode",
+                        4,
+                        4.0,
+                        0.7,
+                        center,
+                    ),
+                }
+                // Blast burst: a crisp spark core at the centre plus a
+                // sprinkle at a bounded sample of destroyed blocks.
+                let tick = self.next_tactile_event_tick();
+                self.tactile_sim.emit_impact_sparks(
+                    center,
+                    [0.0, 1.0, 0.0],
+                    ImpactMaterial::CriticalHit,
+                    tick,
+                );
+                for r in records.iter().take(6) {
+                    let pos = [
+                        (base[0] + i32::from(r[0])) as f32 + 0.5,
+                        (base[1] + i32::from(r[1])) as f32 + 0.5,
+                        (base[2] + i32::from(r[2])) as f32 + 0.5,
+                    ];
+                    self.tactile_sim.emit_impact_sparks(
+                        pos,
+                        [0.0, 1.0, 0.0],
+                        ImpactMaterial::OreOrStone,
+                        tick,
+                    );
+                }
+            }
+            PlayEvent::LevelEvent {
+                event, pos, data, ..
+            } => self.apply_level_event(event, pos, data),
+            PlayEvent::BlockEvent {
+                pos,
+                action,
+                parameter,
+                ..
+            } => self.apply_block_event(pos, action, parameter),
+            PlayEvent::LevelParticles {
+                particle_id,
+                x,
+                y,
+                z,
+                count,
+                ..
+            } => self.apply_level_particles(particle_id, count, [x, y, z]),
+            PlayEvent::TakeItemEntity {
+                item_entity,
+                player,
+                ..
+            } => {
+                // Vanilla plays `entity.item.pickup` on the PLAYERS
+                // source at the collecting player — the item position
+                // is the closest tracked anchor this client keeps.
+                let pos = self
+                    .entity_positions
+                    .get(&item_entity)
+                    .or_else(|| self.entity_positions.get(&player))
+                    .map(|p| [p[0] as f32, p[1] as f32, p[2] as f32])
+                    .unwrap_or([0.0; 3]);
+                self.emit_effect_sound("minecraft:entity.item.pickup", 7, 0.2, 1.0, pos);
+            }
             PlayEvent::Disconnect(reason) => self.status = SessionStatus::Disconnected(reason),
             _ => {}
         }
         Ok(())
     }
 
+    /// Session-side `game_event` handling layered over the world's
+    /// weather mirror: game-mode flips drive the HUD vitals gate,
+    /// `enable_respawn_screen(0)` is vanilla immediate respawn, demo
+    /// events surface as chat hints, and the arrow/pufferfish/guardian
+    /// ids play their player-source stingers.
+    fn apply_game_event(&mut self, event: u8, value: f32) {
+        match event {
+            GAME_EVENT_NO_RESPAWN_BLOCK => {
+                // `block.minecraft.spawn.not_valid` — vanilla shows it
+                // as a screen message when respawn finds no bed/anchor.
+                self.push_chat_line(
+                    "You have no home bed or charged respawn anchor, or it was obstructed"
+                        .to_string(),
+                );
+            }
+            GAME_EVENT_CHANGE_GAME_MODE => {
+                let mode = if value.is_finite() { value as i32 } else { 0 };
+                self.game_mode = mode;
+                self.hud.game_mode = mode;
+                self.hud_revision += 1;
+            }
+            GAME_EVENT_WIN_GAME => {
+                // `value != 0` rolls credits before the respawn; the
+                // credits screen is not implemented, so the request is
+                // recorded until the dimension reset clears it.
+                self.pending_end_credits = value != 0.0;
+            }
+            GAME_EVENT_DEMO => {
+                if let Some(line) = demo_hint_line(value as i32) {
+                    self.push_chat_line(line.to_string());
+                }
+            }
+            GAME_EVENT_ARROW_HIT_PLAYER => {
+                // `entity.arrow.hit_player` plays on the local player
+                // (PLAYERS source), not at a world position.
+                self.emit_player_sound("minecraft:entity.arrow.hit_player", 0.2, 1.0);
+            }
+            GAME_EVENT_PUFFERFISH_STING => {
+                self.emit_player_sound("minecraft:entity.puffer_fish.sting", 1.0, 1.0);
+            }
+            GAME_EVENT_ELDER_GUARDIAN_APPEARANCE => {
+                // Vanilla flashes the ghost elder-guardian overlay over
+                // the HUD — there is no overlay channel for it yet, so
+                // the curse stinger carries the whole effect.
+                self.emit_player_sound("minecraft:entity.elder_guardian.curse", 1.0, 1.0);
+            }
+            GAME_EVENT_ENABLE_RESPAWN_SCREEN => {
+                self.respawn_screen_enabled = value != 0.0;
+                // Flipping to immediate respawn while already dead re-
+                // requests `PERFORM_RESPAWN` on the spot.
+                if !self.respawn_screen_enabled && self.death.is_dead() {
+                    self.request_respawn();
+                }
+            }
+            _ => {}
+        }
+    }
+
+    /// `level_event` id → spatial sound (+ the tactile spark burst for
+    /// the block-break family). The bounded record queue in
+    /// [`WorldState::level_events`](megu_client::world::WorldState) keeps
+    /// the history; this is the live feedback half. Ids follow the
+    /// vanilla `LevelEvent` ordinals.
+    fn apply_level_event(&mut self, event: i32, pos: [i32; 3], data: i32) {
+        let center = [
+            pos[0] as f32 + 0.5,
+            pos[1] as f32 + 0.5,
+            pos[2] as f32 + 0.5,
+        ];
+        if event == 2001 {
+            // Block break: `data` is the destroyed block-state id —
+            // derive the family break sound and emit the crack burst.
+            let sound = state_block_name(
+                &self.world,
+                self.mod_registry.as_ref(),
+                data.max(0) as u32,
+            )
+            .map(break_sound_for_block)
+            .unwrap_or("minecraft:block.stone.break");
+            self.emit_effect_sound(sound, 4, 1.0, 0.8, center);
+            let tick = self.next_tactile_event_tick();
+            self.tactile_sim.emit_impact_sparks(
+                center,
+                [0.0, 1.0, 0.0],
+                ImpactMaterial::OreOrStone,
+                tick,
+            );
+            return;
+        }
+        if let Some((name, category, volume, pitch)) = level_event_sound(event, data) {
+            self.emit_effect_sound(name, category, volume, pitch, center);
+        }
+    }
+
+    /// `block_event` → spatial sound resolved from the block actually
+    /// at `pos` (pistons, chests/barrels, note blocks, bells). The wire
+    /// carries a raw block *id* the client cannot map without the
+    /// registry, so the live state wins.
+    fn apply_block_event(&mut self, pos: [i32; 3], action: u8, parameter: u8) {
+        let center = [
+            pos[0] as f32 + 0.5,
+            pos[1] as f32 + 0.5,
+            pos[2] as f32 + 0.5,
+        ];
+        let name = self.block_name_at(pos);
+        if let Some(sound) = block_event_sound(&name, action, parameter) {
+            self.emit_effect_sound(sound, 4, 0.5, 1.0, center);
+        }
+    }
+
+    /// `level_particles` → tactile spark stand-ins for the combat/blast
+    /// particle families the renderer has no generic emitter for.
+    /// Everything else stays cosmetic-only in the bounded world queue.
+    fn apply_level_particles(&mut self, particle_id: i32, count: i32, pos: [f64; 3]) {
+        // Vanilla particle-palette ids (alphabetical order): combat
+        // hits get the bright spark burst, the explosion emitter maps
+        // to debris sparks. Everything else stays cosmetic-only in the
+        // bounded world queue until a generic particle stage lands.
+        let material = match particle_id {
+            14 | 16 | 33 => Some(ImpactMaterial::CriticalHit), // crit, damage_indicator, enchanted_hit
+            36 => Some(ImpactMaterial::OreOrStone),            // explosion
+            _ => None,
+        };
+        let Some(material) = material.filter(|_| count > 0) else {
+            return;
+        };
+        let pos = [pos[0] as f32, pos[1] as f32, pos[2] as f32];
+        let tick = self.next_tactile_event_tick();
+        self.tactile_sim
+            .emit_impact_sparks(pos, [0.0, 1.0, 0.0], material, tick);
+    }
+
+    /// Play one named spatial sound through the live audio runtime —
+    /// the synthesized counterpart of a `sound_effect` packet for
+    /// events that carry an effect id instead of a sound holder.
+    fn emit_effect_sound(
+        &mut self,
+        name: &str,
+        category: i32,
+        volume: f32,
+        pitch: f32,
+        position: [f32; 3],
+    ) {
+        self.audio.ingest(&WireSoundEvent {
+            name: Some(name.to_string()),
+            registry_id: None,
+            category,
+            position: Some(position),
+            entity_id: None,
+            volume,
+            pitch,
+            seed: 0,
+            fixed_range: None,
+        });
+    }
+
+    /// [`Self::emit_effect_sound`] for a `sound_event` registry id —
+    /// resolution flows through the synced registry table like the
+    /// packet-decoded `registry_id` path.
+    fn emit_registry_sound(
+        &mut self,
+        id: u32,
+        category: i32,
+        volume: f32,
+        pitch: f32,
+        position: [f32; 3],
+    ) {
+        self.audio.ingest(&WireSoundEvent {
+            name: None,
+            registry_id: Some(id),
+            category,
+            position: Some(position),
+            entity_id: None,
+            volume,
+            pitch,
+            seed: 0,
+            fixed_range: None,
+        });
+    }
+
+    /// Play one named sound on the PLAYERS source anchored to the local
+    /// player (`None` position = non-positional when the pose is not
+    /// known yet).
+    fn emit_player_sound(&mut self, name: &str, volume: f32, pitch: f32) {
+        let position = self
+            .pose
+            .map(|pose| pose.feet.map(|coord| coord as f32));
+        self.audio.ingest(&WireSoundEvent {
+            name: Some(name.to_string()),
+            registry_id: None,
+            category: 7,
+            position,
+            entity_id: None,
+            volume,
+            pitch,
+            seed: 0,
+            fixed_range: None,
+        });
+    }
+
     fn reset_dimension(&mut self) {
         self.acoustic_world.reset_dimension(&self.world);
         self.audio.mixer.refresh_acoustics();
+        self.pending_end_credits = false;
         self.entity_positions.clear();
         self.entity_metadata.clear();
         self.mob_effects.clear();
@@ -8520,5 +9052,231 @@ mod tests {
             ui.hud.mini_hud_data.mspt.is_some() && ui.hud.mini_hud_data.tps.is_some(),
             "live tick samples must reach MiniHUD mspt/tps"
         );
+    }
+
+    /// `clear_titles` hides the live overlay immediately: text and raw
+    /// NBT drop while the fade/stay timing state stays armed for the
+    /// next `set_title_text`.
+    #[test]
+    fn clear_titles_clears_overlay_fields_and_bumps_revisions() {
+        let (mut live, _tx) = session();
+        let nbt: Vec<u8> = vec![
+            0x0a, 0x08, 0x00, 0x04, b't', b'e', b'x', b't', 0x00, 0x05, b'H', b'e', b'l', b'l',
+            b'o', 0x00,
+        ];
+        live.apply_event(ClientPlayEvent::Play(PlayEvent::SetTitleText {
+            nbt_bytes: nbt.clone(),
+        }))
+        .unwrap();
+        live.apply_event(ClientPlayEvent::Play(PlayEvent::SetSubtitleText {
+            nbt_bytes: nbt,
+        }))
+        .unwrap();
+        assert_eq!(live.title_text.as_deref(), Some("Hello"));
+        assert_eq!(live.subtitle_text.as_deref(), Some("Hello"));
+        let title_rev = live.title_revision;
+        let hud_rev = live.hud_revision;
+
+        live.apply_event(ClientPlayEvent::Play(PlayEvent::ClearTitles))
+            .unwrap();
+        assert_eq!(live.title_text, None);
+        assert_eq!(live.subtitle_text, None);
+        assert_eq!(live.title_text_nbt, None);
+        assert_eq!(live.subtitle_text_nbt, None);
+        assert!(live.title_revision > title_rev);
+        assert!(live.hud_revision > hud_rev);
+    }
+
+    /// `game_event` session ids: mode flip mirrors into both the session
+    /// and `hud.game_mode` (the layout vitals gate), `win_game` records
+    /// the credits request, `enable_respawn_screen` flips the flag, and
+    /// the demo event surfaces its hint as a chat line.
+    #[test]
+    fn game_event_feeds_game_mode_respawn_flag_and_demo_hints() {
+        let (mut live, _tx) = session();
+        live.apply_event(ClientPlayEvent::Play(PlayEvent::GameEvent {
+            event: 3,
+            value: 1.0,
+        }))
+        .unwrap();
+        assert_eq!(live.game_mode, 1);
+        assert_eq!(live.hud.game_mode, 1);
+
+        live.apply_event(ClientPlayEvent::Play(PlayEvent::GameEvent {
+            event: 4,
+            value: 1.0,
+        }))
+        .unwrap();
+        assert!(live.pending_end_credits);
+
+        live.apply_event(ClientPlayEvent::Play(PlayEvent::GameEvent {
+            event: 11,
+            value: 0.0,
+        }))
+        .unwrap();
+        assert!(!live.respawn_screen_enabled);
+
+        let chat_before = live.hud.chat_lines.len();
+        live.apply_event(ClientPlayEvent::Play(PlayEvent::GameEvent {
+            event: 5,
+            value: 103.0,
+        }))
+        .unwrap();
+        assert_eq!(live.hud.chat_lines.len(), chat_before + 1);
+        assert!(live.hud.chat_lines[chat_before].contains("jump"));
+
+        // `reset_dimension` (respawn/login) clears the credits request.
+        live.apply_event(ClientPlayEvent::Play(PlayEvent::Respawn {
+            dimension: DimensionMeta::default(),
+        }))
+        .unwrap();
+        assert!(!live.pending_end_credits);
+    }
+
+    /// `enable_respawn_screen(0)` is vanilla's immediate respawn: the
+    /// moment death lands the client queues `client_command(0)` itself —
+    /// no death screen, no click.
+    #[test]
+    fn respawn_screen_disabled_auto_requests_on_death() {
+        let (mut live, _tx, rx) = session_with_commands();
+        live.status = SessionStatus::Playing;
+        live.apply_event(ClientPlayEvent::Play(PlayEvent::GameEvent {
+            event: 11,
+            value: 0.0,
+        }))
+        .unwrap();
+        live.apply_event(ClientPlayEvent::Play(PlayEvent::SetHealth {
+            health: 0.0,
+            food: 20,
+            saturation: 5.0,
+        }))
+        .unwrap();
+        assert!(live.is_dead());
+        assert!(matches!(
+            rx.recv().unwrap(),
+            WorkerCommand::ClientCommand { action: 0 }
+        ));
+    }
+
+    /// `explode`: knockback lands on the local player's velocity, every
+    /// destruction record marks its section dirty through the same path
+    /// `block_update` uses, the camera gets a bounded kick, and the
+    /// world counts the removals.
+    #[test]
+    fn explosion_knockback_dirty_marks_camera_kick_and_removals() {
+        let (mut live, _tx) = session();
+        live.apply_event(ClientPlayEvent::Play(PlayEvent::Explosion {
+            x: 8.4,
+            y: 65.2,
+            z: -3.9,
+            power: 4.0,
+            records: vec![[0, 0, 0], [1, 2, 0], [-1, 0, 3]],
+            knockback: [0.5, 1.0, -0.25],
+            block_interaction: 1,
+            small_particle_id: 0,
+            large_particle_id: 0,
+            sound_name: Some("minecraft:entity.generic.explode".to_string()),
+            sound_id: None,
+        }))
+        .unwrap();
+        assert_eq!(live.physics_state.vel, [0.5, 1.0, -0.25]);
+        assert!(live.terrain_dirty);
+        assert!(!live.dirty_terrain_coords.is_empty());
+        assert!(live.tactile_landing_impulse > 0.0);
+        assert_eq!(live.world.block_updates, 3);
+    }
+
+    /// `level_event`/`block_event`/`level_particles`/`take_item_entity`
+    /// flow through `apply_play` into the bounded world history queues —
+    /// and into synthesized sound ingests that must never error.
+    #[test]
+    fn world_feedback_events_route_to_queues_and_sound() {
+        let (mut live, _tx) = session();
+        live.apply_event(ClientPlayEvent::Play(PlayEvent::LevelEvent {
+            event: 1006,
+            pos: [1, 64, 2],
+            data: 0,
+            disable_relative_volume: false,
+        }))
+        .unwrap();
+        assert_eq!(live.world.level_events.len(), 1);
+
+        live.apply_event(ClientPlayEvent::Play(PlayEvent::BlockEvent {
+            pos: [1, 64, 2],
+            action: 0,
+            parameter: 0,
+            block_type: 33,
+        }))
+        .unwrap();
+        assert_eq!(live.world.block_events.len(), 1);
+
+        live.apply_event(ClientPlayEvent::Play(PlayEvent::LevelParticles {
+            particle_id: 14,
+            long_distance: false,
+            x: 1.0,
+            y: 65.0,
+            z: 2.0,
+            offset_x: 0.0,
+            offset_y: 0.0,
+            offset_z: 0.0,
+            max_speed: 0.0,
+            count: 4,
+            particle_data: Vec::new(),
+        }))
+        .unwrap();
+        assert_eq!(live.world.level_particles.len(), 1);
+
+        live.apply_event(ClientPlayEvent::Play(PlayEvent::TakeItemEntity {
+            item_entity: 5,
+            player: 7,
+            amount: 1,
+        }))
+        .unwrap();
+        assert_eq!(live.world.item_pickups.len(), 1);
+    }
+
+    /// The synthesized sound tables stay pinned to the vanilla ordinals.
+    #[test]
+    fn synthesized_sound_tables_cover_the_vanilla_ids() {
+        assert_eq!(
+            level_event_sound(1006, 0).map(|(n, _, _, _)| n),
+            Some("minecraft:block.wooden_door.open")
+        );
+        assert_eq!(
+            level_event_sound(2002, 0).map(|(n, _, _, _)| n),
+            Some("minecraft:entity.splash_potion.break")
+        );
+        assert!(level_event_sound(999, 0).is_none());
+
+        assert_eq!(
+            block_event_sound("minecraft:piston", 0, 0),
+            Some("minecraft:block.piston.extend")
+        );
+        assert_eq!(
+            block_event_sound("minecraft:chest", 1, 1),
+            Some("minecraft:block.chest.open")
+        );
+        assert_eq!(
+            block_event_sound("minecraft:chest", 1, 0),
+            Some("minecraft:block.chest.close")
+        );
+        assert_eq!(block_event_sound("minecraft:stone", 0, 0), None);
+
+        assert_eq!(
+            break_sound_for_block("minecraft:oak_log"),
+            "minecraft:block.wood.break"
+        );
+        assert_eq!(
+            break_sound_for_block("minecraft:glass"),
+            "minecraft:block.glass.break"
+        );
+        assert_eq!(
+            break_sound_for_block("minecraft:stone"),
+            "minecraft:block.stone.break"
+        );
+
+        assert!(demo_hint_line(103).is_some());
+        assert!(demo_hint_line(104).is_some());
+        assert!(demo_hint_line(55).is_none());
     }
 }

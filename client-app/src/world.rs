@@ -2835,6 +2835,9 @@ impl WorldState {
                 pos,
                 stage,
             } => self.apply_block_destruction(*breaker_eid, *pos, *stage),
+            PlayEvent::Explosion {
+                x, y, z, records, ..
+            } => self.apply_explosion_removals(*x, *y, *z, records)?,
             PlayEvent::BlockEntityData {
                 pos,
                 kind,
@@ -2998,6 +3001,45 @@ impl WorldState {
         }
         self.block_destructions
             .insert(breaker_eid, BlockBreakProgress { pos, stage });
+    }
+
+    /// `explode`: the packet's destruction records are byte offsets from
+    /// `floor(center)` — the authoritative client-side block removals,
+    /// all written as air (global palette state `0`). The record list is
+    /// bounded by the decoder's
+    /// [`MAX_EXPLOSION_RECORDS`](crate::protocol::MAX_EXPLOSION_RECORDS)
+    /// cap; every
+    /// write flows through the incremental light queue like
+    /// `block_update` does.
+    fn apply_explosion_removals(
+        &mut self,
+        x: f64,
+        y: f64,
+        z: f64,
+        records: &[[i8; 3]],
+    ) -> Result<(), String> {
+        if records.is_empty() {
+            return Ok(());
+        }
+        let base = [
+            x.floor() as i32,
+            y.floor() as i32,
+            z.floor() as i32,
+        ];
+        let updates: Vec<([i32; 3], u32)> = records
+            .iter()
+            .map(|r| {
+                (
+                    [
+                        base[0] + i32::from(r[0]),
+                        base[1] + i32::from(r[1]),
+                        base[2] + i32::from(r[2]),
+                    ],
+                    0,
+                )
+            })
+            .collect();
+        self.apply_block_updates(&updates)
     }
 
     /// `block_entity_data`: upsert the block entity at `pos` — the live
@@ -3275,5 +3317,68 @@ mod tests {
         assert!(!visual.upside_down);
         assert!(visual.rainbow_sheep_rgb.is_none());
         assert!(!visual.toast_rabbit);
+    }
+
+    /// `explode` destruction records are byte offsets from
+    /// `floor(center)`: each resolves to an absolute position and is
+    /// written as air through the same incremental path `block_update`
+    /// uses — a loaded chunk really loses the blocks.
+    #[test]
+    fn explosion_writes_air_into_loaded_chunks() {
+        use crate::protocol::DecodedSection;
+        let mut world = WorldState::new(
+            DimensionMeta {
+                name: "minecraft:overworld".to_string(),
+                min_y: 0,
+                height: 64,
+                has_skylight: true,
+            },
+            BlockTable::builtin(),
+        );
+        world
+            .apply_chunk(DecodedChunk {
+                cx: 0,
+                cz: 0,
+                sections: (0..4)
+                    .map(|_| DecodedSection {
+                        non_air: SECTION_CELLS as i16,
+                        states: Box::new([1; SECTION_CELLS]),
+                        biomes: [0; 64],
+                    })
+                    .collect(),
+                block_entities: Vec::new(),
+                light: DecodedLightData {
+                    sky_mask: Vec::new(),
+                    block_mask: Vec::new(),
+                    empty_sky_mask: Vec::new(),
+                    empty_block_mask: Vec::new(),
+                    sky_arrays: Vec::new(),
+                    block_arrays: Vec::new(),
+                },
+            })
+            .unwrap();
+        assert_eq!(world.get_block_state(3, 4, 5), Some(1));
+
+        world
+            .apply_play_event(&PlayEvent::Explosion {
+                x: 4.6,
+                y: 4.2,
+                z: 4.8,
+                power: 4.0,
+                // `floor(center)` = (4, 4, 4): records land on
+                // (4, 4, 4) and (3, 4, 5).
+                records: vec![[0, 0, 0], [-1, 0, 1]],
+                knockback: [0.0; 3],
+                block_interaction: 1,
+                small_particle_id: 0,
+                large_particle_id: 0,
+                sound_name: None,
+                sound_id: None,
+            })
+            .unwrap();
+        assert_eq!(world.get_block_state(4, 4, 4), Some(0));
+        assert_eq!(world.get_block_state(3, 4, 5), Some(0));
+        assert_eq!(world.get_block_state(1, 1, 1), Some(1));
+        assert_eq!(world.block_updates, 2);
     }
 }

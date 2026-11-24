@@ -1338,6 +1338,11 @@ pub struct HudState {
     pub xp_progress: f32,
     /// `0..=300` air supply (bubbles hidden at 300).
     pub air: u16,
+    /// Local player game mode: `0` survival, `1` creative, `2` adventure,
+    /// `3` spectator. `layout::hud` uses it for the vanilla draw gates —
+    /// creative and spectator hide the hearts/armor/hunger/air/XP rows,
+    /// spectator also drops the hotbar and crosshair.
+    pub game_mode: i32,
     /// `(title, fraction)` boss bars, top of screen.
     pub bossbars: Vec<(String, f32)>,
     /// Item names per hotbar slot (`None` = empty slot).
@@ -1596,6 +1601,7 @@ impl Default for HudState {
             xp_level: 0,
             xp_progress: 0.0,
             air: 300,
+            game_mode: 0,
             bossbars: Vec::new(),
             hotbar: Default::default(),
             offhand: None,
@@ -1633,6 +1639,7 @@ impl HudState {
             xp_level: 12,
             xp_progress: 0.6,
             air: 210,
+            game_mode: 0,
             bossbars: vec![("Ender Dragon".to_string(), 0.65)],
             hotbar,
             offhand: Some("Shield".to_string()),

@@ -52,12 +52,6 @@
     },
     {
       "check": "s2c_play_event_consumption",
-      "id": "PlayEvent::ClearTitles",
-      "priority": "P1",
-      "reason": "clear_titles drops \u2014 titles/subtitles persist past server clears"
-    },
-    {
-      "check": "s2c_play_event_consumption",
       "id": "PlayEvent::CommandSuggestions",
       "priority": "P1",
       "reason": "command_suggestions drops \u2014 tab-completion never populates"

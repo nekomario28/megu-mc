@@ -1947,53 +1947,65 @@ fn hud(ctx: &mut Ctx) {
         16 * boss_count + 4
     };
 
+    // Game-mode draw gates: vanilla creative (1) and spectator (3) hide
+    // the hearts/armor/hunger/air/XP rows; spectator also drops the
+    // hotbar and the crosshair. `hud_occupied_rects` mirrors this.
+    let show_vitals = hud.game_mode != 1 && hud.game_mode != 3;
+    let show_hotbar = hud.game_mode != 3;
+
     // Crosshair.
-    let cc = UiColor::rgba(230, 230, 230, 190);
-    ctx.fill(cx - 5, h / 2, 11, 1, cc);
-    ctx.fill(cx, h / 2 - 5, 1, 11, cc);
+    if hud.game_mode != 3 {
+        let cc = UiColor::rgba(230, 230, 230, 190);
+        ctx.fill(cx - 5, h / 2, 11, 1, cc);
+        ctx.fill(cx, h / 2 - 5, 1, 11, cc);
+    }
 
     // Hotbar: offhand + 9 slots.
     let slot = 22;
     let hw = 9 * slot;
     let hx = cx - (hw + slot + 4) / 2;
     let hy = h - slot - 4;
-    if let Some(item) = &hud.offhand {
-        slot_cell(ctx, hx, hy, Some(item), false);
-    }
-    for (i, item) in hud.hotbar.iter().enumerate() {
-        slot_cell(
-            ctx,
-            hx + slot + 4 + i as i32 * slot,
-            hy,
-            item.as_ref(),
-            i == hud.selected_slot,
-        );
+    if show_hotbar {
+        if let Some(item) = &hud.offhand {
+            slot_cell(ctx, hx, hy, Some(item), false);
+        }
+        for (i, item) in hud.hotbar.iter().enumerate() {
+            slot_cell(
+                ctx,
+                hx + slot + 4 + i as i32 * slot,
+                hy,
+                item.as_ref(),
+                i == hud.selected_slot,
+            );
+        }
     }
 
     // Vitals: hearts left, hunger right, above the hotbar.
     let hx0 = hx + slot + 4;
     let vy = hy - 12;
-    icon_row(ctx, hx0, vy, hud.health, 20.0, pal::HEALTH);
-    icon_row(ctx, hx0, vy - 10, hud.armor as f32, 20.0, pal::ARMOR);
-    if hud.absorption > 0.0 {
-        icon_row(ctx, hx0, vy - 20, hud.absorption, 20.0, pal::ABSORPTION);
-    }
     let rx = hx0 + hw;
-    icon_row_r(ctx, rx, vy, hud.hunger as f32, 20.0, pal::HUNGER);
-    if hud.air < 300 {
-        icon_row_r(ctx, rx, vy - 10, hud.air as f32 / 30.0, 10.0, pal::AIR);
-    }
+    if show_vitals {
+        icon_row(ctx, hx0, vy, hud.health, 20.0, pal::HEALTH);
+        icon_row(ctx, hx0, vy - 10, hud.armor as f32, 20.0, pal::ARMOR);
+        if hud.absorption > 0.0 {
+            icon_row(ctx, hx0, vy - 20, hud.absorption, 20.0, pal::ABSORPTION);
+        }
+        icon_row_r(ctx, rx, vy, hud.hunger as f32, 20.0, pal::HUNGER);
+        if hud.air < 300 {
+            icon_row_r(ctx, rx, vy - 10, hud.air as f32 / 30.0, 10.0, pal::AIR);
+        }
 
-    // XP bar + level.
-    ctx.progress(
-        lr(cx - 91, hy - 4, 182, 3),
-        hud.xp_progress.clamp(0.0, 1.0),
-        pal::XP,
-        UiColor::rgb(20, 30, 14),
-        pal::BUTTON_BORDER,
-    );
-    if hud.xp_level > 0 {
-        ctx.ctext(cx, hy - 14, 1, pal::XP, &hud.xp_level.to_string());
+        // XP bar + level.
+        ctx.progress(
+            lr(cx - 91, hy - 4, 182, 3),
+            hud.xp_progress.clamp(0.0, 1.0),
+            pal::XP,
+            UiColor::rgb(20, 30, 14),
+            pal::BUTTON_BORDER,
+        );
+        if hud.xp_level > 0 {
+            ctx.ctext(cx, hy - 14, 1, pal::XP, &hud.xp_level.to_string());
+        }
     }
 
     // ------------------------------------------------------------------
@@ -2006,9 +2018,14 @@ fn hud(ctx: &mut Ctx) {
     //     whatever came before (or drop lines that cannot fit).
     // ------------------------------------------------------------------
     let hotbar_top = hy - 4;
-    // Hearts/armor/(absorption) column left, hunger/(air) column right.
-    let vl = hx0..(hx0 + 80);
-    let vr = (rx - 80)..rx;
+    // Hearts/armor/(absorption) column left, hunger/(air) column right —
+    // empty ranges while creative/spectator keeps the rows undrawn so no
+    // overlay ever lifts for invisible chrome.
+    let (vl, vr) = if show_vitals {
+        (hx0..(hx0 + 80), (rx - 80)..rx)
+    } else {
+        (0..0, 0..0)
+    };
     let vtop_l = vy - if hud.absorption > 0.0 { 20 } else { 10 };
     let vtop_r = vy - if hud.air < 300 { 10 } else { 0 };
 
@@ -2638,7 +2655,10 @@ fn hud_occupied_rects(state: &UiState, width: u32, height: u32) -> Vec<UiRect> {
             }
         };
 
-        // Hotbar block (offhand + gap + 9 slots), vitals columns, XP.
+        // Hotbar block (offhand + gap + 9 slots), vitals columns, XP —
+        // the same creative/spectator gates `hud()` applies to the draw.
+        let show_vitals = hud.game_mode != 1 && hud.game_mode != 3;
+        let show_hotbar = hud.game_mode != 3;
         let slot = 22;
         let hw = 9 * slot;
         let hx = cx - (hw + slot + 4) / 2;
@@ -2647,17 +2667,26 @@ fn hud_occupied_rects(state: &UiState, width: u32, height: u32) -> Vec<UiRect> {
         let hx0 = hx + slot + 4;
         let vy = hy - 12;
         let rx = hx0 + hw;
-        let vl = hx0..(hx0 + 80);
-        let vr = (rx - 80)..rx;
+        // Empty ranges while the rows are gated off — the lift/clip math
+        // below then no-ops exactly like the invisible chrome it models.
+        let (vl, vr) = if show_vitals {
+            (hx0..(hx0 + 80), (rx - 80)..rx)
+        } else {
+            (0..0, 0..0)
+        };
         let vtop_l = vy - if hud.absorption > 0.0 { 20 } else { 10 };
         let vtop_r = vy - if hud.air < 300 { 10 } else { 0 };
-        add(hx, hy, slot + 4 + hw, slot);
-        add(cx - 91, hy - 4, 182, 3);
-        if hud.xp_level > 0 {
-            add(cx - 24, hy - 14, 48, 8);
+        if show_hotbar {
+            add(hx, hy, slot + 4 + hw, slot);
         }
-        add(vl.start, vtop_l, 80, vy + 8 - vtop_l);
-        add(vr.start, vtop_r, 80, vy + 8 - vtop_r);
+        if show_vitals {
+            add(cx - 91, hy - 4, 182, 3);
+            if hud.xp_level > 0 {
+                add(cx - 24, hy - 14, 48, 8);
+            }
+            add(vl.start, vtop_l, 80, vy + 8 - vtop_l);
+            add(vr.start, vtop_r, 80, vy + 8 - vtop_r);
+        }
 
         // Actionbar: centered band directly above the vitals.
         let abar = if hud.actionbar.is_empty() {
