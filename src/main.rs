@@ -11,6 +11,7 @@ use std::net::{TcpListener, TcpStream};
 use std::sync::{Mutex, OnceLock, RwLock, RwLockReadGuard, RwLockWriteGuard};
 use std::thread;
 use std::time::{Duration, Instant};
+mod async_chunk_delivery;
 mod cached_lookup;
 mod chunk_ack;
 mod connection_limits;

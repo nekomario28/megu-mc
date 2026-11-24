@@ -646,6 +646,10 @@ pub(crate) struct ChunkPacketCache {
     map: HashMap<(crate::DimId, i32, i32, bool), CachedChunkPacket>,
     capacity: usize,
     use_clock: u64,
+    /// Wire-form builds so far — the metric the compress-once claim stands on:
+    /// N readers of one chunk at one negotiated threshold share a single zlib
+    /// pass; a revision or threshold change is the only legitimate re-encode.
+    encodes: u64,
 }
 
 /// Entries retained; each holds one wire form of a full chunk frame — the
@@ -659,7 +663,16 @@ impl ChunkPacketCache {
             map: HashMap::new(),
             capacity: CHUNK_PACKET_CACHE_CAP,
             use_clock: 0,
+            encodes: 0,
         }
+    }
+
+    /// How many compressed wire forms this cache has actually deflated. Every
+    /// `frame` hit past the first at a given threshold must share the stored
+    /// `Arc` — a climbing count for unchanged entries is a sharing bug.
+    #[allow(dead_code)]
+    pub(crate) fn encode_count(&self) -> u64 {
+        self.encodes
     }
 
     #[cfg(test)]
@@ -711,6 +724,7 @@ impl ChunkPacketCache {
                     let frame: Arc<[u8]> = Arc::from(encode_compressed_frame(
                         body_of_frame(plain), threshold,
                     ));
+                    self.encodes += 1;
                     entry.payload = CachedPayload::Compressed {
                         threshold,
                         frame: frame.clone(),
@@ -2481,6 +2495,43 @@ mod tests {
         assert!(Arc::ptr_eq(&f3, &cache.frame(10, key, 42, None).unwrap().0));
         // frame_uncached emits identical bytes without touching the entry.
         assert_eq!(*ChunkPacketCache::frame_uncached(&[9, 9, 9], None), *f1);
+    }
+
+    #[test]
+    fn chunk_packet_cache_compresses_once_for_any_number_of_compressed_readers() {
+        let mut cache = ChunkPacketCache::new();
+        let key = (crate::DimId::Overworld, 1, -3, false);
+        // A chunk-sized payload so the frame crosses the compression threshold.
+        cache.insert(7, key, 55, vec![], vec![0xAB; 8 * 1024]);
+        // N players at the same negotiated threshold must cost one zlib pass
+        // total — the second reader onward shares the stored `Arc`.
+        let mut shared = None;
+        for _ in 0..8 {
+            let (frame, _) = cache.frame(7, key, 55, Some(256)).unwrap();
+            match &shared {
+                None => shared = Some(frame),
+                Some(first) => assert!(Arc::ptr_eq(first, &frame)),
+            }
+        }
+        assert_eq!(
+            cache.encode_count(),
+            1,
+            "eight readers of one chunk pay exactly one deflate"
+        );
+        // A block/light mutation moves the revision (what `map_chunk_sig` and
+        // the 3x3 versions feed `chunk_packet_revision`): the cached frame no
+        // longer answers and the rebuilt entry pays its own single encode.
+        assert!(cache.frame(7, key, 56, Some(256)).is_none());
+        cache.insert(7, key, 56, vec![], vec![0xCD; 8 * 1024]);
+        let _ = cache.frame(7, key, 56, Some(256)).unwrap();
+        for _ in 0..4 {
+            let _ = cache.frame(7, key, 56, Some(256)).unwrap();
+        }
+        assert_eq!(
+            cache.encode_count(),
+            2,
+            "the invalidated entry re-encodes once, then shares again"
+        );
     }
 
     #[test]

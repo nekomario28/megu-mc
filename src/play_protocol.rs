@@ -5877,32 +5877,66 @@ fn conn_prof() -> bool {
     static ON: OnceLock<bool> = OnceLock::new();
     *ON.get_or_init(|| std::env::var_os("MEGU_CONN_PROF").is_some())
 }
-fn cached_chunk_frame(
-    compression: Option<usize>,
-    gen: &mut GenSources,
-    dim: DimId,
-    cx: i32,
-    cz: i32,
-    occluded: bool,
-) -> Arc<[u8]> {
-    let key = (dim, cx, cz, occluded);
-    let generation = current_gen_seq();
-    // `live_chunk_block_entities` iterates a map; sort so the spliced bytes
-    // (and their fingerprint) are deterministic across readers.
+/// The cache key a `0x27` frame is shared under: dimension, column and the
+/// anti-xray occlusion lane (`true` is the surface player's masked chunk,
+/// `false` the real one — the lanes never share a frame).
+type ChunkFrameKey = (DimId, i32, i32, bool);
+
+/// Everything a `0x27` frame build needs that is fixed at request time. The
+/// entities and revision are computed on the requesting thread — the revision
+/// has to be taken against *its* `gen` fill state, which also makes the plan
+/// the dedup contract a pool worker builds against.
+struct ChunkFramePlan {
+    key: ChunkFrameKey,
+    generation: u64,
+    revision: u64,
+    entities: Vec<ChunkBlockEntity>,
+}
+
+/// The live block-entity slice a `0x27` frame splices in, with the anti-xray
+/// filters the send path applies — buried entity NBT (chests, barrels,
+/// suspicious sand/gravel LootTableSeed, vaults) stays hidden until exposed,
+/// and the occluded lane strips everything under the ceiling — sorted so the
+/// spliced bytes and their fingerprint are deterministic across readers.
+fn chunk_frame_entities(dim: DimId, cx: i32, cz: i32, occluded: bool) -> Vec<ChunkBlockEntity> {
     let mut entities = live_chunk_block_entities(dim, cx, cz);
-    // Anti-xray: do not leak block-entity NBT (chests, barrels, suspicious sand/gravel
-    // LootTableSeed, vaults, etc.) for fully buried cells until exposed.
     if anti_xray_enabled() {
         entities.retain(|&((x, y, z), _, _)| block_exposed_dim(dim, x, y, z));
     }
-    // The occluded lane strips every live block entity under the ceiling too:
-    // a buried beacon, spawner or chest must not reach a surface client at all.
     if occluded {
         if let Some(ceil) = underground_occlude_ceil(dim, cx, cz) {
             entities.retain(|&((_, y, _), _, _)| y >= ceil);
         }
     }
     entities.sort_by(|a, b| (a.0, a.1, &a.2).cmp(&(b.0, b.1, &b.2)));
+    entities
+}
+
+/// The result of probing the shared `ChunkPacketCache` before a build.
+enum ChunkFrameLookup {
+    /// The wire frame, ready to write; the chunk's own emitters are already
+    /// restored into `gen` exactly as a rebuild would record them.
+    Hit(Arc<[u8]>),
+    /// No current entry — the caller either builds inline or hands the plan to
+    /// the async delivery pool.
+    Miss(Box<ChunkFramePlan>),
+}
+
+/// Probe the shared `ChunkPacketCache` for `(dim, cx, cz)` at the revision the
+/// caller's world state implies. Everything the sent bytes can carry is folded
+/// into the revision — the 3x3 `chunk_versions`, `map_chunk_sig`, and the live
+/// block entities — so a hit is byte-for-byte what a rebuild would emit.
+fn chunk_frame_lookup(
+    compression: Option<usize>,
+    gen: &mut GenSources,
+    dim: DimId,
+    cx: i32,
+    cz: i32,
+    occluded: bool,
+) -> ChunkFrameLookup {
+    let key = (dim, cx, cz, occluded);
+    let generation = current_gen_seq();
+    let entities = chunk_frame_entities(dim, cx, cz, occluded);
     let versions = chunk_versions_3x3(dim, cx, cz);
     let revision = chunk_packet_revision(&versions, map_chunk_sig(dim, cx, cz, gen), &entities);
     if let Some((frame, emitters)) = chunk_packet_cache()
@@ -5917,7 +5951,7 @@ fn cached_chunk_frame(
         // A hit restores the chunk's own emitters into `gen` exactly as a
         // rebuild would; `light_dirty_for_dim` reads them below.
         gen.insert((cx, cz), emitters);
-        return frame;
+        return ChunkFrameLookup::Hit(frame);
     }
     if std::env::var_os("MEGU_CHUNK_PROF").is_some() {
         static MISSES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
@@ -5930,27 +5964,438 @@ fn cached_chunk_frame(
             MISSES.fetch_add(1, Ordering::Relaxed) + 1,
         );
     }
+    ChunkFrameLookup::Miss(Box::new(ChunkFramePlan {
+        key,
+        generation,
+        revision,
+        entities,
+    }))
+}
+
+/// The inline build behind a `ChunkFrameLookup::Miss`: `map_chunk_lane`, the
+/// live block-entity splice and the light cull on the calling thread, then
+/// stored under the plan's revision only when its inputs held for the whole
+/// build — a mid-build edit gets correct bytes that are simply not cached.
+fn build_chunk_frame_inline(
+    plan: ChunkFramePlan,
+    gen: &mut GenSources,
+    compression: Option<usize>,
+) -> Arc<[u8]> {
+    let (dim, cx, cz, occluded) = plan.key;
     let built = map_chunk_lane(cx, cz, dim, gen, occluded);
     let emitters = gen.get(&(cx, cz)).cloned().unwrap_or_default();
     let still_current = chunk_packet_revision(
         &chunk_versions_3x3(dim, cx, cz),
         map_chunk_sig(dim, cx, cz, gen),
-        &entities,
-    ) == revision;
-    let (_, packet) = encode_play_level_chunk_with_light(built, entities, dim);
+        &plan.entities,
+    ) == plan.revision;
+    let (_, packet) = encode_play_level_chunk_with_light(built, plan.entities, dim);
     if !still_current {
         if std::env::var_os("MEGU_CHUNK_PROF").is_some() {
             static STALE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-            eprintln!("[chunk-cache] stale cx={cx} cz={cz} rev={revision} total={}", STALE.fetch_add(1, Ordering::Relaxed) + 1);
+            eprintln!("[chunk-cache] stale cx={cx} cz={cz} rev={} total={}", plan.revision, STALE.fetch_add(1, Ordering::Relaxed) + 1);
         }
         return connection_limits::ChunkPacketCache::frame_uncached(&packet, compression);
     }
     let mut cache = chunk_packet_cache().lock().unwrap_or_else(|e| e.into_inner());
-    cache.insert(generation, key, revision, emitters, packet);
+    cache.insert(plan.generation, plan.key, plan.revision, emitters, packet);
     cache
-        .frame(generation, key, revision, compression)
+        .frame(plan.generation, plan.key, plan.revision, compression)
         .map(|(frame, _)| frame)
         .expect("a freshly inserted chunk packet must frame")
+}
+
+/// The shared `0x27` frame for `(dim, cx, cz)` at its current world revision,
+/// built inline on the calling thread. The synchronous counterpart of the
+/// `async_chunk_delivery` pool's worker arm — used by the lane resend, by the
+/// `MEGU_ASYNC_CHUNK_DELIVERY=0` escape hatch, and as the fallback for every
+/// declined or failed async build.
+fn cached_chunk_frame(
+    compression: Option<usize>,
+    gen: &mut GenSources,
+    dim: DimId,
+    cx: i32,
+    cz: i32,
+    occluded: bool,
+) -> Arc<[u8]> {
+    match chunk_frame_lookup(compression, gen, dim, cx, cz, occluded) {
+        ChunkFrameLookup::Hit(frame) => frame,
+        ChunkFrameLookup::Miss(plan) => build_chunk_frame_inline(*plan, gen, compression),
+    }
+}
+
+// ---------- async chunk-frame delivery pool ----------
+//
+// `stream_chunks` used to run the whole `ChunkFrameLookup::Miss` build inline:
+// populate under the generator lock, the per-section encode, the light cull,
+// then the first reader's zlib pass — ~a second of serial work when a moving
+// player crossed into ungenerated ground, multiplied by every player crossing
+// the same ground. The `async_chunk_delivery` pool runs the identical build on
+// bounded workers instead: the send loop enqueues every miss up front and only
+// waits on the frame it is about to write, so workers finish the rest of the
+// batch while earlier frames are on the wire, and two players walking toward
+// the same column share one build.
+
+/// What one finished worker build hands back to its waiters.
+enum FrameOutcome {
+    /// The packet landed in the shared `ChunkPacketCache` under the revision
+    /// the worker computed after generation — and the requester's negotiated
+    /// wire form is primed, so the zlib pass already ran off every connection
+    /// thread. The waiter's own lookup picks the entry up by its current
+    /// revision.
+    Cached,
+    /// Fresh bytes that could not be stored — a mid-build edit invalidated
+    /// the inputs — so the waiter frames them uncached exactly as the inline
+    /// path does.
+    Uncached {
+        packet: Vec<u8>,
+        own_emitters: Vec<((i32, i32, i32), u8)>,
+    },
+}
+
+/// One queued frame build. `gen` is the requester's 3x3 emitter snapshot — the
+/// only `GenSources` window `map_chunk_sig` and the unsettled-light fallback
+/// read — cloned so the worker touches no per-connection state.
+struct FrameJob {
+    plan: ChunkFramePlan,
+    gen: GenSources,
+    compression: Option<usize>,
+    gen_ticket: Option<stream_gen::Ticket>,
+}
+
+/// The worker arm: wait for the chunk's streamed generation (the ticket the
+/// requester already took out, so terrain is ready or `pop_done` on arrival),
+/// then run the byte-identical build `build_chunk_frame_inline` performs —
+/// `map_chunk_lane`, splice, light cull — and store it under the post-build
+/// revision only while the inputs still hold.
+fn run_frame_job(job: FrameJob) -> Option<FrameOutcome> {
+    let (dim, cx, cz, occluded) = job.plan.key;
+    // A worldgen re-init between request and build makes the plan's inputs
+    // stale: decline so the waiter rebuilds against live state, the same
+    // escape `stream_gen`'s generation tag gives its waiters.
+    if job.plan.generation != current_gen_seq() {
+        return None;
+    }
+    if let Some(ticket) = job.gen_ticket {
+        let _ = ticket.wait();
+    }
+    let mut gen = job.gen;
+    // The entity/revision fingerprint is taken here, not carried from the
+    // requester's plan: populate can place the signs, generated spawners and
+    // block entities a pre-generation scan cannot see, so the revision must
+    // describe the world this frame actually encodes — the same inputs a
+    // post-generation `chunk_frame_lookup` computes on the send loop.
+    let entities = chunk_frame_entities(dim, cx, cz, occluded);
+    let revision = chunk_packet_revision(
+        &chunk_versions_3x3(dim, cx, cz),
+        map_chunk_sig(dim, cx, cz, &gen),
+        &entities,
+    );
+    // A racing requester's build may have landed while this job queued or
+    // generated — the dedup window ends at job completion, not request.
+    {
+        let mut cache = chunk_packet_cache().lock().unwrap_or_else(|e| e.into_inner());
+        if cache
+            .frame(job.plan.generation, job.plan.key, revision, job.compression)
+            .is_some()
+        {
+            return Some(FrameOutcome::Cached);
+        }
+    }
+    let built = map_chunk_lane(cx, cz, dim, &mut gen, occluded);
+    let own_emitters = gen.get(&(cx, cz)).cloned().unwrap_or_default();
+    let still_current = chunk_packet_revision(
+        &chunk_versions_3x3(dim, cx, cz),
+        map_chunk_sig(dim, cx, cz, &gen),
+        &entities,
+    ) == revision;
+    let (_, packet) = encode_play_level_chunk_with_light(built, entities, dim);
+    if !still_current {
+        return Some(FrameOutcome::Uncached {
+            packet,
+            own_emitters,
+        });
+    }
+    let mut cache = chunk_packet_cache().lock().unwrap_or_else(|e| e.into_inner());
+    cache.insert(
+        job.plan.generation,
+        job.plan.key,
+        revision,
+        own_emitters,
+        packet,
+    );
+    // Prime the negotiated wire form off the connection thread: with
+    // compression on, this `frame` call is where the chunk's single zlib pass
+    // now runs, so no reader ever compresses on its own socket loop. A
+    // generation bump or eviction between insert and frame only costs the
+    // primed form — the next reader rebuilds it exactly as before.
+    let _ = cache.frame(
+        job.plan.generation,
+        job.plan.key,
+        revision,
+        job.compression,
+    );
+    Some(FrameOutcome::Cached)
+}
+
+/// The pool's dedup key: the cache key plus the requester's revision. Two
+/// requests share one build only when they would share one frame — a pair
+/// whose `gen` fills fingerprint differently (unsettled light reads `gen`)
+/// builds separately exactly as the synchronous path does, while requesters
+/// seeing the same world revision merge no matter which asked first.
+type FramePoolKey = (DimId, i32, i32, bool, u64);
+
+fn chunk_frame_pool() -> &'static async_chunk_delivery::Pool<FramePoolKey, FrameJob, FrameOutcome> {
+    static POOL: OnceLock<
+        async_chunk_delivery::Pool<FramePoolKey, FrameJob, FrameOutcome>,
+    > = OnceLock::new();
+    POOL.get_or_init(|| {
+        async_chunk_delivery::Pool::new(
+            async_chunk_delivery::worker_count(),
+            async_chunk_delivery::ASYNC_FRAME_CAP,
+            run_frame_job,
+        )
+    })
+}
+
+/// The emitter window a frame build actually reads: `map_chunk_sig` and the
+/// unsettled-light fallback only ever touch the 3x3 around `(cx, cz)`, so the
+/// worker's `GenSources` is that slice of the requester's map rather than the
+/// whole connection-side fill.
+fn gen_neighborhood(gen: &GenSources, cx: i32, cz: i32) -> GenSources {
+    let mut out = GenSources::new();
+    for dx in -1..=1 {
+        for dz in -1..=1 {
+            if let Some(emitters) = gen.get(&(cx + dx, cz + dz)) {
+                out.insert((cx + dx, cz + dz), emitters.clone());
+            }
+        }
+    }
+    out
+}
+
+/// One pending slot in the batch send order.
+enum FrameSlot {
+    /// The shared cache already holds the frame — write it now, ~0 ms.
+    Ready(Arc<[u8]>),
+    /// The build is queued on the delivery pool; wait only when this chunk's
+    /// turn to send arrives.
+    Pending(async_chunk_delivery::Ticket<FrameOutcome>),
+    /// The pool declined (stopped or full): the inline build the pre-pool code
+    /// always ran, preceded by the same streamed-generation ticket wait.
+    Inline,
+}
+
+/// The async delivery arm of `stream_chunks`: cache hits write immediately,
+/// misses are enqueued on the delivery pool so they build on background
+/// workers, and the send loop then walks `news` in order — `0x0d`/`0x0c`
+/// framing, `sent` bookkeeping, dirty-light resend inputs and sign packets all
+/// identical to the synchronous arm. Returns `false` on a socket error.
+#[allow(clippy::too_many_arguments)]
+fn stream_chunk_frames_async(
+    s: &mut TcpStream,
+    sent: &mut std::collections::HashSet<(i32, i32)>,
+    gen: &mut GenSources,
+    dirty: &mut std::collections::HashSet<(i32, i32)>,
+    dim: DimId,
+    news: &[(i32, i32)],
+    compression: Option<usize>,
+    occluded: bool,
+    allow_generate: bool,
+) -> bool {
+    // Keep only one build group queued per client — the same fairness bound
+    // the synchronous arm applies to `stream_gen` and `prefetch_terrain_group`:
+    // enqueueing the whole batch would let one client's outer rings sit ahead
+    // of every later client's initial window in the delivery pool's FIFO. The
+    // group is the same `terrain_group` shape: enough lookahead that workers
+    // finish the rest of the group while its first frames go out.
+    let group = terrain_group(async_chunk_delivery::worker_count());
+    for chunk_group in news.chunks(group.max(1)) {
+        // Phase 1 — lookups and enqueues. Nothing here blocks: a cache hit is
+        // an immediate `Arc`, a miss takes out the streamed-generation ticket
+        // and a pool slot, both non-blocking.
+        let mut slots: Vec<FrameSlot> = Vec::with_capacity(chunk_group.len());
+        for &(cx, cz) in chunk_group {
+            match chunk_frame_lookup(compression, gen, dim, cx, cz, occluded) {
+                ChunkFrameLookup::Hit(frame) => slots.push(FrameSlot::Ready(frame)),
+                ChunkFrameLookup::Miss(plan) => {
+                    // Warm the generation pool whether or not the frame pool
+                    // accepts the job — an `Inline` slot waits on the same
+                    // ticket the worker would have.
+                    let gen_ticket = allow_generate
+                        .then(|| stream_gen::request(dim, cx, cz))
+                        .flatten();
+                    let pool_key = (dim, cx, cz, occluded, plan.revision);
+                    let job = FrameJob {
+                        plan: *plan,
+                        gen: gen_neighborhood(gen, cx, cz),
+                        compression,
+                        gen_ticket,
+                    };
+                    match chunk_frame_pool().request(pool_key, job) {
+                        Some(ticket) => slots.push(FrameSlot::Pending(ticket)),
+                        None => slots.push(FrameSlot::Inline),
+                    }
+                }
+            }
+        }
+        // Phase 2 — the ordered send. Chunks leave in `news` order exactly as
+        // the serial path wrote them; a `Pending` slot waits on a build that
+        // has been running since phase 1, so the wait is only ever for the
+        // head of the line, not the whole batch.
+        for ((cx, cz), slot) in chunk_group.iter().zip(slots) {
+            let frame = match slot {
+                FrameSlot::Ready(frame) => frame,
+                FrameSlot::Inline => {
+                    // `stream_gen::request` dedups by key, so this hands back
+                    // the same live ticket phase 1 took out — the inline build
+                    // keeps the synchronous arm's exact wait-then-build shape.
+                    if allow_generate {
+                        if let Some(ticket) = stream_gen::request(dim, *cx, *cz) {
+                            let _ = ticket.wait();
+                        }
+                    }
+                    cached_chunk_frame(compression, gen, dim, *cx, *cz, occluded)
+                }
+                FrameSlot::Pending(ticket) => match ticket.wait().as_deref() {
+                    Some(&FrameOutcome::Uncached {
+                        ref packet,
+                        ref own_emitters,
+                    }) => {
+                        gen.insert((*cx, *cz), own_emitters.clone());
+                        connection_limits::ChunkPacketCache::frame_uncached(packet, compression)
+                    }
+                    // `Cached` — the build landed in the shared cache primed
+                    // for this socket's compression — a declined generation, a
+                    // failed build, or a shared ticket resolved under inputs
+                    // that no longer hold: every one of them takes the normal
+                    // lookup, which hits the frame this build (or another
+                    // requester's) just stored, or rebuilds inline — the same
+                    // path the synchronous arm runs per chunk.
+                    _ => cached_chunk_frame(compression, gen, dim, *cx, *cz, occluded),
+                },
+            };
+            if write_shared_frame_arc(s, frame).is_err() {
+                return false;
+            }
+            note_chunk_delivered(s, sent, gen, dirty, dim, *cx, *cz);
+        }
+    }
+    true
+}
+
+/// Bookkeeping after one `0x27` frame is on the wire: mark the column held,
+/// collect the light-dirty neighbours the resend pass recomputes, and emit one
+/// block-entity packet per sign position. Identical for both delivery arms.
+fn note_chunk_delivered(
+    s: &mut TcpStream,
+    sent: &mut std::collections::HashSet<(i32, i32)>,
+    gen: &mut GenSources,
+    dirty: &mut std::collections::HashSet<(i32, i32)>,
+    dim: DimId,
+    cx: i32,
+    cz: i32,
+) {
+    sent.insert((cx, cz));
+    for n in light_dirty_for_dim(dim, gen, cx, cz) {
+        dirty.insert(n);
+    }
+    // one block-entity packet per sign position; it carries both
+    // sides' lines plus dye/glow/wax state from `sign_entity_pkt`
+    let snap = signs_in_chunk(dim, cx, cz);
+    let mut positions: Vec<(i32, i32, i32)> = Vec::new();
+    for ((_, sx, sy, sz, _), _) in snap {
+        if !positions.contains(&(sx, sy, sz)) {
+            positions.push((sx, sy, sz));
+        }
+    }
+    for (sx, sy, sz) in positions {
+        let _ = send_packet(s, 0x07, sign_entity_pkt(dim, sx, sy, sz));
+    }
+}
+
+/// The pre-pool synchronous arm of `stream_chunks`, kept byte-for-byte for the
+/// `MEGU_ASYNC_CHUNK_DELIVERY=0` escape hatch and as the documented fallback
+/// shape the async arm mirrors: one terrain group of lookahead per batch, then
+/// the serial per-chunk build/write loop.
+#[allow(clippy::too_many_arguments)]
+fn stream_chunk_frames_sync(
+    s: &mut TcpStream,
+    sent: &mut std::collections::HashSet<(i32, i32)>,
+    gen: &mut GenSources,
+    dirty: &mut std::collections::HashSet<(i32, i32)>,
+    dim: DimId,
+    news: &[(i32, i32)],
+    compression: Option<usize>,
+    occluded: bool,
+    allow_generate: bool,
+) -> bool {
+    // Terrain is pure per chunk, so a group of the batch is built off the lock before the
+    // send loop touches it; everything after it (features, overlays, encoding) stays
+    // sequential in the order the client is served. The group size is bounded so the base
+    // rows in `terr_c` cannot outgrow their store.
+    let mut failed = false;
+    let delivery_workers = delivery_prefetch_jobs();
+    let delivery_round = (delivery_workers > 1).then(crate::feature::starts_round_begin);
+    if let Some(round) = delivery_round {
+        let _ = worldgen::with_gen(|g| g.starts_round = Some(round));
+    }
+    // Keep only one terrain group queued per client. Enqueueing an entire
+    // delivery batch lets an early client's outer rings sit ahead of every
+    // later client's initial window in stream_gen's ordered commit lane.
+    // Group-sized lookahead still overlaps terrain preparation with encoding,
+    // while giving other connection threads a chance to enqueue closer chunks.
+    // The terrain rows stop one section below the dimension's own ceiling: a Nether/End
+    // window is 0..256 (16 sections), not the Overworld's -64..320.
+    let (lo, hi) = (dim.min_y(), dim.min_y() + dim.height() - 16);
+    'delivery: for chunk_group in news.chunks(terrain_group(delivery_workers)) {
+        let ticket_group: Vec<Option<stream_gen::Ticket>> = if allow_generate {
+            chunk_group
+                .iter()
+                .map(|&(cx, cz)| stream_gen::request(dim, cx, cz))
+                .collect()
+        } else {
+            chunk_group.iter().map(|_| None).collect()
+        };
+        // A queued chunk carries its own terrain prefetch inside the worker job,
+        // so the group prefetch only covers the chunks the pool declined.
+        let uncovered: Vec<(i32, i32)> = chunk_group
+            .iter()
+            .zip(&ticket_group)
+            .filter(|(_, t)| t.is_none())
+            .map(|(&c, _)| c)
+            .collect();
+        let __pf = Instant::now();
+        prefetch_terrain_group_dim(dim, &uncovered, lo, hi, delivery_workers, delivery_round);
+        let __pfe = __pf.elapsed();
+        if conn_prof() && __pfe > Duration::from_millis(50) {
+            eprintln!("[conn-prof] prefetch_terrain {:?}", __pfe);
+        }
+        for ((cx, cz), ticket) in chunk_group.iter().zip(&ticket_group) {
+            if let Some(ticket) = ticket {
+                // A false wait means the worker could not generate it; the
+                // frame builder's own `ensure_populated` covers that chunk
+                // inline exactly as before.
+                let _ = ticket.wait();
+            }
+            let __cf = Instant::now();
+            let frame = cached_chunk_frame(compression, gen, dim, *cx, *cz, occluded);
+            let __cfe = __cf.elapsed();
+            if conn_prof() && __cfe > Duration::from_millis(50) {
+                eprintln!("[conn-prof] chunk_frame ({cx},{cz}) {:?}", __cfe);
+            }
+            if write_shared_frame_arc(s, frame).is_err() {
+                failed = true;
+                break 'delivery;
+            }
+            note_chunk_delivered(s, sent, gen, dirty, dim, *cx, *cz);
+        }
+    }
+    if let Some(round) = delivery_round {
+        let _ = worldgen::with_gen(|g| g.starts_round = None);
+        crate::feature::starts_round_end(round);
+    }
+    !failed
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -6054,92 +6499,42 @@ fn stream_chunks(
         return;
     }
     let batch = news.len();
-    // Terrain is pure per chunk, so a group of the batch is built off the lock before the
-    // send loop touches it; everything after it (features, overlays, encoding) stays
-    // sequential in the order the client is served. The group size is bounded so the base
-    // rows in `terr_c` cannot outgrow their store.
     if send_packet(s, 0x0d, vec![]).is_err() {
         return;
     }
     let mut dirty: std::collections::HashSet<(i32, i32)> = std::collections::HashSet::new();
-    let delivery_workers = delivery_prefetch_jobs();
-    let delivery_round = (delivery_workers > 1).then(crate::feature::starts_round_begin);
-    if let Some(round) = delivery_round {
-        let _ = worldgen::with_gen(|g| g.starts_round = Some(round));
-    }
-    // Keep only one terrain group queued per client. Enqueueing an entire
-    // delivery batch lets an early client's outer rings sit ahead of every
-    // later client's initial window in stream_gen's ordered commit lane.
-    // Group-sized lookahead still overlaps terrain preparation with encoding,
-    // while giving other connection threads a chance to enqueue closer chunks.
-    // The terrain rows stop one section below the dimension's own ceiling: a Nether/End
-    // window is 0..256 (16 sections), not the Overworld's -64..320.
-    let (lo, hi) = (dim.min_y(), dim.min_y() + dim.height() - 16);
     let compression = socket_compression(s);
-    let mut failed = false;
-    'delivery: for chunk_group in news.chunks(terrain_group(delivery_workers)) {
-        let ticket_group: Vec<Option<stream_gen::Ticket>> = if allow_generate {
-            chunk_group
-                .iter()
-                .map(|&(cx, cz)| stream_gen::request(dim, cx, cz))
-                .collect()
-        } else {
-            chunk_group.iter().map(|_| None).collect()
-        };
-        // A queued chunk carries its own terrain prefetch inside the worker job,
-        // so the group prefetch only covers the chunks the pool declined.
-        let uncovered: Vec<(i32, i32)> = chunk_group
-            .iter()
-            .zip(&ticket_group)
-            .filter(|(_, t)| t.is_none())
-            .map(|(&c, _)| c)
-            .collect();
-        let __pf = Instant::now();
-        prefetch_terrain_group_dim(dim, &uncovered, lo, hi, delivery_workers, delivery_round);
-        let __pfe = __pf.elapsed();
-        if conn_prof() && __pfe > Duration::from_millis(50) {
-            eprintln!("[conn-prof] prefetch_terrain {:?}", __pfe);
-        }
-        for ((cx, cz), ticket) in chunk_group.iter().zip(&ticket_group) {
-            if let Some(ticket) = ticket {
-                // A false wait means the worker could not generate it; the
-                // frame builder's own `ensure_populated` covers that chunk
-                // inline exactly as before.
-                let _ = ticket.wait();
-            }
-            let __cf = Instant::now();
-            let frame = cached_chunk_frame(compression, gen, dim, *cx, *cz, occluded);
-            let __cfe = __cf.elapsed();
-            if conn_prof() && __cfe > Duration::from_millis(50) {
-                eprintln!("[conn-prof] chunk_frame ({cx},{cz}) {:?}", __cfe);
-            }
-            if write_shared_frame_arc(s, frame).is_err() {
-                failed = true;
-                break 'delivery;
-            }
-            sent.insert((*cx, *cz));
-            for n in light_dirty_for_dim(dim, gen, *cx, *cz) {
-                dirty.insert(n);
-            }
-            // one block-entity packet per sign position; it carries both
-            // sides' lines plus dye/glow/wax state from `sign_entity_pkt`
-            let snap = signs_in_chunk(dim, *cx, *cz);
-            let mut positions: Vec<(i32, i32, i32)> = Vec::new();
-            for ((_, sx, sy, sz, _), _) in snap {
-                if !positions.contains(&(sx, sy, sz)) {
-                    positions.push((sx, sy, sz));
-                }
-            }
-            for (sx, sy, sz) in positions {
-                let _ = send_packet(s, 0x07, sign_entity_pkt(dim, sx, sy, sz));
-            }
-        }
-    }
-    if let Some(round) = delivery_round {
-        let _ = worldgen::with_gen(|g| g.starts_round = None);
-        crate::feature::starts_round_end(round);
-    }
-    if failed {
+    // The default arm builds misses on the bounded async delivery pool: cache
+    // hits write immediately, misses build on background workers while earlier
+    // frames go out, and the send loop only waits on the chunk it is about to
+    // write. `MEGU_ASYNC_CHUNK_DELIVERY=0` restores the fully synchronous loop
+    // for deterministic tests and serial CPU comparisons.
+    let delivered = if async_chunk_delivery::enabled() {
+        stream_chunk_frames_async(
+            s,
+            sent,
+            gen,
+            &mut dirty,
+            dim,
+            &news,
+            compression,
+            occluded,
+            allow_generate,
+        )
+    } else {
+        stream_chunk_frames_sync(
+            s,
+            sent,
+            gen,
+            &mut dirty,
+            dim,
+            &news,
+            compression,
+            occluded,
+            allow_generate,
+        )
+    };
+    if !delivered {
         return;
     }
     // A neighbour lit before this batch could not see the emitters generated now, so its light is

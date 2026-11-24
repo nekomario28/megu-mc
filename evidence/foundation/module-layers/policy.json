@@ -59,6 +59,7 @@
       "voxel_faces"
     ],
     [
+      "async_chunk_delivery",
       "brigadier",
       "chunk_ack",
       "connection_limits",
@@ -97,6 +98,10 @@
     ]
   ],
   "allowed_edges": [
+    [
+      "main",
+      "async_chunk_delivery"
+    ],
     [
       "brigadier_wire",
       "brigadier"

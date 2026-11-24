@@ -26,7 +26,8 @@ layers = [
     # do not depend on generation or runtime owners. brigadier is a leaf library too: the
     # Brigadier port owns its own reader/tree/dispatcher and references no other crate module.
     ["ingress_guard", "tick_stats", "chunk_ack", "connection_limits", "trace_env",
-     "chunkprof", "lockprof", "loopprof", "tickprof", "brigadier", "wire"],
+     "async_chunk_delivery", "chunkprof", "lockprof", "loopprof", "tickprof",
+     "brigadier", "wire"],
 ]
 modules = [name for layer in layers for name in layer]
 graph = d.ModuleGraph(
