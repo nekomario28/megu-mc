@@ -200,6 +200,7 @@ pub mod random;
 pub mod romaji_ime;
 pub mod section_rev;
 pub mod server_perf_governors;
+pub mod sim_graph;
 pub mod simd_voxel;
 pub(crate) mod stats;
 pub mod sys_metrics;
