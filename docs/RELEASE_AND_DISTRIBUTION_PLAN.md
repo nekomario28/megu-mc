@@ -8,7 +8,7 @@
 
 - [release-checklist.md](release-checklist.md) — ゲート実行の正本（本書はその上位計画）
 - [LICENSING.md](../LICENSING.md) — 現行ライセンス決定の記録
-- [SECURITY.md](../.github/SECURITY.md) — 脆弱性報告ポリシー
+- [SECURITY.md](../SECURITY.md) — 脆弱性報告ポリシー
 - [website/](../website/) — 既存のランディングサイト（Cloudflare Pages 前提）
 
 ---
@@ -348,7 +348,7 @@ Donation is optional and does not affect features or roadmap.
       LICENSING.md の決定と一致（LGPL 移行を行う場合は本レーン外の
       別レーンで実施済みであること）
 - [ ] `cargo deny check` — advisory + license + source 全パス
-- [ ] Security audit sign-off — `.github/SECURITY.md` 記載スコープ
+- [ ] Security audit sign-off — `SECURITY.md` 記載スコープ
       （protocol DoS / mod sandbox / save corruption / crash redaction）
       の自己レビュー完了
 

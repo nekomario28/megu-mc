@@ -90,14 +90,15 @@ The toolchain is pinned — `channel = "1.98.0"` in
 
 | package | license |
 |---|---|
-| `megu` (root) | `GPL-3.0-or-later` |
-| all twelve subcrates, including `megu-client-gpu` | `LGPL-3.0-or-later OR GPL-3.0-or-later OR AGPL-3.0-or-later` |
+| `megu` (root) | `LGPL-3.0-or-later` |
+| all twelve subcrates, including `megu-client-gpu` | `LGPL-3.0-or-later` |
 | `client-gpu` direct third-party crates (`wgpu`, `winit`, `pollster`, `bytemuck`) | `MIT OR Apache-2.0` |
 
-Every subcrate manifest declares the triple license in its `[package]`
-table and every source file carries the matching SPDX header. The texts
-ship in the tree: [../LICENSE](../LICENSE),
-[../COPYING.LESSER](../COPYING.LESSER), [../COPYING.AGPL](../COPYING.AGPL)
+Every manifest declares `LGPL-3.0-or-later` in its `[package]` table, and
+source files carry an `SPDX-License-Identifier` header (LGPL-only, or the
+earlier `LGPL OR GPL OR AGPL` grant). The texts ship in the tree:
+[../LICENSE](../LICENSE) (LGPL-3.0, the distribution licence),
+[COPYING.GPL](COPYING.GPL) (the GPL-3.0 companion text LGPLv3 asks for)
 and [../NOTICE](../NOTICE). The reasoning and the third-party inventory
 are [../LICENSING.md](../LICENSING.md) and
 [../THIRD_PARTY.md](../THIRD_PARTY.md);
