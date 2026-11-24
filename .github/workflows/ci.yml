@@ -61,6 +61,7 @@ jobs:
           # README*.md and docs/**/*.md points at a path in this tree, and no
           # pre-release repository links the 404-prone /releases/latest.
           python3 tools/docs_link_audit.py
+          python3 tools/hardcode_guard_audit.py && python3 tests/hardcode_guard_test.py
           # Zero-JAR structural guards: pinned version constants stay routed
           # through megu_core::version, the V767 registry name tables stay
           # index-identical, and the server.properties key tables plus the
