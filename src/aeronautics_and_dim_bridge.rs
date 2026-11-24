@@ -497,6 +497,25 @@ impl DimensionModRuntimeBridge {
         Some(desc)
     }
 
+    /// Build a Create orbital descriptor from the same live dimension type and
+    /// environment profile used by portal and gravity resolution.
+    fn orbital_dimension(&self, dim: DimId) -> Option<create_adapter::orbital::OrbitalDimension> {
+        let desc = self.type_desc_for_dim(dim)?;
+        let env = self
+            .env_by_dim
+            .get(&dim)
+            .or_else(|| self.env_by_name.get(dim.dimension_id()))
+            .cloned()
+            .unwrap_or_else(|| dim_mod::DimensionEnvProfile::derive(&desc, 1.0, false));
+        let atmosphere = create_adapter::aeronautics::AtmospherePhysics::from_env_profile(
+            &env,
+            create_adapter::aeronautics::SEA_LEVEL_AIR_DENSITY,
+        );
+        Some(create_adapter::orbital::OrbitalDimension::from_descriptor(
+            &desc, atmosphere,
+        ))
+    }
+
     /// `dimension_type.coordinate_scale` for a live `DimId` (8.0 for the
     /// Nether, 1.0 when nothing declares otherwise).
     fn coordinate_scale(&self, dim: DimId) -> f64 {
@@ -798,6 +817,26 @@ fn aeronautics_bridge() -> &'static Mutex<AeronauticsRuntimeBridge> {
 fn dimension_mod_bridge() -> &'static Mutex<DimensionModRuntimeBridge> {
     static BRIDGE: OnceLock<Mutex<DimensionModRuntimeBridge>> = OnceLock::new();
     BRIDGE.get_or_init(|| Mutex::new(DimensionModRuntimeBridge::new()))
+}
+
+/// Ensure a live vanilla or custom dimension is registered with the Create
+/// orbital router using its shared dimension and environment descriptors.
+#[cfg(feature = "create-offload")]
+#[allow(dead_code)]
+fn dimension_mod_ensure_orbital_dimension(dim: DimId) -> bool {
+    let descriptor = dimension_mod_bridge()
+        .lock()
+        .ok()
+        .and_then(|bridge| bridge.orbital_dimension(dim));
+    let Some(descriptor) = descriptor else {
+        return false;
+    };
+    mod_offload_bridge()
+        .lock()
+        .unwrap_or_else(|error| error.into_inner())
+        .offload
+        .register_orbital_dimension(dim.raw(), descriptor);
+    true
 }
 
 /// One step for every active airship (`dt` seconds, 0.05 at 20 TPS): each
@@ -1309,6 +1348,14 @@ mod aeronautics_and_dim_bridge_tests {
             assert!(dim.raw() >= 3, "custom dim must own a dynamic slot: {dim:?}");
         }
         assert_eq!(crystal.dimension_id(), "testdim:crystal_caves");
+
+        let orbital = dim_lock()
+            .orbital_dimension(crystal)
+            .expect("custom dimension derives a Create orbital descriptor");
+        assert_eq!(orbital.id, "testdim:crystal_caves");
+        assert_eq!((orbital.min_y, orbital.height), (-64, 384));
+        assert_eq!(orbital.coordinate_scale, 4.0);
+        assert_eq!(orbital.atmosphere.gravity_scale, 1.0);
 
         // Environment profiles: the builtin Ad Astra physics override lands on
         // the Moon; discovered types derive sane defaults elsewhere.

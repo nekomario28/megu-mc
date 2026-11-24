@@ -545,6 +545,11 @@ trait RedstoneWorld {
     fn redstone_block(&self, pos: RsPos) -> RsBlock;
     fn is_redstone_conductor(&self, pos: RsPos) -> bool;
 
+    /// `(min_y, max_y_exclusive)` for the dimension backing this world.
+    fn build_height(&self) -> (i32, i32) {
+        (-64, 320)
+    }
+
     fn is_face_sturdy(&self, pos: RsPos, _face: RsDir) -> bool {
         self.is_redstone_conductor(pos)
     }
@@ -1564,7 +1569,7 @@ impl<W: RedstoneWorld> RsPistonWorld for W {
     }
 
     fn build_height(&self) -> (i32, i32) {
-        (-64, 320)
+        RedstoneWorld::build_height(self)
     }
 }
 
@@ -4831,6 +4836,7 @@ mod p4b_parity_tests {
         // min_y or above max_y - 1, so the resolver fails at the boundary.
         struct Bounded {
             cells: std::collections::BTreeMap<RsPos, RsPushBlock>,
+            bounds: (i32, i32),
         }
         impl RsPistonWorld for Bounded {
             fn piston_block(&self, pos: RsPos) -> RsPushBlock {
@@ -4840,13 +4846,16 @@ mod p4b_parity_tests {
                 })
             }
             fn build_height(&self) -> (i32, i32) {
-                (0, 4)
+                self.bounds
             }
         }
         // Block at min_y pushed down: resolve fails.
         let mut cells = std::collections::BTreeMap::new();
         push_cell(&mut cells, 0, 0, 0, movable());
-        let world = Bounded { cells };
+        let world = Bounded {
+            cells,
+            bounds: (0, 4),
+        };
         assert_eq!(
             rs_piston_resolve(&world, RsPos(0, 1, 0), RsDir::Down, true),
             None,
@@ -4855,7 +4864,10 @@ mod p4b_parity_tests {
         // Block at max_y - 1 pushed up: resolve fails.
         let mut cells = std::collections::BTreeMap::new();
         push_cell(&mut cells, 0, 3, 0, movable());
-        let world = Bounded { cells };
+        let world = Bounded {
+            cells,
+            bounds: (0, 4),
+        };
         assert_eq!(
             rs_piston_resolve(&world, RsPos(0, 2, 0), RsDir::Up, true),
             None,
@@ -4866,11 +4878,32 @@ mod p4b_parity_tests {
         // A cell already outside the world is not pushable at all.
         let mut cells = std::collections::BTreeMap::new();
         push_cell(&mut cells, 0, 4, 0, movable());
-        let world = Bounded { cells };
+        let world = Bounded {
+            cells,
+            bounds: (0, 4),
+        };
         assert_eq!(
             rs_piston_resolve(&world, RsPos(0, 3, 0), RsDir::Up, true),
             None,
             "a block above the build height never moves"
+        );
+
+        // A block above the Overworld ceiling is valid in a tall custom
+        // dimension, and the resolver uses that dimension's own upper bound.
+        let mut cells = std::collections::BTreeMap::new();
+        push_cell(&mut cells, 0, 400, 0, movable());
+        let custom = Bounded {
+            cells: cells.clone(),
+            bounds: (-64, 448),
+        };
+        assert!(rs_piston_resolve(&custom, RsPos(0, 399, 0), RsDir::Up, true).is_some());
+        let overworld_bounds = Bounded {
+            cells,
+            bounds: (-64, 320),
+        };
+        assert_eq!(
+            rs_piston_resolve(&overworld_bounds, RsPos(0, 399, 0), RsDir::Up, true),
+            None
         );
     }
 

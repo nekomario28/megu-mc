@@ -299,6 +299,20 @@ impl OrbitalTransitionRouter {
         self.dims.insert(dim, descriptor);
     }
 
+    /// Ensure a live dimension spec is routable, deriving its canonical id,
+    /// coordinate scale and safe arrival band from the shared descriptor.
+    /// Existing explicit registrations take precedence.
+    pub fn ensure_dimension_from_spec(
+        &mut self,
+        dim: u32,
+        descriptor: &DimTypeDescriptor,
+        atmosphere: AtmospherePhysics,
+    ) -> &OrbitalDimension {
+        self.dims
+            .entry(dim)
+            .or_insert_with(|| OrbitalDimension::from_descriptor(descriptor, atmosphere))
+    }
+
     /// The registered descriptor for `dim`, if any.
     pub fn dimension(&self, dim: u32) -> Option<&OrbitalDimension> {
         self.dims.get(&dim)
@@ -718,5 +732,37 @@ mod tests {
             }
         }
         assert_eq!(fired, 1);
+    }
+
+    #[test]
+    fn dynamically_registered_dimension_routes_with_descriptor_physics() {
+        let desc = DimTypeDescriptor::defaults("modded:sky", -64, 512);
+        let mut router = OrbitalTransitionRouter::new();
+        let atmosphere = AtmospherePhysics::low_gravity(0.38, 0.06);
+        let dimension = router.ensure_dimension_from_spec(3, &desc, atmosphere);
+        assert_eq!(dimension.id, "modded:sky");
+        assert_eq!((dimension.min_y, dimension.height), (-64, 512));
+        assert_eq!(dimension.atmosphere, atmosphere);
+        assert_eq!(router.atmosphere_for(3), atmosphere);
+
+        router.register_rule(
+            OrbitalTransitionRule::new(
+                "overworld_to_sky",
+                0,
+                OrbitalTrigger::AscendCeiling { ceiling_y: 90.0 },
+                3,
+            )
+            .with_spawn_y(180.0),
+        );
+        let (addon, reg) = aero_registry();
+        let mut sub = RigidBodySubWorld::assemble(30, 0, hull(&reg), &reg, Some(&addon), 100.0)
+            .unwrap();
+        sub.pos = [0.0, 100.0, 0.0];
+        let transition = router
+            .step_with_dimension_transitions(&mut sub, 0.05)
+            .expect("registered custom dimension route fires");
+        assert_eq!(transition.to_dim, 3);
+        assert_eq!(transition.to_dim_id, "modded:sky");
+        assert_eq!(sub.parent_dim, 3);
     }
 }

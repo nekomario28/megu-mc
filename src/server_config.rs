@@ -37,6 +37,55 @@ antifullbright = true
 check_ops = false
 "#;
 
+const LIVE_VIEW_DISTANCE_DEFAULT: i32 = 8;
+const LIVE_SIMULATION_DISTANCE_DEFAULT: i32 = 8;
+const LIVE_MAX_PLAYERS_DEFAULT: usize = 20;
+
+static LIVE_VIEW_DISTANCE: std::sync::atomic::AtomicI32 =
+    std::sync::atomic::AtomicI32::new(LIVE_VIEW_DISTANCE_DEFAULT);
+static LIVE_SIMULATION_DISTANCE: std::sync::atomic::AtomicI32 =
+    std::sync::atomic::AtomicI32::new(LIVE_SIMULATION_DISTANCE_DEFAULT);
+static LIVE_MAX_PLAYERS: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(LIVE_MAX_PLAYERS_DEFAULT);
+
+/// Install the effective operator settings after file, server.properties and
+/// environment precedence has been resolved.
+pub(crate) fn apply_runtime_server_config(
+    view_distance: Option<i32>,
+    simulation_distance: Option<i32>,
+    max_players: Option<usize>,
+) {
+    LIVE_VIEW_DISTANCE.store(
+        view_distance.unwrap_or(LIVE_VIEW_DISTANCE_DEFAULT).clamp(2, 32),
+        std::sync::atomic::Ordering::Relaxed,
+    );
+    LIVE_SIMULATION_DISTANCE.store(
+        simulation_distance
+            .unwrap_or(LIVE_SIMULATION_DISTANCE_DEFAULT)
+            .clamp(2, 32),
+        std::sync::atomic::Ordering::Relaxed,
+    );
+    LIVE_MAX_PLAYERS.store(
+        max_players.unwrap_or(LIVE_MAX_PLAYERS_DEFAULT).clamp(1, 1000),
+        std::sync::atomic::Ordering::Relaxed,
+    );
+}
+
+#[allow(dead_code)]
+pub(crate) fn live_view_distance() -> i32 {
+    LIVE_VIEW_DISTANCE.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+#[allow(dead_code)]
+pub(crate) fn live_simulation_distance() -> i32 {
+    LIVE_SIMULATION_DISTANCE.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+#[allow(dead_code)]
+pub(crate) fn live_max_players() -> usize {
+    LIVE_MAX_PLAYERS.load(std::sync::atomic::Ordering::Relaxed)
+}
+
 #[derive(Clone, Debug, PartialEq)]
 enum ServerConfigValue {
     Str(String),
@@ -535,6 +584,17 @@ fn server_config_boot() -> ServerConfigDoc {
             std::env::set_var(env, value);
         }
     }
+    apply_runtime_server_config(
+        std::env::var("MEGU_VIEW_DISTANCE")
+            .ok()
+            .and_then(|value| value.parse().ok()),
+        std::env::var("MEGU_SIMULATION_DISTANCE")
+            .ok()
+            .and_then(|value| value.parse().ok()),
+        std::env::var("MEGU_MAX_PLAYERS")
+            .ok()
+            .and_then(|value| value.parse().ok()),
+    );
     // The environment now carries every file layer, so resolving the ops knobs
     // sees the same values the env-reading consumers do. Reported once, like
     // the unknown-key warnings above.
@@ -888,6 +948,28 @@ pub(crate) fn runtime_ops() -> &'static RuntimeOpsConfig {
 #[cfg(test)]
 mod server_config_tests {
     use super::*;
+
+    #[test]
+    fn live_runtime_accessors_apply_overrides_and_clamps() {
+        assert_eq!(live_view_distance(), LIVE_VIEW_DISTANCE_DEFAULT);
+        assert_eq!(live_simulation_distance(), LIVE_SIMULATION_DISTANCE_DEFAULT);
+        assert_eq!(live_max_players(), LIVE_MAX_PLAYERS_DEFAULT);
+
+        apply_runtime_server_config(Some(1), Some(40), Some(0));
+        assert_eq!(live_view_distance(), 2);
+        assert_eq!(live_simulation_distance(), 32);
+        assert_eq!(live_max_players(), 1);
+
+        apply_runtime_server_config(Some(12), Some(6), Some(200));
+        assert_eq!(live_view_distance(), 12);
+        assert_eq!(live_simulation_distance(), 6);
+        assert_eq!(live_max_players(), 200);
+
+        apply_runtime_server_config(None, None, None);
+        assert_eq!(live_view_distance(), LIVE_VIEW_DISTANCE_DEFAULT);
+        assert_eq!(live_simulation_distance(), LIVE_SIMULATION_DISTANCE_DEFAULT);
+        assert_eq!(live_max_players(), LIVE_MAX_PLAYERS_DEFAULT);
+    }
 
     #[test]
     fn default_file_is_five_switches_with_one_line_comments() {

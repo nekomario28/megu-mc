@@ -402,6 +402,12 @@ struct RedstoneWorldAdapter<'a, W> {
     reg: &'a BReg,
     world: &'a mut W,
     torches: &'a mut BTreeMap<RsPos, RsTorchHistory>,
+    build_height: (i32, i32),
+}
+
+fn redstone_build_height_from_dimension(dim: crate::worldgen::DimId) -> (i32, i32) {
+    let min_y = dim.min_y();
+    (min_y, min_y + dim.height())
 }
 
 #[cfg_attr(not(test), allow(dead_code))]
@@ -411,10 +417,30 @@ impl<'a, W: RedstoneBlockWorld> RedstoneWorldAdapter<'a, W> {
         world: &'a mut W,
         torches: &'a mut BTreeMap<RsPos, RsTorchHistory>,
     ) -> Self {
+        Self::new_with_build_height((-64, 320), reg, world, torches)
+    }
+
+    #[allow(dead_code)]
+    fn new_in_dim(
+        dim: crate::worldgen::DimId,
+        reg: &'a BReg,
+        world: &'a mut W,
+        torches: &'a mut BTreeMap<RsPos, RsTorchHistory>,
+    ) -> Self {
+        Self::new_with_build_height(redstone_build_height_from_dimension(dim), reg, world, torches)
+    }
+
+    fn new_with_build_height(
+        build_height: (i32, i32),
+        reg: &'a BReg,
+        world: &'a mut W,
+        torches: &'a mut BTreeMap<RsPos, RsTorchHistory>,
+    ) -> Self {
         Self {
             reg,
             world,
             torches,
+            build_height,
         }
     }
 
@@ -515,6 +541,10 @@ impl<'a, W: RedstoneBlockWorld> RedstoneWorldAdapter<'a, W> {
 }
 
 impl<W: RedstoneBlockWorld> RedstoneWorld for RedstoneWorldAdapter<'_, W> {
+    fn build_height(&self) -> (i32, i32) {
+        self.build_height
+    }
+
     fn redstone_block(&self, pos: RsPos) -> RsBlock {
         match rs_block_from_state(self.reg, self.world.state_at(pos)) {
             RsBlock::Comparator(comparator) => RsBlock::Comparator(ComparatorBlock {
@@ -647,5 +677,18 @@ fn rs_extend_neighborhood(
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod redstone_world_adapter_tests {
+    use super::*;
+
+    #[test]
+    fn dimension_build_bounds_cover_nether_and_tall_custom_dimensions() {
+        assert_eq!(
+            redstone_build_height_from_dimension(crate::worldgen::DimId::Nether),
+            (0, 256)
+        );
     }
 }
