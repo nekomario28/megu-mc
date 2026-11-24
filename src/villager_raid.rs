@@ -1936,6 +1936,81 @@ fn live_allay_give(eid: i32, player: VillageUuid, item: Stack) -> bool {
     }
 }
 
+/// Vanilla `Allay.mobInteract`'s empty-hand branch: an allay carrying a sample
+/// item returns it whole. The owner bond survives — the allay keeps
+/// associating with the player who fed it.
+#[allow(dead_code)]
+fn live_allay_take(eid: i32) -> Option<Stack> {
+    live_native_mob(eid, "allay")?;
+    let mut states = live_native_utility_states().lock().unwrap_or_else(|e| e.into_inner());
+    let NativeUtilityState::Allay(allay) = states.get_mut(&eid)? else {
+        return None;
+    };
+    allay.held.take()
+}
+
+/// What one routed mob interaction decided. The packet handler applies the
+/// inventory side: consume/damage the held item or absorb a returned stack.
+#[allow(dead_code)] // consumed by the interact-entity packet handler owned by another lane
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) enum MobInteractOutcome {
+    /// An iron ingot healed the golem (+25 HP toward 100): consume one held
+    /// iron_ingot.
+    IronGolemRepaired { hp_after: f32 },
+    /// Shears stripped the snow golem's pumpkin; the carved_pumpkin drop is
+    /// already spawned. Damage the shears by one.
+    SnowGolemSheared,
+    /// The allay accepted one of the held item as its new sample: consume it.
+    AllayItemGiven,
+    /// The allay's held sample went to the player's empty hand.
+    AllayItemTaken(Stack),
+}
+
+/// Unified utility-mob interact dispatch for the `interact`/`useOn` entity
+/// lane. `mob_kind` (bare or `minecraft:`-namespaced) is verified against the
+/// live mob's registry type and the interaction only applies in the mob's own
+/// dimension — a click routed at a different-dimension echo does nothing.
+/// Returns the decision for the caller to apply to the held stack.
+#[allow(dead_code)] // consumed by the interact-entity packet handler owned by another lane
+pub(crate) fn villager_raid_interact_mob(
+    dim: DimId,
+    mob_eid: i32,
+    mob_kind: &str,
+    held_item: &str,
+    player_eid: i32,
+) -> Option<MobInteractOutcome> {
+    let kind = mob_kind.strip_prefix("minecraft:").unwrap_or(mob_kind);
+    let mob = live_native_mob(mob_eid, kind)?;
+    if mob.dim != dim {
+        return None;
+    }
+    let item = held_item.strip_prefix("minecraft:").unwrap_or(held_item);
+    match kind {
+        "iron_golem" if item == "iron_ingot" => {
+            live_iron_golem_repair(mob_eid, true).then(|| MobInteractOutcome::IronGolemRepaired {
+                hp_after: *mob.hp.lock().unwrap_or_else(|e| e.into_inner()),
+            })
+        }
+        "snow_golem" if item == "shears" => {
+            live_snow_golem_shear(mob_eid).then_some(MobInteractOutcome::SnowGolemSheared)
+        }
+        "allay" => {
+            let owner = client_snapshot()
+                .into_iter()
+                .find(|client| client.eid == player_eid)
+                .map(|client| client.uuid)?;
+            if item.is_empty() || item == "air" {
+                live_allay_take(mob_eid).map(MobInteractOutcome::AllayItemTaken)
+            } else {
+                let stack: Stack = (name_to_item(item)?, 1, Vec::new());
+                live_allay_give(mob_eid, owner, stack)
+                    .then_some(MobInteractOutcome::AllayItemGiven)
+            }
+        }
+        _ => None,
+    }
+}
+
 #[allow(dead_code)]
 fn live_allay_note(eid: i32, note: BlockPos, tick: u64) -> bool {
     if live_native_mob(eid, "allay").is_none() { return false; }
@@ -6795,5 +6870,167 @@ mod parity_live_wire_utility_tests {
             }
         }
         assert!(dashed, "steering jump must fire live_camel_dash while unsat");
+    }
+}
+
+#[cfg(test)]
+mod villager_raid_interact_dispatch_tests {
+    use super::*;
+    use crate::effect_tests::client_pair;
+
+    fn push_test_mob(name: &str, dim: DimId, hp: f32) -> Arc<Mob> {
+        let spec = entity_spec_by_name(name).unwrap_or_else(|| panic!("{name} spec"));
+        let mob = new_live_mob(spec.id, dim, (0.5, 70.0, 0.5, 0.0, 0.0), hp, None);
+        mobs().lock().unwrap_or_else(|e| e.into_inner()).push(mob.clone());
+        mob
+    }
+
+    fn push_test_client(eid: i32, uuid: VillageUuid) -> Arc<Client> {
+        let (mut client, _receiver) = client_pair();
+        client.eid = eid;
+        client.uuid = uuid;
+        let client = Arc::new(client);
+        crate::clients()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .push(client.clone());
+        client
+    }
+
+    #[test]
+    fn interact_routes_iron_ingot_to_golem_repair() {
+        let _guard = crate::world_guard();
+        if crate::test_support::isolated_world_test() {
+            return;
+        }
+        let golem = push_test_mob("iron_golem", DimId::Overworld, 50.0);
+        assert_eq!(
+            villager_raid_interact_mob(DimId::Overworld, golem.eid, "iron_golem", "iron_ingot", 7),
+            Some(MobInteractOutcome::IronGolemRepaired { hp_after: 75.0 })
+        );
+        // Repair clamps at the 100 HP cap and refuses a full-health golem.
+        *golem.hp.lock().unwrap_or_else(|e| e.into_inner()) = 90.0;
+        assert_eq!(
+            villager_raid_interact_mob(
+                DimId::Overworld,
+                golem.eid,
+                "minecraft:iron_golem",
+                "minecraft:iron_ingot",
+                7,
+            ),
+            Some(MobInteractOutcome::IronGolemRepaired { hp_after: 100.0 }),
+            "namespaced spellings reach the same route"
+        );
+        assert_eq!(
+            villager_raid_interact_mob(DimId::Overworld, golem.eid, "iron_golem", "iron_ingot", 7),
+            None,
+            "a full-health golem declines the ingot"
+        );
+        // Wrong item, wrong kind, wrong dimension and an unknown eid all miss.
+        assert_eq!(
+            villager_raid_interact_mob(DimId::Overworld, golem.eid, "iron_golem", "stick", 7),
+            None
+        );
+        assert_eq!(
+            villager_raid_interact_mob(DimId::Overworld, golem.eid, "snow_golem", "iron_ingot", 7),
+            None
+        );
+        assert_eq!(
+            villager_raid_interact_mob(DimId::Nether, golem.eid, "iron_golem", "iron_ingot", 7),
+            None,
+            "the interaction stays in the mob's own dimension"
+        );
+        assert_eq!(
+            villager_raid_interact_mob(DimId::Overworld, 9_999_999, "iron_golem", "iron_ingot", 7),
+            None
+        );
+    }
+
+    #[test]
+    fn interact_routes_shears_to_snow_golem_pumpkin() {
+        let _guard = crate::world_guard();
+        if crate::test_support::isolated_world_test() {
+            return;
+        }
+        let golem = push_test_mob("snow_golem", DimId::Overworld, 4.0);
+        let drops_before = drops().lock().unwrap_or_else(|e| e.into_inner()).len();
+        assert_eq!(
+            villager_raid_interact_mob(DimId::Overworld, golem.eid, "snow_golem", "shears", 7),
+            Some(MobInteractOutcome::SnowGolemSheared)
+        );
+        {
+            let drops = drops().lock().unwrap_or_else(|e| e.into_inner());
+            assert_eq!(drops.len(), drops_before + 1, "shearing drops the pumpkin");
+            let pumpkin = name_to_item("carved_pumpkin").expect("carved_pumpkin id");
+            assert_eq!(drops.last().map(|drop| drop.item), Some(pumpkin));
+        }
+        // One pumpkin per golem: a second shear does nothing.
+        assert_eq!(
+            villager_raid_interact_mob(DimId::Overworld, golem.eid, "snow_golem", "shears", 7),
+            None
+        );
+        // Non-shear items do not strip the pumpkin.
+        let fresh = push_test_mob("snow_golem", DimId::Nether, 4.0);
+        assert_eq!(
+            villager_raid_interact_mob(DimId::Nether, fresh.eid, "snow_golem", "iron_ingot", 7),
+            None
+        );
+        assert_eq!(
+            villager_raid_interact_mob(DimId::Nether, fresh.eid, "snow_golem", "shears", 7),
+            Some(MobInteractOutcome::SnowGolemSheared),
+            "the route works outside the Overworld"
+        );
+    }
+
+    #[test]
+    fn interact_routes_allay_give_and_empty_hand_take() {
+        let _guard = crate::world_guard();
+        if crate::test_support::isolated_world_test() {
+            return;
+        }
+        let allay = push_test_mob("allay", DimId::End, 20.0);
+        let owner: VillageUuid = [9; 16];
+        let _client = push_test_client(55_001, owner);
+        let diamond = name_to_item("diamond").expect("diamond id");
+        assert_eq!(
+            villager_raid_interact_mob(DimId::End, allay.eid, "allay", "diamond", 55_001),
+            Some(MobInteractOutcome::AllayItemGiven)
+        );
+        // The sample is held: a second give is refused, matching the
+        // full-hands branch of Allay.mobInteract.
+        assert_eq!(
+            villager_raid_interact_mob(DimId::End, allay.eid, "allay", "emerald", 55_001),
+            None
+        );
+        // The empty hand takes the sample back.
+        assert_eq!(
+            villager_raid_interact_mob(DimId::End, allay.eid, "allay", "air", 55_001),
+            Some(MobInteractOutcome::AllayItemTaken((diamond, 1, Vec::new())))
+        );
+        // Nothing held: an empty hand now returns no outcome either.
+        assert_eq!(
+            villager_raid_interact_mob(DimId::End, allay.eid, "allay", "", 55_001),
+            None
+        );
+        // The owner is resolved through the live client list: an eid with no
+        // client cannot feed or retrieve.
+        assert_eq!(
+            villager_raid_interact_mob(DimId::End, allay.eid, "allay", "diamond", 9_999_999),
+            None
+        );
+        assert_eq!(
+            villager_raid_interact_mob(DimId::End, allay.eid, "allay", "diamond", 55_001),
+            Some(MobInteractOutcome::AllayItemGiven),
+            "give/take works in the End, not just the Overworld"
+        );
+        // An unregistered item name never reaches the allay.
+        live_native_utility_states()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(&allay.eid);
+        assert_eq!(
+            villager_raid_interact_mob(DimId::End, allay.eid, "allay", "not_a_real_item", 55_001),
+            None
+        );
     }
 }

@@ -202,12 +202,16 @@ const MOB_ITEM_PICKUP_RADIUS: f64 = 1.45;
 const JOHNNY_VINDICATOR_FOLLOW_RANGE: f64 = 16.0;
 
 /// One dropped-item entity as a pickup candidate: its entity id, the carried
-/// item's protocol id and its world position for the distance check.
+/// item's protocol id, its dimension and its world position for the distance
+/// check. `dim` keeps a drop on one side of a portal unreachable from the
+/// other — two mobs at the same coordinates in different worlds never race
+/// for it.
 #[cfg_attr(not(test), allow(dead_code))]
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub(crate) struct DroppedItemCandidate {
     pub item_eid: i32,
     pub item_id: i32,
+    pub dim: DimId,
     pub x: f64,
     pub y: f64,
     pub z: f64,
@@ -252,6 +256,7 @@ pub(crate) fn evaluate_mob_item_pickups(
         let (mx, my, mz, ..) = *mob.pos.lock().unwrap_or_else(|e| e.into_inner());
         let nearest = dropped_items
             .iter()
+            .filter(|item| item.dim == mob.dim)
             .filter(|item| !claimed.contains(&item.item_eid))
             .filter_map(|item| {
                 let dist_sq =
@@ -302,6 +307,7 @@ pub(crate) fn select_johnny_vindicator_target(
         .iter()
         .filter(|candidate| {
             candidate.eid != vindicator.eid
+                && candidate.dim == vindicator.dim
                 && entity_spec_by_id(candidate.etype).map(|spec| spec.name)
                     != Some("minecraft:vindicator")
                 && *candidate.hp.lock().unwrap_or_else(|e| e.into_inner()) > 0.0
@@ -319,7 +325,7 @@ pub(crate) fn select_johnny_vindicator_target(
 /// `PersistenceRequired` per accepted pair) and every Johnny vindicator's
 /// hostile target sweep. Returns the accepted pickups and the
 /// attacker -> target eid pairs for the caller to apply.
-#[cfg_attr(not(test), allow(dead_code))]
+#[allow(dead_code)] // driven by mob_fire_and_persistence_tick_step
 pub(crate) fn tick_mob_persistence_and_easter_egg_ai(
     mobs: &mut [Mob],
     dropped_items: &[DroppedItemCandidate],
@@ -333,6 +339,47 @@ pub(crate) fn tick_mob_persistence_and_easter_egg_ai(
         })
         .collect();
     (pickups, johnny_targets)
+}
+
+/// What `mob_fire_and_persistence_tick_step` decided in one server tick.
+#[allow(dead_code)] // consumed by the per-tick mob driver owned by another lane
+#[derive(Clone, Debug, Default, PartialEq)]
+pub(crate) struct MobFireAndPersistenceTickOutcome {
+    /// Mobs that took 1.0 fire damage this tick (`Entity.remainingFireTicks`
+    /// countdown paid out) — the caller applies the damage and hurt animation.
+    pub fire_damaged: Vec<i32>,
+    /// Mob/dropped-item pairs the pickup pass accepted, same dimension only.
+    pub pickups: Vec<MobPickupAccepted>,
+    /// `attacker -> target` eid pairs from Johnny vindicator sweeps.
+    pub johnny_targets: Vec<(i32, i32)>,
+}
+
+/// One server-tick bundle over the mob mechanics this lane shares with
+/// `combat_and_health`: each mob's weapon/environmental burn countdown
+/// (`tick_mob_fire`, keyed by eid — dimension-free by construction), then the
+/// persistence and name-tag easter-egg AI pass. `mob_wet` reports the caller's
+/// `Entity.isInWaterOrRain` read for that mob (in water, or exposed to rain);
+/// fire immunity comes from the vanilla `EntityType.fireImmune` table, so
+/// Nether and fire-resistant mobs count down without ever paying damage.
+#[allow(dead_code)] // consumed by the per-tick mob driver owned by another lane
+pub(crate) fn mob_fire_and_persistence_tick_step(
+    mobs: &mut [Mob],
+    dropped_items: &[DroppedItemCandidate],
+    tick: u64,
+    mob_wet: impl Fn(&Mob) -> bool,
+) -> MobFireAndPersistenceTickOutcome {
+    let fire_damaged = mobs
+        .iter()
+        .filter(|mob| tick_mob_fire(mob.eid, tick, mob_fire_immune(mob.etype), mob_wet(mob)))
+        .map(|mob| mob.eid)
+        .collect();
+    let (pickups, johnny_targets) =
+        tick_mob_persistence_and_easter_egg_ai(mobs, dropped_items);
+    MobFireAndPersistenceTickOutcome {
+        fire_damaged,
+        pickups,
+        johnny_targets,
+    }
 }
 
 fn live_despawn_exempt(mob: &Mob) -> bool {
@@ -1130,6 +1177,7 @@ mod mob_despawn_tests {
         let sword = DroppedItemCandidate {
             item_eid: 78_101,
             item_id: 276,
+            dim: DimId::Overworld,
             x: 0.5,
             y: 70.0,
             z: 0.5,
@@ -1137,6 +1185,7 @@ mod mob_despawn_tests {
         let out_of_reach = DroppedItemCandidate {
             item_eid: 78_102,
             item_id: 1,
+            dim: DimId::Overworld,
             x: 3.0,
             y: 70.0,
             z: 0.0,
@@ -1169,6 +1218,7 @@ mod mob_despawn_tests {
         let item = DroppedItemCandidate {
             item_eid: 78_110,
             item_id: 276,
+            dim: DimId::Overworld,
             x: 0.0,
             y: 70.0,
             z: 0.0,
@@ -1185,6 +1235,7 @@ mod mob_despawn_tests {
         let nan_item = DroppedItemCandidate {
             item_eid: 78_111,
             item_id: 1,
+            dim: DimId::Overworld,
             x: f64::NAN,
             y: 70.0,
             z: 0.0,
@@ -1196,6 +1247,7 @@ mod mob_despawn_tests {
         let second = DroppedItemCandidate {
             item_eid: 78_112,
             item_id: 2,
+            dim: DimId::Overworld,
             x: 0.0,
             y: 70.0,
             z: 0.0,
@@ -1305,6 +1357,7 @@ mod mob_despawn_tests {
         let items = [DroppedItemCandidate {
             item_eid: 78_140,
             item_id: 276,
+            dim: DimId::Overworld,
             x: 0.0,
             y: 70.0,
             z: 0.0,
@@ -1333,5 +1386,133 @@ mod mob_despawn_tests {
             .unwrap_or_else(|e| e.into_inner())
             .remove(&78_040);
         clear_mob_persistence_state(78_041);
+    }
+
+    #[test]
+    fn item_pickup_and_johnny_sweep_never_cross_dimensions() {
+        // A drop in the Nether is invisible to an Overworld mob at the same
+        // coordinates, and vice versa.
+        let mut mobs = vec![
+            mob_at(78_050, (0.0, 70.0, 0.0), DimId::Overworld, "zombie"),
+            mob_at(78_051, (0.0, 70.0, 0.0), DimId::Nether, "zombie"),
+        ];
+        let nether_drop = DroppedItemCandidate {
+            item_eid: 78_150,
+            item_id: 276,
+            dim: DimId::Nether,
+            x: 0.0,
+            y: 70.0,
+            z: 0.0,
+        };
+        let accepted = evaluate_mob_item_pickups(&mut mobs, &[nether_drop], MOB_ITEM_PICKUP_RADIUS);
+        assert_eq!(
+            accepted,
+            [MobPickupAccepted {
+                mob_eid: 78_051,
+                item_eid: 78_150,
+                item_id: 276,
+            }],
+            "only the same-dimension zombie may claim the drop"
+        );
+        clear_mob_persistence_state(78_051);
+
+        // A Johnny vindicator's sweep is dimension-scoped too: sharing
+        // coordinates across a portal is not proximity.
+        mob_custom_names()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(78_052, "Johnny".to_string());
+        let johnny = mob_at(78_052, (0.0, 70.0, 0.0), DimId::Overworld, "vindicator");
+        let nether_cow = mob_at(78_053, (0.0, 70.0, 0.0), DimId::Nether, "cow");
+        assert_eq!(
+            select_johnny_vindicator_target(&johnny, &[nether_cow], 16.0),
+            None,
+            "the Nether cow shares coordinates but not a dimension"
+        );
+        let overworld_cow = mob_at(78_054, (1.0, 70.0, 0.0), DimId::Overworld, "cow");
+        assert_eq!(
+            select_johnny_vindicator_target(&johnny, &[overworld_cow], 16.0),
+            Some(78_054)
+        );
+        mob_custom_names()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(&78_052);
+    }
+
+    #[test]
+    fn fire_and_persistence_step_burns_extinguishes_and_sweeps() {
+        let burn_interval = server_ticks(MOB_BURN_TICK_GT);
+        let zombie_t = name_to_etype("zombie").unwrap();
+        let blaze_t = name_to_etype("blaze").unwrap();
+        let mut mobs = vec![
+            mob_at(78_060, (0.0, 70.0, 0.0), DimId::Nether, "zombie"),
+            mob_at(78_061, (0.0, 70.0, 0.0), DimId::Nether, "blaze"),
+            mob_at(78_062, (0.0, 70.0, 0.0), DimId::Overworld, "vindicator"),
+        ];
+        ignite_mob(78_060, server_ticks(80) as u32);
+        ignite_mob(78_061, server_ticks(80) as u32);
+        ignite_mob(78_062, server_ticks(80) as u32);
+        mob_custom_names()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(78_062, "Johnny".to_string());
+        let items = [DroppedItemCandidate {
+            item_eid: 78_160,
+            item_id: 276,
+            dim: DimId::Nether,
+            x: 0.0,
+            y: 70.0,
+            z: 0.0,
+        }];
+        // A dry tick at the burn interval: the zombie pays 1.0 fire damage,
+        // the blaze counts down fire-immune without paying, and the Johnny
+        // sweep stays inside the Overworld (no target there anyway).
+        let out = mob_fire_and_persistence_tick_step(&mut mobs, &items, burn_interval, |_| false);
+        assert_eq!(out.fire_damaged, [78_060, 78_062]);
+        assert!(mob_fire_immune(blaze_t));
+        assert!(!mob_fire_immune(zombie_t));
+        assert_eq!(mob_fire_ticks_of(78_061), server_ticks(80) as u32 - 1);
+        assert_eq!(
+            out.pickups,
+            [MobPickupAccepted {
+                mob_eid: 78_060,
+                item_eid: 78_160,
+                item_id: 276,
+            }]
+        );
+        // The picked-up item wrote PersistenceRequired on the Nether zombie.
+        assert!(live_despawn_exempt(&mobs[0]));
+        assert!(out.johnny_targets.is_empty());
+
+        // Rain/water exposure extinguishes every burn in any dimension.
+        let out = mob_fire_and_persistence_tick_step(
+            &mut mobs,
+            &items,
+            burn_interval * 2,
+            |_| true,
+        );
+        assert!(out.fire_damaged.is_empty());
+        assert_eq!(mob_fire_ticks_of(78_060), 0);
+        assert_eq!(mob_fire_ticks_of(78_061), 0);
+        assert_eq!(mob_fire_ticks_of(78_062), 0);
+
+        // A Johnny target in the same dimension is reported through the step.
+        mob_custom_names()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(78_062, "Johnny".to_string());
+        mobs.push(mob_at(78_063, (1.0, 70.0, 0.0), DimId::Overworld, "cow"));
+        let out = mob_fire_and_persistence_tick_step(&mut mobs, &items, burn_interval * 3, |_| false);
+        assert_eq!(out.johnny_targets, [(78_062, 78_063)]);
+
+        mob_custom_names()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(&78_062);
+        clear_mob_persistence_state(78_060);
+        extinguish_mob_fire(78_060);
+        extinguish_mob_fire(78_061);
+        extinguish_mob_fire(78_062);
     }
 }

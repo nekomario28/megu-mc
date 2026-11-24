@@ -2529,20 +2529,44 @@ fn eval_limited_crafting_allowed(limited_crafting: bool, recipe_unlocked: bool) 
 
 /// `spawnRadius`: the half-width of the square around the world spawn a
 /// respawning player scatters into.
-#[cfg_attr(not(test), allow(dead_code))]
-fn spawn_radius_blocks() -> i32 {
+#[allow(dead_code)] // read by the respawn path in play_protocol (another lane)
+pub(crate) fn spawn_radius_blocks() -> i32 {
     gamerule_live_value("spawnRadius").max(0)
 }
 
 /// `PlayerRespawnLogic`: a uniform offset in `[-radius, radius]` along each
 /// horizontal axis, drawn from one raw roll.
-#[cfg_attr(not(test), allow(dead_code))]
 fn eval_spawn_offset(radius: i32, random_roll: u32) -> i32 {
     if radius <= 0 {
         return 0;
     }
     let span = (radius * 2 + 1) as u32;
     (random_roll % span) as i32 - radius
+}
+
+/// `PlayerRespawnLogic.getSpawnPosInChunk` reduced to the world-spawn
+/// scatter: an independent uniform draw per horizontal axis inside the
+/// `spawnRadius` square around `world_spawn`. A radius of zero keeps the
+/// spawn point exact. The y stays the caller's resolved value — vanilla's
+/// downward column scan is the chunk-height caller's job — so the respawn
+/// path invokes this in one line: `resolve_world_spawn_pos(spawn,
+/// spawn_radius_blocks(), seed)`.
+#[allow(dead_code)] // consumed by the respawn path in play_protocol (another lane)
+pub(crate) fn resolve_world_spawn_pos(
+    world_spawn: [i32; 3],
+    spawn_radius: i32,
+    rng_seed: u64,
+) -> [i32; 3] {
+    let radius = spawn_radius.max(0);
+    if radius == 0 {
+        return world_spawn;
+    }
+    let mut rng = Lcg::new(rng_seed);
+    [
+        world_spawn[0].saturating_add(eval_spawn_offset(radius, rng.next_i32() as u32)),
+        world_spawn[1],
+        world_spawn[2].saturating_add(eval_spawn_offset(radius, rng.next_i32() as u32)),
+    ]
 }
 
 /// `playersNetherPortalDefaultDelay` / `playersNetherPortalCreativeDelay`:
@@ -4723,7 +4747,7 @@ const BRUSH_GRAVEL_LOOT: &[&str] = &[
     "emerald",
 ];
 
-#[cfg_attr(not(test), allow(dead_code))]
+#[allow(dead_code)]
 struct BrushableBlockState {
     gravel: bool,
     suspicious: bool,
@@ -4731,7 +4755,7 @@ struct BrushableBlockState {
     idle_ticks: u32,
 }
 
-#[cfg_attr(not(test), allow(dead_code))]
+#[allow(dead_code)]
 impl BrushableBlockState {
     fn new(gravel: bool) -> Self {
         Self {
@@ -4923,6 +4947,248 @@ fn copper_lightning_deoxidize_chance(distance: i32) -> f32 {
         return 0.0;
     }
     1.0 - distance as f32 / (COPPER_LIGHTNING_RADIUS as f32 + 1.0)
+}
+
+// ---------- random-tick dispatch (oxidation, leaf/coral & brushable decay) ----------
+
+/// How a weathering-copper family spells its stage names. `copper_block` is
+/// the lone family whose weathered names drop the `_block` suffix
+/// (`exposed_copper`, not `exposed_copper_block`); every other family keeps
+/// its stem at all four stages.
+#[allow(dead_code)]
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum CopperFamily {
+    Block,
+    Stem(&'static str),
+}
+
+/// Parse a weathering-copper block name (bare or `minecraft:`-namespaced)
+/// into `(family, stage, waxed)`. Ores, `raw_copper_block` and names that are
+/// not real 1.21.1 copper blocks — `copper`, `waxed_copper`,
+/// `exposed_copper_block` — parse to None.
+#[allow(dead_code)]
+fn copper_parse(block_name: &str) -> Option<(CopperFamily, CopperOxidationStage, bool)> {
+    let name = block_name.strip_prefix("minecraft:").unwrap_or(block_name);
+    let (waxed, name) = match name.strip_prefix("waxed_") {
+        Some(rest) => (true, rest),
+        None => (false, name),
+    };
+    let (stage, stem) = [
+        ("exposed_", CopperOxidationStage::Exposed),
+        ("weathered_", CopperOxidationStage::Weathered),
+        ("oxidized_", CopperOxidationStage::Oxidized),
+    ]
+    .into_iter()
+    .find_map(|(prefix, stage)| name.strip_prefix(prefix).map(|stem| (stage, stem)))
+    .unwrap_or((CopperOxidationStage::Unaffected, name));
+    let family = match stem {
+        "copper" if stage != CopperOxidationStage::Unaffected => CopperFamily::Block,
+        "copper_block" if stage == CopperOxidationStage::Unaffected => CopperFamily::Block,
+        "chiseled_copper" | "cut_copper" | "cut_copper_slab" | "cut_copper_stairs"
+        | "copper_bulb" | "copper_door" | "copper_grate" | "copper_trapdoor" => {
+            const STEMS: [&str; 8] = [
+                "chiseled_copper", "cut_copper", "cut_copper_slab", "cut_copper_stairs",
+                "copper_bulb", "copper_door", "copper_grate", "copper_trapdoor",
+            ];
+            CopperFamily::Stem(STEMS.iter().find(|s| **s == stem).copied().unwrap())
+        }
+        _ => return None,
+    };
+    Some((family, stage, waxed))
+}
+
+/// Reassemble a copper block name from family, stage and wax — the exact
+/// inverse of `copper_parse` on every real weathering-copper name.
+#[allow(dead_code)]
+fn copper_block_name(family: CopperFamily, stage: CopperOxidationStage, waxed: bool) -> String {
+    let prefix = match stage {
+        CopperOxidationStage::Unaffected => "",
+        CopperOxidationStage::Exposed => "exposed_",
+        CopperOxidationStage::Weathered => "weathered_",
+        CopperOxidationStage::Oxidized => "oxidized_",
+    };
+    let stem = match family {
+        CopperFamily::Block if stage == CopperOxidationStage::Unaffected => "copper_block",
+        CopperFamily::Block => "copper",
+        CopperFamily::Stem(stem) => stem,
+    };
+    format!("{}{}{}", if waxed { "waxed_" } else { "" }, prefix, stem)
+}
+
+/// The 20 living coral block names — five `tube`/`brain`/`bubble`/`fire`/
+/// `horn` species across the solid block, plant, fan and wall-fan families —
+/// map to their `dead_` twins. Anything else (including already-dead coral)
+/// is None.
+#[allow(dead_code)]
+fn living_coral_dead_name(block_name: &str) -> Option<String> {
+    let name = block_name.strip_prefix("minecraft:").unwrap_or(block_name);
+    if name.starts_with("dead_") {
+        return None;
+    }
+    let rest = ["tube", "brain", "bubble", "fire", "horn"]
+        .into_iter()
+        .find_map(|species| name.strip_prefix(species))?;
+    matches!(rest, "_coral" | "_coral_block" | "_coral_fan" | "_coral_wall_fan")
+        .then(|| format!("dead_{name}"))
+}
+
+/// `BaseCoralPlantTypeBlock.isInWater`: the cell is a water block or carries
+/// `waterlogged=true`.
+#[allow(dead_code)]
+fn coral_cell_is_water(reg: &crate::block_registry::BReg, st: u32) -> bool {
+    reg.name_of(st) == "minecraft:water"
+        || reg.get_prop(st, "waterlogged").as_deref() == Some("true")
+}
+
+/// Suspicious-block brush state per position, keyed by dimension so a Nether
+/// dig site's progress can never alias the Overworld's. Entries live only
+/// while a brush left progress on the block; a settled or untouched block
+/// drops its entry rather than growing the map.
+type BrushableStates = Mutex<HashMap<(DimId, i32, i32, i32), BrushableBlockState>>;
+
+#[allow(dead_code)]
+fn brushable_tick_states() -> &'static BrushableStates {
+    static STATES: OnceLock<BrushableStates> = OnceLock::new();
+    STATES.get_or_init(Mutex::default)
+}
+
+/// What `player_mechanisms_random_block_tick` did with the sampled block.
+#[allow(dead_code)] // consumed by the shared random-tick dispatch (another lane)
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) enum RandomBlockTickOutcome {
+    /// An unwaxed copper block advanced one oxidation stage; the new state is
+    /// already written with the old state's properties preserved.
+    CopperOxidized {
+        from: CopperOxidationStage,
+        to: CopperOxidationStage,
+    },
+    /// A non-persistent leaf at `distance=7` decayed to air; `dropped_item`
+    /// reports whether the one-in-twenty loot drop also spawned.
+    LeafDecayed { dropped_item: bool },
+    /// A living coral found no water and became its dead variant.
+    CoralDied,
+    /// Idle suspicious sand/gravel shed one brush-progress stage.
+    BrushProgressDecayed { remaining: u8 },
+    /// The block belongs to a handled family but stayed unchanged this tick —
+    /// waxed or fully oxidized copper, a surviving leaf or hydrated coral, an
+    /// untouched or still-idle brushable.
+    NoChange,
+}
+
+/// Random-tick dispatch for the block mechanics this file owns, ready to be
+/// called from the shared random-tick pass. `block_name` (bare or
+/// `minecraft:`-namespaced) selects the arm; each world-writing arm re-verifies
+/// the live state before mutating, so a stale sample degrades to `NoChange`
+/// instead of corrupting the cell. Every arm is dimension-scoped — nothing is
+/// hardcoded to the Overworld.
+///
+/// Handled: `*_leaves` (delegates to `leaf_random_tick`), the 20 living coral
+/// names (`CoralBlock`/`BaseCoralPlantTypeBlock` water scans), the
+/// weathering-copper families (`WeatheringCopper.randomTick`), and
+/// `suspicious_sand`/`suspicious_gravel` idle brush decay. Returns `None` for
+/// every other block so the caller's own table keeps it.
+#[allow(dead_code)] // consumed by the shared random-tick dispatch (another lane)
+pub(crate) fn player_mechanisms_random_block_tick(
+    dim: DimId,
+    x: i32,
+    y: i32,
+    z: i32,
+    block_name: &str,
+    rng: &mut impl FnMut() -> f32,
+) -> Option<RandomBlockTickOutcome> {
+    let name = block_name.strip_prefix("minecraft:").unwrap_or(block_name);
+    if name == "suspicious_sand" || name == "suspicious_gravel" {
+        let key = (dim, x, y, z);
+        let mut states = brushable_tick_states()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let state = states
+            .entry(key)
+            .or_insert_with(|| BrushableBlockState::new(name == "suspicious_gravel"));
+        let before = state.brush_progress;
+        state.tick_decay();
+        let progress = state.brush_progress;
+        if progress == 0 && state.idle_ticks == 0 {
+            states.remove(&key);
+        }
+        return Some(if progress < before {
+            RandomBlockTickOutcome::BrushProgressDecayed { remaining: progress }
+        } else {
+            RandomBlockTickOutcome::NoChange
+        });
+    }
+    let reg = crate::block_registry::breg()?;
+    let st = block_at_cached_dim(dim, x, y, z);
+    let live_name = reg
+        .name_of(st)
+        .strip_prefix("minecraft:")
+        .unwrap_or_else(|| reg.name_of(st));
+    if name.ends_with("_leaves") {
+        if !live_name.ends_with("_leaves") {
+            return Some(RandomBlockTickOutcome::NoChange);
+        }
+        let drops_before = drops().lock().unwrap_or_else(|e| e.into_inner()).len();
+        leaf_random_tick(reg, dim, x, y, z, st);
+        if block_at_cached_dim(dim, x, y, z) == st {
+            return Some(RandomBlockTickOutcome::NoChange);
+        }
+        let dropped_item = drops().lock().unwrap_or_else(|e| e.into_inner()).len() > drops_before;
+        return Some(RandomBlockTickOutcome::LeafDecayed { dropped_item });
+    }
+    if living_coral_dead_name(name).is_some() {
+        let Some(dead_name) = living_coral_dead_name(live_name) else {
+            return Some(RandomBlockTickOutcome::NoChange);
+        };
+        // `CoralBlock.scanForWater` checks all six neighbors; the plant/fan
+        // families check their own cell plus the four horizontal neighbors.
+        let is_coral_block = live_name.ends_with("_coral_block");
+        let offsets: &[(i32, i32, i32)] = if is_coral_block {
+            &[
+                (1, 0, 0),
+                (-1, 0, 0),
+                (0, 1, 0),
+                (0, -1, 0),
+                (0, 0, 1),
+                (0, 0, -1),
+            ]
+        } else {
+            &[(1, 0, 0), (-1, 0, 0), (0, 0, 1), (0, 0, -1)]
+        };
+        let hydrated = (!is_coral_block && coral_cell_is_water(reg, st))
+            || offsets.iter().any(|&(dx, dy, dz)| {
+                coral_cell_is_water(reg, block_at_cached_dim(dim, x + dx, y + dy, z + dz))
+            });
+        if hydrated {
+            return Some(RandomBlockTickOutcome::NoChange);
+        }
+        let props = reg.properties_of(st).unwrap_or_default();
+        let dead_st = reg.checked_state(&dead_name, &props)?;
+        set_block_dim(dim, x, y, z, dead_st);
+        note_block_update_dim(dim, x, y, z, dead_st);
+        return Some(RandomBlockTickOutcome::CoralDied);
+    }
+    if copper_parse(name).is_some() {
+        // The live state is authoritative for the write: parse its stage so a
+        // stale `block_name` cannot rewind a more-oxidized block.
+        let Some((family, stage, waxed)) = copper_parse(live_name) else {
+            return Some(RandomBlockTickOutcome::NoChange);
+        };
+        let mut copper = CopperBlockState { stage, waxed };
+        copper.oxidation_tick(rng());
+        if copper.stage == stage {
+            return Some(RandomBlockTickOutcome::NoChange);
+        }
+        let new_name = copper_block_name(family, copper.stage, waxed);
+        let props = reg.properties_of(st).unwrap_or_default();
+        let new_st = reg.checked_state(&new_name, &props)?;
+        set_block_dim(dim, x, y, z, new_st);
+        note_block_update_dim(dim, x, y, z, new_st);
+        return Some(RandomBlockTickOutcome::CopperOxidized {
+            from: stage,
+            to: copper.stage,
+        });
+    }
+    None
 }
 
 #[cfg(test)]
@@ -5207,5 +5473,175 @@ mod vanilla_trials_tests {
         waxed.lightning_strike();
         assert!(waxed.waxed);
         assert_eq!(waxed.stage, Oxidized);
+    }
+}
+
+#[cfg(test)]
+mod player_mechanisms_random_tick_tests {
+    use super::*;
+    use CopperOxidationStage::*;
+
+    #[test]
+    fn resolve_world_spawn_pos_scatters_inside_the_radius_square() {
+        let spawn = [100, 70, -40];
+        assert_eq!(resolve_world_spawn_pos(spawn, 0, 42), spawn);
+        assert_eq!(resolve_world_spawn_pos(spawn, -5, 42), spawn);
+        for seed in 0..500u64 {
+            let [x, y, z] = resolve_world_spawn_pos(spawn, 7, seed);
+            assert!((-7..=7).contains(&(x - spawn[0])), "seed {seed} x {x}");
+            assert_eq!(y, spawn[1], "the scatter never moves y");
+            assert!((-7..=7).contains(&(z - spawn[2])), "seed {seed} z {z}");
+        }
+        // The draw is deterministic per seed and actually varies.
+        assert_eq!(
+            resolve_world_spawn_pos(spawn, 7, 99),
+            resolve_world_spawn_pos(spawn, 7, 99)
+        );
+        let spread: std::collections::HashSet<_> = (0..40u64)
+            .map(|seed| {
+                let [x, _, z] = resolve_world_spawn_pos(spawn, 7, seed);
+                (x, z)
+            })
+            .collect();
+        assert!(spread.len() > 4, "spawn scatter draws distinct offsets");
+    }
+
+    #[test]
+    fn copper_names_parse_and_emit_all_real_weathering_blocks() {
+        let stems = [
+            "copper",
+            "chiseled_copper",
+            "cut_copper",
+            "cut_copper_slab",
+            "cut_copper_stairs",
+            "copper_bulb",
+            "copper_door",
+            "copper_grate",
+            "copper_trapdoor",
+        ];
+        for stem in stems {
+            let unaffected_name = if stem == "copper" { "copper_block" } else { stem };
+            for (i, prefix) in ["", "exposed_", "weathered_", "oxidized_"].iter().enumerate() {
+                let stage = [Unaffected, Exposed, Weathered, Oxidized][i];
+                for waxed in [false, true] {
+                    let name = format!(
+                        "{}{}{}",
+                        if waxed { "waxed_" } else { "" },
+                        prefix,
+                        if prefix.is_empty() { unaffected_name } else { stem }
+                    );
+                    let (family, parsed_stage, parsed_waxed) = copper_parse(&name)
+                        .unwrap_or_else(|| panic!("{name} must parse"));
+                    assert_eq!((parsed_stage, parsed_waxed), (stage, waxed), "{name}");
+                    assert_eq!(copper_block_name(family, parsed_stage, parsed_waxed), name);
+                    assert_eq!(
+                        copper_parse(&format!("minecraft:{name}")),
+                        copper_parse(&name),
+                        "namespaced spellings parse identically"
+                    );
+                }
+            }
+        }
+        // Ores, raw blocks, items and impossible spellings never parse.
+        for name in [
+            "copper",
+            "waxed_copper",
+            "exposed_copper_block",
+            "copper_ore",
+            "deepslate_copper_ore",
+            "raw_copper_block",
+            "copper_ingot",
+            "waxed_waxed_copper",
+            "iron_block",
+            "",
+        ] {
+            assert_eq!(copper_parse(name), None, "{name}");
+        }
+    }
+
+    #[test]
+    fn living_coral_names_map_to_dead_twins_only() {
+        for species in ["tube", "brain", "bubble", "fire", "horn"] {
+            for suffix in ["_coral", "_coral_block", "_coral_fan", "_coral_wall_fan"] {
+                let name = format!("{species}{suffix}");
+                assert_eq!(
+                    living_coral_dead_name(&name).as_deref(),
+                    Some(format!("dead_{name}").as_str()),
+                    "{name}"
+                );
+                assert_eq!(
+                    living_coral_dead_name(&format!("dead_{name}")),
+                    None,
+                    "dead coral stays dead"
+                );
+            }
+        }
+        for name in ["coral", "coral_block", "dead_tube_coral_block", "sea_pickle", "stone", ""] {
+            assert_eq!(living_coral_dead_name(name), None, "{name}");
+        }
+    }
+
+    #[test]
+    fn brushable_dispatch_ticks_decay_and_keeps_the_map_to_live_entries() {
+        let _guard = crate::world_guard();
+        if crate::test_support::isolated_world_test() {
+            return;
+        }
+        let key = (DimId::Nether, 8, 40, -3);
+        {
+            let mut states = brushable_tick_states()
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            let mut state = BrushableBlockState::new(true);
+            for _ in 0..3 {
+                state.brush(0.0);
+            }
+            states.insert(key, state);
+        }
+        let mut rng = || 0.5f32;
+        // Before the interval completes the arm runs the tick but changes
+        // nothing observable.
+        for _ in 0..BRUSH_DECAY_INTERVAL_TICKS - 1 {
+            assert_eq!(
+                player_mechanisms_random_block_tick(
+                    DimId::Nether, 8, 40, -3, "suspicious_gravel", &mut rng
+                ),
+                Some(RandomBlockTickOutcome::NoChange)
+            );
+        }
+        assert_eq!(
+            player_mechanisms_random_block_tick(
+                DimId::Nether, 8, 40, -3, "suspicious_gravel", &mut rng
+            ),
+            Some(RandomBlockTickOutcome::BrushProgressDecayed { remaining: 2 }),
+            "the dispatched tick_decay sheds one stage per interval"
+        );
+        // The entry is dimension-keyed: the same cell in another dimension is
+        // a fresh, unsettled block.
+        assert_eq!(
+            player_mechanisms_random_block_tick(
+                DimId::Overworld, 8, 40, -3, "suspicious_gravel", &mut rng
+            ),
+            Some(RandomBlockTickOutcome::NoChange)
+        );
+        // Drain the remaining progress; the map entry frees itself at zero.
+        for _ in 0..BRUSH_DECAY_INTERVAL_TICKS * 2 {
+            player_mechanisms_random_block_tick(
+                DimId::Nether, 8, 40, -3, "suspicious_gravel", &mut rng,
+            );
+        }
+        assert!(!brushable_tick_states()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .contains_key(&key));
+        assert!(!brushable_tick_states()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .contains_key(&(DimId::Overworld, 8, 40, -3)));
+        // Unhandled block names pass through to the caller's table.
+        assert_eq!(
+            player_mechanisms_random_block_tick(DimId::Nether, 0, 0, 0, "stone", &mut rng),
+            None
+        );
     }
 }

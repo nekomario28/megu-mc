@@ -865,8 +865,9 @@ fn extinguish_mob_fire(eid: i32) {
 /// One server tick of burning on the map store: decrements cleanly, pays
 /// `1.0` HP every `MOB_BURN_TICK_GT` game ticks, never damages a fire-immune
 /// mob, and goes out in water or rain. Returns the fire damage for the tick.
-#[cfg_attr(not(test), allow(dead_code))]
-fn tick_mob_fire(eid: i32, tick: u64, fire_immune: bool, wet: bool) -> bool {
+/// The per-tick driver is `mob_fire_and_persistence_tick_step`.
+#[allow(dead_code)] // driven by mob_fire_and_persistence_tick_step
+pub(crate) fn tick_mob_fire(eid: i32, tick: u64, fire_immune: bool, wet: bool) -> bool {
     let mut map = mob_fire_ticks().lock().unwrap_or_else(|e| e.into_inner());
     if wet {
         map.remove(&eid);
