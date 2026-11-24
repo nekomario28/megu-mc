@@ -757,6 +757,80 @@ version="9.9.9"
 }
 
 #[test]
+fn jar_in_jar_embedded_mod_ids_satisfy_dependencies() {
+    // Create 6.x-style bundling: the outer JAR requires `flywheel`, no
+    // sibling `mods/` entry provides it, but the JarJar member carries
+    // flywheel's own `mods.toml`.
+    let flywheel_nested = jar(&[(
+        "META-INF/neoforge.mods.toml",
+        br#"modLoader="javafml"
+loaderVersion="[4.0.39]"
+license="MIT"
+[[mods]]
+modId="flywheel"
+version="1.0.0"
+"#
+        .as_slice(),
+    )]);
+    let outer_toml = br#"modLoader="javafml"
+loaderVersion="[4.0.39]"
+license="MIT"
+[[mods]]
+modId="create"
+version="6.0.10"
+[[dependencies.create]]
+modId="flywheel"
+type="required"
+versionRange="[1.0.0,)"
+side="BOTH"
+"#;
+    let jarjar_meta = br#"{"jars":[{"identifier":{"group":"com.example","artifact":"flywheel"},"version":{"artifactVersion":"1.0.0","range":"[1.0,)"},"path":"META-INF/jarjar/flywheel.jar"}]}"#;
+    let outer = jar(&[
+        ("META-INF/neoforge.mods.toml", outer_toml.as_slice()),
+        ("META-INF/jarjar/metadata.json", jarjar_meta.as_slice()),
+        ("META-INF/jarjar/flywheel.jar", flywheel_nested.as_slice()),
+    ]);
+
+    let plan = plan_dual_loader_mods_dir([("create-6.0.10.jar", outer.as_slice())]);
+    assert!(
+        plan.missing_dependencies.is_empty(),
+        "embedded flywheel must satisfy the dependency: {:?}",
+        plan.missing_dependencies
+    );
+    let create = plan
+        .unified_mods
+        .iter()
+        .find(|m| m.mod_id == "create")
+        .expect("create planned");
+    assert!(create.embedded_mod_ids.iter().any(|id| id == "flywheel"));
+
+    // Fabric `jars` convention: a nested JAR under `META-INF/jars/` with
+    // its own `fabric.mod.json` satisfies the same way.
+    let inner = jar(&[(
+        "fabric.mod.json",
+        br#"{"schemaVersion":1,"id":"innerlib","version":"1.0.0","environment":"*"}"#.as_slice(),
+    )]);
+    let fab_manifest = br#"{"schemaVersion":1,"id":"outerfab","version":"1.0.0","environment":"*","depends":{"innerlib":">=1.0"},"jars":[{"file":"META-INF/jars/innerlib.jar"}]}"#;
+    let fab_outer = jar(&[
+        ("fabric.mod.json", fab_manifest.as_slice()),
+        ("META-INF/jars/innerlib.jar", inner.as_slice()),
+    ]);
+    let plan = plan_dual_loader_mods_dir([("outerfab.jar", fab_outer.as_slice())]);
+    assert!(
+        plan.missing_dependencies.is_empty(),
+        "fabric bundled dependency must satisfy: {:?}",
+        plan.missing_dependencies
+    );
+    let outerfab = &plan.unified_mods[0];
+    assert!(
+        outerfab
+            .embedded_mod_ids
+            .iter()
+            .any(|id| id == "innerlib")
+    );
+}
+
+#[test]
 fn scanner_rejects_malformed_manifests() {
     // fabric.mod.json missing "id".
     let bad_json = jar(&[("fabric.mod.json", br#"{"version":"1.0"}"#.as_slice())]);

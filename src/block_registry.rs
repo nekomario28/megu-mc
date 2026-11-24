@@ -80,8 +80,8 @@ pub(crate) fn live_create_item_table() -> &'static [(String, Option<String>)] {
                 })
                 .collect();
         items.push((
-            "create:belt".to_string(),
-            Some("create:mechanical_belt".to_string()),
+            "create:mechanical_belt".to_string(),
+            Some("create:belt".to_string()),
         ));
         items.push(("create:wrench".to_string(), None));
         // Processed material items: press/mixer outputs and mixing inputs.

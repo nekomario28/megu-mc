@@ -29,7 +29,9 @@ use mod_adapter_core::version_compat::{
 };
 use mod_offload::recipe_processor::{Recipe, Resource, ResourceKind, Stack};
 
-use crate::blockstates::{core_create_block_defs, CreateBlockRegistry, CreateBlockRole};
+use crate::blockstates::{
+    core_create_block_aliases, core_create_block_defs, CreateBlockRegistry, CreateBlockRole,
+};
 use crate::factory::Axis;
 
 /// A single operation in a data-defined assembly recipe. The resource
@@ -2585,7 +2587,7 @@ pub fn create_registry_with_addons(
     for addon in addons {
         defs.extend(addon.block_defs());
     }
-    BlockRegistry::build(base_state_id, defs)
+    BlockRegistry::build_with_aliases(base_state_id, defs, &core_create_block_aliases())
 }
 
 /// Merge every addon's universal `offload` half into one

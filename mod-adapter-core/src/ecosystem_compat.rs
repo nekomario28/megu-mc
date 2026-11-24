@@ -1861,6 +1861,83 @@ fn parse_toml(text: &str) -> Result<BTreeMap<String, TomlValue>, JarScanError> {
         .map_err(JarScanError::Toml)
 }
 
+/// Every mod id a nested JAR declares through its own loader manifests —
+/// `fabric.mod.json` `id`/`provides`, `quilt.mod.json` `quilt_loader.id`,
+/// or `META-INF/*.mods.toml` `[[mods]] modId`. Called from
+/// [`loader_extensions::scan_jij_level`] so Jar-in-Jar members satisfy
+/// the outer JAR's dependency check. Strictly best-effort by contract:
+/// real Jar-in-Jar payloads include plain library archives carrying no
+/// loader manifest at all, so unreadable members and parse failures
+/// contribute nothing rather than rejecting the outer JAR.
+pub(crate) fn embedded_jar_mod_ids(
+    entries: &[modpack::ZipMemberEntry],
+    jar_bytes: &[u8],
+) -> Vec<String> {
+    let mut ids = Vec::new();
+    for entry in entries {
+        match entry.name.as_str() {
+            "fabric.mod.json" => {
+                let Ok(bytes) = modpack::read_zip_member(jar_bytes, entry, "nested JAR")
+                else {
+                    continue;
+                };
+                let Ok(doc) = parse_json(&bytes) else {
+                    continue;
+                };
+                let Some(obj) = doc.as_object() else {
+                    continue;
+                };
+                if let Some(id) = json_map_str(obj, "id") {
+                    ids.push(id.to_string());
+                }
+                if let Some(provides) = obj.get("provides").and_then(JsonValue::as_array) {
+                    ids.extend(
+                        provides
+                            .iter()
+                            .filter_map(JsonValue::as_str)
+                            .map(str::to_string),
+                    );
+                }
+            }
+            "META-INF/neoforge.mods.toml" | "META-INF/mods.toml" => {
+                let Ok(bytes) = modpack::read_zip_member(jar_bytes, entry, "nested JAR")
+                else {
+                    continue;
+                };
+                let Ok(text) = std::str::from_utf8(&bytes) else {
+                    continue;
+                };
+                let Ok(root) = parse_toml(text) else {
+                    continue;
+                };
+                let Some(mods) = root.get("mods").and_then(TomlValue::as_array) else {
+                    continue;
+                };
+                for m in mods {
+                    if let Some(id) = m
+                        .as_table()
+                        .and_then(|t| t.get("modId"))
+                        .and_then(TomlValue::as_str)
+                    {
+                        ids.push(id.to_string());
+                    }
+                }
+            }
+            "quilt.mod.json" => {
+                let Ok(bytes) = modpack::read_zip_member(jar_bytes, entry, "nested JAR")
+                else {
+                    continue;
+                };
+                if let Ok(meta) = loader_extensions::parse_quilt_mod_json(&bytes) {
+                    ids.push(meta.mod_id);
+                }
+            }
+            _ => {}
+        }
+    }
+    ids
+}
+
 // ---------------------------------------------------------------------------
 // fabric.mod.json extraction
 // ---------------------------------------------------------------------------
@@ -2427,6 +2504,13 @@ pub struct PlannedMod {
     pub mod_id: String,
     /// Every id the JAR claims.
     pub declared_mod_ids: Vec<String>,
+    /// Mod ids this JAR's embedded Jar-in-Jar/Fabric `jars` members
+    /// provide (Create 6.x bundles Flywheel/Ponder/Registrate under
+    /// `META-INF/jarjar/`; Fabric mods use `META-INF/jars/`). They count
+    /// toward `missing_dependencies` satisfaction without appearing in
+    /// `unified_mods` — the server does not execute nested JARs natively,
+    /// but dependency-wise they are present.
+    pub embedded_mod_ids: Vec<String>,
     pub loader: ModLoaderKind,
     pub version: String,
     pub environment: ModEnvironment,
@@ -2515,6 +2599,13 @@ fn planned_from(
         jar_name: jar_name.to_string(),
         mod_id: effective_id,
         declared_mod_ids: declared_ids,
+        embedded_mod_ids: desc
+            .extensions
+            .jar_in_jar
+            .provided_mod_ids
+            .iter()
+            .cloned()
+            .collect(),
         loader: desc.loader,
         version: desc.version.clone(),
         environment: desc.environment,
@@ -2630,10 +2721,20 @@ where
     plan.duplicate_conflicts
         .sort_by(|a, b| a.mod_id.cmp(&b.mod_id));
 
+    // Dependency satisfaction counts every id a live JAR provides,
+    // including mod ids declared only inside its embedded
+    // Jar-in-Jar/`META-INF/jars/` members — bundling a dependency inside
+    // the outer JAR (Create's Flywheel/Ponder/Registrate) satisfies it
+    // exactly like a sibling `mods/` entry.
     let provided: BTreeSet<&str> = plan
         .unified_mods
         .iter()
-        .flat_map(|m| m.declared_mod_ids.iter().map(String::as_str))
+        .flat_map(|m| {
+            m.declared_mod_ids
+                .iter()
+                .chain(m.embedded_mod_ids.iter())
+                .map(String::as_str)
+        })
         .collect();
     for m in &plan.unified_mods {
         for dep in &m.dependencies {

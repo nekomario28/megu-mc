@@ -2484,6 +2484,115 @@ fn live_create_item_block_name(item: i64) -> Option<&'static str> {
     live_create_item_table().get(idx)?.1.as_deref()
 }
 
+/// The armed Create block table for name→state lookups: the
+/// `BReg`-attached registry when vanilla assets are present, else a
+/// cached `core_create_registry` — the table is deterministic, so both
+/// agree on every state id.
+#[cfg(feature = "mod-suite")]
+fn live_create_block_registry(
+) -> Option<&'static create_adapter::blockstates::CreateBlockRegistry> {
+    if !live_create_enabled() {
+        return None;
+    }
+    if let Some(reg) = breg().and_then(|reg| reg.create_registry()) {
+        return Some(reg);
+    }
+    static FALLBACK: OnceLock<create_adapter::blockstates::CreateBlockRegistry> =
+        OnceLock::new();
+    Some(FALLBACK.get_or_init(|| {
+        create_adapter::blockstates::core_create_registry(
+            create_adapter::blockstates::DEFAULT_BASE_STATE_ID,
+        )
+    }))
+}
+
+/// `(block_name, partial_props)` → runtime state id across every live mod
+/// block source: the armed Create registry (alias ids included —
+/// `create:mechanical_belt` → `create:belt`) first, then the boot
+/// [`UnifiedModRegistryPlan`] `MEGU_MODS_DIR` JAR block table — so
+/// `/fill`, `/setblock`, and mod block placement resolve EVERY
+/// data-driven JAR block, not only the hardcoded Create catalog. `None`
+/// for unknown blocks or invalid properties — the same fail-closed
+/// contract `BReg::checked_state` keeps.
+#[cfg(feature = "mod-suite")]
+fn live_mod_state_for_name(name: &str, properties: &[(String, String)]) -> Option<u32> {
+    if let Some(create_reg) = live_create_block_registry() {
+        if let Some(mut st) = create_reg.default_state(name) {
+            for (key, value) in properties {
+                st = create_reg.with_property(st, key, value)?;
+            }
+            return Some(st);
+        }
+    }
+    let suite = live_mod_suite().lock().unwrap_or_else(|e| e.into_inner());
+    suite
+        .registry_plan
+        .as_ref()?
+        .checked_block_state(name, properties)
+}
+
+/// Reverse of [`live_mod_state_for_name`]: the canonical block id a live
+/// plan state resolves to, or `None` for vanilla/Create-catalog ids.
+#[cfg(feature = "mod-suite")]
+#[allow(dead_code)]
+fn live_mod_name_for_state(st: u32) -> Option<String> {
+    let suite = live_mod_suite().lock().unwrap_or_else(|e| e.into_inner());
+    suite
+        .registry_plan
+        .as_ref()?
+        .resolve_block_state(st)
+        .map(|entry| entry.block_id.clone())
+}
+
+/// Canonical `name[k=v]` spelling for a plan state — the MCF2 sidecar's
+/// JAR-table counterpart of `CreateBlockRegistry::encode_canonical`.
+#[cfg(feature = "mod-suite")]
+fn live_mod_state_canonical(st: u32) -> Option<String> {
+    let suite = live_mod_suite().lock().unwrap_or_else(|e| e.into_inner());
+    let entry = suite
+        .registry_plan
+        .as_ref()?
+        .resolve_block_state(st)?;
+    Some(mod_adapter_core::blockstates::format_canonical(
+        &entry.block_id,
+        &entry.properties,
+    ))
+}
+
+/// `name[k=v,...]` argument form of [`live_mod_state_for_name`], shared by
+/// `/fill`/`/clone` (`modification_block_state`), `/setblock`
+/// (`state_from_arg`), and the MCF2 sidecar decoder. Only namespaced
+/// non-`minecraft:` names consult the live mod tables so vanilla
+/// spellings keep their existing resolution order untouched.
+#[cfg(feature = "mod-suite")]
+fn live_mod_state_for_arg(arg: &str) -> Option<u32> {
+    let (name, props) = match arg.split_once('[') {
+        Some((n, rest)) => {
+            let inner = rest.strip_suffix(']')?;
+            let mut pairs = Vec::new();
+            for part in inner.split(',') {
+                let (k, v) = part.split_once('=')?;
+                pairs.push((k.trim().to_string(), v.trim().to_string()));
+            }
+            (n.trim(), pairs)
+        }
+        None => (arg.trim(), Vec::new()),
+    };
+    if !name.contains(':') || name.starts_with("minecraft:") {
+        return None;
+    }
+    live_mod_state_for_name(name, &props)
+}
+
+/// Non-mod-suite stub: no live mod registries exist, so modded names
+/// never resolve.
+#[cfg(not(feature = "mod-suite"))]
+#[allow(dead_code)]
+#[inline(always)]
+fn live_mod_state_for_arg(_arg: &str) -> Option<u32> {
+    None
+}
+
 /// Water check used by the wheel rule. Prefers the live registry name so
 /// waterlogged/fluid renames keep working, with the hardcoded 1.21.1 window
 /// (see [`LIVE_CREATE_WATER_STATES`]) as the no-assets fallback.
@@ -2702,7 +2811,7 @@ impl LiveCreateRuntime {
             Some("create:depot" | "create:basin") => {
                 self.belt_machines.remove(&pos);
             }
-            Some("create:mechanical_belt") => {
+            Some("create:belt") => {
                 self.held.remove(&pos);
             }
             _ => {
@@ -3132,7 +3241,7 @@ fn live_create_wrench_rotate(pos: FactoryPos, clicked: u32) -> Option<u32> {
     .flatten()
 }
 
-/// Right-click on a tracked `create:depot`, `create:mechanical_belt` or
+/// Right-click on a tracked `create:depot`, `create:belt` or
 /// `create:basin` without the wrench. A held item inserts one unit into the
 /// machine's item slot (depot 1, basin 9, belt input 1) and the caller
 /// consumes it like a placement; an empty hand — or any sneak-click —
@@ -3173,7 +3282,7 @@ fn live_create_interact_block(
             return None;
         }
         let id = rt.factory.registry().block_def_for_state(clicked)?.id.as_str();
-        let belt = id == "create:mechanical_belt";
+        let belt = id == "create:belt";
         let depot = id == "create:depot";
         let basin = id == "create:basin";
         if !belt && !depot && !basin {
@@ -3369,6 +3478,39 @@ fn live_create_fnv32(bytes: &[u8]) -> u32 {
     hash
 }
 
+/// MCF2 canonical spelling for a tracked state: the Create registry's
+/// `encode_canonical` first, then the [`UnifiedModRegistryPlan`] JAR block
+/// table (a `create:*` state the core catalog does not own still gets a
+/// name), and finally a deterministic non-empty fallback — a state that
+/// resolves nowhere must never serialize as `""`, which previously made
+/// the whole sidecar fail closed on reload.
+#[cfg(feature = "mod-suite")]
+fn live_create_encode_state(
+    registry: &create_adapter::blockstates::CreateBlockRegistry,
+    st: u32,
+) -> String {
+    if let Some(canon) = registry.encode_canonical(st) {
+        return canon.to_string();
+    }
+    if let Some(canon) = live_mod_state_canonical(st) {
+        return canon;
+    }
+    format!("megu:unresolved_block_state[{st}]")
+}
+
+/// `megu:unresolved_block_state[<id>]` — the non-empty fallback
+/// [`live_create_encode_state`] writes for a state no registry names.
+/// Decoding hands the raw id back so `load_entries` drops the cell
+/// through the ordinary `sync_cell` gate instead of rejecting the whole
+/// sidecar.
+#[cfg(feature = "mod-suite")]
+fn live_create_unresolved_state(canon: &str) -> Option<u32> {
+    canon
+        .strip_prefix("megu:unresolved_block_state[")
+        .and_then(|rest| rest.strip_suffix(']'))
+        .and_then(|num| num.parse::<u32>().ok())
+}
+
 /// Bytes for `create_factory.bin`, or `None` while Create is unarmed —
 /// callers must not write the file in that case.
 #[cfg(feature = "mod-suite")]
@@ -3388,8 +3530,8 @@ fn live_create_serialize() -> Option<Vec<u8>> {
             out.extend_from_slice(&pos.x.to_be_bytes());
             out.extend_from_slice(&pos.y.to_be_bytes());
             out.extend_from_slice(&pos.z.to_be_bytes());
-            let canon = registry.encode_canonical(*st).unwrap_or_default();
-            write_str(&mut out, canon);
+            let canon = live_create_encode_state(&registry, *st);
+            write_str(&mut out, &canon);
             let names: Vec<&'static str> = rt
                 .held
                 .get(pos)
@@ -3460,7 +3602,10 @@ fn live_create_decode_sidecar(
         }
         let canon = std::str::from_utf8(&rest[..strlen as usize]).map_err(|_| ERR)?;
         rest = &rest[strlen as usize..];
-        let st = registry.decode_canonical(canon).ok_or(ERR)?;
+        let st = live_create_unresolved_state(canon)
+            .or_else(|| registry.decode_canonical(canon))
+            .or_else(|| live_mod_state_for_arg(canon))
+            .ok_or(ERR)?;
         let mut items = Vec::new();
         if v2 {
             let item_count = read_varint(&mut rest).ok_or(ERR)?;
@@ -6628,6 +6773,140 @@ version="3.0.0"
         LIVE_CREATE_TEST_GATE.store(1, Ordering::Relaxed);
     }
 
+    /// Every block the JAR block table extracted must resolve through the
+    /// live lookup — `/fill`/`/clone` (`modification_block_state`),
+    /// `/setblock` (`state_from_arg`), and the state→name reverse mapping.
+    #[test]
+    fn wire_mods_generic_blocks_resolve_for_fill_setblock() {
+        let _serial = WIRE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        fresh_suite();
+        LIVE_CREATE_TEST_GATE.store(2, Ordering::Relaxed);
+        let dir = lmb_temp_dir("generic-blocks");
+        let blockstates = br#"{"variants":{"axis=x,waterlogged=false":{"model":"testmod:block/rock"},"axis=y,waterlogged=false":{"model":"testmod:block/rock"},"axis=x,waterlogged=true":{"model":"testmod:block/rock"},"axis=y,waterlogged=true":{"model":"testmod:block/rock"}}}"#;
+        let manifest = lmb_fabric_manifest("testmod");
+        let jar = lmb_test_jar(&[
+            ("fabric.mod.json", manifest.as_slice()),
+            ("assets/testmod/blockstates/rock.json", blockstates),
+        ]);
+        std::fs::write(dir.join("testmod.jar"), &jar).unwrap();
+        let mut suite = LiveModSuite::new();
+        suite.scan_mods_dir(&dir);
+        *live_mod_suite().lock().unwrap_or_else(|e| e.into_inner()) = suite;
+        live_mod_refresh_hook_gate();
+
+        // Partial-property selectors overlay the default state, exactly
+        // like `BReg::checked_state` does for vanilla ids.
+        let rock_y = live_mod_state_for_name(
+            "testmod:rock",
+            &[("axis".to_string(), "y".to_string())],
+        )
+        .expect("testmod:rock y-axis state resolves");
+        assert!(rock_y >= LIVE_MRS_GENERIC_BLOCK_BASE);
+        assert_eq!(
+            live_mod_name_for_state(rock_y).as_deref(),
+            Some("testmod:rock")
+        );
+
+        // `/fill` resolves through `modification_block_state`; `/setblock`
+        // through `state_from_arg` — both must answer the same states.
+        assert_eq!(
+            modification_block_state("testmod:rock[axis=y]"),
+            Some(rock_y)
+        );
+        assert_eq!(state_from_arg("testmod:rock[axis=y]"), Some(rock_y));
+        let rock_default =
+            live_mod_state_for_name("testmod:rock", &[]).expect("default rock state");
+        assert_eq!(state_from_arg("testmod:rock"), Some(rock_default));
+        assert_eq!(
+            modification_block_state("testmod:rock"),
+            Some(rock_default)
+        );
+
+        // Bad properties and unknown blocks still fail closed; vanilla and
+        // unnamespaced names never consult the mod tables.
+        assert_eq!(modification_block_state("testmod:rock[axis=q]"), None);
+        assert_eq!(modification_block_state("testmod:missing"), None);
+        assert_eq!(live_mod_state_for_arg("minecraft:stone"), None);
+        assert_eq!(live_mod_state_for_arg("stone"), None);
+
+        let _ = std::fs::remove_dir_all(&dir);
+        fresh_suite();
+        LIVE_CREATE_TEST_GATE.store(1, Ordering::Relaxed);
+    }
+
+    /// MCF2 must serialize a plan-table (non-core-catalog) state under a
+    /// resolvable canonical name — never `""` — and the decoder must hand
+    /// the same state id back. Before the fix, `encode_canonical` wrote an
+    /// empty string for such states and the reload failed closed on the
+    /// whole sidecar.
+    #[test]
+    fn wire_mods_sidecar_plan_state_survives_roundtrip() {
+        let _serial = WIRE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _world = crate::world_guard();
+        fresh_suite();
+        LIVE_CREATE_TEST_GATE.store(1, Ordering::Relaxed);
+        *live_create_state().lock().unwrap_or_else(|e| e.into_inner()) = None;
+
+        // A minimal plan with one custom block — no real JAR needed.
+        let mut suite = LiveModSuite::new();
+        suite.registry_plan = Some(UnifiedModRegistryPlan {
+            base_block_state_id: LIVE_MRS_GENERIC_BLOCK_BASE,
+            base_item_id: LIVE_MRS_GENERIC_ITEM_BASE,
+            block_states: vec![
+                DynamicBlockStateEntry {
+                    state_id: LIVE_MRS_GENERIC_BLOCK_BASE,
+                    block_id: "mymod:custom_block".to_string(),
+                    properties: vec![("facing".to_string(), "north".to_string())],
+                },
+                DynamicBlockStateEntry {
+                    state_id: LIVE_MRS_GENERIC_BLOCK_BASE + 1,
+                    block_id: "mymod:custom_block".to_string(),
+                    properties: vec![("facing".to_string(), "south".to_string())],
+                },
+            ],
+            items: BTreeMap::new(),
+            content: RegistryContentIndex::default(),
+        });
+        *live_mod_suite().lock().unwrap_or_else(|e| e.into_inner()) = suite;
+        live_mod_refresh_hook_gate();
+
+        // A tracked cell holding the plan state serializes under the
+        // JAR-table canonical name and the decoder returns the same id.
+        let pos = FactoryPos::new(
+            DimId::Overworld.raw() as i32,
+            4_000_001,
+            80,
+            4_000_001,
+        );
+        live_create_with(|rt| {
+            rt.placed.insert(pos, LIVE_MRS_GENERIC_BLOCK_BASE + 1);
+        });
+        let blob = live_create_serialize().expect("armed runtime serializes");
+        let entries = live_create_decode_sidecar(&blob).expect("plan state decodes");
+        assert_eq!(
+            entries
+                .iter()
+                .map(|(p, st, _)| (*p, *st))
+                .collect::<Vec<_>>(),
+            vec![(pos, LIVE_MRS_GENERIC_BLOCK_BASE + 1)]
+        );
+
+        // The truly-unresolvable fallback stays non-empty and decodes to
+        // the raw id rather than corrupting the file.
+        let registry = create_adapter::blockstates::core_create_registry(
+            create_adapter::blockstates::DEFAULT_BASE_STATE_ID,
+        );
+        let unresolvable = u32::MAX - 7;
+        assert!(registry.state(unresolvable).is_none());
+        let fallback = live_create_encode_state(&registry, unresolvable);
+        assert_eq!(fallback, format!("megu:unresolved_block_state[{unresolvable}]"));
+        assert_eq!(live_create_unresolved_state(&fallback), Some(unresolvable));
+
+        fresh_suite();
+        *live_create_state().lock().unwrap_or_else(|e| e.into_inner()) = None;
+        LIVE_CREATE_TEST_GATE.store(0, Ordering::Relaxed);
+    }
+
 }
 
 // ===========================================================================
@@ -6710,9 +6989,13 @@ mod live_create_tests {
         let shaft = live_create_resolve_item("create:shaft").expect("shaft item");
         assert_eq!(live_create_item_name(shaft), Some("create:shaft"));
         assert_eq!(live_create_item_block_name(shaft), Some("create:shaft"));
-        // The belt alias resolves to the mechanical_belt block.
+        // The canonical belt block is `create:belt`; the legacy
+        // `create:mechanical_belt` item stays accepted as an alias.
         let belt = live_create_resolve_item("create:belt").expect("belt item");
-        assert_eq!(live_create_item_block_name(belt), Some("create:mechanical_belt"));
+        assert_eq!(live_create_item_block_name(belt), Some("create:belt"));
+        let legacy = live_create_resolve_item("create:mechanical_belt")
+            .expect("legacy belt item");
+        assert_eq!(live_create_item_block_name(legacy), Some("create:belt"));
         // Processed material items resolve through the same tables but
         // never place a block.
         for item in [
@@ -6757,6 +7040,66 @@ mod live_create_tests {
         assert_eq!(name_to_item("minecraft:stone"), Some(1));
         assert_eq!(live_create_resolve_item("minecraft:stone"), None);
         assert_eq!(live_create_resolve_item("diamond"), None);
+    }
+
+    #[test]
+    fn create_belt_alias_resolves_and_creative_motor_spins() {
+        let _g = world_guard();
+        arm();
+        let reg = registry();
+        // Legacy `create:mechanical_belt` spellings resolve to the same
+        // states as canonical `create:belt` through every lookup surface.
+        let belt = state_of("create:belt", &[("facing", "north")]);
+        assert_eq!(
+            reg.default_state("create:mechanical_belt"),
+            reg.default_state("create:belt")
+        );
+        assert_eq!(
+            live_mod_state_for_name(
+                "create:mechanical_belt",
+                &[("facing".to_string(), "north".to_string())]
+            ),
+            Some(belt)
+        );
+        assert_eq!(
+            live_mod_state_for_arg("create:mechanical_belt[facing=north]"),
+            Some(belt)
+        );
+        assert_eq!(
+            state_from_arg("create:mechanical_belt[facing=north]"),
+            Some(belt)
+        );
+
+        // A creative motor drives an adjacent shaft at its driven RPM —
+        // no water, wind, or contraption required.
+        let (mx, my, mz) = (9_000_008, 80, 900);
+        let (sx, sy, sz) = (9_000_008, 80, 901);
+        clear(mx, my, mz);
+        clear(sx, sy, sz);
+        let motor_st = state_of("create:creative_motor", &[("facing", "north")]);
+        let shaft_st = state_of("create:shaft", &[("axis", "z")]);
+        put(DimId::Overworld, mx, my, mz, motor_st);
+        put(DimId::Overworld, sx, sy, sz, shaft_st);
+        live_create_with(|rt| {
+            let motor = rt
+                .factory
+                .kinetic_solution(pos_of((mx, my, mz)))
+                .expect("motor registers in the kinetic graph");
+            assert!(
+                motor.capacity > 0.0,
+                "creative motor must provide stress capacity"
+            );
+            let shaft = rt
+                .factory
+                .kinetic_solution(pos_of((sx, sy, sz)))
+                .expect("shaft joins the motor's network");
+            assert_eq!(
+                shaft.speed, 256.0,
+                "shaft must spin at the motor's driven RPM"
+            );
+        });
+        clear(mx, my, mz);
+        clear(sx, sy, sz);
     }
 
     #[test]

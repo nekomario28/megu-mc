@@ -34,13 +34,29 @@ pub enum CreateBlockRole {
 /// `BlockRegistry` in `mod-adapter-core`.
 pub type CreateBlockRegistry = BlockRegistry<CreateBlockRole>;
 
-/// Build the default core Create 1.21.1 block catalog (23 blocks).
-pub fn core_create_registry(base_state_id: u32) -> CreateBlockRegistry {
-    BlockRegistry::build(base_state_id, core_create_block_defs())
-        .expect("built-in Create catalog must be valid")
+/// Legacy block ids accepted as aliases of the canonical Create catalog.
+/// `create:mechanical_belt` predates real Create 6.x, which registers the
+/// belt block as `create:belt`; legacy MCF1/MCF2 sidecars and callers
+/// written against the old id keep resolving while `encode_canonical`
+/// always emits the canonical id.
+pub fn core_create_block_aliases() -> Vec<(String, String)> {
+    vec![(
+        "create:mechanical_belt".to_string(),
+        "create:belt".to_string(),
+    )]
 }
 
-/// Built-in Create 1.21.1 core block catalog (23 blocks covering kinetics,
+/// Build the default core Create 1.21.1 block catalog (24 blocks).
+pub fn core_create_registry(base_state_id: u32) -> CreateBlockRegistry {
+    BlockRegistry::build_with_aliases(
+        base_state_id,
+        core_create_block_defs(),
+        &core_create_block_aliases(),
+    )
+    .expect("built-in Create catalog must be valid")
+}
+
+/// Built-in Create 1.21.1 core block catalog (24 blocks covering kinetics,
 /// belts/chutes, processing, fluids, and contraption anchors).
 pub fn core_create_block_defs() -> Vec<BlockDef<CreateBlockRole>> {
     let axis = || PropertyDef::new("axis", &["x", "y", "z"]);
@@ -115,7 +131,16 @@ pub fn core_create_block_defs() -> Vec<BlockDef<CreateBlockRole>> {
             role: CreateBlockRole::Generator { driven_rpm: 16 },
         },
         BlockDef {
-            id: "create:mechanical_belt".into(),
+            // Creative-mode constant-RPM kinetic source — the standard
+            // power supply in Ponder/showcase schematics.
+            id: "create:creative_motor".into(),
+            properties: vec![facing_all()],
+            load_factor: 0.0,
+            capacity_factor: 2048.0,
+            role: CreateBlockRole::Generator { driven_rpm: 256 },
+        },
+        BlockDef {
+            id: "create:belt".into(),
             properties: vec![
                 facing_horiz(),
                 PropertyDef::new("part", &["start", "middle", "end", "pulley"]),
@@ -260,7 +285,7 @@ mod tests {
     #[test]
     fn cartesian_expansion_and_save_v2_remapping_survive_reorder() {
         let base = core_create_registry(DEFAULT_BASE_STATE_ID);
-        assert_eq!(base.block_count(), 23);
+        assert_eq!(base.block_count(), 24);
         let shaft_default = base.default_state("create:shaft").unwrap();
         assert_eq!(
             base.encode_canonical(shaft_default),
@@ -289,5 +314,53 @@ mod tests {
         let remapped = extended.decode_canonical(saved).unwrap();
         assert_ne!(remapped, y_shaft);
         assert_eq!(extended.encode_canonical(remapped), Some(saved));
+    }
+
+    #[test]
+    fn belt_canonical_id_with_legacy_alias_and_creative_motor() {
+        let base = core_create_registry(DEFAULT_BASE_STATE_ID);
+
+        // Real Create 6.x registers `create:belt`; the adapter's historical
+        // `create:mechanical_belt` stays a resolvable alias.
+        let belt = base
+            .decode_canonical(
+                "create:belt[facing=north,part=middle,slope=horizontal,waterlogged=false]",
+            )
+            .expect("canonical belt state");
+        assert_eq!(
+            base.decode_canonical(
+                "create:mechanical_belt[facing=north,part=middle,slope=horizontal,waterlogged=false]",
+            ),
+            Some(belt),
+            "legacy sidecar spellings must land on the canonical belt state"
+        );
+        assert_eq!(
+            base.default_state("create:mechanical_belt"),
+            base.default_state("create:belt")
+        );
+        assert_eq!(
+            base.encode_canonical(belt),
+            Some("create:belt[facing=north,part=middle,slope=horizontal,waterlogged=false]"),
+            "encode always re-emits the canonical id"
+        );
+        assert_eq!(
+            base.block_def("create:mechanical_belt").map(|d| &d.role),
+            Some(&CreateBlockRole::Belt)
+        );
+
+        // The creative motor registers as a constant-RPM stress source.
+        let motor = base
+            .default_state("create:creative_motor")
+            .expect("creative motor registered");
+        assert_eq!(
+            base.encode_canonical(motor),
+            Some("create:creative_motor[facing=north]")
+        );
+        let def = base.block_def("create:creative_motor").unwrap();
+        assert_eq!(
+            def.role,
+            CreateBlockRole::Generator { driven_rpm: 256 }
+        );
+        assert!(def.capacity_factor > 0.0);
     }
 }

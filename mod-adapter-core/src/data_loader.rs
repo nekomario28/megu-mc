@@ -189,9 +189,15 @@ pub fn load_from_stored_zip(
 }
 
 /// Parse a generic Minecraft/NeoForge/Mod recipe JSON into a [`ParsedModRecipe`].
-/// Recognizes standard `ingredients` / `ingredient` / `input` and `results` /
-/// `result` / `output` schemas used across Vanilla, Create, Mekanism, Thermal,
-/// and AE2.
+/// Recognizes the standard `ingredients` / `ingredient` / `input` and
+/// `results` / `result` / `output` schema families used across Vanilla,
+/// Create, Mekanism, Thermal, and AE2 — including Create's data-driven
+/// processing recipes (`create:pressing`/`mixing`/`crushing`/`milling`/
+/// `compacting`/`splashing`/`haunting`/`deploying`/`sequenced_assembly`,
+/// gated by an optional `heat_requirement`/`heatRequirement`), shaped
+/// `pattern`+`key` crafting (`minecraft:crafting_shaped`,
+/// `create:mechanical_crafting`), smithing `template`/`base`/`addition`
+/// slots, and `neoforge:conditional` recipe wrappers.
 pub fn parse_mod_recipe_json(
     recipe_name: &str,
     recipe_id: u32,
@@ -202,35 +208,124 @@ pub fn parse_mod_recipe_json(
     let Some(obj) = root.as_object() else {
         return Ok(None);
     };
-    let Some(recipe_type) = obj.get("type").and_then(JsonValue::as_str) else {
-        return Ok(None);
-    };
+    Ok(parse_mod_recipe_value(recipe_name, recipe_id, obj, ids, 0))
+}
+
+/// Deepest `neoforge:conditional` `recipe` nesting the parser unwraps —
+/// real conditional recipes nest at most one level.
+const MAX_CONDITIONAL_RECIPE_DEPTH: usize = 4;
+
+fn parse_mod_recipe_value(
+    recipe_name: &str,
+    recipe_id: u32,
+    obj: &BTreeMap<String, JsonValue>,
+    ids: &mut ItemFluidIdTable,
+    depth: usize,
+) -> Option<ParsedModRecipe> {
+    let recipe_type = obj.get("type").and_then(JsonValue::as_str)?;
+
+    // NeoForge conditional recipes carry the real recipe object under
+    // `recipe`; the `neoforge:conditions` list only gates whether the
+    // recipe loads, so an unwrapped entry remains a faithful recipe.
+    if recipe_type == "neoforge:conditional" {
+        if depth < MAX_CONDITIONAL_RECIPE_DEPTH {
+            if let Some(inner) = obj.get("recipe").and_then(JsonValue::as_object) {
+                return parse_mod_recipe_value(recipe_name, recipe_id, inner, ids, depth + 1);
+            }
+        }
+        return None;
+    }
 
     let mut inputs = Vec::new();
-    if let Some(arr) = obj.get("ingredients").and_then(JsonValue::as_array) {
-        for item in arr {
-            if let Some(stack) = parse_stack(item, ids) {
-                merge_stack(&mut inputs, stack);
+    for key in ["ingredients", "item_inputs", "fluid_inputs", "inputs"] {
+        if let Some(val) = obj.get(key) {
+            match val.as_array() {
+                Some(arr) => {
+                    for item in arr {
+                        if let Some(stack) = parse_stack(item, ids) {
+                            merge_stack(&mut inputs, stack);
+                        }
+                    }
+                }
+                None => {
+                    // Some schemas serialize a lone ingredient object
+                    // under the plural key.
+                    if let Some(stack) = parse_stack(val, ids) {
+                        merge_stack(&mut inputs, stack);
+                    }
+                }
             }
         }
     }
-    for key in ["ingredient", "input", "item_input", "fluid_input"] {
+    for key in [
+        "ingredient",
+        "input",
+        "item_input",
+        "fluid_input",
+        "input_item",
+        "input_fluid",
+        "itemInput",
+        "fluidInput",
+        "base",
+        "template",
+        "addition",
+    ] {
         if let Some(val) = obj.get(key) {
             if let Some(stack) = parse_stack(val, ids) {
                 merge_stack(&mut inputs, stack);
             }
         }
     }
-
-    let mut outputs = Vec::new();
-    if let Some(arr) = obj.get("results").and_then(JsonValue::as_array) {
-        for item in arr {
-            if let Some(stack) = parse_stack(item, ids) {
-                merge_stack(&mut outputs, stack);
+    // Shaped crafting (`minecraft:crafting_shaped`,
+    // `create:mechanical_crafting`, …): `key` maps pattern symbols to
+    // ingredient objects; every symbol cell in `pattern` consumes one.
+    if let (Some(pattern), Some(key_map)) = (
+        obj.get("pattern").and_then(JsonValue::as_array),
+        obj.get("key").and_then(JsonValue::as_object),
+    ) {
+        for row in pattern {
+            let Some(row) = row.as_str() else {
+                continue;
+            };
+            for symbol in row.chars() {
+                let key_name = symbol.to_string();
+                if let Some(ingredient) = key_map.get(&key_name) {
+                    if let Some(stack) = parse_stack(ingredient, ids) {
+                        merge_stack(&mut inputs, stack);
+                    }
+                }
             }
         }
     }
-    for key in ["result", "output", "main_output"] {
+
+    let mut outputs = Vec::new();
+    for key in ["results", "item_outputs", "fluid_outputs", "outputs"] {
+        if let Some(val) = obj.get(key) {
+            match val.as_array() {
+                Some(arr) => {
+                    for item in arr {
+                        if let Some(stack) = parse_stack(item, ids) {
+                            merge_stack(&mut outputs, stack);
+                        }
+                    }
+                }
+                None => {
+                    if let Some(stack) = parse_stack(val, ids) {
+                        merge_stack(&mut outputs, stack);
+                    }
+                }
+            }
+        }
+    }
+    for key in [
+        "result",
+        "output",
+        "main_output",
+        "item_output",
+        "fluid_output",
+        "itemOutput",
+        "fluidOutput",
+    ] {
         if let Some(val) = obj.get(key) {
             if let Some(stack) = parse_stack(val, ids) {
                 merge_stack(&mut outputs, stack);
@@ -238,7 +333,7 @@ pub fn parse_mod_recipe_json(
         }
     }
     if inputs.is_empty() || outputs.is_empty() {
-        return Ok(None);
+        return None;
     }
 
     let base_ticks = obj
@@ -246,12 +341,13 @@ pub fn parse_mod_recipe_json(
         .or_else(|| obj.get("processingTime"))
         .or_else(|| obj.get("cookingtime"))
         .or_else(|| obj.get("energy"))
+        .or_else(|| obj.get("time"))
         .and_then(JsonValue::as_u64)
         .and_then(|v| u32::try_from(v).ok())
         .filter(|&v| v > 0)
         .unwrap_or(DEFAULT_PROCESSING_TICKS);
 
-    Ok(Some(ParsedModRecipe {
+    Some(ParsedModRecipe {
         name: recipe_name.to_string(),
         recipe_type: recipe_type.to_string(),
         recipe: Recipe {
@@ -260,7 +356,7 @@ pub fn parse_mod_recipe_json(
             inputs,
             outputs,
         },
-    }))
+    })
 }
 
 fn collect_json_files(
@@ -453,7 +549,25 @@ fn parse_stack(val: &JsonValue, ids: &mut ItemFluidIdTable) -> Option<Stack> {
         });
     }
     let obj = val.as_object()?;
-    if let Some(fluid_name) = obj.get("fluid").and_then(JsonValue::as_str) {
+    // `neoforge:compound`/`forge:compound` ingredients are any-of lists —
+    // the first parseable child is the representative stack.
+    if obj
+        .get("type")
+        .and_then(JsonValue::as_str)
+        .is_some_and(|t| t.contains("compound"))
+    {
+        if let Some(children) = obj.get("children").and_then(JsonValue::as_array) {
+            if let Some(stack) = children.iter().find_map(|c| parse_stack(c, ids)) {
+                return Some(stack);
+            }
+        }
+    }
+    if let Some(fluid_name) = obj
+        .get("fluid")
+        .or_else(|| obj.get("fluidTag"))
+        .or_else(|| obj.get("fluid_tag"))
+        .and_then(JsonValue::as_str)
+    {
         let amount = obj
             .get("amount")
             .and_then(JsonValue::as_u64)
@@ -472,7 +586,21 @@ fn parse_stack(val: &JsonValue, ids: &mut ItemFluidIdTable) -> Option<Stack> {
         .get("item")
         .or_else(|| obj.get("id"))
         .or_else(|| obj.get("tag"))
-        .and_then(JsonValue::as_str)?;
+        .and_then(JsonValue::as_str)
+        .or_else(|| {
+            // One level of `{"ingredient": {…}}` unwrapping — Mekanism/
+            // Thermal nest the real ingredient under `ingredient`.
+            obj.get("ingredient").and_then(|inner| {
+                inner.as_str().or_else(|| {
+                    inner.as_object().and_then(|o| {
+                        o.get("item")
+                            .or_else(|| o.get("id"))
+                            .or_else(|| o.get("tag"))
+                            .and_then(JsonValue::as_str)
+                    })
+                })
+            })
+        })?;
     let count = obj
         .get("count")
         .or_else(|| obj.get("amount"))
@@ -804,5 +932,165 @@ mod tests {
         );
         // Non-blockstate JSON is ignored rather than fabricated.
         assert_eq!(parse_blockstate_properties(br#"{"type": "create:pressing"}"#), None);
+    }
+
+    /// `(item_name, amount)` projections of a recipe's stacks, for
+    /// readable assertions.
+    fn stacks_of(stacks: &[Stack], ids: &ItemFluidIdTable) -> Vec<(String, u32)> {
+        stacks
+            .iter()
+            .map(|s| {
+                let name = match s.resource.kind {
+                    ResourceKind::Item => ids
+                        .items
+                        .iter()
+                        .find(|(_, id)| **id == s.resource.id)
+                        .map(|(n, _)| n.clone()),
+                    ResourceKind::Fluid => ids
+                        .fluids
+                        .iter()
+                        .find(|(_, id)| **id == s.resource.id)
+                        .map(|(n, _)| n.clone()),
+                };
+                (name.unwrap_or_else(|| "?".to_string()), s.amount)
+            })
+            .collect()
+    }
+
+    #[test]
+    fn generic_processing_and_shaped_recipe_schemas_parse() {
+        let mut ids = ItemFluidIdTable::new();
+
+        // Real Create 6.x processing recipe: `ingredients` + `results`
+        // (with `chance`) + `processing_time` + `heat_requirement`.
+        let crushing = parse_mod_recipe_json(
+            "create:crushing/iron_ore",
+            1,
+            br#"{"type":"create:crushing","ingredients":[{"tag":"c:ores/iron"}],
+                "processing_time":250,
+                "results":[{"id":"create:crushed_raw_iron","chance":1.0},
+                           {"id":"minecraft:iron_nugget","count":3,"chance":0.75}]}"#
+                .as_slice(),
+            &mut ids,
+        )
+        .unwrap()
+        .expect("create:crushing parses");
+        assert_eq!(crushing.recipe_type, "create:crushing");
+        assert_eq!(crushing.recipe.base_ticks, 250);
+        assert_eq!(crushing.recipe.inputs.len(), 1);
+        assert_eq!(crushing.recipe.outputs.len(), 2);
+
+        // Heat-gated mixer recipe with a fluid ingredient.
+        let mixing = parse_mod_recipe_json(
+            "create:mixing/lava",
+            2,
+            br#"{"type":"create:mixing","heatRequirement":"superheated",
+                "ingredients":[{"item":"minecraft:cobblestone"},
+                               {"fluid":"minecraft:lava","amount":250}],
+                "results":[{"id":"minecraft:obsidian"}]}"#
+                .as_slice(),
+            &mut ids,
+        )
+        .unwrap()
+        .expect("heated create:mixing parses");
+        assert_eq!(mixing.recipe.inputs.len(), 2);
+
+        // Shaped crafting via `pattern`+`key` (`minecraft:crafting_shaped`,
+        // `create:mechanical_crafting`): every symbol cell is an input.
+        let shaped = parse_mod_recipe_json(
+            "create:mechanical_crafting/mechanical_arm",
+            3,
+            br#"{"type":"create:mechanical_crafting","acceptMirrored":false,
+                "key":{"A":{"item":"create:precision_mechanism"},
+                       "B":{"item":"create:brass_sheet"}},
+                "pattern":["A A","ABA","A A"],
+                "result":{"id":"create:mechanical_arm","count":1}}"#
+                .as_slice(),
+            &mut ids,
+        )
+        .unwrap()
+        .expect("shaped recipe parses");
+        let mut inputs = stacks_of(&shaped.recipe.inputs, &ids);
+        inputs.sort();
+        assert_eq!(
+            inputs,
+            vec![
+                ("create:brass_sheet".to_string(), 1),
+                ("create:precision_mechanism".to_string(), 6),
+            ]
+        );
+
+        // Smithing `template`/`base`/`addition` slots are inputs too.
+        let smithing = parse_mod_recipe_json(
+            "minecraft:smithing/netherite",
+            4,
+            br#"{"type":"minecraft:smithing_transform",
+                "template":{"item":"minecraft:netherite_upgrade_smithing_template"},
+                "base":{"item":"minecraft:diamond_chestplate"},
+                "addition":{"item":"minecraft:netherite_ingot"},
+                "result":{"id":"minecraft:netherite_chestplate"}}"#
+                .as_slice(),
+            &mut ids,
+        )
+        .unwrap()
+        .expect("smithing parses");
+        assert_eq!(smithing.recipe.inputs.len(), 3);
+
+        // `neoforge:conditional` wraps the real recipe under `recipe`.
+        let conditional = parse_mod_recipe_json(
+            "example:cond",
+            5,
+            br#"{"type":"neoforge:conditional",
+                "neoforge:conditions":[{"type":"neoforge:mod_loaded","modid":"example"}],
+                "recipe":{"type":"example:pressing",
+                          "ingredients":[{"item":"example:in"}],
+                          "results":[{"id":"example:out"}]}}"#
+                .as_slice(),
+            &mut ids,
+        )
+        .unwrap()
+        .expect("conditional recipe unwraps");
+        assert_eq!(conditional.recipe_type, "example:pressing");
+
+        // `neoforge:compound` ingredient: first parseable child wins.
+        let compound = parse_mod_recipe_json(
+            "example:compound",
+            6,
+            br#"{"type":"example:mix",
+                "ingredients":[{"type":"neoforge:compound",
+                                "children":[{"item":"example:a"},{"item":"example:b"}]}],
+                "results":[{"id":"example:out"}]}"#
+                .as_slice(),
+            &mut ids,
+        )
+        .unwrap()
+        .expect("compound ingredient parses");
+        let inputs = stacks_of(&compound.recipe.inputs, &ids);
+        assert_eq!(inputs, vec![("example:a".to_string(), 1)]);
+
+        // A lone ingredient object under the plural key still parses.
+        let singular = parse_mod_recipe_json(
+            "example:single",
+            7,
+            br#"{"type":"example:press",
+                "ingredients":{"item":"example:in"},
+                "results":{"id":"example:out","count":2}}"#
+                .as_slice(),
+            &mut ids,
+        )
+        .unwrap()
+        .expect("non-array ingredients parse");
+        assert_eq!(stacks_of(&singular.recipe.outputs, &ids),
+            vec![("example:out".to_string(), 2)]);
+
+        // Schemas with no parseable inputs or outputs are still dropped.
+        assert!(parse_mod_recipe_json(
+            "example:none",
+            8,
+            br#"{"type":"example:mystery"}"#.as_slice(),
+            &mut ids,
+        )
+        .unwrap()
+        .is_none());
     }
 }

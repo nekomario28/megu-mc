@@ -89,6 +89,12 @@ pub struct BlockRegistry<R = UniversalBlockRole> {
     base_state_id: u32,
     blocks: Vec<BlockDef<R>>,
     block_by_id: HashMap<String, usize>,
+    /// Alias block id → canonical block id (e.g. `create:mechanical_belt`
+    /// → `create:belt` after a mod rename). Aliases resolve through
+    /// `block_by_id` so `block_def`/`default_state`/`decode_canonical`
+    /// accept them transparently while `encode_canonical`/`blocks()` keep
+    /// the canonical id.
+    aliases: HashMap<String, String>,
     block_default_state: Vec<u32>,
     states: Vec<BlockStateEntry>,
     state_by_canonical: HashMap<String, u32>,
@@ -98,7 +104,41 @@ impl<R> BlockRegistry<R> {
     /// Build a frozen registry from block definitions across any namespaces.
     /// Blocks sort canonically by `(namespace, path)` so load order never
     /// perturbs runtime IDs, and properties expand in NeoForge Cartesian order.
-    pub fn build(base_state_id: u32, mut defs: Vec<BlockDef<R>>) -> Result<Self, RegistryError> {
+    pub fn build(base_state_id: u32, defs: Vec<BlockDef<R>>) -> Result<Self, RegistryError> {
+        Self::build_with_aliases(base_state_id, defs, &[])
+    }
+
+    /// Build a frozen registry additionally accepting `aliases` —
+    /// `(legacy_id, canonical_id)` pairs where `legacy_id` resolves to the
+    /// canonical block's states without owning any. `canonical_id` must
+    /// name a declared block; `alias` must be a valid resource location not
+    /// already claimed by a block or another alias.
+    pub fn build_with_aliases(
+        base_state_id: u32,
+        defs: Vec<BlockDef<R>>,
+        aliases: &[(String, String)],
+    ) -> Result<Self, RegistryError> {
+        let mut reg = Self::build_defs(base_state_id, defs)?;
+        for (alias, canonical) in aliases {
+            if !is_valid_resource_location(alias) {
+                return Err(RegistryError::InvalidBlockId(alias.clone()));
+            }
+            let Some(&idx) = reg.block_by_id.get(canonical) else {
+                return Err(RegistryError::InvalidBlockId(canonical.clone()));
+            };
+            if reg.block_by_id.contains_key(alias) {
+                return Err(RegistryError::DuplicateBlock(alias.clone()));
+            }
+            reg.block_by_id.insert(alias.clone(), idx);
+            reg.aliases.insert(alias.clone(), canonical.clone());
+        }
+        Ok(reg)
+    }
+
+    fn build_defs(
+        base_state_id: u32,
+        mut defs: Vec<BlockDef<R>>,
+    ) -> Result<Self, RegistryError> {
         for def in &defs {
             if !is_valid_resource_location(&def.id) {
                 return Err(RegistryError::InvalidBlockId(def.id.clone()));
@@ -168,6 +208,7 @@ impl<R> BlockRegistry<R> {
             base_state_id,
             blocks: defs,
             block_by_id,
+            aliases: HashMap::new(),
             block_default_state,
             states,
             state_by_canonical,
@@ -219,21 +260,34 @@ impl<R> BlockRegistry<R> {
         self.state(state_id).map(|entry| entry.canonical.as_str())
     }
 
-    /// Resolve a Save v2 canonical string (accepting properties in any order)
-    /// back to the current runtime `state_id`.
+    /// Resolve a Save v2 canonical string (accepting properties in any order
+    /// and declared alias block ids) back to the current runtime
+    /// `state_id`.
     pub fn decode_canonical(&self, text: &str) -> Option<u32> {
         if let Some(&id) = self.state_by_canonical.get(text) {
             return Some(id);
         }
-        let (block_id, rest) = text.split_once('[')?;
+        let (block_id, rest) = match text.split_once('[') {
+            Some(pair) => pair,
+            // A bare block name carries no selectors: answer the block's
+            // default state — same convention vanilla save formats use
+            // when `Properties` is absent. Alias names resolve too.
+            None => return self.default_state(text.trim()),
+        };
         let inner = rest.strip_suffix(']')?;
         let mut pairs = Vec::new();
         for part in inner.split(',') {
             let (k, v) = part.split_once('=')?;
             pairs.push((k.trim().to_string(), v.trim().to_string()));
         }
-        let normalized = format_canonical(block_id.trim(), &pairs);
+        let normalized = format_canonical(self.resolve_alias(block_id.trim()), &pairs);
         self.state_by_canonical.get(&normalized).copied()
+    }
+
+    /// The canonical block id `id` resolves to — `id` itself when it is not
+    /// a declared alias.
+    fn resolve_alias<'a>(&'a self, id: &'a str) -> &'a str {
+        self.aliases.get(id).map(String::as_str).unwrap_or(id)
     }
 
     /// Return the state ID obtained by setting one property to `value`.
@@ -336,5 +390,82 @@ mod tests {
             reg.encode_canonical(mek_adv),
             Some("mekanism:basic_cable[tier=advanced]")
         );
+    }
+
+    #[test]
+    fn alias_ids_resolve_to_canonical_states_and_encode_canonically() {
+        let defs = vec![
+            BlockDef {
+                id: "create:belt".into(),
+                properties: vec![
+                    PropertyDef::new("part", &["start", "middle", "end"]),
+                    PropertyDef::new("facing", &["north", "east"]),
+                ],
+                load_factor: 1.0,
+                capacity_factor: 0.0,
+                role: UniversalBlockRole::Processor,
+            },
+            BlockDef {
+                id: "create:shaft".into(),
+                properties: vec![PropertyDef::new("axis", &["x", "y"])],
+                load_factor: 1.0,
+                capacity_factor: 0.0,
+                role: UniversalBlockRole::Processor,
+            },
+        ];
+        let aliases = vec![
+            (
+                "create:mechanical_belt".to_string(),
+                "create:belt".to_string(),
+            ),
+            ("create:ghost".to_string(), "create:shaft".to_string()),
+        ];
+        let reg = BlockRegistry::build_with_aliases(DEFAULT_BASE_STATE_ID, defs, &aliases)
+            .expect("alias table builds");
+
+        // Legacy spellings decode to the same state as the canonical id.
+        let canonical_state = reg
+            .decode_canonical("create:belt[facing=east,part=middle]")
+            .unwrap();
+        assert_eq!(
+            reg.decode_canonical("create:mechanical_belt[facing=east,part=middle]"),
+            Some(canonical_state)
+        );
+        // …and re-encode under the canonical id for the save format.
+        assert_eq!(
+            reg.encode_canonical(canonical_state),
+            Some("create:belt[facing=east,part=middle]")
+        );
+        // Bare names (alias or canonical) carry no selectors: the default
+        // state answers, matching absent-`Properties` vanilla convention.
+        assert_eq!(
+            reg.decode_canonical("create:mechanical_belt"),
+            reg.default_state("create:belt")
+        );
+        assert_eq!(
+            reg.default_state("create:mechanical_belt"),
+            reg.default_state("create:belt")
+        );
+        assert!(reg.block_def("create:ghost").is_some());
+        assert!(reg.decode_canonical("create:nope").is_none());
+
+        // Alias hygiene: canonical must name a declared block, alias must
+        // not collide with a block id, and duplicates are rejected.
+        assert!(matches!(
+            BlockRegistry::<UniversalBlockRole>::build_with_aliases(
+                DEFAULT_BASE_STATE_ID,
+                Vec::new(),
+                &[("a:b".into(), "a:c".into())],
+            ),
+            Err(RegistryError::InvalidBlockId(_))
+        ));
+        assert!(matches!(
+            BlockRegistry::<UniversalBlockRole>::build_with_aliases(
+                DEFAULT_BASE_STATE_ID,
+                Vec::new(),
+                &[("a b".into(), "a:c".into())],
+            ),
+            Err(RegistryError::InvalidBlockId(_))
+        ));
     }
 }

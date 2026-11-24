@@ -156,6 +156,13 @@ fn state_from_arg(arg: &str) -> Option<u32> {
     if let Some(state) = neoforge_block_state(arg) {
         return Some(state);
     }
+    // Modded names resolve through the same live mod registries `/fill`
+    // consults (`modification_block_state`), so `/setblock` answers every
+    // `create:*`/JAR block identically while vanilla spellings keep the
+    // tables below.
+    if let Some(state) = live_mod_state_for_arg(arg) {
+        return Some(state);
+    }
     let (name, props) = match arg.split_once('[') {
         Some((n, rest)) => (
             n.trim_start_matches("minecraft:").to_string(),
@@ -5328,11 +5335,15 @@ fn modification_block_state(argument: &str) -> Option<u32> {
         if let Some(state) = neoforge_block_state(argument) {
             return Some(state);
         }
-        return registry.checked_state(argument, &[]);
+        return registry
+            .checked_state(argument, &[])
+            .or_else(|| live_mod_state_for_arg(argument));
     };
     let properties = properties.strip_suffix(']')?;
     if properties.is_empty() {
-        return registry.checked_state(name, &[]);
+        return registry
+            .checked_state(name, &[])
+            .or_else(|| live_mod_state_for_arg(argument));
     }
     let properties = properties
         .split(',')
@@ -5341,7 +5352,9 @@ fn modification_block_state(argument: &str) -> Option<u32> {
             Some((key.to_owned(), value.to_owned()))
         })
         .collect::<Option<Vec<_>>>()?;
-    registry.checked_state(name, &properties)
+    registry
+        .checked_state(name, &properties)
+        .or_else(|| live_mod_state_for_arg(argument))
 }
 
 fn run_block_modification(ctx: &CmdCtx, cmd: &str, args: &[&str]) -> Result<String, String> {

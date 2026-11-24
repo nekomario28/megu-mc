@@ -242,6 +242,29 @@ impl UnifiedModRegistryPlan {
             .map(|entry| entry.state_id)
     }
 
+    /// Vanilla `Block.byName` + `BlockState.setValue` semantics over the
+    /// JAR block table: start from the block's default (first expanded)
+    /// state and overlay each named property. Unknown block ids, property
+    /// names, or property values answer `None` — the same fail-closed
+    /// contract the server's `checked_state` keeps, so `/fill`-style
+    /// selectors accept partial property lists.
+    pub fn checked_block_state(
+        &self,
+        block_id: &str,
+        props: &[(String, String)],
+    ) -> Option<u32> {
+        let default = self
+            .block_states
+            .iter()
+            .find(|entry| entry.block_id == block_id)?;
+        let mut merged = default.properties.clone();
+        for (key, value) in props {
+            let slot = merged.iter_mut().find(|(name, _)| name == key)?;
+            slot.1 = value.clone();
+        }
+        self.block_state_id(block_id, &merged)
+    }
+
     pub fn resolve_item(&self, item_id: u32) -> Option<&str> {
         self.items.get(&item_id).map(String::as_str)
     }

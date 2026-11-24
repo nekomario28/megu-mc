@@ -629,20 +629,78 @@ pub struct JarInJarScan {
     pub extracted_members: usize,
     /// Sum of decompressed bytes of all opened embedded-JAR members.
     pub total_member_bytes: u64,
-    /// Deepest nesting level at which JarJar metadata was found.
+    /// Deepest nesting level at which embedded-JAR declarations were found.
     pub max_depth_seen: usize,
+    /// Mod ids the embedded members provide for dependency resolution:
+    /// every nested JAR's loader-manifest ids (`fabric.mod.json` `id` +
+    /// `provides`, `quilt.mod.json` id, `META-INF/*.mods.toml`
+    /// `[[mods]] modId`) plus each JarJar declaration's Maven artifact —
+    /// so bundled libraries like Create's Flywheel/Ponder/Registrate
+    /// satisfy rather than flag missing.
+    pub provided_mod_ids: BTreeSet<String>,
 }
 
 impl JarInJarScan {
     /// `true` when the archive declares no embedded JARs.
     pub fn is_empty(&self) -> bool {
-        self.declared.is_empty()
+        self.declared.is_empty() && self.extracted_members == 0
     }
 }
 
 struct JarInJarBudget {
     count: usize,
     bytes: u64,
+}
+
+/// `fabric.mod.json` `jars[].file` path hygiene: must stay under
+/// `META-INF/` and name a `.jar` member — same traversal discipline as
+/// [`validate_jar_in_jar_path`] without the fixed `jarjar/` prefix.
+fn fabric_nested_jar_path_ok(path: &str) -> bool {
+    path.len() <= 512
+        && path.starts_with("META-INF/")
+        && path.ends_with(".jar")
+        && !path.starts_with('/')
+        && !path.contains('\\')
+        && !path.contains('\0')
+        && !path
+            .split('/')
+            .any(|seg| seg.is_empty() || seg == "." || seg == "..")
+}
+
+/// Every `jars[].file` declared by this level's `fabric.mod.json` —
+/// best-effort: a missing/malformed manifest or `jars` field simply
+/// contributes no entries.
+fn fabric_nested_jar_paths(
+    entries: &[ZipMemberEntry],
+    jar_bytes: &[u8],
+    display: &str,
+) -> Vec<String> {
+    let Some(entry) = entries.iter().find(|e| e.name == "fabric.mod.json") else {
+        return Vec::new();
+    };
+    let Ok(bytes) = modpack::read_zip_member(jar_bytes, entry, display) else {
+        return Vec::new();
+    };
+    let Ok(doc) = parse_json(&bytes) else {
+        return Vec::new();
+    };
+    let Some(jars) = doc
+        .as_object()
+        .and_then(|o| o.get("jars"))
+        .and_then(JsonValue::as_array)
+    else {
+        return Vec::new();
+    };
+    jars.iter()
+        .take(MAX_JAR_IN_JAR_NESTED_JARS)
+        .filter_map(|jar| {
+            jar.as_object()
+                .and_then(|o| o.get("file"))
+                .and_then(JsonValue::as_str)
+        })
+        .filter(|file| fabric_nested_jar_path_ok(file))
+        .map(str::to_string)
+        .collect()
 }
 
 fn scan_jij_level(
@@ -653,31 +711,44 @@ fn scan_jij_level(
     budget: &mut JarInJarBudget,
     scan: &mut JarInJarScan,
 ) -> Result<(), LoaderExtensionError> {
-    let Some(meta_entry) = entries
+    // Embedded-JAR member paths this level declares: NeoForge JarJar
+    // metadata plus the Fabric `jars` convention (mods bundle dependencies
+    // under `META-INF/jars/` without JarJar metadata).
+    let mut member_paths = fabric_nested_jar_paths(entries, jar_bytes, display);
+    let meta_entry = entries
         .iter()
-        .find(|e| e.name == JAR_IN_JAR_METADATA_PATH)
-    else {
+        .find(|e| e.name == JAR_IN_JAR_METADATA_PATH);
+    if meta_entry.is_none() && member_paths.is_empty() {
         return Ok(());
-    };
+    }
     if depth > MAX_JAR_IN_JAR_DEPTH {
         return Err(err(format!(
             "{display}: jarjar metadata nested deeper than {MAX_JAR_IN_JAR_DEPTH} levels"
         )));
     }
     scan.max_depth_seen = scan.max_depth_seen.max(depth);
-    let meta_bytes = modpack::read_zip_member(jar_bytes, meta_entry, display)
-        .map_err(|e| err(format!("{display}: {}", e.reason())))?;
-    let declared = parse_jarjar_metadata(&meta_bytes)
-        .map_err(|e| err(format!("{display}: {}", e.reason())))?;
+    if let Some(meta_entry) = meta_entry {
+        let meta_bytes = modpack::read_zip_member(jar_bytes, meta_entry, display)
+            .map_err(|e| err(format!("{display}: {}", e.reason())))?;
+        let declared = parse_jarjar_metadata(&meta_bytes)
+            .map_err(|e| err(format!("{display}: {}", e.reason())))?;
+        for desc in declared {
+            member_paths.push(desc.path.clone());
+            // The Maven artifact is itself a mod-id candidate for
+            // dependency satisfaction — a bundled library with no loader
+            // manifest of its own still answers `flywheel`-style deps.
+            scan.provided_mod_ids.insert(desc.artifact.clone());
+            scan.declared.push(desc);
+        }
+    }
 
-    for desc in declared {
+    for path in member_paths {
         let member = entries
             .iter()
-            .find(|e| e.name == desc.path)
+            .find(|e| e.name == path)
             .ok_or_else(|| {
                 err(format!(
-                    "{display}: jarjar declares {} but no such member exists",
-                    desc.path
+                    "{display}: jarjar declares {path} but no such member exists",
                 ))
             })?;
         let bytes = modpack::read_zip_member(jar_bytes, member, display)
@@ -700,12 +771,18 @@ fn scan_jij_level(
         // the same global budget.
         let nested_entries = modpack::zip_member_list(&bytes, display).map_err(|e| {
             err(format!(
-                "{display}: nested JAR {}: {}",
-                desc.path,
+                "{display}: nested JAR {path}: {}",
                 e.reason()
             ))
         })?;
-        scan.declared.push(desc);
+        // Every loader manifest inside the nested JAR is a provided mod id
+        // for the outer JAR's dependency check (bundled Flywheel /
+        // Ponder-style libraries satisfy rather than flag missing).
+        scan.provided_mod_ids
+            .extend(crate::ecosystem_compat::embedded_jar_mod_ids(
+                &nested_entries,
+                &bytes,
+            ));
         scan_jij_level(&nested_entries, &bytes, display, depth + 1, budget, scan)?;
     }
     Ok(())
