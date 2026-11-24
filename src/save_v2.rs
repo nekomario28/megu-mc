@@ -8815,15 +8815,16 @@ mod fix_save_tests {
             let mut reg = teams().lock().unwrap_or_else(|e| e.into_inner());
             *reg = TeamRegistry::default();
             reg.add("red", Some("Red Team")).unwrap();
-            let team = reg.teams.get_mut("red").unwrap();
-            team.color = 14;
-            team.friendly_fire = false;
-            team.see_friendly_invisibles = true;
-            team.prefix = "[R]".to_string();
-            team.suffix = "!".to_string();
-            team.nametag_visibility = "hideForOtherTeams".to_string();
-            team.collision_rule = "pushOtherTeams".to_string();
-            drop(team);
+            {
+                let team = reg.teams.get_mut("red").unwrap();
+                team.color = 14;
+                team.friendly_fire = false;
+                team.see_friendly_invisibles = true;
+                team.prefix = "[R]".to_string();
+                team.suffix = "!".to_string();
+                team.nametag_visibility = "hideForOtherTeams".to_string();
+                team.collision_rule = "pushOtherTeams".to_string();
+            }
             reg.join("red", "alice").unwrap();
             reg.join("red", "bob").unwrap();
         }
