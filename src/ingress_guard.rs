@@ -47,20 +47,29 @@ pub(crate) fn valid_movement_frame(packet_id: i64, body: &[u8]) -> bool {
     if body.len() != required {
         return false;
     }
-    let finite = |o: usize| f64::from_be_bytes(body[o..o + 8].try_into().unwrap()).is_finite();
+    let f64_at = |o: usize| {
+        body.get(o..o + 8)
+            .and_then(|s| s.try_into().ok())
+            .map(f64::from_be_bytes)
+    };
     for offset in [0, 8, 16] {
-        if !finite(offset) {
+        let Some(v) = f64_at(offset) else {
             return false;
-        }
-        let v = f64::from_be_bytes(body[offset..offset + 8].try_into().unwrap());
-        if v.abs() > WORLD_BOUND {
+        };
+        if !v.is_finite() || v.abs() > WORLD_BOUND {
             return false;
         }
     }
     if packet_id == MOVE_POS_ROT {
-        let yaw = f32::from_be_bytes(body[24..28].try_into().unwrap());
-        let pitch = f32::from_be_bytes(body[28..32].try_into().unwrap());
-        return yaw.is_finite() && pitch.is_finite();
+        let f32_at = |o: usize| {
+            body.get(o..o + 4)
+                .and_then(|s| s.try_into().ok())
+                .map(f32::from_be_bytes)
+        };
+        return matches!(
+            (f32_at(24), f32_at(28)),
+            (Some(yaw), Some(pitch)) if yaw.is_finite() && pitch.is_finite()
+        );
     }
     true
 }
