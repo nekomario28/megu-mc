@@ -23,6 +23,10 @@ const SERVER_CONFIG_DEFAULT_FILE: &str = r#"# megu settings. Every key is option
 # max_players = 20
 # The Minecraft release this server runs as: "1.21.1" (default) or "26.3".
 # target_version = "1.21.1"
+# Opt-in: real directional sun shadows (the same sun vector the client GPU
+# renders) modulate spawn light, undead burning and crop growth. Off means
+# strict vanilla lighting everywhere.
+# directional_shadow_light = false
 
 [anticheat]
 # Enable or disable movement, fall-damage and placement checks (creative/spectator and ops are skipped by default).
@@ -570,6 +574,10 @@ const SERVER_CONFIG_KEYS: &[(&str, &str)] = &[
     // Vanilla `op-permission-level` — the level a fresh `/op` grants. The
     // properties layer exports the same variable for `op-permission-level`.
     ("op_permission_level", "MEGU_OP_PERMISSION_LEVEL"),
+    // Opt-in directional shadow gameplay (SERVER-DIRECTIONAL-SHADOW-GAMEPLAY):
+    // not a vanilla gamerule, so it fills an env var like every other server
+    // key instead of touching the gamerule table.
+    ("directional_shadow_light", "MEGU_DIRECTIONAL_SHADOW_LIGHT"),
 ];
 
 /// `[anticheat]` keys: the ones in the default file, then old ones that still work
@@ -729,6 +737,16 @@ fn server_config_boot() -> ServerConfigDoc {
     for w in apply_operator_tables(&doc) {
         eprintln!("[config] {}: {w} (skipped)", path.display());
     }
+    // The opt-in directional-shadow lane resolves from the environment the
+    // file layers just populated; single-threaded still, like every other
+    // boot switch. Anything the strict reader cannot parse stays off.
+    directional_shadow_light_set(
+        std::env::var("MEGU_DIRECTIONAL_SHADOW_LIGHT")
+            .ok()
+            .as_deref()
+            .and_then(ops_bool_str)
+            .unwrap_or(false),
+    );
     doc
 }
 
@@ -1250,6 +1268,44 @@ impl RuntimeOpsConfig {
             self.target_version,
             self.version_pack_dir.as_deref().unwrap_or("<bundled>"),
         )
+    }
+}
+
+// ---------- opt-in directional shadow gameplay ----------
+//
+// SERVER-DIRECTIONAL-SHADOW-GAMEPLAY: real 3D sun shadows — the same vector
+// `client-port`'s GPU shadow map renders — feed spawn light, undead burning
+// and crop growth. Strictly opt-in: `false` keeps every light, burn and grow
+// path bit-exact Vanilla 1.21.1, and `sample_directional_shadow` answers
+// without casting a single ray. Not a gamerule, so the vanilla gamerule
+// table and its persistence stay untouched. Layers: `[server]
+// directional_shadow_light` fills `MEGU_DIRECTIONAL_SHADOW_LIGHT` like every
+// other server key, the environment wins, `server_config_boot` resolves the
+// switch below while still single-threaded.
+
+/// The runtime switch. An atomic, not a resolved `RuntimeOpsConfig` field, so
+/// a live admin toggle can flip it without a reboot.
+static DIRECTIONAL_SHADOW_LIGHT: AtomicBool = AtomicBool::new(false);
+
+/// Whether the directional shadow gameplay lane is live right now.
+pub(crate) fn directional_shadow_light_enabled() -> bool {
+    DIRECTIONAL_SHADOW_LIGHT.load(Ordering::Relaxed)
+}
+
+/// The runtime admin toggle: flips the atomic the live probes read, no
+/// reboot needed. `server_config_boot` resolves the boot value through it
+/// and tests flip it directly.
+pub(crate) fn directional_shadow_light_set(on: bool) {
+    DIRECTIONAL_SHADOW_LIGHT.store(on, Ordering::Relaxed);
+}
+
+/// The feature config a probe builds per query: the live switch plus the
+/// tuned defaults (`DirectionalShadowConfig::default` keeps every lane on so
+/// the single switch is the whole policy).
+pub(crate) fn directional_shadow_cfg() -> DirectionalShadowConfig {
+    DirectionalShadowConfig {
+        enabled: directional_shadow_light_enabled(),
+        ..DirectionalShadowConfig::default()
     }
 }
 

@@ -74,6 +74,11 @@ include!("mod_offload_bridge.rs");
 #[cfg(feature = "create-offload")]
 include!("aeronautics_and_dim_bridge.rs");
 include!("live_mod_bridge.rs");
+// SERVER-DIRECTIONAL-SHADOW-GAMEPLAY: the pure solver shares one file with
+// `megu_server_files::directional_shadow`; splicing it in keeps it out of the
+// module-layer graph (a `mod` would be a new node) while the probe sites
+// below call its items unqualified like every other include.
+include!("../server-files/src/directional_shadow.rs");
 
 // ---------- clients (multiplayer visibility) ----------
 use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU64, AtomicU8, AtomicUsize, Ordering};
@@ -1834,7 +1839,91 @@ fn live_light_at(clients: &[Arc<Client>], dim: DimId, x: i32, y: i32, z: i32) ->
         y,
         z,
     );
+    // SERVER-DIRECTIONAL-SHADOW-GAMEPLAY: while the opt-in lane is on, the same
+    // sun ray the client GPU traces decides how much of the sky light is real
+    // sun, and `effective_gameplay_light` folds it together with the block
+    // light nibble and every dynamic emitter (held luminous items, burning
+    // entities, dropped luminous items) into one value. With the switch off —
+    // or the registry unavailable — none of this runs and the answer is the
+    // vanilla `sky.max(block)` below.
+    if dim == DimId::Overworld && directional_shadow_light_enabled() {
+        let cfg = directional_shadow_cfg();
+        if cfg.affect_mob_spawning {
+            if let Some(reg) = breg() {
+                let sample = sample_directional_shadow(
+                    [x, y, z],
+                    WORLD_TIME.load(Ordering::Relaxed),
+                    sky.clamp(0, 15) as u8,
+                    RAINING.load(Ordering::Relaxed) != 0,
+                    &cfg,
+                    |vx, vy, vz| reg.opacity_of(block_at_cached_dim(dim, vx, vy, vz)),
+                );
+                let lights = dynamic_gameplay_lights(reg, clients, dim);
+                return i32::from(effective_gameplay_light(
+                    &sample,
+                    block.clamp(0, 15) as u8,
+                    &lights,
+                    [x, y, z],
+                    &cfg,
+                ));
+            }
+        }
+    }
     sky.max(block)
+}
+
+/// The dynamic emitters `effective_gameplay_light` counts while the opt-in
+/// directional-shadow lane is live: luminous held items on
+/// dimension-resident players (a held torch or lantern — including modded
+/// luminous items, which resolve through `item_to_state` like vanilla's),
+/// dropped luminous items, and burning mobs (an OptiFine-style level-15
+/// emitter). Static emitters stay in the block-light sections; this list is
+/// only what the world grid does not hold.
+fn dynamic_gameplay_lights(
+    reg: &BReg,
+    clients: &[Arc<Client>],
+    dim: DimId,
+) -> Vec<DynamicGameplayLight> {
+    let mut lights = Vec::new();
+    for client in clients {
+        if *client.dim.lock().unwrap_or_else(|e| e.into_inner()) != dim {
+            continue;
+        }
+        let slot = 36 + *client.held.lock().unwrap_or_else(|e| e.into_inner());
+        let level = client
+            .inv
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(&slot)
+            .and_then(|stack| item_to_state(stack.0))
+            .map_or(0, |st| reg.luminance_of(st));
+        if level > 0 {
+            let (x, y, z, ..) = *client.pos.lock().unwrap_or_else(|e| e.into_inner());
+            lights.push(DynamicGameplayLight {
+                pos: [x as f32, (y + 1.0) as f32, z as f32],
+                light_level: level,
+            });
+        }
+    }
+    for item_drop in drops().lock().unwrap_or_else(|e| e.into_inner()).iter() {
+        let level = item_to_state(item_drop.item).map_or(0, |st| reg.luminance_of(st));
+        if level > 0 {
+            lights.push(DynamicGameplayLight {
+                pos: [item_drop.x as f32, item_drop.y as f32, item_drop.z as f32],
+                light_level: level,
+            });
+        }
+    }
+    for mob in mobs().lock().unwrap_or_else(|e| e.into_inner()).iter() {
+        if mob.dim == dim && *mob.fire_ticks.lock().unwrap_or_else(|e| e.into_inner()) > 0 {
+            let (x, y, z, ..) = *mob.pos.lock().unwrap_or_else(|e| e.into_inner());
+            lights.push(DynamicGameplayLight {
+                pos: [x as f32, (y + 0.5) as f32, z as f32],
+                light_level: 15,
+            });
+        }
+    }
+    lights
 }
 
 /// Non-spectator player positions in `dim`, the anchors every pass shares.
@@ -6193,12 +6282,32 @@ fn live_mob_tick_dimension(
                 by + 1 >= height_at(bx, bz) && block_at_cached(bx, by + 2, bz) == 0
             });
             let sky_light = if in_water || raining { 0.0 } else { 1.0 };
-            let sun_burn = match m.etype {
+            let mut sun_burn = match m.etype {
                 91 => skeleton_burns_in_sun(day, sky_visible, sky_light, false),
                 76 => phantom_burns_in_sun(day, sky_visible, sky_light),
                 124 => day && sky_visible && sky_light > 0.5,
                 _ => false,
             };
+            // SERVER-DIRECTIONAL-SHADOW-GAMEPLAY: while the opt-in lane is on,
+            // vanilla's "sky visible" verdict is not enough — the sun ray the
+            // client renders must actually reach the mob's head cell. A zombie
+            // sheltering in a wall or cliff shadow does not catch fire.
+            if sun_burn && dim == DimId::Overworld && directional_shadow_light_enabled() {
+                let cfg = directional_shadow_cfg();
+                if cfg.affect_undead_burn {
+                    if let Some(reg) = breg() {
+                        let sample = sample_directional_shadow(
+                            [bx, by + 1, bz],
+                            WORLD_TIME.load(Ordering::Relaxed),
+                            15,
+                            raining,
+                            &cfg,
+                            |vx, vy, vz| reg.opacity_of(block_at_cached_dim(dim, vx, vy, vz)),
+                        );
+                        sun_burn = shadow_allows_undead_burn(sun_burn, &sample, &cfg);
+                    }
+                }
+            }
             if sun_burn && dim == DimId::Overworld {
                 let sunlight_burn = server_ticks(160) as i32;
                 let mut fire_ticks = m.fire_ticks.lock().unwrap_or_else(|e| e.into_inner());
@@ -10094,8 +10203,33 @@ fn crop_random_tick(
         random_value: world_rng::next_u64() as u32,
     };
     if let Some(new_age) = eval_crop_random_tick(input) {
-        set_block_dim(dim, x, y, z, reg.with_prop(st, "age", &new_age.to_string()));
-        note_block_update_dim(dim, x, y, z, st);
+        // SERVER-DIRECTIONAL-SHADOW-GAMEPLAY: while the opt-in lane is on, a
+        // cell sitting in a real wall or cliff shadow rolls a sub-1.0
+        // multiplier on every successful vanilla growth — shade slows crops
+        // (never below 0.45), torch light exempts the greenhouse outright.
+        let mut allowed = true;
+        if dim == DimId::Overworld && directional_shadow_light_enabled() {
+            let cfg = directional_shadow_cfg();
+            if cfg.affect_crop_growth {
+                let block_light = random_tick_block_light(reg, dim, x, y, z);
+                let vanilla_sky = u8::from(random_tick_sky_exposed(dim, x, y, z)) * 15;
+                let sample = sample_directional_shadow(
+                    [x, y, z],
+                    WORLD_TIME.load(Ordering::Relaxed),
+                    vanilla_sky,
+                    RAINING.load(Ordering::Relaxed) != 0,
+                    &cfg,
+                    |vx, vy, vz| reg.opacity_of(block_at_cached_dim(dim, vx, vy, vz)),
+                );
+                let multiplier = shadow_crop_growth_multiplier(&sample, block_light, &cfg);
+                allowed = multiplier >= 1.0
+                    || world_rng::next_below(1_000_000) as f32 / 1_000_000.0 < multiplier;
+            }
+        }
+        if allowed {
+            set_block_dim(dim, x, y, z, reg.with_prop(st, "age", &new_age.to_string()));
+            note_block_update_dim(dim, x, y, z, st);
+        }
     }
 }
 
@@ -27026,5 +27160,95 @@ mod mega_w2_tests {
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .retain(|m| m.dim != dim);
+    }
+}
+
+#[cfg(test)]
+mod directional_shadow_live_tests {
+    use super::*;
+
+    /// Restores the atomic switch on drop so the boot default survives the
+    /// probe (tests share the process).
+    struct ShadowFlagGuard(bool);
+    impl std::ops::Drop for ShadowFlagGuard {
+        fn drop(&mut self) {
+            DIRECTIONAL_SHADOW_LIGHT.store(self.0, Ordering::Relaxed);
+        }
+    }
+
+    #[test]
+    fn directional_shadow_toggle_defaults_off_and_setter_roundtrips() {
+        // Vanilla parity is the built-in default: the config and the atomic
+        // both start dark.
+        assert!(!DirectionalShadowConfig::default().enabled);
+        let guard = ShadowFlagGuard(DIRECTIONAL_SHADOW_LIGHT.swap(false, Ordering::Relaxed));
+        assert!(!directional_shadow_light_enabled());
+        assert!(!directional_shadow_cfg().enabled);
+        directional_shadow_light_set(true);
+        assert!(directional_shadow_light_enabled());
+        assert!(directional_shadow_cfg().enabled);
+        drop(guard);
+        assert!(!directional_shadow_light_enabled());
+    }
+
+    #[test]
+    fn directional_shadow_undead_burn_shelters_in_shadow_only_when_on() {
+        let cfg = DirectionalShadowConfig {
+            enabled: true,
+            ..DirectionalShadowConfig::default()
+        };
+        let shaded = ShadowSample {
+            direct_sun_fraction: 0.0,
+            occluded_opacity: 15,
+            in_shadow: true,
+            effective_sky_light: 4,
+        };
+        let lit = ShadowSample {
+            direct_sun_fraction: 1.0,
+            occluded_opacity: 0,
+            in_shadow: false,
+            effective_sky_light: 15,
+        };
+        // Sheltered undead do not burn; sunlit ones still do; a vanilla "no"
+        // is never upgraded to a burn.
+        assert!(!shadow_allows_undead_burn(true, &shaded, &cfg));
+        assert!(shadow_allows_undead_burn(true, &lit, &cfg));
+        assert!(!shadow_allows_undead_burn(false, &lit, &cfg));
+        // Lane off is a pure passthrough of the vanilla verdict.
+        let off = DirectionalShadowConfig {
+            enabled: false,
+            ..DirectionalShadowConfig::default()
+        };
+        assert!(shadow_allows_undead_burn(true, &shaded, &off));
+    }
+
+    #[test]
+    fn directional_shadow_spawn_light_drops_in_wall_shadow_and_dynamic_torch_lifts_it() {
+        let cfg = DirectionalShadowConfig {
+            enabled: true,
+            ..DirectionalShadowConfig::default()
+        };
+        assert!(cfg.affect_mob_spawning && cfg.affect_dynamic_lights);
+        // Morning sun (+X) with a solid wall at x=+3: the probe cell is in
+        // real shade, so the spawn-facing light collapses to the shadow cap
+        // even though the vanilla nibble would say 15.
+        let wall = |vx: i32, vy: i32, vz: i32| -> u8 {
+            if vx == 3 && vz == 0 && (64..=80).contains(&vy) {
+                15
+            } else {
+                0
+            }
+        };
+        let shaded = sample_directional_shadow([0, 64, 0], 1_000, 15, false, &cfg, wall);
+        assert!(shaded.in_shadow);
+        let dark = effective_gameplay_light(&shaded, 0, &[], [0, 64, 0], &cfg);
+        assert!(dark <= 4, "shadowed spawn light {dark}");
+        // A held torch two blocks away lifts the same cell to 12 — dynamic
+        // emitters count even inside a deep directional shadow.
+        let torch = [DynamicGameplayLight {
+            pos: [2.5, 64.5, 0.5],
+            light_level: 14,
+        }];
+        assert_eq!(effective_gameplay_light(&shaded, 0, &torch, [0, 64, 0], &cfg), 12);
     }
 }

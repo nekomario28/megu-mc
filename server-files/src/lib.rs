@@ -79,6 +79,7 @@ pub mod atomic;
 pub mod claims;
 pub mod claims_wire;
 pub mod directory;
+pub mod directional_shadow;
 pub mod eula;
 pub mod installer;
 pub mod json;
@@ -109,6 +110,11 @@ pub use directory::{
     ensure_client_game_dir_layout, ensure_server_game_dir_layout, AdmissionDecision,
     FolderOutcome, ServerDirectory, StandardLayoutEntry, StandardLayoutReport,
     CLIENT_STANDARD_FOLDERS, SERVER_STANDARD_FOLDERS,
+};
+pub use directional_shadow::{
+    compute_sun_direction, dynamic_light_level_at, effective_gameplay_light,
+    sample_directional_shadow, shadow_allows_undead_burn, shadow_crop_growth_multiplier,
+    DirectionalShadowConfig, DynamicGameplayLight, ShadowSample,
 };
 pub use eula::{check_eula, write_default_eula, EulaStatus, EULA_FILE, EULA_LINK};
 pub use installer::{
