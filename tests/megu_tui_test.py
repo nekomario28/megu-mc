@@ -1,15 +1,19 @@
 #!/usr/bin/env python3
 """Regression tests for tools/megu_tui.py.
 
-Covers sparkline rendering, the no-side-effects fallback detection, the
-MetricsParser against realistic megu log lines, deterministic frame
-layout at several terminal sizes, and end-to-end plain-mode passthrough of
-a stub subprocess (stdio forwarding + exact exit code preservation).
+Covers sparkline/text rendering, the no-side-effects fallback selection,
+telemetry-vs-event log filtering, the MetricsParser against realistic megu
+log lines (including hotspot/quarantine and sleeping states), deterministic
+frame layout at compact and wide terminal sizes, keyboard views/history, and
+end-to-end plain-mode passthrough of a stub subprocess.
 """
 
+import argparse
 import importlib.util
+import io
 import os
 from pathlib import Path
+import re
 import subprocess
 import sys
 import tempfile
@@ -26,7 +30,7 @@ BLOCKS = megu_tui.SPARK_BLOCKS
 
 REALISTIC_LOG = [
     "[config] loaded server.toml (profile default)",
-    "megu v0.6 listening 127.0.0.1:25599 (offline identities; no Mojang authentication)",
+    "megu v1.21.1 listening 127.0.0.1:25565 (offline identities; no Mojang authentication)",
     "[live-mods] 5 jar(s): 1 auto-skipped, 2 native-bundle, 1 tier2-shim, 1 tier3",
     "[live-mods] dual-loader: 2 unified, 1 client-only, 0 superseded, 0 rejected, 0 duplicate ids, 0 missing deps, 3 verified damage hooks",
     "[live-mods] weirdmod.jar (weirdmod) tier3: 412 classes, 9 site(s) - mixin target missing",
@@ -34,7 +38,9 @@ REALISTIC_LOG = [
     "[tick] observed_tps=19.97 avg_work_ms=8.21 max_work_ms=21.44 over_budget=0/100",
     "[spine] Alice joined from 127.0.0.1:51112 (uuid 0123456789abcdef0123456789abcdef)",
     "[spine] Bob joined from 127.0.0.1:51130 (uuid fedcba9876543210fedcba9876543210)",
+    "[chat] Alice: welcome aboard",
     "[sz] t=400 VmRSS: 523264 kB | mobs=42 drops=7 xps=3 arrows=0 bob=1 pearl=0 primed=0 chests=18 furn=6 crops=11 world=0 inv=2 clients=2",
+    "[chunkprof] window=60s chunks=1284 (4.2 ms/chunk) map=15.8ms entities=91",
     "[tick] observed_tps=19.41 avg_work_ms=44.10 max_work_ms=58.02 over_budget=3/100",
     "[spine] Alice left (from 127.0.0.1:51112)",
     "Status: Busy (19.4 TPS, 44.1 ms/tick)",
@@ -53,6 +59,40 @@ STUB = (
     "print('stub: got ' + line.strip(), flush=True)\n"
     "sys.exit(7)\n"
 )
+
+
+class FakeProc:
+    def __init__(self):
+        self.stdin = io.BytesIO()
+
+    def poll(self):
+        return None
+
+
+def parse_lines(lines):
+    parser = megu_tui.MetricsParser()
+    for line in lines:
+        parser.feed(line)
+    return parser
+
+
+class TextUtilsTest(unittest.TestCase):
+    def test_vlen_ignores_ansi(self):
+        painted = megu_tui.paint("hello", "green", True)
+        self.assertEqual(megu_tui.vlen(painted), 5)
+        self.assertEqual(megu_tui.strip_ansi(painted), "hello")
+
+    def test_clip_exact_width_plain_and_colored(self):
+        self.assertEqual(megu_tui.clip("hello", 10), "hello     ")
+        self.assertEqual(megu_tui.clip("hello world", 5), "hello")
+        colored = megu_tui.paint("hello", "red", True)
+        clipped = megu_tui.clip(colored, 10)
+        self.assertEqual(megu_tui.vlen(clipped), 10)
+
+    def test_asciify_keeps_output_ascii(self):
+        text = megu_tui.asciify("● ⚠ ▇ café")
+        self.assertTrue(text.isascii())
+        self.assertIn("?", text)
 
 
 class SparklineTest(unittest.TestCase):
@@ -136,19 +176,69 @@ class FallbackDetectionTest(unittest.TestCase):
         self.assertTrue(megu_tui.color_ok({"TERM": "xterm"}))
 
 
+class _FakeStream:
+    def __init__(self, is_tty):
+        self.is_tty = is_tty
+
+    def isatty(self):
+        return self.is_tty
+
+
+class ModeSelectionTest(unittest.TestCase):
+    def namespace(self, **overrides):
+        values = {"plain": False, "tui": False, "no_tui": False}
+        values.update(overrides)
+        return argparse.Namespace(**values)
+
+    def test_want_tui_auto_detect_and_explicit_tui(self):
+        env = {"TERM": "xterm-256color"}
+        self.assertTrue(megu_tui.want_tui(
+            self.namespace(), env, _FakeStream(True), _FakeStream(True)))
+        self.assertTrue(megu_tui.want_tui(
+            self.namespace(tui=True), env,
+            _FakeStream(True), _FakeStream(True)))
+        self.assertFalse(megu_tui.want_tui(
+            self.namespace(tui=True), env,
+            _FakeStream(False), _FakeStream(True)))
+
+    def test_plain_aliases_win_over_tui(self):
+        env = {"TERM": "xterm-256color"}
+        for name in ("plain", "no_tui"):
+            self.assertFalse(megu_tui.want_tui(
+                self.namespace(**{name: True, "tui": True}), env,
+                _FakeStream(True), _FakeStream(True)))
+
+    def test_cli_aliases_parse_to_plain(self):
+        parser = megu_tui.build_parser()
+        for flag in ("--plain", "--no-tui", "--cli", "--nogui"):
+            with self.subTest(flag=flag):
+                args = parser.parse_args([flag, "--server-bin", "megu"])
+                self.assertTrue(args.plain)
+                self.assertFalse(args.tui)
+
+    def test_explicit_tui_flag_parses(self):
+        args = megu_tui.build_parser().parse_args(["--tui"])
+        self.assertTrue(args.tui)
+        self.assertFalse(args.plain)
+
+    def test_log_filter_default_and_choices(self):
+        parser = megu_tui.build_parser()
+        self.assertEqual(parser.parse_args([]).log_filter, "events")
+        for mode in megu_tui.LOG_FILTERS:
+            self.assertEqual(
+                parser.parse_args(["--log-filter", mode]).log_filter, mode)
+
+
 class MetricsParserTest(unittest.TestCase):
     def parse(self, lines=REALISTIC_LOG):
-        parser = megu_tui.MetricsParser()
-        for line in lines:
-            parser.feed(line)
-        return parser.snapshot()
+        return parse_lines(lines).snapshot()
 
     def test_realistic_session(self):
         snap = self.parse()
         self.assertTrue(snap["ready"])
-        self.assertEqual(snap["version"], "0.6")
+        self.assertEqual(snap["version"], "1.21.1")
         self.assertEqual(snap["bind"], "127.0.0.1")
-        self.assertEqual(snap["port"], 25599)
+        self.assertEqual(snap["port"], 25565)
         self.assertIn(19.97, snap["tps"])
         self.assertAlmostEqual(snap["tps_cur"], 19.4)
         self.assertIn(8.21, snap["mspt"])
@@ -165,18 +255,22 @@ class MetricsParserTest(unittest.TestCase):
         self.assertEqual(snap["dual_loader"]["damage_hooks"], 3)
         self.assertEqual(len(snap["mod_details"]), 2)
         self.assertEqual(snap["mod_details"][0]["tier"], "tier3")
+        self.assertEqual(snap["mod_warnings"], 1)
         self.assertEqual(snap["panics"], 1)
         self.assertEqual(snap["errors"], 1)
         self.assertEqual(snap["warnings"], 1)
         self.assertEqual(snap["uptime_ticks"], 400)
         self.assertEqual(snap["clients"], 2)
+        self.assertFalse(snap["sleeping"])
+        self.assertFalse(snap["hotspot_alert"])
         self.assertEqual(snap["lines_seen"], len(REALISTIC_LOG))
         self.assertEqual(len(snap["log"]), len(REALISTIC_LOG))
+        self.assertEqual(len(snap["event_log"]), len(REALISTIC_LOG))
 
     def test_feed_returns_kinds(self):
         parser = megu_tui.MetricsParser()
         self.assertEqual(parser.feed(
-            "megu v0.6 listening 127.0.0.1:25599 (x)"), "ready")
+            "megu v1.21.1 listening 127.0.0.1:25565 (x)"), "ready")
         self.assertEqual(parser.feed(
             "[tick] observed_tps=20.00 avg_work_ms=1.0 max_work_ms=2.0 "
             "over_budget=0/100"), "tick")
@@ -191,12 +285,13 @@ class MetricsParserTest(unittest.TestCase):
         parser.feed("[spine] Zoe left (from 127.0.0.1:9)")
         self.assertEqual(parser.snapshot()["players_online"], 0)
 
-    def test_ring_buffer_bound(self):
+    def test_ring_buffer_bound_and_categories_stay_aligned(self):
         parser = megu_tui.MetricsParser(log_lines=10)
         for index in range(30):
             parser.feed(f"line {index}")
         snap = parser.snapshot()
         self.assertEqual(len(snap["log"]), 10)
+        self.assertEqual(len(snap["log_categories"]), 10)
         self.assertEqual(snap["log"][-1], "line 29")
         self.assertEqual(snap["lines_seen"], 30)
 
@@ -205,6 +300,147 @@ class MetricsParserTest(unittest.TestCase):
         parser.feed("[sz] t=20 VmRSS: 1048576 kB | mobs=0 clients=0")
         self.assertAlmostEqual(parser.snapshot()["mem_cur"], 1024.0)
 
+    def test_telemetry_is_parsed_and_tagged(self):
+        parser = megu_tui.MetricsParser()
+        self.assertEqual(parser.feed(
+            "[tick] observed_tps=18.25 avg_work_ms=31.0 max_work_ms=40.0 "
+            "over_budget=2/100"), "tick")
+        self.assertEqual(parser.feed(
+            "[sz] t=600 VmRSS: 262144 kB | clients=1"), "size")
+        self.assertEqual(parser.feed(
+            "[chunkprof] window=60s chunks=1284 (4.2 ms/chunk) map=15.8ms"),
+            "ms_per_chunk")
+        snap = parser.snapshot()
+        self.assertEqual(snap["log_categories"],
+                         ["telemetry", "telemetry", "telemetry"])
+        self.assertAlmostEqual(snap["tps_cur"], 18.25)
+        self.assertAlmostEqual(snap["mspt_cur"], 31.0)
+        self.assertAlmostEqual(snap["mem_cur"], 256.0)
+        self.assertAlmostEqual(snap["ms_per_chunk_cur"], 4.2)
+        self.assertEqual(snap["uptime_ticks"], 600)
+        self.assertEqual(snap["clients"], 1)
+
+    def test_event_filter_hides_telemetry_but_keeps_metrics(self):
+        snap = self.parse()
+        events = megu_tui.filtered_log_lines(snap, "events")
+        self.assertTrue(any("joined" in line for line in events))
+        self.assertTrue(any("[chat]" in line for line in events))
+        self.assertTrue(any("[security]" in line for line in events))
+        for spam in ("[tick]", "[sz]", "[chunkprof]"):
+            self.assertFalse(any(line.startswith(spam) for line in events),
+                             spam)
+        self.assertAlmostEqual(snap["tps_cur"], 19.4)
+        self.assertAlmostEqual(snap["mspt_cur"], 44.1)
+        self.assertAlmostEqual(snap["mem_cur"], 511.0)
+
+    def test_all_filter_keeps_raw_telemetry(self):
+        snap = self.parse()
+        full = megu_tui.filtered_log_lines(snap, "all")
+        self.assertEqual(len(full), len(REALISTIC_LOG))
+        for spam in ("[tick]", "[sz]", "[chunkprof]"):
+            self.assertTrue(any(line.startswith(spam) for line in full), spam)
+
+    def test_alerts_filter_only_alerts(self):
+        snap = self.parse()
+        alerts = megu_tui.filtered_log_lines(snap, "alerts")
+        self.assertTrue(any("[security]" in line for line in alerts))
+        self.assertTrue(any("[FATAL]" in line for line in alerts))
+        self.assertFalse(any("joined" in line for line in alerts))
+        self.assertFalse(any(line.startswith("[tick]") for line in alerts))
+        self.assertFalse(any("[chat]" in line for line in alerts))
+        entries = megu_tui.selected_log_entries(snap, "alerts")
+        self.assertTrue(all(entry["category"] == "alert" for entry in entries))
+
+    def test_log_filter_cycle_and_normalization(self):
+        self.assertEqual(megu_tui.cycle_log_filter("events"), "alerts")
+        self.assertEqual(megu_tui.cycle_log_filter("alerts"), "all")
+        self.assertEqual(megu_tui.cycle_log_filter("all"), "events")
+        self.assertEqual(megu_tui.normalize_log_filter("bogus"), "events")
+        self.assertEqual(megu_tui.normalize_log_filter("all"), "all")
+
+    def test_hotspot_line_sets_guard_alert(self):
+        parser = megu_tui.MetricsParser()
+        parser.feed("Players: 2/20 (Bob, Carol)")
+        parser.feed("Loaded chunks: 1284")
+        self.assertEqual(parser.feed(
+            "[guard] chunk hotspot (12,-4) throttled after 41 ms"),
+            "hotspot")
+        snap = parser.snapshot()
+        self.assertTrue(snap["hotspot_alert"])
+        self.assertEqual(snap["hotspots"][-1]["cx"], 12)
+        self.assertEqual(snap["hotspots"][-1]["cz"], -4)
+        self.assertEqual(snap["warnings"], 1)
+        text = "\n".join(megu_tui.strip_ansi(line) for line in
+                         megu_tui.render_frame(snap, 100, 24))
+        self.assertIn("Hotspot (12,-4)", text)
+        self.assertIn("throttled", text)
+
+    def test_quarantine_line_sets_guard_alert(self):
+        parser = megu_tui.MetricsParser()
+        parser.feed("Loaded chunks: 512")
+        self.assertEqual(parser.feed(
+            "[quarantine] chunk (7,9) frozen after 3 consecutive faults"),
+            "quarantine")
+        snap = parser.snapshot()
+        self.assertTrue(snap["hotspot_alert"])
+        self.assertEqual(snap["quarantine_alerts"], 1)
+        self.assertEqual(snap["hotspots"][-1]["cx"], 7)
+        self.assertEqual(snap["hotspots"][-1]["cz"], 9)
+        text = "\n".join(megu_tui.strip_ansi(line) for line in
+                         megu_tui.render_frame(snap, 100, 24))
+        self.assertIn("Quarantine (7,9)", text)
+
+    def test_sleeping_and_wake_lines(self):
+        parser = megu_tui.MetricsParser()
+        parser.feed("megu v1.21.1 listening 127.0.0.1:25565 (offline)")
+        parser.feed("[sleep] SLEEPING until a player joins (wake-on-join)")
+        snap = parser.snapshot()
+        self.assertTrue(snap["sleeping"])
+        self.assertEqual(megu_tui._status_word(snap), "SLEEPING")
+        parser.feed("[sleep] woke from sleep on player join")
+        snap = parser.snapshot()
+        self.assertFalse(snap["sleeping"])
+        self.assertEqual(megu_tui._status_word(snap), "ONLINE")
+
+    def test_join_wakes_sleeping_server(self):
+        parser = megu_tui.MetricsParser()
+        parser.feed("megu v1.21.1 listening 127.0.0.1:25565 (offline)")
+        parser.feed("[sleep] SLEEPING until a player joins")
+        self.assertTrue(parser.snapshot()["sleeping"])
+        parser.feed("[spine] Zoe joined from 127.0.0.1:9 (uuid aaaa)")
+        self.assertFalse(parser.snapshot()["sleeping"])
+
+    def test_mod_warnings_are_counted_in_plain_language(self):
+        snap = self.parse()
+        self.assertEqual(snap["mod_warnings"], 1)
+        text = "\n".join(megu_tui.strip_ansi(line) for line in
+                         megu_tui.render_frame(snap, 120, 30))
+        self.assertIn("Mods: 3 active", text)
+        self.assertIn("1 fallback", text)
+        self.assertIn("1 warning", text)
+
+    def test_status_word_bands(self):
+        def snap(tps=None, mspt=None, **extra):
+            base = {"tps_cur": tps, "mspt_cur": mspt, "panics": 0,
+                    "errors": 0, "hotspot_alert": False, "sleeping": False,
+                    "players_online": 1, "ready": True, "status": "Running"}
+            base.update(extra)
+            return base
+        self.assertEqual(megu_tui._status_word(snap(19.9, 10.0)), "ONLINE")
+        self.assertEqual(megu_tui._status_word(snap(19.0, 10.0)), "BUSY")
+        self.assertEqual(megu_tui._status_word(snap(17.0, 10.0)), "ALERT")
+        self.assertEqual(megu_tui._status_word(snap(19.9, 46.0)), "ALERT")
+        self.assertEqual(megu_tui._status_word(
+            snap(19.9, 10.0, sleeping=True, players_online=0)), "SLEEPING")
+        self.assertEqual(megu_tui._status_word(
+            snap(19.9, 10.0, panics=1)), "ALERT")
+        self.assertEqual(megu_tui._status_word(
+            snap(19.9, 10.0, errors=1)), "ALERT")
+        self.assertEqual(megu_tui._status_word(
+            snap(19.9, 10.0, hotspot_alert=True)), "ALERT")
+        self.assertEqual(megu_tui._status_word(
+            {"ready": False, "status": "Booting"}), "BOOTING")
+
 
 class FrameLayoutTest(unittest.TestCase):
     def frame(self, cols, rows, **kwargs):
@@ -212,7 +448,8 @@ class FrameLayoutTest(unittest.TestCase):
         return megu_tui.render_frame(parser.snapshot(), cols, rows, **kwargs)
 
     def test_standard_sizes_never_overflow(self):
-        for cols, rows in ((80, 24), (100, 30), (140, 40), (40, 12)):
+        for cols, rows in ((80, 24), (92, 22), (100, 30), (120, 36),
+                           (140, 40)):
             lines = self.frame(cols, rows)
             self.assertEqual(len(lines), rows, (cols, rows))
             for line in lines:
@@ -226,10 +463,11 @@ class FrameLayoutTest(unittest.TestCase):
                 self.assertLessEqual(megu_tui.vlen(line), cols)
 
     def test_ascii_frame_is_pure_ascii(self):
-        lines = self.frame(80, 24, ascii_mode=True)
-        for line in lines:
-            self.assertTrue(line.isascii(), line)
-            self.assertNotIn("\x1b", line)
+        for cols, rows in ((80, 24), (120, 36)):
+            lines = self.frame(cols, rows, ascii_mode=True)
+            for line in lines:
+                self.assertTrue(line.isascii(), line)
+                self.assertNotIn("\x1b", line)
 
     def test_colored_frame_keeps_widths(self):
         lines = self.frame(100, 30, color=True)
@@ -237,89 +475,255 @@ class FrameLayoutTest(unittest.TestCase):
         for line in lines:
             self.assertEqual(megu_tui.vlen(line), 100)
 
-    def test_frame_contains_dashboard_sections(self):
-        lines = self.frame(100, 30)
+    def test_no_bloated_logo_and_one_line_header(self):
+        self.assertFalse(hasattr(megu_tui, "LOGO"))
+        self.assertFalse(hasattr(megu_tui, "LOGO_ASCII"))
+        lines = self.frame(120, 36)
         text = "\n".join(megu_tui.strip_ansi(line) for line in lines)
-        self.assertIn("TPS", text)
-        self.assertIn("MSPT", text)
-        self.assertIn("MEM", text)
+        self.assertNotIn("███", text)
+        self.assertNotIn("╔", text)
+        header = megu_tui.strip_ansi(lines[0])
+        self.assertIn("MEGU 1.21.1", header)
+        self.assertEqual(text.count("MEGU 1.21.1"), 1)
+        self.assertEqual(header.strip().count("ONLINE"), 1)
+
+    def test_header_has_all_key_fields_at_80_and_120(self):
+        for cols, rows in ((80, 24), (120, 36)):
+            header = megu_tui.strip_ansi(self.frame(cols, rows)[0])
+            self.assertIn("MEGU 1.21.1", header)
+            self.assertIn("ONLINE", header)
+            self.assertIn("127.0.0.1:25565", header)
+            self.assertIn("Players 2/20", header)
+            self.assertIn("TPS 19.9", header)
+            self.assertIn("(11.5ms)", header)
+            self.assertIn("RAM 523 MiB", header)
+
+    def test_summary_is_compact_and_logs_get_most_rows(self):
+        for cols, rows in ((80, 24), (120, 36)):
+            lines = self.frame(cols, rows)
+            plain = [megu_tui.strip_ansi(line) for line in lines]
+            section_index = next(
+                index for index, line in enumerate(plain)
+                if line.lstrip().startswith("Events"))
+            summary_rows = section_index - 1  # exclude the header line
+            self.assertLessEqual(summary_rows, 3, (cols, rows, plain[:5]))
+            self.assertGreaterEqual(rows - section_index - 1, rows * 0.6,
+                                    (cols, rows, section_index))
+
+    def test_health_strip_has_tps_mspt_ram_cpu_sparklines(self):
+        for cols, rows in ((80, 24), (120, 36)):
+            lines = self.frame(cols, rows)
+            health = megu_tui.strip_ansi(lines[1])
+            for label in ("HEALTH", "TPS", "MSPT", "RAM", "CPU"):
+                self.assertIn(label, health)
+            self.assertTrue(any(char in health for char in BLOCKS))
+
+    def test_actionable_cards_use_human_language(self):
+        lines = self.frame(120, 36)
+        text = "\n".join(megu_tui.strip_ansi(line) for line in lines)
+        self.assertIn("Players 2/20: Bob, Carol", text)
+        self.assertIn("Chunks 1,284", text)
+        self.assertIn("Guard: OK", text)
+        self.assertIn("Mods: 3 active", text)
+        self.assertIn("1 fallback", text)
+        self.assertNotRegex(text, r"\bN:\d")
+        self.assertNotRegex(text, r"\bS:\d")
+        self.assertNotRegex(text, r"\bF:\d")
+
+    def test_idle_server_card_says_idle(self):
+        parser = megu_tui.MetricsParser()
+        parser.feed("Players: 0/20")
+        snap = parser.snapshot()
+        text = "\n".join(megu_tui.strip_ansi(line) for line in
+                         megu_tui.render_frame(snap, 120, 24))
+        self.assertIn("Players 0/20 (idle)", text)
+
+    def test_hotspot_alert_is_highlighted(self):
+        parser = megu_tui.demo_parser()
+        parser.feed("[guard] chunk hotspot (12,-4) throttled after 41 ms")
+        snap = parser.snapshot()
+        text = "\n".join(megu_tui.strip_ansi(line) for line in
+                         megu_tui.render_frame(snap, 120, 30))
+        self.assertIn("Hotspot (12,-4)", text)
+        self.assertIn("throttled", text)
+        self.assertNotIn("Guard: OK", text)
+        self.assertIn("ALERT", text)
+        ascii_text = "\n".join(megu_tui.render_frame(
+            snap, 120, 30, ascii_mode=True))
+        self.assertIn("! Hotspot (12,-4)", ascii_text)
+
+    def test_footer_shows_filter_counts_and_shortcuts(self):
+        lines = self.frame(120, 36)
+        footer = megu_tui.strip_ansi(lines[-1])
+        self.assertIn("filter:events", footer)
+        self.assertIn("[p] players", footer)
+        self.assertIn("[m] mods", footer)
+        self.assertIn("[q] save & stop", footer)
+        self.assertIn("1 warn", footer)
+        self.assertIn("0 err", footer)
+        self.assertIn("[/] cmd", footer)
+
+    def test_footer_tracks_active_filter(self):
+        lines = self.frame(120, 36, ui={"log_filter": "alerts"})
+        footer = megu_tui.strip_ansi(lines[-1])
+        self.assertIn("filter:alerts", footer)
+        self.assertIn("Alerts", "\n".join(megu_tui.strip_ansi(l) for l in lines))
+
+    def test_log_filters_change_only_the_log_body(self):
+        snap = megu_tui.demo_parser().snapshot()
+        events = "\n".join(megu_tui.strip_ansi(line) for line in
+                           megu_tui.render_frame(snap, 120, 36,
+                                                 log_filter="events"))
+        all_log = "\n".join(megu_tui.strip_ansi(line) for line in
+                            megu_tui.render_frame(snap, 120, 36,
+                                                  log_filter="all"))
+        alerts = "\n".join(megu_tui.strip_ansi(line) for line in
+                           megu_tui.render_frame(snap, 120, 36,
+                                                 log_filter="alerts"))
+        self.assertNotIn("[tick]", events)
+        self.assertNotIn("[sz]", events)
+        self.assertNotIn("[chunkprof]", events)
+        self.assertIn("[tick]", all_log)
+        self.assertIn("[sz]", all_log)
+        self.assertIn("[chunkprof]", all_log)
+        self.assertEqual(events.splitlines()[0], all_log.splitlines()[0])
+        self.assertIn("[security]", alerts)
+        self.assertNotIn("[tick]", alerts)
+        self.assertNotIn("joined", alerts)
+        self.assertIn("Alerts", alerts)
+
+    def test_players_view(self):
+        lines = self.frame(120, 30, ui={"view": "players"})
+        text = "\n".join(megu_tui.strip_ansi(line) for line in lines)
         self.assertIn("Players", text)
-        self.assertIn("Chunks", text)
-        self.assertIn("Adapted Mods", text)
-        self.assertIn("Guard", text)
-        self.assertIn("1.21.1", text)
-        self.assertIn("26.3", text)
-        self.assertIn("server log", text.lower())
-        self.assertIn("/]", text)  # the '/' command keybinding hint
+        self.assertIn("Status ONLINE", text)
+        self.assertIn("uptime 500 ticks", text)
+        self.assertIn("Bob", text)
+        self.assertIn("127.0.0.1:51130", text)
+        self.assertIn("[p] log", megu_tui.strip_ansi(lines[-1]))
+
+    def test_players_view_when_empty(self):
+        parser = megu_tui.MetricsParser()
+        parser.feed("Players: 0/20")
+        lines = megu_tui.render_frame(parser.snapshot(), 100, 24,
+                                      ui={"view": "players"})
+        text = "\n".join(megu_tui.strip_ansi(line) for line in lines)
+        self.assertIn("No players online", text)
+
+    def test_mods_view_is_human_readable(self):
+        lines = self.frame(120, 30, ui={"view": "mods"})
+        text = "\n".join(megu_tui.strip_ansi(line) for line in lines)
+        self.assertIn("weirdmod.jar", text)
+        self.assertIn("compatibility shim", text)
+        self.assertIn("runtime adapter", text)
+        self.assertNotIn("tier2", text.lower())
+        self.assertNotIn("tier3", text.lower())
+        self.assertIn("3 active", text)
+        self.assertIn("[m] log", megu_tui.strip_ansi(lines[-1]))
+
+    def test_legacy_ui_mods_key_still_opens_mods_view(self):
+        lines = self.frame(100, 30, ui={"mods": True})
+        text = "\n".join(megu_tui.strip_ansi(line) for line in lines)
+        self.assertIn("weirdmod.jar", text)
 
     def test_empty_snapshot_does_not_crash(self):
         snap = megu_tui.MetricsParser().snapshot()
         lines = megu_tui.render_frame(snap, 80, 24)
         self.assertEqual(len(lines), 24)
-
-    def test_mod_details_view(self):
-        parser = megu_tui.demo_parser()
-        snap = parser.snapshot()
-        lines = megu_tui.render_frame(snap, 100, 30,
-                                      ui={"mods": True})
-        text = "\n".join(megu_tui.strip_ansi(line) for line in lines)
-        self.assertIn("adapted mods", text.lower())
-        self.assertIn("weirdmod.jar", text)
+        for line in lines:
+            self.assertEqual(megu_tui.vlen(line), 80)
+        self.assertIn("BOOTING", megu_tui.strip_ansi(lines[0]))
+        self.assertIn("(idle)", "\n".join(megu_tui.strip_ansi(l) for l in lines))
 
 
-class DemoFrameCliTest(unittest.TestCase):
-    def run_tool(self, argv, env=None, input_text=None):
-        merged = dict(os.environ)
-        merged.update(env or {})
-        return subprocess.run(
-            [sys.executable, str(TOOL)] + argv,
-            input=input_text, capture_output=True, text=True, encoding="utf-8",
-            timeout=30, env=merged)
+class KeyboardTest(unittest.TestCase):
+    def state(self):
+        return {"quit": False, "stopping": False, "cmd_mode": False,
+                "cmd_buf": "", "view": "log", "log_filter": "events",
+                "history": [], "history_index": 0}
 
-    def test_demo_frame_piped_has_no_ansi(self):
-        for env in ({}, {"NO_COLOR": "1"}, {"TERM": "dumb"}):
-            result = self.run_tool(
-                ["--demo-frame", "--cols", "80", "--rows", "24"], env=env)
-            self.assertEqual(result.returncode, 0, result.stderr)
-            self.assertNotIn("\x1b", result.stdout)
-            lines = result.stdout.splitlines()
-            self.assertEqual(len(lines), 24)
-            for line in lines:
-                self.assertEqual(len(line), 80)
+    def test_f_cycles_log_filter(self):
+        state = self.state()
+        proc = FakeProc()
+        for expected in ("alerts", "all", "events"):
+            megu_tui.handle_keys(b"f", state, proc)
+            self.assertEqual(state["log_filter"], expected)
 
-    def test_demo_frame_is_deterministic(self):
-        args = ["--demo-frame", "--cols", "100", "--rows", "28"]
-        first = self.run_tool(args)
-        second = self.run_tool(args)
-        self.assertEqual(first.returncode, 0)
-        self.assertEqual(first.stdout, second.stdout)
+    def test_p_and_m_toggle_views(self):
+        state = self.state()
+        proc = FakeProc()
+        megu_tui.handle_keys(b"p", state, proc)
+        self.assertEqual(state["view"], "players")
+        megu_tui.handle_keys(b"p", state, proc)
+        self.assertEqual(state["view"], "log")
+        megu_tui.handle_keys(b"m", state, proc)
+        self.assertEqual(state["view"], "mods")
+        megu_tui.handle_keys(b"m", state, proc)
+        self.assertEqual(state["view"], "log")
 
-    def test_demo_frame_ascii_is_pure_ascii(self):
-        result = self.run_tool(
-            ["--demo-frame", "--ascii", "--cols", "80", "--rows", "24"])
-        self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertTrue(result.stdout.isascii())
-        self.assertNotIn("\x1b", result.stdout)
+    def test_q_and_ctrl_c_set_quit(self):
+        for key in (b"q", b"\x03"):
+            state = self.state()
+            megu_tui.handle_keys(key, state, FakeProc())
+            self.assertTrue(state["quit"])
 
-    def test_render_snapshot_from_log_file(self):
-        with tempfile.NamedTemporaryFile(
-                "w", suffix=".log", delete=False, encoding="utf-8") as handle:
-            handle.write("\n".join(REALISTIC_LOG) + "\n")
-            path = handle.name
-        try:
-            result = self.run_tool(
-                ["--render-snapshot", path, "--cols", "80", "--rows", "24"])
-        finally:
-            os.unlink(path)
-        self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertIn("25599", result.stdout)
-        self.assertIn("TPS", result.stdout)
-        self.assertEqual(len(result.stdout.splitlines()), 24)
+    def test_command_prompt_sends_line_and_records_history(self):
+        state = self.state()
+        proc = FakeProc()
+        megu_tui.handle_keys(b"/", state, proc)
+        self.assertTrue(state["cmd_mode"])
+        megu_tui.handle_keys(b"list", state, proc)
+        megu_tui.handle_keys(b"\r", state, proc)
+        self.assertFalse(state["cmd_mode"])
+        self.assertEqual(proc.stdin.getvalue(), b"list\n")
+        self.assertEqual(state["history"], ["list"])
 
-    def test_render_snapshot_missing_file(self):
-        result = self.run_tool(["--render-snapshot", str(ROOT / "no-such.log")])
-        self.assertEqual(result.returncode, 2)
-        self.assertIn("megu-tui", result.stderr)
+    def test_up_and_down_arrow_history(self):
+        state = self.state()
+        proc = FakeProc()
+        megu_tui.handle_keys(b"/first\r", state, proc)
+        megu_tui.handle_keys(b"/second\r", state, proc)
+        megu_tui.handle_keys(b"/", state, proc)
+        megu_tui.handle_keys(b"\x1b[A", state, proc)
+        self.assertEqual(state["cmd_buf"], "second")
+        megu_tui.handle_keys(b"\x1b[A", state, proc)
+        self.assertEqual(state["cmd_buf"], "first")
+        megu_tui.handle_keys(b"\x1b[B", state, proc)
+        self.assertEqual(state["cmd_buf"], "second")
+        megu_tui.handle_keys(b"\x1b[B", state, proc)
+        self.assertEqual(state["cmd_buf"], "")
+
+    def test_escape_and_backspace_in_command_mode(self):
+        state = self.state()
+        proc = FakeProc()
+        megu_tui.handle_keys(b"/list", state, proc)
+        megu_tui.handle_keys(b"\x7f", state, proc)
+        self.assertEqual(state["cmd_buf"], "lis")
+        megu_tui.handle_keys(b"\x1b", state, proc)
+        self.assertFalse(state["cmd_mode"])
+        self.assertEqual(state["cmd_buf"], "")
+
+    def test_empty_command_is_not_sent(self):
+        state = self.state()
+        proc = FakeProc()
+        megu_tui.handle_keys(b"/\r", state, proc)
+        self.assertEqual(proc.stdin.getvalue(), b"")
+        self.assertEqual(state["history"], [])
+
+    def test_render_key_changes_on_ui_state(self):
+        parser = megu_tui.MetricsParser()
+        state = self.state()
+        base = megu_tui.render_key(parser, state, 80, 24)
+        parser.snapshot()
+        self.assertEqual(base, megu_tui.render_key(parser, state, 80, 24))
+        parser.feed("[tick] observed_tps=20.0 avg_work_ms=1.0 "
+                    "max_work_ms=2.0 over_budget=0/10")
+        self.assertNotEqual(base, megu_tui.render_key(parser, state, 80, 24))
+        for changed in ({"log_filter": "alerts"}, {"view": "players"},
+                        {"cmd_mode": True}, {"cmd_buf": "/list"},
+                        {"stopping": True}):
+            self.assertNotEqual(base, megu_tui.render_key(
+                parser, dict(state, **changed), 80, 24))
 
 
 class ProcMetricsTest(unittest.TestCase):
@@ -418,142 +822,132 @@ class MsPerChunkParseTest(unittest.TestCase):
         self.assertEqual(kind, "size")
         self.assertAlmostEqual(parser.snapshot()["ms_per_chunk_cur"], 3.1)
 
-
-class TelemetryRenderTest(unittest.TestCase):
-    def parser(self):
+    def test_profiling_lines_are_telemetry(self):
         parser = megu_tui.MetricsParser()
-        parser.feed("Loaded chunks: 1284")
-        parser.feed("stats ms/chunk=4.2")
-        parser.note_proc_metrics(512.0, 14, 30.0)
-        parser.note_proc_metrics(513.0, 14, 41.5)
-        return parser
+        parser.feed("[chunk] window stats ms/chunk=4.2")
+        parser.feed("CHUNKPROF region=world map=15.8ms entities=91")
+        self.assertEqual(parser.snapshot()["log_categories"],
+                         ["telemetry", "telemetry"])
 
-    def test_cpu_row_shown_on_tall_frames(self):
-        lines = megu_tui.render_frame(self.parser().snapshot(), 100, 28)
-        text = "\n".join(megu_tui.strip_ansi(line) for line in lines)
-        self.assertIn("CPU 41.5%  thr 14", text)
-        self.assertIn("thr 14", text)
-        self.assertIn("1,284 · 4.2ms/ch", text)
-        for line in lines:
-            self.assertEqual(megu_tui.vlen(line), 100)
 
-    def test_cpu_row_hidden_on_80x24_but_threads_kept(self):
-        lines = megu_tui.render_frame(self.parser().snapshot(), 80, 24)
-        text = "\n".join(megu_tui.strip_ansi(line) for line in lines)
-        self.assertNotIn("CPU", text)          # sparkline row gracefully hidden
-        self.assertIn("thr 14", text)          # threads still on the MEM line
-        self.assertIn("1,284 · 4.2ms/ch", text)
-        for line in lines:
-            self.assertEqual(megu_tui.vlen(line), 80)
+class DemoFrameCliTest(unittest.TestCase):
+    def run_tool(self, argv, env=None, input_text=None):
+        merged = dict(os.environ)
+        merged.update(env or {})
+        return subprocess.run(
+            [sys.executable, str(TOOL)] + argv,
+            input=input_text, capture_output=True, text=True, encoding="utf-8",
+            timeout=30, env=merged)
 
-    def test_ascii_mode_renders_cleanly(self):
-        for cols, rows in ((80, 24), (100, 28)):
-            lines = megu_tui.render_frame(
-                self.parser().snapshot(), cols, rows, ascii_mode=True)
-            text = "\n".join(lines)
-            self.assertTrue(text.isascii())
-            self.assertIn("1,284 - 4.2ms/ch", text)
-            self.assertIn("thr 14", text)
-            self.assertEqual("CPU" in text, rows >= 26)
+    def test_demo_frame_piped_has_no_ansi(self):
+        for env in ({}, {"NO_COLOR": "1"}, {"TERM": "dumb"}):
+            result = self.run_tool(
+                ["--demo-frame", "--cols", "80", "--rows", "24"], env=env)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertNotIn("\x1b", result.stdout)
+            lines = result.stdout.splitlines()
+            self.assertEqual(len(lines), 24)
             for line in lines:
-                self.assertEqual(len(line), cols)
+                self.assertEqual(len(line), 80)
 
+    def test_demo_frame_is_deterministic(self):
+        args = ["--demo-frame", "--cols", "100", "--rows", "28"]
+        first = self.run_tool(args)
+        second = self.run_tool(args)
+        self.assertEqual(first.returncode, 0)
+        self.assertEqual(first.stdout, second.stdout)
 
-class FixedScaleTest(unittest.TestCase):
-    def test_tps_scale_is_zero_to_twenty(self):
-        self.assertEqual(megu_tui.sparkline([20.0], 4, low=0.0, high=20.0)[-1],
-                         BLOCKS[-1])
-        # 19.9 lands one rung under the top (truncated scale): near-full, not
-        # the crash-looking drop a self-scaled sparkline would show.
-        index = BLOCKS.index(
-            megu_tui.sparkline([19.9], 4, low=0.0, high=20.0)[-1])
-        self.assertEqual(index, len(BLOCKS) - 2)
-        tiny = megu_tui.sparkline([19.8, 19.9], 8, low=0.0, high=20.0)
-        self.assertEqual(tiny[0], tiny[1])  # 19.8 vs 19.9: same rung, no drama
+    def test_demo_frame_ascii_is_pure_ascii(self):
+        result = self.run_tool(
+            ["--demo-frame", "--ascii", "--cols", "80", "--rows", "24"])
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertTrue(result.stdout.isascii())
+        self.assertNotIn("\x1b", result.stdout)
 
-    def test_mspt_scale_is_zero_to_fifty_budget(self):
-        low = megu_tui.sparkline([10.0], 4, low=0.0, high=50.0)[-1]
-        high = megu_tui.sparkline([45.0], 4, low=0.0, high=50.0)[-1]
-        spike = megu_tui.sparkline([80.0], 4, low=0.0, high=50.0)[-1]
-        self.assertLessEqual(BLOCKS.index(low), 1)      # 10 ms sits low
-        self.assertGreaterEqual(BLOCKS.index(high), 5)  # 45 ms sits high
-        self.assertEqual(spike, BLOCKS[-1])             # >50 clamps to full bar
+    def test_demo_frame_92x22_sample_is_exact(self):
+        result = self.run_tool(
+            ["--demo-frame", "--ascii", "--cols", "92", "--rows", "22"])
+        self.assertEqual(result.returncode, 0, result.stderr)
+        lines = result.stdout.splitlines()
+        self.assertEqual(len(lines), 22)
+        for line in lines:
+            self.assertEqual(len(line), 92)
+        self.assertIn("MEGU 1.21.1", lines[0])
+        self.assertIn("ONLINE", lines[0])
+        self.assertIn("25565", lines[0])
 
-    def test_tps_band_thresholds(self):
-        self.assertEqual(megu_tui._tps_band(None), "grey")
-        self.assertEqual(megu_tui._tps_band(19.9), "green")
-        self.assertEqual(megu_tui._tps_band(17.0), "yellow")
-        self.assertEqual(megu_tui._tps_band(14.9), "red")
+    def test_demo_frame_cli_alias_is_plain_ascii(self):
+        result = self.run_tool(
+            ["--demo-frame", "--cli", "--cols", "80", "--rows", "24"])
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertTrue(result.stdout.isascii())
+        self.assertNotIn("\x1b", result.stdout)
 
-    def test_mspt_band_thresholds(self):
-        self.assertEqual(megu_tui._mspt_band(None), "grey")
-        self.assertEqual(megu_tui._mspt_band(10.0), "green")
-        self.assertEqual(megu_tui._mspt_band(30.0), "yellow")
-        self.assertEqual(megu_tui._mspt_band(45.0), "red")
+    def test_demo_frame_log_filter_events_hides_telemetry(self):
+        result = self.run_tool(
+            ["--demo-frame", "--log-filter", "events",
+             "--cols", "120", "--rows", "36"])
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertNotIn("[tick]", result.stdout)
+        self.assertNotIn("[sz]", result.stdout)
+        self.assertNotIn("[chunkprof]", result.stdout)
+        self.assertIn("TPS 19.9", result.stdout)
 
-    def _mspt_line(self, mspt):
-        parser = megu_tui.MetricsParser()
-        parser.mspt.append(mspt)
-        lines = megu_tui.render_frame(parser.snapshot(), 80, 24, color=True)
-        return next(line for line in lines if " MSPT " in line)
+    def test_demo_frame_log_filter_all_shows_telemetry(self):
+        result = self.run_tool(
+            ["--demo-frame", "--log-filter", "all",
+             "--cols", "120", "--rows", "36"])
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("[tick]", result.stdout)
+        self.assertIn("[sz]", result.stdout)
+        self.assertIn("[chunkprof]", result.stdout)
+        self.assertIn("All log", result.stdout)
 
-    def test_mspt_rendered_colors(self):
-        self.assertIn(megu_tui.COLORS["green"], self._mspt_line(10.0))
-        self.assertIn(megu_tui.COLORS["yellow"], self._mspt_line(30.0))
-        self.assertIn(megu_tui.COLORS["red"], self._mspt_line(45.0))
+    def test_demo_frame_log_filter_alerts_only(self):
+        result = self.run_tool(
+            ["--demo-frame", "--log-filter", "alerts",
+             "--cols", "120", "--rows", "36"])
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("[security]", result.stdout)
+        self.assertNotIn("[tick]", result.stdout)
+        self.assertNotIn("joined", result.stdout)
+        self.assertIn("Alerts", result.stdout)
 
-    def test_tps_rendered_green_and_near_top(self):
-        parser = megu_tui.MetricsParser()
-        parser.tps.append(19.9)
-        lines = megu_tui.render_frame(parser.snapshot(), 80, 24, color=True)
-        tps_line = next(line for line in lines if " TPS " in line)
-        self.assertIn(megu_tui.COLORS["green"], tps_line)
-        self.assertIn(BLOCKS[-2], megu_tui.strip_ansi(tps_line))
+    def test_demo_frame_log_filter_is_deterministic(self):
+        args = ["--demo-frame", "--log-filter", "alerts",
+                "--cols", "92", "--rows", "22"]
+        first = self.run_tool(args)
+        second = self.run_tool(args)
+        self.assertEqual(first.returncode, 0)
+        self.assertEqual(first.stdout, second.stdout)
 
+    def test_render_snapshot_from_log_file(self):
+        with tempfile.NamedTemporaryFile(
+                "w", suffix=".log", delete=False, encoding="utf-8") as handle:
+            handle.write("\n".join(REALISTIC_LOG) + "\n")
+            path = handle.name
+        try:
+            result = self.run_tool(
+                ["--render-snapshot", path, "--cols", "80", "--rows", "24"])
+        finally:
+            os.unlink(path)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("25565", result.stdout)
+        self.assertIn("TPS", result.stdout)
+        self.assertEqual(len(result.stdout.splitlines()), 24)
 
-class DirtyFrameTest(unittest.TestCase):
-    STATE = {"mods": False, "cmd_mode": False, "cmd_buf": "",
-             "stopping": False}
+    def test_render_snapshot_from_stdin(self):
+        result = self.run_tool(
+            ["--render-snapshot", "-", "--cols", "80", "--rows", "24"],
+            input_text="\n".join(REALISTIC_LOG) + "\n")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("25565", result.stdout)
+        self.assertEqual(len(result.stdout.splitlines()), 24)
 
-    def key(self, parser, state=None, cols=80, rows=24):
-        return megu_tui.render_key(
-            parser, dict(self.STATE, **(state or {})), cols, rows)
-
-    def test_key_stable_when_nothing_changes(self):
-        parser = megu_tui.MetricsParser()
-        before = self.key(parser)
-        parser.snapshot()  # reads must not mark the frame dirty
-        self.assertEqual(before, self.key(parser))
-
-    def test_key_changes_on_new_log_line(self):
-        parser = megu_tui.MetricsParser()
-        before = self.key(parser)
-        parser.feed("[tick] observed_tps=20.0 avg_work_ms=1.0 "
-                    "max_work_ms=2.0 over_budget=0/10")
-        self.assertNotEqual(before, self.key(parser))
-
-    def test_key_changes_on_proc_sample(self):
-        parser = megu_tui.MetricsParser()
-        before = self.key(parser)
-        parser.note_proc_metrics(512.0, 14, 37.5)
-        self.assertNotEqual(before, self.key(parser))
-
-    def test_empty_proc_sample_still_marks_dirty_once(self):
-        parser = megu_tui.MetricsParser()
-        before = self.key(parser)
-        parser.note_proc_metrics(None, None, None)  # all failed: no change
-        self.assertEqual(before, self.key(parser))
-        parser.note_proc_metrics(None, 7, None)
-        self.assertNotEqual(before, self.key(parser))
-
-    def test_key_changes_on_ui_and_geometry(self):
-        parser = megu_tui.MetricsParser()
-        base = self.key(parser)
-        for changed in ({"mods": True}, {"cmd_mode": True},
-                        {"cmd_buf": "/list"}, {"stopping": True}):
-            self.assertNotEqual(base, self.key(parser, changed))
-        self.assertNotEqual(base, self.key(parser, cols=100))
-        self.assertNotEqual(base, self.key(parser, rows=30))
+    def test_render_snapshot_missing_file(self):
+        result = self.run_tool(["--render-snapshot", str(ROOT / "no-such.log")])
+        self.assertEqual(result.returncode, 2)
+        self.assertIn("megu-tui", result.stderr)
 
 
 class PassthroughTest(unittest.TestCase):
@@ -580,23 +974,41 @@ class PassthroughTest(unittest.TestCase):
         self.assertIn("stub: got list", result.stdout)
         self.assertNotIn("\x1b", result.stdout)
 
-    def test_no_tui_alias(self):
-        result = self.run_server(["--no-tui"])
+    def test_explicit_tui_still_falls_back_without_a_tty(self):
+        result = self.run_server(["--tui"])
         self.assertEqual(result.returncode, 7, result.stderr)
+        self.assertIn("stub: ready", result.stdout)
         self.assertNotIn("\x1b", result.stdout)
+
+    def test_plain_aliases_all_passthrough(self):
+        for flag in ("--no-tui", "--cli", "--nogui"):
+            with self.subTest(flag=flag):
+                result = self.run_server([flag])
+                self.assertEqual(result.returncode, 7, result.stderr)
+                self.assertIn("stub: got list", result.stdout)
+                self.assertNotIn("\x1b", result.stdout)
 
     def test_no_color_env_also_plain(self):
         result = self.run_server([], env={"NO_COLOR": "1"})
         self.assertEqual(result.returncode, 7, result.stderr)
         self.assertNotIn("\x1b", result.stdout)
 
+    def test_server_args_after_double_dash_are_forwarded(self):
+        result = self.run_server(["--cli"])
+        self.assertEqual(result.returncode, 7, result.stderr)
+        self.assertIn("stub: got list", result.stdout)
+
     def test_missing_binary_is_a_clean_error(self):
         result = subprocess.run(
-            [sys.executable, str(TOOL), "--plain", "--server-bin",
+            [sys.executable, str(TOOL), "--cli", "--server-bin",
              str(ROOT / "no-such-binary-xyz"), "--"],
             capture_output=True, text=True, timeout=30)
         self.assertEqual(result.returncode, 2)
         self.assertIn("megu-tui", result.stderr)
+
+    def test_stop_timeout_is_accepted(self):
+        result = self.run_server(["--cli", "--stop-timeout", "2.5"])
+        self.assertEqual(result.returncode, 7, result.stderr)
 
 
 if __name__ == "__main__":

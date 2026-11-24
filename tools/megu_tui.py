@@ -1,12 +1,13 @@
 #!/usr/bin/env python3
-"""Terminal-art dashboard and live telemetry wrapper for the megu server CLI.
+"""Smart terminal dashboard and live telemetry wrapper for the megu server.
 
 Three modes:
 
     python3 tools/megu_tui.py --server-bin ./target/release/megu -- <server-args...>
-        Spawn the server under a live dashboard: banner, TPS/MSPT/RSS
-        sparklines, status cards, a scrolling log tail, and a '/' command
-        line that forwards operator commands to the server's stdin console.
+        Spawn the server under a compact, high-signal dashboard: a one-line
+        status header, health/perf sparklines, actionable status cards, a
+        noise-filtered event log, a '/' command line with history, and quick
+        players/mods views.
 
     python3 tools/megu_tui.py --demo-frame [--ascii] [--cols N --rows M]
         Render one deterministic demo frame and exit 0. Used for tests and
@@ -17,12 +18,20 @@ Three modes:
         Parse a captured server log and render one frame from it ('-' reads
         stdin). Also deterministic.
 
+Log filters (also available interactively with 'f'):
+    events   human events + warnings/errors/alerts; tick/size/chunkprof
+             telemetry is folded into the metrics strip and hidden (default)
+    alerts   warnings, errors, security, quarantine and chunk-hotspot alerts
+    all      the raw server log, telemetry lines included
+
 Fallback contract (zero side effects in pipes, CI, and headless logs):
   * stdout not a TTY, TERM unset/dumb/unknown, NO_COLOR set, or an explicit
-    --plain / --no-tui flag -> plain stdio passthrough. The child's stdin,
-    stdout, and stderr are inherited untouched, this wrapper emits no ANSI,
-    and the wrapper exits with the server's exact exit code (128+signal for
-    signal deaths).
+    --plain / --no-tui / --cli / --nogui flag -> plain stdio passthrough.
+    The child's stdin, stdout, and stderr are inherited untouched, this
+    wrapper emits no ANSI, and the wrapper exits with the server's exact exit
+    code (128+signal for signal deaths).
+  * --tui explicitly requests the dashboard, but the same safety checks still
+    apply; a pipe or dumb terminal always falls back to passthrough.
   * --ascii renders the dashboard with pure-ASCII glyphs and no color.
 
 Shutdown contract:
@@ -81,31 +90,15 @@ COLORS = {
     "white": "\x1b[38;5;255m",
 }
 
-MC_VERSIONS = "1.21.1 / 26.3"
+# The Minecraft data version the server targets. This is deliberately the
+# only version string in the UI: server build numbers belong in the log.
+MC_VERSIONS = "1.21.1"
 DEFAULT_COLS = 80
 DEFAULT_ROWS = 24
 STOP_COMMAND = "stop"
 ESCALATE_GRACE = 4.0
-
-LOGO = (
-    "███╗   ███╗███████╗ ██████╗ ██╗   ██╗",
-    "████╗ ████║██╔════╝██╔════╝ ██║   ██║",
-    "██╔████╔██║█████╗  ██║  ███╗██║   ██║",
-    "██║╚██╔╝██║██╔══╝  ██║   ██║██║   ██║",
-    "██║ ╚═╝ ██║███████╗╚██████╔╝╚██████╔╝",
-    "╚═╝     ╚═╝╚══════╝ ╚═════╝  ╚═════╝ ",
-)
-LOGO_ASCII = (
-    " __  __  _____  ____   _   _ ",
-    "|  \\/  || ____|/ ___| | | | |",
-    "| |\\/| ||  _|  | |  _ | | | |",
-    "| |  | || |___ | |_| || |_| |",
-    "|_|  |_||_____| \\____| \\___/ ",
-)
-TAGLINE = " megu · server telemetry console"
-TAGLINE_ASCII = " megu - server telemetry console"
-WORDMARK = "═╡ MEGU · megu ╞═"
-WORDMARK_ASCII = "==[ MEGU megu ]=="
+LOG_FILTERS = ("events", "alerts", "all")
+LOG_FILTER_TITLES = {"events": "Events", "alerts": "Alerts", "all": "All log"}
 
 
 # ---------------------------------------------------------------- text utils
@@ -281,6 +274,25 @@ RE_MS_PER_CHUNK_PAREN = re.compile(
 RE_CHUNKPROF_MS = re.compile(
     r"\bCHUNKPROF\b.*?\bmap=([0-9]+(?:\.[0-9]+)?)\s*ms\b", re.IGNORECASE)
 
+# A hotspot is a chunk coordinate pair attached to a throttling, slow-chunk,
+# or quarantine diagnostic. Both word orders are common in operator logs.
+RE_HOTSPOT = re.compile(
+    r"\b(?:chunk\s+)?(?:hotspot|slow\s+chunk)\b[^()\n]*"
+    r"\(\s*(-?\d+)\s*,\s*(-?\d+)\s*\)", re.IGNORECASE)
+RE_HOTSPOT_CHUNK_FIRST = re.compile(
+    r"\bchunk\b[^()\n]*\(\s*(-?\d+)\s*,\s*(-?\d+)\s*\)"
+    r"[^\n]*(?:hotspot|slow|throttl|quarantin|frozen|froze)", re.IGNORECASE)
+RE_HOTSPOT_KV = re.compile(
+    r"\bcx\s*=\s*(-?\d+)\s*[, ]\s*cz\s*=\s*(-?\d+)", re.IGNORECASE)
+RE_HOTSPOT_COMMA = re.compile(
+    r"\b(?:chunk|hotspot)\s+(-?\d+)\s*,\s*(-?\d+)\b", re.IGNORECASE)
+RE_SLEEP = re.compile(
+    r"\bSLEEPING\b|\bserver\s+(?:is\s+)?(?:sleeping|asleep|idle)\b|"
+    r"\bsleeping\s+until\b|\bidle\s+sleep\b", re.IGNORECASE)
+RE_WAKE = re.compile(
+    r"\bwoke\b|\bwake[- ]on[- ]join\b|\bresumed\s+from\s+sleep\b|"
+    r"\bwaking\b", re.IGNORECASE)
+
 
 def ms_per_chunk_from(line):
     """ms-per-chunk figure from a profiling line; None when none is present."""
@@ -292,12 +304,58 @@ def ms_per_chunk_from(line):
     return None
 
 
+def hotspot_coords(line):
+    """(cx, cz) from a hotspot/slow-chunk/quarantine line, else None."""
+    for pattern in (RE_HOTSPOT, RE_HOTSPOT_CHUNK_FIRST, RE_HOTSPOT_KV,
+                    RE_HOTSPOT_COMMA):
+        match = pattern.search(line)
+        if match:
+            return int(match.group(1)), int(match.group(2))
+    return None
+
+
+def _looks_telemetry(line):
+    stripped = line.lstrip()
+    lower = stripped.lower()
+    return (stripped.startswith("[tick]")
+            or stripped.startswith("[sz]")
+            or stripped.startswith("[chunkprof]")
+            or "chunkprof" in lower
+            or "observed_tps=" in lower
+            or "vmrss:" in lower)
+
+
+def classify_line(line):
+    """Best-effort category for a raw line: event, alert, or telemetry."""
+    lower = line.lower()
+    if _looks_telemetry(line):
+        return "telemetry"
+    if (RE_FATAL.search(line) or RE_ERROR.search(line) or RE_WARN.search(line)
+            or "quarantin" in lower or "hotspot" in lower
+            or "slow chunk" in lower):
+        return "alert"
+    return "event"
+
+
+def classify_kind(line, kind):
+    """Category for a parsed log line, using the decoder's match kind."""
+    if kind in ("tick", "size", "ms_per_chunk") or _looks_telemetry(line):
+        return "telemetry"
+    if kind in ("hotspot", "quarantine"):
+        return "alert"
+    if kind in ("ready", "join", "leave", "lan", "mods", "mod", "status",
+                "players", "chunks", "memory", "sleep", "wake"):
+        return "event"
+    return classify_line(line)
+
+
 class MetricsParser:
     """Fold raw megu stdout/stderr lines into a rolling metrics snapshot.
 
-    Every line lands in the `log` ring buffer; lines whose shape is known are
-    additionally decoded into structured state. feed() returns the matched
-    kind so tests and future consumers can route on it.
+    Every line lands in the `log` ring buffer together with a category
+    (`event`, `alert`, or `telemetry`). Lines whose shape is known are also
+    decoded into structured state. feed() returns the matched kind so tests
+    and future consumers can route on it.
     """
 
     def __init__(self, history=120, log_lines=400):
@@ -329,15 +387,26 @@ class MetricsParser:
         self.port = None
         self.motd = None
         self.status_label = "Booting"
+        self.sleeping = False
+        self.hotspots = collections.deque(maxlen=20)
+        self.quarantine_alerts = 0
         self.log = collections.deque(maxlen=log_lines)
+        self.log_categories = collections.deque(maxlen=log_lines)
         self.lines_seen = 0
+
+    # -- decoding ---------------------------------------------------------
 
     def feed(self, line):
         line = strip_ansi(line).rstrip()
         self.lines_seen += 1
         self.revision += 1
+        kind = self._decode(line)
+        category = classify_kind(line, kind)
         self.log.append(line)
+        self.log_categories.append(category)
+        return kind
 
+    def _decode(self, line):
         mspc = ms_per_chunk_from(line)
         if mspc is not None:
             self.ms_per_chunk.append(mspc)
@@ -371,10 +440,45 @@ class MetricsParser:
                 self.clients = int(match.group(1))
             return "size"
 
+        if RE_SLEEP.search(line) and not line.lstrip().startswith("[live-mods]"):
+            self.sleeping = True
+            self.status_label = "Sleeping"
+            return "sleep"
+        if RE_WAKE.search(line):
+            self.sleeping = False
+            if self.status_label == "Sleeping":
+                self.status_label = "Running"
+            return "wake"
+
+        lower = line.lower()
+        if ("hotspot" in lower or "slow chunk" in lower
+                or ("throttl" in lower and "chunk" in lower)):
+            coords = hotspot_coords(line)
+            cx = coords[0] if coords else None
+            cz = coords[1] if coords else None
+            self.hotspots.append({"cx": cx, "cz": cz, "kind": "hotspot",
+                                  "line": line})
+            self.warnings += 1
+            return "hotspot"
+        if ("quarantin" in lower
+                and ("chunk" in lower
+                     or line.lstrip().lower().startswith("[quarantine"))):
+            coords = hotspot_coords(line)
+            cx = coords[0] if coords else None
+            cz = coords[1] if coords else None
+            self.hotspots.append({"cx": cx, "cz": cz, "kind": "quarantine",
+                                  "line": line})
+            self.quarantine_alerts += 1
+            self.warnings += 1
+            return "quarantine"
+
         match = RE_JOIN.search(line)
         if match:
             self.players[match.group(1)] = match.group(2)
             self.players_online = len(self.players)
+            self.sleeping = False
+            if self.status_label == "Sleeping":
+                self.status_label = "Running"
             return "join"
 
         match = RE_LEFT.search(line) or RE_DISCONNECTED.search(line)
@@ -436,7 +540,12 @@ class MetricsParser:
             self.players_max = int(match.group(2))
             if match.group(3) is not None:
                 names = [name.strip() for name in match.group(3).split(",")]
-                self.players = {name: None for name in names if name}
+                # Keep addresses already learned from join lines; the status
+                # snapshot only reports names.
+                self.players = {
+                    name: self.players.get(name)
+                    for name in names if name
+                }
             return "players"
 
         match = RE_CHUNKS.search(line)
@@ -492,6 +601,17 @@ class MetricsParser:
         """Record an external RSS sample (from /proc/<pid>/status)."""
         self.note_proc_metrics(mib, None, None)
 
+    # -- snapshot ---------------------------------------------------------
+
+    def _mod_warnings(self):
+        dual = self.dual_loader or {}
+        count = int(dual.get("rejected", 0)) + int(dual.get("missing_deps", 0))
+        for detail in self.mod_details:
+            low = detail.get("detail", "").lower()
+            if "missing" in low or "damaged" in low:
+                count += 1
+        return count
+
     def snapshot(self):
         tps = list(self.tps)
         mspt = list(self.mspt)
@@ -500,6 +620,14 @@ class MetricsParser:
         mspc = list(self.ms_per_chunk)
         online = (self.players_online if self.players_online is not None
                   else len(self.players))
+        categories = list(self.log_categories)
+        lines = list(self.log)
+        entries = [
+            {"category": categories[index] if index < len(categories) else "event",
+             "line": line}
+            for index, line in enumerate(lines)
+        ]
+        hotspots = [dict(hotspot) for hotspot in self.hotspots]
         return {
             "ready": self.ready,
             "version": self.version,
@@ -523,6 +651,8 @@ class MetricsParser:
             "ms_per_chunk_cur": mspc[-1] if mspc else None,
             "revision": self.revision,
             "players": sorted(self.players),
+            "player_addrs": {name: address
+                             for name, address in self.players.items()},
             "players_online": online,
             "players_max": self.players_max,
             "loaded_chunks": self.loaded_chunks,
@@ -530,29 +660,44 @@ class MetricsParser:
             "jars_seen": self.jars_seen,
             "mod_details": list(self.mod_details),
             "dual_loader": dict(self.dual_loader),
+            "mod_warnings": self._mod_warnings(),
             "errors": self.errors,
             "warnings": self.warnings,
             "panics": self.panics,
             "over_budget": self.over_budget,
             "uptime_ticks": self.uptime_ticks,
             "clients": self.clients,
+            "sleeping": self.sleeping,
+            "hotspots": hotspots,
+            "hotspot_alert": bool(hotspots),
+            "quarantine_alerts": self.quarantine_alerts,
             "lines_seen": self.lines_seen,
-            "log": list(self.log),
+            "log": lines,
+            "log_categories": categories,
+            "event_log": entries,
         }
 
 
 # ------------------------------------------------------------------- frame
 
-def _dot(ascii_mode):
-    return "-" if ascii_mode else "·"
+def _divider(ascii_mode):
+    return " - " if ascii_mode else " · "
+
+
+def _warning_mark(ascii_mode):
+    return "!" if ascii_mode else "⚠"
+
+
+def _status_bullet(ascii_mode):
+    return "*" if ascii_mode else "●"
 
 
 def _tps_band(cur):
     if cur is None:
         return "grey"
-    if cur >= 19.0:
+    if cur >= 19.5:
         return "green"
-    if cur >= 15.0:
+    if cur >= 18.0:
         return "yellow"
     return "red"
 
@@ -560,9 +705,9 @@ def _tps_band(cur):
 def _mspt_band(cur):
     if cur is None:
         return "grey"
-    if cur < 20.0:
+    if cur < 30.0:
         return "green"
-    if cur < 40.0:
+    if cur < 45.0:
         return "yellow"
     return "red"
 
@@ -578,223 +723,473 @@ def _cpu_band(cur):
 
 
 def _mem_band(cur):
-    return "cyan" if cur is not None else "grey"
-
-
-def _status_color(status, snap):
-    if snap.get("panics"):
-        return "red"
-    label = (status or "").lower()
-    if "running" in label or "smooth" in label:
+    if cur is None:
+        return "grey"
+    if cur < 1024.0:
         return "green"
-    if "boot" in label:
+    if cur < 2048.0:
         return "yellow"
-    if "busy" in label or "overload" in label:
-        return "yellow" if "busy" in label else "red"
-    return "grey"
+    return "red"
 
 
-def _metric_line(name, stat, values, cols, band, ascii_mode, color,
-                 low=None, high=None):
-    prefix = " " + name + " "
-    spark_width = max(0, cols - len(prefix) - vlen(stat) - 2)
-    spark = sparkline(values, spark_width, low=low, high=high,
-                      ascii_mode=ascii_mode)
-    return (prefix + paint(stat, band, color) + "  "
-            + paint(spark, band, color))
+def _status_word(snap):
+    """ALERT / SLEEPING / BUSY / ONLINE / BOOTING, most urgent first."""
+    tps = snap.get("tps_cur")
+    mspt = snap.get("mspt_cur")
+    if (snap.get("panics") or snap.get("hotspot_alert")
+            or snap.get("errors")):
+        return "ALERT"
+    if snap.get("sleeping") and not snap.get("players_online"):
+        return "SLEEPING"
+    if ((tps is not None and tps < 18.0)
+            or (mspt is not None and mspt >= 45.0)):
+        return "ALERT"
+    label = (snap.get("status") or "").lower()
+    if ("busy" in label
+            or (tps is not None and tps < 19.5)
+            or (mspt is not None and mspt >= 30.0)):
+        return "BUSY"
+    if snap.get("ready"):
+        return "ONLINE"
+    return "BOOTING"
 
 
-def _info_line(snap, ascii_mode, color):
-    dot = " " + _dot(ascii_mode) + " "
-    version = snap.get("version") or "?"
+def _status_color(word):
+    return {
+        "ONLINE": "green",
+        "SLEEPING": "cyan",
+        "BUSY": "yellow",
+        "ALERT": "red",
+        "BOOTING": "yellow",
+    }.get(word, "grey")
+
+
+def _header_line(snap, cols, ascii_mode, color):
+    players_max = snap.get("players_max")
+    max_text = str(players_max) if players_max is not None else "?"
     port = snap.get("port")
-    if port:
-        address = f"{snap.get('bind') or 'server'}:{port}"
-    else:
-        address = "not listening yet"
-    mods = snap.get("mods", {})
-    mods_total = (mods.get("native", 0) + mods.get("shim", 0)
-                  + mods.get("fallback", 0) + mods.get("auto_skipped", 0))
-    status = snap.get("status") or "Booting"
-    return (
-        paint(f" megu v{version}", "cyan", color)
-        + dot + f"MC {MC_VERSIONS}"
-        + dot + address
-        + dot + f"mods {mods_total}"
-        + dot + paint(status, _status_color(status, snap), color)
-    )
+    address = (f"{snap.get('bind') or 'server'}:{port}"
+               if port else "not listening")
+    tps = snap.get("tps_cur")
+    mspt = snap.get("mspt_cur")
+    tps_text = (f"{fmt(tps, 1)} ({fmt(mspt, 1)}ms)"
+                if tps is not None else "n/a")
+    mem = snap.get("mem_cur")
+    ram_text = f"{fmt(mem, 0)} MiB" if mem is not None else "n/a MiB"
+    status = _status_word(snap)
+    fields = [
+        paint("MEGU " + MC_VERSIONS, "cyan", color),
+        paint(_status_bullet(ascii_mode) + " " + status,
+              _status_color(status), color),
+        paint(address, "grey", color),
+        paint(f"Players {snap.get('players_online', 0)}/{max_text}",
+              "white", color),
+        paint("TPS " + tps_text, _tps_band(tps), color),
+        paint("RAM " + ram_text, _mem_band(mem), color),
+    ]
+    # Keep the header on one line. Wide terminals get two-space separators;
+    # 80-column terminals use one space; then optional RAM/address fields drop.
+    for count in (6, 5, 4, 3, 2):
+        subset = fields[:count]
+        for separator in ("  ", " "):
+            line = separator.join(subset)
+            if vlen(line) <= cols:
+                return line
+    return clip(" ".join(fields), cols)
 
 
-def _card_block(entries, cols, ascii_mode):
-    """Four bordered status cards in three lines; None when too narrow."""
-    count = len(entries)
-    card_w = (cols - (count - 1)) // count
-    if card_w < 12:
-        return None
-    inner = card_w - 2
-    tops, mids, bots = [], [], []
-    for title, value in entries:
-        if ascii_mode:
-            tops.append("+" + fit_plain("- " + title + " ", inner, "-") + "+")
-            mids.append("|" + center_vis(value, inner) + "|")
-            bots.append("+" + "-" * inner + "+")
+def _health_entries(snap):
+    tps = snap.get("tps_cur")
+    mspt = snap.get("mspt_cur")
+    mem = snap.get("mem_cur")
+    cpu = snap.get("cpu_cur")
+    return [
+        ("TPS", fmt(tps, 1), _tps_band(tps), snap.get("tps", []), 0.0, 20.0),
+        ("MSPT", fmt(mspt, 1) + "ms", _mspt_band(mspt), snap.get("mspt", []),
+         0.0, 50.0),
+        ("RAM", (fmt(mem, 0) + "M") if mem is not None else "n/a",
+         _mem_band(mem), snap.get("mem", []), None, None),
+        ("CPU", (fmt(cpu, 0) + "%") if cpu is not None else "n/a",
+         _cpu_band(cpu), snap.get("cpu", []), 0.0, None),
+    ]
+
+
+def _health_line(snap, cols, ascii_mode, color):
+    entries = _health_entries(snap)
+
+    def render(spark_width, active):
+        parts = [paint("HEALTH", "grey", color)]
+        for name, value, band, values, low, high in active:
+            segment = (paint(name, "grey", color) + " "
+                       + paint(value, band, color))
+            if spark_width > 0:
+                segment += " " + paint(
+                    sparkline(values, spark_width, low=low, high=high,
+                              ascii_mode=ascii_mode), band, color)
+            parts.append(segment)
+        return "  ".join(parts)
+
+    # Prefer showing all four metrics; shrink the sparklines before dropping
+    # a metric so an 80-column terminal still sees TPS, MSPT, RAM and CPU.
+    for active in (entries, entries[:3], entries[:2], entries[:1]):
+        for spark_width in (8, 6, 5, 4, 3, 2, 0):
+            line = render(spark_width, active)
+            if vlen(line) <= cols:
+                return line
+    return clip(render(0, entries[:1]), cols)
+
+
+def _player_card(snap, ascii_mode, color):
+    online = snap.get("players_online", 0)
+    players_max = snap.get("players_max")
+    max_text = str(players_max) if players_max is not None else "?"
+    if not online:
+        return paint(f"Players 0/{max_text} (idle)", "grey", color)
+    names = [name for name in snap.get("players", []) if name]
+    if not names:
+        return paint(f"Players {online}/{max_text}", "white", color)
+    shown = names[:6]
+    text = ", ".join(shown)
+    if len(names) > len(shown):
+        text += f" +{len(names) - len(shown)}"
+    return paint(f"Players {online}/{max_text}: {text}", "white", color)
+
+
+def _guard_card(snap, cols, ascii_mode, color):
+    chunks = snap.get("loaded_chunks")
+    chunks_text = f"Chunks {chunks:,}" if isinstance(chunks, int) else "Chunks n/a"
+    divider = _divider(ascii_mode)
+    hotspots = snap.get("hotspots") or []
+    if hotspots:
+        hotspot = hotspots[-1]
+        cx, cz = hotspot.get("cx"), hotspot.get("cz")
+        kind = hotspot.get("kind", "hotspot")
+        if cx is not None and cz is not None:
+            if kind == "quarantine":
+                badge = f"{_warning_mark(ascii_mode)} Quarantine ({cx},{cz})"
+            else:
+                badge = f"{_warning_mark(ascii_mode)} Hotspot ({cx},{cz}) throttled"
+        elif kind == "quarantine":
+            badge = f"{_warning_mark(ascii_mode)} Chunk quarantined"
         else:
-            tops.append("┌" + fit_plain("─ " + title + " ", inner, "─") + "┐")
-            mids.append("│" + center_vis(value, inner) + "│")
-            bots.append("└" + "─" * inner + "┘")
-    return [" ".join(tops), " ".join(mids), " ".join(bots)]
+            badge = f"{_warning_mark(ascii_mode)} Chunk hotspot detected"
+        return (paint(chunks_text, "white", color) + divider
+                + paint(badge, "red", color))
+    if snap.get("panics"):
+        return (paint(chunks_text, "white", color) + divider
+                + paint("Guard: TRIPPED", "red", color))
+    return (paint(chunks_text, "white", color) + divider
+            + paint("Guard: OK", "green", color))
+
+
+def _mods_card(snap, ascii_mode, color):
+    mods = snap.get("mods", {})
+    active = int(mods.get("native", 0)) + int(mods.get("shim", 0))
+    fallback = int(mods.get("fallback", 0))
+    warnings = int(snap.get("mod_warnings", 0))
+    divider = _divider(ascii_mode)
+    text = f"Mods: {active} active"
+    extras = []
+    if fallback:
+        extras.append(f"{fallback} fallback")
+    if warnings:
+        extras.append(f"{warnings} warning" + ("s" if warnings != 1 else ""))
+    if extras:
+        text += divider + divider.join(extras)
+    return paint(text, "cyan", color)
+
+
+def _pack_segments(segments, cols):
+    """Pack colored segments into one or more lines without splitting words."""
+    if not segments:
+        return [""]
+    for separator in ("  ", " "):
+        total = sum(vlen(segment) for segment in segments)
+        total += len(separator) * (len(segments) - 1)
+        if total <= cols:
+            return [separator.join(segments)]
+    lines = []
+    current = ""
+    for segment in segments:
+        if vlen(segment) > cols:
+            segment = clip(segment, cols)
+        if not current:
+            current = segment
+        elif vlen(current) + 2 + vlen(segment) <= cols:
+            current += "  " + segment
+        else:
+            lines.append(current)
+            current = segment
+    lines.append(current)
+    return lines
 
 
 def _cards(snap, cols, ascii_mode, color):
-    players_max = snap.get("players_max")
-    players_text = f"{snap.get('players_online', 0)}/{players_max if players_max is not None else '?'}"
-    chunks = snap.get("loaded_chunks")
-    chunks_text = f"{chunks:,}" if isinstance(chunks, int) else "n/a"
-    mspc = snap.get("ms_per_chunk_cur")
-    if mspc is not None:
-        chunks_text += f" {_dot(ascii_mode)} {mspc:.1f}ms/ch"
-    mods = snap.get("mods", {})
-    mods_text = (f"N:{mods.get('native', 0)} "
-                 f"S:{mods.get('shim', 0)} F:{mods.get('fallback', 0)}")
-    panics = snap.get("panics", 0)
-    guard_text = "OK" if panics == 0 else f"TRIPPED x{panics}"
-    entries = [
-        ("Players", paint(players_text, "white", color)),
-        ("Chunks", paint(chunks_text, "white", color)),
-        ("Adapted Mods", paint(mods_text, "cyan", color)),
-        ("Guard", paint(guard_text, "green" if panics == 0 else "red", color)),
+    segments = [
+        _player_card(snap, ascii_mode, color),
+        _guard_card(snap, cols, ascii_mode, color),
+        _mods_card(snap, ascii_mode, color),
     ]
-    block = _card_block(entries, cols, ascii_mode)
-    if block is not None:
-        return block
-    dot = " " + _dot(ascii_mode) + " "
-    inline = (" Players " + players_text + dot + "Chunks " + chunks_text + dot
-              + "Mods " + mods_text.replace(":", "") + dot + "Guard " + guard_text)
-    return [paint(inline, "grey", color)]
+    return _pack_segments(segments, cols)
 
 
-def _log_header(title, cols, ascii_mode, color):
-    bar, dash = ("-", "--") if ascii_mode else ("─", "──")
-    return paint(fit_plain(dash + " " + title + " ", cols, bar), "grey", color)
+def _log_category_entries(snap):
+    entries = snap.get("event_log")
+    if entries:
+        return entries
+    lines = snap.get("log", [])
+    categories = snap.get("log_categories") or []
+    return [
+        {"category": (categories[index] if index < len(categories)
+                      else classify_line(line)),
+         "line": line}
+        for index, line in enumerate(lines)
+    ]
 
 
-def _log_color(line, color):
+def normalize_log_filter(name):
+    return name if name in LOG_FILTERS else "events"
+
+
+def cycle_log_filter(name):
+    try:
+        index = LOG_FILTERS.index(normalize_log_filter(name))
+    except ValueError:
+        index = 0
+    return LOG_FILTERS[(index + 1) % len(LOG_FILTERS)]
+
+
+def selected_log_entries(snap, log_filter):
+    mode = normalize_log_filter(log_filter)
+    entries = _log_category_entries(snap)
+    if mode == "all":
+        return entries
+    if mode == "alerts":
+        return [entry for entry in entries
+                if entry.get("category") == "alert"]
+    return [entry for entry in entries
+            if entry.get("category") != "telemetry"]
+
+
+def filtered_log_lines(snap, log_filter):
+    return [entry.get("line", "") for entry in
+            selected_log_entries(snap, log_filter)]
+
+
+# Alias kept for callers that describe the operation as selecting lines.
+select_log_lines = filtered_log_lines
+
+
+def _section_header(title, cols, ascii_mode, color, detail=None):
+    bar = "-" if ascii_mode else "─"
+    label = " " + title
+    if detail:
+        label += (" - " if ascii_mode else "  ·  ") + detail
+    return paint(fit_plain(label + " ", cols, bar), "grey", color)
+
+
+def _color_log_line(entry, color):
+    line = entry.get("line", "")
     if not color:
         return line
-    if RE_FATAL.search(line) or RE_ERROR.search(line):
-        return paint(line, "red", color)
-    if RE_WARN.search(line):
+    category = entry.get("category")
+    if category == "alert":
+        name = "red" if (RE_FATAL.search(line) or RE_ERROR.search(line)) \
+            else "yellow"
+        return paint(line, name, color)
+    if re.search(r"\bjoined\b", line, re.IGNORECASE):
+        return paint(line, "green", color)
+    if (re.search(r"\bleft\b", line, re.IGNORECASE)
+            or re.search(r"\bdisconnected\b", line, re.IGNORECASE)):
+        return paint(line, "grey", color)
+    if line.lstrip().startswith("[chat]") or re.match(r"<\S+>", line.lstrip()):
+        return paint(line, "cyan", color)
+    if line.lstrip().startswith("[cmd]") or line.lstrip().startswith("[console]"):
         return paint(line, "yellow", color)
     return line
 
 
-def _bottom_line(snap, cols, ascii_mode, color, ui):
-    dot = " " + _dot(ascii_mode) + " "
+def _log_section(snap, body_rows, cols, ascii_mode, color, log_filter, dot):
+    if body_rows <= 0:
+        return []
+    mode = normalize_log_filter(log_filter)
+    entries = selected_log_entries(snap, mode)
+    if mode == "events":
+        hidden = max(0, int(snap.get("lines_seen", 0)) - len(entries))
+        detail = "filter:events"
+        if hidden:
+            detail += f"{dot}{hidden} telemetry hidden"
+    elif mode == "alerts":
+        detail = f"filter:alerts{dot}{len(entries)} alert" + (
+            "" if len(entries) == 1 else "s")
+    else:
+        detail = f"filter:all{dot}{len(entries)} lines"
+    out = [_section_header(LOG_FILTER_TITLES[mode], cols, ascii_mode, color,
+                           detail)]
+    tail = entries[-(body_rows - 1):] if body_rows > 1 else []
+    if not tail and body_rows > 1:
+        message = ("no alerts" if mode == "alerts" else "no events yet")
+        out.append(paint("  " + message, "grey", color))
+    else:
+        out.extend(_color_log_line(entry, color) for entry in tail)
+    return out
+
+
+def _players_section(snap, body_rows, cols, ascii_mode, color, dot):
+    if body_rows <= 0:
+        return []
+    online = snap.get("players_online", 0)
+    uptime = snap.get("uptime_ticks")
+    chunks = snap.get("loaded_chunks")
+    detail = f"Status {_status_word(snap)}"
+    detail += f"{dot}{online} online"
+    if uptime is not None:
+        detail += f"{dot}uptime {uptime} ticks"
+    if isinstance(chunks, int):
+        detail += f"{dot}{chunks:,} chunks"
+    out = [_section_header("Players", cols, ascii_mode, color, detail)]
+    names = [name for name in snap.get("players", []) if name]
+    addresses = snap.get("player_addrs") or {}
+    if not online:
+        out.append(paint("  No players online (server idle)", "grey", color))
+    elif not names:
+        out.append(paint(f"  {online} player(s) online (names not reported)",
+                         "grey", color))
+    else:
+        for name in names[:max(0, body_rows - 1)]:
+            address = addresses.get(name) or "connected"
+            out.append(paint(f"  {name}{dot}{address}", "white", color))
+    return out
+
+
+def _tier_label(tier):
+    low = (tier or "").lower()
+    if "tier2" in low:
+        return "compatibility shim"
+    if "tier3" in low:
+        return "runtime adapter"
+    return tier or "adapted"
+
+
+def _mods_section(snap, body_rows, cols, ascii_mode, color, dot):
+    if body_rows <= 0:
+        return []
+    mods = snap.get("mods", {})
+    active = int(mods.get("native", 0)) + int(mods.get("shim", 0))
+    fallback = int(mods.get("fallback", 0))
+    warnings = int(snap.get("mod_warnings", 0))
+    detail = f"{active} active"
+    if fallback:
+        detail += f"{dot}{fallback} fallback"
+    if warnings:
+        detail += f"{dot}{warnings} warning" + ("" if warnings == 1 else "s")
+    out = [_section_header("Mods", cols, ascii_mode, color, detail)]
+    details = snap.get("mod_details", [])
+    if not details:
+        out.append(paint("  No adapted mods recorded", "grey", color))
+        return out
+    for item in details[:max(0, body_rows - 1)]:
+        line = (f"  {item.get('file', '?')}{dot}{item.get('mod_id', '?')}"
+                f"{dot}{_tier_label(item.get('tier'))}"
+                f"{dot}{item.get('detail', '')}")
+        out.append(paint(line, "white", color))
+    return out
+
+
+def _body(snap, body_rows, cols, ascii_mode, color, ui, log_filter):
+    dot = _divider(ascii_mode)
+    view = ui.get("view")
+    if view is None:
+        view = "mods" if ui.get("mods") else "log"
+    if view == "players":
+        return _players_section(snap, body_rows, cols, ascii_mode, color, dot)
+    if view == "mods":
+        return _mods_section(snap, body_rows, cols, ascii_mode, color, dot)
+    return _log_section(snap, body_rows, cols, ascii_mode, color, log_filter,
+                        dot)
+
+
+def _footer_line(snap, cols, ascii_mode, color, ui, log_filter):
     if ui.get("stopping"):
         text = " stopping megu gracefully" + ("..." if ascii_mode else "…")
-        return paint(text, "yellow", color)
+        return paint(clip(text, cols), "yellow", color)
     if ui.get("exited") is not None:
+        dot = _divider(ascii_mode)
         text = f" megu exited{dot}code {ui['exited']}"
-        return paint(text, "grey", color)
+        return paint(clip(text, cols), "grey", color)
     if ui.get("cmd_mode"):
         cursor = "_" if ascii_mode else "█"
-        return " /" + ui.get("cmd_buf", "") + paint(cursor, "cyan", color)
-    view = "mods" if ui.get("mods") else "log"
-    text = (f" {snap.get('lines_seen', 0)} lines" + dot
-            + f"{snap.get('warnings', 0)} warn" + dot
-            + f"{snap.get('errors', 0)} err" + dot
-            + f"view:{view}" + dot + "q=stop m=mods /=cmd")
-    return paint(text, "grey", color)
+        prompt = " /" + ui.get("cmd_buf", "") + cursor
+        return paint(clip(prompt, cols), "cyan", color)
+    mode = normalize_log_filter(log_filter)
+    view = ui.get("view") or ("mods" if ui.get("mods") else "log")
+    player_key = "[p] log" if view == "players" else "[p] players"
+    mods_key = "[m] log" if view == "mods" else "[m] mods"
+    segments = [
+        paint("[/] cmd", "white", color),
+        paint(f"[f] filter:{mode}", "cyan", color),
+        paint(player_key, "white", color),
+        paint(mods_key, "white", color),
+        paint("[q] save & stop", "white", color),
+    ]
+    warnings = int(snap.get("warnings", 0))
+    errors = int(snap.get("errors", 0))
+    counts = (paint(f"{warnings} warn", "yellow" if warnings else "grey", color)
+              + paint(_divider(ascii_mode), "grey", color)
+              + paint(f"{errors} err", "red" if errors else "grey", color))
+    for separator in ("  ", " "):
+        line = separator.join(segments) + separator + counts
+        if vlen(line) <= cols:
+            return line
+    compact = (paint(f"{warnings}w {errors}e", "grey", color))
+    for separator in ("  ", " "):
+        line = separator.join(segments) + separator + compact
+        if vlen(line) <= cols:
+            return line
+    line = " ".join(segments) + " " + compact
+    return clip(line, cols)
 
 
-def render_frame(snap, cols, rows, ascii_mode=False, color=False, ui=None):
+def render_frame(snap, cols, rows, ascii_mode=False, color=False, ui=None,
+                 log_filter=None):
     """Render one dashboard frame as a list of `rows` strings.
 
     Every returned line is exactly `cols` visible columns (ANSI sequences do
     not count). The frame is a pure function of `snap`, `cols`, `rows`, and
     the flags - no clock, no randomness - so --demo-frame and
     --render-snapshot output is deterministic.
+
+    Layout: one-line header, a 1-3 row health/cards summary bar, then the
+    rest of the screen is clean log content, with a one-line footer.
     """
     cols = max(8, int(cols))
     rows = max(4, int(rows))
-    ui = ui or {}
-    dot = " " + _dot(ascii_mode) + " "
+    ui = dict(ui or {})
+    mode = normalize_log_filter(
+        log_filter if log_filter is not None
+        else ui.get("log_filter", "events"))
 
-    head = []
-    if rows >= 24 and cols >= 62:
-        logo = LOGO_ASCII if ascii_mode else LOGO
-        for index, row in enumerate(logo):
-            head.append(paint(row, "purple" if index % 2 == 0 else "pink", color))
-        head.append(paint(TAGLINE_ASCII if ascii_mode else TAGLINE, "cyan", color))
-        head.append("")
-    elif rows >= 15 and cols >= 26:
-        mark = WORDMARK_ASCII if ascii_mode else WORDMARK
-        head.append(paint(mark, "purple", color))
+    blocks = [_header_line(snap, cols, ascii_mode, color)]
+    if rows >= 8:
+        blocks.append(_health_line(snap, cols, ascii_mode, color))
+    if rows >= 10:
+        blocks.extend(_cards(snap, cols, ascii_mode, color))
 
-    head.append(_info_line(snap, ascii_mode, color))
-    if rows >= 16:
-        keys = (" [q] stop" + dot + "[m] mods" + dot + "[/] command" + dot
-                + "[Ctrl+C] shutdown")
-        head.append(paint(keys, "grey", color))
-    if rows >= 20:
-        head.append("")
+    # Keep at least one body line and the footer even on tiny terminals.
+    max_summary = max(1, rows - 2)
+    if len(blocks) > max_summary:
+        blocks = blocks[:max_summary]
 
-    tps_stat = (f"{fmt(snap.get('tps_cur'))}  min {fmt(snap.get('tps_min'))}  "
-                f"avg {fmt(snap.get('tps_avg'))}  [0..20]")
-    mspt_stat = (f"{fmt(snap.get('mspt_cur'), 1)}ms  "
-                 f"p95 {fmt(snap.get('mspt_p95'), 1)}ms  [0..50]")
-    mem_stat = (f"{fmt(snap.get('mem_cur'), 0)} MiB"
-                if snap.get("mem_cur") is not None else "n/a MiB")
-    threads = snap.get("threads")
-    if threads is not None:
-        mem_stat += f"  thr {threads}"
-    metrics = [
-        _metric_line("TPS", tps_stat, snap.get("tps", []), cols,
-                     _tps_band(snap.get("tps_cur")), ascii_mode, color,
-                     low=0.0, high=20.0),
-        _metric_line("MSPT", mspt_stat, snap.get("mspt", []), cols,
-                     _mspt_band(snap.get("mspt_cur")), ascii_mode, color,
-                     low=0.0, high=50.0),
-        _metric_line("MEM", mem_stat, snap.get("mem", []), cols,
-                     _mem_band(snap.get("mem_cur")), ascii_mode, color),
-    ]
-    cpu = snap.get("cpu", [])
-    if rows >= 26 and cpu:
-        cpu_stat = (f"{fmt(snap.get('cpu_cur'), 1)}%  "
-                    f"thr {threads if threads is not None else '?'}")
-        metrics.append(
-            _metric_line("CPU", cpu_stat, cpu, cols,
-                         _cpu_band(snap.get("cpu_cur")), ascii_mode, color,
-                         low=0.0))
+    body_rows = rows - len(blocks) - 1
+    body = []
+    if body_rows > 0:
+        body = _body(snap, body_rows, cols, ascii_mode, color, ui, mode)
 
-    cards = []
-    if rows >= 17:
-        cards = _cards(snap, cols, ascii_mode, color) or []
-    blocks = head + metrics + cards
-
-    avail = rows - len(blocks) - 1
-    log_section = []
-    if avail >= 1:
-        if ui.get("mods"):
-            log_section.append(_log_header("adapted mods (m: back to log)", cols,
-                                           ascii_mode, color))
-            details = snap.get("mod_details", [])
-            pool = [f"{d['file']} ({d['mod_id']}) {d['tier']}: {d['detail']}"
-                    for d in details] or ["no adapted mods recorded"]
-        else:
-            log_section.append(_log_header("server log", cols, ascii_mode, color))
-            pool = snap.get("log", [])
-        for line in pool[-(avail - 1):]:
-            clean = strip_ansi(line).rstrip()
-            if ascii_mode:
-                clean = asciify(clean)
-            log_section.append(_log_color(clean, color))
-
-    lines = blocks + log_section
+    lines = blocks + body[:body_rows]
     if len(lines) > rows - 1:
-        lines = lines[len(lines) - (rows - 1):]
+        lines = lines[:rows - 1]
     lines += [""] * (rows - 1 - len(lines))
-    lines.append(_bottom_line(snap, cols, ascii_mode, color, ui))
+    lines.append(_footer_line(snap, cols, ascii_mode, color, ui, mode))
 
     out = []
     for line in lines:
@@ -815,14 +1210,15 @@ DEMO_LOG = """\
 [live-mods] weirdmod.jar (weirdmod) tier3: 412 classes, 9 site(s) - mixin target missing
 [live-mods] liftcraft.jar (liftcraft) tier2 shim: 208 classes, 4 site(s) - damage hooks lifted
 [tick] observed_tps=19.97 avg_work_ms=8.21 max_work_ms=21.44 over_budget=0/100
-megu v0.6 listening 127.0.0.1:25599 (offline identities; no Mojang authentication)
-[lan] advertising "Megu demo server" on port 25599
+megu v1.21.1 listening 127.0.0.1:25565 (offline identities; no Mojang authentication)
+[lan] advertising "Megu demo server" on port 25565
 [spine] Alice joined from 127.0.0.1:51112 (uuid 0123456789abcdef0123456789abcdef)
 [spine] Bob joined from 127.0.0.1:51130 (uuid fedcba9876543210fedcba9876543210)
+[chat] Alice: hello from the demo world
 [sz] t=400 VmRSS: 523264 kB | mobs=42 drops=7 xps=3 arrows=0 bob=1 pearl=0 primed=0 chests=18 furn=6 crops=11 world=0 inv=2 clients=2
 [tick] observed_tps=19.41 avg_work_ms=44.10 max_work_ms=58.02 over_budget=3/100
 [spine] Alice left (from 127.0.0.1:51112)
-Status: Busy (19.4 TPS, 44.1 ms/tick)
+Status: Running (19.9 TPS, 11.5 ms/tick)
 Players: 2/20 (Bob, Carol)
 Loaded chunks: 1284
 Memory: 511 MB
@@ -1119,34 +1515,96 @@ def read_stdin(fd, timeout):
         return b""
 
 
+def _toggle_view(state, name):
+    current = state.get("view")
+    if current is None:
+        current = "mods" if state.get("mods") else "log"
+    state["view"] = "log" if current == name else name
+
+
 def handle_keys(data, state, proc):
-    for byte in data:
+    """Apply raw terminal bytes to dashboard state; forward submitted commands."""
+    if "log_filter" not in state:
+        state["log_filter"] = "events"
+    if "history" not in state:
+        state["history"] = []
+    if "history_index" not in state:
+        state["history_index"] = len(state["history"])
+    index = 0
+    while index < len(data):
+        byte = data[index]
         if state["cmd_mode"]:
+            if byte == 0x1B:
+                sequence = data[index + 1:index + 3]
+                if sequence == b"[A":
+                    history = state["history"]
+                    if history:
+                        position = max(0, state["history_index"] - 1)
+                        state["history_index"] = position
+                        state["cmd_buf"] = history[position]
+                    index += 3
+                    continue
+                if sequence == b"[B":
+                    history = state["history"]
+                    position = min(len(history), state["history_index"] + 1)
+                    state["history_index"] = position
+                    state["cmd_buf"] = (history[position]
+                                        if position < len(history) else "")
+                    index += 3
+                    continue
+                if sequence in (b"[C", b"[D"):
+                    index += 3
+                    continue
+                state["cmd_mode"] = False
+                state["cmd_buf"] = ""
+                index += 1
+                continue
             if byte in (0x0D, 0x0A):
-                send_line(proc, state["cmd_buf"])
+                command = state["cmd_buf"]
+                if command.strip():
+                    send_line(proc, command)
+                    history = state["history"]
+                    if not history or history[-1] != command:
+                        history.append(command)
+                    del history[:-50]
                 state["cmd_buf"] = ""
                 state["cmd_mode"] = False
+                state["history_index"] = len(state["history"])
             elif byte in (0x7F, 0x08):
                 state["cmd_buf"] = state["cmd_buf"][:-1]
-            elif byte == 0x1B:
-                state["cmd_mode"] = False
-                state["cmd_buf"] = ""
+                state["history_index"] = len(state["history"])
             elif 0x20 <= byte < 0x7F:
                 state["cmd_buf"] += chr(byte)
-        else:
-            if byte == 0x03 or chr(byte) == "q":
-                state["quit"] = True
-            elif chr(byte) == "m":
-                state["mods"] = not state["mods"]
-            elif chr(byte) == "/":
-                state["cmd_mode"] = True
-                state["cmd_buf"] = ""
+                state["history_index"] = len(state["history"])
+            index += 1
+            continue
+
+        char = chr(byte)
+        if byte == 0x03 or char == "q":
+            state["quit"] = True
+        elif char == "f":
+            state["log_filter"] = cycle_log_filter(
+                state.get("log_filter", "events"))
+        elif char == "p":
+            _toggle_view(state, "players")
+        elif char == "m":
+            _toggle_view(state, "mods")
+        elif char == "/":
+            state["cmd_mode"] = True
+            state["cmd_buf"] = ""
+            state["history_index"] = len(state.get("history", []))
+        index += 1
 
 
 def render_key(parser, state, cols, rows):
     """Compact dirty-frame key: a frame is redrawn only while this changes."""
-    return (parser.revision, state.get("mods"), state.get("cmd_mode"),
-            state.get("cmd_buf"), state.get("stopping"), cols, rows)
+    view = state.get("view")
+    if view is None:
+        view = "mods" if state.get("mods") else "log"
+    return (parser.revision, view, state.get("cmd_mode"),
+            state.get("cmd_buf"), state.get("history_index"),
+            normalize_log_filter(state.get("log_filter", "events")),
+            state.get("stopping"), state.get("exited"), cols, rows)
 
 
 def tui_loop(proc, parser, lock, threads, state, term, args, color):
@@ -1199,9 +1657,10 @@ def tui_loop(proc, parser, lock, threads, state, term, args, color):
                 key = render_key(parser, state, size.columns, size.lines)
                 if key != prev_key:
                     snap = parser.snapshot()
-                    frame = render_frame(snap, size.columns, size.lines,
-                                         ascii_mode=args.ascii_mode,
-                                         color=color, ui=state)
+                    frame = render_frame(
+                        snap, size.columns, size.lines,
+                        ascii_mode=args.ascii_mode, color=color, ui=state,
+                        log_filter=state.get("log_filter", args.log_filter))
                     term.write("\x1b[H" + "\r\n".join(frame) + "\x1b[J")
                     prev_key = key
     for thread in threads:
@@ -1242,7 +1701,9 @@ def run_tui(command, args):
     parser = MetricsParser()
     lock = threading.Lock()
     state = {"quit": False, "stopping": False, "stop_sent": False,
-             "mods": False, "cmd_mode": False, "cmd_buf": "",
+             "view": "log", "cmd_mode": False, "cmd_buf": "",
+             "history": [], "history_index": 0,
+             "log_filter": normalize_log_filter(args.log_filter),
              "sigterm": False, "cpu_sample": None}
 
     def reader(pipe):
@@ -1312,9 +1773,13 @@ def color_ok(env):
 
 
 def want_tui(args, env, stdin, stdout):
-    if args.plain or args.no_tui:
+    """Select the dashboard: explicit --tui still respects terminal safety."""
+    if args.plain or getattr(args, "no_tui", False):
         return False
-    return tui_capable(env, stdin.isatty(), stdout.isatty())
+    capable = tui_capable(env, stdin.isatty(), stdout.isatty())
+    if getattr(args, "tui", False):
+        return capable
+    return capable
 
 
 def frame_color(args, env):
@@ -1330,13 +1795,15 @@ def frame_color(args, env):
 def build_parser():
     parser = argparse.ArgumentParser(
         prog="megu_tui",
-        description="megu server terminal dashboard / safe passthrough wrapper",
+        description="megu smart server dashboard / safe passthrough wrapper",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog=(
             "examples:\n"
-            "  %(prog)s --server-bin ./target/release/megu -- --port 25599\n"
-            "  %(prog)s --demo-frame --cols 100 --rows 28\n"
-            "  %(prog)s --render-snapshot server.log\n"
+            "  %(prog)s --server-bin ./target/release/megu -- --port 25565\n"
+            "  %(prog)s --demo-frame --cols 92 --rows 22\n"
+            "  %(prog)s --demo-frame --log-filter all --ascii\n"
+            "  %(prog)s --cli --server-bin ./megu -- --port 25565\n"
+            "  %(prog)s --render-snapshot server.log --log-filter alerts\n"
         ),
     )
     parser.add_argument("--server-bin", metavar="PATH",
@@ -1345,14 +1812,19 @@ def build_parser():
                         help="frame width (default: terminal size or 80)")
     parser.add_argument("--rows", type=int, default=0,
                         help="frame height (default: terminal size or 24)")
-    parser.add_argument("--plain", action="store_true",
-                        help="force plain-text passthrough, never a TUI")
-    parser.add_argument("--no-tui", action="store_true",
-                        help="alias for --plain")
+    parser.add_argument("--plain", "--no-tui", "--cli", "--nogui",
+                        dest="plain", action="store_true",
+                        help="force plain-text passthrough, never a TUI "
+                             "(--no-tui/--cli/--nogui are aliases)")
+    parser.add_argument("--tui", action="store_true",
+                        help="explicitly request the dashboard on an "
+                             "interactive TTY (auto-detected by default)")
     parser.add_argument("--ascii", dest="ascii_mode", action="store_true",
                         help="pure-ASCII glyphs and no color")
     parser.add_argument("--color", action="store_true",
                         help="force ANSI color in frame modes even when piped")
+    parser.add_argument("--log-filter", choices=LOG_FILTERS, default="events",
+                        help="event log filter: events (default), alerts, all")
     parser.add_argument("--demo-frame", action="store_true",
                         help="render one deterministic demo frame and exit")
     parser.add_argument("--render-snapshot", metavar="FILE",
@@ -1388,7 +1860,8 @@ def main(argv=None):
         frame = render_frame(
             parser.snapshot(), cols, rows,
             ascii_mode=args.ascii_mode or args.plain,
-            color=frame_color(args, os.environ))
+            color=frame_color(args, os.environ),
+            log_filter=args.log_filter)
         write_stdout("\n".join(frame) + "\n")
         return 0
 
