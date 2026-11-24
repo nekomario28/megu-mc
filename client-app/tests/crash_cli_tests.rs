@@ -156,7 +156,13 @@ fn crash_reports_dir_flush_and_confirm_flags_parse() {
 #[test]
 fn crash_flags_fold_into_resolved_settings_without_marking_custom() {
     let dir = scratch_dir("fold");
+    // `--preset balanced` pins the graphics base so the assertion does not
+    // depend on probed host hardware: a bare first launch on a lean/headless
+    // host auto-tunes to `Fast` (or `Custom` on a strong one), which is not
+    // what this test is about.
     let mut cfg = parse_args(&[
+        "--preset",
+        "balanced",
         "--crash-report-mode",
         "auto_crash_only",
         "--report-endpoint",

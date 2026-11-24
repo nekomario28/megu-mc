@@ -81,14 +81,18 @@ pub struct MeguPaths {
 
 /// XDG-aware absolute-path env lookup: per the freedesktop basedir spec a
 /// relative or empty value is invalid and must be ignored entirely.
+///
+/// "Absolute" here is the spec's POSIX rule — the value begins with `/` —
+/// not `Path::is_absolute`, which answers for the *host* OS. The resolver
+/// models the *target* OS's layout, so a test exercising `TargetOs::Linux`
+/// semantics on a Windows host still honours `/`-rooted XDG values.
 fn xdg_env_dir<F>(env_get: &F, name: &str) -> Option<PathBuf>
 where
     F: Fn(&str) -> Option<String>,
 {
     env_get(name)
-        .filter(|v| !v.is_empty())
+        .filter(|v| !v.is_empty() && v.starts_with('/'))
         .map(PathBuf::from)
-        .filter(|p| p.is_absolute())
 }
 
 /// Any non-empty home-style env value, used as the last-resort anchor.

@@ -19,6 +19,12 @@ ignore = [
     # keypair per server boot (no persistent RSA key), and no fixed 0.9.x
     # release of `rsa` exists yet.
     { id = "RUSTSEC-2023-0071", reason = "Minecraft protocol 767 requires RSA PKCS#1 v1.5 for ephemeral per-boot login handshake; no patched rsa 0.9.x release exists" },
+    # ttf-parser 0.25.1 is an unavoidable transitive dependency of the client-gpu
+    # winit stack: winit 0.30 -> sctk-adwaita (Wayland CSD) -> ab_glyph ->
+    # owned_ttf_parser -> ttf-parser. The advisory is informational-only
+    # (unmaintained, no CVE/security impact) and names no patched release; the
+    # suggested skrifa migration has to happen upstream in ab_glyph/sctk-adwaita.
+    { id = "RUSTSEC-2026-0192", reason = "informational unmaintained notice only; ttf-parser is transitive via winit -> sctk-adwaita -> ab_glyph and has no patched release" },
 ]
 
 [licenses]

@@ -48,10 +48,11 @@ case "${MUTATION_STABILITY:-0}" in
 # `resourcepack.zip`; that file was removed as unprovenanced (see THIRD_PARTY.md) and the server
 # now simply advertises no resource pack, so there is nothing to copy. Everything else (specs,
 # .git, target, caches) is not an input and is not copied.
-# The manifest also resolves three optional path crates (`create-offload`), so their
-# manifests travel with the copy or cargo cannot read the dependency graph at all.
+# The manifest also resolves path crates (`create-offload` optionals plus the
+# default `megu-server-files` dependency), so their manifests travel with the
+# copy or cargo cannot read the dependency graph at all.
 INPUTS=(Cargo.toml Cargo.lock rust-toolchain.toml src tests tools assets datapacks evidence \
-    core proto mod-adapter-core create-adapter mod-offload state-store)
+    core proto mod-adapter-core create-adapter mod-offload state-store server-files)
 RUNTIME_INPUTS=(config_packets.bin)
 
 fail() {
@@ -1700,12 +1701,12 @@ check "aquifer spline keeps the native float interpolation order" \
         (lerp(t, v0, v1) + t * (1.0 - t) * lerp(t, d0t, d1t)) as f64
     }
 
-    fn eval0_c(' \
+     fn eval0_c(' \
   '        let lerp = |delta: f32, start: f32, end: f32| (1.0 - delta) * start + delta * end;
         (lerp(t, v0, v1) + t * (1.0 - t) * lerp(t, d0t, d1t)) as f64
     }
 
-    fn eval0_c(' \
+     fn eval0_c(' \
   aquifer_matches_the_pinned_chunk_through_its_public_api
 
 check "aquifer deep test keeps the depth threshold" \

@@ -4,15 +4,30 @@ import contextlib
 import json
 import os
 from pathlib import Path
+import re
 import shutil
 import subprocess
 import sys
 import tempfile
+import tomllib
 import unittest
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "tools"))
 from rust_module_graph import references, split_modules, tokens
+
+
+def local_path_deps(manifest):
+    """Every `path = "..."` dependency in a Cargo.toml, across all dep tables."""
+    data = tomllib.loads(manifest.read_text())
+    tables = [data.get(k, {}) for k in
+              ("dependencies", "dev-dependencies", "build-dependencies")]
+    for cfg in data.get("target", {}).values():
+        if isinstance(cfg, dict):
+            tables += [cfg.get(k, {}) for k in
+                       ("dependencies", "dev-dependencies", "build-dependencies")]
+    return {spec["path"] for table in tables for spec in table.values()
+            if isinstance(spec, dict) and "path" in spec}
 
 
 @contextlib.contextmanager
@@ -30,10 +45,27 @@ def fixture():
         for name in ("Cargo.toml", "Cargo.lock"):
             shutil.copy2(ROOT / name, root / name)
         (root / "assets").symlink_to(ROOT / "assets", target_is_directory=True)
-        for dep in ("core", "state-store", "mod-offload", "mod-adapter-core", "create-adapter"):
-            src_dep = ROOT / dep
+        # Every local path crate named by the manifest must resolve inside the
+        # sandbox (their own `../sibling` path deps land on the real checkout
+        # through the same symlinks), so a new `path = "..."` dependency can
+        # never make the sandbox's `cargo rustc` expansion fail again.
+        mounts = set(local_path_deps(ROOT / "Cargo.toml"))
+        # `src/*.rs` may also mount files outside `src/` via `#[path = "../dir/…"]`
+        # (e.g. main.rs mounts proto/src/wire.rs); those top-level dirs must
+        # resolve too. `#[path]` resolves against the source file's directory.
+        for src in (ROOT / "src").glob("*.rs"):
+            for rel in re.findall(r'#\s*\[\s*path\s*=\s*"([^"]+)"', src.read_text()):
+                parts = Path(os.path.normpath(Path("src") / rel)).parts
+                if parts and parts[0] != "src":
+                    i = next((i for i, p in enumerate(parts) if p != ".."),
+                             len(parts) - 1)
+                    mounts.add(str(Path(*parts[:i + 1])))
+        for dep in sorted(mounts):
+            src_dep = (ROOT / dep).resolve()
             if src_dep.is_dir():
-                (root / dep).symlink_to(src_dep, target_is_directory=True)
+                dst = root / dep
+                dst.parent.mkdir(parents=True, exist_ok=True)
+                dst.symlink_to(src_dep, target_is_directory=True)
         for name in ("rust_module_graph.py", "check_layers.py"):
             shutil.copy2(ROOT / "tools" / name, root / "tools" / name)
         for name in ("deps.py", "deps_target.py", "policy.json", "gate_probe.py"):
