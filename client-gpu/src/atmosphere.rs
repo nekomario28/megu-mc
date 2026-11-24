@@ -6,6 +6,9 @@
 //! * [`BiomeAtmosphereBlender`] — exponential `dt_sec`-driven lerp of sky
 //!   zenith/horizon, fog color/density, and underwater/cave depth tint so
 //!   crossing a biome border or ascending into orbit never hard-cuts.
+//! * [`blend_dimension_crossfade`] — cubic-smoothstep crossfade between
+//!   two resolved atmospheres for Phase-1 seamless portal transfers, so a
+//!   dimension swap eases every channel instead of flashing.
 //! * [`ChunkFadeTracker`] — per-`(cx, cz)` arrival ages producing a smooth
 //!   `0.0 -> 1.0` fade over a quarter second.
 //! * [`voxel_clouds_to_geometry`], [`planet_body_to_geometry`],
@@ -209,6 +212,32 @@ pub fn blend_water_transition(
         sun_intensity: a.sun_intensity + (u.sun_intensity - a.sun_intensity) * s,
     }
     .sanitized()
+}
+
+/// Phase-1 seamless dimension transfer crossfade: cubic-smoothstep
+/// (`t = p*p*(3-2p)` on clamped `progress`) linear blend of every
+/// [`AtmosphereParams`] channel — zenith/horizon/fog colors, density,
+/// depth tint, ambient and sun — so Overworld ↔ Nether ↔ End ↔ custom
+/// mod-dimension transfers glide with zero harsh flash. `progress <= 0`
+/// reproduces `from`, `>= 1` reproduces `to`; inputs and output are
+/// sanitized like [`blend_water_transition`].
+pub fn blend_dimension_crossfade(
+    from: &AtmosphereParams,
+    to: &AtmosphereParams,
+    progress: f32,
+) -> AtmosphereParams {
+    // Pin the endpoints exactly: `a + (b - a) * t` is not bit-identical
+    // to `b` at t = 1, and the landing frame must reproduce the
+    // destination palette precisely so the fade finishes flash-free.
+    // NaN `progress` fails both comparisons and falls through to the
+    // blend, where `clean` folds it to `from` anyway.
+    if progress <= 0.0 {
+        return from.sanitized();
+    }
+    if progress >= 1.0 {
+        return to.sanitized();
+    }
+    blend_water_transition(from, to, progress)
 }
 
 /// Horizon-melt factor in `0.0..=1.0` for one cloud cell at
@@ -1162,5 +1191,101 @@ mod tests {
         let styled_quads: usize = crisp_batches.iter().map(|b| b.indices.len() / 6).sum();
         let (_, classic_idx) = voxel_clouds_to_geometry(&cells, &lighting);
         assert_eq!(styled_quads, classic_idx.len() / 6);
+    }
+
+    /// Nether-ish destination palette for the crossfade tests: crimson
+    /// haze, dim ambient — far enough from [`AtmosphereParams::default`]
+    /// that a wrong blend endpoint or t direction is immediately visible.
+    fn nether_atmosphere() -> AtmosphereParams {
+        AtmosphereParams {
+            sky_zenith_rgb: [0.35, 0.05, 0.04],
+            sky_horizon_rgb: [0.55, 0.10, 0.06],
+            fog_rgb: [0.55, 0.10, 0.06],
+            fog_density: 0.05,
+            depth_tint_rgb: [0.9, 0.4, 0.3],
+            depth_tint_strength: 0.2,
+            ambient_rgb: [0.30, 0.12, 0.10],
+            sun_intensity: 0.4,
+        }
+    }
+
+    #[test]
+    fn blend_dimension_crossfade_hits_exact_endpoints() {
+        let from = AtmosphereParams::default();
+        let to = nether_atmosphere();
+        for progress in [f32::NEG_INFINITY, -1.0, -0.0, 0.0] {
+            assert_eq!(
+                blend_dimension_crossfade(&from, &to, progress),
+                from,
+                "progress {progress} must pin `from`"
+            );
+        }
+        for progress in [1.0, 1.5, f32::INFINITY] {
+            assert_eq!(
+                blend_dimension_crossfade(&from, &to, progress),
+                to,
+                "progress {progress} must pin `to`"
+            );
+        }
+    }
+
+    #[test]
+    fn blend_dimension_crossfade_midpoint_is_strictly_intermediate_and_finite() {
+        let from = AtmosphereParams::default();
+        let to = nether_atmosphere();
+        let mid = blend_dimension_crossfade(&from, &to, 0.5);
+        // Smoothstep(0.5) == 0.5 exactly, so each channel sits at the
+        // arithmetic midpoint; strict bounds + finiteness still asserted.
+        let channels = |p: &AtmosphereParams| {
+            [
+                p.sky_zenith_rgb[0],
+                p.sky_zenith_rgb[1],
+                p.sky_zenith_rgb[2],
+                p.sky_horizon_rgb[0],
+                p.sky_horizon_rgb[1],
+                p.sky_horizon_rgb[2],
+                p.fog_rgb[0],
+                p.fog_rgb[1],
+                p.fog_rgb[2],
+                p.fog_density,
+                p.depth_tint_rgb[0],
+                p.depth_tint_rgb[1],
+                p.depth_tint_rgb[2],
+                p.depth_tint_strength,
+                p.ambient_rgb[0],
+                p.ambient_rgb[1],
+                p.ambient_rgb[2],
+                p.sun_intensity,
+            ]
+        };
+        let (a, b, m) = (channels(&from), channels(&to), channels(&mid));
+        for i in 0..a.len() {
+            assert!(m[i].is_finite(), "mid channel {i} must be finite");
+            let (lo, hi) = (a[i].min(b[i]), a[i].max(b[i]));
+            assert!(
+                m[i] > lo && m[i] < hi,
+                "channel {i} must sit strictly between {} and {}, got {}",
+                a[i],
+                b[i],
+                m[i]
+            );
+            let expected = (a[i] + b[i]) * 0.5;
+            assert!(
+                (m[i] - expected).abs() < 1e-6,
+                "smoothstep(0.5)=0.5 ⇒ midpoint channel {i}: {} vs {expected}",
+                m[i]
+            );
+        }
+    }
+
+    #[test]
+    fn blend_dimension_crossfade_stays_finite_on_hostile_input() {
+        let from = AtmosphereParams::default();
+        let to = nether_atmosphere();
+        for progress in [f32::NAN, -f32::NAN, f32::EPSILON, 0.999_999] {
+            let blended = blend_dimension_crossfade(&from, &to, progress);
+            let p = blended.sanitized();
+            assert_eq!(blended, p, "blend output must already be sanitized");
+        }
     }
 }

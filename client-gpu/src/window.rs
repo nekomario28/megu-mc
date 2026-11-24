@@ -18,7 +18,9 @@ use megu_client::friends_store::{
     FriendShareMode as StoreShareMode, FriendsStore, load_or_create_identity,
 };
 use megu_client::integrated;
-use megu_client::protocol::{ItemStackComponents, NbtValue, WireReader, encode_slot_stack};
+use megu_client::protocol::{
+    ItemComponentPatch, ItemStackComponents, NbtValue, WireReader, encode_slot_stack,
+};
 use megu_client::render::{FrameBudgetGovernor, RenderConfig, ThrottleStage};
 use megu_client::server_list::{ServerEntry, ServerListStore};
 use megu_client::settings::{
@@ -38,12 +40,13 @@ use megu_client_mesh::builtin_shadow_wgsl::{
 };
 use megu_client_mesh::entity_rig::{
     EntityPose, EntityRigSpec, build_entity_rig_mesh_with_mouth_item,
+    classify_entity_rig_or_fallback,
 };
 use megu_client_mesh::mesher::classify_vanilla_ber;
 use megu_client_mesh::tactile_effects::{
     TactileEffectsConfig, TactileParticle, TactileParticleKind, TactilePreset,
 };
-use megu_client_mesh::vanilla_plus_3d::ExtrudedMesh;
+use megu_client_mesh::vanilla_plus_3d::{ExtrudedMesh, ExtrudedQuad};
 use megu_client_mesh::vanilla_plus_nature::{NatureParticle, NatureParticleKind};
 use megu_client_mesh::vfx_engine::{ParticleDraw, ParticleOrientation, VfxFrameOutput};
 use megu_core::hash::{FNV1A64_OFFSET_BASIS, FNV1A64_PRIME, Fnv1a64};
@@ -65,6 +68,10 @@ use megu_ui::recipe_browser::{
     BrowserTab, DetailMode, ItemEntry, RecipeBrowserAction, RecipeBrowserState,
 };
 use megu_proto::frl_e2ee::{FriendAllowlist, Frl3GuestToken, Frl3Identity, parse_friend_id};
+use megu_proto::seamless_portal::{
+    SEAMLESS_PORTAL_CHANNEL, SeamlessDimTransitionState, SeamlessPortalPacket,
+    decode_seamless_portal_packet,
+};
 use megu_ui::sign_and_chat::SignEditorState;
 use megu_ui::state::{
     CrashReportMode as UiCrashReportMode, DisconnectedScreenState, FriendListEntry,
@@ -80,10 +87,13 @@ use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop};
 use winit::keyboard::{KeyCode, ModifiersState, PhysicalKey};
 use winit::window::{CursorGrabMode, Fullscreen, Window, WindowAttributes, WindowId};
 
+use crate::atmosphere::{
+    BiomeAtmosphereBlender, ChunkFadeTracker, blend_dimension_crossfade,
+};
 use crate::clipboard::{ClipboardOutcome, SystemClipboard};
 use crate::live_session::{
-    CrosshairPick, LiveSession, PlayerMovement, PlayerPose, SessionPaths, SessionStatus,
-    jar_version_ids,
+    CrosshairPick, EntityContactShadowQuad, LiveSession, PlayerMovement, PlayerPose, SessionPaths,
+    SessionStatus, jar_version_ids,
 };
 use crate::renderer::{GpuRenderer, request_gpu_device};
 use crate::subworld_sync::SubWorldHelmCmd;
@@ -869,6 +879,12 @@ pub struct GpuApp {
     /// Live entity + block-entity mesh staging cache (20 Hz throttle —
     /// the server tick cadence positions actually move at).
     entity_render_cache: LiveEntityRenderCache,
+    /// Phase-1 seamless dimension transfer (`megu:portal_seamless_v1`)
+    /// client state machine: standby prefetch + committed crossfade.
+    /// Fed by [`Self::apply_seamless_portal_channel`], advanced by the
+    /// monotonic frame delta, and consumed by the render path for the
+    /// sky/fog blend and the loading-overlay suppression.
+    seamless_portal: SeamlessDimTransitionState,
     /// Timestamp of the previous physical Space press — the vanilla
     /// ~7-tick double-jump window used by `LiveSession::toggle_flight`
     /// (key repeats are filtered upstream, so every `Pressed` is real).
@@ -893,6 +909,10 @@ struct LiveEntityRenderCache {
     /// per-kind constants, so every placed block entity of a family
     /// shares one mesh.
     ber_meshes: [Option<ExtrudedMesh>; BER_KIND_SLOTS],
+    /// Per-refresh scratch holding the converted live contact-shadow
+    /// quads (`mesh`, folded rgb tint) so their `&ExtrudedMesh` borrows
+    /// outlive the staging call — empty while `entity_shadows` is off.
+    contact_shadow_quads: Vec<(ExtrudedMesh, [f32; 3])>,
     /// Earliest next rebuild instant (20 Hz — the server tick cadence).
     next_refresh: Option<Instant>,
     /// `true` while the renderer's entity/BER ring holds a non-empty
@@ -905,6 +925,7 @@ impl Default for LiveEntityRenderCache {
         Self {
             entity_meshes: std::collections::HashMap::new(),
             ber_meshes: std::array::from_fn(|_| None),
+            contact_shadow_quads: Vec::new(),
             next_refresh: None,
             staged: false,
         }
@@ -1103,6 +1124,7 @@ impl GpuApp {
             particle_scratch: Vec::new(),
             live_particles_staged: false,
             entity_render_cache: LiveEntityRenderCache::default(),
+            seamless_portal: SeamlessDimTransitionState::new(),
             last_space_press: None,
             last_frame: Instant::now(),
             frame_start: Instant::now(),
@@ -1398,6 +1420,47 @@ impl GpuApp {
         }
     }
 
+    /// Feed one raw `megu:portal_seamless_v1` (`MSP1`) channel payload
+    /// into the Phase-1 seamless dimension transfer state machine.
+    /// `false` for any other channel or a frame the fail-closed codec
+    /// rejects — the caller keeps handling those as ordinary unknown
+    /// channels. S2C variants drive standby-prefetch/commit bookkeeping;
+    /// a `PrefetchAck` seen in-band is ignored (acks flow C2S only).
+    #[doc(hidden)]
+    pub fn apply_seamless_portal_channel(&mut self, channel: &str, payload: &[u8]) -> bool {
+        if channel != SEAMLESS_PORTAL_CHANNEL {
+            return false;
+        }
+        let Ok(packet) = decode_seamless_portal_packet(payload) else {
+            return false;
+        };
+        match packet {
+            SeamlessPortalPacket::PrefetchHint(hint) => {
+                self.seamless_portal.on_prefetch_hint(&hint);
+            }
+            SeamlessPortalPacket::PrefetchCancel { transfer_id } => {
+                self.seamless_portal.on_prefetch_cancel(transfer_id);
+            }
+            SeamlessPortalPacket::CommitTransfer(commit) => {
+                self.seamless_portal.on_commit_transfer(&commit);
+            }
+            SeamlessPortalPacket::PrefetchAck { .. } => {}
+        }
+        true
+    }
+
+    /// `true` while the Phase-1 seamless transfer committed the live
+    /// session's current dimension — a blocking "Loading Terrain" overlay
+    /// (and the per-chunk arrival dissolve) must stay suppressed so the
+    /// swap lands in one frame with zero black screen.
+    #[doc(hidden)]
+    pub fn seamless_loading_suppressed(&self) -> bool {
+        self.live.as_ref().is_some_and(|live| {
+            self.seamless_portal
+                .should_suppress_loading_screen(&live.world.dimension.name)
+        })
+    }
+
     /// Rebuild the live entity + block-entity draw set: articulated rig
     /// meshes keyed by entity id + pose fingerprint (rebuilt only when
     /// the spec or pose actually changes), plus one canonical template
@@ -1409,44 +1472,53 @@ impl GpuApp {
         live: &LiveSession,
         cache: &mut LiveEntityRenderCache,
         renderer: &mut GpuRenderer,
+        entity_shadows: bool,
+        enchantment_glint: bool,
     ) {
-        cache
-            .entity_meshes
-            .retain(|eid, _| live.entity_rig(*eid).is_some());
+        cache.entity_meshes.retain(|eid, _| {
+            live.entity_rig(*eid).is_some() || live.world.entities.contains_key(eid)
+        });
         // Pass 1 mutates the caches (new/pose-changed meshes only); pass
         // 2 then borrows them immutably to assemble the draw list — the
         // renderer consumes `&ExtrudedMesh` refs so no mesh is cloned.
         let mut entity_refs: Vec<(i32, [f32; 3], [f32; 3])> = Vec::new();
         for (eid, spec, pos, tracked) in live.entity_render_entries() {
-            let pose = live_entity_pose(live, eid, tracked);
-            // The fox (id 42) carries pickups in its mouth slot: the held
-            // item id joins the cache key so pick-up/drop rebuilds the
-            // mesh immediately, without waiting on a pose change.
-            let mouth_item_id = if spec.entity_type_id == FOX_ENTITY_TYPE_ID {
-                live.entity_mainhand_item_id(eid).filter(|id| *id != 0)
-            } else {
-                None
-            };
-            let key = entity_pose_key(spec, &pose, mouth_item_id);
-            if cache.entity_meshes.get(&eid).is_none_or(|(k, _)| *k != key) {
-                cache.entity_meshes.insert(
-                    eid,
-                    (
-                        key,
-                        build_entity_rig_mesh_with_mouth_item(
-                            spec,
-                            pose,
-                            mouth_item_id.map(mouth_item_rgb),
-                        ),
-                    ),
-                );
-            }
-            entity_refs.push((
+            stage_live_entity(
+                live,
+                cache,
+                &mut entity_refs,
+                enchantment_glint,
                 eid,
-                [pos[0] as f32, pos[1] as f32, pos[2] as f32],
-                live_entity_tint(spec, tracked),
-            ));
+                spec,
+                pos,
+                tracked,
+            );
         }
+        // Never-invisible modded entities: `add_entity` classified only
+        // ids inside the vanilla table, so a registry id outside it
+        // (modded `> u16::MAX` or unmapped) owns no `entity_rigs` entry
+        // and `entity_render_entries` skipped it above — resolve a
+        // visible `GenericProxy` rig instead of dropping the entity.
+        for (eid, spec, pos, tracked) in unrigged_entity_fallbacks(live) {
+            stage_live_entity(
+                live,
+                cache,
+                &mut entity_refs,
+                enchantment_glint,
+                eid,
+                spec,
+                pos,
+                Some(tracked),
+            );
+        }
+        // Grounded contact shadows ride the same lit entity/BER list —
+        // each quad samples world light at its centroid through the same
+        // `sample_live_entity_light` closure the rigs use, gated on the
+        // `entity_shadows` settings key.
+        cache.contact_shadow_quads.clear();
+        cache
+            .contact_shadow_quads
+            .extend(staged_contact_shadow_quads(live, entity_shadows));
         let mut ber_refs: Vec<(usize, [f32; 3], [f32; 3])> = Vec::new();
         for (block_pos, be) in &live.world.block_entities {
             let Some(kind) = classify_tracked_block_entity(be) else {
@@ -1467,12 +1539,18 @@ impl GpuApp {
                 vanilla_ber_base_color_f32(kind),
             ));
         }
-        let mut meshes: Vec<(&ExtrudedMesh, [f32; 3], [f32; 3])> =
-            Vec::with_capacity(entity_refs.len() + ber_refs.len());
+        let mut meshes: Vec<(&ExtrudedMesh, [f32; 3], [f32; 3])> = Vec::with_capacity(
+            entity_refs.len() + ber_refs.len() + cache.contact_shadow_quads.len(),
+        );
         for (eid, origin, tint) in entity_refs {
             if let Some((_, mesh)) = cache.entity_meshes.get(&eid) {
                 meshes.push((mesh, origin, tint));
             }
+        }
+        for (shadow_mesh, tint) in &cache.contact_shadow_quads {
+            // Positions are already world-space (`floor_top + 0.015`), so
+            // the staging origin stays at zero.
+            meshes.push((shadow_mesh, [0.0, 0.0, 0.0], *tint));
         }
         for (slot, origin, tint) in ber_refs {
             if let Some(mesh) = cache.ber_meshes[slot].as_ref() {
@@ -4351,6 +4429,15 @@ impl GpuApp {
                 self.camera.yaw_deg = (pose.yaw + 180.0).rem_euclid(360.0);
                 self.camera.pitch_deg = (-pose.pitch).clamp(-89.9, 89.9);
             }
+            // Phase-1 seamless transfer: the committed crossfade advances
+            // on the monotonic frame delta (Instant — zero SystemTime),
+            // and the state machine's "current" atmosphere stays pinned
+            // to what the biome blender actually shows so the next
+            // commit eases from real sky/fog colors, never stale defaults.
+            self.seamless_portal.advance_ms(dt * 1000.0);
+            let atmo = live.atmosphere_blender.current();
+            self.seamless_portal
+                .set_current_atmosphere(atmo.sky_horizon_rgb, atmo.fog_rgb);
         }
         let rain_level = self
             .live
@@ -4534,6 +4621,12 @@ impl GpuApp {
                     live,
                     &mut self.entity_render_cache,
                     &mut active.renderer,
+                    // `entity_shadows` is a file-only `ClientSettings`
+                    // key (no Video widget owns it), so the persisted
+                    // mirror is the live gate; `enchantment_glint` reads
+                    // the real Video toggle like the 2D path does.
+                    self.persisted_settings.entity_shadows,
+                    self.ui.settings.video.enchantment_glint,
                 );
             }
             // First live frame on the windowed path: hand the sink to the
@@ -4808,13 +4901,46 @@ impl GpuApp {
                             &mut self.live_particles_staged,
                             &mut active.renderer,
                         );
+                        // Phase-1 seamless dimension transfer: while the
+                        // committed crossfade is in flight, fold its eased
+                        // sky/fog into this frame's atmosphere so the swap
+                        // glides instead of hard-cutting; while the
+                        // committed dimension's loading screen stays
+                        // suppressed, the per-chunk arrival dissolve is
+                        // swapped for an instantly-settled tracker so
+                        // prefetched terrain pops in with zero black beat.
+                        let portal_atmosphere = self.seamless_portal.blended_sky_and_fog().map(
+                            |(sky_rgb, fog_rgb, progress)| {
+                                let from = live.atmosphere_blender.current();
+                                let mut to = from;
+                                to.sky_zenith_rgb = sky_rgb;
+                                to.sky_horizon_rgb = sky_rgb;
+                                to.fog_rgb = fog_rgb;
+                                BiomeAtmosphereBlender::new(blend_dimension_crossfade(
+                                    &from, &to, progress,
+                                ))
+                            },
+                        );
+                        let atmosphere = portal_atmosphere
+                            .as_ref()
+                            .unwrap_or(&live.atmosphere_blender);
+                        let empty_fades;
+                        let chunk_fades = if self
+                            .seamless_portal
+                            .should_suppress_loading_screen(&live.world.dimension.name)
+                        {
+                            empty_fades = ChunkFadeTracker::new();
+                            &empty_fades
+                        } else {
+                            &live.chunk_fades
+                        };
                         active.renderer.render_to_view_with_env_and_rain(
                             &view,
                             w,
                             h,
                             &sky,
-                            &live.atmosphere_blender,
-                            &live.chunk_fades,
+                            atmosphere,
+                            chunk_fades,
                             live.world_time_ticks(),
                             &vfx_frame.lights,
                             rain_wetness,
@@ -6717,6 +6843,153 @@ fn live_entity_tint(spec: EntityRigSpec, tracked: Option<&TrackedEntity>) -> [f3
 fn mouth_item_rgb(item_id: i32) -> [u8; 3] {
     let hue = (f64::from(item_id as u32) * 0.618_033_988_749_895).fract() as f32;
     hsv_to_rgb_f32(hue, 0.85, 0.95).map(|c| (c * 255.0).round() as u8)
+}
+
+/// Quad-center UV the whole-mesh 3D glint tint samples — the scroll
+/// comes from [`LiveSession::enchanted_item_quad_tint`]'s shimmer clock,
+/// so one representative texel coordinate per entity is enough.
+const GLINT_SAMPLE_UV: [f32; 2] = [0.5, 0.5];
+
+/// Minimal enchanted stack standing in for the session-private equipment
+/// slots: [`LiveSession::entity_enchanted_item_glint`] already proved a
+/// glinted held/armor stack exists, but the decoded
+/// [`ItemStackComponents`] for equipment never leaves `live_session`, so
+/// this proxy unlocks the shared
+/// [`LiveSession::enchanted_item_quad_tint`] blend. Component id `9` is
+/// `minecraft:enchantments` with a non-empty entry count.
+fn equipment_glint_proxy() -> &'static ItemStackComponents {
+    static PROXY: std::sync::OnceLock<ItemStackComponents> = std::sync::OnceLock::new();
+    PROXY.get_or_init(|| ItemStackComponents {
+        count: 1,
+        item_id: 1,
+        added: vec![ItemComponentPatch {
+            type_id: 9,
+            data: vec![1],
+        }],
+        removed: Vec::new(),
+    })
+}
+
+/// One live entity staged into the entity/BER draw set: the rig mesh
+/// rebuilds only when the pose fingerprint changes, then
+/// `(eid, world origin, tint)` joins the draw refs. While the
+/// `enchantment_glint` video toggle is on, an entity carrying an
+/// enchanted dropped/held/armor stack gets the violet 3D shimmer folded
+/// into its tint through [`LiveSession::enchanted_item_quad_tint`].
+#[allow(clippy::too_many_arguments)]
+fn stage_live_entity(
+    live: &LiveSession,
+    cache: &mut LiveEntityRenderCache,
+    entity_refs: &mut Vec<(i32, [f32; 3], [f32; 3])>,
+    glint_on: bool,
+    eid: i32,
+    spec: EntityRigSpec,
+    pos: [f64; 3],
+    tracked: Option<&TrackedEntity>,
+) {
+    let pose = live_entity_pose(live, eid, tracked);
+    // The fox (id 42) carries pickups in its mouth slot: the held
+    // item id joins the cache key so pick-up/drop rebuilds the
+    // mesh immediately, without waiting on a pose change.
+    let mouth_item_id = if spec.entity_type_id == FOX_ENTITY_TYPE_ID {
+        live.entity_mainhand_item_id(eid).filter(|id| *id != 0)
+    } else {
+        None
+    };
+    let key = entity_pose_key(spec, &pose, mouth_item_id);
+    if cache.entity_meshes.get(&eid).is_none_or(|(k, _)| *k != key) {
+        cache.entity_meshes.insert(
+            eid,
+            (
+                key,
+                build_entity_rig_mesh_with_mouth_item(
+                    spec,
+                    pose,
+                    mouth_item_id.map(mouth_item_rgb),
+                ),
+            ),
+        );
+    }
+    let mut tint = live_entity_tint(spec, tracked);
+    if glint_on && live.entity_enchanted_item_glint(eid) {
+        tint = match live
+            .entity_metadata
+            .get(&eid)
+            .and_then(|meta| meta.item_stack.as_ref())
+        {
+            // Dropped enchanted stack: its real components drive the tint.
+            Some(stack) => live.enchanted_item_quad_tint(stack, tint, GLINT_SAMPLE_UV),
+            None => live.enchanted_item_quad_tint(equipment_glint_proxy(), tint, GLINT_SAMPLE_UV),
+        };
+    }
+    entity_refs.push((
+        eid,
+        [pos[0] as f32, pos[1] as f32, pos[2] as f32],
+        tint,
+    ));
+}
+
+/// Tracked entities the vanilla rig table left unclassified — modded or
+/// out-of-range registry ids `add_entity` could not resolve — each paired
+/// with the visible `GenericProxy` fallback spec from
+/// [`classify_entity_rig_or_fallback`] so nothing modded ever renders
+/// invisible.
+fn unrigged_entity_fallbacks(
+    live: &LiveSession,
+) -> impl Iterator<Item = (i32, EntityRigSpec, [f64; 3], &TrackedEntity)> + '_ {
+    live.world
+        .entities
+        .iter()
+        .filter(|(eid, _)| live.entity_rig(**eid).is_none())
+        .map(|(eid, tracked)| {
+            let spec = classify_entity_rig_or_fallback(
+                u32::try_from(tracked.entity_type.max(0)).unwrap_or(u32::MAX),
+                None,
+            );
+            (*eid, spec, tracked.pos, tracked)
+        })
+}
+
+/// The live contact shadows to stage this refresh — the session's
+/// grounded-mob quads converted for the entity/BER lit list, or empty
+/// while the `entity_shadows` gate is off so the toggle kills every
+/// contact shadow the same refresh it flips.
+fn staged_contact_shadow_quads(
+    live: &LiveSession,
+    enabled: bool,
+) -> Vec<(ExtrudedMesh, [f32; 3])> {
+    if !enabled {
+        return Vec::new();
+    }
+    live.entity_contact_shadow_quads()
+        .into_iter()
+        .map(contact_shadow_quad_mesh)
+        .collect()
+}
+
+/// Convert one live [`EntityContactShadowQuad`] into entity/BER staging
+/// form: a single-quad [`ExtrudedMesh`] (world-space positions, `[0,1,0]`
+/// normal, unit-square UVs, untinted tag) plus the shadow's rgba folded
+/// to an rgb tint. The lit pipeline has no alpha lane, so alpha lerps
+/// the tint from white down to the shadow color — grounded mobs get the
+/// full ~30% darkening and the quad fades toward invisible as the entity
+/// leaves the floor, mirroring the shadow's alpha ramp.
+fn contact_shadow_quad_mesh(quad: EntityContactShadowQuad) -> (ExtrudedMesh, [f32; 3]) {
+    let alpha = quad.rgba[3].clamp(0.0, 1.0);
+    let tint = [
+        alpha.mul_add(quad.rgba[0] - 1.0, 1.0),
+        alpha.mul_add(quad.rgba[1] - 1.0, 1.0),
+        alpha.mul_add(quad.rgba[2] - 1.0, 1.0),
+    ];
+    let mesh = ExtrudedMesh {
+        quads: vec![ExtrudedQuad {
+            positions: quad.positions,
+            normal: quad.normal,
+            uv: [[0.0, 0.0], [1.0, 0.0], [1.0, 1.0], [0.0, 1.0]],
+            tint_index: -1,
+        }],
+    };
+    (mesh, tint)
 }
 
 /// `hsv_to_rgb` for `0..=1` float inputs.
@@ -8780,6 +9053,297 @@ mod tests {
         assert!(enchant_glint_overlay_cmd(true, &plain, rect, 800, 600, 1.25).is_none());
         assert!(
             enchant_glint_overlay_cmd(true, &empty_enchantments, rect, 800, 600, 1.25).is_none()
+        );
+    }
+
+    /// Test-local `add_entity` wire path — mirrors the live_session
+    /// fixture so entity/BER staging tests exercise the real session
+    /// tracker instead of poking private maps.
+    fn window_test_add_entity(live: &mut LiveSession, eid: i32, entity_type: i32, pos: [f64; 3]) {
+        use megu_client::protocol::{ClientPlayEvent, PlayEvent};
+        live.apply_event(ClientPlayEvent::Play(PlayEvent::AddEntity {
+            eid,
+            uuid: [eid as u8; 16],
+            entity_type,
+            x: pos[0],
+            y: pos[1],
+            z: pos[2],
+            pitch: 0.0,
+            yaw: 0.0,
+            head_yaw: 0.0,
+            data: 0,
+            vx: 0.0,
+            vy: 0.0,
+            vz: 0.0,
+        }))
+        .unwrap();
+    }
+
+    /// Air column at `(0, 0)` with one solid floor section under y=64 so
+    /// the contact-shadow collision probe reports a top of 64.0.
+    fn window_test_seed_floor_column(live: &mut LiveSession) {
+        use megu_client::world::{ChunkColumn, StoredSection};
+        let state_count = live.world.state_count;
+        let mut sections: Vec<StoredSection> = (0..live.world.dimension.section_count())
+            .map(|_| StoredSection {
+                palette: megu_kernel::PalettedSection::new_single_bounded(0, state_count)
+                    .expect("air state must fit the bound"),
+                block_light: [0; megu_client_mesh::LIGHT_BYTES],
+                sky_light: [0xff; megu_client_mesh::LIGHT_BYTES],
+                biomes: [0; 64],
+                has_non_air: false,
+            })
+            .collect();
+        sections[7] = StoredSection {
+            palette: megu_kernel::PalettedSection::new_single_bounded(5, state_count).unwrap(),
+            block_light: [0; megu_client_mesh::LIGHT_BYTES],
+            sky_light: [0x00; megu_client_mesh::LIGHT_BYTES],
+            biomes: [0; 64],
+            has_non_air: true,
+        };
+        live.world
+            .columns
+            .insert((0, 0), ChunkColumn { cx: 0, cz: 0, sections });
+    }
+
+    /// The `entity_shadows` toggle gates live contact-shadow staging:
+    /// grounded mobs emit converted quads while enabled and the staged
+    /// list is empty the same refresh the toggle is off.
+    #[test]
+    fn contact_shadow_staging_follows_entity_shadows_gate() {
+        let mut live = LiveSession::offline_with_null_audio();
+        live.vanilla_plus_cfg.nature.enabled = true;
+        window_test_seed_floor_column(&mut live);
+        // Zombie (type 124, biped) grounded on the floor; the item drop
+        // (type 58) never grounds a shadow.
+        window_test_add_entity(&mut live, 30, 124, [0.0, 64.0, 0.0]);
+        window_test_add_entity(&mut live, 31, 58, [2.0, 64.0, 0.0]);
+
+        assert!(
+            staged_contact_shadow_quads(&live, false).is_empty(),
+            "disabled gate must stage zero shadow quads"
+        );
+        let staged = staged_contact_shadow_quads(&live, true);
+        assert_eq!(staged.len(), 1, "only the grounded mob shadows");
+        let (mesh, tint) = &staged[0];
+        assert_eq!(mesh.quads.len(), 1);
+        assert!(mesh.quads[0].positions.iter().all(|p| p[1] == 64.015));
+        // Grounded alpha 0.30 folded over near-black rgb lands the tint
+        // just under white — the lit pipeline's alpha-less fade.
+        for channel in tint {
+            assert!(
+                (*channel - 0.7).abs() < 1e-3,
+                "grounded shadow tint must darken ~30%: {tint:?}"
+            );
+        }
+        // Toggling off mid-flight clears the staged list next refresh.
+        assert!(staged_contact_shadow_quads(&live, false).is_empty());
+    }
+
+    /// The `enchantment_glint` toggle decides whether a staged entity's
+    /// tint picks up the 3D shimmer: enchanted drops shimmer while on
+    /// and fall back to the deterministic per-entity hue while off.
+    #[test]
+    fn staged_entity_glint_follows_enchantment_glint_gate() {
+        use megu_client::protocol::{ClientPlayEvent, PlayEvent, write_varint};
+        let mut live = LiveSession::offline_with_null_audio();
+        // Dropped enchanted stack: `minecraft:item` (type 58) carrying a
+        // component-patched slot at metadata index 8.
+        window_test_add_entity(&mut live, 40, 58, [0.0, 64.0, 0.0]);
+        let item_id = megu_proto::table::ProtocolTable::v767_builtin()
+            .registry_id("minecraft:item", "minecraft:diamond_sword")
+            .unwrap() as i32;
+        let mut item_meta = vec![8u8, 7];
+        item_meta.extend_from_slice(&{
+            let mut wire = Vec::new();
+            write_varint(&mut wire, 1); // stack count
+            write_varint(&mut wire, item_id);
+            write_varint(&mut wire, 1); // added component count
+            write_varint(&mut wire, 0); // removed component count
+            write_varint(&mut wire, 9); // enchantments component id
+            wire.extend_from_slice(&[1, 0x1d, 0x05, 0x00]);
+            wire
+        });
+        item_meta.push(0xFF);
+        live.apply_event(ClientPlayEvent::Play(PlayEvent::SetEntityData {
+            eid: 40,
+            raw_entries: item_meta,
+        }))
+        .unwrap();
+        assert!(live.entity_enchanted_item_glint(40));
+
+        let spec = *live.entity_rig(40).unwrap();
+        let tracked = live.world.entities.get(&40);
+        let pos = [0.0, 64.0, 0.0];
+        let mut cache = LiveEntityRenderCache::default();
+        let mut refs = Vec::new();
+        stage_live_entity(&live, &mut cache, &mut refs, false, 40, spec, pos, tracked);
+        let base = refs[0].2;
+        assert_eq!(base, live_entity_tint(spec, tracked));
+
+        let mut refs = Vec::new();
+        stage_live_entity(&live, &mut cache, &mut refs, true, 40, spec, pos, tracked);
+        let glinted = refs[0].2;
+        assert_ne!(
+            glinted, base,
+            "enchanted drop must shimmer while the toggle is on"
+        );
+
+        // A plain unenchanted drop keeps the base tint either way.
+        window_test_add_entity(&mut live, 41, 58, [1.0, 64.0, 0.0]);
+        let spec41 = *live.entity_rig(41).unwrap();
+        let mut refs = Vec::new();
+        stage_live_entity(
+            &live,
+            &mut cache,
+            &mut refs,
+            true,
+            41,
+            spec41,
+            [1.0, 64.0, 0.0],
+            live.world.entities.get(&41),
+        );
+        assert_eq!(
+            refs[0].2,
+            live_entity_tint(spec41, live.world.entities.get(&41)),
+            "unenchanted drop must never shimmer"
+        );
+    }
+
+    /// Modded or out-of-range entity-type ids never render invisible:
+    /// `add_entity` left them unrigged, so the fallback iterator pairs
+    /// them with a visible `GenericProxy` spec.
+    #[test]
+    fn unrigged_entities_resolve_generic_proxy_fallback() {
+        use megu_client_mesh::entity_rig::EntityRigArchetype;
+        let mut live = LiveSession::offline_with_null_audio();
+        // Past the u16 vanilla table — `add_entity` tracks it but never
+        // classifies a rig.
+        window_test_add_entity(&mut live, 50, 70_000, [3.0, 64.0, 5.0]);
+        assert!(live.entity_rig(50).is_none());
+        // u16-range but unmapped — same hole through the second gate.
+        window_test_add_entity(&mut live, 51, 9_999, [1.0, 64.0, 1.0]);
+        assert!(live.entity_rig(51).is_none());
+        // A classified zombie must NOT appear in the fallback set.
+        window_test_add_entity(&mut live, 52, 124, [0.0, 64.0, 0.0]);
+
+        let fallbacks: std::collections::BTreeMap<i32, EntityRigSpec> =
+            unrigged_entity_fallbacks(&live)
+                .map(|(eid, spec, _, _)| (eid, spec))
+                .collect();
+        assert_eq!(fallbacks.len(), 2, "rigged zombie must be excluded");
+        for eid in [50, 51] {
+            assert_eq!(
+                fallbacks[&eid].archetype,
+                EntityRigArchetype::GenericProxy,
+                "unrigged entity {eid} must get the visible proxy"
+            );
+        }
+        // Staging one end-to-end lands it in the draw refs and the mesh
+        // cache — the never-invisible contract, not just a spec.
+        let mut cache = LiveEntityRenderCache::default();
+        let mut refs = Vec::new();
+        for (eid, spec, pos, tracked) in unrigged_entity_fallbacks(&live) {
+            stage_live_entity(
+                &live,
+                &mut cache,
+                &mut refs,
+                false,
+                eid,
+                spec,
+                pos,
+                Some(tracked),
+            );
+        }
+        assert_eq!(refs.len(), 2);
+        assert!(cache.entity_meshes.contains_key(&50));
+        assert!(cache.entity_meshes.contains_key(&51));
+    }
+
+    /// Phase-1 seamless transfer: the MSP1 channel decoder feeds the
+    /// transition state machine — a commit starts the eased crossfade and
+    /// suppresses the blocking loading screen only when its committed
+    /// dimension matches the live session's.
+    #[test]
+    fn seamless_portal_channel_drives_crossfade_and_suppression() {
+        use megu_proto::seamless_portal::{
+            PortalPrefetchHint, SeamlessDimCommit, encode_seamless_portal_packet,
+        };
+        let mut app = GpuApp::new(GpuCliConfig::default());
+        app.attach_live(LiveSession::offline_with_null_audio());
+        assert_eq!(app.live.as_ref().unwrap().world.dimension.name, "minecraft:overworld");
+
+        // Wrong channel and undecodable payloads are handed back.
+        assert!(!app.apply_seamless_portal_channel("megu:other", &[]));
+        assert!(!app.apply_seamless_portal_channel(SEAMLESS_PORTAL_CHANNEL, b"garbage"));
+        assert!(!app.seamless_loading_suppressed());
+
+        let hint = SeamlessPortalPacket::PrefetchHint(PortalPrefetchHint {
+            transfer_id: 7,
+            target_dim_id: "minecraft:the_nether".into(),
+            target_center_chunk: [0, 0],
+            prefetch_radius: 1,
+            portal_pos: [0.0, 64.0, 0.0],
+            target_spawn: [0.0, 64.0, 0.0],
+            target_yaw: 0.0,
+            target_pitch: 0.0,
+            target_sky_rgb: [0.2, 0.05, 0.05],
+            target_fog_rgb: [0.3, 0.08, 0.08],
+        });
+        assert!(app.apply_seamless_portal_channel(
+            SEAMLESS_PORTAL_CHANNEL,
+            &encode_seamless_portal_packet(&hint),
+        ));
+        // A committed transfer starts the crossfade and suppresses the
+        // loading screen for the live dimension when ids line up.
+        let commit = SeamlessPortalPacket::CommitTransfer(SeamlessDimCommit {
+            transfer_id: 7,
+            target_dim_id: "minecraft:overworld".into(),
+            landing_pos: [0.0, 64.0, 0.0],
+            landing_vel: [0.0; 3],
+            landing_yaw: 0.0,
+            landing_pitch: 0.0,
+            crossfade_ms: 280,
+            keep_momentum: true,
+        });
+        assert!(app.apply_seamless_portal_channel(
+            SEAMLESS_PORTAL_CHANNEL,
+            &encode_seamless_portal_packet(&commit),
+        ));
+        assert!(
+            app.seamless_loading_suppressed(),
+            "committed dimension matching the live session must suppress loading"
+        );
+        assert!(app.seamless_portal.blended_sky_and_fog().is_some());
+
+        // The eased crossfade finishes on monotonic advance; suppression
+        // stays latched to the committed dimension.
+        app.seamless_portal.advance_ms(10_000.0);
+        assert!(app.seamless_portal.blended_sky_and_fog().is_none());
+        assert!(app.seamless_loading_suppressed());
+
+        // A commit for a different dimension stops suppressing the live
+        // session's loading screen.
+        let other = SeamlessPortalPacket::CommitTransfer(SeamlessDimCommit {
+            target_dim_id: "minecraft:the_nether".into(),
+            ..SeamlessDimCommit {
+                transfer_id: 8,
+                target_dim_id: String::new(),
+                landing_pos: [0.0; 3],
+                landing_vel: [0.0; 3],
+                landing_yaw: 0.0,
+                landing_pitch: 0.0,
+                crossfade_ms: 0,
+                keep_momentum: false,
+            }
+        });
+        assert!(app.apply_seamless_portal_channel(
+            SEAMLESS_PORTAL_CHANNEL,
+            &encode_seamless_portal_packet(&other),
+        ));
+        assert!(
+            !app.seamless_loading_suppressed(),
+            "a dimension id that is not the live session's must not suppress"
         );
     }
 }
