@@ -90,6 +90,8 @@
 //!   n > 0)` and every declared length larger than the remaining input, and
 //!   uses a fixed frame stack so hostile nesting cannot overflow the process
 //!   stack.
+//! * [`redstone_eda`] — deterministic bucket-queue propagation for compiled
+//!   redstone wire graphs, with per-component topology cache invalidation.
 //! * [`diff_engine`] — universal differential-computation primitives so
 //!   chunks, GPU buffers, entity state, inventories, and snapshots only
 //!   compute, store, and transmit the exact minimal delta `ΔS`: the
@@ -218,6 +220,7 @@ pub mod nbt_wire;
 pub mod os_desktop;
 pub mod perf_kit;
 pub mod random;
+pub mod redstone_eda;
 pub mod romaji_ime;
 pub mod section_rev;
 pub mod server_perf_governors;
