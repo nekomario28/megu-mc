@@ -108,6 +108,22 @@ const LIVE_ENTITY_REFRESH: Duration = Duration::from_millis(50);
 /// Stable dispatch slots mirroring the 12 [`VanillaBerKind`] families.
 const BER_KIND_SLOTS: usize = 12;
 
+fn sample_live_entity_light(live: &LiveSession, x: f32, y: f32, z: f32) -> (u8, u8) {
+    live.sample_block_and_sky_light(x, y, z)
+}
+
+#[cfg(test)]
+mod entity_lighting_wiring_tests {
+    use super::sample_live_entity_light;
+    use crate::live_session::LiveSession;
+
+    #[test]
+    fn entity_staging_adapter_reads_live_world_light() {
+        let live = LiveSession::offline_with_null_audio();
+        assert_eq!(sample_live_entity_light(&live, 0.25, 64.0, -0.25), (0, 15));
+    }
+}
+
 const THIRD_PERSON_DISTANCE: f32 = 4.0;
 const SPRINT_FOV_BOOST: f32 = 0.10;
 const SPRINT_FOV_SMOOTHING_RATE: f32 = 12.0;
@@ -1444,13 +1460,17 @@ impl GpuApp {
         }
         if meshes.is_empty() {
             if cache.staged {
-                renderer.set_entity_and_ber_meshes(Vec::new());
+                renderer.set_entity_and_ber_meshes_lit(Vec::new(), |x, y, z| {
+                    sample_live_entity_light(live, x, y, z)
+                });
                 cache.staged = false;
             }
             return;
         }
         cache.staged = true;
-        renderer.set_entity_and_ber_meshes(meshes);
+        renderer.set_entity_and_ber_meshes_lit(meshes, |x, y, z| {
+            sample_live_entity_light(live, x, y, z)
+        });
     }
 
     /// Expand every live particle system (tactile sim, nature ambience,

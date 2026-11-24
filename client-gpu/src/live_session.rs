@@ -2060,6 +2060,52 @@ fn compact_replay_event(event: &PlayEvent) -> Option<(i32, [u8; 512], usize)> {
 }
 
 impl LiveSession {
+    /// Sample cached chunk light at a world-space position. Y is clamped to
+    /// the active dimension's section range before indexing; unavailable
+    /// positions use the sky-lit fallback.
+    pub fn sample_block_and_sky_light(&self, wx: f32, wy: f32, wz: f32) -> (u8, u8) {
+        fn floor_i32(value: f32) -> Option<i32> {
+            if !value.is_finite() {
+                return None;
+            }
+            let value = f64::from(value).floor();
+            (value >= f64::from(i32::MIN) && value <= f64::from(i32::MAX))
+                .then_some(value as i32)
+        }
+
+        let (Some(x), Some(y), Some(z)) = (floor_i32(wx), floor_i32(wy), floor_i32(wz)) else {
+            return (0, 15);
+        };
+        let min_section_y = self.world.dimension.min_section_y();
+        let Ok(section_count) = i32::try_from(self.world.dimension.section_count()) else {
+            return (0, 15);
+        };
+        if section_count <= 0 {
+            return (0, 15);
+        }
+        let min_y = min_section_y.saturating_mul(16);
+        let max_y = min_y
+            .saturating_add(section_count.saturating_mul(16))
+            .saturating_sub(1);
+        let y = y.clamp(min_y, max_y);
+        let Some(column) = self.world.columns.get(&(x.div_euclid(16), z.div_euclid(16))) else {
+            return (0, 15);
+        };
+        let section_index = y.div_euclid(16).saturating_sub(min_section_y) as usize;
+        let Some(section) = column.sections.get(section_index) else {
+            return (0, 15);
+        };
+        let index = megu_client_mesh::section_index(
+            x.rem_euclid(16) as usize,
+            y.rem_euclid(16) as usize,
+            z.rem_euclid(16) as usize,
+        );
+        let nibble = |plane: &[u8; megu_client_mesh::LIGHT_BYTES]| {
+            (plane[index / 2] >> ((index & 1) * 4)) & 0x0f
+        };
+        (nibble(&section.block_light), nibble(&section.sky_light))
+    }
+
     pub fn connect(host: String, port: u16, username: String, version: String) -> Self {
         Self::connect_with_paths(host, port, username, version, SessionPaths::default())
     }
@@ -7743,6 +7789,18 @@ mod tests {
         let (tx, incoming) = mpsc::sync_channel(8);
         let (outgoing, _rx) = mpsc::sync_channel(8);
         (LiveSession::with_channels(incoming, outgoing), tx)
+    }
+
+    #[test]
+    fn world_light_sampling_falls_back_and_reads_loaded_chunk_lights() {
+        let (mut live, _) = session();
+        assert_eq!(live.sample_block_and_sky_light(-0.2, -64.0, -16.1), (0, 15));
+        assert_eq!(live.sample_block_and_sky_light(0.0, f32::NAN, 0.0), (0, 15));
+        assert_eq!(live.sample_block_and_sky_light(0.0, f32::INFINITY, 0.0), (0, 15));
+        let chunk = decode_chunk_packet(&decoded_frame(0x27, &stone_chunk()), 24, 64).unwrap();
+        live.apply_event(ClientPlayEvent::Play(PlayEvent::ChunkData(Box::new(chunk))))
+            .unwrap();
+        assert_eq!(live.sample_block_and_sky_light(0.5, -0.5, 0.5), (0, 15));
     }
 
     #[test]

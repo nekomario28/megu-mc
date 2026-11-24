@@ -3784,6 +3784,113 @@ fn append_dynamic_quad(
     true
 }
 
+fn build_lit_entity_ber_geometry(
+    meshes: &[(&ExtrudedMesh, [f32; 3], [f32; 3])],
+    sample_light: &mut impl FnMut(f32, f32, f32) -> (u8, u8),
+) -> (Vec<LitTerrainVertex>, Vec<u32>) {
+    let mut vertices = Vec::new();
+    let mut indices = Vec::new();
+    'meshes: for &(mesh, origin, tint) in meshes {
+        if !origin.iter().chain(tint.iter()).all(|v| v.is_finite()) {
+            continue;
+        }
+        for quad in &mesh.quads {
+            if vertices.len() / 4 >= MAX_DYNAMIC_QUADS {
+                break 'meshes;
+            }
+            let positions = quad.positions.map(|point| [
+                point[0] + origin[0],
+                point[1] + origin[1],
+                point[2] + origin[2],
+            ]);
+            if !positions.iter().flatten().all(|v| v.is_finite())
+                || !quad.normal.iter().all(|v| v.is_finite())
+            {
+                continue;
+            }
+            let centroid = [
+                positions.iter().map(|p| p[0]).sum::<f32>() * 0.25,
+                positions.iter().map(|p| p[1]).sum::<f32>() * 0.25,
+                positions.iter().map(|p| p[2]).sum::<f32>() * 0.25,
+            ];
+            let (block_light, sky_light) = sample_light(centroid[0], centroid[1], centroid[2]);
+            let base = vertices.len() as u32;
+            for position in positions {
+                vertices.push(LitTerrainVertex {
+                    position,
+                    normal: quad.normal,
+                    albedo: entity_quad_tint(quad.tint_index, tint),
+                    light_attr: (u32::from(block_light.min(15)) << 5)
+                        | (u32::from(sky_light.min(15)) << 9),
+                });
+            }
+            indices.extend_from_slice(&[base, base + 1, base + 2, base, base + 2, base + 3]);
+        }
+    }
+    (vertices, indices)
+}
+
+fn entity_quad_tint(tint_index: i32, base_tint: [f32; 3]) -> [f32; 3] {
+    const PACKED_RGB_FLAGS: u32 = 0x0100_0000 | (1 << 30);
+    let packed = tint_index as u32;
+    if tint_index >= 0 && packed & PACKED_RGB_FLAGS != 0 {
+        let rgb = packed & 0x00ff_ffff;
+        [
+            ((rgb >> 16) & 0xff) as f32 / 255.0 * base_tint[0],
+            ((rgb >> 8) & 0xff) as f32 / 255.0 * base_tint[1],
+            (rgb & 0xff) as f32 / 255.0 * base_tint[2],
+        ]
+    } else {
+        base_tint
+    }
+}
+
+#[cfg(test)]
+mod entity_lighting_tests {
+    use super::{build_lit_entity_ber_geometry, entity_quad_tint};
+    use megu_client_mesh::vanilla_plus_3d::{ExtrudedMesh, ExtrudedQuad};
+
+    fn quad(y: f32, normal: [f32; 3], tint_index: i32) -> ExtrudedQuad {
+        ExtrudedQuad {
+            positions: [
+                [0.0, y, 0.0],
+                [1.0, y, 0.0],
+                [1.0, y + 0.25, 0.0],
+                [0.0, y + 0.25, 0.0],
+            ],
+            normal,
+            uv: [[0.0, 0.0]; 4],
+            tint_index,
+        }
+    }
+
+    #[test]
+    fn parts_sample_separate_light_and_keep_face_normals() {
+        let mesh = ExtrudedMesh {
+            quads: vec![quad(0.0, [1.0, 0.0, 0.0], -1), quad(2.0, [0.0, 0.0, -1.0], -1)],
+        };
+        let (vertices, indices) = build_lit_entity_ber_geometry(
+            &[(&mesh, [4.0, 0.0, 8.0], [1.0; 3])],
+            &mut |_, y, _| if y < 1.0 { (0, 0) } else { (14, 15) },
+        );
+        assert_eq!(indices.len(), 12);
+        assert!(vertices[..4].iter().all(|v| v.light_attr == 0));
+        assert!(vertices[4..]
+            .iter()
+            .all(|v| v.light_attr == ((14 << 5) | (15 << 9))));
+        assert!(vertices[..4].iter().all(|v| v.normal == [1.0, 0.0, 0.0]));
+        assert!(vertices[4..].iter().all(|v| v.normal == [0.0, 0.0, -1.0]));
+    }
+
+    #[test]
+    fn packed_rgb_tints_decode_while_regular_tint_indices_stay_compatible() {
+        let tint = entity_quad_tint((1 << 30) | 0x0100_0000 | 0x804020, [1.0; 3]);
+        assert_eq!(tint, [128.0 / 255.0, 64.0 / 255.0, 32.0 / 255.0]);
+        assert_eq!(entity_quad_tint(1, [0.2, 0.4, 0.6]), [0.2, 0.4, 0.6]);
+        assert_eq!(entity_quad_tint(-1, [0.2, 0.4, 0.6]), [0.2, 0.4, 0.6]);
+    }
+}
+
 /// GPU state for instanced particle billboards: the alpha-blended lit
 /// pipeline (same blend/depth contract as `lit_alpha_pipeline`), the
 /// static unit-quad vertex/index pair the vertex shader expands with
@@ -5130,6 +5237,8 @@ fn record_shadow_cascade<'a>(
     shared_index: &'a wgpu::Buffer,
     entry_offsets: &[u32],
     batch_offsets: &[u32],
+    entity_ber: Option<&'a DynamicGeometryRing>,
+    entity_offset: Option<u32>,
     subworld_gpu: &'a SubWorldGpuCache,
     layer: u32,
 ) -> (u64, u64) {
@@ -5237,6 +5346,12 @@ fn record_shadow_cascade<'a>(
         pass.set_index_buffer(entry.index_buffer().slice(..), wgpu::IndexFormat::Uint32);
         pass.draw_indexed(0..entry.index_count, 0, 0..1);
         emitted += 1;
+    }
+    if let (Some(mesh), Some(offset)) = (entity_ber, entity_offset) {
+        pass.set_bind_group(2, Some(&shadow.draw_bg), &[offset]);
+        pass.set_vertex_buffer(0, Some(mesh.vertices.slice(..)));
+        pass.set_index_buffer(mesh.indices.slice(..), wgpu::IndexFormat::Uint32);
+        pass.draw_indexed(0..mesh.index_count, 0, 0..1);
     }
     pass.set_pipeline(&shadow.instanced_depth);
     for (batch, offset) in subworld_gpu
@@ -7050,9 +7165,27 @@ impl GpuRenderer {
         };
     }
 
-    /// Batch articulated entity rigs and Vanilla block entity meshes into
-    /// one GPU vertex/index stream, using the existing lit shader and atlas.
+    /// Backwards-compatible entity/BER staging entry point. Callers with
+    /// world light data should use `set_entity_and_ber_meshes_lit`.
     pub fn set_entity_and_ber_meshes(&mut self, meshes: Vec<(&ExtrudedMesh, [f32; 3], [f32; 3])>) {
+        self.set_entity_and_ber_meshes_lit(meshes, |_, _, _| (0, 15));
+    }
+
+    /// Stage every entity and BER quad with its own world-light sample.
+    /// Shadow-capable frames use the decoded `MEGU_TERRAIN_LIT_WGSL`
+    /// receiver; shadow-disabled frames retain the composite lit fallback.
+    pub fn set_entity_and_ber_meshes_lit(
+        &mut self,
+        meshes: Vec<(&ExtrudedMesh, [f32; 3], [f32; 3])>,
+        mut sample_light: impl FnMut(f32, f32, f32) -> (u8, u8),
+    ) {
+        let (lit_vertices, lit_indices) = build_lit_entity_ber_geometry(&meshes, &mut sample_light);
+        if self.shadow_active && self.shadow.is_some() {
+            let _ = self.upload_lit_terrain(&lit_vertices, &lit_indices);
+        } else {
+            self.lit_terrain = None;
+        }
+
         let mut vertices = Vec::new();
         let mut indices = Vec::new();
         'meshes: for (mesh, origin, tint) in meshes {
@@ -11650,6 +11783,11 @@ impl GpuRenderer {
                 .filter(|batch| batch.index_count > 0 && batch.instance_count > 0)
                 .map(|batch| push_shadow_model(&mut draws, batch.transform.model_matrix())),
         );
+        let entity_ber_offset = self
+            .entity_ber
+            .as_ref()
+            .filter(|mesh| mesh.index_count > 0)
+            .map(|_| push_shadow_model(&mut draws, identity));
         shadow.ensure_draw_capacity(
             &self.ctx.device,
             &self.composite.draw_layout,
@@ -11783,6 +11921,8 @@ impl GpuRenderer {
                         &self.shared_quad_index_buffer,
                         bundle_entry_offsets,
                         bundle_batch_offsets,
+                        self.entity_ber.as_ref(),
+                        entity_ber_offset,
                         &self.subworld_gpu,
                         layer as u32,
                     );
@@ -13017,7 +13157,8 @@ impl GpuRenderer {
                 instanced_draws += 1;
             }
             // Opaque entities and block entities.
-            if let Some(mesh) = entity_ber {
+            if lit_terrain.is_none() {
+                if let Some(mesh) = entity_ber {
                 pass.set_pipeline(&lit_opaque_pipeline);
                 pass.set_bind_group(0, &gpu.lit_frame_bg, &[]);
                 let off = slot(identity, 1.0, 1.0);
@@ -13025,6 +13166,7 @@ impl GpuRenderer {
                 pass.set_vertex_buffer(0, mesh.vertices.slice(..));
                 pass.set_index_buffer(mesh.indices.slice(..), wgpu::IndexFormat::Uint32);
                 pass.draw_indexed(0..mesh.index_count, 0, 0..1);
+                }
             }
 
             // Translucent terrain (stained glass) through the
