@@ -15,6 +15,7 @@ pub mod crop_archetype;
 mod cull;
 mod culler;
 pub mod draw_order;
+pub mod dynamic_light_resolver;
 pub mod entity_rig;
 pub mod ffi;
 pub mod gpu_pipeline;
