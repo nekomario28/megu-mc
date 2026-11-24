@@ -490,13 +490,14 @@ pub fn validate_download_url(url: &str, policy: &SyncPolicy) -> Result<(), ModSy
     Ok(())
 }
 
-/// The `.jar` basename jail: `name` must be a pure-ASCII plain file name
-/// ending in `.jar` (case-insensitive) with a non-empty stem, and may not
+/// The shared basename jail behind [`validate_jar_file_name`] and
+/// [`validate_mmod_file_name`]: `name` must be a pure-ASCII plain file name
+/// ending in `suffix` (case-insensitive) with a non-empty stem, and may not
 /// contain `/`, `\`, `:`, `..`, NUL/control/DEL bytes, a leading `.`, or
 /// shell metacharacters (`$` `` ` `` `(){}[]&;|<>*?!'"~#`). Space is
-/// allowed — real mod JARs carry it — but nothing that can traverse a
+/// allowed — real archives carry it — but nothing that can traverse a
 /// path or expand in a shell is.
-pub fn validate_jar_file_name(name: &str) -> Result<(), ModSyncError> {
+fn validate_file_name_jail(name: &str, suffix: &str) -> Result<(), ModSyncError> {
     let name_err = |m: String| err(ModSyncErrorKind::UnsafeFileName, m);
     if name.is_empty() || name.len() > MAX_SYNC_FILE_NAME_LEN {
         return Err(name_err(format!(
@@ -535,12 +536,24 @@ pub fn validate_jar_file_name(name: &str) -> Result<(), ModSyncError> {
     if name.contains("..") {
         return Err(name_err(format!("file name '{name}' contains '..'")));
     }
-    if name.len() <= 4 || !name[name.len() - 4..].eq_ignore_ascii_case(".jar") {
+    let suffix_len = suffix.len();
+    if name.len() <= suffix_len || !name[name.len() - suffix_len..].eq_ignore_ascii_case(suffix) {
         return Err(name_err(format!(
-            "file name '{name}' is not a .jar basename"
+            "file name '{name}' is not a {suffix} basename"
         )));
     }
     Ok(())
+}
+
+/// The `.jar` basename jail: see [`validate_file_name_jail`].
+pub fn validate_jar_file_name(name: &str) -> Result<(), ModSyncError> {
+    validate_file_name_jail(name, ".jar")
+}
+
+/// The `.mmod` basename jail — identical rules to [`validate_jar_file_name`]
+/// but for megu's pure-data declarative archives.
+pub fn validate_mmod_file_name(name: &str) -> Result<(), ModSyncError> {
+    validate_file_name_jail(name, ".mmod")
 }
 
 /// Structural validation that never touches policy: mod id charset, the
@@ -548,6 +561,15 @@ pub fn validate_jar_file_name(name: &str) -> Result<(), ModSyncError> {
 /// `1..=MAX_MOD_JAR_BYTES`. Shared by encoder, decoder, and
 /// [`validate_sync_entry`].
 fn validate_entry_structure(entry: &ModSyncEntry) -> Result<(), ModSyncError> {
+    validate_entry_core(entry)?;
+    validate_jar_file_name(&entry.file_name)?;
+    Ok(())
+}
+
+/// The filename-independent half of [`validate_entry_structure`]: mod id
+/// charset, digest hex, and size bound. Reused by the profile-isolation
+/// planner for `.mmod` entries, which fail the `.jar` jail by design.
+fn validate_entry_core(entry: &ModSyncEntry) -> Result<(), ModSyncError> {
     if entry.mod_id.is_empty()
         || entry.mod_id.len() > MAX_SYNC_MOD_ID_LEN
         || !entry
@@ -563,7 +585,6 @@ fn validate_entry_structure(entry: &ModSyncEntry) -> Result<(), ModSyncError> {
             ),
         ));
     }
-    validate_jar_file_name(&entry.file_name)?;
     if parse_sha256_hex(&entry.sha256_hex).is_none() {
         return Err(err(
             ModSyncErrorKind::InvalidEntry,
@@ -1514,4 +1535,689 @@ pub fn install_verified_bytes(
         let _ = dir.sync_all();
     }
     Ok(target)
+}
+
+// ---------------------------------------------------------------------------
+// Sandboxed per-server profiles & explicit consent approval plan
+// ---------------------------------------------------------------------------
+//
+// SAFE-MODSYNC-PROFILE-ISOLATION: the legacy flow installs server-required
+// mods into the player's shared `mods/` directory, so connecting to the
+// wrong server can scramble a working setup. This section adds a pure,
+// deterministic planner that instead gives EVERY server its own sandboxed
+// profile directory (`profiles/server-<hash>/mods/`) and overlays the
+// player's personal client-only mods on top — suspending (never deleting)
+// any personal mod that conflicts with a server requirement for that
+// session only.
+//
+// Four distribution sources are recognised, each routed to the safest
+// possible handling:
+//
+// - [`ModSourceKind::ModrinthCdn`] and [`ModSourceKind::GitHubRelease`]
+//   are hash-pinned direct fetches — they land in
+//   `auto_fetch_after_consent` and may only run after the user approves
+//   the [`ModSyncApprovalPlan`].
+// - [`ModSourceKind::CurseForgeBrowserPickup`] honours CurseForge's
+//   distribution terms: the client opens the official project page and
+//   the user drops the downloaded file into a pickup folder, matched by
+//   exact SHA-256. These NEVER auto-fetch.
+// - [`ModSourceKind::ServerDeclarativeMmod`] covers megu's pure-data
+//   `.mmod` archives. A direct in-session server push (marked by
+//   [`SERVER_PUSH_URL_SCHEME`]) is accepted ONLY for `.mmod` basenames —
+//   a pushed `.jar`/`.class`/executable is a hard error, so server push
+//   can never become an RCE or arbitrary-file-drop vector.
+//
+// [`build_sync_approval_plan`] is pure: no clock, no filesystem, no
+// network — the same inputs always produce the same plan.
+
+/// `download_url` marker for a direct in-session server push. The bytes
+/// ride the session payload rather than HTTPS; `sha256_hex` +
+/// `size_bytes` are still enforced before install. ONLY valid for
+/// `.mmod` entries — pushing a `.jar` (or any other executable format)
+/// is rejected outright.
+pub const SERVER_PUSH_URL_SCHEME: &str = "megu-server-push:";
+
+/// Distribution channel a planned sync entry belongs to. The badge is
+/// shown to the user in the consent UI so they know exactly where each
+/// file will come from.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ModSourceKind {
+    /// `https://cdn.modrinth.com/...` — verified SHA-256 direct fetch.
+    ModrinthCdn,
+    /// `https://github.com/<owner>/<repo>/releases/download/<tag>/<file>`
+    /// — verified SHA-256 direct fetch, URL shape strictly validated.
+    GitHubRelease,
+    /// CurseForge project page / forgecdn host — 100% TOS-compliant
+    /// manual browser pickup matched by SHA-256; never auto-fetched.
+    CurseForgeBrowserPickup,
+    /// megu `.mmod` pure-data/asset archive — server push or verified
+    /// fetch; contains no executable bytecode by construction.
+    ServerDeclarativeMmod,
+    /// Any other HTTPS origin — routed to manual browser pickup only,
+    /// never auto-fetched, so an unexpected host can never silently
+    /// become a download source.
+    UnknownExternal,
+}
+
+/// One manifest entry's planned handling under a [`ModSyncApprovalPlan`].
+/// Carries everything the consent UI and the fetch/install stages need:
+/// the exact expected bytes (`sha256_hex` + `size_bytes`), the official
+/// URL to show the user, and the [`ModSourceKind`] badge.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SyncPlanEntry {
+    pub mod_id: String,
+    pub file_name: String,
+    pub download_url: String,
+    pub sha256_hex: String,
+    pub size_bytes: u64,
+    pub source: ModSourceKind,
+}
+
+/// The explicit user-approval plan for syncing `manifest` into one
+/// server's sandboxed profile. Produced by
+/// [`build_sync_approval_plan`]; nothing is fetched or written until the
+/// user consents and the fetch/install stages run.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct ModSyncApprovalPlan {
+    /// Sandboxed profile directory name under the client's profiles
+    /// root: `"server-<16 lowercase hex chars of SHA-256(server_id)>"`.
+    /// Two different servers can never collide onto the same directory,
+    /// and the player's base `mods/` is never touched.
+    pub profile_dir_name: String,
+    /// Hash-pinned entries (Modrinth CDN, GitHub releases, declarative
+    /// `.mmod`) that MAY be fetched over HTTPS — but only after the user
+    /// approves this plan.
+    pub auto_fetch_after_consent: Vec<SyncPlanEntry>,
+    /// Entries requiring manual browser pickup (CurseForge and any
+    /// unrecognised origin). The official URL plus expected SHA-256 are
+    /// carried so the pickup folder can match the file the user
+    /// downloads by hand.
+    pub manual_browser_pickup: Vec<SyncPlanEntry>,
+    /// Personal client-only mod ids kept active in the overlay — they do
+    /// not conflict with anything the server requires.
+    pub preserved_personal_mods: Vec<String>,
+    /// `(mod_id, reason)` pairs for personal mods temporarily suspended
+    /// for THIS server session only — never deleted, restored on
+    /// disconnect or when switching servers.
+    pub temporarily_suspended_personal_mods: Vec<(String, String)>,
+    /// `true` whenever ANY change is needed: a non-empty fetch list, a
+    /// non-empty pickup list, or any suspended personal mod. `false`
+    /// only when the profile is already 100% in sync with zero changes.
+    pub requires_explicit_user_consent: bool,
+}
+
+/// `download_url` names a direct in-session server push.
+fn is_server_push_url(url: &str) -> bool {
+    url.starts_with(SERVER_PUSH_URL_SCHEME)
+}
+
+fn has_suffix_ci(name: &str, suffix: &str) -> bool {
+    name.len() > suffix.len() && name[name.len() - suffix.len()..].eq_ignore_ascii_case(suffix)
+}
+
+/// Deterministic sandboxed profile directory name for `server_id`:
+/// `"server-"` + the first 16 lowercase hex chars of
+/// `SHA-256(server_id)`. Server A and Server B therefore always get
+/// distinct directories — zero cross-contamination — while repeat
+/// connects to the same server reuse the same profile.
+///
+/// `server_id` must be non-empty, at most 256 bytes of pure ASCII
+/// without control/space bytes; anything else is a hard error rather
+/// than a silently hashed surprise.
+pub fn server_profile_dir_name(server_id: &str) -> Result<String, ModSyncError> {
+    if server_id.is_empty()
+        || server_id.len() > 256
+        || !server_id.is_ascii()
+        || server_id.bytes().any(|b| b <= 0x20 || b == 0x7F)
+    {
+        return Err(err(
+            ModSyncErrorKind::InvalidEntry,
+            format!("server id {server_id:?} is empty, over-cap, or not clean ASCII"),
+        ));
+    }
+    let digest = digest_hex(&sha256(server_id.as_bytes()));
+    Ok(format!("server-{}", &digest[..16]))
+}
+
+/// Strict `https://github.com/<owner>/<repo>/releases/download/<tag>/<file>`
+/// validation. On top of [`validate_url_syntax`] (HTTPS-only, no
+/// credentials, no IP literals, no local/internal hosts, port 443 only)
+/// this requires the exact release-download path shape and rejects `..`
+/// traversal segments, percent-encoding, backslashes, `@`, query strings,
+/// and fragments — a GitHub badge can never be forged by URL trickery.
+fn validate_github_release_url(url: &str) -> Result<(), ModSyncError> {
+    let url_err = |m: String| err(ModSyncErrorKind::UnsafeUrl, m);
+    let host = validate_url_syntax(url)?;
+    if host != "github.com" {
+        return Err(url_err(format!(
+            "URL host '{host}' is not github.com"
+        )));
+    }
+    // No query or fragment — release download URLs carry neither, and
+    // either is a classic parameter-pollution/trickery vector.
+    if url.contains('?') || url.contains('#') {
+        return Err(url_err(format!(
+            "GitHub release URL '{url}' carries a query or fragment"
+        )));
+    }
+    let rest = &url[8..]; // past "https://" (any casing — same length)
+    let auth_end = rest.find('/').unwrap_or(rest.len());
+    let path = &rest[auth_end..];
+    if !path.starts_with('/') {
+        return Err(url_err(format!(
+            "GitHub release URL '{url}' has no path"
+        )));
+    }
+    let segments: Vec<&str> = path[1..].split('/').collect();
+    // Exactly: <owner>/<repo>/releases/download/<tag>/<file>
+    if segments.len() != 6
+        || segments[2] != "releases"
+        || segments[3] != "download"
+    {
+        return Err(url_err(format!(
+            "URL '{url}' is not a github.com releases/download path"
+        )));
+    }
+    let owner_ok = |s: &str| {
+        !s.is_empty()
+            && s.len() <= 100
+            && s.bytes()
+                .all(|b| matches!(b, b'a'..=b'z' | b'A'..=b'Z' | b'0'..=b'9' | b'-'))
+    };
+    let repo_ok = |s: &str| {
+        !s.is_empty()
+            && s.len() <= 100
+            && s.bytes().all(|b| {
+                matches!(b, b'a'..=b'z' | b'A'..=b'Z' | b'0'..=b'9' | b'-' | b'.' | b'_')
+            })
+    };
+    // Tag and asset name: printable ASCII minus the trickery bytes.
+    // `%` (encoding tricks), `\` (separator confusion), `@` (authority
+    // spoof residue), `..`/`.` segments (traversal).
+    let loose_ok = |s: &str| {
+        !s.is_empty()
+            && s != "."
+            && s != ".."
+            && !s.contains("..")
+            && s.bytes()
+                .all(|b| (0x21..=0x7E).contains(&b) && !matches!(b, b'%' | b'\\' | b'@'))
+    };
+    if !owner_ok(segments[0])
+        || !repo_ok(segments[1])
+        || !loose_ok(segments[4])
+        || !loose_ok(segments[5])
+    {
+        return Err(url_err(format!(
+            "GitHub release URL '{url}' has a malformed path segment"
+        )));
+    }
+    Ok(())
+}
+
+/// `host` (already normalized) is a CurseForge distribution origin:
+/// `curseforge.com`/`*.curseforge.com` project pages or the `forgecdn.net`
+/// file CDN. Suffix matching requires the dot boundary, so
+/// `notcurseforge.com` never matches.
+fn is_curseforge_host(host: &str) -> bool {
+    host == "curseforge.com"
+        || host.ends_with(".curseforge.com")
+        || host == "forgecdn.net"
+        || host.ends_with(".forgecdn.net")
+}
+
+/// Classify one manifest entry into its [`ModSourceKind`] and target
+/// bucket, applying every fail-closed guard:
+///
+/// - Server push (`megu-server-push:` URLs) is ONLY legal for `.mmod`
+///   basenames — a pushed `.jar` is an RCE/arbitrary-drop attempt and is
+///   a hard error for the whole plan.
+/// - `.mmod` entries are pure-data archives: the `.mmod` jail applies and
+///   the URL may be a server push or any syntactically valid HTTPS URL
+///   (the bytes are hash-pinned, so the host allowlist is not required).
+/// - `.jar` entries must pass the `.jar` jail and the full URL syntax
+///   check, then classify by host: Modrinth CDN / strict GitHub release
+///   path → auto-fetch; CurseForge → manual pickup; anything else →
+///   manual pickup under [`ModSourceKind::UnknownExternal`].
+/// - Any other extension is rejected — the planner only knows how to
+///   handle mods and declarative archives.
+fn classify_plan_entry(entry: &ModSyncEntry) -> Result<(ModSourceKind, bool), ModSyncError> {
+    let entry_err = |m: String| err(ModSyncErrorKind::InvalidEntry, m);
+    validate_entry_core(entry)?;
+
+    if is_server_push_url(&entry.download_url) {
+        if !has_suffix_ci(&entry.file_name, ".mmod") {
+            return Err(entry_err(format!(
+                "direct server push of '{}' refused — only .mmod declarative archives may be pushed",
+                entry.file_name
+            )));
+        }
+        validate_mmod_file_name(&entry.file_name)?;
+        return Ok((ModSourceKind::ServerDeclarativeMmod, true));
+    }
+
+    if has_suffix_ci(&entry.file_name, ".mmod") {
+        validate_mmod_file_name(&entry.file_name)?;
+        // Inert data + hash pin: any well-formed HTTPS origin is safe to
+        // fetch after consent, so only URL *syntax* is enforced here.
+        validate_url_syntax(&entry.download_url)?;
+        return Ok((ModSourceKind::ServerDeclarativeMmod, true));
+    }
+
+    if has_suffix_ci(&entry.file_name, ".jar") {
+        validate_jar_file_name(&entry.file_name)?;
+        let host = validate_url_syntax(&entry.download_url)?;
+        if host == "cdn.modrinth.com" {
+            return Ok((ModSourceKind::ModrinthCdn, true));
+        }
+        if host == "github.com" {
+            validate_github_release_url(&entry.download_url)?;
+            return Ok((ModSourceKind::GitHubRelease, true));
+        }
+        if is_curseforge_host(&host) {
+            return Ok((ModSourceKind::CurseForgeBrowserPickup, false));
+        }
+        return Ok((ModSourceKind::UnknownExternal, false));
+    }
+
+    Err(entry_err(format!(
+        "unsupported sync file type '{}' — only .jar mods and .mmod declarative archives are plannable",
+        entry.file_name
+    )))
+}
+
+/// Whether `existing` already satisfies `wanted` byte-for-byte: same
+/// file name, size, and SHA-256 digest. Mirrors the unchanged-check in
+/// [`compute_manifest_diff`].
+fn profile_entry_satisfies(existing: &ModSyncEntry, wanted: &ModSyncEntry) -> bool {
+    existing.file_name == wanted.file_name
+        && existing.size_bytes == wanted.size_bytes
+        && parse_sha256_hex(&existing.sha256_hex) == parse_sha256_hex(&wanted.sha256_hex)
+}
+
+/// Resolve a personal client-mod descriptor to the identifiers used for
+/// conflict matching. Accepts a bare mod id (`iris`, `sodium-fabric`)
+/// or a file name/path (`sodium-fabric-0.6.13+mc1.21.1.jar`,
+/// `client-personal/shaders/rubidium.jar`, `foo-dev.mmod`). Matching is
+/// `-`/`_`/case-insensitive via [`normalized_id_key`], plus exact
+/// case-insensitive file-name equality.
+fn personal_mod_match_keys(raw: &str) -> (String, BTreeSet<String>) {
+    let trimmed = raw.trim();
+    let mut keys = BTreeSet::new();
+    if !trimmed.is_empty() {
+        keys.insert(normalized_id_key(trimmed));
+    }
+    let base = trimmed.rsplit('/').next().unwrap_or(trimmed);
+    if let Some(id) = infer_candidate_mod_id(base) {
+        keys.insert(normalized_id_key(&id));
+    }
+    for suffix in [".jar", ".mmod"] {
+        if has_suffix_ci(base, suffix) {
+            let stem = &base[..base.len() - suffix.len()];
+            keys.insert(normalized_id_key(stem));
+        }
+    }
+    // Display id: prefer the inferred mod id, else the file stem, else
+    // the raw descriptor.
+    let display = infer_candidate_mod_id(base)
+        .or_else(|| {
+            [".jar", ".mmod"]
+                .iter()
+                .find(|s| has_suffix_ci(base, s))
+                .map(|s| base[..base.len() - s.len()].to_string())
+        })
+        .unwrap_or_else(|| trimmed.to_string());
+    (display, keys)
+}
+
+/// Whether personal mod `raw` conflicts with any manifest entry — by
+/// normalised mod id (advertised id or filename-inferred id) or by exact
+/// case-insensitive file name.
+fn personal_conflicts_with_manifest(raw: &str, manifest: &SyncManifest) -> Option<String> {
+    let (_, keys) = personal_mod_match_keys(raw);
+    let file_name = raw.rsplit('/').next().unwrap_or(raw).to_ascii_lowercase();
+    for entry in &manifest.entries {
+        if keys.contains(&normalized_id_key(&entry.mod_id)) {
+            return Some(entry.mod_id.clone());
+        }
+        if let Some(id) = infer_candidate_mod_id(&entry.file_name) {
+            if keys.contains(&normalized_id_key(&id)) {
+                return Some(entry.mod_id.clone());
+            }
+        }
+        if !file_name.is_empty() && file_name == entry.file_name.to_ascii_lowercase() {
+            return Some(entry.mod_id.clone());
+        }
+    }
+    None
+}
+
+/// Build the explicit [`ModSyncApprovalPlan`] for syncing `manifest`
+/// into `server_id`'s sandboxed profile. Pure and deterministic — no
+/// clock, filesystem, or network access.
+///
+/// - `server_id` names the sandbox; see [`server_profile_dir_name`].
+/// - `manifest` is the server-advertised mod set (already wire-validated
+///   upstream; every entry is re-checked here fail-closed).
+/// - `existing_profile_mods` is the current content of THAT server's
+///   profile — entries already byte-identical are not re-planned, so a
+///   fully in-sync profile yields `requires_explicit_user_consent ==
+///   false`.
+/// - `personal_client_mods` lists the player's personal client-only mod
+///   descriptors (ids or file names). Non-conflicting ones land in
+///   `preserved_personal_mods`; conflicting ones land in
+///   `temporarily_suspended_personal_mods` with a reason — suspended for
+///   this session only, NEVER deleted.
+pub fn build_sync_approval_plan(
+    server_id: &str,
+    manifest: &SyncManifest,
+    existing_profile_mods: &[ModSyncEntry],
+    personal_client_mods: &[String],
+) -> Result<ModSyncApprovalPlan, ModSyncError> {
+    if manifest.entries.len() > MAX_SYNC_MODS {
+        return Err(err(
+            ModSyncErrorKind::TooManyEntries,
+            "manifest entry count exceeds cap",
+        ));
+    }
+    let profile_dir_name = server_profile_dir_name(server_id)?;
+
+    // Duplicate mod ids or file names would make the plan ambiguous —
+    // reject the whole manifest rather than silently pick a winner.
+    let mut seen_ids = BTreeSet::new();
+    let mut seen_names = BTreeSet::new();
+    for entry in &manifest.entries {
+        if !seen_ids.insert(entry.mod_id.to_ascii_lowercase())
+            || !seen_names.insert(entry.file_name.to_ascii_lowercase())
+        {
+            return Err(err(
+                ModSyncErrorKind::InvalidEntry,
+                format!(
+                    "duplicate mod id or file name in manifest: '{}'",
+                    entry.file_name
+                ),
+            ));
+        }
+    }
+
+    let mut plan = ModSyncApprovalPlan {
+        profile_dir_name,
+        ..ModSyncApprovalPlan::default()
+    };
+
+    for entry in &manifest.entries {
+        let (source, auto_fetch) = classify_plan_entry(entry)?;
+        // Already byte-identical in this server's profile → nothing to do.
+        if existing_profile_mods
+            .iter()
+            .any(|old| old.mod_id.eq_ignore_ascii_case(&entry.mod_id) && profile_entry_satisfies(old, entry))
+        {
+            continue;
+        }
+        let planned = SyncPlanEntry {
+            mod_id: entry.mod_id.clone(),
+            file_name: entry.file_name.clone(),
+            download_url: entry.download_url.clone(),
+            sha256_hex: entry.sha256_hex.clone(),
+            size_bytes: entry.size_bytes,
+            source,
+        };
+        if auto_fetch {
+            plan.auto_fetch_after_consent.push(planned);
+        } else {
+            plan.manual_browser_pickup.push(planned);
+        }
+    }
+
+    for raw in personal_client_mods {
+        let (display, _) = personal_mod_match_keys(raw);
+        match personal_conflicts_with_manifest(raw, manifest) {
+            Some(conflicting_mod_id) => plan.temporarily_suspended_personal_mods.push((
+                display,
+                format!("conflicts with server-required mod '{conflicting_mod_id}' — suspended for this session only"),
+            )),
+            None => plan.preserved_personal_mods.push(display),
+        }
+    }
+
+    plan.requires_explicit_user_consent = !plan.auto_fetch_after_consent.is_empty()
+        || !plan.manual_browser_pickup.is_empty()
+        || !plan.temporarily_suspended_personal_mods.is_empty();
+    Ok(plan)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn hex_of(bytes: &[u8]) -> String {
+        digest_hex(&sha256(bytes))
+    }
+
+    fn jar_entry(mod_id: &str, file_name: &str, url: &str) -> ModSyncEntry {
+        ModSyncEntry {
+            mod_id: mod_id.to_string(),
+            file_name: file_name.to_string(),
+            download_url: url.to_string(),
+            sha256_hex: hex_of(b"jar-bytes"),
+            size_bytes: 9,
+        }
+    }
+
+    fn mmod_entry(mod_id: &str, file_name: &str, url: &str) -> ModSyncEntry {
+        ModSyncEntry {
+            mod_id: mod_id.to_string(),
+            file_name: file_name.to_string(),
+            download_url: url.to_string(),
+            sha256_hex: hex_of(b"mmod-bytes"),
+            size_bytes: 10,
+        }
+    }
+
+    fn manifest(entries: Vec<ModSyncEntry>) -> SyncManifest {
+        SyncManifest { entries }
+    }
+
+    #[test]
+    fn distinct_servers_get_distinct_sandboxed_profiles() {
+        let m = manifest(vec![jar_entry(
+            "sodium",
+            "sodium-fabric-0.6.13.jar",
+            "https://cdn.modrinth.com/data/AAAA/versions/B/sodium.jar",
+        )]);
+        let a = build_sync_approval_plan("server-alpha.example", &m, &[], &[]).unwrap();
+        let b = build_sync_approval_plan("server-beta.example", &m, &[], &[]).unwrap();
+        assert_ne!(a.profile_dir_name, b.profile_dir_name);
+        for plan in [&a, &b] {
+            assert!(plan.profile_dir_name.starts_with("server-"));
+            assert_eq!(plan.profile_dir_name.len(), "server-".len() + 16);
+            assert!(plan
+                .profile_dir_name
+                .chars()
+                .skip("server-".len())
+                .all(|c| c.is_ascii_hexdigit() && !c.is_ascii_uppercase()));
+        }
+        // Same server id → same profile (stable reuse).
+        let a2 = build_sync_approval_plan("server-alpha.example", &m, &[], &[]).unwrap();
+        assert_eq!(a.profile_dir_name, a2.profile_dir_name);
+    }
+
+    #[test]
+    fn personal_mods_preserved_and_conflicts_suspended_never_deleted() {
+        let m = manifest(vec![jar_entry(
+            "sodium",
+            "sodium-fabric-0.6.13.jar",
+            "https://cdn.modrinth.com/data/AAAA/versions/B/sodium.jar",
+        )]);
+        let personal = vec![
+            "iris".to_string(),
+            "sodium-fabric-0.6.13+mc1.21.1.jar".to_string(),
+        ];
+        let plan = build_sync_approval_plan("srv", &m, &[], &personal).unwrap();
+        assert_eq!(plan.preserved_personal_mods, vec!["iris".to_string()]);
+        assert_eq!(plan.temporarily_suspended_personal_mods.len(), 1);
+        let (mod_id, reason) = &plan.temporarily_suspended_personal_mods[0];
+        assert_eq!(mod_id, "sodium");
+        assert!(reason.contains("suspended for this session only"));
+        assert!(plan.requires_explicit_user_consent);
+    }
+
+    #[test]
+    fn four_sources_classify_into_auto_fetch_vs_manual_pickup() {
+        let m = manifest(vec![
+            jar_entry(
+                "sodium",
+                "sodium-fabric-0.6.13.jar",
+                "https://cdn.modrinth.com/data/AAAA/versions/B/sodium.jar",
+            ),
+            jar_entry(
+                "mymod",
+                "mymod-1.0.jar",
+                "https://github.com/acme/mymod/releases/download/v1.0.0/mymod-1.0.jar",
+            ),
+            jar_entry(
+                "jei",
+                "jei-1.21.jar",
+                "https://www.curseforge.com/minecraft/mc-mods/jei",
+            ),
+            mmod_entry(
+                "serverpack",
+                "server-pack.mmod",
+                "megu-server-push:session-1",
+            ),
+        ]);
+        let plan = build_sync_approval_plan("srv", &m, &[], &[]).unwrap();
+        assert_eq!(plan.auto_fetch_after_consent.len(), 3);
+        assert_eq!(plan.manual_browser_pickup.len(), 1);
+
+        let sources: Vec<ModSourceKind> = plan
+            .auto_fetch_after_consent
+            .iter()
+            .map(|e| e.source)
+            .collect();
+        assert!(sources.contains(&ModSourceKind::ModrinthCdn));
+        assert!(sources.contains(&ModSourceKind::GitHubRelease));
+        assert!(sources.contains(&ModSourceKind::ServerDeclarativeMmod));
+        assert_eq!(
+            plan.manual_browser_pickup[0].source,
+            ModSourceKind::CurseForgeBrowserPickup
+        );
+        // Every planned entry carries the exact hash pin and badge data.
+        for e in plan
+            .auto_fetch_after_consent
+            .iter()
+            .chain(plan.manual_browser_pickup.iter())
+        {
+            assert_eq!(e.sha256_hex.len(), 64);
+            assert!(e.size_bytes > 0);
+        }
+    }
+
+    #[test]
+    fn unknown_https_origin_is_manual_pickup_never_auto_fetch() {
+        let m = manifest(vec![jar_entry(
+            "mymod",
+            "mymod-1.0.jar",
+            "https://mods.example.com/files/mymod-1.0.jar",
+        )]);
+        let plan = build_sync_approval_plan("srv", &m, &[], &[]).unwrap();
+        assert!(plan.auto_fetch_after_consent.is_empty());
+        assert_eq!(plan.manual_browser_pickup.len(), 1);
+        assert_eq!(
+            plan.manual_browser_pickup[0].source,
+            ModSourceKind::UnknownExternal
+        );
+    }
+
+    #[test]
+    fn security_guards_reject_jar_push_and_bad_github_urls() {
+        // Direct server push of a .jar — RCE/arbitrary-drop attempt.
+        let jar_push = manifest(vec![jar_entry(
+            "evil",
+            "evil-1.0.jar",
+            "megu-server-push:session-1",
+        )]);
+        assert!(build_sync_approval_plan("srv", &jar_push, &[], &[]).is_err());
+
+        // .mmod push is accepted.
+        let mmod_push = manifest(vec![mmod_entry(
+            "pack",
+            "pack.mmod",
+            "megu-server-push:session-1",
+        )]);
+        let plan = build_sync_approval_plan("srv", &mmod_push, &[], &[]).unwrap();
+        assert_eq!(plan.auto_fetch_after_consent.len(), 1);
+
+        // GitHub release URL guards — anything github.com-hosted but
+        // malformed is a hard error.
+        for bad in [
+            "http://github.com/acme/mymod/releases/download/v1/mymod.jar",
+            "https://github.com/acme/mymod/releases/download/../v1/mymod.jar",
+            "https://github.com/acme/mymod/releases/download/v1/mymod.jar?x=1",
+            "https://user@github.com/acme/mymod/releases/download/v1/mymod.jar",
+            "https://github.com/acme/mymod/archive/refs/heads/main.zip",
+        ] {
+            let m = manifest(vec![jar_entry("mymod", "mymod.jar", bad)]);
+            assert!(
+                build_sync_approval_plan("srv", &m, &[], &[]).is_err(),
+                "expected rejection: {bad}"
+            );
+        }
+        // A github-shaped path on an arbitrary host is NOT a
+        // GitHubRelease — it degrades to manual pickup, never auto-fetch.
+        let m = manifest(vec![jar_entry(
+            "mymod",
+            "mymod.jar",
+            "https://evil.example.com/acme/mymod/releases/download/v1/mymod.jar",
+        )]);
+        let plan = build_sync_approval_plan("srv", &m, &[], &[]).unwrap();
+        assert!(plan.auto_fetch_after_consent.is_empty());
+        assert_eq!(
+            plan.manual_browser_pickup[0].source,
+            ModSourceKind::UnknownExternal
+        );
+        // Non-HTTPS anything is a hard error, not a manual pickup.
+        let m = manifest(vec![jar_entry(
+            "mymod",
+            "mymod.jar",
+            "http://cdn.modrinth.com/data/x/y.jar",
+        )]);
+        assert!(build_sync_approval_plan("srv", &m, &[], &[]).is_err());
+    }
+
+    #[test]
+    fn consent_required_only_when_changes_needed() {
+        // Empty manifest, no personal mods → already in sync.
+        let plan =
+            build_sync_approval_plan("srv", &manifest(vec![]), &[], &[]).unwrap();
+        assert!(!plan.requires_explicit_user_consent);
+        assert!(plan.auto_fetch_after_consent.is_empty());
+        assert!(plan.manual_browser_pickup.is_empty());
+
+        // Profile already byte-identical → no consent needed.
+        let entry = jar_entry(
+            "sodium",
+            "sodium-fabric-0.6.13.jar",
+            "https://cdn.modrinth.com/data/AAAA/versions/B/sodium.jar",
+        );
+        let m = manifest(vec![entry.clone()]);
+        let plan = build_sync_approval_plan("srv", &m, &[entry], &[]).unwrap();
+        assert!(!plan.requires_explicit_user_consent);
+
+        // One fetch needed → consent required.
+        let plan = build_sync_approval_plan("srv", &m, &[], &[]).unwrap();
+        assert!(plan.requires_explicit_user_consent);
+
+        // Suspension alone (impossible with empty manifest, so use a
+        // manifest whose only entry is already satisfied) still forces
+        // consent because the overlay changes.
+        let plan = build_sync_approval_plan(
+            "srv",
+            &m,
+            &[m.entries[0].clone()],
+            &["sodium".to_string()],
+        )
+        .unwrap();
+        assert!(plan.requires_explicit_user_consent);
+        assert_eq!(plan.temporarily_suspended_personal_mods.len(), 1);
+    }
 }
