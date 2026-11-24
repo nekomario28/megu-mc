@@ -1,9 +1,11 @@
 // SPDX-License-Identifier: LGPL-3.0-or-later OR GPL-3.0-or-later OR AGPL-3.0-or-later
 #![deny(unsafe_code)]
 //! `mods/` discovery, the way Fabric Loader, NeoForge and the launchers
-//! (Prism, Modrinth App, MultiMC) treat the folder: only regular `.jar`
-//! files are active, everything else is set aside with an explicit reason —
-//! never silently dropped, never a hard failure.
+//! (Prism, Modrinth App, MultiMC) treat the folder: only regular archive
+//! files — `.jar` mods and Megu's native `.mmod` packages (ZIP archives
+//! carrying `megu-mod.toml` + `megu-mod-bundle.json`) — are active,
+//! everything else is set aside with an explicit reason — never silently
+//! dropped, never a hard failure.
 //!
 //! The launchers' shared conventions are honored: `*.disabled` is a mod
 //! toggled off without deleting the jar, entries starting with `.` are
@@ -32,9 +34,9 @@ pub enum ModsDirSkipReason {
     /// A symlink: always refused, so a `mods/` entry can never redirect the
     /// loader outside the folder.
     SymlinkRefused,
-    /// A regular entry that is not a `.jar`: `*.txt`, `*.zip`, `*.toml`,
-    /// `*.log` and anything else, including `.jar`-named non-regular files
-    /// (FIFOs, sockets, devices).
+    /// A regular entry that is not a loadable archive: `*.txt`, `*.zip`,
+    /// `*.toml`, `*.log` and anything else, including `.jar`/`.mmod`-named
+    /// non-regular files (FIFOs, sockets, devices).
     NonJarFile,
     /// A subdirectory that is not the matching `<mc_version>` folder —
     /// `mods/1.20.1/` on a 1.21.1 instance, `mods/memory_repo/` and so on.
@@ -56,8 +58,9 @@ pub struct SkippedModEntry {
 pub struct ModsFolderScan {
     /// The `mods/` directory that was scanned.
     pub root: PathBuf,
-    /// Loadable jars — regular files ending in `.jar` (case-insensitive),
-    /// paths under [`Self::root`], sorted by normalized relative path.
+    /// Loadable archives — regular files ending in `.jar` or `.mmod`
+    /// (case-insensitive), paths under [`Self::root`], sorted by normalized
+    /// relative path.
     pub active_mods: Vec<PathBuf>,
     /// Everything else that was seen, sorted the same way.
     pub skipped: Vec<SkippedModEntry>,
@@ -109,7 +112,7 @@ fn validate_mc_version(version: &str) -> io::Result<()> {
 
 /// What one directory entry means for the scan.
 enum Classification {
-    /// A regular `.jar` file.
+    /// A regular `.jar` or `.mmod` archive file.
     Active,
     /// Set aside with this reason.
     Skip(ModsDirSkipReason),
@@ -144,14 +147,14 @@ fn classify(
             Classification::Skip(ModsDirSkipReason::OtherSubdirectory)
         };
     }
-    // `.disabled` wins over `.jar` (`mod.jar.disabled` is a disabled mod,
-    // not a jar); both suffix checks are ASCII-case-insensitive for the
-    // `.JAR` files Windows tooling produces.
+    // `.disabled` wins over `.jar`/`.mmod` (`mod.jar.disabled` is a disabled
+    // mod, not a jar); the suffix checks are ASCII-case-insensitive for the
+    // `.JAR`/`.MMOD` files Windows tooling produces.
     let lower = text.to_ascii_lowercase();
     if lower.ends_with(".disabled") {
         return Classification::Skip(ModsDirSkipReason::DisabledMod);
     }
-    if lower.ends_with(".jar") && file_type.is_file() {
+    if (lower.ends_with(".jar") || lower.ends_with(".mmod")) && file_type.is_file() {
         return Classification::Active;
     }
     Classification::Skip(ModsDirSkipReason::NonJarFile)
@@ -194,9 +197,9 @@ fn normalized_rel(rel: &Path) -> String {
         .join("/")
 }
 
-/// Scan `mods_dir` for active mod jars, launcher-style.
+/// Scan `mods_dir` for active mod archives, launcher-style.
 ///
-/// `mc_version`, when given, also activates the jars directly inside
+/// `mc_version`, when given, also activates the archives directly inside
 /// `<mods_dir>/<mc_version>/` (Fabric's per-version folder); it must be a
 /// single plain folder name — anything with a path separator, `.`/`..` or
 /// NUL is rejected with `InvalidInput` before anything is read.
@@ -243,5 +246,41 @@ mod tests {
             assert!(scan_mods_folder(&dir, Some(bad)).is_err(), "{bad:?}");
         }
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn mmod_archives_scan_alongside_jars_and_disabled_is_ignored() {
+        let dir = tmp_dir("mmod").join("mods");
+        std::fs::create_dir_all(&dir).unwrap();
+        for name in [
+            "a.jar",
+            "b.mmod",
+            "C.MMOD",
+            "off.mmod.disabled",
+            "notes.txt",
+        ] {
+            std::fs::write(dir.join(name), b"archive-bytes").unwrap();
+        }
+        let scan = scan_mods_folder(&dir, None).unwrap();
+        assert_eq!(
+            scan.relative_active_mods(),
+            vec![
+                "C.MMOD".to_owned(),
+                "a.jar".to_owned(),
+                "b.mmod".to_owned()
+            ]
+        );
+        let reason_for = |name: &str| {
+            scan.relative_skipped()
+                .into_iter()
+                .find(|(path, _)| path == name)
+                .map(|(_, reason)| reason)
+        };
+        assert_eq!(
+            reason_for("off.mmod.disabled"),
+            Some(ModsDirSkipReason::DisabledMod)
+        );
+        assert_eq!(reason_for("notes.txt"), Some(ModsDirSkipReason::NonJarFile));
+        let _ = std::fs::remove_dir_all(dir.parent().unwrap());
     }
 }

@@ -13500,9 +13500,19 @@ fn handle_inner(mut s: TcpStream, live_eid: Arc<AtomicI32>) {
                                     drop_player_items_on_death(victim);
                                 }
                                 if GR_SHOW_DEATH_MESSAGES.load(Ordering::Relaxed) != 0 {
-                                    let message = format!(
-                                        "{} was slain by {}",
-                                        vname, me.name
+                                    // Vanilla `player_attack`: the `.item`
+                                    // variant only when the killer's held
+                                    // item carries a custom name.
+                                    let weapon = {
+                                        let i2 = me.inv.lock().unwrap_or_else(|e| e.into_inner());
+                                        i2.get(&(36 + held_slot))
+                                            .and_then(|st| renamed_custom_name(&st.2))
+                                    };
+                                    let message = format_vanilla_death_message(
+                                        &vname,
+                                        "player_attack",
+                                        Some(me.name.as_str()),
+                                        weapon.as_deref(),
                                     );
                                     let line = system_chat(&message);
                                     broadcast_packet(-1, 0x6c, &line);
@@ -21509,6 +21519,35 @@ mod p5c_live_tests {
             );
         }
     }
+
+    /// `player_death_broadcast` is the funnel the fall landing calls: under
+    /// `showDeathMessages` every tracked client gets a `0x6c` system chat
+    /// carrying the vanilla `death.fell` line.
+    #[test]
+    fn fall_death_broadcast_relays_vanilla_message() {
+        let _guard = world_guard();
+        let (me, mut peer) = loopback_client("fallvictim", 0x7c01);
+        clients().lock().unwrap_or_else(|e| e.into_inner()).push(me.clone());
+        let _clean = LiveCleanup {
+            eid: me.eid,
+            difficulty: DIFFICULTY.load(Ordering::Relaxed),
+        };
+        let prev = GR_SHOW_DEATH_MESSAGES.swap(1, Ordering::Relaxed);
+        player_death_broadcast("FallGuy", "fall");
+        GR_SHOW_DEATH_MESSAGES.store(prev, Ordering::Relaxed);
+        let (id, body) =
+            read_frame(&mut peer).expect("death broadcast must reach the client");
+        assert_eq!(id, 0x6c, "death message rides system chat");
+        let text = b"fell from a high place";
+        assert!(
+            body.windows(text.len()).any(|w| w == text),
+            "vanilla fall message must be broadcast, got {body:?}"
+        );
+        assert!(
+            body.windows(7).any(|w| w == b"FallGuy"),
+            "victim name must be in the message, got {body:?}"
+        );
+    }
 }
 
 #[cfg(test)]
@@ -24094,5 +24133,28 @@ mod admin_wire_play_tests {
             Some(v) => rules.insert("spawnRadius", v),
             None => rules.remove("spawnRadius"),
         };
+    }
+}
+
+#[cfg(test)]
+mod vanilla_death_message_tests {
+    use super::*;
+
+    /// The PvP melee death site formats through
+    /// `format_vanilla_death_message` with `player_attack`: bare killer name
+    /// gives the `slain by` line, a custom-named held item picks the `using`
+    /// variant — vanilla 1.21.1 `death.attack.player[.item]`.
+    #[test]
+    fn pvp_death_message_uses_vanilla_player_attack_patterns() {
+        let f = format_vanilla_death_message;
+        assert_eq!(
+            f("Steve", "player_attack", Some("Alex"), None),
+            "Steve was slain by Alex"
+        );
+        assert_eq!(
+            f("Steve", "player_attack", Some("Alex"), Some("Excalibur")),
+            "Steve was slain by Alex using Excalibur"
+        );
+        assert_eq!(f("Steve", "player_attack", None, None), "Steve was slain");
     }
 }

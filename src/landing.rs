@@ -217,6 +217,7 @@ pub fn player_move(me: &Arc<Client>, previous_ground: bool) {
         && GR_FALL_DAMAGE.load(Ordering::Relaxed) != 0
     {
         let mut hp = me.hp.lock().unwrap_or_else(|e| e.into_inner());
+        let was_alive = *hp > 0.0;
         let damage = (distance - 3.0).ceil() as f32;
         *hp = (*hp - damage * (1.0 - 0.04 * enchant_epf(me, 1) as f32)).max(0.0);
         if *hp <= 0.0 {
@@ -232,6 +233,14 @@ pub fn player_move(me: &Arc<Client>, previous_ground: bool) {
             0x5d,
             health_pkt_c(current, me),
         );
+        // Vanilla `die` on a lethal `fall` source: the death sweep's
+        // `lethal_damage_type` never sees this hit (it lands between ticks),
+        // so the landing path broadcasts the vanilla fall message itself —
+        // once, only when this impact actually killed (a totem save or an
+        // already-dead player stays silent).
+        if was_alive && current <= 0.0 {
+            player_death_broadcast(me.name.as_str(), "fall");
+        }
     }
 }
 
@@ -248,6 +257,22 @@ mod tests {
         assert!(!eligible(7.0, 0.0, false, false, true, 1.0, 1.0));
         assert!(!eligible(7.0, 0.0, true, true, true, 0.6, 0.6));
         assert!(!eligible(f32::NAN, 0.0, true, true, true, 1.0, 1.0));
+    }
+    /// The lethal-landing broadcast goes through
+    /// `player_death_broadcast(.., "fall")`, so the chat line is the vanilla
+    /// 1.21.1 `death.fell.fall` message — `death.fell` fall_variants share
+    /// the `fall`/`ender_pearl` message_id.
+    #[test]
+    fn fall_death_message_is_vanilla_formatted() {
+        assert_eq!(
+            format_vanilla_death_message("Steve", "fall", None, None),
+            "Steve fell from a high place"
+        );
+        // A lethal pearl teleport reads the same fall_variants line.
+        assert_eq!(
+            format_vanilla_death_message("Steve", "ender_pearl", None, None),
+            "Steve fell from a high place"
+        );
     }
     #[test]
     fn stale_landing_does_not_replace_new_block() {
