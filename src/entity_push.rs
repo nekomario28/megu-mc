@@ -335,7 +335,7 @@ fn apply_entity_push_step(
             if (mp.0 - prev_x).abs() > 1e-9 || (mp.2 - prev_z).abs() > 1e-9 {
                 let (x, y, z, yaw, pitch) = *mp;
                 drop(mp);
-                let on_ground = mob_has_support(m.etype, x, y, z);
+                let on_ground = mob_has_support_dim(m.dim, m.etype, x, y, z);
                 broadcast_seen(m.eid, |_c| {
                     (0x70, entity_teleport(m.eid, x, y, z, yaw, pitch, on_ground))
                 });

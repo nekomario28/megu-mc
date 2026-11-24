@@ -495,10 +495,10 @@ fn tick_natural_hostile_despawn() {
             hostile.observe_hurt(&mob, hp);
 
             let (x, y, z, ..) = *mob.pos.lock().unwrap_or_else(|e| e.into_inner());
-            // `players` only tracks the three vanilla dimensions; a datapack
-            // dimension slot indexes past the array, so it sees no players.
+            // `players` is keyed by the mob's own dimension — datapack
+            // dimensions track their players exactly like the vanilla three.
             let distance = players
-                .get(mob.dim.index())
+                .get(&mob.dim)
                 .and_then(|players| nearest_player_distance_sq(players, [x, y, z]));
             if hostile.check_despawn(peaceful, distance) {
                 discarded.insert(mob.eid, mob);
@@ -530,13 +530,11 @@ fn tick_natural_hostile_despawn() {
     });
 }
 
-fn despawn_players(clients: &[Arc<Client>]) -> [Vec<[f64; 3]>; 3] {
-    let mut players = [Vec::new(), Vec::new(), Vec::new()];
+fn despawn_players(clients: &[Arc<Client>]) -> HashMap<DimId, Vec<[f64; 3]>> {
+    let mut players: HashMap<DimId, Vec<[f64; 3]>> = HashMap::new();
     for client in clients.iter().filter(|client| !client.is_spectator()) {
         let (dim, x, y, z, ..) = client_dim_pos(client);
-        if let Some(players) = players.get_mut(dim.index()) {
-            players.push([x, y, z]);
-        }
+        players.entry(dim).or_default().push([x, y, z]);
     }
     players
 }
@@ -840,13 +838,17 @@ mod mob_despawn_tests {
     }
 
     #[test]
-    fn bughunt_root_despawn_tracks_only_vanilla_dimension_slots() {
-        // A client in a datapack dimension (slot >= 3) indexed past the end of
-        // the three-slot per-dimension player array.
+    fn despawn_players_tracks_datapack_dimension_slots() {
+        // A client in a datapack dimension (slot >= 3) is tracked under its
+        // own dimension key — the despawn distance applies there exactly like
+        // it does in the three vanilla dimensions.
         let (player, _) = client_pair();
         *player.dim.lock().unwrap_or_else(|e| e.into_inner()) = DimId::from_raw(3);
         let players = despawn_players(&[Arc::new(player)]);
-        assert!(players.iter().all(Vec::is_empty));
+        assert_eq!(players.get(&DimId::from_raw(3)).map(Vec::len), Some(1));
+        assert!(!players.contains_key(&DimId::Overworld));
+        assert!(!players.contains_key(&DimId::Nether));
+        assert!(!players.contains_key(&DimId::End));
     }
 
     #[test]
@@ -870,6 +872,38 @@ mod mob_despawn_tests {
         tick_natural_hostile_despawn();
         // With no players tracked for its dimension the mob stays loaded.
         assert_eq!(mobs().lock().unwrap_or_else(|e| e.into_inner()).len(), 1);
+    }
+
+    #[test]
+    fn despawn_distance_applies_in_a_datapack_dimension() {
+        // A same-dimension player beyond 128 blocks discards an unprotected
+        // hostile — the distance check runs in the mob's own dimension, not
+        // just the three vanilla ones.
+        let _guard = crate::world_guard();
+        if crate::test_support::isolated_world_test() {
+            return;
+        }
+        DIFFICULTY.store(1, Ordering::Relaxed);
+        tick_natural_hostile_despawn();
+        let (player, _sock) = client_pair();
+        *player.dim.lock().unwrap_or_else(|e| e.into_inner()) = DimId::from_raw(3);
+        crate::clients()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .push(Arc::new(player));
+        push_natural_hostile(
+            &mut mobs().lock().unwrap_or_else(|e| e.into_inner()),
+            zombie_in(41, (1000.0, 70.0, 0.0), DimId::from_raw(3)),
+        );
+        tick_natural_hostile_despawn();
+        assert!(
+            mobs().lock().unwrap_or_else(|e| e.into_inner()).is_empty(),
+            "a monster 1000 blocks from the only same-dimension player must discard"
+        );
+        crate::clients()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .retain(|c| c.eid != 4242);
     }
 
     #[test]

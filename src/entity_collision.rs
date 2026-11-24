@@ -82,45 +82,27 @@ fn block_collision_window(min: [f64; 3], max: [f64; 3]) -> (i32, i32, i32, i32, 
 /// 1.21.1 `BlockCollisions` (`dca.computeNext`) world block collision reader
 /// appending to `out` (cleared first). The sweep window is
 /// [`block_collision_window`]; a caller-owned buffer turns the per-tick
-/// `Vec` allocation into reuse.
+/// `Vec` allocation into reuse. The Overworld arm of
+/// `collect_block_collision_boxes_into_dim`, kept under the old name for the
+/// callers that predate dimensions.
 fn collect_block_collision_boxes_into(
     min: [f64; 3],
     max: [f64; 3],
     out: &mut Vec<([f64; 3], [f64; 3])>,
 ) {
-    out.clear();
-    let Some(reg) = crate::block_registry::breg() else {
-        return;
-    };
-    let (bx0, bx1, by0, by1, bz0, bz1) = block_collision_window(min, max);
-    for by in by0..=by1 {
-        for bz in bz0..=bz1 {
-            for bx in bx0..=bx1 {
-                let st = block_at_cached(bx, by, bz);
-                for (bmin, bmax) in reg.collision_boxes(st) {
-                    let wmin = [
-                        bx as f64 + bmin[0],
-                        by as f64 + bmin[1],
-                        bz as f64 + bmin[2],
-                    ];
-                    let wmax = [
-                        bx as f64 + bmax[0],
-                        by as f64 + bmax[1],
-                        bz as f64 + bmax[2],
-                    ];
-                    if aabb_overlaps((min, max), (wmin, wmax)) {
-                        out.push((wmin, wmax));
-                    }
-                }
-            }
-        }
-    }
+    collect_block_collision_boxes_into_dim(DimId::Overworld, min, max, out)
 }
 
 /// `!collect_block_collision_boxes(min, max).is_empty()` without materializing
 /// the list: stops at the first overlapping block box. Same window, same
 /// `aabb_overlaps` filter — the emptiness answer is identical.
+#[allow(dead_code)]
 fn any_block_collision_box(min: [f64; 3], max: [f64; 3]) -> bool {
+    any_block_collision_box_dim(DimId::Overworld, min, max)
+}
+
+/// `any_block_collision_box` on the dimension's own block view.
+fn any_block_collision_box_dim(dim: DimId, min: [f64; 3], max: [f64; 3]) -> bool {
     let Some(reg) = crate::block_registry::breg() else {
         return false;
     };
@@ -128,7 +110,7 @@ fn any_block_collision_box(min: [f64; 3], max: [f64; 3]) -> bool {
     for by in by0..=by1 {
         for bz in bz0..=bz1 {
             for bx in bx0..=bx1 {
-                let st = block_at_cached(bx, by, bz);
+                let st = block_at_cached_dim(dim, bx, by, bz);
                 for (bmin, bmax) in reg.collision_boxes(st) {
                     let wmin = [
                         bx as f64 + bmin[0],
@@ -441,6 +423,8 @@ fn entity_collide(
     )
 }
 
+/// `entity_collide_world_dim` for callers that predate dimensions: the
+/// Overworld arm, kept under the old name.
 fn entity_collide_world(
     aabb: EntityAabb,
     delta: [f64; 3],
@@ -448,17 +432,7 @@ fn entity_collide_world(
     max_up_step: f32,
     extra_boxes: &[([f64; 3], [f64; 3])],
 ) -> CollideResult {
-    with_collide_scratch(|scratch| {
-        entity_collide_scratch(
-            aabb,
-            delta,
-            on_ground,
-            max_up_step,
-            extra_boxes,
-            |sweep, out| collect_block_collision_boxes_into(sweep.min(), sweep.max(), out),
-            scratch,
-        )
-    })
+    entity_collide_world_dim(DimId::Overworld, aabb, delta, on_ground, max_up_step, extra_boxes)
 }
 
 fn step_entity_move(
@@ -469,16 +443,7 @@ fn step_entity_move(
     on_ground: bool,
     max_up_step: f32,
 ) -> ([f64; 3], CollideResult) {
-    let aabb = EntityAabb::from_dimensions(pos[0], pos[1], pos[2], width, height);
-    let res = entity_collide_world(aabb, delta, on_ground, max_up_step, &[]);
-    (
-        [
-            pos[0] + res.delta[0],
-            pos[1] + res.delta[1],
-            pos[2] + res.delta[2],
-        ],
-        res,
-    )
+    step_entity_move_dim(DimId::Overworld, pos, width, height, delta, on_ground, max_up_step)
 }
 
 /// Registry bounds for the mob types with explicit collision support.
@@ -492,12 +457,17 @@ fn mob_dimensions(etype: i64) -> (f32, f32) {
 }
 
 fn mob_has_support(etype: i64, x: f64, y: f64, z: f64) -> bool {
-    let (w, h) = mob_dimensions(etype);
-    let aabb = EntityAabb::from_dimensions(x, y, z, w, h);
-    entity_collide_world(aabb, [0.0, -1e-4, 0.0], false, 0.0, &[]).vertical_collision_below
+    mob_has_support_dim(DimId::Overworld, etype, x, y, z)
 }
 
 fn mob_collide_move(m: &Arc<Mob>, mp: &mut (f64, f64, f64, f32, f32), dx: f64, dz: f64) {
+    // The Overworld keeps `mob_snap_y`'s surface snap and fall-damage landing;
+    // every other dimension runs the quarter-block `mob_snap_y_dim` variant —
+    // they are deliberately different semantics, not a fallback chain.
+    if m.dim != DimId::Overworld {
+        mob_collide_move_dim(m.dim, m, mp, dx, dz);
+        return;
+    }
     let (w, h) = mob_dimensions(m.etype);
     let on_ground = mob_has_support(m.etype, mp.0, mp.1, mp.2);
     // 1.21.1 Attributes.STEP_HEIGHT (`buw.B`): default 0.6f.
@@ -989,5 +959,32 @@ mod entity_collision_tests {
             }, scratch)
         });
         assert_eq!(expected_still, actual_still);
+    }
+
+    // H1 — the `_dim` collision queries read the entity's own dimension: a
+    // Nether stone cell must not stop an Overworld sweep at the same
+    // coordinates, and the Overworld wrappers keep answering for the Overworld.
+    #[test]
+    fn dim_scoped_collision_queries_read_their_own_dimension() {
+        crate::test_support::require_vanilla_data();
+        let _guard = world_guard();
+        let _snap = TestWorldSnapshot::take();
+        let stone = name_to_state("stone").unwrap();
+        {
+            let mut w = world().write_all();
+            w.entry((DimId::Nether, 0, 0))
+                .or_default()
+                .insert(local_idx(3, 64, 3), stone);
+        }
+        let min = [3.2, 64.2, 3.2];
+        let max = [3.8, 64.8, 3.8];
+        assert!(any_block_collision_box_dim(DimId::Nether, min, max));
+        assert!(!any_block_collision_box_dim(DimId::Overworld, min, max));
+        assert!(!any_block_collision_box(min, max));
+        let mut out = Vec::new();
+        collect_block_collision_boxes_into_dim(DimId::Nether, min, max, &mut out);
+        assert!(!out.is_empty());
+        collect_block_collision_boxes_into_dim(DimId::Overworld, min, max, &mut out);
+        assert!(out.is_empty());
     }
 }

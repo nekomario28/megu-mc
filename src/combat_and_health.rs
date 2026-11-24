@@ -131,6 +131,48 @@ fn xps() -> &'static Mutex<Vec<Xp>> {
     XPS.get_or_init(|| Mutex::new(Vec::new()))
 }
 
+// ---------- entity dimension side table ----------
+// `Arrow`, `Primed`, `Bobber`, `Pearl`, `Snowball`, `Firework` and `Xp` are
+// built with struct literals in files this lane does not own, so the dimension
+// cannot join the struct: it lives here, keyed by entity id. `entity_dim_of`
+// answers `DimId::Overworld` for an eid nobody registered — the dimension those
+// callers always assumed. `clear_entity_dim` retires the entry when the entity
+// despawns so the map cannot grow one row per entity ever spawned.
+static ENTITY_DIMS: OnceLock<RwLock<HashMap<i32, DimId>>> = OnceLock::new();
+fn entity_dims() -> &'static RwLock<HashMap<i32, DimId>> {
+    ENTITY_DIMS.get_or_init(|| RwLock::new(HashMap::new()))
+}
+
+/// The dimension `eid` was registered under, `DimId::Overworld` when none was.
+pub(crate) fn entity_dim_of(eid: i32) -> DimId {
+    entity_dims()
+        .read()
+        .unwrap_or_else(|e| e.into_inner())
+        .get(&eid)
+        .copied()
+        .unwrap_or(DimId::Overworld)
+}
+
+/// Record the dimension an entity lives in. `DimId::Overworld` removes the
+/// entry instead — it is already the default answer.
+pub(crate) fn set_entity_dim(eid: i32, dim: DimId) {
+    let mut dims = entity_dims().write().unwrap_or_else(|e| e.into_inner());
+    if dim == DimId::Overworld {
+        dims.remove(&eid);
+    } else {
+        dims.insert(eid, dim);
+    }
+}
+
+/// Forget an entity's dimension on despawn: eids are never reused, but the
+/// entry would otherwise sit in the table until process end.
+pub(crate) fn clear_entity_dim(eid: i32) {
+    entity_dims()
+        .write()
+        .unwrap_or_else(|e| e.into_inner())
+        .remove(&eid);
+}
+
 // ---------- fresh-orb merge on spawn/tick (MEGA-SCALE §3.2) ----------
 // Orbs spawned through `xp_spawn` since the last `drop_tick` merge pass. The
 // per-eid marker lets a spawn storm collapse inside the tick it lands in —
@@ -150,9 +192,11 @@ const XP_MERGE_FLOOR: usize = 256;
 /// the conserved remainder as additional bounded orbs instead of overflowing.
 const XP_ORB_MAX_VAL: u64 = i16::MAX as u64;
 
-/// Spawn an experience orb, marking it merge-pending so the next `drop_tick`
-/// pass can collapse a spawn burst inside the same tick.
-fn xp_spawn(x: f64, y: f64, z: f64, val: i16) -> i32 {
+/// Spawn an experience orb in `dim`, marking it merge-pending so the next
+/// `drop_tick` pass can collapse a spawn burst inside the same tick. The
+/// orb's dimension is the side-table entry because `Xp` carries no `dim`
+/// field (it is built with struct literals outside this lane).
+fn xp_spawn_dim(dim: DimId, x: f64, y: f64, z: f64, val: i16) -> i32 {
     let eid = NEXT_EID.fetch_add(1, Ordering::SeqCst);
     xps().lock().unwrap_or_else(|e| e.into_inner()).push(Xp {
         eid,
@@ -162,11 +206,18 @@ fn xp_spawn(x: f64, y: f64, z: f64, val: i16) -> i32 {
         val,
         age: 0,
     });
+    set_entity_dim(eid, dim);
     xp_pending()
         .lock()
         .unwrap_or_else(|e| e.into_inner())
         .insert(eid);
     eid
+}
+
+/// `xp_spawn` for callers that predate per-entity dimensions: the orb lands in
+/// the Overworld, the dimension they always assumed.
+fn xp_spawn(x: f64, y: f64, z: f64, val: i16) -> i32 {
+    xp_spawn_dim(DimId::Overworld, x, y, z, val)
 }
 
 /// The merge kernel over one partitioned pool (keepers first, donors after,
@@ -264,39 +315,58 @@ fn xp_merge_pending_locked(xs: &mut Vec<Xp>, pending: &HashSet<i32>) -> Vec<i32>
     if pool.len() < 2 {
         return Vec::new();
     }
-    let mut vals: Vec<u64> = pool.iter().map(|&i| xs[i].val as u64).collect();
-    xp_merge_run(&pool, xs, &mut vals);
+    // Merge only within a dimension: two orbs at the same coordinates in
+    // different dimensions are 1.0 apart in no world, so each dimension's
+    // slice of the pool runs the kernel on its own.
+    let mut groups: Vec<(DimId, Vec<usize>)> = Vec::new();
+    for &i in &pool {
+        let dim = entity_dim_of(xs[i].eid);
+        if let Some((_, group)) = groups.iter_mut().find(|(d, _)| *d == dim) {
+            group.push(i);
+        } else {
+            groups.push((dim, vec![i]));
+        }
+    }
     let mut eaten = HashSet::new();
     let mut order = Vec::new();
     let mut spill = Vec::new();
-    for (k, &i) in pool.iter().enumerate() {
-        if vals[k] == 0 {
-            if eaten.insert(xs[i].eid) {
-                order.push(xs[i].eid);
-            }
-        } else {
-            let keep = vals[k].min(XP_ORB_MAX_VAL);
-            let excess = vals[k] - keep;
-            xs[i].val = keep as i16;
-            if excess > 0 {
-                spill.push((xs[i].x, xs[i].y, xs[i].z, excess));
+    for (dim, gpool) in groups {
+        let mut vals: Vec<u64> = gpool.iter().map(|&i| xs[i].val as u64).collect();
+        xp_merge_run(&gpool, xs, &mut vals);
+        for (k, &i) in gpool.iter().enumerate() {
+            if vals[k] == 0 {
+                if eaten.insert(xs[i].eid) {
+                    order.push(xs[i].eid);
+                }
+            } else {
+                let keep = vals[k].min(XP_ORB_MAX_VAL);
+                let excess = vals[k] - keep;
+                xs[i].val = keep as i16;
+                if excess > 0 {
+                    spill.push((xs[i].x, xs[i].y, xs[i].z, excess, dim));
+                }
             }
         }
     }
     if !eaten.is_empty() {
         xs.retain(|x| !eaten.contains(&x.eid));
+        for &eid in &eaten {
+            clear_entity_dim(eid);
+        }
     }
-    for (x, y, z, mut left) in spill {
+    for (x, y, z, mut left, dim) in spill {
         while left > 0 {
             let take = left.min(XP_ORB_MAX_VAL) as i16;
+            let eid = NEXT_EID.fetch_add(1, Ordering::SeqCst);
             xs.push(Xp {
-                eid: NEXT_EID.fetch_add(1, Ordering::SeqCst),
+                eid,
                 x,
                 y,
                 z,
                 val: take,
                 age: 0,
             });
+            set_entity_dim(eid, dim);
             left -= u64::from(take as u16);
         }
     }
@@ -310,8 +380,9 @@ fn xp_merge_pending_locked(xs: &mut Vec<Xp>, pending: &HashSet<i32>) -> Vec<i32>
 /// save-payload fixture — which never routes a spawn through `xp_spawn` —
 /// cannot observe this path at all.
 ///
-/// The `xps` store is the Overworld orb list, so merged orbs are same-dimension
-/// by construction and the 1.0-block radius is the only spatial gate.
+/// The `xps` store mixes dimensions now, so `xp_merge_pending_locked`
+/// partitions the pool by `entity_dim_of` first — the 1.0-block radius is the
+/// only spatial gate inside a same-dimension group.
 fn xp_merge_pending() {
     let pending: HashSet<i32> = {
         let mut p = xp_pending().lock().unwrap_or_else(|e| e.into_inner());
@@ -1278,21 +1349,27 @@ fn fireworks_step() {
         fws.retain(|f| !expired.iter().any(|(e, ..)| *e == f.eid));
     }
     for (eid, _owner, x, y, z, explosions) in expired {
-        firework_explode(x, y, z, explosions);
+        let fdim = entity_dim_of(eid);
+        clear_entity_dim(eid);
+        firework_explode(fdim, x, y, z, explosions);
         broadcast_seen_destroy(eid);
     }
 }
 
 /// Vanilla `FireworkRocketEntity.explode`: `5 + 2 * explosions` blast damage
-/// inside a ~5-block radius, no block destruction.
-fn firework_explode(x: f64, y: f64, z: f64, explosions: i64) {
+/// inside a ~5-block radius, no block destruction — and only against entities
+/// in the dimension the rocket burst in.
+fn firework_explode(dim: DimId, x: f64, y: f64, z: f64, explosions: i64) {
     let packet = explosion_pkt_with_power(x, y, z, 1.0, &[]);
-    broadcast(-1, |_c| (0x20, packet.clone()));
+    broadcast_near(dim, x, y, z, -1, |_c| (0x20, packet.clone()));
     if explosions <= 0 {
         return;
     }
     let power = (5.0 + 2.0 * explosions as f64) as f32;
     for cl in client_snapshot() {
+        if *cl.dim.lock().unwrap_or_else(|e| e.into_inner()) != dim {
+            continue;
+        }
         let (px, py, pz, ..) = *cl.pos.lock().unwrap_or_else(|e| e.into_inner());
         let dd = ((px - x).powi(2) + (py - y).powi(2) + (pz - z).powi(2)).sqrt();
         if dd < 5.0 && *cl.gm.lock().unwrap_or_else(|e| e.into_inner()) != 1 {
@@ -1322,6 +1399,9 @@ fn firework_explode(x: f64, y: f64, z: f64, explosions: i64) {
         }
     }
     for mob in mobs().lock().unwrap_or_else(|e| e.into_inner()).iter() {
+        if mob.dim != dim {
+            continue;
+        }
         let (mx, my, mz, ..) = *mob.pos.lock().unwrap_or_else(|e| e.into_inner());
         let dd = ((mx - x).powi(2) + (my - y).powi(2) + (mz - z).powi(2)).sqrt();
         if dd < 5.0 {
@@ -1929,9 +2009,9 @@ fn kill_mob(deid: i32, etype: i64, mx: f64, my: f64, mz: f64) {
         .filter(|st| !(was_sheared && st.0 == 202))
         .filter(|_| GR_MOB_LOOT.load(Ordering::Relaxed) == 1)
     {
-        drop_spawn_scattered(DimId::Overworld, mx, my, mz, item, cnt, comps, 0, None, None);
+        drop_spawn_scattered(mob.dim, mx, my, mz, item, cnt, comps, 0, None, None);
     }
-    xp_spawn(mx, my, mz, mob_xp(etype));
+    xp_spawn_dim(mob.dim, mx, my, mz, mob_xp(etype));
     // spawn streams via interest_tick
 }
 
@@ -1947,7 +2027,7 @@ fn mob_env_die(deid: i32, etype: i64, mx: f64, my: f64, mz: f64, burning: bool) 
         .into_iter()
         .filter(|_| GR_MOB_LOOT.load(Ordering::Relaxed) == 1)
     {
-        drop_spawn_scattered(DimId::Overworld, mx, my, mz, item, cnt, comps, 0, None, None);
+        drop_spawn_scattered(mob.dim, mx, my, mz, item, cnt, comps, 0, None, None);
     }
 }
 static LOOT_SEQ: AtomicU64 = AtomicU64::new(0);
@@ -2413,10 +2493,15 @@ fn merge_xp_orbs(xl: &mut [Xp]) -> Vec<i32> {
                 let b = &xl[j];
                 (b.x, b.y, b.z, b.age)
             };
-            if (ax - bx).powi(2) + (ay - by).powi(2) + (az - bz).powi(2) < 1.0 {
+            // Same-dimension orbs only: equal coordinates in different
+            // dimensions are not adjacent in any world.
+            if (ax - bx).powi(2) + (ay - by).powi(2) + (az - bz).powi(2) < 1.0
+                && entity_dim_of(xl[i].eid) == entity_dim_of(xl[j].eid)
+            {
                 let (keep, eat) = if aage <= bage { (i, j) } else { (j, i) };
                 xl[keep].val = xl[keep].val.saturating_add(xl[eat].val);
                 merged.push(xl[eat].eid);
+                clear_entity_dim(xl[eat].eid);
                 break;
             }
         }
@@ -2562,6 +2647,9 @@ fn arrow_tick() {
         let mut seen_tridents = trident_seen().lock().unwrap_or_else(|e| e.into_inner());
         for a in ar.iter_mut() {
             let eid = a.eid;
+            // The projectile's own dimension: block probes, target filters and
+            // the channeling sky check all resolve against `adim`'s world.
+            let adim = entity_dim_of(eid);
             if !region.is_hot(a.x as i32, a.z as i32) {
                 continue;
             }
@@ -2692,6 +2780,9 @@ fn arrow_tick() {
                         .iter()
                         .filter(|c| *c.gm.lock().unwrap_or_else(|e| e.into_inner()) != 1)
                         .find(|c| {
+                            if *c.dim.lock().unwrap_or_else(|e| e.into_inner()) != adim {
+                                return false;
+                            }
                             let p = c.pos.lock().unwrap_or_else(|e| e.into_inner());
                             let (dx, dy, dz) = (p.0 - ax, (p.1 + 0.9) - ay, p.2 - az);
                             dx * dx + dy * dy + dz * dz < 1.3
@@ -2744,7 +2835,8 @@ fn arrow_tick() {
             let segment_start = [ax - a.dx, ay - a.dy, az - a.dz];
             let segment_end = [ax, ay, az];
             // block collision: arrows stick into solid blocks (vanilla)
-            let bst = block_at(ax.floor() as i32, ay.floor() as i32, az.floor() as i32);
+            let bst =
+                block_at_dim(adim, ax.floor() as i32, ay.floor() as i32, az.floor() as i32);
             if bst != 0 && !mob_passable(bst) {
                 // tridents stick like arrows in vanilla too, but our trident
                 // return path handles its own landing — only plain arrows stick
@@ -2771,7 +2863,7 @@ fn arrow_tick() {
                 // other players. The owner and last pierced target are skipped.
                 let ml = mobs().lock().unwrap_or_else(|e| e.into_inner());
                 'outer: for m in ml.iter() {
-                    if m.eid == a.last_hit || m.dim != DimId::Overworld {
+                    if m.eid == a.last_hit || m.dim != adim {
                         continue;
                     }
                     let (mx, my, mz, ..) = *m.pos.lock().unwrap_or_else(|e| e.into_inner());
@@ -2846,7 +2938,7 @@ fn arrow_tick() {
                                 thundering: THUNDERING.load(Ordering::Relaxed) > 0,
                                 open_sky: THUNDERING.load(Ordering::Relaxed) > 0
                                     && can_see_sky(
-                                        DimId::Overworld,
+                                        adim,
                                         mx.floor() as i32,
                                         my.floor() as i32,
                                         mz.floor() as i32,
@@ -2899,6 +2991,9 @@ fn arrow_tick() {
                         if c.eid == a.owner {
                             continue;
                         }
+                        if *c.dim.lock().unwrap_or_else(|e| e.into_inner()) != adim {
+                            continue;
+                        }
                         let (px, py, pz, ..) = {
                             let p = c.pos.lock().unwrap_or_else(|e| e.into_inner());
                             *p
@@ -2930,6 +3025,9 @@ fn arrow_tick() {
             } else {
                 let cls: Vec<Arc<Client>> = client_snapshot();
                 for c in cls.iter() {
+                    if *c.dim.lock().unwrap_or_else(|e| e.into_inner()) != adim {
+                        continue;
+                    }
                     let (px, py, pz, ..) = {
                         let p = c.pos.lock().unwrap_or_else(|e| e.into_inner());
                         *p
@@ -2995,6 +3093,7 @@ fn arrow_tick() {
     }
     for eid in &dead {
         broadcast_seen_destroy(*eid);
+        clear_entity_dim(*eid);
     }
     for (veid, admg, ax, az) in hits {
         let cls: Vec<Arc<Client>> = client_snapshot();
@@ -3137,8 +3236,8 @@ struct BlastSample {
     indestructible: bool,
 }
 
-fn blast_cell_at(x: i32, y: i32, z: i32) -> BlastSample {
-    let st = block_at(x, y, z);
+fn blast_cell_at(dim: DimId, x: i32, y: i32, z: i32) -> BlastSample {
+    let st = block_at_dim(dim, x, y, z);
     if st == 0 {
         return BlastSample {
             state: 0,
@@ -3205,9 +3304,9 @@ impl BlastOut {
 /// otherwise. `None` fails closed — the blast volume exceeded the bounded
 /// cache and zero cells are removed.
 #[cfg(feature = "mod-suite")]
-fn blast_compute(origin: [f64; 3], power: f32, seed: u64) -> Option<BlastOut> {
+fn blast_compute(dim: DimId, origin: [f64; 3], power: f32, seed: u64) -> Option<BlastOut> {
     let source = |x: i32, y: i32, z: i32| {
-        let s = blast_cell_at(x, y, z);
+        let s = blast_cell_at(dim, x, y, z);
         mod_offload::explosion_batch::BlastCell {
             block_id: s.state,
             drop_item: 0,
@@ -3235,9 +3334,9 @@ fn blast_engine() -> &'static Mutex<mod_offload::explosion_batch::ExplosionBatch
 }
 
 #[cfg(not(feature = "mod-suite"))]
-fn blast_compute(origin: [f64; 3], power: f32, seed: u64) -> Option<BlastOut> {
+fn blast_compute(dim: DimId, origin: [f64; 3], power: f32, seed: u64) -> Option<BlastOut> {
     let mut engine = blast_engine().lock().unwrap_or_else(|e| e.into_inner());
-    if !(power.is_finite() && power > 0.0) || !engine.prepare(origin, power) {
+    if !(power.is_finite() && power > 0.0) || !engine.prepare(dim, origin, power) {
         return if engine.prepared_empty() {
             Some(BlastOut::Local(Vec::new()))
         } else {
@@ -3340,7 +3439,7 @@ struct LocalBlastCache {
 impl LocalBlastCache {
     /// Rebuild the snapshot; `false` when the volume exceeds
     /// `BLAST_MAX_CACHE_CELLS` — the caller fails closed with zero removals.
-    fn prepare(&mut self, origin: [f64; 3], power: f32) -> bool {
+    fn prepare(&mut self, dim: DimId, origin: [f64; 3], power: f32) -> bool {
         let Some((min, max)) = local_blast_bounds(origin, power) else {
             self.dims = [0; 3];
             self.cells.clear();
@@ -3363,6 +3462,7 @@ impl LocalBlastCache {
             for ly in 0..dims[1] {
                 for lx in 0..dims[0] {
                     self.cells.push(blast_cell_at(
+                        dim,
                         min[0].saturating_add(lx as i64) as i32,
                         min[1].saturating_add(ly as i64) as i32,
                         min[2].saturating_add(lz as i64) as i32,
@@ -3542,16 +3642,17 @@ impl LocalBlastPlan {
     }
 }
 
-/// One queued mega-blast: its plan plus the origin and power the per-slice
-/// explosion packets carry.
+/// One queued mega-blast: its plan plus the dimension, origin and power the
+/// per-slice removals and explosion packets carry.
 struct MegaBlastJob {
+    dim: DimId,
     center: [f64; 3],
     power: f32,
     slices: MegaBlastSlices,
 }
 
 impl MegaBlastJob {
-    fn new(center: [f64; 3], power: f32, out: BlastOut) -> Self {
+    fn new(dim: DimId, center: [f64; 3], power: f32, out: BlastOut) -> Self {
         let slices = match out {
             #[cfg(feature = "mod-suite")]
             BlastOut::Offload(result) => MegaBlastSlices {
@@ -3566,6 +3667,7 @@ impl MegaBlastJob {
             },
         };
         Self {
+            dim,
             center,
             power,
             slices,
@@ -3636,7 +3738,11 @@ fn coalesce_drop_counts(counts: &HashMap<i64, u64>) -> Vec<(i64, u32)> {
 /// with the vanilla 0.5-1.5s chain fuse, coalesce the surviving drops into
 /// `MEGA_BLAST_STACK` chunks, and return the packet offsets relative to
 /// `base` (the explosion's floored origin cell).
-fn apply_blast_slice(base: [i32; 3], removals: &[BlastRemoval]) -> Vec<(i8, i8, i8)> {
+fn apply_blast_slice(
+    dim: DimId,
+    base: [i32; 3],
+    removals: &[BlastRemoval],
+) -> Vec<(i8, i8, i8)> {
     let mut offs: Vec<(i8, i8, i8)> = Vec::with_capacity(removals.len());
     let mut counts: HashMap<i64, u64> = HashMap::new();
     let mut first_pos: HashMap<i64, [i32; 3]> = HashMap::new();
@@ -3644,7 +3750,7 @@ fn apply_blast_slice(base: [i32; 3], removals: &[BlastRemoval]) -> Vec<(i8, i8, 
     let tile_drops = GR_DO_TILE_DROPS.load(Ordering::Relaxed) != 0;
     for r in removals {
         let [x, y, z] = r.pos;
-        let st = block_at(x, y, z);
+        let st = block_at_dim(dim, x, y, z);
         if st == 0 {
             continue;
         }
@@ -3660,7 +3766,7 @@ fn apply_blast_slice(base: [i32; 3], removals: &[BlastRemoval]) -> Vec<(i8, i8, 
                 }
             }
         }
-        set_block(x, y, z, 0);
+        set_block_dim(dim, x, y, z, 0);
         offs.push((
             (x - base[0]).clamp(-128, 127) as i8,
             (y - base[1]).clamp(-128, 127) as i8,
@@ -3677,6 +3783,8 @@ fn apply_blast_slice(base: [i32; 3], removals: &[BlastRemoval]) -> Vec<(i8, i8, 
             z: tz as f64 + 0.5,
             left: chain_fuse_left(jitter) as i32,
         });
+        // A chained TNT stays in the dimension its block was destroyed in.
+        set_entity_dim(eid, dim);
     }
     // One item entity per full stack, at the first destroyed cell of its
     // item, instead of one entity per block.
@@ -3704,7 +3812,7 @@ fn apply_blast_slice(base: [i32; 3], removals: &[BlastRemoval]) -> Vec<(i8, i8, 
 /// drains across ticks like vanilla entity processing instead of stalling a
 /// single tick.
 fn mega_blast_tick_drain() {
-    let (center, power, removals) = {
+    let (dim, center, power, removals) = {
         let mut q = mega_blast_queue().lock().unwrap_or_else(|e| e.into_inner());
         let Some(job) = q.front_mut() else {
             return;
@@ -3713,11 +3821,11 @@ fn mega_blast_tick_drain() {
             q.pop_front();
             return;
         };
-        let (center, power) = (job.center, job.power);
+        let (dim, center, power) = (job.dim, job.center, job.power);
         if job.is_complete() {
             q.pop_front();
         }
-        (center, power, removals)
+        (dim, center, power, removals)
     };
     if removals.is_empty() {
         return;
@@ -3727,8 +3835,8 @@ fn mega_blast_tick_drain() {
         center[1].floor() as i32,
         center[2].floor() as i32,
     ];
-    let offs = apply_blast_slice(base, &removals);
-    broadcast(-1, |_c| {
+    let offs = apply_blast_slice(dim, base, &removals);
+    broadcast_near(dim, center[0], center[1], center[2], -1, |_c| {
         (
             0x20,
             explosion_pkt_with_power(center[0], center[1], center[2], power, &offs),
@@ -3736,7 +3844,16 @@ fn mega_blast_tick_drain() {
     });
 }
 
+/// `explode_at` for callers that predate per-entity dimensions: the blast
+/// lands in the Overworld, the dimension they always assumed.
 fn explode_at(ex: f64, ey: f64, ez: f64, power: f64) {
+    explode_at_dim(DimId::Overworld, ex, ey, ez, power);
+}
+
+/// One explosion in `dim`: the raycast reads that dimension's blocks, the
+/// removals write that dimension's overlay, chained TNT keeps the dimension,
+/// and only that dimension's players take blast damage.
+fn explode_at_dim(dim: DimId, ex: f64, ey: f64, ez: f64, power: f64) {
     // Fail closed: non-finite or non-positive input mutates nothing — a
     // NaN/infinite, zero or negative power is a no-op, not a hole in the world.
     if !(ex.is_finite() && ey.is_finite() && ez.is_finite() && power.is_finite() && power > 0.0)
@@ -3745,7 +3862,7 @@ fn explode_at(ex: f64, ey: f64, ez: f64, power: f64) {
     }
     let power = power.min(MEGA_BLAST_MAX_POWER);
     let origin = [ex, ey, ez];
-    let Some(out) = blast_compute(origin, power as f32, world_rng::next_u64()) else {
+    let Some(out) = blast_compute(dim, origin, power as f32, world_rng::next_u64()) else {
         // A blast volume beyond the kernel's bounded cache fails closed:
         // nothing is destroyed and nothing is queued.
         return;
@@ -3753,7 +3870,7 @@ fn explode_at(ex: f64, ey: f64, ez: f64, power: f64) {
     if power > MEGA_BLAST_IMMEDIATE_POWER || out.removal_count() > MEGA_BLAST_MAX_PER_TICK {
         // Queue the concentric-ring plan, then take this tick's slice — the
         // first ring still lands immediately when the queue was empty.
-        let job = MegaBlastJob::new(origin, power as f32, out);
+        let job = MegaBlastJob::new(dim, origin, power as f32, out);
         {
             let mut q = mega_blast_queue().lock().unwrap_or_else(|e| e.into_inner());
             if q.len() < MEGA_BLAST_QUEUE_CAP {
@@ -3767,12 +3884,15 @@ fn explode_at(ex: f64, ey: f64, ez: f64, power: f64) {
             origin[1].floor() as i32,
             origin[2].floor() as i32,
         ];
-        let offs = apply_blast_slice(base, &out.into_removals());
-        broadcast(-1, |_c| (0x20, explosion_pkt(ex, ey, ez, &offs)));
+        let offs = apply_blast_slice(dim, base, &out.into_removals());
+        broadcast_near(dim, ex, ey, ez, -1, |_c| (0x20, explosion_pkt(ex, ey, ez, &offs)));
     }
-    ac_note_explosion(DimId::Overworld, [ex, ey, ez], power);
+    ac_note_explosion(dim, [ex, ey, ez], power);
     let cs: Vec<Arc<Client>> = client_snapshot();
     for cl in cs {
+        if *cl.dim.lock().unwrap_or_else(|e| e.into_inner()) != dim {
+            continue;
+        }
         let (px, py, pz, ..) = {
             let p = cl.pos.lock().unwrap_or_else(|e| e.into_inner());
             *p
@@ -3840,7 +3960,9 @@ fn primed_tick() {
     }
     for p in boom {
         broadcast_seen_destroy(p.eid);
-        explode_at(p.x, p.y, p.z, 4.0);
+        let pdim = entity_dim_of(p.eid);
+        clear_entity_dim(p.eid);
+        explode_at_dim(pdim, p.x, p.y, p.z, 4.0);
     }
 }
 
@@ -6741,5 +6863,628 @@ mod mega_scale_t1t3_tests {
             pl.iter().all(|p| (lo..=hi).contains(&p.left)),
             "chain fuses must stay inside the vanilla 0.5-1.5s window"
         );
+    }
+}
+
+// ---------- per-entity dimension tests (H1) ----------
+// The entity-dim side table, the dim-scoped XP/merge paths and the
+// dim-threaded blast/arrow/firework ticks. Pure side-table and merge tests
+// need no registry; world-touching ones snapshot the stores they use.
+#[cfg(all(test, megu_vanilla_data))]
+mod dim_entity_tests {
+    use super::effect_tests::client_pair;
+    use super::*;
+
+    /// Save/restore every shared store a dim-scoped entity test can touch.
+    /// Restored on `Drop`, so a failed assertion still leaves the next test a
+    /// clean world.
+    struct DimWorld {
+        world: HashMap<DimChunkKey, HashMap<u32, u32>>,
+        mobs: Vec<Arc<Mob>>,
+        live_mob_states: HashMap<i32, LiveMobState>,
+        arrows: Vec<Arrow>,
+        primed: Vec<Primed>,
+        fireworks: Vec<Firework>,
+        drops: Vec<Drop>,
+        drop_pending: HashSet<i32>,
+        xps: Vec<Xp>,
+        xp_pending: HashSet<i32>,
+        entity_dims: HashMap<i32, DimId>,
+        queue: std::collections::VecDeque<MegaBlastJob>,
+        clients: Vec<Arc<Client>>,
+        forced: HashSet<(i32, i32)>,
+        region: RegionSets,
+        rng: u64,
+        tile_drops: u8,
+        mob_loot: u8,
+        scheduled: scheduled_ticks::ScheduledTicks,
+        fire_ticks: HashMap<i32, u32>,
+        sheared: HashSet<i32>,
+        tick: u64,
+        thundering: u64,
+    }
+
+    impl DimWorld {
+        fn take() -> Self {
+            let tile_drops = GR_DO_TILE_DROPS.swap(1, Ordering::Relaxed);
+            let mob_loot = GR_MOB_LOOT.swap(1, Ordering::Relaxed);
+            Self {
+                world: world().take_all(),
+                mobs: std::mem::take(&mut *mobs().lock().unwrap_or_else(|e| e.into_inner())),
+                live_mob_states: std::mem::take(
+                    &mut *live_mob_states().lock().unwrap_or_else(|e| e.into_inner()),
+                ),
+                arrows: std::mem::take(&mut *arrows().lock().unwrap_or_else(|e| e.into_inner())),
+                primed: std::mem::take(&mut *primed().lock().unwrap_or_else(|e| e.into_inner())),
+                fireworks: std::mem::take(
+                    &mut *fireworks().lock().unwrap_or_else(|e| e.into_inner()),
+                ),
+                drops: std::mem::take(&mut *drops().lock().unwrap_or_else(|e| e.into_inner())),
+                drop_pending: std::mem::take(
+                    &mut *drop_pending().lock().unwrap_or_else(|e| e.into_inner()),
+                ),
+                xps: std::mem::take(&mut *xps().lock().unwrap_or_else(|e| e.into_inner())),
+                xp_pending: std::mem::take(
+                    &mut *xp_pending().lock().unwrap_or_else(|e| e.into_inner()),
+                ),
+                entity_dims: std::mem::take(
+                    &mut *entity_dims().write().unwrap_or_else(|e| e.into_inner()),
+                ),
+                queue: std::mem::take(
+                    &mut *mega_blast_queue().lock().unwrap_or_else(|e| e.into_inner()),
+                ),
+                clients: std::mem::take(&mut *clients().lock().unwrap_or_else(|e| e.into_inner())),
+                forced: std::mem::take(
+                    &mut *forceloaded().lock().unwrap_or_else(|e| e.into_inner()),
+                ),
+                region: test_region(),
+                rng: world_rng::saved_state(),
+                tile_drops,
+                mob_loot,
+                scheduled: std::mem::replace(
+                    &mut *block_ticks().lock().unwrap_or_else(|e| e.into_inner()),
+                    scheduled_ticks::ScheduledTicks::new(),
+                ),
+                fire_ticks: std::mem::take(
+                    &mut *mob_fire_ticks().lock().unwrap_or_else(|e| e.into_inner()),
+                ),
+                sheared: std::mem::take(
+                    &mut *sheared().lock().unwrap_or_else(|e| e.into_inner()),
+                ),
+                tick: TICK_IDX.swap(0, Ordering::Relaxed),
+                thundering: THUNDERING.swap(0, Ordering::Relaxed),
+            }
+        }
+    }
+
+    impl std::ops::Drop for DimWorld {
+        fn drop(&mut self) {
+            world().restore_all(std::mem::take(&mut self.world));
+            *mobs().lock().unwrap_or_else(|e| e.into_inner()) = std::mem::take(&mut self.mobs);
+            *live_mob_states().lock().unwrap_or_else(|e| e.into_inner()) =
+                std::mem::take(&mut self.live_mob_states);
+            *arrows().lock().unwrap_or_else(|e| e.into_inner()) = std::mem::take(&mut self.arrows);
+            *primed().lock().unwrap_or_else(|e| e.into_inner()) = std::mem::take(&mut self.primed);
+            *fireworks().lock().unwrap_or_else(|e| e.into_inner()) =
+                std::mem::take(&mut self.fireworks);
+            *drops().lock().unwrap_or_else(|e| e.into_inner()) = std::mem::take(&mut self.drops);
+            *drop_pending().lock().unwrap_or_else(|e| e.into_inner()) =
+                std::mem::take(&mut self.drop_pending);
+            *xps().lock().unwrap_or_else(|e| e.into_inner()) = std::mem::take(&mut self.xps);
+            *xp_pending().lock().unwrap_or_else(|e| e.into_inner()) =
+                std::mem::take(&mut self.xp_pending);
+            *entity_dims().write().unwrap_or_else(|e| e.into_inner()) =
+                std::mem::take(&mut self.entity_dims);
+            *mega_blast_queue().lock().unwrap_or_else(|e| e.into_inner()) =
+                std::mem::take(&mut self.queue);
+            *clients().lock().unwrap_or_else(|e| e.into_inner()) = std::mem::take(&mut self.clients);
+            *forceloaded().lock().unwrap_or_else(|e| e.into_inner()) =
+                std::mem::take(&mut self.forced);
+            set_test_region(self.region.0.clone(), self.region.1.clone());
+            world_rng::restore(self.rng);
+            GR_DO_TILE_DROPS.store(self.tile_drops, Ordering::Relaxed);
+            GR_MOB_LOOT.store(self.mob_loot, Ordering::Relaxed);
+            *block_ticks().lock().unwrap_or_else(|e| e.into_inner()) = std::mem::replace(
+                &mut self.scheduled,
+                scheduled_ticks::ScheduledTicks::new(),
+            );
+            *mob_fire_ticks().lock().unwrap_or_else(|e| e.into_inner()) =
+                std::mem::take(&mut self.fire_ticks);
+            *sheared().lock().unwrap_or_else(|e| e.into_inner()) = std::mem::take(&mut self.sheared);
+            TICK_IDX.store(self.tick, Ordering::Relaxed);
+            THUNDERING.store(self.thundering, Ordering::Relaxed);
+        }
+    }
+
+    fn mob_in(eid: i32, pos: (f64, f64, f64), dim: DimId, name: &str) -> Arc<Mob> {
+        let past = Instant::now() - Duration::from_secs(10);
+        Arc::new(Mob {
+            dim,
+            eid,
+            uuid: [0; 16],
+            etype: name_to_etype(name).unwrap(),
+            pos: Mutex::new((pos.0, pos.1, pos.2, 0.0, 0.0)),
+            hp: Mutex::new(20.0),
+            last_hit: Mutex::new(past),
+            hurt_at: Mutex::new(past),
+            last_hurt_tick: Mutex::new(None),
+            fuse: Mutex::new(0),
+            fire_ticks: Mutex::new(0),
+            love: Mutex::new(0),
+            air: Mutex::new(server_ticks(AIR_SUPPLY_GT) as i32),
+            vel: Mutex::new([0.0; 3]),
+        })
+    }
+
+    fn arrow_at(eid: i32, x: f64, y: f64, z: f64, dx: f64) -> Arrow {
+        Arrow {
+            eid,
+            owner: 7,
+            x,
+            y,
+            z,
+            dx,
+            dy: 0.0,
+            dz: 0.0,
+            ttl: 100,
+            dmg: 5.0,
+            fire: 0,
+            punch: 0,
+            kind: 0,
+            loy: 0,
+            ret_item: 0,
+            ret_comps: Vec::new(),
+            pierce: 0,
+            last_hit: -1,
+            stuck: false,
+        }
+    }
+
+    /// `fill_cube` over one dimension's overlay: `block_at_dim` inside the box
+    /// reads only the explicit states, never generated terrain.
+    fn fill_cube_dim(dim: DimId, at: (i32, i32, i32), half: i32, st: u32) {
+        let mut w = world().write_all();
+        for x in at.0 - half..=at.0 + half {
+            for z in at.2 - half..=at.2 + half {
+                let c = w.entry((dim, x >> 4, z >> 4)).or_default();
+                for y in at.1 - half..=at.1 + half {
+                    c.insert(local_idx(x, y, z), st);
+                }
+            }
+        }
+    }
+
+    fn count_in_cube_dim(dim: DimId, at: (i32, i32, i32), half: i32, st: u32) -> usize {
+        let w = world().read_all();
+        let mut n = 0usize;
+        for x in at.0 - half..=at.0 + half {
+            for z in at.2 - half..=at.2 + half {
+                let Some(c) = w.get(&(dim, x >> 4, z >> 4)) else {
+                    continue;
+                };
+                for y in at.1 - half..=at.1 + half {
+                    if c.get(&local_idx(x, y, z)) == Some(&st) {
+                        n += 1;
+                    }
+                }
+            }
+        }
+        n
+    }
+
+    #[test]
+    fn kill_mob_spawns_xp_in_the_mobs_own_dimension() {
+        crate::test_support::require_vanilla_data();
+        let _guard = world_guard();
+        let _w = DimWorld::take();
+        set_test_region(HashSet::from([(0, 0)]), HashSet::new());
+        let etype = name_to_etype("zombie").unwrap();
+        let mob = mob_in(88_001, (8.0, 40.0, 8.0), DimId::Nether, "zombie");
+        mobs().lock().unwrap_or_else(|e| e.into_inner()).push(mob);
+        kill_mob(88_001, etype, 8.0, 40.0, 8.0);
+        let xs = xps().lock().unwrap_or_else(|e| e.into_inner());
+        assert_eq!(xs.len(), 1, "one XP orb for the killed zombie");
+        assert_eq!(
+            entity_dim_of(xs[0].eid),
+            DimId::Nether,
+            "the orb must land in the mob's dimension, not the Overworld"
+        );
+        assert_eq!(xs[0].val, mob_xp(etype));
+    }
+
+    #[test]
+    fn mob_env_die_drops_in_the_mobs_own_dimension() {
+        crate::test_support::require_vanilla_data();
+        let _guard = world_guard();
+        let _w = DimWorld::take();
+        set_test_region(HashSet::from([(0, 0)]), HashSet::new());
+        let etype = name_to_etype("zombie").unwrap();
+        mobs().lock().unwrap_or_else(|e| e.into_inner()).push(mob_in(
+            88_002,
+            (8.0, 40.0, 8.0),
+            DimId::from_raw(3),
+            "zombie",
+        ));
+        mob_env_die(88_002, etype, 8.0, 40.0, 8.0, false);
+        // Environmental death: drops but no XP.
+        assert!(xps().lock().unwrap_or_else(|e| e.into_inner()).is_empty());
+        // The scatter probe ran against the mob's dimension: with no datapack
+        // generator the cells are air, so the drop lands near the death point.
+        let dl = drops().lock().unwrap_or_else(|e| e.into_inner());
+        assert!(!dl.is_empty(), "mob loot still drops in a custom dimension");
+        for d in dl.iter() {
+            assert!(
+                (d.x - 8.0).abs() < 2.0 && (d.y - 40.0).abs() < 2.0 && (d.z - 8.0).abs() < 2.0,
+                "scatter in the entity's own dimension stays near the death point, got ({},{},{})",
+                d.x,
+                d.y,
+                d.z
+            );
+        }
+    }
+
+    #[test]
+    fn explode_at_dim_destroys_only_its_own_dimensions_blocks() {
+        crate::test_support::require_vanilla_data();
+        let _guard = world_guard();
+        let _w = DimWorld::take();
+        world_rng::seed(0x5eed_d1e);
+        let reg = breg().unwrap();
+        let mushroom = reg.state_of("minecraft:red_mushroom", None);
+        let at = (500_032, 100, -500_032);
+        let half = (4.0f64 * 1.75).ceil() as i32 + 2;
+        // Identical fill in both dimensions; the blast must clear exactly one.
+        fill_cube_dim(DimId::Nether, at, half, mushroom);
+        fill_cube_dim(DimId::Overworld, at, half, mushroom);
+        let ow_before = count_in_cube_dim(DimId::Overworld, at, half, mushroom);
+        let nether_before = count_in_cube_dim(DimId::Nether, at, half, mushroom);
+        explode_at_dim(DimId::Nether, at.0 as f64 + 0.5, at.1 as f64, at.2 as f64 + 0.5, 4.0);
+        for _ in 0..64 {
+            if mega_blast_queue()
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .is_empty()
+            {
+                break;
+            }
+            mega_blast_tick_drain();
+        }
+        let nether_after = count_in_cube_dim(DimId::Nether, at, half, mushroom);
+        assert!(
+            nether_after < nether_before,
+            "the Nether blast must destroy Nether cells ({nether_before} -> {nether_after})"
+        );
+        assert_eq!(
+            count_in_cube_dim(DimId::Overworld, at, half, mushroom),
+            ow_before,
+            "the Overworld cells at the same coordinates are untouched"
+        );
+    }
+
+    #[test]
+    fn primed_tnt_detonates_in_its_registered_dimension() {
+        crate::test_support::require_vanilla_data();
+        let _guard = world_guard();
+        let _w = DimWorld::take();
+        world_rng::seed(0x5eed_7a7);
+        let reg = breg().unwrap();
+        let mushroom = reg.state_of("minecraft:red_mushroom", None);
+        let at = (8, 60, 8);
+        let half = (4.0f64 * 1.75).ceil() as i32 + 2;
+        fill_cube_dim(DimId::Nether, at, half, mushroom);
+        fill_cube_dim(DimId::Overworld, at, half, mushroom);
+        set_test_region(HashSet::from([(0, 0)]), HashSet::new());
+        primed().lock().unwrap_or_else(|e| e.into_inner()).push(Primed {
+            eid: 88_010,
+            x: 8.5,
+            y: 60.5,
+            z: 8.5,
+            left: 1,
+        });
+        set_entity_dim(88_010, DimId::Nether);
+        let ow_before = count_in_cube_dim(DimId::Overworld, at, half, mushroom);
+        let nether_before = count_in_cube_dim(DimId::Nether, at, half, mushroom);
+        primed_tick();
+        assert!(primed().lock().unwrap_or_else(|e| e.into_inner()).is_empty());
+        assert!(
+            count_in_cube_dim(DimId::Nether, at, half, mushroom) < nether_before,
+            "the fuse must detonate in the primed entity's own dimension"
+        );
+        assert_eq!(
+            count_in_cube_dim(DimId::Overworld, at, half, mushroom),
+            ow_before
+        );
+        assert_eq!(
+            entity_dim_of(88_010),
+            DimId::Overworld,
+            "the detonated entity's dim entry is retired"
+        );
+    }
+
+    #[test]
+    fn arrow_sticks_into_blocks_in_its_own_dimension() {
+        crate::test_support::require_vanilla_data();
+        let _guard = world_guard();
+        let _w = DimWorld::take();
+        set_test_region(HashSet::from([(0, 0)]), HashSet::new());
+        let reg = breg().unwrap();
+        let stone = reg.state_of("minecraft:stone", None);
+        // Nether stone where both arrows pass: only the Nether arrow sticks.
+        {
+            let mut w = world().write_all();
+            w.entry((DimId::Nether, 0, 0))
+                .or_default()
+                .insert(local_idx(8, 100, 8), stone);
+        }
+        arrows().lock().unwrap_or_else(|e| e.into_inner()).extend([
+            arrow_at(88_020, 8.5, 100.5, 8.5, 0.0),
+            arrow_at(88_021, 8.5, 100.5, 8.5, 0.0),
+        ]);
+        set_entity_dim(88_020, DimId::Nether);
+        arrow_tick();
+        let ar = arrows().lock().unwrap_or_else(|e| e.into_inner());
+        let nether_arrow = ar.iter().find(|a| a.eid == 88_020).unwrap();
+        let ow_arrow = ar.iter().find(|a| a.eid == 88_021).unwrap();
+        assert!(nether_arrow.stuck, "a Nether arrow sticks into a Nether block");
+        assert!(
+            !ow_arrow.stuck,
+            "a Nether block must not stop an Overworld arrow"
+        );
+        drop(ar);
+        assert_eq!(entity_dim_of(88_021), DimId::Overworld);
+    }
+
+    #[test]
+    fn arrow_hits_only_mobs_in_its_own_dimension() {
+        crate::test_support::require_vanilla_data();
+        let _guard = world_guard();
+        let _w = DimWorld::take();
+        set_test_region(HashSet::from([(0, 0)]), HashSet::new());
+        // The Overworld mob is listed first so the skip is observed, then the
+        // Nether mob stands in the same spot and takes the hit.
+        let om = mob_in(88_030, (9.0, 100.0, 8.5), DimId::Overworld, "zombie");
+        let nm = mob_in(88_031, (9.0, 100.0, 8.5), DimId::Nether, "zombie");
+        mobs().lock().unwrap_or_else(|e| e.into_inner()).extend([om, nm]);
+        arrows()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .push(arrow_at(88_022, 8.0, 100.0, 8.5, 2.0));
+        set_entity_dim(88_022, DimId::Nether);
+        arrow_tick();
+        let ml = mobs().lock().unwrap_or_else(|e| e.into_inner());
+        let ow_hp = *ml
+            .iter()
+            .find(|m| m.eid == 88_030)
+            .unwrap()
+            .hp
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let nether_hp = *ml
+            .iter()
+            .find(|m| m.eid == 88_031)
+            .unwrap()
+            .hp
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        assert_eq!(ow_hp, 20.0, "a Nether arrow passes through an Overworld mob");
+        assert!(nether_hp < 20.0, "a Nether arrow damages a Nether mob");
+    }
+
+    #[test]
+    fn firework_blast_damages_only_its_own_dimension() {
+        crate::test_support::require_vanilla_data();
+        let _guard = world_guard();
+        let _w = DimWorld::take();
+        let om = mob_in(88_040, (9.0, 100.0, 8.5), DimId::Overworld, "zombie");
+        let nm = mob_in(88_041, (9.0, 100.0, 8.5), DimId::Nether, "zombie");
+        mobs().lock().unwrap_or_else(|e| e.into_inner()).extend([om, nm]);
+        firework_explode(DimId::Nether, 9.0, 100.5, 8.5, 2);
+        let ml = mobs().lock().unwrap_or_else(|e| e.into_inner());
+        let ow_hp = *ml
+            .iter()
+            .find(|m| m.eid == 88_040)
+            .unwrap()
+            .hp
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let nether_hp = *ml
+            .iter()
+            .find(|m| m.eid == 88_041)
+            .unwrap()
+            .hp
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        assert_eq!(ow_hp, 20.0);
+        assert!(nether_hp < 20.0, "the burst must hit same-dimension mobs");
+        drop(ml);
+        // The tick path resolves the dim off the side table and retires it.
+        fireworks()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .push(Firework {
+                eid: 88_042,
+                owner: 7,
+                x: 9.0,
+                y: 100.5,
+                z: 8.5,
+                dx: 0.0,
+                dy: 0.0,
+                dz: 0.0,
+                ttl: 1,
+                explosions: 0,
+            });
+        set_entity_dim(88_042, DimId::from_raw(3));
+        fireworks_step();
+        assert!(fireworks().lock().unwrap_or_else(|e| e.into_inner()).is_empty());
+        assert_eq!(entity_dim_of(88_042), DimId::Overworld);
+    }
+
+    #[test]
+    fn explosion_packets_reach_only_same_dimension_clients() {
+        crate::test_support::require_vanilla_data();
+        let _guard = world_guard();
+        let _w = DimWorld::take();
+        set_test_region(HashSet::from([(0, 0)]), HashSet::new());
+        // Two clients at the same spot, one in the Nether one in the
+        // Overworld: only the Nether client takes blast damage.
+        let (mut nether_client, _rx1) = client_pair();
+        nether_client.eid = 4242;
+        *nether_client.dim.lock().unwrap_or_else(|e| e.into_inner()) = DimId::Nether;
+        *nether_client.pos.lock().unwrap_or_else(|e| e.into_inner()) =
+            (9.0, 100.0, 8.5, 0.0, 0.0, true);
+        let (mut ow_client, _rx2) = client_pair();
+        ow_client.eid = 4343;
+        *ow_client.pos.lock().unwrap_or_else(|e| e.into_inner()) =
+            (9.0, 100.0, 8.5, 0.0, 0.0, true);
+        let nether_client = Arc::new(nether_client);
+        let ow_client = Arc::new(ow_client);
+        clients()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .extend([nether_client.clone(), ow_client.clone()]);
+        explode_at_dim(DimId::Nether, 9.0, 100.5, 8.5, 4.0);
+        let nether_hp = *nether_client.hp.lock().unwrap_or_else(|e| e.into_inner());
+        let ow_hp = *ow_client.hp.lock().unwrap_or_else(|e| e.into_inner());
+        assert!(nether_hp < 20.0, "a Nether blast hurts a Nether player");
+        assert_eq!(ow_hp, 20.0, "a Nether blast cannot hurt an Overworld player");
+    }
+}
+
+// ---------- per-entity dimension tests, no-registry lane (H1) ----------
+// The side table and both merge partitions run without the vanilla fixture
+// set, so these tests also run on strict-public exports that gate the
+// `megu_vanilla_data` modules out.
+#[cfg(test)]
+mod dim_entity_pure_tests {
+    use super::*;
+
+    /// Save/restore the orb pool, the merge-pending marks and the eid->DimId
+    /// table so each test starts from empty stores even after a failed
+    /// assertion.
+    struct OrbStores {
+        xps: Vec<Xp>,
+        xp_pending: HashSet<i32>,
+        entity_dims: HashMap<i32, DimId>,
+    }
+
+    impl OrbStores {
+        fn take() -> Self {
+            Self {
+                xps: std::mem::take(&mut *xps().lock().unwrap_or_else(|e| e.into_inner())),
+                xp_pending: std::mem::take(
+                    &mut *xp_pending().lock().unwrap_or_else(|e| e.into_inner()),
+                ),
+                entity_dims: std::mem::take(
+                    &mut *entity_dims().write().unwrap_or_else(|e| e.into_inner()),
+                ),
+            }
+        }
+    }
+
+    impl std::ops::Drop for OrbStores {
+        fn drop(&mut self) {
+            *xps().lock().unwrap_or_else(|e| e.into_inner()) = std::mem::take(&mut self.xps);
+            *xp_pending().lock().unwrap_or_else(|e| e.into_inner()) =
+                std::mem::take(&mut self.xp_pending);
+            *entity_dims().write().unwrap_or_else(|e| e.into_inner()) =
+                std::mem::take(&mut self.entity_dims);
+        }
+    }
+
+    #[test]
+    fn entity_dim_side_table_defaults_sets_and_clears() {
+        let _guard = world_guard();
+        let _s = OrbStores::take();
+        assert_eq!(entity_dim_of(9_999_001), DimId::Overworld);
+        set_entity_dim(9_999_001, DimId::Nether);
+        assert_eq!(entity_dim_of(9_999_001), DimId::Nether);
+        set_entity_dim(9_999_001, DimId::from_raw(3));
+        assert_eq!(entity_dim_of(9_999_001), DimId::from_raw(3));
+        clear_entity_dim(9_999_001);
+        assert_eq!(entity_dim_of(9_999_001), DimId::Overworld);
+        // Registering the Overworld stores no row — it is already the default.
+        set_entity_dim(9_999_002, DimId::Nether);
+        set_entity_dim(9_999_002, DimId::Overworld);
+        assert!(entity_dims()
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(&9_999_002)
+            .is_none());
+    }
+
+    #[test]
+    fn xp_spawn_dim_tags_the_orbs_dimension() {
+        let _guard = world_guard();
+        let _s = OrbStores::take();
+        let eid = xp_spawn_dim(DimId::Nether, 1.0, 60.0, 1.0, 7);
+        assert_eq!(entity_dim_of(eid), DimId::Nether);
+        let eid = xp_spawn_dim(DimId::from_raw(3), 1.0, 60.0, 1.0, 7);
+        assert_eq!(entity_dim_of(eid), DimId::from_raw(3));
+        // The compatibility wrapper keeps landing orbs in the Overworld.
+        let eid = xp_spawn(1.0, 60.0, 1.0, 7);
+        assert_eq!(entity_dim_of(eid), DimId::Overworld);
+        assert!(entity_dims()
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(&eid)
+            .is_none());
+    }
+
+    #[test]
+    fn xp_pending_merge_partitions_by_dimension() {
+        let _guard = world_guard();
+        let _s = OrbStores::take();
+        // Coincident donors in two dimensions: neither may absorb the other.
+        xp_spawn_dim(DimId::Nether, 4.0, 60.0, 4.0, 10);
+        let b = xp_spawn_dim(DimId::from_raw(3), 4.0, 60.0, 4.0, 10);
+        let eaten = {
+            let mut xs = std::mem::take(&mut *xps().lock().unwrap_or_else(|e| e.into_inner()));
+            let pending = xp_pending().lock().unwrap_or_else(|e| e.into_inner()).clone();
+            let eaten = xp_merge_pending_locked(&mut xs, &pending);
+            *xps().lock().unwrap_or_else(|e| e.into_inner()) = xs;
+            eaten
+        };
+        assert!(eaten.is_empty(), "cross-dimension orbs must never merge");
+        let xs = xps().lock().unwrap_or_else(|e| e.into_inner());
+        assert_eq!(xs.len(), 2);
+        assert_eq!(xs.iter().map(|x| x.val as i64).sum::<i64>(), 20);
+        drop(xs);
+        // Same-dimension donors still collapse into one orb.
+        clear_entity_dim(b);
+        set_entity_dim(b, DimId::Nether);
+        let eaten = {
+            let mut xs = std::mem::take(&mut *xps().lock().unwrap_or_else(|e| e.into_inner()));
+            let pending = xp_pending().lock().unwrap_or_else(|e| e.into_inner()).clone();
+            let eaten = xp_merge_pending_locked(&mut xs, &pending);
+            *xps().lock().unwrap_or_else(|e| e.into_inner()) = xs;
+            eaten
+        };
+        assert_eq!(eaten.len(), 1, "same-dimension donors merge");
+        let xs = xps().lock().unwrap_or_else(|e| e.into_inner());
+        assert_eq!(xs.len(), 1);
+        assert_eq!(xs[0].val, 20);
+        assert_eq!(entity_dim_of(xs[0].eid), DimId::Nether);
+    }
+
+    #[test]
+    fn env_merge_partitions_by_dimension() {
+        let _guard = world_guard();
+        let _s = OrbStores::take();
+        let mut xs = vec![
+            Xp { eid: 1, x: 4.0, y: 60.0, z: 4.0, val: 10, age: 0 },
+            Xp { eid: 2, x: 4.0, y: 60.0, z: 4.0, val: 10, age: 0 },
+        ];
+        set_entity_dim(2, DimId::Nether);
+        assert!(
+            merge_xp_orbs(&mut xs).is_empty(),
+            "coincident orbs in different dimensions must not merge"
+        );
+        // Same dimension: the earlier orb absorbs the later one; the eaten
+        // slot keeps its stale value until the caller retains it out, so the
+        // assertion reads the reported eid and the survivor.
+        set_entity_dim(2, DimId::Overworld);
+        let merged = merge_xp_orbs(&mut xs);
+        assert_eq!(merged, vec![2]);
+        assert_eq!(xs[0].val, 20);
     }
 }

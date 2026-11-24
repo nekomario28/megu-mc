@@ -468,8 +468,17 @@ fn aabb_in_water(aabb: EntityAabb) -> bool {
     aabb_in_water_with(aabb, &block_at_cached)
 }
 
+fn aabb_in_water_dim(dim: DimId, aabb: EntityAabb) -> bool {
+    aabb_in_water_with(aabb, &|bx, by, bz| block_at_cached_dim(dim, bx, by, bz))
+}
+
+#[allow(dead_code)]
 fn aabb_in_lava(aabb: EntityAabb) -> bool {
     aabb_in_lava_with(aabb, &block_at_cached)
+}
+
+fn aabb_in_lava_dim(dim: DimId, aabb: EntityAabb) -> bool {
+    aabb_in_lava_with(aabb, &|bx, by, bz| block_at_cached_dim(dim, bx, by, bz))
 }
 
 /// 1.21.1 `Player.<clinit>` (`cmx`) pose eye heights:
@@ -549,19 +558,35 @@ fn mob_eye_in_water(etype: i64, x: f64, y: f64, z: f64) -> bool {
 }
 
 fn mob_drowning_submerged(etype: i64, x: f64, y: f64, z: f64) -> bool {
+    mob_drowning_submerged_dim(DimId::Overworld, etype, x, y, z)
+}
+
+/// `mob_drowning_submerged` on the dimension's own block view.
+fn mob_drowning_submerged_dim(dim: DimId, etype: i64, x: f64, y: f64, z: f64) -> bool {
     let eh = mob_eye_height(etype);
-    eye_in_fluid_with(x, y, z, eh, EntityFluidKind::Water, &block_at_cached)
-        && !eye_in_bubble_column_with(x, y, z, eh, &block_at_cached)
+    let get_block = |bx, by, bz| block_at_cached_dim(dim, bx, by, bz);
+    eye_in_fluid_with(x, y, z, eh, EntityFluidKind::Water, &get_block)
+        && !eye_in_bubble_column_with(x, y, z, eh, &get_block)
 }
 
 fn mob_in_water(etype: i64, x: f64, y: f64, z: f64) -> bool {
+    mob_in_water_dim(DimId::Overworld, etype, x, y, z)
+}
+
+/// `mob_in_water` on the dimension's own block view.
+fn mob_in_water_dim(dim: DimId, etype: i64, x: f64, y: f64, z: f64) -> bool {
     let (w, h) = mob_dimensions(etype);
-    aabb_in_water(EntityAabb::from_dimensions(x, y, z, w, h))
+    aabb_in_water_dim(dim, EntityAabb::from_dimensions(x, y, z, w, h))
 }
 
 fn mob_in_lava(etype: i64, x: f64, y: f64, z: f64) -> bool {
+    mob_in_lava_dim(DimId::Overworld, etype, x, y, z)
+}
+
+/// `mob_in_lava` on the dimension's own block view.
+fn mob_in_lava_dim(dim: DimId, etype: i64, x: f64, y: f64, z: f64) -> bool {
     let (w, h) = mob_dimensions(etype);
-    aabb_in_lava(EntityAabb::from_dimensions(x, y, z, w, h))
+    aabb_in_lava_dim(dim, EntityAabb::from_dimensions(x, y, z, w, h))
 }
 
 fn mob_water_state(etype: i64, x: f64, y: f64, z: f64) -> FluidPushResult {
@@ -718,8 +743,14 @@ fn fluid_input_vector(input: [f64; 3], amount: f32, yaw_deg: f32) -> [f64; 3] {
 /// entity's AABB at that position. Only the block half is modelled — the entity half needs the
 /// level's entity-AABB query, and this server's mob lacks one (the mob push grid excludes the
 /// querying mob rather than answering obstruction).
+#[allow(dead_code)]
 fn entity_is_free_blocks(aabb: EntityAabb) -> bool {
-    !any_block_collision_box(aabb.min(), aabb.max())
+    entity_is_free_blocks_dim(DimId::Overworld, aabb)
+}
+
+/// `entity_is_free_blocks` on the dimension's own block view.
+fn entity_is_free_blocks_dim(dim: DimId, aabb: EntityAabb) -> bool {
+    !any_block_collision_box_dim(dim, aabb.min(), aabb.max())
 }
 
 /// The `LivingEntity.travel` inputs the fluid branches read, separated from the mob so the step
@@ -857,6 +888,16 @@ fn travel_fluid_step(
 /// `updateFluidHeightAndDoFluidPushing` for a mob at `pos` with its own `deltaMovement` in
 /// flight, which is what vanilla samples for the `0.0045000000000000005` minimum-speed guard.
 fn mob_water_state_vel(etype: i64, pos: [f64; 3], vel: [f64; 3]) -> FluidPushResult {
+    mob_water_state_vel_dim(DimId::Overworld, etype, pos, vel)
+}
+
+/// `mob_water_state_vel` on the dimension's own block view.
+fn mob_water_state_vel_dim(
+    dim: DimId,
+    etype: i64,
+    pos: [f64; 3],
+    vel: [f64; 3],
+) -> FluidPushResult {
     let (w, h) = mob_dimensions(etype);
     let aabb = EntityAabb::from_dimensions(pos[0], pos[1], pos[2], w, h);
     update_fluid_height_and_push_with(
@@ -866,7 +907,7 @@ fn mob_water_state_vel(etype: i64, pos: [f64; 3], vel: [f64; 3]) -> FluidPushRes
         true,
         false,
         vel,
-        &block_at_cached,
+        &|bx, by, bz| block_at_cached_dim(dim, bx, by, bz),
     )
 }
 
@@ -874,6 +915,16 @@ fn mob_water_state_vel(etype: i64, pos: [f64; 3], vel: [f64; 3]) -> FluidPushRes
 /// `fluid_sweep_states` is verified against in tests.
 #[allow(dead_code)]
 fn mob_lava_state_vel(etype: i64, pos: [f64; 3], vel: [f64; 3]) -> FluidPushResult {
+    mob_lava_state_vel_dim(DimId::Overworld, etype, pos, vel)
+}
+
+/// `mob_lava_state_vel` on the dimension's own block view.
+fn mob_lava_state_vel_dim(
+    dim: DimId,
+    etype: i64,
+    pos: [f64; 3],
+    vel: [f64; 3],
+) -> FluidPushResult {
     let (w, h) = mob_dimensions(etype);
     let aabb = EntityAabb::from_dimensions(pos[0], pos[1], pos[2], w, h);
     update_fluid_height_and_push_with(
@@ -883,7 +934,7 @@ fn mob_lava_state_vel(etype: i64, pos: [f64; 3], vel: [f64; 3]) -> FluidPushResu
         true,
         false,
         vel,
-        &block_at_cached,
+        &|bx, by, bz| block_at_cached_dim(dim, bx, by, bz),
     )
 }
 
@@ -983,10 +1034,21 @@ fn fluid_sweep_states(
     })
 }
 
+#[allow(dead_code)]
 fn mob_fluid_states_vel(etype: i64, pos: [f64; 3], vel: [f64; 3]) -> (FluidPushResult, FluidPushResult) {
+    mob_fluid_states_vel_dim(DimId::Overworld, etype, pos, vel)
+}
+
+/// `mob_fluid_states_vel` on the dimension's own block view.
+fn mob_fluid_states_vel_dim(
+    dim: DimId,
+    etype: i64,
+    pos: [f64; 3],
+    vel: [f64; 3],
+) -> (FluidPushResult, FluidPushResult) {
     let (w, h) = mob_dimensions(etype);
     let aabb = EntityAabb::from_dimensions(pos[0], pos[1], pos[2], w, h);
-    fluid_sweep_states(aabb, vel, &block_at_cached)
+    fluid_sweep_states(aabb, vel, &|bx, by, bz| block_at_cached_dim(dim, bx, by, bz))
 }
 
 /// One `LivingEntity.travel` fluid tick for a mob.
@@ -1002,7 +1064,7 @@ fn mob_fluid_travel_tick(
     let (w, h) = mob_dimensions(m.etype);
     let pos = [mp.0, mp.1, mp.2];
     let mut vel = *m.vel.lock().unwrap_or_else(|e| e.into_inner());
-    let (water, lava) = mob_fluid_states_vel(m.etype, pos, vel);
+    let (water, lava) = mob_fluid_states_vel_dim(m.dim, m.etype, pos, vel);
     let (kind, state) = if water.in_fluid {
         (EntityFluidKind::Water, water)
     } else if lava.max_height > 0.0 {
@@ -1018,7 +1080,7 @@ fn mob_fluid_travel_tick(
         vel[1] + state.push[1],
         vel[2] + state.push[2],
     ];
-    let on_ground = mob_has_support(m.etype, pos[0], pos[1], pos[2]);
+    let on_ground = mob_has_support_dim(m.dim, m.etype, pos[0], pos[1], pos[2]);
     let ctx = LivingTravelContext {
         // `MobEffects.SLOW_FALLING` cannot be raised here: this server keeps effects on `Client`
         // (`effs`), not on `Mob`, so the second argument is the vanilla default.
@@ -1032,11 +1094,11 @@ fn mob_fluid_travel_tick(
     let mut move_fn = |delta: [f64; 3]| {
         let aabb = EntityAabb::from_dimensions(pos[0], pos[1], pos[2], w, h);
         // `Attributes.STEP_HEIGHT` (`buw.B`) default `0.6f`; `Entity.move` runs `collide`.
-        let res = entity_collide_world(aabb, delta, on_ground, 0.6, &[]);
+        let res = entity_collide_world_dim(m.dim, aabb, delta, on_ground, 0.6, &[]);
         (res.delta, res.horizontal_collision)
     };
     let is_free = |p: [f64; 3]| {
-        entity_is_free_blocks(EntityAabb::from_dimensions(p[0], p[1], p[2], w, h))
+        entity_is_free_blocks_dim(m.dim, EntityAabb::from_dimensions(p[0], p[1], p[2], w, h))
     };
     let out = travel_fluid_step(kind, vel, [0.0; 3], mp.3, ctx, &mut move_fn, &is_free);
     mp.0 += out.moved[0];
@@ -1946,5 +2008,60 @@ mod entity_fluid_tests {
             ),
             "dry-cell result must be bit-identical to the scalar sweeps"
         );
+    }
+
+    // H1 — the `_dim` fluid queries read the entity's own dimension: water
+    // written into the Nether overlay must not wet an Overworld mob standing
+    // at the same coordinates, and the Overworld wrappers keep answering for
+    // the Overworld.
+    #[test]
+    fn dim_scoped_fluid_queries_read_their_own_dimension() {
+        crate::test_support::require_vanilla_data();
+        let _guard = world_guard();
+        let _snap = FluidTestWorldSnapshot::take();
+        let zombie = name_to_etype("zombie").unwrap();
+        // Water source cells (state 80) in the Nether overlay only.
+        {
+            let mut w = world().write_all();
+            let c = w.entry((DimId::Nether, 0, 0)).or_default();
+            c.insert(local_idx(5, 60, 5), 80);
+            c.insert(local_idx(5, 61, 5), 80);
+        }
+        assert!(
+            mob_in_water_dim(DimId::Nether, zombie, 5.5, 60.2, 5.5),
+            "a Nether mob standing in Nether water is in water"
+        );
+        assert!(
+            !mob_in_water_dim(DimId::Overworld, zombie, 5.5, 60.2, 5.5),
+            "Nether water must not wet an Overworld mob at the same cell"
+        );
+        assert!(
+            !mob_in_water(zombie, 5.5, 60.2, 5.5),
+            "the wrapper still answers for the Overworld"
+        );
+        // Eye level 1.74 above feet y=60 sits inside the (5,61,5) water cell.
+        assert!(mob_drowning_submerged_dim(
+            DimId::Nether,
+            zombie,
+            5.5,
+            60.0,
+            5.5
+        ));
+        assert!(!mob_drowning_submerged_dim(
+            DimId::Overworld,
+            zombie,
+            5.5,
+            60.0,
+            5.5
+        ));
+        // Lava sees the same partition: a Nether lava cell is not Overworld lava.
+        {
+            let mut w = world().write_all();
+            let c = w.entry((DimId::Nether, 0, 0)).or_default();
+            c.insert(local_idx(5, 60, 5), 96);
+            c.insert(local_idx(5, 61, 5), 96);
+        }
+        assert!(mob_in_lava_dim(DimId::Nether, zombie, 5.5, 60.2, 5.5));
+        assert!(!mob_in_lava_dim(DimId::Overworld, zombie, 5.5, 60.2, 5.5));
     }
 }
