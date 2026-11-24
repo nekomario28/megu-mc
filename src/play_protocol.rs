@@ -733,7 +733,9 @@ fn tag_biome_wire_id(name: &str) -> Option<i32> {
 /// registry publishes: every category whose members resolve to a live
 /// registry id. Categories without a resolver are left out so clients keep
 /// their registry-baseline tags — the wire format only carries ids.
-fn update_tags_wire_map() -> Vec<(String, Vec<(String, Vec<i32>)>)> {
+type UpdateTagsRegistries = Vec<(String, Vec<(String, Vec<i32>)>)>;
+
+fn update_tags_wire_map() -> UpdateTagsRegistries {
     let categories: Vec<(String, Vec<String>)> = {
         let registry = datapack_registry()
             .lock()
@@ -744,7 +746,7 @@ fn update_tags_wire_map() -> Vec<(String, Vec<(String, Vec<i32>)>)> {
             .map(|(category, tags)| (category.clone(), tags.keys().cloned().collect()))
             .collect()
     };
-    let mut registries: Vec<(String, Vec<(String, Vec<i32>)>)> = Vec::new();
+    let mut registries: UpdateTagsRegistries = Vec::new();
     for (category, tag_names) in categories {
         let (registry_name, resolve): (&str, fn(&str) -> Option<i32>) = match category.as_str() {
             "block" => ("minecraft:block", tag_block_wire_id),
@@ -802,7 +804,7 @@ fn update_tags_wire_payload() -> Vec<u8> {
 /// captured packet is authoritative input, never partially applied.
 fn update_tags_wire_decode(
     mut input: &[u8],
-) -> Option<Vec<(String, Vec<(String, Vec<i32>)>)>> {
+) -> Option<UpdateTagsRegistries> {
     let count = read_protocol_i32(&mut input)?;
     if !(0..=64).contains(&count) {
         return None;
@@ -838,9 +840,9 @@ fn update_tags_wire_decode(
 /// semantics are the honest merge), and registries the baseline never carried
 /// are appended.
 fn merge_update_tags_baseline(
-    mut baseline: Vec<(String, Vec<(String, Vec<i32>)>)>,
-    overlay: Vec<(String, Vec<(String, Vec<i32>)>)>,
-) -> Vec<(String, Vec<(String, Vec<i32>)>)> {
+    mut baseline: UpdateTagsRegistries,
+    overlay: UpdateTagsRegistries,
+) -> UpdateTagsRegistries {
     for (reg_name, tags) in overlay {
         let Some((_, base_tags)) = baseline.iter_mut().find(|(n, _)| *n == reg_name) else {
             baseline.push((reg_name, tags));
@@ -975,12 +977,15 @@ fn chunk_biome_data(
     data
 }
 
+/// Per-dimension biome override cells cloned out of the store for one sync pass.
+type BiomeOverrideSnapshot = Vec<(DimId, HashMap<(i32, i32, i32), String>)>;
+
 /// The `/fillbiome` store only ever inserts, so a growing quart-cell count is
 /// the change signal; on change every chunk an override cell touches gets
 /// `chunks_biomes` re-sent to the clients currently holding it.
 fn biome_override_sync_tick() {
     static SEEN: AtomicU64 = AtomicU64::new(0);
-    let snapshot: Vec<(DimId, HashMap<(i32, i32, i32), String>)> = {
+    let snapshot: BiomeOverrideSnapshot = {
         let overrides = biome_overrides()
             .lock()
             .unwrap_or_else(|e| e.into_inner());
@@ -1804,6 +1809,9 @@ fn dig_min_ticks(seconds: f32) -> u64 {
     dig_required_ticks(seconds, 0.7)
 }
 
+/// A queued `use_on` resend: `(dim, x, y, z, tick)` of the clicked cell.
+type UseOnResend = Mutex<Option<(DimId, i32, i32, i32, i64)>>;
+
 struct Client {
     eid: i32,
     uuid: [u8; 16],
@@ -1894,7 +1902,7 @@ struct Client {
     // `handleUseItemOn` resends `ClientboundBlockUpdatePacket` for the clicked
     // cell and `clicked + face` at the end of every use_on; the next queued
     // flush emits them so they carry post-write states like vanilla's tail.
-    use_on_resend: Mutex<Option<(DimId, i32, i32, i32, i64)>>,
+    use_on_resend: UseOnResend,
 }
 
 // Per-player bed occupancy: the bed position, game ticks slept so far and the
@@ -2845,7 +2853,7 @@ thread_local! {
 #[cfg(test)]
 thread_local! {
     static SPAWN_DESCRIPTOR_MATERIALIZATIONS: std::cell::Cell<usize> =
-        std::cell::Cell::new(0);
+        const { std::cell::Cell::new(0) };
 }
 
 fn entity_tracking_range(etype: i64) -> u32 {
@@ -5233,6 +5241,9 @@ fn config_next_frame(
     }
 }
 
+/// `MEGU_SERVER_LINKS` parsed entries: `(builtin id | custom label NBT, url)`.
+type ParsedServerLinks<'a> = Vec<(Option<u32>, Option<Vec<u8>>, &'a str)>;
+
 /// `MEGU_SERVER_LINKS`/`MEGU_REPORT_DETAILS` in their configuration-phase
 /// slots: vanilla writes `server_links` (`0x10`) and `custom_report_details`
 /// (`0x0f`) immediately after the brand custom-payload, before
@@ -5242,7 +5253,7 @@ fn send_config_links_and_reports(s: &mut TcpStream, compression: Option<usize>) 
     if let Ok(links) = std::env::var("MEGU_SERVER_LINKS") {
         // The post-join burst's convention: `builtin:<id>=<url>` or
         // `<text>=<url>`; text labels ride the same `text_component_nbt`.
-        let mut parsed: Vec<(Option<u32>, Option<Vec<u8>>, &str)> = Vec::new();
+        let mut parsed: ParsedServerLinks<'_> = Vec::new();
         for entry in links.split(';').map(str::trim).filter(|e| !e.is_empty()) {
             let Some((label, url)) = entry.split_once('=') else {
                 continue;
@@ -5384,10 +5395,8 @@ fn run_config_exchange(
             return false;
         }
     }
-    if reset_chat_chain {
-        if send_config_reset_chat(s, compression).is_err() {
-            return false;
-        }
+    if reset_chat_chain && send_config_reset_chat(s, compression).is_err() {
+        return false;
     }
     let pack_pushed = send_config_cookie_and_pack(s, compression);
     if pack_pushed {
@@ -5513,12 +5522,13 @@ fn play_reconfigure_exchange(
     // the world view.
     {
         let mut cls = clients().lock().unwrap_or_else(|e| e.into_inner());
-        let pi = player_info_add(&me);
+        let pi = player_info_add(me);
         let mut names: Vec<String> = cls.iter().map(|c| c.name.clone()).collect();
         names.push(me.name.clone());
         let (_, all_names) = encode_play_custom_chat_completions(0, &names);
         let _ = send_packet(&mut me.sock.lock().unwrap_or_else(|e| e.into_inner()), 0x18, all_names);
-        let (_, joined_name) = encode_play_custom_chat_completions(0, &[me.name.clone()]);
+        let (_, joined_name) =
+            encode_play_custom_chat_completions(0, std::slice::from_ref(&me.name));
         for c in cls.iter() {
             let _ = send_packet(&mut me.sock.lock().unwrap_or_else(|e| e.into_inner()), 0x3e, player_info_add(c));
             let _ = send_packet(&mut c.sock.lock().unwrap_or_else(|e| e.into_inner()), 0x3e, pi.clone());
@@ -7254,14 +7264,14 @@ enum LaneWork {
     Resend(bool),
 }
 
-fn lane_probe_queue() -> &'static (
+/// The lane worker's shared state: a per-lane `VecDeque` plus its `Condvar`.
+type LaneProbeQueue = (
     Mutex<std::collections::VecDeque<(i32, LaneWork)>>,
     std::sync::Condvar,
-) {
-    static Q: OnceLock<(
-        Mutex<std::collections::VecDeque<(i32, LaneWork)>>,
-        std::sync::Condvar,
-    )> = OnceLock::new();
+);
+
+fn lane_probe_queue() -> &'static LaneProbeQueue {
+    static Q: OnceLock<LaneProbeQueue> = OnceLock::new();
     Q.get_or_init(|| {
         (
             Mutex::new(std::collections::VecDeque::new()),
@@ -8494,10 +8504,10 @@ fn sign_lines_at(dim: DimId, x: i32, y: i32, z: i32) -> ([String; 4], [String; 4
     (
         g.get(&(dim, x, y, z, 1))
             .cloned()
-            .unwrap_or_else(|| Default::default()),
+            .unwrap_or_else(Default::default),
         g.get(&(dim, x, y, z, 0))
             .cloned()
-            .unwrap_or_else(|| Default::default()),
+            .unwrap_or_else(Default::default),
     )
 }
 fn is_sign_block_state(state: u32) -> bool {
@@ -8512,8 +8522,7 @@ fn is_sign_block_state(state: u32) -> bool {
 }
 /// Remove legacy formatting sequences and C0/C1 controls before any sign text
 /// reaches persistent state or a block-entity broadcast. Retain normal Unicode.
-#[cfg_attr(not(test), allow(dead_code))]
-#[cfg_attr(not(megu_vanilla_data), allow(dead_code))]
+#[cfg_attr(any(not(test), not(megu_vanilla_data)), allow(dead_code))]
 fn sanitize_sign_line(input: &str) -> String {
     let mut clean = String::with_capacity(input.len());
     let mut chars = input.chars().peekable();
@@ -10282,7 +10291,7 @@ fn place_live_recipe(me: &Arc<Client>, place: &PlaceRecipe) {
     );
     let mut echo = |slot: i16, st: &Stack| {
         let mut p = vec![wid];
-        write_varint(&mut p, i64::from(inv_state_next(&me)));
+        write_varint(&mut p, i64::from(inv_state_next(me)));
         p.extend_from_slice(&slot.to_be_bytes());
         p.extend_from_slice(&slot_wire(st));
         let _ = send_packet(&mut sock, 0x15, p);
@@ -10792,7 +10801,7 @@ fn handle_inner(mut s: TcpStream, live_eid: Arc<AtomicI32>) {
     if let Ok(links) = std::env::var("MEGU_SERVER_LINKS") {
         // `builtin:<id>=<url>` or `<text>=<url>`; text labels ride a component
         // built by the same `text_component_nbt` as /title.
-        let mut parsed: Vec<(Option<u32>, Option<Vec<u8>>, &str)> = Vec::new();
+        let mut parsed: ParsedServerLinks<'_> = Vec::new();
         for entry in links.split(';').map(str::trim).filter(|e| !e.is_empty()) {
             let Some((label, url)) = entry.split_once('=') else {
                 continue;
@@ -11008,7 +11017,8 @@ fn handle_inner(mut s: TcpStream, live_eid: Arc<AtomicI32>) {
         let names: Vec<String> = cls.iter().map(|c| c.name.clone()).collect();
         let (_, all_names) = encode_play_custom_chat_completions(0, &names);
         let _ = send_packet(&mut me.sock.lock().unwrap_or_else(|e| e.into_inner()), 0x18, all_names);
-        let (_, joined_name) = encode_play_custom_chat_completions(0, &[me.name.clone()]);
+        let (_, joined_name) =
+            encode_play_custom_chat_completions(0, std::slice::from_ref(&me.name));
         for c in cls.iter().filter(|c| c.eid != me.eid) {
             let _ = send_packet(&mut c.sock.lock().unwrap_or_else(|e| e.into_inner()), 0x18, joined_name.clone());
         }
@@ -11102,7 +11112,6 @@ fn handle_inner(mut s: TcpStream, live_eid: Arc<AtomicI32>) {
     // Reuse the configuration-phase reader: a pipelining client can already
     // have play packets buffered behind its `0x03` finish acknowledgement,
     // and a fresh buffer would silently drop them.
-    let mut rx = rx;
     // Play-state packet inactivity is tracked separately from the keep-alive deadline.
     let mut last_rx = Instant::now();
     let mut chat_throttle = connection_limits::ChatThrottle::new(Instant::now());
@@ -15588,7 +15597,8 @@ fn disconnect_cleanup(me_cleanup: &Arc<Client>, peer: &str) {
         broadcast_packet(me_cleanup.eid, 0x3d, &p);
         // `PlayerList.remove` also drops the name from everyone's completion
         // set — the `custom_chat_completions` remove complement to the join add.
-        let (_, gone_name) = encode_play_custom_chat_completions(1, &[me_cleanup.name.clone()]);
+        let (_, gone_name) =
+            encode_play_custom_chat_completions(1, std::slice::from_ref(&me_cleanup.name));
         broadcast_packet(me_cleanup.eid, 0x18, &gone_name);
         // The last online client list is empty: the snapshot above is the
         // world's final live state, and an idle server's periodic autosave
@@ -19585,7 +19595,7 @@ mod p5c_live_tests {
     fn creative_name_payload(len: usize) -> Vec<u8> {
         let mut payload = vec![8u8]; // NBT string tag
         payload.extend_from_slice(&(len as u16).to_be_bytes());
-        payload.extend(std::iter::repeat(b'a').take(len));
+        payload.extend(std::iter::repeat_n(b'a', len));
         payload
     }
 

@@ -107,19 +107,21 @@ type SignKey = (DimId, i32, i32, i32, u8);
 type SignLines = [String; 4];
 /// A block entity on its way out inside a chunk packet: position, type, NBT.
 type ChunkBlockEntity = (BlockPos, i64, Vec<u8>);
-/// An entity spawn queued for the clients that just became able to see it.
-type SpawnJob = (
-    i32,
-    f64,
-    f64,
-    f64,
-    Box<dyn Fn() -> Vec<(i64, Vec<u8>)> + Send>,
-);
 /// A throwable's hit, carried out of the borrow before it is applied:
 /// (eid, mob hit, dx, dz, egg, x, y, z).
 type ThrowHit = (i32, Option<i32>, f64, f64, bool, f64, f64, f64);
 /// The advancement tree: player -> advancement -> finished criteria.
 type Advancements = HashMap<String, HashMap<String, HashSet<String>>>;
+/// `PENDING_BLOCKS` regrouped per chunk for the batched `0x49` emission:
+/// chunk key -> section position -> section -> packed cell updates.
+type PendingBlocksByChunk =
+    BTreeMap<DimChunkKey, Vec<((i32, i32, i32), HashMap<u16, u32>)>>;
+/// `set_blocks_bulk_dim`'s edit list grouped per `(cx, cz)` column.
+type BulkEditsByChunk = HashMap<(i32, i32), Vec<(i32, i32, i32, u32)>>;
+/// `placement_states`' ordered write set: cell position -> block state.
+type PlacementWrites = Vec<((i32, i32, i32), u32)>;
+/// §5.2③ per-tick coalesced WAL buffer: latest committed state per block pos.
+type PerTickWalBuffer = Mutex<BTreeMap<(DimId, i32, i32, i32), u32>>;
 /// The chunks a client has loaded, as (hot, warm) - the region snapshot.
 #[cfg(test)]
 type RegionSets = (HashSet<ChunkKey>, HashSet<ChunkKey>);
@@ -5603,6 +5605,7 @@ fn apply_entity_push_step_dim(
     });
 }
 
+#[allow(clippy::too_many_arguments)]
 fn live_mob_tick_dimension(
     dim: DimId,
     reg: &crate::block_registry::BReg,
@@ -5995,7 +5998,7 @@ fn live_mob_tick_dimension(
                     rng_u64: world_rng::next_u64(),
                 },
                 target,
-                &crystals,
+                crystals,
             );
             let teleported = effects
                 .iter()
@@ -6304,14 +6307,8 @@ impl<V> ShardsRead<'_, V> {
     fn get(&self, key: &DimChunkKey) -> Option<&V> {
         self.guards[chunk_shard_of(key)].get(key)
     }
-    fn contains_key(&self, key: &DimChunkKey) -> bool {
-        self.get(key).is_some()
-    }
     fn len(&self) -> usize {
         self.guards.iter().map(|g| g.len()).sum()
-    }
-    fn is_empty(&self) -> bool {
-        self.guards.iter().all(|g| g.is_empty())
     }
     fn iter(&self) -> impl Iterator<Item = (&DimChunkKey, &V)> + '_ {
         self.guards.iter().flat_map(|g| g.iter())
@@ -6321,6 +6318,8 @@ impl<V> ShardsRead<'_, V> {
     }
     /// Owned copy of the union — the `guard.clone()` analogue for the
     /// whole-map view.
+    #[cfg(test)]
+    #[cfg_attr(not(megu_vanilla_data), allow(dead_code))]
     fn to_map(&self) -> HashMap<DimChunkKey, V>
     where
         V: Clone,
@@ -6336,14 +6335,10 @@ struct ShardsWrite<'a, V> {
 }
 
 impl<V> ShardsWrite<'_, V> {
-    fn get(&self, key: &DimChunkKey) -> Option<&V> {
-        self.guards[chunk_shard_of(key)].get(key)
-    }
+    #[cfg(test)]
+    #[cfg_attr(not(megu_vanilla_data), allow(dead_code))]
     fn get_mut(&mut self, key: &DimChunkKey) -> Option<&mut V> {
         self.guards[chunk_shard_of(key)].get_mut(key)
-    }
-    fn contains_key(&self, key: &DimChunkKey) -> bool {
-        self.get(key).is_some()
     }
     fn entry(
         &mut self,
@@ -6351,36 +6346,42 @@ impl<V> ShardsWrite<'_, V> {
     ) -> std::collections::hash_map::Entry<'_, DimChunkKey, V> {
         self.guards[chunk_shard_of(&key)].entry(key)
     }
+    #[cfg(test)]
+    #[cfg_attr(not(megu_vanilla_data), allow(dead_code))]
     fn insert(&mut self, key: DimChunkKey, value: V) -> Option<V> {
         self.guards[chunk_shard_of(&key)].insert(key, value)
-    }
-    fn remove(&mut self, key: &DimChunkKey) -> Option<V> {
-        self.guards[chunk_shard_of(&key)].remove(key)
-    }
-    fn len(&self) -> usize {
-        self.guards.iter().map(|g| g.len()).sum()
     }
     fn clear(&mut self) {
         for g in self.guards.iter_mut() {
             g.clear();
         }
     }
+    #[cfg(test)]
+    #[cfg_attr(not(megu_vanilla_data), allow(dead_code))]
+    fn remove(&mut self, key: &DimChunkKey) -> Option<V> {
+        self.guards[chunk_shard_of(key)].remove(key)
+    }
+    #[cfg(test)]
+    #[cfg_attr(not(megu_vanilla_data), allow(dead_code))]
+    fn len(&self) -> usize {
+        self.guards.iter().map(|g| g.len()).sum()
+    }
+    #[cfg(test)]
+    #[cfg_attr(not(megu_vanilla_data), allow(dead_code))]
     fn retain(&mut self, mut f: impl FnMut(&DimChunkKey, &mut V) -> bool) {
         for g in self.guards.iter_mut() {
             g.retain(&mut f);
         }
     }
-    fn iter(&self) -> impl Iterator<Item = (&DimChunkKey, &V)> + '_ {
-        self.guards.iter().flat_map(|g| g.iter())
-    }
-    fn keys(&self) -> impl Iterator<Item = &DimChunkKey> + '_ {
-        self.guards.iter().flat_map(|g| g.keys())
-    }
+    #[cfg(test)]
+    #[cfg_attr(not(megu_vanilla_data), allow(dead_code))]
     fn drain_into(&mut self, out: &mut HashMap<DimChunkKey, V>) {
         for g in self.guards.iter_mut() {
             out.extend(g.drain());
         }
     }
+    #[cfg(test)]
+    #[cfg_attr(not(megu_vanilla_data), allow(dead_code))]
     fn restore(&mut self, map: HashMap<DimChunkKey, V>) {
         self.clear();
         for (key, value) in map {
@@ -6472,6 +6473,8 @@ impl<V> ShardedChunks<V> {
             .sum()
     }
 
+    #[cfg(test)]
+    #[cfg_attr(not(megu_vanilla_data), allow(dead_code))]
     fn is_empty(&self) -> bool {
         self.shards.iter().all(|s| {
             s.lock
@@ -6489,6 +6492,8 @@ impl<V> ShardedChunks<V> {
         self.read(key).get(key).cloned()
     }
 
+    #[cfg(test)]
+    #[cfg_attr(not(megu_vanilla_data), allow(dead_code))]
     fn contains_key(&self, key: &DimChunkKey) -> bool {
         self.read(key).contains_key(key)
     }
@@ -6498,7 +6503,7 @@ impl<V> ShardedChunks<V> {
     }
 
     fn remove(&self, key: &DimChunkKey) -> Option<V> {
-        self.write(&key).remove(key)
+        self.write(key).remove(key)
     }
 
     /// Every key in the map, under per-shard read locks.
@@ -6522,6 +6527,8 @@ impl<V> ShardedChunks<V> {
     }
 
     /// `std::mem::take` on the whole map: drain every shard into one map.
+    #[cfg(test)]
+    #[cfg_attr(not(megu_vanilla_data), allow(dead_code))]
     fn take_all(&self) -> HashMap<DimChunkKey, V> {
         let mut all = self.write_all();
         let mut out = HashMap::with_capacity(all.len());
@@ -6530,6 +6537,8 @@ impl<V> ShardedChunks<V> {
     }
 
     /// Replace the whole map with `map` under write locks on every shard.
+    #[cfg(test)]
+    #[cfg_attr(not(megu_vanilla_data), allow(dead_code))]
     fn restore_all(&self, map: HashMap<DimChunkKey, V>) {
         self.write_all().restore(map);
     }
@@ -6542,6 +6551,8 @@ impl<V> ShardedChunks<V> {
     /// Clear poison on every shard lock — `Mutex::clear_poison`'s
     /// whole-store analogue for the tests that deliberately panic with a
     /// guard held.
+    #[cfg(test)]
+    #[cfg_attr(not(megu_vanilla_data), allow(dead_code))]
     fn clear_poison(&self) {
         for shard in self.shards.iter() {
             shard.lock.clear_poison();
@@ -9997,8 +10008,7 @@ fn apply_queued_block_updates() {
     // one dirty cell anywhere in the column goes out as `block_update` (0x09);
     // two or more emit `section_blocks_update` (0x49) per section, even when a
     // section holds a single dirty cell.
-    let mut by_chunk: BTreeMap<(DimId, i32, i32), Vec<((i32, i32, i32), HashMap<u16, u32>)>> =
-        BTreeMap::new();
+    let mut by_chunk: PendingBlocksByChunk = BTreeMap::new();
     for ((dim, sx, sy, sz), recs) in map {
         by_chunk
             .entry((dim, sx, sz))
@@ -10239,12 +10249,12 @@ fn set_block_if_inner_dim(
         // A rewrite of the identical state must not invalidate chunk caches —
         // the stored content is unchanged; only the version tick cost real work.
         let light_changed =
-            breg().map_or(true, |r| light_properties(r, old) != light_properties(r, st));
+            breg().is_none_or(|r| light_properties(r, old) != light_properties(r, st));
         bump_world_epoch_dim_opts(dim, x, z, light_changed);
         if std::env::var_os("MEGU_CHUNK_PROF").is_some() {
             static N2: AtomicU64 = AtomicU64::new(0);
             let n = N2.fetch_add(1, Ordering::Relaxed);
-            if n % 32 == 0 {
+            if n.is_multiple_of(32) {
                 eprintln!("[chunk-write] ({x},{y},{z}) {old}->{st} {} -> {}",
                     breg().map(|r| r.name_of(old)).unwrap_or("?"),
                     breg().map(|r| r.name_of(st)).unwrap_or("?"));
@@ -10480,7 +10490,7 @@ fn set_block_if_dim_edit(
     store_patch(dim, x, y, z, st);
     if st != old {
         let light_changed =
-            breg().map_or(true, |r| light_properties(r, old) != light_properties(r, st));
+            breg().is_none_or(|r| light_properties(r, old) != light_properties(r, st));
         bump_world_epoch_dim_opts(dim, x, z, light_changed);
     }
     note_light_edit(dim, Position::new(x, y, z), old, st);
@@ -11084,7 +11094,7 @@ fn set_blocks_bulk_dim(dim: DimId, edits: &[(i32, i32, i32, u32)]) -> usize {
         return 0;
     }
     // The last write per cell wins, matching a sequential `set_block` loop.
-    let mut by_chunk: HashMap<(i32, i32), Vec<(i32, i32, i32, u32)>> = HashMap::new();
+    let mut by_chunk: BulkEditsByChunk = HashMap::new();
     for &(x, y, z, st) in edits {
         by_chunk.entry((x >> 4, z >> 4)).or_default().push((x, y, z, st));
     }
@@ -12030,8 +12040,8 @@ fn placement_door_hinge(
         (tx + dx, ty + up, tz + dz)
     };
     let conductor = |pos: (i32, i32, i32)| reg.is_redstone_conductor(get(pos));
-    let i = (conductor(at(facing.left(), 0)) as i32 * -1)
-        + (conductor(at(facing.left(), 1)) as i32 * -1)
+    let i = -(conductor(at(facing.left(), 0)) as i32)
+        - (conductor(at(facing.left(), 1)) as i32)
         + conductor(at(facing.right(), 0)) as i32
         + conductor(at(facing.right(), 1)) as i32;
     let same_door = |pos: (i32, i32, i32)| {
@@ -12169,7 +12179,7 @@ fn rail_update_at(reg: &BReg, dim: DimId, pos: (i32, i32, i32)) {
 /// `getStateForPlacement`: compute the write set for the resolved block name.
 /// The returned vector holds the cells to write in order (main block first,
 /// second halves after). `None` means the item does not resolve to a block.
-fn placement_states(reg: &BReg, item_name: &str, ctx: &PlacementCtx) -> Option<Vec<((i32, i32, i32), u32)>> {
+fn placement_states(reg: &BReg, item_name: &str, ctx: &PlacementCtx) -> Option<PlacementWrites> {
     let name = placement_block_name(item_name, ctx.face)?;
     let full = format!("minecraft:{name}");
     let st0 = reg.state_of(&full, None);
@@ -12208,7 +12218,7 @@ fn placement_states(reg: &BReg, item_name: &str, ctx: &PlacementCtx) -> Option<V
             "bottom"
         };
         st = reg.with_prop(st, "half", half);
-        if let Some(shaped) = reg.stair_after_neighbors(st, (tx, ty, tz), |p| get(p)) {
+        if let Some(shaped) = reg.stair_after_neighbors(st, (tx, ty, tz), &get) {
             st = shaped;
         }
     } else if is("_slab") {
@@ -12351,12 +12361,10 @@ fn placement_states(reg: &BReg, item_name: &str, ctx: &PlacementCtx) -> Option<V
         st = reg.with_prop(st, "facing", facing.property());
     } else if is("_lantern") {
         st = reg.with_prop(st, "hanging", if ctx.face == 0 { "true" } else { "false" });
-    } else if n == "ladder" || is("_wall_torch") {
-        if ctx.face < 2 {
-            return Some(Vec::new());
-        }
-        st = reg.with_prop(st, "facing", fdir.property());
-    } else if n.contains("_wall_") && reg.has_prop(&full, "facing") {
+    } else if n == "ladder"
+        || is("_wall_torch")
+        || (n.contains("_wall_") && reg.has_prop(&full, "facing"))
+    {
         if ctx.face < 2 {
             return Some(Vec::new());
         }
@@ -13211,7 +13219,7 @@ fn note_doors(x: i32, y: i32, z: i32) {
     let changed = block_at(x, y, z);
     for (dx, dy, dz, toward) in [(0i32, 1, 0, 0u8), (0, -1, 0, 1)] {
         let (qx, qy, qz) = (x + dx, y + dy, z + dz);
-        if qy < MIN_Y || qy >= MIN_Y + 384 {
+        if !(MIN_Y..MIN_Y + 384).contains(&qy) {
             continue;
         }
         let st = block_at(qx, qy, qz);
@@ -14585,6 +14593,8 @@ impl BandStore {
 
     /// Drop every cached band: the test-only cold start
     /// `clear_chunk_caches_for_tests` asks for.
+    #[cfg(test)]
+    #[cfg_attr(not(megu_vanilla_data), allow(dead_code))]
     fn clear(&self) {
         self.map.clear();
         self.order
@@ -14634,6 +14644,8 @@ impl SectionStore {
     /// Drop every published column: the test-only cold start
     /// `clear_chunk_caches_for_tests` asks for. `generation` is left alone —
     /// it names the generator the store was filled under, not a cache line.
+    #[cfg(test)]
+    #[cfg_attr(not(megu_vanilla_data), allow(dead_code))]
     fn clear(&self) {
         self.map.clear();
         self.order
@@ -14644,6 +14656,7 @@ impl SectionStore {
 
     /// Remove a column from the map and its slot in the eviction order.
     #[cfg(test)]
+    #[cfg_attr(not(megu_vanilla_data), allow(dead_code))]
     fn remove_column(&self, key: &DimChunkKey) -> Option<PublishedColumn> {
         self.order
             .lock()
@@ -14655,6 +14668,7 @@ impl SectionStore {
     /// Re-seat a column a test removed with `remove_column`: back in the map
     /// and at the newest end of the eviction order.
     #[cfg(test)]
+    #[cfg_attr(not(megu_vanilla_data), allow(dead_code))]
     fn insert_column(&self, key: DimChunkKey, column: PublishedColumn) {
         self.map.insert(key, column);
         self.order
@@ -15202,7 +15216,7 @@ fn bump_world_epoch_dim_opts(dim: DimId, x: i32, z: i32, blocking_changed: bool)
     if std::env::var_os("MEGU_CHUNK_PROF").is_some() {
         static N: AtomicU64 = AtomicU64::new(0);
         let n = N.fetch_add(1, Ordering::Relaxed);
-        if n % 64 == 0 {
+        if n.is_multiple_of(64) {
             eprintln!("[chunk-epoch] bump #{n} at ({x},{z}) seq={seq}");
         }
     }
@@ -15259,13 +15273,13 @@ fn cached_chunk_biomes(dim: DimId, cx: i32, cz: i32, sections: usize, min_y: i32
     }
     let arc = std::sync::Arc::new(cols);
     let mut guard = cache.lock().unwrap_or_else(|e| e.into_inner());
-    if guard.generation == seq {
-        if guard.map.insert((dim, cx, cz), std::sync::Arc::clone(&arc)).is_none() {
-            guard.order.push_back((dim, cx, cz));
-            while guard.order.len() > MAP_CHUNK_CACHE_CAP {
-                if let Some(old) = guard.order.pop_front() {
-                    guard.map.remove(&old);
-                }
+    if guard.generation == seq
+        && guard.map.insert((dim, cx, cz), std::sync::Arc::clone(&arc)).is_none()
+    {
+        guard.order.push_back((dim, cx, cz));
+        while guard.order.len() > MAP_CHUNK_CACHE_CAP {
+            if let Some(old) = guard.order.pop_front() {
+                guard.map.remove(&old);
             }
         }
     }
@@ -15815,7 +15829,7 @@ fn chunk_data_lane(
         // lava/torch glow leak through `gen_sources_here` into the light arrays.
         if occlude_ceil_y.is_some_and(|ceil| sy + 16 <= ceil) {
             PalettedSection::single(if sy < 0 { mask_deep } else { mask_shallow }, true, false)
-                .write_wire(&biomes, &mut data);
+                .write_wire(biomes, &mut data);
             // A masked section has no real base to carry: clearing both keeps the
             // next real section's vertical exposure reads on actual terrain (via
             // the band/overlay/base_state fallbacks) instead of a stale neighbor.
@@ -15834,7 +15848,7 @@ fn chunk_data_lane(
             let st = if sy + 15 < hmin - 4 { 1 } else { 0 };
             // A uniform section's wire is just its header; `single` avoids both the
             // 4096-cell stack array and the 4096-cell scan the legacy encoder would do.
-            PalettedSection::single(st, false, false).write_wire(&biomes, &mut data);
+            PalettedSection::single(st, false, false).write_wire(biomes, &mut data);
         } else {
             let mut arr = [0u32; 4096];
             // One terrain pass for the section: the previous shape took the worldgen
@@ -16170,9 +16184,9 @@ fn chunk_data_lane(
                 // `pack_section` was given, but written straight from the stored palette.
                 base.as_ref()
                     .expect("zero_repack requires a section")
-                    .write_wire(&biomes, &mut data);
+                    .write_wire(biomes, &mut data);
             } else {
-                section_encode_into(&mut data, &arr, &biomes);
+                section_encode_into(&mut data, &arr, biomes);
             }
             if let Some(t) = __tl {
                 chunkprof::add(&chunkprof::ENC_SECTION, t);
@@ -18511,8 +18525,8 @@ fn dwal_path_from_env() -> Option<std::path::PathBuf> {
 /// §5.2③ per-tick coalesced WAL buffer: the latest committed state per
 /// `(dim, x, y, z)`. A `BTreeMap` so the tick-end drain emits records in one
 /// deterministic sorted order.
-fn per_tick_wal_buffer() -> &'static Mutex<BTreeMap<(DimId, i32, i32, i32), u32>> {
-    static BUFFER: OnceLock<Mutex<BTreeMap<(DimId, i32, i32, i32), u32>>> = OnceLock::new();
+fn per_tick_wal_buffer() -> &'static PerTickWalBuffer {
+    static BUFFER: OnceLock<PerTickWalBuffer> = OnceLock::new();
     BUFFER.get_or_init(|| Mutex::new(BTreeMap::new()))
 }
 

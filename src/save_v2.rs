@@ -6161,6 +6161,13 @@ const MAX_BAR_PLAYERS: usize = 65_536;
 const MAX_TEAM_MEMBERS: usize = 65_536;
 const MAX_REGISTRY_STR: usize = 8_192;
 
+/// `(bar id, bar)` entries the `BAR1` footer round-trips.
+type SavedBossbars = Vec<(String, Bossbar)>;
+/// `(uuid, book)` entries the recipe-book footer round-trips.
+type SavedRecipeBooks = Vec<([u8; 16], PlayerRecipeBook)>;
+/// `(uuid, stats)` entries the player-stats footer round-trips.
+type SavedPlayerStats = Vec<([u8; 16], PlayerStats)>;
+
 fn write_registry_str(out: &mut Vec<u8>, value: &str) {
     assert!(
         value.len() <= MAX_REGISTRY_STR,
@@ -6212,7 +6219,7 @@ fn append_bossbar_footer(out: &mut Vec<u8>) {
 
 fn read_bossbar_footer(
     payload: &[u8],
-) -> Result<(&[u8], Vec<(String, Bossbar)>), &'static str> {
+) -> Result<(&[u8], SavedBossbars), &'static str> {
     let (payload, body) = split_save_footer(payload, BOSSBAR_MAGIC)?;
     let Some(body) = body else {
         return Ok((payload, Vec::new()));
@@ -6360,7 +6367,7 @@ fn read_team_footer(payload: &[u8]) -> Result<(&[u8], TeamRegistry), &'static st
     Ok((payload, reg))
 }
 
-fn restore_saved_bossbars(entries: Vec<(String, Bossbar)>) {
+fn restore_saved_bossbars(entries: SavedBossbars) {
     *bossbars().lock().unwrap_or_else(|e| e.into_inner()) =
         entries.into_iter().collect();
 }
@@ -6431,7 +6438,7 @@ fn read_book_recipe_set(input: &mut SaveInput<'_>) -> Result<BTreeSet<String>, &
 
 fn read_recipe_book_footer(
     payload: &[u8],
-) -> Result<(&[u8], Vec<([u8; 16], PlayerRecipeBook)>), &'static str> {
+) -> Result<(&[u8], SavedRecipeBooks), &'static str> {
     let (payload, body) = split_save_footer(payload, RECIPE_BOOK_MAGIC)?;
     let Some(body) = body else {
         return Ok((payload, Vec::new()));
@@ -6504,7 +6511,7 @@ fn append_player_stats_footer(out: &mut Vec<u8>) {
 
 fn read_player_stats_footer(
     payload: &[u8],
-) -> Result<(&[u8], Vec<([u8; 16], PlayerStats)>), &'static str> {
+) -> Result<(&[u8], SavedPlayerStats), &'static str> {
     let (payload, body) = split_save_footer(payload, PLAYER_STATS_MAGIC)?;
     let Some(body) = body else {
         return Ok((payload, Vec::new()));
@@ -6536,12 +6543,12 @@ fn read_player_stats_footer(
     Ok((payload, entries))
 }
 
-fn restore_saved_recipe_books(entries: Vec<([u8; 16], PlayerRecipeBook)>) {
+fn restore_saved_recipe_books(entries: SavedRecipeBooks) {
     *recipe_books().lock().unwrap_or_else(|e| e.into_inner()) =
         entries.into_iter().collect();
 }
 
-fn restore_saved_player_stats(entries: Vec<([u8; 16], PlayerStats)>) {
+fn restore_saved_player_stats(entries: SavedPlayerStats) {
     *player_stats().lock().unwrap_or_else(|e| e.into_inner()) =
         entries.into_iter().collect();
 }
