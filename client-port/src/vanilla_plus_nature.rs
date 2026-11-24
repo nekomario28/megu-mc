@@ -601,6 +601,135 @@ impl WeatherKind {
 }
 
 // ---------------------------------------------------------------------------
+// Pre-rain weather forecast & broken-cloud sky conditions
+// ---------------------------------------------------------------------------
+
+/// Rain-front forecast horizon: on the Megu server `rain_time` counts the
+/// remaining weather ticks down from at most 6000 — five real-time
+/// minutes of heads-up before rain starts or clears.
+pub const RAIN_FORECAST_HORIZON_TICKS: u32 = 6_000;
+
+/// Live weather inputs the client knows right now. Pure data: the caller
+/// fills it each frame from the vanilla rain ramp plus (on the Megu
+/// server) the `rain_time` countdown. External vanilla servers never
+/// share their weather clock, so they leave `ticks_until_rain_change` at
+/// `None` and [`evaluate_weather_cloud_conditions`] falls back to the
+/// early rain-strength ramp.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct WeatherForecastState {
+    /// Live vanilla rain ramp in `0.0..=1.0` (non-finite reads as `0.0`).
+    pub rain_strength: f32,
+    /// Ticks until the next rain flip when the server reports `rain_time`
+    /// (`0..=`[`RAIN_FORECAST_HORIZON_TICKS`]; larger values clamp to the
+    /// horizon). `None` on external vanilla servers.
+    pub ticks_until_rain_change: Option<u32>,
+    /// `true` while precipitation is actually falling.
+    pub currently_raining: bool,
+    /// Biome humidity curve: `0.0` arid desert, `0.5` plains/forest,
+    /// `1.0` jungle/swamp (non-finite reads as `0.5`).
+    pub biome_humidity: f32,
+}
+
+/// Resolved cloud/sky mood for one frame: how much broken cloud coverage
+/// the sky shows, how dark storm-cloud bellies read, how bright the
+/// sunlit silver linings glow, and how much the pre-front breeze picks
+/// up. Every field is finite and bounded for any input.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct CloudSkyConditions {
+    /// Broken-cloud coverage `0.12..=0.95`: sparse wisps in a dry desert,
+    /// patchy cumulus in clear plains, gathering thick decks ahead of
+    /// rain, near-overcast during rain.
+    pub broken_cloud_coverage: f32,
+    /// Beer-Lambert underside darkening `0.0..=1.0`: optically thick
+    /// storm bellies read as dramatic cool slate-grey.
+    pub underside_darkness: f32,
+    /// Silver-lining rim strength `0.0..=1.0`: bright sunlit edges where
+    /// the sun still peeks between broken cloud gaps.
+    pub silver_lining_strength: f32,
+    /// Pre-front wind multiplier `1.0..=1.8`: the breeze picks up
+    /// naturally as a rain front approaches.
+    pub pre_rain_wind_boost: f32,
+}
+
+impl Default for CloudSkyConditions {
+    /// Fair-weather baseline: sparse coverage, no darkening or lining,
+    /// unboosted breeze.
+    fn default() -> Self {
+        Self {
+            broken_cloud_coverage: 0.12,
+            underside_darkness: 0.0,
+            silver_lining_strength: 0.0,
+            pre_rain_wind_boost: 1.0,
+        }
+    }
+}
+
+/// Evaluates [`WeatherForecastState`] into [`CloudSkyConditions`].
+///
+/// Two data paths converge on one `gather` ramp in `0..=1` (how strongly
+/// a rain front is on top of us):
+///
+/// * **Megu server** — `ticks_until_rain_change = Some(t)` gives a real
+///   forecast: with `currently_raining == false` the decks gather over
+///   the countdown, most of the buildup landing in the last ~2 minutes;
+///   with `currently_raining == true` the same countdown instead becomes
+///   a `clearing` ramp that parts the deck and kindles silver linings
+///   before the rain actually ends.
+/// * **External vanilla server** — `None`: the early `rain_strength`
+///   ramp `0.01..0.35` already gathers and darkens clouds visibly before
+///   heavy rain hits, and `biome_humidity` keeps deserts clearer than
+///   jungles under the same sky.
+///
+/// Pure, finite and deterministic — no wall clock, no mod hardcoding.
+pub fn evaluate_weather_cloud_conditions(state: &WeatherForecastState) -> CloudSkyConditions {
+    let rain = clamped(state.rain_strength, 0.0, 1.0);
+    let humidity = finite_or(state.biome_humidity, 0.5).clamp(0.0, 1.0);
+
+    // The vanilla early-ramp fallback works on every server.
+    let mut gather = smoothstep(0.01, 0.35, rain);
+    let mut clearing = 0.0f32;
+    let mut approaching = 0.0f32;
+    if state.currently_raining {
+        // Falling rain keeps a strong overcast floor even at low ramp.
+        gather = gather.max(0.60 + 0.40 * rain);
+    }
+    if let Some(t) = state.ticks_until_rain_change {
+        // Front proximity: 0 at the 5-minute horizon -> 1 imminent.
+        let near = 1.0 - t.min(RAIN_FORECAST_HORIZON_TICKS) as f32
+            / RAIN_FORECAST_HORIZON_TICKS as f32;
+        if state.currently_raining {
+            // Rain is about to clear: the deck parts in the last stretch.
+            clearing = smoothstep(0.50, 0.95, near);
+        } else {
+            // Rain is coming: decks gather smoothly over the approach.
+            approaching = smoothstep(0.0, 1.0, near);
+            gather = gather.max(approaching);
+        }
+    }
+
+    // A departing front opens sunlit gaps again before it fully leaves.
+    let overcast = (gather * (1.0 - 0.45 * clearing)).clamp(0.0, 1.0);
+
+    // Humidity lifts both the clear-sky floor and how thick a gathering
+    // deck can get; Beer-Lambert belly darkening deepens with it too.
+    let coverage =
+        (0.12 + 0.16 * humidity + overcast * (0.52 + 0.24 * humidity)).clamp(0.12, 0.95);
+    let underside = (overcast * (0.55 + 0.45 * humidity)).clamp(0.0, 1.0);
+    // Sunbeams need broken sky: parting fronts blaze, mid-gather gaps
+    // glint; a closed overcast shows almost no lining.
+    let silver = (0.70 * clearing + 0.35 * gather * (1.0 - overcast) * (0.4 + 0.6 * humidity))
+        .clamp(0.0, 1.0);
+    let wind = 1.0 + 0.8 * gather.max(approaching);
+
+    CloudSkyConditions {
+        broken_cloud_coverage: coverage,
+        underside_darkness: underside,
+        silver_lining_strength: silver,
+        pre_rain_wind_boost: wind.clamp(1.0, 1.8),
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Seasonal ambience input (live Season Mod / SSN1 coupling)
 // ---------------------------------------------------------------------------
 
@@ -2715,6 +2844,143 @@ pub fn wind_sway_params_with_atmosphere(
 }
 
 // ---------------------------------------------------------------------------
+// Voxel DDA point-light shadow occlusion
+// ---------------------------------------------------------------------------
+
+/// Hard bound on traversal steps for [`voxel_point_light_visibility`]:
+/// a point light never needs to see past two dozen voxel faces, so the
+/// query stays O(1) microsecond-cheap for CPU/GPU dynamic-light culling.
+pub const MAX_LIGHT_SHADOW_STEPS: u32 = 24;
+
+/// Micro-offset (in blocks) applied to the two side taps of
+/// [`voxel_point_light_soft_visibility`].
+const SOFT_SHADOW_TAP_OFFSET: f32 = 0.24;
+
+/// Bounded Amanatides–Woo 3D voxel DDA from `light_pos` toward
+/// `target_pos`: walks the integer voxel grid, testing
+/// `is_opaque(x, y, z)` on every intermediate cell, and returns
+///
+/// * `1.0` — the light reaches `target_pos` unoccluded,
+/// * `0.0` — a solid cell blocks the segment (no torch/lantern/redstone
+///   light leaks through walls), an input is non-finite, or the
+///   `max_steps` budget ran out before the target cell was reached —
+///   fail closed everywhere: a light whose ray cannot be resolved
+///   contributes no light.
+///
+/// The light's own cell and the target surface cell are **not** tested:
+/// an emitter sitting inside a non-full block must still shine, and a
+/// lit block must not occlude itself. Rays that graze a voxel edge or
+/// corner step the tied axes together, so a diagonal that only touches a
+/// solid cell's corner is not counted as blocked. `max_steps` is clamped
+/// to [`MAX_LIGHT_SHADOW_STEPS`]. Pure `std`, NaN-safe, zero allocations.
+pub fn voxel_point_light_visibility<F>(
+    light_pos: [f32; 3],
+    target_pos: [f32; 3],
+    max_steps: u32,
+    mut is_opaque: F,
+) -> f32
+where
+    F: FnMut(i32, i32, i32) -> bool,
+{
+    if !light_pos.iter().chain(target_pos.iter()).all(|v| v.is_finite()) {
+        return 0.0;
+    }
+    let delta = [
+        target_pos[0] - light_pos[0],
+        target_pos[1] - light_pos[1],
+        target_pos[2] - light_pos[2],
+    ];
+    let len_sq = delta[0] * delta[0] + delta[1] * delta[1] + delta[2] * delta[2];
+    if !len_sq.is_finite() || len_sq < 1.0e-12 {
+        return 1.0; // same spot: nothing stands between light and target
+    }
+
+    let mut cell = [
+        light_pos[0].floor() as i32,
+        light_pos[1].floor() as i32,
+        light_pos[2].floor() as i32,
+    ];
+    let target_cell = [
+        target_pos[0].floor() as i32,
+        target_pos[1].floor() as i32,
+        target_pos[2].floor() as i32,
+    ];
+    if cell == target_cell {
+        return 1.0;
+    }
+
+    let len = len_sq.sqrt();
+    let dir = [delta[0] / len, delta[1] / len, delta[2] / len];
+    let mut step = [0i32; 3];
+    let mut t_max = [f32::INFINITY; 3];
+    let mut t_delta = [f32::INFINITY; 3];
+    for axis in 0..3 {
+        let d = dir[axis];
+        if d > 0.0 {
+            step[axis] = 1;
+            t_max[axis] = (cell[axis].saturating_add(1) as f32 - light_pos[axis]) / d;
+            t_delta[axis] = 1.0 / d;
+        } else if d < 0.0 {
+            step[axis] = -1;
+            t_max[axis] = (light_pos[axis] - cell[axis] as f32) / -d;
+            t_delta[axis] = 1.0 / -d;
+        }
+    }
+
+    for _ in 0..max_steps.min(MAX_LIGHT_SHADOW_STEPS) {
+        // Cross every boundary sharing the smallest t: a ray grazing an
+        // edge or corner steps the tied axes together and never enters
+        // the merely-touched cells.
+        let nearest = t_max[0].min(t_max[1]).min(t_max[2]);
+        for axis in 0..3 {
+            if t_max[axis] <= nearest {
+                t_max[axis] += t_delta[axis];
+                cell[axis] = cell[axis].saturating_add(step[axis]);
+            }
+        }
+        if cell == target_cell {
+            return 1.0;
+        }
+        if is_opaque(cell[0], cell[1], cell[2]) {
+            return 0.0;
+        }
+    }
+    // Step budget exhausted before the target cell: cannot prove the ray
+    // arrives, so the light contributes nothing.
+    0.0
+}
+
+/// 3-tap penumbra variant of [`voxel_point_light_visibility`]: the center
+/// ray plus two rays offset by [`SOFT_SHADOW_TAP_OFFSET`] around the
+/// target are averaged into `0.0`, `1/3`, `2/3` or `1.0`. Surfaces
+/// half-shaded by a voxel edge land on the smooth fractions instead of a
+/// hard 0/1 — a cheap deterministic penumbra for point-light rims.
+pub fn voxel_point_light_soft_visibility<F>(
+    light_pos: [f32; 3],
+    target_pos: [f32; 3],
+    max_steps: u32,
+    mut is_opaque: F,
+) -> f32
+where
+    F: FnMut(i32, i32, i32) -> bool,
+{
+    let mut probe = |dx: f32, dz: f32| {
+        voxel_point_light_visibility(
+            light_pos,
+            [
+                target_pos[0] + dx,
+                target_pos[1],
+                target_pos[2] + dz,
+            ],
+            max_steps,
+            &mut is_opaque,
+        )
+    };
+    let o = SOFT_SHADOW_TAP_OFFSET;
+    (probe(0.0, 0.0) + probe(o, o) + probe(-o, o)) / 3.0
+}
+
+// ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
 
@@ -3103,5 +3369,168 @@ mod tests {
             assert_eq!(src.matches('{').count(), src.matches('}').count());
             assert_eq!(src.matches('(').count(), src.matches(')').count());
         }
+    }
+
+    // -- Pre-rain weather forecast & cloud sky conditions -----------------
+
+    fn forecast(
+        rain: f32,
+        ticks: Option<u32>,
+        raining: bool,
+        humidity: f32,
+    ) -> CloudSkyConditions {
+        evaluate_weather_cloud_conditions(&WeatherForecastState {
+            rain_strength: rain,
+            ticks_until_rain_change: ticks,
+            currently_raining: raining,
+            biome_humidity: humidity,
+        })
+    }
+
+    #[test]
+    fn pre_rain_forecast_gathers_dark_decks_and_wind() {
+        // Megu server clock: one minute before the rain front hits vs a
+        // countdown beyond the 5-minute horizon (clear dry sky).
+        let soon = forecast(0.0, Some(1_200), false, 0.5);
+        let far = forecast(0.0, Some(24_000), false, 0.5);
+        assert!(
+            soon.broken_cloud_coverage > far.broken_cloud_coverage + 0.3,
+            "a minute out the deck must be markedly thicker: {} vs {}",
+            soon.broken_cloud_coverage,
+            far.broken_cloud_coverage
+        );
+        assert!(soon.underside_darkness > far.underside_darkness + 0.3);
+        assert!(soon.pre_rain_wind_boost > far.pre_rain_wind_boost);
+        assert!((far.broken_cloud_coverage - 0.2).abs() < 1e-6);
+        assert_eq!(far.underside_darkness, 0.0);
+        assert_eq!(far.pre_rain_wind_boost, 1.0);
+        // Every output is bounded and finite.
+        for c in [soon, far] {
+            assert!((0.12..=0.95).contains(&c.broken_cloud_coverage));
+            assert!((0.0..=1.0).contains(&c.underside_darkness));
+            assert!((0.0..=1.0).contains(&c.silver_lining_strength));
+            assert!((1.0..=1.8).contains(&c.pre_rain_wind_boost));
+        }
+        // Deterministic.
+        assert_eq!(soon, forecast(0.0, Some(1_200), false, 0.5));
+    }
+
+    #[test]
+    fn vanilla_fallback_ramp_and_humidity_drive_cloud_mood() {
+        // External vanilla server (no forecast clock): the early rain
+        // ramp still builds coverage and darkens undersides ahead of
+        // heavy rain.
+        let desert = forecast(0.15, None, true, 0.0);
+        let jungle = forecast(0.15, None, true, 1.0);
+        assert!(
+            desert.underside_darkness > 0.1,
+            "early ramp must already darken storm bellies"
+        );
+        assert!(desert.broken_cloud_coverage > 0.12);
+        assert!(
+            jungle.broken_cloud_coverage > desert.broken_cloud_coverage + 0.2,
+            "jungle must stay far cloudier than desert: {} vs {}",
+            jungle.broken_cloud_coverage,
+            desert.broken_cloud_coverage
+        );
+        assert!(jungle.underside_darkness > desert.underside_darkness);
+
+        // Bone-dry calm: sparse wisps at the coverage floor, no boost.
+        let dry_calm = forecast(0.0, None, false, 0.0);
+        assert!((dry_calm.broken_cloud_coverage - 0.12).abs() < 1e-6);
+        assert_eq!(dry_calm.underside_darkness, 0.0);
+        assert_eq!(dry_calm.silver_lining_strength, 0.0);
+        assert_eq!(dry_calm.pre_rain_wind_boost, 1.0);
+
+        // Megu parting front: rain with the clear-out countdown nearly
+        // done kindles silver linings vs steady rain far from clearing.
+        let parting = forecast(1.0, Some(300), true, 0.5);
+        let steady = forecast(1.0, Some(5_900), true, 0.5);
+        assert!(parting.silver_lining_strength > steady.silver_lining_strength);
+        assert!(parting.broken_cloud_coverage < steady.broken_cloud_coverage);
+    }
+
+    // -- Voxel DDA point-light shadow occlusion ----------------------------
+
+    #[test]
+    fn voxel_dda_visibility_corridor_wall_and_hostile_inputs() {
+        // Clear corridor: torch light reaches the surface.
+        let clear = voxel_point_light_visibility(
+            [0.5, 64.6, 0.5],
+            [4.5, 64.5, 0.5],
+            24,
+            |_x, _y, _z| false,
+        );
+        assert_eq!(clear, 1.0);
+
+        // A solid stone wall column at x=2 fully blocks the same ray.
+        let wall = voxel_point_light_visibility(
+            [0.5, 64.6, 0.5],
+            [4.5, 64.5, 0.5],
+            24,
+            |x, y, z| x == 2 && y == 64 && z == 0,
+        );
+        assert_eq!(wall, 0.0, "no light may leak through a wall");
+
+        // Diagonal shaft through open air stays lit.
+        let diag = voxel_point_light_visibility(
+            [-3.5, 70.5, -2.5],
+            [6.5, 64.5, 5.5],
+            24,
+            |_, _, _| false,
+        );
+        assert_eq!(diag, 1.0);
+
+        // Same cell: a lit block never occludes itself, even if opaque.
+        assert_eq!(
+            voxel_point_light_visibility([1.2, 64.3, 0.5], [1.8, 64.9, 0.9], 24, |_, _, _| true),
+            1.0
+        );
+        // Non-finite inputs fail closed without panic.
+        for (light, target) in [
+            ([f32::NAN, 0.0, 0.0], [4.5, 64.5, 0.5]),
+            ([0.0, 0.0, 0.0], [f32::INFINITY, 0.0, 0.0]),
+            ([f32::NEG_INFINITY, 1.0, 0.0], [0.0, 0.0, 0.0]),
+        ] {
+            assert_eq!(
+                voxel_point_light_visibility(light, target, 24, |_, _, _| false),
+                0.0
+            );
+        }
+        // Step budget exhausted before the target: fail closed.
+        assert_eq!(
+            voxel_point_light_visibility([0.5, 0.5, 0.5], [30.5, 0.5, 0.5], 4, |_, _, _| false),
+            0.0
+        );
+        // max_steps clamps to the kernel bound: a short hop still resolves.
+        assert_eq!(
+            voxel_point_light_visibility(
+                [0.5, 0.5, 0.5],
+                [5.5, 0.5, 0.5],
+                u32::MAX,
+                |_, _, _| false
+            ),
+            1.0
+        );
+    }
+
+    #[test]
+    fn voxel_dda_soft_visibility_smooths_wall_edges() {
+        // Wall column one row over: the centre ray threads the gap while
+        // both offset taps clip the wall -> a 1/3 penumbra instead of a
+        // hard 0/1 edge.
+        let light = [0.5, 64.5, 0.9];
+        let target = [4.5, 64.5, 0.9];
+        let wall = |x: i32, y: i32, z: i32| x == 3 && y == 64 && z == 1;
+        let hard = voxel_point_light_visibility(light, target, 24, wall);
+        assert_eq!(hard, 1.0, "centre ray must thread the gap");
+        let soft = voxel_point_light_soft_visibility(light, target, 24, wall);
+        assert!(
+            (soft - 1.0 / 3.0).abs() < 1e-6,
+            "two blocked taps must yield a 1/3 penumbra, got {soft}"
+        );
+        // Soft visibility stays bounded and deterministic.
+        assert!((0.0..=1.0).contains(&soft));
+        assert_eq!(soft, voxel_point_light_soft_visibility(light, target, 24, wall));
     }
 }

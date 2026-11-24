@@ -23,8 +23,8 @@ use megu_client_mesh::space_sky_bridge::{
 };
 use megu_client_mesh::vanilla_plus_3d::ExtrudedMesh;
 use megu_client_mesh::vanilla_plus_nature::{
-    cloud_deck_spec, CloudLighting, VoxelCloudCell, FACE_NEG_X, FACE_NEG_Y, FACE_NEG_Z,
-    FACE_POS_X, FACE_POS_Y, FACE_POS_Z,
+    cloud_deck_spec, CloudLighting, CloudSkyConditions, VoxelCloudCell, FACE_NEG_X, FACE_NEG_Y,
+    FACE_NEG_Z, FACE_POS_X, FACE_POS_Y, FACE_POS_Z,
 };
 
 use crate::subworld_render::{box_face_corners, SubWorldTransform, TerrainVertex};
@@ -360,6 +360,59 @@ impl AtmosphereParams {
             ]),
             sun_intensity: (p.sun_intensity * lum).clamp(0.0, 16.0),
         }
+    }
+
+    /// Pre-rain sky mood from a [`CloudSkyConditions`]: as
+    /// `underside_darkness` rises the zenith, horizon and fog ease toward
+    /// a moist cool slate-grey — the sky you actually see under a
+    /// gathering storm deck — fog thickens gently with the humidity, and
+    /// the sun dims. The blend saturates at 55% so the biome's own
+    /// palette always reads through: moody, never a harsh black skybox.
+    /// `silver_lining_strength` keeps a bright silver rim on the horizon
+    /// where the sun still peeks between broken decks.
+    ///
+    /// Zero darkness and zero lining return the sanitized input
+    /// unchanged; output channels stay finite and, for `0..=1` inputs,
+    /// inside `0..=1`.
+    pub fn apply_weather_cloud_mood(&self, conditions: &CloudSkyConditions) -> Self {
+        let p = self.sanitized();
+        let dark = clean(conditions.underside_darkness, 0.0).clamp(0.0, 1.0);
+        let silver = clean(conditions.silver_lining_strength, 0.0).clamp(0.0, 1.0);
+        let coverage = clean(conditions.broken_cloud_coverage, 0.0).clamp(0.0, 1.0);
+        if dark <= 0.0 && silver <= 0.0 {
+            return p;
+        }
+        // Cool wet-slate targets for a storm-covered sky.
+        const STORM_ZENITH: [f32; 3] = [0.22, 0.26, 0.34];
+        const STORM_HORIZON: [f32; 3] = [0.46, 0.51, 0.60];
+        const STORM_AMBIENT: [f32; 3] = [0.30, 0.33, 0.40];
+        // Silver-lining rim: bright cool highlight where the sun leaks
+        // between broken decks, fading as the deck closes overhead.
+        const SILVER_RIM: [f32; 3] = [0.93, 0.95, 1.00];
+
+        let w = 0.55 * dark;
+        let mut sky_horizon = lerp3(p.sky_horizon_rgb, STORM_HORIZON, w);
+        let mut fog_rgb = lerp3(p.fog_rgb, STORM_HORIZON, w);
+        let rim = 0.22 * silver * (1.0 - 0.6 * dark);
+        if rim > 0.0 {
+            sky_horizon = lerp3(sky_horizon, SILVER_RIM, rim);
+            fog_rgb = lerp3(fog_rgb, SILVER_RIM, rim * 0.8);
+        }
+        Self {
+            sky_zenith_rgb: lerp3(p.sky_zenith_rgb, STORM_ZENITH, w),
+            sky_horizon_rgb: sky_horizon,
+            fog_rgb,
+            // Moist air hazes up; a wide broken deck adds a little extra
+            // even where the undersides are still bright.
+            fog_density: (p.fog_density * (1.0 + 0.7 * dark + 0.25 * coverage))
+                .clamp(0.0, 4.0),
+            depth_tint_rgb: p.depth_tint_rgb,
+            depth_tint_strength: p.depth_tint_strength,
+            ambient_rgb: lerp3(p.ambient_rgb, STORM_AMBIENT, w * 0.8),
+            sun_intensity: (p.sun_intensity * (1.0 - 0.45 * dark) * (1.0 + 0.06 * silver))
+                .clamp(0.0, 16.0),
+        }
+        .sanitized()
     }
 
     /// The atmosphere a [`DimensionAdaptationPolicy`] implies: vacuum
@@ -1287,5 +1340,69 @@ mod tests {
             let p = blended.sanitized();
             assert_eq!(blended, p, "blend output must already be sanitized");
         }
+    }
+
+    #[test]
+    fn weather_cloud_mood_darkens_softly_and_stays_bounded() {
+        let base = AtmosphereParams::default();
+        // Fair-weather conditions leave the palette untouched.
+        let clear = base.apply_weather_cloud_mood(&CloudSkyConditions::default());
+        assert_eq!(clear, base.sanitized());
+
+        // Gathering storm: zenith eases toward slate, sun dims, fog
+        // thickens — but never blacks out.
+        let storm = base.apply_weather_cloud_mood(&CloudSkyConditions {
+            broken_cloud_coverage: 0.85,
+            underside_darkness: 0.8,
+            silver_lining_strength: 0.3,
+            pre_rain_wind_boost: 1.6,
+        });
+        for i in 0..3 {
+            assert!(
+                storm.sky_zenith_rgb[i] < base.sky_zenith_rgb[i],
+                "channel {i} must darken under a storm deck"
+            );
+        }
+        assert!(
+            storm.sky_zenith_rgb[2] > base.sky_zenith_rgb[2] * 0.5,
+            "darkening must stay comfortable, not harsh"
+        );
+        assert!(storm.sun_intensity < base.sun_intensity);
+        assert!(storm.fog_density > base.fog_density);
+        for c in storm
+            .sky_zenith_rgb
+            .iter()
+            .chain(storm.sky_horizon_rgb.iter())
+            .chain(storm.fog_rgb.iter())
+            .chain(storm.ambient_rgb.iter())
+        {
+            assert!((0.0..=1.0).contains(c), "channel {c} must stay in 0..=1");
+        }
+
+        // Parting sunbeams: a silver-lining rim lifts the horizon where
+        // the sun still leaks between broken decks.
+        let parting = base.apply_weather_cloud_mood(&CloudSkyConditions {
+            broken_cloud_coverage: 0.55,
+            underside_darkness: 0.3,
+            silver_lining_strength: 0.9,
+            pre_rain_wind_boost: 1.2,
+        });
+        let dark_only = base.apply_weather_cloud_mood(&CloudSkyConditions {
+            broken_cloud_coverage: 0.55,
+            underside_darkness: 0.3,
+            silver_lining_strength: 0.0,
+            pre_rain_wind_boost: 1.2,
+        });
+        for i in 0..3 {
+            assert!(parting.sky_horizon_rgb[i] > dark_only.sky_horizon_rgb[i]);
+        }
+        // Hostile NaN conditions fail closed to the clear palette.
+        let nan = base.apply_weather_cloud_mood(&CloudSkyConditions {
+            broken_cloud_coverage: f32::NAN,
+            underside_darkness: f32::NAN,
+            silver_lining_strength: f32::NAN,
+            pre_rain_wind_boost: f32::NAN,
+        });
+        assert_eq!(nan, base.sanitized());
     }
 }
