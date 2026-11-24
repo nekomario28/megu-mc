@@ -4465,8 +4465,7 @@ const VANILLA_ADVANCEMENT_EXPERIENCE: &[(&str, i32)] = &[
 /// (`minecraft:`-prefixed, sorted). Trigger firing resolves a game event to a
 /// named criterion on a definition; `grant_criterion` accepts the criterion
 /// only when it appears in that definition's requirement groups.
-#[cfg_attr(not(test), allow(dead_code))]
-#[cfg_attr(not(megu_vanilla_data), allow(dead_code))]
+#[cfg_attr(any(not(test), not(megu_vanilla_data)), allow(dead_code))]
 const VANILLA_ADVANCEMENT_TRIGGERS: &[&str] = &[
     "minecraft:allay_drop_item_on_block",
     "minecraft:avoid_vibration",
@@ -4531,8 +4530,7 @@ const TRUNCATED_ADVANCEMENT_CRITERIA: &[&str] = &["consume_i", "player_gene", "t
 
 /// Whether `trigger` (bare or `minecraft:`-prefixed) is one of the vanilla
 /// 1.21.1 advancement trigger types the catalogue references.
-#[cfg_attr(not(test), allow(dead_code))]
-#[cfg_attr(not(megu_vanilla_data), allow(dead_code))]
+#[cfg_attr(any(not(test), not(megu_vanilla_data)), allow(dead_code))]
 fn advancement_trigger_supported(trigger: &str) -> bool {
     let bare = trigger.strip_prefix("minecraft:").unwrap_or(trigger);
     VANILLA_ADVANCEMENT_TRIGGERS
@@ -9499,9 +9497,8 @@ pub(crate) fn respawn_anchor_comparator(charges: u8) -> u8 {
 
 /// What the lodestone dimension+position binding stores on the compass (the
 /// 1.21.1 `lodestone_target` component's tracked pos and dimension).
-#[cfg_attr(not(test), allow(dead_code))]
+#[cfg_attr(any(not(test), not(megu_vanilla_data)), allow(dead_code))]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[cfg_attr(not(megu_vanilla_data), allow(dead_code))]
 pub(crate) struct LodestoneTarget {
     pub dim: DimId,
     pub pos: BlockPos,
@@ -9511,9 +9508,8 @@ pub(crate) struct LodestoneTarget {
 /// right-clicking a lodestone. `validate` mirrors `LodestoneTracker` refresh —
 /// the binding clears (and the needle spins) once the block at the target is
 /// no longer a lodestone.
-#[cfg_attr(not(test), allow(dead_code))]
+#[cfg_attr(any(not(test), not(megu_vanilla_data)), allow(dead_code))]
 #[derive(Debug, Clone, Default)]
-#[cfg_attr(not(megu_vanilla_data), allow(dead_code))]
 pub(crate) struct LodestoneTracker {
     pub target: Option<LodestoneTarget>,
 }

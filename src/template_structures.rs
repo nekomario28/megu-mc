@@ -307,8 +307,7 @@ pub(crate) struct BlockEntityRecord {
     pub(crate) loot_table: Option<String>,
     pub(crate) loot_seed: Option<i64>,
     /// The container `Items` list as `BlockEntity.saveWithoutMetadata` writes it.
-    #[cfg_attr(not(test), allow(dead_code))]
-    #[cfg_attr(not(megu_vanilla_data), allow(dead_code))]
+    #[cfg_attr(any(not(test), not(megu_vanilla_data)), allow(dead_code))]
     pub(crate) items: Option<Tag>,
     /// Entity id inside `SpawnData.entity.id` for `minecraft:mob_spawner`.
     pub(crate) spawner_entity: Option<String>,

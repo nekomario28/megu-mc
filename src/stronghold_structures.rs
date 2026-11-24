@@ -29,8 +29,7 @@ pub(crate) enum StrongholdKind {
 }
 
 impl StrongholdKind {
-    #[cfg_attr(not(test), allow(dead_code))]
-    #[cfg_attr(not(megu_vanilla_data), allow(dead_code))]
+    #[cfg_attr(any(not(test), not(megu_vanilla_data)), allow(dead_code))]
     pub(crate) fn name(self) -> &'static str {
         match self {
             Self::Start => "StartPiece",
@@ -150,8 +149,7 @@ impl StrongholdPiece {
     }
 
     /// The oracle's piece signature: identity, box, depth, orientation, door, flags.
-    #[cfg_attr(not(test), allow(dead_code))]
-    #[cfg_attr(not(megu_vanilla_data), allow(dead_code))]
+    #[cfg_attr(any(not(test), not(megu_vanilla_data)), allow(dead_code))]
     pub(crate) fn signature(&self) -> String {
         let b = self.bounds;
         let orient = match self.orientation {
@@ -975,8 +973,7 @@ pub(crate) fn generate_stronghold_pieces_with_rng(
     }
 }
 
-#[cfg_attr(not(test), allow(dead_code))]
-#[cfg_attr(not(megu_vanilla_data), allow(dead_code))]
+#[cfg_attr(any(not(test), not(megu_vanilla_data)), allow(dead_code))]
 pub(crate) fn generate_stronghold_pieces(
     seed: u64,
     chunk_x: i32,

@@ -23,8 +23,7 @@ pub(crate) struct EntityInfo {
 /// filter tests, `id` is the entity type the constructor resolves, and
 /// `yaw`/`pitch` are what `moveTo` applies (`pitch` is never transformed).
 #[derive(Clone, Debug, PartialEq)]
-#[cfg_attr(not(test), allow(dead_code))]
-#[cfg_attr(not(megu_vanilla_data), allow(dead_code))]
+#[cfg_attr(any(not(test), not(megu_vanilla_data)), allow(dead_code))]
 pub(crate) struct PlacedEntity {
     pub pos: [f64; 3],
     pub block_pos: Pos,
@@ -120,8 +119,7 @@ fn state_from_json(value: &crate::json::J, reg: &BReg) -> Result<u32, &'static s
 /// as exactly two floats. A missing list defaults both to `0.0`; a present one
 /// that is not a float list fails closed — the spawn path would otherwise lose
 /// the entity to `loadEntityRecursive`'s empty `Optional`.
-#[cfg_attr(not(test), allow(dead_code))]
-#[cfg_attr(not(megu_vanilla_data), allow(dead_code))]
+#[cfg_attr(any(not(test), not(megu_vanilla_data)), allow(dead_code))]
 fn entity_rotation(nbt: &Tag) -> Result<(f32, f32), &'static str> {
     let Some(tag) = nbt.get("Rotation") else {
         return Ok((0.0, 0.0));
@@ -144,8 +142,7 @@ fn entity_rotation(nbt: &Tag) -> Result<(f32, f32), &'static str> {
 }
 
 /// `Mth.wrapDegrees`: fold an angle into `[-180, 180)`.
-#[cfg_attr(not(test), allow(dead_code))]
-#[cfg_attr(not(megu_vanilla_data), allow(dead_code))]
+#[cfg_attr(any(not(test), not(megu_vanilla_data)), allow(dead_code))]
 fn wrap_degrees(angle: f32) -> f32 {
     let wrapped = angle % 360.0;
     if wrapped >= 180.0 {
@@ -166,8 +163,7 @@ fn wrap_degrees(angle: f32) -> f32 {
 /// (`bsr.a(dmm)`) is `wrapDegrees(yaw)` plus 0/90/180/270 for
 /// none/CW90/CW180/CCW90. `getYRot()` in the subtraction is the stored yaw
 /// un-updated, so `w` is used twice rather than the wrapped result replacing it.
-#[cfg_attr(not(test), allow(dead_code))]
-#[cfg_attr(not(megu_vanilla_data), allow(dead_code))]
+#[cfg_attr(any(not(test), not(megu_vanilla_data)), allow(dead_code))]
 fn transformed_yaw(
     raw_yaw: f32,
     mirror: crate::structure_transform::Mirror,
@@ -1759,8 +1755,7 @@ impl Template {
     /// here because a malformed entity silently vanishes in native
     /// (`loadEntityRecursive` answers `Optional.empty`) and this port's contract
     /// is to refuse it instead.
-    #[cfg_attr(not(test), allow(dead_code))]
-    #[cfg_attr(not(megu_vanilla_data), allow(dead_code))]
+    #[cfg_attr(any(not(test), not(megu_vanilla_data)), allow(dead_code))]
     pub(crate) fn transformed_entities(
         &self,
         placement: Placement,

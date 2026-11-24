@@ -762,7 +762,7 @@ fn entity_type_matches(expected: &str, actual: Option<&str>) -> bool {
             "minecraft:skeletons" => ENTITY_TYPE_SKELETONS,
             _ => return false,
         };
-        members.iter().any(|member| *member == actual)
+        members.contains(&actual)
     } else {
         expected == actual
     }
@@ -2170,11 +2170,11 @@ pub(crate) fn vanilla_loot_roll(id: &str, seed: i64) -> Vec<LootEntry> {
     loot_items_to_entries(items, &mut rng)
 }
 
-/// Dedicated per-table generators: one function per loot-table base name so
-/// each vanilla table has a named producer. For the few base names shared by
-/// two tables (`bogged`, `consumables`, `corridor`, `desert_pyramid`, `key`)
-/// the function rolls the alphabetically-first table id; `vanilla_loot_roll`
-/// reaches every id exactly.
+// Dedicated per-table generators: one function per loot-table base name so
+// each vanilla table has a named producer. For the few base names shared by
+// two tables (`bogged`, `consumables`, `corridor`, `desert_pyramid`, `key`)
+// the function rolls the alphabetically-first table id; `vanilla_loot_roll`
+// reaches every id exactly.
 
 #[allow(dead_code)]
 fn allay(seed: i64) -> Vec<LootEntry> {
@@ -3122,9 +3122,13 @@ fn zombified_piglin(seed: i64) -> Vec<LootEntry> {
 }
 
 
+/// `(canonical vanilla table id, dedicated generator)` pair.
+#[allow(dead_code)]
+type VanillaLootGenerator = (&'static str, fn(i64) -> Vec<LootEntry>);
+
 /// `(canonical vanilla table id, dedicated generator)` registry.
 #[allow(dead_code)]
-pub(crate) static VANILLA_LOOT_GENERATORS: &[(&str, fn(i64) -> Vec<LootEntry>)] = &[
+pub(crate) static VANILLA_LOOT_GENERATORS: &[VanillaLootGenerator] = &[
     ("minecraft:archaeology/desert_pyramid", desert_pyramid),
     ("minecraft:archaeology/desert_well", desert_well),
     ("minecraft:archaeology/ocean_ruin_cold", ocean_ruin_cold),

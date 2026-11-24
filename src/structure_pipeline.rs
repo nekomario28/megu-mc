@@ -250,8 +250,7 @@ struct SetDef {
 struct Defs {
     sets: Vec<SetDef>,
     set_meta: Vec<SetMeta>,
-    #[cfg_attr(not(test), allow(dead_code))]
-    #[cfg_attr(not(megu_vanilla_data), allow(dead_code))]
+    #[cfg_attr(any(not(test), not(megu_vanilla_data)), allow(dead_code))]
     by_id: HashMap<String, usize>,
     structures: HashMap<String, StructureDef>,
     struct_ids: Vec<String>,
@@ -732,8 +731,7 @@ fn ring_admit(d: &Defs, g: &mut Gen, set: usize, x: i32, z: i32) -> bool {
     false
 }
 
-#[cfg_attr(not(test), allow(dead_code))]
-#[cfg_attr(not(megu_vanilla_data), allow(dead_code))]
+#[cfg_attr(any(not(test), not(megu_vanilla_data)), allow(dead_code))]
 fn ring_chunks(d: &Defs, g: &mut Gen, set: usize) -> std::sync::Arc<HashSet<(i32, i32)>> {
     let seed = g.wseed();
     let tag = preset_tag(g.preset);
@@ -761,8 +759,7 @@ fn ring_chunks(d: &Defs, g: &mut Gen, set: usize) -> std::sync::Arc<HashSet<(i32
 /// [`ring_chunks`]'s computation, without the caches: the eager concentric-ring scan,
 /// which reads the biome quart sweep for all 128 candidates and threads one `last`
 /// hint across them. Kept as the reference the lazy path is tested against.
-#[cfg_attr(not(test), allow(dead_code))]
-#[cfg_attr(not(megu_vanilla_data), allow(dead_code))]
+#[cfg_attr(any(not(test), not(megu_vanilla_data)), allow(dead_code))]
 fn ring_chunks_uncached(d: &Defs, g: &mut Gen, set: usize) -> HashSet<(i32, i32)> {
     let seed = g.wseed();
     if g.preset != worldgen::NoisePreset::Overworld {
@@ -1082,8 +1079,7 @@ fn with_templates<R>(f: impl FnOnce(&Templates) -> R) -> R {
     f(&templates)
 }
 
-#[cfg_attr(not(test), allow(dead_code))]
-#[cfg_attr(not(megu_vanilla_data), allow(dead_code))]
+#[cfg_attr(any(not(test), not(megu_vanilla_data)), allow(dead_code))]
 fn valid_biome(g: &mut Gen, allowed: &HashSet<String>, pos: (i32, i32, i32)) -> bool {
     valid_biome_fast(g, allowed, None, pos)
 }
