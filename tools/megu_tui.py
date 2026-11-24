@@ -24,6 +24,12 @@ Log filters (also available interactively with 'f'):
     alerts   warnings, errors, security, quarantine and chunk-hotspot alerts
     all      the raw server log, telemetry lines included
 
+Startup banner:
+    The classic six-line MEGU logo is written once at the top of the scrolling
+    log (never pinned to the three-line HUD) so it scrolls away as events
+    arrive, like Mohist / Paper / Purpur. `--no-banner` (or MEGU_NO_BANNER=1 /
+    NO_BANNER=1) skips it; `--log-filter alerts` never shows it.
+
 Fallback contract (zero side effects in pipes, CI, and headless logs):
   * stdout not a TTY, TERM unset/dumb/unknown, NO_COLOR set, or an explicit
     --plain / --no-tui / --cli / --nogui flag -> plain stdio passthrough.
@@ -99,6 +105,27 @@ STOP_COMMAND = "stop"
 ESCALATE_GRACE = 4.0
 LOG_FILTERS = ("events", "alerts", "all")
 LOG_FILTER_TITLES = {"events": "Events", "alerts": "Alerts", "all": "All log"}
+
+# The classic six-line MEGU startup banner. It is written once into the
+# scrolling log at boot (never pinned to the HUD) so it scrolls away like the
+# startup art of Mohist / Paper / Purpur.
+LOGO = (
+    "███╗   ███╗███████╗ ██████╗ ██╗   ██╗",
+    "████╗ ████║██╔════╝██╔════╝ ██║   ██║",
+    "██╔████╔██║█████╗  ██║  ███╗██║   ██║",
+    "██║╚██╔╝██║██╔══╝  ██║   ██║██║   ██║",
+    "██║ ╚═╝ ██║███████╗╚██████╔╝╚██████╔╝",
+    "╚═╝     ╚═╝╚══════╝ ╚═════╝  ╚═════╝ ",
+)
+LOGO_ASCII = (
+    "##   ## ######  ####  ##   ##",
+    "### ### ##     ##  ## ##   ##",
+    "## # ## ####   ##     ##   ##",
+    "##   ## ##     ## ### ##   ##",
+    "##   ## ##     ##  ##  ## ## ",
+    "##   ## ######  ####    ###  ",
+)
+BANNER_LINE_SET = frozenset(line.rstrip() for line in LOGO + LOGO_ASCII)
 
 
 # ---------------------------------------------------------------- text utils
@@ -260,6 +287,7 @@ RE_STATUS = re.compile(
     r"^Status:\s+(\w+)\s+\(([0-9.]+)\s+TPS,\s*([0-9.]+)\s+ms/tick\)")
 RE_PLAYERS = re.compile(r"^Players:\s+(\d+)/(\d+)(?:\s+\(([^)]*)\))?")
 RE_CHUNKS = re.compile(r"^Loaded chunks:\s+(\d+)")
+RE_WORLD_CHUNKS = re.compile(r"WorldSummary\(chunks=(\d+)")
 RE_MEMORY = re.compile(r"^Memory:\s+(\d+)\s+MB")
 RE_MODS_STATUS = re.compile(
     r"^Mods:\s+(\d+)\s+native(?:\s*,\s*(\d+)\s+compatibility mode)?")
@@ -314,6 +342,29 @@ def hotspot_coords(line):
     return None
 
 
+def startup_banner(ascii_mode=False):
+    """The six startup banner rows for the requested glyph set."""
+    return LOGO_ASCII if ascii_mode else LOGO
+
+
+def is_banner_line(line):
+    """Whether a captured log line is one of the startup banner rows."""
+    return line.rstrip() in BANNER_LINE_SET
+
+
+def banner_disabled(args, env):
+    """True when --no-banner or MEGU_NO_BANNER/NO_BANNER asks to skip it."""
+    if getattr(args, "no_banner", False):
+        return True
+    for name in ("MEGU_NO_BANNER", "NO_BANNER"):
+        value = env.get(name)
+        if value is None:
+            continue
+        if value.strip().lower() not in ("", "0", "false", "no", "off"):
+            return True
+    return False
+
+
 def _looks_telemetry(line):
     stripped = line.lstrip()
     lower = stripped.lower()
@@ -326,8 +377,10 @@ def _looks_telemetry(line):
 
 
 def classify_line(line):
-    """Best-effort category for a raw line: event, alert, or telemetry."""
+    """Best-effort category for a raw line: banner, event, alert, telemetry."""
     lower = line.lower()
+    if is_banner_line(line):
+        return "banner"
     if _looks_telemetry(line):
         return "telemetry"
     if (RE_FATAL.search(line) or RE_ERROR.search(line) or RE_WARN.search(line)
@@ -339,6 +392,8 @@ def classify_line(line):
 
 def classify_kind(line, kind):
     """Category for a parsed log line, using the decoder's match kind."""
+    if kind == "banner" or is_banner_line(line):
+        return "banner"
     if kind in ("tick", "size", "ms_per_chunk") or _looks_telemetry(line):
         return "telemetry"
     if kind in ("hotspot", "quarantine"):
@@ -393,6 +448,23 @@ class MetricsParser:
         self.log = collections.deque(maxlen=log_lines)
         self.log_categories = collections.deque(maxlen=log_lines)
         self.lines_seen = 0
+        self.banner_added = False
+
+    def inject_banner(self, ascii_mode=False):
+        """Write the startup banner once at the top of the scrolling log.
+
+        Banner lines are not fed through the decoder: they are decorative,
+        never counted as warnings/errors, and carry the dedicated `banner`
+        category so `--log-filter alerts` stays alerts-only.
+        """
+        if self.banner_added:
+            return False
+        for line in startup_banner(ascii_mode):
+            self.log.append(line)
+            self.log_categories.append("banner")
+        self.banner_added = True
+        self.revision += 1
+        return True
 
     # -- decoding ---------------------------------------------------------
 
@@ -407,6 +479,9 @@ class MetricsParser:
         return kind
 
     def _decode(self, line):
+        if is_banner_line(line):
+            return "banner"
+
         mspc = ms_per_chunk_from(line)
         if mspc is not None:
             self.ms_per_chunk.append(mspc)
@@ -548,7 +623,7 @@ class MetricsParser:
                 }
             return "players"
 
-        match = RE_CHUNKS.search(line)
+        match = RE_CHUNKS.search(line) or RE_WORLD_CHUNKS.search(line)
         if match:
             self.loaded_chunks = int(match.group(1))
             return "chunks"
@@ -924,13 +999,39 @@ def _pack_segments(segments, cols):
     return lines
 
 
+def _player_card_compact(snap, color):
+    online = snap.get("players_online", 0)
+    players_max = snap.get("players_max")
+    max_text = str(players_max) if players_max is not None else "?"
+    text = f"Players {online}/{max_text}"
+    if not online:
+        text += " (idle)"
+    return paint(text, "white" if online else "grey", color)
+
+
+def _mods_card_compact(snap, color):
+    mods = snap.get("mods", {})
+    active = int(mods.get("native", 0)) + int(mods.get("shim", 0))
+    return paint(f"Mods: {active} active", "cyan", color)
+
+
 def _cards(snap, cols, ascii_mode, color):
     segments = [
         _player_card(snap, ascii_mode, color),
         _guard_card(snap, cols, ascii_mode, color),
         _mods_card(snap, ascii_mode, color),
     ]
-    return _pack_segments(segments, cols)
+    packed = _pack_segments(segments, cols)
+    if len(packed) == 1:
+        return packed
+    # The pinned HUD is strictly three lines: keep the summary on one line by
+    # dropping optional detail (player names, fallback/warning counts).
+    compact = [
+        _player_card_compact(snap, color),
+        _guard_card(snap, cols, ascii_mode, color),
+        _mods_card_compact(snap, color),
+    ]
+    return _pack_segments(compact, cols)
 
 
 def _log_category_entries(snap):
@@ -993,6 +1094,8 @@ def _color_log_line(entry, color):
     if not color:
         return line
     category = entry.get("category")
+    if category == "banner":
+        return paint(line, "purple", color)
     if category == "alert":
         name = "red" if (RE_FATAL.search(line) or RE_ERROR.search(line)) \
             else "yellow"
@@ -1015,7 +1118,8 @@ def _log_section(snap, body_rows, cols, ascii_mode, color, log_filter, dot):
     mode = normalize_log_filter(log_filter)
     entries = selected_log_entries(snap, mode)
     if mode == "events":
-        hidden = max(0, int(snap.get("lines_seen", 0)) - len(entries))
+        hidden = sum(1 for entry in _log_category_entries(snap)
+                     if entry.get("category") == "telemetry")
         detail = "filter:events"
         if hidden:
             detail += f"{dot}{hidden} telemetry hidden"
@@ -1202,37 +1306,30 @@ def render_frame(snap, cols, rows, ascii_mode=False, color=False, ui=None,
 # -------------------------------------------------------------- demo content
 
 DEMO_LOG = """\
-[config] loaded server.toml (profile default)
-[anvil] loaded world: WorldSummary(chunks=1284, players=3)
-[live-mods] auto-adapt: scanned 5 jar(s) for target 1.21.1
 [live-mods] 5 jar(s): 1 auto-skipped, 2 native-bundle, 1 tier2-shim, 1 tier3
-[live-mods] dual-loader: 2 unified, 1 client-only, 0 superseded, 0 rejected, 0 duplicate ids, 0 missing deps, 3 verified damage hooks
 [live-mods] weirdmod.jar (weirdmod) tier3: 412 classes, 9 site(s) - mixin target missing
 [live-mods] liftcraft.jar (liftcraft) tier2 shim: 208 classes, 4 site(s) - damage hooks lifted
-[tick] observed_tps=19.97 avg_work_ms=8.21 max_work_ms=21.44 over_budget=0/100
+[anvil] loaded world: WorldSummary(chunks=1284, players=3)
+[tick] observed_tps=19.90 avg_work_ms=11.50 max_work_ms=15.77 over_budget=0/100
 megu v1.21.1 listening 127.0.0.1:25565 (offline identities; no Mojang authentication)
-[lan] advertising "Megu demo server" on port 25565
-[spine] Alice joined from 127.0.0.1:51112 (uuid 0123456789abcdef0123456789abcdef)
 [spine] Bob joined from 127.0.0.1:51130 (uuid fedcba9876543210fedcba9876543210)
-[chat] Alice: hello from the demo world
-[sz] t=400 VmRSS: 523264 kB | mobs=42 drops=7 xps=3 arrows=0 bob=1 pearl=0 primed=0 chests=18 furn=6 crops=11 world=0 inv=2 clients=2
-[tick] observed_tps=19.41 avg_work_ms=44.10 max_work_ms=58.02 over_budget=3/100
-[spine] Alice left (from 127.0.0.1:51112)
-Status: Running (19.9 TPS, 11.5 ms/tick)
-Players: 2/20 (Bob, Carol)
-Loaded chunks: 1284
-Memory: 511 MB
-Mods: 2 native, 1 compatibility mode
-[tick] observed_tps=19.95 avg_work_ms=9.02 max_work_ms=15.77 over_budget=0/100
-[security] velocity forwarding refused for Mallory from 10.0.0.9: missing forwarding secret
 [sz] t=500 VmRSS: 524288 kB | mobs=44 drops=8 xps=4 arrows=0 bob=0 pearl=0 primed=0 chests=18 furn=6 crops=12 world=0 inv=2 clients=2
+Players: 2/20 (Bob, Carol)
+[security] velocity forwarding refused for Mallory from 10.0.0.9: missing forwarding secret
 [chunkprof] window=60s chunks=1284 (4.2 ms/chunk) map=15.8ms entities=91
 """
 
 
-def demo_parser():
-    """A deterministic snapshot: canned realistic log plus a synthetic wave."""
+def demo_parser(include_banner=True, ascii_banner=False):
+    """A deterministic snapshot: canned realistic log plus a synthetic wave.
+
+    The startup banner is written before the first server line unless the
+    caller (or --no-banner) opts out. It is ordinary scrolling log content,
+    not pinned chrome, so a long session naturally scrolls it away.
+    """
     parser = MetricsParser()
+    if include_banner:
+        parser.inject_banner(ascii_mode=ascii_banner)
     for line in DEMO_LOG.splitlines():
         parser.feed(line)
     parser.threads = 14
@@ -1699,6 +1796,8 @@ def run_tui(command, args):
         return 2
 
     parser = MetricsParser()
+    if not getattr(args, "no_banner", False):
+        parser.inject_banner(ascii_mode=getattr(args, "ascii_mode", False))
     lock = threading.Lock()
     state = {"quit": False, "stopping": False, "stop_sent": False,
              "view": "log", "cmd_mode": False, "cmd_buf": "",
@@ -1802,6 +1901,7 @@ def build_parser():
             "  %(prog)s --server-bin ./target/release/megu -- --port 25565\n"
             "  %(prog)s --demo-frame --cols 92 --rows 22\n"
             "  %(prog)s --demo-frame --log-filter all --ascii\n"
+            "  %(prog)s --demo-frame --no-banner --ascii\n"
             "  %(prog)s --cli --server-bin ./megu -- --port 25565\n"
             "  %(prog)s --render-snapshot server.log --log-filter alerts\n"
         ),
@@ -1825,6 +1925,9 @@ def build_parser():
                         help="force ANSI color in frame modes even when piped")
     parser.add_argument("--log-filter", choices=LOG_FILTERS, default="events",
                         help="event log filter: events (default), alerts, all")
+    parser.add_argument("--no-banner", action="store_true",
+                        help="skip the startup MEGU banner in the scrolling log"
+                             " (also MEGU_NO_BANNER=1 / NO_BANNER=1)")
     parser.add_argument("--demo-frame", action="store_true",
                         help="render one deterministic demo frame and exit")
     parser.add_argument("--render-snapshot", metavar="FILE",
@@ -1847,14 +1950,19 @@ def main(argv=None):
     argv = sys.argv[1:] if argv is None else argv
     own_args, server_args = split_argv(argv)
     args = build_parser().parse_args(own_args)
+    args.no_banner = banner_disabled(args, os.environ)
 
     size = shutil.get_terminal_size(fallback=(DEFAULT_COLS, DEFAULT_ROWS))
     cols = args.cols if args.cols > 0 else size.columns
     rows = args.rows if args.rows > 0 else size.lines
 
     if args.demo_frame or args.render_snapshot is not None:
-        parser = demo_parser() if args.demo_frame else snapshot_from_file(
-            args.render_snapshot)
+        if args.demo_frame:
+            parser = demo_parser(
+                include_banner=not args.no_banner,
+                ascii_banner=args.ascii_mode or args.plain)
+        else:
+            parser = snapshot_from_file(args.render_snapshot)
         if parser is None:
             return 2
         frame = render_frame(

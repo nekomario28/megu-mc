@@ -358,6 +358,37 @@ class MetricsParserTest(unittest.TestCase):
         self.assertEqual(megu_tui.normalize_log_filter("bogus"), "events")
         self.assertEqual(megu_tui.normalize_log_filter("all"), "all")
 
+    def test_injected_banner_is_categorized_and_not_an_alert(self):
+        parser = megu_tui.MetricsParser()
+        self.assertTrue(parser.inject_banner())
+        self.assertFalse(parser.inject_banner())
+        parser.feed("[config] first server line")
+        snap = parser.snapshot()
+        banner = [entry for entry in snap["event_log"]
+                  if entry["category"] == "banner"]
+        self.assertEqual(len(banner), len(megu_tui.LOGO))
+        self.assertEqual([entry["line"] for entry in banner],
+                         list(megu_tui.LOGO))
+        self.assertEqual(snap["event_log"][0]["category"], "banner")
+        self.assertEqual(snap["lines_seen"], 1)
+        self.assertEqual(snap["warnings"], 0)
+        self.assertEqual(snap["errors"], 0)
+        self.assertEqual(snap["panics"], 0)
+        alerts = megu_tui.filtered_log_lines(snap, "alerts")
+        self.assertFalse(any(line in megu_tui.LOGO for line in alerts))
+        events = megu_tui.filtered_log_lines(snap, "events")
+        self.assertEqual(events[:len(megu_tui.LOGO)], list(megu_tui.LOGO))
+
+    def test_captured_banner_lines_are_recognized_without_counting(self):
+        parser = megu_tui.MetricsParser()
+        for line in megu_tui.LOGO_ASCII:
+            parser.feed(line)
+        snap = parser.snapshot()
+        self.assertEqual(snap["log_categories"],
+                         ["banner"] * len(megu_tui.LOGO_ASCII))
+        self.assertEqual(snap["warnings"], 0)
+        self.assertEqual(snap["errors"], 0)
+
     def test_hotspot_line_sets_guard_alert(self):
         parser = megu_tui.MetricsParser()
         parser.feed("Players: 2/20 (Bob, Carol)")
@@ -475,17 +506,76 @@ class FrameLayoutTest(unittest.TestCase):
         for line in lines:
             self.assertEqual(megu_tui.vlen(line), 100)
 
-    def test_no_bloated_logo_and_one_line_header(self):
-        self.assertFalse(hasattr(megu_tui, "LOGO"))
-        self.assertFalse(hasattr(megu_tui, "LOGO_ASCII"))
-        lines = self.frame(120, 36)
-        text = "\n".join(megu_tui.strip_ansi(line) for line in lines)
-        self.assertNotIn("███", text)
-        self.assertNotIn("╔", text)
-        header = megu_tui.strip_ansi(lines[0])
-        self.assertIn("MEGU 1.21.1", header)
-        self.assertEqual(text.count("MEGU 1.21.1"), 1)
-        self.assertEqual(header.strip().count("ONLINE"), 1)
+    def test_logo_constants_are_six_line_banners(self):
+        self.assertEqual(len(megu_tui.LOGO), 6)
+        self.assertEqual(len(megu_tui.LOGO_ASCII), 6)
+        for line in megu_tui.LOGO_ASCII:
+            self.assertTrue(line.isascii(), line)
+        # The unicode banner uses the classic block-letter wordmark.
+        self.assertIn("█", megu_tui.LOGO[0])
+        self.assertIn("╚", megu_tui.LOGO[-1])
+        self.assertEqual(megu_tui.startup_banner(False), megu_tui.LOGO)
+        self.assertEqual(megu_tui.startup_banner(True), megu_tui.LOGO_ASCII)
+
+    def test_pinned_header_is_three_compact_lines(self):
+        for cols, rows in ((80, 24), (120, 36)):
+            plain = [megu_tui.strip_ansi(line)
+                     for line in self.frame(cols, rows)]
+            self.assertIn("MEGU 1.21.1", plain[0])
+            self.assertIn("ONLINE", plain[0])
+            self.assertIn("HEALTH", plain[1])
+            self.assertIn("TPS", plain[1])
+            self.assertIn("Players 2/20", plain[2])
+            self.assertIn("Chunks 1,284", plain[2])
+            self.assertIn("Guard: OK", plain[2])
+            self.assertIn("Mods: 3 active", plain[2])
+            # The logo is scrolling content, never pinned chrome.
+            for line in plain[:3]:
+                for logo_line in megu_tui.LOGO + megu_tui.LOGO_ASCII:
+                    self.assertNotIn(logo_line.rstrip(), line)
+            self.assertTrue(plain[3].lstrip().startswith("Events"), plain[3])
+
+    def test_startup_banner_is_in_the_scrolling_log(self):
+        plain = [megu_tui.strip_ansi(line).rstrip()
+                 for line in self.frame(120, 36)]
+        section = next(index for index, line in enumerate(plain)
+                       if line.lstrip().startswith("Events"))
+        positions = []
+        for logo_line in megu_tui.LOGO:
+            expected = logo_line.rstrip()
+            index = plain.index(expected)
+            self.assertGreater(index, section)
+            positions.append(index)
+        self.assertEqual(positions, sorted(positions))
+        # ...and it appears before the first captured server line.
+        first_server = next(index for index, line in enumerate(plain)
+                            if line.startswith("[live-mods]"))
+        self.assertLess(max(positions), first_server)
+
+    def test_startup_banner_scrolls_off_naturally(self):
+        parser = megu_tui.MetricsParser()
+        parser.inject_banner()
+        for index in range(3):
+            parser.feed(f"[config] boot line {index}")
+        early = "\n".join(megu_tui.strip_ansi(line) for line in
+                          megu_tui.render_frame(parser.snapshot(), 80, 24))
+        self.assertIn(megu_tui.LOGO[0].rstrip(), early)
+        for index in range(40):
+            parser.feed(f"[config] later line {index}")
+        late = "\n".join(megu_tui.strip_ansi(line) for line in
+                         megu_tui.render_frame(parser.snapshot(), 80, 24))
+        for line in megu_tui.LOGO:
+            self.assertNotIn(line.rstrip(), late)
+
+    def test_startup_banner_is_hidden_under_alerts_filter(self):
+        parser = megu_tui.demo_parser()
+        alerts = "\n".join(megu_tui.strip_ansi(line) for line in
+                           megu_tui.render_frame(parser.snapshot(), 120, 36,
+                                                 log_filter="alerts"))
+        for line in megu_tui.LOGO:
+            self.assertNotIn(line.rstrip(), alerts)
+        self.assertIn("[security]", alerts)
+        self.assertNotIn("[live-mods]", alerts)
 
     def test_header_has_all_key_fields_at_80_and_120(self):
         for cols, rows in ((80, 24), (120, 36)):
@@ -864,6 +954,47 @@ class DemoFrameCliTest(unittest.TestCase):
         self.assertTrue(result.stdout.isascii())
         self.assertNotIn("\x1b", result.stdout)
 
+    def test_demo_frame_shows_startup_banner_in_log(self):
+        result = self.run_tool(
+            ["--demo-frame", "--cols", "120", "--rows", "36"])
+        self.assertEqual(result.returncode, 0, result.stderr)
+        lines = [line.rstrip() for line in result.stdout.splitlines()]
+        for logo_line in megu_tui.LOGO:
+            self.assertIn(logo_line.rstrip(), lines)
+        header = lines[0]
+        self.assertIn("MEGU 1.21.1", header)
+        for logo_line in megu_tui.LOGO:
+            self.assertNotIn(logo_line.rstrip(), header)
+
+    def test_no_banner_flag_and_env_suppress_banner(self):
+        variants = (
+            (["--no-banner"], {}),
+            ([], {"MEGU_NO_BANNER": "1"}),
+            ([], {"NO_BANNER": "1"}),
+        )
+        for extra, env in variants:
+            with self.subTest(extra=extra, env=env):
+                result = self.run_tool(
+                    ["--demo-frame", "--ascii", "--cols", "120", "--rows",
+                     "36"] + extra, env=env)
+                self.assertEqual(result.returncode, 0, result.stderr)
+                for logo_line in megu_tui.LOGO + megu_tui.LOGO_ASCII:
+                    self.assertNotIn(logo_line.rstrip(), result.stdout)
+
+    def test_ascii_banner_respects_exact_frame_bounds(self):
+        for cols, rows in ((80, 24), (92, 22), (120, 36)):
+            parser = megu_tui.MetricsParser()
+            parser.inject_banner(ascii_mode=True)
+            parser.feed("[config] loaded server.toml")
+            lines = megu_tui.render_frame(parser.snapshot(), cols, rows,
+                                          ascii_mode=True)
+            self.assertEqual(len(lines), rows, (cols, rows))
+            for line in lines:
+                self.assertTrue(line.isascii(), line)
+                self.assertEqual(megu_tui.vlen(line), cols, (cols, rows, line))
+            self.assertIn(megu_tui.LOGO_ASCII[0].rstrip(),
+                          [line.rstrip() for line in lines])
+
     def test_demo_frame_92x22_sample_is_exact(self):
         result = self.run_tool(
             ["--demo-frame", "--ascii", "--cols", "92", "--rows", "22"])
@@ -935,6 +1066,23 @@ class DemoFrameCliTest(unittest.TestCase):
         self.assertIn("25565", result.stdout)
         self.assertIn("TPS", result.stdout)
         self.assertEqual(len(result.stdout.splitlines()), 24)
+
+    def test_render_snapshot_does_not_duplicate_captured_banner(self):
+        captured = list(megu_tui.LOGO) + REALISTIC_LOG
+        with tempfile.NamedTemporaryFile(
+                "w", suffix=".log", delete=False, encoding="utf-8") as handle:
+            handle.write("\n".join(captured) + "\n")
+            path = handle.name
+        try:
+            result = self.run_tool(
+                ["--render-snapshot", path, "--cols", "120", "--rows",
+                 "36"])
+        finally:
+            os.unlink(path)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        lines = [line.rstrip() for line in result.stdout.splitlines()]
+        for logo_line in megu_tui.LOGO:
+            self.assertEqual(lines.count(logo_line.rstrip()), 1, logo_line)
 
     def test_render_snapshot_from_stdin(self):
         result = self.run_tool(
