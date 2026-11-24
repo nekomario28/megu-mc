@@ -564,7 +564,10 @@ fn seven_settings_tabs_fit_with_modern_extension_controls() {
     assert!(!ui.settings.qol.show_support_links);
     ui.settings.language = LanguageSetting::Japanese;
     let list = ui.render(640, 360);
-    assert!(list.commands.iter().any(|cmd| matches!(cmd, UiCommand::Text { text, .. } if text == "タイトルの支援リンクを表示: OFF")));
+    assert!(list
+        .commands
+        .iter()
+        .any(|cmd| matches!(cmd, UiCommand::Text { text, .. } if text == "支援リンク: OFF")));
 }
 
 #[test]
@@ -1704,20 +1707,22 @@ fn cjk_glyphs_are_distinct_non_blank_and_fullwidth() {
     assert_eq!(glyph_cells('鿿'), 2);
 }
 
-/// `measure_text_px`/`text_width` advance full-width glyphs double and
+/// `measure_text_px`/`text_width` advance full-width glyphs at
+/// `FULLWIDTH_PX` (12px — near-square against the 8px line height) and
 /// keep ASCII pixel-identical to the legacy 8px-per-char table.
 #[test]
-fn fullwidth_advance_is_exactly_double() {
-    use megu_client_ui::draw::{measure_text_px, text_width};
+fn fullwidth_advance_is_near_square() {
+    use megu_client_ui::draw::{measure_text_px, text_width, FULLWIDTH_PX};
     assert_eq!(text_width("abc", 1), 24);
     assert_eq!(text_width("abc", 2), 48);
-    assert_eq!(text_width("あいう", 1), 48);
-    assert_eq!(text_width("あいう", 2), 96);
-    assert_eq!(text_width("aあb", 1), 32);
-    assert_eq!(measure_text_px("日本語", 1), (48, 8));
-    assert_eq!(measure_text_px("日本語", 2), (96, 16));
-    // Ideographic space advances a full cell pair but paints nothing.
-    assert_eq!(text_width("　", 1), 16);
+    assert_eq!(text_width("あいう", 1), 3 * FULLWIDTH_PX);
+    assert_eq!(text_width("あいう", 2), 6 * FULLWIDTH_PX);
+    assert_eq!(text_width("aあb", 1), 16 + FULLWIDTH_PX);
+    assert_eq!(measure_text_px("日本語", 1), (3 * FULLWIDTH_PX, 8));
+    assert_eq!(measure_text_px("日本語", 2), (6 * FULLWIDTH_PX, 16));
+    // Ideographic space advances like every full-width glyph but paints
+    // nothing.
+    assert_eq!(text_width("　", 1), FULLWIDTH_PX);
 }
 
 /// A hand-made Unifont `.hex` pack loads strictly, rasterizes distinct
@@ -1737,9 +1742,9 @@ fn unifont_pack_loads_and_rasters_distinct_glyphs() {
     let g = atlas.glyph_bitmap('\u{E000}').unwrap();
     assert_eq!(g.cells, 2);
     let (w, h) = atlas.measure_text_px("A\u{E000}", 1);
-    assert_eq!((w, h), (24, 8));
+    assert_eq!((w, h), (8 + megu_client_ui::draw::FULLWIDTH_PX, 8));
     let (w, h, px) = atlas.rasterize_text_px("A\u{E000}", 1);
-    assert_eq!((w, h), (24, 8));
+    assert_eq!((w, h), (8 + megu_client_ui::draw::FULLWIDTH_PX, 8));
     assert!(px.chunks(4).any(|p| p[3] != 0), "pack rasterized blank");
 }
 

@@ -309,12 +309,12 @@ impl GpuBackend {
         match (self, lang) {
             (Self::Auto, UiLang::En) => "Auto",
             (Self::MeshShader, UiLang::En) => "Mesh Shader",
-            (Self::ComputeIndirect, UiLang::En) => "Compute Indirect",
+            (Self::ComputeIndirect, UiLang::En) => "Compute",
             (Self::Classic, UiLang::En) => "Classic",
-            (Self::ClassicLowSpec, UiLang::En) => "Classic Low-Spec",
+            (Self::ClassicLowSpec, UiLang::En) => "Low-Spec",
             (Self::Auto, UiLang::Ja) => "自動",
-            (Self::MeshShader, UiLang::Ja) => "メッシュシェーダー",
-            (Self::ComputeIndirect, UiLang::Ja) => "コンピュート間接",
+            (Self::MeshShader, UiLang::Ja) => "メッシュ",
+            (Self::ComputeIndirect, UiLang::Ja) => "コンピュート",
             (Self::Classic, UiLang::Ja) => "クラシック",
             (Self::ClassicLowSpec, UiLang::Ja) => "低スペック",
         }

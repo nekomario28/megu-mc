@@ -898,3 +898,49 @@ fn every_settings_tab_reachable_via_click() {
         assert_eq!(ui.screen, Screen::Settings(tab), "click did not open {tab:?}");
     }
 }
+
+// ---------------------------------------------------------------------------
+// 7. Label truncation: every button/tab caption renders whole
+// ---------------------------------------------------------------------------
+
+/// No button or tab label may be clipped at the ship resolutions — the
+/// regression where full-width CJK advance (16px) squeezed every
+/// Japanese caption (`公式サイ`, `オーディ`, `フルスクリーン: OF`, ...)
+/// down to a fragment. `truncated_widget_labels` reports each clipped
+/// caption; the list must stay empty on every player-facing screen in
+/// both languages, MiniHUD off *and* on (the chip grid is the widest
+/// QoL layout).
+#[test]
+fn no_button_or_tab_label_truncates_at_1280x720() {
+    for lang in [UiLang::En, UiLang::Ja] {
+        for &(w, h) in &[(1280u32, 720u32), (640u32, 360u32)] {
+            for mini_on in [false, true] {
+                let mut ui = UiState::new();
+                if lang == UiLang::Ja {
+                    ui.set_locale(megu_core::i18n::BuiltinLocale::JaJp);
+                }
+                let mut screens = all_screens(&mut ui);
+                // Screens the hostile fixture doesn't reach.
+                screens.extend([
+                    Screen::Multiplayer,
+                    Screen::ModSyncPrompt,
+                    Screen::Disconnected,
+                ]);
+                if mini_on {
+                    ui.settings.qol.mini_hud = all_minihud_segments(MiniHudAnchor::TopLeft);
+                }
+                for screen in screens {
+                    ui.screen = screen;
+                    ui.nav_stack.clear();
+                    ui.modal = None;
+                    let clipped = megu_client_ui::layout::truncated_widget_labels(&ui, w, h);
+                    assert!(
+                        clipped.is_empty(),
+                        "{screen:?} @{w}x{h} lang={lang:?} mini={mini_on}: \
+                         truncated captions {clipped:?}"
+                    );
+                }
+            }
+        }
+    }
+}

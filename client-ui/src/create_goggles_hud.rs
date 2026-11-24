@@ -170,7 +170,7 @@ impl GogglesHudLayout {
         list.fill_rect(panel, UiColor::rgba(14, 16, 22, 224));
         list.border_rect(panel, UiColor::rgba(105, 117, 139, 240), scale);
 
-        let max_cells = ((panel_w - padding_x * 2).max(0) / 8) as usize;
+        let max_px = (panel_w - padding_x * 2).max(0) as usize;
         let colors = [pal::TEXT, pal::TEXT, pal::TEXT_DIM, stress_color];
         for (index, line) in lines.iter().enumerate() {
             let color = if index < colors.len() {
@@ -180,7 +180,7 @@ impl GogglesHudLayout {
             } else {
                 pal::TEXT_DIM
             };
-            let clipped = clip_text(line, max_cells);
+            let clipped = clip_text(line, max_px);
             list.text_str(
                 (panel_x + padding_x) * s,
                 (panel_y + padding_y + index as i32 * row_h) * s,
@@ -267,16 +267,6 @@ fn covered_text(text: &str) -> String {
         .collect()
 }
 
-fn clip_text(text: &str, cells: usize) -> String {
-    let mut clipped = String::new();
-    let mut used = 0_u32;
-    for c in text.chars() {
-        let cell_width = crate::draw::glyph_cells(c);
-        if used + cell_width > cells as u32 {
-            break;
-        }
-        clipped.push(c);
-        used += cell_width;
-    }
-    clipped
+fn clip_text(text: &str, px: usize) -> String {
+    crate::draw::first_px(text, px).to_string()
 }

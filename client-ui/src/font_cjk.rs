@@ -25,11 +25,13 @@ use std::fmt;
 use std::sync::RwLock;
 
 /// Glyph raster data: one or two adjacent 8×8 tiles, painted left-to-right.
-/// `cells` is the advance in [`crate::draw::GLYPH_SIZE`] columns (1 = half
-/// width, 2 = full width); for `cells == 1`, `tiles[1]` is all zero.
+/// `cells` is the width class in [`crate::draw::GLYPH_SIZE`] columns (1 =
+/// half width, 2 = full width); for `cells == 1`, `tiles[1]` is all zero.
+/// The rendered advance is [`crate::draw::glyph_advance`] — two-cell art
+/// squeezes to [`crate::draw::FULLWIDTH_PX`] px.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct GlyphBitmap {
-    /// Advance width in 8-px cells (1 half-width, 2 full-width).
+    /// Source width in 8-px cells (1 half-width, 2 full-width).
     pub cells: u8,
     /// `tiles[0]` = left cell, `tiles[1]` = right cell (zero for half-width).
     pub tiles: [[u8; 8]; 2],
@@ -5429,7 +5431,14 @@ impl GlyphAtlas {
                 Some(g) => g.cells,
                 None => crate::draw::glyph_bitmap(c).cells,
             };
-            line += u32::from(cells.max(1)) * crate::draw::GLYPH_SIZE * scale;
+            // Same rendered advance as the runtime pipeline
+            // (`draw::glyph_advance`): full-width art renders at
+            // `FULLWIDTH_PX`, half-width at `GLYPH_SIZE`.
+            line += if cells >= 2 {
+                crate::draw::FULLWIDTH_PX
+            } else {
+                crate::draw::GLYPH_SIZE
+            } * scale;
         }
         (width.max(line), (lines + 1) * crate::draw::GLYPH_SIZE * scale)
     }
@@ -5555,7 +5564,11 @@ impl GlyphAtlas {
                 Some(g) => g.cells,
                 None => crate::draw::glyph_bitmap(c).cells,
             };
-            width += u32::from(cells.max(1)) * crate::draw::GLYPH_SIZE * scale;
+            width += if cells >= 2 {
+                crate::draw::FULLWIDTH_PX
+            } else {
+                crate::draw::GLYPH_SIZE
+            } * scale;
         }
         let height = crate::draw::GLYPH_SIZE * scale;
         let mut rgba = vec![0u8; width as usize * height as usize * 4];
@@ -5564,6 +5577,12 @@ impl GlyphAtlas {
             let g = match self.glyph_bitmap(c) {
                 Some(g) => g,
                 None => crate::draw::glyph_bitmap(c),
+            };
+            let cells = u32::from(g.cells.max(1));
+            let (src_w, adv) = if g.cells >= 2 {
+                (cells * 8, crate::draw::FULLWIDTH_PX)
+            } else {
+                (8, crate::draw::GLYPH_SIZE)
             };
             for (tile_idx, tile) in g.tiles.iter().enumerate() {
                 if tile_idx >= g.cells as usize {
@@ -5574,11 +5593,12 @@ impl GlyphAtlas {
                         if (bits & (0x80 >> col)) == 0 {
                             continue;
                         }
+                        // Full-width source art squeezes 16→12 dst px,
+                        // matching `Frame::glyph_cell`'s floor merge.
+                        let dst = (tile_idx as u32 * 8 + col) * adv / src_w;
                         for dy in 0..scale {
                             for dx in 0..scale {
-                                let px = cx
-                                    + (tile_idx as i32 * 8 + col as i32) * scale as i32
-                                    + dx as i32;
+                                let px = cx + dst as i32 * scale as i32 + dx as i32;
                                 let py = row as i32 * scale as i32 + dy as i32;
                                 if px < 0 || py < 0 {
                                     continue;
@@ -5594,7 +5614,7 @@ impl GlyphAtlas {
                     }
                 }
             }
-            cx += i32::from(g.cells.max(1)) * crate::draw::GLYPH_SIZE as i32 * scale as i32;
+            cx += adv as i32 * scale as i32;
         }
         (width, height, rgba)
     }

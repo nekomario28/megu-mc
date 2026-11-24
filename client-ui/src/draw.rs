@@ -28,8 +28,9 @@
 //! a `const fn`. It covers printable ASCII `0x20..=0x7E` on the 8×8 cell
 //! plus the full-width CJK/kana/punctuation/Hangul and half-width extended
 //! Latin/Cyrillic sets in [`crate::font_cjk`] — every code point the
-//! bilingual UI can emit — on a 16×8 "double cell" canvas (a full-width
-//! glyph advances two cells). Anything still unmapped draws the
+//! bilingual UI can emit — on a 16×8 "double cell" canvas that paints
+//! squeezed to [`FULLWIDTH_PX`] px (near-square instead of a 2:1
+//! pancake). Anything still unmapped draws the
 //! [`FALLBACK_GLYPH`] box (or its wide twin) so labels never silently
 //! disappear, and an external [`crate::font_cjk::GlyphAtlas`] font pack can
 //! fill the remaining gaps at runtime.
@@ -137,7 +138,7 @@ pub mod palette {
 
 /// One recorded draw operation. Text positions are the *top-left* of the
 /// first glyph cell; `scale` multiplies the 8×8 cell, so `scale = 2` yields
-/// 16×16 px glyphs.
+/// 16-px-tall glyphs (full-width glyphs advance [`FULLWIDTH_PX`]×scale px).
 #[derive(Clone, Debug, PartialEq)]
 pub enum UiCommand {
     /// Filled rectangle.
@@ -315,6 +316,15 @@ impl UiDrawList {
 
 /// Pixel width/height of one glyph cell at `scale = 1`.
 pub const GLYPH_SIZE: u32 = 8;
+
+/// Logical-pixel advance (and painted width) of a full-width glyph at
+/// `scale = 1`. The glyph art lives on a 16-column "double cell" canvas
+/// (see [`crate::font_cjk`]); painting it 1:1 made every CJK label read
+/// as a squashed 2:1 pancake and pushed Japanese button captions past
+/// their rects, so both renderers squeeze the 16 source columns into
+/// [`FULLWIDTH_PX`] px — near the 8-px line height, i.e. close to the
+/// square proportions East-Asian glyphs are designed for.
+pub const FULLWIDTH_PX: u32 = 12;
 
 /// Number of glyphs in [`FONT_8X8`]: printable ASCII `0x20..=0x7E`.
 pub const FONT_GLYPH_COUNT: usize = 95;
@@ -610,9 +620,23 @@ pub fn glyph_bitmap(c: char) -> crate::font_cjk::GlyphBitmap {
     }
 }
 
-/// Advance width of `c` in 8-px cells: 1 for half-width, 2 for full-width.
+/// Width class of `c` in 8-px source cells: 1 for half-width, 2 for
+/// full-width. This counts the glyph's *source tiles* — the rendered
+/// pen advance is [`glyph_advance`] (a full-width glyph's two 8×8 tiles
+/// squeeze into [`FULLWIDTH_PX`] px).
 pub fn glyph_cells(c: char) -> u32 {
     u32::from(glyph_bitmap(c).cells.max(1))
+}
+
+/// Logical px `c` advances the pen at `scale = 1`: [`GLYPH_SIZE`] for
+/// half-width glyphs, [`FULLWIDTH_PX`] for full-width ones. Multiply by
+/// `scale` for the rendered advance.
+pub fn glyph_advance(c: char) -> u32 {
+    if glyph_cells(c) >= 2 {
+        FULLWIDTH_PX
+    } else {
+        GLYPH_SIZE
+    }
 }
 
 /// `true` when `c` has a real glyph (built-in ASCII, built-in extended
@@ -630,8 +654,9 @@ pub fn glyph_is_covered(c: char) -> bool {
 }
 
 /// Pixel width of `text` rendered at `scale`: every glyph advances
-/// `cells × 8 × scale` px (half-width 1 cell, full-width 2), including
-/// spaces; `'\n'` resets to a new line and is not counted.
+/// [`glyph_advance`] `× scale` px (half-width 8, full-width
+/// [`FULLWIDTH_PX`] at `scale = 1`), including spaces; `'\n'` resets to
+/// a new line and is not counted.
 pub fn text_width(text: &str, scale: u32) -> u32 {
     let mut width = 0u32;
     let mut line = 0u32;
@@ -640,7 +665,7 @@ pub fn text_width(text: &str, scale: u32) -> u32 {
             width = width.max(line);
             line = 0;
         } else {
-            line += glyph_cells(c) * GLYPH_SIZE * scale;
+            line += glyph_advance(c) * scale;
         }
     }
     width.max(line)
@@ -652,9 +677,11 @@ pub fn measure_text_px(text: &str, scale: u32) -> (u32, u32) {
     (text_width(text, scale), text_height(text, scale))
 }
 
-/// Glyph cells `text` advances (sum of [`glyph_cells`], `'\n'` excluded
-/// from the running count): `text_width(text, 1) / 8` without the `u32`
-/// cast dance.
+/// Glyph cells `text` occupies (sum of [`glyph_cells`], `'\n'` excluded
+/// from the running count). Cells are 8-px budget units: because a
+/// full-width glyph costs 2 cells but renders [`FULLWIDTH_PX`] px,
+/// `text_cells(t) * 8` is always `>= text_width(t, 1)` — a cell-count
+/// clip is conservative and can never overrun its pixel budget.
 pub fn text_cells(text: &str) -> usize {
     let mut cells = 0usize;
     for c in text.chars() {
@@ -690,6 +717,37 @@ pub fn last_cells(text: &str, limit: usize) -> &str {
             return &text[start + c.len_utf8()..];
         }
         used += cells;
+    }
+    text
+}
+
+/// Longest prefix of `text` whose rendered advance fits `limit_px`
+/// scale-1 pixels. The exact counterpart of [`first_cells`] for pixel
+/// budgets: a full-width glyph costs [`FULLWIDTH_PX`] px, not two 8-px
+/// cells, so pixel-budget callers get the true fit instead of
+/// under-filling Japanese text by a third.
+pub fn first_px(text: &str, limit_px: usize) -> &str {
+    let mut used = 0usize;
+    for (end, c) in text.char_indices() {
+        let w = glyph_advance(c) as usize;
+        if used + w > limit_px {
+            return &text[..end];
+        }
+        used += w;
+    }
+    text
+}
+
+/// Longest suffix of `text` whose rendered advance fits `limit_px`
+/// scale-1 pixels — the mirror of [`first_px`].
+pub fn last_px(text: &str, limit_px: usize) -> &str {
+    let mut used = 0usize;
+    for (start, c) in text.char_indices().rev() {
+        let w = glyph_advance(c) as usize;
+        if used + w > limit_px {
+            return &text[start + c.len_utf8()..];
+        }
+        used += w;
     }
     text
 }
@@ -1136,19 +1194,30 @@ pub fn tessellate_draw_list_icons(
                         cy += cell as i32;
                         continue;
                     }
+                    let wide = glyph_cells(ch) >= 2;
+                    let adv = if wide {
+                        FULLWIDTH_PX * scale
+                    } else {
+                        GLYPH_SIZE * scale
+                    };
                     if ch != ' ' && ch != '\u{3000}' {
                         let base = glyph_index(ch);
-                        let cells = glyph_cells(ch);
-                        for tile in 0..cells {
-                            let uv = tile_uv(base + tile);
+                        if wide {
+                            // Full-width art squeezes 16 -> FULLWIDTH_PX
+                            // columns: each 8-px tile paints into half
+                            // the advance so strokes compress, never clip.
+                            let half = adv / 2;
+                            mesh.quad(UiRect::new(cx, cy, half, cell), tile_uv(base), *color);
                             mesh.quad(
-                                UiRect::new(cx + (tile * cell) as i32, cy, cell, cell),
-                                uv,
+                                UiRect::new(cx + half as i32, cy, adv - half, cell),
+                                tile_uv(base + 1),
                                 *color,
                             );
+                        } else {
+                            mesh.quad(UiRect::new(cx, cy, cell, cell), tile_uv(base), *color);
                         }
                     }
-                    cx += (glyph_cells(ch) * cell) as i32;
+                    cx += adv as i32;
                 }
             }
             UiCommand::ProgressBar {
@@ -1281,6 +1350,7 @@ impl Frame<'_> {
 
     fn glyph_cell(&mut self, ch: char, x: i32, y: i32, scale: u32, color: UiColor) {
         let bitmap = glyph_bitmap(ch);
+        let wide = bitmap.cells >= 2;
         for (tile_idx, tile) in bitmap.tiles.iter().enumerate() {
             if tile_idx >= bitmap.cells as usize {
                 break;
@@ -1290,9 +1360,19 @@ impl Frame<'_> {
                     if (bits & (0x80 >> col)) == 0 {
                         continue;
                     }
+                    let src_x = tile_idx as i32 * 8 + col as i32;
+                    // Full-width art squeezes 16 -> FULLWIDTH_PX columns:
+                    // the floor map merges adjacent source columns so no
+                    // stroke ever disappears (the GPU path samples both
+                    // tiles into the same squeezed quad pair).
+                    let dst_x = if wide {
+                        src_x * FULLWIDTH_PX as i32 / 16
+                    } else {
+                        src_x
+                    };
                     self.fill(
                         UiRect::new(
-                            x + (tile_idx as i32 * 8 + col as i32) * scale as i32,
+                            x + dst_x * scale as i32,
                             y + (row as i32) * scale as i32,
                             scale,
                             scale,
@@ -1316,7 +1396,7 @@ impl Frame<'_> {
             if ch != ' ' && ch != '\u{3000}' {
                 self.glyph_cell(ch, cx, cy, scale, color);
             }
-            cx += glyph_cells(ch) as i32 * cell;
+            cx += glyph_advance(ch) as i32 * scale as i32;
         }
     }
 }
