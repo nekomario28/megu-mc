@@ -42,6 +42,9 @@ import time
 ROOT = Path(__file__).resolve().parents[1]
 SCRIPT = ROOT / "tools/mutation_check.sh"
 WIRING_AUDIT = ROOT / "tools/wiring_connectivity_audit.py"
+VERSION_AUDIT = ROOT / "tools/version_constant_audit.py"
+REGISTRY_PARITY = ROOT / "tools/registry_table_parity.py"
+SERVER_FILES_PARITY = ROOT / "tools/server_files_parity.py"
 CONTROL = "running 1 test\ntest result: ok. 1 passed; 0 failed; 0 ignored"
 DIRTY = "// MEGU_DIRTY_MARKER"
 # The wire config the fixture plants: its bytes are what a copy has to carry, so the assertion names
@@ -645,6 +648,157 @@ def wiring_audit_cases(keep_going):
     return failures
 
 
+# ---------------------------------------------------------------------------
+# Zero-JAR structural guards (W7 version constants, W14 V767 registry tables,
+# W4/W5 server-files parity). Each tool gets a synthetic --root tree that must
+# pass clean and must fail on a planted drift, so a guard that can no longer
+# go red is itself a red build.
+# ---------------------------------------------------------------------------
+
+STRUCTURAL_VERSION_CLEAN = {
+    # The canonical registry is exempt even though it carries the pinned
+    # literals; a same-valued const under cfg(test) is not production code.
+    "core/src/version.rs": (
+        "pub const PROTOCOL_VERSION: i32 = 767;\n"
+        "pub const DATA_VERSION: i32 = 3955;\n"
+    ),
+    "src/lib.rs": (
+        "pub const UNRELATED: i32 = 42;\n"
+        "#[cfg(test)]\nmod tests {\n"
+        "    const TEST_ONLY_VERSION: i32 = 3955;\n"
+        "    #[test]\n    fn it_works() {}\n}\n"
+    ),
+}
+
+STRUCTURAL_REGISTRY_PASS = {
+    "src/menus_and_items.rs": (
+        'static ITEM_NAMES: [&str; 2] = ["air", "stone"];\n'
+        'static COMP_WIRE_NAMES: [&str; 2] = ["minecraft:a", "minecraft:b"];\n'
+    ),
+    "proto/src/data_v767.rs": (
+        'pub(crate) static V767_ITEMS: [&str; 2] = '
+        '["minecraft:air", "minecraft:stone"];\n'
+        'pub(crate) static V767_COMPONENTS: [&str; 2] = '
+        '["minecraft:a", "minecraft:b"];\n'
+    ),
+}
+
+# The parity guard ratchets the *measured* key delta, so its pass fixture
+# carries this tree's real tables rather than an invented minimal pair.
+STRUCTURAL_SERVER_FILES_PASS = {
+    rel: (ROOT / rel).read_text()
+    for rel in [
+        "src/server_config.rs",
+        "server-files/src/properties.rs",
+        "server-files/src/json.rs",
+    ]
+}
+
+STRUCTURAL_SERVER_FILES_NEW_KEY = (
+    STRUCTURAL_SERVER_FILES_PASS["server-files/src/properties.rs"]
+    + "\nfn injected(doc: &PropertiesFile) {\n"
+      "    let _ = doc.get(\"brand-new-key\");\n}\n"
+)
+
+STRUCTURAL_JSON_NON_DELEGATING = (
+    "pub fn quote(s: &str) -> String { s.to_string() }\n"
+)
+
+STRUCTURAL_JSON_DRIFT = (
+    "pub fn esc(s: &str) -> String {\n"
+    "    let mut o = String::new();\n"
+    "    o.push_str(\"\\\\\\\"\");\n"
+    "    o.push_str(s);\n"
+    "    o\n}\n"
+)
+
+
+def run_structural_audit(tool, root):
+    return subprocess.run(
+        [sys.executable, str(tool), "--root", str(root)],
+        capture_output=True, text=True, timeout=120)
+
+
+def structural_audit_cases(keep_going):
+    """Each case asserts a structural guard's exit contract on a fixture."""
+    failures = []
+    # (name, tool, files, want_rc, marker-or-None)
+    cases = [
+        ("version-constant audit: clean tree passes",
+         VERSION_AUDIT, STRUCTURAL_VERSION_CLEAN, 0, "PASS"),
+        ("version-constant audit: new hardcoded const fails",
+         VERSION_AUDIT,
+         dict(STRUCTURAL_VERSION_CLEAN,
+              **{"src/drift.rs": "const DRIFT_PROTOCOL_VERSION: i32 = 767;\n"}),
+         1, "DRIFT_PROTOCOL_VERSION"),
+        ("version-constant audit: allowlisted symbol with wrong value fails",
+         VERSION_AUDIT,
+         dict(STRUCTURAL_VERSION_CLEAN,
+              **{"src/save_v2.rs":
+                 "const SAVE_DATA_VERSION_RUNNING: i32 = 5023;\n"}),
+         1, "unwaived"),
+        ("registry-table parity: matching tables pass",
+         REGISTRY_PARITY, STRUCTURAL_REGISTRY_PASS, 0, "PASS"),
+        ("registry-table parity: name drift fails",
+         REGISTRY_PARITY,
+         dict(STRUCTURAL_REGISTRY_PASS,
+              **{"proto/src/data_v767.rs":
+                 'pub(crate) static V767_ITEMS: [&str; 2] = '
+                 '["minecraft:air", "minecraft:dirt"];\n'
+                 'pub(crate) static V767_COMPONENTS: [&str; 2] = '
+                 '["minecraft:a", "minecraft:b"];\n'}),
+         1, "index 1"),
+        ("registry-table parity: length drift fails",
+         REGISTRY_PARITY,
+         dict(STRUCTURAL_REGISTRY_PASS,
+              **{"proto/src/data_v767.rs":
+                 'pub(crate) static V767_ITEMS: [&str; 1] = ["minecraft:air"];\n'
+                 'pub(crate) static V767_COMPONENTS: [&str; 2] = '
+                 '["minecraft:a", "minecraft:b"];\n'}),
+         1, "length drift"),
+        ("server-files parity: real tables pass",
+         SERVER_FILES_PARITY, STRUCTURAL_SERVER_FILES_PASS, 0, "PASS"),
+        ("server-files parity: new typed key fails",
+         SERVER_FILES_PARITY,
+         dict(STRUCTURAL_SERVER_FILES_PASS,
+              **{"server-files/src/properties.rs":
+                 STRUCTURAL_SERVER_FILES_NEW_KEY}),
+         1, "server-files-only key set drifted"),
+        ("server-files parity: non-delegating json.rs fails",
+         SERVER_FILES_PARITY,
+         dict(STRUCTURAL_SERVER_FILES_PASS,
+              **{"server-files/src/json.rs": STRUCTURAL_JSON_NON_DELEGATING}),
+         1, "canonical"),
+        ("server-files parity: second JSON escaper fails",
+         SERVER_FILES_PARITY,
+         dict(STRUCTURAL_SERVER_FILES_PASS,
+              **{"server-files/src/rogue.rs": STRUCTURAL_JSON_DRIFT}),
+         1, "emits JSON string escapes"),
+    ]
+    for name, tool, files, want_rc, marker in cases:
+        with tempfile.TemporaryDirectory(prefix="structural-audit-") as tmp:
+            root = Path(tmp)
+            for rel, text in files.items():
+                path = root / rel
+                path.parent.mkdir(parents=True, exist_ok=True)
+                path.write_text(text)
+            try:
+                result = run_structural_audit(tool, root)
+                log = result.stdout + result.stderr
+                assert result.returncode == want_rc, (
+                    f"expected exit {want_rc}, got {result.returncode}\n{log}")
+                if marker is not None:
+                    assert marker in log, f"{marker!r} not in report\n{log}"
+            except AssertionError as error:
+                if not keep_going:
+                    raise
+                failures.append(name)
+                print(f"structural audit self-test: {name} FAIL\n{error}")
+                continue
+            print(f"structural audit self-test: {name} PASS")
+    return failures
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--script", default=None,
@@ -774,6 +928,8 @@ def main():
 
     failures.extend(f"wiring: {name}"
                     for name in wiring_audit_cases(options.keep_going))
+    failures.extend(f"structural: {name}"
+                    for name in structural_audit_cases(options.keep_going))
 
     if failures:
         print(f"gate self-test: {len(failures)} case(s) failed: {', '.join(failures)}")

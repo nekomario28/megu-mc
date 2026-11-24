@@ -53,6 +53,13 @@ jobs:
           python3 tests/opt_wiring_audit_test.py
           python3 tools/opt_wiring_audit.py
           python3 tools/wiring_connectivity_audit.py
+          # Zero-JAR structural guards: pinned version constants stay routed
+          # through megu_core::version, the V767 registry name tables stay
+          # index-identical, and the server.properties key tables plus the
+          # crate's single JSON escaper stay in parity.
+          python3 tools/version_constant_audit.py
+          python3 tools/registry_table_parity.py
+          python3 tools/server_files_parity.py
           python3 tests/java_toolchain_test.py
           python3 tests/verify_gate_coverage_test.py
           python3 tests/installer_cross_os_test.py
