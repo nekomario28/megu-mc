@@ -830,266 +830,74 @@ impl JsonValue {
     }
 }
 
-struct JsonParser<'a> {
-    bytes: &'a [u8],
-    offset: usize,
-    nodes: usize,
+/// Bounds for [`parse_json`]. The canonical reader counts the root value at
+/// depth 0 and rejects a value *at* `max_depth`; `MAX_JSON_DEPTH + 1`
+/// reproduces the retired parser's `depth > MAX_JSON_DEPTH` boundary
+/// exactly. Node and byte ceilings match the historical 100 000 nodes and
+/// [`MAX_JSON_BYTES`]; duplicate keys stay rejected.
+const JSON_LIMITS: megu_core::json::JsonLimits = megu_core::json::JsonLimits {
+    max_depth: MAX_JSON_DEPTH + 1,
+    max_nodes: 100_000,
+    max_bytes: MAX_JSON_BYTES,
+};
+
+/// The retired parser's per-string ceiling, enforced on the decoded value
+/// because [`JsonLimits`] has no string-length axis.
+const MAX_JSON_STRING_BYTES: usize = 65_536;
+
+fn parse_json(input: &str) -> Result<JsonValue, AnimationError> {
+    if input.len() > MAX_JSON_BYTES {
+        return Err(AnimationError::LimitExceeded);
+    }
+    let value = megu_core::json::parse_json_with_limits(input, JSON_LIMITS, true).map_err(|e| {
+        // `JsonLimits` trips surface as the same LimitExceeded the retired
+        // parser raised; every other rejection is InvalidJson.
+        if e.message.contains("nesting too deep") || e.message.contains("too many nodes") {
+            AnimationError::LimitExceeded
+        } else {
+            AnimationError::InvalidJson
+        }
+    })?;
+    json_value_from_core(value)
 }
 
-impl<'a> JsonParser<'a> {
-    fn parse(input: &'a str) -> Result<JsonValue, AnimationError> {
-        if input.len() > MAX_JSON_BYTES {
-            return Err(AnimationError::LimitExceeded);
-        }
-        let mut parser = Self {
-            bytes: input.as_bytes(),
-            offset: 0,
-            nodes: 0,
-        };
-        let result = parser.value(0)?;
-        parser.whitespace();
-        if parser.offset != parser.bytes.len() {
-            return Err(AnimationError::InvalidJson);
-        }
-        Ok(result)
-    }
-
-    fn whitespace(&mut self) {
-        while self
-            .bytes
-            .get(self.offset)
-            .is_some_and(|b| matches!(b, b' ' | b'\t' | b'\n' | b'\r'))
-        {
-            self.offset += 1;
-        }
-    }
-
-    fn consume(&mut self, byte: u8) -> bool {
-        if self.bytes.get(self.offset) == Some(&byte) {
-            self.offset += 1;
-            true
-        } else {
-            false
-        }
-    }
-
-    fn expect(&mut self, byte: u8) -> Result<(), AnimationError> {
-        if self.consume(byte) {
-            Ok(())
-        } else {
-            Err(AnimationError::InvalidJson)
-        }
-    }
-
-    fn keyword(&mut self, word: &[u8]) -> Result<(), AnimationError> {
-        if self.bytes.get(self.offset..self.offset + word.len()) == Some(word) {
-            self.offset += word.len();
-            Ok(())
-        } else {
-            Err(AnimationError::InvalidJson)
-        }
-    }
-
-    fn value(&mut self, depth: usize) -> Result<JsonValue, AnimationError> {
-        if depth > MAX_JSON_DEPTH || self.nodes >= 100_000 {
-            return Err(AnimationError::LimitExceeded);
-        }
-        self.nodes += 1;
-        self.whitespace();
-        match self.bytes.get(self.offset) {
-            Some(b'{') => self.object_value(depth + 1),
-            Some(b'[') => self.array_value(depth + 1),
-            Some(b'"') => self.parse_string().map(JsonValue::String),
-            Some(b't') => {
-                self.keyword(b"true")?;
-                Ok(JsonValue::Bool(true))
-            }
-            Some(b'f') => {
-                self.keyword(b"false")?;
-                Ok(JsonValue::Bool(false))
-            }
-            Some(b'n') => {
-                self.keyword(b"null")?;
-                Ok(JsonValue::Null)
-            }
-            Some(b'-' | b'0'..=b'9') => self.number().map(JsonValue::Number),
-            _ => Err(AnimationError::InvalidJson),
-        }
-    }
-
-    fn object_value(&mut self, depth: usize) -> Result<JsonValue, AnimationError> {
-        self.expect(b'{')?;
-        let mut fields = Vec::new();
-        let mut seen = HashSet::new();
-        self.whitespace();
-        if self.consume(b'}') {
-            return Ok(JsonValue::Object(fields));
-        }
-        loop {
-            self.whitespace();
-            let key = self.parse_string()?;
-            if !seen.insert(key.clone()) {
+/// Consume the canonical [`megu_core::json::JsonValue`] tree into this
+/// module's [`JsonValue`], re-imposing the retired caps the canonical
+/// reader does not model: non-finite numbers and strings (keys included)
+/// past [`MAX_JSON_STRING_BYTES`] fail closed.
+fn json_value_from_core(value: megu_core::json::JsonValue) -> Result<JsonValue, AnimationError> {
+    Ok(match value {
+        megu_core::json::JsonValue::Null => JsonValue::Null,
+        megu_core::json::JsonValue::Bool(b) => JsonValue::Bool(b),
+        megu_core::json::JsonValue::Number(n) => {
+            if !n.is_finite() {
                 return Err(AnimationError::InvalidJson);
             }
-            self.whitespace();
-            self.expect(b':')?;
-            let value = self.value(depth)?;
-            fields.push((key, value));
-            self.whitespace();
-            if self.consume(b'}') {
-                break;
-            }
-            self.expect(b',')?;
+            JsonValue::Number(n)
         }
-        Ok(JsonValue::Object(fields))
-    }
-
-    fn array_value(&mut self, depth: usize) -> Result<JsonValue, AnimationError> {
-        self.expect(b'[')?;
-        let mut items = Vec::new();
-        self.whitespace();
-        if self.consume(b']') {
-            return Ok(JsonValue::Array(items));
-        }
-        loop {
-            items.push(self.value(depth)?);
-            self.whitespace();
-            if self.consume(b']') {
-                break;
-            }
-            self.expect(b',')?;
-        }
-        Ok(JsonValue::Array(items))
-    }
-
-    fn unicode_unit(&mut self) -> Result<u16, AnimationError> {
-        let mut value = 0u16;
-        for _ in 0..4 {
-            let digit = self
-                .bytes
-                .get(self.offset)
-                .and_then(|b| (*b as char).to_digit(16))
-                .ok_or(AnimationError::InvalidJson)?;
-            self.offset += 1;
-            value = value * 16 + digit as u16;
-        }
-        Ok(value)
-    }
-
-    fn parse_string(&mut self) -> Result<String, AnimationError> {
-        self.expect(b'"')?;
-        let mut result = String::new();
-        let mut start = self.offset;
-        loop {
-            let byte = *self
-                .bytes
-                .get(self.offset)
-                .ok_or(AnimationError::InvalidJson)?;
-            if byte == b'"' || byte == b'\\' {
-                let chunk = std::str::from_utf8(&self.bytes[start..self.offset])
-                    .map_err(|_| AnimationError::InvalidJson)?;
-                result.push_str(chunk);
-                if byte == b'"' {
-                    self.offset += 1;
-                    break;
-                }
-                self.offset += 1;
-                let escape = *self
-                    .bytes
-                    .get(self.offset)
-                    .ok_or(AnimationError::InvalidJson)?;
-                self.offset += 1;
-                match escape {
-                    b'"' => result.push('"'),
-                    b'\\' => result.push('\\'),
-                    b'/' => result.push('/'),
-                    b'b' => result.push('\u{0008}'),
-                    b'f' => result.push('\u{000C}'),
-                    b'n' => result.push('\n'),
-                    b'r' => result.push('\r'),
-                    b't' => result.push('\t'),
-                    b'u' => {
-                        let high = self.unicode_unit()?;
-                        let codepoint = if (0xD800..=0xDBFF).contains(&high) {
-                            self.expect(b'\\')?;
-                            self.expect(b'u')?;
-                            let low = self.unicode_unit()?;
-                            if !(0xDC00..=0xDFFF).contains(&low) {
-                                return Err(AnimationError::InvalidJson);
-                            }
-                            0x10000 + ((high as u32 - 0xD800) << 10) + (low as u32 - 0xDC00)
-                        } else if (0xDC00..=0xDFFF).contains(&high) {
-                            return Err(AnimationError::InvalidJson);
-                        } else {
-                            high as u32
-                        };
-                        result.push(char::from_u32(codepoint).ok_or(AnimationError::InvalidJson)?);
-                    }
-                    _ => return Err(AnimationError::InvalidJson),
-                }
-                start = self.offset;
-            } else if byte < 0x20 {
-                return Err(AnimationError::InvalidJson);
-            } else {
-                self.offset += 1;
-            }
-            if result.len() + self.offset.saturating_sub(start) > 65_536 {
+        megu_core::json::JsonValue::String(s) => {
+            if s.len() > MAX_JSON_STRING_BYTES {
                 return Err(AnimationError::LimitExceeded);
             }
+            JsonValue::String(s)
         }
-        if result.len() > 65_536 {
-            return Err(AnimationError::LimitExceeded);
+        megu_core::json::JsonValue::Array(items) => JsonValue::Array(
+            items
+                .into_iter()
+                .map(json_value_from_core)
+                .collect::<Result<_, AnimationError>>()?,
+        ),
+        megu_core::json::JsonValue::Object(fields) => {
+            let mut out = Vec::with_capacity(fields.len());
+            for (key, member) in fields {
+                if key.len() > MAX_JSON_STRING_BYTES {
+                    return Err(AnimationError::LimitExceeded);
+                }
+                out.push((key, json_value_from_core(member)?));
+            }
+            JsonValue::Object(out)
         }
-        Ok(result)
-    }
-
-    fn number(&mut self) -> Result<f64, AnimationError> {
-        let start = self.offset;
-        self.consume(b'-');
-        if !self.consume(b'0') {
-            let first = *self
-                .bytes
-                .get(self.offset)
-                .ok_or(AnimationError::InvalidJson)?;
-            if !(b'1'..=b'9').contains(&first) {
-                return Err(AnimationError::InvalidJson);
-            }
-            self.offset += 1;
-            while self.bytes.get(self.offset).is_some_and(u8::is_ascii_digit) {
-                self.offset += 1;
-            }
-        }
-        if self.consume(b'.') {
-            let digits = self.offset;
-            while self.bytes.get(self.offset).is_some_and(u8::is_ascii_digit) {
-                self.offset += 1;
-            }
-            if self.offset == digits {
-                return Err(AnimationError::InvalidJson);
-            }
-        }
-        if self.consume(b'e') || self.consume(b'E') {
-            if !self.consume(b'+') {
-                self.consume(b'-');
-            }
-            let digits = self.offset;
-            while self.bytes.get(self.offset).is_some_and(u8::is_ascii_digit) {
-                self.offset += 1;
-            }
-            if self.offset == digits {
-                return Err(AnimationError::InvalidJson);
-            }
-        }
-        let text = std::str::from_utf8(&self.bytes[start..self.offset])
-            .map_err(|_| AnimationError::InvalidJson)?;
-        let number = text
-            .parse::<f64>()
-            .map_err(|_| AnimationError::InvalidJson)?;
-        if !number.is_finite() {
-            return Err(AnimationError::InvalidJson);
-        }
-        Ok(number)
-    }
+    })
 }
 
 fn vector3(value: &JsonValue, uniform_scalar: bool) -> Result<[f32; 3], AnimationError> {
@@ -1119,7 +927,7 @@ fn optional_vector3(
 /// Returns all geometry definitions, preserving file order. Each entry's
 /// string identifier comes from `description.identifier` when present.
 pub fn parse_geometry_rigs_json(input: &str) -> Result<Vec<(String, SkeletonRig)>, AnimationError> {
-    let root = JsonParser::parse(input)?;
+    let root = parse_json(input)?;
     let geometries = root
         .field("minecraft:geometry")
         .ok_or(AnimationError::InvalidJson)?
@@ -1293,7 +1101,7 @@ fn parse_loop_mode(value: Option<&JsonValue>) -> Result<LoopMode, AnimationError
 /// `pre` and `post` keyframe values are preserved. Unsupported Molang/string
 /// expressions fail closed instead of silently generating an incorrect pose.
 pub fn parse_animation_json(input: &str) -> Result<Vec<AnimationClip>, AnimationError> {
-    let root = JsonParser::parse(input)?;
+    let root = parse_json(input)?;
     let animations = root
         .field("animations")
         .ok_or(AnimationError::InvalidJson)?
@@ -1399,7 +1207,7 @@ fn jem_model_bones(
 /// Parse an OptiFine `.jem` (JSON Entity Model) document into a rig: each
 /// `models[]` entry is a part tree whose `id`/`part` names the bone.
 pub fn parse_jem_model(input: &str) -> Result<SkeletonRig, AnimationError> {
-    let root = JsonParser::parse(input)?;
+    let root = parse_json(input)?;
     root.object()?;
     let models = root
         .field("models")
@@ -1419,7 +1227,7 @@ pub fn parse_jem_model(input: &str) -> Result<SkeletonRig, AnimationError> {
 /// Parse an OptiFine `.jpm` (JSON Part Model): a single model tree rooted at
 /// the document object, following the same node shape as `.jem` entries.
 pub fn parse_jpm_model(input: &str) -> Result<SkeletonRig, AnimationError> {
-    let root = JsonParser::parse(input)?;
+    let root = parse_json(input)?;
     root.object()?;
     let mut bones = Vec::new();
     let mut index = HashMap::new();

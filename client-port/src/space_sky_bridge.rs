@@ -766,8 +766,8 @@ pub fn build_3d_planet_mesh(body: &PlanetSkyBody) -> ExtrudedMesh {
 // Fail-closed JSON loader
 // ---------------------------------------------------------------------------
 
-/// Minimal JSON value. The parser below is self-contained so this module
-/// stays usable without pulling `model_baker`'s private parser.
+/// Minimal JSON value adapted from the canonical `megu_core::json` tree by
+/// [`parse_json`], kept local so this module's accessors stay unchanged.
 #[derive(Clone, Debug, PartialEq)]
 enum JVal {
     Null,
@@ -808,268 +808,49 @@ impl JVal {
     }
 }
 
-struct JParser<'a> {
-    b: &'a [u8],
-    i: usize,
-}
-
-impl<'a> JParser<'a> {
-    fn err(&self, msg: &str) -> String {
-        format!("JSON error at byte {}: {msg}", self.i)
-    }
-
-    fn peek(&self) -> Option<u8> {
-        self.b.get(self.i).copied()
-    }
-
-    fn ws(&mut self) {
-        while matches!(self.peek(), Some(b' ' | b'\t' | b'\n' | b'\r')) {
-            self.i += 1;
-        }
-    }
-
-    fn value(&mut self, depth: usize) -> Result<JVal, String> {
-        if depth >= MAX_JSON_DEPTH {
-            return Err(self.err("nesting too deep"));
-        }
-        self.ws();
-        match self.peek() {
-            Some(b'{') => self.object(depth),
-            Some(b'[') => self.array(depth),
-            Some(b'"') => Ok(JVal::Str(self.string()?)),
-            Some(b't') => self.literal(b"true", JVal::Bool(true)),
-            Some(b'f') => self.literal(b"false", JVal::Bool(false)),
-            Some(b'n') => self.literal(b"null", JVal::Null),
-            Some(b'-' | b'0'..=b'9') => self.number(),
-            _ => Err(self.err("expected a JSON value")),
-        }
-    }
-
-    fn literal(&mut self, lit: &[u8], v: JVal) -> Result<JVal, String> {
-        if self.b.len() >= self.i + lit.len() && &self.b[self.i..self.i + lit.len()] == lit {
-            self.i += lit.len();
-            Ok(v)
-        } else {
-            Err(self.err("invalid literal"))
-        }
-    }
-
-    fn object(&mut self, depth: usize) -> Result<JVal, String> {
-        self.i += 1; // '{'
-        let mut map = BTreeMap::new();
-        self.ws();
-        if self.peek() == Some(b'}') {
-            self.i += 1;
-            return Ok(JVal::Obj(map));
-        }
-        loop {
-            self.ws();
-            if self.peek() != Some(b'"') {
-                return Err(self.err("expected object key"));
-            }
-            let key = self.string()?;
-            self.ws();
-            if self.peek() != Some(b':') {
-                return Err(self.err("expected ':'"));
-            }
-            self.i += 1;
-            let v = self.value(depth + 1)?;
-            map.insert(key, v);
-            self.ws();
-            match self.peek() {
-                Some(b',') => self.i += 1,
-                Some(b'}') => {
-                    self.i += 1;
-                    return Ok(JVal::Obj(map));
-                }
-                _ => return Err(self.err("expected ',' or '}'")),
-            }
-        }
-    }
-
-    fn array(&mut self, depth: usize) -> Result<JVal, String> {
-        self.i += 1; // '['
-        let mut items = Vec::new();
-        self.ws();
-        if self.peek() == Some(b']') {
-            self.i += 1;
-            return Ok(JVal::Arr(items));
-        }
-        loop {
-            items.push(self.value(depth + 1)?);
-            self.ws();
-            match self.peek() {
-                Some(b',') => self.i += 1,
-                Some(b']') => {
-                    self.i += 1;
-                    return Ok(JVal::Arr(items));
-                }
-                _ => return Err(self.err("expected ',' or ']'")),
-            }
-        }
-    }
-
-    fn string(&mut self) -> Result<String, String> {
-        self.i += 1; // '"'
-        let mut out = String::new();
-        loop {
-            let Some(c) = self.peek() else {
-                return Err(self.err("unterminated string"));
-            };
-            self.i += 1;
-            match c {
-                b'"' => return Ok(out),
-                b'\\' => self.escape(&mut out)?,
-                0x00..=0x1f => return Err(self.err("unescaped control character")),
-                _ => {
-                    // Consume the full UTF-8 sequence the lead byte starts.
-                    let start = self.i - 1;
-                    let len = utf8_len(c).ok_or_else(|| self.err("invalid UTF-8 lead byte"))?;
-                    if self.i - 1 + len > self.b.len() {
-                        return Err(self.err("truncated UTF-8"));
-                    }
-                    self.i = start + len;
-                    out.push_str(
-                        std::str::from_utf8(&self.b[start..self.i])
-                            .map_err(|_| self.err("invalid UTF-8"))?,
-                    );
-                }
-            }
-        }
-    }
-
-    fn escape(&mut self, out: &mut String) -> Result<(), String> {
-        let Some(c) = self.peek() else {
-            return Err(self.err("truncated escape"));
-        };
-        self.i += 1;
-        match c {
-            b'"' => out.push('"'),
-            b'\\' => out.push('\\'),
-            b'/' => out.push('/'),
-            b'b' => out.push('\u{0008}'),
-            b'f' => out.push('\u{000c}'),
-            b'n' => out.push('\n'),
-            b'r' => out.push('\r'),
-            b't' => out.push('\t'),
-            b'u' => {
-                let hi = self.hex4()?;
-                let cp = if (0xd800..0xdc00).contains(&hi) {
-                    if self.peek() == Some(b'\\') {
-                        self.i += 1;
-                        if self.peek() != Some(b'u') {
-                            return Err(self.err("expected low surrogate escape"));
-                        }
-                        self.i += 1;
-                        let lo = self.hex4()?;
-                        if !(0xdc00..0xe000).contains(&lo) {
-                            return Err(self.err("invalid low surrogate"));
-                        }
-                        0x10000 + ((hi - 0xd800) << 10) + (lo - 0xdc00)
-                    } else {
-                        return Err(self.err("unpaired surrogate"));
-                    }
-                } else {
-                    hi
-                };
-                out.push(char::from_u32(cp).ok_or_else(|| self.err("invalid scalar value"))?);
-            }
-            _ => return Err(self.err("invalid escape")),
-        }
-        Ok(())
-    }
-
-    fn hex4(&mut self) -> Result<u32, String> {
-        let mut v = 0u32;
-        for _ in 0..4 {
-            let Some(c) = self.peek() else {
-                return Err(self.err("truncated \\u escape"));
-            };
-            let d = (c as char)
-                .to_digit(16)
-                .ok_or_else(|| self.err("bad hex digit"))?;
-            v = v * 16 + d;
-            self.i += 1;
-        }
-        Ok(v)
-    }
-
-    fn number(&mut self) -> Result<JVal, String> {
-        let start = self.i;
-        if self.peek() == Some(b'-') {
-            self.i += 1;
-        }
-        match self.peek() {
-            Some(b'0') => {
-                self.i += 1;
-                if matches!(self.peek(), Some(b'0'..=b'9')) {
-                    return Err(self.err("leading zeros are not valid JSON"));
-                }
-            }
-            Some(b'1'..=b'9') => {
-                while matches!(self.peek(), Some(b'0'..=b'9')) {
-                    self.i += 1;
-                }
-            }
-            _ => return Err(self.err("expected a digit")),
-        }
-        if self.peek() == Some(b'.') {
-            self.i += 1;
-            if !matches!(self.peek(), Some(b'0'..=b'9')) {
-                return Err(self.err("expected a digit after '.'"));
-            }
-            while matches!(self.peek(), Some(b'0'..=b'9')) {
-                self.i += 1;
-            }
-        }
-        if matches!(self.peek(), Some(b'e' | b'E')) {
-            self.i += 1;
-            if matches!(self.peek(), Some(b'+' | b'-')) {
-                self.i += 1;
-            }
-            if !matches!(self.peek(), Some(b'0'..=b'9')) {
-                return Err(self.err("expected a digit in the exponent"));
-            }
-            while matches!(self.peek(), Some(b'0'..=b'9')) {
-                self.i += 1;
-            }
-        }
-        let text =
-            std::str::from_utf8(&self.b[start..self.i]).map_err(|_| self.err("invalid number"))?;
-        let v: f64 = text.parse().map_err(|_| self.err("invalid number"))?;
-        if !v.is_finite() {
-            return Err(self.err("number is out of range"));
-        }
-        Ok(JVal::Num(v))
-    }
-
-    fn finish(&mut self) -> Result<(), String> {
-        self.ws();
-        if self.i != self.b.len() {
-            return Err(self.err("trailing content after JSON value"));
-        }
-        Ok(())
-    }
-}
-
-fn utf8_len(lead: u8) -> Option<usize> {
-    match lead {
-        0x00..=0x7f => Some(1),
-        0xc0..=0xdf => Some(2),
-        0xe0..=0xef => Some(3),
-        0xf0..=0xf7 => Some(4),
-        _ => None,
-    }
-}
+/// Bounds for [`parse_json`]: the historical [`MAX_JSON_DEPTH`] cap. The
+/// canonical reader counts the root value at depth 0 and rejects any value
+/// at `max_depth`, which is exactly the retired parser's contract here.
+const JSON_LIMITS: megu_core::json::JsonLimits = megu_core::json::JsonLimits {
+    max_depth: MAX_JSON_DEPTH,
+    max_nodes: usize::MAX,
+    max_bytes: usize::MAX,
+};
 
 fn parse_json(text: &str) -> Result<JVal, String> {
-    let mut p = JParser {
-        b: text.as_bytes(),
-        i: 0,
-    };
-    let v = p.value(0)?;
-    p.finish()?;
-    Ok(v)
+    let value = megu_core::json::parse_json_with_limits(text, JSON_LIMITS, false)
+        .map_err(|e| format!("JSON error at byte {}: {}", e.offset, e.message))?;
+    jval_from_json(&value)
+}
+
+/// Adapt the canonical [`megu_core::json::JsonValue`] tree into [`JVal`]:
+/// document-ordered members fold into a `BTreeMap` (last duplicate key
+/// wins, as before) and non-finite numbers fail closed.
+fn jval_from_json(value: &megu_core::json::JsonValue) -> Result<JVal, String> {
+    Ok(match value {
+        megu_core::json::JsonValue::Null => JVal::Null,
+        megu_core::json::JsonValue::Bool(b) => JVal::Bool(*b),
+        megu_core::json::JsonValue::Number(n) => {
+            if !n.is_finite() {
+                return Err("JSON error at byte 0: number is out of range".to_string());
+            }
+            JVal::Num(*n)
+        }
+        megu_core::json::JsonValue::String(s) => JVal::Str(s.clone()),
+        megu_core::json::JsonValue::Array(items) => JVal::Arr(
+            items
+                .iter()
+                .map(jval_from_json)
+                .collect::<Result<_, String>>()?,
+        ),
+        megu_core::json::JsonValue::Object(members) => {
+            let mut map = BTreeMap::new();
+            for (key, member) in members {
+                map.insert(key.clone(), jval_from_json(member)?);
+            }
+            JVal::Obj(map)
+        }
+    })
 }
 
 // ---- field extraction helpers: present-but-wrong-type is an error --------

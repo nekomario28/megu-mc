@@ -29,6 +29,8 @@ use std::collections::{BTreeMap, HashSet};
 use std::error::Error;
 use std::fmt;
 
+use megu_core::json::{JsonLimits, JsonValue};
+
 use crate::section::Direction;
 
 // ---------------------------------------------------------------------------
@@ -190,284 +192,58 @@ impl Json {
     }
 }
 
-struct JsonParser<'a> {
-    bytes: &'a [u8],
-    pos: usize,
-}
-
-impl<'a> JsonParser<'a> {
-    fn err(&self, message: impl Into<String>) -> JsonError {
-        JsonError {
-            offset: self.pos,
-            message: message.into(),
-        }
-    }
-
-    fn peek(&self) -> Option<u8> {
-        self.bytes.get(self.pos).copied()
-    }
-
-    fn skip_ws(&mut self) {
-        while matches!(self.peek(), Some(b' ' | b'\t' | b'\n' | b'\r')) {
-            self.pos += 1;
-        }
-    }
-
-    fn literal(&mut self, literal: &'static [u8], value: Json) -> Result<Json, JsonError> {
-        if self.bytes[self.pos..].starts_with(literal) {
-            self.pos += literal.len();
-            Ok(value)
-        } else {
-            Err(self.err("expected a JSON value"))
-        }
-    }
-
-    fn value(&mut self, depth: usize) -> Result<Json, JsonError> {
-        self.skip_ws();
-        match self.peek() {
-            None => Err(self.err("expected a JSON value")),
-            Some(b'{') => self.object(depth),
-            Some(b'[') => self.array(depth),
-            Some(b'"') => Ok(Json::Str(self.string()?)),
-            Some(b't') => self.literal(b"true", Json::Bool(true)),
-            Some(b'f') => self.literal(b"false", Json::Bool(false)),
-            Some(b'n') => self.literal(b"null", Json::Null),
-            Some(b'-' | b'0'..=b'9') => self.number(),
-            Some(_) => Err(self.err("expected a JSON value")),
-        }
-    }
-
-    /// Entering a container at `depth` enclosing containers: the cap is
-    /// checked here so scalars at maximum depth still parse.
-    fn container_open(&self, depth: usize) -> Result<(), JsonError> {
-        if depth >= MAX_JSON_DEPTH {
-            return Err(self.err(format!("JSON nesting deeper than {MAX_JSON_DEPTH} levels")));
-        }
-        Ok(())
-    }
-
-    fn object(&mut self, depth: usize) -> Result<Json, JsonError> {
-        self.container_open(depth)?;
-        self.pos += 1; // '{'
-        let mut map = BTreeMap::new();
-        self.skip_ws();
-        if self.peek() == Some(b'}') {
-            self.pos += 1;
-            return Ok(Json::Obj(map));
-        }
-        loop {
-            self.skip_ws();
-            if self.peek() != Some(b'"') {
-                return Err(self.err("expected an object key"));
-            }
-            let key = self.string()?;
-            self.skip_ws();
-            if self.peek() != Some(b':') {
-                return Err(self.err("expected ':' after object key"));
-            }
-            self.pos += 1;
-            let value = self.value(depth + 1)?;
-            map.insert(key, value);
-            self.skip_ws();
-            match self.peek() {
-                Some(b',') => self.pos += 1,
-                Some(b'}') => {
-                    self.pos += 1;
-                    return Ok(Json::Obj(map));
-                }
-                _ => return Err(self.err("expected ',' or '}' in object")),
-            }
-        }
-    }
-
-    fn array(&mut self, depth: usize) -> Result<Json, JsonError> {
-        self.container_open(depth)?;
-        self.pos += 1; // '['
-        let mut items = Vec::new();
-        self.skip_ws();
-        if self.peek() == Some(b']') {
-            self.pos += 1;
-            return Ok(Json::Arr(items));
-        }
-        loop {
-            items.push(self.value(depth + 1)?);
-            self.skip_ws();
-            match self.peek() {
-                Some(b',') => self.pos += 1,
-                Some(b']') => {
-                    self.pos += 1;
-                    return Ok(Json::Arr(items));
-                }
-                _ => return Err(self.err("expected ',' or ']' in array")),
-            }
-        }
-    }
-
-    /// A JSON string starting at the opening quote. Byte-level scanning is
-    /// safe: the input is a `&str` (already UTF-8), and the only bytes with
-    /// syntactic meaning — `"`, `\` and control bytes below 0x20 — can never
-    /// appear inside a multi-byte UTF-8 sequence, so runs copied between
-    /// them stay valid UTF-8.
-    fn string(&mut self) -> Result<String, JsonError> {
-        self.pos += 1; // opening '"'
-        let mut out = String::new();
-        loop {
-            let run_start = self.pos;
-            while let Some(b) = self.peek() {
-                if b == b'"' || b == b'\\' || b < 0x20 {
-                    break;
-                }
-                self.pos += 1;
-            }
-            // The slice is valid UTF-8 by the argument above; a failure here
-            // would mean the scanner split a multi-byte sequence, which is
-            // an internal bug — still reported, never unwrapped.
-            let run = std::str::from_utf8(&self.bytes[run_start..self.pos])
-                .map_err(|_| self.err("invalid UTF-8 in string"))?;
-            out.push_str(run);
-            match self.peek() {
-                None => return Err(self.err("unterminated string")),
-                Some(b'"') => {
-                    self.pos += 1;
-                    return Ok(out);
-                }
-                Some(b'\\') => {
-                    self.pos += 1;
-                    self.escape(&mut out)?;
-                }
-                Some(_) => return Err(self.err("unescaped control character in string")),
-            }
-        }
-    }
-
-    /// The byte after `\`. `\uXXXX` sequences are combined into scalar
-    /// values; a lone surrogate is malformed JSON for this parser's purposes
-    /// and refused rather than lossily replaced.
-    fn escape(&mut self, out: &mut String) -> Result<(), JsonError> {
-        match self.peek() {
-            Some(b'"') => out.push('"'),
-            Some(b'\\') => out.push('\\'),
-            Some(b'/') => out.push('/'),
-            Some(b'b') => out.push('\u{8}'),
-            Some(b'f') => out.push('\u{c}'),
-            Some(b'n') => out.push('\n'),
-            Some(b'r') => out.push('\r'),
-            Some(b't') => out.push('\t'),
-            Some(b'u') => {
-                self.pos += 1;
-                let hi = self.hex4()?;
-                let cp = if (0xD800..=0xDBFF).contains(&hi) {
-                    // A high surrogate must be followed by \uDC00-\uDFFF.
-                    if self.peek() == Some(b'\\') {
-                        self.pos += 1;
-                    }
-                    if self.peek() != Some(b'u') {
-                        return Err(self.err("lone high surrogate in \\u escape"));
-                    }
-                    self.pos += 1;
-                    let lo = self.hex4()?;
-                    if !(0xDC00..=0xDFFF).contains(&lo) {
-                        return Err(self.err("expected low surrogate after \\uXXXX"));
-                    }
-                    0x1_0000 + ((hi - 0xD800) << 10) + (lo - 0xDC00)
-                } else if (0xDC00..=0xDFFF).contains(&hi) {
-                    return Err(self.err("lone low surrogate in \\u escape"));
-                } else {
-                    hi
-                };
-                out.push(char::from_u32(cp).ok_or_else(|| self.err("invalid \\u escape"))?);
-                return Ok(());
-            }
-            _ => return Err(self.err("invalid escape sequence")),
-        }
-        self.pos += 1;
-        Ok(())
-    }
-
-    fn hex4(&mut self) -> Result<u32, JsonError> {
-        let mut value = 0u32;
-        for _ in 0..4 {
-            let b = self
-                .peek()
-                .ok_or_else(|| self.err("truncated \\u escape"))?;
-            let digit = match b {
-                b'0'..=b'9' => b - b'0',
-                b'a'..=b'f' => b - b'a' + 10,
-                b'A'..=b'F' => b - b'A' + 10,
-                _ => return Err(self.err("non-hex digit in \\u escape")),
-            };
-            value = value * 16 + u32::from(digit);
-            self.pos += 1;
-        }
-        Ok(value)
-    }
-
-    /// `-?(0|[1-9][0-9]*)(\.[0-9]+)?([eE][+-]?[0-9]+)?` — the JSON number
-    /// grammar, kept strict. The parsed value must stay finite: `1e999`
-    /// overflows to infinity and is rejected rather than silently baking an
-    /// infinite coordinate.
-    fn number(&mut self) -> Result<Json, JsonError> {
-        let start = self.pos;
-        if self.peek() == Some(b'-') {
-            self.pos += 1;
-        }
-        match self.peek() {
-            Some(b'0') => {
-                self.pos += 1;
-                if matches!(self.peek(), Some(b'0'..=b'9')) {
-                    return Err(self.err("leading zeros are not valid JSON"));
-                }
-            }
-            Some(b'1'..=b'9') => {
-                while matches!(self.peek(), Some(b'0'..=b'9')) {
-                    self.pos += 1;
-                }
-            }
-            _ => return Err(self.err("expected a digit")),
-        }
-        if self.peek() == Some(b'.') {
-            self.pos += 1;
-            if !matches!(self.peek(), Some(b'0'..=b'9')) {
-                return Err(self.err("expected a digit after '.'"));
-            }
-            while matches!(self.peek(), Some(b'0'..=b'9')) {
-                self.pos += 1;
-            }
-        }
-        if matches!(self.peek(), Some(b'e') | Some(b'E')) {
-            self.pos += 1;
-            if matches!(self.peek(), Some(b'+') | Some(b'-')) {
-                self.pos += 1;
-            }
-            if !matches!(self.peek(), Some(b'0'..=b'9')) {
-                return Err(self.err("expected a digit in the exponent"));
-            }
-            while matches!(self.peek(), Some(b'0'..=b'9')) {
-                self.pos += 1;
-            }
-        }
-        // The accepted grammar is pure ASCII, so this slice is always &str.
-        let text = std::str::from_utf8(&self.bytes[start..self.pos])
-            .map_err(|_| self.err("invalid number"))?;
-        let value: f64 = text.parse().map_err(|_| self.err("invalid number"))?;
-        if !value.is_finite() {
-            return Err(self.err("number is out of range"));
-        }
-        Ok(Json::Num(value))
-    }
-}
+/// Bounds for [`parse_json`]. `max_depth` is one past [`MAX_JSON_DEPTH`]:
+/// the canonical reader counts the root value at depth 0 and rejects any
+/// value *at* `max_depth`, matching the retired parser's "64 containers,
+/// scalars at depth 64 still parse" contract. Node and byte ceilings stay
+/// off — the retired parser had none and model files can be large.
+const JSON_LIMITS: JsonLimits = JsonLimits {
+    max_depth: MAX_JSON_DEPTH + 1,
+    max_nodes: usize::MAX,
+    max_bytes: usize::MAX,
+};
 
 fn parse_json(text: &str) -> Result<Json, JsonError> {
-    let mut parser = JsonParser {
-        bytes: text.as_bytes(),
-        pos: 0,
-    };
-    let value = parser.value(0)?;
-    parser.skip_ws();
-    if parser.pos != parser.bytes.len() {
-        return Err(parser.err("trailing bytes after JSON value"));
-    }
-    Ok(value)
+    let value = megu_core::json::parse_json_with_limits(text, JSON_LIMITS, false)
+        .map_err(|e| JsonError {
+            offset: e.offset,
+            message: e.message,
+        })?;
+    json_value_to_json(&value)
+}
+
+/// Adapt the canonical [`JsonValue`] tree into this module's [`Json`]:
+/// objects fold document-ordered members into a `BTreeMap` (last duplicate
+/// key wins, as before), and non-finite numbers fail closed — the retired
+/// parser rejected `1e999` at parse time and the baker relies on that.
+fn json_value_to_json(value: &JsonValue) -> Result<Json, JsonError> {
+    Ok(match value {
+        JsonValue::Null => Json::Null,
+        JsonValue::Bool(b) => Json::Bool(*b),
+        JsonValue::Number(n) => {
+            if !n.is_finite() {
+                return Err(JsonError {
+                    offset: 0,
+                    message: "number is out of range".to_string(),
+                });
+            }
+            Json::Num(*n)
+        }
+        JsonValue::String(s) => Json::Str(s.clone()),
+        JsonValue::Array(items) => Json::Arr(
+            items
+                .iter()
+                .map(json_value_to_json)
+                .collect::<Result<_, JsonError>>()?,
+        ),
+        JsonValue::Object(members) => {
+            let mut map = BTreeMap::new();
+            for (key, member) in members {
+                map.insert(key.clone(), json_value_to_json(member)?);
+            }
+            Json::Obj(map)
+        }
+    })
 }
 
 // ---------------------------------------------------------------------------

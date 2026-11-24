@@ -20,6 +20,8 @@
 use std::collections::HashMap;
 use std::fmt;
 
+use megu_core::json::{parse_json_with_limits, JsonLimits, JsonValue as Json};
+
 use crate::data_v767::{
     V767_BLOCKS, V767_COMPONENTS, V767_ENTITY_TYPES, V767_ITEMS, V767_MENUS, V767_PACKETS,
 };
@@ -512,265 +514,31 @@ impl IdRemapper {
 // ---------------------------------------------------------------------------
 // Minimal JSON for version packs
 //
-// Version packs are plain data files, so this is a deliberately small,
-// fail-closed parser: objects, arrays, strings, booleans, null and *integer*
-// numbers only (DataGenerator reports never emit fractions; accepting floats
-// would blur "id" fields). Duplicate object keys and nesting beyond a fixed
-// depth are rejected, and the document must consume the whole input.
+// Version packs are plain data files parsed by the canonical
+// `megu_core::json` reader: a complete RFC 8259 document, fail-closed on
+// malformed input, duplicate object keys and excessive nesting. Numbers
+// surface as `f64`; [`int`] re-imposes the pack rule that id fields are
+// integers.
 // ---------------------------------------------------------------------------
 
-#[derive(Debug, PartialEq)]
-enum Json {
-    Null,
-    Bool(bool),
-    Int(i64),
-    String(String),
-    Array(Vec<Json>),
-    Object(Vec<(String, Json)>),
-}
-
-const MAX_JSON_DEPTH: usize = 64;
-
-struct JsonCursor<'a> {
-    bytes: &'a [u8],
-    pos: usize,
-}
-
-impl<'a> JsonCursor<'a> {
-    fn parse(input: &'a str) -> Result<Json, ProtoError> {
-        let mut cur = Self {
-            bytes: input.as_bytes(),
-            pos: 0,
-        };
-        cur.ws();
-        let value = cur.value(0)?;
-        cur.ws();
-        if cur.pos != cur.bytes.len() {
-            return Err(ProtoError::VersionPack("trailing data after JSON document"));
-        }
-        Ok(value)
-    }
-
-    fn ws(&mut self) {
-        while matches!(self.bytes.get(self.pos), Some(b' ' | b'\t' | b'\n' | b'\r')) {
-            self.pos += 1;
-        }
-    }
-
-    fn value(&mut self, depth: usize) -> Result<Json, ProtoError> {
-        if depth > MAX_JSON_DEPTH {
-            return Err(ProtoError::VersionPack("JSON nesting too deep"));
-        }
-        match self.bytes.get(self.pos) {
-            Some(b'{') => self.object(depth),
-            Some(b'[') => self.array(depth),
-            Some(b'"') => self.string().map(Json::String),
-            Some(b't') => self.literal(b"true", Json::Bool(true)),
-            Some(b'f') => self.literal(b"false", Json::Bool(false)),
-            Some(b'n') => self.literal(b"null", Json::Null),
-            Some(b'-' | b'0'..=b'9') => self.number(),
-            _ => Err(ProtoError::VersionPack("unexpected JSON token")),
-        }
-    }
-
-    fn literal(&mut self, lit: &[u8], value: Json) -> Result<Json, ProtoError> {
-        if self.bytes[self.pos..].starts_with(lit) {
-            self.pos += lit.len();
-            Ok(value)
-        } else {
-            Err(ProtoError::VersionPack("malformed JSON literal"))
-        }
-    }
-
-    fn number(&mut self) -> Result<Json, ProtoError> {
-        let start = self.pos;
-        if self.bytes.get(self.pos) == Some(&b'-') {
-            self.pos += 1;
-        }
-        let int_start = self.pos;
-        while matches!(self.bytes.get(self.pos), Some(b'0'..=b'9')) {
-            self.pos += 1;
-        }
-        if self.pos == int_start {
-            return Err(ProtoError::VersionPack("malformed JSON number"));
-        }
-        if matches!(self.bytes.get(self.pos), Some(b'.' | b'e' | b'E')) {
-            return Err(ProtoError::VersionPack(
-                "non-integer numbers are not valid in version packs",
-            ));
-        }
-        let text = std::str::from_utf8(&self.bytes[start..self.pos])
-            .map_err(|_| ProtoError::VersionPack("non-UTF8 number"))?;
-        text.parse::<i64>()
-            .map(Json::Int)
-            .map_err(|_| ProtoError::VersionPack("number out of i64 range"))
-    }
-
-    fn hex4(&mut self) -> Result<u32, ProtoError> {
-        let mut v = 0u32;
-        for _ in 0..4 {
-            let Some(&b) = self.bytes.get(self.pos) else {
-                return Err(ProtoError::VersionPack("truncated \\u escape"));
-            };
-            self.pos += 1;
-            v = (v << 4)
-                | match b {
-                    b'0'..=b'9' => u32::from(b - b'0'),
-                    b'a'..=b'f' => u32::from(b - b'a' + 10),
-                    b'A'..=b'F' => u32::from(b - b'A' + 10),
-                    _ => return Err(ProtoError::VersionPack("bad \\u escape digit")),
-                };
-        }
-        Ok(v)
-    }
-
-    fn string(&mut self) -> Result<String, ProtoError> {
-        self.pos += 1; // opening quote
-        let mut out = String::new();
-        loop {
-            let Some(&b) = self.bytes.get(self.pos) else {
-                return Err(ProtoError::VersionPack("unterminated JSON string"));
-            };
-            self.pos += 1;
-            match b {
-                b'"' => return Ok(out),
-                b'\\' => {
-                    let Some(&esc) = self.bytes.get(self.pos) else {
-                        return Err(ProtoError::VersionPack("truncated escape"));
-                    };
-                    self.pos += 1;
-                    match esc {
-                        b'"' => out.push('"'),
-                        b'\\' => out.push('\\'),
-                        b'/' => out.push('/'),
-                        b'b' => out.push('\u{8}'),
-                        b'f' => out.push('\u{c}'),
-                        b'n' => out.push('\n'),
-                        b'r' => out.push('\r'),
-                        b't' => out.push('\t'),
-                        b'u' => {
-                            let hi = self.hex4()?;
-                            let c = if (0xd800..0xdc00).contains(&hi) {
-                                if self.bytes.get(self.pos) == Some(&b'\\')
-                                    && self.bytes.get(self.pos + 1) == Some(&b'u')
-                                {
-                                    self.pos += 2;
-                                    let lo = self.hex4()?;
-                                    if !(0xdc00..0xe000).contains(&lo) {
-                                        return Err(ProtoError::VersionPack(
-                                            "lone high surrogate in string",
-                                        ));
-                                    }
-                                    let c = 0x1_0000
-                                        + (((hi - 0xd800) << 10) | (lo - 0xdc00));
-                                    char::from_u32(c).ok_or(ProtoError::VersionPack(
-                                        "bad surrogate pair",
-                                    ))?
-                                } else {
-                                    return Err(ProtoError::VersionPack(
-                                        "lone high surrogate in string",
-                                    ));
-                                }
-                            } else {
-                                char::from_u32(hi).ok_or(ProtoError::VersionPack(
-                                    "bad unicode escape",
-                                ))?
-                            };
-                            out.push(c);
-                        }
-                        _ => return Err(ProtoError::VersionPack("bad string escape")),
-                    }
-                }
-                0x00..=0x1f => {
-                    return Err(ProtoError::VersionPack("raw control character in string"))
-                }
-                _ => {
-                    // Copy the full UTF-8 sequence verbatim — validation
-                    // happens once via from_utf8 at the end.
-                    let extra = match b {
-                        0x20..=0x7f => 0,
-                        0xc0..=0xdf => 1,
-                        0xe0..=0xef => 2,
-                        0xf0..=0xf7 => 3,
-                        _ => return Err(ProtoError::VersionPack("invalid UTF-8 in string")),
-                    };
-                    let start = self.pos - 1;
-                    let end = start + 1 + extra;
-                    if end > self.bytes.len() {
-                        return Err(ProtoError::VersionPack("truncated UTF-8 in string"));
-                    }
-                    let text = std::str::from_utf8(&self.bytes[start..end])
-                        .map_err(|_| ProtoError::VersionPack("invalid UTF-8 in string"))?;
-                    out.push_str(text);
-                    self.pos = end;
-                }
-            }
-        }
-    }
-
-    fn array(&mut self, depth: usize) -> Result<Json, ProtoError> {
-        self.pos += 1; // '['
-        let mut items = Vec::new();
-        self.ws();
-        if self.bytes.get(self.pos) == Some(&b']') {
-            self.pos += 1;
-            return Ok(Json::Array(items));
-        }
-        loop {
-            self.ws();
-            items.push(self.value(depth + 1)?);
-            self.ws();
-            match self.bytes.get(self.pos) {
-                Some(b',') => self.pos += 1,
-                Some(b']') => {
-                    self.pos += 1;
-                    return Ok(Json::Array(items));
-                }
-                _ => return Err(ProtoError::VersionPack("malformed JSON array")),
-            }
-        }
-    }
-
-    fn object(&mut self, depth: usize) -> Result<Json, ProtoError> {
-        self.pos += 1; // '{'
-        let mut entries = Vec::new();
-        self.ws();
-        if self.bytes.get(self.pos) == Some(&b'}') {
-            self.pos += 1;
-            return Ok(Json::Object(entries));
-        }
-        loop {
-            self.ws();
-            if self.bytes.get(self.pos) != Some(&b'"') {
-                return Err(ProtoError::VersionPack("JSON object keys must be strings"));
-            }
-            let key = self.string()?;
-            self.ws();
-            if self.bytes.get(self.pos) != Some(&b':') {
-                return Err(ProtoError::VersionPack("missing ':' in JSON object"));
-            }
-            self.pos += 1;
-            self.ws();
-            let value = self.value(depth + 1)?;
-            if entries.iter().any(|(k, _)| k == &key) {
-                return Err(ProtoError::DuplicateEntry("JSON object repeats a key"));
-            }
-            entries.push((key, value));
-            self.ws();
-            match self.bytes.get(self.pos) {
-                Some(b',') => self.pos += 1,
-                Some(b'}') => {
-                    self.pos += 1;
-                    return Ok(Json::Object(entries));
-                }
-                _ => return Err(ProtoError::VersionPack("malformed JSON object")),
-            }
-        }
-    }
-}
+/// Bounds for version-pack documents. `max_depth` is one past the historical
+/// 64-level cap because the canonical reader counts the root value as depth
+/// 0 where the retired cursor rejected `depth > 64`; node and byte ceilings
+/// stay off — pack files are operator-supplied data, not wire input.
+const JSON_LIMITS: JsonLimits = JsonLimits {
+    max_depth: 65,
+    max_nodes: usize::MAX,
+    max_bytes: usize::MAX,
+};
 
 fn json_parse(input: &str) -> Result<Json, ProtoError> {
-    JsonCursor::parse(input)
+    parse_json_with_limits(input, JSON_LIMITS, true).map_err(|e| {
+        if e.message == "duplicate object key" {
+            ProtoError::DuplicateEntry("JSON object repeats a key")
+        } else {
+            ProtoError::VersionPack("malformed JSON in version pack")
+        }
+    })
 }
 
 fn obj_get<'a>(map: &'a [(String, Json)], key: &str) -> Option<&'a Json> {
@@ -789,7 +557,11 @@ fn object<'a>(
 
 fn int(value: &Json, _what: &'static str) -> Result<i64, ProtoError> {
     match value {
-        Json::Int(n) => Ok(*n),
+        Json::Number(n)
+            if n.fract() == 0.0 && *n >= i64::MIN as f64 && *n <= i64::MAX as f64 =>
+        {
+            Ok(*n as i64)
+        }
         _ => Err(ProtoError::VersionPack("expected an integer id")),
     }
 }

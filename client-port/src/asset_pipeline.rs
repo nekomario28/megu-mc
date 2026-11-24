@@ -921,259 +921,49 @@ impl MetaJson {
     }
 }
 
-struct MetaParser<'a> {
-    bytes: &'a [u8],
-    pos: usize,
-}
-
-impl<'a> MetaParser<'a> {
-    fn err(&self, message: impl Into<String>) -> String {
-        format!("{} at byte {}", message.into(), self.pos)
-    }
-
-    fn peek(&self) -> Option<u8> {
-        self.bytes.get(self.pos).copied()
-    }
-
-    fn skip_ws(&mut self) {
-        while matches!(self.peek(), Some(b' ' | b'\t' | b'\n' | b'\r')) {
-            self.pos += 1;
-        }
-    }
-
-    fn value(&mut self, depth: usize) -> Result<MetaJson, String> {
-        if depth >= MAX_META_JSON_DEPTH {
-            return Err(self.err(format!("JSON nesting deeper than {MAX_META_JSON_DEPTH}")));
-        }
-        self.skip_ws();
-        match self.peek() {
-            Some(b'{') => self.object(depth),
-            Some(b'[') => self.array(depth),
-            Some(b'"') => Ok(MetaJson::Str(self.string()?)),
-            Some(b't') => self.literal(b"true", MetaJson::Bool(true)),
-            Some(b'f') => self.literal(b"false", MetaJson::Bool(false)),
-            Some(b'n') => self.literal(b"null", MetaJson::Null),
-            Some(b'-' | b'0'..=b'9') => self.number(),
-            _ => Err(self.err("expected a JSON value")),
-        }
-    }
-
-    fn literal(&mut self, literal: &'static [u8], value: MetaJson) -> Result<MetaJson, String> {
-        if self.bytes[self.pos..].starts_with(literal) {
-            self.pos += literal.len();
-            Ok(value)
-        } else {
-            Err(self.err("expected a JSON value"))
-        }
-    }
-
-    fn object(&mut self, depth: usize) -> Result<MetaJson, String> {
-        self.pos += 1; // '{'
-        let mut map = BTreeMap::new();
-        self.skip_ws();
-        if self.peek() == Some(b'}') {
-            self.pos += 1;
-            return Ok(MetaJson::Obj(map));
-        }
-        loop {
-            self.skip_ws();
-            if self.peek() != Some(b'"') {
-                return Err(self.err("expected an object key"));
-            }
-            let key = self.string()?;
-            self.skip_ws();
-            if self.peek() != Some(b':') {
-                return Err(self.err("expected ':' after object key"));
-            }
-            self.pos += 1;
-            let value = self.value(depth + 1)?;
-            map.insert(key, value);
-            self.skip_ws();
-            match self.peek() {
-                Some(b',') => self.pos += 1,
-                Some(b'}') => {
-                    self.pos += 1;
-                    return Ok(MetaJson::Obj(map));
-                }
-                _ => return Err(self.err("expected ',' or '}' in object")),
-            }
-        }
-    }
-
-    fn array(&mut self, depth: usize) -> Result<MetaJson, String> {
-        self.pos += 1; // '['
-        let mut items = Vec::new();
-        self.skip_ws();
-        if self.peek() == Some(b']') {
-            self.pos += 1;
-            return Ok(MetaJson::Arr(items));
-        }
-        loop {
-            items.push(self.value(depth + 1)?);
-            self.skip_ws();
-            match self.peek() {
-                Some(b',') => self.pos += 1,
-                Some(b']') => {
-                    self.pos += 1;
-                    return Ok(MetaJson::Arr(items));
-                }
-                _ => return Err(self.err("expected ',' or ']' in array")),
-            }
-        }
-    }
-
-    /// JSON string starting at the opening quote. Byte-level scanning is
-    /// safe for the same reason as `model_baker`'s parser: the input is a
-    /// `&str`, and `"`, `\` and control bytes never appear inside a
-    /// multi-byte UTF-8 sequence.
-    fn string(&mut self) -> Result<String, String> {
-        self.pos += 1; // opening '"'
-        let mut out = String::new();
-        loop {
-            let run_start = self.pos;
-            while let Some(b) = self.peek() {
-                if b == b'"' || b == b'\\' || b < 0x20 {
-                    break;
-                }
-                self.pos += 1;
-            }
-            let run = std::str::from_utf8(&self.bytes[run_start..self.pos])
-                .map_err(|_| self.err("invalid UTF-8 in string"))?;
-            out.push_str(run);
-            match self.peek() {
-                None => return Err(self.err("unterminated string")),
-                Some(b'"') => {
-                    self.pos += 1;
-                    return Ok(out);
-                }
-                Some(b'\\') => {
-                    self.pos += 1;
-                    self.escape(&mut out)?;
-                }
-                Some(_) => return Err(self.err("unescaped control character in string")),
-            }
-        }
-    }
-
-    fn escape(&mut self, out: &mut String) -> Result<(), String> {
-        match self.peek() {
-            Some(b'"') => out.push('"'),
-            Some(b'\\') => out.push('\\'),
-            Some(b'/') => out.push('/'),
-            Some(b'b') => out.push('\u{8}'),
-            Some(b'f') => out.push('\u{c}'),
-            Some(b'n') => out.push('\n'),
-            Some(b'r') => out.push('\r'),
-            Some(b't') => out.push('\t'),
-            Some(b'u') => {
-                self.pos += 1;
-                let hi = self.hex4()?;
-                let cp = if (0xD800..=0xDBFF).contains(&hi) {
-                    if self.peek() == Some(b'\\') {
-                        self.pos += 1;
-                    }
-                    if self.peek() != Some(b'u') {
-                        return Err(self.err("lone high surrogate in \\u escape"));
-                    }
-                    self.pos += 1;
-                    let lo = self.hex4()?;
-                    if !(0xDC00..=0xDFFF).contains(&lo) {
-                        return Err(self.err("expected low surrogate after \\uXXXX"));
-                    }
-                    0x1_0000 + ((hi - 0xD800) << 10) + (lo - 0xDC00)
-                } else if (0xDC00..=0xDFFF).contains(&hi) {
-                    return Err(self.err("lone low surrogate in \\u escape"));
-                } else {
-                    hi
-                };
-                out.push(char::from_u32(cp).ok_or_else(|| self.err("invalid \\u escape"))?);
-                return Ok(());
-            }
-            _ => return Err(self.err("invalid escape sequence")),
-        }
-        self.pos += 1;
-        Ok(())
-    }
-
-    fn hex4(&mut self) -> Result<u32, String> {
-        let mut value = 0u32;
-        for _ in 0..4 {
-            let b = self.peek().ok_or_else(|| self.err("truncated \\u escape"))?;
-            let digit = match b {
-                b'0'..=b'9' => b - b'0',
-                b'a'..=b'f' => b - b'a' + 10,
-                b'A'..=b'F' => b - b'A' + 10,
-                _ => return Err(self.err("non-hex digit in \\u escape")),
-            };
-            value = value * 16 + u32::from(digit);
-            self.pos += 1;
-        }
-        Ok(value)
-    }
-
-    /// Strict JSON number grammar; non-finite results (`1e999`) are
-    /// rejected rather than silently accepted.
-    fn number(&mut self) -> Result<MetaJson, String> {
-        let start = self.pos;
-        if self.peek() == Some(b'-') {
-            self.pos += 1;
-        }
-        match self.peek() {
-            Some(b'0') => {
-                self.pos += 1;
-                if matches!(self.peek(), Some(b'0'..=b'9')) {
-                    return Err(self.err("leading zeros are not valid JSON"));
-                }
-            }
-            Some(b'1'..=b'9') => {
-                while matches!(self.peek(), Some(b'0'..=b'9')) {
-                    self.pos += 1;
-                }
-            }
-            _ => return Err(self.err("expected a digit")),
-        }
-        if self.peek() == Some(b'.') {
-            self.pos += 1;
-            if !matches!(self.peek(), Some(b'0'..=b'9')) {
-                return Err(self.err("expected a digit after '.'"));
-            }
-            while matches!(self.peek(), Some(b'0'..=b'9')) {
-                self.pos += 1;
-            }
-        }
-        if matches!(self.peek(), Some(b'e') | Some(b'E')) {
-            self.pos += 1;
-            if matches!(self.peek(), Some(b'+') | Some(b'-')) {
-                self.pos += 1;
-            }
-            if !matches!(self.peek(), Some(b'0'..=b'9')) {
-                return Err(self.err("expected a digit in the exponent"));
-            }
-            while matches!(self.peek(), Some(b'0'..=b'9')) {
-                self.pos += 1;
-            }
-        }
-        let text = std::str::from_utf8(&self.bytes[start..self.pos])
-            .map_err(|_| self.err("invalid number"))?;
-        let value: f64 = text.parse().map_err(|_| self.err("invalid number"))?;
-        if !value.is_finite() {
-            return Err(self.err("number is out of range"));
-        }
-        Ok(MetaJson::Num(value))
-    }
-}
+/// Bounds for [`parse_meta_json`]: the historical [`MAX_META_JSON_DEPTH`]
+/// cap. The canonical reader counts the root value at depth 0 and rejects
+/// any value at `max_depth`, which is exactly the retired parser's contract.
+const META_JSON_LIMITS: megu_core::json::JsonLimits = megu_core::json::JsonLimits {
+    max_depth: MAX_META_JSON_DEPTH,
+    max_nodes: usize::MAX,
+    max_bytes: usize::MAX,
+};
 
 fn parse_meta_json(text: &str) -> Result<MetaJson, String> {
-    let mut parser = MetaParser {
-        bytes: text.as_bytes(),
-        pos: 0,
-    };
-    let value = parser.value(0)?;
-    parser.skip_ws();
-    if parser.pos != parser.bytes.len() {
-        return Err(parser.err("trailing bytes after JSON value"));
-    }
-    Ok(value)
+    let value = megu_core::json::parse_json_with_limits(text, META_JSON_LIMITS, false)
+        .map_err(|e| format!("{} at byte {}", e.message, e.offset))?;
+    meta_json_from_json(&value)
+}
+
+/// Adapt the canonical [`megu_core::json::JsonValue`] tree into
+/// [`MetaJson`]: document-ordered members fold into a `BTreeMap` (last
+/// duplicate key wins, as before) and non-finite numbers fail closed.
+fn meta_json_from_json(value: &megu_core::json::JsonValue) -> Result<MetaJson, String> {
+    Ok(match value {
+        megu_core::json::JsonValue::Null => MetaJson::Null,
+        megu_core::json::JsonValue::Bool(b) => MetaJson::Bool(*b),
+        megu_core::json::JsonValue::Number(n) => {
+            if !n.is_finite() {
+                return Err("number is out of range at byte 0".to_string());
+            }
+            MetaJson::Num(*n)
+        }
+        megu_core::json::JsonValue::String(s) => MetaJson::Str(s.clone()),
+        megu_core::json::JsonValue::Array(items) => MetaJson::Arr(
+            items
+                .iter()
+                .map(meta_json_from_json)
+                .collect::<Result<_, String>>()?,
+        ),
+        megu_core::json::JsonValue::Object(members) => {
+            let mut map = BTreeMap::new();
+            for (key, member) in members {
+                map.insert(key.clone(), meta_json_from_json(member)?);
+            }
+            MetaJson::Obj(map)
+        }
+    })
 }
 
 /// Reads a strict non-negative `u32` integer field.

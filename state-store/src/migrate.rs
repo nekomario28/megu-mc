@@ -31,6 +31,7 @@
 use crate::datafix::{DataFixError, DataFixReport, DataFixer, DataValue, DV_1_21_1};
 use crate::sharded::ServerContext;
 use crate::snapshot::{decode_snapshot, encode_snapshot, SnapshotError};
+use megu_core::json::{parse_json_with_limits, JsonLimits, JsonValue};
 use megu_core::version::TargetVersion;
 use std::error::Error;
 use std::fmt;
@@ -249,312 +250,135 @@ pub fn migrate_snapshot(
 
 // ------------------------------------------------------------------ JSON in
 
+/// Bounds for [`parse_data_json`]: the historical 64-level nesting cap.
+/// The canonical reader counts the root value as depth 0 and rejects any
+/// value at `max_depth`, so scalars at depth 64 — which the retired parser
+/// allowed — now fail closed at an absurd depth. Node and byte ceilings
+/// stay off: the retired parser had none, and world-metadata exports can
+/// be large.
+const JSON_LIMITS: JsonLimits = JsonLimits {
+    max_depth: MAX_JSON_DEPTH,
+    max_nodes: usize::MAX,
+    max_bytes: usize::MAX,
+};
+
 /// Hard cap on JSON nesting depth. A hostile document must not drive the
 /// recursive parser (or any downstream tree walk) into unbounded stack use;
 /// 64 levels is already far past anything `level.dat` or chunk metadata
 /// produces.
 const MAX_JSON_DEPTH: usize = 64;
 
-struct JsonParser<'a> {
-    bytes: &'a [u8],
-    pos: usize,
-}
-
-impl<'a> JsonParser<'a> {
-    fn err(&self, message: impl Into<String>) -> JsonError {
-        JsonError {
-            offset: self.pos,
-            message: message.into(),
-        }
-    }
-
-    fn peek(&self) -> Option<u8> {
-        self.bytes.get(self.pos).copied()
-    }
-
-    fn skip_ws(&mut self) {
-        while matches!(self.peek(), Some(b' ' | b'\t' | b'\n' | b'\r')) {
-            self.pos += 1;
-        }
-    }
-
-    /// Expect `literal` at the cursor ("true", "false", "null").
-    fn literal(&mut self, literal: &'static [u8], value: DataValue) -> Result<DataValue, JsonError> {
-        if self.bytes[self.pos..].starts_with(literal) {
-            self.pos += literal.len();
-            Ok(value)
-        } else {
-            Err(self.err("expected a JSON value"))
-        }
-    }
-
-    fn value(&mut self, depth: usize) -> Result<DataValue, JsonError> {
-        self.skip_ws();
-        match self.peek() {
-            None => Err(self.err("expected a JSON value")),
-            Some(b'{') => self.object(depth),
-            Some(b'[') => self.array(depth),
-            Some(b'"') => Ok(DataValue::Str(self.string()?)),
-            Some(b't') => self.literal(b"true", DataValue::Bool(true)),
-            Some(b'f') => self.literal(b"false", DataValue::Bool(false)),
-            Some(b'n') => self.literal(b"null", DataValue::Null),
-            Some(b'-' | b'0'..=b'9') => self.number(),
-            Some(_) => Err(self.err("expected a JSON value")),
-        }
-    }
-
-    /// Entering a container at `depth` enclosing containers: the depth cap
-    /// is checked here so scalars at maximum depth still parse.
-    fn container_open(&self, depth: usize) -> Result<(), JsonError> {
-        if depth >= MAX_JSON_DEPTH {
-            return Err(self.err(format!(
-                "JSON nesting deeper than {MAX_JSON_DEPTH} levels"
-            )));
-        }
-        Ok(())
-    }
-
-    fn object(&mut self, depth: usize) -> Result<DataValue, JsonError> {
-        self.container_open(depth)?;
-        self.pos += 1; // '{'
-        let mut map = std::collections::BTreeMap::new();
-        self.skip_ws();
-        if self.peek() == Some(b'}') {
-            self.pos += 1;
-            return Ok(DataValue::Map(map));
-        }
-        loop {
-            self.skip_ws();
-            if self.peek() != Some(b'"') {
-                return Err(self.err("expected an object key"));
-            }
-            let key = self.string()?;
-            self.skip_ws();
-            if self.peek() != Some(b':') {
-                return Err(self.err("expected ':' after object key"));
-            }
-            self.pos += 1;
-            let value = self.value(depth + 1)?;
-            map.insert(key, value);
-            self.skip_ws();
-            match self.peek() {
-                Some(b',') => self.pos += 1,
-                Some(b'}') => {
-                    self.pos += 1;
-                    return Ok(DataValue::Map(map));
-                }
-                _ => return Err(self.err("expected ',' or '}' in object")),
-            }
-        }
-    }
-
-    fn array(&mut self, depth: usize) -> Result<DataValue, JsonError> {
-        self.container_open(depth)?;
-        self.pos += 1; // '['
-        let mut items = Vec::new();
-        self.skip_ws();
-        if self.peek() == Some(b']') {
-            self.pos += 1;
-            return Ok(DataValue::List(items));
-        }
-        loop {
-            items.push(self.value(depth + 1)?);
-            self.skip_ws();
-            match self.peek() {
-                Some(b',') => self.pos += 1,
-                Some(b']') => {
-                    self.pos += 1;
-                    return Ok(DataValue::List(items));
-                }
-                _ => return Err(self.err("expected ',' or ']' in array")),
-            }
-        }
-    }
-
-    /// A JSON string starting at the opening quote. Byte-level scanning is
-    /// safe: the input is a `&str` (already UTF-8), and the only bytes with
-    /// syntactic meaning — `"`, `\` and control bytes below 0x20 — can never
-    /// appear inside a multi-byte UTF-8 sequence, so runs copied between
-    /// them stay valid UTF-8.
-    fn string(&mut self) -> Result<String, JsonError> {
-        self.pos += 1; // opening '"'
-        let mut out = String::new();
-        loop {
-            let run_start = self.pos;
-            while let Some(b) = self.peek() {
-                if b == b'"' || b == b'\\' || b < 0x20 {
-                    break;
-                }
-                self.pos += 1;
-            }
-            // The slice is valid UTF-8 by the argument above; a failure here
-            // would mean the scanner split a multi-byte sequence, which is
-            // an internal bug — still reported, never unwrapped.
-            let run = std::str::from_utf8(&self.bytes[run_start..self.pos])
-                .map_err(|_| self.err("invalid UTF-8 in string"))?;
-            out.push_str(run);
-            match self.peek() {
-                None => return Err(self.err("unterminated string")),
-                Some(b'"') => {
-                    self.pos += 1;
-                    return Ok(out);
-                }
-                Some(b'\\') => {
-                    self.pos += 1;
-                    self.escape(&mut out)?;
-                }
-                Some(_) => return Err(self.err("unescaped control character in string")),
-            }
-        }
-    }
-
-    /// The byte after `\`. `\uXXXX` sequences are combined into scalar
-    /// values; a lone surrogate is malformed JSON for this parser's purposes
-    /// and refused rather than lossily replaced.
-    fn escape(&mut self, out: &mut String) -> Result<(), JsonError> {
-        match self.peek() {
-            Some(b'"') => out.push('"'),
-            Some(b'\\') => out.push('\\'),
-            Some(b'/') => out.push('/'),
-            Some(b'b') => out.push('\u{8}'),
-            Some(b'f') => out.push('\u{c}'),
-            Some(b'n') => out.push('\n'),
-            Some(b'r') => out.push('\r'),
-            Some(b't') => out.push('\t'),
-            Some(b'u') => {
-                self.pos += 1;
-                let hi = self.hex4()?;
-                let cp = if (0xD800..=0xDBFF).contains(&hi) {
-                    // A high surrogate must be followed by \uDC00-\uDFFF.
-                    if self.peek() == Some(b'\\') {
-                        self.pos += 1;
-                    }
-                    if self.peek() != Some(b'u') {
-                        return Err(self.err("lone high surrogate in \\u escape"));
-                    }
-                    self.pos += 1;
-                    let lo = self.hex4()?;
-                    if !(0xDC00..=0xDFFF).contains(&lo) {
-                        return Err(self.err("expected low surrogate after \\uXXXX"));
-                    }
-                    0x1_0000 + ((hi - 0xD800) << 10) + (lo - 0xDC00)
-                } else if (0xDC00..=0xDFFF).contains(&hi) {
-                    return Err(self.err("lone low surrogate in \\u escape"));
-                } else {
-                    hi
-                };
-                // Every value outside the surrogate range (already handled)
-                // and within u16 is a valid scalar.
-                out.push(char::from_u32(cp).ok_or_else(|| self.err("invalid \\u escape"))?);
-                return Ok(());
-            }
-            _ => return Err(self.err("invalid escape sequence")),
-        }
-        self.pos += 1;
-        Ok(())
-    }
-
-    fn hex4(&mut self) -> Result<u32, JsonError> {
-        let mut value = 0u32;
-        for _ in 0..4 {
-            let b = self.peek().ok_or_else(|| self.err("truncated \\u escape"))?;
-            let digit = match b {
-                b'0'..=b'9' => b - b'0',
-                b'a'..=b'f' => b - b'a' + 10,
-                b'A'..=b'F' => b - b'A' + 10,
-                _ => return Err(self.err("non-hex digit in \\u escape")),
-            };
-            value = value * 16 + u32::from(digit);
-            self.pos += 1;
-        }
-        Ok(value)
-    }
-
-    /// `-?(0|[1-9][0-9]*)(\.[0-9]+)?([eE][+-]?[0-9]+)?` — the JSON number
-    /// grammar, kept strict (no `+1`, no `.5`, no leading zeros). Integer
-    /// literals become `Int` and must fit `i64`; fraction/exponent literals
-    /// become `Float` and must stay finite. Both overflow cases fail closed
-    /// rather than silently changing the value.
-    fn number(&mut self) -> Result<DataValue, JsonError> {
-        let start = self.pos;
-        if self.peek() == Some(b'-') {
-            self.pos += 1;
-        }
-        match self.peek() {
-            Some(b'0') => {
-                self.pos += 1;
-                if matches!(self.peek(), Some(b'0'..=b'9')) {
-                    return Err(self.err("leading zeros are not valid JSON"));
-                }
-            }
-            Some(b'1'..=b'9') => {
-                while matches!(self.peek(), Some(b'0'..=b'9')) {
-                    self.pos += 1;
-                }
-            }
-            _ => return Err(self.err("expected a digit")),
-        }
-        let mut is_float = false;
-        if self.peek() == Some(b'.') {
-            is_float = true;
-            self.pos += 1;
-            if !matches!(self.peek(), Some(b'0'..=b'9')) {
-                return Err(self.err("expected a digit after '.'"));
-            }
-            while matches!(self.peek(), Some(b'0'..=b'9')) {
-                self.pos += 1;
-            }
-        }
-        if matches!(self.peek(), Some(b'e') | Some(b'E')) {
-            is_float = true;
-            self.pos += 1;
-            if matches!(self.peek(), Some(b'+') | Some(b'-')) {
-                self.pos += 1;
-            }
-            if !matches!(self.peek(), Some(b'0'..=b'9')) {
-                return Err(self.err("expected a digit in the exponent"));
-            }
-            while matches!(self.peek(), Some(b'0'..=b'9')) {
-                self.pos += 1;
-            }
-        }
-        // The accepted grammar is pure ASCII, so this slice is always &str.
-        let text = std::str::from_utf8(&self.bytes[start..self.pos])
-            .map_err(|_| self.err("invalid number"))?;
-        if is_float {
-            let v: f64 = text
-                .parse()
-                .map_err(|_| self.err("invalid number"))?;
-            if !v.is_finite() {
-                return Err(self.err("number is out of range"));
-            }
-            Ok(DataValue::Float(v))
-        } else {
-            text.parse::<i64>()
-                .map(DataValue::Int)
-                .map_err(|_| self.err("integer is out of range"))
-        }
-    }
-}
-
 /// Parse a JSON document into the format-agnostic [`DataValue`] tree the
 /// [`DataFixer`] operates on.
 ///
-/// Strict and fail-closed: the full JSON grammar (strings with `\uXXXX`
-/// surrogate pairs, the exact number grammar), a 64-level nesting cap, no
-/// trailing bytes after the document, integer literals bounded by `i64` and
-/// floats bounded by `is_finite`.
+/// Delegates to the canonical `megu_core::json` reader: strict RFC 8259,
+/// the whole input must be one document, duplicate object keys keep the
+/// historical last-wins `BTreeMap` semantics. The `Int`/`Float` split stays
+/// lexical — `64` and `64.0` are different [`DataValue`] shapes — so
+/// [`number_lexemes`] re-reads the number spellings in document order for
+/// [`json_to_data_value`]. Non-finite results (`1e999`) and integers past
+/// `i64` fail closed.
 pub fn parse_data_json(text: &str) -> Result<DataValue, JsonError> {
-    let mut parser = JsonParser {
-        bytes: text.as_bytes(),
-        pos: 0,
-    };
-    let value = parser.value(0)?;
-    parser.skip_ws();
-    if parser.pos != parser.bytes.len() {
-        return Err(parser.err("trailing bytes after the JSON document"));
+    let value = parse_json_with_limits(text, JSON_LIMITS, false)
+        .map_err(|e| JsonError {
+            offset: e.offset,
+            message: e.message,
+        })?;
+    let lexemes = number_lexemes(text);
+    let mut next = 0usize;
+    let data = json_to_data_value(&value, &lexemes, &mut next)?;
+    if next != lexemes.len() {
+        // The side scan and the canonical tree disagree about how many
+        // numbers the document holds — an internal invariant, never a
+        // silently mis-typed tree.
+        return Err(JsonError {
+            offset: 0,
+            message: "internal: number lexeme count mismatch".to_string(),
+        });
     }
-    Ok(value)
+    Ok(data)
+}
+
+/// The document's number literals in order, skipping string contents
+/// (escapes honored). The input is already validated by
+/// [`parse_json_with_limits`], so literal boundaries are unambiguous: a
+/// number runs until a byte outside `[0-9+-.eE]`, none of which can legally
+/// follow one in a valid document.
+fn number_lexemes(text: &str) -> Vec<&str> {
+    let bytes = text.as_bytes();
+    let mut out = Vec::new();
+    let mut i = 0usize;
+    let mut in_string = false;
+    while i < bytes.len() {
+        match bytes[i] {
+            b'"' => {
+                in_string = !in_string;
+                i += 1;
+            }
+            b'\\' if in_string => i += 2,
+            b'-' | b'0'..=b'9' if !in_string => {
+                let start = i;
+                while i < bytes.len()
+                    && matches!(bytes[i], b'0'..=b'9' | b'+' | b'-' | b'.' | b'e' | b'E')
+                {
+                    i += 1;
+                }
+                out.push(&text[start..i]);
+            }
+            _ => i += 1,
+        }
+    }
+    out
+}
+
+fn json_number_error(message: &str) -> JsonError {
+    JsonError {
+        offset: 0,
+        message: message.to_string(),
+    }
+}
+
+fn json_to_data_value(
+    value: &JsonValue,
+    lexemes: &[&str],
+    next: &mut usize,
+) -> Result<DataValue, JsonError> {
+    Ok(match value {
+        JsonValue::Null => DataValue::Null,
+        JsonValue::Bool(b) => DataValue::Bool(*b),
+        JsonValue::Number(n) => {
+            let lexeme = lexemes
+                .get(*next)
+                .copied()
+                .ok_or_else(|| json_number_error("internal: missing number lexeme"))?;
+            *next += 1;
+            if lexeme.bytes().any(|b| matches!(b, b'.' | b'e' | b'E')) {
+                if !n.is_finite() {
+                    return Err(json_number_error("number is out of range"));
+                }
+                DataValue::Float(*n)
+            } else {
+                lexeme
+                    .parse::<i64>()
+                    .map(DataValue::Int)
+                    .map_err(|_| json_number_error("integer is out of range"))?
+            }
+        }
+        JsonValue::String(s) => DataValue::Str(s.clone()),
+        JsonValue::Array(items) => DataValue::List(
+            items
+                .iter()
+                .map(|item| json_to_data_value(item, lexemes, next))
+                .collect::<Result<_, JsonError>>()?,
+        ),
+        JsonValue::Object(members) => {
+            let mut map = std::collections::BTreeMap::new();
+            for (key, member) in members {
+                map.insert(key.clone(), json_to_data_value(member, lexemes, next)?);
+            }
+            DataValue::Map(map)
+        }
+    })
 }
 
 // ----------------------------------------------------------------- JSON out
@@ -968,29 +792,29 @@ mod tests {
     #[test]
     fn json_rejects_malformed_documents() {
         for (doc, needle) in [
-            ("", "expected a JSON value"),
-            ("{", "expected an object key"),
-            ("{\"a\": }", "expected a JSON value"),
+            ("", "unexpected end of input"),
+            ("{", "unterminated object"),
+            ("{\"a\": }", "expected a value"),
             ("{\"a\" 1}", "expected ':'"),
             ("{\"a\":1", "expected ',' or '}'"),
-            ("[1,]", "expected a JSON value"),
-            ("tru", "expected a JSON value"),
-            ("nul", "expected a JSON value"),
+            ("[1,]", "expected a value"),
+            ("tru", "bad literal"),
+            ("nul", "bad literal"),
             ("01", "leading zeros"),
-            ("+1", "expected a JSON value"),
-            ("1.", "expected a digit after '.'"),
-            ("1e", "expected a digit in the exponent"),
-            ("-", "expected a digit"),
-            (".5", "expected a JSON value"),
+            ("+1", "expected a value"),
+            ("1.", "bad number"),
+            ("1e", "bad number"),
+            ("-", "expected a value"),
+            (".5", "expected a value"),
             ("\"unterminated", "unterminated string"),
-            ("\"bad\\x\"", "invalid escape"),
-            ("\"\\ud83d\"", "lone high surrogate"),
-            ("\"\\ud83d\\u0041\"", "expected low surrogate"),
-            ("\"\\udc00\"", "lone low surrogate"),
+            ("\"bad\\x\"", "bad escape"),
+            ("\"\\ud83d\"", "lone surrogate"),
+            ("\"\\ud83d\\u0041\"", "lone surrogate"),
+            ("\"\\udc00\"", "lone surrogate"),
             ("9223372036854775808", "out of range"),
             ("1e999", "out of range"),
-            ("{} []", "trailing bytes"),
-            ("[1] extra", "trailing bytes"),
+            ("{} []", "trailing characters"),
+            ("[1] extra", "trailing characters"),
         ] {
             let err = parse_data_json(doc).unwrap_err();
             assert!(
@@ -1007,18 +831,28 @@ mod tests {
         let ok = "[".repeat(MAX_JSON_DEPTH) + &"]".repeat(MAX_JSON_DEPTH);
         assert!(parse_data_json(&ok).is_ok());
         let deep = "[".repeat(MAX_JSON_DEPTH + 1) + &"]".repeat(MAX_JSON_DEPTH + 1);
-        let err = parse_data_json(&deep).unwrap_err();
-        assert!(err.message.contains("deeper than 64"), "{err:?}");
-        // Objects count too.
+        assert!(parse_data_json(&deep).is_err());
+        // Objects count too. The canonical reader counts scalars at the same
+        // depth as containers, so a leaf at depth 64 now fails closed where
+        // the retired parser allowed it.
         let mut doc = String::new();
-        for _ in 0..MAX_JSON_DEPTH {
+        for _ in 0..MAX_JSON_DEPTH - 1 {
             doc.push_str("{\"a\":");
         }
         doc.push('0');
-        for _ in 0..MAX_JSON_DEPTH {
+        for _ in 0..MAX_JSON_DEPTH - 1 {
             doc.push('}');
         }
         assert!(parse_data_json(&doc).is_ok());
+        let mut too_deep = String::new();
+        for _ in 0..MAX_JSON_DEPTH {
+            too_deep.push_str("{\"a\":");
+        }
+        too_deep.push('0');
+        for _ in 0..MAX_JSON_DEPTH {
+            too_deep.push('}');
+        }
+        assert!(parse_data_json(&too_deep).is_err());
     }
 
     #[test]

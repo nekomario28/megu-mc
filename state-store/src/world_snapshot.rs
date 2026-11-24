@@ -18,8 +18,9 @@
 //!
 //! The design fails closed everywhere a hostile or corrupt path could reach:
 //!
-//! * [`Sha256`] is a clean, self-contained FIPS 180-4 implementation — zero
-//!   external crates, no wall-clock reads (`timestamp_secs` is always
+//! * [`Sha256`] wraps the canonical `megu_core::crypto` FIPS 180-4
+//!   implementation — zero external crates, no wall-clock reads
+//!   (`timestamp_secs` is always
 //!   caller-supplied, so the same world at the same timestamp produces the
 //!   same snapshot id).
 //! * [`WorldSnapshotStore::create_snapshot`] refuses symlinks, `..`,
@@ -45,6 +46,7 @@
 
 use crate::datafix::DataValue;
 use crate::migrate::{parse_data_json, to_data_json, write_file_atomic};
+use megu_core::crypto::{hex_encode as hex_lower, sha256_hex};
 use std::collections::{BTreeMap, HashSet};
 use std::error::Error;
 use std::fmt;
@@ -75,143 +77,28 @@ static STAGING_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 // --------------------------------------------------------------- SHA-256
 
-/// Round constants `K[t]`: first 32 bits of the fractional parts of the cube
-/// roots of the first 64 primes (FIPS 180-4 §4.2.2).
-const SHA256_K: [u32; 64] = [
-    0x428a2f98, 0x71374491, 0xb5c0fbcf, 0xe9b5dba5, 0x3956c25b, 0x59f111f1, 0x923f82a4, 0xab1c5ed5,
-    0xd807aa98, 0x12835b01, 0x243185be, 0x550c7dc3, 0x72be5d74, 0x80deb1fe, 0x9bdc06a7, 0xc19bf174,
-    0xe49b69c1, 0xefbe4786, 0x0fc19dc6, 0x240ca1cc, 0x2de92c6f, 0x4a7484aa, 0x5cb0a9dc, 0x76f988da,
-    0x983e5152, 0xa831c66d, 0xb00327c8, 0xbf597fc7, 0xc6e00bf3, 0xd5a79147, 0x06ca6351, 0x14292967,
-    0x27b70a85, 0x2e1b2138, 0x4d2c6dfc, 0x53380d13, 0x650a7354, 0x766a0abb, 0x81c2c92e, 0x92722c85,
-    0xa2bfe8a1, 0xa81a664b, 0xc24b8b70, 0xc76c51a3, 0xd192e819, 0xd6990624, 0xf40e3585, 0x106aa070,
-    0x19a4c116, 0x1e376c08, 0x2748774c, 0x34b0bcb5, 0x391c0cb3, 0x4ed8aa4a, 0x5b9cca4f, 0x682e6ff3,
-    0x748f82ee, 0x78a5636f, 0x84c87814, 0x8cc70208, 0x90befffa, 0xa4506ceb, 0xbef9a3f7, 0xc67178f2,
-];
-
-/// Initial hash value `H(0)`: first 32 bits of the fractional parts of the
-/// square roots of the first 8 primes (FIPS 180-4 §5.3.3).
-const SHA256_H0: [u32; 8] = [
-    0x6a09e667, 0xbb67ae85, 0x3c6ef372, 0xa54ff53a, 0x510e527f, 0x9b05688c, 0x1f83d9ab, 0x5be0cd19,
-];
-
-/// Clean-room FIPS 180-4 SHA-256 over streamed bytes.
-pub struct Sha256 {
-    state: [u32; 8],
-    buf: [u8; 64],
-    buf_len: usize,
-    total_len: u64,
-}
+/// Streaming FIPS 180-4 SHA-256 — a thin wrapper over the canonical
+/// `megu_core::crypto::Sha256` keeping this crate's historical method names
+/// (`finish`/`digest`) stable for callers.
+#[derive(Clone)]
+pub struct Sha256(megu_core::crypto::Sha256);
 
 impl Sha256 {
     pub fn new() -> Self {
-        Self {
-            state: SHA256_H0,
-            buf: [0u8; 64],
-            buf_len: 0,
-            total_len: 0,
-        }
+        Self(megu_core::crypto::Sha256::new())
     }
 
-    fn compress(state: &mut [u32; 8], block: &[u8]) {
-        debug_assert_eq!(block.len(), 64);
-        let mut w = [0u32; 64];
-        for (i, word) in w[..16].iter_mut().enumerate() {
-            *word = u32::from_be_bytes([
-                block[i * 4],
-                block[i * 4 + 1],
-                block[i * 4 + 2],
-                block[i * 4 + 3],
-            ]);
-        }
-        for t in 16..64 {
-            let s0 = w[t - 15].rotate_right(7) ^ w[t - 15].rotate_right(18) ^ (w[t - 15] >> 3);
-            let s1 = w[t - 2].rotate_right(17) ^ w[t - 2].rotate_right(19) ^ (w[t - 2] >> 10);
-            w[t] = w[t - 16]
-                .wrapping_add(s0)
-                .wrapping_add(w[t - 7])
-                .wrapping_add(s1);
-        }
-
-        let [mut a, mut b, mut c, mut d, mut e, mut f, mut g, mut h] = *state;
-        for t in 0..64 {
-            let big_s1 = e.rotate_right(6) ^ e.rotate_right(11) ^ e.rotate_right(25);
-            let ch = (e & f) ^ ((!e) & g);
-            let t1 = h
-                .wrapping_add(big_s1)
-                .wrapping_add(ch)
-                .wrapping_add(SHA256_K[t])
-                .wrapping_add(w[t]);
-            let big_s0 = a.rotate_right(2) ^ a.rotate_right(13) ^ a.rotate_right(22);
-            let maj = (a & b) ^ (a & c) ^ (b & c);
-            let t2 = big_s0.wrapping_add(maj);
-            h = g;
-            g = f;
-            f = e;
-            e = d.wrapping_add(t1);
-            d = c;
-            c = b;
-            b = a;
-            a = t1.wrapping_add(t2);
-        }
-        state[0] = state[0].wrapping_add(a);
-        state[1] = state[1].wrapping_add(b);
-        state[2] = state[2].wrapping_add(c);
-        state[3] = state[3].wrapping_add(d);
-        state[4] = state[4].wrapping_add(e);
-        state[5] = state[5].wrapping_add(f);
-        state[6] = state[6].wrapping_add(g);
-        state[7] = state[7].wrapping_add(h);
+    pub fn update(&mut self, bytes: &[u8]) {
+        self.0.update(bytes);
     }
 
-    pub fn update(&mut self, mut bytes: &[u8]) {
-        self.total_len = self
-            .total_len
-            .checked_add(bytes.len() as u64)
-            .expect("SHA-256 input exceeds 2^64 bits");
-        if self.buf_len > 0 {
-            let take = (64 - self.buf_len).min(bytes.len());
-            self.buf[self.buf_len..self.buf_len + take].copy_from_slice(&bytes[..take]);
-            self.buf_len += take;
-            bytes = &bytes[take..];
-            if self.buf_len == 64 {
-                let block = self.buf;
-                Self::compress(&mut self.state, &block);
-                self.buf_len = 0;
-            }
-        }
-        while bytes.len() >= 64 {
-            Self::compress(&mut self.state, &bytes[..64]);
-            bytes = &bytes[64..];
-        }
-        if !bytes.is_empty() {
-            self.buf[..bytes.len()].copy_from_slice(bytes);
-            self.buf_len = bytes.len();
-        }
-    }
-
-    pub fn finish(mut self) -> [u8; 32] {
-        let bit_len = self.total_len.wrapping_mul(8);
-        self.update(&[0x80]);
-        while self.buf_len != 56 {
-            self.update(&[0]);
-        }
-        // `update` would recount the length block as message bytes; write it
-        // straight into the buffered tail and compress directly.
-        self.buf[56..64].copy_from_slice(&bit_len.to_be_bytes());
-        let block = self.buf;
-        Self::compress(&mut self.state, &block);
-        let mut out = [0u8; 32];
-        for (i, word) in self.state.iter().enumerate() {
-            out[i * 4..i * 4 + 4].copy_from_slice(&word.to_be_bytes());
-        }
-        out
+    pub fn finish(self) -> [u8; 32] {
+        self.0.finalize()
     }
 
     /// One-shot digest of `bytes`.
     pub fn digest(bytes: &[u8]) -> [u8; 32] {
-        let mut h = Self::new();
-        h.update(bytes);
-        h.finish()
+        megu_core::crypto::sha256(bytes)
     }
 }
 
@@ -219,21 +106,6 @@ impl Default for Sha256 {
     fn default() -> Self {
         Self::new()
     }
-}
-
-fn hex_lower(bytes: &[u8]) -> String {
-    const HEX: &[u8; 16] = b"0123456789abcdef";
-    let mut out = String::with_capacity(bytes.len() * 2);
-    for &b in bytes {
-        out.push(HEX[(b >> 4) as usize] as char);
-        out.push(HEX[(b & 0xf) as usize] as char);
-    }
-    out
-}
-
-/// Lowercase-hex digest — the object-store key and manifest spelling.
-fn sha256_hex(bytes: &[u8]) -> String {
-    hex_lower(&Sha256::digest(bytes))
 }
 
 // ---------------------------------------------------------------- errors

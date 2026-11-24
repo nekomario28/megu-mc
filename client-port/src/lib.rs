@@ -126,4 +126,6 @@ pub use upload_budget::{
 pub use visibility::FaceVisibility;
 pub use world::WorldState;
 
-pub const PROTOCOL_VERSION: u32 = 767;
+/// Wire protocol version for the simulated target release (1.21.1 = 767),
+/// sourced from the canonical [`megu_core::version`] registry.
+pub const PROTOCOL_VERSION: u32 = megu_core::version::TargetVersion::V1_21_1.protocol() as u32;
