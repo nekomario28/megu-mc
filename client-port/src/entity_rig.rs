@@ -370,6 +370,24 @@ impl CemBox {
     }
 }
 
+/// Sentinel [`RigBox::tint`] meaning "default entity tint": `-1`, or `1`
+/// while `hurt_flash` is set. Any other value is emitted verbatim as the
+/// quad `tint_index`, letting procedural details (pumpkin head, held mouth
+/// item, projectile accents) carry a distinct palette slot.
+const RIG_TINT_DEFAULT: i32 = i32::MIN;
+
+/// Packed mouth-item tint: bit 30 marks the slot, the low 24 bits carry
+/// the held item's RGB color. Positive and far above the small palette
+/// indices used by rails (`0`/`1`) and hurt flash (`1`).
+const MOUTH_ITEM_TINT_FLAG: i32 = 1 << 30;
+
+fn mouth_item_tint(rgb: [u8; 3]) -> i32 {
+    MOUTH_ITEM_TINT_FLAG
+        | (i32::from(rgb[0]) << 16)
+        | (i32::from(rgb[1]) << 8)
+        | i32::from(rgb[2])
+}
+
 #[derive(Clone, Copy)]
 struct RigBox {
     part: EntityRigPart,
@@ -379,6 +397,7 @@ struct RigBox {
     rotation: [f32; 3],
     uv: [f32; 4],
     inflate: f32,
+    tint: i32,
 }
 
 impl From<&CemBox> for RigBox {
@@ -395,6 +414,7 @@ impl From<&CemBox> for RigBox {
             rotation: value.rotation_deg.map(f32::to_radians),
             uv: value.uv,
             inflate: value.inflate,
+            tint: RIG_TINT_DEFAULT,
         }
     }
 }
@@ -553,7 +573,13 @@ fn emit_box(mesh: &mut ExtrudedMesh, spec: EntityRigSpec, pose: EntityPose, shap
                     positions,
                     normal,
                     uv,
-                    tint_index: if pose.hurt_flash { 1 } else { -1 },
+                    tint_index: if shape.tint != RIG_TINT_DEFAULT {
+                        shape.tint
+                    } else if pose.hurt_flash {
+                        1
+                    } else {
+                        -1
+                    },
                 });
             }
         }
@@ -584,7 +610,264 @@ fn add(
             rotation,
             uv: [0.0, 0.0, 1.0, 1.0],
             inflate,
+            tint: RIG_TINT_DEFAULT,
         },
+    );
+}
+
+/// [`add`] with an explicit `tint_index` palette slot for the emitted quads.
+#[allow(clippy::too_many_arguments)] // Mirrors `add`; see its allow note.
+fn add_tinted(
+    mesh: &mut ExtrudedMesh,
+    spec: EntityRigSpec,
+    pose: EntityPose,
+    part: EntityRigPart,
+    center: [f32; 3],
+    size: [f32; 3],
+    pivot: [f32; 3],
+    rotation: [f32; 3],
+    inflate: f32,
+    tint: i32,
+) {
+    emit_box(
+        mesh,
+        spec,
+        pose,
+        RigBox {
+            part,
+            center,
+            size,
+            pivot,
+            rotation,
+            uv: [0.0, 0.0, 1.0, 1.0],
+            inflate,
+            tint,
+        },
+    );
+}
+
+/// Fox (id 42): a slim quadruped with a distinct snout, two pointed ears,
+/// four legs, and a bushy two-segment tail. Forward is `-Z`. When
+/// `mouth_item_rgb` is `Some`, a small tilted prism is attached at the
+/// snout tip, tinted by the packed RGB value.
+fn add_fox(
+    mesh: &mut ExtrudedMesh,
+    spec: EntityRigSpec,
+    pose: EntityPose,
+    mouth_item_rgb: Option<[u8; 3]>,
+) {
+    use EntityRigPart::*;
+    let w = spec.width;
+    let h = spec.height;
+    let head_pivot = [0.0, h * 0.74, -w * 0.26];
+
+    add(
+        mesh,
+        spec,
+        pose,
+        Torso,
+        [0.0, h * 0.58, w * 0.06],
+        [w * 0.56, h * 0.50, w * 0.82],
+        [0.0, h * 0.72, 0.0],
+        [0.0; 3],
+        0.0,
+    );
+    add(
+        mesh,
+        spec,
+        pose,
+        Head,
+        [0.0, h * 0.80, -w * 0.36],
+        [w * 0.48, h * 0.32, w * 0.40],
+        head_pivot,
+        [0.0; 3],
+        0.0,
+    );
+    // Snout: a narrower muzzle box protruding forward from the head.
+    add(
+        mesh,
+        spec,
+        pose,
+        Head,
+        [0.0, h * 0.74, -w * 0.60],
+        [w * 0.26, h * 0.18, w * 0.34],
+        head_pivot,
+        [0.0; 3],
+        0.0,
+    );
+    // Two pointed ears: a tilted base slab plus a smaller, more tilted tip.
+    for side in [-1.0_f32, 1.0] {
+        add(
+            mesh,
+            spec,
+            pose,
+            Head,
+            [side * w * 0.16, h * 0.95, -w * 0.36],
+            [w * 0.10, h * 0.16, w * 0.08],
+            head_pivot,
+            [0.0, 0.0, -side * 0.45],
+            0.0,
+        );
+        add(
+            mesh,
+            spec,
+            pose,
+            Head,
+            [side * w * 0.23, h * 1.00, -w * 0.36],
+            [w * 0.07, h * 0.12, w * 0.06],
+            head_pivot,
+            [0.0, 0.0, -side * 0.95],
+            0.0,
+        );
+    }
+    for (part, side) in [(LeftLeg, -1.0_f32), (RightLeg, 1.0)] {
+        for z in [-0.28_f32, 0.30] {
+            let pivot = [side * w * 0.23, h * 0.40, z * w];
+            add(
+                mesh,
+                spec,
+                pose,
+                part,
+                [pivot[0], h * 0.21, pivot[2]],
+                [w * 0.15, h * 0.42, w * 0.17],
+                pivot,
+                [0.0; 3],
+                0.0,
+            );
+        }
+    }
+    // Bushy tail: a thick angled base segment and a smaller raised tip,
+    // both bound to `Tail` so it sways with the pose.
+    let tail_pivot = [0.0, h * 0.60, w * 0.42];
+    add(
+        mesh,
+        spec,
+        pose,
+        Tail,
+        [0.0, h * 0.64, w * 0.58],
+        [w * 0.20, h * 0.18, w * 0.36],
+        tail_pivot,
+        [-0.55, 0.0, 0.0],
+        0.0,
+    );
+    add(
+        mesh,
+        spec,
+        pose,
+        Tail,
+        [0.0, h * 0.76, w * 0.72],
+        [w * 0.14, h * 0.14, w * 0.24],
+        tail_pivot,
+        [-0.95, 0.0, 0.0],
+        0.0,
+    );
+    if let Some(rgb) = mouth_item_rgb {
+        add_tinted(
+            mesh,
+            spec,
+            pose,
+            Head,
+            [0.0, h * 0.70, -w * 0.80],
+            [w * 0.14, h * 0.09, w * 0.26],
+            head_pivot,
+            [0.5, 0.0, 0.0],
+            0.0,
+            mouth_item_tint(rgb),
+        );
+    }
+}
+
+/// Snow golem (id 96): stacked lower/upper snow cubes, a pumpkin head,
+/// and two angled stick arms.
+fn add_snow_golem(mesh: &mut ExtrudedMesh, spec: EntityRigSpec, pose: EntityPose) {
+    use EntityRigPart::*;
+    let w = spec.width;
+    let h = spec.height;
+
+    add(
+        mesh,
+        spec,
+        pose,
+        Torso,
+        [0.0, h * 0.27, 0.0],
+        [w * 0.92, h * 0.54, w * 0.92],
+        [0.0, h * 0.55, 0.0],
+        [0.0; 3],
+        0.0,
+    );
+    add(
+        mesh,
+        spec,
+        pose,
+        Torso,
+        [0.0, h * 0.60, 0.0],
+        [w * 0.78, h * 0.34, w * 0.78],
+        [0.0, h * 0.55, 0.0],
+        [0.0; 3],
+        0.0,
+    );
+    // Pumpkin head: same box geometry, distinct accent tint slot.
+    add_tinted(
+        mesh,
+        spec,
+        pose,
+        Head,
+        [0.0, h * 0.83, 0.0],
+        [w * 0.56, h * 0.30, w * 0.56],
+        [0.0, h * 0.68, 0.0],
+        [0.0; 3],
+        0.0,
+        7,
+    );
+    // Long thin arms angled outward from the shoulders.
+    for (part, side) in [(LeftArm, -1.0_f32), (RightArm, 1.0)] {
+        let pivot = [side * w * 0.40, h * 0.70, 0.0];
+        add(
+            mesh,
+            spec,
+            pose,
+            part,
+            [side * w * 0.50, h * 0.44, 0.0],
+            [w * 0.11, h * 0.52, w * 0.11],
+            pivot,
+            [0.0, 0.0, side * 0.35],
+            0.0,
+        );
+    }
+}
+
+/// Thrown spherical projectile proxy: an outer shell cube sized to the
+/// collision box, a smaller inner cube yawed 45 degrees for a faceted
+/// silhouette, and a compact core. `tint` selects a small procedural
+/// accent palette slot per projectile family.
+fn add_thrown_projectile(
+    mesh: &mut ExtrudedMesh,
+    spec: EntityRigSpec,
+    pose: EntityPose,
+    entity_type_id: u16,
+) {
+    use EntityRigPart::*;
+    let w = spec.width;
+    let h = spec.height;
+    let tint = match entity_type_id {
+        97 => 2,  // snowball: crisp ice white
+        28 => 3,  // egg
+        32 => 4,  // ender_pearl
+        117 | 13 => 5, // wind_charge / breeze_wind_charge
+        _ => 6,   // fireball / small_fireball: flame accent
+    };
+    let center = [0.0, h * 0.5, 0.0];
+    add_tinted(
+        mesh, spec, pose, Core, center, [w * 0.94, h * 0.94, w * 0.94], [0.0; 3],
+        [0.0; 3], 0.0, tint,
+    );
+    add_tinted(
+        mesh, spec, pose, Shell, center, [w * 0.70, h * 0.70, w * 0.70], [0.0; 3],
+        [0.0, PI * 0.25, 0.0], 0.0, tint + 1,
+    );
+    add_tinted(
+        mesh, spec, pose, Core, center, [w * 0.38, h * 0.38, w * 0.38], [0.0; 3],
+        [0.0; 3], 0.0, tint,
     );
 }
 
@@ -592,6 +875,26 @@ fn add(
 /// Zero-size collision entities receive small drawable placeholders; skin
 /// overlay alpha/blending is a responsibility of the consuming renderer.
 pub fn build_entity_rig_mesh(spec: EntityRigSpec, pose: EntityPose) -> ExtrudedMesh {
+    build_entity_rig_mesh_inner(spec, pose, None)
+}
+
+/// [`build_entity_rig_mesh`] plus an optional held mouth item for the fox
+/// rig (id 42). When `mouth_item_rgb` is `Some`, a small tilted prism is
+/// attached at the snout tip and its quads carry the RGB packed into
+/// `tint_index` (see [`mouth_item_tint`]). Other entities ignore the item.
+pub fn build_entity_rig_mesh_with_mouth_item(
+    spec: EntityRigSpec,
+    pose: EntityPose,
+    mouth_item_rgb: Option<[u8; 3]>,
+) -> ExtrudedMesh {
+    build_entity_rig_mesh_inner(spec, pose, mouth_item_rgb)
+}
+
+fn build_entity_rig_mesh_inner(
+    spec: EntityRigSpec,
+    pose: EntityPose,
+    mouth_item_rgb: Option<[u8; 3]>,
+) -> ExtrudedMesh {
     use EntityRigArchetype::*;
     use EntityRigPart::*;
     let pose = pose.sanitized();
@@ -604,6 +907,9 @@ pub fn build_entity_rig_mesh(spec: EntityRigSpec, pose: EntityPose) -> ExtrudedM
         ..spec
     };
     match spec.archetype {
+        Biped if spec.entity_type_id == 96 => {
+            add_snow_golem(&mut mesh, spec, pose);
+        }
         Biped => {
             let head = (
                 [0.0, h * 0.875, 0.0],
@@ -689,6 +995,9 @@ pub fn build_entity_rig_mesh(spec: EntityRigSpec, pose: EntityPose) -> ExtrudedM
                     );
                 }
             }
+        }
+        Quadruped if spec.entity_type_id == 42 => {
+            add_fox(&mut mesh, spec, pose, mouth_item_rgb);
         }
         Quadruped => {
             add(
@@ -893,19 +1202,27 @@ pub fn build_entity_rig_mesh(spec: EntityRigSpec, pose: EntityPose) -> ExtrudedM
                 );
             }
         }
-        ProjectileOrItem => {
-            add(
-                &mut mesh,
-                spec,
-                pose,
-                Core,
-                [0.0, h * 0.50, 0.0],
-                [w, h, w],
-                [0.0; 3],
-                [0.0; 3],
-                0.0,
-            );
-        }
+        ProjectileOrItem => match spec.entity_type_id {
+            // Thrown spherical projectiles get a layered faceted proxy
+            // instead of the bare collision box. Arrow (4) and the other
+            // item-like ids keep the generic template.
+            13 | 28 | 32 | 62 | 94 | 97 | 117 => {
+                add_thrown_projectile(&mut mesh, spec, pose, spec.entity_type_id);
+            }
+            _ => {
+                add(
+                    &mut mesh,
+                    spec,
+                    pose,
+                    Core,
+                    [0.0, h * 0.50, 0.0],
+                    [w, h, w],
+                    [0.0; 3],
+                    [0.0; 3],
+                    0.0,
+                );
+            }
+        },
         VehicleOrHanging => {
             add(
                 &mut mesh,
@@ -979,4 +1296,213 @@ pub fn entity_mesh_fingerprint(mesh: &ExtrudedMesh) -> u64 {
         buf.extend_from_slice(&quad.tint_index.to_le_bytes());
     }
     megu_core::perf_kit::fnv1a64(&buf)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn mesh_bounds(mesh: &ExtrudedMesh) -> ([f32; 3], [f32; 3]) {
+        let mut lo = [f32::INFINITY; 3];
+        let mut hi = [f32::NEG_INFINITY; 3];
+        for quad in &mesh.quads {
+            for p in &quad.positions {
+                for axis in 0..3 {
+                    lo[axis] = lo[axis].min(p[axis]);
+                    hi[axis] = hi[axis].max(p[axis]);
+                }
+            }
+        }
+        (lo, hi)
+    }
+
+    /// Same outward-CCW / finite / unit-normal contract the integration
+    /// suite enforces on every one of the 130 rigs.
+    fn assert_valid_mesh(mesh: &ExtrudedMesh) {
+        assert!(!mesh.quads.is_empty());
+        for quad in &mesh.quads {
+            assert!(quad.positions.iter().flatten().all(|v| v.is_finite()));
+            assert!(quad.normal.iter().all(|v| v.is_finite()));
+            assert!(quad
+                .uv
+                .iter()
+                .flatten()
+                .all(|v| v.is_finite() && (0.0..=1.0).contains(v)));
+            let [a, b, c, _] = quad.positions;
+            let x = [b[0] - a[0], b[1] - a[1], b[2] - a[2]];
+            let y = [c[0] - a[0], c[1] - a[1], c[2] - a[2]];
+            let cross = [
+                x[1] * y[2] - x[2] * y[1],
+                x[2] * y[0] - x[0] * y[2],
+                x[0] * y[1] - x[1] * y[0],
+            ];
+            let dot = cross
+                .iter()
+                .zip(quad.normal)
+                .map(|(a, b)| a * b)
+                .sum::<f32>();
+            assert!(dot > 0.0, "quad is not outward CCW");
+            let normal_len = quad.normal.iter().map(|v| v * v).sum::<f32>().sqrt();
+            assert!((normal_len - 1.0).abs() < 1e-4, "non-unit normal");
+        }
+    }
+
+    #[test]
+    fn fox_snow_golem_and_projectiles_classify_and_build_valid_meshes() {
+        for (id, name) in [
+            (42_u16, "minecraft:fox"),
+            (96, "minecraft:snow_golem"),
+            (97, "minecraft:snowball"),
+            (28, "minecraft:egg"),
+            (32, "minecraft:ender_pearl"),
+            (117, "minecraft:wind_charge"),
+            (62, "minecraft:fireball"),
+            (94, "minecraft:small_fireball"),
+        ] {
+            let spec = classify_entity_rig(id).expect("entity id must classify");
+            assert_eq!(spec.name, name);
+            assert_eq!(spec.entity_type_id, id);
+            let mesh = build_entity_rig_mesh(spec, EntityPose::default());
+            assert_valid_mesh(&mesh);
+            let (lo, hi) = mesh_bounds(&mesh);
+            assert!(lo.iter().chain(hi.iter()).all(|v| v.is_finite()));
+            // Feet rest at y = 0 and the body stays within a generous
+            // multiple of the collision box on every axis.
+            assert!(lo[1] >= -0.05 && lo[1] <= 0.05, "id {id} feet y");
+            let span = [
+                hi[0] - lo[0],
+                hi[1] - lo[1],
+                hi[2] - lo[2],
+            ];
+            assert!(span[0] <= spec.width * 2.0 + 0.05, "id {id} x span");
+            assert!(span[2] <= spec.width * 2.0 + 0.05, "id {id} z span");
+            assert!(span[1] <= spec.height * 1.75 + 0.05, "id {id} y span");
+        }
+    }
+
+    #[test]
+    fn projectile_mesh_is_layered_not_a_single_box() {
+        // The old generic template emitted exactly one 6-quad box; the
+        // thrown-projectile proxy emits three boxes (shell, rotated inner,
+        // core) with per-family accent tints.
+        for id in [97_u16, 28, 32, 117, 62, 94] {
+            let spec = classify_entity_rig(id).unwrap();
+            let mesh = build_entity_rig_mesh(spec, EntityPose::default());
+            assert_eq!(mesh.quads.len(), 18, "id {id}");
+            let tints: std::collections::BTreeSet<i32> =
+                mesh.quads.iter().map(|q| q.tint_index).collect();
+            assert!(tints.iter().all(|t| *t > 0), "id {id} tints {tints:?}");
+        }
+        // Snowball reads as ice white: its shell/core share one slot and
+        // the rotated inner facet a second.
+        let snowball = classify_entity_rig(97).unwrap();
+        let mesh = build_entity_rig_mesh(snowball, EntityPose::default());
+        assert!(mesh.quads.iter().any(|q| q.tint_index == 2));
+        assert!(mesh.quads.iter().any(|q| q.tint_index == 3));
+    }
+
+    #[test]
+    fn fox_mouth_item_adds_geometry_and_changes_fingerprint() {
+        let spec = classify_entity_rig(42).unwrap();
+        let pose = EntityPose::default();
+        let empty = build_entity_rig_mesh_with_mouth_item(spec, pose, None);
+        let base = build_entity_rig_mesh(spec, pose);
+        assert_eq!(empty, base, "None mouth item must equal the base rig");
+
+        let rgb = [200_u8, 40, 30];
+        let held = build_entity_rig_mesh_with_mouth_item(spec, pose, Some(rgb));
+        assert_eq!(held.quads.len(), empty.quads.len() + 6);
+        assert_valid_mesh(&held);
+        assert_ne!(
+            entity_mesh_fingerprint(&held),
+            entity_mesh_fingerprint(&empty)
+        );
+        // The held prism carries the packed RGB tint on every one of its
+        // quads and sits forward of the snout (negative Z).
+        let expected_tint = MOUTH_ITEM_TINT_FLAG
+            | (i32::from(rgb[0]) << 16)
+            | (i32::from(rgb[1]) << 8)
+            | i32::from(rgb[2]);
+        let item_quads: Vec<_> = held
+            .quads
+            .iter()
+            .filter(|q| q.tint_index == expected_tint)
+            .collect();
+        assert_eq!(item_quads.len(), 6);
+        assert!(item_quads
+            .iter()
+            .flat_map(|q| q.positions.iter())
+            .all(|p| p[2] < -spec.width * 0.4));
+        // A different item color changes the fingerprint again.
+        let other = build_entity_rig_mesh_with_mouth_item(spec, pose, Some([1, 2, 3]));
+        assert_ne!(
+            entity_mesh_fingerprint(&other),
+            entity_mesh_fingerprint(&held)
+        );
+        // Mouth items on non-fox entities are ignored.
+        let zombie = classify_entity_rig(124).unwrap();
+        assert_eq!(
+            build_entity_rig_mesh_with_mouth_item(zombie, pose, Some(rgb)),
+            build_entity_rig_mesh(zombie, pose)
+        );
+    }
+
+    #[test]
+    fn fox_and_snow_golem_have_distinct_part_layouts() {
+        let fox = classify_entity_rig(42).unwrap();
+        let cow = classify_entity_rig(22).unwrap();
+        assert_ne!(
+            build_entity_rig_mesh(fox, EntityPose::default()),
+            build_entity_rig_mesh(cow, EntityPose::default())
+        );
+        // The fox tail sways with age while the generic quadruped has no
+        // Tail-bound boxes beyond the aquatic template.
+        let pose_a = EntityPose {
+            age_ticks: 0.0,
+            ..EntityPose::default()
+        };
+        let pose_b = EntityPose {
+            age_ticks: 9.0,
+            ..EntityPose::default()
+        };
+        assert_ne!(
+            build_entity_rig_mesh(fox, pose_a),
+            build_entity_rig_mesh(fox, pose_b)
+        );
+
+        let golem = classify_entity_rig(96).unwrap();
+        let zombie = classify_entity_rig(124).unwrap();
+        assert_ne!(
+            build_entity_rig_mesh(golem, EntityPose::default()),
+            build_entity_rig_mesh(zombie, EntityPose::default())
+        );
+        // Pumpkin head carries the accent tint slot.
+        assert!(build_entity_rig_mesh(golem, EntityPose::default())
+            .quads
+            .iter()
+            .any(|q| q.tint_index == 7));
+    }
+
+    #[test]
+    fn existing_archetype_rigs_are_unchanged() {
+        // Biped (128), generic quadruped (22), avian (19), slime (93),
+        // aquatic (20), vehicle (10): fixed quad counts pin the templates
+        // against accidental drift.
+        let expected = [
+            (128_u16, 36_usize),
+            (22, 36),
+            (19, 24),
+            (100, 66),
+            (93, 12),
+            (20, 30),
+            (10, 12),
+            (4, 6), // arrow keeps the generic single-box proxy
+        ];
+        for (id, quads) in expected {
+            let spec = classify_entity_rig(id).unwrap();
+            let mesh = build_entity_rig_mesh(spec, EntityPose::default());
+            assert_eq!(mesh.quads.len(), quads, "id {id}");
+            assert_valid_mesh(&mesh);
+        }
+    }
 }
