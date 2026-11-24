@@ -94,26 +94,40 @@ def lex(text):
 
 
 def production(text):
-    """Mask cfg(test) modules, including their attributes and nested braces."""
+    """Mask test-only modules and functions, including nested braces."""
     source, literals = lex(text)
     syntax = list(source)
     for start, end, _ in literals:
         syntax[start:end] = blank(source[start:end])
     syntax = ''.join(syntax)
     removed = []
-    pattern = re.compile(r'#\s*\[\s*cfg\s*\(\s*test\s*\)\s*\]\s*(?:#\s*\[[^\]]*\]\s*)*(?:pub(?:\([^)]*\))?\s+)?mod\s+\w+\s*\{')
-    for match in pattern.finditer(syntax):
-        if any(a <= match.start() < b for a, b in removed):
+    cfg = re.compile(r'#\s*\[\s*cfg\s*\(\s*(test|all\s*\([^()]*\))\s*\)\s*\]')
+    module = re.compile(r'\s*(?:#\s*\[[^\]]*\]\s*)*(?:pub(?:\([^)]*\))?\s+)?mod\s+\w+\s*\{')
+    test_fn = re.compile(r'#\s*\[\s*test\s*\]\s*(?:#\s*\[[^\]]*\]\s*)*'
+                         r'(?:pub(?:\([^)]*\))?\s+)?(?:async\s+)?(?:unsafe\s+)?'
+                         r'fn\s+\w+\s*\([^{};]*\)[^{;]*\{')
+    blocks = []
+    for match in cfg.finditer(syntax):
+        condition = match.group(1)
+        if condition != 'test' and not re.search(r'(?:^|,)\s*test\s*(?=,|$)',
+                                                   condition[condition.index('(') + 1:-1]):
+            continue
+        body = module.match(syntax, match.end())
+        if body:
+            blocks.append((match.start(), body.end()))
+    blocks.extend((match.start(), match.end()) for match in test_fn.finditer(syntax))
+    for start, body_end in sorted(blocks):
+        if any(a <= start < b for a, b in removed):
             continue
         depth = 1
-        end = match.end()
+        end = body_end
         while end < len(syntax) and depth:
             if syntax[end] == '{':
                 depth += 1
             elif syntax[end] == '}':
                 depth -= 1
             end += 1
-        removed.append((match.start(), end))
+        removed.append((start, end))
     visible = list(source)
     for start, end in removed:
         visible[start:end] = blank(source[start:end])

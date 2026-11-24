@@ -64,6 +64,37 @@ let name = "minecraft:stone";
 ''')
         self.check(0)
 
+    def test_compound_cfg_test_modules_and_production(self):
+        path = 'src/blocks.rs'
+        self.source(path, '''#[cfg(all(test, feature = "mod-suite"))]
+mod t { fn x() { let _ = "create:shaft"; } }
+#[cfg(all(feature = "mod-suite", test))]
+mod other { fn x() { let _ = "botania:pool"; } }
+''')
+        self.assertEqual(self.check(0)['counts'], {})
+        self.source(path, (self.root / path).read_text() + 'let _ = "create:shaft";\n')
+        findings = self.check(1, 'mod_namespace_spread_ratchet')['findings']
+        self.assertEqual(len(findings), 1)
+        self.assertEqual(findings[0]['line'], 5)
+
+    def test_compound_cfg_without_test_is_production(self):
+        self.source('src/blocks.rs', '''#[cfg(all(feature = "mod-suite", feature = "extra"))]
+mod production { fn x() { let _ = "create:shaft"; } }
+''')
+        findings = self.check(1, 'mod_namespace_spread_ratchet')['findings']
+        self.assertEqual(len(findings), 1)
+        self.assertEqual(findings[0]['line'], 2)
+
+    def test_individual_test_function_ignored(self):
+        self.source('src/blocks.rs', '''#[cfg(feature = "mod-suite")]
+#[test]
+fn test_block() { if true { let _ = "create:shaft"; } }
+let _ = "botania:pool";
+''')
+        findings = self.check(1, 'mod_namespace_spread_ratchet')['findings']
+        self.assertEqual(len(findings), 1)
+        self.assertEqual(findings[0]['line'], 4)
+
     def test_raw_strings_and_nested_test_braces(self):
         self.source('client-port/src/builtin_shadow_wgsl.rs', '''#[cfg(test)]
 mod tests { fn t() { if true { let v = r#"create:shaft"#; } } }
