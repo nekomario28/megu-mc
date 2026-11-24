@@ -293,6 +293,107 @@ pub fn compute_nure_iro_patina(
     (rich_albedo, sheen)
 }
 
+/// Rain wetness is restricted to upward faces with a nearly full sky view.
+/// `sky_exposure` and `rain` are normalized to `0..=1` independently of the
+/// packed vanilla skylight range.
+pub fn compute_sky_rain_wetness(normal_y: f32, sky_exposure: f32, rain: f32) -> f32 {
+    let normal_y = if normal_y.is_finite() {
+        normal_y.clamp(-1.0, 1.0)
+    } else {
+        -1.0
+    };
+    let sky = if sky_exposure.is_finite() {
+        sky_exposure.clamp(0.0, 1.0)
+    } else {
+        0.0
+    };
+    let rain = if rain.is_finite() {
+        rain.clamp(0.0, 1.0)
+    } else {
+        0.0
+    };
+    smooth01((normal_y - 0.7) / 0.3) * smooth01((sky - 0.85) / 0.15) * rain
+}
+
+/// Two-octave drifting cloud attenuation mirrored by the terrain WGSL.
+/// Closed interiors return neutral light. The explicit coverage parameter is
+/// available to callers that have explicit weather data; the live shader
+/// scales its procedural cloud coverage with the rain lane in the shadow UBO.
+pub fn compute_cloud_shadow_attenuation(
+    world_xz: [f32; 2],
+    time: f32,
+    sky_exposure: f32,
+    coverage: f32,
+) -> f32 {
+    if !world_xz.iter().all(|v| v.is_finite()) || !time.is_finite() {
+        return 1.0;
+    }
+    let sky = if sky_exposure.is_finite() {
+        smooth01((sky_exposure.clamp(0.0, 1.0) - 0.72) / 0.28)
+    } else {
+        0.0
+    };
+    let coverage = if coverage.is_finite() {
+        coverage.clamp(0.0, 1.0)
+    } else {
+        0.0
+    };
+    if sky <= 0.0 || coverage <= 0.0 {
+        return 1.0;
+    }
+    let drift = time * 0.013;
+    let p0 = [
+        world_xz[0] * 0.018 + drift * 0.72,
+        world_xz[1] * 0.018 + drift * 0.31,
+    ];
+    let broad = (p0[0] * 1.31 + p0[1] * 0.73).sin()
+        * (p0[0] * -0.49 + p0[1] * 1.17).cos();
+    let p1 = [
+        world_xz[0] * 0.044 - drift * 0.53,
+        world_xz[1] * 0.044 + drift * 0.37,
+    ];
+    let fine = (p1[0] * 2.47 - p1[1] * 1.81).sin()
+        * (p1[0] * 1.63 + p1[1] * 2.09).cos();
+    let field = 0.68 * broad + 0.32 * fine;
+    let cloud = smooth01((field + 0.20) / 0.82);
+    (1.0 - 0.65 * sky * cloud * coverage).clamp(0.35, 1.0)
+}
+
+/// Animated concentric ring energy for rain ripples, gated by open-sky
+/// wetness. Mirrors the inexpensive procedural pattern in the terrain WGSL.
+pub fn compute_sky_rain_ripple(
+    world_xz: [f32; 2],
+    time: f32,
+    normal_y: f32,
+    sky_exposure: f32,
+    rain: f32,
+) -> f32 {
+    if !world_xz.iter().all(|v| v.is_finite()) || !time.is_finite() {
+        return 0.0;
+    }
+    let wetness = compute_sky_rain_wetness(normal_y, sky_exposure, rain);
+    if wetness <= 0.0 {
+        return 0.0;
+    }
+    let p = [
+        world_xz[0] * 0.72 + time * 0.031,
+        world_xz[1] * 0.72 - time * 0.021,
+    ];
+    let cell = [p[0].floor(), p[1].floor()];
+    let seed = fract((cell[0] * 17.13 + cell[1] * 91.77).sin() * 31313.7);
+    let center = [fract(seed * 17.0), fract(seed * 71.0)];
+    let local = [fract(p[0]) - center[0], fract(p[1]) - center[1]];
+    let age = fract(time * 0.05 + seed);
+    let radius = age * 0.58;
+    let distance = (local[0] * local[0] + local[1] * local[1]).sqrt();
+    let ring = 1.0 - smooth01(((distance - radius).abs() - 0.025) / 0.045);
+    wetness * ring * (1.0 - age)
+}
+
+fn fract(value: f32) -> f32 {
+    value - value.floor()
+}
+
 #[derive(Clone, Copy, Debug)]
 pub struct ShadowCamera {
     pub position: [f32; 3],
@@ -325,6 +426,7 @@ pub struct ShadowUniforms {
     pub light_view_proj: [[[f32; 4]; 4]; 3],
     pub camera_view_proj: [[f32; 4]; 4],
     pub cascade_splits: [f32; 4],
+    /// xyz = direction toward sun; w = live normalized rain wetness.
     pub sun_direction: [f32; 4],
     pub sun_color: [f32; 4],
     pub moon_color: [f32; 4],
@@ -1598,6 +1700,39 @@ fn komorebi_dapple(world_xz: vec2<f32>, day_phase: f32, sun_elevation: f32) -> f
     let daylight = smoothstep(0.08, 0.20, sun_elevation);
     return 1.0 + daylight * (-0.03 + 0.11 * (0.72 * broad + 0.28 * fine));
 }
+// Two low-cost cloud layers drift with the same day clock as the sky dome.
+// Their soft coverage both shades exposed terrain and leaves luminous gaps
+// for the atmospheric shaft hint below.
+fn cloud_coverage(world_xz: vec2<f32>, day_phase: f32) -> f32 {
+    let phase = day_phase * 6.2831853;
+    let drift = phase * 0.013;
+    let p0 = world_xz * 0.018 + vec2<f32>(drift * 0.72, drift * 0.31);
+    let broad = sin(dot(p0, vec2<f32>(1.31, 0.73)))
+        * cos(dot(p0, vec2<f32>(-0.49, 1.17)));
+    let p1 = world_xz * 0.044 + vec2<f32>(drift * -0.53, drift * 0.37);
+    let fine = sin(dot(p1, vec2<f32>(2.47, -1.81)))
+        * cos(dot(p1, vec2<f32>(1.63, 2.09)));
+    let field = 0.68 * broad + 0.32 * fine;
+    return smoothstep(-0.20, 0.62, field);
+}
+fn cloud_shadow_visibility(world_xz: vec2<f32>, day_phase: f32,
+                           sky_light: f32) -> f32 {
+    let sky_open = smoothstep(10.8, 14.25, sky_light);
+    let rain = clamp(shadow.sun_direction.w, 0.0, 1.0);
+    let coverage = cloud_coverage(world_xz, day_phase) * (0.45 + 0.55 * rain);
+    return mix(1.0, 1.0 - 0.65 * coverage, sky_open);
+}
+fn rain_ripple(world_xz: vec2<f32>, time: f32, wetness: f32) -> f32 {
+    let p = world_xz * 0.72 + vec2<f32>(time * 0.031, -time * 0.021);
+    let cell = floor(p);
+    let seed = fract(sin(dot(cell, vec2<f32>(17.13, 91.77))) * 31313.7);
+    let center = vec2<f32>(fract(seed * 17.0), fract(seed * 71.0));
+    let local = fract(p) - center;
+    let age = fract(time * 0.05 + seed);
+    let radius = age * 0.58;
+    let ring = 1.0 - smoothstep(0.025, 0.07, abs(length(local) - radius));
+    return wetness * ring * (1.0 - age);
+}
 // A1: non-linear sky-light falloff n^1.8 as a single exp2/log2 pair
 // — the dark-vision curve that lets cave depth swallow skylight fast.
 fn sky_light_factor(sky_light: f32) -> f32 {
@@ -1674,6 +1809,15 @@ fn fs_main(input: TerrainOutput) -> @location(0) vec4<f32> {
                         + bounce * warm_bounce_scale) * sky_factor
                        + entrance_bounce) * ambient_dim,
                       vec3<f32>(0.008, 0.009, 0.014));
+    let quality = shadow.render_params.x;
+    var cloud_shadow = 1.0;
+    if (quality >= 2.0) {
+        cloud_shadow = cloud_shadow_visibility(
+            input.world_position.xz,
+            shadow.render_params.y,
+            sky_light,
+        );
+    }
     // Komorebi is real leaf cutout + wind caster geometry whenever the
     // shadow map is live; the analytic dapple survives only as the
     // map-free fallback so walls never show fake wave artifacts.
@@ -1684,26 +1828,43 @@ fn fs_main(input: TerrainOutput) -> @location(0) vec4<f32> {
     }
     // Baked block light burns warm through the deepest dark.
     let block_glow = color_temp(block_light) * pow2(block_light / 15.0) * 0.85;
-    let light = ambient + shadow.sun_color.xyz * sun_power * visibility * komorebi
+    let sun_warmth = 1.0 - smoothstep(0.06, 0.46, max(shadow.sun_direction.y, 0.0));
+    let sun_temperature = mix(vec3<f32>(1.0, 0.99, 0.96),
+                              vec3<f32>(1.0, 0.64, 0.38), sun_warmth);
+    let light = ambient + shadow.sun_color.xyz * sun_temperature * sun_power
+                          * visibility * komorebi * cloud_shadow
                           * direct_gate
                 + shadow.moon_color.xyz * moon_power * shadow.moon_color.w
                   * lunar_visibility * direct_gate
                 + block_glow;
     let view_dir = -view_offset / max(view_distance, 0.0001);
-    // Nure-iro: damp upward stone and timber retain a restrained sky glint.
-    let wetness = clamp(shadow.render_params.z * 24.0, 0.0, 1.0)
-        * smoothstep(0.15, 0.85, normal.y);
+    // The unused sun-direction w lane carries live precipitation. Both sky
+    // exposure and upward normal gate it, so roofs and cave ceilings stay dry.
+    // render_params.z is fog density (let wetness = clamp(shadow.render_params.z * 24.0, 0.0, 1.0));
+    // precipitation instead comes from sun_direction.w below.
+    var wetness = 0.0;
+    if (quality >= 2.0) {
+        wetness = clamp(shadow.sun_direction.w, 0.0, 1.0)
+            * smoothstep(0.7, 1.0, normal.y)
+            * smoothstep(12.75, 15.0, sky_light);
+    }
     let wet_luma = dot(input.albedo, vec3<f32>(0.2126, 0.7152, 0.0722));
     let rich_albedo = clamp(input.albedo
         * (vec3<f32>(1.0) + (input.albedo - vec3<f32>(wet_luma)) * (0.08 * wetness))
         * (1.0 - 0.18 * wetness), vec3<f32>(0.0), vec3<f32>(1.0));
+    var rain_rings = 0.0;
+    if (quality >= 2.0) {
+        rain_rings = rain_ripple(input.world_position.xz,
+                                 shadow.render_params.y * 24000.0, wetness);
+    }
     let grazing_sheen = pow4(1.0 - clamp(dot(normal, view_dir), 0.0, 1.0))
-        * 0.12 * wetness * max(normal.y, 0.0);
+        * (0.12 + 0.035 * rain_rings) * wetness * max(normal.y, 0.0);
     // Quiet the darkest saturated materials before warm lamplight returns.
     var lit_color = rich_albedo * light;
     let luma = dot(lit_color, vec3<f32>(0.299, 0.587, 0.114));
     let shibumi = (1.0 - visibility) * 0.22;
     lit_color = mix(lit_color, vec3<f32>(luma) * vec3<f32>(0.96, 0.95, 1.02), shibumi);
+    lit_color += vec3<f32>(0.10, 0.14, 0.17) * (grazing_sheen + rain_rings * 0.018);
     var lantern_light = vec3<f32>(0.0);
     var lacquer_sheen = vec3<f32>(0.0);
     let inei_boost = mix(1.38, 1.0,
@@ -1761,11 +1922,15 @@ fn fs_main(input: TerrainOutput) -> @location(0) vec4<f32> {
     let fog = mix(indigo_fog, vec3<f32>(0.28, 0.22, 0.25), mist * 0.25)
               + vec3<f32>(0.18, 0.075, 0.04) * mist * toward_sun;
     var color = mix(lit_color, fog, atmosphere);
-    if (shadow.render_params.x >= 3.0) {
+    if (shadow.render_params.x >= 2.0) {
         // Screen-direction sun-shaft hint, without a volumetric buffer.
         let toward = view_offset / max(view_distance, 0.0001);
         let beam = pow24(max(dot(toward, to_sun), 0.0));
-        color += shadow.sun_color.xyz * beam * atmosphere * 0.12;
+        let opening = 1.0 - cloud_coverage(input.world_position.xz, shadow.render_params.y);
+        let shafts = beam * atmosphere * opening * direct_gate * 0.055;
+        color += shadow.sun_color.xyz * sun_temperature * shafts;
+    }
+    if (shadow.render_params.x >= 3.0) {
         color = aces(color);
     }
     return vec4<f32>(pow(max(color, vec3<f32>(0.0)),
@@ -1849,13 +2014,25 @@ fn fs_main(input: SkyOutput) -> @location(0) vec4<f32> {
             let uv = view.xz / (view.y + 0.28) * 0.35 + vec2<f32>(drift, 0.0);
             let cell = floor(uv * 7.0);
             let roll = fract(sin(dot(cell, vec2<f32>(17.13, 91.77))) * 31313.7);
-            if (roll > 0.72) {
-                let fade = smoothstep(0.04, 0.18, view.y)
-                    * (1.0 - smoothstep(0.45, 0.75, view.y));
-                let lit = mix(mix(vec3<f32>(0.10, 0.12, 0.19),
-                                  vec3<f32>(0.82, 0.82, 0.86), day),
-                              vec3<f32>(0.28, 0.24, 0.30), twilight * 0.7);
-                color = mix(color, lit, fade * 0.55);
+            let cloud_presence = smoothstep(0.70, 0.88, roll);
+            if (cloud_presence > 0.001) {
+                let local = fract(uv * 7.0);
+                let edge_distance = min(min(local.x, 1.0 - local.x),
+                                        min(local.y, 1.0 - local.y));
+                let edge = 1.0 - smoothstep(0.02, 0.15, edge_distance);
+                let fade = smoothstep(0.045, 0.20, view.y)
+                    * (1.0 - smoothstep(0.43, 0.75, view.y));
+                let warm_sun = mix(vec3<f32>(1.0, 0.99, 0.96),
+                                   vec3<f32>(1.0, 0.65, 0.40),
+                                   1.0 - smoothstep(0.06, 0.46, max(sun.y, 0.0)));
+                let day_cloud = mix(vec3<f32>(0.10, 0.12, 0.19),
+                                    vec3<f32>(0.82, 0.84, 0.88), day)
+                                    * warm_sun;
+                let lit = mix(day_cloud, vec3<f32>(0.22, 0.25, 0.34), 1.0 - day);
+                let deck_alpha = cloud_presence * fade * 0.46;
+                let rim = cloud_presence * edge * fade * pow4(max(mu, 0.0)) * 0.11;
+                color = mix(color, lit, deck_alpha);
+                color += warm_sun * rim;
             }
         }
     }
@@ -1966,19 +2143,57 @@ fn wave_normal(position: vec2<f32>, phase: f32, quality: f32) -> vec3<f32> {
     }
     return normalize(vec3<f32>(-slope.x, 1.0, -slope.y));
 }
+fn water_body_tint(day: f32, twilight: f32) -> vec3<f32> {
+    // Matches the built-in underwater atmosphere's overworld teal at noon,
+    // shifting smoothly toward a cool silver-blue body tint at night.
+    let underwater_teal = vec3<f32>(0.10, 0.30, 0.42);
+    let moon_blue = vec3<f32>(0.055, 0.105, 0.20);
+    let dusk_teal = vec3<f32>(0.16, 0.24, 0.34);
+    return mix(mix(moon_blue, underwater_teal, day), dusk_teal, twilight * 0.55);
+}
+fn water_cloud_openness(world_xz: vec2<f32>, phase: f32) -> f32 {
+    let p = world_xz * 0.018 + vec2<f32>(phase * 0.009, phase * 0.004);
+    let a = sin(dot(p, vec2<f32>(1.31, 0.73))) * cos(dot(p, vec2<f32>(-0.49, 1.17)));
+    let q = world_xz * 0.044 + vec2<f32>(-phase * 0.005, phase * 0.003);
+    let b = sin(dot(q, vec2<f32>(2.47, -1.81))) * cos(dot(q, vec2<f32>(1.63, 2.09)));
+    return 1.0 - smoothstep(-0.20, 0.62, 0.68 * a + 0.32 * b);
+}
+fn water_rain_ripple(world_xz: vec2<f32>, time: f32, wetness: f32) -> f32 {
+    let p = world_xz * 0.72 + vec2<f32>(time * 0.031, -time * 0.021);
+    let cell = floor(p);
+    let seed = fract(sin(dot(cell, vec2<f32>(17.13, 91.77))) * 31313.7);
+    let center = vec2<f32>(fract(seed * 17.0), fract(seed * 71.0));
+    let local = fract(p) - center;
+    let age = fract(time * 0.05 + seed);
+    let radius = age * 0.58;
+    let ring = 1.0 - smoothstep(0.025, 0.07, abs(length(local) - radius));
+    return wetness * ring * (1.0 - age);
+}
 @fragment
 fn fs_main(input: WaterOutput) -> @location(0) vec4<f32> {
     let quality = shadow.render_params.x;
     let day = smoothstep(-0.12, 0.12, shadow.sun_direction.y);
+    let twilight = 1.0 - smoothstep(0.0, 0.28, abs(shadow.sun_direction.y));
     let depth = clamp(input.depth_hint, 0.0, 1.0);
-    let shallow = vec3<f32>(0.04, 0.32, 0.37);
-    let deep = vec3<f32>(0.012, 0.065, 0.15);
-    var color = mix(shallow, deep, depth);
     let phase = shadow.render_params.y * 6.2831853;
-    let normal = wave_normal(input.world_position.xz, phase, quality);
+    let flow = vec2<f32>(0.78, 0.31);
+    let flowed_position = input.world_position.xz + flow * phase * 1.7;
+    let normal = wave_normal(flowed_position, phase, quality);
+    var rain_rings = 0.0;
+    if (quality >= 2.0) {
+        let sky_exposure = smoothstep(0.85, 1.0, 1.0 - depth);
+        rain_rings = water_rain_ripple(input.world_position.xz,
+            shadow.render_params.y * 24000.0,
+            clamp(shadow.sun_direction.w, 0.0, 1.0) * sky_exposure);
+    }
     let to_camera = shadow.camera_position.xyz - input.world_position;
     let view = to_camera / max(length(to_camera), 0.0001);
     let reflected = reflect(-view, normal);
+    let absorption = exp(-depth * vec3<f32>(2.25, 1.18, 0.62));
+    let body_tint = water_body_tint(day, twilight);
+    let seabed = vec3<f32>(0.12, 0.36, 0.31)
+        * (0.42 + 0.58 * max(shadow.sun_direction.y, 0.0));
+    var color = seabed * absorption + body_tint * (vec3<f32>(1.0) - absorption);
     // Suigetsu: moonlight gathers into a rippling silver-blue path after sunset.
     var suigetsu = vec3<f32>(0.0);
     if (shadow.sun_direction.y < 0.0) {
@@ -1994,21 +2209,47 @@ fn fs_main(input: WaterOutput) -> @location(0) vec4<f32> {
     if (quality <= 1.0) {
         return vec4<f32>(color + suigetsu, 0.88);
     }
-    let fresnel = 0.02 + 0.98 * pow5(1.0 - max(dot(normal, view), 0.0));
-    let sky = mix(vec3<f32>(0.02, 0.035, 0.085),
-                  vec3<f32>(0.18, 0.44, 0.78), day);
-    let sky_reflection = mix(sky * 0.6, sky, clamp(reflected.y, 0.0, 1.0))
-        * (1.0 - shadow.celestial_params.w * 0.55);
-    let half_vector = view + shadow.sun_direction.xyz;
+    // Schlick dielectric Fresnel retains low reflectance face-on and a
+    // strong sky reflection at grazing angles.
+    let fresnel = 0.02 + 0.98 * pow5(1.0 - clamp(dot(normal, view), 0.0, 1.0));
+    color += vec3<f32>(0.10, 0.15, 0.18) * rain_rings * 0.045;
+    let sun_warmth = (1.0 - smoothstep(0.06, 0.46, max(shadow.sun_direction.y, 0.0))) * day;
+    let sun_temperature = mix(vec3<f32>(1.0, 0.99, 0.96),
+                              vec3<f32>(1.0, 0.64, 0.38), sun_warmth);
+    let cloud_open = water_cloud_openness(input.world_position.xz, phase);
+    let day_sky = mix(vec3<f32>(0.18, 0.38, 0.62),
+                      vec3<f32>(0.42, 0.56, 0.70), twilight);
+    let night_sky = vec3<f32>(0.035, 0.065, 0.13) + shadow.moon_color.xyz * 0.22;
+    let sky = mix(night_sky, day_sky * sun_temperature, day);
+    let sky_reflection = mix(sky * 0.58, sky, clamp(reflected.y, 0.0, 1.0))
+        * mix(0.72, 1.0, cloud_open) * (1.0 - shadow.celestial_params.w * 0.55);
+    let half_vector = view + normalize(shadow.sun_direction.xyz);
     let halfway = half_vector / max(length(half_vector), 0.0001);
     let sparkle = pow180(max(dot(normal, halfway), 0.0));
+    let moon_reflection = shadow.moon_color.xyz * pow72(max(dot(reflected,
+        -normalize(shadow.sun_direction.xyz)), 0.0)) * (1.0 - day);
     color = mix(color, sky_reflection, fresnel)
-            + shadow.sun_color.xyz * sparkle * day * 0.8 + suigetsu;
+            + shadow.sun_color.xyz * sun_temperature * sparkle * day * 0.8
+            + moon_reflection + suigetsu;
     if (quality >= 3.0) {
-        let ripple = sin(input.world_position.x * 1.7 + phase * 3.0)
-                     * sin(input.world_position.z * 1.9 - phase * 2.0);
-        let caustic = pow3(max(ripple, 0.0)) * (1.0 - depth);
-        color += vec3<f32>(0.018, 0.06, 0.075) * caustic;
+        let caustic_a = sin(dot(flowed_position, vec2<f32>(1.7, 1.15)) + phase * 2.2)
+            * sin(dot(flowed_position, vec2<f32>(-1.1, 1.9)) - phase * 1.4);
+        let caustic_b = sin(dot(flowed_position * 1.83, vec2<f32>(1.2, -1.7)) - phase * 2.8)
+            * sin(dot(flowed_position * 1.83, vec2<f32>(1.9, 0.8)) + phase * 1.9);
+        let web_a = pow3(max(caustic_a, 0.0));
+        let web_b = pow3(max(caustic_b, 0.0));
+        let caustic = (0.62 * web_a + 0.38 * web_b) * (1.0 - depth)
+            * max(shadow.sun_direction.y, 0.0) * cloud_open;
+        color += vec3<f32>(0.05, 0.15, 0.13) * caustic;
+        // The water stream exposes sky-light depth rather than a scene-depth
+        // texture. This narrow, soft band uses that existing shallow-depth
+        // proxy for restrained edge foam without adding a binding.
+        let shallow_edge = exp(-abs(depth - 0.12) * 28.0);
+        let foam_breakup = smoothstep(0.05, 0.72,
+            sin(dot(flowed_position, vec2<f32>(3.1, 2.7)))
+            * sin(dot(flowed_position, vec2<f32>(-2.4, 3.6))));
+        let foam = shallow_edge * foam_breakup * 0.12;
+        color = mix(color, vec3<f32>(0.84, 0.91, 0.94), foam);
     }
     return vec4<f32>(pow(max(color, vec3<f32>(0.0)),
                          vec3<f32>(1.0 / 2.2)), 0.93);
@@ -2378,4 +2619,54 @@ targets = ["colortex0"]
 "#,
         quality.as_str()
     )
+}
+
+#[cfg(test)]
+mod realism_wgsl_tests {
+    use super::{
+        compute_cloud_shadow_attenuation, compute_sky_rain_ripple, compute_sky_rain_wetness,
+    };
+
+    #[test]
+    fn rain_wetness_and_ripples_require_open_sky_and_rain() {
+        assert_eq!(compute_sky_rain_wetness(1.0, 0.0, 1.0), 0.0);
+        assert_eq!(
+            compute_sky_rain_ripple([12.5, -4.0], 3.0, 1.0, 0.0, 1.0),
+            0.0
+        );
+        assert_eq!(compute_sky_rain_wetness(0.69, 1.0, 1.0), 0.0);
+        assert_eq!(compute_sky_rain_wetness(1.0, 1.0, 0.0), 0.0);
+        assert!(compute_sky_rain_wetness(1.0, 1.0, 1.0) > 0.0);
+        assert!(compute_sky_rain_ripple([2.0, 5.0], 3.0, 1.0, 1.0, 1.0) > 0.0);
+    }
+
+    #[test]
+    fn cloud_shadow_is_bounded_weather_responsive_and_smooth() {
+        let position = [317.0, -81.0];
+        let clear = compute_cloud_shadow_attenuation(position, 0.4, 1.0, 0.0);
+        let cloudy = compute_cloud_shadow_attenuation(position, 0.4, 1.0, 1.0);
+        let nearby = compute_cloud_shadow_attenuation(
+            [position[0] + 0.01, position[1] - 0.01],
+            0.4,
+            1.0,
+            1.0,
+        );
+        assert_eq!(clear, 1.0);
+        assert!(cloudy < clear);
+        assert!((0.35..=1.0).contains(&cloudy));
+        assert!((cloudy - nearby).abs() < 0.01);
+        assert_eq!(
+            compute_cloud_shadow_attenuation(position, 0.4, 0.0, 1.0),
+            1.0
+        );
+        for x in -32..32 {
+            let factor = compute_cloud_shadow_attenuation(
+                [x as f32 * 7.3, x as f32 * -3.1],
+                x as f32 * 0.037,
+                1.0,
+                1.0,
+            );
+            assert!((0.35..=1.0).contains(&factor));
+        }
+    }
 }

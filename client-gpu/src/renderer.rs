@@ -1312,7 +1312,8 @@ struct TerrainBuffers {
 pub struct WaterVertex {
     /// World-space position in blocks.
     pub position: [f32; 3],
-    /// Approximate depth `0.0..=1.0` (deeper = darker blue).
+    /// Inverted packed skylight `0.0..=1.0`, used as a shallow/deep color
+    /// proxy. This is not physical water depth or scene depth.
     pub depth_hint: f32,
 }
 
@@ -1522,9 +1523,9 @@ pub fn section_geometry(
         let base = out.water.len() as u32;
         for vertex in quad {
             let local = decode_packed_local(vertex.position);
-            // Skylight at the surface vertex is a free depth proxy:
-            // open water reads 15 (shallow, bright), shaded/deep water
-            // dims toward the deep-sea colour — no packed field needed.
+            // Skylight is the only available per-vertex water depth proxy:
+            // open water reads 15, shaded water dims. It does not measure
+            // water-column thickness; the water pass has no scene-depth bind.
             let sky_light = ((vertex.attributes >> 9) & 0xf) as f32 / 15.0;
             out.water.push(WaterVertex {
                 position: [
@@ -10904,6 +10905,35 @@ impl GpuRenderer {
         world_time_ticks: u64,
         lights: &[DynamicColoredLight],
     ) {
+        self.render_to_view_with_env_and_rain(
+            view,
+            width,
+            height,
+            sky,
+            atmosphere,
+            chunk_fades,
+            world_time_ticks,
+            lights,
+            0.0,
+        );
+    }
+
+    /// Live-window variant that supplies the already-smoothed precipitation
+    /// amount to the existing spare shadow-uniform lane. Kept separate so
+    /// the established public renderer API remains source-compatible.
+    #[allow(clippy::too_many_arguments)]
+    pub fn render_to_view_with_env_and_rain(
+        &mut self,
+        view: &wgpu::TextureView,
+        width: u32,
+        height: u32,
+        sky: &SkyFogOutput,
+        atmosphere: &BiomeAtmosphereBlender,
+        chunk_fades: &ChunkFadeTracker,
+        world_time_ticks: u64,
+        lights: &[DynamicColoredLight],
+        rain_wetness: f32,
+    ) {
         self.ensure_depth(width, height);
         let mut encoder = self
             .ctx
@@ -10921,6 +10951,7 @@ impl GpuRenderer {
                 chunk_fades,
                 world_time_ticks,
                 lights,
+                rain_wetness,
             );
         } else {
             // No camera => no composed pass; still run the per-frame upload
@@ -11100,11 +11131,19 @@ impl GpuRenderer {
         chunk_fades: &ChunkFadeTracker,
         world_time_ticks: u64,
         lights: &[DynamicColoredLight],
+        rain_wetness: f32,
     ) {
         let (width, height) = size;
         let camera = self.window_camera.get().expect("checked by caller");
         let aspect = width.max(1) as f32 / height.max(1) as f32;
         self.prepare_shadow(&camera, aspect, world_time_ticks);
+        if let Some(stable) = self.frame_stable_shadow.as_mut() {
+            stable.uniforms.sun_direction[3] = if rain_wetness.is_finite() {
+                rain_wetness.clamp(0.0, 1.0)
+            } else {
+                0.0
+            };
+        }
         let decision = self.shadow_decision(&camera, 0, world_time_ticks);
         self.dispatch_shadow_work(encoder, &camera, aspect, decision);
 
@@ -12530,7 +12569,8 @@ impl GpuRenderer {
     /// `MEGU_SKY_ATMOSPHERE_WGSL` needs a separate fullscreen pass with its
     /// own group-0 shadow uniform; this pass currently clears the sky and uses
     /// group 0 for terrain frame/section data. `MEGU_WATER_SURFACE_WGSL`
-    /// requires float3 world-position and per-vertex `depth_hint` inputs,
+    /// requires float3 world-position and per-vertex `depth_hint` inputs
+    /// (currently inverted skylight, not scene depth),
     /// whereas translucent terrain uploads packed block vertices without a
     /// water-depth attribute. Both require dedicated integration work.
     fn encode_composed_world(

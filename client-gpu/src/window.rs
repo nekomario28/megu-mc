@@ -619,10 +619,66 @@ struct GuestLinkGrant {
     token: Frl3GuestToken,
 }
 
+/// A precipitation hold with eased evaporation after rain stops. Server rain
+/// is authoritative while active; the short dry-off ramp avoids instant
+/// visual drying when the weather packet changes to clear.
+#[derive(Clone, Copy, Debug, Default)]
+struct RainWetnessRamp {
+    wetness: f32,
+    dry_start: f32,
+    elapsed: f32,
+    was_raining: bool,
+}
+
+impl RainWetnessRamp {
+    fn update(&mut self, rain_level: f32, dt: f32) -> f32 {
+        let rain = if rain_level.is_finite() {
+            rain_level.clamp(0.0, 1.0)
+        } else {
+            0.0
+        };
+        if rain > 0.0 {
+            self.wetness = rain;
+            self.dry_start = rain;
+            self.elapsed = 0.0;
+            self.was_raining = true;
+        } else {
+            if self.was_raining {
+                self.dry_start = self.wetness;
+                self.elapsed = 0.0;
+                self.was_raining = false;
+            }
+            self.elapsed = (self.elapsed + if dt.is_finite() { dt.clamp(0.0, 1.0) } else { 0.0 })
+                .min(20.0);
+            let t = self.elapsed / 20.0;
+            let eased = t * t * (3.0 - 2.0 * t);
+            self.wetness = self.dry_start * (1.0 - eased);
+        }
+        self.wetness
+    }
+}
+
+#[cfg(test)]
+mod rain_wetness_ramp_tests {
+    use super::RainWetnessRamp;
+
+    #[test]
+    fn rain_stays_live_then_drains_smoothly_over_twenty_seconds() {
+        let mut ramp = RainWetnessRamp::default();
+        assert_eq!(ramp.update(1.0, 1.0 / 60.0), 1.0);
+        let after_stop = (0..10).fold(0.0, |_, _| ramp.update(0.0, 1.0));
+        assert!((after_stop - 0.5).abs() < 0.001);
+        let fully_dry = (0..10).fold(0.0, |_, _| ramp.update(0.0, 1.0));
+        assert_eq!(fully_dry, 0.0);
+        assert_eq!(ramp.update(0.0, 1.0), 0.0);
+    }
+}
+
 /// The `ApplicationHandler` `EventLoop::run_app` drives.
 pub struct GpuApp {
     config: GpuCliConfig,
     live: Option<LiveSession>,
+    rain_wetness: RainWetnessRamp,
     active: Option<ActiveWindow>,
     camera: Camera,
     camera_controller: CameraController,
@@ -946,6 +1002,7 @@ impl GpuApp {
         let mut app = Self {
             config,
             live,
+            rain_wetness: RainWetnessRamp::default(),
             active: None,
             camera,
             camera_controller: CameraController::new(render_config.fov_deg as f32, 1.0, 4.0),
@@ -4205,6 +4262,11 @@ impl GpuApp {
                 self.camera.pitch_deg = (-pose.pitch).clamp(-89.9, 89.9);
             }
         }
+        let rain_level = self
+            .live
+            .as_ref()
+            .map_or(0.0, |live| live.world.rain_level);
+        let rain_wetness = self.rain_wetness.update(rain_level, dt);
         self.sync_disconnected_screen();
         self.sync_death_screen();
         self.sync_container_screen();
@@ -4577,7 +4639,7 @@ impl GpuApp {
                             &mut self.live_particles_staged,
                             &mut active.renderer,
                         );
-                        active.renderer.render_to_view_with_env(
+                        active.renderer.render_to_view_with_env_and_rain(
                             &view,
                             w,
                             h,
@@ -4586,6 +4648,7 @@ impl GpuApp {
                             &live.chunk_fades,
                             live.world_time_ticks(),
                             &vfx_frame.lights,
+                            rain_wetness,
                         );
                     }
                     None => active.renderer.render_to_view(&view, w, h, &sky),
