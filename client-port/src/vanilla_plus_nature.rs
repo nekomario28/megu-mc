@@ -131,6 +131,45 @@ const DENSITY_BASE: f32 = 0.60;
 const DENSITY_CAP_1: f32 = 0.72;
 const DENSITY_CAP_2: f32 = 0.84;
 
+// Storm coverage ramp: thresholds relax towards full overcast as
+// `storm` runs 0.0 (clear) -> 1.0 (thunder).
+const DENSITY_STORM_BASE: f32 = 0.30;
+const DENSITY_STORM_CAP_1: f32 = 0.52;
+const DENSITY_STORM_CAP_2: f32 = 0.70;
+
+/// Altocumulus deck lift above the cumulus base altitude, in blocks. Exactly
+/// one stratum thickness so the mid deck hugs the cumulus tops like an
+/// altocumulus-castellanus turret — the classic stepped puffy cap.
+pub const ALTOCUMULUS_DECK_LIFT: f32 = CLOUD_LAYER_HEIGHT;
+/// Cirrus deck lift above the cumulus base altitude, in blocks. Decks stack
+/// contiguously (base 0, altocumulus at the cumulus top, cirrus at the
+/// altocumulus top) so every column reads as one stepped cloud column and
+/// same-column shared faces are genuinely adjacent — which is also what the
+/// hidden-face and stacked-cap invariants demand.
+pub const CIRRUS_DECK_LIFT: f32 = ALTOCUMULUS_DECK_LIFT + DECK_THICKNESS[1];
+/// Per-deck vertical thickness in blocks `[cumulus, altocumulus, cirrus]` —
+/// the wispy cirrus is thinnest.
+pub const DECK_THICKNESS: [f32; 3] = [CLOUD_LAYER_HEIGHT, 3.0, 2.0];
+/// Per-deck parallax wind-drift multiplier vs [`CLOUD_SCROLL_BLOCKS_PER_TICK`]:
+/// higher decks shear faster across the sky.
+pub const DECK_WIND_SPEED: [f32; 3] = [1.0, 1.5, 2.25];
+/// Per-deck translucency alpha `[cumulus, altocumulus, cirrus]`: the low
+/// cumulus is nearly opaque while the high cirrus lets the sky through.
+pub const DECK_ALPHA: [f32; 3] = [0.82, 0.58, 0.35];
+/// How much sun each deck blocks at ground level for [`cloud_shadow_factor`].
+const DECK_GROUND_SHADE: [f32; 3] = [0.45, 0.30, 0.15];
+
+// Deterministic hash seeds for the upper decks and the cue-driven particles.
+const SEED_CLOUD_ALTO: u64 = 0x4f1b_bcdc_9fb5_0793;
+const SEED_CLOUD_CIRRUS: u64 = 0x7fb5_8165_1cf7_3b21;
+const SEED_DUST: u64 = 0xd6e8_feb8_6659_fd93;
+const SEED_EMBER: u64 = 0xa24b_aed4_963e_e407;
+
+const DUST_MOTE_PERIOD: u64 = 8;
+const EMBER_PERIOD: u64 = 6;
+/// Sky light at or below which sealed-underground dust motes may drift.
+const DUST_MAX_SKY_LIGHT: u8 = 11;
+
 // ---------------------------------------------------------------------------
 // Small numeric helpers (mirroring vfx_engine conventions)
 // ---------------------------------------------------------------------------
@@ -203,6 +242,217 @@ fn cloud_density(cx: i64, cz: i64) -> f32 {
     let n1 = value_noise_2d(cx as f64 / 9.0, cz as f64 / 9.0, SEED_CLOUD_A);
     let n2 = value_noise_2d(cx as f64 / 3.0, cz as f64 / 3.0, SEED_CLOUD_B);
     0.7 * n1 + 0.3 * n2
+}
+
+/// Which atmospheric deck a `layer` slot plays for a given deck count:
+/// `1` deck is classic low cumulus, `2` decks add high cirrus, `3` decks
+/// insert mid altocumulus between the two. Roles: `0` cumulus, `1`
+/// altocumulus, `2` cirrus.
+fn deck_role(layer: u8, layers: u8) -> usize {
+    match layers.clamp(1, 3) {
+        1 => 0,
+        2 => {
+            if layer == 0 {
+                0
+            } else {
+                2
+            }
+        }
+        _ => usize::from(layer.min(2)),
+    }
+}
+
+/// Per-deck coverage field in `[0, 1]`: each deck has its own texture so
+/// silhouettes differ between strata — cumulus blobs, patchy altocumulus
+/// mottling, and long cirrus streaks stretched along the wind axis.
+fn cloud_density_deck(role: usize, cx: i64, cz: i64) -> f32 {
+    match role {
+        0 => cloud_density(cx, cz),
+        1 => {
+            let n1 = value_noise_2d(cx as f64 / 6.0, cz as f64 / 6.0, SEED_CLOUD_ALTO);
+            let n2 = value_noise_2d(cx as f64 / 2.5, cz as f64 / 2.5, SEED_CLOUD_ALTO ^ 0x5a5a);
+            0.65 * n1 + 0.35 * n2
+        }
+        _ => {
+            // Cirrus streaks stretch along X, the direction the layer advects.
+            let n1 = value_noise_2d(cx as f64 / 14.0, cz as f64 / 5.0, SEED_CLOUD_CIRRUS);
+            let n2 = value_noise_2d(cx as f64 / 4.0, cz as f64 / 2.0, SEED_CLOUD_CIRRUS ^ 0x5a5a);
+            0.70 * n1 + 0.30 * n2
+        }
+    }
+}
+
+/// Whole-cell parallax shift for a deck at `scroll` scrolled blocks: higher
+/// decks' coverage pattern slides faster than the shared advection (wind
+/// shear), always quantized to whole cells so the field stays chunky.
+fn deck_cell_shift(role: usize, scroll: f64) -> i64 {
+    let extra = scroll * f64::from(DECK_WIND_SPEED[role] - 1.0);
+    (extra / f64::from(CLOUD_CELL_BLOCKS)).floor() as i64
+}
+
+/// Fully-resolved description of one atmospheric cloud deck.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct CloudDeckSpec {
+    /// Altitude offset above the base cloud height, in blocks.
+    pub altitude_offset: f32,
+    /// Vertical deck thickness in blocks.
+    pub thickness: f32,
+    /// Parallax wind-drift multiplier vs [`CLOUD_SCROLL_BLOCKS_PER_TICK`].
+    pub wind_speed: f32,
+    /// Translucency alpha in `0..=1` (`1.0` opaque; cirrus is wispy).
+    pub opacity: f32,
+    /// Coverage density threshold in clear weather.
+    pub clear_threshold: f32,
+    /// Coverage density threshold under a full storm (lower = more deck).
+    pub storm_threshold: f32,
+}
+
+impl CloudDeckSpec {
+    /// Density threshold interpolated clear -> storm for `storm` in `0..=1`.
+    pub fn threshold(&self, storm: f32) -> f32 {
+        lerp(
+            self.clear_threshold,
+            self.storm_threshold,
+            clamped(storm, 0.0, 1.0),
+        )
+    }
+}
+
+/// Spec table indexed by deck ROLE (`0` cumulus, `1` altocumulus, `2`
+/// cirrus) — see [`deck_role`] for the slot -> role map.
+const DECK_SPECS: [CloudDeckSpec; 3] = [
+    CloudDeckSpec {
+        altitude_offset: 0.0,
+        thickness: DECK_THICKNESS[0],
+        wind_speed: DECK_WIND_SPEED[0],
+        opacity: DECK_ALPHA[0],
+        clear_threshold: DENSITY_BASE,
+        storm_threshold: DENSITY_STORM_BASE,
+    },
+    CloudDeckSpec {
+        altitude_offset: ALTOCUMULUS_DECK_LIFT,
+        thickness: DECK_THICKNESS[1],
+        wind_speed: DECK_WIND_SPEED[1],
+        opacity: DECK_ALPHA[1],
+        clear_threshold: DENSITY_CAP_1,
+        storm_threshold: DENSITY_STORM_CAP_1,
+    },
+    CloudDeckSpec {
+        altitude_offset: CIRRUS_DECK_LIFT,
+        thickness: DECK_THICKNESS[2],
+        wind_speed: DECK_WIND_SPEED[2],
+        opacity: DECK_ALPHA[2],
+        clear_threshold: DENSITY_CAP_2,
+        storm_threshold: DENSITY_STORM_CAP_2,
+    },
+];
+
+/// The [`CloudDeckSpec`] for `layer` under a config of `layers` decks
+/// (`effective_cloud_layers`). See [`deck_role`] for the slot -> deck map.
+pub fn cloud_deck_spec(layer: u8, layers: u8) -> CloudDeckSpec {
+    DECK_SPECS[deck_role(layer, layers)]
+}
+
+/// Pattern gain per deck role `[cumulus, altocumulus, cirrus]`: how strongly
+/// the deck's own texture field opens extra coverage on top of the shared
+/// cumulus field. The shared field keeps every deck's footprint nested over
+/// dense base columns (a cap can never exist without a base); the pattern
+/// term sculpts the boundary — altocumulus caps gather in mottled patches,
+/// cirrus streaks stretch along the wind axis — and it is sampled under the
+/// deck's own parallax shift so coverage edges drift at deck speed.
+const DECK_PATTERN_GAIN: [f32; 3] = [0.0, 0.05, 0.15];
+
+/// `true` when a deck's coverage field exceeds its weather-interpolated
+/// threshold at cell `(cx, cz)`. This is THE cloud density test —
+/// `generate_layered_voxel_clouds` and `cloud_shadow_factor` share it
+/// verbatim so ground shadows match the sky 1:1.
+///
+/// Coverage is the shared cumulus field plus a bounded pattern gain: the
+/// deck texture can only ever *add* coverage over dense base columns, never
+/// float a cap over empty sky (nesting is also enforced structurally by
+/// [`column_occupied`]). The pattern samples at the deck's parallax-shifted
+/// coordinate so cap boundaries advance faster on higher decks.
+fn deck_occupied(role: usize, cx: i64, cz: i64, scroll: f64, storm: f32) -> bool {
+    let field = if DECK_PATTERN_GAIN[role] == 0.0 {
+        cloud_density(cx, cz)
+    } else {
+        let shift = deck_cell_shift(role, scroll);
+        cloud_density(cx, cz)
+            + DECK_PATTERN_GAIN[role]
+                * cloud_density_deck(role, cx.saturating_add(shift), cz)
+    };
+    field > DECK_SPECS[role].threshold(storm)
+}
+
+/// Nested column occupancy: a deck exists only where every deck beneath it
+/// also exists in the same column (wider base, stepped upper decks).
+fn column_occupied(layer: u8, layers: u8, cx: i64, cz: i64, scroll: f64, storm: f32) -> bool {
+    (0..=layer).all(|l| deck_occupied(deck_role(l, layers), cx, cz, scroll, storm))
+}
+
+/// Storm coverage scalar in `0..=1` for a [`WeatherKind`]: clear `0.0`,
+/// rain `0.55`, thunder `1.0`.
+fn weather_storm(weather: WeatherKind) -> f32 {
+    match weather {
+        WeatherKind::Clear => 0.0,
+        WeatherKind::Rain => 0.55,
+        WeatherKind::Thunder => 1.0,
+    }
+}
+
+/// The shared horizontal wind field in blocks per tick: the X component is
+/// the cloud-advection headwind — the same scroll the voxel clouds and the
+/// [`cloud_shadow_factor`] field use — and Z is a slow gusty crosswind that
+/// strengthens with [`WeatherKind::wind_strength`]. `Clear` returns exactly
+/// `(-CLOUD_SCROLL_BLOCKS_PER_TICK, 0.0)`. Grass, leaf, lantern and banner
+/// sway plus ambience particle drift all pull from this one vector so the
+/// whole scene leans the same way under the same sky.
+pub fn shared_wind_vector(world_time_ticks: u64, weather: WeatherKind) -> [f32; 2] {
+    // Normalize weather strength so Clear contributes no boost or gust.
+    let w = ((weather.wind_strength() - 0.15) / (WeatherKind::Thunder.wind_strength() - 0.15))
+        .clamp(0.0, 1.0);
+    let phase = (world_time_ticks % WIND_TIME_WRAP_TICKS) as f32 * 0.05;
+    [
+        -CLOUD_SCROLL_BLOCKS_PER_TICK * (1.0 + 0.55 * w),
+        0.25 * w * (phase * 0.37 + 1.3).sin(),
+    ]
+}
+
+/// Fraction of open-sky sun reaching the ground at `(world_x, world_z)` —
+/// `1.0` full sun, lower under a cloud deck.
+///
+/// Uses the exact same integer-cell occupancy pipeline as
+/// [`generate_layered_voxel_clouds`]: the advection scroll, the per-deck
+/// parallax cell shift, the per-deck density fields and the nested
+/// column rule are shared verbatim, so drifting ground shadows match the
+/// overhead multi-layer clouds 1:1. Rain and thunder deepen the shade the
+/// same way the storm coverage ramp thickens the decks.
+pub fn cloud_shadow_factor(
+    world_x: f32,
+    world_z: f32,
+    world_time_ticks: u64,
+    weather: WeatherKind,
+    layers: u8,
+) -> f32 {
+    let x = f64::from(finite_or(world_x, 0.0).clamp(-MAX_COORD, MAX_COORD));
+    let z = f64::from(finite_or(world_z, 0.0).clamp(-MAX_COORD, MAX_COORD));
+    let scroll = world_time_ticks as f64 * f64::from(CLOUD_SCROLL_BLOCKS_PER_TICK);
+    let cell = f64::from(CLOUD_CELL_BLOCKS);
+    let cx = ((x + scroll) / cell).floor() as i64;
+    let cz = (z / cell).floor() as i64;
+    let storm = weather_storm(weather);
+
+    let decks = layers.clamp(1, 3);
+    let mut light = 1.0f32;
+    for layer in 0..decks {
+        if !column_occupied(layer, decks, cx, cz, scroll, storm) {
+            break; // nested decks: nothing above a missing lower deck
+        }
+        let role = deck_role(layer, decks);
+        light *= 1.0 - DECK_GROUND_SHADE[role];
+    }
+    // Storm decks are deep slate: precipitation darkens what shade exists.
+    (light * (1.0 - 0.25 * storm)).clamp(0.0, 1.0)
 }
 
 /// Per-block sway phase offset so neighbouring plants never move in lockstep.
@@ -709,13 +959,25 @@ pub fn compute_cloud_lighting(
     let day_side = [0.84, 0.88, 0.95];
     let day_bottom = [0.62, 0.68, 0.80];
     let amber = [1.0, 0.62, 0.34];
+    // Golden under-lit rim (sun below the deck) and the cool silver-blue
+    // rim the moon paints while the sun is fully down.
+    let amber_under = [0.98, 0.55, 0.30];
+    let moon_silver = [0.60, 0.70, 0.92];
 
     let mut top = lerp3(night_top, day_top, day);
     let mut side = lerp3(night_side, day_side, day);
-    let bottom = lerp3(night_bottom, day_bottom, day);
+    let mut bottom = lerp3(night_bottom, day_bottom, day);
 
     top = lerp3(top, amber, rim * 0.55);
     side = lerp3(side, amber, rim * 0.30);
+    // Sunrise/sunset light strikes the undersides first: warm under-lit rims.
+    bottom = lerp3(bottom, amber_under, rim * 0.30);
+    // Night: a subtle cool silver-blue moonlight rim, strongest right at the
+    // dusk/dawn band where the moon still catches the deck edges.
+    let night_f = 1.0 - day;
+    let moon_rim = night_f * (0.05 + 0.08 * dusk * (1.0 - above));
+    top = lerp3(top, moon_silver, moon_rim);
+    side = lerp3(side, moon_silver, night_f * 0.04);
 
     // Storm underside darkening; the top greys only slightly.
     let storm = (rain * 0.55 + thunder).clamp(0.0, 1.0);
@@ -749,6 +1011,14 @@ pub fn compute_cloud_lighting(
 /// chunky vanilla feel. Hidden faces between adjacent cloud voxels (and
 /// between stacked strata) are suppressed in [`VoxelCloudCell::exposed_faces`].
 ///
+/// Each `layer` slot is a coherent atmospheric deck — `1` deck is classic
+/// low cumulus, `2` decks add high cirrus, `3` decks insert mid altocumulus
+/// (see [`cloud_deck_spec`] for altitudes, thicknesses, translucency and
+/// parallax speeds). Deck coverage nests inside the deck below, so the base
+/// always reads wider and the upper decks step up like castellanus turrets;
+/// [`cloud_shadow_factor`] evaluates the identical occupancy pipeline for
+/// synchronized drifting ground shadows.
+///
 /// Returns an empty `Vec` unless `config.enabled && config.layered_voxel_clouds`.
 /// Output is bounded by [`MAX_CLOUD_CELLS`] and all positions are finite.
 pub fn generate_layered_voxel_clouds(
@@ -757,9 +1027,40 @@ pub fn generate_layered_voxel_clouds(
     camera_z: f32,
     world_time_ticks: u64,
 ) -> Vec<VoxelCloudCell> {
+    layered_clouds_inner(config, camera_x, camera_z, world_time_ticks, 0.0)
+}
+
+/// Weather-aware variant of [`generate_layered_voxel_clouds`]: the storm
+/// coverage ramp relaxes each deck's density threshold — clear skies are
+/// scattered, rain thickens the decks and thunder builds a near-overcast
+/// storm deck.
+pub fn generate_layered_voxel_clouds_with_weather(
+    config: &VanillaPlusNatureConfig,
+    camera_x: f32,
+    camera_z: f32,
+    world_time_ticks: u64,
+    weather: WeatherKind,
+) -> Vec<VoxelCloudCell> {
+    layered_clouds_inner(
+        config,
+        camera_x,
+        camera_z,
+        world_time_ticks,
+        weather_storm(weather),
+    )
+}
+
+fn layered_clouds_inner(
+    config: &VanillaPlusNatureConfig,
+    camera_x: f32,
+    camera_z: f32,
+    world_time_ticks: u64,
+    storm: f32,
+) -> Vec<VoxelCloudCell> {
     if !config.enabled || !config.layered_voxel_clouds {
         return Vec::new();
     }
+    let storm = clamped(storm, 0.0, 1.0);
     let layers = config.effective_cloud_layers();
     let height = config.effective_cloud_height();
 
@@ -772,22 +1073,20 @@ pub fn generate_layered_voxel_clouds(
     let cx0 = ((cam_x + scroll) / cell).floor() as i64;
     let cz0 = (cam_z / cell).floor() as i64;
 
-    // Occupancy set for hidden-face suppression across all strata.
+    // Occupancy set for hidden-face suppression across all decks. Decks nest
+    // inside the deck beneath them in the same column, so coverage always
+    // reads widest at the base and steps in with altitude.
     let mut occupied: BTreeSet<(i64, u8, i64)> = BTreeSet::new();
     let mut cells: Vec<VoxelCloudCell> = Vec::new();
     for dz in -CLOUD_RADIUS_CELLS..=CLOUD_RADIUS_CELLS {
         for dx in -CLOUD_RADIUS_CELLS..=CLOUD_RADIUS_CELLS {
             let cx = cx0 + i64::from(dx);
             let cz = cz0 + i64::from(dz);
-            let density = cloud_density(cx, cz);
             for layer in 0..layers {
-                let threshold = match layer {
-                    0 => DENSITY_BASE,
-                    1 => DENSITY_CAP_1,
-                    _ => DENSITY_CAP_2,
-                };
-                if density > threshold {
+                if column_occupied(layer, layers, cx, cz, scroll, storm) {
                     occupied.insert((cx, layer, cz));
+                } else {
+                    break; // nested decks: nothing above a missing lower deck
                 }
             }
         }
@@ -797,9 +1096,12 @@ pub fn generate_layered_voxel_clouds(
         for dx in -CLOUD_RADIUS_CELLS..=CLOUD_RADIUS_CELLS {
             let cx = cx0 + i64::from(dx);
             let cz = cz0 + i64::from(dz);
+            // A fully-enclosed voxel is never emitted; gate bottom-up so an
+            // emitted upper-deck voxel always has an emitted voxel below it.
+            let mut emitted_below = false;
             for layer in 0..layers {
                 if !occupied.contains(&(cx, layer, cz)) {
-                    continue;
+                    break;
                 }
                 let mut mask = ALL_FACES;
                 if occupied.contains(&(cx + 1, layer, cz)) {
@@ -820,16 +1122,18 @@ pub fn generate_layered_voxel_clouds(
                 if occupied.contains(&(cx, layer, cz - 1)) {
                     mask &= !FACE_NEG_Z;
                 }
-                if mask == 0 {
-                    continue;
+                if mask == 0 || (layer > 0 && !emitted_below) {
+                    break;
                 }
+                emitted_below = true;
+                let spec = cloud_deck_spec(layer, layers);
                 cells.push(VoxelCloudCell {
                     min: [
                         (cx as f64 * cell - scroll) as f32,
-                        height + f32::from(layer) * CLOUD_LAYER_HEIGHT,
+                        height + spec.altitude_offset,
                         (cz as f64 * cell) as f32,
                     ],
-                    size: [CLOUD_CELL_BLOCKS, CLOUD_LAYER_HEIGHT, CLOUD_CELL_BLOCKS],
+                    size: [CLOUD_CELL_BLOCKS, spec.thickness, CLOUD_CELL_BLOCKS],
                     layer,
                     exposed_faces: mask,
                 });
@@ -881,9 +1185,12 @@ pub enum NatureParticleKind {
     /// the swirl.
     SakuraPetal { rgb: [f32; 3], spiral_phase: f32 },
     /// A soft-pulsing ember of light in warm/temperate biomes at night.
+    /// `buoyancy` is `0.0` for a true hovering firefly; positive values make
+    /// the mote ride a thermal updraft — the channel nether embers use.
     Firefly {
         glow_rgb: [f32; 3],
         pulse_phase: f32,
+        buoyancy: f32,
     },
     /// An expanding ring on a rain-exposed water surface.
     RainRipple { radius: f32, max_radius: f32 },
@@ -934,13 +1241,46 @@ pub struct NatureAmbienceEnv {
     pub waterfall_bases: Vec<([f32; 3], f32)>,
 }
 
+/// Dimension/context cues the retained ambience sim needs but the
+/// per-tick [`NatureAmbienceEnv`] site lists do not carry: whether the
+/// anchor sits in a nether-style dimension (searing air, rising embers) or
+/// sealed underground below the sky (floating dust motes), and the
+/// effective sky light at the anchor.
+///
+/// `Default` is the neutral overworld surface — no embers, no dust motes —
+/// so a caller that never installs cues gets exactly the pre-cue behaviour.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct DimensionAmbienceCues {
+    /// Nether-style dimension: hot dry air, no sky, no weather — embers
+    /// rise on thermals regardless of the day/night flag.
+    pub nether: bool,
+    /// Anchor sealed underground (deep cave, no direct sky): pale dust
+    /// motes may float through the gloom when `sky_light` is low.
+    pub underground: bool,
+    /// Effective sky light at the ambience anchor `0..=15` (`0` = fully
+    /// sealed cave; dust motes need `<= 11`).
+    pub sky_light: u8,
+}
+
+impl Default for DimensionAmbienceCues {
+    fn default() -> Self {
+        Self {
+            nether: false,
+            underground: false,
+            sky_light: 15,
+        }
+    }
+}
+
 /// Retained ambience state: a strictly capped particle `Vec` plus the
-/// deterministic tick counter used for rate-limited spawning.
+/// deterministic tick counter used for rate-limited spawning and the
+/// installed [`DimensionAmbienceCues`].
 #[derive(Clone, Debug)]
 pub struct NatureAmbienceState {
     tier: VfxBudgetTier,
     tick_index: u64,
     particles: Vec<NatureParticle>,
+    cues: DimensionAmbienceCues,
 }
 
 impl Default for NatureAmbienceState {
@@ -955,11 +1295,28 @@ impl NatureAmbienceState {
             tier,
             tick_index: 0,
             particles: Vec::new(),
+            cues: DimensionAmbienceCues::default(),
         }
     }
 
     pub const fn tier(&self) -> VfxBudgetTier {
         self.tier
+    }
+
+    /// The installed dimension/context cues (neutral overworld surface by
+    /// default).
+    pub fn dimension_cues(&self) -> DimensionAmbienceCues {
+        self.cues
+    }
+
+    /// Install dimension/context cues: set `nether` for rising ember
+    /// ambience, `underground` + a low `sky_light` for floating cave dust
+    /// motes. `sky_light` is clamped to `0..=15`.
+    pub fn set_dimension_cues(&mut self, cues: DimensionAmbienceCues) {
+        self.cues = DimensionAmbienceCues {
+            sky_light: cues.sky_light.min(15),
+            ..cues
+        };
     }
 
     /// Re-tiers the budget; live particles beyond the new cap are trimmed
@@ -998,6 +1355,20 @@ fn valid_site(p: &[f32; 3]) -> bool {
     p.iter().all(|c| c.is_finite() && c.abs() <= MAX_COORD)
 }
 
+/// How strongly the shared wind field advects each particle family's
+/// position, `0..=1`: fluttering leaves and petals ride the wind most,
+/// hovering motes least, anchored ripples and mist not at all. Applied to
+/// position only — the authored `vel` kinematics stay canonical.
+fn wind_advection(kind: &NatureParticleKind) -> f32 {
+    match kind {
+        NatureParticleKind::FallingLeaf { .. } => 0.5,
+        NatureParticleKind::SakuraPetal { .. } => 0.55,
+        NatureParticleKind::Firefly { .. } => 0.2,
+        NatureParticleKind::SnowMote { .. } => 0.15,
+        NatureParticleKind::RainRipple { .. } | NatureParticleKind::WaterfallMist { .. } => 0.0,
+    }
+}
+
 /// Advances the ambience simulation by one tick.
 ///
 /// Ageing and motion are deterministic functions of `dt_sec` (clamped to
@@ -1020,6 +1391,9 @@ pub fn tick_nature_ambience(
     };
     state.tick_index = state.tick_index.wrapping_add(1);
     let tick = state.tick_index;
+    // One shared wind field for every drifting family: the same vector that
+    // advects the cloud decks and drives block sway pushes particles too.
+    let wind = shared_wind_vector(tick, env.weather);
 
     for p in state.particles.iter_mut() {
         p.age_sec += dt;
@@ -1047,11 +1421,16 @@ pub fn tick_nature_ambience(
                     -0.30 * (p.age_sec * 2.3 + ph).sin(),
                 ];
             }
-            NatureParticleKind::Firefly { pulse_phase, .. } => {
+            NatureParticleKind::Firefly {
+                pulse_phase,
+                buoyancy,
+                ..
+            } => {
                 let ph = *pulse_phase;
+                let lift = finite_or(*buoyancy, 0.0).clamp(-0.2, 0.6);
                 p.vel = [
                     0.22 * (p.age_sec * 0.9 + ph).sin(),
-                    0.16 * (p.age_sec * 1.3 + ph * 2.0).sin(),
+                    0.16 * (p.age_sec * 1.3 + ph * 2.0).sin() + lift,
                     0.22 * (p.age_sec * 0.8 + ph).cos(),
                 ];
             }
@@ -1073,9 +1452,14 @@ pub fn tick_nature_ambience(
                 ];
             }
         }
-        p.pos[0] += p.vel[0] * dt;
+        // Shared-wind advection: the particle's own `vel` keeps its authored
+        // kinematics (spiral, hover, settle) while the whole family also
+        // drifts with the same field that moves the clouds and swayed
+        // foliage. `wind_advection` is the per-kind susceptibility.
+        let adv = wind_advection(&p.kind);
+        p.pos[0] += (p.vel[0] + wind[0] * adv) * dt;
         p.pos[1] += p.vel[1] * dt;
-        p.pos[2] += p.vel[2] * dt;
+        p.pos[2] += (p.vel[2] + wind[1] * adv) * dt;
     }
     state.particles.retain(|p| !p.expired());
 
@@ -1251,6 +1635,7 @@ pub fn tick_nature_ambience(
                     kind: NatureParticleKind::Firefly {
                         glow_rgb: [0.80 + 0.20 * h1, 1.0, 0.30 + 0.15 * h2],
                         pulse_phase: h2 * TAU,
+                        buoyancy: 0.0,
                     },
                     pos,
                     vel: [0.0; 3],
@@ -1292,6 +1677,84 @@ pub fn tick_nature_ambience(
                     vel: [0.0, -0.26, 0.0],
                     age_sec: 0.0,
                     ttl_sec: 5.5 + 4.0 * h2,
+                },
+            );
+        }
+    }
+
+    // Deep-cave dust motes: sealed underground with little sky light, pale
+    // motes drift through the gloom — sharing the firefly glow channel with
+    // a dim grey-brown tint and neutral buoyancy so they float in place.
+    // Spawn counts scale with the budget tier like every other family.
+    let cues = state.cues;
+    let cue_count = match state.tier {
+        VfxBudgetTier::LowSpec => 1usize,
+        VfxBudgetTier::Balanced => 2,
+        VfxBudgetTier::High => 3,
+    };
+    if cues.underground && cues.sky_light <= DUST_MAX_SKY_LIGHT && tick.is_multiple_of(DUST_MOTE_PERIOD)
+    {
+        let origin = [
+            finite_or(env.origin[0], 0.0).clamp(-MAX_COORD, MAX_COORD),
+            finite_or(env.origin[1], 64.0).clamp(-64.0, 384.0),
+            finite_or(env.origin[2], 0.0).clamp(-MAX_COORD, MAX_COORD),
+        ];
+        for k in 0..cue_count {
+            let h1 = hash01(tick as i64, k as i64, SEED_DUST);
+            let h2 = hash01(k as i64, tick as i64, SEED_DUST ^ 0x33cc);
+            let angle = h1 * TAU;
+            let radius = 1.5 + 5.5 * h2;
+            state.try_spawn(
+                &mut quota,
+                NatureParticle {
+                    kind: NatureParticleKind::Firefly {
+                        glow_rgb: [0.42 + 0.10 * h1, 0.40 + 0.08 * h2, 0.36 + 0.06 * h1],
+                        pulse_phase: h2 * TAU,
+                        buoyancy: 0.0,
+                    },
+                    pos: [
+                        origin[0] + angle.cos() * radius,
+                        origin[1] + 0.4 + 3.0 * h2,
+                        origin[2] + angle.sin() * radius,
+                    ],
+                    vel: [0.0; 3],
+                    age_sec: 0.0,
+                    ttl_sec: 7.0 + 5.0 * h2,
+                },
+            );
+        }
+    }
+
+    // Nether embers: hot sparks riding thermals in nether-style dimensions,
+    // glowing through the firefly channel with positive buoyancy so they
+    // rise. Independent of the day/night flag — there is no sky cycle below.
+    if cues.nether && tick.is_multiple_of(EMBER_PERIOD) {
+        let origin = [
+            finite_or(env.origin[0], 0.0).clamp(-MAX_COORD, MAX_COORD),
+            finite_or(env.origin[1], 64.0).clamp(-64.0, 384.0),
+            finite_or(env.origin[2], 0.0).clamp(-MAX_COORD, MAX_COORD),
+        ];
+        for k in 0..cue_count {
+            let h1 = hash01(tick as i64, k as i64, SEED_EMBER);
+            let h2 = hash01(k as i64, tick as i64, SEED_EMBER ^ 0x77aa);
+            let angle = h1 * TAU;
+            let radius = 2.0 + 7.0 * h2;
+            state.try_spawn(
+                &mut quota,
+                NatureParticle {
+                    kind: NatureParticleKind::Firefly {
+                        glow_rgb: [1.00, 0.30 + 0.22 * h1, 0.05 + 0.08 * h2],
+                        pulse_phase: h2 * TAU,
+                        buoyancy: 0.22 + 0.25 * h1,
+                    },
+                    pos: [
+                        origin[0] + angle.cos() * radius,
+                        origin[1] + 0.5 + 3.5 * h1,
+                        origin[2] + angle.sin() * radius,
+                    ],
+                    vel: [0.0; 3],
+                    age_sec: 0.0,
+                    ttl_sec: 4.0 + 3.5 * h2,
                 },
             );
         }
@@ -1372,6 +1835,9 @@ pub enum WindSwayCategory {
     Leaves,
     /// Lanterns and chains hanging from a top pivot point.
     HangingLantern,
+    /// Banners: top-pinned cloth that flutters — a travelling wave down the
+    /// free edge makes banners visibly flappier than a rigid lantern.
+    Banner,
 }
 
 /// Time-decoupled wind parameters produced once per frame/tick and shared by
@@ -1415,9 +1881,12 @@ pub fn wind_sway_params(
 /// * `Leaves`: a small uniform 3-axis rustle.
 /// * `HangingLantern`: amplitude scales with `1 - local_y` clamped to `0..=1`,
 ///   so the top pivot at `local_y == 1.0` is pinned and the body swings below.
+/// * `Banner`: same top pin as a lantern, but the free cloth edge carries a
+///   secondary wave travelling down `local_y` so banners flutter instead of
+///   swinging like a rigid pendulum.
 ///
 /// Output is always finite; non-finite `local` components fall back to the
-/// pinned position (0.0 for plants, 1.0 for lanterns).
+/// pinned position (0.0 for plants, 1.0 for lanterns and banners).
 pub fn compute_wind_sway(
     params: &WindSwayParams,
     category: WindSwayCategory,
@@ -1449,6 +1918,19 @@ pub fn compute_wind_sway(
             let amp = params.strength * 0.10 * attach;
             [amp * s0, 0.0, amp * s1]
         }
+        WindSwayCategory::Banner => {
+            // Top-pinned cloth: the free edge flutters with a wave that
+            // travels down the banner, so lower `local_y` ripples more.
+            let attach = (1.0 - finite_or(local[1], 1.0)).clamp(0.0, 1.0);
+            let ly = finite_or(local[1], 1.0).clamp(0.0, 1.0);
+            let flutter = 0.7 * s0 + 0.3 * (phase * 2.1 - ly * 4.0).sin();
+            let amp = params.strength * 0.14 * attach;
+            [
+                amp * flutter,
+                0.0,
+                amp * (s1 + 0.4 * (phase * 2.3 - ly * 3.0).cos()),
+            ]
+        }
     }
 }
 
@@ -1456,6 +1938,10 @@ pub fn compute_wind_sway(
 /// `kind` is the [`WindSwayCategory`] discriminant (`0` grass, `1` crop,
 /// `2` leaves, `3` hanging lantern); `block_phase` is the per-block hash phase
 /// computed identically to [`block_phase`].
+///
+/// This text is byte-stable: the cutout shadow caster embeds it verbatim so
+/// leaf shadows move with the visible canopy. New sway kinds get their own
+/// constants — see [`MEGU_WIND_SWAY_BANNER_WGSL_FN`] for `kind == 4`.
 pub const MEGU_WIND_SWAY_WGSL_FN: &str = r#"
 fn megu_wind_sway(local_pos: vec3<f32>, block_phase: f32, time_sec: f32,
                   strength: f32, kind: u32) -> vec3<f32> {
@@ -1475,6 +1961,43 @@ fn megu_wind_sway(local_pos: vec3<f32>, block_phase: f32, time_sec: f32,
         return vec3<f32>(amp * sin(phase * 1.7 + local_pos.x * 3.1),
                          amp * 0.4 * cos(phase * 1.9 + local_pos.y * 2.3),
                          amp * sin(phase * 1.6 + local_pos.z * 2.7));
+    }
+    return vec3<f32>(amp * attach * s0, 0.0, amp * attach * s1 * 0.6);
+}
+"#;
+
+/// Banner-capable extension of [`MEGU_WIND_SWAY_WGSL_FN`]: identical motion
+/// for kinds `0..=3`, plus `kind == 4u` ([`WindSwayCategory::Banner`]) —
+/// top-pinned cloth whose free edge flutters with a wave travelling down
+/// `local_y`. Kept as a separate const because the cutout shadow caster
+/// embeds the base function verbatim.
+pub const MEGU_WIND_SWAY_BANNER_WGSL_FN: &str = r#"
+fn megu_wind_sway_banner(local_pos: vec3<f32>, block_phase: f32, time_sec: f32,
+                         strength: f32, kind: u32) -> vec3<f32> {
+    let phase = time_sec * 1.4 + block_phase;
+    let s0 = sin(phase);
+    let s1 = sin(phase * 0.63 + 1.3);
+    var attach = clamp(local_pos.y, 0.0, 1.0);
+    var amp = strength * 0.12;
+    if (kind == 2u) {
+        attach = 1.0;
+        amp = strength * 0.05;
+    } else if (kind == 3u) {
+        attach = clamp(1.0 - local_pos.y, 0.0, 1.0);
+        amp = strength * 0.10;
+    } else if (kind == 4u) {
+        attach = clamp(1.0 - local_pos.y, 0.0, 1.0);
+        amp = strength * 0.14;
+    }
+    if (kind == 2u) {
+        return vec3<f32>(amp * sin(phase * 1.7 + local_pos.x * 3.1),
+                         amp * 0.4 * cos(phase * 1.9 + local_pos.y * 2.3),
+                         amp * sin(phase * 1.6 + local_pos.z * 2.7));
+    }
+    if (kind == 4u) {
+        let flutter = 0.7 * s0 + 0.3 * sin(phase * 2.1 - local_pos.y * 4.0);
+        return vec3<f32>(amp * attach * flutter, 0.0,
+                         amp * attach * (s1 + 0.4 * cos(phase * 2.3 - local_pos.y * 3.0)));
     }
     return vec3<f32>(amp * attach * s0, 0.0, amp * attach * s1 * 0.6);
 }
@@ -1929,6 +2452,8 @@ pub type WindSwayKind = WindSwayCategory;
 ///   variants) plus `*_tall_grass` / `*_fern` / `*_flower` / `*_sapling` and friends
 ///   -> [`WindSwayCategory::ShortGrass`] — all root-pinned at `local_y == 0.0`
 /// * `*_lantern` -> [`WindSwayCategory::HangingLantern`], top-pinned at `local_y == 1.0`
+/// * `*_banner` / `*_wall_banner` -> [`WindSwayCategory::Banner`], top-pinned cloth
+///   that flutters with a wave travelling down the free edge
 ///
 /// Fail-closed: `sea_lantern`/`jack_o_lantern` (solid cubes despite the
 /// suffix), everything matching [`is_solid_block_name`] (`stone`, `planks`,
@@ -1956,6 +2481,9 @@ pub fn classify_wind_sway_block(
     }
     if path == "lantern" || ends_with_token(&path, "lantern") {
         return Some(WindSwayCategory::HangingLantern);
+    }
+    if path == "banner" || ends_with_token(&path, "banner") {
+        return Some(WindSwayCategory::Banner);
     }
     if has_any_tag(tags, CROP_BLOCK_TAGS) {
         return Some(WindSwayCategory::Crop);
@@ -2184,4 +2712,396 @@ pub fn wind_sway_params_with_atmosphere(
     let mut params = wind_sway_params(config, weather, world_time_ticks);
     params.strength *= finite_or(atmosphere_density, 0.0).clamp(0.0, 1.0);
     params
+}
+
+// ---------------------------------------------------------------------------
+// Tests
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn cloud_cfg(layers: u8) -> VanillaPlusNatureConfig {
+        VanillaPlusNatureConfig {
+            enabled: true,
+            layered_voxel_clouds: true,
+            cloud_layers: layers,
+            ..VanillaPlusNatureConfig::default()
+        }
+    }
+
+    fn ambience_cfg() -> VanillaPlusNatureConfig {
+        VanillaPlusNatureConfig {
+            enabled: true,
+            nature_ambience: true,
+            ..VanillaPlusNatureConfig::default()
+        }
+    }
+
+    fn grey_env() -> NatureAmbienceEnv {
+        NatureAmbienceEnv::default()
+    }
+
+    fn advance(state: &mut NatureAmbienceState, ticks: usize) {
+        let env = grey_env();
+        let cfg = ambience_cfg();
+        for _ in 0..ticks {
+            tick_nature_ambience(state, &cfg, &env, 0.05);
+        }
+    }
+
+    // -- Multi-deck clouds ------------------------------------------------
+
+    #[test]
+    fn deck_specs_have_distinct_altitude_thickness_speed_and_alpha() {
+        let specs: Vec<CloudDeckSpec> =
+            (0..3).map(|l| cloud_deck_spec(l, 3)).collect();
+        // Distinct altitudes: cumulus base, altocumulus cap, cirrus veil.
+        assert!(specs[0].altitude_offset < specs[1].altitude_offset);
+        assert!(specs[1].altitude_offset < specs[2].altitude_offset);
+        // Distinct thickness: wispy cirrus is thinnest.
+        assert!(specs[0].thickness > specs[1].thickness);
+        assert!(specs[1].thickness > specs[2].thickness);
+        // Parallax: higher decks shear faster.
+        assert!(specs[0].wind_speed < specs[1].wind_speed);
+        assert!(specs[1].wind_speed < specs[2].wind_speed);
+        // Translucency: lower decks more opaque, cirrus most translucent.
+        assert!(specs[0].opacity > specs[1].opacity);
+        assert!(specs[1].opacity > specs[2].opacity);
+        // Deck roles: 2-deck maps layer 1 straight to cirrus.
+        assert_eq!(deck_role(1, 2), 2);
+        assert_eq!(deck_role(0, 3), 0);
+        assert_eq!(deck_role(1, 3), 1);
+        assert_eq!(deck_role(2, 3), 2);
+    }
+
+    #[test]
+    fn multi_deck_cells_sit_at_distinct_altitudes_and_thicknesses() {
+        let cells = generate_layered_voxel_clouds(&cloud_cfg(3), 0.0, 0.0, 6_000);
+        assert!(!cells.is_empty());
+        let height = cloud_cfg(3).effective_cloud_height();
+        for c in &cells {
+            let spec = cloud_deck_spec(c.layer, 3);
+            assert!((c.min[1] - (height + spec.altitude_offset)).abs() < 1e-3);
+            assert!((c.size[1] - spec.thickness).abs() < 1e-3);
+        }
+        // Where multiple decks coexist their slab bases differ.
+        let alt: Vec<f32> = cells.iter().map(|c| c.min[1]).collect();
+        let unique: std::collections::BTreeSet<u32> =
+            alt.iter().map(|v| v.to_bits()).collect();
+        if cells.iter().any(|c| c.layer == 1) {
+            assert!(unique.len() >= 2, "cap deck must sit at a distinct altitude");
+        }
+    }
+
+    #[test]
+    fn upper_decks_parallax_shift_grows_with_speed() {
+        // Far enough into the day that deck shifts are non-trivial.
+        let scroll = 6000.0 * 0.4;
+        let s0 = deck_cell_shift(0, scroll);
+        let s1 = deck_cell_shift(1, scroll);
+        let s2 = deck_cell_shift(2, scroll);
+        assert_eq!(s0, 0, "cumulus rides the shared advection unshifted");
+        assert!(s1 > s0 && s2 > s1, "higher decks must shear faster");
+        // Whole-cell quantized: effective drift = scroll + shift*cell.
+        let drift = |role: usize| scroll + deck_cell_shift(role, scroll) as f64 * 12.0;
+        assert!(drift(2) > drift(1) && drift(1) > drift(0));
+    }
+
+    #[test]
+    fn storm_weather_thickens_all_decks() {
+        let clear = generate_layered_voxel_clouds_with_weather(
+            &cloud_cfg(3), 0.0, 0.0, 6_000, WeatherKind::Clear);
+        let rain = generate_layered_voxel_clouds_with_weather(
+            &cloud_cfg(3), 0.0, 0.0, 6_000, WeatherKind::Rain);
+        let thunder = generate_layered_voxel_clouds_with_weather(
+            &cloud_cfg(3), 0.0, 0.0, 6_000, WeatherKind::Thunder);
+        assert!(clear.len() <= rain.len(), "rain must not thin coverage");
+        assert!(rain.len() <= thunder.len(), "thunder must not thin coverage");
+        assert!(thunder.len() > clear.len(), "storm deck must visibly thicken");
+        // Storm ramp is also monotone per column: a clear-sky cap cannot
+        // vanish under storm.
+        for cap in clear.iter().filter(|c| c.layer > 0) {
+            assert!(thunder.iter().any(|t| t.layer == cap.layer
+                && (t.min[0] - cap.min[0]).abs() < 1e-3
+                && (t.min[2] - cap.min[2]).abs() < 1e-3));
+        }
+    }
+
+    // -- Shared wind + ground shadows -------------------------------------
+
+    #[test]
+    fn shared_wind_vector_strength_and_determinism() {
+        let clear = shared_wind_vector(1234, WeatherKind::Clear);
+        assert_eq!(clear, [-CLOUD_SCROLL_BLOCKS_PER_TICK, 0.0]);
+        let rain = shared_wind_vector(1234, WeatherKind::Rain);
+        let thunder = shared_wind_vector(1234, WeatherKind::Thunder);
+        // Stronger weather -> stronger headwind magnitude.
+        assert!(rain[0].abs() > clear[0].abs());
+        assert!(thunder[0].abs() > rain[0].abs());
+        // Deterministic, finite.
+        assert_eq!(thunder, shared_wind_vector(1234, WeatherKind::Thunder));
+        for v in thunder {
+            assert!(v.is_finite());
+        }
+    }
+
+    #[test]
+    fn cloud_shadow_factor_is_bounded_deterministic_and_storm_darkened() {
+        for ticks in [0u64, 6000, 24_001] {
+            for ix in -8..=8 {
+                for iz in -8..=8 {
+                    let x = ix as f32 * 37.5;
+                    let z = iz as f32 * 41.25;
+                    for layers in 1..=3u8 {
+                        let c = cloud_shadow_factor(x, z, ticks, WeatherKind::Clear, layers);
+                        let r = cloud_shadow_factor(x, z, ticks, WeatherKind::Rain, layers);
+                        let t = cloud_shadow_factor(x, z, ticks, WeatherKind::Thunder, layers);
+                        assert!((0.0..=1.0).contains(&c));
+                        assert!((0.0..=1.0).contains(&r));
+                        assert!((0.0..=1.0).contains(&t));
+                        assert!(r <= c + 1e-6, "rain can only darken");
+                        assert!(t <= r + 1e-6, "thunder can only darken");
+                    }
+                }
+            }
+        }
+        // Deterministic.
+        let a = cloud_shadow_factor(17.0, -31.0, 42, WeatherKind::Rain, 3);
+        let b = cloud_shadow_factor(17.0, -31.0, 42, WeatherKind::Rain, 3);
+        assert_eq!(a, b);
+        // Non-finite inputs fail closed into a bounded value.
+        let nan = cloud_shadow_factor(f32::NAN, f32::INFINITY, u64::MAX, WeatherKind::Thunder, 3);
+        assert!((0.0..=1.0).contains(&nan));
+    }
+
+    #[test]
+    fn cloud_shadow_drifts_in_lockstep_with_shared_wind() {
+        // The cumulus-only shadow field advects exactly with wind[0]:
+        // sampling downstream `wind[0]*dt` blocks later must reproduce the
+        // identical factor (integer-cell field, no resampling error).
+        let ticks = 60_000u64;
+        let dt = 37u64;
+        for layers in [1u8] {
+            for &(x, z) in &[(13.0f32, 7.0f32), (-88.0, 123.5), (512.75, -640.0)] {
+                let w = shared_wind_vector(ticks, WeatherKind::Clear);
+                let before = cloud_shadow_factor(x, z, ticks, WeatherKind::Clear, layers);
+                let after = cloud_shadow_factor(
+                    x + w[0] * dt as f32,
+                    z,
+                    ticks + dt,
+                    WeatherKind::Clear,
+                    layers,
+                );
+                assert_eq!(before, after, "shadow must ride the shared wind vector");
+            }
+        }
+    }
+
+    #[test]
+    fn cloud_shadow_matches_generated_sky_columns() {
+        // Where the generator puts a cloud cell, ground shade must drop.
+        let config = cloud_cfg(3);
+        let ticks = 6_000u64;
+        let cells = generate_layered_voxel_clouds(&config, 0.0, 0.0, ticks);
+        assert!(!cells.is_empty());
+        let shaded = cells.iter().any(|c| {
+            let x = c.min[0] + c.size[0] * 0.5;
+            let z = c.min[2] + c.size[2] * 0.5;
+            cloud_shadow_factor(x, z, ticks, WeatherKind::Clear, 3) < 1.0
+        });
+        assert!(shaded, "a live cloud column must cast a ground shadow");
+    }
+
+    // -- Time-of-day cloud lighting ---------------------------------------
+
+    #[test]
+    fn cloud_lighting_runs_warm_at_dusk_cool_at_night_slate_in_storm() {
+        let noon = compute_cloud_lighting(0.9, 0.0, 0.0);
+        // Noon: crisp white top, near-neutral.
+        assert!(noon.top_rgb[1] > 0.85 && (noon.top_rgb[0] - noon.top_rgb[2]).abs() < 0.25);
+        assert!(noon.rim_warmth < 0.15);
+
+        let sunset = compute_cloud_lighting(0.02, 0.0, 0.0);
+        // Sunset: warm amber rim on top AND under-lit warm bottom — the
+        // underside hue flips from cool (b > r at noon) to warm (r > b).
+        assert!(sunset.rim_warmth > noon.rim_warmth);
+        assert!(sunset.top_rgb[0] > sunset.top_rgb[2], "dusk top must lean warm");
+        assert!(noon.bottom_rgb[0] < noon.bottom_rgb[2], "noon undersides stay cool");
+        assert!(sunset.bottom_rgb[0] > sunset.bottom_rgb[2],
+            "dusk undersides get the under-lit golden rim");
+
+        let night = compute_cloud_lighting(-0.8, 0.0, 0.0);
+        // Night: dark, cool silver-blue (b >= r), moonlit rim nudges top.
+        let lum = night.top_rgb[0] + night.top_rgb[1] + night.top_rgb[2];
+        assert!(lum < 1.2, "night tops must be dim");
+        assert!(night.top_rgb[2] >= night.top_rgb[0], "night leans cool");
+
+        let storm = compute_cloud_lighting(0.9, 0.0, 1.0);
+        // Storm underside is deep slate: strictly darker than fair-weather.
+        assert!(storm.bottom_rgb[0] < noon.bottom_rgb[0] * 0.6);
+        assert!(storm.top_rgb[0] < noon.top_rgb[0]);
+        for rgb in [storm.top_rgb, storm.side_rgb, storm.bottom_rgb] {
+            assert!(rgb.iter().all(|c| (0.0..=1.0).contains(c)));
+        }
+    }
+
+    // -- Cue-driven ambience particles -------------------------------------
+
+    fn count_kinds(state: &NatureAmbienceState) -> (usize, usize, usize) {
+        let mut dust = 0usize;
+        let mut ember = 0usize;
+        let mut firefly = 0usize;
+        for p in state.particles() {
+            if let NatureParticleKind::Firefly { glow_rgb, buoyancy, .. } = p.kind {
+                if buoyancy > 0.05 {
+                    ember += 1;
+                } else if glow_rgb[1] < 0.5 {
+                    dust += 1;
+                } else {
+                    firefly += 1;
+                }
+            }
+        }
+        (dust, ember, firefly)
+    }
+
+    #[test]
+    fn deep_cave_dust_motes_spawn_only_in_gloom() {
+        // Sealed cave, low sky light -> dust motes appear.
+        let mut cave = NatureAmbienceState::new(VfxBudgetTier::High);
+        cave.set_dimension_cues(DimensionAmbienceCues {
+            underground: true,
+            sky_light: 6,
+            ..DimensionAmbienceCues::default()
+        });
+        advance(&mut cave, DUST_MOTE_PERIOD as usize);
+        let (dust, ember, _) = count_kinds(&cave);
+        assert!(dust > 0, "gloom cave must float dust motes");
+        assert_eq!(ember, 0);
+
+        // Same cave but bright sky light -> no dust.
+        let mut lit = NatureAmbienceState::new(VfxBudgetTier::High);
+        lit.set_dimension_cues(DimensionAmbienceCues {
+            underground: true,
+            sky_light: 15,
+            ..DimensionAmbienceCues::default()
+        });
+        advance(&mut lit, 3 * DUST_MOTE_PERIOD as usize);
+        assert_eq!(count_kinds(&lit).0, 0, "lit caves keep the air clear");
+
+        // Underground flag off -> no dust even in darkness.
+        let mut open = NatureAmbienceState::new(VfxBudgetTier::High);
+        open.set_dimension_cues(DimensionAmbienceCues {
+            underground: false,
+            sky_light: 0,
+            ..DimensionAmbienceCues::default()
+        });
+        advance(&mut open, 3 * DUST_MOTE_PERIOD as usize);
+        assert_eq!(count_kinds(&open).0, 0);
+    }
+
+    #[test]
+    fn nether_embers_rise_on_buoyancy() {
+        let mut nether = NatureAmbienceState::new(VfxBudgetTier::High);
+        nether.set_dimension_cues(DimensionAmbienceCues {
+            nether: true,
+            ..DimensionAmbienceCues::default()
+        });
+        advance(&mut nether, EMBER_PERIOD as usize + 1);
+        let (dust, ember, firefly) = count_kinds(&nether);
+        assert!(ember > 0, "nether cues must spark rising embers");
+        assert_eq!((dust, firefly), (0, 0));
+        // Buoyancy carries them upward: every live ember's vertical
+        // velocity is positive once kinematics have run.
+        for p in nether.particles() {
+            if let NatureParticleKind::Firefly { buoyancy, .. } = p.kind {
+                if buoyancy > 0.05 {
+                    assert!(p.vel[1] > 0.0, "ember must ride its thermal: vy={}", p.vel[1]);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn cue_particles_respect_vfx_budget_tier_caps() {
+        let mut low = NatureAmbienceState::new(VfxBudgetTier::LowSpec);
+        low.set_dimension_cues(DimensionAmbienceCues {
+            nether: true,
+            underground: true,
+            sky_light: 4,
+        });
+        advance(&mut low, 400);
+        assert!(low.len() <= VfxBudgetTier::LowSpec.max_particles());
+        assert!(!low.is_empty(), "cue families must actually spawn");
+
+        let mut high = NatureAmbienceState::new(VfxBudgetTier::High);
+        high.set_dimension_cues(DimensionAmbienceCues {
+            nether: true,
+            underground: true,
+            sky_light: 4,
+        });
+        advance(&mut high, 400);
+        assert!(high.len() <= VfxBudgetTier::High.max_particles());
+        // The bigger tier sustains strictly more live cue particles.
+        assert!(high.len() > low.len());
+    }
+
+    // -- Banner sway --------------------------------------------------------
+
+    #[test]
+    fn banner_blocks_classify_and_flutter_top_pinned() {
+        let reg = NatureModRegistry::new();
+        for id in [
+            "minecraft:white_banner",
+            "minecraft:red_wall_banner",
+            "some_mod:war_banner",
+        ] {
+            assert_eq!(
+                classify_wind_sway_block(id, &[], &reg),
+                Some(WindSwayCategory::Banner),
+                "{id} must classify as a banner"
+            );
+        }
+        // Non-banners unaffected.
+        assert_eq!(
+            classify_wind_sway_block("minecraft:soul_lantern", &[], &reg),
+            Some(WindSwayCategory::HangingLantern)
+        );
+        assert_eq!(classify_wind_sway_block("minecraft:stone", &[], &reg), None);
+
+        // Top of the cloth (local_y == 1.0) is pinned; the free edge moves.
+        let params = WindSwayParams {
+            strength: 1.0,
+            time_sec: 3.2,
+            frequency: WIND_SWAY_FREQUENCY,
+        };
+        let pinned = compute_wind_sway(&params, WindSwayCategory::Banner, [0, 0, 0], [0.5, 1.0, 0.5]);
+        assert_eq!(pinned, [0.0, 0.0, 0.0], "banner top pivot must stay pinned");
+        let free = compute_wind_sway(&params, WindSwayCategory::Banner, [0, 0, 0], [0.5, 0.0, 0.5]);
+        assert!(free[0].abs() > 1e-4 || free[2].abs() > 1e-4,
+            "free banner edge must sway under wind");
+        // Flutter is a wave, not a pendulum: mid-cloth differs from bottom.
+        let mid = compute_wind_sway(&params, WindSwayCategory::Banner, [0, 0, 0], [0.5, 0.5, 0.5]);
+        assert!(mid.iter().zip(free.iter()).any(|(a, b)| (a - b).abs() > 1e-4));
+        // Zero strength -> zero sway (pack/toggle off).
+        let off = WindSwayParams { strength: 0.0, ..params };
+        assert_eq!(compute_wind_sway(&off, WindSwayCategory::Banner, [0, 0, 0], [0.5, 0.0, 0.5]),
+            [0.0, 0.0, 0.0]);
+    }
+
+    #[test]
+    fn banner_wgsl_extends_the_byte_stable_base_helper() {
+        // The base helper stays verbatim (the cutout shadow caster embeds
+        // it); the banner extension adds kind 4 without touching it.
+        assert!(!MEGU_WIND_SWAY_WGSL_FN.contains("kind == 4u"));
+        assert!(MEGU_WIND_SWAY_BANNER_WGSL_FN.contains("kind == 4u"));
+        assert!(MEGU_WIND_SWAY_BANNER_WGSL_FN.contains("megu_wind_sway_banner"));
+        // Both are brace/paren-balanced enough to parse.
+        for src in [MEGU_WIND_SWAY_WGSL_FN, MEGU_WIND_SWAY_BANNER_WGSL_FN] {
+            assert_eq!(src.matches('{').count(), src.matches('}').count());
+            assert_eq!(src.matches('(').count(), src.matches(')').count());
+        }
+    }
 }

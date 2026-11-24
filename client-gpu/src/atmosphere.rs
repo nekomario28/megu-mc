@@ -20,8 +20,8 @@ use megu_client_mesh::space_sky_bridge::{
 };
 use megu_client_mesh::vanilla_plus_3d::ExtrudedMesh;
 use megu_client_mesh::vanilla_plus_nature::{
-    CloudLighting, VoxelCloudCell, FACE_NEG_X, FACE_NEG_Y, FACE_NEG_Z, FACE_POS_X, FACE_POS_Y,
-    FACE_POS_Z,
+    cloud_deck_spec, CloudLighting, VoxelCloudCell, FACE_NEG_X, FACE_NEG_Y, FACE_NEG_Z,
+    FACE_POS_X, FACE_POS_Y, FACE_POS_Z,
 };
 
 use crate::subworld_render::{box_face_corners, SubWorldTransform, TerrainVertex};
@@ -108,6 +108,124 @@ fn scale3(rgb: [f32; 3], k: f32) -> [f32; 3] {
     [rgb[0] * k, rgb[1] * k, rgb[2] * k]
 }
 
+fn sstep(edge0: f32, edge1: f32, x: f32) -> f32 {
+    let t = ((x - edge0) / (edge1 - edge0)).clamp(0.0, 1.0);
+    t * t * (3.0 - 2.0 * t)
+}
+
+// ---------------------------------------------------------------------------
+// Time-of-day color temperature + Beer-Lambert water column
+// ---------------------------------------------------------------------------
+
+/// Minecraft day length in ticks (24000): tick 0 is sunrise, 6000 noon,
+/// 12000 sunset, 18000 midnight.
+const TICKS_PER_DAY: u64 = 24_000;
+
+/// Per-channel Beer-Lambert absorption coefficients for open ocean water
+/// (per block): red dies first, then green; blue travels farthest.
+pub const WATER_ABSORPTION_RGB: [f32; 3] = [0.30, 0.10, 0.045];
+
+/// Default biome water tint (vanilla-ish clear-ocean teal). Biomes that tint
+/// their water pass their own color into [`AtmosphereParams::underwater_from`].
+pub const DEFAULT_WATER_TINT_RGB: [f32; 3] = [0.10, 0.30, 0.42];
+
+/// Time-of-day color temperature as a multiplicative `[r, g, b]` tint for
+/// sky, fog, cloud and water palettes:
+///
+/// * dawn (tick ~0): warm amber,
+/// * noon (tick ~6000): neutral `~[1, 1, 1]` daylight,
+/// * dusk (tick ~12000): warm copper,
+/// * night (tick ~18000): cool silver-blue moonlight,
+/// * `rain_strength` blends any of the above toward a desaturated, slightly
+///   dimmed overcast grey.
+///
+/// Pure function of `(world_time_ticks, rain_strength)` — deterministic, no
+/// clock, always finite and bounded to `0.0..=1.5` per channel.
+pub fn time_of_day_color_temperature(world_time_ticks: u64, rain_strength: f32) -> [f32; 3] {
+    let t = (world_time_ticks % TICKS_PER_DAY) as f32;
+    let e = (std::f32::consts::TAU * t / TICKS_PER_DAY as f32).sin();
+
+    // Day factor and the low-sun warm band (sunrise and sunset alike).
+    let day = sstep(-0.10, 0.10, e);
+    let warm_w = 1.0 - sstep(0.0, 0.35, e.abs());
+    // Dawn leans amber, dusk leans copper — split by which half of the day.
+    let dawn = t < 6000.0 || t >= 21_600.0;
+    let warm_rgb = if dawn {
+        [1.15, 0.95, 0.80]
+    } else {
+        [1.16, 0.85, 0.66]
+    };
+    let night_rgb = [0.70, 0.80, 1.10];
+
+    // Night cool first, then the low-sun warm band on top: at the horizon
+    // (e ≈ 0, day ≈ 0.5) the warm rim must dominate the dusk palette.
+    let mut temp = lerp3([1.0, 1.0, 1.0], night_rgb, (1.0 - day) * 0.85);
+    temp = lerp3(temp, warm_rgb, warm_w * 0.85);
+
+    // Storm overcast: desaturate toward luminance and dim a touch.
+    let storm = clean(rain_strength, 0.0).clamp(0.0, 1.0);
+    if storm > 0.0 {
+        let lum = 0.2126 * temp[0] + 0.7152 * temp[1] + 0.0722 * temp[2];
+        temp = lerp3(temp, [lum, lum, lum], storm * 0.6);
+        temp = scale3(temp, 1.0 - 0.25 * storm);
+    }
+    [temp[0].clamp(0.0, 1.5), temp[1].clamp(0.0, 1.5), temp[2].clamp(0.0, 1.5)]
+}
+
+/// Beer-Lambert transmittance through `depth_blocks` of `water_tint_rgb`
+/// water: `exp(-a_c * d)` per channel using [`WATER_ABSORPTION_RGB`],
+/// multiplied by the biome water tint. `depth <= 0` returns the tint
+/// unchanged — the surface itself is already water-colored.
+pub fn water_column_transmittance(depth_blocks: f32, water_tint_rgb: [f32; 3]) -> [f32; 3] {
+    let d = clean(depth_blocks, 0.0).max(0.0);
+    let tint = clean_rgb(water_tint_rgb, DEFAULT_WATER_TINT_RGB);
+    [
+        tint[0] * (-WATER_ABSORPTION_RGB[0] * d).exp(),
+        tint[1] * (-WATER_ABSORPTION_RGB[1] * d).exp(),
+        tint[2] * (-WATER_ABSORPTION_RGB[2] * d).exp(),
+    ]
+}
+
+/// Smoothly blend a dry-air atmosphere into its water-column counterpart.
+/// `submersion_01` is smoothstepped internally so entering or leaving water
+/// glides through the transition instead of snapping flat at the surface.
+/// Inputs and output are [`AtmosphereParams::sanitized`].
+pub fn blend_water_transition(
+    above: &AtmosphereParams,
+    underwater: &AtmosphereParams,
+    submersion_01: f32,
+) -> AtmosphereParams {
+    let s = sstep(0.0, 1.0, clean(submersion_01, 0.0));
+    let (a, u) = (above.sanitized(), underwater.sanitized());
+    AtmosphereParams {
+        sky_zenith_rgb: lerp3(a.sky_zenith_rgb, u.sky_zenith_rgb, s),
+        sky_horizon_rgb: lerp3(a.sky_horizon_rgb, u.sky_horizon_rgb, s),
+        fog_rgb: lerp3(a.fog_rgb, u.fog_rgb, s),
+        fog_density: a.fog_density + (u.fog_density - a.fog_density) * s,
+        depth_tint_rgb: lerp3(a.depth_tint_rgb, u.depth_tint_rgb, s),
+        depth_tint_strength: a.depth_tint_strength
+            + (u.depth_tint_strength - a.depth_tint_strength) * s,
+        ambient_rgb: lerp3(a.ambient_rgb, u.ambient_rgb, s),
+        sun_intensity: a.sun_intensity + (u.sun_intensity - a.sun_intensity) * s,
+    }
+    .sanitized()
+}
+
+/// Horizon-melt factor in `0.0..=1.0` for one cloud cell at
+/// `distance_blocks` from the viewer: `1.0` inside `fade_start`, smoothstep
+/// down to `0.0` at `fade_end` so decks dissolve into the horizon fog
+/// instead of clipping at the field edge. A degenerate or non-finite range
+/// falls back to a hard cutoff at `fade_start` (still bounded).
+pub fn cloud_horizon_fade(distance_blocks: f32, fade_start: f32, fade_end: f32) -> f32 {
+    let d = clean(distance_blocks, 0.0).max(0.0);
+    let start = clean(fade_start, 0.0).max(0.0);
+    let end = clean(fade_end, start);
+    if end <= start {
+        return if d >= start { 0.0 } else { 1.0 };
+    }
+    1.0 - sstep(start, end, d)
+}
+
 impl AtmosphereParams {
     /// Vacuum/orbit: star-black sky, zero haze, stark sun.
     pub fn vacuum_orbit() -> Self {
@@ -123,17 +241,95 @@ impl AtmosphereParams {
         }
     }
 
-    /// Underwater: foggy teal with a strong depth tint.
+    /// Underwater: foggy teal with a strong depth tint, derived through the
+    /// shared Beer-Lambert pipeline at a typical eye depth so it always
+    /// stays harmonized with the noon surface palette.
     pub fn underwater() -> Self {
+        Self::default().underwater_from(DEFAULT_WATER_TINT_RGB, 8.0)
+    }
+
+    /// Underwater state derived from THIS surface atmosphere: every channel
+    /// is the surface value filtered through a `depth_blocks` column of
+    /// `water_tint_rgb` water via the same [`WATER_ABSORPTION_RGB`]
+    /// Beer-Lambert curve as [`water_column_transmittance`], plus the
+    /// in-scattered light of the medium itself. Because surface sky, fog,
+    /// ambient and sun all flow through the same optical path, crossing the
+    /// water surface can never snap to a mismatched flat color — feed the
+    /// result through [`blend_water_transition`] for a gradual entry.
+    ///
+    /// `depth_blocks` is clamped to `0..=32`; deeper water absorbs harder
+    /// (reds die first, blues persist — classic Beer-Lambert).
+    pub fn underwater_from(&self, water_tint_rgb: [f32; 3], depth_blocks: f32) -> Self {
+        let surface = self.sanitized();
+        let d = clean(depth_blocks, 8.0).clamp(0.0, 32.0);
+        let tint = clean_rgb(water_tint_rgb, DEFAULT_WATER_TINT_RGB);
+        // Transmittance without the tint multiplier (tint enters as the
+        // in-scatter medium color instead).
+        let t = [
+            (-WATER_ABSORPTION_RGB[0] * d).exp(),
+            (-WATER_ABSORPTION_RGB[1] * d).exp(),
+            (-WATER_ABSORPTION_RGB[2] * d).exp(),
+        ];
+        let t_mean = (t[0] + t[1] + t[2]) / 3.0;
+        // transmitted sky light + medium in-scatter per channel.
+        let veil = |src: [f32; 3], scatter: f32| {
+            [
+                src[0] * t[0] * 0.6 + tint[0] * (1.0 - t[0]) * scatter,
+                src[1] * t[1] * 0.6 + tint[1] * (1.0 - t[1]) * scatter,
+                src[2] * t[2] * 0.6 + tint[2] * (1.0 - t[2]) * scatter,
+            ]
+        };
         Self {
-            sky_zenith_rgb: [0.05, 0.20, 0.32],
-            sky_horizon_rgb: [0.10, 0.30, 0.42],
-            fog_rgb: [0.10, 0.30, 0.42],
-            fog_density: 0.02,
-            depth_tint_rgb: [0.40, 0.70, 0.85],
-            depth_tint_strength: 0.6,
-            ambient_rgb: [0.20, 0.32, 0.40],
-            sun_intensity: 0.55,
+            sky_zenith_rgb: veil(surface.sky_zenith_rgb, 0.65),
+            sky_horizon_rgb: veil(surface.sky_horizon_rgb, 0.85),
+            fog_rgb: veil(surface.sky_horizon_rgb, 1.0),
+            // Water is ~10x denser than air haze; never thinner than a mist.
+            fog_density: (0.008 + 0.03 * (1.0 - t_mean))
+                .max(surface.fog_density * 0.5)
+                .clamp(0.0, 4.0),
+            // The medium's tint multiplied into shaded color: brighten the
+            // tint so the modulated albedo reads watery, not black.
+            depth_tint_rgb: clamp_rgb(scale3(tint, 1.6)),
+            depth_tint_strength: (0.45 + 0.4 * (1.0 - t_mean)).clamp(0.0, 1.0),
+            ambient_rgb: scale3(lerp3(tint, surface.ambient_rgb, t_mean), 0.9),
+            sun_intensity: (surface.sun_intensity * (0.4 + 0.35 * t_mean)).clamp(0.0, 16.0),
+        }
+        .sanitized()
+    }
+
+    /// Time-of-day tinted copy: multiplies sky, fog and ambient channels by
+    /// [`time_of_day_color_temperature`] so the whole palette shares one
+    /// warm/cool rhythm; `sun_intensity` tracks the tint luminance (storms
+    /// dim the sun). Depth fields are untouched — water tints stay physical.
+    pub fn with_time_of_day(&self, world_time_ticks: u64, rain_strength: f32) -> Self {
+        let temp = time_of_day_color_temperature(world_time_ticks, rain_strength);
+        let p = self.sanitized();
+        let lum = 0.2126 * temp[0] + 0.7152 * temp[1] + 0.0722 * temp[2];
+        Self {
+            sky_zenith_rgb: clamp_rgb([
+                p.sky_zenith_rgb[0] * temp[0],
+                p.sky_zenith_rgb[1] * temp[1],
+                p.sky_zenith_rgb[2] * temp[2],
+            ]),
+            sky_horizon_rgb: clamp_rgb([
+                p.sky_horizon_rgb[0] * temp[0],
+                p.sky_horizon_rgb[1] * temp[1],
+                p.sky_horizon_rgb[2] * temp[2],
+            ]),
+            fog_rgb: clamp_rgb([
+                p.fog_rgb[0] * temp[0],
+                p.fog_rgb[1] * temp[1],
+                p.fog_rgb[2] * temp[2],
+            ]),
+            fog_density: p.fog_density,
+            depth_tint_rgb: p.depth_tint_rgb,
+            depth_tint_strength: p.depth_tint_strength,
+            ambient_rgb: clamp_rgb([
+                p.ambient_rgb[0] * temp[0],
+                p.ambient_rgb[1] * temp[1],
+                p.ambient_rgb[2] * temp[2],
+            ]),
+            sun_intensity: (p.sun_intensity * lum).clamp(0.0, 16.0),
         }
     }
 
@@ -465,6 +661,58 @@ fn cloud_channel(v: f32) -> f32 {
     }
 }
 
+/// Emit one cloud cell's exposed quads into `vertices`/`indices`. Shading:
+/// top faces take `lighting.top_rgb`, bottoms `bottom_rgb`, sides
+/// `side_rgb`; `layer` adds the puffy-cap boost and `extra_boost` applies
+/// the styled path's forward-scatter silver lining. Non-finite or
+/// non-positive-size cells emit nothing.
+fn push_cloud_cell_geometry(
+    cell: &VoxelCloudCell,
+    lighting: &CloudLighting,
+    extra_boost: f32,
+    vertices: &mut Vec<TerrainVertex>,
+    indices: &mut Vec<u32>,
+) {
+    let max = [
+        cell.min[0] + cell.size[0],
+        cell.min[1] + cell.size[1],
+        cell.min[2] + cell.size[2],
+    ];
+    if !cell.min.iter().chain(max.iter()).all(|v| v.is_finite())
+        || !cell.size.iter().all(|s| s.is_finite() && *s > 0.0)
+    {
+        return;
+    }
+    let cap_boost = (1.0 + 0.04 * f32::from(cell.layer)) * extra_boost.clamp(0.0, 1.25);
+    let faces = box_face_corners(cell.min, max);
+    for (face, (normal, corners)) in faces.iter().enumerate() {
+        if cell.exposed_faces & CLOUD_FACE_BITS[face] == 0 {
+            continue;
+        }
+        let rgb = match face {
+            2 => lighting.top_rgb,
+            3 => lighting.bottom_rgb,
+            _ => lighting.side_rgb,
+        };
+        let albedo = [
+            (cloud_channel(rgb[0]) * cap_boost).min(1.0),
+            (cloud_channel(rgb[1]) * cap_boost).min(1.0),
+            (cloud_channel(rgb[2]) * cap_boost).min(1.0),
+        ];
+        let base = vertices.len() as u32;
+        for (corner, &position) in corners.iter().enumerate() {
+            vertices.push(TerrainVertex::new(
+                position,
+                *normal,
+                albedo,
+                [[0.0, 0.0], [0.0, 1.0], [1.0, 1.0], [1.0, 0.0]][corner],
+                u32::MAX,
+            ));
+        }
+        indices.extend([base, base + 1, base + 2, base, base + 2, base + 3]);
+    }
+}
+
 /// Convert [`generate_layered_voxel_clouds`] cells into lit geometry: one
 /// quad per exposed face, top faces tinted `lighting.top_rgb`, bottoms
 /// `bottom_rgb`, sides `side_rgb` (upper strata slightly brighter for the
@@ -481,46 +729,98 @@ pub fn voxel_clouds_to_geometry(
     let mut vertices = Vec::with_capacity(quads * 4);
     let mut indices = Vec::with_capacity(quads * 6);
     for cell in cells {
-        let max = [
-            cell.min[0] + cell.size[0],
-            cell.min[1] + cell.size[1],
-            cell.min[2] + cell.size[2],
-        ];
-        if !cell.min.iter().chain(max.iter()).all(|v| v.is_finite())
-            || !cell.size.iter().all(|s| s.is_finite() && *s > 0.0)
-        {
-            continue;
-        }
-        let cap_boost = 1.0 + 0.04 * f32::from(cell.layer);
-        let faces = box_face_corners(cell.min, max);
-        for (face, (normal, corners)) in faces.iter().enumerate() {
-            if cell.exposed_faces & CLOUD_FACE_BITS[face] == 0 {
-                continue;
-            }
-            let rgb = match face {
-                2 => lighting.top_rgb,
-                3 => lighting.bottom_rgb,
-                _ => lighting.side_rgb,
-            };
-            let albedo = [
-                (cloud_channel(rgb[0]) * cap_boost).min(1.0),
-                (cloud_channel(rgb[1]) * cap_boost).min(1.0),
-                (cloud_channel(rgb[2]) * cap_boost).min(1.0),
-            ];
-            let base = vertices.len() as u32;
-            for (corner, &position) in corners.iter().enumerate() {
-                vertices.push(TerrainVertex::new(
-                    position,
-                    *normal,
-                    albedo,
-                    [[0.0, 0.0], [0.0, 1.0], [1.0, 1.0], [1.0, 0.0]][corner],
-                    u32::MAX,
-                ));
-            }
-            indices.extend([base, base + 1, base + 2, base, base + 2, base + 3]);
-        }
+        push_cloud_cell_geometry(cell, lighting, 1.0, &mut vertices, &mut indices);
     }
     (vertices, indices)
+}
+
+/// One cloud geometry batch sharing a single draw-entry alpha — cells are
+/// grouped by `(layer, horizon band)` so each atmospheric deck gets its own
+/// translucency and distant cells melt toward the fog.
+pub struct CloudGeometryBatch {
+    /// Alpha for this batch's draw entry: `deck opacity * horizon band`.
+    /// Multiply by the caller's global cloud pass alpha if one is applied.
+    pub alpha: f32,
+    /// Lit, shaded `TerrainVertex` stream (4 verts per quad).
+    pub vertices: Vec<TerrainVertex>,
+    /// Index stream (6 per quad).
+    pub indices: Vec<u32>,
+    /// The `cell.layer` these quads came from (`0` cumulus, `1..` caps).
+    pub layer: u8,
+    /// Horizon-melt band `0..=4` (`4` = fully crisp, lower = foggier).
+    pub fade_band: u8,
+}
+
+/// Styling knobs for [`voxel_clouds_to_geometry_styled`]: which deck count
+/// resolves each cell's `layer` into its [`cloud_deck_spec`], where the
+/// viewer stands for the horizon melt, and the fade's start/end distances.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct CloudGeometryStyle {
+    /// Active deck count — pass `config.effective_cloud_layers()` so each
+    /// cell's `layer` resolves to the right deck spec (opacity, role).
+    pub layers: u8,
+    /// Viewer world XZ for the horizon-melt distance.
+    pub viewer_xz: [f32; 2],
+    /// Distance (blocks) at which clouds begin melting into horizon fog.
+    pub horizon_fade_start: f32,
+    /// Distance (blocks) at which clouds are fully melted.
+    pub horizon_fade_end: f32,
+}
+
+impl Default for CloudGeometryStyle {
+    /// Three decks around the origin, outer ~40% of a 12-block-cell radius
+    /// melting into the fog.
+    fn default() -> Self {
+        Self {
+            layers: 3,
+            viewer_xz: [0.0, 0.0],
+            horizon_fade_start: 48.0,
+            horizon_fade_end: 78.0,
+        }
+    }
+}
+
+/// Styled variant of [`voxel_clouds_to_geometry`]: identical shading, but
+/// cells are grouped into [`CloudGeometryBatch`]es by deck layer and a
+/// quantized horizon-melt band. Each batch's `alpha` is
+/// `deck opacity * band`, so cumulus stays near-opaque, altocumulus and
+/// cirrus read genuinely translucent, and cells near `horizon_fade_end`
+/// dissolve instead of clipping. Partially melted cells also get a soft
+/// forward-scatter "silver lining" brightening on their lit faces.
+///
+/// Batches are returned in deterministic `(layer, band)` order; fully
+/// melted cells are dropped entirely.
+pub fn voxel_clouds_to_geometry_styled(
+    cells: &[VoxelCloudCell],
+    lighting: &CloudLighting,
+    style: &CloudGeometryStyle,
+) -> Vec<CloudGeometryBatch> {
+    const FADE_BANDS: f32 = 4.0;
+    let mut batches: BTreeMap<(u8, u8), CloudGeometryBatch> = BTreeMap::new();
+    for cell in cells {
+        let cx = cell.min[0] + cell.size[0] * 0.5;
+        let cz = cell.min[2] + cell.size[2] * 0.5;
+        let dist = ((cx - style.viewer_xz[0]).powi(2) + (cz - style.viewer_xz[1]).powi(2)).sqrt();
+        let fade = cloud_horizon_fade(dist, style.horizon_fade_start, style.horizon_fade_end);
+        // Quantize into FADE_BANDS+1 levels; band 0 is fully melted.
+        let band = (fade * FADE_BANDS).round().clamp(0.0, FADE_BANDS) as u8;
+        if band == 0 {
+            continue;
+        }
+        let spec = cloud_deck_spec(cell.layer, style.layers);
+        // Soft forward-scatter silver lining on partially melted edges.
+        let lining = 1.0 + 0.10 * (1.0 - fade);
+        let key = (cell.layer, band);
+        let batch = batches.entry(key).or_insert_with(|| CloudGeometryBatch {
+            alpha: (spec.opacity * (band as f32 / FADE_BANDS)).clamp(0.0, 1.0),
+            vertices: Vec::new(),
+            indices: Vec::new(),
+            layer: cell.layer,
+            fade_band: band,
+        });
+        push_cloud_cell_geometry(cell, lighting, lining, &mut batch.vertices, &mut batch.indices);
+    }
+    batches.into_values().collect()
 }
 
 // ---------------------------------------------------------------------------
@@ -633,5 +933,234 @@ pub fn planet_subworld_transform(placement: &SkyBodyPlacement, distance: f32) ->
         position: [center[0] - half, center[1] - half, center[2] - half],
         quaternion: [0.0, 0.0, 0.0, 1.0],
         scale,
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Tests
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use megu_client_mesh::vanilla_plus_nature::{
+        compute_cloud_lighting, generate_layered_voxel_clouds, VanillaPlusNatureConfig,
+    };
+
+    fn cloud_cfg(layers: u8) -> VanillaPlusNatureConfig {
+        VanillaPlusNatureConfig {
+            enabled: true,
+            layered_voxel_clouds: true,
+            cloud_layers: layers,
+            ..VanillaPlusNatureConfig::default()
+        }
+    }
+
+    #[test]
+    fn color_temperature_walks_amber_noon_copper_silver_and_storm_grey() {
+        let noon = time_of_day_color_temperature(6_000, 0.0);
+        // Noon is neutral daylight: all channels near 1, warm/cool balanced.
+        for c in noon {
+            assert!((0.9..=1.1).contains(&c), "noon channel {c} must stay neutral");
+        }
+
+        let dawn = time_of_day_color_temperature(300, 0.0);
+        let dusk = time_of_day_color_temperature(12_300, 0.0);
+        // Both horizon bands run warm (r > b); dusk is the deeper copper.
+        assert!(dawn[0] > dawn[2], "dawn must lean warm amber");
+        assert!(dusk[0] > dusk[2], "dusk must lean warm copper");
+        assert!(dusk[0] - dusk[1] > dawn[0] - dawn[1],
+            "dusk copper must out-warm dawn amber");
+
+        let night = time_of_day_color_temperature(18_000, 0.0);
+        // Night: cool silver-blue — blue channel exceeds red, overall dimmer.
+        assert!(night[2] > night[0], "night must lean cool silver-blue");
+        assert!(night[0] < noon[0]);
+
+        // Storm overcast: channels converge toward luminance and dim.
+        let storm = time_of_day_color_temperature(6_000, 1.0);
+        let spread_storm = storm[0].max(storm[1]).max(storm[2])
+            - storm[0].min(storm[1]).min(storm[2]);
+        let spread_dusk = dusk[0].max(dusk[1]).max(dusk[2])
+            - dusk[0].min(dusk[1]).min(dusk[2]);
+        let storm_dusk = time_of_day_color_temperature(12_300, 1.0);
+        let spread_storm_dusk = storm_dusk[0].max(storm_dusk[1]).max(storm_dusk[2])
+            - storm_dusk[0].min(storm_dusk[1]).min(storm_dusk[2]);
+        assert!(spread_storm_dusk < spread_dusk, "storm must desaturate");
+        assert!(storm[0].max(storm[1]).max(storm[2]) <= noon[0].max(noon[1]).max(noon[2]),
+            "storm dims every channel");
+        assert!(spread_storm < 0.15, "full storm should be near-grey");
+
+        // Deterministic and bounded at extremes.
+        let wild = time_of_day_color_temperature(u64::MAX, f32::NAN);
+        assert!(wild.iter().all(|c| (0.0..=1.5).contains(c)));
+    }
+
+    #[test]
+    fn water_column_absorbs_red_first() {
+        let shallow = water_column_transmittance(2.0, DEFAULT_WATER_TINT_RGB);
+        let deep = water_column_transmittance(16.0, DEFAULT_WATER_TINT_RGB);
+        // Beer-Lambert ordering: blue survives, red dies first.
+        assert!(deep[2] > deep[1] && deep[1] > deep[0]);
+        assert!(shallow.iter().zip(deep.iter()).all(|(s, d)| s > d));
+        // Depth 0 returns the raw tint.
+        let surface = water_column_transmittance(0.0, DEFAULT_WATER_TINT_RGB);
+        assert_eq!(surface, DEFAULT_WATER_TINT_RGB);
+        for v in deep {
+            assert!(v.is_finite() && v >= 0.0);
+        }
+    }
+
+    #[test]
+    fn underwater_params_derive_from_surface_optics() {
+        let surface = AtmosphereParams::default();
+        let under = surface.underwater_from(DEFAULT_WATER_TINT_RGB, 10.0);
+        // Teal fog denser than air haze, dimmer sun, bounded channels.
+        assert!(under.fog_density > surface.fog_density);
+        assert!(under.sun_intensity < surface.sun_intensity);
+        assert!(under.fog_rgb[2] > under.fog_rgb[0]);
+        assert!(under.depth_tint_strength > 0.3);
+        for c in under
+            .sky_zenith_rgb
+            .iter()
+            .chain(under.fog_rgb.iter())
+            .chain(under.depth_tint_rgb.iter())
+        {
+            assert!((0.0..=4.0).contains(c));
+        }
+        // Deeper water: stronger tint, more fog, less sun.
+        let deeper = surface.underwater_from(DEFAULT_WATER_TINT_RGB, 24.0);
+        assert!(deeper.sun_intensity < under.sun_intensity);
+        assert!(deeper.fog_density >= under.fog_density - 1e-6);
+        // The zero-arg preset stays a harmonized teal.
+        let preset = AtmosphereParams::underwater();
+        assert!(preset.fog_rgb[1] > preset.fog_rgb[0]);
+        assert!(preset.fog_rgb[2] >= preset.fog_rgb[0]);
+    }
+
+    #[test]
+    fn blend_water_transition_glides_without_snapping() {
+        let above = AtmosphereParams::default();
+        let under = above.underwater_from(DEFAULT_WATER_TINT_RGB, 12.0);
+        let close = |p: &AtmosphereParams, q: &AtmosphereParams| {
+            p.sky_zenith_rgb
+                .iter()
+                .chain(p.sky_horizon_rgb.iter())
+                .chain(p.fog_rgb.iter())
+                .chain(p.depth_tint_rgb.iter())
+                .chain(p.ambient_rgb.iter())
+                .zip(
+                    q.sky_zenith_rgb
+                        .iter()
+                        .chain(q.sky_horizon_rgb.iter())
+                        .chain(q.fog_rgb.iter())
+                        .chain(q.depth_tint_rgb.iter())
+                        .chain(q.ambient_rgb.iter()),
+                )
+                .all(|(a, b)| (a - b).abs() < 1e-5)
+                && (p.fog_density - q.fog_density).abs() < 1e-6
+                && (p.depth_tint_strength - q.depth_tint_strength).abs() < 1e-6
+                && (p.sun_intensity - q.sun_intensity).abs() < 1e-6
+        };
+        let dry = blend_water_transition(&above, &under, 0.0);
+        let wet = blend_water_transition(&above, &under, 1.0);
+        assert!(close(&dry, &above.sanitized()));
+        assert!(close(&wet, &under.sanitized()));
+        // Midway sits strictly between on a monotone channel.
+        let mid = blend_water_transition(&above, &under, 0.5);
+        assert!(mid.fog_density > above.fog_density && mid.fog_density < under.fog_density);
+        // Smoothstep keeps the centre off the linear midpoint.
+        let linear = (above.fog_density + under.fog_density) * 0.5;
+        assert!((mid.fog_density - linear).abs() < 0.05);
+        // Clamped inputs and hostile values stay finite.
+        let over = blend_water_transition(&above, &under, 2.0);
+        assert!(close(&over, &under.sanitized()));
+        let nan = blend_water_transition(&above, &under, f32::NAN);
+        assert!(close(&nan, &above.sanitized()));
+    }
+
+    #[test]
+    fn with_time_of_day_tints_sky_and_dims_storm_sun() {
+        let noonish = AtmosphereParams::default().with_time_of_day(6_000, 0.0);
+        // Neutral temperature barely moves the noon palette.
+        assert!((noonish.sky_zenith_rgb[0] - 0.30).abs() < 0.06);
+        let dusk = AtmosphereParams::default().with_time_of_day(12_000, 0.0);
+        assert!(dusk.sky_horizon_rgb[0] > dusk.sky_horizon_rgb[2],
+            "dusk horizon must lean warm");
+        let storm = AtmosphereParams::default().with_time_of_day(6_000, 1.0);
+        assert!(storm.sun_intensity < AtmosphereParams::default().sun_intensity,
+            "storm dims the sun through the tint luminance");
+    }
+
+    #[test]
+    fn cloud_horizon_fade_melts_between_start_and_end() {
+        assert_eq!(cloud_horizon_fade(10.0, 48.0, 78.0), 1.0);
+        assert_eq!(cloud_horizon_fade(90.0, 48.0, 78.0), 0.0);
+        let mid = cloud_horizon_fade(63.0, 48.0, 78.0);
+        assert!((0.0..1.0).contains(&mid) && (mid - 0.5).abs() < 1e-4);
+        // Monotone decreasing across the band.
+        let mut prev = 1.0f32;
+        for i in 0..=20 {
+            let f = cloud_horizon_fade(48.0 + i as f32 * 1.5, 48.0, 78.0);
+            assert!(f <= prev + 1e-6);
+            prev = f;
+        }
+        // Degenerate range: hard cutoff, still bounded.
+        assert_eq!(cloud_horizon_fade(50.0, 48.0, 48.0), 0.0);
+        // Hostile inputs fail closed into a bounded 0..=1.
+        let nan = cloud_horizon_fade(f32::NAN, f32::NAN, f32::NAN);
+        assert!((0.0..=1.0).contains(&nan));
+        assert_eq!(cloud_horizon_fade(f32::NAN, 10.0, 100.0), 1.0);
+    }
+
+    #[test]
+    fn styled_cloud_geometry_batches_by_deck_and_melts_at_horizon() {
+        let cells = generate_layered_voxel_clouds(&cloud_cfg(3), 0.0, 0.0, 6_000);
+        assert!(!cells.is_empty());
+        let lighting = compute_cloud_lighting(0.8, 0.0, 0.0);
+
+        let style = CloudGeometryStyle {
+            layers: 3,
+            viewer_xz: [0.0, 0.0],
+            horizon_fade_start: 10.0,
+            horizon_fade_end: 80.0,
+        };
+        let batches = voxel_clouds_to_geometry_styled(&cells, &lighting, &style);
+        assert!(!batches.is_empty());
+        // Every batch carries valid alpha and indices in range.
+        for b in &batches {
+            assert!((0.0..=1.0).contains(&b.alpha) && b.alpha > 0.0);
+            assert!(!b.vertices.is_empty() && !b.indices.is_empty());
+            let vmax = b.vertices.len() as u32;
+            assert!(b.indices.iter().all(|&i| i < vmax));
+            assert!(b.fade_band >= 1 && b.fade_band <= 4);
+            // Albedo stays in the shaded 0..=1 range even with the lining.
+            assert!(b.vertices.iter().all(|v| v.albedo().iter().all(|c| (0.0..=1.0).contains(c))));
+        }
+        // Deck translucency: a cumulus batch out-alphas a cirrus batch when
+        // both exist at full band.
+        let cum_alpha = batches.iter().filter(|b| b.layer == 0).map(|b| b.alpha).fold(0.0f32, f32::max);
+        if let Some(cir) = batches.iter().filter(|b| b.layer == 2).map(|b| b.alpha).reduce(f32::max) {
+            assert!(cum_alpha > cir, "cumulus must stay more opaque than cirrus");
+        }
+
+        // A viewer very far away melts everything past the fade end.
+        let far = CloudGeometryStyle {
+            viewer_xz: [10_000.0, 0.0],
+            ..style
+        };
+        assert!(voxel_clouds_to_geometry_styled(&cells, &lighting, &far).is_empty());
+
+        // With a huge fade window nothing melts: the crisp band reproduces
+        // the classic geometry quad count.
+        let crisp = CloudGeometryStyle {
+            horizon_fade_start: 1.0e6,
+            horizon_fade_end: 2.0e6,
+            ..style
+        };
+        let crisp_batches = voxel_clouds_to_geometry_styled(&cells, &lighting, &crisp);
+        let styled_quads: usize = crisp_batches.iter().map(|b| b.indices.len() / 6).sum();
+        let (_, classic_idx) = voxel_clouds_to_geometry(&cells, &lighting);
+        assert_eq!(styled_quads, classic_idx.len() / 6);
     }
 }
