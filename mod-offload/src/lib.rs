@@ -10,6 +10,7 @@ pub mod explosion_batch;
 pub mod ffi;
 pub mod fluid_network;
 pub mod kinetic_graph;
+pub mod lazy_catchup;
 pub mod me_network;
 pub mod party_storage;
 pub mod recipe_processor;
@@ -51,4 +52,11 @@ pub use party_storage::{
     RecordError, StorageDecodeError, StorageError, StorageSlotRef, BOX_SLOTS, DEFAULT_BOX_COUNT,
     GUARANTEED_CAPTURE_MULTIPLIER, MAX_BOX_COUNT, MAX_LEVEL, MAX_MOVES, PARTY_SLOTS,
     PRTY_SCHEMA_VERSION, SHAKE_CHECKS,
+};
+pub use lazy_catchup::{
+    catch_up_furnace, catch_up_growth_stage, catch_up_machine_batch, CatchUpLimits,
+    FurnaceCatchUpReport, FurnaceCatchUpState, HeadlessError, HeadlessFactoryNode,
+    HeadlessFactoryRegistry, HeadlessStepReport, MachineCatchUpReport, MachineCatchUpState,
+    DEFAULT_MAX_DELTA_TICKS, HARD_MAX_DELTA_TICKS, MAX_HEADLESS_NODES, MILLI_PER_ITEM,
+    TICKS_PER_HOUR,
 };
