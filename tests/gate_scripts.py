@@ -41,6 +41,7 @@ import time
 
 ROOT = Path(__file__).resolve().parents[1]
 SCRIPT = ROOT / "tools/mutation_check.sh"
+WIRING_AUDIT = ROOT / "tools/wiring_connectivity_audit.py"
 CONTROL = "running 1 test\ntest result: ok. 1 passed; 0 failed; 0 ignored"
 DIRTY = "// MEGU_DIRTY_MARKER"
 # The wire config the fixture plants: its bytes are what a copy has to carry, so the assertion names
@@ -400,6 +401,155 @@ def run_case(cargo_output, cargo_status, *, script=None, missing_anchor=False, l
         return result.returncode, log, journal
 
 
+# ---------------------------------------------------------------------------
+# tools/wiring_connectivity_audit.py self-tests on synthetic Rust trees.
+# Every case drives the real entry point against a private fixture so the
+# assertions are about the audit's verdict, not about a fixture it was told
+# to see: a dead bridge that only test code calls must exit 1, and the same
+# symbol wired by one non-test call site must exit 0.
+# ---------------------------------------------------------------------------
+
+WIRING_TEST_ONLY_CALLER = """\
+fn foo_bridge_tick(dt: f64) {
+    let _ = dt;
+}
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn ticks() { super::foo_bridge_tick(1.0); }
+}
+"""
+
+WIRING_WIRED_CALLER = """\
+fn foo_bridge_tick(dt: f64) {
+    let _ = dt;
+}
+fn step_world() {
+    foo_bridge_tick(1.0);
+}
+"""
+
+WIRING_GHOST_SERVER = """\
+const GHOST_CHANNEL: &str = "megu:ghost_sync_v1";
+fn ghost_frame() -> &'static str { GHOST_CHANNEL }
+"""
+
+WIRING_GHOST_CLIENT = """\
+const GHOST_CLIENT_CHANNEL: &str = "megu:ghost_sync_v1";
+fn handle(channel: &str) -> bool { channel == GHOST_CLIENT_CHANNEL }
+"""
+
+WIRING_TAG_WRITE_ONLY = """\
+fn write_section(out: &mut Vec<u8>) {
+    out.extend_from_slice(b"GHT1");
+}
+"""
+
+WIRING_TAG_ROUNDTRIP = WIRING_TAG_WRITE_ONLY + """\
+fn read_section(b: &[u8]) -> bool {
+    b.ends_with(b"GHT1")
+}
+"""
+
+# The save-tag check fails closed when src/save_v2.rs is absent, so every
+# exit-0 fixture carries a symmetric minimal file.
+WIRING_SAVE_V2_STUB = """\
+fn roundtrip(out: &mut Vec<u8>, b: &[u8]) -> bool {
+    out.extend_from_slice(b"STB1");
+    b.ends_with(b"STB1")
+}
+"""
+
+WIRING_GHOST_WAIVER = {
+    "version": 1,
+    "waivers": [{
+        "check": "one_sided_channel",
+        "symbol": "megu:ghost_sync_v1",
+        "reason": "staged channel documented for the self-test",
+        "lane": "SELFTEST",
+        "date": "2026-11-24",
+    }],
+}
+
+
+def wiring_fixture(root, files, waivers=None):
+    for rel, text in files.items():
+        path = root / rel
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(text)
+    if waivers is not None:
+        (root / "audit").mkdir(exist_ok=True)
+        (root / "audit/wiring_connectivity_waivers.json").write_text(
+            json.dumps(waivers))
+
+
+def run_wiring_audit(root, *args):
+    return subprocess.run(
+        [sys.executable, str(WIRING_AUDIT), "--root", str(root), *args],
+        capture_output=True, text=True, timeout=180)
+
+
+def wiring_audit_cases(keep_going):
+    """Each case asserts the audit's exit contract on a private fixture."""
+    failures = []
+    # (name, files, waivers, argv, want_rc, marker-or-None)
+    cases = [
+        ("test-only bridge call is caught",
+         {"src/foo.rs": WIRING_TEST_ONLY_CALLER}, None, (), 1,
+         "foo_bridge_tick"),
+        ("production call site wires the bridge",
+         {"src/foo.rs": WIRING_WIRED_CALLER,
+          "src/save_v2.rs": WIRING_SAVE_V2_STUB}, None, (), 0,
+         None),
+        ("one-sided server channel is caught",
+         {"src/channels.rs": WIRING_GHOST_SERVER}, None, (), 1,
+         "megu:ghost_sync_v1"),
+        ("client handler closes the channel",
+         {"src/channels.rs": WIRING_GHOST_SERVER,
+          "client-app/src/handle.rs": WIRING_GHOST_CLIENT,
+          "src/save_v2.rs": WIRING_SAVE_V2_STUB}, None, (), 0,
+         None),
+        ("written-but-unread save tag is caught",
+         {"src/save_v2.rs": WIRING_TAG_WRITE_ONLY}, None, (), 1,
+         "GHT1"),
+        ("read path closes the tag roundtrip",
+         {"src/save_v2.rs": WIRING_TAG_ROUNDTRIP}, None, (), 0,
+         None),
+        ("waived finding passes default mode",
+         {"src/channels.rs": WIRING_GHOST_SERVER,
+          "src/save_v2.rs": WIRING_SAVE_V2_STUB}, WIRING_GHOST_WAIVER,
+         (), 0, "WAIVED"),
+        ("wired item makes the waiver stale (warn only)",
+         {"src/channels.rs": WIRING_GHOST_SERVER,
+          "client-app/src/handle.rs": WIRING_GHOST_CLIENT,
+          "src/save_v2.rs": WIRING_SAVE_V2_STUB},
+         WIRING_GHOST_WAIVER, (), 0, "stale waivers"),
+        ("--fail-on-stale rejects a wired waiver",
+         {"src/channels.rs": WIRING_GHOST_SERVER,
+          "client-app/src/handle.rs": WIRING_GHOST_CLIENT},
+         WIRING_GHOST_WAIVER, ("--fail-on-stale",), 1, "stale waivers"),
+    ]
+    for name, files, waivers, argv, want_rc, marker in cases:
+        with tempfile.TemporaryDirectory(prefix="wiring-audit-") as tmp:
+            root = Path(tmp)
+            wiring_fixture(root, files, waivers)
+            try:
+                result = run_wiring_audit(root, *argv)
+                log = result.stdout + result.stderr
+                assert result.returncode == want_rc, (
+                    f"expected exit {want_rc}, got {result.returncode}\n{log}")
+                if marker is not None:
+                    assert marker in log, f"{marker!r} not in report\n{log}"
+            except AssertionError as error:
+                if not keep_going:
+                    raise
+                failures.append(name)
+                print(f"wiring audit self-test: {name} FAIL\n{error}")
+                continue
+            print(f"wiring audit self-test: {name} PASS")
+    return failures
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--script", default=None,
@@ -526,6 +676,9 @@ def main():
         print(f"gate self-test: sigkill leaves residue only in the private copy FAIL\n{error}")
     else:
         print("gate self-test: sigkill leaves residue only in the private copy PASS")
+
+    failures.extend(f"wiring: {name}"
+                    for name in wiring_audit_cases(options.keep_going))
 
     if failures:
         print(f"gate self-test: {len(failures)} case(s) failed: {', '.join(failures)}")

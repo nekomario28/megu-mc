@@ -139,6 +139,12 @@ python3 tools/client_vertical_wiring_audit.py
 # site — a call that retreats into #[cfg(test)] or a comment fails here.
 python3 tests/opt_wiring_audit_test.py
 python3 tools/opt_wiring_audit.py
+# The connectivity audit is a real gate, not a report: any entrypoint-shaped
+# fn whose only callers live in #[cfg(test)] (dead ticks/bridges), any custom
+# channel that exists on only one side, any save tag with no read path, and
+# any bridge-module entrypoint with zero production callers fails here unless
+# it is waived with a reason in audit/wiring_connectivity_waivers.json.
+python3 tools/wiring_connectivity_audit.py
 python3 tests/docker_entrypoint_test.py
 python3 tests/install_linux_test.py
 python3 tests/installer_cross_os_test.py

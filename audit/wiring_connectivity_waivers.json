@@ -1,0 +1,668 @@
+{
+  "version": 1,
+  "comment": "Currently-known unwired subsystems tolerated by tools/wiring_connectivity_audit.py. Every entry is a real 'implemented but never wired into live runtime' gap found at baseline; the audit FAILS on any NEW unwired tick/bridge/channel/save-tag/entrypoint. A landing wire makes its entry stale (warn by default, hard-fail under --fail-on-stale) — prune, never add silently. fn/bridge entries match on check+symbol+file; channel entries match on check+symbol (sites are documentation).",
+  "waivers": [
+    {
+      "check": "asymmetric_save_tag",
+      "symbol": "FAL1",
+      "file": "src/save_v2.rs",
+      "line": 5072,
+      "reason": "Legacy falling-block section tag decoded for backward compatibility; superseded by FAL2 writes — intentionally read-only.",
+      "lane": "SAVE-LEGACY",
+      "date": "2026-11-24"
+    },
+    {
+      "check": "asymmetric_save_tag",
+      "symbol": "MET2",
+      "file": "src/save_v2.rs",
+      "line": 4244,
+      "reason": "Legacy metadata section tag accepted on read for old saves; only MET4 is written — intentionally decode-only.",
+      "lane": "SAVE-LEGACY",
+      "date": "2026-11-24"
+    },
+    {
+      "check": "asymmetric_save_tag",
+      "symbol": "MET3",
+      "file": "src/save_v2.rs",
+      "line": 4244,
+      "reason": "Legacy metadata section tag accepted on read for old saves; only MET4 is written — intentionally decode-only.",
+      "lane": "SAVE-LEGACY",
+      "date": "2026-11-24"
+    },
+    {
+      "check": "dead_tick_or_bridge",
+      "symbol": "tick_rail_network",
+      "file": "create-adapter/src/rail_network.rs",
+      "line": 1173,
+      "reason": "Create rail-network scheduled-train tick implemented (virtual transit, reservations) but never stepped by the factory region tick; only perf tests call it.",
+      "lane": "CREATE-RAIL",
+      "date": "2026-11-24"
+    },
+    {
+      "check": "dead_tick_or_bridge",
+      "symbol": "tick_lifecycle",
+      "file": "mod-adapter-core/src/creature_primitives.rs",
+      "line": 418,
+      "reason": "Creature lifecycle tick (growth/breeding/aquatic suffocation) is fully implemented but only its crate tests call it; no runtime loop steps it.",
+      "lane": "MOD-RUNTIME",
+      "date": "2026-11-24"
+    },
+    {
+      "check": "dead_tick_or_bridge",
+      "symbol": "aeronautics_bridge_discover_addon_jar",
+      "file": "src/aeronautics_and_dim_bridge.rs",
+      "line": 1002,
+      "reason": "Addon-jar discovery entrypoint staged alongside aeronautics_bridge_tick; never invoked from the mod-load path.",
+      "lane": "CREATE-OFFLOAD-LIVE",
+      "date": "2026-11-24"
+    },
+    {
+      "check": "dead_tick_or_bridge",
+      "symbol": "aeronautics_bridge_tick",
+      "file": "src/aeronautics_and_dim_bridge.rs",
+      "line": 847,
+      "reason": "Aeronautics runtime bridge steps every active airship but no game-loop call site exists; the bridge state is saved/loaded (AER1 trailer) without ever being ticked. create-offload feature-gated.",
+      "lane": "CREATE-OFFLOAD-LIVE",
+      "date": "2026-11-24"
+    },
+    {
+      "check": "dead_tick_or_bridge",
+      "symbol": "dimension_mod_load_entries",
+      "file": "src/aeronautics_and_dim_bridge.rs",
+      "line": 1018,
+      "reason": "Dimension-mod entry loader staged for the dim-mod bridge; portal/env records persist (AER1) but loading is never driven.",
+      "lane": "CREATE-OFFLOAD-LIVE",
+      "date": "2026-11-24"
+    },
+    {
+      "check": "dead_tick_or_bridge",
+      "symbol": "dimension_mod_try_portal_teleport",
+      "file": "src/aeronautics_and_dim_bridge.rs",
+      "line": 1042,
+      "reason": "Custom-dimension portal teleport hook staged for the dim bridge; no portal transit call site exists.",
+      "lane": "CREATE-OFFLOAD-LIVE",
+      "date": "2026-11-24"
+    },
+    {
+      "check": "dead_tick_or_bridge",
+      "symbol": "live_anvil_save_tick",
+      "file": "src/anvil_io.rs",
+      "line": 2609,
+      "reason": "Incremental anvil save (dirty-set enqueue + summary) is implemented and test-covered but never scheduled by the autosave path — the exact live_anvil_save_tick defect class.",
+      "lane": "SAVE-INCREMENTAL",
+      "date": "2026-11-24"
+    },
+    {
+      "check": "dead_tick_or_bridge",
+      "symbol": "tick_mob_fire",
+      "file": "src/combat_and_health.rs",
+      "line": 869,
+      "reason": "Mob fire-duration tick helper staged for the combat tick loop; carry-over burning never consults it.",
+      "lane": "COMBAT-TICK",
+      "date": "2026-11-24"
+    },
+    {
+      "check": "dead_tick_or_bridge",
+      "symbol": "hunger_exhaustion_per_tick",
+      "file": "src/effects.rs",
+      "line": 210,
+      "reason": "Hunger-effect exhaustion rate helper marked cfg_attr(not(test), allow(dead_code)); the food/saturation tick never calls it.",
+      "lane": "EFFECTS-HUNGER",
+      "date": "2026-11-24"
+    },
+    {
+      "check": "dead_tick_or_bridge",
+      "symbol": "saturation_tick",
+      "file": "src/effects.rs",
+      "line": 215,
+      "reason": "Saturation-effect tick helper staged beside hunger_exhaustion_per_tick; same unwired status-effect path.",
+      "lane": "EFFECTS-HUNGER",
+      "date": "2026-11-24"
+    },
+    {
+      "check": "dead_tick_or_bridge",
+      "symbol": "fluid_tick_delay",
+      "file": "src/flowing_fluid.rs",
+      "line": 78,
+      "reason": "Vanilla FlowingFluid.getTickDelay parity helper (water 5t, dimension-aware lava) staged for scheduled fluid ticks; the scheduler never queries it.",
+      "lane": "FLUID-SCHED",
+      "date": "2026-11-24"
+    },
+    {
+      "check": "dead_tick_or_bridge",
+      "symbol": "live_attach_orbital_passenger",
+      "file": "src/live_mod_bridge.rs",
+      "line": 3945,
+      "reason": "Passenger attach staged for orbital ship boarding; no seat/ride path reaches it.",
+      "lane": "MOD-SUITE-ORBITAL",
+      "date": "2026-11-24"
+    },
+    {
+      "check": "dead_tick_or_bridge",
+      "symbol": "live_chunk_packet_cache_get_or_encode",
+      "file": "src/live_mod_bridge.rs",
+      "line": 216,
+      "reason": "mod-suite chunk packet memoization (both cfg variants) staged for the live session; encode cache is never consulted by the chunk pipeline.",
+      "lane": "MOD-SUITE-WIRE",
+      "date": "2026-11-24"
+    },
+    {
+      "check": "dead_tick_or_bridge",
+      "symbol": "live_chunk_packet_cache_invalidate",
+      "file": "src/live_mod_bridge.rs",
+      "line": 232,
+      "reason": "Companion invalidation hook for the staged chunk packet cache; no block-change path calls it.",
+      "lane": "MOD-SUITE-WIRE",
+      "date": "2026-11-24"
+    },
+    {
+      "check": "dead_tick_or_bridge",
+      "symbol": "live_format_romaji_chat",
+      "file": "src/live_mod_bridge.rs",
+      "line": 3968,
+      "reason": "Romaji chat formatting staged for a chat-mod lane; the chat path never consults it.",
+      "lane": "MOD-SUITE-WIRE",
+      "date": "2026-11-24"
+    },
+    {
+      "check": "dead_tick_or_bridge",
+      "symbol": "live_mod_accessory_attributes",
+      "file": "src/live_mod_bridge.rs",
+      "line": 1491,
+      "reason": "Accessory attribute projection staged beside equip_accessory; never consulted.",
+      "lane": "MOD-SUITE-WIRE",
+      "date": "2026-11-24"
+    },
+    {
+      "check": "dead_tick_or_bridge",
+      "symbol": "live_mod_chest_holiday_variant",
+      "file": "src/live_mod_bridge.rs",
+      "line": 3741,
+      "reason": "Holiday chest variant picker staged beside the headgear roll; container placement never asks.",
+      "lane": "MOD-SUITE-WIRE",
+      "date": "2026-11-24"
+    },
+    {
+      "check": "dead_tick_or_bridge",
+      "symbol": "live_mod_cutting_board_use",
+      "file": "src/live_mod_bridge.rs",
+      "line": 1463,
+      "reason": "Cutting-board interaction staged for the culinary adapter; no use/interact dispatch reaches it.",
+      "lane": "MOD-SUITE-WIRE",
+      "date": "2026-11-24"
+    },
+    {
+      "check": "dead_tick_or_bridge",
+      "symbol": "live_mod_emit_season_sync",
+      "file": "src/live_mod_bridge.rs",
+      "line": 3722,
+      "reason": "SSN1 season emitter (both cfg variants) staged for the megu:season(+season_v1) channel; never driven on join or season change.",
+      "lane": "MOD-SUITE-WIRE",
+      "date": "2026-11-24"
+    },
+    {
+      "check": "dead_tick_or_bridge",
+      "symbol": "live_mod_equip_accessory",
+      "file": "src/live_mod_bridge.rs",
+      "line": 1474,
+      "reason": "Accessory equip entrypoint staged for accessory_v1; no inventory/container path calls it.",
+      "lane": "MOD-SUITE-WIRE",
+      "date": "2026-11-24"
+    },
+    {
+      "check": "dead_tick_or_bridge",
+      "symbol": "live_mod_eval_damage_hooks",
+      "file": "src/live_mod_bridge.rs",
+      "line": 1385,
+      "reason": "Mod damage-hook evaluation staged for combat dispatch; live_mod_entity_damage_pre is wired but this evaluator is not.",
+      "lane": "MOD-SUITE-WIRE",
+      "date": "2026-11-24"
+    },
+    {
+      "check": "dead_tick_or_bridge",
+      "symbol": "live_mod_magic_absorb_damage",
+      "file": "src/live_mod_bridge.rs",
+      "line": 3788,
+      "reason": "Magic damage absorb staged for combat; damage path never consults it.",
+      "lane": "MOD-SUITE-WIRE",
+      "date": "2026-11-24"
+    },
+    {
+      "check": "dead_tick_or_bridge",
+      "symbol": "live_mod_magic_apply_status",
+      "file": "src/live_mod_bridge.rs",
+      "line": 3783,
+      "reason": "Status application staged beside register_status; no effect path reaches it.",
+      "lane": "MOD-SUITE-WIRE",
+      "date": "2026-11-24"
+    },
+    {
+      "check": "dead_tick_or_bridge",
+      "symbol": "live_mod_magic_cast",
+      "file": "src/live_mod_bridge.rs",
+      "line": 3795,
+      "reason": "Spell cast entrypoint staged for megu:magic_v1 C2S handling; no packet dispatch reaches it.",
+      "lane": "MOD-SUITE-WIRE",
+      "date": "2026-11-24"
+    },
+    {
+      "check": "dead_tick_or_bridge",
+      "symbol": "live_mod_magic_register_status",
+      "file": "src/live_mod_bridge.rs",
+      "line": 3778,
+      "reason": "Custom status registration staged for the magic runtime; never invoked.",
+      "lane": "MOD-SUITE-WIRE",
+      "date": "2026-11-24"
+    },
+    {
+      "check": "dead_tick_or_bridge",
+      "symbol": "live_mod_magic_remove_player",
+      "file": "src/live_mod_bridge.rs",
+      "line": 3807,
+      "reason": "Magic player teardown staged for disconnect cleanup; the disconnect path never calls it.",
+      "lane": "MOD-SUITE-WIRE",
+      "date": "2026-11-24"
+    },
+    {
+      "check": "dead_tick_or_bridge",
+      "symbol": "live_mod_magic_set_attributes",
+      "file": "src/live_mod_bridge.rs",
+      "line": 3773,
+      "reason": "Magic attribute setter staged for the megu:magic_v1 lifecycle; no player-init path calls it.",
+      "lane": "MOD-SUITE-WIRE",
+      "date": "2026-11-24"
+    },
+    {
+      "check": "dead_tick_or_bridge",
+      "symbol": "live_mod_name_for_state",
+      "file": "src/live_mod_bridge.rs",
+      "reason": "MCF2 reverse state->name lookup staged for the mod-suite sidecar write path; the state canonicalizer is wired but this direction is never consulted.",
+      "lane": "MOD-SUITE-WIRE",
+      "date": "2026-11-24",
+      "line": 2538
+    },
+    {
+      "check": "dead_tick_or_bridge",
+      "symbol": "live_mod_remove_cooking_pot",
+      "file": "src/live_mod_bridge.rs",
+      "line": 1438,
+      "reason": "Cooking-pot removal staged beside set_cooking_pot; no block-break path reaches it.",
+      "lane": "MOD-SUITE-WIRE",
+      "date": "2026-11-24"
+    },
+    {
+      "check": "dead_tick_or_bridge",
+      "symbol": "live_mod_roll_halloween_headgear",
+      "file": "src/live_mod_bridge.rs",
+      "line": 3729,
+      "reason": "Holiday headgear roll staged for the seasonal mob-spawn hook; never consulted.",
+      "lane": "MOD-SUITE-WIRE",
+      "date": "2026-11-24"
+    },
+    {
+      "check": "dead_tick_or_bridge",
+      "symbol": "live_mod_set_cooking_pot",
+      "file": "src/live_mod_bridge.rs",
+      "line": 1428,
+      "reason": "Culinary cooking-pot registration staged for the mod-suite block-entity tap; never called.",
+      "lane": "MOD-SUITE-WIRE",
+      "date": "2026-11-24"
+    },
+    {
+      "check": "dead_tick_or_bridge",
+      "symbol": "live_mod_sync_manifest_for_client_probe",
+      "file": "src/live_mod_bridge.rs",
+      "line": 1517,
+      "reason": "Per-client sync manifest probe staged beside the root-hash probe; never queried.",
+      "lane": "MOD-SUITE-WIRE",
+      "date": "2026-11-24"
+    },
+    {
+      "check": "dead_tick_or_bridge",
+      "symbol": "live_mod_sync_root_hash_probe",
+      "file": "src/live_mod_bridge.rs",
+      "line": 1504,
+      "reason": "Mod-sync root-hash probe staged for MRS1/MSY1 sync verification; no verifier calls it.",
+      "lane": "MOD-SUITE-WIRE",
+      "date": "2026-11-24"
+    },
+    {
+      "check": "dead_tick_or_bridge",
+      "symbol": "live_mod_try_qol_right_click_harvest",
+      "file": "src/live_mod_bridge.rs",
+      "line": 3748,
+      "reason": "QoL right-click harvest staged for the interact path (both cfg variants); no use-item dispatch reaches it.",
+      "lane": "MOD-SUITE-WIRE",
+      "date": "2026-11-24"
+    },
+    {
+      "check": "dead_tick_or_bridge",
+      "symbol": "live_mod_unified_runtime",
+      "file": "src/live_mod_bridge.rs",
+      "line": 1282,
+      "reason": "Unified mod runtime singleton accessor staged for the mod-suite bridge; no live init path reaches it.",
+      "lane": "MOD-SUITE-WIRE",
+      "date": "2026-11-24"
+    },
+    {
+      "check": "dead_tick_or_bridge",
+      "symbol": "live_progression_grant",
+      "file": "src/live_mod_bridge.rs",
+      "line": 2283,
+      "reason": "Progression grant staged for advancement/criteria mod hooks; never invoked.",
+      "lane": "MOD-SUITE-WIRE",
+      "date": "2026-11-24"
+    },
+    {
+      "check": "dead_tick_or_bridge",
+      "symbol": "live_register_orbital_dimension",
+      "file": "src/live_mod_bridge.rs",
+      "line": 3903,
+      "reason": "Orbital dimension registration staged for the aeronautics space lane; no dimension setup reaches it.",
+      "lane": "MOD-SUITE-ORBITAL",
+      "date": "2026-11-24"
+    },
+    {
+      "check": "dead_tick_or_bridge",
+      "symbol": "live_register_orbital_rule",
+      "file": "src/live_mod_bridge.rs",
+      "line": 3919,
+      "reason": "Orbital portal rule registration staged beside the dimension hook; never invoked.",
+      "lane": "MOD-SUITE-ORBITAL",
+      "date": "2026-11-24"
+    },
+    {
+      "check": "dead_tick_or_bridge",
+      "symbol": "live_register_orbital_ship",
+      "file": "src/live_mod_bridge.rs",
+      "line": 3931,
+      "reason": "Orbital ship registration staged for subworld transitions; never called.",
+      "lane": "MOD-SUITE-ORBITAL",
+      "date": "2026-11-24"
+    },
+    {
+      "check": "dead_tick_or_bridge",
+      "symbol": "live_server_opt_summary",
+      "file": "src/live_mod_bridge.rs",
+      "line": 4080,
+      "reason": "Server optimization summary surface staged for operator reporting; nothing renders it.",
+      "lane": "MOD-SUITE-WIRE",
+      "date": "2026-11-24"
+    },
+    {
+      "check": "dead_tick_or_bridge",
+      "symbol": "live_take_orbital_transitions",
+      "file": "src/live_mod_bridge.rs",
+      "line": 3957,
+      "reason": "Pending orbital transition drain staged for the aeronautics lane; nothing drains it.",
+      "lane": "MOD-SUITE-ORBITAL",
+      "date": "2026-11-24"
+    },
+    {
+      "check": "dead_tick_or_bridge",
+      "symbol": "live_tier25_flush_tick",
+      "file": "src/live_mod_bridge.rs",
+      "line": 4001,
+      "reason": "Tier2.5 flush tick staged beside submit_guarded; no tick loop reaches it.",
+      "lane": "MOD-SUITE-WIRE",
+      "date": "2026-11-24"
+    },
+    {
+      "check": "dead_tick_or_bridge",
+      "symbol": "live_tier25_submit_guarded",
+      "file": "src/live_mod_bridge.rs",
+      "line": 3987,
+      "reason": "Tier2.5 guarded submission staged for the mod-suite auth lane; never invoked.",
+      "lane": "MOD-SUITE-WIRE",
+      "date": "2026-11-24"
+    },
+    {
+      "check": "dead_tick_or_bridge",
+      "symbol": "tick_mob_persistence_and_easter_egg_ai",
+      "file": "src/mob_despawn.rs",
+      "line": 323,
+      "reason": "Mob persistence + easter-egg AI tick staged for the despawn path; the despawn loop never calls it.",
+      "lane": "MOB-PERSIST",
+      "date": "2026-11-24"
+    },
+    {
+      "check": "dead_tick_or_bridge",
+      "symbol": "live_rollback_summaries",
+      "file": "src/operator_ux.rs",
+      "line": 2971,
+      "reason": "Rollback summary render staged inside the allow(dead_code) ProfilerReport impl; no report path calls it.",
+      "lane": "OPS-UX",
+      "date": "2026-11-24"
+    },
+    {
+      "check": "dead_tick_or_bridge",
+      "symbol": "oxidation_tick",
+      "file": "src/player_mechanisms.rs",
+      "line": 4881,
+      "reason": "Copper oxidation random-tick staged beside tick_decay; exercised only in tests.",
+      "lane": "OXIDATION",
+      "date": "2026-11-24"
+    },
+    {
+      "check": "dead_tick_or_bridge",
+      "symbol": "tick_decay",
+      "file": "src/player_mechanisms.rs",
+      "line": 4763,
+      "reason": "Copper decay tick method staged for weathering; the block-entity tick never schedules it (only cfg(test) callers).",
+      "lane": "OXIDATION",
+      "date": "2026-11-24"
+    },
+    {
+      "check": "dead_tick_or_bridge",
+      "symbol": "live_max_players",
+      "file": "src/server_config.rs",
+      "reason": "Same unwired runtime-config getter as live_view_distance — stored at startup, never read (cap enforcement not wired).",
+      "lane": "SERVER-CONFIG",
+      "date": "2026-11-24",
+      "line": 85
+    },
+    {
+      "check": "dead_tick_or_bridge",
+      "symbol": "live_simulation_distance",
+      "file": "src/server_config.rs",
+      "reason": "Same unwired runtime-config getter as live_view_distance — stored at startup, never read.",
+      "lane": "SERVER-CONFIG",
+      "date": "2026-11-24",
+      "line": 80
+    },
+    {
+      "check": "dead_tick_or_bridge",
+      "symbol": "live_view_distance",
+      "file": "src/server_config.rs",
+      "reason": "Operator view-distance getter: apply_runtime_server_config stores the resolved value but no production path reads it back — the setting is installed but never honored.",
+      "lane": "SERVER-CONFIG",
+      "date": "2026-11-24",
+      "line": 75
+    },
+    {
+      "check": "dead_tick_or_bridge",
+      "symbol": "run_quarantined_tick",
+      "file": "src/server_reliability.rs",
+      "line": 1865,
+      "reason": "Panic-quarantining tick wrapper staged for reliability hardening; the server loop runs unguarded.",
+      "lane": "RELIABILITY",
+      "date": "2026-11-24"
+    },
+    {
+      "check": "dead_tick_or_bridge",
+      "symbol": "record_tick_nanos",
+      "file": "src/teams_and_commands.rs",
+      "line": 544,
+      "reason": "MSPT rolling-window recorder staged for `/tick query`; the server loop never feeds it.",
+      "lane": "TICK-CMD",
+      "date": "2026-11-24"
+    },
+    {
+      "check": "dead_tick_or_bridge",
+      "symbol": "tick_interval_nanos",
+      "file": "src/teams_and_commands.rs",
+      "line": 521,
+      "reason": "/tick pacing helper (sprint-aware interval) staged for the tick-rate command; the tick loop never consults it.",
+      "lane": "TICK-CMD",
+      "date": "2026-11-24"
+    },
+    {
+      "check": "dead_tick_or_bridge",
+      "symbol": "live_allay_give",
+      "file": "src/villager_raid.rs",
+      "line": 1927,
+      "reason": "Allay item-give interaction staged with the golem hooks; never dispatched.",
+      "lane": "MOB-INTERACT",
+      "date": "2026-11-24"
+    },
+    {
+      "check": "dead_tick_or_bridge",
+      "symbol": "live_iron_golem_repair",
+      "file": "src/villager_raid.rs",
+      "line": 1887,
+      "reason": "Iron-golem ingot-repair interaction staged for the mob interact path; never dispatched.",
+      "lane": "MOB-INTERACT",
+      "date": "2026-11-24"
+    },
+    {
+      "check": "dead_tick_or_bridge",
+      "symbol": "live_snow_golem_shear",
+      "file": "src/villager_raid.rs",
+      "line": 1909,
+      "reason": "Snow-golem pumpkin shear staged beside the golem repair; interact path never reaches it.",
+      "lane": "MOB-INTERACT",
+      "date": "2026-11-24"
+    },
+    {
+      "check": "one_sided_channel",
+      "symbol": "create:kinetic_update_v1",
+      "sites": [
+        "client-app/src/kinetic_sync.rs:9"
+      ],
+      "reason": "Client decodes the Create kinetic update channel; neither the server bridge nor create-adapter ever emits it (kinetic_sync_v1 is symmetric, update_v1 is client-only).",
+      "lane": "CREATE-KINETIC",
+      "date": "2026-11-24"
+    },
+    {
+      "check": "one_sided_channel",
+      "symbol": "megu:accessory_v1",
+      "sites": [
+        "proto/src/channel_router.rs:156"
+      ],
+      "reason": "Router-classified accessory sync channel; exists only in the shared channel table — no server emitter, no client handler.",
+      "lane": "MOD-SYNC",
+      "date": "2026-11-24"
+    },
+    {
+      "check": "one_sided_channel",
+      "symbol": "megu:anim_v1",
+      "sites": [
+        "client-app/src/protocol.rs:25",
+        "client-kernel/src/skeletal_anim.rs:17"
+      ],
+      "reason": "Client-side skeletal-animation channel decoder exists; the server emitter lives only in live_mod_bridge test code — the channel is never sent.",
+      "lane": "ANIM-WIRE",
+      "date": "2026-11-24"
+    },
+    {
+      "check": "one_sided_channel",
+      "symbol": "megu:claims_v1",
+      "sites": [
+        "server-files/src/claims_wire.rs:52",
+        "proto/src/channel_router.rs:158"
+      ],
+      "reason": "Claims sync is router-classified and claims_wire frames exist in server tooling, but neither the live server nor the client handles the channel.",
+      "lane": "CLAIMS",
+      "date": "2026-11-24"
+    },
+    {
+      "check": "one_sided_channel",
+      "symbol": "megu:lod_v1",
+      "sites": [
+        "src/lod_protocol.rs:12"
+      ],
+      "reason": "Server LOD opt-in channel is live; client-app has the LOD codec (encode_lod_v1/decode_lod_v1) but never binds it to the channel name — the client can never opt in.",
+      "lane": "LOD-CLIENT",
+      "date": "2026-11-24"
+    },
+    {
+      "check": "one_sided_channel",
+      "symbol": "megu:media_v1",
+      "sites": [
+        "proto/src/channel_router.rs:157"
+      ],
+      "reason": "Router-classified media transfer channel; shared-table entry only, no producer or consumer.",
+      "lane": "MOD-SYNC",
+      "date": "2026-11-24"
+    },
+    {
+      "check": "one_sided_channel",
+      "symbol": "megu:mod_sync_v1",
+      "sites": [
+        "mod-adapter-core/src/mod_sync.rs:69",
+        "proto/src/channel_router.rs:154",
+        "src/live_mod_bridge.rs",
+        "src/play_protocol.rs"
+      ],
+      "reason": "Server-side mod-sync channel constant exists in mod_sync + bridge emission paths; no client-side handler ever references it.",
+      "lane": "MOD-SYNC",
+      "date": "2026-11-24"
+    },
+    {
+      "check": "one_sided_channel",
+      "symbol": "megu:vfx_v1",
+      "sites": [
+        "client-app/src/protocol.rs:24",
+        "client-port/src/vfx_engine.rs:12"
+      ],
+      "reason": "Client VFX channel decoder + engine exist; server emitter for megu:vfx_v1 lives only in test code.",
+      "lane": "VFX-WIRE",
+      "date": "2026-11-24"
+    },
+    {
+      "check": "unwired_subsystem_entry",
+      "symbol": "drain_sync_deltas",
+      "file": "mod-adapter-core/src/culinary_adapter.rs",
+      "line": 1579,
+      "reason": "CookingPotCluster sync-delta drain staged for the mod-sync window; only mod_tick_runtime_tests calls it.",
+      "lane": "MOD-SUITE-WIRE",
+      "date": "2026-11-24"
+    },
+    {
+      "check": "unwired_subsystem_entry",
+      "symbol": "to_sync_entry",
+      "file": "mod-adapter-core/src/dep_resolver.rs",
+      "line": 569,
+      "reason": "ResolvedMod -> ModSyncEntry projection staged for the MRS1 manifest; no sync path projects entries.",
+      "lane": "MOD-SYNC",
+      "date": "2026-11-24"
+    },
+    {
+      "check": "unwired_subsystem_entry",
+      "symbol": "decode_registry_sync_frame",
+      "file": "mod-adapter-core/src/live_registry_bridge.rs",
+      "line": 325,
+      "reason": "MRS1 mod-registry frame decode staged for the live registry sync wire (already module-waived in wiring_audit_unwired.json); the only callers are tests.",
+      "lane": "MOD-SYNC",
+      "date": "2026-11-24"
+    },
+    {
+      "check": "unwired_subsystem_entry",
+      "symbol": "decode_sync_manifest",
+      "file": "mod-adapter-core/src/mod_sync.rs",
+      "line": 840,
+      "reason": "MSY1 manifest decode staged for the mod-sync download path; only fuzz/test callers exist.",
+      "lane": "MOD-SYNC",
+      "date": "2026-11-24"
+    },
+    {
+      "check": "unwired_subsystem_entry",
+      "symbol": "mod_offload_sync_antixray_tags",
+      "file": "src/mod_offload_bridge.rs",
+      "line": 1342,
+      "reason": "Antixray ore/chest tag fold staged for create-offload worldgen; never folded into generated chunks.",
+      "lane": "CREATE-OFFLOAD-LIVE",
+      "date": "2026-11-24"
+    }
+  ]
+}
