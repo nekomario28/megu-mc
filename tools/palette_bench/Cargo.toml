@@ -8,6 +8,9 @@ publish = false
 [workspace]
 
 [dependencies]
+# build.rs inlines src/paletted.rs, which calls megu_core::bits — the crate
+# needs the real dependency, not just the generated adapter.
+megu_core = { package = "megu-core", path = "../../core" }
 
 [profile.release]
 opt-level = 3

@@ -197,9 +197,7 @@ cargo test --manifest-path server-files/Cargo.toml --offline --locked -j 2
 cargo test --manifest-path core/Cargo.toml --offline --locked -j 2
 
 echo "== tools crates"
-# tools/palette_bench is intentionally absent: it does not compile on main
-# (the build.rs-generated adapter uses megu_core but its Cargo.toml declares
-# no dependency). Add it back once that manifest is fixed.
+cargo check --manifest-path tools/palette_bench/Cargo.toml --offline --locked -j 2
 cargo check --manifest-path tools/storage_bench/Cargo.toml --offline --locked -j 2
 cargo check --manifest-path tools/offload_ffi_probe/Cargo.toml --offline --locked -j 2
 

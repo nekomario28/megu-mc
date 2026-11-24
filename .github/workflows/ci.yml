@@ -112,11 +112,9 @@ jobs:
           echo "=== client-gpu (clippy + test) ==="
           cargo clippy --manifest-path client-gpu/Cargo.toml --all-targets --locked -- -D warnings
           cargo test --manifest-path client-gpu/Cargo.toml --locked
-      # tools/palette_bench is deliberately absent: it does not compile on main
-      # (the build.rs-generated adapter uses megu_core but its Cargo.toml
-      # declares no dependency). Add it back once that manifest is fixed.
       - name: Tools crates compile (locked)
         run: |
+          cargo check --manifest-path tools/palette_bench/Cargo.toml --locked
           cargo check --manifest-path tools/storage_bench/Cargo.toml --locked
           cargo check --manifest-path tools/offload_ffi_probe/Cargo.toml --locked
       - name: Build (locked)

@@ -5,15 +5,9 @@ name: Dependency audit
 #
 # Every committed Cargo.lock / standalone manifest is audited, not just the root
 # one — client-gpu alone carries ~235 crates that the root lockfile never sees.
-# `checks` differs per crate only where a pre-existing violation would fail the
-# job today; each carve-out names what must change to restore the full check:
-#   * client-port — bans: megu-client-mesh has no `publish = false` but keeps a
-#     path-only dependency, which cargo-deny rejects as a wildcard. Adding
-#     `publish = false` to client-port/Cargo.toml restores bans.
-#   * client-app, client-gpu — bans fails transitively through client-port
-#     above; licenses fails on symphonia 0.5.5 (MPL-2.0), which deny.toml's
-#     allow list does not cover yet. An MPL-2.0 decision in deny.toml restores
-#     licenses; the client-port fix restores bans.
+# All 16 manifests run the full check set; former carve-outs were restored by
+# marking client-port `publish = false`, allowing MPL-2.0 (symphonia) in
+# deny.toml, and adding the missing megu-core dependency to palette_bench.
 on:
   pull_request:
     branches: [main]
@@ -53,13 +47,13 @@ jobs:
           - manifest: client-kernel/Cargo.toml
             checks: advisories licenses bans sources
           - manifest: client-port/Cargo.toml
-            checks: advisories licenses sources
+            checks: advisories licenses bans sources
           - manifest: client-ui/Cargo.toml
             checks: advisories licenses bans sources
           - manifest: client-app/Cargo.toml
-            checks: advisories sources
+            checks: advisories licenses bans sources
           - manifest: client-gpu/Cargo.toml
-            checks: advisories sources
+            checks: advisories licenses bans sources
           - manifest: tools/palette_bench/Cargo.toml
             checks: advisories licenses bans sources
           - manifest: tools/storage_bench/Cargo.toml
