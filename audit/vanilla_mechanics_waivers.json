@@ -94,48 +94,6 @@
       "reason": "1.21.1 post-death wind-burst behaviour is not implemented; registry only."
     }
   },
-  "unavailable_mob_ai_goal": {
-    "BreakDoorGoal": {
-      "owner": "mob-ai-lane",
-      "reason": "Mob-AI goal is still an Unavailable(...) placeholder; the vanilla goal behaviour is not implemented."
-    },
-    "FleeSunGoal": {
-      "owner": "mob-ai-lane",
-      "reason": "Mob-AI goal is still an Unavailable(...) placeholder; the vanilla goal behaviour is not implemented."
-    },
-    "LeapAtTargetGoal": {
-      "owner": "mob-ai-lane",
-      "reason": "Mob-AI goal is still an Unavailable(...) placeholder; the vanilla goal behaviour is not implemented."
-    },
-    "MoveThroughVillageGoal": {
-      "owner": "mob-ai-lane",
-      "reason": "Mob-AI goal is still an Unavailable(...) placeholder; the vanilla goal behaviour is not implemented."
-    },
-    "RandomLookAroundGoal": {
-      "owner": "mob-ai-lane",
-      "reason": "Mob-AI goal is still an Unavailable(...) placeholder; the vanilla goal behaviour is not implemented."
-    },
-    "RangedBowAttackGoal": {
-      "owner": "mob-ai-lane",
-      "reason": "Mob-AI goal is still an Unavailable(...) placeholder; the vanilla goal behaviour is not implemented."
-    },
-    "RestrictSunGoal": {
-      "owner": "mob-ai-lane",
-      "reason": "Mob-AI goal is still an Unavailable(...) placeholder; the vanilla goal behaviour is not implemented."
-    },
-    "SpiderAttackGoal": {
-      "owner": "mob-ai-lane",
-      "reason": "Mob-AI goal is still an Unavailable(...) placeholder; the vanilla goal behaviour is not implemented."
-    },
-    "ZombieAttackGoal": {
-      "owner": "mob-ai-lane",
-      "reason": "Mob-AI goal is still an Unavailable(...) placeholder; the vanilla goal behaviour is not implemented."
-    },
-    "ZombieAttackTurtleEggGoal": {
-      "owner": "mob-ai-lane",
-      "reason": "Mob-AI goal is still an Unavailable(...) placeholder; the vanilla goal behaviour is not implemented."
-    }
-  },
   "unconsumed_gamerule": {
     "doLimitedCrafting": {
       "owner": "crafting-lane",
