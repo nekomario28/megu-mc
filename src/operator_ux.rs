@@ -4067,6 +4067,7 @@ impl RemoteControlServer {
             let _ = stream.write_all(head.as_bytes());
             let _ = stream.write_all(&reply.body);
             let _ = stream.flush();
+            let _ = stream.shutdown(std::net::Shutdown::Write);
             if let Some(action) = reply.action {
                 actions.push(action);
             }
@@ -4821,9 +4822,14 @@ mod operator_ux_admin_core_tests {
             .set_read_timeout(Some(Duration::from_secs(5)))
             .unwrap();
         client.write_all(request.as_bytes()).unwrap();
+        let _ = client.shutdown(std::net::Shutdown::Write);
         let actions = srv.poll_once(&|| "{\"tps\":20.0}".to_string());
         let mut reply = String::new();
-        client.read_to_string(&mut reply).unwrap();
+        match client.read_to_string(&mut reply) {
+            Ok(_) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::ConnectionReset && !reply.is_empty() => {}
+            Err(e) => panic!("remote_request read failed: {e}"),
+        }
         (reply, actions)
     }
 
