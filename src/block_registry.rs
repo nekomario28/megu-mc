@@ -848,6 +848,18 @@ impl BReg {
         let create = create_adapter::blockstates::core_create_registry(
             create_adapter::blockstates::DEFAULT_BASE_STATE_ID,
         );
+        self.extend_create_registry(create);
+    }
+    /// The work of [`BReg::extend_mod_blocks`] once the armed Create
+    /// registry is built: appends its blocks and expanded states to the
+    /// dense columns, derives each state's physical facts from the block id
+    /// and property pairs via [`derive_mod_block_facts`], then grows the tag
+    /// bitsets so `in_tag` covers the modded block indices.
+    #[cfg(feature = "mod-suite")]
+    fn extend_create_registry(
+        &mut self,
+        create: create_adapter::blockstates::CreateBlockRegistry,
+    ) {
         let base = create.base_state_id() as usize;
         if self.st_blk.len() > base {
             // A vanilla table that already reaches into the mod range would
@@ -866,10 +878,19 @@ impl BReg {
         self.light.resize(need, 0);
         self.postproc.resize(need, 0);
         self.faces.resize(need, 0);
-        let pred = FACT_BLOCKS_MOTION | FACT_SOLID_RENDER | FACT_FLUID_EMPTY
-            | FACT_COLLISION_EMPTY;
+        // The state-id-indexed byte tables are boxed slices; grow them too so
+        // the derived rows land instead of reading as absent-table defaults.
+        let mut predicates = std::mem::take(&mut self.predicates).into_vec();
+        predicates.resize(need, 0);
+        self.predicates = predicates.into_boxed_slice();
+        let mut template_solid = std::mem::take(&mut self.template_solid).into_vec();
+        template_solid.resize(need, 0);
+        self.template_solid = template_solid.into_boxed_slice();
+        let mut full_cube: Option<u16> = None;
+        let mut mod_block_ids = Vec::with_capacity(create.blocks().len());
         for (ci, def) in create.blocks().iter().enumerate() {
             let bi = self.bname.len() as u32;
+            mod_block_ids.push(bi);
             self.idx.insert(def.id.clone(), bi);
             self.bname.push(def.id.clone());
             self.props.push(
@@ -892,7 +913,25 @@ impl BReg {
                 self.hardness[st] = 1.0;
                 self.drops[st] = live_create_block_item_id(&def.id);
                 self.stack_size[st] = 64;
-                self.pred[st] = pred;
+                let facts = derive_mod_block_facts(&def.id, &entry.properties);
+                self.pred[st] = facts.pred;
+                self.light[st] = facts.light;
+                self.faces[st] = facts.faces;
+                self.predicates[st] = facts.native;
+                if facts.pred & FACT_COLLISION_FULL != 0 {
+                    // A full-collision modded block is a template solid and
+                    // collides with the unit cube, so entities and
+                    // fence/pane/wall connection updates treat it like any
+                    // other opaque cube.
+                    self.template_solid[st] = 1;
+                    let shape = *full_cube.get_or_insert_with(|| {
+                        self.shapes.push(([0.0; 3], [1.0; 3]));
+                        (self.shapes.len() - 1) as u16
+                    });
+                    let start = self.col_idx.len() as u32;
+                    self.col_idx.push(shape);
+                    self.col_range[st] = (start, 1);
+                }
                 n += 1;
             }
             self.n_states.push(n);
@@ -900,7 +939,42 @@ impl BReg {
             self.tool_kind.push(2); // pickaxe family
             self.behaviour.push(B_NONE);
         }
+        // The tag bitsets were sized for the vanilla block list before this
+        // extension ran; grow each to cover the appended indices, then tag
+        // every modded block under the vanilla names its id implies
+        // (`*_planks` -> `minecraft:planks`, a solid `*_casing` ->
+        // `minecraft:mineable/pickaxe`), so `in_tag` answers for modded
+        // states instead of reading past the bitsets' end.
+        let words = self.bname.len().div_ceil(64);
+        for bits in self.tag_bits.iter_mut() {
+            let mut grown = std::mem::take(bits).into_vec();
+            grown.resize(words, 0);
+            *bits = grown.into_boxed_slice();
+        }
+        for &bi in &mod_block_ids {
+            let id = self.bname[bi as usize].clone();
+            let path = id.rsplit(':').next().unwrap_or(&id);
+            for tag in mod_block_tag_names(path, mod_block_shape(path)) {
+                let tid = self.tag_id_or_insert(tag, words);
+                self.tag_bits[tid as usize][(bi >> 6) as usize] |= 1u64 << (bi & 63);
+                self.tag_order.entry(tag.to_string()).or_default().push(bi);
+            }
+        }
         self.create_reg = Some(create);
+    }
+    /// The dense id of `tag`, creating the tag's name row, empty bitset and
+    /// lookup entry when the pack did not declare it — modded-only tags
+    /// such as `minecraft:mineable/pickaxe` for a stripped pack.
+    #[cfg(feature = "mod-suite")]
+    fn tag_id_or_insert(&mut self, tag: &'static str, words: usize) -> u32 {
+        if let Some(&id) = self.tag_ids.get(tag) {
+            return id;
+        }
+        let id = self.tag_names.len() as u32;
+        self.tag_names.push(tag.into());
+        self.tag_bits.push(vec![0u64; words].into_boxed_slice());
+        self.tag_ids.insert(tag.to_string(), id);
+        id
     }
     /// The armed Create registry, when the mod-suite extension ran.
     #[cfg(feature = "mod-suite")]
@@ -1806,6 +1880,272 @@ impl BReg {
     }
 }
 
+// ---------- dynamic mod block facts (`mod-suite`) ----------
+//
+// A dynamically registered block arrives with no generated fact-table row, so
+// `extend_create_registry` derives per-state physical facts from the block id
+// and this state's property pairs. The derivation is namespace-agnostic and
+// generic — name and property vocabulary only, never a mod id — so any mod
+// block registered through this path gets vanilla-like opacity, luminance,
+// collision, face sturdiness and tag membership without a per-mod table.
+
+/// Shape family a mod block's id implies. First match wins, in the order
+/// [`mod_block_shape`] checks them.
+#[cfg(feature = "mod-suite")]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ModShape {
+    /// Torches, rails, plants and wire: no collision, no opacity.
+    Empty,
+    /// Glassy fittings and thin mechanical mounts block motion without a
+    /// full-cube collision and pass light.
+    Thin,
+    /// Slabs, stairs, fences and friends cover part of the cube and dim
+    /// light by one level.
+    Partial,
+    /// `*leaves*`: a full-cube body that still passes most light.
+    Leaves,
+    /// Fluid blocks by name (`*_water`, `*_lava`, `*_fluid`, `*_liquid`).
+    Liquid,
+    /// The default: an opaque full cube.
+    Full,
+}
+
+/// Classify a mod block by its path (the part after `namespace:`). The
+/// keyword lists are deliberately generic; an unrecognised block answers
+/// `Full`, the safe opaque-cube default.
+#[cfg(feature = "mod-suite")]
+fn mod_block_shape(path: &str) -> ModShape {
+    // `_block` names are cubes first: `grass_block` must not read as `grass`.
+    if path == "block" || path.ends_with("_block") {
+        return ModShape::Full;
+    }
+    // Suffixes, not substrings: `fluid_pipe` and `water_wheel` are mounts,
+    // not fluids.
+    if ["water", "lava", "fluid", "liquid"]
+        .iter()
+        .any(|k| path.ends_with(k))
+    {
+        return ModShape::Liquid;
+    }
+    if path.contains("leaves") {
+        return ModShape::Leaves;
+    }
+    // Empty-collision fittings: they stop neither light nor entities.
+    const EMPTY: &[&str] = &[
+        "torch", "rail", "flower", "sapling", "crop", "vine", "wire", "button",
+        "lever", "sign", "banner", "candle", "mushroom", "fern", "coral",
+        "reed", "lichen", "grass", "plant", "seed",
+    ];
+    if EMPTY.iter().any(|k| path.contains(k)) {
+        return ModShape::Empty;
+    }
+    // Thin mounts and glassy fittings block motion — usually carrying the
+    // machine's working parts — without a full-cube collision.
+    const THIN: &[&str] = &[
+        "glass", "pane", "grate", "bars", "chain", "lantern", "pipe", "shaft",
+        "belt", "cogwheel", "wheel", "funnel", "chute", "spout", "depot",
+        "basin", "pump", "bearing", "ladder", "scaffold", "frame",
+        "pressure_plate", "door", "trapdoor", "hopper", "cauldron", "anvil",
+        "conduit",
+    ];
+    if THIN.iter().any(|k| path.contains(k)) {
+        return ModShape::Thin;
+    }
+    // Partial occluders cover part of the cube; `bed` is a suffix so
+    // `bedrock` still reads as the full cube it is.
+    const PARTIAL: &[&str] = &[
+        "slab", "stair", "fence", "wall", "carpet", "snow", "path", "farmland",
+    ];
+    if PARTIAL.iter().any(|k| path.contains(k)) || path.ends_with("_bed") {
+        return ModShape::Partial;
+    }
+    ModShape::Full
+}
+
+/// Emission a mod block state's name implies, before properties adjust it:
+/// `magma` is a dull 7, the rest of the emitter vocabulary a torch-like 14.
+/// `lit`/`powered`/`blaze` properties then raise or clear it per state.
+#[cfg(feature = "mod-suite")]
+fn mod_state_luminance(path: &str, prop_pairs: &[(String, String)]) -> u8 {
+    let base = if path.contains("magma") {
+        7
+    } else if [
+        "lamp",
+        "lantern",
+        "torch",
+        "glow",
+        "blaze_burner",
+        "light",
+        "crystal",
+        "luminous",
+        "forge",
+    ]
+    .iter()
+    .any(|k| path.contains(k))
+    {
+        14
+    } else {
+        0
+    };
+    let mut luminance = base;
+    for (key, value) in prop_pairs {
+        match (key.as_str(), value.as_str()) {
+            ("lit", "true") => luminance = 15,
+            ("lit", _) => luminance = 0,
+            ("blaze", level) => {
+                luminance = match level {
+                    "seething" => 15,
+                    "kindled" => 11,
+                    "smouldering" => 7,
+                    _ => 0,
+                }
+            }
+            // `powered` only lights blocks that read as lamps or burners.
+            ("powered", "true") if base > 0 => luminance = 15,
+            _ => {}
+        }
+    }
+    luminance.min(15)
+}
+
+/// The resolved per-state facts `extend_create_registry` writes into the
+/// dense columns.
+#[cfg(feature = "mod-suite")]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct ModBlockFacts {
+    /// The packed predicate byte (`pred` column).
+    pub(crate) pred: u8,
+    /// The packed light byte, `emission << 4 | opacity`.
+    pub(crate) light: u8,
+    /// The three `Support` face planes (`faces` column).
+    pub(crate) faces: u32,
+    /// The `native_predicates` byte: heightmap bits plus the water pair.
+    pub(crate) native: u8,
+}
+
+/// Derive one modded state's physical facts from its block id and resolved
+/// property pairs. Full solids answer like vanilla stone: opacity 15,
+/// `BLOCKS_MOTION | SOLID_RENDER | COLLISION_FULL | FLUID_EMPTY`, all six
+/// faces sturdy on every support plane, so sunlight is blocked, entities
+/// collide, redstone conducts and torches/rails/buttons attach. Decorative
+/// shapes answer the transparent/partial facts their family implies, and
+/// `waterlogged=true` always clears the empty-fluid bit.
+#[cfg(feature = "mod-suite")]
+pub(crate) fn derive_mod_block_facts(
+    block_id: &str,
+    prop_pairs: &[(String, String)],
+) -> ModBlockFacts {
+    let path = block_id.rsplit(':').next().unwrap_or(block_id);
+    let shape = mod_block_shape(path);
+    let waterlogged = prop_pairs
+        .iter()
+        .any(|(k, v)| k == "waterlogged" && v == "true");
+    let mut opacity = match shape {
+        ModShape::Empty | ModShape::Thin => 0,
+        ModShape::Partial | ModShape::Leaves | ModShape::Liquid => 1,
+        ModShape::Full => 15,
+    };
+    if waterlogged {
+        opacity = opacity.max(1);
+    }
+    let mut pred = match shape {
+        ModShape::Empty => FACT_COLLISION_EMPTY | FACT_FLUID_EMPTY,
+        ModShape::Thin | ModShape::Partial => FACT_BLOCKS_MOTION | FACT_FLUID_EMPTY,
+        ModShape::Leaves => {
+            FACT_BLOCKS_MOTION | FACT_SOLID_RENDER | FACT_COLLISION_FULL
+                | FACT_FLUID_EMPTY
+        }
+        ModShape::Liquid => FACT_LIQUID | FACT_COLLISION_EMPTY,
+        ModShape::Full => {
+            FACT_BLOCKS_MOTION | FACT_SOLID_RENDER | FACT_FLUID_EMPTY
+                | FACT_COLLISION_FULL
+        }
+    };
+    if waterlogged {
+        pred &= !FACT_FLUID_EMPTY;
+    }
+    let faces = match shape {
+        ModShape::Full | ModShape::Leaves => 0x003f_3f3f,
+        _ => 0,
+    };
+    // `native_predicates`: WORLD_SURFACE counts every non-air state,
+    // OCEAN_FLOOR and MOTION_BLOCKING count colliders and fluids with the
+    // no-leaves variant skipping Leaves, and bits 64/128 mark water
+    // carriers (a waterlogged mount or a `*_water` fluid).
+    let mut native = 2;
+    if pred & FACT_BLOCKS_MOTION != 0 || pred & FACT_LIQUID != 0 {
+        native |= 4 | 8;
+        if shape != ModShape::Leaves {
+            native |= 16;
+        }
+    }
+    if waterlogged || path.ends_with("water") {
+        native |= 64 | 128;
+    }
+    ModBlockFacts {
+        pred,
+        light: (mod_state_luminance(path, prop_pairs) << 4) | (opacity & 0x0f),
+        faces,
+        native,
+    }
+}
+
+/// The vanilla block tags a modded block's id implies, namespace-agnostic:
+/// `*_planks` -> `minecraft:planks`, `*_leaves` -> `minecraft:leaves`,
+/// `*_ore` and solid blocks -> `minecraft:mineable/pickaxe`, wood-family
+/// solids -> `minecraft:mineable/axe`.
+#[cfg(feature = "mod-suite")]
+fn mod_block_tag_names(path: &str, shape: ModShape) -> Vec<&'static str> {
+    let mut tags = Vec::new();
+    if path.contains("leaves") {
+        tags.push("minecraft:leaves");
+        tags.push("minecraft:mineable/hoe");
+    }
+    if path.ends_with("_bed") {
+        tags.push("minecraft:beds");
+    }
+    if path.ends_with("_planks") {
+        tags.push("minecraft:planks");
+    }
+    if path.ends_with("_log") || path.ends_with("_logs") {
+        tags.push("minecraft:logs");
+    }
+    if path.ends_with("_slab") {
+        tags.push("minecraft:slabs");
+    }
+    if path.ends_with("_stairs") {
+        tags.push("minecraft:stairs");
+    }
+    if path.ends_with("_fence") {
+        tags.push("minecraft:fences");
+    }
+    if path.ends_with("_fence_gate") {
+        tags.push("minecraft:fence_gates");
+    }
+    if path.ends_with("_wall") {
+        tags.push("minecraft:walls");
+    }
+    if path.ends_with("_door") {
+        tags.push("minecraft:doors");
+    }
+    if path.ends_with("_trapdoor") {
+        tags.push("minecraft:trapdoors");
+    }
+    if path.ends_with("_rail") {
+        tags.push("minecraft:rails");
+    }
+    let woody =
+        path.contains("plank") || path.ends_with("_log") || path.contains("wood");
+    if path.ends_with("_ore") || matches!(shape, ModShape::Full | ModShape::Partial) {
+        tags.push(if woody {
+            "minecraft:mineable/axe"
+        } else {
+            "minecraft:mineable/pickaxe"
+        });
+    }
+    tags
+}
+
 fn dp_tag_files(sub: &str) -> HashMap<String, Vec<u8>> {
     let mut m = HashMap::new();
     let base = std::path::Path::new("datapacks");
@@ -1995,5 +2335,183 @@ mod version_asset_tests {
         assert_eq!(paths.block_predicates, dir.join("block_predicates.bin"));
         assert_eq!(paths.template_solid, dir.join("template_solid.bin"));
         let _ = std::fs::remove_dir_all(&dir);
+    }
+}
+
+/// Modded-state fact derivation and the `extend_create_registry` wiring.
+/// The fixtures build a bare `BReg` — no vanilla pack needed — so they run
+/// on strict-public exports too.
+#[cfg(all(test, feature = "mod-suite"))]
+mod mod_block_facts_tests {
+    use super::*;
+    use create_adapter::blockstates::{core_create_registry, DEFAULT_BASE_STATE_ID};
+
+    fn empty_breg() -> BReg {
+        BReg {
+            bname: vec![],
+            idx: HashMap::new(),
+            props: vec![],
+            dfl: vec![],
+            st_lo: vec![],
+            n_states: vec![],
+            st_blk: vec![],
+            st_fl: vec![],
+            hardness: vec![],
+            htools: vec![],
+            tool_kind: vec![],
+            unpaired: vec![],
+            drops: vec![],
+            drops_second: vec![],
+            stack_size: vec![],
+            behaviour: vec![],
+            shapes: vec![],
+            col_range: vec![],
+            col_idx: vec![],
+            pred: vec![],
+            light: vec![],
+            postproc: vec![],
+            faces: vec![],
+            tag_names: vec![],
+            tag_bits: vec![],
+            tag_ids: HashMap::default(),
+            tag_cache: std::array::from_fn(|_| AtomicU64::new(0)),
+            tag_order: HashMap::new(),
+            facts: Vec::new().into_boxed_slice(),
+            predicates: Vec::new().into_boxed_slice(),
+            mineshaft: Vec::new().into_boxed_slice(),
+            multiface: Vec::new().into_boxed_slice(),
+            template_solid: Vec::new().into_boxed_slice(),
+            create_reg: None,
+        }
+    }
+
+    fn create_breg() -> BReg {
+        let mut reg = empty_breg();
+        reg.extend_create_registry(core_create_registry(DEFAULT_BASE_STATE_ID));
+        reg
+    }
+
+    /// A full solid modded block must behave like vanilla stone: opaque,
+    /// full collision, all faces sturdy, redstone-conducting, and inside
+    /// the pickaxe-mineable tag — the facts the zero-filled extension lost.
+    #[test]
+    fn modded_solid_blocks_are_opaque_sturdy_conducting_and_tagged() {
+        let reg = create_breg();
+        let casing = reg.state_of("create:andesite_casing", None);
+        assert!(casing >= DEFAULT_BASE_STATE_ID);
+        assert_eq!(reg.opacity_of(casing), 15);
+        assert_eq!(reg.luminance_of(casing), 0);
+        assert!(reg.is_solid_render(casing));
+        assert!(reg.is_collision_shape_full_block(casing));
+        assert!(!reg.is_collision_empty(casing));
+        assert!(reg.is_redstone_conductor(casing));
+        for direction in 0..6 {
+            assert!(
+                reg.is_face_sturdy(casing, direction, Support::Full),
+                "direction {direction} must support torches and rails"
+            );
+            assert!(reg.side_solid(casing, direction as usize));
+        }
+        // A full-collision modded block collides with the unit cube and is
+        // a template solid for structure connection updates.
+        assert_eq!(reg.collision_boxes(casing).count(), 1);
+        assert_eq!(reg.is_template_solid(casing), Some(true));
+        assert!(reg.in_tag(casing, "minecraft:mineable/pickaxe"));
+        assert!(reg.tag_members("minecraft:mineable/pickaxe").contains(
+            &(reg.st_blk[casing as usize])
+        ));
+    }
+
+    /// Decorative mounts keep their partial facts: a shaft passes light,
+    /// has no full-cube collision, conducts no redstone and is not sturdy,
+    /// while `waterlogged=true` still reports its carried fluid.
+    #[test]
+    fn modded_thin_blocks_stay_transparent_and_non_conducting() {
+        let reg = create_breg();
+        let shaft = reg.state_of(
+            "create:shaft",
+            Some(&mkprops(&[("axis", "y"), ("waterlogged", "false")])),
+        );
+        assert!(shaft >= DEFAULT_BASE_STATE_ID);
+        assert_eq!(reg.opacity_of(shaft), 0);
+        assert_eq!(reg.luminance_of(shaft), 0);
+        assert!(reg.blocks_motion(shaft));
+        assert!(!reg.is_solid_render(shaft));
+        assert!(!reg.is_collision_shape_full_block(shaft));
+        assert!(!reg.is_redstone_conductor(shaft));
+        for direction in 0..6 {
+            assert!(!reg.is_face_sturdy(shaft, direction, Support::Full));
+        }
+        assert!(!reg.in_tag(shaft, "minecraft:mineable/pickaxe"));
+        let wet = reg.state_of(
+            "create:shaft",
+            Some(&mkprops(&[("axis", "y"), ("waterlogged", "true")])),
+        );
+        assert!(reg.is_liquid(wet));
+        assert_eq!(reg.fluid_name(wet), "minecraft:water");
+    }
+
+    /// The derivation itself: emitters light up, `lit`/`blaze`/`powered`
+    /// adjust per state, glass passes light, partial shapes dim it by one,
+    /// and `*_block`/unknown names stay opaque cubes.
+    #[test]
+    fn derived_facts_follow_names_and_properties_generically() {
+        let lum = |id: &str, props: &[(&str, &str)]| {
+            let pairs: Vec<(String, String)> = props
+                .iter()
+                .map(|(k, v)| (k.to_string(), v.to_string()))
+                .collect();
+            derive_mod_block_facts(id, &pairs).light >> 4
+        };
+        assert_eq!(lum("mymod:rose_lamp", &[]), 14);
+        assert_eq!(lum("mymod:glow_panel", &[]), 14);
+        assert_eq!(lum("mymod:magma_vent", &[]), 7);
+        assert_eq!(lum("mymod:arc_lamp", &[("lit", "true")]), 15);
+        assert_eq!(lum("mymod:arc_lamp", &[("lit", "false")]), 0);
+        assert_eq!(lum("mymod:arc_lamp", &[("powered", "true")]), 15);
+        assert_eq!(lum("mymod:plain_box", &[("powered", "true")]), 0);
+        assert_eq!(
+            lum("create:blaze_burner", &[("blaze", "kindled")]),
+            11
+        );
+        assert_eq!(lum("create:blaze_burner", &[("blaze", "none")]), 0);
+
+        let glass = derive_mod_block_facts("mymod:framed_glass", &[]);
+        assert_eq!(glass.light & 0x0f, 0);
+        assert_ne!(glass.pred & FACT_BLOCKS_MOTION, 0);
+        assert_eq!(glass.pred & FACT_COLLISION_FULL, 0);
+        assert_eq!(glass.faces, 0);
+        let slab = derive_mod_block_facts("mymod:basalt_slab", &[]);
+        assert_eq!(slab.light & 0x0f, 1);
+        assert_eq!(slab.pred & FACT_COLLISION_FULL, 0);
+        let ore = derive_mod_block_facts("mymod:tin_ore", &[]);
+        assert_eq!(ore.light & 0x0f, 15);
+        assert_eq!(ore.faces, 0x003f_3f3f);
+        // `grass_block`/`bedrock` must not read as `grass`/`bed`.
+        assert_eq!(mod_block_shape("grass_block"), ModShape::Full);
+        assert_eq!(mod_block_shape("bedrock"), ModShape::Full);
+        assert_eq!(mod_block_shape("fluid_pipe"), ModShape::Thin);
+        assert_eq!(mod_block_shape("water_wheel"), ModShape::Thin);
+        assert_eq!(mod_block_shape("sump_water"), ModShape::Liquid);
+        // Tag vocabulary is namespace-agnostic.
+        assert!(mod_block_tag_names("oak_planks", ModShape::Full)
+            .contains(&"minecraft:planks"));
+        assert!(mod_block_tag_names("palm_leaves", ModShape::Leaves)
+            .contains(&"minecraft:leaves"));
+        assert!(mod_block_tag_names("tin_ore", ModShape::Full)
+            .contains(&"minecraft:mineable/pickaxe"));
+        assert!(mod_block_tag_names("cedar_planks", ModShape::Full)
+            .contains(&"minecraft:mineable/axe"));
+    }
+
+    /// A vanilla table already reaching the mod range refuses the
+    /// extension rather than corrupting both id spaces.
+    #[test]
+    fn extension_refuses_a_colliding_base() {
+        let mut reg = empty_breg();
+        reg.st_blk = vec![0; DEFAULT_BASE_STATE_ID as usize + 1];
+        reg.extend_create_registry(core_create_registry(DEFAULT_BASE_STATE_ID));
+        assert!(reg.create_reg.is_none());
+        assert_eq!(reg.state_count(), DEFAULT_BASE_STATE_ID as usize + 1);
     }
 }

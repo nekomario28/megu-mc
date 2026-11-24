@@ -5,7 +5,7 @@ use crate::{
     Error, STATE_COUNT,
 };
 use megu_core::id::ResourceLocation;
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
 
@@ -235,12 +235,24 @@ pub struct BlockFacts {
     pub face_occlusion: [u8; 6],
 }
 
+/// Bound on registered mod states, mirroring [`MAX_DERIVED_STATES`]: the
+/// overlay is populated from synced data, so a hostile source cannot make
+/// the map itself the attack.
+const MAX_MOD_STATES: usize = 1 << 20;
+
 /// Read-only block-state registry for one Minecraft version's pack.
 pub struct Registry {
     names: Vec<String>,
     first_states: Vec<u32>,
     by_name: HashMap<String, u32>,
     facts: Vec<BlockFacts>,
+    /// Dynamic overlay for modded block states, populated by
+    /// [`Registry::register_mod_block_facts`] /
+    /// [`Registry::extend_mod_block_facts`]. Modded state ids live above
+    /// the pack's own table; [`Registry::facts`] consults this map only
+    /// for ids the pack does not cover, so vanilla answers can never be
+    /// shadowed.
+    mod_facts: BTreeMap<u32, BlockFacts>,
 }
 
 fn parse(json: &[u8]) -> Result<J, Error> {
@@ -641,6 +653,7 @@ impl Registry {
             first_states,
             by_name,
             facts,
+            mod_facts: BTreeMap::new(),
         })
     }
 
@@ -673,10 +686,54 @@ impl Registry {
         self.by_name.get(id.as_str()).copied()
     }
 
+    /// Register physical facts for one modded block state — the half of a
+    /// registry sync a client needs for the light engine and mesher to see
+    /// a modded wall's opacity, a modded lamp's emission and a modded
+    /// pane's face occlusion exactly. Modded state ids must sit above this
+    /// pack's own table; a registration into the vanilla range fails
+    /// closed because the pack owns it.
+    pub fn register_mod_block_facts(
+        &mut self,
+        state_id: u32,
+        facts: BlockFacts,
+    ) -> Result<(), Error> {
+        if (state_id as usize) < self.facts.len() || self.mod_facts.len() >= MAX_MOD_STATES
+        {
+            return Err(Error::InvalidArgument);
+        }
+        self.mod_facts.insert(state_id, facts);
+        Ok(())
+    }
+
+    /// Bulk registration: `facts[i]` lands at `base_state_id + i`, the
+    /// contiguous layout a synced frame's state run already has. The whole
+    /// batch is validated before any insertion so a bad range leaves the
+    /// overlay untouched.
+    pub fn extend_mod_block_facts(
+        &mut self,
+        base_state_id: u32,
+        facts: &[BlockFacts],
+    ) -> Result<(), Error> {
+        if facts.len() > MAX_MOD_STATES
+            || (base_state_id as usize) < self.facts.len()
+            || base_state_id.checked_add(facts.len() as u32).is_none()
+        {
+            return Err(Error::InvalidArgument);
+        }
+        for (index, block_facts) in facts.iter().enumerate() {
+            self.mod_facts.insert(base_state_id + index as u32, *block_facts);
+        }
+        Ok(())
+    }
+
+    /// Facts for `state`: the pack's own row inside the vanilla table, then
+    /// the mod overlay for ids above it, then `InvalidState` — the same
+    /// fail-closed answer an unknown state always got.
     pub fn facts(&self, state: u32) -> Result<BlockFacts, Error> {
         self.facts
             .get(state as usize)
             .copied()
+            .or_else(|| self.mod_facts.get(&state).copied())
             .ok_or(Error::InvalidState)
     }
 
@@ -1310,5 +1367,62 @@ mod tests {
         )
         .unwrap();
         assert!(impulse.in_fluid);
+    }
+
+    #[test]
+    fn mod_block_facts_overlay_serves_states_above_the_pack() {
+        let mut registry = Registry::from_parts(
+            &small_blocks_json(),
+            Some(small_states_json().as_slice()),
+            &small_facts_bin(),
+        )
+        .unwrap();
+        // Outside the pack: unregistered ids still fail closed.
+        assert_eq!(registry.facts(50_000), Err(Error::InvalidState));
+        // An opaque modded wall, a glowing modded lamp, a transparent
+        // modded glass — the three light answers the sync carries.
+        let wall = BlockFacts {
+            opacity: 15,
+            is_solid_render: 1,
+            can_occlude: 1,
+            blocks_motion: 1,
+            sturdy_faces_mask: 0x3f,
+            face_occlusion: [0xf; 6],
+            ..BlockFacts::default()
+        };
+        let lamp = BlockFacts {
+            luminance: 14,
+            ..wall
+        };
+        let glass = BlockFacts {
+            blocks_motion: 1,
+            ..BlockFacts::default()
+        };
+        registry
+            .extend_mod_block_facts(50_000, &[wall, lamp])
+            .unwrap();
+        registry.register_mod_block_facts(50_002, glass).unwrap();
+        assert_eq!(registry.facts(50_000).unwrap().opacity, 15);
+        let lamp_facts = registry.facts(50_001).unwrap();
+        assert_eq!((lamp_facts.luminance, lamp_facts.opacity), (14, 15));
+        assert_eq!(registry.facts(50_002).unwrap().opacity, 0);
+        // A gap inside the modded range still fails closed.
+        assert_eq!(registry.facts(50_100), Err(Error::InvalidState));
+        // The vanilla range cannot be shadowed by the overlay.
+        assert_eq!(
+            registry.register_mod_block_facts(1, glass),
+            Err(Error::InvalidArgument)
+        );
+        assert_eq!(
+            registry.extend_mod_block_facts(0, &[wall]),
+            Err(Error::InvalidArgument)
+        );
+        assert_eq!(registry.facts(1).unwrap().opacity, 15);
+        assert_eq!(registry.facts(6), Err(Error::InvalidState));
+        // An overflowing base cannot wrap ids back into the table.
+        assert_eq!(
+            registry.extend_mod_block_facts(u32::MAX, &[wall, lamp]),
+            Err(Error::InvalidArgument)
+        );
     }
 }
