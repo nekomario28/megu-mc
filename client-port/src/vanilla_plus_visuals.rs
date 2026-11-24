@@ -381,8 +381,17 @@ pub const BETTER_GRASS_BLOCKS: &[&str] = &[
 ];
 
 /// Whether `block_id` is a grass-family block Better Grass can restyle.
+/// The canonical Vanilla entries stay in [`BETTER_GRASS_BLOCKS`]; any
+/// namespace's `*_grass_block`, `*_nylium`, `*_mycelium`, `*_podzol`, or
+/// `*_moss_block` joins them so modded terrain gets the same slope flow.
 pub fn is_better_grass_block(block_id: &str) -> bool {
-    BETTER_GRASS_BLOCKS.contains(&block_path(block_id))
+    let path = block_path(block_id);
+    BETTER_GRASS_BLOCKS.contains(&path)
+        || path.ends_with("_grass_block")
+        || path.ends_with("_nylium")
+        || path.ends_with("_mycelium")
+        || path.ends_with("_podzol")
+        || path.ends_with("_moss_block")
 }
 
 /// Resolves how a grass-family side face should render.
@@ -1349,4 +1358,46 @@ pub fn build_3d_skin_layer_part(
         );
     }
     SkinLayerResult::Extruded(mesh)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn better_grass_accepts_modded_grass_family_suffixes() {
+        // The five canonical Vanilla entries are unchanged, with or without
+        // the minecraft: namespace prefix.
+        for block in [
+            "grass_block",
+            "mycelium",
+            "podzol",
+            "crimson_nylium",
+            "warped_nylium",
+            "minecraft:grass_block",
+            "minecraft:mycelium",
+        ] {
+            assert!(is_better_grass_block(block), "{block}");
+        }
+        // Any namespace's grass-family suffixes join the list.
+        for block in [
+            "biomesoplenty:origin_grass_block",
+            "mymod:crimson_nylium",
+            "mymod:glowing_mycelium",
+            "mymod:sandy_podzol",
+            "mymod:lush_moss_block",
+        ] {
+            assert!(is_better_grass_block(block), "{block}");
+        }
+        // Non-grass blocks and bare suffix-free stems stay ineligible.
+        for block in [
+            "minecraft:stone",
+            "mymod:dirt",
+            "mymod:nylium",
+            "mymod:grass",
+            "mymod:grass_block_slab",
+        ] {
+            assert!(!is_better_grass_block(block), "{block}");
+        }
+    }
 }

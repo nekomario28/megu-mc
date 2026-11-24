@@ -93,8 +93,39 @@ fn surface_kind(world: &WorldState, pos: [i32; 3]) -> SurfaceKind {
             6837..=6868 => SurfaceKind::Vine,
             18372..=18403 => SurfaceKind::Scaffolding,
             22318 => SurfaceKind::PowderSnow,
-            _ => SurfaceKind::Normal,
+            _ => name.map(modded_surface_kind).unwrap_or(SurfaceKind::Normal),
         },
+    }
+}
+
+/// Namespace-agnostic surface classification for modded block names: any
+/// namespace's `*_ice`, `*packed_ice`, `*blue_ice`, `*slime_block`,
+/// `*honey_block`, `*soul_sand`, `*ladder*`, `*scaffold*`, `*cobweb*`, or
+/// `*_web` behaves physically like its vanilla counterpart. Exact vanilla
+/// names are matched upstream in [`surface_kind`]; this only sees registry
+/// names the exact list missed.
+fn modded_surface_kind(name: &str) -> SurfaceKind {
+    let path = name.rsplit(':').next().unwrap_or(name);
+    if path.ends_with("blue_ice") {
+        SurfaceKind::BlueIce
+    } else if path.ends_with("packed_ice") {
+        SurfaceKind::PackedIce
+    } else if path.ends_with("_ice") {
+        SurfaceKind::Ice
+    } else if path.ends_with("slime_block") {
+        SurfaceKind::Slime
+    } else if path.ends_with("honey_block") {
+        SurfaceKind::Honey
+    } else if path.ends_with("soul_sand") {
+        SurfaceKind::SoulSand
+    } else if path.contains("ladder") {
+        SurfaceKind::Ladder
+    } else if path.contains("scaffold") {
+        SurfaceKind::Scaffolding
+    } else if path.contains("cobweb") || path.ends_with("_web") {
+        SurfaceKind::Cobweb
+    } else {
+        SurfaceKind::Normal
     }
 }
 
@@ -1083,4 +1114,44 @@ fn run_session_inner(
         buckets_drawn,
         buckets_culled,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn modded_surface_names_classify_like_their_vanilla_counterparts() {
+        let cases = [
+            ("mymod:frost_ice", SurfaceKind::Ice),
+            ("mymod:packed_ice", SurfaceKind::PackedIce),
+            ("mymod:blue_ice", SurfaceKind::BlueIce),
+            ("quark:frosted_packed_ice", SurfaceKind::PackedIce),
+            ("mymod:slime_block", SurfaceKind::Slime),
+            ("mymod:sticky_slime_block", SurfaceKind::Slime),
+            ("mymod:honey_block", SurfaceKind::Honey),
+            ("mymod:soul_sand", SurfaceKind::SoulSand),
+            ("mymod:scorched_soul_sand", SurfaceKind::SoulSand),
+            ("create:andesite_ladder", SurfaceKind::Ladder),
+            ("mymod:rope_ladder_top", SurfaceKind::Ladder),
+            ("mymod:bamboo_scaffolding", SurfaceKind::Scaffolding),
+            ("mymod:scaffold_bridge", SurfaceKind::Scaffolding),
+            ("mymod:spider_web", SurfaceKind::Cobweb),
+            ("mymod:cobweb_corner", SurfaceKind::Cobweb),
+        ];
+        for (name, expected) in cases {
+            assert_eq!(modded_surface_kind(name), expected, "{name}");
+        }
+        // Names with no surface suffix stay Normal — including bare `ice`,
+        // which the vanilla exact-match arm owns upstream.
+        for name in [
+            "minecraft:ice",
+            "mymod:ice",
+            "mymod:stone",
+            "mymod:webbed",
+            "mymod:lattice",
+        ] {
+            assert_eq!(modded_surface_kind(name), SurfaceKind::Normal, "{name}");
+        }
+    }
 }

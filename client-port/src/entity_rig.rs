@@ -9,7 +9,10 @@ use std::f32::consts::{PI, TAU};
 
 use crate::vanilla_plus_3d::{ExtrudedMesh, ExtrudedQuad, MAX_UPGRADE_QUADS};
 
-/// Eight broad families of reusable procedural rigs.
+/// Broad families of reusable procedural rigs. The first eight cover the
+/// canonical Vanilla registry; [`EntityRigArchetype::GenericProxy`] is the
+/// never-invisible fallback [`classify_entity_rig_named`] assigns to modded
+/// entity names no archetype token matched.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum EntityRigArchetype {
     Biped,
@@ -20,6 +23,10 @@ pub enum EntityRigArchetype {
     Aquatic,
     ProjectileOrItem,
     VehicleOrHanging,
+    /// Compact name-hash-tinted proxy for fully novel modded entity names:
+    /// deterministic, always drawable, and unreachable from the protocol-767
+    /// `0..=129` classification path.
+    GenericProxy,
 }
 
 /// Relative head, torso, and limb sizing for procedural archetype templates.
@@ -63,11 +70,13 @@ impl EntityRigArchetype {
                 torso: 0.66,
                 limbs: 0.12,
             },
-            Self::ProjectileOrItem | Self::VehicleOrHanging => RigProportions {
-                head: 0.0,
-                torso: 1.0,
-                limbs: 0.0,
-            },
+            Self::ProjectileOrItem | Self::VehicleOrHanging | Self::GenericProxy => {
+                RigProportions {
+                    head: 0.0,
+                    torso: 1.0,
+                    limbs: 0.0,
+                }
+            }
         }
     }
 }
@@ -246,6 +255,241 @@ pub fn classify_entity_rig(entity_type_id: u16) -> Option<EntityRigSpec> {
         is_player: entity_type_id == 128,
         translucent_shell: entity_type_id == 93,
     })
+}
+
+/// Synthetic entity-type id assigned to every rig spec resolved from a modded
+/// registry name. Outside the protocol-767 `0..=129` range so the canonical
+/// vanilla table stays byte-identical and a modded spec can never alias a
+/// vanilla template.
+pub const MODDED_ENTITY_TYPE_ID: u16 = u16::MAX;
+
+/// One [`classify_entity_rig_named`] archetype family. `tokens` are
+/// `*token*` substring tests and `suffixes` are `*suffix` tail tests, both
+/// applied to the entity *path* — never the namespace — so `iceandfire:`,
+/// `twilightforest:` and any other mod id resolve identically.
+struct ModdedFamily {
+    tokens: &'static [&'static str],
+    suffixes: &'static [&'static str],
+    archetype: EntityRigArchetype,
+    default_width: f32,
+    default_height: f32,
+}
+
+/// Ordered modded-name families for [`classify_entity_rig_named`]. The first
+/// matching family wins, so specific creatures (dragons, serpents) outrank
+/// the generic biped/quadruped buckets further down.
+const MODDED_FAMILIES: &[ModdedFamily] = &[
+    ModdedFamily {
+        // Large winged quadruped: dragons, wyverns, drakes, griffins.
+        tokens: &["dragon", "wyvern", "drake", "griffin", "hippogriff", "manticore"],
+        suffixes: &[],
+        archetype: EntityRigArchetype::Avian,
+        default_width: 2.4,
+        default_height: 2.2,
+    },
+    ModdedFamily {
+        // Elongated aquatic serpent: sea serpents, leviathans, hydras.
+        tokens: &["serpent", "leviathan", "eel", "worm", "hydra"],
+        suffixes: &[],
+        archetype: EntityRigArchetype::Aquatic,
+        default_width: 1.4,
+        default_height: 1.0,
+    },
+    ModdedFamily {
+        tokens: &["shark", "whale", "squid", "dolphin", "crab", "turtle"],
+        suffixes: &["_fish"],
+        archetype: EntityRigArchetype::Aquatic,
+        default_width: 0.8,
+        default_height: 0.6,
+    },
+    ModdedFamily {
+        tokens: &[
+            "bird", "owl", "eagle", "crow", "phoenix", "bat", "fairy", "pixie", "bee",
+        ],
+        suffixes: &[],
+        archetype: EntityRigArchetype::Avian,
+        default_width: 0.7,
+        default_height: 0.9,
+    },
+    ModdedFamily {
+        tokens: &[
+            "spider", "insect", "ant", "beetle", "scorpion", "mantis", "wasp",
+        ],
+        suffixes: &[],
+        archetype: EntityRigArchetype::Arthropod,
+        default_width: 0.9,
+        default_height: 0.5,
+    },
+    ModdedFamily {
+        tokens: &["slime", "cube", "jelly", "ooze"],
+        suffixes: &[],
+        archetype: EntityRigArchetype::SlimeCube,
+        default_width: 0.8,
+        default_height: 0.8,
+    },
+    ModdedFamily {
+        tokens: &[
+            "golem", "knight", "wizard", "mage", "goblin", "orc", "elf", "bandit",
+            "guard", "villager", "zombie", "skeleton", "witch", "lich", "boss", "human",
+            "npc",
+        ],
+        suffixes: &[],
+        archetype: EntityRigArchetype::Biped,
+        default_width: 0.7,
+        default_height: 1.9,
+    },
+    ModdedFamily {
+        tokens: &[
+            "wolf", "fox", "bear", "deer", "boar", "lion", "tiger", "horse", "mount",
+            "hound", "beast",
+        ],
+        suffixes: &[],
+        archetype: EntityRigArchetype::Quadruped,
+        default_width: 1.0,
+        default_height: 1.2,
+    },
+    ModdedFamily {
+        tokens: &[
+            "arrow", "bolt", "fireball", "orb", "spell", "projectile", "snowball",
+            "bullet",
+        ],
+        suffixes: &[],
+        archetype: EntityRigArchetype::ProjectileOrItem,
+        default_width: 0.4,
+        default_height: 0.4,
+    },
+    ModdedFamily {
+        tokens: &["boat", "cart", "ship", "airship", "vehicle", "seat"],
+        suffixes: &[],
+        archetype: EntityRigArchetype::VehicleOrHanging,
+        default_width: 1.3,
+        default_height: 0.6,
+    },
+];
+
+/// Bounded interner for modded registry names so [`EntityRigSpec::name`]
+/// keeps its `&'static str` contract without leaking per call. A poisoned
+/// lock is recovered, not propagated: the interner still serves correct
+/// names afterwards, it just may re-leak one entry.
+fn intern_entity_name(name: &str) -> &'static str {
+    use std::sync::{Mutex, OnceLock};
+    static NAMES: OnceLock<Mutex<Vec<&'static str>>> = OnceLock::new();
+    let names = NAMES.get_or_init(|| Mutex::new(Vec::new()));
+    let mut guard = names
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if let Some(&interned) = guard.iter().find(|&&entry| entry == name) {
+        return interned;
+    }
+    let interned: &'static str = Box::leak(name.to_owned().into_boxed_str());
+    guard.push(interned);
+    interned
+}
+
+/// Build an [`EntityRigSpec`] for a modded registry name: synthetic
+/// [`MODDED_ENTITY_TYPE_ID`], interned name, family archetype, and the same
+/// translucent-shell flag vanilla slime gets for [`EntityRigArchetype::SlimeCube`].
+fn modded_spec(
+    name: &str,
+    archetype: EntityRigArchetype,
+    width: f32,
+    height: f32,
+) -> EntityRigSpec {
+    EntityRigSpec {
+        entity_type_id: MODDED_ENTITY_TYPE_ID,
+        name: intern_entity_name(name),
+        archetype,
+        width,
+        height,
+        proportions: archetype.proportions(),
+        is_player: false,
+        translucent_shell: matches!(archetype, EntityRigArchetype::SlimeCube),
+    }
+}
+
+/// Infallible rig classification for any registry name — vanilla or modded.
+///
+/// A name whose path matches a canonical Vanilla row (either `minecraft:path`
+/// or bare `path`) resolves to that exact [`classify_entity_rig`] spec, so
+/// all 130 vanilla rigs stay byte-identical. Every other name runs the
+/// namespace-agnostic [`MODDED_FAMILIES`] token table, and a fully novel
+/// name falls through to a [`EntityRigArchetype::GenericProxy`] spec — this
+/// function never returns `None`, so no modded entity is ever invisible.
+/// `width_hint`/`height_hint` override each family's default collision-size
+/// estimate when they are finite and positive.
+pub fn classify_entity_rig_named(
+    name: &str,
+    width_hint: Option<f32>,
+    height_hint: Option<f32>,
+) -> EntityRigSpec {
+    let path = name.rsplit(':').next().unwrap_or(name);
+    if let Some(spec) = ENTITIES
+        .iter()
+        .position(|&(registered, _, _)| registered.rsplit(':').next() == Some(path))
+        .and_then(|index| classify_entity_rig(index as u16))
+    {
+        return spec;
+    }
+    let hint_or = |hint: Option<f32>, default: f32| match hint {
+        Some(value) if value.is_finite() && value > 0.0 => value,
+        _ => default,
+    };
+    for family in MODDED_FAMILIES {
+        let matched = family.tokens.iter().any(|token| path.contains(token))
+            || family.suffixes.iter().any(|suffix| path.ends_with(suffix));
+        if matched {
+            return modded_spec(
+                name,
+                family.archetype,
+                hint_or(width_hint, family.default_width),
+                hint_or(height_hint, family.default_height),
+            );
+        }
+    }
+    modded_spec(
+        name,
+        EntityRigArchetype::GenericProxy,
+        hint_or(width_hint, 0.8),
+        hint_or(height_hint, 1.2),
+    )
+}
+
+/// Total rig resolution for callers holding a wire entity-type id plus an
+/// optional registry name: the canonical vanilla spec first,
+/// [`classify_entity_rig_named`] second, and a visible
+/// [`EntityRigArchetype::GenericProxy`] spec third — modded entities can
+/// never go invisible.
+pub fn classify_entity_rig_or_fallback(
+    entity_type_id: u32,
+    registry_name: Option<&str>,
+) -> EntityRigSpec {
+    if let Ok(id) = u16::try_from(entity_type_id) {
+        if let Some(spec) = classify_entity_rig(id) {
+            return spec;
+        }
+    }
+    if let Some(name) = registry_name.filter(|n| !n.is_empty()) {
+        return classify_entity_rig_named(name, None, None);
+    }
+    modded_spec(
+        "modded:unresolved",
+        EntityRigArchetype::GenericProxy,
+        0.8,
+        1.2,
+    )
+}
+
+/// Deterministic `(primary, accent)` packed-RGB tint pair for
+/// [`EntityRigArchetype::GenericProxy`] rigs: FNV-1a of the registry name
+/// spread across two byte mixes, biased bright so every unresolved modded
+/// entity stays visible instead of collapsing to black.
+fn modded_proxy_tints(name: &str) -> (i32, i32) {
+    let hash = megu_core::perf_kit::fnv1a64(name.as_bytes());
+    let channel = |shift: u32| 64 + (((hash >> shift) & 0xFF) as u8) % 160;
+    (
+        colossal_tint([channel(0), channel(8), channel(16)]),
+        colossal_tint([channel(24), channel(32), channel(40)]),
+    )
 }
 
 /// Animation inputs. Angles are degrees except limb_swing, which is radians.
@@ -1247,6 +1491,36 @@ fn build_entity_rig_mesh_inner(
                 0.0,
             );
         }
+        GenericProxy => {
+            // Never-invisible modded fallback: a name-hash-tinted torso box
+            // plus a brighter head cap so the silhouette reads as a creature
+            // instead of a stray cube.
+            let (primary, accent) = modded_proxy_tints(spec.name);
+            add_tinted(
+                &mut mesh,
+                spec,
+                pose,
+                Core,
+                [0.0, h * 0.42, 0.0],
+                [w * 0.85, h * 0.72, w * 0.85],
+                [0.0; 3],
+                [0.0; 3],
+                0.0,
+                primary,
+            );
+            add_tinted(
+                &mut mesh,
+                spec,
+                pose,
+                Head,
+                [0.0, h * 0.80, -w * 0.08],
+                [w * 0.50, h * 0.26, w * 0.50],
+                [0.0, h * 0.66, 0.0],
+                [0.0; 3],
+                0.0,
+                accent,
+            );
+        }
     }
     mesh
 }
@@ -2150,5 +2424,134 @@ mod colossal_rig_tests {
                 entity_mesh_fingerprint(&floor_b)
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod modded_classifier_tests {
+    use super::*;
+
+    fn assert_drawable(mesh: &ExtrudedMesh) {
+        assert!(!mesh.quads.is_empty(), "modded rig produced no geometry");
+        for quad in &mesh.quads {
+            assert!(quad.positions.iter().flatten().all(|v| v.is_finite()));
+            assert!(quad.normal.iter().all(|v| v.is_finite()));
+            assert!(quad
+                .uv
+                .iter()
+                .flatten()
+                .all(|v| v.is_finite() && (0.0..=1.0).contains(v)));
+        }
+    }
+
+    #[test]
+    fn vanilla_names_resolve_to_byte_identical_canonical_specs() {
+        for id in 0..ENTITIES.len() as u16 {
+            let canonical = classify_entity_rig(id).expect("protocol id must classify");
+            for alias in [
+                canonical.name,
+                canonical.name.strip_prefix("minecraft:").unwrap_or(canonical.name),
+            ] {
+                let named = classify_entity_rig_named(alias, None, None);
+                assert_eq!(named, canonical, "id {id} alias {alias}");
+            }
+        }
+        // The numeric path is untouched: out-of-range ids still yield None.
+        assert!(classify_entity_rig(ENTITIES.len() as u16).is_none());
+        assert!(classify_entity_rig(u16::MAX).is_none());
+    }
+
+    #[test]
+    fn modded_creature_names_classify_and_build_valid_meshes() {
+        let cases: &[(&str, EntityRigArchetype)] = &[
+            ("iceandfire:fire_dragon", EntityRigArchetype::Avian),
+            ("iceandfire:ice_dragon", EntityRigArchetype::Avian),
+            ("iceandfire:sea_serpent", EntityRigArchetype::Aquatic),
+            ("iceandfire:hippogriff", EntityRigArchetype::Avian),
+            ("twilightforest:lich", EntityRigArchetype::Biped),
+            ("twilightforest:minoshroom_boss", EntityRigArchetype::Biped),
+            ("twilightforest:naga", EntityRigArchetype::GenericProxy),
+            ("ars_nouveau:starbuncle", EntityRigArchetype::GenericProxy),
+            ("mymod:cave_spider_queen", EntityRigArchetype::Arthropod),
+            ("mymod:gelatinous_slime", EntityRigArchetype::SlimeCube),
+            ("mymod:great_white_shark", EntityRigArchetype::Aquatic),
+            ("mymod:tropical_reef_fish", EntityRigArchetype::Aquatic),
+            ("mymod:sky_phoenix", EntityRigArchetype::Avian),
+            ("mymod:void_wolf", EntityRigArchetype::Quadruped),
+            ("mymod:arcane_bolt", EntityRigArchetype::ProjectileOrItem),
+            ("mymod:sky_boat", EntityRigArchetype::VehicleOrHanging),
+            ("mymod:totally_unknown_florb", EntityRigArchetype::ProjectileOrItem),
+            ("custommod:flooble", EntityRigArchetype::GenericProxy),
+        ];
+        for &(name, expected) in cases {
+            let spec = classify_entity_rig_named(name, None, None);
+            assert_eq!(spec.archetype, expected, "{name}");
+            assert_eq!(spec.entity_type_id, MODDED_ENTITY_TYPE_ID, "{name}");
+            assert!(!spec.is_player, "{name}");
+            let mesh = build_entity_rig_mesh(spec, EntityPose::default());
+            assert_drawable(&mesh);
+        }
+    }
+
+    #[test]
+    fn size_hints_override_family_defaults_when_positive_and_finite() {
+        let hinted = classify_entity_rig_named("mymod:stone_golem", Some(3.0), Some(4.5));
+        assert_eq!(hinted.archetype, EntityRigArchetype::Biped);
+        assert_eq!(hinted.width, 3.0);
+        assert_eq!(hinted.height, 4.5);
+        for bad in [Some(0.0), Some(-2.0), Some(f32::NAN), None] {
+            let spec = classify_entity_rig_named("mymod:stone_golem", bad, bad);
+            assert_eq!(spec.width, 0.7, "hint {bad:?}");
+            assert_eq!(spec.height, 1.9, "hint {bad:?}");
+        }
+        // Dragon-family defaults stay large without hints.
+        let dragon = classify_entity_rig_named("iceandfire:lightning_dragon", None, None);
+        assert_eq!(dragon.width, 2.4);
+        assert_eq!(dragon.height, 2.2);
+    }
+
+    #[test]
+    fn generic_proxy_tint_is_deterministic_name_derived_and_bright() {
+        let spec_a = classify_entity_rig_named("custommod:flooble", None, None);
+        let spec_b = classify_entity_rig_named("custommod:flooble", None, None);
+        let spec_c = classify_entity_rig_named("custommod:zzqxx", None, None);
+        assert_eq!(spec_a.name, "custommod:flooble");
+        let mesh_a = build_entity_rig_mesh(spec_a, EntityPose::default());
+        let mesh_b = build_entity_rig_mesh(spec_b, EntityPose::default());
+        let mesh_c = build_entity_rig_mesh(spec_c, EntityPose::default());
+        assert_eq!(entity_mesh_fingerprint(&mesh_a), entity_mesh_fingerprint(&mesh_b));
+        assert_ne!(entity_mesh_fingerprint(&mesh_a), entity_mesh_fingerprint(&mesh_c));
+        // Every quad carries the packed sRGB material flag — never the
+        // untinted default — and both palette slots appear.
+        assert!(mesh_a.quads.iter().all(|q| q.tint_index >= 0x0100_0000));
+        let tints: std::collections::BTreeSet<i32> =
+            mesh_a.quads.iter().map(|q| q.tint_index).collect();
+        assert_eq!(tints.len(), 2, "primary + accent tints expected");
+    }
+
+    #[test]
+    fn or_fallback_prefers_vanilla_then_name_then_visible_proxy() {
+        // Exact vanilla id wins even when a registry name is supplied.
+        assert_eq!(
+            classify_entity_rig_or_fallback(124, Some("iceandfire:fire_dragon")),
+            classify_entity_rig(124).unwrap()
+        );
+        // Out-of-range id + name resolves through the token classifier.
+        let named = classify_entity_rig_or_fallback(500, Some("twilightforest:lich"));
+        assert_eq!(named.archetype, EntityRigArchetype::Biped);
+        // No name — or an unusable id — still renders instead of vanishing.
+        for spec in [
+            classify_entity_rig_or_fallback(500, None),
+            classify_entity_rig_or_fallback(u32::MAX, None),
+            classify_entity_rig_or_fallback(9_999_999, Some("")),
+            classify_entity_rig_or_fallback(u32::MAX, Some("custommod:flooble")),
+        ] {
+            let mesh = build_entity_rig_mesh(spec, EntityPose::default());
+            assert_drawable(&mesh);
+        }
+        assert_eq!(
+            classify_entity_rig_or_fallback(u32::MAX, Some("custommod:flooble")).archetype,
+            EntityRigArchetype::GenericProxy
+        );
     }
 }
