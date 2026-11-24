@@ -1,0 +1,13 @@
+[package]
+name = "megu-mod-sdk"
+version = "0.1.0"
+edition = "2021"
+license = "LGPL-3.0-or-later"
+description = "Standalone zero-dependency Mod Developer SDK: typed builders, .mmod packager, and in-memory ModTestHarness"
+publish = false
+
+# Zero crates.io dependencies by design: the only edge is the path-local
+# `megu-core` primitives crate (ResourceLocation, crc32_ieee, zip_archive),
+# which keeps `cargo-deny` 100% clean.
+[dependencies]
+megu_core = { package = "megu-core", path = "../../core" }
