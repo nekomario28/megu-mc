@@ -29,6 +29,13 @@
 //!   `GuiGraphics -> DrawCmd` draw ops, the read-only HUD snapshot mods
 //!   see, fair-play-capped container slot actions, the fail-closed
 //!   `GGB1` wire codec, and the lowering pass into the native draw list.
+//! * [`jei_emi_overlay`] — the JEI/EMI-style *native* side-by-side
+//!   container overlay: non-overlapping left (bookmarks + EMI craft
+//!   tree) and right (paginated 18×18 item grid + search with the
+//!   double-click yellow highlight mode) sidebars around any centered
+//!   container GUI, the classic `#C6C6C6` recipe popup card, the
+//!   purple-gradient item tooltip, and parallel `ItemSpriteSlot`
+//!   emission for runtime `client-gpu` item sprites.
 //!
 //! Typical frame loop for an embedder:
 //!
@@ -49,6 +56,7 @@ pub mod draw;
 pub mod font_cjk;
 pub mod gui_bridge;
 pub mod hud_widgets;
+pub mod jei_emi_overlay;
 pub mod layout;
 pub mod magic_hud;
 pub mod mod_i18n;
