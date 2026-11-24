@@ -502,6 +502,7 @@ fn v4_gpu_compute_hiz_and_section_cull_execute_on_real_gpu_zero_false_negatives(
         yaw_deg: 0.0,
         pitch_deg: 0.0,
         fov_deg: 90.0,
+        roll_rad: 0.0,
         near: 0.1,
         far: 512.0,
     };

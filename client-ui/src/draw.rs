@@ -589,23 +589,32 @@ pub fn glyph_for(c: char) -> &'static [u8; 8] {
 
 /// Complete raster data for `c`: one or two 8×8 cells painted left-to-right.
 ///
-/// Resolution order is deterministic: the built-in ASCII face, then the
-/// built-in extended table ([`crate::font_cjk::EXTRA_GLYPHS`]), then the
-/// installed external [`crate::font_cjk::GlyphAtlas`] pack, then the
-/// fallback box — wide when `c` is an East-Asian full-width codepoint,
-/// narrow otherwise — so every character advances without overlap.
+/// Resolution order is deterministic: for ASCII, the installed vanilla
+/// `ascii.png` table wins over the built-in ASCII face; for non-ASCII,
+/// the installed external [`crate::font_cjk::GlyphAtlas`] pack (real
+/// Unifont) wins over the built-in extended table
+/// ([`crate::font_cjk::EXTRA_GLYPHS`]) so genuine Minecraft art renders
+/// whenever a local pack is installed; then the fallback box — wide when
+/// `c` is an East-Asian full-width codepoint, narrow otherwise — so
+/// every character advances without overlap.
 pub fn glyph_bitmap(c: char) -> crate::font_cjk::GlyphBitmap {
     let cp = c as u32;
     if (0x20..=0x7e).contains(&cp) {
+        if let Some(bits) = crate::font_cjk::external_ascii_glyph(c) {
+            return crate::font_cjk::GlyphBitmap {
+                cells: 1,
+                tiles: [bits, [0; 8]],
+            };
+        }
         return crate::font_cjk::GlyphBitmap {
             cells: 1,
             tiles: [FONT_8X8[(cp - 0x20) as usize], [0; 8]],
         };
     }
-    if let Some((_, bitmap)) = crate::font_cjk::lookup_extra(c) {
+    if let Some(bitmap) = crate::font_cjk::external_glyph(c) {
         return bitmap;
     }
-    if let Some(bitmap) = crate::font_cjk::external_glyph(c) {
+    if let Some((_, bitmap)) = crate::font_cjk::lookup_extra(c) {
         return bitmap;
     }
     if crate::font_cjk::is_fullwidth_codepoint(cp) {
@@ -637,6 +646,37 @@ pub fn glyph_advance(c: char) -> u32 {
     } else {
         GLYPH_SIZE
     }
+}
+
+/// `true` when dst pixel `(dx, dy)` of a `dw`×`dh` px destination cell
+/// lights under the max-pool cover map of a full 16-row Unifont glyph:
+/// the dst pixel samples the source footprint `[dx*sw/dw, (dx+1)*sw/dw)
+/// × [dy*16/dh, (dy+1)*16/dh)` and lights when any covered source pixel
+/// is set. Max-pooling keeps every thin stroke (a sampled-source render
+/// would drop alternate rows at `scale = 1`); at `scale ≥ 2` each of the
+/// 16 source rows maps to ≥1 dst row so the un-squashed art shows fully.
+fn scaled_unifont_lit(
+    g: &crate::font_cjk::GlyphRows16,
+    dx: u32,
+    dy: u32,
+    dw: u32,
+    dh: u32,
+) -> bool {
+    let sw = u32::from(g.cells.max(1)) * 8;
+    let (dw, dh) = (dw.max(1), dh.max(1));
+    let x0 = dx * sw / dw;
+    let x1 = ((dx + 1) * sw / dw).max(x0 + 1).min(sw);
+    let y0 = dy * 16 / dh;
+    let y1 = ((dy + 1) * 16 / dh).max(y0 + 1).min(16);
+    for row in y0..y1 {
+        let bits = g.rows[row as usize];
+        for col in x0..x1 {
+            if bits & (0x8000u16 >> col) != 0 {
+                return true;
+            }
+        }
+    }
+    false
 }
 
 /// `true` when `c` has a real glyph (built-in ASCII, built-in extended
@@ -1201,20 +1241,71 @@ pub fn tessellate_draw_list_icons(
                         GLYPH_SIZE * scale
                     };
                     if ch != ' ' && ch != '\u{3000}' {
-                        let base = glyph_index(ch);
-                        if wide {
-                            // Full-width art squeezes 16 -> FULLWIDTH_PX
-                            // columns: each 8-px tile paints into half
-                            // the advance so strokes compress, never clip.
-                            let half = adv / 2;
-                            mesh.quad(UiRect::new(cx, cy, half, cell), tile_uv(base), *color);
-                            mesh.quad(
-                                UiRect::new(cx + half as i32, cy, adv - half, cell),
-                                tile_uv(base + 1),
-                                *color,
-                            );
-                        } else {
-                            mesh.quad(UiRect::new(cx, cy, cell, cell), tile_uv(base), *color);
+                        let cp = ch as u32;
+                        let mut emitted = false;
+                        if (0x20..=0x7e).contains(&cp) {
+                            if let Some(bits) = crate::font_cjk::external_ascii_glyph(ch) {
+                                // Vanilla ascii.png glyph — external packs
+                                // have no atlas tile, so emit one white
+                                // quad per lit source pixel.
+                                for (row, bits) in bits.iter().enumerate() {
+                                    for col in 0..8u32 {
+                                        if (bits & (0x80 >> col)) != 0 {
+                                            mesh.quad(
+                                                UiRect::new(
+                                                    cx + col as i32 * *scale as i32,
+                                                    cy + row as i32 * *scale as i32,
+                                                    *scale,
+                                                    *scale,
+                                                ),
+                                                white,
+                                                *color,
+                                            );
+                                        }
+                                    }
+                                }
+                                emitted = true;
+                            }
+                        } else if let Some(g) = crate::font_cjk::external_unifont_glyph(ch) {
+                            // Un-squashed 16-row Unifont: per-pixel quads
+                            // squeezed into the advance×line-height cell.
+                            for dy in 0..cell {
+                                for dx in 0..adv {
+                                    if scaled_unifont_lit(&g, dx, dy, adv, cell) {
+                                        mesh.quad(
+                                            UiRect::new(cx + dx as i32, cy + dy as i32, 1, 1),
+                                            white,
+                                            *color,
+                                        );
+                                    }
+                                }
+                            }
+                            emitted = true;
+                        }
+                        if !emitted {
+                            let base = glyph_index(ch);
+                            if wide {
+                                // Full-width art squeezes 16 -> FULLWIDTH_PX
+                                // columns: each 8-px tile paints into half
+                                // the advance so strokes compress, never clip.
+                                let half = adv / 2;
+                                mesh.quad(
+                                    UiRect::new(cx, cy, half, cell),
+                                    tile_uv(base),
+                                    *color,
+                                );
+                                mesh.quad(
+                                    UiRect::new(cx + half as i32, cy, adv - half, cell),
+                                    tile_uv(base + 1),
+                                    *color,
+                                );
+                            } else {
+                                mesh.quad(
+                                    UiRect::new(cx, cy, cell, cell),
+                                    tile_uv(base),
+                                    *color,
+                                );
+                            }
                         }
                     }
                     cx += adv as i32;
@@ -1349,6 +1440,47 @@ impl Frame<'_> {
     }
 
     fn glyph_cell(&mut self, ch: char, x: i32, y: i32, scale: u32, color: UiColor) {
+        let cp = ch as u32;
+        if (0x20..=0x7e).contains(&cp) {
+            if let Some(bits) = crate::font_cjk::external_ascii_glyph(ch) {
+                // Vanilla ascii.png cell — the authentic Minecraft
+                // 8×8 pixel font, same box as the built-in face.
+                for (row, bits) in bits.iter().enumerate() {
+                    for col in 0..8u32 {
+                        if (bits & (0x80 >> col)) != 0 {
+                            self.fill(
+                                UiRect::new(
+                                    x + col as i32 * scale as i32,
+                                    y + row as i32 * scale as i32,
+                                    scale,
+                                    scale,
+                                ),
+                                color,
+                            );
+                        }
+                    }
+                }
+                return;
+            }
+        } else if let Some(g) = crate::font_cjk::external_unifont_glyph(ch) {
+            // Real Unifont — paint the un-squashed 16-row source scaled
+            // into the line-height cell (FULLWIDTH_PX advance stays, so
+            // labels keep their measured bounds).
+            let dw = if g.cells >= 2 {
+                FULLWIDTH_PX * scale
+            } else {
+                GLYPH_SIZE * scale
+            };
+            let dh = GLYPH_SIZE * scale;
+            for dy in 0..dh {
+                for dx in 0..dw {
+                    if scaled_unifont_lit(&g, dx, dy, dw, dh) {
+                        self.fill(UiRect::new(x + dx as i32, y + dy as i32, 1, 1), color);
+                    }
+                }
+            }
+            return;
+        }
         let bitmap = glyph_bitmap(ch);
         let wide = bitmap.cells >= 2;
         for (tile_idx, tile) in bitmap.tiles.iter().enumerate() {

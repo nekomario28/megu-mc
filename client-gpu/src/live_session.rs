@@ -2235,6 +2235,10 @@ pub struct LiveSession {
     latest_camera_micro_offset: CameraMicroOffset,
     /// Latest environment audio occlusion/reverb/muffle hint.
     latest_audio_hint: EnvironmentAudioHint,
+    /// Listener-underwater flag streamed to the dedicated mix thread's
+    /// `AudioCmd::UpdateListener`; the window layer derives it from
+    /// [`Self::latest_audio_hint`]'s `underwater_lowpass`.
+    listener_submerged: bool,
     /// Monotonic event counter seeding deterministic effect hashing for
     /// the `on_*` emit entry points.
     tactile_event_tick: u64,
@@ -2742,6 +2746,7 @@ impl LiveSession {
             latest_night_sky_drama: NightSkyDrama::default(),
             latest_camera_micro_offset: CameraMicroOffset::default(),
             latest_audio_hint: EnvironmentAudioHint::default(),
+            listener_submerged: false,
             tactile_event_tick: 0,
             tactile_last_pose: None,
             tactile_landing_impulse: 0.0,
@@ -2805,6 +2810,15 @@ impl LiveSession {
     /// Latest environment audio occlusion/reverb/muffle hint.
     pub fn latest_audio_hint(&self) -> EnvironmentAudioHint {
         self.latest_audio_hint
+    }
+
+    /// Set the listener-underwater flag sent on the next
+    /// `AudioCmd::UpdateListener` to the dedicated mix thread. The
+    /// window layer derives it from [`Self::latest_audio_hint`]'s
+    /// `underwater_lowpass`, so the real-time audio path applies the
+    /// same submersion muffle the synchronous mixer already had.
+    pub fn set_listener_submerged(&mut self, submerged: bool) {
+        self.listener_submerged = submerged;
     }
 
     /// Environment values currently affecting spatial DSP.
@@ -5191,7 +5205,7 @@ impl LiveSession {
                 vel: [0.0; 3],
                 yaw_deg: pose.yaw,
                 pitch_deg: pose.pitch,
-                submerged: false,
+                submerged: self.listener_submerged,
             });
             if !sent {
                 self.audio

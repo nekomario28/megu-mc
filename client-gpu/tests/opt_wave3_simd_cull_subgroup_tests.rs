@@ -108,6 +108,7 @@ fn test_cameras() -> Vec<Camera> {
             yaw_deg: *yaw,
             pitch_deg: [-60.0, -20.0, 0.0, 30.0][i % 4],
             fov_deg: [55.0, 70.0, 90.0, 110.0][i % 4],
+            roll_rad: 0.0,
             near: 0.1,
             far: 512.0,
         });
@@ -117,6 +118,7 @@ fn test_cameras() -> Vec<Camera> {
         yaw_deg: 17.0,
         pitch_deg: -35.0,
         fov_deg: 80.0,
+        roll_rad: 0.0,
         near: 0.5,
         far: 1024.0,
     });
@@ -221,6 +223,7 @@ fn soa_simd_cull_verdicts_stable_across_add_remove_and_reorder() {
         yaw_deg: 30.0,
         pitch_deg: -15.0,
         fov_deg: 75.0,
+        roll_rad: 0.0,
         near: 0.1,
         far: 512.0,
     };

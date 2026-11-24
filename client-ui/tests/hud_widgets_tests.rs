@@ -689,7 +689,7 @@ fn f3_debug_overlay_renders_both_columns() {
         })
         .collect::<Vec<_>>()
         .join("\n");
-    for needle in ["FPS", "XYZ", "Chunk", "Facing", "Biome", "Light", "Entities", "OS", "GPU", "Mem", "Render scale", "Shadows"] {
+    for needle in ["fps", "XYZ", "Chunk", "Facing", "Biome", "Client Light", "E:", "Megu Native Rust", "GPU", "Mem", "Render Scale", "Shadows"] {
         assert!(all_text.contains(needle), "missing debug line {needle}");
     }
     assert!(report.is_disjoint());

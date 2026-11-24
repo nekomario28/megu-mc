@@ -1437,6 +1437,16 @@ fn shaders_tab(ctx: &mut Ctx, y0: i32) {
         ),
     );
     ctx.dirty_dot(SettingKey::CameraMicroMotion, x + 326, y0 + 202);
+    ctx.btn(
+        WidgetId::VisualNightSky,
+        lr(x, y0 + 220, 320, 20),
+        &format!(
+            "{}: {}",
+            tr(lang, "Night Sky", "よぞら"),
+            onoff(vs.world_effects_detail.night_sky)
+        ),
+    );
+    ctx.dirty_dot(SettingKey::WorldEffectsDetail, x + 326, y0 + 226);
 }
 
 fn video_tab(ctx: &mut Ctx, y0: i32) {
@@ -2245,12 +2255,16 @@ fn qol_tab(ctx: &mut Ctx, y0: i32) {
     }
 
     // Subtle footer — only when the last content row leaves it clear.
-    if qy(last_row) + bh + 4 <= ctx.band_top - 22 {
+    // Both lines sit INSIDE the settings card: its bottom border is 6px
+    // above `band_top` (`panel(…, h - 92)` vs `band_top = h - 32`), so
+    // anchoring the last line 24px up keeps ~10px of padding between
+    // the text and the border instead of painting across it.
+    if qy(last_row) + bh + 4 <= ctx.band_top - 36 {
         // Subtle footer: point players at the community catalog instead
         // of stacking more built-in duplicates of respected mods.
         ctx.ctext(
             ctx.w / 2,
-            ctx.band_top - 22,
+            ctx.band_top - 36,
             1,
             pal::TEXT_DIM,
             tr(
@@ -2261,7 +2275,7 @@ fn qol_tab(ctx: &mut Ctx, y0: i32) {
         );
         ctx.ctext(
             ctx.w / 2,
-            ctx.band_top - 10,
+            ctx.band_top - 24,
             1,
             pal::TEXT_DIM,
             tr(
@@ -3657,6 +3671,27 @@ pub fn layout_title_overlay(
     };
     let mut snapshot = hud_feature_snapshot();
     snapshot.title = overlay;
+    let before = out.len();
+    HudWidgetsRenderer::new().render(&snapshot, width, height, out);
+    out.len() > before
+}
+
+/// Append the vanilla two-column F3 debug overlay
+/// (`hud.debug_overlay`) to the HUD draw list: left column at top-left,
+/// right column at top-right, exactly like [`Ctx::debug`]'s own claim
+/// bookkeeping. Returns `false` while `enabled` is off.
+pub fn layout_debug_overlay(
+    state: &UiState,
+    width: u32,
+    height: u32,
+    out: &mut UiDrawList,
+) -> bool {
+    let overlay = &state.hud.debug_overlay;
+    if !overlay.enabled {
+        return false;
+    }
+    let mut snapshot = hud_feature_snapshot();
+    snapshot.debug = overlay.clone();
     let before = out.len();
     HudWidgetsRenderer::new().render(&snapshot, width, height, out);
     out.len() > before

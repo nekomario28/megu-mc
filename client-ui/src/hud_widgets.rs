@@ -740,24 +740,50 @@ impl ChatInputOverlay {
 // F3 debug overlay
 // ---------------------------------------------------------------------------
 
-/// Structured F3 debug state. Every field is optional so embedders only
-/// fill what the backend knows; non-finite numbers and over-long strings
-/// are sanitized at render. `enabled` is the F3 toggle.
+/// Structured F3 debug state — the vanilla 1.21.1 two-column screen.
+/// Every field is optional so embedders only fill what the backend
+/// knows; non-finite numbers and over-long strings are sanitized at
+/// render. `enabled` is the F3 toggle.
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct F3DebugOverlay {
     pub enabled: bool,
+    /// e.g. `"1.21.1"` → renders `Minecraft 1.21.1 (Megu)`.
+    pub client_version: Option<String>,
     pub fps: Option<f32>,
+    pub frame_ms: Option<f32>,
+    /// `C:` line: rendered sections / loaded sections.
+    pub visible_sections: Option<u32>,
+    pub total_sections: Option<u32>,
+    /// `L:` loaded chunk count, when known.
+    pub loaded_chunks: Option<u32>,
+    /// `D:` render distance in chunks.
+    pub render_distance: Option<u32>,
+    /// Dimension id (`minecraft:overworld`).
+    pub dimension: Option<String>,
     pub position: Option<[f32; 3]>,
+    /// Integer block coordinate under the crosshair's feet.
+    pub block_pos: Option<[i32; 3]>,
     pub chunk: Option<(i32, i32)>,
     pub section_y: Option<i32>,
+    /// Cardinal name (`south`).
     pub facing: Option<String>,
+    /// Axis description (`Towards positive Z`).
+    pub facing_axis: Option<String>,
+    /// `(yaw, pitch)` degrees.
+    pub look_deg: Option<[f32; 2]>,
     pub biome: Option<String>,
     pub sky_light: Option<u8>,
     pub block_light: Option<u8>,
     pub entity_count: Option<u32>,
+    /// `(x, y, z, block_id)` under the crosshair, when a block is hit.
+    pub target_block: Option<(i32, i32, i32, String)>,
     pub target_entity: Option<String>,
     /// Right column: platform/renderer/memory.
     pub os: Option<String>,
+    /// `(width, height)` in physical px.
+    pub display: Option<(u32, u32)>,
+    /// GPU backend name (`Vulkan`, `wgpu`, …).
+    pub backend: Option<String>,
     pub gpu: Option<String>,
     pub memory_used_mb: Option<u64>,
     pub memory_total_mb: Option<u64>,
@@ -901,6 +927,7 @@ impl HudSnapshot {
                 memory_total_mb: Some(8192),
                 render_scale: Some(2.0),
                 shadows: Some(true),
+                ..Default::default()
             },
         }
     }
@@ -1363,54 +1390,130 @@ impl Ctx<'_> {
     }
 }
 
-/// Left debug column lines (vanilla order).
+/// Left debug column lines (vanilla 1.21.1 order).
 fn debug_left_lines(d: &F3DebugOverlay) -> Vec<String> {
     let mut lines = Vec::new();
+    if let Some(v) = &d.client_version {
+        lines.push(format!("Minecraft {} (Megu)", clip_cells(v, 16)));
+    }
     if let Some(fps) = d.fps.filter(|v| v.is_finite() && *v >= 0.0) {
-        lines.push(format!("FPS: {fps:.0}"));
-    }
-    if let Some(p) = d.position {
-        if p.iter().all(|v| v.is_finite()) {
-            lines.push(format!("XYZ: {:.3} / {:.3} / {:.3}", p[0], p[1], p[2]));
-        }
-    }
-    if let Some((cx, cz)) = d.chunk {
-        let mut line = format!("Chunk: {cx}, {cz}");
-        if let Some(y) = d.section_y {
-            line.push_str(&format!("  Section: {y}"));
+        let mut line = format!("{fps:.0} fps");
+        if let Some(ms) = d.frame_ms.filter(|v| v.is_finite() && *v >= 0.0) {
+            line.push_str(&format!(" ({ms:.1} ms)"));
         }
         lines.push(line);
     }
-    if let Some(facing) = &d.facing {
-        lines.push(format!("Facing: {}", clip_cells(facing, 24)));
+    if d.visible_sections.is_some() || d.total_sections.is_some() {
+        let mut line = format!(
+            "C: {} / {}",
+            d.visible_sections
+                .map_or("?".to_string(), |v| v.to_string()),
+            d.total_sections.map_or("?".to_string(), |v| v.to_string())
+        );
+        if let Some(dist) = d.render_distance {
+            line.push_str(&format!("  D: {dist}"));
+        }
+        if let Some(loaded) = d.loaded_chunks {
+            line.push_str(&format!(", L: {loaded}"));
+        }
+        lines.push(line);
+    } else if let Some(dist) = d.render_distance {
+        lines.push(format!("D: {dist}"));
+    }
+    if let Some(n) = d.entity_count {
+        lines.push(format!("E: {n}"));
+    }
+    if let Some(dim) = &d.dimension {
+        lines.push(clip_cells(dim, 40));
+    }
+    if let Some(p) = d.position {
+        if p.iter().all(|v| v.is_finite()) {
+            lines.push(format!("XYZ: {:.3} / {:.5} / {:.3}", p[0], p[1], p[2]));
+        }
+    }
+    let block = d.block_pos.or_else(|| {
+        d.position.filter(|p| p.iter().all(|v| v.is_finite())).map(|p| {
+            [
+                p[0].floor() as i32,
+                p[1].floor() as i32,
+                p[2].floor() as i32,
+            ]
+        })
+    });
+    if let Some(b) = block {
+        let rel = |v: i32| v.rem_euclid(16);
+        lines.push(format!(
+            "Block: {} {} {} [{} {} {}]",
+            b[0],
+            b[1],
+            b[2],
+            rel(b[0]),
+            rel(b[1]),
+            rel(b[2])
+        ));
+    }
+    if let Some((cx, cz)) = d.chunk {
+        let mut line = format!("Chunk: {cx}");
+        if let Some(y) = d.section_y {
+            line.push_str(&format!(" {y}"));
+        } else {
+            line.push_str(" ?");
+        }
+        lines.push(format!(
+            "{line} {cz} in {} {}",
+            cx.div_euclid(32),
+            cz.div_euclid(32)
+        ));
+    }
+    if d.facing.is_some() || d.look_deg.is_some() {
+        let mut line = "Facing:".to_string();
+        if let Some(facing) = &d.facing {
+            line.push_str(&format!(" {}", clip_cells(facing, 24)));
+        }
+        if let Some(axis) = &d.facing_axis {
+            line.push_str(&format!(" ({})", clip_cells(axis, 28)));
+        }
+        if let Some([yaw, pitch]) = d.look_deg {
+            if yaw.is_finite() && pitch.is_finite() {
+                line.push_str(&format!(" ({yaw:.1} / {pitch:.1})"));
+            }
+        }
+        lines.push(line);
+    }
+    if d.sky_light.is_some() || d.block_light.is_some() {
+        let sky = d.sky_light.unwrap_or(0);
+        let block = d.block_light.unwrap_or(0);
+        lines.push(format!(
+            "Client Light: {} ({} sky, {} block)",
+            sky.max(block),
+            d.sky_light.map_or("?".to_string(), |v| v.to_string()),
+            d.block_light.map_or("?".to_string(), |v| v.to_string())
+        ));
     }
     if let Some(biome) = &d.biome {
         lines.push(format!("Biome: {}", clip_cells(biome, 40)));
     }
-    if d.sky_light.is_some() || d.block_light.is_some() {
+    if let Some((x, y, z, id)) = &d.target_block {
         lines.push(format!(
-            "Light: sky {} block {}",
-            d.sky_light.map_or("-".to_string(), |v| v.to_string()),
-            d.block_light.map_or("-".to_string(), |v| v.to_string())
+            "Targeted Block: {x}, {y}, {z} ({})",
+            clip_cells(id, 40)
         ));
     }
-    if let Some(n) = d.entity_count {
-        lines.push(format!("Entities: {n}"));
-    }
     if let Some(target) = &d.target_entity {
-        lines.push(format!("Target: {}", clip_cells(target, 32)));
+        lines.push(format!(
+            "Targeted Entity: {}",
+            clip_cells(target, 32)
+        ));
     }
     lines
 }
 
-/// Right debug column lines: OS / GPU / memory / render settings.
+/// Right debug column lines: platform / GPU / memory / render settings.
 fn debug_right_lines(d: &F3DebugOverlay) -> Vec<String> {
     let mut lines = Vec::new();
-    if let Some(os) = &d.os {
-        lines.push(format!("OS: {}", clip_cells(os, 32)));
-    }
-    if let Some(gpu) = &d.gpu {
-        lines.push(format!("GPU: {}", clip_cells(gpu, 40)));
+    match &d.os {
+        Some(os) => lines.push(format!("Megu Native Rust ({})", clip_cells(os, 24))),
+        None => lines.push("Megu Native Rust".to_string()),
     }
     if d.memory_used_mb.is_some() || d.memory_total_mb.is_some() {
         lines.push(format!(
@@ -1419,8 +1522,18 @@ fn debug_right_lines(d: &F3DebugOverlay) -> Vec<String> {
             d.memory_total_mb.map_or("?".to_string(), |v| v.to_string())
         ));
     }
+    if let Some((w, h)) = d.display {
+        let mut line = format!("Display: {w}x{h}");
+        if let Some(backend) = &d.backend {
+            line.push_str(&format!(" ({})", clip_cells(backend, 16)));
+        }
+        lines.push(line);
+    }
+    if let Some(gpu) = &d.gpu {
+        lines.push(format!("GPU: {}", clip_cells(gpu, 40)));
+    }
     if let Some(scale) = d.render_scale.filter(|v| v.is_finite() && *v > 0.0) {
-        lines.push(format!("Render scale: {scale:.2}"));
+        lines.push(format!("Render Scale: {scale:.2}"));
     }
     if let Some(shadows) = d.shadows {
         lines.push(format!("Shadows: {}", if shadows { "on" } else { "off" }));

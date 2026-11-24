@@ -10,7 +10,7 @@ be reachable from the GPU driver. Anything else is a half-implemented feature
 that compiles cleanly and silently does nothing — the class of bug that let
 dig/place, bossbars, chat, and the death screen slip through.
 
-Four checks, all evaluated on masked Rust source (comments, string/char
+Seven checks, all evaluated on masked Rust source (comments, string/char
 literals and ``#[cfg(test)]`` items are blanked out first — same technique as
 ``tools/wiring_audit.py`` — so test-only callers can never satisfy a check):
 
@@ -33,6 +33,23 @@ literals and ``#[cfg(test)]`` items are blanked out first — same technique as
 4. ``screen_state_reachability`` — every ``Screen`` enum variant and every
    ``pub struct *ScreenState`` in ``client-ui/src`` must be referenced by
    non-test code in ``client-gpu/src`` (``use`` declarations stripped).
+5. ``hud_widget_overlays_wired`` — every ``pub struct *Overlay`` in
+   ``client-ui/src/hud_widgets.rs`` must be named by non-test code in
+   ``client-ui/src/state.rs``, ``client-ui/src/layout.rs``, or
+   ``client-gpu/src``: an overlay struct nothing references renders
+   nowhere.
+6. ``live_session_latest_getters_consumed`` — every ``pub fn latest_*``
+   getter on ``LiveSession`` must have at least one non-test call site in
+   ``client-gpu/src/window.rs`` or ``client-gpu/src/renderer.rs``: a
+   getter nothing calls is a producer nobody reads.
+7. ``no_f3_actionbar_hijack_and_font_loader_wired`` — two structural
+   guards:
+   ``window.rs`` must not write a ``"F3"``-prefixed literal into
+   ``hud.actionbar`` (the real ``F3DebugOverlay`` owns debug output;
+   hijacking the actionbar hides real game messages), and the vanilla
+   font loader (``GlyphAtlas::load_unifont_hex`` or
+   ``vanilla_font::try_load_local_minecraft_fonts``) must be called by
+   non-test ``client-gpu/src`` code or the atlas is dead weight.
 
 Gaps are ratcheted through ``specs/client-vertical-wiring-waivers.json``:
 each entry carries a ``priority`` (``P0``/``P1``/``P2``) and a ``reason``.
@@ -63,14 +80,24 @@ CHECK_S2C = "s2c_play_event_consumption"
 CHECK_C2S = "worker_command_producers"
 CHECK_HUD = "hud_state_writers"
 CHECK_SCREENS = "screen_state_reachability"
-CHECKS = (CHECK_S2C, CHECK_C2S, CHECK_HUD, CHECK_SCREENS)
+CHECK_OVERLAYS = "hud_widget_overlays_wired"
+CHECK_LATEST = "live_session_latest_getters_consumed"
+CHECK_F3_FONT = "no_f3_actionbar_hijack_and_font_loader_wired"
+CHECKS = (
+    CHECK_S2C, CHECK_C2S, CHECK_HUD, CHECK_SCREENS,
+    CHECK_OVERLAYS, CHECK_LATEST, CHECK_F3_FONT,
+)
 
 PRIORITIES = ("P0", "P1", "P2")
 
 PROTOCOL_RS = "client-app/src/protocol.rs"
 WORLD_RS = "client-app/src/world.rs"
 LIVE_SESSION_RS = "client-gpu/src/live_session.rs"
+WINDOW_RS = "client-gpu/src/window.rs"
+RENDERER_RS = "client-gpu/src/renderer.rs"
 UI_STATE_RS = "client-ui/src/state.rs"
+UI_LAYOUT_RS = "client-ui/src/layout.rs"
+HUD_WIDGETS_RS = "client-ui/src/hud_widgets.rs"
 CLIENT_GPU_SRC = "client-gpu/src"
 CLIENT_UI_SRC = "client-ui/src"
 
@@ -453,6 +480,7 @@ _MUTATING_METHODS = (
     "note", "absorb", "begin", "finish", "advance", "merge", "mark", "bump",
     "increment", "decrement", "start", "stop", "refresh", "sync", "bake",
     "write", "enter", "exit", "open", "close", "activate", "deactivate",
+    "clone_from", "copy_from_slice",
 )
 _MUTATING_RE = "|".join(_MUTATING_METHODS)
 
@@ -542,6 +570,86 @@ def check_screens(sources, gpu_sources, ui_sources):
     return results
 
 
+def check_hud_widget_overlays(sources, gpu_sources, ui_sources):
+    widgets = sources.get(HUD_WIDGETS_RS)
+    if widgets is None:
+        raise FileNotFoundError(HUD_WIDGETS_RS)
+    # Consumers: the HUD state that owns the snapshot, the layout that
+    # draws it, and the GPU driver that populates it — never the widget
+    # definitions themselves.
+    consumers = "\n".join(
+        [sources.get(UI_STATE_RS, ""), ui_sources.get(UI_LAYOUT_RS, "")]
+        + list(gpu_sources.values()))
+    results = {}
+    for match in re.finditer(
+            r"\bpub\s+struct\s+([A-Za-z_]\w*Overlay)\b", widgets):
+        name = match.group(1)
+        wired = bool(re.search(rf"(?<!\w){name}\b", consumers))
+        results[name] = {
+            "wired": wired,
+            "detail": (
+                "referenced from non-test state/layout/client-gpu code"
+                if wired else
+                "never referenced outside hud_widgets.rs — renders nowhere"),
+        }
+    return results
+
+
+def check_latest_getters_consumed(sources, gpu_sources):
+    live = sources.get(LIVE_SESSION_RS)
+    if live is None:
+        raise FileNotFoundError(LIVE_SESSION_RS)
+    consumers = "\n".join(
+        gpu_sources.get(path, "") for path in (WINDOW_RS, RENDERER_RS))
+    results = {}
+    for match in re.finditer(r"\bpub\s+fn\s+(latest_[A-Za-z0-9_]*)\b", live):
+        name = match.group(1)
+        wired = bool(re.search(rf"\.{name}\s*\(", consumers))
+        results[name] = {
+            "wired": wired,
+            "detail": (
+                "called from non-test window.rs/renderer.rs code" if wired
+                else "no non-test caller in window.rs/renderer.rs — the "
+                     "produced data is never consumed"),
+        }
+    return results
+
+
+def check_no_f3_hijack_and_font_loader(root, sources, gpu_sources):
+    window_path = root / WINDOW_RS
+    if not window_path.is_file():
+        raise FileNotFoundError(WINDOW_RS)
+    raw_window = window_path.read_text(encoding="utf-8")
+    # The hijack writes a "F3"-prefixed literal into the actionbar inside
+    # one statement; literals are masked for caller checks, so scan the
+    # RAW text but only flag `"F3`/`"F3 |"`-style leading literals that
+    # share a statement with an `actionbar` write.
+    hijack = bool(re.search(
+        r'\bactionbar\b[^;]*"F3\b|actionbar\s*=[^;]*F3', raw_window))
+    gpu_text = "\n".join(gpu_sources.values())
+    font_loader_called = bool(
+        re.search(r"(?<!\w)(?:GlyphAtlas::)?load_unifont_hex\s*\(", gpu_text)
+        or re.search(
+            r"(?<!\w)try_load_local_minecraft_fonts\s*\(", gpu_text))
+    return {
+        "window_actionbar_f3_hijack": {
+            "wired": not hijack,
+            "detail": (
+                'no "F3" literal written into hud.actionbar' if not hijack
+                else 'window.rs writes a "F3"-prefixed string into '
+                     "hud.actionbar — the debug overlay owns F3 output"),
+        },
+        "vanilla_font_loader_wired": {
+            "wired": font_loader_called,
+            "detail": (
+                "load_unifont_hex/try_load_local_minecraft_fonts called "
+                "from non-test client-gpu code" if font_loader_called else
+                "no non-test client-gpu caller — the vanilla font "
+                "pipeline never hydrates"),
+        },
+    }
+
+
 # ---------------------------------------------------------------------------
 # Audit driver
 # ---------------------------------------------------------------------------
@@ -557,7 +665,10 @@ def _masked_sources(root, paths):
 
 
 def run_audit(root):
-    core = _masked_sources(root, (PROTOCOL_RS, WORLD_RS, LIVE_SESSION_RS, UI_STATE_RS))
+    core = _masked_sources(
+        root,
+        (PROTOCOL_RS, WORLD_RS, LIVE_SESSION_RS, UI_STATE_RS,
+         HUD_WIDGETS_RS))
     gpu_sources = {}
     for path in _rust_sources(root, CLIENT_GPU_SRC):
         rel = path.relative_to(root).as_posix()
@@ -579,6 +690,11 @@ def run_audit(root):
         CHECK_C2S: check_worker_commands(consumers, gpu_sources),
         CHECK_HUD: check_hud_state(consumers, gpu_sources),
         CHECK_SCREENS: check_screens(consumers, gpu_sources, ui_sources),
+        CHECK_OVERLAYS: check_hud_widget_overlays(
+            consumers, gpu_sources, ui_sources),
+        CHECK_LATEST: check_latest_getters_consumed(consumers, gpu_sources),
+        CHECK_F3_FONT: check_no_f3_hijack_and_font_loader(
+            root, consumers, gpu_sources),
     }
     return results
 

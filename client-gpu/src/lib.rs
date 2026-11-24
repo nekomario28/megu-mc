@@ -28,6 +28,7 @@ pub mod subworld_render;
 pub mod subworld_sync;
 pub mod title_branding;
 pub mod vanilla_bootstrap;
+pub mod vanilla_font;
 pub mod vanilla_jar;
 pub mod window;
 
@@ -502,6 +503,11 @@ pub struct Camera {
     pub pitch_deg: f32,
     /// Vertical field of view in degrees.
     pub fov_deg: f32,
+    /// View-axis roll in radians (`0` upright) — used only by the view
+    /// matrix, so strafe/billboard axes stay level. The tactile
+    /// micro-motion layer feeds transient landing/turn rolls through
+    /// here.
+    pub roll_rad: f32,
     pub near: f32,
     pub far: f32,
 }
@@ -513,6 +519,7 @@ impl Default for Camera {
             yaw_deg: 0.0,
             pitch_deg: -20.0,
             fov_deg: 70.0,
+            roll_rad: 0.0,
             near: 0.1,
             far: 512.0,
         }
@@ -545,8 +552,24 @@ impl Camera {
     /// World-to-view matrix (column-major for WGSL upload).
     pub fn view_matrix(&self) -> Mat4 {
         let f = self.forward_vector();
-        let s = self.right_vector();
-        let u = cross(s, f);
+        let mut s = self.right_vector();
+        let mut u = cross(s, f);
+        if self.roll_rad != 0.0 {
+            // Roll around the view axis: rotate the screen basis (s, u)
+            // inside the plane perpendicular to `f`.
+            let (sin, cos) = self.roll_rad.sin_cos();
+            let s2 = [
+                s[0] * cos + u[0] * sin,
+                s[1] * cos + u[1] * sin,
+                s[2] * cos + u[2] * sin,
+            ];
+            u = [
+                u[0] * cos - s[0] * sin,
+                u[1] * cos - s[1] * sin,
+                u[2] * cos - s[2] * sin,
+            ];
+            s = s2;
+        }
         let e = self.position;
         [
             [s[0], u[0], -f[0], 0.0],

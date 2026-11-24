@@ -5381,14 +5381,52 @@ fn hex_val(b: u8) -> Option<u32> {
     }
 }
 
-/// Runtime glyph map built from an external Unifont-style `.hex` pack.
-/// Glyphs are stored in the same two-tile form as the built-ins: 16×16
-/// full-width source rows are paired (bitwise OR) into the 16×8 canvas —
-/// a deterministic 2:1 vertical decimation that keeps every stroke — and
-/// 8×16 half-width sources land in the left tile.
+/// Full-height Unifont source rows: `cells` columns of 8 px (1 or 2)
+/// and the 16 source scanlines, MSB = leftmost pixel. Half-width (8×16)
+/// glyphs keep their ink left-justified in the high byte so
+/// `row & (0x8000 >> col)` is one uniform bit test for both widths.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct GlyphRows16 {
+    /// 1 = 8×16 half-width, 2 = 16×16 full-width.
+    pub cells: u8,
+    /// The 16 scanlines, left-justified.
+    pub rows: [u16; 16],
+}
+
+impl GlyphRows16 {
+    /// Deterministic 2:1 vertical decimation into the built-in 8-row
+    /// canvas: adjacent source rows are pairwise OR'd (no stroke is
+    /// dropped); the 16-bit row splits into the two tiles.
+    pub fn decimate(&self) -> GlyphBitmap {
+        let mut tiles = [[0u8; 8]; 2];
+        for (dst, pair) in self.rows.as_chunks::<2>().0.iter().enumerate() {
+            let row = pair[0] | pair[1];
+            tiles[0][dst] = (row >> 8) as u8;
+            tiles[1][dst] = row as u8;
+        }
+        GlyphBitmap {
+            cells: self.cells,
+            tiles,
+        }
+    }
+
+    /// `true` when source pixel `(col, row)` is set.
+    pub fn lit(&self, col: u32, row: u32) -> bool {
+        (col < u32::from(self.cells.max(1)) * 8 && row < 16)
+            && self.rows[row as usize] & (0x8000u16 >> col) != 0
+    }
+}
+
+/// Runtime glyph map built from an external Unifont-style `.hex` pack
+/// plus an optional vanilla `ascii.png` cell table. Glyphs are stored
+/// un-squashed as full 16-row [`GlyphRows16`]; the built-in 8-row canvas
+/// form is produced on demand via [`GlyphRows16::decimate`].
 #[derive(Clone, Debug, Default)]
 pub struct GlyphAtlas {
-    glyphs: BTreeMap<u32, GlyphBitmap>,
+    glyphs: BTreeMap<u32, GlyphRows16>,
+    /// Vanilla `ascii.png` 8×8 cells indexed by raw codepoint 0x00–0x7F
+    /// (cell index = row*16+col of the png's 16×16 grid).
+    ascii: Option<Box<[[u8; 8]; 128]>>,
 }
 
 impl GlyphAtlas {
@@ -5402,15 +5440,73 @@ impl GlyphAtlas {
         self.glyphs.contains_key(&(c as u32))
     }
 
-    /// Loaded bitmap for `c`, if present.
+    /// Loaded bitmap for `c` decimated to the built-in 8-row canvas —
+    /// the compatibility view used for advances and pack diagnostics.
     pub fn glyph_bitmap(&self, c: char) -> Option<GlyphBitmap> {
+        self.glyphs.get(&(c as u32)).map(GlyphRows16::decimate)
+    }
+
+    /// Loaded full 16-row glyph for `c`, if present — the un-squashed
+    /// Unifont source the renderers sample directly.
+    pub fn unifont_glyph(&self, c: char) -> Option<GlyphRows16> {
         self.glyphs.get(&(c as u32)).copied()
     }
 
-    /// Insert (or replace) one glyph — the same representation the `.hex`
-    /// loader produces, exposed so callers can hand-extend an atlas.
+    /// Install the vanilla `ascii.png` table: 128 8×8 bitmaps indexed by
+    /// raw codepoint (cell `row*16+col` of the png grid = codepoint).
+    pub fn set_ascii_bitmap(&mut self, cells: Box<[[u8; 8]; 128]>) {
+        self.ascii = Some(cells);
+    }
+
+    /// `true` when a vanilla `ascii.png` table is installed.
+    pub fn has_ascii_bitmap(&self) -> bool {
+        self.ascii.is_some()
+    }
+
+    /// Fold every glyph of `other` into `self` — later wins per
+    /// codepoint, so patch packs (e.g. `unifont_jp_patch`) loaded after a
+    /// base pack (`unifont_all_no_pua`) override just their codepoints,
+    /// exactly like the vanilla font provider chain.
+    pub fn absorb(&mut self, other: GlyphAtlas) {
+        for (cp, glyph) in other.glyphs {
+            self.glyphs.insert(cp, glyph);
+        }
+        if other.ascii.is_some() {
+            self.ascii = other.ascii;
+        }
+    }
+
+    /// 8×8 bitmap for a U+0000–U+007F codepoint from the installed
+    /// vanilla `ascii.png` table, if loaded.
+    pub fn ascii_glyph(&self, c: char) -> Option<[u8; 8]> {
+        let cp = c as u32;
+        self.ascii
+            .as_ref()
+            .and_then(|t| (cp < 128).then(|| t[cp as usize]))
+    }
+
+    /// Insert (or replace) one glyph in the built-in 8-row canvas form —
+    /// rows are duplicated 1:2 into the full-height store, so the
+    /// inserted bitmap round-trips exactly through `glyph_bitmap`.
     pub fn insert(&mut self, c: char, bitmap: GlyphBitmap) {
-        self.glyphs.insert(c as u32, bitmap);
+        let mut rows = [0u16; 16];
+        for (dst, pair) in rows.as_chunks_mut::<2>().0.iter_mut().enumerate() {
+            let lo = if bitmap.cells >= 2 {
+                bitmap.tiles[1][dst]
+            } else {
+                0
+            };
+            let row = ((bitmap.tiles[0][dst] as u16) << 8) | lo as u16;
+            pair[0] = row;
+            pair[1] = row;
+        }
+        self.glyphs.insert(
+            c as u32,
+            GlyphRows16 {
+                cells: bitmap.cells,
+                rows,
+            },
+        );
     }
 
     /// Pixel width of `text` at `scale` under this atlas: characters the
@@ -5508,10 +5604,9 @@ impl GlyphAtlas {
             };
             debug_assert_eq!(nibble, expected);
             // Unifont rows are `cols*2` hex digits each (8 or 16 px wide),
-            // 16 rows top-to-bottom. The built-in canvas is 8 rows tall, so
-            // adjacent source rows are pairwise OR'd (deterministic 2:1
-            // decimation, no panic on all-blank pairs).
-            let mut tiles = [[0u8; 8]; 2];
+            // 16 rows top-to-bottom — stored un-squashed, left-justified
+            // in u16 so bit `0x8000 >> col` is one uniform test.
+            let mut rows = [0u16; 16];
             let row_digits = cols as usize * 2;
             for (src_row, chunk) in bits_text.as_bytes().chunks(row_digits).enumerate() {
                 let mut bits = [0u8; 2];
@@ -5524,17 +5619,12 @@ impl GlyphAtlas {
                     };
                     bits[col_idx / 2] = (bits[col_idx / 2] << 4) | (v as u8 & 0xF);
                 }
-                let out_row = src_row / 2;
-                if out_row < 8 {
-                    tiles[0][out_row] |= bits[0];
-                    tiles[1][out_row] |= bits[1];
+                if src_row < 16 {
+                    rows[src_row] = ((bits[0] as u16) << 8) | bits[1] as u16;
                 }
             }
-            let bitmap = GlyphBitmap {
-                cells: cols,
-                tiles,
-            };
-            if glyphs.insert(cp, bitmap).is_some() {
+            let glyph = GlyphRows16 { cells: cols, rows };
+            if glyphs.insert(cp, glyph).is_some() {
                 return Err(FontPackError {
                     line,
                     reason: "duplicate codepoint",
@@ -5547,7 +5637,10 @@ impl GlyphAtlas {
                 });
             }
         }
-        Ok(Self { glyphs })
+        Ok(Self {
+            glyphs,
+            ascii: None,
+        })
     }
 
     /// Rasterize `text` (single line) at `scale` into a fresh RGBA buffer:
@@ -5647,4 +5740,24 @@ pub fn external_glyph(c: char) -> Option<GlyphBitmap> {
         .unwrap_or_else(|e| e.into_inner())
         .as_ref()
         .and_then(|atlas| atlas.glyph_bitmap(c))
+}
+
+/// Full 16-row un-squashed glyph for `c` from the installed external
+/// pack, if it covers `c`.
+pub fn external_unifont_glyph(c: char) -> Option<GlyphRows16> {
+    EXTERNAL_FONT
+        .read()
+        .unwrap_or_else(|e| e.into_inner())
+        .as_ref()
+        .and_then(|atlas| atlas.unifont_glyph(c))
+}
+
+/// Vanilla `ascii.png` 8×8 bitmap for `c` from the installed external
+/// pack, if a table was loaded.
+pub fn external_ascii_glyph(c: char) -> Option<[u8; 8]> {
+    EXTERNAL_FONT
+        .read()
+        .unwrap_or_else(|e| e.into_inner())
+        .as_ref()
+        .and_then(|atlas| atlas.ascii_glyph(c))
 }

@@ -3598,6 +3598,10 @@ pub struct GpuRenderer {
     /// Settings -> Video `indirect_light_bounce` toggle — same packed
     /// lane, gating the dynamic-light multi-bounce lobe (default on).
     indirect_light_bounce: bool,
+    /// Settings -> Shaders `night_sky` toggle — gates the sky dome's
+    /// star field via `celestial_params.x` every `prepare_shadow`
+    /// (default on: vanilla night skies show stars).
+    night_sky_enabled: bool,
     /// Pack-supplied `gbuffers_*` pipelines for Create sub-worlds and
     /// kinetic parts (`None` = built-in `COMPOSITE_LIT_WGSL` path).
     pack_subworld: Option<PackSubworldGpu>,
@@ -7442,6 +7446,7 @@ impl GpuRenderer {
             entity_light_daylight: 1.0,
             comfort_exposure: true,
             indirect_light_bounce: true,
+            night_sky_enabled: true,
             pack_subworld: None,
             notice: None,
         }
@@ -8665,6 +8670,20 @@ impl GpuRenderer {
                 comfort_exposure,
                 indirect_light_bounce,
             );
+        }
+    }
+
+    /// Store the Settings -> Shaders `night_sky` toggle: `prepare_shadow`
+    /// zeroes `celestial_params.x` on the frame's stable uniform block
+    /// every encode, so the dome's star field turns off on the next
+    /// frame while sun/moon keep their celestial lanes. A mid-frame call
+    /// patches the already built frame state so the toggle never waits.
+    pub fn set_night_sky(&mut self, enabled: bool) {
+        self.night_sky_enabled = enabled;
+        if let Some(stable) = self.frame_stable_shadow.as_mut() {
+            if !enabled {
+                stable.uniforms.celestial_params[0] = 0.0;
+            }
         }
     }
 
@@ -11976,6 +11995,11 @@ impl GpuRenderer {
                 self.comfort_exposure,
                 self.indirect_light_bounce,
             );
+            // Settings -> Shaders `night_sky` gates the dome's star field
+            // through celestial_params.x (sun/moon/ring stay lit).
+            if !self.night_sky_enabled {
+                stable.uniforms.celestial_params[0] = 0.0;
+            }
         }
         let valid_camera = camera.position.iter().all(|v| v.is_finite())
             && [
@@ -13688,9 +13712,15 @@ impl GpuRenderer {
 
             // Alpha-blended sub-world entries (cloud shells, glass
             // contraptions) — the last world geometry, over water.
+            // Cloud decks are *always* alpha draws: the opaque loop
+            // above skips them unconditionally, so a hybrid deck whose
+            // spec alpha reads ~1.0 must still land here or it would
+            // never draw.
             let mut drew_alpha = false;
             for entry in subworld_gpu.entries() {
-                if entry.index_count == 0 || entry.alpha >= 0.999 {
+                if entry.index_count == 0
+                    || (entry.alpha >= 0.999 && !is_cloud_subworld_id(entry.id))
+                {
                     continue;
                 }
                 if !drew_alpha {

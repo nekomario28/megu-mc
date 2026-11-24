@@ -75,6 +75,12 @@ impl LiveSession {
     pub fn place(&mut self) {
         let _ = self.outgoing.try_send(WorkerCommand::Place { pos: [0; 3] });
     }
+    pub fn latest_fps(&self) -> f32 {
+        60.0
+    }
+    pub fn latest_orphan(&self) -> f32 {
+        0.0
+    }
     fn apply_play(&mut self, event: PlayEvent) {
         match event {
             PlayEvent::Handled { .. } => {}
@@ -99,8 +105,11 @@ mod tests {
 WINDOW = """\
 fn drive(live: &mut LiveSession, ui: &mut UiState) {
     live.send_ping();
+    let _fps = live.latest_fps();
+    crate::vanilla_font::try_load_local_minecraft_fonts(&paths);
     ui.screen = Screen::Title;
     ui.hud.health = 20.0;
+    ui.hud.debug_overlay.clone_from(&overlay);
     live.hud.health = 20.0;
 }
 """
@@ -113,6 +122,20 @@ pub enum Screen {
 pub struct HudState {
     pub health: f32,
     pub armor: u8,
+    pub debug_overlay: F3DebugOverlay,
+}
+"""
+
+HUD_WIDGETS = """\
+pub struct TitleOverlay;
+pub struct F3DebugOverlay;
+pub struct OrphanOverlay;
+"""
+
+UI_LAYOUT = """\
+fn layout(hud: &HudState) -> TitleOverlay {
+    let _ = hud.debug_overlay;
+    TitleOverlay
 }
 """
 
@@ -125,6 +148,8 @@ def make_root(root):
     put(root, "client-gpu/src/live_session.rs", LIVE_SESSION)
     put(root, "client-gpu/src/window.rs", WINDOW)
     put(root, "client-ui/src/state.rs", UI_STATE)
+    put(root, "client-ui/src/hud_widgets.rs", HUD_WIDGETS)
+    put(root, "client-ui/src/layout.rs", UI_LAYOUT)
     put(root, "client-ui/src/death_screen.rs", DEATH_SCREEN)
 
 
@@ -156,6 +181,13 @@ class FixtureTests(unittest.TestCase):
             self.assertEqual(found["hud_state_writers"], {"HudState::armor"})
             self.assertEqual(found["screen_state_reachability"],
                              {"Screen::Dead", "DeadScreenState"})
+            self.assertEqual(found["hud_widget_overlays_wired"],
+                             {"OrphanOverlay"})
+            self.assertEqual(found["live_session_latest_getters_consumed"],
+                             {"latest_orphan"})
+            self.assertEqual(
+                found["no_f3_actionbar_hijack_and_font_loader_wired"],
+                set())
 
     def test_unwaived_gaps_fail_by_default(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -194,9 +226,64 @@ class FixtureTests(unittest.TestCase):
                  "priority": "P1", "reason": "fixture gap"},
                 {"check": "screen_state_reachability", "id": "DeadScreenState",
                  "priority": "P0", "reason": "fixture gap"},
+                {"check": "hud_widget_overlays_wired", "id": "OrphanOverlay",
+                 "priority": "P2", "reason": "fixture gap"},
+                {"check": "live_session_latest_getters_consumed",
+                 "id": "latest_orphan", "priority": "P2",
+                 "reason": "fixture gap"},
             ]
             result = run(root, *waivers_file(root, entries))
             self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+
+    def test_f3_actionbar_hijack_is_caught(self):
+        """Writing a "F3 |" string into hud.actionbar must fail check 7."""
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            make_root(root)
+            put(root, "client-gpu/src/window.rs", WINDOW + """\
+fn hijack(ui: &mut UiState) {
+    ui.hud.actionbar = format!("F3 | stats");
+}
+""")
+            entries = [
+                {"check": "s2c_play_event_consumption", "id": "PlayEvent::Dropped",
+                 "priority": "P1", "reason": "gap"},
+                {"check": "worker_command_producers", "id": "WorkerCommand::Place",
+                 "priority": "P0", "reason": "gap"},
+                {"check": "hud_state_writers", "id": "HudState::armor",
+                 "priority": "P1", "reason": "gap"},
+                {"check": "screen_state_reachability", "id": "Screen::Dead",
+                 "priority": "P1", "reason": "gap"},
+                {"check": "screen_state_reachability", "id": "DeadScreenState",
+                 "priority": "P0", "reason": "gap"},
+                {"check": "hud_widget_overlays_wired", "id": "OrphanOverlay",
+                 "priority": "P2", "reason": "gap"},
+                {"check": "live_session_latest_getters_consumed",
+                 "id": "latest_orphan", "priority": "P2", "reason": "gap"},
+            ]
+            result, data = report(
+                root, *waivers_file(root, entries), "--report-only")
+            self.assertIn(
+                "window_actionbar_f3_hijack",
+                gaps(data)["no_f3_actionbar_hijack_and_font_loader_wired"])
+            self.assertNotIn(
+                "vanilla_font_loader_wired",
+                gaps(data)["no_f3_actionbar_hijack_and_font_loader_wired"])
+
+    def test_missing_font_loader_call_is_caught(self):
+        """Dropping the vanilla-font loader call must fail check 7."""
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            make_root(root)
+            put(root, "client-gpu/src/window.rs",
+                WINDOW.replace(
+                    "    crate::vanilla_font"
+                    "::try_load_local_minecraft_fonts(&paths);\n", ""))
+            result, data = report(
+                root, *empty_waivers(root), "--report-only")
+            self.assertIn(
+                "vanilla_font_loader_wired",
+                gaps(data)["no_f3_actionbar_hijack_and_font_loader_wired"])
 
     def test_fixed_item_reports_stale_waiver(self):
         """Waiving a wired item is stale: reported, fatal only on --fail-on-stale."""
@@ -223,6 +310,10 @@ class FixtureTests(unittest.TestCase):
                  "priority": "P1", "reason": "gap"},
                 {"check": "screen_state_reachability", "id": "DeadScreenState",
                  "priority": "P0", "reason": "gap"},
+                {"check": "hud_widget_overlays_wired", "id": "OrphanOverlay",
+                 "priority": "P2", "reason": "gap"},
+                {"check": "live_session_latest_getters_consumed",
+                 "id": "latest_orphan", "priority": "P2", "reason": "gap"},
             ]
             result = run(root, *waivers_file(root, entries))
             self.assertEqual(result.returncode, 0, result.stdout + result.stderr)

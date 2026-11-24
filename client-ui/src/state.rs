@@ -1891,6 +1891,11 @@ pub struct HudState {
     /// bar is up; `layout::hud` draws the input box + suggestion popup
     /// bottom-left, vanilla style.
     pub chat_input: crate::hud_widgets::ChatInputOverlay,
+    /// Vanilla-style two-column F3 debug overlay (`hud.debug_overlay`):
+    /// the host fills it at its own refresh cadence and flips `enabled`
+    /// with the F3 chord; `layout::hud` composites it over the HUD —
+    /// the `actionbar` keeps carrying real game messages while F3 is up.
+    pub debug_overlay: crate::hud_widgets::F3DebugOverlay,
     /// Item cooldown wipe per item name (the same registry id
     /// `hotbar` entries carry): `0.0..=1.0` fraction of the cooldown
     /// remaining. `layout::hud` darkens the top fraction of matching
@@ -2135,6 +2140,7 @@ impl Default for HudState {
             title_overlay: TitleOverlayState::default(),
             looking_at: crate::magic_hud::LookingAtBlockState::default(),
             chat_input: crate::hud_widgets::ChatInputOverlay::default(),
+            debug_overlay: crate::hud_widgets::F3DebugOverlay::default(),
             item_cooldowns: std::collections::BTreeMap::new(),
         }
     }
@@ -2179,6 +2185,7 @@ impl HudState {
             title_overlay: TitleOverlayState::default(),
             looking_at: crate::magic_hud::LookingAtBlockState::default(),
             chat_input: crate::hud_widgets::ChatInputOverlay::default(),
+            debug_overlay: crate::hud_widgets::F3DebugOverlay::default(),
             item_cooldowns: std::collections::BTreeMap::new(),
         }
     }
@@ -2490,6 +2497,7 @@ pub enum WidgetId {
     VisualBlocks3d,
     VisualWorldEffects,
     VisualCameraMotion,
+    VisualNightSky,
     // Audio tab
     AudioMaster,
     AudioMusic,
@@ -2623,6 +2631,7 @@ impl WidgetId {
                 | Self::VisualBlocks3d
                 | Self::VisualWorldEffects
                 | Self::VisualCameraMotion
+                | Self::VisualNightSky
                 | Self::AudioMaster
                 | Self::AudioMusic
                 | Self::AudioBlocks
@@ -3496,6 +3505,7 @@ impl UiState {
             layout::layout_scoreboard_sidebar(self, width, height, out);
             layout::layout_title_overlay(self, width, height, out);
             layout::layout_looking_at(self, width, height, out);
+            layout::layout_debug_overlay(self, width, height, out);
         }
         // The sign-edit session composites over whatever screen is up —
         // the server owns its open/close lifecycle, not the nav stack.
@@ -4923,6 +4933,10 @@ impl UiState {
             }
             WidgetId::VisualCameraMotion => {
                 s.camera_micro_motion = !s.camera_micro_motion;
+                true
+            }
+            WidgetId::VisualNightSky => {
+                s.world_effects_detail.night_sky = !s.world_effects_detail.night_sky;
                 true
             }
             WidgetId::AudioSpatial3d => {

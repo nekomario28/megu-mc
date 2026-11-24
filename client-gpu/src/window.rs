@@ -53,8 +53,8 @@ use megu_client_mesh::vfx_engine::{ParticleDraw, ParticleOrientation, VfxFrameOu
 use megu_core::hash::{FNV1A64_OFFSET_BASIS, FNV1A64_PRIME, Fnv1a64};
 use megu_core::sys_metrics::{CpuSampler, HostMetricsSnapshot, sample_host_metrics};
 use megu_kernel::debug_chords::{
-    DebugChordAction, DebugChordContext, DebugChordState, DebugTarget, F3Chord, PlayerDebugInfo,
-    finish_gamemode_switcher, handle_f3_chord,
+    DebugChordAction, DebugChordContext, DebugChordState, DebugLine, DebugTarget, F3Chord,
+    PlayerDebugInfo, finish_gamemode_switcher, handle_f3_chord,
 };
 use megu_ui::container_screen::{
     ContainerScreenState, DragState, InventorySortState, MenuScreenSchema, SlotDef, SlotKind,
@@ -63,7 +63,7 @@ use megu_ui::container_screen::{
 use megu_ui::draw::{tessellate_draw_list, tessellate_draw_list_icons};
 use megu_ui::draw::{UiColor, UiCommand, UiDrawList, UiRect, text_width};
 use megu_ui::gui_bridge::{GuiBridgeBatch, lower_bridge_batch_to_draw_cmds};
-use megu_ui::hud_widgets::ScoreboardEntry;
+use megu_ui::hud_widgets::{F3DebugOverlay, ScoreboardEntry};
 use megu_ui::magic_hud::LookingAtBlockState;
 use megu_ui::magic_hud::build_magic_hud_draw_list;
 use megu_ui::recipe_browser::{
@@ -534,6 +534,95 @@ fn cloud_layers_for_settings(settings: &UiSettings) -> u8 {
     }
 }
 
+/// Project one tick of `NightSkyDrama` into world-space debug-line
+/// segments: shooting stars streak along their start→end arc on a
+/// shell inside the far plane, and each aurora band draws a short
+/// undulating curtain arc centered on the north horizon, tint lerping
+/// primary→secondary across the ribbon.
+fn night_sky_drama_lines(
+    drama: &megu_client_mesh::tactile_effects::NightSkyDrama,
+    camera: &Camera,
+) -> Vec<DebugLine> {
+    let shell = (camera.far * 0.8).clamp(80.0, 480.0);
+    let eye = camera.position;
+    let at = |dir: [f32; 3]| {
+        [
+            eye[0] + dir[0] * shell,
+            eye[1] + dir[1] * shell,
+            eye[2] + dir[2] * shell,
+        ]
+    };
+    let mut lines = Vec::new();
+    for star in &drama.shooting_stars {
+        let head_t = star.progress.clamp(0.0, 1.0);
+        let tail_t = (head_t - 0.15).max(0.0);
+        let lerp_dir = |t: f32| {
+            let mut d = [
+                star.start_dir[0] + (star.end_dir[0] - star.start_dir[0]) * t,
+                star.start_dir[1] + (star.end_dir[1] - star.start_dir[1]) * t,
+                star.start_dir[2] + (star.end_dir[2] - star.start_dir[2]) * t,
+            ];
+            let len = (d[0] * d[0] + d[1] * d[1] + d[2] * d[2]).sqrt().max(1e-5);
+            d.iter_mut().for_each(|v| *v /= len);
+            d
+        };
+        let alpha = (star.brightness.clamp(0.0, 1.0) * 255.0) as u8;
+        let rgb = |scale: f32| {
+            [
+                (star.tint[0].clamp(0.0, 1.0) * 255.0 * scale) as u8,
+                (star.tint[1].clamp(0.0, 1.0) * 255.0 * scale) as u8,
+                (star.tint[2].clamp(0.0, 1.0) * 255.0 * scale) as u8,
+            ]
+        };
+        lines.push(DebugLine {
+            start: at(lerp_dir(tail_t)),
+            end: at(lerp_dir(head_t)),
+            rgba: [rgb(1.0)[0], rgb(1.0)[1], rgb(1.0)[2], alpha],
+        });
+    }
+    const AURORA_SEGMENTS: usize = 14;
+    for band in &drama.aurora_bands {
+        let mut prev: Option<[f32; 3]> = None;
+        for i in 0..=AURORA_SEGMENTS {
+            let t = i as f32 / AURORA_SEGMENTS as f32;
+            // Curtain arc centred on the north sky (-Z), ±55° azimuth,
+            // elevation undulating slowly with the band's phase.
+            let az = (-55.0 + 110.0 * t).to_radians();
+            let alt = (band.altitude_deg + 2.5 * (band.phase + t * 4.0).sin()).to_radians();
+            let dir = [az.sin() * alt.cos(), alt.sin(), -az.cos() * alt.cos()];
+            let point = at(dir);
+            if let Some(start) = prev {
+                let mix = |a: f32, b: f32| ((a + (b - a) * t).clamp(0.0, 1.0) * 255.0) as u8;
+                lines.push(DebugLine {
+                    start,
+                    end: point,
+                    rgba: [
+                        mix(band.primary_rgb[0], band.secondary_rgb[0]),
+                        mix(band.primary_rgb[1], band.secondary_rgb[1]),
+                        mix(band.primary_rgb[2], band.secondary_rgb[2]),
+                        (band.intensity.clamp(0.0, 1.0) * 170.0) as u8,
+                    ],
+                });
+            }
+            prev = Some(point);
+        }
+    }
+    lines
+}
+
+/// Vanilla yaw convention: `0` faces south (+Z), `90` west (−X),
+/// `±180` north (−Z), `−90`/`270` east (+X). Returns the F3 cardinal
+/// label + axis subtitle vanilla prints.
+fn facing_from_yaw(yaw: f32) -> (&'static str, &'static str) {
+    let sector = ((yaw % 360.0 + 360.0 + 45.0) % 360.0 / 90.0).floor() as i32;
+    match sector {
+        0 => ("south", "Towards positive Z"),
+        1 => ("west", "Towards negative X"),
+        2 => ("north", "Towards negative Z"),
+        _ => ("east", "Towards positive X"),
+    }
+}
+
 /// `VisualStylePreset` x `CloudMode` -> cloud deck layout: the Vanilla
 /// preset (and `Clouds: Fast` under every preset) keeps the authentic
 /// single cubic deck, while `Clouds: Fancy` under a Megu Natural style
@@ -886,9 +975,20 @@ pub struct GpuApp {
     host_ram_probe: CpuSampler,
     /// Frame-time accumulator gating the ~2 Hz host-metrics resample.
     host_ram_sample_accum_ms: f32,
-    /// Latest F3 diagnostic string and when it was built — refreshed at
-    /// most every `F3_REFRESH` so steady frames never re-format it.
-    f3_text: Option<(String, Instant)>,
+    /// Latest F3 overlay contents and when they were built — refreshed
+    /// at most every `F3_REFRESH` so steady frames never re-populate
+    /// it; the cached copy is mirrored into `ui.hud.debug_overlay`
+    /// every frame so `sync_hud_to`'s wholesale clone can't stomp it.
+    f3_overlay: F3DebugOverlay,
+    f3_overlay_built: Option<Instant>,
+    /// Host-metrics probe for the F3 `Mem:` line — the overlay's 10 Hz
+    /// cadence keeps `/proc` reads cheap.
+    f3_metrics_probe: CpuSampler,
+    /// `true` once the local-Minecraft font probe produced a
+    /// `GlyphAtlas` (Unifont and/or `ascii.png`) and installed it —
+    /// retried while `false` so a late bootstrap download can still
+    /// deliver the assets.
+    vanilla_fonts_loaded: bool,
     /// Mouse deltas accumulated while the loop slept, applied once
     /// immediately before `render_frame` derives the view camera — the
     /// late-latch: input sampled as close to the draw as possible.
@@ -1230,7 +1330,10 @@ impl GpuApp {
             baseline_upload_budget: None,
             host_ram_probe: CpuSampler::new(),
             host_ram_sample_accum_ms: 0.0,
-            f3_text: None,
+            f3_overlay: F3DebugOverlay::default(),
+            f3_overlay_built: None,
+            f3_metrics_probe: CpuSampler::new(),
+            vanilla_fonts_loaded: false,
             pending_mouse_delta: (0.0, 0.0),
             last_subworld_helm: None,
             live_strategy_pending: true,
@@ -1316,6 +1419,102 @@ impl GpuApp {
         app
     }
 
+    /// One-shot local-Minecraft font probe: installs the shared
+    /// `GlyphAtlas` (Unifont `.hex` + vanilla `ascii.png`) when a local
+    /// 1.21.1 install yields one; retries while `vanilla_fonts_loaded`
+    /// is `false` so a late bootstrap download can still deliver the
+    /// assets. Never blocks, never errors — `None` keeps the built-in
+    /// fonts.
+    fn maybe_load_vanilla_fonts(&mut self) {
+        if self.vanilla_fonts_loaded {
+            return;
+        }
+        if let Some(atlas) =
+            crate::vanilla_font::try_load_local_minecraft_fonts(&self.session_paths)
+        {
+            megu_ui::font_cjk::install_external_font(atlas);
+            self.vanilla_fonts_loaded = true;
+        }
+    }
+
+    /// Snapshot the live session + renderer into the two-column F3
+    /// overlay. Runs at `F3_REFRESH` cadence; every field degrades to
+    /// `None` when its source is absent so the overlay stays honest on
+    /// title screens and headless CI. An associated fn over disjoint
+    /// fields so the `active` window borrow can stay mutable.
+    fn build_f3_overlay(
+        live: Option<&LiveSession>,
+        governor: &FrameBudgetGovernor,
+        user_shadow_quality: BuiltinShadowQuality,
+        metrics_probe: &mut CpuSampler,
+        active: &ActiveWindow,
+    ) -> F3DebugOverlay {
+        let mut overlay = F3DebugOverlay {
+            enabled: true,
+            client_version: Some("1.21.1".to_owned()),
+            display: Some((active.size.width, active.size.height)),
+            backend: Some(
+                active
+                    .renderer
+                    .gpu()
+                    .report
+                    .resolution
+                    .backend
+                    .as_str()
+                    .to_owned(),
+            ),
+            gpu: Some(active.renderer.gpu().report.name.clone()),
+            os: Some(std::env::consts::OS.to_owned()),
+            render_scale: Some(active.renderer.render_scale.percent() as f32 / 100.0),
+            shadows: Some(user_shadow_quality != BuiltinShadowQuality::Off),
+            visible_sections: Some(active.renderer.live_section_count() as u32),
+            total_sections: Some(active.renderer.live_section_count() as u32),
+            ..Default::default()
+        };
+        let host = sample_host_metrics(metrics_probe);
+        overlay.memory_used_mb = host.process_rss_mib.or(host.mem_used_mib);
+        overlay.memory_total_mb = host.mem_total_mib;
+        overlay.frame_ms = Some(governor.frame_ms() as f32);
+        let Some(live) = live else {
+            return overlay;
+        };
+        overlay.fps = Some(live.frame_timings.fps_avg() as f32);
+        overlay.frame_ms = Some(live.frame_timings.frame_ms_avg() as f32);
+        overlay.entity_count = Some(live.world.entities.len() as u32);
+        overlay.loaded_chunks = Some(live.world.loaded_chunks() as u32);
+        overlay.render_distance = Some(live.client_view_distance.max(0) as u32);
+        overlay.dimension = Some(live.world.dimension.name.clone());
+        if let Some(pose) = live.pose {
+            overlay.position = Some([
+                pose.feet[0] as f32,
+                pose.feet[1] as f32,
+                pose.feet[2] as f32,
+            ]);
+            let block = [
+                pose.feet[0].floor() as i32,
+                pose.feet[1].floor() as i32,
+                pose.feet[2].floor() as i32,
+            ];
+            overlay.block_pos = Some(block);
+            overlay.chunk = Some((block[0].div_euclid(16), block[2].div_euclid(16)));
+            overlay.section_y = Some(block[1].div_euclid(16));
+            let (cardinal, axis) = facing_from_yaw(pose.yaw);
+            overlay.facing = Some(cardinal.to_owned());
+            overlay.facing_axis = Some(axis.to_owned());
+            overlay.look_deg = Some([pose.yaw, pose.pitch]);
+        }
+        if let Some(([x, y, z], block_id)) = &live.looking_at_block {
+            overlay.target_block = Some((*x, *y, *z, block_id.clone()));
+        }
+        if let Some(entity_id) = live.looking_at_entity {
+            overlay.target_entity = live
+                .entity_rig(entity_id)
+                .map(|rig| rig.name.to_owned())
+                .or_else(|| Some(format!("entity #{entity_id}")));
+        }
+        overlay
+    }
+
     /// Non-blocking poll of the background vanilla-JAR bootstrap, called
     /// once per event-loop turn from `about_to_wait`. In-flight progress
     /// rides `ui.title_status` only while that banner still shows OUR
@@ -1355,6 +1554,9 @@ impl GpuApp {
                 if let Some(live) = &mut self.live {
                     live.refresh_asset_layers();
                 }
+                // The downloaded JAR + assets may now satisfy the font
+                // probe (it stays silent while nothing local exists).
+                self.maybe_load_vanilla_fonts();
                 if self.ui.title_status.as_deref() == self.bootstrap_banner.as_deref() {
                     self.ui.title_status = None;
                 }
@@ -2229,6 +2431,12 @@ impl GpuApp {
             };
             self.user_render_scale = scale;
             active.renderer.set_render_scale(scale);
+            // Sky-dome star field + night drama ride the same toggle
+            // pair: `World Effects` is the master switch, `Night Sky`
+            // the sub-toggle — both must be on for stars to draw.
+            active.renderer.set_night_sky(
+                settings.visual.world_effects && settings.visual.world_effects_detail.night_sky,
+            );
         }
         if vsync_changed {
             if let Some(size) = self.active.as_ref().map(|active| active.size) {
@@ -3670,6 +3878,11 @@ impl GpuApp {
                 None => {}
             }
         }
+        // Same local-install scan feeds the font pipeline: a real
+        // `ascii.png` + Unifont `.hex` upgrade text rendering to the
+        // authentic vanilla font when the host has 1.21.1 installed.
+        // Silent no-op on offline hosts / CI.
+        self.maybe_load_vanilla_fonts();
         // One-time PCIe upload of the runtime `MEGU EDITION` banner
         // textures (wordmark + patched edition strip); the CPU copies
         // stay resident in `title_branding` for a later surface loss.
@@ -5064,67 +5277,49 @@ impl GpuApp {
         }
 
         // HUD/diagnostics through the real client-ui state machine. The
-        // F3 string refreshes at 10 Hz (`F3_REFRESH`): steady frames reuse
-        // the cached line, which also keeps the draw-list fingerprint
-        // stable so the UI mesh rebuild stays skipped.
-        // Actionbar/F3 mirror: compare-before-write plus `clone_from`
-        // buffer reuse keeps unchanged text allocation-free every frame.
-        if self.show_diagnostics {
+        // F3 overlay's DATA refreshes at 10 Hz (`F3_REFRESH`) — steady
+        // frames reuse the cached contents, which also keeps the
+        // draw-list fingerprint stable so the UI mesh rebuild stays
+        // skipped — and the cached overlay is re-mirrored every frame so
+        // `sync_hud_to`'s revision-gated wholesale clone can't stomp it.
+        {
             let stale = self
-                .f3_text
-                .as_ref()
-                .is_none_or(|(_, built)| built.elapsed() >= F3_REFRESH);
+                .f3_overlay_built
+                .is_none_or(|built| built.elapsed() >= F3_REFRESH);
             if stale {
-                self.f3_text = Some((
-                    format!(
-                        "F3 | {} | {} | {} | {:.1} ms | x{:.2}{}",
-                        active.renderer.gpu().report.resolution.backend.as_str(),
-                        self.policy.description,
-                        active.renderer.gpu().report.name,
-                        self.governor.frame_ms(),
-                        self.scale_factor,
-                        self.live
-                            .as_ref()
-                            .map(|live| format!(
-                                " | chunks {} | sections {} | VFX {} | ANM {} (rejected {}) | MOT {:?}",
-                                live.world.loaded_chunks(),
-                                active.renderer.live_section_count(),
-                                live.vfx_admitted,
-                                live.animation_packets,
-                                live.animation_rejected,
-                                live.motion.as_ref().map(|motion| motion.phase),
-                            ))
-                            .unwrap_or_default(),
-                    ),
-                    Instant::now(),
-                ));
+                self.f3_overlay = Self::build_f3_overlay(
+                    self.live.as_ref(),
+                    &self.governor,
+                    self.user_shadow_quality,
+                    &mut self.f3_metrics_probe,
+                    active,
+                );
+                self.f3_overlay_built = Some(Instant::now());
             }
-            let text = self
-                .f3_text
-                .as_ref()
-                .map(|(text, _)| text.as_str())
-                .unwrap_or_default();
-            if self.ui.hud.actionbar != text {
-                self.ui.hud.actionbar = text.to_owned();
+            self.f3_overlay.enabled = self.show_diagnostics;
+            if self.ui.hud.debug_overlay != self.f3_overlay {
+                self.ui.hud.debug_overlay.clone_from(&self.f3_overlay);
             }
-        } else {
-            match self.live.as_ref().map(|live| &live.status) {
-                Some(SessionStatus::Playing) => {
-                    let actionbar = &self.live.as_ref().expect("status read").hud.actionbar;
-                    if self.ui.hud.actionbar != *actionbar {
-                        self.ui.hud.actionbar.clone_from(actionbar);
-                    }
+        }
+        // Actionbar mirror: always the real game actionbar / connection
+        // status — the F3 overlay lives in `hud.debug_overlay` and never
+        // hijacks this channel again.
+        match self.live.as_ref().map(|live| &live.status) {
+            Some(SessionStatus::Playing) => {
+                let actionbar = &self.live.as_ref().expect("status read").hud.actionbar;
+                if self.ui.hud.actionbar != *actionbar {
+                    self.ui.hud.actionbar.clone_from(actionbar);
                 }
-                Some(SessionStatus::Connecting) => {
-                    if self.ui.hud.actionbar != "Connecting to server..." {
-                        self.ui.hud.actionbar = "Connecting to server...".to_owned();
-                    }
-                }
-                Some(SessionStatus::Disconnected(reason)) => {
-                    self.ui.hud.actionbar = format!("Disconnected: {reason}");
-                }
-                None => self.ui.hud.actionbar.clear(),
             }
+            Some(SessionStatus::Connecting) => {
+                if self.ui.hud.actionbar != "Connecting to server..." {
+                    self.ui.hud.actionbar = "Connecting to server...".to_owned();
+                }
+            }
+            Some(SessionStatus::Disconnected(reason)) => {
+                self.ui.hud.actionbar = format!("Disconnected: {reason}");
+            }
+            None => self.ui.hud.actionbar.clear(),
         }
         // Chat-bar mirror lands after `sync_hud_to` (which clones
         // `live.hud` wholesale) and before the draw list rebuild — the
@@ -5297,7 +5492,39 @@ impl GpuApp {
             let mesh = tessellate_draw_list_icons(w, h, draw_list, &self.item_icon_atlas);
             active.renderer.update_ui_mesh(w, h, &mesh);
         }
-        let render_camera = self.camera_controller.view_camera(&self.camera);
+        let mut render_camera = self.camera_controller.view_camera(&self.camera);
+        // Tactile micro-motion: transient turn-roll + landing dip from
+        // the live session's camera sim. The state machine emits an
+        // exact zero offset while the setting is off, so this never
+        // perturbs the view when disabled.
+        if let Some(live) = &self.live {
+            let micro = live.latest_camera_micro_offset();
+            render_camera.roll_rad += micro.roll_rad;
+            render_camera.position[1] -= micro.landing_dip_blocks;
+        }
+        // Environment audio hint: the tactile sim's underwater low-pass
+        // doubles as the `submerged` flag on the mix thread's
+        // `UpdateListener` command — real underwater acoustics on the
+        // dedicated audio path, not just the synchronous mixer.
+        if let Some(live) = &mut self.live {
+            let submerged = live.latest_audio_hint().underwater_lowpass > 0.3;
+            live.set_listener_submerged(submerged);
+        }
+        // Night-sky drama: shooting-star streaks and polar aurora
+        // curtains ride the world-space debug-line overlay. Empty while
+        // `world_effects`/`night_sky` is off or by day — the empty push
+        // also clears stale lines from the previous frame.
+        {
+            let night_sky_on = self.ui.settings.visual.world_effects
+                && self.ui.settings.visual.world_effects_detail.night_sky;
+            let drama_lines = self
+                .live
+                .as_ref()
+                .filter(|_| night_sky_on)
+                .map(|live| night_sky_drama_lines(live.latest_night_sky_drama(), &render_camera))
+                .unwrap_or_default();
+            active.renderer.set_debug_lines(&drama_lines);
+        }
         let sky = active
             .renderer
             .set_camera(&render_camera, w as f32 / h as f32);
@@ -7069,7 +7296,8 @@ fn is_builtin_title_text(command: &UiCommand) -> bool {
         UiCommand::Text { scale, text, .. }
             if (*scale == 3 && text == "MINECRAFT")
                 || (*scale == 1
-                    && (text == "clean-room native client"
+                    && (text == "MEGU EDITION"
+                        || text == "clean-room native client"
                         || text == "クリーンルーム ネイティブクライアント"))
     )
 }
@@ -9947,5 +10175,37 @@ mod tests {
             );
             assert_eq!(cloud_deck_mode(preset, CloudMode::Off), CloudDeckMode::Off);
         }
+    }
+}
+
+#[cfg(test)]
+mod title_text_filter_tests {
+    use super::*;
+
+    /// While the real JAR banner (`minecraft.png` + patched
+    /// `edition.png`) renders, the built-in layout's fallback text —
+    /// both the `MINECRAFT` wordmark and the `MEGU EDITION` subtitle —
+    /// must be stripped so nothing double-draws behind the banner.
+    #[test]
+    fn builtin_title_text_filter_strips_wordmark_and_edition() {
+        let text_cmd = |scale: u32, text: &str| UiCommand::Text {
+            x: 0,
+            y: 0,
+            scale,
+            color: UiColor::rgb(255, 255, 255),
+            text: text.to_owned(),
+        };
+        assert!(is_builtin_title_text(&text_cmd(3, "MINECRAFT")));
+        assert!(is_builtin_title_text(&text_cmd(1, "MEGU EDITION")));
+        assert!(is_builtin_title_text(&text_cmd(1, "clean-room native client")));
+        assert!(is_builtin_title_text(&text_cmd(
+            1,
+            "クリーンルーム ネイティブクライアント"
+        )));
+        // Same words at a different scale are not the fallback banner
+        // (e.g. a splash heading) and must survive the strip.
+        assert!(!is_builtin_title_text(&text_cmd(2, "MEGU EDITION")));
+        assert!(!is_builtin_title_text(&text_cmd(1, "MINECRAFT")));
+        assert!(!is_builtin_title_text(&text_cmd(1, "unrelated label")));
     }
 }
