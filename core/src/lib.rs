@@ -174,6 +174,23 @@
 //!   section, its chunk aggregate and every border-adjacent neighbour
 //!   section, keyed by the [`coords`] types so no duplicate revision
 //!   scheme can drift out of sync.
+//! * [`zero_change_sim`] — zero-allocation simulation kernels that are
+//!   bit-exact drop-ins for the entity-heavy per-tick stages:
+//!   [`zero_change_sim::PathFinderScratch`] swaps the pathfinder's
+//!   per-call `BTreeMap`/`BTreeSet`/`BinaryHeap` for a
+//!   generation-stamped flat record table and a re-warmed heap while
+//!   preserving the exact `(f, h, position)` expansion order — plus a
+//!   *certified* straight-line fast path that only fires when it can
+//!   prove the A* result, with a [`zero_change_sim::LosCache`]
+//!   section-rev line-of-sight memo —
+//!   [`zero_change_sim::ReusableCellMerger`] runs the exact-order XP-orb
+//!   and dropped-item merges over pooled spatial cells with a
+//!   generation-stamped `eaten` bitset and a full-stack pre-filter, and
+//!   [`zero_change_sim::RestingEntitySleepState`] gives resting items,
+//!   orbs and lodged projectiles exact-tick sleep keyed on
+//!   `(block_pos, section_rev)`, waking on the precise tick a floor
+//!   breaks, fluid arrives or an impulse lands while age/despawn/pickup
+//!   ticks keep running untouched.
 
 #![deny(unsafe_code)]
 
@@ -212,4 +229,5 @@ pub mod task_pool;
 pub mod tier25_guard_batch;
 pub mod varint;
 pub mod version;
+pub mod zero_change_sim;
 pub mod zip_archive;
