@@ -495,17 +495,12 @@ fn ray_aabb(origin: [f64; 3], dir: [f64; 3], min: [f64; 3], max: [f64; 3], max_t
 // Bounded delegate wire contracts (CGD1 / EAD1)
 // ===========================================================================
 
-/// IEEE 802 CRC-32 delegated to the shared canonical primitive.
-fn crc32(data: &[u8]) -> u32 {
-    megu_core::hash::crc32_ieee(data)
-}
-
 /// `magic + crc32(body) + body` frame; `None` on any corruption, truncation,
 /// or trailing garbage.
 fn encode_frame(magic: &[u8; 4], body: &[u8]) -> Vec<u8> {
     let mut out = Vec::with_capacity(8 + body.len());
     out.extend_from_slice(magic);
-    out.extend_from_slice(&crc32(body).to_be_bytes());
+    out.extend_from_slice(&megu_core::hash::crc32_ieee(body).to_be_bytes());
     out.extend_from_slice(body);
     out
 }
@@ -516,7 +511,7 @@ fn decode_frame<'a>(magic: &[u8; 4], bytes: &'a [u8]) -> Option<&'a [u8]> {
     }
     let declared = u32::from_be_bytes(bytes[4..8].try_into().ok()?);
     let body = &bytes[8..];
-    (crc32(body) == declared).then_some(body)
+    (megu_core::hash::crc32_ieee(body) == declared).then_some(body)
 }
 
 fn get_i32(body: &[u8], cursor: &mut usize) -> Option<i32> {

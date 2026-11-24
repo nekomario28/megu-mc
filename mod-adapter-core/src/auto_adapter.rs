@@ -3028,25 +3028,13 @@ mod tests {
     // Stored-ZIP JAR builder
     // -------------------------------------------------------------------
 
-    fn crc32(data: &[u8]) -> u32 {
-        let mut crc = !0u32;
-        for &byte in data {
-            crc ^= u32::from(byte);
-            for _ in 0..8 {
-                let mask = 0u32.wrapping_sub(crc & 1);
-                crc = (crc >> 1) ^ (0xEDB8_8320 & mask);
-            }
-        }
-        !crc
-    }
-
     /// Pack `(name, bytes)` members into a real stored-method ZIP archive.
     fn jar(entries: &[(&str, &[u8])]) -> Vec<u8> {
         let mut out = Vec::new();
         let mut central = Vec::new();
         for (name, data) in entries {
             let name = name.as_bytes();
-            let crc = crc32(data);
+            let crc = megu_core::hash::crc32_ieee(data);
             let size = data.len() as u32;
             let offset = out.len() as u32;
 

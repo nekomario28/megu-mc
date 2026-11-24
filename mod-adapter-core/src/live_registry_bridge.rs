@@ -290,7 +290,7 @@ impl UnifiedModRegistryPlan {
             put_u32(&mut out, *id);
             put_string(&mut out, name);
         }
-        let checksum = crc32(&out);
+        let checksum = megu_core::hash::crc32_ieee(&out);
         put_u32(&mut out, checksum);
         out
     }
@@ -335,7 +335,7 @@ pub fn decode_registry_sync_frame(bytes: &[u8]) -> Result<SyncedModRegistry, Reg
             .try_into()
             .map_err(|_| RegistrySyncError::Truncated)?,
     );
-    if crc32(&bytes[..payload_len]) != expected_crc {
+    if megu_core::hash::crc32_ieee(&bytes[..payload_len]) != expected_crc {
         return Err(RegistrySyncError::ChecksumMismatch);
     }
     let mut reader = Reader {
@@ -452,10 +452,6 @@ fn encoded_frame_len(plan: &UnifiedModRegistryPlan) -> Option<usize> {
         length = length.checked_add(4 + 2 + item.len())?;
     }
     Some(length)
-}
-
-fn crc32(bytes: &[u8]) -> u32 {
-    megu_core::hash::crc32_ieee(bytes)
 }
 
 struct Reader<'a> {

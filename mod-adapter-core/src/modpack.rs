@@ -1499,7 +1499,7 @@ fn extract_member_bytes(
             "{display}: {name} decompressed length does not match the directory"
         )));
     }
-    if crc32(&decoded) != member.crc32 {
+    if megu_core::hash::crc32_ieee(&decoded) != member.crc32 {
         return Err(err(format!("{display}: CRC-32 mismatch in {name}")));
     }
     Ok(decoded)
@@ -1529,11 +1529,6 @@ fn inflate_raw(input: &[u8], budget: usize) -> Result<Vec<u8>, String> {
             invalid_deflate()
         }
     })
-}
-
-
-fn crc32(data: &[u8]) -> u32 {
-    megu_core::hash::crc32_ieee(data)
 }
 
 #[cfg(test)]
@@ -2313,7 +2308,7 @@ mod tests {
             0,
             MODRINTH_1211.as_bytes(),
             MODRINTH_1211.len() as u32,
-            crc32(MODRINTH_1211.as_bytes()),
+            megu_core::hash::crc32_ieee(MODRINTH_1211.as_bytes()),
         );
         let (format, text) = pack_member_bytes(&zip, "t.mrpack").unwrap().unwrap();
         assert_eq!(format, ModpackFormat::Modrinth);
@@ -2333,7 +2328,7 @@ mod tests {
     #[test]
     fn archive_reader_prefers_modrinth_then_falls_back_to_curseforge() {
         let cf = CURSEFORGE_1211.as_bytes();
-        let zip = zip_one("manifest.json", 0, 0, cf, cf.len() as u32, crc32(cf));
+        let zip = zip_one("manifest.json", 0, 0, cf, cf.len() as u32, megu_core::hash::crc32_ieee(cf));
         let (format, _) = pack_member_bytes(&zip, "t.zip").unwrap().unwrap();
         assert_eq!(format, ModpackFormat::CurseForge);
     }
@@ -2341,7 +2336,7 @@ mod tests {
     #[test]
     fn archive_reader_fail_closed() {
         let body = MODRINTH_1211.as_bytes();
-        let good_crc = crc32(body);
+        let good_crc = megu_core::hash::crc32_ieee(body);
         for (label, zip) in [
             (
                 "pk prefix without EOCD",
@@ -2349,7 +2344,7 @@ mod tests {
             ),
             (
                 "archive without a manifest member",
-                zip_one("overrides/x.txt", 0, 0, b"x", 1, crc32(b"x")),
+                zip_one("overrides/x.txt", 0, 0, b"x", 1, megu_core::hash::crc32_ieee(b"x")),
             ),
             (
                 "oversized member",
@@ -2440,7 +2435,7 @@ mod tests {
                 0,
                 cf,
                 cf.len() as u32,
-                crc32(cf),
+                megu_core::hash::crc32_ieee(cf),
             ))
             .unwrap();
         let m = ModpackManifest::from_path(&zip_path).unwrap();
