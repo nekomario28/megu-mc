@@ -4370,15 +4370,6 @@ impl LiveServerPolicy {
         Ok(())
     }
 
-    /// The typed view of the stored minimap mode. `set` only ever writes the
-    /// canonical `MinimapPolicyMode::as_str` spelling, but a value that
-    /// bypassed validation reads `Disabled` — fail closed, matching the
-    /// `server-files` policy semantics for unrecognized restrictions.
-    #[allow(dead_code)]
-    fn minimap_policy_mode(&self) -> MinimapPolicyMode {
-        MinimapPolicyMode::parse(&self.minimap_mode).unwrap_or(MinimapPolicyMode::Disabled)
-    }
-
     fn reset(&mut self) {
         *self = Self::default();
     }
@@ -9433,12 +9424,6 @@ mod policy_cmd_tests {
             policy_run(&ctx, "/megu policy get minimap_mode"),
             "minimap_mode = fair_play"
         );
-        {
-            let policy = live_server_policy()
-                .lock()
-                .unwrap_or_else(|e| e.into_inner());
-            assert_eq!(policy.minimap_policy_mode(), MinimapPolicyMode::FairPlay);
-        }
         assert_eq!(
             policy_run(&ctx, "/megu policy set minimap_mode DISABLED"),
             "minimap_mode = disabled"

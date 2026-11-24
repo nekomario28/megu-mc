@@ -1986,7 +1986,6 @@ pub(crate) struct ChunkHotspotPolicy {
     pub cadence: u64,
 }
 
-#[allow(dead_code)]
 impl Default for ChunkHotspotPolicy {
     fn default() -> Self {
         Self {
@@ -2208,7 +2207,7 @@ impl ChunkHotspotQuarantine {
     /// Whether the chunk's tick work may run on `tick`. Healthy chunks always
     /// may; a quarantined chunk owns exactly one `tick % cadence == phase`
     /// slot per cadence window.
-    pub(crate) fn chunk_tick_due(&self, dim: DimId, cx: i32, cz: i32, tick: u64) -> bool {
+    pub(crate) fn chunk_due(&self, dim: DimId, cx: i32, cz: i32, tick: u64) -> bool {
         let state = self.state.lock().unwrap_or_else(|e| e.into_inner());
         match state.chunks.get(&(dim, cx, cz)) {
             Some(entry) if entry.quarantined => {
@@ -3090,13 +3089,13 @@ mod server_reliability_tests {
         assert!(!q.is_chunk_quarantined(DimId::Overworld, 0, 0));
         for tick in 0..16u64 {
             assert!(
-                q.chunk_tick_due(DimId::Overworld, 0, 0, tick),
+                q.chunk_due(DimId::Overworld, 0, 0, tick),
                 "healthy neighbor must tick every tick ({tick})"
             );
             // Quarantine engaged while scoring completed tick 2, so the
             // chunk owns phase slot 2 of every 8-tick window.
             assert_eq!(
-                q.chunk_tick_due(DimId::Nether, 10, -4, tick),
+                q.chunk_due(DimId::Nether, 10, -4, tick),
                 tick % 8 == 2,
                 "throttled chunk cadence at tick {tick}"
             );
@@ -3142,7 +3141,7 @@ mod server_reliability_tests {
             q.record_chunk_cost_us(DimId::Overworld, 3, 3, ChunkCostKind::ModMachine, 1_000, tick);
         }
         assert!(!q.is_chunk_quarantined(DimId::Overworld, 3, 3));
-        assert!(q.chunk_tick_due(DimId::Overworld, 3, 3, 999));
+        assert!(q.chunk_due(DimId::Overworld, 3, 3, 999));
         assert!(
             q.alerts().iter().any(|a| a.contains("auto-lifted")),
             "{:?}",
@@ -3160,7 +3159,7 @@ mod server_reliability_tests {
         assert!(!q.clear_chunk_quarantine(DimId::Overworld, 9, 9));
         assert!(q.clear_chunk_quarantine(DimId::Overworld, 8, 8));
         assert!(!q.is_chunk_quarantined(DimId::Overworld, 8, 8));
-        assert!(q.chunk_tick_due(DimId::Overworld, 8, 8, 3));
+        assert!(q.chunk_due(DimId::Overworld, 8, 8, 3));
         assert!(
             q.alerts()
                 .iter()
