@@ -179,6 +179,16 @@ fn one_update_per_changed_mesh_node_and_sub_millisecond_solve() {
             .len(),
         on.updates.len()
     );
+    let one_pass_neighbor_candidates = solver
+        .nodes()
+        .iter()
+        .filter(|node| node.power > 1)
+        .map(|node| node.links.len())
+        .sum::<usize>();
+    assert_eq!(
+        on.stats.naive_vanilla_updates_avoided,
+        one_pass_neighbor_candidates.saturating_sub(on.stats.state_changes)
+    );
 
     nodes[0].source_power = None;
     for (left, right) in solver.nodes_mut().iter_mut().zip(nodes) {

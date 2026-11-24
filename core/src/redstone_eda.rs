@@ -62,7 +62,7 @@ pub struct WireSolveStats {
     pub nodes_visited: usize,
     /// Number of emitted block-state changes.
     pub state_changes: usize,
-    /// Duplicate neighbor updates avoided relative to a naive cascade.
+    /// Per-edge neighbor writes consolidated into the final block-state delta.
     pub naive_vanilla_updates_avoided: usize,
 }
 
@@ -109,6 +109,7 @@ impl RedstoneWireSolver {
         }
 
         let mut nodes_visited = 0;
+        let mut neighbor_candidates = 0_usize;
         for level in (1_u8..=15).rev() {
             while let Some(index) = buckets[usize::from(level)].pop() {
                 if best[index] != level {
@@ -123,6 +124,7 @@ impl RedstoneWireSolver {
                     if link.to >= self.nodes.len() {
                         continue;
                     }
+                    neighbor_candidates += 1;
                     if next_power > best[link.to] {
                         best[link.to] = next_power;
                         buckets[usize::from(next_power)].push(link.to);
@@ -150,7 +152,7 @@ impl RedstoneWireSolver {
             stats: WireSolveStats {
                 nodes_visited,
                 state_changes,
-                naive_vanilla_updates_avoided: nodes_visited.saturating_sub(state_changes),
+                naive_vanilla_updates_avoided: neighbor_candidates.saturating_sub(state_changes),
             },
         }
     }
