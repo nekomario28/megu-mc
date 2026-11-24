@@ -1582,6 +1582,60 @@ fn fog_factor_at(world: vec3<f32>) -> f32 {
     return clamp(max(linear, expo), 0.0, 1.0);
 }
 
+// Prefix mask over the first `count` of 64 dynamic lights (u64 as lo/hi).
+fn light_mask_prefix(count: u32) -> vec2<u32> {
+    if (count >= 64u) {
+        return vec2<u32>(0xFFFFFFFFu, 0xFFFFFFFFu);
+    }
+    if (count == 32u) {
+        return vec2<u32>(0xFFFFFFFFu, 0u);
+    }
+    if (count > 32u) {
+        return vec2<u32>(0xFFFFFFFFu, (1u << (count - 32u)) - 1u);
+    }
+    if (count == 0u) {
+        return vec2<u32>(0u, 0u);
+    }
+    return vec2<u32>((1u << count) - 1u, 0u);
+}
+
+// Removes and returns the lowest set bit index of the u64 mask
+// (lo = x, hi = y), or 64 when empty — one countTrailingZeros per light.
+fn light_mask_take(mask: ptr<function, vec2<u32>>) -> u32 {
+    if ((*mask).x != 0u) {
+        let i = countTrailingZeros((*mask).x);
+        (*mask).x = (*mask).x & ((*mask).x - 1u);
+        return i;
+    }
+    if ((*mask).y != 0u) {
+        let i = countTrailingZeros((*mask).y);
+        (*mask).y = (*mask).y & ((*mask).y - 1u);
+        return 32u + i;
+    }
+    return 64u;
+}
+
+// Draw-scoped light mask: the prefix over `count` admitted lights ANDed
+// by the shared union mask in light_count.yz (zero = no shared culling)
+// and this draw record's region mask packed into params2.xy (zero =
+// check-all for this draw). The walk below visits only bits that could
+// reach the drawn AABB.
+fn draw_light_mask(count: u32) -> vec2<u32> {
+    var mask = light_mask_prefix(count);
+    let region = dyn_lights.light_count.yz;
+    if (region.x != 0u || region.y != 0u) {
+        mask = mask & region;
+    }
+    let per_draw = vec2<u32>(
+        bitcast<u32>(draw.params2.x),
+        bitcast<u32>(draw.params2.y),
+    );
+    if (per_draw.x != 0u || per_draw.y != 0u) {
+        mask = mask & per_draw;
+    }
+    return mask;
+}
+
 // Apply one luminance-independent shoulder to preserve highlight chromaticity.
 fn filmic(color: vec3<f32>) -> vec3<f32> {
     let peak = max(max(color.r, color.g), color.b);
@@ -1707,14 +1761,24 @@ fn terrain_fs(in: TerrainFragment) -> @location(0) vec4<f32> {
     var color = in.albedo;
     let surface = in.albedo * texel;
     color *= texel;
-    let count = min(dyn_lights.light_count.x, 64u);
-    for (var i = 0u; i < count; i = i + 1u) {
+    var light_mask = draw_light_mask(min(dyn_lights.light_count.x, 64u));
+    loop {
+        let i = light_mask_take(&light_mask);
+        if (i >= 64u) {
+            break;
+        }
         let pl = dyn_lights.lights[i];
         let delta = pl.position_radius.xyz - in.world;
         let radius = max(pl.position_radius.w, 0.01);
-        let dist_sq = max(dot(delta, delta), 0.0001);
-        let dist = sqrt(dist_sq);
-        let falloff = pow(max(1.0 - dist / radius, 0.0), 2.0);
+        let dist_sq = dot(delta, delta);
+        // Outside the bounding sphere the falloff is exactly zero —
+        // skip before paying the sqrt.
+        if (dist_sq >= radius * radius) {
+            continue;
+        }
+        let dist = sqrt(max(dist_sq, 0.0001));
+        let t = max(1.0 - dist * (1.0 / radius), 0.0);
+        let falloff = t * t;
         let diffuse = max(dot(n, delta / dist), 0.0);
         color += surface * pl.color_intensity.xyz * pl.color_intensity.w
             * diffuse * falloff;
@@ -1731,14 +1795,22 @@ fn terrain_translucent_fs(in: TranslucentFragment) -> @location(0) vec4<f32> {
     let n = normalize(in.normal);
     let surface = in.albedo * atlas_sample_rect(in.atlas_rect, in.atlas_anim, in.uv);
     var color = surface;
-    let count = min(dyn_lights.light_count.x, 64u);
-    for (var i = 0u; i < count; i = i + 1u) {
+    var light_mask = draw_light_mask(min(dyn_lights.light_count.x, 64u));
+    loop {
+        let i = light_mask_take(&light_mask);
+        if (i >= 64u) {
+            break;
+        }
         let pl = dyn_lights.lights[i];
         let delta = pl.position_radius.xyz - in.world;
         let radius = max(pl.position_radius.w, 0.01);
-        let dist_sq = max(dot(delta, delta), 0.0001);
-        let dist = sqrt(dist_sq);
-        let falloff = pow(max(1.0 - dist / radius, 0.0), 2.0);
+        let dist_sq = dot(delta, delta);
+        if (dist_sq >= radius * radius) {
+            continue;
+        }
+        let dist = sqrt(max(dist_sq, 0.0001));
+        let t = max(1.0 - dist * (1.0 / radius), 0.0);
+        let falloff = t * t;
         let diffuse = max(dot(n, delta / dist), 0.0);
         color += surface * pl.color_intensity.xyz * pl.color_intensity.w
             * diffuse * falloff;
@@ -1878,6 +1950,59 @@ fn atlas_sample(sprite_id: u32, uv: vec2<f32>) -> vec3<f32> {
         duv_dx, duv_dy,
     ).rgb;
     return mix(cur, next, frame.anim.y);
+}
+
+// Prefix mask over the first `count` of 64 dynamic lights (u64 as lo/hi).
+fn light_mask_prefix(count: u32) -> vec2<u32> {
+    if (count >= 64u) {
+        return vec2<u32>(0xFFFFFFFFu, 0xFFFFFFFFu);
+    }
+    if (count == 32u) {
+        return vec2<u32>(0xFFFFFFFFu, 0u);
+    }
+    if (count > 32u) {
+        return vec2<u32>(0xFFFFFFFFu, (1u << (count - 32u)) - 1u);
+    }
+    if (count == 0u) {
+        return vec2<u32>(0u, 0u);
+    }
+    return vec2<u32>((1u << count) - 1u, 0u);
+}
+
+// Removes and returns the lowest set bit index of the u64 mask
+// (lo = x, hi = y), or 64 when empty — one countTrailingZeros per light.
+fn light_mask_take(mask: ptr<function, vec2<u32>>) -> u32 {
+    if ((*mask).x != 0u) {
+        let i = countTrailingZeros((*mask).x);
+        (*mask).x = (*mask).x & ((*mask).x - 1u);
+        return i;
+    }
+    if ((*mask).y != 0u) {
+        let i = countTrailingZeros((*mask).y);
+        (*mask).y = (*mask).y & ((*mask).y - 1u);
+        return 32u + i;
+    }
+    return 64u;
+}
+
+// Draw-scoped light mask: the prefix over `count` admitted lights ANDed
+// by the shared union mask in light_count.yz (zero = no shared culling)
+// and this draw record's region mask packed into params2.xy (zero =
+// check-all for this draw).
+fn draw_light_mask(count: u32) -> vec2<u32> {
+    var mask = light_mask_prefix(count);
+    let region = dyn_lights.light_count.yz;
+    if (region.x != 0u || region.y != 0u) {
+        mask = mask & region;
+    }
+    let per_draw = vec2<u32>(
+        bitcast<u32>(draw.params2.x),
+        bitcast<u32>(draw.params2.y),
+    );
+    if (per_draw.x != 0u || per_draw.y != 0u) {
+        mask = mask & per_draw;
+    }
+    return mask;
 }
 
 fn filmic(color: vec3<f32>) -> vec3<f32> {
@@ -2020,14 +2145,22 @@ fn lit_fs(in: LitFragment) -> @location(0) vec4<f32> {
     light += vec3<f32>(env.sun.w) * max(dot(n, normalize(env.sun.xyz)), 0.0);
     light += vec3<f32>(in.light_add);
     var color = surface * light;
-    let count = min(dyn_lights.light_count.x, 64u);
-    for (var i = 0u; i < count; i = i + 1u) {
+    var light_mask = draw_light_mask(min(dyn_lights.light_count.x, 64u));
+    loop {
+        let i = light_mask_take(&light_mask);
+        if (i >= 64u) {
+            break;
+        }
         let pl = dyn_lights.lights[i];
         let delta = pl.position_radius.xyz - in.world;
         let radius = max(pl.position_radius.w, 0.01);
-        let dist_sq = max(dot(delta, delta), 0.0001);
-        let dist = sqrt(dist_sq);
-        let falloff = pow(max(1.0 - dist / radius, 0.0), 2.0);
+        let dist_sq = dot(delta, delta);
+        if (dist_sq >= radius * radius) {
+            continue;
+        }
+        let dist = sqrt(max(dist_sq, 0.0001));
+        let t = max(1.0 - dist * (1.0 / radius), 0.0);
+        let falloff = t * t;
         let diffuse = max(dot(n, delta / dist), 0.0);
         color += surface * pl.color_intensity.xyz * pl.color_intensity.w
             * diffuse * falloff;
@@ -2068,11 +2201,15 @@ fn lit_fs(in: LitFragment) -> @location(0) vec4<f32> {
     light += vec3<f32>(env.sun.w) * max(dot(n, normalize(env.sun.xyz)), 0.0);
     light += vec3<f32>(in.light_add);
     var color = surface * light;
-    let count = min(dyn_lights.light_count.x, 64u);
+    var light_mask = draw_light_mask(min(dyn_lights.light_count.x, 64u));
     var light16 = vec3<f16>(0.0);
     let n16 = vec3<f16>(n);
     let surface16 = vec3<f16>(surface);
-    for (var i = 0u; i < count; i = i + 1u) {
+    loop {
+        let i = light_mask_take(&light_mask);
+        if (i >= 64u) {
+            break;
+        }
         let pl = dyn_lights.lights[i];
         let d16 = vec3<f16>(clamp(
             pl.position_radius.xyz - in.world,
@@ -2080,9 +2217,15 @@ fn lit_fs(in: LitFragment) -> @location(0) vec4<f32> {
             vec3<f32>(32000.0),
         ));
         let radius = f16(max(pl.position_radius.w, 0.01));
-        let dist_sq = max(dot(d16, d16), f16(0.0001));
-        let dist = sqrt(dist_sq);
-        let falloff = pow(max(f16(1.0) - dist / radius, f16(0.0)), f16(2.0));
+        let dist_sq = dot(d16, d16);
+        // Outside the bounding sphere the falloff is exactly zero —
+        // skip before paying the half-precision sqrt.
+        if (dist_sq >= radius * radius) {
+            continue;
+        }
+        let dist = sqrt(max(dist_sq, f16(0.0001)));
+        let t = max(f16(1.0) - dist * (f16(1.0) / radius), f16(0.0));
+        let falloff = t * t;
         let diffuse = max(dot(n16, d16 / dist), f16(0.0));
         light16 += surface16 * vec3<f16>(pl.color_intensity.xyz)
             * f16(pl.color_intensity.w) * diffuse * falloff;

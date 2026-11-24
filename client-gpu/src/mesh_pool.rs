@@ -606,6 +606,29 @@ fn splat_quad(
     let max_x = px.iter().fold(f32::NEG_INFINITY, |a, &b| a.max(b));
     let min_y = py.iter().fold(f32::INFINITY, |a, &b| a.min(b));
     let max_y = py.iter().fold(f32::NEG_INFINITY, |a, &b| a.max(b));
+    // Cheap bbox reject: claiming a texel needs an open disc of radius
+    // INSIDE_MARGIN inside the convex quad, so its bbox must exceed
+    // 2*INSIDE_MARGIN in BOTH axes — slivers and sub-texel quads can
+    // never set a depth value. (Skipped for quads with a degenerate
+    // edge, whose 1e-6 length clamp makes `dist` unreliable; they cost
+    // the same loop the old code ran.)
+    let mut ex = [0.0f32; 4];
+    let mut ey = [0.0f32; 4];
+    let mut len = [0.0f32; 4];
+    let mut nondegenerate = true;
+    for edge in 0..4 {
+        let next = (edge + 1) % 4;
+        ex[edge] = px[next] - px[edge];
+        ey[edge] = py[next] - py[edge];
+        let len_sq = ex[edge] * ex[edge] + ey[edge] * ey[edge];
+        len[edge] = len_sq.sqrt().max(1.0e-6);
+        nondegenerate &= len_sq > 1.0e-12;
+    }
+    if nondegenerate
+        && (max_x - min_x <= 2.0 * INSIDE_MARGIN || max_y - min_y <= 2.0 * INSIDE_MARGIN)
+    {
+        return;
+    }
     let x0 = (min_x.floor() as i32).clamp(0, width as i32);
     let x1 = (max_x.ceil() as i32).clamp(0, width as i32);
     let y0 = (min_y.floor() as i32).clamp(0, height as i32);
@@ -616,14 +639,12 @@ fn splat_quad(
             let cx = tx as f32 + 0.5;
             // Inside the convex projected quad iff the center is more than
             // INSIDE_MARGIN texels inside every edge, on either winding.
+            // Edge vectors and lengths are hoisted — the old inner loop
+            // recomputed (ex*ex + ey*ey).sqrt() four times per texel.
             let mut all_pos = true;
             let mut all_neg = true;
             for edge in 0..4 {
-                let (ax, ay) = (px[edge], py[edge]);
-                let (bx, by) = (px[(edge + 1) % 4], py[(edge + 1) % 4]);
-                let (ex, ey) = (bx - ax, by - ay);
-                let len = (ex * ex + ey * ey).sqrt().max(1.0e-6);
-                let dist = (ex * (cy - ay) - ey * (cx - ax)) / len;
+                let dist = (ex[edge] * (cy - py[edge]) - ey[edge] * (cx - px[edge])) / len[edge];
                 all_pos &= dist > INSIDE_MARGIN;
                 all_neg &= dist < -INSIDE_MARGIN;
             }

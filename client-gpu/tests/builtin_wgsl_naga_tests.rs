@@ -7,9 +7,11 @@
 use megu_client::shaders::{TERRAIN_OPAQUE_WGSL, TERRAIN_TRANSLUCENT_WGSL};
 use megu_client_gpu::renderer::{
     compact_caster_wgsl, compact_pack_terrain_wgsl, compact_terrain_wgsl, composed_shadow_wgsl,
-    region_opaque_wgsl, terrain_wgsl,
+    region_opaque_wgsl, terrain_wgsl, terrain_wgsl_f16,
 };
-use megu_client_gpu::subworld_render::{COMPOSITE_LIT_WGSL, COMPOSITE_TERRAIN_WGSL};
+use megu_client_gpu::subworld_render::{
+    lit_wgsl, lit_wgsl_f16, COMPOSITE_LIT_WGSL, COMPOSITE_TERRAIN_WGSL,
+};
 use megu_client_mesh::builtin_shadow_wgsl::{
     BUILTIN_SHADOW_SHADERS, MEGU_SHADOW_CASTERS_WGSL, MEGU_SHADOW_CUTOUT_DEPTH_WGSL,
     MEGU_SHADOW_DEPTH_WGSL, MEGU_SHADOW_SAMPLING_WGSL, MEGU_SKY_ATMOSPHERE_WGSL,
@@ -338,4 +340,91 @@ fn other_fs() -> @location(0) vec4<f32> {
 }
 "#;
     assert_eq!(compact_pack_terrain_wgsl(untouchable), untouchable);
+}
+
+#[test]
+fn dynamic_light_loops_walk_region_mask_and_validate_with_naga() {
+    // OPT #10: every dynamic-light fragment loop iterates `light_mask_take`
+    // over a `draw_light_mask` bitset (shared union mask in `light_count.yz`
+    // ANDed with the per-draw `params2.xy` region mask) and early-outs on
+    // `radius²` before `sqrt`. All produced variants — f32 and f16 — must
+    // still pass the real naga frontend + validator.
+    let terrain_f16 = terrain_wgsl_f16();
+    assert!(
+        terrain_f16.starts_with("enable f16;"),
+        "f16 terrain variant must open with the capability enable"
+    );
+    let lit_f16 = lit_wgsl_f16();
+    assert!(
+        lit_f16.starts_with("enable f16;"),
+        "f16 lit variant must open with the capability enable"
+    );
+    let terrain_f32 = terrain_wgsl(false);
+    let lit_f32 = lit_wgsl(false);
+    let modules: [(&str, &str); 6] = [
+        ("COMPOSITE_TERRAIN_WGSL", COMPOSITE_TERRAIN_WGSL),
+        ("COMPOSITE_LIT_WGSL", COMPOSITE_LIT_WGSL),
+        ("terrain_wgsl(f32)", terrain_f32.as_ref()),
+        ("terrain_wgsl_f16", terrain_f16.as_str()),
+        ("lit_wgsl(f32)", lit_f32.as_ref()),
+        ("lit_wgsl_f16", lit_f16.as_str()),
+    ];
+    for (name, source) in modules {
+        let module = compile_and_validate(name, source);
+        assert!(
+            !module.entry_points.is_empty(),
+            "{name} lost all entry points"
+        );
+        assert!(
+            source.contains("light_mask_take(&light_mask)"),
+            "{name} lost the light-mask walk"
+        );
+        assert!(
+            source.contains("dist_sq >= radius * radius"),
+            "{name} lost the radius² early-out before sqrt"
+        );
+    }
+    // The shared prefix must define the three mask helpers once each, and
+    // the per-draw region mask must be ANDed into the walk bitset.
+    for (name, source) in [
+        ("COMPOSITE_TERRAIN_WGSL", COMPOSITE_TERRAIN_WGSL),
+        ("COMPOSITE_LIT_WGSL", COMPOSITE_LIT_WGSL),
+    ] {
+        assert_eq!(
+            source.matches("fn light_mask_prefix").count(),
+            1,
+            "{name} must define light_mask_prefix once"
+        );
+        assert_eq!(
+            source.matches("fn light_mask_take").count(),
+            1,
+            "{name} must define light_mask_take once"
+        );
+        assert_eq!(
+            source.matches("fn draw_light_mask").count(),
+            1,
+            "{name} must define draw_light_mask once"
+        );
+        assert!(
+            source.contains("dyn_lights.light_count.yz"),
+            "{name} lost the shared union mask read"
+        );
+        assert!(
+            source.contains("draw.params2.x") && source.contains("draw.params2.y"),
+            "{name} lost the per-draw params2 mask read"
+        );
+    }
+    // Opaque + translucent terrain loops each walk the mask (2 sites),
+    // and the f16 splices inherit the prefix helpers verbatim.
+    for (name, source) in [
+        ("COMPOSITE_TERRAIN_WGSL", COMPOSITE_TERRAIN_WGSL),
+        ("terrain_wgsl(f32)", terrain_f32.as_ref()),
+        ("terrain_wgsl_f16", terrain_f16.as_str()),
+    ] {
+        assert_eq!(
+            source.matches("light_mask_take(&light_mask)").count(),
+            2,
+            "{name} must walk the mask in both opaque and translucent loops"
+        );
+    }
 }
