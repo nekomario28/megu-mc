@@ -706,15 +706,18 @@ check "the light packet assembles spill into its floors" \
 
 check "a knocked-out gravity block becomes an entity" \
   src/main.rs '        let eid = NEXT_EID.fetch_add(1, Ordering::SeqCst);
-        falling().lock().unwrap_or_else(|e| e.into_inner()).push(Fall {
-            eid,
-            x: px as f64 + 0.5,
-            y: py as f64,
-            z: pz as f64 + 0.5,
-            dy: 0.0,
-            state: st,
-            time: 0,
-        });' \
+        falling()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .push(Fall {
+                eid,
+                x: px as f64 + 0.5,
+                y: py as f64,
+                z: pz as f64 + 0.5,
+                dy: 0.0,
+                state: st,
+                time: 0,
+            });' \
   '        let _eid = NEXT_EID.fetch_add(1, Ordering::SeqCst);' \
   concurrent_knockout_and_falling_conserve_blocks
 check "light sections start one below the world" \
@@ -855,21 +858,23 @@ check "containers must be decoded, not merely remain absent" \
   a_broken_chest_leaves_no_orphan_entry_across_a_save_and_load
 
 check "a broken furnace cannot retain its slots" \
-  src/main.rs '            if let Some(f) = furnaces().lock().unwrap_or_else(|e| e.into_inner()).remove(&ow_block((x, y, z))) {' \
-  '            if let Some(f) = furnaces().lock().unwrap_or_else(|e| e.into_inner()).remove(&ow_block((x, y, z + 1000))) {' \
+  src/main.rs '            if let Some(f) = furnaces()
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .remove(&ow_block((x, y, z)))
+            {' \
+  '            if let Some(f) = furnaces()
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .remove(&ow_block((x, y, z + 1000)))
+            {' \
   furnace_and_sign_round_trip_keeps_only_live_owners
 
 check "broken sign text cannot survive its block" \
-  src/main.rs '            signs()
-                .lock()
-                .unwrap()
-                .retain(|&(dim, sx, sy, sz, _), _| {
-                    !(dim == DimId::Overworld && sx == x && sy == y && sz == z)
-                });' \
-  '            signs()
-                .lock()
-                .unwrap()
-                .retain(|_, _| true);' \
+  src/main.rs '            signs().lock().unwrap_or_else(|e| e.into_inner()).retain(|&(dim, sx, sy, sz, _), _| {
+                !(dim == DimId::Overworld && sx == x && sy == y && sz == z)
+            });' \
+  '            signs().lock().unwrap_or_else(|e| e.into_inner()).retain(|_, _| true);' \
   furnace_and_sign_round_trip_keeps_only_live_owners
 # The note block's per-state solidity and light now come from the pinned fact table, so this
 # mutation moves to the column it reads. The pumpkin `state_flags` load it used to break is
@@ -1211,14 +1216,8 @@ check "chat returns the actual sender and message" \
   tests/gameplay_wire.py 'gameplay wire: FAIL chat-echo'
 
 check "light arrays agree with their section masks" \
-  src/main.rs '        write_varint(
-            p,
-            mask.iter().map(|w| w.count_ones() as i64).sum::<i64>(),
-        );' \
-  '        write_varint(
-            p,
-            mask.iter().map(|w| w.count_ones() as i64).sum::<i64>() + 1,
-        );' \
+  src/main.rs '        write_varint(p, mask.iter().map(|w| w.count_ones() as i64).sum::<i64>());' \
+  '        write_varint(p, mask.iter().map(|w| w.count_ones() as i64).sum::<i64>() + 1);' \
   tests/gameplay_wire.py 'gameplay wire: FAIL light-mask-count'
 check "an update packet sends block light only" \
   src/main.rs '        [Vec::new(), mask, Vec::new(), empty],' \
@@ -1409,7 +1408,10 @@ check "a removed container closes its window on windowId 1" \
             if let Ok(mut w) = c.sock.lock() {
                 let _ = send_packet(&mut w, 0x12, vec![1u8]);
             }
-            closed += 1;' \
+            closed += 1;
+        }
+    }
+    sync_chest_openers(audience, &before);' \
   '        if had {
             *c.chest_sync.lock().unwrap_or_else(|e| e.into_inner()) = None;
         }
@@ -1417,7 +1419,10 @@ check "a removed container closes its window on windowId 1" \
             if let Ok(mut w) = c.sock.lock() {
                 let _ = send_packet(&mut w, 0x12, Vec::new());
             }
-            closed += 1;' \
+            closed += 1;
+        }
+    }
+    sync_chest_openers(audience, &before);' \
   a_removed_container_closes_the_window_built_on_it
 
 check "a block container stops existing when its block does" \
@@ -2429,10 +2434,8 @@ check "typed feature draws exclude raw positional RNGs" \
   generation_math::tests::draw_trace_separates_wrapped_and_raw_sources
 
 check "dump-only requests cannot fall through to runtime persistence" \
-  src/main.rs '    if std::env::var_os("MEGU_WG_DUMP").is_some()
-        && std::env::var_os("MEGU_WG_PROFILE").is_none()' \
-  '    if std::env::var_os("MEGU_WG_DUMP").is_some()
-        && false' tests/population_plan_test.py 'population plan: FAIL missing-profile'
+  src/main.rs '    if std::env::var_os("MEGU_WG_DUMP").is_some() && std::env::var_os("MEGU_WG_PROFILE").is_none() {' \
+  '    if std::env::var_os("MEGU_WG_DUMP").is_some() && false {' tests/population_plan_test.py 'population plan: FAIL missing-profile'
 
 # Both huge mushrooms and huge fungus double height. Bind this mutation to the
 # mushroom's initial height draw; a bare `height *= 2` now matches both bodies.
@@ -2764,8 +2767,17 @@ check "unpacked empty chest minecarts persist their empty container without re-r
   mineshaft_runtime_tests::cart_deferred_loot_window_click_persistence_and_break_over_packets
 
 check "breaking a chest minecart removes its runtime container entry" \
-  src/main.rs '            if let Some(slots) = chests().lock().unwrap_or_else(|e| e.into_inner()).remove(&ContainerKey::Cart(uuid)) {' \
-  '            if let Some(slots) = chests().lock().unwrap_or_else(|e| e.into_inner()).get(&ContainerKey::Cart(uuid)).cloned() {' \
+  src/main.rs '            if let Some(slots) = chests()
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .remove(&ContainerKey::Cart(uuid))
+            {' \
+  '            if let Some(slots) = chests()
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .get(&ContainerKey::Cart(uuid))
+                .cloned()
+            {' \
   mineshaft_runtime_tests::cart_deferred_loot_window_click_persistence_and_break_over_packets
 
 check "cave-spider spawner light check rejects lit blocks" \
@@ -2774,13 +2786,25 @@ check "cave-spider spawner light check rejects lit blocks" \
   mineshaft_runtime_tests::spawner_runtime_tick_light_cap_break_and_persistence
 
 check "cave-spider spawner counts living nearby spiders for MaxNearbyEntities" \
-  src/main.rs '            .filter(|m| m.dim == DimId::Overworld && m.etype == cave_spider && *m.hp.lock().unwrap_or_else(|e| e.into_inner()) > 0.0)' \
-  '            .filter(|m| m.dim == DimId::Overworld && m.etype == cave_spider && *m.hp.lock().unwrap_or_else(|e| e.into_inner()) < 0.0)' \
+  src/main.rs '            .filter(|m| {
+                m.dim == DimId::Overworld
+                    && m.etype == cave_spider
+                    && *m.hp.lock().unwrap_or_else(|e| e.into_inner()) > 0.0
+            })' \
+  '            .filter(|m| {
+                m.dim == DimId::Overworld
+                    && m.etype == cave_spider
+                    && *m.hp.lock().unwrap_or_else(|e| e.into_inner()) < 0.0
+            })' \
   mineshaft_runtime_tests::spawner_runtime_tick_light_cap_break_and_persistence
 
 check "breaking a spawner block removes its owned NBT entry" \
   src/main.rs '    if Some(st) != name_to_state("spawner") {
-        generated_content().lock().unwrap_or_else(|e| e.into_inner()).spawners.remove(&(x,y,z));
+        generated_content()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .spawners
+            .remove(&(x, y, z));
     }' \
   '    if Some(st) != name_to_state("spawner") {
         let _ = (x, y, z);
@@ -3573,8 +3597,15 @@ check "chest_contract_double_chest_blocks_when_either_half_blocked" \
   tick_tests::chest_contract_blocked_single_double_cat_and_unblocked_barrel
 
 check "chest_contract_broadcast_changes_diffs_both_halves" \
-  src/menus_and_items.rs '                if sync.last_slots[idx] != *stack {' \
-  '                if idx < 27 && sync.last_slots[idx] != *stack {' \
+  src/menus_and_items.rs '                let unchanged = match stack {
+                    Some(st) => *st == sync.last_slots[idx],
+                    None => sync.last_slots[idx].1 == 0,
+                };' \
+  '                let unchanged = idx >= 27
+                    || match stack {
+                        Some(st) => *st == sync.last_slots[idx],
+                        None => sync.last_slots[idx].1 == 0,
+                    };' \
   tick_tests::chest_contract_multi_viewer_broadcast_changes
 
 check "chest_contract_recheck_openers_enforces_reach" \
@@ -3674,14 +3705,17 @@ check "lake_feature_barrier_marks_above_for_post_processing" \
 # lazy block loot materialization, BarrelBlock open property, waterlogged dry partner Solid,
 # and EnderChestBlockEntity anchored 0x08 opener counting.
 check "chest_contract_3d_block_loot_lazy_defers_materialization" \
-  src/main.rs '                pending_block_loot().lock().unwrap_or_else(|e| e.into_inner()).insert(
-                    ow_block(pos),
-                    PendingBlockLoot {
-                        kind,
-                        loot_table,
-                        loot_seed,
-                    },
-                );' \
+  src/main.rs '                pending_block_loot()
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .insert(
+                        ow_block(pos),
+                        PendingBlockLoot {
+                            kind,
+                            loot_table,
+                            loot_seed,
+                        },
+                    );' \
   '                let rolled = roll_loot_container_slots(kind, &loot_table, loot_seed);
                 chests().lock().unwrap_or_else(|e| e.into_inner()).insert(ContainerKey::Block(ow_block(pos)), rolled);' \
   tick_tests::chest_contract_3d_block_loot_stays_lazy_until_first_open
@@ -3706,7 +3740,7 @@ check "chest_contract_3d_dry_chest_is_solid_for_fluid" \
   tick_tests::chest_contract_3d_waterlogged_double_chest_schedules_and_spreads_without_dry_partner_error
 
 check "chest_contract_3d_ender_chest_counts_anchor_openers" \
-  src/menus_and_items.rs '            if matches!(a, ContainerKey::Block(ek) if is_ender_key((ek.1, ek.2, ek.3))) && b.is_none() {' \
+  src/play_protocol.rs '            if matches!(a, ContainerKey::Block(ek) if is_ender_key((ek.1, ek.2, ek.3))) && b.is_none() {' \
   '            if false && matches!(a, ContainerKey::Block(ek) if is_ender_key((ek.1, ek.2, ek.3))) && b.is_none() {' \
   tick_tests::chest_contract_3d_ender_chest_emits_block_event_and_invalidates_on_break
 

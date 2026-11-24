@@ -7322,7 +7322,10 @@ fn chest_placement_pairs_only_with_a_matching_single_chest() {
         Some("single"),
         "a third chest beside a paired half stays single"
     );
-    assert_eq!(chest_partner(row[2].0, row[2].1, row[2].2), None);
+    assert_eq!(
+        chest_partner_dim(DimId::Overworld, row[2].0, row[2].1, row[2].2),
+        None
+    );
     for cell in row.iter().chain([left, right, plain, trapped].iter()) {
         set_block(cell.0, cell.1, cell.2, 0);
     }
@@ -7391,7 +7394,10 @@ fn breaking_a_half_reverts_the_survivor_to_single() {
         Some("single"),
         "the survivor must not stay a half with no partner"
     );
-    assert_eq!(chest_partner(left.0, left.1, left.2), None);
+    assert_eq!(
+        chest_partner_dim(DimId::Overworld, left.0, left.1, left.2),
+        None
+    );
     set_block(left.0, left.1, left.2, 0);
 }
 
