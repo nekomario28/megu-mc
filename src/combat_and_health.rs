@@ -528,6 +528,31 @@ fn refresh_equip_attrs(c: &Client) {
             m.insert(id, (add, mb, mt));
         }
     }
+    // Vanilla `MaceItem` smash with Density (id 6): a held mace whose wielder
+    // has fallen more than the 1.5-block smash trigger adds `0.5 * level`
+    // damage per block fallen past the threshold. The bonus rides the same
+    // attack-damage attribute view the melee damage line reads next.
+    if let Some((_, mace)) = pairs
+        .iter()
+        .find(|(group, _)| *group == ItemAttrSlotGroup::MainHand)
+    {
+        let density = if mace.0 == name_to_item("mace").unwrap_or(-6) {
+            enchant_level(&mace.2, 6)
+        } else {
+            0
+        };
+        if density > 0 {
+            let (_, y, _, _, _, grounded) = *c.pos.lock().unwrap_or_else(|e| e.into_inner());
+            let fall = *c.fall_from.lock().unwrap_or_else(|e| e.into_inner()) - y;
+            if !grounded && fall > 1.5 {
+                let bonus =
+                    f64::from(density_smash_bonus_damage(density as i32, (fall - 1.5) as f32));
+                let (add, mb, mt) =
+                    m.get(&ATTR_ATTACK_DAMAGE).copied().unwrap_or((0.0, 0.0, 1.0));
+                m.insert(ATTR_ATTACK_DAMAGE, (add + bonus, mb, mt));
+            }
+        }
+    }
     equip_attrs().lock().unwrap_or_else(|e| e.into_inner()).insert(c.name.clone(), m);
 }
 
@@ -651,6 +676,7 @@ fn melee_charge(me: &Arc<Client>, item: i64) -> f32 {
             wall: Some(*lm),
         },
     );
+    mace_smash_eval(me, item);
     refresh_equip_attrs(me);
     charge
 }
@@ -1272,6 +1298,124 @@ fn wind_charge_burst(dim: DimId, kind: WindChargeKind, impact: [f64; 3], thrower
     ac_note_explosion(dim, impact, profile.radius);
 }
 
+// ---------- mace smash (Density damage / Wind Burst launch) ----------
+
+/// A mace smash recorded at swing time (vanilla `Player.attack`): the hit's
+/// Density bonus rides the attack-damage attribute view, while the Wind
+/// Burst self-launch and radial knockback pulse apply on the next
+/// combat-state tick, mirroring `doPostAttack`.
+struct MaceSmash {
+    dim: DimId,
+    pos: [f64; 3],
+    /// Wind Burst level on the mace (`enchant_level(.., 41)` at swing time).
+    level: i64,
+    /// Blocks the wielder had fallen when the smash landed.
+    fall: f64,
+}
+static MACE_SMASHES: OnceLock<Mutex<HashMap<i32, MaceSmash>>> = OnceLock::new();
+fn mace_smashes() -> &'static Mutex<HashMap<i32, MaceSmash>> {
+    MACE_SMASHES.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+/// Vanilla `WindBurstEnchantment` (id 41): the wielder is flung `0.3 +
+/// 0.9 * level` blocks upward — I=1.2, II=2.1, III=3.0.
+fn wind_burst_bounce_velocity(level: i64) -> f64 {
+    if level <= 0 {
+        0.0
+    } else {
+        0.3 + 0.9 * level as f64
+    }
+}
+
+/// Evaluate a swing for a Wind Burst mace smash, called from `melee_charge`
+/// at attack time: the held item is a mace, the attacker is past the vanilla
+/// 1.5-block smash fall threshold, is not gliding (`WindBurstEnchantment`
+/// refuses elytra flight) and carries a positive level. A qualifying swing
+/// queues the launch for `combat2_state_tick`.
+fn mace_smash_eval(me: &Arc<Client>, item: i64) {
+    if item != name_to_item("mace").unwrap_or(-6) {
+        return;
+    }
+    let level = {
+        let held_slot = 36 + *me.held.lock().unwrap_or_else(|e| e.into_inner());
+        me.inv
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(&held_slot)
+            .map(|stack| enchant_level(&stack.2, 41))
+            .unwrap_or(0)
+    };
+    if level <= 0 {
+        return;
+    }
+    let (x, y, z, _, _, grounded) = *me.pos.lock().unwrap_or_else(|e| e.into_inner());
+    if grounded || *me.fall_fly.lock().unwrap_or_else(|e| e.into_inner()) {
+        return;
+    }
+    let fall = *me.fall_from.lock().unwrap_or_else(|e| e.into_inner()) - y;
+    if fall <= 1.5 {
+        return;
+    }
+    mace_smashes().lock().unwrap_or_else(|e| e.into_inner()).insert(
+        me.eid,
+        MaceSmash {
+            dim: *me.dim.lock().unwrap_or_else(|e| e.into_inner()),
+            pos: [x, y, z],
+            level,
+            fall,
+        },
+    );
+}
+
+/// Apply the queued Wind Burst (`WindBurstEnchantment.doPostAttack`): the
+/// wielder gets the level-scaled upward bounce, entities in the burst reach
+/// take the radial knockback pulse, and the wielder's fall distance resets
+/// at the burst Y so the mace combo only counts the drop below it.
+fn wind_burst_apply(c: &Arc<Client>, smash: MaceSmash) {
+    let bounce = wind_burst_bounce_velocity(smash.level);
+    let pkt = velocity_pkt(c.eid, 0, (bounce * 8000.0) as i16, 0);
+    if let Ok(mut w) = c.sock.lock() {
+        let _ = send_packet(&mut w, 0x5a, pkt.clone());
+    }
+    broadcast_seen_ex(c.eid, c.eid, |_c| (0x5a, pkt.clone()));
+    wind_charge_reset_fall(c, smash.pos[1]);
+    // `WindBurstEnchantment` detonates a level-scaled burst (strength
+    // `3.5 * level`); `wind_burst_bounce_strength` gives that per level
+    // for a qualifying smash fall.
+    let power = wind_burst_bounce_strength(smash.level as i32, smash.fall as f32, false);
+    for m in mobs().lock().unwrap_or_else(|e| e.into_inner()).iter() {
+        if m.dim != smash.dim {
+            continue;
+        }
+        let (mx, my, mz, ..) = *m.pos.lock().unwrap_or_else(|e| e.into_inner());
+        let eye = my + f64::from(entity_eye_height_1211(m.etype));
+        if let Some(dv) = evaluate_wind_charge_burst(
+            WindChargeKind::Player,
+            smash.pos,
+            [mx, my, mz],
+            eye,
+            1.0,
+            0.0,
+        ) {
+            let mut p = m.pos.lock().unwrap_or_else(|e| e.into_inner());
+            p.0 += dv[0];
+            p.1 += dv[1];
+            p.2 += dv[2];
+            let (nx, ny, nz, yaw, pitch) = *p;
+            drop(p);
+            broadcast_seen(m.eid, |_c| {
+                (0x70, entity_teleport(m.eid, nx, ny, nz, yaw, pitch, true))
+            });
+        }
+    }
+    broadcast(-1, |_c| {
+        (
+            0x20,
+            explosion_pkt_with_power(smash.pos[0], smash.pos[1], smash.pos[2], power.max(0.1), &[]),
+        )
+    });
+}
+
 // ---------- shield arc / warmup / axe disable ----------
 
 /// `getTicksUsingItem() >= 5`: the shield covers the player only after this
@@ -1327,6 +1471,25 @@ fn combat2_state_tick() {
         .lock()
         .unwrap_or_else(|e| e.into_inner())
         .retain(|eid, _| live.contains(eid));
+    {
+        // `doPostAttack` Wind Burst: each smash queued by `mace_smash_eval`
+        // resolves here — the wielder's upward launch, the radial knockback
+        // pulse and the fall-distance reset land one tick after the hit.
+        let mut smashes = mace_smashes().lock().unwrap_or_else(|e| e.into_inner());
+        let mut drained = Vec::new();
+        for c in &cls {
+            if let Some(smash) = smashes.remove(&c.eid) {
+                drained.push((Arc::clone(c), smash));
+            }
+        }
+        smashes.retain(|eid, _| live.contains(eid));
+        drop(smashes);
+        for (c, smash) in drained {
+            if *c.dim.lock().unwrap_or_else(|e| e.into_inner()) == smash.dim {
+                wind_burst_apply(&c, smash);
+            }
+        }
+    }
     wind_charge_projectile_step();
     fireworks_step();
 }
@@ -4344,10 +4507,19 @@ fn player_movement_exhaustion(c: &Client, (x, y, z): (f64, f64, f64)) -> f32 {
     } else if *c.sprinting.lock().unwrap_or_else(|e| e.into_inner()) {
         distance as f32 * 0.1
     } else if *c.sneaking.lock().unwrap_or_else(|e| e.into_inner()) {
-        distance as f32 * 0.005
+        // Vanilla `generic.sneaking_speed` (Swift Sneak, id 37): the sneak
+        // crawl rises from 0.3 by 0.15 per level (cap 1.0). Exhaustion tracks
+        // the distance covered, normalized on the 0.3 base crawl so an
+        // unenchanted sneak accrues exactly what it did before.
+        distance as f32 * 0.005 * sneak_movement_speed_multiplier(c) / 0.3
     } else {
         0.0
     };
+    // Vanilla per-tick enchant consumers that ride the movement hook:
+    // Frost Walker's `onEntityMoved` freeze around grounded feet and the
+    // fishing rod's Lure / Luck of the Sea on the owner's live bobber.
+    frost_walker_freeze(c);
+    apply_fishing_enchants(c);
     let hunger = c
         .effs
         .lock()
@@ -4712,7 +4884,18 @@ mod p1_combat_tests {
             attack_tickers().lock().unwrap_or_else(|e| e.into_inner()).remove(&4242);
             equip_attrs().lock().unwrap_or_else(|e| e.into_inner()).remove("totem-test");
             mobs().lock().unwrap_or_else(|e| e.into_inner()).retain(|m| m.eid != 4242);
+            mace_smashes().lock().unwrap_or_else(|e| e.into_inner()).remove(&4242);
+            clients()
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .retain(|c| c.eid != 4242);
         }
+    }
+
+    fn enchanted_stack(item: &str, ench: &[(i64, i64)]) -> Stack {
+        let mut comps = Vec::new();
+        comp_set(&mut comps, COMP_ENCHANTMENTS, enchantments_data(ench, true));
+        (name_to_item(item).unwrap(), 1, comps)
     }
 
     fn attr_stack(mods: &[ItemAttributeModifier]) -> Stack {
@@ -5039,6 +5222,195 @@ mod p1_combat_tests {
         assert_eq!(drops.len(), 64);
         assert!(drops.iter().all(|stack| stack.0 == 1 && stack.1 == 1));
         assert!(roll_loot(&[pool(4, Vec::new())]).is_empty());
+    }
+
+    #[test]
+    fn p1_combat_density_adds_fall_scaled_smash_damage() {
+        let _guard = crate::world_guard();
+        let _g = CombatGuard::new();
+        let (client, _rx) = client_pair();
+        // Airborne 6.5 blocks into a fall with a Density II mace in hand:
+        // +0.5 * 2 * (6.5 - 1.5) = +5 attack damage.
+        {
+            let mut p = client.pos.lock().unwrap_or_else(|e| e.into_inner());
+            *p = (0.0, 63.5, 0.0, 0.0, 0.0, false);
+        }
+        *client.fall_from.lock().unwrap_or_else(|e| e.into_inner()) = 70.0;
+        client
+            .inv
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(36, enchanted_stack("mace", &[(6, 2)]));
+        refresh_equip_attrs(&client);
+        let add = equip_attrs()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get("totem-test")
+            .and_then(|m| m.get(&ATTR_ATTACK_DAMAGE))
+            .copied()
+            .unwrap_or_default()
+            .0;
+        assert!(
+            (add - 5.0).abs() < 1e-6,
+            "density II after 5 smash blocks must add 5.0, got {add}"
+        );
+        // On the ground the smash bonus never applies.
+        client.pos.lock().unwrap_or_else(|e| e.into_inner()).5 = true;
+        refresh_equip_attrs(&client);
+        let add = equip_attrs()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get("totem-test")
+            .and_then(|m| m.get(&ATTR_ATTACK_DAMAGE))
+            .copied()
+            .unwrap_or_default()
+            .0;
+        assert_eq!(add, 0.0, "grounded swing keeps no density bonus");
+        // Below the 1.5-block smash trigger nothing applies either.
+        client.pos.lock().unwrap_or_else(|e| e.into_inner()).5 = false;
+        {
+            let mut p = client.pos.lock().unwrap_or_else(|e| e.into_inner());
+            p.1 = 69.0;
+        }
+        refresh_equip_attrs(&client);
+        let add = equip_attrs()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get("totem-test")
+            .and_then(|m| m.get(&ATTR_ATTACK_DAMAGE))
+            .copied()
+            .unwrap_or_default()
+            .0;
+        assert_eq!(add, 0.0, "a 1-block fall is below the smash trigger");
+        // And a non-mace item never carries the bonus.
+        client
+            .inv
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(36, enchanted_stack("diamond_sword", &[(6, 2)]));
+        {
+            let mut p = client.pos.lock().unwrap_or_else(|e| e.into_inner());
+            p.1 = 63.5;
+        }
+        refresh_equip_attrs(&client);
+        let add = equip_attrs()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get("totem-test")
+            .and_then(|m| m.get(&ATTR_ATTACK_DAMAGE))
+            .copied()
+            .unwrap_or_default()
+            .0;
+        assert_eq!(add, 0.0, "density on a sword does nothing");
+    }
+
+    #[test]
+    fn p1_combat_wind_burst_smash_bounces_resets_fall_and_pulses() {
+        let _guard = crate::world_guard();
+        let _g = CombatGuard::new();
+        let (client, mut rx) = client_pair();
+        // Airborne 4 blocks into a fall, Wind Burst I mace in hand.
+        {
+            let mut p = client.pos.lock().unwrap_or_else(|e| e.into_inner());
+            *p = (0.0, 66.0, 0.0, 0.0, 0.0, false);
+        }
+        *client.fall_from.lock().unwrap_or_else(|e| e.into_inner()) = 70.0;
+        client
+            .inv
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(36, enchanted_stack("mace", &[(41, 1)]));
+        let client = Arc::new(client);
+        clients()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .push(client.clone());
+        let mob = test_mob(4243);
+        *mob.pos.lock().unwrap_or_else(|e| e.into_inner()) = (0.4, 66.4, 0.0, 0.0, 0.0);
+        mobs().lock().unwrap_or_else(|e| e.into_inner()).push(mob.clone());
+
+        let mace = name_to_item("mace").unwrap();
+        melee_charge(&client, mace);
+        assert!(
+            mace_smashes()
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .contains_key(&4242),
+            "a qualifying mace smash queues the wind burst launch"
+        );
+        combat2_state_tick();
+        assert!(
+            mace_smashes().lock().unwrap_or_else(|e| e.into_inner()).is_empty(),
+            "the combat tick drains the queued smash"
+        );
+        // Fall distance resets to the burst Y so the combo only counts the
+        // drop below it.
+        assert_eq!(
+            *client.fall_from.lock().unwrap_or_else(|e| e.into_inner()),
+            66.0
+        );
+        // The wielder gets the level I upward launch (1.2 blocks → vy 9600).
+        let mut buf = [0u8; 64];
+        let n = std::io::Read::read(&mut rx, &mut buf).unwrap();
+        assert!(n > 0, "the wind burst writes the wielder velocity packet");
+        assert_eq!(buf[1], 0x5a, "first frame is the entity-velocity packet");
+        let vy = i16::from_be_bytes([buf[6], buf[7]]);
+        assert_eq!(vy, (1.2 * 8000.0) as i16, "wind burst I launches at 1.2");
+        // The radial pulse knocked the nearby mob away from the burst.
+        let mp = *mob.pos.lock().unwrap_or_else(|e| e.into_inner());
+        assert!(mp.0 > 0.4, "mace smash pulse pushes mobs away, got {}", mp.0);
+        mobs().lock().unwrap_or_else(|e| e.into_inner()).retain(|m| m.eid != 4243);
+    }
+
+    #[test]
+    fn p1_combat_wind_burst_requires_airborne_smash_past_trigger() {
+        let _guard = crate::world_guard();
+        let _g = CombatGuard::new();
+        let (client, _rx) = client_pair();
+        let mace = name_to_item("mace").unwrap();
+        client
+            .inv
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(36, enchanted_stack("mace", &[(41, 3)]));
+        let client = Arc::new(client);
+        // Grounded: `WindBurstEnchantment` refuses to queue.
+        mace_smash_eval(&client, mace);
+        // Elytra flight: refused as well.
+        {
+            let mut p = client.pos.lock().unwrap_or_else(|e| e.into_inner());
+            p.5 = false;
+        }
+        *client.fall_fly.lock().unwrap_or_else(|e| e.into_inner()) = true;
+        *client.fall_from.lock().unwrap_or_else(|e| e.into_inner()) = 80.0;
+        mace_smash_eval(&client, mace);
+        // A fall at or under the 1.5-block trigger: refused.
+        *client.fall_fly.lock().unwrap_or_else(|e| e.into_inner()) = false;
+        {
+            let mut p = client.pos.lock().unwrap_or_else(|e| e.into_inner());
+            p.1 = 79.0;
+        }
+        mace_smash_eval(&client, mace);
+        // And without Wind Burst on the mace: refused.
+        client
+            .inv
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(36, enchanted_stack("mace", &[(6, 3)]));
+        {
+            let mut p = client.pos.lock().unwrap_or_else(|e| e.into_inner());
+            p.1 = 60.0;
+        }
+        mace_smash_eval(&client, mace);
+        assert!(mace_smashes()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .is_empty());
+        // Levels I–III bounce 1.2 / 2.1 / 3.0 blocks.
+        assert!((wind_burst_bounce_velocity(1) - 1.2).abs() < 1e-9);
+        assert!((wind_burst_bounce_velocity(2) - 2.1).abs() < 1e-9);
+        assert!((wind_burst_bounce_velocity(3) - 3.0).abs() < 1e-9);
+        assert_eq!(wind_burst_bounce_velocity(0), 0.0);
     }
 }
 

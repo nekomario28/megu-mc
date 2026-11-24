@@ -810,12 +810,12 @@ fn unbreaking_consumes_durability(level: i32, random_0_to_1: f32, is_armor: bool
     random_0_to_1 >= 0.0 && random_0_to_1 < damage_chance
 }
 
-#[cfg_attr(not(test), allow(dead_code))]
 fn lure_wait_ticks(base_wait_ticks: i32, level: i32) -> i32 {
-    (base_wait_ticks - level.max(0).saturating_mul(100)).max(0)
+    // Vanilla `getFishingTimeReduction`: 5s (100 ticks) per level, and the
+    // lure can never push the wait below a 20-tick bite window.
+    (base_wait_ticks - level.max(0).saturating_mul(100)).max(20)
 }
 
-#[cfg_attr(not(test), allow(dead_code))]
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 struct FishingLootWeights {
     treasure: i32,
@@ -823,12 +823,13 @@ struct FishingLootWeights {
     fish: i32,
 }
 
-#[cfg_attr(not(test), allow(dead_code))]
+/// The vanilla `gameplay/fishing` base split; `luck` is the Luck of the Sea
+/// level (`quality +2` on treasure, `quality -2` on junk, fish unchanged).
 fn luck_of_the_sea_weights(level: i32, base: FishingLootWeights) -> FishingLootWeights {
     let luck = level.max(0);
     FishingLootWeights {
         treasure: (base.treasure + 2 * luck).max(0),
-        junk: (base.junk - luck).max(0),
+        junk: (base.junk - 2 * luck).max(0),
         fish: base.fish.max(0),
     }
 }
@@ -870,7 +871,6 @@ fn soul_speed_multiplier(level: i32) -> f32 {
     1.0 + level.max(0) as f32 * 0.03
 }
 
-#[cfg_attr(not(test), allow(dead_code))]
 fn swift_sneak_speed_multiplier(level: i32) -> f32 {
     (0.3 + level.max(0) as f32 * 0.15).min(1.0)
 }
@@ -885,7 +885,6 @@ fn soul_speed_on_soul_block_bonus(level: i32, standing_on_soul_block: bool) -> f
     0.03 + level as f32 * 0.0105
 }
 
-#[cfg_attr(any(not(test), not(megu_vanilla_data)), allow(dead_code))]
 fn frost_walker_freeze_radius(level: i32) -> i32 {
     if level <= 0 { 0 } else { level.saturating_add(2).min(16) }
 }
@@ -922,7 +921,6 @@ fn piercing_max_entities(level: i32) -> i32 {
     level.max(0).saturating_add(1)
 }
 
-#[cfg_attr(any(not(test), not(megu_vanilla_data)), allow(dead_code))]
 fn density_smash_bonus_damage(level: i32, fall_blocks: f32) -> f32 {
     level.max(0) as f32 * 0.5 * fall_blocks.max(0.0)
 }
@@ -974,6 +972,154 @@ fn channeling_strikes_lightning(
     hit_lightning_rod: bool,
 ) -> bool {
     level > 0 && thunderstorm && sky_visible && trident_hit && (hit_entity || hit_lightning_rod)
+}
+
+// ---------- live enchant consumers (movement / fishing tick hooks) ----------
+
+/// Vanilla `generic.sneaking_speed` on the worn leggings (slot 7): Swift
+/// Sneak (id 37) lifts the 0.3 sneak crawl by `0.15 * level`, capped at 1.0
+/// by the attribute's range — I=0.45, II=0.60, III=0.75.
+fn sneak_movement_speed_multiplier(c: &Client) -> f32 {
+    let level = {
+        let inv = c.inv.lock().unwrap_or_else(|e| e.into_inner());
+        inv.get(&7i16)
+            .map(|stack| enchant_level(&stack.2, 37))
+            .unwrap_or(0)
+    };
+    swift_sneak_speed_multiplier(level as i32)
+}
+
+/// Vanilla `FrostWalkerEnchantment.onEntityMoved`: while the player stands
+/// on solid ground, still (level 0) water sources within `min(16, 2 + level)`
+/// of the feet — with air above — freeze into `frosted_ice` at age 0.
+/// Returns the number of cells frozen this tick.
+fn frost_walker_freeze(c: &Client) -> usize {
+    let level = {
+        let inv = c.inv.lock().unwrap_or_else(|e| e.into_inner());
+        inv.get(&8i16)
+            .map(|stack| enchant_level(&stack.2, 14))
+            .unwrap_or(0)
+    };
+    let radius = frost_walker_freeze_radius(level as i32);
+    if radius <= 0 {
+        return 0;
+    }
+    let (x, y, z, _, _, grounded) = *c.pos.lock().unwrap_or_else(|e| e.into_inner());
+    if !grounded {
+        return 0;
+    }
+    let dim = *c.dim.lock().unwrap_or_else(|e| e.into_inner());
+    let Some(reg) = crate::block_registry::breg() else {
+        return 0;
+    };
+    let Some(frosted) = name_to_state("frosted_ice") else {
+        return 0;
+    };
+    // `freezeNearby` scans `offset(-r,-1,-r)..offset(+r,+1,+r)` and keeps only
+    // cells `closerToCenterThan(position, r)`.
+    let feet = (x.floor() as i32, y.floor() as i32, z.floor() as i32);
+    let reach = f64::from(radius);
+    let mut frozen = 0;
+    for dx in -radius..=radius {
+        for dy in -1..=1 {
+            for dz in -radius..=radius {
+                let (cx, cy, cz) = (feet.0 + dx, feet.1 + dy, feet.2 + dz);
+                let dd = (cx as f64 + 0.5 - x).powi(2)
+                    + (cy as f64 + 0.5 - y).powi(2)
+                    + (cz as f64 + 0.5 - z).powi(2);
+                if dd > reach * reach {
+                    continue;
+                }
+                // The cell above must be air (`FrostWalkerEnchantment` only
+                // ices the open surface); the candidate must be a still
+                // water source (LiquidBlock.LEVEL == 0).
+                if !reg.is_air(block_at_dim(dim, cx, cy + 1, cz)) {
+                    continue;
+                }
+                let st = block_at_dim(dim, cx, cy, cz);
+                if reg.name_of(st) != "minecraft:water"
+                    || reg.get_prop(st, "level").as_deref() != Some("0")
+                {
+                    continue;
+                }
+                set_block_dim(dim, cx, cy, cz, frosted);
+                note_block_update_dim(dim, cx, cy, cz, frosted);
+                frozen += 1;
+            }
+        }
+    }
+    frozen
+}
+
+/// Bobber eids whose Lure wait reduction already landed on `Bobber.age`;
+/// entries are pruned the moment the bobber leaves the store.
+static FISHING_LURE_APPLIED: OnceLock<Mutex<HashSet<i32>>> = OnceLock::new();
+fn fishing_lure_applied() -> &'static Mutex<HashSet<i32>> {
+    FISHING_LURE_APPLIED.get_or_init(|| Mutex::new(HashSet::new()))
+}
+
+/// Owner eid -> the Luck of the Sea-adjusted catch weights for the bobber
+/// currently in the water (`gameplay/fishing` pays treasure/junk/fish).
+static FISHING_LUCK: OnceLock<Mutex<HashMap<i32, FishingLootWeights>>> = OnceLock::new();
+fn fishing_luck() -> &'static Mutex<HashMap<i32, FishingLootWeights>> {
+    FISHING_LUCK.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+/// The vanilla `gameplay/fishing` base weights: 5% treasure, 10% junk, fish
+/// the remainder.
+const FISHING_BASE_WEIGHTS: FishingLootWeights = FishingLootWeights {
+    treasure: 5,
+    junk: 10,
+    fish: 85,
+};
+
+/// Per-player fishing enchant consumption on the movement tick. Lure (id 21)
+/// pulls the bite threshold forward by `100 ticks * level` (floor 20 ticks)
+/// via a one-time `Bobber.age` shift; Luck of the Sea (id 20) re-weights the
+/// catch table kept for the reel (`treasure +2`, `junk -2` per level).
+fn apply_fishing_enchants(c: &Client) {
+    let (luck, lure) = {
+        let inv = c.inv.lock().unwrap_or_else(|e| e.into_inner());
+        let held = *c.held.lock().unwrap_or_else(|e| e.into_inner());
+        let rod = name_to_item("fishing_rod").unwrap_or(931);
+        [36 + held, 45]
+            .iter()
+            .filter_map(|slot| inv.get(slot))
+            .find(|stack| stack.0 == rod)
+            .map(|stack| (enchant_level(&stack.2, 20), enchant_level(&stack.2, 21)))
+            .unwrap_or((0, 0))
+    };
+    let mut fb = bobbers().lock().unwrap_or_else(|e| e.into_inner());
+    if !fb.iter().any(|b| b.owner == c.eid) {
+        fishing_luck().lock().unwrap_or_else(|e| e.into_inner()).remove(&c.eid);
+        fishing_lure_applied()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .retain(|eid| fb.iter().any(|b| b.eid == *eid));
+        return;
+    }
+    fishing_luck().lock().unwrap_or_else(|e| e.into_inner()).insert(
+        c.eid,
+        luck_of_the_sea_weights(luck as i32, FISHING_BASE_WEIGHTS),
+    );
+    if lure <= 0 {
+        return;
+    }
+    // `timeUntilLured - 100 * level`, floored at 20 ticks: shifting `age`
+    // once makes the fixed `BOBBER_BITE_GT` bite check land that early.
+    let wait = server_ticks(BOBBER_BITE_GT) as i32;
+    let shift = wait - lure_wait_ticks(wait, lure as i32);
+    if shift <= 0 {
+        return;
+    }
+    let mut applied = fishing_lure_applied().lock().unwrap_or_else(|e| e.into_inner());
+    for b in fb.iter_mut() {
+        if b.owner == c.eid && !applied.contains(&b.eid) {
+            b.age += shift;
+            applied.insert(b.eid);
+        }
+    }
+    applied.retain(|eid| fb.iter().any(|b| b.eid == *eid));
 }
 
 /// Protocol 767 play clientbound packet 0x04 `award_stats` payload.
@@ -1358,7 +1504,7 @@ mod player_mechanisms_combat_mining_durability_tests {
         assert!(unbreaking_consumes_durability(3, 0.69, true));
         assert!(!unbreaking_consumes_durability(3, 0.71, true));
         assert_eq!(lure_wait_ticks(600, 2), 400);
-        assert_eq!(lure_wait_ticks(100, 2), 0);
+        assert_eq!(lure_wait_ticks(100, 2), 20);
         assert_eq!(
             luck_of_the_sea_weights(
                 2,
@@ -1370,7 +1516,7 @@ mod player_mechanisms_combat_mining_durability_tests {
             ),
             FishingLootWeights {
                 treasure: 9,
-                junk: 8,
+                junk: 6,
                 fish: 85
             }
         );
@@ -1461,6 +1607,154 @@ mod player_mechanisms_combat_mining_durability_tests {
         }
         assert_eq!(item_max_durability("stone"), None);
     }
+    fn enchanted_item(item: &str, ench: &[(i64, i64)]) -> Stack {
+        let mut comps = Vec::new();
+        comp_set(&mut comps, COMP_ENCHANTMENTS, enchantments_data(ench, true));
+        (name_to_item(item).unwrap(), 1, comps)
+    }
+
+    #[test]
+    fn swift_sneak_leggings_boost_the_sneak_crawl() {
+        let _guard = crate::world_guard();
+        let (client, _rx) = crate::effect_tests::client_pair();
+        assert_eq!(
+            sneak_movement_speed_multiplier(&client),
+            0.3,
+            "no Swift Sneak keeps the vanilla 0.3 crawl"
+        );
+        for (level, want) in [(1, 0.45), (2, 0.60), (3, 0.75)] {
+            client
+                .inv
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .insert(7, enchanted_item("iron_leggings", &[(37, level)]));
+            let got = sneak_movement_speed_multiplier(&client);
+            assert!(
+                (got - want).abs() < 1e-6,
+                "Swift Sneak {level} must give {want}, got {got}"
+            );
+        }
+        // The attribute caps at 1.0 no matter how high the level.
+        client
+            .inv
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(7, enchanted_item("iron_leggings", &[(37, 5)]));
+        assert_eq!(sneak_movement_speed_multiplier(&client), 1.0);
+        // Live wiring: the sneak exhaustion term scales with the multiplier.
+        *client.sneaking.lock().unwrap_or_else(|e| e.into_inner()) = true;
+        let ex = player_movement_exhaustion(&client, (1.0, 70.0, 0.0));
+        assert!(
+            (ex - 0.005 * 1.0 / 0.3).abs() < 1e-6,
+            "capped sneak exhausts at 1.0/0.3 of base, got {ex}"
+        );
+        client
+            .inv
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(&7);
+        let ex = player_movement_exhaustion(&client, (2.0, 70.0, 0.0));
+        assert!((ex - 0.005).abs() < 1e-6, "bare sneak exhausts at base, got {ex}");
+    }
+
+    #[test]
+    fn fishing_enchants_shift_the_bite_and_reweight_the_catch() {
+        let _guard = crate::world_guard();
+        let (client, _rx) = crate::effect_tests::client_pair();
+        client
+            .inv
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(36, enchanted_item("fishing_rod", &[(20, 2), (21, 2)]));
+        bobbers().lock().unwrap_or_else(|e| e.into_inner()).push(Bobber {
+            eid: 99905,
+            owner: 4242,
+            x: 1.0,
+            y: 63.0,
+            z: 1.0,
+            dx: 0.0,
+            dy: 0.0,
+            dz: 0.0,
+            age: 0,
+            bit: false,
+            dip: 0,
+        });
+        // Live wiring through the movement tick: Lure II shifts the wait
+        // forward by `100 * 2` ticks against the 20-tick floor, Luck of the
+        // Sea II re-weights to treasure 9 / junk 6 / fish 85.
+        player_movement_exhaustion(&client, (0.0, 70.0, 0.0));
+        let wait = server_ticks(BOBBER_BITE_GT) as i32;
+        let shift = wait - lure_wait_ticks(wait, 2);
+        assert_eq!(
+            bobbers().lock().unwrap_or_else(|e| e.into_inner())[0].age,
+            shift,
+            "lure II must shift the bobber age by wait-20 ticks"
+        );
+        assert_eq!(shift, 55, "75-tick wait floored at 20 shifts 55");
+        assert_eq!(
+            fishing_luck()
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .get(&4242)
+                .copied(),
+            Some(FishingLootWeights {
+                treasure: 9,
+                junk: 6,
+                fish: 85,
+            }),
+            "luck of the sea II adjusts the catch split"
+        );
+        // The age shift lands once per cast — a second tick does not re-apply.
+        player_movement_exhaustion(&client, (0.0, 70.0, 0.0));
+        assert_eq!(
+            bobbers().lock().unwrap_or_else(|e| e.into_inner())[0].age,
+            shift
+        );
+        // With the bobber gone the catch weights drop out of the map.
+        bobbers()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .retain(|b| b.eid != 99905);
+        apply_fishing_enchants(&client);
+        assert!(fishing_luck()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(&4242)
+            .is_none());
+        assert!(!fishing_lure_applied()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .contains(&99905));
+    }
+
+    #[test]
+    fn fishing_enchant_formulas_match_the_vanilla_table() {
+        // Lure: -100 ticks per level, floor 20 (vanilla `getFishingTimeReduction`).
+        assert_eq!(lure_wait_ticks(500, 0), 500);
+        assert_eq!(lure_wait_ticks(500, 1), 400);
+        assert_eq!(lure_wait_ticks(500, 3), 200);
+        assert_eq!(lure_wait_ticks(500, 10), 20);
+        assert_eq!(lure_wait_ticks(119, 1), 20);
+        // Luck of the Sea: treasure +2, junk -2 per level on the 5/10/85 base.
+        assert_eq!(
+            luck_of_the_sea_weights(0, FISHING_BASE_WEIGHTS),
+            FISHING_BASE_WEIGHTS
+        );
+        assert_eq!(
+            luck_of_the_sea_weights(3, FISHING_BASE_WEIGHTS),
+            FishingLootWeights {
+                treasure: 11,
+                junk: 4,
+                fish: 85,
+            }
+        );
+        // Junk never goes negative at high luck.
+        assert_eq!(
+            luck_of_the_sea_weights(9, FISHING_BASE_WEIGHTS).junk,
+            0
+        );
+    }
+
 }
 
 /// Preview a repair. A nonblank rename sets a custom name, and a blank rename clears it.
@@ -4415,6 +4709,84 @@ mod p8b2_parity_enchantment_and_stats_tests {
         let mut body = &packet[2..];
         assert_eq!(decode_award_stats(&mut body), Some(stats));
     }
+
+    fn enchanted_item(item: &str, ench: &[(i64, i64)]) -> Stack {
+        let mut comps = Vec::new();
+        comp_set(&mut comps, COMP_ENCHANTMENTS, enchantments_data(ench, true));
+        (name_to_item(item).unwrap(), 1, comps)
+    }
+
+        #[test]
+    fn p8b2_frost_walker_freezes_still_water_around_grounded_feet() {
+        let _guard = crate::world_guard();
+        let (client, _rx) = crate::effect_tests::client_pair();
+        let dim = DimId::Overworld;
+        let Some(air) = name_to_state("air") else {
+            return;
+        };
+        let Some(water) = name_to_state("water") else {
+            return;
+        };
+        let Some(frosted) = name_to_state("frosted_ice") else {
+            return;
+        };
+        // Level-1 Frost Walker (radius 3) over a small pool: save the cells,
+        // lay still water sources with air above, and stand on them.
+        let mut saved = Vec::new();
+        for dx in -2..=2i32 {
+            for dy in 68..=72i32 {
+                for dz in -2..=2i32 {
+                    saved.push((dx, dy, dz, block_at_dim(dim, dx, dy, dz)));
+                    set_block_dim(dim, dx, dy, dz, air);
+                }
+            }
+        }
+        for (wx, wz) in [(0, 0), (1, 0), (-1, -1), (2, 1)] {
+            set_block_dim(dim, wx, 69, wz, water);
+        }
+        // Flowing (non-source) water one cell over must NOT freeze.
+        let reg = crate::block_registry::breg().unwrap();
+        let flowing = reg.with_prop(water, "level", "1");
+        set_block_dim(dim, -2, 69, 2, flowing);
+        {
+            let mut p = client.pos.lock().unwrap_or_else(|e| e.into_inner());
+            *p = (0.0, 70.0, 0.0, 0.0, 0.0, true);
+        }
+        client
+            .inv
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(8, enchanted_item("leather_boots", &[(14, 1)]));
+
+        // Live wiring: the movement-exhaustion tick hook runs the freeze.
+        player_movement_exhaustion(&client, (0.0, 70.0, 0.0));
+        let frozen = |x, z| reg.name_of(block_at_dim(dim, x, 69, z)) == "minecraft:frosted_ice";
+        assert!(frozen(0, 0), "source under the feet freezes");
+        assert!(frozen(1, 0), "source inside the radius freezes");
+        assert!(frozen(-1, -1), "source inside the radius freezes");
+        assert!(
+            reg.name_of(block_at_dim(dim, -2, 69, 2)) == "minecraft:water",
+            "flowing water never freezes"
+        );
+        let _ = frosted;
+        // Airborne the freeze refuses; without boots it refuses too.
+        client.pos.lock().unwrap_or_else(|e| e.into_inner()).5 = false;
+        set_block_dim(dim, 0, 69, 0, water);
+        assert_eq!(frost_walker_freeze(&client), 0);
+        assert_eq!(reg.name_of(block_at_dim(dim, 0, 69, 0)), "minecraft:water");
+        client.pos.lock().unwrap_or_else(|e| e.into_inner()).5 = true;
+        client
+            .inv
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(&8);
+        assert_eq!(frost_walker_freeze(&client), 0);
+        for (x, y, z, st) in saved {
+            set_block_dim(dim, x, y, z, st);
+        }
+    }
+
+
 }
 
 // ============================================================================
