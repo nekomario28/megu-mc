@@ -70,6 +70,7 @@ include!("play_protocol.rs");
 include!("lod_protocol.rs");
 include!("anvil_io.rs");
 include!("recipes_and_stats.rs");
+include!("startup_bench.rs");
 #[cfg(feature = "create-offload")]
 include!("mod_offload_bridge.rs");
 #[cfg(feature = "create-offload")]
@@ -21466,23 +21467,27 @@ fn write_server_fatal_crash_report(panic_msg: &str) {
 }
 
 fn main() {
+    // `MEGU_STARTUP_PROFILE=1` prints one `[startup]` line per stage to stderr
+    // (src/startup_bench.rs); unarmed it costs one `OnceLock` read per mark.
+    let mut boot_prof = StartupProfiler::new();
     // Startup flags first, before anything reads the world, the config or a
     // socket: `--help`/`--version` return inside the parser, `--dir` relocates
     // before `server.toml`/`eula.txt`/the world are resolved.
     let rest = parse_startup_flags();
+    boot_prof.mark("cli-flags");
     // `server.toml` first, while the process is single-threaded: its `[server]` keys are
     // exported as the `MEGU_*` variables everything below already reads.
     // Tool modes (probe arguments, worldgen dumps) never touch it — and neither do
     // the EULA gate nor the banner, which belong to the real boot alone.
-    if rest.is_empty()
+    let real_boot = rest.is_empty()
         && std::env::var_os("MEGU_WG_DUMP").is_none()
-        && std::env::var_os("MEGU_WG_PROFILE").is_none()
-    {
+        && std::env::var_os("MEGU_WG_PROFILE").is_none();
+    if real_boot {
         eula_direct_launch_check();
         megu_startup_banner();
         let doc = server_config_boot();
         ac_install(AcConfig::from_doc(&doc, |name| std::env::var(name).ok()));
-        refresh_hidden_tags_from_datapacks(std::path::Path::new(DATAPACK_DIRECTORY));
+        boot_prof.mark("server-config");
     }
     // Live mod suite (mod-suite feature): scans MEGU_MODS_DIR and arms the
     // operator mod-sync/progression files. Inert unless the feature is built
@@ -22450,6 +22455,88 @@ fn main() {
         }
         return;
     }
+    // ---- cold-start fast path --------------------------------------------
+    // Everything past this line is a live server boot: every tool/dump/probe
+    // mode above has already returned. The game listener therefore binds
+    // *before* the seed/worldgen/save datapack work, so exec->`listening`
+    // stays in the low milliseconds instead of paying the full world load.
+    // Two invariants keep that safe:
+    //   * every check that gates whether the port may be bound at all —
+    //     `check_bind` and `offline_public_bind_check` — still runs ahead of
+    //     `bind`, so a refused configuration exits exactly as before;
+    //   * the accept loop below only runs after the full sequential init, so
+    //     a client that connects at t=2ms parks in the kernel backlog and can
+    //     never observe a half-loaded world.
+    // Fail before any state is loaded or listener opened.
+    let bind = std::env::var("MEGU_BIND_ADDR").unwrap_or_else(|_| "127.0.0.1".into());
+    if let Err(why) = connection_limits::check_bind(
+        "game listener",
+        &bind,
+        connection_limits::public_bind_allowed(),
+    ) {
+        eprintln!("[security] {why}");
+        std::process::exit(2);
+    }
+    // A public bind without an identity layer fails closed too: offline mode
+    // trusts the claimed name for every privilege check, so a reachable
+    // listener must run online-mode or Velocity forwarding — or carry the
+    // operator's explicit insecure-override.
+    if let Err(why) = offline_public_bind_check(
+        &bind,
+        online_mode_enabled(),
+        velocity_forwarding_enabled(),
+        env_flag("MEGU_ALLOW_INSECURE_OFFLINE_PUBLIC"),
+    ) {
+        eprintln!("[security] {why}");
+        std::process::exit(2);
+    }
+    let port: u16 = std::env::var("MEGU_PORT")
+        .ok()
+        .and_then(|p| p.parse().ok())
+        .unwrap_or(DEFAULT_LISTEN_PORT);
+    let l = TcpListener::bind((bind.as_str(), port)).expect("game listener bind failed");
+    boot_prof.mark("tcp-bind");
+    // Vanilla's "Open to LAN" multicast advertisement — opt-in, and only ever
+    // armed on the port the listener actually owns.
+    start_lan_announcer(l.local_addr().map(|a| a.port()).unwrap_or(port));
+    // The GS4 query responder follows the same rule: it is armed only once
+    // the game listener owns its port, and only when opted into.
+    start_gs4_query(&bind, l.local_addr().map(|a| a.port()).unwrap_or(port));
+    let identity_mode = if velocity_forwarding_enabled() {
+        "Velocity-forwarded identities"
+    } else if online_mode_enabled() {
+        "Mojang-authenticated online identities"
+    } else {
+        "offline identities; no Mojang authentication"
+    };
+    eprintln!("megu v0.6 listening {bind}:{port} ({identity_mode})");
+    boot_prof.mark("listening");
+    // systemd `Type=notify`: READY=1 once the game listener owns its port —
+    // a 0-cost no-op when `$NOTIFY_SOCKET` is absent (non-systemd hosts).
+    megu_server_files::sd_notify::notify_ready();
+    // ---- deferred init: nothing below is needed to own the port ----------
+    // The block registry parses ~3 MB of generated JSON/fact tables on its
+    // first `breg()` call; running that beside the seed/save load below keeps
+    // the parse out of whichever stage would otherwise pay it serially.
+    // `breg()`'s `OnceLock` keeps it a single load — the first caller that
+    // needs the registry simply blocks until this thread finishes.
+    thread::spawn(|| {
+        let t = Instant::now();
+        let _ = block_registry::breg();
+        startup_profile_parallel("block-registry", t.elapsed());
+    });
+    // The RSA-1024 keypair serves the whole process lifetime but is pure CPU
+    // work: overlap it with the world/save load too. The join below stays
+    // ahead of the accept loop, so no login can ever observe a missing
+    // provider — online mode still fails closed if keygen fails.
+    let online_auth = online_mode_enabled().then(|| thread::spawn(RsaOnlineAuth::new));
+    // The anti-xray hidden-tag scan (datapack tag walk + the registry the warm
+    // thread above is already parsing) is only consulted by the chunk encoder,
+    // which cannot run before the accept loop anyway.
+    if real_boot {
+        refresh_hidden_tags_from_datapacks(std::path::Path::new(DATAPACK_DIRECTORY));
+        boot_prof.mark("hidden-tags");
+    }
     // datapack worldgen uses the saved seed by default. An explicit environment seed may only
     // select a new world's seed or confirm the existing one.
     let requested_seed = std::env::var("MEGU_SEED").ok().map(|v| {
@@ -22470,6 +22557,7 @@ fn main() {
             std::process::exit(1);
         }
     };
+    boot_prof.mark("seed-resolve");
     if std::env::var("MEGU_WG").ok().as_deref() != Some("old") {
         if worldgen::init(wg_seed, name_to_state) {
             // The Nether and the End are generated by the same seed with their own noise
@@ -22501,6 +22589,7 @@ fn main() {
     }
     WORLD_SEED.store(wg_seed, Ordering::Relaxed);
     world_rng::seed(wg_seed);
+    boot_prof.mark("worldgen-init");
 
     // A corrupt protected save must stop startup rather than silently
     // continuing with a world that failed validation.
@@ -22509,6 +22598,7 @@ fn main() {
         eprintln!("[spine] refusing corrupt world save: {error} (original file preserved)");
         std::process::exit(1);
     }
+    boot_prof.mark("save-load");
     // A configured live Anvil directory imports after the overlay save so its
     // chunks win where both stores name the same position.
     live_anvil_load_if_armed();
@@ -22516,6 +22606,7 @@ fn main() {
     // last so the newest recorded write wins, then arm the journal for live
     // edits. A no-op unless the variable names a valid path.
     dwal_boot_recover_and_arm();
+    boot_prof.mark("save-extras");
     // The initial-spawn decision happens after the save loads so a recorded
     // `setworldspawn` always wins; only a world with nothing recorded (or an
     // explicit MEGU_SAFE_SPAWN=1) takes the dry-ground search.
@@ -22525,50 +22616,38 @@ fn main() {
         *spawn = (x, y, z, spawn.3);
         eprintln!("[spine] safe world spawn at {x:.1} {y:.1} {z:.1}");
     }
+    boot_prof.mark("spawn-search");
     if let Err(error) = landing::initialize() {
         eprintln!("[mod-compatibility] {error}");
         std::process::exit(1);
     }
-    // Fail before any state is loaded or listener opened.
-    let bind = std::env::var("MEGU_BIND_ADDR").unwrap_or_else(|_| "127.0.0.1".into());
-    if let Err(why) = connection_limits::check_bind(
-        "game listener",
-        &bind,
-        connection_limits::public_bind_allowed(),
-    ) {
-        eprintln!("[security] {why}");
-        std::process::exit(2);
-    }
-    if online_mode_enabled() {
+    boot_prof.mark("landing");
+    if let Some(keygen) = online_auth {
         // One RSA keypair serves the process lifetime, before accepting any
-        // connection whose identity must be verified by Mojang.
-        let provider = RsaOnlineAuth::new().unwrap_or_else(|error| {
-            eprintln!("[security] {error}");
-            std::process::exit(2);
-        });
+        // connection whose identity must be verified by Mojang. The keygen was
+        // overlapped with the world load above; this join stays ahead of the
+        // accept loop, so no login can observe a missing provider.
+        let provider = keygen
+            .join()
+            .unwrap_or_else(|_| Err("online-mode RSA keygen thread panicked".to_string()))
+            .unwrap_or_else(|error| {
+                eprintln!("[security] {error}");
+                std::process::exit(2);
+            });
         set_online_auth_provider(Some(Arc::new(provider)));
-    }
-    // A public bind without an identity layer fails closed too: offline mode
-    // trusts the claimed name for every privilege check, so a reachable
-    // listener must run online-mode or Velocity forwarding — or carry the
-    // operator's explicit insecure-override.
-    if let Err(why) = offline_public_bind_check(
-        &bind,
-        online_mode_enabled(),
-        velocity_forwarding_enabled(),
-        env_flag("MEGU_ALLOW_INSECURE_OFFLINE_PUBLIC"),
-    ) {
-        eprintln!("[security] {why}");
-        std::process::exit(2);
+        boot_prof.mark("online-auth");
     }
     if let Err(error) = load_operators(std::path::Path::new(OPS_FILE)) {
         eprintln!("[spine] could not load {OPS_FILE}: {error}");
     }
+    boot_prof.mark("operators");
     if let Err(error) = reload_datapacks(std::path::Path::new(DATAPACK_DIRECTORY), None, true) {
         eprintln!("[spine] {error}");
     }
+    boot_prof.mark("datapacks");
     std::thread::spawn(rcon_listener);
     http_server();
+    boot_prof.mark("side-listeners");
     // Opt-in debug seeding of a few mobs near spawn (only if none restored
     // from save). Vanilla spawns nothing at startup; a live natural spawner
     // populates the area instead. `MEGU_DEBUG_SEED_MOBS=1` (the issue-#88
@@ -22670,28 +22749,7 @@ fn main() {
             });
         });
     }
-    let port: u16 = std::env::var("MEGU_PORT")
-        .ok()
-        .and_then(|p| p.parse().ok())
-        .unwrap_or(DEFAULT_LISTEN_PORT);
-    let l = TcpListener::bind((bind.as_str(), port)).expect("game listener bind failed");
-    // Vanilla's "Open to LAN" multicast advertisement — opt-in, and only ever
-    // armed on the port the listener actually owns.
-    start_lan_announcer(l.local_addr().map(|a| a.port()).unwrap_or(port));
-    // The GS4 query responder follows the same rule: it is armed only once
-    // the game listener owns its port, and only when opted into.
-    start_gs4_query(&bind, l.local_addr().map(|a| a.port()).unwrap_or(port));
-    let identity_mode = if velocity_forwarding_enabled() {
-        "Velocity-forwarded identities"
-    } else if online_mode_enabled() {
-        "Mojang-authenticated online identities"
-    } else {
-        "offline identities; no Mojang authentication"
-    };
-    eprintln!("megu v0.6 listening {bind}:{port} ({identity_mode})");
-    // systemd `Type=notify`: READY=1 once the game listener owns its port —
-    // a 0-cost no-op when `$NOTIFY_SOCKET` is absent (non-systemd hosts).
-    megu_server_files::sd_notify::notify_ready();
+    boot_prof.mark("service-threads");
     let startup_summary = operator_status_summary();
     if resolved_console_mode() == ServerConsoleMode::PlainCli {
         println!("{startup_summary}");
@@ -22700,6 +22758,7 @@ fn main() {
     if !connection_limits::is_loopback_bind(&bind) {
         eprintln!("[security] non-loopback bind (MEGU_ALLOW_PUBLIC_BIND set): restrict access with a firewall/private network");
     }
+    boot_prof.mark("ready");
     static ACTIVE: AtomicUsize = AtomicUsize::new(0);
     for s in l.incoming().flatten() {
         // connection cap: refuse above 64 live handler threads
