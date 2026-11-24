@@ -54,26 +54,7 @@ fn run(args: &[&str]) -> (i32, String, String) {
 
 // -- Minimal ZIP writer (local headers + central directory + EOCD) ------
 
-fn crc32(data: &[u8]) -> u32 {
-    const TABLE: [u32; 256] = {
-        let mut table = [0; 256];
-        let mut i = 0;
-        while i < table.len() {
-            let mut crc = i as u32;
-            let mut bit = 0;
-            while bit < 8 {
-                crc = (crc >> 1) ^ if crc & 1 == 1 { 0xedb8_8320 } else { 0 };
-                bit += 1;
-            }
-            table[i] = crc;
-            i += 1;
-        }
-        table
-    };
-    !data.iter().fold(!0, |crc, byte| {
-        (crc >> 8) ^ TABLE[((crc as u8) ^ byte) as usize]
-    })
-}
+use megu_core::hash::crc32_ieee as crc32;
 
 struct ZipEntry<'a> {
     name: &'a str,

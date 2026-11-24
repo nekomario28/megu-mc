@@ -411,26 +411,7 @@ fn cgd1_fails_closed_on_corruption_and_bounds_violations() {
 
 /// Test-local CRC-32 identical to the module's private one — keeps the
 /// corruption fixtures honest without exposing the helper.
-fn crc32_of(data: &[u8]) -> u32 {
-    const TABLE: [u32; 256] = {
-        let mut table = [0; 256];
-        let mut i = 0;
-        while i < 256 {
-            let mut crc = i as u32;
-            let mut bit = 0;
-            while bit < 8 {
-                crc = (crc >> 1) ^ if crc & 1 == 1 { 0xedb8_8320 } else { 0 };
-                bit += 1;
-            }
-            table[i] = crc;
-            i += 1;
-        }
-        table
-    };
-    !data.iter().fold(!0, |crc, byte| {
-        (crc >> 8) ^ TABLE[((crc as u8) ^ byte) as usize]
-    })
-}
+use megu_core::hash::crc32_ieee as crc32_of;
 
 // ===========================================================================
 // EAD1 — entity-AI delegate wire contract

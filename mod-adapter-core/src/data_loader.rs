@@ -683,207 +683,44 @@ impl JsonValue {
     }
 }
 
-struct JsonParser<'a> {
-    src: &'a [u8],
-    pos: usize,
-    depth: usize,
-}
-
+/// Parse a complete JSON document under [`MAX_JSON_BYTES`] /
+/// [`MAX_JSON_DEPTH`] via the canonical `megu_core::json` reader, then lower
+/// it into this module's [`JsonValue`] shape.
 pub fn parse_json(bytes: &[u8]) -> Result<JsonValue, DataLoadError> {
     if bytes.len() > MAX_JSON_BYTES {
         return Err(DataLoadError::Json("JSON exceeds max size".into()));
     }
-    let mut parser = JsonParser {
-        src: bytes,
-        pos: 0,
-        depth: 0,
-    };
-    let val = parser.parse_value()?;
-    parser.skip_ws();
-    if parser.pos != parser.src.len() {
-        return Err(DataLoadError::Json(
-            "trailing bytes after JSON value".into(),
-        ));
-    }
-    Ok(val)
+    let text = std::str::from_utf8(bytes)
+        .map_err(|_| DataLoadError::Json("JSON is not valid UTF-8".into()))?;
+    let value = megu_core::json::parse_json_with_limits(
+        text,
+        megu_core::json::JsonLimits {
+            max_depth: MAX_JSON_DEPTH,
+            max_nodes: MAX_JSON_BYTES,
+            max_bytes: MAX_JSON_BYTES,
+        },
+        false,
+    )
+    .map_err(|e| DataLoadError::Json(e.to_string()))?;
+    Ok(json_value_from_core(value))
 }
 
-impl<'a> JsonParser<'a> {
-    fn skip_ws(&mut self) {
-        while let Some(&b) = self.src.get(self.pos) {
-            if matches!(b, b' ' | b'\t' | b'\r' | b'\n') {
-                self.pos += 1;
-            } else {
-                break;
-            }
+fn json_value_from_core(value: megu_core::json::JsonValue) -> JsonValue {
+    use megu_core::json::JsonValue as Core;
+    match value {
+        Core::Null => JsonValue::Null,
+        Core::Bool(b) => JsonValue::Bool(b),
+        Core::Number(n) => JsonValue::Number(n),
+        Core::String(s) => JsonValue::String(s),
+        Core::Array(items) => {
+            JsonValue::Array(items.into_iter().map(json_value_from_core).collect())
         }
-    }
-
-    fn peek(&self) -> Option<u8> {
-        self.src.get(self.pos).copied()
-    }
-
-    fn parse_value(&mut self) -> Result<JsonValue, DataLoadError> {
-        self.skip_ws();
-        if self.depth >= MAX_JSON_DEPTH {
-            return Err(DataLoadError::Json("max JSON nesting exceeded".into()));
-        }
-        match self.peek() {
-            Some(b'{') => self.parse_object(),
-            Some(b'[') => self.parse_array(),
-            Some(b'"') => self.parse_string().map(JsonValue::String),
-            Some(b't') => self.expect_literal(b"true", JsonValue::Bool(true)),
-            Some(b'f') => self.expect_literal(b"false", JsonValue::Bool(false)),
-            Some(b'n') => self.expect_literal(b"null", JsonValue::Null),
-            Some(b'-' | b'0'..=b'9') => self.parse_number(),
-            _ => Err(DataLoadError::Json(format!(
-                "unexpected token at {}",
-                self.pos
-            ))),
-        }
-    }
-
-    fn expect_literal(&mut self, lit: &[u8], val: JsonValue) -> Result<JsonValue, DataLoadError> {
-        if self.src.get(self.pos..self.pos + lit.len()) == Some(lit) {
-            self.pos += lit.len();
-            Ok(val)
-        } else {
-            Err(DataLoadError::Json(format!(
-                "invalid literal at {}",
-                self.pos
-            )))
-        }
-    }
-
-    fn parse_object(&mut self) -> Result<JsonValue, DataLoadError> {
-        self.pos += 1;
-        self.depth += 1;
-        let mut map = BTreeMap::new();
-        self.skip_ws();
-        if self.peek() == Some(b'}') {
-            self.pos += 1;
-            self.depth -= 1;
-            return Ok(JsonValue::Object(map));
-        }
-        loop {
-            self.skip_ws();
-            let key = self.parse_string()?;
-            self.skip_ws();
-            if self.peek() != Some(b':') {
-                return Err(DataLoadError::Json("expected ':' in object".into()));
-            }
-            self.pos += 1;
-            let value = self.parse_value()?;
-            map.insert(key, value);
-            self.skip_ws();
-            match self.peek() {
-                Some(b',') => self.pos += 1,
-                Some(b'}') => {
-                    self.pos += 1;
-                    self.depth -= 1;
-                    return Ok(JsonValue::Object(map));
-                }
-                _ => return Err(DataLoadError::Json("expected ',' or '}' in object".into())),
-            }
-        }
-    }
-
-    fn parse_array(&mut self) -> Result<JsonValue, DataLoadError> {
-        self.pos += 1;
-        self.depth += 1;
-        let mut arr = Vec::new();
-        self.skip_ws();
-        if self.peek() == Some(b']') {
-            self.pos += 1;
-            self.depth -= 1;
-            return Ok(JsonValue::Array(arr));
-        }
-        loop {
-            let value = self.parse_value()?;
-            arr.push(value);
-            self.skip_ws();
-            match self.peek() {
-                Some(b',') => self.pos += 1,
-                Some(b']') => {
-                    self.pos += 1;
-                    self.depth -= 1;
-                    return Ok(JsonValue::Array(arr));
-                }
-                _ => return Err(DataLoadError::Json("expected ',' or ']' in array".into())),
-            }
-        }
-    }
-
-    fn parse_string(&mut self) -> Result<String, DataLoadError> {
-        if self.peek() != Some(b'"') {
-            return Err(DataLoadError::Json("expected string quote".into()));
-        }
-        self.pos += 1;
-        let mut out = String::new();
-        while let Some(&b) = self.src.get(self.pos) {
-            self.pos += 1;
-            match b {
-                b'"' => return Ok(out),
-                b'\\' => {
-                    let esc = *self
-                        .src
-                        .get(self.pos)
-                        .ok_or_else(|| DataLoadError::Json("unterminated escape".into()))?;
-                    self.pos += 1;
-                    match esc {
-                        b'"' => out.push('"'),
-                        b'\\' => out.push('\\'),
-                        b'/' => out.push('/'),
-                        b'b' => out.push('\u{0008}'),
-                        b'f' => out.push('\u{000C}'),
-                        b'n' => out.push('\n'),
-                        b'r' => out.push('\r'),
-                        b't' => out.push('\t'),
-                        b'u' => {
-                            let hex = self.src.get(self.pos..self.pos + 4).ok_or_else(|| {
-                                DataLoadError::Json("short unicode escape".into())
-                            })?;
-                            self.pos += 4;
-                            let hex_str = std::str::from_utf8(hex).map_err(|_| {
-                                DataLoadError::Json("invalid unicode escape".into())
-                            })?;
-                            let code = u32::from_str_radix(hex_str, 16)
-                                .map_err(|_| DataLoadError::Json("invalid hex escape".into()))?;
-                            let ch = char::from_u32(code).unwrap_or('\u{FFFD}');
-                            out.push(ch);
-                        }
-                        _ => return Err(DataLoadError::Json("unknown escape".into())),
-                    }
-                }
-                _ if b < 0x80 => out.push(b as char),
-                _ => {
-                    let start = self.pos - 1;
-                    let rest = std::str::from_utf8(&self.src[start..])
-                        .map_err(|_| DataLoadError::Json("invalid UTF-8 in string".into()))?;
-                    let ch = rest.chars().next().unwrap();
-                    out.push(ch);
-                    self.pos = start + ch.len_utf8();
-                }
-            }
-        }
-        Err(DataLoadError::Json("unterminated string".into()))
-    }
-
-    fn parse_number(&mut self) -> Result<JsonValue, DataLoadError> {
-        let start = self.pos;
-        while let Some(&b) = self.src.get(self.pos) {
-            if matches!(b, b'0'..=b'9' | b'-' | b'+' | b'.' | b'e' | b'E') {
-                self.pos += 1;
-            } else {
-                break;
-            }
-        }
-        let s = std::str::from_utf8(&self.src[start..self.pos])
-            .map_err(|_| DataLoadError::Json("invalid number UTF-8".into()))?;
-        let n = s
-            .parse::<f64>()
-            .map_err(|_| DataLoadError::Json(format!("invalid number '{s}'")))?;
-        Ok(JsonValue::Number(n))
+        Core::Object(pairs) => JsonValue::Object(
+            pairs
+                .into_iter()
+                .map(|(k, v)| (k, json_value_from_core(v)))
+                .collect(),
+        ),
     }
 }
 

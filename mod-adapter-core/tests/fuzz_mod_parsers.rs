@@ -405,17 +405,7 @@ fn fuzz_input(rng: &mut Rng, corpus: &[Vec<u8>], max_len: usize) -> Vec<u8> {
 // ZIP / JAR / deflate builders — real framing so corpus seeds reach deep.
 // ---------------------------------------------------------------------------
 
-fn crc32(data: &[u8]) -> u32 {
-    let mut crc = !0u32;
-    for &byte in data {
-        crc ^= u32::from(byte);
-        for _ in 0..8 {
-            let mask = 0u32.wrapping_sub(crc & 1);
-            crc = (crc >> 1) ^ (0xEDB8_8320 & mask);
-        }
-    }
-    !crc
-}
+use megu_core::hash::crc32_ieee as crc32;
 
 /// Raw-deflate stored blocks (BTYPE=00) wrapping `data` verbatim — a legal
 /// method-8 stream with ~1:1 expansion.

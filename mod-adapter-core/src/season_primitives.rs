@@ -874,159 +874,6 @@ impl CropTagSet {
     }
 }
 
-/// Minimal fail-closed JSON cursor for tag files. Accepts only what a
-/// standard Minecraft tag JSON needs: objects, arrays, strings, numbers,
-/// `true`/`false`/`null`.
-struct JsonCursor<'a> {
-    bytes: &'a [u8],
-    pos: usize,
-}
-
-impl<'a> JsonCursor<'a> {
-    fn new(s: &'a str) -> Self {
-        Self {
-            bytes: s.as_bytes(),
-            pos: 0,
-        }
-    }
-
-    fn peek(&self) -> Option<u8> {
-        self.bytes.get(self.pos).copied()
-    }
-
-    fn ws(&mut self) {
-        while matches!(self.peek(), Some(b' ' | b'\t' | b'\n' | b'\r')) {
-            self.pos += 1;
-        }
-    }
-
-    fn expect(&mut self, b: u8) -> Option<()> {
-        self.ws();
-        if self.peek() == Some(b) {
-            self.pos += 1;
-            Some(())
-        } else {
-            None
-        }
-    }
-
-    fn eat(&mut self, b: u8) -> bool {
-        self.expect(b).is_some()
-    }
-
-    fn string(&mut self) -> Option<String> {
-        self.ws();
-        if self.peek() != Some(b'"') {
-            return None;
-        }
-        self.pos += 1;
-        let mut out = String::new();
-        loop {
-            match self.peek()? {
-                b'"' => {
-                    self.pos += 1;
-                    return Some(out);
-                }
-                b'\\' => {
-                    self.pos += 1;
-                    match self.peek()? {
-                        b'"' => out.push('"'),
-                        b'\\' => out.push('\\'),
-                        b'/' => out.push('/'),
-                        b'n' => out.push('\n'),
-                        b't' => out.push('\t'),
-                        b'r' => out.push('\r'),
-                        b'b' => out.push('\u{0008}'),
-                        b'f' => out.push('\u{000C}'),
-                        _ => return None, // \uXXXX unsupported — fail closed
-                    }
-                    self.pos += 1;
-                }
-                c if c < 0x20 => return None, // raw control chars are invalid JSON
-                _ => {
-                    // Copy one UTF-8 code point verbatim.
-                    let start = self.pos;
-                    let len = utf8_len(self.bytes[start]);
-                    let end = start.checked_add(len)?;
-                    let slice = self.bytes.get(start..end)?;
-                    out.push_str(std::str::from_utf8(slice).ok()?);
-                    self.pos = end;
-                }
-            }
-        }
-    }
-
-    /// Skip any JSON value, with a nesting depth cap.
-    fn skip_value(&mut self, depth: usize) -> Option<()> {
-        if depth > 16 {
-            return None;
-        }
-        self.ws();
-        match self.peek()? {
-            b'"' => self.string().map(|_| ()),
-            b'{' => {
-                self.pos += 1;
-                if self.eat(b'}') {
-                    return Some(());
-                }
-                loop {
-                    self.string()?;
-                    self.expect(b':')?;
-                    self.skip_value(depth + 1)?;
-                    if self.eat(b',') {
-                        continue;
-                    }
-                    return self.expect(b'}');
-                }
-            }
-            b'[' => {
-                self.pos += 1;
-                if self.eat(b']') {
-                    return Some(());
-                }
-                loop {
-                    self.skip_value(depth + 1)?;
-                    if self.eat(b',') {
-                        continue;
-                    }
-                    return self.expect(b']');
-                }
-            }
-            b't' => self.literal(b"true"),
-            b'f' => self.literal(b"false"),
-            b'n' => self.literal(b"null"),
-            b'-' | b'0'..=b'9' => {
-                while matches!(
-                    self.peek(),
-                    Some(b'-' | b'+' | b'0'..=b'9' | b'.' | b'e' | b'E')
-                ) {
-                    self.pos += 1;
-                }
-                Some(())
-            }
-            _ => None,
-        }
-    }
-
-    fn literal(&mut self, lit: &[u8]) -> Option<()> {
-        if self.bytes.get(self.pos..self.pos + lit.len()) == Some(lit) {
-            self.pos += lit.len();
-            Some(())
-        } else {
-            None
-        }
-    }
-}
-
-fn utf8_len(first: u8) -> usize {
-    match first {
-        0x00..=0x7F => 1,
-        0xC0..=0xDF => 2,
-        0xE0..=0xEF => 3,
-        _ => 4,
-    }
-}
-
 /// Whether `id` looks like a namespaced identifier (`a-z0-9_./:-`,
 /// namespaced or bare).
 fn valid_entry_id(id: &str) -> bool {
@@ -1040,13 +887,18 @@ fn valid_entry_id(id: &str) -> bool {
 ///
 /// Accepts `{"values": ["minecraft:wheat", "#c:crops/corn", ...]}` plus any
 /// sibling keys (`"replace": false`, `"optional": [...]`, ...) — unknown
-/// members are skipped, malformed input returns `None`. Entries starting
+/// members are ignored, malformed input returns `None`. Entries starting
 /// with `#` land in [`CropTagSet::tag_refs`] (with `#` stripped), plain
 /// entries in [`CropTagSet::ids`]. Empty, oversized, or non-identifier
 /// entries fail closed.
 pub fn load_season_tag_json(kind: SeasonTagKind, json_str: &str) -> Option<CropTagSet> {
-    let mut cur = JsonCursor::new(json_str);
-    cur.expect(b'{')?;
+    use megu_core::json::JsonValue as CoreJson;
+
+    let root = megu_core::json::parse_json(json_str).ok()?;
+    let members = match &root {
+        CoreJson::Object(members) => members,
+        _ => return None,
+    };
 
     let mut set = CropTagSet {
         kind,
@@ -1054,51 +906,36 @@ pub fn load_season_tag_json(kind: SeasonTagKind, json_str: &str) -> Option<CropT
     };
     let mut saw_values = false;
 
-    if cur.eat(b'}') {
-        return None; // empty object carries no tag data
-    }
-    loop {
-        let key = cur.string()?;
-        cur.expect(b':')?;
-        if key == "values" {
-            cur.expect(b'[')?;
-            if cur.eat(b']') {
-                saw_values = true;
-            } else {
-                loop {
-                    let entry = cur.string()?;
-                    let (is_tag, body) = match entry.strip_prefix('#') {
-                        Some(rest) => (true, rest.to_string()),
-                        None => (false, entry),
-                    };
-                    if !valid_entry_id(&body) {
-                        return None;
-                    }
-                    if is_tag {
-                        set.tag_refs.insert(body);
-                    } else {
-                        set.ids.insert(body);
-                    }
-                    if cur.eat(b',') {
-                        continue;
-                    }
-                    cur.expect(b']')?;
-                    saw_values = true;
-                    break;
-                }
-            }
-        } else {
-            cur.skip_value(0)?;
-        }
-        if cur.eat(b',') {
+    for (key, value) in members {
+        if key != "values" {
             continue;
         }
-        cur.expect(b'}')?;
-        break;
+        let items = match value {
+            CoreJson::Array(items) => items,
+            _ => return None,
+        };
+        saw_values = true;
+        for item in items {
+            let entry = match item {
+                CoreJson::String(s) => s.as_str(),
+                _ => return None,
+            };
+            let (is_tag, body) = match entry.strip_prefix('#') {
+                Some(rest) => (true, rest),
+                None => (false, entry),
+            };
+            if !valid_entry_id(body) {
+                return None;
+            }
+            if is_tag {
+                set.tag_refs.insert(body.to_string());
+            } else {
+                set.ids.insert(body.to_string());
+            }
+        }
     }
 
-    cur.ws();
-    if cur.pos != cur.bytes.len() || !saw_values {
+    if !saw_values {
         return None;
     }
     Some(set)

@@ -33,21 +33,7 @@ use mod_adapter_core::neoforge_wire::{
 // ecosystem_compat tests).
 // ---------------------------------------------------------------------------
 
-fn crc32(data: &[u8]) -> u32 {
-    let mut table = [0u32; 256];
-    for (i, t) in table.iter_mut().enumerate() {
-        let mut c = i as u32;
-        for _ in 0..8 {
-            c = if c & 1 != 0 { 0xEDB8_8320 ^ (c >> 1) } else { c >> 1 };
-        }
-        *t = c;
-    }
-    let mut crc = !0u32;
-    for &b in data {
-        crc = table[((crc ^ u32::from(b)) & 0xFF) as usize] ^ (crc >> 8);
-    }
-    !crc
-}
+use megu_core::hash::crc32_ieee as crc32;
 
 fn jar(entries: &[(&str, &[u8])]) -> Vec<u8> {
     let mut out = Vec::new();

@@ -374,17 +374,7 @@ fn build_class(internal: &str, class_anns: Vec<Ann>, methods: Vec<Meth>) -> Vec<
 // ZIP/JAR builder (stored members, real central directory + EOCD)
 // ---------------------------------------------------------------------------
 
-fn crc32(data: &[u8]) -> u32 {
-    let mut crc = !0u32;
-    for &byte in data {
-        crc ^= u32::from(byte);
-        for _ in 0..8 {
-            let mask = 0u32.wrapping_sub(crc & 1);
-            crc = (crc >> 1) ^ (0xEDB8_8320 & mask);
-        }
-    }
-    !crc
-}
+use megu_core::hash::crc32_ieee as crc32;
 
 /// Pack `entries` (name → bytes) into a real ZIP archive with stored
 /// (uncompressed) members.

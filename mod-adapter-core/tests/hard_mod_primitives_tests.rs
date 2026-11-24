@@ -38,17 +38,7 @@ impl Drop for ScratchDir {
     }
 }
 
-fn crc32(data: &[u8]) -> u32 {
-    let mut crc = !0u32;
-    for &byte in data {
-        crc ^= u32::from(byte);
-        for _ in 0..8 {
-            let mask = 0u32.wrapping_sub(crc & 1);
-            crc = (crc >> 1) ^ (0xedb8_8320 & mask);
-        }
-    }
-    !crc
-}
+use megu_core::hash::crc32_ieee as crc32;
 
 fn synthetic_jar(mod_id: &str) -> Vec<u8> {
     let manifest = format!(r#"{{"id":"{mod_id}","version":"1.0.0","environment":"*"}}"#);
