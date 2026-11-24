@@ -32,12 +32,14 @@
 //     false-flag movement checks.
 
 use create_adapter::addon_profile::{
-    builtin_create_addon_profiles, create_registry_with_addons,
-    discover_create_addon_profile, CreateAddonProfile,
+    builtin_create_addon_profiles, create_registry_with_addons, discover_create_addon_profile,
+    CreateAddonProfile, PropulsionSpec,
 };
 use create_adapter::aeronautics::{
-    decode_aeronautics_snapshot, encode_aeronautics_snapshot, RigidBodySubWorld,
+    decode_aeronautics_snapshot, encode_aeronautics_snapshot, RigidBodySubWorld, SubWorldHelmInput,
+    SubWorldSyncFrame, SubWorldSyncKind, DEFAULT_BLOCK_MASS, SEA_LEVEL_AIR_DENSITY,
 };
+use create_adapter::orbital::{OrbitalDimension, OrbitalTransitionRouter};
 use mod_adapter_core::data_loader as mod_data;
 use mod_adapter_core::dimension_mod as dim_mod;
 
@@ -58,10 +60,7 @@ const ADB_MAX_SHIP_BYTES: usize = 1 << 24;
 /// blocks register later still get hidden when they land).
 #[allow(dead_code)]
 fn register_hidden_block_names(names: impl IntoIterator<Item = impl AsRef<str>>) -> usize {
-    let wanted: HashSet<String> = names
-        .into_iter()
-        .map(|name| ns_rl(name.as_ref()))
-        .collect();
+    let wanted: HashSet<String> = names.into_iter().map(|name| ns_rl(name.as_ref())).collect();
     if wanted.is_empty() {
         return 0;
     }
@@ -134,6 +133,12 @@ struct AeronauticsRuntimeBridge {
     mod_hidden_names: BTreeSet<String>,
     /// Ticks actually stepped — an empty bridge must never tick.
     ticks_stepped: u64,
+    /// Encoded S2C frames queued by assembly and simulation ticks.
+    sync_frames: Vec<(u32, Vec<u8>)>,
+    /// Monotonic per-ship revisions for client pose deltas.
+    revisions: BTreeMap<u64, u32>,
+    /// Per-dimension atmosphere and transition rules for the active fleet.
+    orbital_router: OrbitalTransitionRouter,
 }
 
 #[allow(dead_code)]
@@ -147,6 +152,9 @@ impl AeronauticsRuntimeBridge {
             next_subworld_id: 1,
             mod_hidden_names: BTreeSet::new(),
             ticks_stepped: 0,
+            sync_frames: Vec::new(),
+            revisions: BTreeMap::new(),
+            orbital_router: OrbitalTransitionRouter::new(),
         }
     }
 
@@ -201,6 +209,7 @@ impl AeronauticsRuntimeBridge {
         )
         .map_err(|e| format!("aeronautics assemble {subworld_id}: {e:?}"))?;
         self.add_airship(sub);
+        self.revisions.insert(subworld_id, 0);
         Ok(())
     }
 
@@ -244,8 +253,39 @@ impl AeronauticsRuntimeBridge {
     /// `ac_note_carried_motion`.
     fn step(&mut self, dt: f64, gravity: f64, air_density: f64) {
         self.ticks_stepped += 1;
+        self.orbital_router.set_base_gravity(gravity);
         for sub in self.airships.values_mut() {
-            sub.step(dt, gravity, air_density);
+            if self.orbital_router.dimension(sub.parent_dim).is_none() {
+                self.orbital_router.register_dimension(
+                    sub.parent_dim,
+                    OrbitalDimension::new(
+                        DimId::from_raw(sub.parent_dim).dimension_id(),
+                        create_adapter::aeronautics::AtmospherePhysics {
+                            air_density,
+                            ..create_adapter::aeronautics::AtmospherePhysics::OVERWORLD
+                        },
+                    ),
+                );
+            }
+            let _ = self.orbital_router.step_with_dimension_transitions(sub, dt);
+        }
+        for (id, sub) in &self.airships {
+            let revision = self.revisions.entry(*id).or_default();
+            *revision = revision.saturating_add(1);
+            let frame = SubWorldSyncFrame {
+                kind: SubWorldSyncKind::PoseDelta,
+                subworld_id: *id,
+                dim_id: DimId::from_raw(sub.parent_dim).dimension_id().to_owned(),
+                pos: sub.pos,
+                quat: sub.quat.map(|v| v as f32),
+                vel: sub.vel.map(|v| v as f32),
+                ang_vel: sub.omega.map(|v| v as f32),
+                revision: *revision,
+                voxels: Vec::new(),
+            };
+            if let Ok(bytes) = frame.encode() {
+                self.sync_frames.push((sub.parent_dim, bytes));
+            }
         }
         for (eid, (ship, offset)) in &self.passengers {
             let Some(sub) = self.airships.get(ship) else {
@@ -337,13 +377,63 @@ impl AeronauticsRuntimeBridge {
             .into_iter()
             .map(|(p, b)| (p.as_ref().to_string(), b.as_ref().to_vec()))
             .collect();
+        let raw_jars: Vec<(String, Vec<u8>)> = entries
+            .iter()
+            .filter(|(path, bytes)| path.ends_with(".jar") && bytes.starts_with(b"PK\x03\x04"))
+            .cloned()
+            .collect();
         let zip = adb_stored_zip(&entries);
-        let mut ids = mod_data::ItemFluidIdTable::new();
-        let data = mod_data::load_from_stored_zip(&zip, &mut ids)
-            .map_err(|e| format!("addon jar scan: {e:?}"))?;
+        let mut data = if zip.is_empty() {
+            mod_data::LoadedModData::default()
+        } else {
+            let bundle =
+                mod_adapter_core::auto_adapter::extract_mod_data(&zip, "aeronautics entries")?;
+            mod_data::LoadedModData {
+                recipes: bundle.recipes,
+                tags: bundle.tags,
+                blockstates: bundle.blockstates,
+                skipped_compressed_zip_entries: 0,
+            }
+        };
+        for (path, bytes) in raw_jars {
+            let bundle = mod_adapter_core::auto_adapter::extract_mod_data(&bytes, &path)?;
+            data.recipes.extend(bundle.recipes);
+            data.tags.extend(bundle.tags);
+            data.blockstates.extend(bundle.blockstates);
+        }
         let mut hidden: BTreeSet<String> = BTreeSet::new();
-        for ns in adb_addon_namespaces(&data) {
-            let profile = discover_create_addon_profile(&ns, &data);
+        let namespaces = adb_addon_namespaces(&data);
+        for ns in namespaces {
+            let mut profile = discover_create_addon_profile(&ns, &data);
+            // Aeronautics 1.3.3 splits its real blocks across three bundled
+            // namespaces. Preserve those identities in propulsion metadata
+            // even when their path names do not match the generic heuristic.
+            let mut propulsion = profile
+                .propulsion
+                .take()
+                .unwrap_or_else(PropulsionSpec::aeronautics_default);
+            for id in data
+                .blockstates
+                .keys()
+                .filter(|id| id.starts_with(&format!("{ns}:")))
+            {
+                let path = id.split_once(':').map(|(_, path)| path).unwrap_or(id);
+                if adb_is_real_propeller(id, path) {
+                    propulsion.propeller_blocks.push(id.clone());
+                }
+                if adb_is_real_lift(id, path) {
+                    propulsion.buoyancy_blocks.push(id.clone());
+                }
+                if adb_is_real_control(id, path) {
+                    propulsion.rudder_blocks.push(id.clone());
+                }
+            }
+            if !propulsion.propeller_blocks.is_empty()
+                || !propulsion.buoyancy_blocks.is_empty()
+                || !propulsion.rudder_blocks.is_empty()
+            {
+                profile.propulsion = Some(propulsion);
+            }
             if profile.block_defs().is_empty() && profile.hidden_blocks.is_empty() {
                 continue;
             }
@@ -353,8 +443,37 @@ impl AeronauticsRuntimeBridge {
             }
             self.add_addon(profile);
         }
-        Ok(register_hidden_block_names(hidden.iter().map(String::as_str)))
+        Ok(register_hidden_block_names(
+            hidden.iter().map(String::as_str),
+        ))
     }
+}
+
+fn adb_is_real_propeller(id: &str, path: &str) -> bool {
+    id == "aeronautics:andesite_propeller"
+        || id == "aeronautics:gyroscopic_propeller_bearing"
+        || (id.starts_with("simulated:") && path.contains("portable_engine"))
+        || (id.starts_with("simulated:") && path.contains("propeller"))
+        || path.contains("thruster")
+}
+
+fn adb_is_real_lift(id: &str, path: &str) -> bool {
+    id == "aeronautics:adjustable_burner"
+        || (id.starts_with("aeronautics:") && (path.contains("envelope") || path.contains("sail")))
+        || (id.starts_with("simulated:") && path.contains("sail"))
+        || path.contains("balloon")
+}
+
+fn adb_is_real_control(id: &str, path: &str) -> bool {
+    (id.starts_with("simulated:") && path.contains("handle"))
+        || id == "simulated:altitude_sensor"
+        || id == "simulated:analog_transmission"
+        || id == "offroad:wheel_mount"
+        || id == "offroad:rockcutting_wheel"
+        || id == "offroad:borehead_bearing"
+        || path == "helm"
+        || path == "cockpit"
+        || path.contains("rudder")
 }
 
 // ---------------------------------------------------------------------------
@@ -474,8 +593,7 @@ impl DimensionModRuntimeBridge {
                 dim_mod::DimTypeDescriptor::defaults("minecraft:overworld", -64, 384)
             }
             DimId::Nether => {
-                let mut t =
-                    dim_mod::DimTypeDescriptor::defaults("minecraft:the_nether", 0, 256);
+                let mut t = dim_mod::DimTypeDescriptor::defaults("minecraft:the_nether", 0, 256);
                 t.coordinate_scale = 8.0;
                 t.has_skylight = false;
                 t.has_ceiling = true;
@@ -597,7 +715,9 @@ impl DimensionModRuntimeBridge {
                 .iter()
                 .filter(|(p, _)| adb_is_dimension_json(p))
                 .filter_map(|(p, b)| {
-                    std::str::from_utf8(b).ok().map(|s| (p.clone(), s.to_string()))
+                    std::str::from_utf8(b)
+                        .ok()
+                        .map(|s| (p.clone(), s.to_string()))
                 })
                 .collect();
             if !files.is_empty() {
@@ -613,8 +733,7 @@ impl DimensionModRuntimeBridge {
         for name in &hidden {
             self.mod_hidden_names.insert(ns_rl(name));
         }
-        report.hidden_states_added =
-            register_hidden_block_names(hidden.iter().map(String::as_str));
+        report.hidden_states_added = register_hidden_block_names(hidden.iter().map(String::as_str));
 
         // Discovered `dimension_type`/`dimension` tables win over builtins.
         for t in &data.dimension_types {
@@ -627,8 +746,7 @@ impl DimensionModRuntimeBridge {
         // Environment profiles: a builtin profile's physics overrides apply
         // when its mod's dims were discovered; every other dim derives a safe
         // default from its own `dimension_type`.
-        let discovered: HashSet<&str> =
-            data.dimensions.iter().map(|d| d.id.as_str()).collect();
+        let discovered: HashSet<&str> = data.dimensions.iter().map(|d| d.id.as_str()).collect();
         for profile in dim_mod::builtin_dimension_mod_profiles() {
             if profile
                 .dimensions
@@ -762,12 +880,11 @@ fn adb_addon_namespaces(data: &mod_data::LoadedModData) -> BTreeSet<String> {
     out
 }
 
-/// Wrap `(path, bytes)` JAR entries as a stored (uncompressed) ZIP the
-/// `load_from_stored_zip` scanner accepts verbatim — local file headers only;
-/// the scanner stops at the first non-entry signature so no central directory
-/// is needed.
+/// Wrap `(path, bytes)` JAR entries as a complete stored (uncompressed) ZIP.
 fn adb_stored_zip(entries: &[(String, Vec<u8>)]) -> Vec<u8> {
     let mut out = Vec::new();
+    let mut central = Vec::new();
+    let mut entry_count = 0u16;
     for (name, data) in entries {
         if !name.ends_with(".json")
             || !(name.starts_with("data/") || name.starts_with("assets/"))
@@ -776,20 +893,52 @@ fn adb_stored_zip(entries: &[(String, Vec<u8>)]) -> Vec<u8> {
         {
             continue;
         }
+        let offset = out.len() as u32;
+        let crc = megu_core::hash::crc32_ieee(data);
         out.extend_from_slice(&0x0403_4b50u32.to_le_bytes()); // local file header
         out.extend_from_slice(&20u16.to_le_bytes()); // version needed
         out.extend_from_slice(&0u16.to_le_bytes()); // flags
         out.extend_from_slice(&0u16.to_le_bytes()); // method 0 = stored
         out.extend_from_slice(&0u16.to_le_bytes()); // mod time
         out.extend_from_slice(&0u16.to_le_bytes()); // mod date
-        out.extend_from_slice(&0u32.to_le_bytes()); // crc32 (scanner ignores)
+        out.extend_from_slice(&crc.to_le_bytes());
         out.extend_from_slice(&(data.len() as u32).to_le_bytes()); // comp size
         out.extend_from_slice(&(data.len() as u32).to_le_bytes()); // uncomp size
         out.extend_from_slice(&(name.len() as u16).to_le_bytes());
         out.extend_from_slice(&0u16.to_le_bytes()); // extra len
         out.extend_from_slice(name.as_bytes());
         out.extend_from_slice(data);
+
+        central.extend_from_slice(&0x0201_4b50u32.to_le_bytes());
+        central.extend_from_slice(&20u16.to_le_bytes());
+        central.extend_from_slice(&20u16.to_le_bytes());
+        central.extend_from_slice(&0u16.to_le_bytes());
+        central.extend_from_slice(&0u16.to_le_bytes());
+        central.extend_from_slice(&0u16.to_le_bytes());
+        central.extend_from_slice(&0u16.to_le_bytes());
+        central.extend_from_slice(&crc.to_le_bytes());
+        central.extend_from_slice(&(data.len() as u32).to_le_bytes());
+        central.extend_from_slice(&(data.len() as u32).to_le_bytes());
+        central.extend_from_slice(&(name.len() as u16).to_le_bytes());
+        central.extend_from_slice(&0u16.to_le_bytes());
+        central.extend_from_slice(&0u16.to_le_bytes());
+        central.extend_from_slice(&0u16.to_le_bytes());
+        central.extend_from_slice(&0u16.to_le_bytes());
+        central.extend_from_slice(&0u32.to_le_bytes());
+        central.extend_from_slice(&offset.to_le_bytes());
+        central.extend_from_slice(name.as_bytes());
+        entry_count = entry_count.saturating_add(1);
     }
+    let central_offset = out.len() as u32;
+    out.extend_from_slice(&central);
+    out.extend_from_slice(&0x0605_4b50u32.to_le_bytes());
+    out.extend_from_slice(&0u16.to_le_bytes());
+    out.extend_from_slice(&0u16.to_le_bytes());
+    out.extend_from_slice(&entry_count.to_le_bytes());
+    out.extend_from_slice(&entry_count.to_le_bytes());
+    out.extend_from_slice(&(central.len() as u32).to_le_bytes());
+    out.extend_from_slice(&central_offset.to_le_bytes());
+    out.extend_from_slice(&0u16.to_le_bytes());
     out
 }
 
@@ -831,6 +980,11 @@ fn dimension_mod_ensure_orbital_dimension(dim: DimId) -> bool {
     let Some(descriptor) = descriptor else {
         return false;
     };
+    if let Ok(mut bridge) = aeronautics_bridge().lock() {
+        bridge
+            .orbital_router
+            .register_dimension(dim.raw(), descriptor.clone());
+    }
     mod_offload_bridge()
         .lock()
         .unwrap_or_else(|error| error.into_inner())
@@ -852,6 +1006,149 @@ fn aeronautics_bridge_tick(dt: f64, gravity: f64, air_density: f64) {
         return;
     }
     bridge.step(dt, gravity, air_density);
+}
+
+/// Assemble a live airship from world-space block coordinates and queue its
+/// complete S2C spawn snapshot. Every input block is a `(position,state_id,id)` tuple.
+fn aeronautics_bridge_assemble_ship(
+    dim: DimId,
+    origin: [i32; 3],
+    blocks: &[([i32; 3], u32, &str)],
+) -> Result<u64, String> {
+    if blocks.is_empty() || blocks.len() > create_adapter::aeronautics::MAX_SUBWORLD_VOXELS {
+        return Err("ship assembly must contain 1..=65536 blocks".into());
+    }
+    let mut cells = BTreeMap::new();
+    let mut voxels = Vec::with_capacity(blocks.len());
+    for (world, state, name) in blocks {
+        let local = [
+            world[0] - origin[0],
+            world[1] - origin[1],
+            world[2] - origin[2],
+        ];
+        if local
+            .iter()
+            .any(|v| *v < i32::from(i16::MIN) || *v > i32::from(i16::MAX))
+        {
+            return Err("ship block lies outside the wire coordinate range".into());
+        }
+        if !name.contains(':') || name.len() > 32_767 {
+            return Err(format!("invalid block id: {name}"));
+        }
+        if cells.insert(local, (*name).to_owned()).is_some() {
+            return Err("duplicate ship block position".into());
+        }
+        voxels.push(([local[0] as i16, local[1] as i16, local[2] as i16], *state));
+    }
+    let mut bridge = aeronautics_bridge()
+        .lock()
+        .map_err(|_| "aeronautics bridge lock poisoned".to_string())?;
+    bridge.ensure_registry()?;
+    let id = bridge.next_subworld_id.max(1);
+    bridge.assemble_airship(id, dim.raw(), cells, None, DEFAULT_BLOCK_MASS)?;
+    let Some(sub) = bridge.airships.get_mut(&id) else {
+        return Err("assembled ship was not registered".into());
+    };
+    sub.pos = [
+        f64::from(origin[0]),
+        f64::from(origin[1]),
+        f64::from(origin[2]),
+    ];
+    let frame = SubWorldSyncFrame {
+        kind: SubWorldSyncKind::FullSpawn,
+        subworld_id: id,
+        dim_id: dim.dimension_id().to_owned(),
+        pos: sub.pos,
+        quat: sub.quat.map(|v| v as f32),
+        vel: [0.0; 3],
+        ang_vel: [0.0; 3],
+        revision: 0,
+        voxels,
+    }
+    .encode()?;
+    bridge.sync_frames.push((dim.raw(), frame));
+    Ok(id)
+}
+
+/// Apply a player helm packet to the addressed live ship.
+fn aeronautics_bridge_apply_helm_input(
+    player_eid: u32,
+    input: &SubWorldHelmInput,
+) -> Result<(), String> {
+    input.encode()?;
+    let mut bridge = aeronautics_bridge()
+        .lock()
+        .map_err(|_| "aeronautics bridge lock poisoned".to_string())?;
+    if input.disassemble {
+        let sub = bridge
+            .airships
+            .remove(&input.subworld_id)
+            .ok_or_else(|| "unknown subworld".to_string())?;
+        let frame = SubWorldSyncFrame {
+            kind: SubWorldSyncKind::Despawn,
+            subworld_id: input.subworld_id,
+            dim_id: DimId::from_raw(sub.parent_dim).dimension_id().to_owned(),
+            pos: sub.pos,
+            quat: sub.quat.map(|v| v as f32),
+            vel: [0.0; 3],
+            ang_vel: [0.0; 3],
+            revision: bridge
+                .revisions
+                .remove(&input.subworld_id)
+                .unwrap_or(0)
+                .saturating_add(1),
+            voxels: Vec::new(),
+        }
+        .encode()?;
+        bridge.sync_frames.push((sub.parent_dim, frame));
+        bridge
+            .passengers
+            .retain(|_, (ship, _)| *ship != input.subworld_id);
+        let _ = player_eid;
+        return Ok(());
+    }
+    let sub = bridge
+        .airships
+        .get_mut(&input.subworld_id)
+        .ok_or_else(|| "unknown subworld".to_string())?;
+    sub.apply_helm_input(input)?;
+    let _ = player_eid;
+    Ok(())
+}
+
+/// Advance active airships and return queued `(dimension, encoded frame)` S2C updates.
+fn aeronautics_bridge_step_and_drain_sync_frames(dt_secs: f32) -> Vec<(DimId, Vec<u8>)> {
+    if !dt_secs.is_finite() || dt_secs <= 0.0 {
+        return Vec::new();
+    }
+    aeronautics_bridge_tick(f64::from(dt_secs), 9.81, SEA_LEVEL_AIR_DENSITY);
+    let Ok(mut bridge) = aeronautics_bridge().lock() else {
+        return Vec::new();
+    };
+    std::mem::take(&mut bridge.sync_frames)
+        .into_iter()
+        .map(|(dim, bytes)| (DimId::from_raw(dim), bytes))
+        .collect()
+}
+
+fn aeronautics_bridge_ship_summaries() -> Vec<(u64, DimId, [f64; 3], [f64; 3])> {
+    aeronautics_bridge()
+        .lock()
+        .map(|bridge| {
+            bridge
+                .airships
+                .values()
+                .map(|ship| {
+                    (
+                        ship.id,
+                        DimId::from_raw(ship.parent_dim),
+                        ship.pos,
+                        ship.vel,
+                    )
+                })
+                .collect()
+        })
+        .unwrap_or_default()
 }
 
 /// Save v2 bytes for the whole airship fleet (`AERO` v1 snapshots inside the
@@ -945,11 +1242,9 @@ fn aeronautics_state_load_bytes(bytes: &[u8]) -> bool {
     };
     let mut records = Vec::with_capacity(env_count);
     for _ in 0..env_count {
-        let Some(dimension_id) = mod_wire::read_mc_string(
-            bytes,
-            &mut cursor,
-            mod_wire::MAX_REGISTRY_DATA_NAME_LEN,
-        ) else {
+        let Some(dimension_id) =
+            mod_wire::read_mc_string(bytes, &mut cursor, mod_wire::MAX_REGISTRY_DATA_NAME_LEN)
+        else {
             return false;
         };
         let Some(gravity_raw) = bytes.get(cursor..cursor + 8) else {
@@ -966,11 +1261,9 @@ fn aeronautics_state_load_bytes(bytes: &[u8]) -> bool {
             return false;
         };
         cursor += 4;
-        let Some(sky_effects) = mod_wire::read_mc_string(
-            bytes,
-            &mut cursor,
-            mod_wire::MAX_REGISTRY_DATA_NAME_LEN,
-        ) else {
+        let Some(sky_effects) =
+            mod_wire::read_mc_string(bytes, &mut cursor, mod_wire::MAX_REGISTRY_DATA_NAME_LEN)
+        else {
             return false;
         };
         records.push(dim_mod::DimensionEnvProfile {
@@ -1078,6 +1371,7 @@ mod aeronautics_and_dim_bridge_tests {
     use super::*;
     use create_adapter::aeronautics::{DEFAULT_BLOCK_MASS, SEA_LEVEL_AIR_DENSITY};
     use create_adapter::factory::DimBlockPos;
+    use create_adapter::orbital::{OrbitalTransitionRule, OrbitalTrigger};
 
     /// Several tests here reprogram the process-global bridges; serialize them.
     /// A panicking sibling test must not cascade poison into the next one, so
@@ -1085,11 +1379,15 @@ mod aeronautics_and_dim_bridge_tests {
     static ADB_LOCK: Mutex<()> = Mutex::new(());
 
     fn adb_lock() -> std::sync::MutexGuard<'static, AeronauticsRuntimeBridge> {
-        aeronautics_bridge().lock().unwrap_or_else(|e| e.into_inner())
+        aeronautics_bridge()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
     }
 
     fn dim_lock() -> std::sync::MutexGuard<'static, DimensionModRuntimeBridge> {
-        dimension_mod_bridge().lock().unwrap_or_else(|e| e.into_inner())
+        dimension_mod_bridge()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
     }
 
     /// Synthetic `Client` (same fixture style as `mod_offload_bridge`'s tests)
@@ -1177,6 +1475,58 @@ mod aeronautics_and_dim_bridge_tests {
         reg.encode_canonical(st).unwrap().to_string()
     }
 
+    fn test_stored_zip(entries: &[(&str, &[u8])]) -> Vec<u8> {
+        let mut out = Vec::new();
+        let mut central = Vec::new();
+        for (name, data) in entries {
+            let offset = out.len() as u32;
+            let crc = megu_core::hash::crc32_ieee(data);
+            out.extend_from_slice(&0x0403_4b50u32.to_le_bytes());
+            out.extend_from_slice(&20u16.to_le_bytes());
+            out.extend_from_slice(&0u16.to_le_bytes());
+            out.extend_from_slice(&0u16.to_le_bytes());
+            out.extend_from_slice(&0u16.to_le_bytes());
+            out.extend_from_slice(&0u16.to_le_bytes());
+            out.extend_from_slice(&crc.to_le_bytes());
+            out.extend_from_slice(&(data.len() as u32).to_le_bytes());
+            out.extend_from_slice(&(data.len() as u32).to_le_bytes());
+            out.extend_from_slice(&(name.len() as u16).to_le_bytes());
+            out.extend_from_slice(&0u16.to_le_bytes());
+            out.extend_from_slice(name.as_bytes());
+            out.extend_from_slice(data);
+
+            central.extend_from_slice(&0x0201_4b50u32.to_le_bytes());
+            central.extend_from_slice(&20u16.to_le_bytes());
+            central.extend_from_slice(&20u16.to_le_bytes());
+            central.extend_from_slice(&0u16.to_le_bytes());
+            central.extend_from_slice(&0u16.to_le_bytes());
+            central.extend_from_slice(&0u16.to_le_bytes());
+            central.extend_from_slice(&0u16.to_le_bytes());
+            central.extend_from_slice(&crc.to_le_bytes());
+            central.extend_from_slice(&(data.len() as u32).to_le_bytes());
+            central.extend_from_slice(&(data.len() as u32).to_le_bytes());
+            central.extend_from_slice(&(name.len() as u16).to_le_bytes());
+            central.extend_from_slice(&0u16.to_le_bytes());
+            central.extend_from_slice(&0u16.to_le_bytes());
+            central.extend_from_slice(&0u16.to_le_bytes());
+            central.extend_from_slice(&0u16.to_le_bytes());
+            central.extend_from_slice(&0u32.to_le_bytes());
+            central.extend_from_slice(&offset.to_le_bytes());
+            central.extend_from_slice(name.as_bytes());
+        }
+        let central_offset = out.len() as u32;
+        out.extend_from_slice(&central);
+        out.extend_from_slice(&0x0605_4b50u32.to_le_bytes());
+        out.extend_from_slice(&0u16.to_le_bytes());
+        out.extend_from_slice(&0u16.to_le_bytes());
+        out.extend_from_slice(&(entries.len() as u16).to_le_bytes());
+        out.extend_from_slice(&(entries.len() as u16).to_le_bytes());
+        out.extend_from_slice(&(central.len() as u32).to_le_bytes());
+        out.extend_from_slice(&central_offset.to_le_bytes());
+        out.extend_from_slice(&0u16.to_le_bytes());
+        out
+    }
+
     /// The proven flying-ship fixture: `propeller_engine[axis=x]` drives
     /// `create:shaft[axis=x]` into `propeller_bearing[facing=east]` (a live
     /// 64-RPM kinetic chain pushing +X), under a single balloon envelope.
@@ -1219,8 +1569,14 @@ mod aeronautics_and_dim_bridge_tests {
                 b.ensure_registry().unwrap();
                 powered_airship_cells(b.registry.as_ref().unwrap())
             };
-            b.assemble_airship(1, dim.raw(), cells, Some("createaeronautics"), DEFAULT_BLOCK_MASS)
-                .unwrap();
+            b.assemble_airship(
+                1,
+                dim.raw(),
+                cells,
+                Some("createaeronautics"),
+                DEFAULT_BLOCK_MASS,
+            )
+            .unwrap();
             let ship = b.airships.get_mut(&1).unwrap();
             assert_eq!(ship.propellers.len(), 2, "engine + bearing both thrust");
             ship.pos = [0.0, 100.0, 0.0];
@@ -1261,8 +1617,14 @@ mod aeronautics_and_dim_bridge_tests {
             );
             pos = to;
         }
-        assert!(saw_overspeed, "ship must exceed vanilla move allowance to prove the carry path");
-        assert!(saw_descent, "one balloon must not lift the hull — descent exercises the NoFall leg");
+        assert!(
+            saw_overspeed,
+            "ship must exceed vanilla move allowance to prove the carry path"
+        );
+        assert!(
+            saw_descent,
+            "one balloon must not lift the hull — descent exercises the NoFall leg"
+        );
         assert_eq!(ac_flag_count(pilot_eid, AcCheckId::Movement), 0);
         assert_eq!(ac_flag_count(pilot_eid, AcCheckId::NoFall), 0);
         // The embedded factory is still live: the propeller node solves at the
@@ -1295,8 +1657,7 @@ mod aeronautics_and_dim_bridge_tests {
     }
 
     #[test]
-    fn dimension_mod_jar_auto_registers_live_track2_dim_and_portal_teleport_passes_anticheat()
-    {
+    fn dimension_mod_jar_auto_registers_live_track2_dim_and_portal_teleport_passes_anticheat() {
         let _serial = ADB_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         *dim_lock() = DimensionModRuntimeBridge::new();
         ac_test_set_anti_xray(Some(true));
@@ -1353,7 +1714,10 @@ mod aeronautics_and_dim_bridge_tests {
         let undergarden =
             DimId::parse_dimension_id("undergarden:undergarden").expect("undergarden registered");
         for dim in [crystal, moon, undergarden] {
-            assert!(dim.raw() >= 3, "custom dim must own a dynamic slot: {dim:?}");
+            assert!(
+                dim.raw() >= 3,
+                "custom dim must own a dynamic slot: {dim:?}"
+            );
         }
         assert_eq!(crystal.dimension_id(), "testdim:crystal_caves");
 
@@ -1389,7 +1753,10 @@ mod aeronautics_and_dim_bridge_tests {
             assert!(b.mod_hidden_names.contains("minecraft:calcite"));
         }
         let calcite = name_to_state("calcite").expect("vanilla block");
-        assert!(is_hidden(calcite), "#c:ores member must be hidden from xray");
+        assert!(
+            is_hidden(calcite),
+            "#c:ores member must be hidden from xray"
+        );
 
         // A custom VerticalFrame portal (the Aether pattern: glowstone frame
         // + water_bucket igniter) registered on the custom dim.
@@ -1433,9 +1800,8 @@ mod aeronautics_and_dim_bridge_tests {
                     .unwrap_or_else(|| "minecraft:air".to_string()),
             )
         };
-        let transition =
-            dim_mod::detect_vertical_portal(&rule, [10, 70, 20], &block_at)
-                .expect("glowstone frame must validate");
+        let transition = dim_mod::detect_vertical_portal(&rule, [10, 70, 20], &block_at)
+            .expect("glowstone frame must validate");
         assert_eq!(transition.target_dim, "testdim:crystal_caves");
         assert_eq!(transition.cell_count, 6);
 
@@ -1443,8 +1809,18 @@ mod aeronautics_and_dim_bridge_tests {
         // maps the 3000-block journey through `ac_expect_teleport` + grace.
         let traveller_eid = 988_010;
         let control_eid = 988_011;
-        let traveller = mk_client("adb_traveller", traveller_eid, DimId::Overworld, (0.5, 80.0, 0.5));
-        let control = mk_client("adb_control", control_eid, DimId::Overworld, (0.5, 80.0, 0.5));
+        let traveller = mk_client(
+            "adb_traveller",
+            traveller_eid,
+            DimId::Overworld,
+            (0.5, 80.0, 0.5),
+        );
+        let control = mk_client(
+            "adb_control",
+            control_eid,
+            DimId::Overworld,
+            (0.5, 80.0, 0.5),
+        );
         for c in [&traveller, &control] {
             ac_test_set_player_preset(&c.name, AcPreset::Standard);
             let v = ac_check_move(c, (0.5, 80.0, 0.5), (0.6, 80.0, 0.5), false);
@@ -1470,7 +1846,11 @@ mod aeronautics_and_dim_bridge_tests {
         assert!((intent.target_pos[2] - (-500.125)).abs() < 1e-9);
 
         let from = (source_pos[0], source_pos[1], source_pos[2]);
-        let to = (intent.target_pos[0], intent.target_pos[1], intent.target_pos[2]);
+        let to = (
+            intent.target_pos[0],
+            intent.target_pos[1],
+            intent.target_pos[2],
+        );
         let v = ac_check_move(&traveller, from, to, false);
         assert!(
             matches!(v, AcMoveVerdict::Accept { .. }),
@@ -1481,7 +1861,10 @@ mod aeronautics_and_dim_bridge_tests {
 
         // The identical hop without the portal grant is a plain blink: flagged.
         let v = ac_check_move(&control, from, to, false);
-        assert!(matches!(v, AcMoveVerdict::Setback), "ungranted portal hop must flag");
+        assert!(
+            matches!(v, AcMoveVerdict::Setback),
+            "ungranted portal hop must flag"
+        );
         assert!(ac_flag_count(control_eid, AcCheckId::Movement) > 0);
 
         ac_test_set_anti_xray(None);
@@ -1503,10 +1886,22 @@ mod aeronautics_and_dim_bridge_tests {
             b.airships.get_mut(&7).unwrap().pos = [3.0, 90.0, -4.0];
 
             let mut raft = BTreeMap::new();
-            raft.insert([0, 0, 0], canonical(&reg, "createaeronautics:airship_assembler"));
-            raft.insert([1, 0, 0], canonical(&reg, "createaeronautics:airship_assembler"));
-            raft.insert([0, 1, 0], canonical(&reg, "createaeronautics:balloon_envelope"));
-            raft.insert([1, 1, 0], canonical(&reg, "createaeronautics:balloon_envelope"));
+            raft.insert(
+                [0, 0, 0],
+                canonical(&reg, "createaeronautics:airship_assembler"),
+            );
+            raft.insert(
+                [1, 0, 0],
+                canonical(&reg, "createaeronautics:airship_assembler"),
+            );
+            raft.insert(
+                [0, 1, 0],
+                canonical(&reg, "createaeronautics:balloon_envelope"),
+            );
+            raft.insert(
+                [1, 1, 0],
+                canonical(&reg, "createaeronautics:balloon_envelope"),
+            );
             b.assemble_airship(9, 0, raft, Some("createaeronautics"), DEFAULT_BLOCK_MASS)
                 .unwrap();
             b.airships.get_mut(&9).unwrap().pos = [-10.0, 120.0, 6.0];
@@ -1525,7 +1920,10 @@ mod aeronautics_and_dim_bridge_tests {
         *adb_lock() = AeronauticsRuntimeBridge::new();
         assert!(aeronautics_bridge_load_bytes(&blob1));
         let reblob = aeronautics_bridge_save_bytes();
-        assert_eq!(reblob, blob1, "save -> load -> save must round-trip exactly");
+        assert_eq!(
+            reblob, blob1,
+            "save -> load -> save must round-trip exactly"
+        );
         // The restored fleet keeps flying (the powered ship's live network
         // survived the codec).
         let before = adb_lock().airships[&7].pos;
@@ -1533,7 +1931,10 @@ mod aeronautics_and_dim_bridge_tests {
             aeronautics_bridge_tick(0.05, 9.81, SEA_LEVEL_AIR_DENSITY);
         }
         let after = adb_lock().airships[&7].pos;
-        assert!(after[0] > before[0], "restored ship must keep +X thrust: {before:?} -> {after:?}");
+        assert!(
+            after[0] > before[0],
+            "restored ship must keep +X thrust: {before:?} -> {after:?}"
+        );
 
         // Corrupt blobs fail closed and leave the fleet untouched.
         let moved_blob = aeronautics_bridge_save_bytes();
@@ -1584,11 +1985,171 @@ mod aeronautics_and_dim_bridge_tests {
             profile.propulsion.is_some(),
             "flux_propeller must classify as propulsion"
         );
-        assert!(profile.hidden_blocks.contains(&"mysteryaddon:flux_ore".to_string()));
+        assert!(profile
+            .hidden_blocks
+            .contains(&"mysteryaddon:flux_ore".to_string()));
         // The rebuilt shared registry now knows the addon's blocks.
         b.ensure_registry().unwrap();
-        let reg = b.registry.as_ref().expect("registry rebuilt after discovery");
+        let reg = b
+            .registry
+            .as_ref()
+            .expect("registry rebuilt after discovery");
         assert!(reg.default_state("mysteryaddon:flux_propeller").is_some());
         assert!(reg.default_state("mysteryaddon:flux_ore").is_some());
+    }
+
+    #[test]
+    fn bundled_aeronautics_jarjar_discovers_all_three_real_namespaces() {
+        let _serial = ADB_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        *adb_lock() = AeronauticsRuntimeBridge::new();
+        let aero = test_stored_zip(&[(
+            "assets/aeronautics/blockstates/andesite_propeller.json",
+            br#"{"variants":{"":{"model":"aeronautics:block/andesite_propeller"}}}"#,
+        )]);
+        let simulated = test_stored_zip(&[(
+            "assets/simulated/blockstates/black_portable_engine.json",
+            br#"{"variants":{"":{"model":"simulated:block/black_portable_engine"}}}"#,
+        )]);
+        let offroad = test_stored_zip(&[(
+            "assets/offroad/blockstates/wheel_mount.json",
+            br#"{"variants":{"":{"model":"offroad:block/wheel_mount"}}}"#,
+        )]);
+        let bundled = test_stored_zip(&[
+            ("META-INF/jarjar/aeronautics.jar", aero.as_slice()),
+            ("META-INF/jarjar/simulated.jar", simulated.as_slice()),
+            ("META-INF/jarjar/offroad.jar", offroad.as_slice()),
+        ]);
+        {
+            let mut bridge = adb_lock();
+            bridge
+                .discover_addon_jar([("create-aeronautics-bundled.jar", bundled.as_slice())])
+                .unwrap();
+            for namespace in ["aeronautics", "simulated", "offroad"] {
+                assert!(
+                    bridge
+                        .addons
+                        .iter()
+                        .any(|profile| profile.mod_id == namespace),
+                    "missing {namespace}"
+                );
+            }
+            let aero_profile = bridge
+                .addons
+                .iter()
+                .find(|p| p.mod_id == "aeronautics")
+                .unwrap();
+            assert!(aero_profile
+                .propulsion
+                .as_ref()
+                .unwrap()
+                .propeller_blocks
+                .contains(&"aeronautics:andesite_propeller".to_string()));
+            let simulated_profile = bridge
+                .addons
+                .iter()
+                .find(|p| p.mod_id == "simulated")
+                .unwrap();
+            assert!(simulated_profile
+                .propulsion
+                .as_ref()
+                .unwrap()
+                .propeller_blocks
+                .contains(&"simulated:black_portable_engine".to_string()));
+            let offroad_profile = bridge
+                .addons
+                .iter()
+                .find(|p| p.mod_id == "offroad")
+                .unwrap();
+            assert!(offroad_profile
+                .propulsion
+                .as_ref()
+                .unwrap()
+                .rudder_blocks
+                .contains(&"offroad:wheel_mount".to_string()));
+        }
+    }
+
+    #[test]
+    fn live_world_assembly_helm_flight_and_sync_drain() {
+        let _serial = ADB_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        *adb_lock() = AeronauticsRuntimeBridge::new();
+        let blocks = [
+            ([10, 100, 10], 1, "aeronautics:andesite_propeller"),
+            ([11, 100, 10], 2, "aeronautics:red_envelope"),
+        ];
+        let id =
+            aeronautics_bridge_assemble_ship(DimId::Overworld, [10, 100, 10], &blocks).unwrap();
+        aeronautics_bridge()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .orbital_router
+            .register_rule(OrbitalTransitionRule::new(
+                "test-ascent",
+                DimId::Overworld.raw(),
+                OrbitalTrigger::AscendCeiling { ceiling_y: 100.1 },
+                2,
+            ));
+        let spawn_frames = aeronautics_bridge_step_and_drain_sync_frames(0.05);
+        assert!(spawn_frames
+            .iter()
+            .any(|(_, bytes)| SubWorldSyncFrame::decode(bytes)
+                .is_ok_and(|f| f.kind == SubWorldSyncKind::FullSpawn)));
+        let input = SubWorldHelmInput {
+            subworld_id: id,
+            throttle: 1.0,
+            pitch: 0.25,
+            yaw: -0.2,
+            roll: 0.1,
+            buoyancy_delta: 1.0,
+            disassemble: false,
+        };
+        aeronautics_bridge_apply_helm_input(91, &input).unwrap();
+        for _ in 0..20 {
+            let frames = aeronautics_bridge_step_and_drain_sync_frames(0.05);
+            assert!(frames
+                .iter()
+                .any(|(_, bytes)| SubWorldSyncFrame::decode(bytes)
+                    .is_ok_and(|f| f.kind == SubWorldSyncKind::PoseDelta)));
+        }
+        {
+            let bridge = adb_lock();
+            let ship = bridge
+                .airships
+                .get(&id)
+                .expect("live ship remains registered");
+            assert!(
+                ship.pos[1] > 100.0,
+                "helium control should increase altitude: {:?}",
+                ship.pos
+            );
+            assert!(
+                ship.vel[0] > 0.0,
+                "throttle should increase forward velocity: {:?}",
+                ship.vel
+            );
+            assert!(
+                ship.omega.iter().any(|v| v.abs() > 0.0),
+                "steering should rotate the ship"
+            );
+            assert_eq!(
+                ship.parent_dim, 2,
+                "configured orbital ceiling should transfer the ship"
+            );
+        }
+        let despawn = SubWorldHelmInput {
+            disassemble: true,
+            throttle: 0.0,
+            pitch: 0.0,
+            yaw: 0.0,
+            roll: 0.0,
+            buoyancy_delta: 0.0,
+            ..input
+        };
+        aeronautics_bridge_apply_helm_input(91, &despawn).unwrap();
+        let frames = aeronautics_bridge_step_and_drain_sync_frames(0.05);
+        assert!(frames
+            .iter()
+            .any(|(_, bytes)| SubWorldSyncFrame::decode(bytes)
+                .is_ok_and(|f| f.kind == SubWorldSyncKind::Despawn)));
     }
 }

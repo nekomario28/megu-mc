@@ -10,9 +10,7 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
-use mod_adapter_core::neoforge_wire::{
-    read_mc_string, read_varint, write_mc_string, write_varint,
-};
+use mod_adapter_core::neoforge_wire::{read_mc_string, read_varint, write_mc_string, write_varint};
 use mod_adapter_core::version_compat::{data_version_for, McVersion};
 use mod_offload::kinetic_graph::NetworkStatus;
 
@@ -44,6 +42,292 @@ pub const MAX_OMEGA: f64 = 32.0;
 const INTERNAL_REGION_STEPS: usize = 1_024;
 /// Maximum canonical blockstate string length accepted by the codec.
 const MAX_BLOCKSTATE_LEN: usize = 32_767;
+/// S2C channel carrying versioned 6-DOF sub-world snapshots and pose deltas.
+pub const SUBWORLD_SYNC_CHANNEL: &str = "megu:subworld_sync_v1";
+/// C2S channel carrying versioned 6-DOF helm input.
+pub const SUBWORLD_HELM_CHANNEL: &str = "megu:subworld_helm_v1";
+/// Maximum voxel records in one complete sub-world spawn frame.
+pub const MAX_SUBWORLD_VOXELS: usize = 65_536;
+const SUBWORLD_SYNC_MAGIC: [u8; 4] = *b"SW6D";
+const SUBWORLD_SYNC_VERSION: u8 = 1;
+
+/// Kind of update carried by [`SubWorldSyncFrame`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SubWorldSyncKind {
+    FullSpawn,
+    PoseDelta,
+    Despawn,
+}
+
+/// Version 1 server-to-client sub-world state. Quaternion order is `[x,y,z,w]`.
+#[derive(Clone, Debug, PartialEq)]
+pub struct SubWorldSyncFrame {
+    pub kind: SubWorldSyncKind,
+    pub subworld_id: u64,
+    pub dim_id: String,
+    pub pos: [f64; 3],
+    pub quat: [f32; 4],
+    pub vel: [f32; 3],
+    pub ang_vel: [f32; 3],
+    pub revision: u32,
+    pub voxels: Vec<([i16; 3], u32)>,
+}
+
+impl SubWorldSyncFrame {
+    /// Encode the bounded `SW6D` v1 frame, rejecting invalid poses and oversized data.
+    pub fn encode(&self) -> Result<Vec<u8>, String> {
+        if self.dim_id.is_empty() || self.dim_id.len() > u16::MAX as usize {
+            return Err("invalid subworld dimension id length".into());
+        }
+        if self.pos.iter().any(|v| !v.is_finite())
+            || self.vel.iter().chain(&self.ang_vel).any(|v| !v.is_finite())
+        {
+            return Err("non-finite subworld pose".into());
+        }
+        let qnorm = self
+            .quat
+            .iter()
+            .map(|v| f64::from(*v) * f64::from(*v))
+            .sum::<f64>();
+        if self.quat.iter().any(|v| !v.is_finite()) || (qnorm - 1.0).abs() > 1.0e-3 {
+            return Err("subworld quaternion must be a normalized unit quaternion".into());
+        }
+        if (self.kind == SubWorldSyncKind::FullSpawn && self.voxels.len() > MAX_SUBWORLD_VOXELS)
+            || (self.kind != SubWorldSyncKind::FullSpawn && !self.voxels.is_empty())
+        {
+            return Err("invalid subworld voxel list".into());
+        }
+        let mut out = Vec::with_capacity(100 + self.dim_id.len() + self.voxels.len() * 10);
+        out.extend_from_slice(&SUBWORLD_SYNC_MAGIC);
+        out.push(SUBWORLD_SYNC_VERSION);
+        out.push(match self.kind {
+            SubWorldSyncKind::FullSpawn => 0,
+            SubWorldSyncKind::PoseDelta => 1,
+            SubWorldSyncKind::Despawn => 2,
+        });
+        out.extend_from_slice(&self.subworld_id.to_be_bytes());
+        out.extend_from_slice(&(self.dim_id.len() as u16).to_be_bytes());
+        out.extend_from_slice(self.dim_id.as_bytes());
+        for v in self.pos {
+            out.extend_from_slice(&v.to_be_bytes());
+        }
+        for v in self.quat {
+            out.extend_from_slice(&v.to_be_bytes());
+        }
+        for v in self.vel {
+            out.extend_from_slice(&v.to_be_bytes());
+        }
+        for v in self.ang_vel {
+            out.extend_from_slice(&v.to_be_bytes());
+        }
+        out.extend_from_slice(&self.revision.to_be_bytes());
+        if self.kind == SubWorldSyncKind::FullSpawn {
+            out.extend_from_slice(&(self.voxels.len() as u32).to_be_bytes());
+            for (offset, state) in &self.voxels {
+                for v in offset {
+                    out.extend_from_slice(&v.to_be_bytes());
+                }
+                out.extend_from_slice(&state.to_be_bytes());
+            }
+        }
+        Ok(out)
+    }
+
+    /// Decode one complete v1 frame. Trailing and truncated bytes are rejected.
+    pub fn decode(bytes: &[u8]) -> Result<Self, String> {
+        const BASE_LEN: usize = 4 + 1 + 1 + 8 + 2 + 3 * 8 + 4 * 4 + 3 * 4 + 3 * 4 + 4;
+        if bytes.len() < BASE_LEN {
+            return Err("truncated subworld sync frame".into());
+        }
+        let mut c = 0usize;
+        let take = |c: &mut usize, n: usize| -> Result<&[u8], String> {
+            let end = c
+                .checked_add(n)
+                .ok_or_else(|| "subworld frame length overflow".to_string())?;
+            let value = bytes
+                .get(*c..end)
+                .ok_or_else(|| "truncated subworld sync frame".to_string())?;
+            *c = end;
+            Ok(value)
+        };
+        if take(&mut c, 4)? != SUBWORLD_SYNC_MAGIC {
+            return Err("bad subworld sync magic".into());
+        }
+        if take(&mut c, 1)?[0] != SUBWORLD_SYNC_VERSION {
+            return Err("unsupported subworld sync version".into());
+        }
+        let kind = match take(&mut c, 1)?[0] {
+            0 => SubWorldSyncKind::FullSpawn,
+            1 => SubWorldSyncKind::PoseDelta,
+            2 => SubWorldSyncKind::Despawn,
+            _ => return Err("unknown subworld sync kind".into()),
+        };
+        let subworld_id = u64::from_be_bytes(
+            take(&mut c, 8)?
+                .try_into()
+                .map_err(|_| "truncated subworld id")?,
+        );
+        let dim_len = usize::from(u16::from_be_bytes(
+            take(&mut c, 2)?
+                .try_into()
+                .map_err(|_| "truncated dimension length")?,
+        ));
+        if dim_len == 0 {
+            return Err("empty subworld dimension id".into());
+        }
+        let dim_id = std::str::from_utf8(take(&mut c, dim_len)?)
+            .map_err(|_| "invalid subworld dimension UTF-8")?
+            .to_owned();
+        let read_f64 = |c: &mut usize| -> Result<f64, String> {
+            Ok(f64::from_be_bytes(
+                take(c, 8)?.try_into().map_err(|_| "truncated f64")?,
+            ))
+        };
+        let read_f32 = |c: &mut usize| -> Result<f32, String> {
+            Ok(f32::from_be_bytes(
+                take(c, 4)?.try_into().map_err(|_| "truncated f32")?,
+            ))
+        };
+        let mut pos = [0.0; 3];
+        for v in &mut pos {
+            *v = read_f64(&mut c)?;
+        }
+        let mut quat = [0.0; 4];
+        for v in &mut quat {
+            *v = read_f32(&mut c)?;
+        }
+        let mut vel = [0.0; 3];
+        for v in &mut vel {
+            *v = read_f32(&mut c)?;
+        }
+        let mut ang_vel = [0.0; 3];
+        for v in &mut ang_vel {
+            *v = read_f32(&mut c)?;
+        }
+        let revision = u32::from_be_bytes(
+            take(&mut c, 4)?
+                .try_into()
+                .map_err(|_| "truncated revision")?,
+        );
+        let mut voxels = Vec::new();
+        if kind == SubWorldSyncKind::FullSpawn {
+            let count = u32::from_be_bytes(
+                take(&mut c, 4)?
+                    .try_into()
+                    .map_err(|_| "truncated voxel count")?,
+            ) as usize;
+            if count > MAX_SUBWORLD_VOXELS
+                || count
+                    .checked_mul(10)
+                    .is_none_or(|n| n > bytes.len().saturating_sub(c))
+            {
+                return Err("invalid or oversized subworld voxel count".into());
+            }
+            voxels.reserve(count);
+            for _ in 0..count {
+                let mut offset = [0i16; 3];
+                for v in &mut offset {
+                    *v = i16::from_be_bytes(
+                        take(&mut c, 2)?
+                            .try_into()
+                            .map_err(|_| "truncated voxel offset")?,
+                    );
+                }
+                let state = u32::from_be_bytes(
+                    take(&mut c, 4)?
+                        .try_into()
+                        .map_err(|_| "truncated voxel state")?,
+                );
+                voxels.push((offset, state));
+            }
+        }
+        if c != bytes.len() {
+            return Err("trailing subworld sync bytes".into());
+        }
+        let frame = Self {
+            kind,
+            subworld_id,
+            dim_id,
+            pos,
+            quat,
+            vel,
+            ang_vel,
+            revision,
+            voxels,
+        };
+        // Reuse the encoder's finite and quaternion validation.
+        frame.encode()?;
+        Ok(frame)
+    }
+}
+
+/// Client-to-server bounded helm controls. Every scalar is finite and clamped to `[-1, 1]`.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct SubWorldHelmInput {
+    pub subworld_id: u64,
+    pub throttle: f32,
+    pub pitch: f32,
+    pub yaw: f32,
+    pub roll: f32,
+    pub buoyancy_delta: f32,
+    pub disassemble: bool,
+}
+
+impl SubWorldHelmInput {
+    pub fn encode(&self) -> Result<Vec<u8>, String> {
+        let values = [
+            self.throttle,
+            self.pitch,
+            self.yaw,
+            self.roll,
+            self.buoyancy_delta,
+        ];
+        if values
+            .iter()
+            .any(|v| !v.is_finite() || !(-1.0..=1.0).contains(v))
+        {
+            return Err("helm controls must be finite and within -1..=1".into());
+        }
+        let mut out = Vec::with_capacity(29);
+        out.extend_from_slice(&self.subworld_id.to_be_bytes());
+        for v in values {
+            out.extend_from_slice(&v.to_be_bytes());
+        }
+        out.push(u8::from(self.disassemble));
+        Ok(out)
+    }
+
+    pub fn decode(bytes: &[u8]) -> Result<Self, String> {
+        if bytes.len() != 29 {
+            return Err("invalid helm frame length".into());
+        }
+        let subworld_id =
+            u64::from_be_bytes(bytes[..8].try_into().map_err(|_| "truncated helm id")?);
+        let mut values = [0.0f32; 5];
+        for (i, value) in values.iter_mut().enumerate() {
+            let start = 8 + i * 4;
+            *value = f32::from_be_bytes(
+                bytes[start..start + 4]
+                    .try_into()
+                    .map_err(|_| "truncated helm value")?,
+            );
+        }
+        if bytes[28] > 1 {
+            return Err("invalid helm disassemble flag".into());
+        }
+        let frame = Self {
+            subworld_id,
+            throttle: values[0],
+            pitch: values[1],
+            yaw: values[2],
+            roll: values[3],
+            buoyancy_delta: values[4],
+            disassemble: bytes[28] != 0,
+        };
+        frame.encode()?;
+        Ok(frame)
+    }
+}
 
 /// Per-dimension environment physics for [`RigidBodySubWorld::step_with_atmosphere`].
 ///
@@ -208,6 +492,8 @@ pub struct RigidBodySubWorld {
     pub buoyancy_blocks: u32,
     pub propellers: Vec<PropellerMount>,
     pub rudders: Vec<RudderMount>,
+    /// Player helm input `[throttle, pitch, yaw, roll, buoyancy_delta]`.
+    helm: [f64; 5],
 }
 
 impl RigidBodySubWorld {
@@ -262,6 +548,7 @@ impl RigidBodySubWorld {
             buoyancy_blocks: 0,
             propellers: Vec::new(),
             rudders: Vec::new(),
+            helm: [0.0; 5],
         };
         sub.rebuild_factory();
         sub.recompute_physics();
@@ -398,24 +685,47 @@ impl RigidBodySubWorld {
         for (local, canonical) in &self.blocks {
             let block_id = canonical_block_id(canonical);
             let path = id_path(block_id);
-            if prop_set.contains(block_id) || path.contains("propeller") {
+            if is_propulsion_block(block_id) || prop_set.contains(block_id) {
                 self.propellers.push(PropellerMount {
                     local: *local,
                     axis: axis_from_canonical(canonical),
                     min_rpm: self.min_rpms.get(block_id).copied().unwrap_or(0.0),
                     thrust_per_rpm: self.propulsion.thrust_per_rpm,
                 });
-            } else if rud_set.contains(block_id) || path.contains("rudder") {
+            } else if is_control_block(block_id)
+                || rud_set.contains(block_id)
+                || path.contains("rudder")
+            {
                 self.rudders.push(RudderMount {
                     local: *local,
                     torque_axis: Axis::Y,
                     sense_axis: Axis::X,
                     gain: self.propulsion.rudder_torque,
                 });
-            } else if buoy_set.contains(block_id) || is_buoyant_path(path) {
+            } else if is_lift_block(block_id)
+                || buoy_set.contains(block_id)
+                || is_buoyant_path(path)
+            {
                 self.buoyancy_blocks = self.buoyancy_blocks.saturating_add(1);
             }
         }
+    }
+
+    /// Apply validated pilot controls to this sub-world.
+    pub fn apply_helm_input(&mut self, input: &SubWorldHelmInput) -> Result<(), String> {
+        input.encode()?;
+        if input.subworld_id != self.id {
+            return Err("helm input targets a different subworld".into());
+        }
+        self.helm = [
+            input.throttle,
+            input.pitch,
+            input.yaw,
+            input.roll,
+            input.buoyancy_delta,
+        ]
+        .map(f64::from);
+        Ok(())
     }
 
     /// Live solved RPM of the propeller mount's kinetic node (0 when
@@ -470,11 +780,7 @@ impl RigidBodySubWorld {
             dt,
             gravity,
             atmosphere.air_density,
-            if atmosphere.enable_buoyancy {
-                1.0
-            } else {
-                0.0
-            },
+            if atmosphere.enable_buoyancy { 1.0 } else { 0.0 },
             atmosphere.vacuum_damping,
         );
     }
@@ -512,7 +818,9 @@ impl RigidBodySubWorld {
             0.0
         };
         self.tick = self.tick.saturating_add(1);
-        let _ = self.factory.step_tick(self.tick, INTERNAL_REGION_STEPS, None);
+        let _ = self
+            .factory
+            .step_tick(self.tick, INTERNAL_REGION_STEPS, None);
 
         let conj = quat_conjugate(self.quat);
         // Ship-relative airflow and spin in the local (body) frame.
@@ -527,6 +835,12 @@ impl RigidBodySubWorld {
                 thrust_local[mount.axis.index()] += rpm * mount.thrust_per_rpm;
             }
         }
+        // Helm throttle is a direct bounded actuator. It remains usable for
+        // blocks whose upstream kinetic node is absent from the local registry.
+        let direct_thrust = self.helm[0] * self.propulsion.thrust_per_rpm * 64.0;
+        if !self.propellers.is_empty() {
+            thrust_local[0] += direct_thrust;
+        }
         let thrust_world = quat_rotate(self.quat, thrust_local);
 
         // Rudder weathercock torque + angular damping (local frame). Control
@@ -536,6 +850,9 @@ impl RigidBodySubWorld {
             torque_local[rudder.torque_axis.index()] -=
                 rudder.gain * air_density * v_local[rudder.sense_axis.index()];
         }
+        torque_local[0] += self.helm[1] * self.mass * 9.81;
+        torque_local[1] += self.helm[2] * self.mass * 9.81;
+        torque_local[2] += self.helm[3] * self.mass * 9.81;
         for i in 0..3 {
             torque_local[i] -= self.propulsion.angular_drag_coeff * air_density * omega_local_in[i];
         }
@@ -548,7 +865,10 @@ impl RigidBodySubWorld {
             let mut force = sanitize(
                 thrust_world[i] - drag * self.vel[i]
                     + if i == 1 {
-                        buoyancy_scale * self.buoyancy_force(air_density) - self.mass * gravity
+                        buoyancy_scale
+                            * self.buoyancy_force(air_density)
+                            * (1.0 + self.helm[4]).max(0.0)
+                            - self.mass * gravity
                     } else {
                         0.0
                     },
@@ -578,9 +898,7 @@ impl RigidBodySubWorld {
         ];
         let gyro = cross3(omega_local, iw);
         for i in 0..3 {
-            let alpha = sanitize(
-                (torque_local[i] - gyro[i]) / self.inertia_diag[i].max(1e-9),
-            );
+            let alpha = sanitize((torque_local[i] - gyro[i]) / self.inertia_diag[i].max(1e-9));
             omega_local[i] = sanitize(omega_local[i] + alpha * dt);
         }
         self.omega = quat_rotate(self.quat, omega_local);
@@ -624,11 +942,7 @@ impl RigidBodySubWorld {
 
     /// Exact inverse of [`Self::local_to_world`] via the quaternion conjugate.
     pub fn world_to_local(&self, w: [f64; 3]) -> [f64; 3] {
-        let rel = [
-            w[0] - self.pos[0],
-            w[1] - self.pos[1],
-            w[2] - self.pos[2],
-        ];
+        let rel = [w[0] - self.pos[0], w[1] - self.pos[1], w[2] - self.pos[2]];
         let l = quat_rotate(quat_conjugate(self.quat), rel);
         [
             l[0] + self.center_of_mass[0],
@@ -732,7 +1046,9 @@ pub fn decode_aeronautics_snapshot(
     registry: &CreateBlockRegistry,
 ) -> Result<RigidBodySubWorld, AeronauticsError> {
     if bytes.len() < 5 || bytes[..4] != AERO_MAGIC || bytes[4] != AERO_VERSION {
-        return Err(AeronauticsError::CorruptSnapshot("bad magic/version".into()));
+        return Err(AeronauticsError::CorruptSnapshot(
+            "bad magic/version".into(),
+        ));
     }
     let mut c = 5usize;
     let corrupt = |what: &str| AeronauticsError::CorruptSnapshot(what.to_string());
@@ -851,6 +1167,7 @@ pub fn decode_aeronautics_snapshot(
         buoyancy_blocks,
         propellers,
         rudders,
+        helm: [0.0; 5],
     };
     sub.rebuild_factory();
     Ok(sub)
@@ -936,8 +1253,6 @@ pub fn decode_snapshot_with_data_version(
 fn crc32_ieee(data: &[u8]) -> u32 {
     megu_core::hash::crc32_ieee(data)
 }
-
-
 
 // ---------------------------------------------------------------------------
 // Quaternion / vector math (deterministic f64, NaN-sanitized)
@@ -1055,11 +1370,7 @@ fn r_f64(bytes: &[u8], c: &mut usize) -> Option<f64> {
 }
 
 fn r_f64s(bytes: &[u8], c: &mut usize) -> Option<[f64; 3]> {
-    Some([
-        r_f64(bytes, c)?,
-        r_f64(bytes, c)?,
-        r_f64(bytes, c)?,
-    ])
+    Some([r_f64(bytes, c)?, r_f64(bytes, c)?, r_f64(bytes, c)?])
 }
 
 fn r_quat(bytes: &[u8], c: &mut usize) -> Option<[f64; 4]> {
@@ -1123,6 +1434,36 @@ fn is_buoyant_path(path: &str) -> bool {
         || path.contains("float")
 }
 
+fn is_propulsion_block(id: &str) -> bool {
+    let path = id_path(id);
+    id == "aeronautics:andesite_propeller"
+        || id == "aeronautics:gyroscopic_propeller_bearing"
+        || (id.starts_with("simulated:") && path.contains("portable_engine"))
+        || (id.starts_with("simulated:") && path.contains("propeller"))
+        || path.contains("thruster")
+}
+
+fn is_lift_block(id: &str) -> bool {
+    let path = id_path(id);
+    id == "aeronautics:adjustable_burner"
+        || (id.starts_with("aeronautics:") && (path.contains("envelope") || path.contains("sail")))
+        || (id.starts_with("simulated:") && path.contains("sail"))
+        || path.contains("balloon")
+}
+
+fn is_control_block(id: &str) -> bool {
+    let path = id_path(id);
+    (id.starts_with("simulated:") && (path.contains("handle") || path.contains("helm")))
+        || path.contains("rudder")
+        || path == "helm"
+        || path == "cockpit"
+        || id == "simulated:altitude_sensor"
+        || id == "simulated:analog_transmission"
+        || id == "offroad:wheel_mount"
+        || id == "offroad:rockcutting_wheel"
+        || id == "offroad:borehead_bearing"
+}
+
 /// Rotation axis declared by a canonical blockstate string's `axis=` or
 /// `facing=` property (default `Y` when absent — Create's fallback).
 fn axis_from_canonical(canonical: &str) -> Axis {
@@ -1167,10 +1508,93 @@ mod tests {
 
     fn aero_registry() -> (CreateAddonProfile, CreateBlockRegistry) {
         let addon = createaeronautics_profile();
-        let reg =
-            create_registry_with_addons(DEFAULT_BASE_STATE_ID, std::slice::from_ref(&addon))
-                .unwrap();
+        let reg = create_registry_with_addons(DEFAULT_BASE_STATE_ID, std::slice::from_ref(&addon))
+            .unwrap();
         (addon, reg)
+    }
+
+    #[test]
+    fn real_aeronautics_133_ids_classify_as_physics_and_controls() {
+        let (addon, reg) = aero_registry();
+        let ids = [
+            "aeronautics:andesite_propeller",
+            "aeronautics:adjustable_burner",
+            "aeronautics:red_envelope",
+            "aeronautics:blue_envelope_encased_shaft",
+            "simulated:black_portable_engine",
+            "simulated:small_propeller",
+            "simulated:symmetric_sail",
+            "simulated:altitude_sensor",
+            "simulated:analog_transmission",
+            "simulated:steering_handle",
+            "offroad:wheel_mount",
+        ];
+        let cells = ids
+            .iter()
+            .enumerate()
+            .map(|(i, id)| ([i as i32, 0, 0], (*id).to_owned()))
+            .collect();
+        let sub = RigidBodySubWorld::assemble(1, 0, cells, &reg, Some(&addon), 100.0).unwrap();
+        assert!(sub.propellers.len() >= 3);
+        assert!(sub.buoyancy_blocks >= 4);
+        assert!(sub.rudders.len() >= 4);
+    }
+
+    #[test]
+    fn subworld_sync_frame_roundtrip_and_bounds_fail_closed() {
+        let frame = SubWorldSyncFrame {
+            kind: SubWorldSyncKind::FullSpawn,
+            subworld_id: 17,
+            dim_id: "minecraft:overworld".into(),
+            pos: [1.25, 64.0, -2.5],
+            quat: [0.0, 0.0, 0.0, 1.0],
+            vel: [0.5, 0.0, -0.25],
+            ang_vel: [0.0, 0.1, 0.0],
+            revision: 3,
+            voxels: vec![([0, 0, 0], 1), ([2, -1, 3], 42)],
+        };
+        let bytes = frame.encode().unwrap();
+        assert_eq!(SubWorldSyncFrame::decode(&bytes).unwrap(), frame);
+        assert!(SubWorldSyncFrame::decode(&bytes[..bytes.len() - 1]).is_err());
+        let mut oversized = bytes.clone();
+        let count_at = 84 + frame.dim_id.len();
+        oversized[count_at..count_at + 4]
+            .copy_from_slice(&((MAX_SUBWORLD_VOXELS as u32) + 1).to_be_bytes());
+        assert!(SubWorldSyncFrame::decode(&oversized).is_err());
+        let mut invalid_quat = frame.clone();
+        invalid_quat.quat = [0.0, 0.0, 0.0, 0.0];
+        assert!(invalid_quat.encode().is_err());
+        let mut pose = SubWorldSyncFrame {
+            kind: SubWorldSyncKind::PoseDelta,
+            voxels: Vec::new(),
+            ..frame
+        };
+        pose.pos[0] = f64::NAN;
+        assert!(pose.encode().is_err());
+    }
+
+    #[test]
+    fn subworld_helm_frame_roundtrip_and_non_finite_rejection() {
+        let input = SubWorldHelmInput {
+            subworld_id: 99,
+            throttle: 0.5,
+            pitch: -0.2,
+            yaw: 1.0,
+            roll: 0.0,
+            buoyancy_delta: -0.4,
+            disassemble: false,
+        };
+        let bytes = input.encode().unwrap();
+        assert_eq!(SubWorldHelmInput::decode(&bytes).unwrap(), input);
+        assert!(SubWorldHelmInput::decode(&bytes[..28]).is_err());
+        let mut nan = bytes;
+        nan[8..12].copy_from_slice(&f32::NAN.to_be_bytes());
+        assert!(SubWorldHelmInput::decode(&nan).is_err());
+        let invalid = SubWorldHelmInput {
+            throttle: f32::INFINITY,
+            ..input
+        };
+        assert!(invalid.encode().is_err());
     }
 
     fn canonical(reg: &CreateBlockRegistry, id: &str) -> String {
@@ -1187,7 +1611,13 @@ mod tests {
     }
 
     fn assert_finite(sub: &RigidBodySubWorld) {
-        for v in sub.pos.iter().chain(&sub.vel).chain(&sub.omega).chain(&sub.quat) {
+        for v in sub
+            .pos
+            .iter()
+            .chain(&sub.vel)
+            .chain(&sub.omega)
+            .chain(&sub.quat)
+        {
             assert!(
                 v.is_finite(),
                 "non-finite state: pos={:?} vel={:?} omega={:?} quat={:?}",
@@ -1265,7 +1695,10 @@ mod tests {
         sub.remove_block([0, 1, 0]);
         assert_eq!(sub.mass, 600.0);
         assert_eq!(sub.buoyancy_blocks, 0);
-        sub.set_block([0, 1, 0], canonical(&reg, "createaeronautics:levitation_core"));
+        sub.set_block(
+            [0, 1, 0],
+            canonical(&reg, "createaeronautics:levitation_core"),
+        );
         assert_eq!(sub.buoyancy_blocks, 1);
     }
 
@@ -1282,12 +1715,19 @@ mod tests {
         cells.insert([1, 0, 0], canonical_with(&reg, "create:shaft", "axis", "x"));
         cells.insert(
             [2, 0, 0],
-            canonical_with(&reg, "createaeronautics:propeller_bearing", "facing", "east"),
+            canonical_with(
+                &reg,
+                "createaeronautics:propeller_bearing",
+                "facing",
+                "east",
+            ),
         );
-        cells.insert([0, 1, 0], canonical(&reg, "createaeronautics:balloon_envelope"));
+        cells.insert(
+            [0, 1, 0],
+            canonical(&reg, "createaeronautics:balloon_envelope"),
+        );
 
-        let mut sub =
-            RigidBodySubWorld::assemble(1, 0, cells, &reg, Some(&addon), 100.0).unwrap();
+        let mut sub = RigidBodySubWorld::assemble(1, 0, cells, &reg, Some(&addon), 100.0).unwrap();
         assert_eq!(sub.propellers.len(), 2); // engine + bearing both thrust
         let rpm = sub
             .factory()
@@ -1351,10 +1791,12 @@ mod tests {
     fn rotation_transforms_roundtrip_and_passenger_delta_matches_finite_difference() {
         let (addon, reg) = aero_registry();
         let mut cells = BTreeMap::new();
-        cells.insert([0, 0, 0], canonical(&reg, "createaeronautics:airship_assembler"));
+        cells.insert(
+            [0, 0, 0],
+            canonical(&reg, "createaeronautics:airship_assembler"),
+        );
         cells.insert([2, 0, 0], canonical(&reg, "createaeronautics:rudder"));
-        let mut sub =
-            RigidBodySubWorld::assemble(1, 3, cells, &reg, Some(&addon), 100.0).unwrap();
+        let mut sub = RigidBodySubWorld::assemble(1, 3, cells, &reg, Some(&addon), 100.0).unwrap();
         // Non-trivial orientation and motion.
         sub.quat = quat_normalize([0.1, 0.3, -0.2, 0.9]);
         sub.pos = [10.0, 80.0, -4.0];
@@ -1414,13 +1856,20 @@ mod tests {
         );
         cells.insert(
             [1, 0, 0],
-            canonical_with(&reg, "createaeronautics:propeller_bearing", "facing", "east"),
+            canonical_with(
+                &reg,
+                "createaeronautics:propeller_bearing",
+                "facing",
+                "east",
+            ),
         );
-        cells.insert([0, 1, 0], canonical(&reg, "createaeronautics:balloon_envelope"));
+        cells.insert(
+            [0, 1, 0],
+            canonical(&reg, "createaeronautics:balloon_envelope"),
+        );
         cells.insert([0, 0, 1], canonical(&reg, "createaeronautics:rudder"));
 
-        let mut sub =
-            RigidBodySubWorld::assemble(42, 3, cells, &reg, Some(&addon), 100.0).unwrap();
+        let mut sub = RigidBodySubWorld::assemble(42, 3, cells, &reg, Some(&addon), 100.0).unwrap();
         sub.pos = [5.0, 90.0, -7.5];
         for _ in 0..10 {
             sub.step(0.05, 9.81, SEA_LEVEL_AIR_DENSITY);
@@ -1485,12 +1934,19 @@ mod tests {
         );
         cells.insert(
             [1, 0, 0],
-            canonical_with(&reg, "createaeronautics:propeller_bearing", "facing", "east"),
+            canonical_with(
+                &reg,
+                "createaeronautics:propeller_bearing",
+                "facing",
+                "east",
+            ),
         );
-        cells.insert([0, 1, 0], canonical(&reg, "createaeronautics:balloon_envelope"));
+        cells.insert(
+            [0, 1, 0],
+            canonical(&reg, "createaeronautics:balloon_envelope"),
+        );
 
-        let mut sub =
-            RigidBodySubWorld::assemble(7, 3, cells, &reg, Some(&addon), 100.0).unwrap();
+        let mut sub = RigidBodySubWorld::assemble(7, 3, cells, &reg, Some(&addon), 100.0).unwrap();
         sub.pos = [2.0, 64.0, -1.0];
         for _ in 0..10 {
             sub.step(0.05, 9.81, SEA_LEVEL_AIR_DENSITY);
@@ -1519,8 +1975,14 @@ mod tests {
     fn aero2_envelope_fails_closed_on_corruption() {
         let (addon, reg) = aero_registry();
         let mut cells = BTreeMap::new();
-        cells.insert([0, 0, 0], canonical(&reg, "createaeronautics:airship_assembler"));
-        cells.insert([0, 1, 0], canonical(&reg, "createaeronautics:balloon_envelope"));
+        cells.insert(
+            [0, 0, 0],
+            canonical(&reg, "createaeronautics:airship_assembler"),
+        );
+        cells.insert(
+            [0, 1, 0],
+            canonical(&reg, "createaeronautics:balloon_envelope"),
+        );
         let sub = RigidBodySubWorld::assemble(1, 0, cells, &reg, Some(&addon), 100.0).unwrap();
         let env = sub.encode_snapshot_for_data_version(AERO_DATA_VERSION_26_3);
 

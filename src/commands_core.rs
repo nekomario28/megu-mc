@@ -5678,6 +5678,7 @@ fn command_usage(name: &str) -> String {
     // reports it as unknown rather than pretending a usage line exists.
     let usage = match name.trim_start_matches('/') {
         "advancement" => "/advancement grant|revoke|query <target> everything|from|through|until|only <id> [<criterion>]",
+        "aero" => "/aero list | assemble <x> <y> <z> <radius> | throttle <id> <val> | steer <id> <pitch> <yaw> <roll> | disassemble <id> | schematic <path> <x> <y> <z>",
         "attribute" => "/attribute <target> <attribute> get|base get|base set|modifier add|modifier remove|modifier value get ...",
         "ban" => "/ban <player> [<reason>]",
         "ban-ip" => "/ban-ip <target> [<reason>]",
@@ -6427,6 +6428,7 @@ fn native_command_dispatcher(
         )
         .then(args("arguments")),
     );
+    register_at_level("aero", literal("aero").then(args("arguments")));
     register(
         literal("datapack")
             .then(choices(done("list"), &["enabled", "available"]))
@@ -8024,6 +8026,247 @@ fn broadcast_world_time() {
     });
 }
 
+#[cfg(feature = "create-offload")]
+fn run_aero_command(ctx: &CmdCtx, args: &[&str]) -> String {
+    use create_adapter::aeronautics::SubWorldHelmInput;
+
+    let eid = ctx.me.as_ref().map_or(0, |client| client.eid as u32);
+    match args {
+        ["schematic", path, x, y, z] => {
+            let (Ok(x), Ok(y), Ok(z)) = (x.parse::<i32>(), y.parse::<i32>(), z.parse::<i32>()) else {
+                return "usage: /aero schematic <path> <x> <y> <z>".into();
+            };
+            #[cfg(feature = "mod-suite")]
+            {
+                let metadata = match std::fs::metadata(path) {
+                    Ok(metadata) => metadata,
+                    Err(error) => return format!("Could not read schematic metadata: {error}"),
+                };
+                if metadata.len() > create_adapter::schematic::SCHEMATIC_MAX_DECOMPRESSED_BYTES as u64 {
+                    return "schematic file exceeds the 16 MiB input bound".into();
+                }
+                let bytes = match std::fs::read(path) {
+                    Ok(bytes) => bytes,
+                    Err(error) => return format!("Could not read schematic: {error}"),
+                };
+                let dim = ctx
+                    .me
+                    .as_ref()
+                    .map(|client| *client.dim.lock().unwrap_or_else(|e| e.into_inner()))
+                    .unwrap_or(DimId::Overworld);
+                match live_place_nbt_schematic_in_dim(dim, (x, y, z), &bytes) {
+                    Ok(report) => format!(
+                        "Placed {} schematic blocks; {} kinetic nodes armed, {} skipped, {} palette entries unresolved",
+                        report.placed_blocks,
+                        report.kinetic_nodes_armed,
+                        report.skipped_blocks,
+                        report.unresolved_palette_entries,
+                    ),
+                    Err(error) => format!("Could not place schematic: {error}"),
+                }
+            }
+            #[cfg(not(feature = "mod-suite"))]
+            {
+                let _ = (path, x, y, z);
+                "NBT schematic placement requires the mod-suite feature".into()
+            }
+        }
+        ["list"] => {
+            let ships = aeronautics_bridge_ship_summaries();
+            if ships.is_empty() {
+                return "No active airships".into();
+            }
+            ships
+                .into_iter()
+                .map(|(id, dim, pos, vel)| {
+                    format!(
+                        "#{id} {} pos=({:.1},{:.1},{:.1}) vel=({:.2},{:.2},{:.2})",
+                        dim.dimension_id(), pos[0], pos[1], pos[2], vel[0], vel[1], vel[2]
+                    )
+                })
+                .collect::<Vec<_>>()
+                .join("; ")
+        }
+        ["tick", dt] => {
+            let Ok(dt) = dt.parse::<f32>() else {
+                return "usage: /aero tick <dt-seconds>".into();
+            };
+            if !dt.is_finite() || !(0.001..=0.1).contains(&dt) {
+                return "aero tick duration must be finite and within 0.001..=0.1 seconds".into();
+            }
+            let frames = aeronautics_bridge_step_and_drain_sync_frames(dt);
+            let frame_count = frames.len();
+            let byte_count = frames.iter().map(|(_, bytes)| bytes.len()).sum::<usize>();
+            format!(
+                "Advanced airships by {dt:.3}s; drained {frame_count} subworld sync frames ({byte_count} bytes). Network broadcast requires server tick integration."
+            )
+        }
+        ["duct-insert", x, y, z, item] => {
+            let (Ok(x), Ok(y), Ok(z), Ok(item)) = (
+                x.parse::<i32>(),
+                y.parse::<i32>(),
+                z.parse::<i32>(),
+                item.parse::<i64>(),
+            ) else {
+                return "usage: /aero duct-insert <x> <y> <z> <item-id>".into();
+            };
+            let dim = ctx
+                .me
+                .as_ref()
+                .map(|client| *client.dim.lock().unwrap_or_else(|e| e.into_inner()))
+                .unwrap_or(DimId::Overworld);
+            #[cfg(feature = "mod-suite")]
+            {
+                if live_create_duct_insert(dim, x, y, z, item) {
+                    format!("Inserted item {item} into the Create duct at {x} {y} {z}")
+                } else {
+                    "Create duct rejected the item or the target is not an insertable duct".into()
+                }
+            }
+            #[cfg(not(feature = "mod-suite"))]
+            {
+                let _ = (dim, x, y, z, item);
+                "Create duct insertion requires the mod-suite feature".into()
+            }
+        }
+        ["assemble", x, y, z, radius] => {
+            let (Ok(x), Ok(y), Ok(z), Ok(radius)) = (
+                x.parse::<i32>(),
+                y.parse::<i32>(),
+                z.parse::<i32>(),
+                radius.parse::<i32>(),
+            ) else {
+                return "usage: /aero assemble <x> <y> <z> <radius>".into();
+            };
+            if !(1..=32).contains(&radius)
+                || [x, y, z].iter().any(|coord| coord.abs() > 30_000_000)
+            {
+                return "aero coordinates must be within world bounds and radius 1..=32".into();
+            }
+            let dim = ctx
+                .me
+                .as_ref()
+                .map(|client| *client.dim.lock().unwrap_or_else(|e| e.into_inner()))
+                .unwrap_or(DimId::Overworld);
+            let mut blocks = Vec::new();
+            for bx in (x - radius)..=(x + radius) {
+                for by in (y - radius)..=(y + radius) {
+                    for bz in (z - radius)..=(z + radius) {
+                        let (dx, dy, dz) = (bx - x, by - y, bz - z);
+                        if dx * dx + dy * dy + dz * dz > radius * radius {
+                            continue;
+                        }
+                        let state = block_at_dim(dim, bx, by, bz);
+                        #[cfg(feature = "mod-suite")]
+                        let name = live_mod_state_canonical(state);
+                        #[cfg(not(feature = "mod-suite"))]
+                        let name = None;
+                        let name = name.or_else(|| {
+                            breg().map(|registry| registry.name_of(state).to_owned())
+                        });
+                        let Some(name) = name else { continue };
+                        if name == "minecraft:air" {
+                            continue;
+                        }
+                        blocks.push(([bx, by, bz], state, name));
+                    }
+                }
+            }
+            let refs = blocks
+                .iter()
+                .map(|(pos, state, name)| (*pos, *state, name.as_str()))
+                .collect::<Vec<_>>();
+            match aeronautics_bridge_assemble_ship(dim, [x, y, z], &refs) {
+                Ok(id) => format!("Assembled airship #{id} from {} blocks", refs.len()),
+                Err(error) => format!("Could not assemble airship: {error}"),
+            }
+        }
+        ["throttle", id, value] => {
+            let (Ok(id), Ok(throttle)) = (id.parse::<u64>(), value.parse::<f32>()) else {
+                return "usage: /aero throttle <id> <-1..=1>".into();
+            };
+            let input = SubWorldHelmInput {
+                subworld_id: id,
+                throttle,
+                pitch: 0.0,
+                yaw: 0.0,
+                roll: 0.0,
+                buoyancy_delta: 0.0,
+                disassemble: false,
+            };
+            match aeronautics_bridge_apply_helm_input(eid, &input) {
+                Ok(()) => format!("Airship #{id} throttle set to {throttle}"),
+                Err(error) => error,
+            }
+        }
+        ["steer", id, pitch, yaw, roll] => {
+            let (Ok(id), Ok(pitch), Ok(yaw), Ok(roll)) = (
+                id.parse::<u64>(),
+                pitch.parse::<f32>(),
+                yaw.parse::<f32>(),
+                roll.parse::<f32>(),
+            ) else {
+                return "usage: /aero steer <id> <pitch> <yaw> <roll>".into();
+            };
+            let input = SubWorldHelmInput {
+                subworld_id: id,
+                throttle: 0.0,
+                pitch,
+                yaw,
+                roll,
+                buoyancy_delta: 0.0,
+                disassemble: false,
+            };
+            match aeronautics_bridge_apply_helm_input(eid, &input) {
+                Ok(()) => format!("Airship #{id} helm updated"),
+                Err(error) => error,
+            }
+        }
+        ["disassemble", id] => {
+            let Ok(id) = id.parse::<u64>() else {
+                return "usage: /aero disassemble <id>".into();
+            };
+            let input = SubWorldHelmInput {
+                subworld_id: id,
+                throttle: 0.0,
+                pitch: 0.0,
+                yaw: 0.0,
+                roll: 0.0,
+                buoyancy_delta: 0.0,
+                disassemble: true,
+            };
+            match aeronautics_bridge_apply_helm_input(eid, &input) {
+                Ok(()) => format!("Airship #{id} disassembled"),
+                Err(error) => error,
+            }
+        }
+        _ => "usage: /aero list | tick <dt-seconds> | assemble <x> <y> <z> <radius> | throttle <id> <val> | steer <id> <pitch> <yaw> <roll> | disassemble <id> | duct-insert <x> <y> <z> <item-id>".into(),
+    }
+}
+
+#[cfg(all(test, feature = "create-offload"))]
+mod aero_command_tests {
+    use super::*;
+
+    fn context() -> CmdCtx {
+        CmdCtx {
+            me: None,
+            x: 0.0,
+            y: 0.0,
+            z: 0.0,
+        }
+    }
+
+    #[test]
+    fn aero_tick_and_duct_commands_reject_invalid_arguments() {
+        let ctx = context();
+        assert!(run_aero_command(&ctx, &["tick", "NaN"]).contains("must be finite"));
+        assert!(run_aero_command(&ctx, &["tick", "0.5"]).contains("within 0.001..=0.1"));
+        assert!(run_aero_command(&ctx, &["duct-insert", "1", "2", "3", "bad"])
+            .contains("usage:"));
+    }
+}
+
 fn run_command_ctx(ctx: &CmdCtx, msg: &str, s: &mut Option<&Client>) -> String {
     let me = ctx.me.as_ref();
     let Some(input) = msg.strip_prefix('/') else { return "Expected a command starting with /".into() };
@@ -9178,6 +9421,12 @@ fn run_command_ctx(ctx: &CmdCtx, msg: &str, s: &mut Option<&Client>) -> String {
         // OPS-ADMIN-BUILTIN: `/megu` fans out to policy/audit/rollback/claim/
         // backup/metrics; the handler re-checks `level` per subcommand.
         "megu" => run_megu_command(ctx, level, &args),
+        "aero" => {
+            #[cfg(feature = "create-offload")]
+            { run_aero_command(ctx, &args) }
+            #[cfg(not(feature = "create-offload"))]
+            { "Create Aeronautics requires the create-offload feature".into() }
+        }
         "transfer" => run_transfer_command(ctx, level, &args),
         // P8c cluster-C diagnostics are owner-level (4) too; each handler
         // re-checks `level` like `run_profile_command` does.

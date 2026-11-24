@@ -1095,6 +1095,26 @@
       "reason": "Zsh-style command bar toggle: .zsh_command_bar is never read outside state.rs \u2014 the command bar feature is not implemented.",
       "lane": "CLIENT-SETTINGS",
       "date": "2026-11-24"
+    },
+    {
+      "check": "one_sided_channel",
+      "symbol": "megu:subworld_sync_v1",
+      "sites": [
+        "create-adapter/src/aeronautics.rs:46"
+      ],
+      "reason": "Awaiting A1-CLIENT subworld sync receiver lane",
+      "lane": "A1-SERVER",
+      "date": "2026-11-24"
+    },
+    {
+      "check": "one_sided_channel",
+      "symbol": "megu:subworld_helm_v1",
+      "sites": [
+        "create-adapter/src/aeronautics.rs:48"
+      ],
+      "reason": "Awaiting A1-CLIENT subworld sync receiver lane",
+      "lane": "A1-SERVER",
+      "date": "2026-11-24"
     }
   ]
 }
