@@ -62,6 +62,7 @@ use megu_ui::recipe_browser::{
     BrowserTab, DetailMode, ItemEntry, RecipeBrowserAction, RecipeBrowserState,
 };
 use megu_proto::frl_e2ee::{FriendAllowlist, Frl3GuestToken, Frl3Identity, parse_friend_id};
+use megu_ui::sign_and_chat::SignEditorState;
 use megu_ui::state::{
     CrashReportMode as UiCrashReportMode, DisconnectedScreenState, FriendListEntry,
     FriendShareMode as UiShareMode, FriendsScreenState, GpuBackend, LodMode, MinimapMode,
@@ -1661,9 +1662,11 @@ impl GpuApp {
         self.singleplayer_server = None;
         self.container_screen = None;
         self.chat_bar = None;
+        self.ui.sign_editor = None;
         self.advancements_open = false;
         self.paused = false;
         self.keys = Keys::default();
+        self.update_ime();
         self.maybe_regrab();
     }
 
@@ -1945,13 +1948,14 @@ impl GpuApp {
     }
 
     /// True when the pointer should be captured for mouselook: in-game,
-    /// unpaused, no chat bar, no container/inventory screen, no
-    /// advancements overlay.
+    /// unpaused, no chat bar, no sign editor, no container/inventory
+    /// screen, no advancements overlay.
     fn wants_cursor_grab(&self) -> bool {
         self.ui.screen == Screen::InGameHud
             && !self.paused
             && self.focused
             && self.chat_bar.is_none()
+            && self.ui.sign_editor.is_none()
             && self.container_screen.is_none()
             && !self.advancements_open
     }
@@ -1969,11 +1973,13 @@ impl GpuApp {
     }
 
     /// `true` while an editable text surface owns typing: the in-game
-    /// chat bar, any focused UI text field, or a delegated sub-screen's
-    /// search field. IME enablement and the clipboard chords key off
-    /// this — during raw WASD gameplay it is `false`.
+    /// chat bar, the server-driven sign editor, any focused UI text
+    /// field, or a delegated sub-screen's search field. IME enablement
+    /// and the clipboard chords key off this — during raw WASD gameplay
+    /// it is `false`.
     fn text_input_active(&self) -> bool {
         self.chat_bar.is_some()
+            || self.ui.sign_editor.is_some()
             || self.ui.fps_field_active()
             || self.ui.join_field_active()
             || self.ui.world_name_field_active()
@@ -2022,6 +2028,13 @@ impl GpuApp {
     /// `UiInputEvent::CharTyped` so each field's own filter and cap
     /// applies.
     fn committed_text_actions(&mut self, text: &str) -> Vec<UiAction> {
+        // The sign-edit overlay outranks every other surface while open:
+        // committed strings land on the active line verbatim (the model
+        // strips control chars and caps the vanilla line length).
+        if let Some(editor) = &mut self.ui.sign_editor {
+            editor.insert_str(text);
+            return Vec::new();
+        }
         if let Some(bar) = &mut self.chat_bar {
             let room = CHAT_FIELD_MAX_CHARS.saturating_sub(bar.text().chars().count());
             let mut fed = false;
@@ -2071,7 +2084,9 @@ impl GpuApp {
     /// OS clipboard (or the in-app fallback) and report which store
     /// took them.
     fn clipboard_copy(&mut self) {
-        let text = if let Some(bar) = &self.chat_bar {
+        let text = if let Some(editor) = &self.ui.sign_editor {
+            editor.lines()[editor.active_line()].clone()
+        } else if let Some(bar) = &self.chat_bar {
             bar.text().to_owned()
         } else {
             match self.active_field_text() {
@@ -3878,6 +3893,120 @@ impl GpuApp {
         }
     }
 
+    /// Lift the server's pending `open_sign_editor` instruction into
+    /// `ui.sign_editor`: the overlay takes over keyboard + IME input like
+    /// the chat bar does. Called after `live.poll` each frame.
+    fn sync_sign_editor(&mut self) {
+        let pending = self
+            .live
+            .as_mut()
+            .and_then(|live| live.take_pending_sign_editor());
+        let Some((pos, is_front)) = pending else {
+            return;
+        };
+        // A fresh editor replaces the chat bar and drops every held
+        // movement key so WASD can't leak into the session while typing.
+        self.chat_bar = None;
+        self.chat_suggestions.clear();
+        self.keys = Keys::default();
+        if let Some(event) = self.input_router.release_held_keys() {
+            self.apply_window_input(event);
+        }
+        self.ui.sign_editor = Some(SignEditorState::new(pos, is_front, Default::default()));
+        self.set_cursor_grab(false);
+        self.update_ime();
+    }
+
+    /// Route a key event into the open sign editor: arrows/editing keys
+    /// drive [`SignEditorState`], Enter advances a line (closing on the
+    /// last, like vanilla's sign screen), Escape closes, the
+    /// `Ctrl`/`Cmd` clipboard chords paste/copy, and all other text
+    /// feeds [`Self::committed_text_actions`] (Japanese text also
+    /// arrives via `WindowEvent::Ime::Commit`).
+    fn sign_editor_key(&mut self, event: &winit::event::KeyEvent, event_loop: &ActiveEventLoop) {
+        if event.state != ElementState::Pressed {
+            return;
+        }
+        if self.clipboard_modifier_held() {
+            match event.physical_key {
+                PhysicalKey::Code(KeyCode::KeyV) => {
+                    for action in self.clipboard_paste_actions() {
+                        self.apply_ui_action(&action, event_loop);
+                    }
+                    return;
+                }
+                PhysicalKey::Code(KeyCode::KeyC) => {
+                    self.clipboard_copy();
+                    return;
+                }
+                _ => {}
+            }
+        }
+        let mut close = false;
+        match event.physical_key {
+            PhysicalKey::Code(KeyCode::Escape) => close = true,
+            PhysicalKey::Code(KeyCode::Enter) | PhysicalKey::Code(KeyCode::NumpadEnter) => {
+                if let Some(editor) = &mut self.ui.sign_editor {
+                    close = editor.enter();
+                }
+            }
+            PhysicalKey::Code(KeyCode::Backspace) => {
+                if let Some(editor) = &mut self.ui.sign_editor {
+                    editor.backspace();
+                }
+            }
+            PhysicalKey::Code(KeyCode::ArrowUp) => {
+                if let Some(editor) = &mut self.ui.sign_editor {
+                    editor.move_up();
+                }
+            }
+            PhysicalKey::Code(KeyCode::ArrowDown) => {
+                if let Some(editor) = &mut self.ui.sign_editor {
+                    editor.move_down();
+                }
+            }
+            PhysicalKey::Code(KeyCode::ArrowLeft) => {
+                if let Some(editor) = &mut self.ui.sign_editor {
+                    editor.move_left();
+                }
+            }
+            PhysicalKey::Code(KeyCode::ArrowRight) => {
+                if let Some(editor) = &mut self.ui.sign_editor {
+                    editor.move_right();
+                }
+            }
+            _ => {
+                // Typed text — an `Ime::Commit` echo is swallowed so a
+                // composed string can never insert twice.
+                if let Some(text) = &event.text {
+                    if !self.swallow_ime_echo(text) {
+                        for action in self.committed_text_actions(text) {
+                            self.apply_ui_action(&action, event_loop);
+                        }
+                    }
+                }
+            }
+        }
+        if close {
+            self.finish_sign_editor();
+        }
+    }
+
+    /// Close the sign editor and ship the result: vanilla's sign screen
+    /// sends `sign_update` on every exit path (Done, Enter on the last
+    /// line and Escape alike), then the pointer + IME return to gameplay
+    /// state.
+    fn finish_sign_editor(&mut self) {
+        let Some(editor) = self.ui.sign_editor.take() else {
+            return;
+        };
+        if let Some(live) = &mut self.live {
+            live.send_update_sign(editor.pos, editor.is_front, editor.lines().clone());
+        }
+        self.update_ime();
+        self.maybe_regrab();
+    }
+
     /// Death loop: `player_combat_kill`/`set_health(<=0)` flipped
     /// `live.death` dead -> put the death screen up (refreshing the
     /// cause/score line while it stays up); `respawn`/`set_health(>0)`
@@ -3898,8 +4027,10 @@ impl GpuApp {
                     self.paused = false;
                     self.container_screen = None;
                     self.chat_bar = None;
+                    self.ui.sign_editor = None;
                     self.advancements_open = false;
                     self.keys = Keys::default();
+                    self.update_ime();
                     self.maybe_regrab();
                 }
             }
@@ -3927,9 +4058,11 @@ impl GpuApp {
         self.container_screen = None;
         self.own_inventory_open = false;
         self.chat_bar = None;
+        self.ui.sign_editor = None;
         self.advancements_open = false;
         self.paused = false;
         self.keys = Keys::default();
+        self.update_ime();
         if let Some(requirements) = missing_mods.filter(|items| !items.is_empty()) {
             let address = self.last_server_address.clone().unwrap_or_default();
             self.open_mod_sync_prompt(address, &requirements, &std::collections::BTreeMap::new());
@@ -4059,6 +4192,7 @@ impl GpuApp {
         self.sync_death_screen();
         self.sync_container_screen();
         self.sync_chat_completion_state(dt);
+        self.sync_sign_editor();
 
         let player_dead = self.live.as_ref().is_some_and(|live| live.is_dead());
         // Camera movement only applies while unpaused and alive — a dead
@@ -5435,7 +5569,9 @@ impl ApplicationHandler for GpuApp {
                 }
             }
             WindowEvent::KeyboardInput { event, .. } => {
-                if self.chat_bar.is_some() {
+                if self.ui.sign_editor.is_some() {
+                    self.sign_editor_key(&event, event_loop);
+                } else if self.chat_bar.is_some() {
                     self.chat_bar_key(&event, event_loop);
                 } else if let PhysicalKey::Code(code) = event.physical_key {
                     if !event.repeat {
@@ -7994,5 +8130,156 @@ mod tests {
         assert!(app.swallow_ime_echo("あ"));
         assert!(!app.swallow_ime_echo("あ"));
         assert!(!app.swallow_ime_echo("い"));
+    }
+
+    /// `open_sign_editor` lifts into `ui.sign_editor` via
+    /// `sync_sign_editor`, which also turns `text_input_active` on so
+    /// IME stays enabled and WASD is not routed to `self.keys`.
+    #[test]
+    fn sign_editor_opens_on_server_packet_and_claims_text_input() {
+        use megu_client::protocol::{ClientPlayEvent, PlayEvent};
+        let mut app = GpuApp::new(GpuCliConfig::default());
+        let (_tx, incoming) = std::sync::mpsc::sync_channel(8);
+        let (outgoing, _rx) = std::sync::mpsc::sync_channel(8);
+        let mut live = LiveSession::with_channels(incoming, outgoing);
+        live.status = SessionStatus::Playing;
+        app.attach_live(live);
+        app.ui.screen = Screen::InGameHud;
+        assert!(!app.text_input_active());
+
+        app.live
+            .as_mut()
+            .unwrap()
+            .apply_event(ClientPlayEvent::Play(PlayEvent::OpenSignEditor {
+                pos: [10, 64, -20],
+                front_side: true,
+            }))
+            .unwrap();
+        app.sync_sign_editor();
+
+        let editor = app.ui.sign_editor.as_ref().expect("sign editor open");
+        assert_eq!(editor.pos, (10, 64, -20));
+        assert!(editor.is_front);
+        assert!(app.text_input_active());
+        assert!(
+            !app.keys.forward && !app.keys.sprint,
+            "movement keys must be released while the editor owns input"
+        );
+    }
+
+    /// A second `open_sign_editor` re-arms the pending slot even while a
+    /// first editor is still open (server-side re-open).
+    #[test]
+    fn sign_editor_reopen_replaces_pending() {
+        use megu_client::protocol::{ClientPlayEvent, PlayEvent};
+        let mut app = GpuApp::new(GpuCliConfig::default());
+        let (_tx, incoming) = std::sync::mpsc::sync_channel(8);
+        let (outgoing, _rx) = std::sync::mpsc::sync_channel(8);
+        let mut live = LiveSession::with_channels(incoming, outgoing);
+        live.status = SessionStatus::Playing;
+        app.attach_live(live);
+        for pos in [[1, 2, 3], [4, 5, 6]] {
+            app.live
+                .as_mut()
+                .unwrap()
+                .apply_event(ClientPlayEvent::Play(PlayEvent::OpenSignEditor {
+                    pos,
+                    front_side: false,
+                }))
+                .unwrap();
+        }
+        app.sync_sign_editor();
+        assert_eq!(app.ui.sign_editor.as_ref().unwrap().pos, (4, 5, 6));
+    }
+
+    /// IME-committed Japanese text lands in the active sign line, then
+    /// close ships `sign_update` with the full 4-line payload and drops
+    /// `text_input_active` again.
+    #[test]
+    fn sign_editor_ime_commit_and_finish_sends_update() {
+        use crate::live_session::WorkerCommand;
+        let mut app = GpuApp::new(GpuCliConfig::default());
+        let (_tx, incoming) = std::sync::mpsc::sync_channel(8);
+        let (outgoing, rx) = std::sync::mpsc::sync_channel(8);
+        let mut live = LiveSession::with_channels(incoming, outgoing);
+        live.status = SessionStatus::Playing;
+        app.attach_live(live);
+        app.ui.screen = Screen::InGameHud;
+        app.ui.sign_editor = Some(SignEditorState::new(
+            (1, 64, 1),
+            true,
+            Default::default(),
+        ));
+
+        // Ime::Commit path: multi-byte UTF-8 inserts intact.
+        app.dispatch_committed_text("看板");
+        app.dispatch_committed_text("テキスト");
+        {
+            let editor = app.ui.sign_editor.as_ref().unwrap();
+            assert_eq!(editor.lines()[0], "看板テキスト");
+            assert_eq!(editor.cursor_col(), 6);
+        }
+        // Paste path: `insert_str` feeds the active line (control chars
+        // like `\n` are stripped by the state model).
+        {
+            let editor = app.ui.sign_editor.as_mut().unwrap();
+            editor.move_down();
+            editor.insert_str("売店");
+            editor.move_down();
+            editor.insert_str("open");
+            editor.move_down();
+            editor.insert_str("24h");
+            assert_eq!(editor.lines()[1], "売店");
+            assert_eq!(editor.lines()[2], "open");
+            assert_eq!(editor.lines()[3], "24h");
+        }
+
+        app.finish_sign_editor();
+        assert!(app.ui.sign_editor.is_none());
+        assert!(!app.text_input_active());
+        match rx.try_recv() {
+            Ok(WorkerCommand::UpdateSign {
+                pos,
+                is_front,
+                lines,
+            }) => {
+                assert_eq!(pos, (1, 64, 1));
+                assert!(is_front);
+                assert_eq!(
+                    lines,
+                    [
+                        "看板テキスト".to_owned(),
+                        "売店".to_owned(),
+                        "open".to_owned(),
+                        "24h".to_owned(),
+                    ]
+                );
+            }
+            _ => panic!("expected UpdateSign command"),
+        }
+    }
+
+    /// The `sign_update` WorkerCommand encodes through to a wire body the
+    /// worker's `send_raw` path writes verbatim.
+    #[test]
+    fn update_sign_command_encodes_wire_payload() {
+        let payload = crate::live_session::encode_sign_update_payload(
+            (-300, 64, 12345),
+            false,
+            &[
+                "看板".to_owned(),
+                String::new(),
+                "l3".to_owned(),
+                String::new(),
+            ],
+        );
+        let mut r = megu_client::protocol::WireReader::new(&payload);
+        assert_eq!(r.read_position().unwrap(), [-300, 64, 12345]);
+        assert!(!r.read_bool().unwrap());
+        assert_eq!(r.read_string(384).unwrap(), "看板");
+        assert_eq!(r.read_string(384).unwrap(), "");
+        assert_eq!(r.read_string(384).unwrap(), "l3");
+        assert_eq!(r.read_string(384).unwrap(), "");
+        assert_eq!(r.remaining(), 0);
     }
 }

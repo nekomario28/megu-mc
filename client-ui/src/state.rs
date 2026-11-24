@@ -2671,6 +2671,10 @@ pub struct UiState {
 
     /// HUD data the game fills per frame.
     pub hud: HudState,
+    /// Server-driven sign-edit session (S2C `open_sign_editor`): while
+    /// `Some`, the HUD composites the 4-line editor overlay and the host
+    /// routes all keyboard/IME/clipboard input into it.
+    pub sign_editor: Option<crate::sign_and_chat::SignEditorState>,
     /// Death-screen data the live session fills on `player_combat_kill` /
     /// `set_health(<=0)`; rendered while [`Screen::Death`] is up.
     pub death: crate::death_screen::DeathScreenState,
@@ -2760,6 +2764,7 @@ impl Default for UiState {
             mod_sync_prompt: ModSyncPromptState::default(),
             mod_sync_decision: None,
             hud: HudState::default(),
+            sign_editor: None,
             death: crate::death_screen::DeathScreenState::default(),
             title_status: None,
             singleplayer: SingleplayerState::default(),
@@ -3029,6 +3034,9 @@ impl UiState {
             layout::layout_title_overlay(self, width, height, out);
             layout::layout_looking_at(self, width, height, out);
         }
+        // The sign-edit session composites over whatever screen is up —
+        // the server owns its open/close lifecycle, not the nav stack.
+        layout::layout_sign_editor(self, width, height, out);
         self.hit_regions = regions;
         if let Some(i) = self.focus_index {
             if i >= self.hit_regions.len() {
@@ -4856,3 +4864,99 @@ mod friends_screen_tests {
         }
     }
 }
+
+#[cfg(test)]
+mod sign_editor_overlay_tests {
+    use super::*;
+    use crate::sign_and_chat::SignEditorState;
+
+    /// Every draw command the sign-edit overlay emits must land inside
+    /// the viewport — checked at the 854×480 minimum and a 4K extreme.
+    #[test]
+    fn sign_editor_overlay_stays_inside_viewport() {
+        for &(w, h) in &[(854u32, 480u32), (3840, 2160), (640, 360)] {
+            let mut ui = UiState::new();
+            ui.screen = Screen::InGameHud;
+            ui.sign_editor = Some(SignEditorState::new(
+                (0, 64, 0),
+                true,
+                [
+                    "Hello".to_owned(),
+                    "看板のテキスト編集の長い行".to_owned(),
+                    String::new(),
+                    "x".repeat(400),
+                ],
+            ));
+            let mut out = crate::draw::UiDrawList::new();
+            assert!(
+                crate::layout::layout_sign_editor(&ui, w, h, &mut out),
+                "overlay must draw at {w}x{h}"
+            );
+            assert!(!out.commands.is_empty());
+            for cmd in &out.commands {
+                match cmd {
+                    crate::draw::UiCommand::FillRect { rect, .. }
+                    | crate::draw::UiCommand::BorderRect { rect, .. }
+                    | crate::draw::UiCommand::ProgressBar { rect, .. } => {
+                        assert!(rect.x >= 0 && rect.y >= 0, "{cmd:?} left/top overflow @{w}x{h}");
+                        assert!(
+                            rect.right() <= w as i32 && rect.bottom() <= h as i32,
+                            "{cmd:?} right/bottom overflow @{w}x{h}"
+                        );
+                    }
+                    crate::draw::UiCommand::Text {
+                        x,
+                        y,
+                        scale,
+                        text,
+                        ..
+                    } => {
+                        assert!(*x >= 0 && *y >= 0, "{cmd:?} left/top overflow @{w}x{h}");
+                        assert!(
+                            *y + 8 * *scale as i32 <= h as i32,
+                            "{cmd:?} bottom overflow @{w}x{h}"
+                        );
+                        assert!(
+                            *x + crate::draw::text_width(text, *scale) as i32 <= w as i32,
+                            "{cmd:?} right overflow @{w}x{h}"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    /// The overlay must also emit through `UiState::render` (the path the
+    /// GPU window actually draws) and disappear with the editor.
+    #[test]
+    fn sign_editor_overlay_renders_through_ui_state() {
+        let mut ui = UiState::new();
+        ui.screen = Screen::InGameHud;
+        ui.sign_editor = Some(SignEditorState::new((1, 2, 3), false, Default::default()));
+        let with_editor = ui.render(854, 480);
+        assert!(!with_editor.commands.is_empty());
+
+        ui.sign_editor = None;
+        let without_editor = ui.render(854, 480);
+        assert!(
+            with_editor.commands.len() > without_editor.commands.len(),
+            "the open editor must add draw commands to the frame"
+        );
+    }
+
+    /// The Japanese locale draws the localized panel title.
+    #[test]
+    fn sign_editor_overlay_uses_japanese_title() {
+        let mut ui = UiState::new();
+        ui.screen = Screen::InGameHud;
+        ui.settings.language = LanguageSetting::Japanese;
+        ui.sign_editor = Some(SignEditorState::new((0, 0, 0), true, Default::default()));
+        let mut out = crate::draw::UiDrawList::new();
+        assert!(crate::layout::layout_sign_editor(&ui, 1280, 720, &mut out));
+        assert!(out.commands.iter().any(|cmd| matches!(
+            cmd,
+            crate::draw::UiCommand::Text { text, .. } if text == "看板のテキスト編集"
+        )));
+    }
+}
+

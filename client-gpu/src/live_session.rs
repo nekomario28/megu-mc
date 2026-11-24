@@ -24,7 +24,8 @@ use megu_client::protocol::{
     DecodedMotionTrigger, DimensionMeta, EntityMetaValue, ItemStackComponents, PlayEvent,
     PlayerInfoUpdateEntry, ProtocolClient, SeasonWireSync, TeleportSync, TransferTarget,
     WireReader, WireSoundEvent, WireStopSound, decode_item_stack_components,
-    handle_transfer_packet, offline_uuid, parse_entity_metadata, parse_uuid,
+    handle_transfer_packet, offline_uuid, pack_position, parse_entity_metadata, parse_uuid,
+    write_string,
 };
 use megu_client::render::ClientVfxHost;
 use megu_client::render_graph::GpuPipelineKind;
@@ -417,6 +418,13 @@ pub(crate) enum WorkerCommand {
     /// 0x04 is preserved verbatim from the last sync).
     PlayerAbilities {
         flags: u8,
+    },
+    /// `sign_update` — the sign-edit screen's Done/Escape packet: packed
+    /// block position, front/back face flag, and the four text lines.
+    UpdateSign {
+        pos: (i32, i32, i32),
+        is_front: bool,
+        lines: [String; 4],
     },
     /// `resource_pack` — status answer for a `resource_pack_push`/`pop`:
     /// the pack UUID plus the vanilla action code (accepted, loaded,
@@ -1409,6 +1417,9 @@ pub struct LiveSession {
     pub actionbar_nbt: Option<Vec<u8>>,
     /// Validated `transfer` reconnect target, if the server issued one.
     pub pending_transfer: Option<TransferTarget>,
+    /// `open_sign_editor` instruction waiting for the window to lift it
+    /// into `UiState::sign_editor`: `(block_pos, is_front)`.
+    pending_sign_editor: Option<((i32, i32, i32), bool)>,
     /// Vanilla use-item/container sequence counter echoed on `use_item`,
     /// `use_item_on`, `player_action`, and `container_click` packets.
     use_item_sequence: i32,
@@ -2108,6 +2119,7 @@ impl LiveSession {
             looking_at_hud: None,
             actionbar_nbt: None,
             pending_transfer: None,
+            pending_sign_editor: None,
             use_item_sequence: 0,
             pending_interaction_seqs: BTreeMap::new(),
             highest_acknowledged_sequence: 0,
@@ -3689,6 +3701,31 @@ impl LiveSession {
     /// Take the validated `transfer` reconnect target, if one arrived.
     pub fn take_pending_transfer(&mut self) -> Option<TransferTarget> {
         self.pending_transfer.take()
+    }
+
+    /// Take the pending `open_sign_editor` request the window turns into
+    /// a `UiState::sign_editor` session: `(block_pos, is_front)`.
+    pub fn take_pending_sign_editor(&mut self) -> Option<((i32, i32, i32), bool)> {
+        self.pending_sign_editor.take()
+    }
+
+    /// Queue the sign-edit screen's `sign_update` packet: packed block
+    /// position + front/back flag + the four lines, encoded by the
+    /// worker and sent via `send_raw`. Returns whether the worker queue
+    /// accepted the command.
+    pub fn send_update_sign(
+        &self,
+        pos: (i32, i32, i32),
+        is_front: bool,
+        lines: [String; 4],
+    ) -> bool {
+        self.outgoing
+            .try_send(WorkerCommand::UpdateSign {
+                pos,
+                is_front,
+                lines,
+            })
+            .is_ok()
     }
 
     /// The classified rig for a tracked entity (set on `add_entity`).
@@ -5339,6 +5376,10 @@ impl LiveSession {
                     self.open_screen = None;
                 }
             }
+            PlayEvent::OpenSignEditor { pos, front_side } => {
+                self.pending_sign_editor =
+                    Some(((pos[0], pos[1], pos[2]), front_side));
+            }
             PlayEvent::ContainerSetContent {
                 window_id,
                 state_id,
@@ -6681,6 +6722,14 @@ fn run_connection(
                 Ok(WorkerCommand::PlayerAbilities { flags }) => {
                     client.send_player_abilities(flags)?;
                 }
+                Ok(WorkerCommand::UpdateSign {
+                    pos,
+                    is_front,
+                    lines,
+                }) => {
+                    let payload = encode_sign_update_payload(pos, is_front, &lines);
+                    client.send_raw(sign_update_packet_id(client.protocol_version), &payload)?;
+                }
                 Ok(WorkerCommand::ResourcePackResponse { uuid, status }) => {
                     client.send_resource_pack(uuid, status)?;
                 }
@@ -7050,14 +7099,49 @@ fn armor_points_for(item_name: Option<&str>) -> u32 {
 }
 
 /// Seed the session command dispatcher with the vanilla command-name set
-/// (`zsh_command_bar`'s `COMMAND_SPECS`) so `complete_suggestions` answers
-/// the same literals the bar highlights before any `declare_commands`.
+/// (`zsh_command_bar`'s `COMMAND_SPECS`) plus the megu/server navigation
+/// shortcuts so `complete_suggestions` answers the same literals the bar
+/// highlights before any `declare_commands`.
 fn seeded_command_dispatcher() -> CommandDispatcher {
     let mut dispatcher = CommandDispatcher::new();
     for name in megu_client::zsh_command_bar::vanilla_command_names() {
         let _ = dispatcher.register_literal(name);
     }
+    // Client/server navigation commands servers commonly expose; not in
+    // vanilla's command table but always safe completion candidates.
+    for name in ["megu", "aero", "hub", "server", "world"] {
+        let _ = dispatcher.register_literal(name);
+    }
     dispatcher
+}
+
+/// `sign_update` C2S packet id for the negotiated protocol: `0x35` on
+/// vanilla 1.21.1 / protocol 767, `0x3e` on 26.3 / protocol 777
+/// (`proto/src/data_v767.rs` / `data_v777.rs` `sign_update` rows).
+fn sign_update_packet_id(version: megu_proto::ProtocolVersion) -> i32 {
+    match version {
+        megu_proto::ProtocolVersion::V26_3 => 0x3e,
+        _ => 0x35,
+    }
+}
+
+/// `ServerboundSignUpdatePacket` body: `Position` (packed `x:26|z:26|y:12`
+/// big-endian `i64`), `is_front` bool, then the four lines as
+/// VarInt-prefixed UTF-8 strings in row order.
+pub(crate) fn encode_sign_update_payload(
+    pos: (i32, i32, i32),
+    is_front: bool,
+    lines: &[String; 4],
+) -> Vec<u8> {
+    let mut payload = Vec::with_capacity(9 + 5 + 4 * 5);
+    payload.extend_from_slice(
+        &pack_position([pos.0, pos.1, pos.2]).to_be_bytes(),
+    );
+    payload.push(u8::from(is_front));
+    for line in lines {
+        write_string(&mut payload, line);
+    }
+    payload
 }
 
 /// Priority order for off-thread `SectionMesh` submissions — mirrors
@@ -10091,5 +10175,116 @@ mod tests {
         assert!(demo_hint_line(103).is_some());
         assert!(demo_hint_line(104).is_some());
         assert!(demo_hint_line(55).is_none());
+    }
+
+    #[test]
+    fn open_sign_editor_sets_pending_for_window() {
+        let (mut live, _tx) = session();
+        live.apply_event(ClientPlayEvent::Play(PlayEvent::OpenSignEditor {
+            pos: [10, 64, -20],
+            front_side: true,
+        }))
+        .unwrap();
+        assert_eq!(
+            live.take_pending_sign_editor(),
+            Some(((10, 64, -20), true))
+        );
+        assert_eq!(live.take_pending_sign_editor(), None);
+    }
+
+    #[test]
+    fn open_sign_editor_back_side_pending() {
+        let (mut live, _tx) = session();
+        live.apply_event(ClientPlayEvent::Play(PlayEvent::OpenSignEditor {
+            pos: [-3, 70, 42],
+            front_side: false,
+        }))
+        .unwrap();
+        assert_eq!(
+            live.take_pending_sign_editor(),
+            Some(((-3, 70, 42), false))
+        );
+    }
+
+    #[test]
+    fn send_update_sign_queues_worker_command() {
+        let (live, _tx, rx) = session_with_commands();
+        let lines: [String; 4] = [
+            "Hello".to_owned(),
+            "看板".to_owned(),
+            String::new(),
+            "four".to_owned(),
+        ];
+        assert!(live.send_update_sign((10, 64, -20), true, lines.clone()));
+        match rx.try_recv() {
+            Ok(WorkerCommand::UpdateSign {
+                pos,
+                is_front,
+                lines: got,
+            }) => {
+                assert_eq!(pos, (10, 64, -20));
+                assert!(is_front);
+                assert_eq!(got, lines);
+            }
+            _ => panic!("expected UpdateSign command"),
+        }
+    }
+
+    #[test]
+    fn sign_update_payload_decodes_to_position_face_and_lines() {
+        // Vanilla `ServerboundSignUpdatePacket` body layout: Position
+        // (packed i64, x:26|z:26|y:12), is_front bool, then four
+        // VarInt-prefixed UTF-8 strings — including multi-byte CJK.
+        let lines: [String; 4] = [
+            "看板のテキスト".to_owned(),
+            "line2".to_owned(),
+            "san行目".to_owned(),
+            String::new(),
+        ];
+        let payload = encode_sign_update_payload((-300, 64, 12345), true, &lines);
+        let mut r = WireReader::new(&payload);
+        assert_eq!(r.read_position().unwrap(), [-300, 64, 12345]);
+        assert!(r.read_bool().unwrap());
+        for want in &lines {
+            assert_eq!(&r.read_string(384).unwrap(), want);
+        }
+        assert_eq!(r.remaining(), 0);
+
+        // is_front=false round-trips the face flag.
+        let payload = encode_sign_update_payload((0, -60, 0), false, &lines);
+        let mut r = WireReader::new(&payload);
+        assert_eq!(r.read_position().unwrap(), [0, -60, 0]);
+        assert!(!r.read_bool().unwrap());
+    }
+
+    #[test]
+    fn sign_update_packet_id_matches_registered_tables() {
+        // `proto/src/data_v767.rs`: play/serverbound sign_update = 0x35;
+        // `proto/src/data_v777.rs`: same name at 0x3e.
+        assert_eq!(
+            sign_update_packet_id(megu_proto::ProtocolVersion::V1_21_1),
+            0x35
+        );
+        assert_eq!(
+            sign_update_packet_id(megu_proto::ProtocolVersion::V26_3),
+            0x3e
+        );
+    }
+
+    #[test]
+    fn seeded_dispatcher_offers_megu_navigation_commands() {
+        let dispatcher = seeded_command_dispatcher();
+        for cmd in ["megu", "aero", "hub", "server", "world"] {
+            // Brigadier completes on the typed prefix — the chat bar
+            // asks at the cursor, so a one-letter head must offer it.
+            let prefix = &cmd[..1];
+            let suggestions = dispatcher
+                .complete_suggestions(prefix, prefix.len())
+                .unwrap_or_else(|_| panic!("suggestions for {cmd}"));
+            assert!(
+                (0..suggestions.len()).any(|i| suggestions.get(i) == Some(cmd)),
+                "seeded dispatcher must complete /{cmd} from /{prefix}"
+            );
+        }
     }
 }

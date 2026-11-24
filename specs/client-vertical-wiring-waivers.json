@@ -88,12 +88,6 @@
     },
     {
       "check": "s2c_play_event_consumption",
-      "id": "PlayEvent::OpenSignEditor",
-      "priority": "P1",
-      "reason": "open_sign_editor drops \u2014 sign edit UI never opens"
-    },
-    {
-      "check": "s2c_play_event_consumption",
       "id": "PlayEvent::Other",
       "priority": "P2",
       "reason": "catch-all variant for undecoded packet ids \u2014 intentionally unhandled"

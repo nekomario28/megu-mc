@@ -19,6 +19,7 @@ use megu_core::sys_metrics::{MiniHudAnchor, format_mini_hud_lines};
 use crate::draw::{UiColor, UiCommand, UiDrawList, UiRect, palette as pal, text_width};
 use crate::hud_widgets::{HudSnapshot, HudWidgetsRenderer};
 use crate::magic_hud::MagicHudState;
+use crate::sign_and_chat::SIGN_LINE_COUNT;
 use crate::state::{
     FPS_CAP_STEPS, HitRegion, HudState, HudSubtitle, MiniHudPreset, ModSyncChange, Screen,
     SettingKey, SettingsTab, SubtitleDirection, UiLang, UiModal, UiState, WidgetId, tr,
@@ -3292,6 +3293,123 @@ pub fn layout_looking_at(state: &UiState, width: u32, height: u32, out: &mut UiD
             *color,
             clipped,
         );
+    }
+    true
+}
+
+/// Append the server-driven sign-edit overlay (`state.sign_editor`) to
+/// the draw list: a full-screen dim behind a centered wooden panel with
+/// the `Edit Sign Message` / `看板のテキスト編集` header, the four
+/// editable lines (active line highlighted, char-cell caret at the
+/// cursor), and a `[Done]` hint. Returns `false` while no session is
+/// open; panel geometry is clamped into the viewport so nothing draws
+/// outside `width`×`height` at any size.
+pub fn layout_sign_editor(
+    state: &UiState,
+    width: u32,
+    height: u32,
+    out: &mut UiDrawList,
+) -> bool {
+    let Some(editor) = &state.sign_editor else {
+        return false;
+    };
+    // Same auto GUI scale the other HUD overlays use so panels agree.
+    let ms = ((height as f32 / 360.0).floor() as u32)
+        .clamp(1, 4)
+        .min(((width as f32 / 320.0).floor() as u32).max(1));
+    let lw = (width / ms) as i32;
+    let lh = (height / ms) as i32;
+
+    const EDGE: i32 = 8;
+    const TITLE_H: i32 = 14;
+    const ROW_H: i32 = 13;
+    const HINT_H: i32 = 14;
+    const PAD: i32 = 6;
+    let rows_h = ROW_H * SIGN_LINE_COUNT as i32;
+    let panel_w = (lw - 2 * EDGE).clamp(0, 300);
+    let panel_h = (lh - 2 * EDGE).clamp(0, TITLE_H + rows_h + HINT_H + 2 * PAD);
+    if panel_w < 32 || panel_h < 32 {
+        return false;
+    }
+    let px_l = ((lw - panel_w) / 2).max(EDGE.min(lw - panel_w));
+    let py_l = ((lh - panel_h) / 2).max(EDGE.min(lh - panel_h));
+
+    // Vanilla sign-edit backdrop: the world dims behind the editor.
+    out.fill_rect(
+        UiRect::new(0, 0, width, height),
+        UiColor::rgba(0, 0, 0, 128),
+    );
+
+    let px = px_l * ms as i32;
+    let py = py_l * ms as i32;
+    let pw = (panel_w * ms as i32) as u32;
+    let ph = (panel_h * ms as i32) as u32;
+    // Oak-sign wood: light plank fill, darker frame + line slots.
+    const WOOD: UiColor = UiColor::rgb(168, 124, 72);
+    const WOOD_DARK: UiColor = UiColor::rgb(104, 72, 40);
+    const WOOD_SLOT: UiColor = UiColor::rgb(140, 100, 58);
+    const WOOD_SLOT_ACTIVE: UiColor = UiColor::rgb(188, 142, 86);
+    const INK: UiColor = UiColor::rgb(34, 24, 12);
+    out.fill_rect(UiRect::new(px, py, pw, ph), WOOD);
+    out.border_rect(UiRect::new(px, py, pw, ph), WOOD_DARK, ms);
+
+    let inner_w = panel_w - 2 * PAD;
+    let title = tr(
+        state.lang(),
+        "Edit Sign Message",
+        "看板のテキスト編集",
+    );
+    let title = crate::draw::first_cells(title, (inner_w / 8).max(0) as usize);
+    let title_w = text_width(title, ms) as i32;
+    let title_y = (py_l + PAD + (TITLE_H - 8) / 2) * ms as i32;
+    out.text_str(px + (pw as i32 - title_w) / 2, title_y, ms, INK, title);
+
+    // Four text lines: the active row gets a brighter slot + caret.
+    let rows_y = py_l + PAD + TITLE_H;
+    for (i, line) in editor.lines().iter().enumerate() {
+        let ry = rows_y + i as i32 * ROW_H;
+        if ry + ROW_H > py_l + panel_h - HINT_H - 2 {
+            break;
+        }
+        let active = i == editor.active_line();
+        let slot = UiRect::new(
+            (px_l + PAD) * ms as i32,
+            ry * ms as i32,
+            (inner_w * ms as i32) as u32,
+            (ROW_H - 2) as u32 * ms,
+        );
+        out.fill_rect(slot, if active { WOOD_SLOT_ACTIVE } else { WOOD_SLOT });
+        if active {
+            out.border_rect(slot, UiColor::rgb(238, 226, 190), ms.max(1));
+        }
+        let text_pad = 3;
+        let cells = ((inner_w - 2 * text_pad) / 8).max(0) as usize;
+        let clipped = crate::draw::first_cells(line, cells);
+        let tx = (px_l + PAD + text_pad) * ms as i32;
+        let ty = (ry + (ROW_H - 2 - 8) / 2) * ms as i32;
+        out.text_str(tx, ty, ms, INK, clipped);
+        if active {
+            // Caret: 1-cell sliver at the cursor's cell offset inside the
+            // clipped text, clamped into the slot's right edge.
+            let prefix_text: String = line.chars().take(editor.cursor_col()).collect();
+            let prefix = crate::draw::first_cells(&prefix_text, cells);
+            let caret_x = (tx + text_width(prefix, ms) as i32)
+                .min(slot.right() - ms as i32)
+                .max(tx);
+            out.fill_rect(
+                UiRect::new(caret_x, ty, ms, 8 * ms),
+                UiColor::rgb(240, 232, 210),
+            );
+        }
+    }
+
+    // Bottom hint row.
+    let hint = tr(state.lang(), "[Done]", "[完了]");
+    let hint = crate::draw::first_cells(hint, (inner_w / 8).max(0) as usize);
+    let hint_w = text_width(hint, ms) as i32;
+    let hint_y = (py_l + panel_h - PAD - (HINT_H + 8) / 2) * ms as i32;
+    if hint_y >= title_y + 8 * ms as i32 {
+        out.text_str(px + (pw as i32 - hint_w) / 2, hint_y, ms, INK, hint);
     }
     true
 }
