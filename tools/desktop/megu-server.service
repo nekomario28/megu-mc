@@ -1,0 +1,32 @@
+# Megu dedicated server — systemd unit.
+# Install:  sudo install -Dm644 megu-server.service /etc/systemd/system/megu-server.service
+# Enable:   sudo systemctl enable --now megu-server
+# The server world lives in WorkingDirectory below; adjust User=/paths to
+# taste. Type=notify + WatchdogSec are already wired: megu emits READY=1,
+# STATUS= and watchdog pings over sd_notify with zero extra config.
+[Unit]
+Description=Megu dedicated Minecraft-compatible server
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=notify
+WatchdogSec=30
+ExecStart=/usr/local/bin/megu --cli
+WorkingDirectory=/var/lib/megu
+Restart=on-failure
+RestartSec=5
+
+# Hardening: the server only needs its own data directory writable.
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectSystem=strict
+ReadWritePaths=/var/lib/megu
+ProtectHome=read-only
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+RestrictSUIDSGID=yes
+
+[Install]
+WantedBy=multi-user.target

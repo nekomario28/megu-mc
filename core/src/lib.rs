@@ -140,6 +140,12 @@
 //!   expansion + bounds-safe palette gather). Every `#[target_feature]`
 //!   path is guarded by `is_x86_feature_detected!` — Core 2 Duo
 //!   (x86-64-v1) always lands on the safe scalar tier.
+//! * [`linux_desktop`] — zero-dependency Linux/Unix desktop integration:
+//!   [`linux_desktop::MeguPaths`] XDG + `--gameDir` path resolution with
+//!   freedesktop-spec fallbacks, [`linux_desktop::OmarchyThemePalette`]
+//!   live Omarchy `colors.toml` theme sync, and fail-silent
+//!   `xdg-open`/`notify-send` helpers that never surface an error to a
+//!   beginner on any OS.
 
 #![deny(unsafe_code)]
 
@@ -155,6 +161,7 @@ pub mod hw_adaptive_engine;
 pub mod id;
 pub mod i18n;
 pub mod json;
+pub mod linux_desktop;
 pub mod math;
 pub mod math_opt_engine;
 pub mod math_opt_foundation;

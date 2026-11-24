@@ -1,0 +1,12 @@
+[Desktop Entry]
+Type=Application
+Name=Megu
+Comment=A fast Minecraft-compatible client and dedicated server
+Comment[ja]=Minecraft互換の高速クライアント＆専用サーバー
+Exec=megu-client-gpu
+Icon=megu
+Terminal=false
+Categories=Game;
+Keywords=minecraft;game;sandbox;
+StartupWMClass=megu-client
+StartupNotify=true

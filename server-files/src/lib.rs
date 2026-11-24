@@ -73,6 +73,12 @@
 //!   categorized log, the pinned three-line HUD renderer
 //!   ([`server_tui::ServerTuiState::render_frame`]), and the interactive key
 //!   map — a pure-`std` port of `tools/megu_tui.py`.
+//! * [`sd_notify`] — zero-dependency systemd `Type=notify` integration
+//!   (single `SOCK_DGRAM` datagram to `$NOTIFY_SOCKET`, strictly
+//!   non-blocking and fail-silent off systemd) plus the local
+//!   control-socket wire helpers: [`sd_notify::CtlStatusSnapshot`],
+//!   [`sd_notify::format_ctl_status_json`] and [`sd_notify::parse_ctl_line`]
+//!   for `megu ctl`/Waybar status without opening a TCP RCON port.
 
 pub mod admin_cli;
 pub mod atomic;
@@ -91,6 +97,7 @@ pub mod pack_loader;
 pub mod pack_router;
 pub mod perf_cache;
 pub mod properties;
+pub mod sd_notify;
 pub mod server_tui;
 pub mod usercache;
 
