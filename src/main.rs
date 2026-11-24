@@ -21117,7 +21117,7 @@ mod main_admin_tui_wire_tests {
                 Some("xterm-256color"),
                 false,
             ),
-            ServerConsoleMode::Tui
+            if cfg!(windows) { ServerConsoleMode::PlainCli } else { ServerConsoleMode::Tui }
         );
         assert_eq!(
             resolve_console_mode(

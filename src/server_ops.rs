@@ -1768,7 +1768,7 @@ mod server_ops_tests {
         // `/dev/null` — the headless case — returns Eof with no dispatch and no spin.
         let mut calls = 0;
         let exit = run_stdin_console_loop(
-            std::io::BufReader::new(std::fs::File::open("/dev/null").unwrap()),
+            std::io::BufReader::new(std::fs::File::open(if cfg!(windows) { "NUL" } else { "/dev/null" }).unwrap()),
             |_| {
                 calls += 1;
                 String::new()
