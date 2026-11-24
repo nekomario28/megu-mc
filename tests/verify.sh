@@ -130,6 +130,7 @@ python3 tests/live_parity_e2e_wire.py --self-test
 python3 tests/mod_suite_live_wire.py --self-test
 python3 tests/client_oracle_fuzz_wire.py --self-test
 python3 tests/multiplayer_stress_wire.py --self-test
+python3 tests/survival_journey_regression_wire.py --self-test
 python3 tests/client_parity_gate_test.py
 # The vertical-slice wiring audit is a real gate, not a report: it fails on any
 # S2C event / C2S command / HUD field / screen that lacks a named non-test wire
