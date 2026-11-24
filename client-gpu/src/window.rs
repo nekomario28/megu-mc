@@ -34,7 +34,9 @@ use megu_client_mesh::ber_instancing::{
     build_ber_mesh,
 };
 use megu_client_mesh::builtin_shadow_wgsl::{BuiltinShadowQuality, RenderScalePreset};
-use megu_client_mesh::entity_rig::{EntityPose, EntityRigSpec, build_entity_rig_mesh};
+use megu_client_mesh::entity_rig::{
+    EntityPose, EntityRigSpec, build_entity_rig_mesh_with_mouth_item,
+};
 use megu_client_mesh::mesher::classify_vanilla_ber;
 use megu_client_mesh::tactile_effects::{
     TactileEffectsConfig, TactileParticle, TactileParticleKind, TactilePreset,
@@ -79,6 +81,7 @@ use crate::live_session::{
     jar_version_ids,
 };
 use crate::renderer::{GpuRenderer, request_gpu_device};
+use crate::subworld_sync::SubWorldHelmCmd;
 use crate::title_branding::{TitleBrandingAssets, title_branding_sources};
 use crate::{
     Camera, DisplayPresentationPolicy, GpuCliConfig, MoveInput, build_demo_scene,
@@ -745,6 +748,10 @@ pub struct GpuApp {
     /// ~7-tick double-jump window used by `LiveSession::toggle_flight`
     /// (key repeats are filtered upstream, so every `Pressed` is real).
     last_space_press: Option<Instant>,
+    /// Last helm frame pushed to the session's worker — dispatch is
+    /// change-only (a released stick is one zeroed frame, not a stream)
+    /// and unbinding emits a single control release.
+    last_subworld_helm: Option<SubWorldHelmCmd>,
     last_frame: Instant,
     frame_start: Instant,
     fatal: Option<String>,
@@ -957,6 +964,7 @@ impl GpuApp {
             baseline_upload_budget: None,
             f3_text: None,
             pending_mouse_delta: (0.0, 0.0),
+            last_subworld_helm: None,
             live_strategy_pending: true,
             ui_draw_list: UiDrawList::new(),
             particle_scratch: Vec::new(),
@@ -1271,11 +1279,27 @@ impl GpuApp {
         let mut entity_refs: Vec<(i32, [f32; 3], [f32; 3])> = Vec::new();
         for (eid, spec, pos, tracked) in live.entity_render_entries() {
             let pose = live_entity_pose(live, eid, tracked);
-            let key = entity_pose_key(spec, &pose);
+            // The fox (id 42) carries pickups in its mouth slot: the held
+            // item id joins the cache key so pick-up/drop rebuilds the
+            // mesh immediately, without waiting on a pose change.
+            let mouth_item_id = if spec.entity_type_id == FOX_ENTITY_TYPE_ID {
+                live.entity_mainhand_item_id(eid).filter(|id| *id != 0)
+            } else {
+                None
+            };
+            let key = entity_pose_key(spec, &pose, mouth_item_id);
             if cache.entity_meshes.get(&eid).is_none_or(|(k, _)| *k != key) {
-                cache
-                    .entity_meshes
-                    .insert(eid, (key, build_entity_rig_mesh(spec, pose)));
+                cache.entity_meshes.insert(
+                    eid,
+                    (
+                        key,
+                        build_entity_rig_mesh_with_mouth_item(
+                            spec,
+                            pose,
+                            mouth_item_id.map(mouth_item_rgb),
+                        ),
+                    ),
+                );
             }
             entity_refs.push((
                 eid,
@@ -3845,6 +3869,12 @@ impl GpuApp {
                 jump: !self.paused && input.vertical > 0.0,
                 sneak: !self.paused && self.keys.down,
             });
+            // Aeronautics helm: while an SW6D snapshot binds the player
+            // to a sub-world, the same movement keys steer it.
+            let helm = live
+                .player_subworld()
+                .map(|id| subworld_helm_cmd(id, input, self.paused));
+            dispatch_subworld_helm(live, helm, &mut self.last_subworld_helm);
         }
 
         // Occluded (minimized / fully covered): zero GPU work. The live
@@ -5832,10 +5862,64 @@ fn live_entity_pose(
     pose
 }
 
-/// Fingerprint of `(spec, pose)` so rig meshes rebuild only on real
-/// change — floats quantize to 1/64 to keep jitter from thrashing the
-/// cache.
-fn entity_pose_key(spec: EntityRigSpec, pose: &EntityPose) -> u64 {
+/// Helm frame for `subworld_id` built from the shared FPS move input:
+/// W/S throttle, A/D yaw rate, Space/Shift altitude delta; a paused app
+/// emits a fully released frame.
+fn subworld_helm_cmd(subworld_id: u64, input: MoveInput, paused: bool) -> SubWorldHelmCmd {
+    let input = if paused { MoveInput::default() } else { input };
+    SubWorldHelmCmd {
+        subworld_id,
+        throttle: input.forward,
+        yaw_rate: input.strafe,
+        pitch_rate: 0.0,
+        altitude_delta: input.vertical,
+        flags: 0,
+    }
+}
+
+/// Push the current helm frame to the session's worker on change only:
+/// an unchanged command is not re-sent (a released stick is one zeroed
+/// frame, not a stream of zeroes), and losing the binding sends a single
+/// control release to the last helm target so a parked craft does not
+/// keep thrusting under a stale input.
+fn dispatch_subworld_helm(
+    live: &LiveSession,
+    next: Option<SubWorldHelmCmd>,
+    last: &mut Option<SubWorldHelmCmd>,
+) {
+    if next == *last {
+        return;
+    }
+    if let Some(cmd) = next.or_else(|| {
+        last.filter(subworld_helm_cmd_active)
+            .map(|prev| SubWorldHelmCmd {
+                subworld_id: prev.subworld_id,
+                ..SubWorldHelmCmd::default()
+            })
+    }) {
+        live.send_subworld_helm(&cmd);
+    }
+    *last = next;
+}
+
+/// `true` while any helm control is off neutral — a release frame only
+/// matters when the last dispatched command actually moved something.
+fn subworld_helm_cmd_active(cmd: &SubWorldHelmCmd) -> bool {
+    cmd.throttle != 0.0
+        || cmd.yaw_rate != 0.0
+        || cmd.pitch_rate != 0.0
+        || cmd.altitude_delta != 0.0
+        || cmd.flags != 0
+}
+
+/// Vanilla fox entity type id — the only rig with a held mouth slot.
+const FOX_ENTITY_TYPE_ID: u16 = 42;
+
+/// Fingerprint of `(spec, pose, held mouth item)` so rig meshes rebuild
+/// only on real change — floats quantize to 1/64 to keep jitter from
+/// thrashing the cache, and the item id joins so the fox's mouth prism
+/// follows pick-up/drop without waiting on a pose delta.
+fn entity_pose_key(spec: EntityRigSpec, pose: &EntityPose, held_item_id: Option<i32>) -> u64 {
     // Word-wise FNV-1a step (`hash ^= word; hash *= prime`) — not the
     // byte-wise `Fnv1a64` stream, kept bit-identical to the historical
     // digest; only the offset basis and prime come from `megu_core`.
@@ -5861,6 +5945,7 @@ fn entity_pose_key(spec: EntityRigSpec, pose: &EntityPose) -> u64 {
         | u64::from(pose.hurt_flash) << 3
         | u64::from(pose.baby) << 4
         | u64::from(pose.enable_skin_3d_layers) << 5);
+    mix((held_item_id.map_or(0, |id| i64::from(id) + 1)) as u64);
     hash
 }
 
@@ -5873,6 +5958,14 @@ fn live_entity_tint(spec: EntityRigSpec, tracked: Option<&TrackedEntity>) -> [f3
     }
     let hue = (f64::from(spec.entity_type_id) * 0.618_033_988_749_895).fract() as f32;
     hsv_to_rgb_f32(hue, 0.5, 0.85)
+}
+
+/// Deterministic vibrant colour for the fox's held mouth item — the
+/// golden-ratio hue walk [`live_entity_tint`] uses, keyed on the item id
+/// so distinct pickups tint the mouth prism differently.
+fn mouth_item_rgb(item_id: i32) -> [u8; 3] {
+    let hue = (f64::from(item_id as u32) * 0.618_033_988_749_895).fract() as f32;
+    hsv_to_rgb_f32(hue, 0.85, 0.95).map(|c| (c * 255.0).round() as u8)
 }
 
 /// `hsv_to_rgb` for `0..=1` float inputs.
@@ -6870,22 +6963,178 @@ mod tests {
         let spec = megu_client_mesh::entity_rig::classify_entity_rig(114) // zombie
             .expect("zombie rig spec");
         let base = EntityPose::default();
-        let key = entity_pose_key(spec, &base);
+        let key = entity_pose_key(spec, &base, None);
         let jitter = EntityPose {
             head_yaw_deg: 0.005, // < 1/64 quantization step
             ..EntityPose::default()
         };
-        assert_eq!(entity_pose_key(spec, &jitter), key);
+        assert_eq!(entity_pose_key(spec, &jitter, None), key);
         let turned = EntityPose {
             head_yaw_deg: 45.0,
             ..EntityPose::default()
         };
-        assert_ne!(entity_pose_key(spec, &turned), key);
+        assert_ne!(entity_pose_key(spec, &turned, None), key);
         let sneaking = EntityPose {
             sneaking: true,
             ..EntityPose::default()
         };
-        assert_ne!(entity_pose_key(spec, &sneaking), key);
+        assert_ne!(entity_pose_key(spec, &sneaking, None), key);
+    }
+
+    /// Aeronautics helm: an SW6D pose flagged player-aboard binds the
+    /// session, player input drives change-only SHLM frames, and losing
+    /// the binding emits one zeroed release.
+    #[test]
+    fn subworld_helm_dispatch_binds_drives_and_releases() {
+        use crate::live_session::WorkerCommand;
+        let (_incoming_tx, incoming) = std::sync::mpsc::sync_channel(8);
+        let (outgoing, outgoing_rx) = std::sync::mpsc::sync_channel(8);
+        let mut live = LiveSession::with_channels(incoming, outgoing);
+
+        let sw6d = |id: u64, flags: u8| {
+            let mut bytes = Vec::new();
+            bytes.extend_from_slice(b"SW6D");
+            bytes.push(1);
+            bytes.extend_from_slice(&1u16.to_be_bytes());
+            bytes.extend_from_slice(&id.to_be_bytes());
+            for value in [4.0f64, 5.0, 6.0] {
+                bytes.extend_from_slice(&value.to_be_bytes());
+            }
+            for value in [0.0f32, 0.0, 0.0, 1.0] {
+                bytes.extend_from_slice(&value.to_be_bytes());
+            }
+            for _ in 0..6 {
+                bytes.extend_from_slice(&0.0f32.to_be_bytes());
+            }
+            bytes.push(flags);
+            bytes
+        };
+        let sync_event = |payload: Vec<u8>| {
+            megu_client::protocol::ClientPlayEvent::CustomChannel(
+                megu_client::protocol::ClientCustomChannelEvent::Unknown {
+                    channel: crate::subworld_sync::SUBWORLD_SYNC_CHANNEL.to_owned(),
+                    payload,
+                },
+            )
+        };
+        let recv_helm = |rx: &std::sync::mpsc::Receiver<WorkerCommand>| match rx.try_recv() {
+            Ok(WorkerCommand::SendCustomPayload { channel, payload }) => {
+                assert_eq!(channel, crate::subworld_sync::SUBWORLD_HELM_CHANNEL);
+                crate::subworld_sync::decode_helm_cmd(&payload).expect("SHLM v1 decode")
+            }
+            _ => panic!("expected a helm SendCustomPayload"),
+        };
+
+        // Unbound input dispatches nothing.
+        let mut last = None;
+        let input = MoveInput {
+            forward: 1.0,
+            ..MoveInput::default()
+        };
+        let unbound = live
+            .player_subworld()
+            .map(|id| subworld_helm_cmd(id, input, false));
+        dispatch_subworld_helm(&live, unbound, &mut last);
+        assert!(outgoing_rx.try_recv().is_err());
+
+        // A flagged SW6D pose binds the player and lands in the render bank.
+        live.apply_event(sync_event(sw6d(77, 0x01))).unwrap();
+        assert_eq!(live.player_subworld(), Some(77));
+        assert_eq!(
+            live.subworlds.get(77).unwrap().transform.position,
+            [4.0, 5.0, 6.0]
+        );
+
+        // First bound frame sends SHLM; identical repeats are suppressed.
+        let cmd = subworld_helm_cmd(77, input, false);
+        assert_eq!(cmd.throttle, 1.0);
+        dispatch_subworld_helm(&live, Some(cmd), &mut last);
+        assert_eq!(recv_helm(&outgoing_rx), cmd);
+        dispatch_subworld_helm(&live, Some(cmd), &mut last);
+        assert!(
+            outgoing_rx.try_recv().is_err(),
+            "unchanged helm frame must not resend"
+        );
+
+        // A released stick sends one zeroed frame; staying released sends none.
+        let released = subworld_helm_cmd(77, MoveInput::default(), false);
+        dispatch_subworld_helm(&live, Some(released), &mut last);
+        assert_eq!(recv_helm(&outgoing_rx), released);
+        dispatch_subworld_helm(&live, Some(released), &mut last);
+        assert!(outgoing_rx.try_recv().is_err());
+
+        // Dropping the binding after an active command releases controls once.
+        dispatch_subworld_helm(&live, Some(cmd), &mut last);
+        assert_eq!(recv_helm(&outgoing_rx), cmd);
+        live.apply_event(sync_event(sw6d(77, 0))).unwrap();
+        assert_eq!(live.player_subworld(), None);
+        dispatch_subworld_helm(&live, None, &mut last);
+        let release = recv_helm(&outgoing_rx);
+        assert_eq!(release.subworld_id, 77);
+        assert!(!subworld_helm_cmd_active(&release));
+        dispatch_subworld_helm(&live, None, &mut last);
+        assert!(outgoing_rx.try_recv().is_err(), "release is sent once");
+    }
+
+    /// Fox mouth slot: the held main-hand item id joins the mesh cache
+    /// key and paints the mouth prism, so pick-up/drop rebuilds the mesh
+    /// immediately instead of waiting on a pose delta.
+    #[test]
+    fn fox_mouth_item_cache_key_and_mesh_follow_mainhand_item() {
+        let (_tx, incoming) = std::sync::mpsc::sync_channel(8);
+        let (outgoing, _rx) = std::sync::mpsc::sync_channel(8);
+        let mut live = LiveSession::with_channels(incoming, outgoing);
+        live.apply_event(megu_client::protocol::ClientPlayEvent::Play(
+            megu_client::protocol::PlayEvent::AddEntity {
+                eid: 9,
+                uuid: [1; 16],
+                entity_type: i32::from(FOX_ENTITY_TYPE_ID),
+                x: 1.0,
+                y: 64.0,
+                z: 2.0,
+                pitch: 0.0,
+                yaw: 0.0,
+                head_yaw: 0.0,
+                data: 0,
+                vx: 0.0,
+                vy: 0.0,
+                vz: 0.0,
+            },
+        ))
+        .unwrap();
+        let spec = *live.entity_rig(9).expect("fox rig");
+        let pose = EntityPose::default();
+
+        // Bare-handed fox: no mouth item, base fingerprint and mesh.
+        assert_eq!(live.entity_mainhand_item_id(9), None);
+        let bare_key = entity_pose_key(spec, &pose, None);
+        let bare = build_entity_rig_mesh_with_mouth_item(spec, pose, None);
+
+        live.apply_event(megu_client::protocol::ClientPlayEvent::Play(
+            megu_client::protocol::PlayEvent::SetEquipment {
+                eid: 9,
+                entries: vec![megu_client::protocol::EquipmentEntry {
+                    slot: 0,
+                    item_wire: vec![1, 5, 0, 0],
+                }],
+            },
+        ))
+        .unwrap();
+        assert_eq!(live.entity_mainhand_item_id(9), Some(5));
+        let held_key = entity_pose_key(spec, &pose, Some(5));
+        assert_ne!(held_key, bare_key, "held item id must invalidate the mesh cache");
+        let held = build_entity_rig_mesh_with_mouth_item(spec, pose, Some(mouth_item_rgb(5)));
+        assert_eq!(
+            held.quads.len(),
+            bare.quads.len() + 6,
+            "mouth prism adds six quads"
+        );
+
+        // Distinct items re-key and re-tint; drops return to the bare key.
+        assert_ne!(entity_pose_key(spec, &pose, Some(7)), held_key);
+        assert_eq!(entity_pose_key(spec, &pose, None), bare_key);
+        assert_eq!(mouth_item_rgb(5), mouth_item_rgb(5));
+        assert_ne!(mouth_item_rgb(5), mouth_item_rgb(7));
     }
 
     /// C5: quads pushed for live particles are axis-consistent

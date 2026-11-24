@@ -1694,6 +1694,10 @@ pub struct LiveSession {
     pub chunk_fades: ChunkFadeTracker,
     pub subworlds: SubWorldRenderBank,
     subworld_sync_received_at: Option<Instant>,
+    /// SW6D-flagged sub-world the local player pilots (pose `flags` bit
+    /// [`SUBWORLD_POSE_PLAYER_ABOARD`]); `None` while the latest snapshot
+    /// marks no sub-world as player-controlled.
+    player_subworld_id: Option<u64>,
     /// Monotone revision bumped whenever any HUD-visible field mutates
     /// (chat, scoreboard, actionbar, title, health/hunger/hotbar,
     /// subtitle, magic HUD). The window's sync skips the `HudState`
@@ -2198,6 +2202,7 @@ impl LiveSession {
             chunk_fades: ChunkFadeTracker::new(),
             subworlds: SubWorldRenderBank::new(),
             subworld_sync_received_at: None,
+            player_subworld_id: None,
             hud_revision: 0,
             last_synced_hud_revision: u64::MAX,
             hud_sync_skips: 0,
@@ -3401,6 +3406,14 @@ impl LiveSession {
             .try_send(WorkerCommand::ClientInformation { view_distance });
     }
 
+    /// The sub-world the latest SW6D snapshot flags as player-controlled,
+    /// while its render entry is still live — the helm target
+    /// [`Self::send_subworld_helm`] commands should address.
+    pub fn player_subworld(&self) -> Option<u64> {
+        self.player_subworld_id
+            .filter(|id| self.subworlds.get(*id).is_some())
+    }
+
     /// Queue one Aeronautics helm command for the connection worker.
     /// Returns false when the bounded worker queue cannot accept it.
     pub fn send_subworld_helm(&self, cmd: &SubWorldHelmCmd) -> bool {
@@ -3681,6 +3694,15 @@ impl LiveSession {
     /// The classified rig for a tracked entity (set on `add_entity`).
     pub fn entity_rig(&self, entity_id: i32) -> Option<&EntityRigSpec> {
         self.entity_rigs.get(&entity_id)
+    }
+
+    /// Main-hand item id a tracked entity holds (equipment slot 0) —
+    /// `Some` lets rigged holders (the fox's mouth slot) rebuild their
+    /// mesh on pick-up/drop without a pose change.
+    pub fn entity_mainhand_item_id(&self, eid: i32) -> Option<i32> {
+        self.entity_equipment
+            .get(&(eid, 0))
+            .map(|stack| stack.item_id)
     }
 
     /// Iterate renderable live entities — every tracked entity that has a
@@ -6293,6 +6315,11 @@ impl LiveSession {
                 if let Ok(frame) = decode_sync_frame(&payload) {
                     self.subworlds.apply_sync_frame(&frame);
                     self.subworld_sync_received_at = Some(Instant::now());
+                    self.player_subworld_id = frame
+                        .poses
+                        .iter()
+                        .find(|pose| pose.flags & SUBWORLD_POSE_PLAYER_ABOARD != 0)
+                        .map(|pose| pose.subworld_id);
                 }
             }
             ClientCustomChannelEvent::Unknown { .. } => {}
@@ -6743,6 +6770,10 @@ fn run_connection(
 /// Reserved `subworlds` id for the layered voxel-cloud sheet (kept clear of
 /// contraption ids, which allocate from 1 upward).
 pub const CLOUD_SUBWORLD_ID: u64 = u64::MAX;
+
+/// SW6D v1 pose-flag bit marking the sub-world the local player rides and
+/// helms — the binding [`LiveSession::send_subworld_helm`] commands target.
+const SUBWORLD_POSE_PLAYER_ABOARD: u8 = 0x01;
 
 /// Quantize one [`CloudLighting`] state to 1/32 steps for the cloud-mesh
 /// cache key: the tint is baked into vertex albedo, so a real change must
@@ -7318,6 +7349,110 @@ mod tests {
         assert!(wire.ends_with(&payload));
         assert_eq!(play_custom_payload_packet_id(767), 0x12);
         assert_eq!(play_custom_payload_packet_id(777), 0x16);
+    }
+
+    /// SW6D v1 builder for `(subworld_id, x, flags)` pose rows — the same
+    /// layout `subworld_custom_payload_channels_dispatch_inbound_and_outbound`
+    /// writes inline.
+    fn sw6d_test_frame(poses: &[(u64, f64, u8)]) -> Vec<u8> {
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(b"SW6D");
+        bytes.push(1);
+        bytes.extend_from_slice(&(poses.len() as u16).to_be_bytes());
+        for &(id, x, flags) in poses {
+            bytes.extend_from_slice(&id.to_be_bytes());
+            for value in [x, 5.0, 6.0] {
+                bytes.extend_from_slice(&value.to_be_bytes());
+            }
+            for value in [0.0f32, 0.0, 0.0, 1.0] {
+                bytes.extend_from_slice(&value.to_be_bytes());
+            }
+            for _ in 0..6 {
+                bytes.extend_from_slice(&0.0f32.to_be_bytes());
+            }
+            bytes.push(flags);
+        }
+        bytes
+    }
+
+    #[test]
+    fn sw6d_frames_drain_into_render_bank_and_interpolate() {
+        let (mut live, tx) = session();
+        tx.send(WorkerMessage::Play(framed(
+            SUBWORLD_SYNC_CHANNEL,
+            &sw6d_test_frame(&[(77, 4.0, 0x01)]),
+        )))
+        .unwrap();
+        tx.send(WorkerMessage::Play(framed(
+            SUBWORLD_SYNC_CHANNEL,
+            &sw6d_test_frame(&[(77, 10.0, 0x01)]),
+        )))
+        .unwrap();
+        live.poll([0.0; 3], &[]);
+        assert_eq!(live.player_subworld(), Some(77));
+        // `poll` interpolates against the previous snapshot instead of
+        // snapping the transform to the newest pose.
+        let x = live.subworlds.get(77).unwrap().transform.position[0];
+        assert!(x < 5.0, "interpolated transform must not snap to {x}");
+    }
+
+    #[test]
+    fn player_subworld_binding_and_mainhand_item_helpers() {
+        let (mut live, _tx) = session();
+        // An unflagged pose registers in the bank but binds nobody.
+        live.apply_event(framed(
+            SUBWORLD_SYNC_CHANNEL,
+            &sw6d_test_frame(&[(77, 4.0, 0)]),
+        ))
+        .unwrap();
+        assert!(live.subworlds.get(77).is_some());
+        assert_eq!(live.player_subworld(), None);
+        // A player-aboard flagged pose binds; an empty snapshot releases.
+        live.apply_event(framed(
+            SUBWORLD_SYNC_CHANNEL,
+            &sw6d_test_frame(&[(77, 4.0, 0x01)]),
+        ))
+        .unwrap();
+        assert_eq!(live.player_subworld(), Some(77));
+        live.apply_event(framed(SUBWORLD_SYNC_CHANNEL, &sw6d_test_frame(&[])))
+            .unwrap();
+        assert_eq!(live.player_subworld(), None);
+        assert!(live.subworlds.get(77).is_none());
+
+        live.apply_event(ClientPlayEvent::Play(PlayEvent::AddEntity {
+            eid: 9,
+            uuid: [1; 16],
+            entity_type: 42,
+            x: 1.0,
+            y: 64.0,
+            z: 2.0,
+            pitch: 0.0,
+            yaw: 0.0,
+            head_yaw: 0.0,
+            data: 0,
+            vx: 0.0,
+            vy: 0.0,
+            vz: 0.0,
+        }))
+        .unwrap();
+        assert_eq!(live.entity_rig(9).unwrap().name, "minecraft:fox");
+        assert_eq!(live.entity_mainhand_item_id(9), None);
+        live.apply_event(ClientPlayEvent::Play(PlayEvent::SetEquipment {
+            eid: 9,
+            entries: vec![
+                EquipmentEntry {
+                    slot: 0,
+                    item_wire: vec![1, 5, 0, 0],
+                },
+                EquipmentEntry {
+                    slot: 4,
+                    item_wire: vec![1, 7, 0, 0],
+                },
+            ],
+        }))
+        .unwrap();
+        // Slot 0 only — the boots entry must not leak into the main hand.
+        assert_eq!(live.entity_mainhand_item_id(9), Some(5));
     }
 
     #[test]
