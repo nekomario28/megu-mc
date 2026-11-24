@@ -57,6 +57,10 @@ jobs:
           # declared damage type, mob-AI goal placeholder, gamerule, status
           # effect and enchantment must be wired or explicitly waived.
           python3 tools/vanilla_mechanics_coverage_audit.py
+          # Reader-facing docs must resolve: every relative Markdown/HTML link in
+          # README*.md and docs/**/*.md points at a path in this tree, and no
+          # pre-release repository links the 404-prone /releases/latest.
+          python3 tools/docs_link_audit.py
           # Zero-JAR structural guards: pinned version constants stay routed
           # through megu_core::version, the V767 registry name tables stay
           # index-identical, and the server.properties key tables plus the

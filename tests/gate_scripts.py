@@ -45,6 +45,7 @@ WIRING_AUDIT = ROOT / "tools/wiring_connectivity_audit.py"
 VERSION_AUDIT = ROOT / "tools/version_constant_audit.py"
 REGISTRY_PARITY = ROOT / "tools/registry_table_parity.py"
 SERVER_FILES_PARITY = ROOT / "tools/server_files_parity.py"
+DOCS_LINK_AUDIT = ROOT / "tools/docs_link_audit.py"
 CONTROL = "running 1 test\ntest result: ok. 1 passed; 0 failed; 0 ignored"
 DIRTY = "// MEGU_DIRTY_MARKER"
 # The wire config the fixture plants: its bytes are what a copy has to carry, so the assertion names
@@ -1015,6 +1016,178 @@ def vanilla_mechanics_audit_cases(keep_going):
     return failures
 
 
+# ---------------------------------------------------------------------------
+# tools/docs_link_audit.py self-tests on synthetic doc trees. The gate exists to
+# make a dead reader-facing link a red build, so every case plants the defect it
+# is about and asserts the audit names it at file:line - and that the decoys
+# (code spans, fences, external URLs, anchors) cannot make it speak at all.
+# ---------------------------------------------------------------------------
+
+DOCS_LINK_CLEAN = {
+    "README.md": (
+        "# Megu\n"
+        "\n"
+        "[guide](docs/operator-guide.md) - [anchor](docs/operator-guide.md#install)\n"
+        "[site](https://megu.megumin.tech/) - [mail](mailto:dev@example.com) - "
+        "[jump](#downloads)\n"
+        "[ja](README.ja.md) - <a href=\"docs/architecture.md\">architecture</a> - "
+        "[dir](docs/)\n"
+    ),
+    "README.ja.md": "# 目次\n\n[en](README.md) - [docs](docs/operator-guide.md#install)\n",
+    "docs/operator-guide.md": (
+        "# Operator guide\n"
+        "\n"
+        "[back](../README.md) - [arch](architecture.md#crates) - [licence](../LICENSE)\n"
+    ),
+    "docs/architecture.md": "# Architecture\n\n## Crates\n\n[guide](operator-guide.md)\n",
+    "LICENSE": "GNU LESSER GENERAL PUBLIC LICENSE\n",
+}
+
+# The `[gone]` link sits on line 4 of each README, so the assertion is a line number
+# the report has to compute, not one the fixture told it.
+DOCS_LINK_BROKEN = dict(DOCS_LINK_CLEAN, **{
+    "README.md": "# Megu\n\n[guide](docs/operator-guide.md)\n[gone](docs/missing-guide.md)\n",
+})
+
+DOCS_LINK_BROKEN_JA = dict(DOCS_LINK_CLEAN, **{
+    "README.ja.md": "# 目次\n\n[en](README.md)\n[gone](docs/missing-guide.md)\n",
+})
+
+DOCS_LINK_CODE = dict(DOCS_LINK_CLEAN, **{
+    "README.md": (
+        "# Megu\n"
+        "\n"
+        "`[inline](docs/inline-missing.md)`\n"
+        "\n"
+        "```md\n`[nested](docs/nested-missing.md)`\n[fenced](docs/fenced-missing.md)\n```\n"
+        "\n"
+        "~~~\n[tilde](docs/tilde-missing.md)\n~~~\n"
+        "\n"
+        "[real](docs/operator-guide.md)\n"
+    ),
+})
+
+DOCS_LINK_PRE_RELEASE = dict(DOCS_LINK_CLEAN, **{
+    "README.md": (
+        "# Megu\n"
+        "\n"
+        "[Downloads](https://github.com/nekomario28/megu-mc/releases/latest)\n"
+        "<a href=\"https://github.com/nekomario28/megu-mc/releases/latest\">badge</a>\n"
+        "[all releases](https://github.com/nekomario28/megu-mc/releases)\n"
+    ),
+    # A docs page, not a README: the scan covers docs/**/*.md as well.
+    "docs/operator-guide.md": (
+        "# Operator guide\n"
+        "\n"
+        "[build](https://github.com/nekomario28/megu-mc/releases/latest/download/megu.tar.gz)\n"
+    ),
+})
+
+DOCS_LINK_HTML = dict(DOCS_LINK_CLEAN, **{
+    "docs/operator-guide.md": (
+        "# Operator guide\n"
+        "\n"
+        "<a href=\"../missing.md\">stale anchor</a>\n"
+    ),
+})
+
+DOCS_LINK_ESCAPE = dict(DOCS_LINK_CLEAN, **{
+    "docs/operator-guide.md": (
+        "# Operator guide\n"
+        "\n"
+        "[outside](../../outside-the-repo.md)\n"
+    ),
+})
+
+
+def docs_fixture(root, files):
+    for rel, text in files.items():
+        path = root / rel
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(text)
+
+
+def run_docs_link_audit(root, *args):
+    return subprocess.run(
+        [sys.executable, str(DOCS_LINK_AUDIT), "--root", str(root), *args],
+        capture_output=True, text=True, timeout=120)
+
+
+def docs_link_audit_cases(keep_going):
+    """Each case asserts the dead-link detector's exit and file:line contract."""
+    failures = []
+    # (name, files, argv, want_rc, required, absent)
+    cases = [
+        ("valid relative links, anchors and external URLs pass",
+         DOCS_LINK_CLEAN, (), 0, ("PASS", "relative link"), ()),
+        ("broken relative link is reported at file:line",
+         DOCS_LINK_BROKEN, (), 1,
+         ("README.md:4", "docs/missing-guide.md", "does not exist"),
+         ("PASS",)),
+        ("the Japanese README is scanned too",
+         DOCS_LINK_BROKEN_JA, (), 1,
+         ("README.ja.md:4", "docs/missing-guide.md"), ()),
+        ("fenced and inline code spans are not links",
+         DOCS_LINK_CODE, (), 0, ("PASS",),
+         ("inline-missing.md", "nested-missing.md", "fenced-missing.md",
+          "tilde-missing.md")),
+        ("pre-release /releases/latest is flagged",
+         DOCS_LINK_PRE_RELEASE, (), 1,
+         ("README.md:3", "README.md:4", "releases/latest",
+          "docs/operator-guide.md:3"),
+         ("PASS",)),
+        ("a broken HTML anchor is a broken link",
+         DOCS_LINK_HTML, (), 1,
+         ("docs/operator-guide.md:3", "../missing.md"), ()),
+        ("a link leaving the repository root is flagged",
+         DOCS_LINK_ESCAPE, (), 1,
+         ("docs/operator-guide.md:3", "escapes the repository root"), ()),
+        # A scan that finds no document reports zero broken links, so a wrong --root
+        # has to be an error rather than the cleanest possible pass.
+        ("a root with no documents is an error, not a pass",
+         {}, (), 2, ("no documents",), ("PASS",)),
+        ("--json exposes the clean report shape",
+         DOCS_LINK_CLEAN, ("--json",), 0, (), ()),
+        ("--json exposes every violation",
+         DOCS_LINK_BROKEN, ("--json",), 1, (), ()),
+    ]
+    for name, files, argv, want_rc, markers, absent in cases:
+        with tempfile.TemporaryDirectory(prefix="docs-link-audit-") as tmp:
+            root = Path(tmp)
+            docs_fixture(root, files)
+            try:
+                result = run_docs_link_audit(root, *argv)
+                log = result.stdout + result.stderr
+                assert result.returncode == want_rc, (
+                    f"expected exit {want_rc}, got {result.returncode}\n{log}")
+                for marker in markers:
+                    assert marker in log, f"{marker!r} not in report\n{log}"
+                for marker in absent:
+                    assert marker not in log, (
+                        f"{marker!r} was reported although it is not a link\n{log}")
+                if "--json" in argv:
+                    parsed = json.loads(result.stdout)
+                    assert parsed["ok"] is (want_rc == 0), parsed
+                    assert parsed["count"] == len(parsed["violations"]), parsed
+                    assert {"root", "ok", "files", "links_checked",
+                            "external_links", "violations", "count"} <= set(parsed), parsed
+                    if want_rc == 0:
+                        assert parsed["links_checked"] > 0, parsed
+                        assert parsed["violations"] == [], parsed
+                    for violation in parsed["violations"]:
+                        assert {"kind", "file", "line", "target",
+                                "reason"} <= set(violation), violation
+                        assert isinstance(violation["line"], int), violation
+            except (AssertionError, ValueError) as error:
+                if not keep_going:
+                    raise
+                failures.append(name)
+                print(f"docs link audit self-test: {name} FAIL\n{error}")
+                continue
+            print(f"docs link audit self-test: {name} PASS")
+    return failures
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--script", default=None,
@@ -1148,6 +1321,8 @@ def main():
                     for name in structural_audit_cases(options.keep_going))
     failures.extend(f"vanilla-mechanics: {name}"
                     for name in vanilla_mechanics_audit_cases(options.keep_going))
+    failures.extend(f"docs-links: {name}"
+                    for name in docs_link_audit_cases(options.keep_going))
 
     if failures:
         print(f"gate self-test: {len(failures)} case(s) failed: {', '.join(failures)}")
