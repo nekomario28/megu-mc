@@ -205,7 +205,7 @@ fn weird_sampler_production_evaluation_scales_all_axes_with_real_normal() {
             _ => unreachable!(),
         };
         let mut found_positive = false;
-        let mut memo = HashMap::new();
+        let mut memo = crate::worldgen::FlatMemo::default();
         'search: for y in (-64..=320).step_by(16) {
             for z in (-64..=64).step_by(8) {
                 for x in (-64..=64).step_by(8) {
@@ -214,7 +214,7 @@ fn weird_sampler_production_evaluation_scales_all_axes_with_real_normal() {
                     if actual <= 0.0 {
                         continue;
                     }
-                    let mut input_memo = HashMap::new();
+                    let mut input_memo = crate::worldgen::FlatMemo::default();
                     let raw = g.eval(input, x, y, z, &mut input_memo);
                     let rarity = mapper.rarity(raw);
                     let expected = rarity
@@ -345,7 +345,7 @@ fn weird_sampler_installed_nodes_are_nonzero() {
                 .expect("installed weird sampler must parse");
             let values: Vec<_> = [(17, -23, 41), (-97, 63, -131), (4097, -61, -8189)]
                 .into_iter()
-                .map(|(x, y, z)| g.eval(id, x, y, z, &mut HashMap::new()))
+                .map(|(x, y, z)| g.eval(id, x, y, z, &mut crate::worldgen::FlatMemo::default()))
                 .collect();
             assert!(
                 values.iter().any(|value| *value > 0.0),
@@ -435,7 +435,7 @@ fn weird_sampler_matches_native_mapper_and_samples() {
                     r#"{{"type":"minecraft:weird_scaled_sampler","input":{input},"noise":"{noise}","rarity_value_mapper":"{mapper_name}"}}"#
                 );
                 let node = g.node(&jparse(json.as_bytes()).unwrap(), &files).unwrap();
-                let actual = g.eval(node, pos[0], pos[1], pos[2], &mut HashMap::new());
+                let actual = g.eval(node, pos[0], pos[1], pos[2], &mut crate::worldgen::FlatMemo::default());
                 assert_eq!(
                     actual.to_bits(),
                     weird_bits(expected.get("value_bits").unwrap()),
@@ -491,13 +491,13 @@ fn weird_sampler_uses_the_callers_interpolation_context() {
         carve_sched: None,
     };
     cc.grids[interp] = Some(vec![1.0; 5 * 5 * 2].into_boxed_slice());
-    let actual = g.eval_c(node, 3, 4, 5, &mut HashMap::new(), Some(&cc));
+    let actual = g.eval_c(node, 3, 4, 5, &mut crate::worldgen::FlatMemo::default(), Some(&cc));
     let expected = 2.0 * g.noises[ni].get(1.5, 2.0, 2.5).abs();
     assert!(actual > 0.0);
     assert_eq!(actual.to_bits(), expected.to_bits());
     assert_ne!(
         actual.to_bits(),
-        g.eval(node, 3, 4, 5, &mut HashMap::new()).to_bits(),
+        g.eval(node, 3, 4, 5, &mut crate::worldgen::FlatMemo::default()).to_bits(),
         "context control must differ"
     );
 }

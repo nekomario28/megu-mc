@@ -1710,6 +1710,54 @@ fn element_bounding_box<D: JigsawData>(
     }
 }
 
+/// The template's jigsaw blocks rotated to `rot` at position `(0,0,0)`, extracted
+/// once per `(template, rotation)` and shared. The pool attach loop asks for this
+/// list once per candidate x rotation x parent piece — that is per element the
+/// palette scan, the per-block `transform_state` and, most of all, the NBT
+/// `BTreeMap` deep clone of every jigsaw block, repeated hundreds of times for a
+/// handful of templates. `Arc` entries make the per-call vector clone free; the
+/// shuffle and sort that follow still run on the caller's RNG so the produced
+/// order is unchanged.
+fn rotated_jigsaws(
+    tpl: &std::sync::Arc<Template>,
+    rot: Rotation,
+    reg: &BReg,
+) -> Vec<std::sync::Arc<BlockInfo>> {
+    thread_local! {
+        // Keyed by the template's Arc identity so an entry can never outlive a
+        // reload and answer for a different template at a reused address.
+        static ROTATED_JIGSAWS: std::cell::RefCell<
+            HashMap<(usize, u8), (std::sync::Weak<Template>, Vec<std::sync::Arc<BlockInfo>>)>,
+        > = std::cell::RefCell::new(HashMap::new());
+    }
+    let key = (std::sync::Arc::as_ptr(tpl) as usize, rot as u8);
+    if let Some((weak, list)) = ROTATED_JIGSAWS.with(|c| c.borrow().get(&key).cloned()) {
+        if weak.upgrade().is_some_and(|a| std::sync::Arc::ptr_eq(&a, tpl)) {
+            return list;
+        }
+    }
+    let list: Vec<std::sync::Arc<BlockInfo>> = match tpl.palettes.first() {
+        None => Vec::new(),
+        Some(pal) => pal
+            .iter()
+            .filter(|b| reg.name_of(b.state) == "minecraft:jigsaw")
+            .map(|b| {
+                let tp = transform_block(b.pos, Mirror::None, rot, (0, 0, 0));
+                std::sync::Arc::new(BlockInfo {
+                    pos: tp,
+                    state: transform_state(b.state, Mirror::None, rot).unwrap_or(b.state),
+                    nbt: b.nbt.clone(),
+                })
+            })
+            .collect(),
+    };
+    ROTATED_JIGSAWS.with(|c| {
+        c.borrow_mut()
+            .insert(key, (std::sync::Arc::downgrade(tpl), list.clone()))
+    });
+    list
+}
+
 fn element_shuffled_jigsaws<D: JigsawData>(
     repo: &mut D,
     el: &PoolElement,
@@ -1717,7 +1765,7 @@ fn element_shuffled_jigsaws<D: JigsawData>(
     rot: Rotation,
     rng: &mut Lcg,
     reg: &BReg,
-) -> Result<Vec<BlockInfo>, String> {
+) -> Result<Vec<std::sync::Arc<BlockInfo>>, String> {
     match el {
         PoolElement::Empty => Ok(Vec::new()),
         PoolElement::Feature { .. } => {
@@ -1746,33 +1794,34 @@ fn element_shuffled_jigsaws<D: JigsawData>(
                     Tag::String(crate::nbt::NbtString::text("rollable")),
                 ),
             ]));
-            Ok(vec![BlockInfo {
+            Ok(vec![std::sync::Arc::new(BlockInfo {
                 pos,
                 state,
                 nbt: Some(nbt),
-            }])
+            })])
         }
         PoolElement::Single { location, .. } | PoolElement::LegacySingle { location, .. } => {
             let tpl = repo.template(location, reg)?;
-            let mut list: Vec<BlockInfo> = match tpl.palettes.first() {
-                None => Vec::new(),
-                Some(pal) => pal
+            let mut list: Vec<std::sync::Arc<BlockInfo>> = if pos == (0, 0, 0) {
+                rotated_jigsaws(&tpl, rot, reg)
+            } else {
+                // A nonzero offset bakes into `pos`, so the shared entries cannot
+                // be returned as-is; this path is once per parent piece, not per
+                // candidate, so the block copy stays cheap overall.
+                rotated_jigsaws(&tpl, rot, reg)
                     .iter()
-                    .filter(|b| reg.name_of(b.state) == "minecraft:jigsaw")
                     .map(|b| {
-                        let tp = transform_block(b.pos, Mirror::None, rot, (0, 0, 0));
-                        BlockInfo {
+                        std::sync::Arc::new(BlockInfo {
                             pos: (
-                                tp.0.wrapping_add(pos.0),
-                                tp.1.wrapping_add(pos.1),
-                                tp.2.wrapping_add(pos.2),
+                                b.pos.0.wrapping_add(pos.0),
+                                b.pos.1.wrapping_add(pos.1),
+                                b.pos.2.wrapping_add(pos.2),
                             ),
-                            state: transform_state(b.state, Mirror::None, rot)
-                                .unwrap_or(b.state),
+                            state: b.state,
                             nbt: b.nbt.clone(),
-                        }
+                        })
                     })
-                    .collect(),
+                    .collect()
             };
             util_shuffle(&mut list, rng);
             // Stable sort descending by selection_priority (default 0)
@@ -2156,7 +2205,7 @@ fn generate_pieces_with_hm<D: JigsawData, W: JigsawWorld>(
                             };
 
                         for cand_jig in &cand_jigs {
-                            if !jigsaws_can_attach(&p_jig, cand_jig, reg) {
+                            if !jigsaws_can_attach(&p_jig, cand_jig.as_ref(), reg) {
                                 continue;
                             }
                             let cj_pos = cand_jig.pos;

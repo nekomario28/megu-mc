@@ -182,9 +182,12 @@ ln -s "$ROOT/assets" "$SPINE_DIR/assets"
 # driver reaches finish-configuration without a pack handshake. Anti-cheat off: the
 # driver climbs 4 blocks per packet with no world model, which vanilla only accepts
 # because it runs in creative; a survival megu viewer would be pulled back.
+# MEGU_ALLOW_FLIGHT mirrors vanilla's `allow-flight` server property: the airborne
+# driver is kicked by the 80-tick floating check otherwise — the same check vanilla
+# exempts because the driver joins in creative, which megu's driver does not emulate.
 ( cd "$SPINE_DIR" && MEGU_PORT="$SPINE_PORT" MEGU_SEED="$SEED" MEGU_RESOURCE_PACK_URL="" \
     MEGU_COMPRESSION_THRESHOLD=-1 \
-    MEGU_ANTICHEAT=off exec "$ROOT/target/release/megu" ) > "$SPINE_DIR/spine.log" 2>&1 &
+    MEGU_ALLOW_FLIGHT=1 MEGU_ANTICHEAT=off exec "$ROOT/target/release/megu" ) > "$SPINE_DIR/spine.log" 2>&1 &
 SPID=$!
 wait_for_line "$SPINE_DIR/spine.log" "$SPID" 'listening' 60
 SPI=$(sample_load "$SPID" "$SPINE_PORT" "$WORK/spine-load.txt")

@@ -30,6 +30,94 @@ use crate::json::{jbool, jparse, J};
 use crate::generation_math::*;
 use crate::trace_env::{env_flag, env_str};
 
+/// Multiply-mix hasher for the generator's small integer coordinate keys
+/// (`(i32, i32)` chunks, `(i32, i32, i32)` cells and sections, packed `u32`s).
+/// SipHash on these keys is pure overhead — the maps below are probed
+/// millions of times per chunk batch (`terr_c`, `feat_c`, `rc`, `col_c`) and
+/// are never iterated for output, so a weaker-but-faster hash is a free win.
+/// hashbrown reads the low bits for the bucket and the top 7 for the tag; the
+/// xor-shift in `push` folds high entropy down before `finish`.
+#[derive(Default, Clone)]
+pub(crate) struct CoordHasher(u64);
+
+impl CoordHasher {
+    const SEED: u64 = 0x9E37_79B9_7F4A_7C15;
+    #[inline(always)]
+    fn push(&mut self, v: u64) {
+        self.0 = (self.0 ^ v).wrapping_mul(Self::SEED);
+        self.0 ^= self.0 >> 30;
+    }
+}
+
+impl std::hash::Hasher for CoordHasher {
+    #[inline]
+    fn finish(&self) -> u64 {
+        self.0
+    }
+    #[inline]
+    fn write(&mut self, bytes: &[u8]) {
+        for chunk in bytes.chunks(8) {
+            let mut buf = [0u8; 8];
+            buf[..chunk.len()].copy_from_slice(chunk);
+            self.push(u64::from_le_bytes(buf));
+        }
+    }
+    #[inline]
+    fn write_u8(&mut self, v: u8) {
+        self.push(v as u64);
+    }
+    #[inline]
+    fn write_u16(&mut self, v: u16) {
+        self.push(v as u64);
+    }
+    #[inline]
+    fn write_u32(&mut self, v: u32) {
+        self.push(v as u64);
+    }
+    #[inline]
+    fn write_u64(&mut self, v: u64) {
+        self.push(v);
+    }
+    #[inline]
+    fn write_u128(&mut self, v: u128) {
+        self.push(v as u64);
+        self.push((v >> 64) as u64);
+    }
+    #[inline]
+    fn write_usize(&mut self, v: usize) {
+        self.push(v as u64);
+    }
+    #[inline]
+    fn write_i8(&mut self, v: i8) {
+        self.push(v as u64);
+    }
+    #[inline]
+    fn write_i16(&mut self, v: i16) {
+        self.push(v as u64);
+    }
+    #[inline]
+    fn write_i32(&mut self, v: i32) {
+        self.push(v as u64);
+    }
+    #[inline]
+    fn write_i64(&mut self, v: i64) {
+        self.push(v as u64);
+    }
+    #[inline]
+    fn write_i128(&mut self, v: i128) {
+        self.push(v as u64);
+        self.push((v >> 64) as u64);
+    }
+    #[inline]
+    fn write_isize(&mut self, v: isize) {
+        self.push(v as u64);
+    }
+}
+
+pub(crate) type CoordBuild = std::hash::BuildHasherDefault<CoordHasher>;
+pub(crate) type CoordMap<K, V> = HashMap<K, V, CoordBuild>;
+pub(crate) type CoordSet<K> = HashSet<K, CoordBuild>;
+
 // ---------- worldgen datapack parse diagnostics ----------
 
 /// One worldgen datapack entry that failed to parse: the datapack directory
@@ -1842,7 +1930,7 @@ struct SC {
     est_min: i32,
     biome: Option<((i32, i32, i32), u16)>,
     nt: Vec<u8>, // per-column memo for 2d noise_threshold (0=unset, 1=false, 2=true)
-    memo: HashMap<(usize, i32, i32, i32), f64>,
+    memo: FlatMemo,
 }
 impl SC {
     fn new() -> SC {
@@ -1860,7 +1948,7 @@ impl SC {
             est_min: i32::MAX,
             biome: None,
             nt: Vec::new(),
-            memo: HashMap::new(),
+            memo: HashMap::default(),
         }
     }
     #[inline]
@@ -2295,9 +2383,9 @@ struct BaseColLazy {
     fz_zero: bool,
 }
 
-type ShapeMarkMap = HashMap<(i32, i32), Vec<(i32, i32, i32)>>;
+type ShapeMarkMap = CoordMap<(i32, i32), Vec<(i32, i32, i32)>>;
 type ShapeMarkBuckets = Vec<((i32, i32), Vec<(i32, i32, i32)>)>;
-type FlatMemo = HashMap<(usize, i32, i32, i32), f64>;
+pub(crate) type FlatMemo = CoordMap<(usize, i32, i32, i32), f64>;
 
 pub struct Gen {
     /// The immutable inputs. `Deref` keeps every existing field name working;
@@ -2317,28 +2405,28 @@ pub struct Gen {
     aq_chunk_use: [u64; AQ_CHUNK_SLOTS],
     aq_chunk_tick: u64,
     aq_cell12: AqCell12,
-    prelim_c: HashMap<(i32, i32), i32>,
+    prelim_c: CoordMap<(i32, i32), i32>,
     /// per chunk: the distinct biomes of its section palettes, i.e. what vanilla's
     /// `applyBiomeDecoration` unions over the 3x3 before deciding which features run
-    chunk_biomes: HashMap<(i32, i32), std::sync::Arc<Vec<String>>>,
+    chunk_biomes: CoordMap<(i32, i32), std::sync::Arc<Vec<String>>>,
     chunk_biomes_ord: std::collections::VecDeque<(i32, i32)>,
     prelim_ord: std::collections::VecDeque<(i32, i32)>,
-    clim_c: HashMap<(i32, i32), ([i64; 5], f64)>,
+    clim_c: CoordMap<(i32, i32), ([i64; 5], f64)>,
     clim_ord: std::collections::VecDeque<(i32, i32)>,
     // Paletted biome IDs by quart position for surface rules.
-    bioq: HashMap<(i32, i32, i32), u16>,
+    bioq: CoordMap<(i32, i32, i32), u16>,
     bioq_ord: std::collections::VecDeque<(i32, i32, i32)>,
     // Cached `biome_quart(qx, qy, qz, None)` answers (pure when `last` is None).
-    bioq_none: HashMap<(i32, i32, i32), u16>,
+    bioq_none: CoordMap<(i32, i32, i32), u16>,
     bioq_none_ord: std::collections::VecDeque<(i32, i32, i32)>,
     // Lazy single-column base heightmap cache `(x, z) -> (surf, wtop_or_i32_min)` plus
     // reusable scratch buffers so `top_ws`/`top_oc` during beardifier resolution never
     // have to compute a full 25-column × 49-level chunk grid for a single column query.
-    base_hm_c: HashMap<(i32, i32), (i32, i32)>,
+    base_hm_c: CoordMap<(i32, i32), (i32, i32)>,
     base_hm_cc: Option<Box<ChunkCols>>,
     base_hm_memos: Option<Box<[FlatCornerMemo; 4]>>,
     base_col_lazy: Option<Box<BaseColLazy>>,
-    col_c: HashMap<(i32, i32), std::sync::Arc<ChunkCols>>,
+    col_c: CoordMap<(i32, i32), std::sync::Arc<ChunkCols>>,
     col_ord: std::collections::VecDeque<(i32, i32)>,
     /// The parallel terrain round this generator belongs to, if any: selects that round's
     /// shared structure-start cache instead of the thread-local one. `Gen` cannot name the
@@ -2356,11 +2444,11 @@ pub struct Gen {
     /// `findGenerationPoint` scans. Keyed like `col_c` but *not* interchangeable with
     /// it: a base column has no beardifier and no surface rule, so it is pure in
     /// (seed, preset, chunk) and may be cached even while a beard is resolving.
-    base_c: HashMap<(i32, i32), std::sync::Arc<ChunkCols>>,
+    base_c: CoordMap<(i32, i32), std::sync::Arc<ChunkCols>>,
     base_ord: std::collections::VecDeque<(i32, i32)>,
     /// Per-chunk beardifier input, keyed like `col_c`. Pure in (seed, cx, cz): the
     /// resolver reads structure starts, which are functions of the seed only.
-    beard_c: HashMap<(i32, i32), std::sync::Arc<BeardChunkData>>,
+    beard_c: CoordMap<(i32, i32), std::sync::Arc<BeardChunkData>>,
     beard_ord: std::collections::VecDeque<(i32, i32)>,
     /// Per-generator resolver override (tests); the world registers a global one.
     beard_resolver: Option<BeardResolver>,
@@ -2374,7 +2462,7 @@ pub struct Gen {
     /// (`specs/chunk-parallelism`, lever 2): the rows are a pure function of the
     /// immutable data and the seed, so a scratch generator produces the same array the
     /// world generator would. Bounded by `TERRAIN_STORE_BOUND`.
-    terr_c: HashMap<(i32, i32, i32), std::sync::Arc<[u32; 4096]>>,
+    terr_c: CoordMap<(i32, i32, i32), std::sync::Arc<[u32; 4096]>>,
     terr_ord: std::collections::VecDeque<(i32, i32, i32)>,
     /// Sections installed into [`Gen::terr_c`] and not yet consumed by `terrain_section_at`,
     /// for the M3 P1a M4 counter only. Lives on the generator (not in a process-wide set)
@@ -2383,14 +2471,14 @@ pub struct Gen {
     /// `MEGU_M3_PROFILE`/`FEAT_PROFILE` is on.
     terr_pending: std::collections::BTreeSet<(i32, i32, i32)>,
     // feature layer: chunk -> {(y-min)<<8|z<<4|x -> state}
-    feat_c: HashMap<(i32, i32), HashMap<u32, u32>>,
+    feat_c: CoordMap<(i32, i32), CoordMap<u32, u32>>,
     /// Container contents staged by template placement during feature population.
     /// Generation-owned: they are moved into the runtime container store as soon as
     /// this generator's lock is released (see `block_state`), never kept as a second
     /// live store.
     staged_payloads: Vec<((i32, i32, i32), crate::generation_payload::GenerationPayload)>,
     feat_ord: std::collections::VecDeque<(i32, i32)>,
-    deep_c: HashMap<(i32, i32, i32), u32>,
+    deep_c: CoordMap<(i32, i32, i32), u32>,
     deep_ord: std::collections::VecDeque<(i32, i32, i32)>,
     pub(crate) pop_done: HashSet<(i32, i32)>,
     /// The window a recorded population plan covers (`None` outside a planned run): the
@@ -2413,7 +2501,7 @@ pub struct Gen {
     /// Which writer filed each mark, for `MARK_TRACE` only. Kept apart from
     /// [`Gen::shape_marks`] because the buckets are the answer and this is the audit of it;
     /// a position filed twice keeps its last writer.
-    mark_src: HashMap<(i32, i32, i32), MarkSrc>,
+    mark_src: CoordMap<(i32, i32, i32), MarkSrc>,
     /// `Aquifer.shouldScheduleFluidUpdate()` as of the last `computeSubstance` call on this
     /// generator, i.e. the port's `NoiseBasedAquifer.shouldScheduleFluidUpdate`. Vanilla keeps
     /// it as a mutable field on the aquifer object and three mark sites read it right after the
@@ -2429,7 +2517,7 @@ pub struct Gen {
     /// Sections whose terrain-stage marks are already in [`Gen::shape_marks`]. Keyed by
     /// section because that is the granularity `base_section_rows` decides and
     /// `terrain_section` can be asked for twice.
-    terrain_marked: HashSet<(i32, i32, i32)>,
+    terrain_marked: CoordSet<(i32, i32, i32)>,
     /// The chunk whose FEATURES pass is running (`None` outside one): the centre of the
     /// step's `blockStateWriteRadius` window. See `feature_write_allowed`.
     pub(crate) pop_active: Option<(i32, i32)>,
@@ -2441,7 +2529,7 @@ pub struct Gen {
     /// reads and both outputs the stage writes (see `CarveStage`). **Nothing else may
     /// hold a carve claim or a post-carve WG value** — three containers with three
     /// lifetimes let a claim outlive the output it stood for.
-    carve_c: HashMap<(i32, i32), CarveStage>,
+    carve_c: CoordMap<(i32, i32), CarveStage>,
     /// The `carve_c` records that carry a WG value, oldest first: the retention bound
     /// lives in exactly one place (`set_wg_after_carve`).
     carve_ord: std::collections::VecDeque<(i32, i32)>,
@@ -2456,7 +2544,7 @@ pub struct Gen {
     /// higher layer pulls the work instead of being called from here.
     pub(crate) a3a_dispatch: Option<Vec<(i32, i32)>>,
     // per column: (highest non-air + 1, highest solid + 1) written by the feature layer
-    feat_hm: HashMap<(i32, i32), (i32, i32)>,
+    feat_hm: CoordMap<(i32, i32), (i32, i32)>,
     // Each generator owns its pending ticks; only the active world's handles are published.
     generated_ticks: GeneratedTickQueues,
     /// The most precise `(id, reason)` a failed surface-rule parse recorded on
@@ -2754,7 +2842,7 @@ impl<K: std::hash::Hash + Eq + Clone, V: Clone> FlightCache<K, V> {
         FlightCache {
             bound,
             inner: Mutex::new(FlightCacheInner {
-                map: HashMap::new(),
+                map: HashMap::default(),
                 ord: std::collections::VecDeque::new(),
             }),
             #[cfg(test)]
@@ -2969,7 +3057,7 @@ impl TerrainShare {
             bases: FlightCache::new(Some(BASE_CACHE_CAP)),
             beards: FlightCache::new(Some(BEARD_CACHE_CAP)),
             cols: FlightCache::new(Some(COL_CACHE_CAP)),
-            base_surf: Mutex::new(HashMap::new()),
+            base_surf: Mutex::new(HashMap::default()),
         }
     }
 
@@ -2989,7 +3077,7 @@ static TERRAIN_SHARES: std::sync::OnceLock<Mutex<HashMap<u64, std::sync::Arc<Ter
     std::sync::OnceLock::new();
 
 fn terrain_shares() -> &'static Mutex<HashMap<u64, std::sync::Arc<TerrainShare>>> {
-    TERRAIN_SHARES.get_or_init(|| Mutex::new(HashMap::new()))
+    TERRAIN_SHARES.get_or_init(|| Mutex::new(HashMap::default()))
 }
 
 /// Open a round's shared terrain caches under the id its generators carry in
@@ -3612,7 +3700,7 @@ impl Gen {
     /// while a converted pack may use the newer `worldgen/feature`; both have to load,
     /// because the data is the reference and the conversion is not.
     pub(crate) fn dp_files_any(subdirs: &[&str]) -> HashMap<String, Vec<u8>> {
-        let mut m = HashMap::new();
+        let mut m = HashMap::default();
         for subdir in subdirs {
             for (k, v) in Self::dp_files_one(subdir) {
                 m.insert(k, v);
@@ -3622,7 +3710,7 @@ impl Gen {
     }
 
     fn dp_files_one(subdir: &str) -> HashMap<String, Vec<u8>> {
-        let mut m = HashMap::new();
+        let mut m = HashMap::default();
         {
             for p in Gen::packs() {
                 let root = p.join("data");
@@ -3696,7 +3784,7 @@ impl Gen {
                 };
                 let noaq = std::env::var_os("MEGU_NOAQ").is_some();
                 let key = (seed, preset_id, res as usize, noaq, Self::packs());
-                let cache = CACHE.get_or_init(|| Mutex::new(HashMap::new()));
+                let cache = CACHE.get_or_init(|| Mutex::new(HashMap::default()));
                 if let Some(hit) = cache.lock().unwrap_or_else(|e| e.into_inner()).get(&key) {
                     return hit
                         .as_ref()
@@ -3747,9 +3835,9 @@ impl Gen {
             data: std::sync::Arc::new(GenData {
                 preset,
                 dfs: vec![],
-                names: HashMap::new(),
+                names: HashMap::default(),
                 noises: vec![],
-                noise_names: HashMap::new(),
+                noise_names: HashMap::default(),
                 factory: Xor::seed(seed).splitter(),
                 base: String::new(),
                 final_density: 0,
@@ -3771,9 +3859,9 @@ impl Gen {
                 legacy_random_source: false,
                 rules: vec![],
                 conds: vec![],
-                rule_ids: HashMap::new(),
-                cond_ids: HashMap::new(),
-                bleaf: HashMap::new(),
+                rule_ids: HashMap::default(),
+                cond_ids: HashMap::default(),
+                bleaf: HashMap::default(),
                 surface_rule: None,
                 deep_fast: None,
                 prelim_df: None,
@@ -3804,50 +3892,50 @@ impl Gen {
             aq_chunk_use: [0; AQ_CHUNK_SLOTS],
             aq_chunk_tick: 0,
             aq_cell12: AqCell12::empty(),
-            prelim_c: HashMap::new(),
-            chunk_biomes: HashMap::new(),
+            prelim_c: HashMap::default(),
+            chunk_biomes: HashMap::default(),
             chunk_biomes_ord: std::collections::VecDeque::new(),
             prelim_ord: std::collections::VecDeque::new(),
-            clim_c: HashMap::new(),
+            clim_c: HashMap::default(),
             clim_ord: std::collections::VecDeque::new(),
-            bioq: HashMap::new(),
+            bioq: HashMap::default(),
             bioq_ord: std::collections::VecDeque::new(),
-            bioq_none: HashMap::new(),
+            bioq_none: HashMap::default(),
             bioq_none_ord: std::collections::VecDeque::new(),
-            base_hm_c: HashMap::new(),
+            base_hm_c: HashMap::default(),
             base_hm_cc: None,
             base_hm_memos: None,
             base_col_lazy: None,
-            col_c: HashMap::new(),
+            col_c: HashMap::default(),
             col_ord: std::collections::VecDeque::new(),
             starts_round: None,
             share_slot: None,
-            base_c: HashMap::new(),
+            base_c: HashMap::default(),
             base_ord: std::collections::VecDeque::new(),
-            beard_c: HashMap::new(),
+            beard_c: HashMap::default(),
             beard_ord: std::collections::VecDeque::new(),
             beard_resolver: None,
             beard_depth: 0,
-            terr_c: HashMap::new(),
+            terr_c: HashMap::default(),
             terr_ord: std::collections::VecDeque::new(),
             terr_pending: std::collections::BTreeSet::new(),
-            feat_c: HashMap::new(),
+            feat_c: HashMap::default(),
             staged_payloads: Vec::new(),
             feat_ord: std::collections::VecDeque::new(),
-            deep_c: HashMap::new(),
+            deep_c: HashMap::default(),
             deep_ord: std::collections::VecDeque::new(),
             pop_done: HashSet::new(),
             pop_plan_window: None,
-            shape_marks: HashMap::new(),
+            shape_marks: HashMap::default(),
             mark_pool: Vec::new(),
-            mark_src: HashMap::new(),
+            mark_src: HashMap::default(),
             aq_sched: false,
             aq_calls: 0,
-            terrain_marked: HashSet::new(),
+            terrain_marked: HashSet::default(),
             pop_active: None,
             restored_tick_sources: HashSet::new(),
             suppress_generated_ticks: false,
-            carve_c: HashMap::new(),
+            carve_c: HashMap::default(),
             carve_ord: std::collections::VecDeque::new(),
             pop_region: std::env::var("MEGU_POP_REGION").ok().and_then(|v| {
                 let p: Vec<i32> = v.split(',').filter_map(|n| n.parse().ok()).collect();
@@ -3858,12 +3946,12 @@ impl Gen {
                 }
             }),
             a3a_dispatch: None,
-            memo: HashMap::new(),
+            memo: HashMap::default(),
             corner_memo: None,
             dfcol_scratch: None,
             mineshaft_spawners: HashSet::new(),
             payload_sources: HashSet::new(),
-            feat_hm: HashMap::new(),
+            feat_hm: HashMap::default(),
             rule_diag: None,
             generated_ticks: GeneratedTickQueues::default(),
         };
@@ -4925,13 +5013,13 @@ impl Gen {
         out
     }
 
-    pub(crate) fn eval(
+     pub(crate) fn eval(
         &self,
         id: usize,
         x: i32,
         y: i32,
         z: i32,
-        memo: &mut HashMap<(usize, i32, i32, i32), f64>,
+        memo: &mut FlatMemo,
     ) -> f64 {
         self.eval_c(id, x, y, z, memo, None)
     }
@@ -4941,13 +5029,13 @@ impl Gen {
     /// grid instead of evaluating its input at block resolution (vanilla
     /// NoiseChunk). While the grids are being filled `cc` is None, which is a
     /// corner sample.
-    fn eval_c(
+     fn eval_c(
         &self,
         id: usize,
         x: i32,
         y: i32,
         z: i32,
-        memo: &mut HashMap<(usize, i32, i32, i32), f64>,
+        memo: &mut FlatMemo,
         cc: Option<&ChunkCols>,
     ) -> f64 {
         if wg_count() {
@@ -4982,7 +5070,7 @@ impl Gen {
         if let Some(prog) = self.dfprog.as_ref() {
             return prog.eval(self, Some(cc), x, y, z);
         }
-        let mut memo = HashMap::new();
+        let mut memo = HashMap::default();
         self.eval_c(self.final_density, x, y, z, &mut memo, Some(cc))
     }
 
@@ -5001,7 +5089,7 @@ impl Gen {
         }
         let mut out = [0.0f64; DF4];
         for (k, o) in out.iter_mut().enumerate() {
-            let mut memo = HashMap::new();
+            let mut memo = HashMap::default();
             *o = self.eval_c(self.final_density, x + k as i32, y, z, &mut memo, Some(cc));
         }
         out
@@ -5018,7 +5106,7 @@ impl Gen {
         }
         let mut out = [0.0f64; DF8];
         for (k, o) in out.iter_mut().enumerate() {
-            let mut memo = HashMap::new();
+            let mut memo = HashMap::default();
             *o = self.eval_c(self.final_density, x + k as i32, y, z, &mut memo, Some(cc));
         }
         out
@@ -5063,13 +5151,13 @@ impl Gen {
         self.interp_ids_from(&roots)
     }
 
-    fn eval_spline_c(
+     fn eval_spline_c(
         &self,
         s: &Spl,
         x: i32,
         y: i32,
         z: i32,
-        memo: &mut HashMap<(usize, i32, i32, i32), f64>,
+        memo: &mut FlatMemo,
         cc: Option<&ChunkCols>,
     ) -> f64 {
         // CubicSpline stores locations/derivatives/constants as f32 and casts
@@ -5103,13 +5191,13 @@ impl Gen {
         (lerp(t, v0, v1) + t * (1.0 - t) * lerp(t, d0t, d1t)) as f64
     }
 
-    fn eval0_c(
+     fn eval0_c(
         &self,
         id: usize,
         x: i32,
         y: i32,
         z: i32,
-        memo: &mut HashMap<(usize, i32, i32, i32), f64>,
+        memo: &mut FlatMemo,
         cc: Option<&ChunkCols>,
     ) -> f64 {
         match &self.dfs[id] {
@@ -5422,7 +5510,7 @@ impl Gen {
                 // The inner scan evaluates `density` at other `yy` values; route it
                 // through the scalar interpreter with its own memo so those 3D `Cache`
                 // lookups cannot be mistaken for this corner's generation.
-                let mut sm = HashMap::new();
+                let mut sm = HashMap::default();
                 let ub = self.eval_c(*upper, x, 0, z, &mut sm, None) as i32;
                 let mut yy = ub.div_euclid(*cell_h) * *cell_h;
                 while yy >= *lower {
@@ -5908,7 +5996,7 @@ fn df_run(
                         m.clear();
                         g.eval_c(id as usize, x, y, z, m, cc)
                     } else {
-                        let mut memo = HashMap::new();
+                        let mut memo = HashMap::default();
                         g.eval_c(id as usize, x, y, z, &mut memo, cc)
                     };
                     sp += 1;
@@ -6029,7 +6117,7 @@ struct DfColScratch {
     /// The memo `Op::Call` would otherwise allocate fresh on every dispatch;
     /// it is cleared per call, so the reuse changes nothing but the
     /// allocation.
-    cm: HashMap<(usize, i32, i32, i32), f64>,
+    cm: FlatMemo,
 }
 
 impl DfCols {
@@ -6797,7 +6885,7 @@ unsafe fn run4_avx2(
                 Op::Call(id) => {
                     let mut r = [0.0f64; DF4];
                     for (k, o) in r.iter_mut().enumerate() {
-                        let mut memo = HashMap::new();
+                        let mut memo = HashMap::default();
                         *o = g.eval_c(id as usize, x + k as i32, y, z, &mut memo, cc);
                     }
                     wr!(sp, v4_from_arr(r));
@@ -7172,7 +7260,7 @@ unsafe fn run8_avx512(
                 }
                 Op::Call(id) => {
                     let r: [f64; DF8] = std::array::from_fn(|k| {
-                        let mut memo = HashMap::new();
+                        let mut memo = HashMap::default();
                         g.eval_c(id as usize, x + k as i32, y, z, &mut memo, cc)
                     });
                     wr!(sp, v8_from_arr(r));
@@ -7559,7 +7647,7 @@ unsafe fn run4y_avx2(
                 Op::Call(id) => {
                     let mut r = [0.0f64; DF4];
                     for (k, o) in r.iter_mut().enumerate() {
-                        let mut memo = HashMap::new();
+                        let mut memo = HashMap::default();
                         *o = g.eval_c(
                             id as usize,
                             x,
@@ -7947,7 +8035,7 @@ unsafe fn run8y_avx512(
                 }
                 Op::Call(id) => {
                     let r: [f64; DF8] = std::array::from_fn(|k| {
-                        let mut memo = HashMap::new();
+                        let mut memo = HashMap::default();
                         g.eval_c(
                             id as usize,
                             x,
@@ -8582,7 +8670,7 @@ impl Gen {
                 let mut levels = (self.min_y..=start).rev().step_by(step as usize);
                 let found = if wg_count() {
                     levels.find(|&y| {
-                        self.eval(density, ax, y, az, &mut HashMap::new()) > threshold
+                        self.eval(density, ax, y, az, &mut HashMap::default()) > threshold
                     })
                 } else {
                     // The corner evaluator already separates values fixed for this
@@ -9436,8 +9524,8 @@ pub(crate) fn population_discipline(requests: &[(i32, i32)]) -> Vec<PopBatch> {
     // One FIFO bucket per level, and the pop order is by level: a `BTreeMap` is the whole queue.
     let mut buckets: std::collections::BTreeMap<i32, std::collections::VecDeque<(i32, i32)>> =
         std::collections::BTreeMap::new();
-    let mut queued: HashSet<(i32, i32)> = HashSet::new();
-    let mut decorated: HashSet<(i32, i32)> = HashSet::new();
+    let mut queued: HashSet<(i32, i32)> = HashSet::default();
+    let mut decorated: HashSet<(i32, i32)> = HashSet::default();
     for &request in requests {
         if queued.insert(request) {
             buckets
@@ -10166,57 +10254,57 @@ impl Gen {
     pub(crate) fn fresh_scratch(data: std::sync::Arc<GenData>) -> Gen {
         Gen {
             data,
-            memo: HashMap::new(),
+            memo: HashMap::default(),
             corner_memo: None,
             dfcol_scratch: None,
             aq_chunk: std::array::from_fn(|_| None),
             aq_chunk_use: [0; AQ_CHUNK_SLOTS],
             aq_chunk_tick: 0,
             aq_cell12: AqCell12::empty(),
-            prelim_c: HashMap::new(),
-            chunk_biomes: HashMap::new(),
+            prelim_c: HashMap::default(),
+            chunk_biomes: HashMap::default(),
             chunk_biomes_ord: std::collections::VecDeque::new(),
             prelim_ord: std::collections::VecDeque::new(),
-            clim_c: HashMap::new(),
+            clim_c: HashMap::default(),
             clim_ord: std::collections::VecDeque::new(),
-            bioq: HashMap::new(),
+            bioq: HashMap::default(),
             bioq_ord: std::collections::VecDeque::new(),
-            bioq_none: HashMap::new(),
+            bioq_none: HashMap::default(),
             bioq_none_ord: std::collections::VecDeque::new(),
-            base_hm_c: HashMap::new(),
+            base_hm_c: HashMap::default(),
             base_hm_cc: None,
             base_hm_memos: None,
             base_col_lazy: None,
-            col_c: HashMap::new(),
+            col_c: HashMap::default(),
             col_ord: std::collections::VecDeque::new(),
             starts_round: None,
             share_slot: None,
-            base_c: HashMap::new(),
+            base_c: HashMap::default(),
             base_ord: std::collections::VecDeque::new(),
-            beard_c: HashMap::new(),
+            beard_c: HashMap::default(),
             beard_ord: std::collections::VecDeque::new(),
             beard_resolver: None,
             beard_depth: 0,
-            terr_c: HashMap::new(),
+            terr_c: HashMap::default(),
             terr_ord: std::collections::VecDeque::new(),
             terr_pending: std::collections::BTreeSet::new(),
-            feat_c: HashMap::new(),
+            feat_c: HashMap::default(),
             staged_payloads: Vec::new(),
             feat_ord: std::collections::VecDeque::new(),
-            deep_c: HashMap::new(),
+            deep_c: HashMap::default(),
             deep_ord: std::collections::VecDeque::new(),
             pop_done: HashSet::new(),
             pop_plan_window: None,
-            shape_marks: HashMap::new(),
+            shape_marks: HashMap::default(),
             mark_pool: Vec::new(),
-            mark_src: HashMap::new(),
+            mark_src: HashMap::default(),
             aq_sched: false,
             aq_calls: 0,
-            terrain_marked: HashSet::new(),
+            terrain_marked: HashSet::default(),
             pop_active: None,
             restored_tick_sources: HashSet::new(),
             suppress_generated_ticks: false,
-            carve_c: HashMap::new(),
+            carve_c: HashMap::default(),
             carve_ord: std::collections::VecDeque::new(),
             pop_region: std::env::var("MEGU_POP_REGION").ok().and_then(|v| {
                 let p: Vec<i32> = v.split(',').filter_map(|n| n.parse().ok()).collect();
@@ -10229,7 +10317,7 @@ impl Gen {
             a3a_dispatch: None,
             mineshaft_spawners: HashSet::new(),
             payload_sources: HashSet::new(),
-            feat_hm: HashMap::new(),
+            feat_hm: HashMap::default(),
             generated_ticks: GeneratedTickQueues::default(),
             rule_diag: None,
         }
@@ -11276,7 +11364,7 @@ impl Gen {
         // when diagnostics are on; the flat path has no per-visit counter to update.
         if wg_count() {
             grids = (0..g.dfs.len()).map(|_| None).collect();
-            let mut memo: HashMap<(usize, i32, i32, i32), f64> = HashMap::new();
+            let mut memo: FlatMemo = FlatMemo::default();
             for &(iid, inner) in &g.interp_nodes {
                 let mut cells = vec![0.0f64; nx * nx * ny];
                 for zi in 0..nx {
@@ -12914,7 +13002,7 @@ impl Gen {
         }
         let mut seen: Vec<String> = vec![];
         let mut seen_mask = 0u128;
-        let mut seen_extra: HashSet<u16> = HashSet::new();
+        let mut seen_extra: HashSet<u16> = HashSet::default();
         let (qx0, qz0) = (cx * 4, cz * 4);
         // The quart y index is the *block* y divided by four, so the sweep has to start at
         // `min_y / 4` (-16 in the overworld), not at 0. Starting at 0 covered y = 0..383 and
@@ -12991,7 +13079,7 @@ impl Gen {
         // The return value is the number of distinct chunks this call decorated: duplicates
         // in `order` claim once (as in the original loop), whether the serial or the A3-a
         // arm ran them.
-        let mut distinct: std::collections::HashSet<(i32, i32)> = std::collections::HashSet::new();
+        let mut distinct: std::collections::HashSet<(i32, i32)> = std::collections::HashSet::default();
         for &(x, z) in &list {
             if !self.pop_done.contains(&(x, z)) {
                 distinct.insert((x, z));
@@ -13193,7 +13281,7 @@ impl Gen {
     /// the order in which disjoint wave windows are merged cannot change the bound.
     pub(crate) fn merge_feat_hm(
         &mut self,
-        entries: HashMap<(i32, i32), (i32, i32)>,
+        entries: CoordMap<(i32, i32), (i32, i32)>,
     ) {
         for (key, (non_air, solid)) in entries {
             let e = self.feat_hm.entry(key).or_insert((i32::MIN, i32::MIN));
@@ -13209,7 +13297,7 @@ impl Gen {
     }
 
     /// Take a wave worker's feature-height maxima for the owner to merge at commit.
-    pub(crate) fn feat_hm_for_worker(&mut self) -> HashMap<(i32, i32), (i32, i32)> {
+    pub(crate) fn feat_hm_for_worker(&mut self) -> CoordMap<(i32, i32), (i32, i32)> {
         std::mem::take(&mut self.feat_hm)
     }
 
@@ -13412,7 +13500,7 @@ impl Gen {
 
     /// feature overrides for a whole chunk (populate flushes here)
     #[allow(dead_code)]
-    pub(crate) fn feat_map(&self, cx: i32, cz: i32) -> Option<&HashMap<u32, u32>> {
+    pub(crate) fn feat_map(&self, cx: i32, cz: i32) -> Option<&CoordMap<u32, u32>> {
         self.feat_c.get(&(cx, cz))
     }
 }
@@ -13524,7 +13612,7 @@ pub fn density_in(cc: &ChunkCols, x: i32, y: i32, z: i32) -> f64 {
 pub fn debug_eval(name: &str, x: i32, y: i32, z: i32) -> Option<f64> {
     let mut g = gen_lock();
     let g = g.as_mut()?;
-    let mut m = HashMap::new();
+    let mut m = HashMap::default();
     if let Some(nn) = name.strip_prefix("noise:") {
         let ni = g.noise_id(&format!("minecraft:{}", nn))?;
         return Some(g.noises[ni].get(x as f64, y as f64, z as f64));
@@ -13546,7 +13634,7 @@ pub fn df_stats() -> String {
         Some(g) => g,
         None => return String::new(),
     };
-    let mut per_kind: HashMap<&'static str, u64> = HashMap::new();
+    let mut per_kind: HashMap<&'static str, u64> = HashMap::default();
     let mut rows: Vec<(u64, usize, &'static str)> = Vec::new();
     let mut total = 0u64;
     for (id, c) in hits.iter().enumerate() {
@@ -14347,7 +14435,7 @@ impl Gen {
                 }
             }
         }
-        self.eval(id, x, y, z, &mut HashMap::new())
+        self.eval(id, x, y, z, &mut HashMap::default())
     }
 
     fn aq_fluid_y(
@@ -14365,7 +14453,7 @@ impl Gen {
         let deep = match self.climate {
             Some(c) => {
                 if wg_count() {
-                    let mut memo = HashMap::new();
+                    let mut memo = HashMap::default();
                     self.eval(c[3], x, y, z, &mut memo) < -0.225f32 as f64
                         && self.eval(c[4], x, y, z, &mut memo) > 0.9f32 as f64
                 } else {
@@ -15298,7 +15386,7 @@ impl Gen {
         let mut t = [0i64; 5];
         let off;
         if wg_count() {
-            let mut memo = HashMap::new();
+            let mut memo = HashMap::default();
             for (i, &id) in [cl[0], cl[1], cl[2], cl[3], cl[5]].iter().enumerate() {
                 t[i] = (self.eval(id, bx, 0, bz, &mut memo) * 10000.0) as i64;
             }
@@ -15358,7 +15446,7 @@ impl Gen {
                     qx << 2,
                     qy << 2,
                     qz << 2,
-                    &mut HashMap::new(),
+                    &mut HashMap::default(),
                 ) * 10000.0) as i64
             }
         };
@@ -15426,7 +15514,7 @@ impl Gen {
                     x,
                     qy.wrapping_mul(4),
                     z,
-                    &mut HashMap::new(),
+                    &mut HashMap::default(),
                 );
                 if erosion > 0.25 {
                     1
@@ -15620,7 +15708,7 @@ mod wg_tests {
     fn p8b1_issue199_surface_rule_failures_are_recorded_not_dropped() {
         crate::test_support::require_vanilla_data();
         let mut g = Gen::load(0, crate::name_to_state).expect("pinned pack");
-        let empty = HashMap::new();
+        let empty = HashMap::default();
         let before = last_worldgen_parse_report().errors.len();
 
         // An unknown rule type: the deepest failure names the type.
@@ -16087,7 +16175,7 @@ mod wg_tests {
         .unwrap();
         let reg = crate::block_registry::breg().unwrap();
         let mut want: std::collections::HashMap<(i32, i32, i32), String> =
-            std::collections::HashMap::new();
+            std::collections::HashMap::default();
         for line in expected_text.lines() {
             if line.starts_with('#') {
                 continue;
@@ -16111,7 +16199,7 @@ mod wg_tests {
         assert!(init(0, crate::name_to_state), "generator for the captured seed");
         let (lo, hi) = (min_y(), max_y());
         let mut got: std::collections::HashMap<(i32, i32, i32), String> =
-            std::collections::HashMap::new();
+            std::collections::HashMap::default();
         let mut sy = lo;
         while sy <= hi {
             let arr = terrain_section(0, sy, 0, crate::feature::populate).unwrap();
@@ -16172,7 +16260,7 @@ mod wg_tests {
         .unwrap();
         let reg = crate::block_registry::breg().unwrap();
         let mut want: std::collections::HashMap<(i32, i32, i32), String> =
-            std::collections::HashMap::new();
+            std::collections::HashMap::default();
         for line in expected_text.lines() {
             if line.starts_with('#') {
                 continue;
@@ -16200,7 +16288,7 @@ mod wg_tests {
         assert!(init(4242, crate::name_to_state), "generator for the captured seed");
         let (lo, hi) = (min_y(), max_y());
         let mut got: std::collections::HashMap<(i32, i32, i32), String> =
-            std::collections::HashMap::new();
+            std::collections::HashMap::default();
         let mut sy = lo;
         while sy <= hi {
             let arr = terrain_section(-96, sy, 35, crate::feature::populate).unwrap();
@@ -16371,7 +16459,7 @@ mod wg_tests {
         for seed in [0u64, 42] {
             let mut g = Gen::load(seed, crate::name_to_state).expect("pinned datapack");
             let config = jparse(br#"{"type":"minecraft:end_islands"}"#).unwrap();
-            let index = g.node(&config, &HashMap::new()).expect("End density node");
+            let index = g.node(&config, &HashMap::default()).expect("End density node");
             let mut checked = 0;
             for row in include_str!("../tests/data/end_islands_1211.tsv").lines() {
                 let f: Vec<_> = row.split('\t').collect();
@@ -16379,7 +16467,7 @@ mod wg_tests {
                     continue;
                 }
                 let (x, z) = (f[1].parse::<i32>().unwrap(), f[2].parse::<i32>().unwrap());
-                let actual = g.eval(index, x, 64, z, &mut HashMap::new());
+                let actual = g.eval(index, x, 64, z, &mut HashMap::default());
                 assert_eq!(
                     actual.to_bits(),
                     u64::from_str_radix(f[4], 16).unwrap(),
@@ -16394,7 +16482,7 @@ mod wg_tests {
     #[test]
     fn unsupported_density_types_fail_closed_at_every_reference_boundary() {
         let mut g = Gen::load(0, crate::name_to_state).expect("pinned datapack");
-        let empty = HashMap::new();
+        let empty = HashMap::default();
 
         // Unknown nodes must never masquerade as a legitimate zero function.
         let unknown = jparse(br#"{"type":"minecraft:unsupported_density"}"#).unwrap();
@@ -16409,7 +16497,7 @@ mod wg_tests {
 
         // A failing named definition must not leave the recursion placeholder
         // cached as a valid reference on subsequent loads.
-        let mut files = HashMap::new();
+        let mut files = HashMap::default();
         files.insert(
             "minecraft:broken".to_string(),
             br#"{"type":"minecraft:unsupported_density"}"#.to_vec(),
@@ -16422,13 +16510,13 @@ mod wg_tests {
         // An intentional numeric zero remains valid and must still evaluate.
         let valid = jparse(br#"{"type":"minecraft:add","argument1":2,"argument2":0}"#).unwrap();
         let id = g.node(&valid, &empty).expect("known density operators");
-        assert_eq!(g.eval(id, 0, 0, 0, &mut HashMap::new()), 2.0);
+        assert_eq!(g.eval(id, 0, 0, 0, &mut HashMap::default()), 2.0);
     }
 
     #[test]
     fn shifted_noise_preserves_y_and_rejects_invalid_required_shifts() {
         let mut g = Gen::load(0, crate::name_to_state).expect("pinned datapack");
-        let empty = HashMap::new();
+        let empty = HashMap::default();
         let good = jparse(
             br#"{"type":"minecraft:shifted_noise","noise":"minecraft:temperature","shift_x":0,"shift_y":3,"shift_z":0,"xz_scale":1,"y_scale":1}"#,
         )
@@ -16556,7 +16644,7 @@ mod wg_tests {
                     for lz in 0..16 {
                         for lx in 0..16 {
                             let (x, z) = (cx * 16 + lx, cz * 16 + lz);
-                            let mut memo = HashMap::new();
+                            let mut memo = HashMap::default();
                             let want =
                                 g.eval_c(g.final_density, x, y, z, &mut memo, Some(cc));
                             let got = prog.eval(&g, Some(cc), x, y, z);
@@ -16597,7 +16685,7 @@ mod wg_tests {
                 for z in [-5, 0, 9] {
                     let mut y = g.min_y;
                     while y < g.min_y + g.height {
-                        let mut memo = HashMap::new();
+                        let mut memo = HashMap::default();
                         let want = g.eval_c(g.final_density, x, y, z, &mut memo, None);
                         let got = prog.eval(&g, None, x, y, z);
                         assert_eq!(
@@ -17231,7 +17319,7 @@ mod wg_tests {
             "deep-dark chunk lost its below-zero biome: {set:?}"
         );
         // and the set must be the union over *every* quart layer of the chunk
-        let mut union = std::collections::HashSet::new();
+        let mut union = std::collections::HashSet::default();
         for qy in g.min_y / 4..(g.min_y + g.height) / 4 {
             for lx in 0..4 {
                 for lz in 0..4 {
@@ -17450,9 +17538,9 @@ mod wg_tests {
             "59353fb40c36d304f2035d51e7d6e6baa98dc05c"
         );
         let mut g = Gen::load(0, crate::name_to_state).expect("pinned pack");
-        let empty = HashMap::new();
+        let empty = HashMap::default();
         let mut checked = 0;
-        let mut ids = HashSet::new();
+        let mut ids = HashSet::<&str>::new();
         for row in fixture.get("cases").unwrap().as_arr().unwrap() {
             assert!(ids.insert(row.get("id").unwrap().str()));
             if row.get("op").unwrap().str() != "state" {
@@ -17495,7 +17583,7 @@ mod wg_tests {
         ))
         .expect("surface reference JSON");
         let mut g = Gen::load(0, crate::name_to_state).expect("pinned pack");
-        let empty = HashMap::new();
+        let empty = HashMap::default();
         let condition = jparse(br#"{"type":"minecraft:temperature"}"#).unwrap();
         let cid = g
             .cond_node(&condition, &empty)
@@ -17563,7 +17651,7 @@ mod wg_tests {
     #[test]
     fn surface_sequence_rejects_a_child_that_did_not_parse() {
         let mut g = Gen::load(0, crate::name_to_state).expect("pinned pack");
-        let empty = HashMap::new();
+        let empty = HashMap::default();
         for child in [
             r#"{"type":"minecraft:block"}"#,
             r#"{"type":"minecraft:unknown_rule"}"#,
@@ -17696,7 +17784,7 @@ mod wg_tests {
         let cc = chunk_cols(0, 0).unwrap();
         let mut gg = gen_lock();
         let g = gg.as_mut().unwrap();
-        let mut kinds: HashMap<u32, u32> = HashMap::new();
+        let mut kinds: HashMap<u32, u32> = HashMap::default();
         let mut nmat = 0;
         for lz in 0..16 {
             for lx in 0..16 {
@@ -17719,7 +17807,7 @@ mod wg_tests {
         let cc = chunk_cols(0, 0).unwrap();
         let mut gg = gen_lock();
         let g = gg.as_mut().unwrap();
-        let mut kinds: HashMap<u32, u32> = HashMap::new();
+        let mut kinds: HashMap<u32, u32> = HashMap::default();
         for lz in 0..16 {
             for lx in 0..16 {
                 if let Some(m) = &cc.surface_mats(g).mats[lz * 16 + lx] {
@@ -19219,8 +19307,8 @@ mod wg_tests {
         // Bit identity across the fold boundary: the interpreted evaluator and
         // the trilerped chunk path must agree bit for bit.
         for (x, y, z) in [(0, 0, 0), (3, -20, -7), (-129, 64, 255), (1000, 200, -333)] {
-            let a = folded.eval(folded.final_density, x, y, z, &mut HashMap::new());
-            let b = raw.eval(raw.final_density, x, y, z, &mut HashMap::new());
+            let a = folded.eval(folded.final_density, x, y, z, &mut HashMap::default());
+            let b = raw.eval(raw.final_density, x, y, z, &mut HashMap::default());
             assert_eq!(
                 a.to_bits(),
                 b.to_bits(),
@@ -21586,7 +21674,7 @@ mod wg_tests {
                     let (sx, sz) = (lxz(x - 5), lxz(z - 5));
                     for y in [min_y, -54, 0, 63, min_y + height - 1] {
                         let sy = ly12(y + 1);
-                        let mut idxs = std::collections::HashSet::new();
+                        let mut idxs = std::collections::HashSet::<usize>::new();
                         for dx in 0..=1 {
                             for dy in -1..=1 {
                                 for dz in 0..=1 {
@@ -21736,7 +21824,7 @@ mod wg_tests {
                 // `final_columns = true` fills every `interp_ids()` grid — density and
                 // vein alike; a base column only carries the density-reachable ones.
                 let cc = g.build_cols_body(cx, cz, true).expect("cols");
-                let mut memo: HashMap<(usize, i32, i32, i32), f64> = HashMap::new();
+                let mut memo: FlatMemo = FlatMemo::default();
                 let mut grids = 0usize;
                 for iid in g.interp_ids() {
                     let inner = match g.dfs[iid] {
@@ -21778,7 +21866,7 @@ mod wg_tests {
                     flat.next_3d();
                     let v0 = g.eval_flat(id, bx, g.min_y, bz, &mut flat);
                     for by in [-64, -1, 0, 1, 63, 320] {
-                        let mut sm = HashMap::new();
+                        let mut sm = HashMap::default();
                         let want = g.eval_c(id, bx, by, bz, &mut sm, None);
                         if want.is_nan() && v0.is_nan() {
                             continue;

@@ -62,7 +62,7 @@ fn aquifer_matches_the_pinned_chunk_through_its_public_api() {
             row[2].num() as i32,
         );
         let want = u64::from_str_radix(row[3].str(), 16).unwrap();
-        let got = g.eval(idwj, x, y, z, &mut HashMap::new()).to_bits();
+        let got = g.eval(idwj, x, y, z, &mut crate::worldgen::FlatMemo::default()).to_bits();
         assert_eq!(got, want, "initial_density_without_jaggedness {x},{y},{z}");
     }
     let prelim = result.get("prelim").unwrap().as_arr().unwrap();

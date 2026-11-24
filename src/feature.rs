@@ -9867,7 +9867,7 @@ struct OriginCarversCache {
     /// a replacement generator, a reseed or another dimension cannot answer from the previous
     /// one's entries: the biome source is a function of exactly these three.
     ctx: (u64, u64, NoisePreset),
-    map: HashMap<(i32, i32), OriginCarvers>,
+    map: CoordMap<(i32, i32), OriginCarvers>,
     order: std::collections::VecDeque<(i32, i32)>,
 }
 
@@ -9877,7 +9877,7 @@ impl Default for OriginCarversCache {
             // `GEN_SEQ` starts at 1, so the first lookup always takes the miss path and a
             // cache can never answer before it knows which generator it belongs to.
             ctx: (0, 0, NoisePreset::Overworld),
-            map: HashMap::new(),
+            map: CoordMap::default(),
             order: std::collections::VecDeque::new(),
         }
     }
@@ -9968,7 +9968,7 @@ struct OriginGrid {
     w: usize,
     h: usize,
     cells: Vec<OriginCarvers>,
-    sparse: Option<HashMap<(i32, i32), OriginCarvers>>,
+    sparse: Option<CoordMap<(i32, i32), OriginCarvers>>,
 }
 
 impl OriginGrid {
@@ -10000,7 +10000,7 @@ impl OriginGrid {
             w,
             h,
             cells: if sparse { Vec::new() } else { vec![None; w * h] },
-            sparse: sparse.then(HashMap::new),
+            sparse: sparse.then(CoordMap::default),
         }
     }
     #[inline]
@@ -10703,20 +10703,20 @@ pub(crate) fn precarve_order(g: &mut Gen, pending: &[(i32, i32)], jobs: usize) {
             order = Vec::new();
         }
         if seen.capacity() > (256 * 1024) / std::mem::size_of::<(i32, i32)>() {
-            seen = HashSet::new();
+            seen = CoordSet::default();
         }
         s.0 = order;
         s.1 = seen;
     });
 }
 
-type PrecarveScratch = (Vec<(i32, i32)>, HashSet<(i32, i32)>);
+type PrecarveScratch = (Vec<(i32, i32)>, CoordSet<(i32, i32)>);
 
 thread_local! {
     /// `precarve_order`'s dedupe buffers, parked between populates. The pair is a
     /// few KB at the 32-chunk call bound, well under the 256 KiB idle-scratch cap.
     static PRECARVE_SCRATCH: std::cell::RefCell<PrecarveScratch> =
-        std::cell::RefCell::new((Vec::new(), HashSet::new()));
+        std::cell::RefCell::new((Vec::new(), CoordSet::default()));
 }
 
 /// The minimum Chebyshev-independent spacing of two chunks in one wave. `POP_WRITE_RADIUS`
@@ -10784,7 +10784,7 @@ struct PopulateWorkerResult {
     direct_marks: WorkerDirectMarks,
     payloads: crate::generation_context::StagedPayloads,
     mineshaft_spawners: HashSet<(i32, i32, usize)>,
-    feat_hm: HashMap<(i32, i32), (i32, i32)>,
+    feat_hm: CoordMap<(i32, i32), (i32, i32)>,
     leaves: Vec<GeneratedTick>,
     fluids: Vec<GeneratedTick>,
     /// The worker's resident terrain answers: the columns it built (`Gen::col_c`) and the
@@ -10814,7 +10814,7 @@ fn populate_worker(
         direct_marks: Vec::new(),
         payloads: Vec::new(),
         mineshaft_spawners: HashSet::new(),
-        feat_hm: HashMap::new(),
+        feat_hm: CoordMap::default(),
         leaves: Vec::new(),
         fluids: Vec::new(),
         cols: Vec::new(),

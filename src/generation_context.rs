@@ -4,7 +4,7 @@
 // live here without importing higher-level tree or template implementations.
 
 use crate::block_registry::{breg, BReg, HeightmapKind};
-use crate::worldgen::Gen;
+use crate::worldgen::{CoordMap, Gen};
 use std::cell::OnceCell;
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -484,11 +484,11 @@ pub(crate) struct FC<'a> {
     /// writer) and `WorldGenRegion.setBlock`'s own `hasPostProcess` gate
     /// (`BReg::has_post_process`, filed by [`FC::set`]). The sets are disjoint.
     pub(crate) shape_marks: Vec<(i32, i32, i32)>,
-    rc: HashMap<(i32, i32, i32), u32>, // terrain read-through cache
+    rc: CoordMap<(i32, i32, i32), u32>, // terrain read-through cache
     /// Frozen pre-CARVERS `*_WG` heightmaps, memoized per column. Feature writes
     /// do not invalidate this terrain-only view. Live (non-WG) variants are never
     /// cached: they follow carver and feature writes.
-    hmwg: HashMap<(i32, i32, HeightmapKind), i32>,
+    hmwg: CoordMap<(i32, i32, HeightmapKind), i32>,
 
     /// Generated entity and block-entity data, not a live store. The runtime
     /// handoff routes each payload to its owner after releasing the generator.
@@ -526,8 +526,8 @@ impl<'a> FC<'a> {
             worker_order: None,
             wr: FlatChunkWriteMap::new(),
             shape_marks: Vec::new(),
-            rc: HashMap::new(),
-            hmwg: HashMap::new(),
+            rc: CoordMap::default(),
+            hmwg: CoordMap::default(),
             payloads: Vec::new(),
             cc: None,
             promo_light: None,
