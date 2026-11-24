@@ -29,6 +29,14 @@
 //!   `GuiGraphics -> DrawCmd` draw ops, the read-only HUD snapshot mods
 //!   see, fair-play-capped container slot actions, the fail-closed
 //!   `GGB1` wire codec, and the lowering pass into the native draw list.
+//! * [`recipe_search`] — the pure-logic core a JEI/EMI-style overlay
+//!   wires in: a Japanese-aware kana/romaji normalizer
+//!   (`daia`/`だいあ`/`ダイア` all reach `ダイヤモンド`), an inverted
+//!   [`recipe_search::RecipeSearchIndex`] with `@mod`/`#tag`/text
+//!   tokens plus `R`/`U` lookups and Polymorph-style conflict groups,
+//!   and [`recipe_search::NearbyChestCraftPlanner`] emitting atomic
+//!   transfer plans that pull from the player inventory and nearby
+//!   chests for 1-click and max-stack shift-crafts.
 //!
 //! Typical frame loop for an embedder:
 //!
@@ -55,6 +63,7 @@ pub mod mod_i18n;
 pub mod mod_menu;
 pub mod qol_helpers;
 pub mod recipe_browser;
+pub mod recipe_search;
 pub mod shader_screen;
 pub mod sign_and_chat;
 pub mod state;
