@@ -94,7 +94,7 @@ pub const WATER: u8 = 1;
 pub const LAVA: u8 = 2;
 
 #[repr(C)]
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
 pub struct Block {
     pub state_id: u32,
     pub tint: u32,
@@ -248,15 +248,19 @@ pub struct Section {
 /// same block (uniform air, deep stone, ocean water — the large majority of
 /// sections in a world) allocates nothing: [`SectionBlocks::Uniform`] keeps
 /// the single `Block` value inline. [`SectionBlocks::Dense`] is the full
-/// expanded array and is only materialized by the first non-uniform write
-/// ([`CompressedSection::set`]) or an explicit
-/// [`CompressedSection::expand`].
+/// expanded array. Mixed snapshots can be compacted after meshing and
+/// expanded only for mutable edits or mesher input.
 #[derive(Clone, Debug)]
 pub enum SectionBlocks {
     /// Every cell holds this block; zero heap allocation.
     Uniform(Block),
     /// Fully expanded per-cell storage.
     Dense(Box<[Block; SECTION_CELLS]>),
+    /// Palette-compressed storage used for retained mesh snapshots.
+    Palette {
+        palette: Box<[Block]>,
+        indices: Box<[u16; SECTION_CELLS]>,
+    },
 }
 
 impl SectionBlocks {
@@ -269,7 +273,7 @@ impl SectionBlocks {
     pub fn uniform_block(&self) -> Option<Block> {
         match self {
             Self::Uniform(block) => Some(*block),
-            Self::Dense(_) => None,
+            Self::Dense(_) | Self::Palette { .. } => None,
         }
     }
 
@@ -280,6 +284,17 @@ impl SectionBlocks {
         match self {
             Self::Uniform(_) => 0,
             Self::Dense(dense) => std::mem::size_of_val(&**dense),
+            Self::Palette { palette, indices } => {
+                std::mem::size_of_val(&**palette) + std::mem::size_of_val(&**indices)
+            }
+        }
+    }
+
+    /// Heap bytes held specifically by an expanded dense array.
+    pub fn dense_bytes(&self) -> usize {
+        match self {
+            Self::Dense(dense) => std::mem::size_of_val(&**dense),
+            Self::Uniform(_) | Self::Palette { .. } => 0,
         }
     }
 
@@ -292,6 +307,7 @@ impl SectionBlocks {
                 *block
             }
             Self::Dense(dense) => dense[index],
+            Self::Palette { palette, indices } => palette[indices[index] as usize],
         }
     }
 
@@ -299,18 +315,70 @@ impl SectionBlocks {
     pub fn as_dense(&self) -> Option<&[Block; SECTION_CELLS]> {
         match self {
             Self::Dense(dense) => Some(dense),
-            Self::Uniform(_) => None,
+            Self::Uniform(_) | Self::Palette { .. } => None,
         }
     }
 
     /// Ensures dense storage and returns the expanded array for mutation.
     fn promote(&mut self) -> &mut [Block; SECTION_CELLS] {
-        if let Self::Uniform(block) = self {
-            *self = Self::Dense(Box::new([*block; SECTION_CELLS]));
+        match self {
+            Self::Uniform(block) => *self = Self::Dense(Box::new([*block; SECTION_CELLS])),
+            Self::Palette { palette, indices } => {
+                let dense = Box::new(std::array::from_fn(|i| palette[indices[i] as usize]));
+                *self = Self::Dense(dense);
+            }
+            Self::Dense(_) => {}
         }
         match self {
             Self::Dense(dense) => dense,
-            Self::Uniform(_) => unreachable!(),
+            Self::Uniform(_) | Self::Palette { .. } => unreachable!(),
+        }
+    }
+
+    /// Replaces a dense array with a first-seen-order palette representation.
+    /// Returns the number of dense bytes released.
+    pub(crate) fn compact_dense(&mut self) -> usize {
+        let Self::Dense(dense) = self else {
+            return 0;
+        };
+        let released = std::mem::size_of_val(&**dense);
+        let mut palette = Vec::new();
+        let mut lookup = std::collections::HashMap::new();
+        let mut indices = Box::new([0u16; SECTION_CELLS]);
+        for (index, &block) in dense.iter().enumerate() {
+            let id = if let Some(&id) = lookup.get(&block) {
+                id
+            } else {
+                let id = u16::try_from(palette.len()).expect("a section has at most 4096 cells");
+                palette.push(block);
+                lookup.insert(block, id);
+                id
+            };
+            indices[index] = id;
+        }
+        let compact_bytes = std::mem::size_of_val(&*indices)
+            + palette.len() * std::mem::size_of::<Block>();
+        if compact_bytes >= released {
+            return 0;
+        }
+        if palette.len() == 1 {
+            *self = Self::Uniform(palette[0]);
+        } else {
+            *self = Self::Palette {
+                palette: palette.into_boxed_slice(),
+                indices,
+            };
+        }
+        released
+    }
+
+    pub(crate) fn expand(&self) -> Box<[Block; SECTION_CELLS]> {
+        match self {
+            Self::Dense(dense) => dense.clone(),
+            Self::Uniform(block) => Box::new([*block; SECTION_CELLS]),
+            Self::Palette { palette, indices } => {
+                Box::new(std::array::from_fn(|i| palette[indices[i] as usize]))
+            }
         }
     }
 
@@ -320,9 +388,17 @@ impl SectionBlocks {
         match (self, other) {
             (Self::Uniform(a), Self::Uniform(b)) => a == b,
             (Self::Dense(a), Self::Dense(b)) => a == b,
-            (Self::Uniform(u), Self::Dense(d)) | (Self::Dense(d), Self::Uniform(u)) => {
-                d.iter().all(|cell| cell == u)
-            }
+            (
+                Self::Palette {
+                    palette: left_palette,
+                    indices: left_indices,
+                },
+                Self::Palette {
+                    palette: right_palette,
+                    indices: right_indices,
+                },
+            ) if left_palette == right_palette => left_indices == right_indices,
+            _ => (0..SECTION_CELLS).all(|index| self.cell(index) == other.cell(index)),
         }
     }
 }
@@ -367,6 +443,16 @@ impl CompressedSection {
     /// Heap bytes held by the block storage (`0` when uniform).
     pub fn heap_bytes(&self) -> usize {
         self.blocks.heap_bytes()
+    }
+
+    /// Heap bytes held by a fully expanded block array.
+    pub fn dense_bytes(&self) -> usize {
+        self.blocks.dense_bytes()
+    }
+
+    /// Replaces an expanded block array with compact palette storage.
+    pub(crate) fn compact_dense_blocks(&mut self) -> usize {
+        self.blocks.compact_dense()
     }
 
     /// Reads a local cell, identical to [`Section::get`]. Panics when a
@@ -426,10 +512,7 @@ impl CompressedSection {
     /// block into it.
     pub fn expand(&self) -> Section {
         Section {
-            blocks: match &self.blocks {
-                SectionBlocks::Dense(dense) => dense.clone(),
-                SectionBlocks::Uniform(block) => Box::new([*block; SECTION_CELLS]),
-            },
+            blocks: self.blocks.expand(),
             block_light: self.block_light,
             sky_light: self.sky_light,
         }

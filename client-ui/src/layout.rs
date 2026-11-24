@@ -51,6 +51,7 @@ pub fn layout_screen_into(
     let mut ctx = Ctx {
         list: std::mem::take(out),
         regions: std::mem::take(regions),
+        hud_scratch: String::new(),
         w: (width.min(i32::MAX as u32) as i32) / s,
         h: (height.min(i32::MAX as u32) as i32) / s,
         pw: width,
@@ -91,6 +92,7 @@ pub fn layout_screen_into(
 struct Ctx<'a> {
     list: UiDrawList,
     regions: Vec<HitRegion>,
+    hud_scratch: String,
     w: i32,
     h: i32,
     /// Physical-pixel viewport for the embedded sub-screens (they take
@@ -179,6 +181,41 @@ impl Ctx<'_> {
             mult * self.s as u32,
             color,
             s,
+        );
+    }
+
+    fn hud_text(&mut self, x: i32, y: i32, mult: u32, color: UiColor, text: &str, limit: usize) {
+        self.hud_scratch.clear();
+        write_hud_str(text, limit, &mut self.hud_scratch);
+        if x < 0 || x >= self.w || y < 0 || y + 8 * mult as i32 > self.h {
+            return;
+        }
+        let cells = ((self.w - x) / (8 * mult as i32)).max(0) as usize;
+        let clipped = first_chars(&self.hud_scratch, cells);
+        self.list.text_str(
+            x * self.s,
+            y * self.s,
+            mult * self.s as u32,
+            color,
+            clipped,
+        );
+    }
+
+    fn hud_ctext(&mut self, cx: i32, y: i32, mult: u32, color: UiColor, text: &str, limit: usize) {
+        self.hud_scratch.clear();
+        write_hud_str(text, limit, &mut self.hud_scratch);
+        if y < 0 || y + 8 * mult as i32 > self.h {
+            return;
+        }
+        let cells = ((self.w - 8) / (8 * mult as i32)).max(0) as usize;
+        let clipped = first_chars(&self.hud_scratch, cells);
+        let w = text_width(clipped, mult * self.s as u32) as i32;
+        self.list.text_str(
+            (cx * self.s - w / 2).max(0),
+            y * self.s,
+            mult * self.s as u32,
+            color,
+            clipped,
         );
     }
 
@@ -473,7 +510,7 @@ fn title(ctx: &mut Ctx) {
     // Host-reported status/errors stay visible on the menu — a failed
     // singleplayer launch or multiplayer join never reads as a no-op.
     if let Some(status) = &ctx.state.title_status {
-        ctx.ctext(cx, ctx.h - 24, 1, pal::WARNING, &hud_str(status, 56));
+        ctx.hud_ctext(cx, ctx.h - 24, 1, pal::WARNING, status, 56);
     }
 
     boot_badge(ctx, 106);
@@ -594,7 +631,7 @@ fn singleplayer(ctx: &mut Ctx) {
     // Status/errors (failed launches, validation rejections) render
     // right above Back — never silently dropped.
     if let Some(status) = &ctx.state.title_status {
-        ctx.ctext(cx, ctx.h - 41, 1, pal::WARNING, &hud_str(status, 56));
+        ctx.hud_ctext(cx, ctx.h - 41, 1, pal::WARNING, status, 56);
     }
     ctx.button_unchecked(
         WidgetId::SingleplayerBack,
@@ -728,7 +765,7 @@ fn multiplayer(ctx: &mut Ctx) {
         .as_deref()
         .or(ctx.state.title_status.as_deref())
     {
-        ctx.ctext(cx, ctx.h - 41, 1, pal::WARNING, &hud_str(status, 56));
+        ctx.hud_ctext(cx, ctx.h - 41, 1, pal::WARNING, status, 56);
     }
     ctx.button_unchecked(
         WidgetId::MultiplayerBack,
@@ -757,7 +794,7 @@ fn disconnected(ctx: &mut Ctx) {
         },
     );
     if !state.reason.is_empty() {
-        ctx.ctext(cx, ty + 24, 1, pal::TEXT, &hud_str(&state.reason, 72));
+        ctx.hud_ctext(cx, ty + 24, 1, pal::TEXT, &state.reason, 72);
     }
     let bw = 140.min(ctx.w - 12).max(24);
     ctx.btn(
@@ -1075,10 +1112,18 @@ fn first_chars(text: &str, limit: usize) -> &str {
 /// names): flatten control characters — a `\n` inside a hostile packet
 /// string must never wrap the HUD — then clip to `limit` glyph cells.
 fn hud_str(text: &str, limit: usize) -> String {
-    text.chars()
-        .map(|c| if c.is_control() { ' ' } else { c })
-        .take(limit)
-        .collect()
+    let mut out = String::new();
+    write_hud_str(text, limit, &mut out);
+    out
+}
+
+fn write_hud_str(text: &str, limit: usize, out: &mut String) {
+    out.clear();
+    out.extend(
+        text.chars()
+            .map(|c| if c.is_control() { ' ' } else { c })
+            .take(limit),
+    );
 }
 
 fn shaders_tab(ctx: &mut Ctx, y0: i32) {
@@ -1096,14 +1141,15 @@ fn shaders_tab(ctx: &mut Ctx, y0: i32) {
         pal::TEXT_DIM,
         tr(lang, "Current Shaderpack", "現在のシェーダーパック"),
     );
-    ctx.ctext(cx, y0 + 12, 1, pal::TEXT, &hud_str(name, 38));
+    ctx.hud_ctext(cx, y0 + 12, 1, pal::TEXT, name, 38);
     if !ctx.state.active_shaderpack_profile.is_empty() {
-        ctx.ctext(
+        ctx.hud_ctext(
             cx,
             y0 + 24,
             1,
             pal::TEXT_DIM,
-            &hud_str(&ctx.state.active_shaderpack_profile, 38),
+            &ctx.state.active_shaderpack_profile,
+            38,
         );
     }
     let x = cx - 160;
@@ -1135,14 +1181,14 @@ fn shaders_tab(ctx: &mut Ctx, y0: i32) {
             pal::TEXT_DIM,
             tr(lang, "Selected Shaderpack", "選択中のシェーダーパック"),
         );
-        ctx.ctext(cx, y0 + 108, 1, pal::TEXT, &hud_str(label, 38));
+        ctx.hud_ctext(cx, y0 + 108, 1, pal::TEXT, label, 38);
     }
 
     // Visual style: an external shader pack always wins — it shows a
     // clean status line and every built-in visual shader yields to it.
     let vs = &ctx.state.settings.visual;
     if let Some(status) = vs.external_shader_status(lang) {
-        ctx.ctext(cx, y0 + 126, 1, pal::ACCENT, &hud_str(&status, 44));
+        ctx.hud_ctext(cx, y0 + 126, 1, pal::ACCENT, &status, 44);
     } else {
         ctx.btn(
             WidgetId::VisualPreset,
@@ -1799,7 +1845,7 @@ fn mod_sync(ctx: &mut Ctx) {
             // clip so they can't overrun the SHA column or the panel edge.
             let sha = e.short_sha().to_string();
             let name_cells = ((pw - 28 - text_width(&sha, 1) as i32 - 8) / 8).max(1) as usize;
-            ctx.text(px + 20, y, 1, pal::TEXT, &hud_str(&e.name, name_cells));
+            ctx.hud_text(px + 20, y, 1, pal::TEXT, &e.name, name_cells);
             let sw = text_width(&sha, ctx.s as u32) as i32;
             ctx.text(px + pw - 8 - sw / ctx.s, y, 1, pal::TEXT_DIM, &sha);
         }
@@ -1931,7 +1977,7 @@ fn hud(ctx: &mut Ctx) {
     for (i, (name, frac)) in hud.bossbars.iter().take(3).enumerate() {
         let y = 6 + i as i32 * 16;
         let bw = (w - 40).clamp(8, 200);
-        ctx.ctext(cx, y, 1, pal::TEXT, &hud_str(name, ((w - 8) / 8).max(0) as usize));
+        ctx.hud_ctext(cx, y, 1, pal::TEXT, name, ((w - 8) / 8).max(0) as usize);
         ctx.progress(
             lr(cx - bw / 2, y + 9, bw, 5),
             frac.clamp(0.0, 1.0),
@@ -2220,13 +2266,7 @@ fn hud(ctx: &mut Ctx) {
                 if Some(i) == selected {
                     ctx.fill(5, ry, pop_w - 2, 10, UiColor::rgba(80, 88, 110, 120));
                 }
-                ctx.text(
-                    7,
-                    ry + 1,
-                    1,
-                    pal::TEXT,
-                    &hud_str(cand, ((pop_w - 10) / 8).max(1) as usize),
-                );
+                ctx.hud_text(7, ry + 1, 1, pal::TEXT, cand, ((pop_w - 10) / 8).max(1) as usize);
             }
         }
     }
@@ -2260,7 +2300,7 @@ fn hud(ctx: &mut Ctx) {
         );
         for (i, (name, ping)) in hud.players.iter().take(shown).enumerate() {
             let y = py + 14 + i as i32 * 11;
-            ctx.text(px + 6, y, 1, pal::TEXT, &hud_str(name, name_cells));
+            ctx.hud_text(px + 6, y, 1, pal::TEXT, name, name_cells);
             ping_bars(ctx, px + pw - 30, y, *ping);
             ctx.text(px + pw - 52, y, 1, pal::TEXT_DIM, &format!("{ping}ms"));
         }
@@ -2482,11 +2522,25 @@ pub fn layout_subtitle_hud(
     height: u32,
     out: &mut UiDrawList,
 ) -> bool {
+    let mut reserved = Vec::new();
+    layout_subtitle_hud_with_scratch(state, subtitles, width, height, out, &mut reserved)
+}
+
+/// Buffer-reusing form of [`layout_subtitle_hud`]. `reserved` keeps its
+/// allocation across frames and is refilled with the same occupancy geometry.
+pub fn layout_subtitle_hud_with_scratch(
+    state: &UiState,
+    subtitles: &SubtitleHudState,
+    width: u32,
+    height: u32,
+    out: &mut UiDrawList,
+    reserved: &mut Vec<UiRect>,
+) -> bool {
     if !state.settings.qol.show_subtitles || subtitles.is_empty() {
         return false;
     }
-    let reserved = hud_occupied_rects(state, width, height);
-    subtitles.render_avoiding(width as f32, height as f32, &reserved, out)
+    hud_occupied_rects_into(state, width, height, reserved);
+    subtitles.render_avoiding(width as f32, height as f32, reserved, out)
 }
 
 // ---------------------------------------------------------------------------
@@ -2684,20 +2738,32 @@ pub fn layout_looking_at(state: &UiState, width: u32, height: u32, out: &mut UiD
 /// anchors to corners the spatial panel only reaches on degenerate
 /// layouts.
 fn hud_occupied_rects(state: &UiState, width: u32, height: u32) -> Vec<UiRect> {
+    let mut rects = Vec::new();
+    hud_occupied_rects_into(state, width, height, &mut rects);
+    rects
+}
+
+/// Fill a reusable buffer with the physical HUD occupancy rectangles.
+pub fn hud_occupied_rects_into(
+    state: &UiState,
+    width: u32,
+    height: u32,
+    rects: &mut Vec<UiRect>,
+) {
+    rects.clear();
     let hud = &state.hud;
     let s = state.effective_scale(height) as i32;
     if s <= 0 {
-        return Vec::new();
+        return;
     }
     let w = (width.min(i32::MAX as u32) as i32) / s;
     let h = (height.min(i32::MAX as u32) as i32) / s;
     if w <= 0 || h <= 0 {
-        return Vec::new();
+        return;
     }
     let cx = w / 2;
 
     // Logical-px accumulator; converted to physical at the end.
-    let mut rects: Vec<UiRect> = Vec::new();
     {
         let mut add = |x: i32, y: i32, rw: i32, rh: i32| {
             if rw > 0 && rh > 0 {
@@ -2914,17 +2980,14 @@ fn hud_occupied_rects(state: &UiState, width: u32, height: u32) -> Vec<UiRect> {
         }
     }
 
-    rects
-        .into_iter()
-        .map(|r| {
-            UiRect::new(
-                r.x * s,
-                r.y * s,
-                (r.w as i32 * s).max(0) as u32,
-                (r.h as i32 * s).max(0) as u32,
-            )
-        })
-        .collect()
+    for rect in rects.iter_mut() {
+        *rect = UiRect::new(
+            rect.x * s,
+            rect.y * s,
+            (rect.w as i32 * s).max(0) as u32,
+            (rect.h as i32 * s).max(0) as u32,
+        );
+    }
 }
 
 fn slot_cell(ctx: &mut Ctx, x: i32, y: i32, item: Option<&String>, selected: bool) {
@@ -2942,7 +3005,7 @@ fn slot_cell(ctx: &mut Ctx, x: i32, y: i32, item: Option<&String>, selected: boo
     );
     if let Some(name) = item {
         // Two cells max: three glyphs would spill into the next slot.
-        ctx.text(x + 3, y + 7, 1, pal::TEXT_DIM, &hud_str(name, 2));
+        ctx.hud_text(x + 3, y + 7, 1, pal::TEXT_DIM, name, 2);
     }
 }
 

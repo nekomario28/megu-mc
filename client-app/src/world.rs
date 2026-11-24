@@ -1021,6 +1021,10 @@ fn face_visibility_of(blocks: &SectionBlocks) -> FaceVisibility {
             }
         }
         SectionBlocks::Dense(dense) => FaceVisibility::compute(dense),
+        SectionBlocks::Palette { .. } => {
+            let expanded = Box::new(std::array::from_fn(|i| blocks.cell(i)));
+            FaceVisibility::compute(&expanded)
+        }
     }
 }
 
@@ -1831,14 +1835,19 @@ impl WorldState {
             [0u8; LIGHT_BYTES]
         };
 
-        let (sky_per_section, block_per_section) =
-            unpack_section_lights(&decoded.light, section_count, default_sky);
-
         let min_sy = self.dimension.min_section_y();
         let mut stored_sections = Vec::with_capacity(section_count);
+        let mut sky_cursor = usize::from(bitset_get(&decoded.light.sky_mask, 0));
+        let mut block_cursor = usize::from(bitset_get(&decoded.light.block_mask, 0));
         for (idx, sec) in decoded.sections.iter().enumerate() {
-            let sky = sky_per_section[idx].unwrap_or(default_sky);
-            let blk = block_per_section[idx].unwrap_or([0u8; LIGHT_BYTES]);
+            let (sky_update, block_update) = section_light_updates(
+                &decoded.light,
+                idx + 1,
+                &mut sky_cursor,
+                &mut block_cursor,
+            );
+            let sky = sky_update.unwrap_or(default_sky);
+            let blk = block_update.unwrap_or([0u8; LIGHT_BYTES]);
             let mut stored =
                 StoredSection::from_states(&sec.states, blk, sky, &self.blocks, self.state_count)?;
             stored.biomes = sec.biomes;
@@ -2070,24 +2079,21 @@ impl WorldState {
         let Some(col) = self.columns.get_mut(&(cx, cz)) else {
             return Ok(());
         };
-        let section_count = col.sections.len();
-        let default_sky = if self.dimension.has_skylight {
-            [0xffu8; LIGHT_BYTES]
-        } else {
-            [0u8; LIGHT_BYTES]
-        };
-        let (sky_updates, block_updates) = unpack_section_lights(light, section_count, default_sky);
         let min_sy = self.dimension.min_section_y();
+        let mut sky_cursor = usize::from(bitset_get(&light.sky_mask, 0));
+        let mut block_cursor = usize::from(bitset_get(&light.block_mask, 0));
 
         for (idx, sec) in col.sections.iter_mut().enumerate() {
             let mut changed = false;
-            if let Some(new_sky) = sky_updates[idx] {
+            let (sky_update, block_update) =
+                section_light_updates(light, idx + 1, &mut sky_cursor, &mut block_cursor);
+            if let Some(new_sky) = sky_update {
                 if sec.sky_light != new_sky {
                     sec.sky_light = new_sky;
                     changed = true;
                 }
             }
-            if let Some(new_blk) = block_updates[idx] {
+            if let Some(new_blk) = block_update {
                 if sec.block_light != new_blk {
                     sec.block_light = new_blk;
                     changed = true;
@@ -2518,6 +2524,11 @@ impl WorldState {
     /// Replaces byte-comparing `PackedVertex` slices with one `u64` compare.
     pub fn section_mesh_revision(&self, coord: SectionCoord) -> Option<u64> {
         self.section_mesh_revisions.get(&coord).copied()
+    }
+
+    /// Dense block-array bytes still retained by the mesh cache.
+    pub fn mesh_cache_dense_bytes(&self) -> usize {
+        self.mesh_cache.mesh_cache_dense_bytes()
     }
 
     /// Number of sections still holding their CPU `Vec<PackedVertex>` copy.
@@ -3081,51 +3092,32 @@ fn read_nibble(bytes: &[u8; LIGHT_BYTES], idx: usize) -> u8 {
     (bytes[idx / 2] >> ((idx & 1) * 4)) & 0x0f
 }
 
-type SectionLightPlanes = (
-    Vec<Option<[u8; LIGHT_BYTES]>>,
-    Vec<Option<[u8; LIGHT_BYTES]>>,
-);
-
-fn unpack_section_lights(
+fn section_light_updates(
     light: &DecodedLightData,
-    section_count: usize,
-    _default_sky: [u8; LIGHT_BYTES],
-) -> SectionLightPlanes {
-    let mut sky_out = vec![None; section_count];
-    let mut block_out = vec![None; section_count];
+    light_section: usize,
+    sky_cursor: &mut usize,
+    block_cursor: &mut usize,
+) -> (Option<[u8; LIGHT_BYTES]>, Option<[u8; LIGHT_BYTES]>) {
+    let sky_val = if bitset_get(&light.sky_mask, light_section) {
+        let arr = light.sky_arrays.get(*sky_cursor).copied();
+        *sky_cursor += 1;
+        arr
+    } else if bitset_get(&light.empty_sky_mask, light_section) {
+        Some([0u8; LIGHT_BYTES])
+    } else {
+        None
+    };
 
-    let light_sections = section_count + 2;
-    let mut sky_cursor = 0usize;
-    let mut block_cursor = 0usize;
-
-    for ls in 0..light_sections {
-        let sky_val = if bitset_get(&light.sky_mask, ls) {
-            let arr = light.sky_arrays.get(sky_cursor).copied();
-            sky_cursor += 1;
-            arr
-        } else if bitset_get(&light.empty_sky_mask, ls) {
-            Some([0u8; LIGHT_BYTES])
-        } else {
-            None
-        };
-
-        let block_val = if bitset_get(&light.block_mask, ls) {
-            let arr = light.block_arrays.get(block_cursor).copied();
-            block_cursor += 1;
-            arr
-        } else if bitset_get(&light.empty_block_mask, ls) {
-            Some([0u8; LIGHT_BYTES])
-        } else {
-            None
-        };
-
-        // Light section 0 is below min_y and section_count + 1 is above max_y.
-        if ls >= 1 && ls <= section_count {
-            sky_out[ls - 1] = sky_val;
-            block_out[ls - 1] = block_val;
-        }
-    }
-    (sky_out, block_out)
+    let block_val = if bitset_get(&light.block_mask, light_section) {
+        let arr = light.block_arrays.get(*block_cursor).copied();
+        *block_cursor += 1;
+        arr
+    } else if bitset_get(&light.empty_block_mask, light_section) {
+        Some([0u8; LIGHT_BYTES])
+    } else {
+        None
+    };
+    (sky_val, block_val)
 }
 
 // ---------------------------------------------------------------------------
@@ -3380,5 +3372,58 @@ mod tests {
         assert_eq!(world.get_block_state(3, 4, 5), Some(0));
         assert_eq!(world.get_block_state(1, 1, 1), Some(1));
         assert_eq!(world.block_updates, 2);
+    }
+
+    #[test]
+    fn twenty_four_section_column_releases_dense_mesh_snapshots_after_meshing() {
+        use crate::protocol::DecodedSection;
+
+        let blocks = BlockTable::builtin();
+        assert_ne!(blocks.mesh_block(1), blocks.mesh_block(2));
+        let mut world = WorldState::new(
+            DimensionMeta {
+                name: "minecraft:overworld".to_string(),
+                min_y: -64,
+                height: 384,
+                has_skylight: true,
+            },
+            blocks,
+        );
+        let sections = (0..24)
+            .map(|_| {
+                let mut states = Box::new([1; SECTION_CELLS]);
+                states[0] = 2;
+                DecodedSection {
+                    non_air: SECTION_CELLS as i16,
+                    states,
+                    biomes: [0; 64],
+                }
+            })
+            .collect();
+        world
+            .apply_chunk(DecodedChunk {
+                cx: 0,
+                cz: 0,
+                sections,
+                light: DecodedLightData {
+                    sky_mask: Vec::new(),
+                    block_mask: Vec::new(),
+                    empty_sky_mask: Vec::new(),
+                    empty_block_mask: Vec::new(),
+                    sky_arrays: Vec::new(),
+                    block_arrays: Vec::new(),
+                },
+                block_entities: Vec::new(),
+            })
+            .unwrap();
+
+        let before = world.mesh_cache_dense_bytes();
+        assert_eq!(before, 24 * 65_536);
+        assert_eq!(world.mesh_cache.rebuild_dirty(usize::MAX).len(), 24);
+        let after = world.mesh_cache.mesh_cache_blocks_heap_bytes();
+        assert_eq!(world.mesh_cache_dense_bytes(), 0);
+        assert_eq!(after, 24 * (4096 * 2 + 2 * std::mem::size_of::<Block>()));
+        assert_eq!(world.get_block_state(0, -64, 0), Some(2));
+        assert_eq!(world.get_block_state(1, -64, 0), Some(1));
     }
 }

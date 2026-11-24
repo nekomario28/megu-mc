@@ -3,7 +3,7 @@
 //! directional formatting, fade-out, and viewport/hotbar non-overlap.
 
 use megu_client_ui::draw::{text_width, UiColor, UiCommand, UiDrawList, UiRect};
-use megu_client_ui::layout::layout_subtitle_hud;
+use megu_client_ui::layout::{layout_subtitle_hud, layout_subtitle_hud_with_scratch};
 use megu_client_ui::state::{HudState, Screen, UiState};
 use megu_client_ui::subtitle_hud::{
     SubtitleArrow, SubtitleHudState, DEFAULT_TTL_SECS, MAX_SUBTITLE_ENTRIES,
@@ -334,6 +334,41 @@ fn layout_subtitle_hud_gates_on_setting_and_emptiness() {
         assert!(layout_subtitle_hud(&ui, &subs, w, h, &mut out));
         assert!(out.commands.len() > before);
     }
+}
+
+#[test]
+fn scratch_layout_matches_legacy_and_reuses_occupancy_capacity() {
+    let (w, h) = (1280, 720);
+    let mut ui = hostile_ui(true);
+    let subs = spatial_subtitles();
+    let mut expected = ui.render(w, h);
+    let mut actual = ui.render(w, h);
+    assert!(layout_subtitle_hud(&ui, &subs, w, h, &mut expected));
+
+    let mut occupied = Vec::new();
+    assert!(layout_subtitle_hud_with_scratch(
+        &ui,
+        &subs,
+        w,
+        h,
+        &mut actual,
+        &mut occupied,
+    ));
+    assert_eq!(actual, expected);
+    assert!(!occupied.is_empty());
+    let capacity = occupied.capacity();
+
+    let mut next = ui.render(w, h);
+    assert!(layout_subtitle_hud_with_scratch(
+        &ui,
+        &subs,
+        w,
+        h,
+        &mut next,
+        &mut occupied,
+    ));
+    assert_eq!(next, expected);
+    assert_eq!(occupied.capacity(), capacity);
 }
 
 #[test]

@@ -193,13 +193,17 @@ pub fn build_and_pack_section_mesh(input: &SectionMeshInput) -> BuiltSectionMesh
     let Some(center) = input.cells[0].as_deref() else {
         return out;
     };
-    // `Uniform` centers hold no dense array; materialize one for this pass so
+    // Compact and uniform centers materialize one array for this pass so
     // `SectionView` keeps its flat-block layout, bit-identical to `build`.
     let expanded;
     let blocks: &[Block; SECTION_CELLS] = match &center.blocks {
         SectionBlocks::Dense(dense) => dense,
         SectionBlocks::Uniform(block) => {
             expanded = Box::new([*block; SECTION_CELLS]);
+            &expanded
+        }
+        blocks @ SectionBlocks::Palette { .. } => {
+            expanded = blocks.expand();
             &expanded
         }
     };
@@ -555,6 +559,45 @@ impl MeshCache {
         self.sections.get(&coord).map(|arc| arc.heap_bytes())
     }
 
+    /// Total block-storage heap bytes held by section snapshots.
+    pub fn mesh_cache_blocks_heap_bytes(&self) -> usize {
+        self.sections.values().map(|section| section.heap_bytes()).sum()
+    }
+
+    /// Total bytes held by dense section arrays still retained in this cache.
+    pub fn mesh_cache_dense_bytes(&self) -> usize {
+        self.sections
+            .values()
+            .map(|section| section.blocks.dense_bytes())
+            .sum()
+    }
+
+    /// Compacts any retained dense snapshots without changing voxel content.
+    /// Existing asynchronous inputs keep their own immutable `Arc` snapshots;
+    /// the cache points at compact replacements for all future jobs.
+    pub fn compact_dense_snapshots(&mut self) -> usize {
+        let coords: Vec<_> = self.sections.keys().copied().collect();
+        coords
+            .into_iter()
+            .map(|coord| self.compact_dense_snapshot(coord))
+            .sum()
+    }
+
+    fn compact_dense_snapshot(&mut self, coord: SectionCoord) -> usize {
+        let Some(section) = self.sections.get_mut(&coord) else {
+            return 0;
+        };
+        if let Some(section) = Arc::get_mut(section) {
+            return section.compact_dense_blocks();
+        }
+        let mut compact = (**section).clone();
+        let released = compact.compact_dense_blocks();
+        if released != 0 {
+            *section = Arc::new(compact);
+        }
+        released
+    }
+
     pub fn pending(&self) -> usize {
         self.dirty.len()
     }
@@ -604,6 +647,7 @@ impl MeshCache {
             };
             self.subtile_masks.remove(&coord);
             let mesh = self.build(coord);
+            self.compact_dense_snapshot(coord);
             self.meshes.insert(coord, mesh);
             self.released_meta.remove(&coord);
             self.note_rebuilt(coord);
@@ -638,6 +682,7 @@ impl MeshCache {
                 break;
             }
             let mesh = self.build(coord);
+            self.compact_dense_snapshot(coord);
             // RenderRegion uploads four packed vertices and six u32 indices
             // for each quad. Budget the actual payload rather than the in-RAM
             // size of a Quad, with a conservative CPU transfer estimate.
@@ -696,6 +741,7 @@ impl MeshCache {
             self.dirty.remove(&coord);
             self.subtile_masks.remove(&coord);
             let mesh = self.build(coord);
+            self.compact_dense_snapshot(coord);
             self.meshes.insert(coord, mesh);
             self.released_meta.remove(&coord);
             self.note_rebuilt(coord);
@@ -959,7 +1005,7 @@ impl MeshCache {
 
     fn build(&self, coord: SectionCoord) -> Vec<Quad> {
         let stored = &self.sections[&coord];
-        // `Uniform` sections hold no dense array; materialize one just for
+    // Compact and uniform sections hold no dense array; materialize one just for
         // this meshing pass so `SectionView` keeps its flat-block layout and
         // the mesher output is bit-identical to a dense snapshot.
         let expanded;
@@ -967,6 +1013,10 @@ impl MeshCache {
             SectionBlocks::Dense(dense) => dense,
             SectionBlocks::Uniform(block) => {
                 expanded = Box::new([*block; SECTION_CELLS]);
+                &expanded
+            }
+            blocks @ SectionBlocks::Palette { .. } => {
+                expanded = blocks.expand();
                 &expanded
             }
         };
@@ -988,7 +1038,7 @@ impl MeshCache {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{Layer, NO_FLUID};
+    use crate::{section_index, Layer, NO_FLUID};
 
     /// Axis-aligned box frustum: inside `min ..= max` in world blocks.
     fn box_planes(min: [f32; 3], max: [f32; 3]) -> [[f32; 4]; 6] {
@@ -1024,6 +1074,86 @@ mod tests {
             flags: 0,
             reserved: 0,
         }
+    }
+
+    fn dense_two_block_section() -> Section {
+        let mut blocks = Box::new([Block::AIR; SECTION_CELLS]);
+        blocks[section_index(15, 8, 8)] = Block::opaque_cube(1);
+        Section {
+            blocks,
+            block_light: [0; crate::LIGHT_BYTES],
+            sky_light: [0xff; crate::LIGHT_BYTES],
+        }
+    }
+
+    #[test]
+    fn meshing_compacts_dense_snapshot_without_changing_quads() {
+        let coord = SectionCoord(0, 0, 0);
+        let mut cache = MeshCache::default();
+        cache.insert(coord, dense_two_block_section());
+        let original = cache.build(coord);
+        let original_input = cache.snapshot_section_input(coord, 1).unwrap();
+        let original_built = build_and_pack_section_mesh(&original_input);
+        assert_eq!(cache.mesh_cache_dense_bytes(), 65_536);
+
+        cache.rebuild_dirty(usize::MAX);
+        assert_eq!(cache.mesh_cache_dense_bytes(), 0);
+        assert!(cache.mesh_cache_blocks_heap_bytes() < 65_536);
+        assert_eq!(cache.build(coord), original);
+        let compact_input = cache.snapshot_section_input(coord, 1).unwrap();
+        assert_eq!(build_and_pack_section_mesh(&compact_input), original_built);
+        assert_eq!(cache.mesh(coord), Some(original.as_slice()));
+        assert_eq!(cache.mesh_cache_dense_bytes(), 0);
+    }
+
+    #[test]
+    fn compact_snapshots_preserve_neighbor_arrival_and_boundary_edit_remeshes() {
+        let center = SectionCoord(0, 0, 0);
+        let east = SectionCoord(1, 0, 0);
+        let mut cache = MeshCache::default();
+        cache.insert(center, dense_two_block_section());
+        cache.rebuild_dirty(usize::MAX);
+        let east_faces_without_neighbor = cache
+            .mesh(center)
+            .unwrap()
+            .iter()
+            .filter(|quad| quad.direction == Direction::East)
+            .count();
+        assert_eq!(east_faces_without_neighbor, 1);
+        assert_eq!(cache.mesh_cache_dense_bytes(), 0);
+
+        let mut neighbor = Box::new([Block::AIR; SECTION_CELLS]);
+        neighbor[section_index(0, 8, 8)] = Block::opaque_cube(2);
+        cache.insert(
+            east,
+            Section {
+                blocks: neighbor,
+                block_light: [0; crate::LIGHT_BYTES],
+                sky_light: [0xff; crate::LIGHT_BYTES],
+            },
+        );
+        assert_eq!(cache.pending(), 2);
+        cache.rebuild_dirty(usize::MAX);
+        let east_faces_with_neighbor = cache
+            .mesh(center)
+            .unwrap()
+            .iter()
+            .filter(|quad| quad.direction == Direction::East)
+            .count();
+        assert_eq!(east_faces_with_neighbor, 0);
+        assert_eq!(cache.mesh_cache_dense_bytes(), 0);
+
+        assert!(cache.set_cell(east, [0, 8, 8], Block::AIR, Light::new(0, 15)));
+        assert!(cache.pending() >= 2);
+        cache.rebuild_dirty(usize::MAX);
+        let east_faces_after_edit = cache
+            .mesh(center)
+            .unwrap()
+            .iter()
+            .filter(|quad| quad.direction == Direction::East)
+            .count();
+        assert_eq!(east_faces_after_edit, 1);
+        assert_eq!(cache.mesh_cache_dense_bytes(), 0);
     }
 
     #[test]

@@ -1010,6 +1010,29 @@ pub fn decode_paletted_container(
     min_bits: u8,
     direct_bits: u8,
 ) -> Result<Vec<u32>, String> {
+    let mut out = vec![0; entry_count];
+    decode_paletted_container_into(
+        reader,
+        entry_count,
+        indirect_max,
+        min_bits,
+        direct_bits,
+        &mut out,
+    )?;
+    Ok(out)
+}
+
+fn decode_paletted_container_into(
+    reader: &mut WireReader<'_>,
+    entry_count: usize,
+    indirect_max: u8,
+    min_bits: u8,
+    direct_bits: u8,
+    out: &mut [u32],
+) -> Result<(), String> {
+    if out.len() != entry_count {
+        return Err(format!("palette output length {} != {entry_count}", out.len()));
+    }
     let bits = reader.read_u8()?;
     if bits == 0 {
         let single = u32::try_from(reader.read_varint()?)
@@ -1019,7 +1042,8 @@ pub fn decode_paletted_container(
         if data_len != 0 {
             let _ = reader.take(data_len * 8)?;
         }
-        return Ok(vec![single; entry_count]);
+        out.fill(single);
+        return Ok(());
     }
 
     let palette = if bits <= indirect_max {
@@ -1068,7 +1092,6 @@ pub fn decode_paletted_container(
         words.push(reader.read_u64()?);
     }
 
-    let mut out = Vec::with_capacity(entry_count);
     for i in 0..entry_count {
         let word = words[i / per_word];
         let shift = (i % per_word) * usize::from(bits);
@@ -1079,9 +1102,9 @@ pub fn decode_paletted_container(
                 .ok_or_else(|| format!("palette index {raw} out of range {}", pal.len()))?,
             None => raw,
         };
-        out.push(state);
+        out[i] = state;
     }
-    Ok(out)
+    Ok(())
 }
 
 #[derive(Clone, Debug)]
@@ -1275,12 +1298,24 @@ pub fn decode_chunk_packet_profiled(
     let mut sections = Vec::with_capacity(section_count);
     for _ in 0..section_count {
         let non_air = sec_reader.read_i16()?;
-        let states_vec = decode_paletted_container(&mut sec_reader, 4096, 8, 4, state_direct_bits)?;
-        let biomes_vec = decode_paletted_container(&mut sec_reader, 64, 3, 1, biome_direct_bits)?;
         let mut states = Box::new([0u32; 4096]);
-        states.copy_from_slice(&states_vec);
         let mut biomes = [0u32; 64];
-        biomes.copy_from_slice(&biomes_vec);
+        decode_paletted_container_into(
+            &mut sec_reader,
+            states.len(),
+            8,
+            4,
+            state_direct_bits,
+            &mut states[..],
+        )?;
+        decode_paletted_container_into(
+            &mut sec_reader,
+            biomes.len(),
+            3,
+            1,
+            biome_direct_bits,
+            &mut biomes,
+        )?;
         sections.push(DecodedSection {
             non_air,
             states,
