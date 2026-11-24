@@ -29,6 +29,11 @@
 //!   `GuiGraphics -> DrawCmd` draw ops, the read-only HUD snapshot mods
 //!   see, fair-play-capped container slot actions, the fail-closed
 //!   `GGB1` wire codec, and the lowering pass into the native draw list.
+//! * [`seamless_ux`] — the seamless-onboarding layer: one-click
+//!   bilingual quality presets + ranked settings search + the
+//!   translucent live-preview settings backdrop, the universal
+//!   drag-and-drop payload classifier with mandatory consent prompts,
+//!   and the secret-denylist-guarded existing-launcher importer.
 //!
 //! Typical frame loop for an embedder:
 //!
@@ -55,6 +60,7 @@ pub mod mod_i18n;
 pub mod mod_menu;
 pub mod qol_helpers;
 pub mod recipe_browser;
+pub mod seamless_ux;
 pub mod shader_screen;
 pub mod sign_and_chat;
 pub mod state;
