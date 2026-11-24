@@ -110,6 +110,19 @@
 //!   controller, and exact 63-bit Morton Z-order keys with the
 //!   Mara-McGuire 2013 closed-form projected sphere diameter for
 //!   sub-pixel LOD/Hi-Z culling.
+//! * [`json`] — the canonical fail-closed RFC 8259 reader/writer:
+//!   [`json::parse_json`] / [`json::parse_json_with_limits`] reject malformed
+//!   documents with byte-offset [`json::JsonError`]s under bounded depth,
+//!   node and byte [`json::JsonLimits`] (plus opt-in duplicate-key
+//!   rejection), and [`json::quote_json_string`] /
+//!   [`json::JsonValue::to_json_string`] emit one canonical escaping so every
+//!   lane serializes identically.
+//! * [`crypto`] — the canonical pure-Rust digests the workspace shares:
+//!   streaming + one-shot + hex forms of FIPS 180-4 [`crypto::Sha256`] and
+//!   [`crypto::Sha1`] and RFC 1321 [`crypto::Md5`], plus the Minecraft
+//!   derivations [`crypto::offline_player_uuid`] (UUID v3 over
+//!   `"OfflinePlayer:" + name`), [`crypto::minecraft_sha1_hex`] (Mojang's
+//!   signed `BigInteger` server hash) and [`crypto::sha256_file`].
 //! * [`morton`] — branchless SWAR magic-bit Morton (Z-order) spatial
 //!   encoding for cache locality: [`morton::morton3_encode_u4`] /
 //!   [`morton::morton3_decode_u4`] give the 12-bit `0..4096` index space
@@ -132,6 +145,7 @@
 
 pub mod bits;
 pub mod crash_report;
+pub mod crypto;
 pub mod diff_engine;
 pub mod dye_and_items;
 pub mod fault_isolation;
@@ -140,6 +154,7 @@ pub mod hash;
 pub mod hw_adaptive_engine;
 pub mod id;
 pub mod i18n;
+pub mod json;
 pub mod math;
 pub mod math_opt_engine;
 pub mod math_opt_foundation;
