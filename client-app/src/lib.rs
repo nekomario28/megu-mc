@@ -8,6 +8,7 @@ pub mod cli;
 pub mod crash_reporter;
 pub mod frame_pacer;
 pub mod friend_client;
+pub mod friends_store;
 pub mod hardware_profile;
 pub mod integrated;
 pub mod kinetic_sync;

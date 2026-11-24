@@ -7,7 +7,7 @@
 use std::env;
 use std::fs;
 use std::io;
-use std::net::{SocketAddr, TcpListener, TcpStream};
+use std::net::{Ipv4Addr, SocketAddr, TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::thread;
@@ -20,6 +20,47 @@ use crate::settings::{ClientSettings, HostMapFairPlaySettings};
 const READY_TIMEOUT: Duration = Duration::from_secs(15);
 const READY_POLL: Duration = Duration::from_millis(50);
 
+/// The integrated host binds loopback only — never `0.0.0.0`, so a
+/// singleplayer or friend-hosted world is unreachable from the LAN even
+/// when a friend relay exposes it to remote guests.
+pub const INTEGRATED_BIND_IP: Ipv4Addr = Ipv4Addr::LOCALHOST;
+
+/// The dedicated `megu` server's conventional port. Integrated
+/// singleplayer/friend-hosted worlds must never claim it: a player
+/// running a dedicated `megu` server on `25565` while playing
+/// singleplayer on the same PC would otherwise collide.
+pub const DEDICATED_SERVER_PORT: u16 = 25565;
+
+/// Allocate the integrated host's OS-assigned ephemeral port on loopback.
+/// Binding port `0` — never a fixed port — is what guarantees an
+/// integrated world can never collide with a dedicated `megu` server
+/// running on the same machine.
+fn allocate_loopback_port() -> Result<u16, String> {
+    let listener = TcpListener::bind((INTEGRATED_BIND_IP, 0))
+        .map_err(|e| format!("cannot allocate loopback port: {e}"))?;
+    let port = listener
+        .local_addr()
+        .map_err(|e| format!("cannot read loopback port: {e}"))?
+        .port();
+    // Ephemeral allocations never land on 25565 on any platform, but the
+    // dedicated-server collision guarantee is worth a fail-closed check.
+    if port == DEDICATED_SERVER_PORT {
+        return Err(
+            "OS assigned the dedicated-server port to the integrated host".to_string(),
+        );
+    }
+    Ok(port)
+}
+
+/// The only location an integrated or friend-hosted world may live:
+/// `<gameDir>/saves/<world>` after [`validate_world_name`] rejects every
+/// separator, traversal segment, dot name and control character — so a
+/// world name can never write outside `saves/`.
+pub fn world_save_dir(game_dir: &Path, world_name: &str) -> Result<PathBuf, String> {
+    validate_world_name(world_name)?;
+    Ok(game_dir.join("saves").join(world_name))
+}
+
 /// A running integrated `megu` server child. Dropping kills and reaps it.
 pub struct SingleplayerServer {
     child: Child,
@@ -30,7 +71,7 @@ pub struct SingleplayerServer {
 
 impl SingleplayerServer {
     pub fn addr(&self) -> SocketAddr {
-        SocketAddr::from(([127, 0, 0, 1], self.port))
+        SocketAddr::from((INTEGRATED_BIND_IP, self.port))
     }
 }
 
@@ -424,23 +465,16 @@ pub fn launch(cfg: &CliConfig) -> Result<SingleplayerServer, String> {
     })?;
 
     let game_dir = cfg.game_dir.clone().unwrap_or_else(|| PathBuf::from("."));
-    let world_dir = game_dir.join("saves").join(world);
+    let world_dir = world_save_dir(&game_dir, world)?;
     prepare_world_dir(&world_dir, &runtime_root)?;
 
     // Ephemeral loopback port: bind :0, read the assigned port, release.
-    let port = {
-        let listener = TcpListener::bind(("127.0.0.1", 0))
-            .map_err(|e| format!("cannot allocate loopback port: {e}"))?;
-        listener
-            .local_addr()
-            .map_err(|e| format!("cannot read loopback port: {e}"))?
-            .port()
-    };
+    let port = allocate_loopback_port()?;
 
     let mut command = Command::new(&server_bin);
     command
         .current_dir(&world_dir)
-        .env("MEGU_BIND_ADDR", "127.0.0.1")
+        .env("MEGU_BIND_ADDR", INTEGRATED_BIND_IP.to_string())
         .env("MEGU_PORT", port.to_string())
         .env("MEGU_WORLD_DIR", &world_dir)
         .stdin(Stdio::null())
@@ -469,7 +503,7 @@ pub fn launch(cfg: &CliConfig) -> Result<SingleplayerServer, String> {
         )
     })?;
 
-    let addr = SocketAddr::from(([127, 0, 0, 1], port));
+    let addr = SocketAddr::from((INTEGRATED_BIND_IP, port));
     let deadline = Instant::now() + READY_TIMEOUT;
     loop {
         if let Ok(Some(status)) = child.try_wait() {
@@ -566,5 +600,42 @@ mod tests {
             Some(canonicalize_best_effort(root.join("mods")))
         );
         let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn integrated_host_never_claims_dedicated_port_or_escapes_saves() {
+        // Loopback only — never the wildcard — and always an OS-assigned
+        // ephemeral port, so an integrated world can never collide with a
+        // dedicated `megu` server on 25565 on the same machine.
+        assert!(INTEGRATED_BIND_IP.is_loopback());
+        assert!(!INTEGRATED_BIND_IP.is_unspecified());
+        for _ in 0..16 {
+            let port = allocate_loopback_port().unwrap();
+            assert_ne!(port, DEDICATED_SERVER_PORT);
+        }
+
+        // Worlds live strictly under <gameDir>/saves/<world>; every
+        // separator, traversal segment and dot/control name is rejected
+        // before the path is ever joined.
+        let game_dir = Path::new("megu-game-dir");
+        let world_dir = world_save_dir(game_dir, "My World").unwrap();
+        assert_eq!(world_dir, game_dir.join("saves").join("My World"));
+        assert!(world_dir.starts_with(game_dir.join("saves")));
+        for bad in [
+            "..",
+            ".",
+            "",
+            "../escape",
+            "a/b",
+            "a\\b",
+            "saves/../outside",
+            "nul\0byte",
+            "ctrl\u{0007}char",
+        ] {
+            assert!(
+                world_save_dir(game_dir, bad).is_err(),
+                "world name {bad:?} must be rejected"
+            );
+        }
     }
 }
