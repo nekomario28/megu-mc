@@ -1,0 +1,15 @@
+# Native Megu mod package manifest. Read by tools/megu_mod_dev.py;
+# the server consumes megu-mod-bundle.json.
+schema = "megu-mod/1"
+
+[mod]
+id = "ruby_starter"
+name = "Ruby Starter"
+version = "0.1.0"
+mc_version_range = "[1.21.1,)"
+authors = ["Example Author"]
+license = "MIT"
+description = "Native ruby mod: block, item, shaped/smelting recipes, unified #c:gems/ruby tag, and two locales."
+
+[bundle]
+file = "megu-mod-bundle.json"

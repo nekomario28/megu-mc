@@ -92,6 +92,7 @@ python3 tests/fabric_shim_test.py
 python3 tests/client_launcher_test.py
 python3 tests/megu_start_test.py
 python3 tests/megu_mods_test.py
+python3 tests/megu_mod_dev_test.py
 python3 tests/megu_tui_test.py
 python3 tests/megu_shell_test.py
 python3 tests/load_client_test.py

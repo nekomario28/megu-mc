@@ -2,6 +2,8 @@
 
 対象は Minecraft 1.21.1 の NeoForge / Fabric Mod 作者、および Megu クライアント用シェーダー作者です。現行の CLI・アダプター・Bundle API の使い方を示します。事前解析で互換候補と判定されても、実ワールドでの動作保証にはなりません。
 
+ネイティブ Mod を JSON だけで作りたい場合は [Mod SDK ガイド](mod-sdk-guide.md) と [tools/megu_mod_dev.py](../tools/megu_mod_dev.py)（`init` / `validate` / `pack` / `watch` / `doctor`）を先に読んでください。AI エージェント向けの契約は [sdk/AGENTS.md](../sdk/AGENTS.md) にあります。
+
 ## 1. 既存 Mod（NeoForge 1.21.1 / Fabric 1.21.1）をそのまま動かす仕組み（自動アダプト）
 
 既存の `.jar` は `mods/` に置く運用を想定しています。作者が JAR を手作業で Rust に変換する必要はありません。サーバー側の `mod-adapter-core` がメタデータ、JSON データ、Mixin と JVM バイトコードを調べ、利用できるネイティブ機能・互換経路・フォールバックを振り分けます。**自動判定とすべての Mod の完全動作は別**で、実行には Mod ごとの互換性が必要です。
@@ -71,7 +73,7 @@ python3 tools/mod_launcher.py --mods-dir mods/ --auto-adapt --dry-run --json
 
 **ネイティブ開発の利点** — 対応する宣言的プリミティブだけで完結する Mod は、**Gradle・JDK・Minecraft mappings・Mixin の設定やボイラープレートが不要**です。JSON を記述して Rust の汎用ランタイムに渡せるため、個別の Java クラスをコンパイルする工程と JVM 実行コストを省けます。対応範囲では変更もデータ中心で、`dep_resolver::assess_hot_reload_after_add` は Bundle を含む安全な JAR を **hot-reload 可能と判定**します。再起動不要の適用可否は JAR 内の Mixin・ネイティブライブラリ・バイトコードに依存します。
 
-**スターターの自動生成は実装済み**です。`--scaffold-native` は `megu-mod-bundle/1` の検証可能な宣言 JSON を標準出力または指定ファイルに生成します。`--version` は Bundle の `mc_version_range`（バージョン指定または Maven / SemVer 範囲）、`--name` は表示名の検証用引数です。現行のスキーマには表示名のフィールドがないため、Bundle に保存されるのは `mod_id` とバージョン範囲などの定義済みフィールドです。データパックの JSON は別途作成してください。
+**スターターの自動生成は実装済み**です。`--scaffold-native` は `megu-mod-bundle/1` の検証可能な宣言 JSON を標準出力または指定ファイルに生成します。プロジェクト全体（`megu-mod.toml`、bundle、`data/`、`assets/`、`README.md`）を雛形から作る場合は [tools/megu_mod_dev.py](../tools/megu_mod_dev.py) の `init`、検証・`.mmod` 生成・ホットリロードは `validate` / `pack` / `watch` を使います。手順の全体は [Mod SDK ガイド](mod-sdk-guide.md) を参照してください。`--version` は Bundle の `mc_version_range`（バージョン指定または Maven / SemVer 範囲）、`--name` は表示名の検証用引数です。現行のスキーマには表示名のフィールドがないため、Bundle に保存されるのは `mod_id` とバージョン範囲などの定義済みフィールドです。データパックの JSON は別途作成してください。
 
 ```sh
 # ファイルに保存する（親ディレクトリは事前に作成）
@@ -299,6 +301,7 @@ Fabric / NeoForge 互換レイヤ経由で動的ロードする **独立した�
 - Auto-adapt an existing JAR with `--adapt-jar mods/example.jar --out mods/adapted --json` (schema `megu-jar-adaptation/1`).
 - Auto-adapt a full folder with `--adapt-mods-dir mods/ --out mods/adapted --json` (schema `megu-mods-dir-adaptation/1`).
 - Generate a valid `megu-mod-bundle/1` starter with `--scaffold-native my_sample_mod --out my_sample_mod.bundle.json`.
+- Build a whole native project with `python3 tools/megu_mod_dev.py init|validate|pack|watch`; see [the Mod SDK guide](mod-sdk-guide.md) and the [AI agent contract](../sdk/AGENTS.md).
 - `--adapt-*` exits 0 for accepted/skipped/Tier 2 mods, 2 for Tier 3 or invalid arguments, and 1 for unreadable or unsafe input.
 - `live_mod_bridge` auto-classifies JARs and registers validated bundles during boot. `tools/mod_launcher.py --auto-adapt` enables launcher preflight classification.
 - Native bundle authors can avoid Gradle, JDK, mappings and Mixin boilerplate.

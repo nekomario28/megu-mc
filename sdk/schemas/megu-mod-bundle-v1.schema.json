@@ -1,0 +1,899 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://megu.megumin.tech/schemas/megu-mod-bundle-v1.schema.json",
+  "title": "megu-mod-bundle/1",
+  "description": "Fail-closed declarative mod bundle consumed by mod-adapter-core/src/unified_bundle.rs (`DeclarativeModBundle::from_json`). Every key here is accepted; every other key is rejected. The document describes a JVM-free mod: portals, progression barriers, biome regions, creature specs, custom payload channels, and optionally spells, custom statuses, and multiblock rituals. Ids are Minecraft resource locations (`namespace:path`, unqualified names default to `minecraft:`), section counts are capped at 1024 entries, and version ranges accept Maven (`[1.21.1,)`) or SemVer (`>=1.21.1 <1.22`) syntax. Duplicate spell/status/ritual ids and duplicate ritual pattern offsets are rejected by the runtime and by `tools/megu_mod_dev.py validate`.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema",
+    "mod_id",
+    "mc_version_range",
+    "portals",
+    "progression_barriers",
+    "biome_regions",
+    "creatures",
+    "custom_channels"
+  ],
+  "properties": {
+    "schema": {
+      "description": "Exact schema tag. Any other value is rejected as `UnknownSchema`.",
+      "const": "megu-mod-bundle/1"
+    },
+    "mod_id": {
+      "description": "Declaring mod id. A valid resource location without traversal; `ruby_starter` is accepted as the unqualified path (namespace defaults to `minecraft`) and `ruby_starter:core` is accepted as a namespaced id.",
+      "$ref": "#/$defs/resourceLocation"
+    },
+    "mc_version_range": {
+      "description": "Minecraft compatibility range checked per install target. Maven interval syntax opens with `[` or `(` (e.g. `[1.21,1.21.5]`, `[1.21.1,)`); otherwise Fabric SemVer syntax is parsed (`>=1.21.1`, `~1.21.1`, `1.21.x`, `>=1.21.1 <1.22 || 26.3`). Empty or malformed ranges are rejected.",
+      "$ref": "#/$defs/versionRange"
+    },
+    "portals": {
+      "description": "Portal rules folded into `dimension_mod::PortalRegistry`. Required (may be empty).",
+      "type": "array",
+      "maxItems": 1024,
+      "items": { "$ref": "#/$defs/portal" }
+    },
+    "progression_barriers": {
+      "description": "Advancement-gated progression rules folded into `world_extensions::ProgressionBarrierEngine`. Required (may be empty).",
+      "type": "array",
+      "maxItems": 1024,
+      "items": { "$ref": "#/$defs/progressionBarrier" }
+    },
+    "biome_regions": {
+      "description": "Weighted biome-override regions folded into `world_extensions::BiomeRegionBlender`. Required (may be empty).",
+      "type": "array",
+      "maxItems": 1024,
+      "items": { "$ref": "#/$defs/biomeRegion" }
+    },
+    "creatures": {
+      "description": "Tameable/breedable creature specs folded into `creature_primitives::CreatureSpec`. Required (may be empty).",
+      "type": "array",
+      "maxItems": 1024,
+      "items": { "$ref": "#/$defs/creature" }
+    },
+    "custom_channels": {
+      "description": "`CustomPacketPayload` channel ids the bundle listens on. Each entry is a resource location. This declares channel ids only; it never registers executable handlers. Required (may be empty).",
+      "type": "array",
+      "maxItems": 1024,
+      "items": { "$ref": "#/$defs/resourceLocation" }
+    },
+    "spells": {
+      "description": "Optional composable spell definitions (`magic_primitives::SpellDefinition`). Ids must be unique. Omit the key entirely when unused: it is optional, but when present it must be an array.",
+      "type": "array",
+      "maxItems": 1024,
+      "items": { "$ref": "#/$defs/spell" }
+    },
+    "custom_statuses": {
+      "description": "Optional custom status-effect definitions (`magic_primitives::StatusEffectDefinition`). Ids must be unique. Omit the key entirely when unused.",
+      "type": "array",
+      "maxItems": 1024,
+      "items": { "$ref": "#/$defs/customStatus" }
+    },
+    "rituals": {
+      "description": "Optional multiblock ritual recipes (`magic_primitives::RitualRecipe`). Ids and pattern offsets must be unique. Omit the key entirely when unused.",
+      "type": "array",
+      "maxItems": 1024,
+      "items": { "$ref": "#/$defs/ritual" }
+    }
+  },
+  "$defs": {
+    "resourceLocation": {
+      "description": "Minecraft resource location validated by `megu_core::id::ResourceLocation::parse`: optional `namespace:` prefix, namespace `[a-z0-9_.-]+`, path `[a-z0-9_./-]+`, no second `:`, and no `..` path segment. Unqualified input (`stone`) defaults to `minecraft:stone`.",
+      "type": "string",
+      "pattern": "^(?:[a-z0-9_.-]+:)?[a-z0-9_./-]+$",
+      "not": { "pattern": "(^|/)\\.\\.(/|$)" },
+      "examples": ["minecraft:stone", "ruby_starter:ruby_block", "c:gems/ruby"]
+    },
+    "tagOrResourceLocation": {
+      "description": "Either a resource location or a `#`-prefixed tag reference. Allowed exactly where the runtime primitive accepts tags (portal pool borders, creature item lists).",
+      "type": "string",
+      "pattern": "^#?(?:[a-z0-9_.-]+:)?[a-z0-9_./-]+$",
+      "not": { "pattern": "(^|/)\\.\\.(/|$)" },
+      "examples": ["#c:gems/ruby", "#ruby_starter:ruby_boar_food", "minecraft:apple"]
+    },
+    "versionRange": {
+      "description": "Maven interval or Fabric SemVer range parsed by `version_compat::VersionRange::parse`. Both syntaxes are fail-closed: empty input, stray separators, and non-numeric components are rejected.",
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 64,
+      "pattern": "^\\s*(?:\\[|\\(|\\*|x|X|[0-9]|[~^<>=])",
+      "examples": ["[1.21.1,)", ">=1.21.1 <1.22", "~1.21.1", "1.21.x"]
+    },
+    "u8": {
+      "description": "Unsigned 8-bit integer.",
+      "type": "integer",
+      "minimum": 0,
+      "maximum": 255
+    },
+    "u32": {
+      "description": "Unsigned 32-bit integer.",
+      "type": "integer",
+      "minimum": 0,
+      "maximum": 4294967295
+    },
+    "i32": {
+      "description": "Signed 32-bit integer.",
+      "type": "integer",
+      "minimum": -2147483648,
+      "maximum": 2147483647
+    },
+    "speed": {
+      "description": "Non-negative finite movement speed multiplier.",
+      "type": "number",
+      "minimum": 0
+    },
+    "traversalRejectingTagList": {
+      "description": "Array of at most 512 tag-or-id references.",
+      "type": "array",
+      "maxItems": 512,
+      "items": { "$ref": "#/$defs/tagOrResourceLocation" }
+    },
+    "resourceLocationList": {
+      "description": "Array of at most 512 resource locations.",
+      "type": "array",
+      "maxItems": 512,
+      "items": { "$ref": "#/$defs/resourceLocation" }
+    },
+    "portal": {
+      "description": "One portal rule. `name` is a free-form rule identifier (built-in rules spell dimension id plus suffix, e.g. `ad_astra:moon:rocket_ascent`) and only has to be non-empty; the ids around it are validated resource locations.",
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["name", "target_dim", "trigger"],
+      "properties": {
+        "name": {
+          "description": "Non-empty rule identifier. Not a resource location.",
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128,
+          "examples": ["ruby_starter:ruby_gate"]
+        },
+        "target_dim": {
+          "description": "Destination dimension id.",
+          "$ref": "#/$defs/resourceLocation"
+        },
+        "teleport_grace_ticks": {
+          "description": "Immunity window after a transition. Optional; the runtime default applies when absent.",
+          "$ref": "#/$defs/u32"
+        },
+        "trigger": { "$ref": "#/$defs/portalTrigger" }
+      }
+    },
+    "portalTrigger": {
+      "description": "Portal activation shape. The `kind` field selects exactly one variant; unknown kinds are rejected rather than defaulted.",
+      "oneOf": [
+        { "$ref": "#/$defs/triggerVerticalFrame" },
+        { "$ref": "#/$defs/triggerHorizontalPool" },
+        { "$ref": "#/$defs/triggerAltitudeThreshold" },
+        { "$ref": "#/$defs/triggerDirectBlockInteract" }
+      ]
+    },
+    "triggerVerticalFrame": {
+      "description": "Obsidian-style vertical frame built from `frame_block`, lit by `igniter_item`, opening into `portal_block`. Minimums must be >= 1 and each maximum must be >= its minimum (checked by the runtime).",
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "kind",
+        "frame_block",
+        "igniter_item",
+        "min_width",
+        "min_height",
+        "max_width",
+        "max_height",
+        "portal_block"
+      ],
+      "properties": {
+        "kind": { "const": "vertical_frame" },
+        "frame_block": { "$ref": "#/$defs/resourceLocation" },
+        "igniter_item": { "$ref": "#/$defs/resourceLocation" },
+        "min_width": { "type": "integer", "minimum": 1, "maximum": 4294967295 },
+        "min_height": { "type": "integer", "minimum": 1, "maximum": 4294967295 },
+        "max_width": { "$ref": "#/$defs/u32" },
+        "max_height": { "$ref": "#/$defs/u32" },
+        "portal_block": { "$ref": "#/$defs/resourceLocation" }
+      }
+    },
+    "triggerHorizontalPool": {
+      "description": "Fluid-pool portal (e.g. a tagged water pool). `border_tags_or_blocks` accepts tags or ids and must be non-empty.",
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "kind",
+        "border_tags_or_blocks",
+        "fluid_block",
+        "min_size",
+        "drop_item",
+        "portal_block"
+      ],
+      "properties": {
+        "kind": { "const": "horizontal_pool" },
+        "border_tags_or_blocks": {
+          "type": "array",
+          "minItems": 1,
+          "maxItems": 512,
+          "items": { "$ref": "#/$defs/tagOrResourceLocation" }
+        },
+        "fluid_block": { "$ref": "#/$defs/resourceLocation" },
+        "min_size": { "type": "integer", "minimum": 1, "maximum": 4294967295 },
+        "drop_item": { "$ref": "#/$defs/resourceLocation" },
+        "portal_block": { "$ref": "#/$defs/resourceLocation" }
+      }
+    },
+    "triggerAltitudeThreshold": {
+      "description": "Rocket-ascent style portal: crossing `min_y_trigger` teleports when the optional vehicle/item requirement is met.",
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["kind", "min_y_trigger"],
+      "properties": {
+        "kind": { "const": "altitude_threshold" },
+        "min_y_trigger": { "$ref": "#/$defs/i32" },
+        "required_vehicle_or_item": {
+          "description": "Optional vehicle or item id required to activate. Omit or use null for none.",
+          "anyOf": [
+            { "$ref": "#/$defs/resourceLocation" },
+            { "type": "null" }
+          ]
+        }
+      }
+    },
+    "triggerDirectBlockInteract": {
+      "description": "Right-click a specific block to teleport, optionally requiring an item.",
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["kind", "block_id"],
+      "properties": {
+        "kind": { "const": "direct_block_interact" },
+        "block_id": { "$ref": "#/$defs/resourceLocation" },
+        "required_item": {
+          "description": "Optional item id required to activate. Omit or use null for none.",
+          "anyOf": [
+            { "$ref": "#/$defs/resourceLocation" },
+            { "type": "null" }
+          ]
+        }
+      }
+    },
+    "progressionBarrier": {
+      "description": "Advancement-gated dimension/biome lock. Entry, block break/place, periodic damage, and forced effects are all declarative; no event handler is registered.",
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["id", "dimension", "target_biomes", "required_advancements"],
+      "properties": {
+        "id": { "$ref": "#/$defs/resourceLocation" },
+        "dimension": { "$ref": "#/$defs/resourceLocation" },
+        "target_biomes": {
+          "description": "Biomes the barrier applies to. Must be non-empty.",
+          "$ref": "#/$defs/resourceLocationList",
+          "minItems": 1
+        },
+        "required_advancements": {
+          "description": "All listed advancements must be completed. Must be non-empty.",
+          "$ref": "#/$defs/resourceLocationList",
+          "minItems": 1
+        },
+        "block_break_protected": {
+          "description": "Reject block breaks inside gated biomes. Defaults to true.",
+          "type": "boolean",
+          "default": true
+        },
+        "block_place_protected": {
+          "description": "Reject block placements inside gated biomes. Defaults to true.",
+          "type": "boolean",
+          "default": true
+        },
+        "enforce_effects": {
+          "description": "Status effects re-applied while the player is inside the gated biomes.",
+          "type": "array",
+          "maxItems": 512,
+          "items": { "$ref": "#/$defs/enforcedEffect" }
+        },
+        "periodic_damage": {
+          "description": "Optional repeating damage while inside the gate. `hearts` must be > 0 and `interval_ticks` >= 1.",
+          "anyOf": [
+            { "$ref": "#/$defs/periodicDamage" },
+            { "type": "null" }
+          ]
+        }
+      }
+    },
+    "enforcedEffect": {
+      "description": "One status effect the barrier applies.",
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["effect", "duration_ticks", "amplifier"],
+      "properties": {
+        "effect": { "$ref": "#/$defs/resourceLocation" },
+        "duration_ticks": { "$ref": "#/$defs/u32" },
+        "amplifier": { "$ref": "#/$defs/u8" }
+      }
+    },
+    "periodicDamage": {
+      "description": "Periodic damage tick (in hearts).",
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["hearts", "interval_ticks"],
+      "properties": {
+        "hearts": { "type": "number", "exclusiveMinimum": 0 },
+        "interval_ticks": { "type": "integer", "minimum": 1, "maximum": 4294967295 }
+      }
+    },
+    "biomeRegion": {
+      "description": "Weighted biome-replacement region (TerraBlender-style Voronoi composition). `biome_overrides` must be non-empty.",
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["mod_id", "dimension", "weight", "biome_overrides"],
+      "properties": {
+        "mod_id": { "$ref": "#/$defs/resourceLocation" },
+        "dimension": { "$ref": "#/$defs/resourceLocation" },
+        "weight": {
+          "description": "Relative selection weight. 0 is accepted but never wins a weighted pick.",
+          "$ref": "#/$defs/u32"
+        },
+        "biome_overrides": {
+          "description": "Map of original biome id to replacement biome id. Must be non-empty.",
+          "type": "object",
+          "minProperties": 1,
+          "maxProperties": 512,
+          "propertyNames": { "$ref": "#/$defs/resourceLocation" },
+          "additionalProperties": { "$ref": "#/$defs/resourceLocation" }
+        }
+      }
+    },
+    "creature": {
+      "description": "Declarative tameable/breedable creature. `max_health` must be > 0, `tame_chance` lies in [0, 1], and movement uses one of five profiles.",
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["entity_type", "max_health", "movement"],
+      "properties": {
+        "entity_type": { "$ref": "#/$defs/resourceLocation" },
+        "max_health": {
+          "description": "Maximum health in half-hearts; must be > 0.",
+          "type": "number",
+          "exclusiveMinimum": 0
+        },
+        "tame_items": {
+          "description": "Items or tags that can tame the creature.",
+          "$ref": "#/$defs/traversalRejectingTagList"
+        },
+        "tame_chance": {
+          "description": "Per-attempt tame probability in [0, 1]. Defaults to 0.",
+          "type": "number",
+          "minimum": 0,
+          "maximum": 1,
+          "default": 0
+        },
+        "breed_items": {
+          "description": "Items or tags that trigger love mode.",
+          "$ref": "#/$defs/traversalRejectingTagList"
+        },
+        "heal_items": {
+          "description": "Items/tags and the health each restores.",
+          "type": "array",
+          "maxItems": 512,
+          "items": { "$ref": "#/$defs/healItem" }
+        },
+        "baby_growth_ticks": {
+          "description": "Ticks a baby needs to mature. Defaults to 24000.",
+          "$ref": "#/$defs/u32",
+          "default": 24000
+        },
+        "breed_cooldown_ticks": {
+          "description": "Breeding cooldown after a successful breed. Defaults to 6000.",
+          "$ref": "#/$defs/u32",
+          "default": 6000
+        },
+        "supports_wander_mode": {
+          "description": "Whether the command UI exposes the wander mode. Defaults to false.",
+          "type": "boolean",
+          "default": false
+        },
+        "can_shoulder_perch": {
+          "description": "Whether a tamed creature can perch on the owner's shoulder. Defaults to false.",
+          "type": "boolean",
+          "default": false
+        },
+        "rideable_when_tamed": {
+          "description": "Whether a tamed creature is rideable. Defaults to false.",
+          "type": "boolean",
+          "default": false
+        },
+        "movement": { "$ref": "#/$defs/movementProfile" }
+      }
+    },
+    "healItem": {
+      "description": "One healing item entry.",
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["item", "heal"],
+      "properties": {
+        "item": { "$ref": "#/$defs/tagOrResourceLocation" },
+        "heal": {
+          "description": "Health restored in half-hearts; must be >= 0.",
+          "type": "number",
+          "minimum": 0
+        }
+      }
+    },
+    "movementProfile": {
+      "description": "Locomotion profile. `kind` selects exactly one variant.",
+      "oneOf": [
+        { "$ref": "#/$defs/movementLand" },
+        { "$ref": "#/$defs/movementAmphibious" },
+        { "$ref": "#/$defs/movementAquatic" },
+        { "$ref": "#/$defs/movementGlidingFlight" },
+        { "$ref": "#/$defs/movementWallClimb" }
+      ]
+    },
+    "movementLand": {
+      "description": "Ground-only locomotion.",
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["kind", "ground_speed"],
+      "properties": {
+        "kind": { "const": "land" },
+        "ground_speed": { "$ref": "#/$defs/speed" }
+      }
+    },
+    "movementAmphibious": {
+      "description": "Walks on land and swims.",
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["kind", "land_speed", "swim_speed"],
+      "properties": {
+        "kind": { "const": "amphibious" },
+        "land_speed": { "$ref": "#/$defs/speed" },
+        "swim_speed": { "$ref": "#/$defs/speed" }
+      }
+    },
+    "movementAquatic": {
+      "description": "Fully aquatic; suffocates after `suffocates_in_air_ticks` out of water.",
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["kind", "swim_speed", "suffocates_in_air_ticks"],
+      "properties": {
+        "kind": { "const": "aquatic" },
+        "swim_speed": { "$ref": "#/$defs/speed" },
+        "suffocates_in_air_ticks": { "$ref": "#/$defs/u32" }
+      }
+    },
+    "movementGlidingFlight": {
+      "description": "Ground movement plus gliding flight.",
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["kind", "ground_speed", "fly_speed", "glide_fall_scale"],
+      "properties": {
+        "kind": { "const": "gliding_flight" },
+        "ground_speed": { "$ref": "#/$defs/speed" },
+        "fly_speed": { "$ref": "#/$defs/speed" },
+        "glide_fall_scale": { "$ref": "#/$defs/speed" }
+      }
+    },
+    "movementWallClimb": {
+      "description": "Ground movement plus wall climbing.",
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["kind", "ground_speed", "climb_speed"],
+      "properties": {
+        "kind": { "const": "wall_climb" },
+        "ground_speed": { "$ref": "#/$defs/speed" },
+        "climb_speed": { "$ref": "#/$defs/speed" }
+      }
+    },
+    "spell": {
+      "description": "Composable spell: cast state, ordered delivery steps (1..=16), and per-step effects (<=8). `mana_cost` must be >= 0.",
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["id", "mana_cost", "base_cooldown_ticks", "cast", "steps"],
+      "properties": {
+        "id": { "$ref": "#/$defs/resourceLocation" },
+        "mana_cost": { "type": "number", "minimum": 0 },
+        "base_cooldown_ticks": { "$ref": "#/$defs/u32" },
+        "cast": { "$ref": "#/$defs/spellCast" },
+        "interrupt_on_damage": {
+          "description": "Cancel the cast when the caster takes damage. Defaults to false.",
+          "type": "boolean",
+          "default": false
+        },
+        "interrupt_on_move": {
+          "description": "Cancel the cast when the caster moves. Defaults to false.",
+          "type": "boolean",
+          "default": false
+        },
+        "steps": {
+          "description": "Ordered delivery steps. Must contain at least one step, at most 16.",
+          "type": "array",
+          "minItems": 1,
+          "maxItems": 16,
+          "items": { "$ref": "#/$defs/spellStep" }
+        }
+      }
+    },
+    "spellCast": {
+      "description": "Cast timing model. `kind` selects exactly one variant.",
+      "oneOf": [
+        { "$ref": "#/$defs/castInstant" },
+        { "$ref": "#/$defs/castTime" },
+        { "$ref": "#/$defs/castChanneled" }
+      ]
+    },
+    "castInstant": {
+      "description": "Immediate cast.",
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["kind"],
+      "properties": { "kind": { "const": "instant" } }
+    },
+    "castTime": {
+      "description": "Fixed cast time in ticks (1..=72000).",
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["kind", "total_ticks"],
+      "properties": {
+        "kind": { "const": "cast_time" },
+        "total_ticks": { "type": "integer", "minimum": 1, "maximum": 72000 }
+      }
+    },
+    "castChanneled": {
+      "description": "Channeled cast: one pulse every `interval_ticks`, up to `max_ticks`, costing `mana_per_pulse` each.",
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["kind", "interval_ticks", "max_ticks", "mana_per_pulse"],
+      "properties": {
+        "kind": { "const": "channeled" },
+        "interval_ticks": { "type": "integer", "minimum": 1, "maximum": 4294967295 },
+        "max_ticks": { "type": "integer", "minimum": 1, "maximum": 72000 },
+        "mana_per_pulse": { "type": "number", "minimum": 0 }
+      }
+    },
+    "spellStep": {
+      "description": "One delivery step: a form plus the effects applied to every target it reaches.",
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["form", "effects"],
+      "properties": {
+        "form": { "$ref": "#/$defs/spellForm" },
+        "effects": {
+          "type": "array",
+          "maxItems": 8,
+          "items": { "$ref": "#/$defs/spellEffect" }
+        }
+      }
+    },
+    "spellForm": {
+      "description": "Delivery form. `kind` selects exactly one variant; every numeric bound mirrors `SpellForm::validate`.",
+      "oneOf": [
+        { "$ref": "#/$defs/formSelfCast" },
+        { "$ref": "#/$defs/formTouch" },
+        { "$ref": "#/$defs/formProjectile" },
+        { "$ref": "#/$defs/formRaycastBeam" },
+        { "$ref": "#/$defs/formAoeZone" },
+        { "$ref": "#/$defs/formChain" },
+        { "$ref": "#/$defs/formOrbit" },
+        { "$ref": "#/$defs/formSummon" }
+      ]
+    },
+    "formSelfCast": {
+      "description": "Apply effects to the caster.",
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["kind"],
+      "properties": { "kind": { "const": "self_cast" } }
+    },
+    "formTouch": {
+      "description": "Melee-range application; `range` must be > 0.",
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["kind", "range"],
+      "properties": {
+        "kind": { "const": "touch" },
+        "range": { "type": "number", "exclusiveMinimum": 0 }
+      }
+    },
+    "formProjectile": {
+      "description": "Projectile delivery; `speed` must be > 0 and `max_ticks` lies in 1..=72000.",
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["kind", "speed", "gravity", "max_ticks"],
+      "properties": {
+        "kind": { "const": "projectile" },
+        "speed": { "type": "number", "exclusiveMinimum": 0 },
+        "gravity": { "type": "number" },
+        "max_ticks": { "type": "integer", "minimum": 1, "maximum": 72000 }
+      }
+    },
+    "formRaycastBeam": {
+      "description": "Hitscan beam; `range` must be > 0 and `pierce_cap` lies in 1..=64.",
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["kind", "range", "pierce_cap"],
+      "properties": {
+        "kind": { "const": "raycast_beam" },
+        "range": { "type": "number", "exclusiveMinimum": 0 },
+        "pierce_cap": { "type": "integer", "minimum": 1, "maximum": 64 }
+      }
+    },
+    "formAoeZone": {
+      "description": "Pulsing area zone; `radius` must be in (0, 32].",
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["kind", "radius", "duration_ticks", "pulse_interval"],
+      "properties": {
+        "kind": { "const": "aoe_zone" },
+        "radius": { "type": "number", "exclusiveMinimum": 0, "maximum": 32 },
+        "duration_ticks": { "type": "integer", "minimum": 1, "maximum": 72000 },
+        "pulse_interval": { "type": "integer", "minimum": 1, "maximum": 4294967295 }
+      }
+    },
+    "formChain": {
+      "description": "Chain lightning; `max_hops` lies in 1..=8.",
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["kind", "max_hops", "hop_radius"],
+      "properties": {
+        "kind": { "const": "chain" },
+        "max_hops": { "type": "integer", "minimum": 1, "maximum": 8 },
+        "hop_radius": { "type": "number", "exclusiveMinimum": 0 }
+      }
+    },
+    "formOrbit": {
+      "description": "Orbiting orbs; `count` lies in 1..=32.",
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["kind", "count", "radius", "duration_ticks"],
+      "properties": {
+        "kind": { "const": "orbit" },
+        "count": { "type": "integer", "minimum": 1, "maximum": 32 },
+        "radius": { "type": "number", "exclusiveMinimum": 0 },
+        "duration_ticks": { "type": "integer", "minimum": 1, "maximum": 72000 }
+      }
+    },
+    "formSummon": {
+      "description": "Summon temporary entities; `max_active` lies in 1..=16.",
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["kind", "entity_type", "duration_ticks", "max_active"],
+      "properties": {
+        "kind": { "const": "summon" },
+        "entity_type": { "$ref": "#/$defs/resourceLocation" },
+        "duration_ticks": { "type": "integer", "minimum": 1, "maximum": 72000 },
+        "max_active": { "type": "integer", "minimum": 1, "maximum": 16 }
+      }
+    },
+    "spellEffect": {
+      "description": "One spell effect. `kind` selects exactly one variant; numeric bounds mirror `SpellEffect::validate`.",
+      "oneOf": [
+        { "$ref": "#/$defs/effectDamage" },
+        { "$ref": "#/$defs/effectHeal" },
+        { "$ref": "#/$defs/effectShield" },
+        { "$ref": "#/$defs/effectApplyStatus" },
+        { "$ref": "#/$defs/effectKnockback" },
+        { "$ref": "#/$defs/effectBlink" },
+        { "$ref": "#/$defs/effectConjureLight" },
+        { "$ref": "#/$defs/effectBreakBlock" },
+        { "$ref": "#/$defs/effectEmitVfx" }
+      ]
+    },
+    "effectDamage": {
+      "description": "Damage scaled by the caster's spell power.",
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["kind", "school", "base_amount"],
+      "properties": {
+        "kind": { "const": "damage" },
+        "school": { "$ref": "#/$defs/resourceLocation" },
+        "base_amount": { "type": "number", "minimum": 0 }
+      }
+    },
+    "effectHeal": {
+      "description": "Healing scaled by spell power.",
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["kind", "base_amount"],
+      "properties": {
+        "kind": { "const": "heal" },
+        "base_amount": { "type": "number", "minimum": 0 }
+      }
+    },
+    "effectShield": {
+      "description": "Absorption shield with a bounded duration.",
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["kind", "amount", "duration_ticks"],
+      "properties": {
+        "kind": { "const": "shield" },
+        "amount": { "type": "number", "minimum": 0 },
+        "duration_ticks": { "type": "integer", "minimum": 1, "maximum": 72000 }
+      }
+    },
+    "effectApplyStatus": {
+      "description": "Apply a registered custom status effect.",
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["kind", "status_id", "amplifier", "duration_ticks"],
+      "properties": {
+        "kind": { "const": "apply_status" },
+        "status_id": { "$ref": "#/$defs/resourceLocation" },
+        "amplifier": { "$ref": "#/$defs/u8" },
+        "duration_ticks": { "type": "integer", "minimum": 1, "maximum": 72000 }
+      }
+    },
+    "effectKnockback": {
+      "description": "Radial knockback impulse.",
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["kind", "strength"],
+      "properties": {
+        "kind": { "const": "knockback" },
+        "strength": { "type": "number", "minimum": 0 }
+      }
+    },
+    "effectBlink": {
+      "description": "Short-range teleport.",
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["kind", "max_distance"],
+      "properties": {
+        "kind": { "const": "blink" },
+        "max_distance": { "type": "number", "minimum": 0 }
+      }
+    },
+    "effectConjureLight": {
+      "description": "Place light; `level` lies in 0..=15.",
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["kind", "level", "duration_ticks"],
+      "properties": {
+        "kind": { "const": "conjure_light" },
+        "level": { "type": "integer", "minimum": 0, "maximum": 15 },
+        "duration_ticks": { "type": "integer", "minimum": 1, "maximum": 72000 }
+      }
+    },
+    "effectBreakBlock": {
+      "description": "Break a block up to `max_tier` harvest tier (0..=4).",
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["kind", "max_tier"],
+      "properties": {
+        "kind": { "const": "break_block" },
+        "max_tier": { "type": "integer", "minimum": 0, "maximum": 4 }
+      }
+    },
+    "effectEmitVfx": {
+      "description": "Emit a registered VFX id.",
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["kind", "vfx_id"],
+      "properties": {
+        "kind": { "const": "emit_vfx" },
+        "vfx_id": { "$ref": "#/$defs/resourceLocation" }
+      }
+    },
+    "customStatus": {
+      "description": "Custom status effect: damage/heal over time, absorption, action locks, attribute modifiers, and a VFX aura. `id` is the only required field. When `damage_per_pulse` or `heal_per_pulse` is > 0, `pulse_interval_ticks` must be >= 1.",
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["id"],
+      "properties": {
+        "id": { "$ref": "#/$defs/resourceLocation" },
+        "max_amplifier": {
+          "description": "Highest amplifier the registry accepts. Defaults to 0.",
+          "$ref": "#/$defs/u8",
+          "default": 0
+        },
+        "pulse_interval_ticks": {
+          "description": "Ticks between DoT/HoT pulses. Defaults to 0 (no pulse).",
+          "$ref": "#/$defs/u32",
+          "default": 0
+        },
+        "damage_per_pulse": {
+          "description": "Damage applied each pulse; must be >= 0. Defaults to 0.",
+          "type": "number",
+          "minimum": 0,
+          "default": 0
+        },
+        "heal_per_pulse": {
+          "description": "Healing applied each pulse; must be >= 0. Defaults to 0.",
+          "type": "number",
+          "minimum": 0,
+          "default": 0
+        },
+        "absorption_per_level": {
+          "description": "Absorption hearts granted per amplifier level. Defaults to 0.",
+          "type": "number",
+          "minimum": 0,
+          "default": 0
+        },
+        "frozen": {
+          "description": "Lock movement. Defaults to false.",
+          "type": "boolean",
+          "default": false
+        },
+        "rooted": {
+          "description": "Prevent voluntary movement. Defaults to false.",
+          "type": "boolean",
+          "default": false
+        },
+        "silenced": {
+          "description": "Disable spell casting. Defaults to false.",
+          "type": "boolean",
+          "default": false
+        },
+        "disarmed": {
+          "description": "Prevent item use. Defaults to false.",
+          "type": "boolean",
+          "default": false
+        },
+        "attribute_modifiers": {
+          "description": "Attribute id to additive modifier. At most 16 entries.",
+          "type": "object",
+          "maxProperties": 16,
+          "propertyNames": { "$ref": "#/$defs/resourceLocation" },
+          "additionalProperties": { "type": "number" }
+        },
+        "vfx_aura": {
+          "description": "Optional aura vfx id. Omit or use null for none.",
+          "anyOf": [
+            { "$ref": "#/$defs/resourceLocation" },
+            { "type": "null" }
+          ]
+        }
+      },
+      "allOf": [
+        {
+          "if": {
+            "anyOf": [
+              {
+                "required": ["damage_per_pulse"],
+                "properties": { "damage_per_pulse": { "exclusiveMinimum": 0 } }
+              },
+              {
+                "required": ["heal_per_pulse"],
+                "properties": { "heal_per_pulse": { "exclusiveMinimum": 0 } }
+              }
+            ]
+          },
+          "then": {
+            "required": ["pulse_interval_ticks"],
+            "properties": { "pulse_interval_ticks": { "minimum": 1 } }
+          }
+        }
+      ]
+    },
+    "ritual": {
+      "description": "Multiblock ritual: pattern offsets from the altar origin (each component in -16..=16), item reagents (1..=64 distinct, count >= 1), duration 1..=72000 ticks, and mana drain per tick. Ids and offsets must be unique.",
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["id", "pattern", "reagents", "duration_ticks", "mana_per_tick"],
+      "properties": {
+        "id": { "$ref": "#/$defs/resourceLocation" },
+        "pattern": {
+          "description": "Pattern blocks relative to the altar origin. At most 256 entries; offsets must be unique.",
+          "type": "array",
+          "maxItems": 256,
+          "items": { "$ref": "#/$defs/ritualBlock" }
+        },
+        "reagents": {
+          "description": "Item id to required count (each count >= 1).",
+          "type": "object",
+          "maxProperties": 64,
+          "propertyNames": { "$ref": "#/$defs/resourceLocation" },
+          "additionalProperties": { "type": "integer", "minimum": 1, "maximum": 4294967295 }
+        },
+        "duration_ticks": { "type": "integer", "minimum": 1, "maximum": 72000 },
+        "mana_per_tick": { "type": "number", "minimum": 0 }
+      }
+    },
+    "ritualBlock": {
+      "description": "One pattern block at a relative offset.",
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["dx", "dy", "dz", "block"],
+      "properties": {
+        "dx": { "type": "integer", "minimum": -16, "maximum": 16 },
+        "dy": { "type": "integer", "minimum": -16, "maximum": 16 },
+        "dz": { "type": "integer", "minimum": -16, "maximum": 16 },
+        "block": { "$ref": "#/$defs/resourceLocation" }
+      }
+    }
+  }
+}
