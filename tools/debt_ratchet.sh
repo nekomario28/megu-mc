@@ -41,18 +41,26 @@ count_noncomment() {
   grep -hEv '^[[:space:]]*//' src/*.rs 2>/dev/null | grep -oE "$1" | wc -l | tr -d ' '
 }
 
-# ratchet <label> <pattern> <limit> <why> [noncomment]
-ratchet() {
-  local label="$1" pattern="$2" limit="$3" why="$4" now display
-  if [ "${5:-}" = "noncomment" ]; then
-    now=$(count_noncomment "$pattern")
-    display="$now / $limit"
-  else
-    now=$(count "$pattern")
-    display="$now"
-  fi
+# count_ws <grep -E pattern> [find args...]
+#
+# Same contract as count(), but across every .rs in the repo — all standalone
+# crates and tools/ — rather than only the root crate's src/. Build output and
+# .git are excluded; callers pass extra find path filters (e.g.
+# -not -path '*/tests/*') to scope the count. find, not git ls-files, so the
+# ratchet still measures something inside a source snapshot with no .git.
+count_ws() {
+  local pattern="$1"
+  shift
+  find . -name '*.rs' -not -path '*/target/*' -not -path './.git/*' "$@" \
+      -exec grep -ohE "$pattern" {} + 2>/dev/null | wc -l | tr -d ' '
+}
+
+# report <label> <now> <limit> <why> [display]
+report() {
+  local label="$1" now="$2" limit="$3" why="$4" display="${5:-}"
+  display="${display:-$now}"
   if [ "$now" -eq 0 ] && [ "$limit" -gt 0 ]; then
-    echo "BLIND $label: the pattern '$pattern' matches nothing, so this check proves nothing."
+    echo "BLIND $label: the pattern matches nothing, so this check proves nothing."
     echo "      Either the thing it counts was removed - lower the limit to 0 and say so - or the"
     echo "      pattern no longer describes it and the ratchet has been passing on nothing."
     blind=$((blind + 1))
@@ -66,6 +74,28 @@ ratchet() {
   else
     echo "ok    $label: $display"
   fi
+}
+
+# ratchet <label> <pattern> <limit> <why> [noncomment]
+ratchet() {
+  local label="$1" pattern="$2" limit="$3" why="$4" now display
+  if [ "${5:-}" = "noncomment" ]; then
+    now=$(count_noncomment "$pattern")
+    report "$label" "$now" "$limit" "$why" "$now / $limit"
+  else
+    now=$(count "$pattern")
+    report "$label" "$now" "$limit" "$why"
+  fi
+}
+
+# ratchet_ws <label> <pattern> <limit> <why> [find args...]
+# Workspace-wide variant of ratchet(): the pattern is counted across every
+# .rs outside the excluded paths, so a duplicate that lands in a standalone
+# crate or tools/ is caught the same as one in src/.
+ratchet_ws() {
+  local label="$1" pattern="$2" limit="$3" why="$4"
+  shift 4
+  report "$label" "$(count_ws "$pattern" "$@")" "$limit" "$why"
 }
 
 # The clock cannot be saved, replayed or compared. Every consumer now draws from the world
@@ -84,6 +114,39 @@ ratchet "ignored tests (parked gates)" '#\[ignore' 1 \
 ratchet "lock/rwlock unwraps (no new poison cascades)" \
   '\.(lock|read|write)\(\)\.unwrap\(\)' 0 \
   "Poison-sensitive lock unwraps are extinct; any new one needs an explicit review." noncomment
+
+# Workspace-wide ratchets. These count every .rs in the repo — root src/ plus
+# all standalone crates and tools/ — so a regression cannot hide in a crate the
+# root-src counters never see. Baselines are the exact counts on main; lowering
+# one is a deliberate edit here, raising one is a reviewed decision.
+
+# An allow(dead_code) is a silenced warning; at this count it is load-bearing
+# only because each site was accepted once. New ones must be argued here.
+ratchet_ws "allow(dead_code) attributes (workspace)" 'allow\(dead_code\)' 2632 \
+  "Dead code should be deleted or wired, not silenced. A new allowance needs an explicit decision."
+
+# SHA-256 keeps being re-implemented per crate (mod-adapter-core, proto,
+# server-files, state-store, root) instead of shared through megu-core. The
+# ceiling freezes today's duplicates; consolidation lowers it.
+ratchet_ws "duplicate sha256/Sha256 impls outside core" \
+  '^(pub(\(crate\)|\(super\))? )?(struct Sha256|fn sha256)\b' 8 \
+  "SHA-256 belongs in megu-core; a new copy is a new thing to keep correct." \
+  -not -path '*/tests/*' -not -path './core/src/*'
+
+# Same story for the hand-rolled JSON parsers: five crates carry their own
+# JsonParser/parse_json. Frozen at today's count until they share one.
+ratchet_ws "duplicate JsonParser/parse_json impls outside core" \
+  '^(pub(\(crate\)|\(super\))? )?(struct JsonParser|fn parse_json)\b' 17 \
+  "JSON parsing belongs in megu-core; a new copy is a new parser to keep correct." \
+  -not -path '*/tests/*' -not -path './core/src/*'
+
+# CRC32 (IEEE) likewise: the canonical table lives in core/src/hash.rs; every
+# other top-level copy is a duplicate. Test modules are excluded by the
+# column-0 anchor and the */tests/* path filter.
+ratchet_ws "duplicate crc32 impls outside core/src/hash.rs" \
+  '^(pub(\(crate\)|\(super\))? )?(const )?fn crc32\(' 11 \
+  "CRC32 belongs in core/src/hash.rs; a new copy is a new table to keep correct." \
+  -not -path '*/tests/*' -not -path './core/src/hash.rs'
 
 echo
 if [ "$blind" -gt 0 ]; then

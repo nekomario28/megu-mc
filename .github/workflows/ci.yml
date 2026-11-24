@@ -56,6 +56,12 @@ jobs:
           python3 tests/java_toolchain_test.py
           python3 tests/verify_gate_coverage_test.py
           python3 tests/installer_cross_os_test.py
+          # Zero-JAR structural gates: no assets/, no datapacks/vanilla, no built
+          # binary required, so they run on every push rather than only nightly.
+          python3 tests/wiring_audit_test.py
+          python3 tests/public_export_test.py
+          python3 tests/release_bundle_test.py
+          python3 tests/item_interaction_audit_test.py
           python3 website/check_site.py
           node website/test_functions.mjs
       - name: Install the required dependency inspector from an immutable revision
@@ -106,6 +112,13 @@ jobs:
           echo "=== client-gpu (clippy + test) ==="
           cargo clippy --manifest-path client-gpu/Cargo.toml --all-targets --locked -- -D warnings
           cargo test --manifest-path client-gpu/Cargo.toml --locked
+      # tools/palette_bench is deliberately absent: it does not compile on main
+      # (the build.rs-generated adapter uses megu_core but its Cargo.toml
+      # declares no dependency). Add it back once that manifest is fixed.
+      - name: Tools crates compile (locked)
+        run: |
+          cargo check --manifest-path tools/storage_bench/Cargo.toml --locked
+          cargo check --manifest-path tools/offload_ffi_probe/Cargo.toml --locked
       - name: Build (locked)
         run: |
           cargo build --locked --message-format=json-render-diagnostics > build-artifacts.json

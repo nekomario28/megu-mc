@@ -19,7 +19,10 @@ jobs:
       matrix:
         os: [ubuntu-latest, macos-latest, windows-latest]
     runs-on: ${{ matrix.os }}
-    timeout-minutes: 35
+    # Root `cargo test --bin megu` codegen-builds the full dependency tree on
+    # every OS; 2-job Windows/macOS runners need well over the old 35-minute
+    # check-only budget.
+    timeout-minutes: 90
     env:
       CARGO_BUILD_JOBS: 2
     steps:
@@ -46,10 +49,12 @@ jobs:
           done
           echo "=== client-gpu (check) ==="
           cargo check --manifest-path client-gpu/Cargo.toml --all-targets --locked
-      # Root binary must compile everywhere: signal-hook is cfg(unix)-gated and
-      # entity UUID entropy goes through os_fill_random (urandom / BCryptGenRandom).
-      - name: Root binary check (locked)
-        run: cargo check --bins --locked
+      # Root binary must compile and its unit tests must pass everywhere:
+      # signal-hook is cfg(unix)-gated and entity UUID entropy goes through
+      # os_fill_random (urandom / BCryptGenRandom). The crate is a single
+      # binary (src/main.rs), so the target is --bin megu, not --lib.
+      - name: Root binary tests (locked)
+        run: cargo test --bin megu --locked -- --test-threads=2
       - name: Python & 3-OS installer/TUI gates
         shell: bash
         run: |

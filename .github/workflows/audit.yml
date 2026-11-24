@@ -2,6 +2,18 @@ name: Dependency audit
 
 # Advisories (RustSec), licenses, bans and sources via cargo-deny; configuration in deny.toml.
 # Advisories are time dependent, so this also runs weekly, not only when dependencies change.
+#
+# Every committed Cargo.lock / standalone manifest is audited, not just the root
+# one — client-gpu alone carries ~235 crates that the root lockfile never sees.
+# `checks` differs per crate only where a pre-existing violation would fail the
+# job today; each carve-out names what must change to restore the full check:
+#   * client-port — bans: megu-client-mesh has no `publish = false` but keeps a
+#     path-only dependency, which cargo-deny rejects as a wildcard. Adding
+#     `publish = false` to client-port/Cargo.toml restores bans.
+#   * client-app, client-gpu — bans fails transitively through client-port
+#     above; licenses fails on symphonia 0.5.5 (MPL-2.0), which deny.toml's
+#     allow list does not cover yet. An MPL-2.0 decision in deny.toml restores
+#     licenses; the client-port fix restores bans.
 on:
   pull_request:
     branches: [main]
@@ -18,10 +30,47 @@ jobs:
   cargo-deny:
     runs-on: ubuntu-latest
     timeout-minutes: 10
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - manifest: Cargo.toml
+            checks: advisories licenses bans sources
+          - manifest: core/Cargo.toml
+            checks: advisories licenses bans sources
+          - manifest: proto/Cargo.toml
+            checks: advisories licenses bans sources
+          - manifest: state-store/Cargo.toml
+            checks: advisories licenses bans sources
+          - manifest: server-files/Cargo.toml
+            checks: advisories licenses bans sources
+          - manifest: mod-offload/Cargo.toml
+            checks: advisories licenses bans sources
+          - manifest: mod-adapter-core/Cargo.toml
+            checks: advisories licenses bans sources
+          - manifest: create-adapter/Cargo.toml
+            checks: advisories licenses bans sources
+          - manifest: client-kernel/Cargo.toml
+            checks: advisories licenses bans sources
+          - manifest: client-port/Cargo.toml
+            checks: advisories licenses sources
+          - manifest: client-ui/Cargo.toml
+            checks: advisories licenses bans sources
+          - manifest: client-app/Cargo.toml
+            checks: advisories sources
+          - manifest: client-gpu/Cargo.toml
+            checks: advisories sources
+          - manifest: tools/palette_bench/Cargo.toml
+            checks: advisories licenses bans sources
+          - manifest: tools/storage_bench/Cargo.toml
+            checks: advisories licenses bans sources
+          - manifest: tools/offload_ffi_probe/Cargo.toml
+            checks: advisories licenses bans sources
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
           persist-credentials: false
       - uses: EmbarkStudios/cargo-deny-action@3c6349835b2b7b196a839186cb8b78e02f7b5f25 # v2.1.1
         with:
-          command: check advisories licenses bans sources
+          manifest-path: ${{ matrix.manifest }}
+          command: check ${{ matrix.checks }}

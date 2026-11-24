@@ -172,7 +172,8 @@ cleanup_verify_artifacts() {
   rm -f "$build_manifest"
   rm -rf client-port/target client-kernel/target client-app/target client-ui/target client-gpu/target mod-offload/target \
       mod-adapter-core/target create-adapter/target proto/target state-store/target \
-      server-files/target core/target
+      server-files/target core/target \
+      tools/palette_bench/target tools/storage_bench/target tools/offload_ffi_probe/target
   # The companion suite only writes repo-local output when CARGO_TARGET_DIR is
   # unset; a caller-provided target dir is the caller's to keep.
   if [ -z "${CARGO_TARGET_DIR:-}" ]; then
@@ -194,6 +195,13 @@ cargo test --manifest-path proto/Cargo.toml --offline --locked -j 2
 cargo test --manifest-path state-store/Cargo.toml --offline --locked -j 2
 cargo test --manifest-path server-files/Cargo.toml --offline --locked -j 2
 cargo test --manifest-path core/Cargo.toml --offline --locked -j 2
+
+echo "== tools crates"
+# tools/palette_bench is intentionally absent: it does not compile on main
+# (the build.rs-generated adapter uses megu_core but its Cargo.toml declares
+# no dependency). Add it back once that manifest is fixed.
+cargo check --manifest-path tools/storage_bench/Cargo.toml --offline --locked -j 2
+cargo check --manifest-path tools/offload_ffi_probe/Cargo.toml --offline --locked -j 2
 
 echo "== companion suite e2e"
 python3 tests/companion_suite_e2e.py --target-dir "${CARGO_TARGET_DIR:-$PWD/target/companion-e2e}"
