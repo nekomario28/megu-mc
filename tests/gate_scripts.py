@@ -799,6 +799,222 @@ def structural_audit_cases(keep_going):
     return failures
 
 
+# ---------------------------------------------------------------------------
+# Vanilla mechanics coverage audit (registry-vs-runtime). Each case plants a
+# minimal registry shape and asserts the audit's exit contract, so a detector
+# that stops discovering a registry, or a wiring rule that accepts a test-only
+# reference, is itself a red build.
+# ---------------------------------------------------------------------------
+
+VANILLA_AUDIT = ROOT / "tools/vanilla_mechanics_coverage_audit.py"
+
+VANILLA_MECHANICS_CLEAN = """\
+const COMMAND_GAMERULE_DEFAULTS: &[(&str, bool, i32)] = &[
+    ("doFoo", true, 1),
+    ("doBar", false, 0),
+];
+
+const EFFECT_REGISTRY: [&str; 5] = [
+    "speed",
+    "poison",
+    "regeneration",
+    "luck",
+    "wither",
+];
+
+static GR_DO_FOO: AtomicU8 = AtomicU8::new(1);
+static GR_DO_BAR: AtomicU8 = AtomicU8::new(0);
+
+fn gamerule_atomic_value(name: &str) -> Option<i32> {
+    Some(match name {
+        "doFoo" => GR_DO_FOO.load(Ordering::Relaxed) as i32,
+        "doBar" => GR_DO_BAR.load(Ordering::Relaxed) as i32,
+        _ => return None,
+    })
+}
+
+fn damage_type_known(name: &str) -> bool {
+    const TYPES: &[&str] = &["fall", "fly_into_wall", "cramming"];
+    TYPES.contains(&name)
+}
+
+fn enchant_id(name: &str) -> Option<i64> {
+    Some(match name {
+        "sharpness" => 32,
+        "protection" => 27,
+        "unbreaking" => 39,
+        "mending" => 22,
+        "frost_walker" => 14,
+        _ => return None,
+    })
+}
+
+fn hurt(kind: &str, amount: f32) { let _ = (kind, amount); }
+fn effect_named_present(ids: &[i32], name: &str) -> bool { let _ = (ids, name); true }
+fn enchant_level(comps: &[i64], id: i64) -> i64 { let _ = (comps, id); 0 }
+fn gamerule_live_value(name: &str) -> i32 { let _ = name; 0 }
+
+fn apply_hit() {
+    hurt("fall", 1.0);
+    hurt("fly_into_wall", 2.0);
+    hurt("cramming", 6.0);
+}
+
+fn gameplay_tick() {
+    if gamerule_live_value("doFoo") != 0 {}
+    if gamerule_live_value("doBar") != 0 {}
+    let _ = effect_named_present(&[], "speed");
+    let _ = effect_named_present(&[], "poison");
+    let _ = effect_named_present(&[], "regeneration");
+    let _ = effect_named_present(&[], "luck");
+    let _ = effect_named_present(&[], "wither");
+    let _ = enchant_level(&[], 32);
+    let _ = enchant_level(&[], 27);
+    let _ = enchant_level(&[], 39);
+    let _ = enchant_level(&[], 22);
+    let _ = enchant_level(&[], 14);
+}
+"""
+
+VANILLA_TEST_ONLY_WIRING = """\
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn tricky_literal() -> &'static str { "{ unbalanced }([" }
+
+    #[test]
+    fn wires_in_tests_only() {
+        let _ = tricky_literal();
+        hurt("sonic_boom", 1.0);
+        let _ = gamerule_live_value("doBaz");
+        let _ = effect_named_present(&[], "blindness");
+        let _ = enchant_level(&[], 41);
+        let _ = Unavailable("AvoidEntityGoal<Cat>");
+    }
+}
+"""
+
+VANILLA_MECHANICS_WAIVERS = {
+    "unimplemented_damage_type": {"sonic_boom": {"reason": "fixture gap"}},
+    "unavailable_mob_ai_goal": {
+        "AvoidEntityGoal<Cat>": {"reason": "fixture gap"}},
+    "unconsumed_gamerule": {"doBaz": {"reason": "fixture gap"}},
+    "unapplied_status_effect": {"blindness": {"reason": "fixture gap"}},
+    "unapplied_enchantment": {"wind_burst": {"reason": "fixture gap"}},
+}
+
+
+def vanilla_fixture(*, gaps=False, test_only=False):
+    """Clean wiring, the same tree with declared gaps, or test-only wiring."""
+    text = VANILLA_MECHANICS_CLEAN
+    if gaps or test_only:
+        # Declare four more mechanics without any production consumer.
+        text = text.replace(
+            'const TYPES: &[&str] = &["fall", "fly_into_wall", "cramming"];',
+            'const TYPES: &[&str] = &["fall", "fly_into_wall", "cramming", '
+            '"sonic_boom"];'
+        ).replace(
+            '    ("doBar", false, 0),',
+            '    ("doBar", false, 0),\n    ("doBaz", true, 1),'
+        ).replace(
+            '    "wither",\n];',
+            '    "wither",\n    "blindness",\n];'
+        ).replace(
+            '        "frost_walker" => 14,',
+            '        "frost_walker" => 14,\n        "wind_burst" => 41,'
+        )
+    if test_only:
+        # Every gap reference lives inside a cfg(test) module: none may count.
+        text += VANILLA_TEST_ONLY_WIRING
+    elif gaps:
+        text += ('\nfn unavailable_goals() { let _ = '
+                 'Unavailable("AvoidEntityGoal<Cat>"); }\n')
+    return text
+
+
+def run_vanilla_audit(root, *args):
+    return subprocess.run(
+        [sys.executable, str(VANILLA_AUDIT), "--root", str(root), *args],
+        capture_output=True, text=True, timeout=180)
+
+
+def vanilla_mechanics_audit_cases(keep_going):
+    """Each case asserts a registry-vs-runtime detector's exit contract."""
+    failures = []
+    # (name, fixture kwargs, waivers, argv, want_rc, required, absent)
+    cases = [
+        ("clean registry wiring passes",
+         {"gaps": False}, None, (), 0, ("PASS",), ()),
+        ("declared but unwired mechanics fail",
+         {"gaps": True}, None, (), 1,
+         ("sonic_boom", "doBaz", "blindness", "wind_burst",
+          "AvoidEntityGoal<Cat>"), ()),
+        ("waived baseline passes",
+         {"gaps": True}, VANILLA_MECHANICS_WAIVERS, (), 0, ("PASS",), ()),
+        ("test-only wiring never satisfies a check",
+         {"test_only": True}, None, (), 1,
+         ("sonic_boom", "doBaz", "blindness", "wind_burst"),
+         ("AvoidEntityGoal<Cat>",)),
+        ("--json exposes all five categories",
+         {"gaps": False}, None, ("--json",), 0,
+         ("unimplemented_damage_type", "unavailable_mob_ai_goal",
+          "unconsumed_gamerule", "unapplied_status_effect",
+          "unapplied_enchantment"), ()),
+        ("waiver for a wired mechanic warns by default",
+         {"gaps": True},
+         dict(VANILLA_MECHANICS_WAIVERS,
+              **{"unimplemented_damage_type": {
+                  "sonic_boom": {"reason": "fixture gap"},
+                  "fly_into_wall": {"reason": "already wired"}}}),
+         (), 0, ("stale", "fly_into_wall"), ()),
+        ("--fail-on-stale rejects a wired waiver",
+         {"gaps": True},
+         dict(VANILLA_MECHANICS_WAIVERS,
+              **{"unimplemented_damage_type": {
+                  "sonic_boom": {"reason": "fixture gap"},
+                  "fly_into_wall": {"reason": "already wired"}}}),
+         ("--fail-on-stale",), 1, ("STALE", "fly_into_wall"), ()),
+    ]
+    for name, kwargs, waivers, argv, want_rc, markers, absent in cases:
+        with tempfile.TemporaryDirectory(prefix="vanilla-audit-") as tmp:
+            root = Path(tmp)
+            (root / "src").mkdir()
+            (root / "src/mechanics.rs").write_text(vanilla_fixture(**kwargs))
+            if waivers is not None:
+                (root / "audit").mkdir()
+                (root / "audit/vanilla_mechanics_waivers.json").write_text(
+                    json.dumps(waivers))
+            try:
+                result = run_vanilla_audit(root, *argv)
+                log = result.stdout + result.stderr
+                assert result.returncode == want_rc, (
+                    f"expected exit {want_rc}, got {result.returncode}\n{log}")
+                for marker in markers:
+                    assert marker in log, f"{marker!r} not in report\n{log}"
+                for marker in absent:
+                    assert marker not in log, (
+                        f"{marker!r} was counted although it only exists in "
+                        f"cfg(test) code\n{log}")
+                if "--json" in argv and result.returncode == 0:
+                    parsed = json.loads(result.stdout)
+                    assert parsed["ok"] is True, parsed
+                    assert set(parsed["categories"]) == {
+                        "unimplemented_damage_type",
+                        "unavailable_mob_ai_goal",
+                        "unconsumed_gamerule",
+                        "unapplied_status_effect",
+                        "unapplied_enchantment"}, parsed["categories"]
+            except (AssertionError, ValueError) as error:
+                if not keep_going:
+                    raise
+                failures.append(name)
+                print(f"vanilla mechanics audit self-test: {name} FAIL\n{error}")
+                continue
+            print(f"vanilla mechanics audit self-test: {name} PASS")
+    return failures
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--script", default=None,
@@ -930,6 +1146,8 @@ def main():
                     for name in wiring_audit_cases(options.keep_going))
     failures.extend(f"structural: {name}"
                     for name in structural_audit_cases(options.keep_going))
+    failures.extend(f"vanilla-mechanics: {name}"
+                    for name in vanilla_mechanics_audit_cases(options.keep_going))
 
     if failures:
         print(f"gate self-test: {len(failures)} case(s) failed: {', '.join(failures)}")

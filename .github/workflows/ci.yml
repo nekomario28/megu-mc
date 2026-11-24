@@ -53,6 +53,10 @@ jobs:
           python3 tests/opt_wiring_audit_test.py
           python3 tools/opt_wiring_audit.py
           python3 tools/wiring_connectivity_audit.py
+          # Registry-vs-runtime coverage for Vanilla 1.21.1 mechanics: every
+          # declared damage type, mob-AI goal placeholder, gamerule, status
+          # effect and enchantment must be wired or explicitly waived.
+          python3 tools/vanilla_mechanics_coverage_audit.py
           # Zero-JAR structural guards: pinned version constants stay routed
           # through megu_core::version, the V767 registry name tables stay
           # index-identical, and the server.properties key tables plus the
