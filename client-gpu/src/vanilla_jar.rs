@@ -17,11 +17,13 @@
 //! keeps its own copy rather than widening another crate's API).
 
 use std::fmt;
+use std::fs::File;
+use std::io::{Cursor, Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 
 use megu_client_mesh::asset_pipeline::{animation_from_mcmeta, ResourcePackLayer};
 use megu_client_mesh::png_decode;
-use megu_core::zip_archive::{LazyZipIndex, ZipError};
+use megu_core::zip_archive::{inflate_raw_rfc1951, LazyZipIndex, ZipError};
 
 /// Total on-disk bytes the archive itself may occupy.
 pub const MAX_ARCHIVE_BYTES: u64 = 256 * 1024 * 1024;
@@ -34,6 +36,15 @@ pub const MAX_ENTRY_BYTES: u64 = 8 * 1024 * 1024;
 /// Cap the number of JARs and their aggregate materialized asset bytes.
 pub const MAX_MOD_JARS: usize = 256;
 pub const MAX_MOD_ASSET_BYTES: u64 = MAX_UNPACKED_BYTES;
+/// Deepest Jar-in-Jar level scanned for assets: the outer `mods/*.jar` is
+/// depth 0, its `META-INF/jarjar/*.jar` / `META-INF/jars/*.jar` children are
+/// depth 1, and nesting inside those is followed once more (depth 2) before
+/// any deeper `jarjar`/`jars` entries are ignored.
+pub const MAX_JIJ_DEPTH: usize = 2;
+/// Nested JARs opened per outer mod JAR.
+pub const MAX_JIJ_JARS_PER_MOD: usize = 64;
+/// Uncompressed byte cap for one nested JAR payload.
+pub const MAX_JIJ_JAR_BYTES: u64 = 64 * 1024 * 1024;
 
 /// Why a JAR/pack read failed — every variant is a fail-closed stop, never
 /// a silent partial load.
@@ -85,6 +96,10 @@ pub struct ModJarLoadReport {
     pub loaded: Vec<PathBuf>,
     pub rejected: Vec<(PathBuf, JarError)>,
     pub entries_seen: usize,
+    /// Formatted notes for nested Jar-in-Jar members that were skipped
+    /// without failing the outer mod JAR (corrupt nested archive, depth cap,
+    /// per-nested-JAR byte cap, ...).
+    pub skipped: Vec<String>,
 }
 
 /// One decompressed archive member selected by the caller's filter.
@@ -260,8 +275,523 @@ fn is_mod_asset(name: &str) -> bool {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Recursive Jar-in-Jar extraction
+//
+// `LazyZipIndex` only opens archives from a `Path` and flattens one level of
+// `META-INF/jarjar`/`META-INF/jars` nesting without keeping per-JAR
+// provenance, so nested JARs could not be ordered or isolated. The reader
+// below is the same bounded contract over any `Read + Seek` source — the
+// outer `mods/*.jar` `File` at depth 0 and an in-memory `Cursor` for every
+// nested JAR — reusing `megu_core::zip_archive`'s RFC 1951 inflater instead
+// of duplicating DEFLATE. EOCD + Central Directory are streamed record by
+// record (never the whole archive), every member name passes
+// [`validate_entry_name`] fail-closed, ZIP64/multi-disk/encrypted archives
+// are rejected, and nested JARs recurse only to [`MAX_JIJ_DEPTH`].
+// ---------------------------------------------------------------------------
+
+/// EOCD tail window: 22-byte record plus the maximum 65 535-byte comment.
+const JIJ_EOCD_WINDOW: u64 = 65_557;
+const JIJ_EOCD_MIN: usize = 22;
+const JIJ_CDE_FIXED: usize = 46;
+const JIJ_LFH_FIXED: usize = 30;
+const JIJ_SIG_LFH: u32 = 0x0403_4b50;
+const JIJ_SIG_CDE: u32 = 0x0201_4b50;
+const JIJ_SIG_EOCD: u32 = 0x0605_4b50;
+const JIJ_METHOD_STORED: u16 = 0;
+const JIJ_METHOD_DEFLATE: u16 = 8;
+
+fn u16_at(bytes: &[u8], offset: usize) -> u16 {
+    u16::from_le_bytes([bytes[offset], bytes[offset + 1]])
+}
+
+fn u32_at(bytes: &[u8], offset: usize) -> u32 {
+    u32::from_le_bytes([
+        bytes[offset],
+        bytes[offset + 1],
+        bytes[offset + 2],
+        bytes[offset + 3],
+    ])
+}
+
+fn io_reason(err: std::io::Error) -> JarError {
+    JarError::Io {
+        reason: err.to_string(),
+    }
+}
+
+fn read_at<R: Read + Seek>(reader: &mut R, offset: u64, buf: &mut [u8]) -> Result<(), JarError> {
+    reader
+        .seek(SeekFrom::Start(offset))
+        .and_then(|_| reader.read_exact(buf))
+        .map_err(io_reason)
+}
+
+/// One Central Directory member (directory records already dropped).
+struct ZipMember {
+    name: String,
+    method: u16,
+    compressed_size: u64,
+    uncompressed_size: u64,
+    local_offset: u64,
+}
+
+/// `META-INF/jarjar/*.jar` (NeoForge) or `META-INF/jars/*.jar` (Fabric),
+/// case-insensitive like the loader's own convention. The prefix check is
+/// length-exact so `jarjar/` can never alias `jars/`.
+fn is_jar_in_jar_entry(name: &str) -> bool {
+    const JAR_JAR: &str = "META-INF/jarjar/";
+    const JARS: &str = "META-INF/jars/";
+    if name.len() <= JAR_JAR.len()
+        || !name
+            .get(name.len() - 4..)
+            .is_some_and(|s| s.eq_ignore_ascii_case(".jar"))
+    {
+        return false;
+    }
+    name.get(..JAR_JAR.len())
+        .is_some_and(|p| p.eq_ignore_ascii_case(JAR_JAR))
+        || name
+            .get(..JARS.len())
+            .is_some_and(|p| p.eq_ignore_ascii_case(JARS))
+}
+
+/// Locate the EOCD record in the assembled tail window: the record's
+/// comment length must land exactly on the end of the archive.
+fn find_eocd(tail: &[u8]) -> Option<usize> {
+    if tail.len() < JIJ_EOCD_MIN {
+        return None;
+    }
+    let mut pos = tail.len() - JIJ_EOCD_MIN;
+    loop {
+        if u32_at(tail, pos) == JIJ_SIG_EOCD
+            && pos + JIJ_EOCD_MIN + u16_at(tail, pos + 20) as usize == tail.len()
+        {
+            return Some(pos);
+        }
+        if pos == 0 {
+            return None;
+        }
+        pos -= 1;
+    }
+}
+
+/// Index every file member of the ZIP stream behind `reader`: scan the EOCD
+/// tail window, then stream the Central Directory record by record. Returns
+/// the archive length and the validated member list. Fails closed on
+/// traversal/unsafe names (whole archive, matching `LazyZipIndex`), ZIP64,
+/// multi-disk, encryption, non-UTF-8 names and structural corruption.
+fn index_zip<R: Read + Seek>(reader: &mut R) -> Result<(u64, Vec<ZipMember>), JarError> {
+    let len = reader.seek(SeekFrom::End(0)).map_err(io_reason)?;
+    if len < JIJ_EOCD_MIN as u64 {
+        return Err(JarError::Malformed {
+            reason: "not a ZIP archive".to_owned(),
+        });
+    }
+    let window = len.min(JIJ_EOCD_WINDOW);
+    let mut tail = vec![0u8; window as usize];
+    read_at(reader, len - window, &mut tail)?;
+    let Some(eocd) = find_eocd(&tail) else {
+        return Err(JarError::Malformed {
+            reason: "no end-of-central-directory record".to_owned(),
+        });
+    };
+    let rec = &tail[eocd..];
+    if u16_at(rec, 4) != 0 || u16_at(rec, 6) != 0 || u16_at(rec, 8) != u16_at(rec, 10) {
+        return Err(JarError::Unsupported {
+            reason: "multi-disk archive".to_owned(),
+        });
+    }
+    let total = u16_at(rec, 10) as usize;
+    let cd_size = u32_at(rec, 12) as u64;
+    let cd_offset = u32_at(rec, 16) as u64;
+    // Saturated sentinel fields mean ZIP64; such archives cannot fit the
+    // byte/entry budgets anyway, so they are rejected outright.
+    if total == u16::MAX as usize || cd_size == u32::MAX as u64 || cd_offset == u32::MAX as u64 {
+        return Err(JarError::Unsupported {
+            reason: "ZIP64 archive".to_owned(),
+        });
+    }
+    if total > MAX_ARCHIVE_ENTRIES {
+        return Err(JarError::BudgetExceeded {
+            reason: format!("archive has {total} entries (cap {MAX_ARCHIVE_ENTRIES})"),
+        });
+    }
+    let cd_end = cd_offset
+        .checked_add(cd_size)
+        .filter(|&end| end <= len)
+        .ok_or_else(|| JarError::Malformed {
+            reason: "central directory outside archive".to_owned(),
+        })?;
+
+    let mut members = Vec::with_capacity(total.min(256));
+    let mut cursor = cd_offset;
+    for _ in 0..total {
+        if cursor + JIJ_CDE_FIXED as u64 > cd_end {
+            return Err(JarError::Malformed {
+                reason: "central directory truncated".to_owned(),
+            });
+        }
+        let mut fixed = [0u8; JIJ_CDE_FIXED];
+        read_at(reader, cursor, &mut fixed)?;
+        cursor += JIJ_CDE_FIXED as u64;
+        if u32_at(&fixed, 0) != JIJ_SIG_CDE {
+            return Err(JarError::Malformed {
+                reason: "bad central directory signature".to_owned(),
+            });
+        }
+        let flags = u16_at(&fixed, 8);
+        if flags & 1 != 0 {
+            return Err(JarError::Unsupported {
+                reason: "encrypted entry".to_owned(),
+            });
+        }
+        let method = u16_at(&fixed, 10);
+        let compressed_size = u32_at(&fixed, 20) as u64;
+        let uncompressed_size = u32_at(&fixed, 24) as u64;
+        let name_len = u16_at(&fixed, 28) as u64;
+        let extra_len = u16_at(&fixed, 30) as u64;
+        let comment_len = u16_at(&fixed, 32) as u64;
+        let disk_start = u16_at(&fixed, 34);
+        let local_offset = u32_at(&fixed, 42) as u64;
+        if compressed_size == u32::MAX as u64
+            || uncompressed_size == u32::MAX as u64
+            || local_offset == u32::MAX as u64
+        {
+            return Err(JarError::Unsupported {
+                reason: "ZIP64 entry".to_owned(),
+            });
+        }
+        if disk_start != 0 {
+            return Err(JarError::Unsupported {
+                reason: "multi-disk archive".to_owned(),
+            });
+        }
+        let record_end = cursor
+            .checked_add(name_len + extra_len + comment_len)
+            .filter(|&end| end <= cd_end)
+            .ok_or_else(|| JarError::Malformed {
+                reason: "entry record overruns central directory".to_owned(),
+            })?;
+        let mut name_bytes = vec![0u8; name_len as usize];
+        read_at(reader, cursor, &mut name_bytes)?;
+        cursor = record_end;
+        let name = String::from_utf8(name_bytes).map_err(|_| JarError::Malformed {
+            reason: "entry name is not UTF-8".to_owned(),
+        })?;
+        if name.ends_with('/') {
+            continue;
+        }
+        validate_entry_name(&name)?;
+        members.push(ZipMember {
+            name,
+            method,
+            compressed_size,
+            uncompressed_size,
+            local_offset,
+        });
+    }
+    Ok((len, members))
+}
+
+/// Decompress one indexed member, bounded by `max_bytes` on both the
+/// declared uncompressed size and the actual inflated output. The compressed
+/// read is capped at a generous multiple of the output cap so a tiny
+/// declared output cannot smuggle a huge payload through.
+fn read_zip_member<R: Read + Seek>(
+    reader: &mut R,
+    archive_len: u64,
+    member: &ZipMember,
+    max_bytes: u64,
+) -> Result<Vec<u8>, JarError> {
+    match member.method {
+        JIJ_METHOD_STORED | JIJ_METHOD_DEFLATE => {}
+        other => {
+            return Err(JarError::Unsupported {
+                reason: format!("compression method {other}"),
+            })
+        }
+    }
+    if member.uncompressed_size > max_bytes {
+        return Err(JarError::BudgetExceeded {
+            reason: format!(
+                "entry is {} bytes (cap {max_bytes})",
+                member.uncompressed_size
+            ),
+        });
+    }
+    if member.compressed_size
+        > max_bytes
+            .saturating_mul(2)
+            .saturating_add(1024 * 1024)
+    {
+        return Err(JarError::BudgetExceeded {
+            reason: format!(
+                "entry compressed size {} exceeds sane bound",
+                member.compressed_size
+            ),
+        });
+    }
+    let mut header = [0u8; JIJ_LFH_FIXED];
+    read_at(reader, member.local_offset, &mut header)?;
+    if u32_at(&header, 0) != JIJ_SIG_LFH {
+        return Err(JarError::Malformed {
+            reason: "bad local file header signature".to_owned(),
+        });
+    }
+    let data_offset = member
+        .local_offset
+        .checked_add(JIJ_LFH_FIXED as u64)
+        .and_then(|off| {
+            off.checked_add(u16_at(&header, 26) as u64 + u16_at(&header, 28) as u64)
+        })
+        .ok_or_else(|| JarError::Malformed {
+            reason: "local data offset overflow".to_owned(),
+        })?;
+    data_offset
+        .checked_add(member.compressed_size)
+        .filter(|&end| end <= archive_len)
+        .ok_or_else(|| JarError::Malformed {
+            reason: "entry data outside archive".to_owned(),
+        })?;
+    let mut compressed = vec![0u8; member.compressed_size as usize];
+    read_at(reader, data_offset, &mut compressed)?;
+    match member.method {
+        JIJ_METHOD_STORED => {
+            if compressed.len() as u64 != member.uncompressed_size {
+                return Err(JarError::Malformed {
+                    reason: "stored entry size mismatch".to_owned(),
+                });
+            }
+            Ok(compressed)
+        }
+        _ => {
+            let out = inflate_raw_rfc1951(&compressed, member.uncompressed_size as usize)
+                .map_err(|err| match err {
+                    ZipError::OutputCapExceeded | ZipError::EntryTooLarge { .. } => {
+                        JarError::BudgetExceeded {
+                            reason: "inflated entry exceeds output cap".to_owned(),
+                        }
+                    }
+                    other => JarError::Malformed {
+                        reason: format!("deflate: {other}"),
+                    },
+                })?;
+            if out.len() as u64 != member.uncompressed_size {
+                return Err(JarError::Malformed {
+                    reason: "inflated size mismatch".to_owned(),
+                });
+            }
+            Ok(out)
+        }
+    }
+}
+
+/// Per-outer-JAR collection state: budget left, deterministic layer order
+/// (inner JARs before the JAR that nests them), nested-JAR count and every
+/// non-fatal skip note.
+struct JarCollect {
+    layers: Vec<ResourcePackLayer>,
+    entries_seen: usize,
+    jars_opened: usize,
+    remaining: u64,
+    skipped: Vec<String>,
+}
+
+/// Charge `amount` bytes against the aggregate mod-asset budget. Budget
+/// violations are always fatal for the whole outer JAR — matching the
+/// pre-Jar-in-Jar aggregate accounting — while structural problems inside a
+/// nested JAR only skip that nested JAR.
+fn charge_budget(ctx: &mut JarCollect, amount: u64) -> Result<(), JarError> {
+    if amount > ctx.remaining {
+        return Err(JarError::BudgetExceeded {
+            reason: "aggregate mod assets exceed budget".to_owned(),
+        });
+    }
+    ctx.remaining -= amount;
+    Ok(())
+}
+
+/// Index `reader`'s archive, then emit [`ResourcePackLayer`]s for its
+/// `is_mod_asset` members and recurse into its sorted Jar-in-Jar members
+/// first so inner layers sit earlier (lower priority) than this level's.
+/// `strict` preserves the historical outer-JAR contract: any skipped asset
+/// entry fails the whole mod JAR. Nested levels record skips instead.
+fn collect_zip_assets<R: Read + Seek>(
+    reader: &mut R,
+    depth: usize,
+    label: &str,
+    strict: bool,
+    ctx: &mut JarCollect,
+) -> Result<(), JarError> {
+    let (archive_len, members) = index_zip(reader)?;
+    ctx.entries_seen += members.len();
+
+    let mut nested: Vec<&ZipMember> = members
+        .iter()
+        .filter(|member| is_jar_in_jar_entry(&member.name))
+        .collect();
+    let assets: Vec<&ZipMember> = members
+        .iter()
+        .filter(|member| is_mod_asset(&member.name))
+        .collect();
+    nested.sort_by(|a, b| a.name.cmp(&b.name).then(a.local_offset.cmp(&b.local_offset)));
+
+    for member in nested {
+        if depth >= MAX_JIJ_DEPTH {
+            ctx.skipped.push(format!(
+                "{label}: {}: jar-in-jar depth exceeds {MAX_JIJ_DEPTH}",
+                member.name
+            ));
+            continue;
+        }
+        if ctx.jars_opened >= MAX_JIJ_JARS_PER_MOD {
+            ctx.skipped.push(format!(
+                "{label}: {}: more than {MAX_JIJ_JARS_PER_MOD} nested JARs",
+                member.name
+            ));
+            continue;
+        }
+        if member.uncompressed_size > MAX_JIJ_JAR_BYTES {
+            ctx.skipped.push(format!(
+                "{label}: {}: nested JAR exceeds {MAX_JIJ_JAR_BYTES}-byte cap",
+                member.name
+            ));
+            continue;
+        }
+        // The nested JAR's own bytes are materialized in memory, so they
+        // count against the same aggregate budget as the assets inside.
+        charge_budget(ctx, member.uncompressed_size)?;
+        ctx.jars_opened += 1;
+        match read_zip_member(reader, archive_len, member, MAX_JIJ_JAR_BYTES) {
+            Ok(bytes) => {
+                let mut cursor = Cursor::new(bytes);
+                match collect_zip_assets(&mut cursor, depth + 1, &member.name, false, ctx) {
+                    Ok(()) => {}
+                    Err(err @ JarError::BudgetExceeded { .. }) => return Err(err),
+                    Err(err) => ctx.skipped.push(format!("{}: {err}", member.name)),
+                }
+            }
+            Err(err @ JarError::BudgetExceeded { .. }) => return Err(err),
+            Err(err) => ctx.skipped.push(format!("{}: {err}", member.name)),
+        }
+    }
+
+    let mut entries = Vec::new();
+    let mut read_report = JarReadReport::default();
+    for member in assets {
+        if member.uncompressed_size > MAX_ENTRY_BYTES {
+            let reason = format!(
+                "entry exceeds {MAX_ENTRY_BYTES}-byte cap ({})",
+                member.uncompressed_size
+            );
+            if strict {
+                read_report.skipped.push((member.name.clone(), reason));
+            } else {
+                ctx.skipped.push(format!("{label}: {}: {reason}", member.name));
+            }
+            continue;
+        }
+        // Charge the declared size before materializing so a JAR full of
+        // asset entries cannot allocate past the aggregate budget. The
+        // reader verifies the inflated length equals this declaration.
+        charge_budget(ctx, member.uncompressed_size)?;
+        match read_zip_member(reader, archive_len, member, MAX_ENTRY_BYTES) {
+            Ok(bytes) => entries.push(JarEntry {
+                name: member.name.clone(),
+                bytes,
+            }),
+            Err(err) => {
+                let reason = err.to_string();
+                if strict {
+                    read_report.skipped.push((member.name.clone(), reason));
+                } else {
+                    ctx.skipped
+                        .push(format!("{label}: {}: {reason}", member.name));
+                }
+            }
+        }
+    }
+    let layer = layer_from_entries(label.to_owned(), &entries, &mut read_report);
+    if strict {
+        if let Some((name, reason)) = read_report.skipped.first() {
+            return Err(JarError::Malformed {
+                reason: format!("{name}: {reason}"),
+            });
+        }
+    } else {
+        for (name, reason) in read_report.skipped {
+            ctx.skipped.push(format!("{label}: {name}: {reason}"));
+        }
+    }
+    // Unpacked asset bytes were charged per entry above; only the decoded
+    // sprite payloads still need accounting.
+    let decoded = layer
+        .sprites
+        .values()
+        .map(|(_, _, rgba)| rgba.len() as u64)
+        .sum::<u64>();
+    charge_budget(ctx, decoded)?;
+    let has_content = !layer.blockstates.is_empty()
+        || !layer.models.is_empty()
+        || !layer.sprites.is_empty()
+        || !layer.animations.is_empty();
+    if has_content {
+        ctx.layers.push(layer);
+    }
+    Ok(())
+}
+
+/// Read one `mods/*.jar` including every reachable Jar-in-Jar level. Returns
+/// the layers in priority order (deepest/inner JARs first, outer JAR last so
+/// its assets win key collisions), the inspected entry count, the nested-JAR
+/// skip notes, and the aggregate bytes charged against `MAX_MOD_ASSET_BYTES`.
+fn load_single_mod_jar(
+    jar: &Path,
+    budget: u64,
+) -> Result<(Vec<ResourcePackLayer>, usize, Vec<String>, u64), JarError> {
+    let size = std::fs::metadata(jar)
+        .map_err(|err| JarError::Io {
+            reason: format!("cannot stat {}: {err}", jar.display()),
+        })?
+        .len();
+    if size > MAX_ARCHIVE_BYTES {
+        return Err(JarError::BudgetExceeded {
+            reason: format!("archive size {size} exceeds {MAX_ARCHIVE_BYTES}"),
+        });
+    }
+    let mut file = File::open(jar).map_err(|err| JarError::Io {
+        reason: format!("cannot read {}: {err}", jar.display()),
+    })?;
+    let label = jar
+        .file_name()
+        .unwrap_or_default()
+        .to_string_lossy()
+        .into_owned();
+    let mut ctx = JarCollect {
+        layers: Vec::new(),
+        entries_seen: 0,
+        jars_opened: 0,
+        remaining: budget,
+        skipped: Vec::new(),
+    };
+    collect_zip_assets(&mut file, 0, &label, true, &mut ctx)?;
+    Ok((
+        ctx.layers,
+        ctx.entries_seen,
+        ctx.skipped,
+        budget - ctx.remaining,
+    ))
+}
+
 /// Load regular `mods/*.jar` entries by filename, isolating corrupt JARs.
 /// Later JARs override earlier JARs, and user packs override all mod layers.
+/// Bundled mods nest their real content under `META-INF/jarjar/*.jar`
+/// (NeoForge) or `META-INF/jars/*.jar` (Fabric); those nested JARs are
+/// scanned recursively to [`MAX_JIJ_DEPTH`] and emit their own layers in
+/// sorted entry-name order, so an asset-less wrapper JAR like
+/// `create-aeronautics-bundled-*.jar` still contributes every nested
+/// namespace's blockstates, models, textures and animations.
 pub fn load_mod_jar_layers(mods_dir: &Path) -> (Vec<ResourcePackLayer>, ModJarLoadReport) {
     let mut layers = Vec::new();
     let mut report = ModJarLoadReport::default();
@@ -304,39 +834,13 @@ pub fn load_mod_jar_layers(mods_dir: &Path) -> (Vec<ResourcePackLayer>, ModJarLo
             }));
             continue;
         }
-        let result = read_selected_entries(&jar, is_mod_asset).and_then(|(entries, mut read_report)| {
-            report.entries_seen += read_report.entries_seen;
-            if let Some((name, reason)) = read_report.skipped.first() {
-                return Err(JarError::Malformed {
-                    reason: format!("{name}: {reason}"),
-                });
-            }
-            let unpacked = entries.iter().map(|entry| entry.bytes.len() as u64).sum::<u64>();
-            if unpacked > MAX_MOD_ASSET_BYTES.saturating_sub(total_assets) {
-                return Err(JarError::BudgetExceeded {
-                    reason: format!("aggregate mod assets exceed {MAX_MOD_ASSET_BYTES} bytes"),
-                });
-            }
-            let layer = layer_from_entries(jar.file_name().unwrap_or_default().to_string_lossy().into_owned(), &entries, &mut read_report);
-            if let Some((name, reason)) = read_report.skipped.first() {
-                return Err(JarError::Malformed {
-                    reason: format!("{name}: {reason}"),
-                });
-            }
-            let decoded = layer.sprites.values().map(|(_, _, rgba)| rgba.len() as u64).sum::<u64>();
-            let charge = unpacked.saturating_add(decoded);
-            if charge > MAX_MOD_ASSET_BYTES.saturating_sub(total_assets) {
-                return Err(JarError::BudgetExceeded {
-                    reason: format!("aggregate decoded mod assets exceed {MAX_MOD_ASSET_BYTES} bytes"),
-                });
-            }
-            total_assets += charge;
-            Ok(layer)
-        });
-        match result {
-            Ok(layer) => {
+        match load_single_mod_jar(&jar, MAX_MOD_ASSET_BYTES.saturating_sub(total_assets)) {
+            Ok((mut jar_layers, seen, skipped, spent)) => {
+                total_assets += spent;
+                report.entries_seen += seen;
+                report.skipped.extend(skipped);
                 report.loaded.push(jar);
-                layers.push(layer);
+                layers.append(&mut jar_layers);
             }
             Err(err) => report.rejected.push((jar, err)),
         }
@@ -695,33 +1199,70 @@ mod tests {
     /// Minimal stored-ZIP writer for unit tests (no compression needed to
     /// prove the reader's structure handling).
     fn stored_zip(entries: &[(&str, &[u8])]) -> Vec<u8> {
+        let owned: Vec<(String, Vec<u8>, bool)> = entries
+            .iter()
+            .map(|(name, data)| ((*name).to_owned(), data.to_vec(), false))
+            .collect();
+        test_zip(&owned)
+    }
+
+    /// Raw RFC 1951 stream made only of stored blocks — the DEFLATE method a
+    /// `test_zip` entry marked `deflate` carries inside the archive.
+    fn raw_deflate_stored(data: &[u8]) -> Vec<u8> {
+        let blocks: Vec<&[u8]> = if data.is_empty() {
+            vec![&[][..]]
+        } else {
+            data.chunks(65_535).collect()
+        };
+        let mut out = Vec::with_capacity(data.len() + blocks.len() * 5);
+        for (index, chunk) in blocks.iter().enumerate() {
+            out.push(if index + 1 == blocks.len() { 0x01 } else { 0x00 });
+            let len = chunk.len() as u16;
+            out.extend_from_slice(&len.to_le_bytes());
+            out.extend_from_slice(&(!len).to_le_bytes());
+            out.extend_from_slice(chunk);
+        }
+        out
+    }
+
+    /// ZIP writer for unit tests: `(name, contents, deflate)` per entry.
+    /// `deflate` entries carry a raw stored-block RFC 1951 stream so the
+    /// reader's inflate path is exercised without a compressor dependency.
+    fn test_zip(entries: &[(String, Vec<u8>, bool)]) -> Vec<u8> {
         let mut out = Vec::new();
         let mut central = Vec::new();
-        for (name, data) in entries {
+        for (name, data, deflate) in entries {
+            let deflated;
+            let (method, payload): (u16, &[u8]) = if *deflate {
+                deflated = raw_deflate_stored(data);
+                (8, &deflated)
+            } else {
+                (0, data.as_slice())
+            };
             let lh_off = out.len() as u32;
             out.extend_from_slice(&0x0403_4b50u32.to_le_bytes());
             out.extend_from_slice(&20u16.to_le_bytes()); // version
             out.extend_from_slice(&0u16.to_le_bytes()); // flags
-            out.extend_from_slice(&0u16.to_le_bytes()); // method stored
+            out.extend_from_slice(&method.to_le_bytes());
             out.extend_from_slice(&0u16.to_le_bytes()); // time
             out.extend_from_slice(&0u16.to_le_bytes()); // date
             out.extend_from_slice(&0u32.to_le_bytes()); // crc
-            out.extend_from_slice(&(data.len() as u32).to_le_bytes());
+            out.extend_from_slice(&(payload.len() as u32).to_le_bytes());
             out.extend_from_slice(&(data.len() as u32).to_le_bytes());
             out.extend_from_slice(&(name.len() as u16).to_le_bytes());
             out.extend_from_slice(&0u16.to_le_bytes()); // extra
             out.extend_from_slice(name.as_bytes());
-            out.extend_from_slice(data);
+            out.extend_from_slice(payload);
 
             central.extend_from_slice(&0x0201_4b50u32.to_le_bytes());
             central.extend_from_slice(&20u16.to_le_bytes());
             central.extend_from_slice(&20u16.to_le_bytes());
             central.extend_from_slice(&0u16.to_le_bytes());
-            central.extend_from_slice(&0u16.to_le_bytes());
+            central.extend_from_slice(&method.to_le_bytes());
             central.extend_from_slice(&0u16.to_le_bytes());
             central.extend_from_slice(&0u16.to_le_bytes());
             central.extend_from_slice(&0u32.to_le_bytes());
-            central.extend_from_slice(&(data.len() as u32).to_le_bytes());
+            central.extend_from_slice(&(payload.len() as u32).to_le_bytes());
             central.extend_from_slice(&(data.len() as u32).to_le_bytes());
             central.extend_from_slice(&(name.len() as u16).to_le_bytes());
             central.extend_from_slice(&0u16.to_le_bytes());
@@ -743,6 +1284,76 @@ mod tests {
         out.extend_from_slice(&cd_offset.to_le_bytes());
         out.extend_from_slice(&0u16.to_le_bytes());
         out
+    }
+
+    /// Minimal valid 1x1 RGBA PNG with a caller-chosen texel — CRCs are
+    /// computed for real so `decode_png_rgba` accepts it.
+    fn solid_png(r: u8, g: u8, b: u8, a: u8) -> Vec<u8> {
+        fn chunk(kind: &[u8; 4], data: &[u8]) -> Vec<u8> {
+            let mut out = Vec::new();
+            out.extend_from_slice(&(data.len() as u32).to_be_bytes());
+            out.extend_from_slice(kind);
+            out.extend_from_slice(data);
+            let crc = megu_core::hash::crc32_ieee_update(
+                megu_core::hash::crc32_ieee_update(0, kind),
+                data,
+            );
+            out.extend_from_slice(&crc.to_be_bytes());
+            out
+        }
+        let mut ihdr = Vec::new();
+        ihdr.extend_from_slice(&1u32.to_be_bytes());
+        ihdr.extend_from_slice(&1u32.to_be_bytes());
+        ihdr.extend_from_slice(&[8, 6, 0, 0, 0]);
+        let idat = megu_core::zip_archive::zlib_compress_stored(&[0, r, g, b, a]);
+        let mut png = vec![137, 80, 78, 71, 13, 10, 26, 10];
+        png.extend(chunk(b"IHDR", &ihdr));
+        png.extend(chunk(b"IDAT", &idat));
+        png.extend(chunk(b"IEND", &[]));
+        png
+    }
+
+    /// A self-contained mod JAR for namespace `ns` exposing one block
+    /// `ns:<block>` (blockstate + model + texture + lang), the same shape a
+    /// real NeoForge/Fabric library JAR carries.
+    fn namespace_jar(ns: &str, block: &str, png: &[u8]) -> Vec<u8> {
+        let blockstate = format!(
+            "{{\"variants\":{{\"\":{{\"model\":\"{ns}:block/{block}\"}}}}}}"
+        );
+        let model = format!(
+            "{{\"textures\":{{\"all\":\"{ns}:block/{block}\"}},\"elements\":[{{\"from\":[0,0,0],\"to\":[16,16,16],\"faces\":{{\"down\":{{\"texture\":\"#all\"}},\"up\":{{\"texture\":\"#all\"}},\"north\":{{\"texture\":\"#all\"}},\"south\":{{\"texture\":\"#all\"}},\"west\":{{\"texture\":\"#all\"}},\"east\":{{\"texture\":\"#all\"}}}}}}]}}"
+        );
+        let lang = format!("{{\"block.{ns}.{block}\":\"{block}\"}}");
+        test_zip(&[
+            (
+                format!("assets/{ns}/blockstates/{block}.json"),
+                blockstate.into_bytes(),
+                false,
+            ),
+            (
+                format!("assets/{ns}/models/block/{block}.json"),
+                model.into_bytes(),
+                false,
+            ),
+            (
+                format!("assets/{ns}/textures/block/{block}.png"),
+                png.to_vec(),
+                false,
+            ),
+            (
+                format!("assets/{ns}/lang/en_us.json"),
+                lang.into_bytes(),
+                false,
+            ),
+            ("META-INF/MANIFEST.MF".to_owned(), b"nested mod".to_vec(), false),
+        ])
+    }
+
+    /// Sprite texel at the atlas placement of `key`, for override assertions.
+    fn atlas_texel(bundle: &CompiledAssetBundle, key: &str) -> [u8; 4] {
+        let placement = bundle.atlas.placement(key).expect("sprite placed");
+        let offset = ((placement.y * bundle.atlas.width + placement.x) * 4) as usize;
+        bundle.atlas.rgba[offset..offset + 4].try_into().unwrap()
     }
 
     #[test]
@@ -796,5 +1407,243 @@ mod tests {
             }
         }
         std::fs::remove_file(&jar).ok();
+    }
+
+    /// Mirrors `create-aeronautics-bundled-1.21.1-1.3.3.jar`: an outer JAR
+    /// with zero top-level assets nesting `aeronautics`, `offroad` and
+    /// `simulated` under `META-INF/jarjar/*.jar` (NeoForge). All three
+    /// namespaces' blockstates, models and textures must reach the bundle.
+    #[test]
+    fn bundled_neoforge_jarjar_loads_all_nested_namespaces() {
+        let root = test_dir("jarjar");
+        let mods = root.join("mods");
+        std::fs::create_dir_all(&mods).unwrap();
+        let outer = test_zip(&[
+            (
+                "META-INF/MANIFEST.MF".to_owned(),
+                b"Create Aeronautics bundled".to_vec(),
+                false,
+            ),
+            (
+                "META-INF/jarjar/aeronautics.jar".to_owned(),
+                namespace_jar("aeronautics", "rotor", &CREATE_PNG),
+                false,
+            ),
+            (
+                "META-INF/jarjar/offroad.jar".to_owned(),
+                namespace_jar("offroad", "wheel", &solid_png(200, 30, 30, 255)),
+                true, // Deflate-compressed nested JAR, like real jarjar output.
+            ),
+            (
+                "META-INF/jarjar/simulated.jar".to_owned(),
+                namespace_jar("simulated", "engine", &solid_png(30, 200, 30, 255)),
+                false,
+            ),
+        ]);
+        std::fs::write(
+            mods.join("create-aeronautics-bundled-1.21.1-1.3.3.jar"),
+            outer,
+        )
+        .unwrap();
+
+        let (layers, report) = load_mod_jar_layers(&mods);
+        assert_eq!(report.loaded.len(), 1, "{:?}", report.rejected);
+        assert!(report.rejected.is_empty(), "{:?}", report.rejected);
+        assert!(report.skipped.is_empty(), "{:?}", report.skipped);
+        // Sorted nested-JAR order; the asset-less wrapper emits no layer.
+        assert_eq!(layers.len(), 3);
+        assert_eq!(layers[0].name, "META-INF/jarjar/aeronautics.jar");
+        assert_eq!(layers[1].name, "META-INF/jarjar/offroad.jar");
+        assert_eq!(layers[2].name, "META-INF/jarjar/simulated.jar");
+        for layer in &layers {
+            assert_eq!(layer.blockstates.len(), 1, "{}", layer.name);
+            assert_eq!(layer.models.len(), 1, "{}", layer.name);
+            assert_eq!(layer.sprites.len(), 1, "{}", layer.name);
+        }
+
+        let bundle = CompiledAssetBundle::build(&layers).expect("bundled jarjar bundle");
+        for (ns, block) in [
+            ("aeronautics", "rotor"),
+            ("offroad", "wheel"),
+            ("simulated", "engine"),
+        ] {
+            let id = format!("{ns}:{block}");
+            let quads = bundle
+                .bake_block_with_uvs(&id, &[], [0, 0, 0])
+                .unwrap_or_else(|err| panic!("{id} should bake: {err}"));
+            assert!(!quads.is_empty(), "{id} produced no quads");
+            assert!(bundle.atlas.placement(&format!("{ns}:block/{block}")).is_some());
+        }
+        // The deflated `offroad` nested JAR decoded to its own texel.
+        assert_eq!(atlas_texel(&bundle, "offroad:block/wheel"), [200, 30, 30, 255]);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    /// Fabric nests libraries under `META-INF/jars/*.jar`. The nested JAR's
+    /// assets load alongside the wrapper's own top-level assets, and the
+    /// wrapper layer — pushed last — wins shared-key collisions.
+    #[test]
+    fn fabric_jars_dir_nested_assets_load_with_outer_override() {
+        let root = test_dir("fabric-jars");
+        let mods = root.join("mods");
+        std::fs::create_dir_all(&mods).unwrap();
+
+        let inner_png = solid_png(10, 20, 30, 255);
+        let outer_png = solid_png(90, 80, 70, 255);
+        let inner = namespace_jar("fibers", "strand", &inner_png);
+        // Same texture key in both JARs; the outer wrapper must win.
+        let mut outer_entries: Vec<(String, Vec<u8>, bool)> = vec![
+            (
+                "META-INF/jars/fibers-lib.jar".to_owned(),
+                inner,
+                false,
+            ),
+            (
+                "assets/fibers/blockstates/strand.json".to_owned(),
+                br#"{"variants":{"":{"model":"fibers:block/strand"}}}"#.to_vec(),
+                false,
+            ),
+            (
+                "assets/fibers/textures/block/strand.png".to_owned(),
+                outer_png,
+                false,
+            ),
+        ];
+        // Give the wrapper its own distinct block too, proving merge.
+        outer_entries.extend(namespace_jar_entries("fibers", "bolt", &solid_png(1, 2, 3, 255)));
+        let outer = test_zip(&outer_entries);
+        std::fs::write(mods.join("fibers-bundled.jar"), outer).unwrap();
+
+        let (layers, report) = load_mod_jar_layers(&mods);
+        assert!(report.rejected.is_empty(), "{:?}", report.rejected);
+        assert!(report.skipped.is_empty(), "{:?}", report.skipped);
+        assert_eq!(report.loaded.len(), 1);
+        assert_eq!(layers.len(), 2, "{:?}", layers.iter().map(|l| &l.name).collect::<Vec<_>>());
+        assert_eq!(layers[0].name, "META-INF/jars/fibers-lib.jar");
+        assert_eq!(layers[1].name, "fibers-bundled.jar");
+
+        let bundle = CompiledAssetBundle::build(&layers).expect("fabric bundle");
+        // Inner-JAR block bakes; the shared texture resolves to the OUTER
+        // wrapper's texel because its layer is later in the stack.
+        let quads = bundle
+            .bake_block_with_uvs("fibers:strand", &[], [0, 0, 0])
+            .expect("inner strand bakes");
+        assert!(!quads.is_empty());
+        assert_eq!(atlas_texel(&bundle, "fibers:block/strand"), [90, 80, 70, 255]);
+        let bolt = bundle
+            .bake_block_with_uvs("fibers:bolt", &[], [0, 0, 0])
+            .expect("outer bolt bakes");
+        assert!(!bolt.is_empty());
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    /// `(name, contents, deflate)` entries of [`namespace_jar`] without the
+    /// trailing manifest, for merging into a hand-built wrapper JAR.
+    fn namespace_jar_entries(ns: &str, block: &str, png: &[u8]) -> Vec<(String, Vec<u8>, bool)> {
+        let blockstate = format!(
+            "{{\"variants\":{{\"\":{{\"model\":\"{ns}:block/{block}\"}}}}}}"
+        );
+        let model = format!(
+            "{{\"textures\":{{\"all\":\"{ns}:block/{block}\"}},\"elements\":[{{\"from\":[0,0,0],\"to\":[16,16,16],\"faces\":{{\"down\":{{\"texture\":\"#all\"}},\"up\":{{\"texture\":\"#all\"}},\"north\":{{\"texture\":\"#all\"}},\"south\":{{\"texture\":\"#all\"}},\"west\":{{\"texture\":\"#all\"}},\"east\":{{\"texture\":\"#all\"}}}}}}]}}"
+        );
+        vec![
+            (
+                format!("assets/{ns}/blockstates/{block}.json"),
+                blockstate.into_bytes(),
+                false,
+            ),
+            (
+                format!("assets/{ns}/models/block/{block}.json"),
+                model.into_bytes(),
+                false,
+            ),
+            (
+                format!("assets/{ns}/textures/block/{block}.png"),
+                png.to_vec(),
+                false,
+            ),
+        ]
+    }
+
+    /// Nesting deeper than [`MAX_JIJ_DEPTH`] stops cleanly, and a corrupt or
+    /// traversal-carrying nested JAR is skipped without breaking the valid
+    /// siblings inside the same wrapper or other mod JARs.
+    #[test]
+    fn jarjar_depth_cap_and_hostile_nested_jars_are_isolated() {
+        let root = test_dir("jarjar-hostile");
+        let mods = root.join("mods");
+        std::fs::create_dir_all(&mods).unwrap();
+
+        // level3 -> level2 -> level1 -> outer: only depths 1 and 2 load.
+        let level3 = namespace_jar("deep3", "core", &CREATE_PNG);
+        let level2 = test_zip(&[
+            (
+                "META-INF/jarjar/level3.jar".to_owned(),
+                level3,
+                false,
+            ),
+        ]
+        .into_iter()
+        .chain(namespace_jar_entries("deep2", "gear", &CREATE_PNG))
+        .collect::<Vec<_>>());
+        let level1 = test_zip(&[
+            ("META-INF/jarjar/level2.jar".to_owned(), level2, false),
+        ]
+        .into_iter()
+        .chain(namespace_jar_entries("deep1", "shaft", &CREATE_PNG))
+        .collect::<Vec<_>>());
+
+        let traversal = stored_zip(&[("assets/evil/../block/bad.json", b"{}")]);
+        let broken = b"this is not a zip archive at all".to_vec();
+        let outer = test_zip(&[
+            ("META-INF/jarjar/level1.jar".to_owned(), level1, false),
+            ("META-INF/jarjar/traversal.jar".to_owned(), traversal, false),
+            ("META-INF/jarjar/broken.jar".to_owned(), broken, false),
+            ("META-INF/jarjar/valid.jar".to_owned(), namespace_jar("good", "part", &CREATE_PNG), false),
+        ]);
+        std::fs::write(mods.join("nested-hostile.jar"), outer).unwrap();
+        // A plain sibling mod JAR must be unaffected either way.
+        std::fs::write(
+            mods.join("zzz-sibling.jar"),
+            create_jar(
+                br##"{"textures":{"all":"create:block/andesite_casing"},"elements":[{"from":[0,0,0],"to":[16,16,16],"faces":{"north":{"texture":"#all"}}}]}"##,
+            ),
+        )
+        .unwrap();
+
+        let (layers, report) = load_mod_jar_layers(&mods);
+        assert_eq!(report.loaded.len(), 2, "{:?}", report.rejected);
+        assert!(report.rejected.is_empty(), "{:?}", report.rejected);
+        // Depth-3 JAR ignored, traversal + corrupt nested JARs recorded.
+        assert!(
+            report
+                .skipped
+                .iter()
+                .any(|note| note.contains("level3.jar") && note.contains("depth")),
+            "{:?}",
+            report.skipped
+        );
+        assert!(
+            report.skipped.iter().any(|note| note.contains("traversal.jar")),
+            "{:?}",
+            report.skipped
+        );
+        assert!(
+            report.skipped.iter().any(|note| note.contains("broken.jar")),
+            "{:?}",
+            report.skipped
+        );
+
+        let bundle = CompiledAssetBundle::build(&layers).expect("hostile bundle");
+        for id in ["deep1:shaft", "deep2:gear", "good:part", "create:andesite_casing"] {
+            assert!(
+                bundle
+                    .bake_block_with_uvs(id, &[], [0, 0, 0])
+                    .is_ok_and(|quads| !quads.is_empty()),
+                "{id} should bake"
+            );
+        }
+        assert!(bundle.atlas.placement("deep3:block/core").is_none());
+        std::fs::remove_dir_all(root).unwrap();
     }
 }
