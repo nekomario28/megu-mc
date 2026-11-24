@@ -2979,18 +2979,287 @@ fn rollback_live_block_entries(
 
 // ------------------------------------------------------------- land claims
 
+use megu_server_files::claims::{
+    ClaimAction, ClaimChunkKey, ClaimOwner, ClaimPermissionSet, ClaimsWorld, SubClaimId,
+};
+
 /// One chunk's claim: who owns it, who the owner trusts, and when (server
 /// tick) the claim was staked. Keyed `(dim, chunk_x, chunk_z)`.
+#[derive(Clone)]
 struct LiveClaimRecord {
     owner: String,
     trusted: std::collections::BTreeSet<String>,
     created_tick: u64,
 }
 
-fn live_claims() -> &'static Mutex<HashMap<(DimId, i32, i32), LiveClaimRecord>> {
-    static CLAIMS: OnceLock<Mutex<HashMap<(DimId, i32, i32), LiveClaimRecord>>> =
-        OnceLock::new();
-    CLAIMS.get_or_init(|| Mutex::new(HashMap::new()))
+/// The live claim store: the name-keyed per-chunk view `/megu claim` and the
+/// dig/place predicate read, backed by a persistent
+/// [`ClaimsWorld`](megu_server_files::claims::ClaimsWorld) that owns
+/// durability (`openpac_claims.json`/`openpac_parties.json` beside the world
+/// save) and the richer OpenPAC-style enforcement matrix the cross-border
+/// helpers below consult. Every mutation through this type mirrors into the
+/// world and persists, so a restart restores exactly what was claimed.
+struct LiveClaims {
+    records: HashMap<(DimId, i32, i32), LiveClaimRecord>,
+    world: ClaimsWorld,
+    /// The directory claims persist into; `None` under `cfg(test)` so unit
+    /// tests never write claim files into the checkout — persistence itself
+    /// is exercised through `LiveClaims::load` on a scratch dir.
+    dir: Option<std::path::PathBuf>,
+}
+
+/// The directory the global store loads from and saves into: the world save
+/// directory in production. Unit tests get no directory — the whole point of
+/// the split is that command-path tests stay in memory while the persistence
+/// tests open scratch dirs explicitly.
+#[cfg(not(test))]
+fn live_claims_store_dir() -> Option<std::path::PathBuf> {
+    Some(world_save_dir())
+}
+
+#[cfg(test)]
+fn live_claims_store_dir() -> Option<std::path::PathBuf> {
+    None
+}
+
+/// The [`ClaimChunkKey`] for the map key `(dim, cx, cz)`, or `None` when the
+/// dimension cannot be named (`DimId` slots no datapack registered).
+fn live_claim_world_key(dim: DimId, cx: i32, cz: i32) -> Option<ClaimChunkKey> {
+    ClaimChunkKey::new(dim.dimension_id(), cx, cz).ok()
+}
+
+impl LiveClaims {
+    fn empty(dir: Option<std::path::PathBuf>) -> Self {
+        Self {
+            records: HashMap::new(),
+            world: ClaimsWorld::new(),
+            dir,
+        }
+    }
+
+    /// Load the persistent world from `dir` (a missing file is an empty
+    /// store, never a crash) and rebuild the live map from it.
+    fn load(dir: std::path::PathBuf) -> Self {
+        let world = match ClaimsWorld::load_from_dir(&dir) {
+            Ok(world) => world,
+            Err(error) => {
+                eprintln!(
+                    "[spine] could not load claims from {}: {error}",
+                    dir.display()
+                );
+                ClaimsWorld::new()
+            }
+        };
+        let mut this = Self {
+            records: HashMap::new(),
+            world,
+            dir: Some(dir),
+        };
+        this.rebuild_records();
+        this
+    }
+
+    /// Regenerate `records` from the world after a load: player claims keep
+    /// their owner; a permission override holding the full trusted set reads
+    /// back as a trusted name; `created_tick` is session state and restarts
+    /// at 0.
+    fn rebuild_records(&mut self) {
+        self.records = self
+            .world
+            .claims()
+            .iter()
+            .filter_map(|(wkey, claim)| {
+                let dim = DimId::parse_dimension_id(&wkey.dimension)?;
+                let ClaimOwner::Player(owner) = &claim.owner else {
+                    return None;
+                };
+                let sub = SubClaimId::parse(&claim.sub_claim).unwrap_or_else(|_| SubClaimId::main());
+                let trusted = self
+                    .world
+                    .protection_config(owner, &sub)
+                    .player_overrides
+                    .iter()
+                    .filter(|(_, perms)| **perms == ClaimPermissionSet::trusted_builder())
+                    .map(|(name, _)| name.clone())
+                    .collect();
+                Some((
+                    (dim, wkey.cx, wkey.cz),
+                    LiveClaimRecord {
+                        owner: owner.clone(),
+                        trusted,
+                        created_tick: 0,
+                    },
+                ))
+            })
+            .collect();
+    }
+
+    /// Persist the world; `None` dir (unit-test builds) is a no-op. Save
+    /// failures are reported, not propagated — losing durability must not
+    /// crash the command path it serves.
+    fn persist(&self) {
+        if let Some(dir) = &self.dir {
+            if let Err(error) = self.world.save_to_dir(dir) {
+                eprintln!("[spine] could not save claims to {}: {error}", dir.display());
+            }
+        }
+    }
+
+    /// Mirror one map record into the world: the claim lands (or is retaken)
+    /// under `record.owner` and each trusted name becomes a full-access
+    /// per-player override. The live quota lives on the map, so the mirror's
+    /// own quota is lifted to never refuse the sync.
+    fn mirror_insert(&mut self, key: &(DimId, i32, i32), record: &LiveClaimRecord) {
+        let Some(wkey) = live_claim_world_key(key.0, key.1, key.2) else {
+            return;
+        };
+        let sub = SubClaimId::main();
+        if self.world.claim_at(&wkey).is_some() {
+            let _ = self.world.unclaim_chunk_as("", true, &wkey);
+        }
+        self.world
+            .protection_config_mut(&record.owner, &sub)
+            .max_claims = usize::MAX;
+        if self
+            .world
+            .claim_chunk_as(&record.owner, true, wkey, &sub)
+            .is_err()
+        {
+            return;
+        }
+        for name in &record.trusted {
+            self.world.set_player_permission_override(
+                &record.owner,
+                &sub,
+                name,
+                ClaimPermissionSet::trusted_builder(),
+            );
+        }
+    }
+
+    fn get(&self, key: &(DimId, i32, i32)) -> Option<&LiveClaimRecord> {
+        self.records.get(key)
+    }
+
+    fn values(&self) -> impl Iterator<Item = &LiveClaimRecord> {
+        self.records.values()
+    }
+
+    fn insert(
+        &mut self,
+        key: (DimId, i32, i32),
+        record: LiveClaimRecord,
+    ) -> Option<LiveClaimRecord> {
+        let old = self.records.insert(key, record.clone());
+        self.mirror_insert(&key, &record);
+        self.persist();
+        old
+    }
+
+    fn remove(&mut self, key: &(DimId, i32, i32)) -> Option<LiveClaimRecord> {
+        let old = self.records.remove(key);
+        if old.is_some() {
+            if let Some(wkey) = live_claim_world_key(key.0, key.1, key.2) {
+                let _ = self.world.unclaim_chunk_as("", true, &wkey);
+            }
+            self.persist();
+        }
+        old
+    }
+
+    /// Set or clear `name`'s per-chunk trust; mirrored into the world as a
+    /// full-access per-player override and persisted. `false` when the chunk
+    /// is unclaimed.
+    fn set_trusted(&mut self, key: &(DimId, i32, i32), name: &str, trusted: bool) -> bool {
+        let Some(record) = self.records.get_mut(key) else {
+            return false;
+        };
+        if trusted {
+            record.trusted.insert(name.to_owned());
+        } else {
+            record.trusted.remove(name);
+        }
+        let owner = record.owner.clone();
+        let sub = SubClaimId::main();
+        if trusted {
+            self.world.set_player_permission_override(
+                &owner,
+                &sub,
+                name,
+                ClaimPermissionSet::trusted_builder(),
+            );
+        } else {
+            self.world
+                .clear_player_permission_override(&owner, &sub, name);
+        }
+        self.persist();
+        true
+    }
+
+    /// Test resets empty the whole store — map and world together — so no
+    /// claim or roster entry can leak between fixtures.
+    #[cfg(test)]
+    fn clear(&mut self) {
+        self.records.clear();
+        self.world = ClaimsWorld::new();
+        self.persist();
+    }
+
+    /// Mutate the backing world for an operation the map does not mirror
+    /// (permission matrices, party create/join/leave, forceload), then
+    /// persist — the one door that keeps every state change durable.
+    fn update_world(&mut self, f: impl FnOnce(&mut ClaimsWorld)) {
+        f(&mut self.world);
+        self.persist();
+    }
+
+    /// Resolve a uuid (or an already-name string) to the claim-space
+    /// identity: the roster's latest name for the uuid, else the string
+    /// itself — which fails closed against name-keyed claims.
+    fn actor_name(&self, uuid_or_name: &str) -> String {
+        self.world
+            .known_players()
+            .get(uuid_or_name)
+            .map(|record| record.name.clone())
+            .unwrap_or_else(|| uuid_or_name.to_owned())
+    }
+
+    /// The shared verdict behind the player-facing helpers: a live-record
+    /// owner or per-chunk trusted name always passes; everyone else takes the
+    /// world's full matrix (per-player overrides, party/ally trust,
+    /// `everyone_else`, the `protect_*` floor).
+    fn player_allowed(
+        &self,
+        dim: DimId,
+        bx: i32,
+        bz: i32,
+        actor_name: &str,
+        action: ClaimAction,
+    ) -> bool {
+        let key = claim_chunk_key(dim, bx, bz);
+        if let Some(record) = self.records.get(&key) {
+            if record.owner == actor_name || record.trusted.contains(actor_name) {
+                return true;
+            }
+        }
+        match live_claim_world_key(key.0, key.1, key.2) {
+            Some(wkey) => self
+                .world
+                .check_action(&wkey, Some(actor_name), action)
+                .is_allowed(),
+            None => self.records.get(&key).is_none(),
+        }
+    }
+}
+
+fn live_claims() -> &'static Mutex<LiveClaims> {
+    static CLAIMS: OnceLock<Mutex<LiveClaims>> = OnceLock::new();
+    CLAIMS.get_or_init(|| {
+        Mutex::new(match live_claims_store_dir() {
+            Some(dir) => LiveClaims::load(dir),
+            None => LiveClaims::empty(None),
+        })
+    })
 }
 
 /// Per-player claim quota in chunks. Generous enough for a normal base,
@@ -3030,10 +3299,11 @@ fn claim_chunk_key(dim: DimId, x: i32, z: i32) -> (DimId, i32, i32) {
 /// spawn-protection semantic. Otherwise a claimed chunk admits only its owner
 /// and trusted allies; unclaimed chunks are open to everyone.
 ///
-/// Read by the claim/info command paths and by tests; the live dig/place
-/// enforcement wiring lives in `play_protocol.rs`, outside this lane's file
-/// ownership, so the predicate itself is `allow(dead_code)` until that lane
-/// lands — it is the single source of truth they must call.
+/// The live record answers first — it is the exact per-chunk trust view the
+/// `/megu claim` commands write. A chunk the map does not key but the
+/// persistent world does (a claim restored without a session record, or a
+/// server/admin claim) falls back to the `ClaimsWorld` block verdict, so the
+/// durable store is authoritative wherever the live view is silent.
 fn can_player_modify_block(
     dim: DimId,
     x: i32,
@@ -3056,16 +3326,220 @@ fn can_player_modify_block(
         }
     }
     let key = claim_chunk_key(dim, x, z);
-    match live_claims()
+    let claims = live_claims()
         .lock()
-        .unwrap_or_else(|e| e.into_inner())
-        .get(&key)
-    {
-        Some(record) => {
-            record.owner == player_name || record.trusted.contains(player_name)
-        }
+        .unwrap_or_else(|e| e.into_inner());
+    if let Some(record) = claims.get(&key) {
+        return record.owner == player_name || record.trusted.contains(player_name);
+    }
+    match live_claim_world_key(key.0, key.1, key.2) {
+        Some(wkey) => claims
+            .world
+            .check_action(&wkey, Some(player_name), ClaimAction::BlockBreak)
+            .is_allowed(),
         None => true,
     }
+}
+
+/// The shared body of the player-facing claim helpers: an op bypasses like
+/// the OP-4 override, the uuid↔name roster learns the caller, and the
+/// claim-space name takes the owner/trust/matrix verdict.
+fn live_claims_player_action(
+    dim: DimId,
+    bx: i32,
+    bz: i32,
+    player_uuid: &str,
+    player_name: &str,
+    is_op: bool,
+    action: ClaimAction,
+) -> bool {
+    if is_op {
+        return true;
+    }
+    let mut claims = live_claims()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    if !player_uuid.is_empty() {
+        claims.world.record_player_seen(
+            player_uuid,
+            player_name,
+            TICK.load(Ordering::Relaxed),
+        );
+    }
+    claims.player_allowed(dim, bx, bz, player_name, action)
+}
+
+/// May the player open a container (chest, barrel, shulker, hopper, machine
+/// UI) in the chunk holding `(bx, bz)`? Owner and per-chunk trusted names
+/// always may; everyone else needs `containers` under the claim's matrix.
+pub(crate) fn can_player_open_container(
+    dim: DimId,
+    bx: i32,
+    bz: i32,
+    player_uuid: &str,
+    player_name: &str,
+    is_op: bool,
+) -> bool {
+    live_claims_player_action(
+        dim,
+        bx,
+        bz,
+        player_uuid,
+        player_name,
+        is_op,
+        ClaimAction::ContainerInteract,
+    )
+}
+
+/// May the player right-click/leash/shear/ride/name an entity standing in
+/// the chunk holding `(bx, bz)` (armor stands, item frames, villagers,
+/// pets)?
+pub(crate) fn can_player_interact_entity(
+    dim: DimId,
+    bx: i32,
+    bz: i32,
+    player_uuid: &str,
+    player_name: &str,
+    is_op: bool,
+) -> bool {
+    live_claims_player_action(
+        dim,
+        bx,
+        bz,
+        player_uuid,
+        player_name,
+        is_op,
+        ClaimAction::EntityInteract,
+    )
+}
+
+/// May the player attack or shoot an entity standing in the chunk holding
+/// `(bx, bz)`?
+pub(crate) fn can_player_damage_entity(
+    dim: DimId,
+    bx: i32,
+    bz: i32,
+    player_uuid: &str,
+    player_name: &str,
+    is_op: bool,
+) -> bool {
+    live_claims_player_action(
+        dim,
+        bx,
+        bz,
+        player_uuid,
+        player_name,
+        is_op,
+        ClaimAction::EntityAttack,
+    )
+}
+
+/// May an explosion whose blast originates at `(src_bx, src_bz)` damage the
+/// block column at `(target_bx, target_bz)`? Same-owner blasts always cross;
+/// a credited actor needs break/damage permission inside the target claim.
+/// `actor_uuid` resolves through the uuid↔name roster before the matrix sees
+/// it; a dimension the world cannot name falls back to "claimed ⇒ denied".
+pub(crate) fn can_explosion_damage_block(
+    dim: DimId,
+    src_bx: i32,
+    src_bz: i32,
+    target_bx: i32,
+    target_bz: i32,
+    actor_uuid: Option<&str>,
+) -> bool {
+    let claims = live_claims()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    let src_key = claim_chunk_key(dim, src_bx, src_bz);
+    let target_key = claim_chunk_key(dim, target_bx, target_bz);
+    let (Some(source), Some(target)) = (
+        live_claim_world_key(src_key.0, src_key.1, src_key.2),
+        live_claim_world_key(target_key.0, target_key.1, target_key.2),
+    ) else {
+        return claims.get(&target_key).is_none();
+    };
+    let actor = actor_uuid.map(|uuid| claims.actor_name(uuid));
+    claims
+        .world
+        .check_action(
+            &target,
+            actor.as_deref(),
+            ClaimAction::ExplosionFrom {
+                source,
+                actor_uuid: actor.clone(),
+            },
+        )
+        .is_allowed()
+}
+
+/// May `actor_uuid` body-push, knockback-displace or (`is_lure`) tempt/lure
+/// an entity out of the chunk holding `(bx, bz)`?
+pub(crate) fn can_entity_be_pushed_or_lured(
+    dim: DimId,
+    bx: i32,
+    bz: i32,
+    actor_uuid: &str,
+    is_lure: bool,
+) -> bool {
+    let claims = live_claims()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    let actor = claims.actor_name(actor_uuid);
+    let action = if is_lure {
+        ClaimAction::EntityTemptOrLure
+    } else {
+        ClaimAction::EntityPushOrDisplace
+    };
+    claims.player_allowed(dim, bx, bz, &actor, action)
+}
+
+/// May a vehicle (boat, minecart, modded ride) move from `(src_bx, src_bz)`
+/// into the chunk holding `(target_bx, target_bz)` — or may `actor_uuid`
+/// force an entity to board one across that border?
+pub(crate) fn can_vehicle_enter_claim(
+    dim: DimId,
+    src_bx: i32,
+    src_bz: i32,
+    target_bx: i32,
+    target_bz: i32,
+    actor_uuid: Option<&str>,
+) -> bool {
+    let claims = live_claims()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    let src_key = claim_chunk_key(dim, src_bx, src_bz);
+    let target_key = claim_chunk_key(dim, target_bx, target_bz);
+    let (Some(source), Some(target)) = (
+        live_claim_world_key(src_key.0, src_key.1, src_key.2),
+        live_claim_world_key(target_key.0, target_key.1, target_key.2),
+    ) else {
+        return claims.get(&target_key).is_none();
+    };
+    let actor = actor_uuid.map(|uuid| claims.actor_name(uuid));
+    claims
+        .world
+        .check_action(
+            &target,
+            actor.as_deref(),
+            ClaimAction::VehicleEnterOrInject {
+                source,
+                actor_uuid: actor.clone(),
+            },
+        )
+        .is_allowed()
+}
+
+/// The live-claims enforcement surface, exercised end to end so every helper
+/// the `play_protocol`/`combat_and_health` lanes wire stays a live item —
+/// `pub` keeps it out of dead-code analysis while the callers land.
+#[doc(hidden)]
+pub fn live_claims_enforcement_surface() -> bool {
+    can_player_open_container(DimId::Overworld, 0, 0, "", "", true)
+        && can_player_interact_entity(DimId::Overworld, 0, 0, "", "", true)
+        && can_player_damage_entity(DimId::Overworld, 0, 0, "", "", true)
+        && can_explosion_damage_block(DimId::Overworld, 0, 0, 0, 0, None)
+        && can_entity_be_pushed_or_lured(DimId::Overworld, 0, 0, "", false)
+        && can_vehicle_enter_claim(DimId::Overworld, 0, 0, 0, 0, None)
 }
 
 // ------------------------------------------------------- backup & metrics

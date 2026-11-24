@@ -5818,21 +5818,48 @@ fn player_permission_level(name: &str) -> u8 {
     verified_permission_level("", name, false)
 }
 
+/// Repin a console-seeded offline-UUID op entry to the verified online UUID
+/// at identity-check time: `/op` on a player who has never logged in seeds the
+/// offline derivation as a placeholder, and the first verified login turns it
+/// into a real pin. The file write is production-only so unit tests keep the
+/// mutation in memory and no `ops.json` leaks into the checkout.
+fn reconcile_ops_uuid(name: &str, uuid: &str, authenticated: bool, registry: &mut OpsRegistry) {
+    if !authenticated || !registry.reconcile_op_uuid_on_online_login(name, uuid) {
+        return;
+    }
+    persist_ops_registry(registry);
+}
+
+#[cfg(not(test))]
+fn persist_ops_registry(registry: &OpsRegistry) {
+    if let Err(error) = registry.save(std::path::Path::new(OPS_FILE)) {
+        eprintln!("[spine] could not save reconciled {OPS_FILE}: {error}");
+    }
+}
+
+#[cfg(test)]
+fn persist_ops_registry(_: &OpsRegistry) {}
+
 /// `player_permission_level` for an identity the server verified: `uuid` is the
 /// session/forwarded UUID (dashed or plain hex) and `authenticated` says it can
 /// be trusted. The registry judges the UUID before the name; a stored-UUID
-/// conflict never grants operator level (see `OpsRegistry::find_authenticated`).
+/// conflict never grants operator level (see `OpsRegistry::find_authenticated`),
+/// and it also bars the legacy name-only fallback below — a different verified
+/// UUID claiming an op's name is name-recycling, not authentication.
 fn verified_permission_level(uuid: &str, name: &str, authenticated: bool) -> u8 {
     if allow_unsafe_player_admin() {
         return 4;
     }
-    let level = ops_registry()
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
-        .op_level_of_authenticated(uuid, name, authenticated);
+    let mut registry = ops_registry().lock().unwrap_or_else(|e| e.into_inner());
+    reconcile_ops_uuid(name, uuid, authenticated, &mut registry);
+    let level = registry.op_level_of_authenticated(uuid, name, authenticated);
     if level > 0 {
         return level;
     }
+    if authenticated && registry.has_uuid_conflict(name, uuid) {
+        return 0;
+    }
+    drop(registry);
     // The legacy name set is written by `set_operator` alongside the registry;
     // a name present only there is still a level-4 operator.
     if OPERATORS
@@ -5952,6 +5979,16 @@ fn set_operator(path: &std::path::Path, name: &str, enable: bool) -> std::io::Re
     let mut proposed_registry = registry.clone();
     if enable {
         proposed_registry.set(&name, live_op_permission_level(), false);
+        // An authenticated player is opped under their verified UUID, not the
+        // offline seed `/op` writes for a name it cannot check — the seat is
+        // pinned before the file lands, so a later name-recycling login cannot
+        // inherit it.
+        if let Some(client) = client_snapshot()
+            .iter()
+            .find(|c| c.name.eq_ignore_ascii_case(&name) && authenticated_player(c.eid))
+        {
+            proposed_registry.reconcile_op_uuid_on_online_login(&name, &uuid_text(&client.uuid));
+        }
     } else {
         proposed_registry.remove(&name);
     }
@@ -12437,5 +12474,81 @@ mod admin_wire_tests {
         *OPERATORS.lock().unwrap_or_else(|e| e.into_inner()) = previous_ops;
         *ops_registry().lock().unwrap_or_else(|e| e.into_inner()) = previous_registry;
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// SEC-FIX-P0-1: a verified UUID that collides with a stored one never
+    /// inherits the name's operator level through the legacy name-only
+    /// `OPERATORS` fallback — the recycled-name bypass the audit found —
+    /// while a console-seeded offline-UUID `/op` repins to the real Mojang
+    /// UUID at the first verified login.
+    #[test]
+    fn op_uuid_verified_permission_never_falls_back_across_conflict() {
+        let _guard = world_guard();
+        let uuid_a = "3f06bb63-1939-4bc3-b8a1-9d0d1e2c3a4b";
+        let uuid_b = "bbbbbbbb-0000-4000-8000-000000000000";
+        let uuid_c = "cccccccc-0000-4000-8000-000000000000";
+        let previous_ops = OPERATORS.lock().unwrap_or_else(|e| e.into_inner()).clone();
+        let previous_registry = ops_registry().lock().unwrap_or_else(|e| e.into_inner()).clone();
+        let previous_admin = std::env::var_os("MEGU_ALLOW_PLAYER_ADMIN_COMMANDS");
+        std::env::remove_var("MEGU_ALLOW_PLAYER_ADMIN_COMMANDS");
+
+        // A Mojang-UUID-pinned entry grants level 4 to (name, uuid_A, true)
+        // even with the name still in the legacy set.
+        ops_registry()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .entries
+            .push(OpEntry {
+                uuid: uuid_a.into(),
+                name: "aw_op_pinned".into(),
+                level: 4,
+                bypasses_player_limit: false,
+            });
+        OPERATORS
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert("aw_op_pinned".into());
+        assert_eq!(verified_permission_level(uuid_a, "aw_op_pinned", true), 4);
+        // The recycled name with a different verified UUID gets 0 — the
+        // name-only OPERATORS fallback must not rescue a rejected identity.
+        assert_eq!(
+            verified_permission_level(uuid_b, "aw_op_pinned", true),
+            0,
+            "verified UUID mismatch must not inherit OP through the name set"
+        );
+        // Unauthenticated lookups keep the legacy name semantics.
+        assert_eq!(verified_permission_level("", "aw_op_pinned", false), 4);
+
+        // `/op` on a player who never logged in stores the offline-derived
+        // seed UUID; the first verified online login repins it and grants.
+        ops_registry()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .set("aw_op_seeded", 4, false);
+        OPERATORS
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert("aw_op_seeded".into());
+        assert_eq!(
+            verified_permission_level(uuid_b, "aw_op_seeded", true),
+            4,
+            "offline-seeded entry repins to the verified online UUID"
+        );
+        // The pin is real now: a third non-operator identity claiming the
+        // name is a conflict, not a repin — and the owner still passes
+        // because the uuid is the identity, wherever it is stored.
+        assert_eq!(
+            verified_permission_level(uuid_c, "aw_op_seeded", true),
+            0,
+            "a repinned entry must refuse yet another verified UUID"
+        );
+        assert_eq!(verified_permission_level(uuid_a, "anything", true), 4);
+
+        *OPERATORS.lock().unwrap_or_else(|e| e.into_inner()) = previous_ops;
+        *ops_registry().lock().unwrap_or_else(|e| e.into_inner()) = previous_registry;
+        match previous_admin {
+            Some(v) => std::env::set_var("MEGU_ALLOW_PLAYER_ADMIN_COMMANDS", v),
+            None => std::env::remove_var("MEGU_ALLOW_PLAYER_ADMIN_COMMANDS"),
+        }
     }
 }

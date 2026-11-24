@@ -195,6 +195,58 @@ impl OpsRegistry {
         self.find(name)
     }
 
+    /// `true` when `name` owns an operator entry pinned to a stored UUID that
+    /// does not equal `verified_uuid` — the recycled-name signal
+    /// `verified_permission_level` uses to keep the legacy name-only fallback
+    /// from re-granting a level the verified-identity lookup just refused.
+    /// Entries carrying no stored UUID cannot contradict a verified identity.
+    pub(crate) fn has_uuid_conflict(&self, name: &str, verified_uuid: &str) -> bool {
+        let verified = normalize_player_uuid(verified_uuid);
+        self.entries.iter().any(|e| {
+            e.name.eq_ignore_ascii_case(name)
+                && !e.uuid.is_empty()
+                && normalize_player_uuid(&e.uuid) != verified
+        })
+    }
+
+    /// Pin `name`'s operator entry to the verified online-mode `verified_uuid`
+    /// when the stored UUID is still the offline-mode derivation `/op` seeded —
+    /// the console-opped-before-first-online-login case, where the seed was a
+    /// placeholder, never a checked identity. A stored UUID that is neither
+    /// empty nor the offline derivation is a real pin: repinning it would let
+    /// a name-recycler steal the seat, so it is left for `has_uuid_conflict`
+    /// to refuse. Returns `true` when the entry was repinned.
+    pub(crate) fn reconcile_op_uuid_on_online_login(
+        &mut self,
+        name: &str,
+        verified_uuid: &str,
+    ) -> bool {
+        let verified = normalize_player_uuid(verified_uuid);
+        if verified.is_empty() {
+            return false;
+        }
+        let Some(entry) = self
+            .entries
+            .iter_mut()
+            .find(|e| e.name.eq_ignore_ascii_case(name))
+        else {
+            return false;
+        };
+        let stored = normalize_player_uuid(&entry.uuid);
+        if stored == verified {
+            return false;
+        }
+        // The offline seed is compared against both spellings: the stored name
+        // is what `/op` normalized, the claimed name is what the player sent.
+        let offline_seeded = stored == normalize_player_uuid(&offline_uuid_string(&entry.name))
+            || stored == normalize_player_uuid(&offline_uuid_string(name));
+        if entry.uuid.is_empty() || offline_seeded {
+            entry.uuid = verified_uuid.to_owned();
+            return true;
+        }
+        false
+    }
+
     /// `0` when the name is not an operator, else its `1..=4` level.
     pub(crate) fn op_level_of(&self, name: &str) -> u8 {
         self.find(name).map(|e| e.level).unwrap_or(0)
@@ -2206,6 +2258,64 @@ mod server_ops_tests {
             )
             .is_ok()
         );
+    }
+
+    /// SEC-FIX-P0-1: a UUID-pinned op entry grants its level only to the
+    /// matching verified identity — a different verified UUID under the same
+    /// (recycled) name reports a conflict the caller must fail closed on —
+    /// while an offline-seeded `/op` entry repins to the real Mojang UUID at
+    /// the first online login.
+    #[test]
+    fn op_uuid_conflict_denies_recycled_name_and_repins_offline_seed() {
+        let uuid_a = "3f06bb63-1939-4bc3-b8a1-9d0d1e2c3a4b";
+        let uuid_b = "bbbbbbbb-0000-4000-8000-000000000000";
+        let uuid_c = "cccccccc-0000-4000-8000-000000000000";
+
+        // A Mojang-UUID-pinned entry: (name, uuid_A, authenticated) gets the
+        // level; (name, uuid_B, authenticated) is a hard conflict.
+        let pinned = OpsRegistry {
+            entries: vec![OpEntry {
+                uuid: uuid_a.into(),
+                name: "Recycled".into(),
+                level: 4,
+                bypasses_player_limit: false,
+            }],
+        };
+        assert_eq!(pinned.op_level_of_authenticated(uuid_a, "Recycled", true), 4);
+        assert_eq!(pinned.op_level_of_authenticated(uuid_b, "Recycled", true), 0);
+        assert!(!pinned.has_uuid_conflict("Recycled", uuid_a));
+        assert!(pinned.has_uuid_conflict("Recycled", uuid_b));
+        // A real pin never repins to the impostor's uuid.
+        let mut pinned_mut = pinned.clone();
+        assert!(!pinned_mut.reconcile_op_uuid_on_online_login("Recycled", uuid_b));
+        assert_eq!(pinned_mut.entries[0].uuid, uuid_a);
+
+        // `/op` on a player who never logged in stores the offline-derived
+        // seed; the first verified online login repins it and starts
+        // granting, and a third identity is a conflict from then on.
+        let mut seeded = OpsRegistry::default();
+        seeded.set("freshop", 4, false);
+        assert_eq!(seeded.entries[0].uuid, offline_uuid_string("freshop"));
+        assert!(seeded.reconcile_op_uuid_on_online_login("Freshop", uuid_b));
+        assert_eq!(seeded.entries[0].uuid, uuid_b);
+        assert_eq!(seeded.op_level_of_authenticated(uuid_b, "freshop", true), 4);
+        assert!(seeded.has_uuid_conflict("freshop", uuid_c));
+        assert!(!seeded.reconcile_op_uuid_on_online_login("freshop", uuid_c));
+
+        // A name-only entry (empty stored UUID) pins to the first verified
+        // login too — it carried no identity to contradict.
+        let mut name_only = OpsRegistry {
+            entries: vec![OpEntry {
+                uuid: String::new(),
+                name: "Legacy".into(),
+                level: 3,
+                bypasses_player_limit: false,
+            }],
+        };
+        assert!(name_only.reconcile_op_uuid_on_online_login("legacy", uuid_c));
+        assert_eq!(name_only.op_level_of_authenticated(uuid_c, "legacy", true), 3);
+        // Reconciling to an empty uuid is a no-op — verification never erases.
+        assert!(!name_only.reconcile_op_uuid_on_online_login("legacy", ""));
     }
 
     #[test]

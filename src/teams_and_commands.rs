@@ -4696,6 +4696,10 @@ fn run_megu_claim(ctx: &CmdCtx, level: u8, args: &[&str]) -> String {
             let mut claims = live_claims()
                 .lock()
                 .unwrap_or_else(|e| e.into_inner());
+            if let Some(client) = ctx.me.as_ref() {
+                let uuid = uuid_text(&client.uuid);
+                claims.update_world(|world| world.record_player_seen(&uuid, &player, tick));
+            }
             if let Some(record) = claims.get(&key) {
                 return if record.owner == player {
                     "This chunk is already claimed by you".to_owned()
@@ -4752,17 +4756,17 @@ fn run_megu_claim(ctx: &CmdCtx, level: u8, args: &[&str]) -> String {
             let mut claims = live_claims()
                 .lock()
                 .unwrap_or_else(|e| e.into_inner());
-            let Some(record) = claims.get_mut(&key) else {
+            let Some(record) = claims.get(&key) else {
                 return "This chunk is not claimed".into();
             };
-            if record.owner != player && level < 4 {
-                return format!("Only the claim owner ({}) or an operator may do that", record.owner);
+            let owner = record.owner.clone();
+            if owner != player && level < 4 {
+                return format!("Only the claim owner ({owner}) or an operator may do that");
             }
+            claims.set_trusted(&key, *name, trust);
             if trust {
-                record.trusted.insert((*name).to_owned());
                 format!("Trusted {name} on this claim")
             } else {
-                record.trusted.remove(*name);
                 format!("Removed trust for {name} on this claim")
             }
         }
@@ -11551,6 +11555,130 @@ mod ops_admin_builtin_tests {
         assert_eq!(ops_run(&op, "/megu bogus"), MEGU_USAGE);
         assert_eq!(ops_run(&op, "/megu claim"), MEGU_USAGE);
         ops_deop("ops_misc_op");
+        ops_reset_claims();
+    }
+
+    /// SEC-FIX-P0-4: the live store persists every mutation into
+    /// `openpac_claims.json`/`openpac_parties.json` and a reload restores the
+    /// exact claim, its trust overrides and the wider permission matrix —
+    /// plus parties, which live in the same durable world.
+    #[test]
+    fn ops_admin_builtin_claims_persist_across_reload() {
+        let _world = world_guard();
+        let _serial = ops_admin_lock().lock().unwrap_or_else(|e| e.into_inner());
+        let dir = std::env::temp_dir().join(format!("megu-claims-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let key = (DimId::Overworld, 40, 40);
+        {
+            // A missing directory/file is an empty store, never a crash.
+            let mut store = LiveClaims::load(dir.clone());
+            assert!(store.get(&key).is_none());
+            store.insert(
+                key,
+                LiveClaimRecord {
+                    owner: "persist_alice".into(),
+                    trusted: ["persist_bob".to_owned()].into_iter().collect(),
+                    created_tick: 7,
+                },
+            );
+            // A permission-matrix update and a party join persist through the
+            // same door every other mutation takes.
+            store.update_world(|w| {
+                w.set_everyone_else_permissions(
+                    "persist_alice",
+                    &SubClaimId::main(),
+                    ClaimPermissionSet::visitor(),
+                );
+                let _ = w.create_party("persist_alice", "crew");
+            });
+            assert!(dir.join(megu_server_files::claims::CLAIMS_FILE).exists());
+            assert!(dir.join(megu_server_files::claims::PARTIES_FILE).exists());
+        }
+        {
+            let store = LiveClaims::load(dir.clone());
+            let record = store.get(&key).expect("claim must survive reload");
+            assert_eq!(record.owner, "persist_alice");
+            assert!(record.trusted.contains("persist_bob"));
+            // The permission override came back as data, not just as trust.
+            let cfg = store
+                .world
+                .protection_config("persist_alice", &SubClaimId::main());
+            assert!(cfg.everyone_else.redstone_and_doors);
+            assert!(cfg.everyone_else.item_pickup_drop);
+            assert!(!cfg.everyone_else.block_break);
+            assert!(store.world.party_of("persist_alice").is_some());
+            // The reloaded matrix enforces: trusted builds, outsiders denied.
+            let wkey = live_claim_world_key(key.0, key.1, key.2).unwrap();
+            assert!(store
+                .world
+                .check_action(&wkey, Some("persist_bob"), ClaimAction::BlockBreak)
+                .is_allowed());
+            assert!(store
+                .world
+                .check_action(&wkey, Some("mallory"), ClaimAction::BlockBreak)
+                .is_denied());
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// SEC-FIX-P0-4: every enforcement helper the play/combat lanes call
+    /// answers from the same persistent world — outsiders denied, owner and
+    /// trusted allowed, ops bypassing.
+    #[test]
+    fn ops_admin_builtin_claim_enforcement_helpers_deny_outsiders() {
+        let _world = world_guard();
+        let _serial = ops_admin_lock().lock().unwrap_or_else(|e| e.into_inner());
+        ops_reset_claims();
+        let dim = DimId::Overworld;
+        let alice = ops_op_ctx("ops_enf_alice", 0, 800.5, 70.0, 800.5);
+        assert!(ops_run(&alice, "/megu claim here").contains("Claimed chunk"));
+        // Outsider denied on every player-facing action; owner and op allowed.
+        for (name, is_op, want) in [
+            ("ops_enf_alice", false, true),
+            ("ops_enf_mallory", false, false),
+            ("ops_enf_mallory", true, true),
+        ] {
+            let uuid = format!("uuid-{name}");
+            assert_eq!(
+                can_player_open_container(dim, 800, 800, &uuid, name, is_op),
+                want,
+                "container {name} op={is_op}"
+            );
+            assert_eq!(
+                can_player_interact_entity(dim, 800, 800, &uuid, name, is_op),
+                want,
+                "entity interact {name} op={is_op}"
+            );
+            assert_eq!(
+                can_player_damage_entity(dim, 800, 800, &uuid, name, is_op),
+                want,
+                "entity damage {name} op={is_op}"
+            );
+        }
+        // Cross-border grief surface: an outsider's explosion, vehicle,
+        // shove or lure into the claim is denied.
+        assert!(!can_explosion_damage_block(dim, 799, 799, 800, 800, Some("ops_enf_mallory")));
+        assert!(!can_vehicle_enter_claim(dim, 799, 799, 800, 800, Some("ops_enf_mallory")));
+        assert!(!can_entity_be_pushed_or_lured(dim, 800, 800, "ops_enf_mallory", false));
+        assert!(!can_entity_be_pushed_or_lured(dim, 800, 800, "ops_enf_mallory", true));
+        // The owner's own blast/vehicle/shove on their claim stays allowed.
+        assert!(can_explosion_damage_block(dim, 800, 800, 800, 800, Some("ops_enf_alice")));
+        assert!(can_vehicle_enter_claim(dim, 800, 800, 800, 800, Some("ops_enf_alice")));
+        assert!(can_entity_be_pushed_or_lured(dim, 800, 800, "ops_enf_alice", true));
+        // An uncredited explosion crossing into the claim is denied; one that
+        // never leaves wilderness is allowed.
+        assert!(!can_explosion_damage_block(dim, 799, 799, 800, 800, None));
+        assert!(can_explosion_damage_block(dim, 700, 700, 799, 799, None));
+        // Trust grants the whole surface again — and untrust revokes it.
+        assert!(ops_run(&alice, "/megu claim trust ops_enf_bob").contains("Trusted"));
+        for (name, is_op) in [("ops_enf_bob", false)] {
+            let uuid = format!("uuid-{name}");
+            assert!(can_player_open_container(dim, 800, 800, &uuid, name, is_op));
+            assert!(can_player_interact_entity(dim, 800, 800, &uuid, name, is_op));
+            assert!(can_player_damage_entity(dim, 800, 800, &uuid, name, is_op));
+        }
+        assert!(ops_run(&alice, "/megu claim untrust ops_enf_bob").contains("Removed trust"));
+        assert!(!can_player_open_container(dim, 800, 800, "uuid-ops_enf_bob", "ops_enf_bob", false));
         ops_reset_claims();
     }
 }
