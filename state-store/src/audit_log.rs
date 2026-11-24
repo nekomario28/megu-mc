@@ -465,7 +465,9 @@ impl AuditLog {
         frame.extend_from_slice(AUDIT_MAGIC);
         frame.extend_from_slice(&(payload.len() as u32).to_be_bytes());
         frame.extend_from_slice(&payload);
-        frame.extend_from_slice(&crc32(&payload).to_be_bytes());
+        frame.extend_from_slice(
+            &megu_core::hash::crc32_ieee(&payload).to_be_bytes(),
+        );
         frame
     }
 
@@ -852,7 +854,7 @@ fn decode_frame(bytes: &[u8]) -> Option<(AuditRecord, usize)> {
     }
     let payload = &bytes[8..8 + len];
     let stored_crc = u32::from_be_bytes(bytes[8 + len..end].try_into().ok()?);
-    if crc32(payload) != stored_crc {
+    if megu_core::hash::crc32_ieee(payload) != stored_crc {
         return None;
     }
     Some((decode_payload(payload)?, end))
@@ -889,17 +891,10 @@ fn read_audit_frame<R: Read>(reader: &mut R) -> io::Result<Option<AuditRecord>> 
     }
     let payload = &body[..len as usize];
     let stored_crc = u32::from_be_bytes(body[len as usize..].try_into().expect("4 crc bytes"));
-    if crc32(payload) != stored_crc {
+    if megu_core::hash::crc32_ieee(payload) != stored_crc {
         return Ok(None);
     }
     Ok(decode_payload(payload))
-}
-
-// ------------------------------------------------------------------ CRC32
-
-/// IEEE 802.3 reflected CRC32 delegated to the shared canonical primitive.
-fn crc32(bytes: &[u8]) -> u32 {
-    megu_core::hash::crc32_ieee(bytes)
 }
 
 #[cfg(test)]

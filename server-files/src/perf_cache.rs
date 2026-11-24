@@ -399,15 +399,6 @@ fn normalize_look(look_x: f64, look_z: f64) -> (f64, f64) {
 }
 
 // ---------------------------------------------------------------------------
-// IEEE CRC32
-// ---------------------------------------------------------------------------
-
-/// IEEE 802.3 reflected CRC32 delegated to the shared canonical primitive.
-fn crc32(bytes: &[u8]) -> u32 {
-    megu_core::hash::crc32_ieee(bytes)
-}
-
-// ---------------------------------------------------------------------------
 // StartupBinaryCache
 // ---------------------------------------------------------------------------
 
@@ -575,7 +566,7 @@ impl StartupBinaryCache {
         let len = u32::try_from(payload.len()).unwrap_or(u32::MAX);
         out.extend_from_slice(&len.to_be_bytes());
         out.extend_from_slice(payload);
-        let crc = crc32(&out);
+        let crc = megu_core::hash::crc32_ieee(&out);
         out.extend_from_slice(&crc.to_be_bytes());
         out
     }
@@ -615,7 +606,7 @@ impl StartupBinaryCache {
         let (body, crc_field) = bytes.split_at(bytes.len() - ENVELOPE_FOOTER_LEN);
         let stored_crc =
             u32::from_be_bytes([crc_field[0], crc_field[1], crc_field[2], crc_field[3]]);
-        if crc32(body) != stored_crc {
+        if megu_core::hash::crc32_ieee(body) != stored_crc {
             return CacheLookup::Miss(CacheMissReason::Corrupt);
         }
         if body[..4] != STARTUP_CACHE_MAGIC {

@@ -347,7 +347,7 @@ fn inspect_png(name: &str, data: &[u8], policy: &PackRouterPolicy) -> Result<(),
     }
     let crc = be32(data, 29).ok_or_else(|| unsupported(name, "truncated PNG IHDR CRC"))?;
     if crc
-        != crc32(
+        != megu_core::hash::crc32_ieee(
             data.get(12..29)
                 .ok_or_else(|| unsupported(name, "truncated PNG IHDR"))?,
         )
@@ -630,17 +630,13 @@ fn read_member(
     let data = index
         .read_entry(&entry.name, MAX_TOTAL_UNCOMPRESSED as usize)
         .map_err(|error| unsupported(&entry.name, format!("invalid member: {error}")))?;
-    if crc32(&data) != entry.crc {
+    if megu_core::hash::crc32_ieee(&data) != entry.crc {
         return Err(unsupported(
             &entry.name,
             "uncompressed size or CRC32 mismatch",
         ));
     }
     Ok(data)
-}
-
-fn crc32(data: &[u8]) -> u32 {
-    megu_core::hash::crc32_ieee(data)
 }
 
 fn normalize_include(source: &str, include: &str) -> Option<String> {

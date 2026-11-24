@@ -135,13 +135,6 @@ impl fmt::Display for SnapshotError {
 
 impl Error for SnapshotError {}
 
-// ------------------------------------------------------------------ CRC32
-
-/// IEEE 802.3 reflected CRC32 delegated to the shared canonical primitive.
-fn crc32(bytes: &[u8]) -> u32 {
-    megu_core::hash::crc32_ieee(bytes)
-}
-
 // ----------------------------------------------------------------- encode
 
 fn put_u32(out: &mut Vec<u8>, v: u32) {
@@ -241,7 +234,7 @@ pub fn encode_snapshot(ctx: &ServerContext, target: TargetVersion) -> Vec<u8> {
             }
         }
     }
-    let crc = crc32(&out);
+    let crc = megu_core::hash::crc32_ieee(&out);
     put_u32(&mut out, crc);
     out
 }
@@ -328,7 +321,7 @@ pub fn decode_snapshot(bytes: &[u8]) -> Result<(ServerContext, TargetVersion), S
         return Err(SnapshotError::BadMagic);
     }
     let expected = u32::from_be_bytes(trailer.try_into().unwrap());
-    let actual = crc32(body);
+    let actual = megu_core::hash::crc32_ieee(body);
     if actual != expected {
         return Err(SnapshotError::CrcMismatch { expected, actual });
     }
@@ -399,9 +392,12 @@ mod tests {
     /// The IEEE 802.3 check vector every CRC32 implementation must reproduce.
     #[test]
     fn crc32_matches_the_standard_check_vector() {
-        assert_eq!(crc32(b"123456789"), 0xCBF4_3926);
-        assert_eq!(crc32(b""), 0);
-        assert_eq!(crc32(b"STV1"), 0x2E76_03D4);
+        assert_eq!(
+            megu_core::hash::crc32_ieee(b"123456789"),
+            0xCBF4_3926
+        );
+        assert_eq!(megu_core::hash::crc32_ieee(b""), 0);
+        assert_eq!(megu_core::hash::crc32_ieee(b"STV1"), 0x2E76_03D4);
     }
 
     /// A context with the vanilla trio's two hot dimensions plus a modded
@@ -547,7 +543,7 @@ mod tests {
     /// Hand-roll a body so CRC-correct malformed streams can be built.
     fn wrap(body: &[u8]) -> Vec<u8> {
         let mut out = body.to_vec();
-        out.extend_from_slice(&crc32(&out).to_be_bytes());
+        out.extend_from_slice(&megu_core::hash::crc32_ieee(&out).to_be_bytes());
         out
     }
 
@@ -571,7 +567,7 @@ mod tests {
                 decode_snapshot(&bad).err(),
                 Some(SnapshotError::CrcMismatch {
                     expected: u32::from_be_bytes(bytes[bytes.len() - 4..].try_into().unwrap()),
-                    actual: crc32(&bad[..bad.len() - 4]),
+                    actual: megu_core::hash::crc32_ieee(&bad[..bad.len() - 4]),
                 }),
                 "flip at byte {i}"
             );

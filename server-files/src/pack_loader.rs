@@ -179,7 +179,7 @@ fn append_stored(
     })?;
     let data_len = u32::try_from(contents.len()).map_err(|_| invalid("file too large"))?;
     let start = u32::try_from(archive.len()).map_err(|_| invalid("ZIP offset overflow"))?;
-    let crc = crc32(contents);
+    let crc = megu_core::hash::crc32_ieee(contents);
     archive.extend(0x0403_4b50u32.to_le_bytes());
     archive.extend(20u16.to_le_bytes());
     archive.extend(0u16.to_le_bytes());
@@ -436,15 +436,13 @@ fn extract_member(
             )))
         }
     };
-    if decoded.len() as u64 != entry.uncompressed_size || crc32(&decoded) != entry.crc32 {
+    if decoded.len() as u64 != entry.uncompressed_size
+        || megu_core::hash::crc32_ieee(&decoded) != entry.crc32
+    {
         return Err(invalid(format!(
             "{}: uncompressed size or CRC mismatch",
             entry.name
         )));
     }
     Ok(decoded)
-}
-
-fn crc32(data: &[u8]) -> u32 {
-    megu_core::hash::crc32_ieee(data)
 }
