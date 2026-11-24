@@ -19,6 +19,8 @@ Megu is a free, open-source, clean-room Rust server and pure-`wgpu` native GPU c
 
 > **Alpha Status (`v0.1.0-alpha.2`)**: Early pre-release. Core 1.21.1 gameplay, native Vulkan/DX12/Metal rendering, and data-driven mods work today, while 100% vanilla worldgen/AI coverage and arbitrary Java Mixin execution remain in progress. See the [Roadmap](specs/ROADMAP.md).
 
+> **Start here:** the **[Operator Guide](docs/operator-guide.md)** explains the clean split between the dedicated server (`megu`) and the native GPU client (`megu-client-gpu`), with first-boot, mods, and admin commands.
+
 ## How To (Players)
 
 Choose **one** category below from the **[Downloads page](https://megu.megumin.tech/#downloads)** or **[GitHub Releases](https://github.com/nekomario28/megu-mc/releases/latest)** (ordered from most popular):
@@ -26,6 +28,8 @@ Choose **one** category below from the **[Downloads page](https://megu.megumin.t
 ### 1. Official Launcher &amp; Standalone Client (`megu-installer` — GUI / CLI, No Java Needed)
 
 Automatically downloads/stages `megu-client-gpu` into `<minecraft_dir>/bin/` and registers the **Megu (1.21.1)** profile in the Official Minecraft Launcher (run with `gui` / `--gui` for the graphical dialog, or default 1-click install):
+
+> **No terminal step required before playing.** On first launch, `megu-client-gpu` reuses an existing 1.21.1 client JAR from the Official Launcher, PrismLauncher, or Modrinth App, or fetches and SHA-1-verifies it from Mojang's CDN in the background. `megu-installer` only stages the binary and launcher profile.
 
 | OS | File / Command | Description |
 | :--- | :--- | :--- |
@@ -55,12 +59,12 @@ Download the full platform archive (`megu-<version>-<target>.tar.gz`) from **[Gi
 | **`macos-arm64`** | **[`megu-v0.1.0-alpha.2-macos-arm64.tar.gz`](https://github.com/nekomario28/megu-mc/releases/download/v0.1.0-alpha.2/megu-v0.1.0-alpha.2-macos-arm64.tar.gz)** | `megu`, `megu-client-gpu`, `megu-client`, `megu-installer`, `megu-mod-check`, `megu-world-migrate`, `megu-init`, `megu-admin` |
 | **`macos-x86_64`** | **[`megu-v0.1.0-alpha.2-macos-x86_64.tar.gz`](https://github.com/nekomario28/megu-mc/releases/download/v0.1.0-alpha.2/megu-v0.1.0-alpha.2-macos-x86_64.tar.gz)** | `megu`, `megu-client-gpu`, `megu-client`, `megu-installer`, `megu-mod-check`, `megu-world-migrate`, `megu-init`, `megu-admin` |
 
-> **Which binary do I run?** `megu-client-gpu` is the native GPU game client for playing (`megu-client` is the headless/CLI client), `megu` runs the dedicated server, and `megu-installer` fetches the required vanilla 1.21.1 assets cleanly on first run.
+> **Which binary do I run?** `megu-client-gpu` is the native GPU game client for playing (`megu-client` is the headless/CLI client and status probe); `megu` runs the dedicated server. `megu-client-gpu` obtains Vanilla 1.21.1 assets by itself on first launch, so `megu-installer` is a convenience for staging the binary and launcher profile, never a prerequisite.
 
 ```sh
 ./megu-installer server --dir ./megu-server
 # Set eula=true in ./megu-server/eula.txt after reviewing the Minecraft EULA:
-cd ./megu-server && ./megu --port 25565
+cd ./megu-server && ./megu --port 25565   # bare `megu` defaults to port 25599
 ```
 
 - Documentation on configuring and hosting Megu: **[Operator Guide](docs/operator-guide.md)** · **[Security Notes](SECURITY_NOTES.md)**

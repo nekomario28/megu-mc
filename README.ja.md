@@ -19,6 +19,8 @@ Megu は、省メモリ・高速起動・OpenGL 依存ゼロを目指して設�
 
 > **Alpha 版（`v0.1.0-alpha.2`）**: 初期プレリリース版です。1.21.1 の基本ゲームプレイ、純 Vulkan / DX12 / Metal 描画、データ駆動 Mod が動作します。全バニラ要素の完全網羅や任意の複雑な Java Mixin 実行は開発進行中です（詳細: [ロードマップ](specs/ROADMAP.md)）。
 
+> **まずはこちら:** **[運用ガイド](docs/operator-guide.md)** で、専用サーバー（`megu`）とネイティブ GPU クライアント（`megu-client-gpu`）の明確な役割分担、初回起動、Mod、管理コマンドを確認できます。
+
 ## 使い方（プレイヤー向け）
 
 **[ダウンロードページ](https://megu.megumin.tech/#downloads)** または **[GitHub Releases](https://github.com/nekomario28/megu-mc/releases/latest)** から、プレイスタイルに合わせて **以下のカテゴリのどれか 1 つ** を選んで導入します（よく使われる順）：
@@ -26,6 +28,8 @@ Megu は、省メモリ・高速起動・OpenGL 依存ゼロを目指して設�
 ### 1. 公式ランチャー＆単体クライアント導入（`megu-installer` — GUI / CLI 両対応・Java 不要）
 
 ネイティブ GPU クライアント（`megu-client-gpu`）を `<minecraft_dir>/bin/` へ自動配置し、公式 Minecraft ランチャーに **Megu (1.21.1)** プロファイルを登録します（`gui` / `--gui` 引数で GUI 画面、引数なしで 1 クリック自動導入）：
+
+> **プレイ前にターミナル作業は不要です。** `megu-client-gpu` は初回起動時に、公式ランチャー / PrismLauncher / Modrinth App の既存 1.21.1 クライアント JAR を再利用するか、Mojang の CDN からバックグラウンドで取得して SHA-1 検証します。`megu-installer` はバイナリ配置とランチャープロファイル登録だけを行う補助ツールです。
 
 | OS | ファイル名 / コマンド | 説明 |
 | :--- | :--- | :--- |
@@ -55,12 +59,12 @@ Megu は、省メモリ・高速起動・OpenGL 依存ゼロを目指して設�
 | **`macos-arm64`** | **[`megu-v0.1.0-alpha.2-macos-arm64.tar.gz`](https://github.com/nekomario28/megu-mc/releases/download/v0.1.0-alpha.2/megu-v0.1.0-alpha.2-macos-arm64.tar.gz)** | `megu`、`megu-client-gpu`、`megu-client`、`megu-installer`、`megu-mod-check`、`megu-world-migrate`、`megu-init`、`megu-admin` |
 | **`macos-x86_64`** | **[`megu-v0.1.0-alpha.2-macos-x86_64.tar.gz`](https://github.com/nekomario28/megu-mc/releases/download/v0.1.0-alpha.2/megu-v0.1.0-alpha.2-macos-x86_64.tar.gz)** | `megu`、`megu-client-gpu`、`megu-client`、`megu-installer`、`megu-mod-check`、`megu-world-migrate`、`megu-init`、`megu-admin` |
 
-> **どのバイナリを使えばいい？** `megu-client-gpu` がプレイ用のネイティブ GPU ゲームクライアント（`megu-client` はヘッドレス / CLI クライアント）、`megu` が専用サーバー、`megu-installer` が初回起動時に必要な vanilla 1.21.1 アセットをクリーンに取得します。
+> **どのバイナリを使えばいい？** `megu-client-gpu` がプレイ用のネイティブ GPU ゲームクライアント（`megu-client` はヘッドレス / CLI クライアント兼ステータス確認用）、`megu` が専用サーバーです。`megu-client-gpu` は初回起動時に Vanilla 1.21.1 アセットを自身で取得するため、`megu-installer` はバイナリ配置とランチャープロファイル登録の補助ツールであり、必須ではありません。
 
 ```sh
 ./megu-installer server --dir ./megu-server
 # ./megu-server/eula.txt を確認して eula=true に変更後、起動：
-cd ./megu-server && ./megu --port 25565
+cd ./megu-server && ./megu --port 25565   # 引数なしの `megu` は既定で 25599 番
 ```
 
 - サーバー設定・外部公開時の注意点: **[運用ガイド](docs/operator-guide.md)** · **[SECURITY_NOTES.md](SECURITY_NOTES.md)**

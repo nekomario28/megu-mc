@@ -1,9 +1,219 @@
 # Operator guide
 
-Running an megu server: first-time setup, modpack pre-flight, runtime
-knobs, Docker, world migration and status probing. Every command below is
-copied from the binaries in this tree — each binary's `--help` is the
-authoritative flag list.
+Megu ships **two separate programs**. They share a codebase, but they are
+not the same binary and they do not share a directory or a config file:
+
+- **`megu`** is the dedicated server. It owns the world, listens for
+  players, and is the only one you expose to the network.
+- **`megu-client-gpu`** is the native GPU client (Vulkan / DX12 / Metal).
+  It runs on the player's machine, connects out to a server, and also
+  hosts singleplayer worlds by launching a loopback `megu` process.
+
+If you only remember one sentence: **run `megu` on the server, run
+`megu-client-gpu` on the player's PC.** `megu-client` is a third,
+headless/CLI client used for status probing and automation, not for
+windowed play.
+
+## Dedicated server vs. native GPU client
+
+| | **Dedicated server (`megu`)** | **Native GPU client (`megu-client-gpu`)** |
+| :--- | :--- | :--- |
+| **Job** | Headless game server: world ticks, players, saves, admin commands | Windowed renderer + game client; singleplayer hosts a loopback `megu` |
+| **Runs on** | Server, VPS, or a spare PC | The player's Windows / macOS / Linux machine |
+| **Game port** | TCP **25599** by default; pass `--port 25565` for the usual port. Also `[server] port`, `MEGU_PORT`, `server-port` | No inbound game port. `--connect <host[:port]>` defaults to **25565** on the remote server |
+| **Bind address** | `127.0.0.1` by default; a public bind requires `MEGU_ALLOW_PUBLIC_BIND=1` | Outbound only; singleplayer binds an ephemeral loopback port |
+| **World / data** | The server directory (`--dir`, default cwd): `world_overlay.bin`, `world_overlay_nether.bin`, `world_overlay_end.bin`, `backups/`, `mods/`, `datapacks/` | `--gameDir` (default cwd): `saves/<world>/` for singleplayer, plus `versions/`, `mods/`, `resourcepacks/`, `megu-client.toml`, `options.txt`; assets live under `--assetsDir` |
+| **Config** | `server.toml` (`[server]`, `[anticheat]`) → `server.properties` (Vanilla keys, read-only) → `MEGU_*` env (wins) | `megu-client.toml` (or imported `options.txt`), launcher args, `MEGU_*` env |
+| **Mods** | `mods/*.jar` scanned when `MEGU_MODS_DIR` is set (release builds include the mod suite) | `<gameDir>/mods/*.jar` for textures/recipes and for the integrated host |
+| **Admin surface** | Console, RCON (opt-in), `/megu …`, `/transfer`, `/profile` | In-game UI only; no server administration |
+| **Start** | `./megu --port 25565` | `./megu-client-gpu --connect play.example.net:25565` |
+
+The **client is never a server**: do not port-forward to it, and do not
+copy `server.toml` into a client folder. The **server has no window**: run
+it in a terminal, a service manager, or the provided container.
+
+### The two Megu client binaries
+
+| Binary | Use it for |
+| :--- | :--- |
+| `megu-client-gpu` | The real game client: window, rendering, live multiplayer, singleplayer. |
+| `megu-client` | Headless/CLI client and status probe (`megu-client --ping host:25565`); also the home of crash-report flags and integrated-host launcher plumbing. |
+
+`megu-installer` is setup only. It stages binaries and registers a
+launcher profile; it is **not** required before opening
+`megu-client-gpu`, because the GPU client bootstraps its own Vanilla
+1.21.1 assets (see below).
+
+## Quick start: dedicated server (3 steps)
+
+### 1. Download and lay out the directory
+
+Use either route — both create a self-contained server folder:
+
+```sh
+# Route A: the installer (from a release archive or tools/install_linux.sh)
+./megu-installer server --dir ./megu-server
+
+# Route B: the full archive + the initializer
+./megu-init --dir ./megu-server
+```
+
+`megu-init` creates `world/`, `mods/`, `datapacks/`, `backups/`,
+`server.toml`, `eula.txt`, `ops.json`, and `whitelist.json`. It does not
+write `server.properties`.
+
+### 2. Accept the Minecraft EULA
+
+Read <https://aka.ms/MinecraftEULA>, then edit `./megu-server/eula.txt`:
+
+```properties
+eula=true
+```
+
+`megu` refuses to boot with exit code 2 when a present `eula.txt` is not
+accepted. The container image requires `EULA=TRUE`. A **missing**
+`eula.txt` is allowed for first boots and repository development runs.
+
+### 3. Run it
+
+```sh
+cd ./megu-server
+./megu --port 25565      # omit --port to listen on 25599
+```
+
+At the console, `status` prints TPS/players/chunks/memory and `stop`
+saves and exits. `server.toml` is re-read on Vanilla `/reload`.
+
+### Which config file holds what
+
+| File | Holds | Notes |
+| :--- | :--- | :--- |
+| `server.properties` | Vanilla keys: `server-port`, `server-ip`, `motd`, `max-players`, `white-list` / `enforce-whitelist`, `difficulty`, `gamemode`, `view-distance`, `simulation-distance`, `online-mode`, `allow-flight`, `pvp`, `rcon.port`, `rcon.password`, `op-permission-level`, `player-idle-timeout`, `network-compression-threshold`, `level-seed` | Read if present, **never created**; lowest priority. Drop in a file from an existing Vanilla server and its recognized keys are honored. |
+| `server.toml` | Megu extensions. `[server]`: `port`, `bind_addr`, `motd`, `max_players`, `seed`, `compression_threshold`, `allowlist`, `idle_timeout_secs`, `login_timeout_secs`, `backup_interval_secs`, `backup_max_keep`, `max_conn_per_ip`, `resource_pack_url`, `resource_pack_required`, `rcon_port`, `online_mode`, `velocity_forwarding`, `velocity_forwarding_secret`, `autosave_interval_secs`, `lan_broadcast`, `auto_load_balance`, `target_version`, `version_pack_dir`. `[anticheat]`: `enabled`, `antixray`, `hide_underground`, `antifullbright`, `check_ops`, `preset`, `alerts`, `exempt`, `exempt_ops`, `ops_bypass`, `anti_xray` | Optional; written with comments on first boot. Unknown tables/keys are reported and skipped. There is **no `[backup]` table** — backup knobs are the `[server] backup_*` keys. |
+| `MEGU_*` environment | Same settings plus runtime-only knobs (`MEGU_ALLOW_PUBLIC_BIND`, `MEGU_RCON_PASS`, `MEGU_ANVIL_WORLD_DIR`, …) | **Highest priority**; overrides both files. `MEGU_CONFIG` points at a different `server.toml`. |
+
+Settings precedence is **environment → `server.toml` → `server.properties`**.
+The full environment table is in §3.
+
+## Quick start: client (zero manual steps)
+
+```sh
+# Multiplayer
+./megu-client-gpu --connect play.example.net:25565
+
+# Singleplayer (launches a loopback megu automatically)
+./megu-client-gpu --quickPlaySingleplayer MyWorld
+```
+
+Or launch the **Megu (1.21.1)** profile that `megu-installer` registered;
+the client also accepts the standard launcher arguments (`--gameDir`,
+`--assetsDir`, `--assetIndex`, `--version`, `--username`, `--uuid`,
+`--accessToken`, `--quickPlayMultiplayer`, …).
+
+**You do not need to run `megu-installer` in a terminal, or download
+assets by hand, before the first window opens.** On first launch the
+client:
+
+1. Scans, in order, `<gameDir>/versions/1.21.1/1.21.1.jar`, the Official
+   Launcher's `.minecraft` (native and Flatpak), the PrismLauncher library
+   cache, the Modrinth App cache, and Megu's own cache
+   (`~/.cache/megu`, `~/Library/Caches/megu`, or `%LOCALAPPDATA%\megu`).
+   The first readable ZIP wins — an existing 1.21.1 install is reused
+   instantly for textures, models, and title branding.
+2. If no local JAR exists, fetches the Mojang version manifest, then the
+   version JSON, then the client JAR **in the background**. The chain is
+   HTTPS-only against Mojang's official hosts, streamed in 64 KiB chunks
+   to a `.part` file, checked against the manifest's SHA-1 and the ZIP
+   magic, and atomically renamed only after verification. Progress is
+   shown on the title line; textures and branding hot-reload when it is
+   ready.
+3. Shows built-in placeholder branding while a download is in flight, so
+   the window opens immediately instead of blocking on the network.
+
+Set `MEGU_NO_AUTO_FETCH=1` (or `MEGU_OFFLINE=1`) to disable the network
+fetch. The client never needs Java. Client settings live in
+`<gameDir>/megu-client.toml`; if that file is absent, an existing Vanilla
+`options.txt` is imported once.
+
+## Quick start: modded servers
+
+Release builds ship the `mod-suite` and `create-offload` features. Put
+Fabric / NeoForge JARs in `mods/`, then point the standalone server at
+them (the integrated client host does this automatically):
+
+```sh
+MEGU_MODS_DIR=./mods ./megu --port 25565
+
+# Pre-flight a pack or folder without a JVM:
+./megu-mod-check --scan-mods-dir ./mods
+```
+
+- **Jar-in-Jar.** Embedded JARs under NeoForge's `META-INF/jarjar/` and
+  Fabric's nested-JAR layout are extracted recursively (depth, count, and
+  total-byte caps) and their `data/` and `assets/` content is folded into
+  the adapter, so bundled libraries are not silently ignored.
+- **Create 6.x / Create: Aeronautics.** The zero-JVM `create-adapter`
+  covers Create 6.x-generation kinetics, belts, contraptions, factory
+  processing, and Aeronautics-style 6-DOF rigid-body ships with a
+  deterministic `AERO` save codec. Addon profiles are data-driven rather
+  than one Rust implementation per addon.
+- **Anvil compatibility.** `--import-anvil <dir>` / `--export-anvil <dir>`
+  convert a Vanilla 1.21.1 world once; `MEGU_ANVIL_WORLD_DIR=<dir>` keeps a
+  Vanilla/NeoForge world live. Root NBT the server does not interpret
+  (`Heightmaps`, `structures`, `neoforge:attachments`, `ForgeData`,
+  `fabric:attachments`, `block_ticks`, …) is preserved and merged back on
+  re-encode. Palette entries the registry cannot resolve (mod blocks)
+  decode as air but keep a per-cell **tombstone** of the original
+  `{Name, Properties}` compound, so a load → save cycle restores the mod
+  block instead of erasing it.
+- **Cross-mod interop.** `UnifiedTagIndex` maps `#c:` and `#forge:` tag
+  namespaces onto one index, and `BlockCapabilityBus` exposes item, fluid,
+  and energy capabilities across mods — all in-process, no JVM bridge.
+- **Honest limits.** Arbitrary Java code and Mixin execution still need
+  the JVM bridge; `megu-mod-check` reports JARs that need inspection
+  instead of pretending they ran. Create support targets the 6.x
+  (1.21.1) generation, and Aeronautics support is the native 6-DOF
+  adapter, not a promise that every addon version runs.
+
+## Quick start: operator commands and safety
+
+```text
+/transfer <hostname> [<port>] [<players>]        # level 3; native 1.21.1 transfer (0x73)
+/megu policy list|get <key>|set <key> <value>|reset   # level 4
+/megu audit [player] [radius]                    # level 4; live block audit ring
+/megu rollback <player> <radius> [max_blocks]    # level 4
+/megu claim here|unclaim|trust <player>|untrust <player>|info
+/megu claim admin-unclaim|spawn-radius <n>|spawn-protect <n>   # level 4
+/megu backup plan|status                         # level 4; no external plugin
+/megu metrics                                    # level 4; Prometheus text exposition
+```
+
+- **`/transfer`** sends the Vanilla clientbound transfer packet. It
+  defaults to port **25565** and targets **`@s`** when no player selector
+  is given; the host must be a printable, non-space ASCII hostname.
+- **Velocity modern forwarding** is opt-in: set
+  `MEGU_VELOCITY_FORWARDING=1` and a shared `MEGU_VELOCITY_SECRET`. The
+  proxy must answer `velocity:player_info` with an HMAC-SHA256 identity
+  signed by that secret. Forwarding is checked **before** online mode;
+  never stack both, and firewall the backend so only the proxy reaches it.
+- **`/megu metrics`** prints a Prometheus 0.0.4 text exposition
+  (`megu_tps`, MSPT percentiles, players, chunks, faults, RSS, uptime).
+  There is no built-in HTTP scrape listener — capture the command output
+  from the console, RCON, or your process supervisor.
+- **`/megu backup plan|status`** reports the next rotation and existing
+  `backups/world*.bak` generations. Rotation itself is off by default
+  (`backup_max_keep = 0`); set it in `[server]` and **test a restore**
+  before relying on it.
+
+Safety posture, in one paragraph: the server binds loopback and runs
+without authentication by default. Opening it to the internet requires
+`MEGU_ALLOW_PUBLIC_BIND=1` (which logs a warning) **plus** real identity
+— `MEGU_ONLINE_MODE=1` or a Velocity proxy — and preferably an allowlist
+and a firewall. RCON stays off unless both `MEGU_RCON_PORT` and a
+nonempty `MEGU_RCON_PASS` are set. See
+[../SECURITY_NOTES.md](../SECURITY_NOTES.md) before exposing anything.
+
+## The full binary set
 
 Seven primary operator-facing binaries ship in this repository, alongside
 `megu-admin` for the legacy offline administration commands:
@@ -16,13 +226,19 @@ Seven primary operator-facing binaries ship in this repository, alongside
 | `megu-mod-check` | [../mod-adapter-core](../mod-adapter-core) | modpack pre-flight checker |
 | `megu-world-migrate` | [../state-store](../state-store) | inspect and migrate world data between 1.21.1 and 26.3 |
 | `megu-client` | [../client-app](../client-app) | native client; `--ping` doubles as a status probe |
-| `megu-client-gpu` | [../client-gpu](../client-gpu) | wgpu client; adapter probe and offline demo |
+| `megu-client-gpu` | [../client-gpu](../client-gpu) | windowed wgpu client: live play, integrated singleplayer host, zero-manual Vanilla JAR bootstrap |
 | `megu-voice-relay` | [../proto](../proto) | zero-dependency `VCR1` UDP proximity voice relay sidecar |
 
 The server and the tools target two Minecraft versions: `1.21.1`
 (protocol 767, DataVersion 3955) and `26.3` (protocol 777, DataVersion
 5023). What each piece does with them is stated where it is used; §7 is
 honest about today's coverage.
+
+---
+
+The numbered sections below are the detailed reference: setup edge cases,
+modpack pre-flight, every runtime knob, Docker, world migration, voice
+relay, alpha caveats, and the optional report relay.
 
 ## 1. First-time server setup
 
@@ -255,7 +471,7 @@ Environment knobs the runtime actually reads:
 
 | variable | default | effect |
 |---|---|---|
-| `MEGU_PORT` | 25565 | game listener port |
+| `MEGU_PORT` | 25599 | game listener port (`--port 25565` for the conventional port) |
 | `MEGU_BIND_ADDR` | 127.0.0.1 | game listener address |
 | `MEGU_ALLOW_PUBLIC_BIND` | off | required to bind any non-loopback address |
 | `MEGU_MOTD` | "megu" | server-list description and LAN announcement text |
@@ -530,9 +746,9 @@ megu-client-gpu --connect 127.0.0.1:25565
 
 `--headless-probe` enumerates GPU adapters and the selected pipeline without
 opening a window. `--offline-demo` opens a built-in scene without a server.
-`--connect` currently records the target and shows it in the HUD; the live
-gameplay wire session is still being integrated. Ship this optional binary
-with `release_bundle.py build --extra-binary <path/to/megu-client-gpu>`
+`--connect` joins a live multiplayer session (default port 25565), and
+`--quickPlaySingleplayer <world>` launches a loopback `megu` host. Ship this
+binary with `release_bundle.py build --extra-binary <path/to/megu-client-gpu>`
 (or `.exe` on Windows).
 
 **External shader packs.** Supply a shaderpack ZIP or directory and,
@@ -576,7 +792,9 @@ No third-party shaders are bundled.
 - **EULA acceptance requires an operator action.** Direct `megu-init`
   writes `eula=true` only with explicit `--accept-eula` when creating or
   replacing `eula.txt`. The container requires `EULA=TRUE` to start.
-  The bare `megu` binary does not read `eula.txt`.
+  The bare `megu` binary reads `eula.txt` from its working directory (or
+  `--dir`) and exits 2 if the file exists but is not accepted; a missing
+  `eula.txt` is allowed for first boots and development runs.
 - [../SECURITY_NOTES.md](../SECURITY_NOTES.md) carries the full
   bind/allowlist posture; [../SECURITY.md](../SECURITY.md) is the
   reporting channel.
