@@ -71,11 +71,12 @@ use crate::subworld_render::{
     DEBUG_LINE_WGSL, DRAW_UNIFORM_STRIDE, DebugLineVertex, LIT_VERTEX_LAYOUT, PART_INSTANCE_LAYOUT,
     PARTICLE_BILLBOARD_CORNERS, PARTICLE_BILLBOARD_INDICES, PARTICLE_INSTANCE_LAYOUT,
     PARTICLE_QUAD_LAYOUT, ParticleBillboardPack, ParticleInstance, SubWorldGpuCache,
-    SubWorldRenderBank, TerrainVertex, VfxLightsGpu, lit_wgsl, pack_particle_billboard,
+    SubWorldRenderBank, SubWorldTransform, TerrainVertex, VfxLightsGpu, lit_wgsl,
+    pack_particle_billboard,
 };
 use crate::{
     Camera, DemoScene, Mat4, build_index_buffer, gpu_capabilities_for, gpu_shader_caps_for,
-    negotiate_pipeline, pack_quads_to_vertices, wgpu_backends_for,
+    mat4_mul_vec4, negotiate_pipeline, pack_quads_to_vertices, wgpu_backends_for,
 };
 
 // ---------------------------------------------------------------------------
@@ -3574,6 +3575,12 @@ pub struct GpuRenderer {
     /// User brightness multiplier, `50..=200` percent.
     gamma_pct: u16,
     smooth_lighting: bool,
+    /// Sky-light daylight factor for the `Shadows: Off` entity/BER
+    /// fallback tint — refreshed every composed frame in
+    /// [`Self::prepare_shadow`] from the live world clock via vanilla's
+    /// `clamp(sun.y * 2 + 0.2, 0, 1)` day-brightness curve. Defaults to
+    /// full daylight before the first frame encodes.
+    entity_light_daylight: f32,
     /// Pack-supplied `gbuffers_*` pipelines for Create sub-worlds and
     /// kinetic parts (`None` = built-in `COMPOSITE_LIT_WGSL` path).
     pack_subworld: Option<PackSubworldGpu>,
@@ -3784,18 +3791,64 @@ fn append_dynamic_quad(
     true
 }
 
-fn build_lit_entity_ber_geometry(
+/// Vanilla entity/BER light brightness: the lightmap's `l / (3 - 2l)`
+/// brightness ramp applied to block light and daylight-scaled sky
+/// light, keeping the brighter of the two and flooring at `0.06` so a
+/// quad in absolute darkness stays barely visible instead of going
+/// fully black. `block_light`/`sky_light` are `0..=15` nibbles;
+/// `daylight_factor` is `0..=1` (`1` noon, `0` night — the renderer's
+/// `entity_light_daylight` tracks the live world clock). Non-finite
+/// daylight fails closed to `0`.
+pub fn vanilla_light_brightness(block_light: u8, sky_light: u8, daylight_factor: f32) -> f32 {
+    fn ramp(level: f32) -> f32 {
+        let l = level.clamp(0.0, 1.0);
+        l / (3.0 - 2.0 * l)
+    }
+    let daylight = if daylight_factor.is_finite() {
+        daylight_factor.clamp(0.0, 1.0)
+    } else {
+        0.0
+    };
+    let block = ramp(f32::from(block_light.min(15)) / 15.0);
+    let sky = ramp(f32::from(sky_light.min(15)) / 15.0) * daylight;
+    block.max(sky).clamp(0.06, 1.0)
+}
+
+/// Both entity/BER vertex streams from one mesh pass: the
+/// `LitTerrainVertex` shadow-receiver stream (world `(block_light,
+/// sky_light)` per quad in `light_attr`) and the `TerrainVertex`
+/// composite-lit fallback stream whose RGB tint is modulated by
+/// [`vanilla_light_brightness`] — `Shadows: Off` frames then keep the
+/// same dark-cave/torch-bright response the receiver path gives
+/// `Shadows: On`. Each quad samples world light once at its centroid,
+/// so the two streams can never disagree on the sample.
+struct EntityBerGeometry {
+    lit_vertices: Vec<LitTerrainVertex>,
+    lit_indices: Vec<u32>,
+    vertices: Vec<TerrainVertex>,
+    indices: Vec<u32>,
+}
+
+fn build_entity_ber_geometry(
     meshes: &[(&ExtrudedMesh, [f32; 3], [f32; 3])],
     sample_light: &mut impl FnMut(f32, f32, f32) -> (u8, u8),
-) -> (Vec<LitTerrainVertex>, Vec<u32>) {
-    let mut vertices = Vec::new();
-    let mut indices = Vec::new();
+    daylight_factor: f32,
+) -> EntityBerGeometry {
+    let mut out = EntityBerGeometry {
+        lit_vertices: Vec::new(),
+        lit_indices: Vec::new(),
+        vertices: Vec::new(),
+        indices: Vec::new(),
+    };
     'meshes: for &(mesh, origin, tint) in meshes {
         if !origin.iter().chain(tint.iter()).all(|v| v.is_finite()) {
             continue;
         }
         for quad in &mesh.quads {
-            if vertices.len() / 4 >= MAX_DYNAMIC_QUADS {
+            // Each stream keeps its own `MAX_DYNAMIC_QUADS` ceiling —
+            // the loops this replaces capped them independently.
+            let lit_full = out.lit_vertices.len() / 4 >= MAX_DYNAMIC_QUADS;
+            if lit_full && out.vertices.len() / 4 >= MAX_DYNAMIC_QUADS {
                 break 'meshes;
             }
             let positions = quad.positions.map(|point| [
@@ -3813,21 +3866,94 @@ fn build_lit_entity_ber_geometry(
                 positions.iter().map(|p| p[1]).sum::<f32>() * 0.25,
                 positions.iter().map(|p| p[2]).sum::<f32>() * 0.25,
             ];
-            let (block_light, sky_light) = sample_light(centroid[0], centroid[1], centroid[2]);
-            let base = vertices.len() as u32;
-            for position in positions {
-                vertices.push(LitTerrainVertex {
-                    position,
-                    normal: quad.normal,
-                    albedo: entity_quad_tint(quad.tint_index, tint),
-                    light_attr: (u32::from(block_light.min(15)) << 5)
-                        | (u32::from(sky_light.min(15)) << 9),
-                });
+            let (block_light, sky_light) =
+                sample_light(centroid[0], centroid[1], centroid[2]);
+            if !lit_full {
+                let base = out.lit_vertices.len() as u32;
+                for position in positions {
+                    out.lit_vertices.push(LitTerrainVertex {
+                        position,
+                        normal: quad.normal,
+                        albedo: entity_quad_tint(quad.tint_index, tint),
+                        light_attr: (u32::from(block_light.min(15)) << 5)
+                            | (u32::from(sky_light.min(15)) << 9),
+                    });
+                }
+                out.lit_indices
+                    .extend_from_slice(&[base, base + 1, base + 2, base, base + 2, base + 3]);
             }
-            indices.extend_from_slice(&[base, base + 1, base + 2, base, base + 2, base + 3]);
+            let brightness =
+                vanilla_light_brightness(block_light, sky_light, daylight_factor);
+            append_dynamic_quad(
+                &mut out.vertices,
+                &mut out.indices,
+                positions,
+                quad.normal,
+                quad.uv,
+                tint.map(|v| v * brightness),
+            );
         }
     }
-    (vertices, indices)
+    out
+}
+
+/// Test-only view of the lit stream — production consumes the combined
+/// [`build_entity_ber_geometry`] pass.
+#[cfg(test)]
+fn build_lit_entity_ber_geometry(
+    meshes: &[(&ExtrudedMesh, [f32; 3], [f32; 3])],
+    sample_light: &mut impl FnMut(f32, f32, f32) -> (u8, u8),
+) -> (Vec<LitTerrainVertex>, Vec<u32>) {
+    let geometry = build_entity_ber_geometry(meshes, sample_light, 1.0);
+    (geometry.lit_vertices, geometry.lit_indices)
+}
+
+/// Bake one sub-world's model-space `TerrainVertex` mesh into a
+/// world-space `LitTerrainVertex` stream stamped with `(block_light,
+/// sky_light)` — the `LitSubWorldMesh` payload a caller can hand to
+/// [`GpuRenderer::upload_lit_terrain`] when a moving contraption or
+/// airship should ride the `MEGU_TERRAIN_LIT_WGSL` shadow-receiver path
+/// instead of the composite `TerrainVertex` draw. Positions transform
+/// by `transform.model_matrix()`; normals transform by its linear part
+/// (uniform scale normalizes away). Indices pass through unchanged.
+pub fn lit_subworld_mesh(
+    mesh: &(Vec<TerrainVertex>, Vec<u32>),
+    transform: &SubWorldTransform,
+    block_light: u8,
+    sky_light: u8,
+) -> (Vec<LitTerrainVertex>, Vec<u32>) {
+    let model = transform.model_matrix();
+    let light_attr = (u32::from(block_light.min(15)) << 5) | (u32::from(sky_light.min(15)) << 9);
+    let vertices = mesh
+        .0
+        .iter()
+        .map(|vertex| {
+            let p = mat4_mul_vec4(
+                &model,
+                [
+                    vertex.position[0],
+                    vertex.position[1],
+                    vertex.position[2],
+                    1.0,
+                ],
+            );
+            let n = vertex.normal();
+            let t = mat4_mul_vec4(&model, [n[0], n[1], n[2], 0.0]);
+            let len = (t[0] * t[0] + t[1] * t[1] + t[2] * t[2]).sqrt();
+            let normal = if len.is_finite() && len > 1.0e-12 {
+                [t[0] / len, t[1] / len, t[2] / len]
+            } else {
+                [0.0, 1.0, 0.0]
+            };
+            LitTerrainVertex {
+                position: [p[0], p[1], p[2]],
+                normal,
+                albedo: vertex.albedo(),
+                light_attr,
+            }
+        })
+        .collect();
+    (vertices, mesh.1.clone())
 }
 
 fn entity_quad_tint(tint_index: i32, base_tint: [f32; 3]) -> [f32; 3] {
@@ -3847,7 +3973,11 @@ fn entity_quad_tint(tint_index: i32, base_tint: [f32; 3]) -> [f32; 3] {
 
 #[cfg(test)]
 mod entity_lighting_tests {
-    use super::{build_lit_entity_ber_geometry, entity_quad_tint};
+    use super::{
+        build_entity_ber_geometry, build_lit_entity_ber_geometry, entity_quad_tint,
+        lit_subworld_mesh, vanilla_light_brightness,
+    };
+    use crate::subworld_render::{SubWorldTransform, box_mesh};
     use megu_client_mesh::vanilla_plus_3d::{ExtrudedMesh, ExtrudedQuad};
 
     fn quad(y: f32, normal: [f32; 3], tint_index: i32) -> ExtrudedQuad {
@@ -3888,6 +4018,97 @@ mod entity_lighting_tests {
         assert_eq!(tint, [128.0 / 255.0, 64.0 / 255.0, 32.0 / 255.0]);
         assert_eq!(entity_quad_tint(1, [0.2, 0.4, 0.6]), [0.2, 0.4, 0.6]);
         assert_eq!(entity_quad_tint(-1, [0.2, 0.4, 0.6]), [0.2, 0.4, 0.6]);
+    }
+
+    #[test]
+    fn vanilla_light_brightness_tracks_the_lightmap_ramp() {
+        // Deep dark cave: the 0.06 floor keeps it under the dark bound.
+        assert!(vanilla_light_brightness(0, 0, 1.0) < 0.12);
+        // Next to a torch in a cave, or sunlit surface: full brightness.
+        assert!(vanilla_light_brightness(15, 0, 1.0) >= 0.95);
+        assert!(vanilla_light_brightness(0, 15, 1.0) >= 0.95);
+        // Monotonic in block light and bounded to [0.06, 1.0].
+        let low = vanilla_light_brightness(4, 0, 1.0);
+        let mid = vanilla_light_brightness(9, 0, 1.0);
+        let high = vanilla_light_brightness(14, 0, 1.0);
+        assert!(low < mid && mid < high);
+        // Night kills the sky contribution; block light is unaffected.
+        assert!(vanilla_light_brightness(0, 15, 0.0) < 0.12);
+        assert!(vanilla_light_brightness(15, 0, 0.0) >= 0.95);
+        // Out-of-contract inputs clamp instead of NaN-ing out.
+        assert!(vanilla_light_brightness(255, 255, 1.0) <= 1.0);
+        assert_eq!(vanilla_light_brightness(0, 0, f32::NAN), 0.06);
+    }
+
+    #[test]
+    fn shadows_off_fallback_darkens_cave_tint_but_not_sunlit() {
+        let mesh = ExtrudedMesh {
+            quads: vec![quad(0.0, [0.0, 1.0, 0.0], -1)],
+        };
+        let dark = build_entity_ber_geometry(
+            &[(&mesh, [0.0, 0.0, 0.0], [1.0; 3])],
+            &mut |_, _, _| (0, 0),
+            1.0,
+        );
+        let sunlit = build_entity_ber_geometry(
+            &[(&mesh, [0.0, 0.0, 0.0], [1.0; 3])],
+            &mut |_, _, _| (0, 15),
+            1.0,
+        );
+        assert_eq!(dark.vertices.len(), 4);
+        assert_eq!(sunlit.vertices.len(), 4);
+        let dark_albedo = dark.vertices[0].albedo();
+        let sun_albedo = sunlit.vertices[0].albedo();
+        assert!(dark_albedo.iter().all(|c| *c < 0.15));
+        assert!(sun_albedo.iter().all(|c| *c > 0.9));
+        // The lit receiver stream is unaffected by the fallback tint.
+        assert!(dark
+            .lit_vertices
+            .iter()
+            .all(|v| (v.light_attr >> 5) & 0xf == 0 && (v.light_attr >> 9) & 0xf == 0));
+        assert!(sunlit
+            .lit_vertices
+            .iter()
+            .all(|v| (v.light_attr >> 5) & 0xf == 0 && (v.light_attr >> 9) & 0xf == 15));
+        // Torch light brightens the fallback even with zero sky light.
+        let torch = build_entity_ber_geometry(
+            &[(&mesh, [0.0, 0.0, 0.0], [1.0; 3])],
+            &mut |_, _, _| (15, 0),
+            1.0,
+        );
+        assert!(torch.vertices[0].albedo().iter().all(|c| *c > 0.9));
+    }
+
+    #[test]
+    fn lit_subworld_mesh_bakes_transform_and_packs_light() {
+        let (vertices, indices) = box_mesh([0.0; 3], [1.0; 3], [0.5, 0.6, 0.7]);
+        let transform = SubWorldTransform {
+            position: [10.0, 20.0, 30.0],
+            quaternion: crate::subworld_render::quat_from_axis_angle(
+                [0.0, 1.0, 0.0],
+                std::f32::consts::FRAC_PI_2,
+            ),
+            scale: 1.0,
+        };
+        let (lit, lit_indices) = lit_subworld_mesh(&(vertices, indices), &transform, 14, 9);
+        assert_eq!(lit.len(), 24);
+        assert_eq!(lit_indices.len(), 36);
+        assert!(lit
+            .iter()
+            .all(|v| v.light_attr == ((14 << 5) | (9 << 9))));
+        // A +Y face normal rotated 90° about Y lands on ±X/±Z, and every
+        // position stays inside the 1-block box around the pivot.
+        assert!(lit.iter().all(|v| {
+            (10.0 - 1.0..=10.0 + 1.0).contains(&v.position[0])
+                && (20.0..=20.0 + 1.0).contains(&v.position[1])
+                && (30.0 - 1.0..=30.0 + 1.0).contains(&v.position[2])
+        }));
+        assert!(lit.iter().all(|v| {
+            let len = (v.normal[0].powi(2) + v.normal[1].powi(2) + v.normal[2].powi(2)).sqrt();
+            (len - 1.0).abs() < 1e-3
+        }));
+        // Albedo survives the unorm8 round-trip through the packed vertex.
+        assert!((lit[0].albedo[0] - 0.5).abs() < 0.01);
     }
 }
 
@@ -7118,6 +7339,7 @@ impl GpuRenderer {
             },
             gamma_pct: 100,
             smooth_lighting: true,
+            entity_light_daylight: 1.0,
             pack_subworld: None,
             notice: None,
         }
@@ -7173,48 +7395,32 @@ impl GpuRenderer {
 
     /// Stage every entity and BER quad with its own world-light sample.
     /// Shadow-capable frames use the decoded `MEGU_TERRAIN_LIT_WGSL`
-    /// receiver; shadow-disabled frames retain the composite lit fallback.
+    /// receiver; shadow-disabled frames retain the composite lit
+    /// fallback, now with the RGB tint modulated by
+    /// [`vanilla_light_brightness`] so `Shadows: Off` still darkens in
+    /// caves and brightens beside torches.
     pub fn set_entity_and_ber_meshes_lit(
         &mut self,
         meshes: Vec<(&ExtrudedMesh, [f32; 3], [f32; 3])>,
         mut sample_light: impl FnMut(f32, f32, f32) -> (u8, u8),
     ) {
-        let (lit_vertices, lit_indices) = build_lit_entity_ber_geometry(&meshes, &mut sample_light);
+        let geometry = build_entity_ber_geometry(
+            &meshes,
+            &mut sample_light,
+            self.entity_light_daylight,
+        );
         if self.shadow_active && self.shadow.is_some() {
-            let _ = self.upload_lit_terrain(&lit_vertices, &lit_indices);
+            let _ = self.upload_lit_terrain(&geometry.lit_vertices, &geometry.lit_indices);
         } else {
             self.lit_terrain = None;
         }
 
-        let mut vertices = Vec::new();
-        let mut indices = Vec::new();
-        'meshes: for (mesh, origin, tint) in meshes {
-            if !origin.iter().chain(tint.iter()).all(|v| v.is_finite()) {
-                continue;
-            }
-            for quad in &mesh.quads {
-                if vertices.len() / 4 >= MAX_DYNAMIC_QUADS {
-                    break 'meshes;
-                }
-                let positions = quad.positions.map(|point| {
-                    [
-                        point[0] + origin[0],
-                        point[1] + origin[1],
-                        point[2] + origin[2],
-                    ]
-                });
-                append_dynamic_quad(
-                    &mut vertices,
-                    &mut indices,
-                    positions,
-                    quad.normal,
-                    quad.uv,
-                    tint,
-                );
-            }
-        }
-        let (allocs, reuses) =
-            stage_dynamic_geometry(&self.ctx, &mut self.entity_ber, &vertices, &indices);
+        let (allocs, reuses) = stage_dynamic_geometry(
+            &self.ctx,
+            &mut self.entity_ber,
+            &geometry.vertices,
+            &geometry.indices,
+        );
         self.dynamic_buffer_allocs += allocs;
         self.dynamic_ring_reuses += reuses;
     }
@@ -11533,6 +11739,14 @@ impl GpuRenderer {
 
     fn prepare_shadow(&mut self, camera: &Camera, aspect: f32, world_time_ticks: u64) {
         let sun = compute_sun_direction(world_time_ticks);
+        // Vanilla day-brightness curve (`1 - skyDarken` shape): noon sun
+        // elevation 1 -> 1.0, dusk/dawn horizon -> ~0. Non-finite sun
+        // keeps the default full-daylight factor.
+        self.entity_light_daylight = if sun[1].is_finite() {
+            (sun[1] * 2.0 + 0.2).clamp(0.0, 1.0)
+        } else {
+            1.0
+        };
         // The rotation-invariant state is rebuilt every frame: its camera
         // vectors feed the sky dome even while cascades are off, and the
         // texel-snapped orthos drive the pending-cascade drain.
@@ -13086,13 +13300,15 @@ impl GpuRenderer {
             // Non-terrain draws continue in `draw_scratch` past the
             // terrain slice so one `write_buffer` covers the whole frame.
             let scratch = &mut gpu.draw_scratch;
-            let mut slot = |model: Mat4, fade: f32, alpha: f32| -> u32 {
+            // `world_light` is the packed sub-world light word
+            // (`pack_subworld_light`/`0`) carried in `params2.z`.
+            let mut slot = |model: Mat4, fade: f32, alpha: f32, world_light: u32| -> u32 {
                 let index = scratch.len();
                 scratch.push(CompositeDrawUniforms {
                     mvp: mat4_mul(&view_proj, &model),
                     model,
                     params: [fade, alpha, 0.0, 0.0],
-                    params2: [0.0; 4],
+                    params2: [0.0, 0.0, f32::from_bits(world_light), 0.0],
                     _stride_pad: [0.0; 24],
                 });
                 index as u32 * DRAW_UNIFORM_STRIDE
@@ -13126,7 +13342,7 @@ impl GpuRenderer {
                     drew_opaque_subworld = true;
                 }
                 let model = entry.transform.model_matrix();
-                let off = slot(model, 1.0, entry.alpha);
+                let off = slot(model, 1.0, entry.alpha, entry.world_light);
                 pass.set_bind_group(1, &gpu.draw_bg, &[off]);
                 pass.set_vertex_buffer(0, entry.vertex_buffer().slice(..));
                 pass.set_index_buffer(entry.index_buffer().slice(..), wgpu::IndexFormat::Uint32);
@@ -13145,7 +13361,7 @@ impl GpuRenderer {
                     drew_instanced = true;
                 }
                 let model = batch.transform.model_matrix();
-                let off = slot(model, 1.0, 1.0);
+                let off = slot(model, 1.0, 1.0, 0);
                 pass.set_bind_group(1, &gpu.draw_bg, &[off]);
                 pass.set_vertex_buffer(0, batch.template_vertex_buffer().slice(..));
                 pass.set_vertex_buffer(1, batch.instance_buffer().slice(..));
@@ -13161,7 +13377,7 @@ impl GpuRenderer {
                 if let Some(mesh) = entity_ber {
                 pass.set_pipeline(&lit_opaque_pipeline);
                 pass.set_bind_group(0, &gpu.lit_frame_bg, &[]);
-                let off = slot(identity, 1.0, 1.0);
+                let off = slot(identity, 1.0, 1.0, 0);
                 pass.set_bind_group(1, &gpu.draw_bg, &[off]);
                 pass.set_vertex_buffer(0, mesh.vertices.slice(..));
                 pass.set_index_buffer(mesh.indices.slice(..), wgpu::IndexFormat::Uint32);
@@ -13183,7 +13399,7 @@ impl GpuRenderer {
             }
             if let Some(scene) = scene {
                 if scene.translucent_index_count > 0 {
-                    let off = slot(identity, 1.0, 1.0);
+                    let off = slot(identity, 1.0, 1.0, 0);
                     pass.set_bind_group(0, frame_bind_group, &[]);
                     pass.set_bind_group(1, &gpu.draw_bg, &[off]);
                     pass.set_vertex_buffer(0, scene.translucent_vertices.slice(..));
@@ -13202,7 +13418,7 @@ impl GpuRenderer {
                         continue;
                     }
                     let fade = chunk_fades.fade_alpha(coord.0, coord.2);
-                    let off = slot(identity, fade, 1.0);
+                    let off = slot(identity, fade, 1.0, 0);
                     pass.set_bind_group(0, &section.bind_group, &[]);
                     pass.set_bind_group(1, &gpu.draw_bg, &[off]);
                     pass.set_vertex_buffer(0, section.terrain.translucent_vertices.slice(..));
@@ -13253,7 +13469,7 @@ impl GpuRenderer {
                     drew_alpha = true;
                 }
                 let model = entry.transform.model_matrix();
-                let off = slot(model, 1.0, entry.alpha);
+                let off = slot(model, 1.0, entry.alpha, entry.world_light);
                 pass.set_bind_group(1, &gpu.draw_bg, &[off]);
                 pass.set_vertex_buffer(0, entry.vertex_buffer().slice(..));
                 pass.set_index_buffer(entry.index_buffer().slice(..), wgpu::IndexFormat::Uint32);
@@ -13274,7 +13490,7 @@ impl GpuRenderer {
                                 .unwrap_or(&billboards.pipeline),
                         );
                         pass.set_bind_group(0, &gpu.lit_frame_bg, &[]);
-                        let off = slot(identity, 1.0, 1.0);
+                        let off = slot(identity, 1.0, 1.0, 0);
                         pass.set_bind_group(1, &gpu.draw_bg, &[off]);
                         pass.set_vertex_buffer(0, billboards.quad_vertices.slice(..));
                         pass.set_vertex_buffer(1, ring.buffer.slice(..));
@@ -13292,7 +13508,7 @@ impl GpuRenderer {
                 pass.set_vertex_buffer(0, mesh.vertices.slice(..));
                 pass.set_index_buffer(mesh.indices.slice(..), wgpu::IndexFormat::Uint32);
                 for (i, &alpha) in particle_alphas.iter().enumerate() {
-                    let off = slot(identity, 1.0, alpha);
+                    let off = slot(identity, 1.0, alpha, 0);
                     pass.set_bind_group(1, &gpu.draw_bg, &[off]);
                     pass.draw_indexed((i as u32 * 6)..((i as u32 + 1) * 6), 0, 0..1);
                 }

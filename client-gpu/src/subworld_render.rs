@@ -404,8 +404,35 @@ pub struct SubWorldRenderEntry {
     pub indices: Vec<u32>,
     /// Global alpha multiplier (`1.0` opaque; clouds use `< 1`).
     pub alpha: f32,
+    /// Packed world-light word the composed pass reads out of
+    /// [`CompositeDrawUniforms::params2`]`[2]`: `block_light` nibble at
+    /// bits 0..4, `sky_light` nibble at bits 4..8, [`SUBWORLD_LIGHT_ENABLED`]
+    /// at bit 8. `0` keeps the legacy env-only shading — `(0, 0)` is a
+    /// valid pitch-black sample, never a disable.
+    pub world_light: u32,
     /// Set when `vertices`/`indices` changed since the last GPU sync.
     pub dirty: bool,
+}
+
+/// Enable bit in the packed world-light word (`SubWorldRenderEntry::
+/// world_light` and `CompositeDrawUniforms::params2` bitcast `z`).
+pub const SUBWORLD_LIGHT_ENABLED: u32 = 1 << 8;
+
+/// Pack a nibble `(block_light, sky_light)` sample into the enabled
+/// world-light word.
+pub fn pack_subworld_light(block_light: u8, sky_light: u8) -> u32 {
+    u32::from(block_light.min(15))
+        | (u32::from(sky_light.min(15)) << 4)
+        | SUBWORLD_LIGHT_ENABLED
+}
+
+/// Inverse of [`pack_subworld_light`]: `Some((block_light, sky_light))`
+/// when the enable bit is set, `None` for the disabled (`0`) word.
+pub fn unpack_subworld_light(word: u32) -> Option<(u8, u8)> {
+    if word & SUBWORLD_LIGHT_ENABLED == 0 {
+        return None;
+    }
+    Some(((word & 0xf) as u8, ((word >> 4) & 0xf) as u8))
 }
 
 impl SubWorldRenderEntry {
@@ -422,6 +449,7 @@ impl SubWorldRenderEntry {
             vertices,
             indices,
             alpha: 1.0,
+            world_light: 0,
             dirty: true,
         }
     }
@@ -866,6 +894,34 @@ impl SubWorldRenderBank {
         }
     }
 
+    /// Assign a real world `(block_light, sky_light)` nibble sample to a
+    /// sub-world: the composed pass folds it into the draw uniform so a
+    /// moving contraption or airship darkens in caves and brightens
+    /// beside torches instead of keeping fixed env ambient+sun. The
+    /// update lands through the draw-uniform pool — geometry stays
+    /// clean (no re-upload). Returns `false` for an unknown id.
+    pub fn set_subworld_light(&mut self, id: u64, block_light: u8, sky_light: u8) -> bool {
+        match self.entries.get_mut(&id) {
+            Some(entry) => {
+                entry.world_light = pack_subworld_light(block_light, sky_light);
+                true
+            }
+            None => false,
+        }
+    }
+
+    /// Drop a sub-world's world-light override back to the legacy
+    /// env-only shading. Returns `false` for an unknown id.
+    pub fn clear_subworld_light(&mut self, id: u64) -> bool {
+        match self.entries.get_mut(&id) {
+            Some(entry) => {
+                entry.world_light = 0;
+                true
+            }
+            None => false,
+        }
+    }
+
     /// Drop a sub-world; its GPU buffers release on the next sync.
     pub fn remove(&mut self, id: u64) -> bool {
         self.entries.remove(&id).is_some()
@@ -965,6 +1021,37 @@ mod subworld_sync_tests {
         assert!((transform.position[0] - 5.0).abs() < 1e-5);
         assert!((transform.quaternion.iter().map(|v| v * v).sum::<f32>() - 1.0).abs() < 1e-5);
     }
+
+    #[test]
+    fn subworld_light_packs_decodes_and_clears() {
+        // The packed word round-trips and defaults to disabled.
+        assert_eq!(unpack_subworld_light(pack_subworld_light(14, 9)), Some((14, 9)));
+        assert_eq!(unpack_subworld_light(pack_subworld_light(0, 0)), Some((0, 0)));
+        assert_eq!(unpack_subworld_light(0), None);
+        assert_eq!(pack_subworld_light(255, 255) & 0xff, 0xff);
+
+        let mut bank = SubWorldRenderBank::new();
+        let mesh = box_mesh([0.0; 3], [1.0; 3], [1.0; 3]);
+        bank.upsert_contraption_subworld(7, [0.0; 3], [0.0, 1.0, 0.0], 0.0, &mesh);
+        // Unknown ids fail cleanly; known ids accept the sample without
+        // touching the geometry-dirty flag (draw-uniform carry).
+        assert!(!bank.set_subworld_light(99, 15, 15));
+        assert!(bank.set_subworld_light(7, 4, 15));
+        let entry = bank.get(7).unwrap();
+        assert_eq!(unpack_subworld_light(entry.world_light), Some((4, 15)));
+        assert!(entry.dirty);
+        // A pitch-black cave sample stays enabled — `0` is not a disable.
+        assert!(bank.set_subworld_light(7, 0, 0));
+        assert_eq!(unpack_subworld_light(bank.get(7).unwrap().world_light), Some((0, 0)));
+        assert!(bank.clear_subworld_light(7));
+        assert_eq!(unpack_subworld_light(bank.get(7).unwrap().world_light), None);
+        assert!(!bank.clear_subworld_light(99));
+        // Entries minted through the sync path default to env-only shading.
+        bank.apply_sync_frame(&SubWorldSyncFrame {
+            poses: vec![pose(11, 0.0, [0.0, 0.0, 0.0, 1.0])],
+        });
+        assert_eq!(unpack_subworld_light(bank.get(11).unwrap().world_light), None);
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -977,6 +1064,8 @@ pub struct GpuSubWorldEntry {
     pub transform: SubWorldTransform,
     /// Global alpha multiplier.
     pub alpha: f32,
+    /// Packed world-light word mirrored from the bank (`0` = disabled).
+    pub world_light: u32,
     /// Index count in `indices`.
     pub index_count: u32,
     vertices: wgpu::Buffer,
@@ -1215,6 +1304,7 @@ impl SubWorldGpuCache {
                     GpuSubWorldEntry {
                         transform: entry.transform,
                         alpha: entry.alpha,
+                        world_light: entry.world_light,
                         index_count: entry.indices.len() as u32,
                         vertices,
                         indices,
@@ -1226,6 +1316,7 @@ impl SubWorldGpuCache {
             let mut gpu = gpu;
             gpu.transform = entry.transform;
             gpu.alpha = entry.alpha;
+            gpu.world_light = entry.world_light;
             gpu.index_count = entry.indices.len() as u32;
             entry.dirty = false;
             self.entries.insert(entry.id, gpu);
@@ -1332,7 +1423,9 @@ pub struct CompositeDrawUniforms {
     pub model: Mat4,
     /// `x` = chunk-fade alpha, `y` = global alpha multiplier.
     pub params: [f32; 4],
-    /// Reserved.
+    /// `xy` = per-draw dynamic-light mask (bitcast `u64`, `0` =
+    /// check-all); `z` = bitcast packed sub-world world-light word
+    /// ([`pack_subworld_light`], `0` = disabled); `w` reserved.
     pub params2: [f32; 4],
     /// Stride padding: 160 bytes of data + 96 bytes pad = 256.
     pub _stride_pad: [f32; 24],
@@ -2219,6 +2312,20 @@ fn lit_fs(in: LitFragment) -> @location(0) vec4<f32> {
         * env.ambient.w;
     light += vec3<f32>(env.sun.w) * max(dot(n, normalize(env.sun.xyz)), 0.0);
     light += vec3<f32>(in.light_add);
+    // Per-sub-world world light: `params2.z` bitcasts to the packed word
+    // (block nibble | sky nibble << 4 | enable bit 8) the CPU writes for
+    // `SubWorldRenderEntry` draws — `0` keeps the legacy env-only
+    // shading. The vanilla `l / (3 - 2l)` brightness ramp scales
+    // ambient+sun; the 64 dynamic lights still accumulate on top below.
+    let wlight = bitcast<u32>(draw.params2.z);
+    if (wlight & 0x100u) != 0u {
+        let wb = f32(wlight & 0xfu) / 15.0;
+        let ws = f32((wlight >> 4u) & 0xfu) / 15.0;
+        let wday = clamp(env.sun.y * 2.0 + 0.2, 0.0, 1.0);
+        let wblock = wb / (3.0 - 2.0 * wb);
+        let wsky = ws / (3.0 - 2.0 * ws) * wday;
+        light *= clamp(max(wblock, wsky), 0.06, 1.0);
+    }
     var color = surface * light;
     var light_mask = draw_light_mask(min(dyn_lights.light_count.x, 64u));
     loop {
@@ -2275,6 +2382,17 @@ fn lit_fs(in: LitFragment) -> @location(0) vec4<f32> {
         * env.ambient.w;
     light += vec3<f32>(env.sun.w) * max(dot(n, normalize(env.sun.xyz)), 0.0);
     light += vec3<f32>(in.light_add);
+    // Same per-sub-world world-light decode as the f32 `lit_fs` —
+    // `params2.z` packs (block | sky << 4 | enable bit 8), `0` disables.
+    let wlight = bitcast<u32>(draw.params2.z);
+    if (wlight & 0x100u) != 0u {
+        let wb = f32(wlight & 0xfu) / 15.0;
+        let ws = f32((wlight >> 4u) & 0xfu) / 15.0;
+        let wday = clamp(env.sun.y * 2.0 + 0.2, 0.0, 1.0);
+        let wblock = wb / (3.0 - 2.0 * wb);
+        let wsky = ws / (3.0 - 2.0 * ws) * wday;
+        light *= clamp(max(wblock, wsky), 0.06, 1.0);
+    }
     var color = surface * light;
     var light_mask = draw_light_mask(min(dyn_lights.light_count.x, 64u));
     var light16 = vec3<f16>(0.0);
