@@ -8586,7 +8586,9 @@ mod wire_mods_tests {
 
     fn lmb_silent(peer: &mut TcpStream) -> bool {
         peer.set_read_timeout(Some(Duration::from_millis(150))).ok();
-        peer.read(&mut [0u8; 8]).is_err()
+        let silent = peer.read(&mut [0u8; 8]).is_err();
+        peer.set_read_timeout(Some(Duration::from_secs(5))).ok();
+        silent
     }
 
     // ---------- boot scan ----------
@@ -8986,6 +8988,7 @@ mod wire_mods_tests {
 
     #[test]
     fn wire_mods_appleskin_emits_767_custom_payload_with_delta_suppression() {
+        let _guard = crate::world_guard();
         let _serial = WIRE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         fresh_suite();
         live_mod_suite()
@@ -9017,6 +9020,9 @@ mod wire_mods_tests {
         live_mod_appleskin_sync(&me);
         assert!(lmb_silent(&mut peer), "sub-epsilon drift must stay silent");
 
+        // Advance one server tick so the DistanceTier::Near coalescer's
+        // 1-tick cadence allows the next changed observation to emit.
+        TICK_IDX.fetch_add(1, Ordering::Relaxed);
         *me.sat.lock().unwrap_or_else(|e| e.into_inner()) = 4.5;
         *me.walk_acc.lock().unwrap_or_else(|e| e.into_inner()) = 0.25;
         live_mod_appleskin_sync(&me);

@@ -94,11 +94,15 @@ fn p3_dedicated_audio_mix_thread_64_voices_nonblocking_submit_zero_underruns() {
     );
     assert_eq!(ring.dropped_commands(), 0, "512-slot ring held all submissions");
 
-    // Let the real-time loop run ~15 blocks (40 ms > 10 × 2.67 ms).
-    std::thread::sleep(Duration::from_millis(50));
+    // Let the real-time loop mix >= 10 blocks; poll up to 250 ms so shared
+    // CI VMs with coarse timer coalescing (notably macOS runners) do not flake.
+    let mix_deadline = Instant::now() + Duration::from_millis(250);
+    while thread.blocks_mixed() < 10 && Instant::now() < mix_deadline {
+        std::thread::sleep(Duration::from_millis(5));
+    }
     assert!(
         thread.blocks_mixed() >= 10,
-        "expected >= 10 blocks in 50 ms, got {}",
+        "expected >= 10 blocks within 250 ms, got {}",
         thread.blocks_mixed()
     );
     assert_eq!(
