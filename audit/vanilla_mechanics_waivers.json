@@ -2,16 +2,7 @@
   "generated_by": "tools/vanilla_mechanics_coverage_audit.py",
   "note": "Baseline of declared-but-unwired Vanilla 1.21.1 mechanics. Remove an entry only when the audit reports it stale (the mechanic is now live).",
   "schema": 1,
-  "unconsumed_gamerule": {
-    "doLimitedCrafting": {
-      "owner": "crafting-lane",
-      "reason": "The do_limited_crafting_enabled() getter is #[allow(dead_code)] with no production caller; crafting is never gated by the rule."
-    },
-    "spawnRadius": {
-      "owner": "respawn-lane",
-      "reason": "The spawn_radius_blocks() getter is #[allow(dead_code)] with no production caller; respawn scatter does not read the rule."
-    }
-  },
+  "unconsumed_gamerule": {},
   "unimplemented_damage_type": {
     "arrow": {
       "owner": "combat-lane",

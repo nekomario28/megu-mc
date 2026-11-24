@@ -14941,7 +14941,7 @@ fn block_light_sections_from_dim(
     type BlockLightQueue = std::collections::VecDeque<((i32, i32, i32), u8)>;
     thread_local! {
         static BLOCK_LIGHT_SCRATCH: std::cell::RefCell<(Vec<u8>, Vec<u8>, BlockLightQueue)> =
-            std::cell::RefCell::new((Vec::new(), Vec::new(), BlockLightQueue::new()));
+            const { std::cell::RefCell::new((Vec::new(), Vec::new(), BlockLightQueue::new())) };
     }
     let light_sections = dim.light_sections();
     let light_min_y = dim.light_min_y();
@@ -21130,7 +21130,7 @@ fn start_server_tui(bind: &str, port: u16, identity_mode: &str, startup_summary:
                             }
                             restore_tui_terminal();
                             let mut none: Option<&Client> = None;
-                            let _ = run_command(None, "/stop", &mut none);
+                            run_command(None, "/stop", &mut none);
                             return;
                         }
                         TuiAction::None => {}

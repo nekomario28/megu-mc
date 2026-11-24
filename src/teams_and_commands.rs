@@ -3895,13 +3895,13 @@ fn publish_state() -> &'static Mutex<Option<PublishState>> {
 }
 
 /// The port `/publish` advertises when the argument is omitted: the configured
-/// game port (`MEGU_PORT`, default 25599) like the main listener.
+/// game port (`MEGU_PORT`, default 25565) like the main listener.
 fn publish_default_port() -> u16 {
     std::env::var("MEGU_PORT")
         .ok()
         .and_then(|p| p.parse::<u16>().ok())
         .filter(|p| *p >= 1024)
-        .unwrap_or(25599)
+        .unwrap_or(DEFAULT_LISTEN_PORT)
 }
 
 /// `/debug start|stop|function <name>` — Vanilla `DebugCommand` on the live
@@ -4698,7 +4698,7 @@ fn run_megu_claim(ctx: &CmdCtx, level: u8, args: &[&str]) -> String {
                 .unwrap_or_else(|e| e.into_inner());
             if let Some(record) = claims.get(&key) {
                 return if record.owner == player {
-                    format!("This chunk is already claimed by you")
+                    "This chunk is already claimed by you".to_owned()
                 } else {
                     format!("This chunk is already claimed by {}", record.owner)
                 };
@@ -11494,7 +11494,7 @@ mod ops_admin_builtin_tests {
         assert!(!can_player_modify_block(dim, sx, sz, "ops_spawn_victim", 0));
         assert!(can_player_modify_block(dim, sx + 100, sz + 100, "ops_spawn_victim", 0));
         assert!(can_player_modify_block(dim, sx, sz, "ops_spawn_victim", 4));
-        assert_eq!(ops_run(&op, "/megu claim info").lines().any(|l| l.contains("Spawn protection: 12")), true);
+        assert!(ops_run(&op, "/megu claim info").lines().any(|l| l.contains("Spawn protection: 12")));
         // `spawn-protect` is the same setter; 0 disables cleanly.
         assert_eq!(ops_run(&op, "/megu claim spawn-protect 0"), "Spawn protection disabled");
         assert!(can_player_modify_block(dim, sx, sz, "ops_spawn_victim", 0));

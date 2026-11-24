@@ -3024,7 +3024,7 @@ fn drop_tick() {
         };
         for (slot, st) in changed {
             let mut p = vec![0u8];
-            write_varint(&mut p, i64::from(inv_state_next(&*c)));
+            write_varint(&mut p, i64::from(inv_state_next(&c)));
             p.extend_from_slice(&slot.to_be_bytes());
             p.extend_from_slice(&slot_wire(&st));
             if let Ok(mut w) = c.sock.lock() {
@@ -3398,8 +3398,7 @@ fn unpack_window_loot_if_needed(window: (ContainerKey, Option<ContainerKey>)) {
 // evaluated stacks go through the same slot shuffle and count splitting the
 // seeded `abandoned_mineshaft` table uses, then land in `slot_limit` slots.
 
-#[cfg_attr(not(test), allow(dead_code))]
-#[cfg_attr(not(megu_vanilla_data), allow(dead_code))]
+#[cfg_attr(any(not(test), not(megu_vanilla_data)), allow(dead_code))]
 fn loot_json_tag_items(tag: &str, depth: usize) -> Vec<&'static str> {
     let mut out = Vec::new();
     if depth > 8 {
@@ -3428,8 +3427,7 @@ fn loot_json_tag_items(tag: &str, depth: usize) -> Vec<&'static str> {
     out
 }
 
-#[cfg_attr(not(test), allow(dead_code))]
-#[cfg_attr(not(megu_vanilla_data), allow(dead_code))]
+#[cfg_attr(any(not(test), not(megu_vanilla_data)), allow(dead_code))]
 fn loot_json_stack(item: &crate::chest_loot::LootItem) -> Option<Stack> {
     let id = name_to_item(item.item.as_str())?;
     if id == 0 || item.count <= 0 {
@@ -3458,8 +3456,7 @@ fn loot_json_stack(item: &crate::chest_loot::LootItem) -> Option<Stack> {
     (count > 0).then_some((id, count as u8, comps))
 }
 
-#[cfg_attr(not(test), allow(dead_code))]
-#[cfg_attr(not(megu_vanilla_data), allow(dead_code))]
+#[cfg_attr(any(not(test), not(megu_vanilla_data)), allow(dead_code))]
 fn loot_json_next_int(rng: &mut crate::generation_math::Lcg, min: i32, max: i32) -> i32 {
     if min >= max {
         min
@@ -3468,8 +3465,7 @@ fn loot_json_next_int(rng: &mut crate::generation_math::Lcg, min: i32, max: i32)
     }
 }
 
-#[cfg_attr(not(test), allow(dead_code))]
-#[cfg_attr(not(megu_vanilla_data), allow(dead_code))]
+#[cfg_attr(any(not(test), not(megu_vanilla_data)), allow(dead_code))]
 fn loot_json_shuffle<T>(list: &mut [T], rng: &mut crate::generation_math::Lcg) {
     for i in (2..=list.len()).rev() {
         let j = rng.next_bound(i as i32) as usize;
@@ -3479,8 +3475,7 @@ fn loot_json_shuffle<T>(list: &mut [T], rng: &mut crate::generation_math::Lcg) {
 
 // The same split vanilla applies when a rolled stack does not fit the free
 // slots: oversized stacks are divided at random, then the survivors shuffle.
-#[cfg_attr(not(test), allow(dead_code))]
-#[cfg_attr(not(megu_vanilla_data), allow(dead_code))]
+#[cfg_attr(any(not(test), not(megu_vanilla_data)), allow(dead_code))]
 fn loot_json_split(
     items: Vec<Stack>,
     empty_slots: usize,
@@ -3519,8 +3514,7 @@ fn loot_json_split(
 /// Fill `slot_limit` container slots from a raw loot-table JSON body
 /// (`data/<ns>/loot_table/**.json` or a vanilla table). Seed 0 is unseeded,
 /// matching `RandomizableContainer.unpackLootTable`.
-#[cfg_attr(not(test), allow(dead_code))]
-#[cfg_attr(not(megu_vanilla_data), allow(dead_code))]
+#[cfg_attr(any(not(test), not(megu_vanilla_data)), allow(dead_code))]
 pub(crate) fn unpack_loot_table_json(
     table_json: &str,
     seed: i64,
@@ -8728,9 +8722,8 @@ impl LiveBlockEntityStore {
             self.remove_entry(key);
         }
         let id = live_block_entity_id(reg.name_of(state))?;
-        if !self.entries.contains_key(&key) {
-            self.entries
-                .insert(key, (block, LiveBlockEntity::load(reg, state, id, &Tag::End)));
+        if let std::collections::hash_map::Entry::Vacant(e) = self.entries.entry(key) {
+            e.insert((block, LiveBlockEntity::load(reg, state, id, &Tag::End)));
             self.index_add(key);
         }
         Some(&mut self.entries.get_mut(&key)?.1)
@@ -17204,20 +17197,20 @@ fn bundle_try_insert(contents: &mut Vec<Stack>, add: &Stack) -> (Vec<u8>, u8) {
     let mut remaining = add.1;
     let mut weight: i64 = contents.iter().map(bundle_stack_weight).sum();
     // Fill an existing compatible entry first (vanilla merges before appending).
-    for i in 0..contents.len() {
+    for entry in contents.iter_mut() {
         if remaining == 0 || weight >= BUNDLE_WEIGHT_MAX {
             break;
         }
-        if contents[i].0 != add.0 || contents[i].2 != add.2 {
+        if entry.0 != add.0 || entry.2 != add.2 {
             continue;
         }
-        let per = (BUNDLE_WEIGHT_MAX / stack_max_of(&contents[i]).max(1)).max(1);
-        let room = stack_max_of(&contents[i]) - i64::from(contents[i].1);
+        let per = (BUNDLE_WEIGHT_MAX / stack_max_of(entry).max(1)).max(1);
+        let room = stack_max_of(entry) - i64::from(entry.1);
         let fits = ((BUNDLE_WEIGHT_MAX - weight) / per)
             .min(room)
             .min(i64::from(remaining));
         if fits > 0 {
-            contents[i].1 += fits as u8;
+            entry.1 += fits as u8;
             remaining -= fits as u8;
             weight += per * fits;
         }
@@ -17235,7 +17228,7 @@ fn bundle_try_insert(contents: &mut Vec<Stack>, add: &Stack) -> (Vec<u8>, u8) {
 
 /// Vanilla `BundleItem.overrideOtherStackedOnMe` with an empty cursor:
 /// removes the *last* non-empty entry (bundles are LIFO) and yields it.
-fn bundle_try_extract(contents: &mut Vec<Stack>) -> Option<(Stack, Vec<u8>)> {
+fn bundle_try_extract(contents: &mut [Stack]) -> Option<(Stack, Vec<u8>)> {
     let st = contents.iter_mut().find(|e| e.1 > 0)?;
     let out = st.clone();
     st.1 = 0;
@@ -17359,8 +17352,7 @@ fn ominous_bottle_amplifier(st: &Stack) -> Option<i64> {
 /// Whether a `can_break`/`can_place_on` predicate set permits `state`
 /// (adventure-mode predicates; the server applies them to block-break and
 /// block-place decisions like vanilla's `AdventureModePredicate.test`).
-#[cfg_attr(not(test), allow(dead_code))]
-#[cfg_attr(not(megu_vanilla_data), allow(dead_code))]
+#[cfg_attr(any(not(test), not(megu_vanilla_data)), allow(dead_code))]
 fn block_predicates_allow(data: &[u8], state: u32, reg: &crate::block_registry::BReg) -> bool {
     let mut p = 0;
     let Some(n) = slot_read_count(data, &mut p, 256) else {
@@ -17385,8 +17377,7 @@ fn block_predicates_allow(data: &[u8], state: u32, reg: &crate::block_registry::
 
 /// Re-reads one `can_break`/`can_place_on` block predicate
 /// (`{blocks?, properties?, nbt?}`) and tests whether it covers `state`.
-#[cfg_attr(not(test), allow(dead_code))]
-#[cfg_attr(not(megu_vanilla_data), allow(dead_code))]
+#[cfg_attr(any(not(test), not(megu_vanilla_data)), allow(dead_code))]
 fn predicate_matches_state(
     data: &[u8],
     p: &mut usize,
@@ -17467,8 +17458,7 @@ fn predicate_matches_state(
     slot_read_optional_nbt(data, p).is_some()
 }
 
-#[cfg_attr(not(test), allow(dead_code))]
-#[cfg_attr(not(megu_vanilla_data), allow(dead_code))]
+#[cfg_attr(any(not(test), not(megu_vanilla_data)), allow(dead_code))]
 fn stack_can_break(st: &Stack, state: u32, reg: &crate::block_registry::BReg) -> bool {
     match comp_get(&st.2, COMP_CAN_BREAK) {
         Some(data) => block_predicates_allow(data, state, reg),
@@ -17476,8 +17466,7 @@ fn stack_can_break(st: &Stack, state: u32, reg: &crate::block_registry::BReg) ->
     }
 }
 
-#[cfg_attr(not(test), allow(dead_code))]
-#[cfg_attr(not(megu_vanilla_data), allow(dead_code))]
+#[cfg_attr(any(not(test), not(megu_vanilla_data)), allow(dead_code))]
 fn stack_can_place_on(st: &Stack, state: u32, reg: &crate::block_registry::BReg) -> bool {
     match comp_get(&st.2, COMP_CAN_PLACE_ON) {
         Some(data) => block_predicates_allow(data, state, reg),
@@ -17759,8 +17748,7 @@ fn item_block_entity_data(st: &Stack) -> Option<crate::nbt::Tag> {
 /// `minecraft:block_state`: `{property: value}` overrides applied to the
 /// placed block state, like vanilla `BlockItem.updateCustomBlockEntityTag`'s
 /// state application.
-#[cfg_attr(not(test), allow(dead_code))]
-#[cfg_attr(not(megu_vanilla_data), allow(dead_code))]
+#[cfg_attr(any(not(test), not(megu_vanilla_data)), allow(dead_code))]
 fn item_block_state_override(st: &Stack, base: u32) -> u32 {
     let Some(reg) = breg() else { return base };
     let Some(data) = comp_get(&st.2, COMP_BLOCK_STATE) else {
@@ -18611,12 +18599,8 @@ fn crossbow_fire_loaded(me: &Arc<Client>, held_slot: i16) {
         }
     };
     for (i, proj) in projectiles.iter().enumerate() {
-        let spread = if multi && projectiles.len() == 1 {
-            0.0
-        } else {
-            0.0
-        };
-        launch(proj, spread + if projectiles.len() > 1 { (i as f64 - 1.0) * 0.1745 } else { 0.0 });
+        let spread = if projectiles.len() > 1 { (i as f64 - 1.0) * 0.1745 } else { 0.0 };
+        launch(proj, spread);
     }
     if multi && projectiles.len() == 1 {
         launch(&projectiles[0], -0.1745);
@@ -19784,7 +19768,7 @@ mod s5_multidim_tests {
             all.insert(win.0, HashMap::from([(0i16, (803i64, 3u8, Vec::new()) as Stack)]));
         }
         // First visit surfaces the seeded slot: one SetSlot frame.
-        chest_viewer_tick_on(&[c.clone()]);
+        chest_viewer_tick_on(std::slice::from_ref(&c));
         let first = read_frames(&mut rx);
         assert_eq!(first.len(), 1);
         assert_eq!(first[0].0, 0x15);
@@ -19795,7 +19779,7 @@ mod s5_multidim_tests {
             assert_eq!(sync.last_slots.len(), 27);
         }
         // Unchanged: zero frames — the diff did no work.
-        chest_viewer_tick_on(&[c.clone()]);
+        chest_viewer_tick_on(std::slice::from_ref(&c));
         assert!(read_frames(&mut rx).is_empty(), "an unchanged window must send nothing");
         // One slot changed: exactly one frame.
         {
@@ -19804,7 +19788,7 @@ mod s5_multidim_tests {
                 .unwrap()
                 .insert(5i16, (804i64, 2u8, Vec::new()));
         }
-        chest_viewer_tick_on(&[c.clone()]);
+        chest_viewer_tick_on(std::slice::from_ref(&c));
         let changed = read_frames(&mut rx);
         assert_eq!(changed.len(), 1);
         assert_eq!(changed[0].0, 0x15);
@@ -19813,12 +19797,12 @@ mod s5_multidim_tests {
             let mut all = chests().lock().unwrap_or_else(|e| e.into_inner());
             all.get_mut(&win.0).unwrap().remove(&0i16);
         }
-        chest_viewer_tick_on(&[c.clone()]);
+        chest_viewer_tick_on(std::slice::from_ref(&c));
         let removed = read_frames(&mut rx);
         assert_eq!(removed.len(), 1);
         assert_eq!(removed[0].0, 0x15);
         // Idle again.
-        chest_viewer_tick_on(&[c.clone()]);
+        chest_viewer_tick_on(std::slice::from_ref(&c));
         assert!(read_frames(&mut rx).is_empty());
         *c.open_chest.lock().unwrap_or_else(|e| e.into_inner()) = None;
         let mut all = chests().lock().unwrap_or_else(|e| e.into_inner());

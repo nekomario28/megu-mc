@@ -128,21 +128,23 @@ ratchet "lock/rwlock unwraps (no new poison cascades)" \
 # waived in audit/wiring_connectivity_waivers.json until its caller lands.
 # 2644 -> 2680: upstream lanes landed 36 more allows ahead of this commit
 # (vanilla-mob batch 247b2f6c +19, aeronautics & client batches the rest).
-ratchet_ws "allow(dead_code) attributes (workspace)" 'allow\(dead_code\)' 2680 \
+# 2680 -> 2439: the deduplication & dead-code sweep merged duplicate cfg_attr
+# pairs and removed or wired staged helpers across lanes.
+ratchet_ws "allow(dead_code) attributes (workspace)" 'allow\(dead_code\)' 2439 \
   "Dead code should be deleted or wired, not silenced. A new allowance needs an explicit decision."
 
 # SHA-256 keeps being re-implemented per crate (mod-adapter-core, proto,
 # server-files, state-store, root) instead of shared through megu-core. The
 # ceiling freezes today's duplicates; consolidation lowers it.
 ratchet_ws "duplicate sha256/Sha256 impls outside core" \
-  '^(pub(\(crate\)|\(super\))? )?(struct Sha256|fn sha256)\b' 8 \
+  '^(pub(\(crate\)|\(super\))? )?(struct Sha256|fn sha256)\b' 4 \
   "SHA-256 belongs in megu-core; a new copy is a new thing to keep correct." \
   -not -path '*/tests/*' -not -path './core/src/*'
 
 # Same story for the hand-rolled JSON parsers: five crates carry their own
 # JsonParser/parse_json. Frozen at today's count until they share one.
 ratchet_ws "duplicate JsonParser/parse_json impls outside core" \
-  '^(pub(\(crate\)|\(super\))? )?(struct JsonParser|fn parse_json)\b' 17 \
+  '^(pub(\(crate\)|\(super\))? )?(struct JsonParser|fn parse_json)\b' 9 \
   "JSON parsing belongs in megu-core; a new copy is a new parser to keep correct." \
   -not -path '*/tests/*' -not -path './core/src/*'
 
@@ -150,7 +152,7 @@ ratchet_ws "duplicate JsonParser/parse_json impls outside core" \
 # other top-level copy is a duplicate. Test modules are excluded by the
 # column-0 anchor and the */tests/* path filter.
 ratchet_ws "duplicate crc32 impls outside core/src/hash.rs" \
-  '^(pub(\(crate\)|\(super\))? )?(const )?fn crc32\(' 11 \
+  '^(pub(\(crate\)|\(super\))? )?(const )?fn crc32\(' 3 \
   "CRC32 belongs in core/src/hash.rs; a new copy is a new table to keep correct." \
   -not -path '*/tests/*' -not -path './core/src/hash.rs'
 

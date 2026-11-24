@@ -58,15 +58,6 @@
     },
     {
       "check": "dead_tick_or_bridge",
-      "symbol": "aeronautics_bridge_tick",
-      "file": "src/aeronautics_and_dim_bridge.rs",
-      "line": 847,
-      "reason": "Aeronautics runtime bridge steps every active airship but no game-loop call site exists; the bridge state is saved/loaded (AER1 trailer) without ever being ticked. create-offload feature-gated.",
-      "lane": "CREATE-OFFLOAD-LIVE",
-      "date": "2026-11-24"
-    },
-    {
-      "check": "dead_tick_or_bridge",
       "symbol": "dimension_mod_load_entries",
       "file": "src/aeronautics_and_dim_bridge.rs",
       "line": 1018,
@@ -81,24 +72,6 @@
       "line": 1042,
       "reason": "Custom-dimension portal teleport hook staged for the dim bridge; no portal transit call site exists.",
       "lane": "CREATE-OFFLOAD-LIVE",
-      "date": "2026-11-24"
-    },
-    {
-      "check": "dead_tick_or_bridge",
-      "symbol": "live_anvil_save_tick",
-      "file": "src/anvil_io.rs",
-      "line": 2609,
-      "reason": "Incremental anvil save (dirty-set enqueue + summary) is implemented and test-covered but never scheduled by the autosave path \u2014 the exact live_anvil_save_tick defect class.",
-      "lane": "SAVE-INCREMENTAL",
-      "date": "2026-11-24"
-    },
-    {
-      "check": "dead_tick_or_bridge",
-      "symbol": "tick_mob_fire",
-      "file": "src/combat_and_health.rs",
-      "line": 869,
-      "reason": "Mob fire-duration tick helper staged for the combat tick loop; carry-over burning never consults it.",
-      "lane": "COMBAT-TICK",
       "date": "2026-11-24"
     },
     {
@@ -274,15 +247,6 @@
     },
     {
       "check": "dead_tick_or_bridge",
-      "symbol": "live_mod_name_for_state",
-      "file": "src/live_mod_bridge.rs",
-      "reason": "MCF2 reverse state->name lookup staged for the mod-suite sidecar write path; the state canonicalizer is wired but this direction is never consulted.",
-      "lane": "MOD-SUITE-WIRE",
-      "date": "2026-11-24",
-      "line": 2538
-    },
-    {
-      "check": "dead_tick_or_bridge",
       "symbol": "live_mod_remove_cooking_pot",
       "file": "src/live_mod_bridge.rs",
       "line": 1438,
@@ -418,38 +382,11 @@
     },
     {
       "check": "dead_tick_or_bridge",
-      "symbol": "tick_mob_persistence_and_easter_egg_ai",
-      "file": "src/mob_despawn.rs",
-      "line": 323,
-      "reason": "Mob persistence + easter-egg AI tick staged for the despawn path; the despawn loop never calls it.",
-      "lane": "MOB-PERSIST",
-      "date": "2026-11-24"
-    },
-    {
-      "check": "dead_tick_or_bridge",
       "symbol": "live_rollback_summaries",
       "file": "src/operator_ux.rs",
       "line": 2971,
       "reason": "Rollback summary render staged inside the allow(dead_code) ProfilerReport impl; no report path calls it.",
       "lane": "OPS-UX",
-      "date": "2026-11-24"
-    },
-    {
-      "check": "dead_tick_or_bridge",
-      "symbol": "oxidation_tick",
-      "file": "src/player_mechanisms.rs",
-      "line": 4881,
-      "reason": "Copper oxidation random-tick staged beside tick_decay; exercised only in tests.",
-      "lane": "OXIDATION",
-      "date": "2026-11-24"
-    },
-    {
-      "check": "dead_tick_or_bridge",
-      "symbol": "tick_decay",
-      "file": "src/player_mechanisms.rs",
-      "line": 4763,
-      "reason": "Copper decay tick method staged for weathering; the block-entity tick never schedules it (only cfg(test) callers).",
-      "lane": "OXIDATION",
       "date": "2026-11-24"
     },
     {
@@ -477,33 +414,6 @@
       "line": 521,
       "reason": "/tick pacing helper (sprint-aware interval) staged for the tick-rate command; the tick loop never consults it.",
       "lane": "TICK-CMD",
-      "date": "2026-11-24"
-    },
-    {
-      "check": "dead_tick_or_bridge",
-      "symbol": "live_allay_give",
-      "file": "src/villager_raid.rs",
-      "line": 1927,
-      "reason": "Allay item-give interaction staged with the golem hooks; never dispatched.",
-      "lane": "MOB-INTERACT",
-      "date": "2026-11-24"
-    },
-    {
-      "check": "dead_tick_or_bridge",
-      "symbol": "live_iron_golem_repair",
-      "file": "src/villager_raid.rs",
-      "line": 1887,
-      "reason": "Iron-golem ingot-repair interaction staged for the mob interact path; never dispatched.",
-      "lane": "MOB-INTERACT",
-      "date": "2026-11-24"
-    },
-    {
-      "check": "dead_tick_or_bridge",
-      "symbol": "live_snow_golem_shear",
-      "file": "src/villager_raid.rs",
-      "line": 1909,
-      "reason": "Snow-golem pumpkin shear staged beside the golem repair; interact path never reaches it.",
-      "lane": "MOB-INTERACT",
       "date": "2026-11-24"
     },
     {
@@ -729,15 +639,6 @@
     },
     {
       "check": "dead_server_config_field",
-      "symbol": "MEGU_AUTOSAVE_SECS",
-      "file": "src/server_config.rs",
-      "line": 472,
-      "reason": "[server] autosave_interval_secs exports here; the only reader is RuntimeOpsConfig::from_doc into a field whose runtime_ops() accessor is dead \u2014 no live autosave consumer reads the variable.",
-      "lane": "SERVER-CONFIG",
-      "date": "2026-11-24"
-    },
-    {
-      "check": "dead_server_config_field",
       "symbol": "MEGU_AUTO_LOAD_BALANCE",
       "file": "src/server_config.rs",
       "line": 475,
@@ -778,15 +679,6 @@
       "file": "src/server_config.rs",
       "line": 301,
       "reason": "server.properties rcon.password deliberately feeds both MEGU_RCON_PASSWORD and MEGU_RCON_PASS; the listener only reads MEGU_RCON_PASS \u2014 this is a documented dead alias.",
-      "lane": "SERVER-CONFIG",
-      "date": "2026-11-24"
-    },
-    {
-      "check": "dead_server_config_field",
-      "symbol": "MEGU_OP_PERMISSION_LEVEL",
-      "file": "src/server_config.rs",
-      "line": 306,
-      "reason": "server.properties op-permission-level exports here but nothing reads the variable \u2014 no permission-level application exists at runtime.",
       "lane": "SERVER-CONFIG",
       "date": "2026-11-24"
     },
@@ -882,118 +774,10 @@
     },
     {
       "check": "dead_client_config_field",
-      "symbol": "ClientSettings.qol.chat_history_lines",
-      "file": "client-app/src/settings.rs",
-      "line": 395,
-      "reason": "Chat history capacity is serialized and bridged to UiSettings.qol but the chat log has no history-limit consumer.",
-      "lane": "CLIENT-SETTINGS",
-      "date": "2026-11-24"
-    },
-    {
-      "check": "dead_client_config_field",
-      "symbol": "ClientSettings.qol.prevent_tool_break",
-      "file": "client-app/src/settings.rs",
-      "line": 393,
-      "reason": "Tool-break guard is serialized and bridged to UiSettings.qol but no input/swing path consults it.",
-      "lane": "CLIENT-SETTINGS",
-      "date": "2026-11-24"
-    },
-    {
-      "check": "dead_client_config_field",
-      "symbol": "ClientSettings.qol.retain_chat_on_reconnect",
-      "file": "client-app/src/settings.rs",
-      "line": 397,
-      "reason": "Chat retention flag is serialized and bridged to UiSettings.qol but the disconnect path clears chat unconditionally.",
-      "lane": "CLIENT-SETTINGS",
-      "date": "2026-11-24"
-    },
-    {
-      "check": "dead_client_config_field",
-      "symbol": "ClientSettings.qol.tool_warn_percent",
-      "file": "client-app/src/settings.rs",
-      "line": 389,
-      "reason": "Tool-durability warning threshold is serialized and bridged to UiSettings.qol but no HUD/durability path reads it.",
-      "lane": "CLIENT-SETTINGS",
-      "date": "2026-11-24"
-    },
-    {
-      "check": "dead_client_config_field",
       "symbol": "UiSettings.language",
       "file": "client-ui/src/state.rs",
       "line": 800,
       "reason": "Legacy LanguageSetting kept synchronized for backward compatibility; all live translation paths read UiSettings.locale instead \u2014 .language is never read outside state.rs.",
-      "lane": "CLIENT-SETTINGS",
-      "date": "2026-11-24"
-    },
-    {
-      "check": "dead_client_config_field",
-      "symbol": "UiSettings.qol.chat_history_lines",
-      "file": "client-ui/src/state.rs",
-      "line": 455,
-      "reason": "Copied from ClientSettings.qol but only displayed in qol_tab; no chat-log consumer reads it.",
-      "lane": "CLIENT-SETTINGS",
-      "date": "2026-11-24"
-    },
-    {
-      "check": "dead_client_config_field",
-      "symbol": "UiSettings.qol.prevent_tool_break",
-      "file": "client-ui/src/state.rs",
-      "line": 453,
-      "reason": "Copied from ClientSettings.qol but only toggled in qol_tab; no input/swing path consults it.",
-      "lane": "CLIENT-SETTINGS",
-      "date": "2026-11-24"
-    },
-    {
-      "check": "dead_client_config_field",
-      "symbol": "UiSettings.qol.retain_chat_on_reconnect",
-      "file": "client-ui/src/state.rs",
-      "line": 457,
-      "reason": "Copied from ClientSettings.qol but only toggled in qol_tab; the disconnect path clears chat unconditionally.",
-      "lane": "CLIENT-SETTINGS",
-      "date": "2026-11-24"
-    },
-    {
-      "check": "dead_client_config_field",
-      "symbol": "UiSettings.qol.tool_warn_percent",
-      "file": "client-ui/src/state.rs",
-      "line": 451,
-      "reason": "Copied from ClientSettings.qol but only rendered in qol_tab; no HUD/durability path reads it.",
-      "lane": "CLIENT-SETTINGS",
-      "date": "2026-11-24"
-    },
-    {
-      "check": "dead_client_config_field",
-      "symbol": "UiSettings.qol_inventory_sort",
-      "file": "client-ui/src/state.rs",
-      "line": 796,
-      "reason": "Mouse Tweaks-style inventory sort toggle: builtin_inventory_sort_active() is never called and .qol_inventory_sort is never read outside state.rs \u2014 inventory sorting is not implemented.",
-      "lane": "CLIENT-SETTINGS",
-      "date": "2026-11-24"
-    },
-    {
-      "check": "dead_client_config_field",
-      "symbol": "UiSettings.qol_looking_at_hud",
-      "file": "client-ui/src/state.rs",
-      "line": 792,
-      "reason": "Jade-style looking-at HUD toggle: builtin_looking_at_hud_active() is never called and .qol_looking_at_hud is never read outside state.rs \u2014 the HUD feature is not implemented.",
-      "lane": "CLIENT-SETTINGS",
-      "date": "2026-11-24"
-    },
-    {
-      "check": "dead_client_config_field",
-      "symbol": "UiSettings.qol_mouse_tweaks",
-      "file": "client-ui/src/state.rs",
-      "line": 794,
-      "reason": "Mouse Tweaks-style drag tweaks toggle: builtin_mouse_tweaks_active() is never called and .qol_mouse_tweaks is never read outside state.rs \u2014 drag tweaks are not implemented.",
-      "lane": "CLIENT-SETTINGS",
-      "date": "2026-11-24"
-    },
-    {
-      "check": "dead_client_config_field",
-      "symbol": "UiSettings.shader_quick.shaders_enabled",
-      "file": "client-ui/src/state.rs",
-      "line": 642,
-      "reason": "Quick shader enable toggle is only read inside shaders_tab; no renderer path consults it.",
       "lane": "CLIENT-SETTINGS",
       "date": "2026-11-24"
     },
@@ -1004,53 +788,6 @@
       "line": 730,
       "reason": "External shader-pack yield name is only read by external_shader_status()/builtin_shaders_yielded() inside the shaders tab; no renderer yield path consumes it.",
       "lane": "CLIENT-SETTINGS",
-      "date": "2026-11-24"
-    },
-    {
-      "check": "dead_client_config_field",
-      "symbol": "UiSettings.zsh_command_bar",
-      "file": "client-ui/src/state.rs",
-      "line": 798,
-      "reason": "Zsh-style command bar toggle: .zsh_command_bar is never read outside state.rs \u2014 the command bar feature is not implemented.",
-      "lane": "CLIENT-SETTINGS",
-      "date": "2026-11-24"
-    },
-    {
-      "check": "one_sided_channel",
-      "symbol": "megu:subworld_sync_v1",
-      "sites": [
-        "create-adapter/src/aeronautics.rs:46"
-      ],
-      "reason": "Awaiting A1-CLIENT subworld sync receiver lane",
-      "lane": "A1-SERVER",
-      "date": "2026-11-24"
-    },
-    {
-      "check": "one_sided_channel",
-      "symbol": "megu:subworld_helm_v1",
-      "sites": [
-        "create-adapter/src/aeronautics.rs:48"
-      ],
-      "reason": "Awaiting A1-CLIENT subworld sync receiver lane",
-      "lane": "A1-SERVER",
-      "date": "2026-11-24"
-    },
-    {
-      "check": "dead_tick_or_bridge",
-      "symbol": "live_cap_insert_item",
-      "file": "src/live_mod_bridge.rs",
-      "line": 1794,
-      "reason": "XMOD1-CORE staged bus insert API for vanilla hopper/dispenser consumers (menus_and_items.rs) and game_tick push paths (main.rs) \u2014 those files belong to the A1-SERVER lane; E2E cap_bus tests exercise this entry meanwhile.",
-      "lane": "XMOD1-CORE",
-      "date": "2026-11-24"
-    },
-    {
-      "check": "dead_tick_or_bridge",
-      "symbol": "live_cap_extract_item",
-      "file": "src/live_mod_bridge.rs",
-      "line": 1879,
-      "reason": "XMOD1-CORE staged bus extract API \u2014 pull side of the hopper/game_tick surface; consumers land with A1-SERVER outside this lane's allowed files.",
-      "lane": "XMOD1-CORE",
       "date": "2026-11-24"
     },
     {
@@ -1144,21 +881,111 @@
       "date": "2026-11-24"
     },
     {
-      "check": "dead_tick_or_bridge",
-      "symbol": "mob_fire_and_persistence_tick_step",
-      "file": "src/mob_despawn.rs",
-      "line": 365,
-      "reason": "Vanilla-mob batch 247b2f6c staged fire/persistence tick step; the mob tick-loop consumer lands in the owning lane's follow-up.",
-      "lane": "VANILLA-MOBS",
+      "check": "dead_client_config_field",
+      "symbol": "ClientSettings.seamless_qol.auto_reconnect",
+      "file": "client-app/src/settings.rs",
+      "line": 471,
+      "reason": "Seamless-QoL settings block staged by d8779f4b; the field is parsed/serialized and bridged but the consumer lands with the owning CLIENT-UI lane.",
+      "lane": "CLIENT-UI-QOL",
       "date": "2026-11-24"
     },
     {
-      "check": "dead_tick_or_bridge",
-      "symbol": "player_mechanisms_random_block_tick",
-      "file": "src/player_mechanisms.rs",
-      "line": 5091,
-      "reason": "Vanilla-mob batch 247b2f6c staged random-block tick entry; the block-tick dispatch consumer lands in the owning lane's follow-up.",
-      "lane": "VANILLA-MOBS",
+      "check": "dead_client_config_field",
+      "symbol": "ClientSettings.seamless_qol.auto_replenish",
+      "file": "client-app/src/settings.rs",
+      "line": 474,
+      "reason": "Seamless-QoL settings block staged by d8779f4b; the field is parsed/serialized and bridged but the consumer lands with the owning CLIENT-UI lane.",
+      "lane": "CLIENT-UI-QOL",
+      "date": "2026-11-24"
+    },
+    {
+      "check": "dead_client_config_field",
+      "symbol": "ClientSettings.seamless_qol.quick_stack_nearby",
+      "file": "client-app/src/settings.rs",
+      "line": 476,
+      "reason": "Seamless-QoL settings block staged by d8779f4b; the field is parsed/serialized and bridged but the consumer lands with the owning CLIENT-UI lane.",
+      "lane": "CLIENT-UI-QOL",
+      "date": "2026-11-24"
+    },
+    {
+      "check": "dead_client_config_field",
+      "symbol": "ClientSettings.seamless_qol.food_saturation_preview",
+      "file": "client-app/src/settings.rs",
+      "line": 479,
+      "reason": "Seamless-QoL settings block staged by d8779f4b; the field is parsed/serialized and bridged but the consumer lands with the owning CLIENT-UI lane.",
+      "lane": "CLIENT-UI-QOL",
+      "date": "2026-11-24"
+    },
+    {
+      "check": "dead_client_config_field",
+      "symbol": "ClientSettings.seamless_qol.shulker_tooltip_peek",
+      "file": "client-app/src/settings.rs",
+      "line": 482,
+      "reason": "Seamless-QoL settings block staged by d8779f4b; the field is parsed/serialized and bridged but the consumer lands with the owning CLIENT-UI lane.",
+      "lane": "CLIENT-UI-QOL",
+      "date": "2026-11-24"
+    },
+    {
+      "check": "dead_client_config_field",
+      "symbol": "ClientSettings.seamless_qol.chat_scroll_lock",
+      "file": "client-app/src/settings.rs",
+      "line": 485,
+      "reason": "Seamless-QoL settings block staged by d8779f4b; the field is parsed/serialized and bridged but the consumer lands with the owning CLIENT-UI lane.",
+      "lane": "CLIENT-UI-QOL",
+      "date": "2026-11-24"
+    },
+    {
+      "check": "dead_client_config_field",
+      "symbol": "ClientSettings.seamless_qol.toast_notifications",
+      "file": "client-app/src/settings.rs",
+      "line": 488,
+      "reason": "Seamless-QoL settings block staged by d8779f4b; the field is parsed/serialized and bridged but the consumer lands with the owning CLIENT-UI lane.",
+      "lane": "CLIENT-UI-QOL",
+      "date": "2026-11-24"
+    },
+    {
+      "check": "dead_client_config_field",
+      "symbol": "UiSettings.qol.auto_reconnect",
+      "file": "client-ui/src/state.rs",
+      "line": 475,
+      "reason": "Seamless-QoL settings block staged by d8779f4b; the field is parsed/serialized and bridged but the consumer lands with the owning CLIENT-UI lane.",
+      "lane": "CLIENT-UI-QOL",
+      "date": "2026-11-24"
+    },
+    {
+      "check": "dead_client_config_field",
+      "symbol": "UiSettings.qol.auto_replenish",
+      "file": "client-ui/src/state.rs",
+      "line": 478,
+      "reason": "Seamless-QoL settings block staged by d8779f4b; the field is parsed/serialized and bridged but the consumer lands with the owning CLIENT-UI lane.",
+      "lane": "CLIENT-UI-QOL",
+      "date": "2026-11-24"
+    },
+    {
+      "check": "dead_client_config_field",
+      "symbol": "UiSettings.qol.quick_stack_nearby",
+      "file": "client-ui/src/state.rs",
+      "line": 481,
+      "reason": "Seamless-QoL settings block staged by d8779f4b; the field is parsed/serialized and bridged but the consumer lands with the owning CLIENT-UI lane.",
+      "lane": "CLIENT-UI-QOL",
+      "date": "2026-11-24"
+    },
+    {
+      "check": "dead_client_config_field",
+      "symbol": "UiSettings.qol.food_saturation_preview",
+      "file": "client-ui/src/state.rs",
+      "line": 484,
+      "reason": "Seamless-QoL settings block staged by d8779f4b; the field is parsed/serialized and bridged but the consumer lands with the owning CLIENT-UI lane.",
+      "lane": "CLIENT-UI-QOL",
+      "date": "2026-11-24"
+    },
+    {
+      "check": "dead_client_config_field",
+      "symbol": "UiSettings.qol.shulker_tooltip_peek",
+      "file": "client-ui/src/state.rs",
+      "line": 487,
+      "reason": "Seamless-QoL settings block staged by d8779f4b; the field is parsed/serialized and bridged but the consumer lands with the owning CLIENT-UI lane.",
+      "lane": "CLIENT-UI-QOL",
       "date": "2026-11-24"
     }
   ]

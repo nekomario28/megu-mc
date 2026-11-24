@@ -1645,8 +1645,7 @@ fn shield_raised_ticks(c: &Client) -> u64 {
 }
 
 /// The spin-attack window a Riptide launch armed for `eid`, in game ticks.
-#[cfg_attr(not(megu_vanilla_data), allow(dead_code))]
-#[cfg_attr(not(test), allow(dead_code))]
+#[cfg_attr(any(not(test), not(megu_vanilla_data)), allow(dead_code))]
 fn spin_attack_ticks_left(eid: i32) -> u64 {
     let now = TICK_IDX.load(Ordering::Relaxed);
     riptide_spin()
@@ -2802,7 +2801,9 @@ fn arrow_tick() {
     mob_hurt_window_tick();
     combat2_state_tick();
     let mut dead: Vec<i32> = vec![];
-    let mut hits: Vec<(i32, f32, f64, f64)> = vec![]; // (victim eid, dmg, arrow x, z)
+    // (victim eid, dmg, arrow x, z, owner eid, kind, custom-named stack)
+    type ArrowHit = (i32, f32, f64, f64, i32, u8, Option<String>);
+    let mut hits: Vec<ArrowHit> = vec![];
     let mut mob_dead: Vec<(i32, i64, f64, f64, f64)> = vec![];
     {
         let mut ar = arrows().lock().unwrap_or_else(|e| e.into_inner());
@@ -2975,7 +2976,7 @@ fn arrow_tick() {
                             .cloned()
                             .unwrap_or((802, 1, Vec::new()));
                     let mut p = vec![0u8];
-                    write_varint(&mut p, i64::from(inv_state_next(&*c)));
+                    write_varint(&mut p, i64::from(inv_state_next(&c)));
                     p.extend_from_slice(&slot.to_be_bytes());
                     p.extend_from_slice(&slot_wire(&st));
                     if let Ok(mut w) = c.sock.lock() {
@@ -3173,7 +3174,15 @@ fn arrow_tick() {
                             0.3,
                             2.0,
                         ) {
-                            hits.push((c.eid, a.dmg, ax, az));
+                            hits.push((
+                                c.eid,
+                                a.dmg,
+                                ax,
+                                az,
+                                a.owner,
+                                a.kind,
+                                renamed_custom_name(&a.ret_comps),
+                            ));
                             if a.pierce > 0 {
                                 a.pierce -= 1;
                                 a.last_hit = c.eid;
@@ -3204,7 +3213,15 @@ fn arrow_tick() {
                         0.3,
                         2.0,
                     ) {
-                        hits.push((c.eid, a.dmg, ax, az));
+                        hits.push((
+                            c.eid,
+                            a.dmg,
+                            ax,
+                            az,
+                            a.owner,
+                            a.kind,
+                            renamed_custom_name(&a.ret_comps),
+                        ));
                         if a.kind == 1 && a.loy > 0 {
                             returning.insert(eid);
                         } else {
@@ -3259,7 +3276,7 @@ fn arrow_tick() {
         broadcast_seen_destroy(*eid);
         clear_entity_dim(*eid);
     }
-    for (veid, admg, ax, az) in hits {
+    for (veid, admg, ax, az, owner_eid, proj_kind, proj_weapon) in hits {
         let cls: Vec<Arc<Client>> = client_snapshot();
         if let Some(c) = cls.iter().find(|c| c.eid == veid) {
             if *c.gm.lock().unwrap_or_else(|e| e.into_inner()) == 1 {
@@ -3306,10 +3323,23 @@ fn arrow_tick() {
                 let _ = send_packet(&mut w, 0x5d, health_pkt_c(hh, c));
             }
             let vname = c.name.clone();
+            // Vanilla `DamageSource` attribution: the shooter's display name
+            // fills the attacker's message slot; a mob-owned projectile
+            // (owner < 0) is the skeleton that loosed it.
+            let attacker = if owner_eid >= 0 {
+                cls.iter().find(|p| p.eid == owner_eid).map(|p| p.name.clone())
+            } else {
+                Some("Skeleton".to_owned())
+            };
             drop(cls);
             broadcast_seen_ex(veid, veid, |_c| (0x24, hurt_anim(veid)));
             if hh <= 0.0 && GR_SHOW_DEATH_MESSAGES.load(Ordering::Relaxed) != 0 {
-                let line = system_chat(&format!("{} was shot by Skeleton", vname));
+                let line = system_chat(&format_vanilla_death_message(
+                    &vname,
+                    if proj_kind == 1 { "trident" } else { "arrow" },
+                    attacker.as_deref(),
+                    proj_weapon.as_deref(),
+                ));
                 broadcast(-1, |_c| (0x6c, line.clone()));
             }
         }
@@ -4261,10 +4291,33 @@ fn live_mob_melee(mob: &Mob, player: &Arc<Client>, pos: [f64; 3], amount: f32, u
     if *player.hp.lock().unwrap_or_else(|e| e.into_inner()) <= 0.0
         && GR_SHOW_DEATH_MESSAGES.load(Ordering::Relaxed) != 0
     {
-        let name = entity_spec_by_id(mob.etype).map_or("mob", |spec| {
-            spec.name.strip_prefix("minecraft:").unwrap_or(spec.name)
-        });
-        let line = system_chat(&format!("{} was slain by {}", player.name, name));
+        // Vanilla `DamageSources.mobAttack`: the attacker's display name is a
+        // custom name when one is set, and a custom-named held item picks the
+        // `... using <item>` line.
+        let name = mob_custom_names()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(&mob.eid)
+            .cloned()
+            .unwrap_or_else(|| {
+                entity_spec_by_id(mob.etype).map_or("mob".to_owned(), |spec| {
+                    spec.name
+                        .strip_prefix("minecraft:")
+                        .unwrap_or(spec.name)
+                        .to_owned()
+                })
+            });
+        let weapon = mob_equipment()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(&mob.eid)
+            .and_then(|eq| renamed_custom_name(&eq.get(EquipmentSlot::MainHand).2));
+        let line = system_chat(&format_vanilla_death_message(
+            &player.name,
+            "mob_attack",
+            Some(&name),
+            weapon.as_deref(),
+        ));
         broadcast(-1, |_| (0x6c, line.clone()));
     }
 }
