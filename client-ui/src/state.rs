@@ -434,12 +434,12 @@ pub struct AudioSettings {
 impl Default for AudioSettings {
     fn default() -> Self {
         Self {
-            master: 100,
-            music: 70,
+            master: 50,
+            music: 45,
             blocks: 100,
             hostile: 100,
             friendly: 100,
-            max_volume_cap: 100,
+            max_volume_cap: 85,
             max_concurrent_same_sound: 4,
         }
     }

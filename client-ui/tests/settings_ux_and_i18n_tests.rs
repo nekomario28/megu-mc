@@ -8,8 +8,8 @@
 
 use megu_client_ui::draw::UiCommand;
 use megu_client_ui::state::{
-    LanguageSetting, Screen, SettingKey, StartupStageTiming, StartupTimeline, UiAction,
-    UiInputEvent, UiLang, UiModal, UiState, VisualStylePreset, WidgetId,
+    AudioSettings, LanguageSetting, Screen, SettingKey, StartupStageTiming, StartupTimeline,
+    UiAction, UiInputEvent, UiLang, UiModal, UiState, VisualStylePreset, WidgetId,
     LIVE_LOADING_OVERLAY_MIN_MS, SETTINGS_SESSION_UNDO_CAP,
 };
 use megu_core::i18n::{BuiltinLocale, ALL_BUILTIN_LOCALES};
@@ -575,4 +575,29 @@ fn boot_badge_click_opens_timeline_modal_and_ok_closes() {
     let mut bare = UiState::new();
     bare.render(w, h);
     assert!(!has_region(&bare, WidgetId::BootBadge));
+}
+
+// ---------------------------------------------------------------------------
+// 6. Ear-safe first-launch audio defaults
+// ---------------------------------------------------------------------------
+
+#[test]
+fn audio_settings_first_launch_defaults_are_ear_safe() {
+    let a = AudioSettings::default();
+    assert!(
+        a.master <= 60,
+        "first-launch master {} must stay ear-safe",
+        a.master
+    );
+    assert!(
+        a.music <= 60,
+        "first-launch music {} must stay ear-safe",
+        a.music
+    );
+    assert!(
+        a.max_volume_cap <= 90,
+        "first-launch cap {} must stay ear-safe",
+        a.max_volume_cap
+    );
+    assert_eq!(a.max_concurrent_same_sound, 4);
 }

@@ -22,10 +22,10 @@ use megu_core::hash::fnv1a64;
 use crate::crash_reporter::{CrashSubmitPolicy, parse_report_url};
 
 use crate::audio_qol::{
-    DEFAULT_CHAT_HISTORY_LINES, DEFAULT_MAX_CONCURRENT_SAME_SOUND, DEFAULT_MAX_VOLUME_CAP,
-    DEFAULT_TOOL_WARN_PERCENT, DEFAULT_ZOOM_DIVISOR, MAX_CHAT_HISTORY_LINES,
-    MAX_MAX_CONCURRENT_SAME_SOUND, MAX_TOOL_WARN_PERCENT, MAX_VOLUME_CAP, MAX_ZOOM_DIVISOR,
-    MIN_CHAT_HISTORY_LINES, MIN_MAX_CONCURRENT_SAME_SOUND, MIN_ZOOM_DIVISOR,
+    DEFAULT_CHAT_HISTORY_LINES, DEFAULT_MAX_CONCURRENT_SAME_SOUND, DEFAULT_TOOL_WARN_PERCENT,
+    DEFAULT_ZOOM_DIVISOR, MAX_CHAT_HISTORY_LINES, MAX_MAX_CONCURRENT_SAME_SOUND,
+    MAX_TOOL_WARN_PERCENT, MAX_VOLUME_CAP, MAX_ZOOM_DIVISOR, MIN_CHAT_HISTORY_LINES,
+    MIN_MAX_CONCURRENT_SAME_SOUND, MIN_ZOOM_DIVISOR,
 };
 use crate::lod::LodConfig;
 
@@ -74,6 +74,11 @@ pub const DISTANT_HORIZON_FAR_CHUNKS: i32 = 128;
 const LOD_MEMORY_BUDGET_BYTES: usize = 64 * 1024 * 1024;
 /// Default filename for [`ClientSettings::to_toml`] output.
 pub const SETTINGS_FILE_NAME: &str = "megu-client.toml";
+/// Default `qol.max_volume_cap` for a fresh profile: a soft `0.85` bus
+/// ceiling so stacked loud sounds (thunder, Wither spawn, explosions)
+/// never clip or blast headphones on first launch. `1.0` remains
+/// available for players who opt out.
+pub const DEFAULT_MAX_VOLUME_CAP: f32 = 0.85;
 
 /// Stable physical key names used by the window's rebindable controls.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -421,9 +426,9 @@ impl HostMapFairPlaySettings {
 /// section existed keep working unchanged.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct ClientQolSettings {
-    /// Hard ceiling for the mixed audio buffer, `0.0..=1.0`. `1.0` (the
-    /// default) leaves the mix untouched; lower values cap spikes such as
-    /// thunder or Wither hurt sounds.
+    /// Hard ceiling for the mixed audio buffer, `0.0..=1.0`. The default
+    /// `0.85` soft-caps the mix so loud stacked sounds never clip;
+    /// `1.0` leaves the mix untouched for players who opt out.
     pub max_volume_cap: f32,
     /// How many instances of the same `(sound_id, cell)` may play per tick
     /// before redundant stacking is attenuated/suppressed, `1..=32`.
@@ -640,8 +645,8 @@ impl ClientSettings {
             lazy_catchup_gameplay: false,
             fov: DEFAULT_FOV,
             mouse_sensitivity_pct: 100,
-            volume_master: 100,
-            volume_music: 70,
+            volume_master: 50,
+            volume_music: 45,
             volume_blocks: 100,
             volume_hostile: 100,
             volume_friendly: 100,

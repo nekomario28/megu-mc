@@ -295,6 +295,39 @@ fn qol_settings_toml_roundtrip_and_omitted_defaults() {
 
     // Invalid values warn and keep the default.
     let (bad, warnings) = ClientSettings::from_toml("[qol]\nmax_volume_cap = \"loud\"\n");
-    assert_eq!(bad.qol.max_volume_cap, 1.0);
+    assert_eq!(
+        bad.qol.max_volume_cap,
+        megu_client::settings::DEFAULT_MAX_VOLUME_CAP
+    );
     assert!(warnings.iter().any(|w| w.contains("max_volume_cap")));
+}
+
+#[test]
+fn first_launch_audio_defaults_are_ear_safe_and_explicit_values_win() {
+    let fresh = ClientSettings::default();
+    assert!(
+        fresh.volume_master <= 60,
+        "first-launch master volume {} must stay ear-safe",
+        fresh.volume_master
+    );
+    assert!(
+        fresh.volume_music <= 60,
+        "first-launch music volume {} must stay ear-safe",
+        fresh.volume_music
+    );
+    assert!(
+        fresh.qol.max_volume_cap <= 0.90,
+        "first-launch max_volume_cap {} must stay ear-safe",
+        fresh.qol.max_volume_cap
+    );
+    assert_eq!(fresh.qol.max_concurrent_same_sound, 4);
+
+    // A TOML file that explicitly asks for full volume is honored verbatim.
+    let (explicit, warnings) = ClientSettings::from_toml(
+        "volume_master = 100\nvolume_music = 100\n[qol]\nmax_volume_cap = 1.0\n",
+    );
+    assert!(warnings.is_empty(), "unexpected warnings: {warnings:?}");
+    assert_eq!(explicit.volume_master, 100);
+    assert_eq!(explicit.volume_music, 100);
+    assert_eq!(explicit.qol.max_volume_cap, 1.0);
 }
