@@ -152,6 +152,8 @@ python3 tools/wiring_connectivity_audit.py
 # fail closed on a weakened guard or a new violation class.
 python3 tools/hardcode_guard_audit.py
 python3 tests/hardcode_guard_test.py
+python3 tools/playblocker_guard_audit.py
+python3 tests/playblocker_guard_test.py
 python3 tools/security_invariants_audit.py
 python3 tests/security_invariants_test.py
 python3 tests/docker_entrypoint_test.py

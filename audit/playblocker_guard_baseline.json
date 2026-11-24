@@ -1,0 +1,13 @@
+{
+  "counts": {
+    "client-gpu/src/live_session.rs": 0,
+    "core/src/linux_desktop.rs": 0,
+    "core/src/os_desktop.rs": 0,
+    "proto/src/seamless_portal.rs": 0,
+    "server-files/src/claims.rs": 14,
+    "server-files/src/custom_portal.rs": 0,
+    "server-files/src/sd_notify.rs": 0,
+    "src/ingress_guard.rs": 4,
+    "src/play_protocol.rs": 62
+  }
+}

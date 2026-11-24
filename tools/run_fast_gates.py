@@ -25,6 +25,8 @@ GATES = (
     "tools/docs_link_audit.py",
     "tools/hardcode_guard_audit.py",
     "tests/hardcode_guard_test.py",
+    "tools/playblocker_guard_audit.py",
+    "tests/playblocker_guard_test.py",
     "tools/version_constant_audit.py",
     "tools/registry_table_parity.py",
     "tools/server_files_parity.py",
