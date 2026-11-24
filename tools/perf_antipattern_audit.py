@@ -134,6 +134,22 @@ WIRED = (
      ('src/live_mod_bridge.rs',), 'any'),
     ('AdaptivePollBackoff', rb'\bAdaptivePollBackoff\b',
      ('src/live_mod_bridge.rs',), 'any'),
+    # First-launch hardware auto-tune: the entry call must exist in BOTH
+    # the CLI path (client-app --auto-tune) and the client boot path.
+    ('recommend_tuning', rb'\brecommend_tuning\b',
+     ('client-app/src/cli.rs', 'client-gpu/src/window.rs'), 'each'),
+    # Bounded async chunk-frame build pool behind play_protocol delivery.
+    ('async_chunk_delivery', rb'\basync_chunk_delivery::',
+     ('src/play_protocol.rs',), 'any'),
+    # Shared compressed chunk-packet cache on the encode hot path.
+    ('ChunkPacketCache', rb'\bChunkPacketCache\b',
+     ('src/play_protocol.rs',), 'any'),
+    # Coordinate-keyed hash maps/sets in the worldgen hot loops.
+    ('CoordHasher', rb'\bCoord(?:Hasher|Map|Set|Build)\b',
+     ('src/worldgen.rs',), 'any'),
+    # Per-rotation jigsaw template cache inside structure placement.
+    ('rotated_jigsaws', rb'\brotated_jigsaws\b',
+     ('src/jigsaw_structures.rs',), 'any'),
 )
 
 DECL_HEAD = re.compile(

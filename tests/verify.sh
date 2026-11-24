@@ -161,6 +161,7 @@ python3 tests/playblocker_guard_test.py
 # unwired shipped optimizers all fail against audit/perf_antipattern_baseline.json.
 python3 tools/perf_antipattern_audit.py
 python3 tests/perf_antipattern_test.py
+python3 tests/tick_spike_gate_test.py
 python3 tools/security_invariants_audit.py
 python3 tests/security_invariants_test.py
 python3 tests/docker_entrypoint_test.py
@@ -277,6 +278,9 @@ timeout 180 python3 tests/creative_parity_wire.py "$binary"
 # Ratchet: tolerate list is empty (LD3 fixed); drop tolerated ids as fixes land.
 timeout 180 python3 tests/wire_minimality_test.py "$binary" --tolerate ''
 timeout 180 python3 tools/vanilla_live_diff.py --megu-bin "$binary" --format text --strict
+# Bounded live tick-spike gate: the server must keep max_work_ms under the
+# ceiling and observed_tps over the floor while it idles loaded.
+timeout 120 python3 tools/tick_spike_gate.py --server-bin "$binary" --live-seconds 30
 timeout 180 python3 tests/client_prediction_wire.py --binary "$binary"
 timeout 180 python3 tests/client_inventory_pickup_wire.py --binary "$binary"
 timeout 180 python3 tests/client_kernel_wire.py "$binary"

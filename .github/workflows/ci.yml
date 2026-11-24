@@ -46,6 +46,7 @@ jobs:
           # python3 tests/hardcode_guard_test.py
           # python3 tools/perf_antipattern_audit.py
           # python3 tests/perf_antipattern_test.py
+          # python3 tests/tick_spike_gate_test.py
           python3 tools/run_fast_gates.py
           node website/test_functions.mjs
       - name: Install the required dependency inspector from an immutable revision
@@ -62,6 +63,19 @@ jobs:
           echo "$RUNNER_TEMP/gxkit-venv/bin" >> "$GITHUB_PATH"
       - name: Fetch locked dependencies for the offline all-features compiler gate
         run: cargo fetch --locked
+      # Root + client-gpu run here too because client-gpu is the only manifest
+      # needing the MPL-2.0 (symphonia) allowance — a drifted allowlist or a new
+      # GPL/AGPL/ARR dep in either tree must fail the push, not only audit.yml.
+      - name: cargo deny licenses/bans/sources (root workspace)
+        uses: EmbarkStudios/cargo-deny-action@3c6349835b2b7b196a839186cb8b78e02f7b5f25 # v2.1.1
+        with:
+          manifest-path: Cargo.toml
+          command: check licenses bans sources
+      - name: cargo deny licenses/bans/sources (client-gpu)
+        uses: EmbarkStudios/cargo-deny-action@3c6349835b2b7b196a839186cb8b78e02f7b5f25 # v2.1.1
+        with:
+          manifest-path: client-gpu/Cargo.toml
+          command: check licenses bans sources
       - name: Source changes must drive the dependency gate
         run: |
           python3 tests/layers_gate_test.py

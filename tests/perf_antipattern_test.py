@@ -123,6 +123,33 @@ class PerfAntipatternTests(unittest.TestCase):
             self.assertIn('AutoRecipeMemoizer', result.stdout)
             self.assertIn('AdaptivePollBackoff', result.stdout)
 
+    def test_newly_wired_optimizers_fail_when_calls_removed(self):
+        # Every optimizer registered in WIRED must produce an
+        # 'unwired_optimizer' finding the moment its last production use
+        # disappears — proving each entry is live, not decorative.
+        cases = (
+            ('client-app/src/cli.rs', 'recommend_tuning'),
+            ('client-gpu/src/window.rs', 'recommend_tuning'),
+            ('src/play_protocol.rs', 'async_chunk_delivery'),
+            ('src/play_protocol.rs', 'ChunkPacketCache'),
+            ('src/worldgen.rs', 'CoordHasher'),
+            ('src/jigsaw_structures.rs', 'rotated_jigsaws'),
+        )
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            self.copy_audit_inputs(root)
+            for name, label in cases:
+                with self.subTest(file=name, label=label):
+                    path = root / name
+                    original = path.read_text(encoding='utf-8')
+                    path.write_text('fn audit_probe() {}\n', encoding='utf-8')
+                    result = run('--root', root)
+                    self.assertEqual(result.returncode, 1,
+                                     f'{label} not caught: {result.stdout + result.stderr}')
+                    self.assertIn('unwired_optimizer', result.stdout)
+                    self.assertIn(label, result.stdout)
+                    path.write_text(original, encoding='utf-8')
+
     def test_decl_head_and_import_do_not_count_as_use(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -145,7 +172,7 @@ class PerfAntipatternTests(unittest.TestCase):
             report = json.loads(result.stdout)
             self.assertTrue(report['ok'])
             self.assertFalse(report['findings'])
-            self.assertEqual(report['files_scanned'], 11)
+            self.assertEqual(report['files_scanned'], 12)
             self.assertIn('vec_remove_zero', report['counts'])
             # A ceiling above the current count is a stale-baseline tip only —
             # pass normally, fail under --fail-on-stale.

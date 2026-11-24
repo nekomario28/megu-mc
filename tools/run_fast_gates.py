@@ -30,6 +30,7 @@ GATES = (
     "tests/playblocker_guard_test.py",
     "tools/perf_antipattern_audit.py",
     "tests/perf_antipattern_test.py",
+    "tests/tick_spike_gate_test.py",
     "tools/version_constant_audit.py",
     "tools/registry_table_parity.py",
     "tools/server_files_parity.py",

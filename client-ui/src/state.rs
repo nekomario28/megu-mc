@@ -229,13 +229,18 @@ impl VideoPreset {
         Self::ALL[(i + 1) % Self::ALL.len()]
     }
 
-    pub const fn label(self) -> &'static str {
-        match self {
-            Self::Fast => "Fast",
-            Self::Balanced => "Balanced",
-            Self::High => "High",
-            Self::Ultra => "Ultra",
-            Self::Custom => "Custom",
+    pub const fn label(self, lang: UiLang) -> &'static str {
+        match (self, lang) {
+            (Self::Fast, UiLang::En) => "Fast",
+            (Self::Balanced, UiLang::En) => "Balanced",
+            (Self::High, UiLang::En) => "High",
+            (Self::Ultra, UiLang::En) => "Ultra",
+            (Self::Custom, UiLang::En) => "Custom",
+            (Self::Fast, UiLang::Ja) => "高速",
+            (Self::Balanced, UiLang::Ja) => "バランス",
+            (Self::High, UiLang::Ja) => "高",
+            (Self::Ultra, UiLang::Ja) => "最高",
+            (Self::Custom, UiLang::Ja) => "カスタム",
         }
     }
 }
@@ -261,11 +266,14 @@ impl LodMode {
         }
     }
 
-    pub const fn label(self) -> &'static str {
-        match self {
-            Self::Off => "Off",
-            Self::Medium => "Medium (64c)",
-            Self::Far => "Far (128c)",
+    pub const fn label(self, lang: UiLang) -> &'static str {
+        match (self, lang) {
+            (Self::Off, UiLang::En) => "Off",
+            (Self::Medium, UiLang::En) => "Medium (64c)",
+            (Self::Far, UiLang::En) => "Far (128c)",
+            (Self::Off, UiLang::Ja) => "オフ",
+            (Self::Medium, UiLang::Ja) => "中 (64c)",
+            (Self::Far, UiLang::Ja) => "遠 (128c)",
         }
     }
 }
@@ -297,13 +305,18 @@ impl GpuBackend {
         }
     }
 
-    pub const fn label(self) -> &'static str {
-        match self {
-            Self::Auto => "Auto",
-            Self::MeshShader => "Mesh Shader",
-            Self::ComputeIndirect => "Compute Indirect",
-            Self::Classic => "Classic",
-            Self::ClassicLowSpec => "Classic Low-Spec",
+    pub const fn label(self, lang: UiLang) -> &'static str {
+        match (self, lang) {
+            (Self::Auto, UiLang::En) => "Auto",
+            (Self::MeshShader, UiLang::En) => "Mesh Shader",
+            (Self::ComputeIndirect, UiLang::En) => "Compute Indirect",
+            (Self::Classic, UiLang::En) => "Classic",
+            (Self::ClassicLowSpec, UiLang::En) => "Classic Low-Spec",
+            (Self::Auto, UiLang::Ja) => "自動",
+            (Self::MeshShader, UiLang::Ja) => "メッシュシェーダー",
+            (Self::ComputeIndirect, UiLang::Ja) => "コンピュート間接",
+            (Self::Classic, UiLang::Ja) => "クラシック",
+            (Self::ClassicLowSpec, UiLang::Ja) => "低スペック",
         }
     }
 }
@@ -484,10 +497,10 @@ impl VideoSettings {
             })
     }
 
-    /// Display string for the current cap (`"Unlimited"` for `0`).
-    pub fn fps_cap_label(&self) -> String {
+    /// Display string for the current cap (`"Unlimited"`/`"無制限"` for `0`).
+    pub fn fps_cap_label(&self, lang: UiLang) -> String {
         if self.fps_cap == 0 {
-            "Unlimited".to_string()
+            tr(lang, "Unlimited", "無制限").to_string()
         } else {
             self.fps_cap.to_string()
         }
@@ -627,11 +640,14 @@ impl CrashReportMode {
         }
     }
 
-    pub const fn label(self) -> &'static str {
-        match self {
-            Self::Ask => "Ask",
-            Self::AutoCrashOnly => "Auto (crashes only)",
-            Self::Off => "Off",
+    pub const fn label(self, lang: UiLang) -> &'static str {
+        match (self, lang) {
+            (Self::Ask, UiLang::En) => "Ask",
+            (Self::AutoCrashOnly, UiLang::En) => "Auto (crashes only)",
+            (Self::Off, UiLang::En) => "Off",
+            (Self::Ask, UiLang::Ja) => "確認",
+            (Self::AutoCrashOnly, UiLang::Ja) => "クラッシュ時のみ",
+            (Self::Off, UiLang::Ja) => "オフ",
         }
     }
 }
@@ -802,11 +818,14 @@ impl MinimapMode {
         }
     }
 
-    pub const fn label(self) -> &'static str {
-        match self {
-            Self::Unrestricted => "Unrestricted",
-            Self::FairPlay => "Fair-Play",
-            Self::Disabled => "Disabled",
+    pub const fn label(self, lang: UiLang) -> &'static str {
+        match (self, lang) {
+            (Self::Unrestricted, UiLang::En) => "Unrestricted",
+            (Self::FairPlay, UiLang::En) => "Fair-Play",
+            (Self::Disabled, UiLang::En) => "Disabled",
+            (Self::Unrestricted, UiLang::Ja) => "無制限",
+            (Self::FairPlay, UiLang::Ja) => "フェアプレイ",
+            (Self::Disabled, UiLang::Ja) => "無効",
         }
     }
 }
@@ -832,11 +851,14 @@ impl PlayerRadarScope {
         }
     }
 
-    pub const fn label(self) -> &'static str {
-        match self {
-            Self::All => "All",
-            Self::PartyOnly => "Party Only",
-            Self::None => "None",
+    pub const fn label(self, lang: UiLang) -> &'static str {
+        match (self, lang) {
+            (Self::All, UiLang::En) => "All",
+            (Self::PartyOnly, UiLang::En) => "Party Only",
+            (Self::None, UiLang::En) => "None",
+            (Self::All, UiLang::Ja) => "すべて",
+            (Self::PartyOnly, UiLang::Ja) => "パーティーのみ",
+            (Self::None, UiLang::Ja) => "なし",
         }
     }
 }
@@ -905,7 +927,8 @@ impl VisualStylePreset {
 
     pub const fn label(self, lang: UiLang) -> &'static str {
         match (self, lang) {
-            (Self::Vanilla, _) => "Vanilla",
+            (Self::Vanilla, UiLang::En) => "Vanilla",
+            (Self::Vanilla, UiLang::Ja) => "バニラ",
             (Self::MeguNatural, _) => "Megu Natural",
         }
     }

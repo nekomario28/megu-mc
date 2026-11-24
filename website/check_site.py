@@ -31,6 +31,10 @@ Checks, all fail-closed:
   7. SEO surface: <link rel="canonical">, robots.txt, sitemap.xml,
      Open Graph / Twitter Card meta, og-card.png (1200x630) + og-card.svg,
      and a parseable schema.org SoftwareApplication JSON-LD block.
+  8. Client cross-links: the four MEGU_*_URL constants in
+     client-gpu/src/window.rs resolve to the site-config.js customDomain,
+     real #support/#report anchors in index.html, a hash handler in
+     app.js, non-empty sponsor links, and a populated FUNDING.yml.
 
 Exit status: 0 clean, 1 findings.
 """
@@ -1121,6 +1125,110 @@ def check_functions_unit():
     return []
 
 
+def check_client_website_links():
+    """Check 8: client URL constants stay in sync with the landing page.
+
+    client-gpu/src/window.rs hardcodes MEGU_WEBSITE_URL, MEGU_SUPPORT_URL,
+    MEGU_CONTRIBUTE_URL, and MEGU_REPORT_URL. A drifted constant, a removed
+    section anchor, or an emptied sponsor link would silently break the
+    in-client Title/About/Pause buttons — this cross-check fails closed
+    instead.
+    """
+    window_rs = ROOT / "client-gpu" / "src" / "window.rs"
+    index = WEBSITE / "index.html"
+    app = WEBSITE / "app.js"
+    config = WEBSITE / "site-config.js"
+    for path in (window_rs, index, app, config):
+        if not path.is_file():
+            return [f"{path.relative_to(ROOT)} is missing"]
+    window = window_rs.read_text(encoding="utf-8")
+    markup = index.read_text(encoding="utf-8")
+    script = app.read_text(encoding="utf-8")
+    cfg = config.read_text(encoding="utf-8")
+
+    urls = {}
+    for name in ("MEGU_WEBSITE_URL", "MEGU_SUPPORT_URL",
+                 "MEGU_CONTRIBUTE_URL", "MEGU_REPORT_URL"):
+        match = re.search(
+            rf'pub const {name}\s*:\s*&str\s*=\s*"([^"]+)"', window)
+        urls[name] = match.group(1) if match else None
+    findings = [
+        f"client-gpu/src/window.rs does not declare pub const {name}"
+        for name, value in urls.items()
+        if value is None
+    ]
+
+    def config_value(key):
+        match = re.search(rf'\b{key}\s*:\s*"([^"]*)"', cfg)
+        return match.group(1) if match else None
+
+    domain = config_value("customDomain")
+    expected_origin = f"https://{domain}/" if domain else None
+    if expected_origin is None:
+        findings.append(
+            "site-config.js customDomain is empty — the client links "
+            "cannot resolve a canonical origin")
+    else:
+        if urls["MEGU_WEBSITE_URL"] != expected_origin:
+            findings.append(
+                f"MEGU_WEBSITE_URL is {urls['MEGU_WEBSITE_URL']!r}, "
+                f"expected {expected_origin!r} (site-config.js customDomain)")
+        for name in ("MEGU_SUPPORT_URL", "MEGU_REPORT_URL"):
+            value = urls[name]
+            if value is not None and not value.startswith(expected_origin):
+                findings.append(
+                    f"{name} is {value!r} — must stay on "
+                    f"{expected_origin!r} so its anchor resolves")
+
+    def fragment(url):
+        match = re.match(r"^https?://[^#]*#([A-Za-z0-9_-]+)$", url or "")
+        return match.group(1) if match else None
+
+    support_fragment = fragment(urls["MEGU_SUPPORT_URL"])
+    if support_fragment != "support":
+        findings.append(
+            f"MEGU_SUPPORT_URL must end in #support, got "
+            f"{urls['MEGU_SUPPORT_URL']!r}")
+    elif f'id="{support_fragment}"' not in markup:
+        findings.append(
+            f'index.html is missing id="{support_fragment}" — the client '
+            "support link anchors nowhere")
+    for key in ("sponsorUrl", "githubSponsorsUrl"):
+        if not config_value(key):
+            findings.append(
+                f"site-config.js {key} is empty — the #support section "
+                "the client links to renders no sponsor button")
+
+    report_fragment = fragment(urls["MEGU_REPORT_URL"])
+    if report_fragment not in ("report", "feedback"):
+        findings.append(
+            f"MEGU_REPORT_URL must end in #report or #feedback (never a "
+            f"bare URL), got {urls['MEGU_REPORT_URL']!r}")
+    else:
+        if f'id="{report_fragment}"' not in markup:
+            findings.append(
+                f'index.html is missing id="{report_fragment}" — the '
+                "client report link anchors nowhere")
+        if f'"#{report_fragment}"' not in script:
+            findings.append(
+                f"app.js does not handle #{report_fragment} — the client "
+                "report link would land on a static page instead of "
+                "auto-opening the feedback modal")
+
+    github_url = config_value("githubUrl")
+    if urls["MEGU_CONTRIBUTE_URL"] != github_url:
+        findings.append(
+            f"MEGU_CONTRIBUTE_URL is {urls['MEGU_CONTRIBUTE_URL']!r}, "
+            f"expected site-config.js githubUrl {github_url!r}")
+
+    funding = ROOT / ".github" / "FUNDING.yml"
+    if not funding.is_file():
+        findings.append(".github/FUNDING.yml is missing")
+    elif not funding.read_text(encoding="utf-8").strip():
+        findings.append(".github/FUNDING.yml is empty")
+    return findings
+
+
 def main():
     checks = (
         ("local assets & zero external deps", check_local_assets),
@@ -1130,6 +1238,7 @@ def main():
         ("app.js unit check (node)", check_js_unit),
         ("functions unit check (node)", check_functions_unit),
         ("SEO metadata & crawler files", check_seo_metadata),
+        ("client <-> website links", check_client_website_links),
     )
     failures = []
     skipped = 0

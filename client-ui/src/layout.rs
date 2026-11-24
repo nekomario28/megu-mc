@@ -1230,7 +1230,7 @@ fn shaders_tab(ctx: &mut Ctx, y0: i32) {
     let lang = ctx.lang;
     let cx = ctx.w / 2;
     let name = if ctx.state.active_shaderpack_name.is_empty() {
-        "Vanilla (Off)"
+        tr(lang, "Vanilla (Off)", "バニラ (オフ)")
     } else {
         &ctx.state.active_shaderpack_name
     };
@@ -1363,7 +1363,11 @@ fn video_tab(ctx: &mut Ctx, y0: i32) {
     ctx.btn(
         WidgetId::VideoPreset,
         lr(x, y, bw, 20),
-        &format!("{}: {}", tr(lang, "Preset", "プリセット"), v.preset.label()),
+        &format!(
+            "{}: {}",
+            tr(lang, "Preset", "プリセット"),
+            v.preset.label(lang)
+        ),
     );
     ctx.dirty_dot(SettingKey::VideoPreset, x + bw + 6, y + 6);
 
@@ -1439,7 +1443,11 @@ fn video_tab(ctx: &mut Ctx, y0: i32) {
         0,
         WidgetId::VideoLod,
         SettingKey::VideoLod,
-        &format!("{}: {}", tr(lang, "Distant LOD", "遠景LOD"), v.lod.label()),
+        &format!(
+            "{}: {}",
+            tr(lang, "Distant LOD", "遠景LOD"),
+            v.lod.label(lang)
+        ),
     );
     pair(
         ctx,
@@ -1450,7 +1458,7 @@ fn video_tab(ctx: &mut Ctx, y0: i32) {
         &format!(
             "{}: {}",
             tr(lang, "GPU Backend", "GPUバックエンド"),
-            v.gpu_backend.label()
+            v.gpu_backend.label(lang)
         ),
     );
 
@@ -1482,7 +1490,11 @@ fn video_tab(ctx: &mut Ctx, y0: i32) {
         WidgetId::VideoFpsSlider,
         lr(x, y, 200, 20),
         frac,
-        &format!("{}: {}", tr(lang, "FPS Cap", "FPS上限"), v.fps_cap_label()),
+        &format!(
+            "{}: {}",
+            tr(lang, "FPS Cap", "FPS上限"),
+            v.fps_cap_label(lang)
+        ),
     );
     ctx.textfield(
         WidgetId::VideoFpsField,
@@ -1957,7 +1969,7 @@ fn qol_tab(ctx: &mut Ctx, y0: i32) {
         &format!(
             "{}: {}",
             tr(lang, "Crash Report Mode", "クラッシュレポート"),
-            q.crash_report_mode.label()
+            q.crash_report_mode.label(lang)
         ),
     );
     ctx.dirty_dot(SettingKey::QolCrashReportMode, x + 326, qy(6) + (bh - 8) / 2);
@@ -2166,7 +2178,7 @@ fn fairplay_tab(ctx: &mut Ctx, y0: i32) {
         &format!(
             "{}: {}",
             tr(lang, "Minimap Mode", "ミニマップ"),
-            f.minimap_mode.label()
+            f.minimap_mode.label(lang)
         ),
     );
     ctx.dirty_dot(SettingKey::FpMinimapMode, x + 326, y + 6);
@@ -2202,7 +2214,7 @@ fn fairplay_tab(ctx: &mut Ctx, y0: i32) {
         &format!(
             "{}: {}",
             tr(lang, "Player Radar Scope", "プレイヤーレーダー"),
-            f.player_radar_scope.label()
+            f.player_radar_scope.label(lang)
         ),
     );
     ctx.dirty_dot(SettingKey::FpPlayerRadarScope, x + 326, y + 6);
@@ -2268,7 +2280,7 @@ fn language_tab(ctx: &mut Ctx, y0: i32) {
         &format!(
             "{} — {} · {} {}",
             locale.code(),
-            locale.english_name(),
+            locale.native_name(),
             megu_core::i18n::ALL_BUILTIN_LOCALES.len(),
             tr(lang, "built-in + .json packs", "内蔵 + .jsonパック")
         ),
@@ -2782,16 +2794,26 @@ fn mod_sync_prompt(ctx: &mut Ctx) {
     let rows = &ctx.state.mod_sync_prompt.rows;
     let panel_h = (44 + rows.len().min(8) as i32 * 17).min((ctx.h - 112).max(44));
     ctx.panel(px, 44, pw, panel_h);
-    ctx.text(px + 8, 48, 1, pal::TEXT_DIM, "MOD ID          REQUIRED       INSTALLED");
+    ctx.text(px + 8, 48, 1, pal::TEXT_DIM, tr(lang, "MOD ID", "Mod ID"));
+    ctx.hud_text(px + 144, 48, 1, pal::TEXT_DIM, tr(lang, "REQUIRED", "要求"), 10);
+    ctx.hud_text(px + 240, 48, 1, pal::TEXT_DIM, tr(lang, "INSTALLED", "現行"), 16);
     for (i, row) in rows.iter().take(8).enumerate() {
         let y = 64 + i as i32 * 17;
-        let installed = row.installed_version.as_deref().unwrap_or("missing");
+        let installed = row
+            .installed_version
+            .as_deref()
+            .unwrap_or(tr(lang, "missing", "なし"));
         ctx.hud_text(px + 8, y, 1, pal::TEXT, &row.mod_id, 16);
         ctx.hud_text(px + 144, y, 1, pal::WARNING, &row.required_version, 10);
         ctx.hud_text(px + 240, y, 1, if row.installed_version.is_some() { pal::DANGER } else { pal::TEXT_DIM }, installed, 16);
     }
     if rows.len() > 8 {
-        ctx.text(px + 8, 44 + panel_h - 10, 1, pal::TEXT_DIM, &format!("... {} more", rows.len() - 8));
+        let more = if lang == UiLang::Ja {
+            format!("あと{}行", rows.len() - 8)
+        } else {
+            format!("... {} more", rows.len() - 8)
+        };
+        ctx.text(px + 8, 44 + panel_h - 10, 1, pal::TEXT_DIM, &more);
     }
     let progress_y = (44 + panel_h + 8).min(ctx.h - 62);
     ctx.hud_text(px + 8, progress_y, 1, pal::TEXT, &ctx.state.mod_sync_prompt.progress_label, 48);
@@ -2803,8 +2825,8 @@ fn mod_sync_prompt(ctx: &mut Ctx) {
         ctx.fill(x, y, w * i32::from(percent.min(100)) / 100, 6, pal::ACCENT);
     }
     let by = ctx.h - 44;
-    ctx.btn(WidgetId::ModSyncPromptConfirm, lr(cx - 170, by, 220, 22), tr(lang, "Download from Modrinth & Reconnect", "Download & Reconnect"));
-    ctx.btn(WidgetId::ModSyncPromptCancel, lr(cx + 58, by, 112, 22), tr(lang, "Cancel", "Cancel"));
+    ctx.btn(WidgetId::ModSyncPromptConfirm, lr(cx - 170, by, 220, 22), tr(lang, "Download from Modrinth & Reconnect", "ダウンロードして再接続"));
+    ctx.btn(WidgetId::ModSyncPromptCancel, lr(cx + 58, by, 112, 22), tr(lang, "Cancel", "キャンセル"));
 }
 
 // ---------------------------------------------------------------------------
@@ -4317,7 +4339,7 @@ fn pause(ctx: &mut Ctx) {
     ctx.btn(
         WidgetId::PauseSaveReplay,
         lr(x, y, bw, bh),
-        tr(lang, "Save 60s Instant Replay", "Save 60s Replay"),
+        tr(lang, "Save 60s Instant Replay", "60sリプレイを保存"),
     );
     y += step;
     ctx.btn(
@@ -4843,6 +4865,366 @@ mod tests {
             UiCommand::Text { text, color, .. }
                 if text.contains("+") && *color == pal::WARNING
         )));
+    }
+
+    // -------------------------------------------------------------------
+    // Player-facing guards: settings tab ownership, anti-dev-jargon copy,
+    // Japanese completeness, and zero-tofu glyph coverage. These pin the
+    // regressions where video controls leaked onto the Controls tab,
+    // English labels fell through in Japanese, and internal jargon shipped.
+    // -------------------------------------------------------------------
+
+    /// Every menu screen a player can reach without live session data.
+    /// Embedded sub-screens (`ModMenu`, `RecipeBrowser`) and the in-game
+    /// HUD render their own trees with dedicated test modules — this
+    /// list covers the native chrome and tab chrome.
+    fn menu_screens() -> Vec<(String, Screen)> {
+        let mut out: Vec<(String, Screen)> = [
+            Screen::Title,
+            Screen::Singleplayer,
+            Screen::Multiplayer,
+            Screen::AboutMegu,
+            Screen::Friends,
+            Screen::ModSyncConsent,
+            Screen::ModSyncPrompt,
+            Screen::Disconnected,
+            Screen::Pause,
+            Screen::Death,
+            Screen::CrashRecovery,
+        ]
+        .into_iter()
+        .map(|s| (format!("{s:?}"), s))
+        .collect();
+        for tab in SettingsTab::ALL {
+            out.push((format!("Settings({tab:?})"), Screen::Settings(tab)));
+        }
+        out
+    }
+
+    /// State that exercises the *UI chrome*: every link row is populated,
+    /// while host-provided data (rebind action names are real English
+    /// identifiers the host ships regardless of locale) is emptied so the
+    /// guards pin layout strings, not host data.
+    fn menu_state(lang: UiLang, screen: Screen) -> UiState {
+        let mut ui = UiState::default();
+        if lang == UiLang::Ja {
+            // The same code path the host takes on a locale pick: sets
+            // both `settings.language` (tr) and `settings.locale`
+            // (ui_text / i18n catalog).
+            ui.set_locale(megu_core::i18n::BuiltinLocale::JaJp);
+        }
+        ui.keybinds = KeyBindings::default();
+        ui.website_url = "https://megu.megumin.tech/".to_string();
+        ui.support_url = "https://megu.megumin.tech/#support".to_string();
+        ui.contribute_url = "https://github.com/nekomario28/megu-mc".to_string();
+        ui.report_url = "https://megu.megumin.tech/#report".to_string();
+        ui.navigate(screen);
+        ui
+    }
+
+    fn rendered_texts(state: &UiState, w: u32, h: u32) -> Vec<String> {
+        let (draw, _) = layout_screen(state, w, h);
+        draw.commands
+            .iter()
+            .filter_map(|c| match c {
+                UiCommand::Text { text, .. } => Some(text.clone()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn settings_tabs_own_their_widget_ids() {
+        for (w, h) in [(1280u32, 720u32), (640u32, 360u32)] {
+            // Render all seven tabs once each; bucket every hit region by
+            // the tab that emitted it.
+            let mut hits: Vec<(SettingsTab, WidgetId)> = Vec::new();
+            for tab in SettingsTab::ALL {
+                let ui = menu_state(UiLang::En, Screen::Settings(tab));
+                let (_, regions) = layout_screen(&ui, w, h);
+                hits.extend(regions.iter().map(|r| (tab, r.id)));
+            }
+            let tabs_of = |pred: &dyn Fn(WidgetId) -> bool| -> Vec<SettingsTab> {
+                let mut seen: Vec<SettingsTab> = hits
+                    .iter()
+                    .filter(|(_, id)| pred(*id))
+                    .map(|(tab, _)| *tab)
+                    .collect();
+                seen.dedup();
+                seen
+            };
+            // Video widgets belong to Video alone — the regression that
+            // painted them on Controls.
+            for id in [
+                WidgetId::VideoFullscreen,
+                WidgetId::VideoGamma,
+                WidgetId::VideoGuiScale,
+                WidgetId::VideoEntityShadows,
+                WidgetId::VideoClouds,
+            ] {
+                assert_eq!(
+                    tabs_of(&|i| i == id),
+                    [SettingsTab::Video],
+                    "{id:?} must render only on Video at {w}x{h}"
+                );
+            }
+            // The relocated built-ins and MiniHUD chips are QoL-only.
+            assert_eq!(
+                tabs_of(&|i| matches!(i, WidgetId::QolBuiltin(_))),
+                [SettingsTab::Qol],
+                "QolBuiltin leaked off the QoL tab at {w}x{h}"
+            );
+            assert_eq!(
+                tabs_of(&|i| matches!(i, WidgetId::MiniHudSegment(_))),
+                [] as [SettingsTab; 0],
+                "MiniHudSegment rendered with MiniHUD off at {w}x{h}"
+            );
+            // Rebind cells and the mouse-Y toggle are Controls-only.
+            assert_eq!(
+                tabs_of(&|i| matches!(i, WidgetId::ControlKey(_))),
+                [SettingsTab::Controls],
+                "ControlKey leaked off the Controls tab at {w}x{h}"
+            );
+            assert_eq!(
+                tabs_of(&|i| i == WidgetId::VideoInvertY),
+                [SettingsTab::Controls],
+                "VideoInvertY must render only on Controls at {w}x{h}"
+            );
+            // Positive anchors: the ids do appear on their owning tab.
+            for id in [
+                WidgetId::VideoFullscreen,
+                WidgetId::VideoGamma,
+                WidgetId::VideoGuiScale,
+                WidgetId::VideoEntityShadows,
+                WidgetId::VideoClouds,
+            ] {
+                assert!(
+                    hits.iter().any(|(t, i)| *t == SettingsTab::Video && *i == id),
+                    "{id:?} missing from Video at {w}x{h}"
+                );
+            }
+            // With MiniHUD on, its chips still belong to QoL alone.
+            let mut ui = menu_state(UiLang::En, Screen::Settings(SettingsTab::Qol));
+            ui.settings.qol.mini_hud.enabled = true;
+            let (_, regions) = layout_screen(&ui, w, h);
+            assert!(
+                regions
+                    .iter()
+                    .any(|r| matches!(r.id, WidgetId::MiniHudSegment(_))),
+                "MiniHudSegment missing on QoL with MiniHUD on at {w}x{h}"
+            );
+        }
+        // The chips never render outside QoL even when enabled.
+        for tab in SettingsTab::ALL {
+            let mut ui = menu_state(UiLang::En, Screen::Settings(tab));
+            ui.settings.qol.mini_hud.enabled = true;
+            let (_, regions) = layout_screen(&ui, 1280, 720);
+            if tab == SettingsTab::Qol {
+                continue;
+            }
+            assert!(
+                !regions
+                    .iter()
+                    .any(|r| matches!(r.id, WidgetId::MiniHudSegment(_))),
+                "MiniHudSegment leaked onto {tab:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn player_facing_screens_carry_no_dev_jargon() {
+        // Internal codenames, license spdx, and dev-notes phrasing that
+        // must never reach a player-facing string.
+        const JARGON: &[&str] = &[
+            "Protocol 767",
+            "zero-dep",
+            "client-ui",
+            "Zsh command",
+            "GPL-3.0-or-later",
+            "AGPL-3.0-or-later",
+            "clean-room",
+            "(opt-in)",
+        ];
+        // Token check: jargon must not appear as a standalone token, but
+        // LGPL-3.0-or-later (the real license) contains no bare GPL/AGPL.
+        fn has_token(text: &str, needle: &str) -> bool {
+            text.match_indices(needle).any(|(i, _)| {
+                text[..i]
+                    .chars()
+                    .next_back()
+                    .is_none_or(|c| !c.is_ascii_alphanumeric() && c != '-')
+            })
+        }
+        for lang in [UiLang::En, UiLang::Ja] {
+            for (name, screen) in menu_screens() {
+                for (w, h) in [(1280u32, 720u32), (640u32, 360u32)] {
+                    let ui = menu_state(lang, screen);
+                    for text in rendered_texts(&ui, w, h) {
+                        for jargon in JARGON {
+                            assert!(
+                                !has_token(&text, jargon),
+                                "{name} ({lang:?} {w}x{h}) renders dev jargon \
+                                 {jargon:?} in {text:?}"
+                            );
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn ja_menu_labels_never_fall_back_to_english() {
+        // English phrases a Japanese build shipped before they were
+        // translated — the exact regression fingerprints.
+        const KNOWN_LEAKS: &[&str] = &[
+            "Master Volume",
+            "Hostile Mobs",
+            "Friendly Mobs",
+            "Same-Sound",
+            "Forward",
+            "Swap Offhand",
+            "Advancements",
+            "Sort Inventory",
+            "Fullscreen:",
+            "Brightness:",
+            "GUI Scale:",
+            "Invert Y:",
+            "Looking-at HUD",
+            "Mouse tweaks",
+            "Inventory sort",
+            "Press any key",
+        ];
+        // Latin tokens that are legitimate on Japanese screens (brand,
+        // units, feature names, and the few real English proper nouns).
+        const ALLOWED_LATIN: &[&str] = &[
+            "MINECRAFT", "MEGU", "EDITION", "ENHANCED", "Megu", "Minecraft",
+            "Mod", "Mods", "Modrinth", "Recommended", "VSync", "FPS", "TPS",
+            "MSPT", "BGM", "RAM", "GPU", "LOD", "GUI", "HUD", "LAN", "ID",
+            "OK", "SHA", "ON", "OFF", "E2EE", "LGPL", "QoL", "later", "ms",
+            "fps", "id", "v", "tick", "MiB", "GiB", "KiB", "c", "dB",
+            // Locale autonyms render natively regardless of UI language.
+            "English", "Deutsch", "Fran", "Espa", "Italiano", "Polski",
+            "json",
+        ];
+        let mut screens = vec![
+            ("Title".to_string(), Screen::Title),
+            ("AboutMegu".to_string(), Screen::AboutMegu),
+            ("Pause".to_string(), Screen::Pause),
+            ("ModSyncPrompt".to_string(), Screen::ModSyncPrompt),
+        ];
+        screens.extend(
+            SettingsTab::ALL
+                .into_iter()
+                .map(|tab| (format!("Settings({tab:?})"), Screen::Settings(tab))),
+        );
+        for (name, screen) in screens {
+            for (w, h) in [(1280u32, 720u32), (640u32, 360u32)] {
+                let ui = menu_state(UiLang::Ja, screen);
+                for text in rendered_texts(&ui, w, h) {
+                    for leak in KNOWN_LEAKS {
+                        assert!(
+                            !text.contains(leak),
+                            "{name} {w}x{h} JA label fell back to {leak:?} in {text:?}"
+                        );
+                    }
+                    // Generic fallback catch: no run of Latin letters
+                    // (a whole untranslated word) outside the allowlist.
+                    // SDL-style bound-key names (`KeyW`, `ShiftLeft`,
+                    // `F11`, `Space`) are host data, not chrome.
+                    fn key_name(word: &str) -> bool {
+                        word.starts_with("Key")
+                            || word.starts_with("Mouse")
+                            || word.starts_with("Arrow")
+                            || word.starts_with("Num")
+                            || word.starts_with("Shift")
+                            || word.starts_with("Control")
+                            || word.starts_with("Alt")
+                            || word.starts_with("Page")
+                            || word.starts_with("F")
+                                && word[1..].chars().all(|c| c.is_ascii_digit())
+                            || matches!(
+                                word,
+                                "Space"
+                                    | "Slash"
+                                    | "Tab"
+                                    | "Backspace"
+                                    | "CapsLock"
+                                    | "Return"
+                                    | "Escape"
+                                    | "Grave"
+                                    | "Minus"
+                                    | "Equal"
+                                    | "Comma"
+                                    | "Period"
+                                    | "Semicolon"
+                                    | "Apostrophe"
+                                    | "Backslash"
+                                    | "Delete"
+                                    | "Insert"
+                                    | "Home"
+                                    | "End"
+                            )
+                    }
+                    for word in text
+                        .split(|c: char| !c.is_ascii_alphabetic())
+                        .filter(|s| s.len() >= 3 && !key_name(s))
+                    {
+                        assert!(
+                            ALLOWED_LATIN
+                                .iter()
+                                .any(|allowed| word.contains(allowed) || allowed.contains(&word)),
+                            "{name} {w}x{h} JA label has untranslated word \
+                             {word:?} in {text:?}"
+                        );
+                    }
+                }
+            }
+        }
+        // While a rebinding capture is armed the Controls tab prompts in
+        // Japanese, never in English.
+        let mut ui = menu_state(UiLang::Ja, Screen::Settings(SettingsTab::Controls));
+        ui.capturing_key_binding = Some(0);
+        let texts = rendered_texts(&ui, 1280, 720);
+        assert!(
+            texts.iter().any(|t| t.contains("キーを押してください")),
+            "Controls capture prompt is not Japanese: {texts:?}"
+        );
+        assert!(
+            !texts.iter().any(|t| t.contains("Press any key")),
+            "Controls capture prompt leaked English: {texts:?}"
+        );
+    }
+
+    #[test]
+    fn every_ja_screen_has_zero_tofu_glyphs() {
+        use std::collections::BTreeSet;
+        let mut uncovered: BTreeSet<char> = BTreeSet::new();
+        let mut offenders: Vec<String> = Vec::new();
+        for (name, screen) in menu_screens() {
+            for (w, h) in [(1280u32, 720u32), (640u32, 360u32)] {
+                let ui = menu_state(UiLang::Ja, screen);
+                for text in rendered_texts(&ui, w, h) {
+                    if text
+                        .chars()
+                        .any(|c| !crate::draw::glyph_is_covered(c))
+                    {
+                        uncovered.extend(
+                            text.chars()
+                                .filter(|c| !crate::draw::glyph_is_covered(*c)),
+                        );
+                        offenders.push(format!("{name} {w}x{h}: {text:?}"));
+                    }
+                }
+            }
+        }
+        assert!(
+            uncovered.is_empty(),
+            "JA tofu glyphs: {:?} (U+{:04X?}) — offenders: {:?}",
+            uncovered,
+            uncovered.iter().map(|c| *c as u32).collect::<Vec<_>>(),
+            offenders
+        );
     }
 }
 

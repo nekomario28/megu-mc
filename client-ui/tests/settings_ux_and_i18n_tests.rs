@@ -96,7 +96,7 @@ fn visual_style_preset_ordering_labels_and_default() {
         VisualStylePreset::MeguNatural
     );
     assert_eq!(VisualStylePreset::Vanilla.label(UiLang::En), "Vanilla");
-    assert_eq!(VisualStylePreset::Vanilla.label(UiLang::Ja), "Vanilla");
+    assert_eq!(VisualStylePreset::Vanilla.label(UiLang::Ja), "バニラ");
     assert_eq!(
         VisualStylePreset::MeguNatural.label(UiLang::En),
         "Megu Natural"
