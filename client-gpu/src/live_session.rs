@@ -4000,6 +4000,16 @@ impl LiveSession {
         self.asset_bundle_pending_upload = true;
     }
 
+    /// Re-arm asset discovery after an external change — e.g. the vanilla
+    /// JAR bootstrap finishing its download into Megu's cache. Unlike
+    /// [`Self::request_atlas_reload`] this also fires when no bundle was
+    /// ever built (`atlas_meta` still `None` because discovery ran before
+    /// the JAR existed), so the next `ensure_asset_bundle` pass re-resolves
+    /// every layer and newly discovered textures upload seamlessly.
+    pub fn refresh_asset_layers(&mut self) {
+        self.asset_bundle_tried = false;
+    }
+
     /// Scan `assets/*/optifine/cem/*.jem|*.jpm` in the loaded pack and register
     /// each custom entity model in `world.animations` under its file stem
     /// (`zombie.jem` -> `zombie`), matching OptiFine's CEM lookup. Unreadable
@@ -6621,35 +6631,37 @@ pub fn discover_asset_layers(
     let mut report = AssetDiscovery::default();
     let mut cem_dirs = Vec::new();
 
-    if let Some(game_dir) = paths.game_dir.as_deref() {
-        for version_id in jar_version_ids(paths) {
-            let jar = game_dir
-                .join("versions")
-                .join(&version_id)
-                .join(format!("{version_id}.jar"));
-            if !jar.is_file() {
-                continue;
-            }
-            match crate::vanilla_jar::vanilla_jar_texture_layer(&jar) {
-                Ok((layer, jar_report)) => {
-                    report.jar_textures = layer.sprites.len();
-                    report.jar_path = Some(jar.clone());
-                    report.zip_entries_seen += jar_report.entries_seen;
-                    for (entry, reason) in jar_report.skipped {
-                        report
-                            .notes
-                            .push(format!("{}: {entry}: {reason}", jar.display()));
-                    }
-                    layers.push(layer);
-                    break;
-                }
-                Err(err) => {
+    // Local-first vanilla JAR discovery runs with or without `--gameDir`:
+    // `<gameDir>/versions/<id>/<id>.jar` first, then every launcher cache
+    // (Official/Flatpak `.minecraft`, Prism libraries, Modrinth meta) and
+    // Megu's own cache — a user who installed the same Minecraft version
+    // anywhere gets vanilla textures with zero manual steps.
+    for jar in crate::vanilla_bootstrap::local_vanilla_jar_candidates(paths) {
+        if !crate::vanilla_bootstrap::is_valid_jar_candidate(&jar) {
+            continue;
+        }
+        match crate::vanilla_jar::vanilla_jar_texture_layer(&jar) {
+            Ok((layer, jar_report)) => {
+                report.jar_textures = layer.sprites.len();
+                report.jar_path = Some(jar.clone());
+                report.zip_entries_seen += jar_report.entries_seen;
+                for (entry, reason) in jar_report.skipped {
                     report
                         .notes
-                        .push(format!("client JAR {} unreadable: {err}", jar.display()));
+                        .push(format!("{}: {entry}: {reason}", jar.display()));
                 }
+                layers.push(layer);
+                break;
+            }
+            Err(err) => {
+                report
+                    .notes
+                    .push(format!("client JAR {} unreadable: {err}", jar.display()));
             }
         }
+    }
+
+    if let Some(game_dir) = paths.game_dir.as_deref() {
         let (mod_layers, mod_report) =
             crate::vanilla_jar::load_mod_jar_layers(&game_dir.join("mods"));
         report.zip_entries_seen += mod_report.entries_seen;

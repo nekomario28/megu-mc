@@ -322,7 +322,11 @@ fn parse_expected_sha256(sums_text: &str, filename: &str) -> Option<String> {
 }
 
 /// Download `url` to `dest`, preferring curl and falling back to wget so
-/// minimal distros (Alpine, Void musl) that ship only BusyBox wget still work.
+/// minimal distros (Alpine, Void musl) that ship only BusyBox wget still
+/// work. On Windows, `curl` may resolve nothing even though the OS-bundled
+/// `curl.exe` exists in System32 (Windows 10 1803+), and PowerShell's
+/// `Invoke-WebRequest` is the always-present last resort — both are tried
+/// before wget so Windows users are never blocked by a missing PATH entry.
 fn download_release_file(url: &str, dest: &std::path::Path) -> Option<()> {
     let curl_ok = std::process::Command::new("curl")
         .args(["-fsSL", url, "-o"])
@@ -332,6 +336,44 @@ fn download_release_file(url: &str, dest: &std::path::Path) -> Option<()> {
         .unwrap_or(false);
     if curl_ok {
         return Some(());
+    }
+    #[cfg(windows)]
+    {
+        // The bundled curl.exe ships in System32 even when it is not on
+        // PATH (e.g. older images or stripped environments).
+        let curl_exe = std::env::var_os("SystemRoot")
+            .map(|root| std::path::Path::new(&root).join("System32").join("curl.exe"))
+            .filter(|path| path.is_file())
+            .unwrap_or_else(|| std::path::PathBuf::from(r"C:\Windows\System32\curl.exe"));
+        if curl_exe.is_file() {
+            let ok = std::process::Command::new(&curl_exe)
+                .args(["-fsSL", url, "-o"])
+                .arg(dest)
+                .status()
+                .map(|status| status.success())
+                .unwrap_or(false);
+            if ok {
+                return Some(());
+            }
+        }
+        // PowerShell 5 `Invoke-WebRequest` is present on every supported
+        // Windows release; single-quoted literals with ''-escaped quotes
+        // keep URL/path interpolation injection-free.
+        let script = format!(
+            "Invoke-WebRequest -UseBasicParsing -Uri '{}' -OutFile '{}'",
+            url.replace('\'', "''"),
+            dest.display().to_string().replace('\'', "''")
+        );
+        for shell in ["powershell", "pwsh"] {
+            let ok = std::process::Command::new(shell)
+                .args(["-NoProfile", "-NonInteractive", "-Command", &script])
+                .status()
+                .map(|status| status.success())
+                .unwrap_or(false);
+            if ok && dest.is_file() {
+                return Some(());
+            }
+        }
     }
     let wget_ok = std::process::Command::new("wget")
         .arg("-q")

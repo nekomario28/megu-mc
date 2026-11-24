@@ -1,0 +1,1675 @@
+// SPDX-License-Identifier: LGPL-3.0-or-later OR GPL-3.0-or-later OR AGPL-3.0-or-later
+//! Zero-manual-step vanilla client JAR bootstrap — the Paper/NeoForge-grade
+//! first-run path.
+//!
+//! A fresh Megu launch needs the vanilla client JAR for blockstates, models
+//! and textures. Users must never be told to run `megu-installer` in a
+//! terminal just to get vanilla textures, so this module does two things:
+//!
+//! * [`discover_local_vanilla_jar`] scans every place a client JAR for the
+//!   requested version already lives — `<gameDir>/versions/`, the Official
+//!   Launcher's `.minecraft` (incl. Flatpak), PrismLauncher/MultiMC-style
+//!   library caches, the Modrinth App cache and Megu's own cache dir — on
+//!   Linux, macOS and Windows. [`candidate_vanilla_jar_paths_for_os`] is the
+//!   pure OS/env -> path-list mapping unit tests exercise offline.
+//! * [`spawn_vanilla_jar_bootstrap`] runs the Mojang manifest -> version
+//!   JSON -> client JAR chain on a background thread: HTTPS-only against an
+//!   official-host allowlist, SHA-1 verified against the version manifest,
+//!   streamed in bounded chunks to a `.part` file that is atomically
+//!   renamed only after the digest and ZIP magic check out. The window
+//!   loop polls [`VanillaJarBootstrap::progress`] and hot-reloads asset
+//!   layers + title branding when [`BootstrapProgress::Ready`] lands.
+//!
+//! Auto-fetch is disabled when `MEGU_NO_AUTO_FETCH` or `MEGU_OFFLINE` is
+//! set, and under `cfg(test)` unless a test explicitly spawns against a
+//! loopback URL — unit tests never touch the real network.
+//!
+//! The SHA-1 below is a clean-room FIPS 180-4 implementation (no extra
+//! crate), and the JSON reader is a bounded clean-room parser in the same
+//! style `client-port`'s model baker carries (private there, so this lane
+//! keeps its own copy rather than widening another crate's API).
+
+use std::collections::BTreeMap;
+use std::io::{Read, Write};
+use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex};
+use std::time::Duration;
+
+use crate::live_session::{jar_version_ids, SessionPaths};
+use crate::vanilla_jar::MAX_ARCHIVE_BYTES;
+
+/// Mojang's version manifest — step 1 of the official download chain.
+pub const VANILLA_MANIFEST_URL: &str =
+    "https://piston-meta.mojang.com/mc/game/version_manifest_v2.json";
+/// `version_manifest_v2.json` is ~1 MiB today; 4 MiB leaves headroom.
+const MAX_MANIFEST_BYTES: u64 = 4 * 1024 * 1024;
+/// Per-version metadata JSON cap.
+const MAX_VERSION_JSON_BYTES: u64 = 2 * 1024 * 1024;
+/// The 1.21.1 client JAR is ~26 MiB; 128 MiB bounds the download.
+pub const MAX_CLIENT_JAR_BYTES: u64 = 128 * 1024 * 1024;
+/// Download stream chunk size.
+const DOWNLOAD_CHUNK: usize = 64 * 1024;
+/// Every valid client JAR starts with a local-file-header ZIP signature.
+const ZIP_MAGIC: [u8; 4] = *b"PK\x03\x04";
+
+/// HTTPS-only official Mojang hosts the whole chain may resolve to.
+const MOJANG_HOST_PREFIXES: [&str; 3] = [
+    "https://piston-meta.mojang.com/",
+    "https://piston-data.mojang.com/",
+    "https://launchermeta.mojang.com/",
+];
+
+/// What the background bootstrap thread is doing right now — the UI
+/// renders this on the title/startup status line.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum BootstrapProgress {
+    /// Fetching `version_manifest_v2.json` or the per-version metadata.
+    FetchingManifest,
+    /// Streaming the client JAR; `total` is the manifest-declared size
+    /// when known.
+    Downloading {
+        downloaded: u64,
+        total: Option<u64>,
+    },
+    /// Download complete; SHA-1 + ZIP magic verification in progress.
+    Verifying,
+    /// Client JAR verified and atomically in place.
+    Ready(PathBuf),
+    /// Terminal failure — the reason is user-presentable.
+    Failed(String),
+}
+
+impl BootstrapProgress {
+    /// `true` once the worker reached a terminal state.
+    pub fn is_terminal(&self) -> bool {
+        matches!(self, Self::Ready(_) | Self::Failed(_))
+    }
+}
+
+/// Human-readable one-liner for an in-flight [`BootstrapProgress`] —
+/// e.g. `Downloading Minecraft 1.21.1 assets... 42% (11.2 / 26.8 MB)`.
+/// `None` for terminal states (the caller writes those itself).
+pub fn bootstrap_progress_label(version_id: &str, progress: &BootstrapProgress) -> Option<String> {
+    match progress {
+        BootstrapProgress::FetchingManifest => Some(format!(
+            "Fetching Minecraft {version_id} download manifest..."
+        )),
+        BootstrapProgress::Downloading { downloaded, total } => {
+            let done = *downloaded as f64 / (1024.0 * 1024.0);
+            Some(match total {
+                Some(total) if *total > 0 => {
+                    let total_mb = *total as f64 / (1024.0 * 1024.0);
+                    let pct = (*downloaded as f64 * 100.0 / *total as f64).min(100.0);
+                    format!(
+                        "Downloading Minecraft {version_id} assets... {pct:.0}% ({done:.1} / {total_mb:.1} MB)"
+                    )
+                }
+                _ => format!("Downloading Minecraft {version_id} assets... {done:.1} MB"),
+            })
+        }
+        BootstrapProgress::Verifying => Some(format!(
+            "Verifying Minecraft {version_id} assets..."
+        )),
+        BootstrapProgress::Ready(_) | BootstrapProgress::Failed(_) => None,
+    }
+}
+
+/// Pollable handle to the background download worker. The UI loop reads
+/// [`Self::progress`] — cheap, non-blocking, lock-poison tolerant.
+pub struct VanillaJarBootstrap {
+    shared: Arc<Mutex<BootstrapProgress>>,
+}
+
+impl VanillaJarBootstrap {
+    /// Latest worker state. `Ready`/`Failed` are terminal.
+    pub fn progress(&self) -> BootstrapProgress {
+        self.shared
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
+    }
+}
+
+fn set_progress(shared: &Mutex<BootstrapProgress>, progress: BootstrapProgress) {
+    *shared.lock().unwrap_or_else(|e| e.into_inner()) = progress;
+}
+
+/// `false` when the user opted out (`MEGU_NO_AUTO_FETCH`/`MEGU_OFFLINE`),
+/// or under `cfg(test)` so unit tests can never hit the real network —
+/// hermetic tests spawn [`spawn_vanilla_jar_bootstrap_with_manifest`]
+/// against a loopback URL instead.
+pub fn auto_fetch_enabled() -> bool {
+    if cfg!(test) {
+        return false;
+    }
+    std::env::var_os("MEGU_NO_AUTO_FETCH").is_none()
+        && std::env::var_os("MEGU_OFFLINE").is_none()
+}
+
+/// Official-host HTTPS allowlist. Loopback `http://` is reachable only in
+/// unit tests, where the hermetic `TcpListener` harness serves mock
+/// Mojang responses.
+fn url_allowed(url: &str) -> bool {
+    #[cfg(test)]
+    if url.starts_with("http://127.0.0.1:") || url.starts_with("http://localhost:") {
+        return true;
+    }
+    MOJANG_HOST_PREFIXES.iter().any(|p| url.starts_with(p))
+}
+
+/// `version_id` is a directory name under `versions/` — refuse anything
+/// that could escape it (separators, drive syntax, `.`/`..` components).
+fn valid_version_id(version_id: &str) -> bool {
+    !version_id.is_empty()
+        && !matches!(version_id, "." | "..")
+        && !version_id.contains(['/', '\\', ':'])
+}
+
+// ---------------------------------------------------------------------------
+// Local discovery — scan launchers before ever touching the network
+// ---------------------------------------------------------------------------
+
+/// The OS layout family [`candidate_vanilla_jar_paths_for_os`] emits.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum LauncherOs {
+    Linux,
+    MacOs,
+    Windows,
+}
+
+fn host_os() -> LauncherOs {
+    match std::env::consts::OS {
+        "macos" => LauncherOs::MacOs,
+        "windows" => LauncherOs::Windows,
+        _ => LauncherOs::Linux,
+    }
+}
+
+/// Environment roots the candidate mapping reads — passed explicitly so
+/// the mapping stays pure and testable on any host.
+#[derive(Clone, Debug, Default)]
+pub struct OsEnv {
+    /// `$HOME` / `%USERPROFILE%`.
+    pub home: Option<PathBuf>,
+    /// `${XDG_DATA_HOME}` (Linux default `$HOME/.local/share`).
+    pub xdg_data_home: Option<PathBuf>,
+    /// `${XDG_CACHE_HOME}` (Linux default `$HOME/.cache`).
+    pub xdg_cache_home: Option<PathBuf>,
+    /// `%APPDATA%` (Windows roaming profile root).
+    pub appdata: Option<PathBuf>,
+    /// `%LOCALAPPDATA%` (Windows local profile root).
+    pub localappdata: Option<PathBuf>,
+    /// `%USERPROFILE%` — Windows `APPDATA` fallback root.
+    pub userprofile: Option<PathBuf>,
+}
+
+impl OsEnv {
+    /// Snapshot the real process environment.
+    fn from_env() -> Self {
+        let get = |key: &str| std::env::var_os(key).map(PathBuf::from);
+        Self {
+            home: get("HOME").or_else(|| get("USERPROFILE")),
+            xdg_data_home: get("XDG_DATA_HOME"),
+            xdg_cache_home: get("XDG_CACHE_HOME"),
+            appdata: get("APPDATA"),
+            localappdata: get("LOCALAPPDATA"),
+            userprofile: get("USERPROFILE"),
+        }
+    }
+}
+
+fn join(path: &Path, parts: &[&str]) -> PathBuf {
+    parts.iter().fold(path.to_path_buf(), |acc, part| acc.join(part))
+}
+
+/// Megu's own vanilla-JAR cache root (`versions/<id>/<id>.jar` under it).
+/// Where the bootstrap downloads land when no `--gameDir` was passed.
+pub fn megu_cache_dir(os: LauncherOs, env: &OsEnv) -> Option<PathBuf> {
+    match os {
+        LauncherOs::Linux => env
+            .xdg_cache_home
+            .clone()
+            .or_else(|| env.home.as_ref().map(|h| h.join(".cache")))
+            .map(|root| root.join("megu")),
+        LauncherOs::MacOs => env
+            .home
+            .as_ref()
+            .map(|h| join(h, &["Library", "Caches", "megu"])),
+        LauncherOs::Windows => env
+            .localappdata
+            .clone()
+            .or_else(|| {
+                env.userprofile
+                    .as_ref()
+                    .map(|u| join(u, &["AppData", "Local"]))
+            })
+            .map(|root| root.join("megu")),
+    }
+}
+
+/// Megu's own cache dir on this host (used as the bootstrap destination
+/// when no `--gameDir` was passed).
+pub fn default_vanilla_cache_dir() -> Option<PathBuf> {
+    megu_cache_dir(host_os(), &OsEnv::from_env())
+}
+
+/// Every on-disk location a client JAR for `version_ids` may already
+/// occupy, in priority order — the first readable ZIP wins:
+///
+/// 1. `<gameDir>/versions/<id>/<id>.jar` (explicit launcher root),
+/// 2. the Official Launcher's `.minecraft` (native + Flatpak),
+/// 3. PrismLauncher / Modrinth App library caches,
+/// 4. Megu's own cache dir (where the background bootstrap writes when
+///    no `--gameDir` was passed — always scanned so a previously fetched
+///    JAR is picked up regardless of how Megu was launched).
+///
+/// Pure function: every input is explicit, so Linux/macOS/Windows layouts
+/// are all covered by offline unit tests.
+pub fn candidate_vanilla_jar_paths_for_os(
+    os: LauncherOs,
+    env: &OsEnv,
+    game_dir: Option<&Path>,
+    version_ids: &[String],
+) -> Vec<PathBuf> {
+    let mut out = Vec::new();
+    for id in version_ids.iter().filter(|id| valid_version_id(id)) {
+        if let Some(game_dir) = game_dir {
+            out.push(join(
+                game_dir,
+                &["versions", id, &format!("{id}.jar")],
+            ));
+        }
+        match os {
+            LauncherOs::Linux => {
+                if let Some(home) = &env.home {
+                    out.push(join(
+                        home,
+                        &[".minecraft", "versions", id, &format!("{id}.jar")],
+                    ));
+                    out.push(join(
+                        home,
+                        &[
+                            ".var", "app", "com.mojang.Minecraft", ".minecraft", "versions",
+                            id, &format!("{id}.jar"),
+                        ],
+                    ));
+                    let data = env
+                        .xdg_data_home
+                        .clone()
+                        .unwrap_or_else(|| join(home, &[".local", "share"]));
+                    out.push(join(
+                        &data,
+                        &[
+                            "PrismLauncher", "libraries", "com", "mojang", "minecraft", id,
+                            &format!("minecraft-{id}-client.jar"),
+                        ],
+                    ));
+                    out.push(join(
+                        home,
+                        &[
+                            ".var", "app", "org.prismlauncher.PrismLauncher", "data",
+                            "PrismLauncher", "libraries", "com", "mojang", "minecraft", id,
+                            &format!("minecraft-{id}-client.jar"),
+                        ],
+                    ));
+                    out.push(join(
+                        &data,
+                        &["ModrinthApp", "meta", "versions", id, &format!("{id}.jar")],
+                    ));
+                }
+            }
+            LauncherOs::MacOs => {
+                if let Some(home) = &env.home {
+                    let app_support = join(home, &["Library", "Application Support"]);
+                    out.push(join(
+                        &app_support,
+                        &["minecraft", "versions", id, &format!("{id}.jar")],
+                    ));
+                    out.push(join(
+                        &app_support,
+                        &[
+                            "PrismLauncher", "libraries", "com", "mojang", "minecraft", id,
+                            &format!("minecraft-{id}-client.jar"),
+                        ],
+                    ));
+                    out.push(join(
+                        &app_support,
+                        &["ModrinthApp", "meta", "versions", id, &format!("{id}.jar")],
+                    ));
+                }
+            }
+            LauncherOs::Windows => {
+                let roaming = env
+                    .appdata
+                    .clone()
+                    .or_else(|| {
+                        env.userprofile
+                            .as_ref()
+                            .map(|u| join(u, &["AppData", "Roaming"]))
+                    });
+                if let Some(roaming) = &roaming {
+                    out.push(join(
+                        roaming,
+                        &[".minecraft", "versions", id, &format!("{id}.jar")],
+                    ));
+                    out.push(join(
+                        roaming,
+                        &[
+                            "PrismLauncher", "libraries", "com", "mojang", "minecraft", id,
+                            &format!("minecraft-{id}-client.jar"),
+                        ],
+                    ));
+                    out.push(join(
+                        roaming,
+                        &["ModrinthApp", "meta", "versions", id, &format!("{id}.jar")],
+                    ));
+                }
+            }
+        }
+        if let Some(cache) = megu_cache_dir(os, env) {
+            out.push(join(
+                &cache,
+                &["versions", id, &format!("{id}.jar")],
+            ));
+        }
+    }
+    out
+}
+
+/// Ordered local candidate list for a live session (real host OS + env).
+pub fn local_vanilla_jar_candidates(paths: &SessionPaths) -> Vec<PathBuf> {
+    candidate_vanilla_jar_paths_for_os(
+        host_os(),
+        &OsEnv::from_env(),
+        paths.game_dir.as_deref(),
+        &jar_version_ids(paths),
+    )
+}
+
+/// `true` when `path` is a regular readable file within
+/// [`MAX_ARCHIVE_BYTES`] that starts with ZIP magic `PK\x03\x04` — the
+/// cheap gate every candidate must pass before the reader trusts it.
+pub fn is_valid_jar_candidate(path: &Path) -> bool {
+    let Ok(meta) = std::fs::metadata(path) else {
+        return false;
+    };
+    if !meta.is_file() || meta.len() < 4 || meta.len() > MAX_ARCHIVE_BYTES {
+        return false;
+    }
+    let mut magic = [0u8; 4];
+    match std::fs::File::open(path).and_then(|mut f| f.read_exact(&mut magic)) {
+        Ok(()) => magic == ZIP_MAGIC,
+        Err(_) => false,
+    }
+}
+
+/// First local candidate that is a real, readable client JAR — scans the
+/// `<gameDir>` versions dir, Official/Prism/Modrinth launcher caches and
+/// Megu's own cache, so a user who already installed the same Minecraft
+/// version anywhere gets vanilla textures instantly.
+pub fn discover_local_vanilla_jar(paths: &SessionPaths) -> Option<PathBuf> {
+    local_vanilla_jar_candidates(paths)
+        .into_iter()
+        .find(|jar| is_valid_jar_candidate(jar))
+}
+
+/// The root a bootstrap download lands under (`versions/<id>/<id>.jar`
+/// inside it): the explicit `--gameDir` when passed — mirroring the
+/// layout every launcher already uses — else Megu's cache dir. `None`
+/// when no cache location resolves (e.g. no `HOME`).
+pub fn bootstrap_dest_dir(paths: &SessionPaths) -> Option<PathBuf> {
+    paths.game_dir.clone().or_else(default_vanilla_cache_dir)
+}
+
+// ---------------------------------------------------------------------------
+// Clean-room FIPS 180-4 SHA-1 (incremental, streaming download digest)
+// ---------------------------------------------------------------------------
+
+struct Sha1 {
+    state: [u32; 5],
+    block: [u8; 64],
+    block_len: usize,
+    total: u64,
+}
+
+impl Sha1 {
+    fn new() -> Self {
+        Self {
+            state: [0x6745_2301, 0xEFCD_AB89, 0x98BA_DCFE, 0x1032_5476, 0xC3D2_E1F0],
+            block: [0; 64],
+            block_len: 0,
+            total: 0,
+        }
+    }
+
+    fn compress(state: &mut [u32; 5], block: &[u8]) {
+        let mut w = [0u32; 80];
+        for (i, word) in w.iter_mut().take(16).enumerate() {
+            *word = u32::from_be_bytes([
+                block[i * 4],
+                block[i * 4 + 1],
+                block[i * 4 + 2],
+                block[i * 4 + 3],
+            ]);
+        }
+        for i in 16..80 {
+            w[i] = (w[i - 3] ^ w[i - 8] ^ w[i - 14] ^ w[i - 16]).rotate_left(1);
+        }
+        let [mut a, mut b, mut c, mut d, mut e] = *state;
+        for (i, word) in w.iter().enumerate() {
+            let (f, k) = match i {
+                0..=19 => ((b & c) | ((!b) & d), 0x5A82_7999),
+                20..=39 => (b ^ c ^ d, 0x6ED9_EBA1),
+                40..=59 => ((b & c) | (b & d) | (c & d), 0x8F1B_BCDC),
+                _ => (b ^ c ^ d, 0xCA62_C1D6),
+            };
+            let t = a
+                .rotate_left(5)
+                .wrapping_add(f)
+                .wrapping_add(e)
+                .wrapping_add(k)
+                .wrapping_add(*word);
+            e = d;
+            d = c;
+            c = b.rotate_left(30);
+            b = a;
+            a = t;
+        }
+        for (acc, v) in state.iter_mut().zip([a, b, c, d, e]) {
+            *acc = acc.wrapping_add(v);
+        }
+    }
+
+    fn update(&mut self, mut data: &[u8]) {
+        self.total = self.total.wrapping_add(data.len() as u64);
+        if self.block_len > 0 {
+            let take = (64 - self.block_len).min(data.len());
+            self.block[self.block_len..self.block_len + take].copy_from_slice(&data[..take]);
+            self.block_len += take;
+            data = &data[take..];
+            if self.block_len == 64 {
+                let block = self.block;
+                Self::compress(&mut self.state, &block);
+                self.block_len = 0;
+            }
+        }
+        while data.len() >= 64 {
+            Self::compress(&mut self.state, &data[..64]);
+            data = &data[64..];
+        }
+        if !data.is_empty() {
+            self.block[..data.len()].copy_from_slice(data);
+            self.block_len = data.len();
+        }
+    }
+
+    fn finish_hex(mut self) -> String {
+        let bit_len = self.total.wrapping_mul(8);
+        self.update(&[0x80]);
+        while self.block_len != 56 {
+            self.update(&[0]);
+        }
+        self.update(&bit_len.to_be_bytes());
+        let mut out = String::with_capacity(40);
+        for word in self.state {
+            out.push_str(&format!("{word:08x}"));
+        }
+        out
+    }
+}
+
+#[cfg(test)]
+fn sha1_hex(data: &[u8]) -> String {
+    let mut hasher = Sha1::new();
+    hasher.update(data);
+    hasher.finish_hex()
+}
+
+// ---------------------------------------------------------------------------
+// Bounded clean-room JSON reader (same style as client-port's model baker)
+// ---------------------------------------------------------------------------
+
+const MAX_JSON_DEPTH: usize = 32;
+
+enum Json {
+    Null,
+    Bool,
+    Num(f64),
+    Str(String),
+    Arr(Vec<Json>),
+    Obj(BTreeMap<String, Json>),
+}
+
+impl Json {
+    fn get(&self, key: &str) -> Option<&Json> {
+        match self {
+            Self::Obj(map) => map.get(key),
+            _ => None,
+        }
+    }
+
+    fn as_str(&self) -> Option<&str> {
+        match self {
+            Self::Str(s) => Some(s),
+            _ => None,
+        }
+    }
+
+    fn as_array(&self) -> Option<&[Json]> {
+        match self {
+            Self::Arr(items) => Some(items),
+            _ => None,
+        }
+    }
+
+    fn as_u64(&self) -> Option<u64> {
+        match self {
+            Self::Num(n) if n.is_finite() && *n >= 0.0 && n.fract() == 0.0 => Some(*n as u64),
+            _ => None,
+        }
+    }
+}
+
+struct JsonParser<'a> {
+    bytes: &'a [u8],
+    pos: usize,
+}
+
+impl<'a> JsonParser<'a> {
+    fn err(&self, message: &str) -> String {
+        format!("JSON error at byte {}: {message}", self.pos)
+    }
+
+    fn peek(&self) -> Option<u8> {
+        self.bytes.get(self.pos).copied()
+    }
+
+    fn skip_ws(&mut self) {
+        while matches!(self.peek(), Some(b' ' | b'\t' | b'\n' | b'\r')) {
+            self.pos += 1;
+        }
+    }
+
+    fn literal(&mut self, literal: &'static [u8], value: Json) -> Result<Json, String> {
+        if self.bytes[self.pos..].starts_with(literal) {
+            self.pos += literal.len();
+            Ok(value)
+        } else {
+            Err(self.err("expected a JSON value"))
+        }
+    }
+
+    fn value(&mut self, depth: usize) -> Result<Json, String> {
+        self.skip_ws();
+        match self.peek() {
+            None => Err(self.err("expected a JSON value")),
+            Some(b'{') => self.object(depth),
+            Some(b'[') => self.array(depth),
+            Some(b'"') => Ok(Json::Str(self.string()?)),
+            Some(b't') => self.literal(b"true", Json::Bool),
+            Some(b'f') => self.literal(b"false", Json::Bool),
+            Some(b'n') => self.literal(b"null", Json::Null),
+            Some(b'-' | b'0'..=b'9') => self.number(),
+            Some(_) => Err(self.err("expected a JSON value")),
+        }
+    }
+
+    fn container_open(&self, depth: usize) -> Result<(), String> {
+        if depth >= MAX_JSON_DEPTH {
+            return Err(self.err("JSON nesting too deep"));
+        }
+        Ok(())
+    }
+
+    fn object(&mut self, depth: usize) -> Result<Json, String> {
+        self.container_open(depth)?;
+        self.pos += 1; // '{'
+        let mut map = BTreeMap::new();
+        self.skip_ws();
+        if self.peek() == Some(b'}') {
+            self.pos += 1;
+            return Ok(Json::Obj(map));
+        }
+        loop {
+            self.skip_ws();
+            if self.peek() != Some(b'"') {
+                return Err(self.err("expected an object key"));
+            }
+            let key = self.string()?;
+            self.skip_ws();
+            if self.peek() != Some(b':') {
+                return Err(self.err("expected ':' after object key"));
+            }
+            self.pos += 1;
+            let value = self.value(depth + 1)?;
+            map.insert(key, value);
+            self.skip_ws();
+            match self.peek() {
+                Some(b',') => self.pos += 1,
+                Some(b'}') => {
+                    self.pos += 1;
+                    return Ok(Json::Obj(map));
+                }
+                _ => return Err(self.err("expected ',' or '}' in object")),
+            }
+        }
+    }
+
+    fn array(&mut self, depth: usize) -> Result<Json, String> {
+        self.container_open(depth)?;
+        self.pos += 1; // '['
+        let mut items = Vec::new();
+        self.skip_ws();
+        if self.peek() == Some(b']') {
+            self.pos += 1;
+            return Ok(Json::Arr(items));
+        }
+        loop {
+            items.push(self.value(depth + 1)?);
+            self.skip_ws();
+            match self.peek() {
+                Some(b',') => self.pos += 1,
+                Some(b']') => {
+                    self.pos += 1;
+                    return Ok(Json::Arr(items));
+                }
+                _ => return Err(self.err("expected ',' or ']' in array")),
+            }
+        }
+    }
+
+    fn string(&mut self) -> Result<String, String> {
+        self.pos += 1; // opening '"'
+        let mut out = String::new();
+        loop {
+            let run_start = self.pos;
+            while let Some(b) = self.peek() {
+                if b == b'"' || b == b'\\' || b < 0x20 {
+                    break;
+                }
+                self.pos += 1;
+            }
+            // `text` is already UTF-8; `"` `\` and control bytes can never
+            // appear inside a multi-byte sequence, so runs stay valid.
+            out.push_str(
+                std::str::from_utf8(&self.bytes[run_start..self.pos])
+                    .map_err(|_| self.err("invalid UTF-8 in string"))?,
+            );
+            match self.peek() {
+                None => return Err(self.err("unterminated string")),
+                Some(b'"') => {
+                    self.pos += 1;
+                    return Ok(out);
+                }
+                Some(b'\\') => {
+                    self.pos += 1;
+                    match self.peek() {
+                        Some(b'"') => out.push('"'),
+                        Some(b'\\') => out.push('\\'),
+                        Some(b'/') => out.push('/'),
+                        Some(b'b') => out.push('\u{0008}'),
+                        Some(b'f') => out.push('\u{000C}'),
+                        Some(b'n') => out.push('\n'),
+                        Some(b'r') => out.push('\r'),
+                        Some(b't') => out.push('\t'),
+                        Some(b'u') => {
+                            let cp = self.hex4()?;
+                            if (0xD800..0xDC00).contains(&cp) {
+                                // High surrogate: pair with a following \uXXXX.
+                                self.pos += 1;
+                                if self.peek() != Some(b'\\') {
+                                    return Err(self.err("unpaired surrogate in string"));
+                                }
+                                self.pos += 1;
+                                if self.peek() != Some(b'u') {
+                                    return Err(self.err("unpaired surrogate in string"));
+                                }
+                                let lo = self.hex4()?;
+                                if !(0xDC00..0xE000).contains(&lo) {
+                                    return Err(self.err("unpaired surrogate in string"));
+                                }
+                                let c = 0x10000 + ((cp - 0xD800) << 10) + (lo - 0xDC00);
+                                out.push(char::from_u32(c).unwrap_or('\u{FFFD}'));
+                                continue;
+                            }
+                            out.push(char::from_u32(cp).unwrap_or('\u{FFFD}'));
+                        }
+                        _ => return Err(self.err("invalid string escape")),
+                    }
+                    self.pos += 1;
+                }
+                Some(_) => return Err(self.err("unescaped control byte in string")),
+            }
+        }
+    }
+
+    fn hex4(&mut self) -> Result<u32, String> {
+        self.pos += 1; // 'u'
+        let mut value = 0u32;
+        for _ in 0..4 {
+            let digit = match self.peek() {
+                Some(b @ b'0'..=b'9') => u32::from(b - b'0'),
+                Some(b @ b'a'..=b'f') => u32::from(b - b'a') + 10,
+                Some(b @ b'A'..=b'F') => u32::from(b - b'A') + 10,
+                _ => return Err(self.err("invalid \\u escape")),
+            };
+            value = value * 16 + digit;
+            self.pos += 1;
+        }
+        Ok(value)
+    }
+
+    fn number(&mut self) -> Result<Json, String> {
+        let start = self.pos;
+        if self.peek() == Some(b'-') {
+            self.pos += 1;
+        }
+        while matches!(self.peek(), Some(b'0'..=b'9')) {
+            self.pos += 1;
+        }
+        if self.peek() == Some(b'.') {
+            self.pos += 1;
+            while matches!(self.peek(), Some(b'0'..=b'9')) {
+                self.pos += 1;
+            }
+        }
+        if matches!(self.peek(), Some(b'e' | b'E')) {
+            self.pos += 1;
+            if matches!(self.peek(), Some(b'+' | b'-')) {
+                self.pos += 1;
+            }
+            while matches!(self.peek(), Some(b'0'..=b'9')) {
+                self.pos += 1;
+            }
+        }
+        let text = std::str::from_utf8(&self.bytes[start..self.pos])
+            .map_err(|_| self.err("invalid number"))?;
+        text.parse::<f64>()
+            .map(Json::Num)
+            .map_err(|_| self.err("invalid number"))
+    }
+}
+
+fn parse_json(text: &str) -> Result<Json, String> {
+    if text.len() > MAX_MANIFEST_BYTES as usize {
+        return Err("JSON document exceeds size cap".to_owned());
+    }
+    let mut parser = JsonParser {
+        bytes: text.as_bytes(),
+        pos: 0,
+    };
+    let value = parser.value(0)?;
+    parser.skip_ws();
+    if parser.pos != text.len() {
+        return Err(parser.err("trailing bytes after JSON value"));
+    }
+    Ok(value)
+}
+
+// ---------------------------------------------------------------------------
+// Manifest chain parsing
+// ---------------------------------------------------------------------------
+
+/// `version_manifest_v2.json` -> the per-version metadata URL for
+/// `version_id`. The extracted URL is re-checked against the Mojang
+/// allowlist so a poisoned manifest can never redirect the fetch.
+fn manifest_version_url(manifest_text: &str, version_id: &str) -> Result<String, String> {
+    let manifest = parse_json(manifest_text)?;
+    let versions = manifest
+        .get("versions")
+        .and_then(Json::as_array)
+        .ok_or_else(|| "manifest has no versions array".to_owned())?;
+    for entry in versions {
+        if entry.get("id").and_then(Json::as_str) == Some(version_id) {
+            let url = entry
+                .get("url")
+                .and_then(Json::as_str)
+                .ok_or_else(|| format!("version {version_id:?} entry has no url"))?;
+            if !url_allowed(url) {
+                return Err(format!("version {version_id:?} url is not a Mojang host"));
+            }
+            return Ok(url.to_owned());
+        }
+    }
+    Err(format!("version {version_id:?} not in Mojang manifest"))
+}
+
+/// `downloads.client` fields needed for the verified download.
+struct ClientDownload {
+    url: String,
+    sha1: String,
+    size: u64,
+}
+
+/// Per-version metadata JSON -> `downloads.client.{url,sha1,size}` with
+/// every field range-checked and the URL allowlisted.
+fn client_download_info(version_text: &str) -> Result<ClientDownload, String> {
+    let json = parse_json(version_text)?;
+    let client = json
+        .get("downloads")
+        .and_then(|d| d.get("client"))
+        .ok_or_else(|| "version JSON has no downloads.client".to_owned())?;
+    let url = client
+        .get("url")
+        .and_then(Json::as_str)
+        .ok_or_else(|| "downloads.client has no url".to_owned())?;
+    if !url_allowed(url) {
+        return Err("client JAR url is not a Mojang host".to_owned());
+    }
+    let sha1 = client
+        .get("sha1")
+        .and_then(Json::as_str)
+        .ok_or_else(|| "downloads.client has no sha1".to_owned())?;
+    if sha1.len() != 40
+        || !sha1
+            .bytes()
+            .all(|b| b.is_ascii_digit() || matches!(b, b'a'..=b'f'))
+    {
+        return Err("downloads.client sha1 is not 40 lowercase hex".to_owned());
+    }
+    let size = client
+        .get("size")
+        .and_then(Json::as_u64)
+        .ok_or_else(|| "downloads.client has no size".to_owned())?;
+    if size == 0 || size > MAX_CLIENT_JAR_BYTES {
+        return Err(format!("client JAR size {size} outside 1..={MAX_CLIENT_JAR_BYTES}"));
+    }
+    Ok(ClientDownload {
+        url: url.to_owned(),
+        sha1: sha1.to_ascii_lowercase(),
+        size,
+    })
+}
+
+// ---------------------------------------------------------------------------
+// Download worker
+// ---------------------------------------------------------------------------
+
+fn http_agent() -> ureq::Agent {
+    ureq::Agent::config_builder()
+        .timeout_connect(Some(Duration::from_secs(15)))
+        .timeout_recv_response(Some(Duration::from_secs(15)))
+        // Body budget is a whole-body bound (ureq semantics): the ~26 MiB
+        // JAR on a slow link needs minutes, not the 15 s header budget.
+        .timeout_recv_body(Some(Duration::from_secs(600)))
+        .build()
+        .into()
+}
+
+/// Bounded GET -> UTF-8 body. Fails closed on non-allowlisted URLs and
+/// bodies past `cap`.
+fn fetch_text(agent: &ureq::Agent, url: &str, cap: u64) -> Result<String, String> {
+    if !url_allowed(url) {
+        return Err(format!("refusing non-Mojang URL {url}"));
+    }
+    let mut response = agent
+        .get(url)
+        .call()
+        .map_err(|e| format!("GET {url}: {e}"))?;
+    response
+        .body_mut()
+        .with_config()
+        .limit(cap)
+        .read_to_string()
+        .map_err(|e| format!("GET {url}: {e}"))
+}
+
+/// Stream `client.url` into `part` in 64 KiB chunks while hashing, then
+/// verify SHA-1 + ZIP magic and atomically rename to `jar`.
+fn download_and_verify(
+    agent: &ureq::Agent,
+    client: &ClientDownload,
+    part: &Path,
+    jar: &Path,
+    shared: &Mutex<BootstrapProgress>,
+) -> Result<(), String> {
+    let mut response = agent
+        .get(&client.url)
+        .call()
+        .map_err(|e| format!("GET {}: {e}", client.url))?;
+    let total = response.body().content_length().or(Some(client.size));
+    let mut file = std::fs::File::create(part)
+        .map_err(|e| format!("cannot create {}: {e}", part.display()))?;
+    let mut hasher = Sha1::new();
+    let mut magic = Vec::with_capacity(4);
+    let mut downloaded = 0u64;
+    let mut chunk = [0u8; DOWNLOAD_CHUNK];
+    let mut reader = response.body_mut().as_reader();
+    set_progress(shared, BootstrapProgress::Downloading { downloaded, total });
+    let result = loop {
+        match reader.read(&mut chunk) {
+            Ok(0) => break Ok(()),
+            Ok(n) => {
+                downloaded += n as u64;
+                if downloaded > MAX_CLIENT_JAR_BYTES {
+                    break Err(format!(
+                        "client JAR exceeds {MAX_CLIENT_JAR_BYTES}-byte cap"
+                    ));
+                }
+                if magic.len() < 4 {
+                    let take = (4 - magic.len()).min(n);
+                    magic.extend_from_slice(&chunk[..take]);
+                }
+                hasher.update(&chunk[..n]);
+                if let Err(e) = file.write_all(&chunk[..n]) {
+                    break Err(format!("write {}: {e}", part.display()));
+                }
+                set_progress(
+                    shared,
+                    BootstrapProgress::Downloading { downloaded, total },
+                );
+            }
+            Err(e) => break Err(format!("read {}: {e}", client.url)),
+        }
+    };
+    if let Err(reason) = result {
+        drop(file);
+        let _ = std::fs::remove_file(part);
+        return Err(reason);
+    }
+    if let Err(e) = file.sync_all() {
+        let _ = std::fs::remove_file(part);
+        return Err(format!("sync {}: {e}", part.display()));
+    }
+    drop(file);
+
+    set_progress(shared, BootstrapProgress::Verifying);
+    let fail = |reason: String| -> Result<(), String> {
+        let _ = std::fs::remove_file(part);
+        Err(reason)
+    };
+    if magic != ZIP_MAGIC {
+        return fail("downloaded file is not a ZIP archive".to_owned());
+    }
+    if downloaded != client.size {
+        return fail(format!(
+            "client JAR is {downloaded} bytes, manifest declared {}",
+            client.size
+        ));
+    }
+    let actual = hasher.finish_hex();
+    if actual != client.sha1 {
+        return fail(format!(
+            "SHA-1 mismatch: got {actual}, manifest declared {}",
+            client.sha1
+        ));
+    }
+    std::fs::rename(part, jar).map_err(|e| {
+        let _ = std::fs::remove_file(part);
+        format!("cannot install {}: {e}", jar.display())
+    })
+}
+
+fn bootstrap_run(
+    version_id: &str,
+    dest_root: &Path,
+    manifest_url: &str,
+    shared: &Mutex<BootstrapProgress>,
+) -> Result<PathBuf, String> {
+    let version_dir = dest_root.join("versions").join(version_id);
+    let jar = version_dir.join(format!("{version_id}.jar"));
+    // A JAR that appeared since discovery ran (another launcher, a
+    // previous successful fetch) already satisfies the requirement.
+    if is_valid_jar_candidate(&jar) {
+        return Ok(jar);
+    }
+    let agent = http_agent();
+    set_progress(shared, BootstrapProgress::FetchingManifest);
+    let manifest_text = fetch_text(&agent, manifest_url, MAX_MANIFEST_BYTES)?;
+    let version_url = manifest_version_url(&manifest_text, version_id)?;
+    let version_text = fetch_text(&agent, &version_url, MAX_VERSION_JSON_BYTES)?;
+    let client = client_download_info(&version_text)?;
+    std::fs::create_dir_all(&version_dir)
+        .map_err(|e| format!("cannot create {}: {e}", version_dir.display()))?;
+    let part = version_dir.join(format!("{version_id}.jar.part"));
+    download_and_verify(&agent, &client, &part, &jar, shared)?;
+    Ok(jar)
+}
+
+/// Spawn the manifest -> version JSON -> SHA-1-verified client JAR
+/// download chain on a daemon thread. Returns `None` for an unsafe
+/// `version_id` or a non-allowlisted manifest URL; progress is polled
+/// non-blockingly from the UI loop through the returned handle.
+#[doc(hidden)]
+pub fn spawn_vanilla_jar_bootstrap_with_manifest(
+    version_id: &str,
+    dest_game_dir: &Path,
+    manifest_url: &str,
+) -> Option<VanillaJarBootstrap> {
+    if !valid_version_id(version_id) || !url_allowed(manifest_url) {
+        return None;
+    }
+    let shared = Arc::new(Mutex::new(BootstrapProgress::FetchingManifest));
+    let worker_shared = Arc::clone(&shared);
+    let version = version_id.to_owned();
+    let dest = dest_game_dir.to_path_buf();
+    let url = manifest_url.to_owned();
+    std::thread::Builder::new()
+        .name("megu-vanilla-jar-bootstrap".to_owned())
+        .spawn(move || {
+            let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                bootstrap_run(&version, &dest, &url, &worker_shared)
+            }));
+            let outcome = match result {
+                Ok(Ok(jar)) => BootstrapProgress::Ready(jar),
+                Ok(Err(reason)) => BootstrapProgress::Failed(reason),
+                Err(_) => BootstrapProgress::Failed("download worker crashed".to_owned()),
+            };
+            set_progress(&worker_shared, outcome);
+        })
+        .ok()?;
+    Some(VanillaJarBootstrap { shared })
+}
+
+/// [`spawn_vanilla_jar_bootstrap_with_manifest`] pinned to the official
+/// Mojang version manifest.
+pub fn spawn_vanilla_jar_bootstrap(
+    version_id: &str,
+    dest_game_dir: &Path,
+) -> Option<VanillaJarBootstrap> {
+    spawn_vanilla_jar_bootstrap_with_manifest(version_id, dest_game_dir, VANILLA_MANIFEST_URL)
+}
+
+// ---------------------------------------------------------------------------
+// Tests — fully offline: candidate mapping is pure, SHA-1 uses published
+// vectors, and the download chain is served by a hermetic loopback
+// TcpListener. No test ever touches a real network host.
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::net::TcpListener;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    static NEXT_TEMP_DIR: AtomicUsize = AtomicUsize::new(0);
+
+    fn test_dir(label: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "megu-bootstrap-{label}-{}-{}",
+            std::process::id(),
+            NEXT_TEMP_DIR.fetch_add(1, Ordering::Relaxed),
+        ));
+        std::fs::create_dir_all(&dir).expect("test directory created");
+        dir
+    }
+
+    fn pb(s: &str) -> PathBuf {
+        PathBuf::from(s)
+    }
+
+    fn ids() -> Vec<String> {
+        vec!["1.21.1".to_owned()]
+    }
+
+    // -- candidate mapping -------------------------------------------------
+
+    #[test]
+    fn linux_candidates_cover_game_dir_official_flatpak_prism_modrinth_cache() {
+        let env = OsEnv {
+            home: Some(pb("/home/alice")),
+            ..OsEnv::default()
+        };
+        let out = candidate_vanilla_jar_paths_for_os(
+            LauncherOs::Linux,
+            &env,
+            Some(&pb("/games/mc")),
+            &ids(),
+        );
+        let strings: Vec<String> = out.iter().map(|p| p.display().to_string()).collect();
+        assert_eq!(strings[0], "/games/mc/versions/1.21.1/1.21.1.jar");
+        assert!(strings.contains(&"/home/alice/.minecraft/versions/1.21.1/1.21.1.jar".to_owned()));
+        assert!(strings.contains(
+            &"/home/alice/.var/app/com.mojang.Minecraft/.minecraft/versions/1.21.1/1.21.1.jar"
+                .to_owned()
+        ));
+        assert!(strings.contains(
+            &"/home/alice/.local/share/PrismLauncher/libraries/com/mojang/minecraft/1.21.1/minecraft-1.21.1-client.jar"
+                .to_owned()
+        ));
+        assert!(strings.contains(
+            &"/home/alice/.var/app/org.prismlauncher.PrismLauncher/data/PrismLauncher/libraries/com/mojang/minecraft/1.21.1/minecraft-1.21.1-client.jar"
+                .to_owned()
+        ));
+        assert!(strings.contains(
+            &"/home/alice/.local/share/ModrinthApp/meta/versions/1.21.1/1.21.1.jar".to_owned()
+        ));
+        assert!(strings.contains(&"/home/alice/.cache/megu/versions/1.21.1/1.21.1.jar".to_owned()));
+    }
+
+    #[test]
+    fn linux_candidates_honor_xdg_roots() {
+        let env = OsEnv {
+            home: Some(pb("/home/alice")),
+            xdg_data_home: Some(pb("/xdg/data")),
+            xdg_cache_home: Some(pb("/xdg/cache")),
+            ..OsEnv::default()
+        };
+        let out = candidate_vanilla_jar_paths_for_os(LauncherOs::Linux, &env, None, &ids());
+        let strings: Vec<String> = out.iter().map(|p| p.display().to_string()).collect();
+        assert!(strings.contains(
+            &"/xdg/data/PrismLauncher/libraries/com/mojang/minecraft/1.21.1/minecraft-1.21.1-client.jar"
+                .to_owned()
+        ));
+        assert!(strings.contains(
+            &"/xdg/data/ModrinthApp/meta/versions/1.21.1/1.21.1.jar".to_owned()
+        ));
+        assert!(strings.contains(&"/xdg/cache/megu/versions/1.21.1/1.21.1.jar".to_owned()));
+    }
+
+    #[test]
+    fn macos_candidates_cover_launcher_prism_modrinth_cache() {
+        let env = OsEnv {
+            home: Some(pb("/Users/alice")),
+            ..OsEnv::default()
+        };
+        let out = candidate_vanilla_jar_paths_for_os(LauncherOs::MacOs, &env, None, &ids());
+        let strings: Vec<String> = out.iter().map(|p| p.display().to_string()).collect();
+        assert!(strings.contains(
+            &"/Users/alice/Library/Application Support/minecraft/versions/1.21.1/1.21.1.jar"
+                .to_owned()
+        ));
+        assert!(strings.contains(
+            &"/Users/alice/Library/Application Support/PrismLauncher/libraries/com/mojang/minecraft/1.21.1/minecraft-1.21.1-client.jar"
+                .to_owned()
+        ));
+        assert!(strings.contains(
+            &"/Users/alice/Library/Application Support/ModrinthApp/meta/versions/1.21.1/1.21.1.jar"
+                .to_owned()
+        ));
+        assert!(strings.contains(
+            &"/Users/alice/Library/Caches/megu/versions/1.21.1/1.21.1.jar".to_owned()
+        ));
+    }
+
+    #[test]
+    fn windows_candidates_cover_appdata_prism_modrinth_localappdata() {
+        let roaming = pb(r"C:\Users\alice\AppData\Roaming");
+        let local = pb(r"C:\Users\alice\AppData\Local");
+        let env = OsEnv {
+            appdata: Some(roaming.clone()),
+            localappdata: Some(local.clone()),
+            userprofile: Some(pb(r"C:\Users\alice")),
+            ..OsEnv::default()
+        };
+        let out = candidate_vanilla_jar_paths_for_os(LauncherOs::Windows, &env, None, &ids());
+        // Path comparisons are component-wise, so these hold on every
+        // host that runs the suite (the env roots are opaque strings).
+        assert!(out.contains(&roaming.join(".minecraft/versions/1.21.1/1.21.1.jar")));
+        assert!(out.contains(&roaming.join(
+            "PrismLauncher/libraries/com/mojang/minecraft/1.21.1/minecraft-1.21.1-client.jar"
+        )));
+        assert!(out.contains(&roaming.join("ModrinthApp/meta/versions/1.21.1/1.21.1.jar")));
+        assert!(out.contains(&local.join("megu/versions/1.21.1/1.21.1.jar")));
+    }
+
+    #[test]
+    fn windows_candidates_fall_back_to_userprofile_when_appdata_unset() {
+        let profile = pb(r"C:\Users\alice");
+        let env = OsEnv {
+            userprofile: Some(profile.clone()),
+            ..OsEnv::default()
+        };
+        let out = candidate_vanilla_jar_paths_for_os(LauncherOs::Windows, &env, None, &ids());
+        assert!(out.contains(&profile.join(
+            "AppData/Roaming/.minecraft/versions/1.21.1/1.21.1.jar"
+        )));
+        assert!(out.contains(&profile.join("AppData/Local/megu/versions/1.21.1/1.21.1.jar")));
+    }
+
+    #[test]
+    fn unsafe_version_ids_never_enter_candidate_paths() {
+        let env = OsEnv {
+            home: Some(pb("/home/alice")),
+            ..OsEnv::default()
+        };
+        let out = candidate_vanilla_jar_paths_for_os(
+            LauncherOs::Linux,
+            &env,
+            Some(&pb("/games/mc")),
+            &[
+                "..".to_owned(),
+                "../escape".to_owned(),
+                "a/b".to_owned(),
+                String::new(),
+            ],
+        );
+        assert!(out.is_empty(), "unsafe ids produced paths: {out:?}");
+    }
+
+    #[test]
+    fn jar_candidate_requires_zip_magic_within_size_cap() {
+        let dir = test_dir("candidate");
+        let good = dir.join("good.jar");
+        std::fs::write(&good, b"PK\x03\x04rest").unwrap();
+        assert!(is_valid_jar_candidate(&good));
+        let bad = dir.join("bad.jar");
+        std::fs::write(&bad, b"not a zip").unwrap();
+        assert!(!is_valid_jar_candidate(&bad));
+        let empty = dir.join("empty.jar");
+        std::fs::write(&empty, b"").unwrap();
+        assert!(!is_valid_jar_candidate(&empty));
+        assert!(!is_valid_jar_candidate(&dir.join("missing.jar")));
+        assert!(!is_valid_jar_candidate(&dir)); // a directory, not a file
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn discover_local_finds_game_dir_jar_first() {
+        let dir = test_dir("discover");
+        let jar_dir = dir.join("versions").join("1.21.1");
+        std::fs::create_dir_all(&jar_dir).unwrap();
+        let jar = jar_dir.join("1.21.1.jar");
+        std::fs::write(&jar, b"PK\x03\x04jar").unwrap();
+        let paths = SessionPaths {
+            game_dir: Some(dir.clone()),
+            version_id: Some("1.21.1".to_owned()),
+            ..SessionPaths::default()
+        };
+        assert_eq!(discover_local_vanilla_jar(&paths).as_deref(), Some(jar.as_path()));
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    // -- SHA-1 -------------------------------------------------------------
+
+    #[test]
+    fn sha1_matches_published_fips_vectors() {
+        assert_eq!(sha1_hex(b""), "da39a3ee5e6b4b0d3255bfef95601890afd80709");
+        assert_eq!(sha1_hex(b"abc"), "a9993e364706816aba3e25717850c26c9cd0d89d");
+        assert_eq!(
+            sha1_hex(b"abcdbcdecdefdefgefghfghighijhijkijkljklmklmnlmnomnopnopq"),
+            "84983e441c3bd26ebaae4aa1f95129e5e54670f1"
+        );
+        // Multi-block stream boundary: 1,000,000 'a' exercised through
+        // incremental updates of varying sizes.
+        let input = vec![b'a'; 1_000_000];
+        let mut hasher = Sha1::new();
+        for chunk in input.chunks(63) {
+            hasher.update(chunk);
+        }
+        assert_eq!(hasher.finish_hex(), "34aa973cd4c4daa4f61eeb2bdbad27316534016f");
+    }
+
+    // -- URL allowlist -----------------------------------------------------
+
+    #[test]
+    fn mojang_https_hosts_allowed_everything_else_rejected() {
+        assert!(url_allowed(VANILLA_MANIFEST_URL));
+        assert!(url_allowed("https://piston-data.mojang.com/v1/objects/ab/cd/client.jar"));
+        assert!(url_allowed("https://launchermeta.mojang.com/v1/packages/x/1.21.1.json"));
+        assert!(!url_allowed("http://piston-meta.mojang.com/mc/game/version_manifest_v2.json"));
+        assert!(!url_allowed("https://piston-meta.mojang.com.evil.example/x"));
+        assert!(!url_allowed("https://evil.example/piston-meta.mojang.com/"));
+        assert!(!url_allowed("ftp://piston-meta.mojang.com/x"));
+        assert!(!url_allowed(""));
+        // Loopback is test-only (cfg(test) active here).
+        assert!(url_allowed("http://127.0.0.1:8080/manifest.json"));
+        assert!(url_allowed("http://localhost:8080/manifest.json"));
+    }
+
+    // -- manifest / version JSON parsing -----------------------------------
+
+    const MANIFEST: &str = r#"{
+        "latest": {"release": "1.21.1", "snapshot": "24w33a"},
+        "versions": [
+            {"id": "24w33a", "type": "snapshot", "url": "https://piston-meta.mojang.com/v1/packages/aaa/24w33a.json"},
+            {"id": "1.21.1", "type": "release", "url": "https://piston-meta.mojang.com/v1/packages/bbb/1.21.1.json"},
+            {"id": "1.20.4", "type": "release", "url": "https://piston-meta.mojang.com/v1/packages/ccc/1.20.4.json"}
+        ]
+    }"#;
+
+    #[test]
+    fn manifest_version_url_extracts_requested_release() {
+        assert_eq!(
+            manifest_version_url(MANIFEST, "1.21.1").unwrap(),
+            "https://piston-meta.mojang.com/v1/packages/bbb/1.21.1.json"
+        );
+        assert_eq!(
+            manifest_version_url(MANIFEST, "24w33a").unwrap(),
+            "https://piston-meta.mojang.com/v1/packages/aaa/24w33a.json"
+        );
+    }
+
+    #[test]
+    fn manifest_version_url_fails_closed() {
+        assert!(manifest_version_url(MANIFEST, "9.9.9").is_err());
+        assert!(manifest_version_url("not json", "1.21.1").is_err());
+        assert!(manifest_version_url("{}", "1.21.1").is_err());
+        // A poisoned manifest redirecting off the allowlist is rejected.
+        let evil = MANIFEST.replace(
+            "https://piston-meta.mojang.com/v1/packages/bbb/1.21.1.json",
+            "https://evil.example/1.21.1.json",
+        );
+        assert!(manifest_version_url(&evil, "1.21.1").is_err());
+        let http = MANIFEST.replace(
+            "https://piston-meta.mojang.com/v1/packages/bbb/1.21.1.json",
+            "http://piston-meta.mojang.com/v1/packages/bbb/1.21.1.json",
+        );
+        assert!(manifest_version_url(&http, "1.21.1").is_err());
+    }
+
+    fn version_json(url: &str, sha1: &str, size: u64) -> String {
+        format!(
+            r#"{{"id":"1.21.1","downloads":{{"client":{{"sha1":"{sha1}","size":{size},"url":"{url}"}},"server":{{"sha1":"{}","size":1,"url":"{url}"}}}}}}"#,
+            "0".repeat(40)
+        )
+    }
+
+    #[test]
+    fn client_download_info_extracts_and_validates() {
+        let jar_url = "https://piston-data.mojang.com/v1/objects/aabbcc/client.jar";
+        let info = client_download_info(&version_json(jar_url, &"a".repeat(40), 26_000_000))
+            .unwrap();
+        assert_eq!(info.url, jar_url);
+        assert_eq!(info.sha1, "a".repeat(40));
+        assert_eq!(info.size, 26_000_000);
+    }
+
+    #[test]
+    fn client_download_info_fails_closed() {
+        let jar_url = "https://piston-data.mojang.com/v1/objects/aabbcc/client.jar";
+        // Wrong host.
+        assert!(client_download_info(&version_json(
+            "https://evil.example/client.jar",
+            &"a".repeat(40),
+            1_000
+        ))
+        .is_err());
+        // Malformed sha1.
+        assert!(client_download_info(&version_json(jar_url, "xyz", 1_000)).is_err());
+        assert!(client_download_info(&version_json(jar_url, &"A".repeat(40), 1_000)).is_err());
+        // Oversized / zero / missing size.
+        assert!(client_download_info(&version_json(
+            jar_url,
+            &"a".repeat(40),
+            MAX_CLIENT_JAR_BYTES + 1
+        ))
+        .is_err());
+        assert!(client_download_info(&version_json(jar_url, &"a".repeat(40), 0)).is_err());
+        assert!(client_download_info(r#"{"downloads":{"other":{}}}"#).is_err());
+        assert!(client_download_info("{}").is_err());
+    }
+
+    // -- hermetic end-to-end ------------------------------------------------
+
+    /// Minimal stored-ZIP writer (same shape vanilla_jar's tests carry).
+    fn stored_zip(entries: &[(&str, &[u8])]) -> Vec<u8> {
+        let mut out = Vec::new();
+        let mut central = Vec::new();
+        for (name, data) in entries {
+            let lh_off = out.len() as u32;
+            out.extend_from_slice(&0x0403_4b50u32.to_le_bytes());
+            out.extend_from_slice(&20u16.to_le_bytes());
+            out.extend_from_slice(&0u16.to_le_bytes());
+            out.extend_from_slice(&0u16.to_le_bytes());
+            out.extend_from_slice(&0u16.to_le_bytes());
+            out.extend_from_slice(&0u16.to_le_bytes());
+            out.extend_from_slice(&0u32.to_le_bytes());
+            out.extend_from_slice(&(data.len() as u32).to_le_bytes());
+            out.extend_from_slice(&(data.len() as u32).to_le_bytes());
+            out.extend_from_slice(&(name.len() as u16).to_le_bytes());
+            out.extend_from_slice(&0u16.to_le_bytes());
+            out.extend_from_slice(name.as_bytes());
+            out.extend_from_slice(data);
+
+            central.extend_from_slice(&0x0201_4b50u32.to_le_bytes());
+            central.extend_from_slice(&20u16.to_le_bytes());
+            central.extend_from_slice(&20u16.to_le_bytes());
+            central.extend_from_slice(&0u16.to_le_bytes());
+            central.extend_from_slice(&0u16.to_le_bytes());
+            central.extend_from_slice(&0u16.to_le_bytes());
+            central.extend_from_slice(&0u16.to_le_bytes());
+            central.extend_from_slice(&0u32.to_le_bytes());
+            central.extend_from_slice(&(data.len() as u32).to_le_bytes());
+            central.extend_from_slice(&(data.len() as u32).to_le_bytes());
+            central.extend_from_slice(&(name.len() as u16).to_le_bytes());
+            central.extend_from_slice(&0u16.to_le_bytes());
+            central.extend_from_slice(&0u16.to_le_bytes());
+            central.extend_from_slice(&0u16.to_le_bytes());
+            central.extend_from_slice(&0u16.to_le_bytes());
+            central.extend_from_slice(&lh_off.to_le_bytes());
+            central.extend_from_slice(name.as_bytes());
+        }
+        let cd_offset = out.len() as u32;
+        out.extend_from_slice(&central);
+        out.extend_from_slice(&0x0605_4b50u32.to_le_bytes());
+        out.extend_from_slice(&0u16.to_le_bytes());
+        out.extend_from_slice(&0u16.to_le_bytes());
+        out.extend_from_slice(&(entries.len() as u16).to_le_bytes());
+        out.extend_from_slice(&(entries.len() as u16).to_le_bytes());
+        out.extend_from_slice(&(central.len() as u32).to_le_bytes());
+        out.extend_from_slice(&cd_offset.to_le_bytes());
+        out.extend_from_slice(&0u16.to_le_bytes());
+        out
+    }
+
+    /// One loopback HTTP/1.0 exchange per connection: read the request
+    /// head, dispatch on the path, write a Content-Length response.
+    /// `body_delay` stalls the jar body write so the client observably
+    /// sits in `Downloading` for a deterministic window.
+    fn serve_once(
+        listener: &TcpListener,
+        body_delay: Duration,
+        respond: impl Fn(&str) -> (u16, Vec<u8>),
+    ) {
+        for stream in listener.incoming() {
+            let mut stream = match stream {
+                Ok(s) => s,
+                Err(_) => return,
+            };
+            let mut head = Vec::new();
+            let mut byte = [0u8; 1];
+            loop {
+                match stream.read(&mut byte) {
+                    Ok(0) | Err(_) => return,
+                    Ok(_) => {
+                        head.push(byte[0]);
+                        if head.ends_with(b"\r\n\r\n") {
+                            break;
+                        }
+                        if head.len() > 16 * 1024 {
+                            return;
+                        }
+                    }
+                }
+            }
+            let request = String::from_utf8_lossy(&head);
+            let path = request
+                .split_whitespace()
+                .nth(1)
+                .unwrap_or("/")
+                .to_owned();
+            let (status, body) = respond(&path);
+            let reason = if status == 200 { "OK" } else { "Not Found" };
+            let response = format!(
+                "HTTP/1.0 {status} {reason}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                body.len()
+            );
+            if stream.write_all(response.as_bytes()).is_err() {
+                return;
+            }
+            if !body_delay.is_zero() {
+                std::thread::sleep(body_delay);
+            }
+            if stream.write_all(&body).is_err() {
+                return;
+            }
+        }
+    }
+
+    /// Spin up a loopback server serving manifest -> version JSON -> JAR.
+    /// Returns the manifest URL.
+    fn mock_mojang_server(
+        jar_bytes: Vec<u8>,
+        served_sha1: String,
+        jar_body_delay: Duration,
+    ) -> String {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind loopback");
+        let port = listener.local_addr().unwrap().port();
+        let base = format!("http://127.0.0.1:{port}");
+        let manifest_url = format!("{base}/version_manifest_v2.json");
+        let version_url = format!("{base}/1.21.1.json");
+        let jar_url = format!("{base}/client.jar");
+        let manifest = MANIFEST.replace(
+            "https://piston-meta.mojang.com/v1/packages/bbb/1.21.1.json",
+            &version_url,
+        );
+        let version = version_json(&jar_url, &served_sha1, jar_bytes.len() as u64);
+        std::thread::spawn(move || {
+            serve_once(&listener, jar_body_delay, move |path| match path {
+                "/version_manifest_v2.json" => (200, manifest.clone().into_bytes()),
+                "/1.21.1.json" => (200, version.clone().into_bytes()),
+                "/client.jar" => (200, jar_bytes.clone()),
+                _ => (404, b"nope".to_vec()),
+            });
+        });
+        manifest_url
+    }
+
+    fn await_terminal(handle: &VanillaJarBootstrap) -> BootstrapProgress {
+        for _ in 0..2_000 {
+            let progress = handle.progress();
+            if progress.is_terminal() {
+                return progress;
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        panic!("bootstrap did not reach a terminal state")
+    }
+
+    #[test]
+    fn bootstrap_downloads_verifies_and_installs_jar() {
+        let jar_bytes = stored_zip(&[
+            ("assets/minecraft/textures/block/stone.png", b"PNG".as_slice()),
+            ("META-INF/MANIFEST.MF", b"MF".as_slice()),
+        ]);
+        // The jar body is delayed so the client observably parks in
+        // `Downloading` — the transition sequence is part of the contract.
+        let manifest_url = mock_mojang_server(
+            jar_bytes.clone(),
+            sha1_hex(&jar_bytes),
+            Duration::from_millis(300),
+        );
+        let dest = test_dir("e2e-ok");
+        let handle =
+            spawn_vanilla_jar_bootstrap_with_manifest("1.21.1", &dest, &manifest_url).unwrap();
+        let mut saw_fetching = false;
+        let mut saw_downloading = false;
+        let ready = loop {
+            match handle.progress() {
+                BootstrapProgress::FetchingManifest => saw_fetching = true,
+                BootstrapProgress::Downloading { .. } => saw_downloading = true,
+                BootstrapProgress::Verifying => {}
+                terminal => break terminal,
+            }
+            std::thread::sleep(Duration::from_millis(2));
+        };
+        match ready {
+            BootstrapProgress::Ready(jar) => {
+                let expected = dest.join("versions/1.21.1/1.21.1.jar");
+                assert_eq!(jar, expected);
+                assert!(expected.is_file());
+                assert!(!dest.join("versions/1.21.1/1.21.1.jar.part").exists());
+                assert_eq!(std::fs::read(&expected).unwrap(), jar_bytes);
+                assert!(is_valid_jar_candidate(&expected));
+                // Discovery now resolves the downloaded JAR.
+                let paths = SessionPaths {
+                    game_dir: Some(dest.clone()),
+                    version_id: Some("1.21.1".to_owned()),
+                    ..SessionPaths::default()
+                };
+                assert_eq!(
+                    discover_local_vanilla_jar(&paths).as_deref(),
+                    Some(expected.as_path())
+                );
+            }
+            other => panic!("bootstrap failed: {other:?}"),
+        }
+        assert!(saw_fetching || saw_downloading, "no in-flight progress observed");
+        assert!(saw_downloading, "Downloading state never observed");
+        std::fs::remove_dir_all(&dest).unwrap();
+    }
+
+    #[test]
+    fn bootstrap_sha1_mismatch_fails_closed_and_cleans_part() {
+        let jar_bytes = stored_zip(&[("assets/x/y.png", b"Y".as_slice())]);
+        let manifest_url = mock_mojang_server(jar_bytes, "0".repeat(40), Duration::ZERO);
+        let dest = test_dir("e2e-bad-sha");
+        let handle =
+            spawn_vanilla_jar_bootstrap_with_manifest("1.21.1", &dest, &manifest_url).unwrap();
+        match await_terminal(&handle) {
+            BootstrapProgress::Failed(reason) => {
+                assert!(reason.contains("SHA-1"), "unexpected failure: {reason}");
+            }
+            other => panic!("expected Failed, got {other:?}"),
+        }
+        let version_dir = dest.join("versions/1.21.1");
+        assert!(!version_dir.join("1.21.1.jar").exists());
+        assert!(!version_dir.join("1.21.1.jar.part").exists());
+        std::fs::remove_dir_all(&dest).unwrap();
+    }
+
+    #[test]
+    fn bootstrap_reports_manifest_failures_cleanly() {
+        // Loopback server that 404s every path: the failure is a clean
+        // status reason, not a hang or panic.
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        std::thread::spawn(move || {
+            serve_once(&listener, Duration::ZERO, |_| (404, b"nope".to_vec()));
+        });
+        let dest = test_dir("e2e-404");
+        let handle = spawn_vanilla_jar_bootstrap_with_manifest(
+            "1.21.1",
+            &dest,
+            &format!("http://127.0.0.1:{port}/manifest.json"),
+        )
+        .unwrap();
+        match await_terminal(&handle) {
+            BootstrapProgress::Failed(_) => {}
+            other => panic!("expected Failed, got {other:?}"),
+        }
+        std::fs::remove_dir_all(&dest).unwrap();
+    }
+
+    #[test]
+    fn spawn_rejects_unsafe_inputs() {
+        let dest = test_dir("spawn-guard");
+        assert!(spawn_vanilla_jar_bootstrap("../x", &dest).is_none());
+        assert!(spawn_vanilla_jar_bootstrap("", &dest).is_none());
+        assert!(spawn_vanilla_jar_bootstrap_with_manifest(
+            "1.21.1",
+            &dest,
+            "https://evil.example/manifest.json"
+        )
+        .is_none());
+        std::fs::remove_dir_all(&dest).unwrap();
+    }
+
+    #[test]
+    fn progress_labels_track_the_download() {
+        assert_eq!(
+            bootstrap_progress_label("1.21.1", &BootstrapProgress::FetchingManifest).unwrap(),
+            "Fetching Minecraft 1.21.1 download manifest..."
+        );
+        let line = bootstrap_progress_label(
+            "1.21.1",
+            &BootstrapProgress::Downloading {
+                downloaded: 11 * 1024 * 1024,
+                total: Some(26 * 1024 * 1024),
+            },
+        )
+        .unwrap();
+        assert!(line.contains("Downloading Minecraft 1.21.1 assets"), "{line}");
+        assert!(line.contains('%'), "{line}");
+        assert!(line.contains("MB"), "{line}");
+        assert_eq!(
+            bootstrap_progress_label("1.21.1", &BootstrapProgress::Verifying).unwrap(),
+            "Verifying Minecraft 1.21.1 assets..."
+        );
+        assert!(bootstrap_progress_label("1.21.1", &BootstrapProgress::Ready(pb("/x"))).is_none());
+        assert!(
+            bootstrap_progress_label("1.21.1", &BootstrapProgress::Failed("x".to_owned())).is_none()
+        );
+    }
+}

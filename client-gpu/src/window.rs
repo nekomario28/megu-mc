@@ -611,6 +611,19 @@ pub struct GpuApp {
     friend_host: Option<FriendHostSession>,
     /// Friend-relay guest bridge while joined through an invite code.
     friend_bridge: Option<FriendGuestBridge>,
+    /// Background vanilla client-JAR bootstrap (manifest fetch +
+    /// SHA-1-verified download) spawned at boot when no local JAR was
+    /// found; polled non-blockingly from the event loop.
+    vanilla_bootstrap: Option<crate::vanilla_bootstrap::VanillaJarBootstrap>,
+    /// `true` once the bootstrap was spawned (or deliberately skipped) so
+    /// a `Failed` download is not retried on every surface re-creation.
+    bootstrap_attempted: bool,
+    /// Version id the bootstrap targets — progress/status text.
+    bootstrap_version: String,
+    /// The exact progress line this app last placed in
+    /// `ui.title_status`, so a real `status_line` message is never
+    /// overwritten by download progress.
+    bootstrap_banner: Option<String>,
     /// Last live `title_revision` applied to `ui.hud.title_overlay`.
     title_seen_rev: u64,
     /// Fractional-tick accumulator driving `TitleOverlayState::tick` at 20/s.
@@ -831,6 +844,10 @@ impl GpuApp {
             singleplayer_server,
             friend_host: None,
             friend_bridge: None,
+            vanilla_bootstrap: None,
+            bootstrap_attempted: false,
+            bootstrap_version: String::new(),
+            bootstrap_banner: None,
             title_seen_rev: 0,
             title_tick_accum: 0.0,
             ui,
@@ -903,6 +920,82 @@ impl GpuApp {
         app.apply_settings(&boot_settings);
         app.refresh_singleplayer_worlds();
         app
+    }
+
+    /// Non-blocking poll of the background vanilla-JAR bootstrap, called
+    /// once per event-loop turn from `about_to_wait`. In-flight progress
+    /// rides `ui.title_status` only while that banner still shows OUR
+    /// bootstrap text — a real `status_line` message always wins. On
+    /// `Ready` the texture layers + title branding hot-reload seamlessly;
+    /// on `Failed` a clean, actionable status line replaces the banner —
+    /// the user is never told to run `megu-installer` by hand.
+    fn poll_vanilla_bootstrap(&mut self) {
+        let Some(progress) = self
+            .vanilla_bootstrap
+            .as_ref()
+            .map(crate::vanilla_bootstrap::VanillaJarBootstrap::progress)
+        else {
+            return;
+        };
+        use crate::vanilla_bootstrap::BootstrapProgress as P;
+        match progress {
+            P::Ready(jar) => {
+                self.vanilla_bootstrap = None;
+                let version = std::mem::take(&mut self.bootstrap_version);
+                // Same source resolution as boot: branding reload picks up
+                // the real `minecraft.png`/`edition.png`/splash pool.
+                let (_, mod_jars) = title_branding_sources(&self.session_paths);
+                self.title_branding =
+                    crate::title_branding::load_title_branding_from_jar(&jar, &mod_jars);
+                if let Some(active) = self.active.as_mut() {
+                    if self.title_branding.has_banner() {
+                        active.renderer.set_title_branding(
+                            self.title_branding.logo.as_ref(),
+                            self.title_branding.edition.as_ref(),
+                        );
+                    }
+                }
+                // Re-arm asset discovery: the JAR now sits inside the
+                // candidate set, so the next bundle pass picks up the
+                // vanilla textures and re-uploads the atlas seamlessly.
+                if let Some(live) = &mut self.live {
+                    live.refresh_asset_layers();
+                }
+                if self.ui.title_status.as_deref() == self.bootstrap_banner.as_deref() {
+                    self.ui.title_status = None;
+                }
+                self.bootstrap_banner = None;
+                self.status_line(format!(
+                    "Minecraft {version} assets ready — vanilla textures loaded"
+                ));
+            }
+            P::Failed(reason) => {
+                self.vanilla_bootstrap = None;
+                let version = std::mem::take(&mut self.bootstrap_version);
+                if self.ui.title_status.as_deref() == self.bootstrap_banner.as_deref() {
+                    self.ui.title_status = None;
+                }
+                self.bootstrap_banner = None;
+                self.status_line(format!(
+                    "Offline: could not auto-download {version} assets ({reason}). \
+                     Connect to the internet and restart, or pass --gameDir."
+                ));
+            }
+            _ => {
+                let Some(line) = crate::vanilla_bootstrap::bootstrap_progress_label(
+                    &self.bootstrap_version,
+                    &progress,
+                ) else {
+                    return;
+                };
+                if self.ui.title_status.is_none()
+                    || self.ui.title_status.as_deref() == self.bootstrap_banner.as_deref()
+                {
+                    self.ui.title_status = Some(line.clone());
+                    self.bootstrap_banner = Some(line);
+                }
+            }
+        }
     }
 
     /// The fatal setup error, if `resumed` hit one (`run` reports it).
@@ -2032,6 +2125,62 @@ impl GpuApp {
             .surface
             .configure(&active.renderer.gpu().device, &config);
         self.baseline_upload_budget = Some(active.renderer.upload_budget().clone());
+        // Zero-manual-step vanilla JAR bootstrap — kept in `init_gpu`
+        // (the real window path) rather than `GpuApp::new` so headless
+        // construction never scans host launcher dirs or hits the
+        // network. Step 1: an Official/Prism/Modrinth install of the
+        // same version (or Megu's own bootstrap cache) can satisfy
+        // branding and textures with no download at all. Step 2: still
+        // no client JAR anywhere -> manifest fetch + SHA-1 download in
+        // the background, like Paper/NeoForge; `poll_vanilla_bootstrap`
+        // hot-reloads textures + branding on `Ready`. Skipped while a
+        // bootstrap is already running, and attempted only once per
+        // process so a failed download isn't retried on every surface
+        // re-creation.
+        if self.vanilla_bootstrap.is_none() {
+            let local_jar =
+                crate::vanilla_bootstrap::discover_local_vanilla_jar(&self.session_paths);
+            match local_jar {
+                Some(jar) => {
+                    if !self.title_branding.has_banner() {
+                        let (_, mod_jars) = title_branding_sources(&self.session_paths);
+                        self.title_branding =
+                            crate::title_branding::load_title_branding_from_jar(
+                                &jar, &mod_jars,
+                            );
+                    }
+                    self.bootstrap_attempted = true;
+                }
+                None if !self.bootstrap_attempted => {
+                    self.bootstrap_attempted = true;
+                    if crate::vanilla_bootstrap::auto_fetch_enabled() {
+                        if let Some(version_id) =
+                            crate::live_session::jar_version_ids(&self.session_paths)
+                                .last()
+                                .cloned()
+                        {
+                            if let Some(dest) = crate::vanilla_bootstrap::bootstrap_dest_dir(
+                                &self.session_paths,
+                            ) {
+                                if let Some(handle) =
+                                    crate::vanilla_bootstrap::spawn_vanilla_jar_bootstrap(
+                                        &version_id,
+                                        &dest,
+                                    )
+                                {
+                                    self.status_line(format!(
+                                        "Downloading Minecraft {version_id} assets in the background..."
+                                    ));
+                                    self.bootstrap_version = version_id;
+                                    self.vanilla_bootstrap = Some(handle);
+                                }
+                            }
+                        }
+                    }
+                }
+                None => {}
+            }
+        }
         // One-time PCIe upload of the runtime `MEGU EDITION` banner
         // textures (wordmark + patched edition strip); the CPU copies
         // stay resident in `title_branding` for a later surface loss.
@@ -3880,6 +4029,10 @@ impl ApplicationHandler for GpuApp {
             event_loop.exit();
             return;
         }
+        // Vanilla-JAR bootstrap poll is cheap and non-blocking; it runs
+        // even while occluded so a download finishing in the background
+        // still lands `Ready` and re-arms asset discovery.
+        self.poll_vanilla_bootstrap();
         if self.occluded
             && std::env::var_os("MEGU_DISABLE_OCCLUSION_SLEEP").is_none()
         {

@@ -23,6 +23,7 @@ pub mod recipe_ingest;
 pub mod renderer;
 pub mod subworld_render;
 pub mod title_branding;
+pub mod vanilla_bootstrap;
 pub mod vanilla_jar;
 pub mod window;
 

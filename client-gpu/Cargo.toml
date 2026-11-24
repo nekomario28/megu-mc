@@ -40,6 +40,10 @@ megu_proto = { package = "megu-proto", path = "../proto" }
 megu_ui = { package = "megu-client-ui", path = "../client-ui" }
 bytemuck = { version = "1.25", features = ["derive"] }
 pollster = "0.4"
+# Vanilla client-JAR bootstrap: Mojang manifest fetch + SHA-1-verified
+# download over pure-Rust rustls — identical on Linux/macOS/Windows, zero
+# OpenSSL anywhere in the graph. Version/features match the root crate.
+ureq = { version = "3.4.2", features = ["rustls"] }
 # Pure-wgpu policy: no OpenGL/GLES/EGL/WGL anywhere in the dependency graph.
 # Each OS compiles only its native primary backend(s), so `glow`,
 # `khronos-egl` and `glutin_wgl_sys` never enter the build.
