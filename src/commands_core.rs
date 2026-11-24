@@ -5714,7 +5714,7 @@ fn command_usage(name: &str) -> String {
         "locate" => "/locate structure|biome|poi <id>",
         "loot" => "/loot spawn|give|insert|replace <target> <source>",
         "me" => "/me <action>",
-        "megu" => "/megu policy list|get <key>|set <key> <value>|reset|audit [player] [radius]|rollback <player> <radius> [max_blocks]|claim here|unclaim|trust <player>|untrust <player>|info|admin-unclaim|spawn-radius <n>|backup plan|status|metrics|mod add|remove|list|snapshot|restart",
+        "megu" => "/megu policy list|get <key>|set <key> <value>|reset|audit [player] [radius]|rollback <player> <radius> [max_blocks]|claim here|unclaim|trust <player>|untrust <player>|info|admin-unclaim|spawn-radius <n>|backup plan|status|metrics|mod add|remove|list|snapshot|restart|shadowlight [on|off|status]",
         "msg" | "tell" | "w" => "/msg <player> <message>",
         "op" => "/op <player>",
         "pardon" => "/pardon <player>",
@@ -8405,9 +8405,37 @@ fn run_megu_mod_command(level: u8, args: &[&str]) -> String {
     }
 }
 
+/// `/megu shadowlight [on|off|status]` — the live operator toggle for the
+/// directional shadow gameplay lane (mob spawning, undead sunlight burn,
+/// crop growth, dynamic lights). It flips the `server_config` atomic the
+/// probes read, so no reboot is needed; OFF restores strict Vanilla 1.21.1
+/// light behavior. Bare `/megu shadowlight` reports the current state.
+fn run_megu_shadowlight_command(args: &[&str]) -> String {
+    match args.first().copied().unwrap_or("status") {
+        "on" | "true" => {
+            directional_shadow_light_set(true);
+            "Directional shadow light gameplay ENABLED (mob spawning, undead sunlight burn, crop growth, dynamic lights)".into()
+        }
+        "off" | "false" => {
+            directional_shadow_light_set(false);
+            "Directional shadow light gameplay DISABLED (strict Vanilla 1.21.1 light behavior)".into()
+        }
+        "status" => format!(
+            "Directional shadow light gameplay is {}",
+            if directional_shadow_light_enabled() {
+                "enabled"
+            } else {
+                "disabled"
+            }
+        ),
+        other => format!("unknown shadowlight argument '{other}'; usage: /megu shadowlight [on|off|status]"),
+    }
+}
+
 /// The OPS-ADMIN-BUILTIN `/megu` root with the ADMIN-WIRE subcommands wired in:
-/// `mod`, `status`, `snapshot`, `restart`. A Survival Moderator (level < 4)
-/// reaches only the read-only `audit` and `status` its allowlist granted.
+/// `mod`, `status`, `snapshot`, `restart`, `shadowlight`. A Survival Moderator
+/// (level < 4) reaches only the read-only `audit` and `status` its allowlist
+/// granted.
 fn run_megu_command_admin_wired(
     ctx: &CmdCtx,
     level: u8,
@@ -8423,6 +8451,12 @@ fn run_megu_command_admin_wired(
     }
     match args.first().copied() {
         Some("mod") => run_megu_mod_command(level, &args[1..]),
+        Some("shadowlight") => {
+            if level < 4 {
+                return P8C_DENIED.into();
+            }
+            run_megu_shadowlight_command(&args[1..])
+        }
         Some("status") => {
             if level < 4 {
                 P8C_DENIED.into()
@@ -12269,6 +12303,38 @@ mod admin_wire_tests {
         assert!(reply.contains("TPS:"), "{reply}");
         assert!(reply.contains("MSPT"), "{reply}");
         assert!(reply.contains("Survival mods:"), "{reply}");
+    }
+
+    /// `/megu shadowlight` flips the live directional-shadow atomic and
+    /// restores the boot value afterwards.
+    #[test]
+    fn megu_shadowlight_toggles_and_reports() {
+        let _guard = world_guard();
+        let prior = directional_shadow_light_enabled();
+        let ctx = aw_ctx(None);
+
+        let reply = run_command_ctx(&ctx, "/megu shadowlight on", &mut None);
+        assert!(reply.contains("ENABLED"), "{reply}");
+        assert!(directional_shadow_light_enabled());
+
+        let reply = run_command_ctx(&ctx, "/megu shadowlight true", &mut None);
+        assert!(reply.contains("ENABLED"), "{reply}");
+        assert!(directional_shadow_light_enabled());
+
+        let reply = run_command_ctx(&ctx, "/megu shadowlight status", &mut None);
+        assert!(reply.contains("is enabled"), "{reply}");
+
+        let reply = run_command_ctx(&ctx, "/megu shadowlight off", &mut None);
+        assert!(reply.contains("DISABLED"), "{reply}");
+        assert!(!directional_shadow_light_enabled());
+
+        let reply = run_command_ctx(&ctx, "/megu shadowlight false", &mut None);
+        assert!(reply.contains("DISABLED"), "{reply}");
+
+        let reply = run_command_ctx(&ctx, "/megu shadowlight", &mut None);
+        assert!(reply.contains("is disabled"), "{reply}");
+
+        directional_shadow_light_set(prior);
     }
 
     /// `/op` writes Vanilla `ops.json` object entries honoring
