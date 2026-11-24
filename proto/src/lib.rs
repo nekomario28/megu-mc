@@ -66,6 +66,15 @@
 //!   a [`frl_e2ee::FriendAllowlist`], and the directional
 //!   [`frl_e2ee::Frl3Cipher`] record layer — after which the relay sees only
 //!   ciphertext.
+//! * [`friend_session`] — the one-click friend-multiplayer transport kit:
+//!   `MEGU-XXXX-XXXX-XXXX` invite codes ([`friend_session::InviteCode`]),
+//!   pure-`std` NAT-PMP/PCP/UPnP-IGD port-mapping wire formats with the
+//!   always-unmapping [`friend_session::PortLeaseGuard`], a clean-room
+//!   STUN binding codec plus the [`friend_session::HolePunchMachine`]
+//!   coordinator, and the self-hostable `MGR1` relay framing with its
+//!   per-session token-bucket rate limiter — all behind the
+//!   EULA-preserving [`friend_session::FriendPublishPolicy`] and explicit
+//!   [`friend_session::PublishConsent`] gating.
 
 pub mod codec;
 pub mod item_components;
@@ -73,6 +82,7 @@ pub mod channel_router;
 mod data_v767;
 mod data_v777;
 pub mod friend_relay;
+pub mod friend_session;
 pub mod frl_auth;
 pub mod frl_e2ee;
 pub mod resolver;
