@@ -595,8 +595,9 @@ pub(crate) trait OverworldSpawnQueries {
     fn spawn_is_spawner(&self) -> bool;
     /// MobSpawnType.ignoresLightRequirements — false for MobSpawnType.NATURAL.
     fn ignores_light_requirements(&self) -> bool;
-    /// level instanceof WorldGenLevel — false on the live tick; only the
-    /// chunk-generation path spawns below the slime chunk ceiling.
+    /// `level instanceof WorldGenLevel` — true on live `ServerLevel` ticks
+    /// (since `ServerLevel implements WorldGenLevel` in Vanilla 1.21.1),
+    /// enabling underground `y < 40` slime-chunk spawning.
     fn is_world_gen(&self) -> bool;
     /// Holder<Biome> at pos, or None when the column has no generator.
     fn biome_id(&self, pos: NaturalSpawnPos) -> Option<String>;
@@ -1142,7 +1143,9 @@ impl OverworldSpawnQueries for LiveNaturalSpawnQueries<'_> {
     }
 
     fn is_world_gen(&self) -> bool {
-        false
+        // Vanilla `ServerLevel` implements `WorldGenLevel`, so live Overworld
+        // natural spawning evaluates slime chunks (`y < 40`) using world seed.
+        true
     }
 
     fn biome_id(&self, pos: NaturalSpawnPos) -> Option<String> {
