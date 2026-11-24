@@ -62,11 +62,10 @@ mappings*.txt
 /eula.txt
 
 # ---- game data ----------------------------------------------------------------------------
-# This branch keeps its data in-tree (datapacks/vanilla, config_packets.bin, assets/*.json and the
-# tests/data fixtures are tracked on purpose: the suite reads them, and the fixtures are this
-# project's own measurements). `tools/vanilla_data/gen_vanilla_data.sh` regenerates them from your
-# own pinned 1.21.1 jar and `--verify` checks the tree without one; its output is *not* ignored
-# here.
+# This tree is clean-room: datapacks/vanilla, config_packets.bin, assets/*.json and the generated
+# tests/data fixtures are NOT tracked. `tools/vanilla_data/gen_vanilla_data.sh` regenerates them
+# from your own pinned 1.21.1 jar and `--verify` checks the tree without one; its output is
+# ignored below so a local regeneration can never slip into the index.
 # The three files that were tracked without a usable provenance are gone - assets/pblocks.json and
 # assets/properties.json (byte-identical to another project's GPL-3.0 data) and resourcepack.zip
 # (origin unknown, optional server feature) - and `tools/provenance_check.py` fails the build if one

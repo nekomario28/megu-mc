@@ -33,7 +33,9 @@ Checks:
   of ``channel``/``custom_payload``/``plugin``/``register`` vocabulary) must
   appear on both the server side (``src/`` + server crates) and the client
   side (``client-*/src``). ``proto/src`` is shared infrastructure and
-  satisfies neither side by itself. ``minecraft:brand`` /
+  satisfies neither side by itself. A ``const NAME: &str = "megu:…"``
+  declaration binds ``NAME`` to the channel, so ``NAME`` references count
+  as channel uses on whichever side they appear. ``minecraft:brand`` /
   ``minecraft:register`` / ``minecraft:unregister`` are vanilla-standard and
   excluded. Third-party mod namespaces (``fabric:``, ``neoforge:`` …) are
   intentionally outside the ``megu:``/``create:`` discovery set.
@@ -566,6 +568,14 @@ CONTEXT_WINDOW = 300
 CHANNEL_ALLOWLIST = {
     "minecraft:brand", "minecraft:register", "minecraft:unregister",
 }
+# A `const NAME: &str = "megu:…"` declaration binds the identifier to the
+# channel value, so a bare `NAME` reference is the same wiring evidence as
+# the literal. This is how shared crates publish channel ids that both the
+# server and the client consume (e.g. proto's `SEAMLESS_PORTAL_CHANNEL`,
+# referenced on both sides but spelled as a literal only inside proto).
+CHANNEL_CONST = re.compile(
+    r"\bconst\s+([A-Z_][A-Z0-9_]*)\s*:\s*&\s*str\s*=\s*"
+    r'"((?:megu|create):[a-z0-9_/-]+)"')
 
 
 def check_channels(corpus):
@@ -585,6 +595,38 @@ def check_channels(corpus):
                 channel, {"server": [], "client": [], "shared": []})
             info[entry["side"]].append(
                 f"{rel}:{line_of(entry['raw'], match.start())}")
+    # Constant-bound references: an identifier declared as the channel's
+    # `&str` constant carries the channel wherever it is used. References
+    # inside the declaring statement itself are the binding, not a use.
+    ident_channels = {}   # ident -> {channels} — resolved only when unique
+    decl_spans = {}       # rel -> [(start, end)] of `const … = "…";`
+    for rel, entry in corpus.items():
+        code = entry["str_code"]
+        for match in CHANNEL_CONST.finditer(code):
+            ident_channels.setdefault(match.group(1), set()).add(
+                match.group(2))
+            stmt_end = code.find(";", match.end())
+            decl_spans.setdefault(rel, []).append(
+                (match.start(), stmt_end + 1 if stmt_end >= 0
+                 else match.end()))
+    for ident, bound in ident_channels.items():
+        if len(bound) != 1:
+            continue
+        channel = next(iter(bound))
+        needle = re.compile(rf"(?<![A-Za-z0-9_]){re.escape(ident)}"
+                            r"(?![A-Za-z0-9_])")
+        info = channels.setdefault(
+            channel, {"server": [], "client": [], "shared": []})
+        for rel, entry in corpus.items():
+            code = entry["code"]
+            if ident not in code:
+                continue
+            spans = decl_spans.get(rel, ())
+            for match in needle.finditer(code):
+                if any(s <= match.start() < e for s, e in spans):
+                    continue
+                info[entry["side"]].append(
+                    f"{rel}:{line_of(entry['raw'], match.start())}")
     for channel, sides in sorted(channels.items()):
         server, client, shared = sides["server"], sides["client"], sides["shared"]
         if server and client:
@@ -1213,6 +1255,20 @@ def check_server_config(corpus, gated):
             live_wired[name] = bool(evidence_sites(
                 corpus, needle, None, {SERVER_CONFIG_FILE} | gated, {}))
 
+        # `static NAME:` declarations and the functions whose bodies touch
+        # them: an opt-in `*_set`/`*_enabled` accessor pair serves liveness
+        # the same way a `live_*` accessor does, so a runtime switch named
+        # after its env var (`DIRECTIONAL_SHADOW_LIGHT`, `LAZY_CATCHUP_ENABLED`)
+        # is traced through the getter's real callers, not only through the
+        # `LIVE_*` naming convention.
+        declared_statics = set(re.findall(
+            r"\bstatic\s+([A-Z_][A-Z0-9_]*)\b", sc_code))
+        static_readers = {}
+        for _n, _s, _b, _e in fns:
+            for _m in re.finditer(r"\b[A-Z_][A-Z0-9_]{2,}\b",
+                                  sc_code[_b:_e]):
+                static_readers.setdefault(_m.group(0), set()).add(_n)
+
         # --- `RuntimeOpsConfig` fields: `.field` reads in files that ---
         # actually touch the typed view (a same-named local struct field
         # must not satisfy the check).
@@ -1277,8 +1333,16 @@ def check_server_config(corpus, gated):
             elif fn in fn_field:
                 sink = ("field", fn_field[fn])
             elif fn == "server_config_boot":
-                static = "LIVE_" + env[5:]
-                if static in sc_code:
+                # `apply_runtime_server_config` args fill `LIVE_*` atomics;
+                # the opt-in `*_set(env::var(…))` lanes write a static named
+                # after the variable itself (`MEGU_DIRECTIONAL_SHADOW_LIGHT`
+                # -> `DIRECTIONAL_SHADOW_LIGHT`).
+                static = next(
+                    (cand for cand in ("LIVE_" + env[5:], env[5:])
+                     if cand in declared_statics), None)
+                if static is None and "LIVE_" + env[5:] in sc_code:
+                    static = "LIVE_" + env[5:]
+                if static is not None:
                     sink = ("static", static)
             if sink is not None:
                 inside_sites.setdefault(env, []).append(sink)
@@ -1287,6 +1351,17 @@ def check_server_config(corpus, gated):
             for acc, (_line, st) in live_candidates.items():
                 if st == name:
                     return live_wired.get(acc, False)
+            # Non-`live_*` accessors (`name_enabled`/`name_set` pairs): a
+            # static is also live when a function that touches it has real
+            # non-test callers outside this file.
+            for fn_name in static_readers.get(name, ()):
+                if fn_name in live_candidates:
+                    continue
+                if evidence_sites(
+                        corpus,
+                        re.compile(rf"\b{re.escape(fn_name)}\b"), None,
+                        {SERVER_CONFIG_FILE} | gated, {}):
+                    return True
             return bool(evidence_sites(
                 corpus, re.compile(rf"\b{re.escape(name)}\b"), None,
                 {SERVER_CONFIG_FILE} | gated, {}))

@@ -20,6 +20,7 @@ GATES = (
     "tools/client_vertical_wiring_audit.py",
     "tests/opt_wiring_audit_test.py",
     "tools/opt_wiring_audit.py",
+    "tests/wiring_connectivity_audit_test.py",
     "tools/wiring_connectivity_audit.py",  # no --fail-on-stale, as before
     "tools/vanilla_mechanics_coverage_audit.py",
     "tools/docs_link_audit.py",

@@ -96,3 +96,51 @@ test input and is not distributed here; its jar metadata says "All Rights Reserv
 Modrinth page says MIT, so do not redistribute it.
 The Java sources under compat/ are megu's own code. The classes under compat/*/java/net/minecraft/
 are empty placeholder shapes (a name only, no Minecraft code) that satisfy method signatures.
+
+Horizon (MIT License)
+---------------------
+Horizon is an open-source Minecraft server implementation whose design and whose
+oracle-harness approach informed parts of this tree: the `BiomeWeather`
+altitude/temperature helper adapted in src/worldgen.rs, the `pickup_inner` /
+`move_to` container slot semantics followed by src/menus_and_items.rs, and the
+oracle harnesses under tools/ (tools/biome-tree/ExportBiomeTree.java,
+tools/container-oracle/ContainerOracle.java, tools/parity_cache.py). No Horizon
+source is committed, vendored or redistributed here; the adaptation is recorded
+in evidence/foundation/horizon-reuse/.
+
+  upstream ...... https://github.com/ludovic111/horizon
+                  (surveyed revision 0564ab0bcd3235daa6001033261b79aef5f81de1)
+  license ....... MIT License, "Copyright (c) 2026 Ludovic"
+  full text ..... third_party/licenses/horizon.txt
+
+Valence (MIT License)
+---------------------
+Valence is an open-source Minecraft server framework. Clean-room primitive
+comparisons referenced its published semantics: the ray/segment geometry
+comparison documented in src/combat_and_health.rs and the seam inventory in
+evidence/foundation/valence-primitives/. No Valence source is committed,
+vendored or redistributed here.
+
+  upstream ...... https://github.com/valence-rs/valence
+                  (surveyed revision c4177cab47ae109c848a431756d5d7c0207c05ed)
+  license ....... MIT License, "Copyright (c) 2022 Ryan Johnson"
+  full text ..... third_party/licenses/valence.txt
+
+Soju06/hyperchunk (MIT License) — prior art only
+------------------------------------------------
+Soju06/hyperchunk (MIT) was read only as prior art for density-function DAG
+flattening (see the design note in src/worldgen.rs and
+evidence/foundation/oss-survey/). No hyperchunk code was copied into this
+repository, so no license text is required here.
+
+Rust audio decoding dependencies (MPL-2.0)
+------------------------------------------
+The client-gpu workspace (client-gpu/Cargo.lock) decodes Ogg Vorbis audio
+through unmodified crates.io releases of symphonia, symphonia-core,
+symphonia-codec-vorbis, symphonia-format-ogg, symphonia-metadata and
+symphonia-utils-xiph v0.5.5, all published under the Mozilla Public License
+2.0 (MPL-2.0). MPL-2.0 is a weak file-level copyleft license compatible with
+this project's LGPL-3.0-or-later; deny.toml allows it and `cargo deny check
+licenses` passes. The crates are fetched by cargo at build time and are not
+committed to this repository; the MPL-2.0 text is available at
+https://www.mozilla.org/en-US/MPL/2.0/ and in each crate's own package.

@@ -987,6 +987,24 @@
       "reason": "Seamless-QoL settings block staged by d8779f4b; the field is parsed/serialized and bridged but the consumer lands with the owning CLIENT-UI lane.",
       "lane": "CLIENT-UI-QOL",
       "date": "2026-11-24"
+    },
+    {
+      "check": "dead_tick_or_bridge",
+      "symbol": "set_gui_bridge_batch",
+      "file": "client-gpu/src/window.rs",
+      "line": 1386,
+      "reason": "Tier-2 mod GUI batch feed deferred to alpha.4: the gui_bridge_batch field is consumed by the HUD lowering pass, but no production caller pushes a batch yet — only the staged setter and tests.",
+      "lane": "ALPHA4-GUI-BRIDGE",
+      "date": "2026-11-24"
+    },
+    {
+      "check": "unwired_subsystem_entry",
+      "symbol": "build_sync_approval_plan",
+      "file": "mod-adapter-core/src/mod_sync.rs",
+      "line": 1910,
+      "reason": "Alpha.4 mod-sync consent planner: produces the per-server ModSyncApprovalPlan (sandboxed profile staging, personal-mod preservation/suspension) but the client approval flow that would invoke it is intentionally deferred to alpha.4.",
+      "lane": "ALPHA4-MOD-SYNC",
+      "date": "2026-11-24"
     }
   ]
 }

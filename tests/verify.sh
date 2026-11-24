@@ -148,6 +148,7 @@ python3 tools/opt_wiring_audit.py
 # channel that exists on only one side, any save tag with no read path, and
 # any bridge-module entrypoint with zero production callers fails here unless
 # it is waived with a reason in audit/wiring_connectivity_waivers.json.
+python3 tests/wiring_connectivity_audit_test.py
 python3 tools/wiring_connectivity_audit.py
 # The hardcode and security-invariant audits are real gates, not reports: both
 # fail closed on a weakened guard or a new violation class.

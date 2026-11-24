@@ -17,21 +17,27 @@
 
 ## 1. コミット済みの非オリジナル資産・確認済み資産 / Committed assets & provenance inventory
 
-> 開発ブランチはテスト用の生成データを一部追跡します。以下は開発ツリーの一覧です。
+> **追跡状況 / Tracking status (2026-11-24)**: `origin/main` は clean-room ツリーです。`datapacks/vanilla/`、
+> `assets/block_states_1211.json`、`assets/blocks_1211.json`、`config_packets.bin` と生成 TSV
+> (`tests/data/biome_probe_ties_1211.tsv`, `random_next_int_1211.tsv`, `biome_probe_1211.tsv`,
+> `vanilla_vectors_1211.tsv`) は**追跡していません** — 利用者が手元の 1.21.1 jar から
+> `tools/vanilla_data/gen_vanilla_data.sh` でローカル生成します (§5)。下の表は各パスの出所の記録です。
+> `tools/provenance_check.py --strict-public` は対象パスが未追跡かつ ignore 済みかを検査します。
 > `tools/export_public_branch.sh --out ../megu-public --verify` は §5 の生成物を除外して ignore し、開発履歴を継がない別リポジトリを作ります。
-> `tools/provenance_check.py --strict-public` は D5 の対象パスが未追跡かつ ignore 済みかを検査します。
+> On `origin/main` none of the Mojang-derived paths above are tracked or shipped; they are regenerated
+> locally from the user's own jar. The table records provenance, not current tracking state.
 
 | パス / Path | 内容・規模 / What & size | README の記述 | 出所 | 根拠・観察 (facts) |
 |---|---|---|---|---|
-| `datapacks/vanilla/` | worldgen JSON・tag・構造テンプレート・biome tree | Mojang 由来 | `documented` | 開発用に追跡。`tools/vanilla_data/gen_vanilla_data.sh --verify` で目録を照合する (§5)。 |
+| `datapacks/vanilla/` | worldgen JSON・tag・構造テンプレート・biome tree | Mojang 由来 | `documented` | `origin/main` では未追跡。`tools/vanilla_data/gen_vanilla_data.sh` がローカル生成し、`--verify` で目録を照合する (§5)。 |
 | `datapacks/{modtest,rectest,spinetest,tagtest,testpack}/` | テスト用の小さな datapack (計 約25 files) | 自作テストフィクスチャ | `documented` (first-party) | オーナー (`nekomario28`) により自作（first-party）の最小テスト用 datapack であることを確認済み (2026-11-20)。 |
 | `assets/blocks_1211.json` | ブロック物性 (1060 entries, 765,435 bytes, sha256 `7d1d95c4…c654`, `id/name/displayName/hardness/resistance/stackSize/diggable/material/...`) | Mojang 由来 | `documented` (下記) | **PrismarineJS/minecraft-data の `data/pc/1.21.1/blocks.json` とバイト単位で同一** (2026-10-25 に GitHub API で取得して `cmp` で確認。最終変更 commit `d56346a4e32d`, 2024-10-26)。minecraft-data は MIT (同リポジトリの README「License: MIT」。リポジトリ直下に LICENSE ファイルは無く、著作権者名の記載は見つからなかったため、ここでは作成していない)。README は「一部のデータは wiki.vg / minecraft.gamepedia.com から抽出」とも記載。帰属表示は [NOTICE](NOTICE) と README を参照。 |
-| `assets/block_states_1211.json` | 状態ごとの luminance / light_block / flags / full_sides と衝突形状 (dedup した `shapes` + 状態ごとの `collision_shapes`) | Mojang 由来 (jar の事実値) | `documented` | `tools/vanilla_data/gen_vanilla_data.sh` が 1.21.1 jar から生成し、`jar_sha1` を自分のフィールドに持つ (照合は `tools/provenance_check.py`)。**現行ブランチでは追跡**しており、`git ls-files` で確認できる。公開候補では除外。 |
-| `tests/data/biome_probe_1211.tsv`, `tests/data/vanilla_vectors_1211.tsv` | biome 検索結果・照合値 | 事実値 | `documented` | 生成対象だが開発 HEAD では未追跡かつ ignore されていない。 |
-| `tests/data/biome_probe_ties_1211.tsv` | 開発用に追跡。leaf の range 端から作った同距離 tie の多い biome 検索結果 2,500 点 (seed 固定) | 事実値 | `documented` | 同じツールで再生成。tie をゲームと同じ子の走査順で解くことを `worldgen.rs` のテストが全点で検証する。 |
-| `tests/data/random_next_int_1211.tsv` | 開発用に追跡。ゲームの乱数クラスの `nextInt(bound)` 256 回分のハッシュ 1,116 行 (数値のみ) | 事実値 | `documented` | 同じツールで再生成。`generation_math.rs` のテストが全行を検証する。 |
+| `assets/block_states_1211.json` | 状態ごとの luminance / light_block / flags / full_sides と衝突形状 (dedup した `shapes` + 状態ごとの `collision_shapes`) | Mojang 由来 (jar の事実値) | `documented` | `tools/vanilla_data/gen_vanilla_data.sh` が 1.21.1 jar から生成し、`jar_sha1` を自分のフィールドに持つ (照合は `tools/provenance_check.py`)。**`origin/main` では未追跡**で、`.gitignore` 済み (`git ls-files` / `git check-ignore` で確認できる)。利用者がローカル生成する。 |
+| `tests/data/biome_probe_1211.tsv`, `tests/data/vanilla_vectors_1211.tsv` | biome 検索結果・照合値 | 事実値 | `documented` | 生成対象。`origin/main` では未追跡かつ `.gitignore` 済み。 |
+| `tests/data/biome_probe_ties_1211.tsv` | `origin/main` では未追跡。leaf の range 端から作った同距離 tie の多い biome 検索結果 2,500 点 (seed 固定) | 事実値 | `documented` | 同じツールで再生成。tie をゲームと同じ子の走査順で解くことを `worldgen.rs` のテストが全点で検証する。 |
+| `tests/data/random_next_int_1211.tsv` | `origin/main` では未追跡。ゲームの乱数クラスの `nextInt(bound)` 256 回分のハッシュ 1,116 行 (数値のみ) | 事実値 | `documented` | 同じツールで再生成。`generation_math.rs` のテストが全行を検証する。 |
 | `resourcepack.zip` (旧: 345 bytes, `pack.mcmeta` + 72 B の `stone.png`) | **索引から削除 (`git rm`)**。サーバーは `resourcepack.zip` が無ければリソースパックを配信しない (任意機能) ので、再生成しない。ローカルで使う場合だけ利用者が作業ディレクトリに置く | — | 削除済み | 出所不明 (Mojang のテクスチャかは未確認) だったため。`tools/provenance_check.py` が「追跡または `src/`・`tests/` から参照されたら失敗」する。`src/main.rs` の任意機能の読み取り 2 か所だけを宣言付きで許している (§1 追記)。 |
-| `config_packets.bin` (旧: 105,095 bytes) | 開発用に追跡 (§9) | Mojang 由来 | 生成手順あり: `tools/vanilla_data/capture_config_packets.py` | 手元の 1.21.1 jar から実サーバーを一時起動して Configuration フェーズを記録する (`--accept-eula` 必須)。旧ファイルとは tag パケットの registry の並びだけが異なる (同サイズ、registry data は先頭から一致)。 |
+| `config_packets.bin` (旧: 105,095 bytes) | `origin/main` では未追跡 (§9) | Mojang 由来 | 生成手順あり: `tools/vanilla_data/capture_config_packets.py` | 手元の 1.21.1 jar から実サーバーを一時起動して Configuration フェーズを記録する (`--accept-eula` 必須)。旧ファイルとは tag パケットの registry の並びだけが異なる (同サイズ、registry data は先頭から一致)。 |
 | `evidence/gameplay/**/*.javap.txt` (旧 6 files) | **削除** (§9) | — | 削除済み | Mojang クラスの逆アセンブルは再配布しない。`tools/bytecode_probe.sh <class>` が手元の jar と公式マッピングから同じ出力を作る。 |
 | `evidence/gameplay/**/*.mapping.txt`, `evidence/gameplay/light-update/mappings.txt` (旧 3 files) | **削除** (§9) | — | 削除済み | Mojang 公式マッピングの抜粋は再配布しない。`tools/bytecode_probe.sh` が利用者の手元のマッピングを読む。 |
 | `evidence/foundation/audit-snapshots/main.*.rs` (4 files) | 過去の自作 `src/main.rs` のスナップショット | (第三者物ではない) | `documented` (first-party) | 同ディレクトリの README が由来と sha256 を記載。第三者由来ではなく、このリポジトリの自作コードの旧版です。`AUDIT_WIRE.md` / `SECURITY_NOTES.md` から参照されています (削除していません)。 |
@@ -40,8 +46,13 @@
 
 ## 2. Rust 依存クレートのライセンス / Rust dependency licenses
 
-`cargo metadata --format-version 1 --locked --all-features` (Cargo.lock, 2026-10-25) の `license` フィールドをそのまま転記したもの。`cargo-deny` (`deny.toml`) が CI で同じ集合を検査します。`megu` 自体は `Cargo.toml` で `license = "LGPL-3.0-or-later"` を宣言しています (`LICENSE` / 付随 `docs/COPYING.GPL` と一致)。依存クレート 78 個に GPL / LGPL / AGPL / MPL のものはありません (LICENSING.md §2a)。
-Copied verbatim from the `license` field of each crate's published metadata; this is what the crates declare, not an independent verification of their license texts. 78 crates (optional JNI adapters included).
+`cargo metadata --format-version 1 --locked --all-features` の `license` フィールドをそのまま転記したもの (下の表は root `Cargo.lock`、2026-10-25 時点の 78 クレート)。`cargo-deny` (`deny.toml`) が CI で同じ集合を検査します。`megu` 自体は `Cargo.toml` で `license = "LGPL-3.0-or-later"` を宣言しています (`LICENSE` / 付随 `docs/COPYING.GPL` と一致)。
+Copied verbatim from the `license` field of each crate's published metadata; this is what the crates declare, not an independent verification of their license texts. The table below is the root `Cargo.lock` transcription (78 crates, optional JNI adapters included, as of 2026-10-25).
+
+**Audited counts (2026-11-24) / 監査済み件数:**
+
+- Root `Cargo.lock`: **107 third-party crates** — 100% permissive (MIT / Apache-2.0 / ISC / BSD / Zlib / 0BSD / Unlicense / Unicode-3.0 / CDLA-Permissive-2.0); 0 copyleft.
+- `client-gpu/Cargo.lock`: **258 third-party crates** — 250 permissive, 2 `r-efi` builds dual-licensed `MIT OR Apache-2.0 OR LGPL-2.1-or-later`, and 6 `symphonia*` audio-decoding crates (`symphonia`, `symphonia-core`, `symphonia-codec-vorbis`, `symphonia-format-ogg`, `symphonia-metadata`, `symphonia-utils-xiph` v0.5.5) under `MPL-2.0`. All are allowed in `deny.toml` and compatible with `LGPL-3.0-or-later`; `cargo deny check licenses` passes on both workspaces (see NOTICE for the symphonia attribution).
 
 | crate | version | license (as declared) | 種別 |
 |---|---|---|---|
@@ -278,3 +289,19 @@ tools/vanilla_data/gen_vanilla_data.sh --jar /path/to/1.21.1-server.jar [--mappi
 | 残る言及 | README / THIRD_PARTY.md / NOTICE の帰属、`tick_queue.rs` の設計参照 (設計のみ、issue #3)、`specs/` と `DESIGN.md` の設計参照、`evidence/foundation/provenance/` の 2026-10-21 の測定記録。ブロック名 `pumpkin` / `carved_pumpkin` は Minecraft の名前。 |
 | `evidence/time-contract/**/*.log` ほか | 一部の AI レビューのログ (Pumpkin に触れた引用を含む) は `main` にのみ存在し、このブランチの系列 (#16→#19→#20→#22) では #20 で削除済み (`evidence/time-contract/REDACTION.md` 参照)。公開リポジトリから消えるのは `main` を置き換える・書き換えるときで、この PR は `main` に触れない。 |
 
+
+## 12. 参照した OSS 実装と帰属 / Referenced OSS implementations (attribution)
+
+上流のコードをコミット・ベンダーしていない参照・適応元の一覧。帰属表示は [NOTICE](NOTICE)、
+ライセンス本文は `third_party/licenses/` を参照。
+Projects whose design or semantics informed this tree. No upstream source is committed or
+vendored; see [NOTICE](NOTICE) for attribution and `third_party/licenses/` for license texts.
+
+| プロジェクト / Project | License | 参照形態 / How referenced | 記録 / Record |
+|---|---|---|---|
+| **Horizon** (`ludovic111/horizon`, surveyed rev `0564ab0`) | MIT (`Copyright (c) 2026 Ludovic`) | `src/worldgen.rs` の `BiomeWeather` altitude/temperature 補助 (適応)、`src/menus_and_items.rs` の `pickup_inner` / `move_to` スロット意味論、oracle ハーネス (`tools/biome-tree/ExportBiomeTree.java`, `tools/container-oracle/ContainerOracle.java`, `tools/parity_cache.py`) の設計参照 | `third_party/licenses/horizon.txt`, `evidence/foundation/horizon-reuse/`, NOTICE |
+| **Valence** (`valence-rs/valence`, surveyed rev `c4177cab`) | MIT (`Copyright (c) 2022 Ryan Johnson`) | clean-room のプリミティブ比較: `src/combat_and_health.rs` の ray/segment 幾何比較、`evidence/foundation/valence-primitives/` のシーム目録 | `third_party/licenses/valence.txt`, `evidence/foundation/valence-reuse/`, NOTICE |
+| **Soju06/hyperchunk** | MIT | density-function DAG flattening の**概念・先行事例の参照のみ — コードの複写なし** (`src/worldgen.rs` の設計注記、`evidence/foundation/oss-survey/`) | NOTICE |
+
+`client-gpu` ワークスペースの音声デコード依存 (`symphonia*` v0.5.5、MPL-2.0、crates.io の未改変
+リリース) については §2 と NOTICE を参照。
