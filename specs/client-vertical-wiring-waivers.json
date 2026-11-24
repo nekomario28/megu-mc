@@ -250,12 +250,6 @@
     },
     {
       "check": "screen_state_reachability",
-      "id": "Screen::Friends",
-      "priority": "P2",
-      "reason": "reached only via client-ui-internal OpenScreen dispatch (title/pause buttons); never named by the host"
-    },
-    {
-      "check": "screen_state_reachability",
       "id": "Screen::ModMenu",
       "priority": "P2",
       "reason": "reached via UiState::open_mod_menu from internal widget ids; variant never named by the host"

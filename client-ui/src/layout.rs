@@ -663,70 +663,182 @@ fn multiplayer(ctx: &mut Ctx) {
     let px = cx - pw / 2;
 
     // The direct-connect block anchors to the footer: label + field +
-    // button row = 66 logical px. The server list owns what remains.
+    // button row = 66 logical px. Everything above it splits between the
+    // "Friends & LAN" section (top) and the saved-server list.
     let direct_h = 66;
     let direct_top = (ctx.band_top - 4 - direct_h).max(36);
-    let list_top = 34;
+    let list_top = 30;
     let list_bottom = direct_top - 4;
+    let avail = list_bottom - list_top;
 
-    // --- Saved servers -----------------------------------------------
-    let servers = &ctx.state.multiplayer.servers;
-    ctx.panel(px, list_top, pw, (list_bottom - list_top).max(10));
-    let row_h = 20;
-    let body_h = (list_bottom - list_top - 6).max(0);
-    let mut visible = (body_h / row_h) as usize;
-    if servers.len() > visible {
-        visible = ((body_h - 18) / row_h).max(0) as usize;
+    // --- Friends & LAN ------------------------------------------------
+    // Friend-hosted worlds (1-click E2EE join) and LAN-discovered worlds
+    // (direct join) share one panel — friends first, then LAN rows. The
+    // section owns ~2/5 of the vertical space, capped so huge viewports
+    // keep the saved list dominant.
+    let fl_panel_h = ((avail * 2 / 5) - 12).clamp(24, 140);
+    let fl_top = list_top + 12;
+    let saved_label_y = fl_top + fl_panel_h + 4;
+    let saved_top = saved_label_y + 10;
+    let saved_bottom = list_bottom;
+
+    ctx.text(
+        px + 2,
+        list_top,
+        1,
+        pal::ACCENT,
+        tr(lang, "Friends & LAN", "フレンドとLAN"),
+    );
+    ctx.btn(
+        WidgetId::MultiplayerManageFriends,
+        lr(px + pw - 110, list_top - 3, 110, 14),
+        tr(lang, "Manage Friends", "フレンド管理"),
+    );
+
+    let friend_worlds = &ctx.state.multiplayer.friend_worlds;
+    let lan_worlds = &ctx.state.multiplayer.lan_worlds;
+    let fl_total = friend_worlds.len() + lan_worlds.len();
+    ctx.panel(px, fl_top, pw, fl_panel_h);
+    let fl_row_h = 18;
+    let fl_body = (fl_panel_h - 6).max(0);
+    let mut fl_visible = (fl_body / fl_row_h) as usize;
+    if fl_total > fl_visible {
+        fl_visible = ((fl_body - 18) / fl_row_h).max(0) as usize;
     }
-    let scroll = ctx
+    let fl_scroll = ctx
         .state
         .multiplayer
-        .scroll
-        .min(servers.len().saturating_sub(visible));
-    if servers.is_empty() {
+        .friend_lan_scroll
+        .min(fl_total.saturating_sub(fl_visible));
+    if fl_total == 0 && fl_panel_h >= 22 {
         ctx.ctext(
             cx,
-            list_top + 6,
+            fl_top + 8,
             1,
             pal::TEXT_DIM,
-            tr(lang, "No saved servers", "サーバーはまだありません"),
+            tr(
+                lang,
+                "No friend or LAN worlds online",
+                "オンラインのフレンド/LANワールドはありません",
+            ),
         );
     }
-    let selected = ctx.state.multiplayer.selected;
-    for row in 0..visible {
-        let i = scroll + row;
-        let Some(entry) = servers.get(i) else { break };
-        let r = lr(px + 4, list_top + 4 + row as i32 * row_h, pw - 8, row_h - 2);
-        // Selected rows draw a highlight fill under the button row id.
-        if selected == Some(i) {
-            ctx.fill(r.x, r.y, r.w as i32, r.h as i32, pal::BUTTON_HOVER);
+    let fl_chars = ((pw - 20) / 8).max(4) as usize;
+    for row in 0..fl_visible {
+        let i = fl_scroll + row;
+        let y = fl_top + 4 + row as i32 * fl_row_h;
+        let r = lr(px + 4, y, pw - 8, fl_row_h - 2);
+        if i < friend_worlds.len() {
+            let entry = &friend_worlds[i];
+            let label = format!(
+                "{} — {} ({}/{})",
+                entry.friend_name, entry.world_name, entry.online_players, entry.max_players
+            );
+            ctx.btn(
+                WidgetId::MultiplayerFriendWorld(i),
+                r,
+                &hud_str(&label, fl_chars),
+            );
+        } else {
+            let Some(entry) = lan_worlds.get(i - friend_worlds.len()) else {
+                break;
+            };
+            let label = format!("LAN {} — {}:{}", entry.name, entry.address, entry.port);
+            ctx.btn(
+                WidgetId::MultiplayerLanWorld(i - friend_worlds.len()),
+                r,
+                &hud_str(&label, fl_chars),
+            );
         }
-        let label = format!("{} — {}:{}", entry.name, entry.address, entry.port);
-        ctx.btn(
-            WidgetId::MultiplayerServer(i),
-            r,
-            &hud_str(&label, ((pw - 20) / 8).max(4) as usize),
-        );
     }
-    let py = list_top + 4 + visible as i32 * row_h;
-    if servers.len() > visible && pw >= 176 && py + 16 <= list_bottom {
+    let fl_py = fl_top + 4 + fl_visible as i32 * fl_row_h;
+    if fl_total > fl_visible && pw >= 176 && fl_py + 16 <= fl_top + fl_panel_h {
         ctx.btn(
-            WidgetId::MultiplayerListUp,
-            lr(px + 4, py, 60, 16),
+            WidgetId::MultiplayerFriendLanUp,
+            lr(px + 4, fl_py, 60, 16),
             tr(lang, "Up", "上"),
         );
         ctx.ctext(
             cx,
-            py + 4,
+            fl_py + 4,
             1,
             pal::TEXT_DIM,
-            &format!("{}-{}", scroll + 1, (scroll + visible).min(servers.len())),
+            &format!("{}-{}", fl_scroll + 1, (fl_scroll + fl_visible).min(fl_total)),
         );
         ctx.btn(
-            WidgetId::MultiplayerListDown,
-            lr(px + pw - 64, py, 60, 16),
+            WidgetId::MultiplayerFriendLanDown,
+            lr(px + pw - 64, fl_py, 60, 16),
             tr(lang, "Down", "下"),
         );
+    }
+
+    // --- Saved servers -----------------------------------------------
+    if saved_bottom > saved_top + 8 {
+        ctx.text(
+            px + 2,
+            saved_label_y,
+            1,
+            pal::ACCENT,
+            tr(lang, "Saved Servers", "保存したサーバー"),
+        );
+        let servers = &ctx.state.multiplayer.servers;
+        ctx.panel(px, saved_top, pw, (saved_bottom - saved_top).max(10));
+        let row_h = 20;
+        let body_h = (saved_bottom - saved_top - 6).max(0);
+        let mut visible = (body_h / row_h) as usize;
+        if servers.len() > visible {
+            visible = ((body_h - 18) / row_h).max(0) as usize;
+        }
+        let scroll = ctx
+            .state
+            .multiplayer
+            .scroll
+            .min(servers.len().saturating_sub(visible));
+        if servers.is_empty() {
+            ctx.ctext(
+                cx,
+                saved_top + 6,
+                1,
+                pal::TEXT_DIM,
+                tr(lang, "No saved servers", "サーバーはまだありません"),
+            );
+        }
+        let selected = ctx.state.multiplayer.selected;
+        for row in 0..visible {
+            let i = scroll + row;
+            let Some(entry) = servers.get(i) else { break };
+            let r = lr(px + 4, saved_top + 4 + row as i32 * row_h, pw - 8, row_h - 2);
+            // Selected rows draw a highlight fill under the button row id.
+            if selected == Some(i) {
+                ctx.fill(r.x, r.y, r.w as i32, r.h as i32, pal::BUTTON_HOVER);
+            }
+            let label = format!("{} — {}:{}", entry.name, entry.address, entry.port);
+            ctx.btn(
+                WidgetId::MultiplayerServer(i),
+                r,
+                &hud_str(&label, ((pw - 20) / 8).max(4) as usize),
+            );
+        }
+        let py = saved_top + 4 + visible as i32 * row_h;
+        if servers.len() > visible && pw >= 176 && py + 16 <= saved_bottom {
+            ctx.btn(
+                WidgetId::MultiplayerListUp,
+                lr(px + 4, py, 60, 16),
+                tr(lang, "Up", "上"),
+            );
+            ctx.ctext(
+                cx,
+                py + 4,
+                1,
+                pal::TEXT_DIM,
+                &format!("{}-{}", scroll + 1, (scroll + visible).min(servers.len())),
+            );
+            ctx.btn(
+                WidgetId::MultiplayerListDown,
+                lr(px + pw - 64, py, 60, 16),
+                tr(lang, "Down", "下"),
+            );
+        }
     }
 
     // --- Direct connect / quick-add -----------------------------------
@@ -1842,6 +1954,59 @@ fn language_tab(ctx: &mut Ctx, y0: i32) {
 // Friends
 // ---------------------------------------------------------------------------
 
+/// `megu-id:` strings are 66 chars — far wider than any row. Show a
+/// middle-elided form (`megu-id:ABCDEFGH..WXYZ`); the full string is
+/// only ever copied, never retyped.
+fn friend_id_short(id: &str) -> String {
+    let chars: Vec<char> = id.chars().collect();
+    if chars.len() <= 24 {
+        return id.to_string();
+    }
+    let head: String = chars[..18].iter().collect();
+    let tail: String = chars[chars.len() - 4..].iter().collect();
+    format!("{head}..{tail}")
+}
+
+/// One friends-allowlist row: name + truncated id (row-select region),
+/// SAS/online column, Selected checkbox, instant Remove. Narrow rows
+/// shed the optional columns before shedding Remove.
+fn friend_row(ctx: &mut Ctx, x0: i32, y: i32, rw: i32, i: usize) {
+    let entry = &ctx.state.friends.friends[i];
+    let selected = ctx.state.friends.selected == Some(i);
+    let show_sas = rw >= 240;
+    let show_cb = rw >= 160;
+    let right_w = 48 + if show_cb { 32 } else { 0 } + if show_sas { 56 } else { 0 };
+    let text_w = (rw - right_w - 8).max(0);
+
+    let row = lr(x0, y, rw, 18);
+    if selected {
+        ctx.fill(row.x, row.y, row.w as i32, row.h as i32, pal::BUTTON_HOVER);
+    }
+    ctx.region(WidgetId::FriendRow(i), lr(x0, y, text_w + 4, 18));
+    let label = format!("{}  {}", entry.name, friend_id_short(&entry.friend_id));
+    ctx.hud_text(x0 + 4, y + 5, 1, pal::TEXT, &label, (text_w / 8).max(2) as usize);
+
+    let mut rx = x0 + rw;
+    rx -= 48;
+    ctx.btn(WidgetId::FriendRemove(i), lr(rx, y + 1, 44, 16), tr(ctx.lang, "Remove", "削除"));
+    if show_cb {
+        rx -= 32;
+        ctx.btn(
+            WidgetId::FriendSelected(i),
+            lr(rx, y + 1, 28, 16),
+            if entry.selected_for_share { "[x]" } else { "[ ]" },
+        );
+    }
+    if show_sas {
+        rx -= 56;
+        let sas = entry
+            .sas_code
+            .map(|c| format!("{c:06}"))
+            .unwrap_or_else(|| if entry.connected { "online".into() } else { "-".into() });
+        ctx.hud_text(rx, y + 5, 1, pal::TEXT_DIM, &sas, 6);
+    }
+}
+
 fn friends(ctx: &mut Ctx) {
     ctx.menu_background();
     let lang = ctx.lang;
@@ -1849,93 +2014,307 @@ fn friends(ctx: &mut Ctx) {
 
     ctx.ctext(
         cx,
-        10,
+        8,
         2,
         pal::TEXT,
         tr(lang, "Play with Friends", "フレンドと遊ぶ"),
     );
 
-    // Reserve the Back strip: content widgets that would reach it are
-    // dropped by the helpers rather than painted under Back.
-    ctx.band_top = ctx.h - 32;
+    // Footer strip (status line + Back): content widgets that would
+    // reach it are dropped instead of painting under the chrome.
+    ctx.band_top = ctx.h - 40;
 
-    // Host panel.
-    let pw = 340.min(ctx.w - 8).max(40);
-    let px = cx - pw / 2;
-    ctx.panel(px, 40, pw, 100);
-    ctx.ctext(
-        cx,
-        46,
+    let wide = ctx.w >= 620;
+    let gap = 8;
+    let (lx, col_w) = if wide {
+        let col_w = ((ctx.w - 24) / 2).max(40);
+        (8, col_w)
+    } else {
+        (cx - (ctx.w - 8).max(40) / 2, (ctx.w - 8).max(40))
+    };
+    let rx = lx + col_w + gap;
+    let f = &ctx.state.friends;
+
+    // --- "Your Friend ID" row (left column top) -----------------------
+    ctx.text(
+        lx + 2,
+        28,
         1,
-        pal::TEXT_DIM,
-        tr(
-            lang,
-            "Host a world - share this invite code",
-            "ワールドをホスト — 招待コードを共有",
-        ),
+        pal::ACCENT,
+        tr(lang, "Your Friend ID", "あなたのフレンドID"),
     );
-    let code = ctx.state.invite_display();
-    ctx.ctext(cx, 60, 2, pal::TEXT, &code);
-    let by = 92;
-    // Generate / Copy / Revoke share one adaptive row; below ~260px the
-    // buttons compress (labels elide) instead of running off the left
-    // edge, and below ~140px the band check drops the row entirely.
-    let bw3 = ((ctx.w - 8 - 12) / 3).clamp(0, 90);
-    let trio = bw3 * 3 + 12;
-    let mut bx = cx - trio / 2;
-    for (id, label) in [
-        (WidgetId::FriendsGenerate, tr(lang, "Generate", "生成")),
-        (WidgetId::FriendsCopy, tr(lang, "Copy", "コピー")),
-        (WidgetId::FriendsRevoke, tr(lang, "Revoke", "無効化")),
-    ] {
-        ctx.btn(id, lr(bx, by, bw3, 18), label);
-        bx += bw3 + 6;
+    let id_y = 40;
+    let id_short = if f.my_friend_id.is_empty() {
+        tr(lang, "(identity not loaded)", "(IDが読み込まれていません)").to_string()
+    } else {
+        friend_id_short(&f.my_friend_id)
+    };
+    ctx.hud_text(lx + 4, id_y + 5, 1, pal::TEXT, &id_short, ((col_w - 96) / 8).max(4) as usize);
+    ctx.btn(
+        WidgetId::FriendsCopyId,
+        lr(lx + col_w - 88, id_y, 84, 16),
+        tr(lang, "Copy ID", "IDをコピー"),
+    );
+
+    // --- Add Friend row -----------------------------------------------
+    // Wide: top of the right column. Narrow: under the identity row.
+    let add_x = if wide { rx } else { lx };
+    let add_y = if wide { 40 } else { id_y + 22 };
+    if wide {
+        ctx.text(
+            add_x + 2,
+            28,
+            1,
+            pal::ACCENT,
+            tr(lang, "Add Friend", "フレンド追加"),
+        );
     }
-
-    // Guest panel: shrink it before it ever reaches the Back button.
-    let guest_h = (ctx.h - 30 - 6 - 152).clamp(56, 96);
-    ctx.panel(px, 152, pw, guest_h);
-    ctx.ctext(
-        cx,
-        158,
-        1,
-        pal::TEXT_DIM,
-        tr(lang, "Join a friend's world", "フレンドのワールドに参加"),
-    );
-    // Join field + button split whatever width the panel offers.
-    let join_btn_w = 70.min(pw / 3);
-    let field_w = pw - 24 - join_btn_w - 6;
+    let name_w = (col_w * 30 / 100).max(24);
+    let add_btn_w = 52.min(col_w / 5).max(24);
+    let id_w = (col_w - name_w - add_btn_w - 8).max(24);
     ctx.textfield(
-        WidgetId::FriendsJoinField,
-        lr(px + 12, 176, field_w, 20),
-        &ctx.state.join_code_text,
-        ctx.state.join_field_active(),
-        "MEGU-XXXX-XXXX",
+        WidgetId::FriendsAddNameField,
+        lr(add_x, add_y, name_w, 18),
+        &f.add_name_text,
+        f.add_name_field_active(),
+        tr(lang, "Name", "なまえ"),
+    );
+    ctx.textfield(
+        WidgetId::FriendsAddIdField,
+        lr(add_x + name_w + 4, add_y, id_w, 18),
+        &f.add_id_text,
+        f.add_id_field_active(),
+        "megu-id:…",
     );
     ctx.btn(
-        WidgetId::FriendsJoin,
-        lr(px + 12 + field_w + 6, 176, join_btn_w, 20),
-        tr(lang, "Join", "参加"),
+        WidgetId::FriendsAdd,
+        lr(add_x + name_w + 4 + id_w + 4, add_y, add_btn_w, 18),
+        tr(lang, "Add", "追加"),
     );
-    if ctx.state.join_error {
-        ctx.ctext(
-            cx,
-            200,
+    if let Some(err) = &f.add_error {
+        ctx.hud_text(
+            add_x + 4,
+            add_y + 21,
             1,
             pal::DANGER,
+            err,
+            ((col_w - 8) / 8).max(4) as usize,
+        );
+    }
+
+    // --- Host World Sharing block (bottom-anchored, above invite) ------
+    // Vertical budget: mode toggle + relay field + guest-link row +
+    // link/status line ≈ 78px; the legacy invite block needs 64 more
+    // and only renders when the friends list still keeps ~3 rows.
+    let share_h = 88;
+    let invite_h = 66;
+    // Narrow: the friends-list header sits under the Add row; wide: the
+    // left column's list sits under the identity row.
+    let list_top = if wide { 64 } else { add_y + 34 };
+    let content_bottom = ctx.band_top - 4;
+    let want_invite = wide || content_bottom - list_top > share_h + invite_h + 64;
+    let invite_top = if want_invite {
+        content_bottom - invite_h
+    } else {
+        content_bottom
+    };
+    // Wide: sharing anchors above the invite block in the right column.
+    // Narrow: it anchors above the invite block (or the footer).
+    // Clamped below the fixed rows so short viewports shed the block's
+    // bottom widgets (band check) instead of overlapping the Add row.
+    let share_top = (invite_top - if wide { 6 } else { 4 } - share_h).max(add_y + 32);
+
+    let share_x = if wide { rx } else { lx };
+    let share_w = col_w;
+    ctx.text(
+        share_x + 2,
+        share_top,
+        1,
+        pal::ACCENT,
+        tr(lang, "Host World Sharing (1-hop only)", "ワールド共有（1ホップのみ）"),
+    );
+    let mode_y = share_top + 10;
+    ctx.btn(
+        WidgetId::FriendsShareMode,
+        lr(share_x, mode_y, share_w, 18),
+        &format!(
+            "{}: {}",
+            tr(lang, "Sharing", "共有"),
+            f.share_mode.label(lang)
+        ),
+    );
+    ctx.text(
+        share_x + 2,
+        mode_y + 22,
+        1,
+        pal::TEXT_DIM,
+        tr(lang, "Relay Address", "リレーアドレス"),
+    );
+    ctx.textfield(
+        WidgetId::FriendsRelayField,
+        lr(share_x + 92, mode_y + 20, (share_w - 92).max(24), 18),
+        &f.relay_addr_text,
+        f.relay_field_active(),
+        tr(lang, "host:port", "ホスト:ポート"),
+    );
+    let gl_y = mode_y + 42;
+    let gl_w = (share_w * 3 / 5).max(24);
+    ctx.btn(
+        WidgetId::FriendsGenerateGuestLink,
+        lr(share_x, gl_y, gl_w, 18),
+        tr(lang, "Generate 128-bit Guest Link", "128ビットゲストリンク生成"),
+    );
+    ctx.btn(
+        WidgetId::FriendsCopyGuestLink,
+        lr(share_x + gl_w + 4, gl_y, (share_w - gl_w - 4).max(24), 18),
+        tr(lang, "Copy Guest Link", "ゲストリンクをコピー"),
+    );
+    let link_y = gl_y + 22;
+    match (&f.guest_link, &f.status) {
+        (Some(link), _) => ctx.hud_text(
+            share_x + 4,
+            link_y,
+            1,
+            pal::TEXT,
+            &friend_id_short(link),
+            ((share_w - 8) / 8).max(4) as usize,
+        ),
+        (None, Some(status)) => ctx.hud_text(
+            share_x + 4,
+            link_y,
+            1,
+            pal::TEXT_DIM,
+            status,
+            ((share_w - 8) / 8).max(4) as usize,
+        ),
+        (None, None) => {}
+    }
+
+    // --- Legacy invite-code block --------------------------------------
+    // Wide: bottom of the right column. Narrow: above the footer, only
+    // when the friends list still gets its minimum height.
+    let inv_x = if wide { rx } else { lx };
+    if wide || want_invite {
+        let inv_top = invite_top;
+        ctx.text(
+            inv_x + 2,
+            inv_top,
+            1,
+            pal::ACCENT,
+            tr(lang, "Invite Codes", "招待コード"),
+        );
+        let code = ctx.state.invite_display();
+        ctx.text(inv_x + 4, inv_top + 12, 1, pal::TEXT, &code);
+        let by = inv_top + 24;
+        let bw3 = ((col_w - 12) / 3).clamp(0, 90);
+        let mut bx = inv_x;
+        for (id, label) in [
+            (WidgetId::FriendsGenerate, tr(lang, "Generate", "生成")),
+            (WidgetId::FriendsCopy, tr(lang, "Copy", "コピー")),
+            (WidgetId::FriendsRevoke, tr(lang, "Revoke", "無効化")),
+        ] {
+            ctx.btn(id, lr(bx, by, bw3, 16), label);
+            bx += bw3 + 6;
+        }
+        let join_btn_w = 50.min(col_w / 4).max(24);
+        let field_w = (col_w - join_btn_w - 6).max(24);
+        ctx.textfield(
+            WidgetId::FriendsJoinField,
+            lr(inv_x, by + 20, field_w, 18),
+            &ctx.state.join_code_text,
+            ctx.state.join_field_active(),
+            "MEGU-XXXX-XXXX",
+        );
+        ctx.btn(
+            WidgetId::FriendsJoin,
+            lr(inv_x + field_w + 6, by + 20, join_btn_w, 18),
+            tr(lang, "Join", "参加"),
+        );
+        if ctx.state.join_error {
+            ctx.hud_text(
+                inv_x + 4,
+                by + 40,
+                1,
+                pal::DANGER,
+                tr(
+                    lang,
+                    "Invalid code - expected MEGU-XXXX-XXXX",
+                    "無効なコード — MEGU-XXXX-XXXX",
+                ),
+                ((col_w - 8) / 8).max(4) as usize,
+            );
+        }
+    }
+
+    // --- Friends allowlist (left column, absorbs remaining height) -----
+    let list_bottom = if wide { content_bottom } else { share_top - 4 };
+    ctx.text(
+        lx + 2,
+        list_top,
+        1,
+        pal::ACCENT,
+        tr(lang, "Friends", "フレンド"),
+    );
+    let panel_top = list_top + 10;
+    let panel_h = (list_bottom - panel_top).max(0);
+    ctx.panel(lx, panel_top, col_w, panel_h);
+    let row_h = 20;
+    let body_h = (panel_h - 6).max(0);
+    let mut visible = (body_h / row_h) as usize;
+    if f.friends.len() > visible {
+        visible = ((body_h - 18) / row_h).max(0) as usize;
+    }
+    let scroll = f.scroll.min(f.friends.len().saturating_sub(visible));
+    if f.friends.is_empty() && panel_h >= 22 {
+        ctx.ctext(
+            lx + col_w / 2,
+            panel_top + 8,
+            1,
+            pal::TEXT_DIM,
             tr(
                 lang,
-                "Invalid code - expected MEGU-XXXX-XXXX",
-                "無効なコード — MEGU-XXXX-XXXX",
+                "No friends yet - add a megu-id: above",
+                "フレンドがいません — 上の megu-id: で追加",
             ),
+        );
+    }
+    for row in 0..visible {
+        let i = scroll + row;
+        if i >= f.friends.len() {
+            break;
+        }
+        friend_row(ctx, lx + 4, panel_top + 4 + row as i32 * row_h, col_w - 8, i);
+    }
+    let py = panel_top + 4 + visible as i32 * row_h;
+    if f.friends.len() > visible && col_w >= 176 && py + 16 <= list_bottom {
+        ctx.btn(
+            WidgetId::FriendsListUp,
+            lr(lx + 4, py, 60, 16),
+            tr(lang, "Up", "上"),
+        );
+        ctx.ctext(
+            lx + col_w / 2,
+            py + 4,
+            1,
+            pal::TEXT_DIM,
+            &format!("{}-{}", scroll + 1, (scroll + visible).min(f.friends.len())),
+        );
+        ctx.btn(
+            WidgetId::FriendsListDown,
+            lr(lx + col_w - 64, py, 60, 16),
+            tr(lang, "Down", "下"),
         );
     }
 
     ctx.band_top = i32::MAX;
+    // Inline status/add feedback shares the footer strip with Back.
+    if let Some(status) = ctx.state.friends.status.as_deref() {
+        ctx.hud_ctext(cx, ctx.h - 37, 1, pal::WARNING, status, 56);
+    }
     let bw = 90.min(ctx.w - 8).max(24);
     ctx.button_unchecked(
         WidgetId::FriendsBack,
-        lr(cx - bw / 2, ctx.h - 30, bw, 20),
+        lr(cx - bw / 2, ctx.h - 28, bw, 20),
         tr(lang, "Back", "戻る"),
         true,
     );

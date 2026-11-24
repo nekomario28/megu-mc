@@ -3,14 +3,20 @@
 //! controls, pause/settings via `megu_ui`, background-FPS throttling,
 //! and `FrameBudgetGovernor` pacing — all driving the real `wgpu` renderer.
 
-use std::sync::Arc;
+use std::collections::BTreeMap;
+use std::io::{Read, Write};
+use std::net::{SocketAddr, TcpStream};
+use std::sync::{Arc, Mutex, mpsc};
 use std::time::{Duration, Instant};
 
 use crate::live_session::LiveHudFeed;
 use megu_client::audio_qol::{
     DEFAULT_ZOOM_SMOOTHING_RATE, ToolDurability, ZoomState, check_tool_durability_warning,
 };
-use megu_client::friend_client::{FriendGuestBridge, FriendHostSession};
+use megu_client::friend_client::{FriendGuestBridge, FriendHostEvent, FriendHostSession};
+use megu_client::friends_store::{
+    FriendShareMode as StoreShareMode, FriendsStore, load_or_create_identity,
+};
 use megu_client::integrated;
 use megu_client::protocol::{NbtValue, WireReader, encode_slot_stack};
 use megu_client::render::{FrameBudgetGovernor, RenderConfig, ThrottleStage};
@@ -53,11 +59,12 @@ use megu_ui::magic_hud::build_magic_hud_draw_list;
 use megu_ui::recipe_browser::{
     BrowserTab, DetailMode, ItemEntry, RecipeBrowserAction, RecipeBrowserState,
 };
+use megu_proto::frl_e2ee::{FriendAllowlist, Frl3GuestToken, Frl3Identity, parse_friend_id};
 use megu_ui::state::{
-    CrashReportMode as UiCrashReportMode, DisconnectedScreenState, GpuBackend, LodMode,
-    MinimapMode, MultiplayerScreenState, MultiplayerServerEntry, PlayerRadarScope, Screen,
-    SettingsTab, UiAction, UiInputEvent, UiKey, UiSettings, UiState, VideoPreset,
-    VisualStylePreset,
+    CrashReportMode as UiCrashReportMode, DisconnectedScreenState, FriendListEntry,
+    FriendShareMode as UiShareMode, FriendsScreenState, GpuBackend, LodMode, MinimapMode,
+    MultiplayerScreenState, MultiplayerServerEntry, PlayerRadarScope, Screen, SettingsTab,
+    UiAction, UiInputEvent, UiKey, UiSettings, UiState, VideoPreset, VisualStylePreset,
 };
 use megu_ui::state::{ScoreboardState, TitleOverlayState, invite_code_display};
 use winit::application::ApplicationHandler;
@@ -102,6 +109,10 @@ const SPRINT_FOV_SMOOTHING_RATE: f32 = 12.0;
 
 /// Friend-relay session timeout (register, join, revoke round-trips).
 const FRIEND_TIMEOUT: Duration = Duration::from_secs(10);
+/// `FRL3-FRIEND` host-share poll cadence: the relay link's read timeout
+/// doubles as the worker's event poll, so allowlist refreshes (friend
+/// removal kicks) apply within about this window.
+const FRIEND_SHARE_TIMEOUT: Duration = Duration::from_secs(3);
 
 /// Non-registry menu id for the client-side window-0 player inventory —
 /// `menu_schema` owns `0..=24` and this sentinel can never collide.
@@ -542,6 +553,47 @@ impl Keys {
     }
 }
 
+/// Commands the UI thread hands the friend-share worker.
+enum FriendShareCommand {
+    /// Rebuild the session allowlist — removed friends are kicked
+    /// (their streams terminated) inside `update_allowlist`.
+    ApplyAllowlist(FriendAllowlist),
+    /// Revoke the invite and end the pump.
+    Stop,
+}
+
+/// The worker's view back to the UI thread: the registered invite code,
+/// currently open guest streams, and a sticky error when the relay
+/// drops the session underneath us.
+#[derive(Default)]
+struct FriendShareShared {
+    invite_code: Option<megu_proto::InviteCode>,
+    /// `stream_id` → `(guest_name, verified guest megu-id)`.
+    guests: BTreeMap<u32, (String, Option<String>)>,
+    stopped: bool,
+    last_error: Option<String>,
+}
+
+/// The `FRL3-FRIEND` host-share pump running on its own thread:
+/// `FriendHostSession::recv_event` only returns per relay packet or per
+/// `FRIEND_SHARE_TIMEOUT` read window, so between polls the worker
+/// drains [`FriendShareCommand`]s and pumps guest↔world bytes over the
+/// per-stream loopback TCP pipes it opens to the integrated server.
+struct FriendShareWorker {
+    commands: mpsc::Sender<FriendShareCommand>,
+    shared: Arc<Mutex<FriendShareShared>>,
+    thread: Option<std::thread::JoinHandle<()>>,
+}
+
+/// A minted 128-bit one-off [`Frl3GuestToken`] bound to a friend's
+/// static key — admits exactly that guest key with that token while the
+/// grant lives (share-mode admission still applies to the key itself:
+/// `allowlist.allows` checks key *and* token).
+struct GuestLinkGrant {
+    friend_pk: [u8; 32],
+    token: Frl3GuestToken,
+}
+
 /// The `ApplicationHandler` `EventLoop::run_app` drives.
 pub struct GpuApp {
     config: GpuCliConfig,
@@ -621,6 +673,20 @@ pub struct GpuApp {
     friend_host: Option<FriendHostSession>,
     /// Friend-relay guest bridge while joined through an invite code.
     friend_bridge: Option<FriendGuestBridge>,
+    /// `FRL3` device identity from `<gameDir>/megu-identity.key` — the
+    /// 256-bit static key behind the player's `megu-id:`.
+    frl_identity: Option<Frl3Identity>,
+    /// `megu-friends.toml` mirror: share mode, saved relay, allowlist.
+    friends_store: Option<FriendsStore>,
+    /// Live `FRL3-FRIEND` host-share worker while Host World Sharing is
+    /// on; owns the relay session and the per-guest loopback pipes.
+    friend_share: Option<FriendShareWorker>,
+    /// The minted 128-bit guest token bound to one friend's allowlist
+    /// slot for the current share session; cleared when sharing stops.
+    guest_link_grant: Option<GuestLinkGrant>,
+    /// `(host megu-id, six-digit SAS)` of the latest friend join, for
+    /// the Friends screen's pairing readout.
+    friend_join_sas: Option<(String, u32)>,
     /// Background vanilla client-JAR bootstrap (manifest fetch +
     /// SHA-1-verified download) spawned at boot when no local JAR was
     /// found; polled non-blockingly from the event loop.
@@ -870,6 +936,11 @@ impl GpuApp {
             singleplayer_server,
             friend_host: None,
             friend_bridge: None,
+            frl_identity: None,
+            friends_store: None,
+            friend_share: None,
+            guest_link_grant: None,
+            friend_join_sas: None,
             vanilla_bootstrap: None,
             bootstrap_attempted: false,
             bootstrap_version: String::new(),
@@ -945,6 +1016,15 @@ impl GpuApp {
         let boot_settings = app.ui.settings.clone();
         app.apply_settings(&boot_settings);
         app.refresh_singleplayer_worlds();
+        // Quick-play boots straight into a hosted world — only that path
+        // loads FRL3 state eagerly so a persisted share mode re-arms
+        // before any screen opens. A plain boot must not mint
+        // `megu-identity.key` the player never asked for; screen entry
+        // loads it on demand.
+        if app.config.quick_play_singleplayer.is_some() {
+            app.load_friends_state();
+            app.maybe_start_friend_share();
+        }
         app
     }
 
@@ -1300,6 +1380,12 @@ impl GpuApp {
                 if *screen == Screen::Multiplayer {
                     self.refresh_multiplayer_servers();
                 }
+                // Both screens read `megu-friends.toml` + the FRL3
+                // identity; reload on entry so a hand-edited file or a
+                // late-bound relay address is picked up.
+                if matches!(*screen, Screen::Friends | Screen::Multiplayer) {
+                    self.load_friends_state();
+                }
                 self.ui.navigate(*screen);
             }
             UiAction::Back => {
@@ -1431,6 +1517,31 @@ impl GpuApp {
             }
             UiAction::LeaveWorld => self.leave_world_for_title(),
             UiAction::RecipeBrowser(action) => self.dispatch_recipe_browser_action(action),
+            // No clipboard backend is linked into this binary (same
+            // stance as `CopyInvite` above): the text stays visible on
+            // screen and the status line reports the dispatch.
+            UiAction::CopyText(text) => {
+                self.status_line(format!("Copy: {}…", truncate_for_status(text)));
+            }
+            UiAction::AddFriend { name, friend_id } => self.add_friend(name, friend_id),
+            UiAction::RemoveFriend { friend_id } => self.remove_friend(friend_id),
+            UiAction::SetFriendShareMode(mode) => self.set_friend_share_mode(*mode),
+            UiAction::SetFriendSelected {
+                friend_id,
+                selected,
+            } => self.set_friend_selected(friend_id, *selected),
+            UiAction::SaveRelayAddr { addr } => self.save_relay_addr(addr),
+            UiAction::GenerateGuestLink { friend_id } => self.generate_guest_link(friend_id),
+            UiAction::JoinFriendWorld { index } => {
+                if let Err(err) = self.join_friend_world(*index) {
+                    self.status_line(format!("Friend world: {err}"));
+                }
+            }
+            UiAction::JoinGuestLink { link } => {
+                if let Err(err) = self.join_guest_link(link) {
+                    self.status_line(format!("Guest link: {err}"));
+                }
+            }
             _ => {}
         }
     }
@@ -1473,6 +1584,9 @@ impl GpuApp {
     /// overlay. The UI already navigated to `Screen::Title` inside
     /// `activate`.
     fn leave_world_for_title(&mut self) {
+        // No world to share: revoke the friend session; the persisted
+        // share mode re-arms on the next hosted world.
+        self.stop_friend_share();
         self.live = None;
         self.singleplayer_server = None;
         self.container_screen = None;
@@ -1970,6 +2084,7 @@ impl GpuApp {
         let addr = server.addr();
         self.singleplayer_server = Some(server);
         self.connect_to(addr.ip().to_string(), addr.port());
+        self.maybe_start_friend_share();
         Ok(())
     }
 
@@ -2071,11 +2186,7 @@ impl GpuApp {
     /// configured relay, then run the normal session over its loopback
     /// endpoint — exactly the headless client's relay path.
     fn join_with_code(&mut self, code_value: u64) -> Result<(), String> {
-        let relay = self
-            .config
-            .relay
-            .clone()
-            .ok_or_else(|| "friend invites need --relay host:port".to_owned())?;
+        let relay = self.friend_relay_addr()?;
         let display = invite_code_display(code_value);
         let code = megu_proto::InviteCode::parse(&display)
             .map_err(|e| format!("invite code {display}: {e}"))?;
@@ -2116,6 +2227,522 @@ impl GpuApp {
         let value = invite_code_value(&code);
         self.friend_host = Some(session);
         self.ui.active_invite = Some(value);
+        Ok(())
+    }
+
+    // ------------------------------------------------------------------
+    // FRL3 friends: identity, allowlist store, host-share worker
+    // ------------------------------------------------------------------
+
+    /// `<gameDir>` or `.` — where `megu-identity.key`/`megu-friends.toml`
+    /// (and every other launcher-scoped file) live.
+    fn game_dir_path(&self) -> std::path::PathBuf {
+        self.config
+            .game_dir
+            .clone()
+            .unwrap_or_else(|| std::path::PathBuf::from("."))
+    }
+
+    /// Load `megu-identity.key` + `megu-friends.toml` and mirror them
+    /// into `ui.friends`. Runs at boot and every time the Friends or
+    /// Multiplayer screens open so a hand-edited toml is picked up; a
+    /// corrupt file is reported, never silently replaced.
+    fn load_friends_state(&mut self) {
+        let dir = self.game_dir_path();
+        match load_or_create_identity(&dir) {
+            Ok(identity) => self.frl_identity = Some(identity),
+            Err(err) => self.status_line(format!("FRL3 identity: {err}")),
+        }
+        match FriendsStore::load(&dir) {
+            Ok(mut store) => {
+                if let Some(identity) = &self.frl_identity {
+                    store.bind_identity(identity);
+                }
+                self.friends_store = Some(store);
+            }
+            Err(err) => self.status_line(format!("megu-friends.toml: {err}")),
+        }
+        self.refresh_friends_ui();
+    }
+
+    /// Mirror `friends_store` + the live share session into
+    /// `ui.friends` after every mutation — the screen only ever shows
+    /// what is persisted. Text fields the player is typing in are left
+    /// alone (relay field check mirrors the address-field pattern).
+    fn refresh_friends_ui(&mut self) {
+        let ui_friends: &mut FriendsScreenState = &mut self.ui.friends;
+        ui_friends.my_friend_id = self
+            .frl_identity
+            .as_ref()
+            .map(Frl3Identity::friend_id)
+            .unwrap_or_default();
+        let mut rows = Vec::new();
+        if let Some(store) = &self.friends_store {
+            ui_friends.share_mode = match store.share_mode {
+                StoreShareMode::Off => UiShareMode::Off,
+                StoreShareMode::FriendsOnly => UiShareMode::FriendsOnly,
+                StoreShareMode::SelectedFriends => UiShareMode::SelectedFriends,
+            };
+            if !ui_friends.relay_field_active() {
+                ui_friends.relay_addr_text = store.relay_addr.clone().unwrap_or_default();
+            }
+            rows = store
+                .friends
+                .iter()
+                .map(|f| FriendListEntry {
+                    name: f.name.clone(),
+                    friend_id: f.friend_id.clone(),
+                    selected_for_share: f.selected_for_share,
+                    connected: false,
+                    sas_code: None,
+                })
+                .collect();
+        }
+        // Live guest streams mark the row of the friend the handshake
+        // actually verified — the claim comes from `guest_friend_id`,
+        // never the spoofable `guest_name`.
+        if let Some(worker) = &self.friend_share {
+            if let Ok(shared) = worker.shared.lock() {
+                for (_, friend_id) in shared.guests.values() {
+                    if let Some(friend_id) = friend_id {
+                        if let Some(row) = rows.iter_mut().find(|r| &r.friend_id == friend_id) {
+                            row.connected = true;
+                        }
+                    }
+                }
+            }
+        }
+        // The guest-side SAS lands on the joined host's row.
+        if let Some((friend_id, sas)) = &self.friend_join_sas {
+            if let Some(row) = rows.iter_mut().find(|r| &r.friend_id == friend_id) {
+                row.sas_code = Some(*sas);
+            }
+        }
+        ui_friends.friends = rows;
+        if ui_friends
+            .selected
+            .is_some_and(|i| i >= ui_friends.friends.len())
+        {
+            ui_friends.selected = None;
+        }
+        ui_friends.scroll = ui_friends
+            .scroll
+            .min(ui_friends.friends.len().saturating_sub(1));
+        ui_friends.sharing_active = self.friend_share.is_some();
+    }
+
+    /// The relay `host:port` joins and sharing bind to: an explicit
+    /// `--relay` wins, the saved `megu-friends.toml` address is the
+    /// fallback — so a saved relay never needs the CLI flag.
+    fn friend_relay_addr(&self) -> Result<String, String> {
+        if let Some(relay) = &self.config.relay {
+            return Ok(relay.clone());
+        }
+        self.friends_store
+            .as_ref()
+            .and_then(|store| store.relay_addr.clone())
+            .ok_or_else(|| {
+                "set a relay address on the Friends screen (or pass --relay)".to_owned()
+            })
+    }
+
+    /// The allowlist the share session enforces right now: the store's
+    /// mode-driven set plus the live 128-bit guest-link grant (a
+    /// token-bound entry admits that one guest key with that token).
+    fn current_allowlist(&self) -> FriendAllowlist {
+        let mut allowlist = self
+            .friends_store
+            .as_ref()
+            .map(FriendsStore::active_allowlist)
+            .unwrap_or_default();
+        if let Some(grant) = &self.guest_link_grant {
+            allowlist.add_with_token(grant.friend_pk, grant.token);
+        }
+        allowlist
+    }
+
+    /// Persist the store, then push the rebuilt allowlist into the live
+    /// share worker — `update_allowlist` inside terminates the streams
+    /// of friends that fell out of the set.
+    fn commit_friends_store(&mut self) -> Result<(), String> {
+        let Some(store) = &self.friends_store else {
+            return Err("friends store not loaded".to_owned());
+        };
+        store
+            .save(&self.game_dir_path())
+            .map_err(|e| format!("megu-friends.toml save: {e}"))?;
+        if let Some(worker) = &self.friend_share {
+            let _ = worker
+                .commands
+                .send(FriendShareCommand::ApplyAllowlist(self.current_allowlist()));
+        }
+        Ok(())
+    }
+
+    /// `UiAction::AddFriend` — the store validates fail-closed (checksum,
+    /// duplicate key, self-key); rejections land on the inline error
+    /// line, never the void.
+    fn add_friend(&mut self, name: &str, friend_id: &str) {
+        let Some(store) = &mut self.friends_store else {
+            self.ui.friends.add_error = Some("friends store not loaded".to_owned());
+            return;
+        };
+        match store.add_friend(name, friend_id) {
+            Err(err) => self.ui.friends.add_error = Some(err),
+            Ok(entry) => {
+                let fid = entry.friend_id.clone();
+                match self.commit_friends_store() {
+                    Ok(()) => {
+                        self.ui.friends.add_error = None;
+                        self.ui.friends.add_name_text.clear();
+                        self.ui.friends.add_id_text.clear();
+                        self.ui.friends.status = Some(format!("Added {fid}"));
+                    }
+                    Err(err) => self.ui.friends.add_error = Some(err),
+                }
+            }
+        }
+        self.refresh_friends_ui();
+    }
+
+    /// `UiAction::RemoveFriend` — instant revoke: persists the removal,
+    /// then the worker's allowlist refresh terminates any live guest
+    /// stream for that key within one `FRIEND_SHARE_TIMEOUT` poll.
+    fn remove_friend(&mut self, friend_id: &str) {
+        let Some(store) = &mut self.friends_store else {
+            self.ui.friends.status = Some("friends store not loaded".to_owned());
+            return;
+        };
+        if !store.remove_friend(friend_id) {
+            self.ui.friends.status = Some("friend not in the allowlist".to_owned());
+        } else {
+            match self.commit_friends_store() {
+                Ok(()) => {
+                    self.ui.friends.status =
+                        Some(format!("Removed {friend_id} — kicked from your world"))
+                }
+                Err(err) => self.ui.friends.status = Some(err),
+            }
+        }
+        self.refresh_friends_ui();
+    }
+
+    /// `UiAction::SetFriendShareMode` — persist the mode, then start or
+    /// stop the E2EE share session to match. `Off` revokes; an active
+    /// mode registers when a world is hosted (or re-pushes the
+    /// allowlist into a running session).
+    fn set_friend_share_mode(&mut self, mode: UiShareMode) {
+        let store_mode = match mode {
+            UiShareMode::Off => StoreShareMode::Off,
+            UiShareMode::FriendsOnly => StoreShareMode::FriendsOnly,
+            UiShareMode::SelectedFriends => StoreShareMode::SelectedFriends,
+        };
+        if let Some(store) = &mut self.friends_store {
+            store.share_mode = store_mode;
+        }
+        if let Err(err) = self.commit_friends_store() {
+            self.ui.friends.status = Some(err);
+        }
+        match mode {
+            UiShareMode::Off => self.stop_friend_share(),
+            _ => {
+                if self.friend_share.is_none() && self.singleplayer_server.is_some() {
+                    match self.start_friend_share() {
+                        Ok(()) => {
+                            self.ui.friends.status = Some("Sharing live".to_owned());
+                        }
+                        Err(err) => {
+                            self.ui.friends.status = Some(format!("Sharing: {err}"));
+                        }
+                    }
+                } else if self.friend_share.is_none() {
+                    self.ui.friends.status = Some(
+                        "Sharing armed — starts when you host a world".to_owned(),
+                    );
+                }
+            }
+        }
+        self.refresh_friends_ui();
+    }
+
+    /// `UiAction::SetFriendSelected` — persist the row's
+    /// `selected_for_share` flag and refresh the live allowlist.
+    fn set_friend_selected(&mut self, friend_id: &str, selected: bool) {
+        let Some(store) = &mut self.friends_store else {
+            return;
+        };
+        if let Some(entry) = store
+            .friends
+            .iter_mut()
+            .find(|f| f.friend_id == friend_id)
+        {
+            entry.selected_for_share = selected;
+            if let Err(err) = self.commit_friends_store() {
+                self.ui.friends.status = Some(err);
+            }
+        }
+        self.refresh_friends_ui();
+    }
+
+    /// `UiAction::SaveRelayAddr` — persist the typed `host:port`; `""`
+    /// clears. Joins and sharing read it back through
+    /// [`Self::friend_relay_addr`].
+    fn save_relay_addr(&mut self, addr: &str) {
+        let Some(store) = &mut self.friends_store else {
+            self.ui.friends.status = Some("friends store not loaded".to_owned());
+            return;
+        };
+        store.relay_addr = if addr.is_empty() {
+            None
+        } else {
+            Some(addr.to_owned())
+        };
+        match self.commit_friends_store() {
+            Ok(()) => {
+                self.ui.friends.status = Some(if addr.is_empty() {
+                    "Relay address cleared".to_owned()
+                } else {
+                    format!("Relay saved: {addr}")
+                });
+            }
+            Err(err) => self.ui.friends.status = Some(err),
+        }
+        self.refresh_friends_ui();
+    }
+
+    /// Register the E2EE host-share session on the relay and spawn the
+    /// pump thread. No-op when sharing already runs.
+    fn start_friend_share(&mut self) -> Result<(), String> {
+        if self.friend_share.is_some() {
+            return Ok(());
+        }
+        let server = self
+            .singleplayer_server
+            .as_ref()
+            .ok_or_else(|| "start a world first (Singleplayer)".to_owned())?;
+        let identity = self
+            .frl_identity
+            .clone()
+            .ok_or_else(|| "no FRL3 identity (megu-identity.key)".to_owned())?;
+        let relay = self.friend_relay_addr()?;
+        let protocol = self.config.mc_version.parse::<i32>().unwrap_or(767);
+        let world = self
+            .config
+            .quick_play_singleplayer
+            .clone()
+            .unwrap_or_else(|| "New World".to_owned());
+        let host = FriendHostSession::register_e2ee_friends(
+            &relay,
+            protocol,
+            &world,
+            8,
+            identity,
+            self.current_allowlist(),
+            FRIEND_SHARE_TIMEOUT,
+        )?;
+        let invite_code = host.invite_code();
+        let shared = Arc::new(Mutex::new(FriendShareShared {
+            invite_code: Some(invite_code),
+            ..FriendShareShared::default()
+        }));
+        let (commands, inbox) = mpsc::channel();
+        let worker_shared = Arc::clone(&shared);
+        let world_addr = server.addr();
+        let thread = std::thread::Builder::new()
+            .name("friend-share".to_owned())
+            .spawn(move || run_friend_share_worker(host, world_addr, worker_shared, inbox))
+            .map_err(|e| format!("friend share worker: {e}"))?;
+        self.friend_share = Some(FriendShareWorker {
+            commands,
+            shared,
+            thread: Some(thread),
+        });
+        self.status_line(format!("Friend sharing live: {invite_code}"));
+        Ok(())
+    }
+
+    /// Revoke the share session and join the pump thread (bounded by
+    /// `FRIEND_SHARE_TIMEOUT` per pending relay read).
+    fn stop_friend_share(&mut self) {
+        if let Some(mut worker) = self.friend_share.take() {
+            let _ = worker.commands.send(FriendShareCommand::Stop);
+            if let Some(thread) = worker.thread.take() {
+                let _ = thread.join();
+            }
+        }
+        self.guest_link_grant = None;
+        self.ui.friends.guest_link = None;
+        self.ui.friends.sharing_active = false;
+    }
+
+    /// Start sharing when the persisted mode is armed and a world is
+    /// hosted — called after a singleplayer world attaches so the
+    /// toggle survives restarts like vanilla's "Open to LAN".
+    fn maybe_start_friend_share(&mut self) {
+        let armed = self
+            .friends_store
+            .as_ref()
+            .is_some_and(|store| store.share_mode != StoreShareMode::Off);
+        if armed && self.friend_share.is_none() && self.singleplayer_server.is_some() {
+            if let Err(err) = self.start_friend_share() {
+                self.status_line(format!("Friend sharing: {err}"));
+            }
+            self.refresh_friends_ui();
+        }
+    }
+
+    /// Reap a worker that exited on its own (relay drop, fatal link
+    /// error) and refresh the guest-connected row flags — polled from
+    /// the event loop next to the other background workers.
+    fn poll_friend_share(&mut self) {
+        let dead = self.friend_share.as_ref().is_some_and(|worker| {
+            worker
+                .shared
+                .lock()
+                .map(|shared| shared.stopped)
+                .unwrap_or(false)
+        });
+        if dead {
+            let mut last_error = None;
+            if let Some(mut worker) = self.friend_share.take() {
+                if let Ok(shared) = worker.shared.lock() {
+                    last_error = shared.last_error.clone();
+                }
+                if let Some(thread) = worker.thread.take() {
+                    let _ = thread.join();
+                }
+            }
+            self.guest_link_grant = None;
+            self.ui.friends.guest_link = None;
+            self.ui.friends.sharing_active = false;
+            match last_error {
+                Some(err) => self.status_line(format!("Friend sharing stopped: {err}")),
+                None => self.status_line("Friend sharing stopped"),
+            }
+            self.refresh_friends_ui();
+        } else if self.friend_share.is_some() && self.ui.screen == Screen::Friends {
+            self.refresh_friends_ui();
+        }
+    }
+
+    /// `UiAction::GenerateGuestLink` — mint a 128-bit token bound to the
+    /// selected friend's key, push it into the live allowlist, and
+    /// compose the shareable `megu-friend:` link (host id + invite code
+    /// + token).
+    fn generate_guest_link(&mut self, friend_id: &str) {
+        match self.build_guest_link(friend_id) {
+            Ok(link) => {
+                self.ui.friends.guest_link = Some(link);
+                self.ui.friends.status = Some("Guest link ready".to_owned());
+            }
+            Err(err) => self.ui.friends.status = Some(format!("Guest link: {err}")),
+        }
+        self.refresh_friends_ui();
+    }
+
+    fn build_guest_link(&mut self, friend_id: &str) -> Result<String, String> {
+        let friend_pk =
+            parse_friend_id(friend_id).map_err(|e| format!("friend id: {e}"))?;
+        let token = Frl3GuestToken::generate();
+        self.guest_link_grant = Some(GuestLinkGrant { friend_pk, token });
+        let worker = self
+            .friend_share
+            .as_ref()
+            .ok_or_else(|| "turn Sharing on first".to_owned())?;
+        worker
+            .commands
+            .send(FriendShareCommand::ApplyAllowlist(self.current_allowlist()))
+            .map_err(|_| "share worker is gone".to_owned())?;
+        let invite_code = worker
+            .shared
+            .lock()
+            .ok()
+            .and_then(|shared| shared.invite_code)
+            .ok_or_else(|| "no invite code yet".to_owned())?;
+        let host_id = self
+            .frl_identity
+            .as_ref()
+            .map(FriendsStore::my_friend_id)
+            .ok_or_else(|| "no FRL3 identity".to_owned())?;
+        Ok(format!(
+            "megu-friend:{host_id}:{invite_code}:{}",
+            guest_link_b32_encode(&token.as_bytes())
+        ))
+    }
+
+    /// `UiAction::JoinFriendWorld` — 1-click E2EE join of a friend-hosted
+    /// world row: the row's pinned `megu-id:` becomes the expected host
+    /// key, its invite code + relay address come from the presence feed.
+    fn join_friend_world(&mut self, index: usize) -> Result<(), String> {
+        let entry = self
+            .ui
+            .multiplayer
+            .friend_worlds
+            .get(index)
+            .cloned()
+            .ok_or_else(|| "friend world no longer listed".to_owned())?;
+        let host_pk = parse_friend_id(&entry.friend_id)
+            .map_err(|e| format!("friend id '{}': {e}", entry.friend_id))?;
+        let code = megu_proto::InviteCode::parse(&entry.invite_code)
+            .map_err(|e| format!("invite code {}: {e}", entry.invite_code))?;
+        let relay = if entry.relay_addr.is_empty() {
+            self.friend_relay_addr()?
+        } else {
+            entry.relay_addr.clone()
+        };
+        let identity = self
+            .frl_identity
+            .clone()
+            .ok_or_else(|| "no FRL3 identity — open the Friends screen once".to_owned())?;
+        let bridge = FriendGuestBridge::start_e2ee_friend(
+            &relay,
+            &code,
+            &self.config.username,
+            &identity,
+            &host_pk,
+            FRIEND_TIMEOUT,
+        )?;
+        if let Some(sas) = bridge.sas_code() {
+            self.friend_join_sas = Some((entry.friend_id.clone(), sas));
+            self.status_line(format!(
+                "Friend join SAS {sas:06} — compare it with {}",
+                entry.friend_name
+            ));
+        }
+        let addr = bridge.local_addr();
+        self.friend_bridge = Some(bridge);
+        self.connect_to(addr.ip().to_string(), addr.port());
+        Ok(())
+    }
+
+    /// `UiAction::JoinGuestLink` — parse the pasted `megu-friend:` link
+    /// (host id + invite code + 128-bit token) and open the E2EE join
+    /// with `start_e2ee_friend_with_token`.
+    fn join_guest_link(&mut self, link: &str) -> Result<(), String> {
+        let (host_pk, host_id, code, token) = parse_guest_link(link)?;
+        let relay = self.friend_relay_addr()?;
+        let identity = self
+            .frl_identity
+            .clone()
+            .ok_or_else(|| "no FRL3 identity — open the Friends screen once".to_owned())?;
+        let bridge = FriendGuestBridge::start_e2ee_friend_with_token(
+            &relay,
+            &code,
+            &self.config.username,
+            &identity,
+            &host_pk,
+            token,
+            FRIEND_TIMEOUT,
+        )?;
+        if let Some(sas) = bridge.sas_code() {
+            self.friend_join_sas = Some((host_id, sas));
+            self.status_line(format!(
+                "Friend join SAS {sas:06} — compare it with your friend"
+            ));
+        }
+        let addr = bridge.local_addr();
+        self.friend_bridge = Some(bridge);
+        self.connect_to(addr.ip().to_string(), addr.port());
         Ok(())
     }
 
@@ -4059,6 +4686,194 @@ impl GpuApp {
     }
 }
 
+/// The friend-share pump. `recv_event` returns once per relay packet or
+/// per `FRIEND_SHARE_TIMEOUT` read window; between windows the worker
+/// drains UI commands (allowlist refresh = instant friend kicks, Stop)
+/// and forwards each guest stream to a loopback TCP pipe into the
+/// integrated server — the relay only ever sees AEAD records.
+fn run_friend_share_worker(
+    mut host: FriendHostSession,
+    world_addr: SocketAddr,
+    shared: Arc<Mutex<FriendShareShared>>,
+    commands: mpsc::Receiver<FriendShareCommand>,
+) {
+    let mut pipes: BTreeMap<u32, TcpStream> = BTreeMap::new();
+    let mut stop = false;
+    while !stop {
+        match host.recv_event() {
+            Ok(FriendHostEvent::GuestOpened {
+                stream_id,
+                guest_name,
+            }) => {
+                let friend_id = host.guest_friend_id(stream_id);
+                match TcpStream::connect_timeout(&world_addr, FRIEND_SHARE_TIMEOUT) {
+                    Ok(tcp) => {
+                        let _ = tcp.set_nonblocking(true);
+                        pipes.insert(stream_id, tcp);
+                    }
+                    Err(_) => {
+                        let _ = host.close_stream(stream_id, "local world unreachable");
+                    }
+                }
+                if let Ok(mut s) = shared.lock() {
+                    s.guests.insert(stream_id, (guest_name, friend_id));
+                }
+            }
+            Ok(FriendHostEvent::GameData {
+                stream_id,
+                payload,
+            }) => {
+                let dead = pipes
+                    .get_mut(&stream_id)
+                    .is_some_and(|tcp| tcp.write_all(&payload).is_err());
+                if dead {
+                    pipes.remove(&stream_id);
+                    let _ = host.close_stream(stream_id, "local link closed");
+                }
+            }
+            Ok(FriendHostEvent::GuestClosed { stream_id, .. }) => {
+                pipes.remove(&stream_id);
+                if let Ok(mut s) = shared.lock() {
+                    s.guests.remove(&stream_id);
+                }
+            }
+            // A timed-out poll keeps partial frames buffered inside the
+            // link — retrying loses nothing.
+            Err(err) if err.contains("timed out") => {}
+            Err(err) => {
+                if let Ok(mut s) = shared.lock() {
+                    s.last_error = Some(err);
+                }
+                break;
+            }
+        }
+        while let Ok(command) = commands.try_recv() {
+            match command {
+                FriendShareCommand::ApplyAllowlist(allowlist) => {
+                    if let Err(err) = host.update_allowlist(allowlist) {
+                        if let Ok(mut s) = shared.lock() {
+                            s.last_error = Some(err);
+                        }
+                    }
+                }
+                FriendShareCommand::Stop => stop = true,
+            }
+        }
+        // World → guest: each pipe is nonblocking; a dead pipe closes
+        // the stream so a crashed world can never wedge a guest.
+        let mut dead = Vec::new();
+        for (stream_id, tcp) in pipes.iter_mut() {
+            let mut buf = [0u8; 8192];
+            match tcp.read(&mut buf) {
+                Ok(0) => dead.push(*stream_id),
+                Ok(n) => {
+                    if host.send_game_bytes(*stream_id, &buf[..n]).is_err() {
+                        dead.push(*stream_id);
+                    }
+                }
+                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {}
+                Err(_) => dead.push(*stream_id),
+            }
+        }
+        for stream_id in dead {
+            pipes.remove(&stream_id);
+            let _ = host.close_stream(stream_id, "local link closed");
+        }
+    }
+    let _ = host.revoke();
+    if let Ok(mut s) = shared.lock() {
+        s.stopped = true;
+        s.guests.clear();
+    }
+}
+
+/// One status-line line's worth of `text` — char-boundary safe, so a
+/// pasted `megu-friend:` link or `megu-id:` never splits mid-grapheme.
+fn truncate_for_status(text: &str) -> &str {
+    const LIMIT: usize = 64;
+    if text.len() <= LIMIT {
+        return text;
+    }
+    let mut end = LIMIT;
+    while !text.is_char_boundary(end) {
+        end -= 1;
+    }
+    &text[..end]
+}
+
+/// Crockford Base32 — the same alphabet `InviteCode` and `megu-id:`
+/// render with — for the 128-bit token segment of `megu-friend:` links.
+const GUEST_LINK_B32: &[u8; 32] = b"0123456789ABCDEFGHJKMNPQRSTVWXYZ";
+
+fn guest_link_b32_encode(bytes: &[u8]) -> String {
+    let mut out = String::with_capacity((bytes.len() * 8).div_ceil(5));
+    let mut acc = 0u32;
+    let mut bits = 0u32;
+    for &b in bytes {
+        acc = (acc << 8) | u32::from(b);
+        bits += 8;
+        while bits >= 5 {
+            bits -= 5;
+            out.push(char::from(GUEST_LINK_B32[((acc >> bits) & 31) as usize]));
+        }
+    }
+    if bits > 0 {
+        out.push(char::from(
+            GUEST_LINK_B32[((acc << (5 - bits)) & 31) as usize],
+        ));
+    }
+    out
+}
+
+fn guest_link_b32_decode(text: &str) -> Result<Vec<u8>, String> {
+    let mut acc = 0u64;
+    let mut bits = 0u32;
+    let mut out = Vec::with_capacity(text.len() * 5 / 8);
+    for raw in text.bytes() {
+        // Homoglyph normalization matches `InviteCode::parse`.
+        let digit = match raw.to_ascii_uppercase() {
+            b'O' => b'0',
+            b'I' | b'L' => b'1',
+            d => d,
+        };
+        let Some(v) = GUEST_LINK_B32.iter().position(|&c| c == digit) else {
+            return Err("invalid base32 character in guest link".to_owned());
+        };
+        acc = (acc << 5) | v as u64;
+        bits += 5;
+        if bits >= 8 {
+            bits -= 8;
+            out.push((acc >> bits) as u8);
+        }
+    }
+    Ok(out)
+}
+
+/// `megu-friend:megu-id:<58>:MEGU-XXXX-XXXX:<26>` — host static id +
+/// invite code + 128-bit one-off token, `:`-separated so the embedded
+/// `megu-id:`/`MEGU-…` hyphens can't confuse the split. Fail-closed:
+/// every segment is re-validated (id checksum, code shape, token size).
+fn parse_guest_link(
+    link: &str,
+) -> Result<([u8; 32], String, megu_proto::InviteCode, Frl3GuestToken), String> {
+    let segs: Vec<&str> = link.trim().split(':').collect();
+    if segs.len() != 5
+        || !segs[0].eq_ignore_ascii_case("megu-friend")
+        || !segs[1].eq_ignore_ascii_case("megu-id")
+    {
+        return Err("expected megu-friend:megu-id:<id>:<code>:<token>".to_owned());
+    }
+    let host_id = format!("megu-id:{}", segs[2]);
+    let host_pk = parse_friend_id(&host_id).map_err(|e| format!("host id: {e}"))?;
+    let code =
+        megu_proto::InviteCode::parse(segs[3]).map_err(|e| format!("invite code: {e}"))?;
+    let token = guest_link_b32_decode(segs[4])?;
+    let token: [u8; 16] = token
+        .try_into()
+        .map_err(|_| "guest token must be 128 bits".to_owned())?;
+    Ok((host_pk, host_id, code, Frl3GuestToken::from_bytes(token)))
+}
+
 /// Parse the simple `missing mods: id@version, ...` kick form used by
 /// server-side dependency gates. Unknown prose stays on the ordinary
 /// disconnect screen instead of being guessed into install requests.
@@ -4436,6 +5251,8 @@ impl ApplicationHandler for GpuApp {
         // even while occluded so a download finishing in the background
         // still lands `Ready` and re-arms asset discovery.
         self.poll_vanilla_bootstrap();
+        // Reap a dead share worker + keep guest-connected flags fresh.
+        self.poll_friend_share();
         if self.occluded && std::env::var_os("MEGU_DISABLE_OCCLUSION_SLEEP").is_none() {
             // Zero-GPU sleep: no redraw requests at all. A slow tick keeps
             // the live session polled until the surface un-occludes.
@@ -6232,5 +7049,237 @@ mod tests {
             .unwrap();
         app.sync_container_screen();
         assert_eq!(app.container_screen.as_ref().unwrap().property(2), 42);
+    }
+
+    /// Opening `Screen::Friends` mints `megu-identity.key` +
+    /// `megu-friends.toml` under `<gameDir>` and mirrors them into
+    /// `ui.friends` — the row set is exactly what the store holds.
+    #[test]
+    fn friends_screen_loads_identity_and_store_into_ui() {
+        let dir =
+            std::env::temp_dir().join(format!("megu-gpu-friends-load-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut app = GpuApp::new(GpuCliConfig {
+            game_dir: Some(dir.clone()),
+            ..GpuCliConfig::default()
+        });
+        // A plain boot does not mint identity files (screen entry owns that).
+        assert!(!dir.join("megu-identity.key").exists());
+
+        app.dispatch_ui_action(&UiAction::OpenScreen(Screen::Friends));
+        assert_eq!(app.ui.screen, Screen::Friends);
+        assert!(dir.join("megu-identity.key").exists());
+        assert!(app.ui.friends.my_friend_id.starts_with("megu-id:"));
+        // The persisted identity and the displayed id agree.
+        let store = FriendsStore::load(&dir).unwrap();
+        let identity = load_or_create_identity(&dir).unwrap();
+        assert_eq!(
+            app.ui.friends.my_friend_id,
+            FriendsStore::my_friend_id(&identity)
+        );
+        assert!(store.friends.is_empty());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// `AddFriend`/`RemoveFriend` through `dispatch_ui_action` persist to
+    /// `megu-friends.toml`, mirror the rows, and surface store rejections
+    /// (bad checksum, self-key, duplicate) on `add_error` — never silent.
+    #[test]
+    fn friends_add_remove_persist_through_dispatch() {
+        let dir =
+            std::env::temp_dir().join(format!("megu-gpu-friends-edit-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut app = GpuApp::new(GpuCliConfig {
+            game_dir: Some(dir.clone()),
+            ..GpuCliConfig::default()
+        });
+        app.dispatch_ui_action(&UiAction::OpenScreen(Screen::Friends));
+
+        // Rejections land inline: garbage id, then the player's own key.
+        app.dispatch_ui_action(&UiAction::AddFriend {
+            name: "Bad".into(),
+            friend_id: "megu-id:NOTAREALID".into(),
+        });
+        assert!(app.ui.friends.add_error.is_some());
+        let own = app.ui.friends.my_friend_id.clone();
+        app.dispatch_ui_action(&UiAction::AddFriend {
+            name: "Self".into(),
+            friend_id: own,
+        });
+        assert!(app.ui.friends.add_error.is_some());
+        assert!(app.ui.friends.friends.is_empty());
+
+        // A valid `megu-id:` adds + persists + clears the input fields.
+        let friend_id = Frl3Identity::from_secret([9u8; 32]).friend_id();
+        app.ui.friends.add_name_text = "Pal".into();
+        app.ui.friends.add_id_text = friend_id.clone();
+        app.dispatch_ui_action(&UiAction::AddFriend {
+            name: "Pal".into(),
+            friend_id: friend_id.clone(),
+        });
+        assert!(app.ui.friends.add_error.is_none());
+        assert_eq!(app.ui.friends.friends.len(), 1);
+        assert_eq!(app.ui.friends.friends[0].friend_id, friend_id);
+        assert!(app.ui.friends.add_name_text.is_empty());
+        assert!(app.ui.friends.add_id_text.is_empty());
+        let store = FriendsStore::load(&dir).unwrap();
+        assert_eq!(store.friends.len(), 1);
+        assert_eq!(store.friends[0].name, "Pal");
+
+        // Duplicates are rejected too.
+        app.dispatch_ui_action(&UiAction::AddFriend {
+            name: "Pal2".into(),
+            friend_id: friend_id.clone(),
+        });
+        assert!(app.ui.friends.add_error.is_some());
+
+        // Remove persists and drops the row.
+        app.dispatch_ui_action(&UiAction::RemoveFriend {
+            friend_id: friend_id.clone(),
+        });
+        assert!(app.ui.friends.friends.is_empty());
+        let store = FriendsStore::load(&dir).unwrap();
+        assert!(store.friends.is_empty());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Share-mode cycling + the relay field persist to
+    /// `megu-friends.toml`; a non-`Off` mode without a hosted world is
+    /// armed (not silently dropped) and `Off` stops a live share.
+    #[test]
+    fn friends_share_mode_and_relay_persist_to_toml() {
+        let dir =
+            std::env::temp_dir().join(format!("megu-gpu-friends-mode-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut app = GpuApp::new(GpuCliConfig {
+            game_dir: Some(dir.clone()),
+            ..GpuCliConfig::default()
+        });
+        app.dispatch_ui_action(&UiAction::OpenScreen(Screen::Friends));
+
+        app.dispatch_ui_action(&UiAction::SetFriendShareMode(
+            UiShareMode::SelectedFriends,
+        ));
+        let store = FriendsStore::load(&dir).unwrap();
+        assert_eq!(store.share_mode, StoreShareMode::SelectedFriends);
+        // No hosted world → armed, not a bogus "live" claim.
+        assert!(!app.ui.friends.sharing_active);
+        assert!(app.friend_share.is_none());
+        assert!(app
+            .ui
+            .friends
+            .status
+            .as_deref()
+            .is_some_and(|s| s.contains("armed")));
+
+        app.dispatch_ui_action(&UiAction::SaveRelayAddr {
+            addr: "relay.example.org:7777".into(),
+        });
+        let store = FriendsStore::load(&dir).unwrap();
+        assert_eq!(store.relay_addr.as_deref(), Some("relay.example.org:7777"));
+        // The saved relay is the join/share fallback once persisted.
+        assert_eq!(app.friend_relay_addr().unwrap(), "relay.example.org:7777");
+        // An explicit `--relay` still wins over the saved one.
+        let mut app2 = GpuApp::new(GpuCliConfig {
+            game_dir: Some(dir.clone()),
+            relay: Some("cli-relay:1".into()),
+            ..GpuCliConfig::default()
+        });
+        app2.dispatch_ui_action(&UiAction::OpenScreen(Screen::Friends));
+        assert_eq!(app2.friend_relay_addr().unwrap(), "cli-relay:1");
+
+        // Back to Off — persisted.
+        app.dispatch_ui_action(&UiAction::SetFriendShareMode(UiShareMode::Off));
+        let store = FriendsStore::load(&dir).unwrap();
+        assert_eq!(store.share_mode, StoreShareMode::Off);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The `megu-friend:` guest-link codec round-trips host id + invite
+    /// code + 128-bit token and rejects every malformed surface form —
+    /// a bad id checksum, a truncated token, garbage — fail-closed.
+    #[test]
+    fn guest_link_codec_roundtrip_and_rejects_garbage() {
+        let host_id = Frl3Identity::from_secret([7u8; 32]).friend_id();
+        let code = megu_proto::InviteCode::from_bytes([0x12, 0x34, 0x56, 0x78, 0x9A]);
+        let token = Frl3GuestToken::from_bytes([0xAB; 16]);
+        let link = format!(
+            "megu-friend:{host_id}:{code}:{}",
+            guest_link_b32_encode(&token.as_bytes())
+        );
+        let (pk, parsed_id, parsed_code, parsed_token) = parse_guest_link(&link).unwrap();
+        assert_eq!(parsed_id, host_id);
+        assert_eq!(pk, parse_friend_id(&host_id).unwrap());
+        assert_eq!(parsed_code.as_bytes(), code.as_bytes());
+        assert_eq!(parsed_token.as_bytes(), token.as_bytes());
+
+        assert!(parse_guest_link("nonsense").is_err());
+        assert!(parse_guest_link("megu-friend:megu-id:BADID:MEGU-0000-0000:AAAA").is_err());
+        // Token must decode to exactly 16 bytes.
+        assert!(parse_guest_link(&format!(
+            "megu-friend:{host_id}:{code}:AAAA"
+        ))
+        .is_err());
+        // A missing segment can't be salvaged.
+        assert!(parse_guest_link(&format!("megu-friend:{host_id}")).is_err());
+    }
+
+    /// `JoinFriendWorld` resolves the row and surfaces every failure on
+    /// the status line — an empty list, a bad id, an unreachable relay —
+    /// without panicking or leaving a bridge behind.
+    #[test]
+    fn join_friend_world_surfaces_errors_not_panics() {
+        let dir =
+            std::env::temp_dir().join(format!("megu-gpu-friend-join-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut app = GpuApp::new(GpuCliConfig {
+            game_dir: Some(dir.clone()),
+            ..GpuCliConfig::default()
+        });
+        app.dispatch_ui_action(&UiAction::OpenScreen(Screen::Multiplayer));
+
+        // Empty row list → out-of-range is an error, not a panic.
+        app.dispatch_ui_action(&UiAction::JoinFriendWorld { index: 0 });
+        assert!(app.ui.title_status.is_some());
+        assert!(app.friend_bridge.is_none());
+
+        // A well-formed row pointing at a closed relay port fails the
+        // handshake fast and leaves no half-attached bridge.
+        app.ui.multiplayer.friend_worlds = vec![megu_ui::state::FriendWorldEntry {
+            friend_name: "Pal".into(),
+            friend_id: Frl3Identity::from_secret([3u8; 32]).friend_id(),
+            world_name: "Sky".into(),
+            online_players: 1,
+            max_players: 8,
+            relay_addr: "127.0.0.1:1".into(),
+            invite_code: "MEGU-0000-0000".into(),
+        }];
+        app.dispatch_ui_action(&UiAction::JoinFriendWorld { index: 0 });
+        assert!(app.ui.title_status.is_some());
+        assert!(app.friend_bridge.is_none());
+
+        // Same for a pasted guest link with a dead relay.
+        app.dispatch_ui_action(&UiAction::JoinGuestLink {
+            link: "megu-friend:megu-id:NOTREAL:MEGU-0000-0000:AAAA".into(),
+        });
+        assert!(app.friend_bridge.is_none());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// `CopyText` has no clipboard backend here — the dispatch reports
+    /// on the status line so the click can never fall into the void.
+    #[test]
+    fn copy_text_reports_on_status_line() {
+        let mut app = GpuApp::new(GpuCliConfig::default());
+        app.dispatch_ui_action(&UiAction::CopyText("megu-id:ABCDEF".into()));
+        assert!(app
+            .ui
+            .title_status
+            .as_deref()
+            .is_some_and(|s| s.starts_with("Copy:")));
     }
 }

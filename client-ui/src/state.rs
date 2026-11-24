@@ -1910,6 +1910,66 @@ pub enum UiAction {
     RevokeInvite,
     /// Guest wants to join using this parsed code value.
     JoinWithCode(u64),
+    /// Copy `0` to the system clipboard — the player's own `megu-id:` or
+    /// a generated guest link (host reports when no clipboard backend).
+    CopyText(String),
+    /// Friends screen `[Add]`: pair `friend_id` (a `megu-id:` string)
+    /// under `name`. The host validates fail-closed — bad checksum,
+    /// duplicate key, or the player's own key are rejected into
+    /// `friends.add_error`.
+    AddFriend {
+        /// Display name for the new friend row.
+        name: String,
+        /// The pasted `megu-id:` text.
+        friend_id: String,
+    },
+    /// Friends row `[Remove]`: instantly revoke `friend_id` (a
+    /// `megu-id:`) from `megu-friends.toml` and kick any live guest
+    /// stream via the share session's allowlist refresh.
+    RemoveFriend {
+        /// Canonical `megu-id:` of the friend to drop.
+        friend_id: String,
+    },
+    /// Host World Sharing cycle landed on a new mode; the host persists
+    /// it to `megu-friends.toml` and starts/stops the E2EE share session.
+    SetFriendShareMode(FriendShareMode),
+    /// A friend row's Selected-Friends checkbox toggled; the host
+    /// persists `selected_for_share` and refreshes the live allowlist.
+    SetFriendSelected {
+        /// Canonical `megu-id:` of the friend toggled.
+        friend_id: String,
+        /// New `selected_for_share` value.
+        selected: bool,
+    },
+    /// The relay-address field committed; the host persists it to
+    /// `megu-friends.toml` (`""` clears) — joins and sharing never need
+    /// `--relay` once this is saved.
+    SaveRelayAddr {
+        /// The typed `host:port` text, verbatim.
+        addr: String,
+    },
+    /// `[Generate Guest Link]`: mint a 128-bit one-off guest token bound
+    /// to `friend_id` and compose the shareable `megu-friend:` link —
+    /// admits a guest who is not on the always-on allowlist exactly once
+    /// while the token entry lives.
+    GenerateGuestLink {
+        /// Canonical `megu-id:` of the friend the token binds to.
+        friend_id: String,
+    },
+    /// A "Friends & LAN" friend-world row click: the host resolves row
+    /// `index` of `multiplayer.friend_worlds` and opens the E2EE join
+    /// (`FriendGuestBridge::start_e2ee_friend`).
+    JoinFriendWorld {
+        /// Index into `multiplayer.friend_worlds`.
+        index: usize,
+    },
+    /// Guest pasted a `megu-friend:` guest link in the join field; the
+    /// host parses host id + invite code + 128-bit token and opens the
+    /// E2EE join (`start_e2ee_friend_with_token`).
+    JoinGuestLink {
+        /// The pasted `megu-friend:` link, verbatim.
+        link: String,
+    },
     /// Player explicitly accepted the pending mod sync; install `0`.
     ApplyModSync(Vec<ModSyncEntry>),
     /// Player explicitly requested the missing dependencies from Modrinth.
@@ -1984,6 +2044,16 @@ pub enum WidgetId {
     MultiplayerListUp,
     MultiplayerListDown,
     MultiplayerBack,
+    /// A friend-hosted world row in the "Friends & LAN" section; `0`
+    /// indexes `multiplayer.friend_worlds`. Click = 1-click E2EE join.
+    MultiplayerFriendWorld(usize),
+    /// A LAN-discovered world row; `0` indexes `multiplayer.lan_worlds`.
+    MultiplayerLanWorld(usize),
+    /// "Friends & LAN" section pager.
+    MultiplayerFriendLanUp,
+    MultiplayerFriendLanDown,
+    /// Shortcut into `Screen::Friends` from the section header.
+    MultiplayerManageFriends,
     // Disconnected screen
     DisconnectedBack,
     // Settings chrome
@@ -2065,6 +2135,34 @@ pub enum WidgetId {
     FriendsJoinField,
     FriendsJoin,
     FriendsBack,
+    /// `[Copy ID]` beside the player's own `megu-id:`.
+    FriendsCopyId,
+    /// Add-friend display-name text field.
+    FriendsAddNameField,
+    /// Add-friend `megu-id:` text field.
+    FriendsAddIdField,
+    /// `[Add]` — pair the typed `megu-id:` under the typed name.
+    FriendsAdd,
+    /// A friend row's name/id zone; `0` indexes `friends.friends`.
+    /// Click selects the row for `[Generate Guest Link]`.
+    FriendRow(usize),
+    /// A friend row's Selected-Friends checkbox; `0` indexes
+    /// `friends.friends`.
+    FriendSelected(usize),
+    /// A friend row's instant `[Remove]`; `0` indexes `friends.friends`.
+    FriendRemove(usize),
+    /// Host World Sharing cycle toggle (Off / Friends Only / Selected).
+    FriendsShareMode,
+    /// Saved `Relay Address` text field.
+    FriendsRelayField,
+    /// `[Generate 128-bit Guest Link]` — one-off token for the selected
+    /// friend row.
+    FriendsGenerateGuestLink,
+    /// `[Copy Guest Link]` — copies `friends.guest_link`.
+    FriendsCopyGuestLink,
+    /// Friends allowlist pager.
+    FriendsListUp,
+    FriendsListDown,
     // Mod sync
     ModSyncAccept,
     ModSyncDecline,
@@ -2145,6 +2243,8 @@ impl WidgetId {
                 | Self::FpRadarScope
                 | Self::FpWaypointTeleport
                 | Self::LanguageChoice
+                | Self::FriendsShareMode
+                | Self::FriendSelected(_)
         )
     }
 
@@ -2154,6 +2254,9 @@ impl WidgetId {
             self,
             Self::VideoFpsField
                 | Self::FriendsJoinField
+                | Self::FriendsAddNameField
+                | Self::FriendsAddIdField
+                | Self::FriendsRelayField
                 | Self::SingleplayerNameField
                 | Self::SingleplayerSeedField
                 | Self::MultiplayerAddressField
@@ -2210,8 +2313,15 @@ pub enum UiModal {
 
 /// Largest accepted FPS field text (`"2000"`, `0` handled separately).
 const FPS_FIELD_MAX_LEN: usize = 4;
-/// Largest accepted join field text (`"MEGU-XXXX-XXXX"` + slack).
-const JOIN_FIELD_MAX_LEN: usize = 14;
+/// Largest accepted join field text — a `MEGU-XXXX-XXXX` invite code or
+/// a `megu-friend:megu-id:<58>:<8>:<26>` guest link (≈115 chars + slack).
+const JOIN_FIELD_MAX_LEN: usize = 128;
+/// Largest accepted add-friend display-name text.
+const FRIEND_NAME_FIELD_MAX_LEN: usize = 32;
+/// Largest accepted add-friend `megu-id:` text (8 + 58 + slack).
+const FRIEND_ID_FIELD_MAX_LEN: usize = 80;
+/// Largest accepted saved-relay `host:port` text.
+const RELAY_FIELD_MAX_LEN: usize = 260;
 /// Largest accepted world-name field text on [`Screen::Singleplayer`].
 const WORLD_NAME_FIELD_MAX_LEN: usize = 64;
 /// Largest accepted seed field text on [`Screen::Singleplayer`].
@@ -2298,6 +2408,12 @@ pub struct MultiplayerServerEntry {
 pub struct MultiplayerScreenState {
     /// Saved servers in store order.
     pub servers: Vec<MultiplayerServerEntry>,
+    /// Friend-hosted worlds currently online (host-filled presence feed).
+    /// Row clicks are 1-click E2EE joins ([`UiAction::JoinFriendWorld`]).
+    pub friend_worlds: Vec<FriendWorldEntry>,
+    /// LAN-discovered worlds (host-filled discovery feed). Row clicks
+    /// join `address`/`port` directly ([`UiAction::JoinServer`]).
+    pub lan_worlds: Vec<LanWorldEntry>,
     /// Highlighted row — the Join button's target when the
     /// direct-connect field is blank.
     pub selected: Option<usize>,
@@ -2305,6 +2421,9 @@ pub struct MultiplayerScreenState {
     pub address_text: String,
     /// First visible row in `servers` when the list overflows the panel.
     pub scroll: usize,
+    /// First visible row across `friend_worlds` + `lan_worlds` in the
+    /// "Friends & LAN" section when it overflows its panel.
+    pub friend_lan_scroll: usize,
     /// Last inline status/error line (invalid input, store failure) —
     /// rendered as a banner so joins never fail silently.
     pub status: Option<String>,
@@ -2327,6 +2446,154 @@ pub struct DisconnectedScreenState {
     pub title: String,
     /// Exact reason the server/session reported, verbatim.
     pub reason: String,
+}
+
+/// One friend-hosted live world row in the "Friends & LAN" section of
+/// [`Screen::Multiplayer`]. The host fills these from its friend-presence
+/// feed; a row click is a 1-click E2EE join ([`UiAction::JoinFriendWorld`]).
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct FriendWorldEntry {
+    /// Display name of the hosting friend.
+    pub friend_name: String,
+    /// Canonical `megu-id:` of the host (pinned by the E2EE handshake).
+    pub friend_id: String,
+    /// World name the friend registered on the relay.
+    pub world_name: String,
+    /// Players currently in that world.
+    pub online_players: u32,
+    /// Host-declared guest cap.
+    pub max_players: u32,
+    /// Relay `host:port` the world is reachable through.
+    pub relay_addr: String,
+    /// Invite code the friend world published (`MEGU-XXXX-XXXX`).
+    pub invite_code: String,
+}
+
+/// One LAN-discovered world row in the "Friends & LAN" section; a row
+/// click joins `address`/`port` directly ([`UiAction::JoinServer`]).
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct LanWorldEntry {
+    /// Display name of the LAN world.
+    pub name: String,
+    /// Resolved host (IP literal or DNS name).
+    pub address: String,
+    /// Server port.
+    pub port: u16,
+    /// Optional motd/player line the discovery feed reported.
+    pub motd: String,
+}
+
+/// Who a hosted world is shared with over `FRL3-FRIEND`. Mirrors the
+/// host's `megu-friends.toml` `share_mode`; strictly one hop — there is
+/// no friends-of-friends expansion.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum FriendShareMode {
+    /// Friend hosting is disabled; the allowlist is always empty.
+    #[default]
+    Off,
+    /// Every paired friend may join.
+    FriendsOnly,
+    /// Only friends flagged `selected_for_share` may join.
+    SelectedFriends,
+}
+
+impl FriendShareMode {
+    /// The next mode in the `Off → Friends Only → Selected Friends`
+    /// cycle; `dir` steps backward when negative.
+    pub fn step(self, dir: i32) -> Self {
+        const ALL: [FriendShareMode; 3] = [
+            FriendShareMode::Off,
+            FriendShareMode::FriendsOnly,
+            FriendShareMode::SelectedFriends,
+        ];
+        let i = ALL.iter().position(|m| *m == self).unwrap_or(0) as i32;
+        ALL[(i + dir).rem_euclid(ALL.len() as i32) as usize]
+    }
+
+    /// Localized label for the cycle toggle.
+    pub fn label(self, lang: UiLang) -> &'static str {
+        match self {
+            FriendShareMode::Off => tr(lang, "Off", "オフ"),
+            FriendShareMode::FriendsOnly => {
+                tr(lang, "Friends Only", "フレンドのみ")
+            }
+            FriendShareMode::SelectedFriends => {
+                tr(lang, "Selected Friends", "選択したフレンド")
+            }
+        }
+    }
+}
+
+/// One paired friend row on [`Screen::Friends`]. The host mirrors
+/// `megu-friends.toml` here; runtime columns (`connected`, `sas_code`)
+/// come from the live share/join sessions.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct FriendListEntry {
+    /// Display name the player gave this friend.
+    pub name: String,
+    /// Canonical `megu-id:` (rendered truncated).
+    pub friend_id: String,
+    /// Admitted under [`FriendShareMode::SelectedFriends`].
+    pub selected_for_share: bool,
+    /// `true` while this friend holds a live guest stream on our world.
+    pub connected: bool,
+    /// Six-digit `FRL3-FRIEND` transcript SAS from a live pairing
+    /// session, when one is known.
+    pub sas_code: Option<u32>,
+}
+
+/// The [`Screen::Friends`] FRL3 identity + allowlist + host-sharing
+/// state. Everything here is a host-maintained mirror of
+/// `<gameDir>/megu-friends.toml` plus editable text fields; mutations
+/// are emitted as [`UiAction`]s the host persists.
+#[derive(Clone, Debug, Default)]
+pub struct FriendsScreenState {
+    /// The player's own full `megu-id:` (rendered truncated; copied whole).
+    pub my_friend_id: String,
+    /// Paired friends in store order.
+    pub friends: Vec<FriendListEntry>,
+    /// Row selected for `[Generate Guest Link]`, if any.
+    pub selected: Option<usize>,
+    /// Host World Sharing toggle mirror (host writes from the store).
+    pub share_mode: FriendShareMode,
+    /// `true` while the host's E2EE friend-share session is live.
+    pub sharing_active: bool,
+    /// Editable saved-relay `host:port` text (persisted via
+    /// [`UiAction::SaveRelayAddr`]).
+    pub relay_addr_text: String,
+    /// Latest generated 128-bit guest link text, if any.
+    pub guest_link: Option<String>,
+    /// Add-friend display-name field.
+    pub add_name_text: String,
+    /// Add-friend `megu-id:` field.
+    pub add_id_text: String,
+    /// Fail-closed add-friend rejection text (bad checksum, duplicate,
+    /// self-key) — rendered inline until the next input.
+    pub add_error: Option<String>,
+    /// Inline status line (share/relay/guest-link feedback).
+    pub status: Option<String>,
+    /// First visible row in `friends` when the list overflows the panel.
+    pub scroll: usize,
+    name_focused: bool,
+    id_focused: bool,
+    relay_focused: bool,
+}
+
+impl FriendsScreenState {
+    /// `true` while the add-friend name field owns typing.
+    pub fn add_name_field_active(&self) -> bool {
+        self.name_focused
+    }
+
+    /// `true` while the add-friend `megu-id:` field owns typing.
+    pub fn add_id_field_active(&self) -> bool {
+        self.id_focused
+    }
+
+    /// `true` while the relay-address field owns typing.
+    pub fn relay_field_active(&self) -> bool {
+        self.relay_focused
+    }
 }
 
 /// Largest accepted direct-connect text (`"[v6]:65535"` + slack).
@@ -2417,6 +2684,8 @@ pub struct UiState {
     pub singleplayer: SingleplayerState,
     /// The [`Screen::Multiplayer`] server select & direct-connect state.
     pub multiplayer: MultiplayerScreenState,
+    /// The [`Screen::Friends`] FRL3 identity/allowlist/sharing state.
+    pub friends: FriendsScreenState,
     /// The [`Screen::Disconnected`] kick/drop reason data.
     pub disconnected: DisconnectedScreenState,
 
@@ -2495,6 +2764,7 @@ impl Default for UiState {
             title_status: None,
             singleplayer: SingleplayerState::default(),
             multiplayer: MultiplayerScreenState::default(),
+            friends: FriendsScreenState::default(),
             disconnected: DisconnectedScreenState::default(),
             crash: None,
             crash_sent: false,
@@ -3083,6 +3353,9 @@ impl UiState {
             || self.singleplayer.name_focused
             || self.singleplayer.seed_focused
             || self.multiplayer.address_focused
+            || self.friends.name_focused
+            || self.friends.id_focused
+            || self.friends.relay_focused
     }
 
     fn handle_key(&mut self, key: UiKey) -> Vec<UiAction> {
@@ -3136,6 +3409,14 @@ impl UiState {
                 } else if self.multiplayer.address_focused {
                     self.multiplayer.address_text.pop();
                     self.multiplayer.status = None;
+                } else if self.friends.name_focused {
+                    self.friends.add_name_text.pop();
+                    self.friends.add_error = None;
+                } else if self.friends.id_focused {
+                    self.friends.add_id_text.pop();
+                    self.friends.add_error = None;
+                } else if self.friends.relay_focused {
+                    self.friends.relay_addr_text.pop();
                 }
                 Vec::new()
             }
@@ -3167,11 +3448,31 @@ impl UiState {
                 self.fps_field_error = false;
             }
         } else if self.join_field_focused {
-            if (c.is_ascii_alphanumeric() || c == '-')
+            if (c.is_ascii_alphanumeric() || c == '-' || c == ':')
                 && self.join_code_text.len() < JOIN_FIELD_MAX_LEN
             {
                 self.join_code_text.push(c.to_ascii_uppercase());
                 self.join_error = false;
+            }
+        } else if self.friends.name_focused {
+            if !c.is_control()
+                && self.friends.add_name_text.chars().count() < FRIEND_NAME_FIELD_MAX_LEN
+            {
+                self.friends.add_name_text.push(c);
+                self.friends.add_error = None;
+            }
+        } else if self.friends.id_focused {
+            if (c.is_ascii_alphanumeric() || matches!(c, ':' | '-' | ' '))
+                && self.friends.add_id_text.len() < FRIEND_ID_FIELD_MAX_LEN
+            {
+                self.friends.add_id_text.push(c.to_ascii_uppercase());
+                self.friends.add_error = None;
+            }
+        } else if self.friends.relay_focused {
+            if (c.is_ascii_alphanumeric() || matches!(c, '.' | '-' | '_' | ':' | '[' | ']'))
+                && self.friends.relay_addr_text.chars().count() < RELAY_FIELD_MAX_LEN
+            {
+                self.friends.relay_addr_text.push(c);
             }
         } else if self.singleplayer.name_focused {
             if !c.is_control()
@@ -3227,12 +3528,35 @@ impl UiState {
         } else if self.multiplayer.address_focused {
             self.unfocus_fields();
             self.try_join_server()
+        } else if self.friends.name_focused {
+            // Form flow: Enter in the name field steps down to the
+            // `megu-id:` field instead of adding half-typed input.
+            self.friends.name_focused = false;
+            self.friends.id_focused = true;
+            Vec::new()
+        } else if self.friends.id_focused {
+            self.unfocus_fields();
+            self.try_add_friend()
+        } else if self.friends.relay_focused {
+            self.unfocus_fields();
+            vec![UiAction::SaveRelayAddr {
+                addr: self.friends.relay_addr_text.trim().to_string(),
+            }]
         } else {
             Vec::new()
         }
     }
 
     fn try_join(&mut self) -> Vec<UiAction> {
+        let text = self.join_code_text.trim();
+        // A pasted `megu-friend:` guest link takes the 128-bit-token join
+        // path; the host re-parses it (fail-closed) before connecting.
+        if text.to_ascii_lowercase().starts_with("megu-friend:") {
+            self.join_error = false;
+            return vec![UiAction::JoinGuestLink {
+                link: text.to_string(),
+            }];
+        }
         match invite_code_parse(&self.join_code_text) {
             Some(code) => {
                 self.join_error = false;
@@ -3243,6 +3567,37 @@ impl UiState {
                 Vec::new()
             }
         }
+    }
+
+    /// Friends `[Add]` (or Enter on the `megu-id:` field): emits the
+    /// pairing request; the host validates fail-closed (bad checksum,
+    /// duplicate, self-key) and reports through `friends.add_error`.
+    fn try_add_friend(&mut self) -> Vec<UiAction> {
+        let name = self.friends.add_name_text.trim();
+        let friend_id = self.friends.add_id_text.trim();
+        if friend_id.is_empty() {
+            self.friends.add_error = Some(
+                tr(
+                    self.lang(),
+                    "Paste a megu-id: to add",
+                    "追加する megu-id: を貼り付けてください",
+                )
+                .to_string(),
+            );
+            return Vec::new();
+        }
+        let name = if name.is_empty() {
+            // Unnamed friends display as their truncated id until the
+            // player renames them (no rename UI yet).
+            friend_id.chars().take(16).collect::<String>()
+        } else {
+            name.to_string()
+        };
+        self.friends.add_error = None;
+        vec![UiAction::AddFriend {
+            name,
+            friend_id: friend_id.to_string(),
+        }]
     }
 
     /// "Create & Play" (or Enter on the seed field): the name the field
@@ -3348,6 +3703,9 @@ impl UiState {
         self.singleplayer.name_focused = false;
         self.singleplayer.seed_focused = false;
         self.multiplayer.address_focused = false;
+        self.friends.name_focused = false;
+        self.friends.id_focused = false;
+        self.friends.relay_focused = false;
     }
 
     fn escape(&mut self) -> Vec<UiAction> {
@@ -3501,6 +3859,39 @@ impl UiState {
                 self.multiplayer.scroll = (self.multiplayer.scroll + 1).min(max_scroll);
                 Vec::new()
             }
+            WidgetId::MultiplayerFriendWorld(index) => {
+                if index < self.multiplayer.friend_worlds.len() {
+                    vec![UiAction::JoinFriendWorld { index }]
+                } else {
+                    Vec::new()
+                }
+            }
+            WidgetId::MultiplayerLanWorld(index) => {
+                match self.multiplayer.lan_worlds.get(index) {
+                    Some(entry) => vec![UiAction::JoinServer {
+                        address: entry.address.clone(),
+                        port: entry.port,
+                    }],
+                    None => Vec::new(),
+                }
+            }
+            WidgetId::MultiplayerFriendLanUp => {
+                self.multiplayer.friend_lan_scroll =
+                    self.multiplayer.friend_lan_scroll.saturating_sub(1);
+                Vec::new()
+            }
+            WidgetId::MultiplayerFriendLanDown => {
+                let total =
+                    self.multiplayer.friend_worlds.len() + self.multiplayer.lan_worlds.len();
+                let max_scroll = total.saturating_sub(1);
+                self.multiplayer.friend_lan_scroll =
+                    (self.multiplayer.friend_lan_scroll + 1).min(max_scroll);
+                Vec::new()
+            }
+            WidgetId::MultiplayerManageFriends => {
+                self.navigate(Screen::Friends);
+                vec![UiAction::OpenScreen(Screen::Friends)]
+            }
             WidgetId::MultiplayerBack => {
                 self.back();
                 vec![UiAction::Back]
@@ -3630,6 +4021,86 @@ impl UiState {
             WidgetId::FriendsBack => {
                 self.back();
                 vec![UiAction::Back]
+            }
+            WidgetId::FriendsCopyId => {
+                if self.friends.my_friend_id.is_empty() {
+                    Vec::new()
+                } else {
+                    vec![UiAction::CopyText(self.friends.my_friend_id.clone())]
+                }
+            }
+            WidgetId::FriendsAddNameField => {
+                self.unfocus_fields();
+                self.friends.name_focused = true;
+                Vec::new()
+            }
+            WidgetId::FriendsAddIdField => {
+                self.unfocus_fields();
+                self.friends.id_focused = true;
+                Vec::new()
+            }
+            WidgetId::FriendsAdd => self.try_add_friend(),
+            WidgetId::FriendRow(index) => {
+                self.friends.selected = (index < self.friends.friends.len()).then_some(index);
+                Vec::new()
+            }
+            WidgetId::FriendRemove(index) => match self.friends.friends.get(index) {
+                Some(entry) => {
+                    let friend_id = entry.friend_id.clone();
+                    if self.friends.selected == Some(index) {
+                        self.friends.selected = None;
+                    }
+                    vec![UiAction::RemoveFriend { friend_id }]
+                }
+                None => Vec::new(),
+            },
+            WidgetId::FriendsRelayField => {
+                self.unfocus_fields();
+                self.friends.relay_focused = true;
+                Vec::new()
+            }
+            WidgetId::FriendsGenerateGuestLink => match self.friends.selected {
+                Some(index) => match self.friends.friends.get(index) {
+                    Some(entry) => vec![UiAction::GenerateGuestLink {
+                        friend_id: entry.friend_id.clone(),
+                    }],
+                    None => {
+                        self.friends.selected = None;
+                        self.friends.status = Some(
+                            tr(
+                                self.lang(),
+                                "Select a friend row first",
+                                "先にフレンド行を選択してください",
+                            )
+                            .to_string(),
+                        );
+                        Vec::new()
+                    }
+                },
+                None => {
+                    self.friends.status = Some(
+                        tr(
+                            self.lang(),
+                            "Select a friend row first",
+                            "先にフレンド行を選択してください",
+                        )
+                        .to_string(),
+                    );
+                    Vec::new()
+                }
+            },
+            WidgetId::FriendsCopyGuestLink => match self.friends.guest_link.clone() {
+                Some(link) => vec![UiAction::CopyText(link)],
+                None => Vec::new(),
+            },
+            WidgetId::FriendsListUp => {
+                self.friends.scroll = self.friends.scroll.saturating_sub(1);
+                Vec::new()
+            }
+            WidgetId::FriendsListDown => {
+                let max_scroll = self.friends.friends.len().saturating_sub(1);
+                self.friends.scroll = (self.friends.scroll + 1).min(max_scroll);
+                Vec::new()
             }
 
             WidgetId::ModSyncAccept => {
@@ -3762,6 +4233,32 @@ impl UiState {
                 return vec![UiAction::SettingsChanged];
             }
             return Vec::new();
+        }
+        // Friends-screen controls own `self.friends`, not `self.settings` —
+        // handle them before the settings-snapshot match below.
+        match id {
+            WidgetId::FriendsShareMode => {
+                let next = self.friends.share_mode.step(dir);
+                if next == self.friends.share_mode {
+                    return Vec::new();
+                }
+                self.friends.share_mode = next;
+                self.friends.status = None;
+                return vec![UiAction::SetFriendShareMode(next)];
+            }
+            WidgetId::FriendSelected(index) => {
+                return match self.friends.friends.get_mut(index) {
+                    Some(entry) => {
+                        entry.selected_for_share = !entry.selected_for_share;
+                        vec![UiAction::SetFriendSelected {
+                            friend_id: entry.friend_id.clone(),
+                            selected: entry.selected_for_share,
+                        }]
+                    }
+                    None => Vec::new(),
+                };
+            }
+            _ => {}
         }
         let prior = self.settings.clone();
         let v = &mut self.settings.video;
@@ -4062,5 +4559,300 @@ mod mod_sync_prompt_tests {
         assert!(list.commands.iter().any(|command| matches!(command, crate::draw::UiCommand::Text { text, .. } if text.contains("Save 60s Instant Replay"))));
         assert!(ui.hit_regions.iter().any(|region| region.id == WidgetId::PauseSaveReplay));
         assert_eq!(ui.activate(WidgetId::PauseSaveReplay, 0, 0, UiRect::new(0, 0, 0, 0)), vec![UiAction::SaveInstantReplay]);
+    }
+}
+
+#[cfg(test)]
+mod friends_screen_tests {
+    use super::*;
+
+    const ZERO: UiRect = UiRect::new(0, 0, 0, 0);
+
+    fn demo_friends() -> UiState {
+        let mut ui = UiState {
+            screen: Screen::Friends,
+            ..UiState::default()
+        };
+        ui.friends.my_friend_id = "megu-id:TESTHOST".into();
+        ui.friends.friends = vec![
+            FriendListEntry {
+                name: "Alice".into(),
+                friend_id: "megu-id:ALICE".into(),
+                selected_for_share: false,
+                connected: true,
+                sas_code: Some(123456),
+            },
+            FriendListEntry {
+                name: "Bob".into(),
+                friend_id: "megu-id:BOB".into(),
+                selected_for_share: true,
+                connected: false,
+                sas_code: None,
+            },
+        ];
+        ui
+    }
+
+    #[test]
+    fn friends_identity_add_and_remove_actions() {
+        let mut ui = demo_friends();
+
+        // [Copy ID] emits the full megu-id, never the truncated display.
+        assert_eq!(
+            ui.activate(WidgetId::FriendsCopyId, 0, 0, ZERO),
+            vec![UiAction::CopyText("megu-id:TESTHOST".into())]
+        );
+        ui.friends.my_friend_id.clear();
+        assert!(ui.activate(WidgetId::FriendsCopyId, 0, 0, ZERO).is_empty());
+
+        // [Add] fails closed on an empty id field.
+        assert!(ui.activate(WidgetId::FriendsAdd, 0, 0, ZERO).is_empty());
+        assert!(ui.friends.add_error.is_some());
+        ui.friends.add_name_text = "Carol".into();
+        ui.friends.add_id_text = "megu-id:CAROL".into();
+        ui.friends.add_error = None;
+        assert_eq!(
+            ui.activate(WidgetId::FriendsAdd, 0, 0, ZERO),
+            vec![UiAction::AddFriend {
+                name: "Carol".into(),
+                friend_id: "megu-id:CAROL".into(),
+            }]
+        );
+
+        // Row [Remove] emits the instant-revoke action keyed by megu-id.
+        ui.friends.selected = Some(0);
+        assert_eq!(
+            ui.activate(WidgetId::FriendRemove(0), 0, 0, ZERO),
+            vec![UiAction::RemoveFriend {
+                friend_id: "megu-id:ALICE".into(),
+            }]
+        );
+        assert_eq!(ui.friends.selected, None);
+        // Out-of-range rows never emit.
+        assert!(ui.activate(WidgetId::FriendRemove(9), 0, 0, ZERO).is_empty());
+    }
+
+    #[test]
+    fn friends_share_mode_cycles_and_checkbox_persists() {
+        let mut ui = demo_friends();
+        assert_eq!(ui.friends.share_mode, FriendShareMode::Off);
+        assert_eq!(
+            ui.activate(WidgetId::FriendsShareMode, 0, 0, ZERO),
+            vec![UiAction::SetFriendShareMode(FriendShareMode::FriendsOnly)]
+        );
+        assert_eq!(
+            ui.activate(WidgetId::FriendsShareMode, 0, 0, ZERO),
+            vec![UiAction::SetFriendShareMode(FriendShareMode::SelectedFriends)]
+        );
+        assert_eq!(
+            ui.activate(WidgetId::FriendsShareMode, 0, 0, ZERO),
+            vec![UiAction::SetFriendShareMode(FriendShareMode::Off)]
+        );
+
+        // Selected-Friends checkbox toggles the row mirror and reports.
+        assert_eq!(
+            ui.activate(WidgetId::FriendSelected(0), 0, 0, ZERO),
+            vec![UiAction::SetFriendSelected {
+                friend_id: "megu-id:ALICE".into(),
+                selected: true,
+            }]
+        );
+        assert!(ui.friends.friends[0].selected_for_share);
+        assert!(ui.activate(WidgetId::FriendSelected(9), 0, 0, ZERO).is_empty());
+    }
+
+    #[test]
+    fn friends_guest_link_needs_a_selected_row() {
+        let mut ui = demo_friends();
+
+        // No row selected: fail-closed status, no action.
+        assert!(
+            ui.activate(WidgetId::FriendsGenerateGuestLink, 0, 0, ZERO)
+                .is_empty()
+        );
+        assert!(ui.friends.status.is_some());
+
+        ui.friends.status = None;
+        ui.activate(WidgetId::FriendRow(1), 0, 0, ZERO);
+        assert_eq!(ui.friends.selected, Some(1));
+        assert_eq!(
+            ui.activate(WidgetId::FriendsGenerateGuestLink, 0, 0, ZERO),
+            vec![UiAction::GenerateGuestLink {
+                friend_id: "megu-id:BOB".into(),
+            }]
+        );
+
+        // Copy only fires once a link exists.
+        assert!(
+            ui.activate(WidgetId::FriendsCopyGuestLink, 0, 0, ZERO)
+                .is_empty()
+        );
+        ui.friends.guest_link = Some("megu-friend:x:y:z".into());
+        assert_eq!(
+            ui.activate(WidgetId::FriendsCopyGuestLink, 0, 0, ZERO),
+            vec![UiAction::CopyText("megu-friend:x:y:z".into())]
+        );
+    }
+
+    #[test]
+    fn friends_relay_field_commits_saved_address() {
+        let mut ui = demo_friends();
+        ui.activate(WidgetId::FriendsRelayField, 0, 0, ZERO);
+        for c in "relay.example.net:25575".chars() {
+            ui.handle_input(UiInputEvent::CharTyped(c));
+        }
+        let acts = ui.handle_input(UiInputEvent::KeyPressed(UiKey::Enter));
+        assert_eq!(
+            acts,
+            vec![UiAction::SaveRelayAddr {
+                addr: "relay.example.net:25575".into(),
+            }]
+        );
+    }
+
+    #[test]
+    fn friends_join_field_routes_guest_links_to_token_join() {
+        let mut ui = demo_friends();
+        ui.activate(WidgetId::FriendsJoinField, 0, 0, ZERO);
+        ui.join_code_text =
+            "megu-friend:megu-id:HOSTKEY58:ABCDEFGH:TOKEN26CHARS".into();
+        assert_eq!(
+            ui.activate(WidgetId::FriendsJoin, 0, 0, ZERO),
+            vec![UiAction::JoinGuestLink {
+                link: "megu-friend:megu-id:HOSTKEY58:ABCDEFGH:TOKEN26CHARS".into(),
+            }]
+        );
+    }
+
+    #[test]
+    fn multiplayer_friends_lan_rows_emit_join_actions() {
+        let mut ui = UiState {
+            screen: Screen::Multiplayer,
+            ..UiState::default()
+        };
+        ui.multiplayer.friend_worlds = vec![FriendWorldEntry {
+            friend_name: "Alice".into(),
+            friend_id: "megu-id:ALICE".into(),
+            world_name: "Skyblock".into(),
+            online_players: 2,
+            max_players: 8,
+            relay_addr: "relay.example.net:25575".into(),
+            invite_code: "MEGU-AAAA-BBBB".into(),
+        }];
+        ui.multiplayer.lan_worlds = vec![LanWorldEntry {
+            name: "Kitchen LAN".into(),
+            address: "192.168.1.20".into(),
+            port: 25565,
+            motd: "hi".into(),
+        }];
+
+        assert_eq!(
+            ui.activate(WidgetId::MultiplayerFriendWorld(0), 0, 0, ZERO),
+            vec![UiAction::JoinFriendWorld { index: 0 }]
+        );
+        assert_eq!(
+            ui.activate(WidgetId::MultiplayerLanWorld(0), 0, 0, ZERO),
+            vec![UiAction::JoinServer {
+                address: "192.168.1.20".into(),
+                port: 25565,
+            }]
+        );
+        assert_eq!(
+            ui.activate(WidgetId::MultiplayerManageFriends, 0, 0, ZERO),
+            vec![UiAction::OpenScreen(Screen::Friends)]
+        );
+        assert_eq!(ui.screen, Screen::Friends);
+    }
+
+    #[test]
+    fn friends_and_multiplayer_have_full_controls_at_ship_sizes() {
+        let mut ui = demo_friends();
+        ui.multiplayer.friend_worlds = vec![FriendWorldEntry {
+            friend_name: "Alice".into(),
+            friend_id: "megu-id:ALICE".into(),
+            world_name: "Skyblock".into(),
+            online_players: 1,
+            max_players: 8,
+            relay_addr: "r".into(),
+            invite_code: "MEGU-AAAA-BBBB".into(),
+        }];
+        ui.multiplayer.lan_worlds = vec![LanWorldEntry {
+            name: "L".into(),
+            address: "10.0.0.1".into(),
+            port: 25565,
+            motd: String::new(),
+        }];
+        ui.multiplayer.servers = vec![MultiplayerServerEntry {
+            name: "Hub".into(),
+            address: "hub.example.net".into(),
+            port: 25565,
+        }];
+
+        for &(w, h) in &[(854u32, 480u32), (1280, 720)] {
+            ui.screen = Screen::Friends;
+            ui.render(w, h);
+            for id in [
+                WidgetId::FriendsCopyId,
+                WidgetId::FriendsAddNameField,
+                WidgetId::FriendsAddIdField,
+                WidgetId::FriendsAdd,
+                WidgetId::FriendRow(0),
+                WidgetId::FriendRemove(0),
+                WidgetId::FriendsShareMode,
+                WidgetId::FriendsRelayField,
+                WidgetId::FriendsGenerateGuestLink,
+                WidgetId::FriendsCopyGuestLink,
+                WidgetId::FriendsGenerate,
+                WidgetId::FriendsCopy,
+                WidgetId::FriendsRevoke,
+                WidgetId::FriendsJoinField,
+                WidgetId::FriendsJoin,
+                WidgetId::FriendsBack,
+            ] {
+                assert!(
+                    ui.hit_regions.iter().any(|r| r.id == id),
+                    "{id:?} missing on Friends @{w}x{h}"
+                );
+            }
+            assert_no_overlap(&ui.hit_regions, w, h);
+
+            ui.screen = Screen::Multiplayer;
+            ui.render(w, h);
+            for id in [
+                WidgetId::MultiplayerFriendWorld(0),
+                WidgetId::MultiplayerLanWorld(0),
+                WidgetId::MultiplayerManageFriends,
+                WidgetId::MultiplayerServer(0),
+                WidgetId::MultiplayerAddressField,
+                WidgetId::MultiplayerJoin,
+                WidgetId::MultiplayerAdd,
+                WidgetId::MultiplayerDelete,
+                WidgetId::MultiplayerBack,
+            ] {
+                assert!(
+                    ui.hit_regions.iter().any(|r| r.id == id),
+                    "{id:?} missing on Multiplayer @{w}x{h}"
+                );
+            }
+            assert_no_overlap(&ui.hit_regions, w, h);
+        }
+    }
+
+    fn assert_no_overlap(regions: &[HitRegion], w: u32, h: u32) {
+        for (i, a) in regions.iter().enumerate() {
+            assert!(
+                a.rect.x >= 0
+                    && a.rect.y >= 0
+                    && a.rect.right() <= w as i32
+                    && a.rect.bottom() <= h as i32,
+                "region outside {w}x{h}: {a:?}"
+            );
+            for b in &regions[i + 1..] {
+                assert!(
+                    !a.rect.intersects(b.rect),
+                    "regions overlap: {a:?} vs {b:?}"
+                );
+            }
+        }
     }
 }
