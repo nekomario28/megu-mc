@@ -726,6 +726,8 @@ impl GoalFlags {
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct AiEntityPerception {
     pub entity_id: i32,
+    /// Protocol entity type id; `-1` when the caller does not classify it.
+    pub etype: i64,
     pub position: (f64, f64, f64),
     pub width: f32,
     pub line_of_sight: bool,
@@ -739,6 +741,7 @@ impl AiEntityPerception {
     pub fn new(entity_id: i32, position: (f64, f64, f64)) -> Self {
         Self {
             entity_id,
+            etype: -1,
             position,
             width: 0.6,
             line_of_sight: true,
@@ -746,6 +749,68 @@ impl AiEntityPerception {
             in_love: false,
             compatible: false,
         }
+    }
+}
+
+/// One mob observed next to the ticking entity. Mob-vs-mob goals (fleeing,
+/// inter-mob targeting) filter these; players keep arriving through
+/// `AiEntityPerception` instead.
+#[cfg_attr(not(test), allow(dead_code))]
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(crate) struct NearbyMob {
+    pub entity_id: i32,
+    /// Protocol entity type id (`entity_spec_by_id` index).
+    pub etype: i64,
+    pub position: (f64, f64, f64),
+    pub line_of_sight: bool,
+    /// Rolled-up armadillo-style state; vanilla spiders only flee armadillos
+    /// that are *not* scared.
+    pub scared: bool,
+    /// Vanilla `isBaby`; foxes only prey on turtles while they are babies.
+    pub baby: bool,
+}
+
+#[cfg_attr(not(test), allow(dead_code))]
+impl NearbyMob {
+    pub fn new(entity_id: i32, etype: i64, position: (f64, f64, f64)) -> Self {
+        Self {
+            entity_id,
+            etype,
+            position,
+            line_of_sight: true,
+            scared: false,
+            baby: false,
+        }
+    }
+}
+
+/// The per-tick mob-vs-mob observation shared with every goal. `nearby_mobs`
+/// defaults to empty so callers that supply no mob perception see no change.
+#[cfg_attr(not(test), allow(dead_code))]
+#[derive(Clone, Debug, Default, PartialEq)]
+pub(crate) struct MobPerception {
+    pub nearby_mobs: Vec<NearbyMob>,
+}
+
+#[cfg_attr(not(test), allow(dead_code))]
+impl MobPerception {
+    /// Nearest mob satisfying `accept` within `max_dist` of `position`.
+    fn nearest(
+        &self,
+        position: (f64, f64, f64),
+        max_dist: f64,
+        accept: impl Fn(&NearbyMob) -> bool,
+    ) -> Option<NearbyMob> {
+        let max_dist_sq = max_dist * max_dist;
+        self.nearby_mobs
+            .iter()
+            .filter(|mob| accept(mob))
+            .filter(|mob| entity_distance_sq(position, mob.position) <= max_dist_sq)
+            .min_by(|a, b| {
+                entity_distance_sq(position, a.position)
+                    .total_cmp(&entity_distance_sq(position, b.position))
+            })
+            .copied()
     }
 }
 
@@ -793,13 +858,32 @@ fn entity_distance_sq(a: (f64, f64, f64), b: (f64, f64, f64)) -> f64 {
     dx * dx + dy * dy + dz * dz
 }
 
+/// A projectile launch a ranged goal wants the caller to perform. The caller
+/// owns spawning, spread/inaccuracy, and damage application.
+#[cfg_attr(not(test), allow(dead_code))]
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(crate) enum RangedProjectileAction {
+    /// Vanilla `SnowGolem.performRangedAttack` (snowball arc, 1.6 speed).
+    Snowball {
+        target_eid: i32,
+        target_pos: (f64, f64, f64),
+        velocity: (f64, f64, f64),
+    },
+}
+
 #[cfg_attr(not(test), allow(dead_code))]
 #[derive(Clone, Debug, Default, PartialEq)]
 pub(crate) struct GoalOutput {
     pub move_target: Option<(f64, f64, f64)>,
     pub look_target: Option<(f64, f64, f64)>,
+    /// Multiplies the mob's waypoint stride (vanilla walk/sprint modifiers).
+    pub speed_modifier: Option<f64>,
     pub jump: bool,
     pub attack_target: Option<i32>,
+    /// Mob-vs-mob target chosen by a target-selector goal this tick.
+    pub mob_target: Option<i32>,
+    /// Projectile a ranged goal wants launched this tick.
+    pub ranged_attack: Option<RangedProjectileAction>,
     pub swell: Option<bool>,
     pub breed_target: Option<i32>,
 }
@@ -811,8 +895,11 @@ impl GoalOutput {
     fn merge_missing(&mut self, next: GoalOutput) {
         self.move_target = self.move_target.or(next.move_target);
         self.look_target = self.look_target.or(next.look_target);
+        self.speed_modifier = self.speed_modifier.or(next.speed_modifier);
         self.jump |= next.jump;
         self.attack_target = self.attack_target.or(next.attack_target);
+        self.mob_target = self.mob_target.or(next.mob_target);
+        self.ranged_attack = self.ranged_attack.or(next.ranged_attack);
         self.swell = self.swell.or(next.swell);
         self.breed_target = self.breed_target.or(next.breed_target);
     }
@@ -831,6 +918,9 @@ pub(crate) trait Goal {
     fn tick(&mut self, ctx: &GoalContext<'_>) -> Option<GoalOutput>;
     fn stop(&mut self, ctx: &GoalContext<'_>);
     fn idle_tick(&mut self, _ctx: &GoalContext<'_>) {}
+    /// Receives the mob-vs-mob observation before `can_use` evaluation runs.
+    /// Goals that never look at neighbouring mobs keep the default no-op.
+    fn perceive(&mut self, _position: (f64, f64, f64), _perception: &MobPerception) {}
     fn stop_output(&self) -> Option<GoalOutput> {
         None
     }
@@ -846,6 +936,9 @@ struct RunningGoal {
 #[derive(Default)]
 pub(crate) struct GoalSelector {
     goals: Vec<RunningGoal>,
+    /// Mob-vs-mob observation applied to every goal at the top of `tick`.
+    /// Empty by default so selectors without a perception feed are unchanged.
+    pub perception: MobPerception,
 }
 
 #[cfg_attr(not(test), allow(dead_code))]
@@ -864,6 +957,9 @@ impl GoalSelector {
     }
 
     pub fn tick(&mut self, ctx: &GoalContext<'_>) -> GoalOutput {
+        for entry in &mut self.goals {
+            entry.goal.perceive(ctx.position, &self.perception);
+        }
         let mut stopped = GoalOutput::default();
         for entry in &mut self.goals {
             if entry.running && !entry.goal.can_continue_to_use(ctx) {
@@ -943,6 +1039,8 @@ impl GoalSelector {
 #[derive(Default)]
 pub(crate) struct TargetSelector {
     selector: GoalSelector,
+    /// Mob-vs-mob observation forwarded into the wrapped selector on `tick`.
+    pub perception: MobPerception,
 }
 
 #[cfg_attr(not(test), allow(dead_code))]
@@ -952,6 +1050,7 @@ impl TargetSelector {
     }
 
     pub fn tick(&mut self, ctx: &GoalContext<'_>) -> GoalOutput {
+        self.selector.perception.clone_from(&self.perception);
         self.selector.tick(ctx)
     }
 
@@ -999,6 +1098,11 @@ impl Goal for FloatGoal {
 pub(crate) struct SwellGoal {
     pub priority: i32,
     ignited: bool,
+    /// Entity types whose presence inside `avoid_dist` forces the fuse off —
+    /// the creeper's cat/ocelot flee outranks swelling in vanilla.
+    avoid_etypes: &'static [i64],
+    avoid_dist: f32,
+    avoid_threat: bool,
 }
 
 #[cfg_attr(not(test), allow(dead_code))]
@@ -1007,7 +1111,18 @@ impl SwellGoal {
         Self {
             priority,
             ignited: false,
+            avoid_etypes: &[],
+            avoid_dist: 0.0,
+            avoid_threat: false,
         }
+    }
+
+    /// While any `etypes` mob is perceived inside `dist`, the goal cannot run
+    /// and a running fuse is aborted (vanilla creeper vs cats/ocelots).
+    pub fn aborted_by(mut self, etypes: &'static [i64], dist: f32) -> Self {
+        self.avoid_etypes = etypes;
+        self.avoid_dist = dist;
+        self
     }
 }
 
@@ -1019,12 +1134,22 @@ impl Goal for SwellGoal {
     fn flags(&self) -> u8 {
         GoalFlags::MOVE
     }
+    fn perceive(&mut self, position: (f64, f64, f64), perception: &MobPerception) {
+        let max_sq = f64::from(self.avoid_dist) * f64::from(self.avoid_dist);
+        self.avoid_threat = !self.avoid_etypes.is_empty()
+            && perception.nearby_mobs.iter().any(|mob| {
+                self.avoid_etypes.contains(&mob.etype)
+                    && entity_distance_sq(position, mob.position) <= max_sq
+            });
+    }
     fn can_use(&self, ctx: &GoalContext<'_>) -> bool {
-        ctx.target
-            .is_some_and(|target| entity_distance_sq(ctx.position, target.position) < 9.0)
+        !self.avoid_threat
+            && ctx
+                .target
+                .is_some_and(|target| entity_distance_sq(ctx.position, target.position) < 9.0)
     }
     fn can_continue_to_use(&self, ctx: &GoalContext<'_>) -> bool {
-        self.ignited || self.can_use(ctx)
+        !self.avoid_threat && (self.ignited || self.can_use(ctx))
     }
     fn start(&mut self, _: &GoalContext<'_>) {}
     fn tick(&mut self, ctx: &GoalContext<'_>) -> Option<GoalOutput> {
@@ -1475,16 +1600,383 @@ impl Goal for LookAtPlayerGoal {
     fn stop(&mut self, _: &GoalContext<'_>) {}
 }
 
+/// Vanilla `AvoidEntityGoal` constructor arguments: which entity types to
+/// flee, the trigger radius, and the walk/sprint speed modifiers.
 #[cfg_attr(not(test), allow(dead_code))]
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(crate) struct AvoidEntitySpec {
+    /// Protocol entity type ids the mob flees from.
+    pub flee_etypes: &'static [i64],
+    /// Rolled-up (`scared`) entities do not count; vanilla spiders only flee
+    /// armadillos that are not rolled up.
+    pub require_unscared: bool,
+    /// Flee trigger radius in blocks (vanilla `maxDist`, 6.0 here).
+    pub max_dist: f32,
+    /// Navigation speed multiplier while the threat is past the sprint band.
+    pub walk_speed: f32,
+    /// Navigation speed multiplier while the threat is closer than 7 blocks
+    /// (vanilla hard-codes the `distanceToSqr < 49` sprint check).
+    pub sprint_speed: f32,
+}
+
+/// Vanilla `AvoidEntityGoal` (1.21.1): flee the nearest matching mob inside
+/// `max_dist`. The goal keeps a straight-line flee destination up to date;
+/// the caller applies `speed_modifier` to the waypoint stride.
+#[cfg_attr(not(test), allow(dead_code))]
+#[derive(Debug)]
+pub(crate) struct AvoidEntityGoal {
+    pub priority: i32,
+    pub spec: AvoidEntitySpec,
+    threat: Option<NearbyMob>,
+}
+
+#[cfg_attr(not(test), allow(dead_code))]
+impl AvoidEntityGoal {
+    pub fn new(priority: i32, spec: AvoidEntitySpec) -> Self {
+        Self {
+            priority,
+            spec,
+            threat: None,
+        }
+    }
+}
+
+#[cfg_attr(not(test), allow(dead_code))]
+impl Goal for AvoidEntityGoal {
+    fn priority(&self) -> i32 {
+        self.priority
+    }
+    fn flags(&self) -> u8 {
+        GoalFlags::MOVE
+    }
+    fn perceive(&mut self, position: (f64, f64, f64), perception: &MobPerception) {
+        self.threat = perception.nearest(position, f64::from(self.spec.max_dist), |mob| {
+            self.spec.flee_etypes.contains(&mob.etype)
+                && !(self.spec.require_unscared && mob.scared)
+        });
+    }
+    fn can_use(&self, _: &GoalContext<'_>) -> bool {
+        self.threat.is_some()
+    }
+    fn can_continue_to_use(&self, _: &GoalContext<'_>) -> bool {
+        self.threat.is_some()
+    }
+    fn start(&mut self, _: &GoalContext<'_>) {}
+    fn tick(&mut self, ctx: &GoalContext<'_>) -> Option<GoalOutput> {
+        let threat = self.threat?;
+        let (dx, dz) = (
+            ctx.position.0 - threat.position.0,
+            ctx.position.2 - threat.position.2,
+        );
+        let norm = dx.hypot(dz);
+        let (fx, fz) = if norm > 1.0e-6 {
+            (dx / norm, dz / norm)
+        } else {
+            (1.0, 0.0)
+        };
+        let reach = f64::from(self.spec.max_dist);
+        // Vanilla switches to the sprint modifier inside 7 blocks of the
+        // threat and walks the flee path otherwise.
+        let speed_modifier = if entity_distance_sq(ctx.position, threat.position) < 49.0 {
+            self.spec.sprint_speed
+        } else {
+            self.spec.walk_speed
+        };
+        Some(GoalOutput {
+            move_target: Some((
+                ctx.position.0 + fx * reach,
+                ctx.position.1,
+                ctx.position.2 + fz * reach,
+            )),
+            speed_modifier: Some(f64::from(speed_modifier)),
+            ..GoalOutput::default()
+        })
+    }
+    fn stop(&mut self, _: &GoalContext<'_>) {}
+}
+
+/// Vanilla `RangedAttackGoal` as registered on `SnowGolem` (1.21.1):
+/// `new RangedAttackGoal(this, 1.25, 20, 10.0)`. The goal stops navigating
+/// once it has held line of sight inside the attack radius and launches a
+/// `Snowball` projectile on the 20-tick (1 second) interval.
+#[cfg_attr(not(test), allow(dead_code))]
+#[derive(Debug)]
+pub(crate) struct RangedSnowballGoal {
+    pub priority: i32,
+    /// Vanilla `attackRadius` in blocks.
+    pub attack_radius: f32,
+    /// Vanilla `attackInterval` in ticks (snow golem: 20 == 1.0 s).
+    pub attack_interval: u32,
+    /// Vanilla `seeTime`: consecutive ticks of target line of sight.
+    see_time: u32,
+    /// Vanilla `attackTime` countdown; `-1` arms the initial interval.
+    attack_time: i32,
+}
+
+#[cfg_attr(not(test), allow(dead_code))]
+impl RangedSnowballGoal {
+    pub fn new(priority: i32) -> Self {
+        Self {
+            priority,
+            attack_radius: 10.0,
+            attack_interval: 20,
+            see_time: 0,
+            attack_time: -1,
+        }
+    }
+}
+
+#[cfg_attr(not(test), allow(dead_code))]
+impl Goal for RangedSnowballGoal {
+    fn priority(&self) -> i32 {
+        self.priority
+    }
+    fn flags(&self) -> u8 {
+        GoalFlags::MOVE | GoalFlags::LOOK
+    }
+    fn can_use(&self, ctx: &GoalContext<'_>) -> bool {
+        ctx.target.is_some()
+    }
+    fn can_continue_to_use(&self, ctx: &GoalContext<'_>) -> bool {
+        self.can_use(ctx)
+    }
+    fn start(&mut self, _: &GoalContext<'_>) {}
+    fn tick(&mut self, ctx: &GoalContext<'_>) -> Option<GoalOutput> {
+        let target = ctx.target?;
+        let distance_sq = entity_distance_sq(ctx.position, target.position);
+        if target.line_of_sight {
+            self.see_time = self.see_time.saturating_add(1);
+        } else {
+            self.see_time = 0;
+        }
+        let radius_sq = f64::from(self.attack_radius) * f64::from(self.attack_radius);
+        let within = distance_sq <= radius_sq;
+        // Vanilla navigates to the target until it is in range and has been
+        // seen for 5 consecutive ticks, then holds position.
+        let move_target = (!within || self.see_time < 5).then_some(target.position);
+        self.attack_time -= 1;
+        let mut ranged_attack = None;
+        if self.attack_time == 0 {
+            if target.line_of_sight && within {
+                // Target eye line minus the 1.1 projectile spawn offset; the
+                // +0.2/block arc compensation lives in the velocity helper.
+                let eye_height =
+                    entity_spec_by_id(target.etype).map_or(1.62, |spec| f64::from(spec.eye_height));
+                let velocity = snow_golem_snowball_velocity(
+                    [ctx.position.0, ctx.position.1, ctx.position.2],
+                    [target.position.0, target.position.1, target.position.2],
+                    eye_height,
+                );
+                ranged_attack = Some(RangedProjectileAction::Snowball {
+                    target_eid: target.entity_id,
+                    target_pos: target.position,
+                    velocity: (velocity[0], velocity[1], velocity[2]),
+                });
+                // Vanilla floors `distance/radius * (max - min) + min`; the
+                // snow golem registers min == max == `attack_interval`.
+                self.attack_time = i32::try_from(self.attack_interval).unwrap_or(i32::MAX);
+            }
+        } else if self.attack_time < 0 {
+            self.attack_time = i32::try_from(self.attack_interval).unwrap_or(i32::MAX);
+        }
+        Some(GoalOutput {
+            move_target,
+            look_target: Some(target.position),
+            ranged_attack,
+            ..GoalOutput::default()
+        })
+    }
+    fn stop(&mut self, _: &GoalContext<'_>) {
+        self.see_time = 0;
+        self.attack_time = -1;
+    }
+}
+
+/// How a `NearestAttackableMobGoal` accepts nearby mobs (1.21.1 predicates).
+#[cfg_attr(not(test), allow(dead_code))]
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(crate) enum MobPreySelector {
+    /// `entity instanceof Enemy` — vanilla's hostile-mob marker interface,
+    /// which maps onto the registry's `Monster` category.
+    HostileMobs,
+    /// `instanceof Enemy && !instanceof Excluded` (iron golems skip creepers).
+    HostileExcept(&'static [i64]),
+    /// An explicit list of protocol entity type ids.
+    Etypes(&'static [i64]),
+}
+
+/// Vanilla `NearestAttackableTargetGoal` parameters for mob-vs-mob prey.
+#[cfg_attr(not(test), allow(dead_code))]
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(crate) struct MobTargetSpec {
+    pub prey: MobPreySelector,
+    /// Acquisition radius in blocks (vanilla `follow_range` — 16.0 default).
+    pub max_dist: f64,
+    /// Vanilla `mustSee`: require line of sight to accept the candidate.
+    pub must_see: bool,
+    /// Only babies qualify (foxes only take turtles while they are babies).
+    pub baby_only: bool,
+}
+
+#[cfg_attr(not(test), allow(dead_code))]
+fn is_enemy_etype(etype: i64) -> bool {
+    entity_spec_by_id(etype).is_some_and(|spec| spec.category == EntityMobCategory::Monster)
+}
+
+/// Vanilla `NearestAttackableTargetGoal` for mob prey: scans `MobPerception`
+/// for the nearest acceptable mob inside `max_dist` and publishes it on the
+/// `mob_target` channel every tick while running.
+#[cfg_attr(not(test), allow(dead_code))]
+#[derive(Debug)]
+pub(crate) struct NearestAttackableMobGoal {
+    pub priority: i32,
+    pub spec: MobTargetSpec,
+    candidate: Option<NearbyMob>,
+}
+
+#[cfg_attr(not(test), allow(dead_code))]
+impl NearestAttackableMobGoal {
+    pub fn new(priority: i32, spec: MobTargetSpec) -> Self {
+        Self {
+            priority,
+            spec,
+            candidate: None,
+        }
+    }
+
+    fn accepts(&self, mob: &NearbyMob) -> bool {
+        let matches = match self.spec.prey {
+            MobPreySelector::HostileMobs => is_enemy_etype(mob.etype),
+            MobPreySelector::HostileExcept(excluded) => {
+                is_enemy_etype(mob.etype) && !excluded.contains(&mob.etype)
+            }
+            MobPreySelector::Etypes(etypes) => etypes.contains(&mob.etype),
+        };
+        matches
+            && (!self.spec.baby_only || mob.baby)
+            && (!self.spec.must_see || mob.line_of_sight)
+    }
+}
+
+#[cfg_attr(not(test), allow(dead_code))]
+impl Goal for NearestAttackableMobGoal {
+    fn priority(&self) -> i32 {
+        self.priority
+    }
+    fn flags(&self) -> u8 {
+        GoalFlags::TARGET
+    }
+    fn perceive(&mut self, position: (f64, f64, f64), perception: &MobPerception) {
+        self.candidate = perception
+            .nearest(position, self.spec.max_dist, |mob| self.accepts(mob));
+    }
+    fn can_use(&self, _: &GoalContext<'_>) -> bool {
+        self.candidate.is_some()
+    }
+    fn can_continue_to_use(&self, _: &GoalContext<'_>) -> bool {
+        self.candidate.is_some()
+    }
+    fn start(&mut self, _: &GoalContext<'_>) {}
+    fn tick(&mut self, _: &GoalContext<'_>) -> Option<GoalOutput> {
+        Some(GoalOutput {
+            mob_target: Some(self.candidate?.entity_id),
+            ..GoalOutput::default()
+        })
+    }
+    fn stop(&mut self, _: &GoalContext<'_>) {}
+}
+
+/// Vanilla `targetSelector` mob-vs-mob goals from each mob's
+/// `registerTargetGoals` (1.21.1). Player-facing target goals stay with the
+/// live player scan; only goals whose candidates come from `MobPerception`
+/// are built here.
+#[cfg_attr(not(test), allow(dead_code))]
+pub(crate) fn build_target_selector_for_etype(etype: i64) -> TargetSelector {
+    use MobPreySelector::*;
+    let mut selector = TargetSelector::default();
+    let mut add = |priority: i32, prey, max_dist, must_see, baby_only| {
+        selector.add_goal(Box::new(NearestAttackableMobGoal::new(
+            priority,
+            MobTargetSpec {
+                prey,
+                max_dist,
+                must_see,
+                baby_only,
+            },
+        )));
+    };
+    match etype {
+        // SnowGolem: NearestAttackableTargetGoal<Mob> -> instanceof Enemy,
+        // inside the snowball attack radius.
+        96 => add(1, HostileMobs, 10.0, true, false),
+        // IronGolem: Enemy && !(entity instanceof Creeper).
+        57 => add(3, HostileExcept(&[23]), 16.0, false, false),
+        // Untamed Wolf: Sheep/Rabbit/Fox prey plus the AbstractSkeleton family.
+        122 => {
+            add(4, Etypes(&[87, 84, 42]), 16.0, false, false);
+            add(5, Etypes(&[91, 102, 11, 120]), 16.0, false, false);
+        }
+        // Fox: Chicken, Rabbit, small fish, and baby Turtle prey.
+        42 => {
+            add(4, Etypes(&[19]), 16.0, false, false);
+            add(4, Etypes(&[84]), 16.0, false, false);
+            add(4, Etypes(&[20, 86, 110]), 16.0, false, false);
+            add(4, Etypes(&[111]), 16.0, false, true);
+        }
+        _ => {}
+    }
+    selector
+}
+
+#[cfg_attr(not(test), allow(dead_code))]
+#[derive(Clone, Copy, Debug, PartialEq)]
 pub(crate) enum MobGoalKind {
     Float,
     Swell,
     MeleeAttack,
+    RangedSnowball,
+    AvoidEntity(AvoidEntitySpec),
     WaterAvoidingRandomStroll,
     LookAtPlayer,
     Unavailable(&'static str),
 }
+
+/// Vanilla `AvoidEntityGoal` constants (maxDist 6.0, walk 1.0, sprint 1.2).
+#[cfg_attr(not(test), allow(dead_code))]
+const AVOID_OCELOT: AvoidEntitySpec = AvoidEntitySpec {
+    flee_etypes: &[72],
+    require_unscared: false,
+    max_dist: 6.0,
+    walk_speed: 1.0,
+    sprint_speed: 1.2,
+};
+
+#[cfg_attr(not(test), allow(dead_code))]
+const AVOID_CAT: AvoidEntitySpec = AvoidEntitySpec {
+    flee_etypes: &[15],
+    require_unscared: false,
+    max_dist: 6.0,
+    walk_speed: 1.0,
+    sprint_speed: 1.2,
+};
+
+#[cfg_attr(not(test), allow(dead_code))]
+const AVOID_WOLF: AvoidEntitySpec = AvoidEntitySpec {
+    flee_etypes: &[122],
+    require_unscared: false,
+    max_dist: 6.0,
+    walk_speed: 1.0,
+    sprint_speed: 1.2,
+};
+
+#[cfg_attr(not(test), allow(dead_code))]
+const AVOID_UNROLLED_ARMADILLO: AvoidEntitySpec = AvoidEntitySpec {
+    flee_etypes: &[2],
+    require_unscared: true,
+    max_dist: 6.0,
+    walk_speed: 1.0,
+    sprint_speed: 1.2,
+};
 
 /// The equipment and door-breaking state that changes vanilla goal registration.
 #[cfg_attr(not(test), allow(dead_code))]
@@ -1528,11 +2020,13 @@ impl MobGoalPlan {
                     (5, "NearestAttackableTargetGoal<Turtle> (baby on land)"),
                 ],
             ),
-            "minecraft:skeleton" => (
+            // Stray and Bogged extend AbstractSkeleton and register the same
+            // goal table as Skeleton in 1.21.1.
+            "minecraft:skeleton" | "minecraft:stray" | "minecraft:bogged" => (
                 vec![
                     (2, Unavailable("RestrictSunGoal")),
                     (3, Unavailable("FleeSunGoal")),
-                    (3, Unavailable("AvoidEntityGoal<Wolf>")),
+                    (3, AvoidEntity(AVOID_WOLF)),
                     (
                         4,
                         if settings.skeleton_has_bow {
@@ -1556,8 +2050,8 @@ impl MobGoalPlan {
                 vec![
                     (1, Float),
                     (2, Swell),
-                    (3, Unavailable("AvoidEntityGoal<Ocelot>")),
-                    (3, Unavailable("AvoidEntityGoal<Cat>")),
+                    (3, AvoidEntity(AVOID_OCELOT)),
+                    (3, AvoidEntity(AVOID_CAT)),
                     (4, MeleeAttack),
                     (5, WaterAvoidingRandomStroll),
                     (6, LookAtPlayer),
@@ -1568,10 +2062,11 @@ impl MobGoalPlan {
                     (2, "HurtByTargetGoal"),
                 ],
             ),
-            "minecraft:spider" => (
+            // CaveSpider inherits Spider.registerGoals unchanged in 1.21.1.
+            "minecraft:spider" | "minecraft:cave_spider" => (
                 vec![
                     (1, Float),
-                    (2, Unavailable("AvoidEntityGoal<Armadillo> (unscared)")),
+                    (2, AvoidEntity(AVOID_UNROLLED_ARMADILLO)),
                     (3, Unavailable("LeapAtTargetGoal")),
                     (4, Unavailable("SpiderAttackGoal")),
                     (5, WaterAvoidingRandomStroll),
@@ -1583,6 +2078,17 @@ impl MobGoalPlan {
                     (2, "SpiderTargetGoal<Player>"),
                     (3, "SpiderTargetGoal<IronGolem>"),
                 ],
+            ),
+            "minecraft:snow_golem" => (
+                vec![
+                    (1, RangedSnowball),
+                    (2, WaterAvoidingRandomStroll),
+                    (3, LookAtPlayer),
+                    (4, Unavailable("RandomLookAroundGoal")),
+                ],
+                // The Enemy-mob target goal is implemented: it lives in
+                // `build_target_selector_for_etype`.
+                &[],
             ),
             _ => return None,
         };
@@ -1600,8 +2106,13 @@ impl MobGoalPlan {
         for &(priority, kind) in &self.goals {
             let goal: Box<dyn Goal> = match kind {
                 MobGoalKind::Float => Box::new(FloatGoal { priority }),
-                MobGoalKind::Swell => Box::new(SwellGoal::new(priority)),
+                // Only creepers swell; their fuse yields to the cat/ocelot flee.
+                MobGoalKind::Swell => {
+                    Box::new(SwellGoal::new(priority).aborted_by(&[72, 15], 6.0))
+                }
                 MobGoalKind::MeleeAttack => Box::new(MeleeAttackGoal::new(priority)),
+                MobGoalKind::RangedSnowball => Box::new(RangedSnowballGoal::new(priority)),
+                MobGoalKind::AvoidEntity(spec) => Box::new(AvoidEntityGoal::new(priority, spec)),
                 MobGoalKind::WaterAvoidingRandomStroll => {
                     Box::new(WaterAvoidingRandomStrollGoal::new(priority, seed))
                 }
@@ -1650,9 +2161,13 @@ pub(crate) fn build_goal_selector_for_etype(etype: i64) -> GoalSelector {
     let mut selector = GoalSelector::default();
     selector.add_goal(Box::new(FloatGoal { priority: 0 }));
     match spec.name {
-        "minecraft:husk" | "minecraft:drowned" | "minecraft:cave_spider" | "minecraft:stray" => {
+        "minecraft:husk" | "minecraft:drowned" => {
             selector.add_goal(Box::new(MeleeAttackGoal::new(2)));
         }
+        // MeleeAttackGoal so the new mob-vs-mob target goals feed an attack.
+        "minecraft:iron_golem" => selector.add_goal(Box::new(MeleeAttackGoal::new(1))),
+        "minecraft:fox" => selector.add_goal(Box::new(MeleeAttackGoal::new(4))),
+        "minecraft:wolf" => selector.add_goal(Box::new(MeleeAttackGoal::new(7))),
         "minecraft:cow" | "minecraft:pig" | "minecraft:sheep" | "minecraft:chicken" => {
             // Item IDs are the existing 1.21.1 server item mappings.
             let tempting_item = match spec.name {
@@ -1680,6 +2195,12 @@ pub(crate) fn build_goal_selector_for_etype(etype: i64) -> GoalSelector {
 pub(crate) struct MobAiProfile {
     pub etype: i64,
     pub selector: GoalSelector,
+    /// Vanilla `targetSelector` for mob-vs-mob targets (empty for most mobs).
+    pub target_selector: TargetSelector,
+    /// Mob-vs-mob observation fed to both selectors each step. Stays empty
+    /// until a caller supplies nearby mobs, which keeps callers that only
+    /// track players unchanged.
+    pub perception: MobPerception,
     pub navigation: PathNavigation,
     pub movement_speed: f64,
     pub eye_height: f64,
@@ -1704,6 +2225,8 @@ impl MobAiProfile {
         Self {
             etype,
             selector: build_goal_selector_for_etype(etype),
+            target_selector: build_target_selector_for_etype(etype),
+            perception: MobPerception::default(),
             navigation: PathNavigation::default(),
             movement_speed,
             eye_height: spec.map_or(1.53, |spec| f64::from(spec.eye_height)),
@@ -1726,6 +2249,10 @@ pub(crate) struct MobAiStepResult {
     pub look_pitch: Option<f32>,
     pub jump: bool,
     pub attack_target: Option<i32>,
+    /// Mob-vs-mob target chosen by the target selector this tick.
+    pub mob_target: Option<i32>,
+    /// Ranged-goal projectile launch (e.g. a snow golem's snowball).
+    pub ranged_attack: Option<RangedProjectileAction>,
     pub swell: Option<bool>,
     pub breed_target: Option<i32>,
     /// `maxEntityCramming` damage evaluated for this tick; the live push
@@ -1740,7 +2267,41 @@ pub(crate) fn tick_mob_ai_step(
     profile: &mut MobAiProfile,
     ctx: &GoalContext<'_>,
 ) -> MobAiStepResult {
-    let goal = profile.selector.tick(ctx);
+    profile.selector.perception.clone_from(&profile.perception);
+    profile
+        .target_selector
+        .perception
+        .clone_from(&profile.perception);
+    // Vanilla ticks the target selector first, so a mob-vs-mob target chosen
+    // this tick already feeds the goal selector.
+    let targets = profile.target_selector.tick(ctx);
+    let substituted;
+    let ctx = if ctx.target.is_none() {
+        match targets.mob_target.and_then(|eid| {
+            profile
+                .perception
+                .nearby_mobs
+                .iter()
+                .find(|mob| mob.entity_id == eid)
+        }) {
+            Some(mob) => {
+                let mut target = AiEntityPerception::new(mob.entity_id, mob.position);
+                target.etype = mob.etype;
+                target.line_of_sight = mob.line_of_sight;
+                target.width = entity_spec_by_id(mob.etype).map_or(0.6, |spec| spec.width);
+                substituted = GoalContext {
+                    target: Some(target),
+                    ..*ctx
+                };
+                &substituted
+            }
+            None => ctx,
+        }
+    } else {
+        ctx
+    };
+    let mut goal = profile.selector.tick(ctx);
+    goal.merge_missing(targets);
     let mut waypoint = goal.move_target;
     if let (Some(world), Some(target)) = (ctx.world, goal.move_target) {
         let destination = (
@@ -1782,7 +2343,8 @@ pub(crate) fn tick_mob_ai_step(
         let dz = point.2 - ctx.position.2;
         let distance = dx.hypot(dz);
         if distance > 0.05 {
-            let step = profile.movement_speed.max(0.0).min(distance);
+            let speed = profile.movement_speed * goal.speed_modifier.unwrap_or(1.0);
+            let step = speed.max(0.0).min(distance);
             movement_delta = (dx / distance * step, 0.0, dz / distance * step);
         }
         jump |= point.1 > ctx.position.1 + 0.5;
@@ -1902,6 +2464,8 @@ pub(crate) fn tick_mob_ai_step(
         look_pitch,
         jump,
         attack_target,
+        mob_target: goal.mob_target,
+        ranged_attack: goal.ranged_attack,
         swell: goal.swell,
         breed_target: goal.breed_target,
         cramming_damage,
@@ -1978,6 +2542,10 @@ mod mob_ai_tests {
 
     fn target(id: i32, x: f64, y: f64, z: f64) -> AiEntityPerception {
         AiEntityPerception::new(id, (x, y, z))
+    }
+
+    fn mob_at(etype: i64, eid: i32, x: f64, z: f64) -> NearbyMob {
+        NearbyMob::new(eid, etype, (x, 1.0, z))
     }
 
     #[cfg_attr(not(megu_vanilla_data), allow(dead_code))]
@@ -2303,7 +2871,7 @@ mod mob_ai_tests {
                 &[
                     (2, Unavailable("RestrictSunGoal")),
                     (3, Unavailable("FleeSunGoal")),
-                    (3, Unavailable("AvoidEntityGoal<Wolf>")),
+                    (3, AvoidEntity(AVOID_WOLF)),
                     (4, Unavailable("RangedBowAttackGoal")),
                     (5, WaterAvoidingRandomStroll),
                     (6, LookAtPlayer),
@@ -2315,15 +2883,15 @@ mod mob_ai_tests {
                     (3, "NearestAttackableTargetGoal<IronGolem>"),
                     (3, "NearestAttackableTargetGoal<Turtle> (baby on land)"),
                 ],
-                &[5, 6],
+                &[3, 5, 6],
             ),
             (
                 "creeper",
                 &[
                     (1, Float),
                     (2, Swell),
-                    (3, Unavailable("AvoidEntityGoal<Ocelot>")),
-                    (3, Unavailable("AvoidEntityGoal<Cat>")),
+                    (3, AvoidEntity(AVOID_OCELOT)),
+                    (3, AvoidEntity(AVOID_CAT)),
                     (4, MeleeAttack),
                     (5, WaterAvoidingRandomStroll),
                     (6, LookAtPlayer),
@@ -2333,13 +2901,13 @@ mod mob_ai_tests {
                     (1, "NearestAttackableTargetGoal<Player>"),
                     (2, "HurtByTargetGoal"),
                 ],
-                &[1, 2, 4, 5, 6],
+                &[1, 2, 3, 3, 4, 5, 6],
             ),
             (
                 "spider",
                 &[
                     (1, Float),
-                    (2, Unavailable("AvoidEntityGoal<Armadillo> (unscared)")),
+                    (2, AvoidEntity(AVOID_UNROLLED_ARMADILLO)),
                     (3, Unavailable("LeapAtTargetGoal")),
                     (4, Unavailable("SpiderAttackGoal")),
                     (5, WaterAvoidingRandomStroll),
@@ -2351,7 +2919,7 @@ mod mob_ai_tests {
                     (2, "SpiderTargetGoal<Player>"),
                     (3, "SpiderTargetGoal<IronGolem>"),
                 ],
-                &[1, 5, 6],
+                &[1, 2, 5, 6],
             ),
         ];
         for (name, goals, missing_targets, active_priorities) in cases {
@@ -2378,7 +2946,8 @@ mod mob_ai_tests {
         let unarmed =
             MobGoalPlan::for_entity(entity_id("skeleton"), MobGoalSettings::default()).unwrap();
         assert_eq!(unarmed.goals[3], (4, MobGoalKind::MeleeAttack));
-        assert_eq!(unarmed.build_selector(0).goals[0].goal.priority(), 4);
+        // The priority-3 wolf avoidance now installs ahead of the melee attack.
+        assert_eq!(unarmed.build_selector(0).goals[0].goal.priority(), 3);
         let breaking = MobGoalPlan::for_entity(
             entity_id("zombie"),
             MobGoalSettings {
@@ -2400,7 +2969,7 @@ mod mob_ai_tests {
         let mut creeper = build_goal_selector_for_etype(23);
         let mut zombie = build_goal_selector_for_etype(124);
         let mut cow = build_goal_selector_for_etype(22);
-        assert_eq!(creeper.goals.len(), 5);
+        assert_eq!(creeper.goals.len(), 7);
         assert_eq!(zombie.goals.len(), 4);
         assert_eq!(cow.goals.len(), 6);
         assert_eq!(build_goal_selector_for_etype(-1).goals.len(), 0);
@@ -3155,5 +3724,227 @@ mod mob_ai_tests {
             ..GoalContext::default()
         };
         assert_eq!(tick_mob_ai_step(&mut profile, &ctx).cramming_damage, 0.0);
+    }
+
+    #[test]
+    fn avoid_entity_goal_flees_within_max_dist_and_sprints_inside_seven() {
+        let spec = AvoidEntitySpec {
+            flee_etypes: &[99],
+            require_unscared: false,
+            max_dist: 10.0,
+            walk_speed: 1.0,
+            sprint_speed: 1.5,
+        };
+        let mut goal = AvoidEntityGoal::new(3, spec);
+        let ctx = GoalContext {
+            position: (0.0, 1.0, 0.0),
+            ..GoalContext::default()
+        };
+        assert!(!goal.can_use(&ctx));
+        let mut perception = MobPerception::default();
+        perception.nearby_mobs.push(mob_at(99, 7, 8.0, 0.0));
+        goal.perceive(ctx.position, &perception);
+        assert!(goal.can_use(&ctx));
+        let out = goal.tick(&ctx).unwrap();
+        let (x, _, z) = out.move_target.unwrap();
+        assert!(x < 0.0 && z == 0.0);
+        // Eight blocks out is past the 7-block sprint band: walk modifier.
+        assert_eq!(out.speed_modifier, Some(1.0));
+        perception.nearby_mobs = vec![mob_at(99, 7, 6.0, 0.0)];
+        goal.perceive(ctx.position, &perception);
+        assert_eq!(goal.tick(&ctx).unwrap().speed_modifier, Some(1.5));
+        // Outside max_dist the goal drops the threat.
+        perception.nearby_mobs = vec![mob_at(99, 7, 10.5, 0.0)];
+        goal.perceive(ctx.position, &perception);
+        assert!(!goal.can_use(&ctx));
+    }
+
+    #[test]
+    fn creeper_flees_cat_and_ocelot_and_aborts_swell() {
+        let plan = MobGoalPlan::for_entity(23, MobGoalSettings::default()).unwrap();
+        let mut selector = plan.build_selector(0);
+        let mut ctx = GoalContext {
+            position: (0.0, 1.0, 0.0),
+            ..GoalContext::default()
+        };
+        // A cat inside 6 blocks sends the creeper the other way at sprint.
+        selector.perception.nearby_mobs = vec![mob_at(15, 7, 3.0, 0.0)];
+        let out = selector.tick(&ctx);
+        let dest = out.move_target.expect("creeper must flee the cat");
+        assert!(
+            entity_distance_sq(dest, (3.0, 1.0, 0.0))
+                > entity_distance_sq(ctx.position, (3.0, 1.0, 0.0)),
+            "flee destination {dest:?} must be further from the cat"
+        );
+        assert!((out.speed_modifier.unwrap() - 1.2).abs() < 1.0e-6);
+        // Ocelots scare creepers the same way.
+        selector.perception.nearby_mobs = vec![mob_at(72, 7, -3.0, 0.0)];
+        let out = selector.tick(&ctx);
+        assert!(out.move_target.unwrap().0 > ctx.position.0);
+        // Six blocks is the whole trigger radius.
+        selector.perception.nearby_mobs = vec![mob_at(15, 7, 7.0, 0.0)];
+        assert!(selector.tick(&ctx).move_target.is_none());
+        // A lit fuse aborts the moment a cat enters the flee radius.
+        selector.perception.nearby_mobs = Vec::new();
+        ctx.target = Some(target(9, 2.0, 1.0, 0.0));
+        assert_eq!(selector.tick(&ctx).swell, Some(true));
+        selector.perception.nearby_mobs = vec![mob_at(15, 7, 1.0, 0.5)];
+        let out = selector.tick(&ctx);
+        assert_eq!(out.swell, Some(false));
+        assert!(out.move_target.unwrap().0 < 0.0);
+    }
+
+    #[test]
+    fn skeleton_family_flees_wolves_within_six_blocks() {
+        for name in ["skeleton", "stray", "bogged"] {
+            let etype = entity_spec_by_name(name).unwrap().id;
+            let mut selector = build_goal_selector_for_etype(etype);
+            let ctx = GoalContext {
+                position: (0.0, 1.0, 0.0),
+                ..GoalContext::default()
+            };
+            selector.perception.nearby_mobs = vec![mob_at(122, 7, 4.0, 0.0)];
+            let out = selector.tick(&ctx);
+            assert!(
+                out.move_target.is_some_and(|(x, ..)| x < 0.0),
+                "{name} must flee the wolf"
+            );
+            selector.perception.nearby_mobs = vec![mob_at(122, 7, 7.0, 0.0)];
+            assert!(selector.tick(&ctx).move_target.is_none(), "{name}");
+        }
+    }
+
+    #[test]
+    fn spider_family_flees_only_unscared_armadillos() {
+        for name in ["spider", "cave_spider"] {
+            let etype = entity_spec_by_name(name).unwrap().id;
+            let mut selector = build_goal_selector_for_etype(etype);
+            let ctx = GoalContext {
+                position: (0.0, 1.0, 0.0),
+                ..GoalContext::default()
+            };
+            let mut armadillo = mob_at(2, 7, 4.0, 0.0);
+            selector.perception.nearby_mobs = vec![armadillo];
+            assert!(
+                selector
+                    .tick(&ctx)
+                    .move_target
+                    .is_some_and(|(x, ..)| x < 0.0),
+                "{name} must flee the unrolled armadillo"
+            );
+            armadillo.scared = true;
+            selector.perception.nearby_mobs = vec![armadillo];
+            assert!(selector.tick(&ctx).move_target.is_none(), "{name}");
+        }
+    }
+
+    #[test]
+    fn v1211_veh_ai_creeper_flee_speed_applies_sprint_modifier_through_step() {
+        let mut profile = MobAiProfile::new(23);
+        profile.perception.nearby_mobs = vec![mob_at(15, 7, 3.0, 0.0)];
+        let ctx = GoalContext {
+            position: (0.0, 1.0, 0.0),
+            ..GoalContext::default()
+        };
+        let step = tick_mob_ai_step(&mut profile, &ctx);
+        // movement_speed 0.25 * sprint modifier 1.2, straight away from the cat.
+        assert_eq!(step.move_target, Some((-6.0, 1.0, 0.0)));
+        assert!((step.movement_delta.0 + 0.3).abs() < 1.0e-6);
+        assert_eq!((step.movement_delta.1, step.movement_delta.2), (0.0, 0.0));
+    }
+
+    #[test]
+    fn snow_golem_targets_enemies_and_throws_snowballs_on_cadence() {
+        let mut profile = MobAiProfile::new(96);
+        profile.perception.nearby_mobs = vec![mob_at(124, 7, 5.0, 0.0)];
+        let ctx = GoalContext {
+            position: (0.0, 1.0, 0.0),
+            ..GoalContext::default()
+        };
+        assert_eq!(tick_mob_ai_step(&mut profile, &ctx).mob_target, Some(7));
+        let mut shots = Vec::new();
+        for tick in 2..=41 {
+            let step = tick_mob_ai_step(&mut profile, &ctx);
+            if let Some(RangedProjectileAction::Snowball {
+                target_eid,
+                target_pos,
+                velocity,
+            }) = step.ranged_attack
+            {
+                shots.push((tick, target_eid, target_pos, velocity));
+            }
+        }
+        // Vanilla arms the 20-tick interval on first sight, then repeats it.
+        assert_eq!(shots.len(), 2, "{shots:?}");
+        assert_eq!(shots[0].0, 21);
+        assert_eq!(shots[1].0, 41);
+        assert!(shots.iter().all(|(_, eid, ..)| *eid == 7));
+        let (vx, vy, vz) = shots[0].3;
+        let speed = (vx * vx + vy * vy + vz * vz).sqrt();
+        assert!((speed - 1.6).abs() < 1.0e-9, "snowball speed {speed}");
+        assert!(vx > 0.0, "snowball flies toward the target");
+        // Passive mobs are never Enemy targets.
+        profile.perception.nearby_mobs = vec![mob_at(22, 8, 5.0, 0.0)];
+        assert_eq!(tick_mob_ai_step(&mut profile, &ctx).mob_target, None);
+    }
+
+    #[test]
+    fn iron_golem_targets_hostile_mobs_but_never_creepers() {
+        let mut profile = MobAiProfile::new(57);
+        let ctx = GoalContext {
+            position: (0.0, 1.0, 0.0),
+            ..GoalContext::default()
+        };
+        profile.perception.nearby_mobs = vec![mob_at(23, 5, 4.0, 0.0)];
+        assert_eq!(tick_mob_ai_step(&mut profile, &ctx).mob_target, None);
+        profile.perception.nearby_mobs = vec![mob_at(124, 7, 4.0, 0.0)];
+        assert_eq!(tick_mob_ai_step(&mut profile, &ctx).mob_target, Some(7));
+        // The creeper is the closest mob yet the skeleton still wins.
+        profile.perception.nearby_mobs = vec![
+            mob_at(124, 7, 10.0, 0.0),
+            mob_at(91, 8, 3.0, 0.0),
+            mob_at(23, 5, 1.0, 0.0),
+        ];
+        assert_eq!(tick_mob_ai_step(&mut profile, &ctx).mob_target, Some(8));
+    }
+
+    #[test]
+    fn untamed_wolf_targets_sheep_and_skeletons() {
+        let mut profile = MobAiProfile::new(122);
+        let ctx = GoalContext {
+            position: (0.0, 1.0, 0.0),
+            ..GoalContext::default()
+        };
+        profile.perception.nearby_mobs = vec![mob_at(87, 7, 5.0, 0.0)];
+        assert_eq!(tick_mob_ai_step(&mut profile, &ctx).mob_target, Some(7));
+        profile.perception.nearby_mobs = vec![mob_at(91, 8, 5.0, 0.0)];
+        assert_eq!(tick_mob_ai_step(&mut profile, &ctx).mob_target, Some(8));
+        // Pigs are not wolf prey.
+        profile.perception.nearby_mobs = vec![mob_at(77, 9, 5.0, 0.0)];
+        assert_eq!(tick_mob_ai_step(&mut profile, &ctx).mob_target, None);
+    }
+
+    #[test]
+    fn fox_targets_poultry_rabbits_fish_and_baby_turtles() {
+        let mut profile = MobAiProfile::new(42);
+        let ctx = GoalContext {
+            position: (0.0, 1.0, 0.0),
+            ..GoalContext::default()
+        };
+        for etype in [19, 84, 20, 86, 110] {
+            profile.perception.nearby_mobs = vec![mob_at(etype, 7, 5.0, 0.0)];
+            assert_eq!(
+                tick_mob_ai_step(&mut profile, &ctx).mob_target,
+                Some(7),
+                "fox must target etype {etype}"
+            );
+        }
+        // Turtles only qualify while babies.
+        profile.perception.nearby_mobs = vec![mob_at(111, 7, 5.0, 0.0)];
+        assert_eq!(tick_mob_ai_step(&mut profile, &ctx).mob_target, None);
+        let mut baby = mob_at(111, 7, 5.0, 0.0);
+        baby.baby = true;
+        profile.perception.nearby_mobs = vec![baby];
+        assert_eq!(tick_mob_ai_step(&mut profile, &ctx).mob_target, Some(7));
     }
 }

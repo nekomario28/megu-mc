@@ -1204,6 +1204,38 @@ fn iron_golem_fling_velocity(target_pos: [f64; 3], golem_pos: [f64; 3]) -> [f64;
     [horizontal[0] * 0.4, 0.4, horizontal[2] * 0.4]
 }
 
+/// Vanilla `SnowGolem.performRangedAttack` (1.21.1): aims at the target's eye
+/// line minus the 1.1 projectile spawn offset, adds the 0.2-per-block arc
+/// compensation, and throws at 1.6 speed (the 12.0 inaccuracy stays with the
+/// launcher's spread, so this vector is deterministic).
+#[cfg_attr(not(test), allow(dead_code))]
+fn snow_golem_snowball_velocity(
+    golem_pos: [f64; 3],
+    target_pos: [f64; 3],
+    target_eye_height: f64,
+) -> [f64; 3] {
+    // The snowball spawns at `getEyeY() - 0.1` (snow golem eye height 1.7).
+    let snowball_y = golem_pos[1] + 1.6;
+    let dx = target_pos[0] - golem_pos[0];
+    let dy = target_pos[1] + target_eye_height - 1.1 - snowball_y;
+    let dz = target_pos[2] - golem_pos[2];
+    let arc = (dx * dx + dz * dz).sqrt() * 0.2;
+    mob_behavior_unit([dx, dy + arc, dz]).map(|component| component * 1.6)
+}
+
+/// Vanilla `Snowball.onHitEntity`: a thrown snowball deals 3 damage only to
+/// Blazes; every other entity takes a 0-damage hurt that still applies the
+/// standard projectile knockback.
+#[cfg_attr(not(test), allow(dead_code))]
+fn snowball_hit_effect(target: &str) -> (f32, bool) {
+    let damage = if mob_behavior_id(target) == "blaze" {
+        3.0
+    } else {
+        0.0
+    };
+    (damage, true)
+}
+
 #[cfg_attr(not(test), allow(dead_code))]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum WitchPotion {
@@ -5745,6 +5777,28 @@ mod mob_behaviors_tests {
         assert!((fling[0] - 0.24).abs() < 1e-12);
         assert_eq!(fling[1], 0.4);
         assert!((fling[2] - 0.32).abs() < 1e-12);
+    }
+
+    #[test]
+    fn snow_golem_snowball_arc_compensates_and_hits_blazes_for_three() {
+        // A target 10 blocks east, feet level with the golem: vanilla adds
+        // 0.2 * horizontal distance of arc lift to the eye-line delta.
+        let velocity = snow_golem_snowball_velocity([0.0, 0.0, 0.0], [10.0, 0.0, 0.0], 1.74);
+        let speed = mob_behavior_dot(velocity, velocity).sqrt();
+        assert!((speed - 1.6).abs() < 1e-12, "snowball speed {speed}");
+        // dy = 1.74 - 1.1 - 1.6 = -0.96 before the +2.0 arc compensation.
+        assert!(velocity[1] > 0.0, "arc lift must push the throw up");
+        assert!(velocity[0] > 0.0 && velocity[2].abs() < 1e-12);
+        // A directly overhead target still yields a unit 1.6-speed throw.
+        let up = snow_golem_snowball_velocity([0.0, 0.0, 0.0], [0.0, 5.0, 0.0], 1.62);
+        assert!((mob_behavior_dot(up, up).sqrt() - 1.6).abs() < 1e-12);
+
+        // Snowballs deal 3 damage only to Blazes; everything else takes a
+        // 0-damage hurt that still carries the standard knockback.
+        assert_eq!(snowball_hit_effect("minecraft:blaze"), (3.0, true));
+        assert_eq!(snowball_hit_effect("blaze"), (3.0, true));
+        assert_eq!(snowball_hit_effect("minecraft:zombie"), (0.0, true));
+        assert_eq!(snowball_hit_effect("creeper"), (0.0, true));
     }
 }
 
