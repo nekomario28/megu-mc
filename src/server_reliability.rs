@@ -1911,6 +1911,488 @@ pub(crate) fn run_quarantined_tick(
     TickFaultOutcome::Faulted { quarantined }
 }
 
+// ================= per-chunk lag hotspot quarantine =================
+//
+// Paper, Purpur and NeoForge can name a lagging plugin or a lagging entity;
+// none of them can say "chunk (10,-4) in the_nether burned 18 ms of the tick
+// for 40 ticks straight, so we throttled just that chunk while every other
+// player kept 20 TPS". `ChunkHotspotQuarantine` is that missing piece: the
+// tick loop reports per-(dimension, chunk) cost samples through
+// `record_chunk_cost_us`, a per-cost-kind EWMA smooths them for the hotspot
+// report, and a chunk whose *whole-tick* cost stays over
+// `quarantine_threshold_us` for `trigger_ticks` consecutive ticks drops to a
+// 1-in-`cadence` tick cadence — a trickle, not a freeze, so its block
+// entities still smelt. Hysteresis lifts the throttle only after
+// `hysteresis_exit_ticks` consecutive ticks under `hysteresis_exit_us`, or an
+// operator clears it by hand. The tracked set is hard-bounded and evicts the
+// least-recently-active entries, so the tracker itself can never become the
+// leak it exists to find. Nothing here reads a wall clock: `tick` is the
+// caller's monotonic tick counter.
+
+/// Which subsystem inside one chunk burned the tick budget.
+#[allow(dead_code)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub(crate) enum ChunkCostKind {
+    /// Ticking tile entities: hoppers, droppers, furnaces, chests, ...
+    BlockEntity,
+    /// Mob/item entity AI and movement inside the chunk.
+    Entities,
+    /// Redstone wire/piston/repeater propagation.
+    Redstone,
+    /// Mod-driven machines — the runaway-mod case no vanilla profiler names.
+    ModMachine,
+}
+
+#[allow(dead_code)]
+impl ChunkCostKind {
+    const ALL: [ChunkCostKind; 4] = [
+        Self::BlockEntity,
+        Self::Entities,
+        Self::Redstone,
+        Self::ModMachine,
+    ];
+
+    fn index(self) -> usize {
+        self as usize
+    }
+
+    /// Stable operator-facing spelling for reports and alerts.
+    pub(crate) fn as_str(self) -> &'static str {
+        match self {
+            Self::BlockEntity => "block_entity",
+            Self::Entities => "entities",
+            Self::Redstone => "redstone",
+            Self::ModMachine => "mod_machine",
+        }
+    }
+}
+
+/// `(dimension, chunk x, chunk z)` — the identity a hotspot is quarantined by.
+type ChunkHotspotKey = (DimId, i32, i32);
+
+/// Tunables for `ChunkHotspotQuarantine`; `Default` is the shipped policy.
+#[allow(dead_code)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct ChunkHotspotPolicy {
+    /// Smoothed per-chunk tick cost (µs) that counts as "hot".
+    pub quarantine_threshold_us: u64,
+    /// Smoothed cost that must hold for `hysteresis_exit_ticks` to lift.
+    pub hysteresis_exit_us: u64,
+    /// Consecutive hot ticks before the chunk drops to the slow cadence.
+    pub trigger_ticks: u32,
+    /// Consecutive cool ticks that auto-lift a quarantine.
+    pub hysteresis_exit_ticks: u32,
+    /// A quarantined chunk ticks once every this many ticks.
+    pub cadence: u64,
+}
+
+#[allow(dead_code)]
+impl Default for ChunkHotspotPolicy {
+    fn default() -> Self {
+        Self {
+            quarantine_threshold_us: 15_000,
+            hysteresis_exit_us: 4_000,
+            trigger_ticks: 3,
+            hysteresis_exit_ticks: 20,
+            cadence: 8,
+        }
+    }
+}
+
+/// Hard bound on tracked chunks; least-recently-active entries evict first
+/// so the tracker itself stays a fixed-size structure.
+const CHUNK_HOTSPOT_MAX_TRACKED: usize = 4_096;
+/// EWMA weight of the newest cost sample.
+const CHUNK_HOTSPOT_EWMA_ALPHA: f64 = 0.4;
+/// Operator alerts kept for `/megu status`-style surfaces.
+const CHUNK_HOTSPOT_MAX_ALERTS: usize = 64;
+
+#[derive(Default)]
+struct ChunkHotspotEntry {
+    /// Per-kind EWMA in microseconds; `kind_seen` marks which slots hold a
+    /// real first sample (an EWMA initialises to the first cost, not zero,
+    /// so one 20 ms spike is not diluted by empty history).
+    kind_ewma: [f64; 4],
+    kind_seen: u8,
+    samples: u64,
+    /// Tick of the newest sample; the first sample of a *new* tick is also
+    /// the boundary that scores the tick before it.
+    last_tick: Option<u64>,
+    /// Whole-tick cost accumulator: every cost-kind sample of the current
+    /// tick sums here and is scored once, when the next tick's first sample
+    /// lands. Streaks count *this* instantaneous per-tick total — the spec's
+    /// "exceeds the threshold for N consecutive ticks" — while the EWMA
+    /// above stays the smoothed metric reports and alerts quote.
+    tick_cost_us: f64,
+    over_streak: u32,
+    cool_streak: u32,
+    quarantined: bool,
+    /// `tick % cadence` slot this chunk owns while quarantined, so throttled
+    /// chunks spread across the tick instead of all firing together.
+    phase: u64,
+}
+
+/// What changed when a completed tick was scored.
+enum HotspotTransition {
+    /// `trigger_ticks` consecutive hot ticks elapsed: throttle engaged.
+    Quarantined { ewma_us: f64, kind: ChunkCostKind },
+    /// `hysteresis_exit_ticks` consecutive cool ticks elapsed: auto-lifted.
+    Lifted { ewma_us: f64 },
+}
+
+#[allow(dead_code)]
+impl ChunkHotspotEntry {
+    /// Smoothed total tick cost across every reported cost kind.
+    fn total_ewma_us(&self) -> f64 {
+        self.kind_ewma.iter().sum()
+    }
+
+    /// The cost kind with the highest smoothed share — what the report names.
+    fn dominant_kind(&self) -> ChunkCostKind {
+        ChunkCostKind::ALL
+            .iter()
+            .copied()
+            .filter(|k| self.kind_seen & (1 << k.index()) != 0)
+            .max_by(|a, b| {
+                self.kind_ewma[a.index()]
+                    .total_cmp(&self.kind_ewma[b.index()])
+            })
+            .unwrap_or(ChunkCostKind::BlockEntity)
+    }
+
+    /// Score the tick that just completed. Called once per tick — on the
+    /// first sample of the *next* tick — so multi-kind chunks are judged on
+    /// their whole-tick cost, never on one subsystem's partial view.
+    fn score_completed_tick(
+        &mut self,
+        policy: &ChunkHotspotPolicy,
+        tick: u64,
+        tick_cost_us: f64,
+    ) -> Option<HotspotTransition> {
+        if tick_cost_us > policy.quarantine_threshold_us as f64 {
+            self.over_streak = self.over_streak.saturating_add(1);
+            self.cool_streak = 0;
+        } else if tick_cost_us < policy.hysteresis_exit_us as f64 {
+            self.cool_streak = self.cool_streak.saturating_add(1);
+            self.over_streak = 0;
+        } else {
+            // Inside the hysteresis band the chunk is neither hot enough to
+            // count toward a quarantine nor cool enough to earn a lift.
+            self.over_streak = 0;
+            self.cool_streak = 0;
+        }
+        if !self.quarantined && self.over_streak >= policy.trigger_ticks {
+            self.quarantined = true;
+            self.phase = tick % policy.cadence.max(1);
+            return Some(HotspotTransition::Quarantined {
+                ewma_us: self.total_ewma_us(),
+                kind: self.dominant_kind(),
+            });
+        }
+        if self.quarantined && self.cool_streak >= policy.hysteresis_exit_ticks {
+            self.quarantined = false;
+            return Some(HotspotTransition::Lifted {
+                ewma_us: self.total_ewma_us(),
+            });
+        }
+        None
+    }
+}
+
+/// One row of `top_lag_hotspots` / `format_hotspot_report`.
+#[allow(dead_code)]
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) struct ChunkHotspotSummary {
+    pub dim: DimId,
+    pub cx: i32,
+    pub cz: i32,
+    /// The subsystem with the highest smoothed share of the chunk's cost.
+    pub dominant_kind: ChunkCostKind,
+    /// Smoothed whole-chunk tick cost in microseconds.
+    pub ewma_us: u64,
+    pub samples: u64,
+    pub quarantined: bool,
+}
+
+#[derive(Default)]
+struct ChunkHotspotState {
+    chunks: HashMap<ChunkHotspotKey, ChunkHotspotEntry>,
+    /// Bounded operator alert ring: quarantine engage/lift/clear lines,
+    /// oldest dropped first.
+    alerts: Vec<String>,
+}
+
+/// Per-(dimension, chunk) lag accounting with automatic throttling. See the
+/// section comment for the policy; the short version is: sustained hot
+/// chunks drop to a 1-in-`cadence` tick cadence and recover on hysteresis.
+#[allow(dead_code)]
+pub(crate) struct ChunkHotspotQuarantine {
+    policy: ChunkHotspotPolicy,
+    state: Mutex<ChunkHotspotState>,
+}
+
+#[allow(dead_code)]
+impl ChunkHotspotQuarantine {
+    pub(crate) fn new() -> Self {
+        Self::with_policy(ChunkHotspotPolicy::default())
+    }
+
+    pub(crate) fn with_policy(policy: ChunkHotspotPolicy) -> Self {
+        ChunkHotspotQuarantine {
+            policy,
+            state: Mutex::new(ChunkHotspotState::default()),
+        }
+    }
+
+    pub(crate) fn policy(&self) -> ChunkHotspotPolicy {
+        self.policy
+    }
+
+    /// Report one chunk-subsystem cost sample for `tick`. The tick loop calls
+    /// this once per (chunk, cost kind) per tick actually spent; the tracker
+    /// itself decides when the chunk is hot enough to throttle.
+    pub(crate) fn record_chunk_cost_us(
+        &self,
+        dim: DimId,
+        cx: i32,
+        cz: i32,
+        kind: ChunkCostKind,
+        cost_us: u64,
+        tick: u64,
+    ) {
+        let key = (dim, cx, cz);
+        let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        let ChunkHotspotState { chunks, alerts } = &mut *state;
+        if chunks.len() >= CHUNK_HOTSPOT_MAX_TRACKED && !chunks.contains_key(&key) {
+            evict_oldest_chunk_entry(chunks);
+        }
+        let entry = chunks.entry(key).or_default();
+        // The first sample of a NEW tick closes the previous tick's books:
+        // score its whole-tick cost exactly as that tick left it, once per
+        // tick however many cost kinds reported inside it.
+        if let Some(prev_tick) = entry.last_tick.filter(|&t| t != tick) {
+            let completed_cost = std::mem::take(&mut entry.tick_cost_us);
+            if let Some(transition) =
+                entry.score_completed_tick(&self.policy, prev_tick, completed_cost)
+            {
+                let line = match transition {
+                    HotspotTransition::Quarantined { ewma_us, kind } => format!(
+                        "[hotspot] quarantined dim={} chunk=({cx},{cz}) kind={} \
+                         ewma={ewma_us:.0}us cadence=1/{}",
+                        chunk_dim_label(dim),
+                        kind.as_str(),
+                        self.policy.cadence
+                    ),
+                    HotspotTransition::Lifted { ewma_us } => format!(
+                        "[hotspot] auto-lifted dim={} chunk=({cx},{cz}) ewma={ewma_us:.0}us",
+                        chunk_dim_label(dim)
+                    ),
+                };
+                push_chunk_alert(alerts, line);
+            }
+        }
+        entry.last_tick = Some(tick);
+        entry.tick_cost_us += cost_us as f64;
+        let slot = kind.index();
+        let cost = cost_us as f64;
+        entry.kind_ewma[slot] = if entry.kind_seen & (1 << slot) != 0 {
+            CHUNK_HOTSPOT_EWMA_ALPHA * cost
+                + (1.0 - CHUNK_HOTSPOT_EWMA_ALPHA) * entry.kind_ewma[slot]
+        } else {
+            cost
+        };
+        entry.kind_seen |= 1 << slot;
+        entry.samples = entry.samples.saturating_add(1);
+    }
+
+    /// Whether the chunk's tick work may run on `tick`. Healthy chunks always
+    /// may; a quarantined chunk owns exactly one `tick % cadence == phase`
+    /// slot per cadence window.
+    pub(crate) fn chunk_tick_due(&self, dim: DimId, cx: i32, cz: i32, tick: u64) -> bool {
+        let state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        match state.chunks.get(&(dim, cx, cz)) {
+            Some(entry) if entry.quarantined => {
+                tick % self.policy.cadence.max(1) == entry.phase
+            }
+            _ => true,
+        }
+    }
+
+    /// Whether the chunk is currently on the throttled cadence.
+    pub(crate) fn is_chunk_quarantined(&self, dim: DimId, cx: i32, cz: i32) -> bool {
+        self.state
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .chunks
+            .get(&(dim, cx, cz))
+            .is_some_and(|entry| entry.quarantined)
+    }
+
+    /// Operator override: release a quarantined chunk now. Returns whether a
+    /// quarantine was actually lifted.
+    pub(crate) fn clear_chunk_quarantine(&self, dim: DimId, cx: i32, cz: i32) -> bool {
+        let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        let ChunkHotspotState { chunks, alerts } = &mut *state;
+        let Some(entry) = chunks.get_mut(&(dim, cx, cz)) else {
+            return false;
+        };
+        if !entry.quarantined {
+            return false;
+        }
+        entry.quarantined = false;
+        entry.over_streak = 0;
+        entry.cool_streak = 0;
+        push_chunk_alert(
+            alerts,
+            format!(
+                "[hotspot] quarantine cleared by operator dim={} chunk=({cx},{cz})",
+                chunk_dim_label(dim)
+            ),
+        );
+        true
+    }
+
+    /// The operator alert ring, oldest first — quarantine engage/lift/clear
+    /// lines a `/megu status` surface can show verbatim.
+    pub(crate) fn alerts(&self) -> Vec<String> {
+        self.state
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .alerts
+            .clone()
+    }
+
+    /// Hottest chunks by smoothed tick cost, worst first. Ties break on
+    /// `(dim, cx, cz)` so the ordering is deterministic for reports.
+    pub(crate) fn top_lag_hotspots(&self, limit: usize) -> Vec<ChunkHotspotSummary> {
+        let state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        let mut out = chunk_hotspot_summaries(&state.chunks);
+        out.truncate(limit);
+        out
+    }
+
+    /// Spark-free instant lag diagnosis for `/megu status`: the policy in
+    /// force, the tracked/quarantined counts, the top hotspots and the recent
+    /// operator alerts — all from in-memory counters, no profiler attach.
+    pub(crate) fn format_hotspot_report(&self) -> String {
+        let state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        let quarantined = state
+            .chunks
+            .values()
+            .filter(|entry| entry.quarantined)
+            .count();
+        let mut out = format!(
+            "chunk hotspot report: {} chunks tracked, {quarantined} quarantined\n\
+             policy: quarantine >{}us for {} ticks, lift <{}us for {} ticks, \
+             cadence 1/{}",
+            state.chunks.len(),
+            self.policy.quarantine_threshold_us,
+            self.policy.trigger_ticks,
+            self.policy.hysteresis_exit_us,
+            self.policy.hysteresis_exit_ticks,
+            self.policy.cadence,
+        );
+        let mut top = chunk_hotspot_summaries(&state.chunks);
+        top.truncate(10);
+        if top.is_empty() {
+            out.push_str("\nno chunk cost samples recorded");
+        }
+        for (i, s) in top.iter().enumerate() {
+            out.push_str(&format!(
+                "\n#{:<2} dim={} chunk=({}, {}) kind={} ewma={}us samples={}{}",
+                i + 1,
+                chunk_dim_label(s.dim),
+                s.cx,
+                s.cz,
+                s.dominant_kind.as_str(),
+                s.ewma_us,
+                s.samples,
+                if s.quarantined { " QUARANTINED" } else { "" },
+            ));
+        }
+        if !state.alerts.is_empty() {
+            out.push_str("\nrecent alerts:");
+            for alert in state.alerts.iter().rev().take(8) {
+                out.push('\n');
+                out.push_str(alert);
+            }
+        }
+        out
+    }
+}
+
+impl Default for ChunkHotspotQuarantine {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// Sorted hotspot rows shared by `top_lag_hotspots` and the report so both
+/// see one ordering under a single lock.
+fn chunk_hotspot_summaries(
+    chunks: &HashMap<ChunkHotspotKey, ChunkHotspotEntry>,
+) -> Vec<ChunkHotspotSummary> {
+    let mut out: Vec<ChunkHotspotSummary> = chunks
+        .iter()
+        .map(|(&(dim, cx, cz), entry)| ChunkHotspotSummary {
+            dim,
+            cx,
+            cz,
+            dominant_kind: entry.dominant_kind(),
+            ewma_us: entry.total_ewma_us().round().max(0.0) as u64,
+            samples: entry.samples,
+            quarantined: entry.quarantined,
+        })
+        .collect();
+    out.sort_by(|a, b| {
+        b.ewma_us
+            .cmp(&a.ewma_us)
+            .then(a.dim.cmp(&b.dim))
+            .then(a.cx.cmp(&b.cx))
+            .then(a.cz.cmp(&b.cz))
+    });
+    out
+}
+
+/// Drop the least-recently-active entry. Quarantined chunks are only evicted
+/// when every tracked chunk is quarantined — the hard bound wins over the
+/// freeze, but only as the last resort.
+fn evict_oldest_chunk_entry(chunks: &mut HashMap<ChunkHotspotKey, ChunkHotspotEntry>) {
+    let victim = chunks
+        .iter()
+        .min_by_key(|(key, entry)| {
+            (
+                entry.quarantined,
+                entry.last_tick.unwrap_or(0),
+                key.0,
+                key.1,
+                key.2,
+            )
+        })
+        .map(|(key, _)| *key);
+    if let Some(key) = victim {
+        chunks.remove(&key);
+    }
+}
+
+fn push_chunk_alert(alerts: &mut Vec<String>, line: String) {
+    if alerts.len() >= CHUNK_HOTSPOT_MAX_ALERTS {
+        alerts.remove(0);
+    }
+    alerts.push(line);
+}
+
+/// Operator-facing dimension label: the canonical id when the slot resolves,
+/// a raw-slot fallback when it does not (a datapack dimension mid-reload).
+fn chunk_dim_label(dim: DimId) -> String {
+    let id = dim.dimension_id();
+    if id.is_empty() {
+        format!("dim#{}", dim.raw())
+    } else {
+        id.to_string()
+    }
+}
+
 #[cfg(test)]
 mod server_reliability_tests {
     use super::*;
@@ -2575,5 +3057,174 @@ mod server_reliability_tests {
         let fresh = TickFaultQuarantine::load_persisted(&dir.join("absent.txt"), 1).unwrap();
         assert!(!fresh.is_quarantined(&be));
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // ---- per-chunk lag hotspot quarantine ----
+
+    /// One cost sample per tick for `ticks` consecutive ticks.
+    fn hotspot_ticks(
+        q: &ChunkHotspotQuarantine,
+        chunk: (DimId, i32, i32),
+        kind: ChunkCostKind,
+        cost_us: u64,
+        first_tick: u64,
+        ticks: u64,
+    ) {
+        let (dim, cx, cz) = chunk;
+        for tick in first_tick..first_tick + ticks {
+            q.record_chunk_cost_us(dim, cx, cz, kind, cost_us, tick);
+        }
+    }
+
+    /// A sustained 20 ms mod machine quarantines its own chunk — and only its
+    /// own chunk — dropping to one tick in eight while the healthy neighbor
+    /// keeps every tick.
+    #[test]
+    fn hotspot_quarantine_throttles_only_the_hot_chunk() {
+        let q = ChunkHotspotQuarantine::new();
+        hotspot_ticks(&q, (DimId::Overworld, 0, 0), ChunkCostKind::Entities, 500, 0, 8);
+        // Four samples: the third completed tick (scored on the fourth
+        // record) crosses `trigger_ticks` and engages the quarantine.
+        hotspot_ticks(&q, (DimId::Nether, 10, -4), ChunkCostKind::ModMachine, 20_000, 0, 4);
+        assert!(q.is_chunk_quarantined(DimId::Nether, 10, -4));
+        assert!(!q.is_chunk_quarantined(DimId::Overworld, 0, 0));
+        for tick in 0..16u64 {
+            assert!(
+                q.chunk_tick_due(DimId::Overworld, 0, 0, tick),
+                "healthy neighbor must tick every tick ({tick})"
+            );
+            // Quarantine engaged while scoring completed tick 2, so the
+            // chunk owns phase slot 2 of every 8-tick window.
+            assert_eq!(
+                q.chunk_tick_due(DimId::Nether, 10, -4, tick),
+                tick % 8 == 2,
+                "throttled chunk cadence at tick {tick}"
+            );
+        }
+        let alerts = q.alerts();
+        assert!(
+            alerts.iter().any(|a| a.contains("quarantined")
+                && a.contains("(10,-4)")
+                && a.contains("mod_machine")
+                && a.contains("minecraft:the_nether")),
+            "{alerts:?}"
+        );
+    }
+
+    /// One giant spike is smoothed by the EWMA and never reaches
+    /// `trigger_ticks` consecutive hot ticks.
+    #[test]
+    fn hotspot_single_spike_does_not_quarantine() {
+        let q = ChunkHotspotQuarantine::new();
+        q.record_chunk_cost_us(DimId::End, 7, 7, ChunkCostKind::ModMachine, 60_000, 0);
+        hotspot_ticks(&q, (DimId::End, 7, 7), ChunkCostKind::ModMachine, 500, 1, 6);
+        assert!(!q.is_chunk_quarantined(DimId::End, 7, 7));
+    }
+
+    /// Hysteresis: the quarantine lifts itself only after
+    /// `hysteresis_exit_ticks` consecutive cool completed ticks, and the lift
+    /// is recorded as an operator alert.
+    #[test]
+    fn hotspot_hysteresis_auto_lifts_after_cool_streak() {
+        let q = ChunkHotspotQuarantine::new();
+        hotspot_ticks(&q, (DimId::Overworld, 3, 3), ChunkCostKind::ModMachine, 20_000, 0, 4);
+        assert!(q.is_chunk_quarantined(DimId::Overworld, 3, 3));
+        // Every cheap completed tick counts toward the 20-tick cool streak:
+        // records through tick 20 score completed ticks 3..19 (16 cool), so
+        // the chunk is still quarantined; records through tick 30 score
+        // through tick 29, and the twentieth cool score lands on completed
+        // tick 23 — the lift fires mid-window.
+        for tick in 4..=20u64 {
+            q.record_chunk_cost_us(DimId::Overworld, 3, 3, ChunkCostKind::ModMachine, 1_000, tick);
+        }
+        assert!(q.is_chunk_quarantined(DimId::Overworld, 3, 3));
+        for tick in 21..=30u64 {
+            q.record_chunk_cost_us(DimId::Overworld, 3, 3, ChunkCostKind::ModMachine, 1_000, tick);
+        }
+        assert!(!q.is_chunk_quarantined(DimId::Overworld, 3, 3));
+        assert!(q.chunk_tick_due(DimId::Overworld, 3, 3, 999));
+        assert!(
+            q.alerts().iter().any(|a| a.contains("auto-lifted")),
+            "{:?}",
+            q.alerts()
+        );
+    }
+
+    /// An operator clear lifts the quarantine immediately and is logged;
+    /// clearing a healthy chunk is a no-op.
+    #[test]
+    fn hotspot_manual_clear_lifts_quarantine() {
+        let q = ChunkHotspotQuarantine::new();
+        hotspot_ticks(&q, (DimId::Overworld, 8, 8), ChunkCostKind::Entities, 25_000, 0, 4);
+        assert!(q.is_chunk_quarantined(DimId::Overworld, 8, 8));
+        assert!(!q.clear_chunk_quarantine(DimId::Overworld, 9, 9));
+        assert!(q.clear_chunk_quarantine(DimId::Overworld, 8, 8));
+        assert!(!q.is_chunk_quarantined(DimId::Overworld, 8, 8));
+        assert!(q.chunk_tick_due(DimId::Overworld, 8, 8, 3));
+        assert!(
+            q.alerts()
+                .iter()
+                .any(|a| a.contains("cleared by operator") && a.contains("(8,8)")),
+            "{:?}",
+            q.alerts()
+        );
+        // A second clear finds nothing to lift.
+        assert!(!q.clear_chunk_quarantine(DimId::Overworld, 8, 8));
+    }
+
+    /// The tracked set is hard-bounded: past `CHUNK_HOTSPOT_MAX_TRACKED` the
+    /// least-recently-active entry evicts, and refreshing a chunk protects it.
+    #[test]
+    fn hotspot_map_is_bounded_and_evicts_least_recently_active() {
+        let q = ChunkHotspotQuarantine::new();
+        for cx in 0..CHUNK_HOTSPOT_MAX_TRACKED as i32 {
+            q.record_chunk_cost_us(DimId::Overworld, cx, 0, ChunkCostKind::Entities, 100, 0);
+        }
+        // Refresh chunk cx=0 so it is not the oldest idle entry.
+        q.record_chunk_cost_us(DimId::Overworld, 0, 0, ChunkCostKind::Entities, 100, 9);
+        // One more distinct chunk forces exactly one eviction.
+        q.record_chunk_cost_us(DimId::Overworld, CHUNK_HOTSPOT_MAX_TRACKED as i32, 0, ChunkCostKind::Entities, 100, 10);
+        let top = q.top_lag_hotspots(usize::MAX);
+        assert_eq!(top.len(), CHUNK_HOTSPOT_MAX_TRACKED);
+        assert!(top.iter().any(|s| s.cx == 0 && s.cz == 0));
+        // cx=1 held the oldest activity stamp and the smallest key: evicted.
+        assert!(!top.iter().any(|s| s.cx == 1 && s.cz == 0));
+        assert!(top.iter().any(|s| s.cx == CHUNK_HOTSPOT_MAX_TRACKED as i32));
+    }
+
+    /// `top_lag_hotspots` orders by smoothed cost descending with a
+    /// deterministic tie-break, and `format_hotspot_report` renders the
+    /// Spark-free `/megu status` diagnosis from the same ordering.
+    #[test]
+    fn hotspot_top_lag_hotspots_orders_and_report_formats() {
+        let q = ChunkHotspotQuarantine::new();
+        hotspot_ticks(&q, (DimId::Overworld, 1, 1), ChunkCostKind::ModMachine, 30_000, 0, 4);
+        hotspot_ticks(&q, (DimId::Nether, 2, 2), ChunkCostKind::Entities, 10_000, 0, 3);
+        hotspot_ticks(&q, (DimId::End, 3, 3), ChunkCostKind::BlockEntity, 2_000, 0, 3);
+        hotspot_ticks(&q, (DimId::Overworld, 4, 4), ChunkCostKind::Redstone, 100, 0, 3);
+        let top = q.top_lag_hotspots(10);
+        let coords: Vec<(DimId, i32, i32)> = top.iter().map(|s| (s.dim, s.cx, s.cz)).collect();
+        assert_eq!(
+            coords,
+            vec![
+                (DimId::Overworld, 1, 1),
+                (DimId::Nether, 2, 2),
+                (DimId::End, 3, 3),
+                (DimId::Overworld, 4, 4),
+            ]
+        );
+        assert!(top[0].quarantined);
+        assert_eq!(top[0].dominant_kind, ChunkCostKind::ModMachine);
+        assert_eq!(top[0].ewma_us, 30_000);
+        assert_eq!(top[3].dominant_kind, ChunkCostKind::Redstone);
+        assert!(!top[3].quarantined);
+
+        let report = q.format_hotspot_report();
+        assert!(report.contains("chunk hotspot report: 4 chunks tracked, 1 quarantined"));
+        assert!(report.contains("chunk=(1, 1)"), "{report}");
+        assert!(report.contains("kind=mod_machine"), "{report}");
+        assert!(report.contains("QUARANTINED"), "{report}");
+        assert!(report.contains("recent alerts:"), "{report}");
+        assert!(report.contains("[hotspot] quarantined"), "{report}");
     }
 }

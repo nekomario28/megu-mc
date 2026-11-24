@@ -4181,6 +4181,41 @@ fn run_publish_command(level: u8, args: &[&str]) -> String {
 
 const POLICY_USAGE: &str = "usage: /megu policy list|get <key>|set <key> <value>|reset";
 
+/// Typed `minimap_mode` vocabulary — the same spellings
+/// `server-files/src/properties.rs` (`MinimapMode`) accepts on
+/// `server.properties`, plus the `fair-play` alias operators naturally type.
+/// `parse` is fail-closed: anything unrecognized is `None`, never a guess.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum MinimapPolicyMode {
+    Unrestricted,
+    FairPlay,
+    Disabled,
+}
+
+impl MinimapPolicyMode {
+    /// The canonical `server.properties` spelling this mode stores as.
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Unrestricted => "unrestricted",
+            Self::FairPlay => "fair_play",
+            Self::Disabled => "disabled",
+        }
+    }
+
+    /// ASCII-case-insensitive, surrounding-whitespace tolerant; accepts both
+    /// the `server.properties` `fair_play` spelling and the `fair-play`
+    /// alias. Anything else is `None` — an unrecognized restriction is never
+    /// silently accepted.
+    fn parse(raw: &str) -> Option<Self> {
+        Some(match raw.trim().to_ascii_lowercase().as_str() {
+            "unrestricted" => Self::Unrestricted,
+            "fair_play" | "fair-play" => Self::FairPlay,
+            "disabled" => Self::Disabled,
+            _ => return None,
+        })
+    }
+}
+
 #[derive(Clone, Debug, PartialEq)]
 struct LiveServerPolicy {
     minimap_mode: String,
@@ -4280,12 +4315,10 @@ impl LiveServerPolicy {
     fn set(&mut self, key: &str, value: &str) -> Result<(), String> {
         match key {
             "minimap_mode" => {
-                self.minimap_mode = policy_choice(
-                    key,
-                    value,
-                    &["unrestricted", "fair_play", "disabled"],
-                )?
-                .to_owned();
+                self.minimap_mode = MinimapPolicyMode::parse(value)
+                    .ok_or_else(|| policy_invalid_value(key, value))?
+                    .as_str()
+                    .to_owned();
             }
             "allow_cave_map" => self.allow_cave_map = policy_bool(key, value)?,
             "allow_mob_radar" => self.allow_mob_radar = policy_bool(key, value)?,
@@ -4335,6 +4368,15 @@ impl LiveServerPolicy {
             _ => return Err(format!("Unknown policy '{key}'")),
         }
         Ok(())
+    }
+
+    /// The typed view of the stored minimap mode. `set` only ever writes the
+    /// canonical `MinimapPolicyMode::as_str` spelling, but a value that
+    /// bypassed validation reads `Disabled` — fail closed, matching the
+    /// `server-files` policy semantics for unrecognized restrictions.
+    #[allow(dead_code)]
+    fn minimap_policy_mode(&self) -> MinimapPolicyMode {
+        MinimapPolicyMode::parse(&self.minimap_mode).unwrap_or(MinimapPolicyMode::Disabled)
     }
 
     fn reset(&mut self) {
@@ -9343,6 +9385,78 @@ mod policy_cmd_tests {
             assert_eq!(policy_run(&ctx, line), POLICY_USAGE, "{line}");
         }
         policy_reset();
+    }
+
+    /// P0-3: `minimap_mode` is a typed enum matching the
+    /// `server-files/src/properties.rs` `MinimapMode` spellings — both
+    /// `fair_play` and the `fair-play` alias parse to `FairPlay`, canonical
+    /// `as_str` output round-trips, and anything unrecognized fails closed.
+    #[test]
+    fn minimap_policy_mode_typed_parse_and_policy_roundtrip() {
+        assert_eq!(
+            MinimapPolicyMode::parse("unrestricted"),
+            Some(MinimapPolicyMode::Unrestricted)
+        );
+        assert_eq!(
+            MinimapPolicyMode::parse("disabled"),
+            Some(MinimapPolicyMode::Disabled)
+        );
+        for spelling in ["fair_play", "fair-play", "FAIR_PLAY", " Fair-Play "] {
+            assert_eq!(
+                MinimapPolicyMode::parse(spelling),
+                Some(MinimapPolicyMode::FairPlay),
+                "{spelling}"
+            );
+        }
+        for bad in ["", "bogus", "fairplay", "fair play", "none"] {
+            assert_eq!(MinimapPolicyMode::parse(bad), None, "{bad}");
+        }
+        for mode in [
+            MinimapPolicyMode::Unrestricted,
+            MinimapPolicyMode::FairPlay,
+            MinimapPolicyMode::Disabled,
+        ] {
+            assert_eq!(MinimapPolicyMode::parse(mode.as_str()), Some(mode));
+        }
+
+        let _world = world_guard();
+        let _serial = policy_test_lock().lock().unwrap_or_else(|e| e.into_inner());
+        policy_reset();
+        let ctx = policy_ctx(None);
+        // The `fair-play` alias stores the canonical `server.properties`
+        // spelling; `get`/`list` read it back identically.
+        assert_eq!(
+            policy_run(&ctx, "/megu policy set minimap_mode fair-play"),
+            "minimap_mode = fair_play"
+        );
+        assert_eq!(
+            policy_run(&ctx, "/megu policy get minimap_mode"),
+            "minimap_mode = fair_play"
+        );
+        {
+            let policy = live_server_policy()
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            assert_eq!(policy.minimap_policy_mode(), MinimapPolicyMode::FairPlay);
+        }
+        assert_eq!(
+            policy_run(&ctx, "/megu policy set minimap_mode DISABLED"),
+            "minimap_mode = disabled"
+        );
+        // Unknown values still fail closed and leave the prior mode in place.
+        assert_eq!(
+            policy_run(&ctx, "/megu policy set minimap_mode bogus"),
+            "Invalid value 'bogus' for policy 'minimap_mode'"
+        );
+        assert_eq!(
+            policy_run(&ctx, "/megu policy get minimap_mode"),
+            "minimap_mode = disabled"
+        );
+        policy_reset();
+        assert_eq!(
+            policy_run(&ctx, "/megu policy get minimap_mode"),
+            "minimap_mode = unrestricted"
+        );
     }
 
     #[test]
