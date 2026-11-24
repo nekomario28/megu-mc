@@ -694,3 +694,440 @@ fn resulting_mark(delta: &ExternalGraphDelta) -> Option<ShadowMark> {
         ExternalGraphDelta::TransportInsert { .. } => return None,
     })
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::region_scheduler::RegionKey;
+
+    fn drive_node(capacity: f64, speed: f64) -> KineticNode {
+        KineticNode {
+            capacity,
+            load: 0.0,
+            driven_speed: Some(speed),
+        }
+    }
+
+    #[test]
+    fn empty_and_oversized_batches_fail_cleanly() {
+        let mut bridge = OffloadSyncBridge::new(KineticGraph::default());
+        assert_eq!(bridge.ingest(&[]).unwrap(), BridgeSyncReport::default());
+        let deltas = vec![
+            ExternalGraphDelta::KineticRemove { id: 0 };
+            MAX_INGEST_DELTAS + 1
+        ];
+        assert_eq!(
+            bridge.ingest(&deltas),
+            Err(BridgeError::BatchTooLarge {
+                len: MAX_INGEST_DELTAS + 1,
+                max: MAX_INGEST_DELTAS,
+            })
+        );
+        // The rejected batch leaves the bridge untouched.
+        assert_eq!(bridge.ingest(&[]).unwrap(), BridgeSyncReport::default());
+    }
+
+    #[test]
+    fn kinetic_deltas_apply_in_key_order_and_skip_unchanged() {
+        let mut bridge = OffloadSyncBridge::new(KineticGraph::default());
+        // The link is listed before its nodes; ShadowKey order still applies
+        // node upserts first so the connect succeeds.
+        let report = bridge
+            .ingest(&[
+                ExternalGraphDelta::KineticLink {
+                    a: 1,
+                    b: 2,
+                    ratio: 2.0,
+                },
+                ExternalGraphDelta::KineticUpsert {
+                    id: 2,
+                    node: KineticNode::default(),
+                },
+                ExternalGraphDelta::KineticUpsert {
+                    id: 1,
+                    node: drive_node(10.0, 4.0),
+                },
+            ])
+            .unwrap();
+        assert_eq!((report.received, report.applied), (3, 3));
+        assert!(report.failed.is_empty());
+        assert_eq!(bridge.sink().solution(2).unwrap().speed, 8.0);
+
+        // Re-ingesting identical state deltas skips the sink entirely.
+        let report = bridge
+            .ingest(&[
+                ExternalGraphDelta::KineticUpsert {
+                    id: 1,
+                    node: drive_node(10.0, 4.0),
+                },
+                ExternalGraphDelta::KineticLink {
+                    a: 1,
+                    b: 2,
+                    ratio: 2.0,
+                },
+            ])
+            .unwrap();
+        assert_eq!((report.skipped, report.applied), (2, 0));
+    }
+
+    #[test]
+    fn same_batch_state_deltas_coalesce_last_wins() {
+        let mut bridge = OffloadSyncBridge::new(KineticGraph::default());
+        let report = bridge
+            .ingest(&[
+                ExternalGraphDelta::KineticUpsert {
+                    id: 1,
+                    node: drive_node(10.0, 4.0),
+                },
+                ExternalGraphDelta::KineticUpsert {
+                    id: 1,
+                    node: drive_node(20.0, 4.0),
+                },
+            ])
+            .unwrap();
+        assert_eq!(
+            (report.received, report.coalesced, report.applied),
+            (2, 1, 1)
+        );
+        assert_eq!(bridge.sink().solution(1).unwrap().capacity, 20.0);
+    }
+
+    #[test]
+    fn reversed_pair_deltas_share_one_canonical_shadow_mark() {
+        let mut bridge = OffloadSyncBridge::new(KineticGraph::default());
+        bridge
+            .ingest(&[
+                ExternalGraphDelta::KineticUpsert {
+                    id: 1,
+                    node: drive_node(10.0, 4.0),
+                },
+                ExternalGraphDelta::KineticUpsert {
+                    id: 2,
+                    node: KineticNode::default(),
+                },
+            ])
+            .unwrap();
+        // Two spellings of the same undirected edge in one batch coalesce;
+        // only the last (connect(2, 1, 0.5)) reaches the sink.
+        let report = bridge
+            .ingest(&[
+                ExternalGraphDelta::KineticLink {
+                    a: 1,
+                    b: 2,
+                    ratio: 2.0,
+                },
+                ExternalGraphDelta::KineticLink {
+                    a: 2,
+                    b: 1,
+                    ratio: 0.5,
+                },
+            ])
+            .unwrap();
+        assert_eq!((report.coalesced, report.applied), (1, 1));
+        assert_eq!(bridge.sink().solution(2).unwrap().speed, 8.0);
+
+        // A later batch expressing the identical edge from the other side
+        // produces the same canonical mark and is skipped.
+        let report = bridge
+            .ingest(&[ExternalGraphDelta::KineticLink {
+                a: 2,
+                b: 1,
+                ratio: 0.5,
+            }])
+            .unwrap();
+        assert_eq!((report.skipped, report.applied), (1, 0));
+    }
+
+    #[test]
+    fn node_removal_orphans_pair_marks_and_repeats_skip() {
+        let mut bridge = OffloadSyncBridge::new(KineticGraph::default());
+        bridge
+            .ingest(&[
+                ExternalGraphDelta::KineticUpsert {
+                    id: 1,
+                    node: drive_node(5.0, 1.0),
+                },
+                ExternalGraphDelta::KineticUpsert {
+                    id: 2,
+                    node: KineticNode::default(),
+                },
+                ExternalGraphDelta::KineticLink {
+                    a: 1,
+                    b: 2,
+                    ratio: 1.0,
+                },
+            ])
+            .unwrap();
+        let report = bridge
+            .ingest(&[ExternalGraphDelta::KineticRemove { id: 1 }])
+            .unwrap();
+        assert_eq!(report.applied, 1);
+        // The shadow records absence, so a repeated remove skips rather than
+        // failing against the sink's MissingNode.
+        let report = bridge
+            .ingest(&[ExternalGraphDelta::KineticRemove { id: 1 }])
+            .unwrap();
+        assert_eq!((report.skipped, report.applied), (1, 0));
+        // Re-linking the orphaned pair retries the sink and fails closed.
+        let report = bridge
+            .ingest(&[ExternalGraphDelta::KineticLink {
+                a: 1,
+                b: 2,
+                ratio: 1.0,
+            }])
+            .unwrap();
+        assert_eq!(report.failed.len(), 1);
+        assert_eq!(
+            report.failed[0].error,
+            BridgeError::Kinetic(GraphError::MissingNode(1))
+        );
+    }
+
+    #[test]
+    fn failed_deltas_leave_no_shadow_and_retry_cleanly() {
+        let mut bridge = OffloadSyncBridge::new(KineticGraph::default());
+        let report = bridge
+            .ingest(&[ExternalGraphDelta::KineticLink {
+                a: 1,
+                b: 2,
+                ratio: 1.0,
+            }])
+            .unwrap();
+        assert_eq!(report.failed.len(), 1);
+        assert_eq!(
+            report.failed[0].error,
+            BridgeError::Kinetic(GraphError::MissingNode(1))
+        );
+        // The failed link wrote no shadow mark, so the identical batch plus
+        // the missing nodes succeeds on retry.
+        let report = bridge
+            .ingest(&[
+                ExternalGraphDelta::KineticLink {
+                    a: 1,
+                    b: 2,
+                    ratio: 1.0,
+                },
+                ExternalGraphDelta::KineticUpsert {
+                    id: 1,
+                    node: drive_node(5.0, 2.0),
+                },
+                ExternalGraphDelta::KineticUpsert {
+                    id: 2,
+                    node: KineticNode::default(),
+                },
+            ])
+            .unwrap();
+        assert_eq!((report.applied, report.failed.len()), (3, 0));
+        assert!(bridge.sink().solution(2).is_some());
+    }
+
+    #[test]
+    fn unsupported_deltas_fail_without_aborting_the_batch() {
+        let mut bridge = OffloadSyncBridge::new(KineticGraph::default());
+        let report = bridge
+            .ingest(&[
+                ExternalGraphDelta::KineticUpsert {
+                    id: 1,
+                    node: drive_node(5.0, 1.0),
+                },
+                ExternalGraphDelta::MeNodeUpsert {
+                    id: 1,
+                    kind: MeNodeKind::Controller,
+                },
+                ExternalGraphDelta::TransportInsert { id: 1, item: 9 },
+            ])
+            .unwrap();
+        assert_eq!(report.applied, 1);
+        assert_eq!(report.failed.len(), 2);
+        assert!(report
+            .failed
+            .iter()
+            .all(|f| f.error == BridgeError::UnsupportedDelta));
+        assert!(bridge.sink().solution(1).is_some());
+    }
+
+    #[test]
+    fn transport_insert_events_are_never_deduplicated() {
+        let mut bridge = OffloadSyncBridge::new(SleepingTransport::default());
+        let report = bridge
+            .ingest(&[
+                ExternalGraphDelta::TransportMachine {
+                    id: 7,
+                    capacity: 4,
+                    delay: 1,
+                },
+                ExternalGraphDelta::TransportInsert { id: 7, item: 10 },
+                ExternalGraphDelta::TransportInsert { id: 7, item: 10 },
+            ])
+            .unwrap();
+        assert_eq!(
+            (report.applied, report.coalesced, report.skipped),
+            (3, 0, 0)
+        );
+        assert_eq!(bridge.sink().machine(7).unwrap().input_items, 2);
+        // Identical events in later batches still apply every time.
+        let report = bridge
+            .ingest(&[ExternalGraphDelta::TransportInsert { id: 7, item: 10 }])
+            .unwrap();
+        assert_eq!(report.applied, 1);
+        assert_eq!(bridge.sink().machine(7).unwrap().input_items, 3);
+        // State deltas on the same sink do dedup.
+        let report = bridge
+            .ingest(&[ExternalGraphDelta::TransportMachine {
+                id: 7,
+                capacity: 4,
+                delay: 1,
+            }])
+            .unwrap();
+        assert_eq!(report.skipped, 1);
+        // Re-declaring different machine geometry fails closed.
+        let report = bridge
+            .ingest(&[ExternalGraphDelta::TransportMachine {
+                id: 7,
+                capacity: 8,
+                delay: 1,
+            }])
+            .unwrap();
+        assert_eq!(report.failed.len(), 1);
+    }
+
+    #[test]
+    fn fluid_deltas_validate_contents_and_order() {
+        let mut bridge = OffloadSyncBridge::new(FluidNetwork::default());
+        // FluidTank sorts before FluidContent, so the set succeeds even
+        // though it was listed first.
+        let report = bridge
+            .ingest(&[
+                ExternalGraphDelta::FluidSet {
+                    id: 1,
+                    fluid: Some(7),
+                    amount: 5,
+                },
+                ExternalGraphDelta::FluidTankUpsert {
+                    id: 1,
+                    capacity: 10,
+                    elevation: 0,
+                },
+            ])
+            .unwrap();
+        assert_eq!((report.applied, report.failed.len()), (2, 0));
+        let tank = bridge.sink().tank(1).unwrap();
+        assert_eq!((tank.fluid, tank.amount), (Some(7), 5));
+
+        // Positive amount without a fluid id is malformed input.
+        let report = bridge
+            .ingest(&[ExternalGraphDelta::FluidSet {
+                id: 1,
+                fluid: None,
+                amount: 3,
+            }])
+            .unwrap();
+        assert_eq!(report.failed.len(), 1);
+        assert_eq!(
+            report.failed[0].error,
+            BridgeError::InvalidDelta("fluid set requires a fluid id")
+        );
+        // Zero amount drains the tank and needs no fluid id.
+        let report = bridge
+            .ingest(&[ExternalGraphDelta::FluidSet {
+                id: 1,
+                fluid: None,
+                amount: 0,
+            }])
+            .unwrap();
+        assert_eq!(report.applied, 1);
+        let tank = bridge.sink().tank(1).unwrap();
+        assert_eq!((tank.fluid, tank.amount), (None, 0));
+    }
+
+    #[test]
+    fn me_deltas_route_through_me_graph_target() {
+        let mut bridge = OffloadSyncBridge::new(MeGraphTarget::default());
+        let report = bridge
+            .ingest(&[
+                ExternalGraphDelta::MeNodeUpsert {
+                    id: 1,
+                    kind: MeNodeKind::Controller,
+                },
+                ExternalGraphDelta::MeNodeUpsert {
+                    id: 2,
+                    kind: MeNodeKind::NormalCable,
+                },
+                ExternalGraphDelta::MeLink {
+                    a: 1,
+                    b: 2,
+                    linked: true,
+                },
+                ExternalGraphDelta::MeCellUpsert {
+                    cell: StorageCell::new(9, 1, 128, 4, 8),
+                },
+            ])
+            .unwrap();
+        assert_eq!((report.applied, report.failed.len()), (4, 0));
+        assert_eq!(
+            bridge.sink().channels.node_kind(1),
+            Some(MeNodeKind::Controller)
+        );
+        assert!(bridge.sink().storage.cell(9).is_some());
+
+        // A kind change removes and re-adds the node deterministically.
+        let report = bridge
+            .ingest(&[ExternalGraphDelta::MeNodeUpsert {
+                id: 1,
+                kind: MeNodeKind::DenseCable,
+            }])
+            .unwrap();
+        assert_eq!(report.applied, 1);
+        assert_eq!(
+            bridge.sink().channels.node_kind(1),
+            Some(MeNodeKind::DenseCable)
+        );
+
+        // Re-upserting a cell id replaces its contents.
+        let mut cell = StorageCell::new(9, 5, 64, 2, 4);
+        cell.contents.insert("megu:ingot".to_string(), 3);
+        bridge
+            .ingest(&[ExternalGraphDelta::MeCellUpsert { cell }])
+            .unwrap();
+        assert_eq!(bridge.sink().storage.cell(9).unwrap().priority, 5);
+
+        // Removing a node orphans its pair marks; re-linking then fails
+        // closed against the missing node.
+        bridge
+            .ingest(&[ExternalGraphDelta::MeNodeRemove { id: 2 }])
+            .unwrap();
+        let report = bridge
+            .ingest(&[ExternalGraphDelta::MeLink {
+                a: 1,
+                b: 2,
+                linked: true,
+            }])
+            .unwrap();
+        assert_eq!(report.failed.len(), 1);
+    }
+
+    #[test]
+    fn region_sink_routes_kernels_and_rejects_me_deltas() {
+        let mut bridge = OffloadSyncBridge::new(Region::new(RegionKey::for_block(0, 0, 0)));
+        let report = bridge
+            .ingest(&[
+                ExternalGraphDelta::KineticUpsert {
+                    id: 3,
+                    node: drive_node(8.0, 2.0),
+                },
+                ExternalGraphDelta::FluidTankUpsert {
+                    id: 4,
+                    capacity: 20,
+                    elevation: 1,
+                },
+                ExternalGraphDelta::MeCellUpsert {
+                    cell: StorageCell::new(1, 0, 8, 1, 1),
+                },
+            ])
+            .unwrap();
+        assert_eq!((report.applied, report.failed.len()), (2, 1));
+        assert_eq!(report.failed[0].error, BridgeError::UnsupportedDelta);
+        assert!(bridge.sink().kinetic.solution(3).is_some());
+        assert!(bridge.sink().fluid().tank(4).is_some());
+    }
+}

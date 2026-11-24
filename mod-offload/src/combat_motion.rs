@@ -711,3 +711,487 @@ pub fn decode_motion_trigger(bytes: &[u8]) -> Result<MotionTrigger, MotionError>
         phase: ActionPhase::from_byte(bytes[27])?,
     })
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn spec(anticipation: u32, active: u32, recovery: u32) -> ActionSpec {
+        ActionSpec {
+            action_id: 7,
+            anticipation_ticks: anticipation,
+            active_ticks: active,
+            recovery_ticks: recovery,
+            cancel_after_tick: None,
+            invulnerable_window: None,
+            movement_speed_factor: 1.0,
+            hit_shape: HitShape::RadialAoe { radius: 3.0 },
+        }
+    }
+
+    /// Instant-attack spec: zero anticipation puts the action straight into
+    /// the active hit window at tick 0.
+    fn attacker(hit_shape: HitShape) -> ActiveAction {
+        let mut s = spec(0, 10, 0);
+        s.hit_shape = hit_shape;
+        ActiveAction::start(s, 1.0, 100, Hand::MainHand).unwrap()
+    }
+
+    fn candidate(id: u64, x: f64, y: f64, z: f64) -> HitCandidate {
+        HitCandidate {
+            target_id: id,
+            position: Vec3::new(x, y, z),
+        }
+    }
+
+    #[test]
+    fn spec_validation_rejects_malformed_timings_and_shapes() {
+        assert_eq!(
+            spec(1, 0, 1).validate(),
+            Err(MotionError::InvalidSpec),
+            "active_ticks == 0"
+        );
+        let mut bad = spec(1, 1, 1);
+        bad.movement_speed_factor = f32::NAN;
+        assert_eq!(bad.validate(), Err(MotionError::InvalidSpec));
+        bad.movement_speed_factor = -0.5;
+        assert_eq!(bad.validate(), Err(MotionError::InvalidSpec));
+        bad.movement_speed_factor = 1.0;
+        bad.cancel_after_tick = Some(4); // nominal total is 3
+        assert_eq!(bad.validate(), Err(MotionError::InvalidSpec));
+        bad.cancel_after_tick = None;
+        bad.invulnerable_window = Some(TickWindow {
+            start_tick: 2,
+            end_tick: 2,
+        });
+        assert_eq!(bad.validate(), Err(MotionError::InvalidSpec));
+        bad.invulnerable_window = Some(TickWindow {
+            start_tick: 1,
+            end_tick: 9,
+        });
+        assert_eq!(bad.validate(), Err(MotionError::InvalidSpec));
+        bad.invulnerable_window = None;
+        bad.hit_shape = HitShape::SweepArc {
+            reach: 3.0,
+            half_angle_deg: 181.0,
+            vertical_tolerance: 1.0,
+        };
+        assert_eq!(bad.validate(), Err(MotionError::InvalidSpec));
+        bad.hit_shape = HitShape::RadialAoe { radius: 0.0 };
+        assert_eq!(bad.validate(), Err(MotionError::InvalidSpec));
+        bad.hit_shape = HitShape::ThrustCapsule {
+            reach: 2.0,
+            radius: -1.0,
+        };
+        assert_eq!(bad.validate(), Err(MotionError::InvalidSpec));
+        bad.hit_shape = HitShape::ForwardCone {
+            reach: f64::INFINITY,
+            half_angle_deg: 45.0,
+        };
+        assert_eq!(bad.validate(), Err(MotionError::InvalidSpec));
+        // Phase tick sum overflowing u32 is a distinct error.
+        let overflow = ActionSpec {
+            anticipation_ticks: u32::MAX,
+            active_ticks: 1,
+            recovery_ticks: 0,
+            ..spec(0, 1, 0)
+        };
+        assert_eq!(overflow.validate(), Err(MotionError::TickOverflow));
+    }
+
+    #[test]
+    fn speed_multiplier_is_normalized_and_scales_the_timeline() {
+        let base = spec(2, 4, 2);
+        let fast = ActiveAction::start(base.clone(), 100.0, 0, Hand::MainHand).unwrap();
+        assert_eq!(fast.speed_multiplier(), 4.0);
+        // ceil(2/4) + ceil(4/4) + ceil(2/4) = 1 + 1 + 1
+        assert_eq!(fast.total_ticks(), 3);
+        let slow = ActiveAction::start(base.clone(), 0.1, 0, Hand::MainHand).unwrap();
+        assert_eq!(slow.speed_multiplier(), 0.25);
+        // ceil(n / 0.25) = 4n per phase: 8 + 16 + 8
+        assert_eq!(slow.total_ticks(), 32);
+        assert_eq!(
+            ActiveAction::start(base, f32::NAN, 0, Hand::MainHand).unwrap_err(),
+            MotionError::NonFinite
+        );
+        // Finite out-of-range speeds clamp to the same floor as tiny positives.
+        let negative = ActiveAction::start(spec(1, 1, 1), -3.0, 0, Hand::MainHand).unwrap();
+        assert_eq!(negative.speed_multiplier(), 0.25);
+    }
+
+    #[test]
+    fn scaled_ticks_overflow_and_end_tick_overflow_fail_closed() {
+        // ceil((u32::MAX - 10) / 0.25) exceeds u32::MAX.
+        let huge = spec(u32::MAX - 10, 5, 0);
+        assert_eq!(
+            ActiveAction::start(huge, 0.1, 0, Hand::MainHand).unwrap_err(),
+            MotionError::TickOverflow
+        );
+        // now_tick + total_ticks must fit in u64.
+        assert_eq!(
+            ActiveAction::start(spec(1, 1, 1), 1.0, u64::MAX - 1, Hand::MainHand).unwrap_err(),
+            MotionError::TickOverflow
+        );
+    }
+
+    #[test]
+    fn timeline_phases_windows_and_tick_safety() {
+        let mut s = spec(2, 4, 2);
+        s.movement_speed_factor = 0.5;
+        s.cancel_after_tick = Some(3);
+        s.invulnerable_window = Some(TickWindow {
+            start_tick: 3,
+            end_tick: 6,
+        });
+        let mut action = ActiveAction::start(s, 1.0, 100, Hand::OffHand).unwrap();
+        assert_eq!(action.phase(), ActionPhase::Anticipation);
+        assert_eq!(action.hand(), Hand::OffHand);
+        assert_eq!(action.movement_speed_factor(), 0.5);
+        assert!(!action.can_cancel());
+        assert!(!action.is_invulnerable());
+        // A duplicate tick is idempotent; a rewind is rejected.
+        assert_eq!(action.advance_to(100), Ok(ActionPhase::Anticipation));
+        assert_eq!(action.elapsed_ticks(), 0);
+        assert_eq!(action.advance_to(99), Err(MotionError::TickRewind));
+        assert_eq!(action.advance_to(101), Ok(ActionPhase::Anticipation));
+        assert_eq!(action.advance_to(103), Ok(ActionPhase::ActiveHitWindow));
+        assert!(action.can_cancel());
+        assert!(action.is_invulnerable());
+        // The invulnerable window is half-open: elapsed 6 is outside [3, 6).
+        assert_eq!(action.advance_to(106), Ok(ActionPhase::Recovery));
+        assert!(!action.is_invulnerable());
+        assert_eq!(action.advance_to(108), Ok(ActionPhase::Idle));
+        assert!(!action.can_cancel());
+        assert_eq!(action.movement_speed_factor(), 1.0);
+        assert_eq!(action.total_ticks(), 8);
+        assert_eq!(action.finished_at(), 108);
+    }
+
+    fn combo_spec() -> ActionSpec {
+        let mut s = spec(1, 4, 1);
+        s.cancel_after_tick = Some(2);
+        s
+    }
+
+    #[test]
+    fn combo_trigger_locks_same_tick_and_honors_cancel_marker() {
+        let chain = ComboChain::new(vec![combo_spec(), combo_spec()], 10, true).unwrap();
+        let mut state = ComboState::default();
+        let first = {
+            let a = state.trigger(&chain, 100, 1.0).unwrap();
+            (a.combo_index(), a.hand(), a.start_tick())
+        };
+        assert_eq!(first, (0, Hand::MainHand, 100));
+        // Same-tick retransmission is locked even though cancellation is legal.
+        assert!(matches!(
+            state.trigger(&chain, 100, 1.0),
+            Err(MotionError::ActionLocked)
+        ));
+        state.advance_to(101).unwrap();
+        assert!(matches!(
+            state.trigger(&chain, 101, 1.0),
+            Err(MotionError::ActionLocked)
+        ));
+        // At the cancel marker the next step starts with the alternate hand.
+        let second = {
+            let a = state.trigger(&chain, 102, 1.0).unwrap();
+            (a.combo_index(), a.hand(), a.start_tick())
+        };
+        assert_eq!(second, (1, Hand::OffHand, 102));
+    }
+
+    #[test]
+    fn combo_window_expiry_restarts_and_rewinds_fail() {
+        let chain = ComboChain::new(vec![combo_spec(), combo_spec()], 5, true).unwrap();
+        let mut state = ComboState::default();
+        state.trigger(&chain, 100, 1.0).unwrap(); // finishes at 106
+        // 110 - 106 = 4 <= window: continue to step 1 on the off hand.
+        let second = {
+            let a = state.trigger(&chain, 110, 1.0).unwrap();
+            (a.combo_index(), a.hand())
+        };
+        assert_eq!(second, (1, Hand::OffHand)); // step 1 finishes at 116
+        // 122 - 116 = 6 > window: fresh restart resets index and hand.
+        let third = {
+            let a = state.trigger(&chain, 122, 1.0).unwrap();
+            (a.combo_index(), a.hand())
+        };
+        assert_eq!(third, (0, Hand::MainHand));
+        assert!(matches!(
+            state.advance_to(50),
+            Err(MotionError::TickRewind)
+        ));
+        assert!(matches!(
+            state.trigger(&chain, 123, f32::NAN),
+            Err(MotionError::NonFinite)
+        ));
+    }
+
+    #[test]
+    fn combo_chain_validation_bounds() {
+        assert!(matches!(
+            ComboChain::new(vec![], 0, false),
+            Err(MotionError::InvalidCombo)
+        ));
+        assert!(matches!(
+            ComboChain::new(vec![spec(0, 0, 1)], 0, false),
+            Err(MotionError::InvalidSpec)
+        ));
+        let too_many = vec![spec(0, 1, 0); usize::from(u16::MAX) + 2];
+        assert!(matches!(
+            ComboChain::new(too_many, 0, false),
+            Err(MotionError::InvalidCombo)
+        ));
+    }
+
+    #[test]
+    fn hit_validation_rejects_outside_window_and_nonfinite_geometry() {
+        let mut s = spec(2, 4, 2);
+        s.hit_shape = HitShape::RadialAoe { radius: 3.0 };
+        let mut outside = ActiveAction::start(s, 1.0, 0, Hand::MainHand).unwrap();
+        let origin = Vec3::new(0.0, 0.0, 0.0);
+        let facing = Vec3::new(1.0, 0.0, 0.0);
+        assert_eq!(
+            validate_hit(&mut outside, origin, facing, candidate(1, 1.0, 0.0, 0.0), None),
+            HitValidationVerdict::OutsideActiveWindow
+        );
+
+        let mut a = attacker(HitShape::RadialAoe { radius: 3.0 });
+        assert_eq!(
+            validate_hit(&mut a, origin, facing, candidate(1, f64::NAN, 0.0, 0.0), None),
+            HitValidationVerdict::InvalidGeometry
+        );
+        assert_eq!(
+            validate_hit(
+                &mut a,
+                Vec3::new(f64::INFINITY, 0.0, 0.0),
+                facing,
+                candidate(1, 1.0, 0.0, 0.0),
+                None
+            ),
+            HitValidationVerdict::InvalidGeometry
+        );
+        assert_eq!(
+            validate_hit(&mut a, origin, Vec3::new(f64::NAN, 0.0, 0.0), candidate(1, 1.0, 0.0, 0.0), None),
+            HitValidationVerdict::InvalidGeometry
+        );
+    }
+
+    #[test]
+    fn radial_aoe_accepts_dedups_and_bounds_range() {
+        let mut a = attacker(HitShape::RadialAoe { radius: 3.0 });
+        let origin = Vec3::new(0.0, 0.0, 0.0);
+        let facing = Vec3::new(1.0, 0.0, 0.0);
+        assert_eq!(
+            validate_hit(&mut a, origin, facing, candidate(1, 0.0, 0.0, 0.0), None),
+            HitValidationVerdict::Accepted,
+            "zero distance is inside the radius"
+        );
+        assert_eq!(
+            validate_hit(&mut a, origin, facing, candidate(1, 1.0, 0.0, 0.0), None),
+            HitValidationVerdict::AlreadyHit
+        );
+        assert_eq!(
+            validate_hit(&mut a, origin, facing, candidate(2, 3.0, 0.0, 0.0), None),
+            HitValidationVerdict::Accepted,
+            "distance == radius is inclusive"
+        );
+        assert_eq!(
+            validate_hit(&mut a, origin, facing, candidate(3, 3.1, 0.0, 0.0), None),
+            HitValidationVerdict::OutOfRange
+        );
+    }
+
+    #[test]
+    fn invulnerable_target_is_rejected_after_dedup_check() {
+        let mut target_spec = spec(0, 10, 0);
+        target_spec.invulnerable_window = Some(TickWindow {
+            start_tick: 0,
+            end_tick: 10,
+        });
+        let target = ActiveAction::start(target_spec, 1.0, 100, Hand::MainHand).unwrap();
+        let mut a = attacker(HitShape::RadialAoe { radius: 3.0 });
+        let origin = Vec3::new(0.0, 0.0, 0.0);
+        let facing = Vec3::new(1.0, 0.0, 0.0);
+        assert_eq!(
+            validate_hit(&mut a, origin, facing, candidate(9, 1.0, 0.0, 0.0), Some(&target)),
+            HitValidationVerdict::Invulnerable
+        );
+        // Once the dodge window ends the same geometry is accepted.
+        let mut expired_spec = spec(0, 10, 0);
+        expired_spec.invulnerable_window = Some(TickWindow {
+            start_tick: 0,
+            end_tick: 1,
+        });
+        let mut expired = ActiveAction::start(expired_spec, 1.0, 100, Hand::MainHand).unwrap();
+        expired.advance_to(101).unwrap();
+        assert_eq!(
+            validate_hit(&mut a, origin, facing, candidate(10, 1.0, 0.0, 0.0), Some(&expired)),
+            HitValidationVerdict::Accepted
+        );
+    }
+
+    #[test]
+    fn sweep_arc_checks_horizontal_reach_angle_and_height() {
+        let mut a = attacker(HitShape::SweepArc {
+            reach: 5.0,
+            half_angle_deg: 90.0,
+            vertical_tolerance: 2.0,
+        });
+        let origin = Vec3::new(0.0, 0.0, 0.0);
+        let facing = Vec3::new(1.0, 0.0, 0.0);
+        assert_eq!(
+            validate_hit(&mut a, origin, facing, candidate(1, 3.0, 0.0, 0.0), None),
+            HitValidationVerdict::Accepted
+        );
+        assert_eq!(
+            validate_hit(&mut a, origin, facing, candidate(2, 0.0, 0.0, 3.0), None),
+            HitValidationVerdict::OutsideArc,
+            "perpendicular is outside a 90 degree half-angle"
+        );
+        assert_eq!(
+            validate_hit(&mut a, origin, facing, candidate(3, -3.0, 0.0, 0.0), None),
+            HitValidationVerdict::OutsideArc
+        );
+        assert_eq!(
+            validate_hit(&mut a, origin, facing, candidate(4, 6.0, 0.0, 0.0), None),
+            HitValidationVerdict::OutOfRange
+        );
+        assert_eq!(
+            validate_hit(&mut a, origin, facing, candidate(5, 3.0, 3.0, 0.0), None),
+            HitValidationVerdict::OutOfRange,
+            "vertical tolerance exceeded"
+        );
+        assert_eq!(
+            validate_hit(&mut a, origin, Vec3::new(0.0, 0.0, 0.0), candidate(6, 1.0, 0.0, 0.0), None),
+            HitValidationVerdict::InvalidGeometry,
+            "zero horizontal facing cannot define an arc"
+        );
+        // Directly overhead still counts: horizontal distance is zero.
+        assert_eq!(
+            validate_hit(&mut a, origin, facing, candidate(7, 0.0, 1.0, 0.0), None),
+            HitValidationVerdict::Accepted
+        );
+    }
+
+    #[test]
+    fn thrust_capsule_and_forward_cone_geometry() {
+        let mut thrust = attacker(HitShape::ThrustCapsule {
+            reach: 4.0,
+            radius: 1.0,
+        });
+        let origin = Vec3::new(0.0, 0.0, 0.0);
+        let forward = Vec3::new(0.0, 0.0, 1.0);
+        assert_eq!(
+            validate_hit(&mut thrust, origin, forward, candidate(1, 0.0, 0.0, 3.0), None),
+            HitValidationVerdict::Accepted
+        );
+        assert_eq!(
+            validate_hit(&mut thrust, origin, forward, candidate(2, 0.0, 0.0, 0.0), None),
+            HitValidationVerdict::Accepted,
+            "zero distance sits inside the capsule"
+        );
+        assert_eq!(
+            validate_hit(&mut thrust, origin, forward, candidate(3, 0.0, 0.0, -1.0), None),
+            HitValidationVerdict::OutsideArc,
+            "behind the attacker is outside the thrust"
+        );
+        assert_eq!(
+            validate_hit(&mut thrust, origin, forward, candidate(4, 0.0, 0.0, 6.0), None),
+            HitValidationVerdict::OutOfRange,
+            "beyond reach + radius"
+        );
+        assert_eq!(
+            validate_hit(&mut thrust, origin, forward, candidate(5, 1.5, 0.0, 3.0), None),
+            HitValidationVerdict::OutOfRange,
+            "perpendicular offset exceeds the capsule radius"
+        );
+        assert_eq!(
+            validate_hit(&mut thrust, origin, Vec3::new(0.0, 0.0, 0.0), candidate(6, 0.0, 0.0, 1.0), None),
+            HitValidationVerdict::InvalidGeometry
+        );
+
+        let mut cone = attacker(HitShape::ForwardCone {
+            reach: 5.0,
+            half_angle_deg: 45.0,
+        });
+        let facing = Vec3::new(1.0, 0.0, 0.0);
+        assert_eq!(
+            validate_hit(&mut cone, origin, facing, candidate(1, 3.0, 0.0, 0.0), None),
+            HitValidationVerdict::Accepted
+        );
+        assert_eq!(
+            validate_hit(&mut cone, origin, facing, candidate(2, 0.0, 0.0, 3.0), None),
+            HitValidationVerdict::OutsideArc
+        );
+        assert_eq!(
+            validate_hit(&mut cone, origin, facing, candidate(3, 6.0, 0.0, 0.0), None),
+            HitValidationVerdict::OutOfRange
+        );
+        assert_eq!(
+            validate_hit(&mut cone, origin, facing, candidate(4, 0.0, 0.0, 0.0), None),
+            HitValidationVerdict::Accepted,
+            "zero distance skips the angle test"
+        );
+    }
+
+    #[test]
+    fn mot1_roundtrip_and_rejection_paths() {
+        let trigger = MotionTrigger {
+            entity_id: u64::MAX,
+            action_id: u32::MAX,
+            combo_index: u16::MAX,
+            hand: Hand::OffHand,
+            speed_multiplier: 0.25,
+            elapsed_ticks: u32::MAX,
+            phase: ActionPhase::Recovery,
+        };
+        let bytes = encode_motion_trigger(&trigger).unwrap();
+        assert_eq!(bytes.len(), MOT1_PACKET_LEN);
+        assert_eq!(&bytes[..4], &MOT1_MAGIC);
+        assert_eq!(decode_motion_trigger(&bytes), Ok(trigger));
+
+        let mut s = spec(0, 10, 0);
+        s.hit_shape = HitShape::RadialAoe { radius: 1.0 };
+        let action = ActiveAction::start(s, 2.0, 55, Hand::MainHand).unwrap();
+        let snapshot = MotionTrigger::from_action(9, &action);
+        let packet = encode_motion_trigger(&snapshot).unwrap();
+        assert_eq!(decode_motion_trigger(&packet), Ok(snapshot));
+
+        assert_eq!(
+            encode_motion_trigger(&MotionTrigger {
+                speed_multiplier: f32::NAN,
+                ..trigger
+            })
+            .unwrap_err(),
+            MotionError::NonFinite
+        );
+        assert_eq!(
+            encode_motion_trigger(&MotionTrigger {
+                speed_multiplier: 4.5,
+                ..trigger
+            })
+            .unwrap_err(),
+            MotionError::InvalidPacket
+        );
+        assert_eq!(
+            decode_motion_trigger(&bytes[..MOT1_PACKET_LEN - 1]),
+            Err(MotionError::InvalidPacket)
+        );
+        let mut bad_magic = bytes;
+        bad_magic[0] = b'X';
+        assert_eq!(decode_motion_trigger(&bad_magic), Err(MotionError::InvalidPacket));
+        let mut bad_phase = bytes;
+        bad_phase[27] = 9;
+        assert_eq!(decode_motion_trigger(&bad_phase), Err(MotionError::InvalidPacket));
+        let mut bad_hand = bytes;
+        bad_hand[18] = 2;
+        assert_eq!(decode_motion_trigger(&bad_hand), Err(MotionError::InvalidPacket));
+        let mut nan_speed = bytes;
+        nan_speed[19..23].copy_from_slice(&f32::NAN.to_bits().to_be_bytes());
+        assert_eq!(decode_motion_trigger(&nan_speed), Err(MotionError::NonFinite));
+        let mut slow_speed = bytes;
+        slow_speed[19..23].copy_from_slice(&0.1f32.to_bits().to_be_bytes());
+        assert_eq!(decode_motion_trigger(&slow_speed), Err(MotionError::InvalidPacket));
+    }
+}

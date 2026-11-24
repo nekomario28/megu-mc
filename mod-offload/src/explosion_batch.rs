@@ -1013,3 +1013,405 @@ impl<'a, S: BlastBlockSource + ?Sized> BlastWorld<'a, S> {
         Ok(results)
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Solid stone cube `[-half, half]^3` with the given blast resistance.
+    fn stone_cube(half: i32, resistance: f32) -> HashMap<(i32, i32, i32), BlastCell> {
+        let mut map = HashMap::new();
+        for x in -half..=half {
+            for y in -half..=half {
+                for z in -half..=half {
+                    map.insert(
+                        (x, y, z),
+                        BlastCell::solid(7, resistance, 3, 2),
+                    );
+                }
+            }
+        }
+        map
+    }
+
+    #[test]
+    fn xor_shift_is_deterministic_and_bounded() {
+        let mut a = XorShift64::new(42);
+        let mut b = XorShift64::new(42);
+        for _ in 0..256 {
+            assert_eq!(a.next_u64(), b.next_u64());
+        }
+        let mut rng = XorShift64::new(0);
+        for _ in 0..1024 {
+            let v = rng.next_f32();
+            assert!((0.0..1.0).contains(&v));
+        }
+        // Different seeds diverge immediately.
+        assert_ne!(XorShift64::new(1).next_u64(), XorShift64::new(2).next_u64());
+    }
+
+    #[test]
+    fn scrub_power_fails_closed() {
+        assert_eq!(scrub_power(f32::NAN), 0.0);
+        assert_eq!(scrub_power(f32::INFINITY), 0.0);
+        assert_eq!(scrub_power(f32::NEG_INFINITY), 0.0);
+        assert_eq!(scrub_power(-1.0), 0.0);
+        assert_eq!(scrub_power(0.0), 0.0);
+        assert_eq!(scrub_power(TNT_POWER), TNT_POWER);
+        assert_eq!(scrub_power(1000.0), MAX_BLAST_POWER);
+        assert_eq!(scrub_power(MAX_BLAST_POWER), MAX_BLAST_POWER);
+    }
+
+    #[test]
+    fn blast_bounds_cover_ray_reach_and_reject_nonfinite() {
+        assert_eq!(blast_bounds([f64::NAN, 0.0, 0.0], 4.0), None);
+        let (min, max) = blast_bounds([0.5, 0.5, 0.5], 4.0).unwrap();
+        // extent = ceil(4 * 1.75) + 2 = 9 around floor(0.5) = 0
+        assert_eq!(min, [-9, -9, -9]);
+        assert_eq!(max, [9, 9, 9]);
+        // Zero power still reserves the margin around the origin cell.
+        let (min, max) = blast_bounds([0.5, 0.5, 0.5], 0.0).unwrap();
+        assert_eq!((min, max), ([-2, -2, -2], [2, 2, 2]));
+    }
+
+    #[test]
+    fn volume_cache_snapshots_bounds_and_reads_air_outside() {
+        let world = stone_cube(1, 0.5);
+        let mut cache = BlastVolumeCache::new();
+        cache.prepare(&world, [0.5, 0.5, 0.5], 4.0).unwrap();
+        assert_eq!(
+            cache.bounds(),
+            blast_bounds([0.5, 0.5, 0.5], 4.0).unwrap()
+        );
+        assert!(cache.volume() > 0);
+        assert_eq!(cache.get(0, 0, 0).block_id, 7);
+        assert_eq!(cache.get(10_000, 0, 0), BlastCell::AIR);
+        // A non-finite origin empties the snapshot instead of failing.
+        cache.prepare(&world, [f64::NAN, 0.0, 0.0], 4.0).unwrap();
+        assert_eq!(cache.volume(), 0);
+        assert_eq!(cache.get(0, 0, 0), BlastCell::AIR);
+    }
+
+    #[test]
+    fn empty_and_degenerate_blasts_cast_no_rays() {
+        let world: HashMap<(i32, i32, i32), BlastCell> = HashMap::new();
+        let mut batch = ExplosionBatch::new();
+        // All-air world: every ray marches but records nothing.
+        let result = batch.blast(&world, [0.5, 0.5, 0.5], TNT_POWER, 1).unwrap();
+        assert_eq!(result.stats.rays_cast, RAY_SURFACE_CELLS as u64);
+        assert_eq!(result.stats.affected, 0);
+        assert!(result.stats.steps > 0);
+        assert!(result.cells.is_empty());
+
+        // Zero, negative, NaN power and non-finite origins are empty results.
+        for (origin, power) in [
+            ([0.5, 0.5, 0.5], 0.0),
+            ([0.5, 0.5, 0.5], -4.0),
+            ([0.5, 0.5, 0.5], f32::NAN),
+            ([f64::NAN, 0.0, 0.0], 4.0),
+        ] {
+            let result = batch.blast(&world, origin, power, 1).unwrap();
+            assert!(result.cells.is_empty());
+            assert_eq!(result.stats, BlastStats::default());
+            assert_eq!(result.bounds, ([0; 3], [0; 3]));
+        }
+    }
+
+    #[test]
+    fn cube_blast_destroys_cells_in_sorted_order_deterministically() {
+        let world = stone_cube(2, 0.5);
+        let mut batch = ExplosionBatch::new();
+        let result = batch.blast(&world, [0.5, 0.5, 0.5], TNT_POWER, 7).unwrap();
+        assert_eq!(result.stats.rays_cast, RAY_SURFACE_CELLS as u64);
+        assert!(result.stats.affected > 0);
+        assert_eq!(result.stats.affected as usize, result.cells.len());
+        assert!(result.cells.windows(2).all(|w| w[0].pos <= w[1].pos));
+        assert!(result
+            .cells
+            .iter()
+            .all(|c| c.cell.block_id == 7 && c.intensity > 0.0));
+        assert!(result
+            .cells
+            .iter()
+            .all(|c| c.pos.iter().all(|&v| (-2..=2).contains(&v))));
+
+        // Identical inputs reproduce the identical destroyed set.
+        let mut again = ExplosionBatch::new();
+        let second = again
+            .blast(&world, [0.5, 0.5, 0.5], TNT_POWER, 7)
+            .unwrap();
+        assert_eq!(result.cells, second.cells);
+        assert_eq!(result.stats, second.stats);
+        assert_eq!(result.bounds, second.bounds);
+
+        // A different seed changes the per-ray power draws.
+        let third = again
+            .blast(&world, [0.5, 0.5, 0.5], TNT_POWER, 8)
+            .unwrap();
+        assert_ne!(result.cells, third.cells);
+    }
+
+    #[test]
+    fn resistance_and_indestructible_flags_block_recording() {
+        // Bedrock-class resistance costs more per step than any TNT ray
+        // carries, so rays die inside the first cell and nothing is recorded.
+        let world = stone_cube(2, 1000.0);
+        let mut batch = ExplosionBatch::new();
+        let result = batch.blast(&world, [0.5, 0.5, 0.5], TNT_POWER, 3).unwrap();
+        assert!(result.cells.is_empty());
+        assert_eq!(result.stats.rays_cast, RAY_SURFACE_CELLS as u64);
+
+        // Indestructible cells still attenuate rays but are never destroyed.
+        let mut world = stone_cube(2, 0.0);
+        for cell in world.values_mut() {
+            cell.flags = FLAG_INDESTRUCTIBLE;
+        }
+        let result = batch
+            .blast(&world, [0.5, 0.5, 0.5], TNT_POWER, 3)
+            .unwrap();
+        assert!(result.cells.is_empty());
+        assert!(result.stats.steps > result.stats.rays_cast);
+    }
+
+    #[test]
+    fn oversized_blast_fails_closed_before_allocating() {
+        let world = stone_cube(0, 0.0);
+        let mut batch = ExplosionBatch::new();
+        let err = batch
+            .blast(&world, [0.5, 0.5, 0.5], MAX_BLAST_POWER, 1)
+            .unwrap_err();
+        assert!(matches!(err, ExplosionError::RegionTooLarge { .. }));
+    }
+
+    #[test]
+    fn coalesce_item_counts_conserves_and_chunks() {
+        let stacks = coalesce_item_counts([(5, 10), (5, 70), (3, 1)], 64);
+        assert_eq!(
+            stacks,
+            vec![
+                ItemStack {
+                    item_id: 3,
+                    count: 1
+                },
+                ItemStack {
+                    item_id: 5,
+                    count: 64
+                },
+                ItemStack {
+                    item_id: 5,
+                    count: 16
+                },
+            ],
+            "ascending item id, <= stack_size chunks"
+        );
+        assert_eq!(
+            stacks.iter().map(|s| u64::from(s.count)).sum::<u64>(),
+            81
+        );
+        // stack_size 0 clamps to 1 rather than dividing by zero.
+        let stacks = coalesce_item_counts([(9, 2)], 0);
+        assert_eq!(
+            stacks,
+            vec![
+                ItemStack {
+                    item_id: 9,
+                    count: 1
+                },
+                ItemStack {
+                    item_id: 9,
+                    count: 1
+                },
+            ]
+        );
+        assert!(coalesce_item_counts(std::iter::empty::<(u32, u32)>(), 64).is_empty());
+    }
+
+    fn planned_result() -> BlastResult {
+        BlastResult {
+            origin: [0.5, 0.5, 0.5],
+            power: TNT_POWER,
+            bounds: ([0; 3], [0; 3]),
+            cells: vec![
+                AffectedCell {
+                    pos: [5, 5, 5],
+                    intensity: 0.5,
+                    cell: BlastCell::solid(2, 0.0, 0, 0),
+                },
+                AffectedCell {
+                    pos: [1, 0, 0],
+                    intensity: 2.0,
+                    cell: BlastCell::solid(1, 0.0, 5, 2),
+                },
+                AffectedCell {
+                    pos: [0, 0, 0],
+                    intensity: 3.0,
+                    cell: BlastCell::solid(1, 0.0, 5, 2),
+                },
+                AffectedCell {
+                    pos: [0, 1, 0],
+                    intensity: 1.0,
+                    cell: BlastCell::solid(1, 0.0, 5, 2),
+                },
+            ],
+            stats: BlastStats::default(),
+        }
+    }
+
+    #[test]
+    fn mega_blast_plan_drains_in_concentric_rings() {
+        let result = planned_result();
+        assert!(!MegaBlastPlan::needs_slicing(&result));
+        let mut plan = MegaBlastPlan::new(&result, 2);
+        assert_eq!(plan.budget(), 2);
+        assert_eq!(plan.total(), 4);
+        // Block centers sit at pos + 0.5: [0,0,0] is ring 0, the unit-axis
+        // neighbours are ring 1, and [5,5,5] lands in ring 8.
+        assert_eq!(plan.ring_count(), 3);
+        assert!(!plan.is_complete());
+        assert_eq!(plan.progress(), (0, 4));
+
+        let slices = plan.drain();
+        assert_eq!(slices.len(), 2);
+        assert_eq!(
+            slices[0]
+                .removals
+                .iter()
+                .map(|r| r.pos)
+                .collect::<Vec<_>>(),
+            vec![[0, 0, 0], [0, 1, 0]]
+        );
+        assert_eq!((slices[0].first_ring, slices[0].last_ring), (0, 1));
+        assert_eq!(
+            slices[1]
+                .removals
+                .iter()
+                .map(|r| r.pos)
+                .collect::<Vec<_>>(),
+            vec![[1, 0, 0], [5, 5, 5]]
+        );
+        assert_eq!((slices[1].first_ring, slices[1].last_ring), (1, 8));
+        assert!(slices[1].last_ring >= slices[0].last_ring);
+
+        // Section updates pack vanilla-style and sort by packed position.
+        for slice in &slices {
+            assert_eq!(slice.section_updates.len(), 1);
+            let section = &slice.section_updates[0];
+            assert_eq!(section.section, [0, 0, 0]);
+            assert!(section
+                .updates
+                .windows(2)
+                .all(|w| w[0].packed_pos <= w[1].packed_pos));
+            assert!(section.updates.iter().all(|u| u.block_id == 0));
+        }
+        assert_eq!(slices[0].section_updates[0].updates[0].packed_pos, 0);
+        assert_eq!(slices[0].section_updates[0].updates[1].packed_pos, 256);
+        assert_eq!(slices[1].section_updates[0].updates[0].packed_pos, 1);
+        // [5,5,5] local (5,5,5): 5 | 5 << 4 | 5 << 8
+        assert_eq!(slices[1].section_updates[0].updates[1].packed_pos, 1365);
+
+        // Drops coalesce per slice and conserve the per-block counts.
+        assert_eq!(
+            slices[0].drops,
+            vec![ItemStack {
+                item_id: 5,
+                count: 4
+            }]
+        );
+        assert_eq!(
+            slices[1].drops,
+            vec![ItemStack {
+                item_id: 5,
+                count: 2
+            }]
+        );
+
+        assert!(plan.is_complete());
+        assert_eq!(plan.done(), 4);
+        assert_eq!(plan.progress(), (4, 4));
+        assert_eq!(slices[1].done, 4);
+        assert_eq!(slices[1].total, 4);
+        assert_eq!(slices[0].tick_index, 0);
+        assert_eq!(slices[1].tick_index, 1);
+        assert!(plan.next_slice().is_none());
+        assert_eq!(plan.center(), [0.5, 0.5, 0.5]);
+    }
+
+    #[test]
+    fn mega_blast_plan_edge_cases() {
+        // Budget clamps to at least one removal per tick.
+        let mut plan = MegaBlastPlan::new(&planned_result(), 0);
+        assert_eq!(plan.budget(), 1);
+        assert_eq!(plan.drain().len(), 4);
+
+        // An empty blast plans nothing.
+        let empty = BlastResult::empty([0.0; 3], 0.0);
+        let mut plan = MegaBlastPlan::new(&empty, 16);
+        assert_eq!(plan.total(), 0);
+        assert_eq!(plan.ring_count(), 0);
+        assert!(plan.is_complete());
+        assert!(plan.next_slice().is_none());
+
+        // The slicing threshold is strict.
+        let cells = (0..=MEGA_BLAST_MAX_PER_TICK)
+            .map(|i| AffectedCell {
+                pos: [i as i32, 0, 0],
+                intensity: 1.0,
+                cell: BlastCell::solid(1, 0.0, 0, 0),
+            })
+            .collect();
+        let big = BlastResult {
+            cells,
+            ..planned_result()
+        };
+        assert!(MegaBlastPlan::needs_slicing(&big));
+        let mut plan = MegaBlastPlan::new(&big, MEGA_BLAST_MAX_PER_TICK);
+        let first = plan.next_slice().unwrap();
+        assert_eq!(first.removals.len(), MEGA_BLAST_MAX_PER_TICK);
+        assert_eq!(first.done, MEGA_BLAST_MAX_PER_TICK);
+        assert_eq!(plan.next_slice().unwrap().removals.len(), 1);
+        assert!(plan.next_slice().is_none());
+    }
+
+    #[test]
+    fn blast_world_dedups_sorts_and_sees_prior_craters() {
+        let mut world_map = stone_cube(8, 0.5);
+        world_map.insert((0, 0, 0), BlastCell::solid(9, 0.3, 0, 0));
+        world_map.insert((6, 0, 6), BlastCell::solid(9, 0.3, 0, 0));
+        let mut world = BlastWorld::new(&world_map);
+
+        // Duplicate primed positions collapse; a genuinely air cell skips
+        // without casting rays.
+        let results = world
+            .detonate_tnt_tick(
+                &[[0, 0, 0], [0, 0, 0], [6, 0, 6], [40, 0, 40]],
+                TNT_POWER,
+                11,
+            )
+            .unwrap();
+        assert_eq!(world.stats.deduplicated, 1);
+        assert_eq!(world.stats.skipped_already_air, 1);
+        assert_eq!(world.stats.blasts_run, 2);
+        assert_eq!(results.len(), 2);
+        assert!(world.is_destroyed([0, 0, 0]));
+        assert!(world.cell(0, 0, 0).is_air());
+        // The second charge sits ~8.5 blocks away through stone: the first
+        // crater cannot reach it, so its own blast still runs.
+        assert!(world.is_destroyed([6, 0, 6]));
+
+        // Re-detonating the same positions now finds air and skips.
+        let results = world
+            .detonate_tnt_tick(&[[0, 0, 0], [6, 0, 6]], TNT_POWER, 11)
+            .unwrap();
+        assert!(results.is_empty());
+        assert_eq!(world.stats.skipped_already_air, 3);
+        assert_eq!(world.stats.blasts_run, 2);
+
+        // Degenerate power still consumes a solid position deterministically.
+        let results = world
+            .detonate_tnt_tick(&[[-7, 0, -7]], f32::NAN, 5)
+            .unwrap();
+        assert_eq!(results.len(), 1);
+        assert!(results[0].cells.is_empty());
+        assert!(world.is_destroyed([-7, 0, -7]));
+    }
+}

@@ -651,3 +651,541 @@ impl ChunkSensorBroadPhase {
         evaluate_candidates(mob, &self.targets, indices, has_line_of_sight)
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn push(
+        pool: &mut SoaEntityPool,
+        id: u32,
+        pos: [f64; 3],
+        kind: EntityKind,
+        flags: u8,
+    ) {
+        pool.push(id, pos, [0.0; 3], [0.3, 0.9], kind, flags);
+    }
+
+    #[test]
+    fn pool_shape_and_empty_collision_solve() {
+        let mut pool = SoaEntityPool::default();
+        assert!(pool.is_empty());
+        push(&mut pool, 1, [0.0, 0.0, 0.0], EntityKind::Sheep, FLAG_PUSHABLE);
+        assert_eq!(pool.len(), 1);
+        assert!(!pool.is_empty());
+        let empty = SoaEntityPool::default();
+        let result = solve_collisions_spatial(&empty, 0, &[]);
+        assert!(result.push_deltas.is_empty());
+        assert!(result.candidate_counts.is_empty());
+        // A lone entity has no candidates and no motion.
+        let result = solve_collisions_spatial(&pool, 0, &[0]);
+        assert_eq!(result.candidate_counts, vec![0]);
+        assert_eq!(result.push_deltas[0], [0.0; 3]);
+    }
+
+    #[test]
+    fn collisions_push_overlapping_entities_apart_symmetrically() {
+        let mut pool = SoaEntityPool::default();
+        push(&mut pool, 1, [0.0, 0.0, 0.0], EntityKind::Sheep, FLAG_PUSHABLE);
+        push(&mut pool, 2, [0.5, 0.0, 0.0], EntityKind::Sheep, FLAG_PUSHABLE);
+        let result = solve_collisions_spatial(&pool, 0, &[0, 0]);
+        assert_eq!(result.candidate_counts, vec![1, 1]);
+        assert!(result.push_deltas[0][0] < 0.0);
+        assert!(result.push_deltas[1][0] > 0.0);
+        assert!(
+            (result.push_deltas[0][0] + result.push_deltas[1][0]).abs() < 1e-12,
+            "push impulses conserve momentum"
+        );
+        assert_eq!(result.push_deltas[0][1], 0.0);
+        assert!(!result.cramming_damage.iter().any(|d| *d));
+    }
+
+    #[test]
+    fn coincident_entities_count_but_never_push() {
+        let mut pool = SoaEntityPool::default();
+        push(&mut pool, 1, [0.0, 0.0, 0.0], EntityKind::Sheep, FLAG_PUSHABLE);
+        push(&mut pool, 2, [0.0, 0.0, 0.0], EntityKind::Cow, FLAG_PUSHABLE);
+        let result = solve_collisions_spatial(&pool, 0, &[0, 0]);
+        assert_eq!(result.candidate_counts, vec![1, 1]);
+        assert_eq!(result.push_deltas[0], [0.0; 3]);
+        assert_eq!(result.push_deltas[1], [0.0; 3]);
+    }
+
+    #[test]
+    fn flags_gate_candidacy_physics_and_cramming() {
+        // Spectator and non-living movers are inert; a spectator target is
+        // invisible to the broad phase entirely.
+        let mut pool = SoaEntityPool::default();
+        push(&mut pool, 1, [0.0, 0.0, 0.0], EntityKind::Sheep, FLAG_PUSHABLE);
+        push(
+            &mut pool,
+            2,
+            [0.5, 0.0, 0.0],
+            EntityKind::Cow,
+            FLAG_PUSHABLE | FLAG_SPECTATOR,
+        );
+        push(
+            &mut pool,
+            3,
+            [0.5, 0.0, 0.5],
+            EntityKind::PointOfInterest,
+            FLAG_PUSHABLE,
+        );
+        push(
+            &mut pool,
+            4,
+            [1.0, 0.0, 0.0],
+            EntityKind::Zombie,
+            FLAG_PUSHABLE | FLAG_SPECTATOR,
+        );
+        let result = solve_collisions_spatial(&pool, 0, &[0; 4]);
+        // Entity 1 sees only the point of interest; entity 2 is a spectator
+        // mover; entity 3 is not living; entity 4 is a spectator.
+        assert_eq!(result.candidate_counts, vec![1, 0, 0, 0]);
+        assert!(result.push_deltas[1].iter().all(|v| *v == 0.0));
+        assert!(result.push_deltas[3].iter().all(|v| *v == 0.0));
+
+        // NO_PHYSICS still counts as a candidate but never exchanges motion.
+        let mut pool = SoaEntityPool::default();
+        push(&mut pool, 1, [0.0, 0.0, 0.0], EntityKind::Sheep, FLAG_PUSHABLE);
+        push(
+            &mut pool,
+            2,
+            [0.5, 0.0, 0.0],
+            EntityKind::Cow,
+            FLAG_PUSHABLE | FLAG_NO_PHYSICS,
+        );
+        let result = solve_collisions_spatial(&pool, 0, &[0, 0]);
+        assert_eq!(result.candidate_counts, vec![1, 1]);
+        assert_eq!(result.push_deltas[0], [0.0; 3]);
+        assert_eq!(result.push_deltas[1], [0.0; 3]);
+
+        // A vehicle target is never displaced, but the pusher still moves.
+        let mut pool = SoaEntityPool::default();
+        push(&mut pool, 1, [0.0, 0.0, 0.0], EntityKind::Sheep, FLAG_PUSHABLE);
+        push(
+            &mut pool,
+            2,
+            [0.5, 0.0, 0.0],
+            EntityKind::Cow,
+            FLAG_PUSHABLE | FLAG_VEHICLE,
+        );
+        let result = solve_collisions_spatial(&pool, 0, &[0, 0]);
+        assert!(result.push_deltas[1].iter().all(|v| *v == 0.0));
+        assert!(result.push_deltas[0][0] < 0.0);
+        assert_eq!(result.push_deltas[0][1], 0.0);
+    }
+
+    #[test]
+    fn cramming_requires_count_nonpassengers_and_a_multiple_of_four_roll() {
+        let mut pool = SoaEntityPool::default();
+        for id in 1..=3 {
+            push(&mut pool, id, [0.0, 0.0, 0.0], EntityKind::Sheep, FLAG_PUSHABLE);
+        }
+        // Every entity sees two candidates; threshold 2 is met everywhere.
+        let result = solve_collisions_spatial(&pool, 2, &[0, 4, 8]);
+        assert_eq!(result.candidate_counts, vec![2, 2, 2]);
+        assert_eq!(result.cramming_damage, vec![true, true, true]);
+        // Rolls not divisible by 4 suppress damage per entity.
+        let result = solve_collisions_spatial(&pool, 2, &[1, 4, 8]);
+        assert_eq!(result.cramming_damage, vec![false, true, true]);
+        // Threshold 0 disables cramming entirely.
+        let result = solve_collisions_spatial(&pool, 0, &[0, 0, 0]);
+        assert!(!result.cramming_damage.iter().any(|d| *d));
+
+        // A passenger neighbour does not count toward nonpassenger cramming,
+        // though the passenger entity itself still suffers from real mobs.
+        pool.flags[2] |= FLAG_PASSENGER;
+        let result = solve_collisions_spatial(&pool, 2, &[0, 0, 0]);
+        assert_eq!(result.cramming_damage, vec![false, false, true]);
+    }
+
+    #[test]
+    fn oversized_bounds_fall_back_to_full_scan() {
+        let mut pool = SoaEntityPool::default();
+        pool.push(
+            1,
+            [0.0, 0.0, 0.0],
+            [0.0; 3],
+            [200.0, 200.0],
+            EntityKind::Sheep,
+            FLAG_PUSHABLE,
+        );
+        push(&mut pool, 2, [100.0, 0.0, 0.0], EntityKind::Cow, FLAG_PUSHABLE);
+        let result = solve_collisions_spatial(&pool, 0, &[0, 0]);
+        assert_eq!(result.candidate_counts, vec![1, 1]);
+    }
+
+    #[test]
+    fn item_stack_merging_respects_identity_velocity_and_stack_cap() {
+        let item = |id: u32, pos: [f64; 3], vel: [f64; 3], count: u32| DroppedItem {
+            id,
+            pos,
+            vel,
+            item_id: 7,
+            component_hash: 42,
+            count,
+            max_stack_size: 64,
+        };
+        let mut items = vec![
+            item(1, [0.0, 0.0, 0.0], [0.0; 3], 60),
+            item(2, [0.4, 0.0, 0.0], [0.0; 3], 10),
+            item(3, [0.0, 0.0, 0.6], [0.0; 3], 4),
+            item(4, [1.9, 0.0, 0.0], [0.0; 3], 5),
+            item(5, [2.1, 0.0, 0.0], [1.0, 0.0, 0.0], 5),
+        ];
+        // Items 4 and 5 sit in adjacent spatial cells but differ in velocity;
+        // item 3 is beyond the 0.5 merge radius.
+        let report = merge_item_stacks(&mut items);
+        // Item 2 fills stack 1 to 64 and keeps 6; item 4 merges into... nothing
+        // identical is near, and item 5's velocity differs.
+        assert_eq!(items[0].count, 64);
+        assert_eq!(items[1].count, 6);
+        assert_eq!(items[3].count, 5);
+        assert_eq!(items[4].count, 5);
+        assert_eq!(report.transferred, 4);
+        assert_eq!(report.eliminated, 0);
+
+        // A full drain eliminates the donor and leaves a tombstone.
+        let mut items = vec![
+            item(1, [0.0, 0.0, 0.0], [0.0; 3], 60),
+            item(2, [0.0, 0.0, 0.0], [0.0; 3], 4),
+        ];
+        let report = merge_item_stacks(&mut items);
+        assert_eq!(report, MergeReport {
+            eliminated: 1,
+            transferred: 4,
+        });
+        assert_eq!(items[1].count, 0);
+
+        // Tombstones neither merge nor receive.
+        let mut items = vec![
+            item(1, [0.0, 0.0, 0.0], [0.0; 3], 0),
+            item(2, [0.0, 0.0, 0.0], [0.0; 3], 7),
+        ];
+        let report = merge_item_stacks(&mut items);
+        assert_eq!(report, MergeReport::default());
+        assert_eq!(items[1].count, 7);
+
+        // Different item identity or component hash never coalesces.
+        let mut items = vec![
+            item(1, [0.0, 0.0, 0.0], [0.0; 3], 3),
+            DroppedItem {
+                item_id: 8,
+                ..item(2, [0.0, 0.0, 0.0], [0.0; 3], 3)
+            },
+            DroppedItem {
+                component_hash: 43,
+                ..item(3, [0.0, 0.0, 0.0], [0.0; 3], 3)
+            },
+        ];
+        assert_eq!(merge_item_stacks(&mut items), MergeReport::default());
+    }
+
+    #[test]
+    fn xp_orbs_merge_with_checked_arithmetic() {
+        let orb = |id: u32, pos: [f64; 3], vel: [f64; 3], value: u64| XpOrb {
+            id,
+            pos,
+            vel,
+            value,
+        };
+        let mut orbs = vec![
+            orb(1, [0.0, 0.0, 0.0], [0.0; 3], 1),
+            orb(2, [0.5, 0.0, 0.0], [0.0; 3], 2),
+            orb(3, [1.5, 0.0, 0.0], [0.0; 3], 4), // outside the 1.0 radius
+        ];
+        let report = merge_xp_orbs(&mut orbs);
+        assert_eq!(report, MergeReport {
+            eliminated: 1,
+            transferred: 2,
+        });
+        assert_eq!(orbs[0].value, 3);
+        assert_eq!(orbs[1].value, 0);
+        assert_eq!(orbs[2].value, 4);
+
+        // u64 overflow refuses the merge instead of wrapping.
+        let mut orbs = vec![
+            orb(1, [0.0, 0.0, 0.0], [0.0; 3], u64::MAX),
+            orb(2, [0.0, 0.0, 0.0], [0.0; 3], 1),
+        ];
+        assert_eq!(merge_xp_orbs(&mut orbs), MergeReport::default());
+        assert_eq!(orbs[0].value, u64::MAX);
+        assert_eq!(orbs[1].value, 1);
+
+        // Divergent velocities never coalesce.
+        let mut orbs = vec![
+            orb(1, [0.0, 0.0, 0.0], [0.0; 3], 5),
+            orb(2, [0.0, 0.0, 0.0], [0.0, 1.0, 0.0], 5),
+        ];
+        assert_eq!(merge_xp_orbs(&mut orbs), MergeReport::default());
+    }
+
+    #[test]
+    fn confined_ai_sleep_wake_timers_and_orientation() {
+        let input = AiTickInput {
+            pos: [0.0, 0.0, 0.0],
+            nearest_player: Some([1.0, 0.0, 0.0]),
+            enclosed: true,
+            navigation_idle: true,
+            ..AiTickInput::default()
+        };
+        let mut sheep = EntityAiState::new(EntityKind::Sheep);
+        let result = tick_confined_ai(&mut sheep, &input, true);
+        assert!(!result.pathfinding_ran);
+        assert!(!result.woke);
+        assert_eq!(sheep.pathfinding_calls, 0);
+        // Player due east of the mob: yaw faces -90 degrees (north convention).
+        assert!((f64::from(sheep.head_yaw) + 90.0).abs() < 1e-5);
+
+        // Any wake stimulus restores pathfinding and reports the wake; an
+        // open pen only suppresses sleep, it is not itself a wake event.
+        for (wake, expected_woke) in [
+            (
+                AiTickInput {
+                    damaged: true,
+                    ..input
+                },
+                true,
+            ),
+            (
+                AiTickInput {
+                    predator_or_zombie_nearby: true,
+                    ..input
+                },
+                true,
+            ),
+            (
+                AiTickInput {
+                    enclosed: false,
+                    ..input
+                },
+                false,
+            ),
+        ] {
+            let mut state = EntityAiState::new(EntityKind::Sheep);
+            let result = tick_confined_ai(&mut state, &wake, true);
+            assert!(result.pathfinding_ran);
+            assert_eq!(result.woke, expected_woke);
+        }
+
+        // Non-idle-sleeping kinds never sleep even when enclosed and idle.
+        let mut zombie = EntityAiState::new(EntityKind::Zombie);
+        let result = tick_confined_ai(&mut zombie, &input, true);
+        assert!(result.pathfinding_ran);
+        assert_eq!(zombie.pathfinding_calls, 1);
+
+        // Optimization disabled forces pathfinding for every kind.
+        let mut pig = EntityAiState::new(EntityKind::Pig);
+        let result = tick_confined_ai(&mut pig, &input, false);
+        assert!(result.pathfinding_ran);
+        assert_eq!(pig.pathfinding_calls, 1);
+    }
+
+    #[test]
+    fn confined_ai_timers_and_lifecycle() {
+        let mut sheep = EntityAiState::new(EntityKind::Sheep);
+        sheep.has_wool = false;
+        sheep.grass_eating_ticks = 3;
+        sheep.baby_age = -5;
+        let result = tick_confined_ai(
+            &mut sheep,
+            &AiTickInput {
+                grass_eaten: true,
+                ..AiTickInput::default()
+            },
+            false,
+        );
+        assert!(result.wool_regrown);
+        assert!(sheep.has_wool);
+        assert_eq!(sheep.grass_eating_ticks, 2);
+        assert_eq!(sheep.baby_age, -4);
+
+        // Grass cannot regrow wool on non-sheep or while already woolly.
+        let mut cow = EntityAiState::new(EntityKind::Cow);
+        let result = tick_confined_ai(
+            &mut cow,
+            &AiTickInput {
+                grass_eaten: true,
+                ..AiTickInput::default()
+            },
+            false,
+        );
+        assert!(!result.wool_regrown);
+
+        let mut chicken = EntityAiState::new(EntityKind::Chicken);
+        chicken.egg_timer = 1;
+        let result = tick_confined_ai(
+            &mut chicken,
+            &AiTickInput {
+                next_egg_interval: 0,
+                ..AiTickInput::default()
+            },
+            false,
+        );
+        assert!(result.egg_laid);
+        assert_eq!(chicken.eggs_laid, 1);
+        assert_eq!(chicken.egg_timer, 1, "interval clamps to at least 1");
+    }
+
+    fn sensor(id: u32, kind: EntityKind, dimension: i32, pos: [f64; 3]) -> SensorEntity {
+        SensorEntity {
+            id,
+            kind,
+            dimension,
+            pos,
+            invisible: false,
+            invisible_range_multiplier: 0.07,
+            gold_armor: false,
+        }
+    }
+
+    fn mob(id: u32, kind: EntityKind, pos: [f64; 3], follow_range: f64) -> MobSensor {
+        MobSensor {
+            id,
+            kind,
+            dimension: 0,
+            pos,
+            follow_range,
+        }
+    }
+
+    fn los(_: &MobSensor, _: &SensorEntity) -> bool {
+        true
+    }
+
+    fn no_los(_: &MobSensor, _: &SensorEntity) -> bool {
+        false
+    }
+
+    #[test]
+    fn mob_targeting_matches_reference_and_respects_kind_rules() {
+        let targets = vec![
+            sensor(1, EntityKind::Player, 0, [3.0, 0.0, 0.0]),
+            sensor(2, EntityKind::Villager, 0, [6.0, 0.0, 0.0]),
+            sensor(3, EntityKind::Player, 0, [30.0, 0.0, 0.0]), // out of range
+            sensor(4, EntityKind::Zombie, 0, [1.0, 0.0, 0.0]),  // wrong kind
+            sensor(5, EntityKind::Cow, 0, [2.0, 0.0, 0.0]),     // wrong kind
+            sensor(6, EntityKind::Player, 1, [1.0, 0.0, 0.0]),  // wrong dimension
+        ];
+        let zombie = mob(10, EntityKind::Zombie, [0.0, 0.0, 0.0], 10.0);
+        let broad = ChunkSensorBroadPhase::build(42, &targets);
+        assert_eq!(evaluate_mob_targets_uncached(&zombie, &targets, los), Some(1));
+        assert_eq!(broad.evaluate_mob_targets(&zombie, los), Some(1));
+
+        // Nearest eligible target wins when several are in range.
+        let targets = vec![
+            sensor(7, EntityKind::Villager, 0, [8.0, 0.0, 0.0]),
+            sensor(8, EntityKind::Player, 0, [4.0, 0.0, 0.0]),
+        ];
+        let broad = ChunkSensorBroadPhase::build(43, &targets);
+        assert_eq!(
+            evaluate_mob_targets_uncached(&zombie, &targets, los),
+            Some(8)
+        );
+        assert_eq!(broad.evaluate_mob_targets(&zombie, los), Some(8));
+
+        // Line of sight gates every candidate.
+        assert_eq!(
+            evaluate_mob_targets_uncached(&zombie, &targets, no_los),
+            None
+        );
+        assert_eq!(broad.evaluate_mob_targets(&zombie, no_los), None);
+    }
+
+    #[test]
+    fn mob_targeting_kind_specific_rules() {
+        let enderman = mob(9, EntityKind::Enderman, [0.0, 0.0, 0.0], 64.0);
+        let targets = vec![
+            sensor(1, EntityKind::Endermite, 0, [5.0, 0.0, 0.0]),
+            sensor(2, EntityKind::Player, 0, [1.0, 0.0, 0.0]),
+        ];
+        assert_eq!(
+            evaluate_mob_targets_uncached(&enderman, &targets, los),
+            Some(1)
+        );
+
+        let piglin = mob(2, EntityKind::Piglin, [0.0, 0.0, 0.0], 16.0);
+        let mut gold = sensor(3, EntityKind::Player, 0, [2.0, 0.0, 0.0]);
+        gold.gold_armor = true;
+        let targets = vec![
+            gold,
+            sensor(4, EntityKind::Player, 0, [4.0, 0.0, 0.0]),
+        ];
+        assert_eq!(
+            evaluate_mob_targets_uncached(&piglin, &targets, los),
+            Some(4),
+            "gold-armored players are ignored by piglins"
+        );
+        let all_gold = vec![SensorEntity {
+            gold_armor: true,
+            ..sensor(5, EntityKind::Player, 0, [2.0, 0.0, 0.0])
+        }];
+        assert_eq!(
+            evaluate_mob_targets_uncached(&piglin, &all_gold, los),
+            None
+        );
+    }
+
+    #[test]
+    fn invisibility_scales_range_and_broadphase_stays_a_superset() {
+        let zombie = mob(10, EntityKind::Zombie, [0.0, 0.0, 0.0], 10.0);
+        let mut invisible = sensor(1, EntityKind::Player, 0, [5.0, 0.0, 0.0]);
+        invisible.invisible = true;
+        // 10 * 0.07 = 0.7 effective range: distance 5 is out of range.
+        assert_eq!(evaluate_mob_targets_uncached(&zombie, &[invisible], los), None);
+        let broad = ChunkSensorBroadPhase::build(7, &[invisible]);
+        assert_eq!(broad.evaluate_mob_targets(&zombie, los), None);
+
+        // A multiplier above 1 widens both the narrow phase and the broad-phase
+        // search window identically.
+        invisible.invisible_range_multiplier = 2.0;
+        invisible.pos = [15.0, 0.0, 0.0]; // distance 15 <= 10 * 2.0
+        let targets = vec![invisible];
+        let broad = ChunkSensorBroadPhase::build(8, &targets);
+        assert_eq!(
+            evaluate_mob_targets_uncached(&zombie, &targets, los),
+            Some(1)
+        );
+        assert_eq!(broad.evaluate_mob_targets(&zombie, los), Some(1));
+    }
+
+    #[test]
+    fn broadphase_matches_uncached_across_chunk_boundaries() {
+        let targets = vec![
+            sensor(1, EntityKind::Villager, 0, [-3.0, 0.0, 0.0]),  // chunk -1
+            sensor(2, EntityKind::Player, 0, [20.0, 0.0, 0.0]),     // chunk 1
+            sensor(3, EntityKind::Villager, 0, [15.9, 0.0, 0.0]),   // chunk 0 edge
+            sensor(4, EntityKind::Player, 0, [-20.0, 0.0, 0.0]),    // chunk -2
+        ];
+        let broad = ChunkSensorBroadPhase::build(9, &targets);
+        assert_eq!(broad.chunk_population(0, 0, 0), 1);
+        assert_eq!(broad.chunk_population(0, -1, 0), 1);
+        assert_eq!(broad.chunk_population(0, 1, 0), 1);
+        assert_eq!(broad.chunk_population(1, 0, 0), 0);
+
+        for pos in [
+            [0.0, 0.0, 0.0],
+            [15.5, 0.0, 0.0],
+            [-15.5, 0.0, 0.0],
+            [8.0, 0.0, 8.0],
+        ] {
+            for range in [4.0, 12.0, 1000.0] {
+                let zombie = mob(10, EntityKind::Zombie, pos, range);
+                let expected = evaluate_mob_targets_uncached(&zombie, &targets, los);
+                assert_eq!(
+                    broad.evaluate_mob_targets(&zombie, los),
+                    expected,
+                    "pos {pos:?} range {range}"
+                );
+            }
+        }
+
+        // A degenerate follow range never matches and never panics.
+        let zombie = mob(10, EntityKind::Zombie, [0.0, 0.0, 0.0], f64::NAN);
+        assert_eq!(
+            evaluate_mob_targets_uncached(&zombie, &targets, los),
+            None
+        );
+    }
+}
