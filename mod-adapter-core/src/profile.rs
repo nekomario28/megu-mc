@@ -17,6 +17,10 @@ use mod_offload::region_scheduler::{
 };
 
 use crate::blockstates::{BlockDef, BlockRegistry, PropertyDef, RegistryError, UniversalBlockRole};
+use crate::capability_bus::{
+    BlockCapabilityBus, BlockCoord, EnergyTransferHandler, FluidTransferHandler,
+    ItemTransferHandler, SimpleEnergyBuffer, SimpleFluidTank, SimpleSlotInventory,
+};
 use crate::data_loader::{parse_json, DataLoadError, JsonValue};
 
 /// World coordinate with arbitrary dynamic dimension ID (`0=Overworld`, `3+=custom`).
@@ -168,6 +172,95 @@ impl ModOffloadProfile {
             self.processor_recipe_types
                 .entry(k.clone())
                 .or_insert_with(|| v.clone());
+        }
+    }
+
+    /// Generic [`crate::capability_bus`] endpoints `block_id` exposes
+    /// in-world under this profile: `FluidTank`/`FluidPipe`/`FluidPump`
+    /// yield a [`SimpleFluidTank`] sized by `tank_capacity_mb`
+    /// ([`DEFAULT_PROFILE_TANK_MB`] when undeclared), `TransportPipe` /
+    /// `Processor` yield a [`SimpleSlotInventory`], and the
+    /// `NetworkCable`/`NetworkGenerator`/`NetworkConsumer` family yields
+    /// a [`SimpleEnergyBuffer`]. `Decorative` and `ContraptionAnchor`
+    /// blocks expose nothing. Adapters register the returned endpoints at
+    /// any [`BlockCoord`] — zero mod-specific wiring.
+    pub fn capability_endpoints_for(&self, block_id: &str) -> ProfileCapabilityEndpoints {
+        let mut out = ProfileCapabilityEndpoints::default();
+        let Some(role) = self
+            .blocks
+            .iter()
+            .find(|b| b.id == block_id)
+            .map(|b| b.role)
+        else {
+            return out;
+        };
+        match role {
+            UniversalBlockRole::FluidTank
+            | UniversalBlockRole::FluidPipe
+            | UniversalBlockRole::FluidPump => {
+                let capacity = self
+                    .tank_capacity_mb
+                    .get(block_id)
+                    .copied()
+                    .unwrap_or(DEFAULT_PROFILE_TANK_MB);
+                out.fluid = Some(Box::new(SimpleFluidTank::new(u64::from(capacity))));
+            }
+            UniversalBlockRole::TransportPipe | UniversalBlockRole::Processor => {
+                out.item = Some(Box::new(SimpleSlotInventory::new(
+                    PROFILE_INVENTORY_SLOTS,
+                    PROFILE_MAX_STACK,
+                )));
+            }
+            UniversalBlockRole::NetworkCable
+            | UniversalBlockRole::NetworkGenerator
+            | UniversalBlockRole::NetworkConsumer => {
+                out.energy = Some(Box::new(SimpleEnergyBuffer::new(DEFAULT_PROFILE_ENERGY_FE)));
+            }
+            UniversalBlockRole::Decorative | UniversalBlockRole::ContraptionAnchor => {}
+        }
+        out
+    }
+}
+
+/// Tank size used for profile fluid blocks without an explicit
+/// `tank_capacity_mb` (the Mekanism basic tank's 16 000 mB).
+pub const DEFAULT_PROFILE_TANK_MB: u32 = 16_000;
+/// FE capacity of a generic profile energy endpoint.
+pub const DEFAULT_PROFILE_ENERGY_FE: u64 = 10_000;
+/// Slot count of a generic profile item endpoint (chest-like).
+pub const PROFILE_INVENTORY_SLOTS: usize = 9;
+/// Per-slot stack cap of a generic profile item endpoint.
+pub const PROFILE_MAX_STACK: u32 = 64;
+
+/// Generic capability-bus endpoints a profile block exposes in-world —
+/// at most one of each kind, matching what a real block entity can
+/// register under NeoForge `BlockCapabilities`.
+#[derive(Default)]
+pub struct ProfileCapabilityEndpoints {
+    /// Item handler, when the role exposes one.
+    pub item: Option<Box<dyn ItemTransferHandler + Send>>,
+    /// Fluid handler, when the role exposes one.
+    pub fluid: Option<Box<dyn FluidTransferHandler + Send>>,
+    /// Energy handler, when the role exposes one.
+    pub energy: Option<Box<dyn EnergyTransferHandler + Send>>,
+}
+
+impl ProfileCapabilityEndpoints {
+    /// `true` when the block exposes no capabilities.
+    pub fn is_empty(&self) -> bool {
+        self.item.is_none() && self.fluid.is_none() && self.energy.is_none()
+    }
+
+    /// Register every present endpoint at `coord` on `bus`.
+    pub fn register_into(self, bus: &mut BlockCapabilityBus, coord: &BlockCoord) {
+        if let Some(handler) = self.item {
+            bus.register_item_handler(coord.clone(), handler);
+        }
+        if let Some(handler) = self.fluid {
+            bus.register_fluid_handler(coord.clone(), handler);
+        }
+        if let Some(handler) = self.energy {
+            bus.register_energy_handler(coord.clone(), handler);
         }
     }
 }

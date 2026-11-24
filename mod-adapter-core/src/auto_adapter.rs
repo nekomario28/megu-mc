@@ -269,6 +269,20 @@ pub struct ModDataBundle {
     pub embedded_jars: Vec<String>,
 }
 
+impl ModDataBundle {
+    /// Every extracted `data/<ns>/tags/**` entry merged into a
+    /// [`crate::unified_tags::UnifiedTagIndex`] — nested `#` references
+    /// resolve at query time under the shared depth/cycle guards, and
+    /// legacy `forge:`/`neoforge:` ids alias onto `c:` bidirectionally, so
+    /// the flat table gains full NeoForge 1.21.1 common-tag semantics
+    /// without changing the existing `tags` map.
+    pub fn unified_tag_index(&self) -> crate::unified_tags::UnifiedTagIndex {
+        let mut index = crate::unified_tags::UnifiedTagIndex::new();
+        index.merge_auto_adapter_tags(&self.tags);
+        index
+    }
+}
+
 /// The artifact [`synthesize_bundle`] produces for a native JAR: the
 /// validated `megu-mod-bundle/1` document packaged together with the
 /// real [`ModDataBundle`] extracted from the JAR's `data/` and `assets/`

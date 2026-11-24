@@ -54,7 +54,7 @@ const MAX_CULINARY_SCAN_BYTES: u64 = 256 * 1024 * 1024;
 const MAX_STACK: u16 = 64;
 
 /// Input capacity of the cooking pot block entity.
-const POT_INPUT_SLOTS: usize = 6;
+pub const POT_INPUT_SLOTS: usize = 6;
 
 /// Vanilla default `cookingtime` when a recipe omits it.
 const DEFAULT_COOKING_TIME: u32 = 200;
@@ -119,7 +119,7 @@ fn malformed(msg: impl Into<String>) -> CulinaryError {
 // ---------------------------------------------------------------------------
 
 /// Prepend `minecraft:` to a bare path id; namespaced ids pass through.
-fn normalize_id(raw: &str) -> String {
+pub(crate) fn normalize_id(raw: &str) -> String {
     let raw = raw.trim();
     if raw.contains(':') {
         raw.to_string()

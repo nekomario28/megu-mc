@@ -189,6 +189,24 @@ impl DimensionModData {
             .into_iter()
             .collect()
     }
+
+    /// Merge the discovered ore/chest tag members into a
+    /// [`crate::unified_tags::UnifiedTagIndex`] under the conventional
+    /// `c:ores` / `c:chests` block tags — reachable through the legacy
+    /// `forge:` aliases too, so mods that only shipped `forge:` files and
+    /// mods that query `c:` interoperate with zero mod-specific wiring.
+    pub fn populate_unified_tags(&self, index: &mut crate::unified_tags::UnifiedTagIndex) {
+        index.merge_values(
+            crate::unified_tags::TagDomain::Block,
+            "c:ores",
+            self.ore_blocks.iter(),
+        );
+        index.merge_values(
+            crate::unified_tags::TagDomain::Block,
+            "c:chests",
+            self.chest_blocks.iter(),
+        );
+    }
 }
 
 /// Scan `(path, bytes)` entries from a mod JAR or datapack directory and

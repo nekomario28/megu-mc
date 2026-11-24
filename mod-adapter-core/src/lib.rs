@@ -157,12 +157,33 @@
 //!   statuses, multiblock [`magic_primitives::RitualRecipe`] altars with a
 //!   bounded cycle-safe [`magic_primitives::ManaNetwork`], and the `MAG1`
 //!   `megu:magic_v1` sync codec.
+//! - [`unified_tags`]: cross-mod `XMOD1-CORE` unified tag foundation —
+//!   one merged item/block/fluid [`unified_tags::UnifiedTagIndex`] across
+//!   every loaded JAR (bounded Jar-in-Jar inner JARs included), datapacks,
+//!   and the Vanilla 1.21.1 `c:` baseline, with deterministic nested-tag
+//!   expansion, depth-16 fail-closed cycle guards, `"replace"`/optional
+//!   entry handling, and bidirectional `#c:*` ↔ `#forge:*`/`#neoforge:*`
+//!   common-tag aliasing, plus flattening interop with
+//!   [`culinary_adapter::TagIndex`] and the `auto_adapter` tag table.
+//! - [`capability_bus`]: cross-mod block-capability bus — a pure-Rust
+//!   NeoForge `BlockCapabilities`/Fabric Transfer-API model
+//!   ([`capability_bus::ItemTransferHandler`],
+//!   [`capability_bus::FluidTransferHandler`],
+//!   [`capability_bus::EnergyTransferHandler`]) over dimension-generic
+//!   [`capability_bus::BlockCoord`]s, lossless component-carrying
+//!   [`capability_bus::CapabilityItemStack`]s, atomic simulate-then-commit
+//!   `transfer_*_between` helpers that can never duplicate or vanish
+//!   cargo, and ready-made [`capability_bus::SimpleSlotInventory`] /
+//!   [`capability_bus::SimpleFluidTank`] /
+//!   [`capability_bus::SimpleEnergyBuffer`] /
+//!   [`capability_bus::CookingPotItemAdapter`] endpoints.
 
 #![deny(unsafe_code)]
 
 pub mod auto_adapter;
 pub mod blockstates;
 pub mod bytecode_subset_vm;
+pub mod capability_bus;
 pub mod class_mixin_scanner;
 pub mod creature_primitives;
 pub mod culinary_adapter;
@@ -187,6 +208,7 @@ pub mod neoforge_wire;
 pub mod profile;
 pub mod season_primitives;
 pub mod unified_bundle;
+pub mod unified_tags;
 pub mod vanilla_qol_and_holidays;
 pub mod version_compat;
 pub mod world_extensions;
