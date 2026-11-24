@@ -30,26 +30,47 @@ fn main() {
             }
         }
     }
+    let mut uniform_varying_light = Section::filled(stone, Light::new(0, 0));
+    for y in 0..EDGE {
+        for z in 0..EDGE {
+            for x in 0..EDGE {
+                let block_light = ((x + z) % 16) as u8;
+                let sky_light = ((y + x) % 16) as u8;
+                uniform_varying_light.set(x, y, z, stone, Light::new(block_light, sky_light));
+            }
+        }
+    }
     println!(
         "uniform cube: {} raw faces, {} outer faces before merging",
         SECTION_CELLS * 6,
         EDGE * EDGE * 6
     );
+    let mut verified_cases = 0;
     for (name, section, expected) in [
-        ("solid", solid, 6),
-        ("checkerboard", checkerboard, SECTION_CELLS * 3),
+        ("uniform solid", solid, Some(6)),
+        ("uniform mixed-light", uniform_varying_light, None),
+        ("mixed checkerboard", checkerboard, Some(SECTION_CELLS * 3)),
     ] {
         let view = section.view();
-        assert_eq!(mesh_section(&view).len(), expected);
+        let baseline = mesh_section(&view);
+        let quad_count = baseline.len();
+        if let Some(expected) = expected {
+            assert_eq!(quad_count, expected);
+        }
+        verified_cases += 1;
+        drop(baseline);
         let start = Instant::now();
         for _ in 0..runs {
-            black_box(mesh_section(black_box(&view)));
+            let output = mesh_section(black_box(&view));
+            assert_eq!(output.len(), quad_count);
+            black_box(output);
         }
         println!(
-            "{name}: {expected} quads, {runs} sections, {:.2} us/section",
+            "{name}: {quad_count} quads, {runs} sections, {:.2} us/section",
             start.elapsed().as_secs_f64() * 1e6 / runs as f64
         );
     }
+    println!("fixture quad-count verifications: {verified_cases}/3");
     overworld_column(runs);
 }
 

@@ -464,11 +464,13 @@ fn border_lane4(occ: &[u8; PAD_CELLS], base: usize, step: usize, bit: u8) -> u64
     word
 }
 
+#[derive(Clone, Copy)]
 pub(crate) struct InteriorScan {
     pub any_cube: bool,
     pub any_fluid: bool,
     pub any_same_state_cull: bool,
     pub any_partial_occ: bool,
+    pub uniform: Option<Block>,
 }
 
 /// The single block value shared by every cell, or `None` when the section
@@ -517,6 +519,7 @@ fn load_interior_uniform(
             any_fluid,
             any_same_state_cull,
             any_partial_occ,
+            uniform: Some(block),
         };
     }
 
@@ -566,6 +569,7 @@ fn load_interior_uniform(
         any_fluid,
         any_same_state_cull,
         any_partial_occ,
+        uniform: Some(block),
     }
 }
 
@@ -693,6 +697,7 @@ pub(crate) fn load_interior(
             any_fluid,
             any_same_state_cull,
             any_partial_occ,
+            uniform: None,
         };
     }
 
@@ -725,6 +730,7 @@ pub(crate) fn load_interior(
         any_fluid,
         any_same_state_cull,
         any_partial_occ,
+        uniform: None,
     }
 }
 
@@ -1329,6 +1335,75 @@ fn try_uniform_full_slice(
     })
 }
 
+/// Emit the six boundary faces of a uniform, full-cube section without walking
+/// all 16 slices. A face is accepted only when the existing full-slice rules
+/// prove it is one exact quad, or every adjacent cell fully occludes it. Any
+/// mixed occupancy or lighting falls back to the ordinary greedy mesher.
+fn try_uniform_boundary_box<S: QuadSink>(
+    block: Block,
+    blocks: &[Block; SECTION_CELLS],
+    scratch: &MesherScratch,
+    any_same_state_cull: bool,
+    y_offset: f32,
+    quads: &mut S,
+) -> bool {
+    if block.flags & OPAQUE == 0
+        || block.occlusion & ALL_FACES != ALL_FACES
+        || block.fluid() != NO_FLUID
+        || block.flags & SAME_STATE_CULL != 0
+    {
+        return false;
+    }
+
+    let directions = [
+        Direction::Down,
+        Direction::Up,
+        Direction::North,
+        Direction::South,
+        Direction::West,
+        Direction::East,
+    ];
+    let mut faces = [None; 6];
+    for (index, direction) in directions.into_iter().enumerate() {
+        let slice = if direction.step() < 0 { 0 } else { EDGE - 1 };
+        if let Some(face) = try_uniform_full_slice(
+            blocks,
+            &scratch.occ,
+            &scratch.light,
+            direction,
+            slice,
+            any_same_state_cull,
+            y_offset,
+        ) {
+            faces[index] = Some(face);
+            continue;
+        }
+
+        let (pad_s, pad_u, pad_v, pad_step) = DIR_PAD_STRIDES[direction as usize];
+        let pad_origin = (PAD_SLICE + PAD_EDGE + 1) as isize + slice as isize * pad_s;
+        let base = pad_origin + pad_step - pad_u - pad_v;
+        let opp_bit = direction.opposite().bit();
+        let mut fully_occluded = true;
+        'cells: for v in 0..EDGE {
+            for u in 0..EDGE {
+                let idx = (base + v as isize * pad_v + u as isize * pad_u) as usize;
+                if scratch.occ[idx] & opp_bit == 0 {
+                    fully_occluded = false;
+                    break 'cells;
+                }
+            }
+        }
+        if !fully_occluded {
+            return false;
+        }
+    }
+
+    for face in faces.into_iter().flatten() {
+        quads.push(face);
+    }
+    true
+}
+
 struct SliceCtx<'a, B> {
     blocks: &'a [Block; SECTION_CELLS],
     borders: &'a B,
@@ -1615,11 +1690,24 @@ fn mesh_cubes_fast<B: BorderStates, S: QuadSink>(
     blocks: &[Block; SECTION_CELLS],
     borders: &B,
     scratch: &mut MesherScratch,
-    any_same_state_cull: bool,
-    any_partial_occ: bool,
+    scan: InteriorScan,
     y_offset: f32,
     quads: &mut S,
 ) {
+    if let Some(block) = scan.uniform {
+        if try_uniform_boundary_box(
+            block,
+            blocks,
+            scratch,
+            scan.any_same_state_cull,
+            y_offset,
+            quads,
+        ) {
+            return;
+        }
+    }
+    let any_same_state_cull = scan.any_same_state_cull;
+    let any_partial_occ = scan.any_partial_occ;
     let ctx = SliceCtx {
         blocks,
         borders,
@@ -2138,8 +2226,7 @@ pub(crate) fn mesh_loaded_section<B: BorderStates, S: QuadSink>(
             blocks,
             borders,
             scratch,
-            scan.any_same_state_cull,
-            scan.any_partial_occ,
+            scan,
             y_offset,
             quads,
         );

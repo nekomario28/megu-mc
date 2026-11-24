@@ -95,6 +95,56 @@ fn uniform_cube_reduces_to_six_outward_quads() {
 }
 
 #[test]
+fn uniform_boundary_fast_path_matches_scalar_oracle_for_neighbor_patterns() {
+    let section = Section::filled(STONE, DARK);
+    let water = Block {
+        state_id: 80,
+        fluid_kind: WATER,
+        ..Block::AIR
+    };
+    let neighbor_blocks = [Block::AIR, STONE, water];
+
+    for pattern in 0..5 {
+        let planes: [[Sample; FACE_CELLS]; 6] = std::array::from_fn(|direction| {
+            std::array::from_fn(|cell| {
+                let block = match pattern {
+                    0 => Block::AIR,
+                    1 => STONE,
+                    2 => neighbor_blocks[(cell + direction) % neighbor_blocks.len()],
+                    3 => if (cell + direction) % 2 == 0 {
+                        STONE
+                    } else {
+                        Block::AIR
+                    },
+                    _ => Block::AIR,
+                };
+                let light = match pattern {
+                    0 => DAY,
+                    1 => DARK,
+                    2 => Light::new((cell % 16) as u8, ((cell / 16) % 16) as u8),
+                    3 => {
+                        if cell % 2 == 0 { DAY } else { DARK }
+                    }
+                    _ => Light::new(0, 12),
+                };
+                Sample::new(block, light)
+            })
+        });
+        let mut view = section.view();
+        for direction in Direction::ALL {
+            view.borders[direction as usize] = Some(&planes[direction as usize]);
+        }
+        let actual = mesh_section(&view);
+        let expected = reference::mesh_section_scalar(&view);
+        reference::assert_quads_bit_identical(
+            &actual,
+            &expected,
+            &format!("uniform neighbor pattern {pattern}"),
+        );
+    }
+}
+
+#[test]
 fn all_borders_use_world_axes_and_directional_occlusion() {
     let points = [
         [6, 0, 8],
