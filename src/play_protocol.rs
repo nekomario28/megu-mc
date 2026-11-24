@@ -17255,6 +17255,12 @@ mod connection_slot_tests {
             .expect("connect test peer");
         let (_peer, _) = listener.accept().expect("accept test peer");
         let writer_socket = socket.try_clone().expect("clone writer socket");
+        // Mirror production (`start_play_writer` sets SO_SNDTIMEO before spawn):
+        // on Windows Winsock, changing SO_SNDTIMEO from another thread does not
+        // interrupt a `send()` that is already blocked with an infinite timeout.
+        writer_socket
+            .set_write_timeout(Some(Duration::from_millis(250)))
+            .expect("set initial writer timeout");
         let writer = std::thread::spawn(move || {
             let payload = vec![0; 1024 * 1024];
             let mut stream = writer_socket;
