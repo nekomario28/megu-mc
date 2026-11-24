@@ -12,6 +12,9 @@
 //   * `mod_offload_sync_antixray_tags` — folds `#c:ores`/`#forge:ores`/`#c:chests`/
 //     `#forge:chests` (and name-heuristic) mod blocks into `hidden_extra()`, the
 //     same anti-xray hidden set `refresh_hidden_tags_from_datapacks` feeds.
+//     The sync runs automatically inside `enable_create`/`load_profiles`/
+//     `declare_tag`, so loaded mod blocks protect against x-ray with no
+//     manual second call; the free function stays for explicit re-syncs.
 //   * `mod_offload_config_payloads` — deterministic Configuration-phase `0x07`
 //     registry data and `neoforge:frozen_registry*` custom payloads, emitted only
 //     while custom mod blocks are active so vanilla clients see nothing new.
@@ -262,6 +265,9 @@ impl ModOffloadBridge {
                 .unwrap_or_else(mob_zero_stress);
             let _ = self.offload.register_contraption(contraption, stress);
         }
+        // Freshly armed mod block space may already match the anti-xray
+        // tag/name rules declared so far — fold it in immediately.
+        self.sync_antixray_tags();
     }
 
     /// Run `f` on the live assembly `id`, preserving its stress budget across
@@ -306,6 +312,10 @@ impl ModOffloadBridge {
         let runtime = UniversalModRuntime::from_profiles(base, &profiles)?;
         self.universal = Some(runtime);
         self.profiles = profiles;
+        // Loaded mod blocks may sit under already-declared `#c:ores`/
+        // `#forge:chests` tags or match the ore/chest/barrel name heuristic:
+        // hide them against x-ray now, not on some later manual sync.
+        self.sync_antixray_tags();
         Ok(())
     }
 
@@ -513,6 +523,9 @@ impl ModOffloadBridge {
             let name: String = member.into();
             entry.insert(ns_rl(&name));
         }
+        // A freshly declared `#c:ores`/`#forge:chests`-family tag may name
+        // already-loaded mod blocks — re-fold the hidden set right away.
+        self.sync_antixray_tags();
     }
 
     /// Every loaded custom mod block id across both adapter tiers.
@@ -1735,42 +1748,54 @@ mod mod_offload_bridge_tests {
             assert_eq!(&decoded, expected_states);
         }
 
-        // Anti-xray tag sync: tag-declared + name-heuristic mod blocks land in
-        // the bridge's tracked custom-state set, vanilla names resolve through
-        // `breg()`, and unknown names skip cleanly.
+        // Anti-xray tag sync is wired into the load path: `load_profiles` and
+        // `declare_tag` fold tag members and name-heuristic blocks into the
+        // hidden set themselves — no manual `sync_antixray_tags` call needed.
         {
             let mut b = mod_offload_bridge().lock().unwrap_or_else(|e| e.into_inner());
-            // A loaded profile block matching `#c:ores` tracks its custom states.
+            // `quartz_ore` matches the `*_ore` name heuristic, so profile load
+            // alone hides it; `loot_vault` shares no ore/chest/barrel
+            // substring, so only its `#forge:chests` tag membership can hide it.
             let custom = ModOffloadProfile::from_json(
-                br#"{"mod_id":"testmod","blocks":[{"id":"testmod:quartz_ore","role":"decorative"}]}"#,
+                br#"{"mod_id":"testmod","blocks":[{"id":"testmod:quartz_ore","role":"decorative"},{"id":"testmod:loot_vault","role":"decorative"}]}"#,
             )
             .unwrap();
             b.load_profiles(vec![custom]).unwrap();
-            b.declare_tag(
-                "c:ores",
-                ["create:zinc_ore", "testmod:quartz_ore", "minecraft:gold_ore"],
-            );
-            let added = b.sync_antixray_tags();
-            assert!(added > 0);
-            // `testmod:quartz_ore` is a loaded mod block: its expanded custom
-            // state IDs are tracked in the bridge registry. `create:zinc_ore` is
-            // not in the loaded core catalog, so it skipped cleanly.
             let quartz_states = b.mod_state_ids_for_block("testmod:quartz_ore");
             assert!(!quartz_states.is_empty());
             assert!(quartz_states.iter().all(|st| b.mod_state_ids.contains(st)));
-            assert!(b.mod_state_ids_for_block("create:zinc_ore").is_empty());
-            let extra = hidden_extra().lock().unwrap_or_else(|e| e.into_inner());
-            for st in &quartz_states {
-                assert!(extra.contains(st));
+            let vault_states = b.mod_state_ids_for_block("testmod:loot_vault");
+            assert!(!vault_states.is_empty());
+            assert!(
+                vault_states.iter().all(|st| !b.mod_state_ids.contains(st)),
+                "loot_vault must not be hidden before its tag is declared"
+            );
+            {
+                let extra = hidden_extra().lock().unwrap_or_else(|e| e.into_inner());
+                for st in &quartz_states {
+                    assert!(extra.contains(st));
+                }
             }
-            if let Some(reg) = breg() {
-                for st in 0..reg.state_count() as u32 {
-                    if reg.name_of(st) == "minecraft:gold_ore" {
-                        assert!(extra.contains(&st));
+            b.declare_tag("forge:chests", ["testmod:loot_vault", "minecraft:chest"]);
+            b.declare_tag("c:ores", ["minecraft:gold_ore"]);
+            assert!(vault_states.iter().all(|st| b.mod_state_ids.contains(st)));
+            {
+                let extra = hidden_extra().lock().unwrap_or_else(|e| e.into_inner());
+                for st in quartz_states.iter().chain(&vault_states) {
+                    assert!(extra.contains(st));
+                }
+                if let Some(reg) = breg() {
+                    for st in 0..reg.state_count() as u32 {
+                        if matches!(reg.name_of(st), "minecraft:chest" | "minecraft:gold_ore") {
+                            assert!(extra.contains(&st));
+                        }
                     }
                 }
             }
             assert!(HIDDEN_EXTRA_USED.load(Ordering::Relaxed));
+            // The entrypoint stays available for explicit re-syncs and is
+            // idempotent once the load path already folded everything in.
+            assert_eq!(b.sync_antixray_tags(), 0);
         }
     }
 

@@ -57,6 +57,7 @@
 
 use crate::datafix::{DataFixError, DataFixReport, DataFixer, DataValue, DV_1_21_1, DV_26_3};
 use crate::migrate::to_data_json;
+use megu_core::nbt_wire::{self, NbtWireError, NbtWireLimits};
 use megu_core::version::TargetVersion;
 use std::collections::BTreeMap;
 use std::error::Error;
@@ -560,14 +561,51 @@ impl<'a> NbtReader<'a> {
     }
 }
 
+/// Canonical wire bounds for the NBT codec, expressed in this module's caps:
+/// `max_depth` matches [`NBT_DEPTH_CAP`] container levels and the
+/// aggregate/list/array budgets are the document size cap — the same
+/// fail-closed profile `world_interop`'s raw-NBT skipper uses.
+fn nbt_wire_limits() -> NbtWireLimits {
+    NbtWireLimits {
+        max_depth: NBT_DEPTH_CAP,
+        max_tags: NBT_SIZE_CAP,
+        max_list_len: NBT_SIZE_CAP,
+        max_array_bytes: NBT_SIZE_CAP,
+    }
+}
+
+/// Map a canonical [`nbt_wire`] rejection onto this codec's error surface.
+/// The skipper reports no byte offset, so structural failures land on
+/// `MalformedNbt` carrying the wire diagnostic as the message; truncation
+/// and depth keep their dedicated variants.
+fn nbt_wire_validate(bytes: &[u8]) -> Result<(), AnvilInspectError> {
+    nbt_wire::skip_named_nbt(bytes, nbt_wire_limits())
+        .map(|_| ())
+        .map_err(|error| match error {
+            NbtWireError::UnexpectedEof { .. } => AnvilInspectError::TruncatedNbt {
+                offset: bytes.len(),
+            },
+            NbtWireError::DepthExceeded { depth, .. } => AnvilInspectError::NbtTooDeep { depth },
+            NbtWireError::InvalidTagId(tag) => AnvilInspectError::MalformedNbt {
+                offset: 0,
+                message: format!("invalid NBT tag id {tag}"),
+            },
+            other => AnvilInspectError::MalformedNbt {
+                offset: 0,
+                message: other.to_string(),
+            },
+        })
+}
+
 /// Decode one named-NBT document (`level.dat`, chunk NBT, `servers.dat`)
 /// into its root name and a [`DataValue`] tree.
 ///
-/// Fail-closed: the input may not exceed [`NBT_SIZE_CAP`], every byte after
-/// the root tag is an error, container nesting is capped at
-/// [`NBT_DEPTH_CAP`], collection lengths must fit the remaining input
-/// before any allocation happens, and strings must be valid modified UTF-8
-/// that maps onto real UTF-8.
+/// Fail-closed: the input may not exceed [`NBT_SIZE_CAP`], structural
+/// bounds — tag ids, declared lengths vs remaining input, list/array caps
+/// and container depth — are proven up front by the canonical
+/// [`megu_core::nbt_wire`] skipper every other NBT consumer in the tree
+/// shares, every byte after the root tag is an error, and strings must be
+/// valid modified UTF-8 that maps onto real UTF-8.
 ///
 /// Type projection: all four integer widths become [`DataValue::Int`],
 /// floats become [`DataValue::Float`], the three array tags become `List`s
@@ -579,6 +617,13 @@ pub fn decode_nbt_to_data_value(bytes: &[u8]) -> Result<(String, DataValue), Anv
             len: bytes.len(),
             cap: NBT_SIZE_CAP,
         });
+    }
+    // Canonical structural validation before any allocation: the wire skipper
+    // proves the whole document's tag ids, lengths, caps and depth with the
+    // same bounds every other NBT reader enforces. A `TAG_End` root keeps the
+    // codec's historic ("", Null) answer and skips the wire pass.
+    if bytes.first().copied() != Some(0) {
+        nbt_wire_validate(bytes)?;
     }
     let mut reader = NbtReader {
         input: bytes,
