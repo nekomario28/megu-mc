@@ -2404,7 +2404,7 @@ fn container_state_stale(me: &Client, wid: u8, click_state_id: i32) -> bool {
         1 => me
             .chest_sync
             .lock()
-            .unwrap()
+            .unwrap_or_else(|e| e.into_inner())
             .as_ref()
             .map_or(0, |sync| sync.state_id),
         _ => return false,
@@ -2646,7 +2646,7 @@ fn sleep_tick() {
     }
     let percentage = command_gamerules()
         .lock()
-        .unwrap()
+        .unwrap_or_else(|e| e.into_inner())
         .get("playersSleepingPercentage")
         .copied()
         .unwrap_or(100);
@@ -2966,7 +2966,7 @@ fn interest_tick() {
     }
     mob_equipment()
         .lock()
-        .unwrap()
+        .unwrap_or_else(|e| e.into_inner())
         .retain(|eid, _| live_eids.contains(eid));
     for (&knot_eid, &(dim, pos)) in leash_knots()
         .lock()
@@ -5907,7 +5907,7 @@ fn cached_chunk_frame(
     let revision = chunk_packet_revision(&versions, map_chunk_sig(dim, cx, cz, gen), &entities);
     if let Some((frame, emitters)) = chunk_packet_cache()
         .lock()
-        .unwrap()
+        .unwrap_or_else(|e| e.into_inner())
         .frame(generation, key, revision, compression)
     {
         if std::env::var_os("MEGU_CHUNK_PROF").is_some() {
@@ -7234,7 +7234,7 @@ fn live_beacon_anchor(me: &Client, dim: DimId) -> Option<DimBlockPos> {
     let (px, py, pz, ..) = *me.pos.lock().unwrap_or_else(|e| e.into_inner());
     live_block_entities()
         .lock()
-        .unwrap()
+        .unwrap_or_else(|e| e.into_inner())
         .entries
         .iter()
         .filter(|(&(edim, x, y, z), _)| edim == dim && is_beacon(x, y, z))
@@ -7577,7 +7577,7 @@ fn dim_type_wire_id(dim: DimId) -> i32 {
     };
     dim_type_entry_ids()
         .lock()
-        .unwrap()
+        .unwrap_or_else(|e| e.into_inner())
         .get(spec.type_key)
         .copied()
         .unwrap_or_else(|| dim_type_wire_ids()[0])
@@ -7807,7 +7807,41 @@ fn try_ignite_nether_portal(reg: &block_registry::BReg, dim: DimId, x: i32, y: i
         }
         return true;
     }
-    false
+    // Opt-in custom shapes (`MEGU_CUSTOM_PORTAL_SHAPES=1`, default off for
+    // strict Vanilla rectangle parity): when the rectangle check failed, the
+    // predicate-driven detector admits arches, circles, hearts and
+    // crying-obsidian frames and ignites their interior cells.
+    let cfg = megu_server_files::custom_portal::CustomPortalConfig {
+        enabled: std::env::var("MEGU_CUSTOM_PORTAL_SHAPES")
+            .map(|v| matches!(v.trim(), "1" | "true" | "yes" | "on"))
+            .unwrap_or(false),
+        ..Default::default()
+    };
+    if !cfg.enabled {
+        return false;
+    }
+    let Some(shape) = megu_server_files::custom_portal::detect_any_custom_portal(
+        [x, y, z],
+        &cfg,
+        |cx, cy, cz| empty(block_at_dim(dim, cx, cy, cz)),
+        |cx, cy, cz| {
+            let st = block_at_dim(dim, cx, cy, cz);
+            st == obsidian
+                || (cfg.allow_crying_obsidian
+                    && reg.name_of(st) == "minecraft:crying_obsidian")
+        },
+    ) else {
+        return false;
+    };
+    let portal = match shape.plane {
+        megu_server_files::custom_portal::PortalPlane::VerticalZ => 5865,
+        _ => 5864,
+    };
+    for [bx, by, bz] in &shape.interior {
+        set_block_dim(dim, *bx, *by, *bz, portal);
+        note_block_update_dim(dim, *bx, *by, *bz, portal);
+    }
+    true
 }
 
 /// Materialise a safe landing in a Nether or Overworld destination: an obsidian floor under
@@ -7889,10 +7923,35 @@ fn enter_portal(
     view: i32,
 ) {
     let dim = *me.dim.lock().unwrap_or_else(|e| e.into_inner());
-    if is_end_portal_state(st) {
+    // Measured entry velocity (per-tick displacement into the portal cell):
+    // feeds both the gravity-flip landing clamp and the MSP1 commit.
+    let (px, py, pz, _, _, _) = *me.pos.lock().unwrap_or_else(|e| e.into_inner());
+    let (lx, ly, lz) = *me.lastp.lock().unwrap_or_else(|e| e.into_inner());
+    let entry_vel = [px - lx, py - ly, pz - lz];
+    let (target_dim, landing) = if is_end_portal_state(st) {
         if dim == DimId::Overworld {
             materialize_end_spawn();
-            switch_client_dimension(me, DimId::End, (100.5, 49.0, 0.5, yaw, pitch), view);
+            // Void-proof arrival: the entry velocity is clamped onto the
+            // 5x5 obsidian platform so a fast entry can never carry the
+            // player off the edge into the Void.
+            let plan = megu_server_files::custom_portal::compute_safe_gravity_flip_landing(
+                entry_vel,
+                [100.5, 49.0, 0.5],
+                2.5,
+                true,
+            );
+            let landing = (
+                plan.landing_pos[0],
+                plan.landing_pos[1],
+                plan.landing_pos[2],
+            );
+            switch_client_dimension(
+                me,
+                DimId::End,
+                (landing.0, landing.1, landing.2, yaw, pitch),
+                view,
+            );
+            (DimId::End, landing)
         } else {
             let (sdim, sx, sy, sz) = {
                 let sdim = *me.spawn_dim.lock().unwrap_or_else(|e| e.into_inner());
@@ -7903,6 +7962,7 @@ fn enter_portal(
                 (sdim, pos.0, pos.1, pos.2)
             };
             switch_client_dimension(me, sdim, (sx, sy, sz, yaw, pitch), view);
+            (sdim, (sx, sy, sz))
         }
     } else {
         // 1:8 horizontal scaling. Overworld (x,z) -> Nether (x/8, z/8) and back.
@@ -7912,11 +7972,54 @@ fn enter_portal(
             return;
         };
         materialize_nether_landing(ndim, nx, ny, nz);
+        let landing = (nx as f64 + 0.5, ny as f64, nz as f64 + 0.5);
         switch_client_dimension(
             me,
             ndim,
-            (nx as f64 + 0.5, ny as f64, nz as f64 + 0.5, yaw, pitch),
+            (landing.0, landing.1, landing.2, yaw, pitch),
             view,
+        );
+        (ndim, landing)
+    };
+    // `megu:portal_seamless_v1` (`MSP1`) CommitTransfer, emitted alongside
+    // the standard dimension-switch packets: Megu clients that prefetched
+    // the destination crossfade with zero loading screen while vanilla
+    // clients ignore the unknown channel and continue cleanly.
+    {
+        static MSP1_TRANSFER_SEQ: AtomicU64 = AtomicU64::new(0);
+        let target_dim_id = {
+            let id = target_dim.dimension_id();
+            if id.is_empty() {
+                format!("megu:dim_{}", target_dim.raw())
+            } else {
+                id.to_string()
+            }
+        };
+        let commit = SeamlessDimCommit {
+            transfer_id: MSP1_TRANSFER_SEQ.fetch_add(1, Ordering::Relaxed) + 1,
+            target_dim_id,
+            landing_pos: [landing.0, landing.1, landing.2],
+            landing_vel: [
+                entry_vel[0] as f32,
+                entry_vel[1] as f32,
+                entry_vel[2] as f32,
+            ],
+            landing_yaw: yaw,
+            landing_pitch: pitch,
+            crossfade_ms: seamless_portal::DEFAULT_CROSSFADE_MS,
+            keep_momentum: true,
+        };
+        // The shared constant is the wire id the client decodes on — pin it.
+        debug_assert_eq!(SEAMLESS_PORTAL_CHANNEL, "megu:portal_seamless_v1");
+        let mut body = Vec::with_capacity(SEAMLESS_PORTAL_CHANNEL.len() + 64);
+        write_str(&mut body, SEAMLESS_PORTAL_CHANNEL);
+        body.extend_from_slice(&encode_seamless_portal_packet(
+            &SeamlessPortalPacket::CommitTransfer(commit),
+        ));
+        let _ = send_packet(
+            &mut me.sock.lock().unwrap_or_else(|e| e.into_inner()),
+            LIVE_MOD_S2C_CUSTOM_PAYLOAD_ID,
+            body,
         );
     }
     // Arrival is inside a real portal; hold the per-player guard until the player steps out
@@ -8512,7 +8615,7 @@ fn signs() -> &'static LockedMap<SignKey, SignLines> {
 fn signs_in_chunk(dim: DimId, cx: i32, cz: i32) -> Vec<(SignKey, SignLines)> {
     signs()
         .lock()
-        .unwrap()
+        .unwrap_or_else(|e| e.into_inner())
         .iter()
         .filter(|(&(sdim, x, _, z, _), _)| sdim == dim && x >> 4 == cx && z >> 4 == cz)
         .map(|(k, v)| (*k, v.clone()))
@@ -10047,7 +10150,7 @@ fn live_mount_forget(eid: i32) {
     for (passenger, at) in freed {
         if let Some(client) = clients()
             .lock()
-            .unwrap()
+            .unwrap_or_else(|e| e.into_inner())
             .iter()
             .find(|c| c.eid == passenger)
             .cloned()
@@ -10204,7 +10307,7 @@ fn player_stats() -> &'static Mutex<HashMap<[u8; 16], PlayerStats>> {
 fn stat_increment(me: &Client, category: StatCategory, stat_id: i32, delta: i32) {
     player_stats()
         .lock()
-        .unwrap()
+        .unwrap_or_else(|e| e.into_inner())
         .entry(me.uuid)
         .or_default()
         .increment(category, stat_id, delta);
@@ -10215,7 +10318,7 @@ fn stat_increment(me: &Client, category: StatCategory, stat_id: i32, delta: i32)
 fn player_recipe_book(uuid: [u8; 16]) -> PlayerRecipeBook {
     recipe_books()
         .lock()
-        .unwrap()
+        .unwrap_or_else(|e| e.into_inner())
         .entry(uuid)
         .or_default()
         .clone()
@@ -10350,7 +10453,7 @@ fn place_live_recipe(me: &Arc<Client>, place: &PlaceRecipe) {
     // server knows may lay out, matching `ServerRecipeBook` semantics.
     let unlocked = recipe_books()
         .lock()
-        .unwrap()
+        .unwrap_or_else(|e| e.into_inner())
         .get(&me.uuid)
         .is_some_and(|book| book.is_unlocked(&place.recipe_id));
     if !eval_limited_crafting_allowed(do_limited_crafting_enabled(), unlocked) {
@@ -12314,7 +12417,7 @@ fn handle_inner(mut s: TcpStream, live_eid: Arc<AtomicI32>) {
                         let held = me
                             .inv
                             .lock()
-                            .unwrap()
+                            .unwrap_or_else(|e| e.into_inner())
                             .get(&(36 + held_slot))
                             .cloned()
                             .unwrap_or((0, 0, Vec::new()));
@@ -12366,13 +12469,13 @@ fn handle_inner(mut s: TcpStream, live_eid: Arc<AtomicI32>) {
                     // `set_beacon_effect` would resolve against.
                     beacon_menu_anchors()
                         .lock()
-                        .unwrap()
+                        .unwrap_or_else(|e| e.into_inner())
                         .insert(me.eid, (dim, x, y, z));
                     with_save_guard(|| {
                         if let Some(reg) = crate::block_registry::breg() {
                             live_block_entities()
                                 .lock()
-                                .unwrap()
+                                .unwrap_or_else(|e| e.into_inner())
                                 .at(reg, (dim, x, y, z), clicked);
                         }
                     });
@@ -12441,6 +12544,19 @@ fn handle_inner(mut s: TcpStream, live_eid: Arc<AtomicI32>) {
                 }
                 // chest: open container instead of placing
                 if let Some(kind) = container_kind(block_at_dim(dim, x, y, z)) {
+                    // Persistent claims: opening a container inside a claim
+                    // needs the container-interact permission.
+                    if !can_player_open_container(
+                        dim,
+                        x,
+                        z,
+                        &uuid_text(&me.uuid),
+                        &me.name,
+                        client_permission_level(&me) >= 4,
+                    ) {
+                        let _ = send_packet(&mut me.sock.lock().unwrap_or_else(|e| e.into_inner()), 0x05, ack(seq));
+                        continue;
+                    }
                     // The window is `DoubleBlockCombiner` order, not click order: the
                     // right half owns slots 0..=26 whichever half was right-clicked.
                     let window = chest_window_for_player(dim, x, y, z);
@@ -12475,6 +12591,19 @@ fn handle_inner(mut s: TcpStream, live_eid: Arc<AtomicI32>) {
                 }
                 // ender chest: per-player shared storage (synthetic key, not world pos)
                 if (7513..=7520).contains(&block_at_dim(dim, x, y, z)) {
+                    // Persistent claims: ender chest open is a container
+                    // interact on the clicked cell.
+                    if !can_player_open_container(
+                        dim,
+                        x,
+                        z,
+                        &uuid_text(&me.uuid),
+                        &me.name,
+                        client_permission_level(&me) >= 4,
+                    ) {
+                        let _ = send_packet(&mut me.sock.lock().unwrap_or_else(|e| e.into_inner()), 0x05, ack(seq));
+                        continue;
+                    }
                     // `EnderChestBlock.useWithoutItem` (`dip.a`): refuses when the cell
                     // above `isRedstoneConductor`.
                     if is_blocked_chest_by_block_dim(dim, (x, y, z)) {
@@ -12504,12 +12633,23 @@ fn handle_inner(mut s: TcpStream, live_eid: Arc<AtomicI32>) {
                     && me
                         .inv
                         .lock()
-                        .unwrap()
+                        .unwrap_or_else(|e| e.into_inner())
                         .get(&(36 + held_slot))
                         .map(|v| v.0)
                         .unwrap_or(0)
                         == 798
                 {
+                    // Persistent claims: priming TNT modifies the cell.
+                    if !can_player_modify_block(
+                        dim,
+                        x,
+                        z,
+                        &me.name,
+                        client_permission_level(&me),
+                    ) {
+                        let _ = send_packet(&mut me.sock.lock().unwrap_or_else(|e| e.into_inner()), 0x05, ack(seq));
+                        continue;
+                    }
                     set_block_dim(dim, x, y, z, 0);
                     note_block_update_dim(dim, x, y, z, 0);
                     let eid = NEXT_EID.fetch_add(1, Ordering::SeqCst);
@@ -12558,6 +12698,19 @@ fn handle_inner(mut s: TcpStream, live_eid: Arc<AtomicI32>) {
                     continue;
                 }
                 if block_at_dim(dim, x, y, z) == name_to_state("furnace").unwrap_or(u32::MAX) {
+                    // Persistent claims: furnace open is a container
+                    // interact on the clicked cell.
+                    if !can_player_open_container(
+                        dim,
+                        x,
+                        z,
+                        &uuid_text(&me.uuid),
+                        &me.name,
+                        client_permission_level(&me) >= 4,
+                    ) {
+                        let _ = send_packet(&mut me.sock.lock().unwrap_or_else(|e| e.into_inner()), 0x05, ack(seq));
+                        continue;
+                    }
                     close_live_menu(&me, false, true);
                     *me.open_furnace.lock().unwrap_or_else(|e| e.into_inner()) = Some((dim, x, y, z));
                     let inv = me.inv.lock().unwrap_or_else(|e| e.into_inner()).clone();
@@ -12574,6 +12727,18 @@ fn handle_inner(mut s: TcpStream, live_eid: Arc<AtomicI32>) {
                 if let Some((item, cnt, _hc)) = held_b {
                     let src = block_at_dim(dim, x, y, z);
                     if item == 908 && (src == 80 || src == 96) {
+                        // Persistent claims: filling a bucket removes the
+                        // source cell — a block modification.
+                        if !can_player_modify_block(
+                            dim,
+                            x,
+                            z,
+                            &me.name,
+                            client_permission_level(&me),
+                        ) {
+                            let _ = send_packet(&mut me.sock.lock().unwrap_or_else(|e| e.into_inner()), 0x05, ack(seq));
+                            continue;
+                        }
                         let fi = if src == 80 { 909 } else { 910 };
                         set_block_dim(dim, x, y, z, 0);
                         note_block_update_dim(dim, x, y, z, 0);
@@ -13054,13 +13219,42 @@ fn handle_inner(mut s: TcpStream, live_eid: Arc<AtomicI32>) {
                             if !ac_check_attack(&me, dim, target_center) {
                                 continue;
                             }
+                            // Persistent claims: damaging an entity inside a
+                            // claim needs the entity-attack permission.
+                            if !can_player_damage_entity(
+                                dim,
+                                tx.floor() as i32,
+                                tz.floor() as i32,
+                                &uuid_text(&me.uuid),
+                                &me.name,
+                                client_permission_level(&me) >= 4,
+                            ) {
+                                continue;
+                            }
+                        }
+                    }
+                    if mouse == 0 || mouse == 2 {
+                        if let Some((tx, _ty, tz, _is_cart)) = tp {
+                            // Persistent claims: interacting with an entity
+                            // inside a claim needs the entity-interact
+                            // permission.
+                            if !can_player_interact_entity(
+                                *me.dim.lock().unwrap_or_else(|e| e.into_inner()),
+                                tx.floor() as i32,
+                                tz.floor() as i32,
+                                &uuid_text(&me.uuid),
+                                &me.name,
+                                client_permission_level(&me) >= 4,
+                            ) {
+                                continue;
+                            }
                         }
                     }
                 }
                 if mouse == 0 || mouse == 2 {
                     let cart_uuid = generated_content()
                         .lock()
-                        .unwrap()
+                        .unwrap_or_else(|e| e.into_inner())
                         .carts
                         .iter()
                         .find(|c| c.eid == target)
@@ -13134,7 +13328,7 @@ fn handle_inner(mut s: TcpStream, live_eid: Arc<AtomicI32>) {
                     // interact: villagers open trade UI; wheat breeds animals
                     let villager = mobs()
                         .lock()
-                        .unwrap()
+                        .unwrap_or_else(|e| e.into_inner())
                         .iter()
                         .find(|m| m.eid == target && Some(m.etype) == name_to_etype("villager"))
                         .cloned();
@@ -13142,7 +13336,7 @@ fn handle_inner(mut s: TcpStream, live_eid: Arc<AtomicI32>) {
                     let held_it = me
                         .inv
                         .lock()
-                        .unwrap()
+                        .unwrap_or_else(|e| e.into_inner())
                         .get(&(36 + held_slot))
                         .cloned()
                         .unwrap_or((0, 0, Vec::new()))
@@ -13290,7 +13484,7 @@ fn handle_inner(mut s: TcpStream, live_eid: Arc<AtomicI32>) {
                             let vic: Option<Arc<Client>> = {
                                 clients()
                                     .lock()
-                                    .unwrap()
+                                    .unwrap_or_else(|e| e.into_inner())
                                     .iter()
                                     .find(|c| c.eid == target)
                                     .cloned()
@@ -13631,7 +13825,7 @@ fn handle_inner(mut s: TcpStream, live_eid: Arc<AtomicI32>) {
                                 let blind = me
                                     .effs
                                     .lock()
-                                    .unwrap()
+                                    .unwrap_or_else(|e| e.into_inner())
                                     .iter()
                                     .any(|effect| effect.id == 14);
                                 let ff = *me.fall_from.lock().unwrap_or_else(|e| e.into_inner());
@@ -13662,9 +13856,35 @@ fn handle_inner(mut s: TcpStream, live_eid: Arc<AtomicI32>) {
                                             * -4.0,
                                     )
                                 };
+                                // Registered multi-part layouts (mod
+                                // colossals): the melee ray is tested
+                                // against the part AABBs and the struck
+                                // part's damage multiplier scales the hit —
+                                // `1.0` for every ordinary mob.
+                                let (mx2, my2, mz2, ..) =
+                                    *m.pos.lock().unwrap_or_else(|e| e.into_inner());
+                                let (_ew, eh2) = entity_dimensions_1211(m.etype);
+                                let dir = [
+                                    mx2 - px,
+                                    (my2 + f64::from(eh2) / 2.0) - (py + 1.62),
+                                    mz2 - pz,
+                                ];
+                                let ray_len =
+                                    (dir[0].powi(2) + dir[1].powi(2) + dir[2].powi(2)).sqrt();
+                                let colossal_scale = if ray_len > 1e-6 {
+                                    live_colossal_attack_scale(
+                                        [px, py + 1.62, pz],
+                                        [dir[0] / ray_len, dir[1] / ray_len, dir[2] / ray_len],
+                                        ray_len + 1.0,
+                                        m,
+                                    )
+                                } else {
+                                    1.0
+                                };
                                 let mut h = m.hp.lock().unwrap_or_else(|e| e.into_inner());
                                 *h -= ((wep + sharp + spec + strb + wkb).max(0.0))
                                     * scale
+                                    * colossal_scale
                                     * if crit { 1.5 } else { 1.0 };
                                 drop(h);
                                 // Vanilla swords sweep even without Sweeping Edge.
@@ -13872,7 +14092,7 @@ fn handle_inner(mut s: TcpStream, live_eid: Arc<AtomicI32>) {
                 if let Some(s) = decode_recipe_book_change_settings(&mut sl) {
                     recipe_books()
                         .lock()
-                        .unwrap()
+                        .unwrap_or_else(|e| e.into_inner())
                         .entry(me.uuid)
                         .or_default()
                         .apply_book_settings(s.book_type, s.book_open, s.filter_active);
@@ -13884,7 +14104,7 @@ fn handle_inner(mut s: TcpStream, live_eid: Arc<AtomicI32>) {
                 if let Some(id) = decode_recipe_book_seen_recipe(&mut sl) {
                     recipe_books()
                         .lock()
-                        .unwrap()
+                        .unwrap_or_else(|e| e.into_inner())
                         .entry(me.uuid)
                         .or_default()
                         .seen_recipe(&id);
@@ -14041,6 +14261,9 @@ fn handle_inner(mut s: TcpStream, live_eid: Arc<AtomicI32>) {
                         || !is_sign_block_state(block_at_dim(dim, sx, sy, sz))
                         // a waxed sign's text is frozen; vanilla drops the edit
                         || sign_meta_at(dim, sx, sy, sz).is_waxed
+                        // Persistent claims: editing sign text modifies the
+                        // block.
+                        || !can_player_modify_block(dim, sx, sz, &me.name, perm)
                     {
                         continue;
                     }
@@ -14166,7 +14389,7 @@ fn handle_inner(mut s: TcpStream, live_eid: Arc<AtomicI32>) {
                         let stack = me
                             .inv
                             .lock()
-                            .unwrap()
+                            .unwrap_or_else(|e| e.into_inner())
                             .get(&held_slot)
                             .cloned()
                             .unwrap_or_default();
@@ -17446,7 +17669,7 @@ mod sleep_protocol_parity_tests {
         let old_world_time = WORLD_TIME.load(Ordering::Relaxed);
         let old_percentage = command_gamerules()
             .lock()
-            .unwrap()
+            .unwrap_or_else(|e| e.into_inner())
             .get("playersSleepingPercentage")
             .copied();
         let (client, _peer) = effect_tests::client_pair();
@@ -17471,7 +17694,7 @@ mod sleep_protocol_parity_tests {
         WORLD_TIME.store(13000, Ordering::Relaxed);
         command_gamerules()
             .lock()
-            .unwrap()
+            .unwrap_or_else(|e| e.into_inner())
             .insert("playersSleepingPercentage", 110);
         enter_bed(&client, 0, 64, 0);
         for _ in 0..150 {
@@ -17485,13 +17708,13 @@ mod sleep_protocol_parity_tests {
             Some(v) => {
                 command_gamerules()
                     .lock()
-                    .unwrap()
+                    .unwrap_or_else(|e| e.into_inner())
                     .insert("playersSleepingPercentage", v);
             }
             None => {
                 command_gamerules()
                     .lock()
-                    .unwrap()
+                    .unwrap_or_else(|e| e.into_inner())
                     .remove("playersSleepingPercentage");
             }
         }
@@ -17630,7 +17853,7 @@ mod w3_tests {
         let me = loop {
             if let Some(found) = clients()
                 .lock()
-                .unwrap()
+                .unwrap_or_else(|e| e.into_inner())
                 .iter()
                 .find(|c| c.name == name)
                 .cloned()
@@ -18978,7 +19201,7 @@ mod w4_tests {
         fn decrypt_login_field(&self, ciphertext: &[u8]) -> Option<Vec<u8>> {
             self.decrypt_calls
                 .lock()
-                .unwrap()
+                .unwrap_or_else(|e| e.into_inner())
                 .push(ciphertext.to_vec());
             Some(ciphertext.to_vec())
         }
@@ -19520,7 +19743,7 @@ mod p5c_live_tests {
         fn drop(&mut self) {
             clients()
                 .lock()
-                .unwrap()
+                .unwrap_or_else(|e| e.into_inner())
                 .retain(|c| c.eid != self.eid);
             DIFFICULTY.store(self.difficulty, Ordering::Relaxed);
         }
@@ -19694,7 +19917,7 @@ mod p5c_live_tests {
         assert!(!player_is_admin(&me.name), "default players are not operators");
         OPERATORS
             .lock()
-            .unwrap()
+            .unwrap_or_else(|e| e.into_inner())
             .insert(me.name.to_ascii_lowercase());
         assert!(player_is_admin(&me.name));
         OPERATORS.lock().unwrap_or_else(|e| e.into_inner()).remove(&me.name.to_ascii_lowercase());
@@ -20438,7 +20661,7 @@ mod p5c_live_tests {
         let cart_eid = mobs().lock().unwrap_or_else(|e| e.into_inner()).last().unwrap().eid;
         w1_vehicle_phys()
             .lock()
-            .unwrap()
+            .unwrap_or_else(|e| e.into_inner())
             .insert(cart_eid, W1VehiclePhys {
                 vel: [0.1, 0.0, 0.0],
                 ..W1VehiclePhys::default()
@@ -20482,7 +20705,7 @@ mod p5c_live_tests {
         });
         let cart = mobs()
             .lock()
-            .unwrap()
+            .unwrap_or_else(|e| e.into_inner())
             .iter()
             .find(|m| m.eid == cart_eid)
             .unwrap()
@@ -20498,7 +20721,7 @@ mod p5c_live_tests {
         );
         let boat = mobs()
             .lock()
-            .unwrap()
+            .unwrap_or_else(|e| e.into_inner())
             .iter()
             .find(|m| m.eid == boat_eid)
             .unwrap()
@@ -20541,7 +20764,7 @@ mod p5c_live_tests {
         }
         let eids: Vec<i32> = mobs()
             .lock()
-            .unwrap()
+            .unwrap_or_else(|e| e.into_inner())
             .iter()
             .filter(|m| !before.contains(&m.eid))
             .map(|m| m.eid)
@@ -20549,7 +20772,7 @@ mod p5c_live_tests {
         assert_eq!(eids.len(), 4);
         let phantom_eid = mobs()
             .lock()
-            .unwrap()
+            .unwrap_or_else(|e| e.into_inner())
             .iter()
             .find(|m| m.etype == 76 && eids.contains(&m.eid))
             .unwrap()
@@ -20582,7 +20805,7 @@ mod p5c_live_tests {
         );
         let phantom = mobs()
             .lock()
-            .unwrap()
+            .unwrap_or_else(|e| e.into_inner())
             .iter()
             .find(|m| m.eid == phantom_eid)
             .unwrap()
@@ -20764,7 +20987,7 @@ mod p5c_live_tests {
         assert!(
             drops()
                 .lock()
-                .unwrap()
+                .unwrap_or_else(|e| e.into_inner())
                 .iter()
                 .any(|d| d.item == 1 && d.cnt == 3),
             "decay-off chest spill must drop its stack"
@@ -22421,7 +22644,7 @@ mod parity_58_c2s_tests {
             let eids = std::mem::take(&mut self.0);
             clients()
                 .lock()
-                .unwrap()
+                .unwrap_or_else(|e| e.into_inner())
                 .retain(|c| !eids.contains(&c.eid));
         }
     }
@@ -22451,7 +22674,7 @@ mod parity_58_c2s_tests {
         fn drop(&mut self) {
             pearls()
                 .lock()
-                .unwrap()
+                .unwrap_or_else(|e| e.into_inner())
                 .retain(|p| p.eid != 99001 && p.eid != 99002);
             death_drop_marks().lock().unwrap_or_else(|e| e.into_inner()).remove(&self.0);
         }
@@ -22724,7 +22947,7 @@ mod parity_58_c2s_tests {
 
         OPERATORS
             .lock()
-            .unwrap()
+            .unwrap_or_else(|e| e.into_inner())
             .insert(me.name.to_ascii_lowercase());
         let _op = P58Op(me.name.to_ascii_lowercase());
         assert!(c2s_apply_lock_difficulty(&me, true), "OP locks");
@@ -22839,14 +23062,14 @@ mod parity_58_c2s_tests {
 
         command_gamerules()
             .lock()
-            .unwrap()
+            .unwrap_or_else(|e| e.into_inner())
             .insert("reducedDebugInfo", 0);
         gamerule_watch_tick(); // re-baselines the watcher
         assert!(p58_frame(&mut peer).is_none(), "no event while unchanged");
 
         command_gamerules()
             .lock()
-            .unwrap()
+            .unwrap_or_else(|e| e.into_inner())
             .insert("reducedDebugInfo", 1);
         gamerule_watch_tick();
         let (id, body) = p58_frame(&mut peer).expect("status 22");
@@ -22855,7 +23078,7 @@ mod parity_58_c2s_tests {
 
         command_gamerules()
             .lock()
-            .unwrap()
+            .unwrap_or_else(|e| e.into_inner())
             .insert("reducedDebugInfo", 0);
         gamerule_watch_tick();
         let (id2, body2) = p58_frame(&mut peer).expect("status 23");
@@ -22898,7 +23121,7 @@ mod parity_58_c2s_tests {
 
         command_gamerules()
             .lock()
-            .unwrap()
+            .unwrap_or_else(|e| e.into_inner())
             .insert("enderPearlsVanishOnDeath", 1);
         drop_player_items_on_death(&me);
         {
@@ -22930,12 +23153,12 @@ mod parity_58_c2s_tests {
         ] {
             command_gamerules()
                 .lock()
-                .unwrap()
+                .unwrap_or_else(|e| e.into_inner())
                 .insert(name, on);
             assert_eq!(gamerule_live_value(name), on, "{name} on");
             command_gamerules()
                 .lock()
-                .unwrap()
+                .unwrap_or_else(|e| e.into_inner())
                 .insert(name, off);
             assert_eq!(gamerule_live_value(name), off, "{name} off");
         }
@@ -22956,7 +23179,7 @@ mod parity_58_c2s_tests {
 
         command_gamerules()
             .lock()
-            .unwrap()
+            .unwrap_or_else(|e| e.into_inner())
             .insert("globalSoundEvents", 0);
         end_portal_spawn_sound(DimId::Overworld, 0.5, 65.0, 0.5);
         assert!(p58_frame(&mut near_peer).is_some(), "near listener hears it");
@@ -22964,7 +23187,7 @@ mod parity_58_c2s_tests {
 
         command_gamerules()
             .lock()
-            .unwrap()
+            .unwrap_or_else(|e| e.into_inner())
             .insert("globalSoundEvents", 1);
         end_portal_spawn_sound(DimId::Overworld, 0.5, 65.0, 0.5);
         assert!(p58_frame(&mut near_peer).is_some());
@@ -24151,5 +24374,187 @@ mod vanilla_death_message_tests {
             "Steve was slain by Alex using Excalibur"
         );
         assert_eq!(f("Steve", "player_attack", None, None), "Steve was slain");
+    }
+}
+
+/// P0-2/P0-3/P0-5A coverage: claims gate every grief/interact surface the
+/// handlers now consult, the blast slice respects them, and a non-rectangular
+/// frame ignites under the opt-in custom-shapes config.
+#[cfg(test)]
+mod claims_portals_blast_tests {
+    use super::*;
+
+    fn claim_for(dim: DimId, bx: i32, bz: i32, owner: &str) -> (DimId, i32, i32) {
+        let key = claim_chunk_key(dim, bx, bz);
+        live_claims()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(
+                key,
+                LiveClaimRecord {
+                    owner: owner.into(),
+                    trusted: std::collections::BTreeSet::new(),
+                    created_tick: 0,
+                },
+            );
+        key
+    }
+
+    fn unclaim(key: (DimId, i32, i32)) {
+        live_claims()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(&key);
+    }
+
+    /// Claimed chunk: an outsider cannot modify blocks, open containers,
+    /// touch or hurt entities, or let an explosion take the chunk; the
+    /// owner and an OP-4 bypass as before.
+    #[test]
+    fn claims_gate_blocks_containers_entities_and_explosions() {
+        let _world_guard = world_guard();
+        let dim = DimId::Overworld;
+        // Deep in a claim-free region of the flat test world.
+        let (bx, bz) = (24_032, 24_032);
+        let key = claim_for(dim, bx, bz, "alice");
+
+        assert!(
+            !can_player_modify_block(dim, bx, bz, "mallory", 0),
+            "outsider TNT ignite / dig / place / sign / bucket denied"
+        );
+        assert!(!can_player_open_container(
+            dim, bx, bz, "mallory-uuid", "mallory", false
+        ));
+        assert!(!can_player_interact_entity(
+            dim, bx, bz, "mallory-uuid", "mallory", false
+        ));
+        assert!(!can_player_damage_entity(
+            dim, bx, bz, "mallory-uuid", "mallory", false
+        ));
+        // An explosion sourced outside the claim still cannot reach in.
+        assert!(!can_explosion_damage_block(dim, bx + 64, bz + 64, bx, bz, None));
+        // OpenPAC semantics: a claim does not protect itself from a blast it
+        // hosts — the owner's own TNT inside their land still works.
+        assert!(can_explosion_damage_block(dim, bx, bz, bx, bz, None));
+
+        assert!(can_player_modify_block(dim, bx, bz, "alice", 0));
+        assert!(can_player_open_container(
+            dim, bx, bz, "alice-uuid", "alice", false
+        ));
+        assert!(can_player_modify_block(dim, bx, bz, "mallory", 4));
+        // Unclaimed neighbours stay open.
+        assert!(can_player_modify_block(dim, bx + 32, bz, "mallory", 0));
+        assert!(can_explosion_damage_block(
+            dim,
+            bx + 64,
+            bz + 64,
+            bx + 32,
+            bz,
+            None
+        ));
+
+        unclaim(key);
+    }
+
+    /// The blast slice itself honours the claim verdict: a claimed target
+    /// cell survives while an unclaimed neighbour in the same slice breaks.
+    #[test]
+    fn blast_slice_leaves_claimed_cells_intact() {
+        let _world_guard = world_guard();
+        let dim = DimId::Overworld;
+        let (cx, cy, cz) = (26_000, 100, 26_000);
+        let stone = name_to_state("stone").unwrap();
+        let key = claim_for(dim, cx, cz, "alice");
+        set_block_dim(dim, cx, cy, cz, stone);
+        set_block_dim(dim, cx + 16, cy, cz, stone);
+
+        // Source sits outside the claim so the target-side verdict denies it
+        // (a blast the claim hosts itself would be allowed to self-grief).
+        apply_blast_slice(
+            dim,
+            [cx + 64, cy, cz],
+            &[
+                BlastRemoval {
+                    pos: [cx, cy, cz],
+                },
+                BlastRemoval {
+                    pos: [cx + 16, cy, cz],
+                },
+            ],
+        );
+
+        assert_ne!(
+            block_at_dim(dim, cx, cy, cz),
+            0,
+            "claimed cell survives the slice"
+        );
+        assert_eq!(
+            block_at_dim(dim, cx + 16, cy, cz),
+            0,
+            "unclaimed neighbour still breaks"
+        );
+        set_block_dim(dim, cx, cy, cz, 0);
+        unclaim(key);
+    }
+}
+
+/// P0-5A coverage: a non-rectangular frame ignites under the opt-in custom
+/// shapes config. Needs the vanilla pack for the block registry, so it sits
+/// behind the same `megu_vanilla_data` gate as the other live-wire tests.
+#[cfg(all(test, megu_vanilla_data))]
+mod custom_portal_tests {
+    use super::*;
+
+    /// With `MEGU_CUSTOM_PORTAL_SHAPES=1` a non-rectangular obsidian ring
+    /// (corners are air, so the strict vanilla rectangle check rejects it)
+    /// still ignites its interior.
+    #[test]
+    fn custom_shaped_portal_ignites_when_enabled() {
+        crate::test_support::require_vanilla_data();
+        let _world_guard = world_guard();
+        let dim = DimId::Overworld;
+        let reg = block_registry::breg().unwrap();
+        let obsidian = reg.state_of("minecraft:obsidian", None);
+        // 5x5 silhouette with air corners — a ring, not a rectangle.
+        let (bx, by, bz) = (28_000, 140, 28_000);
+        let frame: &[(i32, i32)] = &[
+            (1, 0),
+            (2, 0),
+            (3, 0),
+            (0, 1),
+            (4, 1),
+            (0, 2),
+            (4, 2),
+            (0, 3),
+            (4, 3),
+            (1, 4),
+            (2, 4),
+            (3, 4),
+        ];
+        let mut prev = Vec::new();
+        for dx in 0..5 {
+            for dy in 0..5 {
+                prev.push((bx + dx, by + dy, block_at_dim(dim, bx + dx, by + dy, bz)));
+            }
+        }
+        for &(dx, dy) in frame {
+            set_block_dim(dim, bx + dx, by + dy, bz, obsidian);
+        }
+        let prev_flag = std::env::var("MEGU_CUSTOM_PORTAL_SHAPES").ok();
+        std::env::set_var("MEGU_CUSTOM_PORTAL_SHAPES", "1");
+        let ignited = try_ignite_nether_portal(reg, dim, bx + 2, by + 2, bz);
+        match prev_flag {
+            Some(v) => std::env::set_var("MEGU_CUSTOM_PORTAL_SHAPES", v),
+            None => std::env::remove_var("MEGU_CUSTOM_PORTAL_SHAPES"),
+        }
+        assert!(ignited, "custom ring ignited");
+        let st = block_at_dim(dim, bx + 2, by + 2, bz);
+        assert!(
+            st == 5864 || st == 5865,
+            "interior cell is a portal state, got {st}"
+        );
+        for &(px, py, st0) in &prev {
+            set_block_dim(dim, px, py, bz, st0);
+        }
     }
 }

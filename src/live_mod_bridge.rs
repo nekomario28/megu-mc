@@ -256,8 +256,9 @@ use mod_adapter_core::capability_bus::{
 #[cfg(feature = "mod-suite")]
 use mod_adapter_core::colossal_and_forge::{
     evaluate_breath_cone, BlockProbe, BreathEntity, BreathOutcome, ElementKind,
-    ElementalBreathSpec, ForgeTickEvents, GrowthStageCurve, MultiBlockForgeRuntime,
-    MultiBlockForgeSpec, MultiPartHitbox, PartHit,
+    ElementalBreathSpec, ForgeCellExpect, ForgePatternCell, ForgeTickEvents,
+    GrowthStageCurve, MultiBlockForgeRuntime, MultiBlockForgeSpec, MultiPartHitbox,
+    PartHit, PartKind, PartOffsetSpec,
 };
 #[cfg(feature = "mod-suite")]
 use mod_offload::auto_optimizer::{
@@ -268,12 +269,16 @@ use mod_offload::auto_optimizer::{
 use mod_offload::lazy_catchup::{
     catch_up_furnace, catch_up_growth_stage, catch_up_machine_batch, CatchUpLimits,
     FurnaceCatchUpReport, FurnaceCatchUpState, HeadlessFactoryNode, HeadlessFactoryRegistry,
-    MachineCatchUpReport, MachineCatchUpState,
+    MachineCatchUpReport, MachineCatchUpState, MILLI_PER_ITEM,
+};
+#[cfg(feature = "mod-suite")]
+use mod_adapter_core::recipe_conflict_unify::{
+    InputSignature, MaterialUnifier, RecipeCandidate, RecipeConflictIndex,
 };
 #[cfg(feature = "mod-suite")]
 use mod_adapter_core::culinary_adapter::{
     CookResult, CookingPotState, CulinaryDiscoveryStats, CulinaryRegistry, CuttingOutcome,
-    TagIndex,
+    IngredientMatcher, TagIndex,
 };
 #[cfg(feature = "mod-suite")]
 use mod_adapter_core::ecosystem_compat::{
@@ -499,6 +504,15 @@ struct LiveModSuite {
     /// from. `None` until the first join builds it, and after any
     /// invalidation — subsequent joins hand the same `Arc` back in O(1).
     mrs1_cache: Option<Mrs1FrameCache>,
+    /// OreDictionary-style recipe de-confliction surface, rebuilt at the end
+    /// of every `scan_mods_dir`: overlapping culinary recipes register under
+    /// their input signature so `resolve` ranks them deterministically
+    /// (vanilla first, then recipe id).
+    recipe_conflicts: RecipeConflictIndex,
+    /// Canonicalises equivalent material ids through the merged unified tag
+    /// index. Disabled by default for strict Vanilla parity; consulted by
+    /// the live recipe lookup surface.
+    material_unifier: MaterialUnifier,
 }
 
 /// The inputs one `MRS1` frame is a pure function of: the suite's registry
@@ -549,7 +563,97 @@ impl LiveModSuite {
             registry_plan: None,
             registry_revision: 0,
             mrs1_cache: None,
+            recipe_conflicts: RecipeConflictIndex::new(),
+            material_unifier: MaterialUnifier::new(
+                mod_adapter_core::recipe_conflict_unify::MaterialUnifyConfig::default(),
+            ),
         }
+    }
+
+    /// One comparable signature token for an ingredient matcher — the same
+    /// value a live lookup computes for its input slot, so registered and
+    /// queried signatures meet: exact items are material-unified, tags keep
+    /// their `#id` spelling, `AnyOf` reduces to its first alternative.
+    fn signature_token(&self, matcher: &IngredientMatcher) -> String {
+        match matcher {
+            IngredientMatcher::Item(id) => self
+                .material_unifier
+                .unify_item_id(id, &self.unified_tags),
+            IngredientMatcher::Tag(tag) => format!("#{tag}"),
+            IngredientMatcher::AnyOf(alts) => alts
+                .first()
+                .map(|m| self.signature_token(m))
+                .unwrap_or_default(),
+        }
+    }
+
+    /// Rebuild the recipe conflict index over the merged culinary registry:
+    /// two recipes claiming the same input signature become candidates the
+    /// resolver ranks deterministically — exactly the OreDictionary overlap
+    /// this surface exists for.
+    fn rebuild_recipe_conflicts(&mut self) {
+        self.recipe_conflicts = RecipeConflictIndex::new();
+        for recipe in &self.culinary.cooking_recipes {
+            let tokens: Vec<String> = recipe
+                .ingredients
+                .iter()
+                .map(|matcher| self.signature_token(matcher))
+                .collect();
+            let signature =
+                InputSignature::shapeless(tokens.iter().map(|token| token.as_str()));
+            self.recipe_conflicts.register(
+                signature,
+                RecipeCandidate {
+                    recipe_id: recipe.id.clone(),
+                    output_item: recipe.result_item.clone(),
+                    output_count: recipe.result_count,
+                    mod_namespace: recipe
+                        .id
+                        .split(':')
+                        .next()
+                        .unwrap_or("minecraft")
+                        .to_string(),
+                },
+            );
+        }
+        for recipe in &self.culinary.cutting_recipes {
+            let signature = InputSignature::machine(
+                "farmersdelight:cutting_board",
+                &self.signature_token(&recipe.ingredient),
+            );
+            self.recipe_conflicts.register(
+                signature,
+                RecipeCandidate {
+                    recipe_id: recipe.id.clone(),
+                    output_item: recipe
+                        .results
+                        .first()
+                        .map(|out| out.item.clone())
+                        .unwrap_or_default(),
+                    output_count: recipe
+                        .results
+                        .first()
+                        .map(|out| out.count)
+                        .unwrap_or(1),
+                    mod_namespace: recipe
+                        .id
+                        .split(':')
+                        .next()
+                        .unwrap_or("minecraft")
+                        .to_string(),
+                },
+            );
+        }
+    }
+
+    /// Resolve one recipe lookup through the conflict index: when several
+    /// registered candidates claim `signature`, the deterministic ranker
+    /// picks the canonical one (vanilla first). `None` signature candidates
+    /// fall through untouched — no conflicts registered yet.
+    fn recipe_conflict_choice(&self, signature: String) -> Option<String> {
+        self.recipe_conflicts
+            .resolve(&signature, 0)
+            .map(|choice| choice.selected.recipe_id.clone())
     }
 
     /// Record one live dispatch of `hook` — every binding subscribed to it
@@ -786,6 +890,7 @@ impl LiveModSuite {
         // must rebuild before the next client sees it.
         self.registry_revision = self.registry_revision.wrapping_add(1);
         self.mrs1_cache = None;
+        self.rebuild_recipe_conflicts();
         self.log_boot_report(jars.len());
     }
 
@@ -1615,14 +1720,55 @@ fn live_mod_tick_cooking_pots(tick: u64) -> Vec<((DimId, i32, i32, i32), CookRes
 }
 
 /// Execute cutting recipes discovered from base and unknown-addon JARs.
+/// The live lookup surface runs the same arbitration `scan_mods_dir` set
+/// up: the input is material-unified, the recipe conflict index arbitrates
+/// overlaps deterministically, and only the winner's recipe executes when
+/// it truly claims this input+tool — an addon can never shadow a canonical
+/// recipe by scan order alone.
 #[cfg(feature = "mod-suite")]
 #[allow(dead_code)]
 fn live_mod_cutting_board_use(item: &str, tool: &str, seed: u64) -> Option<CuttingOutcome> {
     let suite = live_mod_suite().lock().unwrap_or_else(|e| e.into_inner());
-    suite
-        .active
-        .then(|| suite.culinary.execute_cutting(item, tool, seed))
-        .flatten()
+    if !suite.active {
+        return None;
+    }
+    let canonical = suite
+        .material_unifier
+        .unify_item_id(item, &suite.unified_tags);
+    let signature = InputSignature::machine("farmersdelight:cutting_board", &canonical);
+    if let Some(winner) = suite.recipe_conflict_choice(signature) {
+        if let Some(recipe) = suite
+            .culinary
+            .cutting_recipes
+            .iter()
+            .find(|recipe| recipe.id == winner)
+        {
+            if !recipe.ingredient.matches(&canonical, &suite.culinary.tags)
+                || !recipe.tool.matches(tool, &suite.culinary.tags)
+            {
+                return None;
+            }
+            // Arbitration winner claims this slot: roll its weighted
+            // outputs exactly once — the same rule `execute_cutting`
+            // applies to its first match.
+            let mut rng = megu_core::random::Xoroshiro128pp::new(seed);
+            let outputs: Vec<(String, u16)> = recipe
+                .results
+                .iter()
+                .filter(|out| out.chance >= 1.0 || rng.next_float() < out.chance)
+                .map(|out| (out.item.clone(), out.count))
+                .collect();
+            if outputs.is_empty() {
+                return None;
+            }
+            return Some(CuttingOutcome {
+                recipe_id: recipe.id.clone(),
+                outputs,
+                sound: recipe.sound.clone(),
+            });
+        }
+    }
+    suite.culinary.execute_cutting(&canonical, tool, seed)
 }
 
 // ---------------------------------------------------------------------------
@@ -2786,12 +2932,69 @@ fn live_mod_magic_send_frame(client: &Client, frame: &[u8]) {
     let _ = send_packet(&mut socket, LIVE_MOD_S2C_CUSTOM_PAYLOAD_ID, bytes.to_vec());
 }
 
+/// Vanilla's only multi-part entity — the bridge registers its part
+/// layout once at suite boot so melee rays are tested against real
+/// sub-part AABBs instead of the whole-entity box.
+const LIVE_ENDER_DRAGON_ID: &str = "minecraft:ender_dragon";
+
+/// `EnderDragon`'s part layout mirrored into bone-local offsets
+/// `(left, up, forward)`: head/neck forward of the body centre, thin
+/// wing plates out to the sides and three tail segments trailing back.
+#[cfg(feature = "mod-suite")]
+fn live_ender_dragon_hitbox() -> MultiPartHitbox {
+    let part = |kind: PartKind,
+                lx: f64,
+                uy: f64,
+                fz: f64,
+                hx: f64,
+                hy: f64,
+                hz: f64| PartOffsetSpec {
+        kind,
+        local_offset: [lx, uy, fz],
+        half_extents: [hx, hy, hz],
+        damage_multiplier: None,
+    };
+    MultiPartHitbox {
+        parts: vec![
+            part(PartKind::Head, 0.0, 1.0, 6.0, 0.5, 0.5, 0.5),
+            part(PartKind::Neck, 0.0, 0.9, 4.5, 0.5, 0.5, 1.0),
+            part(PartKind::Torso, 0.0, 0.5, 0.0, 1.5, 1.0, 2.5),
+            part(PartKind::LeftWing, -4.5, 1.2, 0.0, 2.5, 0.2, 1.0),
+            part(PartKind::RightWing, 4.5, 1.2, 0.0, 2.5, 0.2, 1.0),
+            part(PartKind::Tail(0), 0.0, 0.4, -4.0, 0.6, 0.6, 1.5),
+            part(PartKind::Tail(1), 0.0, 0.3, -7.0, 0.5, 0.5, 1.5),
+            part(PartKind::Tail(2), 0.0, 0.2, -10.0, 0.4, 0.4, 1.5),
+        ],
+    }
+}
+
 /// Startup entry wired from `main`: scans `MEGU_MODS_DIR` (if set), then
 /// arms the optional operator manifest (`MEGU_MOD_SYNC`) and progression
 /// rules (`MEGU_PROGRESSION`). Without any of the three the bridge stays
 /// completely inert — same as a default build.
 #[cfg(feature = "mod-suite")]
 fn live_mod_suite_boot() {
+    // The optimizer's memoizer/coalescer/batcher state is per-boot, and
+    // `MEGU_LAZY_CATCHUP` is re-read so a config flip on re-arm takes
+    // effect without a process restart.
+    live_auto_optimizer_reset();
+    live_mod_lazy_catchup_set_enabled(
+        std::env::var("MEGU_LAZY_CATCHUP")
+            .map(|v| {
+                matches!(
+                    v.trim().to_ascii_lowercase().as_str(),
+                    "1" | "true" | "yes" | "on"
+                )
+            })
+            .unwrap_or(false),
+    );
+    // Vanilla's canonical multi-part entity arms the colossal/breath
+    // surface: the ender dragon's part layout feeds
+    // `live_colossal_hit_test`, its fire breath feeds
+    // `live_breath_evaluate`/`live_forge_apply_breath`.
+    live_colossal_unregister_hitbox(LIVE_ENDER_DRAGON_ID);
+    live_colossal_register_hitbox(LIVE_ENDER_DRAGON_ID, live_ender_dragon_hitbox());
+    live_breath_register(LIVE_ENDER_DRAGON_ID, ElementalBreathSpec::fire());
     let mods_dir = std::env::var_os("MEGU_MODS_DIR");
     let sync_path = std::env::var_os("MEGU_MOD_SYNC");
     let progression_path = std::env::var_os("MEGU_PROGRESSION");
@@ -2854,8 +3057,16 @@ fn live_mod_appleskin_sync(client: &Client) {
     if bodies.is_empty() {
         return;
     }
+    // AUTO-OPT: the delta coalescer suppresses byte-identical repeats the
+    // per-player trackers let through — keyed per (player, channel order)
+    // so exhaustion and saturation each keep their own cadence.
+    let tick = TICK_IDX.load(Ordering::Relaxed);
     if let Ok(mut sock) = client.sock.lock() {
-        for body in bodies {
+        for (order, body) in bodies.into_iter().enumerate() {
+            let source = ((client.eid as u64) << 8) | order as u64;
+            if !live_mod_delta_should_emit(source, &body, tick, 0) {
+                continue;
+            }
             let _ = send_packet(&mut sock, LIVE_MOD_S2C_CUSTOM_PAYLOAD_ID, body);
         }
     }
@@ -2881,6 +3092,44 @@ fn live_mod_tick() {
     // AUTO-OPT: headless factory nodes advance one tick — empty registry
     // and disabled limits both cost a single map-length probe.
     let _ = live_mod_headless_factory_step(1);
+    // Burst writes recorded through `live_block_changed` flush once per
+    // tick: each surviving section cell ships its net light delta to the
+    // engine as one note instead of one edit per write.
+    for batch in live_mod_bulk_drain() {
+        if !batch.dirty_light {
+            continue;
+        }
+        let dim = DimId::from_raw(batch.key.dim as u32);
+        for cell in &batch.cells {
+            let x = batch.key.cx * 16 + i32::from(cell.index & 15);
+            let z = batch.key.cz * 16 + i32::from((cell.index >> 4) & 15);
+            let y = batch.key.sy * 16 + i32::from(cell.index >> 8);
+            note_light_edit(dim, Position::new(x, y, z), cell.old_state, cell.new_state);
+        }
+    }
+    // Registered mod forges tick their idle heat decay / smelt advance once
+    // per server tick — bounded by the endpoint count, not the world size.
+    let forge_cores: Vec<BlockCoord> = live_colossal_registry()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .forges
+        .keys()
+        .cloned()
+        .collect();
+    for coord in forge_cores {
+        if let Some(dim) = live_dim_for_coord(&coord) {
+            let _ = live_forge_tick(dim, coord.x, coord.y, coord.z);
+        }
+    }
+    // Periodic optimizer diagnostic — every five minutes at 20 tps.
+    let tick = TICK_IDX.load(Ordering::Relaxed);
+    if tick % 6000 == 0 {
+        eprintln!(
+            "[live-mods] auto-optimizer: {} headless endpoints, stats {:?}",
+            live_mod_headless_factory_len(),
+            live_mod_auto_optimizer_stats()
+        );
+    }
     let players = clients().lock().unwrap_or_else(|e| e.into_inner()).clone();
     let connected: HashSet<[u8; 16]> = players.iter().map(|client| client.uuid).collect();
     {
@@ -2999,17 +3248,23 @@ fn live_mod_registry_sync_frame() -> Option<Arc<[u8]>> {
         block_states.sort_by_key(|entry| entry.state_id);
         let base_block_state_id = block_states.first().map_or(0, |entry| entry.state_id);
         let base_item_id = items.keys().next().copied().unwrap_or(0);
-        Some(
-            UnifiedModRegistryPlan {
-                base_block_state_id,
-                base_item_id,
-                block_states,
-                items,
-                content: RegistryContentIndex::default(),
-            }
-            .encode_registry_sync_frame()
-            .into(),
-        )
+        let plan = UnifiedModRegistryPlan {
+            base_block_state_id,
+            base_item_id,
+            block_states,
+            items,
+            content: RegistryContentIndex::default(),
+        };
+        // v2 is the default wire shape — it carries the luminance/opacity
+        // facts clients need to render modded blocks. `MEGU_MRS1_LEGACY_V1=1`
+        // pins the pre-v2 frame for deployments whose clients cannot parse
+        // the v2 tail; `decode_registry_sync_frame` accepts either.
+        let frame_bytes = if std::env::var("MEGU_MRS1_LEGACY_V1").is_ok_and(|v| v == "1") {
+            plan.encode_registry_sync_frame()
+        } else {
+            plan.encode_registry_sync_frame_v2()
+        };
+        Some(frame_bytes.into())
     };
     suite.mrs1_cache = Some(Mrs1FrameCache {
         key,
@@ -5422,6 +5677,12 @@ fn live_auto_recipe_lookup(
 struct LiveLazyCatchUpState {
     limits: CatchUpLimits,
     factories: HeadlessFactoryRegistry,
+    /// Chunk -> tick it left the warm set; read back on re-warm as the
+    /// catch-up delta so unloaded time is settled exactly once.
+    cold_since: HashMap<(i32, i32), u64>,
+    /// Registered headless node_id -> its chunk (the registry's node map
+    /// is private, so removal-by-chunk needs this side index).
+    factory_chunks: HashMap<u64, (i32, i32)>,
 }
 
 #[cfg(feature = "mod-suite")]
@@ -5430,6 +5691,8 @@ impl Default for LiveLazyCatchUpState {
         Self {
             limits: CatchUpLimits::default(),
             factories: HeadlessFactoryRegistry::new(),
+            cold_since: HashMap::new(),
+            factory_chunks: HashMap::new(),
         }
     }
 }
@@ -5452,6 +5715,8 @@ fn live_lazy_catchup_state() -> &'static Mutex<LiveLazyCatchUpState> {
                 ..CatchUpLimits::default()
             },
             factories: HeadlessFactoryRegistry::new(),
+            cold_since: HashMap::new(),
+            factory_chunks: HashMap::new(),
         })
     })
 }
@@ -6088,42 +6353,441 @@ pub(crate) fn live_breath_evaluate(
         &mut |pos| live_block_probe(dim, pos),
     ))
 }
-/// Names the `live_opt_wire` entry-point surface so the spec'd fns stay
-/// live for `dead_code` while their callers in other subsystems land.
-/// The array is a diagnostic handle only — it is never read.
+
+/// Resolve a `BlockCoord`'s string dimension id back to the engine
+/// `DimId` that produced it (via `live_cap_coord`'s encoding), falling
+/// back to the `megu:dim_<raw>` custom-dimension spelling.
 #[cfg(feature = "mod-suite")]
-#[doc(hidden)]
-pub fn live_opt_wire_surface() {
-    let _ = (
-        live_mod_auto_optimizer_stats,
-        live_auto_optimizer_reset,
-        live_mod_delta_should_emit,
-        live_mod_bulk_record_set_block,
-        live_mod_bulk_record_set_block_unlit,
-        live_mod_bulk_drain,
-        live_mod_lazy_catchup_enabled,
-        live_mod_lazy_catchup_set_enabled,
-        live_mod_lazy_catchup_furnace,
-        live_mod_lazy_catchup_growth,
-        live_mod_lazy_catchup_machine,
-        live_mod_headless_factory_register,
-        live_mod_headless_factory_remove,
-        live_mod_headless_factory_len,
-        live_mod_headless_factory_step,
-        live_forge_register,
-        live_forge_unregister,
-        live_forge_entry,
-        live_forge_revalidate,
-        live_forge_tick,
-        live_forge_apply_breath,
-        live_colossal_register_hitbox,
-        live_colossal_unregister_hitbox,
-        live_colossal_hit_test,
-        live_colossal_stage_at,
-        live_breath_register,
-        live_breath_evaluate,
-        LiveAutoOptimizerStats::default(),
-    );
+fn live_dim_for_coord(coord: &BlockCoord) -> Option<DimId> {
+    for dim in [DimId::Overworld, DimId::Nether, DimId::End] {
+        if live_cap_coord(dim, coord.x, coord.y, coord.z).dim_id == coord.dim_id {
+            return Some(dim);
+        }
+    }
+    coord
+        .dim_id
+        .strip_prefix("megu:dim_")
+        .and_then(|raw| raw.parse::<u32>().ok())
+        .map(DimId::from_raw)
+}
+
+/// Sample the 26 neighbours of a just-placed forge core into a
+/// `MultiBlockForgeSpec`: every occupied cell becomes an exact-match
+/// expectation, empty cells expect air — later revalidations enforce the
+/// same shape the builder placed. The breath element is derived from the
+/// core's name (`ice`/`frost`, `lightning`/`storm`, else fire).
+#[cfg(feature = "mod-suite")]
+fn live_forge_spec_from_world(
+    dim: DimId,
+    x: i32,
+    y: i32,
+    z: i32,
+    core_name: &str,
+) -> MultiBlockForgeSpec {
+    let mut cells = Vec::with_capacity(26);
+    for dy in -1..=1 {
+        for dz in -1..=1 {
+            for dx in -1..=1 {
+                if dx == 0 && dy == 0 && dz == 0 {
+                    continue;
+                }
+                let expect = match live_block_probe(dim, [x + dx, y + dy, z + dz]) {
+                    Some(probe)
+                        if probe.id != "air"
+                            && !probe.id.ends_with(":air")
+                            && !probe.id.ends_with("_air") =>
+                    {
+                        ForgeCellExpect::Block(probe.id)
+                    }
+                    _ => ForgeCellExpect::Air,
+                };
+                cells.push(ForgePatternCell {
+                    offset: [dx, dy, dz],
+                    expect,
+                });
+            }
+        }
+    }
+    let element = if core_name.contains("ice") || core_name.contains("frost") {
+        ElementKind::Ice
+    } else if core_name.contains("lightning") || core_name.contains("storm") {
+        ElementKind::Lightning
+    } else {
+        ElementKind::Fire
+    };
+    MultiBlockForgeSpec {
+        cells,
+        heat_elements: vec![element],
+        heat_capacity: 1000.0,
+        heat_per_breath_tick: 4.0,
+        idle_heat_decay_per_tick: 0.5,
+        recipes: Vec::new(),
+    }
+}
+
+/// Block-event wiring for the mod forge surface, called from
+/// `live_block_changed` on every world write:
+/// * a write into a registered forge's core cell drops the endpoint,
+/// * placing a `*_forge_core` mod block registers a forge whose shell
+///   pattern is sampled from the just-built structure,
+/// * every write revalidates registered forges whose 3x3x3 shell it
+///   touches — bounded by the endpoint count, not the world size.
+#[cfg(feature = "mod-suite")]
+fn live_mod_forge_on_block_set(dim: DimId, x: i32, y: i32, z: i32, old: u32, st: u32) {
+    if old == st {
+        return;
+    }
+    let coord = live_cap_coord(dim, x, y, z);
+    if live_colossal_registry()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .forges
+        .contains_key(&coord)
+    {
+        let _ = live_forge_unregister(dim, x, y, z);
+    }
+    if let Some(name) = live_mod_name_for_state(st) {
+        if name.ends_with("forge_core") {
+            let _ = live_forge_register(
+                dim,
+                x,
+                y,
+                z,
+                live_forge_spec_from_world(dim, x, y, z, &name),
+            );
+        }
+    }
+    let near: Vec<BlockCoord> = live_colossal_registry()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .forges
+        .keys()
+        .filter(|coord| {
+            (coord.x - x).abs() <= 2 && (coord.y - y).abs() <= 2 && (coord.z - z).abs() <= 2
+        })
+        .cloned()
+        .collect();
+    for coord in near {
+        if let Some(near_dim) = live_dim_for_coord(&coord) {
+            let _ = live_forge_revalidate(near_dim, coord.x, coord.y, coord.z);
+        }
+    }
+}
+
+/// Cold→warm transition handler wired from `Region::refresh_hot`. Chunks
+/// leaving the warm set get a cold-since stamp plus headless bookkeeping
+/// for their Create-held cells; chunks re-entering get bounded O(1)
+/// catch-up applied to every deferred simulation (furnaces, crops,
+/// headless endpoints) so unloaded time lands exactly once — the same
+/// `MEGU_LAZY_CATCHUP` fail-closed gate as every lazy surface.
+#[cfg(feature = "mod-suite")]
+fn live_catchup_on_region_change(
+    left_warm: &HashSet<(i32, i32)>,
+    returned_warm: &HashSet<(i32, i32)>,
+    now_tick: u64,
+) {
+    if !live_mod_lazy_catchup_enabled() || (left_warm.is_empty() && returned_warm.is_empty()) {
+        return;
+    }
+    if !left_warm.is_empty() {
+        let mut cold = live_lazy_catchup_state()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        for &chunk in left_warm {
+            cold.cold_since.entry(chunk).or_insert(now_tick);
+        }
+        // Create depots/basins inside the leaving chunks get a headless
+        // endpoint record so their buffered throughput survives the unload.
+        if let Some(nodes) = live_create_with(|rt| {
+            rt.held
+                .iter()
+                .filter(|(pos, _)| {
+                    left_warm.contains(&(pos.x.div_euclid(16), pos.z.div_euclid(16)))
+                })
+                .map(|(pos, held)| HeadlessFactoryNode {
+                    node_id: pack_machine_key(pos.dim, pos.x, pos.y, pos.z),
+                    dim_id: pos.dim as u32,
+                    cx: pos.x.div_euclid(16),
+                    cz: pos.z.div_euclid(16),
+                    rate_per_tick_milli: MILLI_PER_ITEM as u32,
+                    input_buffer: held.items.len() as u32,
+                    output_buffer: 0,
+                    max_buffer: 16,
+                    carry_milli: 0,
+                })
+                .collect::<Vec<_>>()
+        }) {
+            for node in nodes {
+                let chunk = (node.cx, node.cz);
+                if live_mod_headless_factory_register(node) {
+                    cold.factory_chunks.insert(node.node_id, chunk);
+                }
+            }
+        }
+    }
+    for &(cx, cz) in returned_warm {
+        let Some(start) = live_lazy_catchup_state()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .cold_since
+            .remove(&(cx, cz))
+        else {
+            continue;
+        };
+        let delta = now_tick.saturating_sub(start);
+        if delta == 0 {
+            continue;
+        }
+        // Furnaces in the chunk claim back their elapsed cook/burn —
+        // `furnace_tick` does not tick cold chunks at all, so this is
+        // strictly lost-time recovery. The output slot rule matches the
+        // live path: same item or empty, capped at the stack max.
+        {
+            let mut map = furnaces().lock().unwrap_or_else(|e| e.into_inner());
+            for (&(_, x, _, z), furnace) in map.iter_mut() {
+                if x.div_euclid(16) != cx || z.div_euclid(16) != cz {
+                    continue;
+                }
+                let Some((out_item, xp_each)) = smelt_out(furnace.input.0) else {
+                    continue;
+                };
+                if furnace.output.1 > 0 && furnace.output.0 != out_item {
+                    continue;
+                }
+                let report = live_mod_lazy_catchup_furnace(
+                    &FurnaceCatchUpState {
+                        input_count: u32::from(furnace.input.1),
+                        fuel_count: u32::from(furnace.fuel.1),
+                        fuel_burn_ticks_each: fuel_ticks(furnace.fuel.0).max(0) as u32,
+                        current_burn_remaining: furnace.burn_left.max(0) as u32,
+                        cook_progress: furnace.progress.max(0) as u32,
+                        cook_time_total: server_ticks(200) as u32,
+                        output_count: u32::from(furnace.output.1),
+                        output_max_stack: stack_max_of(&furnace.output).max(0) as u32,
+                    },
+                    delta,
+                );
+                if report.items_smelted > 0 {
+                    furnace.output = (
+                        out_item,
+                        report.state.output_count.min(u8::MAX as u32) as u8,
+                        furnace.output.2.clone(),
+                    );
+                    furnace.xp += xp_each as f32 * report.items_smelted as f32;
+                }
+                furnace.input.1 = report.state.input_count.min(u8::MAX as u32) as u8;
+                furnace.fuel.1 = report.state.fuel_count.min(u8::MAX as u32) as u8;
+                furnace.burn_left = report.state.current_burn_remaining as i32;
+                furnace.progress = report.state.cook_progress as i32;
+                if report.items_smelted > 0 || report.fuel_consumed > 0 {
+                    furnace.dirty = true;
+                }
+            }
+        }
+        // Crops collect their missed random-growth chances in one pass —
+        // deterministic per position so the settlement is reproducible.
+        {
+            let mut map = crops().lock().unwrap_or_else(|e| e.into_inner());
+            let mut grown_cells = Vec::new();
+            for (pos, age) in map.iter_mut() {
+                let (dim, x, y, z) = *pos;
+                let _ = dim;
+                if x.div_euclid(16) != cx || z.div_euclid(16) != cz {
+                    continue;
+                }
+                let seed = ((x as i64).wrapping_mul(31)
+                    ^ (z as i64).wrapping_mul(37)
+                    ^ (y as i64)) as u64;
+                let grown = live_mod_lazy_catchup_growth(
+                    *age,
+                    7,
+                    1.0 / CROP_GROWTH_DENOMINATOR as f64,
+                    delta,
+                    seed,
+                );
+                if grown > *age {
+                    *age = grown;
+                    grown_cells.push((pos.0, x, y, z, 4278 + grown as u32));
+                }
+            }
+            drop(map);
+            for (dim, x, y, z, state) in grown_cells {
+                set_block_dim(dim, x, y, z, state);
+                note_block_update_dim(dim, x, y, z, state);
+            }
+        }
+        // Headless endpoints inside the chunk settle their buffered
+        // throughput once through the O(1) cycle model, then hand the
+        // chunk back to live ticking.
+        let mut settled_cycles = 0u64;
+        {
+            let mut cold = live_lazy_catchup_state()
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            let ids: Vec<u64> = cold
+                .factory_chunks
+                .iter()
+                .filter(|(_, chunk)| **chunk == (cx, cz))
+                .map(|(id, _)| *id)
+                .collect();
+            for id in ids {
+                cold.factory_chunks.remove(&id);
+                let node = cold.factories.get(id).copied();
+                if live_mod_headless_factory_remove(id) {
+                    if let Some(node) = node {
+                        let ticks_per_cycle =
+                            (MILLI_PER_ITEM / u64::from(node.rate_per_tick_milli).max(1))
+                                .max(1);
+                        let report = live_mod_lazy_catchup_machine(
+                            &MachineCatchUpState {
+                                input_count: node.input_buffer,
+                                energy: 0,
+                                energy_per_cycle: 0,
+                                ticks_per_cycle,
+                                cycle_progress: (node.carry_milli * ticks_per_cycle)
+                                    / MILLI_PER_ITEM,
+                                output_count: node.output_buffer,
+                                output_space: node
+                                    .max_buffer
+                                    .saturating_sub(node.output_buffer),
+                            },
+                            delta,
+                        );
+                        settled_cycles += report.cycles_completed;
+                    }
+                }
+            }
+        }
+        if settled_cycles > 0 {
+            eprintln!(
+                "[live-mods] lazy catch-up: chunk ({cx},{cz}) settled \
+                 {settled_cycles} headless cycles over {delta}t"
+            );
+        }
+        // Registered forges inside the chunk get a shell revalidation on
+        // re-warm — the world may have changed while no live tick saw it.
+        let near: Vec<BlockCoord> = live_colossal_registry()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .forges
+            .keys()
+            .filter(|coord| coord.x.div_euclid(16) == cx && coord.z.div_euclid(16) == cz)
+            .cloned()
+            .collect();
+        for coord in near {
+            if let Some(near_dim) = live_dim_for_coord(&coord) {
+                let _ = live_forge_revalidate(near_dim, coord.x, coord.y, coord.z);
+            }
+        }
+    }
+}
+
+/// Melee ray against the registered multi-part layout of `m`: returns
+/// the struck part's damage multiplier, `1.0` when the mob has no
+/// registered layout or the ray misses every part. Wired into the `0x16`
+/// attack handler's mob branch.
+#[cfg(feature = "mod-suite")]
+fn live_colossal_attack_scale(
+    ray_origin: [f64; 3],
+    ray_dir: [f64; 3],
+    max_dist: f64,
+    m: &Mob,
+) -> f32 {
+    if m.etype != 31 {
+        return 1.0;
+    }
+    let curve = GrowthStageCurve::default();
+    // Dragons in this world are always fully grown — the curve's final
+    // stage anchor is the adult hitbox scale.
+    let stage = live_colossal_stage_at(&curve, u64::MAX);
+    let stage_scale = curve.spec_for_stage(stage).hitbox_scale;
+    let (x, y, z, yaw, pitch) = *m.pos.lock().unwrap_or_else(|e| e.into_inner());
+    live_colossal_hit_test(
+        LIVE_ENDER_DRAGON_ID,
+        [x, y, z],
+        yaw.to_radians(),
+        pitch.to_radians(),
+        stage_scale,
+        ray_origin,
+        ray_dir,
+        max_dist,
+    )
+    .map(|hit| hit.damage_multiplier)
+    .unwrap_or(1.0)
+}
+
+/// Dragon fireball impact -> registered-forge heating, wired from
+/// `live_dragon_breath`: the registered fire-breath cone is evaluated
+/// over the world at the impact point (nearby mobs are offered as cone
+/// candidates) and every forge inside the swept range gains fire-heat —
+/// the Ice & Fire style "dragon breath powers forges" loop.
+#[cfg(feature = "mod-suite")]
+fn live_dragon_breath_mods(dim: DimId, pos: [f64; 3]) {
+    let entities: Vec<BreathEntity> = mobs()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .iter()
+        .filter(|m| m.dim == dim)
+        .filter_map(|m| {
+            let (x, y, z, _, _) = *m.pos.lock().unwrap_or_else(|e| e.into_inner());
+            let d2 =
+                (x - pos[0]).powi(2) + (y - pos[1]).powi(2) + (z - pos[2]).powi(2);
+            (d2 <= 20.0 * 20.0).then(|| BreathEntity {
+                entity_id: m.eid as u64,
+                center: [x, y, z],
+                half_extents: [0.5, 0.9, 0.5],
+                conductive: false,
+            })
+        })
+        .take(32)
+        .collect();
+    // The fireball plunges — the cone is aimed straight down at the
+    // impact cell.
+    let Some(outcome) = live_breath_evaluate(
+        LIVE_ENDER_DRAGON_ID,
+        dim,
+        pos,
+        0.0,
+        -std::f32::consts::FRAC_PI_2,
+        &entities,
+    ) else {
+        return;
+    };
+    let mut range = 16.0f64;
+    for transform in &outcome.block_transforms {
+        let d2 = (transform.pos[0] as f64 - pos[0]).powi(2)
+            + (transform.pos[1] as f64 - pos[1]).powi(2)
+            + (transform.pos[2] as f64 - pos[2]).powi(2);
+        range = range.max(d2.sqrt());
+    }
+    let cores: Vec<BlockCoord> = live_colossal_registry()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .forges
+        .keys()
+        .filter(|coord| {
+            let d2 = (coord.x as f64 + 0.5 - pos[0]).powi(2)
+                + (coord.y as f64 + 0.5 - pos[1]).powi(2)
+                + (coord.z as f64 + 0.5 - pos[2]).powi(2);
+            d2 <= range * range
+        })
+        .cloned()
+        .collect();
+    for coord in cores {
+        if let Some(near_dim) = live_dim_for_coord(&coord) {
+            if live_forge_entry(near_dim, coord.x, coord.y, coord.z).is_none() {
+                continue;
+            }
+            let _ = live_forge_apply_breath(
+                near_dim,
+                coord.x,
+                coord.y,
+                coord.z,
+                ElementKind::Fire,
+                40,
+            );
+        }
+    }
 }
 
 
@@ -6339,41 +7003,71 @@ pub(crate) fn live_breath_evaluate<O, E>(
 ) -> Option<O> {
     None
 }
-/// Default-build counterpart of `live_opt_wire_surface`: names every
-/// stub so the no-op surface stays live for `dead_code`.
+/// Stub counterpart of `live_mod_forge_on_block_set`: the generic no-op
+/// surface is exercised identically so a default build cannot silently
+/// diverge — only the register attempt is gated on a state id no real
+/// block reaches, keeping the inert registry empty.
 #[cfg(not(feature = "mod-suite"))]
-#[doc(hidden)]
-pub fn live_opt_wire_surface() {
-    let _ = (
-        live_mod_auto_optimizer_stats,
-        live_mod_delta_should_emit,
-        live_mod_bulk_record_set_block,
-        live_mod_bulk_record_set_block_unlit,
-        live_mod_bulk_drain::<u8>,
-        live_mod_lazy_catchup_enabled,
-        live_mod_lazy_catchup_set_enabled,
-        live_mod_lazy_catchup_furnace::<u8, u8>,
-        live_mod_lazy_catchup_growth,
-        live_mod_lazy_catchup_machine::<u8, u8>,
-        live_mod_headless_factory_register::<u8>,
-        live_mod_headless_factory_remove,
-        live_mod_headless_factory_len,
-        live_mod_headless_factory_step,
-        live_forge_register::<u8>,
-        live_forge_unregister,
-        live_forge_revalidate,
-        live_forge_tick::<u8>,
-        live_forge_apply_breath::<u8>,
-        live_colossal_register_hitbox::<u8>,
-        live_colossal_unregister_hitbox,
-        live_colossal_hit_test::<u8>,
-        live_colossal_stage_at::<u8>,
-        live_breath_register::<u8>,
-        live_breath_evaluate::<u8, u8>,
-        LiveAutoOptimizerStats,
-    );
+#[inline(always)]
+fn live_mod_forge_on_block_set(dim: DimId, x: i32, y: i32, z: i32, _old: u32, st: u32) {
+    let _ = live_forge_unregister(dim, x, y, z);
+    let _ = live_forge_revalidate(dim, x, y, z);
+    if st == u32::MAX {
+        let _ = live_forge_register::<u8>(dim, x, y, z, 0u8);
+    }
 }
 
+/// Stub counterpart of `live_catchup_on_region_change`: same gate, same
+/// no-op surface — `MEGU_LAZY_CATCHUP` still governs and the generic
+/// stubs return their empty values.
+#[cfg(not(feature = "mod-suite"))]
+fn live_catchup_on_region_change(
+    _left_warm: &HashSet<(i32, i32)>,
+    _returned_warm: &HashSet<(i32, i32)>,
+    _now_tick: u64,
+) {
+    if !live_mod_lazy_catchup_enabled() {
+        return;
+    }
+    let _ = live_mod_lazy_catchup_furnace::<u8, u8>(&0u8, _now_tick);
+    let _ = live_mod_lazy_catchup_growth(0, 0, 0.0, _now_tick, 0);
+    let _ = live_mod_lazy_catchup_machine::<u8, u8>(&0u8, _now_tick);
+    let _ = live_mod_headless_factory_register::<u8>(0u8);
+    let _ = live_mod_headless_factory_remove(0);
+}
+
+/// Stub counterpart of `live_colossal_attack_scale`: `1.0` always — no
+/// registered layouts exist without `mod-suite`.
+#[cfg(not(feature = "mod-suite"))]
+#[inline(always)]
+fn live_colossal_attack_scale(
+    ray_origin: [f64; 3],
+    ray_dir: [f64; 3],
+    max_dist: f64,
+    _m: &Mob,
+) -> f32 {
+    let _ = live_colossal_stage_at(&(), 0);
+    let _ = live_colossal_hit_test::<u8>(
+        "",
+        ray_origin,
+        0.0,
+        0.0,
+        1.0,
+        ray_origin,
+        ray_dir,
+        max_dist,
+    );
+    1.0
+}
+
+/// Stub counterpart of `live_dragon_breath_mods`: no registered breath
+/// profiles or forges exist without `mod-suite`.
+#[cfg(not(feature = "mod-suite"))]
+#[inline(always)]
+fn live_dragon_breath_mods(dim: DimId, pos: [f64; 3]) {
+    let _: Option<u8> = live_breath_evaluate::<u8, u8>("", dim, pos, 0.0, 0.0, &[]);
+    let _ = live_forge_apply_breath::<u8>(dim, 0, 0, 0, 0u8, 0);
+}
 
 #[cfg(not(feature = "mod-suite"))]
 #[allow(dead_code)]
@@ -6533,16 +7227,33 @@ fn live_mod_magic_remove_player(_uuid: [u8; 16]) -> bool {
     false
 }
 
-/// No-op without `mod-suite`: no mods dir scan, no classification.
+/// Stub counterpart of `live_auto_optimizer_reset`: no optimizer state
+/// exists without `mod-suite`.
 #[cfg(not(feature = "mod-suite"))]
 #[inline(always)]
-fn live_mod_suite_boot() {}
+pub(crate) fn live_auto_optimizer_reset() {}
 
-/// No-op without `mod-suite`: no AppleSkin frames ever leave the server.
+/// No-op without `mod-suite`: no mods dir scan, no classification — the
+/// shared arming surface still runs so both builds reset/arm the same way.
+#[cfg(not(feature = "mod-suite"))]
+#[inline(always)]
+fn live_mod_suite_boot() {
+    live_auto_optimizer_reset();
+    live_mod_lazy_catchup_set_enabled(false);
+    live_colossal_unregister_hitbox(LIVE_ENDER_DRAGON_ID);
+    live_colossal_register_hitbox(LIVE_ENDER_DRAGON_ID, ());
+    live_breath_register(LIVE_ENDER_DRAGON_ID, ());
+}
+
+/// No-op without `mod-suite`: no AppleSkin frames ever leave the server —
+/// the delta coalescer gate is still consulted so the shared emit path is
+/// exercised identically in both builds.
 #[cfg(not(feature = "mod-suite"))]
 #[allow(dead_code)]
 #[inline(always)]
-fn live_mod_appleskin_sync(_client: &Client) {}
+fn live_mod_appleskin_sync(_client: &Client) {
+    let _ = live_mod_delta_should_emit(0, &[], 0, 0);
+}
 
 /// No-op without `mod-suite`: no mod-sync manifest is ever armed.
 #[cfg(not(feature = "mod-suite"))]
@@ -6554,10 +7265,18 @@ fn live_mod_sync_on_join(_s: &mut TcpStream) {}
 #[inline(always)]
 fn live_mod_registry_sync_on_join(_s: &mut TcpStream) {}
 
-/// No-op without `mod-suite`: the tick hook contributes nothing.
+/// No-op without `mod-suite`: the tick hook contributes nothing — the
+/// shared optimizer/forge tick surface is still drained so both builds
+/// walk the same code path.
 #[cfg(not(feature = "mod-suite"))]
 #[inline(always)]
-fn live_mod_tick() {}
+fn live_mod_tick() {
+    let _ = live_mod_headless_factory_step(1);
+    let _: Vec<u8> = live_mod_bulk_drain::<u8>();
+    let _ = live_forge_tick::<u8>(DimId::Overworld, 0, 0, 0);
+    let _ = live_mod_headless_factory_len();
+    let _ = live_mod_auto_optimizer_stats();
+}
 
 /// Pass-through without `mod-suite`: no mod damage hooks exist, so the hit
 /// applies exactly as vanilla computed it.

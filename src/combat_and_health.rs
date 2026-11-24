@@ -3949,6 +3949,14 @@ fn apply_blast_slice(
         if st == 0 {
             continue;
         }
+        // Persistent claims: blocks inside a claimed chunk are immune to
+        // every blast source (TNT, creepers, end crystals, respawn
+        // anchors). Skipped cells stay in the world, never drop, and never
+        // chain-prime TNT — matching how blast-immune blocks are simply
+        // absent from the removal set.
+        if !can_explosion_damage_block(dim, base[0], base[2], x, z, None) {
+            continue;
+        }
         // vanilla: TNT destroyed by an explosion primes itself — short fuse
         // (0.5-1.5s), this is what makes chains work
         if (2094..=2095).contains(&st) {

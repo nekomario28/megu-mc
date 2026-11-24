@@ -80,6 +80,21 @@ include!("live_mod_bridge.rs");
 // below call its items unqualified like every other include.
 include!("../server-files/src/directional_shadow.rs");
 
+// `megu:portal_seamless_v1` (`MSP1`) wire codec, mounted from the shared
+// `megu_proto` crate: `seamless_portal.rs` depends only on `crate::wire`, so
+// the two files mount as a self-contained module pair here — the `megu`
+// binary does not link `megu_proto` directly.
+#[allow(dead_code)]
+#[path = "../proto/src/wire.rs"]
+mod wire;
+#[allow(dead_code)]
+#[path = "../proto/src/seamless_portal.rs"]
+mod seamless_portal;
+use seamless_portal::{
+    encode_seamless_portal_packet, SeamlessDimCommit, SeamlessPortalPacket,
+    SEAMLESS_PORTAL_CHANNEL,
+};
+
 // ---------- clients (multiplayer visibility) ----------
 use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU64, AtomicU8, AtomicUsize, Ordering};
 use std::sync::Arc;
@@ -4181,6 +4196,10 @@ fn live_dragon_clouds() -> &'static Mutex<Vec<LiveDragonBreath>> {
 }
 
 fn live_dragon_breath(dim: DimId, pos: [f64; 3]) {
+    // The impact also feeds the mod forge/breath surface: a registered
+    // fire-breath cone evaluated at `pos` heats every forge in range.
+    // No-op when no forge/breath profiles are armed (vanilla path intact).
+    live_dragon_breath_mods(dim, pos);
     let mut clouds = live_dragon_clouds()
         .lock()
         .unwrap_or_else(|e| e.into_inner());
@@ -8834,13 +8853,23 @@ fn refresh_hot() {
     }
     let mut r = region().lock().unwrap_or_else(|e| e.into_inner());
     r.hot = h;
-    r.warm = w;
+    let previous_warm = std::mem::replace(&mut r.warm, w);
     r.sig = Some(HotSig {
         forced: forced_set,
         centers,
         warm_radius,
     });
+    // Chunk membership transitions drive the lazy catch-up surface:
+    // warm→cold chunks stamp a cold-since tick (and park headless
+    // endpoints), cold→warm chunks settle their deferred furnace/crop/
+    // machine time in bounded O(1) work. A no-op unless `MEGU_LAZY_CATCHUP`
+    // opted in — the lock is dropped before the sweep touches world maps.
+    let left_warm: HashSet<(i32, i32)> = previous_warm.difference(&r.warm).copied().collect();
+    let returned_warm: HashSet<(i32, i32)> =
+        r.warm.difference(&previous_warm).copied().collect();
+    drop(r);
     HOT_REBUILDS.fetch_add(1, Ordering::Relaxed);
+    live_catchup_on_region_change(&left_warm, &returned_warm, TICK_IDX.load(Ordering::Relaxed));
 }
 // warm ring: block-level systems tick, entities/projectiles stay frozen —
 // the vanilla lazy-chunk analogue (blocks progress, entities don't). The production paths call
@@ -12447,6 +12476,22 @@ fn with_redstone_origins(work: impl FnOnce()) {
 }
 
 fn live_block_changed(dim: DimId, pos @ RsPos(x, y, z): RsPos, old: u32, new: u32) {
+    // AUTO-OPT: every world write lands in the section batcher — burst
+    // writers flush once per tick via `live_mod_bulk_drain` instead of one
+    // light note per cell. Light-preserving writes take the unlit path so
+    // the drain knows which cells actually need a relight note.
+    if breg()
+        .map(|reg| light_properties(&reg, old) == light_properties(&reg, new))
+        .unwrap_or(false)
+    {
+        live_mod_bulk_record_set_block_unlit(dim, x, y, z, old, new);
+    } else {
+        live_mod_bulk_record_set_block(dim, x, y, z, old, new);
+    }
+    // Mod forge bookkeeping: core writes register/drop endpoints and every
+    // write revalidates the shells it touches — all no-ops on a stock
+    // world with no registered forges.
+    live_mod_forge_on_block_set(dim, x, y, z, old, new);
     if old == new {
         return;
     }
@@ -20138,6 +20183,9 @@ fn flush_live_saves() {
 /// written first (the worker may be mid-write), backups rotate, then the final
 /// overlay files land before the process is allowed to exit.
 fn shutdown_world_save() {
+    // systemd `Type=notify`: STOPPING=1 before the final world flush so the
+    // service manager grants the full save window. No-op off systemd.
+    megu_server_files::sd_notify::notify_stopping();
     if dwal_enabled() {
         dwal_shutdown_save_checkpointed();
         return;
@@ -21408,6 +21456,11 @@ fn main() {
     // operator mod-sync/progression files. Inert unless the feature is built
     // in *and* one of its env vars names a file or directory.
     live_mod_suite_boot();
+    // Claims enforcement self-check: every shared helper must answer `true`
+    // for an operator — a regression would silently deny all interacts.
+    if !live_claims_enforcement_surface() {
+        eprintln!("[megu] WARN: claims enforcement surface self-check failed");
+    }
     // Terrain evaluates `add(final_density, beardifier)` (see `worldgen`), and the
     // structure pipeline owns the starts that feed it. `worldgen` sits below `feature`
     // in `tools/layers_check.sh`, so the edge is a registered function pointer rather
@@ -22604,6 +22657,9 @@ fn main() {
         "offline identities; no Mojang authentication"
     };
     eprintln!("megu v0.6 listening {bind}:{port} ({identity_mode})");
+    // systemd `Type=notify`: READY=1 once the game listener owns its port —
+    // a 0-cost no-op when `$NOTIFY_SOCKET` is absent (non-systemd hosts).
+    megu_server_files::sd_notify::notify_ready();
     let startup_summary = operator_status_summary();
     if resolved_console_mode() == ServerConsoleMode::PlainCli {
         println!("{startup_summary}");

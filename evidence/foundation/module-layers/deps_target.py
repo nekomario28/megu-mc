@@ -10,8 +10,10 @@ import depsgx as d
 layers = [
     ["main"],
     # The wire format is the tree's first consumer: it reads brigadier and nothing else, and
-    # nothing below it may read it back.
-    ["brigadier_wire"],
+    # nothing below it may read it back. `seamless_portal` is the same shape: the
+    # `megu:portal_seamless_v1` (MSP1) codec mounted from `megu_proto`, reading
+    # only the leaf `wire` primitives.
+    ["brigadier_wire", "seamless_portal"],
     ["chest_loot", "java_compat", "landing", "effects", "minecart", "spawner", "tick_persistence", "stream_gen", "tick_workers"],
     ["cached_lookup", "world_rng", "tick_queue", "landing_types", "flowing_fluid", "scheduled_ticks"],
     ["feature", "structure_template"],
@@ -24,13 +26,14 @@ layers = [
     # do not depend on generation or runtime owners. brigadier is a leaf library too: the
     # Brigadier port owns its own reader/tree/dispatcher and references no other crate module.
     ["ingress_guard", "tick_stats", "chunk_ack", "connection_limits", "trace_env",
-     "chunkprof", "lockprof", "loopprof", "tickprof", "brigadier"],
+     "chunkprof", "lockprof", "loopprof", "tickprof", "brigadier", "wire"],
 ]
 modules = [name for layer in layers for name in layer]
 graph = d.ModuleGraph(
     modules=modules,
     depends=[("main", name) for name in modules if name != "main"] + [
         ("brigadier_wire", "brigadier"),
+        ("seamless_portal", "wire"),
         ("chest_loot", "generation_math"),
         ("spawner", "generation_math"), ("spawner", "nbt"),
         ("landing", "java_compat"), ("landing", "landing_types"),

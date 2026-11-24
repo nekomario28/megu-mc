@@ -5,7 +5,8 @@
       "main"
     ],
     [
-      "brigadier_wire"
+      "brigadier_wire",
+      "seamless_portal"
     ],
     [
       "chest_loot",
@@ -67,7 +68,8 @@
       "chunkprof",
       "lockprof",
       "loopprof",
-      "tickprof"
+      "tickprof",
+      "wire"
     ]
   ],
   "explicit_generation_modules": [
@@ -562,6 +564,18 @@
     [
       "spawner",
       "nbt"
+    ],
+    [
+      "main",
+      "seamless_portal"
+    ],
+    [
+      "main",
+      "wire"
+    ],
+    [
+      "seamless_portal",
+      "wire"
     ]
   ],
   "accepted_errors": []
