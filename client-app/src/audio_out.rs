@@ -23,6 +23,8 @@ use std::sync::{mpsc, Arc, Condvar, Mutex, RwLock};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
+use megu_client_mesh::tactile_effects::EnvironmentAudioHint;
+
 use crate::audio_qol::AudioLimiter;
 use crate::protocol::{WireSoundEvent, WireStopSound};
 use crate::session::{AudioStats, OpenAirWorld, PlaySoundEvent, SoundMixer};
@@ -1824,6 +1826,329 @@ fn sound_scalars(
 }
 
 // ---------------------------------------------------------------------------
+// Subtle armor-equipment foley (fully procedural micro-clinks/rustles)
+// ---------------------------------------------------------------------------
+
+/// Vanilla sound-source id for the Players channel. Armor foley is a
+/// first-person body sound, so it is governed by the Players volume
+/// slider in addition to Master.
+pub const SOUND_CATEGORY_PLAYERS: i32 = 7;
+
+/// Base of the caller-assigned `voice_id` space used for foley voices on
+/// the dedicated-mix-thread path — high enough never to collide with
+/// protocol-derived voice ids (irrelevant for the 2D bypass, but kept
+/// stable for acoustic-result bookkeeping).
+const FOLEY_VOICE_ID_BASE: u64 = 0xf01e_0000_0000_0000;
+
+/// Armor family a foley cue is synthesized for. [`ArmorFoleyMaterial::None`]
+/// is the strict silence case: classification of unarmored/unknown pieces,
+/// triggering, and synthesis are all complete no-ops.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum ArmorFoleyMaterial {
+    /// No audible armor — unarmored, elytra, unrecognized materials.
+    #[default]
+    None,
+    /// Soft cloth/leather rustle.
+    Leather,
+    /// Light interlocking-mail jingle.
+    Chainmail,
+    /// Standard dull plate clink.
+    Iron,
+    /// Brighter, higher plate clink.
+    Gold,
+    /// Crisp high metallic tick.
+    Diamond,
+    /// Heavy, low, muted clink.
+    Netherite,
+}
+
+/// Synthesis recipe for one micro-foley cue: low-gain, tens of
+/// milliseconds, no asset file involved. All fields are baked into
+/// [`synthesize_armor_foley_pcm`]; the struct is the inspectable contract.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct ArmorFoleyCue {
+    /// Base loudness in dBFS (`<= 0`), scaled further by trigger intensity.
+    pub gain_db: f32,
+    /// Resonance/band center in Hz.
+    pub center_hz: f32,
+    /// Clip length in milliseconds (`35..=60` for every material).
+    pub duration_ms: u16,
+}
+
+impl ArmorFoleyMaterial {
+    /// Per-material synthesis recipe; `None` yields a zero-length,
+    /// effectively `-inf` cue so synthesis stays strictly silent.
+    pub const fn cue(self) -> ArmorFoleyCue {
+        match self {
+            Self::None => ArmorFoleyCue {
+                gain_db: -120.0,
+                center_hz: 0.0,
+                duration_ms: 0,
+            },
+            Self::Leather => ArmorFoleyCue {
+                gain_db: -34.0,
+                center_hz: 950.0,
+                duration_ms: 60,
+            },
+            Self::Chainmail => ArmorFoleyCue {
+                gain_db: -31.0,
+                center_hz: 5200.0,
+                duration_ms: 48,
+            },
+            Self::Iron => ArmorFoleyCue {
+                gain_db: -28.0,
+                center_hz: 3400.0,
+                duration_ms: 50,
+            },
+            Self::Gold => ArmorFoleyCue {
+                gain_db: -29.0,
+                center_hz: 4200.0,
+                duration_ms: 45,
+            },
+            Self::Diamond => ArmorFoleyCue {
+                gain_db: -27.0,
+                center_hz: 4900.0,
+                duration_ms: 42,
+            },
+            Self::Netherite => ArmorFoleyCue {
+                gain_db: -26.0,
+                center_hz: 2800.0,
+                duration_ms: 55,
+            },
+        }
+    }
+
+    /// Vanilla armor-tier rank used to pick the dominant material when a
+    /// loadout mixes several (`None < Leather < Gold < Chainmail < Iron
+    /// < Diamond < Netherite`).
+    const fn classify_rank(self) -> u8 {
+        match self {
+            Self::None => 0,
+            Self::Leather => 1,
+            Self::Gold => 2,
+            Self::Chainmail => 3,
+            Self::Iron => 4,
+            Self::Diamond => 5,
+            Self::Netherite => 6,
+        }
+    }
+}
+
+/// Item-name suffixes that mark an armor slot piece (head / chest / legs /
+/// feet). Required for classification so `"iron_golem_spawn_egg"` or
+/// `"diamond_pickaxe"` never count as armor.
+const ARMOR_SLOT_SUFFIXES: &[&str] = &[
+    "helmet",
+    "helm",
+    "cap",
+    "hat",
+    "coif",
+    "hood",
+    "mask",
+    "chestplate",
+    "tunic",
+    "vest",
+    "leggings",
+    "pants",
+    "greaves",
+    "trousers",
+    "boots",
+    "sabatons",
+    "shoes",
+];
+
+/// `true` when `name` (an item id path, namespace already stripped) ends
+/// in a recognized armor-slot word, e.g. `"iron_chestplate"`,
+/// `"mail_coif"` or `"steel_greathelm"`. Non-material armor pieces still
+/// classify as [`ArmorFoleyMaterial::None`] downstream.
+fn name_is_armor_piece(name: &str) -> bool {
+    ARMOR_SLOT_SUFFIXES
+        .iter()
+        .any(|suffix| name.ends_with(suffix))
+}
+
+/// Classify a set of equipped armor item ids into the dominant foley
+/// material. Ids may be namespaced (`"minecraft:iron_chestplate"`) or
+/// bare (`"leather_boots"`); an item only counts when its name ends in a
+/// recognized armor-slot word and carries a known material token, so
+/// Mod pieces like `"somemod:steel_chainmail_coif"` still resolve while
+/// unrelated names (`"iron_golem_spawn_egg"`, `"diamond_pickaxe"`,
+/// `"elytra"`) do not. Within one id the material token nearest the slot
+/// word wins; across ids the highest vanilla armor tier wins.
+pub fn classify_armor_foley(equipped_armor_ids: &[&str]) -> ArmorFoleyMaterial {
+    let mut best = ArmorFoleyMaterial::None;
+    for id in equipped_armor_ids {
+        let name = id.rsplit(':').next().unwrap_or(id);
+        if !name_is_armor_piece(name) {
+            continue;
+        }
+        let mut material = ArmorFoleyMaterial::None;
+        for token in name.split('_') {
+            material = match token {
+                t if t.eq_ignore_ascii_case("leather") || t.eq_ignore_ascii_case("hide") => {
+                    ArmorFoleyMaterial::Leather
+                }
+                t if t.eq_ignore_ascii_case("chain")
+                    || t.eq_ignore_ascii_case("chainmail")
+                    || t.eq_ignore_ascii_case("mail") =>
+                {
+                    ArmorFoleyMaterial::Chainmail
+                }
+                t if t.eq_ignore_ascii_case("iron") || t.eq_ignore_ascii_case("steel") => {
+                    ArmorFoleyMaterial::Iron
+                }
+                t if t.eq_ignore_ascii_case("gold") || t.eq_ignore_ascii_case("golden") => {
+                    ArmorFoleyMaterial::Gold
+                }
+                t if t.eq_ignore_ascii_case("diamond") => ArmorFoleyMaterial::Diamond,
+                t if t.eq_ignore_ascii_case("netherite") => ArmorFoleyMaterial::Netherite,
+                _ => material,
+            };
+        }
+        if material.classify_rank() > best.classify_rank() {
+            best = material;
+        }
+    }
+    best
+}
+
+/// Splitmix64 — the deterministic bit source for all foley synthesis;
+/// no `rand` dependency, reproducible across platforms.
+fn foley_next_u64(state: &mut u64) -> u64 {
+    *state = state.wrapping_add(0x9e37_79b9_7f4a_7c15);
+    let mut z = *state;
+    z = (z ^ (z >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
+    z = (z ^ (z >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
+    z ^ (z >> 31)
+}
+
+/// Deterministic `0..=1` draw off the foley bit source.
+fn foley_f01(state: &mut u64) -> f32 {
+    ((foley_next_u64(state) >> 40) & 0x00ff_ffff) as f32 / 16_777_215.0
+}
+
+/// Synthesize one armor-foley cue as mono s16 PCM at `sample_rate`.
+///
+/// * `material`: from [`classify_armor_foley`] — `None` returns an empty
+///   buffer (strict silence, zero work).
+/// * `intensity`: `0..=1` caller estimate of movement speed or landing
+///   impact; scales the cue's gain linearly. `0` (or non-finite) returns
+///   an empty buffer.
+/// * `sample_rate`: output rate; `0` returns an empty buffer, other
+///   values are clamped to `8_000..=192_000`.
+/// * `seed`: deterministic variation — same inputs reproduce the exact
+///   same PCM, different seeds give different phase/transient draws.
+///
+/// Metals render as a short inharmonic-partial clink with a seeded
+/// ±3% detune and a click transient (Chainmail adds a second, lighter
+/// jingle); Leather renders as bandpassed noise rustle under a hump
+/// envelope. The result is peak-normalized to `<= 0.9` full scale so it
+/// can never clip downstream, and is deliberately quiet (`-26..-34` dB
+/// base gain): pure-Rust procedural audio, no Mojang asset required.
+pub fn synthesize_armor_foley_pcm(
+    material: ArmorFoleyMaterial,
+    intensity: f32,
+    sample_rate: u32,
+    seed: u64,
+) -> Vec<i16> {
+    if matches!(material, ArmorFoleyMaterial::None) || sample_rate == 0 {
+        return Vec::new();
+    }
+    let cue = material.cue();
+    let rate = sample_rate.clamp(8_000, 192_000);
+    let intensity = if intensity.is_finite() {
+        intensity.clamp(0.0, 1.0)
+    } else {
+        0.0
+    };
+    if intensity <= 0.0 {
+        return Vec::new();
+    }
+    let n = (usize::from(cue.duration_ms) * rate as usize / 1000).max(1);
+    let rate_f = rate as f32;
+    let mut rng = seed ^ 0x6a09_e667_f3bc_c909;
+    let mut buf = vec![0.0f32; n];
+
+    match material {
+        ArmorFoleyMaterial::Leather => {
+            // Bandpassed noise rustle: the difference between two one-pole
+            // lowpasses behaves like a cheap bandpass around `center_hz`,
+            // under a sin^2 hump envelope with a seeded fabric wobble.
+            let lp_fast = 1.0 - (-TAU_F * cue.center_hz / rate_f).exp();
+            let lp_slow = 1.0 - (-TAU_F * cue.center_hz * 0.20 / rate_f).exp();
+            let wobble = 6.0 + 6.0 * foley_f01(&mut rng);
+            let mut fast = 0.0f32;
+            let mut slow = 0.0f32;
+            for (i, s) in buf.iter_mut().enumerate() {
+                let x = foley_f01(&mut rng) * 2.0 - 1.0;
+                fast += lp_fast * (x - fast);
+                slow += lp_slow * (x - slow);
+                let t = i as f32 / n as f32;
+                let env = PI_F * t;
+                let env = env.sin() * env.sin() * (0.8 + 0.2 * (wobble * t).sin());
+                *s = (fast - slow) * env * 4.0;
+            }
+        }
+        _ => {
+            // Inharmonic plate clink: four decaying partials around
+            // `center_hz` with seeded detune, a fast attack and a short
+            // noise transient at the strike.
+            const RATIOS: [f32; 4] = [1.0, 1.51, 2.42, 3.94];
+            const AMPS: [f32; 4] = [1.0, 0.5, 0.24, 0.11];
+            let dur = n as f32 / rate_f;
+            let mut ratio = [0.0f32; 4];
+            let mut phase = [0.0f32; 4];
+            for k in 0..4 {
+                ratio[k] = RATIOS[k] * (0.97 + 0.06 * foley_f01(&mut rng));
+                phase[k] = foley_f01(&mut rng) * TAU_F;
+            }
+            let echo = matches!(material, ArmorFoleyMaterial::Chainmail);
+            for (i, s) in buf.iter_mut().enumerate() {
+                let t = i as f32 / rate_f;
+                let attack = 1.0 - (-t / 0.0018).exp();
+                let mut v = 0.0f32;
+                for k in 0..4 {
+                    let tau = dur * (0.30 + 0.22 * k as f32);
+                    v += AMPS[k]
+                        * (TAU_F * cue.center_hz * ratio[k] * t + phase[k]).sin()
+                        * (-t / tau).exp();
+                }
+                if echo {
+                    // Mail jingle: a second, lighter clink partway through.
+                    let t2 = t - dur * 0.52;
+                    if t2 > 0.0 {
+                        v += 0.4
+                            * (TAU_F * cue.center_hz * 1.33 * t2 + phase[1]).sin()
+                            * (-t2 / (dur * 0.18)).exp();
+                    }
+                }
+                let trans = if t < 0.002 {
+                    (foley_f01(&mut rng) * 2.0 - 1.0) * 0.12 * (-t / 0.0009).exp()
+                } else {
+                    0.0
+                };
+                *s = (v * attack + trans) * 0.6;
+            }
+        }
+    }
+
+    let lin = 10f32.powf(cue.gain_db / 20.0) * intensity;
+    let peak = buf.iter().fold(0.0f32, |m, s| m.max(s.abs()));
+    let scale = if peak * lin > 0.9 && peak > 0.0 {
+        0.9 / peak
+    } else {
+        lin
+    };
+    buf.iter()
+        .map(|s| ((s * scale).clamp(-1.0, 1.0) * 32_767.0).round() as i16)
+        .collect()
+}
+
+/// `2.0 * PI` as `f32` — local alias so the synth stays terse.
+const TAU_F: f32 = std::f32::consts::TAU;
+const PI_F: f32 = std::f32::consts::PI;
+
+// ---------------------------------------------------------------------------
 // AudioRuntime — the live pipeline inside ProtocolClient
 // ---------------------------------------------------------------------------
 
@@ -1884,6 +2209,9 @@ pub struct AudioRuntime {
     /// command ring (Gate P3), while `pump`/`pump_frames` stay intact for
     /// the synchronous path.
     mix_thread: Option<AudioMixThread>,
+    /// Seed counter feeding [`synthesize_armor_foley_pcm`] — each trigger
+    /// advances it so successive clinks differ while staying reproducible.
+    next_foley_seed: u64,
 }
 
 impl AudioRuntime {
@@ -1954,6 +2282,7 @@ impl AudioRuntime {
             next_ingest_order: 0,
             pending_decode_stops: VecDeque::new(),
             mix_thread: None,
+            next_foley_seed: 0,
         }
     }
 
@@ -2294,6 +2623,75 @@ impl AudioRuntime {
             }
         }
         self.mixer.submit(ev);
+    }
+
+    /// Non-blocking trigger for the procedural armor-equipment micro-foley
+    /// (see [`synthesize_armor_foley_pcm`]). `intensity` is the caller's
+    /// `0..=1` movement-speed/landing-impact estimate; the cue plays on the
+    /// Players channel ([`SOUND_CATEGORY_PLAYERS`]) as a centered 2D voice,
+    /// so Master and Players gains plus the bus limiter all apply — a
+    /// muted session produces silence downstream.
+    ///
+    /// Strictly a no-op — returns `false` without synthesizing — for
+    /// [`ArmorFoleyMaterial::None`], non-positive/non-finite intensity, or
+    /// a zero [`AudioLimiter::max_volume_cap`]. On the dedicated-mix-thread
+    /// path the cue is posted as a `PlayDecoded` ring command instead;
+    /// `false` there means the ring was full.
+    pub fn trigger_armor_foley(&mut self, material: ArmorFoleyMaterial, intensity: f32) -> bool {
+        if matches!(material, ArmorFoleyMaterial::None)
+            || self.mixer.limiter.max_volume_cap() <= 0.0
+        {
+            return false;
+        }
+        let intensity = if intensity.is_finite() {
+            intensity.clamp(0.0, 1.0)
+        } else {
+            0.0
+        };
+        if intensity <= 0.0 {
+            return false;
+        }
+        self.next_foley_seed = self.next_foley_seed.wrapping_add(1);
+        let seed = self.next_foley_seed;
+        let pcm_i16 = synthesize_armor_foley_pcm(material, intensity, MIX_SAMPLE_RATE, seed);
+        if pcm_i16.is_empty() {
+            return false;
+        }
+        let pcm: Vec<f32> = pcm_i16.iter().map(|&s| f32::from(s) / 32_768.0).collect();
+        if self.mix_thread.is_some() {
+            return self.submit_cmd_nonblocking(AudioCmd::PlayDecoded {
+                voice_id: FOLEY_VOICE_ID_BASE + seed,
+                pcm: Arc::new(DecodedPcm::Mono(pcm)),
+                pos: [0.0; 3],
+                entity_id: None,
+                volume: 1.0,
+                pitch: 1.0,
+                attenuation_distance: 0.0,
+                is_2d: true,
+            });
+        }
+        self.submit_play(PlaySoundEvent {
+            label: "megu.armor_foley".to_string(),
+            pcm: Arc::new(pcm),
+            stereo_pcm: None,
+            is_placeholder: false,
+            category: SOUND_CATEGORY_PLAYERS,
+            position: None,
+            entity_id: None,
+            volume: 1.0,
+            pitch: 1.0,
+            seed: seed as i64,
+            max_range_m: f32::INFINITY,
+        });
+        true
+    }
+
+    /// Apply the tactile environment's cave/eaves/underwater acoustic hint
+    /// (from `tactile_effects::compute_environment_audio_hint`) to every
+    /// live and future voice — the synchronous mixer folds it into the
+    /// per-voice reverb send and occlusion loss itself.
+    pub fn set_environment_hint(&mut self, hint: EnvironmentAudioHint) {
+        self.mixer.set_environment_hint(hint);
     }
 
     /// Listener pose update (feet position + optional look angles — `None`
@@ -3879,6 +4277,187 @@ mod tests {
             std::thread::sleep(Duration::from_millis(5));
         }
         assert_eq!(calls.load(Ordering::Relaxed), 2);
+        rt.finish();
+    }
+
+    // ------------------------------------------------------------------
+    // Armor foley
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn classify_armor_foley_picks_highest_tier_present() {
+        assert_eq!(classify_armor_foley(&[]), ArmorFoleyMaterial::None);
+        assert_eq!(
+            classify_armor_foley(&["minecraft:leather_boots", "leather_cap"]),
+            ArmorFoleyMaterial::Leather
+        );
+        assert_eq!(
+            classify_armor_foley(&["chainmail_chestplate"]),
+            ArmorFoleyMaterial::Chainmail
+        );
+        assert_eq!(
+            classify_armor_foley(&["golden_leggings"]),
+            ArmorFoleyMaterial::Gold
+        );
+        // Mixed loadouts resolve to the highest vanilla armor tier.
+        assert_eq!(
+            classify_armor_foley(&[
+                "leather_helmet",
+                "minecraft:iron_chestplate",
+                "leather_boots"
+            ]),
+            ArmorFoleyMaterial::Iron
+        );
+        assert_eq!(
+            classify_armor_foley(&["netherite_boots", "diamond_chestplate"]),
+            ArmorFoleyMaterial::Netherite
+        );
+        assert_eq!(
+            classify_armor_foley(&["iron_helmet", "chainmail_leggings"]),
+            ArmorFoleyMaterial::Iron
+        );
+        // Mod namespaces and compound names still resolve by token.
+        assert_eq!(
+            classify_armor_foley(&["somemod:steel_chainmail_coif"]),
+            ArmorFoleyMaterial::Chainmail
+        );
+        // Non-armor / unknown materials stay silent.
+        assert_eq!(
+            classify_armor_foley(&["turtle_helmet", "elytra", "carved_pumpkin"]),
+            ArmorFoleyMaterial::None
+        );
+        // Token matching: "iron" inside unrelated names does not count.
+        assert_eq!(
+            classify_armor_foley(&["iron_golem_spawn_egg"]),
+            ArmorFoleyMaterial::None
+        );
+    }
+
+    #[test]
+    fn armor_foley_cue_is_quiet_and_in_spec_duration() {
+        for m in [
+            ArmorFoleyMaterial::Leather,
+            ArmorFoleyMaterial::Chainmail,
+            ArmorFoleyMaterial::Iron,
+            ArmorFoleyMaterial::Gold,
+            ArmorFoleyMaterial::Diamond,
+            ArmorFoleyMaterial::Netherite,
+        ] {
+            let cue = m.cue();
+            assert!(cue.gain_db <= -20.0, "foley must stay subtle: {cue:?}");
+            assert!(
+                (35..=60).contains(&cue.duration_ms),
+                "duration out of spec: {cue:?}"
+            );
+            assert!(cue.center_hz > 0.0);
+        }
+        let none = ArmorFoleyMaterial::None.cue();
+        assert_eq!(none.duration_ms, 0);
+    }
+
+    #[test]
+    fn synthesize_armor_foley_pcm_is_silent_for_none_and_zero_intensity() {
+        assert!(synthesize_armor_foley_pcm(ArmorFoleyMaterial::None, 1.0, 48_000, 7).is_empty());
+        for m in [
+            ArmorFoleyMaterial::Iron,
+            ArmorFoleyMaterial::Leather,
+            ArmorFoleyMaterial::Netherite,
+        ] {
+            assert!(synthesize_armor_foley_pcm(m, 0.0, 48_000, 7).is_empty());
+            assert!(synthesize_armor_foley_pcm(m, f32::NAN, 48_000, 7).is_empty());
+            assert!(synthesize_armor_foley_pcm(m, -1.0, 48_000, 7).is_empty());
+            assert!(synthesize_armor_foley_pcm(m, 1.0, 0, 7).is_empty());
+        }
+    }
+
+    #[test]
+    fn synthesize_armor_foley_pcm_is_bounded_finite_and_non_clipping() {
+        for m in [
+            ArmorFoleyMaterial::Iron,
+            ArmorFoleyMaterial::Chainmail,
+            ArmorFoleyMaterial::Leather,
+            ArmorFoleyMaterial::Gold,
+            ArmorFoleyMaterial::Diamond,
+            ArmorFoleyMaterial::Netherite,
+        ] {
+            let pcm = synthesize_armor_foley_pcm(m, 1.0, 48_000, 42);
+            let expected = usize::from(m.cue().duration_ms) * 48;
+            assert_eq!(pcm.len(), expected, "{m:?} length");
+            let peak = pcm.iter().map(|s| s.unsigned_abs()).max().unwrap_or(0);
+            assert!(peak > 0, "{m:?} must not be silent");
+            // ~0.9 full-scale ceiling: no clipping ever.
+            assert!(peak <= 30_000, "{m:?} peak {peak} too hot");
+        }
+    }
+
+    #[test]
+    fn synthesize_armor_foley_pcm_is_deterministic_for_fixed_seed() {
+        let a = synthesize_armor_foley_pcm(ArmorFoleyMaterial::Iron, 0.8, 48_000, 99);
+        let b = synthesize_armor_foley_pcm(ArmorFoleyMaterial::Iron, 0.8, 48_000, 99);
+        assert_eq!(a, b, "same seed must reproduce identical PCM");
+        let c = synthesize_armor_foley_pcm(ArmorFoleyMaterial::Iron, 0.8, 48_000, 100);
+        assert_ne!(a, c, "different seeds should differ");
+        // Intensity scales loudness: half intensity <= full-intensity peak.
+        let loud = synthesize_armor_foley_pcm(ArmorFoleyMaterial::Iron, 1.0, 48_000, 7);
+        let quiet = synthesize_armor_foley_pcm(ArmorFoleyMaterial::Iron, 0.5, 48_000, 7);
+        let peak = |p: &[i16]| p.iter().map(|s| s.unsigned_abs()).max().unwrap_or(0);
+        assert!(peak(&quiet) < peak(&loud));
+    }
+
+    fn foley_runtime(max_volume_cap: f32) -> AudioRuntime {
+        AudioRuntime::new(&AudioSessionConfig {
+            sink: AudioSinkKind::Null,
+            assets_dir: None,
+            asset_index: None,
+            game_dir: None,
+            max_volume_cap,
+            max_concurrent_same_sound: 4,
+            subtitle_path: None,
+            subtitles_to_stderr: false,
+        })
+    }
+
+    #[test]
+    fn trigger_armor_foley_submits_players_channel_voice() {
+        let mut rt = foley_runtime(1.0);
+        assert!(!rt.trigger_armor_foley(ArmorFoleyMaterial::None, 1.0));
+        assert!(!rt.trigger_armor_foley(ArmorFoleyMaterial::Iron, 0.0));
+        assert_eq!(rt.stats().events_submitted, 0);
+
+        assert!(rt.trigger_armor_foley(ArmorFoleyMaterial::Iron, 1.0));
+        rt.pump_frames(64);
+        assert_eq!(rt.stats().events_submitted, 1);
+        assert_eq!(rt.mixer.voice_count(), 1, "the foley voice must be live");
+        let labels = rt.mixer.voice_labels();
+        assert_eq!(labels, ["megu.armor_foley"]);
+        // No position + no entity => 2D bypass voice (centered, no reverb).
+        let debug = rt.mixer.voice_debug();
+        assert_eq!(debug.len(), 1);
+        assert!(!debug[0].4, "foley must not spatialize");
+        rt.finish();
+    }
+
+    #[test]
+    fn trigger_armor_foley_respects_zero_volume_cap() {
+        let mut rt = foley_runtime(0.0);
+        assert!(!rt.trigger_armor_foley(ArmorFoleyMaterial::Netherite, 1.0));
+        rt.pump_frames(64);
+        assert_eq!(rt.stats().events_submitted, 0);
+        rt.finish();
+    }
+
+    #[test]
+    fn set_environment_hint_reaches_the_mixer() {
+        let mut rt = foley_runtime(1.0);
+        assert_eq!(rt.mixer.environment_hint(), EnvironmentAudioHint::default());
+        rt.set_environment_hint(EnvironmentAudioHint {
+            underwater_lowpass: 0.0,
+            cave_reverb_mix: 0.6,
+            rain_eaves_occlusion: 0.4,
+        });
+        let hint = rt.mixer.environment_hint();
+        assert_eq!(hint.cave_reverb_mix, 0.6);
+        assert_eq!(hint.rain_eaves_occlusion, 0.4);
         rt.finish();
     }
 

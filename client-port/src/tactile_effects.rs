@@ -901,12 +901,398 @@ pub fn compute_environment_audio_hint(
 }
 
 // ---------------------------------------------------------------------------
+// Footprints & grass parting
+// ---------------------------------------------------------------------------
+
+/// Ground surface a [`FootprintDecal`] was stamped into. Only soft,
+/// deformable materials keep a visible print — plain stone/wood never
+/// reaches this enum (no decal is recorded for them upstream).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum FootprintSurface {
+    /// Snow layer / snow block: crisp deep print, longest-lived.
+    Snow,
+    /// Regular sand: soft tan print.
+    Sand,
+    /// Red sand (badlands): warm red-tan print.
+    RedSand,
+    /// Soul sand valley floor: dull blue-grey print.
+    SoulSand,
+    /// Mud / muddy mangrove roots: dark wet print.
+    Mud,
+}
+
+impl FootprintSurface {
+    /// Base decal lifetime in seconds before evaporation/fill-in.
+    pub const fn max_age_sec(self) -> f32 {
+        match self {
+            Self::Snow => 14.0,
+            Self::Sand => 9.0,
+            Self::RedSand => 9.0,
+            Self::SoulSand => 10.0,
+            Self::Mud => 11.0,
+        }
+    }
+
+    /// Linear `0..=1` tint for the decal face.
+    pub fn rgb(self) -> [f32; 3] {
+        match self {
+            Self::Snow => [0.88, 0.92, 0.98],
+            Self::Sand => [0.80, 0.72, 0.50],
+            Self::RedSand => [0.70, 0.42, 0.24],
+            Self::SoulSand => [0.38, 0.32, 0.30],
+            Self::Mud => [0.32, 0.26, 0.20],
+        }
+    }
+}
+
+/// One stamped footprint decal. `pos` already carries the alternating
+/// left/right lateral offset applied by [`FootprintTrail::record_step`];
+/// `yaw_rad` is the facing the step was taken in so a renderer can orient
+/// the footprint quad. `alpha()` fades the print in fast and out slowly
+/// and is the only aging signal a renderer needs.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct FootprintDecal {
+    /// World-space decal center (already foot-offset).
+    pub pos: [f32; 3],
+    /// Facing when the step was recorded, radians (vanilla yaw convention:
+    /// `0` faces +Z/south).
+    pub yaw_rad: f32,
+    /// `true` for the left foot's print — alternates each recorded step.
+    pub is_left: bool,
+    /// Surface the print was stamped into.
+    pub surface: FootprintSurface,
+    /// Seconds since the print was recorded (already aged by `tick`).
+    pub age_sec: f32,
+    /// Seconds at which the print is fully gone.
+    pub max_age_sec: f32,
+}
+
+impl FootprintDecal {
+    /// `true` once the print reached the end of its lifetime (a non-finite
+    /// age counts as expired, never as immortal).
+    pub fn expired(&self) -> bool {
+        !self.age_sec.is_finite() || self.age_sec >= self.max_age_sec
+    }
+
+    /// Smooth opacity `0.0..=1.0`: a fast fade-in over the first 5% of
+    /// life, full strength through the middle, then a smoothstep fade-out
+    /// over the last ~45%. Always finite and bounded, even for a zero or
+    /// negative `max_age_sec`.
+    pub fn alpha(&self) -> f32 {
+        if self.max_age_sec <= 0.0 || !self.age_sec.is_finite() {
+            return 0.0;
+        }
+        let t = (self.age_sec / self.max_age_sec).clamp(0.0, 1.0);
+        let fade_in = {
+            let x = (t / 0.05).clamp(0.0, 1.0);
+            x * x * (3.0 - 2.0 * x)
+        };
+        let fade_out = {
+            let x = ((t - 0.55) / 0.45).clamp(0.0, 1.0);
+            1.0 - x * x * (3.0 - 2.0 * x)
+        };
+        (fade_in * fade_out).clamp(0.0, 1.0)
+    }
+}
+
+/// Minimum horizontal distance between two recorded prints, in blocks —
+/// the stride gate that keeps a standing or shuffling player from
+/// spamming decals.
+pub const FOOTPRINT_MIN_STRIDE_BLOCKS: f32 = 0.55;
+/// Lateral distance of each foot's print from the walk axis, in blocks.
+pub const FOOTPRINT_LATERAL_OFFSET: f32 = 0.14;
+/// Snowfall aging multiplier — falling snow fills prints ~3x faster.
+pub const FOOTPRINT_SNOWFALL_AGE_RATE: f32 = 3.0;
+
+/// Bounded ring buffer of [`FootprintDecal`]s — `64`/`96`/`128` slots for
+/// `LowSpec`/`Balanced`/`High`. Allocated once up front: after warm-up
+/// neither `record_step` nor `tick` touches the heap (expiry eviction is
+/// an in-place `retain`, the ring overwrite is a slot assignment).
+#[derive(Clone, Debug)]
+pub struct FootprintTrail {
+    decals: Vec<FootprintDecal>,
+    /// Ring write index used once `decals` is full.
+    head: usize,
+    capacity: usize,
+    /// Last position a print was recorded at — the stride gate anchor.
+    last_step_pos: Option<[f32; 3]>,
+    /// Alternating foot selector: `true` ⇒ next print is the left foot.
+    next_left: bool,
+}
+
+impl FootprintTrail {
+    /// Decal capacity per hardware tier: `LowSpec` 64, `Balanced` 96,
+    /// `High` 128.
+    pub const fn capacity_for_tier(tier: VfxHardwareTier) -> usize {
+        match tier {
+            VfxHardwareTier::LowSpec => 64,
+            VfxHardwareTier::Balanced => 96,
+            VfxHardwareTier::High => 128,
+        }
+    }
+
+    /// Empty trail sized for `tier`; the backing `Vec` is fully allocated
+    /// here so steady-state recording never allocates.
+    pub fn new(tier: VfxHardwareTier) -> Self {
+        let capacity = Self::capacity_for_tier(tier);
+        Self {
+            decals: Vec::with_capacity(capacity),
+            head: 0,
+            capacity,
+            last_step_pos: None,
+            next_left: true,
+        }
+    }
+
+    /// Maximum decals this trail retains.
+    pub const fn capacity(&self) -> usize {
+        self.capacity
+    }
+
+    /// Live decals (unordered — the ring may wrap).
+    pub fn decals(&self) -> &[FootprintDecal] {
+        &self.decals
+    }
+
+    pub fn len(&self) -> usize {
+        self.decals.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.decals.is_empty()
+    }
+
+    /// Drop every print and reset the stride/foot alternation state.
+    pub fn clear(&mut self) {
+        self.decals.clear();
+        self.head = 0;
+        self.last_step_pos = None;
+        self.next_left = true;
+    }
+
+    /// Record one footstep at `pos` facing `yaw_rad` on `surface`.
+    ///
+    /// * Rejects non-finite or far-lands positions and non-finite yaw.
+    /// * The stride gate ignores steps within
+    ///   [`FOOTPRINT_MIN_STRIDE_BLOCKS`] (horizontal distance) of the last
+    ///   recorded print, so standing still never spams decals.
+    /// * Each accepted step alternates the left/right foot and shifts the
+    ///   decal `FOOTPRINT_LATERAL_OFFSET` blocks perpendicular to the
+    ///   facing direction.
+    ///
+    /// When the ring is full the oldest slot is overwritten. Returns
+    /// `true` when a decal was actually recorded.
+    pub fn record_step(&mut self, pos: [f32; 3], yaw_rad: f32, surface: FootprintSurface) -> bool {
+        if !valid_pos(&pos) || !yaw_rad.is_finite() {
+            return false;
+        }
+        if let Some(last) = self.last_step_pos {
+            let dx = pos[0] - last[0];
+            let dz = pos[2] - last[2];
+            if dx * dx + dz * dz < FOOTPRINT_MIN_STRIDE_BLOCKS * FOOTPRINT_MIN_STRIDE_BLOCKS {
+                return false;
+            }
+        }
+        let is_left = self.next_left;
+        self.next_left = !self.next_left;
+        // Vanilla yaw: forward = (-sin yaw, 0, cos yaw); the left hand is
+        // forward rotated +90 deg about +Y = (cos yaw, 0, sin yaw).
+        let side = if is_left { 1.0f32 } else { -1.0f32 };
+        let (sy, cy) = yaw_rad.sin_cos();
+        let decal = FootprintDecal {
+            pos: [
+                pos[0] + cy * FOOTPRINT_LATERAL_OFFSET * side,
+                pos[1],
+                pos[2] + sy * FOOTPRINT_LATERAL_OFFSET * side,
+            ],
+            yaw_rad,
+            is_left,
+            surface,
+            age_sec: 0.0,
+            max_age_sec: surface.max_age_sec(),
+        };
+        if self.decals.len() < self.capacity {
+            self.decals.push(decal);
+        } else {
+            self.decals[self.head] = decal;
+            self.head = (self.head + 1) % self.capacity;
+        }
+        self.last_step_pos = Some(pos);
+        true
+    }
+
+    /// Age every decal by `dt_sec` (clamped to `0..=0.25`) and evict
+    /// expired prints. While `is_snowing` they age
+    /// [`FOOTPRINT_SNOWFALL_AGE_RATE`]x faster — fresh snowfall fills the
+    /// prints back in.
+    pub fn tick(&mut self, dt_sec: f32, is_snowing: bool) {
+        let dt = if dt_sec.is_finite() {
+            dt_sec.clamp(0.0, MAX_DT_SEC)
+        } else {
+            0.0
+        };
+        let rate = if is_snowing {
+            FOOTPRINT_SNOWFALL_AGE_RATE
+        } else {
+            1.0
+        };
+        for d in &mut self.decals {
+            d.age_sec += dt * rate;
+        }
+        let before = self.decals.len();
+        self.decals.retain(|d| !d.expired());
+        if self.decals.len() < before || self.decals.len() < self.capacity {
+            // Slots freed (or never filled): appends take over again, so
+            // restart the ring write head at the front.
+            self.head = 0;
+        }
+    }
+}
+
+/// Maximum entity positions a [`GrassPartingField`] retains — the bend
+/// only matters for the few bodies actually inside the grass.
+pub const GRASS_PARTING_MAX_ENTITIES: usize = 16;
+/// Default radial reach of the parting bend, in blocks.
+pub const GRASS_PARTING_DEFAULT_RADIUS: f32 = 1.1;
+/// Hard cap on the total parting displacement, in blocks.
+pub const GRASS_PARTING_MAX_BEND: f32 = 0.35;
+/// Hard cap on the accepted radius — a hostile caller cannot bend grass
+/// from across the section.
+const GRASS_PARTING_RADIUS_CAP: f32 = 8.0;
+/// Vertical tolerance: entities this many blocks above/below the grass
+/// do not part it (a cave under a meadow stays quiet).
+const GRASS_PARTING_MAX_DY: f32 = 1.6;
+
+/// Compute the lateral displacement applied to one grass tuft at
+/// `grass_pos` by the bodies in `entities`, up to `radius` blocks away.
+///
+/// Each nearby entity contributes a smoothstep-weighted radial push in
+/// the XZ plane pointing away from it (full strength at the entity's
+/// feet, `0` exactly at `radius`); contributions sum and the total is
+/// clamped to [`GRASS_PARTING_MAX_BEND`]. Entities more than
+/// [`GRASS_PARTING_MAX_DY`] blocks above/below the tuft are ignored, as
+/// are non-finite positions; a coincident entity pushes along +X at full
+/// strength so the result is always finite. Pure math — no allocation,
+/// no clock.
+pub fn compute_grass_parting_offset(
+    grass_pos: [f32; 3],
+    entities: &[[f32; 3]],
+    radius: f32,
+) -> [f32; 3] {
+    if !valid_pos(&grass_pos) || !radius.is_finite() || radius <= 0.0 {
+        return [0.0; 3];
+    }
+    let radius = radius.min(GRASS_PARTING_RADIUS_CAP);
+    let mut acc = [0.0f32; 2];
+    for e in entities {
+        if !valid_pos(e) {
+            continue;
+        }
+        if (e[1] - grass_pos[1]).abs() > GRASS_PARTING_MAX_DY {
+            continue;
+        }
+        let dx = grass_pos[0] - e[0];
+        let dz = grass_pos[2] - e[2];
+        let dist = (dx * dx + dz * dz).sqrt();
+        if dist >= radius {
+            continue;
+        }
+        // Smoothstep falloff: 1 at the entity, 0 at the rim.
+        let t = (1.0 - dist / radius).clamp(0.0, 1.0);
+        let w = t * t * (3.0 - 2.0 * t);
+        let (ux, uz) = if dist > 1.0e-6 {
+            (dx / dist, dz / dist)
+        } else {
+            (1.0, 0.0)
+        };
+        acc[0] += ux * w;
+        acc[1] += uz * w;
+    }
+    let mag = (acc[0] * acc[0] + acc[1] * acc[1]).sqrt();
+    if mag > 1.0e-6 {
+        let s = (mag.min(1.0) / mag) * GRASS_PARTING_MAX_BEND;
+        [acc[0] * s, 0.0, acc[1] * s]
+    } else {
+        [0.0; 3]
+    }
+}
+
+/// Bounded set of nearby entity positions driving the grass-parting
+/// bend — at most [`GRASS_PARTING_MAX_ENTITIES`] live at once, stored in
+/// a fixed inline array (zero heap traffic per tick).
+#[derive(Clone, Debug)]
+pub struct GrassPartingField {
+    entities: [[f32; 3]; GRASS_PARTING_MAX_ENTITIES],
+    count: usize,
+}
+
+impl Default for GrassPartingField {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl GrassPartingField {
+    pub const fn new() -> Self {
+        Self {
+            entities: [[0.0; 3]; GRASS_PARTING_MAX_ENTITIES],
+            count: 0,
+        }
+    }
+
+    /// Tracked entity positions (`len <= 16`).
+    pub fn entities(&self) -> &[[f32; 3]] {
+        &self.entities[..self.count]
+    }
+
+    pub const fn len(&self) -> usize {
+        self.count
+    }
+
+    pub const fn is_empty(&self) -> bool {
+        self.count == 0
+    }
+
+    pub fn clear(&mut self) {
+        self.count = 0;
+    }
+
+    /// Track one entity position; `false` when the field is full or the
+    /// position is non-finite/out of bounds.
+    pub fn push(&mut self, pos: [f32; 3]) -> bool {
+        if self.count >= GRASS_PARTING_MAX_ENTITIES || !valid_pos(&pos) {
+            return false;
+        }
+        self.entities[self.count] = pos;
+        self.count += 1;
+        true
+    }
+
+    /// Replace the tracked set, keeping at most
+    /// [`GRASS_PARTING_MAX_ENTITIES`] valid positions.
+    pub fn set_entities(&mut self, entities: &[[f32; 3]]) {
+        self.count = 0;
+        for &pos in entities {
+            if !self.push(pos) && self.count >= GRASS_PARTING_MAX_ENTITIES {
+                break;
+            }
+        }
+    }
+
+    /// Parting offset for a tuft at `grass_pos` with the default radius.
+    pub fn offset(&self, grass_pos: [f32; 3]) -> [f32; 3] {
+        compute_grass_parting_offset(grass_pos, self.entities(), GRASS_PARTING_DEFAULT_RADIUS)
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Simulation
 // ---------------------------------------------------------------------------
 
 /// Retained tactile-effect state: a strictly capped particle `Vec`, the
-/// [`WetnessTracker`] for the followed entity, and the
-/// [`CameraMicroMotionState`]. Construct via [`Self::new`]; every `emit_*`
+/// [`WetnessTracker`] for the followed entity, the
+/// [`CameraMicroMotionState`], a [`FootprintTrail`] and a
+/// [`GrassPartingField`]. Construct via [`Self::new`]; every `emit_*`
 /// method returns how many particles were actually spawned after the
 /// hardware-tier cap.
 #[derive(Clone, Debug)]
@@ -916,6 +1302,11 @@ pub struct TactileEffectsSim {
     particles: Vec<TactileParticle>,
     wetness: WetnessTracker,
     camera: CameraMicroMotionState,
+    footprints: FootprintTrail,
+    grass_parting: GrassPartingField,
+    /// Whether precipitation overhead is snow — footprint decals age
+    /// [`FOOTPRINT_SNOWFALL_AGE_RATE`]x faster while it falls.
+    is_snowing: bool,
     tick_index: u64,
 }
 
@@ -933,6 +1324,9 @@ impl TactileEffectsSim {
             particles: Vec::new(),
             wetness: WetnessTracker::new(),
             camera: CameraMicroMotionState::default(),
+            footprints: FootprintTrail::new(tier),
+            grass_parting: GrassPartingField::new(),
+            is_snowing: false,
             tick_index: 0,
         }
     }
@@ -1003,6 +1397,55 @@ impl TactileEffectsSim {
 
     pub fn camera_mut(&mut self) -> &mut CameraMicroMotionState {
         &mut self.camera
+    }
+
+    /// The bounded footprint decal trail (read-only — drive it through
+    /// [`Self::record_footprint_step`] so the preset/toggle gates apply).
+    pub fn footprints(&self) -> &FootprintTrail {
+        &self.footprints
+    }
+
+    /// Direct trail access for tests/tools that bypass the config gates.
+    pub fn footprints_mut(&mut self) -> &mut FootprintTrail {
+        &mut self.footprints
+    }
+
+    /// The bounded nearby-entity set driving grass parting.
+    pub fn grass_parting(&self) -> &GrassPartingField {
+        &self.grass_parting
+    }
+
+    /// Mutable access so callers can feed nearby entity positions each tick.
+    pub fn grass_parting_mut(&mut self) -> &mut GrassPartingField {
+        &mut self.grass_parting
+    }
+
+    /// `true` while snowfall is aging footprints at
+    /// [`FOOTPRINT_SNOWFALL_AGE_RATE`]x rate.
+    pub const fn is_snowing(&self) -> bool {
+        self.is_snowing
+    }
+
+    /// Flag overhead snowfall for [`FootprintTrail::tick`].
+    pub fn set_snowing(&mut self, is_snowing: bool) {
+        self.is_snowing = is_snowing;
+    }
+
+    /// Record one footstep into the footprint trail. Gated like
+    /// [`Self::emit_footstep_or_landing`]: silent while the preset is
+    /// `Off` or `tree_shake_and_footsteps` is disabled; the stride and
+    /// validity gates inside [`FootprintTrail::record_step`] still apply.
+    /// Returns `true` when a decal was actually stamped.
+    pub fn record_footprint_step(
+        &mut self,
+        pos: [f32; 3],
+        yaw_rad: f32,
+        surface: FootprintSurface,
+    ) -> bool {
+        if !self.effects_on() || !self.config.tree_shake_and_footsteps {
+            return false;
+        }
+        self.footprints.record_step(pos, yaw_rad, surface)
     }
 
     /// `true` while the preset allows new spawns (`Subtle` or `Fancy`).
@@ -1575,6 +2018,7 @@ impl TactileEffectsSim {
             0.0
         };
         self.tick_index = self.tick_index.wrapping_add(1);
+        self.footprints.tick(dt, self.is_snowing);
 
         let mut landed_drips: Vec<[f32; 3]> = Vec::new();
         for p in &mut self.particles {
@@ -1705,5 +2149,315 @@ impl TactileEffectsSim {
                 );
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn active_sim() -> TactileEffectsSim {
+        TactileEffectsSim::new(
+            TactileEffectsConfig {
+                preset: TactilePreset::Subtle,
+                ..TactileEffectsConfig::default()
+            },
+            VfxHardwareTier::Balanced,
+        )
+    }
+
+    // ----- FootprintTrail -------------------------------------------------
+
+    #[test]
+    fn tactile_footprint_stride_gate_blocks_stationary_spam() {
+        let mut trail = FootprintTrail::new(VfxHardwareTier::Balanced);
+        assert!(trail.record_step([0.0, 64.0, 0.0], 0.0, FootprintSurface::Snow));
+        // Same spot, and steps inside 0.55 blocks, add nothing.
+        assert!(!trail.record_step([0.0, 64.0, 0.0], 0.0, FootprintSurface::Snow));
+        assert!(!trail.record_step([0.2, 64.0, 0.0], 0.0, FootprintSurface::Snow));
+        assert!(!trail.record_step([0.0, 64.0, 0.54], 0.0, FootprintSurface::Snow));
+        assert_eq!(trail.len(), 1);
+        // A real stride records the next print and re-anchors the gate.
+        assert!(trail.record_step([0.0, 64.0, 0.8], 0.0, FootprintSurface::Snow));
+        assert_eq!(trail.len(), 2);
+        assert!(!trail.record_step([0.0, 64.0, 1.1], 0.0, FootprintSurface::Snow));
+        assert_eq!(trail.len(), 2);
+    }
+
+    #[test]
+    fn tactile_footprint_feet_alternate_with_mirrored_lateral_offset() {
+        let mut trail = FootprintTrail::new(VfxHardwareTier::Balanced);
+        for i in 0..4 {
+            assert!(trail.record_step([0.0, 64.0, i as f32], 0.0, FootprintSurface::Sand));
+        }
+        let d = trail.decals();
+        assert!(d[0].is_left);
+        assert!(!d[1].is_left);
+        assert!(d[2].is_left);
+        assert!(!d[3].is_left);
+        // Facing +Z (yaw 0): left hand is +X, so the left print sits at
+        // +0.14 and the right at -0.14, both exactly on the walk axis in Z.
+        assert!((d[0].pos[0] - FOOTPRINT_LATERAL_OFFSET).abs() < 1e-6);
+        assert!((d[1].pos[0] + FOOTPRINT_LATERAL_OFFSET).abs() < 1e-6);
+        assert!((d[0].pos[2] - 0.0).abs() < 1e-6);
+        assert!((d[1].pos[2] - 1.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn tactile_footprint_rejects_invalid_input() {
+        let mut trail = FootprintTrail::new(VfxHardwareTier::Balanced);
+        assert!(!trail.record_step([f32::NAN, 0.0, 0.0], 0.0, FootprintSurface::Mud));
+        assert!(!trail.record_step([40_000_000.0, 0.0, 0.0], 0.0, FootprintSurface::Mud));
+        assert!(!trail.record_step([0.0, 0.0, 0.0], f32::INFINITY, FootprintSurface::Mud));
+        assert!(trail.is_empty());
+    }
+
+    #[test]
+    fn tactile_footprint_snowfall_ages_three_times_faster() {
+        let mut dry = FootprintTrail::new(VfxHardwareTier::Balanced);
+        let mut snowy = FootprintTrail::new(VfxHardwareTier::Balanced);
+        for t in [&mut dry, &mut snowy] {
+            assert!(t.record_step([0.0, 64.0, 0.0], 0.0, FootprintSurface::Snow));
+        }
+        dry.tick(0.10, false);
+        snowy.tick(0.10, true);
+        let dry_age = dry.decals()[0].age_sec;
+        let snow_age = snowy.decals()[0].age_sec;
+        assert!((snow_age - dry_age * FOOTPRINT_SNOWFALL_AGE_RATE).abs() < 1e-6);
+        // Snow prints live 14 s: at 3x rate the snowy copy expires while
+        // the dry one is only partway through its fade-out.
+        for _ in 0..32 {
+            dry.tick(0.25, false);
+            snowy.tick(0.25, true);
+        }
+        assert!(snowy.is_empty(), "snowfall must fill prints in fast");
+        assert!(!dry.is_empty(), "the dry print is still fading");
+        let a = dry.decals()[0].alpha();
+        assert!(a < 1.0 && a > 0.0, "dry print mid-fade, alpha={a}");
+    }
+
+    #[test]
+    fn tactile_footprint_expired_decals_evict_cleanly() {
+        let mut trail = FootprintTrail::new(VfxHardwareTier::Balanced);
+        assert!(trail.record_step([0.0, 64.0, 0.0], 0.0, FootprintSurface::Sand));
+        // Sand lives 9 s; dt clamps at 0.25 so tick past the whole life.
+        for _ in 0..50 {
+            trail.tick(1.0, false);
+        }
+        assert!(trail.is_empty());
+        // The trail still records afterwards — eviction resets cleanly.
+        assert!(trail.record_step([0.0, 64.0, 2.0], 0.0, FootprintSurface::Sand));
+        assert_eq!(trail.len(), 1);
+    }
+
+    #[test]
+    fn tactile_footprint_ring_stays_bounded_and_overwrites_oldest() {
+        let mut trail = FootprintTrail::new(VfxHardwareTier::LowSpec);
+        let cap = trail.capacity();
+        assert_eq!(cap, 64);
+        for i in 0..cap + 8 {
+            assert!(trail.record_step([i as f32, 64.0, 0.0], 0.0, FootprintSurface::Snow));
+        }
+        assert_eq!(trail.len(), cap);
+        // The first 8 prints were overwritten by the ring.
+        let min_x = trail
+            .decals()
+            .iter()
+            .map(|d| d.pos[0])
+            .fold(f32::INFINITY, f32::min);
+        assert!(min_x > 4.0, "oldest prints must be evicted, min_x={min_x}");
+        // Recording past the cap keeps working without growth.
+        assert!(trail.record_step([1000.0, 64.0, 0.0], 0.0, FootprintSurface::Snow));
+        assert_eq!(trail.len(), cap);
+    }
+
+    #[test]
+    fn tactile_footprint_alpha_is_smooth_and_bounded() {
+        let mut d = FootprintDecal {
+            pos: [0.0; 3],
+            yaw_rad: 0.0,
+            is_left: true,
+            surface: FootprintSurface::Snow,
+            age_sec: 0.0,
+            max_age_sec: 10.0,
+        };
+        assert_eq!(d.alpha(), 0.0);
+        let mut prev = 0.0f32;
+        // Fade-in rises monotonically to 1.
+        for i in 1..=10 {
+            d.age_sec = i as f32 * 0.05;
+            let a = d.alpha();
+            assert!((0.0..=1.0).contains(&a));
+            assert!(a >= prev, "fade-in must be monotonic: {prev} -> {a}");
+            prev = a;
+        }
+        assert_eq!(prev, 1.0);
+        // Mid-life holds full strength.
+        d.age_sec = 5.0;
+        assert_eq!(d.alpha(), 1.0);
+        // Fade-out descends to 0 at expiry.
+        d.age_sec = 8.0;
+        let mid = d.alpha();
+        assert!(mid < 1.0 && mid > 0.0);
+        d.age_sec = 10.0;
+        assert_eq!(d.alpha(), 0.0);
+        // Degenerate inputs stay finite and bounded.
+        d.max_age_sec = 0.0;
+        d.age_sec = 0.0;
+        assert_eq!(d.alpha(), 0.0);
+        d.max_age_sec = -1.0;
+        assert_eq!(d.alpha(), 0.0);
+        d.max_age_sec = 10.0;
+        d.age_sec = f32::NAN;
+        assert_eq!(d.alpha(), 0.0);
+    }
+
+    // ----- Grass parting ---------------------------------------------------
+
+    #[test]
+    fn tactile_grass_parting_pushes_radially_away() {
+        let grass = [0.0, 64.0, 0.0];
+        // Entity south of the tuft: the bend must point north (+Z... no,
+        // grass minus entity = +Z is wrong: entity at z=-0.5 means the
+        // tuft is pushed away toward +Z).
+        let off = compute_grass_parting_offset(grass, &[[0.0, 64.0, -0.5]], 1.1);
+        assert!(off[2] > 0.0, "must push away from the entity: {off:?}");
+        assert!((off[0]).abs() < 1e-6);
+        assert_eq!(off[1], 0.0, "parting is horizontal only");
+        let mag = (off[0] * off[0] + off[2] * off[2]).sqrt();
+        assert!(mag <= GRASS_PARTING_MAX_BEND + 1e-6);
+        // Mirrored entity mirrors the push.
+        let off2 = compute_grass_parting_offset(grass, &[[0.0, 64.0, 0.5]], 1.1);
+        assert!(off2[2] < 0.0);
+        assert!((off[2] + off2[2]).abs() < 1e-6);
+    }
+
+    #[test]
+    fn tactile_grass_parting_falls_off_and_zeroes_outside_radius() {
+        let grass = [0.0, 64.0, 0.0];
+        let entity = [0.6, 64.0, 0.0];
+        let near = compute_grass_parting_offset(grass, &[entity], 1.1);
+        let far = compute_grass_parting_offset(grass, &[[1.0, 64.0, 0.0]], 1.1);
+        let mag = |o: [f32; 3]| (o[0] * o[0] + o[2] * o[2]).sqrt();
+        assert!(mag(near) > mag(far), "closer entities must bend more");
+        // At and beyond the radius: exactly nothing.
+        assert_eq!(
+            compute_grass_parting_offset(grass, &[[1.1, 64.0, 0.0]], 1.1),
+            [0.0; 3]
+        );
+        assert_eq!(
+            compute_grass_parting_offset(grass, &[[5.0, 64.0, 0.0]], 1.1),
+            [0.0; 3]
+        );
+        // Vertical separation beyond the gate also bends nothing.
+        assert_eq!(
+            compute_grass_parting_offset(grass, &[[0.0, 70.0, 0.0]], 1.1),
+            [0.0; 3]
+        );
+    }
+
+    #[test]
+    fn tactile_grass_parting_is_bounded_under_a_mob_cluster() {
+        let grass = [0.0, 64.0, 0.0];
+        // Sixteen entities piled on top of the tuft cannot exceed the cap.
+        let entities: Vec<[f32; 3]> = (0..16).map(|i| [0.01 * i as f32, 64.0, 0.0]).collect();
+        let off = compute_grass_parting_offset(grass, &entities, 1.1);
+        let mag = (off[0] * off[0] + off[2] * off[2]).sqrt();
+        assert!(mag <= GRASS_PARTING_MAX_BEND + 1e-6, "mag={mag}");
+        assert!(off.iter().all(|c| c.is_finite()));
+    }
+
+    #[test]
+    fn tactile_grass_parting_survives_nan_and_coincident_inputs() {
+        let grass = [0.0, 64.0, 0.0];
+        // Coincident entity: finite, bounded, deterministic fallback dir.
+        let off = compute_grass_parting_offset(grass, &[grass], 1.1);
+        assert!(off.iter().all(|c| c.is_finite()));
+        assert!((off[0] - GRASS_PARTING_MAX_BEND).abs() < 1e-6);
+        // NaN/Inf entities are skipped, NaN grass and bad radii yield zero.
+        let bad = [f32::NAN, 64.0, 0.0];
+        assert!(
+            compute_grass_parting_offset(grass, &[bad, [0.5, 64.0, 0.0]], 1.1)
+                .iter()
+                .all(|c| c.is_finite())
+        );
+        assert_eq!(
+            compute_grass_parting_offset(bad, &[[0.5, 64.0, 0.0]], 1.1),
+            [0.0; 3]
+        );
+        assert_eq!(
+            compute_grass_parting_offset(grass, &[[0.5, 64.0, 0.0]], 0.0),
+            [0.0; 3]
+        );
+        assert_eq!(
+            compute_grass_parting_offset(grass, &[[0.5, 64.0, 0.0]], f32::NAN),
+            [0.0; 3]
+        );
+        assert_eq!(
+            compute_grass_parting_offset(grass, &[[0.5, 64.0, 0.0]], -2.0),
+            [0.0; 3]
+        );
+    }
+
+    #[test]
+    fn tactile_grass_parting_field_bounds_at_sixteen() {
+        let mut field = GrassPartingField::new();
+        for i in 0..20 {
+            let ok = field.push([i as f32, 64.0, 0.0]);
+            assert_eq!(ok, i < GRASS_PARTING_MAX_ENTITIES);
+        }
+        assert_eq!(field.len(), GRASS_PARTING_MAX_ENTITIES);
+        // NaN positions are refused.
+        assert!(!field.push([f32::NAN, 0.0, 0.0]));
+        field.clear();
+        assert!(field.is_empty());
+        // set_entities keeps only valid entries up to the cap.
+        field.set_entities(&[
+            [0.0, 64.0, 0.0],
+            [f32::INFINITY, 0.0, 0.0],
+            [1.0, 64.0, 0.0],
+        ]);
+        assert_eq!(field.len(), 2);
+        let off = field.offset([0.5, 64.0, 0.5]);
+        assert!(off.iter().all(|c| c.is_finite()));
+    }
+
+    // ----- Sim integration -------------------------------------------------
+
+    #[test]
+    fn tactile_sim_footprint_drive_respects_preset_and_toggle() {
+        // Off preset: nothing records.
+        let mut sim = TactileEffectsSim::default();
+        assert!(!sim.record_footprint_step([0.0, 64.0, 0.0], 0.0, FootprintSurface::Snow));
+        assert!(sim.footprints().is_empty());
+
+        let mut sim = active_sim();
+        assert!(sim.record_footprint_step([0.0, 64.0, 0.0], 0.0, FootprintSurface::Snow));
+        assert_eq!(sim.footprints().len(), 1);
+
+        // Toggling the feature off stops new prints; existing ones still age.
+        let mut cfg = sim.config().clone();
+        cfg.tree_shake_and_footsteps = false;
+        sim.set_config(cfg);
+        assert!(!sim.record_footprint_step([0.0, 64.0, 1.0], 0.0, FootprintSurface::Snow));
+        assert_eq!(sim.footprints().len(), 1);
+    }
+
+    #[test]
+    fn tactile_sim_step_ages_footprints_with_snowfall_flag() {
+        let mut sim = active_sim();
+        assert!(sim.record_footprint_step([0.0, 64.0, 0.0], 0.0, FootprintSurface::Snow));
+        assert!(!sim.is_snowing());
+        sim.set_snowing(true);
+        sim.step(0.1);
+        let age = sim.footprints().decals()[0].age_sec;
+        assert!(
+            (age - 0.1 * FOOTPRINT_SNOWFALL_AGE_RATE).abs() < 1e-6,
+            "step must age prints at the snowfall rate, got {age}"
+        );
+        sim.set_snowing(false);
+        sim.step(0.1);
+        let age2 = sim.footprints().decals()[0].age_sec;
+        assert!((age2 - age - 0.1).abs() < 1e-6);
     }
 }
