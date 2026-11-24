@@ -44,5 +44,6 @@ pub mod mod_i18n;
 pub mod mod_menu;
 pub mod recipe_browser;
 pub mod shader_screen;
+pub mod sign_and_chat;
 pub mod state;
 pub mod subtitle_hud;
