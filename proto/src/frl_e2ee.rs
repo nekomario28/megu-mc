@@ -1161,18 +1161,6 @@ impl FriendAllowlist {
     }
 }
 
-/// IEEE CRC32 over `data` — the `megu-id:` checksum.
-fn crc32(data: &[u8]) -> u32 {
-    let mut crc = 0xFFFF_FFFFu32;
-    for &b in data {
-        crc ^= u32::from(b);
-        for _ in 0..8 {
-            crc = (crc >> 1) ^ (0xEDB8_8320 & 0u32.wrapping_sub(crc & 1));
-        }
-    }
-    !crc
-}
-
 /// Crockford Base32 — the same alphabet the invite codes use.
 const FRIEND_B32: &[u8; 32] = b"0123456789ABCDEFGHJKMNPQRSTVWXYZ";
 
@@ -1235,7 +1223,7 @@ fn b32_decode(text: &str) -> Option<Vec<u8>> {
 pub fn format_friend_id(static_pk: &[u8; 32]) -> String {
     let mut data = [0u8; 36];
     data[..32].copy_from_slice(static_pk);
-    data[32..].copy_from_slice(&crc32(static_pk).to_be_bytes());
+    data[32..].copy_from_slice(&megu_core::hash::crc32_ieee(static_pk).to_be_bytes());
     format!("megu-id:{}", b32_encode(&data))
 }
 
@@ -1265,7 +1253,7 @@ pub fn parse_friend_id(text: &str) -> Result<[u8; 32], E2eeError> {
     }
     let pk: [u8; 32] = data[..32].try_into().unwrap();
     let got = u32::from_be_bytes(data[32..].try_into().unwrap());
-    if got != crc32(&pk) {
+    if got != megu_core::hash::crc32_ieee(&pk) {
         return Err(E2eeError::BadFriendId);
     }
     Ok(pk)
@@ -1716,7 +1704,7 @@ mod tests {
     #[test]
     fn crc32_known_value() {
         // IEEE CRC32 of "123456789" is the textbook 0xCBF43926.
-        assert_eq!(crc32(b"123456789"), 0xCBF4_3926);
+        assert_eq!(megu_core::hash::crc32_ieee(b"123456789"), 0xCBF4_3926);
     }
 
     #[test]
