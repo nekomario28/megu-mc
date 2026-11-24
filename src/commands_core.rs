@@ -5714,7 +5714,7 @@ fn command_usage(name: &str) -> String {
         "locate" => "/locate structure|biome|poi <id>",
         "loot" => "/loot spawn|give|insert|replace <target> <source>",
         "me" => "/me <action>",
-        "megu" => "/megu policy list|get <key>|set <key> <value>|reset|audit [player] [radius]|rollback <player> <radius> [max_blocks]|claim here|unclaim|trust <player>|untrust <player>|info|admin-unclaim|spawn-radius <n>|backup plan|status|metrics|mod add|remove|list|snapshot|restart|shadowlight [on|off|status]",
+        "megu" => "/megu policy list|get <key>|set <key> <value>|reset|audit [player] [radius]|rollback <player> <radius> [max_blocks]|claim here|unclaim|trust <player>|untrust <player>|info|admin-unclaim|spawn-radius <n>|backup plan|status|metrics|mod add|remove|list|snapshot|restart|shadowlight [on|off|status]|lazycatchup [on|off|status]",
         "msg" | "tell" | "w" => "/msg <player> <message>",
         "op" => "/op <player>",
         "pardon" => "/pardon <player>",
@@ -8432,8 +8432,36 @@ fn run_megu_shadowlight_command(args: &[&str]) -> String {
     }
 }
 
+/// `/megu lazycatchup [on|off|status]` — the live operator toggle for the
+/// O(1) unloaded-chunk catch-up lane (furnaces, crops, headless factories
+/// tick while their chunk stays unloaded). It flips the `server_config`
+/// atomic the probes read, so no reboot is needed; OFF restores strict
+/// Vanilla 1.21.1 unloaded-chunk behavior. Bare `/megu lazycatchup`
+/// reports the current state.
+fn run_megu_lazycatchup_command(args: &[&str]) -> String {
+    match args.first().copied().unwrap_or("status") {
+        "on" | "true" => {
+            lazy_catchup_set(true);
+            "Unloaded chunk catch-up (furnaces, crops, headless factories) ENABLED".into()
+        }
+        "off" | "false" => {
+            lazy_catchup_set(false);
+            "Unloaded chunk catch-up (furnaces, crops, headless factories) DISABLED (strict Vanilla)".into()
+        }
+        "status" => format!(
+            "Unloaded chunk catch-up (furnaces, crops, headless factories) is {}",
+            if lazy_catchup_enabled() {
+                "enabled"
+            } else {
+                "disabled"
+            }
+        ),
+        other => format!("unknown lazycatchup argument '{other}'; usage: /megu lazycatchup [on|off|status]"),
+    }
+}
+
 /// The OPS-ADMIN-BUILTIN `/megu` root with the ADMIN-WIRE subcommands wired in:
-/// `mod`, `status`, `snapshot`, `restart`, `shadowlight`. A Survival Moderator
+/// `mod`, `status`, `snapshot`, `restart`, `shadowlight`, `lazycatchup`. A Survival Moderator
 /// (level < 4) reaches only the read-only `audit` and `status` its allowlist
 /// granted.
 fn run_megu_command_admin_wired(
@@ -8456,6 +8484,12 @@ fn run_megu_command_admin_wired(
                 return P8C_DENIED.into();
             }
             run_megu_shadowlight_command(&args[1..])
+        }
+        Some("lazycatchup") | Some("catchup") => {
+            if level < 4 {
+                return P8C_DENIED.into();
+            }
+            run_megu_lazycatchup_command(&args[1..])
         }
         Some("status") => {
             if level < 4 {
@@ -12335,6 +12369,39 @@ mod admin_wire_tests {
         assert!(reply.contains("is disabled"), "{reply}");
 
         directional_shadow_light_set(prior);
+    }
+
+    /// `/megu lazycatchup` (and its `catchup` alias) flips the live
+    /// unloaded-chunk catch-up atomic and restores the boot value
+    /// afterwards.
+    #[test]
+    fn megu_lazycatchup_toggles_and_reports() {
+        let _guard = world_guard();
+        let prior = lazy_catchup_enabled();
+        let ctx = aw_ctx(None);
+
+        let reply = run_command_ctx(&ctx, "/megu lazycatchup on", &mut None);
+        assert!(reply.contains("ENABLED"), "{reply}");
+        assert!(lazy_catchup_enabled());
+
+        let reply = run_command_ctx(&ctx, "/megu lazycatchup true", &mut None);
+        assert!(reply.contains("ENABLED"), "{reply}");
+        assert!(lazy_catchup_enabled());
+
+        let reply = run_command_ctx(&ctx, "/megu catchup status", &mut None);
+        assert!(reply.contains("is enabled"), "{reply}");
+
+        let reply = run_command_ctx(&ctx, "/megu lazycatchup off", &mut None);
+        assert!(reply.contains("DISABLED"), "{reply}");
+        assert!(!lazy_catchup_enabled());
+
+        let reply = run_command_ctx(&ctx, "/megu lazycatchup false", &mut None);
+        assert!(reply.contains("DISABLED"), "{reply}");
+
+        let reply = run_command_ctx(&ctx, "/megu lazycatchup", &mut None);
+        assert!(reply.contains("is disabled"), "{reply}");
+
+        lazy_catchup_set(prior);
     }
 
     /// `/op` writes Vanilla `ops.json` object entries honoring

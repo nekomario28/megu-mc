@@ -2455,6 +2455,13 @@ impl GpuApp {
             "MEGU_DIRECTIONAL_SHADOW_LIGHT",
             directional_shadow_light_env_value(settings.directional_shadow_gameplay),
         );
+        // Same spawn path for the opt-in unloaded-chunk catch-up lane:
+        // `MEGU_LAZY_CATCHUP` reaches `server_config_boot` through the
+        // inherited environment.
+        std::env::set_var(
+            "MEGU_LAZY_CATCHUP",
+            lazy_catchup_env_value(settings.lazy_catchup_gameplay),
+        );
         integrated::launch(&cli)
     }
 
@@ -6164,6 +6171,7 @@ fn apply_client_settings_to_ui(src: &ClientSettings, ui: &mut UiSettings) {
     ui.video.enchantment_glint = src.enchantment_glint;
     ui.video.indirect_light_bounce = src.indirect_light_bounce;
     ui.video.directional_shadow_gameplay = src.directional_shadow_gameplay;
+    ui.video.lazy_catchup_gameplay = src.lazy_catchup_gameplay;
     ui.audio.master = src.volume_master;
     ui.audio.music = src.volume_music;
     ui.audio.blocks = src.volume_blocks;
@@ -6203,6 +6211,13 @@ fn apply_client_settings_to_ui(src: &ClientSettings, ui: &mut UiSettings) {
 /// `1/true/yes/on` alphabet, but the env pair stays canonical `"1"` /
 /// `"0"` like the other boot switches.
 fn directional_shadow_light_env_value(on: bool) -> &'static str {
+    if on { "1" } else { "0" }
+}
+
+/// `MEGU_LAZY_CATCHUP` value for the integrated/hosted server spawn —
+/// the same canonical `"1"` / `"0"` pair the server-side `ops_bool_str`
+/// reader resolves.
+fn lazy_catchup_env_value(on: bool) -> &'static str {
     if on { "1" } else { "0" }
 }
 
@@ -6358,6 +6373,7 @@ fn ui_to_client_settings(ui: &UiSettings, base: &ClientSettings) -> ClientSettin
     out.enchantment_glint = ui.video.enchantment_glint;
     out.indirect_light_bounce = ui.video.indirect_light_bounce;
     out.directional_shadow_gameplay = ui.video.directional_shadow_gameplay;
+    out.lazy_catchup_gameplay = ui.video.lazy_catchup_gameplay;
     out.volume_master = ui.audio.master;
     out.volume_music = ui.audio.music;
     out.volume_blocks = ui.audio.blocks;
@@ -8658,6 +8674,7 @@ mod tests {
             enchantment_glint: false,
             indirect_light_bounce: false,
             directional_shadow_gameplay: true,
+            lazy_catchup_gameplay: true,
             ..ClientSettings::default()
         };
 
@@ -8668,18 +8685,21 @@ mod tests {
         assert!(!ui.video.enchantment_glint);
         assert!(!ui.video.indirect_light_bounce);
         assert!(ui.video.directional_shadow_gameplay);
+        assert!(ui.video.lazy_catchup_gameplay);
 
         ui.video.comfort_exposure = true;
         ui.video.dynamic_lights = true;
         ui.video.enchantment_glint = true;
         ui.video.indirect_light_bounce = true;
         ui.video.directional_shadow_gameplay = false;
+        ui.video.lazy_catchup_gameplay = false;
         let out = ui_to_client_settings(&ui, &client);
         assert!(out.comfort_exposure);
         assert!(out.dynamic_lights);
         assert!(out.enchantment_glint);
         assert!(out.indirect_light_bounce);
         assert!(!out.directional_shadow_gameplay);
+        assert!(!out.lazy_catchup_gameplay);
         // File-only fields ride `base` untouched through the overlay.
         assert_eq!(out.shader_pack, client.shader_pack);
         assert_eq!(out.report_endpoint, client.report_endpoint);

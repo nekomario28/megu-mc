@@ -27,6 +27,10 @@ const SERVER_CONFIG_DEFAULT_FILE: &str = r#"# megu settings. Every key is option
 # renders) modulate spawn light, undead burning and crop growth. Off means
 # strict vanilla lighting everywhere.
 # directional_shadow_light = false
+# Opt-in: O(1) unloaded-chunk catch-up (furnaces, crops, headless
+# factories tick without a chunk loader). Off keeps strict Vanilla
+# unloaded-chunk behavior.
+# lazy_catchup = false
 
 [anticheat]
 # Enable or disable movement, fall-damage and placement checks (creative/spectator and ops are skipped by default).
@@ -578,6 +582,9 @@ const SERVER_CONFIG_KEYS: &[(&str, &str)] = &[
     // not a vanilla gamerule, so it fills an env var like every other server
     // key instead of touching the gamerule table.
     ("directional_shadow_light", "MEGU_DIRECTIONAL_SHADOW_LIGHT"),
+    // Opt-in unloaded-chunk catch-up: not a vanilla gamerule either, so it
+    // fills an env var like every other server key.
+    ("lazy_catchup", "MEGU_LAZY_CATCHUP"),
 ];
 
 /// `[anticheat]` keys: the ones in the default file, then old ones that still work
@@ -742,6 +749,15 @@ fn server_config_boot() -> ServerConfigDoc {
     // boot switch. Anything the strict reader cannot parse stays off.
     directional_shadow_light_set(
         std::env::var("MEGU_DIRECTIONAL_SHADOW_LIGHT")
+            .ok()
+            .as_deref()
+            .and_then(ops_bool_str)
+            .unwrap_or(false),
+    );
+    // Same single-threaded resolution for the opt-in unloaded-chunk
+    // catch-up lane; anything the strict reader cannot parse stays off.
+    lazy_catchup_set(
+        std::env::var("MEGU_LAZY_CATCHUP")
             .ok()
             .as_deref()
             .and_then(ops_bool_str)
@@ -1307,6 +1323,33 @@ pub(crate) fn directional_shadow_cfg() -> DirectionalShadowConfig {
         enabled: directional_shadow_light_enabled(),
         ..DirectionalShadowConfig::default()
     }
+}
+
+// ---------- opt-in unloaded-chunk catch-up ----------
+//
+// LAZY-CATCHUP: furnaces, crops and headless factories keep ticking while
+// their chunk is unloaded, resolved in O(1) per due machine instead of a
+// chunk-loader scan. Strictly opt-in: `false` keeps every unloaded-chunk
+// path bit-exact Vanilla 1.21.1. Not a gamerule, so the vanilla gamerule
+// table and its persistence stay untouched. Layers: `[server]
+// lazy_catchup` fills `MEGU_LAZY_CATCHUP` like every other server key, the
+// environment wins, `server_config_boot` resolves the switch below while
+// still single-threaded.
+
+/// The runtime switch. An atomic, not a resolved `RuntimeOpsConfig` field, so
+/// a live admin toggle can flip it without a reboot.
+pub(crate) static LAZY_CATCHUP_ENABLED: AtomicBool = AtomicBool::new(false);
+
+/// Whether the unloaded-chunk catch-up lane is live right now.
+pub(crate) fn lazy_catchup_enabled() -> bool {
+    LAZY_CATCHUP_ENABLED.load(Ordering::Relaxed)
+}
+
+/// The runtime admin toggle: flips the atomic the live probes read, no
+/// reboot needed. `server_config_boot` resolves the boot value through it
+/// and tests flip it directly.
+pub(crate) fn lazy_catchup_set(enabled: bool) {
+    LAZY_CATCHUP_ENABLED.store(enabled, Ordering::Relaxed);
 }
 
 static RUNTIME_OPS: OnceLock<RuntimeOpsConfig> = OnceLock::new();

@@ -531,6 +531,11 @@ pub struct ClientSettings {
     /// growth, dynamic-light spawn suppression). Remote servers keep
     /// their own host settings. Default `false`.
     pub directional_shadow_gameplay: bool,
+    /// Opt-in O(1) unloaded-chunk catch-up for worlds this client hosts
+    /// or plays locally (furnaces, crops, headless factories tick while
+    /// their chunk stays unloaded). Remote servers keep their own host
+    /// settings. Default `false`.
+    pub lazy_catchup_gameplay: bool,
     /// `30..=110` degrees.
     pub fov: u8,
     /// Mouse-look sensitivity percent `10..=200` (`100` = 1.0×).
@@ -632,6 +637,7 @@ impl ClientSettings {
             enchantment_glint: true,
             indirect_light_bounce: true,
             directional_shadow_gameplay: false,
+            lazy_catchup_gameplay: false,
             fov: DEFAULT_FOV,
             mouse_sensitivity_pct: 100,
             volume_master: 100,
@@ -772,6 +778,7 @@ impl ClientSettings {
              enchantment_glint = {}\n\
              indirect_light_bounce = {}\n\
              directional_shadow_gameplay = {}\n\
+             lazy_catchup_gameplay = {}\n\
              fov = {}\n\
              mouse_sensitivity_pct = {}\n\
              volume_master = {}\n\
@@ -827,6 +834,7 @@ impl ClientSettings {
             self.enchantment_glint,
             self.indirect_light_bounce,
             self.directional_shadow_gameplay,
+            self.lazy_catchup_gameplay,
             self.fov,
             self.mouse_sensitivity_pct,
             self.volume_master,
@@ -918,6 +926,9 @@ impl ClientSettings {
                 "directional_shadow_gameplay" => {
                     self.directional_shadow_gameplay =
                         parsed.directional_shadow_gameplay;
+                }
+                "lazy_catchup_gameplay" => {
+                    self.lazy_catchup_gameplay = parsed.lazy_catchup_gameplay;
                 }
                 "fov" => self.fov = parsed.fov,
                 "mouse_sensitivity_pct" => {
@@ -1193,6 +1204,13 @@ impl ClientSettings {
                     Some(b) => {
                         settings.directional_shadow_gameplay = b;
                         seen.push("directional_shadow_gameplay");
+                    }
+                    None => invalid(&mut warnings),
+                },
+                "lazy_catchup_gameplay" => match parse_bool(value) {
+                    Some(b) => {
+                        settings.lazy_catchup_gameplay = b;
+                        seen.push("lazy_catchup_gameplay");
                     }
                     None => invalid(&mut warnings),
                 },
@@ -2009,6 +2027,7 @@ mod tests {
             enchantment_glint: false,
             indirect_light_bounce: true,
             directional_shadow_gameplay: true,
+            lazy_catchup_gameplay: true,
             fov: 90,
             mouse_sensitivity_pct: 150,
             volume_master: 80,
@@ -2187,6 +2206,7 @@ mod tests {
         assert!(s.enchantment_glint);
         assert!(s.indirect_light_bounce);
         assert!(!s.directional_shadow_gameplay);
+        assert!(!s.lazy_catchup_gameplay);
 
         // Files written before these keys existed keep the defaults.
         let (s, warnings) = ClientSettings::from_toml("view_distance = 20\n");
@@ -2196,6 +2216,7 @@ mod tests {
         assert!(s.enchantment_glint);
         assert!(s.indirect_light_bounce);
         assert!(!s.directional_shadow_gameplay);
+        assert!(!s.lazy_catchup_gameplay);
 
         // Explicit values parse in both directions and round-trip.
         let (s, warnings) = ClientSettings::from_toml(
@@ -2203,7 +2224,8 @@ mod tests {
              dynamic_lights = false\n\
              enchantment_glint = false\n\
              indirect_light_bounce = false\n\
-             directional_shadow_gameplay = true\n",
+             directional_shadow_gameplay = true\n\
+             lazy_catchup_gameplay = true\n",
         );
         assert!(warnings.is_empty(), "unexpected warnings: {warnings:?}");
         assert!(!s.comfort_exposure);
@@ -2211,14 +2233,18 @@ mod tests {
         assert!(!s.enchantment_glint);
         assert!(!s.indirect_light_bounce);
         assert!(s.directional_shadow_gameplay);
+        assert!(s.lazy_catchup_gameplay);
         let (back, warnings) = ClientSettings::from_toml(&s.to_toml());
         assert_eq!(back, s);
         assert!(warnings.is_empty());
 
         // apply_toml overlays only the keys a file defines.
         let mut s = ClientSettings::default();
-        s.apply_toml("directional_shadow_gameplay = true\ncomfort_exposure = false\n");
+        s.apply_toml(
+            "directional_shadow_gameplay = true\nlazy_catchup_gameplay = true\ncomfort_exposure = false\n",
+        );
         assert!(s.directional_shadow_gameplay);
+        assert!(s.lazy_catchup_gameplay);
         assert!(!s.comfort_exposure);
         assert!(s.dynamic_lights);
         assert!(s.enchantment_glint);

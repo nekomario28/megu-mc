@@ -1478,7 +1478,7 @@ fn video_tab(ctx: &mut Ctx, y0: i32) {
     ctx.dirty_dot(SettingKey::VideoSmoothLighting, x + bw + 6, y + 6);
 
     // --- Lighting & shadow gameplay (right column) ---------------------
-    let lighting: [(WidgetId, SettingKey, &str, &str, bool); 5] = [
+    let lighting: [(WidgetId, SettingKey, &str, &str, bool); 6] = [
         (
             WidgetId::VideoComfortExposure,
             SettingKey::VideoComfortExposure,
@@ -1514,6 +1514,13 @@ fn video_tab(ctx: &mut Ctx, y0: i32) {
             "シャドウゲームプレイ（ローカル/ホスト）",
             v.directional_shadow_gameplay,
         ),
+        (
+            WidgetId::VideoLazyCatchupGameplay,
+            SettingKey::VideoLazyCatchupGameplay,
+            "Unloaded Catch-Up (Local)",
+            "チャンクローダー不要の追いつき（ローカル）",
+            v.lazy_catchup_gameplay,
+        ),
     ];
     ctx.text(rx, vy(0), 1, pal::ACCENT, tr(lang, "LIGHTING", "ライティング"));
     for (i, (id, key, en, ja, on)) in lighting.iter().enumerate() {
@@ -1525,17 +1532,17 @@ fn video_tab(ctx: &mut Ctx, y0: i32) {
         );
         ctx.dirty_dot(*key, x + bw + 6, y + 6);
     }
-    // Scope hint for the opt-in gameplay toggle: local/hosted worlds
+    // Scope hint for the opt-in gameplay toggles: local/hosted worlds
     // only — remote servers keep their own host settings.
     ctx.text(
         rx,
-        vy(6) + 2,
+        vy(7) + 2,
         1,
         pal::TEXT_DIM,
         tr(
             lang,
-            "Shadow gameplay: Singleplayer / Friends Host worlds; remote servers use host settings",
-            "シャドウゲームプレイはシングルプレイとフレンドホストのワールドのみ。リモートサーバーはホスト設定です",
+            "Gameplay toggles: Singleplayer / Friends Host worlds; remote servers use host settings",
+            "ゲームプレイ設定はシングルプレイとフレンドホストのワールドのみ。リモートサーバーはホスト設定です",
         ),
     );
 }

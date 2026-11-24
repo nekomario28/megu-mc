@@ -358,6 +358,11 @@ pub struct VideoSettings {
     /// dynamic-light spawn suppression). Remote servers keep their host
     /// settings. Default `false`.
     pub directional_shadow_gameplay: bool,
+    /// Opt-in O(1) unloaded-chunk catch-up for Singleplayer / Friends
+    /// Host worlds (furnaces, crops, headless factories tick while their
+    /// chunk stays unloaded). Remote servers keep their host settings.
+    /// Default `false`.
+    pub lazy_catchup_gameplay: bool,
 }
 
 impl Default for VideoSettings {
@@ -376,6 +381,7 @@ impl Default for VideoSettings {
             enchantment_glint: true,
             indirect_light_bounce: true,
             directional_shadow_gameplay: false,
+            lazy_catchup_gameplay: false,
         }
     }
 }
@@ -1103,6 +1109,7 @@ pub enum SettingKey {
     VideoEnchantmentGlint,
     VideoIndirectLightBounce,
     VideoDirectionalShadowGameplay,
+    VideoLazyCatchupGameplay,
     DisplayFullscreen,
     DisplayInvertY,
     DisplayGamma,
@@ -1199,6 +1206,9 @@ impl SettingsTransaction {
             K::VideoDirectionalShadowGameplay => {
                 current.video.directional_shadow_gameplay
                     == opened.video.directional_shadow_gameplay
+            }
+            K::VideoLazyCatchupGameplay => {
+                current.video.lazy_catchup_gameplay == opened.video.lazy_catchup_gameplay
             }
             K::DisplayFullscreen => current.fullscreen == opened.fullscreen,
             K::DisplayInvertY => current.mouse_invert_y == opened.mouse_invert_y,
@@ -1319,6 +1329,9 @@ impl SettingsTransaction {
             K::VideoDirectionalShadowGameplay => {
                 current.video.directional_shadow_gameplay =
                     opened.video.directional_shadow_gameplay
+            }
+            K::VideoLazyCatchupGameplay => {
+                current.video.lazy_catchup_gameplay = opened.video.lazy_catchup_gameplay
             }
             K::DisplayFullscreen => current.fullscreen = opened.fullscreen,
             K::DisplayInvertY => current.mouse_invert_y = opened.mouse_invert_y,
@@ -2257,6 +2270,7 @@ pub enum WidgetId {
     VideoEnchantmentGlint,
     VideoIndirectLightBounce,
     VideoDirectionalShadowGameplay,
+    VideoLazyCatchupGameplay,
     // Settings session toolbar (mistake-proof undo/redo/discard/reset)
     SettingsUndo,
     SettingsRedo,
@@ -4579,6 +4593,11 @@ impl UiState {
             }
             WidgetId::VideoDirectionalShadowGameplay => {
                 v.directional_shadow_gameplay = !v.directional_shadow_gameplay;
+                v.preset = VideoPreset::Custom;
+                true
+            }
+            WidgetId::VideoLazyCatchupGameplay => {
+                v.lazy_catchup_gameplay = !v.lazy_catchup_gameplay;
                 v.preset = VideoPreset::Custom;
                 true
             }
