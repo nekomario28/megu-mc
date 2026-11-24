@@ -37,10 +37,12 @@
 //! `TICKPAR_FAILED` pool/panic/timeout losses. `MEGU_TICKPAR_PROF=1` prints a
 //! summary line every 64 resolved batches.
 
+use std::cell::RefCell;
 use std::collections::VecDeque;
 use std::panic::{catch_unwind, AssertUnwindSafe};
-use std::sync::atomic::{AtomicI8, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicI64, AtomicI8, AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex, OnceLock};
+use std::thread::LocalKey;
 use std::time::{Duration, Instant};
 
 use crate::block_registry::{breg, BReg};
@@ -49,8 +51,8 @@ use crate::{
     block_at, block_at_cached, block_at_cached_dim, drowned_should_hide_in_water,
     enderman_stared_at, entity_distance_sq, entity_spec_by_id, height_at, item_to_name,
     live_mob_block_hit, live_mob_states, mob_cell_solid, mob_drowning_submerged, mob_in_lava,
-    mob_in_water, pet_follow_teleport_step, spider_is_hostile, AiEntityPerception, Client,
-    LiveMobPlayer, Mob, MobBehaviorState, CHUNK_VERSION_SEQ,
+    mob_in_water, pet_follow_teleport_step, shrink_if_sparse, spider_is_hostile,
+    AiEntityPerception, Client, LiveMobPlayer, Mob, MobBehaviorState, CHUNK_VERSION_SEQ,
 };
 
 // ---------------------------------------------------------------------------
@@ -98,6 +100,27 @@ fn parallel_enabled() -> bool {
 #[cfg(test)]
 pub(crate) fn set_parallel_override(v: Option<bool>) {
     PARALLEL_OVERRIDE.store(v.map(i8::from).unwrap_or(-1), Ordering::Relaxed);
+}
+
+/// Mob jobs one worker task prepares and commits as a single batch. A range
+/// worker still computes each mob independently — identical inputs, identical
+/// plan output — but lands up to this many results under one `results` lock
+/// and one condvar wake instead of one task/lock/notify per mob.
+const MOB_BATCH_SIZE: usize = 32;
+
+/// -1 = `MOB_BATCH_SIZE`, otherwise the fixed range size (test hook).
+static MOB_BATCH_OVERRIDE: AtomicI64 = AtomicI64::new(-1);
+
+fn mob_batch_size() -> usize {
+    match MOB_BATCH_OVERRIDE.load(Ordering::Relaxed) {
+        n if n > 0 => n as usize,
+        _ => MOB_BATCH_SIZE,
+    }
+}
+
+#[cfg(test)]
+fn set_mob_batch_override(v: Option<usize>) {
+    MOB_BATCH_OVERRIDE.store(v.map(|n| n as i64).unwrap_or(-1), Ordering::Relaxed);
 }
 
 fn prof_enabled() -> bool {
@@ -619,8 +642,62 @@ struct BatchShared {
     hostile: bool,
 }
 
+thread_local! {
+    /// The per-tick `jobs`/`results` buffers, recycled through
+    /// [`BatchShared::drop`] so a steady mob count stops paying two fresh
+    /// `Vec`s per dimension tick. Each is `mem::take`n out for the batch and
+    /// handed back (cleared, sparsity-bounded) when the last `Arc` drops —
+    /// normally on the tick thread, which is also where `mob_plans` runs.
+    static JOB_VECS: RefCell<Vec<Option<MobJobInput>>> = const { RefCell::new(Vec::new()) };
+    static RESULT_VECS: RefCell<Vec<Option<Slot>>> = const { RefCell::new(Vec::new()) };
+    /// Commit scratch on worker threads: `(job index, resolved slot)` pairs
+    /// gathered for one `MOB_BATCH_SIZE` range so the whole batch lands under
+    /// a single `results` lock + one condvar wake. `try_borrow_mut` keeps a
+    /// nested use on a local `Vec` — no panics — and the buffer shrinks when
+    /// a spike leaves it far above steady use.
+    static RANGE_SCRATCH: RefCell<Vec<(usize, Slot)>> = const { RefCell::new(Vec::new()) };
+}
+
+fn take_vec_scratch<T>(cell: &'static LocalKey<RefCell<Vec<T>>>) -> Vec<T> {
+    cell.try_with(|c| match c.try_borrow_mut() {
+        Ok(mut v) => std::mem::take(&mut *v),
+        Err(_) => Vec::new(),
+    })
+    .unwrap_or_default()
+}
+
+fn return_vec_scratch<T>(cell: &'static LocalKey<RefCell<Vec<T>>>, mut v: Vec<T>) {
+    if v.is_empty() {
+        return;
+    }
+    // Bound while `len` still describes this tick's mob count, then clear —
+    // a one-time spike must not pin its peak capacity forever.
+    shrink_if_sparse(&mut v);
+    v.clear();
+    let _ = cell.try_with(move |c| {
+        if let Ok(mut slot) = c.try_borrow_mut() {
+            *slot = v;
+        }
+    });
+}
+
+impl Drop for BatchShared {
+    fn drop(&mut self) {
+        let jobs = std::mem::take(&mut self.jobs);
+        let results = std::mem::take(self.results.get_mut().unwrap_or_else(|e| e.into_inner()));
+        return_vec_scratch(&JOB_VECS, jobs);
+        return_vec_scratch(&RESULT_VECS, results);
+    }
+}
+
 enum Work {
-    Plan { batch: Arc<BatchShared>, idx: usize },
+    /// Prepare the dispatched jobs in `start..end` of one dimension batch
+    /// and commit them under a single results lock.
+    Plan {
+        batch: Arc<BatchShared>,
+        start: usize,
+        end: usize,
+    },
     /// Bare job used by the pool's own tests (panic survival, job accounting).
     #[cfg(test)]
     Test(Box<dyn FnOnce() + Send>),
@@ -692,17 +769,27 @@ fn worker_loop(pool: &'static Pool) {
             }
         };
         match work {
-            Work::Plan { batch, idx } => {
-                // Job-level catch: a panic resolves this slot to Err so the
-                // commit falls back inline instead of waiting forever.
-                let r = catch_unwind(AssertUnwindSafe(|| prepare(&batch, idx)))
-                    .unwrap_or(Err(()));
-                batch.results.lock().unwrap_or_else(|e| e.into_inner())[idx] =
-                    Some(match r {
-                        Ok(plan) => Slot::Done(plan),
-                        Err(()) => Slot::Failed,
-                    });
-                batch.done_cv.notify_all();
+            Work::Plan { batch, start, end } => {
+                // Per-job catch inside `run_plan_range`; this outer catch
+                // only guards the commit path — a panic there fails every
+                // still-pending slot in the range so the tick falls back
+                // inline instead of stalling on the condvar timeout.
+                if catch_unwind(AssertUnwindSafe(|| run_plan_range(&batch, start, end)))
+                    .is_err()
+                {
+                    let mut results = batch.results.lock().unwrap_or_else(|e| e.into_inner());
+                    let mut failed = false;
+                    for idx in start..end {
+                        if batch.jobs[idx].is_some() && results[idx].is_none() {
+                            results[idx] = Some(Slot::Failed);
+                            failed = true;
+                        }
+                    }
+                    drop(results);
+                    if failed {
+                        batch.done_cv.notify_all();
+                    }
+                }
             }
             #[cfg(test)]
             Work::Test(job) => {
@@ -710,6 +797,56 @@ fn worker_loop(pool: &'static Pool) {
             }
         }
     }
+}
+
+/// Prepare every dispatched job in `start..end` and land all of them under
+/// one `results` lock + one condvar wake. Jobs run in index order on this
+/// worker with the same inputs the per-mob dispatch used, so each plan is
+/// bit-identical — only the synchronization granularity changed.
+fn run_plan_range(batch: &BatchShared, start: usize, end: usize) {
+    RANGE_SCRATCH.with(|cell| match cell.try_borrow_mut() {
+        Ok(mut v) => {
+            v.clear();
+            run_plan_range_into(batch, start, end, &mut v);
+            // `len` is 0 after the drain, so bound on capacity directly: a
+            // spike (huge override in tests) must not pin memory forever.
+            if v.capacity() > 4096 {
+                v.shrink_to(2048);
+            }
+        }
+        Err(_) => {
+            let mut v = Vec::new();
+            run_plan_range_into(batch, start, end, &mut v);
+        }
+    });
+}
+
+fn run_plan_range_into(
+    batch: &BatchShared,
+    start: usize,
+    end: usize,
+    buf: &mut Vec<(usize, Slot)>,
+) {
+    for idx in start..end {
+        if batch.jobs[idx].is_none() {
+            continue;
+        }
+        let slot = match catch_unwind(AssertUnwindSafe(|| prepare(batch, idx))) {
+            Ok(Ok(plan)) => Slot::Done(plan),
+            _ => Slot::Failed,
+        };
+        buf.push((idx, slot));
+    }
+    if buf.is_empty() {
+        return;
+    }
+    {
+        let mut results = batch.results.lock().unwrap_or_else(|e| e.into_inner());
+        for (idx, slot) in buf.drain(..) {
+            results[idx] = Some(slot);
+        }
+    }
+    batch.done_cv.notify_all();
 }
 
 fn prepare(batch: &BatchShared, idx: usize) -> Result<MobPlan, ()> {
@@ -915,8 +1052,13 @@ pub(crate) fn mob_plans(
     // plans the loop can never consume.
     let activation_full = activation >= crate::LoadBudget::FULL.entity_activation_range;
     let activation_sq = (activation as f64).powi(2);
-    let mut jobs: Vec<Option<MobJobInput>> = Vec::with_capacity(set.len);
-    let mut results: Vec<Option<Slot>> = Vec::with_capacity(set.len);
+    // The two per-mob buffers ride the tick thread's recycling pool: taken
+    // out with their steady-state capacity and handed back by
+    // `BatchShared::drop`, so a stable mob count allocates nothing here.
+    let mut jobs = take_vec_scratch(&JOB_VECS);
+    let mut results = take_vec_scratch(&RESULT_VECS);
+    jobs.clear();
+    results.clear();
     for (i, m) in mobs_snap.iter().enumerate() {
         let mut job = None;
         let mut result = None;
@@ -959,15 +1101,26 @@ pub(crate) fn mob_plans(
         day,
         hostile,
     });
+    // Chunk the mob list into fixed-size ranges: each pool task prepares a
+    // contiguous slice and commits it under one lock + one wake, so 500 mobs
+    // cost ~16 tasks and ~16 synchronizations instead of 1,500 of each.
+    // Slots are still indexed by mob position, so resolution order — and
+    // therefore every observable output — is unchanged.
+    let batch_size = mob_batch_size();
     let mut n = 0u64;
-    for (i, job) in batch.jobs.iter().enumerate() {
-        if job.is_some() {
+    let mut start = 0usize;
+    while start < batch.jobs.len() {
+        let end = (start + batch_size).min(batch.jobs.len());
+        let pending = batch.jobs[start..end].iter().filter(|j| j.is_some()).count();
+        if pending > 0 {
+            n += pending as u64;
             pool.submit(Work::Plan {
                 batch: batch.clone(),
-                idx: i,
+                start,
+                end,
             });
-            n += 1;
         }
+        start = end;
     }
     TICKPAR_REQUESTED.fetch_add(n, Ordering::Relaxed);
     set.batch = Some(batch);
@@ -1208,6 +1361,142 @@ mod tests {
         );
         assert!(set.batch.is_none());
         assert!(set.take_valid(0, (0.0, 0.0, 0.0)).is_none());
+        set_parallel_override(None);
+    }
+
+    fn plan_mob(eid: i32, x: f64) -> Arc<Mob> {
+        Arc::new(Mob {
+            dim: DimId::Overworld,
+            eid,
+            uuid: [eid as u8; 16],
+            // Zombie: a spec'd hostile with no pet, tempting, or spider branches,
+            // so every plan field is a pure function of the shared inputs.
+            etype: 124,
+            pos: Mutex::new((x, 65.0, x, 0.0, 0.0)),
+            hp: Mutex::new(20.0),
+            last_hit: Mutex::new(Instant::now() - Duration::from_secs(60)),
+            hurt_at: Mutex::new(Instant::now() - Duration::from_secs(60)),
+            last_hurt_tick: Mutex::new(None),
+            vel: Mutex::new([0.0; 3]),
+            fuse: Mutex::new(0),
+            fire_ticks: Mutex::new(0),
+            love: Mutex::new(0),
+            air: Mutex::new(300),
+        })
+    }
+
+    fn perception_eq(a: &AiEntityPerception, b: &AiEntityPerception) -> bool {
+        a.entity_id == b.entity_id
+            && a.position == b.position
+            && a.width == b.width
+            && a.line_of_sight == b.line_of_sight
+            && a.held_item == b.held_item
+            && a.in_love == b.in_love
+            && a.compatible == b.compatible
+    }
+
+    fn targeting_eq(a: &MobTargeting, b: &MobTargeting) -> bool {
+        a.pos == b.pos
+            && a.provoked == b.provoked
+            && a.nearest == b.nearest
+            && a.target == b.target
+            && a.look == b.look
+            && a.spectators == b.spectators
+            && a.stare == b.stare
+            && match (&a.perception, &b.perception) {
+                (Some(x), Some(y)) => perception_eq(x, y),
+                (None, None) => true,
+                _ => false,
+            }
+    }
+
+    fn plans_equal(a: &MobPlan, b: &MobPlan) -> bool {
+        a.pos == b.pos
+            && a.env.probe_pos == b.env.probe_pos
+            && a.env.feet_state == b.env.feet_state
+            && a.env.in_water == b.env.in_water
+            && a.env.in_lava == b.env.in_lava
+            && a.env.submerged == b.env.submerged
+            && a.env.cell_solid == b.env.cell_solid
+            && a.env.above_state == b.env.above_state
+            && a.env.sky_height == b.env.sky_height
+            && a.env.sky_air2 == b.env.sky_air2
+            && a.env.below_block == b.env.below_block
+            && match (&a.pet, &b.pet) {
+                (Some(x), Some(y)) => {
+                    x.state == y.state && x.teleport == y.teleport
+                }
+                (None, None) => true,
+                _ => false,
+            }
+            && match (&a.targeting, &b.targeting) {
+                (Some(x), Some(y)) => targeting_eq(x, y),
+                (None, None) => true,
+                _ => false,
+            }
+    }
+
+    /// Chunked range dispatch must produce bit-identical plans to the old
+    /// one-task-per-mob dispatch: same mobs, same gates, every chunk boundary
+    /// (1, 31, 32, 33) and a 200-mob run.
+    #[test]
+    fn batched_ranges_preserve_bit_identical_plans() {
+        crate::test_support::require_vanilla_data();
+        // The world read by `env_probe` must not move mid-comparison; the
+        // guard also serializes against the serial/parallel fixture's
+        // `set_parallel_override` window in tick_tests.
+        let _guard = crate::world_guard();
+        set_parallel_override(Some(true));
+        let run = |n: usize, batch: Option<usize>| -> Vec<Option<MobPlan>> {
+            set_mob_batch_override(batch);
+            let mobs: Vec<Arc<Mob>> = (0..n)
+                .map(|i| plan_mob(10_000 + i as i32, i as f64 * 0.5))
+                .collect();
+            let dead = vec![false; n];
+            let hot = vec![true; n];
+            let mut set = mob_plans(
+                DimId::Overworld,
+                &mobs,
+                &[],
+                &dead,
+                &hot,
+                true,
+                true,
+                i32::MAX,
+            );
+            let mut out = Vec::with_capacity(n);
+            for i in 0..n {
+                out.push(set.resolve(i));
+            }
+            out
+        };
+        // A serial-mode interloper (another test's override) resolves every
+        // slot to None; retry until the pool actually produced plans.
+        let attempt = |n: usize, batch: Option<usize>| -> Vec<Option<MobPlan>> {
+            for _ in 0..8 {
+                let out = run(n, batch);
+                if out.iter().all(Option::is_some) {
+                    return out;
+                }
+            }
+            panic!("worker pool produced no plans for {n} mobs");
+        };
+        for n in [1usize, 31, 32, 33, 200] {
+            let reference = attempt(n, Some(1));
+            for batch in [Some(31), Some(32), Some(33), None] {
+                let got = attempt(n, batch);
+                for (i, (want, have)) in reference.iter().zip(got.iter()).enumerate() {
+                    let (Some(want), Some(have)) = (want, have) else {
+                        panic!("mob {i} of {n} (batch {batch:?}) lost its plan");
+                    };
+                    assert!(
+                        plans_equal(want, have),
+                        "mob {i} of {n} (batch {batch:?}) plan diverged"
+                    );
+                }
+            }
+        }
+        set_mob_batch_override(None);
         set_parallel_override(None);
     }
 

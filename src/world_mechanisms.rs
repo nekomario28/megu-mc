@@ -78,21 +78,130 @@ thread_local! {
         const { std::cell::RefCell::new(std::collections::VecDeque::new()) };
 }
 
-/// Per-tick scratch for [`tick_world_block_entities`]: the mob snapshot, the
-/// sorted block-entity position list and the crafter re-poll list are rebuilt
-/// every tick but never escape the pass, so they ride one bounded
-/// thread-local instead of three fresh `Vec`s per tick. The whole struct is
-/// taken out for the pass so re-entrant use still sees empty buffers.
+/// Per-tick scratch for [`tick_world_block_entities`]: the mob snapshot and
+/// the crafter re-poll list are rebuilt every tick but never escape the
+/// pass, so they ride one bounded thread-local instead of two fresh `Vec`s
+/// per tick. The whole struct is taken out for the pass so re-entrant use
+/// still sees empty buffers. The sorted position list moved to the
+/// fingerprint-keyed [`BE_TICK_POSITIONS`] cache — it persists across ticks
+/// instead of being rebuilt.
 #[derive(Default)]
 struct BeTickScratch {
     live_mobs: Vec<(i64, [f64; 3])>,
-    positions: Vec<(DimId, i32, i32, i32)>,
     crafter_power: Vec<(BlockPos, bool)>,
 }
 
 thread_local! {
     static BE_TICK_SCRATCH: std::cell::RefCell<BeTickScratch> =
         std::cell::RefCell::new(BeTickScratch::default());
+}
+
+/// Per-dimension dispatch observability for [`tick_world_block_entities`].
+/// Counts live behind their own map (not inside the position entry) so a
+/// cache rebuild cannot reset them, and per-dim so concurrent ticks of
+/// other dimensions — including other tests — cannot pollute a fixture's
+/// numbers. `dispatched` counts entities that reached a machine arm;
+/// `skipped` counts registered ticking entities idled out before dispatch;
+/// `rebuilds`/`hits` count sorted-position cache misses and matches.
+#[derive(Default)]
+struct BeDimCounts {
+    dispatched: AtomicU64,
+    skipped: AtomicU64,
+    rebuilds: AtomicU64,
+    hits: AtomicU64,
+}
+
+fn be_dim_counts() -> &'static Mutex<HashMap<DimId, Arc<BeDimCounts>>> {
+    static COUNTS: OnceLock<Mutex<HashMap<DimId, Arc<BeDimCounts>>>> = OnceLock::new();
+    COUNTS.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+fn be_counts_for(dim: DimId) -> Arc<BeDimCounts> {
+    be_dim_counts()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .entry(dim)
+        .or_insert_with(|| Arc::new(BeDimCounts::default()))
+        .clone()
+}
+
+/// One dimension's cached sorted position list. `fingerprint` covers every
+/// `(pos, kind)` pair of the ticking-capable entities in the dimension, so a
+/// match proves the sorted list is still exact.
+struct BeTickPositions {
+    fingerprint: u128,
+    /// Sorted `(x, y, z)` of ticking-capable entities only — lecterns,
+    /// chiseled bookshelves and decorated pots match the tick's `_` arm and
+    /// are excluded, which also keeps them out of the fingerprint so their
+    /// churn cannot invalidate the list.
+    positions: Arc<Vec<(i32, i32, i32)>>,
+}
+
+fn be_tick_positions() -> &'static Mutex<HashMap<DimId, BeTickPositions>> {
+    static CACHE: OnceLock<Mutex<HashMap<DimId, BeTickPositions>>> = OnceLock::new();
+    CACHE.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+/// The tick loop's machine arms, as a discriminant for the position
+/// fingerprint. `0` marks the families that fall through to `_`.
+fn be_tick_kind(entity: &VanillaBlockEntity) -> u8 {
+    match entity {
+        VanillaBlockEntity::Campfire(_) => 1,
+        VanillaBlockEntity::BrewingStand(_) => 2,
+        VanillaBlockEntity::MobSpawner(_) => 3,
+        VanillaBlockEntity::Jukebox(_) => 4,
+        VanillaBlockEntity::Crafter(_) => 5,
+        VanillaBlockEntity::Beacon(_) => 6,
+        _ => 0,
+    }
+}
+
+/// splitmix64-style lane mixer for the position fingerprint — order-free
+/// (per-key lanes are summed), deterministic, and far cheaper than a
+/// cryptographic hash over what is only a cache key, not a security check.
+fn be_fp_mix(a: u64, b: u64) -> (u64, u64) {
+    let finish = |mut x: u64| {
+        x = (x ^ (x >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+        x = (x ^ (x >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+        x ^ (x >> 31)
+    };
+    (
+        finish(a ^ 0x9E37_79B9_7F4A_7C15),
+        finish(b ^ 0xC2B2_AE3D_27D4_EB4F),
+    )
+}
+
+/// Order-independent 128-bit fingerprint of the dimension's ticking
+/// `(pos, kind)` set. The registry is a plain `Mutex<HashMap>` that
+/// `save_v2`'s footer restore rewrites directly, so no mutation hook exists
+/// to hang a version counter on — folding the keys each tick catches every
+/// writer, including ones outside `register_world_block_entity`, while a
+/// steady world pays one hash pass and no `Vec` copy or sort.
+fn be_dim_fingerprint(
+    store: &HashMap<(DimId, i32, i32, i32), VanillaBlockEntity>,
+    dim: DimId,
+) -> u128 {
+    let mut lo = 0u64;
+    let mut hi = 0u64;
+    let mut n = 0u64;
+    for (&(d, x, y, z), entity) in store.iter() {
+        if d != dim {
+            continue;
+        }
+        let kind = be_tick_kind(entity);
+        if kind == 0 {
+            continue;
+        }
+        n += 1;
+        let a = (x as u32 as u64) | ((y as u32 as u64) << 32);
+        let b = (z as u32 as u64) | ((u64::from(kind)) << 32);
+        let (ma, mb) = be_fp_mix(a, b);
+        lo = lo.wrapping_add(ma);
+        hi = hi.wrapping_add(mb);
+    }
+    lo ^= n.wrapping_mul(0x9E37_79B9_7F4A_7C15);
+    hi ^= n.wrapping_mul(0xC2B2_AE3D_27D4_EB4F);
+    (u128::from(hi) << 64) | u128::from(lo)
 }
 
 #[cfg_attr(not(test), allow(dead_code))]
@@ -3036,14 +3145,13 @@ pub(crate) fn tick_world_block_entities(
     nearby_players: &[[f64; 3]],
     rand_seed: u64,
 ) -> Vec<WorldBlockEntityEvent> {
-    // The mob snapshot, position list and crafter re-poll list ride the
-    // bounded thread-local scratch: taken out for the pass so the `RefCell`
-    // is never held across the registry locks below, and returned bounded
-    // for the next tick.
+    // The mob snapshot and crafter re-poll list ride the bounded
+    // thread-local scratch: taken out for the pass so the `RefCell` is never
+    // held across the registry locks below, and returned bounded for the
+    // next tick.
     let mut scratch =
         BE_TICK_SCRATCH.with(|cell| std::mem::take(&mut *cell.borrow_mut()));
     scratch.live_mobs.clear();
-    scratch.positions.clear();
     scratch.crafter_power.clear();
     // Snapshot live entities before locking the block-entity store. This also
     // avoids acquiring the mobs registry while the block-entity lock is held.
@@ -3062,19 +3170,74 @@ pub(crate) fn tick_world_block_entities(
     let mut store = world_block_entity_registry()
         .lock()
         .unwrap_or_else(|e| e.into_inner());
-    // HashMap iteration order is randomized. Sort positions for deterministic
-    // spawner randomness and event order across runs and insertion histories.
-    scratch
-        .positions
-        .extend(store.keys().filter(|(d, _, _, _)| *d == dim).copied());
-    scratch.positions.sort_by_key(|(_, x, y, z)| (*x, *y, *z));
+    // Cached sorted positions: one fingerprint pass over the dimension's
+    // ticking entries decides whether the sorted list is still exact. A hit
+    // costs no `Vec` copy and no sort; a miss rebuilds once, still under the
+    // store lock so the fingerprint and the list can never disagree.
+    let fingerprint = be_dim_fingerprint(&store, dim);
+    let counts = be_counts_for(dim);
+    let positions = {
+        let mut cache = be_tick_positions()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        match cache.get(&dim) {
+            Some(entry) if entry.fingerprint == fingerprint => {
+                counts.hits.fetch_add(1, Ordering::Relaxed);
+                entry.positions.clone()
+            }
+            _ => {
+                counts.rebuilds.fetch_add(1, Ordering::Relaxed);
+                let mut positions: Vec<(i32, i32, i32)> = store
+                    .iter()
+                    .filter(|(&(d, _, _, _), entity)| d == dim && be_tick_kind(entity) != 0)
+                    .map(|(&(_, x, y, z), _)| (x, y, z))
+                    .collect();
+                // HashMap iteration order is randomized. Sort positions for
+                // deterministic spawner randomness and event order across
+                // runs and insertion histories — only on rebuild now.
+                positions.sort_unstable();
+                let positions = Arc::new(positions);
+                cache.insert(
+                    dim,
+                    BeTickPositions {
+                        fingerprint,
+                        positions: positions.clone(),
+                    },
+                );
+                positions
+            }
+        }
+    };
     let mut rng = WorldMechanismLcg::new(rand_seed ^ world_tick);
     let mut events = Vec::new();
     // Crafters whose last applied powered state the redstone pass may since
     // have changed are re-polled after the store lock is released.
-    for &(dim, x, y, z) in &scratch.positions {
+    for &(x, y, z) in positions.iter() {
         let pos = (x, y, z);
         let Some(entity) = store.get_mut(&(dim, x, y, z)) else { continue };
+        // Idle sleep: a machine whose tick is provably a no-op is skipped
+        // before dispatch. The predicate reads live state every tick, so any
+        // register/interact/item/redstone/load mutation wakes the machine on
+        // the very next pass — no wake bookkeeping to invalidate.
+        let idle = match &*entity {
+            // `tick` on four empty slots returns nothing and mutates
+            // nothing, lit or not; `place` wakes it.
+            VanillaBlockEntity::Campfire(fire) => fire.slots.iter().all(Option::is_none),
+            // `brewing_inert` is exact: `tick` would return `Idle` without
+            // touching a field.
+            VanillaBlockEntity::BrewingStand(stand) => brewing_inert(stand),
+            // The arm only bumps `ticks_since_song_started` when a record
+            // is loaded.
+            VanillaBlockEntity::Jukebox(jukebox) => jukebox.record_item.is_none(),
+            // The beacon only acts on its 80-tick pulse.
+            VanillaBlockEntity::Beacon(_) => !world_tick.is_multiple_of(80),
+            _ => false,
+        };
+        if idle {
+            counts.skipped.fetch_add(1, Ordering::Relaxed);
+            continue;
+        }
+        counts.dispatched.fetch_add(1, Ordering::Relaxed);
         match entity {
             VanillaBlockEntity::Campfire(fire) => {
                 let lit = reg.is_some_and(|reg| {
@@ -3227,7 +3390,6 @@ pub(crate) fn tick_world_block_entities(
         }
     }
     bound_vec_scratch(&mut scratch.live_mobs);
-    bound_vec_scratch(&mut scratch.positions);
     bound_vec_scratch(&mut scratch.crafter_power);
     BE_TICK_SCRATCH.with(|cell| *cell.borrow_mut() = scratch);
     events
@@ -3247,6 +3409,7 @@ mod w_be_integration_tests {
 
     #[test]
     fn w_be_registry_dimensions_and_all_nine_comparator_families() {
+        let _guard = world_guard();
         let pos = (23401, 220, 23401);
         place(DimId::Overworld, pos, VanillaBlockEntity::Jukebox(JukeboxBlockEntity {
             record_item: Some("minecraft:music_disc_cat".into()),
@@ -3329,6 +3492,7 @@ mod w_be_integration_tests {
 
     #[test]
     fn w_be_brewing_consumes_blaze_fuel_and_finishes_400_ticks() {
+        let _guard = world_guard();
         let dim = DimId::Nether;
         let pos = (23430, 220, 23430);
         let stand = BrewingStand {
@@ -3356,6 +3520,7 @@ mod w_be_integration_tests {
 
     #[test]
     fn w_be_spawner_respects_player_radius_delay_cap_and_determinism() {
+        let _guard = world_guard();
         let dim = DimId::End;
         let pos = (23440, 220, 23440);
         let spawner = MobSpawnerBlockEntity {
@@ -3391,6 +3556,7 @@ mod w_be_integration_tests {
 
     #[test]
     fn w_be_spawner_unknown_entity_does_not_emit_invalid_spawn() {
+        let _guard = world_guard();
         let dim = DimId::End;
         let pos = (23445, 220, 23445);
         place(dim, pos, VanillaBlockEntity::MobSpawner(MobSpawnerBlockEntity {
@@ -3440,6 +3606,7 @@ mod w_be_integration_tests {
 
     #[test]
     fn w_be_jukebox_ticks_and_comparator_output() {
+        let _guard = world_guard();
         let dim = DimId::End;
         let pos = (23460, 220, 23460);
         place(dim, pos, VanillaBlockEntity::Jukebox(JukeboxBlockEntity {
@@ -3456,6 +3623,7 @@ mod w_be_integration_tests {
 
     #[test]
     fn w_be_lectern_pages_and_book_insertion_removal() {
+        let _guard = world_guard();
         let dim = DimId::End;
         let pos = (23470, 220, 23470);
         place(dim, pos, VanillaBlockEntity::Lectern(LecternBlockEntity {
@@ -3473,6 +3641,7 @@ mod w_be_integration_tests {
 
     #[test]
     fn w_be_bookshelf_slot_bounds_and_last_interacted_comparator() {
+        let _guard = world_guard();
         let dim = DimId::End;
         let pos = (23480, 220, 23480);
         place(dim, pos, VanillaBlockEntity::ChiseledBookshelf(ChiseledBookshelfBlockEntity::default()));
@@ -3487,6 +3656,7 @@ mod w_be_integration_tests {
 
     #[test]
     fn w_be_pot_insert_extract_respects_stack_capacity() {
+        let _guard = world_guard();
         let dim = DimId::Nether;
         let pos = (23490, 220, 23490);
         place(dim, pos, VanillaBlockEntity::DecoratedPot(DecoratedPotBlockEntity::default()));
@@ -3505,6 +3675,7 @@ mod w_be_integration_tests {
 
     #[test]
     fn w_be_crafter_slot_toggle_and_rising_edge_pulse() {
+        let _guard = world_guard();
         let dim = DimId::End;
         let pos = (23500, 220, 23500);
         place(dim, pos, VanillaBlockEntity::Crafter(CrafterBlockEntity::default()));
@@ -3518,6 +3689,153 @@ mod w_be_integration_tests {
         assert_eq!(interact_world_block_entity(dim, pos, Some("unpowered"), None), Some(WorldBlockEntityInteraction::Changed));
         assert_eq!(interact_world_block_entity(dim, pos, Some("powered"), None), Some(WorldBlockEntityInteraction::CrafterPulse));
         remove(dim, pos);
+    }
+
+    /// The sorted-position cache must reuse its list while the dimension's
+    /// ticking `(pos, kind)` set is unchanged and rebuild exactly once per
+    /// insert/remove — including mutations that bypass the register/remove
+    /// wrappers, like `save_v2`'s direct registry rewrite.
+    #[test]
+    fn w_be_position_cache_hits_until_registry_changes() {
+        // A raw dimension slot no other fixture uses, so the fingerprint
+        // sees only this test's entities; the guard keeps a concurrent
+        // save/load from wiping the registry mid-assertion.
+        let _guard = world_guard();
+        let dim = DimId::from_raw(0xBE01);
+        let pos = (61_000, 80, 61_000);
+        let counts = || be_counts_for(dim);
+        let rebuild_hits = |c: &BeDimCounts| {
+            (
+                c.rebuilds.load(Ordering::Relaxed),
+                c.hits.load(Ordering::Relaxed),
+            )
+        };
+
+        // First tick builds the (empty) entry; the second is a pure hit.
+        tick_world_block_entities(dim, 0, &[], 7);
+        let (r0, h0) = rebuild_hits(&counts());
+        tick_world_block_entities(dim, 1, &[], 7);
+        let (r1, h1) = rebuild_hits(&counts());
+        assert_eq!(r1, r0, "unchanged registry must not re-sort");
+        assert_eq!(h1, h0 + 1, "unchanged registry must hit the cache");
+
+        // A non-ticking entity does not change the ticking set: still a hit.
+        place(dim, pos, VanillaBlockEntity::Lectern(LecternBlockEntity::default()));
+        tick_world_block_entities(dim, 2, &[], 7);
+        assert_eq!(rebuild_hits(&counts()).0, r0, "a lectern must not invalidate the tick list");
+
+        // A ticking insert and a direct-registry remove each invalidate once.
+        place(dim, (pos.0 + 1, pos.1, pos.2), VanillaBlockEntity::Jukebox(JukeboxBlockEntity::default()));
+        tick_world_block_entities(dim, 3, &[], 7);
+        assert_eq!(rebuild_hits(&counts()).0, r0 + 1, "insert must invalidate the cache");
+        remove(dim, (pos.0 + 1, pos.1, pos.2));
+        tick_world_block_entities(dim, 4, &[], 7);
+        assert_eq!(rebuild_hits(&counts()).0, r0 + 2, "remove must invalidate the cache");
+
+        // A kind swap at an existing key changes the fingerprint too.
+        world_block_entity_registry()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(
+                (dim, pos.0, pos.1, pos.2),
+                VanillaBlockEntity::Jukebox(JukeboxBlockEntity::default()),
+            );
+        tick_world_block_entities(dim, 5, &[], 7);
+        assert_eq!(rebuild_hits(&counts()).0, r0 + 3, "kind swap must invalidate the cache");
+        remove(dim, pos);
+        tick_world_block_entities(dim, 6, &[], 7);
+    }
+
+    /// 500 idle machines plus two live ones: the idle half must skip
+    /// dispatch entirely while the brewing stand finishes its 400-tick brew
+    /// and the jukebox counts every pass — vanilla progression, zero idle
+    /// work.
+    #[test]
+    fn w_be_idle_machines_sleep_while_active_ones_tick() {
+        // The guard keeps a concurrent save/load or world-tick stage from
+        // touching the shared registry while the 402-tick fixture runs.
+        let _guard = world_guard();
+        let dim = DimId::from_raw(0xBE02);
+        let base = (62_000, 80, 62_000);
+        for i in 0..250 {
+            place(
+                dim,
+                (base.0 + i, base.1, base.2),
+                VanillaBlockEntity::Campfire(CampfireBlockEntity::default()),
+            );
+            place(
+                dim,
+                (base.0, base.1, base.2 + 1_000 + i),
+                VanillaBlockEntity::Jukebox(JukeboxBlockEntity::default()),
+            );
+        }
+        let brew_pos = (base.0, base.1, base.2 + 2_000);
+        place(
+            dim,
+            brew_pos,
+            VanillaBlockEntity::BrewingStand(BrewingStand {
+                bottles: [Some(BrewingPotion {
+                    kind: PotionKind::Water,
+                    form: PotionForm::Drinkable,
+                }); 3],
+                ingredient: Some((BrewingIngredient::NetherWart, 2)),
+                blaze_powder: 1,
+                ..Default::default()
+            }),
+        );
+        let music_pos = (base.0 + 1, base.1, base.2 + 2_000);
+        place(
+            dim,
+            music_pos,
+            VanillaBlockEntity::Jukebox(JukeboxBlockEntity {
+                record_item: Some("minecraft:music_disc_cat".into()),
+                ..Default::default()
+            }),
+        );
+
+        let counts = be_counts_for(dim);
+        let dispatched = || counts.dispatched.load(Ordering::Relaxed);
+        let skipped = || counts.skipped.load(Ordering::Relaxed);
+        let (d0, s0) = (dispatched(), skipped());
+        assert!(tick_world_block_entities(dim, 0, &[], 42).is_empty());
+        assert_eq!(
+            dispatched() - d0,
+            2,
+            "only the brewing stand and the record jukebox may dispatch"
+        );
+        assert_eq!(skipped() - s0, 500, "every idle machine must skip");
+
+        // Vanilla progression: 399 quiet ticks, then the brew completes on
+        // tick 400 exactly like the single-stand fixture.
+        for tick in 1..400 {
+            assert!(tick_world_block_entities(dim, tick, &[], 42).is_empty());
+        }
+        assert_eq!(tick_world_block_entities(dim, 400, &[], 42), [
+            WorldBlockEntityEvent::Brewed { pos: brew_pos, ejected_glass_bottle: false }
+        ]);
+
+        // Once the brew finishes the stand goes inert and sleeps too: the
+        // next pass dispatches only the still-playing jukebox.
+        let (d1, s1) = (dispatched(), skipped());
+        assert!(tick_world_block_entities(dim, 401, &[], 42).is_empty());
+        assert_eq!(dispatched() - d1, 1);
+        assert_eq!(skipped() - s1, 501);
+
+        // The jukebox counted every dispatched pass: ticks 0..=401 = 402.
+        let VanillaBlockEntity::Jukebox(jukebox) = remove(dim, music_pos) else {
+            panic!("jukebox")
+        };
+        assert_eq!(jukebox.ticks_since_song_started, 402);
+        // The finished stand is inert with its brew state intact.
+        let VanillaBlockEntity::BrewingStand(stand) = remove(dim, brew_pos) else {
+            panic!("stand")
+        };
+        assert_eq!(stand.brew_time, 0);
+        assert_eq!(stand.fuel, 19);
+        for i in 0..250 {
+            remove(dim, (base.0 + i, base.1, base.2));
+            remove(dim, (base.0, base.1, base.2 + 1_000 + i));
+        }
     }
 }
 
@@ -10283,10 +10601,6 @@ mod vanilla_blocks_tests {
             let scratch = cell.borrow();
             assert!(
                 scratch.live_mobs.capacity() * std::mem::size_of::<(i64, [f64; 3])>()
-                    <= 256 * 1024
-            );
-            assert!(
-                scratch.positions.capacity() * std::mem::size_of::<(DimId, i32, i32, i32)>()
                     <= 256 * 1024
             );
             assert!(
