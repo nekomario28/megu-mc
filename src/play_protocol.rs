@@ -2254,6 +2254,17 @@ fn player_info_add(c: &Client) -> Vec<u8> {
     write_varint(&mut p, 0); // latency
     p
 }
+
+/// S2C `ClientboundPlayerInfoRemovePacket` (`0x3d`): a VarInt count followed
+/// by the UUIDs whose tab-list entries are removed.
+fn player_info_remove_pkt(uuids: &[[u8; 16]]) -> Vec<u8> {
+    let mut p = Vec::with_capacity(5 + uuids.len() * 16);
+    write_varint(&mut p, uuids.len() as i64);
+    for uuid in uuids {
+        p.extend_from_slice(uuid);
+    }
+    p
+}
 fn spawn_player(c: &Client) -> Vec<u8> {
     let (x, y, z, yaw, pitch, _g) = *c.pos.lock().unwrap_or_else(|e| e.into_inner());
     let mut p = Vec::new();
@@ -11062,16 +11073,22 @@ fn forget_per_eid_state(eid: i32) {
 struct ConnectionCleanupGuard {
     client: Option<Arc<Client>>,
     peer: String,
+    login: Option<connection_limits::LoginGuard>,
 }
 
 impl ConnectionCleanupGuard {
     /// Arm the guard the moment the client joins the online list: from then on
     /// the end of the handler's scope — clean exit or panic unwind alike —
     /// runs `disconnect_cleanup` exactly once.
-    fn new(client: Arc<Client>, peer: &str) -> Self {
+    fn new(
+        client: Arc<Client>,
+        peer: &str,
+        login: connection_limits::LoginGuard,
+    ) -> Self {
         Self {
             client: Some(client),
             peer: peer.to_owned(),
+            login: Some(login),
         }
     }
 }
@@ -11087,11 +11104,12 @@ impl std::ops::Drop for ConnectionCleanupGuard {
             // residual sweep in `handle` cover anything it could not finish.
             let peer = self.peer.clone();
             let cleanup_client = Arc::clone(&client);
+            let login = &mut self.login;
             let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || {
-                disconnect_cleanup(&cleanup_client, &peer);
+                disconnect_cleanup_with_login(&cleanup_client, &peer, login);
             }));
         } else {
-            disconnect_cleanup(&client, &self.peer);
+            disconnect_cleanup_with_login(&client, &self.peer, &mut self.login);
         }
         client.close_play_writer();
     }
@@ -11242,7 +11260,7 @@ fn handle_inner(mut s: TcpStream, live_eid: Arc<AtomicI32>) {
     // Held until this function returns, i.e. through the player's save on
     // logout: a second session under the same identity cannot start from stale
     // saved state or write over this one.
-    let _login = match LOGINS.reserve(&name, uuid) {
+    let login = match LOGINS.reserve(&name, uuid) {
         Ok(g) => g,
         Err(why) => {
             eprintln!("[security] duplicate login refused for {name} from {peer}: {why:?}");
@@ -11704,7 +11722,7 @@ fn handle_inner(mut s: TcpStream, live_eid: Arc<AtomicI32>) {
     // runs the whole disconnect teardown when this function's scope ends —
     // a clean `'conn` break and a panic unwind take the same path. `handle`'s
     // `forget_live_client` then sweeps anything a mid-unwind teardown missed.
-    let _disconnect_guard = ConnectionCleanupGuard::new(me.clone(), &peer);
+    let _disconnect_guard = ConnectionCleanupGuard::new(me.clone(), &peer, login);
     // An operator change can happen during the initial chunk stream, before
     // the client is present in the online list used by /op and /reload.
     if login_admin != client_is_admin(&me) {
@@ -16345,6 +16363,20 @@ mod play_protocol_opt_s2_tests {
 /// `ConnectionCleanupGuard`; `forget_live_client` covers the residual client
 /// list/maps when a panic interrupted it partway.
 fn disconnect_cleanup(me_cleanup: &Arc<Client>, peer: &str) {
+    disconnect_cleanup_with_login(me_cleanup, peer, &mut None);
+}
+
+fn disconnect_cleanup_with_login(
+    me_cleanup: &Arc<Client>,
+    peer: &str,
+    login: &mut Option<connection_limits::LoginGuard>,
+) {
+    // EOF ends the live session immediately. Do this before item, menu and
+    // persistence work so status/login admission stops counting a dead socket.
+    let mut cls = clients().lock().unwrap_or_else(|e| e.into_inner());
+    cls.retain(|c| c.eid != me_cleanup.eid);
+    let last_client_left = cls.is_empty();
+    drop(cls);
     {
         eprintln!("[spine] {} left (from {})", me_cleanup.name, peer);
         {
@@ -16450,6 +16482,10 @@ fn disconnect_cleanup(me_cleanup: &Arc<Client>, peer: &str) {
                 .unwrap_or_else(|e| e.into_inner())
                 .remove(&ender_container_key(&me_cleanup.uuid));
         }
+        // The player snapshot is now durable in memory/on disk. Let a fast
+        // reconnect load it while the remaining world and tracker cleanup runs.
+        // Keeping the reservation through the save prevents stale-state races.
+        drop(login.take());
         // vanilla `ServerPlayer.disconnect` -> `containerMenu.removed` -> stopOpen:
         // the leaving viewer stops counting before it leaves the client list. The window
         // is read into a local first: `if let Some(open) = *mutex.lock().unwrap_or_else(|e| e.into_inner())` holds
@@ -16470,10 +16506,6 @@ fn disconnect_cleanup(me_cleanup: &Arc<Client>, peer: &str) {
                 java_compat::S1Event::PlayerLogout(me_cleanup.eid, me_cleanup.name.clone()),
             );
         }
-        let mut cls = clients().lock().unwrap_or_else(|e| e.into_inner());
-        cls.retain(|c| c.eid != me_cleanup.eid);
-        let last_client_left = cls.is_empty();
-        drop(cls);
         *me_cleanup.sleeping.lock().unwrap_or_else(|e| e.into_inner()) = None;
         forget_per_eid_state(me_cleanup.eid);
         // `Entity.remove` on the leaving player: they step out of any vehicle
@@ -16484,10 +16516,14 @@ fn disconnect_cleanup(me_cleanup: &Arc<Client>, peer: &str) {
         detach_tethers_involving(me_cleanup.eid, None);
         // vanilla culls the destroy to this entity's trackers
         broadcast_seen_destroy(me_cleanup.eid);
-        let mut p = Vec::new();
-        write_varint(&mut p, 1);
-        p.extend_from_slice(&me_cleanup.uuid);
-        broadcast_packet(me_cleanup.eid, 0x3d, &p);
+        let p = player_info_remove_pkt(&[me_cleanup.uuid]);
+        for viewer in client_snapshot() {
+            let _ = send_packet(
+                &mut viewer.sock.lock().unwrap_or_else(|e| e.into_inner()),
+                0x3d,
+                p.clone(),
+            );
+        }
         // `PlayerList.remove` also drops the name from everyone's completion
         // set — the `custom_chat_completions` remove complement to the join add.
         let (_, gone_name) =
@@ -24020,6 +24056,13 @@ mod security_hardening_tests {
         client.eid = 97001; // unique: parallel tests share the static tables
         let me = Arc::new(client);
         let eid = me.eid;
+        let login = LOGINS
+            .reserve(&me.name, me.uuid)
+            .expect("initial active login reserves its identity");
+        assert!(
+            LOGINS.reserve(&me.name, me.uuid).is_err(),
+            "an active live connection still rejects a duplicate login"
+        );
 
         clients()
             .lock()
@@ -24075,7 +24118,7 @@ mod security_hardening_tests {
         // The panic unwinds through the guard's Drop — exactly the leak the
         // audit found when a mid-loop panic skipped the teardown block.
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            let _guard = ConnectionCleanupGuard::new(me.clone(), "127.0.0.1:test");
+            let _guard = ConnectionCleanupGuard::new(me.clone(), "127.0.0.1:test", login);
             panic!("simulated handler panic");
         }));
         assert!(result.is_err(), "the simulated panic reached the harness");
@@ -24171,6 +24214,60 @@ mod security_hardening_tests {
                 .unwrap_or_else(|e| e.into_inner())
                 .contains_key("totem-test"),
             "disconnect saved the position snapshot"
+        );
+        assert!(
+            LOGINS.reserve(&me.name, me.uuid).is_ok(),
+            "disconnect releases the identity reservation after saving, allowing immediate reconnect"
+        );
+    }
+
+    #[test]
+    fn player_info_remove_packet_encodes_count_and_uuid_bytes() {
+        let uuids = [[0x11; 16], [0x22; 16]];
+        let packet = player_info_remove_pkt(&uuids);
+        let mut expected = vec![2];
+        expected.extend_from_slice(&uuids[0]);
+        expected.extend_from_slice(&uuids[1]);
+        assert_eq!(packet, expected, "0x3d is VarInt count followed by UUIDs");
+    }
+
+    #[test]
+    fn duplicate_login_is_rejected_while_live_and_allowed_after_disconnect_save() {
+        let _world = world_guard();
+        let (mut client, _peer) = effect_tests::client_pair();
+        client.eid = 97003;
+        client.name = "reconnect-after-save".to_owned();
+        client.uuid = [0x63; 16];
+        let me = Arc::new(client);
+        let login = LOGINS
+            .reserve(&me.name, me.uuid)
+            .expect("first connection reserves identity");
+        assert!(
+            LOGINS.reserve(&me.name, me.uuid).is_err(),
+            "a second active connection remains refused"
+        );
+        clients()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .push(me.clone());
+
+        drop(ConnectionCleanupGuard::new(
+            me.clone(),
+            "127.0.0.1:reconnect-test",
+            login,
+        ));
+
+        assert!(
+            !clients()
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .iter()
+                .any(|client| client.eid == me.eid),
+            "EOF cleanup unregisters the client before reconnect"
+        );
+        assert!(
+            LOGINS.reserve(&me.name, me.uuid).is_ok(),
+            "saved disconnect state allows an immediate reconnect"
         );
     }
 
