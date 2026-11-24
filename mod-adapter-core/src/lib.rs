@@ -78,6 +78,17 @@
 //!   plain language which files are auto-skipped as
 //!   [`fallback::BUILTIN_SUPERSEDED_PERF_MODS`], which are client-only,
 //!   which run natively, and which still need a bytecode inspection.
+//! - [`colossal_and_forge`]: generic colossal multi-part creature and
+//!   multi-block forge primitives — a five-stage
+//!   [`colossal_and_forge::GrowthStageCurve`] with smooth `0.35..=2.2`
+//!   hitbox scaling and a `flight_unlock_stage` gate, yaw/pitch-rotated
+//!   multi-part AABBs with per-part damage multipliers and ray hit
+//!   testing, a stage-gated mounted-flight controller with stamina and
+//!   safe-landing detection, bounded elemental breath cones (<= 48
+//!   blocks reach, <= 256 block transforms per tick) driving declarative
+//!   terrain-transform tables and lightning chain-arcs, and a generic
+//!   `validate_structure` multi-block forge with breath-charged heat and
+//!   lossless alloy smelting — all data-driven, zero mod-specific code.
 //! - [`creature_primitives`]: generic zero-mod-name creature primitives —
 //!   a declarative [`creature_primitives::CreatureSpec`]/[`creature_primitives::CreatureState`]
 //!   tame/breed/command-mode state machine (`Follow`/`Sit`/`Wander`, healing,
@@ -185,6 +196,7 @@ pub mod blockstates;
 pub mod bytecode_subset_vm;
 pub mod capability_bus;
 pub mod class_mixin_scanner;
+pub mod colossal_and_forge;
 pub mod creature_primitives;
 pub mod culinary_adapter;
 pub mod custom_media;
@@ -213,6 +225,10 @@ pub mod vanilla_qol_and_holidays;
 pub mod version_compat;
 pub mod world_extensions;
 
+pub use colossal_and_forge::{
+    ElementKind, ElementalBreathSpec, GrowthStageCurve, GrowthStageSpec, MultiBlockForgeRuntime,
+    MultiBlockForgeSpec, MultiPartHitbox, PartKind,
+};
 pub use dimension_mod::{
     DimEntryDescriptor, DimTypeDescriptor, DimensionEnvProfile, DimensionModClassification,
     DimensionModData, DimensionModProfile, GeneratorKind, PortalRegistry, PortalRule,

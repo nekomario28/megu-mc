@@ -343,6 +343,65 @@ fn modrinth_loaders_for(preferred: &[ModLoaderKind]) -> Vec<ModrinthLoader> {
 }
 
 // ---------------------------------------------------------------------------
+// Library-shim classifier — pure config/utility deps vs gameplay mods
+// ---------------------------------------------------------------------------
+
+/// Mod ids of well-known pure configuration/utility library shims: these
+/// ship config screens, animation frameworks, shared registries, or
+/// common code — but no gameplay content of their own, so a missing one
+/// only blocks the *requiring* mod and adds nothing by itself.
+///
+/// The list is deliberately conservative: only ids that are
+/// unambiguously library-only are included (mod-loader `modid`s, not
+/// display names — `jupiter`/`uranus` are the config and utility shims
+/// colossal-creature ecosystems like IceAndFire CE depend on, `citadel`
+/// is its animation library, `cloth-config`/`yacl` are config screens,
+/// `architectury`/`balm`/`puzzleslib`/`bookshelf`/`placebo`/`rhino`/
+/// `resourcefullib` are shared library platforms, `geckolib` is an
+/// animation library, `collective`/`supermartijn642configlib`/
+/// `cupboard`/`forgeconfigapiport`/`kotlinforforge` are pure
+/// config/language shims).
+pub const KNOWN_CONFIG_UTILITY_LIBRARY_MODS: &[&str] = &[
+    "architectury",
+    "balm",
+    "bookshelf",
+    "citadel",
+    "cloth_config",
+    "collective",
+    "cupboard",
+    "forgeconfigapiport",
+    "geckolib",
+    "jupiter",
+    "kotlinforforge",
+    "placebo",
+    "puzzleslib",
+    "resourcefullib",
+    "rhino",
+    "supermartijn642configlib",
+    "uranus",
+    "yacl",
+    "yet_another_config_lib",
+];
+
+/// Whether `mod_id` names a known pure config/utility library shim — a
+/// dependency supplying no gameplay content itself. Comparison is
+/// case-insensitive and treats `-`/` ` as `_` (`cloth-config`,
+/// `Cloth-Config`, and `cloth_config` classify identically). Unknown ids
+/// return `false` — fail-closed toward "gameplay mod", never the
+/// reverse.
+///
+/// Recovery guidance uses this to distinguish "install this library so
+/// the requiring mod loads" from "this dependency actually adds
+/// content".
+pub fn is_config_or_utility_library_mod(mod_id: &str) -> bool {
+    let normalized = mod_id
+        .trim()
+        .to_ascii_lowercase()
+        .replace(['-', ' '], "_");
+    !normalized.is_empty() && KNOWN_CONFIG_UTILITY_LIBRARY_MODS.contains(&normalized.as_str())
+}
+
+// ---------------------------------------------------------------------------
 // MissingDepQuery — exact Modrinth v2 query URL for one missing dependency
 // ---------------------------------------------------------------------------
 
@@ -1079,6 +1138,14 @@ pub fn plan_dep_recovery(
         );
         entry.instruction_en = en;
         entry.instruction_ja = ja;
+        if is_config_or_utility_library_mod(&entry.required_mod_id) {
+            entry.instruction_en.push_str(
+                " [pure config/utility library — supplies no gameplay content itself]",
+            );
+            entry.instruction_ja.push_str(
+                "［純粋な設定/ユーティリティライブラリ — 単体ではゲームプレイ要素なし］",
+            );
+        }
         entries.push(entry);
     }
 
@@ -1547,5 +1614,38 @@ mod tests {
         // Truncated and non-hex inputs fail closed.
         assert!(parse_sha512_hex(&hex(&digest)[..126]).is_none());
         assert!(parse_sha512_hex(&"z".repeat(128)).is_none());
+    }
+
+    #[test]
+    fn library_shim_classifier_recognizes_known_shims() {
+        for id in [
+            "jupiter",
+            "uranus",
+            "citadel",
+            "cloth-config",
+            "architectury",
+            "geckolib",
+            "balm",
+            "puzzleslib",
+            "yet-another-config-lib",
+        ] {
+            assert!(is_config_or_utility_library_mod(id), "{id}");
+        }
+        // Case-insensitive and dash/underscore-insensitive.
+        assert!(is_config_or_utility_library_mod("Cloth-Config"));
+        assert!(is_config_or_utility_library_mod("YACL"));
+        assert!(is_config_or_utility_library_mod(" yet_another_config_lib "));
+        // Gameplay mods, unknown ids, near-misses and empties fail closed.
+        for id in [
+            "iceandfire",
+            "sodium",
+            "jei",
+            "uranus2",
+            "jupiterx",
+            "",
+            "  ",
+        ] {
+            assert!(!is_config_or_utility_library_mod(id), "{id}");
+        }
     }
 }

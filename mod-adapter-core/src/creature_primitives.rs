@@ -29,6 +29,7 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
+use crate::colossal_and_forge::GrowthStageCurve;
 use crate::neoforge_wire::{read_varint, write_varint};
 
 // ===========================================================================
@@ -174,6 +175,43 @@ impl CreatureState {
     /// `true` when `uuid` is the recorded owner.
     pub fn owned_by(&self, uuid: &[u8; 16]) -> bool {
         self.owner_uuid.as_ref() == Some(uuid)
+    }
+
+    /// Lifetime ticks for growth-curve staging — the bridge into
+    /// [`crate::colossal_and_forge::GrowthStageCurve`].
+    ///
+    /// `age` follows the vanilla convention (negative while a baby, `0`
+    /// for a fresh adult); colossal-creature hosts may keep incrementing
+    /// `age` past `0` to count lifetime beyond vanilla maturity.
+    /// `birth_age_ticks` is the gestation/maturation length encoded as a
+    /// negative `age` at spawn (e.g. `spec.baby_growth_ticks`), so the
+    /// returned counter is exactly `birth_age_ticks + age` clamped at
+    /// `0` — ticks lived since spawn.
+    pub fn growth_age_ticks(&self, birth_age_ticks: u32) -> u64 {
+        (birth_age_ticks as i64 + i64::from(self.age)).max(0) as u64
+    }
+
+    /// `1..=5` growth stage under `curve` for this creature's lifetime.
+    pub fn growth_stage(&self, curve: &GrowthStageCurve, birth_age_ticks: u32) -> u8 {
+        curve.stage_for_age_ticks(self.growth_age_ticks(birth_age_ticks))
+    }
+
+    /// Effective maximum health: `spec.max_health` scaled by the growth
+    /// curve's smooth health multiplier at this creature's lifetime.
+    pub fn effective_max_health(
+        &self,
+        spec: &CreatureSpec,
+        curve: &GrowthStageCurve,
+        birth_age_ticks: u32,
+    ) -> f32 {
+        (spec.max_health
+            * curve.max_health_multiplier_at(self.growth_age_ticks(birth_age_ticks)))
+        .max(0.0)
+    }
+
+    /// `true` once this creature's growth stage unlocks mounted flight.
+    pub fn flight_unlocked(&self, curve: &GrowthStageCurve, birth_age_ticks: u32) -> bool {
+        curve.flight_unlocked_at(self.growth_age_ticks(birth_age_ticks))
     }
 }
 
@@ -936,5 +974,63 @@ pub fn decode_metadata_entries(bytes: &[u8]) -> Option<BTreeMap<u8, MetaValue>> 
         let type_id = u8::try_from(read_varint(bytes, &mut cursor)?).ok()?;
         let value = MetaValue::decode_value(type_id, bytes, &mut cursor)?;
         slots.insert(index, value);
+    }
+}
+
+// ===========================================================================
+// Tests
+// ===========================================================================
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn bear_spec() -> CreatureSpec {
+        CreatureSpec {
+            entity_type: "anyzoo:bear".to_string(),
+            max_health: 30.0,
+            tame_items: Vec::new(),
+            tame_chance: 0.5,
+            breed_items: Vec::new(),
+            heal_items: Vec::new(),
+            baby_growth_ticks: DEFAULT_BABY_GROWTH_TICKS,
+            breed_cooldown_ticks: DEFAULT_BREED_COOLDOWN_TICKS,
+            supports_wander_mode: true,
+            can_shoulder_perch: false,
+            rideable_when_tamed: true,
+            movement: MovementProfile::Land { ground_speed: 0.25 },
+        }
+    }
+
+    #[test]
+    fn growth_age_ticks_counts_lifetime_since_spawn() {
+        let mut c = CreatureState::new(1, "anyzoo:bear", 30.0, [0.0; 3]);
+        c.age = -24_000; // just hatched
+        assert_eq!(c.growth_age_ticks(DEFAULT_BABY_GROWTH_TICKS), 0);
+        c.age = -1; // one tick before vanilla adulthood
+        assert_eq!(c.growth_age_ticks(DEFAULT_BABY_GROWTH_TICKS), 23_999);
+        c.age = 0; // fresh adult
+        assert_eq!(c.growth_age_ticks(DEFAULT_BABY_GROWTH_TICKS), 24_000);
+        // Hosts may drive `age` positive to count lifetime past maturity.
+        c.age = 96_000;
+        assert_eq!(c.growth_age_ticks(DEFAULT_BABY_GROWTH_TICKS), 120_000);
+    }
+
+    #[test]
+    fn growth_stage_and_flight_unlock_bridge_the_curve() {
+        let curve = GrowthStageCurve::default(); // flight at stage 3
+        let spec = bear_spec();
+        let mut c = CreatureState::new(1, "anyzoo:bear", 30.0, [0.0; 3]);
+        c.age = -24_000;
+        assert_eq!(c.growth_stage(&curve, DEFAULT_BABY_GROWTH_TICKS), 1);
+        assert!(!c.flight_unlocked(&curve, DEFAULT_BABY_GROWTH_TICKS));
+        c.age = 48_000; // 72_000 lifetime ticks -> stage 3 exactly
+        assert_eq!(c.growth_stage(&curve, DEFAULT_BABY_GROWTH_TICKS), 3);
+        assert!(c.flight_unlocked(&curve, DEFAULT_BABY_GROWTH_TICKS));
+        // effective_max_health tracks the curve multiplier (stage 3 = 1.0).
+        assert!((c.effective_max_health(&spec, &curve, DEFAULT_BABY_GROWTH_TICKS) - 30.0).abs() < 0.01);
+        // A hatchling (stage 1, multiplier 0.4) is much frailer.
+        c.age = -24_000;
+        assert!((c.effective_max_health(&spec, &curve, DEFAULT_BABY_GROWTH_TICKS) - 12.0).abs() < 0.01);
     }
 }
