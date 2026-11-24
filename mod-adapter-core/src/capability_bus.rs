@@ -249,6 +249,38 @@ pub trait FluidTransferHandler {
         filter_fluid: Option<&str>,
         simulate: bool,
     ) -> Option<CapabilityFluidStack>;
+
+    /// Number of addressable tanks. Single-tank endpoints (the common
+    /// case) keep the default `1`; multi-tank machines override.
+    fn fluid_tank_count(&self) -> usize {
+        1
+    }
+
+    /// Non-mutating snapshot of tank `tank`'s contents. The default
+    /// reports `None`; endpoints that can observe a tank without
+    /// draining it override (see [`SimpleFluidTank`]).
+    fn peek_fluid(&self, tank: usize) -> Option<CapabilityFluidStack> {
+        let _ = tank;
+        None
+    }
+
+    /// Face-agnostic convenience fill (internal access, `None` face):
+    /// returns milli-buckets accepted. `simulate: true` must not mutate.
+    fn insert_fluid(&mut self, fluid: CapabilityFluidStack, simulate: bool) -> u64 {
+        self.fill_fluid(None, &fluid, simulate)
+    }
+
+    /// Face-agnostic convenience drain (internal access, `None` face),
+    /// restricted to `fluid_filter` when given. `simulate: true` must
+    /// not mutate.
+    fn extract_fluid(
+        &mut self,
+        fluid_filter: Option<&str>,
+        max_mb: u64,
+        simulate: bool,
+    ) -> Option<CapabilityFluidStack> {
+        self.drain_fluid(None, max_mb, fluid_filter, simulate)
+    }
 }
 
 /// Energy-side block capability (`IEnergyStorage` analogue; amounts in
@@ -283,6 +315,158 @@ pub trait EnergyTransferHandler {
 
     /// FE capacity.
     fn max_energy_stored(&self) -> u64;
+
+    /// Face-agnostic convenience alias for
+    /// [`energy_stored`](Self::energy_stored).
+    fn stored_fe(&self) -> u64 {
+        self.energy_stored()
+    }
+
+    /// Face-agnostic convenience alias for
+    /// [`max_energy_stored`](Self::max_energy_stored).
+    fn capacity_fe(&self) -> u64 {
+        self.max_energy_stored()
+    }
+
+    /// Face-agnostic convenience receive (internal access, `None`
+    /// face): returns FE accepted. `simulate: true` must not mutate.
+    fn receive_fe(&mut self, max_fe: u64, simulate: bool) -> u64 {
+        self.receive_energy(None, max_fe, simulate)
+    }
+
+    /// Face-agnostic convenience extract (internal access, `None`
+    /// face): returns FE provided. `simulate: true` must not mutate.
+    fn extract_fe(&mut self, max_fe: u64, simulate: bool) -> u64 {
+        self.extract_energy(None, max_fe, simulate)
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Energy units — one internal FE canonical form, declared unit kept
+// alongside so cross-mod conversions stay explicit.
+// ---------------------------------------------------------------------------
+
+/// Energy unit family an [`EnergyAmount`] is denominated in. FE is the
+/// bus-internal canonical unit; RF, EU, and Create-style kinetic Stress
+/// (SU) convert through [`EnergyConversionRates`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum EnergyUnit {
+    /// Forge Energy (the canonical unit).
+    Fe,
+    /// Redstone Flux — `1 RF == 1 FE` by default.
+    Rf,
+    /// Industrial EU — `1 EU == 4 FE` by default.
+    Eu,
+    /// Rotational Stress Units — `1 SU == 2 FE` by default.
+    StressSu,
+}
+
+/// Integer FE-per-unit conversion table. All math is saturating: a
+/// hostile or absurd `u64::MAX` amount clamps instead of overflowing,
+/// and there is no floating point anywhere (zero NaN, zero rounding
+/// drift). A `0` rate is treated as `1` so division can never panic —
+/// callers that need lossless conversion check
+/// [`EnergyConversionRates::converts_losslessly`] first.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct EnergyConversionRates {
+    /// FE per 1 RF (default `1`).
+    pub fe_per_rf: u64,
+    /// FE per 1 EU (default `4`).
+    pub fe_per_eu: u64,
+    /// FE per 1 Stress SU (default `2`).
+    pub fe_per_stress_su: u64,
+}
+
+impl Default for EnergyConversionRates {
+    fn default() -> Self {
+        Self {
+            fe_per_rf: 1,
+            fe_per_eu: 4,
+            fe_per_stress_su: 2,
+        }
+    }
+}
+
+impl EnergyConversionRates {
+    /// FE-per-unit rate for `unit`, never `0` (a `0`-configured rate
+    /// degrades to identity rather than dividing by zero).
+    pub fn fe_per(&self, unit: EnergyUnit) -> u64 {
+        let rate = match unit {
+            EnergyUnit::Fe => 1,
+            EnergyUnit::Rf => self.fe_per_rf,
+            EnergyUnit::Eu => self.fe_per_eu,
+            EnergyUnit::StressSu => self.fe_per_stress_su,
+        };
+        rate.max(1)
+    }
+
+    /// Convert `amount` of `unit` into canonical FE, saturating at
+    /// `u64::MAX`.
+    pub fn to_fe(&self, unit: EnergyUnit, amount: u64) -> u64 {
+        amount.saturating_mul(self.fe_per(unit))
+    }
+
+    /// Convert canonical `fe` into `unit`, rounding down (the remainder
+    /// cannot be represented in the coarser unit).
+    pub fn from_fe(&self, unit: EnergyUnit, fe: u64) -> u64 {
+        fe / self.fe_per(unit)
+    }
+
+    /// `true` when `amount` of `from` converts to `to` with no remainder
+    /// — the strict check callers use before a lossless-only exchange.
+    pub fn converts_losslessly(
+        &self,
+        from: EnergyUnit,
+        to: EnergyUnit,
+        amount: u64,
+    ) -> bool {
+        let fe = self.to_fe(from, amount);
+        fe != u64::MAX && fe.is_multiple_of(self.fe_per(to))
+    }
+}
+
+/// An amount of energy denominated in a specific [`EnergyUnit`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct EnergyAmount {
+    /// Unit family.
+    pub unit: EnergyUnit,
+    /// Amount in `unit`.
+    pub amount: u64,
+}
+
+impl EnergyAmount {
+    /// `amount` of `unit`.
+    pub fn new(unit: EnergyUnit, amount: u64) -> Self {
+        Self { unit, amount }
+    }
+
+    /// Canonical FE equivalent under `rates` (saturating).
+    pub fn to_fe(&self, rates: &EnergyConversionRates) -> u64 {
+        rates.to_fe(self.unit, self.amount)
+    }
+
+    /// Re-denominate into `target`, rounding down when the FE value is
+    /// not an exact multiple of the target rate.
+    pub fn convert(&self, target: EnergyUnit, rates: &EnergyConversionRates) -> EnergyAmount {
+        EnergyAmount {
+            unit: target,
+            amount: rates.from_fe(target, self.to_fe(rates)),
+        }
+    }
+
+    /// Re-denominate into `target` only when the conversion is exact;
+    /// `None` on any remainder or saturation.
+    pub fn convert_exact(
+        &self,
+        target: EnergyUnit,
+        rates: &EnergyConversionRates,
+    ) -> Option<EnergyAmount> {
+        if rates.converts_losslessly(self.unit, target, self.amount) {
+            Some(self.convert(target, rates))
+        } else {
+            None
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -491,13 +675,43 @@ impl BlockCapabilityBus {
         to_face: Option<FaceDirection>,
         max_mb: u64,
     ) -> u64 {
+        self.transfer_fluid_impl(from, from_face, to, to_face, None, max_mb)
+    }
+
+    /// Face-agnostic [`transfer_fluid_between`](Self::transfer_fluid_between)
+    /// restricted to a single fluid id: only `fluid_filter` (when
+    /// `Some`) may move, and a rejecting or full destination leaks zero
+    /// mB. Internal (`None` face) access on both endpoints.
+    pub fn transfer_fluid_between_filtered(
+        &mut self,
+        from: &BlockCoord,
+        to: &BlockCoord,
+        fluid_filter: Option<&str>,
+        max_mb: u64,
+    ) -> u64 {
+        self.transfer_fluid_impl(from, None, to, None, fluid_filter, max_mb)
+    }
+
+    /// Shared simulate-then-commit fluid move. `fluid_filter`
+    /// constrains the probe drain; the committed drain then pins the
+    /// *probed* fluid id so the destination can never receive a fluid
+    /// it did not simulate.
+    fn transfer_fluid_impl(
+        &mut self,
+        from: &BlockCoord,
+        from_face: Option<FaceDirection>,
+        to: &BlockCoord,
+        to_face: Option<FaceDirection>,
+        fluid_filter: Option<&str>,
+        max_mb: u64,
+    ) -> u64 {
         if from == to || max_mb == 0 {
             return 0;
         }
         let Some(src) = self.fluids.get_mut(from) else {
             return 0;
         };
-        let Some(probe) = src.drain_fluid(from_face, max_mb, None, true) else {
+        let Some(probe) = src.drain_fluid(from_face, max_mb, fluid_filter, true) else {
             return 0;
         };
         if probe.is_empty() {
@@ -879,6 +1093,18 @@ impl FluidTransferHandler for SimpleFluidTank {
             Some(out)
         }
     }
+
+    fn fluid_tank_count(&self) -> usize {
+        1
+    }
+
+    fn peek_fluid(&self, tank: usize) -> Option<CapabilityFluidStack> {
+        if tank == 0 {
+            self.fluid.clone()
+        } else {
+            None
+        }
+    }
 }
 
 /// Generic FE buffer endpoint with per-direction rate limits.
@@ -958,6 +1184,10 @@ impl EnergyTransferHandler for SimpleEnergyBuffer {
         self.capacity_fe
     }
 }
+
+/// [`SimpleEnergyBuffer`] under its generic storage name — the ready-made
+/// reusable FE endpoint for tests and mod machines.
+pub type SimpleEnergyStorage = SimpleEnergyBuffer;
 
 // ---------------------------------------------------------------------------
 // Living cross-mod proof: culinary cooking pot as an ItemTransferHandler
@@ -1138,5 +1368,244 @@ impl ItemTransferHandler for CookingPotItemAdapter {
 
     fn slots(&self) -> usize {
         crate::culinary_adapter::POT_INPUT_SLOTS + 2 // inputs + container + output
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Tests
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn coord(dim: &str, x: i32) -> BlockCoord {
+        BlockCoord::new(dim, x, 64, 0)
+    }
+
+    fn stored_fluid(bus: &BlockCapabilityBus, at: &BlockCoord) -> Option<CapabilityFluidStack> {
+        bus.fluid_endpoint(at)
+            .and_then(|h| h.as_any().downcast_ref::<SimpleFluidTank>())
+            .and_then(|t| t.fluid().cloned())
+    }
+
+    fn stored_fe(bus: &BlockCapabilityBus, at: &BlockCoord) -> Option<u64> {
+        bus.energy_endpoint(at).map(|h| h.energy_stored())
+    }
+
+    #[test]
+    fn filtered_fluid_transfer_rolls_back_and_never_leaks() {
+        let mut bus = BlockCapabilityBus::new();
+        let src_at = coord("mod_a:dim", 0);
+        let dst_at = coord("mod_b:dim", 1);
+        let missing_at = coord("mod_b:dim", 9);
+
+        let mut src = SimpleFluidTank::new(4000);
+        src.set_fluid(Some(CapabilityFluidStack::new("mod_a:steam", 2000)));
+        bus.register_fluid_handler(src_at.clone(), Box::new(src));
+        bus.register_fluid_handler(dst_at.clone(), Box::new(SimpleFluidTank::new(500)));
+
+        // Filter mismatch: destination never sees the probe.
+        assert_eq!(
+            bus.transfer_fluid_between_filtered(&src_at, &dst_at, Some("mod_a:lava"), 2000),
+            0
+        );
+        // Matching filter, destination caps at 500 mB.
+        assert_eq!(
+            bus.transfer_fluid_between_filtered(&src_at, &dst_at, Some("mod_a:steam"), 2000),
+            500
+        );
+        assert_eq!(stored_fluid(&bus, &src_at).map(|f| f.amount_mb), Some(1500));
+        assert_eq!(
+            stored_fluid(&bus, &dst_at),
+            Some(CapabilityFluidStack::new("mod_a:steam", 500))
+        );
+
+        // Destination now full: zero draw, zero leak.
+        assert_eq!(
+            bus.transfer_fluid_between_filtered(&src_at, &dst_at, Some("mod_a:steam"), 1000),
+            0
+        );
+        assert_eq!(stored_fluid(&bus, &src_at).map(|f| f.amount_mb), Some(1500));
+
+        // Incompatible fluid in the destination rejects everything.
+        let mut dst = SimpleFluidTank::new(1000);
+        dst.set_fluid(Some(CapabilityFluidStack::new("mod_b:oil", 100)));
+        let oil_at = coord("mod_b:dim", 2);
+        bus.register_fluid_handler(oil_at.clone(), Box::new(dst));
+        assert_eq!(
+            bus.transfer_fluid_between_filtered(&src_at, &oil_at, Some("mod_a:steam"), 1000),
+            0,
+            "destination holding a different fluid rejects the fill"
+        );
+        assert_eq!(
+            stored_fluid(&bus, &src_at).map(|f| f.amount_mb),
+            Some(1500),
+            "rejected commit rolls back into the source whole"
+        );
+        assert_eq!(
+            stored_fluid(&bus, &oil_at).map(|f| f.amount_mb),
+            Some(100),
+            "destination untouched"
+        );
+
+        // Missing endpoints and self-transfers move nothing.
+        assert_eq!(
+            bus.transfer_fluid_between_filtered(&src_at, &missing_at, None, 100),
+            0
+        );
+        assert_eq!(
+            bus.transfer_fluid_between_filtered(&src_at, &src_at, None, 100),
+            0
+        );
+        assert_eq!(stored_fluid(&bus, &src_at).map(|f| f.amount_mb), Some(1500));
+    }
+
+    #[test]
+    fn faceless_fluid_convenience_and_peek() {
+        let mut tank = SimpleFluidTank::new(1000);
+        assert_eq!(tank.fluid_tank_count(), 1);
+        assert!(tank.peek_fluid(0).is_none());
+        assert!(tank.peek_fluid(1).is_none(), "out-of-range tank");
+
+        // Simulated insert must not mutate.
+        assert_eq!(
+            tank.insert_fluid(CapabilityFluidStack::new("mod_a:biofuel", 2000), true),
+            1000
+        );
+        assert!(tank.peek_fluid(0).is_none(), "simulate left the tank empty");
+
+        assert_eq!(
+            tank.insert_fluid(CapabilityFluidStack::new("mod_a:biofuel", 700), false),
+            700
+        );
+        assert_eq!(
+            tank.peek_fluid(0),
+            Some(CapabilityFluidStack::new("mod_a:biofuel", 700))
+        );
+
+        // Filtered extract honours the fluid id; simulate does not mutate.
+        assert!(tank
+            .extract_fluid(Some("mod_b:other"), 500, true)
+            .is_none());
+        assert_eq!(
+            tank.extract_fluid(Some("mod_a:biofuel"), 500, true),
+            Some(CapabilityFluidStack::new("mod_a:biofuel", 500))
+        );
+        assert_eq!(
+            tank.extract_fluid(Some("mod_a:biofuel"), 500, false),
+            Some(CapabilityFluidStack::new("mod_a:biofuel", 500))
+        );
+        assert_eq!(
+            tank.peek_fluid(0),
+            Some(CapabilityFluidStack::new("mod_a:biofuel", 200))
+        );
+    }
+
+    #[test]
+    fn energy_units_convert_saturating_and_exact() {
+        let rates = EnergyConversionRates::default();
+        assert_eq!(EnergyAmount::new(EnergyUnit::Rf, 7).to_fe(&rates), 7);
+        assert_eq!(EnergyAmount::new(EnergyUnit::Eu, 7).to_fe(&rates), 28);
+        assert_eq!(EnergyAmount::new(EnergyUnit::StressSu, 7).to_fe(&rates), 14);
+        assert_eq!(EnergyAmount::new(EnergyUnit::Fe, 7).to_fe(&rates), 7);
+
+        // Saturating: no overflow, no panic.
+        assert_eq!(
+            EnergyAmount::new(EnergyUnit::Eu, u64::MAX).to_fe(&rates),
+            u64::MAX
+        );
+
+        // Floor division vs exact conversion.
+        let three_eu = EnergyAmount::new(EnergyUnit::Eu, 3); // 12 FE
+        assert_eq!(three_eu.convert(EnergyUnit::StressSu, &rates).amount, 6);
+        let five_fe = EnergyAmount::new(EnergyUnit::Fe, 5); // 5 FE -> 1 EU (+1 remainder)
+        assert_eq!(five_fe.convert(EnergyUnit::Eu, &rates).amount, 1);
+        assert!(five_fe.convert_exact(EnergyUnit::Eu, &rates).is_none());
+        assert_eq!(
+            EnergyAmount::new(EnergyUnit::Fe, 8)
+                .convert_exact(EnergyUnit::Eu, &rates),
+            Some(EnergyAmount::new(EnergyUnit::Eu, 2))
+        );
+
+        // A zero-configured rate degrades to 1:1 rather than panicking.
+        let zero = EnergyConversionRates {
+            fe_per_rf: 1,
+            fe_per_eu: 0,
+            fe_per_stress_su: 0,
+        };
+        assert_eq!(zero.from_fe(EnergyUnit::Eu, 9), 9);
+        assert_eq!(zero.to_fe(EnergyUnit::StressSu, 9), 9);
+    }
+
+    #[test]
+    fn three_mod_energy_chain_conserves_fe() {
+        let mut bus = BlockCapabilityBus::new();
+        let gen_at = coord("mod_a:dim", 0); // generator
+        let battery_at = coord("mod_b:dim", 1); // battery
+        let consumer_at = coord("mod_c:dim", 2); // consumer
+
+        // Mod A generator produces EU; the bus stores canonical FE.
+        let rates = EnergyConversionRates::default();
+        let generated = EnergyAmount::new(EnergyUnit::Eu, 2_500);
+        let mut gen = SimpleEnergyBuffer::new(100_000);
+        gen.set_stored(generated.to_fe(&rates)); // 10_000 FE
+        bus.register_energy_handler(gen_at.clone(), Box::new(gen));
+        bus.register_energy_handler(
+            battery_at.clone(),
+            Box::new(SimpleEnergyBuffer::new(8_000)),
+        );
+        bus.register_energy_handler(
+            consumer_at.clone(),
+            Box::new(SimpleEnergyStorage::new(4_000)),
+        );
+
+        let before: u64 = [&gen_at, &battery_at, &consumer_at]
+            .iter()
+            .filter_map(|at| stored_fe(&bus, at))
+            .sum();
+        assert_eq!(before, 10_000);
+
+        // Generator -> battery: clamped by the battery's 8k capacity.
+        assert_eq!(
+            bus.transfer_energy_between(&gen_at, None, &battery_at, None, 10_000),
+            8_000
+        );
+        // Battery -> consumer: clamped by the consumer's 4k capacity.
+        assert_eq!(
+            bus.transfer_energy_between(&battery_at, None, &consumer_at, None, 8_000),
+            4_000
+        );
+
+        // Strict conservation: 2000 gen + 4000 battery + 4000 consumer.
+        assert_eq!(stored_fe(&bus, &gen_at), Some(2_000));
+        assert_eq!(stored_fe(&bus, &battery_at), Some(4_000));
+        assert_eq!(stored_fe(&bus, &consumer_at), Some(4_000));
+        let after: u64 = [&gen_at, &battery_at, &consumer_at]
+            .iter()
+            .filter_map(|at| stored_fe(&bus, at))
+            .sum();
+        assert_eq!(after, before, "zero FE created or destroyed");
+
+        // Face-agnostic convenience API mutates only on commit.
+        {
+            let consumer = bus
+                .energy_endpoint_mut(&consumer_at)
+                .expect("consumer registered");
+            assert_eq!(consumer.capacity_fe(), 4_000);
+            assert_eq!(consumer.extract_fe(1_000, true), 1_000);
+            assert_eq!(consumer.stored_fe(), 4_000, "simulate did not drain");
+            assert_eq!(consumer.extract_fe(1_000, false), 1_000);
+            assert_eq!(consumer.stored_fe(), 3_000);
+            assert_eq!(consumer.receive_fe(500, false), 500);
+            assert_eq!(consumer.stored_fe(), 3_500);
+        }
+        // One conservation-still-holds check after the convenience calls:
+        // extracted 1000, received 500 -> net -500.
+        let final_total: u64 = [&gen_at, &battery_at, &consumer_at]
+            .iter()
+            .filter_map(|at| stored_fe(&bus, at))
+            .sum();
+        assert_eq!(final_total, 9_500);
     }
 }

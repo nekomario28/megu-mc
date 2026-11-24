@@ -184,10 +184,21 @@
 //!   [`capability_bus::BlockCoord`]s, lossless component-carrying
 //!   [`capability_bus::CapabilityItemStack`]s, atomic simulate-then-commit
 //!   `transfer_*_between` helpers that can never duplicate or vanish
-//!   cargo, and ready-made [`capability_bus::SimpleSlotInventory`] /
+//!   cargo, saturating [`capability_bus::EnergyUnit`] /
+//!   [`capability_bus::EnergyConversionRates`] /
+//!   [`capability_bus::EnergyAmount`] FE/RF/EU/SU conversion, and
+//!   ready-made [`capability_bus::SimpleSlotInventory`] /
 //!   [`capability_bus::SimpleFluidTank`] /
 //!   [`capability_bus::SimpleEnergyBuffer`] /
 //!   [`capability_bus::CookingPotItemAdapter`] endpoints.
+//! - [`recipe_conflict_unify`]: always-on recipe conflict index —
+//!   Vanilla's silent same-input collisions become a deterministic,
+//!   vanilla-first `< i/N >` selector over
+//!   [`recipe_conflict_unify::InputSignature`] keys — plus the strictly
+//!   opt-in [`recipe_conflict_unify::MaterialUnifier`] that maps every
+//!   `#c:<family>/<material>` (`#forge:*` spellings included) tag member
+//!   onto one namespace-priority-ranked canonical item, with a
+//!   per-item exclusion list and a disabled-by-default passthrough.
 
 #![deny(unsafe_code)]
 
@@ -218,6 +229,7 @@ pub mod mod_tick_runtime;
 pub mod modpack;
 pub mod neoforge_wire;
 pub mod profile;
+pub mod recipe_conflict_unify;
 pub mod season_primitives;
 pub mod unified_bundle;
 pub mod unified_tags;
@@ -233,4 +245,8 @@ pub use dimension_mod::{
     DimEntryDescriptor, DimTypeDescriptor, DimensionEnvProfile, DimensionModClassification,
     DimensionModData, DimensionModProfile, GeneratorKind, PortalRegistry, PortalRule,
     PortalTransition, PortalTrigger, TeleportIntent,
+};
+pub use recipe_conflict_unify::{
+    InputSignature, MaterialUnifier, MaterialUnifyConfig, RecipeCandidate, RecipeConflictIndex,
+    ResolvedRecipeChoice, MATERIAL_TAG_FAMILIES,
 };
