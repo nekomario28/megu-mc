@@ -1021,10 +1021,18 @@ where
     S: AsRef<str>,
     B: AsRef<[u8]>,
 {
-    dimension_mod_bridge()
+    let report = dimension_mod_bridge()
         .lock()
         .map_err(|_| "dimension mod bridge lock poisoned".to_string())
-        .and_then(|mut b| b.load_dimension_mod_entries(entries))
+        .and_then(|mut b| b.load_dimension_mod_entries(entries))?;
+    #[cfg(feature = "create-offload")]
+    for dim in DimId::all_registered()
+        .into_iter()
+        .filter(|dim| !dim.is_vanilla())
+    {
+        let _ = dimension_mod_ensure_orbital_dimension(dim);
+    }
+    Ok(report)
 }
 
 /// Portal-hop hook: produce the `TeleportIntent` for a validated transition
@@ -1356,6 +1364,15 @@ mod aeronautics_and_dim_bridge_tests {
         assert_eq!((orbital.min_y, orbital.height), (-64, 384));
         assert_eq!(orbital.coordinate_scale, 4.0);
         assert_eq!(orbital.atmosphere.gravity_scale, 1.0);
+        let offload_bridge = mod_offload_bridge()
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        let live_orbital = offload_bridge
+            .offload
+            .orbital_router()
+            .dimension(crystal.raw())
+            .expect("dimension load registers custom orbital route");
+        assert_eq!(live_orbital.id, "testdim:crystal_caves");
 
         // Environment profiles: the builtin Ad Astra physics override lands on
         // the Moon; discovered types derive sane defaults elsewhere.
