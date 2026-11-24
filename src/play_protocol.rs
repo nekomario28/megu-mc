@@ -3196,6 +3196,7 @@ fn interest_tick() {
     }
     dig_progress_tick(&cls);
     combat_tick(&cls);
+    flight_kick_tick(&cls);
     // Death is a server-tick event (vanilla LivingEntity.die): an idle
     // victim's own read loop may not wake for seconds, so the tick sweep
     // drives drop_player_items_on_death — it emits the 0x1f death event and
@@ -3285,6 +3286,63 @@ fn combat_note_damage(victim: &Client) {
                 0x3b,
                 encode_play_player_combat_enter().1,
             );
+        }
+    }
+}
+
+/// `ServerGamePacketListenerImpl`'s `floatingTicks` ledger: consecutive
+/// airborne, non-falling ticks per player eid, plus the last sampled `y` so
+/// the per-tick `dy` is the same measurement Vanilla takes per move packet.
+/// Entries are swept with the client list so a disconnect frees its row.
+fn floating_ticks() -> &'static Mutex<HashMap<i32, (u32, f64)>> {
+    static FLOATING: OnceLock<Mutex<HashMap<i32, (u32, f64)>>> = OnceLock::new();
+    FLOATING.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+/// `allow-flight` (`MEGU_ALLOW_FLIGHT`, Vanilla `allow-flight`): `false`
+/// kicks a survival/adventure player who reports airborne for 80 straight
+/// ticks without actually falling — Vanilla's `floatingTicks` check with the
+/// same exemptions (creative/spectator, dead, sleeping, riding, elytra
+/// gliding, submerged). "Airborne without falling" is vanilla's
+/// `dY >= -0.03125 && noBlocksAround`: a non-air block in the half-block
+/// band under the feet, or real downward speed, both reset the count.
+fn flight_kick_tick(cls: &[Arc<Client>]) {
+    let mut floating = floating_ticks().lock().unwrap_or_else(|e| e.into_inner());
+    floating.retain(|eid, _| cls.iter().any(|c| c.eid == *eid));
+    if live_allow_flight() {
+        floating.clear();
+        return;
+    }
+    let air_supply = server_ticks(AIR_SUPPLY_GT) as i32;
+    for c in cls {
+        let exempt = matches!(*c.gm.lock().unwrap_or_else(|e| e.into_inner()), 1 | 3)
+            || *c.hp.lock().unwrap_or_else(|e| e.into_inner()) <= 0.0
+            || c.sleeping.lock().unwrap_or_else(|e| e.into_inner()).is_some()
+            || *c.fall_fly.lock().unwrap_or_else(|e| e.into_inner())
+            || vehicle_of(c.eid).is_some()
+            || *c.air.lock().unwrap_or_else(|e| e.into_inner()) < air_supply;
+        if exempt {
+            floating.remove(&c.eid);
+            continue;
+        }
+        let (x, y, z, _, _, grounded) = *c.pos.lock().unwrap_or_else(|e| e.into_inner());
+        let entry = floating.entry(c.eid).or_insert((0, y));
+        let dy = y - entry.1;
+        entry.1 = y;
+        let supported = crate::block_registry::breg().is_some_and(|reg| {
+            let dim = *c.dim.lock().unwrap_or_else(|e| e.into_inner());
+            let (bx, bz) = (x.floor() as i32, z.floor() as i32);
+            [y - 0.1, y - 0.55]
+                .iter()
+                .any(|probe| !reg.is_air(block_at_dim(dim, bx, probe.floor() as i32, bz)))
+        });
+        if grounded || supported || dy < -0.03125 {
+            entry.0 = 0;
+            continue;
+        }
+        entry.0 += 1;
+        if entry.0 >= 80 {
+            kick_client(c, "Flying is not enabled on this server");
         }
     }
 }
@@ -5017,17 +5075,17 @@ fn player_attack_damage_wire_id(config: &[(i64, Vec<u8>)]) -> Option<i32> {
     matches.next().is_none().then_some(index as i32)
 }
 
-const SERVER_VIEW_DISTANCE: i32 = 8;
-const SERVER_SIMULATION_DISTANCE: i32 = SERVER_VIEW_DISTANCE;
-
 /// S2C `0x55` SetChunkCacheRadius + `0x62` SetSimulationDistance: sent right
 /// after Join Game and whenever the client's effective view distance changes.
+/// Both radii come from the live server config (`MEGU_VIEW_DISTANCE` /
+/// `MEGU_SIMULATION_DISTANCE`, `server.toml`/`server.properties` included,
+/// each clamped to Vanilla's `2..=32`).
 fn send_view_distance(s: &mut TcpStream, view: i32) {
     let mut p = Vec::new();
     write_varint(&mut p, i64::from(view));
     let _ = send_packet(s, 0x55, p);
     let mut p = Vec::new();
-    write_varint(&mut p, i64::from(SERVER_SIMULATION_DISTANCE));
+    write_varint(&mut p, i64::from(live_simulation_distance()));
     let _ = send_packet(s, 0x62, p);
 }
 
@@ -7537,9 +7595,9 @@ fn join_game(dim: DimId, gm: u8, eid: i32) -> Vec<u8> {
     for d in dimensions {
         write_str(&mut p, d.dimension_id());
     }
-    write_varint(&mut p, 20);
-    write_varint(&mut p, SERVER_VIEW_DISTANCE as i64);
-    write_varint(&mut p, 8);
+    write_varint(&mut p, live_max_players() as i64);
+    write_varint(&mut p, i64::from(live_view_distance()));
+    write_varint(&mut p, i64::from(live_simulation_distance()));
     p.push(0);
     p.push(1);
     p.push(0);
@@ -8579,18 +8637,13 @@ fn nbt_named_byte(v: &mut Vec<u8>, name: &str, b: u8) {
     v.push(b);
 }
 /// A plain string component, as the game encodes it: `"Hi"`, not `{"text":"Hi"}`.
+/// The escaping is the canonical `megu_core::json` writer's — `\n` `\t` `\r`
+/// `\b` `\f` short forms like Vanilla's Gson, `\u00xx` for the other control
+/// characters — so every JSON the server emits (chat components, sign text,
+/// and the `ops.json`/`whitelist.json`/`banned-*.json` writes in
+/// `server_ops.rs`) is byte-identical to `megu-admin`/`megu-init`.
 fn json_text(s: &str) -> String {
-    let mut o = String::from("\"");
-    for c in s.chars() {
-        match c {
-            '"' => o.push_str("\\\""),
-            '\\' => o.push_str("\\\\"),
-            c if (c as u32) < 0x20 => o.push_str(&format!("\\u{:04x}", c as u32)),
-            c => o.push(c),
-        }
-    }
-    o.push('"');
-    o
+    megu_core::json::quote_json_string(s)
 }
 /// A sign side, in the shape the game itself writes.
 ///
@@ -9325,35 +9378,81 @@ fn save_live_player_snapshot(
 // ---------- W3 live protocol wiring ----------
 
 /// The live copies of the Vanilla ops/ban/whitelist files, loaded lazily from
-/// the server working directory on the first login and refreshed by the admin
-/// commands. `None` means "not loaded yet"; `max_players` snapshots
-/// `MEGU_MAX_PLAYERS` (default 20) at load so the check is a single read.
+/// `dir` (the server working directory) on the first login. `None` means "not
+/// loaded yet". Each registry carries the file stamp it was read at, so
+/// `refresh` can re-consult only the files `/op`, `/ban`, `/pardon`,
+/// `/whitelist add|remove|reload` — or an operator's editor — actually
+/// changed: new logins see the mutation immediately, no restart needed. The
+/// player cap and the whitelist enforcement switch are not file state at all:
+/// `live_max_players()` seeds the cap at load (the atomic only moves at
+/// boot), and `whitelist.enabled` mirrors `live_whitelist_enforced()`
+/// (`MEGU_WHITELIST` / `MEGU_WHITELIST_ENABLED` at boot, `/whitelist on|off`
+/// afterwards) because Vanilla keeps that flag in `server.properties`, not
+/// in `whitelist.json`.
 struct LiveAdmission {
+    dir: std::path::PathBuf,
     ops: OpsRegistry,
     bans: BanRegistry,
     whitelist: WhitelistRegistry,
     max_players: usize,
+    ops_stamp: Option<OpsFileStamp>,
+    whitelist_stamp: Option<OpsFileStamp>,
+    ban_players_stamp: Option<OpsFileStamp>,
+    ban_ips_stamp: Option<OpsFileStamp>,
 }
 
 impl LiveAdmission {
-    fn load() -> Self {
-        let dir = std::path::Path::new(".");
-        let mut whitelist =
-            WhitelistRegistry::load(&dir.join(WHITELIST_FILE)).unwrap_or_default();
-        // `enforceWhitelist` is a server.properties fact upstream; megu keeps
-        // it in the environment so whitelist.json stays data-only.
-        whitelist.enabled = std::env::var("MEGU_WHITELIST")
-            .map(|v| matches!(v.as_str(), "1" | "true" | "on"))
-            .unwrap_or(false);
-        Self {
+    fn load(dir: &std::path::Path) -> Self {
+        let mut admission = Self {
+            dir: dir.to_path_buf(),
             ops: OpsRegistry::load(&dir.join(OPS_FILE)).unwrap_or_default(),
             bans: BanRegistry::load(dir).unwrap_or_default(),
-            whitelist,
-            max_players: std::env::var("MEGU_MAX_PLAYERS")
-                .ok()
-                .and_then(|v| v.parse::<usize>().ok())
-                .unwrap_or(20),
+            whitelist: WhitelistRegistry::load(&dir.join(WHITELIST_FILE)).unwrap_or_default(),
+            max_players: live_max_players(),
+            ops_stamp: ops_file_stamp(&dir.join(OPS_FILE)),
+            whitelist_stamp: ops_file_stamp(&dir.join(WHITELIST_FILE)),
+            ban_players_stamp: ops_file_stamp(&dir.join(BANNED_PLAYERS_FILE)),
+            ban_ips_stamp: ops_file_stamp(&dir.join(BANNED_IPS_FILE)),
+        };
+        admission.whitelist.enabled = live_whitelist_enforced();
+        admission
+    }
+
+    /// `PlayerList` file-reload semantics on every login admission: a file
+    /// whose stamp moved wins over the in-memory copy, while an unchanged or
+    /// unreadable file keeps the last good registry (a half-written or corrupt
+    /// file never silently de-ops or unbans anyone). The enforcement switch
+    /// re-reads the live knob every time so `/whitelist on|off` — which writes
+    /// no file — also takes effect for the next login.
+    fn refresh(&mut self) {
+        let ops_path = self.dir.join(OPS_FILE);
+        let stamp = ops_file_stamp(&ops_path);
+        if stamp != self.ops_stamp {
+            if let Ok(ops) = OpsRegistry::load(&ops_path) {
+                self.ops = ops;
+                self.ops_stamp = stamp;
+            }
         }
+        let whitelist_path = self.dir.join(WHITELIST_FILE);
+        let stamp = ops_file_stamp(&whitelist_path);
+        if stamp != self.whitelist_stamp {
+            if let Ok(entries) = WhitelistRegistry::load(&whitelist_path) {
+                self.whitelist = entries;
+                self.whitelist_stamp = stamp;
+            }
+        }
+        let players_path = self.dir.join(BANNED_PLAYERS_FILE);
+        let ips_path = self.dir.join(BANNED_IPS_FILE);
+        let (players_stamp, ips_stamp) =
+            (ops_file_stamp(&players_path), ops_file_stamp(&ips_path));
+        if players_stamp != self.ban_players_stamp || ips_stamp != self.ban_ips_stamp {
+            if let Ok(bans) = BanRegistry::load(&self.dir) {
+                self.bans = bans;
+                self.ban_players_stamp = players_stamp;
+                self.ban_ips_stamp = ips_stamp;
+            }
+        }
+        self.whitelist.enabled = live_whitelist_enforced();
     }
 }
 
@@ -10529,7 +10628,7 @@ fn handle_inner(mut s: TcpStream, live_eid: Arc<AtomicI32>) {
                 .iter()
                 .map(|c| (c.name.clone(), c.uuid))
                 .collect();
-            let max = std::env::var("MEGU_MAX_PLAYERS").ok().and_then(|v| v.parse::<usize>().ok()).unwrap_or(20);
+            let max = live_max_players();
             let motd = std::env::var("MEGU_MOTD").unwrap_or_else(|_| "megu".to_owned());
             let json = build_status_json_rich(&motd, max, &online_players, status_favicon());
             let mut pl = Vec::new();
@@ -10610,7 +10709,11 @@ fn handle_inner(mut s: TcpStream, live_eid: Arc<AtomicI32>) {
     {
         let online = clients().lock().unwrap_or_else(|e| e.into_inner()).len();
         let mut live = live_admission().lock().unwrap_or_else(|e| e.into_inner());
-        let live = live.get_or_insert_with(LiveAdmission::load);
+        let live = live.get_or_insert_with(|| LiveAdmission::load(std::path::Path::new(".")));
+        // A `/ban`, `/pardon`, `/whitelist` or `/op` issued since the last
+        // login — or a file an operator edited by hand — lands on the next
+        // admission check, not after a restart.
+        live.refresh();
         if let Err(reason) = check_login_admission_verified(
             &name,
             &uuid_text(&uuid),
@@ -10722,7 +10825,7 @@ fn handle_inner(mut s: TcpStream, live_eid: Arc<AtomicI32>) {
             encode_play_server_data(&motd, icon.as_deref()).1,
         );
     }
-    send_view_distance(&mut s, client_view.clamp(2, SERVER_VIEW_DISTANCE));
+    send_view_distance(&mut s, client_view.clamp(2, live_view_distance()));
     let login_admin = verified_permission_level(&uuid_text(&uuid), &name, authenticated) >= 2;
     if send_commands(&mut s, login_admin).is_err() {
         return;
@@ -10749,7 +10852,7 @@ fn handle_inner(mut s: TcpStream, live_eid: Arc<AtomicI32>) {
     }
     let mut sent: std::collections::HashSet<(i32, i32)> = std::collections::HashSet::new();
     let mut gen: GenSources = GenSources::new();
-    let mut view = client_view.clamp(2, SERVER_VIEW_DISTANCE);
+    let mut view = client_view.clamp(2, live_view_distance());
     let mut chunk_ack = connection_limits::chunk_feedback(window_batch(view));
     let mut chunk_delivery = connection_limits::ChunkDelivery::default();
     let initial_window = initial_chunk_window(sx, sz);
@@ -11368,7 +11471,7 @@ fn handle_inner(mut s: TcpStream, live_eid: Arc<AtomicI32>) {
                 let Some(requested) = client_info_view_distance(&b) else {
                     break 'conn;
                 };
-                let effective = requested.clamp(2, SERVER_VIEW_DISTANCE);
+                let effective = requested.clamp(2, live_view_distance());
                 if effective != view {
                     view = effective;
                     *me.view.lock().unwrap_or_else(|e| e.into_inner()) = view;
@@ -13172,6 +13275,12 @@ fn handle_inner(mut s: TcpStream, live_eid: Arc<AtomicI32>) {
                             };
                             if let Some(v) = vic.as_ref() {
                                 if *v.gm.lock().unwrap_or_else(|e| e.into_inner()) == 1 {
+                                } else if !live_pvp_enabled() {
+                                    // `pvp=false`: a player's melee against
+                                    // another player does nothing, the same
+                                    // way Vanilla's `Player.attack` returns
+                                    // early on `!isPvpAllowed`.
+                                    continue;
                                 } else {
                                     // vanilla: attack_damage attribute (fist=1) + held item bonus + sharpness
                                     let held = {
@@ -17230,14 +17339,14 @@ mod sleep_protocol_parity_tests {
 
         let (client, mut peer) = effect_tests::client_pair();
         client.enter_play_wire(None, Default::default());
-        send_view_distance(&mut client.sock.lock().unwrap_or_else(|e| e.into_inner()), SERVER_VIEW_DISTANCE);
+        send_view_distance(&mut client.sock.lock().unwrap_or_else(|e| e.into_inner()), live_view_distance());
         assert_eq!(
             read_packet(&mut peer, deadline()),
-            Some((0x55, vec![SERVER_VIEW_DISTANCE as u8]))
+            Some((0x55, vec![live_view_distance() as u8]))
         );
         assert_eq!(
             read_packet(&mut peer, deadline()),
-            Some((0x62, vec![SERVER_SIMULATION_DISTANCE as u8]))
+            Some((0x62, vec![live_simulation_distance() as u8]))
         );
 
         // A matching stateId is accepted; a stale one triggers a full 0x13
@@ -17380,12 +17489,197 @@ mod w3_tests {
         whitelist: WhitelistRegistry,
         max_players: usize,
     ) -> LiveAdmission {
+        // The dir is a path that never exists: every stamp stays `None` and
+        // `refresh` keeps the injected registries instead of reloading real
+        // files. Callers mirror `whitelist.enabled` into the live enforcement
+        // switch right before each injection — `refresh` re-reads the switch
+        // from `live_whitelist_enforced()`, the same source `/whitelist on|off`
+        // and the boot env layer drive.
         LiveAdmission {
+            dir: std::path::PathBuf::from("__megu_test_no_such_dir__"),
             ops: OpsRegistry::default(),
             bans,
             whitelist,
             max_players,
+            ops_stamp: None,
+            whitelist_stamp: None,
+            ban_players_stamp: None,
+            ban_ips_stamp: None,
         }
+    }
+
+    fn w3_tmp_dir(tag: &str) -> std::path::PathBuf {
+        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("target")
+            .join(format!("megu-w3-{tag}-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    #[test]
+    fn w3_live_config_knobs_reach_the_protocol() {
+        // `view-distance`/`simulation-distance`/`max-players` resolved from
+        // `MEGU_*`/`server.toml`/`server.properties` all land on the same
+        // atomics `apply_runtime_server_config` fills; the protocol reads
+        // them live instead of its own constants.
+        let _guard = world_guard();
+        apply_runtime_server_config(Some(12), Some(6), Some(42), None, None, None);
+        assert_eq!(live_view_distance(), 12);
+        assert_eq!(live_simulation_distance(), 6);
+        assert_eq!(live_max_players(), 42);
+        // The login cap an admission load carries is the live knob, not a
+        // re-parsed `MEGU_MAX_PLAYERS` or the hardcoded 20.
+        let admission = LiveAdmission::load(std::path::Path::new("__megu_test_no_such_dir__"));
+        assert_eq!(admission.max_players, 42);
+        // The client's requested radius is bounded by the live server cap.
+        assert_eq!(24_i32.clamp(2, live_view_distance()), 12);
+        apply_runtime_server_config(None, None, None, None, None, None);
+        assert_eq!(live_view_distance(), 8);
+        assert_eq!(live_max_players(), 20);
+    }
+
+    #[test]
+    fn w3_live_admission_refresh_tracks_whitelist_and_ban_files() {
+        // `/whitelist add`, `/ban` and hand edits write the Vanilla files; the
+        // next login's `refresh` sees the stamps moved and reloads — no
+        // restart, no stale boot snapshot.
+        let _guard = world_guard();
+        let dir = w3_tmp_dir("admission");
+        let check = |a: &LiveAdmission| {
+            check_login_admission_verified(
+                "W3Player",
+                "",
+                "9.9.9.9",
+                0,
+                20,
+                &a.ops,
+                &a.bans,
+                &a.whitelist,
+                false,
+            )
+        };
+        // Enforcement comes from the live switch (`MEGU_WHITELIST*` at boot,
+        // `/whitelist on|off` afterwards), not a flag inside whitelist.json.
+        set_whitelist_enforced(true);
+        let mut admission = LiveAdmission::load(&dir);
+        assert_eq!(
+            check(&admission),
+            Err("You are not white-listed on this server!".to_owned())
+        );
+
+        let mut whitelist = WhitelistRegistry::default();
+        whitelist.add("W3Player");
+        whitelist.save(&dir.join(WHITELIST_FILE)).unwrap();
+        admission.refresh();
+        assert_eq!(check(&admission), Ok(()));
+
+        let mut bans = BanRegistry::default();
+        bans.players.push(BanEntry {
+            uuid: "u".into(),
+            name: "W3Player".into(),
+            created: "now".into(),
+            source: "test".into(),
+            expires: "forever".into(),
+            reason: "later ban".into(),
+        });
+        bans.save(&dir).unwrap();
+        admission.refresh();
+        assert_eq!(
+            check(&admission),
+            Err("You are banned from this server.\nReason: later ban".to_owned())
+        );
+
+        // `/pardon` deleting the entry is picked up the same way.
+        std::fs::write(dir.join(BANNED_PLAYERS_FILE), "[]\n").unwrap();
+        admission.refresh();
+        assert_eq!(check(&admission), Ok(()));
+        set_whitelist_enforced(false);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn w3_allow_flight_off_kicks_a_player_hovering_80_ticks() {
+        // `MEGU_ALLOW_FLIGHT`/`allow-flight=false`: a survival player airborne
+        // for 80 ticks without actually falling is kicked, Vanilla's
+        // `floatingTicks` rule. The fixture floats at y=300 — above any
+        // generated support — with `y` frozen (the `dY >= -0.03125`
+        // "not actually falling" case).
+        let _guard = world_guard();
+        let (client, mut peer) = effect_tests::client_pair();
+        let me = Arc::new(client);
+        *me.pos.lock().unwrap_or_else(|e| e.into_inner()) =
+            (0.5, 300.0, 0.5, 0.0, 0.0, false);
+        *me.air.lock().unwrap_or_else(|e| e.into_inner()) =
+            server_ticks(AIR_SUPPLY_GT) as i32;
+        let cls = vec![me.clone()];
+        apply_runtime_server_config(None, None, None, None, Some(false), None);
+        for _ in 0..79 {
+            flight_kick_tick(&cls);
+        }
+        assert_eq!(
+            floating_ticks()
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .get(&me.eid)
+                .map(|entry| entry.0),
+            Some(79),
+            "79 airborne ticks must count but not yet kick"
+        );
+        flight_kick_tick(&cls);
+        let (id, _) = read_packet(&mut peer, w3_deadline()).expect("disconnect frame");
+        assert_eq!(id, 0x1d, "the 80th floating tick sends play Disconnect");
+
+        // A real fall resets the counter the same way vanilla's dY test does.
+        let (mut client2, _peer2) = effect_tests::client_pair();
+        client2.eid = me.eid + 1;
+        let me2 = Arc::new(client2);
+        *me2.pos.lock().unwrap_or_else(|e| e.into_inner()) =
+            (0.5, 300.0, 0.5, 0.0, 0.0, false);
+        *me2.air.lock().unwrap_or_else(|e| e.into_inner()) =
+            server_ticks(AIR_SUPPLY_GT) as i32;
+        let cls2 = vec![me2.clone()];
+        flight_kick_tick(&cls2);
+        *me2.pos.lock().unwrap_or_else(|e| e.into_inner()) =
+            (0.5, 299.0, 0.5, 0.0, 0.0, false);
+        flight_kick_tick(&cls2);
+        assert_eq!(
+            floating_ticks()
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .get(&me2.eid)
+                .map(|entry| entry.0),
+            Some(0),
+            "dy < -0.03125 is a fall, not a hover"
+        );
+
+        // `allow-flight=true` clears every counter: the same hover is legal.
+        apply_runtime_server_config(None, None, None, None, Some(true), None);
+        for _ in 0..200 {
+            flight_kick_tick(&cls2);
+        }
+        assert!(
+            floating_ticks()
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .get(&me2.eid)
+                .is_none(),
+            "allow-flight on must not even count"
+        );
+        apply_runtime_server_config(None, None, None, None, None, None);
+        floating_ticks()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clear();
+    }
+
+    #[test]
+    fn w3_json_text_is_the_canonical_escaper() {
+        // Chat/sign JSON components and the ops files share one escaper, so
+        // `\n` and `\t` keep the Gson short forms everywhere.
+        for s in ["plain", "bad\"name\n\ttab", "ctrl\u{1}\u{7f}end"] {
+            assert_eq!(json_text(s), megu_core::json::quote_json_string(s));
+        }
+        assert_eq!(json_text("a\nb"), "\"a\\nb\"");
     }
 
     #[test]
@@ -17429,6 +17723,9 @@ mod w3_tests {
             ),
         ];
         for (name, admission, reason) in cases {
+            // `/whitelist on|off` semantics: the injected registry's `enabled`
+            // is mirrored into the live switch `refresh` re-reads.
+            set_whitelist_enforced(admission.whitelist.enabled);
             *live_admission().lock().unwrap_or_else(|e| e.into_inner()) = Some(admission);
             let (mut cli, server) = w3_login_session(name, [0xabu8; 16]);
             let (pid, body) = read_packet(&mut cli, w3_deadline()).expect("disconnect packet");
@@ -17446,6 +17743,60 @@ mod w3_tests {
             let _ = server.join();
         }
         *live_admission().lock().unwrap_or_else(|e| e.into_inner()) = None;
+        set_whitelist_enforced(false);
+    }
+
+    #[test]
+    #[cfg(megu_vanilla_data)]
+    fn w3_pvp_flag_gates_live_player_attacks() {
+        // Two live play clients on loopback: with `pvp=false` the melee is
+        // cancelled before damage, with `pvp=true` the same swing lands.
+        let _guard = world_guard();
+        let (mut atk_cli, atk_server, atk) = w3_connect("W3PvpAtk", [0x3au8; 16]);
+        let (vic_cli, vic_server, vic) = w3_connect("W3PvpVic", [0x3bu8; 16]);
+        let hp0 = *vic.hp.lock().unwrap_or_else(|e| e.into_inner());
+        // Victim stands one block east of the attacker, who faces east.
+        {
+            let (px, py, pz, ..) = *atk.pos.lock().unwrap_or_else(|e| e.into_inner());
+            *vic.pos.lock().unwrap_or_else(|e| e.into_inner()) =
+                (px + 1.0, py, pz, 0.0, 0.0, true);
+            let mut ap = atk.pos.lock().unwrap_or_else(|e| e.into_inner());
+            ap.3 = -90.0;
+        }
+        let mut attack = Vec::new();
+        write_varint(&mut attack, i64::from(vic.eid));
+        write_varint(&mut attack, 1);
+
+        apply_runtime_server_config(None, None, None, Some(false), None, None);
+        send_packet(&mut atk_cli, 0x16, attack.clone()).unwrap();
+        std::thread::sleep(Duration::from_millis(400));
+        assert_eq!(
+            *vic.last_hurt.lock().unwrap_or_else(|e| e.into_inner()),
+            0.0,
+            "pvp=false must cancel the hit before any damage is recorded"
+        );
+        assert_eq!(
+            *vic.invulnerable.lock().unwrap_or_else(|e| e.into_inner()),
+            0,
+            "a cancelled hit must not open the victim's hurt window"
+        );
+
+        apply_runtime_server_config(None, None, None, Some(true), None, None);
+        send_packet(&mut atk_cli, 0x16, attack).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(3);
+        while *vic.last_hurt.lock().unwrap_or_else(|e| e.into_inner()) == 0.0 {
+            assert!(Instant::now() < deadline, "pvp=true hit never landed");
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert!(
+            *vic.hp.lock().unwrap_or_else(|e| e.into_inner()) < hp0,
+            "pvp=true must let the melee reach the victim's health"
+        );
+        apply_runtime_server_config(None, None, None, None, None, None);
+        drop(atk_cli);
+        drop(vic_cli);
+        let _ = atk_server.join();
+        let _ = vic_server.join();
     }
 
     #[test]
@@ -18566,6 +18917,7 @@ mod w4_tests {
 
         // The IP ban runs on the *forwarded* address, not the loopback peer.
         *live_admission().lock().unwrap_or_else(|e| e.into_inner()) = Some(LiveAdmission {
+            dir: std::path::PathBuf::from("__megu_test_no_such_dir__"),
             ops: OpsRegistry::default(),
             bans: BanRegistry {
                 players: Vec::new(),
@@ -18579,6 +18931,10 @@ mod w4_tests {
             },
             whitelist: WhitelistRegistry::default(),
             max_players: 20,
+            ops_stamp: None,
+            whitelist_stamp: None,
+            ban_players_stamp: None,
+            ban_ips_stamp: None,
         });
         let signed = w4_velocity_payload(
             secret.as_bytes(),

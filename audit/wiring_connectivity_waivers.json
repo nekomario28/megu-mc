@@ -454,33 +454,6 @@
     },
     {
       "check": "dead_tick_or_bridge",
-      "symbol": "live_max_players",
-      "file": "src/server_config.rs",
-      "reason": "Same unwired runtime-config getter as live_view_distance \u2014 stored at startup, never read (cap enforcement not wired).",
-      "lane": "SERVER-CONFIG",
-      "date": "2026-11-24",
-      "line": 85
-    },
-    {
-      "check": "dead_tick_or_bridge",
-      "symbol": "live_simulation_distance",
-      "file": "src/server_config.rs",
-      "reason": "Same unwired runtime-config getter as live_view_distance \u2014 stored at startup, never read.",
-      "lane": "SERVER-CONFIG",
-      "date": "2026-11-24",
-      "line": 80
-    },
-    {
-      "check": "dead_tick_or_bridge",
-      "symbol": "live_view_distance",
-      "file": "src/server_config.rs",
-      "reason": "Operator view-distance getter: apply_runtime_server_config stores the resolved value but no production path reads it back \u2014 the setting is installed but never honored.",
-      "lane": "SERVER-CONFIG",
-      "date": "2026-11-24",
-      "line": 75
-    },
-    {
-      "check": "dead_tick_or_bridge",
       "symbol": "run_quarantined_tick",
       "file": "src/server_reliability.rs",
       "line": 1865,
@@ -666,33 +639,6 @@
     },
     {
       "check": "dead_server_config_field",
-      "symbol": "live_view_distance",
-      "file": "src/server_config.rs",
-      "line": 75,
-      "reason": "LIVE_VIEW_DISTANCE is written from the environment in apply_runtime_server_config (called by server_config_boot) but the accessor is #[allow(dead_code)] with zero non-test callers \u2014 the override is stored, never consumed.",
-      "lane": "SERVER-CONFIG",
-      "date": "2026-11-24"
-    },
-    {
-      "check": "dead_server_config_field",
-      "symbol": "live_simulation_distance",
-      "file": "src/server_config.rs",
-      "line": 80,
-      "reason": "LIVE_SIMULATION_DISTANCE is written from the environment in apply_runtime_server_config (called by server_config_boot) but the accessor is #[allow(dead_code)] with zero non-test callers \u2014 the override is stored, never consumed.",
-      "lane": "SERVER-CONFIG",
-      "date": "2026-11-24"
-    },
-    {
-      "check": "dead_server_config_field",
-      "symbol": "live_max_players",
-      "file": "src/server_config.rs",
-      "line": 85,
-      "reason": "LIVE_MAX_PLAYERS is written from the environment in apply_runtime_server_config (called by server_config_boot) but the accessor is #[allow(dead_code)] with zero non-test callers \u2014 the override is stored, never consumed.",
-      "lane": "SERVER-CONFIG",
-      "date": "2026-11-24"
-    },
-    {
-      "check": "dead_server_config_field",
       "symbol": "RuntimeOpsConfig.online_mode",
       "file": "src/server_config.rs",
       "line": 655,
@@ -828,24 +774,6 @@
     },
     {
       "check": "dead_server_config_field",
-      "symbol": "MEGU_VIEW_DISTANCE",
-      "file": "src/server_config.rs",
-      "line": 298,
-      "reason": "server.properties view-distance exports here; read only by server_config_boot into LIVE_VIEW_DISTANCE whose live_view_distance() accessor is dead (the client's command.env write into integrated servers is not a read).",
-      "lane": "SERVER-CONFIG",
-      "date": "2026-11-24"
-    },
-    {
-      "check": "dead_server_config_field",
-      "symbol": "MEGU_SIMULATION_DISTANCE",
-      "file": "src/server_config.rs",
-      "line": 299,
-      "reason": "server.properties simulation-distance exports here; read only by server_config_boot into LIVE_SIMULATION_DISTANCE whose live_simulation_distance() accessor is dead.",
-      "lane": "SERVER-CONFIG",
-      "date": "2026-11-24"
-    },
-    {
-      "check": "dead_server_config_field",
       "symbol": "MEGU_RCON_PASSWORD",
       "file": "src/server_config.rs",
       "line": 301,
@@ -868,15 +796,6 @@
       "file": "src/server_config.rs",
       "line": 307,
       "reason": "server.properties pvp exports here but nothing reads the variable \u2014 no PvP gate exists in combat.",
-      "lane": "SERVER-CONFIG",
-      "date": "2026-11-24"
-    },
-    {
-      "check": "dead_server_config_field",
-      "symbol": "MEGU_ALLOW_FLIGHT",
-      "file": "src/server_config.rs",
-      "line": 308,
-      "reason": "server.properties allow-flight exports here but nothing reads the variable \u2014 no flight-permission check exists at runtime.",
       "lane": "SERVER-CONFIG",
       "date": "2026-11-24"
     },

@@ -16,6 +16,44 @@ pub(crate) const BANNED_IPS_FILE: &str = "banned-ips.json";
 #[allow(dead_code)]
 pub(crate) const WHITELIST_FILE: &str = "whitelist.json";
 
+/// The run-time whitelist enforcement switch (vanilla `white-list` /
+/// `enforce-whitelist`). `apply_runtime_server_config` seeds it from
+/// `MEGU_WHITELIST` / `MEGU_WHITELIST_ENABLED` at boot, `/whitelist on|off`
+/// flips it without touching a file, and login admission consults it for
+/// every new connection.
+static WHITELIST_ENFORCED: AtomicBool = AtomicBool::new(false);
+
+pub(crate) fn live_whitelist_enforced() -> bool {
+    WHITELIST_ENFORCED.load(Ordering::Relaxed)
+}
+
+pub(crate) fn set_whitelist_enforced(enabled: bool) {
+    WHITELIST_ENFORCED.store(enabled, Ordering::Relaxed);
+}
+
+/// The cheap file identity the live-admission reload compares: modification
+/// time in epoch nanos and length. `None` reads as "the file does not exist",
+/// which is itself a state a later create can move out of.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) struct OpsFileStamp {
+    modified_nanos: Option<u128>,
+    len: u64,
+}
+
+/// The stamp of `path` right now, or `None` when it cannot be stat'ed (a
+/// missing file is a normal state for the optional ops files).
+pub(crate) fn ops_file_stamp(path: &std::path::Path) -> Option<OpsFileStamp> {
+    let meta = std::fs::metadata(path).ok()?;
+    Some(OpsFileStamp {
+        modified_nanos: meta
+            .modified()
+            .ok()
+            .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+            .map(|d| d.as_nanos()),
+        len: meta.len(),
+    })
+}
+
 /// Temp-file-then-rename write, same discipline as `set_operator`: a crash leaves
 /// the old or the new file, never a truncated one.
 #[allow(dead_code)]
@@ -273,8 +311,8 @@ fn ops_registry_json(registry: &OpsRegistry) -> String {
     let mut out = String::from("[\n");
     for (i, e) in registry.entries.iter().enumerate() {
         out.push_str("  {\n");
-        out.push_str(&format!("    \"uuid\": {},\n", json_text(&e.uuid)));
-        out.push_str(&format!("    \"name\": {},\n", json_text(&e.name)));
+        out.push_str(&format!("    \"uuid\": {},\n", megu_core::json::quote_json_string(&e.uuid)));
+        out.push_str(&format!("    \"name\": {},\n", megu_core::json::quote_json_string(&e.name)));
         out.push_str(&format!("    \"level\": {},\n", e.level));
         out.push_str(&format!(
             "    \"bypassesPlayerLimit\": {}\n",
@@ -520,12 +558,12 @@ fn ban_ips_parse(text: &str) -> Option<Vec<IpBanEntry>> {
 fn ban_entry_json(e: &BanEntry) -> String {
     format!(
         "  {{\n    \"uuid\": {},\n    \"name\": {},\n    \"created\": {},\n    \"source\": {},\n    \"expires\": {},\n    \"reason\": {}\n  }}",
-        json_text(&e.uuid),
-        json_text(&e.name),
-        json_text(&e.created),
-        json_text(&e.source),
-        json_text(&e.expires),
-        json_text(&e.reason)
+        megu_core::json::quote_json_string(&e.uuid),
+        megu_core::json::quote_json_string(&e.name),
+        megu_core::json::quote_json_string(&e.created),
+        megu_core::json::quote_json_string(&e.source),
+        megu_core::json::quote_json_string(&e.expires),
+        megu_core::json::quote_json_string(&e.reason)
     )
 }
 
@@ -550,11 +588,11 @@ fn ban_ips_json(registry: &BanRegistry) -> String {
     for (i, e) in registry.ips.iter().enumerate() {
         out.push_str(&format!(
             "  {{\n    \"ip\": {},\n    \"created\": {},\n    \"source\": {},\n    \"expires\": {},\n    \"reason\": {}\n  }}",
-            json_text(&e.ip),
-            json_text(&e.created),
-            json_text(&e.source),
-            json_text(&e.expires),
-            json_text(&e.reason)
+            megu_core::json::quote_json_string(&e.ip),
+            megu_core::json::quote_json_string(&e.created),
+            megu_core::json::quote_json_string(&e.source),
+            megu_core::json::quote_json_string(&e.expires),
+            megu_core::json::quote_json_string(&e.reason)
         ));
         out.push_str(if i + 1 == registry.ips.len() { "\n" } else { ",\n" });
     }
@@ -673,8 +711,8 @@ fn whitelist_json(registry: &WhitelistRegistry) -> String {
     for (i, e) in registry.entries.iter().enumerate() {
         out.push_str(&format!(
             "  {{\n    \"uuid\": {},\n    \"name\": {}\n  }}",
-            json_text(&e.uuid),
-            json_text(&e.name)
+            megu_core::json::quote_json_string(&e.uuid),
+            megu_core::json::quote_json_string(&e.name)
         ));
         out.push_str(if i + 1 == registry.entries.len() {
             "\n"
@@ -873,12 +911,18 @@ pub(crate) fn exec_server_ops_command(
                     ("Whitelist is already turned on".into(), Vec::new())
                 } else {
                     whitelist.enabled = true;
+                    // The file carries no flag, so the live switch is what
+                    // login admission reads for new connections.
+                    set_whitelist_enforced(true);
                     ("Whitelist is now turned on".into(), Vec::new())
                 }
             }
             Some("off") => {
-                if whitelist.enabled {
+                // The live switch may be armed by config while this registry
+                // was loaded flag-less from disk; `off` clears both.
+                if whitelist.enabled || live_whitelist_enforced() {
                     whitelist.enabled = false;
+                    set_whitelist_enforced(false);
                     ("Whitelist is now turned off".into(), Vec::new())
                 } else {
                     ("Whitelist is already turned off".into(), Vec::new())
@@ -2148,6 +2192,107 @@ mod server_ops_tests {
             )
             .is_ok()
         );
+    }
+
+    #[test]
+    fn ops_file_stamp_notices_writes_and_missing_files() {
+        let dir = tmp_dir("stamps");
+        let path = dir.join(WHITELIST_FILE);
+        // Missing file: `None`, and a later create is a stamp change.
+        assert_eq!(ops_file_stamp(&path), None);
+        std::fs::write(&path, "[]\n").unwrap();
+        let first = ops_file_stamp(&path).unwrap();
+        assert_eq!(first.len, 3);
+        assert_eq!(ops_file_stamp(&path), Some(first));
+        // A content change — including a same-length one — moves the stamp.
+        std::fs::write(&path, "[ ]\n").unwrap();
+        let second = ops_file_stamp(&path).unwrap();
+        assert_ne!(second, first);
+        std::fs::remove_file(&path).unwrap();
+        assert_eq!(ops_file_stamp(&path), None);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn whitelist_on_and_off_drive_the_live_enforcement_switch() {
+        // The enforcement atomic is process-global; hold the world guard so
+        // this can't race the other tests that seed or read it.
+        let _guard = world_guard();
+        let dir = tmp_dir("wl-enforced");
+        let mut bans = BanRegistry::default();
+        let mut whitelist = WhitelistRegistry::default();
+        let run = |input: &str, bans: &mut BanRegistry, whitelist: &mut WhitelistRegistry| {
+            exec_server_ops_command(input, bans, whitelist, &dir, "Server", "now")
+        };
+        set_whitelist_enforced(false);
+        let (reply, _) = run("whitelist on", &mut bans, &mut whitelist);
+        assert_eq!(reply, "Whitelist is now turned on");
+        assert!(live_whitelist_enforced());
+        // The switch survives a file reload the same way `enabled` does.
+        let (reply, _) = run("whitelist reload", &mut bans, &mut whitelist);
+        assert_eq!(reply, "Reloaded the whitelist");
+        assert!(live_whitelist_enforced());
+        let (reply, _) = run("whitelist off", &mut bans, &mut whitelist);
+        assert_eq!(reply, "Whitelist is now turned off");
+        assert!(!live_whitelist_enforced());
+        // A config-armed switch reports "turned off", never "already off".
+        set_whitelist_enforced(true);
+        let (reply, _) = run("whitelist off", &mut bans, &mut whitelist);
+        assert_eq!(reply, "Whitelist is now turned off");
+        assert!(!live_whitelist_enforced());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn ops_json_files_escape_like_the_canonical_writer() {
+        // `\n`/`\t`/`"`/`§` names and reasons go out through
+        // `megu_core::json::quote_json_string` — the same bytes `megu-admin`
+        // and `megu-init` write — never the old `\u000a` `\u0009` drift.
+        let tricky = "bad\"name\n\ttab §color";
+        let quoted = megu_core::json::quote_json_string(tricky);
+        assert_eq!(
+            quoted,
+            "\"bad\\\"name\\n\\ttab §color\"",
+            "control characters keep the Gson short escapes"
+        );
+
+        let dir = tmp_dir("json-escape");
+        let mut bans = BanRegistry::default();
+        bans.players.push(BanEntry {
+            uuid: "u".into(),
+            name: tricky.into(),
+            created: "now".into(),
+            source: "s".into(),
+            expires: "forever".into(),
+            reason: "line one\nline\ttwo".into(),
+        });
+        let body = ban_players_json(&bans);
+        assert!(body.contains(&format!("\"name\": {quoted}")), "{body}");
+        assert!(
+            body.contains("\"reason\": \"line one\\nline\\ttwo\""),
+            "{body}"
+        );
+        assert!(!body.contains("\\u000"), "{body}");
+
+        let mut whitelist = WhitelistRegistry::default();
+        whitelist.entries.push(WhitelistEntry {
+            uuid: "u".into(),
+            name: tricky.into(),
+        });
+        let body = whitelist_json(&whitelist);
+        assert!(body.contains(&format!("\"name\": {quoted}")), "{body}");
+
+        // What the files write, the canonical reader parses back.
+        bans.save(&dir).unwrap();
+        let text = std::fs::read_to_string(dir.join(BANNED_PLAYERS_FILE)).unwrap();
+        assert!(
+            megu_core::json::parse_json(&text).is_ok(),
+            "written {BANNED_PLAYERS_FILE} must parse: {text}"
+        );
+        whitelist.save(&dir.join(WHITELIST_FILE)).unwrap();
+        let text = std::fs::read_to_string(dir.join(WHITELIST_FILE)).unwrap();
+        assert!(megu_core::json::parse_json(&text).is_ok(), "{text}");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

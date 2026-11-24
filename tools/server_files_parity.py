@@ -53,8 +53,19 @@ SERVER_FILES_SRC = "server-files/src"
 # `root-only`: keys SERVER_PROPERTIES_KEYS maps that server-files does not
 # type. `server-files-only`: keys the typed ServerProperties surface reads
 # or writes that the runtime's env-var table does not map.
+# `enable-command-block`/`resource-pack`/`require-resource-pack` joined the
+# root table when MEGU_* runtime consumers were wired (CFG-SERVER-1);
+# `enforce-secure-profile` moved to the shared set for the same reason.
 EXPECTED_ROOT_ONLY = frozenset(
-    {"server-ip", "player-idle-timeout", "op-permission-level", "allow-flight"}
+    {
+        "server-ip",
+        "player-idle-timeout",
+        "op-permission-level",
+        "allow-flight",
+        "enable-command-block",
+        "resource-pack",
+        "require-resource-pack",
+    }
 )
 EXPECTED_SERVER_FILES_ONLY = frozenset(
     {
@@ -62,7 +73,6 @@ EXPECTED_SERVER_FILES_ONLY = frozenset(
         "enable-rcon",
         "enable-query",
         "query.port",
-        "enforce-secure-profile",
         "minimap-mode",
         "allow-cave-map",
         "allow-mob-radar",

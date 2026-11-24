@@ -1192,7 +1192,7 @@ check "configuration information after known packs reaches chunk streaming" \
   tests/client_settings_wire.py 'client settings wire: FAIL config-late-window'
 
 check "play information reaches the live chunk window" \
-  src/play_protocol.rs '                let effective = requested.clamp(2, SERVER_VIEW_DISTANCE);' \
+  src/play_protocol.rs '                let effective = requested.clamp(2, live_view_distance());' \
   '                let effective = view;' \
   tests/client_settings_wire.py 'client settings wire: FAIL play-view-3'
 check "breaking changes server state, not only the predicted wire update" \
@@ -1968,7 +1968,7 @@ check "fluid handoff does not consume the ordinary runtime counter" \
   tick_tests::generated_fluid_handoff_matches_native_proto_unpack
 
 check "a sign message is a JSON string component" \
-  src/play_protocol.rs "    o.push('\"');" "    o.push(' ');" \
+  src/play_protocol.rs '        nbt_str(v, &json_text(l));' '        nbt_str(v, l);' \
   sign_side_nbt_matches_the_shape_the_game_writes
 
 check "a sign side omits filtered_messages" \
@@ -3953,8 +3953,8 @@ check "p2_3_s4_respawn_names_the_destination" \
   tick_tests::p2_3_s4_switch_client_dimension_emits_respawn_clears_chunks_and_syncs_position
 
 check "p2_3_s4_portal_horizontal_scaling" \
-  src/play_protocol.rs '        (DimId::Nether, bx as f64 / 8.0, bz as f64 / 8.0)' \
-  '        (DimId::Nether, bx as f64, bz as f64)' \
+  src/play_protocol.rs '    let ratio = portal_coordinate_ratio(dim.coordinate_scale(), ndim.coordinate_scale());' \
+  '    let ratio = 1.0;' \
   tick_tests::p2_3_s4_portal_scaling_clamps_y_and_the_arrival_guard_blocks_bounce
 
 check "p2_3_s4_logout_saves_the_live_dimension" \

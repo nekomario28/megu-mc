@@ -40,6 +40,8 @@ check_ops = false
 const LIVE_VIEW_DISTANCE_DEFAULT: i32 = 8;
 const LIVE_SIMULATION_DISTANCE_DEFAULT: i32 = 8;
 const LIVE_MAX_PLAYERS_DEFAULT: usize = 20;
+const LIVE_PVP_DEFAULT: bool = true;
+const LIVE_ALLOW_FLIGHT_DEFAULT: bool = false;
 
 static LIVE_VIEW_DISTANCE: std::sync::atomic::AtomicI32 =
     std::sync::atomic::AtomicI32::new(LIVE_VIEW_DISTANCE_DEFAULT);
@@ -47,13 +49,22 @@ static LIVE_SIMULATION_DISTANCE: std::sync::atomic::AtomicI32 =
     std::sync::atomic::AtomicI32::new(LIVE_SIMULATION_DISTANCE_DEFAULT);
 static LIVE_MAX_PLAYERS: std::sync::atomic::AtomicUsize =
     std::sync::atomic::AtomicUsize::new(LIVE_MAX_PLAYERS_DEFAULT);
+static LIVE_PVP_ENABLED: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(LIVE_PVP_DEFAULT);
+static LIVE_ALLOW_FLIGHT: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(LIVE_ALLOW_FLIGHT_DEFAULT);
 
 /// Install the effective operator settings after file, server.properties and
-/// environment precedence has been resolved.
+/// environment precedence has been resolved. `whitelist_enforced` is the
+/// boot-time seed for the run-time whitelist switch (`/whitelist on|off`
+/// keeps flipping it afterwards — see `set_whitelist_enforced`).
 pub(crate) fn apply_runtime_server_config(
     view_distance: Option<i32>,
     simulation_distance: Option<i32>,
     max_players: Option<usize>,
+    pvp: Option<bool>,
+    allow_flight: Option<bool>,
+    whitelist_enforced: Option<bool>,
 ) {
     LIVE_VIEW_DISTANCE.store(
         view_distance.unwrap_or(LIVE_VIEW_DISTANCE_DEFAULT).clamp(2, 32),
@@ -69,21 +80,46 @@ pub(crate) fn apply_runtime_server_config(
         max_players.unwrap_or(LIVE_MAX_PLAYERS_DEFAULT).clamp(1, 1000),
         std::sync::atomic::Ordering::Relaxed,
     );
+    LIVE_PVP_ENABLED.store(
+        pvp.unwrap_or(LIVE_PVP_DEFAULT),
+        std::sync::atomic::Ordering::Relaxed,
+    );
+    LIVE_ALLOW_FLIGHT.store(
+        allow_flight.unwrap_or(LIVE_ALLOW_FLIGHT_DEFAULT),
+        std::sync::atomic::Ordering::Relaxed,
+    );
+    if let Some(enforced) = whitelist_enforced {
+        set_whitelist_enforced(enforced);
+    }
 }
 
-#[allow(dead_code)]
+/// The server's chunk-tracking radius (`view-distance`, `MEGU_VIEW_DISTANCE`),
+/// clamped to Vanilla's `2..=32`.
 pub(crate) fn live_view_distance() -> i32 {
     LIVE_VIEW_DISTANCE.load(std::sync::atomic::Ordering::Relaxed)
 }
 
-#[allow(dead_code)]
+/// The entity-ticking radius (`simulation-distance`,
+/// `MEGU_SIMULATION_DISTANCE`), clamped to `2..=32`.
 pub(crate) fn live_simulation_distance() -> i32 {
     LIVE_SIMULATION_DISTANCE.load(std::sync::atomic::Ordering::Relaxed)
 }
 
-#[allow(dead_code)]
+/// The login cap (`max-players`, `MEGU_MAX_PLAYERS`).
 pub(crate) fn live_max_players() -> usize {
     LIVE_MAX_PLAYERS.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// Vanilla `pvp` (`MEGU_PVP`): `false` cancels player-vs-player damage.
+pub(crate) fn live_pvp_enabled() -> bool {
+    LIVE_PVP_ENABLED.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// Vanilla `allow-flight` (`MEGU_ALLOW_FLIGHT`): `false` kicks survival and
+/// adventure players who hover 80 ticks without falling (see
+/// `flight_kick_tick`); default off like Vanilla.
+pub(crate) fn live_allow_flight() -> bool {
+    LIVE_ALLOW_FLIGHT.load(std::sync::atomic::Ordering::Relaxed)
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -307,7 +343,18 @@ const SERVER_PROPERTIES_KEYS: &[(&str, &str)] = &[
     ("pvp", "MEGU_PVP"),
     ("allow-flight", "MEGU_ALLOW_FLIGHT"),
     ("online-mode", "MEGU_ONLINE_MODE"),
+    ("enable-command-block", "MEGU_ENABLE_COMMAND_BLOCK"),
+    ("resource-pack", "MEGU_RESOURCE_PACK_URL"),
+    ("require-resource-pack", "MEGU_RESOURCE_PACK_REQUIRED"),
+    ("enforce-secure-profile", "MEGU_ENFORCE_SECURE_PROFILE"),
 ];
+
+/// Properties keys handled without an env export. `enable-rcon` is Vanilla's
+/// switch and defaults off: it gates the `rcon.*` fills inside
+/// `server_properties_env`, so a properties file carrying a bare `rcon.port`
+/// cannot open the listener (which only reads `MEGU_RCON_PORT`) — and the
+/// switch itself never becomes a `MEGU_*` variable nothing would read.
+const SERVER_PROPERTIES_HANDLED_KEYS: &[&str] = &["enable-rcon"];
 
 /// Java `.properties` escape sequences. `\n`, `\t`, `\r`, `\f` and `\uXXXX` produce
 /// the named character; any other escaped character (including `\=`, `\:` and `\\`)
@@ -412,7 +459,18 @@ fn server_properties_env(
 ) -> Vec<(&'static str, String)> {
     let mut out = Vec::new();
     let mut emitted = HashSet::new();
+    // `enable-rcon=false` (or absent — the Vanilla default) suppresses the
+    // `rcon.*` exports entirely: the port alone must not open the socket.
+    let rcon_enabled = props
+        .get("enable-rcon")
+        .map(|value| ops_bool_str(value).unwrap_or(false))
+        .unwrap_or(false);
     for &(key, env) in SERVER_PROPERTIES_KEYS {
+        if !rcon_enabled
+            && matches!(env, "MEGU_RCON_PORT" | "MEGU_RCON_PASS" | "MEGU_RCON_PASSWORD")
+        {
+            continue;
+        }
         if emitted.contains(env) || is_set(env) {
             continue;
         }
@@ -440,6 +498,20 @@ fn server_properties_env(
         }
     }
     out
+}
+
+/// Properties keys `SERVER_PROPERTIES_KEYS` does not map, one warning each —
+/// the same `(ignored)` treatment `server.toml` unknown keys get, so a typo in
+/// a dropped-in Vanilla file is reported instead of vanishing silently.
+fn server_properties_unknown_keys(props: &BTreeMap<String, String>) -> Vec<String> {
+    props
+        .keys()
+        .filter(|key| {
+            !SERVER_PROPERTIES_KEYS.iter().any(|(known, _)| known == key)
+                && !SERVER_PROPERTIES_HANDLED_KEYS.contains(&key.as_str())
+        })
+        .map(|key| format!("unknown key `{key}`"))
+        .collect()
 }
 
 /// `[server]` keys and the environment variable each one stands for. The file only
@@ -583,7 +655,21 @@ fn server_config_boot() -> ServerConfigDoc {
         for (env, value) in server_properties_env(&props, |name| std::env::var_os(name).is_some()) {
             std::env::set_var(env, value);
         }
+        for w in server_properties_unknown_keys(&props) {
+            eprintln!("[config] {}: {w} (ignored)", server_properties_path(&path).display());
+        }
     }
+    // `MEGU_WHITELIST` is the historical variable; `MEGU_WHITELIST_ENABLED` is
+    // the canonical name `white-list`/`enforce-whitelist` export into. Both
+    // stay supported, the explicit legacy variable winning when both are set.
+    let whitelist_enforced = std::env::var("MEGU_WHITELIST")
+        .ok()
+        .and_then(|value| ops_bool_str(&value))
+        .or_else(|| {
+            std::env::var("MEGU_WHITELIST_ENABLED")
+                .ok()
+                .and_then(|value| ops_bool_str(&value))
+        });
     apply_runtime_server_config(
         std::env::var("MEGU_VIEW_DISTANCE")
             .ok()
@@ -594,6 +680,13 @@ fn server_config_boot() -> ServerConfigDoc {
         std::env::var("MEGU_MAX_PLAYERS")
             .ok()
             .and_then(|value| value.parse().ok()),
+        std::env::var("MEGU_PVP")
+            .ok()
+            .and_then(|value| ops_bool_str(&value)),
+        std::env::var("MEGU_ALLOW_FLIGHT")
+            .ok()
+            .and_then(|value| ops_bool_str(&value)),
+        whitelist_enforced,
     );
     // The environment now carries every file layer, so resolving the ops knobs
     // sees the same values the env-reading consumers do. Reported once, like
@@ -602,6 +695,7 @@ fn server_config_boot() -> ServerConfigDoc {
     for note in &ops.notes {
         eprintln!("[config] {note}");
     }
+    eprintln!("[config] {}", ops.summary());
     let _ = RUNTIME_OPS.set(ops);
     doc
 }
@@ -918,7 +1012,6 @@ impl RuntimeOpsConfig {
 
     /// One operator-log line naming every effective knob; the forwarding
     /// secret stays `[REDACTED]` so a pasted startup log cannot leak it.
-    #[allow(dead_code)]
     pub(crate) fn summary(&self) -> String {
         format!(
             "ops: online_mode={} velocity_forwarding={} (secret {}) autosave={}s backups={} lan={} load_balance={} target_version={} pack_dir={}",
@@ -951,24 +1044,141 @@ mod server_config_tests {
 
     #[test]
     fn live_runtime_accessors_apply_overrides_and_clamps() {
+        // The `live_*` atomics are process-global; every test mutating them
+        // (here and in the ops/protocol suites) holds the world guard.
+        let _guard = world_guard();
         assert_eq!(live_view_distance(), LIVE_VIEW_DISTANCE_DEFAULT);
         assert_eq!(live_simulation_distance(), LIVE_SIMULATION_DISTANCE_DEFAULT);
         assert_eq!(live_max_players(), LIVE_MAX_PLAYERS_DEFAULT);
 
-        apply_runtime_server_config(Some(1), Some(40), Some(0));
+        apply_runtime_server_config(Some(1), Some(40), Some(0), None, None, None);
         assert_eq!(live_view_distance(), 2);
         assert_eq!(live_simulation_distance(), 32);
         assert_eq!(live_max_players(), 1);
 
-        apply_runtime_server_config(Some(12), Some(6), Some(200));
+        apply_runtime_server_config(Some(12), Some(6), Some(200), None, None, None);
         assert_eq!(live_view_distance(), 12);
         assert_eq!(live_simulation_distance(), 6);
         assert_eq!(live_max_players(), 200);
 
-        apply_runtime_server_config(None, None, None);
+        apply_runtime_server_config(None, None, None, None, None, None);
         assert_eq!(live_view_distance(), LIVE_VIEW_DISTANCE_DEFAULT);
         assert_eq!(live_simulation_distance(), LIVE_SIMULATION_DISTANCE_DEFAULT);
         assert_eq!(live_max_players(), LIVE_MAX_PLAYERS_DEFAULT);
+    }
+
+    #[test]
+    fn live_runtime_pvp_flight_and_whitelist_seed_apply() {
+        // The gameplay flags ride the same install: `pvp=false` and
+        // `allow-flight=true` reach their getters, and the whitelist seed
+        // drives the shared enforcement switch `/whitelist on|off` flips.
+        let _guard = world_guard();
+        apply_runtime_server_config(None, None, None, Some(false), Some(true), Some(true));
+        assert!(!live_pvp_enabled());
+        assert!(live_allow_flight());
+        assert!(live_whitelist_enforced());
+
+        apply_runtime_server_config(None, None, None, Some(true), Some(false), Some(false));
+        assert!(live_pvp_enabled());
+        assert!(!live_allow_flight());
+        assert!(!live_whitelist_enforced());
+    }
+
+    #[test]
+    fn server_properties_gameplay_and_admin_keys_export() {
+        let props = server_properties_parse(
+            "view-distance=12\n\
+             simulation-distance=6\n\
+             max-players=42\n\
+             white-list=true\n\
+             pvp=false\n\
+             allow-flight=true\n\
+             enable-command-block=true\n\
+             resource-pack=https://example.invalid/pack.zip\n\
+             require-resource-pack=true\n\
+             enforce-secure-profile=true\n\
+             enable-rcon=true\n",
+        );
+        let env = server_properties_env(&props, |_| false);
+        let got: BTreeMap<&str, String> = env.into_iter().collect();
+        assert_eq!(got["MEGU_VIEW_DISTANCE"], "12");
+        assert_eq!(got["MEGU_SIMULATION_DISTANCE"], "6");
+        assert_eq!(got["MEGU_MAX_PLAYERS"], "42");
+        assert_eq!(got["MEGU_WHITELIST_ENABLED"], "true");
+        assert_eq!(got["MEGU_PVP"], "false");
+        assert_eq!(got["MEGU_ALLOW_FLIGHT"], "true");
+        assert_eq!(got["MEGU_ENABLE_COMMAND_BLOCK"], "true");
+        assert_eq!(
+            got["MEGU_RESOURCE_PACK_URL"],
+            "https://example.invalid/pack.zip"
+        );
+        assert_eq!(got["MEGU_RESOURCE_PACK_REQUIRED"], "true");
+        assert_eq!(got["MEGU_ENFORCE_SECURE_PROFILE"], "true");
+        // `enable-rcon` is consumed semantically: it exports nothing itself
+        // but is still a recognized (not unknown) key.
+        assert!(!got.contains_key("MEGU_ENABLE_RCON"));
+        // Every one of these keys is mapped or handled, so none is reported
+        // unknown.
+        assert!(server_properties_unknown_keys(&props).is_empty());
+    }
+
+    #[test]
+    fn server_properties_enable_rcon_gates_the_rcon_fills() {
+        // Vanilla semantics: `enable-rcon` defaults off, so a bare `rcon.port`
+        // must not open the listener that reads `MEGU_RCON_PORT`.
+        for body in ["rcon.port=25575\n", "rcon.port=25575\nenable-rcon=false\n"] {
+            let props = server_properties_parse(body);
+            let got: BTreeMap<&str, String> =
+                server_properties_env(&props, |_| false).into_iter().collect();
+            assert!(
+                !got.contains_key("MEGU_RCON_PORT")
+                    && !got.contains_key("MEGU_RCON_PASS")
+                    && !got.contains_key("MEGU_RCON_PASSWORD"),
+                "rcon fills must be suppressed without enable-rcon=true: {body:?}"
+            );
+            assert!(server_properties_unknown_keys(&props).is_empty());
+        }
+        // `enable-rcon=true` releases the port, password and RCON fills.
+        let props = server_properties_parse(
+            "enable-rcon=true\nrcon.port=25575\nrcon.password=secret\n",
+        );
+        let got: BTreeMap<&str, String> =
+            server_properties_env(&props, |_| false).into_iter().collect();
+        assert_eq!(got["MEGU_RCON_PORT"], "25575");
+        assert_eq!(got["MEGU_RCON_PASS"], "secret");
+        assert_eq!(got["MEGU_RCON_PASSWORD"], "secret");
+        // An already-set `MEGU_RCON_PORT` is upper-layer state: the gate only
+        // decides what the properties file itself fills.
+        let got: BTreeMap<&str, String> = server_properties_env(
+            &server_properties_parse("rcon.port=25575\n"),
+            |name| name == "MEGU_RCON_PORT",
+        )
+        .into_iter()
+        .collect();
+        assert!(!got.contains_key("MEGU_RCON_PORT"));
+    }
+
+    #[test]
+    fn server_properties_unknown_keys_are_reported_not_dropped() {
+        let props = server_properties_parse(
+            "view-distance=12\n\
+             viwe-distance=4\n\
+             motd=hi\n\
+             not-a-real-key=x\n",
+        );
+        let unknown = server_properties_unknown_keys(&props);
+        assert_eq!(
+            unknown,
+            vec![
+                "unknown key `not-a-real-key`".to_owned(),
+                "unknown key `viwe-distance`".to_owned(),
+            ]
+        );
+        // The real keys still exported while the typos were only warnings.
+        let env = server_properties_env(&props, |_| false);
+        let got: BTreeMap<&str, String> = env.into_iter().collect();
+        assert_eq!(got["MEGU_VIEW_DISTANCE"], "12");
+        assert_eq!(got["MEGU_MOTD"], "hi");
     }
 
     #[test]
