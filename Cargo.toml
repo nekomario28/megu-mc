@@ -73,7 +73,7 @@ megu-server-files = { path = "server-files" }
 megu-state-store = { path = "state-store", optional = true }
 mod-offload = { path = "mod-offload", optional = true }
 ureq = { version = "3.4.2", features = ["rustls"] }
-rsa = "=0.9.10"
+rsa = "=0.10.0"
 rand = "=0.8.8"
 
 # Unix-only: `src/main.rs` arms the SIGTERM/SIGINT save handler through
