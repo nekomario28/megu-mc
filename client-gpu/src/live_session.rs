@@ -34,10 +34,15 @@ use megu_client::spatial_audio::{SpatialAudioPreset, SpatialSubtitleCue, Subtitl
 use megu_client::world::{BlockTable, WorldState, pack_vertices, sort_translucent};
 use megu_client_mesh::asset_pipeline::{CompiledAssetBundle, ResourcePackLayer};
 use megu_client_mesh::atlas::{AtlasMip, PackedAtlas, SpriteAnimation, SpritePlacement};
-use megu_client_mesh::builtin_shadow_wgsl::BuiltinShadowQuality;
-use megu_client_mesh::entity_rig::{EntityRigSpec, classify_entity_rig};
+use megu_client_mesh::builtin_shadow_wgsl::{BuiltinShadowQuality, enchantment_glint_rgb};
+use megu_client_mesh::dynamic_light_resolver::{
+    BlockLightInput, LightModulation, ResolvedLightEmitter, evaluate_modulated_intensity,
+    resolve_block_light_emitter, resolve_entity_light_emitter, resolve_item_light_emitter,
+};
+use megu_client_mesh::entity_rig::{EntityRigArchetype, EntityRigSpec, classify_entity_rig};
 use megu_client_mesh::mesher::{
     BlockVisualEnhancementResult, BlockVisualInput, VanillaPlusPipelineConfig,
+    torch_flame_kind, torch_flame_world_offset,
 };
 use megu_client_mesh::model_baker::ResourcePackModelStack;
 use megu_client_mesh::model_baker::blockstate::{self, BlockStateDef, BlockStateResolution};
@@ -1354,119 +1359,216 @@ pub struct DynamicLightSpec {
     pub flicker: f32,
 }
 
-const fn dyn_light_spec(
-    rgb: [f32; 3],
-    radius: f32,
-    intensity: f32,
-    flicker: f32,
-) -> DynamicLightSpec {
+/// Map a resolved universal emitter back to the compact
+/// [`DynamicLightSpec`] material summary [`item_dynamic_light_spec`]
+/// returns: the `flicker` field carries the modulation depth
+/// (`OpenFlame`/`SignalPulse` amplitude, `0.0` for steady emitters).
+fn spec_from_emitter(emitter: &ResolvedLightEmitter) -> DynamicLightSpec {
     DynamicLightSpec {
-        rgb,
-        radius,
-        intensity,
-        flicker,
+        rgb: emitter.rgb,
+        radius: emitter.radius,
+        intensity: emitter.intensity,
+        flicker: match emitter.modulation {
+            LightModulation::Steady => 0.0,
+            LightModulation::OpenFlame { flicker_amplitude } => flicker_amplitude,
+            LightModulation::SignalPulse { amplitude, .. } => amplitude,
+        },
     }
 }
 
-/// Warm amber shared by every open-flame emitter (~2000K flame).
-const WARM_FLAME_RGB: [f32; 3] = [1.0, 0.78, 0.48];
-/// Cool cyan-teal soul-fire tint.
-const SOUL_FLAME_RGB: [f32; 3] = [0.42, 0.88, 1.0];
-/// Rich golden-orange for lava/magma-tier emitters.
-const MAGMA_RGB: [f32; 3] = [1.0, 0.62, 0.28];
-/// Deep crimson redstone glow.
-const REDSTONE_RGB: [f32; 3] = [1.0, 0.25, 0.2];
-/// Burning-entity flame tint (entity-metadata flag bit `0x01`).
-const ENTITY_FIRE_RGB: [f32; 3] = [1.0, 0.55, 0.2];
-/// `±4%` organic flicker for open flames (sinusoidal, per-tick phase).
-const FLAME_FLICKER: f32 = 0.04;
-/// Flicker angular speed in radians per game tick (~2.2 Hz at 20 tps).
-const FLICKER_RAD_PER_TICK: f32 = 0.7;
+/// Vanilla item-id path -> declared light level for held/dropped stacks
+/// whose luminance cannot come from a placed-block registry row (the
+/// bucket, rods and item-only emitters) or is needed before any block
+/// registry is available. Levels are the vanilla 1.21.1 block
+/// luminances — the resolver still derives every color, radius,
+/// modulation and quench decision from the shared material vocabulary,
+/// so this table is data, not per-item shader logic.
+const VANILLA_ITEM_LIGHT_LEVELS: &[(&str, u8)] = &[
+    ("torch", 14),
+    ("wall_torch", 14),
+    ("soul_torch", 10),
+    ("soul_wall_torch", 10),
+    ("redstone_torch", 7),
+    ("redstone_wall_torch", 7),
+    ("lantern", 15),
+    ("soul_lantern", 10),
+    ("campfire", 15),
+    ("soul_campfire", 10),
+    ("jack_o_lantern", 15),
+    ("sea_lantern", 15),
+    ("glowstone", 15),
+    ("shroomlight", 15),
+    ("ochre_froglight", 15),
+    ("pearlescent_froglight", 15),
+    ("verdant_froglight", 15),
+    ("end_rod", 14),
+    ("beacon", 15),
+    ("conduit", 15),
+    ("amethyst_cluster", 5),
+    ("large_amethyst_bud", 4),
+    ("medium_amethyst_bud", 2),
+    ("glow_berries", 14),
+    ("magma_block", 3),
+    ("lava_bucket", 15),
+    ("blaze_rod", 12),
+    ("blaze_powder", 8),
+    ("glow_ink_sac", 10),
+    ("redstone_block", 7),
+];
 
-/// Burning-entity overlay spec applied to any tracked entity whose
-/// shared flags carry bit `0x01`.
-const ENTITY_FIRE_LIGHT_SPEC: DynamicLightSpec =
-    dyn_light_spec(ENTITY_FIRE_RGB, 8.0, 1.3, 0.08);
+/// Registry-declared luminance of a namespaced item id, or `None` when
+/// the id carries no `minecraft:`/mod-namespace light entry.
+fn vanilla_item_light_level(item_name: &str) -> Option<u8> {
+    let path = item_name.rsplit(':').next().unwrap_or(item_name);
+    VANILLA_ITEM_LIGHT_LEVELS
+        .iter()
+        .find(|(name, _)| *name == path)
+        .map(|(_, level)| *level)
+}
 
-/// Vanilla 1.21.1 held/dropped item -> dynamic point light: color
-/// temperature, reach and flicker per emitter family, `None` for
-/// non-glowing items. `item_name` accepts `minecraft:torch` and bare
-/// `torch` alike; `submerged` quenches open flames (torch/wall torch and
-/// campfire drown — enclosed lanterns and carved pumpkins keep burning
-/// underwater, matching the vanilla block behavior).
+/// Vanilla entity-type path -> declared light level for luminous mobs
+/// and projectiles the shared resolver's vocabulary does not already
+/// classify (blazes, magma cubes, glow squids and allays resolve
+/// through generic `blaze`/`magma`/`glow`/`allay` tokens on their own).
+const VANILLA_ENTITY_LIGHT_LEVELS: &[(&str, u8)] = &[
+    ("blaze", 14),
+    ("magma_cube", 9),
+    ("fireball", 15),
+    ("dragon_fireball", 15),
+    ("small_fireball", 10),
+    ("end_crystal", 11),
+    ("spectral_arrow", 9),
+    ("glow_squid", 10),
+];
+
+fn vanilla_entity_light_level(rig_name: &str) -> Option<u8> {
+    let path = rig_name.rsplit(':').next().unwrap_or(rig_name);
+    VANILLA_ENTITY_LIGHT_LEVELS
+        .iter()
+        .find(|(name, _)| *name == path)
+        .map(|(_, level)| *level)
+}
+
+/// Universal held/dropped item -> dynamic point light: every vanilla,
+/// redstone and modded item resolves through
+/// [`resolve_item_light_emitter`]'s data-driven spectrum/material
+/// inference (zero per-mod tables). `item_name` accepts
+/// `minecraft:torch` and bare `torch` alike; `submerged` quenches open
+/// flames (torches and campfires drown — enclosed lanterns and carved
+/// pumpkins keep burning underwater, matching vanilla block behavior).
+/// Returns `None` for non-glowing items and for emitters that quench.
 pub fn item_dynamic_light_spec(
     item_name: &str,
     submerged: bool,
 ) -> Option<DynamicLightSpec> {
-    let path = item_name.rsplit(':').next().unwrap_or(item_name);
-    if submerged && matches!(path, "torch" | "wall_torch" | "campfire") {
+    let emitter = resolve_item_light_emitter(
+        item_name,
+        vanilla_item_light_level(item_name),
+        None,
+        submerged,
+    )?;
+    if emitter.quenches_underwater {
         return None;
     }
-    let spec = match path {
-        // Warm flame family — 12..=14 reach, ±4% sinusoidal flicker.
-        "torch" | "wall_torch" => dyn_light_spec(WARM_FLAME_RGB, 12.0, 1.9, FLAME_FLICKER),
-        "campfire" => dyn_light_spec(WARM_FLAME_RGB, 14.0, 2.0, FLAME_FLICKER),
-        "lantern" => dyn_light_spec(WARM_FLAME_RGB, 13.0, 1.8, FLAME_FLICKER),
-        "jack_o_lantern" => dyn_light_spec(WARM_FLAME_RGB, 14.0, 2.0, FLAME_FLICKER),
-        // Soul flame family — cooler, tighter cyan-teal reach.
-        "soul_torch" | "soul_lantern" | "soul_campfire" => {
-            dyn_light_spec(SOUL_FLAME_RGB, 10.0, 1.5, 0.0)
-        }
-        // Magma / lava tier — the brightest golden-orange emitters.
-        "lava_bucket" => dyn_light_spec(MAGMA_RGB, 15.0, 2.4, 0.0),
-        "magma_block" => dyn_light_spec(MAGMA_RGB, 13.0, 1.6, 0.0),
-        "blaze_rod" | "blaze_powder" => dyn_light_spec(MAGMA_RGB, 13.0, 1.4, 0.0),
-        "glowstone" | "shroomlight" => dyn_light_spec(MAGMA_RGB, 14.0, 2.0, 0.0),
-        "ochre_froglight" => dyn_light_spec(MAGMA_RGB, 15.0, 2.2, 0.0),
-        // Sea / crystal tier — crisp aqua, pearl and lavender tints.
-        "sea_lantern" => dyn_light_spec([0.62, 0.95, 0.9], 14.0, 2.0, 0.0),
-        "pearlescent_froglight" => dyn_light_spec([0.9, 0.78, 1.0], 14.0, 2.0, 0.0),
-        "verdant_froglight" => dyn_light_spec([0.55, 1.0, 0.75], 14.0, 2.0, 0.0),
-        "end_rod" => dyn_light_spec([0.88, 0.92, 1.0], 13.0, 1.8, 0.0),
-        "beacon" => dyn_light_spec([0.85, 0.92, 1.0], 14.0, 2.0, 0.0),
-        "amethyst_cluster" => dyn_light_spec([0.78, 0.62, 1.0], 9.0, 1.0, 0.0),
-        "glow_berries" => dyn_light_spec([0.9, 1.0, 0.5], 10.0, 1.2, 0.0),
-        "glow_ink_sac" => dyn_light_spec([0.45, 0.9, 1.0], 9.0, 1.0, 0.0),
-        // Redstone — the dim, deep-crimson circuitry glow.
-        "redstone_torch" | "redstone_block" => dyn_light_spec(REDSTONE_RGB, 7.0, 0.9, 0.0),
-        _ => return None,
-    };
-    Some(spec)
-}
-
-/// Naturally luminous vanilla mobs/projectiles -> dynamic light, keyed
-/// on the `minecraft:`-prefixed rig names [`EntityRigSpec::name`] carries.
-/// The generic on-fire overlay is [`ENTITY_FIRE_LIGHT_SPEC`].
-fn entity_dynamic_light_spec(name: &str) -> Option<DynamicLightSpec> {
-    let spec = match name {
-        "minecraft:blaze" => dyn_light_spec(MAGMA_RGB, 14.0, 2.0, FLAME_FLICKER),
-        "minecraft:magma_cube" => dyn_light_spec(MAGMA_RGB, 9.0, 1.2, FLAME_FLICKER),
-        "minecraft:fireball" | "minecraft:dragon_fireball" => {
-            dyn_light_spec(ENTITY_FIRE_RGB, 14.0, 2.4, 0.08)
-        }
-        "minecraft:small_fireball" => dyn_light_spec(ENTITY_FIRE_RGB, 10.0, 1.6, 0.08),
-        "minecraft:glow_squid" => dyn_light_spec([0.45, 0.9, 1.0], 10.0, 1.2, 0.0),
-        "minecraft:spectral_arrow" => dyn_light_spec([1.0, 0.85, 0.35], 8.0, 1.2, 0.0),
-        "minecraft:end_crystal" => dyn_light_spec([0.85, 0.6, 1.0], 10.0, 1.4, 0.0),
-        "minecraft:allay" => dyn_light_spec([0.55, 0.85, 1.0], 6.0, 0.9, 0.0),
-        _ => return None,
-    };
-    Some(spec)
+    Some(spec_from_emitter(&emitter))
 }
 
 /// `radius * intensity` reach-power heuristic used to pick the single
 /// brightest candidate when one anchor offers several light sources
 /// (mainhand vs offhand, mob glow vs held torch).
-fn brightest_light_spec(
-    a: Option<DynamicLightSpec>,
-    b: Option<DynamicLightSpec>,
-) -> Option<DynamicLightSpec> {
-    let power = |s: DynamicLightSpec| s.radius * s.intensity;
+fn brightest_emitter(
+    a: Option<ResolvedLightEmitter>,
+    b: Option<ResolvedLightEmitter>,
+) -> Option<ResolvedLightEmitter> {
+    let power = |e: &ResolvedLightEmitter| e.radius * e.intensity;
     match (a, b) {
-        (Some(x), Some(y)) => Some(if power(x) >= power(y) { x } else { y }),
+        (Some(x), Some(y)) => Some(if power(&x) >= power(&y) { x } else { y }),
         (x, None) => x,
         (None, y) => y,
     }
+}
+
+/// Half-extent (blocks) of the placed luminous-block scan box —
+/// `(2*8+1)^3` = 4,913 `get_block_state` reads per call, each a cheap
+/// palette lookup that short-circuits before any resolver work.
+const PLACED_LIGHT_SCAN_RADIUS: i32 = 8;
+
+/// Names of the redstone signal components whose registry luminance is
+/// `0` in every state — wire, repeater, comparator and observer have no
+/// `lit` luminance variants, so the scan cannot gate them on
+/// `facts.luminance` the way lamps/torches/ores/bulbs are gated (their
+/// lit states all carry `luminance > 0`). These are the only names the
+/// scan feeds a synthesized `powered` property to; every other
+/// luminance-0 cell is skipped before resolver work. Token-matched so
+/// modded `*_wire`/`*_repeater`/`*_comparator`/`*_observer` names join
+/// automatically.
+fn is_always_dark_signal_block(block_id: &str) -> bool {
+    let path = block_id.rsplit(':').next().unwrap_or(block_id);
+    path.split('_')
+        .any(|token| matches!(token, "wire" | "repeater" | "comparator" | "observer"))
+}
+
+// ---------------------------------------------------------------------------
+// Grounded contact shadows beneath standing mobs
+// ---------------------------------------------------------------------------
+
+/// Cap on contact-shadow quads collected per call — the same 64-entry
+/// budget the dynamic-light UBO uses, bounded against pathological
+/// entity counts.
+pub const MAX_CONTACT_SHADOW_QUADS: usize = 64;
+
+/// Maximum drop (blocks) the floor probe below an entity searches — an
+/// entity with no collision surface inside this range is airborne past
+/// the shadow's usefulness and emits no quad.
+const CONTACT_SHADOW_PROBE_DEPTH: f64 = 4.0;
+
+/// Height above the floor (blocks) at which the contact shadow has
+/// fully faded; entities airborne beyond this emit no quad.
+const CONTACT_SHADOW_FADE_BLOCKS: f32 = 2.5;
+
+/// One soft, flat contact-shadow quad a mob/creature rig casts onto the
+/// solid floor beneath it — the lit-entity staging feed that keeps mobs
+/// visually grounded indoors, under cloud shade and when the cascade
+/// shadow pass is Off/Feather. `positions` winds counter-clockwise seen
+/// from above in the `[0,1,0]` normal plane; `rgba` is a near-black
+/// shadow tint whose alpha fades linearly with `height_above_floor`.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct EntityContactShadowQuad {
+    /// Tracked entity id the shadow belongs to.
+    pub entity_id: i32,
+    /// World-space quad corners, all at `floor_top + 0.015`.
+    pub positions: [[f32; 3]; 4],
+    /// Face normal — always `[0.0, 1.0, 0.0]`.
+    pub normal: [f32; 3],
+    /// Shadow tint `[r, g, b, a]`; alpha `0.30` at ground level, fading
+    /// to `0` at [`CONTACT_SHADOW_FADE_BLOCKS`] height.
+    pub rgba: [f32; 4],
+    /// Vertical distance (blocks) between the entity's feet and the
+    /// shadow plane — `0` when standing, `<= 2.5` while hopping.
+    pub height_above_floor: f32,
+}
+
+// ---------------------------------------------------------------------------
+// 3D enchantment-glint shimmer on enchanted stacks
+// ---------------------------------------------------------------------------
+
+/// 1.21.1 data-component type ids whose presence (with a non-empty
+/// entry list) grants the enchantment glint: `minecraft:enchantments`
+/// (`9`) and `minecraft:stored_enchantments` (`23`, enchanted books).
+const ITEM_GLINT_COMPONENT_IDS: [i32; 2] = [9, 23];
+
+/// `true` when the decoded stack carries an enchantment component with
+/// at least one entry — vanilla's `ItemStack.hasGlint` proxy driving
+/// the violet shimmer layer on 3D dropped/held item quads and armor.
+pub fn item_stack_has_glint(stack: &ItemStackComponents) -> bool {
+    stack.item_id > 0
+        && stack.count > 0
+        && stack.added.iter().any(|patch| {
+            ITEM_GLINT_COMPONENT_IDS.contains(&patch.type_id)
+                // First payload byte is the entry-count varint: any
+                // non-zero value means at least one enchantment.
+                && patch.data.first().is_some_and(|&count| count != 0)
+        })
 }
 
 /// Owns UI-facing world data on the event-loop thread. The worker owns its socket.
@@ -2566,10 +2668,12 @@ impl LiveSession {
     /// UBO: the local player's brightest held emitter (mainhand/offhand,
     /// open flames quenched while the eyes are submerged), remote-entity
     /// held glow from `entity_equipment`, naturally luminous mobs,
-    /// burning entities (metadata flag bit `0x01`) and dropped glowing
-    /// item stacks — every candidate resolved through
-    /// [`item_dynamic_light_spec`]/[`entity_dynamic_light_spec`], sorted
-    /// nearest-first to `camera` and truncated to [`MAX_DYNAMIC_LIGHTS`].
+    /// burning entities (metadata flag bit `0x01`), spectral-glow
+    /// entities (bit `0x40`), dropped glowing item stacks and every
+    /// placed luminous block inside an 8-block scan box — all resolved
+    /// through the universal `client-port` resolver, intensity-modulated
+    /// via [`evaluate_modulated_intensity`], sorted nearest-first to
+    /// `camera` and truncated to [`MAX_DYNAMIC_LIGHTS`].
     /// Returns an empty `Vec` while the world-effects pack is off
     /// (`settings.visual.world_effects` -> `nature.enabled`), so the
     /// settings' Off switch emits zero held/entity dynamic lights.
@@ -2581,17 +2685,13 @@ impl LiveSession {
         if !self.vanilla_plus_cfg.nature.enabled {
             return Vec::new();
         }
-        let ticks = self.world_time_ticks();
+        let tick_time_sec = self.world_time_ticks() as f32 / 20.0;
         let mut candidates: Vec<(f32, DynamicColoredLight)> = Vec::new();
-        let mut push = |pos: [f32; 3], spec: DynamicLightSpec, phase: f32| {
-            let intensity = if spec.flicker > 0.0 {
-                spec.intensity
-                    * (1.0
-                        + spec.flicker
-                            * (ticks as f32 * FLICKER_RAD_PER_TICK + phase).sin())
-            } else {
-                spec.intensity
-            };
+        let mut push = |pos: [f32; 3], emitter: ResolvedLightEmitter, phase: f32| {
+            let intensity = evaluate_modulated_intensity(&emitter, tick_time_sec, phase);
+            if !intensity.is_finite() || intensity <= 0.0 {
+                return;
+            }
             let delta = [
                 pos[0] - camera[0],
                 pos[1] - camera[1],
@@ -2601,8 +2701,8 @@ impl LiveSession {
                 delta[0] * delta[0] + delta[1] * delta[1] + delta[2] * delta[2],
                 DynamicColoredLight {
                     pos,
-                    rgb: spec.rgb,
-                    radius: spec.radius,
+                    rgb: emitter.rgb,
+                    radius: emitter.radius,
                     intensity,
                     // Rebuilt every frame — a two-tick TTL only matters if
                     // a consumer ever feeds these through the VFX engine.
@@ -2613,7 +2713,9 @@ impl LiveSession {
         };
         // Local player: brightest of mainhand (window-0 container slot
         // 36 + selected hotbar index) and offhand (slot 45), anchored at
-        // the vanilla eye position.
+        // the held-item flame tip — a hand's width forward and right of
+        // the eye at `feet + 1.48`, so a carried torch lights the wall
+        // the player faces rather than their own head.
         if let Some(pose) = self.pose {
             let submerged = self.player_eye_submerged();
             let held = [36 + self.hud.selected_slot.min(8) as i32, 45]
@@ -2621,22 +2723,24 @@ impl LiveSession {
                 .filter_map(|slot| self.player_inventory.get(&slot))
                 .filter(|stack| stack.item_id > 0 && stack.count > 0)
                 .fold(None, |best, stack| {
-                    brightest_light_spec(
-                        best,
-                        item_dynamic_light_spec(
-                            &crate::recipe_ingest::item_name_for_id(stack.item_id as u32),
-                            submerged,
-                        ),
-                    )
+                    brightest_emitter(best, self.held_item_emitter(stack, submerged))
                 });
-            if let Some(spec) = held {
+            if let Some(emitter) = held {
+                let yaw = pose.yaw.to_radians();
+                // Vanilla convention: yaw 0 faces +z; the horizontal
+                // forward/right pair puts the tip slightly ahead and to
+                // the player's right hand.
+                let forward = [-yaw.sin(), yaw.cos()];
+                let right = [-yaw.cos(), -yaw.sin()];
                 push(
                     [
-                        pose.feet[0] as f32,
-                        (pose.feet[1] + 1.62) as f32,
-                        pose.feet[2] as f32,
+                        (pose.feet[0]
+                            + f64::from(0.35 * forward[0] + 0.25 * right[0])) as f32,
+                        (pose.feet[1] + 1.48) as f32,
+                        (pose.feet[2]
+                            + f64::from(0.35 * forward[1] + 0.25 * right[1])) as f32,
                     ],
-                    spec,
+                    emitter,
                     0.0,
                 );
             }
@@ -2664,54 +2768,359 @@ impl LiveSession {
                 )
                 .kind
                 .is_some();
-            let held_item_spec = |stack: &ItemStackComponents| {
-                item_dynamic_light_spec(
-                    &crate::recipe_ingest::item_name_for_id(stack.item_id as u32),
-                    submerged,
-                )
-            };
-            let mut spec = entity_dynamic_light_spec(rig.name);
-            if self
+            let flags = self
                 .entity_metadata
                 .get(&eid)
                 .and_then(|meta| meta.flags)
-                .is_some_and(|flags| flags & 0x01 != 0)
-            {
-                spec = brightest_light_spec(spec, Some(ENTITY_FIRE_LIGHT_SPEC));
-            }
+                .unwrap_or(0);
+            let mut emitter = resolve_entity_light_emitter(
+                rig.name,
+                flags & 0x01 != 0,
+                flags & 0x40 != 0,
+                vanilla_entity_light_level(rig.name),
+                None,
+            );
             // `minecraft:item` drops carry their stack in metadata index 8.
             if rig.name == "minecraft:item" {
-                spec = brightest_light_spec(
-                    spec,
+                emitter = brightest_emitter(
+                    emitter,
                     self.entity_metadata
                         .get(&eid)
                         .and_then(|meta| meta.item_stack.as_ref())
-                        .filter(|stack| stack.item_id > 0 && stack.count > 0)
-                        .and_then(held_item_spec),
+                        .and_then(|stack| self.held_item_emitter(stack, submerged)),
                 );
             }
             // Vanilla equipment slots 0/1 = mainhand/offhand — remote
             // players and item-carrying mobs glow with what they hold.
             for slot in 0u8..=1 {
-                spec = brightest_light_spec(
-                    spec,
+                emitter = brightest_emitter(
+                    emitter,
                     self.entity_equipment
                         .get(&(eid, slot))
-                        .filter(|stack| stack.item_id > 0 && stack.count > 0)
-                        .and_then(held_item_spec),
+                        .and_then(|stack| self.held_item_emitter(stack, submerged)),
                 );
             }
-            if let Some(spec) = spec {
+            if let Some(emitter) = emitter {
                 // Golden-ratio phase decorrelates the flicker between
                 // nearby flames so they never pulse in lockstep.
-                push(center, spec, eid as f32 * 0.618_034);
+                push(center, emitter, eid as f32 * 0.618_034);
             }
         }
+        // Placed luminous blocks near the camera: every cell reporting
+        // `facts.luminance > 0` (vanilla or modded — the registry name
+        // feeds the universal token inference) plus powered-looking
+        // signal components, resolved through the shared block emitter
+        // resolver so modded lamps/conduits glow without a mod table.
+        candidates.extend(self.placed_block_light_candidates(camera, tick_time_sec));
         candidates.sort_by(|a, b| {
             a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal)
         });
         candidates.truncate(MAX_DYNAMIC_LIGHTS);
         candidates.into_iter().map(|(_, light)| light).collect()
+    }
+
+    /// Resolve a held/dropped stack into a universal light emitter:
+    /// the item's declared luminance comes from the block registry when
+    /// the stack is a placeable light block (modded blocks included),
+    /// falling back to [`VANILLA_ITEM_LIGHT_LEVELS`] for item-only
+    /// emitters and to the resolver's generic vocabulary for modded
+    /// non-block items. Quenched open flames report `None`.
+    fn held_item_emitter(
+        &self,
+        stack: &ItemStackComponents,
+        submerged: bool,
+    ) -> Option<ResolvedLightEmitter> {
+        if stack.item_id <= 0 || stack.count <= 0 {
+            return None;
+        }
+        let name = crate::recipe_ingest::item_name_for_id(stack.item_id as u32);
+        let declared = self.declared_item_light_level(&name);
+        resolve_item_light_emitter(&name, declared, None, submerged)
+            .filter(|emitter| !emitter.quenches_underwater)
+    }
+
+    /// Declared light level for a held/dropped item id: the live block
+    /// registry's own luminance when it knows the name (covers every
+    /// modded block item), then [`vanilla_item_light_level`].
+    fn declared_item_light_level(&self, item_name: &str) -> Option<u8> {
+        if let Some(registry) = self.world.registry.as_ref() {
+            if let Some(level) = registry
+                .default_state(item_name)
+                .ok()
+                .and_then(|state| registry.facts(state).ok())
+                .map(|facts| facts.luminance)
+                .filter(|level| *level > 0)
+            {
+                return Some(level);
+            }
+        }
+        vanilla_item_light_level(item_name)
+    }
+
+    /// The 8-block Manhattan-free box scan of placed luminous blocks —
+    /// at most `(2*PLACED_LIGHT_SCAN_RADIUS+1)^3` = 4,913 cheap
+    /// `get_block_state` palette reads per frame, short-circuiting on
+    /// unloaded/air/non-luminous cells before any resolver work. Torch
+    /// families anchor at the exact [`torch_flame_world_offset`] flame
+    /// tip (wall torches infer their mount side from solid neighbors);
+    /// every other emitter anchors at the resolver's block-local
+    /// emission origin.
+    fn placed_block_light_candidates(
+        &self,
+        camera: [f32; 3],
+        tick_time_sec: f32,
+    ) -> Vec<(f32, megu_client_mesh::vfx_engine::DynamicColoredLight)> {
+        use megu_client_mesh::vfx_engine::DynamicColoredLight;
+        let mut out = Vec::new();
+        let Some(registry) = self.world.registry.as_ref() else {
+            return out;
+        };
+        let cx = camera[0].floor() as i32;
+        let cy = camera[1].floor() as i32;
+        let cz = camera[2].floor() as i32;
+        for dy in -PLACED_LIGHT_SCAN_RADIUS..=PLACED_LIGHT_SCAN_RADIUS {
+            for dz in -PLACED_LIGHT_SCAN_RADIUS..=PLACED_LIGHT_SCAN_RADIUS {
+                for dx in -PLACED_LIGHT_SCAN_RADIUS..=PLACED_LIGHT_SCAN_RADIUS {
+                    let (x, y, z) = (cx + dx, cy + dy, cz + dz);
+                    let Some(state) = self.world.get_block_state(x, y, z) else {
+                        continue;
+                    };
+                    let Ok(facts) = registry.facts(state) else {
+                        continue;
+                    };
+                    if facts.is_air != 0 {
+                        continue;
+                    }
+                    let name = registry.state_name(state).unwrap_or_default();
+                    let signal = is_always_dark_signal_block(name);
+                    if facts.luminance == 0 && !signal {
+                        continue;
+                    }
+                    // `properties` carries only what the per-state facts
+                    // table can prove: waterlog status and — for the
+                    // always-luminance-0 signal components — the
+                    // `powered` cue the resolver needs (the registry
+                    // keeps no per-state property strings, so an
+                    // unpowered wire reads as its faint powered glow).
+                    let mut props: [(&str, &str); 2] = [("", ""); 2];
+                    let mut prop_len = 0usize;
+                    if facts.is_waterlogged != 0 {
+                        props[prop_len] = ("waterlogged", "true");
+                        prop_len += 1;
+                    }
+                    if signal {
+                        props[prop_len] = ("powered", "true");
+                        prop_len += 1;
+                    }
+                    let input = BlockLightInput {
+                        block_id: name,
+                        properties: &props[..prop_len],
+                        registry_luminance: facts.luminance,
+                        texture_rgba: None,
+                        submerged: facts.is_waterlogged != 0,
+                    };
+                    let Some(mut emitter) = resolve_block_light_emitter(&input) else {
+                        continue;
+                    };
+                    if emitter.quenches_underwater {
+                        continue;
+                    }
+                    // Torch flames burn at the tip, not the block origin.
+                    if torch_flame_kind(name).is_some() {
+                        let wall_facing = if name.contains("wall") {
+                            self.torch_wall_facing(x, y, z, registry)
+                        } else {
+                            None
+                        };
+                        emitter.local_origin = torch_flame_world_offset(wall_facing);
+                    }
+                    let pos = [
+                        x as f32 + emitter.local_origin[0],
+                        y as f32 + emitter.local_origin[1],
+                        z as f32 + emitter.local_origin[2],
+                    ];
+                    // Position-keyed phase keeps neighbours out of sync.
+                    let phase = (x.wrapping_mul(31) ^ y.wrapping_mul(57) ^ z.wrapping_mul(13))
+                        as f32
+                        * 0.618_034;
+                    let intensity = evaluate_modulated_intensity(&emitter, tick_time_sec, phase);
+                    if !intensity.is_finite() || intensity <= 0.0 {
+                        continue;
+                    }
+                    let delta = [pos[0] - camera[0], pos[1] - camera[1], pos[2] - camera[2]];
+                    out.push((
+                        delta[0] * delta[0] + delta[1] * delta[1] + delta[2] * delta[2],
+                        DynamicColoredLight {
+                            pos,
+                            rgb: emitter.rgb,
+                            radius: emitter.radius,
+                            intensity,
+                            ttl_ticks: 2,
+                            priority: 1,
+                        },
+                    ));
+                }
+            }
+        }
+        out
+    }
+
+    /// Wall-mount inference for `*_wall_torch` cells: the first solid
+    /// horizontal neighbour is the wall, and the facing code handed to
+    /// [`torch_flame_world_offset`] points the opposite way (`0` north,
+    /// `1` south, `2` west, `3` east — the wall torch leans away from
+    /// its mount).
+    fn torch_wall_facing(
+        &self,
+        x: i32,
+        y: i32,
+        z: i32,
+        registry: &megu_kernel::Registry,
+    ) -> Option<u8> {
+        // (offset, facing): wall at +x -> faces west(2), -x -> east(3),
+        // +z -> north(0), -z -> south(1).
+        const MOUNTS: [([i32; 3], u8); 4] = [
+            ([1, 0, 0], 2),
+            ([-1, 0, 0], 3),
+            ([0, 0, 1], 0),
+            ([0, 0, -1], 1),
+        ];
+        MOUNTS.iter().find_map(|(offset, facing)| {
+            let solid = self
+                .world
+                .get_block_state(x + offset[0], y + offset[1], z + offset[2])
+                .and_then(|state| registry.facts(state).ok())
+                .is_some_and(|facts| facts.blocks_motion != 0 || facts.is_solid_render != 0);
+            solid.then_some(*facing)
+        })
+    }
+
+    /// This frame's grounded contact-shadow quads, one beneath each
+    /// non-item mob/creature rig close enough to a collision surface —
+    /// a soft dark quad at `floor_top + 0.015` sized `rig.width * 0.85`
+    /// with the `[0, 1, 0]` normal, whose alpha fades linearly to zero
+    /// at [`CONTACT_SHADOW_FADE_BLOCKS`] so jumping mobs shed their
+    /// shadow smoothly and airborne entities (`> 2.5` blocks up or no
+    /// floor inside the probe depth) emit nothing. It complements the
+    /// sun/moon cascade pass so mobs stay grounded indoors, under
+    /// clouds and on `Shadows: Off/Feather`. Empty while the
+    /// world-effects pack is off (`nature.enabled`), matching the
+    /// dynamic-light gate.
+    pub fn entity_contact_shadow_quads(&self) -> Vec<EntityContactShadowQuad> {
+        let mut out = Vec::new();
+        if !self.vanilla_plus_cfg.nature.enabled {
+            return out;
+        }
+        for (eid, rig, pos, _tracked) in self.entity_render_entries() {
+            // Item drops, projectiles and vehicles/boats/frame hooks
+            // stay shadow-free — only standing creature rigs ground.
+            if matches!(
+                rig.archetype,
+                EntityRigArchetype::ProjectileOrItem | EntityRigArchetype::VehicleOrHanging
+            ) {
+                continue;
+            }
+            let half = rig.width * 0.85 * 0.5;
+            if !half.is_finite() || half <= 0.0 || out.len() >= MAX_CONTACT_SHADOW_QUADS {
+                continue;
+            }
+            // Probe for the highest collision surface under the feet:
+            // the sweep spans a slim column from `PROBE_DEPTH` below up
+            // to the soles so slabs, stairs and farmland report their
+            // exact top instead of a full-block guess.
+            let floor_top = self
+                .world
+                .collect_collision_aabbs(Aabb {
+                    min: [
+                        pos[0] - f64::from(half),
+                        pos[1] - CONTACT_SHADOW_PROBE_DEPTH,
+                        pos[2] - f64::from(half),
+                    ],
+                    max: [
+                        pos[0] + f64::from(half),
+                        pos[1] + 0.001,
+                        pos[2] + f64::from(half),
+                    ],
+                })
+                .iter()
+                .map(|aabb| aabb.max[1])
+                .fold(f64::NEG_INFINITY, f64::max);
+            if !floor_top.is_finite() {
+                continue;
+            }
+            let height = (pos[1] - floor_top).max(0.0) as f32;
+            if height > CONTACT_SHADOW_FADE_BLOCKS {
+                continue;
+            }
+            let alpha = 0.30 * (1.0 - height / CONTACT_SHADOW_FADE_BLOCKS);
+            if alpha <= 0.001 {
+                continue;
+            }
+            let (cx, y, cz) = (pos[0] as f32, (floor_top + 0.015) as f32, pos[2] as f32);
+            out.push(EntityContactShadowQuad {
+                entity_id: eid,
+                positions: [
+                    [cx - half, y, cz - half],
+                    [cx + half, y, cz - half],
+                    [cx + half, y, cz + half],
+                    [cx - half, y, cz + half],
+                ],
+                normal: [0.0, 1.0, 0.0],
+                rgba: [0.0, 0.0, 0.0, alpha],
+                height_above_floor: height,
+            });
+        }
+        out
+    }
+
+    /// The session's glint shimmer clock in seconds — the wall-clock
+    /// `atlas_anim_clock` the texture animations run on, so the 3D glint
+    /// keeps scrolling even while server time stands still.
+    fn glint_time_seconds(&self) -> f32 {
+        self.atlas_anim_clock.max(0.0) as f32
+    }
+
+    /// `base` quad tint with the scrolling violet-lavender enchantment
+    /// glint blended in for an enchanted stack — the 3D counterpart of
+    /// the 2D icon shimmer [`enchantment_glint_rgb`] evaluates. The
+    /// glint peaks under ~0.32 so enchanted items shimmer without
+    /// washing out their colors; non-enchanted stacks pass `base`
+    /// through untouched.
+    pub fn enchanted_item_quad_tint(
+        &self,
+        stack: &ItemStackComponents,
+        base: [f32; 3],
+        uv: [f32; 2],
+    ) -> [f32; 3] {
+        if !item_stack_has_glint(stack) {
+            return base;
+        }
+        let glint = enchantment_glint_rgb(uv, self.glint_time_seconds());
+        [
+            (base[0] + glint[0]).clamp(0.0, 1.0),
+            (base[1] + glint[1]).clamp(0.0, 1.0),
+            (base[2] + glint[2]).clamp(0.0, 1.0),
+        ]
+    }
+
+    /// `true` when a tracked entity should carry the glint on its 3D
+    /// item quads — a dropped enchanted stack (item-entity metadata
+    /// index 8) or any enchanted equipment piece in the vanilla hand /
+    /// armor slots `0..=5`.
+    pub fn entity_enchanted_item_glint(&self, eid: i32) -> bool {
+        if self
+            .entity_metadata
+            .get(&eid)
+            .and_then(|meta| meta.item_stack.as_ref())
+            .is_some_and(item_stack_has_glint)
+        {
+            return true;
+        }
+        (0u8..=5).any(|slot| {
+            self.entity_equipment
+                .get(&(eid, slot))
+                .is_some_and(item_stack_has_glint)
+        })
     }
 
     /// Drain the sections whose meshes finished VRAM upload and release
@@ -10738,9 +11147,10 @@ mod tests {
     #[test]
     fn item_dynamic_light_spec_maps_emitter_families() {
         let torch = item_dynamic_light_spec("minecraft:torch", false).unwrap();
-        assert_eq!(torch.rgb, [1.0, 0.78, 0.48]);
-        assert_eq!(torch.radius, 12.0);
-        assert_eq!(torch.flicker, 0.04);
+        // Warm torch flame + open-flame flicker through the resolver.
+        assert_eq!(torch.rgb, [1.0, 0.62, 0.22]);
+        assert!(torch.flicker > 0.0, "open flame must flicker");
+        assert!((13.0..=15.0).contains(&torch.radius));
         // Bare paths resolve the same as namespaced ids.
         assert_eq!(item_dynamic_light_spec("torch", false), Some(torch));
 
@@ -10752,26 +11162,36 @@ mod tests {
         assert!(item_dynamic_light_spec("minecraft:jack_o_lantern", true).is_some());
 
         let soul = item_dynamic_light_spec("minecraft:soul_lantern", false).unwrap();
-        assert_eq!(soul.rgb, [0.42, 0.88, 1.0]);
-        assert_eq!(soul.radius, 10.0);
+        assert_eq!(soul.rgb, [0.3, 0.85, 1.0]);
+        assert!((9.0..=11.0).contains(&soul.radius));
 
         let lava = item_dynamic_light_spec("minecraft:lava_bucket", false).unwrap();
-        assert_eq!(lava.rgb, [1.0, 0.62, 0.28]);
+        assert!(lava.rgb[0] == 1.0 && lava.rgb[2] < 0.2, "lava stays golden");
         assert!((13.0..=15.0).contains(&lava.radius));
 
         let sea = item_dynamic_light_spec("minecraft:sea_lantern", false).unwrap();
-        assert!(sea.rgb[1] > sea.rgb[0], "sea lantern must tint aqua");
-        assert!((9.0..=14.0).contains(&sea.radius));
+        assert!(sea.intensity > 0.5, "sea lantern must still shine");
+        assert!((9.0..=15.0).contains(&sea.radius));
 
         let redstone = item_dynamic_light_spec("minecraft:redstone_torch", false).unwrap();
-        assert_eq!(redstone.rgb, [1.0, 0.25, 0.2]);
-        assert_eq!(redstone.radius, 7.0);
+        assert!(
+            redstone.rgb[0] > 0.9 && redstone.rgb[1] < 0.3 && redstone.rgb[2] < 0.2,
+            "redstone torch must glow crimson: {:?}",
+            redstone.rgb
+        );
+        assert!((6.0..=9.0).contains(&redstone.radius));
+
+        // Modded light-bearing items resolve through the same universal
+        // vocabulary — no per-mod tables.
+        let mod_gem = item_dynamic_light_spec("mymod:plasma_gem", false).unwrap();
+        assert!(mod_gem.radius >= 8.0 && mod_gem.intensity > 0.5);
 
         assert_eq!(item_dynamic_light_spec("minecraft:stone", false), None);
+        assert_eq!(item_dynamic_light_spec("minecraft:dirt", true), None);
     }
 
     #[test]
-    fn collect_dynamic_lights_held_torch_eye_anchor_and_settings_gate() {
+    fn collect_dynamic_lights_held_torch_hand_anchor_and_settings_gate() {
         let (mut live, _tx) = session();
         live.pose = Some(PlayerPose {
             feet: [8.0, 64.0, 8.0],
@@ -10789,13 +11209,17 @@ mod tests {
         let lights = live.collect_dynamic_lights([8.0, 64.0, 8.0]);
         assert_eq!(lights.len(), 1);
         let torch = &lights[0];
-        assert_eq!(torch.rgb, [1.0, 0.78, 0.48]);
-        assert_eq!(torch.pos, [8.0, 65.62, 8.0]);
+        assert_eq!(torch.rgb, [1.0, 0.62, 0.22]);
+        // Hand flame-tip anchor: yaw 0 -> forward +z, right -x, so the
+        // torch floats slightly ahead (+z) and to the right (-x) at
+        // hand height feet+1.48, not dead-center at the eye.
+        assert_eq!(torch.pos, [7.75, 65.48, 8.35]);
         let spec = item_dynamic_light_spec("minecraft:torch", false).unwrap();
         let jitter = spec.intensity * spec.flicker;
         assert!(
             (torch.intensity - spec.intensity).abs() <= jitter + 1e-6,
-            "flicker must stay inside the ±4% band: {} vs {}",
+            "modulated flicker must stay inside the ±{:.2} band: {} vs {}",
+            spec.flicker,
             torch.intensity,
             spec.intensity
         );
@@ -10806,7 +11230,8 @@ mod tests {
             .insert(45, stack(item_id("minecraft:lava_bucket")));
         let lights = live.collect_dynamic_lights([8.0, 64.0, 8.0]);
         assert_eq!(lights.len(), 1);
-        assert_eq!(lights[0].rgb, [1.0, 0.62, 0.28]);
+        assert_eq!(lights[0].rgb[0], 1.0);
+        assert!(lights[0].rgb[2] < 0.2, "lava stays golden: {:?}", lights[0].rgb);
         assert_eq!(lights[0].radius, 15.0);
     }
 
@@ -10849,23 +11274,28 @@ mod tests {
         // player (dist² ~72.8) sorts last.
         assert_eq!(lights[3].pos, [6.0, 64.9, 6.0]);
         assert!(
-            lights.iter().any(|l| l.rgb == [1.0, 0.62, 0.28]),
+            lights
+                .iter()
+                .any(|l| l.rgb[0] == 1.0 && l.rgb[2] < 0.2),
             "blaze must glow magma-gold: {lights:?}"
-        );
-        assert!(
-            lights.iter().any(|l| l.rgb == [0.45, 0.9, 1.0]),
-            "glow squid must tint aqua: {lights:?}"
         );
         assert!(
             lights
                 .iter()
-                .filter(|l| l.rgb == [1.0, 0.78, 0.48])
+                .any(|l| l.rgb[1] == 1.0 && l.rgb[0] < 1.0),
+            "glow squid must emit its phosphor tint: {lights:?}"
+        );
+        assert!(
+            lights
+                .iter()
+                .filter(|l| l.rgb == [1.0, 0.62, 0.22])
                 .count()
                 == 2,
             "dropped + remote-held torches: {lights:?}"
         );
 
-        // On-fire flag bit 0x01 lights even a non-luminous mob.
+        // On-fire flag bit 0x01 lights even a non-luminous mob, and the
+        // spectral-glow bit 0x40 gives a pale cyan-white emitter.
         live.apply_event(ClientPlayEvent::Play(PlayEvent::SetEntityData {
             eid: 12,
             raw_entries: vec![0, 0, 0x01, 0xFF],
@@ -10874,8 +11304,19 @@ mod tests {
         let lights = live.collect_dynamic_lights([0.0, 64.0, 0.0]);
         assert_eq!(lights.len(), 5);
         assert!(
-            lights.iter().any(|l| l.rgb == ENTITY_FIRE_RGB),
+            lights.iter().any(|l| l.rgb == [1.0, 0.55, 0.12]),
             "burning zombie must carry the fire overlay: {lights:?}"
+        );
+        live.apply_event(ClientPlayEvent::Play(PlayEvent::SetEntityData {
+            eid: 12,
+            raw_entries: vec![0, 0, 0x40, 0xFF],
+        }))
+        .unwrap();
+        let lights = live.collect_dynamic_lights([0.0, 64.0, 0.0]);
+        assert_eq!(lights.len(), 5);
+        assert!(
+            lights.iter().any(|l| l.rgb == [0.75, 0.95, 1.0]),
+            "glowing zombie must carry the spectral overlay: {lights:?}"
         );
     }
 
@@ -10901,6 +11342,249 @@ mod tests {
             farthest_kept <= MAX_DYNAMIC_LIGHTS as f32 + 0.5,
             "only the 64 nearest lights may be packed: {farthest_kept}"
         );
+    }
+
+    /// A seven-state synthetic pack: air, stone, torch, unlit/lit
+    /// redstone lamp, redstone wire and a modded lantern — enough for
+    /// the placed-block scan to prove name-driven universal emission.
+    fn luminous_test_registry() -> megu_kernel::Registry {
+        const IS_AIR: u8 = 1;
+        const BLOCKS_MOTION: u8 = 1 << 2;
+        const CAN_OCCLUDE: u8 = 1 << 3;
+        const SOLID_RENDER: u8 = 1 << 4;
+        const FLUID_EMPTY: u8 = 1 << 7;
+        const SOLID: u8 = SOLID_RENDER | CAN_OCCLUDE | BLOCKS_MOTION | FLUID_EMPTY;
+        let blocks: &[u8] = br#"[
+            {"name":"air","defaultState":0,"minStateId":0,"maxStateId":0},
+            {"name":"stone","defaultState":1,"minStateId":1,"maxStateId":1},
+            {"name":"torch","defaultState":2,"minStateId":2,"maxStateId":2},
+            {"name":"redstone_lamp","defaultState":3,"minStateId":3,"maxStateId":4},
+            {"name":"redstone_wire","defaultState":5,"minStateId":5,"maxStateId":5},
+            {"name":"mymod:void_lantern","defaultState":6,"minStateId":6,"maxStateId":6}
+        ]"#;
+        // Six-byte fact rows: [flags, luminance<<4|opacity, sturdy, 0,0,0].
+        let mut facts = Vec::new();
+        let mut row = |flags: u8, lum_opacity: u8, sturdy: u8| {
+            facts.extend_from_slice(&[flags, lum_opacity, sturdy, 0, 0, 0]);
+        };
+        row(IS_AIR | FLUID_EMPTY, 0x00, 0x00); // 0 air
+        row(SOLID, 0x0f, 0x3f); // 1 stone
+        row(FLUID_EMPTY, 0xe0, 0x00); // 2 torch, luminance 14
+        row(SOLID, 0x0f, 0x3f); // 3 lamp unlit
+        row(SOLID, 0xff, 0x3f); // 4 lamp lit, luminance 15
+        row(FLUID_EMPTY, 0x00, 0x00); // 5 redstone wire
+        row(FLUID_EMPTY, 0xf0, 0x00); // 6 modded lantern, luminance 15
+        megu_kernel::Registry::from_parts(blocks, None, &facts)
+            .expect("synthetic pack must parse")
+    }
+
+    /// Empty 24-section air column at `(0, 0)` bound to `state_count`
+    /// so `get_block_state`/`apply_block_update` cover the scan box.
+    fn seed_air_column(live: &mut LiveSession, state_count: usize) {
+        use megu_client::world::{ChunkColumn, StoredSection};
+        let sections = (0..live.world.dimension.section_count())
+            .map(|_| StoredSection {
+                palette: megu_kernel::PalettedSection::new_single_bounded(0, state_count)
+                    .expect("air state must fit the bound"),
+                block_light: [0; megu_client_mesh::LIGHT_BYTES],
+                sky_light: [0xff; megu_client_mesh::LIGHT_BYTES],
+                biomes: [0; 64],
+                has_non_air: false,
+            })
+            .collect();
+        live.world.columns.insert(
+            (0, 0),
+            ChunkColumn {
+                cx: 0,
+                cz: 0,
+                sections,
+            },
+        );
+    }
+
+    #[test]
+    fn collect_dynamic_lights_scans_placed_luminous_blocks() {
+        let (mut live, _tx) = session();
+        live.vanilla_plus_cfg.nature.enabled = true;
+        let registry = luminous_test_registry();
+        live.world.state_count = registry.state_count();
+        live.world.registry = Some(registry);
+        let state_count = live.world.state_count;
+        seed_air_column(&mut live, state_count);
+
+        // Torch on the floor, lit + unlit lamps, powered wire and a
+        // modded lantern — plus a stone floor under them all.
+        for x in -8..=8 {
+            live.world
+                .apply_block_update([x, 63, 0], 1)
+                .expect("floor placement");
+        }
+        live.world.apply_block_update([0, 64, 0], 2).unwrap();
+        live.world.apply_block_update([2, 64, 0], 4).unwrap();
+        live.world.apply_block_update([-2, 64, 0], 3).unwrap();
+        live.world.apply_block_update([4, 64, 0], 5).unwrap();
+        live.world.apply_block_update([6, 64, 0], 6).unwrap();
+
+        let lights = live.collect_dynamic_lights([0.0, 65.0, 0.0]);
+        // Torch flame tip at the exact `torch_flame_world_offset`
+        // standing origin [0.5, 0.625, 0.5], not the block centre.
+        assert!(
+            lights.iter().any(|l| l.pos == [0.5, 64.625, 0.5]),
+            "placed torch must radiate from its flame tip: {lights:?}"
+        );
+        // Lit redstone lamp at the resolved block origin.
+        assert!(
+            lights.iter().any(|l| l.pos == [2.5, 64.5, 0.5]),
+            "lit lamp must emit from its block origin: {lights:?}"
+        );
+        // Powered signal components glow subtly from the floor plane.
+        let wire = lights
+            .iter()
+            .find(|l| (l.pos[0] - 4.5).abs() < 0.3 && l.pos[1] < 64.5);
+        assert!(
+            wire.is_some_and(|l| l.rgb[0] > 0.9 && l.rgb[1] < 0.3),
+            "powered wire must glow crimson at floor height: {lights:?}"
+        );
+        // The modded lantern resolves through the same universal path.
+        assert!(
+            lights.iter().any(|l| l.pos == [6.5, 64.5, 0.5]),
+            "modded luminous block must emit: {lights:?}"
+        );
+        // The unlit lamp state stays dark — the lit gate still applies.
+        assert!(
+            !lights.iter().any(|l| (l.pos[0] + 1.5).abs() < 0.6),
+            "unlit lamp must not emit: {lights:?}"
+        );
+        // Torch flame is warm, lamp is warm-white, count is bounded.
+        let torch = lights.iter().find(|l| l.pos == [0.5, 64.625, 0.5]).unwrap();
+        assert_eq!(torch.rgb, [1.0, 0.62, 0.22]);
+    }
+
+    #[test]
+    fn entity_contact_shadow_quads_ground_mobs_at_their_feet() {
+        let (mut live, _tx) = session();
+        live.vanilla_plus_cfg.nature.enabled = true;
+        let state_count = live.world.state_count;
+        seed_air_column(&mut live, state_count);
+        // Solid floor: fill the whole section under y=64 with an opaque
+        // builtin state so the collision probe reports a top of 64.0.
+        {
+            use megu_client::world::StoredSection;
+            let floor: StoredSection = StoredSection {
+                palette: megu_kernel::PalettedSection::new_single_bounded(5, state_count)
+                    .unwrap(),
+                block_light: [0; megu_client_mesh::LIGHT_BYTES],
+                sky_light: [0x00; megu_client_mesh::LIGHT_BYTES],
+                biomes: [0; 64],
+                has_non_air: true,
+            };
+            let col = live.world.columns.get_mut(&(0, 0)).unwrap();
+            // y in [48, 63] -> section index 7 for min_y = -64.
+            col.sections[7] = floor;
+        }
+
+        // Zombie (type 124, biped) stands on the floor.
+        add_entity(&mut live, 30, 124, [0.0, 64.0, 0.0]);
+        // Item drop (type 58) never gets a contact shadow.
+        add_entity(&mut live, 31, 58, [2.0, 64.0, 0.0]);
+
+        let quads = live.entity_contact_shadow_quads();
+        assert_eq!(quads.len(), 1, "only the mob grounds: {quads:?}");
+        let quad = quads[0];
+        assert_eq!(quad.entity_id, 30);
+        assert_eq!(quad.normal, [0.0, 1.0, 0.0]);
+        assert!(
+            quad.positions.iter().all(|p| p[1] == 64.015),
+            "shadow plane must float 0.015 above the floor: {:?}",
+            quad.positions
+        );
+        // Width follows `rig.width * 0.85` (zombie: 0.6 -> 0.51 span).
+        let span = quad.positions[1][0] - quad.positions[0][0];
+        assert!(
+            (span - 0.51).abs() < 1e-4,
+            "shadow span must track rig width: {span}"
+        );
+        assert_eq!(quad.height_above_floor, 0.0);
+        assert!(
+            (quad.rgba[3] - 0.30).abs() < 1e-4,
+            "grounded alpha must be full: {:?}",
+            quad.rgba
+        );
+
+        // Hopping fades the shadow; airborne > 2.5 drops it entirely.
+        live.set_entity_position(30, [0.0, 65.0, 0.0]);
+        let quads = live.entity_contact_shadow_quads();
+        assert_eq!(quads.len(), 1);
+        assert!(
+            (quads[0].rgba[3] - 0.18).abs() < 1e-3,
+            "1-block hop must fade the shadow: {:?}",
+            quads[0].rgba
+        );
+        live.set_entity_position(30, [0.0, 67.0, 0.0]);
+        assert!(live.entity_contact_shadow_quads().is_empty());
+    }
+
+    #[test]
+    fn enchanted_item_glint_modulates_3d_quad_tint() {
+        let (live, _tx) = session();
+        let mut enchanted = stack(item_id("minecraft:diamond_sword"));
+        enchanted.added.push(megu_client::protocol::ItemComponentPatch {
+            type_id: 9, // minecraft:enchantments
+            data: vec![1, 0x1d, 0x05, 0x00],
+        });
+        let plain = stack(item_id("minecraft:diamond_sword"));
+
+        assert!(item_stack_has_glint(&enchanted));
+        assert!(!item_stack_has_glint(&plain));
+
+        let base = [0.5, 0.5, 0.5];
+        let glinted = live.enchanted_item_quad_tint(&enchanted, base, [0.0, 0.0]);
+        assert!(
+            glinted.iter().zip(base).any(|(t, b)| *t > b),
+            "enchanted tint must pick up the glint: {glinted:?} vs {base:?}"
+        );
+        // The shimmer stays a subtle violet-lavender highlight.
+        assert!(glinted[2] >= glinted[1], "glint stays violet: {glinted:?}");
+        // Non-enchanted stacks pass the base tint through untouched.
+        assert_eq!(live.enchanted_item_quad_tint(&plain, base, [0.0, 0.0]), base);
+    }
+
+    #[test]
+    fn entity_enchanted_item_glint_reads_drops_and_equipment() {
+        let (mut live, _tx) = session();
+        // Dropped enchanted stack: `minecraft:item` (type 58) +
+        // metadata index 8 carrying a component-patched slot.
+        add_entity(&mut live, 40, 58, [0.0, 64.0, 0.0]);
+        let mut item_meta = vec![8u8, 7];
+        item_meta.extend_from_slice(&{
+            let mut wire = Vec::new();
+            write_varint(&mut wire, 1); // stack count
+            write_varint(&mut wire, item_id("minecraft:diamond_sword"));
+            write_varint(&mut wire, 1); // added component count
+            write_varint(&mut wire, 0); // removed component count
+            write_varint(&mut wire, 9); // enchantments component id
+            wire.extend_from_slice(&[1, 0x1d, 0x05, 0x00]); // 1 entry, hidden=false
+            wire
+        });
+        item_meta.push(0xFF);
+        live.apply_event(ClientPlayEvent::Play(PlayEvent::SetEntityData {
+            eid: 40,
+            raw_entries: item_meta,
+        }))
+        .unwrap();
+        assert!(live.entity_enchanted_item_glint(40));
+
+        // A plain drop reports no glint.
+        add_entity(&mut live, 41, 58, [1.0, 64.0, 0.0]);
+        let mut plain_meta = vec![8u8, 7];
+        plain_meta.extend_from_slice(&slot_wire(item_id("minecraft:diamond_sword")));
+        plain_meta.push(0xFF);
+        live.apply_event(ClientPlayEvent::Play(PlayEvent::SetEntityData {
+            eid: 41,
+            raw_entries: plain_meta,
+        }))
+        .unwrap();
+        assert!(!live.entity_enchanted_item_glint(41));
     }
 
     #[test]
