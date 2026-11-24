@@ -119,6 +119,7 @@ fn mob_batch_size() -> usize {
 }
 
 #[cfg(test)]
+#[cfg_attr(not(megu_vanilla_data), allow(dead_code))]
 fn set_mob_batch_override(v: Option<usize>) {
     MOB_BATCH_OVERRIDE.store(v.map(|n| n as i64).unwrap_or(-1), Ordering::Relaxed);
 }
@@ -1364,6 +1365,7 @@ mod tests {
         set_parallel_override(None);
     }
 
+    #[cfg(megu_vanilla_data)]
     fn plan_mob(eid: i32, x: f64) -> Arc<Mob> {
         Arc::new(Mob {
             dim: DimId::Overworld,
@@ -1385,6 +1387,7 @@ mod tests {
         })
     }
 
+    #[cfg(megu_vanilla_data)]
     fn perception_eq(a: &AiEntityPerception, b: &AiEntityPerception) -> bool {
         a.entity_id == b.entity_id
             && a.position == b.position
@@ -1395,6 +1398,7 @@ mod tests {
             && a.compatible == b.compatible
     }
 
+    #[cfg(megu_vanilla_data)]
     fn targeting_eq(a: &MobTargeting, b: &MobTargeting) -> bool {
         a.pos == b.pos
             && a.provoked == b.provoked
@@ -1410,6 +1414,7 @@ mod tests {
             }
     }
 
+    #[cfg(megu_vanilla_data)]
     fn plans_equal(a: &MobPlan, b: &MobPlan) -> bool {
         a.pos == b.pos
             && a.env.probe_pos == b.env.probe_pos
@@ -1439,6 +1444,7 @@ mod tests {
     /// Chunked range dispatch must produce bit-identical plans to the old
     /// one-task-per-mob dispatch: same mobs, same gates, every chunk boundary
     /// (1, 31, 32, 33) and a 200-mob run.
+    #[cfg(megu_vanilla_data)]
     #[test]
     fn batched_ranges_preserve_bit_identical_plans() {
         crate::test_support::require_vanilla_data();
