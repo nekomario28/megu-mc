@@ -59,9 +59,17 @@
 //! keeps both off the wire after registration and binds all proofs to a
 //! per-connection nonce. Remaining, by design: `HostRegister` still carries
 //! `session_key` once (an observer of that frame can forge this session's
-//! revokes), and `StreamData` is unauthenticated byte pipe — an *active*
-//! MITM can splice into it. Both need real transport security (TLS/QUIC),
-//! deliberately out of scope for this zero-dependency crate.
+//! revokes), and `StreamData` itself is relay-visible — the relay is inside
+//! the `FRL2` trust boundary.
+//!
+//! The **`FRL3`** layer in [`crate::frl_e2ee`] closes the second gap
+//! end-to-end: an ephemeral X25519 + ChaCha20-Poly1305 AEAD handshake and
+//! record layer that runs *inside* `StreamData` payloads, so the relay —
+//! and any MITM on the path — sees only length-prefixed ciphertext it
+//! cannot read, splice, reorder or replay. [`Frl3Stream`] wraps a blocking
+//! `Read + Write` guest link (any `TcpStream`) with the join, handshake
+//! and record exchange; the host drives the same layer sans-IO over its
+//! multiplexed tunnel.
 //!
 //! The length prefix is validated **before** any allocation: an oversized or
 //! truncated frame, foreign magic, an unknown tag, invalid UTF-8 or trailing
@@ -92,6 +100,9 @@
 //!   one [`TcpFriendRelay::poll_once`] drain per tick that accepts links,
 //!   parses frames and bridges payload bytes both directions, with
 //!   [`FriendRelayMetrics`] counters for everything it admitted or refused.
+//! * [`Frl3Stream`] — a blocking guest-side `Read + Write` adapter that
+//!   performs `GuestJoin` and then the `FRL3` E2EE handshake + record layer
+//!   inside `StreamData` payloads (see [`crate::frl_e2ee`]).
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
@@ -102,6 +113,10 @@ use std::time::{Duration, Instant};
 use megu_core::random::Xoroshiro128pp;
 
 use crate::frl_auth;
+use crate::frl_e2ee::{
+    E2eeError, Frl3Cipher, Frl3FriendGuestHandshake, Frl3GuestHandshake, Frl3GuestToken,
+    Frl3Identity, Frl3Message,
+};
 use crate::wire::{ProtoError, WireReader, WireWriter};
 
 /// Magic bytes every `FRL2` frame body opens with. Foreign traffic sharing a
@@ -672,26 +687,38 @@ fn windows_csprng(buf: &mut [u8]) -> bool {
     }
 }
 
-/// OS entropy for invite-code generation: the platform CSPRNG —
-/// `/dev/urandom` on Unix, `BCryptGenRandom` on Windows — with a portable
-/// mixer (pid, heap ASLR and monotonic-clock jitter folded through a
-/// splitmix64 finalizer) for platforms where neither is available.
-fn draw_seed() -> u64 {
-    let mut buf = [0u8; 8];
+/// Fill `buf` from the platform CSPRNG — `/dev/urandom` on Unix,
+/// `BCryptGenRandom` on Windows. `false` on platforms where neither is
+/// available (or on API failure) so the caller can apply the portable
+/// mixer. Shared with [`crate::frl_e2ee::random_32_bytes`].
+pub(crate) fn os_random_bytes(buf: &mut [u8]) -> bool {
     #[cfg(unix)]
     {
         if std::fs::File::open("/dev/urandom")
-            .and_then(|mut f| f.read_exact(&mut buf))
+            .and_then(|mut f| f.read_exact(buf))
             .is_ok()
         {
-            return u64::from_ne_bytes(buf);
+            return true;
         }
     }
     #[cfg(windows)]
     {
-        if windows_csprng(&mut buf) {
-            return u64::from_ne_bytes(buf);
+        if windows_csprng(buf) {
+            return true;
         }
+    }
+    let _ = buf;
+    false
+}
+
+/// OS entropy for invite-code generation: the platform CSPRNG —
+/// `/dev/urandom` on Unix, `BCryptGenRandom` on Windows — with a portable
+/// mixer (pid, heap ASLR and monotonic-clock jitter folded through a
+/// splitmix64 finalizer) for platforms where neither is available.
+pub(crate) fn draw_seed() -> u64 {
+    let mut buf = [0u8; 8];
+    if os_random_bytes(&mut buf) {
+        return u64::from_ne_bytes(buf);
     }
     let marker = Box::new(0u8);
     let mut x = (u64::from(std::process::id()) << 32)
@@ -1636,6 +1663,312 @@ impl TcpFriendRelay {
             // second HostRegister, a GuestJoin on a live stream, a
             // HostRevoke with no session — fails closed.
             _ => self.mark_dead(id),
+        }
+    }
+}
+
+/// Every failure mode of a [`Frl3Stream`]: transport errors, `FRL2`
+/// framing errors, cryptographic rejections and link-level closes.
+#[derive(Debug)]
+pub enum Frl3StreamError {
+    /// The underlying `Read + Write` transport failed.
+    Io(io::Error),
+    /// An `FRL2` frame failed to parse (bad magic, oversized length).
+    Protocol(ProtoError),
+    /// The `FRL3` cryptographic layer rejected the peer or a record.
+    Crypto(E2eeError),
+    /// The relay refused the `GuestJoin` (unknown/expired invite, full
+    /// world, unavailable host).
+    Rejected(String),
+    /// The stream (or the link itself) closed underneath us.
+    Closed(String),
+    /// A frame arrived that this stage of the protocol cannot accept —
+    /// fail closed, the peer is not speaking `FRL3` honestly.
+    UnexpectedPacket,
+}
+
+impl fmt::Display for Frl3StreamError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Frl3StreamError::Io(e) => write!(f, "friend relay transport error: {e}"),
+            Frl3StreamError::Protocol(e) => write!(f, "friend relay protocol error: {e}"),
+            Frl3StreamError::Crypto(e) => write!(f, "FRL3 error: {e}"),
+            Frl3StreamError::Rejected(r) => write!(f, "friend invite rejected: {r}"),
+            Frl3StreamError::Closed(r) => write!(f, "friend stream closed: {r}"),
+            Frl3StreamError::UnexpectedPacket => {
+                f.write_str("unexpected packet during FRL3 exchange")
+            }
+        }
+    }
+}
+
+impl std::error::Error for Frl3StreamError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Frl3StreamError::Io(e) => Some(e),
+            Frl3StreamError::Protocol(e) => Some(e),
+            Frl3StreamError::Crypto(e) => Some(e),
+            _ => None,
+        }
+    }
+}
+
+impl From<io::Error> for Frl3StreamError {
+    fn from(e: io::Error) -> Self {
+        Frl3StreamError::Io(e)
+    }
+}
+
+impl From<ProtoError> for Frl3StreamError {
+    fn from(e: ProtoError) -> Self {
+        Frl3StreamError::Protocol(e)
+    }
+}
+
+impl From<E2eeError> for Frl3StreamError {
+    fn from(e: E2eeError) -> Self {
+        Frl3StreamError::Crypto(e)
+    }
+}
+
+/// Plaintext bytes per `FRL3` record on a `Frl3Stream`: one record
+/// (`4 + ct + 16`) must fit one `StreamData` payload.
+const FRL3_CHUNK_BYTES: usize = MAX_STREAM_PAYLOAD_BYTES - 4 - 16;
+
+/// A blocking guest-side link speaking `FRL2` frames with the `FRL3`
+/// E2EE layer running inside `StreamData` payloads — the `TcpStream`-
+/// compatible half of the friend-relay transport upgrade.
+///
+/// `S` is any `Read + Write` transport (in practice a `TcpStream` with
+/// timeouts the caller configures). [`Frl3Stream::join`] performs the whole
+/// `RelayHello` → `GuestJoin` → `GuestAccepted` dance and then the
+/// `FRL3-PSK` handshake; [`Frl3Stream::join_friend`] does the same with the
+/// mutual-identity `FRL3-FRIEND` handshake. Afterwards [`send`](Self::send)
+/// and [`recv`](Self::recv) move arbitrary byte chunks — each one becomes
+/// AEAD-sealed records inside `StreamData` frames, which the relay forwards
+/// verbatim but can neither read nor forge.
+pub struct Frl3Stream<S> {
+    io: S,
+    stream_id: u32,
+    cipher: Frl3Cipher,
+    /// Buffered `FRL2` frame bytes between `recv` calls.
+    inbuf: Vec<u8>,
+}
+
+impl<S: Read + Write> Frl3Stream<S> {
+    /// `FRL2` guest admission on `io`: read the `RelayHello` nonce, send
+    /// `GuestJoin` (`key_id`/`tag` proof — the code never travels), and
+    /// return the admitted `stream_id` plus partially-read frame buffer.
+    fn frl2_join(io: &mut S, code: &InviteCode, guest_name: &str) -> Result<(u32, Vec<u8>), Frl3StreamError> {
+        let mut inbuf = Vec::new();
+        let nonce = match framed_read(io, &mut inbuf)? {
+            FriendPacket::RelayHello { nonce } => nonce,
+            _ => return Err(Frl3StreamError::UnexpectedPacket),
+        };
+        let key_id = frl_auth::join_key_id(&code.as_bytes(), &nonce);
+        let tag = frl_auth::join_tag(&code.as_bytes(), &key_id, guest_name);
+        framed_write(
+            io,
+            &FriendPacket::GuestJoin {
+                key_id,
+                guest_name: guest_name.to_owned(),
+                tag,
+            },
+        )?;
+        match framed_read(io, &mut inbuf)? {
+            FriendPacket::GuestAccepted { stream_id } => Ok((stream_id, inbuf)),
+            FriendPacket::GuestRejected { reason } => Err(Frl3StreamError::Rejected(reason)),
+            _ => Err(Frl3StreamError::UnexpectedPacket),
+        }
+    }
+
+    /// Send one handshake [`Frl3Message`] inside a `StreamData` payload and
+    /// wait for the peer's `StreamData` reply (handling `Heartbeat` and
+    /// failing closed on `StreamClose` or foreign frames).
+    fn handshake_exchange(
+        io: &mut S,
+        inbuf: &mut Vec<u8>,
+        stream_id: u32,
+        message: &Frl3Message,
+    ) -> Result<Vec<u8>, Frl3StreamError> {
+        framed_write(
+            io,
+            &FriendPacket::StreamData {
+                stream_id,
+                payload: message.encode(),
+            },
+        )?;
+        loop {
+            match framed_read(io, inbuf)? {
+                FriendPacket::StreamData {
+                    stream_id: got,
+                    payload,
+                } if got == stream_id => return Ok(payload),
+                FriendPacket::StreamClose { stream_id: got, reason } if got == stream_id => {
+                    return Err(Frl3StreamError::Closed(reason))
+                }
+                FriendPacket::Heartbeat { nonce } => {
+                    framed_write(io, &FriendPacket::HeartbeatAck { nonce })?;
+                }
+                _ => return Err(Frl3StreamError::UnexpectedPacket),
+            }
+        }
+    }
+
+    /// Full `FRL3-PSK` guest path: `GuestJoin` on `io`, then the
+    /// invite-code-bound ephemeral handshake inside `StreamData`.
+    pub fn join(mut io: S, code: &InviteCode, guest_name: &str) -> Result<Self, Frl3StreamError> {
+        let (stream_id, mut inbuf) = Self::frl2_join(&mut io, code, guest_name)?;
+        let (hs, hello) = Frl3GuestHandshake::start(code, stream_id, guest_name);
+        let reply = Self::handshake_exchange(
+            &mut io,
+            &mut inbuf,
+            stream_id,
+            &Frl3Message::Hello(hello),
+        )?;
+        let cipher = match Frl3Message::decode(&reply)? {
+            Frl3Message::Ack(ack) => hs.finish(&ack)?,
+            _ => return Err(Frl3StreamError::UnexpectedPacket),
+        };
+        Ok(Self {
+            io,
+            stream_id,
+            cipher,
+            inbuf,
+        })
+    }
+
+    /// Full `FRL3-FRIEND` guest path: mutual static-identity handshake —
+    /// the guest proves its [`Frl3Identity`] to a host whose
+    /// `host_static_pk` it pinned out-of-band (the `megu-id:` it paired
+    /// with), optionally presenting `token` for a one-off allowlist seat.
+    pub fn join_friend(
+        mut io: S,
+        code: &InviteCode,
+        guest_name: &str,
+        identity: &Frl3Identity,
+        host_static_pk: &[u8; 32],
+        token: Frl3GuestToken,
+    ) -> Result<Self, Frl3StreamError> {
+        let (stream_id, mut inbuf) = Self::frl2_join(&mut io, code, guest_name)?;
+        let (hs, hello) =
+            Frl3FriendGuestHandshake::start(identity, host_static_pk, stream_id, guest_name, token)?;
+        let reply = Self::handshake_exchange(
+            &mut io,
+            &mut inbuf,
+            stream_id,
+            &Frl3Message::FriendHello(hello),
+        )?;
+        let cipher = match Frl3Message::decode(&reply)? {
+            Frl3Message::FriendAck(ack) => hs.finish(&ack)?,
+            _ => return Err(Frl3StreamError::UnexpectedPacket),
+        };
+        Ok(Self {
+            io,
+            stream_id,
+            cipher,
+            inbuf,
+        })
+    }
+
+    /// The `FRL2` stream this link owns.
+    pub fn stream_id(&self) -> u32 {
+        self.stream_id
+    }
+
+    /// The six-digit SAS fingerprint of the completed handshake — compare
+    /// visually with the host when pairing a new friend.
+    pub fn sas_code(&self) -> u32 {
+        self.cipher.sas_code()
+    }
+
+    /// Seal `bytes` and send them as `FRL3` records inside `StreamData`
+    /// frames. Chunks are capped so each record fits one payload.
+    pub fn send(&mut self, bytes: &[u8]) -> Result<(), Frl3StreamError> {
+        for chunk in bytes.chunks(FRL3_CHUNK_BYTES) {
+            let payload = self.cipher.seal(chunk)?;
+            framed_write(
+                &mut self.io,
+                &FriendPacket::StreamData {
+                    stream_id: self.stream_id,
+                    payload,
+                },
+            )?;
+        }
+        Ok(())
+    }
+
+    /// Receive the next sealed chunk: reads `FRL2` frames until a
+    /// `StreamData` for this stream arrives and opens it. `Heartbeat`s are
+    /// answered inline; `StreamClose` and anything unexpected fail closed.
+    pub fn recv(&mut self) -> Result<Vec<u8>, Frl3StreamError> {
+        loop {
+            match framed_read(&mut self.io, &mut self.inbuf)? {
+                FriendPacket::StreamData {
+                    stream_id,
+                    payload,
+                } if stream_id == self.stream_id => {
+                    if Frl3Message::is_handshake(&payload) {
+                        return Err(Frl3StreamError::UnexpectedPacket);
+                    }
+                    return Ok(self.cipher.open(&payload)?);
+                }
+                FriendPacket::StreamClose { stream_id, reason } if stream_id == self.stream_id => {
+                    return Err(Frl3StreamError::Closed(reason))
+                }
+                FriendPacket::Heartbeat { nonce } => {
+                    framed_write(&mut self.io, &FriendPacket::HeartbeatAck { nonce })?;
+                }
+                FriendPacket::HeartbeatAck { .. } => {}
+                _ => return Err(Frl3StreamError::UnexpectedPacket),
+            }
+        }
+    }
+
+    /// Politely end the stream (`StreamClose`); the peer learns the reason.
+    pub fn close(&mut self, reason: &str) -> Result<(), Frl3StreamError> {
+        framed_write(
+            &mut self.io,
+            &FriendPacket::StreamClose {
+                stream_id: self.stream_id,
+                reason: reason.to_owned(),
+            },
+        )
+    }
+
+    /// Give the transport back.
+    pub fn into_inner(self) -> S {
+        self.io
+    }
+}
+
+/// Write one `FRL2` frame to a blocking transport.
+fn framed_write<S: Write>(io: &mut S, packet: &FriendPacket) -> Result<(), Frl3StreamError> {
+    io.write_all(&encode_frame(packet)?)?;
+    Ok(())
+}
+
+/// Read the next complete `FRL2` frame from a blocking transport, keeping
+/// partial bytes in `inbuf` between calls. EOF is a closed link.
+fn framed_read<S: Read>(
+    io: &mut S,
+    inbuf: &mut Vec<u8>,
+) -> Result<FriendPacket, Frl3StreamError> {
+    loop {
+        match next_frame_len(inbuf)? {
+            Some(total) => {
+                let body = inbuf[4..total].to_vec();
+                inbuf.drain(..total);
+                return Ok(decode_packet(&body)?);
+            }
+            None => {
+                let mut buf = [0u8; 8192];
+                let n = io.read(&mut buf)?;
+                if n == 0 {
+                    return Err(Frl3StreamError::Closed("link closed".to_owned()));
+                }
+                inbuf.extend_from_slice(&buf[..n]);
+            }
         }
     }
 }

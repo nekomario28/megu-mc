@@ -50,6 +50,13 @@
 //!   invite expiry, constant-time secret comparison and per-host stream
 //!   isolation, and the live non-blocking [`friend_relay::TcpFriendRelay`]
 //!   bridging one host tunnel to many guest TCP connections.
+//! * [`frl_e2ee`] — the `FRL3` zero-trust end-to-end encryption layer that
+//!   runs inside `friend_relay`'s `StreamData`: pure-Rust RFC 7748 X25519,
+//!   RFC 8439 ChaCha20-Poly1305 AEAD and HKDF-SHA256, an invite-PSK ephemeral
+//!   handshake plus a Noise-IK-style mutual static-identity handshake with
+//!   a [`frl_e2ee::FriendAllowlist`], and the directional
+//!   [`frl_e2ee::Frl3Cipher`] record layer — after which the relay sees only
+//!   ciphertext.
 
 pub mod codec;
 pub mod item_components;
@@ -58,6 +65,7 @@ mod data_v767;
 mod data_v777;
 pub mod friend_relay;
 pub mod frl_auth;
+pub mod frl_e2ee;
 pub mod resolver;
 pub mod router;
 pub mod session;
@@ -80,8 +88,16 @@ pub use channel_router::{
 };
 pub use friend_relay::{
     ExpiredHost, FriendPacket, FriendRelayConfig, FriendRelayMetrics, FriendRelayRouter,
-    GuestStream, HostSession, InviteCode, RevokeError, TcpFriendRelay, FRIEND_MAGIC,
-    MAX_FRL2_FRAME_BYTES, MAX_STREAM_PAYLOAD_BYTES,
+    Frl3Stream, Frl3StreamError, GuestStream, HostSession, InviteCode, RevokeError,
+    TcpFriendRelay, FRIEND_MAGIC, MAX_FRL2_FRAME_BYTES, MAX_STREAM_PAYLOAD_BYTES,
+};
+pub use frl_e2ee::{
+    aead_open, aead_seal, format_friend_id, friend_host_accept,
+    friend_host_accept_with_secret, hkdf_expand, hkdf_extract, host_accept,
+    host_accept_with_secret, parse_friend_id, random_32_bytes, sas_code, x25519,
+    x25519_public, E2eeError, FriendAllowlist, Frl3Ack, Frl3Cipher, Frl3FriendAck,
+    Frl3FriendGuestHandshake, Frl3FriendHello, Frl3GuestHandshake, Frl3GuestToken, Frl3Hello,
+    Frl3Identity, Frl3Message, MAX_E2EE_RECORD_BYTES,
 };
 pub use resolver::{resolve as resolve_server_address, ResolveError};
 pub use router::{SessionRemapSummary, SessionRemapper, TableDrivenCodec, VersionRouter};
