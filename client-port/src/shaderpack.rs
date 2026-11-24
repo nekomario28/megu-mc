@@ -58,9 +58,6 @@ pub const MAX_INCLUDE_DEPTH: usize = 16;
 pub const MAX_TOTAL_INCLUDES: usize = 1024;
 /// Maximum bytes of any `.properties` file.
 pub const MAX_PROPERTIES_BYTES: u64 = 1024 * 1024;
-/// Maximum ZIP comment/record sizes we will parse (64 KiB EOCD search window,
-/// matching the ZIP spec's maximum comment length).
-const EOCD_SEARCH_WINDOW: usize = 65_557;
 
 // ---------------------------------------------------------------------------
 // Errors
@@ -649,145 +646,65 @@ fn shader_root_prefix<'a>(names: impl Iterator<Item = &'a str>) -> String {
 }
 
 // ---------------------------------------------------------------------------
-// Bounded ZIP reader + clean-room inflate (RFC 1950/1951)
+// Bounded ZIP reader (delegates to `megu_core::zip_archive::ZipSliceIndex`)
 // ---------------------------------------------------------------------------
 
-fn u16le(data: &[u8], off: usize) -> Result<u16, ShaderPackError> {
-    data.get(off..off + 2)
-        .map(|b| u16::from_le_bytes([b[0], b[1]]))
-        .ok_or_else(|| ShaderPackError::ZipMalformed {
-            reason: "truncated record".to_owned(),
-        })
-}
-
-fn u32le(data: &[u8], off: usize) -> Result<u32, ShaderPackError> {
-    data.get(off..off + 4)
-        .map(|b| u32::from_le_bytes([b[0], b[1], b[2], b[3]]))
-        .ok_or_else(|| ShaderPackError::ZipMalformed {
-            reason: "truncated record".to_owned(),
-        })
+/// Map a canonical ZIP index failure onto the pack error surface.
+fn zip_index_error(error: megu_core::zip_archive::ZipError) -> ShaderPackError {
+    use megu_core::zip_archive::ZipError as Z;
+    match error {
+        Z::InvalidEntryName(path) => ShaderPackError::UnsafePath { path },
+        Z::MultiDisk => ShaderPackError::ZipUnsupported {
+            reason: "multi-disk archive".to_owned(),
+        },
+        Z::Encrypted(name) => ShaderPackError::ZipUnsupported {
+            reason: format!("encrypted entry {name}"),
+        },
+        Z::UnsupportedMethod(method) => ShaderPackError::ZipUnsupported {
+            reason: format!("compression method {method}"),
+        },
+        other => ShaderPackError::ZipMalformed {
+            reason: other.to_string(),
+        },
+    }
 }
 
 /// Parse the central directory of `zip` and decompress every regular file
-/// entry. Returns `(name, uncompressed-bytes)` pairs in archive order.
+/// entry. EOCD/Central-Directory walking, name validation, ZIP64, multi-disk
+/// and encryption rejection are delegated to the canonical
+/// [`megu_core::zip_archive::ZipSliceIndex`]; returns `(name,
+/// uncompressed-bytes)` pairs in archive order.
 fn read_zip_entries(zip: &[u8]) -> Result<Vec<(String, Vec<u8>)>, ShaderPackError> {
-    let malformed = |reason: &str| ShaderPackError::ZipMalformed {
-        reason: reason.to_owned(),
-    };
-    // Locate EOCD by scanning the tail window backwards.
-    let start = zip.len().saturating_sub(EOCD_SEARCH_WINDOW);
-    let mut eocd = None;
-    for i in (start..zip.len().saturating_sub(3)).rev() {
-        if zip[i..i + 4] == [0x50, 0x4b, 0x05, 0x06] {
-            eocd = Some(i);
-            break;
-        }
-    }
-    let eocd = eocd.ok_or_else(|| malformed("no end-of-central-directory record"))?;
-    let disk = u16le(zip, eocd + 4)?;
-    let cd_disk = u16le(zip, eocd + 6)?;
-    if disk != 0 || cd_disk != 0 {
-        return Err(ShaderPackError::ZipUnsupported {
-            reason: "multi-disk archive".to_owned(),
-        });
-    }
-    let total_entries = u16le(zip, eocd + 10)? as usize;
-    let cd_offset = u32le(zip, eocd + 16)? as usize;
-    if total_entries == 0xFFFF || u32le(zip, eocd + 12)? == 0xFFFF_FFFF || cd_offset == 0xFFFF_FFFF {
-        return Err(ShaderPackError::ZipUnsupported {
-            reason: "ZIP64 archive".to_owned(),
-        });
-    }
-    if total_entries > MAX_PACK_FILES {
-        return Err(ShaderPackError::TooManyFiles {
-            count: total_entries,
-        });
-    }
-    let mut out = Vec::with_capacity(total_entries.min(1024));
-    let mut off = cd_offset;
-    for _ in 0..total_entries {
-        if u32le(zip, off)? != 0x0201_4b50 {
-            return Err(malformed("bad central-directory signature"));
-        }
-        let flags = u16le(zip, off + 8)?;
-        let method = u16le(zip, off + 10)?;
-        let csize = u32le(zip, off + 20)? as usize;
-        let usize_ = u32le(zip, off + 24)? as u64;
-        let name_len = u16le(zip, off + 28)? as usize;
-        let extra_len = u16le(zip, off + 30)? as usize;
-        let comment_len = u16le(zip, off + 32)? as usize;
-        let lh_off = u32le(zip, off + 42)? as usize;
-        if flags & 0x1 != 0 {
-            return Err(ShaderPackError::ZipUnsupported {
-                reason: "encrypted entry".to_owned(),
-            });
-        }
-        if csize == 0xFFFF_FFFF || usize_ == u64::from(u32::MAX) {
-            return Err(ShaderPackError::ZipUnsupported {
-                reason: "ZIP64 entry".to_owned(),
-            });
-        }
-        let name_bytes = zip
-            .get(off + 46..off + 46 + name_len)
-            .ok_or_else(|| malformed("truncated entry name"))?;
-        let name = std::str::from_utf8(name_bytes)
-            .map_err(|_| malformed("non-UTF-8 entry name"))?
-            .to_owned();
-        if name.ends_with('/') {
-            off += 46 + name_len + extra_len + comment_len;
+    let index = megu_core::zip_archive::ZipSliceIndex::open(zip).map_err(zip_index_error)?;
+    let mut out = Vec::new();
+    for meta in index.entries() {
+        // Only top-level members are pack files; Jar-in-Jar children are
+        // not part of the shaderpack layout.
+        if meta.archive_id != 0 {
             continue;
         }
-        // Validate *before* doing any work with the name.
-        validate_virtual_path(&name)
-            .map_err(|_| ShaderPackError::UnsafePath { path: name.clone() })?;
-        if usize_ > MAX_SHADER_FILE_BYTES {
+        let name = meta.name.clone();
+        if meta.uncompressed_size > MAX_SHADER_FILE_BYTES {
             return Err(ShaderPackError::FileTooLarge {
                 path: name,
-                bytes: usize_,
+                bytes: meta.uncompressed_size,
             });
         }
-        // Local header: re-read name/extra lengths to find the data.
-        if u32le(zip, lh_off)? != 0x0403_4b50 {
-            return Err(malformed("bad local-file-header signature"));
-        }
-        let l_name_len = u16le(zip, lh_off + 26)? as usize;
-        let l_extra_len = u16le(zip, lh_off + 28)? as usize;
-        let data_start = lh_off
-            .checked_add(30)
-            .and_then(|v| v.checked_add(l_name_len))
-            .and_then(|v| v.checked_add(l_extra_len))
-            .ok_or_else(|| malformed("header offset overflow"))?;
-        let data = zip
-            .get(data_start..data_start + csize)
-            .ok_or_else(|| malformed("truncated entry data"))?;
-        let bytes = match method {
-            0 => {
-                if data.len() as u64 != usize_ {
-                    return Err(malformed("stored entry size mismatch"));
+        let bytes = index
+            .read_entry(&name, MAX_SHADER_FILE_BYTES as usize)
+            .map_err(|e| match e {
+                megu_core::zip_archive::ZipError::UnsupportedMethod(method) => {
+                    ShaderPackError::ZipUnsupported {
+                        reason: format!("compression method {method}"),
+                    }
                 }
-                data.to_vec()
-            }
-            8 => inflate(data, usize_ as usize)?,
-            m => {
-                return Err(ShaderPackError::ZipUnsupported {
-                    reason: format!("compression method {m}"),
-                })
-            }
-        };
+                other => ShaderPackError::ZipMalformed {
+                    reason: format!("{name}: {other}"),
+                },
+            })?;
         out.push((name, bytes));
-        off += 46 + name_len + extra_len + comment_len;
     }
     Ok(out)
-}
-
-/// Inflate `input` (raw DEFLATE) into at most `limit` bytes.
-///
-/// Shared with the PNG/protocol decoders via `crate::inflate`. Output is
-/// capped at `limit` so a hostile stream cannot expand unboundedly.
-fn inflate(input: &[u8], limit: usize) -> Result<Vec<u8>, ShaderPackError> {
-    crate::inflate::inflate(input, limit).map_err(|e| ShaderPackError::ZipMalformed {
-        reason: e.reason().to_owned(),
-    })
 }
 
 // ---------------------------------------------------------------------------

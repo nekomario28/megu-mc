@@ -232,24 +232,34 @@ pub fn load_validated_pack_zip(bytes: &[u8]) -> Result<LoadedPack, PackLoadError
         warnings: Vec::new(),
     };
 
-    for entry in indexed_members(bytes)? {
-        let Some(kind) = asset_kind(&entry.name) else {
+    // The router has already validated the complete central directory and
+    // every member. The canonical slice index re-walks it once more to
+    // obtain member metadata for the selected, bounded documents.
+    let index = megu_core::zip_archive::ZipSliceIndex::open(bytes)
+        .map_err(|error| invalid(format!("validated ZIP index: {error}")))?;
+    for entry in index.entries() {
+        // Only top-level members are pack assets.
+        if entry.archive_id != 0 {
+            continue;
+        }
+        let name = entry.name.clone();
+        let Some(kind) = asset_kind(&name) else {
             continue;
         };
-        if entry.uncompressed_len > MAX_DOCUMENT_BYTES {
+        if entry.uncompressed_size > MAX_DOCUMENT_BYTES as u64 {
             if kind == AssetKind::Metadata {
                 return Err(invalid("pack.mcmeta exceeds metadata size limit"));
             }
             pack.warnings
-                .push(format!("{}: document exceeds 1 MiB", entry.name));
+                .push(format!("{}: document exceeds 1 MiB", name));
             continue;
         }
-        let content = extract_member(bytes, &entry)?;
+        let content = extract_member(&index, entry)?;
         let text = match std::str::from_utf8(&content) {
             Ok(text) => text,
             Err(error) if kind != AssetKind::Metadata => {
                 pack.warnings
-                    .push(format!("{}: invalid UTF-8: {error}", entry.name));
+                    .push(format!("{}: invalid UTF-8: {error}", name));
                 continue;
             }
             Err(error) => return Err(invalid(format!("pack.mcmeta: invalid UTF-8: {error}"))),
@@ -275,35 +285,35 @@ pub fn load_validated_pack_zip(bytes: &[u8]) -> Result<LoadedPack, PackLoadError
             AssetKind::Blockstate | AssetKind::Model => match json::parse(text) {
                 Ok(json) => {
                     if kind == AssetKind::Blockstate {
-                        pack.blockstates.insert(entry.name, json);
+                        pack.blockstates.insert(name, json);
                     } else {
-                        pack.models.insert(entry.name, json);
+                        pack.models.insert(name, json);
                     }
                 }
-                Err(error) => pack.warnings.push(format!("{}: {error}", entry.name)),
+                Err(error) => pack.warnings.push(format!("{}: {error}", name)),
             },
             AssetKind::Jem => record(
                 &mut pack.jem_models,
                 &mut pack.warnings,
-                entry.name,
+                name,
                 optifine_compat::parse_jem(text),
             ),
             AssetKind::Jpm => record(
                 &mut pack.jpm_models,
                 &mut pack.warnings,
-                entry.name,
+                name,
                 optifine_compat::parse_jpm(text),
             ),
             AssetKind::Ctm => record(
                 &mut pack.ctm_rules,
                 &mut pack.warnings,
-                entry.name,
+                name,
                 optifine_compat::parse_ctm_properties(text),
             ),
             AssetKind::Emissive => record(
                 &mut pack.emissive,
                 &mut pack.warnings,
-                entry.name,
+                name,
                 optifine_compat::parse_emissive_properties(text),
             ),
             AssetKind::Metadata => unreachable!("metadata handled above"),
@@ -392,92 +402,41 @@ fn asset_kind(name: &str) -> Option<AssetKind> {
     None
 }
 
-struct IndexedMember {
-    name: String,
-    method: u16,
-    crc: u32,
-    uncompressed_len: usize,
-    compressed_start: usize,
-    compressed_len: usize,
-}
-
-fn bytes_at(bytes: &[u8], start: usize, len: usize) -> Option<&[u8]> {
-    bytes.get(start..start.checked_add(len)?)
-}
-
-fn le16(bytes: &[u8], at: usize) -> Option<u16> {
-    Some(u16::from_le_bytes(bytes_at(bytes, at, 2)?.try_into().ok()?))
-}
-
-fn le32(bytes: &[u8], at: usize) -> Option<u32> {
-    Some(u32::from_le_bytes(bytes_at(bytes, at, 4)?.try_into().ok()?))
-}
-
-// The router has already validated the complete central directory and every
-// member. This second pass obtains offsets for selected, bounded documents.
-fn indexed_members(bytes: &[u8]) -> Result<Vec<IndexedMember>, PackLoadError> {
-    let eocd = (bytes.len().saturating_sub(22 + 65_535)..=bytes.len() - 22)
-        .rev()
-        .find(|&at| {
-            le32(bytes, at) == Some(0x0605_4b50)
-                && le16(bytes, at + 20)
-                    .is_some_and(|comment| at + 22 + comment as usize == bytes.len())
-        })
-        .ok_or_else(|| invalid("validated ZIP EOCD missing"))?;
-    let mut cursor =
-        le32(bytes, eocd + 16).ok_or_else(|| invalid("validated ZIP index missing"))? as usize;
-    let count = le16(bytes, eocd + 10).ok_or_else(|| invalid("validated ZIP count missing"))?;
-    let mut entries = Vec::with_capacity(count as usize);
-    for _ in 0..count {
-        if le32(bytes, cursor) != Some(0x0201_4b50) {
-            return Err(invalid("validated ZIP index mismatch"));
-        }
-        let name_len =
-            le16(bytes, cursor + 28).ok_or_else(|| invalid("ZIP entry name length"))? as usize;
-        let extra_len =
-            le16(bytes, cursor + 30).ok_or_else(|| invalid("ZIP extra length"))? as usize;
-        let comment_len =
-            le16(bytes, cursor + 32).ok_or_else(|| invalid("ZIP comment length"))? as usize;
-        let name = std::str::from_utf8(
-            bytes_at(bytes, cursor + 46, name_len).ok_or_else(|| invalid("ZIP entry name"))?,
-        )
-        .map_err(|_| invalid("ZIP entry name encoding"))?;
-        let local = le32(bytes, cursor + 42).ok_or_else(|| invalid("ZIP local offset"))? as usize;
-        let name_size = le16(bytes, local + 26).ok_or_else(|| invalid("ZIP local name"))? as usize;
-        let extra_size =
-            le16(bytes, local + 28).ok_or_else(|| invalid("ZIP local extra"))? as usize;
-        let start = local
-            .checked_add(30 + name_size + extra_size)
-            .ok_or_else(|| invalid("ZIP member offset"))?;
-        entries.push(IndexedMember {
-            name: name.to_owned(),
-            method: le16(bytes, cursor + 10).ok_or_else(|| invalid("ZIP method"))?,
-            crc: le32(bytes, cursor + 16).ok_or_else(|| invalid("ZIP CRC"))?,
-            compressed_len: le32(bytes, cursor + 20)
-                .ok_or_else(|| invalid("ZIP compressed size"))?
-                as usize,
-            uncompressed_len: le32(bytes, cursor + 24)
-                .ok_or_else(|| invalid("ZIP uncompressed size"))?
-                as usize,
-            compressed_start: start,
-        });
-        cursor = cursor
-            .checked_add(46 + name_len + extra_len + comment_len)
-            .ok_or_else(|| invalid("ZIP index offset overflow"))?;
-    }
-    Ok(entries)
-}
-
-fn extract_member(bytes: &[u8], entry: &IndexedMember) -> Result<Vec<u8>, PackLoadError> {
-    let input = bytes_at(bytes, entry.compressed_start, entry.compressed_len)
-        .ok_or_else(|| invalid(format!("{}: member out of range", entry.name)))?;
-    let decoded = match entry.method {
+/// Decode one already-validated member through the canonical slice index.
+/// The router verified the whole archive beforehand; the CRC re-check here
+/// is cheap defense in depth for the documents actually consumed. The
+/// DEFLATE stream must consume its declared compressed bytes exactly.
+fn extract_member(
+    index: &megu_core::zip_archive::ZipSliceIndex<'_>,
+    entry: &megu_core::zip_archive::ZipEntryMeta,
+) -> Result<Vec<u8>, PackLoadError> {
+    let input = index
+        .compressed_member(&entry.name)
+        .map_err(|error| invalid(format!("{}: {error}", entry.name)))?;
+    let decoded = match entry.compression_method {
         0 => input.to_vec(),
-        8 => inflate_raw(input, entry.uncompressed_len)
-            .map_err(|error| invalid(format!("{}: {error}", entry.name)))?,
-        _ => return Err(invalid(format!("{}: unsupported compression", entry.name))),
+        8 => {
+            let (out, consumed) = megu_core::zip_archive::inflate_raw_rfc1951_with_consumed(
+                input,
+                entry.uncompressed_size as usize,
+            )
+            .map_err(|error| invalid(format!("{}: {error}", entry.name)))?;
+            if consumed != input.len() {
+                return Err(invalid(format!(
+                    "{}: trailing DEFLATE bytes or uncompressed size mismatch",
+                    entry.name
+                )));
+            }
+            out
+        }
+        method => {
+            return Err(invalid(format!(
+                "{}: unsupported compression method {method}",
+                entry.name
+            )))
+        }
     };
-    if decoded.len() != entry.uncompressed_len || crc32(&decoded) != entry.crc {
+    if decoded.len() as u64 != entry.uncompressed_size || crc32(&decoded) != entry.crc32 {
         return Err(invalid(format!(
             "{}: uncompressed size or CRC mismatch",
             entry.name
@@ -488,18 +447,4 @@ fn extract_member(bytes: &[u8], entry: &IndexedMember) -> Result<Vec<u8>, PackLo
 
 fn crc32(data: &[u8]) -> u32 {
     megu_core::hash::crc32_ieee(data)
-}
-
-pub(crate) fn inflate_raw(input: &[u8], expected: usize) -> Result<Vec<u8>, &'static str> {
-    let (out, consumed) = megu_core::zip_archive::inflate_raw_rfc1951_with_consumed(input, expected)
-        .map_err(|error| match error {
-            megu_core::zip_archive::ZipError::OutputCapExceeded => {
-                "inflated member exceeds declared length"
-            }
-            _ => "invalid DEFLATE stream",
-        })?;
-    if consumed != input.len() || out.len() != expected {
-        return Err("trailing DEFLATE bytes or uncompressed size mismatch");
-    }
-    Ok(out)
 }

@@ -616,6 +616,19 @@ pub struct ZipEntryMeta {
     /// Deflate nested JARs it locates the compressed blob. `None` for
     /// top-level members.
     pub nested_range: Option<(u64, u64)>,
+    /// CRC-32 (IEEE) of the uncompressed payload, from the Central Directory.
+    /// [`LazyZipIndex::read_entry`] and [`ZipSliceIndex::read_entry`] decode
+    /// and size-check payloads but leave CRC verification to callers that
+    /// need it; compare against [`crate::hash::crc32_ieee`] of the decoded
+    /// bytes.
+    pub crc32: u32,
+    /// Offset of this entry's Central Directory record within its archive
+    /// source's coordinate space: an absolute file offset for
+    /// [`LazyZipIndex`] level-0 members, an absolute offset into the archive
+    /// image for [`ZipSliceIndex`] level-0 members, and source-relative for
+    /// nested-JAR children (absolute into the parent image for Stored nested
+    /// JARs, relative to the inflated buffer for Deflate nested JARs).
+    pub central_header_offset: u64,
 }
 
 fn u16le(b: &[u8], o: usize) -> u16 {
@@ -690,9 +703,12 @@ struct CentralInfo {
 struct RawEntry {
     name: String,
     method: u16,
+    crc32: u32,
     comp_size: u64,
     uncomp_size: u64,
     local_off: u64,
+    /// Absolute offset of this record's Central Directory header.
+    central_header_offset: u64,
 }
 
 /// Scan an assembled tail window for an EOCD record whose comment length
@@ -857,10 +873,12 @@ fn u64le_at(b: &[u8]) -> u64 {
     u64le(b, 0)
 }
 
-/// Parse Central Directory bytes into validated raw entries. Directory
+/// Parse Central Directory bytes into validated raw entries. `cd_base` is
+/// the absolute offset of `cd`'s first byte within the archive source, used
+/// to report each record's [`RawEntry::central_header_offset`]. Directory
 /// records (names ending in `/`) are skipped; every file name must pass
 /// [`validate_entry_name`].
-fn parse_central(cd: &[u8], expected: usize) -> Result<Vec<RawEntry>, ZipError> {
+fn parse_central(cd: &[u8], cd_base: u64, expected: usize) -> Result<Vec<RawEntry>, ZipError> {
     let mut entries = Vec::new();
     let mut p = 0usize;
     while p < cd.len() {
@@ -905,9 +923,13 @@ fn parse_central(cd: &[u8], expected: usize) -> Result<Vec<RawEntry>, ZipError> 
             entries.push(RawEntry {
                 name,
                 method,
+                crc32: u32le(fixed, 16),
                 comp_size: comp,
                 uncomp_size: uncomp,
                 local_off,
+                central_header_offset: cd_base
+                    .checked_add(p as u64)
+                    .ok_or(ZipError::Malformed("central header offset overflow"))?,
             });
         }
         p = next;
@@ -924,7 +946,7 @@ fn read_archive_index(src: &mut dyn RangeRead) -> Result<Vec<RawEntry>, ZipError
     let info = resolve_central(src)?;
     let mut cd = vec![0u8; info.cd_size as usize];
     src.read_exact_at(info.cd_offset, &mut cd)?;
-    parse_central(&cd, info.total_entries as usize)
+    parse_central(&cd, info.cd_offset, info.total_entries as usize)
 }
 
 /// Read a Local File Header and return the offset of the entry's data.
@@ -950,12 +972,15 @@ fn is_nested_jar(name: &str) -> bool {
 }
 
 /// Byte source behind an [`ZipEntryMeta::archive_id`].
-enum ArchiveSource {
+enum ArchiveSource<'a> {
     /// Reads hit the on-disk file at absolute offsets. Used for the top-level
     /// archive and for stored nested JARs (child offsets pre-adjusted).
     ParentFile,
     /// Reads hit a fully inflated deflated nested JAR held in memory.
     Inflated(Vec<u8>),
+    /// Reads hit an in-memory archive image at absolute offsets — the
+    /// [`ZipSliceIndex`] primary source and its stored nested-JAR levels.
+    Slice(&'a [u8]),
 }
 
 /// Lazy index over a ZIP/JAR: EOCD + Central Directory read at open, entry
@@ -963,7 +988,7 @@ enum ArchiveSource {
 pub struct LazyZipIndex {
     file: Mutex<File>,
     file_len: u64,
-    sources: Vec<ArchiveSource>,
+    sources: Vec<ArchiveSource<'static>>,
     entries: Vec<ZipEntryMeta>,
     bytes_read_for_index: u64,
 }
@@ -987,157 +1012,26 @@ impl LazyZipIndex {
     ) -> Result<Self, ZipError> {
         let mut file = File::open(path)?;
         let file_len = file.metadata()?.len();
-        let mut counted = 0u64;
-        let raw = {
-            let mut range = FileRange {
+        let (entries, sources, counted) = {
+            let mut backend = IndexBackend::File {
                 file: &mut file,
-                counted: &mut counted,
-                base: 0,
+                counted: 0,
                 len: file_len,
             };
-            read_archive_index(&mut range)?
+            let mut sink = SourceSink {
+                sources: vec![ArchiveSource::ParentFile],
+                stored: StoredLevel::File,
+            };
+            let entries = build_index(&mut backend, &mut sink, &filter)?;
+            (entries, sink.sources, backend.counted())
         };
-
-        let mut index = Self {
+        Ok(Self {
             file: Mutex::new(file),
             file_len,
-            sources: vec![ArchiveSource::ParentFile],
-            entries: Vec::new(),
+            sources,
+            entries,
             bytes_read_for_index: counted,
-        };
-        let mut total_nested = 0u64;
-
-        for entry in raw {
-            if entry.local_off + LFH_FIXED as u64 > file_len {
-                return Err(ZipError::Malformed("local header outside archive"));
-            }
-            if is_nested_jar(&entry.name)
-                && index.sources.len() <= u16::MAX as usize
-                && entry.method == METHOD_STORED
-                && entry.comp_size == entry.uncomp_size
-            {
-                let (data_off, children) = {
-                    let mut range = FileRange {
-                        file: index.file.get_mut().map_err(|_| ZipError::LockPoisoned)?,
-                        counted: &mut counted,
-                        base: 0,
-                        len: file_len,
-                    };
-                    let data_off = local_data_offset(&mut range, entry.local_off)?;
-                    if data_off + entry.uncomp_size > file_len {
-                        return Err(ZipError::Malformed("nested jar outside archive"));
-                    }
-                    let mut nested = FileRange {
-                        file: range.file,
-                        counted: range.counted,
-                        base: data_off,
-                        len: entry.uncomp_size,
-                    };
-                    (data_off, read_archive_index(&mut nested)?)
-                };
-                let archive_id = index.sources.len() as u16;
-                index.sources.push(ArchiveSource::ParentFile);
-                if filter(&entry.name) {
-                    index.entries.push(ZipEntryMeta {
-                        archive_id: 0,
-                        name: entry.name.clone(),
-                        local_header_offset: entry.local_off,
-                        compressed_size: entry.comp_size,
-                        uncompressed_size: entry.uncomp_size,
-                        compression_method: entry.method,
-                        nested_range: Some((data_off, entry.uncomp_size)),
-                    });
-                }
-                for child in children {
-                    if child.local_off + LFH_FIXED as u64 > entry.uncomp_size {
-                        return Err(ZipError::Malformed("nested local header outside jar"));
-                    }
-                    if filter(&child.name) {
-                        index.entries.push(ZipEntryMeta {
-                            archive_id,
-                            name: child.name,
-                            local_header_offset: data_off + child.local_off,
-                            compressed_size: child.comp_size,
-                            uncompressed_size: child.uncomp_size,
-                            compression_method: child.method,
-                            nested_range: Some((data_off, entry.uncomp_size)),
-                        });
-                    }
-                }
-            } else if is_nested_jar(&entry.name)
-                && index.sources.len() <= u16::MAX as usize
-                && entry.method == METHOD_DEFLATE
-                && entry.uncomp_size <= MAX_NESTED_JAR_BYTES
-                && total_nested + entry.uncomp_size <= MAX_TOTAL_NESTED_BYTES
-            {
-                total_nested += entry.uncomp_size;
-                let (data_off, inflated, children) = {
-                    let mut range = FileRange {
-                        file: index.file.get_mut().map_err(|_| ZipError::LockPoisoned)?,
-                        counted: &mut counted,
-                        base: 0,
-                        len: file_len,
-                    };
-                    let data_off = local_data_offset(&mut range, entry.local_off)?;
-                    if data_off + entry.comp_size > file_len {
-                        return Err(ZipError::Malformed("nested jar outside archive"));
-                    }
-                    let mut comp = vec![0u8; entry.comp_size as usize];
-                    range.read_exact_at(data_off, &mut comp)?;
-                    let inflated =
-                        inflate_raw_rfc1951(&comp, entry.uncomp_size as usize)?;
-                    if inflated.len() as u64 != entry.uncomp_size {
-                        return Err(ZipError::Malformed("nested jar size mismatch"));
-                    }
-                    let children = {
-                        let mut slice = SliceRange { buf: &inflated };
-                        read_archive_index(&mut slice)?
-                    };
-                    (data_off, inflated, children)
-                };
-                let archive_id = index.sources.len() as u16;
-                index.sources.push(ArchiveSource::Inflated(inflated));
-                if filter(&entry.name) {
-                    index.entries.push(ZipEntryMeta {
-                        archive_id: 0,
-                        name: entry.name.clone(),
-                        local_header_offset: entry.local_off,
-                        compressed_size: entry.comp_size,
-                        uncompressed_size: entry.uncomp_size,
-                        compression_method: entry.method,
-                        nested_range: Some((data_off, entry.comp_size)),
-                    });
-                }
-                for child in children {
-                    if child.local_off + LFH_FIXED as u64 > entry.uncomp_size {
-                        return Err(ZipError::Malformed("nested local header outside jar"));
-                    }
-                    if filter(&child.name) {
-                        index.entries.push(ZipEntryMeta {
-                            archive_id,
-                            name: child.name,
-                            local_header_offset: child.local_off,
-                            compressed_size: child.comp_size,
-                            uncompressed_size: child.uncomp_size,
-                            compression_method: child.method,
-                            nested_range: Some((data_off, entry.comp_size)),
-                        });
-                    }
-                }
-            } else if filter(&entry.name) {
-                index.entries.push(ZipEntryMeta {
-                    archive_id: 0,
-                    name: entry.name,
-                    local_header_offset: entry.local_off,
-                    compressed_size: entry.comp_size,
-                    uncompressed_size: entry.uncomp_size,
-                    compression_method: entry.method,
-                    nested_range: None,
-                });
-            }
-        }
-        index.bytes_read_for_index = counted;
-        Ok(index)
+        })
     }
 
     /// All indexed members (including nested-JAR children).
@@ -1158,23 +1052,8 @@ impl LazyZipIndex {
     /// name/extra fields, reads only `compressed_size` bytes, and inflates
     /// when the method is Deflate — all bounded by `max_bytes`.
     pub fn read_entry(&self, name: &str, max_bytes: usize) -> Result<Vec<u8>, ZipError> {
-        let entry = self
-            .entries
-            .iter()
-            .find(|e| e.name == name)
-            .ok_or_else(|| ZipError::EntryNotFound(name.to_owned()))?;
-        if entry.uncompressed_size > max_bytes as u64 {
-            return Err(ZipError::EntryTooLarge {
-                uncompressed_size: entry.uncompressed_size,
-                max_bytes: max_bytes as u64,
-            });
-        }
-        match entry.compression_method {
-            METHOD_STORED | METHOD_DEFLATE => {}
-            other => return Err(ZipError::UnsupportedMethod(other)),
-        }
-
-        let comp = match &self.sources[entry.archive_id as usize] {
+        let entry = entry_for_read(&self.entries, name, max_bytes)?;
+        match &self.sources[entry.archive_id as usize] {
             ArchiveSource::ParentFile => {
                 let mut file = self.file.lock().map_err(|_| ZipError::LockPoisoned)?;
                 let mut hdr = [0u8; LFH_FIXED];
@@ -1193,52 +1072,663 @@ impl LazyZipIndex {
                 let mut comp = vec![0u8; entry.compressed_size as usize];
                 file.seek(SeekFrom::Start(data_off))?;
                 file.read_exact(&mut comp)?;
-                comp
+                decode_entry_payload(entry, &comp, max_bytes)
             }
-            ArchiveSource::Inflated(buf) => {
-                let end = usize::try_from(entry.local_header_offset)
-                    .ok()
-                    .and_then(|s| s.checked_add(LFH_FIXED))
-                    .ok_or(ZipError::Truncated)?;
-                let hdr = buf
-                    .get(usize::try_from(entry.local_header_offset).map_err(|_| {
-                        ZipError::Truncated
-                    })?..end)
-                    .ok_or(ZipError::Truncated)?;
-                if u32le(hdr, 0) != SIG_LFH {
-                    return Err(ZipError::Malformed("bad local file header signature"));
-                }
-                let data_off = usize::try_from(entry.local_header_offset)
-                    .map_err(|_| ZipError::Truncated)?
-                    + LFH_FIXED
-                    + u16le(hdr, 26) as usize
-                    + u16le(hdr, 28) as usize;
-                let end = data_off
-                    .checked_add(usize::try_from(entry.compressed_size).map_err(|_| {
-                        ZipError::Malformed("entry too large for host")
-                    })?)
-                    .ok_or(ZipError::Truncated)?;
-                buf.get(data_off..end)
-                    .ok_or(ZipError::Truncated)?
-                    .to_vec()
-            }
-        };
-
-        match entry.compression_method {
-            METHOD_STORED => {
-                if comp.len() as u64 != entry.uncompressed_size {
-                    return Err(ZipError::Malformed("stored entry size mismatch"));
-                }
-                Ok(comp)
-            }
-            METHOD_DEFLATE => {
-                let out = inflate_raw_rfc1951(&comp, max_bytes)?;
-                if out.len() as u64 != entry.uncompressed_size {
-                    return Err(ZipError::Malformed("inflated size mismatch"));
-                }
-                Ok(out)
-            }
-            other => Err(ZipError::UnsupportedMethod(other)),
+            ArchiveSource::Inflated(buf) => read_entry_image(buf, entry, max_bytes),
+            ArchiveSource::Slice(image) => read_entry_image(image, entry, max_bytes),
         }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Shared index pipeline (file-backed and in-memory archives)
+// ---------------------------------------------------------------------------
+
+/// Uniform random-access byte source over the primary archive image while
+/// [`build_index`] runs: either the on-disk file or an in-memory slice.
+enum IndexBackend<'a> {
+    File {
+        file: &'a mut File,
+        counted: u64,
+        len: u64,
+    },
+    Slice {
+        buf: &'a [u8],
+        counted: u64,
+    },
+}
+
+impl IndexBackend<'_> {
+    fn len(&self) -> u64 {
+        match self {
+            Self::File { len, .. } => *len,
+            Self::Slice { buf, .. } => buf.len() as u64,
+        }
+    }
+
+    fn counted(&self) -> u64 {
+        match self {
+            Self::File { counted, .. } | Self::Slice { counted, .. } => *counted,
+        }
+    }
+
+    /// Reader over `[base, base + len)` of the primary archive image; reads
+    /// are charged to index telemetry exactly like [`FileRange`].
+    fn range(&mut self, base: u64, len: u64) -> Result<Box<dyn RangeRead + '_>, ZipError> {
+        match self {
+            Self::File {
+                file, counted, ..
+            } => Ok(Box::new(FileRange {
+                file,
+                counted,
+                base,
+                len,
+            })),
+            Self::Slice { buf, counted } => {
+                let start = usize::try_from(base).map_err(|_| ZipError::Truncated)?;
+                let size = usize::try_from(len).map_err(|_| ZipError::Truncated)?;
+                let end = start.checked_add(size).ok_or(ZipError::Truncated)?;
+                let slice = buf.get(start..end).ok_or(ZipError::Truncated)?;
+                Ok(Box::new(CountedSlice {
+                    buf: slice,
+                    counted,
+                }))
+            }
+        }
+    }
+}
+
+/// [`SliceRange`] that charges every satisfied read to index telemetry,
+/// mirroring [`FileRange`]'s accounting for in-memory archives.
+struct CountedSlice<'a> {
+    buf: &'a [u8],
+    counted: &'a mut u64,
+}
+
+impl RangeRead for CountedSlice<'_> {
+    fn read_exact_at(&mut self, off: u64, buf: &mut [u8]) -> Result<(), ZipError> {
+        let start = usize::try_from(off).map_err(|_| ZipError::Truncated)?;
+        let end = start.checked_add(buf.len()).ok_or(ZipError::Truncated)?;
+        let slice = self.buf.get(start..end).ok_or(ZipError::Truncated)?;
+        buf.copy_from_slice(slice);
+        *self.counted += buf.len() as u64;
+        Ok(())
+    }
+    fn len(&self) -> u64 {
+        self.buf.len() as u64
+    }
+}
+
+/// What a Stored nested-JAR level indexes into while [`build_index`] runs.
+#[derive(Clone, Copy)]
+enum StoredLevel<'a> {
+    /// The on-disk file at absolute offsets ([`LazyZipIndex`]).
+    File,
+    /// The borrowed archive image at absolute offsets ([`ZipSliceIndex`]).
+    Slice(&'a [u8]),
+}
+
+/// Registers the byte source behind each indexed archive level while
+/// [`build_index`] descends into nested JARs.
+struct SourceSink<'a> {
+    sources: Vec<ArchiveSource<'a>>,
+    stored: StoredLevel<'a>,
+}
+
+impl<'a> SourceSink<'a> {
+    fn count(&self) -> usize {
+        self.sources.len()
+    }
+
+    /// Register a Stored nested-JAR level sharing the primary image.
+    fn push_stored(&mut self) -> u16 {
+        let id = self.sources.len() as u16;
+        self.sources.push(match self.stored {
+            StoredLevel::File => ArchiveSource::ParentFile,
+            StoredLevel::Slice(image) => ArchiveSource::Slice(image),
+        });
+        id
+    }
+
+    /// Register an inflated Deflate nested-JAR buffer.
+    fn push_inflated(&mut self, buf: Vec<u8>) -> u16 {
+        let id = self.sources.len() as u16;
+        self.sources.push(ArchiveSource::Inflated(buf));
+        id
+    }
+}
+
+/// Shared index builder backing both [`LazyZipIndex`] and [`ZipSliceIndex`]:
+/// resolves EOCD + Central Directory through `backend`, validates every
+/// entry name fail-closed, and descends one level into
+/// `META-INF/jarjar/*.jar` / `META-INF/jars/*.jar` exactly like
+/// [`LazyZipIndex::open_filtered`]. `sink` decides which byte source each
+/// archive level reads from.
+fn build_index(
+    backend: &mut IndexBackend<'_>,
+    sink: &mut SourceSink<'_>,
+    filter: &dyn Fn(&str) -> bool,
+) -> Result<Vec<ZipEntryMeta>, ZipError> {
+    let primary_len = backend.len();
+    let raw = {
+        let mut top = backend.range(0, primary_len)?;
+        read_archive_index(&mut *top)?
+    };
+    let mut entries = Vec::new();
+    let mut total_nested = 0u64;
+
+    for entry in raw {
+        if entry.local_off + LFH_FIXED as u64 > primary_len {
+            return Err(ZipError::Malformed("local header outside archive"));
+        }
+        if is_nested_jar(&entry.name)
+            && sink.count() <= u16::MAX as usize
+            && entry.method == METHOD_STORED
+            && entry.comp_size == entry.uncomp_size
+        {
+            let (data_off, children) = {
+                let data_off = {
+                    let mut top = backend.range(0, primary_len)?;
+                    local_data_offset(&mut *top, entry.local_off)?
+                };
+                if data_off + entry.uncomp_size > primary_len {
+                    return Err(ZipError::Malformed("nested jar outside archive"));
+                }
+                let mut nested = backend.range(data_off, entry.uncomp_size)?;
+                (data_off, read_archive_index(&mut *nested)?)
+            };
+            let archive_id = sink.push_stored();
+            if filter(&entry.name) {
+                entries.push(ZipEntryMeta {
+                    archive_id: 0,
+                    name: entry.name.clone(),
+                    local_header_offset: entry.local_off,
+                    compressed_size: entry.comp_size,
+                    uncompressed_size: entry.uncomp_size,
+                    compression_method: entry.method,
+                    nested_range: Some((data_off, entry.uncomp_size)),
+                    crc32: entry.crc32,
+                    central_header_offset: entry.central_header_offset,
+                });
+            }
+            for child in children {
+                if child.local_off + LFH_FIXED as u64 > entry.uncomp_size {
+                    return Err(ZipError::Malformed("nested local header outside jar"));
+                }
+                if filter(&child.name) {
+                    entries.push(ZipEntryMeta {
+                        archive_id,
+                        name: child.name,
+                        local_header_offset: data_off + child.local_off,
+                        compressed_size: child.comp_size,
+                        uncompressed_size: child.uncomp_size,
+                        compression_method: child.method,
+                        nested_range: Some((data_off, entry.uncomp_size)),
+                        crc32: child.crc32,
+                        central_header_offset: data_off + child.central_header_offset,
+                    });
+                }
+            }
+        } else if is_nested_jar(&entry.name)
+            && sink.count() <= u16::MAX as usize
+            && entry.method == METHOD_DEFLATE
+            && entry.uncomp_size <= MAX_NESTED_JAR_BYTES
+            && total_nested + entry.uncomp_size <= MAX_TOTAL_NESTED_BYTES
+        {
+            total_nested += entry.uncomp_size;
+            let (data_off, inflated, children) = {
+                let (data_off, comp) = {
+                    let mut top = backend.range(0, primary_len)?;
+                    let data_off = local_data_offset(&mut *top, entry.local_off)?;
+                    if data_off + entry.comp_size > primary_len {
+                        return Err(ZipError::Malformed("nested jar outside archive"));
+                    }
+                    let mut comp = vec![0u8; entry.comp_size as usize];
+                    top.read_exact_at(data_off, &mut comp)?;
+                    (data_off, comp)
+                };
+                let inflated = inflate_raw_rfc1951(&comp, entry.uncomp_size as usize)?;
+                if inflated.len() as u64 != entry.uncomp_size {
+                    return Err(ZipError::Malformed("nested jar size mismatch"));
+                }
+                let children = {
+                    let mut slice = SliceRange { buf: &inflated };
+                    read_archive_index(&mut slice)?
+                };
+                (data_off, inflated, children)
+            };
+            let archive_id = sink.push_inflated(inflated);
+            if filter(&entry.name) {
+                entries.push(ZipEntryMeta {
+                    archive_id: 0,
+                    name: entry.name.clone(),
+                    local_header_offset: entry.local_off,
+                    compressed_size: entry.comp_size,
+                    uncompressed_size: entry.uncomp_size,
+                    compression_method: entry.method,
+                    nested_range: Some((data_off, entry.comp_size)),
+                    crc32: entry.crc32,
+                    central_header_offset: entry.central_header_offset,
+                });
+            }
+            for child in children {
+                if child.local_off + LFH_FIXED as u64 > entry.uncomp_size {
+                    return Err(ZipError::Malformed("nested local header outside jar"));
+                }
+                if filter(&child.name) {
+                    entries.push(ZipEntryMeta {
+                        archive_id,
+                        name: child.name,
+                        local_header_offset: child.local_off,
+                        compressed_size: child.comp_size,
+                        uncompressed_size: child.uncomp_size,
+                        compression_method: child.method,
+                        nested_range: Some((data_off, entry.comp_size)),
+                        crc32: child.crc32,
+                        central_header_offset: child.central_header_offset,
+                    });
+                }
+            }
+        } else if filter(&entry.name) {
+            entries.push(ZipEntryMeta {
+                archive_id: 0,
+                name: entry.name,
+                local_header_offset: entry.local_off,
+                compressed_size: entry.comp_size,
+                uncompressed_size: entry.uncomp_size,
+                compression_method: entry.method,
+                nested_range: None,
+                crc32: entry.crc32,
+                central_header_offset: entry.central_header_offset,
+            });
+        }
+    }
+    Ok(entries)
+}
+
+/// Shared `read_entry` lookup and gates: resolve `name` (top-level archive
+/// members win over same-named nested-JAR children) and enforce the
+/// uncompressed-size cap and compression-method allowlist.
+fn entry_for_read<'e>(
+    entries: &'e [ZipEntryMeta],
+    name: &str,
+    max_bytes: usize,
+) -> Result<&'e ZipEntryMeta, ZipError> {
+    let entry = entries
+        .iter()
+        .find(|e| e.name == name && e.archive_id == 0)
+        .or_else(|| entries.iter().find(|e| e.name == name))
+        .ok_or_else(|| ZipError::EntryNotFound(name.to_owned()))?;
+    if entry.uncompressed_size > max_bytes as u64 {
+        return Err(ZipError::EntryTooLarge {
+            uncompressed_size: entry.uncompressed_size,
+            max_bytes: max_bytes as u64,
+        });
+    }
+    match entry.compression_method {
+        METHOD_STORED | METHOD_DEFLATE => {}
+        other => return Err(ZipError::UnsupportedMethod(other)),
+    }
+    Ok(entry)
+}
+
+/// Decode already-read compressed payload bytes into the entry's plaintext.
+fn decode_entry_payload(
+    entry: &ZipEntryMeta,
+    comp: &[u8],
+    max_bytes: usize,
+) -> Result<Vec<u8>, ZipError> {
+    match entry.compression_method {
+        METHOD_STORED => {
+            if comp.len() as u64 != entry.uncompressed_size {
+                return Err(ZipError::Malformed("stored entry size mismatch"));
+            }
+            Ok(comp.to_vec())
+        }
+        METHOD_DEFLATE => {
+            let (out, consumed) = inflate_raw_rfc1951_with_consumed(comp, max_bytes)?;
+            if consumed != comp.len() {
+                return Err(ZipError::Malformed("deflate stream does not fill member"));
+            }
+            if out.len() as u64 != entry.uncompressed_size {
+                return Err(ZipError::Malformed("inflated size mismatch"));
+            }
+            Ok(out)
+        }
+        other => Err(ZipError::UnsupportedMethod(other)),
+    }
+}
+
+/// Borrow the `compressed_size` payload bytes following an entry's Local
+/// File Header inside `image`.
+fn compressed_payload<'i>(image: &'i [u8], entry: &ZipEntryMeta) -> Result<&'i [u8], ZipError> {
+    let start = usize::try_from(entry.local_header_offset).map_err(|_| ZipError::Truncated)?;
+    let end = start.checked_add(LFH_FIXED).ok_or(ZipError::Truncated)?;
+    let hdr = image.get(start..end).ok_or(ZipError::Truncated)?;
+    if u32le(hdr, 0) != SIG_LFH {
+        return Err(ZipError::Malformed("bad local file header signature"));
+    }
+    let data_off = start
+        .checked_add(LFH_FIXED)
+        .and_then(|v| v.checked_add(u16le(hdr, 26) as usize))
+        .and_then(|v| v.checked_add(u16le(hdr, 28) as usize))
+        .ok_or(ZipError::Truncated)?;
+    let comp_len =
+        usize::try_from(entry.compressed_size).map_err(|_| ZipError::Truncated)?;
+    let end = data_off.checked_add(comp_len).ok_or(ZipError::Truncated)?;
+    image.get(data_off..end).ok_or(ZipError::Truncated)
+}
+
+/// Read and decode one entry held in an in-memory image (an inflated nested
+/// JAR or a [`ZipSliceIndex`] archive level). `local_header_offset` is
+/// relative to `image`.
+fn read_entry_image(
+    image: &[u8],
+    entry: &ZipEntryMeta,
+    max_bytes: usize,
+) -> Result<Vec<u8>, ZipError> {
+    let comp = compressed_payload(image, entry)?;
+    decode_entry_payload(entry, comp, max_bytes)
+}
+
+/// Lazy index over a ZIP/JAR held entirely in memory: the same fail-closed
+/// EOCD, Central Directory, ZIP64, multi-disk, encryption, traversal and
+/// output-cap checks as [`LazyZipIndex`], but every read hits the borrowed
+/// byte slice — zero copies, zero file I/O, zero disk extraction.
+///
+/// Like [`LazyZipIndex`], one level of Jar-in-Jar is resolved at index time
+/// and entry payloads are decoded on demand by [`Self::read_entry`]. CRC-32
+/// verification is left to callers via [`ZipEntryMeta::crc32`].
+pub struct ZipSliceIndex<'a> {
+    bytes: &'a [u8],
+    sources: Vec<ArchiveSource<'a>>,
+    entries: Vec<ZipEntryMeta>,
+    bytes_read_for_index: u64,
+}
+
+impl<'a> ZipSliceIndex<'a> {
+    /// Index every archive member in `bytes`.
+    pub fn open(bytes: &'a [u8]) -> Result<Self, ZipError> {
+        Self::open_filtered(bytes, |_| true)
+    }
+
+    /// Index archive members whose names pass `filter`, mirroring
+    /// [`LazyZipIndex::open_filtered`] including one level of Jar-in-Jar
+    /// descent.
+    pub fn open_filtered(
+        bytes: &'a [u8],
+        filter: impl Fn(&str) -> bool,
+    ) -> Result<Self, ZipError> {
+        let mut backend = IndexBackend::Slice {
+            buf: bytes,
+            counted: 0,
+        };
+        let mut sink = SourceSink {
+            sources: vec![ArchiveSource::Slice(bytes)],
+            stored: StoredLevel::Slice(bytes),
+        };
+        let entries = build_index(&mut backend, &mut sink, &filter)?;
+        Ok(Self {
+            bytes,
+            sources: sink.sources,
+            entries,
+            bytes_read_for_index: backend.counted(),
+        })
+    }
+
+    /// All indexed members (including nested-JAR children).
+    pub fn entries(&self) -> &[ZipEntryMeta] {
+        &self.entries
+    }
+
+    /// Bytes of `bytes` touched while building the index — the in-memory
+    /// analogue of [`LazyZipIndex::bytes_read_for_index`].
+    pub fn bytes_read_for_index(&self) -> u64 {
+        self.bytes_read_for_index
+    }
+
+    /// Borrowed archive image this index was built from.
+    pub fn bytes(&self) -> &'a [u8] {
+        self.bytes
+    }
+
+    /// Borrow the raw `compressed_size` payload bytes of `name` — the exact
+    /// slice following its Local File Header — for callers that need
+    /// stream-level validation such as consumed-length checks. Zero-copy;
+    /// the borrow is tied to `&self`.
+    pub fn compressed_member(&self, name: &str) -> Result<&[u8], ZipError> {
+        let entry = entry_for_read(&self.entries, name, usize::MAX)?;
+        match &self.sources[entry.archive_id as usize] {
+            ArchiveSource::Slice(image) => compressed_payload(image, entry),
+            ArchiveSource::Inflated(image) => compressed_payload(image, entry),
+            ArchiveSource::ParentFile => {
+                Err(ZipError::Malformed("file-backed source in slice index"))
+            }
+        }
+    }
+
+    /// Fetch and decompress one entry from the byte slice, fail-closed —
+    /// the in-memory analogue of [`LazyZipIndex::read_entry`].
+    pub fn read_entry(&self, name: &str, max_bytes: usize) -> Result<Vec<u8>, ZipError> {
+        let entry = entry_for_read(&self.entries, name, max_bytes)?;
+        match &self.sources[entry.archive_id as usize] {
+            ArchiveSource::Slice(image) => read_entry_image(image, entry, max_bytes),
+            ArchiveSource::Inflated(buf) => read_entry_image(buf, entry, max_bytes),
+            ArchiveSource::ParentFile => {
+                Err(ZipError::Malformed("file-backed source in slice index"))
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod slice_index_tests {
+    use super::*;
+
+    fn w16(out: &mut Vec<u8>, v: u16) {
+        out.extend_from_slice(&v.to_le_bytes());
+    }
+    fn w32(out: &mut Vec<u8>, v: u32) {
+        out.extend_from_slice(&v.to_le_bytes());
+    }
+
+    /// Fixture entry: `stored` is the byte stream after the Local File
+    /// Header (verbatim for Stored, compressed for Deflate), `plain` is the
+    /// payload the CRC-32 covers, and `uncomp` is the declared uncompressed
+    /// size (may differ from `plain.len()` to exercise the output cap).
+    struct Fix<'a> {
+        name: &'a str,
+        method: u16,
+        stored: &'a [u8],
+        plain: &'a [u8],
+        uncomp: usize,
+    }
+
+    /// Minimal fixture ZIP with real CRC-32 fields, mirroring
+    /// `core/tests/zip_archive_tests.rs`.
+    fn build_zip(entries: &[Fix<'_>]) -> Vec<u8> {
+        let mut out = Vec::new();
+        let mut central = Vec::new();
+        for e in entries {
+            let local_off = out.len() as u32;
+            let crc = crate::hash::crc32_ieee(e.plain);
+            w32(&mut out, SIG_LFH);
+            w16(&mut out, 20);
+            w16(&mut out, 0);
+            w16(&mut out, e.method);
+            w16(&mut out, 0);
+            w16(&mut out, 0);
+            w32(&mut out, crc);
+            w32(&mut out, e.stored.len() as u32);
+            w32(&mut out, e.uncomp as u32);
+            w16(&mut out, e.name.len() as u16);
+            w16(&mut out, 0);
+            out.extend_from_slice(e.name.as_bytes());
+            out.extend_from_slice(e.stored);
+
+            w32(&mut central, SIG_CDE);
+            w16(&mut central, 20);
+            w16(&mut central, 20);
+            w16(&mut central, 0);
+            w16(&mut central, e.method);
+            w16(&mut central, 0);
+            w16(&mut central, 0);
+            w32(&mut central, crc);
+            w32(&mut central, e.stored.len() as u32);
+            w32(&mut central, e.uncomp as u32);
+            w16(&mut central, e.name.len() as u16);
+            w16(&mut central, 0);
+            w16(&mut central, 0);
+            w16(&mut central, 0);
+            w16(&mut central, 0);
+            w32(&mut central, 0);
+            w32(&mut central, local_off);
+            central.extend_from_slice(e.name.as_bytes());
+        }
+        let cd_off = out.len() as u32;
+        let cd_size = central.len() as u32;
+        out.extend_from_slice(&central);
+        w32(&mut out, SIG_EOCD);
+        w16(&mut out, 0);
+        w16(&mut out, 0);
+        w16(&mut out, entries.len() as u16);
+        w16(&mut out, entries.len() as u16);
+        w32(&mut out, cd_size);
+        w32(&mut out, cd_off);
+        w16(&mut out, 0);
+        out
+    }
+
+    /// RFC 1951 stored-block Deflate stream (BFINAL on the last block).
+    fn deflate_stored_blocks(data: &[u8]) -> Vec<u8> {
+        let mut out = Vec::new();
+        if data.is_empty() {
+            out.extend_from_slice(&[0x01, 0, 0, 0xff, 0xff]);
+            return out;
+        }
+        let count = data.len().div_ceil(65_535);
+        for (i, chunk) in data.chunks(65_535).enumerate() {
+            out.push(u8::from(i + 1 == count));
+            let len = chunk.len() as u16;
+            out.extend_from_slice(&len.to_le_bytes());
+            out.extend_from_slice(&(!len).to_le_bytes());
+            out.extend_from_slice(chunk);
+        }
+        out
+    }
+
+    fn stored<'a>(name: &'a str, plain: &'a [u8]) -> Fix<'a> {
+        Fix {
+            name,
+            method: METHOD_STORED,
+            stored: plain,
+            plain,
+            uncomp: plain.len(),
+        }
+    }
+
+    fn deflated<'a>(name: &'a str, plain: &'a [u8], comp: &'a [u8]) -> Fix<'a> {
+        Fix {
+            name,
+            method: METHOD_DEFLATE,
+            stored: comp,
+            plain,
+            uncomp: plain.len(),
+        }
+    }
+
+    #[test]
+    fn slice_index_reads_stored_and_deflated_members() {
+        let stored_data = b"stored payload".to_vec();
+        let plain = b"deflated payload bytes".to_vec();
+        let comp = deflate_stored_blocks(&plain);
+        let zip = build_zip(&[
+            stored("assets/x/a.ogg", &stored_data),
+            deflated("assets/x/b.ogg", &plain, &comp),
+            stored("assets/x/dir/", &[]),
+        ]);
+
+        let idx = ZipSliceIndex::open(&zip).unwrap();
+        assert_eq!(idx.entries().len(), 2);
+        assert!(idx.bytes_read_for_index() > 0);
+        assert_eq!(idx.bytes(), zip.as_slice());
+        assert_eq!(
+            idx.read_entry("assets/x/a.ogg", MAX_OGG_BYTES).unwrap(),
+            stored_data
+        );
+        assert_eq!(
+            idx.read_entry("assets/x/b.ogg", MAX_OGG_BYTES).unwrap(),
+            plain
+        );
+        let meta = idx
+            .entries()
+            .iter()
+            .find(|e| e.name == "assets/x/a.ogg")
+            .unwrap();
+        assert_eq!(meta.archive_id, 0);
+        assert_eq!(meta.crc32, crate::hash::crc32_ieee(b"stored payload"));
+        assert_eq!(u32le(&zip, meta.central_header_offset as usize), SIG_CDE);
+        assert!(matches!(
+            idx.read_entry("assets/x/missing.ogg", MAX_OGG_BYTES),
+            Err(ZipError::EntryNotFound(_))
+        ));
+    }
+
+    #[test]
+    fn slice_index_rejects_traversal_names_and_corrupt_eocd() {
+        for bad in ["../evil", "a/./b", "a\\b", "C:evil", "a\0b"] {
+            let zip = build_zip(&[stored(bad, &[1])]);
+            assert!(
+                matches!(
+                    ZipSliceIndex::open(&zip),
+                    Err(ZipError::InvalidEntryName(_))
+                ),
+                "expected traversal reject for {bad:?}"
+            );
+        }
+
+        let good = build_zip(&[stored("a.txt", &[7])]);
+        for cut in [0usize, 4, good.len() - 10, good.len() - 1] {
+            assert!(
+                ZipSliceIndex::open(&good[..cut]).is_err(),
+                "truncated at {cut} must fail closed"
+            );
+        }
+        assert!(matches!(
+            ZipSliceIndex::open(b"not a zip at all"),
+            Err(ZipError::NotZipArchive)
+        ));
+        // Corrupt the EOCD signature: indexing must fail closed.
+        let mut garbage = good.clone();
+        garbage[good.len() - 22] = 0;
+        assert!(matches!(
+            ZipSliceIndex::open(&garbage),
+            Err(ZipError::NotZipArchive)
+        ));
+        // Corrupt a Central Directory signature: parsing must fail closed.
+        let mut bad_cd = good.clone();
+        let cd_off = u32le(&good, good.len() - 6) as usize;
+        bad_cd[cd_off] = 0;
+        assert!(ZipSliceIndex::open(&bad_cd).is_err());
+    }
+
+    #[test]
+    fn slice_index_enforces_entry_and_output_caps() {
+        // Declared 100 KiB, real stream expands to 200 KiB: the output cap
+        // must trip before the declared size does.
+        let bomb_data = vec![0xCDu8; 200 * 1024];
+        let comp = deflate_stored_blocks(&bomb_data);
+        let mut bomb = deflated("assets/x/bomb.ogg", &bomb_data, &comp);
+        bomb.uncomp = 100 * 1024;
+        let zip = build_zip(&[bomb]);
+        let idx = ZipSliceIndex::open(&zip).unwrap();
+        assert!(matches!(
+            idx.read_entry("assets/x/bomb.ogg", 64 * 1024),
+            Err(ZipError::EntryTooLarge { .. })
+        ));
+        assert!(matches!(
+            idx.read_entry("assets/x/bomb.ogg", 150 * 1024),
+            Err(ZipError::OutputCapExceeded)
+        ));
     }
 }

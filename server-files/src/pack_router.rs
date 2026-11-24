@@ -1,14 +1,16 @@
 // SPDX-License-Identifier: LGPL-3.0-or-later OR GPL-3.0-or-later OR AGPL-3.0-or-later
 //! Bounded, read-only ZIP inspection and capability routing for untrusted packs.
 //!
-//! Every member is verified against the central directory and its CRC before a
-//! route is returned. ZIP64, split archives, encryption, non-file members and
-//! unsupported compression methods are quarantined. No filesystem writes occur.
+//! EOCD and Central Directory parsing is delegated to the canonical
+//! [`megu_core::zip_archive::ZipSliceIndex`]; every member is then verified
+//! against its declared CRC before a route is returned. Encryption,
+//! non-file members, unsupported compression methods, unsafe extra fields,
+//! and local/central metadata disagreement are quarantined. No filesystem
+//! writes occur.
 
 #![deny(unsafe_code)]
 
 use std::collections::{BTreeMap, HashMap, HashSet};
-use std::ops::Range;
 
 pub const MAX_ENTRIES: usize = 65_536;
 pub const MAX_TOTAL_UNCOMPRESSED: u64 = 512 * 1024 * 1024;
@@ -141,7 +143,13 @@ fn quarantine(
 /// capabilities are advisory until the entire archive has passed validation.
 pub fn inspect_and_route_pack(zip_bytes: &[u8], policy: &PackRouterPolicy) -> PackRoutingReport {
     let mut capabilities = PackCapabilities::default();
-    let entries = match parse_archive(zip_bytes, policy) {
+    let index = match megu_core::zip_archive::ZipSliceIndex::open(zip_bytes) {
+        Ok(index) => index,
+        Err(problem) => {
+            return quarantine(PackKind::Unknown, capabilities, vec![zip_index_problem(&problem)])
+        }
+    };
+    let entries = match parse_archive(zip_bytes, &index, policy) {
         Ok(entries) => entries,
         Err(problem) => return quarantine(PackKind::Unknown, capabilities, vec![problem]),
     };
@@ -150,9 +158,6 @@ pub fn inspect_and_route_pack(zip_bytes: &[u8], policy: &PackRouterPolicy) -> Pa
     let mut function_sources = BTreeMap::new();
     for entry in &entries {
         capabilities.observe(&entry.name);
-        if entry.name.ends_with('/') {
-            continue;
-        }
         let lower = entry.name.to_ascii_lowercase();
         if is_executable(&lower) {
             threats.push(threat(
@@ -161,7 +166,7 @@ pub fn inspect_and_route_pack(zip_bytes: &[u8], policy: &PackRouterPolicy) -> Pa
                 "executable or script member",
             ));
         }
-        let data = match read_member(zip_bytes, entry) {
+        let data = match read_member(&index, entry) {
             Ok(data) => data,
             Err(problem) => {
                 threats.push(problem);
@@ -361,10 +366,29 @@ fn be32(bytes: &[u8], offset: usize) -> Option<u32> {
 #[derive(Debug)]
 struct Entry {
     name: String,
-    method: u16,
-    compressed: Range<usize>,
-    uncompressed_len: usize,
     crc: u32,
+}
+
+/// Map a canonical index-open failure onto the quarantine surface. Unsafe
+/// names and encrypted members keep their dedicated threat kinds; every
+/// other structural failure is an unsupported-archive threat.
+fn zip_index_problem(error: &megu_core::zip_archive::ZipError) -> PackThreat {
+    use megu_core::zip_archive::ZipError as Z;
+    match error {
+        Z::Encrypted(name) => unsupported(name, "encrypted entry"),
+        Z::InvalidEntryName(name) => {
+            threat(PackThreatKind::PathTraversal, name, "unsafe ZIP entry path")
+        }
+        // A saturated 32-bit Central Directory field declares a member of at
+        // least 4 GiB; without a ZIP64 extra field the canonical index
+        // rejects it, and the pack policy classifies that as a size bomb.
+        Z::Malformed("missing ZIP64 extra field") => threat(
+            PackThreatKind::ZipBomb,
+            "<archive>",
+            "member declares a saturated ZIP64 size without ZIP64 metadata",
+        ),
+        other => unsupported("<archive>", other.to_string()),
+    }
 }
 
 fn bytes_at(bytes: &[u8], offset: usize, count: usize) -> Option<&[u8]> {
@@ -419,118 +443,79 @@ fn validate_name(name: &str) -> Result<(), PackThreatKind> {
     Ok(())
 }
 
-fn parse_archive(zip: &[u8], policy: &PackRouterPolicy) -> Result<Vec<Entry>, PackThreat> {
+/// Validate every indexed member against pack policy. EOCD/Central
+/// Directory structure comes from the canonical
+/// [`megu_core::zip_archive::ZipSliceIndex`]; the fixed Central Directory
+/// header is re-read per member only for the policy fields the canonical
+/// index does not model (flags, made-by, external attributes, disk start,
+/// extra fields), and the Local File Header is cross-checked for
+/// local/central disagreement.
+fn parse_archive(
+    zip: &[u8],
+    index: &megu_core::zip_archive::ZipSliceIndex<'_>,
+    policy: &PackRouterPolicy,
+) -> Result<Vec<Entry>, PackThreat> {
     let invalid = |why| unsupported("<archive>", why);
-    if zip.len() < 22 {
-        return Err(invalid("missing ZIP end-of-central-directory record"));
-    }
-    let earliest = zip.len().saturating_sub(22 + 65_535);
-    let eocd = (earliest..=zip.len() - 22)
-        .rev()
-        .find(|&at| {
-            le32(zip, at) == Some(0x0605_4b50)
-                && le16(zip, at + 20)
-                    .is_some_and(|comment| at + 22 + usize::from(comment) == zip.len())
-        })
-        .ok_or_else(|| invalid("missing valid ZIP end-of-central-directory record"))?;
-    let disk = le16(zip, eocd)
-        .and_then(|_| le16(zip, eocd + 4))
-        .ok_or_else(|| invalid("truncated EOCD"))?;
-    let cd_disk = le16(zip, eocd + 6).ok_or_else(|| invalid("truncated EOCD"))?;
-    let disk_entries = le16(zip, eocd + 8).ok_or_else(|| invalid("truncated EOCD"))?;
-    let count = usize::from(le16(zip, eocd + 10).ok_or_else(|| invalid("truncated EOCD"))?);
-    let cd_size = le32(zip, eocd + 12).ok_or_else(|| invalid("truncated EOCD"))? as usize;
-    let cd_start = le32(zip, eocd + 16).ok_or_else(|| invalid("truncated EOCD"))? as usize;
-    if disk != 0
-        || cd_disk != 0
-        || usize::from(disk_entries) != count
-        || count > MAX_ENTRIES
-        || count == usize::from(u16::MAX)
-        || cd_size == u32::MAX as usize
-        || cd_start == u32::MAX as usize
-        || cd_start.checked_add(cd_size) != Some(eocd)
-    {
-        return Err(if count > MAX_ENTRIES {
-            threat(PackThreatKind::ZipBomb, "<archive>", "too many ZIP entries")
-        } else {
-            invalid("multi-disk/ZIP64 archive or inconsistent directory offsets")
-        });
-    }
-    let mut entries = Vec::with_capacity(count);
-    let mut ranges = Vec::with_capacity(count);
+    let cap = policy
+        .max_total_uncompressed_bytes
+        .min(MAX_TOTAL_UNCOMPRESSED);
+    let mut entries = Vec::new();
     let mut seen = HashSet::new();
     let mut total = 0u64;
-    let mut cursor = cd_start;
-    for _ in 0..count {
-        if le32(zip, cursor) != Some(0x0201_4b50) || bytes_at(zip, cursor, 46).is_none() {
-            return Err(invalid("invalid central-directory entry"));
+    for meta in index.entries() {
+        // Only top-level members are pack content; Jar-in-Jar children are
+        // not part of the pack layout.
+        if meta.archive_id != 0 {
+            continue;
         }
-        let made_by =
-            le16(zip, cursor + 4).ok_or_else(|| invalid("truncated central directory"))?;
-        let flags = le16(zip, cursor + 8).ok_or_else(|| invalid("truncated central directory"))?;
-        let method =
-            le16(zip, cursor + 10).ok_or_else(|| invalid("truncated central directory"))?;
-        let crc = le32(zip, cursor + 16).ok_or_else(|| invalid("truncated central directory"))?;
-        let compressed_size =
-            le32(zip, cursor + 20).ok_or_else(|| invalid("truncated central directory"))?;
-        let size = le32(zip, cursor + 24).ok_or_else(|| invalid("truncated central directory"))?;
-        let name_len = usize::from(
-            le16(zip, cursor + 28).ok_or_else(|| invalid("truncated central directory"))?,
-        );
-        let extra_len = usize::from(
-            le16(zip, cursor + 30).ok_or_else(|| invalid("truncated central directory"))?,
-        );
-        let comment_len = usize::from(
-            le16(zip, cursor + 32).ok_or_else(|| invalid("truncated central directory"))?,
-        );
-        let disk_start =
-            le16(zip, cursor + 34).ok_or_else(|| invalid("truncated central directory"))?;
-        let external =
-            le32(zip, cursor + 38).ok_or_else(|| invalid("truncated central directory"))?;
-        let local =
-            le32(zip, cursor + 42).ok_or_else(|| invalid("truncated central directory"))? as usize;
-        let name_bytes =
-            bytes_at(zip, cursor + 46, name_len).ok_or_else(|| invalid("truncated entry name"))?;
-        let name = std::str::from_utf8(name_bytes)
-            .map_err(|_| invalid("non-UTF-8 entry name"))?
-            .to_owned();
-        let extra = bytes_at(zip, cursor + 46 + name_len, extra_len)
-            .ok_or_else(|| unsupported(&name, "truncated extra fields"))?;
-        extra_fields(extra).map_err(|why| unsupported(&name, why))?;
-        cursor = cursor
-            .checked_add(46 + name_len + extra_len + comment_len)
-            .ok_or_else(|| unsupported(&name, "central-directory offset overflow"))?;
-        if cursor > eocd {
-            return Err(unsupported(
-                &name,
-                "central-directory entry exceeds directory",
-            ));
-        }
+        let name = meta.name.clone();
         if let Err(kind) = validate_name(&name) {
             return Err(threat(kind, &name, "unsafe ZIP entry path"));
         }
         if !seen.insert(name.to_ascii_lowercase()) {
             return Err(unsupported(&name, "duplicate or case-colliding ZIP entry"));
         }
+
+        // Policy fields live in the raw Central Directory record, addressed
+        // by the canonical index's recorded header offset.
+        let cd_at = usize::try_from(meta.central_header_offset)
+            .map_err(|_| invalid("central header offset overflow"))?;
+        let fixed = bytes_at(zip, cd_at, 46)
+            .ok_or_else(|| unsupported(&name, "truncated central directory"))?;
+        if le32(fixed, 0) != Some(0x0201_4b50) {
+            return Err(unsupported(&name, "central directory record mismatch"));
+        }
+        let made_by = le16(fixed, 4).ok_or_else(|| invalid("truncated central directory"))?;
+        let flags = le16(fixed, 8).ok_or_else(|| invalid("truncated central directory"))?;
+        let disk_start =
+            le16(fixed, 34).ok_or_else(|| invalid("truncated central directory"))?;
+        let external =
+            le32(fixed, 38).ok_or_else(|| invalid("truncated central directory"))?;
+        let name_len = usize::from(
+            le16(fixed, 28).ok_or_else(|| invalid("truncated central directory"))?,
+        );
+        let extra_len = usize::from(
+            le16(fixed, 30).ok_or_else(|| invalid("truncated central directory"))?,
+        );
+        let extra = bytes_at(zip, cd_at + 46 + name_len, extra_len)
+            .ok_or_else(|| unsupported(&name, "truncated extra fields"))?;
+        extra_fields(extra).map_err(|why| unsupported(&name, why))?;
+
+        let method = meta.compression_method;
+        let compressed_u64 = meta.compressed_size;
+        let size_u64 = meta.uncompressed_size;
         let mode = (external >> 16) & 0xf000;
         if disk_start != 0
             || flags & !(0x0800 | 0x0008 | 0x0006) != 0
             || flags & 0x0006 != 0
             || !matches!(method, 0 | 8)
-            || ((made_by >> 8) == 3
-                && mode != 0
-                && mode != if name.ends_with('/') { 0x4000 } else { 0x8000 })
+            || ((made_by >> 8) == 3 && mode != 0 && mode != 0x8000)
         {
             return Err(unsupported(
                 &name,
                 "encrypted, unsupported compression, flags, or special file",
             ));
         }
-        let compressed_u64 = u64::from(compressed_size);
-        let size_u64 = u64::from(size);
-        let cap = policy
-            .max_total_uncompressed_bytes
-            .min(MAX_TOTAL_UNCOMPRESSED);
         total = total.checked_add(size_u64).ok_or_else(|| {
             threat(
                 PackThreatKind::ZipBomb,
@@ -543,7 +528,7 @@ fn parse_archive(zip: &[u8], policy: &PackRouterPolicy) -> Result<Vec<Entry>, Pa
             || size_u64
                 > compressed_u64
                     .saturating_mul(policy.max_compression_ratio.min(MAX_COMPRESSION_RATIO))
-            || (compressed_size == 0 && size != 0)
+            || (compressed_u64 == 0 && size_u64 != 0)
         {
             return Err(threat(
                 PackThreatKind::ZipBomb,
@@ -551,11 +536,16 @@ fn parse_archive(zip: &[u8], policy: &PackRouterPolicy) -> Result<Vec<Entry>, Pa
                 "uncompressed size or compression ratio exceeds policy",
             ));
         }
-        if (name.ends_with('/') && (compressed_size != 0 || size != 0))
-            || (method == 0 && compressed_size != size)
-        {
-            return Err(unsupported(&name, "invalid directory or stored size"));
+        if method == 0 && compressed_u64 != size_u64 {
+            return Err(unsupported(&name, "invalid stored size"));
         }
+
+        // Local File Header cross-check: flags, method, name bytes, extra
+        // fields and the CRC/size fields must agree with the Central
+        // Directory (zeroed fields are tolerated only under the data-
+        // descriptor flag).
+        let local = usize::try_from(meta.local_header_offset)
+            .map_err(|_| unsupported(&name, "local header offset overflow"))?;
         if le32(zip, local) != Some(0x0403_4b50) {
             return Err(unsupported(&name, "missing matching local-file header"));
         }
@@ -571,7 +561,7 @@ fn parse_archive(zip: &[u8], policy: &PackRouterPolicy) -> Result<Vec<Entry>, Pa
         );
         if local_flags != flags
             || local_method != method
-            || bytes_at(zip, local + 30, local_name_len) != Some(name_bytes)
+            || bytes_at(zip, local + 30, local_name_len) != Some(name.as_bytes())
         {
             return Err(unsupported(
                 &name,
@@ -588,81 +578,59 @@ fn parse_archive(zip: &[u8], policy: &PackRouterPolicy) -> Result<Vec<Entry>, Pa
         let local_size =
             le32(zip, local + 22).ok_or_else(|| unsupported(&name, "truncated local header"))?;
         if (flags & 8 == 0
-            && (local_crc != crc || local_compressed != compressed_size || local_size != size))
+            && (local_crc != meta.crc32
+                || u64::from(local_compressed) != compressed_u64
+                || u64::from(local_size) != size_u64))
             || (flags & 8 != 0
-                && (local_crc != 0 && local_crc != crc
-                    || local_compressed != 0 && local_compressed != compressed_size
-                    || local_size != 0 && local_size != size))
+                && (local_crc != 0 && local_crc != meta.crc32
+                    || local_compressed != 0 && u64::from(local_compressed) != compressed_u64
+                    || local_size != 0 && u64::from(local_size) != size_u64))
         {
             return Err(unsupported(
                 &name,
                 "local and central sizes or CRC disagree",
             ));
         }
-        let start = local
+        // The member's compressed payload must end exactly at the declared
+        // boundary, and a data descriptor (general-purpose flag bit 3) must
+        // repeat the Central Directory CRC and sizes.
+        let compressed_usize = usize::try_from(compressed_u64)
+            .map_err(|_| unsupported(&name, "member size overflow"))?;
+        let data_start = local
             .checked_add(30 + local_name_len + local_extra_len)
             .ok_or_else(|| unsupported(&name, "local-header offset overflow"))?;
-        let end = start
-            .checked_add(compressed_size as usize)
+        let data_end = data_start
+            .checked_add(compressed_usize)
             .ok_or_else(|| unsupported(&name, "member offset overflow"))?;
-        if end > cd_start {
-            return Err(unsupported(&name, "member overlaps central directory"));
+        if data_end > zip.len() {
+            return Err(unsupported(&name, "member out of range"));
         }
-        let mut record_end = end;
         if flags & 8 != 0 {
-            let has_signature = le32(zip, end) == Some(0x0807_4b50);
-            let descriptor = end + if has_signature { 4 } else { 0 };
-            if le32(zip, descriptor) != Some(crc)
-                || le32(zip, descriptor + 4) != Some(compressed_size)
-                || le32(zip, descriptor + 8) != Some(size)
+            let has_signature = le32(zip, data_end) == Some(0x0807_4b50);
+            let descriptor = data_end + usize::from(has_signature) * 4;
+            if le32(zip, descriptor) != Some(meta.crc32)
+                || le32(zip, descriptor + 4) != u32::try_from(compressed_u64).ok()
+                || le32(zip, descriptor + 8) != u32::try_from(size_u64).ok()
             {
                 return Err(unsupported(&name, "invalid data descriptor"));
             }
-            record_end = descriptor + 12;
         }
-        if record_end > cd_start {
-            return Err(unsupported(
-                &name,
-                "member record overlaps central directory",
-            ));
-        }
-        ranges.push((local, record_end));
         entries.push(Entry {
             name,
-            method,
-            compressed: start..end,
-            uncompressed_len: size as usize,
-            crc,
+            crc: meta.crc32,
         });
-    }
-    if cursor != eocd {
-        return Err(invalid("unaccounted central-directory bytes"));
-    }
-    ranges.sort_unstable();
-    let mut end = 0usize;
-    for (start, next_end) in ranges {
-        if start != end {
-            return Err(invalid("overlapping ZIP records or unreferenced payload"));
-        }
-        end = next_end;
-    }
-    if end != cd_start {
-        return Err(invalid("unreferenced bytes before central directory"));
     }
     Ok(entries)
 }
 
-fn read_member(zip: &[u8], entry: &Entry) -> Result<Vec<u8>, PackThreat> {
-    let input = zip
-        .get(entry.compressed.clone())
-        .ok_or_else(|| unsupported(&entry.name, "member out of range"))?;
-    let data = if entry.method == 0 {
-        input.to_vec()
-    } else {
-        crate::pack_loader::inflate_raw(input, entry.uncompressed_len)
-            .map_err(|why| unsupported(&entry.name, format!("invalid DEFLATE member: {why}")))?
-    };
-    if data.len() != entry.uncompressed_len || crc32(&data) != entry.crc {
+fn read_member(
+    index: &megu_core::zip_archive::ZipSliceIndex<'_>,
+    entry: &Entry,
+) -> Result<Vec<u8>, PackThreat> {
+    let data = index
+        .read_entry(&entry.name, MAX_TOTAL_UNCOMPRESSED as usize)
+        .map_err(|error| unsupported(&entry.name, format!("invalid member: {error}")))?;
+    if crc32(&data) != entry.crc {
         return Err(unsupported(
             &entry.name,
             "uncompressed size or CRC32 mismatch",
@@ -856,3 +824,4 @@ fn detect_graph_issue(
     }
     Ok(())
 }
+
