@@ -4,11 +4,12 @@
 use crate::generation_math::Lcg;
 use std::collections::BTreeMap;
 
-// Minimal JSON value + parser for the generic loot evaluator. The module-layer
-// ratchet forbids adding a `chest_loot -> json` source edge, so this stays
-// private here rather than reusing `crate::json`. It accepts the subset vanilla
-// loot tables use: objects, arrays, strings (with basic escapes), numbers and
-// the true/false/null literals.
+// Minimal JSON value + parser for the generic loot evaluator. The
+// module-layer ratchet forbids adding a `chest_loot -> json` source edge, so
+// the canonical `megu_core::json` reader is used directly and lowered into
+// the private `J` shape below. It accepts the subset vanilla loot tables use:
+// objects, arrays, strings (with basic escapes), numbers and the
+// true/false/null literals.
 #[allow(dead_code)]
 #[derive(Clone, Debug)]
 pub(crate) enum J {
@@ -46,141 +47,41 @@ impl J {
     }
 }
 
-#[allow(dead_code)]
-struct LootJsonParser<'a> {
-    bytes: &'a [u8],
-    pos: usize,
-}
+/// Bounds for loot-table documents: operator-supplied datapack JSON, so
+/// node/byte ceilings stay off; the depth cap keeps the canonical recursive
+/// reader fail-closed where the retired cursor recursed unbounded.
+const LOOT_JSON_LIMITS: megu_core::json::JsonLimits = megu_core::json::JsonLimits {
+    max_depth: 128,
+    max_nodes: usize::MAX,
+    max_bytes: usize::MAX,
+};
 
-#[allow(dead_code)]
-impl<'a> LootJsonParser<'a> {
-    fn ws(&mut self) {
-        while matches!(self.bytes.get(self.pos), Some(b) if b.is_ascii_whitespace()) {
-            self.pos += 1;
-        }
-    }
-
-    fn string(&mut self) -> Option<String> {
-        if self.bytes.get(self.pos) != Some(&b'"') {
-            return None;
-        }
-        self.pos += 1;
-        let mut out = String::new();
-        loop {
-            let b = *self.bytes.get(self.pos)?;
-            self.pos += 1;
-            match b {
-                b'"' => return Some(out),
-                b'\\' => {
-                    let escaped = *self.bytes.get(self.pos)?;
-                    self.pos += 1;
-                    out.push(match escaped {
-                        b'n' => '\n',
-                        b't' => '\t',
-                        b'r' => '\r',
-                        b'u' => {
-                            let hex = self.bytes.get(self.pos..self.pos + 4)?;
-                            self.pos += 4;
-                            let hex = std::str::from_utf8(hex).ok()?;
-                            char::from_u32(u32::from_str_radix(hex, 16).ok()?)?
-                        }
-                        other => other as char,
-                    });
-                }
-                other => out.push(other as char),
-            }
-        }
-    }
-
-    fn value(&mut self) -> Option<J> {
-        self.ws();
-        match *self.bytes.get(self.pos)? {
-            b'{' => {
-                self.pos += 1;
-                let mut fields = Vec::new();
-                loop {
-                    self.ws();
-                    if self.bytes.get(self.pos) == Some(&b'}') {
-                        self.pos += 1;
-                        return Some(J::Obj(fields));
-                    }
-                    let key = self.string()?;
-                    self.ws();
-                    if self.bytes.get(self.pos) != Some(&b':') {
-                        return None;
-                    }
-                    self.pos += 1;
-                    let value = self.value()?;
-                    fields.push((key, value));
-                    self.ws();
-                    match self.bytes.get(self.pos) {
-                        Some(b',') => self.pos += 1,
-                        Some(b'}') => {
-                            self.pos += 1;
-                            return Some(J::Obj(fields));
-                        }
-                        _ => return None,
-                    }
-                }
-            }
-            b'[' => {
-                self.pos += 1;
-                let mut items = Vec::new();
-                loop {
-                    self.ws();
-                    if self.bytes.get(self.pos) == Some(&b']') {
-                        self.pos += 1;
-                        return Some(J::Arr(items));
-                    }
-                    items.push(self.value()?);
-                    self.ws();
-                    match self.bytes.get(self.pos) {
-                        Some(b',') => self.pos += 1,
-                        Some(b']') => {
-                            self.pos += 1;
-                            return Some(J::Arr(items));
-                        }
-                        _ => return None,
-                    }
-                }
-            }
-            b'"' => self.string().map(J::Str),
-            b't' => {
-                self.pos += 4;
-                Some(J::Num(1.0))
-            }
-            b'f' => {
-                self.pos += 5;
-                Some(J::Num(0.0))
-            }
-            b'n' => {
-                self.pos += 4;
-                Some(J::Null)
-            }
-            _ => {
-                let start = self.pos;
-                while matches!(
-                    self.bytes.get(self.pos),
-                    Some(b'-' | b'+' | b'.' | b'e' | b'E' | b'0'..=b'9')
-                ) {
-                    self.pos += 1;
-                }
-                if start == self.pos {
-                    return None;
-                }
-                std::str::from_utf8(&self.bytes[start..self.pos])
-                    .ok()?
-                    .parse()
-                    .ok()
-                    .map(J::Num)
-            }
-        }
+/// Lower the canonical [`megu_core::json::JsonValue`] tree into `J`.
+/// `true`/`false` surface as `Num(1.0)`/`Num(0.0)` exactly as the retired
+/// cursor spelled them, so `jbool`/`jnum` callers see no change.
+fn lower_json(value: megu_core::json::JsonValue) -> J {
+    use megu_core::json::JsonValue as Core;
+    match value {
+        Core::Null => J::Null,
+        Core::Bool(b) => J::Num(if b { 1.0 } else { 0.0 }),
+        Core::Number(n) => J::Num(n),
+        Core::String(s) => J::Str(s),
+        Core::Array(items) => J::Arr(items.into_iter().map(lower_json).collect()),
+        Core::Object(pairs) => J::Obj(
+            pairs
+                .into_iter()
+                .map(|(k, v)| (k, lower_json(v)))
+                .collect(),
+        ),
     }
 }
 
 #[allow(dead_code)]
 pub(crate) fn jparse(bytes: &[u8]) -> Option<J> {
-    LootJsonParser { bytes, pos: 0 }.value()
+    let text = std::str::from_utf8(bytes).ok()?;
+    megu_core::json::parse_json_with_limits(text, LOOT_JSON_LIMITS, false)
+        .ok()
+        .map(lower_json)
 }
 
 pub(crate) fn js<'a>(j: &'a J, key: &str) -> Option<&'a J> {

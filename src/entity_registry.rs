@@ -430,28 +430,12 @@ pub(crate) struct EntityPersistRecord {
     pub variant: Option<String>,
 }
 
-// IEEE CRC32 (poly 0xEDB88320) over the whole ENT2 frame before the trailer.
-const CRC32_TABLE: [u32; 256] = {
-    let mut table = [0u32; 256];
-    let mut i = 0;
-    while i < 256 {
-        let mut c = i as u32;
-        let mut bit = 0;
-        while bit < 8 {
-            c = if c & 1 != 0 { 0xEDB8_8320 ^ (c >> 1) } else { c >> 1 };
-            bit += 1;
-        }
-        table[i] = c;
-        i += 1;
-    }
-    table
-};
-
+// IEEE CRC32 (poly 0xEDB88320) over the whole ENT2 frame before the trailer,
+// via the canonical `megu_core::hash::crc32_ieee` (init/final `!0`, identical
+// to the fold this replaces).
 #[cfg_attr(not(test), allow(dead_code))]
 fn persist_crc32(bytes: &[u8]) -> u32 {
-    bytes.iter().fold(!0u32, |crc, &b| {
-        CRC32_TABLE[(crc ^ u32::from(b)) as u8 as usize] ^ (crc >> 8)
-    }) ^ !0
+    megu_core::hash::crc32_ieee(bytes)
 }
 
 /// A namespaced `namespace:path` id. Vanilla ResourceLocation syntax:
