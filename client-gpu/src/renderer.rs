@@ -13,72 +13,69 @@ use std::time::Instant;
 
 use bytemuck::{Pod, Zeroable};
 use megu_client::shaders::{
-    validate_wgsl_module, WgslStage, TERRAIN_OPAQUE_WGSL, TERRAIN_TRANSLUCENT_WGSL,
+    TERRAIN_OPAQUE_WGSL, TERRAIN_TRANSLUCENT_WGSL, WgslStage, validate_wgsl_module,
 };
 use megu_client::world::WorldState;
 use megu_client_mesh::atlas::{AtlasMip, AtlasTileRect, PackedAtlas, SpriteAnimation};
 use megu_client_mesh::ber_instancing::{VanillaParticleQuad, VanillaParticleWorld};
 use megu_client_mesh::builtin_shadow_wgsl::{
-    build_shadow_uniforms_celestial, compute_cascade_splits, compute_region_light_mask,
-    compute_sun_direction, negotiate_builtin_shadow_quality, pack_vfx1_lights,
-    BuiltinShadowQuality, CascadeConfig,
-    DirtyOnlyShadowCache, EclipseMode, RenderScalePreset, ShadowCacheDecision, ShadowCamera,
-    ShadowDirtyReason, ShadowUniforms, MEGU_SHADOW_CASTERS_WGSL, MEGU_SHADOW_CUTOUT_DEPTH_WGSL,
-    MEGU_SHADOW_DEPTH_WGSL, MEGU_SHADOW_SAMPLING_WGSL, MEGU_SKY_ATMOSPHERE_WGSL,
-    MEGU_SPATIAL_SHARPEN_WGSL, MEGU_STAINED_GLASS_SHADOW_COLOR_WGSL, MEGU_TERRAIN_LIT_WGSL,
-    MEGU_WATER_SURFACE_WGSL, VfxLightUniforms,
+    BuiltinShadowQuality, CascadeConfig, DirtyOnlyShadowCache, EclipseMode,
+    MEGU_SHADOW_CASTERS_WGSL, MEGU_SHADOW_CUTOUT_DEPTH_WGSL, MEGU_SHADOW_DEPTH_WGSL,
+    MEGU_SHADOW_SAMPLING_WGSL, MEGU_SKY_ATMOSPHERE_WGSL, MEGU_SPATIAL_SHARPEN_WGSL,
+    MEGU_STAINED_GLASS_SHADOW_COLOR_WGSL, MEGU_TERRAIN_LIT_WGSL, MEGU_WATER_SURFACE_WGSL,
+    RenderScalePreset, ShadowCacheDecision, ShadowCamera, ShadowDirtyReason, ShadowUniforms,
+    VfxLightUniforms, build_shadow_uniforms_celestial, compute_cascade_splits,
+    compute_region_light_mask, compute_sun_direction, negotiate_builtin_shadow_quality,
+    pack_vfx1_lights,
 };
 use megu_client_mesh::compact_vertex::{
-    CompactVoxelVertex, COMPACT_VERTEX_MAX_EDGE, COMPACT_VERTEX_MAX_STATE_ID,
-    COMPACT_VERTEX_MAX_TINT, COMPACT_VERTEX_MAX_Y_FIXED, COMPACT_VERTEX_WGSL_UNPACK,
+    COMPACT_VERTEX_MAX_EDGE, COMPACT_VERTEX_MAX_STATE_ID, COMPACT_VERTEX_MAX_TINT,
+    COMPACT_VERTEX_MAX_Y_FIXED, COMPACT_VERTEX_WGSL_UNPACK, CompactVoxelVertex,
 };
 use megu_client_mesh::ffi::PackedVertex;
 use megu_client_mesh::vanilla_plus_3d::ExtrudedMesh;
 use megu_client_mesh::vfx_engine::DynamicColoredLight;
 use megu_client_mesh::{
-    box_facing_mask, box_in_frustum, bucket_draw_mask, ChunkUploadBudget, Direction,
-    DirectionBuckets, GraphCuller, HiZPyramid, RenderRegions, SectionCoord, SectionGraph,
-    DIRECTION_BUCKETS, EDGE, REGION_X, REGION_Y, REGION_Z,
+    BackendResolution, GpuCapabilities, GpuShaderCaps, MeguWgslPack, PassKind, PipelineStage,
+    RenderBackendPreference, ShaderPackSource, is_megu_wgsl_pack,
 };
 use megu_client_mesh::{
-    is_megu_wgsl_pack, BackendResolution, GpuCapabilities, GpuShaderCaps, MeguWgslPack, PassKind,
-    PipelineStage, RenderBackendPreference, ShaderPackSource,
+    ChunkUploadBudget, DIRECTION_BUCKETS, Direction, DirectionBuckets, EDGE, GraphCuller,
+    HiZPyramid, REGION_X, REGION_Y, REGION_Z, RenderRegions, SectionCoord, SectionGraph,
+    box_facing_mask, box_in_frustum, bucket_draw_mask,
 };
 use megu_core::hash::{
-    Fnv1a64, FNV1A64_OFFSET_BASIS as FNV1A_OFFSET, FNV1A64_PRIME as FNV1A_PRIME,
+    FNV1A64_OFFSET_BASIS as FNV1A_OFFSET, FNV1A64_PRIME as FNV1A_PRIME, Fnv1a64,
 };
-use megu_core::math_opt_engine::{
-    morton3d_encode, morton3d_signed, projected_sphere_diameter_px,
-};
+use megu_core::math_opt_engine::{morton3d_encode, morton3d_signed, projected_sphere_diameter_px};
 use megu_core::math_opt_foundation::{LipschitzTileClassifier, TileSignDecision};
 use megu_kernel::debug_chords::DebugLine;
-use megu_kernel::entity_interp::{evaluate_sky_and_fog, SkyFogInput, SkyFogOutput};
-use megu_ui::draw::{font_atlas_rgba, UiMesh, FONT_ATLAS_HEIGHT, FONT_ATLAS_WIDTH};
+use megu_kernel::entity_interp::{SkyFogInput, SkyFogOutput, evaluate_sky_and_fog};
+use megu_ui::draw::{FONT_ATLAS_HEIGHT, FONT_ATLAS_WIDTH, UiMesh, font_atlas_rgba};
 use winit::event_loop::OwnedDisplayHandle;
 
 use crate::atmosphere::{AtmosphereParams, BiomeAtmosphereBlender, ChunkFadeTracker};
 use crate::gpu_hiz::{CullStats, CullUniforms, GpuHizCuller, IndirectArgs, SectionGpuRecord};
 use crate::live_session::hw_adaptive_engine::{
-    detect_universal_hardware_profile, select_compute_strategy, ComputeStrategy,
-    GpuComputeParadigm, MemoryFootprintClass, MemoryTransferStrategy,
+    ComputeStrategy, GpuComputeParadigm, MemoryFootprintClass, MemoryTransferStrategy,
+    detect_universal_hardware_profile, select_compute_strategy,
 };
 use crate::live_session::{ExternalSectionsDelta, LiveSession};
 use crate::mat4_mul;
 use crate::mesh_pool::{
-    build_hiz_stream, compute_opaque_bucket_ranges, HiZSplatSection,
-    MeshJob, MeshJobPool, MeshResult,
+    HiZSplatSection, MeshJob, MeshJobPool, MeshResult, build_hiz_stream,
+    compute_opaque_bucket_ranges,
 };
 use crate::subworld_render::{
-    pack_particle_billboard, CompositeDrawUniforms, CompositeEnvUniforms, DebugLineVertex,
-    ParticleBillboardPack, ParticleInstance, SubWorldGpuCache, SubWorldRenderBank, TerrainVertex,
-    lit_wgsl, VfxLightsGpu, COMPOSITE_TERRAIN_WGSL, DEBUG_LINE_VERTEX_LAYOUT,
-    DEBUG_LINE_WGSL, DRAW_UNIFORM_STRIDE, LIT_VERTEX_LAYOUT, PARTICLE_BILLBOARD_CORNERS,
-    PARTICLE_BILLBOARD_INDICES, PARTICLE_INSTANCE_LAYOUT, PARTICLE_QUAD_LAYOUT,
-    PART_INSTANCE_LAYOUT,
+    COMPOSITE_TERRAIN_WGSL, CompositeDrawUniforms, CompositeEnvUniforms, DEBUG_LINE_VERTEX_LAYOUT,
+    DEBUG_LINE_WGSL, DRAW_UNIFORM_STRIDE, DebugLineVertex, LIT_VERTEX_LAYOUT, PART_INSTANCE_LAYOUT,
+    PARTICLE_BILLBOARD_CORNERS, PARTICLE_BILLBOARD_INDICES, PARTICLE_INSTANCE_LAYOUT,
+    PARTICLE_QUAD_LAYOUT, ParticleBillboardPack, ParticleInstance, SubWorldGpuCache,
+    SubWorldRenderBank, TerrainVertex, VfxLightsGpu, lit_wgsl, pack_particle_billboard,
 };
 use crate::{
-    build_index_buffer, gpu_capabilities_for, gpu_shader_caps_for, negotiate_pipeline,
-    pack_quads_to_vertices, wgpu_backends_for, Camera, DemoScene, Mat4,
+    Camera, DemoScene, Mat4, build_index_buffer, gpu_capabilities_for, gpu_shader_caps_for,
+    negotiate_pipeline, pack_quads_to_vertices, wgpu_backends_for,
 };
 
 // ---------------------------------------------------------------------------
@@ -284,7 +281,8 @@ pub fn request_gpu_device(
         eprintln!(
             "{}: running on a software fallback adapter ({}); \
              expect reduced frame rates",
-            crate::CLIENT_GPU_NAME, report.name
+            crate::CLIENT_GPU_NAME,
+            report.name
         );
     }
     // Opportunistic feature request: `SHADER_F16` unlocks the
@@ -764,7 +762,10 @@ fn pack_input_struct(source: &str, name: &str) -> Option<PackInputStruct> {
     residue.push_str(&body[last..]);
     for line in residue.lines() {
         let line = line.split("//").next().unwrap_or("");
-        if line.trim_matches(|c: char| c.is_whitespace() || c == ',' || c == ';').is_empty() {
+        if line
+            .trim_matches(|c: char| c.is_whitespace() || c == ',' || c == ';')
+            .is_empty()
+        {
             continue;
         }
         return None;
@@ -840,11 +841,11 @@ fn pack_vertex_inputs(source: &str) -> (Vec<PackInputStruct>, Vec<PackFreeEntry>
                     if type_name == "u32" && loc < 4 && !name.is_empty() {
                         free.push((loc, name));
                     }
-                } else if type_name
-                    .chars()
-                    .all(|c| c.is_alphanumeric() || c == '_')
+                } else if type_name.chars().all(|c| c.is_alphanumeric() || c == '_')
                     && !type_name.is_empty()
-                    && structs.iter().all(|s: &PackInputStruct| s.name != type_name)
+                    && structs
+                        .iter()
+                        .all(|s: &PackInputStruct| s.name != type_name)
                 {
                     if let Some(spec) = pack_input_struct(source, type_name) {
                         structs.push(spec);
@@ -895,7 +896,10 @@ pub fn compact_pack_terrain_wgsl(source: &str) -> String {
         let mut ctor_args = String::new();
         for (loc, field) in &spec.fields {
             packed_fields.push_str(&format!("    {field}: u32,\n"));
-            ctor_args.push_str(&format!("pv_words.{}, ", PACK_WORD_BY_LOCATION[*loc as usize]));
+            ctor_args.push_str(&format!(
+                "pv_words.{}, ",
+                PACK_WORD_BY_LOCATION[*loc as usize]
+            ));
         }
         let ctor_args = ctor_args.trim_end_matches(", ");
         out.replace_range(
@@ -939,17 +943,8 @@ pub fn compact_pack_terrain_wgsl(source: &str) -> String {
             }
             let params_src = &out[param_open_rel + 1..sig_close];
             let decl = params_src.split(',').next_back().unwrap_or("").trim();
-            let param = decl
-                .rsplit(')')
-                .next()
-                .unwrap_or(decl)
-                .trim()
-                .to_string();
-            if param.is_empty()
-                || !param
-                    .chars()
-                    .all(|c| c.is_alphanumeric() || c == '_')
-            {
+            let param = decl.rsplit(')').next().unwrap_or(decl).trim().to_string();
+            if param.is_empty() || !param.chars().all(|c| c.is_alphanumeric() || c == '_') {
                 continue;
             }
             let name_start = out[..param_open_rel]
@@ -1044,8 +1039,9 @@ pub fn compact_pack_terrain_wgsl(source: &str) -> String {
             .map(str::trim)
             .filter(|p| !p.is_empty() && !matched.contains(p))
             .collect();
-        let mut new_params =
-            String::from("@location(0) word0: u32, @location(1) word1: u32, @location(2) word2: u32");
+        let mut new_params = String::from(
+            "@location(0) word0: u32, @location(1) word1: u32, @location(2) word2: u32",
+        );
         for p in kept {
             new_params.push_str(", ");
             new_params.push_str(p);
@@ -1158,13 +1154,28 @@ pub fn compact_arena_words(vertex: &PackedVertex, section_word: u32) -> [u32; 3]
 /// `compact_unrepresentable_quads` so the domain check stays observable.
 #[doc(hidden)]
 pub fn stage_compact_verts(scratch: &mut Vec<u8>, verts: &[PackedVertex]) -> u64 {
+    stage_compact_verts_with_smooth_lighting(scratch, verts, true)
+}
+
+/// As [`stage_compact_verts`], with AO attributes flattened when smooth
+/// lighting is disabled. AO occupies bits 3..4 of the packed attributes.
+#[doc(hidden)]
+pub fn stage_compact_verts_with_smooth_lighting(
+    scratch: &mut Vec<u8>,
+    verts: &[PackedVertex],
+    smooth_lighting: bool,
+) -> u64 {
     scratch.clear();
     scratch.reserve(verts.len() * REGION_VERTEX_BYTES);
     let mut bad_quads = 0u64;
     for quad in verts.chunks(4) {
         if quad.iter().all(CompactVoxelVertex::is_representable) {
             for vertex in quad {
-                let compact = CompactVoxelVertex::from_packed(vertex);
+                let mut adjusted = *vertex;
+                if !smooth_lighting {
+                    adjusted.attributes = (adjusted.attributes & !(0x3 << 3)) | (0x3 << 3);
+                }
+                let compact = CompactVoxelVertex::from_packed(&adjusted);
                 scratch.extend_from_slice(&compact.word0.to_ne_bytes());
                 scratch.extend_from_slice(&compact.word1.to_ne_bytes());
                 scratch.extend_from_slice(&compact.word2.to_ne_bytes());
@@ -2197,7 +2208,9 @@ impl RegionArena {
             if needed > self.vertex_capacity {
                 let live_bytes = u64::from(self.flushed_vertex_len) * stride;
                 let slab = slab_vertex_bytes.max(64);
-                let cap_bytes = (needed * REGION_VERTEX_BYTES).max(slab).next_multiple_of(slab);
+                let cap_bytes = (needed * REGION_VERTEX_BYTES)
+                    .max(slab)
+                    .next_multiple_of(slab);
                 self.vertex_capacity = cap_bytes / REGION_VERTEX_BYTES;
                 let new_buffer = device.create_buffer(&wgpu::BufferDescriptor {
                     label: Some("region-arena-vertices"),
@@ -2240,8 +2253,9 @@ impl RegionArena {
                     *byte_offset,
                     bytes,
                 );
-                self.flushed_vertex_len =
-                    self.flushed_vertex_len.max((byte_offset + len) as u32 / stride as u32);
+                self.flushed_vertex_len = self
+                    .flushed_vertex_len
+                    .max((byte_offset + len) as u32 / stride as u32);
                 committed.push(coord);
                 staged += 1;
             }
@@ -2870,8 +2884,7 @@ fn encode_opaque_terrain<'a>(
                             skipped_buckets += 1;
                         }
                         if let Some((start, end, fade_bits)) = run.take() {
-                            let off =
-                                slot(identity, f32::from_bits(fade_bits), 1.0, region_mask);
+                            let off = slot(identity, f32::from_bits(fade_bits), 1.0, region_mask);
                             pass.set_bind_group(1, Some(draw_bg), &[off]);
                             pass.draw_indexed(start..end, 0, 0..1);
                             arena_draws += 1;
@@ -2893,8 +2906,7 @@ fn encode_opaque_terrain<'a>(
                         }
                         _ => {
                             if let Some((start, end, bits)) = run.take() {
-                                let off =
-                                    slot(identity, f32::from_bits(bits), 1.0, region_mask);
+                                let off = slot(identity, f32::from_bits(bits), 1.0, region_mask);
                                 pass.set_bind_group(1, Some(draw_bg), &[off]);
                                 pass.draw_indexed(start..end, 0, 0..1);
                                 arena_draws += 1;
@@ -2940,11 +2952,8 @@ fn encode_opaque_terrain<'a>(
         // one sphere∩AABB pass narrows its light walk to the lights
         // that can actually reach it.
         let edge = EDGE as f32;
-        let section_mask = draw_light_mask(
-            min,
-            [min[0] + edge, min[1] + edge, min[2] + edge],
-            lights,
-        );
+        let section_mask =
+            draw_light_mask(min, [min[0] + edge, min[1] + edge, min[2] + edge], lights);
         match section.opaque_bucket_ranges {
             Some(ranges) => {
                 let draw_mask = section_draw_mask(min, camera_position);
@@ -3559,6 +3568,9 @@ pub struct GpuRenderer {
     pub tbdr_depth_discards: u64,
     /// The active shaderpack hook verdict (or `None` for built-in).
     pub shaderpack: ShaderpackAttempt,
+    /// User brightness multiplier, `50..=200` percent.
+    gamma_pct: u16,
+    smooth_lighting: bool,
     /// Pack-supplied `gbuffers_*` pipelines for Create sub-worlds and
     /// kinetic parts (`None` = built-in `COMPOSITE_LIT_WGSL` path).
     pack_subworld: Option<PackSubworldGpu>,
@@ -3649,11 +3661,7 @@ fn stage_dynamic_geometry(
     ctx.queue
         .write_buffer(&r.indices, 0, bytemuck::cast_slice(indices));
     r.index_count = indices.len() as u32;
-    if allocated {
-        (1, 0)
-    } else {
-        (0, 1)
-    }
+    if allocated { (1, 0) } else { (0, 1) }
 }
 
 /// FNV-1a digest of the staged dynamic geometry draw state — part of the
@@ -3724,11 +3732,7 @@ fn stage_particle_instances(
     ctx.queue
         .write_buffer(&r.buffer, 0, bytemuck::cast_slice(instances));
     r.count = instances.len() as u32;
-    if allocated {
-        (1, 0)
-    } else {
-        (0, 1)
-    }
+    if allocated { (1, 0) } else { (0, 1) }
 }
 
 /// Digest of the staged billboard instance ring — the instanced twin of
@@ -3795,8 +3799,7 @@ fn particle_instancing_supported(device: &wgpu::Device) -> bool {
     let limits = device.limits();
     limits.max_vertex_buffers >= 2
         && limits.max_vertex_attributes >= 8
-        && limits.max_vertex_buffer_array_stride
-            >= std::mem::size_of::<ParticleInstance>() as u32
+        && limits.max_vertex_buffer_array_stride >= std::mem::size_of::<ParticleInstance>() as u32
 }
 
 /// GPU state for the composed pass: the fade/light-aware terrain pipeline,
@@ -4832,26 +4835,17 @@ fn camera_focal_y_px(camera: &crate::Camera, height_px: u32) -> f32 {
 /// the silhouette diameter depends only on `‖c_view‖`, so the
 /// world-space distance is passed head-on (the helper's
 /// camera-inside → `INFINITY` contract still prevents a false reject).
-pub fn is_subpixel_section(
-    camera_position: [f32; 3],
-    aabb_min: [f32; 3],
-    focal_y_px: f32,
-) -> bool {
+pub fn is_subpixel_section(camera_position: [f32; 3], aabb_min: [f32; 3], focal_y_px: f32) -> bool {
     const SUBPIXEL_THRESHOLD_PX: f32 = 0.5;
     let half = EDGE as f32 * 0.5;
-    let center = [
-        aabb_min[0] + half,
-        aabb_min[1] + half,
-        aabb_min[2] + half,
-    ];
+    let center = [aabb_min[0] + half, aabb_min[1] + half, aabb_min[2] + half];
     let distance = (0..3)
         .map(|i| (center[i] - camera_position[i]) * (center[i] - camera_position[i]))
         .sum::<f32>()
         .sqrt();
     // Bounding sphere of the EDGE³ box: half the space diagonal.
     let radius = half * 3.0_f32.sqrt();
-    projected_sphere_diameter_px([0.0, 0.0, distance], radius, focal_y_px)
-        < SUBPIXEL_THRESHOLD_PX
+    projected_sphere_diameter_px([0.0, 0.0, distance], radius, focal_y_px) < SUBPIXEL_THRESHOLD_PX
 }
 
 /// Conservative whole-tile frustum decision driven by
@@ -4881,11 +4875,8 @@ pub fn section_frustum_visible(min: [f32; 3], planes: &[[f32; 4]]) -> bool {
             + f64::from(nz) * center[2]
             + f64::from(d);
         let bound = f64::from(nx.mul_add(nx, ny.mul_add(ny, nz * nz)).sqrt());
-        match LipschitzTileClassifier::classify_subtile_lipschitz(
-            center_value,
-            bound,
-            half_extents,
-        ) {
+        match LipschitzTileClassifier::classify_subtile_lipschitz(center_value, bound, half_extents)
+        {
             // Strictly outside this plane — provably invisible.
             TileSignDecision::UniformNegative => return false,
             // Strictly inside — this plane can never cull the box.
@@ -5100,8 +5091,6 @@ pub fn draw_light_mask(min: [f32; 3], max: [f32; 3], lights: &VfxLightsGpu) -> u
     }
     mask
 }
-
-
 
 /// One coord's contribution to `cull_graphs_stamp` — the `+1` length
 /// term plus the mixed-coordinate hash. Shared by the full
@@ -5593,10 +5582,7 @@ impl ShadowGpu {
                 &lit_module,
                 "billboard_vs",
                 "lit_fs",
-                &[
-                    Some(PARTICLE_QUAD_LAYOUT),
-                    Some(PARTICLE_INSTANCE_LAYOUT),
-                ],
+                &[Some(PARTICLE_QUAD_LAYOUT), Some(PARTICLE_INSTANCE_LAYOUT)],
                 Some(ALPHA_BLEND),
                 false,
                 None,
@@ -7011,6 +6997,8 @@ impl GpuRenderer {
             shaderpack: ShaderpackAttempt::Fallback {
                 notice: "built-in terrain pipeline".to_string(),
             },
+            gamma_pct: 100,
+            smooth_lighting: true,
             pack_subworld: None,
             notice: None,
         }
@@ -7108,8 +7096,7 @@ impl GpuRenderer {
     pub fn set_particle_billboards(&mut self, quads: &[VanillaParticleQuad]) {
         self.particle_alphas.clear();
         self.particle_instance_scratch.clear();
-        self.particle_instances_capped +=
-            quads.len().saturating_sub(MAX_DYNAMIC_QUADS) as u64;
+        self.particle_instances_capped += quads.len().saturating_sub(MAX_DYNAMIC_QUADS) as u64;
         if self.particle_instancing {
             let mut cpu_only = false;
             for quad in quads.iter().take(MAX_DYNAMIC_QUADS) {
@@ -7413,10 +7400,7 @@ impl GpuRenderer {
         let terrain_region_module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("composite-terrain-region"),
             source: wgpu::ShaderSource::Wgsl(Cow::Owned(region_opaque_wgsl(
-                &compact_terrain_wgsl(
-                    &terrain_wgsl(ctx.report.shader_f16),
-                    Some("terrain_vs"),
-                ),
+                &compact_terrain_wgsl(&terrain_wgsl(ctx.report.shader_f16), Some("terrain_vs")),
             ))),
         });
         let lit_module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
@@ -7532,10 +7516,7 @@ impl GpuRenderer {
                 &lit_module,
                 "billboard_vs",
                 "lit_fs",
-                &[
-                    Some(PARTICLE_QUAD_LAYOUT),
-                    Some(PARTICLE_INSTANCE_LAYOUT),
-                ],
+                &[Some(PARTICLE_QUAD_LAYOUT), Some(PARTICLE_INSTANCE_LAYOUT)],
                 Some(ALPHA_BLEND),
                 false,
                 None,
@@ -7927,8 +7908,7 @@ impl GpuRenderer {
             ) {
                 Ok(info) => info,
                 Err(err) => {
-                    last_rejection =
-                        format!("{}: structural validation failed: {err}", pass.name);
+                    last_rejection = format!("{}: structural validation failed: {err}", pass.name);
                     continue;
                 }
             };
@@ -7959,9 +7939,7 @@ impl GpuRenderer {
                 .device
                 .create_shader_module(wgpu::ShaderModuleDescriptor {
                     label: Some("megu-pack-subworld"),
-                    source: wgpu::ShaderSource::Wgsl(Cow::Borrowed(
-                        pass.wgsl_source.as_str(),
-                    )),
+                    source: wgpu::ShaderSource::Wgsl(Cow::Borrowed(pass.wgsl_source.as_str())),
                 });
             if pollster::block_on(scope.pop()).is_some() {
                 last_rejection = format!("{}: device rejected module", pass.name);
@@ -8034,9 +8012,7 @@ impl GpuRenderer {
                     instanced,
                     needs_shadow,
                 });
-                return format!(
-                    "; pass {name:?} drives Create sub-worlds + kinetic parts"
-                );
+                return format!("; pass {name:?} drives Create sub-worlds + kinetic parts");
             }
             last_rejection = format!("{}: device rejected every lit pipeline", pass.name);
         }
@@ -8099,10 +8075,8 @@ impl GpuRenderer {
                 continue;
             }
             let wgsl = compact_pack_terrain_wgsl(&pass.wgsl_source);
-            let info = match validate_wgsl_module(
-                &wgsl,
-                &[WgslStage::Vertex, WgslStage::Fragment],
-            ) {
+            let info = match validate_wgsl_module(&wgsl, &[WgslStage::Vertex, WgslStage::Fragment])
+            {
                 Ok(info) => info,
                 Err(err) => {
                     last_rejection = format!("{}: structural validation failed: {err}", pass.name);
@@ -8204,9 +8178,8 @@ impl GpuRenderer {
                     path.display()
                 ));
             }
-            let pack =
-                megu_client_mesh::load_megu_wgsl_pack(&source, &self.ctx.report.shader_caps)
-                    .map_err(|e| format!("cannot load {}: {e}", path.display()))?;
+            let pack = megu_client_mesh::load_megu_wgsl_pack(&source, &self.ctx.report.shader_caps)
+                .map_err(|e| format!("cannot load {}: {e}", path.display()))?;
             Ok(self.apply_shaderpack(&pack))
         })();
         match attempt {
@@ -8219,6 +8192,26 @@ impl GpuRenderer {
                 self.shaderpack.clone()
             }
         }
+    }
+
+    /// Set the live brightness/exposure multiplier.
+    pub fn set_gamma_pct(&mut self, gamma_pct: u16) {
+        self.gamma_pct = gamma_pct.clamp(50, 200);
+    }
+
+    /// Toggle per-vertex ambient occlusion for subsequent section uploads.
+    /// Existing section meshes are re-dirtied by the owning live session.
+    pub fn set_smooth_lighting(&mut self, enabled: bool) {
+        self.smooth_lighting = enabled;
+    }
+
+    /// Return to the built-in shader path after a shaderpack toggle-off.
+    pub fn disable_shaderpack(&mut self) {
+        self.pack_subworld = None;
+        self.shaderpack = ShaderpackAttempt::Fallback {
+            notice: "built-in terrain pipeline".to_owned(),
+        };
+        self.notice = None;
     }
 
     /// Upload a meshed scene: quads -> real `megu_client_mesh` packed
@@ -8281,8 +8274,7 @@ impl GpuRenderer {
             live.requeue_cpu_released_sections();
             // First attach: the delta stream predates this renderer —
             // mirror the map wholesale and discard pending events.
-            self.external_sections
-                .clone_from(&live.external_sections);
+            self.external_sections.clone_from(&live.external_sections);
             live.discard_external_sections_delta();
             self.external_section_full_syncs += 1;
         } else if let Some(delta) = live.take_external_sections_delta() {
@@ -8372,11 +8364,9 @@ impl GpuRenderer {
     /// Order-independent stamp of the mirrored `section_graphs` set —
     /// a graph-only world change still invalidates the cull cache.
     fn compute_graphs_stamp(&self) -> u64 {
-        self.section_graphs
-            .keys()
-            .fold(0u64, |stamp, &coord| {
-                stamp.wrapping_add(graph_key_stamp(coord))
-            })
+        self.section_graphs.keys().fold(0u64, |stamp, &coord| {
+            stamp.wrapping_add(graph_key_stamp(coord))
+        })
     }
 
     /// Remove one coord from the `section_graphs` mirror, folding its
@@ -8385,9 +8375,7 @@ impl GpuRenderer {
     /// refreshes never re-scan the whole map.
     fn section_graph_remove(&mut self, coord: SectionCoord) {
         if self.section_graphs.remove(&coord).is_some() {
-            self.cull_graphs_stamp = self
-                .cull_graphs_stamp
-                .wrapping_sub(graph_key_stamp(coord));
+            self.cull_graphs_stamp = self.cull_graphs_stamp.wrapping_sub(graph_key_stamp(coord));
         }
     }
 
@@ -8451,9 +8439,7 @@ impl GpuRenderer {
             return false;
         }
         let up_to_date = match self.pending_uploads.get(&coord) {
-            Some(pending) => {
-                pending.matches(&external.packed, external.digest, &external.order)
-            }
+            Some(pending) => pending.matches(&external.packed, external.digest, &external.order),
             None => self.live_sections.get(&coord).is_some_and(|existing| {
                 existing.matches_upload(
                     external.digest,
@@ -8517,8 +8503,7 @@ impl GpuRenderer {
                     // the event that marked it dirty may already be
                     // reflected in the lane's payload.
                     let external = self.external_sections[&coord].clone();
-                    scheduled +=
-                        usize::from(self.queue_external_section_upload(coord, &external));
+                    scheduled += usize::from(self.queue_external_section_upload(coord, &external));
                 }
                 None if world.released_mesh_meta(coord).is_some() => {
                     // The world released this section's CPU copy after
@@ -8551,9 +8536,8 @@ impl GpuRenderer {
                         // The session's external entry is only present
                         // while it is fresher than the world payload —
                         // queue it over the stale world mesh.
-                        scheduled += usize::from(
-                            self.queue_external_section_upload(coord, &external),
-                        );
+                        scheduled +=
+                            usize::from(self.queue_external_section_upload(coord, &external));
                     } else {
                         let order = world.translucent_order(coord).unwrap_or(&[]);
                         scheduled += usize::from(
@@ -8638,9 +8622,8 @@ impl GpuRenderer {
                         continue;
                     }
                     if self.section_graphs.insert(coord, graph).is_none() {
-                        self.cull_graphs_stamp = self
-                            .cull_graphs_stamp
-                            .wrapping_add(graph_key_stamp(coord));
+                        self.cull_graphs_stamp =
+                            self.cull_graphs_stamp.wrapping_add(graph_key_stamp(coord));
                     }
                 }
                 self.section_graph_partial_syncs += 1;
@@ -8743,9 +8726,8 @@ impl GpuRenderer {
                     // retained per section.
                     self.compact_unrepresentable_quads +=
                         arena.insert(coord, &geometry.opaque, section_word, ranges);
-                    self.cpu_opaque_bytes_freed += (geometry.opaque.len()
-                        * std::mem::size_of::<PackedVertex>())
-                        as u64;
+                    self.cpu_opaque_bytes_freed +=
+                        (geometry.opaque.len() * std::mem::size_of::<PackedVertex>()) as u64;
                 }
                 origin
             });
@@ -8923,7 +8905,8 @@ impl GpuRenderer {
         // Telemetry: bytes the resident set would have pinned before the
         // CPU-lifetime drop — full packed mesh + order per section.
         self.cpu_mesh_bytes_freed += (std::mem::size_of_val(packed)
-            + order_len as usize * std::mem::size_of::<u32>()) as u64;
+            + order_len as usize * std::mem::size_of::<u32>())
+            as u64;
         // The renderer-side external mirror no longer needs its CPU copy
         // either once this upload is resident; the session's own copy is
         // released via `take_uploaded_section_coords` downstream.
@@ -8965,8 +8948,11 @@ impl GpuRenderer {
         }
         self.translucent_order_rewrites += 1;
         let mut bytes = std::mem::take(&mut self.compact_vertex_bytes);
-        self.compact_unrepresentable_quads +=
-            stage_compact_verts(&mut bytes, &streams.translucent);
+        self.compact_unrepresentable_quads += stage_compact_verts_with_smooth_lighting(
+            &mut bytes,
+            &streams.translucent,
+            self.smooth_lighting,
+        );
         let section = self
             .live_sections
             .get_mut(&coord)
@@ -9014,7 +9000,8 @@ impl GpuRenderer {
     /// [`Self::compact_unrepresentable_quads`].
     fn compact_vertex_buffer(&mut self, label: &str, verts: &[PackedVertex]) -> wgpu::Buffer {
         let mut bytes = std::mem::take(&mut self.compact_vertex_bytes);
-        self.compact_unrepresentable_quads += stage_compact_verts(&mut bytes, verts);
+        self.compact_unrepresentable_quads +=
+            stage_compact_verts_with_smooth_lighting(&mut bytes, verts, self.smooth_lighting);
         let buffer = self.ctx.device.create_buffer(&wgpu::BufferDescriptor {
             label: Some(label),
             size: (bytes.len() as u64).max(16),
@@ -9472,12 +9459,7 @@ impl GpuRenderer {
     /// (`cull_cache_hits += 1`); a miss refills the retained
     /// `cull_result` verdict bits instead of allocating
     /// fresh `HashSet`s every frame.
-    fn cull_live_sections(
-        &mut self,
-        view_proj: &Mat4,
-        camera_position: [f32; 3],
-        focal_y_px: f32,
-    ) {
+    fn cull_live_sections(&mut self, view_proj: &Mat4, camera_position: [f32; 3], focal_y_px: f32) {
         let camera_section = SectionCoord(
             (camera_position[0] / EDGE as f32).floor() as i32,
             (camera_position[1] / EDGE as f32).floor() as i32,
@@ -10041,10 +10023,7 @@ impl GpuRenderer {
         });
         if fast_hit {
             let count = self.gpu_indirect.as_ref().expect("fast hit").cached_count;
-            let occlusion_armed = self
-                .gpu_hiz
-                .as_ref()
-                .is_some_and(|hiz| hiz.pyramid_ready())
+            let occlusion_armed = self.gpu_hiz.as_ref().is_some_and(|hiz| hiz.pyramid_ready())
                 && self.gpu_hiz_frame_vp == Some(*view_proj);
             let (depth_w, depth_h) = self.depth_size;
             let (hiz_w, hiz_h, mip_count) = {
@@ -10079,9 +10058,11 @@ impl GpuRenderer {
             self.ctx
                 .queue
                 .write_buffer(&buffers.uniforms, 0, bytemuck::bytes_of(&uniforms));
-            self.ctx
-                .queue
-                .write_buffer(&buffers.stats, 0, bytemuck::bytes_of(&CullStats::default()));
+            self.ctx.queue.write_buffer(
+                &buffers.stats,
+                0,
+                bytemuck::bytes_of(&CullStats::default()),
+            );
             self.gpu_indirect_record_uploads_skipped += 1;
             let culler = self.gpu_hiz.as_mut().expect("created above");
             culler.cull_sections_into_indirect_buffer(
@@ -10130,9 +10111,7 @@ impl GpuRenderer {
                 continue;
             }
             if self.morton_order_enabled {
-                slots.sort_by_key(|&(coord, _)| {
-                    opaque_section_sort_key(coord, camera_position)
-                });
+                slots.sort_by_key(|&(coord, _)| opaque_section_sort_key(coord, camera_position));
             } else {
                 // Deterministic Morton order avoids spurious HashMap-order
                 // diffs when `morton_order_enabled` is off.
@@ -10172,10 +10151,7 @@ impl GpuRenderer {
         self.ensure_gpu_indirect_capacity(records.len());
         // Arm occlusion only when the pyramid is fresh for this exact
         // view; the WGSL early-outs `hiz_occluded` on `params.z == 0`.
-        let occlusion_armed = self
-            .gpu_hiz
-            .as_ref()
-            .is_some_and(|hiz| hiz.pyramid_ready())
+        let occlusion_armed = self.gpu_hiz.as_ref().is_some_and(|hiz| hiz.pyramid_ready())
             && self.gpu_hiz_frame_vp == Some(*view_proj);
         let (depth_w, depth_h) = self.depth_size;
         let (hiz_w, hiz_h, mip_count) = {
@@ -10198,7 +10174,11 @@ impl GpuRenderer {
             params: [
                 hiz_w as f32,
                 hiz_h as f32,
-                if occlusion_armed { mip_count as f32 } else { 0.0 },
+                if occlusion_armed {
+                    mip_count as f32
+                } else {
+                    0.0
+                },
                 count as f32,
             ],
         };
@@ -10681,24 +10661,27 @@ impl GpuRenderer {
             },
         );
         let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
-        let bind_group = self.ctx.device.create_bind_group(&wgpu::BindGroupDescriptor {
-            label: Some(label),
-            layout: &self.title_branding.layout,
-            entries: &[
-                wgpu::BindGroupEntry {
-                    binding: 0,
-                    resource: self.ui_quad.uniform.as_entire_binding(),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 1,
-                    resource: wgpu::BindingResource::TextureView(&view),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 2,
-                    resource: wgpu::BindingResource::Sampler(&self.ui_sampler),
-                },
-            ],
-        });
+        let bind_group = self
+            .ctx
+            .device
+            .create_bind_group(&wgpu::BindGroupDescriptor {
+                label: Some(label),
+                layout: &self.title_branding.layout,
+                entries: &[
+                    wgpu::BindGroupEntry {
+                        binding: 0,
+                        resource: self.ui_quad.uniform.as_entire_binding(),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 1,
+                        resource: wgpu::BindingResource::TextureView(&view),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 2,
+                        resource: wgpu::BindingResource::Sampler(&self.ui_sampler),
+                    },
+                ],
+            });
         Some(BrandingQuadGpu {
             _texture: texture,
             bind_group,
@@ -10751,8 +10734,7 @@ impl GpuRenderer {
             return;
         }
         self.title_branding.mesh_key = Some(key);
-        self.title_branding.logo_draw =
-            logo_rect.is_some() && self.title_branding.logo.is_some();
+        self.title_branding.logo_draw = logo_rect.is_some() && self.title_branding.logo.is_some();
         self.title_branding.edition_draw =
             edition_rect.is_some() && self.title_branding.edition.is_some();
 
@@ -10807,33 +10789,33 @@ impl GpuRenderer {
             let vbytes = (branding.vertex_scratch.len() * 32) as u64;
             if vbytes > branding.splash_vertex_capacity {
                 branding.splash_vertex_capacity = vbytes * 2;
-                branding.splash_vertices =
-                    self.ctx.device.create_buffer(&wgpu::BufferDescriptor {
-                        label: Some("title-splash-vertices"),
-                        size: branding.splash_vertex_capacity,
-                        usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
-                        mapped_at_creation: false,
-                    });
+                branding.splash_vertices = self.ctx.device.create_buffer(&wgpu::BufferDescriptor {
+                    label: Some("title-splash-vertices"),
+                    size: branding.splash_vertex_capacity,
+                    usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
+                    mapped_at_creation: false,
+                });
             }
             let ibytes = (mesh.indices.len() * 4) as u64;
             if ibytes > branding.splash_index_capacity {
                 branding.splash_index_capacity = ibytes * 2;
-                branding.splash_indices =
-                    self.ctx.device.create_buffer(&wgpu::BufferDescriptor {
-                        label: Some("title-splash-indices"),
-                        size: branding.splash_index_capacity,
-                        usage: wgpu::BufferUsages::INDEX | wgpu::BufferUsages::COPY_DST,
-                        mapped_at_creation: false,
-                    });
+                branding.splash_indices = self.ctx.device.create_buffer(&wgpu::BufferDescriptor {
+                    label: Some("title-splash-indices"),
+                    size: branding.splash_index_capacity,
+                    usage: wgpu::BufferUsages::INDEX | wgpu::BufferUsages::COPY_DST,
+                    mapped_at_creation: false,
+                });
             }
             self.ctx.queue.write_buffer(
                 &branding.splash_vertices,
                 0,
                 bytemuck::cast_slice(&branding.vertex_scratch),
             );
-            self.ctx
-                .queue
-                .write_buffer(&branding.splash_indices, 0, bytemuck::cast_slice(&mesh.indices));
+            self.ctx.queue.write_buffer(
+                &branding.splash_indices,
+                0,
+                bytemuck::cast_slice(&mesh.indices),
+            );
         }
     }
 
@@ -11134,7 +11116,7 @@ impl GpuRenderer {
                 atmo.ambient_rgb[0],
                 atmo.ambient_rgb[1],
                 atmo.ambient_rgb[2],
-                1.0,
+                f32::from(self.gamma_pct) / 100.0,
             ],
             atmo: [atmo.fog_density, 0.0, 0.0, 0.0],
             depth_tint: [
@@ -11147,8 +11129,7 @@ impl GpuRenderer {
         self.write_env_ubo_dedup(&env);
         let uniforms = pack_vfx1_lights(lights, self.shadow_quality);
         let union_mask = self.lit_union_light_mask(&uniforms);
-        let lights =
-            VfxLightsGpu::from(&uniforms.with_region_light_mask(union_mask));
+        let lights = VfxLightsGpu::from(&uniforms.with_region_light_mask(union_mask));
         self.write_lights_ubo_dedup(&lights);
         self.write_frame_uniforms(&camera, aspect, atmo.fog_rgb, sky.fog_start, sky.fog_end);
         // Pending uploads may all be admitted by this frame's drain inside
@@ -11574,9 +11555,7 @@ impl GpuRenderer {
         section_offsets.extend(
             self.live_sections
                 .iter()
-                .filter(|(_, section)| {
-                    section.arena.is_none() && section.opaque_index_total > 0
-                })
+                .filter(|(_, section)| section.arena.is_none() && section.opaque_index_total > 0)
                 .map(|(coord, _)| (*coord, 0u32)),
         );
         // Cutout casters: sorted for stable pool slots across recorded
@@ -11702,7 +11681,10 @@ impl GpuRenderer {
         }
         fnv1a_u64(&mut casters, dynamic_geometry_digest(&self.entity_ber));
         fnv1a_u64(&mut casters, dynamic_geometry_digest(&self.particles));
-        fnv1a_u64(&mut casters, particle_instance_digest(&self.particle_instances));
+        fnv1a_u64(
+            &mut casters,
+            particle_instance_digest(&self.particle_instances),
+        );
         // Buffer replacement under identical content — the epoch covers
         // every sync that touched real GPU objects.
         fnv1a_u64(&mut casters, self.subworld_gpu_epoch);
@@ -12053,7 +12035,7 @@ impl GpuRenderer {
                 atmo.ambient_rgb[0],
                 atmo.ambient_rgb[1],
                 atmo.ambient_rgb[2],
-                1.0,
+                f32::from(self.gamma_pct) / 100.0,
             ],
             atmo: [atmo.fog_density, 0.0, 0.0, 0.0],
             depth_tint: [
@@ -13411,6 +13393,22 @@ fn index_buffer(
 mod tests {
     use super::*;
 
+    #[test]
+    fn smooth_lighting_changes_staged_vertex_ao_bits() {
+        let vertices = [PackedVertex {
+            attributes: (1 << 20) | (1 << 25),
+            ..PackedVertex::default()
+        }; 4];
+        let mut smooth = Vec::new();
+        let mut flat = Vec::new();
+        stage_compact_verts_with_smooth_lighting(&mut smooth, &vertices, true);
+        stage_compact_verts_with_smooth_lighting(&mut flat, &vertices, false);
+        assert_ne!(
+            smooth, flat,
+            "flat lighting must clear per-vertex AO shading"
+        );
+    }
+
     /// The fallback policy's failure surface: when hardware enumeration
     /// AND the software-fallback retry both fail, `NoAdapter` names both
     /// errors and tells the user what would fix it.
@@ -13438,7 +13436,10 @@ mod tests {
             wgpu::DeviceType::VirtualGpu,
             wgpu::DeviceType::Other,
         ] {
-            assert!(!adapter_is_software_fallback(device_type), "{device_type:?}");
+            assert!(
+                !adapter_is_software_fallback(device_type),
+                "{device_type:?}"
+            );
         }
     }
 }

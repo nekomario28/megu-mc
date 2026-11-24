@@ -7,25 +7,28 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use crate::live_session::LiveHudFeed;
-use megu_client::audio_qol::{ZoomState, DEFAULT_ZOOM_SMOOTHING_RATE};
+use megu_client::audio_qol::{
+    DEFAULT_ZOOM_SMOOTHING_RATE, ToolDurability, ZoomState, check_tool_durability_warning,
+};
 use megu_client::friend_client::{FriendGuestBridge, FriendHostSession};
 use megu_client::integrated;
-use megu_client::protocol::{encode_slot_stack, NbtValue, WireReader};
+use megu_client::protocol::{NbtValue, WireReader, encode_slot_stack};
 use megu_client::render::{FrameBudgetGovernor, RenderConfig, ThrottleStage};
 use megu_client::server_list::{ServerEntry, ServerListStore};
 use megu_client::settings::{
-    ClientSettings, CrashReportMode as ClientCrashReportMode, DistantHorizon,
-    HostMinimapMode, HostPlayerRadarScope, QualityPreset,
+    ClientSettings, CrashReportMode as ClientCrashReportMode, DistantHorizon, HostMinimapMode,
+    HostPlayerRadarScope, QualityPreset,
 };
 use megu_client::spatial_audio::SpatialAudioPreset;
 use megu_client::world::{TrackedBlockEntity, TrackedEntity};
 use megu_client::zsh_command_bar::ZshCommandBar;
+use megu_client_mesh::ChunkUploadBudget;
 use megu_client_mesh::ber_instancing::{
-    build_ber_mesh, VanillaBerFacing, VanillaBerKind, VanillaBerState, VanillaParticleQuad,
-    VanillaParticleWorld,
+    VanillaBerFacing, VanillaBerKind, VanillaBerState, VanillaParticleQuad, VanillaParticleWorld,
+    build_ber_mesh,
 };
 use megu_client_mesh::builtin_shadow_wgsl::{BuiltinShadowQuality, RenderScalePreset};
-use megu_client_mesh::entity_rig::{build_entity_rig_mesh, EntityPose, EntityRigSpec};
+use megu_client_mesh::entity_rig::{EntityPose, EntityRigSpec, build_entity_rig_mesh};
 use megu_client_mesh::mesher::classify_vanilla_ber;
 use megu_client_mesh::tactile_effects::{
     TactileEffectsConfig, TactileParticle, TactileParticleKind, TactilePreset,
@@ -33,48 +36,47 @@ use megu_client_mesh::tactile_effects::{
 use megu_client_mesh::vanilla_plus_3d::ExtrudedMesh;
 use megu_client_mesh::vanilla_plus_nature::{NatureParticle, NatureParticleKind};
 use megu_client_mesh::vfx_engine::{ParticleDraw, ParticleOrientation, VfxFrameOutput};
-use megu_client_mesh::ChunkUploadBudget;
-use megu_core::hash::{Fnv1a64, FNV1A64_OFFSET_BASIS, FNV1A64_PRIME};
+use megu_core::hash::{FNV1A64_OFFSET_BASIS, FNV1A64_PRIME, Fnv1a64};
 use megu_kernel::debug_chords::{
-    finish_gamemode_switcher, handle_f3_chord, DebugChordAction, DebugChordContext,
-    DebugChordState, DebugTarget, F3Chord, PlayerDebugInfo,
+    DebugChordAction, DebugChordContext, DebugChordState, DebugTarget, F3Chord, PlayerDebugInfo,
+    finish_gamemode_switcher, handle_f3_chord,
 };
 use megu_ui::container_screen::{
-    menu_schema, ContainerScreenState, DragState, InventorySortState, MenuScreenSchema, SlotDef,
-    SlotKind, UiItemStack,
+    ContainerScreenState, DragState, InventorySortState, MenuScreenSchema, SlotDef, SlotKind,
+    UiItemStack, menu_schema,
 };
 use megu_ui::draw::tessellate_draw_list;
-use megu_ui::draw::{text_width, UiColor, UiCommand, UiDrawList, UiRect};
+use megu_ui::draw::{UiColor, UiCommand, UiDrawList, UiRect, text_width};
 use megu_ui::hud_widgets::ScoreboardEntry;
+use megu_ui::magic_hud::LookingAtBlockState;
+use megu_ui::magic_hud::build_magic_hud_draw_list;
 use megu_ui::recipe_browser::{
     BrowserTab, DetailMode, ItemEntry, RecipeBrowserAction, RecipeBrowserState,
 };
-use megu_ui::magic_hud::build_magic_hud_draw_list;
-use megu_ui::magic_hud::LookingAtBlockState;
-use megu_ui::state::{invite_code_display, ScoreboardState, TitleOverlayState};
 use megu_ui::state::{
     CrashReportMode as UiCrashReportMode, DisconnectedScreenState, GpuBackend, LodMode,
     MinimapMode, MultiplayerScreenState, MultiplayerServerEntry, PlayerRadarScope, Screen,
     SettingsTab, UiAction, UiInputEvent, UiKey, UiSettings, UiState, VideoPreset,
     VisualStylePreset,
 };
+use megu_ui::state::{ScoreboardState, TitleOverlayState, invite_code_display};
 use winit::application::ApplicationHandler;
 use winit::dpi::PhysicalSize;
 use winit::event::{DeviceEvent, DeviceId, ElementState, MouseButton, WindowEvent};
 use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop};
 use winit::keyboard::{KeyCode, PhysicalKey};
-use winit::window::{CursorGrabMode, Window, WindowAttributes, WindowId};
+use winit::window::{CursorGrabMode, Fullscreen, Window, WindowAttributes, WindowId};
 
 use crate::live_session::{
-    jar_version_ids, CrosshairPick, LiveSession, PlayerMovement, PlayerPose, SessionPaths,
-    SessionStatus,
+    CrosshairPick, LiveSession, PlayerMovement, PlayerPose, SessionPaths, SessionStatus,
+    jar_version_ids,
 };
-use crate::renderer::{request_gpu_device, GpuRenderer};
-use crate::title_branding::{title_branding_sources, TitleBrandingAssets};
+use crate::renderer::{GpuRenderer, request_gpu_device};
+use crate::title_branding::{TitleBrandingAssets, title_branding_sources};
 use crate::{
-    build_demo_scene, detect_display_server_kind, fingerprint_draw_list, preferred_alpha_mode,
-    present_mode_for, select_display_presentation_policy, Camera, DisplayPresentationPolicy,
-    GpuCliConfig, MoveInput,
+    Camera, DisplayPresentationPolicy, GpuCliConfig, MoveInput, build_demo_scene,
+    detect_display_server_kind, fingerprint_draw_list, preferred_alpha_mode, present_mode_for,
+    select_display_presentation_policy,
 };
 
 /// Window title.
@@ -156,9 +158,13 @@ pub enum WindowInputEvent {
     SetDebugOverlayVisible(bool),
     SelectHotbar(u8),
     SwapOffhand,
-    DropItem { entire_stack: bool },
+    DropItem {
+        entire_stack: bool,
+    },
     OpenInventory,
-    OpenChat { slash_prefill: bool },
+    OpenChat {
+        slash_prefill: bool,
+    },
     SetTabListVisible(bool),
     SortInventory,
     OpenAdvancements,
@@ -583,6 +589,7 @@ pub struct GpuApp {
     /// `ui_to_client_settings` overlays the UI's mapped keys onto so
     /// file-only fields (shader pack, report endpoint) survive a save.
     persisted_settings: megu_client::settings::ClientSettings,
+    active_shaderpack_path: Option<String>,
     /// Where [`persisted_settings`](Self::persisted_settings) writes.
     settings_path: std::path::PathBuf,
     /// Debounced atomic writer for `persisted_settings` — dirty-only,
@@ -713,14 +720,44 @@ impl GpuApp {
             version_id: config.version_id.clone(),
             resource_pack_dir: config.resource_pack_dir.clone(),
         };
+        // Load options before starting quick play so the integrated host
+        // receives the same fair-play policy as worlds started from the UI.
+        let settings_path = config
+            .game_dir
+            .clone()
+            .unwrap_or_else(|| std::path::PathBuf::from("."))
+            .join(megu_client::settings::SETTINGS_FILE_NAME);
+        let mut startup_status = Vec::new();
+        let mut persisted_settings = megu_client::settings::ClientSettings {
+            vsync: config.vsync,
+            ..megu_client::settings::ClientSettings::default()
+        };
+        if let Ok(text) = std::fs::read_to_string(&settings_path) {
+            for warning in persisted_settings.apply_toml(&text) {
+                startup_status.push(format!("{}: {warning}", settings_path.display()));
+            }
+        } else if !settings_path.exists() {
+            let options_path = settings_path
+                .parent()
+                .unwrap_or_else(|| std::path::Path::new("."))
+                .join("options.txt");
+            if let Ok(text) = std::fs::read_to_string(&options_path) {
+                persisted_settings =
+                    megu_client::settings::ClientSettings::import_vanilla_options_txt(&text);
+                startup_status.push(format!("Imported settings from {}", options_path.display()));
+            }
+        }
+        if let Some(path) = &config.shader_pack {
+            persisted_settings.shader_pack = Some(path.display().to_string());
+            persisted_settings.shaders_enabled = true;
+        }
         // `--quickPlaySingleplayer`: launch the integrated server first so
         // the session can bind its loopback endpoint. Failures surface as a
         // title-screen status line, never a silent no-op.
         let mut singleplayer_server = None;
-        let mut startup_status = Vec::new();
         if !config.offline_demo {
             if let Some(world) = &config.quick_play_singleplayer {
-                match Self::launch_singleplayer(&config, world) {
+                match Self::launch_singleplayer(&config, world, &persisted_settings) {
                     Ok(server) => singleplayer_server = Some(server),
                     Err(err) => {
                         startup_status.push(format!("Singleplayer {world:?}: {err}"));
@@ -740,7 +777,7 @@ impl GpuApp {
                 session_paths.clone(),
                 config.access_token.clone(),
                 config.uuid.clone(),
-                UiSettings::default().video.view_distance as i8,
+                persisted_settings.view_distance as i8,
             ))
         } else {
             config.connect.as_ref().map(|(host, port)| {
@@ -752,7 +789,7 @@ impl GpuApp {
                     session_paths.clone(),
                     config.access_token.clone(),
                     config.uuid.clone(),
-                    UiSettings::default().video.view_distance as i8,
+                    persisted_settings.view_distance as i8,
                 )
             })
         };
@@ -776,24 +813,6 @@ impl GpuApp {
         let splash_seed = splash_seed_for(&config);
         let mut ui = UiState::new();
         apply_megu_default_links(&mut ui);
-        // Persisted `megu-client.toml` (launcher-root `<gameDir>/`, `.`
-        // fallback): CLI flags seed the base, the file overlays whatever
-        // keys it defines, and every UI-visible field mirrors the result
-        // so `apply_settings` below activates it in one shot.
-        let settings_path = config
-            .game_dir
-            .clone()
-            .unwrap_or_else(|| std::path::PathBuf::from("."))
-            .join(megu_client::settings::SETTINGS_FILE_NAME);
-        let mut persisted_settings = megu_client::settings::ClientSettings {
-            vsync: render_config.vsync,
-            ..megu_client::settings::ClientSettings::default()
-        };
-        if let Ok(text) = std::fs::read_to_string(&settings_path) {
-            for warning in persisted_settings.apply_toml(&text) {
-                startup_status.push(format!("{}: {warning}", settings_path.display()));
-            }
-        }
         apply_client_settings_to_ui(&persisted_settings, &mut ui.settings);
         // Straight into gameplay when a world/server is already targeted;
         // the title screen otherwise — like a vanilla launch with no
@@ -835,6 +854,7 @@ impl GpuApp {
             chat_shift_held: false,
             settings_save_guard: megu_client::settings::SettingsSaveGuard::new(),
             persisted_settings,
+            active_shaderpack_path: None,
             settings_path,
             inventory_sort: InventorySortState::default(),
             session_paths,
@@ -1098,6 +1118,7 @@ impl GpuApp {
         // The session spawns its own mixer — seed the persisted volume
         // sliders before the first packet can start a voice.
         live.set_audio_volumes(&audio_settings);
+        live.set_chat_history_limit(self.ui.settings.qol.chat_history_lines);
         for message in self.debug_messages.iter().cloned() {
             live.push_chat_line(message);
         }
@@ -1165,11 +1186,7 @@ impl GpuApp {
         for (eid, spec, pos, tracked) in live.entity_render_entries() {
             let pose = live_entity_pose(live, eid, tracked);
             let key = entity_pose_key(spec, &pose);
-            if cache
-                .entity_meshes
-                .get(&eid)
-                .is_none_or(|(k, _)| *k != key)
-            {
+            if cache.entity_meshes.get(&eid).is_none_or(|(k, _)| *k != key) {
                 cache
                     .entity_meshes
                     .insert(eid, (key, build_entity_rig_mesh(spec, pose)));
@@ -1285,12 +1302,16 @@ impl GpuApp {
             }
             UiAction::SettingsChanged => {
                 let settings = self.ui.settings.clone();
-                self.apply_settings(&settings);
                 // Atomic persistence: overlay the mapped keys onto the
                 // last loaded file state (file-only keys survive), then
                 // the save guard writes only on real byte changes.
                 self.persisted_settings =
                     ui_to_client_settings(&settings, &self.persisted_settings);
+                if let Some(selection) = self.ui.shader_packs.pending() {
+                    self.persisted_settings.shader_pack = Some(selection.pack_id);
+                    self.persisted_settings.shader_profile = selection.profile;
+                }
+                self.apply_settings(&settings);
                 self.settings_save_guard.mark_dirty();
                 if let Err(err) = self
                     .settings_save_guard
@@ -1498,11 +1519,11 @@ impl GpuApp {
                         SessionStatus::Connecting => {
                             self.status_line(format!("Place recipe {recipe_id}: still connecting"))
                         }
-                        SessionStatus::Disconnected(_) => self
-                            .status_line(format!("Place recipe {recipe_id}: not connected")),
+                        SessionStatus::Disconnected(_) => {
+                            self.status_line(format!("Place recipe {recipe_id}: not connected"))
+                        }
                     },
-                    None => self
-                        .status_line(format!("Place recipe {recipe_id}: not connected")),
+                    None => self.status_line(format!("Place recipe {recipe_id}: not connected")),
                 }
             }
             RecipeBrowserAction::Close => {
@@ -1534,6 +1555,8 @@ impl GpuApp {
     /// too, so every `SettingsChanged` action is fully live.
     pub fn apply_settings(&mut self, settings: &UiSettings) {
         let video = &settings.video;
+        let smooth_lighting_changed = self.render_config.smooth_lighting != video.smooth_lighting;
+        self.ui.ui_scale = settings.gui_scale.min(4);
         self.camera_controller
             .set_smooth_zoom(settings.qol.smooth_zoom);
         self.apply_camera_settings(
@@ -1551,8 +1574,44 @@ impl GpuApp {
         self.render_config.vsync = video.vsync;
         self.render_config.smooth_lighting = video.smooth_lighting;
         self.render_config.view_distance = Some(i32::from(video.view_distance));
+        self.inventory_sort.enabled = settings.builtin_inventory_sort_active(false);
+        // The renderer's frustum and section culler read `camera.far`;
+        // updating RenderConfig alone does not alter the active GPU path.
+        self.camera.far = effective_camera_far(video.view_distance, video.lod);
+        if let Some(active) = &self.active {
+            let should_fullscreen = settings.fullscreen;
+            if active.window.fullscreen().is_some() != should_fullscreen {
+                active
+                    .window
+                    .set_fullscreen(should_fullscreen.then_some(Fullscreen::Borderless(None)));
+            }
+        }
+        let selected_backend = ui_gpu_backend(video.gpu_backend);
+        if selected_backend != self.render_config.gpu_backend {
+            self.status_line("GPU backend change requires restart".to_owned());
+        }
 
+        let desired_shaderpack = settings
+            .shader_quick
+            .shaders_enabled
+            .then(|| {
+                self.persisted_settings
+                    .shader_pack
+                    .as_deref()
+                    .map(|pack| resolve_shaderpack_path(self.config.game_dir.as_deref(), pack))
+            })
+            .flatten();
         if let Some(active) = &mut self.active {
+            active.renderer.set_gamma_pct(settings.gamma_pct);
+            active.renderer.set_smooth_lighting(video.smooth_lighting);
+            if desired_shaderpack != self.active_shaderpack_path {
+                if let Some(path) = desired_shaderpack.as_deref() {
+                    active.renderer.load_shaderpack(std::path::Path::new(path));
+                } else {
+                    active.renderer.disable_shaderpack();
+                }
+                self.active_shaderpack_path = desired_shaderpack;
+            }
             let shadow_quality = match settings.visual.preset {
                 VisualStylePreset::Vanilla | VisualStylePreset::MeguNaturalLight => {
                     BuiltinShadowQuality::Off
@@ -1582,6 +1641,13 @@ impl GpuApp {
         // mixer preset all take the same toggles the settings screen
         // exposes.
         if let Some(live) = &mut self.live {
+            if smooth_lighting_changed {
+                live.rebuild_loaded_sections_for_lighting(
+                    self.camera.position,
+                    video.view_distance,
+                );
+            }
+            live.set_chat_history_limit(settings.qol.chat_history_lines);
             live.vanilla_plus_cfg.three_d.enabled = settings.visual.blocks_and_skins_3d;
             live.vanilla_plus_cfg.nature.enabled = settings.visual.world_effects;
             let detail = &settings.visual.world_effects_detail;
@@ -1685,8 +1751,9 @@ impl GpuApp {
             self.debug_messages.drain(..excess);
         }
         self.ui.hud.chat_lines.push(message.clone());
-        if self.ui.hud.chat_lines.len() > 100 {
-            let excess = self.ui.hud.chat_lines.len() - 100;
+        let chat_limit = self.ui.settings.qol.chat_history_lines.clamp(100, 5000);
+        if self.ui.hud.chat_lines.len() > chat_limit {
+            let excess = self.ui.hud.chat_lines.len() - chat_limit;
             self.ui.hud.chat_lines.drain(..excess);
         }
         if let Some(live) = &mut self.live {
@@ -1696,6 +1763,10 @@ impl GpuApp {
 
     /// Spawn a session against `host:port` and switch the UI into gameplay.
     fn connect_to(&mut self, host: String, port: u16) {
+        let retained_chat = retained_chat_on_reconnect(
+            self.ui.settings.qol.retain_chat_on_reconnect,
+            &self.ui.hud.chat_lines,
+        );
         let live = LiveSession::connect_with_paths_and_auth(
             host,
             port,
@@ -1719,6 +1790,16 @@ impl GpuApp {
         self.on_live_attached();
         self.ui.screen = Screen::InGameHud;
         self.ui.hud = megu_ui::state::HudState::default();
+        if !retained_chat.is_empty() {
+            self.ui.hud.chat_lines = retained_chat;
+            if let Some(live) = &mut self.live {
+                live.clear_chat_log();
+                live.set_chat_history_limit(self.ui.settings.qol.chat_history_lines);
+                for line in self.ui.hud.chat_lines.iter().cloned() {
+                    live.push_chat_line(line);
+                }
+            }
+        }
         self.paused = false;
         self.maybe_regrab();
     }
@@ -1729,12 +1810,14 @@ impl GpuApp {
     fn launch_singleplayer(
         config: &GpuCliConfig,
         world: &str,
+        settings: &ClientSettings,
     ) -> Result<integrated::SingleplayerServer, String> {
         let mut cli = megu_client::cli::CliConfig::default();
         cli.quick_play_singleplayer = Some(world.to_owned());
         cli.server_bin = config.server_bin.clone();
         cli.game_dir = config.game_dir.clone();
         cli.seed = config.seed;
+        cli.client_settings = settings.clone();
         integrated::launch(&cli)
     }
 
@@ -1756,7 +1839,7 @@ impl GpuApp {
     fn start_singleplayer_world(&mut self, world: &str, seed: Option<i64>) -> Result<(), String> {
         let mut config = self.config.clone();
         config.seed = seed.or(config.seed);
-        let server = Self::launch_singleplayer(&config, world)?;
+        let server = Self::launch_singleplayer(&config, world, &self.persisted_settings)?;
         let addr = server.addr();
         self.singleplayer_server = Some(server);
         self.connect_to(addr.ip().to_string(), addr.port());
@@ -2107,9 +2190,7 @@ impl GpuApp {
         let mut active = ActiveWindow {
             window,
             surface,
-            renderer: {
-                GpuRenderer::new(ctx, surface_format)
-            },
+            renderer: { GpuRenderer::new(ctx, surface_format) },
             surface_format,
             size,
         };
@@ -2145,9 +2226,7 @@ impl GpuApp {
                     if !self.title_branding.has_banner() {
                         let (_, mod_jars) = title_branding_sources(&self.session_paths);
                         self.title_branding =
-                            crate::title_branding::load_title_branding_from_jar(
-                                &jar, &mod_jars,
-                            );
+                            crate::title_branding::load_title_branding_from_jar(&jar, &mod_jars);
                     }
                     self.bootstrap_attempted = true;
                 }
@@ -2159,9 +2238,9 @@ impl GpuApp {
                                 .last()
                                 .cloned()
                         {
-                            if let Some(dest) = crate::vanilla_bootstrap::bootstrap_dest_dir(
-                                &self.session_paths,
-                            ) {
+                            if let Some(dest) =
+                                crate::vanilla_bootstrap::bootstrap_dest_dir(&self.session_paths)
+                            {
                                 if let Some(handle) =
                                     crate::vanilla_bootstrap::spawn_vanilla_jar_bootstrap(
                                         &version_id,
@@ -2197,8 +2276,12 @@ impl GpuApp {
                 .upload_scene(&scene)
                 .map_err(|e| e.to_string())?;
         }
-        if let Some(path) = &self.config.shader_pack {
-            active.renderer.load_shaderpack(path);
+        if self.persisted_settings.shaders_enabled {
+            if let Some(pack) = self.persisted_settings.shader_pack.as_deref() {
+                let path = resolve_shaderpack_path(self.config.game_dir.as_deref(), pack);
+                active.renderer.load_shaderpack(std::path::Path::new(&path));
+                self.active_shaderpack_path = Some(path);
+            }
         }
         // Fresh `GpuRenderer` (first `resumed`, device loss, surface
         // re-create): re-arm the compute-strategy push so the next live
@@ -2370,6 +2453,8 @@ impl GpuApp {
         if self.ui_wants_input() {
             return;
         }
+        let warn_percent = self.ui.settings.qol.tool_warn_percent;
+        let prevent_tool_break = self.ui.settings.qol.prevent_tool_break;
         let Some(live) = &mut self.live else { return };
         if live.is_dead() {
             return;
@@ -2381,6 +2466,26 @@ impl GpuApp {
                         live.attack_entity(hit.entity_id);
                     }
                     Some(CrosshairPick::Block(hit)) => {
+                        if let Some((damage, max_damage)) = held_tool_durability(live) {
+                            match check_tool_durability_warning(
+                                damage,
+                                max_damage,
+                                warn_percent,
+                                prevent_tool_break,
+                            ) {
+                                ToolDurability::BlockLastUse => {
+                                    live.hud.actionbar = "Tool protected from breaking".to_owned();
+                                    live.hud_revision += 1;
+                                    return;
+                                }
+                                ToolDurability::LowWarning { remaining } => {
+                                    live.hud.actionbar =
+                                        format!("Tool durability low ({remaining})");
+                                    live.hud_revision += 1;
+                                }
+                                ToolDurability::Ok => {}
+                            }
+                        }
                         live.dig_start(hit.block_pos, hit.face as i8);
                     }
                     None => {}
@@ -2407,6 +2512,26 @@ impl GpuApp {
                         );
                     }
                     Some(CrosshairPick::Block(hit)) => {
+                        if let Some((damage, max_damage)) = held_tool_durability(live) {
+                            match check_tool_durability_warning(
+                                damage,
+                                max_damage,
+                                warn_percent,
+                                prevent_tool_break,
+                            ) {
+                                ToolDurability::BlockLastUse => {
+                                    live.hud.actionbar = "Tool protected from breaking".to_owned();
+                                    live.hud_revision += 1;
+                                    return;
+                                }
+                                ToolDurability::LowWarning { remaining } => {
+                                    live.hud.actionbar =
+                                        format!("Tool durability low ({remaining})");
+                                    live.hud_revision += 1;
+                                }
+                                ToolDurability::Ok => {}
+                            }
+                        }
                         live.use_item_on(
                             0,
                             hit.block_pos,
@@ -2471,6 +2596,32 @@ impl GpuApp {
         true
     }
 
+    /// Mouse Tweaks style wheel transfer: while a container owns the pointer,
+    /// each wheel notch quick-moves the hovered stack. Vanilla grabbed-wheel
+    /// hotbar selection remains the fallback when the feature is disabled.
+    fn container_scroll_tweak(&mut self, steps: i32) -> bool {
+        if steps == 0 || !self.ui.settings.builtin_mouse_tweaks_active(false) {
+            return false;
+        }
+        let Some(screen) = &mut self.container_screen else {
+            return false;
+        };
+        let Some(slot) = screen.hovered_slot else {
+            return false;
+        };
+        let Some(live) = &mut self.live else {
+            return false;
+        };
+        for _ in 0..steps.unsigned_abs().min(64) {
+            if let Some(action) = screen.click_mode(slot as i16, 0, 1) {
+                Self::forward_click_action(live, action);
+            } else {
+                break;
+            }
+        }
+        true
+    }
+
     /// The six view-frustum planes of the current render camera, in the
     /// `box_in_frustum` form `LiveSession::poll` orders mesh rebuilds
     /// with. `None` while no active surface exists (poll then degrades to
@@ -2526,10 +2677,7 @@ impl GpuApp {
                 .ui
                 .recipe_browser
                 .open_detail(item, DetailMode::Recipes),
-            RecipeFocus::Uses => self
-                .ui
-                .recipe_browser
-                .open_detail(item, DetailMode::Uses),
+            RecipeFocus::Uses => self.ui.recipe_browser.open_detail(item, DetailMode::Uses),
             RecipeFocus::Ponder => {
                 let scene =
                     crate::recipe_ingest::ponder_scene_for(&self.ui.recipe_browser.index, item);
@@ -2688,7 +2836,11 @@ impl GpuApp {
             self.pending_suggestion_tx = None;
             self.maybe_regrab();
         }
-        sync_chat_input_hud(&mut self.ui.hud.chat_input, self.chat_bar.as_ref());
+        sync_chat_input_hud(
+            &mut self.ui.hud.chat_input,
+            self.chat_bar.as_ref(),
+            self.ui.settings.zsh_command_bar,
+        );
     }
 
     /// Fold the live session's server-driven completion channels into
@@ -2719,9 +2871,7 @@ impl GpuApp {
         if live.custom_chat_completions_rev != self.seen_completions_rev {
             self.seen_completions_rev = live.custom_chat_completions_rev;
             if let Some(bar) = &mut self.chat_bar {
-                bar.set_custom_chat_completions(
-                    live.custom_chat_completions.iter().cloned(),
-                );
+                bar.set_custom_chat_completions(live.custom_chat_completions.iter().cloned());
             }
         }
         // Cooldowns decrement on the client tick (20 Hz), not per frame.
@@ -2852,15 +3002,19 @@ impl GpuApp {
             *title_tick_accum -= 0.05;
         }
 
-        ui.hud.looking_at = match &feed.looking_at_block {
-            Some((position, block_id)) => LookingAtBlockState {
-                enabled: true,
-                block_id: block_id.clone(),
-                display_name: block_id.clone(),
-                position: Some(*position),
-                ..Default::default()
-            },
-            None => LookingAtBlockState::default(),
+        ui.hud.looking_at = if ui.settings.builtin_looking_at_hud_active(false) {
+            match &feed.looking_at_block {
+                Some((position, block_id)) => LookingAtBlockState {
+                    enabled: true,
+                    block_id: block_id.clone(),
+                    display_name: block_id.clone(),
+                    position: Some(*position),
+                    ..Default::default()
+                },
+                None => LookingAtBlockState::default(),
+            }
+        } else {
+            LookingAtBlockState::default()
         };
     }
 
@@ -2875,8 +3029,11 @@ impl GpuApp {
         // pose read below is the freshest input the OS delivered.
         let (mdx, mdy) = std::mem::take(&mut self.pending_mouse_delta);
         if mdx != 0.0 || mdy != 0.0 {
-            self.camera_controller
-                .apply_mouse_look(&mut self.camera, mdx, mdy);
+            self.camera_controller.apply_mouse_look(
+                &mut self.camera,
+                mdx,
+                mouse_pitch_delta(mdy, self.ui.settings.mouse_invert_y),
+            );
         }
 
         let planes = self.view_frustum_planes();
@@ -2931,9 +3088,7 @@ impl GpuApp {
 
         // Occluded (minimized / fully covered): zero GPU work. The live
         // session above still polls so the connection stays alive.
-        if self.occluded
-            && std::env::var_os("MEGU_DISABLE_OCCLUSION_SLEEP").is_none()
-        {
+        if self.occluded && std::env::var_os("MEGU_DISABLE_OCCLUSION_SLEEP").is_none() {
             return;
         }
 
@@ -2985,6 +3140,18 @@ impl GpuApp {
             // Revision-gated HUD sync: unchanged server state skips the
             // `HudState` clone entirely (`live.hud_sync_skips` counts hits).
             live.sync_hud_to(&mut self.ui.hud);
+            let mini_hud = &mut self.ui.settings.qol.mini_hud;
+            let mini_segments = self.persisted_settings.mini_hud_segments;
+            mini_hud.enabled = self.persisted_settings.mini_hud_enabled;
+            mini_hud.show_fps = mini_segments & (1 << 0) != 0;
+            mini_hud.show_coords = mini_segments & (1 << 1) != 0;
+            mini_hud.show_biome = mini_segments & (1 << 2) != 0;
+            mini_hud.show_facing = mini_segments & (1 << 3) != 0;
+            mini_hud.show_ping = mini_segments & (1 << 4) != 0;
+            mini_hud.show_mspt_tps = mini_segments & (1 << 5) != 0;
+            mini_hud.show_light_level = mini_segments & (1 << 6) != 0;
+            mini_hud.show_chunks_entities = mini_segments & (1 << 7) != 0;
+            mini_hud.show_ram = mini_segments & (1 << 8) != 0;
             live.record_frame_and_refresh_minihud(dt, &mut self.ui);
             live.set_ui_locale(self.ui.settings.locale.code());
             let feed = live.hud_feed();
@@ -3025,7 +3192,9 @@ impl GpuApp {
             // `.mcmeta` playback: one `SpriteFrame` rewrite per animated
             // sprite, and only when the client-side 20 Hz clock advanced
             // inside `poll` — steady frames cost one compare.
-            active.renderer.tick_atlas_animations(live.atlas_anim_tick());
+            active
+                .renderer
+                .tick_atlas_animations(live.atlas_anim_tick());
             active.renderer.sync_subworlds(&mut live.subworlds);
             // First live frame on this renderer (attach order or
             // surface/device re-creation): push the session's
@@ -3048,8 +3217,7 @@ impl GpuApp {
                 .next_refresh
                 .is_none_or(|t| frame_begin >= t)
             {
-                self.entity_render_cache.next_refresh =
-                    Some(frame_begin + LIVE_ENTITY_REFRESH);
+                self.entity_render_cache.next_refresh = Some(frame_begin + LIVE_ENTITY_REFRESH);
                 Self::refresh_live_entity_and_ber(
                     live,
                     &mut self.entity_render_cache,
@@ -3145,7 +3313,11 @@ impl GpuApp {
         // Chat-bar mirror lands after `sync_hud_to` (which clones
         // `live.hud` wholesale) and before the draw list rebuild — the
         // input strip + suggestion popup read it this frame.
-        sync_chat_input_hud(&mut self.ui.hud.chat_input, self.chat_bar.as_ref());
+        sync_chat_input_hud(
+            &mut self.ui.hud.chat_input,
+            self.chat_bar.as_ref(),
+            self.ui.settings.zsh_command_bar,
+        );
         // Pooled draw list (C4): `render_into` clears + refills
         // `self.ui_draw_list` in place so steady frames allocate
         // nothing (text payloads recycle inside the list). The command
@@ -3209,12 +3381,7 @@ impl GpuApp {
             screen.render(w as f32, h as f32, draw_list);
         }
         if self.advancements_open {
-            Self::render_advancements_overlay(
-                self.live.as_ref(),
-                w as i32,
-                h as i32,
-                draw_list,
-            );
+            Self::render_advancements_overlay(self.live.as_ref(), w as i32, h as i32, draw_list);
         }
         // Dirty-only upload: unchanged HUD frames skip even the quad
         // tessellation; changed frames upload only the small dynamic
@@ -3241,8 +3408,7 @@ impl GpuApp {
                         // light UBO (`dynamic_colored_lights` did the
                         // same call and discarded the rest) and the
                         // particle staging below.
-                        let vfx_frame =
-                            live.vfx.frame_output(render_camera.forward_vector());
+                        let vfx_frame = live.vfx.frame_output(render_camera.forward_vector());
                         Self::stage_live_particles(
                             live,
                             &vfx_frame,
@@ -3281,12 +3447,9 @@ impl GpuApp {
                 if let Ok(path) = std::env::var("MEGU_FRAME_DUMP") {
                     static DUMPED: std::sync::atomic::AtomicBool =
                         std::sync::atomic::AtomicBool::new(false);
-                    static PN0: std::sync::atomic::AtomicU32 =
-                        std::sync::atomic::AtomicU32::new(0);
+                    static PN0: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
                     let pn = PN0.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                    if pn >= 30
-                        && !DUMPED.swap(true, std::sync::atomic::Ordering::Relaxed)
-                    {
+                    if pn >= 30 && !DUMPED.swap(true, std::sync::atomic::Ordering::Relaxed) {
                         let dev = &active.renderer.gpu().device;
                         let queue = &active.renderer.gpu().queue;
                         let row = w * 4;
@@ -3294,15 +3457,12 @@ impl GpuApp {
                         let buf = dev.create_buffer(&wgpu::BufferDescriptor {
                             label: Some("frame-dump"),
                             size: (padded * h) as u64,
-                            usage: wgpu::BufferUsages::COPY_DST
-                                | wgpu::BufferUsages::MAP_READ,
+                            usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
                             mapped_at_creation: false,
                         });
-                        let mut enc = dev.create_command_encoder(
-                            &wgpu::CommandEncoderDescriptor {
-                                label: Some("frame-dump"),
-                            },
-                        );
+                        let mut enc = dev.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                            label: Some("frame-dump"),
+                        });
                         enc.copy_texture_to_buffer(
                             wgpu::TexelCopyTextureInfo {
                                 texture: &frame.texture,
@@ -3336,13 +3496,10 @@ impl GpuApp {
                         });
                         if let Ok(Ok(())) = rx2.recv() {
                             let data = slice.get_mapped_range().unwrap();
-                            let mut img =
-                                format!("P6\n{} {}\n255\n", w, h).into_bytes();
+                            let mut img = format!("P6\n{} {}\n255\n", w, h).into_bytes();
                             for y in 0..h as usize {
                                 let start = y * padded as usize;
-                                img.extend_from_slice(
-                                    &data[start..start + row as usize],
-                                );
+                                img.extend_from_slice(&data[start..start + row as usize]);
                             }
                             drop(data);
                             buf.unmap();
@@ -3353,12 +3510,10 @@ impl GpuApp {
                 }
                 active.renderer.gpu().queue.present(frame);
                 if std::env::var_os("MEGU_FPS_LOG").is_some() {
-                    static FPS: std::sync::OnceLock<
-                        std::sync::Mutex<(std::time::Instant, u32)>,
-                    > = std::sync::OnceLock::new();
-                    let st = FPS.get_or_init(|| {
-                        std::sync::Mutex::new((std::time::Instant::now(), 0))
-                    });
+                    static FPS: std::sync::OnceLock<std::sync::Mutex<(std::time::Instant, u32)>> =
+                        std::sync::OnceLock::new();
+                    let st =
+                        FPS.get_or_init(|| std::sync::Mutex::new((std::time::Instant::now(), 0)));
                     let mut g = st.lock().unwrap();
                     g.1 += 1;
                     let el = g.0.elapsed();
@@ -3464,6 +3619,18 @@ impl GpuApp {
 
     fn handle_key(&mut self, code: KeyCode, state: ElementState, event_loop: &ActiveEventLoop) {
         let pressed = state == ElementState::Pressed;
+        if let Some(index) = self.ui.capturing_key_binding {
+            if pressed {
+                if code == KeyCode::Escape {
+                    self.ui.capturing_key_binding = None;
+                } else if self.ui.settings.keys.set(index, format!("{code:?}")) {
+                    self.ui.capturing_key_binding = None;
+                    self.dispatch_ui_action(&UiAction::SettingsChanged);
+                }
+            }
+            return;
+        }
+        let code = remap_bound_key(code, &self.ui.settings.keys);
         let f3_chord_pressed =
             pressed && self.input_router.f3_held && f3_chord_for_key(code).is_some();
         // JEI hover hotkeys while a container/inventory surface is up:
@@ -3548,6 +3715,10 @@ impl GpuApp {
                 }
             }
             KeyCode::KeyC => self.camera_controller.set_zoomed(pressed && !self.paused),
+            KeyCode::F11 if pressed => {
+                toggle_fullscreen_setting(&mut self.ui.settings);
+                self.dispatch_ui_action(&UiAction::SettingsChanged);
+            }
             KeyCode::F5 if pressed && !self.paused => {
                 self.camera_controller.cycle_mode();
             }
@@ -3640,8 +3811,9 @@ impl GpuApp {
                     let excess = self.debug_messages.len() - 100;
                     self.debug_messages.drain(..excess);
                 }
-                if self.ui.hud.chat_lines.len() > 100 {
-                    let excess = self.ui.hud.chat_lines.len() - 100;
+                let chat_limit = self.ui.settings.qol.chat_history_lines.clamp(100, 5000);
+                if self.ui.hud.chat_lines.len() > chat_limit {
+                    let excess = self.ui.hud.chat_lines.len() - chat_limit;
                     self.ui.hud.chat_lines.drain(..excess);
                 }
             }
@@ -3863,6 +4035,67 @@ fn open_url(url: &str) -> Result<(), String> {
     }
 }
 
+fn remap_bound_key(code: KeyCode, bindings: &megu_ui::state::KeyBindings) -> KeyCode {
+    let physical = format!("{code:?}");
+    [
+        (&bindings.forward, KeyCode::KeyW),
+        (&bindings.back, KeyCode::KeyS),
+        (&bindings.left, KeyCode::KeyA),
+        (&bindings.right, KeyCode::KeyD),
+        (&bindings.jump, KeyCode::Space),
+        (&bindings.sneak, KeyCode::ShiftLeft),
+        (&bindings.sprint, KeyCode::ControlLeft),
+        (&bindings.inventory, KeyCode::KeyE),
+        (&bindings.drop, KeyCode::KeyQ),
+        (&bindings.swap_offhand, KeyCode::KeyF),
+        (&bindings.chat, KeyCode::KeyT),
+        (&bindings.command, KeyCode::Slash),
+        (&bindings.zoom, KeyCode::KeyC),
+        (&bindings.camera_toggle, KeyCode::F5),
+        (&bindings.fullscreen, KeyCode::F11),
+        (&bindings.advancements, KeyCode::KeyL),
+        (&bindings.sort_inventory, KeyCode::KeyR),
+    ]
+    .into_iter()
+    .find_map(|(binding, action)| (binding == &physical).then_some(action))
+    .unwrap_or(code)
+}
+
+fn toggle_fullscreen_setting(settings: &mut UiSettings) {
+    settings.fullscreen = !settings.fullscreen;
+}
+
+fn mouse_pitch_delta(delta_y: f64, invert_y: bool) -> f64 {
+    if invert_y { -delta_y } else { delta_y }
+}
+
+fn effective_camera_far(view_distance: u8, lod: LodMode) -> f32 {
+    let chunks = match lod {
+        LodMode::Off => i32::from(view_distance),
+        LodMode::Medium => i32::from(view_distance).max(64),
+        LodMode::Far => i32::from(view_distance).max(128),
+    };
+    chunks as f32 * 16.0
+}
+
+fn resolve_shaderpack_path(game_dir: Option<&std::path::Path>, pack: &str) -> String {
+    let path = std::path::Path::new(pack);
+    if path.is_absolute() {
+        return path.display().to_string();
+    }
+    let root = game_dir.unwrap_or_else(|| std::path::Path::new("."));
+    let joined = if path.components().count() == 1 {
+        root.join("shaderpacks").join(path)
+    } else {
+        root.join(path)
+    };
+    joined.display().to_string()
+}
+
+fn retained_chat_on_reconnect(retain: bool, chat: &[String]) -> Vec<String> {
+    if retain { chat.to_vec() } else { Vec::new() }
+}
+
 fn ui_key(code: KeyCode) -> Option<UiKey> {
     Some(match code {
         KeyCode::Tab => UiKey::Tab,
@@ -3936,8 +4169,7 @@ impl ApplicationHandler for GpuApp {
                         if event.state == ElementState::Pressed && self.ui_wants_input() {
                             if let Some(text) = &event.text {
                                 for ch in text.chars().filter(|c| !c.is_control()) {
-                                    for action in
-                                        self.ui.handle_input(UiInputEvent::CharTyped(ch))
+                                    for action in self.ui.handle_input(UiInputEvent::CharTyped(ch))
                                     {
                                         self.apply_ui_action(&action, event_loop);
                                     }
@@ -3983,21 +4215,20 @@ impl ApplicationHandler for GpuApp {
                 }
             }
             WindowEvent::MouseWheel { delta, .. } => {
+                let lines = match delta {
+                    winit::event::MouseScrollDelta::LineDelta(_, y) => y,
+                    winit::event::MouseScrollDelta::PixelDelta(pos) => (pos.y / 40.0) as f32,
+                };
+                let steps = lines.round() as i32;
+                if !self.cursor_grabbed && !self.paused && self.container_scroll_tweak(steps) {
+                    return;
+                }
                 // Grabbed scroll cycles the held hotbar slot (vanilla
                 // `mouseScrolling$scrollHotbar`).
-                if self.cursor_grabbed && !self.paused && self.live.is_some() {
-                    let lines = match delta {
-                        winit::event::MouseScrollDelta::LineDelta(_, y) => y,
-                        winit::event::MouseScrollDelta::PixelDelta(pos) => {
-                            (pos.y / 40.0) as f32
-                        }
-                    };
-                    let steps = lines.round() as i32;
-                    if steps != 0 {
-                        let current = i32::from(self.input_router.active_hotbar_slot);
-                        let next = (current - steps).rem_euclid(9) as u8;
-                        self.apply_window_input(WindowInputEvent::SelectHotbar(next));
-                    }
+                if self.cursor_grabbed && !self.paused && self.live.is_some() && steps != 0 {
+                    let current = i32::from(self.input_router.active_hotbar_slot);
+                    let next = (current - steps).rem_euclid(9) as u8;
+                    self.apply_window_input(WindowInputEvent::SelectHotbar(next));
                 }
             }
             WindowEvent::RedrawRequested => self.render_frame(),
@@ -4033,9 +4264,7 @@ impl ApplicationHandler for GpuApp {
         // even while occluded so a download finishing in the background
         // still lands `Ready` and re-arms asset discovery.
         self.poll_vanilla_bootstrap();
-        if self.occluded
-            && std::env::var_os("MEGU_DISABLE_OCCLUSION_SLEEP").is_none()
-        {
+        if self.occluded && std::env::var_os("MEGU_DISABLE_OCCLUSION_SLEEP").is_none() {
             // Zero-GPU sleep: no redraw requests at all. A slow tick keeps
             // the live session polled until the surface un-occludes.
             if let Some(live) = &mut self.live {
@@ -4116,12 +4345,7 @@ fn list_saved_worlds(game_dir: Option<&std::path::Path>) -> Vec<String> {
     let mut worlds: Vec<String> = match std::fs::read_dir(&saves) {
         Ok(entries) => entries
             .filter_map(|entry| entry.ok())
-            .filter(|entry| {
-                entry
-                    .file_type()
-                    .map(|kind| kind.is_dir())
-                    .unwrap_or(false)
-            })
+            .filter(|entry| entry.file_type().map(|kind| kind.is_dir()).unwrap_or(false))
             .filter_map(|entry| entry.file_name().into_string().ok())
             .collect(),
         Err(_) => Vec::new(),
@@ -4138,13 +4362,17 @@ fn list_saved_worlds(game_dir: Option<&std::path::Path>) -> Vec<String> {
 fn sync_chat_input_hud(
     input: &mut megu_ui::hud_widgets::ChatInputOverlay,
     bar: Option<&ZshCommandBar>,
+    show_suggestions: bool,
 ) {
     match bar {
         Some(bar) => {
             input.open = true;
             input.text = bar.text().to_string();
             input.cursor = bar.text()[..bar.cursor()].chars().count();
-            if let Some((list, selected)) = bar.completion_menu_list() {
+            if !show_suggestions {
+                input.completions.clear();
+                input.completion_index = megu_ui::hud_widgets::NO_COMPLETION;
+            } else if let Some((list, selected)) = bar.completion_menu_list() {
                 input.completions = list;
                 input.completion_index = selected;
             } else {
@@ -4165,12 +4393,80 @@ fn sync_chat_input_hud(
     }
 }
 
+/// Read the held hotbar stack's explicit 1.21.1 `max_damage` (component 2)
+/// and `damage` (component 3) patches. Items whose prototype carries these
+/// components implicitly are left alone because the client has no registry
+/// prototype table to resolve them safely.
+fn held_tool_durability(live: &LiveSession) -> Option<(u32, u32)> {
+    let slot = 36 + live.hud.selected_slot.min(8) as i32;
+    let stack = live.player_inventory.get(&slot)?;
+    let component_value = |type_id| {
+        stack
+            .added
+            .iter()
+            .find(|component| component.type_id == type_id)
+            .and_then(|component| parse_component_varint(&component.data))
+    };
+    let max_damage = component_value(2)?;
+    let damage = component_value(3).unwrap_or(0);
+    (max_damage > 0).then_some((damage, max_damage))
+}
+
+fn parse_component_varint(bytes: &[u8]) -> Option<u32> {
+    let mut result = 0u32;
+    for (index, byte) in bytes.iter().copied().enumerate().take(5) {
+        result |= u32::from(byte & 0x7f).checked_shl((index * 7) as u32)?;
+        if byte & 0x80 == 0 {
+            return (index + 1 == bytes.len()).then_some(result);
+        }
+    }
+    None
+}
+
 /// Mirror the persisted `client-app` settings into `UiSettings` — every
 /// UI-visible key the file defines (video/audio/camera/QoL/fair-play)
 /// lands on its widget state so `apply_settings` activates it. UI-only
 /// surfaces (visual style, locale, shader quick-toggle, language) stay
 /// untouched.
 fn apply_client_settings_to_ui(src: &ClientSettings, ui: &mut UiSettings) {
+    ui.fullscreen = src.fullscreen;
+    ui.mouse_invert_y = src.mouse_invert_y;
+    ui.gamma_pct = src.gamma_pct.clamp(50, 200);
+    ui.gui_scale = src.gui_scale.min(4);
+    ui.keys = megu_ui::state::KeyBindings {
+        forward: src.keys.forward.clone(),
+        back: src.keys.back.clone(),
+        left: src.keys.left.clone(),
+        right: src.keys.right.clone(),
+        jump: src.keys.jump.clone(),
+        sneak: src.keys.sneak.clone(),
+        sprint: src.keys.sprint.clone(),
+        inventory: src.keys.inventory.clone(),
+        drop: src.keys.drop.clone(),
+        swap_offhand: src.keys.swap_offhand.clone(),
+        chat: src.keys.chat.clone(),
+        command: src.keys.command.clone(),
+        zoom: src.keys.zoom.clone(),
+        camera_toggle: src.keys.camera_toggle.clone(),
+        fullscreen: src.keys.fullscreen.clone(),
+        advancements: src.keys.advancements.clone(),
+        sort_inventory: src.keys.sort_inventory.clone(),
+    };
+    ui.shader_quick.shaders_enabled = src.shaders_enabled;
+    ui.qol_looking_at_hud = src.builtin_looking_at_hud;
+    ui.qol_mouse_tweaks = src.builtin_mouse_tweaks;
+    ui.qol_inventory_sort = src.builtin_inventory_sort;
+    ui.zsh_command_bar = src.zsh_command_bar;
+    ui.qol.mini_hud.enabled = src.mini_hud_enabled;
+    ui.qol.mini_hud.show_fps = src.mini_hud_segments & (1 << 0) != 0;
+    ui.qol.mini_hud.show_coords = src.mini_hud_segments & (1 << 1) != 0;
+    ui.qol.mini_hud.show_biome = src.mini_hud_segments & (1 << 2) != 0;
+    ui.qol.mini_hud.show_facing = src.mini_hud_segments & (1 << 3) != 0;
+    ui.qol.mini_hud.show_ping = src.mini_hud_segments & (1 << 4) != 0;
+    ui.qol.mini_hud.show_mspt_tps = src.mini_hud_segments & (1 << 5) != 0;
+    ui.qol.mini_hud.show_light_level = src.mini_hud_segments & (1 << 6) != 0;
+    ui.qol.mini_hud.show_chunks_entities = src.mini_hud_segments & (1 << 7) != 0;
+    ui.qol.mini_hud.show_ram = src.mini_hud_segments & (1 << 8) != 0;
     ui.video.preset = match src.preset {
         QualityPreset::Fast => VideoPreset::Fast,
         QualityPreset::Balanced => VideoPreset::Balanced,
@@ -4187,9 +4483,7 @@ fn apply_client_settings_to_ui(src: &ClientSettings, ui: &mut UiSettings) {
     ui.video.gpu_backend = match src.gpu_backend {
         megu_client_mesh::RenderBackendPreference::Auto => GpuBackend::Auto,
         megu_client_mesh::RenderBackendPreference::MeshShader => GpuBackend::MeshShader,
-        megu_client_mesh::RenderBackendPreference::ComputeIndirect => {
-            GpuBackend::ComputeIndirect
-        }
+        megu_client_mesh::RenderBackendPreference::ComputeIndirect => GpuBackend::ComputeIndirect,
         megu_client_mesh::RenderBackendPreference::Classic => GpuBackend::Classic,
         megu_client_mesh::RenderBackendPreference::ClassicLowSpec => GpuBackend::ClassicLowSpec,
     };
@@ -4231,12 +4525,61 @@ fn apply_client_settings_to_ui(src: &ClientSettings, ui: &mut UiSettings) {
     ui.fair_play.allow_waypoint_teleport = src.map_fair_play.allow_waypoint_teleport;
 }
 
+fn ui_gpu_backend(backend: GpuBackend) -> megu_client_mesh::RenderBackendPreference {
+    match backend {
+        GpuBackend::Auto => megu_client_mesh::RenderBackendPreference::Auto,
+        GpuBackend::MeshShader => megu_client_mesh::RenderBackendPreference::MeshShader,
+        GpuBackend::ComputeIndirect => megu_client_mesh::RenderBackendPreference::ComputeIndirect,
+        GpuBackend::Classic => megu_client_mesh::RenderBackendPreference::Classic,
+        GpuBackend::ClassicLowSpec => megu_client_mesh::RenderBackendPreference::ClassicLowSpec,
+    }
+}
+
 /// Overlay the UI-visible settings onto `base` (the last loaded file
 /// state): every widget-owned key writes back, and file-only fields
 /// (`shader_pack`, `shader_profile`, `report_endpoint`, `particles`,
 /// `clouds`, `entity_shadows`) survive untouched.
 fn ui_to_client_settings(ui: &UiSettings, base: &ClientSettings) -> ClientSettings {
     let mut out = base.clone();
+    out.shaders_enabled = ui.shader_quick.shaders_enabled;
+    out.builtin_looking_at_hud = ui.qol_looking_at_hud;
+    out.builtin_mouse_tweaks = ui.qol_mouse_tweaks;
+    out.builtin_inventory_sort = ui.qol_inventory_sort;
+    out.zsh_command_bar = ui.zsh_command_bar;
+    let mini = &ui.qol.mini_hud;
+    out.mini_hud_enabled = mini.enabled;
+    out.mini_hud_segments = u16::from(mini.show_fps)
+        | (u16::from(mini.show_coords) << 1)
+        | (u16::from(mini.show_biome) << 2)
+        | (u16::from(mini.show_facing) << 3)
+        | (u16::from(mini.show_ping) << 4)
+        | (u16::from(mini.show_mspt_tps) << 5)
+        | (u16::from(mini.show_light_level) << 6)
+        | (u16::from(mini.show_chunks_entities) << 7)
+        | (u16::from(mini.show_ram) << 8);
+    out.fullscreen = ui.fullscreen;
+    out.mouse_invert_y = ui.mouse_invert_y;
+    out.gamma_pct = ui.gamma_pct.clamp(50, 200);
+    out.gui_scale = ui.gui_scale.min(4);
+    out.keys = megu_client::settings::KeyBindings {
+        forward: ui.keys.forward.clone(),
+        back: ui.keys.back.clone(),
+        left: ui.keys.left.clone(),
+        right: ui.keys.right.clone(),
+        jump: ui.keys.jump.clone(),
+        sneak: ui.keys.sneak.clone(),
+        sprint: ui.keys.sprint.clone(),
+        inventory: ui.keys.inventory.clone(),
+        drop: ui.keys.drop.clone(),
+        swap_offhand: ui.keys.swap_offhand.clone(),
+        chat: ui.keys.chat.clone(),
+        command: ui.keys.command.clone(),
+        zoom: ui.keys.zoom.clone(),
+        camera_toggle: ui.keys.camera_toggle.clone(),
+        fullscreen: ui.keys.fullscreen.clone(),
+        advancements: ui.keys.advancements.clone(),
+        sort_inventory: ui.keys.sort_inventory.clone(),
+    };
     out.preset = match ui.video.preset {
         VideoPreset::Fast => QualityPreset::Fast,
         VideoPreset::Balanced => QualityPreset::Balanced,
@@ -4253,9 +4596,7 @@ fn ui_to_client_settings(ui: &UiSettings, base: &ClientSettings) -> ClientSettin
     out.gpu_backend = match ui.video.gpu_backend {
         GpuBackend::Auto => megu_client_mesh::RenderBackendPreference::Auto,
         GpuBackend::MeshShader => megu_client_mesh::RenderBackendPreference::MeshShader,
-        GpuBackend::ComputeIndirect => {
-            megu_client_mesh::RenderBackendPreference::ComputeIndirect
-        }
+        GpuBackend::ComputeIndirect => megu_client_mesh::RenderBackendPreference::ComputeIndirect,
         GpuBackend::Classic => megu_client_mesh::RenderBackendPreference::Classic,
         GpuBackend::ClassicLowSpec => megu_client_mesh::RenderBackendPreference::ClassicLowSpec,
     };
@@ -4287,8 +4628,7 @@ fn ui_to_client_settings(ui: &UiSettings, base: &ClientSettings) -> ClientSettin
         MinimapMode::FairPlay => HostMinimapMode::FairPlay,
         MinimapMode::Disabled => HostMinimapMode::Disabled,
     };
-    out.map_fair_play.minimap_fair_play =
-        ui.fair_play.minimap_mode != MinimapMode::Unrestricted;
+    out.map_fair_play.minimap_fair_play = ui.fair_play.minimap_mode != MinimapMode::Unrestricted;
     out.map_fair_play.allow_cave_map = ui.fair_play.allow_cave_map;
     out.map_fair_play.allow_mob_radar = ui.fair_play.allow_mob_radar;
     // `allow_entity_radar` mirrors `allow_mob_radar` (same restriction).
@@ -4439,9 +4779,7 @@ fn default_vanilla_ber_state(kind: VanillaBerKind) -> VanillaBerState {
             lit: true,
             item_count: 2,
         },
-        VanillaBerKind::BrewingStand => VanillaBerState::BrewingStand {
-            bottle_mask: 0b111,
-        },
+        VanillaBerKind::BrewingStand => VanillaBerState::BrewingStand { bottle_mask: 0b111 },
         VanillaBerKind::Lectern => VanillaBerState::Lectern {
             has_book: false,
             facing: VanillaBerFacing::South,
@@ -4500,8 +4838,7 @@ fn live_entity_pose(
         // shared flags byte keeps the sneak/elytra bits too.
         pose.swimming = meta.pose == Some(3);
         pose.sneaking = meta.pose == Some(5) || meta.flags.is_some_and(|f| f & 0x02 != 0);
-        pose.elytra_flying =
-            meta.pose == Some(1) || meta.flags.is_some_and(|f| f & 0x80 != 0);
+        pose.elytra_flying = meta.pose == Some(1) || meta.flags.is_some_and(|f| f & 0x80 != 0);
     }
     pose
 }
@@ -4637,12 +4974,7 @@ fn push_billboard(
 
 /// Horizontal quad lying on the XZ plane (water ripples, dust rings,
 /// ground decals).
-fn push_flat_ring(
-    quads: &mut Vec<VanillaParticleQuad>,
-    pos: [f32; 3],
-    half: f32,
-    color: [f32; 4],
-) {
+fn push_flat_ring(quads: &mut Vec<VanillaParticleQuad>, pos: [f32; 3], half: f32, color: [f32; 4]) {
     if !half.is_finite() || half <= 0.0 {
         return;
     }
@@ -4732,14 +5064,12 @@ fn push_vfx_particle(
             let speed = (particle.velocity[0] * particle.velocity[0]
                 + particle.velocity[1] * particle.velocity[1]
                 + particle.velocity[2] * particle.velocity[2])
-            .sqrt();
+                .sqrt();
             if speed > 1e-4 {
                 // Streak axis along the velocity (longer when faster);
                 // the cross axis stays as camera-perpendicular as the
                 // motion allows.
-                let axis_u = particle
-                    .velocity
-                    .map(|v| v / speed * (half + speed * 0.5));
+                let axis_u = particle.velocity.map(|v| v / speed * (half + speed * 0.5));
                 let cx = axis_u[1] * forward[2] - axis_u[2] * forward[1];
                 let cy = axis_u[2] * forward[0] - axis_u[0] * forward[2];
                 let cz = axis_u[0] * forward[1] - axis_u[1] * forward[0];
@@ -4805,6 +5135,97 @@ pub fn run(config: GpuCliConfig) -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn remapped_key_binding_routes_to_vanilla_action_and_persists_capture_name() {
+        let mut bindings = megu_ui::state::KeyBindings {
+            forward: "KeyI".to_owned(),
+            ..megu_ui::state::KeyBindings::default()
+        };
+        assert_eq!(remap_bound_key(KeyCode::KeyI, &bindings), KeyCode::KeyW);
+        assert_eq!(remap_bound_key(KeyCode::KeyW, &bindings), KeyCode::KeyW);
+        assert!(bindings.set(0, format!("{:?}", KeyCode::KeyJ)));
+        assert_eq!(bindings.forward, "KeyJ");
+    }
+
+    #[test]
+    fn held_tool_components_drive_warning_and_final_use_guard() {
+        let (_tx, incoming) = std::sync::mpsc::sync_channel(1);
+        let (outgoing, _rx) = std::sync::mpsc::sync_channel(1);
+        let mut live = LiveSession::with_channels(incoming, outgoing);
+        live.player_inventory.insert(
+            36,
+            megu_client::protocol::ItemStackComponents {
+                count: 1,
+                item_id: 1,
+                added: vec![
+                    megu_client::protocol::ItemComponentPatch {
+                        type_id: 2,
+                        data: vec![10],
+                    },
+                    megu_client::protocol::ItemComponentPatch {
+                        type_id: 3,
+                        data: vec![9],
+                    },
+                ],
+                removed: Vec::new(),
+            },
+        );
+        let (damage, max_damage) = held_tool_durability(&live).expect("durability components");
+        assert_eq!(
+            check_tool_durability_warning(damage, max_damage, 10, false),
+            ToolDurability::LowWarning { remaining: 1 }
+        );
+        assert_eq!(
+            check_tool_durability_warning(damage, max_damage, 10, true),
+            ToolDurability::BlockLastUse
+        );
+    }
+
+    #[test]
+    fn fullscreen_and_invert_y_helpers_change_runtime_input_state() {
+        let mut settings = UiSettings::default();
+        toggle_fullscreen_setting(&mut settings);
+        assert!(settings.fullscreen);
+        toggle_fullscreen_setting(&mut settings);
+        assert!(!settings.fullscreen);
+        assert_eq!(mouse_pitch_delta(3.5, false), 3.5);
+        assert_eq!(mouse_pitch_delta(3.5, true), -3.5);
+        assert_eq!(effective_camera_far(8, LodMode::Off), 128.0);
+        assert_eq!(effective_camera_far(8, LodMode::Medium), 1024.0);
+        assert_eq!(effective_camera_far(8, LodMode::Far), 2048.0);
+        let chat = vec!["old line".to_owned()];
+        assert_eq!(retained_chat_on_reconnect(true, &chat), chat);
+        assert!(retained_chat_on_reconnect(false, &chat).is_empty());
+    }
+
+    #[test]
+    fn first_run_options_txt_import_seeds_the_live_settings_model() {
+        let dir =
+            std::env::temp_dir().join(format!("megu-gpu-options-import-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("create game dir");
+        std::fs::write(
+            dir.join("options.txt"),
+            "renderDistance:8\nfov:0.75\nenableVsync:false\nao:0\ninvertYMouse:true\ngamma:0.5\nguiScale:2\nfullscreen:true\n",
+        )
+        .expect("write vanilla options");
+        let app = GpuApp::new(GpuCliConfig {
+            game_dir: Some(dir.clone()),
+            offline_demo: true,
+            ..GpuCliConfig::default()
+        });
+        assert_eq!(app.persisted_settings.view_distance, 8);
+        assert_eq!(app.ui.settings.fov_deg, 90);
+        assert!(!app.ui.settings.video.vsync);
+        assert!(!app.ui.settings.video.smooth_lighting);
+        assert!(app.ui.settings.mouse_invert_y);
+        assert_eq!(app.ui.settings.gamma_pct, 150);
+        assert_eq!(app.ui.settings.gui_scale, 2);
+        assert!(app.ui.settings.fullscreen);
+        assert!(!dir.join(megu_client::settings::SETTINGS_FILE_NAME).exists());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     #[test]
     fn megu_default_links_wire_into_gpu_app_and_respect_show_support_links_toggle() {
@@ -4888,10 +5309,7 @@ mod tests {
 
     #[test]
     fn submit_crash_report_honors_off_mode_and_writes_redacted_local_report() {
-        let dir = std::env::temp_dir().join(format!(
-            "megu-gpu-crash-test-{}",
-            std::process::id()
-        ));
+        let dir = std::env::temp_dir().join(format!("megu-gpu-crash-test-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
 
@@ -4931,10 +5349,7 @@ mod tests {
 
     #[test]
     fn list_saved_worlds_lists_only_directories_sorted() {
-        let dir = std::env::temp_dir().join(format!(
-            "megu-gpu-saves-test-{}",
-            std::process::id()
-        ));
+        let dir = std::env::temp_dir().join(format!("megu-gpu-saves-test-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         let saves = dir.join("saves");
         std::fs::create_dir_all(saves.join("Beta World")).unwrap();
@@ -4953,10 +5368,7 @@ mod tests {
 
     #[test]
     fn singleplayer_screen_populates_worlds_from_game_dir() {
-        let dir = std::env::temp_dir().join(format!(
-            "megu-gpu-sp-worlds-{}",
-            std::process::id()
-        ));
+        let dir = std::env::temp_dir().join(format!("megu-gpu-sp-worlds-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(dir.join("saves").join("Test World")).unwrap();
 
@@ -4975,9 +5387,7 @@ mod tests {
     #[test]
     fn play_world_launch_failure_surfaces_visible_status() {
         let mut app = GpuApp::new(GpuCliConfig {
-            server_bin: Some(std::path::PathBuf::from(
-                "/nonexistent/megu-integrated",
-            )),
+            server_bin: Some(std::path::PathBuf::from("/nonexistent/megu-integrated")),
             ..GpuCliConfig::default()
         });
         app.dispatch_ui_action(&UiAction::PlayWorld {
@@ -4991,10 +5401,11 @@ mod tests {
             status.contains("Singleplayer") && status.contains("New World"),
             "title_status did not capture the failure: {status:?}"
         );
-        assert!(app
-            .status_messages()
-            .iter()
-            .any(|m| m.contains("Singleplayer")));
+        assert!(
+            app.status_messages()
+                .iter()
+                .any(|m| m.contains("Singleplayer"))
+        );
     }
 
     #[test]
@@ -5130,7 +5541,8 @@ mod tests {
         let mut live = LiveSession::offline_with_null_audio();
         live.status = SessionStatus::Playing;
         app.attach_live(live);
-        app.ui.show_death(megu_ui::death_screen::DeathScreenState::default());
+        app.ui
+            .show_death(megu_ui::death_screen::DeathScreenState::default());
 
         // The real click path: the widget emits `LeaveWorld` while the
         // state machine navigates to Title; dispatch drops the session.
@@ -5332,6 +5744,9 @@ mod tests {
     fn chat_lines_bounded_and_never_duplicated_across_frames() {
         let mut app = GpuApp::new(GpuCliConfig::default());
         app.attach_live(LiveSession::offline_with_null_audio());
+        app.ui.settings.qol.chat_history_lines = 100;
+        let settings = app.ui.settings.clone();
+        app.apply_settings(&settings);
         for i in 0..140 {
             app.dispatch_input(WindowInputEvent::DebugChord(
                 DebugChordAction::ChatFeedback(format!("line {i}")),
@@ -5339,10 +5754,7 @@ mod tests {
         }
         // Simulate 300 rendered frames worth of HUD syncs.
         for _ in 0..300 {
-            app.live
-                .as_mut()
-                .unwrap()
-                .sync_hud_to(&mut app.ui.hud);
+            app.live.as_mut().unwrap().sync_hud_to(&mut app.ui.hud);
         }
         assert!(
             app.ui.hud.chat_lines.len() <= 100,
@@ -5370,6 +5782,9 @@ mod tests {
     #[test]
     fn offline_chat_lines_stay_bounded() {
         let mut app = GpuApp::new(GpuCliConfig::default());
+        app.ui.settings.qol.chat_history_lines = 100;
+        let settings = app.ui.settings.clone();
+        app.apply_settings(&settings);
         for i in 0..140 {
             app.dispatch_input(WindowInputEvent::DebugChord(
                 DebugChordAction::ChatFeedback(format!("line {i}")),
@@ -5377,7 +5792,10 @@ mod tests {
         }
         assert!(app.ui.hud.chat_lines.len() <= 100);
         assert_eq!(app.debug_messages.len(), 100);
-        assert_eq!(app.ui.hud.chat_lines.first().map(String::as_str), Some("line 40"));
+        assert_eq!(
+            app.ui.hud.chat_lines.first().map(String::as_str),
+            Some("line 40")
+        );
     }
 
     /// C3: attaching a session replays the pre-connect debug log into
@@ -5500,10 +5918,8 @@ mod tests {
     /// persists through the store, `DeleteServer` removes it.
     #[test]
     fn multiplayer_screen_loads_and_persists_server_list() {
-        let dir = std::env::temp_dir().join(format!(
-            "megu-gpu-servers-test-{}",
-            std::process::id()
-        ));
+        let dir =
+            std::env::temp_dir().join(format!("megu-gpu-servers-test-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         let mut app = GpuApp::new(GpuCliConfig {

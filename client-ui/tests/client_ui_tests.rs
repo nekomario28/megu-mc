@@ -6,23 +6,19 @@
 //! must behave through the real input router.
 
 use megu_client_ui::draw::{
-    encode_png_rgba, font_atlas_rgba, glyph_for, rasterize_draw_list, tessellate_draw_list,
-    text_height, text_width, UiColor, UiCommand, UiDrawList, UiRect, FONT_ATLAS_HEIGHT,
-    FONT_ATLAS_WIDTH,
+    FONT_ATLAS_HEIGHT, FONT_ATLAS_WIDTH, UiColor, UiCommand, UiDrawList, UiRect, encode_png_rgba,
+    font_atlas_rgba, glyph_for, rasterize_draw_list, tessellate_draw_list, text_height, text_width,
 };
-use megu_client_ui::magic_hud::{
-    CastBarState, CooldownSlotState, MagicHudState, StatusBadgeState,
-};
+use megu_client_ui::magic_hud::{CastBarState, CooldownSlotState, MagicHudState, StatusBadgeState};
 use megu_client_ui::mod_menu::{ModMenuEntry, ModMenuState, ModMenuWidgetId};
 use megu_client_ui::recipe_browser::{
-    BrowserTab, ItemEntry, PonderScene, PonderStep, RecipeBrowserState, RecipeIndex,
-    RecipeWidgetId,
+    BrowserTab, ItemEntry, PonderScene, PonderStep, RecipeBrowserState, RecipeIndex, RecipeWidgetId,
 };
 use megu_client_ui::state::{
-    invite_code_display, invite_code_parse, CraftingConflictOverlay, CrashReportMode,
-    GamepadButton, HitRegion, HudSubtitle, LanguageSetting, MiniHudPreset, MinimapMode,
-    ModSyncEntry, PlayerRadarScope, Screen, SettingsTab, SubtitleDirection, UiAction, UiInputEvent,
-    UiKey, UiLang, UiModal, UiState, WidgetId, CRASH_PREVIEW_MAX_BYTES,
+    CRASH_PREVIEW_MAX_BYTES, CraftingConflictOverlay, CrashReportMode, GamepadButton, HitRegion,
+    HudSubtitle, LanguageSetting, MiniHudPreset, MinimapMode, ModSyncEntry, PlayerRadarScope,
+    Screen, SettingsTab, SubtitleDirection, UiAction, UiInputEvent, UiKey, UiLang, UiModal,
+    UiState, WidgetId, invite_code_display, invite_code_parse,
 };
 use megu_core::crash_report::CrashContext;
 use megu_core::sys_metrics::{MiniHudAnchor, MiniHudConfig, MiniHudData};
@@ -144,11 +140,7 @@ fn assert_draws_within_viewport(list: &UiDrawList, w: u32, h: u32) {
                 );
             }
             UiCommand::Text {
-                x,
-                y,
-                scale,
-                text,
-                ..
+                x, y, scale, text, ..
             } => {
                 let right = *x + text_width(text, *scale) as i32;
                 let bottom = *y + text_height(text, *scale) as i32;
@@ -278,10 +270,11 @@ fn title_flow_and_support_links() {
 
     // Support/Contribute hidden while URLs are empty.
     assert!(!ui.hit_regions.iter().any(|r| r.id == WidgetId::SupportLink));
-    assert!(!ui
-        .hit_regions
-        .iter()
-        .any(|r| r.id == WidgetId::ContributeLink));
+    assert!(
+        !ui.hit_regions
+            .iter()
+            .any(|r| r.id == WidgetId::ContributeLink)
+    );
 
     ui.support_url = "https://example.invalid/support".to_string();
     ui.contribute_url = "https://example.invalid/contribute".to_string();
@@ -349,9 +342,11 @@ fn title_links_respect_support_preference_and_report_is_always_accessible() {
             })
             .collect();
         assert_eq!(links.len(), 4);
-        assert!(links
-            .iter()
-            .all(|r| r.rect.y == 6 * s && r.rect.bottom() < 34 * s));
+        assert!(
+            links
+                .iter()
+                .all(|r| r.rect.y == 6 * s && r.rect.bottom() < 34 * s)
+        );
         assert_eq!(
             links.iter().map(|r| r.rect.right()).max(),
             Some(w as i32 - 4 * s)
@@ -360,9 +355,7 @@ fn title_links_respect_support_preference_and_report_is_always_accessible() {
             .commands
             .iter()
             .find_map(|cmd| match cmd {
-                UiCommand::Text { y, text, .. } if text.starts_with("megu client-ui") => {
-                    Some(*y)
-                }
+                UiCommand::Text { y, text, .. } if text.starts_with("megu client-ui") => Some(*y),
                 _ => None,
             })
             .expect("version label");
@@ -376,10 +369,11 @@ fn title_links_respect_support_preference_and_report_is_always_accessible() {
     for &(w, h) in &HIT_SIZES {
         ui.render(w, h);
         assert_hit_regions_within_viewport(&ui.hit_regions, w, h);
-        assert!(!ui
-            .hit_regions
-            .iter()
-            .any(|r| matches!(r.id, WidgetId::SupportLink | WidgetId::ContributeLink)));
+        assert!(
+            !ui.hit_regions
+                .iter()
+                .any(|r| matches!(r.id, WidgetId::SupportLink | WidgetId::ContributeLink))
+        );
         assert_eq!(
             click(&mut ui, WidgetId::ReportLink, w, h),
             vec![UiAction::OpenUrl(ui.report_url.clone())]
@@ -391,10 +385,12 @@ fn title_links_respect_support_preference_and_report_is_always_accessible() {
     }
     ui.settings.language = LanguageSetting::Japanese;
     let commands = ui.render(640, 360);
-    assert!(commands
-        .commands
-        .iter()
-        .any(|cmd| matches!(cmd, UiCommand::Text { text, .. } if text == "報告")));
+    assert!(
+        commands
+            .commands
+            .iter()
+            .any(|cmd| matches!(cmd, UiCommand::Text { text, .. } if text == "報告"))
+    );
 
     ui.report_url.clear();
     ui.render(640, 360);
@@ -471,14 +467,16 @@ fn pause_report_bug_is_optional_and_never_advertises_support() {
     for &(w, h) in &HIT_SIZES {
         ui.render(w, h);
         assert_hit_regions_within_viewport(&ui.hit_regions, w, h);
-        assert!(ui
-            .hit_regions
-            .iter()
-            .any(|r| r.id == WidgetId::PauseReportBug));
-        assert!(!ui
-            .hit_regions
-            .iter()
-            .any(|r| matches!(r.id, WidgetId::SupportLink | WidgetId::ContributeLink)));
+        assert!(
+            ui.hit_regions
+                .iter()
+                .any(|r| r.id == WidgetId::PauseReportBug)
+        );
+        assert!(
+            !ui.hit_regions
+                .iter()
+                .any(|r| matches!(r.id, WidgetId::SupportLink | WidgetId::ContributeLink))
+        );
         assert_eq!(
             click(&mut ui, WidgetId::PauseReportBug, w, h),
             vec![UiAction::OpenUrl(ui.report_url.clone())]
@@ -487,21 +485,25 @@ fn pause_report_bug_is_optional_and_never_advertises_support() {
 }
 
 #[test]
-fn six_settings_tabs_fit_with_modern_extension_controls() {
+fn seven_settings_tabs_fit_with_modern_extension_controls() {
     let mut ui = UiState::new();
-    assert_eq!(SettingsTab::ALL.len(), 6);
+    assert_eq!(SettingsTab::ALL.len(), 7);
     for &(w, h) in &HIT_SIZES {
         for tab in SettingsTab::ALL {
             ui.screen = Screen::Settings(tab);
             let list = ui.render(w, h);
             assert_hit_regions_within_viewport(&ui.hit_regions, w, h);
-            assert!(ui
-                .hit_regions
-                .iter()
-                .any(|r| r.id == WidgetId::SettingsDone));
+            assert!(
+                ui.hit_regions
+                    .iter()
+                    .any(|r| r.id == WidgetId::SettingsDone)
+            );
             let extension = matches!(
                 tab,
-                SettingsTab::Shaders | SettingsTab::Qol | SettingsTab::FairPlay
+                SettingsTab::Shaders
+                    | SettingsTab::Qol
+                    | SettingsTab::FairPlay
+                    | SettingsTab::Controls
             );
             assert_eq!(
                 list.commands.iter().any(
@@ -539,17 +541,19 @@ fn six_settings_tabs_fit_with_modern_extension_controls() {
     ui.active_shaderpack_profile = "High Quality".into();
     let list = ui.render(640, 360);
     for label in ["Example shaderpack", "High Quality"] {
-        assert!(list
-            .commands
-            .iter()
-            .any(|cmd| matches!(cmd, UiCommand::Text { text, .. } if text == label)));
+        assert!(
+            list.commands
+                .iter()
+                .any(|cmd| matches!(cmd, UiCommand::Text { text, .. } if text == label))
+        );
     }
     ui.active_shaderpack_name.clear();
     let list = ui.render(640, 360);
-    assert!(list
-        .commands
-        .iter()
-        .any(|cmd| matches!(cmd, UiCommand::Text { text, .. } if text == "Vanilla (Off)")));
+    assert!(
+        list.commands
+            .iter()
+            .any(|cmd| matches!(cmd, UiCommand::Text { text, .. } if text == "Vanilla (Off)"))
+    );
 
     click(&mut ui, WidgetId::TabQol, 640, 360);
     assert_eq!(
@@ -590,22 +594,30 @@ fn magic_hud_only_adds_overlay_when_active() {
     };
     let overlay = ui.render(640, 360);
     assert!(overlay.len() > baseline.len());
-    assert!(overlay
-        .commands
-        .iter()
-        .any(|cmd| matches!(cmd, UiCommand::Text { text, .. } if text.contains("Mana"))));
-    assert!(overlay
-        .commands
-        .iter()
-        .any(|cmd| matches!(cmd, UiCommand::Text { text, .. } if text.contains("Fireball"))));
-    assert!(overlay
-        .commands
-        .iter()
-        .any(|cmd| matches!(cmd, UiCommand::Text { text, .. } if text.contains("Frost"))));
-    assert!(overlay
-        .commands
-        .iter()
-        .any(|cmd| matches!(cmd, UiCommand::Text { text, .. } if text.contains("Ward"))));
+    assert!(
+        overlay
+            .commands
+            .iter()
+            .any(|cmd| matches!(cmd, UiCommand::Text { text, .. } if text.contains("Mana")))
+    );
+    assert!(
+        overlay
+            .commands
+            .iter()
+            .any(|cmd| matches!(cmd, UiCommand::Text { text, .. } if text.contains("Fireball")))
+    );
+    assert!(
+        overlay
+            .commands
+            .iter()
+            .any(|cmd| matches!(cmd, UiCommand::Text { text, .. } if text.contains("Frost")))
+    );
+    assert!(
+        overlay
+            .commands
+            .iter()
+            .any(|cmd| matches!(cmd, UiCommand::Text { text, .. } if text.contains("Ward")))
+    );
     assert!(ui.hit_regions.is_empty());
 
     let mut reused = UiDrawList::new();
@@ -833,20 +845,22 @@ fn mod_sync_missing_dependencies_require_an_explicit_click() {
     ui.screen = Screen::ModSyncConsent;
     for &(w, h) in &HIT_SIZES {
         ui.render(w, h);
-        assert!(!ui
-            .hit_regions
-            .iter()
-            .any(|r| r.id == WidgetId::ModSyncDownloadMissing));
+        assert!(
+            !ui.hit_regions
+                .iter()
+                .any(|r| r.id == WidgetId::ModSyncDownloadMissing)
+        );
     }
 
     ui.missing_mod_deps = vec!["create".into(), "fabric-api".into()];
     for &(w, h) in &HIT_SIZES {
         ui.render(w, h);
         assert_hit_regions_within_viewport(&ui.hit_regions, w, h);
-        assert!(ui
-            .hit_regions
-            .iter()
-            .any(|r| r.id == WidgetId::ModSyncDownloadMissing));
+        assert!(
+            ui.hit_regions
+                .iter()
+                .any(|r| r.id == WidgetId::ModSyncDownloadMissing)
+        );
         assert_eq!(ui.mod_sync_decision, None);
         assert_eq!(
             click(&mut ui, WidgetId::ModSyncDownloadMissing, w, h),
@@ -913,10 +927,11 @@ fn crash_recovery_gates_send_on_confirmation() {
     assert_eq!(acts, vec![UiAction::SubmitCrashReport]);
     assert!(ui.crash_sent);
     ui.render(w, h);
-    assert!(!ui
-        .hit_regions
-        .iter()
-        .any(|r| r.id == WidgetId::CrashSendReport));
+    assert!(
+        !ui.hit_regions
+            .iter()
+            .any(|r| r.id == WidgetId::CrashSendReport)
+    );
     let r = send_rect;
     let acts = ui.handle_input(UiInputEvent::Click {
         x: r.x + r.w as i32 / 2,
@@ -1059,9 +1074,11 @@ fn minihud_and_subtitles_default_off_and_emit_zero_commands() {
     assert_eq!(ui.settings.qol.mini_hud_preset(), MiniHudPreset::Off);
     assert!(ui.hud.mini_hud_data.fps.is_none());
     assert!(ui.hud.subtitles.is_empty());
-    assert!(!megu_client_ui::state::QolSettings::default()
-        .mini_hud
-        .enabled);
+    assert!(
+        !megu_client_ui::state::QolSettings::default()
+            .mini_hud
+            .enabled
+    );
 
     for &(w, h) in &HIT_SIZES {
         let baseline = ui.render(w, h);
@@ -1113,10 +1130,11 @@ fn qol_tab_wires_minihud_preset_and_subtitles_without_overlap() {
     assert!(ui.settings.qol.mini_hud.show_fps);
     assert!(!ui.settings.qol.mini_hud.show_ram);
     let list = ui.render(640, 360);
-    assert!(list
-        .commands
-        .iter()
-        .any(|c| matches!(c, UiCommand::Text { text, .. } if text == "MiniHUD: Basic")));
+    assert!(
+        list.commands
+            .iter()
+            .any(|c| matches!(c, UiCommand::Text { text, .. } if text == "MiniHUD: Basic"))
+    );
 
     assert_eq!(
         click(&mut ui, WidgetId::QolMiniHud, 640, 360),
@@ -1403,13 +1421,7 @@ fn render_into_reuses_draw_list_buffers_and_recycles_text_heaps() {
     assert!(list.commands.is_empty());
     assert_eq!(list.commands.capacity(), cap_before);
     assert_eq!(list.recycled_text_buffer_count(), text_count);
-    list.text_str(
-        0,
-        0,
-        1,
-        megu_client_ui::draw::UiColor::rgb(1, 2, 3),
-        "hud",
-    );
+    list.text_str(0, 0, 1, megu_client_ui::draw::UiColor::rgb(1, 2, 3), "hud");
     assert_eq!(list.recycled_text_buffer_count(), text_count - 1);
     match &list.commands[0] {
         UiCommand::Text { text, .. } => assert_eq!(text, "hud"),
@@ -1522,10 +1534,11 @@ fn recipe_browser_opens_from_pause_with_ponder_and_done_back() {
             "missing Recipe::{inner:?} region"
         );
     }
-    assert!(ui
-        .hit_regions
-        .iter()
-        .any(|r| r.id == WidgetId::RecipeBrowserDone));
+    assert!(
+        ui.hit_regions
+            .iter()
+            .any(|r| r.id == WidgetId::RecipeBrowserDone)
+    );
     assert_hit_regions_within_viewport(&ui.hit_regions, w, h);
 
     // The 3D Ponder tab renders its isometric scene when loaded.
@@ -1533,7 +1546,9 @@ fn recipe_browser_opens_from_pause_with_ponder_and_done_back() {
     scene.add_block(0, 0, 0, UiColor::rgb(120, 80, 40));
     scene.add_block(1, 0, 0, UiColor::rgb(120, 80, 40));
     scene.add_block(0, 1, 0, UiColor::rgb(160, 120, 60));
-    scene.steps.push(PonderStep::new("power the wheel", "動力", 40));
+    scene
+        .steps
+        .push(PonderStep::new("power the wheel", "動力", 40));
     ui.recipe_browser.ponder = Some(scene);
     ui.recipe_browser.tab = BrowserTab::Ponder;
     let list = ui.render(w, h);
@@ -1545,10 +1560,11 @@ fn recipe_browser_opens_from_pause_with_ponder_and_done_back() {
         c,
         UiCommand::Text { text, .. } if text.contains("power the wheel")
     )));
-    assert!(ui
-        .hit_regions
-        .iter()
-        .any(|r| r.id == WidgetId::Recipe(RecipeWidgetId::PonderNext)));
+    assert!(
+        ui.hit_regions
+            .iter()
+            .any(|r| r.id == WidgetId::Recipe(RecipeWidgetId::PonderNext))
+    );
 
     // Done returns to the Pause screen (the nav stack remembers it).
     let acts = click(&mut ui, WidgetId::RecipeBrowserDone, w, h);
@@ -1576,7 +1592,10 @@ fn crafting_conflict_overlay_is_zero_clutter_until_two_candidates() {
         assert!(ui.hit_regions.is_empty());
         ui.hud.crafting_conflict.total_candidates = 1;
         let one = ui.render(w, h);
-        assert_eq!(one, baseline, "single candidate emitted commands at {w}x{h}");
+        assert_eq!(
+            one, baseline,
+            "single candidate emitted commands at {w}x{h}"
+        );
         assert!(ui.hit_regions.is_empty());
 
         // Two or more emit exactly one compact `< k/N >` cycle button.
@@ -1655,8 +1674,8 @@ fn cjk_glyphs_are_distinct_non_blank_and_fullwidth() {
     let wide = [
         'あ', 'い', 'ん', 'を', 'が', 'ぱ', 'っ', 'ゃ', // hiragana
         'ア', 'イ', 'ン', 'ヲ', 'ガ', 'パ', 'ッ', 'ャ', // katakana
-        '、', '。', '・', '「', '」', '『', '』', '【', '】', 'ー', '〜', '！', '？',
-        '（', '）', // punctuation
+        '、', '。', '・', '「', '」', '『', '』', '【', '】', 'ー', '〜', '！', '？', '（',
+        '）', // punctuation
         '設', '定', '日', '本', '語', '画', '面', '音', // kanji used in ja UI
     ];
     let mut seen = std::collections::HashMap::new();
@@ -1729,15 +1748,15 @@ fn unifont_pack_loads_and_rasters_distinct_glyphs() {
 fn unifont_loader_fails_closed_on_bad_input() {
     use megu_client_ui::font_cjk::GlyphAtlas;
     let bad = [
-        "0041", // no separator
-        "0041:", // empty hexbits
-        "0041:FF", // wrong length
+        "0041",                                                                         // no separator
+        "0041:",                                  // empty hexbits
+        "0041:FF",                                // wrong length
         "0041:0000000018242442427E4242424200000", // 33 digits
-        "ZZZZ:0000000018242442427E424242420000", // non-hex codepoint
+        "ZZZZ:0000000018242442427E424242420000",  // non-hex codepoint
         "10000:0000000018242442427E424242420000", // above BMP
-        "0041:0000000018242442427G424242420000", // non-hex digit
+        "0041:0000000018242442427G424242420000",  // non-hex digit
         "0041:0000000018242442427E424242420000\n0041:0000000018242442427E424242420000", // duplicate
-        &format!("{:200}", 'x'), // line over the 96-char bound
+        &format!("{:200}", 'x'),                  // line over the 96-char bound
     ];
     for input in bad {
         assert!(
@@ -1820,7 +1839,9 @@ fn death_screen_hardcore_disables_respawn() {
     });
     ui.render(1280, 720);
     assert!(
-        !ui.hit_regions.iter().any(|r| r.id == WidgetId::DeathRespawn),
+        !ui.hit_regions
+            .iter()
+            .any(|r| r.id == WidgetId::DeathRespawn),
         "hardcore death must not offer a live respawn button"
     );
     assert!(
@@ -1838,13 +1859,17 @@ fn death_screen_hardcore_disables_respawn() {
     });
     ui.render(1280, 720);
     assert!(
-        !ui.hit_regions.iter().any(|r| r.id == WidgetId::DeathRespawn),
+        !ui.hit_regions
+            .iter()
+            .any(|r| r.id == WidgetId::DeathRespawn),
         "cooldown must disable the respawn button"
     );
     ui.update_death(DeathScreenState::default());
     ui.render(1280, 720);
     assert!(
-        ui.hit_regions.iter().any(|r| r.id == WidgetId::DeathRespawn),
+        ui.hit_regions
+            .iter()
+            .any(|r| r.id == WidgetId::DeathRespawn),
         "expired cooldown re-enables respawn"
     );
 }

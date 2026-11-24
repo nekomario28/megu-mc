@@ -24,7 +24,7 @@
 //! rasterizer — the string data stays correct for richer GPU atlases.
 
 use megu_core::crash_report::CrashContext;
-use megu_core::i18n::{BuiltinLocale, I18nCatalog, UiTextKey, ALL_BUILTIN_LOCALES};
+use megu_core::i18n::{ALL_BUILTIN_LOCALES, BuiltinLocale, I18nCatalog, UiTextKey};
 use megu_core::sys_metrics::{MiniHudConfig, MiniHudData};
 
 use crate::draw::UiRect;
@@ -122,17 +122,20 @@ pub enum SettingsTab {
     FairPlay,
     /// UI language.
     Language,
+    /// Rebindable gameplay controls.
+    Controls,
 }
 
 impl SettingsTab {
     /// All tabs, left to right.
-    pub const ALL: [Self; 6] = [
+    pub const ALL: [Self; 7] = [
         Self::Video,
         Self::Audio,
         Self::Shaders,
         Self::Qol,
         Self::FairPlay,
         Self::Language,
+        Self::Controls,
     ];
 
     pub fn label(self, lang: UiLang) -> &'static str {
@@ -143,6 +146,7 @@ impl SettingsTab {
             Self::Qol => tr(lang, "QoL", "QoL"),
             Self::FairPlay => tr(lang, "Fair-Play", "フェアプレイ"),
             Self::Language => tr(lang, "Language", "言語"),
+            Self::Controls => tr(lang, "Controls", "操作設定"),
         }
     }
 }
@@ -741,6 +745,102 @@ pub struct VisualStyleSettings {
     pub camera_micro_motion: bool,
 }
 
+/// UI mirror of the persisted physical gameplay bindings.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct KeyBindings {
+    pub forward: String,
+    pub back: String,
+    pub left: String,
+    pub right: String,
+    pub jump: String,
+    pub sneak: String,
+    pub sprint: String,
+    pub inventory: String,
+    pub drop: String,
+    pub swap_offhand: String,
+    pub chat: String,
+    pub command: String,
+    pub zoom: String,
+    pub camera_toggle: String,
+    pub fullscreen: String,
+    pub advancements: String,
+    pub sort_inventory: String,
+}
+
+impl Default for KeyBindings {
+    fn default() -> Self {
+        Self {
+            forward: "KeyW".into(),
+            back: "KeyS".into(),
+            left: "KeyA".into(),
+            right: "KeyD".into(),
+            jump: "Space".into(),
+            sneak: "ShiftLeft".into(),
+            sprint: "ControlLeft".into(),
+            inventory: "KeyE".into(),
+            drop: "KeyQ".into(),
+            swap_offhand: "KeyF".into(),
+            chat: "KeyT".into(),
+            command: "Slash".into(),
+            zoom: "KeyC".into(),
+            camera_toggle: "F5".into(),
+            fullscreen: "F11".into(),
+            advancements: "KeyL".into(),
+            sort_inventory: "KeyR".into(),
+        }
+    }
+}
+
+impl KeyBindings {
+    pub fn get(&self, index: usize) -> Option<&str> {
+        Some(String::as_str(match index {
+            0 => &self.forward,
+            1 => &self.back,
+            2 => &self.left,
+            3 => &self.right,
+            4 => &self.jump,
+            5 => &self.sneak,
+            6 => &self.sprint,
+            7 => &self.inventory,
+            8 => &self.drop,
+            9 => &self.swap_offhand,
+            10 => &self.chat,
+            11 => &self.command,
+            12 => &self.zoom,
+            13 => &self.camera_toggle,
+            14 => &self.fullscreen,
+            15 => &self.advancements,
+            16 => &self.sort_inventory,
+            _ => return None,
+        }))
+    }
+
+    pub fn set(&mut self, index: usize, value: String) -> bool {
+        let slot = match index {
+            0 => &mut self.forward,
+            1 => &mut self.back,
+            2 => &mut self.left,
+            3 => &mut self.right,
+            4 => &mut self.jump,
+            5 => &mut self.sneak,
+            6 => &mut self.sprint,
+            7 => &mut self.inventory,
+            8 => &mut self.drop,
+            9 => &mut self.swap_offhand,
+            10 => &mut self.chat,
+            11 => &mut self.command,
+            12 => &mut self.zoom,
+            13 => &mut self.camera_toggle,
+            14 => &mut self.fullscreen,
+            15 => &mut self.advancements,
+            16 => &mut self.sort_inventory,
+            _ => return false,
+        };
+        *slot = value;
+        true
+    }
+}
+
 impl Default for VisualStyleSettings {
     fn default() -> Self {
         Self {
@@ -779,6 +879,12 @@ impl VisualStyleSettings {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct UiSettings {
     pub video: VideoSettings,
+    pub fullscreen: bool,
+    pub mouse_invert_y: bool,
+    pub gamma_pct: u16,
+    /// `0` = automatic, `1..=4` are fixed UI scale factors.
+    pub gui_scale: u8,
+    pub keys: KeyBindings,
     pub audio: AudioSettings,
     pub shader_quick: ShaderQuickSettings,
     pub qol: QolSettings,
@@ -811,6 +917,11 @@ impl Default for UiSettings {
     fn default() -> Self {
         Self {
             video: VideoSettings::default(),
+            fullscreen: false,
+            mouse_invert_y: false,
+            gamma_pct: 100,
+            gui_scale: 0,
+            keys: KeyBindings::default(),
             audio: AudioSettings::default(),
             shader_quick: ShaderQuickSettings::default(),
             qol: QolSettings::default(),
@@ -897,6 +1008,11 @@ pub enum SettingKey {
     VideoBackgroundFps,
     VideoVsync,
     VideoSmoothLighting,
+    DisplayFullscreen,
+    DisplayInvertY,
+    DisplayGamma,
+    DisplayGuiScale,
+    KeyBindings,
     AudioMaster,
     AudioMusic,
     AudioBlocks,
@@ -964,9 +1080,12 @@ impl SettingsTransaction {
             K::VideoFpsCap => current.video.fps_cap == opened.video.fps_cap,
             K::VideoBackgroundFps => current.video.background_fps == opened.video.background_fps,
             K::VideoVsync => current.video.vsync == opened.video.vsync,
-            K::VideoSmoothLighting => {
-                current.video.smooth_lighting == opened.video.smooth_lighting
-            }
+            K::VideoSmoothLighting => current.video.smooth_lighting == opened.video.smooth_lighting,
+            K::DisplayFullscreen => current.fullscreen == opened.fullscreen,
+            K::DisplayInvertY => current.mouse_invert_y == opened.mouse_invert_y,
+            K::DisplayGamma => current.gamma_pct == opened.gamma_pct,
+            K::DisplayGuiScale => current.gui_scale == opened.gui_scale,
+            K::KeyBindings => current.keys == opened.keys,
             K::AudioMaster => current.audio.master == opened.audio.master,
             K::AudioMusic => current.audio.music == opened.audio.music,
             K::AudioBlocks => current.audio.blocks == opened.audio.blocks,
@@ -974,8 +1093,7 @@ impl SettingsTransaction {
             K::AudioFriendly => current.audio.friendly == opened.audio.friendly,
             K::AudioMaxVolumeCap => current.audio.max_volume_cap == opened.audio.max_volume_cap,
             K::AudioMaxConcurrentSameSound => {
-                current.audio.max_concurrent_same_sound
-                    == opened.audio.max_concurrent_same_sound
+                current.audio.max_concurrent_same_sound == opened.audio.max_concurrent_same_sound
             }
             K::AudioSpatial3d => current.visual.spatial_audio_3d == opened.visual.spatial_audio_3d,
             K::ShadersEnabled => {
@@ -983,8 +1101,7 @@ impl SettingsTransaction {
             }
             K::VisualStylePreset => current.visual.preset == opened.visual.preset,
             K::ExternalShaderPack => {
-                current.visual.external_shader_pack_name
-                    == opened.visual.external_shader_pack_name
+                current.visual.external_shader_pack_name == opened.visual.external_shader_pack_name
             }
             K::BlocksAndSkins3d => {
                 current.visual.blocks_and_skins_3d == opened.visual.blocks_and_skins_3d
@@ -1004,9 +1121,7 @@ impl SettingsTransaction {
             K::QolInventorySort => current.qol_inventory_sort == opened.qol_inventory_sort,
             K::ZshCommandBar => current.zsh_command_bar == opened.zsh_command_bar,
             K::QolSmoothZoom => current.qol.smooth_zoom == opened.qol.smooth_zoom,
-            K::QolToolWarnPercent => {
-                current.qol.tool_warn_percent == opened.qol.tool_warn_percent
-            }
+            K::QolToolWarnPercent => current.qol.tool_warn_percent == opened.qol.tool_warn_percent,
             K::QolPreventToolBreak => {
                 current.qol.prevent_tool_break == opened.qol.prevent_tool_break
             }
@@ -1016,9 +1131,7 @@ impl SettingsTransaction {
             K::QolRetainChatOnReconnect => {
                 current.qol.retain_chat_on_reconnect == opened.qol.retain_chat_on_reconnect
             }
-            K::QolCrashReportMode => {
-                current.qol.crash_report_mode == opened.qol.crash_report_mode
-            }
+            K::QolCrashReportMode => current.qol.crash_report_mode == opened.qol.crash_report_mode,
             K::QolShowSupportLinks => {
                 current.qol.show_support_links == opened.qol.show_support_links
             }
@@ -1038,9 +1151,7 @@ impl SettingsTransaction {
                 current.fair_play.allow_waypoint_teleport
                     == opened.fair_play.allow_waypoint_teleport
             }
-            K::Language => {
-                current.language == opened.language && current.locale == opened.locale
-            }
+            K::Language => current.language == opened.language && current.locale == opened.locale,
         }
     }
 
@@ -1057,9 +1168,12 @@ impl SettingsTransaction {
             K::VideoFpsCap => current.video.fps_cap = opened.video.fps_cap,
             K::VideoBackgroundFps => current.video.background_fps = opened.video.background_fps,
             K::VideoVsync => current.video.vsync = opened.video.vsync,
-            K::VideoSmoothLighting => {
-                current.video.smooth_lighting = opened.video.smooth_lighting
-            }
+            K::VideoSmoothLighting => current.video.smooth_lighting = opened.video.smooth_lighting,
+            K::DisplayFullscreen => current.fullscreen = opened.fullscreen,
+            K::DisplayInvertY => current.mouse_invert_y = opened.mouse_invert_y,
+            K::DisplayGamma => current.gamma_pct = opened.gamma_pct,
+            K::DisplayGuiScale => current.gui_scale = opened.gui_scale,
+            K::KeyBindings => current.keys = opened.keys.clone(),
             K::AudioMaster => current.audio.master = opened.audio.master,
             K::AudioMusic => current.audio.music = opened.audio.music,
             K::AudioBlocks => current.audio.blocks = opened.audio.blocks,
@@ -1067,12 +1181,9 @@ impl SettingsTransaction {
             K::AudioFriendly => current.audio.friendly = opened.audio.friendly,
             K::AudioMaxVolumeCap => current.audio.max_volume_cap = opened.audio.max_volume_cap,
             K::AudioMaxConcurrentSameSound => {
-                current.audio.max_concurrent_same_sound =
-                    opened.audio.max_concurrent_same_sound
+                current.audio.max_concurrent_same_sound = opened.audio.max_concurrent_same_sound
             }
-            K::AudioSpatial3d => {
-                current.visual.spatial_audio_3d = opened.visual.spatial_audio_3d
-            }
+            K::AudioSpatial3d => current.visual.spatial_audio_3d = opened.visual.spatial_audio_3d,
             K::ShadersEnabled => {
                 current.shader_quick.shaders_enabled = opened.shader_quick.shaders_enabled
             }
@@ -1086,8 +1197,7 @@ impl SettingsTransaction {
             }
             K::WorldEffects => current.visual.world_effects = opened.visual.world_effects,
             K::WorldEffectsDetail => {
-                current.visual.world_effects_detail =
-                    opened.visual.world_effects_detail.clone()
+                current.visual.world_effects_detail = opened.visual.world_effects_detail.clone()
             }
             K::CameraMicroMotion => {
                 current.visual.camera_micro_motion = opened.visual.camera_micro_motion
@@ -1100,9 +1210,7 @@ impl SettingsTransaction {
             K::QolInventorySort => current.qol_inventory_sort = opened.qol_inventory_sort,
             K::ZshCommandBar => current.zsh_command_bar = opened.zsh_command_bar,
             K::QolSmoothZoom => current.qol.smooth_zoom = opened.qol.smooth_zoom,
-            K::QolToolWarnPercent => {
-                current.qol.tool_warn_percent = opened.qol.tool_warn_percent
-            }
+            K::QolToolWarnPercent => current.qol.tool_warn_percent = opened.qol.tool_warn_percent,
             K::QolPreventToolBreak => {
                 current.qol.prevent_tool_break = opened.qol.prevent_tool_break
             }
@@ -1112,20 +1220,14 @@ impl SettingsTransaction {
             K::QolRetainChatOnReconnect => {
                 current.qol.retain_chat_on_reconnect = opened.qol.retain_chat_on_reconnect
             }
-            K::QolCrashReportMode => {
-                current.qol.crash_report_mode = opened.qol.crash_report_mode
-            }
+            K::QolCrashReportMode => current.qol.crash_report_mode = opened.qol.crash_report_mode,
             K::QolShowSupportLinks => {
                 current.qol.show_support_links = opened.qol.show_support_links
             }
             K::QolMiniHud => current.qol.mini_hud = opened.qol.mini_hud.clone(),
             K::QolShowSubtitles => current.qol.show_subtitles = opened.qol.show_subtitles,
-            K::FpMinimapMode => {
-                current.fair_play.minimap_mode = opened.fair_play.minimap_mode
-            }
-            K::FpAllowCaveMap => {
-                current.fair_play.allow_cave_map = opened.fair_play.allow_cave_map
-            }
+            K::FpMinimapMode => current.fair_play.minimap_mode = opened.fair_play.minimap_mode,
+            K::FpAllowCaveMap => current.fair_play.allow_cave_map = opened.fair_play.allow_cave_map,
             K::FpAllowMobRadar => {
                 current.fair_play.allow_mob_radar = opened.fair_play.allow_mob_radar
             }
@@ -1133,8 +1235,7 @@ impl SettingsTransaction {
                 current.fair_play.player_radar_scope = opened.fair_play.player_radar_scope
             }
             K::FpAllowWaypointTeleport => {
-                current.fair_play.allow_waypoint_teleport =
-                    opened.fair_play.allow_waypoint_teleport
+                current.fair_play.allow_waypoint_teleport = opened.fair_play.allow_waypoint_teleport
             }
             K::Language => {
                 current.language = opened.language;
@@ -1869,6 +1970,14 @@ pub enum WidgetId {
     TabQol,
     TabFairPlay,
     TabLanguage,
+    TabControls,
+    ControlKey(usize),
+    QolBuiltin(usize),
+    MiniHudSegment(usize),
+    VideoFullscreen,
+    VideoInvertY,
+    VideoGamma,
+    VideoGuiScale,
     // Video tab
     VideoPreset,
     VideoViewDistance,
@@ -1975,6 +2084,8 @@ impl WidgetId {
                 | Self::VideoBackgroundFps
                 | Self::VideoVsync
                 | Self::VideoSmoothLighting
+                | Self::QolBuiltin(_)
+                | Self::MiniHudSegment(_)
                 | Self::ShadersEnabled
                 | Self::VisualPreset
                 | Self::VisualBlocks3d
@@ -2228,6 +2339,8 @@ pub struct UiState {
     pub nav_stack: Vec<Screen>,
     /// All player-facing settings.
     pub settings: UiSettings,
+    /// Selected binding row while waiting for a physical key press.
+    pub capturing_key_binding: Option<usize>,
     /// GUI scale: `0` = auto (`height/270`, clamped `1..=4`), else fixed.
     pub ui_scale: u8,
     /// Open modal, if any.
@@ -2330,6 +2443,7 @@ impl Default for UiState {
             screen: Screen::Title,
             nav_stack: Vec::new(),
             settings: UiSettings::default(),
+            capturing_key_binding: None,
             ui_scale: 0,
             modal: None,
             hit_regions: Vec::new(),
@@ -2560,10 +2674,7 @@ impl UiState {
         if self.settings == self.settings_tx.opened_snapshot {
             return Vec::new();
         }
-        let prior = std::mem::replace(
-            &mut self.settings,
-            self.settings_tx.opened_snapshot.clone(),
-        );
+        let prior = std::mem::replace(&mut self.settings, self.settings_tx.opened_snapshot.clone());
         self.push_settings_undo(prior);
         vec![UiAction::SettingsChanged]
     }
@@ -2817,6 +2928,11 @@ impl UiState {
                 Vec::new()
             }
             UiInputEvent::Click { x, y } => self.handle_click(x, y),
+            UiInputEvent::KeyPressed(UiKey::Escape)
+                if self.capturing_key_binding.take().is_some() =>
+            {
+                Vec::new()
+            }
             UiInputEvent::KeyPressed(key) => self.handle_key(key),
             UiInputEvent::CharTyped(c) => self.handle_char(c),
             UiInputEvent::GamepadPressed(btn) => match btn {
@@ -2837,12 +2953,7 @@ impl UiState {
     fn forward_to_mod_menu(&mut self, ev: UiInputEvent) -> Vec<UiAction> {
         match ev {
             UiInputEvent::Click { x, y } => {
-                if let Some(region) = self
-                    .hit_regions
-                    .iter()
-                    .find(|r| r.contains(x, y))
-                    .copied()
-                {
+                if let Some(region) = self.hit_regions.iter().find(|r| r.contains(x, y)).copied() {
                     if !matches!(region.id, WidgetId::ModMenu(_)) {
                         return self.handle_click(x, y);
                     }
@@ -2878,12 +2989,7 @@ impl UiState {
     fn forward_to_recipe_browser(&mut self, ev: UiInputEvent) -> Vec<UiAction> {
         match ev {
             UiInputEvent::Click { x, y } => {
-                if let Some(region) = self
-                    .hit_regions
-                    .iter()
-                    .find(|r| r.contains(x, y))
-                    .copied()
-                {
+                if let Some(region) = self.hit_regions.iter().find(|r| r.contains(x, y)).copied() {
                     if !matches!(region.id, WidgetId::Recipe(_)) {
                         return self.handle_click(x, y);
                     }
@@ -3036,8 +3142,7 @@ impl UiState {
         {
             self.singleplayer.seed_text.push(c);
         } else if self.multiplayer.address_focused
-            && (c.is_ascii_alphanumeric()
-                || matches!(c, '.' | '-' | '_' | ':' | '[' | ']'))
+            && (c.is_ascii_alphanumeric() || matches!(c, '.' | '-' | '_' | ':' | '[' | ']'))
             && self.multiplayer.address_text.chars().count() < SERVER_ADDRESS_FIELD_MAX_LEN
         {
             self.multiplayer.address_text.push(c);
@@ -3413,6 +3518,11 @@ impl UiState {
             WidgetId::TabQol => self.select_tab(SettingsTab::Qol),
             WidgetId::TabFairPlay => self.select_tab(SettingsTab::FairPlay),
             WidgetId::TabLanguage => self.select_tab(SettingsTab::Language),
+            WidgetId::TabControls => self.select_tab(SettingsTab::Controls),
+            WidgetId::ControlKey(index) => {
+                self.capturing_key_binding = (index < 17).then_some(index);
+                Vec::new()
+            }
             WidgetId::ShadersOpenOptions => vec![UiAction::OpenShaderOptions],
 
             WidgetId::SettingsUndo => self.undo_settings(),
@@ -3606,6 +3716,10 @@ impl UiState {
         }
         let prior = self.settings.clone();
         let v = &mut self.settings.video;
+        let fullscreen = &mut self.settings.fullscreen;
+        let mouse_invert_y = &mut self.settings.mouse_invert_y;
+        let gamma_pct = &mut self.settings.gamma_pct;
+        let gui_scale = &mut self.settings.gui_scale;
         let a = &mut self.settings.audio;
         let q = &mut self.settings.qol;
         let f = &mut self.settings.fair_play;
@@ -3651,6 +3765,62 @@ impl UiState {
                 v.smooth_lighting = !v.smooth_lighting;
                 v.preset = VideoPreset::Custom;
                 true
+            }
+            WidgetId::VideoFullscreen => {
+                *fullscreen = !*fullscreen;
+                true
+            }
+            WidgetId::VideoInvertY => {
+                *mouse_invert_y = !*mouse_invert_y;
+                true
+            }
+            WidgetId::VideoGamma => {
+                *gamma_pct = (i32::from(*gamma_pct) + 5 * dir).clamp(50, 200) as u16;
+                true
+            }
+            WidgetId::VideoGuiScale => {
+                *gui_scale = (*gui_scale % 5 + 1) % 5;
+                true
+            }
+            WidgetId::QolBuiltin(index) => match index {
+                0 => {
+                    self.settings.qol_looking_at_hud = !self.settings.qol_looking_at_hud;
+                    true
+                }
+                1 => {
+                    self.settings.qol_mouse_tweaks = !self.settings.qol_mouse_tweaks;
+                    true
+                }
+                2 => {
+                    self.settings.qol_inventory_sort = !self.settings.qol_inventory_sort;
+                    true
+                }
+                3 => {
+                    self.settings.zsh_command_bar = !self.settings.zsh_command_bar;
+                    true
+                }
+                _ => false,
+            },
+            WidgetId::MiniHudSegment(index) => {
+                if index >= 9 {
+                    false
+                } else {
+                    let mini = &mut q.mini_hud;
+                    mini.enabled = true;
+                    let enabled = match index {
+                        0 => &mut mini.show_fps,
+                        1 => &mut mini.show_coords,
+                        2 => &mut mini.show_biome,
+                        3 => &mut mini.show_facing,
+                        4 => &mut mini.show_ping,
+                        5 => &mut mini.show_mspt_tps,
+                        6 => &mut mini.show_light_level,
+                        7 => &mut mini.show_chunks_entities,
+                        _ => &mut mini.show_ram,
+                    };
+                    *enabled = !*enabled;
+                    true
+                }
             }
             WidgetId::ShadersEnabled => {
                 self.settings.shader_quick.shaders_enabled =

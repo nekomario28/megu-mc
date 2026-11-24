@@ -14,14 +14,14 @@
 //! regions are returned, so the dimmed screen is truly inert.
 
 use megu_core::i18n::UiTextKey;
-use megu_core::sys_metrics::{format_mini_hud_lines, MiniHudAnchor};
+use megu_core::sys_metrics::{MiniHudAnchor, format_mini_hud_lines};
 
-use crate::draw::{palette as pal, text_width, UiColor, UiCommand, UiDrawList, UiRect};
+use crate::draw::{UiColor, UiCommand, UiDrawList, UiRect, palette as pal, text_width};
 use crate::hud_widgets::{HudSnapshot, HudWidgetsRenderer};
 use crate::magic_hud::MagicHudState;
 use crate::state::{
-    tr, HitRegion, HudState, HudSubtitle, MiniHudPreset, ModSyncChange, Screen, SettingKey,
-    SettingsTab, SubtitleDirection, UiLang, UiModal, UiState, WidgetId, FPS_CAP_STEPS,
+    FPS_CAP_STEPS, HitRegion, HudState, HudSubtitle, MiniHudPreset, ModSyncChange, Screen,
+    SettingKey, SettingsTab, SubtitleDirection, UiLang, UiModal, UiState, WidgetId, tr,
 };
 use crate::subtitle_hud::SubtitleHudState;
 
@@ -192,13 +192,8 @@ impl Ctx<'_> {
         }
         let cells = ((self.w - x) / (8 * mult as i32)).max(0) as usize;
         let clipped = first_chars(&self.hud_scratch, cells);
-        self.list.text_str(
-            x * self.s,
-            y * self.s,
-            mult * self.s as u32,
-            color,
-            clipped,
-        );
+        self.list
+            .text_str(x * self.s, y * self.s, mult * self.s as u32, color, clipped);
     }
 
     fn hud_ctext(&mut self, cx: i32, y: i32, mult: u32, color: UiColor, text: &str, limit: usize) {
@@ -237,7 +232,10 @@ impl Ctx<'_> {
     fn region(&mut self, id: WidgetId, r: UiRect) {
         let p = self.phys(r);
         let (x0, y0) = (p.x.max(0), p.y.max(0));
-        let (x1, y1) = (p.right().min(self.pw as i32), p.bottom().min(self.ph as i32));
+        let (x1, y1) = (
+            p.right().min(self.pw as i32),
+            p.bottom().min(self.ph as i32),
+        );
         if x1 <= x0 || y1 <= y0 {
             return;
         }
@@ -389,11 +387,7 @@ impl Ctx<'_> {
 }
 
 fn onoff(v: bool) -> &'static str {
-    if v {
-        "ON"
-    } else {
-        "OFF"
-    }
+    if v { "ON" } else { "OFF" }
 }
 
 impl Ctx<'_> {
@@ -525,7 +519,13 @@ fn singleplayer(ctx: &mut Ctx) {
     let lang = ctx.lang;
     let cx = ctx.w / 2;
 
-    ctx.ctext(cx, 8, 2, pal::TEXT, tr(lang, "Select World", "ワールドを選択"));
+    ctx.ctext(
+        cx,
+        8,
+        2,
+        pal::TEXT,
+        tr(lang, "Select World", "ワールドを選択"),
+    );
 
     // Reserve the footer strip (status line + Back): list and create
     // widgets that would reach it are dropped by the helpers instead of
@@ -646,7 +646,13 @@ fn multiplayer(ctx: &mut Ctx) {
     let lang = ctx.lang;
     let cx = ctx.w / 2;
 
-    ctx.ctext(cx, 8, 2, pal::TEXT, tr(lang, "Play Multiplayer", "マルチプレイ"));
+    ctx.ctext(
+        cx,
+        8,
+        2,
+        pal::TEXT,
+        tr(lang, "Play Multiplayer", "マルチプレイ"),
+    );
 
     // Footer strip (status line + Back): like Singleplayer, widgets that
     // would reach it are dropped instead of painting under the chrome.
@@ -812,11 +818,7 @@ fn boot_badge(ctx: &mut Ctx, clear: i32) {
     let Some(timeline) = &ctx.state.startup_timeline else {
         return;
     };
-    let label = format!(
-        "{}: {} ms",
-        tr(ctx.lang, "Boot", "起動"),
-        timeline.total_ms
-    );
+    let label = format!("{}: {} ms", tr(ctx.lang, "Boot", "起動"), timeline.total_ms);
     let bw = (text_width(&label, 1) as i32 + 8).min(ctx.w - 8);
     let bx = ctx.w - 4 - bw;
     if bw < 24 || ctx.h < 30 || bx < ctx.w / 2 + clear {
@@ -840,8 +842,10 @@ fn settings(ctx: &mut Ctx, active: SettingsTab) {
     // the strip hugs the top edge when the window is too short to leave
     // the footer its own band.
     let gap = 4;
-    let tw = 76.min((ctx.w - 4 - gap * (SettingsTab::ALL.len() as i32 - 1))
-        / SettingsTab::ALL.len() as i32)
+    let tw = 76
+        .min(
+            (ctx.w - 4 - gap * (SettingsTab::ALL.len() as i32 - 1)) / SettingsTab::ALL.len() as i32,
+        )
         .max(10);
     // `None` below ~56px: the strip and the footer cannot coexist, and
     // the footer (Done) wins — tabs stay reachable via keyboard.
@@ -863,6 +867,7 @@ fn settings(ctx: &mut Ctx, active: SettingsTab) {
             SettingsTab::Qol => WidgetId::TabQol,
             SettingsTab::FairPlay => WidgetId::TabFairPlay,
             SettingsTab::Language => WidgetId::TabLanguage,
+            SettingsTab::Controls => WidgetId::TabControls,
         };
         let is_active = tab == active;
         let hot = ctx.hovered(id);
@@ -892,7 +897,7 @@ fn settings(ctx: &mut Ctx, active: SettingsTab) {
 
     let modern = matches!(
         active,
-        SettingsTab::Shaders | SettingsTab::Qol | SettingsTab::FairPlay
+        SettingsTab::Shaders | SettingsTab::Qol | SettingsTab::FairPlay | SettingsTab::Controls
     );
     if modern {
         let panel_w = 348.min(ctx.w - 8).max(8);
@@ -906,11 +911,7 @@ fn settings(ctx: &mut Ctx, active: SettingsTab) {
     // dropped by the widget helpers rather than painted under Done.
     ctx.band_top = ctx.h - 32;
     let y0 = if modern {
-        if ctx.h < 300 {
-            76
-        } else {
-            82
-        }
+        if ctx.h < 300 { 76 } else { 82 }
     } else {
         56
     };
@@ -921,6 +922,7 @@ fn settings(ctx: &mut Ctx, active: SettingsTab) {
         SettingsTab::Qol => qol_tab(ctx, y0),
         SettingsTab::FairPlay => fairplay_tab(ctx, y0),
         SettingsTab::Language => language_tab(ctx, y0),
+        SettingsTab::Controls => controls_tab(ctx, y0),
     }
     ctx.band_top = i32::MAX;
 
@@ -955,7 +957,11 @@ fn settings(ctx: &mut Ctx, active: SettingsTab) {
             tr(lang, "Discard", "破棄"),
             ctx.state.is_session_dirty(),
         ),
-        (WidgetId::SettingsResetDefaults, tr(lang, "Reset", "初期化"), true),
+        (
+            WidgetId::SettingsResetDefaults,
+            tr(lang, "Reset", "初期化"),
+            true,
+        ),
     ];
     let gap = 4;
     let bw7 = 100.min((ctx.w - 16 - gap * 6) / 7);
@@ -1346,14 +1352,136 @@ fn video_tab(ctx: &mut Ctx, y0: i32) {
     ctx.dirty_dot(SettingKey::VideoSmoothLighting, x + 326, y + 6);
 }
 
+fn controls_tab(ctx: &mut Ctx, y0: i32) {
+    const LABELS: [&str; 17] = [
+        "Forward",
+        "Back",
+        "Left",
+        "Right",
+        "Jump",
+        "Sneak",
+        "Sprint",
+        "Inventory",
+        "Drop",
+        "Swap Offhand",
+        "Chat",
+        "Command",
+        "Zoom",
+        "Camera Toggle",
+        "Fullscreen",
+        "Advancements",
+        "Sort Inventory",
+    ];
+    let panel_x = (ctx.w - 340).max(4) / 2;
+    for (index, label) in LABELS.iter().enumerate() {
+        let column = (index / 9) as i32;
+        let row_index = (index % 9) as i32;
+        let x = panel_x + column * 174;
+        let y = y0 + row_index * 22;
+        ctx.text(x, y + 4, 1, pal::TEXT, label);
+        let binding = if ctx.state.capturing_key_binding == Some(index) {
+            "Press any key…"
+        } else {
+            ctx.state.settings.keys.get(index).unwrap_or("-")
+        };
+        ctx.btn(WidgetId::ControlKey(index), lr(x + 86, y, 82, 18), binding);
+    }
+
+    let y = y0 + 9 * 22;
+    let left = panel_x;
+    let right = panel_x + 174;
+    ctx.btn(
+        WidgetId::VideoFullscreen,
+        lr(left, y, 168, 18),
+        &format!("Fullscreen: {}", onoff(ctx.state.settings.fullscreen)),
+    );
+    ctx.btn(
+        WidgetId::VideoInvertY,
+        lr(right, y, 168, 18),
+        &format!("Invert Y: {}", onoff(ctx.state.settings.mouse_invert_y)),
+    );
+    ctx.btn(
+        WidgetId::VideoGamma,
+        lr(left, y + 22, 168, 18),
+        &format!("Brightness: {}%", ctx.state.settings.gamma_pct),
+    );
+    let scale = if ctx.state.settings.gui_scale == 0 {
+        "Auto".to_owned()
+    } else {
+        ctx.state.settings.gui_scale.to_string()
+    };
+    ctx.btn(
+        WidgetId::VideoGuiScale,
+        lr(right, y + 22, 168, 18),
+        &format!("GUI Scale: {scale}"),
+    );
+    let toggles = [
+        ("Looking-at HUD", ctx.state.settings.qol_looking_at_hud),
+        ("Mouse tweaks", ctx.state.settings.qol_mouse_tweaks),
+        ("Inventory sort", ctx.state.settings.qol_inventory_sort),
+        (
+            "Zsh command suggestions",
+            ctx.state.settings.zsh_command_bar,
+        ),
+    ];
+    for (index, (label, enabled)) in toggles.into_iter().enumerate() {
+        let column = (index % 2) as i32;
+        let row_index = (index / 2) as i32;
+        ctx.btn(
+            WidgetId::QolBuiltin(index),
+            lr(left + column * 174, y + 48 + row_index * 22, 168, 18),
+            &format!("{label}: {}", onoff(enabled)),
+        );
+    }
+    let mini = &ctx.state.settings.qol.mini_hud;
+    let segments = [
+        ("FPS", mini.show_fps),
+        ("Coords", mini.show_coords),
+        ("Biome", mini.show_biome),
+        ("Facing", mini.show_facing),
+        ("Ping", mini.show_ping),
+        ("TPS/MSPT", mini.show_mspt_tps),
+        ("Light", mini.show_light_level),
+        ("Chunks", mini.show_chunks_entities),
+        ("Memory", mini.show_ram),
+    ];
+    for (index, (label, enabled)) in segments.into_iter().enumerate() {
+        let column = (index % 3) as i32;
+        let row_index = (index / 3) as i32;
+        ctx.btn(
+            WidgetId::MiniHudSegment(index),
+            lr(left + column * 116, y + 96 + row_index * 18, 112, 16),
+            &format!("{label}: {}", onoff(enabled)),
+        );
+    }
+    if ctx.state.capturing_key_binding.is_some() {
+        ctx.text(left, y + 96, 1, pal::ACCENT, "Press any key…  Esc cancels");
+    }
+}
+
 fn audio_tab(ctx: &mut Ctx, y0: i32) {
     let lang = ctx.lang;
     let a = &ctx.state.settings.audio;
 
     let rows: [(WidgetId, SettingKey, &str, u8); 7] = [
-        (WidgetId::AudioMaster, SettingKey::AudioMaster, "Master Volume", a.master),
-        (WidgetId::AudioMusic, SettingKey::AudioMusic, "Music", a.music),
-        (WidgetId::AudioBlocks, SettingKey::AudioBlocks, "Blocks", a.blocks),
+        (
+            WidgetId::AudioMaster,
+            SettingKey::AudioMaster,
+            "Master Volume",
+            a.master,
+        ),
+        (
+            WidgetId::AudioMusic,
+            SettingKey::AudioMusic,
+            "Music",
+            a.music,
+        ),
+        (
+            WidgetId::AudioBlocks,
+            SettingKey::AudioBlocks,
+            "Blocks",
+            a.blocks,
+        ),
         (
             WidgetId::AudioHostile,
             SettingKey::AudioHostile,
@@ -1456,7 +1584,11 @@ fn qol_tab(ctx: &mut Ctx, y0: i32) {
             q.tool_warn_percent
         ),
     );
-    ctx.dirty_dot(SettingKey::QolToolWarnPercent, x + 326, qy(1) + (bh - 8) / 2);
+    ctx.dirty_dot(
+        SettingKey::QolToolWarnPercent,
+        x + 326,
+        qy(1) + (bh - 8) / 2,
+    );
 
     ctx.btn(
         WidgetId::QolPreventBreak,
@@ -1468,7 +1600,11 @@ fn qol_tab(ctx: &mut Ctx, y0: i32) {
             tr(lang, "opt-in", "オプトイン")
         ),
     );
-    ctx.dirty_dot(SettingKey::QolPreventToolBreak, x + 326, qy(2) + (bh - 8) / 2);
+    ctx.dirty_dot(
+        SettingKey::QolPreventToolBreak,
+        x + 326,
+        qy(2) + (bh - 8) / 2,
+    );
 
     let frac = (q.chat_history_lines as f32 - 100.0) / 4900.0;
     ctx.slider(
@@ -1482,7 +1618,11 @@ fn qol_tab(ctx: &mut Ctx, y0: i32) {
             tr(lang, "lines", "行")
         ),
     );
-    ctx.dirty_dot(SettingKey::QolChatHistoryLines, x + 326, qy(3) + (bh - 8) / 2);
+    ctx.dirty_dot(
+        SettingKey::QolChatHistoryLines,
+        x + 326,
+        qy(3) + (bh - 8) / 2,
+    );
 
     ctx.btn(
         WidgetId::QolRetainChat,
@@ -1508,7 +1648,11 @@ fn qol_tab(ctx: &mut Ctx, y0: i32) {
             q.crash_report_mode.label()
         ),
     );
-    ctx.dirty_dot(SettingKey::QolCrashReportMode, x + 326, qy(5) + (bh - 8) / 2);
+    ctx.dirty_dot(
+        SettingKey::QolCrashReportMode,
+        x + 326,
+        qy(5) + (bh - 8) / 2,
+    );
 
     ctx.btn(
         WidgetId::QolShowSupportLinks,
@@ -1527,7 +1671,11 @@ fn qol_tab(ctx: &mut Ctx, y0: i32) {
             )
         },
     );
-    ctx.dirty_dot(SettingKey::QolShowSupportLinks, x + 326, qy(6) + (bh - 8) / 2);
+    ctx.dirty_dot(
+        SettingKey::QolShowSupportLinks,
+        x + 326,
+        qy(6) + (bh - 8) / 2,
+    );
 
     // The two opt-in overlays share one compact row of half-width
     // toggles: the MiniHUD cycles Off/Basic/Advanced presets, the
@@ -2250,9 +2398,7 @@ fn hud(ctx: &mut Ctx) {
                 .completions
                 .iter()
                 .take(rows)
-                .map(|cand| {
-                    crate::draw::text_width(&hud_str(cand, 40), 1) as i32
-                })
+                .map(|cand| crate::draw::text_width(&hud_str(cand, 40), 1) as i32)
                 .max()
                 .unwrap_or(0);
             let pop_w = (widest + 8).min(w - 8);
@@ -2266,7 +2412,14 @@ fn hud(ctx: &mut Ctx) {
                 if Some(i) == selected {
                     ctx.fill(5, ry, pop_w - 2, 10, UiColor::rgba(80, 88, 110, 120));
                 }
-                ctx.hud_text(7, ry + 1, 1, pal::TEXT, cand, ((pop_w - 10) / 8).max(1) as usize);
+                ctx.hud_text(
+                    7,
+                    ry + 1,
+                    1,
+                    pal::TEXT,
+                    cand,
+                    ((pop_w - 10) / 8).max(1) as usize,
+                );
             }
         }
     }
@@ -2412,9 +2565,7 @@ fn hud(ctx: &mut Ctx) {
             let box_w = (text_w + 2 * pad).min(max_box_w);
             let bx = match anchor {
                 MiniHudAnchor::TopLeft | MiniHudAnchor::BottomLeft => 4,
-                MiniHudAnchor::TopRight | MiniHudAnchor::BottomRight => {
-                    (w - 4 - box_w).max(4)
-                }
+                MiniHudAnchor::TopRight | MiniHudAnchor::BottomRight => (w - 4 - box_w).max(4),
             };
             let box_h = 2 * pad + shown.len() as i32 * 10 - 2;
             let by = match anchor {
@@ -2744,12 +2895,7 @@ fn hud_occupied_rects(state: &UiState, width: u32, height: u32) -> Vec<UiRect> {
 }
 
 /// Fill a reusable buffer with the physical HUD occupancy rectangles.
-pub fn hud_occupied_rects_into(
-    state: &UiState,
-    width: u32,
-    height: u32,
-    rects: &mut Vec<UiRect>,
-) {
+pub fn hud_occupied_rects_into(state: &UiState, width: u32, height: u32, rects: &mut Vec<UiRect>) {
     rects.clear();
     let hud = &state.hud;
     let s = state.effective_scale(height) as i32;
@@ -2959,12 +3105,7 @@ pub fn hud_occupied_rects_into(
 
         // MagicHUD bottom bars + top-right status column (same frame the
         // MiniHUD collision code uses).
-        if let Some(mf) = magic_frame(
-            &hud.magic,
-            (w * s) as u32,
-            (h * s) as u32,
-            s,
-        ) {
+        if let Some(mf) = magic_frame(&hud.magic, (w * s) as u32, (h * s) as u32, s) {
             add(
                 mf.panel.start,
                 mf.stack_top,
@@ -3330,7 +3471,11 @@ fn modal(ctx: &mut Ctx) {
             let ok_w = (pair - 6) / 2;
             let cancel_w = pair - 6 - ok_w;
             let ox = mx + (mw - pair) / 2;
-            ctx.btn(WidgetId::ModalOk, lr(ox, my + mh - 34, ok_w, 20), tr(lang, "OK", "OK"));
+            ctx.btn(
+                WidgetId::ModalOk,
+                lr(ox, my + mh - 34, ok_w, 20),
+                tr(lang, "OK", "OK"),
+            );
             if let Some(r) = ctx.regions.last_mut() {
                 r.modal = true;
             }
@@ -3369,11 +3514,7 @@ fn modal(ctx: &mut Ctx) {
                 my + 36,
                 1,
                 pal::WARNING,
-                tr(
-                    lang,
-                    "Undo can recover this",
-                    "「元に戻す」で復元できます",
-                ),
+                tr(lang, "Undo can recover this", "「元に戻す」で復元できます"),
             );
             let pair = mw - 22;
             let ok_w = (pair - 6) / 2;

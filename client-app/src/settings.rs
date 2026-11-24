@@ -19,7 +19,7 @@ use std::path::Path;
 use megu_client_mesh::RenderBackendPreference;
 use megu_core::hash::fnv1a64;
 
-use crate::crash_reporter::{parse_report_url, CrashSubmitPolicy};
+use crate::crash_reporter::{CrashSubmitPolicy, parse_report_url};
 
 use crate::audio_qol::{
     DEFAULT_CHAT_HISTORY_LINES, DEFAULT_MAX_CONCURRENT_SAME_SOUND, DEFAULT_MAX_VOLUME_CAP,
@@ -74,6 +74,52 @@ pub const DISTANT_HORIZON_FAR_CHUNKS: i32 = 128;
 const LOD_MEMORY_BUDGET_BYTES: usize = 64 * 1024 * 1024;
 /// Default filename for [`ClientSettings::to_toml`] output.
 pub const SETTINGS_FILE_NAME: &str = "megu-client.toml";
+
+/// Stable physical key names used by the window's rebindable controls.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct KeyBindings {
+    pub forward: String,
+    pub back: String,
+    pub left: String,
+    pub right: String,
+    pub jump: String,
+    pub sneak: String,
+    pub sprint: String,
+    pub inventory: String,
+    pub drop: String,
+    pub swap_offhand: String,
+    pub chat: String,
+    pub command: String,
+    pub zoom: String,
+    pub camera_toggle: String,
+    pub fullscreen: String,
+    pub advancements: String,
+    pub sort_inventory: String,
+}
+
+impl Default for KeyBindings {
+    fn default() -> Self {
+        Self {
+            forward: "KeyW".into(),
+            back: "KeyS".into(),
+            left: "KeyA".into(),
+            right: "KeyD".into(),
+            jump: "Space".into(),
+            sneak: "ShiftLeft".into(),
+            sprint: "ControlLeft".into(),
+            inventory: "KeyE".into(),
+            drop: "KeyQ".into(),
+            swap_offhand: "KeyF".into(),
+            chat: "KeyT".into(),
+            command: "Slash".into(),
+            zoom: "KeyC".into(),
+            camera_toggle: "F5".into(),
+            fullscreen: "F11".into(),
+            advancements: "KeyL".into(),
+            sort_inventory: "KeyR".into(),
+        }
+    }
+}
 
 /// Named bundle of player-visible settings.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -454,6 +500,14 @@ pub struct ClientSettings {
     /// `None` — the default on every preset — keeps built-in rendering;
     /// packs that exceed the GPU's capabilities fail closed back to it.
     pub shader_pack: Option<String>,
+    /// Whether the selected shader pack is active.
+    pub shaders_enabled: bool,
+    pub builtin_looking_at_hud: bool,
+    pub builtin_mouse_tweaks: bool,
+    pub builtin_inventory_sort: bool,
+    pub zsh_command_bar: bool,
+    pub mini_hud_enabled: bool,
+    pub mini_hud_segments: u16,
     /// Optional `profile.<NAME>` inside the pack's `shaders.properties`
     /// activated on load; `None` uses the pack's own defaults.
     pub shader_profile: Option<String>,
@@ -475,6 +529,12 @@ pub struct ClientSettings {
     /// enforces. `None` — the default — means zero network egress:
     /// reports stay on disk under `crash-reports/` no matter the mode.
     pub report_endpoint: Option<String>,
+    pub fullscreen: bool,
+    pub mouse_invert_y: bool,
+    pub gamma_pct: u16,
+    /// `0` = automatic, `1..=4` are fixed UI scale factors.
+    pub gui_scale: u8,
+    pub keys: KeyBindings,
 }
 
 impl Default for ClientSettings {
@@ -513,11 +573,23 @@ impl ClientSettings {
             background_fps_limit: DEFAULT_BACKGROUND_FPS_LIMIT,
             gpu_backend: RenderBackendPreference::Auto,
             shader_pack: None,
+            shaders_enabled: false,
+            builtin_looking_at_hud: true,
+            builtin_mouse_tweaks: true,
+            builtin_inventory_sort: true,
+            zsh_command_bar: true,
+            mini_hud_enabled: false,
+            mini_hud_segments: 0b1_1111,
             shader_profile: None,
             map_fair_play: HostMapFairPlaySettings::default(),
             qol: ClientQolSettings::default(),
             crash_report_mode: CrashReportMode::default(),
             report_endpoint: None,
+            fullscreen: false,
+            mouse_invert_y: false,
+            gamma_pct: 100,
+            gui_scale: 0,
+            keys: KeyBindings::default(),
         };
         match preset {
             QualityPreset::Fast => {
@@ -589,6 +661,22 @@ impl ClientSettings {
                 shader_lines.push_str(&format!("shader_profile = \"{profile}\"\n"));
             }
         }
+        shader_lines.push_str(&format!("shaders_enabled = {}\n", self.shaders_enabled));
+        shader_lines.push_str(&format!(
+            "builtin_looking_at_hud = {}\n",
+            self.builtin_looking_at_hud
+        ));
+        shader_lines.push_str(&format!(
+            "builtin_mouse_tweaks = {}\n",
+            self.builtin_mouse_tweaks
+        ));
+        shader_lines.push_str(&format!(
+            "builtin_inventory_sort = {}\n",
+            self.builtin_inventory_sort
+        ));
+        shader_lines.push_str(&format!("zsh_command_bar = {}\n", self.zsh_command_bar));
+        shader_lines.push_str(&format!("mini_hud_enabled = {}\n", self.mini_hud_enabled));
+        shader_lines.push_str(&format!("mini_hud_segments = {}\n", self.mini_hud_segments));
         // The report endpoint is omitted entirely when unset so a default
         // file configures no egress; only values that still pass the
         // transport URL allowlist are ever written back out.
@@ -618,6 +706,10 @@ impl ClientSettings {
              max_fps = {}\n\
              background_fps_limit = {}\n\
              gpu_backend = \"{}\"\n\
+             fullscreen = {}\n\
+             mouse_invert_y = {}\n\
+             gamma_pct = {}\n\
+             gui_scale = {}\n\
              crash_report_mode = \"{}\"\n\
              {shader_lines}\
              {report_line}\
@@ -657,6 +749,10 @@ impl ClientSettings {
             max_fps,
             self.background_fps_limit,
             self.gpu_backend.as_str(),
+            self.fullscreen,
+            self.mouse_invert_y,
+            self.gamma_pct,
+            self.gui_scale,
             self.crash_report_mode.as_str(),
             self.map_fair_play.minimap_fair_play,
             self.map_fair_play.allow_cave_map,
@@ -672,6 +768,25 @@ impl ClientSettings {
             self.qol.prevent_tool_break,
             self.qol.chat_history_lines,
             self.qol.retain_chat_on_reconnect,
+        ) + &format!(
+            "\n[keys]\nforward = \"{}\"\nback = \"{}\"\nleft = \"{}\"\nright = \"{}\"\njump = \"{}\"\nsneak = \"{}\"\nsprint = \"{}\"\ninventory = \"{}\"\ndrop = \"{}\"\nswap_offhand = \"{}\"\nchat = \"{}\"\ncommand = \"{}\"\nzoom = \"{}\"\ncamera_toggle = \"{}\"\nfullscreen = \"{}\"\nadvancements = \"{}\"\nsort_inventory = \"{}\"\n",
+            self.keys.forward,
+            self.keys.back,
+            self.keys.left,
+            self.keys.right,
+            self.keys.jump,
+            self.keys.sneak,
+            self.keys.sprint,
+            self.keys.inventory,
+            self.keys.drop,
+            self.keys.swap_offhand,
+            self.keys.chat,
+            self.keys.command,
+            self.keys.zoom,
+            self.keys.camera_toggle,
+            self.keys.fullscreen,
+            self.keys.advancements,
+            self.keys.sort_inventory,
         )
     }
 
@@ -713,25 +828,56 @@ impl ClientSettings {
                     self.background_fps_limit = parsed.background_fps_limit;
                 }
                 "gpu_backend" => self.gpu_backend = parsed.gpu_backend,
+                "fullscreen" => self.fullscreen = parsed.fullscreen,
+                "mouse_invert_y" => self.mouse_invert_y = parsed.mouse_invert_y,
+                "gamma_pct" => self.gamma_pct = parsed.gamma_pct,
+                "gui_scale" => self.gui_scale = parsed.gui_scale,
+                "keys.forward" => self.keys.forward = parsed.keys.forward.clone(),
+                "keys.back" => self.keys.back = parsed.keys.back.clone(),
+                "keys.left" => self.keys.left = parsed.keys.left.clone(),
+                "keys.right" => self.keys.right = parsed.keys.right.clone(),
+                "keys.jump" => self.keys.jump = parsed.keys.jump.clone(),
+                "keys.sneak" => self.keys.sneak = parsed.keys.sneak.clone(),
+                "keys.sprint" => self.keys.sprint = parsed.keys.sprint.clone(),
+                "keys.inventory" => self.keys.inventory = parsed.keys.inventory.clone(),
+                "keys.drop" => self.keys.drop = parsed.keys.drop.clone(),
+                "keys.swap_offhand" => self.keys.swap_offhand = parsed.keys.swap_offhand.clone(),
+                "keys.chat" => self.keys.chat = parsed.keys.chat.clone(),
+                "keys.command" => self.keys.command = parsed.keys.command.clone(),
+                "keys.zoom" => self.keys.zoom = parsed.keys.zoom.clone(),
+                "keys.camera_toggle" => self.keys.camera_toggle = parsed.keys.camera_toggle.clone(),
+                "keys.fullscreen" => self.keys.fullscreen = parsed.keys.fullscreen.clone(),
+                "keys.advancements" => self.keys.advancements = parsed.keys.advancements.clone(),
+                "keys.sort_inventory" => {
+                    self.keys.sort_inventory = parsed.keys.sort_inventory.clone()
+                }
                 "shader_pack" => self.shader_pack = parsed.shader_pack.clone(),
+                "shaders_enabled" => self.shaders_enabled = parsed.shaders_enabled,
+                "builtin_looking_at_hud" => {
+                    self.builtin_looking_at_hud = parsed.builtin_looking_at_hud
+                }
+                "builtin_mouse_tweaks" => self.builtin_mouse_tweaks = parsed.builtin_mouse_tweaks,
+                "builtin_inventory_sort" => {
+                    self.builtin_inventory_sort = parsed.builtin_inventory_sort
+                }
+                "zsh_command_bar" => self.zsh_command_bar = parsed.zsh_command_bar,
+                "mini_hud_enabled" => self.mini_hud_enabled = parsed.mini_hud_enabled,
+                "mini_hud_segments" => self.mini_hud_segments = parsed.mini_hud_segments,
                 "shader_profile" => self.shader_profile = parsed.shader_profile.clone(),
                 "minimap_fair_play" | "minimap_mode" => {
                     // The mirrored pair is already consistent in `parsed`.
-                    self.map_fair_play.minimap_fair_play =
-                        parsed.map_fair_play.minimap_fair_play;
+                    self.map_fair_play.minimap_fair_play = parsed.map_fair_play.minimap_fair_play;
                     self.map_fair_play.minimap_mode = parsed.map_fair_play.minimap_mode;
                 }
                 "allow_cave_map" => {
                     self.map_fair_play.allow_cave_map = parsed.map_fair_play.allow_cave_map;
                 }
                 "allow_entity_radar" | "allow_mob_radar" => {
-                    self.map_fair_play.allow_entity_radar =
-                        parsed.map_fair_play.allow_entity_radar;
+                    self.map_fair_play.allow_entity_radar = parsed.map_fair_play.allow_entity_radar;
                     self.map_fair_play.allow_mob_radar = parsed.map_fair_play.allow_mob_radar;
                 }
                 "player_radar_scope" => {
-                    self.map_fair_play.player_radar_scope =
-                        parsed.map_fair_play.player_radar_scope;
+                    self.map_fair_play.player_radar_scope = parsed.map_fair_play.player_radar_scope;
                 }
                 "allow_waypoint_teleport" => {
                     self.map_fair_play.allow_waypoint_teleport =
@@ -739,8 +885,7 @@ impl ClientSettings {
                 }
                 "max_volume_cap" => self.qol.max_volume_cap = parsed.qol.max_volume_cap,
                 "max_concurrent_same_sound" => {
-                    self.qol.max_concurrent_same_sound =
-                        parsed.qol.max_concurrent_same_sound;
+                    self.qol.max_concurrent_same_sound = parsed.qol.max_concurrent_same_sound;
                 }
                 "zoom_divisor" => self.qol.zoom_divisor = parsed.qol.zoom_divisor,
                 "tool_warn_percent" => {
@@ -783,9 +928,14 @@ impl ClientSettings {
         let mut settings = ClientSettings::default();
         let mut warnings = Vec::new();
         let mut seen: Vec<&'static str> = Vec::new();
+        let mut section = "";
         for raw_line in text.lines() {
             let line = raw_line.split('#').next().unwrap_or("").trim();
-            if line.is_empty() || (line.starts_with('[') && line.ends_with(']')) {
+            if line.is_empty() {
+                continue;
+            }
+            if line.starts_with('[') && line.ends_with(']') {
+                section = line[1..line.len() - 1].trim();
                 continue;
             }
             let Some((key, raw_value)) = line.split_once('=') else {
@@ -794,6 +944,43 @@ impl ClientSettings {
             };
             let key = key.trim();
             let value = unquote(raw_value.trim());
+            if section == "keys" {
+                let slot = match key {
+                    "forward" => (&mut settings.keys.forward, "keys.forward"),
+                    "back" => (&mut settings.keys.back, "keys.back"),
+                    "left" => (&mut settings.keys.left, "keys.left"),
+                    "right" => (&mut settings.keys.right, "keys.right"),
+                    "jump" => (&mut settings.keys.jump, "keys.jump"),
+                    "sneak" => (&mut settings.keys.sneak, "keys.sneak"),
+                    "sprint" => (&mut settings.keys.sprint, "keys.sprint"),
+                    "inventory" => (&mut settings.keys.inventory, "keys.inventory"),
+                    "drop" => (&mut settings.keys.drop, "keys.drop"),
+                    "swap_offhand" => (&mut settings.keys.swap_offhand, "keys.swap_offhand"),
+                    "chat" => (&mut settings.keys.chat, "keys.chat"),
+                    "command" => (&mut settings.keys.command, "keys.command"),
+                    "zoom" => (&mut settings.keys.zoom, "keys.zoom"),
+                    "camera_toggle" => (&mut settings.keys.camera_toggle, "keys.camera_toggle"),
+                    "fullscreen" => (&mut settings.keys.fullscreen, "keys.fullscreen"),
+                    "advancements" => (&mut settings.keys.advancements, "keys.advancements"),
+                    "sort_inventory" => (&mut settings.keys.sort_inventory, "keys.sort_inventory"),
+                    _ => {
+                        warnings.push(format!("unknown key '{key}' in [keys]"));
+                        continue;
+                    }
+                };
+                if !value.is_empty()
+                    && value.len() <= 32
+                    && value
+                        .bytes()
+                        .all(|b| b.is_ascii_alphanumeric() || b == b'_')
+                {
+                    *slot.0 = value.to_owned();
+                    seen.push(slot.1);
+                } else {
+                    warnings.push(format!("invalid value for '{key}': '{value}'"));
+                }
+                continue;
+            }
             let invalid = |warnings: &mut Vec<String>| {
                 warnings.push(format!("invalid value for '{key}': '{value}'"));
             };
@@ -912,8 +1099,7 @@ impl ClientSettings {
                     None => invalid(&mut warnings),
                 },
                 "max_fps" => {
-                    if value.eq_ignore_ascii_case("unlimited")
-                        || value.eq_ignore_ascii_case("none")
+                    if value.eq_ignore_ascii_case("unlimited") || value.eq_ignore_ascii_case("none")
                     {
                         settings.max_fps = None;
                         seen.push("max_fps");
@@ -953,12 +1139,91 @@ impl ClientSettings {
                     }
                     None => invalid(&mut warnings),
                 },
+                "fullscreen" | "mouse_invert_y" => match parse_bool(value) {
+                    Some(value) => {
+                        if key == "fullscreen" {
+                            settings.fullscreen = value;
+                        } else {
+                            settings.mouse_invert_y = value;
+                        }
+                        seen.push(if key == "fullscreen" {
+                            "fullscreen"
+                        } else {
+                            "mouse_invert_y"
+                        });
+                    }
+                    None => invalid(&mut warnings),
+                },
+                "gamma_pct" => match value.parse::<i64>() {
+                    Ok(value) => {
+                        settings.gamma_pct = clamp_i64(value, 50, 200, key, &mut warnings) as u16;
+                        seen.push("gamma_pct");
+                    }
+                    Err(_) => invalid(&mut warnings),
+                },
+                "gui_scale" => match value.parse::<i64>() {
+                    Ok(value) => {
+                        settings.gui_scale = clamp_i64(value, 0, 4, key, &mut warnings) as u8;
+                        seen.push("gui_scale");
+                    }
+                    Err(_) => invalid(&mut warnings),
+                },
                 "shader_pack" => match sanitize_shader_selector(value) {
                     Some(v) => {
                         settings.shader_pack = Some(v);
                         seen.push("shader_pack");
                     }
                     None => invalid(&mut warnings),
+                },
+                "shaders_enabled" => match parse_bool(value) {
+                    Some(v) => {
+                        settings.shaders_enabled = v;
+                        seen.push("shaders_enabled");
+                    }
+                    None => invalid(&mut warnings),
+                },
+                "builtin_looking_at_hud" => match parse_bool(value) {
+                    Some(v) => {
+                        settings.builtin_looking_at_hud = v;
+                        seen.push("builtin_looking_at_hud");
+                    }
+                    None => invalid(&mut warnings),
+                },
+                "builtin_mouse_tweaks" => match parse_bool(value) {
+                    Some(v) => {
+                        settings.builtin_mouse_tweaks = v;
+                        seen.push("builtin_mouse_tweaks");
+                    }
+                    None => invalid(&mut warnings),
+                },
+                "builtin_inventory_sort" => match parse_bool(value) {
+                    Some(v) => {
+                        settings.builtin_inventory_sort = v;
+                        seen.push("builtin_inventory_sort");
+                    }
+                    None => invalid(&mut warnings),
+                },
+                "zsh_command_bar" => match parse_bool(value) {
+                    Some(v) => {
+                        settings.zsh_command_bar = v;
+                        seen.push("zsh_command_bar");
+                    }
+                    None => invalid(&mut warnings),
+                },
+                "mini_hud_enabled" => match parse_bool(value) {
+                    Some(v) => {
+                        settings.mini_hud_enabled = v;
+                        seen.push("mini_hud_enabled");
+                    }
+                    None => invalid(&mut warnings),
+                },
+                "mini_hud_segments" => match value.parse::<i64>() {
+                    Ok(v) => {
+                        settings.mini_hud_segments =
+                            clamp_i64(v, 0, 511, key, &mut warnings) as u16;
+                        seen.push("mini_hud_segments");
+                    }
+                    Err(_) => invalid(&mut warnings),
                 },
                 "shader_profile" => match sanitize_shader_selector(value) {
                     Some(v) => {
@@ -987,9 +1252,8 @@ impl ClientSettings {
                                 settings.report_endpoint = Some(value.to_string());
                                 seen.push("report_endpoint");
                             }
-                            Err(err) => warnings.push(format!(
-                                "invalid value for '{key}': '{value}' ({err})"
-                            )),
+                            Err(err) => warnings
+                                .push(format!("invalid value for '{key}': '{value}' ({err})")),
                         }
                     }
                 }
@@ -1079,26 +1343,17 @@ impl ClientSettings {
                 },
                 "zoom_divisor" => match value.parse::<f32>() {
                     Ok(v) if v.is_finite() => {
-                        settings.qol.zoom_divisor = clamp_f32(
-                            v,
-                            MIN_ZOOM_DIVISOR,
-                            MAX_ZOOM_DIVISOR,
-                            key,
-                            &mut warnings,
-                        );
+                        settings.qol.zoom_divisor =
+                            clamp_f32(v, MIN_ZOOM_DIVISOR, MAX_ZOOM_DIVISOR, key, &mut warnings);
                         seen.push("zoom_divisor");
                     }
                     _ => invalid(&mut warnings),
                 },
                 "tool_warn_percent" => match value.parse::<i64>() {
                     Ok(v) => {
-                        settings.qol.tool_warn_percent = clamp_i64(
-                            v,
-                            0,
-                            i64::from(MAX_TOOL_WARN_PERCENT),
-                            key,
-                            &mut warnings,
-                        ) as u8;
+                        settings.qol.tool_warn_percent =
+                            clamp_i64(v, 0, i64::from(MAX_TOOL_WARN_PERCENT), key, &mut warnings)
+                                as u8;
                         seen.push("tool_warn_percent");
                     }
                     Err(_) => invalid(&mut warnings),
@@ -1188,10 +1443,8 @@ impl ClientSettings {
         }
         if let Some(v) = get("renderDistance").and_then(parse_i64) {
             applied = true;
-            self.view_distance = v.clamp(
-                i64::from(MIN_VIEW_DISTANCE),
-                i64::from(MAX_VIEW_DISTANCE),
-            ) as u8;
+            self.view_distance =
+                v.clamp(i64::from(MIN_VIEW_DISTANCE), i64::from(MAX_VIEW_DISTANCE)) as u8;
         }
         if let Some(raw) = get("fov") {
             // Vanilla stores fov as a 0..1 slider fraction (0.5 = 70 deg);
@@ -1199,9 +1452,8 @@ impl ClientSettings {
             if let Ok(v) = raw.parse::<f64>() {
                 applied = true;
                 let degrees = if v <= 1.5 { 30.0 + 80.0 * v } else { v };
-                self.fov = (degrees.round() as i64)
-                    .clamp(i64::from(MIN_FOV), i64::from(MAX_FOV))
-                    as u8;
+                self.fov =
+                    (degrees.round() as i64).clamp(i64::from(MIN_FOV), i64::from(MAX_FOV)) as u8;
             }
         }
         if let Some(v) = get("particles").and_then(parse_i64) {
@@ -1239,6 +1491,24 @@ impl ClientSettings {
         if let Some(v) = get("ao").and_then(parse_i64) {
             applied = true;
             self.smooth_lighting = v != 0;
+        }
+        if let Some(v) = get("invertYMouse") {
+            applied = true;
+            self.mouse_invert_y = v.eq_ignore_ascii_case("true");
+        }
+        if let Some(v) = get("fullscreen") {
+            applied = true;
+            self.fullscreen = v.eq_ignore_ascii_case("true");
+        }
+        if let Some(v) = get("guiScale").and_then(parse_i64) {
+            applied = true;
+            self.gui_scale = v.clamp(0, 4) as u8;
+        }
+        if let Some(v) = get("gamma").and_then(|v| v.parse::<f64>().ok()) {
+            if v.is_finite() {
+                applied = true;
+                self.gamma_pct = (100.0 + v.clamp(0.0, 1.0) * 100.0).round() as u16;
+            }
         }
         if let Some(v) = get("entityShadows") {
             applied = true;
@@ -1365,7 +1635,6 @@ impl SettingsSaveGuard {
     }
 }
 
-
 /// Write `bytes` to `path` atomically: a sibling `*.tmp` file is written
 /// first, then renamed over `path`, so a crash mid-write can never leave a
 /// truncated settings file.
@@ -1383,11 +1652,7 @@ fn write_atomic(path: &Path, bytes: &[u8]) -> Result<(), String> {
     std::fs::write(&tmp, bytes).map_err(|e| format!("cannot write {}: {e}", tmp.display()))?;
     std::fs::rename(&tmp, path).map_err(|e| {
         let _ = std::fs::remove_file(&tmp);
-        format!(
-            "cannot rename {} to {}: {e}",
-            tmp.display(),
-            path.display()
-        )
+        format!("cannot rename {} to {}: {e}", tmp.display(), path.display())
     })
 }
 
@@ -1398,9 +1663,7 @@ pub fn is_valid_shader_selector(value: &str) -> bool {
     let trimmed = value.trim();
     !trimmed.is_empty()
         && !trimmed.chars().any(|c| c == '"' || c.is_control())
-        && !trimmed
-            .split(&['/', '\\'][..])
-            .any(|part| part == "..")
+        && !trimmed.split(&['/', '\\'][..]).any(|part| part == "..")
 }
 
 /// Normalize a `shader_pack`/`shader_profile` selector for the settings
@@ -1483,9 +1746,11 @@ mod tests {
                 assert!((MIN_MAX_FPS..=MAX_MAX_FPS).contains(&fps));
             }
             if let Some(lod) = s.to_lod_config() {
-                assert!(0 <= lod.full_detail_radius
-                    && lod.full_detail_radius <= lod.fine_lod_radius
-                    && lod.fine_lod_radius <= lod.coarse_lod_radius);
+                assert!(
+                    0 <= lod.full_detail_radius
+                        && lod.full_detail_radius <= lod.fine_lod_radius
+                        && lod.fine_lod_radius <= lod.coarse_lod_radius
+                );
             }
             assert_eq!(s.engine_optimizations(), BuiltInOptimizations::ALL_ON);
         }
@@ -1546,6 +1811,13 @@ mod tests {
             background_fps_limit: 45,
             gpu_backend: RenderBackendPreference::ClassicLowSpec,
             shader_pack: Some("shaderpacks/Complementary.zip".to_owned()),
+            shaders_enabled: true,
+            builtin_looking_at_hud: false,
+            builtin_mouse_tweaks: false,
+            builtin_inventory_sort: false,
+            zsh_command_bar: false,
+            mini_hud_enabled: true,
+            mini_hud_segments: 0b101_001_011,
             shader_profile: Some("HIGH".to_owned()),
             map_fair_play: HostMapFairPlaySettings {
                 minimap_fair_play: true,
@@ -1567,6 +1839,14 @@ mod tests {
             },
             crash_report_mode: CrashReportMode::AutoCrashOnly,
             report_endpoint: Some("https://reports.example.com/api/report".to_owned()),
+            fullscreen: true,
+            mouse_invert_y: true,
+            gamma_pct: 175,
+            gui_scale: 3,
+            keys: KeyBindings {
+                forward: "KeyI".to_owned(),
+                ..KeyBindings::default()
+            },
         };
         let text = s.to_toml();
         let (back, warnings) = ClientSettings::from_toml(&text);
@@ -1728,10 +2008,7 @@ mod tests {
 
     #[test]
     fn write_toml_round_trips_through_from_toml() {
-        let dir = std::env::temp_dir().join(format!(
-            "megu-settings-test-{}",
-            std::process::id()
-        ));
+        let dir = std::env::temp_dir().join(format!("megu-settings-test-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("nested/out.toml");
         let s = ClientSettings::from_preset(QualityPreset::Ultra);
