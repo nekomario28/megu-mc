@@ -2,7 +2,7 @@
 
 Two contracts in `TreeFeature`'s decorator hand-off and one diagnostic that was
 printing its own scan bound. Measured against the pinned 1.21.1 jar
-(`/home/yuu/mc-spine-local/captures/native/mc-native-overworld-20261111/server.jar`,
+(`<local>/captures/native/mc-native-overworld-20261111/server.jar`,
 mappings `/var/tmp/mcm/server.txt`, `tools/bytecode_probe.sh`).
 
 Both contracts are RNG-stream contracts, not cosmetics: `TrunkVineDecorator` draws

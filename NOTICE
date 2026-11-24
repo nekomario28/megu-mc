@@ -51,7 +51,8 @@ SOFTWARE.
 
 assets/blocks_1211.json
 -----------------------
-Block data for Minecraft Java 1.21.1, byte-identical to
+This file is not shipped on public main. The previously used block data for
+Minecraft Java 1.21.1 was byte-identical to
 `data/pc/1.21.1/blocks.json` in https://github.com/PrismarineJS/minecraft-data
 (last changed upstream in commit d56346a4e32defcd28d9ba6750957c12001e78d6).
 
@@ -60,14 +61,15 @@ upstream repository has no LICENSE file and no named copyright holder at the tim
 writing, so none is reproduced here. The upstream README also notes that some of the data
 was extracted from wiki.vg and minecraft.gamepedia.com.
 
-Minecraft data (development checkout versus public export)
----------------------------------------------------------
+Minecraft data (local generation for live and parity tests)
+----------------------------------------------------------
 Derived from Minecraft, (c) Mojang Studios / Microsoft; not covered by megu's LGPL-3.0-or-later
-license. Do not redistribute these outputs or the jar. The development
-branch tracks datapacks/vanilla/, assets/block_states_1211.json, config_packets.bin,
-tests/data/biome_probe_ties_1211.tsv and tests/data/random_next_int_1211.tsv.
-tools/vanilla_data/gen_vanilla_data.sh generates these and tests/data/biome_probe_1211.tsv
-and tests/data/vanilla_vectors_1211.tsv from the user's own 1.21.1 server jar
+license. Do not redistribute these outputs or the jar. Public main is a clean-room
+tree: datapacks/vanilla/, assets/block_states_1211.json, config_packets.bin and the
+generator's TSVs (tests/data/biome_probe_ties_1211.tsv, tests/data/random_next_int_1211.tsv,
+tests/data/biome_probe_1211.tsv and tests/data/vanilla_vectors_1211.tsv) are not tracked.
+For live server and vanilla-data parity tests, generate these inputs locally with
+tools/vanilla_data/gen_vanilla_data.sh from your own 1.21.1 server jar
 (sha1 59353fb40c36d304f2035d51e7d6e6baa98dc05c). Capturing config_packets.bin
 requires the user's explicit --accept-eula. --verify checks the datapack without a jar.
 tools/export_public_branch.sh omits all these paths and ignores local regenerated copies

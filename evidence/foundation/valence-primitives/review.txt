@@ -12,10 +12,10 @@ session id: 01a172dc-1f97-7eb1-a260-4a4dd6038672
 user
 <task>Review the uncommitted diff in this checkout for actionable correctness regressions, following code-review and refactor-clean. Read-only STATIC review only: do not run builds, tests, Java, downloads, or servers. This snapshot is copied from an implementing worktree whose mutation campaign is running elsewhere. Focus on the changed section palette writer, modified-UTF-8 writers and lore preservation, finite AABB clip and arrow dispatch, and oracle/test blind spots. Separate existing documented limitations from regressions caused by this diff.</task><output_contract>Report concrete actionable findings with paths and reasoning; if none, say so. State that this is static review and identify any evidence limits. Do not change files.</output_contract>
 2026-10-25T11:39:51.357568Z ERROR codex_api::endpoint::responses_websocket: failed to connect to websocket: HTTP error: 426 Upgrade Required, url: ws://127.0.0.1:17841/v1/responses
-warning: loading hooks from both /home/yuu/.codex/hooks.json and /home/yuu/.codex/config.toml; prefer a single representation for this layer
-warning: loading hooks from both /home/yuu/.codex/hooks.json and /home/yuu/.codex/config.toml; prefer a single representation for this layer
+warning: loading hooks from both <home>/.codex/hooks.json and <home>/.codex/config.toml; prefer a single representation for this layer
+warning: loading hooks from both <home>/.codex/hooks.json and <home>/.codex/config.toml; prefer a single representation for this layer
 exec
-/usr/bin/bash -lc "cat /home/yuu/.codex/skills/code-review/SKILL.md; cat /home/yuu/.agents/skills/refactor-clean/SKILL.md; rg -n 'mc-spine' /home/yuu/.codex/memories/MEMORY.md" in /tmp/mc-primitives-review-wt
+/usr/bin/bash -lc "cat <home>/.codex/skills/code-review/SKILL.md; cat <home>/.agents/skills/refactor-clean/SKILL.md; rg -n 'mc-spine' <home>/.codex/memories/MEMORY.md" in /tmp/mc-primitives-review-wt
  succeeded in 0ms:
 ---
 name: code-review
@@ -581,7 +581,7 @@ When the two owners disagree about *coverage* the failure is silent in one direc
 named three blocks and the asset named nineteen, so sixteen concrete powders never fell and nothing
 failed. Pin the set by count as well as by name.
 192:# Task Group: mc-spine recovery, bounded Fabric/NeoForge compatibility, and lightweight-server design
-195:applies_to: cwd=/home/yuu/Documents/Codex/2026-10-04/mc/outputs/mc-spine/native; reuse_rule=use current repository history and canonical `native/DESIGN.md`; do not generalize pinned adapter tests into arbitrary-Mod or production-performance compatibility
+195:applies_to: cwd=<worktree>/native; reuse_rule=use current repository history and canonical `native/DESIGN.md`; do not generalize pinned adapter tests into arbitrary-Mod or production-performance compatibility
 197:## Task 1: Recover mc-spine source/history and preserve provenance, outcome=success
 205:- mc-spine, Minecraft 1.21.1, protocol 767, RECOVERY-MANIFEST.json, v2.37, 860142fa, write_varint, signed i64, OOM, cargo build --offline --locked
 235:- The canonical recovered source is v2.37 `860142fa21e5c77ca3818d9e331756fa0df72b13`; `/data/lane-scratch/mc-spine` was an older/mixed copy. Recovery at `outputs/mc-spine/runtime` passed build, 9 tests, and SHA-256 checks for 2,461 restored entries. [Task 1]
@@ -2141,7 +2141,7 @@ if __name__ == "__main__":
     unittest.main()
 
 exec
-/usr/bin/bash -lc "cat evidence/foundation/valence-primitives/README.md; git diff -- .github/workflows/ci.yml tests/verify.sh; sed -n '3210,3320p' src/main.rs; cat tests/primitives_oracle_test.py; sed -n '1,65p' /home/yuu/.agents/skills/refactor-clean/SKILL.md" in /tmp/mc-primitives-review-wt
+/usr/bin/bash -lc "cat evidence/foundation/valence-primitives/README.md; git diff -- .github/workflows/ci.yml tests/verify.sh; sed -n '3210,3320p' src/main.rs; cat tests/primitives_oracle_test.py; sed -n '1,65p' <home>/.agents/skills/refactor-clean/SKILL.md" in /tmp/mc-primitives-review-wt
  succeeded in 0ms:
 # Valence-inspired binary / geometry seams — local WIP
 

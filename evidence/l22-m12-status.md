@@ -1,7 +1,7 @@
 # L22 / M12 status
 
 Date: 2026-11-23  
-Checkout: `/home/yuu/mc-spine`, branch `main`; HEAD observed at final review: `88f33dc1fe775c08721a2dcaf03d26c3de38cbd5`. The shared branch advanced during this task; validation ran against the shared working tree. Final `src/play_protocol.rs` SHA-256: `17c0b450131ef1045162e383ebdab0ad265a4aaa5cf9fd2b6bb45bdcd370bd3d`.
+Checkout: `<repo>`, branch `main`; HEAD observed at final review: `88f33dc1fe775c08721a2dcaf03d26c3de38cbd5`. The shared branch advanced during this task; validation ran against the shared working tree. Final `src/play_protocol.rs` SHA-256: `17c0b450131ef1045162e383ebdab0ad265a4aaa5cf9fd2b6bb45bdcd370bd3d`.
 
 ## Changes
 

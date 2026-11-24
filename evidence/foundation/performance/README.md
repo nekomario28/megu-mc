@@ -158,7 +158,7 @@ the wall clock.
 `Soju06/hyperchunk` @ `387c9ad30ac1b4eddbcaad31a02e8864d5b394c1` (MIT),
 `core/src/df_compile.c` and `core/include/hc_df.h`, read as prior art for this
 change - **no code copied** (the reference clone sits outside the repository at
-`/home/yuu/mc-spine-local/reference/hyperchunk-387c9ad/`). What it corroborates:
+`<local>/reference/hyperchunk-387c9ad/`). What it corroborates:
 
 * the DAG is *flattened* into an index-addressed node table and walked by a
   loop, not recursed over (`hc_df_node_t` + `hc_df_eval`, scratch keyed by node
@@ -1109,7 +1109,7 @@ recomputes more levels at chunk boundaries) but stay deterministic; the hash mis
 and the 16,384-element memmove are gone from every hot cell.
 
 ```sh
-BASE=/home/yuu/mc-spine/target/tmp/mc-spine-a1a-base   # saved at base 8dad8c7
+BASE=<repo>/target/tmp/mc-spine-a1a-base   # saved at base 8dad8c7
 for jobs in 1 5; do
   for arm in "" MC_SPINE_NOFEAT=1 "MC_SPINE_NOFEAT=1 MC_SPINE_NOCARVE=1"; do
     systemd-run --user --scope -p CPUQuota=250% -p MemoryMax=3G --collect \
@@ -1199,7 +1199,7 @@ SHA-256 verification (release binary, seed 0, `MC_SPINE_WG_DUMP_N=8`,
 PGO build (`tools/pgo_build.sh`, executable, `--out`/`--dry-run`/`--jobs N`
 supported; llvm-profdata discovery order: active toolchain rustup sysroot →
 other installed toolchains' sysroots → PATH → `/usr/bin/llvm-profdata*`).
-Used: `/home/yuu/.rustup/toolchains/1.97.1-x86_64-unknown-linux-gnu/lib/rustlib/x86_64-unknown-linux-gnu/bin/llvm-profdata`
+Used: `<home>/.rustup/toolchains/1.97.1-x86_64-unknown-linux-gnu/lib/rustlib/x86_64-unknown-linux-gnu/bin/llvm-profdata`
 (LLVM 22.1.6). `/usr/bin/llvm-profdata` (23.1.5) was also discovered but
 rejected the raw profiles: "raw profile format version = 10; expected version
 = 11", so the script's first-working-candidate merge picked the 1.97.1

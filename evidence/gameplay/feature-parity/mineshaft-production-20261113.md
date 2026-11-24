@@ -114,7 +114,7 @@ The target has no block entities, so its zero difference cannot prove those path
 ## Source binding and retained receipts
 
 Local artifact root:
-`/home/yuu/mc-spine-local/scratch/current/mineshaft-production-20261113/`.
+`<local>/scratch/current/mineshaft-production-20261113/`.
 The controls bind a working-tree source/input manifest, not HEAD alone; no commit
 or push occurred. Later documentation-only edits do not rewrite earlier receipts.
 

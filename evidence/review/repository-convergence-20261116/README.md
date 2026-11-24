@@ -228,4 +228,4 @@ longer describes the tree. A `WARN` on an `ACTIVE` row is expected while its tas
   `evidence/review/repository-convergence-20261116/` output is the deliverable,
   not uncommitted work, and the validator ignores exactly that prefix.
 - Detailed host paths and the raw command outputs stay outside the repository
-  (`/home/yuu/mc-spine-local/audit/git-convergence-20261116/`).
+  (`<local>/audit/git-convergence-20261116/`).

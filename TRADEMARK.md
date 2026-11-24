@@ -36,4 +36,4 @@ All third-party trademarks (including Minecraft, NeoForge, Fabric, Create, Modri
 For Certified Host partnerships, logo usage, or trademark questions, contact:
 
 - **Partners & Licensing:** `partners@megumin.tech`
-- **General Contact:** `contact@megumin.tech`
+- **General community questions:** [GitHub Discussions](https://github.com/nekomario28/megu-mc/discussions)

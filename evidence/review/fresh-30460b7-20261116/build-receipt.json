@@ -16,7 +16,7 @@
  "cargo": "cargo",
  "problems": [],
  "binary": {
-  "path": "/home/yuu/.cache/mc-spine-evidence/30460b7/target/debug/deps/mc_spine-5263732b84b8ac33",
+  "path": "<cache>/mc-spine-evidence/30460b7/target/debug/deps/mc_spine-5263732b84b8ac33",
   "bytes": 74669872,
   "sha256": "23af568b4106e5b03525a2b81a69fb8cdb027f1c51a5c19e65a79e6edf25f4d5",
   "mtime": "2026-11-16T01:16:11Z"

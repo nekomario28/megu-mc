@@ -3,7 +3,7 @@
 
   tools/provenance_check.py            check this checkout
   tools/provenance_check.py --strict-public
-                                       also require that the data D5 is going to untrack is
+                                       also require that the listed generated inputs are
                                        neither tracked nor committable
   tools/provenance_check.py --self-test
                                        prove the guard can fail, before trusting it in CI
@@ -16,9 +16,8 @@ the consumers read `assets/block_states_1211.json`, generated from the pinned 1.
 `git add -f` of an ignored path or an edit that starts reading one again, and both are silent
 without it.
 
-`--strict-public` is the D5 rehearsal: it asserts the Mojang-derived data this branch still tracks
-is untracked *and* ignored, so a future release commit cannot pick it up by accident. It is a
-separate flag because the default must pass on this branch's tree as it is.
+`--strict-public` additionally requires the listed generated inputs to be untracked *and*
+ignored, so a release commit cannot pick them up by accident.
 
 The license scan is the other half of provenance: every workspace manifest must declare a
 `license =` field, and that declaration must not name a GPL-incompatible identifier
@@ -87,6 +86,7 @@ LICENSE_MANIFESTS = (
     "mod-adapter-core/Cargo.toml",
     "mod-offload/Cargo.toml",
     "proto/Cargo.toml",
+    "sdk/megu-mod-sdk/Cargo.toml",
     "server-files/Cargo.toml",
     "state-store/Cargo.toml",
     "tools/offload_ffi_probe/Cargo.toml",
@@ -610,8 +610,8 @@ def selftest(root):
              write=[("client-app/Cargo.toml",
                      '[package]\nname = "a"\nlicense = "Proprietary"\n')],
              expect=True),
-        case("a manifest without a license field fails",
-             write=[("mod-adapter-core/Cargo.toml",
+        case("an SDK manifest without a license field fails",
+             write=[("sdk/megu-mod-sdk/Cargo.toml",
                      '[package]\nname = "a"\nversion = "0.1.0"\n')],
              expect=True),
         # Gate G2: production embeds of generated/Mojang data fail; test-scope

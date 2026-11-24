@@ -12,7 +12,7 @@ reproduction with explicit timeouts and timestamped stderr capture.
 | Rebuilt binary | `target/debug/mc-spine`, `cargo build --offline --locked` **PASS** (12.45 s), SHA-256 `07d33d53742e687d64d9c4fb87f6285a497306ba142db583bd01ba2c7d7605b0` |
 | Tools | `tools/load_client.py` SHA-256 `d79746c847873912686dd1adcffdc85bcc60b7d07fd1e1b91796535de4262c3b`; `tools/load_compare.sh`; `tools/perf_bench.py` SHA-256 `7c731c52c8c5b4e831af1cc1bae1a51638104b45892a066de2f26a49b267891f` |
 | Temp policy | `mkdir -p target/tmp`; `TMPDIR="$PWD/target/tmp"`; `JAVA_TOOL_OPTIONS="-Djava.io.tmpdir=$PWD/target/tmp -XX:-UsePerfData"` where Java ran |
-| Raw artifacts (outside Git) | `/home/yuu/mc-spine-local/captures/matrix-b6/warm-diag/` — `original-spine.log`, `original-spine-load.txt`, `original-van-load.txt`, `spine.log`, `loadwarm.txt`, `loada.txt`, `spine.stdout` |
+| Raw artifacts (outside Git) | `<local>/captures/matrix-b6/warm-diag/` — `original-spine.log`, `original-spine-load.txt`, `original-van-load.txt`, `spine.log`, `loadwarm.txt`, `loada.txt`, `spine.stdout` |
 
 **Correction to the task wording.** `tools/perf_bench.py --help` exposes only
 `--binary/--arms/--jobs/--rounds/--dump-n/--profile-counters/--compare-binary/.../--json/--markdown`;

@@ -10,10 +10,10 @@ Status: **レシピは既存行2件を byte 一致で再現した(採否ゲー�
 |---|---|
 | base commit | `0fa6807`(`perf/worldgen-parallel`、worktree `t3-0ff56908`、dirty 0) |
 | port binary | `target/debug/mc-spine` sha256 `7dc623bf3372e5e8d71ad6cab6b65196f2a3ba7f125862234b4371524c4ef7ca`(`cargo build --offline --locked -j6`) |
-| pinned server jar | `/home/yuu/tmpx/carverfresh/server.jar` sha1 `59353fb40c36d304f2035d51e7d6e6baa98dc05c` |
-| official mappings | `/home/yuu/mc-spine-local/audit/historical/fossil-placement-20261106/server.txt` sha1 `03f8985492bda0afc0898465341eb0acef35f570` |
-| captures | `/home/yuu/mc-spine-local/captures/matrix-v3/`(新規)、`matrix-v1|v2`(既存参照) |
-| raw | `/home/yuu/mc-spine-local/audit/p21t3-20261119/` |
+| pinned server jar | `<home>/tmpx/carverfresh/server.jar` sha1 `59353fb40c36d304f2035d51e7d6e6baa98dc05c` |
+| official mappings | `<local>/audit/historical/fossil-placement-20261106/server.txt` sha1 `03f8985492bda0afc0898465341eb0acef35f570` |
+| captures | `<local>/captures/matrix-v3/`(新規)、`matrix-v1|v2`(既存参照) |
+| raw | `<local>/audit/p21t3-20261119/` |
 
 ## 1. なぜレシピか
 

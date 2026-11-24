@@ -121,5 +121,5 @@ prune, delete, reset, stash, canonical edit or remote action was performed.
 
 Raw logs, the pre-fix tree used for the negative control, the export, the
 runner scripts and the private build target stay outside the repository at
-`/home/yuu/mc-spine-local/audit/contributor-integration-20261116/`. This page
+`<local>/audit/contributor-integration-20261116/`. This page
 carries the numbers and the limits; that directory carries the bytes.

@@ -224,8 +224,8 @@ output is in the compared artifact.
 ## Reproduce
 
 ```sh
-CAP=/home/yuu/mc-spine-local/captures/matrix-v1/nat-4242-village-taiga
-CAPB=/home/yuu/mc-spine-local/captures/t6b/nat-taiga-mlight
+CAP=<local>/captures/matrix-v1/nat-4242-village-taiga
+CAPB=<local>/captures/t6b/nat-taiga-mlight
 tools/port_triage.py "$CAP/world"  4 -32 --n 3 --pop-order "$CAP/order.tsv"  --pop-order-scope recorded --binary <bin>
 tools/port_triage.py "$CAPB/world" 4 -32 --n 3 --pop-order "$CAPB/order.tsv" --pop-order-scope recorded --binary <bin>
 

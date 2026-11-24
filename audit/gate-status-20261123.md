@@ -1,6 +1,6 @@
 # Gate-status + lint survey — 2026-11-23
 
-Repo: `/home/yuu/mc-spine` @ `8b00b7d2` (megu-mc, clean-room Minecraft 1.21.1).
+Repo: `<repo>` @ `8b00b7d2` (megu-mc, clean-room Minecraft 1.21.1).
 Read-only survey: no source modified, no `cargo test` run, no commits.
 
 ## 1. `python3 tools/dev_check.py` — exit 0

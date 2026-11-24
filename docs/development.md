@@ -17,14 +17,13 @@
 
 ### 2.1 3つの種類
 
-| 種類 | 例 | 開発ブランチでの状態 |
+| 種類 | 例 | 公開 `main` での状態 |
 |---|---|---|
-| 追跡されている入力 | `assets/block_states_1211.json`、`assets/*_1211.bin`、`datapacks/vanilla/`、`config_packets.bin`、`tests/data/` のfixture | クローンしただけでビルド・一部テストに使える。`include_bytes!` でコンパイル時に読むものもある（`tests/data/biome_probe_ties_1211.tsv`・`tests/data/random_next_int_1211.tsv` も追跡。`assets/block_states_1211.json` は `762f312` で jar 生成出力へ切替済み） |
-| 生成器が作るが、このHEADには無いもの | `tests/data/biome_probe_1211.tsv`、`tests/data/vanilla_vectors_1211.tsv` | 無い。`tools/` 側の生成・照合が対象 |
+| 追跡している入力 | `datapacks/testpack/`、`tests/data/` の個別 fixture | クリーンルームの T0/静的検査と、データに依存しないクレートの unit テストはクローン直後から実行可能 |
+| 手元の jar から生成する入力 | `datapacks/vanilla/`、`assets/block_states_1211.json`、`config_packets.bin`、生成器の `tests/data/*.tsv` | 追跡しない。T2/T3 の実サーバー接続・vanilla データ照合には §2.2 で用意する |
 | 利用者が任意で置くもの（任意機能の入力） | `resourcepack.zip` | 無ければリソースパックを配信しない。`762f312` で追跡から削除し、`tools/provenance_check.py` で再混入を禁止している |
 
-`datapacks/vanilla/` はworldgenのJSON、block tag、構造物templateなどを含みます。`assets/blocks_1211.json` は
-PrismarineJS/minecraft-data（MIT）由来で、帰属は [NOTICE](../NOTICE) にあります。
+`datapacks/vanilla/` はworldgenのJSON、block tag、構造物templateなどを含むローカル生成物です。PrismarineJS/minecraft-data（MIT）由来の旧 `assets/blocks_1211.json` も同梱していません。帰属は [NOTICE](../NOTICE) にあります。
 
 ### 2.2 生成器
 
@@ -40,7 +39,7 @@ tools/vanilla_data/gen_vanilla_data.sh --jar /path/to/server.jar --fetch-fabric-
 
 - `--fetch-fabric-mappings` は Fabric の intermediary / Yarn（CC0、sha256固定）の2ファイルだけをダウンロードします。手元にある場合は `--mappings DIR` を使います。
 - `--accept-eula` は **Minecraft EULA（https://aka.ms/MinecraftEULA）に同意したという意味**です。サーバーをオフライン・ループバックで一時起動するためで、付けなければ `config_packets.bin` 以外が生成されます。他人の代わりに同意したり、CIで自動的に付けたりしないでください。
-- 生成器の出力先はリポジトリ内です。現行HEADでは一部の出力が追跡されているため、再生成すると `git status` に差分が出ます。**その差分をそのままコミットしないでください**（2.4）。
+- 生成器の出力先はリポジトリ内です。生成物は手元のテスト用です。**コミットしないでください**（2.4）。
 - `config_packets.bin` が無い場合、サーバーは起動してもクライアントへregistryを送れません（`src/main.rs` の起動時メッセージ）。
 
 生成器と抽出器（`tools/vanilla_data/Extract.java`、`build_vanilla_data.py`）はこのツリーにあります。ただし、
@@ -50,19 +49,19 @@ tools/vanilla_data/gen_vanilla_data.sh --jar /path/to/server.jar --fetch-fabric-
 
 | 確認 | 必要なもの |
 |---|---|
-| `cargo build` | 追跡済みの `assets/*.json` と `assets/*_1211.bin`（`include_bytes!`） |
-| `cargo test` の一部 | 追跡済みの `tests/data/*.tsv`、`datapacks/vanilla/`、`assets/feature_order_1211.json` など。個別の対応は各テストの `std::fs::read` / `include_bytes!` を `rg` で確認する |
+| 通常のビルド・データ不要の unit テスト | 指定の Rust ツールチェーンと依存クレート。Mojang の生成データは不要 |
+| vanilla データ照合 | §2.2 の生成データと各 oracle 専用の fixture。必要な入力は対象テストと生成器で確認する |
 | `tests/verify.sh` 全体 | 上記に加え、サーバーバイナリ、loopbackのwire試験、`depsgx`（層ゲート）、時間 |
 | `--features native-oracle` のテスト | 固定jarから作ったnative fixture。無いと**失敗する**（skipしない）。CIの `p1-native-oracle.yml` がjarを取得して実行する |
-| ゲームlistenerの手動確認 | 追跡データとビルド済みバイナリ。外部公開はしない |
+| ゲームlistenerの手動確認 | ローカル生成データとビルド済みバイナリ。外部公開はしない |
 
 テストの段と前提クラスは [tests/README.md](../tests/README.md)、道具の入口は
 [tools/README.md](../tools/README.md) にあります。どのコマンドを走らせるかは
 [tests/verify.sh](../tests/verify.sh) が正本です。
 
-### 2.4 開発ツリーと公開候補を分ける
+### 2.4 ローカル生成物と公開ツリーを分ける
 
-開発ブランチの入力は削除しません。追跡の有無は `git ls-files`、生成済み datapack の検査は
+`main` 自体がクリーンルームの公開ツリーです。追跡の有無は `git ls-files`、生成済み datapack の検査は
 `tools/vanilla_data/gen_vanilla_data.sh --verify` で確認できます（jar 不要）。
 
 ```sh
@@ -73,7 +72,7 @@ tools/export_public_branch.sh --out ../megu-public --verify
 単一コミットの別リポジトリを作ります。出力先は開発ツリーの外の新規または空ディレクトリにしてください。
 既定のブランチ名は `public-export`。`--from-worktree` はコミット前の検査専用で、索引にあるパスの作業コピーを読みます。
 元の履歴は変更せず、push もしません。候補では `--strict-public` が通り、再生成前の `dev_check.py` は
-ビルド・実行時入力が不足して exit 1 になるのが正常です。ビルドするには §2.2 に従ってください。
+生成入力の不足を報告することがあります。実サーバーや vanilla データ照合を動かすには §2.2 に従ってください。
 この検査は他の fixture や画像等の出所を認定しません。[LICENSING.md](../LICENSING.md) §5 の確認が別途必要です。
 
 貢献者へのルール:
@@ -118,7 +117,7 @@ grep -E '^python3 tests/' tests/verify.sh
   exit 0 でした。`java`/`javac`/`cargo`/`rustc` を 127 で落とした PATH でも同じ結果でした。
   測定した件数・所要時間・生ログは
   [contributor-readiness-2026-11-16](../evidence/review/contributor-readiness-2026-11-16.md)。
-- この段は追跡データが前提です。来歴の整理でデータが外れると生成が必要になります。
+- 現行 CI のデータ生成不要の高速ゲートは `python3 tools/run_fast_gates.py` でまとめて実行できます。
 
 ### T1: Rustのunit／回帰
 

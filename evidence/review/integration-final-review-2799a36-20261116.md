@@ -4,9 +4,9 @@
 対象と参照元は下の §0。数値はすべて本レビューが自分で走らせた測定か、SHA で束縛された保存ログに紐づく。
 継承しただけの主張は §6 に分離した。
 
-- レビュー用 checkout: `/home/yuu/.t3/worktrees/mc-spine/t3-bcaff3af-3038d8506b9c7851`（base `e7ead8e`、独自 branch）
-- 読み取り専用で参照した候補 worktree: `/home/yuu/.t3/worktrees/mc-spine/t3-b2eb8ad1-ebf296b8314a2ff7`
-- private log: `/home/yuu/mc-spine-local/audit/deepseek-int-20261116-125633/final-review-20261116-1351/`
+- レビュー用 checkout: `<worktree>`（base `e7ead8e`、独自 branch）
+- 読み取り専用で参照した候補 worktree: `<worktree>`
+- private log: `<local>/audit/deepseek-int-20261116-125633/final-review-20261116-1351/`
   （`parse_tests.py` / `cmp_union.py` / `entries.py` / `cmp_mut.py` / `anchor_check.py` /
   `facts_crosscheck.py`+`.out` / `jungle_cells.py` / `jungle-cells-121.log` / `tests.json`）
 - 資源: JVM・GPU・cargo ビルド・新規 capture なし。git / 保存 dump / 保存 javap / python のみ。
@@ -50,7 +50,7 @@
 置換案（§5 の当該行をそのまま差し替え）:
 
 ```
-| Python unit（`tests/verify.sh` の 37 本。`gate_scripts.py` は `static-gates.log` 側） | `python-units.log` は 36 本 = 35 exit 0 + `layers_gate_test` exit 1（depsgx 不在で 16 failures）。`/home/yuu/gxkit/.venv/bin` を前置した再実行で 17/17 OK（当該再実行の出力は保存されておらず、log 末尾の `layers_gate_exit=0` のみ） | `python-units.log`, `static-gates.log` |
+| Python unit（`tests/verify.sh` の 37 本。`gate_scripts.py` は `static-gates.log` 側） | `python-units.log` は 36 本 = 35 exit 0 + `layers_gate_test` exit 1（depsgx 不在で 16 failures）。`<home>/gxkit/.venv/bin` を前置した再実行で 17/17 OK（当該再実行の出力は保存されておらず、log 末尾の `layers_gate_exit=0` のみ） | `python-units.log`, `static-gates.log` |
 ```
 
 ### F2 (medium・gate 被覆) — 追加 mutation は 15 件、proved は 14 件。6B の 1 件が未実行

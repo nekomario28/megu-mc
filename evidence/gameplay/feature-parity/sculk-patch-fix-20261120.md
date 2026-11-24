@@ -11,7 +11,7 @@ outside `src/feature.rs` ownership; it does not establish default-worldgen parit
 
 - Branch: `t3/fix-sculk-patch-parity`; starting HEAD:
   `9a1cc1303cddaf5f8ebbdfcaf49a1b975c433d21`.
-- Pinned 1.21.1 server: `/home/yuu/tmpx/carverfresh/server.jar`, SHA-1
+- Pinned 1.21.1 server: `<home>/tmpx/carverfresh/server.jar`, SHA-1
   `59353fb40c36d304f2035d51e7d6e6baa98dc05c`.
 - Native source: `/var/tmp/chunkfix-gate/world`, saved reference from
   2026-10-29; seed 0, chunks `(-16,112)` through `(-15,113)`.

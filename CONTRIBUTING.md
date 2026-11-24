@@ -1,26 +1,31 @@
 # Contributing / 貢献について
 
-megu は実験段階のサーバーで、完成品ではありません。小さく検証できる変更を歓迎します。
+megu は Minecraft Java Edition 向けのクリーンルーム実装で、Rust サーバーと `wgpu` のみで描画するネイティブ GPU クライアントを開発しています。小さく検証できる変更を歓迎します。
 このページは**作業の進め方**と**提出時の契約**を持ちます。環境・データ・テストの詳細は
 [開発ガイド](docs/development.md)、現在の作業は [specs/README.md](specs/README.md)、
 次の順序は [specs/ROADMAP.md](specs/ROADMAP.md) を参照してください。
 
-## 最初の一歩（3 コマンド・オンボーディング）
+## 最初の一歩
 
-Clone 後にまず以下の 3 コマンドで環境とゲートを確認してください：
+公開 `main` は `datapacks/vanilla/`、`assets/block_states_1211.json`、`config_packets.bin` を追跡しません。クローン後、vanilla データを生成せずに T0 の静的ゲートと各クレートのデータ不要の unit テストから始められます。
 
 ```sh
 # 1. ツールチェーン (Rust 1.98.0, Python 3, Java 21) と入力データの確認
 python3 tools/dev_check.py
 
-# 2. モジュール境界・技術的負債・来歴（Provenance）の静的ゲート
-bash tools/layers_check.sh && bash tools/debt_ratchet.sh && python3 tools/provenance_check.py
+# 2. CI の高速ゲート（公開時の衛生、ハードコード・安全性・プレイ阻害、文書リンク、バージョン等）
+python3 tools/run_fast_gates.py
 
-# 3. ターゲットを絞った高速テスト確認
-cargo test --locked <test_filter>
+# 3. モジュール境界（depsgx が必要）と負債。来歴ゲートは単独でも実行可能
+bash tools/layers_check.sh
+bash tools/debt_ratchet.sh
+python3 tools/provenance_check.py --strict-zero-gl
+
+# 4. 変更対象クレートの unit テスト（例）
+cargo test --locked --manifest-path core/Cargo.toml
 ```
 
-（クリーンエクスポートブランチから作業する場合は `bash tools/vanilla_data/gen_vanilla_data.sh --jar /path/to/1.21.1-server.jar --fetch-fabric-mappings --accept-eula` で vanilla データを生成できます。）
+実サーバーへの接続や vanilla データを使う T2/T3 照合の前には、自分の 1.21.1 `server.jar` から `tools/vanilla_data/gen_vanilla_data.sh` でローカル生成してください。必要な引数と `--accept-eula` の意味は[開発ガイド §2.2](docs/development.md#22-生成器)を参照してください。
 
 1. [specs/README.md](specs/README.md) で、いま何が未確認かを読む。
 2. [specs/ROADMAP.md](specs/ROADMAP.md) で、次に閉じる出口を確認する。
@@ -30,12 +35,13 @@ cargo test --locked <test_filter>
 
 ## 並列開発のモジュール分担（コンフリクト防止ルール）
 
-複数人で並行作業する際は、以下の 3 トラックに作業ブランチを分け、`src/main.rs` での衝突を避けてください：
+複数人で並行作業する際は、以下の 4 トラックに作業ブランチを分け、`src/main.rs` での衝突を避けてください：
 
 - **Track 1（Worldgen & Structure Parity）**: `src/worldgen.rs`, `src/feature.rs`, `src/structure_*.rs`, `src/jigsaw_structures.rs`, `src/template_structures.rs`, `src/single_piece_structures.rs`, `src/end_city_mansion.rs`, `tools/structure_capture.py`
-- **Track 2（NeoForge / Fabric Mod 互換レイヤ）**: `compat/neoforge-events/`, `compat/fabric-probe/`, `src/java_compat.rs`, `src/landing*.rs`, `tools/shimcheck.py`
+- **Track 2（NeoForge / Fabric Mod 互換レイヤ）**: `compat/neoforge-events/`, `compat/fabric-probe/`, `src/java_compat.rs`, `src/landing*.rs`, `tools/shimcheck.py`。ネイティブ Mod 作者向け SDK は `sdk/megu-mod-sdk/`。
 - **Track 3（Runtime / Protocol 767 / Gameplay / Networking）**: `src/main.rs`, `src/entity_*.rs`, `src/lighting.rs`, `src/paletted.rs`, `tests/*_wire.py`
   - **`src/main.rs` の Single-Writer ルール**: `src/main.rs` を編集するブランチは同時に 1 つに絞るか、新しいロジックは専用サブモジュールに切り出して `src/main.rs` 側は最小の呼び出し配線のみにしてください。
+- **Track 4（Native GPU Client）**: `client-gpu/`, `client-port/`, `client-ui/`, `client-app/`, `client-kernel/`
 
 作業中のブランチやworktreeを上書きしないでください。`git add -A` / `git commit -a` / `git stash` で
 他人のindexを巻き込まず、pathspecで自分の変更だけをstageします。
@@ -85,4 +91,4 @@ cargo test --locked <test_filter>
 ## English summary
 
 The project is distributed under `LGPL-3.0-or-later` ([LICENSE](LICENSE), with the GPLv3 text in [docs/COPYING.GPL](docs/COPYING.GPL) as the LGPLv3-required companion), and contributed code is provided under `LGPL-3.0-or-later`; LGPLv3 section 2 lets downstream users take the work under GPLv3. Commits must be signed off (`git commit -s`, DCO 1.1).
-When referencing or adapting permissive or LGPL-3.0 projects (such as C2ME under MIT or Lithium under LGPL-3.0), record attribution in [THIRD_PARTY.md](THIRD_PARTY.md) and [NOTICE](NOTICE), and avoid mixing third-party `GPL-3.0-only` or `AGPL-3.0-only` code directly into first-party files so they remain distributable under `LGPL-3.0-or-later`. Do not add Mojang-derived data, mappings, or third-party jars. Run `python3 tools/dev_check.py`, `bash tools/layers_check.sh`, `bash tools/debt_ratchet.sh`, and `python3 tools/provenance_check.py` before opening a PR.
+When referencing or adapting permissive or LGPL-3.0 projects (such as C2ME under MIT or Lithium under LGPL-3.0), record attribution in [THIRD_PARTY.md](THIRD_PARTY.md) and [NOTICE](NOTICE), and avoid mixing third-party `GPL-3.0-only` or `AGPL-3.0-only` code directly into first-party files so they remain distributable under `LGPL-3.0-or-later`. Do not add Mojang-derived data, mappings, or third-party jars. On a clean clone of `main`, start with `python3 tools/dev_check.py`, `python3 tools/run_fast_gates.py` and the affected crate’s data-independent unit tests. The fast gates include `python3 tools/provenance_check.py --strict-zero-gl`; also run `bash tools/layers_check.sh` (requires `depsgx`) and `bash tools/debt_ratchet.sh`. Live server and vanilla-data parity tests need locally generated inputs: use `tools/vanilla_data/gen_vanilla_data.sh` with your own 1.21.1 server jar as described in the [development guide](docs/development.md).

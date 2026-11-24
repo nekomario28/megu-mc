@@ -2,7 +2,7 @@
 
 Date: 2026-11-16. 候補 `51c44d3`（base `82799b4` + `e9214ac` の cherry-pick）。
 作業は tool-created worktree（`t3-3d969a40-…`）と private audit dir
-`/home/yuu/mc-spine-local/audit/converged-chunk-integration-20261116T103726Z/` のみ。
+`<local>/audit/converged-chunk-integration-20261116T103726Z/` のみ。
 push・tag・PR・network・download は無し。監査 dir は 93 MiB、raw log は全 phase 分を保持している。
 
 本書は**この候補について実測した記録**である。恒久的な契約は `tests/verify.sh` と
@@ -133,7 +133,7 @@ stage 後に `set -u` 下で未定義の `$n` を参照して exit 1 になり s
 
 * **CI の pin ではない**。`.github/workflows/ci.yml` の `GXKIT_REV` は
   `d6b9ad8db4774919c8b4fb032342e53b2548b660`、本実行の `depsgx` はローカル editable
-  `973b293a` の 1.0.0（`/home/yuu/gxkit/.venv/bin` を PATH に置き `MC_SPINE_DEPSGX` は unset）。
+  `973b293a` の 1.0.0（`<home>/gxkit/.venv/bin` を PATH に置き `MC_SPINE_DEPSGX` は unset）。
   layers gate は inspector の probe（2 cycle / layer-violation / forbidden-dependency）で
   「fail できること」を確認してから 42/108 を判定している。
 * **whole-world native CI は NOT RUN**（pin/native の world claim は無い）。
@@ -154,7 +154,7 @@ stage 後に `set -u` 下で未定義の `$n` を参照して exit 1 になり s
 
 ## raw artifacts
 
-`/home/yuu/mc-spine-local/audit/converged-chunk-integration-20261116T103726Z/`
+`<local>/audit/converged-chunk-integration-20261116T103726Z/`
 
 | 内容 | path |
 |---|---|

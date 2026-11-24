@@ -3,9 +3,9 @@
 ## Frozen native reference and full-state comparison
 
 - Port revision `5759cbef5e5bf9f809365c6b2a4cc2fd9d9d57a9`, branch `t3/nether-end-structure-parity`. `cargo build --offline --locked` passed. The rebuilt `target/debug/mc-spine` has SHA-256 `18a290e379c83672591d0d44dbf8b956f0485d1283513b5dd4a45843ddf59902`.
-- Pinned Vanilla 1.21.1 reference `/home/yuu/tmpx/carverfresh/server.jar` has SHA-1 `59353fb40c36d304f2035d51e7d6e6baa98dc05c`; runtime is `/usr/lib/jvm/java-21-openjdk`. Native captures used frozen `structures` stage, seed `4242`, and dimension-specific world folders `DIM-1` and `DIM1`.
+- Pinned Vanilla 1.21.1 reference `<home>/tmpx/carverfresh/server.jar` has SHA-1 `59353fb40c36d304f2035d51e7d6e6baa98dc05c`; runtime is `/usr/lib/jvm/java-21-openjdk`. Native captures used frozen `structures` stage, seed `4242`, and dimension-specific world folders `DIM-1` and `DIM1`.
 - `tools/structure_capture.py` supports `--dimension nether` and `--dimension end`. It reused each capture only after verifying its saved `structures.starts` and `Children[]`. `tools/port_triage.py` reported `mode=full noaq=False` with no excluded attributes. Each comparison covered all **65,536 typed block-state cells** in one 16×16 chunk from Y `0..255`, including air kinds and state properties. Each canonical binary grid is 262,144 bytes.
-- Artifacts, triage reports, native logs, and promotion receipts are outside Git at `/home/yuu/mc-spine-local/captures/matrix-b5/`. `TMPDIR` and Java `java.io.tmpdir` used workspace `target/tmp` with `-XX:-UsePerfData` for the native workflow.
+- Artifacts, triage reports, native logs, and promotion receipts are outside Git at `<local>/captures/matrix-b5/`. `TMPDIR` and Java `java.io.tmpdir` used workspace `target/tmp` with `-XX:-UsePerfData` for the native workflow.
 
 ## Verified structures
 
@@ -35,7 +35,7 @@ The `native.bin` and port `dump.bin` hashes below cover the complete canonical g
 
 ## Fixture promotion
 
-The three zero-diff captures were replayed through `tools/structure_capture.py --capture-dir ... --height-window dimension --manifest /home/yuu/mc-spine-local/captures/matrix-v2/manifest-promotable.json` with unique B5 row IDs.
+The three zero-diff captures were replayed through `tools/structure_capture.py --capture-dir ... --height-window dimension --manifest <local>/captures/matrix-v2/manifest-promotable.json` with unique B5 row IDs.
 
 - `b5-20261120-fortress-4242--25-6-0-256`
 - `b5-20261120-nether-fossil-4242--22-20-0-256`
@@ -52,6 +52,6 @@ The existing **18 rows were checked for exact JSON-value equality** before and a
 | `bash tools/layers_check.sh` | **PASS**, source graph 44 modules, 111 edges, 0 named errors |
 | `bash tools/debt_ratchet.sh` | **PASS**, wall-clock reads 0, ignored tests 1, debt ratchet 0 over limit |
 | `python3 tools/provenance_check.py` | **PASS**, provenance clean |
-| `python3 tools/fixture_suite.py /home/yuu/mc-spine-local/captures/matrix-v2/manifest-promotable.json --out /home/yuu/mc-spine-local/captures/matrix-b5/b5-suite-final` | **PASS**, `MATCH=21`, `DIFF=0`, `INVALID=0`, `NOT_RUN=0` |
+| `python3 tools/fixture_suite.py <local>/captures/matrix-v2/manifest-promotable.json --out <local>/captures/matrix-b5/b5-suite-final` | **PASS**, `MATCH=21`, `DIFF=0`, `INVALID=0`, `NOT_RUN=0` |
 
 All listed commands exited with code 0. Gate logs are `matrix-b5/{cargo-structure-test,layers-check,debt-ratchet,provenance-check,fixture-suite}.log`; suite results are `matrix-b5/b5-suite-final/result.json`. The measurements establish exact parity for these three frozen chunk windows at the `structures` stage. Additional structure locations, block entities, loot, and later gameplay stages were outside this measured scope.

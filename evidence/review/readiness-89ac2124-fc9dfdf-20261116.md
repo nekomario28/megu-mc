@@ -8,9 +8,9 @@ Scope: 独立した integration/readiness review。canonical統合の承認で�
 
 | | 値 |
 |---|---|
-| canonical repo | `/home/yuu/mc-spine`、clean `perf/worldgen-parallel` = `e7ead8e66466b0b6467450cd3ea31d86a0e39cd3`（review時点で未変更） |
+| canonical repo | `<repo>`、clean `perf/worldgen-parallel` = `e7ead8e66466b0b6467450cd3ea31d86a0e39cd3`（review時点で未変更） |
 | base | `e7ead8e66466b0b6467450cd3ea31d86a0e39cd3` |
-| review worktree | `/home/yuu/.t3/worktrees/mc-spine/t3-1f0488a5-da686e44cfc6095d`、branch `t3/mc-spine-readiness-review`、開始時 clean |
+| review worktree | `<worktree>`、branch `t3/mc-spine-readiness-review`、開始時 clean |
 | 入力1 | `89ac21244b022f3d6d281c83478187a344c911d2`（parent = `e7ead8e`、`t3/401f5f2c`） |
 | 入力2 | `fc9dfdf8f2ebf7af25924a6f759d08ed04b966d4`（parent = `e7ead8e`、`t3/27d57348`） |
 | candidate（cherry-pick後） | `00ae47c0b32c2815d65de290d98366caa8789a05` → `1d98301a24484066467b4f92ef1b7f6511d9d98d` |
@@ -35,7 +35,7 @@ Scope: 独立した integration/readiness review。canonical統合の承認で�
   `opt-level=1` / `debuginfo=line-tables-only` / `debug-assertions=on`。
   `-C overflow-checks` は cargo が渡しておらず rustc の既定（= `debug-assertions`）に従うため on。
   cargo 自身の表示も `Finished \`test\` profile [optimized + debuginfo]`。
-  log: `/home/yuu/.cache/mc-spine-readiness/logs/build_v.log`（36行目）。
+  log: `<cache>/mc-spine-readiness/logs/build_v.log`（36行目）。
 - **test discovery が減っていないこと**: 同 binary `--list` で **533** tests。
   base は著者 receipt の `530 passed / 1 ignored` = 531、`fc9dfdf` が2本追加 → 533 と一致。
   （base 側 531 は本 review では再計測していない = 著者報告。）
@@ -83,7 +83,7 @@ Scope: 独立した integration/readiness review。canonical統合の承認で�
 
 | | |
 |---|---|
-| gate | `/home/yuu/Documents/project-incubator/scripts/resource_gate.py --class light --need-mem-gb 2` → `GO class=light avail=16.1GB swap_used=23.1%` |
+| gate | `<local>/project-incubator/scripts/resource_gate.py --class light --need-mem-gb 2` → `GO class=light avail=16.1GB swap_used=23.1%` |
 | scope | `systemd-run --user --scope -p MemoryMax=3G -p CPUQuota=100% -p Slice=app.slice`（`devin-compute.slice` 外、named scope 2本） |
 | 実行 | `cargo test --offline --locked -j1 --bin mc-spine`, `--test-threads=1`, `CARGO_TARGET_DIR=<worktree>/target-readiness` |
 | job1 | 09:53:00 → 09:54:33（cold build を含む。`/usr/bin/time` 不在で timing/log 取りが1度失敗、同じ scope 内で再実行） |

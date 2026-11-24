@@ -7,7 +7,7 @@ the Rust scheduler and world-save tick reader. The implementation base was
 ## Native capture and replay
 
 The oracle checks the server JAR SHA-1 before opening the embedded game JAR.
-The input was `/home/yuu/tmpx/carverfresh/server.jar`, SHA-1
+The input was `<home>/tmpx/carverfresh/server.jar`, SHA-1
 `59353fb40c36d304f2035d51e7d6e6baa98dc05c`, run with OpenJDK 21.
 The original fixtures reproduced byte-for-byte.
 

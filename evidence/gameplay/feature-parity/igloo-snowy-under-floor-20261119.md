@@ -10,7 +10,7 @@ Status: **HOLD(受入しない)。原因は記述子単位で特定済み: port 
 |---|---|
 | base commit | `0fa6807`(`perf/worldgen-parallel`) |
 | port binary | `target/debug/mc-spine` sha256 `7dc623bf3372e5e8d71ad6cab6b65196f2a3ba7f125862234b4371524c4ef7ca` |
-| capture | `/home/yuu/mc-spine-local/captures/matrix-v3/nat-4242-igloo`(frozen, overworld/noise, −64/384, seed 4242) |
+| capture | `<local>/captures/matrix-v3/nat-4242-igloo`(frozen, overworld/noise, −64/384, seed 4242) |
 | port dump | `dumps/nat-4242-igloo/dump.bin` sha256 `e23b53520eb5529e…` |
 | heightmap 対照 | `dumps/nat-4242-igloo-hm/`(`--port-hm --hm-name MOTION_BLOCKING`) |
 | instrumented recapture | `captures/scratch-p21t3/igloo-featurebox`(`-Dfeaturebox=588,78,-8192,600,90,-8178`)、`…/igloo-stack`(同 + `-Dfeaturestack=1`) |

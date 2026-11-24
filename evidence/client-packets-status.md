@@ -72,7 +72,7 @@ means no production decoder is present.
 - `python3 tools/v767_total_parity_audit.py`: Play/Clientbound 115/124 covered.
 - `cargo check --offline` from `client-app`: passed.
 - `cargo test --release --offline -j2 --test v1211_proto767_tests --test world_entities_ber_tests` from `client-app`: passed, 17 + 8 tests.
-- Requested full `cargo test --release --offline -j2` from `client-app`: 81 library tests passed, one unrelated existing test failed at `src/integrated.rs:551`; it selected `/home/yuu/mc-spine` as runtime root instead of its temporary fixture. Re-running that test with `/tmp` as the command working directory produced the same failure because the executable's ancestors include the repository root.
+- Requested full `cargo test --release --offline -j2` from `client-app`: 81 library tests passed, one unrelated existing test failed at `src/integrated.rs:551`; it selected `<repo>` as runtime root instead of its temporary fixture. Re-running that test with `/tmp` as the command working directory produced the same failure because the executable's ancestors include the repository root.
 
 The full-test failure is environment/path discovery evidence, not evidence that
 the packet changes pass the entire suite. No live Minecraft server/client

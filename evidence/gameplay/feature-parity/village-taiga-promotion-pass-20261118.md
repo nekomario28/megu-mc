@@ -175,7 +175,7 @@ re-derives to itself, so removing the skip changes nothing observable), and the 
 ## 7. Reproduce
 
 ```sh
-CAP=/home/yuu/mc-spine-local/captures/matrix-v1/nat-4242-village-taiga
+CAP=<local>/captures/matrix-v1/nat-4242-village-taiga
 tools/port_triage.py "$CAP/world" 4 -32 --n 3 --pop-order "$CAP/order.tsv" \
   --pop-order-scope recorded --binary target/debug/mc-spine          # 3 / 884736
 

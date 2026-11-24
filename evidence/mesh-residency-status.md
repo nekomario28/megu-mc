@@ -43,7 +43,7 @@ counters, or render-identity claims are made.
   rejected because this checkout is not a Cargo workspace.
 - `cargo test --release --offline -j2 --manifest-path client-app/Cargo.toml`:
   compiled; 81 passed, 1 unrelated integrated-server runtime-root test failed
-  (`find_runtime_root` selected `/home/yuu/mc-spine` instead of its temporary
+  (`find_runtime_root` selected `<repo>` instead of its temporary
   runtime directory). The isolated test reproduced the same failure.
 - `cargo test --release --offline -j2 --manifest-path client-gpu/Cargo.toml`:
   blocked at compilation by the pre-existing unresolved import

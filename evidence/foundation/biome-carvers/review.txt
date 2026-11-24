@@ -1,6 +1,6 @@
 ## Findings (static review; no build, test, Java, Cargo or jar execution performed)
 
-I read the changed files and resolved the oracle's obfuscated names against `/home/yuu/.cache/mc-spine-work/mc121/server.txt`; I only *read* the pinned jar bytes (zip read + hashes), I did not execute it.
+I read the changed files and resolved the oracle's obfuscated names against `<cache>/mc-spine-work/mc121/server.txt`; I only *read* the pinned jar bytes (zip read + hashes), I did not execute it.
 
 ### 1. `carver_lists_match_the_pinned_biomes` cannot distinguish "empty list" from "biome absent"; the loader drops the six empty biomes — `src/generation_contract_tests.rs:510`, `src/feature.rs:4234-4243`, `src/feature.rs:4223`
 

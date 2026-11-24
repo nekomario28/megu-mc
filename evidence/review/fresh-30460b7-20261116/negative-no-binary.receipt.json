@@ -9,7 +9,7 @@
  },
  "expect_head": "14d1916f52d11db401d12194d5ab1c55102dd4e9",
  "filters": [],
- "cargo": "/home/yuu/.cache/mc-spine-evidence/30460b7/negative/fake-cargo.sh",
+ "cargo": "<cache>/mc-spine-evidence/30460b7/negative/fake-cargo.sh",
  "problems": [
   "no unique Cargo executable: expected one mc-spine test harness executable, received 0"
  ],

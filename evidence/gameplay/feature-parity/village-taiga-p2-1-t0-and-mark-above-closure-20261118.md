@@ -7,8 +7,8 @@ Status: **測定で決着。`village-taiga` (4,-32)+3×3 は `1 / 884,736 -> 0 /
 | | |
 |---|---|
 | base commit | `354128a4e2d9ba44a7e797bf9b4161f397374a7d` (`perf/worldgen-parallel` / `t3/0abcc5e8`) |
-| pinned server jar | `/home/yuu/tmpx/carverfresh/server.jar` (SHA-1 `59353fb40c36d304f2035d51e7d6e6baa98dc05c`) |
-| official mappings | `/home/yuu/mc-spine-local/audit/historical/fossil-placement-20261106/server.txt` (SHA-1 `03f8985492bda0afc0898465341eb0acef35f570`) |
+| pinned server jar | `<home>/tmpx/carverfresh/server.jar` (SHA-1 `59353fb40c36d304f2035d51e7d6e6baa98dc05c`) |
+| official mappings | `<local>/audit/historical/fossil-placement-20261106/server.txt` (SHA-1 `03f8985492bda0afc0898465341eb0acef35f570`) |
 | port dump (`dumps/village/dump.bin`) | `0dd5a9d8abb350c3d73adaa573aa083a128b8eaa75ef3a5d696618a1d11654e8` |
 
 ## 1. Bytecode Verification (`javap -p -c`)

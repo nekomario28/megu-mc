@@ -66,29 +66,26 @@ LEGACY_NAME_RE = re.compile(r"mc-spine|MC_SPINE|mc_spine")
 
 
 def tracked_files():
-    out = subprocess.check_output(["git", "ls-files"], cwd=ROOT, text=True)
-    return [line for line in out.splitlines() if line]
+    out = subprocess.check_output(["git", "ls-files", "-z"], cwd=ROOT, text=True)
+    return out.split("\0")[:-1]
 
 
-def iter_audited_text_files():
+def iter_audited_text_files(*, skip_prefixes=SKIP_PREFIXES):
     for rel in tracked_files():
-        if rel.startswith(SKIP_PREFIXES):
+        if rel.startswith(skip_prefixes):
             continue
         path = ROOT / rel
         if not path.is_file():
             continue
-        if path.suffix.lower() in FORBIDDEN_BINARY_EXTS or rel in ALLOWED_TRACKED_BINARIES:
-            continue
-        try:
-            yield rel, path.read_text(encoding="utf-8")
-        except UnicodeDecodeError:
-            continue
+        data = path.read_bytes()
+        if b"\0" not in data:
+            yield rel, data.decode("utf-8", errors="surrogateescape")
 
 
 class PublicHygieneTest(unittest.TestCase):
     def test_no_personal_paths_or_worktree_leaks(self):
         hits = []
-        for rel, text in iter_audited_text_files():
+        for rel, text in iter_audited_text_files(skip_prefixes=()):
             if rel == "tests/public_hygiene_test.py":
                 continue
             for lineno, line in enumerate(text.splitlines(), 1):
@@ -125,6 +122,9 @@ class PublicHygieneTest(unittest.TestCase):
     def test_no_legacy_name_in_public_docs_website_or_workflows(self):
         public_roots = {
             "README.md",
+            "README.ja.md",
+            "SECURITY_NOTES.md",
+            "CODE_OF_CONDUCT.md",
             "TRADEMARK.md",
             "LICENSING.md",
             "CONTRIBUTING.md",

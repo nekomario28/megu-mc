@@ -1,7 +1,7 @@
 # The `hasPostProcess` contract: mark at write, consume at promotion, read the light there
 
 The audit this lane implements is
-`/home/yuu/mc-spine-local/audit/convergence-prep-20261116/postprocess_audit.md`
+`<local>/audit/convergence-prep-20261116/postprocess_audit.md`
 (1.21.1 bytecode, read from the pinned jar). It establishes four facts and this page takes them as
 given, re-checking each against the artifact rather than the prose:
 
@@ -326,7 +326,7 @@ MC_SPINE_VANILLA_SERVER_JAR=captures/t6b/nat-nf-str/server.jar \
   python3 tools/block_state_facts_from_jar.py        # compares; --write regenerates the asset
 
 # the residual, before and after
-CAP=/home/yuu/mc-spine-local/captures/t6b/nat-nf-str
+CAP=<local>/captures/t6b/nat-nf-str
 tools/port_triage.py "$CAP/world" -25 19 --n 3 --preset nether \
   --pop-order "$CAP/poporder.tsv" --pop-order-scope recorded --binary <binary>
 

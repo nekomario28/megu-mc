@@ -1,2 +1,2 @@
-    Checking mc-spine v0.0.0 (/home/yuu/oss-bounty/work/mc-spine)
+    Checking mc-spine v0.0.0 (<repo>)
     Finished `dev` profile [unoptimized + debuginfo] target(s) in 0.83s

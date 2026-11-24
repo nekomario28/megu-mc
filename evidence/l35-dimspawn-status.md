@@ -18,7 +18,7 @@ the existing monster spawning path.
 ## Vanilla reference
 
 - Pinned runtime: Minecraft 1.21.1 dedicated server jar at
-  `/home/yuu/.cache/mc-spine-audit/load/vanilla/versions/1.21.1/server-1.21.1.jar`
+  `<cache>/mc-spine-audit/load/vanilla/versions/1.21.1/server-1.21.1.jar`
   (SHA-256 `c301de10f575027d13eac18c7f34409d60648cf56a35d566aa1f530ff617840a`).
 - Official server mappings for 1.21.1 map
   `NaturalSpawner.spawnMobsForChunkGeneration` to `ddh.a(ddl,jm,dcd,ayw)` and

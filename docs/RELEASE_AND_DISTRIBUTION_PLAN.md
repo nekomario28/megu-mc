@@ -21,51 +21,12 @@
 2026-11-22 に **`LGPL-3.0-or-later`** 単一表記へ統一済みです（2026-11-20 時点の
 トリプルライセンス移行経路を経て確定）。
 
-### 推奨: 本体を `LGPL-3.0-or-later` に統一する
+### 配布物に同梱するもの
 
-`megu` は **mod エコシステム上で動くエンジン**であり、配布形態としては
-「単体サーバー/クライアント」だけでなく「外部 mod JAR を動的ロードする
-ホスト」として振る舞う。ここで `GPL-3.0-or-later` を選ぶと、外部 mod 作者が
-「自分の MIT/Apache-2.0 mod が GPL エンジン上で動くとライセンス感染するのでは」
-と警戒し、Fabric/NeoForge エコシステム（Sodium=MIT、Lithium=LGPL-3.0、
-Horizon=GPL-3.0、C2ME=MIT、NeoForge=LGPL-2.1、Fabric=Apache-2.0）との
-相性が悪化する。
-
-`LGPL-3.0-or-later` を推す理由:
-
-1. **エコシステム整合** — Sodium (MIT), Lithium (LGPL-3.0), C2ME (MIT),
-   Starlight, FerriteCore など主要 performance mod と同じ「weak copyleft」
-   レイヤーに立てる。mod 作者の心理的・法的ハードルが最も低い。
-2. **エンジン fork への強い copyleft は維持** — `megu` 本体や
-   `megu-core` の改変・再配布には依然 LGPLv3 のソース公開義務がかかる。
-   「クローズド商用 fork による持ち逃げ」は防げる（GPL との実質的差は
-   「リンク/ロードされる側への波及」のみ）。
-3. **外部 mod JAR への非波及をライセンス条文で明確化** — LGPLv3 §4/§5 と
-   「mere aggregation / dynamic loading」の解釈により、MIT/Apache/BSD/ARR
-   ライセンスの外部 mod がカスタム linking exception なしで実行可能。
-   現行の「Fabric/NeoForge 互換レイヤ経由で動的ロードされる独立 JAR には
-   コピーレフトを波及させない」という設計意図と条文レベルで一致する。
-4. **GPLv3 との双方向互換** — LGPLv3 §3 により LGPL-3.0-or-later コードは
-   GPLv3 プロジェクトへ取り込める。将来 GPL-3.0-or-later 側のコンポーネントと
-   統合する場合も障害にならない（逆も LGPL 側が GPL を取り込む場合は
-   GPL 側の条件が優先される点に注意）。
-5. **将来の再ライセンス自由度** — `-or-later` により、コントリビューターの
-   同意なしに LGPL-3.0 → GPL-3.0-or-later 等への移行判断が可能
-   （トリプルライセンス寄稿と組み合わせて最大の柔軟性）。
-
-### 注意点・やるべきこと（メンテナ判断事項）
-
-- 現行 `LICENSE` は GPLv3 本文。LGPL への変更は `COPYING.LESSER` を
-  `LICENSE` 相当に昇格させる作業であり、**本レーンのスコープ外**
-  （`LICENSE`/`Cargo.toml`/`deny.toml`/`LICENSING.md` は編集禁止）。
-  実施する場合は別レーンで `LICENSE` 差し替え + `Cargo.toml` license
-  field + `LICENSING.md` 更新 + `NOTICE` 確認を一括で行う。
-- `GPL-3.0-or-later` 据え置きも選択肢として残る。その場合は
-  「外部 mod は別プロセス/別ライセンスのプラグインとして扱う」設計を
-  ドキュメントでより明確にする必要がある。
-- AGPL-3.0-or-later はマネージドホスティング（SaaS 的提供）まで
-  ソース公開を求めるため、コミュニティ mod エコシステムには過剰。
-  トリプルライセンスの選択肢として残すのが妥当。
+本体と寄稿コードのライセンス本文は [LICENSE](../LICENSE)（LGPLv3）です。
+[docs/COPYING.GPL](COPYING.GPL) は LGPLv3 に付随する GPLv3 本文で、別の本体ライセンスではありません。
+再配布時は両方の本文と [NOTICE](../NOTICE) の帰属表示を同梱してください。
+実行時にロードされる独立した外部 Mod JAR と利用者が導入したシェーダーパックには、それぞれの作者のライセンスが適用されます。
 
 ---
 
@@ -343,10 +304,8 @@ Donation is optional and does not affect features or roadmap.
       で Mojang 派生物ゼロを証明
 - [ ] `cargo check --bins --offline --locked` — stripped public export で
       バイナリがビルドできることを確認
-- [ ] License 整合: `LICENSE` / `COPYING.LESSER` / `COPYING.AGPL` /
-      `Cargo.toml` license field / `NOTICE` / `deny.toml` が
-      LICENSING.md の決定と一致（LGPL 移行を行う場合は本レーン外の
-      別レーンで実施済みであること）
+- [ ] License 整合: `LICENSE`（LGPLv3）・`docs/COPYING.GPL`（GPLv3 付随文）・`NOTICE` を同梱し、
+      各 `Cargo.toml` の `license` が `LGPL-3.0-or-later` であることを確認
 - [ ] `cargo deny check` — advisory + license + source 全パス
 - [ ] Security audit sign-off — `SECURITY.md` 記載スコープ
       （protocol DoS / mod sandbox / save corruption / crash redaction）

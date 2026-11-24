@@ -176,7 +176,7 @@ python3 tools/port_runtime_stage_check.py \
   /data/lane-scratch/mc-parity-final-full-1027 \
   /data/lane-scratch/mc-parity-final-early-1027 \
   /data/lane-scratch/mc-parity-final-reload-1027 \
-  /home/yuu/.cache/mc-spine-work/r1-ticked-native/native.bin \
-  /home/yuu/.cache/mc-spine-work/r1-stage-report.json \
+  <cache>/mc-spine-work/r1-ticked-native/native.bin \
+  <cache>/mc-spine-work/r1-stage-report.json \
   target/debug/mc-spine
 ```

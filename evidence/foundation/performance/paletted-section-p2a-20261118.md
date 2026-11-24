@@ -37,7 +37,7 @@ Dataset (seed `4242`, post-feature `terrain_section_at` with `feature::populate`
 - **End**: `10x10` = 100 chunks × 16 sections = **1,600** sections
 - **Total**: **10,976** real sections (`44,957,696` cells)
 
-Measured output (`/home/yuu/mc-spine-local/audit/p2a-paletted-20261118/paletted-bench.log`):
+Measured output (`<local>/audit/p2a-paletted-20261118/paletted-bench.log`):
 
 | Metric | Measured Value |
 |---|---:|

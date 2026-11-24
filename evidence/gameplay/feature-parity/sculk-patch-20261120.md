@@ -132,7 +132,7 @@ exit 0) is not met.
    record of 1 because the current gate compares canonical state ids, not names.
 
 2. **Small 1-chunk fixture pair** from the fixture-suite demo
-   (`/home/yuu/mc-spine-local/audit/fixture-suite-20261116-204353/demo/captures/sculk/capture/world`
+   (`<local>/audit/fixture-suite-20261116-204353/demo/captures/sculk/capture/world`
    + `port.bin`, seed 4242, chunk (0,0), `n=1 x0=0 z0=0 --require-match`):
 
    ```

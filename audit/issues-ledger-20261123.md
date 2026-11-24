@@ -1,6 +1,6 @@
 # Issues ledger — consolidated audit findings (2026-11-23)
 
-Repo: `/home/yuu/mc-spine` @ `8b00b7d2` (`main`). Harvested from all 15 docs in
+Repo: `<repo>` @ `8b00b7d2` (`main`). Harvested from all 15 docs in
 `audit/`, `AUDIT_WIRE.md`, and the known-gap statements in `specs/ROADMAP.md`,
 `specs/implementation-checklist.md`, `specs/README.md`. Every row was
 spot-verified against HEAD with reads/greps only (no builds, no tests).

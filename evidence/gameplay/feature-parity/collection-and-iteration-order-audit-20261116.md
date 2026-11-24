@@ -431,7 +431,7 @@ tools/bytecode_probe.sh 'net.minecraft.core.Direction$Plane'
 
 # the scan over all 414 worldgen classes (javap once, then the signatures above)
 python3 tools/feature_order_scan.py \
-    --jar /home/yuu/mc-spine-local/captures/native/mc-native-overworld-20261111/server.jar \
+    --jar <local>/captures/native/mc-native-overworld-20261111/server.jar \
     --mappings /var/tmp/mcm/server.txt --verify-sha1
 
 cargo test --offline --locked --bin mc-spine -- --test-threads=1

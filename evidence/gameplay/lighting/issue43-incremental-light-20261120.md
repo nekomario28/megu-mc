@@ -28,7 +28,7 @@ chunk boundary.
 
 ## Vanilla 1.21.1 comparison
 
-The probe starts the pinned jar at `/home/yuu/tmpx/carverfresh/server.jar`, SHA-1
+The probe starts the pinned jar at `<home>/tmpx/carverfresh/server.jar`, SHA-1
 `59353fb40c36d304f2035d51e7d6e6baa98dc05c`, with OpenJDK 21 and a flat
 Overworld from y=-64 with height 384. It forceloads a 3×3 chunk area and models
 its four-layer opaque floor. The roof spans x,z=6..10 at y=-40, with a support

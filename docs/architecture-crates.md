@@ -1,12 +1,10 @@
 # Crate architecture
 
-The dependency map of the twelve standalone crates plus the root `megu`
-package, the license model, and the fast-iteration commands. The
-manifests are the source of truth — this page is the map, and every edge
-below is read out of the `*/Cargo.toml` `[dependencies]` tables.
-Eleven crates have no third-party dependencies. The twelfth, `client-gpu`,
-isolates `winit`/`wgpu` and their external dependencies in its own
-manifest and `client-gpu/Cargo.lock`.
+The tree has 17 `Cargo.toml` manifests: 13 standalone crates (including
+`sdk/megu-mod-sdk`), the root `megu` server, and three tools:
+`tools/offload_ffi_probe`, `tools/palette_bench` and `tools/storage_bench`.
+The map below shows the in-tree dependencies of the server and the 13 crates;
+each package's manifest is the source of truth.
 
 ## Packages
 
@@ -24,6 +22,7 @@ manifest and `client-gpu/Cargo.lock`.
 | [../client-ui](../client-ui/Cargo.toml) | `megu-client-ui` | independent pure-Rust client UI drawing/screens, including shaderpack selection ([src/shader_screen.rs](../client-ui/src/shader_screen.rs)) and mana/cast/cooldown/status HUD overlay ([src/magic_hud.rs](../client-ui/src/magic_hud.rs)) |
 | [../client-app](../client-app/Cargo.toml) | `megu-client` | native client executable; `--shader-pack`/`--shader-profile` CLI ([src/cli.rs](../client-app/src/cli.rs)), shaderpack activation and GPU fallback ([src/shaderpack_runtime.rs](../client-app/src/shaderpack_runtime.rs)), RenderGraph integration, `ClientVfxHost` ([src/render.rs](../client-app/src/render.rs)), `WorldAnimationHost` ([src/world.rs](../client-app/src/world.rs)) and `recv_play_with_custom_channels` for `MAG1`/`VFX1`/`ANM1`/`MOT1` ([src/protocol.rs](../client-app/src/protocol.rs)) |
 | [../client-gpu](../client-gpu/Cargo.toml) | `megu-client-gpu` | isolated windowed `winit` 0.30.13 + `wgpu` 30.0.1 GPU client, `pollster` and `bytemuck`; `--headless-probe`, real GPU window/surface and offscreen rendering ([src/main.rs](../client-gpu/src/main.rs), [src/renderer.rs](../client-gpu/src/renderer.rs)) |
+| [../sdk/megu-mod-sdk](../sdk/megu-mod-sdk/Cargo.toml) | `megu-mod-sdk` | typed builders, `.mmod` packaging and an in-memory mod test harness |
 | [../Cargo.toml](../Cargo.toml) | `megu` | the root server package ([../src/main.rs](../src/main.rs)) |
 
 Six primary operator-facing binaries come out of the tree: `megu` (root),
@@ -51,18 +50,20 @@ megu-state-store     → megu-core                  [bin: megu-world-migrate]
 megu-server-files    → megu-core                  [bins: megu-init, megu-admin]
 mod-offload              (no in-tree deps)
 mod-adapter-core         → megu-core, mod-offload     [bin: megu-mod-check]
-create-adapter           → mod-adapter-core, mod-offload
+create-adapter           → megu-core, mod-adapter-core, mod-offload
+megu-mod-sdk             → megu-core
 megu-kernel          → megu-core
-megu-client-mesh     (no in-tree deps)                [bin: cull_region_bench]
+megu-client-mesh     → megu-core                      [bin: cull_region_bench]
 megu-client-ui       → megu-core
-megu-client          → megu-kernel, megu-client-mesh, megu-proto
-megu-client-gpu      → megu-client, megu-client-mesh,
+megu-client          → megu-core, megu-kernel, megu-client-mesh, megu-proto
+megu-client-gpu      → megu-client, megu-client-mesh, megu-core, megu-proto,
                            megu-kernel, megu-client-ui   [bin: megu-client-gpu]
-megu (root)          → mod-adapter-core?, create-adapter?   (optional deps)
+megu (root)          → megu-core, megu-server-files,
+                       mod-adapter-core?, create-adapter?, mod-offload?, megu-state-store?
 ```
 
-The root optional edges are enabled by `create-offload`; the default
-server build resolves those path dependencies without linking them.
+`?` denotes an optional dependency. `create-offload` enables the two adapter
+crates; `mod-suite` enables all four optional in-tree dependencies.
 
 ## Standalone crates, not a workspace
 
@@ -70,18 +71,11 @@ There is deliberately no `[workspace]` table. Each crate is an
 independent package — its own `Cargo.toml`, version and build directory —
 held together by `path` dependencies. `cargo build` in a crate directory
 builds that crate and its path deps without touching the root; `cargo
-build` at the repository root builds the `megu` package only. Cargo
-builds of the eleven dependency-free crates use their own lockfiles;
-`client-gpu/Cargo.lock` pins the separate third-party GPU stack. Cargo
+build` at the repository root builds the `megu` package only. `client-gpu/Cargo.lock` pins the third-party GPU stack. Cargo
 profiles are read from the package being built, so
 `cargo build --profile fast` refers to the `fast` profile defined in the
 root [../Cargo.toml](../Cargo.toml) (inherits `release`, `lto = false`,
 `codegen-units = 16`, `incremental = true`).
-
-The root server stays buildable with zero subcrate code linked:
-`mod-adapter-core` and `create-adapter` are `optional = true` and only
-join the binary through the `create-offload` feature
-([../src/mod_offload_bridge.rs](../src/mod_offload_bridge.rs)).
 
 The toolchain is pinned — `channel = "1.98.0"` in
 [../rust-toolchain.toml](../rust-toolchain.toml).
@@ -91,8 +85,8 @@ The toolchain is pinned — `channel = "1.98.0"` in
 | package | license |
 |---|---|
 | `megu` (root) | `LGPL-3.0-or-later` |
-| all twelve subcrates, including `megu-client-gpu` | `LGPL-3.0-or-later` |
-| `client-gpu` direct third-party crates (`wgpu`, `winit`, `pollster`, `bytemuck`) | `MIT OR Apache-2.0` |
+| all 13 standalone crates, including `megu-mod-sdk` | `LGPL-3.0-or-later` |
+| all three tool crates | `LGPL-3.0-or-later` |
 
 Every manifest declares `LGPL-3.0-or-later` in its `[package]` table, and
 source files carry an `SPDX-License-Identifier` header (LGPL-only, or the

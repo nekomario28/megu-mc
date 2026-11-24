@@ -99,7 +99,7 @@ texture cannot fail the whole table.
     inside this repo — `find_runtime_root` sorts candidate ancestors
     alphabetically and the repo root itself contains
     `config_packets.bin`/`datapacks/`/`assets/block_states_1211.json`,
-    so `/home/yuu/mc-spine` outranks the test's `/tmp` runtime.
+    so `<repo>` outranks the test's `/tmp` runtime.
   - `client-gpu wire_client_math_qol_tests::
     world_block_updates_drain_coalesced_light_queue` — the test is
     written for a checkout *without* generated assets; this checkout has

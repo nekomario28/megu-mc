@@ -1,2 +1,2 @@
-   Compiling mc-spine v0.0.0 (/home/yuu/oss-bounty/work/mc-spine)
+   Compiling mc-spine v0.0.0 (<repo>)
     Finished `release` profile [optimized] target(s) in 31.10s

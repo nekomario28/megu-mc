@@ -1,6 +1,6 @@
 # Static Bug-Signature Sweep — 2026-11-23
 
-Repo: `/home/yuu/mc-spine` @ `8b00b7d2` (megu-mc, Minecraft protocol 767 / 1.21.1).
+Repo: `<repo>` @ `8b00b7d2` (megu-mc, Minecraft protocol 767 / 1.21.1).
 Method: `rg` + targeted reads only. No builds, no tests. Test-only code excluded.
 Reachability was verified by tracing callers, not by matching symbol names.
 
@@ -17,28 +17,28 @@ of finished-but-unwired production features.
 ### Medium
 
 **M1 — PANIC-ON-WIRE: `.expect()` on End-dimension portal target**
-[src/play_protocol.rs:6655](/home/yuu/mc-spine/src/play_protocol.rs:6655)
+[src/play_protocol.rs:6655](../src/play_protocol.rs#L6655)
 
 ```rust
 .expect("only the End has no Nether portal")
 ```
 
 `enter_portal` is reached from `tick_portal` (called every tick from the play loop,
-[src/play_protocol.rs:10209](/home/yuu/mc-spine/src/play_protocol.rs:10209)) when a
+[src/play_protocol.rs:10209](../src/play_protocol.rs#L10209)) when a
 player stands inside a `nether_portal` block state. The `else` branch (non-End,
 non-Nether dims) calls `nether_portal_target(DimId::End).expect(...)`. If a
 `nether_portal` block exists in the End dimension — placeable by an op via
 `/setblock`/`/fill`, allowed inside structure templates
 (`template_structures.rs` whitelists `minecraft:nether_portal`), or present in a
 crafted save — the player touching it panics. The panic unwinds to the
-per-connection `catch_unwind` at [src/main.rs:20222](/home/yuu/mc-spine/src/main.rs:20222)
+per-connection `catch_unwind` at [src/main.rs:20222](../src/main.rs#L20222)
 → `disconnect_cleanup`; no mutex is held at the panic site (`dim`/`in_portal`
 guards are temporaries, `drop(at)` precedes), so impact is a targeted kick of
 that connection, not server-wide corruption. Requires unusual world state, hence
 Medium rather than High.
 
 **M2 — PANIC-ON-WIRE (untrusted file): unclamped `DIFFICULTY` byte → OOB array index**
-[src/save_v2.rs:4767](/home/yuu/mc-spine/src/save_v2.rs:4767) stores the raw save
+[src/save_v2.rs:4767](../src/save_v2.rs#L4767) stores the raw save
 byte:
 
 ```rust
@@ -46,18 +46,18 @@ DIFFICULTY.store(b[p], Ordering::Relaxed);
 ```
 
 Every other writer clamps or validates (`set_difficulty` rejects `>3`,
-[src/commands_core.rs:5848](/home/yuu/mc-spine/src/commands_core.rs:5848);
-anvil load clamps `0..=3`, [src/anvil_io.rs:1179](/home/yuu/mc-spine/src/anvil_io.rs:1179);
+[src/commands_core.rs:5848](../src/commands_core.rs#L5848);
+anvil load clamps `0..=3`, [src/anvil_io.rs:1179](../src/anvil_io.rs#L1179);
 play packet rejects `b[0] > 3`). The save_v2 path does not. A crafted/edited save
 with difficulty byte `>3` then makes the `/difficulty` query panic at
-[src/commands_core.rs:8139](/home/yuu/mc-spine/src/commands_core.rs:8139):
+[src/commands_core.rs:8139](../src/commands_core.rs#L8139):
 
 ```rust
 ["peaceful","easy","normal","hard"][DIFFICULTY.load(Ordering::Relaxed) as usize]
 ```
 
 All other `DIFFICULTY.load` consumers use `match` with `_ =>` fallthrough — this
-index is the only panic site. Also note [src/anvil_io.rs:1120](/home/yuu/mc-spine/src/anvil_io.rs:1120)
+index is the only panic site. Also note [src/anvil_io.rs:1120](../src/anvil_io.rs#L1120)
 `DIFFICULTY.load(...) as i8` wraps values `128..=255` on the next save, silently
 corrupting the byte further. Severity Medium (requires loading a hostile save;
 panic is per-connection via catch_unwind but the corrupted byte persists).
@@ -65,7 +65,7 @@ panic is per-connection via catch_unwind but the corrupted byte persists).
 ### Low
 
 **L1 — PANIC-ON-WIRE: TOCTOU `unwrap()` on actor entity lookup**
-[src/commands_core.rs:8749](/home/yuu/mc-spine/src/commands_core.rs:8749)
+[src/commands_core.rs:8749](../src/commands_core.rs#L8749)
 
 ```rust
 a.get(args[2]).unwrap()
@@ -78,7 +78,7 @@ issuing connection is disconnected by the outer `catch_unwind`. Op-gated command
 path; narrow race window. Low.
 
 **L2 — TRUNCATION CAST: NBT string length `as u16` (latent)**
-[proto/src/item_components.rs:991](/home/yuu/mc-spine/proto/src/item_components.rs:991)
+[proto/src/item_components.rs:991](../proto/src/item_components.rs#L991)
 
 ```rust
 w.write_u16(value.len() as u16);
@@ -86,7 +86,7 @@ w.write_u16(value.len() as u16);
 
 `put_nbt_string` silently wraps string lengths ≥ 65536. Today every input reaches
 it through `sanitize_text_component`, which bounds payloads at
-`MAX_COMPONENT_BYTES = 4096` ([proto/src/item_components.rs:15](/home/yuu/mc-spine/proto/src/item_components.rs:15)),
+`MAX_COMPONENT_BYTES = 4096` ([proto/src/item_components.rs:15](../proto/src/item_components.rs#L15)),
 so it cannot trigger — but it is the same bug class as the known
 `nbt_str`/`s.len() as u16` example and will silently corrupt component bytes if a
 future caller bypasses the 4 KiB cap. Sibling at line 1001,
@@ -94,7 +94,7 @@ future caller bypasses the 4 KiB cap. Sibling at line 1001,
 Low / latent.
 
 **L3 — TRUNCATION CASTS: `as u16`/`as u32` on wire counts in live-mod bridge**
-[src/live_mod_bridge.rs](/home/yuu/mc-spine/src/live_mod_bridge.rs) — ~10 sites
+[src/live_mod_bridge.rs](../src/live_mod_bridge.rs) — ~10 sites
 in the 2990–3340 range (e.g. length/count fields serialized as `as u16`/`as u32`).
 Counts above 65535/2^32 wrap and corrupt the bridge frame. Reachability requires
 the `mod-suite`/`create-offload` feature and a mod adapter emitting oversized
@@ -102,8 +102,8 @@ counts; the data is adapter-produced rather than directly remote-wire, so
 severity is Low and feature-gated.
 
 **L4 — DEAD/UNWIRED: finished anti-xray masking path never called**
-[src/antixray.rs:48](/home/yuu/mc-spine/src/antixray.rs:48) `mask_chunk` and
-[src/antixray.rs:104](/home/yuu/mc-spine/src/antixray.rs:104) `obfuscate_chunk`
+[src/antixray.rs:48](../src/antixray.rs#L48) `mask_chunk` and
+[src/antixray.rs:104](../src/antixray.rs#L104) `obfuscate_chunk`
 (~110 lines incl. decoy/filler logic) are annotated
 `#[cfg_attr(not(test), allow(dead_code))]`; their only callers are the module's
 own tests. Production anti-xray is implemented inline via `is_hidden` /
@@ -111,7 +111,7 @@ own tests. Production anti-xray is implemented inline via `is_hidden` /
 implementation left unwired — either wire it or delete it before it rots.
 
 **L5 — DEAD/UNWIRED: enchantment/melee combat cluster (test-only callers)**
-[src/combat_and_health.rs](/home/yuu/mc-spine/src/combat_and_health.rs):
+[src/combat_and_health.rs](../src/combat_and_health.rs):
 `enchantment_targets_aquatic` (:621), `typed_damage_bonus` (:646),
 `bane_slowness_iv` (:663), `entity_is_living` (:691), `melee_hit_damage` (:741),
 `ignite_mob_fire_aspect` (:773), `mob_fire_ticks_of` (:780), `tick_mob_fire`
@@ -121,7 +121,7 @@ modules (lines ≥4937). This is a complete vanilla-faithful damage/enchantment
 model that production combat never calls — finished feature, unwired.
 
 **L6 — DEAD/UNWIRED: save-format dead getters**
-[src/anvil_io.rs:846–886](/home/yuu/mc-spine/src/anvil_io.rs:846) — `data_version`,
+[src/anvil_io.rs:846–886](../src/anvil_io.rs#L846) — `data_version`,
 `version_id`, `level_name`, `difficulty_locked`, `game_type` accessors on the
 level record; no production callers.
 
@@ -169,7 +169,7 @@ can outlive it. Worth a sweep toward `into_inner` recovery or `parking_lot`.
   (4–8/15) established at decode/construct time; index math masked to 4096.
 - **Chunk-boundary arithmetic**: `x >> 4` / `x & 15` / `div_euclid(16)` used
   consistently in `lighting.rs` neighbor propagation, `main.rs` cell packing,
-  and `worldgen.rs`; `local_idx` ([src/main.rs:9491](/home/yuu/mc-spine/src/main.rs:9491))
+  and `worldgen.rs`; `local_idx` ([src/main.rs:9491](../src/main.rs#L9491))
   uses `checked_sub(MIN_Y)` and returns `u32::MAX` for out-of-range y instead of
   wrapping; portal `floor() as i32` scaling is float-safe for encodable coords.
 - **`brigadier.rs` "Can't find node before cursor"**: child suggestion contexts
@@ -195,5 +195,5 @@ can outlive it. Worth a sweep toward `into_inner` recovery or `parking_lot`.
   (`play_protocol.rs`, `main.rs`, `nbt.rs`, `paletted.rs`, `anvil_io.rs`,
   `proto/src/*`) rather than exhaustively; all sampled sites were bounded.
 - Findings assume the documented `catch_unwind` containment at
-  [src/main.rs:20222](/home/yuu/mc-spine/src/main.rs:20222); if per-connection
+  [src/main.rs:20222](../src/main.rs#L20222); if per-connection
   panic containment is ever removed, M1/L1/M2 become full server crashes.

@@ -9,7 +9,7 @@ Status: **HOLD(受入しない)。`src/` は無変更。測ったのは
 |---|---|
 | base commit | `0fa6807`(`perf/worldgen-parallel`) |
 | port binary | `target/debug/mc-spine` sha256 `7dc623bf3372e5e8d71ad6cab6b65196f2a3ba7f125862234b4371524c4ef7ca` |
-| capture | `/home/yuu/mc-spine-local/captures/matrix-v3/nat-4242-village-plains`(frozen, overworld, window −64/384, seed 4242, `Chunks` 1) |
+| capture | `<local>/captures/matrix-v3/nat-4242-village-plains`(frozen, overworld, window −64/384, seed 4242, `Chunks` 1) |
 | port dump | `dumps/nat-4242-village-plains/dump.bin` sha256 `c372f3700e20778b…` |
 | triage | `dumps/nat-4242-village-plains/{triage.json,port_triage.log}` |
 | heightmap 対照 | `dumps/nat-4242-village-plains-hm/`(`--port-hm --hm-name MOTION_BLOCKING`) |

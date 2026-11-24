@@ -2,8 +2,8 @@
 
 Date: 2026-11-16. 対象: 候補 `ac0896d` の上に積んだ3コミット（`c3e71c0`, `d4e0e6f`, `cbe2cf2`）。
 作業は tool-created worktree（`t3-87d06ba5-…`）と private audit dir
-`/home/yuu/mc-spine-local/audit/test-harness-repair-20261116T150404/` のみ。
-canonical `/home/yuu/mc-spine` への書き込み・push・network・full campaign・native capture は無し。
+`<local>/audit/test-harness-repair-20261116T150404/` のみ。
+canonical `<repo>` への書き込み・push・network・full campaign・native capture は無し。
 
 本書は**その時点の測定記録**であって恒久的な契約ではない。恒久的な契約は
 [`tools/README.md` の gate 節](../../tools/README.md)に、動く gate は
@@ -110,7 +110,7 @@ stability の5 case（fails twice / green / compile / crash / zero-selected）�
 ### 依存の出所（正直に）
 
 `layers_check.sh` は CI 固定の depsgx（`d6b9ad8db4774919c8b4fb032342e53b2548b660`）ではなく、
-ホストにある `/home/yuu/gxkit/.venv/bin/depsgx` **1.0.0（editable HEAD `973b293a`）** で PASS した。
+ホストにある `<home>/gxkit/.venv/bin/depsgx` **1.0.0（editable HEAD `973b293a`）** で PASS した。
 固定版での green ではないし、インストールもしていない。
 
 ## 資源
@@ -126,7 +126,7 @@ private evidence は 82 MiB copy + 853 MiB target を1 campaign ごとに作っ�
 上の本文は `e928750` 時点の測定記録で、**そのまま残す**。ここから先は親レビューが
 source で指摘した4点（R1–R4）に対する追加の修理と、その測定。対象は `e928750` の上、
 worktree は `t3-042df13c-…`、durable 側は
-`/home/yuu/mc-spine-local/audit/snapshot-boundary-repair-20261116T155346/`。
+`<local>/audit/snapshot-boundary-repair-20261116T155346/`。
 
 ### 何が欠けていたか（レビューの主張を source で確認した）
 

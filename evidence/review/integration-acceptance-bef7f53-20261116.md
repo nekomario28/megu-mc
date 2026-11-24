@@ -5,16 +5,16 @@
 
 **2026-11-16 追補（最終 remediation）**: 独立レビュー `5dcaf3a` の F1–F6 をこの文書に反映した。
 変更は文書と `src/feature.rs` の docstring だけで、production の意味は変えていない。
-新しい測定は `/home/yuu/mc-spine-local/audit/final-landing-20261116-1415/` にあり、
+新しい測定は `<local>/audit/final-landing-20261116-1415/` にあり、
 以下の各節で「継承（当時の測定、いま再検証不能）」と「今回測った」を分けて書く。
 canonical `perf/worldgen-parallel`（`e7ead8e`）はこの remediation の間も**未変更**。
 
-- 作業 worktree: `/home/yuu/.t3/worktrees/mc-spine/t3-b2eb8ad1-ebf296b8314a2ff7`
+- 作業 worktree: `<worktree>`
 - branch: `t3/worldgen-integration-audit`
 - base: `e7ead8e66466b0b6467450cd3ea31d86a0e39cd3`（`perf/worldgen-parallel`）
 - **統合候補（コード）: `bef7f531ab902e64d05ef04d339c9f8a796f0e68`**
 - この報告 commit は `bef7f53` の上に docs のみを積む
-- 実行台帳: `/home/yuu/mc-spine-local/audit/deepseek-int-20261116-125633/`
+- 実行台帳: `<local>/audit/deepseek-int-20261116-125633/`
 
 ## 1. 選んだ commit / 捨てた commit
 
@@ -151,7 +151,7 @@ d557519ea4e467ed637b6362c81bdeab01ce262f50a5049e2f28a926b4756601  exporter-check
   `PASS+FAIL == ATTEMPTED`、`FAIL == 0` を assert する（`run_python_units.sh`）。
 - 結果: **ファイル 37/37 exit 0**、うち unittest のケース合計 **196**（29 ファイルが
   `Ran N tests` を出す）。`summary.txt` は `SCANNED=37 ATTEMPTED=37 PASS=37 FAIL=0`。
-- 検査器の同定: `depsgx` **1.0.0**、import 元 `/home/yuu/gxkit/packages/depsgx/src`
+- 検査器の同定: `depsgx` **1.0.0**、import 元 `<home>/gxkit/packages/depsgx/src`
   （editable、gxkit **HEAD `973b293a…`**、`packages/depsgx` は clean）。CI の pin は
   `d6b9ad8…` だが、この host の venv は pin ではない（`merge-base --is-ancestor` = no、
   `d6b9ad8..973b293 -- packages/depsgx` は 8 files / +120 / −27）。**したがって
@@ -343,7 +343,7 @@ pinned official mappings (`server.txt` sha1 `03f89854…`) はこの host に無
 - **SKIP された変異**: 0（focused 実行内）。
 - **環境依存**: `tests/layers_gate_test.py` は `depsgx` が PATH に必要。PATH 無しでは 16 失敗
   するが、それは環境の欠陥であってコードの欠陥ではない。2026-11-16 の再実行では
-  `/home/yuu/gxkit/.venv/bin` を前置して **17/17 OK**（depsgx 1.0.0、§5.1）。ただし
+  `<home>/gxkit/.venv/bin` を前置して **17/17 OK**（depsgx 1.0.0、§5.1）。ただし
   `MC_SPINE_DEPSGX` を export したままだと、このテストの「検査器が無い」系 fixture が
   環境変数を継承して別の理由で落ちる（実測 4 失敗、§5.1 の負の対照）。
   `tools/layers_check.sh` も depsgx を必要とする。
@@ -395,7 +395,7 @@ assertion や golden output の弱体化はしていない。
 
 独立レビュー `5dcaf3a` の指摘への是正。**production の意味は変えていない**: `src/` の変更は
 `src/feature.rs` の docstring 1 箇所だけで、ほかは `evidence/` の文書。検証と生ログは
-`/home/yuu/mc-spine-local/audit/final-landing-20261116-1415/`。
+`<local>/audit/final-landing-20261116-1415/`。
 
 1. **F1（Python の件数）**: §5 の「37/37 exit 0」を撤回し、当時の log の実数（36 entry /
    35 exit 0 / `layers_gate_test` exit 1）と、変数だけの `layers_gate_exit=0` を明記した。
@@ -440,7 +440,7 @@ assertion や golden output の弱体化はしていない。
   `.mutation-backup` が残る（次回起動は backup を見て exit 2 で拒む）。本 pass で過去の
   SIGKILL 残留が実際に起きたことは確認していない（未証明）。今回の変異実行は隔離 worktree と
   専用 target で、他のビルド・読み手を同時に走らせずに行った。canonical
-  `/home/yuu/mc-spine` ではハーネスを実行していない。
+  `<repo>` ではハーネスを実行していない。
 - 同ハーネスの restored 制御は「復元後の再ビルド＋再 green」を記録するが、復元の検証は
   **source の sha256** までで、使われたバイナリの同一性は検査しない。今回の実行では追加で
   検証した（§18）: `src/*.mutation-backup` 0、`git status` 0 行、receipt のバイナリ sha256
@@ -450,7 +450,7 @@ assertion や golden output の弱体化はしていない。
 ## 18. 最終候補の実測（2026-11-16, HEAD `aeea52a`）
 
 最終候補 `aeea52ad…`（`2799a36` + 独立レビュー報告 + この remediation）上で、source-bound に
-取り直した。すべて `/home/yuu/mc-spine-local/audit/final-landing-20261116-1415/`。
+取り直した。すべて `<local>/audit/final-landing-20261116-1415/`。
 
 | 検証 | 結果 | ログ |
 |---|---|---|
@@ -476,4 +476,4 @@ assertion や golden output の弱体化はしていない。
 - この remediation の後続 commit は docs のみで、`src` / `assets` / `tools` / `Cargo.toml` の
   tree object は変えない（実行 SHA と最終 docs HEAD で同一性を確認する）。
 - **canonical への着地は親の指示で HELD**（FF の authorization は取り消された）。
-  `/home/yuu/mc-spine` は `e7ead8e667…` / `perf/worldgen-parallel` / clean のまま触っていない。
+  `<repo>` は `e7ead8e667…` / `perf/worldgen-parallel` / clean のまま触っていない。

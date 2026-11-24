@@ -8,8 +8,7 @@ body:
       value: |
         Keep it compact — one issue per bug. Crash reports are easiest to
         triage with a `MEGU-E-XXXXXXXX` fingerprint from the crash screen.
-        Feature requests and support questions belong in GitHub Discussions
-        or Discord (see the issue chooser).
+        Feature requests and support questions belong in [GitHub Discussions](https://github.com/nekomario28/megu-mc/discussions).
 
         簡潔にお願いします — 1 issue = 1 bug。クラッシュ報告はクラッシュ画面の
         `MEGU-E-XXXXXXXX` フィンガープリント付きが最もトリアージしやすいです。
@@ -68,7 +67,7 @@ body:
     attributes:
       label: Megu / engine version
       description: "Commit SHA, release tag, or build identifier. (コミット SHA・リリースタグ等)"
-      placeholder: "e.g. alpha-2026.11.22 or git sha"
+      placeholder: "e.g. v0.1.0-alpha.2 or git sha"
     validations:
       required: true
 

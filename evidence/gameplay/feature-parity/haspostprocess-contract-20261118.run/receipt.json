@@ -21,7 +21,7 @@
  "cargo": "cargo",
  "problems": [],
  "binary": {
-  "path": "/home/yuu/.t3/worktrees/mc-spine/t3-ec6cf822-a285eddd91cde2fb/target/debug/deps/mc_spine-5263732b84b8ac33",
+  "path": "<worktree>/target/debug/deps/mc_spine-5263732b84b8ac33",
   "bytes": 78562448,
   "sha256": "840cd82bf2ba2d4fe1d8bfdd2dc5cd7e8cdc778d82c727f1e41e4d08526e39ea",
   "mtime": "2026-11-17T17:43:13Z"

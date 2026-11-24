@@ -136,7 +136,7 @@ measured cells exercise.
 ## 6. Reproduce
 
 ```sh
-CAP=/home/yuu/mc-spine-local/captures/matrix-v1/nat-4242-village-taiga
+CAP=<local>/captures/matrix-v1/nat-4242-village-taiga
 tools/port_triage.py "$CAP/world" 4 -32 --n 3 --pop-order "$CAP/order.tsv" \
   --pop-order-scope recorded --binary target/debug/mc-spine          # 1 / 884736
 
@@ -148,7 +148,7 @@ MC_SPINE_POP_ORDER_SCOPE=recorded MARK_TRACE=all ./target/debug/mc-spine | grep 
 # the cell the fluid machine used to refuse
 MC_SPINE_SEED=4242 MC_SPINE_WG_PROFILE=0 MC_SPINE_WG_DUMP=/tmp/c.bin MC_SPINE_WG_DUMP_N=1 \
 MC_SPINE_WG_DUMP_X=6 MC_SPINE_WG_DUMP_Z=-33 MC_SPINE_WG_DUMP_CANON=/tmp/c.canon \
-MC_SPINE_POP_ORDER=/home/yuu/mc-spine-local/audit/village-taiga-closure-20261118T114736/order-c6m32-ring.tsv \
+MC_SPINE_POP_ORDER=<local>/audit/village-taiga-closure-20261118T114736/order-c6m32-ring.tsv \
 MC_SPINE_POP_ORDER_SCOPE=recorded ./target/debug/mc-spine
 awk -F'\t' '$2==19 && $3==-513' /tmp/c.canon     # 100 = short_grass, 98/99 = water
 ```

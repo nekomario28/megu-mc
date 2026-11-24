@@ -229,7 +229,7 @@ file = "final.wgsl"
 4. **バージョン整合**: `megu-mod.toml` の `version` と `mc_version_range` を
    bundle と一致させる（`validate` が `manifest.mismatch` で検出）。
 5. **ライセンス**: `license` を明記し、同梱物の来歴を確認。Megu 本体は
-   GPL-3.0-or-later、外部 Mod / シェーダーは作者のライセンスのままです
+   `LGPL-3.0-or-later`、外部 Mod / シェーダーは作者のライセンスのままです
    （[LICENSING.md](../LICENSING.md)、[LICENSE](../LICENSE)）。
 6. **アセット**: Mojang・第三者のテクスチャ/モデル/音声を同梱しない。
 7. **Modrinth**: `.mmod`（または互換が必要なら `--compat-jar` の `.jar`）を

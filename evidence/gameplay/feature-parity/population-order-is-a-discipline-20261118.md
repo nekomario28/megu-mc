@@ -2,7 +2,7 @@
 
 Vanilla 1.21.1, pinned jar `59353fb4…`, mappings `03f89854…`, read with `tools/vanilla_src.sh`
 (Vineflower 1.10.1, the build this host has). Raw notes, decompiled sources, probe captures and
-the analysis scripts: `/home/yuu/mc-spine-local/audit/population-order-20261118-015835/`.
+the analysis scripts: `<local>/audit/population-order-20261118-015835/`.
 
 Answers one question: what decides the next chunk to populate, and can the port reproduce it as a
 default order? Short version: the **rule** is readable from the jar and is the same in every

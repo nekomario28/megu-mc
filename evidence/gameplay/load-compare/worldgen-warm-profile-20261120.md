@@ -9,7 +9,7 @@ the release binary, and the smallest change that removes the failure.
 
 | item | value |
 |---|---|
-| Checkout | `/home/yuu/.t3/worktrees/mc-spine/t3-f55c5b95-b8efd686a3f85468`, branch `t3/worldgen-warm-latency-profile`, HEAD `3f1cb4a16e685799661d46c937196a47a54cf5f3` (`main`) |
+| Checkout | `<worktree>`, branch `t3/worldgen-warm-latency-profile`, HEAD `3f1cb4a16e685799661d46c937196a47a54cf5f3` (`main`) |
 | Release build | `mkdir -p target/tmp && export TMPDIR="$PWD/target/tmp"; cargo build --release --offline --locked` → **PASS** in 58.14 s; binary `target/release/mc-spine`, SHA-256 `0a0ab28c6c0e13649606b5603efa3fbadd0786b308d52148f6a53d47e6a83979` |
 | Debug build | `cargo build --offline --locked` → **PASS** in 11.41 s (same three warnings) |
 | Tools | `tools/perf_bench.py` SHA-256 `7c731c52c8c5b4e831af1cc1bae1a51638104b45892a066de2f26a49b267891f`; `tools/load_compare.sh` `9e16162406187863f8c1f712c7c50ca1f90eaf447fbe2c8a17022a3390d5c021`; `tools/load_client.py` `d79746c847873912686dd1adcffdc85bcc60b7d07fd1e1b91796535de4262c3b` |

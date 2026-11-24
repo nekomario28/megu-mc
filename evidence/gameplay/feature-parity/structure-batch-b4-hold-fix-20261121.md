@@ -25,7 +25,7 @@ From the repository root, use the original capture directories and a new output 
 mkdir -p target/tmp
 export TMPDIR=$PWD/target/tmp JAVA_TOOL_OPTIONS="-Djava.io.tmpdir=$PWD/target/tmp -XX:-UsePerfData"
 cargo build --offline --locked -j 1
-captures=/home/yuu/mc-spine-local/captures
+captures=<local>/captures
 out="$PWD/target/b4-hold-fix-repro"
 
 triage() {
@@ -49,7 +49,7 @@ jungle-pyramid matrix-b4/nat-4242-b4-jungle-pyramid 137 -117
 FIXTURES
 
 export PATH="/usr/lib/jvm/java-21-openjdk/bin:$PATH"
-export CARVER_FIXTURE_BASE=/home/yuu/tmpx/carverfresh
+export CARVER_FIXTURE_BASE=<home>/tmpx/carverfresh
 export MC_SPINE_SEED=4242
 MC_FIXTURE_STAGE=terrain systemd-run --scope --user -p MemoryMax=1800M -p CPUQuota=100% \
     bash tools/carve-agent/native_fixture.sh "$out/vanilla-terrain-buried" 126 -182 1 frozen

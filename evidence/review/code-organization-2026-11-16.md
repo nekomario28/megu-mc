@@ -42,7 +42,7 @@
 ## 挙動を保存した理由（呼び出し側の全数確認）
 
 全ツリー（`src/ tools/ tests/ specs/ *.md`）で当該シンボルを検索した結果は
-`/home/yuu/mc-spine-local/audit/code-organization/call-sites.log`:
+`<local>/audit/code-organization/call-sites.log`:
 
 - `tick_persistence::prefix` … `main.rs:9780`（`GEN1` 解析用）、`main.rs:27303`（カート検査）、
   `mineshaft_tests.rs:647,724`。いずれも返り値のスライスだけを使い、本体長0の受理に依存していない
@@ -59,7 +59,7 @@
 
 ## テストと受領書
 
-`/home/yuu/mc-spine-local/audit/code-organization/final-receipt.log`（source-bound）:
+`<local>/audit/code-organization/final-receipt.log`（source-bound）:
 
 - `src/tick_persistence.rs` sha256 = `9bc68c9102782b7b0768c0d102699dcdac4e0076635c8d2af8c5179852d25cae`
   （実行前後で同一 = 走行中に内容は変わっていない）
@@ -70,7 +70,7 @@
 - `tick_persistence::tests` **5 passed / 0 failed**（530 filtered）
 - `persistence_tests::` **13 passed / 0 failed**（子プロセスの isolated fixture 各1 passed を含む）
 - ビルドは `MemoryMax=6G` `MemorySwapMax=2G` `CPUQuota=200%` の named scope、`-j 2`、
-  `CARGO_TARGET_DIR=/home/yuu/mc-spine-local/target/code-org-26c63f09`（他workerと非共有）
+  `CARGO_TARGET_DIR=<local>/target/code-org-26c63f09`（他workerと非共有）
 - `cargo test --no-run` の警告30件に `src/tick_persistence.rs` を指すものは無い（`build-2.log` を
   `grep tick_persistence` して0件）。この変更が増やした警告は無い。clippy は **NOT RUN**（別ビルドが必要で、
   本変更の判断には不要）
@@ -83,7 +83,7 @@
 
 `prefix` だけを変更前の実装（自前のフレーミング）に戻すと
 `a_footer_that_frames_no_body_is_refused_by_both_consumers` が落ちる
-（`/home/yuu/mc-spine-local/audit/code-organization/negative-control.log`）:
+（`<local>/audit/code-organization/negative-control.log`）:
 
 ```
 panicked at src/tick_persistence.rs:257:9:   (変更前実装に戻した版の行番号、ログからの引用)

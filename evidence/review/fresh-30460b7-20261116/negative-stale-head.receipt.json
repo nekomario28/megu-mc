@@ -14,7 +14,7 @@
   "stale source: HEAD 14d1916f52d11db401d12194d5ab1c55102dd4e9 != expected 0000000000000000000000000000000000000000"
  ],
  "binary": {
-  "path": "/home/yuu/.t3/worktrees/mc-spine/t3-a99f7ba4-18feaf996fd716b1/target/debug/deps/mc_spine-5263732b84b8ac33",
+  "path": "<worktree>/target/debug/deps/mc_spine-5263732b84b8ac33",
   "bytes": 74669872,
   "sha256": "23af568b4106e5b03525a2b81a69fb8cdb027f1c51a5c19e65a79e6edf25f4d5",
   "mtime": "2026-11-16T01:25:38Z"

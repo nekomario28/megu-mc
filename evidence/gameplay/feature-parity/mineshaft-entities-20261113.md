@@ -128,7 +128,7 @@ an absent default cache path; the resumed checks used the authenticated jar
 explicitly. None of these failed/omitted runs is reported as successful validation.
 
 Local artifacts are retained under
-`/home/yuu/mc-spine-local/scratch/current/mineshaft-entities-20261113/`.
+`<local>/scratch/current/mineshaft-entities-20261113/`.
 `verification-2/current-verification.json` binds logs, the rebuilt binary and the
 final non-document input manifest. It explicitly separates source-locked reuse
 of earlier passed checks from resumed controls and the mutation-anchor repair.
