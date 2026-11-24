@@ -1,62 +1,74 @@
 <div align="center">
-  <img src="website/logo.svg" width="84" height="84" alt="Megu Logo">
+  <img src="website/logo.svg" width="96" height="96" alt="Megu logo">
   <h1>Megu</h1>
-  <p><strong>Clean-room Rust server &amp; native GPU client (Vulkan / DX12 / Metal) for Minecraft: Java Edition 1.21.1</strong></p>
+  <p><strong>Clean-room Rust server &amp; native GPU client for Minecraft: Java Edition 1.21.1 — zero JVM, zero OpenGL.</strong></p>
   <p>
-    <a href="https://github.com/nekomario28/megu-mc/releases"><img src="https://img.shields.io/github/v/release/nekomario28/megu-mc?include_prereleases&label=release&color=e05d44" alt="Latest Release"></a>
-    <a href="https://megu.megumin.tech/"><img src="https://img.shields.io/badge/minecraft-1.21.1-2ea44f" alt="Minecraft 1.21.1"></a>
-    <a href="LICENSE"><img src="https://img.shields.io/badge/license-LGPL--3.0--or--later-blue" alt="License: LGPL-3.0-or-later"></a>
-    <a href="https://github.com/sponsors/nekomario28"><img src="https://img.shields.io/github/sponsors/nekomario28?label=Sponsors&color=db61a2" alt="GitHub Sponsors"></a>
+    <a href="https://github.com/nekomario28/megu-mc/releases"><img src="https://img.shields.io/github/v/release/nekomario28/megu-mc?include_prereleases&style=flat-square&label=release&color=e05d44" alt="Latest Release"></a>
+    <a href="https://github.com/nekomario28/megu-mc/actions/workflows/ci.yml"><img src="https://github.com/nekomario28/megu-mc/actions/workflows/ci.yml/badge.svg" alt="CI"></a>
+    <a href="https://github.com/nekomario28/megu-mc/actions/workflows/cross-platform.yml"><img src="https://github.com/nekomario28/megu-mc/actions/workflows/cross-platform.yml/badge.svg" alt="Cross-Platform"></a>
+    <a href="https://megu.megumin.tech/"><img src="https://img.shields.io/badge/minecraft-1.21.1-2ea44f?style=flat-square" alt="Minecraft 1.21.1"></a>
+    <a href="LICENSE"><img src="https://img.shields.io/badge/license-LGPL--3.0--or--later-blue?style=flat-square" alt="License: LGPL-3.0-or-later"></a>
+    <a href="https://github.com/sponsors/nekomario28"><img src="https://img.shields.io/github/sponsors/nekomario28?label=Sponsors&color=db61a2&style=flat-square" alt="GitHub Sponsors"></a>
   </p>
   <p>
-    <strong>English</strong> · <a href="README.ja.md"><strong>日本語</strong></a> · <a href="https://megu.megumin.tech/"><strong>Website</strong></a> · <a href="https://github.com/nekomario28/megu-mc/releases"><strong>Downloads</strong></a> · <a href="docs/operator-guide.md"><strong>Docs</strong></a>
+    <strong>English</strong> · <a href="README.ja.md"><strong>日本語</strong></a> · <a href="https://megu.megumin.tech/"><strong>Website</strong></a> · <a href="https://github.com/nekomario28/megu-mc/releases"><strong>Downloads</strong></a> · <a href="docs/operator-guide.md"><strong>Docs</strong></a> · <a href="https://github.com/nekomario28/megu-mc/discussions"><strong>Discussions</strong></a> · <a href="https://megu.megumin.tech/#support"><strong>Support</strong></a>
   </p>
 </div>
 
 ---
 
-Megu is a free, open-source, clean-room Rust server and pure-`wgpu` native GPU client for **Minecraft: Java Edition 1.21.1**, built for low memory usage, fast startup, and zero OpenGL dependency.
+Megu is a free, open-source, clean-room reimplementation of **Minecraft: Java Edition 1.21.1** in Rust — a dedicated server (`megu`) and a pure-`wgpu` native GPU client (`megu-client-gpu`) built for low memory usage, fast startup, and zero OpenGL / JVM dependency.
 
 > **Alpha Status (`v0.1.0-alpha.2`)**: Early pre-release. Core 1.21.1 gameplay, native Vulkan/DX12/Metal rendering, and data-driven mods work today, while 100% vanilla worldgen/AI coverage and arbitrary Java Mixin execution remain in progress. See the [Roadmap](specs/ROADMAP.md).
 
 > **Start here:** the **[Operator Guide](docs/operator-guide.md)** explains the clean split between the dedicated server (`megu`) and the native GPU client (`megu-client-gpu`), with first-boot, mods, and admin commands.
 
-## How To (Players)
+## Measured Performance
 
-Choose **one** category below from the **[Downloads page](https://megu.megumin.tech/#downloads)** or **[GitHub Releases](https://github.com/nekomario28/megu-mc/releases)** (ordered from most popular):
+`WARM=1 bash tools/load_compare.sh 20 0` — a 20-second **moving-viewer** load test (same seed, view distance and movement script, Linux x86_64): Vanilla 1.21.1 `server.jar` vs `megu`.
 
-### 1. Official Launcher &amp; Standalone Client (`megu-installer` — GUI / CLI, No Java Needed)
+| Metric | **Megu** | Vanilla 1.21.1 | Δ |
+| :--- | ---: | ---: | ---: |
+| CPU time | **3.42 s** | 5.39 s | **−37%** |
+| Chunk generation cost | **20.60 ms/chunk** | 32.87 ms/chunk | **−37%** |
+| Memory (VmRSS) | **331 MiB** | 1,122 MiB | **−70%** |
+| Threads | **16** | 66 | **−76%** |
 
-Automatically downloads/stages `megu-client-gpu` into `<minecraft_dir>/bin/` and registers the **Megu (1.21.1)** profile in the Official Minecraft Launcher (run with `gui` / `--gui` for the graphical dialog, or default 1-click install):
+<sub>Idle `megu` sits at ~122 MiB. Reproduce with `WARM=1 bash tools/load_compare.sh 20 0`. Honest scope: Megu is an alpha implementing fewer vanilla features, so part of the gap is "does less", not "does it cheaper"; general-seed 100% worldgen parity and arbitrary Java Mixin execution remain in progress.</sub>
 
-> **No terminal step required before playing.** On first launch, `megu-client-gpu` reuses an existing 1.21.1 client JAR from the Official Launcher, PrismLauncher, or Modrinth App, or fetches and SHA-1-verifies it from Mojang's CDN in the background. `megu-installer` only stages the binary and launcher profile.
->
-> **No Java memory tuning:** Megu runs natively in Rust (zero JVM / zero OpenGL). You do **not** need to tune Java `-Xmx` memory sliders in the Official Launcher or Prism — Megu manages memory automatically. Adjust the optional RAM budget slider (with automatic cache eviction under memory pressure) anytime in **Settings → Video**.
+## Why Megu
 
-| OS | File / Command | Description |
+| Dedicated Server (`megu`) | Native GPU Client (`megu-client-gpu`) | Mods &amp; Native SDK |
 | :--- | :--- | :--- |
-| **Windows (x86_64)** | **[`megu-installer-windows-x86_64.exe`](https://github.com/nekomario28/megu-mc/releases/download/v0.1.0-alpha.2/megu-installer-windows-x86_64.exe)** | Standalone `.exe` installer (`%APPDATA%\.minecraft` &amp; Microsoft Store Launcher; run `megu-installer-windows-x86_64.exe gui` for GUI mode) |
-| **Linux (x86_64)** | `curl -fsSL https://raw.githubusercontent.com/nekomario28/megu-mc/main/tools/install_linux.sh \| sh`<br>*(or **[`megu-installer-linux-x86_64`](https://github.com/nekomario28/megu-mc/releases/download/v0.1.0-alpha.2/megu-installer-linux-x86_64)**)* | Auto-detects standard `~/.minecraft` and Flatpak (`~/.var/app/com.mojang.Minecraft/.minecraft`) |
-| **macOS (Apple Silicon)** | **[`megu-installer-macos-arm64`](https://github.com/nekomario28/megu-mc/releases/download/v0.1.0-alpha.2/megu-installer-macos-arm64)** | Standalone native installer for `~/Library/Application Support/minecraft` |
+| Vanilla 1.21.1 on port **25565** | Pure `wgpu` — Vulkan / DX12 / Metal | `.mmod` native format + `--compat-jar` for Modrinth / CurseForge JARs |
+| Async chunk delivery + pre-compressed chunk-frame cache | Zero OpenGL, zero JVM — one native binary | Tiered JVM-free NeoForge / Fabric compatibility (`Create 6.0.10`, 35+ mixed-modpack E2E) |
+| Pure-Rust TTY auto-detect TUI or `--cli`; `systemd` `sd_notify` | Greedy-meshed translucent clouds, 64-light dynamic light cache | `megu-mod-check` pre-flight without a JVM (or in-browser at [megu.megumin.tech/#checker](https://megu.megumin.tech/#checker)) |
+| Hardened auth, DDoS &amp; zero-unwrap ingress | First-launch hardware auto-tune + eye-comfort optics | Typed builders, packaging &amp; test harness in [`sdk/megu-mod-sdk`](sdk/megu-mod-sdk) |
+| Reversible Vanilla Anvil world import/export | Official Launcher, PrismLauncher &amp; Modrinth App compatible | Data-driven mods: drop in `mods/`, no Java required |
 
-### 2. Modrinth App &amp; Prism Launcher (Modpack / Instance Import)
+## Quick Start
 
-| Launcher | File / Command | Description |
-| :--- | :--- | :--- |
-| **Modrinth App / Prism Launcher** | **[`megu-1.21.1.mrpack`](https://github.com/nekomario28/megu-mc/releases/download/v0.1.0-alpha.2/megu-1.21.1.mrpack)** | Standard Modrinth `.mrpack` modpack — drag &amp; drop directly into your launcher |
-| **Prism Launcher (Native ZIP)** | **[`megu-prism-1.21.1.zip`](https://github.com/nekomario28/megu-mc/releases/download/v0.1.0-alpha.2/megu-prism-1.21.1.zip)** | Pre-configured Prism instance archive (or generate locally via `megu-installer prism`) |
+**Players** — pick one from the **[Downloads page](https://megu.megumin.tech/#downloads)** or **[GitHub Releases](https://github.com/nekomario28/megu-mc/releases)**:
 
-## Verified feature highlights (upcoming alpha.3)
+| OS / Launcher | File / Command |
+| :--- | :--- |
+| **Windows (x86_64)** | [`megu-installer-windows-x86_64.exe`](https://github.com/nekomario28/megu-mc/releases/download/v0.1.0-alpha.2/megu-installer-windows-x86_64.exe) — standalone installer, `gui` arg for GUI mode |
+| **Linux (x86_64)** | `curl -fsSL https://raw.githubusercontent.com/nekomario28/megu-mc/main/tools/install_linux.sh \| sh` (or [`megu-installer-linux-x86_64`](https://github.com/nekomario28/megu-mc/releases/download/v0.1.0-alpha.2/megu-installer-linux-x86_64)) |
+| **macOS (Apple Silicon)** | [`megu-installer-macos-arm64`](https://github.com/nekomario28/megu-mc/releases/download/v0.1.0-alpha.2/megu-installer-macos-arm64) |
+| **Modrinth App / Prism** | [`megu-1.21.1.mrpack`](https://github.com/nekomario28/megu-mc/releases/download/v0.1.0-alpha.2/megu-1.21.1.mrpack) (drag &amp; drop) or [`megu-prism-1.21.1.zip`](https://github.com/nekomario28/megu-mc/releases/download/v0.1.0-alpha.2/megu-prism-1.21.1.zip) |
 
-- **Server:** Vanilla 1.21.1 on port **25565** by default, with 51/51 GameRules, 42/42 Enchantments, 39/39 Effects, Vanilla fuels and death messages. Built-in pure-Rust TTY-auto-detect TUI or plain CLI (`--cli`), `systemd` `sd_notify`, Hub `/server`/`/hub`/`/world`, Survival Moderator `/megu mod`, hardened authentication, DDoS and zero-unwrap ingress, and `.mmod` / `.jar` recognition.
-- **Client:** Pure `wgpu` eye-comfort optics (`comfort_exposure`, `indirect_light_bounce`, Snell water refraction, dawn/dusk air-mass optics and three-layer translucent clouds); per-part lit entities, mobs and block entities, mob cascade and contact shadows, universal data-driven dynamic lights (Vanilla, redstone and modded), and 3D/2D enchantment glint. First-launch audio defaults to 50% master / 45% music with a `Loud Sound Limiter` dB display. Installed vs `[+ Browse]` Mod Menu supports in-process Soft Reload; E2EE Friends and LAN use isolated `127.0.0.1:0` hosting. OS locale, clipboard, Japanese IME and a four-line sign editor are supported.
-- **Opt-in extensions (off by default for strict Vanilla parity):** 3D directional shadow-light gameplay (`directional_shadow_light`, `/megu shadowlight on|off`, or the local client Settings toggle); chunk-loader-free O(1) unloaded catch-up (`lazy_catchup`, `/megu lazycatchup on|off`, or the local client Settings toggle); custom-shaped Nether portals (`MEGU_CUSTOM_PORTAL_SHAPES=1`).
+The installer stages `megu-client-gpu` into `<minecraft_dir>/bin/` and registers the **Megu (1.21.1)** launcher profile. On first launch the client reuses an existing 1.21.1 client JAR from the Official Launcher, PrismLauncher or Modrinth App — or fetches and SHA-1-verifies it from Mojang's CDN. No Java, no `-Xmx` tuning: adjust the optional RAM budget slider anytime in **Settings → Video**.
 
-These highlights describe wired capabilities, not a promise of full Vanilla worldgen/AI or arbitrary Java Mixin compatibility. See the [Operator Guide](docs/operator-guide.md) for operational limits.
+**Server admins** — one command from any full platform archive:
 
-## How To (Server Admins &amp; Full CLI Suite)
+```sh
+./megu-installer server --dir ./megu-server
+# Set eula=true in ./megu-server/eula.txt after reviewing the Minecraft EULA:
+cd ./megu-server && ./megu                 # defaults to port 25565
+```
 
-Download the full platform archive (`megu-<version>-<target>.tar.gz`) from **[GitHub Releases](https://github.com/nekomario28/megu-mc/releases/tag/v0.1.0-alpha.2)** (`v0.1.0-alpha.2`). Eight targets are published per release: `windows-x86_64`, `windows-arm64`, `linux-x86_64`, `linux-arm64`, `linux-x86_64-musl`, `linux-arm64-musl`, `macos-arm64`, and `macos-x86_64`. Each archive bundles `megu` (dedicated server), `megu-client-gpu`, `megu-client`, `megu-installer`, `megu-mod-check`, `megu-world-migrate`, `megu-init`, and `megu-admin`; the `*-musl` archives are statically linked and **server-only** (`megu` + `megu-installer`).
+<details>
+<summary><strong>All 8 platform archives (v0.1.0-alpha.2)</strong> — full suite: <code>megu</code>, <code>megu-client-gpu</code>, <code>megu-client</code>, <code>megu-installer</code>, <code>megu-mod-check</code>, <code>megu-world-migrate</code>, <code>megu-init</code>, <code>megu-admin</code></summary>
 
 | Target | Full Archive | Included Binaries |
 | :--- | :--- | :--- |
@@ -71,25 +83,55 @@ Download the full platform archive (`megu-<version>-<target>.tar.gz`) from **[Gi
 
 > **Which binary do I run?** `megu-client-gpu` is the native GPU game client for playing (`megu-client` is the headless/CLI client and status probe); `megu` runs the dedicated server. `megu-client-gpu` obtains Vanilla 1.21.1 assets by itself on first launch, so `megu-installer` is a convenience for staging the binary and launcher profile, never a prerequisite.
 
-```sh
-./megu-installer server --dir ./megu-server
-# Set eula=true in ./megu-server/eula.txt after reviewing the Minecraft EULA:
-cd ./megu-server && ./megu                 # defaults to port 25565
-```
+</details>
 
-- Documentation on configuring and hosting Megu: **[Operator Guide](docs/operator-guide.md)** · **[Security Notes](SECURITY_NOTES.md)**
-- Friend invites without port forwarding, `FRL3` end-to-end encryption and the trust store: **[Friend Play & E2EE](docs/friend-play-e2ee.md)**
-- How existing Fabric / NeoForge mods, tags, capabilities and modded saves are handled: **[Mod Compatibility](docs/mod-compatibility.md)**
-- Docker setup: `docker build -f docker/Dockerfile .`
+## Verified Feature Highlights (upcoming alpha.3)
 
-## How To (Mod & Shader Authors)
+- **Server:** Vanilla 1.21.1 on port **25565** by default, with 51/51 GameRules, 42/42 Enchantments, 39/39 Effects, Vanilla fuels and death messages. Built-in pure-Rust TTY-auto-detect TUI or plain CLI (`--cli`), `systemd` `sd_notify`, Hub `/server`/`/hub`/`/world`, Survival Moderator `/megu mod`, hardened authentication, DDoS and zero-unwrap ingress, and `.mmod` / `.jar` recognition.
+- **Client:** Pure `wgpu` eye-comfort optics (`comfort_exposure`, `indirect_light_bounce`, Snell water refraction, dawn/dusk air-mass optics and three-layer translucent clouds); per-part lit entities, mobs and block entities, mob cascade and contact shadows, universal data-driven dynamic lights (Vanilla, redstone and modded), and 3D/2D enchantment glint. First-launch audio defaults to 50% master / 45% music with a `Loud Sound Limiter` dB display. Installed vs `[+ Browse]` Mod Menu supports in-process Soft Reload; E2EE Friends and LAN use isolated `127.0.0.1:0` hosting. OS locale, clipboard, Japanese IME and a four-line sign editor are supported.
+- **Opt-in extensions (off by default for strict Vanilla parity):** 3D directional shadow-light gameplay (`directional_shadow_light`, `/megu shadowlight on|off`, or the local client Settings toggle); chunk-loader-free O(1) unloaded catch-up (`lazy_catchup`, `/megu lazycatchup on|off`, or the local client Settings toggle); custom-shaped Nether portals (`MEGU_CUSTOM_PORTAL_SHAPES=1`).
+
+These highlights describe wired capabilities, not a promise of full Vanilla worldgen/AI or arbitrary Java Mixin compatibility. See the [Operator Guide](docs/operator-guide.md) for operational limits.
+
+## What You Need
+
+- **No Java, anywhere.** Server and client are pure Rust native binaries — no JVM to install, no `-Xmx` sliders to tune.
+- **Client:** any GPU with Vulkan, DirectX 12 or Metal support; first launch auto-tunes to your hardware. `megu-client-gpu` obtains official 1.21.1 assets itself — reusing your existing launcher JAR or fetching SHA-1-verified files from Mojang's CDN. **Clean-room:** no Mojang code or assets ship in this repository; the client downloads what it needs from Mojang at runtime.
+- **Server:** runs on glibc and static `*-musl` builds alike; import an existing Vanilla world with `--import-anvil` or `MEGU_ANVIL_WORLD_DIR`.
+
+## Platform Support
+
+| Platform | `megu-client-gpu` | `megu` server |
+| :--- | :---: | :---: |
+| Windows x86_64 / arm64 | ✓ | ✓ |
+| macOS arm64 / x86_64 | ✓ | ✓ |
+| Linux x86_64 / arm64 (glibc) | ✓ | ✓ |
+| Linux x86_64 / arm64 (musl, static) | — | ✓ |
+
+## Architecture
+
+13 standalone crates plus the root server — no workspace, each manifest is its own source of truth. Full map: **[Crate Architecture](docs/architecture-crates.md)**.
+
+| Crate | Owns |
+| :--- | :--- |
+| `megu` (root) | Dedicated server — protocol 767 gameplay, tick engine, worldgen, saves |
+| `megu-core` | Canonical version constants, `ResourceLocation`, Java-exact RNG, vanilla math |
+| `megu-proto` | Protocol IR & packet tables (767/777), codec, `VCR1` proximity voice relay |
+| `megu-state-store` | 64-shard runtime store, `STV1` snapshots, `1.21.1 ↔ 26.3` DataFixer, Anvil inspector |
+| `megu-server-files` | `server.properties`/eula/ops persistence, `megu-init`/`megu-admin`, claims &amp; parties |
+| `mod-adapter-core` · `create-adapter` · `mod-offload` | Zero-JVM mod classification, Mixin→Event lifting, Create optimizer, factory/combat kernels |
+| `megu-kernel` · `megu-client-mesh` · `megu-client-ui` | Protocol-767 kernel, voxel mesher + `VFX1` engine, client UI screens |
+| `megu-client` · `megu-client-gpu` | Headless/CLI client; windowed `winit` + `wgpu` GPU client |
+| `megu-mod-sdk` | Typed builders, `.mmod` packaging, in-memory mod test harness |
+
+## Mod &amp; Shader Authors
 
 - Place data-driven Fabric / NeoForge mods in `mods/`, or pre-flight any modpack without a JVM using `megu-mod-check --scan-mods-dir ./mods` (or in your browser at **[megu.megumin.tech/#checker](https://megu.megumin.tech/#checker)**).
 - Native `.mmod` format and `--compat-jar` for Modrinth/CurseForge: **[Mod SDK guide](docs/mod-sdk-guide.md)** · **[SDK agent guide](sdk/AGENTS.md)**
 - Authoring guide & WGSL shader specifications: **[Mod & Shader Author Guide](docs/mod-author-guide.md)**
 - End-to-end handling of embedded JARs, tag namespaces, mod sync and modded saves: **[Mod Compatibility](docs/mod-compatibility.md)**
 
-## How To (Compiling From Source)
+## Building From Source
 
 To compile Megu from source, you need **Rust `1.98.0`** (pinned in [rust-toolchain.toml](rust-toolchain.toml)) and Python 3:
 
@@ -99,8 +141,12 @@ cargo build --locked --release
 ```
 
 - Architecture & local test tiers: **[Development Guide](docs/development.md)** · **[Crate Architecture](docs/architecture-crates.md)**
+- Server configuration & hosting: **[Operator Guide](docs/operator-guide.md)** · **[Security Notes](SECURITY_NOTES.md)** · Docker: `docker build -f docker/Dockerfile .`
+- Friend invites without port forwarding, `FRL3` E2EE and the trust store: **[Friend Play & E2EE](docs/friend-play-e2ee.md)**
 
-## How To (Pull Request)
+## Community &amp; Contributing
+
+Questions and ideas → **[GitHub Discussions](https://github.com/nekomario28/megu-mc/discussions)**; bug reports without a GitHub account → **[web report](https://megu.megumin.tech/#report)**.
 
 See **[Contributing](CONTRIBUTING.md)** and our **[Code of Conduct](CODE_OF_CONDUCT.md)**. All commits require DCO sign-off (`git commit -s`). For security issues, see **[SECURITY.md](SECURITY.md)**.
 
