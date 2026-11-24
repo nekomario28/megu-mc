@@ -49,7 +49,7 @@ use megu_client_mesh::tactile_effects::{
 use megu_client_mesh::vanilla_plus_nature::{
     ActiveSeasonKind, CLOUD_CELL_BLOCKS, CLOUD_SCROLL_BLOCKS_PER_TICK, CloudLighting,
     NatureAmbienceEnv, NatureAmbienceState, NatureModRegistry, SeasonAmbienceInput,
-    compute_cloud_lighting, generate_layered_voxel_clouds, tick_nature_ambience,
+    compute_cloud_lighting, generate_layered_voxel_clouds_with_atmosphere, tick_nature_ambience,
 };
 use megu_client_mesh::{
     BuiltSectionMesh, DIRECTION_BUCKETS, DirectionBuckets, SectionCoord, box_in_frustum,
@@ -1330,6 +1330,145 @@ impl ExternalSectionsDelta {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Gameplay dynamic lights (held items, glowing mobs, dropped glow items)
+// ---------------------------------------------------------------------------
+
+/// Point-light capacity of the WGSL `DynamicLights` UBO — the hard
+/// ceiling every frame's gameplay light list is truncated to before it
+/// merges with the server VFX1 lights on the same binding.
+pub const MAX_DYNAMIC_LIGHTS: usize = 64;
+
+/// One resolved dynamic-light material: linear color temperature, reach
+/// and peak intensity, plus the depth of the organic sinusoidal flicker
+/// applied per frame (`0.0` = steady emitters — lanterns, crystals).
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct DynamicLightSpec {
+    /// Linear-space color temperature of the emitter.
+    pub rgb: [f32; 3],
+    /// Falloff reach in blocks (the UBO's `position_radius.w`).
+    pub radius: f32,
+    /// Peak brightness multiplier (the UBO's `color_intensity.w`).
+    pub intensity: f32,
+    /// `±` fraction of `intensity` the per-tick sine flicker sweeps.
+    pub flicker: f32,
+}
+
+const fn dyn_light_spec(
+    rgb: [f32; 3],
+    radius: f32,
+    intensity: f32,
+    flicker: f32,
+) -> DynamicLightSpec {
+    DynamicLightSpec {
+        rgb,
+        radius,
+        intensity,
+        flicker,
+    }
+}
+
+/// Warm amber shared by every open-flame emitter (~2000K flame).
+const WARM_FLAME_RGB: [f32; 3] = [1.0, 0.78, 0.48];
+/// Cool cyan-teal soul-fire tint.
+const SOUL_FLAME_RGB: [f32; 3] = [0.42, 0.88, 1.0];
+/// Rich golden-orange for lava/magma-tier emitters.
+const MAGMA_RGB: [f32; 3] = [1.0, 0.62, 0.28];
+/// Deep crimson redstone glow.
+const REDSTONE_RGB: [f32; 3] = [1.0, 0.25, 0.2];
+/// Burning-entity flame tint (entity-metadata flag bit `0x01`).
+const ENTITY_FIRE_RGB: [f32; 3] = [1.0, 0.55, 0.2];
+/// `±4%` organic flicker for open flames (sinusoidal, per-tick phase).
+const FLAME_FLICKER: f32 = 0.04;
+/// Flicker angular speed in radians per game tick (~2.2 Hz at 20 tps).
+const FLICKER_RAD_PER_TICK: f32 = 0.7;
+
+/// Burning-entity overlay spec applied to any tracked entity whose
+/// shared flags carry bit `0x01`.
+const ENTITY_FIRE_LIGHT_SPEC: DynamicLightSpec =
+    dyn_light_spec(ENTITY_FIRE_RGB, 8.0, 1.3, 0.08);
+
+/// Vanilla 1.21.1 held/dropped item -> dynamic point light: color
+/// temperature, reach and flicker per emitter family, `None` for
+/// non-glowing items. `item_name` accepts `minecraft:torch` and bare
+/// `torch` alike; `submerged` quenches open flames (torch/wall torch and
+/// campfire drown — enclosed lanterns and carved pumpkins keep burning
+/// underwater, matching the vanilla block behavior).
+pub fn item_dynamic_light_spec(
+    item_name: &str,
+    submerged: bool,
+) -> Option<DynamicLightSpec> {
+    let path = item_name.rsplit(':').next().unwrap_or(item_name);
+    if submerged && matches!(path, "torch" | "wall_torch" | "campfire") {
+        return None;
+    }
+    let spec = match path {
+        // Warm flame family — 12..=14 reach, ±4% sinusoidal flicker.
+        "torch" | "wall_torch" => dyn_light_spec(WARM_FLAME_RGB, 12.0, 1.9, FLAME_FLICKER),
+        "campfire" => dyn_light_spec(WARM_FLAME_RGB, 14.0, 2.0, FLAME_FLICKER),
+        "lantern" => dyn_light_spec(WARM_FLAME_RGB, 13.0, 1.8, FLAME_FLICKER),
+        "jack_o_lantern" => dyn_light_spec(WARM_FLAME_RGB, 14.0, 2.0, FLAME_FLICKER),
+        // Soul flame family — cooler, tighter cyan-teal reach.
+        "soul_torch" | "soul_lantern" | "soul_campfire" => {
+            dyn_light_spec(SOUL_FLAME_RGB, 10.0, 1.5, 0.0)
+        }
+        // Magma / lava tier — the brightest golden-orange emitters.
+        "lava_bucket" => dyn_light_spec(MAGMA_RGB, 15.0, 2.4, 0.0),
+        "magma_block" => dyn_light_spec(MAGMA_RGB, 13.0, 1.6, 0.0),
+        "blaze_rod" | "blaze_powder" => dyn_light_spec(MAGMA_RGB, 13.0, 1.4, 0.0),
+        "glowstone" | "shroomlight" => dyn_light_spec(MAGMA_RGB, 14.0, 2.0, 0.0),
+        "ochre_froglight" => dyn_light_spec(MAGMA_RGB, 15.0, 2.2, 0.0),
+        // Sea / crystal tier — crisp aqua, pearl and lavender tints.
+        "sea_lantern" => dyn_light_spec([0.62, 0.95, 0.9], 14.0, 2.0, 0.0),
+        "pearlescent_froglight" => dyn_light_spec([0.9, 0.78, 1.0], 14.0, 2.0, 0.0),
+        "verdant_froglight" => dyn_light_spec([0.55, 1.0, 0.75], 14.0, 2.0, 0.0),
+        "end_rod" => dyn_light_spec([0.88, 0.92, 1.0], 13.0, 1.8, 0.0),
+        "beacon" => dyn_light_spec([0.85, 0.92, 1.0], 14.0, 2.0, 0.0),
+        "amethyst_cluster" => dyn_light_spec([0.78, 0.62, 1.0], 9.0, 1.0, 0.0),
+        "glow_berries" => dyn_light_spec([0.9, 1.0, 0.5], 10.0, 1.2, 0.0),
+        "glow_ink_sac" => dyn_light_spec([0.45, 0.9, 1.0], 9.0, 1.0, 0.0),
+        // Redstone — the dim, deep-crimson circuitry glow.
+        "redstone_torch" | "redstone_block" => dyn_light_spec(REDSTONE_RGB, 7.0, 0.9, 0.0),
+        _ => return None,
+    };
+    Some(spec)
+}
+
+/// Naturally luminous vanilla mobs/projectiles -> dynamic light, keyed
+/// on the `minecraft:`-prefixed rig names [`EntityRigSpec::name`] carries.
+/// The generic on-fire overlay is [`ENTITY_FIRE_LIGHT_SPEC`].
+fn entity_dynamic_light_spec(name: &str) -> Option<DynamicLightSpec> {
+    let spec = match name {
+        "minecraft:blaze" => dyn_light_spec(MAGMA_RGB, 14.0, 2.0, FLAME_FLICKER),
+        "minecraft:magma_cube" => dyn_light_spec(MAGMA_RGB, 9.0, 1.2, FLAME_FLICKER),
+        "minecraft:fireball" | "minecraft:dragon_fireball" => {
+            dyn_light_spec(ENTITY_FIRE_RGB, 14.0, 2.4, 0.08)
+        }
+        "minecraft:small_fireball" => dyn_light_spec(ENTITY_FIRE_RGB, 10.0, 1.6, 0.08),
+        "minecraft:glow_squid" => dyn_light_spec([0.45, 0.9, 1.0], 10.0, 1.2, 0.0),
+        "minecraft:spectral_arrow" => dyn_light_spec([1.0, 0.85, 0.35], 8.0, 1.2, 0.0),
+        "minecraft:end_crystal" => dyn_light_spec([0.85, 0.6, 1.0], 10.0, 1.4, 0.0),
+        "minecraft:allay" => dyn_light_spec([0.55, 0.85, 1.0], 6.0, 0.9, 0.0),
+        _ => return None,
+    };
+    Some(spec)
+}
+
+/// `radius * intensity` reach-power heuristic used to pick the single
+/// brightest candidate when one anchor offers several light sources
+/// (mainhand vs offhand, mob glow vs held torch).
+fn brightest_light_spec(
+    a: Option<DynamicLightSpec>,
+    b: Option<DynamicLightSpec>,
+) -> Option<DynamicLightSpec> {
+    let power = |s: DynamicLightSpec| s.radius * s.intensity;
+    match (a, b) {
+        (Some(x), Some(y)) => Some(if power(x) >= power(y) { x } else { y }),
+        (x, None) => x,
+        (None, y) => y,
+    }
+}
+
 /// Owns UI-facing world data on the event-loop thread. The worker owns its socket.
 pub struct LiveSession {
     incoming: Receiver<WorkerMessage>,
@@ -1690,10 +1829,14 @@ pub struct LiveSession {
     pub place_recipe_requests: Vec<(u8, String, bool)>,
     /// Integer-cell key the layered voxel-cloud mesh was last generated
     /// for: `(cloud_cx, cloud_cz, scroll_cell, cloud_layers,
-    /// cloud_height_bits)`. Between key hits only the sub-cell X offset
-    /// changes, which slides through the existing `SubWorld` model
-    /// matrix instead of rebuilding the mesh.
-    cloud_mesh_key: Option<(i64, i64, i64, u32, u32)>,
+    /// cloud_height_bits, clouds_gate_open)`. Between key hits only the
+    /// sub-cell X offset changes, which slides through the existing
+    /// `SubWorld` model matrix instead of rebuilding the mesh. The gate
+    /// flag is the atmosphere/dimension check
+    /// [`generate_layered_voxel_clouds_with_atmosphere`] applies —
+    /// without it a dimension swap or an orbit-ascent blend could keep a
+    /// stale cloud sheet alive on the reuse path below.
+    cloud_mesh_key: Option<(i64, i64, i64, u32, u32, bool)>,
     /// Quantized (1/32) cloud-lighting key for the cached mesh: weather
     /// or day-phase shifts that change the baked tint force a
     /// regenerate even inside one cell.
@@ -2355,6 +2498,174 @@ impl LiveSession {
             ]
         });
         self.vfx.frame_output(forward).lights
+    }
+
+    /// `true` while the local player's eye block contains fluid — quenches
+    /// held open-flame dynamic lights and feeds the tactile wetness/drip
+    /// tracker (vanilla eye height 1.62 above the feet pose).
+    pub fn player_eye_submerged(&self) -> bool {
+        self.pose.is_some_and(|pose| {
+            self.world
+                .fluid_cell_at(
+                    pose.feet[0].floor() as i32,
+                    (pose.feet[1] + 1.62).floor() as i32,
+                    pose.feet[2].floor() as i32,
+                )
+                .kind
+                .is_some()
+        })
+    }
+
+    /// This frame's gameplay-driven dynamic lights for the 64-light WGSL
+    /// UBO: the local player's brightest held emitter (mainhand/offhand,
+    /// open flames quenched while the eyes are submerged), remote-entity
+    /// held glow from `entity_equipment`, naturally luminous mobs,
+    /// burning entities (metadata flag bit `0x01`) and dropped glowing
+    /// item stacks — every candidate resolved through
+    /// [`item_dynamic_light_spec`]/[`entity_dynamic_light_spec`], sorted
+    /// nearest-first to `camera` and truncated to [`MAX_DYNAMIC_LIGHTS`].
+    /// Returns an empty `Vec` while the world-effects pack is off
+    /// (`settings.visual.world_effects` -> `nature.enabled`), so the
+    /// settings' Off switch emits zero held/entity dynamic lights.
+    pub fn collect_dynamic_lights(
+        &self,
+        camera: [f32; 3],
+    ) -> Vec<megu_client_mesh::vfx_engine::DynamicColoredLight> {
+        use megu_client_mesh::vfx_engine::DynamicColoredLight;
+        if !self.vanilla_plus_cfg.nature.enabled {
+            return Vec::new();
+        }
+        let ticks = self.world_time_ticks();
+        let mut candidates: Vec<(f32, DynamicColoredLight)> = Vec::new();
+        let mut push = |pos: [f32; 3], spec: DynamicLightSpec, phase: f32| {
+            let intensity = if spec.flicker > 0.0 {
+                spec.intensity
+                    * (1.0
+                        + spec.flicker
+                            * (ticks as f32 * FLICKER_RAD_PER_TICK + phase).sin())
+            } else {
+                spec.intensity
+            };
+            let delta = [
+                pos[0] - camera[0],
+                pos[1] - camera[1],
+                pos[2] - camera[2],
+            ];
+            candidates.push((
+                delta[0] * delta[0] + delta[1] * delta[1] + delta[2] * delta[2],
+                DynamicColoredLight {
+                    pos,
+                    rgb: spec.rgb,
+                    radius: spec.radius,
+                    intensity,
+                    // Rebuilt every frame — a two-tick TTL only matters if
+                    // a consumer ever feeds these through the VFX engine.
+                    ttl_ticks: 2,
+                    priority: 1,
+                },
+            ));
+        };
+        // Local player: brightest of mainhand (window-0 container slot
+        // 36 + selected hotbar index) and offhand (slot 45), anchored at
+        // the vanilla eye position.
+        if let Some(pose) = self.pose {
+            let submerged = self.player_eye_submerged();
+            let held = [36 + self.hud.selected_slot.min(8) as i32, 45]
+                .into_iter()
+                .filter_map(|slot| self.player_inventory.get(&slot))
+                .filter(|stack| stack.item_id > 0 && stack.count > 0)
+                .fold(None, |best, stack| {
+                    brightest_light_spec(
+                        best,
+                        item_dynamic_light_spec(
+                            &crate::recipe_ingest::item_name_for_id(stack.item_id as u32),
+                            submerged,
+                        ),
+                    )
+                });
+            if let Some(spec) = held {
+                push(
+                    [
+                        pose.feet[0] as f32,
+                        (pose.feet[1] + 1.62) as f32,
+                        pose.feet[2] as f32,
+                    ],
+                    spec,
+                    0.0,
+                );
+            }
+        }
+        // Remote entities: luminous mobs, burning entities, dropped glow
+        // items and equipment-held emitters — one light per entity, the
+        // brightest candidate winning. The entity's own center-cell fluid
+        // check quenches held open flames underwater just like the local
+        // player's eye check.
+        for (eid, rig, pos, _tracked) in self.entity_render_entries() {
+            if Some(eid) == self.player_entity_id {
+                continue;
+            }
+            let center = [
+                pos[0] as f32,
+                (pos[1] + f64::from(rig.height) * 0.5) as f32,
+                pos[2] as f32,
+            ];
+            let submerged = self
+                .world
+                .fluid_cell_at(
+                    center[0].floor() as i32,
+                    center[1].floor() as i32,
+                    center[2].floor() as i32,
+                )
+                .kind
+                .is_some();
+            let held_item_spec = |stack: &ItemStackComponents| {
+                item_dynamic_light_spec(
+                    &crate::recipe_ingest::item_name_for_id(stack.item_id as u32),
+                    submerged,
+                )
+            };
+            let mut spec = entity_dynamic_light_spec(rig.name);
+            if self
+                .entity_metadata
+                .get(&eid)
+                .and_then(|meta| meta.flags)
+                .is_some_and(|flags| flags & 0x01 != 0)
+            {
+                spec = brightest_light_spec(spec, Some(ENTITY_FIRE_LIGHT_SPEC));
+            }
+            // `minecraft:item` drops carry their stack in metadata index 8.
+            if rig.name == "minecraft:item" {
+                spec = brightest_light_spec(
+                    spec,
+                    self.entity_metadata
+                        .get(&eid)
+                        .and_then(|meta| meta.item_stack.as_ref())
+                        .filter(|stack| stack.item_id > 0 && stack.count > 0)
+                        .and_then(held_item_spec),
+                );
+            }
+            // Vanilla equipment slots 0/1 = mainhand/offhand — remote
+            // players and item-carrying mobs glow with what they hold.
+            for slot in 0u8..=1 {
+                spec = brightest_light_spec(
+                    spec,
+                    self.entity_equipment
+                        .get(&(eid, slot))
+                        .filter(|stack| stack.item_id > 0 && stack.count > 0)
+                        .and_then(held_item_spec),
+                );
+            }
+            if let Some(spec) = spec {
+                // Golden-ratio phase decorrelates the flicker between
+                // nearby flames so they never pulse in lockstep.
+                push(center, spec, eid as f32 * 0.618_034);
+            }
+        }
+        candidates.sort_by(|a, b| {
+            a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal)
+        });
+        candidates.truncate(MAX_DYNAMIC_LIGHTS);
+        candidates.into_iter().map(|(_, light)| light).collect()
     }
 
     /// Drain the sections whose meshes finished VRAM upload and release
@@ -4296,17 +4607,23 @@ impl LiveSession {
 
     /// Regenerate the layered voxel-cloud sheet from the live camera/world
     /// time and mirror it into `subworlds` for the translucent lit pass.
-    /// Cells come from `generate_layered_voxel_clouds`; the pack's
-    /// `enabled`/`layered_voxel_clouds` toggles gate emission (an empty set
-    /// removes the sheet instead of leaving a stale frame).
+    /// Cells come from [`generate_layered_voxel_clouds_with_atmosphere`]:
+    /// skylight-bearing dimensions with a non-vacuum atmosphere (the
+    /// `DimensionAdaptationPolicy::enable_voxel_clouds` intent, resolved
+    /// here through `dimension.has_skylight` + the blender's air-density
+    /// proxy) emit cells, while Nether/End/vacuum-orbit produce an empty
+    /// set — the pack's `enabled`/`layered_voxel_clouds` toggles gate on
+    /// top of that (an empty set removes the sheet instead of leaving a
+    /// stale frame).
     ///
     /// The mesh is cached on the integer cell grid `(cloud_cx, cloud_cz,
-    /// scroll_cell, cloud_layers, cloud_height)`: `generate` bakes
-    /// `cx*cell - scroll` into `min.x`, so feeding the cell-aligned
-    /// canonical tick produces a mesh whose only drift inside one cell is
-    /// the sub-cell X remainder — applied to the existing `SubWorld`
-    /// model matrix via `set_transform` instead of a geometry rebuild.
-    /// `cloud_mesh_reuses` counts the matrix-only slides.
+    /// scroll_cell, cloud_layers, cloud_height, clouds_gate_open)`:
+    /// `generate` bakes `cx*cell - scroll` into `min.x`, so feeding the
+    /// cell-aligned canonical tick produces a mesh whose only drift
+    /// inside one cell is the sub-cell X remainder — applied to the
+    /// existing `SubWorld` model matrix via `set_transform` instead of a
+    /// geometry rebuild. `cloud_mesh_reuses` counts the matrix-only
+    /// slides.
     pub fn refresh_voxel_clouds(&mut self) {
         let (cam_x, cam_z) = self
             .pose
@@ -4329,12 +4646,20 @@ impl LiveSession {
         let cloud_cx = ((f64::from(cam_x) + canon_scroll) / cell).floor() as i64;
         let cloud_cz = (f64::from(cam_z) / cell).floor() as i64;
         let nature = &self.vanilla_plus_cfg.nature;
+        // The gate `generate_layered_voxel_clouds_with_atmosphere`
+        // applies (`allow_clouds` + `density >= MIN_SKY_ATMOSPHERE`) must
+        // ride in the mesh key: without it the reuse branch below could
+        // keep a stale sheet alive through a dimension swap or the
+        // orbit-ascent fog blend crossing the threshold.
+        let clouds_open =
+            self.world.dimension.has_skylight && self.tactile_atmosphere_density() >= 0.15;
         let key = (
             cloud_cx,
             cloud_cz,
             scroll_cell,
             u32::from(nature.effective_cloud_layers()),
             nature.effective_cloud_height().to_bits(),
+            clouds_open,
         );
         // Sub-cell drift this frame: the model matrix slides the cached
         // mesh by the fraction of a cell scrolled since the last boundary.
@@ -4359,7 +4684,14 @@ impl LiveSession {
             self.cloud_mesh_reuses += 1;
             return;
         }
-        let cells = generate_layered_voxel_clouds(nature, cam_x, cam_z, canon_ticks);
+        let cells = generate_layered_voxel_clouds_with_atmosphere(
+            nature,
+            cam_x,
+            cam_z,
+            canon_ticks,
+            self.tactile_atmosphere_density(),
+            self.world.dimension.has_skylight,
+        );
         if cells.is_empty() {
             self.subworlds.remove(CLOUD_SUBWORLD_ID);
             self.cloud_mesh_key = None;
@@ -6308,6 +6640,14 @@ impl LiveSession {
         self.atmosphere_blender
             .set_target(self.base_atmosphere_target);
         self.atmosphere_blender.snap_to_target();
+        // The atmosphere gate on layered voxel clouds flips with the
+        // dimension (Nether/End/vacuum lose `has_skylight` and the fog
+        // blend restarts at a new density) — drop the cached sheet so the
+        // next `refresh_voxel_clouds` evaluates the gate fresh instead of
+        // matrix-sliding a stale overworld mesh.
+        self.subworlds.remove(CLOUD_SUBWORLD_ID);
+        self.cloud_mesh_key = None;
+        self.cloud_mesh_lighting_key = None;
     }
 
     fn apply_custom(&mut self, channel: ClientCustomChannelEvent) -> Result<(), String> {
@@ -10286,5 +10626,257 @@ mod tests {
                 "seeded dispatcher must complete /{cmd} from /{prefix}"
             );
         }
+    }
+
+
+    // ------------------------------------------------------------------
+    // REALISM-DYNAMIC-LIGHTS-LIVE
+    // ------------------------------------------------------------------
+
+    fn item_id(name: &str) -> i32 {
+        megu_proto::table::ProtocolTable::v767_builtin()
+            .registry_id("minecraft:item", name)
+            .unwrap_or_else(|| panic!("builtin item table must know {name}"))
+            as i32
+    }
+
+    fn stack(item_id: i32) -> ItemStackComponents {
+        ItemStackComponents {
+            count: 1,
+            item_id,
+            added: Vec::new(),
+            removed: Vec::new(),
+        }
+    }
+
+    fn slot_wire(item_id: i32) -> Vec<u8> {
+        let mut wire = Vec::new();
+        write_varint(&mut wire, 1);
+        write_varint(&mut wire, item_id);
+        write_varint(&mut wire, 0);
+        write_varint(&mut wire, 0);
+        wire
+    }
+
+    fn add_entity(live: &mut LiveSession, eid: i32, entity_type: i32, pos: [f64; 3]) {
+        live.apply_event(ClientPlayEvent::Play(PlayEvent::AddEntity {
+            eid,
+            uuid: [eid as u8; 16],
+            entity_type,
+            x: pos[0],
+            y: pos[1],
+            z: pos[2],
+            pitch: 0.0,
+            yaw: 0.0,
+            head_yaw: 0.0,
+            data: 0,
+            vx: 0.0,
+            vy: 0.0,
+            vz: 0.0,
+        }))
+        .unwrap();
+    }
+
+    #[test]
+    fn item_dynamic_light_spec_maps_emitter_families() {
+        let torch = item_dynamic_light_spec("minecraft:torch", false).unwrap();
+        assert_eq!(torch.rgb, [1.0, 0.78, 0.48]);
+        assert_eq!(torch.radius, 12.0);
+        assert_eq!(torch.flicker, 0.04);
+        // Bare paths resolve the same as namespaced ids.
+        assert_eq!(item_dynamic_light_spec("torch", false), Some(torch));
+
+        // Open flames drown; enclosed lanterns keep burning underwater.
+        assert_eq!(item_dynamic_light_spec("minecraft:torch", true), None);
+        assert_eq!(item_dynamic_light_spec("minecraft:campfire", true), None);
+        assert_eq!(item_dynamic_light_spec("minecraft:wall_torch", true), None);
+        assert!(item_dynamic_light_spec("minecraft:lantern", true).is_some());
+        assert!(item_dynamic_light_spec("minecraft:jack_o_lantern", true).is_some());
+
+        let soul = item_dynamic_light_spec("minecraft:soul_lantern", false).unwrap();
+        assert_eq!(soul.rgb, [0.42, 0.88, 1.0]);
+        assert_eq!(soul.radius, 10.0);
+
+        let lava = item_dynamic_light_spec("minecraft:lava_bucket", false).unwrap();
+        assert_eq!(lava.rgb, [1.0, 0.62, 0.28]);
+        assert!((13.0..=15.0).contains(&lava.radius));
+
+        let sea = item_dynamic_light_spec("minecraft:sea_lantern", false).unwrap();
+        assert!(sea.rgb[1] > sea.rgb[0], "sea lantern must tint aqua");
+        assert!((9.0..=14.0).contains(&sea.radius));
+
+        let redstone = item_dynamic_light_spec("minecraft:redstone_torch", false).unwrap();
+        assert_eq!(redstone.rgb, [1.0, 0.25, 0.2]);
+        assert_eq!(redstone.radius, 7.0);
+
+        assert_eq!(item_dynamic_light_spec("minecraft:stone", false), None);
+    }
+
+    #[test]
+    fn collect_dynamic_lights_held_torch_eye_anchor_and_settings_gate() {
+        let (mut live, _tx) = session();
+        live.pose = Some(PlayerPose {
+            feet: [8.0, 64.0, 8.0],
+            yaw: 0.0,
+            pitch: 0.0,
+        });
+        live.hud.selected_slot = 0;
+        live.player_inventory
+            .insert(36, stack(item_id("minecraft:torch")));
+
+        // world_effects Off -> zero held/entity lights.
+        assert!(live.collect_dynamic_lights([8.0, 64.0, 8.0]).is_empty());
+
+        live.vanilla_plus_cfg.nature.enabled = true;
+        let lights = live.collect_dynamic_lights([8.0, 64.0, 8.0]);
+        assert_eq!(lights.len(), 1);
+        let torch = &lights[0];
+        assert_eq!(torch.rgb, [1.0, 0.78, 0.48]);
+        assert_eq!(torch.pos, [8.0, 65.62, 8.0]);
+        let spec = item_dynamic_light_spec("minecraft:torch", false).unwrap();
+        let jitter = spec.intensity * spec.flicker;
+        assert!(
+            (torch.intensity - spec.intensity).abs() <= jitter + 1e-6,
+            "flicker must stay inside the ±4% band: {} vs {}",
+            torch.intensity,
+            spec.intensity
+        );
+
+        // The brighter of the two hands wins: offhand lava bucket beats
+        // the mainhand torch.
+        live.player_inventory
+            .insert(45, stack(item_id("minecraft:lava_bucket")));
+        let lights = live.collect_dynamic_lights([8.0, 64.0, 8.0]);
+        assert_eq!(lights.len(), 1);
+        assert_eq!(lights[0].rgb, [1.0, 0.62, 0.28]);
+        assert_eq!(lights[0].radius, 15.0);
+    }
+
+    #[test]
+    fn collect_dynamic_lights_mobs_fire_drops_and_remote_held_items() {
+        let (mut live, _tx) = session();
+        live.vanilla_plus_cfg.nature.enabled = true;
+
+        // Blaze (type 8) and glow squid (type 48) emit on their own.
+        add_entity(&mut live, 10, 8, [4.0, 64.0, 0.0]);
+        add_entity(&mut live, 11, 48, [-4.0, 64.0, 0.0]);
+        // A zombie (type 124) is dark until the on-fire flag lands.
+        add_entity(&mut live, 12, 124, [0.0, 64.0, 4.0]);
+        // Dropped torch: `minecraft:item` (type 58) + metadata slot 8.
+        add_entity(&mut live, 13, 58, [0.0, 64.0, -4.0]);
+        let mut item_meta = vec![8u8, 7];
+        item_meta.extend_from_slice(&slot_wire(item_id("minecraft:torch")));
+        item_meta.push(0xFF);
+        live.apply_event(ClientPlayEvent::Play(PlayEvent::SetEntityData {
+            eid: 13,
+            raw_entries: item_meta,
+        }))
+        .unwrap();
+        // Remote player (type 128) holding a torch in mainhand slot 0.
+        add_entity(&mut live, 14, 128, [6.0, 64.0, 6.0]);
+        live.apply_event(ClientPlayEvent::Play(PlayEvent::SetEquipment {
+            eid: 14,
+            entries: vec![EquipmentEntry {
+                slot: 0,
+                item_wire: slot_wire(item_id("minecraft:torch")),
+            }],
+        }))
+        .unwrap();
+
+        let lights = live.collect_dynamic_lights([0.0, 64.0, 0.0]);
+        // Blaze, glow squid, dropped torch and the remote torch-holder:
+        // four lights (the zombie stays dark until it burns).
+        assert_eq!(lights.len(), 4);
+        // Nearest-first ordering for the UBO pack: the farthest remote
+        // player (dist² ~72.8) sorts last.
+        assert_eq!(lights[3].pos, [6.0, 64.9, 6.0]);
+        assert!(
+            lights.iter().any(|l| l.rgb == [1.0, 0.62, 0.28]),
+            "blaze must glow magma-gold: {lights:?}"
+        );
+        assert!(
+            lights.iter().any(|l| l.rgb == [0.45, 0.9, 1.0]),
+            "glow squid must tint aqua: {lights:?}"
+        );
+        assert!(
+            lights
+                .iter()
+                .filter(|l| l.rgb == [1.0, 0.78, 0.48])
+                .count()
+                == 2,
+            "dropped + remote-held torches: {lights:?}"
+        );
+
+        // On-fire flag bit 0x01 lights even a non-luminous mob.
+        live.apply_event(ClientPlayEvent::Play(PlayEvent::SetEntityData {
+            eid: 12,
+            raw_entries: vec![0, 0, 0x01, 0xFF],
+        }))
+        .unwrap();
+        let lights = live.collect_dynamic_lights([0.0, 64.0, 0.0]);
+        assert_eq!(lights.len(), 5);
+        assert!(
+            lights.iter().any(|l| l.rgb == ENTITY_FIRE_RGB),
+            "burning zombie must carry the fire overlay: {lights:?}"
+        );
+    }
+
+    #[test]
+    fn collect_dynamic_lights_caps_at_wgsl_64_light_budget() {
+        let (mut live, _tx) = session();
+        live.vanilla_plus_cfg.nature.enabled = true;
+        // 80 blazes receding along +X from the camera.
+        for index in 0..80 {
+            add_entity(
+                &mut live,
+                1000 + index,
+                8,
+                [(index + 1) as f64, 64.0, 0.0],
+            );
+        }
+        let lights = live.collect_dynamic_lights([0.0, 64.0, 0.0]);
+        assert_eq!(lights.len(), MAX_DYNAMIC_LIGHTS);
+        // The sort is stable nearest-first: the last admitted light is
+        // closer than the first rejected one would have been.
+        let farthest_kept = lights.iter().map(|l| l.pos[0]).fold(0.0f32, f32::max);
+        assert!(
+            farthest_kept <= MAX_DYNAMIC_LIGHTS as f32 + 0.5,
+            "only the 64 nearest lights may be packed: {farthest_kept}"
+        );
+    }
+
+    #[test]
+    fn voxel_clouds_follow_the_atmosphere_gate() {
+        let (mut live, _tx) = session();
+        live.vanilla_plus_cfg.nature.enabled = true;
+        live.refresh_voxel_clouds();
+        assert!(
+            live.subworlds.get(CLOUD_SUBWORLD_ID).is_some(),
+            "overworld default must emit a layered cloud sheet"
+        );
+
+        // Nether/End semantics: no skylight -> no cloud sheet.
+        live.world.dimension.has_skylight = false;
+        live.refresh_voxel_clouds();
+        assert!(
+            live.subworlds.get(CLOUD_SUBWORLD_ID).is_none(),
+            "skylight-less dimension must drop the cloud sheet"
+        );
+
+        // Back to the overworld: clouds return ...
+        live.world.dimension.has_skylight = true;
+        live.refresh_voxel_clouds();
+        assert!(live.subworlds.get(CLOUD_SUBWORLD_ID).is_some());
+
+        // ... then the vacuum-orbit blend (zero atmosphere density)
+        // removes them again.
+        live.atmosphere_blender
+            .set_target(AtmosphereParams::vacuum_orbit());
+        live.atmosphere_blender.snap_to_target();
+        live.refresh_voxel_clouds();
+        assert!(
+            live.subworlds.get(CLOUD_SUBWORLD_ID).is_none(),
+            "vacuum atmosphere must suppress voxel clouds"
+        );
     }
 }

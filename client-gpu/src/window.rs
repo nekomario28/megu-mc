@@ -487,6 +487,22 @@ impl CameraController {
     }
 }
 
+/// Voxel-cloud stratum count for the active quality ladder: `Fast`
+/// trims to a single layer, `Balanced`/untuned settings keep the
+/// pack's two-layer look, and `High`/`Ultra` — plus the cinematic
+/// `MeguNatural` visual preset — earn a third stratum for parallax
+/// depth. Clamped to the pack's `1..=3` contract.
+fn cloud_layers_for_settings(settings: &UiSettings) -> u8 {
+    if matches!(settings.visual.preset, VisualStylePreset::MeguNatural) {
+        return 3;
+    }
+    match settings.video.preset {
+        VideoPreset::Fast => 1,
+        VideoPreset::Balanced | VideoPreset::Custom => 2,
+        VideoPreset::High | VideoPreset::Ultra => 3,
+    }
+}
+
 fn finite_clamp(value: f32, fallback: f32, low: f32, high: f32) -> f32 {
     if value.is_finite() {
         value.clamp(low, high)
@@ -1884,6 +1900,7 @@ impl GpuApp {
             live.set_chat_history_limit(settings.qol.chat_history_lines);
             live.vanilla_plus_cfg.three_d.enabled = settings.visual.blocks_and_skins_3d;
             live.vanilla_plus_cfg.nature.enabled = settings.visual.world_effects;
+            live.vanilla_plus_cfg.nature.cloud_layers = cloud_layers_for_settings(settings);
             let detail = &settings.visual.world_effects_detail;
             let tactile = live.tactile_config().clone();
             live.set_tactile_config(TactileEffectsConfig {
@@ -4379,17 +4396,7 @@ impl GpuApp {
             // at the working-set bound, V2).
             live.release_uploaded_cpu_copies(&mut active.renderer);
             // Tactile weather/touch sim ticks on the render clock.
-            let submerged = live.pose.is_some_and(|pose| {
-                let eye = [
-                    pose.feet[0].floor() as i32,
-                    (pose.feet[1] + 1.62).floor() as i32,
-                    pose.feet[2].floor() as i32,
-                ];
-                live.world
-                    .fluid_cell_at(eye[0], eye[1], eye[2])
-                    .kind
-                    .is_some()
-            });
+            let submerged = live.player_eye_submerged();
             live.step_tactile_frame(
                 dt,
                 live.world_time_ticks(),
@@ -4551,7 +4558,17 @@ impl GpuApp {
                         // light UBO (`dynamic_colored_lights` did the
                         // same call and discarded the rest) and the
                         // particle staging below.
-                        let vfx_frame = live.vfx.frame_output(render_camera.forward_vector());
+                        let mut vfx_frame =
+                            live.vfx.frame_output(render_camera.forward_vector());
+                        // Gameplay dynamic lights (held torches, glowing
+                        // mobs, dropped glow items) share the 64-light
+                        // WGSL UBO with the server VFX1 lights —
+                        // nearest-first, budget-capped inside
+                        // `collect_dynamic_lights`, empty while the
+                        // world-effects setting is Off.
+                        vfx_frame
+                            .lights
+                            .extend(live.collect_dynamic_lights(render_camera.position));
                         Self::stage_live_particles(
                             live,
                             &vfx_frame,
@@ -8281,5 +8298,40 @@ mod tests {
         assert_eq!(r.read_string(384).unwrap(), "l3");
         assert_eq!(r.read_string(384).unwrap(), "");
         assert_eq!(r.remaining(), 0);
+    }
+
+    /// REALISM-DYNAMIC-LIGHTS-LIVE: the quality ladder drives the
+    /// layered voxel-cloud stratum count through `apply_settings` —
+    /// `Balanced` keeps 2 layers, `High`/`Ultra` and the cinematic
+    /// `MeguNatural` preset earn 3, `Fast` trims to 1.
+    #[test]
+    fn apply_settings_scales_voxel_cloud_layers_with_the_quality_ladder() {
+        fn layers(video: VideoPreset, visual: VisualStylePreset) -> u8 {
+            let mut app = GpuApp::new(GpuCliConfig::default());
+            let (_tx, incoming) = std::sync::mpsc::sync_channel(8);
+            let (outgoing, _rx) = std::sync::mpsc::sync_channel(8);
+            app.attach_live(LiveSession::with_channels(incoming, outgoing));
+            let mut settings = UiSettings::default();
+            settings.video.preset = video;
+            settings.visual.preset = visual;
+            app.apply_settings(&settings);
+            app.live
+                .as_ref()
+                .unwrap()
+                .vanilla_plus_cfg
+                .nature
+                .cloud_layers
+        }
+
+        assert_eq!(layers(VideoPreset::Fast, VisualStylePreset::Vanilla), 1);
+        assert_eq!(layers(VideoPreset::Balanced, VisualStylePreset::Vanilla), 2);
+        assert_eq!(layers(VideoPreset::High, VisualStylePreset::Vanilla), 3);
+        assert_eq!(layers(VideoPreset::Ultra, VisualStylePreset::Vanilla), 3);
+        // Cinematic visual preset wins the third stratum even on the
+        // balanced video preset.
+        assert_eq!(
+            layers(VideoPreset::Balanced, VisualStylePreset::MeguNatural),
+            3
+        );
     }
 }
