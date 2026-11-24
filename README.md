@@ -30,6 +30,8 @@ Choose **one** category below from the **[Downloads page](https://megu.megumin.t
 Automatically downloads/stages `megu-client-gpu` into `<minecraft_dir>/bin/` and registers the **Megu (1.21.1)** profile in the Official Minecraft Launcher (run with `gui` / `--gui` for the graphical dialog, or default 1-click install):
 
 > **No terminal step required before playing.** On first launch, `megu-client-gpu` reuses an existing 1.21.1 client JAR from the Official Launcher, PrismLauncher, or Modrinth App, or fetches and SHA-1-verifies it from Mojang's CDN in the background. `megu-installer` only stages the binary and launcher profile.
+>
+> **No Java memory tuning:** Megu runs natively in Rust (zero JVM / zero OpenGL). You do **not** need to tune Java `-Xmx` memory sliders in the Official Launcher or Prism — Megu manages memory automatically. Adjust the optional RAM budget slider (with automatic cache eviction under memory pressure) anytime in **Settings → Video**.
 
 | OS | File / Command | Description |
 | :--- | :--- | :--- |
@@ -43,6 +45,14 @@ Automatically downloads/stages `megu-client-gpu` into `<minecraft_dir>/bin/` and
 | :--- | :--- | :--- |
 | **Modrinth App / Prism Launcher** | **[`megu-1.21.1.mrpack`](https://github.com/nekomario28/megu-mc/releases/download/v0.1.0-alpha.2/megu-1.21.1.mrpack)** | Standard Modrinth `.mrpack` modpack — drag &amp; drop directly into your launcher |
 | **Prism Launcher (Native ZIP)** | **[`megu-prism-1.21.1.zip`](https://github.com/nekomario28/megu-mc/releases/download/v0.1.0-alpha.2/megu-prism-1.21.1.zip)** | Pre-configured Prism instance archive (or generate locally via `megu-installer prism`) |
+
+## Verified feature highlights (upcoming alpha.3)
+
+- **Server:** Vanilla 1.21.1 on port **25565** by default, with 51/51 GameRules, 42/42 Enchantments, 39/39 Effects, Vanilla fuels and death messages. Built-in pure-Rust TTY-auto-detect TUI or plain CLI (`--cli`), `systemd` `sd_notify`, Hub `/server`/`/hub`/`/world`, Survival Moderator `/megu mod`, hardened authentication, DDoS and zero-unwrap ingress, and `.mmod` / `.jar` recognition.
+- **Client:** Pure `wgpu` eye-comfort optics (`comfort_exposure`, `indirect_light_bounce`, Snell water refraction, dawn/dusk air-mass optics and three-layer translucent clouds); per-part lit entities, mobs and block entities, mob cascade and contact shadows, universal data-driven dynamic lights (Vanilla, redstone and modded), and 3D/2D enchantment glint. First-launch audio defaults to 50% master / 45% music with a `Loud Sound Limiter` dB display. Installed vs `[+ Browse]` Mod Menu supports in-process Soft Reload; E2EE Friends and LAN use isolated `127.0.0.1:0` hosting. OS locale, clipboard, Japanese IME and a four-line sign editor are supported.
+- **Opt-in extensions (off by default for strict Vanilla parity):** 3D directional shadow-light gameplay (`directional_shadow_light`, `/megu shadowlight on|off`, or the local client Settings toggle); chunk-loader-free O(1) unloaded catch-up (`lazy_catchup`, `/megu lazycatchup on|off`, or the local client Settings toggle); custom-shaped Nether portals (`MEGU_CUSTOM_PORTAL_SHAPES=1`).
+
+These highlights describe wired capabilities, not a promise of full Vanilla worldgen/AI or arbitrary Java Mixin compatibility. See the [Operator Guide](docs/operator-guide.md) for operational limits.
 
 ## How To (Server Admins &amp; Full CLI Suite)
 
@@ -64,7 +74,7 @@ Download the full platform archive (`megu-<version>-<target>.tar.gz`) from **[Gi
 ```sh
 ./megu-installer server --dir ./megu-server
 # Set eula=true in ./megu-server/eula.txt after reviewing the Minecraft EULA:
-cd ./megu-server && ./megu --port 25565   # bare `megu` defaults to port 25599
+cd ./megu-server && ./megu                 # defaults to port 25565
 ```
 
 - Documentation on configuring and hosting Megu: **[Operator Guide](docs/operator-guide.md)** · **[Security Notes](SECURITY_NOTES.md)**
@@ -75,6 +85,7 @@ cd ./megu-server && ./megu --port 25565   # bare `megu` defaults to port 25599
 ## How To (Mod & Shader Authors)
 
 - Place data-driven Fabric / NeoForge mods in `mods/`, or pre-flight any modpack without a JVM using `megu-mod-check --scan-mods-dir ./mods` (or in your browser at **[megu.megumin.tech/#checker](https://megu.megumin.tech/#checker)**).
+- Native `.mmod` format and `--compat-jar` for Modrinth/CurseForge: **[Mod SDK guide](docs/mod-sdk-guide.md)** · **[SDK agent guide](sdk/AGENTS.md)**
 - Authoring guide & WGSL shader specifications: **[Mod & Shader Author Guide](docs/mod-author-guide.md)**
 - End-to-end handling of embedded JARs, tag namespaces, mod sync and modded saves: **[Mod Compatibility](docs/mod-compatibility.md)**
 

@@ -30,6 +30,8 @@ Megu は、省メモリ・高速起動・OpenGL 依存ゼロを目指して設�
 ネイティブ GPU クライアント（`megu-client-gpu`）を `<minecraft_dir>/bin/` へ自動配置し、公式 Minecraft ランチャーに **Megu (1.21.1)** プロファイルを登録します（`gui` / `--gui` 引数で GUI 画面、引数なしで 1 クリック自動導入）：
 
 > **プレイ前にターミナル作業は不要です。** `megu-client-gpu` は初回起動時に、公式ランチャー / PrismLauncher / Modrinth App の既存 1.21.1 クライアント JAR を再利用するか、Mojang の CDN からバックグラウンドで取得して SHA-1 検証します。`megu-installer` はバイナリ配置とランチャープロファイル登録だけを行う補助ツールです。
+>
+> **Java のメモリ設定は不要です。** Megu 本体は純 Rust 製（JVM ゼロ・OpenGL ゼロ）のため、公式ランチャーや Prism 側の Java メモリ割り当て（`-Xmx`）調整は**不要**です。既定の「自動」のままで動作し、必要に応じてゲーム内の **設定 → ビデオ** からキャッシュ上限スライダー（OS メモリ逼迫時の自動解放ガード付き）をいつでも調整できます。
 
 | OS | ファイル名 / コマンド | 説明 |
 | :--- | :--- | :--- |
@@ -43,6 +45,14 @@ Megu は、省メモリ・高速起動・OpenGL 依存ゼロを目指して設�
 | :--- | :--- | :--- |
 | **Modrinth App / Prism Launcher** | **[`megu-1.21.1.mrpack`](https://github.com/nekomario28/megu-mc/releases/download/v0.1.0-alpha.2/megu-1.21.1.mrpack)** | 標準 Modrinth `.mrpack` パッケージ — ランチャー画面へドラッグ＆ドロップするだけで導入 |
 | **Prism Launcher（ネイティブ ZIP）** | **[`megu-prism-1.21.1.zip`](https://github.com/nekomario28/megu-mc/releases/download/v0.1.0-alpha.2/megu-prism-1.21.1.zip)** | Prism 用インスタンス ZIP（または `megu-installer prism` でローカル自動生成） |
+
+## 検証済み機能のハイライト（次期 alpha.3）
+
+- **サーバー:** Vanilla 1.21.1、既定ポート **25565**。GameRule 51/51、エンチャント 42/42、効果 39/39、バニラの燃料と死亡メッセージに対応。純 Rust 製の TTY 自動判定 TUI / プレーン CLI（`--cli`）、`systemd` `sd_notify`、Hub の `/server`・`/hub`・`/world`、Survival Moderator の `/megu mod`、認証・DDoS 対策・入口での unwrap 排除、`.mmod` / `.jar` 識別。
+- **クライアント:** 純 `wgpu` の目に優しい描画（`comfort_exposure`、`indirect_light_bounce`、Snell の法則による水の屈折、朝夕の大気光学、半透明 3 層雲）。エンティティ・Mob・ブロックエンティティのパーツ別照明、Mob のカスケード影と接触影、バニラ・レッドストーン・Mod の光源に対応するハードコード不要の動的照明、3D/2D エンチャントグリント。初回音量はマスター 50% / 音楽 45%、`Loud Sound Limiter` は dB 表示。Mod Menu は Installed / `[+ Browse]` とプロセス内 Soft Reload に対応。E2EE フレンドと LAN は `127.0.0.1:0` の隔離ホストを使用。OS 言語・クリップボード・日本語 IME・4 行の看板編集に対応。
+- **明示的な拡張（厳密な Vanilla 互換のため既定ではオフ）:** 3D 方向性影光源のゲームプレイ（`directional_shadow_light`、`/megu shadowlight on|off`、クライアント設定のローカルトグル）、チャンクローダー不要の O(1) 非ロード中追いつき処理（`lazy_catchup`、`/megu lazycatchup on|off`、クライアント設定のローカルトグル）、自由形状のネザーポータル（`MEGU_CUSTOM_PORTAL_SHAPES=1`）。
+
+全バニラのワールド生成・AI や任意の Java Mixin 実行まで保証するものではありません。運用上の制限は [運用ガイド](docs/operator-guide.md) を参照してください。
 
 ## 使い方（サーバー管理者・全 CLI ツール一式）
 
@@ -64,7 +74,7 @@ Megu は、省メモリ・高速起動・OpenGL 依存ゼロを目指して設�
 ```sh
 ./megu-installer server --dir ./megu-server
 # ./megu-server/eula.txt を確認して eula=true に変更後、起動：
-cd ./megu-server && ./megu --port 25565   # 引数なしの `megu` は既定で 25599 番
+cd ./megu-server && ./megu                 # 既定のポートは 25565 番
 ```
 
 - サーバー設定・外部公開時の注意点: **[運用ガイド](docs/operator-guide.md)** · **[SECURITY_NOTES.md](SECURITY_NOTES.md)**
@@ -75,6 +85,7 @@ cd ./megu-server && ./megu --port 25565   # 引数なしの `megu` は既定で 
 ## 使い方（Mod・シェーダー作者向け）
 
 - データ駆動の Fabric / NeoForge Mod を `mods/` に配置するか、`megu-mod-check --scan-mods-dir ./mods`（またはブラウザ上の **[Modpack 診断](https://megu.megumin.tech/#checker)**）で JVM 不要の事前検査を行えます。
+- `.mmod` 形式と Modrinth / CurseForge 向け `--compat-jar`: **[Mod SDK ガイド](docs/mod-sdk-guide.md)** · **[SDK 開発ガイド](sdk/AGENTS.md)**
 - 制作ガイド・WGSL シェーダー仕様: **[Mod・シェーダー作者向けガイド](docs/mod-author-guide.md)**
 - 内包 JAR・タグ名前空間・Mod 同期・Mod 入りセーブの扱いの全体像: **[Mod 互換性](docs/mod-compatibility.md)**
 

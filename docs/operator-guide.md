@@ -20,11 +20,11 @@ windowed play.
 | :--- | :--- | :--- |
 | **Job** | Headless game server: world ticks, players, saves, admin commands | Windowed renderer + game client; singleplayer hosts a loopback `megu` |
 | **Runs on** | Server, VPS, or a spare PC | The player's Windows / macOS / Linux machine |
-| **Game port** | TCP **25599** by default; pass `--port 25565` for the usual port. Also `[server] port`, `MEGU_PORT`, `server-port` | No inbound game port. `--connect <host[:port]>` defaults to **25565** on the remote server |
+| **Game port** | TCP **25565** by default; override via `--port`, `[server] port`, `MEGU_PORT`, or `server-port` | No inbound game port. `--connect <host[:port]>` defaults to **25565** on the remote server |
 | **Bind address** | `127.0.0.1` by default; a public bind requires `MEGU_ALLOW_PUBLIC_BIND=1` | Outbound only; singleplayer binds an ephemeral loopback port |
 | **World / data** | The server directory (`--dir`, default cwd): `world_overlay.bin`, `world_overlay_nether.bin`, `world_overlay_end.bin`, `backups/`, `mods/`, `datapacks/` | `--gameDir` (default cwd): `saves/<world>/` for singleplayer, plus `versions/`, `mods/`, `resourcepacks/`, `megu-client.toml`, `options.txt`; assets live under `--assetsDir` |
 | **Config** | `server.toml` (`[server]`, `[anticheat]`) → `server.properties` (Vanilla keys, read-only) → `MEGU_*` env (wins) | `megu-client.toml` (or imported `options.txt`), launcher args, `MEGU_*` env |
-| **Mods** | `mods/*.jar` scanned when `MEGU_MODS_DIR` is set (release builds include the mod suite) | `<gameDir>/mods/*.jar` for textures/recipes and for the integrated host |
+| **Mods** | `.mmod` / `.jar` recognition; `mods/*.jar` scanned when `MEGU_MODS_DIR` is set (release builds include the mod suite) | `<gameDir>/mods/` for textures/recipes and for the integrated host |
 | **Admin surface** | Console, RCON (opt-in), `/megu …`, `/transfer`, `/profile` | In-game UI only; no server administration |
 | **Start** | `./megu --port 25565` | `./megu-client-gpu --connect play.example.net:25565` |
 
@@ -43,6 +43,13 @@ it in a terminal, a service manager, or the provided container.
 launcher profile; it is **not** required before opening
 `megu-client-gpu`, because the GPU client bootstraps its own Vanilla
 1.21.1 assets (see below).
+
+## Verified alpha.3 feature scope
+
+- **Server:** Vanilla 1.21.1, default TCP port **25565**, 51/51 GameRules, 42/42 Enchantments, 39/39 Effects, Vanilla fuels and death messages. The built-in pure-Rust console auto-detects a TTY for its TUI; `--cli` selects plain CLI. `systemd` `sd_notify`, Hub `/server`/`/hub`/`/world`, Survival Moderator `/megu mod`, hardened auth/DDoS/zero-unwrap ingress and `.mmod` / `.jar` recognition are wired. Public binding still requires the security steps below.
+- **Native client:** Pure `wgpu` eye-comfort optics (`comfort_exposure`, `indirect_light_bounce`, Snell water refraction, dawn/dusk air-mass optics, three-layer translucent clouds), per-part lit entities/mobs/block entities, mob cascade/contact shadows, data-driven dynamic lights for Vanilla, redstone and modded sources, and 3D/2D enchantment glint. First-launch audio defaults to 50% master / 45% music; `Loud Sound Limiter` displays dB. The Installed / `[+ Browse]` Mod Menu supports in-process Soft Reload; E2EE Friends and LAN use isolated `127.0.0.1:0` hosting. OS locale, clipboard, Japanese IME and four-line sign editing are supported. No JVM or OpenGL is needed; Settings → Video offers an optional RAM budget with memory-pressure cache eviction instead of Java `-Xmx` tuning.
+- **Opt-in extensions (off by default for strict Vanilla parity):** 3D directional shadow-light gameplay via `directional_shadow_light`, `/megu shadowlight on|off`, or the local client Settings toggle; chunk-loader-free O(1) unloaded catch-up via `lazy_catchup`, `/megu lazycatchup on|off`, or the local client Settings toggle; custom-shaped Nether portals via `MEGU_CUSTOM_PORTAL_SHAPES=1`.
+- **Mod development:** See the [Mod SDK guide](mod-sdk-guide.md) and [SDK agent guide](../sdk/AGENTS.md) for native `.mmod` and `--compat-jar` for Modrinth/CurseForge. Arbitrary Java Mixin execution is not native; see the compatibility limits below.
 
 ## Quick start: dedicated server (3 steps)
 
@@ -78,7 +85,7 @@ accepted. The container image requires `EULA=TRUE`. A **missing**
 
 ```sh
 cd ./megu-server
-./megu --port 25565      # omit --port to listen on 25599
+./megu                   # defaults to 25565; --port overrides it
 ```
 
 At the console, `status` prints TPS/players/chunks/memory and `stop`
@@ -471,7 +478,7 @@ Environment knobs the runtime actually reads:
 
 | variable | default | effect |
 |---|---|---|
-| `MEGU_PORT` | 25599 | game listener port (`--port 25565` for the conventional port) |
+| `MEGU_PORT` | 25565 | game listener port (`--port` overrides the default) |
 | `MEGU_BIND_ADDR` | 127.0.0.1 | game listener address |
 | `MEGU_ALLOW_PUBLIC_BIND` | off | required to bind any non-loopback address |
 | `MEGU_MOTD` | "megu" | server-list description and LAN announcement text |
