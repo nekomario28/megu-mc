@@ -165,6 +165,11 @@ pub enum UiCommand {
         back: UiColor,
         border: UiColor,
     },
+    /// An item icon slot. When the host supplied an [`ItemIconAtlas`]
+    /// (real `assets/*/textures/item/*.png` sprites) the GPU quad path
+    /// samples the atlas; every other path — and unknown ids — paints the
+    /// deterministic swatch + monogram, so a slot is never invisible.
+    ItemIcon { rect: UiRect, item_id: String },
 }
 
 /// An ordered list of 2D commands; painting is back-to-front.
@@ -198,11 +203,14 @@ impl UiDrawList {
     }
 
     /// Drop every command while keeping `commands` capacity and recycling
-    /// `Text` payloads into the string pool for [`text_str`](Self::text_str).
+    /// `Text`/`ItemIcon` payloads into the string pool for
+    /// [`text_str`](Self::text_str).
     pub fn clear(&mut self) {
         for command in self.commands.drain(..) {
-            if let UiCommand::Text { text, .. } = command {
-                self.string_pool.push(text);
+            match command {
+                UiCommand::Text { text, .. } => self.string_pool.push(text),
+                UiCommand::ItemIcon { item_id, .. } => self.string_pool.push(item_id),
+                _ => {}
             }
         }
     }
@@ -268,6 +276,27 @@ impl UiDrawList {
             fill,
             back,
             border,
+        });
+    }
+
+    /// Item icon slot (see [`UiCommand::ItemIcon`]). `id` is the
+    /// namespaced item id (`"minecraft:iron_ingot"`).
+    pub fn item_icon(&mut self, rect: UiRect, id: &str) {
+        self.push(UiCommand::ItemIcon {
+            rect,
+            item_id: id.to_owned(),
+        });
+    }
+
+    /// [`item_icon`](Self::item_icon) over a recycled payload buffer —
+    /// the same zero-alloc-on-warm-pool contract as [`text_str`].
+    pub fn item_icon_str(&mut self, rect: UiRect, id: &str) {
+        let mut owned = self.string_pool.pop().unwrap_or_default();
+        owned.clear();
+        owned.push_str(id);
+        self.push(UiCommand::ItemIcon {
+            rect,
+            item_id: owned,
         });
     }
 
@@ -754,6 +783,169 @@ fn tile_uv(tile: u32) -> [f32; 4] {
     ]
 }
 
+// ---------------------------------------------------------------------------
+// UI item-icon atlas (`assets/<ns>/textures/{item,block}/*.png` sprites)
+// ---------------------------------------------------------------------------
+
+/// The square cell every item icon is normalized into on the atlas.
+pub const ITEM_ICON_CELL: u32 = 16;
+/// Hard cap on distinct item ids the atlas can hold — `64×64` cells.
+pub const ITEM_ICON_MAX: usize = 4096;
+
+/// Packed RGBA8 item-icon atlas plus the `item_id → uv` lookup the
+/// tessellator resolves [`UiCommand::ItemIcon`] against. Built once by
+/// the host from real JAR sprites, uploaded to the GPU once, then
+/// immutable — steady frames do no work here.
+#[derive(Clone, Debug, Default)]
+pub struct ItemIconAtlas {
+    /// Atlas pixel width (`cols * ITEM_ICON_CELL`).
+    pub width: u32,
+    /// Atlas pixel height (`rows * ITEM_ICON_CELL`).
+    pub height: u32,
+    /// Tightly packed `width*height*4` RGBA8.
+    pub rgba: Vec<u8>,
+    /// `namespaced item id → normalized [u0, v0, u1, v1]`.
+    uvs: std::collections::HashMap<String, [f32; 4]>,
+}
+
+impl ItemIconAtlas {
+    /// Atlas-space uv rect for `id`, if it was added to the atlas.
+    pub fn uv(&self, id: &str) -> Option<[f32; 4]> {
+        self.uvs.get(id).copied()
+    }
+
+    /// Distinct item ids packed.
+    pub fn len(&self) -> usize {
+        self.uvs.len()
+    }
+
+    /// `true` when no sprites were packed (all icons fall back).
+    pub fn is_empty(&self) -> bool {
+        self.uvs.is_empty()
+    }
+}
+
+/// Accumulates `(id, w, h, rgba)` sprites, normalizing each into a
+/// [`ITEM_ICON_CELL`] square at `add` time; `finish` packs the grid.
+/// Duplicate ids keep the first sprite (later JARs never stomp an item
+/// icon — same contract as recipe dedup).
+#[derive(Default)]
+pub struct ItemIconAtlasBuilder {
+    sprites: Vec<(String, [u8; (ITEM_ICON_CELL * ITEM_ICON_CELL * 4) as usize])>,
+    seen: std::collections::HashSet<String>,
+}
+
+impl ItemIconAtlasBuilder {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Add `id`'s `w`×`h` RGBA8 sprite. Animated strips (`h` a multiple
+    /// of `w` taller than one frame) contribute only their first `w×w`
+    /// frame; any other aspect ratio samples the whole image. Returns
+    /// `false` for malformed payloads, duplicates, or a full atlas.
+    pub fn add(&mut self, id: &str, w: u32, h: u32, rgba: &[u8]) -> bool {
+        if id.is_empty()
+            || w == 0
+            || h == 0
+            || rgba.len() != w as usize * h as usize * 4
+            || self.sprites.len() >= ITEM_ICON_MAX
+            || !self.seen.insert(id.to_owned())
+        {
+            return false;
+        }
+        let cell = ITEM_ICON_CELL as usize;
+        // Animated vertical strips: the first square frame is the icon.
+        let frame_h = if h > w && h.is_multiple_of(w) { w } else { h };
+        let mut out = [0u8; (ITEM_ICON_CELL * ITEM_ICON_CELL * 4) as usize];
+        for cy in 0..cell {
+            let sy = (cy as u32 * frame_h / ITEM_ICON_CELL) as usize;
+            for cx in 0..cell {
+                let sx = (cx as u32 * w / ITEM_ICON_CELL) as usize;
+                let s = (sy * w as usize + sx) * 4;
+                let d = (cy * cell + cx) * 4;
+                out[d..d + 4].copy_from_slice(&rgba[s..s + 4]);
+            }
+        }
+        self.sprites.push((id.to_owned(), out));
+        true
+    }
+
+    /// Pack every accepted sprite into a near-square grid atlas.
+    pub fn finish(self) -> ItemIconAtlas {
+        let n = self.sprites.len();
+        if n == 0 {
+            return ItemIconAtlas::default();
+        }
+        let cols = (n as f64).sqrt().ceil() as u32;
+        let rows = (n as u32).div_ceil(cols);
+        let cell = ITEM_ICON_CELL as usize;
+        let (aw, ah) = (cols as usize * cell, rows as usize * cell);
+        let mut rgba = vec![0u8; aw * ah * 4];
+        let mut uvs = std::collections::HashMap::with_capacity(n);
+        for (i, (id, sprite)) in self.sprites.into_iter().enumerate() {
+            let (cx, cy) = (i as u32 % cols, i as u32 / cols);
+            let (px, py) = (cx as usize * cell, cy as usize * cell);
+            for row in 0..cell {
+                let s = row * cell * 4;
+                let d = ((py + row) * aw + px) * 4;
+                rgba[d..d + cell * 4].copy_from_slice(&sprite[s..s + cell * 4]);
+            }
+            let (w, h) = (aw as f32, ah as f32);
+            uvs.insert(
+                id,
+                [
+                    (px as f32 + 0.5) / w,
+                    (py as f32 + 0.5) / h,
+                    (px as f32 + cell as f32 - 0.5) / w,
+                    (py as f32 + cell as f32 - 0.5) / h,
+                ],
+            );
+        }
+        ItemIconAtlas {
+            width: aw as u32,
+            height: ah as u32,
+            rgba,
+            uvs,
+        }
+    }
+}
+
+/// Deterministic swatch + monogram fallback for an `ItemIcon` with no
+/// atlas entry — identical hashing to `item_color` in `recipe_browser`
+/// so both code paths paint the same color for the same id.
+fn icon_fallback(item_id: &str) -> (UiColor, char) {
+    const RAMP: [UiColor; 16] = [
+        UiColor::rgb(188, 84, 84),
+        UiColor::rgb(188, 132, 84),
+        UiColor::rgb(188, 172, 84),
+        UiColor::rgb(140, 188, 84),
+        UiColor::rgb(84, 188, 96),
+        UiColor::rgb(84, 188, 150),
+        UiColor::rgb(84, 178, 188),
+        UiColor::rgb(84, 136, 188),
+        UiColor::rgb(96, 96, 188),
+        UiColor::rgb(140, 84, 188),
+        UiColor::rgb(188, 84, 168),
+        UiColor::rgb(188, 84, 116),
+        UiColor::rgb(150, 150, 160),
+        UiColor::rgb(110, 124, 84),
+        UiColor::rgb(96, 110, 140),
+        UiColor::rgb(176, 148, 96),
+    ];
+    let mut hash: u32 = 0x811c_9dc5;
+    for &b in item_id.as_bytes() {
+        hash = (hash ^ u32::from(b)).wrapping_mul(0x0100_0193);
+    }
+    let letter = item_id
+        .rsplit([':', '/'])
+        .next()
+        .and_then(|s| s.chars().next())
+        .unwrap_or('?')
+        .to_ascii_uppercase();
+    (RAMP[(hash >> 16) as usize & 15], letter)
+}
+
 /// One vertex of the baked UI mesh: pixel-space `position`, normalized
 /// `uv` into [`font_atlas_rgba`], and straight-alpha `color`.
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
@@ -773,10 +965,13 @@ pub struct UiMesh {
 
 /// WGSL source of the companion shader [`tessellate_draw_list`] output is
 /// built for. Bindings: `group(0)` `0` = uniforms (screen size in pixels),
-/// `1` = the font atlas texture, `2` = a nearest-neighbor sampler. Vertex
-/// inputs match [`UiVertex`] field order. Alpha-blended over whatever is
-/// underneath; embedders enable standard src-over blending on the color
-/// target.
+/// `1` = the font atlas texture, `2` = a nearest-neighbor sampler,
+/// `3` = the [`ItemIconAtlas`] texture, `4` = its sampler. Vertex inputs
+/// match [`UiVertex`] field order. An icon quad marks its uv by biasing
+/// `u` into `[-2.0, -1.0]` — impossible for real font-atlas uvs — so the
+/// fragment stage samples the second texture instead. Alpha-blended over
+/// whatever is underneath; embedders enable standard src-over blending
+/// on the color target.
 pub const UI_QUAD_WGSL: &str = r#"
 struct UiUniforms {
     screen_size : vec2<f32>,
@@ -785,6 +980,8 @@ struct UiUniforms {
 @group(0) @binding(0) var<uniform> u : UiUniforms;
 @group(0) @binding(1) var atlas_tex : texture_2d<f32>;
 @group(0) @binding(2) var atlas_smp : sampler;
+@group(0) @binding(3) var icon_tex : texture_2d<f32>;
+@group(0) @binding(4) var icon_smp : sampler;
 
 struct VsIn {
     @location(0) position : vec2<f32>,
@@ -812,6 +1009,12 @@ fn vs_main(in : VsIn) -> VsOut {
 
 @fragment
 fn fs_main(in : VsOut) -> @location(0) vec4<f32> {
+    // Item-icon quads carry u = icon_u - 2.0 (see UiMesh::icon_quad);
+    // font/fill quads always keep u >= 0.
+    if (in.uv.x < -1.0) {
+        let texel = textureSample(icon_tex, icon_smp, vec2<f32>(in.uv.x + 2.0, in.uv.y));
+        return in.color * texel;
+    }
     let texel = textureSample(atlas_tex, atlas_smp, in.uv);
     return in.color * texel;
 }
@@ -850,6 +1053,17 @@ impl UiMesh {
             .extend_from_slice(&[base, base + 1, base + 2, base, base + 2, base + 3]);
     }
 
+    /// A quad sampling the item-icon texture: `u` is biased by `-2.0`
+    /// into `[-2.0, -1.0]` — the range real font uvs never reach — so
+    /// `fs_main` switches textures per fragment.
+    fn icon_quad(&mut self, rect: UiRect, uv: [f32; 4]) {
+        self.quad(
+            rect,
+            [uv[0] - 2.0, uv[1], uv[2] - 2.0, uv[3]],
+            UiColor::rgb(255, 255, 255),
+        );
+    }
+
     fn border(&mut self, rect: UiRect, color: UiColor, thickness: u32) {
         let uv = tile_uv(WHITE_TILE_INDEX);
         let t = thickness.min(rect.w.min(rect.h)) as i32;
@@ -876,7 +1090,23 @@ impl UiMesh {
 /// Positions stay in pixel space; [`UI_QUAD_WGSL`] maps them to NDC with
 /// the `screen_size` uniform (`width`, `height` here are only used for the
 /// embedder's convenience — the mesh itself is resolution-independent).
+/// [`UiCommand::ItemIcon`] paints its swatch+monogram fallback; hosts
+/// with a JAR-built [`ItemIconAtlas`] call
+/// [`tessellate_draw_list_icons`] for real item sprites.
 pub fn tessellate_draw_list(_width: u32, _height: u32, list: &UiDrawList) -> UiMesh {
+    tessellate_draw_list_icons(_width, _height, list, &ItemIconAtlas::default())
+}
+
+/// [`tessellate_draw_list`] with an [`ItemIconAtlas`]: `ItemIcon`
+/// commands whose id resolved a sprite emit a quad sampling the icon
+/// texture (`uv.x = icon_u - 2.0` sentinel the WGSL branches on);
+/// unknown ids keep the deterministic swatch + monogram fallback.
+pub fn tessellate_draw_list_icons(
+    _width: u32,
+    _height: u32,
+    list: &UiDrawList,
+    icons: &ItemIconAtlas,
+) -> UiMesh {
     let mut mesh = UiMesh::default();
     let white = tile_uv(WHITE_TILE_INDEX);
     for cmd in &list.commands {
@@ -936,9 +1166,34 @@ pub fn tessellate_draw_list(_width: u32, _height: u32, list: &UiDrawList) -> UiM
                     mesh.quad(UiRect::new(inner.x, inner.y, fw, inner.h), white, *fill);
                 }
             }
+            UiCommand::ItemIcon { rect, item_id } => {
+                if let Some(uv) = icons.uv(item_id) {
+                    mesh.icon_quad(*rect, uv);
+                } else {
+                    icon_fallback_quads(&mut mesh, *rect, item_id);
+                }
+            }
         }
     }
     mesh
+}
+
+/// Swatch + monogram fallback quads for an unmapped `ItemIcon` — the
+/// same look the software rasterizer produces so both paths agree.
+fn icon_fallback_quads(mesh: &mut UiMesh, rect: UiRect, item_id: &str) {
+    let (color, letter) = icon_fallback(item_id);
+    mesh.quad(rect, tile_uv(WHITE_TILE_INDEX), color);
+    if letter != ' ' {
+        let scale = (rect.w.min(rect.h) / GLYPH_SIZE).max(1);
+        let cell = GLYPH_SIZE * scale;
+        let cx = rect.x + ((rect.w as i32 - cell as i32) / 2).max(0);
+        let cy = rect.y + ((rect.h as i32 - cell as i32) / 2).max(0);
+        mesh.quad(
+            UiRect::new(cx, cy, cell, cell),
+            tile_uv(glyph_index(letter)),
+            UiColor::rgb(30, 30, 34),
+        );
+    }
 }
 
 /// `rect` shrunk by `m` px on every side (clamped to empty).
@@ -1104,6 +1359,19 @@ pub fn rasterize_draw_list(width: u32, height: u32, list: &UiDrawList) -> Vec<u8
                     let fw = (inner.w as f32 * fraction.clamp(0.0, 1.0)) as u32;
                     if fw > 0 {
                         frame.fill(UiRect::new(inner.x, inner.y, fw, inner.h), *fill);
+                    }
+                }
+                UiCommand::ItemIcon { rect, item_id } => {
+                    // Software path has no atlas: deterministic swatch +
+                    // monogram, mirroring `icon_fallback_quads`.
+                    let (color, letter) = icon_fallback(item_id);
+                    frame.fill(*rect, color);
+                    if letter != ' ' {
+                        let scale = (rect.w.min(rect.h) / GLYPH_SIZE).max(1);
+                        let cell = (GLYPH_SIZE * scale) as i32;
+                        let cx = rect.x + ((rect.w as i32 - cell) / 2).max(0);
+                        let cy = rect.y + ((rect.h as i32 - cell) / 2).max(0);
+                        frame.text(cx, cy, scale, UiColor::rgb(30, 30, 34), &letter.to_string());
                     }
                 }
             }

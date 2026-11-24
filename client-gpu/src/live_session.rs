@@ -1933,6 +1933,11 @@ pub struct LiveSession {
     /// [`Self::request_atlas_reload`].
     pub pending_atlas_pixels: Option<PendingAtlasPixels>,
     asset_bundle_tried: bool,
+    /// UI item-icon atlas (`item_id → uv` + RGBA) packed from the same
+    /// decoded `assets/*/textures/{item,block}` sprites the block atlas
+    /// pass consumed — `window.rs` uploads `rgba` once and keeps the uv
+    /// map for `UiCommand::ItemIcon` tessellation.
+    pub item_icon_atlas: Option<megu_ui::draw::ItemIconAtlas>,
     /// Set when a bundle landed but `GpuRenderer::upload_block_atlas`
     /// has not consumed it yet (window.rs owns the GPU upload).
     pub asset_bundle_pending_upload: bool,
@@ -2635,6 +2640,7 @@ impl LiveSession {
             atlas_meta: None,
             pending_atlas_pixels: None,
             asset_bundle_tried: false,
+            item_icon_atlas: None,
             asset_bundle_pending_upload: false,
             asset_discovery: AssetDiscovery::default(),
             commands: seeded_command_dispatcher(),
@@ -5226,6 +5232,10 @@ impl LiveSession {
         if layers.is_empty() {
             return;
         }
+        // The `layers` sprites are dropped after `split_compiled_bundle`
+        // (VRAM owns the texels) — the UI icon atlas is packed here while
+        // the decoded `textures/{item,block}` payloads are still alive.
+        self.item_icon_atlas = Some(crate::recipe_ingest::build_item_icon_atlas(&layers));
         for dir in &cem_dirs {
             self.register_cem_models(dir);
         }

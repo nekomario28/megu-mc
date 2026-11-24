@@ -12,9 +12,9 @@ use std::collections::BTreeMap;
 
 use megu_client_ui::draw::{rasterize_draw_list, UiCommand, UiRect};
 use megu_client_ui::recipe_browser::{
-    AnimatedPart, BrowserTab, DetailMode, DungeonLootEntry, EnchantmentCompat, HeatRequirement,
-    ItemEntry, JerTab, MobDropEntry, OreDistribution, PonderAnim, PonderAxis, PonderScene,
-    PonderStep, Recipe, RecipeBrowserAction, RecipeBrowserState, RecipeCategory,
+    AnimatedPart, BrowserTab, DetailMode, DungeonLootEntry, EnchantmentCompat, FuelEntry,
+    HeatRequirement, ItemEntry, JerTab, MobDropEntry, OreDistribution, PonderAnim, PonderAxis,
+    PonderScene, PonderStep, Recipe, RecipeBrowserAction, RecipeBrowserState, RecipeCategory,
     RecipeHitRegion, RecipeIndex, RecipeIngredient, RecipeWidgetId, VillagerTradeEntry,
 };
 use megu_client_ui::state::{GamepadButton, UiInputEvent, UiKey, UiLang};
@@ -127,6 +127,10 @@ fn fixture_index() -> RecipeIndex {
     idx.add_recipe(press);
 
     // JER rows.
+    idx.fuels.push(FuelEntry {
+        item: "minecraft:coal".into(),
+        burn_ticks: 1600,
+    });
     idx.mob_drops.push(MobDropEntry {
         mob_id: "minecraft:zombie".into(),
         item_id: "minecraft:iron_ingot".into(),
@@ -716,6 +720,7 @@ fn jer_tabs_render_all_sub_lists() {
         JerTab::Trades,
         JerTab::Loot,
         JerTab::Enchants,
+        JerTab::Fuels,
     ] {
         s.jer_tab = tab;
         let (list, hits) = s.render(w, h);
@@ -735,6 +740,15 @@ fn jer_tabs_render_all_sub_lists() {
             JerTab::Trades => assert!(texts.iter().any(|t| t.contains("librarian"))),
             JerTab::Loot => assert!(texts.iter().any(|t| t.contains("simple_dungeon"))),
             JerTab::Enchants => assert!(texts.iter().any(|t| t.contains("sharpness"))),
+            JerTab::Fuels => {
+                // Burn-time column — a fuel row must print its ticks.
+                assert!(
+                    texts
+                        .iter()
+                        .any(|t| t.contains("burn") || t.chars().any(|c| c.is_ascii_digit())),
+                    "fuels tab shows burn ticks"
+                );
+            }
         }
         assert_no_overlaps(&hits);
     }
@@ -1058,4 +1072,251 @@ fn search_clear_button_and_field_focus() {
     assert!(s.search_focused());
     click(&mut s, w, h, RecipeWidgetId::ItemSlot(0));
     assert!(!s.search_focused());
+}
+
+// ---------------------------------------------------------------------------
+// EMI query syntax: `|` OR clauses, `-` negation, `%tooltip`, craftable-only
+// ---------------------------------------------------------------------------
+
+#[test]
+fn emi_or_clauses_negation_and_tooltip_tokens() {
+    let mut s = fixture();
+
+    // `|` unions two independent clauses.
+    s.search = "cogwheel | gearbox".into();
+    let ids = visible_ids(&s);
+    assert!(ids.contains(&"create:cogwheel".to_string()));
+    assert!(ids.contains(&"create_addon:gearbox".to_string()));
+    assert!(!ids.contains(&"minecraft:iron_ingot".to_string()));
+
+    // `-` negates within an AND clause — plain text and @mod forms.
+    s.search = "iron -@create".into();
+    let ids = visible_ids(&s);
+    assert!(ids.contains(&"minecraft:iron_ingot".to_string()));
+    assert!(!ids.contains(&"create:iron_sheet".to_string()));
+    assert!(!ids.contains(&"create:crushed_iron_ore".to_string()));
+
+    // Negated #tag removes tag matches.
+    s.search = "iron -#c:ingots".into();
+    let ids = visible_ids(&s);
+    assert!(!ids.contains(&"minecraft:iron_ingot".to_string()));
+    assert!(ids.contains(&"minecraft:iron_block".to_string()));
+
+    // %tooltip restricts to tooltip-line matches.
+    s.search = "%rotation".into();
+    assert_eq!(visible_ids(&s), ["create:cogwheel"]);
+
+    // Mixed clause: `(iron AND NOT create) OR cogwheel`.
+    s.search = "iron -@create | cogwheel".into();
+    let ids = visible_ids(&s);
+    assert!(ids.contains(&"create:cogwheel".to_string()));
+    assert!(ids.contains(&"minecraft:iron_ingot".to_string()));
+    assert!(!ids.contains(&"create:iron_sheet".to_string()));
+}
+
+#[test]
+fn craftable_only_filters_to_live_inventory() {
+    let mut s = fixture();
+    s.craftable_only = true;
+    // With only 4 oak logs, only `oak_log -> 4 planks` is fully craftable.
+    s.inventory.insert("minecraft:oak_log".to_owned(), 4);
+    assert_eq!(visible_ids(&s), ["minecraft:oak_planks"]);
+    // Stocking iron ore opens the smelting chain's output.
+    s.inventory.insert("minecraft:iron_ore".to_owned(), 2);
+    let ids = visible_ids(&s);
+    assert!(ids.contains(&"minecraft:iron_ingot".to_string()));
+    assert!(ids.contains(&"minecraft:oak_planks".to_string()));
+    assert!(!ids.contains(&"minecraft:iron_block".to_string())); // needs 9 ingots
+}
+
+// ---------------------------------------------------------------------------
+// Backspace viewing-history
+// ---------------------------------------------------------------------------
+
+#[test]
+fn backspace_walks_detail_history_then_closes() {
+    let mut s = fixture();
+    s.open_detail("minecraft:iron_ingot", DetailMode::Recipes);
+    s.open_detail("minecraft:iron_block", DetailMode::Uses);
+    assert_eq!(
+        s.detail,
+        Some(("minecraft:iron_block".to_owned(), DetailMode::Uses))
+    );
+    s.back_or_close();
+    assert_eq!(
+        s.detail,
+        Some(("minecraft:iron_ingot".to_owned(), DetailMode::Recipes))
+    );
+    s.back_or_close();
+    assert!(s.detail.is_none());
+    // Fully unwound: Backspace closes the browser surface.
+    let acts = s.back_or_close();
+    assert!(acts.iter().any(|a| matches!(a, RecipeBrowserAction::Close)));
+}
+
+// ---------------------------------------------------------------------------
+// Visual recipe diagrams: 3x3 shaped grid keeps row/col positions
+// ---------------------------------------------------------------------------
+
+#[test]
+fn shaped_recipe_grid_preserves_row_and_column_positions() {
+    let mut idx = RecipeIndex::new();
+    idx.items = vec![
+        item("test:in_a", "Input A"),
+        item("test:in_b", "Input B"),
+        item("test:out", "Output"),
+    ];
+    let mut r = Recipe::new("test:r", RecipeCategory::CraftingShaped);
+    r.inputs = vec![
+        RecipeIngredient::item("test:in_a", 1),
+        RecipeIngredient::item("test:in_b", 1),
+    ];
+    r.outputs = vec![megu_client_ui::recipe_browser::ItemStack {
+        item: "test:out".into(),
+        count: 1,
+    }];
+    // Top-left cell (0) and bottom-right cell (8) — a diagonal that MUST
+    // render two rows/two columns apart, never packed side-by-side.
+    r.grid = Some(vec![
+        Some(0),
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        Some(1),
+    ]);
+    idx.add_recipe(r);
+    let mut s = RecipeBrowserState::new(idx);
+    s.open_detail("test:out", DetailMode::Recipes);
+    let (list, hits) = s.render(1280, 720);
+
+    let slot = |n: usize| {
+        hits.iter()
+            .find(|h| h.id == RecipeWidgetId::DetailSlot(n))
+            .unwrap_or_else(|| panic!("no DetailSlot({n}) region"))
+            .rect
+    };
+    let (a, b) = (slot(0), slot(1));
+    // Hit regions are physical pixels: logical 18px slot x ui scale.
+    let px = s.effective_scale(720);
+    assert_eq!(a.w, 18 * px, "18px ingredient slot");
+    // col 0 -> col 2 is two 20px columns; row 0 -> row 2 is two 19px rows.
+    assert_eq!(b.x - a.x, 40 * px as i32, "column 0 to column 2");
+    assert_eq!(b.y - a.y, 38 * px as i32, "row 0 to row 2");
+    // Real ItemIcon commands (not flat color strips) fill the slots.
+    let icons: Vec<&UiCommand> = list
+        .commands
+        .iter()
+        .filter(|c| matches!(c, UiCommand::ItemIcon { .. }))
+        .collect();
+    assert!(
+        icons.len() >= 3,
+        "two inputs + output slots render icons, got {}",
+        icons.len()
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Side overlay: zero overlap with the container panel, None when too narrow
+// ---------------------------------------------------------------------------
+
+#[test]
+fn side_overlay_never_overlaps_container_panel() {
+    let mut s = fixture();
+    s.bookmarks = vec!["minecraft:iron_ingot".into()];
+
+    for &(w, h) in &SIZES {
+        let scale = s.effective_scale(h) as i32;
+        // A chest-panel-sized centered rect, in physical pixels.
+        let (pw, ph) = (176 * scale, 166 * scale);
+        let panel = UiRect::new(
+            (w as i32 - pw) / 2,
+            (h as i32 - ph) / 2,
+            pw as u32,
+            ph as u32,
+        );
+        let Some((list, hits)) = s.render_overlay(w, h, panel) else {
+            // Too narrow is a legal answer — the overlay hides entirely
+            // rather than overlap.
+            assert!(w <= 640, "{w}x{h} must fit the side panels");
+            continue;
+        };
+        // Hit regions and `panel` are both physical-pixel rects.
+        for hreg in &hits {
+            assert!(
+                !hreg.rect.intersects(panel),
+                "{w}x{h}: overlay region {hreg:?} overlaps the container panel"
+            );
+        }
+        assert_no_overlaps(&hits);
+        assert_non_blank(&rasterize_draw_list(w, h, &list));
+    }
+
+    // A near-fullscreen panel always rejects the overlay outright.
+    let big = UiRect::new(2, 2, 1276, 716);
+    assert!(s.render_overlay(1280, 720, big).is_none());
+    // Minimum-size guard.
+    assert!(s
+        .render_overlay(200, 100, UiRect::new(0, 0, 8, 8))
+        .is_none());
+}
+
+// ---------------------------------------------------------------------------
+// JER Fuels tab
+// ---------------------------------------------------------------------------
+
+#[test]
+fn jer_fuels_tab_lists_burn_ticks_and_smelted_counts() {
+    let mut s = fixture();
+    s.tab = BrowserTab::Jer;
+    s.jer_tab = JerTab::Fuels;
+    let (list, hits) = s.render(1280, 720);
+    let texts: Vec<&str> = list
+        .commands
+        .iter()
+        .filter_map(|c| match c {
+            UiCommand::Text { text, .. } => Some(text.as_str()),
+            _ => None,
+        })
+        .collect();
+    // The coal fixture: 1600 ticks = 8 items smelted.
+    assert!(
+        texts.iter().any(|t| t.contains("1600t") && t.contains("8")),
+        "fuel row missing burn/smelted readout: {texts:?}"
+    );
+    // The Fuels sub-tab button is a live hit region.
+    assert!(hits.iter().any(|h| h.id == RecipeWidgetId::JerTabFuels));
+}
+
+// ---------------------------------------------------------------------------
+// Overlay defaults OFF (`recipe_overlay_enabled` + QoL widget)
+// ---------------------------------------------------------------------------
+
+#[test]
+fn recipe_overlay_defaults_off_and_qol_widget_toggles() {
+    let settings = megu_client_ui::state::QolSettings::default();
+    assert!(!settings.recipe_overlay_enabled, "overlay must default OFF");
+
+    // The Settings -> QoL widget flips the same single flag.
+    use megu_client_ui::state::{Screen, SettingsTab, UiState, WidgetId};
+    let mut ui = UiState::default();
+    ui.navigate(Screen::Settings(SettingsTab::Qol));
+    assert!(!ui.settings.qol.recipe_overlay_enabled);
+    for expected in [true, false] {
+        ui.render(1280, 720);
+        let rect = ui
+            .hit_regions
+            .iter()
+            .find(|r| r.id == WidgetId::QolRecipeOverlay)
+            .expect("QoL tab exposes the recipe overlay toggle")
+            .rect;
+        ui.handle_input(UiInputEvent::Click {
+            x: rect.x + rect.w as i32 / 2,
+            y: rect.y + rect.h as i32 / 2,
+        });
+        assert_eq!(ui.settings.qol.recipe_overlay_enabled, expected);
+    }
 }

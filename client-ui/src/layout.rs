@@ -2076,10 +2076,10 @@ fn qol_tab(ctx: &mut Ctx, y0: i32) {
     let conflicts = crate::qol_helpers::detect_keybind_conflicts(&ctx.state.keybinds);
     let flagged = crate::qol_helpers::conflicted_bind_indices(&conflicts);
 
-    // Controls section: conflicted bindings first with `[!]` badges
-    // (red when a row collides more than once, amber otherwise), then
-    // the unflagged table — two display-only columns clipped by the
-    // footer band like every other row.
+    // Controls section header + the Recipe Overlay toggle share the
+    // first conflict row: header left-aligned over the keybind table,
+    // toggle in the empty right column — zero vertical cost.
+    // (`Ctrl+O` flips the same setting in-game.)
     if qy(conflict_row) + 10 <= ctx.band_top {
         let header = if conflicts.is_empty() {
             tr(lang, "Controls - no conflicts", "操作 — 重複なし").to_string()
@@ -2091,8 +2091,8 @@ fn qol_tab(ctx: &mut Ctx, y0: i32) {
                 tr(lang, "conflict(s)", "重複")
             )
         };
-        ctx.ctext(
-            ctx.w / 2,
+        ctx.text(
+            x + 4,
             qy(conflict_row) + 2,
             1,
             if conflicts.is_empty() {
@@ -2101,6 +2101,18 @@ fn qol_tab(ctx: &mut Ctx, y0: i32) {
                 pal::WARNING
             },
             &header,
+        );
+        pair(
+            ctx,
+            conflict_row,
+            1,
+            WidgetId::QolRecipeOverlay,
+            SettingKey::QolRecipeOverlay,
+            &format!(
+                "{}: {}",
+                tr(lang, "Recipe Overlay", "レシピ検索UI"),
+                onoff(q.recipe_overlay_enabled)
+            ),
         );
     }
     let mut order: Vec<usize> = flagged.clone();

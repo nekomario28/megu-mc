@@ -33,6 +33,7 @@ fn command_bounds(command: &UiCommand) -> Option<UiRect> {
     match command {
         UiCommand::FillRect { rect, .. }
         | UiCommand::BorderRect { rect, .. }
+        | UiCommand::ItemIcon { rect, .. }
         | UiCommand::ProgressBar { rect, .. } => Some(*rect),
         UiCommand::Text {
             x, y, scale, text, ..

@@ -2994,6 +2994,16 @@ struct UiQuadGpu {
     bind_group: wgpu::BindGroup,
     uniform: wgpu::Buffer,
     _font_texture: wgpu::Texture,
+    /// The packed item-icon atlas texture (`binding 3` in
+    /// `UI_QUAD_WGSL`); starts as a 1×1 transparent placeholder and is
+    /// replaced once by [`GpuRenderer::upload_item_icon_atlas`].
+    _icon_texture: wgpu::Texture,
+    /// Kept so `upload_item_icon_atlas` can rebuild `bind_group` around
+    /// the new texture; branding bind groups bind this view too (they
+    /// never emit icon quads, so sampling it is harmless).
+    icon_view: wgpu::TextureView,
+    font_view: wgpu::TextureView,
+    font_sampler: wgpu::Sampler,
     vertices: wgpu::Buffer,
     indices: wgpu::Buffer,
     vertex_capacity: u64,
@@ -6866,6 +6876,22 @@ impl GpuRenderer {
                             ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
                             count: None,
                         },
+                        wgpu::BindGroupLayoutEntry {
+                            binding: 3,
+                            visibility: wgpu::ShaderStages::FRAGMENT,
+                            ty: wgpu::BindingType::Texture {
+                                sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                                view_dimension: wgpu::TextureViewDimension::D2,
+                                multisampled: false,
+                            },
+                            count: None,
+                        },
+                        wgpu::BindGroupLayoutEntry {
+                            binding: 4,
+                            visibility: wgpu::ShaderStages::FRAGMENT,
+                            ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
+                            count: None,
+                        },
                     ],
                 });
         let ui_quad_pipeline_layout =
@@ -6958,6 +6984,43 @@ impl GpuRenderer {
             min_filter: wgpu::FilterMode::Nearest,
             ..wgpu::SamplerDescriptor::default()
         });
+        // 1×1 transparent placeholder bound until `upload_item_icon_atlas`
+        // lands the real packed atlas — icon quads sample transparent and
+        // the tessellator's fallback swatch stays on top.
+        let ui_icon_texture = ctx.device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("ui-icon-atlas-placeholder"),
+            size: wgpu::Extent3d {
+                width: 1,
+                height: 1,
+                depth_or_array_layers: 1,
+            },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: wgpu::TextureFormat::Rgba8Unorm,
+            usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+            view_formats: &[],
+        });
+        ctx.queue.write_texture(
+            wgpu::TexelCopyTextureInfo {
+                texture: &ui_icon_texture,
+                mip_level: 0,
+                origin: wgpu::Origin3d::ZERO,
+                aspect: wgpu::TextureAspect::All,
+            },
+            &[0u8; 4],
+            wgpu::TexelCopyBufferLayout {
+                offset: 0,
+                bytes_per_row: Some(4),
+                rows_per_image: Some(1),
+            },
+            wgpu::Extent3d {
+                width: 1,
+                height: 1,
+                depth_or_array_layers: 1,
+            },
+        );
+        let ui_icon_view = ui_icon_texture.create_view(&wgpu::TextureViewDescriptor::default());
         let ui_quad_bind_group = ctx.device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("ui-quad-bind-group"),
             layout: &ui_quad_layout,
@@ -6972,6 +7035,14 @@ impl GpuRenderer {
                 },
                 wgpu::BindGroupEntry {
                     binding: 2,
+                    resource: wgpu::BindingResource::Sampler(&ui_font_sampler),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 3,
+                    resource: wgpu::BindingResource::TextureView(&ui_icon_view),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 4,
                     resource: wgpu::BindingResource::Sampler(&ui_font_sampler),
                 },
             ],
@@ -6993,6 +7064,10 @@ impl GpuRenderer {
             bind_group: ui_quad_bind_group,
             uniform: ui_quad_uniform,
             _font_texture: ui_font_texture,
+            _icon_texture: ui_icon_texture,
+            icon_view: ui_icon_view,
+            font_view: ui_font_view,
+            font_sampler: ui_font_sampler,
             vertices: ui_quad_vertices,
             indices: ui_quad_indices,
             vertex_capacity: 4096,
@@ -10905,6 +10980,81 @@ impl GpuRenderer {
         Ok(())
     }
 
+    /// Replace the item-icon atlas texture (`binding 3` of the ui_quad
+    /// bind group) with a freshly packed [`megu_ui::draw::ItemIconAtlas`]
+    /// and rebuild the overlay bind group around it. Called once after
+    /// the asset bundle lands — steady frames never touch this.
+    /// `is_empty()` atlases keep the transparent placeholder bound.
+    pub fn upload_item_icon_atlas(&mut self, atlas: &megu_ui::draw::ItemIconAtlas) {
+        if atlas.is_empty() {
+            return;
+        }
+        let texture = self.ctx.device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("ui-icon-atlas"),
+            size: wgpu::Extent3d {
+                width: atlas.width,
+                height: atlas.height,
+                depth_or_array_layers: 1,
+            },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: wgpu::TextureFormat::Rgba8Unorm,
+            usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+            view_formats: &[],
+        });
+        self.ctx.queue.write_texture(
+            wgpu::TexelCopyTextureInfo {
+                texture: &texture,
+                mip_level: 0,
+                origin: wgpu::Origin3d::ZERO,
+                aspect: wgpu::TextureAspect::All,
+            },
+            &atlas.rgba,
+            wgpu::TexelCopyBufferLayout {
+                offset: 0,
+                bytes_per_row: Some(atlas.width * 4),
+                rows_per_image: Some(atlas.height),
+            },
+            wgpu::Extent3d {
+                width: atlas.width,
+                height: atlas.height,
+                depth_or_array_layers: 1,
+            },
+        );
+        self.ui_quad.icon_view = texture.create_view(&wgpu::TextureViewDescriptor::default());
+        self.ui_quad._icon_texture = texture;
+        self.ui_quad.bind_group = self
+            .ctx
+            .device
+            .create_bind_group(&wgpu::BindGroupDescriptor {
+                label: Some("ui-quad-bind-group"),
+                layout: &self.title_branding.layout,
+                entries: &[
+                    wgpu::BindGroupEntry {
+                        binding: 0,
+                        resource: self.ui_quad.uniform.as_entire_binding(),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 1,
+                        resource: wgpu::BindingResource::TextureView(&self.ui_quad.font_view),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 2,
+                        resource: wgpu::BindingResource::Sampler(&self.ui_quad.font_sampler),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 3,
+                        resource: wgpu::BindingResource::TextureView(&self.ui_quad.icon_view),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 4,
+                        resource: wgpu::BindingResource::Sampler(&self.ui_quad.font_sampler),
+                    },
+                ],
+            });
+    }
+
     /// Upload a [`tessellate_draw_list`](megu_ui::draw::tessellate_draw_list)
     /// mesh for the GPU-quad UI overlay: rewrites only the 16-byte
     /// screen-size uniform plus the dynamic vertex/index buffers (grown,
@@ -11066,6 +11216,14 @@ impl GpuRenderer {
                     },
                     wgpu::BindGroupEntry {
                         binding: 2,
+                        resource: wgpu::BindingResource::Sampler(&self.ui_sampler),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 3,
+                        resource: wgpu::BindingResource::TextureView(&self.ui_quad.icon_view),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 4,
                         resource: wgpu::BindingResource::Sampler(&self.ui_sampler),
                     },
                 ],

@@ -585,6 +585,10 @@ pub struct UiEnchantment {
 pub struct UiItemStack {
     pub item_id: u32,
     pub count: u8,
+    /// Namespaced item id (`minecraft:stone`) when the host resolved the
+    /// numeric `item_id` — feeds real `ItemIcon` textures; empty keeps
+    /// the hashed swatch fallback.
+    pub namespaced_id: String,
     pub max_stack: u8,
     /// Remaining durability; `-1` means not damageable.
     pub durability: i32,
@@ -607,6 +611,7 @@ impl UiItemStack {
         Self {
             item_id,
             count,
+            namespaced_id: String::new(),
             max_stack: 64,
             durability: -1,
             max_durability: 0,
@@ -627,6 +632,12 @@ impl UiItemStack {
 
     pub fn is_empty(&self) -> bool {
         self.count == 0 || self.item_id == 0
+    }
+
+    /// Attach the namespaced item id (icon texture lookup key).
+    pub fn with_namespaced_id(mut self, id: impl Into<String>) -> Self {
+        self.namespaced_id = id.into();
+        self
     }
 
     pub fn with_name(mut self, name: impl Into<String>) -> Self {
@@ -1099,9 +1110,13 @@ impl ContainerScreenState {
             if item.is_empty() {
                 continue;
             }
-            let icon = item_icon_color(item.item_id);
-            let inset = UiRect::new(slot.rect.x + 3, slot.rect.y + 3, 12, 12);
-            out.fill_rect(inset, icon);
+            let inset = UiRect::new(slot.rect.x + 2, slot.rect.y + 2, 16, 16);
+            if item.namespaced_id.is_empty() {
+                let icon = item_icon_color(item.item_id);
+                out.fill_rect(UiRect::new(slot.rect.x + 3, slot.rect.y + 3, 12, 12), icon);
+            } else {
+                out.item_icon_str(inset, &item.namespaced_id);
+            }
             if item.count > 1 {
                 let label = item.count.to_string();
                 out.text(
@@ -1148,10 +1163,17 @@ impl ContainerScreenState {
             let rect = UiRect::new(vw - 24, vh - 24, 20, 20);
             out.fill_rect(rect, palette::SLOT);
             out.border_rect(rect, palette::BUTTON_BORDER_HOVER, 1);
-            out.fill_rect(
-                UiRect::new(rect.x + 3, rect.y + 3, 14, 14),
-                item_icon_color(cursor.item_id),
-            );
+            if cursor.namespaced_id.is_empty() {
+                out.fill_rect(
+                    UiRect::new(rect.x + 3, rect.y + 3, 14, 14),
+                    item_icon_color(cursor.item_id),
+                );
+            } else {
+                out.item_icon_str(
+                    UiRect::new(rect.x + 2, rect.y + 2, 16, 16),
+                    &cursor.namespaced_id,
+                );
+            }
             if cursor.count > 1 {
                 out.text(
                     rect.right() - 2 - text_width(&cursor.count.to_string(), 1) as i32,

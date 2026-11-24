@@ -60,7 +60,7 @@ use megu_ui::container_screen::{
     ContainerScreenState, DragState, InventorySortState, MenuScreenSchema, SlotDef, SlotKind,
     UiItemStack, menu_schema,
 };
-use megu_ui::draw::tessellate_draw_list;
+use megu_ui::draw::{tessellate_draw_list, tessellate_draw_list_icons};
 use megu_ui::draw::{UiColor, UiCommand, UiDrawList, UiRect, text_width};
 use megu_ui::gui_bridge::{GuiBridgeBatch, lower_bridge_batch_to_draw_cmds};
 use megu_ui::hud_widgets::ScoreboardEntry;
@@ -805,6 +805,23 @@ pub struct GpuApp {
     /// Boot-time recipe-browser ingest report (mod JARs + vanilla client
     /// JAR + datapacks); empty when no `--gameDir` was supplied.
     recipe_ingest: crate::recipe_ingest::IngestReport,
+    /// CPU-side `item_id → uv` map for `UiCommand::ItemIcon`
+    /// tessellation; the RGBA payload is uploaded to the renderer once
+    /// and dropped (VRAM owns texels, matching the block atlas).
+    item_icon_atlas: megu_ui::draw::ItemIconAtlas,
+    /// `true` once `item_icon_atlas.rgba` reached the renderer — upload
+    /// happens once per asset-bundle build, never per frame.
+    item_icon_atlas_uploaded: bool,
+    /// `player_inventory_state_id` the browser's `inventory` mirror was
+    /// last rebuilt from — `-1` forces a first sync.
+    recipe_inventory_state: i32,
+    /// Hit regions produced by the in-container recipe overlay's last
+    /// `render_overlay` call — click/hover routing reads this each frame.
+    recipe_overlay_regions: Vec<megu_ui::recipe_browser::RecipeHitRegion>,
+    /// Locale the lang ingest currently covers — a language change
+    /// re-runs `ingest_lang_into_ui` once so localized item names and
+    /// search follow the new display language.
+    lang_ingested_locale: String,
     /// Clean-room runtime `MEGU EDITION` title branding (wordmark +
     /// patched edition strip, merged splash pool) loaded once at boot —
     /// the built-in splash set with no banner when no local client JAR
@@ -1182,6 +1199,11 @@ impl GpuApp {
             mod_sync_worker: None,
             last_server_address: None,
             recipe_ingest: crate::recipe_ingest::IngestReport::default(),
+            item_icon_atlas: megu_ui::draw::ItemIconAtlas::default(),
+            item_icon_atlas_uploaded: false,
+            recipe_inventory_state: -1,
+            recipe_overlay_regions: Vec::new(),
+            lang_ingested_locale: String::new(),
             title_branding: TitleBrandingAssets::fallback(),
             splash_seed,
             singleplayer_server,
@@ -1241,6 +1263,15 @@ impl GpuApp {
             let summary = app.recipe_ingest.summary_line();
             app.status_line(summary);
         }
+        // Localized item names: `en_us` + the active display locale, from
+        // every JAR's `assets/*/lang/*.json` (zero extraction). The
+        // browser's `active_locale` was already synced from settings
+        // during `UiState` construction; switching language re-ingests.
+        let _ = crate::recipe_ingest::ingest_lang_into_ui(
+            &app.session_paths,
+            &mut app.ui.recipe_browser,
+        );
+        app.lang_ingested_locale = app.ui.recipe_browser.active_locale.clone();
         // Runtime `MEGU EDITION` title branding: when the launcher paths
         // resolve a local client JAR, its `minecraft.png`/`edition.png`/
         // `splashes.txt` are read in memory through the lazy ZIP index —
@@ -1418,6 +1449,12 @@ impl GpuApp {
         &self.ui.recipe_browser
     }
 
+    /// The QoL `recipe_overlay_enabled` flag — `Ctrl+O` and
+    /// Settings→QoL both write this single source of truth.
+    pub fn recipe_overlay_enabled(&self) -> bool {
+        self.ui.settings.qol.recipe_overlay_enabled
+    }
+
     /// Runtime `MEGU EDITION` title branding assets loaded at boot —
     /// [`TitleBrandingAssets::fallback`] state (built-in splashes, no
     /// banner) when no local client JAR was discoverable.
@@ -1452,6 +1489,13 @@ impl GpuApp {
     pub fn attach_live(&mut self, live: LiveSession) {
         self.live = Some(live);
         self.on_live_attached();
+    }
+
+    /// Mirror of the `ModifiersChanged` event's state write — headless
+    /// tests drive `Ctrl`/`Cmd` chords through the same field the real
+    /// event path sets.
+    pub fn set_modifiers(&mut self, state: ModifiersState) {
+        self.modifiers = state;
     }
 
     /// One-time per-attach wiring shared by `connect_to`/`attach_live`:
@@ -1918,6 +1962,7 @@ impl GpuApp {
             // pass re-scans the mods dir's JARs (fresh metadata +
             // textures) without a process restart.
             live.refresh_asset_layers();
+            self.item_icon_atlas_uploaded = false;
             // `set_ui_locale` invalidates the cached `ModTranslationTable`
             // only on a real locale change; the two-step hop through an
             // unused tag drops it unconditionally so the next lookup
@@ -2309,6 +2354,9 @@ impl GpuApp {
             || self.ui.server_address_field_active()
             || (self.ui.screen == Screen::RecipeBrowser && self.ui.recipe_browser.search_focused())
             || (self.ui.screen == Screen::ModMenu && self.ui.mod_menu.search_focused())
+            || (self.ui.settings.qol.recipe_overlay_enabled
+                && self.container_screen.is_some()
+                && self.ui.recipe_browser.search_focused())
     }
 
     /// `Ctrl` (every platform) or `Cmd` (macOS) currently held — the
@@ -2366,6 +2414,29 @@ impl GpuApp {
             }
             if fed {
                 self.refresh_chat_suggestions();
+            }
+            return Vec::new();
+        }
+        // JEI/EMI overlay search: the container keeps `Screen::InGameHud`
+        // underneath, so `ui_wants_input` is false — the browser's
+        // `CharTyped` arm owns the text surface instead.
+        if self.ui.settings.qol.recipe_overlay_enabled
+            && self.container_screen.is_some()
+            && self.ui.recipe_browser.search_focused()
+        {
+            let (w, h) = self
+                .active
+                .as_ref()
+                .map(|a| (a.size.width, a.size.height))
+                .unwrap_or((0, 0));
+            for ch in text.chars().filter(|c| !c.is_control()) {
+                for action in self
+                    .ui
+                    .recipe_browser
+                    .handle_input(UiInputEvent::CharTyped(ch), w, h)
+                {
+                    self.dispatch_recipe_browser_action(&action);
+                }
             }
             return Vec::new();
         }
@@ -3340,6 +3411,9 @@ impl GpuApp {
                         UiItemStack::new(
                             stack.item_id.max(0) as u32,
                             stack.count.clamp(0, 255) as u8,
+                        )
+                        .with_namespaced_id(
+                            crate::recipe_ingest::item_name_for_id(stack.item_id.max(0) as u32),
                         ),
                     );
                 }
@@ -3349,6 +3423,9 @@ impl GpuApp {
                     carried.item_id.max(0) as u32,
                     carried.count.clamp(0, 255) as u8,
                 )
+                .with_namespaced_id(crate::recipe_ingest::item_name_for_id(
+                    carried.item_id.max(0) as u32,
+                ))
             }));
         }
         self.container_screen = Some(screen);
@@ -3699,6 +3776,11 @@ impl GpuApp {
                                     UiItemStack::new(
                                         stack.item_id.max(0) as u32,
                                         stack.count.clamp(0, 255) as u8,
+                                    )
+                                    .with_namespaced_id(
+                                        crate::recipe_ingest::item_name_for_id(
+                                            stack.item_id.max(0) as u32,
+                                        ),
                                     ),
                                 );
                             }
@@ -3707,6 +3789,11 @@ impl GpuApp {
                             UiItemStack::new(
                                 carried.item_id.max(0) as u32,
                                 carried.count.clamp(0, 255) as u8,
+                            )
+                            .with_namespaced_id(
+                                crate::recipe_ingest::item_name_for_id(
+                                    carried.item_id.max(0) as u32
+                                ),
                             )
                         }));
                     }
@@ -3726,6 +3813,11 @@ impl GpuApp {
                                         UiItemStack::new(
                                             stack.item_id.max(0) as u32,
                                             stack.count.clamp(0, 255) as u8,
+                                        )
+                                        .with_namespaced_id(
+                                            crate::recipe_ingest::item_name_for_id(
+                                                stack.item_id.max(0) as u32,
+                                            ),
                                         ),
                                     );
                                 }
@@ -3734,6 +3826,11 @@ impl GpuApp {
                                 UiItemStack::new(
                                     carried.item_id.max(0) as u32,
                                     carried.count.clamp(0, 255) as u8,
+                                )
+                                .with_namespaced_id(
+                                    crate::recipe_ingest::item_name_for_id(
+                                        carried.item_id.max(0) as u32
+                                    ),
                                 )
                             }));
                         }
@@ -3901,6 +3998,23 @@ impl GpuApp {
         };
         match state {
             ElementState::Pressed => {
+                // JEI/EMI overlay widgets (search, grid, bookmarks,
+                // detail slots) outrank container slots — same rule as
+                // JEI: sidebar clicks never touch the hovered slot.
+                if self.ui.settings.qol.recipe_overlay_enabled {
+                    if let Some(id) = self
+                        .recipe_overlay_regions
+                        .iter()
+                        .find(|r| r.contains(mx, my))
+                        .map(|r| r.id)
+                    {
+                        let actions = self.ui.recipe_browser.activate_region(id);
+                        for action in &actions {
+                            self.dispatch_recipe_browser_action(action);
+                        }
+                        return true;
+                    }
+                }
                 let layout = screen.layout(w, h);
                 if let Some(hit) = layout.slots.iter().find(|slot| slot.rect.contains(mx, my)) {
                     let slot_index = hit.index;
@@ -3993,6 +4107,91 @@ impl GpuApp {
         (stack.item_id != 0).then(|| crate::recipe_ingest::item_name_for_id(stack.item_id))
     }
 
+    /// Item under the cursor across both surfaces: a container slot, or
+    /// a sidebar/detail slot in the JEI/EMI overlay's hit regions.
+    fn overlay_focused_item(&self) -> Option<String> {
+        self.hovered_item_name()
+            .or_else(|| self.ui.recipe_browser.hovered_item())
+    }
+
+    /// JEI/EMI side-overlay key chord — `true` when the press was
+    /// consumed:
+    /// `Ctrl`/`Cmd`+`O` toggles `recipe_overlay_enabled` in place;
+    /// `A` bookmarks the hovered stack (container or sidebar slot);
+    /// `R`/`U` open the recipe detail inside the overlay; `Backspace`
+    /// pops search text then the detail history; `Escape` backs out of
+    /// detail while leaving the container itself open.
+    pub fn handle_overlay_key(&mut self, code: KeyCode, pressed: bool) -> bool {
+        if pressed
+            && self.container_screen.is_some()
+            && self.clipboard_modifier_held()
+            && code == KeyCode::KeyO
+        {
+            self.ui.settings.qol.recipe_overlay_enabled =
+                !self.ui.settings.qol.recipe_overlay_enabled;
+            self.dispatch_ui_action(&UiAction::SettingsChanged);
+            return true;
+        }
+        if !(pressed
+            && !self.paused
+            && self.container_screen.is_some()
+            && self.ui.settings.qol.recipe_overlay_enabled)
+        {
+            return false;
+        }
+        let (w, h) = self
+            .active
+            .as_ref()
+            .map(|a| (a.size.width, a.size.height))
+            .unwrap_or((0, 0));
+        match code {
+            KeyCode::KeyA => {
+                if let Some(item) = self.overlay_focused_item() {
+                    self.ui.recipe_browser.toggle_bookmark(&item);
+                    return true;
+                }
+            }
+            KeyCode::KeyR | KeyCode::KeyU => {
+                if let Some(item) = self.overlay_focused_item() {
+                    let mode = if code == KeyCode::KeyR {
+                        DetailMode::Recipes
+                    } else {
+                        DetailMode::Uses
+                    };
+                    if self.ui.recipe_browser.index.item(&item).is_none() {
+                        let name = crate::recipe_ingest::humanize_id(&item);
+                        self.ui
+                            .recipe_browser
+                            .index
+                            .add_item(ItemEntry::new(&item, &name));
+                    }
+                    self.ui.recipe_browser.open_detail(&item, mode);
+                    return true;
+                }
+            }
+            KeyCode::Backspace => {
+                let actions = self.ui.recipe_browser.handle_input(
+                    UiInputEvent::KeyPressed(UiKey::Backspace),
+                    w,
+                    h,
+                );
+                for action in &actions {
+                    self.dispatch_recipe_browser_action(action);
+                }
+                return true;
+            }
+            KeyCode::Escape if self.ui.recipe_browser.detail.is_some() => {
+                let actions = self.ui.recipe_browser.back_or_close();
+                for action in &actions {
+                    self.dispatch_recipe_browser_action(action);
+                }
+                return true;
+            }
+            _ => {}
+        }
+        false
+    }
+
     /// JEI-style `R`/`U`/`W` open: navigate to the recipe browser focused
     /// on `item` (recipes/uses detail, or a Ponder scene on the Ponder
     /// tab). A hovered stack is ground truth, so the id lands in the
@@ -4022,6 +4221,40 @@ impl GpuApp {
             self.dispatch_ui_action(&action);
         }
         self.maybe_regrab();
+    }
+
+    /// Per-frame feed for the recipe browser's live inputs: the 20 Hz
+    /// clock driving tag-slot cycling, the player-inventory mirror the
+    /// craftable-only filter + autofill coloring read (rebuilt only when
+    /// `player_inventory_state_id` moves), and a one-shot lang re-ingest
+    /// when the display locale changed.
+    fn sync_recipe_browser_side_state(&mut self) {
+        let browser = &mut self.ui.recipe_browser;
+        browser.clock_ticks = self
+            .frame_start
+            .saturating_duration_since(self.ui_anim_epoch)
+            .as_millis() as u64
+            / 50;
+        if let Some(live) = &self.live {
+            if live.player_inventory_state_id != self.recipe_inventory_state {
+                self.recipe_inventory_state = live.player_inventory_state_id;
+                browser.inventory.clear();
+                for stack in live.player_inventory.values() {
+                    if stack.item_id != 0 && stack.count > 0 {
+                        let id =
+                            crate::recipe_ingest::item_name_for_id(stack.item_id.max(0) as u32);
+                        *browser.inventory.entry(id).or_insert(0) += stack.count as u64;
+                    }
+                }
+            }
+        } else if self.recipe_inventory_state != 0 {
+            self.recipe_inventory_state = 0;
+            browser.inventory.clear();
+        }
+        if browser.active_locale != self.lang_ingested_locale {
+            let _ = crate::recipe_ingest::ingest_lang_into_ui(&self.session_paths, browser);
+            self.lang_ingested_locale = browser.active_locale.clone();
+        }
     }
 
     /// While a container screen is open: hover highlight, plus vanilla
@@ -4059,6 +4292,20 @@ impl GpuApp {
                 }
             }
         }
+        // JEI/EMI overlay hover: the tooltip anchor and `hovered_item`
+        // read `overlay_mouse`/`hover`, fed from the last frame's hit
+        // regions (stale-rect clicks are rejected in `activate` anyway).
+        let overlay_on = self.ui.settings.qol.recipe_overlay_enabled;
+        let browser = &mut self.ui.recipe_browser;
+        browser.overlay_mouse = overlay_on.then_some((mx, my));
+        browser.hover = overlay_on
+            .then(|| {
+                self.recipe_overlay_regions
+                    .iter()
+                    .find(|r| r.contains(mx, my))
+                    .map(|r| r.id)
+            })
+            .flatten();
     }
 
     /// Recompute the chat bar's `/` suggestions through the session's
@@ -4599,6 +4846,7 @@ impl GpuApp {
             dispatch_subworld_helm(live, helm, &mut self.last_subworld_helm);
         }
 
+        self.sync_recipe_browser_side_state();
         // Occluded (minimized / fully covered): zero GPU work. The live
         // session above still polls so the connection stays alive.
         if self.occluded && std::env::var_os("MEGU_DISABLE_OCCLUSION_SLEEP").is_none() {
@@ -4714,6 +4962,17 @@ impl GpuApp {
                 // `live.pending_atlas_pixels` is `None` (`atlas_meta`
                 // stays resident).
                 live.upload_pending_atlas(&mut active.renderer);
+            }
+            if !self.item_icon_atlas_uploaded {
+                if let Some(atlas) = live.item_icon_atlas.take() {
+                    // Same RAM/VRAM split as the block atlas: `rgba`
+                    // uploads once, the uv map stays CPU-side for
+                    // `UiCommand::ItemIcon` tessellation.
+                    active.renderer.upload_item_icon_atlas(&atlas);
+                    self.item_icon_atlas = atlas;
+                    self.item_icon_atlas.rgba = Vec::new();
+                    self.item_icon_atlas_uploaded = true;
+                }
             }
             // `.mcmeta` playback: one `SpriteFrame` rewrite per animated
             // sprite, and only when the client-side 20 Hz clock advanced
@@ -4966,6 +5225,21 @@ impl GpuApp {
         // Server-driven container screen draws above the HUD.
         if let Some(screen) = &self.container_screen {
             screen.render(w as f32, h as f32, draw_list);
+            // JEI/EMI side overlay: bookmark column left, search+grid
+            // right — only when the QoL toggle is on and both columns
+            // fit without overlapping the container panel.
+            if self.ui.settings.qol.recipe_overlay_enabled {
+                let panel = screen.panel_rect(w as f32, h as f32);
+                if let Some((overlay, regions)) = self.ui.recipe_browser.render_overlay(w, h, panel)
+                {
+                    draw_list.commands.extend(overlay.commands);
+                    self.recipe_overlay_regions = regions;
+                } else {
+                    self.recipe_overlay_regions.clear();
+                }
+            } else {
+                self.recipe_overlay_regions.clear();
+            }
             if glint_on {
                 // The window-0 inventory feeds slots straight from
                 // `live.player_inventory`; a server screen renders
@@ -5020,7 +5294,7 @@ impl GpuApp {
         // write (`renderer.ui_cpu_raster_uploads` stays at zero).
         let fingerprint = fingerprint_draw_list(w, h, draw_list);
         if self.ui_cache.should_upload(w, h, fingerprint) {
-            let mesh = tessellate_draw_list(w, h, draw_list);
+            let mesh = tessellate_draw_list_icons(w, h, draw_list, &self.item_icon_atlas);
             active.renderer.update_ui_mesh(w, h, &mesh);
         }
         let render_camera = self.camera_controller.view_camera(&self.camera);
@@ -5375,6 +5649,13 @@ impl GpuApp {
             }
             return;
         }
+        // JEI/EMI side overlay hotkeys (`Ctrl+O` toggle, `A` bookmark,
+        // `R`/`U` detail, `Backspace`/`Esc` history) — the whole chord
+        // lives in `handle_overlay_key` so headless tests drive the same
+        // code path without `ActiveEventLoop`.
+        if self.handle_overlay_key(code, pressed) {
+            return;
+        }
         // JEI hover hotkeys while a container/inventory surface is up:
         // `R` shows recipes, `U` uses, `W` the Ponder scene — but only when
         // a resolvable stack is under the cursor. Otherwise the key keeps
@@ -5383,7 +5664,7 @@ impl GpuApp {
             && !self.paused
             && self.container_screen.is_some()
             && matches!(code, KeyCode::KeyR | KeyCode::KeyU | KeyCode::KeyW)
-            && self.hovered_item_name().is_some()
+            && self.overlay_focused_item().is_some()
         {
             let focus = match code {
                 KeyCode::KeyR => RecipeFocus::Recipes,
@@ -5624,7 +5905,7 @@ impl GpuApp {
                 // Re-verify the hovered stack here — a stale event can
                 // never open a detail view for an item that is not under
                 // the cursor (the key path checks before emitting too).
-                if let Some(item) = self.hovered_item_name() {
+                if let Some(item) = self.overlay_focused_item() {
                     self.open_recipe_browser_focused(&item, focus);
                 }
             }
@@ -6528,6 +6809,7 @@ fn apply_client_settings_to_ui(src: &ClientSettings, ui: &mut UiSettings) {
     ui.qol.prevent_tool_break = src.qol.prevent_tool_break;
     ui.qol.chat_history_lines = src.qol.chat_history_lines;
     ui.qol.retain_chat_on_reconnect = src.qol.retain_chat_on_reconnect;
+    ui.qol.recipe_overlay_enabled = src.seamless_qol.recipe_overlay_enabled;
     ui.qol.crash_report_mode = match src.crash_report_mode {
         ClientCrashReportMode::Ask => UiCrashReportMode::Ask,
         ClientCrashReportMode::AutoCrashOnly => UiCrashReportMode::AutoCrashOnly,
@@ -6737,6 +7019,7 @@ fn ui_to_client_settings(ui: &UiSettings, base: &ClientSettings) -> ClientSettin
     out.qol.prevent_tool_break = ui.qol.prevent_tool_break;
     out.qol.chat_history_lines = ui.qol.chat_history_lines;
     out.qol.retain_chat_on_reconnect = ui.qol.retain_chat_on_reconnect;
+    out.seamless_qol.recipe_overlay_enabled = ui.qol.recipe_overlay_enabled;
     out.crash_report_mode = match ui.qol.crash_report_mode {
         UiCrashReportMode::Ask => ClientCrashReportMode::Ask,
         UiCrashReportMode::AutoCrashOnly => ClientCrashReportMode::AutoCrashOnly,

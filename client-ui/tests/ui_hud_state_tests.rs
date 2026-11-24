@@ -390,6 +390,7 @@ fn all_three_features_compose_through_ui_state_render() {
         match cmd {
             UiCommand::FillRect { rect, .. }
             | UiCommand::BorderRect { rect, .. }
+            | UiCommand::ItemIcon { rect, .. }
             | UiCommand::ProgressBar { rect, .. } => {
                 assert!(rect.x >= 0 && rect.y >= 0);
                 assert!(rect.right() <= VIEW.0 as i32);

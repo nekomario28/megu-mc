@@ -696,6 +696,10 @@ pub struct QolSettings {
     pub chat_scroll_lock: bool,
     /// Non-intrusive top-right toast stack — `true` by default.
     pub toast_notifications: bool,
+    /// JEI/EMI-style recipe browser side panels beside open container
+    /// screens — `false` by default (opt-in; `Ctrl+O` toggles it
+    /// in-game too).
+    pub recipe_overlay_enabled: bool,
 }
 
 impl Default for QolSettings {
@@ -722,6 +726,7 @@ impl Default for QolSettings {
             shulker_tooltip_peek: false,
             chat_scroll_lock: true,
             toast_notifications: true,
+            recipe_overlay_enabled: false,
         }
     }
 }
@@ -1335,6 +1340,7 @@ pub enum SettingKey {
     QolShulkerPeek,
     QolChatScrollLock,
     QolToastNotifications,
+    QolRecipeOverlay,
     FpMinimapMode,
     FpAllowCaveMap,
     FpAllowMobRadar,
@@ -1468,6 +1474,9 @@ impl SettingsTransaction {
             K::QolToastNotifications => {
                 current.qol.toast_notifications == opened.qol.toast_notifications
             }
+            K::QolRecipeOverlay => {
+                current.qol.recipe_overlay_enabled == opened.qol.recipe_overlay_enabled
+            }
             K::FpMinimapMode => current.fair_play.minimap_mode == opened.fair_play.minimap_mode,
             K::FpAllowCaveMap => {
                 current.fair_play.allow_cave_map == opened.fair_play.allow_cave_map
@@ -1598,6 +1607,9 @@ impl SettingsTransaction {
             }
             K::QolToastNotifications => {
                 current.qol.toast_notifications = opened.qol.toast_notifications
+            }
+            K::QolRecipeOverlay => {
+                current.qol.recipe_overlay_enabled = opened.qol.recipe_overlay_enabled
             }
             K::FpMinimapMode => current.fair_play.minimap_mode = opened.fair_play.minimap_mode,
             K::FpAllowCaveMap => current.fair_play.allow_cave_map = opened.fair_play.allow_cave_map,
@@ -2504,6 +2516,7 @@ pub enum WidgetId {
     QolShulkerPeek,
     QolChatScrollLock,
     QolToasts,
+    QolRecipeOverlay,
     // Fair-Play tab
     FpMinimapMode,
     FpCaveMap,
@@ -2634,6 +2647,7 @@ impl WidgetId {
                 | Self::QolShulkerPeek
                 | Self::QolChatScrollLock
                 | Self::QolToasts
+                | Self::QolRecipeOverlay
                 | Self::FpMinimapMode
                 | Self::FpCaveMap
                 | Self::FpMobRadar
@@ -3474,6 +3488,7 @@ impl UiState {
         self.mod_menu.ui_scale = self.ui_scale;
         self.recipe_browser.lang = lang;
         self.recipe_browser.ui_scale = self.ui_scale;
+        self.recipe_browser.active_locale = self.settings.locale.code().to_ascii_lowercase();
         let mut regions = std::mem::take(&mut self.hit_regions);
         layout::layout_screen_into(self, width, height, out, &mut regions);
         if self.screen == Screen::InGameHud {
@@ -3598,6 +3613,7 @@ impl UiState {
     pub fn open_recipe_browser(&mut self) -> Vec<UiAction> {
         self.recipe_browser.lang = self.lang();
         self.recipe_browser.ui_scale = self.ui_scale;
+        self.recipe_browser.active_locale = self.settings.locale.code().to_ascii_lowercase();
         self.navigate(Screen::RecipeBrowser);
         vec![UiAction::OpenScreen(Screen::RecipeBrowser)]
     }
@@ -5020,6 +5036,10 @@ impl UiState {
                 }
                 true
             }
+            WidgetId::QolRecipeOverlay => {
+                q.recipe_overlay_enabled = !q.recipe_overlay_enabled;
+                true
+            }
             WidgetId::FpMinimapMode => {
                 f.minimap_mode = f.minimap_mode.next();
                 true
@@ -5445,6 +5465,7 @@ mod sign_editor_overlay_tests {
                 match cmd {
                     crate::draw::UiCommand::FillRect { rect, .. }
                     | crate::draw::UiCommand::BorderRect { rect, .. }
+                    | crate::draw::UiCommand::ItemIcon { rect, .. }
                     | crate::draw::UiCommand::ProgressBar { rect, .. } => {
                         assert!(rect.x >= 0 && rect.y >= 0, "{cmd:?} left/top overflow @{w}x{h}");
                         assert!(

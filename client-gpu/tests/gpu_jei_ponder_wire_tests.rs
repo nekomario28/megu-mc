@@ -390,8 +390,15 @@ fn jei_ingest_boot_scans_game_dir_mods_in_deterministic_order() {
 
 /// Attach a `Playing` offline session whose window-0 mirror holds a stone
 /// stack at slot 10, then open `E` — the state R/U/W need.
-fn app_with_inventory() -> GpuApp {
-    let mut app = GpuApp::new(GpuCliConfig::default());
+fn app_with_inventory() -> (GpuApp, TempDir) {
+    // Scratch `game_dir`: `Ctrl+O` / settings writes persist under it —
+    // never into the crate root (where the next test's auto-load would
+    // pick them up). The guard is returned so the dir outlives the app.
+    let game = TempDir::new("game");
+    let mut app = GpuApp::new(GpuCliConfig {
+        game_dir: Some(game.0.clone()),
+        ..GpuCliConfig::default()
+    });
     let mut live = LiveSession::offline_with_null_audio();
     live.status = SessionStatus::Playing;
     let mut payload = Vec::new();
@@ -410,12 +417,12 @@ fn app_with_inventory() -> GpuApp {
     app.attach_live(live);
     app.dispatch_input(WindowInputEvent::OpenInventory);
     assert!(app.own_inventory_open());
-    app
+    (app, game)
 }
 
 #[test]
 fn jei_plus_autofill_and_r_u_w_hotkeys_dispatch_in_window_state() {
-    let mut app = app_with_inventory();
+    let (mut app, _game) = app_with_inventory();
     assert_eq!(app.container_slot_count(), Some(46));
 
     // `+` transfer while Playing: the window-0 place_recipe request is
@@ -565,4 +572,234 @@ fn jei_ingest_reads_loose_datapack_dir_and_plural_layouts() {
             .resolve_ingredient(&browser.index.recipe("loose:alloy").unwrap().inputs[0]),
         "loose:ruby"
     );
+}
+
+// ---------------------------------------------------------------------------
+// Test 4 — Ctrl+O overlay toggle + `A`/`R`/`Backspace` overlay hotkeys
+// ---------------------------------------------------------------------------
+
+#[test]
+fn ctrl_o_toggles_overlay_and_a_r_backspace_drive_overlay_state() {
+    let (mut app, _game) = app_with_inventory();
+    assert_eq!(app.container_slot_count(), Some(46));
+    assert!(!app.recipe_overlay_enabled(), "overlay defaults OFF");
+
+    // Ctrl+O flips `recipe_overlay_enabled` in place — twice restores it.
+    app.set_modifiers(winit::keyboard::ModifiersState::CONTROL);
+    assert!(app.handle_overlay_key(winit::keyboard::KeyCode::KeyO, true));
+    assert!(app.recipe_overlay_enabled());
+    assert!(app.handle_overlay_key(winit::keyboard::KeyCode::KeyO, true));
+    assert!(!app.recipe_overlay_enabled());
+    app.handle_overlay_key(winit::keyboard::KeyCode::KeyO, true);
+    app.set_modifiers(winit::keyboard::ModifiersState::empty());
+
+    // `A` bookmarks the hovered container stack (slot 10 = stone).
+    app.set_container_hover(Some(10));
+    assert!(app.handle_overlay_key(winit::keyboard::KeyCode::KeyA, true));
+    assert!(app
+        .recipe_browser()
+        .bookmarks
+        .iter()
+        .any(|b| b == "minecraft:stone"));
+    // Second `A` toggles it back off.
+    assert!(app.handle_overlay_key(winit::keyboard::KeyCode::KeyA, true));
+    assert!(!app
+        .recipe_browser()
+        .bookmarks
+        .iter()
+        .any(|b| b == "minecraft:stone"));
+
+    // `R` opens Recipes *inside the overlay* — the owning screen stays
+    // put (container is never navigated away to full-screen).
+    let screen_before = app.screen();
+    assert!(app.handle_overlay_key(winit::keyboard::KeyCode::KeyR, true));
+    assert_eq!(app.screen(), screen_before);
+    assert_eq!(
+        app.recipe_browser().detail,
+        Some(("minecraft:stone".to_owned(), DetailMode::Recipes))
+    );
+    // Backspace walks detail history back, keeping the container open.
+    assert!(app.handle_overlay_key(winit::keyboard::KeyCode::Backspace, true));
+    assert!(app.recipe_browser().detail.is_none());
+    assert_eq!(app.screen(), screen_before);
+    assert!(app.own_inventory_open());
+}
+
+// ---------------------------------------------------------------------------
+// Test 5 — en_us + active-locale lang ingest (arbitrary locale, zero
+// hardcoding), furnace_fuels data map, and the item-icon atlas
+// ---------------------------------------------------------------------------
+
+/// Minimal real PNG encoder: `w*h` RGBA8, one zlib stream per file —
+/// enough for the lazy-JAR asset layer to decode like a mod sprite.
+fn tiny_png(w: u32, h: u32, rgba: [u8; 4]) -> Vec<u8> {
+    let mut row = Vec::with_capacity((w * 4 + 1) as usize);
+    row.push(0); // filter: none
+    for _ in 0..w {
+        row.extend_from_slice(&rgba);
+    }
+    let raw = row.repeat(h as usize);
+    // zlib stream: 0x78 0x01 + stored deflate blocks + adler32.
+    let mut z = vec![0x78u8, 0x01];
+    let mut chunks = raw.chunks(u16::MAX as usize).peekable();
+    while let Some(block) = chunks.next() {
+        let last = chunks.peek().is_none();
+        z.push(if last { 1 } else { 0 });
+        z.extend_from_slice(&(block.len() as u16).to_le_bytes());
+        z.extend_from_slice(&(!(block.len() as u16)).to_le_bytes());
+        z.extend_from_slice(block);
+    }
+    // adler32 of the uncompressed data.
+    let (mut a, mut b) = (1u32, 0u32);
+    for &byte in &raw {
+        a = (a + u32::from(byte)) % 65521;
+        b = (b + a) % 65521;
+    }
+    z.extend_from_slice(&(b << 16 | a).to_be_bytes());
+
+    let mut out = vec![0x89, b'P', b'N', b'G', 0x0d, 0x0a, 0x1a, 0x0a];
+    let mut chunk = |tag: &[u8; 4], data: &[u8]| {
+        out.extend_from_slice(&(data.len() as u32).to_be_bytes());
+        let start = out.len();
+        out.extend_from_slice(tag);
+        out.extend_from_slice(data);
+        let crc = megu_core::hash::crc32_ieee(&out[start..]);
+        out.extend_from_slice(&crc.to_be_bytes());
+    };
+    let mut ihdr = w.to_be_bytes().to_vec();
+    ihdr.extend_from_slice(&h.to_be_bytes());
+    ihdr.extend_from_slice(&[8, 6, 0, 0, 0]); // 8-bit RGBA
+    chunk(b"IHDR", &ihdr);
+    chunk(b"IDAT", &z);
+    chunk(b"IEND", &[]);
+    out
+}
+
+#[test]
+fn lang_fuels_and_icon_atlas_ingest_arbitrary_mods_and_locales() {
+    let tmp = TempDir::new("lang");
+    let jar = tmp.0.join("my_mod-2.0.0.jar");
+
+    let en = br#"{ "item.my_mod.widget": "Gizmo Widget" }"#;
+    let fr = br#"{ "item.my_mod.widget": "Bidule Gizmo" }"#;
+    let fuels = br##"{
+        "values": {
+            "my_mod:star_dust": { "burn_time": 2400 },
+            "#my_mod:reactor_rods": { "burn_time": 4800 }
+        }
+    }"##;
+    let rods_tag = br#"{
+        "replace": false,
+        "values": ["my_mod:rod_a", "my_mod:rod_b"]
+    }"#;
+    let sprite = tiny_png(16, 16, [30, 200, 120, 255]);
+    std::fs::write(
+        &jar,
+        deflate_zip(&[
+            ("assets/my_mod/lang/en_us.json", en.as_slice()),
+            ("assets/my_mod/lang/fr_fr.json", fr.as_slice()),
+            ("assets/my_mod/textures/item/widget.png", sprite.as_slice()),
+            (
+                "data/my_mod/data_maps/item/furnace_fuels.json",
+                fuels.as_slice(),
+            ),
+            (
+                "data/my_mod/tags/item/reactor_rods.json",
+                rods_tag.as_slice(),
+            ),
+        ]),
+    )
+    .unwrap();
+
+    // --- Lang: English + arbitrary active locale, zero hardcoding. ---
+    let mut browser = RecipeBrowserState::default();
+    let report = megu_client_gpu::recipe_ingest::ingest_lang_into_index(
+        std::slice::from_ref(&jar),
+        &["fr_fr".to_owned()],
+        &mut browser.index,
+    );
+    assert_eq!(report.sources_scanned, 1);
+    assert_eq!(report.json_failed, 0, "notes: {:?}", report.notes);
+    let entry = browser
+        .index
+        .item("my_mod:widget")
+        .expect("lang-only item is catalogued");
+    assert_eq!(entry.display_name, "Gizmo Widget");
+    assert_eq!(
+        entry.localized_names.get("fr_fr").map(String::as_str),
+        Some("Bidule Gizmo")
+    );
+    browser.active_locale = "fr_fr".to_owned();
+    assert_eq!(
+        browser
+            .index
+            .display_name_for_locale("my_mod:widget", "fr_fr"),
+        "Bidule Gizmo"
+    );
+    assert_eq!(
+        browser
+            .index
+            .display_name_for_locale("my_mod:widget", "en_us"),
+        "Gizmo Widget"
+    );
+    // Search hits BOTH the English name and the active-locale name.
+    browser.search = "gizmo".into();
+    assert_eq!(browser.visible_items().len(), 1);
+    browser.search = "bidule".into();
+    let ids: Vec<&str> = browser
+        .visible_items()
+        .iter()
+        .map(|&i| browser.index.items[i].id.as_str())
+        .collect();
+    assert_eq!(ids, ["my_mod:widget"]);
+
+    // --- NeoForge furnace_fuels data map: item + symbolic #tag rows. ---
+    let report2 = ingest_mod_jars_into_ui(std::slice::from_ref(&jar), &mut browser);
+    assert!(report2.fuels >= 2, "fuels: {}", report2.fuels);
+    assert!(browser
+        .index
+        .fuels
+        .iter()
+        .any(|f| f.item == "my_mod:star_dust" && f.burn_ticks == 2400));
+    assert!(browser
+        .index
+        .fuels
+        .iter()
+        .any(|f| f.item == "#my_mod:reactor_rods" && f.burn_ticks == 4800));
+
+    // --- Item-icon atlas from the same JAR's decoded PNG sprites. ---
+    let (layer, read) =
+        megu_client_gpu::vanilla_jar::zip_pack_layer(&jar).expect("pack layer reads");
+    assert_eq!(read.entries_seen, 5);
+    assert!(!layer.sprites.is_empty(), "sprite must decode");
+    let atlas = megu_client_gpu::recipe_ingest::build_item_icon_atlas(&[layer]);
+    assert!(atlas.uv("my_mod:widget").is_some(), "widget icon packed");
+    assert!(!atlas.rgba.is_empty() && atlas.width >= 16);
+
+    // Real icon quads get the atlas uv; unknown ids keep the deterministic
+    // swatch + monogram fallback (never blank).
+    use megu_ui::draw::{tessellate_draw_list_icons, UiDrawList, UiRect};
+    let mut list = UiDrawList::new();
+    list.item_icon(UiRect::new(0, 0, 18, 18), "my_mod:widget");
+    let mesh = tessellate_draw_list_icons(64, 64, &list, &atlas);
+    assert_eq!(mesh.vertices.len(), 4);
+    let uv = atlas.uv("my_mod:widget").unwrap();
+    // The atlas is resolved (icon uvs carry the negative-u icon-texture
+    // marker — the same rect the atlas stored, shifted out of font space).
+    assert!(
+        (mesh.vertices[0].uv[0] - (uv[0] - 2.0)).abs() < 0.01,
+        "real uv used: {:?} vs {:?}",
+        mesh.vertices[0].uv,
+        uv
+    );
+
+    let mut list2 = UiDrawList::new();
+    list2.item_icon(UiRect::new(0, 0, 18, 18), "missing:thing");
+    let mesh2 = tessellate_draw_list_icons(64, 64, &list2, &atlas);
+    assert!(mesh2.vertices.len() >= 4, "fallback still tessellates");
+    assert!(
+        mesh2.vertices.iter().all(|v| v.uv[0] >= 0.0),
+        "fallback must not sample the icon atlas"
+    );
+    assert_eq!(tmp.file_count(), 1, "zero extraction: {:?}", tmp.0);
 }

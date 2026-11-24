@@ -43,8 +43,8 @@ use megu_core::zip_archive::LazyZipIndex;
 use megu_proto::table::ProtocolTable;
 use megu_ui::draw::UiColor;
 use megu_ui::recipe_browser::{
-    item_color, AnimatedPart, DungeonLootEntry, ItemEntry, MobDropEntry, PonderAnim, PonderAxis,
-    PonderScene, PonderStep, RecipeBrowserState, RecipeIndex, RecipeIngredient,
+    item_color, AnimatedPart, DungeonLootEntry, FuelEntry, ItemEntry, MobDropEntry, PonderAnim,
+    PonderAxis, PonderScene, PonderStep, RecipeBrowserState, RecipeIndex, RecipeIngredient,
 };
 use megu_ui::state::UiLang;
 
@@ -108,6 +108,8 @@ pub struct IngestReport {
     pub dungeon_loot: usize,
     /// New [`ItemEntry`] catalog rows created.
     pub items_registered: usize,
+    /// `furnace_fuels` data-map rows loaded (JER Fuels tab).
+    pub fuels: usize,
     /// Total `data/` JSONs that could not be parsed at all.
     pub json_failed: usize,
     /// Bounded per-entry failure record (`"<source>: <entry>: <reason>"`).
@@ -235,6 +237,8 @@ enum DataKind<'a> {
     EntityLoot { ns: &'a str, rel: &'a str },
     /// `.../loot_table(s)/chests/<rel>.json` → chest id `<ns>:chests/<rel>`.
     ChestLoot { ns: &'a str, rel: &'a str },
+    /// `data/<ns>/data_maps/item/furnace_fuels.json` — NeoForge fuel map.
+    FuelDataMap,
 }
 
 fn classify(entry: &str) -> Option<DataKind<'_>> {
@@ -258,6 +262,9 @@ fn classify(entry: &str) -> Option<DataKind<'_>> {
                 .filter(|rel| !rel.is_empty())
                 .map(|rel| DataKind::ItemTag { ns, rel });
         }
+    }
+    if path == "data_maps/item/furnace_fuels.json" {
+        return Some(DataKind::FuelDataMap);
     }
     for root in ["loot_table/", "loot_tables/"] {
         if let Some(rest) = path.strip_prefix(root) {
@@ -313,6 +320,137 @@ pub fn ingest_mod_jars_into_ui(jars: &[PathBuf], browser: &mut RecipeBrowserStat
         work.ingest_jar(jar);
     }
     work.finish()
+}
+
+// ---------------------------------------------------------------------------
+// Lang files — English (`en_us`) + the active display locale
+// ---------------------------------------------------------------------------
+
+/// Bounded caps for the lang pass (separate from the `data/` pass).
+const MAX_LANG_FILES: usize = 4_096;
+const MAX_LANG_ENTRIES: usize = 524_288;
+
+/// Read every `assets/<ns>/lang/{en_us,<locale>}.json` in `jar` (mod or
+/// vanilla JAR — [`crate::vanilla_jar::read_selected_entries`] walks one
+/// level of Jar-in-Jar too, so bundled mods contribute their lang files)
+/// and merge the `item.*`/`block.*` names into `index` under `locale`.
+///
+/// `en_us` always loads; `locale` loads in addition when it differs, so
+/// search matches English + the active display language for **any** mod
+/// and **any** locale — zero hardcoding.
+pub fn ingest_lang_into_index(
+    jar_paths: &[PathBuf],
+    locales: &[String],
+    index: &mut RecipeIndex,
+) -> IngestReport {
+    let mut report = IngestReport::default();
+    let want: BTreeSet<String> = std::iter::once("en_us".to_owned())
+        .chain(locales.iter().map(|l| l.to_ascii_lowercase()))
+        .collect();
+    for jar in jar_paths {
+        let source = jar
+            .file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_else(|| jar.display().to_string());
+        let (entries, read) = match crate::vanilla_jar::read_selected_entries(jar, |name| {
+            if !name.starts_with("assets/") || !name.ends_with(".json") {
+                return false;
+            }
+            let Some((ns, cat, sub)) = lang_subpath(name) else {
+                return false;
+            };
+            let _ = ns;
+            cat == "lang" && want.contains(&sub)
+        }) {
+            Ok(ok) => ok,
+            Err(err) => {
+                report.sources_failed += 1;
+                report.note(&source, "<index>", &err.to_string());
+                continue;
+            }
+        };
+        report.sources_scanned += 1;
+        report.entries_seen += read.entries_seen;
+        for (name, reason) in &read.skipped {
+            report.note(&source, name, reason);
+        }
+        for entry in entries.into_iter().take(MAX_LANG_FILES) {
+            let Some((_, _, locale)) = lang_subpath(&entry.name) else {
+                continue;
+            };
+            let Ok(text) = String::from_utf8(entry.bytes) else {
+                report.json_failed += 1;
+                continue;
+            };
+            let Some(root) = parse_json(&text) else {
+                report.json_failed += 1;
+                continue;
+            };
+            let Some(obj) = root.as_object() else {
+                continue;
+            };
+            let mut map = BTreeMap::new();
+            for (key, value) in obj.iter().take(MAX_LANG_ENTRIES) {
+                if let Json::Str(name) = value {
+                    map.insert(key.clone(), name.clone());
+                }
+            }
+            index.apply_lang_map(&locale, &map);
+            report.tags_loaded += map.len();
+        }
+    }
+    report
+}
+
+/// `assets/<ns>/lang/<locale>.json` → `(ns, "lang", locale)` — the
+/// locale is the filename stem, lowercased to match
+/// [`RecipeBrowserState::active_locale`](megu_ui::recipe_browser::RecipeBrowserState::active_locale).
+fn lang_subpath(name: &str) -> Option<(String, String, String)> {
+    let rest = name.strip_prefix("assets/")?;
+    let (ns, tail) = rest.split_once('/')?;
+    let (category, file) = tail.split_once('/')?;
+    let stem = file.strip_suffix(".json")?;
+    if ns.is_empty() || category.is_empty() || stem.is_empty() {
+        return None;
+    }
+    Some((
+        ns.to_owned(),
+        category.to_owned(),
+        stem.to_ascii_lowercase(),
+    ))
+}
+
+/// Convenience wrapper: all JAR sources [`SessionPaths`] implies.
+pub fn ingest_lang_into_ui(paths: &SessionPaths, browser: &mut RecipeBrowserState) -> IngestReport {
+    let locale = browser.active_locale.clone();
+    ingest_lang_into_index(&collect_jar_paths(paths), &[locale], &mut browser.index)
+}
+
+// ---------------------------------------------------------------------------
+// UI item-icon atlas — pack decoded `assets/*/textures/{item,block}` sprites
+// ---------------------------------------------------------------------------
+
+/// Build the UI item-icon atlas from the *already decoded* pack layers the
+/// block atlas pipeline assembled (zero extra JAR reads). Highest-priority
+/// layer wins per id, matching resource-pack semantics; `item/` sprites
+/// outrank `block/` for the same id; `ns:item/foo` → icon id `ns:foo`.
+pub fn build_item_icon_atlas(
+    layers: &[megu_client_mesh::asset_pipeline::ResourcePackLayer],
+) -> megu_ui::draw::ItemIconAtlas {
+    let mut builder = megu_ui::draw::ItemIconAtlasBuilder::new();
+    for layer in layers.iter().rev() {
+        for (key, (w, h, rgba)) in &layer.sprites {
+            let Some((ns, stem)) = key.split_once(':') else {
+                continue;
+            };
+            for prefix in ["item/", "block/"] {
+                if let Some(path) = stem.strip_prefix(prefix) {
+                    builder.add(&format!("{ns}:{path}"), *w, *h, rgba);
+                }
+            }
+        }
+    }
+    builder.finish()
 }
 
 /// Humanized catalog title (`"some_mod:my_item/thing"` → `"Thing"` → title case).
@@ -440,9 +578,39 @@ impl<'a> IngestWork<'a> {
         }
     }
 
-    /// After all sources: resolve nested `#tag` refs and stamp memberships.
+    /// After all sources: resolve nested `#tag` refs and stamp memberships,
+    /// then seed the tag-driven vanilla fuel fallback when no data map
+    /// declared fuels (vanilla 1.21.1 ships no `furnace_fuels` map — its
+    /// burn table lives in code; these tag memberships are the data-driven
+    /// part of it, so the fallback emits `#tag` rows, never item lists).
     fn finish(mut self) -> IngestReport {
         self.apply_tags();
+        if self.index.fuels.is_empty() {
+            // `(tag, burn_ticks)` — the NeoForge vanilla data map's own
+            // tag-keyed share (200 ticks = 1 item smelted).
+            const FALLBACK_TAGS: &[(&str, u32)] = &[
+                ("minecraft:logs", 300),
+                ("minecraft:planks", 300),
+                ("minecraft:wooden_slabs", 150),
+                ("minecraft:coals", 1600),
+                ("minecraft:wool", 100),
+                ("minecraft:boats", 1200),
+            ];
+            for (tag, burn) in FALLBACK_TAGS {
+                if !self
+                    .index
+                    .items
+                    .iter()
+                    .any(|e| e.tags.iter().any(|t| t == tag))
+                {
+                    continue; // absent tag — no fuel row to claim.
+                }
+                self.index.fuels.push(FuelEntry {
+                    item: format!("#{tag}"),
+                    burn_ticks: *burn,
+                });
+            }
+        }
         self.report
     }
 
@@ -605,6 +773,51 @@ impl<'a> IngestWork<'a> {
                 if self.loot_docs_seen.insert(chest.clone()) {
                     self.ingest_loot(source, "", Some(&chest), text);
                 }
+            }
+            DataKind::FuelDataMap => self.ingest_fuel_map(source, text),
+        }
+    }
+
+    /// NeoForge `furnace_fuels` item data map:
+    /// `{"values":{"<id|#tag>":{"burn_time":N}}}` → [`FuelEntry`] rows.
+    /// Entries keyed by `#tag` stay symbolic — the Fuels tab resolves
+    /// them through the item-tag index.
+    fn ingest_fuel_map(&mut self, source: &str, text: &str) {
+        let Some(root) = parse_json(text) else {
+            self.report.json_failed += 1;
+            self.report
+                .note(source, "furnace_fuels", "data map malformed");
+            return;
+        };
+        let Some(values) = root
+            .as_object()
+            .and_then(|o| o.get("values"))
+            .and_then(Json::as_object)
+        else {
+            return; // an empty/disabled map is legal — nothing to add.
+        };
+        for (id, payload) in values.iter().take(MAX_TAG_VALUES) {
+            let Some(burn) = payload
+                .as_object()
+                .and_then(|o| o.get("burn_time"))
+                .and_then(Json::as_f64)
+            else {
+                continue;
+            };
+            if !(1.0..=1_000_000.0).contains(&burn) {
+                continue;
+            }
+            if !id.is_empty() && self.index.fuels.len() < MAX_LOOT_ROWS {
+                self.index.fuels.push(FuelEntry {
+                    item: id.clone(),
+                    burn_ticks: burn.round() as u32,
+                });
+                self.report.fuels += 1;
+            }
+            if let Some(item) = id.strip_prefix('#') {
+                let _ = item; // tag fuel stays symbolic; members resolve at view time.
+            } else {
+                self.ensure_item(id);
             }
         }
     }

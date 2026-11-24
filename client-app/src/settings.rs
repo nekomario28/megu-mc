@@ -491,6 +491,9 @@ pub struct ClientSeamlessQolSettings {
     /// Show the non-intrusive top-right toast stack (connection status,
     /// warnings). `true` by default.
     pub toast_notifications: bool,
+    /// JEI/EMI-style recipe side-overlay beside open containers
+    /// (`Ctrl+O` toggles it in-game). `false` by default — opt-in.
+    pub recipe_overlay_enabled: bool,
 }
 
 impl Default for ClientSeamlessQolSettings {
@@ -503,6 +506,7 @@ impl Default for ClientSeamlessQolSettings {
             shulker_tooltip_peek: true,
             chat_scroll_lock: true,
             toast_notifications: true,
+            recipe_overlay_enabled: false,
         }
     }
 }
@@ -835,7 +839,8 @@ impl ClientSettings {
              food_saturation_preview = {}\n\
              shulker_tooltip_peek = {}\n\
              chat_scroll_lock = {}\n\
-             toast_notifications = {}\n",
+             toast_notifications = {}\n\
+             recipe_overlay_enabled = {}\n",
             self.preset.as_str(),
             self.view_distance,
             self.distant_horizon.as_str(),
@@ -887,6 +892,7 @@ impl ClientSettings {
             self.seamless_qol.shulker_tooltip_peek,
             self.seamless_qol.chat_scroll_lock,
             self.seamless_qol.toast_notifications,
+            self.seamless_qol.recipe_overlay_enabled,
         ) + &format!(
             "\n[keys]\nforward = \"{}\"\nback = \"{}\"\nleft = \"{}\"\nright = \"{}\"\njump = \"{}\"\nsneak = \"{}\"\nsprint = \"{}\"\ninventory = \"{}\"\ndrop = \"{}\"\nswap_offhand = \"{}\"\nchat = \"{}\"\ncommand = \"{}\"\nzoom = \"{}\"\ncamera_toggle = \"{}\"\nfullscreen = \"{}\"\nadvancements = \"{}\"\nsort_inventory = \"{}\"\n",
             self.keys.forward,
@@ -1047,6 +1053,10 @@ impl ClientSettings {
                 "chat_scroll_lock" => self.seamless_qol.chat_scroll_lock = parsed.seamless_qol.chat_scroll_lock,
                 "toast_notifications" => {
                     self.seamless_qol.toast_notifications = parsed.seamless_qol.toast_notifications;
+                }
+                "recipe_overlay_enabled" => {
+                    self.seamless_qol.recipe_overlay_enabled =
+                        parsed.seamless_qol.recipe_overlay_enabled;
                 }
                 "crash_report_mode" => self.crash_report_mode = parsed.crash_report_mode,
                 "report_endpoint" => self.report_endpoint = parsed.report_endpoint.clone(),
@@ -1635,6 +1645,13 @@ impl ClientSettings {
                     }
                     None => invalid(&mut warnings),
                 },
+                "recipe_overlay_enabled" => match parse_bool(value) {
+                    Some(b) => {
+                        settings.seamless_qol.recipe_overlay_enabled = b;
+                        seen.push("recipe_overlay_enabled");
+                    }
+                    None => invalid(&mut warnings),
+                },
                 other => warnings.push(format!("unknown key '{other}' ignored")),
             }
         }
@@ -2102,6 +2119,7 @@ mod tests {
                 shulker_tooltip_peek: false,
                 chat_scroll_lock: false,
                 toast_notifications: false,
+                recipe_overlay_enabled: true,
             },
             crash_report_mode: CrashReportMode::AutoCrashOnly,
             report_endpoint: Some("https://reports.example.com/api/report".to_owned()),
@@ -2138,6 +2156,8 @@ mod tests {
         assert!(q.shulker_tooltip_peek);
         assert!(q.chat_scroll_lock);
         assert!(q.toast_notifications);
+        // The recipe side-overlay is a strict opt-in.
+        assert!(!q.recipe_overlay_enabled);
     }
 
     #[test]
@@ -2151,6 +2171,7 @@ mod tests {
                 shulker_tooltip_peek: false,
                 chat_scroll_lock: false,
                 toast_notifications: false,
+                recipe_overlay_enabled: true,
             },
             ..ClientSettings::default()
         };

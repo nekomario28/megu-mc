@@ -460,6 +460,40 @@ impl CliConfig {
         self.resolve_client_settings_inner(auto_dir, None)
     }
 
+    /// `true` when any settings-domain flag was passed on the command
+    /// line — visual tuning, shaders, fair-play knobs, or consent/egress
+    /// (`--crash-report-mode`, `--report-endpoint`, …). Launcher
+    /// plumbing flags (`--username`, `--gameDir`, `--server`, …) do not
+    /// count: a launcher-booted first launch still auto-tunes.
+    fn has_explicit_settings_flags(&self) -> bool {
+        self.view_distance_explicit
+            || self.fov.is_some()
+            || self.distant_horizon.is_some()
+            || self.clouds.is_some()
+            || self.particles.is_some()
+            || self.smooth_lighting.is_some()
+            || self.entity_shadows.is_some()
+            || self.vsync.is_some()
+            || self.max_fps.is_some()
+            || self.background_fps.is_some()
+            || self.gpu_backend.is_some()
+            || self.shader_pack.is_some()
+            || self.shader_profile.is_some()
+            || self.fair_play
+            || self.minimap_mode.is_some()
+            || self.allow_cave_map.is_some()
+            || self.allow_entity_radar.is_some()
+            || self.allow_mob_radar.is_some()
+            || self.player_radar.is_some()
+            || self.allow_waypoint_teleport.is_some()
+            || self.import_vanilla_options.is_some()
+            || self.crash_report_mode.is_some()
+            || self.report_endpoint.is_some()
+            || self.crash_reports_dir.is_some()
+            || self.flush_crash_reports
+            || self.confirm_send
+    }
+
     /// [`CliConfig::resolve_client_settings_from`] with an injectable
     /// host probe: `Some(profile)` skips the live [`probe_host_hardware`]
     /// call so tests stay deterministic.
@@ -480,13 +514,18 @@ impl CliConfig {
             auto.is_file().then_some(auto)
         });
 
-        // `--auto-tune` — and any true first launch with no user TOML or
-        // `--preset` base — seeds the base from the probed host hardware
-        // BEFORE the settings file, the options.txt import, and explicit
-        // flags are overlaid, so every manual value always wins over the
-        // recommendation. An existing `megu-client.toml` suppresses the
-        // automatic seed entirely; it is never rewritten.
-        if self.auto_tune || (file_path.is_none() && self.preset.is_none()) {
+        // `--auto-tune` — and any true first launch with no user TOML,
+        // `--preset` base, or explicit settings flag — seeds the base
+        // from the probed host hardware BEFORE the settings file, the
+        // options.txt import, and explicit flags are overlaid, so every
+        // manual value always wins over the recommendation. An existing
+        // `megu-client.toml` or any explicit settings flag (including
+        // consent/egress keys like `--crash-report-mode`) means the user
+        // is already steering: not a first launch, no seed. The file is
+        // never rewritten.
+        if self.auto_tune
+            || (file_path.is_none() && self.preset.is_none() && !self.has_explicit_settings_flags())
+        {
             let profile = hardware_profile.unwrap_or_else(probe_host_hardware);
             recommend_tuning(&profile).apply_to(&mut settings);
             source_present = true;
