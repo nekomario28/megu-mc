@@ -61,6 +61,14 @@
 //!   `mods/` scanner: deterministic `.jar` discovery (plus the optional
 //!   `<mc_version>` subfolder) with a typed [`mods_dir::ModsDirSkipReason`]
 //!   for every entry it sets aside.
+//! * [`modrinth_sync`] — zero-redistribution Modrinth support: the ToS
+//!   `User-Agent`/rate-limit/attribution contract, a strict
+//!   `modrinth.index.json` (`.mrpack`) parser/writer with fail-closed path
+//!   and CDN-URL checks, the server-push
+//!   [`modrinth_sync::ServerModSyncManifest`] -> [`modrinth_sync::ModSyncPlan`]
+//!   diff, and the deterministic dependency/conflict resolver. Mod jars
+//!   are never bundled — only IDs, hashes and verified
+//!   `cdn.modrinth.com` URLs cross the wire.
 //! * [`perf_cache`] — zero-side-effect performance caches: a shared
 //!   `Arc<[u8]>` compressed chunk packet cache keyed on every
 //!   rendering/protocol discriminator, a view-direction chunk send queue
@@ -91,6 +99,7 @@ pub mod eula;
 pub mod installer;
 pub mod json;
 pub mod lists;
+pub mod modrinth_sync;
 pub mod mods_dir;
 pub mod optifine_compat;
 pub mod pack_loader;
