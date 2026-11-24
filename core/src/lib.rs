@@ -99,6 +99,9 @@
 //!   GPU/inventory arrays, the [`diff_engine::SubtileDiffMask`] 64-bit
 //!   `4³` sub-tile locality mask for `16³` voxel sections, and the
 //!   [`diff_engine::FieldDiffBitset`] zero-alloc 64-field dirty tracker.
+//! * [`crowd_physics`] — zero-dependency 3D micro-cell indexing, bounded
+//!   crowd push/sync/sleep policies, floor-support caching, and per-cell
+//!   render/pose budgets for dense entity groups.
 //! * [`math_opt_engine`] — four paper-backed, allocation-free mathematical
 //!   engines: a [`math_opt_engine::DiscountedUcbAutotuner`] Discounted-UCB
 //!   non-stationary bandit (Garivier & Moulines 2011) that detects kernel
@@ -177,6 +180,7 @@
 pub mod bits;
 pub mod coords;
 pub mod crash_report;
+pub mod crowd_physics;
 pub mod crypto;
 pub mod diff_engine;
 pub mod dye_and_items;
