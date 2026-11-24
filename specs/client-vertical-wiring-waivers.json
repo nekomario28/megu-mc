@@ -250,21 +250,9 @@
     },
     {
       "check": "screen_state_reachability",
-      "id": "Screen::ModMenu",
-      "priority": "P2",
-      "reason": "reached via UiState::open_mod_menu from internal widget ids; variant never named by the host"
-    },
-    {
-      "check": "screen_state_reachability",
       "id": "Screen::ModSyncConsent",
       "priority": "P1",
       "reason": "unreachable \u2014 nothing navigates to it and pending_mod_sync is never populated; the consent gate is dead code"
-    },
-    {
-      "check": "screen_state_reachability",
-      "id": "Screen::RecipeBrowser",
-      "priority": "P2",
-      "reason": "reached via ui.open_recipe_browser() from window.rs \u2014 method-level wiring, variant never named in client-gpu"
     },
     {
       "check": "screen_state_reachability",

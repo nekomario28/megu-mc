@@ -71,11 +71,12 @@ use megu_ui::state::{
 use megu_ui::state::{ScoreboardState, TitleOverlayState, invite_code_display};
 use winit::application::ApplicationHandler;
 use winit::dpi::PhysicalSize;
-use winit::event::{DeviceEvent, DeviceId, ElementState, MouseButton, WindowEvent};
+use winit::event::{DeviceEvent, DeviceId, ElementState, Ime, MouseButton, WindowEvent};
 use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop};
-use winit::keyboard::{KeyCode, PhysicalKey};
+use winit::keyboard::{KeyCode, ModifiersState, PhysicalKey};
 use winit::window::{CursorGrabMode, Fullscreen, Window, WindowAttributes, WindowId};
 
+use crate::clipboard::{ClipboardOutcome, SystemClipboard};
 use crate::live_session::{
     CrosshairPick, LiveSession, PlayerMovement, PlayerPose, SessionPaths, SessionStatus,
     jar_version_ids,
@@ -116,6 +117,10 @@ const FRIEND_TIMEOUT: Duration = Duration::from_secs(10);
 /// doubles as the worker's event poll, so allowlist refreshes (friend
 /// removal kicks) apply within about this window.
 const FRIEND_SHARE_TIMEOUT: Duration = Duration::from_secs(3);
+
+/// Vanilla's chat length cap — paste and IME feeds into the chat bar
+/// stop at this many characters.
+const CHAT_FIELD_MAX_CHARS: usize = 256;
 
 /// Non-registry menu id for the client-side window-0 player inventory —
 /// `menu_schema` owns `0..=24` and this sentinel can never collide.
@@ -650,6 +655,25 @@ pub struct GpuApp {
     /// Debounced atomic writer for `persisted_settings` — dirty-only,
     /// byte-compare, temp-file + rename (`SettingsSaveGuard`).
     settings_save_guard: megu_client::settings::SettingsSaveGuard,
+    /// OS clipboard backend + in-process fallback (see
+    /// [`crate::clipboard`]): `CopyInvite`/`Ctrl+C` writes and `Ctrl+V`
+    /// reads land here, degrading to the in-app buffer when no display
+    /// or clipboard tool exists.
+    clipboard: SystemClipboard,
+    /// Last delivered `ModifiersChanged` state — `Ctrl` (and `Cmd` on
+    /// macOS) gates the copy/paste chords on text surfaces.
+    modifiers: ModifiersState,
+    /// Live IME composition string from `Ime::Preedit` — cleared on
+    /// `Commit`/`Disabled` so a stale preedit can never double-insert.
+    ime_preedit: Option<String>,
+    /// Last `set_ime_allowed` pushed to the window: `true` while a text
+    /// surface owns typing, `false` during raw WASD gameplay so the IME
+    /// can never hijack movement keys.
+    ime_allowed: bool,
+    /// Platforms that echo `Ime::Commit` again inside the following
+    /// `KeyEvent.text` would double-insert; the commit string + instant
+    /// is recorded so the keyboard path can swallow the echo.
+    last_ime_commit: Option<(String, Instant)>,
     /// QoL container sorter armed by the `SortInventory` keybind.
     inventory_sort: InventorySortState,
     /// Launcher filesystem paths handed to every `LiveSession` this app
@@ -933,6 +957,11 @@ impl GpuApp {
             persisted_settings,
             active_shaderpack_path: None,
             settings_path,
+            clipboard: SystemClipboard::new(),
+            modifiers: ModifiersState::empty(),
+            ime_preedit: None,
+            ime_allowed: false,
+            last_ime_commit: None,
             inventory_sort: InventorySortState::default(),
             session_paths,
             mod_sync_worker: None,
@@ -1489,10 +1518,18 @@ impl GpuApp {
                 Err(err) => self.status_line(format!("Invite: {err}")),
             },
             UiAction::CopyInvite(code) => {
-                // No clipboard backend is linked into this binary; the code
-                // stays visible on the Friends screen and the status line
-                // reports the dispatch instead of dropping it.
-                self.status_line(format!("Invite code {code} — share it with a friend"));
+                // The code stays visible on the Friends screen; the
+                // status line says which store actually holds it (a
+                // headless/missing-tool session only has the in-app
+                // buffer).
+                match self.clipboard.set_text(code) {
+                    ClipboardOutcome::System => {
+                        self.status_line(format!("Invite code {code} copied to clipboard"))
+                    }
+                    ClipboardOutcome::Fallback => {
+                        self.status_line(format!("Invite code {code} copied (in-app buffer)"))
+                    }
+                }
             }
             UiAction::RevokeInvite => {
                 self.ui.active_invite = None;
@@ -1541,12 +1578,18 @@ impl GpuApp {
             }
             UiAction::LeaveWorld => self.leave_world_for_title(),
             UiAction::RecipeBrowser(action) => self.dispatch_recipe_browser_action(action),
-            // No clipboard backend is linked into this binary (same
-            // stance as `CopyInvite` above): the text stays visible on
-            // screen and the status line reports the dispatch.
-            UiAction::CopyText(text) => {
-                self.status_line(format!("Copy: {}…", truncate_for_status(text)));
-            }
+            // Copy buttons on friend rows/guest links — same honest
+            // reporting as `CopyInvite`: system store vs in-app buffer,
+            // with a truncated preview so the click reads back what it
+            // copied.
+            UiAction::CopyText(text) => match self.clipboard.set_text(text) {
+                ClipboardOutcome::System => self
+                    .status_line(format!("Copied to clipboard: {}", truncate_for_status(text))),
+                ClipboardOutcome::Fallback => self.status_line(format!(
+                    "Copied (in-app buffer): {}",
+                    truncate_for_status(text)
+                )),
+            },
             UiAction::AddFriend { name, friend_id } => self.add_friend(name, friend_id),
             UiAction::RemoveFriend { friend_id } => self.remove_friend(friend_id),
             UiAction::SetFriendShareMode(mode) => self.set_friend_share_mode(*mode),
@@ -1568,6 +1611,9 @@ impl GpuApp {
             }
             _ => {}
         }
+        // Screen navigations change whether IME is allowed — settle the
+        // flag here so the headless dispatch path stays consistent.
+        self.update_ime();
     }
 
     /// Enter the mismatch flow when a caller has a structured server mod manifest.
@@ -1920,6 +1966,160 @@ impl GpuApp {
     /// every non-HUD screen) rather than gameplay movement.
     fn ui_wants_input(&self) -> bool {
         self.paused || self.ui.screen != Screen::InGameHud
+    }
+
+    /// `true` while an editable text surface owns typing: the in-game
+    /// chat bar, any focused UI text field, or a delegated sub-screen's
+    /// search field. IME enablement and the clipboard chords key off
+    /// this — during raw WASD gameplay it is `false`.
+    fn text_input_active(&self) -> bool {
+        self.chat_bar.is_some()
+            || self.ui.fps_field_active()
+            || self.ui.join_field_active()
+            || self.ui.world_name_field_active()
+            || self.ui.world_seed_field_active()
+            || self.ui.server_address_field_active()
+            || (self.ui.screen == Screen::RecipeBrowser && self.ui.recipe_browser.search_focused())
+            || (self.ui.screen == Screen::ModMenu && self.ui.mod_menu.search_focused())
+    }
+
+    /// `Ctrl` (every platform) or `Cmd` (macOS) currently held — the
+    /// copy/paste chord modifier.
+    fn clipboard_modifier_held(&self) -> bool {
+        self.modifiers.control_key() || (cfg!(target_os = "macos") && self.modifiers.super_key())
+    }
+
+    /// `true` when a `V`/`C` press is a clipboard chord
+    /// (`Ctrl`/`Cmd`+key) with a live text surface to feed.
+    fn clipboard_chord(&self, code: KeyCode, state: ElementState) -> bool {
+        state == ElementState::Pressed
+            && self.clipboard_modifier_held()
+            && self.text_input_active()
+            && matches!(code, KeyCode::KeyV | KeyCode::KeyC)
+    }
+
+    /// Push the current text-input state to the OS's IME: allowed while
+    /// a text surface owns typing (chat bar, focused UI field, delegated
+    /// search), forbidden during raw 3D gameplay so the compositor can
+    /// never hijack WASD movement keys. Only transitions reach the
+    /// window — `set_ime_allowed` is not a per-event call.
+    fn update_ime(&mut self) {
+        let allowed = self.text_input_active();
+        if allowed == self.ime_allowed {
+            return;
+        }
+        self.ime_allowed = allowed;
+        if let Some(active) = &self.active {
+            active.window.set_ime_allowed(allowed);
+        }
+    }
+
+    /// Route committed text — an `Ime::Commit` string, a sanitized
+    /// paste, or a test dispatch — into the active text surface and
+    /// return the [`UiAction`]s the resulting `CharTyped` events
+    /// produced. The chat bar consumes text directly (capped at
+    /// vanilla's [`CHAT_FIELD_MAX_CHARS`]); UI fields go through
+    /// `UiInputEvent::CharTyped` so each field's own filter and cap
+    /// applies.
+    fn committed_text_actions(&mut self, text: &str) -> Vec<UiAction> {
+        if let Some(bar) = &mut self.chat_bar {
+            let room = CHAT_FIELD_MAX_CHARS.saturating_sub(bar.text().chars().count());
+            let mut fed = false;
+            for ch in text.chars().filter(|c| !c.is_control()).take(room) {
+                bar.push_char(ch);
+                fed = true;
+            }
+            if fed {
+                self.refresh_chat_suggestions();
+            }
+            return Vec::new();
+        }
+        if !self.ui_wants_input() {
+            return Vec::new();
+        }
+        let mut actions = Vec::new();
+        for ch in text.chars().filter(|c| !c.is_control()) {
+            actions.extend(self.ui.handle_input(UiInputEvent::CharTyped(ch)));
+        }
+        actions
+    }
+
+    /// The event-loop-free text feed tests use — mirrors how
+    /// [`dispatch_input`](Self::dispatch_input) bypasses
+    /// `ActiveEventLoop`. IME commits and pastes route identically.
+    pub fn dispatch_committed_text(&mut self, text: &str) {
+        for action in self.committed_text_actions(text) {
+            self.dispatch_ui_action(&action);
+        }
+    }
+
+    /// `Ctrl`/`Cmd`+`V`: pull the clipboard (system tool or the in-app
+    /// fallback), sanitize it for a single-line field, and feed the
+    /// result. Returns the actions the text produced.
+    fn clipboard_paste_actions(&mut self) -> Vec<UiAction> {
+        let Some(raw) = self.clipboard.get_text() else {
+            return Vec::new();
+        };
+        let text = crate::clipboard::sanitize_paste_text(&raw, true);
+        if text.is_empty() {
+            return Vec::new();
+        }
+        self.committed_text_actions(&text)
+    }
+
+    /// `Ctrl`/`Cmd`+`C`: copy the active text surface's contents to the
+    /// OS clipboard (or the in-app fallback) and report which store
+    /// took them.
+    fn clipboard_copy(&mut self) {
+        let text = if let Some(bar) = &self.chat_bar {
+            bar.text().to_owned()
+        } else {
+            match self.active_field_text() {
+                Some(text) => text.to_owned(),
+                None => return,
+            }
+        };
+        if text.is_empty() {
+            return;
+        }
+        match self.clipboard.set_text(&text) {
+            ClipboardOutcome::System => self.status_line("Copied to clipboard"),
+            ClipboardOutcome::Fallback => self.status_line("Copied (in-app buffer)"),
+        }
+    }
+
+    /// Contents of whichever single-line UI field owns typing.
+    fn active_field_text(&self) -> Option<&str> {
+        if self.ui.fps_field_active() {
+            Some(self.ui.fps_field_text())
+        } else if self.ui.join_field_active() {
+            Some(&self.ui.join_code_text)
+        } else if self.ui.world_name_field_active() {
+            Some(&self.ui.singleplayer.new_name)
+        } else if self.ui.world_seed_field_active() {
+            Some(&self.ui.singleplayer.seed_text)
+        } else if self.ui.server_address_field_active() {
+            Some(&self.ui.multiplayer.address_text)
+        } else {
+            None
+        }
+    }
+
+    /// `true` when `text` echoes the `Ime::Commit` delivered moments
+    /// ago — some platforms report the same committed string again as
+    /// `KeyEvent.text`, which would double-insert. The first matching
+    /// echo is swallowed and cleared so only one suppression happens.
+    fn swallow_ime_echo(&mut self, text: &str) -> bool {
+        let echo = self
+            .last_ime_commit
+            .as_ref()
+            .is_some_and(|(committed, when)| {
+                committed == text && when.elapsed() < Duration::from_millis(50)
+            });
+        if echo {
+            self.last_ime_commit = None;
+        }
+        echo
     }
 
     /// A user-visible status line for actions that can't silently no-op:
@@ -3530,7 +3730,7 @@ impl GpuApp {
     /// Route a key event into the open chat bar: text from `event.text`,
     /// editing keys, Tab cycles badge completions, Enter sends through
     /// `send_chat`, Escape closes and re-grabs the pointer.
-    fn chat_bar_key(&mut self, event: &winit::event::KeyEvent) {
+    fn chat_bar_key(&mut self, event: &winit::event::KeyEvent, event_loop: &ActiveEventLoop) {
         // Shift presses/releases must track even through the early
         // release-return so Shift+Tab cycles completions backwards.
         if matches!(
@@ -3542,6 +3742,24 @@ impl GpuApp {
         }
         if event.state != ElementState::Pressed {
             return;
+        }
+        // Clipboard chords reach the chat bar before the per-key match:
+        // `Ctrl`/`Cmd`+`V` pastes sanitized single-line text, `+C` copies
+        // the draft — and neither leaks a control char into the buffer.
+        if self.clipboard_modifier_held() {
+            match event.physical_key {
+                PhysicalKey::Code(KeyCode::KeyV) => {
+                    for action in self.clipboard_paste_actions() {
+                        self.apply_ui_action(&action, event_loop);
+                    }
+                    return;
+                }
+                PhysicalKey::Code(KeyCode::KeyC) => {
+                    self.clipboard_copy();
+                    return;
+                }
+                _ => {}
+            }
         }
         let mut close = false;
         match event.physical_key {
@@ -3600,7 +3818,7 @@ impl GpuApp {
             _ => {
                 if let Some(text) = &event.text {
                     if let Some(bar) = &mut self.chat_bar {
-                        for ch in text.chars() {
+                        for ch in text.chars().filter(|c| !c.is_control()) {
                             bar.push_char(ch);
                         }
                     }
@@ -4428,6 +4646,20 @@ impl GpuApp {
         let code = remap_bound_key(code, &self.ui.settings.keys);
         let f3_chord_pressed =
             pressed && self.input_router.f3_held && f3_chord_for_key(code).is_some();
+        // OS clipboard chords on text surfaces — before the input
+        // router so `Ctrl`/`Cmd`+`V`/`C` reaches the focused field
+        // instead of gameplay bindings (zoom, drop-stack, debug chords).
+        if self.clipboard_chord(code, state) {
+            match code {
+                KeyCode::KeyV => {
+                    for action in self.clipboard_paste_actions() {
+                        self.apply_ui_action(&action, event_loop);
+                    }
+                }
+                _ => self.clipboard_copy(),
+            }
+            return;
+        }
         // JEI hover hotkeys while a container/inventory surface is up:
         // `R` shows recipes, `U` uses, `W` the Ponder scene — but only when
         // a resolvable stack is under the cursor. Otherwise the key keeps
@@ -4682,6 +4914,10 @@ impl GpuApp {
                 }
             }
         }
+        // `OpenChat` (and any future input event that opens a text
+        // surface) toggles IME allow state — keep the headless
+        // `dispatch_input` path consistent with the windowed one.
+        self.update_ime();
     }
 
     fn apply_ui_action(&mut self, action: &UiAction, event_loop: &ActiveEventLoop) {
@@ -5163,6 +5399,7 @@ impl ApplicationHandler for GpuApp {
                 self.focused = focused;
                 if !focused {
                     self.keys = Keys::default();
+                    self.modifiers = ModifiersState::empty();
                     if let Some(event) = self.input_router.release_held_keys() {
                         self.apply_window_input(event);
                     }
@@ -5172,22 +5409,52 @@ impl ApplicationHandler for GpuApp {
                     self.maybe_regrab();
                 }
             }
+            WindowEvent::ModifiersChanged(mods) => {
+                self.modifiers = mods.state();
+            }
+            WindowEvent::Ime(ime) => {
+                match ime {
+                    Ime::Enabled => {}
+                    Ime::Disabled => self.ime_preedit = None,
+                    Ime::Preedit(text, _cursor) => {
+                        self.ime_preedit = if text.is_empty() { None } else { Some(text) };
+                    }
+                    Ime::Commit(text) => {
+                        // The preedit clears on commit; the composed
+                        // string feeds the active text surface exactly
+                        // once — a platform echo of the same string as
+                        // `KeyEvent.text` is swallowed downstream.
+                        self.ime_preedit = None;
+                        if !text.is_empty() {
+                            self.last_ime_commit = Some((text.clone(), Instant::now()));
+                            for action in self.committed_text_actions(&text) {
+                                self.apply_ui_action(&action, event_loop);
+                            }
+                        }
+                    }
+                }
+            }
             WindowEvent::KeyboardInput { event, .. } => {
                 if self.chat_bar.is_some() {
-                    self.chat_bar_key(&event);
+                    self.chat_bar_key(&event, event_loop);
                 } else if let PhysicalKey::Code(code) = event.physical_key {
                     if !event.repeat {
                         self.handle_key(code, event.state, event_loop);
                         // Text entry for UI screens (the recipe browser's
                         // search field and its `r`/`u`/`p`/`+` item keys
                         // all ride `CharTyped`, which winit reports via
-                        // `event.text`).
+                        // `event.text`). A payload that only echoes the
+                        // `Ime::Commit` delivered moments ago must not
+                        // insert twice.
                         if event.state == ElementState::Pressed && self.ui_wants_input() {
                             if let Some(text) = &event.text {
-                                for ch in text.chars().filter(|c| !c.is_control()) {
-                                    for action in self.ui.handle_input(UiInputEvent::CharTyped(ch))
-                                    {
-                                        self.apply_ui_action(&action, event_loop);
+                                if !self.swallow_ime_echo(text) {
+                                    for ch in text.chars().filter(|c| !c.is_control()) {
+                                        for action in
+                                            self.ui.handle_input(UiInputEvent::CharTyped(ch))
+                                        {
+                                            self.apply_ui_action(&action, event_loop);
+                                        }
                                     }
                                 }
                             }
@@ -5250,6 +5517,10 @@ impl ApplicationHandler for GpuApp {
             WindowEvent::RedrawRequested => self.render_frame(),
             _ => {}
         }
+        // Text-entry state changes arrive through this single funnel —
+        // clicks focusing fields, Escape closing the chat bar, screen
+        // navigations — so the IME allow flag always settles here.
+        self.update_ime();
     }
 
     fn device_event(
@@ -7519,16 +7790,209 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// `CopyText` has no clipboard backend here — the dispatch reports
-    /// on the status line so the click can never fall into the void.
+    /// `CopyText` writes through the clipboard backend — the dispatch
+    /// lands the text in the store and reports which one (the in-app
+    /// buffer here, pinned so the test is deterministic everywhere).
     #[test]
     fn copy_text_reports_on_status_line() {
         let mut app = GpuApp::new(GpuCliConfig::default());
+        app.clipboard = SystemClipboard::in_memory();
         app.dispatch_ui_action(&UiAction::CopyText("megu-id:ABCDEF".into()));
+        assert_eq!(app.clipboard.get_text().as_deref(), Some("megu-id:ABCDEF"));
         assert!(app
             .ui
             .title_status
             .as_deref()
-            .is_some_and(|s| s.starts_with("Copy:")));
+            .is_some_and(|s| s.starts_with("Copied")));
+    }
+    /// `UiAction::CopyInvite` writes through the clipboard backend and
+    /// the status line honestly reports which store took the text —
+    /// `SystemClipboard::in_memory` pins the fallback path so the test
+    /// is deterministic on both desktops and headless CI.
+    #[test]
+    fn copy_invite_writes_clipboard_and_reports_store() {
+        let mut app = GpuApp::new(GpuCliConfig::default());
+        app.clipboard = SystemClipboard::in_memory();
+
+        app.dispatch_ui_action(&UiAction::CopyInvite("MEGU-ABCD-1234".to_string()));
+        assert_eq!(app.clipboard.get_text().as_deref(), Some("MEGU-ABCD-1234"));
+        assert!(
+            app.status_messages()
+                .iter()
+                .any(|m| m.contains("MEGU-ABCD-1234") && m.contains("in-app buffer")),
+            "fallback store must be reported honestly: {:?}",
+            app.status_messages()
+        );
+    }
+
+    /// `Ctrl+C` on the chat bar copies the draft and reports which
+    /// store actually holds the text.
+    #[test]
+    fn copy_reports_clipboard_outcome() {
+        let mut app = GpuApp::new(GpuCliConfig::default());
+        app.clipboard = SystemClipboard::in_memory();
+        let mut bar = ZshCommandBar::new();
+        bar.set_text("/say hi");
+        app.chat_bar = Some(bar);
+
+        app.clipboard_copy();
+        assert_eq!(app.clipboard.get_text().as_deref(), Some("/say hi"));
+        assert!(app
+            .status_messages()
+            .iter()
+            .any(|m| m.contains("in-app buffer")));
+    }
+
+    /// `Ime::Commit` text routes into the active text surface exactly
+    /// like typed characters: a focused UI field takes the full UTF-8
+    /// string (the world-name field accepts CJK), the chat bar takes it
+    /// byte-for-byte, and no character is dropped.
+    #[test]
+    fn ime_commit_feeds_japanese_text_into_focused_inputs() {
+        let mut app = GpuApp::new(GpuCliConfig::default());
+
+        // World-name field on the Singleplayer screen.
+        app.dispatch_ui_action(&UiAction::OpenScreen(Screen::Singleplayer));
+        let _ = app.ui.render(1280, 720);
+        let hit = app
+            .ui
+            .hit_regions
+            .iter()
+            .find(|h| h.id == megu_ui::state::WidgetId::SingleplayerNameField)
+            .cloned()
+            .expect("name field hit region");
+        for action in app.ui.handle_input(UiInputEvent::Click {
+            x: hit.rect.x + 2,
+            y: hit.rect.y + 2,
+        }) {
+            app.dispatch_ui_action(&action);
+        }
+        assert!(app.ui.world_name_field_active());
+        app.ui.singleplayer.new_name.clear();
+        app.dispatch_committed_text("こんにちは");
+        assert_eq!(app.ui.singleplayer.new_name, "こんにちは");
+
+        // The in-game chat bar takes the same commit verbatim.
+        app.chat_bar = Some(ZshCommandBar::new());
+        app.dispatch_committed_text("こんにちは世界");
+        assert_eq!(
+            app.chat_bar.as_ref().map(|b| b.text()),
+            Some("こんにちは世界")
+        );
+
+        // Control characters inside a commit never reach the buffer.
+        app.chat_bar.as_mut().unwrap().clear();
+        app.dispatch_committed_text("ab\ncd\x07ef");
+        assert_eq!(app.chat_bar.as_ref().map(|b| b.text()), Some("abcdef"));
+    }
+
+    /// `set_ime_allowed` tracks text-entry state: off during raw WASD
+    /// gameplay (the IME can never hijack movement keys), on for the
+    /// chat bar and focused UI fields, off again once they close.
+    #[test]
+    fn ime_allowed_tracks_text_entry_not_gameplay() {
+        let mut app = GpuApp::new(GpuCliConfig::default());
+
+        // Live 3D gameplay: IME stays off.
+        app.ui.screen = Screen::InGameHud;
+        app.update_ime();
+        assert!(!app.ime_allowed);
+
+        // Opening the chat bar enables it; closing disables it again.
+        app.chat_bar = Some(ZshCommandBar::new());
+        app.update_ime();
+        assert!(app.ime_allowed);
+        app.chat_bar = None;
+        app.update_ime();
+        assert!(!app.ime_allowed);
+
+        // A focused UI text field also enables it.
+        app.dispatch_ui_action(&UiAction::OpenScreen(Screen::Multiplayer));
+        let _ = app.ui.render(1280, 720);
+        let hit = app
+            .ui
+            .hit_regions
+            .iter()
+            .find(|h| h.id == megu_ui::state::WidgetId::MultiplayerAddressField)
+            .cloned()
+            .expect("address field hit region");
+        for action in app.ui.handle_input(UiInputEvent::Click {
+            x: hit.rect.x + 2,
+            y: hit.rect.y + 2,
+        }) {
+            app.dispatch_ui_action(&action);
+        }
+        assert!(app.ui.server_address_field_active());
+        app.update_ime();
+        assert!(app.ime_allowed);
+
+        // Escape out of the field -> back to no-IME.
+        for action in app.ui.handle_input(UiInputEvent::KeyPressed(UiKey::Escape)) {
+            app.dispatch_ui_action(&action);
+        }
+        app.update_ime();
+        assert!(!app.ime_allowed);
+    }
+
+    /// `Ctrl+V` path: clipboard text is sanitized for the single-line
+    /// chat bar (`\r\n` stripped) and capped at the vanilla chat
+    /// length — never a mid-commit panic or a doubled paste.
+    #[test]
+    fn paste_sanitizes_newlines_and_caps_chat_length() {
+        let mut app = GpuApp::new(GpuCliConfig::default());
+        app.clipboard = SystemClipboard::in_memory();
+        app.chat_bar = Some(ZshCommandBar::new());
+
+        app.clipboard.set_text("megu.example.com\r\n:25565");
+        let actions = app.clipboard_paste_actions();
+        assert!(actions.is_empty());
+        assert_eq!(
+            app.chat_bar.as_ref().map(|b| b.text()),
+            Some("megu.example.com:25565")
+        );
+
+        // The vanilla 256-char cap truncates, never overflows.
+        let long = "x".repeat(CHAT_FIELD_MAX_CHARS + 40);
+        app.clipboard.set_text(&long);
+        let actions = app.clipboard_paste_actions();
+        assert!(actions.is_empty());
+        assert_eq!(
+            app.chat_bar.as_ref().unwrap().text().chars().count(),
+            CHAT_FIELD_MAX_CHARS
+        );
+    }
+
+    /// The `Ctrl`/`Cmd` chord only fires while a text surface owns
+    /// typing — raw gameplay keeps `V`/`C` free for their real
+    /// bindings.
+    #[test]
+    fn clipboard_chord_requires_text_surface_and_modifier() {
+        let mut app = GpuApp::new(GpuCliConfig::default());
+        app.modifiers = ModifiersState::CONTROL;
+        app.ui.screen = Screen::InGameHud;
+        // No text surface in raw gameplay.
+        assert!(!app.clipboard_chord(KeyCode::KeyV, ElementState::Pressed));
+        app.chat_bar = Some(ZshCommandBar::new());
+        assert!(app.clipboard_chord(KeyCode::KeyV, ElementState::Pressed));
+        assert!(app.clipboard_chord(KeyCode::KeyC, ElementState::Pressed));
+        // A released modifier drops the chord; a release event never
+        // counts as a press.
+        app.modifiers = ModifiersState::empty();
+        assert!(!app.clipboard_chord(KeyCode::KeyV, ElementState::Pressed));
+        app.modifiers = ModifiersState::CONTROL;
+        assert!(!app.clipboard_chord(KeyCode::KeyV, ElementState::Released));
+    }
+
+    /// A platform that re-reports the committed string as
+    /// `KeyEvent.text` triggers the swallow exactly once — a second
+    /// identical echo (or a genuinely typed repeat) is never
+    /// suppressed.
+    #[test]
+    fn ime_echo_swallow_is_single_shot() {
+        let mut app = GpuApp::new(GpuCliConfig::default());
+        app.last_ime_commit = Some(("あ".to_string(), Instant::now()));
+        assert!(app.swallow_ime_echo("あ"));
+        assert!(!app.swallow_ime_echo("あ"));
+        assert!(!app.swallow_ime_echo("い"));
     }
 }
