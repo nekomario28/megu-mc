@@ -6,10 +6,12 @@
 
 use megu_client_ui::draw::UiRect;
 use megu_client_ui::gamepad::{
-    process_radial_stick, radial_slice_for_angle, GamepadAction, GamepadAxis, GamepadBrand,
-    GamepadButton, GamepadEvent, GamepadMapper, GamepadState, RadialWheelState, RumbleKind,
-    StickConfig, UiContext, CURSOR_SPEED_PX_PER_SEC, HOTBAR_SLOTS, RUMBLE_QUEUE_MAX,
-    SNAP_RADIUS_PX, TRIGGER_PRESS_THRESHOLD, TRIGGER_RELEASE_THRESHOLD,
+    build_context_hints, process_radial_stick, radial_slice_for_angle, AnalogMovementMode,
+    BadgeShape, GamepadAction, GamepadAxis, GamepadBrand, GamepadButton, GamepadEvent,
+    GamepadMapper, GamepadState, HintContext, InputModeTracker, InputSourceMode,
+    RadialWheelState, RumbleKind, StickConfig, UiContext, CURSOR_SPEED_PX_PER_SEC,
+    HOTBAR_SLOTS, RADIAL_ACTIONS, RUMBLE_QUEUE_MAX, SNAP_RADIUS_PX, TRIGGER_PRESS_THRESHOLD,
+    TRIGGER_RELEASE_THRESHOLD, UI_SCROLL_TICKS_PER_SEC,
 };
 use megu_client_ui::state::{HitRegion, UiLang, WidgetId};
 
@@ -182,35 +184,99 @@ fn left_stick_drives_movement_with_sprint_click() {
 
 #[test]
 fn per_brand_prompt_labels() {
+    // Xbox: letters + geometric menu glyphs + short D-pad arrows.
     assert_eq!(GamepadButton::South.prompt_label(GamepadBrand::Xbox), "A");
     assert_eq!(GamepadButton::East.prompt_label(GamepadBrand::Xbox), "B");
-    assert_eq!(
-        GamepadButton::South.prompt_label(GamepadBrand::PlayStation),
-        "Cross"
-    );
-    assert_eq!(
-        GamepadButton::East.prompt_label(GamepadBrand::PlayStation),
-        "Circle"
-    );
-    assert_eq!(
-        GamepadButton::West.prompt_label(GamepadBrand::PlayStation),
-        "Square"
-    );
-    assert_eq!(
-        GamepadButton::North.prompt_label(GamepadBrand::PlayStation),
-        "Triangle"
-    );
-    // Nintendo positions: the physical south button is labeled B.
+    assert_eq!(GamepadButton::Start.prompt_label(GamepadBrand::Xbox), "☰");
+    assert_eq!(GamepadButton::Select.prompt_label(GamepadBrand::Xbox), "⧉");
+    assert_eq!(GamepadButton::DpadUp.prompt_label(GamepadBrand::Xbox), "↑");
+    assert_eq!(GamepadButton::DpadDown.prompt_label(GamepadBrand::Xbox), "↓");
+    assert_eq!(GamepadButton::DpadLeft.prompt_label(GamepadBrand::Xbox), "←");
+    assert_eq!(GamepadButton::DpadRight.prompt_label(GamepadBrand::Xbox), "→");
+
+    // PlayStation: natural symbols, never English words.
+    assert_eq!(GamepadButton::South.prompt_label(GamepadBrand::PlayStation), "✕");
+    assert_eq!(GamepadButton::East.prompt_label(GamepadBrand::PlayStation), "○");
+    assert_eq!(GamepadButton::West.prompt_label(GamepadBrand::PlayStation), "□");
+    assert_eq!(GamepadButton::North.prompt_label(GamepadBrand::PlayStation), "△");
+    assert_eq!(GamepadButton::DpadUp.prompt_label(GamepadBrand::PlayStation), "↑");
+
+    // Nintendo positions: the physical south button is labeled B; the
+    // Select glyph is U+2212, not an ASCII hyphen.
     assert_eq!(GamepadButton::South.prompt_label(GamepadBrand::Switch), "B");
     assert_eq!(GamepadButton::East.prompt_label(GamepadBrand::Switch), "A");
-    assert_eq!(
-        GamepadButton::South.prompt_label(GamepadBrand::SteamDeck),
-        "A"
-    );
-    assert_eq!(
+    assert_eq!(GamepadButton::Start.prompt_label(GamepadBrand::Switch), "+");
+    assert_eq!(GamepadButton::Select.prompt_label(GamepadBrand::Switch), "−");
+    assert_ne!(GamepadButton::Select.prompt_label(GamepadBrand::Switch), "-");
+    assert_eq!(GamepadButton::Guide.prompt_label(GamepadBrand::Switch), "HOME");
+    assert_eq!(GamepadButton::LeftStick.prompt_label(GamepadBrand::Switch), "LS");
+    assert_eq!(GamepadButton::DpadRight.prompt_label(GamepadBrand::Switch), "→");
+
+    // Steam Deck: ☰ menu, ⧉ view, STEAM guide — never "..." or
+    // duplicated STEAM for Select.
+    assert_eq!(GamepadButton::South.prompt_label(GamepadBrand::SteamDeck), "A");
+    assert_eq!(GamepadButton::Start.prompt_label(GamepadBrand::SteamDeck), "☰");
+    assert_eq!(GamepadButton::Select.prompt_label(GamepadBrand::SteamDeck), "⧉");
+    assert_eq!(GamepadButton::Guide.prompt_label(GamepadBrand::SteamDeck), "STEAM");
+    assert_ne!(GamepadButton::Start.prompt_label(GamepadBrand::SteamDeck), "...");
+    assert_ne!(
         GamepadButton::Select.prompt_label(GamepadBrand::SteamDeck),
-        "STEAM"
+        GamepadButton::Guide.prompt_label(GamepadBrand::SteamDeck)
     );
+}
+
+#[test]
+fn badge_specs_are_geometric_per_brand() {
+    // Shapes follow the physical control.
+    let badge = GamepadButton::South.badge_spec(GamepadBrand::Xbox);
+    assert_eq!(badge.shape, BadgeShape::Circle);
+    assert_eq!(badge.symbol, "A");
+    assert!(badge.fill_rgba[1] > badge.fill_rgba[0], "A badge is green");
+    assert_eq!(
+        GamepadButton::LeftShoulder
+            .badge_spec(GamepadBrand::Xbox)
+            .shape,
+        BadgeShape::Bumper
+    );
+    assert_eq!(
+        GamepadButton::RightTrigger
+            .badge_spec(GamepadBrand::Xbox)
+            .shape,
+        BadgeShape::Trigger
+    );
+    assert_eq!(
+        GamepadButton::Start.badge_spec(GamepadBrand::Xbox).shape,
+        BadgeShape::Pill
+    );
+    assert_eq!(
+        GamepadButton::DpadUp.badge_spec(GamepadBrand::Xbox).shape,
+        BadgeShape::DpadDir
+    );
+
+    // PlayStation face badges carry the four action colors.
+    for (btn, dom) in [
+        (GamepadButton::South, 2),  // ✕: blue-dominant
+        (GamepadButton::East, 0),   // ○: red-dominant
+        (GamepadButton::West, 0),   // □: pink (red) dominant
+        (GamepadButton::North, 1),  // △: teal-green dominant
+    ] {
+        let b = btn.badge_spec(GamepadBrand::PlayStation);
+        assert_eq!(b.shape, BadgeShape::Circle);
+        assert!(
+            b.fill_rgba[dom] >= b.fill_rgba[0].max(b.fill_rgba[2]) - 1,
+            "{btn:?} badge {b:?} wrong dominant channel"
+        );
+    }
+
+    // Switch: crisp charcoal + white everywhere.
+    let b = GamepadButton::East.badge_spec(GamepadBrand::Switch);
+    assert_eq!(b.symbol, "A");
+    assert!(b.fill_rgba[0] < 60 && b.fg_rgba[0] > 200);
+
+    // Steam Deck: dark slate + white.
+    let b = GamepadButton::Guide.badge_spec(GamepadBrand::SteamDeck);
+    assert_eq!(b.symbol, "STEAM");
+    assert!(b.fill_rgba[0] < 80 && b.fg_rgba[0] > 200);
 }
 
 #[test]
@@ -376,6 +442,18 @@ fn grid_regions() -> Vec<HitRegion> {
         }
     }
     regions
+}
+
+fn row_regions(cols: usize) -> Vec<HitRegion> {
+    // Single row of 40x40 cells at 100px pitch: centers (50,50), (150,50), ...
+    (0..cols)
+        .map(|c| {
+            HitRegion::new(
+                WidgetId::ControlKey(c),
+                UiRect::new(30 + c as i32 * 100, 30, 40, 40),
+            )
+        })
+        .collect()
 }
 
 fn ui_ctx(regions: &[HitRegion]) -> UiContext<'_> {
@@ -650,4 +728,404 @@ fn rumble_respects_toggle_strength_and_bounds() {
         mapper.emit_rumble(RumbleKind::BlockBreak);
     }
     assert!(mapper.pending_rumble() <= RUMBLE_QUEUE_MAX);
+}
+
+// ---------------------------------------------------------------------------
+// D-pad auto-repeat, UI scroll, virtual keyboard, input tracker, 8-way
+// ---------------------------------------------------------------------------
+
+fn jumps(events: &[GamepadEvent]) -> Vec<usize> {
+    events
+        .iter()
+        .filter_map(|e| match e {
+            GamepadEvent::FocusJumped { region_index } => Some(*region_index),
+            _ => None,
+        })
+        .collect()
+}
+
+#[test]
+fn dpad_hold_repeats_after_delay_and_interval() {
+    let regions = row_regions(6);
+    let mut mapper = GamepadMapper::default();
+    mapper.ui_mode = true;
+    let ctx = ui_ctx(&regions);
+    let held = with_button(GamepadButton::DpadRight);
+    const HOLD_DT: f32 = 0.1;
+
+    // Press edge: immediate jump to region 0.
+    let ev = mapper.update(&held, DT, Some(ctx));
+    assert_eq!(jumps(&ev), vec![0]);
+
+    // 0.016 + 0.3s held: still under the 0.35s delay — silent.
+    for _ in 0..3 {
+        let ev = mapper.update(&held, HOLD_DT, Some(ctx));
+        assert!(jumps(&ev).is_empty(), "repeat fired before delay: {ev:?}");
+    }
+    // ~0.416s: first auto-repeat fires (next cell).
+    let ev = mapper.update(&held, HOLD_DT, Some(ctx));
+    assert_eq!(jumps(&ev), vec![1]);
+    // ~0.516s: one interval (~0.09s) later — repeat #2.
+    let ev = mapper.update(&held, HOLD_DT, Some(ctx));
+    assert_eq!(jumps(&ev), vec![2]);
+}
+
+#[test]
+fn dpad_repeat_resets_on_release() {
+    let regions = row_regions(6);
+    let mut mapper = GamepadMapper::default();
+    mapper.ui_mode = true;
+    let ctx = ui_ctx(&regions);
+    let held = with_button(GamepadButton::DpadRight);
+
+    // Press → jump to 0; hold past the delay so a repeat lands on 1.
+    assert_eq!(jumps(&mapper.update(&held, DT, Some(ctx))), vec![0]);
+    for _ in 0..4 {
+        mapper.update(&held, 0.1, Some(ctx));
+    }
+    assert_eq!(mapper.focused_region(), Some(1));
+
+    // Releasing and pressing again jumps immediately (edge) — but the
+    // repeat timer restarts, so three more held frames stay silent.
+    mapper.update(&frame(), DT, None);
+    let ev = mapper.update(&held, DT, Some(ctx));
+    assert_eq!(jumps(&ev), vec![2]);
+    for _ in 0..3 {
+        let ev = mapper.update(&held, 0.1, Some(ctx));
+        assert!(jumps(&ev).is_empty(), "timer failed to reset on release");
+    }
+}
+
+#[test]
+fn dpad_repeat_resets_on_direction_change() {
+    let regions = grid_regions();
+    let mut mapper = GamepadMapper::default();
+    mapper.ui_mode = true;
+    let ctx = ui_ctx(&regions);
+
+    // Hold right until a repeat has fired (focus reaches region 1).
+    let held_r = with_button(GamepadButton::DpadRight);
+    mapper.update(&held_r, DT, Some(ctx));
+    for _ in 0..4 {
+        mapper.update(&held_r, 0.1, Some(ctx));
+    }
+    assert_eq!(mapper.focused_region(), Some(1));
+
+    // Switching to down while still inside the repeat rhythm jumps
+    // immediately to the cell below — then the timer restarts.
+    let held_d = with_button(GamepadButton::DpadDown);
+    let ev = mapper.update(&held_d, DT, Some(ctx));
+    assert_eq!(jumps(&ev), vec![4], "direction change must jump at once");
+    for _ in 0..3 {
+        let ev = mapper.update(&held_d, 0.1, Some(ctx));
+        assert!(
+            jumps(&ev).is_empty(),
+            "timer failed to reset on direction change"
+        );
+    }
+}
+
+#[test]
+fn right_stick_scrolls_ui_lists() {
+    let mut mapper = GamepadMapper::default();
+    mapper.ui_mode = true;
+
+    let mut raw = frame();
+    raw.set_axis(GamepadAxis::RightY, -1.0);
+    let events = mapper.update(&raw, DT, None);
+    let (dx, dy) = events
+        .iter()
+        .find_map(|e| match e {
+            GamepadEvent::UiScroll { dx, dy } => Some((*dx, *dy)),
+            _ => None,
+        })
+        .expect("stick deflection must emit UiScroll");
+    assert_eq!(dx, 0.0);
+    assert!(dy < 0.0, "stick up scrolls up: {dy}");
+    // Full deflection for one 16ms frame at 6 ticks/s ≈ 0.096 ticks.
+    assert!((dy.abs() - UI_SCROLL_TICKS_PER_SEC * DT).abs() < 1e-4);
+
+    // Inside the deadzone: silence.
+    raw.set_axis(GamepadAxis::RightY, 0.1);
+    let events = mapper.update(&raw, DT, None);
+    assert!(!events
+        .iter()
+        .any(|e| matches!(e, GamepadEvent::UiScroll { .. })));
+
+    // Horizontal scroll too.
+    let mut raw = frame();
+    raw.set_axis(GamepadAxis::RightX, 1.0);
+    let events = mapper.update(&raw, DT, None);
+    assert!(events
+        .iter()
+        .any(|e| matches!(e, GamepadEvent::UiScroll { dx, .. } if *dx > 0.0)));
+}
+
+#[test]
+fn confirm_on_text_field_requests_virtual_keyboard() {
+    // Text field under the cursor → RequestVirtualKeyboard, no UiConfirm.
+    let text_regions = vec![HitRegion::new(
+        WidgetId::VideoFpsField,
+        UiRect::new(0, 0, 50, 50),
+    )];
+    let mut mapper = GamepadMapper::default();
+    mapper.ui_mode = true;
+    let events = mapper.update(
+        &with_button(GamepadButton::South),
+        DT,
+        Some(ui_ctx(&text_regions)),
+    );
+    assert!(events
+        .iter()
+        .any(|e| matches!(e, GamepadEvent::RequestVirtualKeyboard)));
+    assert!(!has_action(&events, GamepadAction::UiConfirm));
+
+    // Non-text region under the cursor → plain UiConfirm.
+    let button_regions = vec![HitRegion::new(
+        WidgetId::TitleSingleplayer,
+        UiRect::new(0, 0, 50, 50),
+    )];
+    let mut mapper = GamepadMapper::default();
+    mapper.ui_mode = true;
+    let events = mapper.update(
+        &with_button(GamepadButton::South),
+        DT,
+        Some(ui_ctx(&button_regions)),
+    );
+    assert!(has_action(&events, GamepadAction::UiConfirm));
+    assert!(!events
+        .iter()
+        .any(|e| matches!(e, GamepadEvent::RequestVirtualKeyboard)));
+
+    // Focused-region path: D-pad onto a text field, then confirm.
+    let text_regions = vec![HitRegion::new(
+        WidgetId::SingleplayerSeedField,
+        UiRect::new(80, 30, 40, 40),
+    )];
+    let mut mapper = GamepadMapper::default();
+    mapper.ui_mode = true;
+    mapper.update(
+        &with_button(GamepadButton::DpadRight),
+        DT,
+        Some(ui_ctx(&text_regions)),
+    );
+    assert_eq!(mapper.focused_region(), Some(0));
+    let events = mapper.update(
+        &with_button(GamepadButton::South),
+        DT,
+        Some(ui_ctx(&text_regions)),
+    );
+    assert!(events
+        .iter()
+        .any(|e| matches!(e, GamepadEvent::RequestVirtualKeyboard)));
+}
+
+#[test]
+fn input_mode_tracker_switches_seamlessly() {
+    let mut t = InputModeTracker::default();
+    assert_eq!(t.mode(), InputSourceMode::KeyboardMouse);
+
+    // Any button activity flips to gamepad instantly.
+    t.on_gamepad_state(&with_button(GamepadButton::South));
+    assert_eq!(t.mode(), InputSourceMode::Gamepad);
+
+    // Sub-threshold mouse jitter does not steal focus.
+    t.on_mouse_motion(1.0, 0.0);
+    assert_eq!(t.mode(), InputSourceMode::Gamepad);
+    t.on_mouse_motion(f32::NAN, 0.0);
+    assert_eq!(t.mode(), InputSourceMode::Gamepad);
+
+    // Motion >= 4px flips back; so does any key or mouse click.
+    t.on_mouse_motion(3.0, 3.0); // 4.24px
+    assert_eq!(t.mode(), InputSourceMode::KeyboardMouse);
+    t.on_gamepad_state(&with_button(GamepadButton::Start));
+    t.on_keyboard_input();
+    assert_eq!(t.mode(), InputSourceMode::KeyboardMouse);
+    t.on_gamepad_state(&with_button(GamepadButton::Start));
+    t.on_mouse_button();
+    assert_eq!(t.mode(), InputSourceMode::KeyboardMouse);
+
+    // Tiny stick drift (below the activity threshold) does not switch.
+    let mut raw = frame();
+    raw.set_axis(GamepadAxis::LeftX, 0.05);
+    t.on_gamepad_state(&raw);
+    assert_eq!(t.mode(), InputSourceMode::KeyboardMouse);
+    // Real deflection does.
+    raw.set_axis(GamepadAxis::LeftX, 0.5);
+    t.on_gamepad_state(&raw);
+    assert_eq!(t.mode(), InputSourceMode::Gamepad);
+}
+
+#[test]
+fn eight_way_snap_for_anticheat_servers() {
+    let mut mapper = GamepadMapper::default();
+    mapper.movement_mode = AnalogMovementMode::EightWayVanillaCompat;
+
+    // Nearly-cardinal input snaps exactly onto the cardinal.
+    let mut raw = frame();
+    raw.set_axis(GamepadAxis::LeftX, 1.0);
+    raw.set_axis(GamepadAxis::LeftY, -0.1);
+    let events = mapper.update(&raw, DT, None);
+    let (fwd, strafe) = events
+        .iter()
+        .find_map(|e| match e {
+            GamepadEvent::Move {
+                forward, strafe, ..
+            } => Some((*forward, *strafe)),
+            _ => None,
+        })
+        .unwrap();
+    assert_eq!(fwd, 0.0, "off-cardinal drift must snap to a cardinal");
+    assert!(strafe > 0.9);
+
+    // Near-diagonal snaps to a 45° diagonal: |fwd| == |strafe| > 0.
+    raw.set_axis(GamepadAxis::LeftX, 0.7);
+    raw.set_axis(GamepadAxis::LeftY, -0.7);
+    let events = mapper.update(&raw, DT, None);
+    let (fwd, strafe) = events
+        .iter()
+        .find_map(|e| match e {
+            GamepadEvent::Move {
+                forward, strafe, ..
+            } => Some((*forward, *strafe)),
+            _ => None,
+        })
+        .unwrap();
+    assert!(fwd > 0.6 && strafe > 0.6 && (fwd - strafe).abs() < 1e-4);
+
+    // Default mode keeps the full analog direction.
+    let mut mapper = GamepadMapper::default();
+    assert_eq!(mapper.movement_mode, AnalogMovementMode::Full360);
+    let mut raw = frame();
+    raw.set_axis(GamepadAxis::LeftX, 1.0);
+    raw.set_axis(GamepadAxis::LeftY, -0.1);
+    let events = mapper.update(&raw, DT, None);
+    let (fwd, _) = events
+        .iter()
+        .find_map(|e| match e {
+            GamepadEvent::Move {
+                forward, strafe, ..
+            } => Some((*forward, *strafe)),
+            _ => None,
+        })
+        .unwrap();
+    assert!(fwd > 0.0, "Full360 must preserve analog direction");
+}
+
+// ---------------------------------------------------------------------------
+// Context hint bar & radial wheel render layout
+// ---------------------------------------------------------------------------
+
+#[test]
+fn context_hints_are_brand_swap_and_language_aware() {
+    // Gameplay EN/Xbox: first hint is A = Jump.
+    let hints = build_context_hints(HintContext::Gameplay, GamepadBrand::Xbox, UiLang::En, true);
+    assert_eq!(hints[0].badge.symbol, "A");
+    assert_eq!(hints[0].label, "Jump");
+    assert!(hints.iter().any(|h| h.label == "Use / Place"));
+    assert!(hints.iter().any(|h| h.label == "Attack / Mine"));
+
+    // Switch with swap ON: confirm badge is the east `A`; JA labels.
+    let hints =
+        build_context_hints(HintContext::Gameplay, GamepadBrand::Switch, UiLang::Ja, true);
+    assert_eq!(hints[0].badge.symbol, "A");
+    assert_eq!(hints[0].label, "ジャンプ");
+    assert!(hints.iter().any(|h| h.label == "使う / 置く"));
+    assert!(hints.iter().any(|h| h.label == "攻撃 / 採掘"));
+    assert!(hints.iter().any(|h| h.label == "インベントリ"));
+
+    // Swap OFF: confirm falls back to the south `B`.
+    let hints =
+        build_context_hints(HintContext::Gameplay, GamepadBrand::Switch, UiLang::Ja, false);
+    assert_eq!(hints[0].badge.symbol, "B");
+
+    // PlayStation badges carry the symbols, not English words.
+    let hints =
+        build_context_hints(HintContext::Gameplay, GamepadBrand::PlayStation, UiLang::En, true);
+    assert_eq!(hints[0].badge.symbol, "✕");
+    assert_eq!(hints[0].badge.shape, BadgeShape::Circle);
+
+    // Inventory JA: quick-move / split / scroll / back.
+    let hints =
+        build_context_hints(HintContext::Inventory, GamepadBrand::Xbox, UiLang::Ja, true);
+    assert!(hints
+        .iter()
+        .any(|h| h.label == "クイック移動" && h.badge.symbol == "Y"));
+    assert!(hints.iter().any(|h| h.label == "半分に分ける"));
+    assert!(hints.iter().any(|h| h.label == "スクロール"));
+    assert!(hints.iter().any(|h| h.label == "戻る"));
+
+    // Settings: tab hints and Close; TextInput is concise.
+    let hints =
+        build_context_hints(HintContext::Settings, GamepadBrand::Xbox, UiLang::Ja, true);
+    assert!(hints.iter().any(|h| h.label == "前のタブ"));
+    assert!(hints.iter().any(|h| h.label == "閉じる"));
+    let hints = build_context_hints(HintContext::TextInput, GamepadBrand::Xbox, UiLang::En, true);
+    assert_eq!(hints.len(), 2);
+
+    // Every context produces a non-empty bar on every brand.
+    for ctx in [
+        HintContext::Gameplay,
+        HintContext::Inventory,
+        HintContext::Container,
+        HintContext::Crafting,
+        HintContext::PauseMenu,
+        HintContext::Settings,
+        HintContext::TextInput,
+    ] {
+        for brand in [
+            GamepadBrand::Xbox,
+            GamepadBrand::PlayStation,
+            GamepadBrand::Switch,
+            GamepadBrand::SteamDeck,
+        ] {
+            assert!(
+                !build_context_hints(ctx, brand, UiLang::En, true).is_empty(),
+                "{ctx:?}/{brand:?} produced no hints"
+            );
+        }
+    }
+}
+
+#[test]
+fn radial_layout_exposes_draw_ready_geometry() {
+    let mut wheel = RadialWheelState {
+        open: true,
+        selected: Some(2),
+    };
+    let layout = wheel.layout(320.0, 180.0, 100.0, UiLang::En);
+    assert!(layout.open);
+    assert_eq!(layout.slices.len(), 8);
+    assert_eq!((layout.center_x, layout.center_y, layout.radius), (320.0, 180.0, 100.0));
+
+    // Slice i is centered at i*45°, spanning ±22.5°.
+    for (i, s) in layout.slices.iter().enumerate() {
+        assert_eq!(s.index, i);
+        assert_eq!(s.action, RADIAL_ACTIONS[i]);
+        assert!((s.angle_center_deg - i as f32 * 45.0).abs() < 1e-6);
+        assert!((s.angle_start_deg - (s.angle_center_deg - 22.5)).abs() < 1e-6);
+        assert!((s.angle_end_deg - (s.angle_center_deg + 22.5)).abs() < 1e-6);
+        assert_eq!(s.highlighted, i == 2);
+    }
+
+    // Anchors sit on the wheel ring: slice 0 east, slice 2 north
+    // (screen-y grows downward).
+    let s0 = layout.slices[0];
+    assert!((s0.anchor_x - (320.0 + 62.0)).abs() < 0.01);
+    assert!((s0.anchor_y - 180.0).abs() < 0.01);
+    let s2 = layout.slices[2];
+    assert!((s2.anchor_x - 320.0).abs() < 0.01);
+    assert!((s2.anchor_y - (180.0 - 62.0)).abs() < 0.01);
+
+    // Labels localize; non-finite geometry sanitizes.
+    assert_eq!(layout.slices[0].label, "Debug (F3)");
+    let ja = wheel.layout(320.0, 180.0, 100.0, UiLang::Ja);
+    assert_eq!(ja.slices[0].label, "デバッグ (F3)");
+    let bad = wheel.layout(f32::NAN, 0.0, -5.0, UiLang::En);
+    assert!(bad.slices.iter().all(|s| s.anchor_x.is_finite()));
+
+    // Neutral selection highlights nothing.
+    wheel.selected = None;
+    let layout = wheel.layout(0.0, 0.0, 100.0, UiLang::En);
+    assert!(layout.slices.iter().all(|s| !s.highlighted));
 }

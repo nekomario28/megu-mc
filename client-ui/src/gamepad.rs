@@ -20,9 +20,16 @@
 //!   spatial focus jumps, confirm/cancel/quick-move/split-stack and bumper
 //!   tab switching — with the Nintendo confirm-swap option.
 //! * [`RadialWheelState`] — an 8-slice action wheel driven by the right
-//!   stick while Select is held.
+//!   stick while Select is held, plus [`RadialWheelState::layout`]'s
+//!   pure-geometry render model for `client-gpu`.
 //! * [`RumbleCommand`] — a bounded haptic queue honoring `rumble_enabled`
 //!   and `rumble_strength`.
+//! * [`build_context_hints`] — Controllable-style per-screen button hint
+//!   bars ([`HintContext`] / [`ConsoleHintItem`]) with clean-room
+//!   geometric [`ButtonBadgeSpec`]s.
+//! * [`InputModeTracker`] — seamless keyboard/mouse ⇄ gamepad prompt
+//!   switching; [`AnalogMovementMode::EightWayVanillaCompat`] — 8-way
+//!   movement snap for strict third-party anti-cheat servers.
 
 #![forbid(unsafe_code)]
 
@@ -180,7 +187,8 @@ impl GamepadButton {
     ///
     /// Face buttons follow the physical position, so Nintendo pads
     /// correctly read `B/A/Y/X` (confirm sits on the *east* label `A`).
-    /// ASCII only: guaranteed to render in the built-in bitmap font.
+    /// Symbols (`✕○□△`, arrows, `☰`, `⧉`) are drawn by the built-in
+    /// extended glyph table — no external brand assets anywhere.
     pub const fn prompt_label(self, brand: GamepadBrand) -> &'static str {
         match brand {
             GamepadBrand::Xbox => match self {
@@ -194,19 +202,19 @@ impl GamepadButton {
                 Self::RightTrigger => "RT",
                 Self::LeftStick => "LS",
                 Self::RightStick => "RS",
-                Self::Start => "Menu",
-                Self::Select => "View",
+                Self::Start => "☰",
+                Self::Select => "⧉",
                 Self::Guide => "Xbox",
-                Self::DpadUp => "D-Pad Up",
-                Self::DpadDown => "D-Pad Down",
-                Self::DpadLeft => "D-Pad Left",
-                Self::DpadRight => "D-Pad Right",
+                Self::DpadUp => "↑",
+                Self::DpadDown => "↓",
+                Self::DpadLeft => "←",
+                Self::DpadRight => "→",
             },
             GamepadBrand::PlayStation => match self {
-                Self::South => "Cross",
-                Self::East => "Circle",
-                Self::West => "Square",
-                Self::North => "Triangle",
+                Self::South => "✕",
+                Self::East => "○",
+                Self::West => "□",
+                Self::North => "△",
                 Self::LeftShoulder => "L1",
                 Self::RightShoulder => "R1",
                 Self::LeftTrigger => "L2",
@@ -216,10 +224,10 @@ impl GamepadButton {
                 Self::Start => "Options",
                 Self::Select => "Create",
                 Self::Guide => "PS",
-                Self::DpadUp => "D-Pad Up",
-                Self::DpadDown => "D-Pad Down",
-                Self::DpadLeft => "D-Pad Left",
-                Self::DpadRight => "D-Pad Right",
+                Self::DpadUp => "↑",
+                Self::DpadDown => "↓",
+                Self::DpadLeft => "←",
+                Self::DpadRight => "→",
             },
             GamepadBrand::Switch => match self {
                 Self::South => "B",
@@ -230,15 +238,15 @@ impl GamepadButton {
                 Self::RightShoulder => "R",
                 Self::LeftTrigger => "ZL",
                 Self::RightTrigger => "ZR",
-                Self::LeftStick => "L Stick",
-                Self::RightStick => "R Stick",
+                Self::LeftStick => "LS",
+                Self::RightStick => "RS",
                 Self::Start => "+",
-                Self::Select => "-",
-                Self::Guide => "Home",
-                Self::DpadUp => "D-Pad Up",
-                Self::DpadDown => "D-Pad Down",
-                Self::DpadLeft => "D-Pad Left",
-                Self::DpadRight => "D-Pad Right",
+                Self::Select => "−",
+                Self::Guide => "HOME",
+                Self::DpadUp => "↑",
+                Self::DpadDown => "↓",
+                Self::DpadLeft => "←",
+                Self::DpadRight => "→",
             },
             GamepadBrand::SteamDeck => match self {
                 Self::South => "A",
@@ -251,17 +259,106 @@ impl GamepadButton {
                 Self::RightTrigger => "R2",
                 Self::LeftStick => "L3",
                 Self::RightStick => "R3",
-                Self::Start => "...",
-                Self::Select => "STEAM",
+                Self::Start => "☰",
+                Self::Select => "⧉",
                 Self::Guide => "STEAM",
-                Self::DpadUp => "D-Pad Up",
-                Self::DpadDown => "D-Pad Down",
-                Self::DpadLeft => "D-Pad Left",
-                Self::DpadRight => "D-Pad Right",
+                Self::DpadUp => "↑",
+                Self::DpadDown => "↓",
+                Self::DpadLeft => "←",
+                Self::DpadRight => "→",
             },
         }
     }
+
+    /// Geometric badge spec for drawing this button's prompt without any
+    /// external brand assets — shape, symbol and flat RGBA colors a
+    /// rasterizer can draw as primitives.
+    pub const fn badge_spec(self, brand: GamepadBrand) -> ButtonBadgeSpec {
+        let shape = match self {
+            Self::South | Self::East | Self::West | Self::North => BadgeShape::Circle,
+            Self::LeftStick | Self::RightStick | Self::Guide => BadgeShape::Circle,
+            Self::LeftShoulder | Self::RightShoulder => BadgeShape::Bumper,
+            Self::LeftTrigger | Self::RightTrigger => BadgeShape::Trigger,
+            Self::Start | Self::Select => BadgeShape::Pill,
+            Self::DpadUp | Self::DpadDown | Self::DpadLeft | Self::DpadRight => {
+                BadgeShape::DpadDir
+            }
+        };
+        let fill_rgba = match brand {
+            GamepadBrand::Xbox => match self {
+                Self::South => XBOX_FACE_A,
+                Self::East => XBOX_FACE_B,
+                Self::West => XBOX_FACE_X,
+                Self::North => XBOX_FACE_Y,
+                _ => XBOX_BASE_FILL,
+            },
+            GamepadBrand::PlayStation => match self {
+                Self::South => PS_FACE_CROSS,
+                Self::East => PS_FACE_CIRCLE,
+                Self::West => PS_FACE_SQUARE,
+                Self::North => PS_FACE_TRIANGLE,
+                _ => PS_BASE_FILL,
+            },
+            GamepadBrand::Switch => SWITCH_FILL,
+            GamepadBrand::SteamDeck => STEAMDECK_FILL,
+        };
+        ButtonBadgeSpec {
+            shape,
+            symbol: self.prompt_label(brand),
+            fill_rgba,
+            fg_rgba: BADGE_FG,
+            outline_rgba: BADGE_OUTLINE,
+        }
+    }
 }
+
+/// The primitive a renderer should draw behind a prompt symbol.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum BadgeShape {
+    /// Round face-button / stick-click / guide badge.
+    Circle,
+    /// Oblong menu button badge (Start/Select).
+    Pill,
+    /// Shoulder bumper badge.
+    Bumper,
+    /// Analog trigger badge.
+    Trigger,
+    /// Directional-pad arrow badge.
+    DpadDir,
+}
+
+/// Everything needed to paint one clean-room button prompt badge.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ButtonBadgeSpec {
+    /// Badge silhouette.
+    pub shape: BadgeShape,
+    /// Prompt symbol drawn in `fg_rgba` (same string as
+    /// [`GamepadButton::prompt_label`]).
+    pub symbol: &'static str,
+    /// Badge fill color.
+    pub fill_rgba: [u8; 4],
+    /// Symbol foreground color.
+    pub fg_rgba: [u8; 4],
+    /// 1px outline color.
+    pub outline_rgba: [u8; 4],
+}
+
+const BADGE_FG: [u8; 4] = [245, 245, 247, 255];
+const BADGE_OUTLINE: [u8; 4] = [12, 12, 14, 255];
+// Clean-room flat approximations of the familiar console button
+// colors — geometry only, never brand artwork.
+const XBOX_FACE_A: [u8; 4] = [82, 176, 67, 255];
+const XBOX_FACE_B: [u8; 4] = [194, 62, 62, 255];
+const XBOX_FACE_X: [u8; 4] = [54, 117, 204, 255];
+const XBOX_FACE_Y: [u8; 4] = [233, 178, 43, 255];
+const XBOX_BASE_FILL: [u8; 4] = [45, 45, 48, 255];
+const PS_FACE_CROSS: [u8; 4] = [82, 123, 207, 255];
+const PS_FACE_CIRCLE: [u8; 4] = [209, 79, 89, 255];
+const PS_FACE_SQUARE: [u8; 4] = [211, 98, 163, 255];
+const PS_FACE_TRIANGLE: [u8; 4] = [66, 174, 151, 255];
+const PS_BASE_FILL: [u8; 4] = [40, 40, 46, 255];
+const SWITCH_FILL: [u8; 4] = [36, 36, 40, 255];
+const STEAMDECK_FILL: [u8; 4] = [44, 52, 62, 255];
 
 /// Analog axes (sticks in `-1.0..=1.0`, triggers `0.0..=1.0`).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -653,6 +750,84 @@ impl RadialWheelState {
     pub fn selected_action(&self) -> Option<RadialAction> {
         self.selected.map(|i| RADIAL_ACTIONS[i % RADIAL_SLICE_COUNT])
     }
+
+    /// Pure-geometry render model: the 8 slice angle spans, label anchor
+    /// points, localized labels and highlight state — everything
+    /// `client-gpu` needs to draw the wheel without knowing wheel logic.
+    ///
+    /// `radius <= 0` or non-finite inputs are sanitized to `0`.
+    pub fn layout(
+        &self,
+        center_x: f32,
+        center_y: f32,
+        radius: f32,
+        lang: UiLang,
+    ) -> RadialWheelLayout {
+        let clean = |v: f32| if v.is_finite() { v } else { 0.0 };
+        let (cx, cy, r) = (clean(center_x), clean(center_y), clean(radius).max(0.0));
+        let label_r = r * 0.62;
+        RadialWheelLayout {
+            center_x: cx,
+            center_y: cy,
+            radius: r,
+            open: self.open,
+            slices: std::array::from_fn(|i| {
+                let center = i as f32 * 45.0;
+                let rad = center.to_radians();
+                RadialWheelSliceLayout {
+                    index: i,
+                    action: RADIAL_ACTIONS[i],
+                    label: RADIAL_ACTIONS[i].name(lang),
+                    angle_start_deg: center - 22.5,
+                    angle_center_deg: center,
+                    angle_end_deg: center + 22.5,
+                    anchor_x: cx + rad.cos() * label_r,
+                    // Screen y grows downward; wheel angles run
+                    // counter-clockwise, so subtract the sine.
+                    anchor_y: cy - rad.sin() * label_r,
+                    highlighted: self.selected == Some(i),
+                }
+            }),
+        }
+    }
+}
+
+/// Draw-ready geometry for one radial-wheel slice.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct RadialWheelSliceLayout {
+    /// Slice index `0..8` (0 = east, counter-clockwise).
+    pub index: usize,
+    /// The action this slice activates.
+    pub action: RadialAction,
+    /// Localized label for the slice.
+    pub label: &'static str,
+    /// Sector start angle in degrees (center − 22.5°).
+    pub angle_start_deg: f32,
+    /// Sector center angle in degrees (`index * 45`).
+    pub angle_center_deg: f32,
+    /// Sector end angle in degrees (center + 22.5°).
+    pub angle_end_deg: f32,
+    /// Label anchor X in physical pixels.
+    pub anchor_x: f32,
+    /// Label anchor Y in physical pixels.
+    pub anchor_y: f32,
+    /// `true` when the stick currently selects this slice.
+    pub highlighted: bool,
+}
+
+/// Draw-ready geometry for the whole radial wheel.
+#[derive(Clone, Debug, PartialEq)]
+pub struct RadialWheelLayout {
+    /// Wheel center X in physical pixels.
+    pub center_x: f32,
+    /// Wheel center Y in physical pixels.
+    pub center_y: f32,
+    /// Outer wheel radius in physical pixels.
+    pub radius: f32,
+    /// Mirrors [`RadialWheelState::open`].
+    pub open: bool,
+    /// All eight slices, in index order.
+    pub slices: [RadialWheelSliceLayout; RADIAL_SLICE_COUNT],
 }
 
 // ---------------------------------------------------------------------------
@@ -706,10 +881,22 @@ pub enum GamepadEvent {
         y: f32,
     },
     /// D-pad focus jump landed on `hit_regions[region_index]` (UI mode).
+    /// Emitted on press edges and by the hold auto-repeater.
     FocusJumped {
         /// Index into the frame's [`UiContext::hit_regions`].
         region_index: usize,
     },
+    /// Right-stick scroll for lists, recipes and chests (UI mode).
+    /// Values are in scroll ticks, already `dt`-scaled after deadzone.
+    UiScroll {
+        /// Horizontal scroll ticks.
+        dx: f32,
+        /// Vertical scroll ticks (`+` = stick down / scroll down).
+        dy: f32,
+    },
+    /// UI mode: the confirm press landed on a text field — the host
+    /// should open the virtual keyboard instead of a click.
+    RequestVirtualKeyboard,
     /// The radial wheel opened (Select pressed).
     RadialOpened,
     /// Highlighted slice changed while the wheel is open.
@@ -746,6 +933,133 @@ pub const TRIGGER_RELEASE_THRESHOLD: f32 = 0.55;
 /// Largest `dt` the mapper integrates per frame; bigger gaps (loading
 /// hitches) are clamped so look/cursor never teleport.
 pub const MAX_FRAME_DT_SECS: f32 = 0.1;
+/// UI mode: how long a D-pad direction must be held before focus jumps
+/// start auto-repeating.
+pub const DPAD_REPEAT_DELAY_SECS: f32 = 0.35;
+/// UI mode: interval between auto-repeat focus jumps once the initial
+/// [`DPAD_REPEAT_DELAY_SECS`] has elapsed.
+pub const DPAD_REPEAT_INTERVAL_SECS: f32 = 0.09;
+/// UI mode: right-stick scroll speed in list ticks per second at full
+/// deflection.
+pub const UI_SCROLL_TICKS_PER_SEC: f32 = 6.0;
+/// Mouse motion magnitude (px) that flips the input source back to
+/// keyboard/mouse in [`InputModeTracker`].
+pub const MOUSE_SWITCH_THRESHOLD_PX: f32 = 4.0;
+/// Minimum axis deflection counted as gamepad activity by
+/// [`InputModeTracker`] — comfortably above stick drift.
+pub const GAMEPAD_ACTIVITY_THRESHOLD: f32 = 0.1;
+
+// ---------------------------------------------------------------------------
+// Input source switching & movement modes
+// ---------------------------------------------------------------------------
+
+/// Which device family currently owns the UI — drives prompt glyph and
+/// hint-bar flavor. Switching is seamless: whichever device produced
+/// activity last wins.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum InputSourceMode {
+    /// Keyboard and mouse.
+    #[default]
+    KeyboardMouse,
+    /// Any controller handled by this engine.
+    Gamepad,
+}
+
+/// Tracks the active [`InputSourceMode`]. Deterministic: driven purely by
+/// the events fed to it, never by wall-clock time.
+#[derive(Clone, Debug, Default)]
+pub struct InputModeTracker {
+    mode: InputSourceMode,
+}
+
+impl InputModeTracker {
+    pub fn mode(&self) -> InputSourceMode {
+        self.mode
+    }
+
+    /// Any button press or stick/trigger deflection beyond
+    /// [`GAMEPAD_ACTIVITY_THRESHOLD`] immediately selects
+    /// [`InputSourceMode::Gamepad`].
+    pub fn on_gamepad_state(&mut self, state: &GamepadState) -> InputSourceMode {
+        let active = state.buttons.iter().any(|&b| b)
+            || state
+                .axes
+                .iter()
+                .any(|&v| v.is_finite() && v.abs() >= GAMEPAD_ACTIVITY_THRESHOLD);
+        if active {
+            self.mode = InputSourceMode::Gamepad;
+        }
+        self.mode
+    }
+
+    /// Any keyboard input selects keyboard/mouse.
+    pub fn on_keyboard_input(&mut self) -> InputSourceMode {
+        self.mode = InputSourceMode::KeyboardMouse;
+        self.mode
+    }
+
+    /// Mouse motion flips to keyboard/mouse once the frame delta reaches
+    /// [`MOUSE_SWITCH_THRESHOLD_PX`] — small jitter never causes a
+    /// prompt-flavor flicker.
+    pub fn on_mouse_motion(&mut self, dx: f32, dy: f32) -> InputSourceMode {
+        if dx.is_finite()
+            && dy.is_finite()
+            && dx.hypot(dy) >= MOUSE_SWITCH_THRESHOLD_PX
+        {
+            self.mode = InputSourceMode::KeyboardMouse;
+        }
+        self.mode
+    }
+
+    /// Any mouse button click selects keyboard/mouse.
+    pub fn on_mouse_button(&mut self) -> InputSourceMode {
+        self.mode = InputSourceMode::KeyboardMouse;
+        self.mode
+    }
+}
+
+/// How the left stick maps onto movement input.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum AnalogMovementMode {
+    /// Full 360° analog — default for local worlds and Megu servers.
+    #[default]
+    Full360,
+    /// Snap stick direction to the 8 vanilla cardinal/diagonal vectors.
+    /// For strict third-party servers whose anti-cheat rejects
+    /// non-keyboard movement angles.
+    EightWayVanillaCompat,
+}
+
+/// The physical button meaning "confirm / jump / primary" for `brand`
+/// under the Nintendo confirm-swap setting.
+const fn confirm_button_for(brand: GamepadBrand, nintendo_confirm_swap: bool) -> GamepadButton {
+    if matches!(brand, GamepadBrand::Switch) && nintendo_confirm_swap {
+        GamepadButton::East
+    } else {
+        GamepadButton::South
+    }
+}
+
+/// The physical button meaning "cancel / drop / back" for `brand`.
+const fn cancel_button_for(brand: GamepadBrand, nintendo_confirm_swap: bool) -> GamepadButton {
+    if matches!(brand, GamepadBrand::Switch) && nintendo_confirm_swap {
+        GamepadButton::South
+    } else {
+        GamepadButton::East
+    }
+}
+
+/// Snap a direction vector to the nearest of the 8 vanilla movement
+/// directions (45° sectors), preserving magnitude.
+fn snap_to_eight_way(x: f32, y: f32) -> (f32, f32) {
+    let mag = x.hypot(y);
+    if !mag.is_finite() || mag <= f32::EPSILON {
+        return (0.0, 0.0);
+    }
+    let snapped = (y.atan2(x) / std::f32::consts::FRAC_PI_4).round()
+        * std::f32::consts::FRAC_PI_4;
+    (snapped.cos() * mag, snapped.sin() * mag)
+}
 
 /// The stateful mapper: feed it [`GamepadState`] frames, get
 /// [`GamepadEvent`]s, [`RumbleCommand`]s and UI focus/cursor state back.
@@ -773,7 +1087,12 @@ pub struct GamepadMapper {
     /// cursor, the D-pad performs focus jumps and the face buttons become
     /// confirm/cancel/quick-move/split-stack instead of gameplay binds.
     pub ui_mode: bool,
+    /// Left-stick movement semantics (full analog vs 8-way snap).
+    pub movement_mode: AnalogMovementMode,
     prev_buttons: [bool; GAMEPAD_BUTTON_COUNT],
+    dpad_held_dir: Option<(i32, i32)>,
+    dpad_held_secs: f32,
+    dpad_next_repeat: f32,
     lt_pressed: bool,
     rt_pressed: bool,
     hotbar_slot: usize,
@@ -802,7 +1121,11 @@ impl GamepadMapper {
             rumble_enabled: true,
             rumble_strength: 1.0,
             ui_mode: false,
+            movement_mode: AnalogMovementMode::Full360,
             prev_buttons: [false; GAMEPAD_BUTTON_COUNT],
+            dpad_held_dir: None,
+            dpad_held_secs: 0.0,
+            dpad_next_repeat: DPAD_REPEAT_DELAY_SECS,
             lt_pressed: false,
             rt_pressed: false,
             hotbar_slot: 0,
@@ -818,20 +1141,12 @@ impl GamepadMapper {
     /// now — `East` (`A`) on Switch when [`Self::nintendo_confirm_swap`]
     /// is set, `South` everywhere else.
     pub fn confirm_button(&self) -> GamepadButton {
-        if self.brand == GamepadBrand::Switch && self.nintendo_confirm_swap {
-            GamepadButton::East
-        } else {
-            GamepadButton::South
-        }
+        confirm_button_for(self.brand, self.nintendo_confirm_swap)
     }
 
     /// The physical button that means "cancel / drop / back".
     pub fn cancel_button(&self) -> GamepadButton {
-        if self.brand == GamepadBrand::Switch && self.nintendo_confirm_swap {
-            GamepadButton::South
-        } else {
-            GamepadButton::East
-        }
+        cancel_button_for(self.brand, self.nintendo_confirm_swap)
     }
 
     /// Current hotbar slot (`0..9`).
@@ -905,9 +1220,11 @@ impl GamepadMapper {
         self.update_buttons(raw, ui, &mut events);
 
         if self.ui_mode {
+            self.update_dpad_repeat(raw, dt, ui, &mut events);
             if let Some(ctx) = ui {
                 self.update_cursor(raw, dt, ctx, &mut events);
             }
+            self.update_ui_scroll(raw, dt, &mut events);
         } else {
             self.update_radial(raw, &mut events);
             self.update_sticks(raw, dt, &mut events);
@@ -1032,6 +1349,10 @@ impl GamepadMapper {
                 }
                 return;
             }
+            if btn == self.confirm_button() && self.confirm_targets_text_field(ui) {
+                events.push(GamepadEvent::RequestVirtualKeyboard);
+                return;
+            }
             if let Some(action) = self.ui_action(btn) {
                 events.push(GamepadEvent::ActionPressed(action));
             }
@@ -1087,6 +1408,12 @@ impl GamepadMapper {
             raw.axis(GamepadAxis::LeftY),
             &self.left_stick,
         );
+        // Anti-cheat compatibility: collapse the analog direction to the
+        // 8 vanilla vectors when the strict movement mode is selected.
+        let (lx, ly) = match self.movement_mode {
+            AnalogMovementMode::Full360 => (lx, ly),
+            AnalogMovementMode::EightWayVanillaCompat => snap_to_eight_way(lx, ly),
+        };
         // `+y` is stick-down on the device; forward is up.
         events.push(GamepadEvent::Move {
             forward: (-ly).clamp(-1.0, 1.0),
@@ -1131,6 +1458,78 @@ impl GamepadMapper {
     }
 
     // -- UI navigation ---------------------------------------------------
+
+    /// D-pad hold auto-repeat: after [`DPAD_REPEAT_DELAY_SECS`] the focus
+    /// jump refires every [`DPAD_REPEAT_INTERVAL_SECS`] until release or
+    /// a direction change. Fully deterministic — driven by `dt`, never
+    /// the wall clock.
+    fn update_dpad_repeat(
+        &mut self,
+        raw: &GamepadState,
+        dt: f32,
+        ui: Option<UiContext<'_>>,
+        events: &mut Vec<GamepadEvent>,
+    ) {
+        let held = if raw.button(GamepadButton::DpadUp) {
+            Some((0, -1))
+        } else if raw.button(GamepadButton::DpadDown) {
+            Some((0, 1))
+        } else if raw.button(GamepadButton::DpadLeft) {
+            Some((-1, 0))
+        } else if raw.button(GamepadButton::DpadRight) {
+            Some((1, 0))
+        } else {
+            None
+        };
+        if held != self.dpad_held_dir {
+            self.dpad_held_dir = held;
+            self.dpad_held_secs = 0.0;
+            self.dpad_next_repeat = DPAD_REPEAT_DELAY_SECS;
+        }
+        let (Some((dx, dy)), Some(ctx)) = (held, ui) else {
+            return;
+        };
+        self.dpad_held_secs += dt;
+        while self.dpad_held_secs >= self.dpad_next_repeat {
+            self.dpad_next_repeat += DPAD_REPEAT_INTERVAL_SECS;
+            if let Some(i) = self.focus_jump(dx, dy, ctx.hit_regions) {
+                events.push(GamepadEvent::FocusJumped { region_index: i });
+            }
+        }
+    }
+
+    /// Right-stick UI scroll for recipe lists, settings and chests.
+    fn update_ui_scroll(&mut self, raw: &GamepadState, dt: f32, events: &mut Vec<GamepadEvent>) {
+        let (rx, ry) = process_radial_stick(
+            raw.axis(GamepadAxis::RightX),
+            raw.axis(GamepadAxis::RightY),
+            &self.right_stick,
+        );
+        if rx != 0.0 || ry != 0.0 {
+            events.push(GamepadEvent::UiScroll {
+                dx: rx * UI_SCROLL_TICKS_PER_SEC * dt,
+                dy: ry * UI_SCROLL_TICKS_PER_SEC * dt,
+            });
+        }
+    }
+
+    /// Whether a confirm press would land on a text field (focused
+    /// region first, else the region under the virtual cursor).
+    fn confirm_targets_text_field(&self, ui: Option<UiContext<'_>>) -> bool {
+        let Some(ctx) = ui else {
+            return false;
+        };
+        if let Some(r) = self
+            .focused_region
+            .and_then(|i| ctx.hit_regions.get(i))
+        {
+            return r.id.is_text_field();
+        }
+        ctx.hit_regions.iter().any(|r| {
+            r.id.is_text_field()
+                && r.contains(self.cursor_x as i32, self.cursor_y as i32)
+        })
+    }
 
     fn update_cursor(
         &mut self,
@@ -1236,4 +1635,132 @@ fn nearest_region(x: f32, y: f32, regions: &[HitRegion]) -> Option<(f32, f32, f3
         }
     }
     best
+}
+
+// ---------------------------------------------------------------------------
+// Context button-hint bar
+// ---------------------------------------------------------------------------
+
+/// Which screen family the hint bar describes.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum HintContext {
+    /// In-world gameplay (HUD).
+    Gameplay,
+    /// Player inventory.
+    Inventory,
+    /// Chest / container screens.
+    Container,
+    /// Crafting table / recipe screens.
+    Crafting,
+    /// Pause menu.
+    PauseMenu,
+    /// Settings screens.
+    Settings,
+    /// Text input (sign, chat, search fields).
+    TextInput,
+}
+
+/// One hint-bar entry: a clean-room button badge plus a localized label.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct ConsoleHintItem {
+    /// Geometric badge for the bound button on the current brand.
+    pub badge: ButtonBadgeSpec,
+    /// Bilingual action label.
+    pub label: &'static str,
+}
+
+/// Controllable-style context hint bar: the short row of
+/// "button = action" prompts shown at the bottom of every screen.
+///
+/// Badges follow `brand`; the confirm/cancel pair honors
+/// `nintendo_confirm_swap` exactly like [`GamepadMapper`].
+pub fn build_context_hints(
+    context: HintContext,
+    brand: GamepadBrand,
+    lang: UiLang,
+    nintendo_confirm_swap: bool,
+) -> Vec<ConsoleHintItem> {
+    let confirm = confirm_button_for(brand, nintendo_confirm_swap);
+    let cancel = cancel_button_for(brand, nintendo_confirm_swap);
+    let item = |btn: GamepadButton, label: &'static str| ConsoleHintItem {
+        badge: btn.badge_spec(brand),
+        label,
+    };
+    match context {
+        HintContext::Gameplay => vec![
+            item(confirm, tr(lang, "Jump", "ジャンプ")),
+            item(cancel, tr(lang, "Drop", "ドロップ")),
+            item(GamepadButton::West, tr(lang, "Inventory", "インベントリ")),
+            item(
+                GamepadButton::LeftShoulder,
+                tr(lang, "Prev Slot", "前のスロット"),
+            ),
+            item(
+                GamepadButton::RightShoulder,
+                tr(lang, "Next Slot", "次のスロット"),
+            ),
+            item(GamepadButton::LeftTrigger, tr(lang, "Use / Place", "使う / 置く")),
+            item(
+                GamepadButton::RightTrigger,
+                tr(lang, "Attack / Mine", "攻撃 / 採掘"),
+            ),
+            item(GamepadButton::Start, tr(lang, "Pause", "一時停止")),
+        ],
+        HintContext::Inventory | HintContext::Container => vec![
+            item(confirm, tr(lang, "Confirm", "決定")),
+            item(
+                GamepadButton::North,
+                tr(lang, "Quick Move", "クイック移動"),
+            ),
+            item(
+                GamepadButton::West,
+                tr(lang, "Split Stack", "半分に分ける"),
+            ),
+            item(
+                GamepadButton::RightStick,
+                tr(lang, "Scroll", "スクロール"),
+            ),
+            item(cancel, tr(lang, "Back", "戻る")),
+        ],
+        HintContext::Crafting => vec![
+            item(confirm, tr(lang, "Craft", "クラフト")),
+            item(
+                GamepadButton::North,
+                tr(lang, "Quick Move", "クイック移動"),
+            ),
+            item(
+                GamepadButton::DpadDown,
+                tr(lang, "Recipes", "レシピ"),
+            ),
+            item(
+                GamepadButton::RightStick,
+                tr(lang, "Scroll", "スクロール"),
+            ),
+            item(cancel, tr(lang, "Back", "戻る")),
+        ],
+        HintContext::PauseMenu => vec![
+            item(confirm, tr(lang, "Confirm", "決定")),
+            item(cancel, tr(lang, "Back", "戻る")),
+        ],
+        HintContext::Settings => vec![
+            item(confirm, tr(lang, "Confirm", "決定")),
+            item(
+                GamepadButton::LeftShoulder,
+                tr(lang, "Prev Tab", "前のタブ"),
+            ),
+            item(
+                GamepadButton::RightShoulder,
+                tr(lang, "Next Tab", "次のタブ"),
+            ),
+            item(
+                GamepadButton::RightStick,
+                tr(lang, "Scroll", "スクロール"),
+            ),
+            item(cancel, tr(lang, "Close", "閉じる")),
+        ],
+        HintContext::TextInput => vec![
+            item(confirm, tr(lang, "Submit", "決定")),
+            item(cancel, tr(lang, "Close", "閉じる")),
+        ],
+    }
 }
