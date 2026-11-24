@@ -22,6 +22,7 @@ use megu_client::protocol::{
     ItemComponentPatch, ItemStackComponents, NbtValue, WireReader, encode_slot_stack,
 };
 use megu_client::render::{FrameBudgetGovernor, RenderConfig, ThrottleStage};
+use megu_client::settings::CloudMode;
 use megu_client::server_list::{ServerEntry, ServerListStore};
 use megu_client::settings::{
     ClientSettings, CrashReportMode as ClientCrashReportMode, DistantHorizon, HostMinimapMode,
@@ -93,8 +94,8 @@ use crate::atmosphere::{
 };
 use crate::clipboard::{ClipboardOutcome, SystemClipboard};
 use crate::live_session::{
-    CLOUD_SUBWORLD_ID, CrosshairPick, EntityContactShadowQuad, LiveSession, PlayerMovement,
-    PlayerPose, SessionPaths, SessionStatus, jar_version_ids,
+    CLOUD_SUBWORLD_ID, CloudDeckMode, CrosshairPick, EntityContactShadowQuad, LiveSession,
+    PlayerMovement, PlayerPose, SessionPaths, SessionStatus, jar_version_ids,
 };
 use crate::renderer::{GpuRenderer, request_gpu_device};
 use crate::subworld_sync::SubWorldHelmCmd;
@@ -530,6 +531,23 @@ fn cloud_layers_for_settings(settings: &UiSettings) -> u8 {
         VideoPreset::Fast => 1,
         VideoPreset::Balanced | VideoPreset::Custom => 2,
         VideoPreset::High | VideoPreset::Ultra => 3,
+    }
+}
+
+/// `VisualStylePreset` x `CloudMode` -> cloud deck layout: the Vanilla
+/// preset (and `Clouds: Fast` under every preset) keeps the authentic
+/// single cubic deck, while `Clouds: Fancy` under a Megu Natural style
+/// opts into the three parallax hybrid decks. `Off` removes them all.
+fn cloud_deck_mode(preset: VisualStylePreset, clouds: CloudMode) -> CloudDeckMode {
+    match clouds {
+        CloudMode::Off => CloudDeckMode::Off,
+        CloudMode::Fast => CloudDeckMode::Vanilla,
+        CloudMode::Fancy => match preset {
+            VisualStylePreset::MeguNatural | VisualStylePreset::MeguNaturalLight => {
+                CloudDeckMode::Hybrid
+            }
+            VisualStylePreset::Vanilla => CloudDeckMode::Vanilla,
+        },
     }
 }
 
@@ -4644,6 +4662,11 @@ impl GpuApp {
             mini_hud.show_light_level = mini_segments & (1 << 6) != 0;
             mini_hud.show_chunks_entities = mini_segments & (1 << 7) != 0;
             mini_hud.show_ram = mini_segments & (1 << 8) != 0;
+            // Visual-style preset x `Clouds` decides the deck layout
+            // every frame: Vanilla stays one authentic cubic deck, Megu
+            // Natural + Fancy opts into the hybrid parallax set.
+            live.cloud_deck_mode =
+                cloud_deck_mode(self.ui.settings.visual.preset, self.render_config.clouds);
             live.record_frame_and_refresh_minihud(dt, &mut self.ui);
             live.set_ui_locale(self.ui.settings.locale.code());
             let feed = live.hud_feed();
@@ -9563,5 +9586,41 @@ mod tests {
             !app.seamless_loading_suppressed(),
             "a dimension id that is not the live session's must not suppress"
         );
+    }
+
+    /// Vanilla default must stay the authentic single-deck cubic cloud;
+    /// only Megu Natural + Fancy opts into the hybrid parallax decks.
+    #[test]
+    fn cloud_deck_mode_maps_preset_and_cloud_mode() {
+        // Vanilla preset (the default): every cloud mode stays vanilla.
+        for clouds in [CloudMode::Fast, CloudMode::Fancy] {
+            assert_eq!(
+                cloud_deck_mode(VisualStylePreset::Vanilla, clouds),
+                CloudDeckMode::Vanilla,
+                "Vanilla preset + {clouds:?} must keep the single cubic deck"
+            );
+        }
+        assert_eq!(
+            cloud_deck_mode(VisualStylePreset::Vanilla, CloudMode::Off),
+            CloudDeckMode::Off
+        );
+        // Megu Natural styles: Fancy unlocks the hybrid decks, Fast
+        // stays one lightweight greedy deck, Off stays empty.
+        for preset in [
+            VisualStylePreset::MeguNaturalLight,
+            VisualStylePreset::MeguNatural,
+        ] {
+            assert_eq!(
+                cloud_deck_mode(preset, CloudMode::Fancy),
+                CloudDeckMode::Hybrid,
+                "{preset:?} + Fancy must enable the hybrid decks"
+            );
+            assert_eq!(
+                cloud_deck_mode(preset, CloudMode::Fast),
+                CloudDeckMode::Vanilla,
+                "{preset:?} + Fast must stay a single greedy deck"
+            );
+            assert_eq!(cloud_deck_mode(preset, CloudMode::Off), CloudDeckMode::Off);
+        }
     }
 }

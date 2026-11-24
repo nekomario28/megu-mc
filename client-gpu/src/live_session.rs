@@ -92,11 +92,11 @@ use megu_core::math_opt_engine::{
 use crate::SecretString;
 use crate::atmosphere::{
     AtmosphereParams, BiomeAtmosphereBlender, CLOUD_RENDER_ALPHA, ChunkFadeTracker,
-    voxel_clouds_to_geometry,
+    voxel_clouds_to_geometry_flagged,
 };
 use crate::subworld_render::{
-    InstancedPartBatch, InstancedPartRecord, SubWorldRenderBank, SubWorldRenderEntry,
-    SubWorldTransform, TerrainVertex, box_mesh, quat_from_axis_angle,
+    InstancedPartBatch, InstancedPartRecord, MAT_FLAG_CLOUD, SubWorldRenderBank,
+    SubWorldRenderEntry, SubWorldTransform, TerrainVertex, box_mesh, quat_from_axis_angle,
 };
 use crate::subworld_sync::{
     decode_sync_frame, encode_helm_cmd, SubWorldHelmCmd, SUBWORLD_HELM_CHANNEL,
@@ -2118,20 +2118,21 @@ pub struct LiveSession {
     /// `place_recipe` requests — the observable edge between the UI's
     /// `+` dispatch and the worker channel.
     pub place_recipe_requests: Vec<(u8, String, bool)>,
-    /// Integer-cell key the layered voxel-cloud mesh was last generated
-    /// for: `(cloud_cx, cloud_cz, scroll_cell, cloud_layers,
-    /// cloud_height_bits, clouds_gate_open)`. Between key hits only the
-    /// sub-cell X offset changes, which slides through the existing
-    /// `SubWorld` model matrix instead of rebuilding the mesh. The gate
-    /// flag is the atmosphere/dimension check
-    /// [`generate_layered_voxel_clouds_with_atmosphere`] applies —
-    /// without it a dimension swap or an orbit-ascent blend could keep a
-    /// stale cloud sheet alive on the reuse path below.
-    cloud_mesh_key: Option<(i64, i64, i64, u32, u32, bool)>,
-    /// Quantized (1/32) cloud-lighting key for the cached mesh: weather
-    /// or day-phase shifts that change the baked tint force a
-    /// regenerate even inside one cell.
-    cloud_mesh_lighting_key: Option<[u32; 10]>,
+    /// Per-deck integer-cell key each layered voxel-cloud mesh was last
+    /// generated for: `(cloud_cx, cloud_cz, scroll_cell, cloud_layers,
+    /// cloud_height_bits)`. Between key hits only the sub-cell X offset
+    /// changes, which slides through the existing `SubWorld` model
+    /// matrix instead of rebuilding the mesh. The
+    /// [`generate_layered_voxel_clouds_with_atmosphere`] gate
+    /// (`has_skylight` + `density >= MIN_SKY_ATMOSPHERE`) is evaluated
+    /// before the deck loop — a closed gate drops every deck, so a
+    /// dimension swap or orbit-ascent blend cannot reuse a stale sheet.
+    cloud_deck_cache: [CloudDeckCache; 3],
+    /// How many cloud decks `refresh_voxel_clouds` keeps resident and how
+    /// they're shaded — set by `window.rs` from `CloudMode` x
+    /// `VisualStylePreset`. `Vanilla` preserves the classic single-deck
+    /// behaviour (greedy-meshed, no parallax/bob/hybrid optics).
+    pub cloud_deck_mode: CloudDeckMode,
     /// Composed frames that reused the cached cloud mesh with a
     /// matrix-only sub-cell scroll slide.
     pub cloud_mesh_reuses: u64,
@@ -2698,8 +2699,8 @@ impl LiveSession {
             domain_hints,
             compute_strategy_apply_count: 0,
             place_recipe_requests: Vec::new(),
-            cloud_mesh_key: None,
-            cloud_mesh_lighting_key: None,
+            cloud_deck_cache: [CloudDeckCache::default(); 3],
+            cloud_deck_mode: CloudDeckMode::default(),
             cloud_mesh_reuses: 0,
             atmosphere_blender: BiomeAtmosphereBlender::new(AtmosphereParams::default()),
             chunk_fades: ChunkFadeTracker::new(),
@@ -5377,16 +5378,29 @@ impl LiveSession {
     /// set — the pack's `enabled`/`layered_voxel_clouds` toggles gate on
     /// top of that (an empty set removes the sheet instead of leaving a
     /// stale frame).
-    ///
-    /// The mesh is cached on the integer cell grid `(cloud_cx, cloud_cz,
-    /// scroll_cell, cloud_layers, cloud_height, clouds_gate_open)`:
+    /// The mesh is cached per deck on the integer cell grid `(cloud_cx,
+    /// cloud_cz, scroll_cell, cloud_layers, cloud_height)`:
     /// `generate` bakes `cx*cell - scroll` into `min.x`, so feeding the
     /// cell-aligned canonical tick produces a mesh whose only drift
     /// inside one cell is the sub-cell X remainder — applied to the
     /// existing `SubWorld` model matrix via `set_transform` instead of a
     /// geometry rebuild. `cloud_mesh_reuses` counts the matrix-only
-    /// slides.
+    /// slides. `CloudDeckMode::Hybrid` keeps three decks alive (each
+    /// with its own parallax scroll, gentle bob and `MAT_FLAG_CLOUD`
+    /// hybrid optics); `Vanilla`/`Fast` keeps the single authentic cubic
+    /// deck, `Off` and skylight-less dimensions keep none.
     pub fn refresh_voxel_clouds(&mut self) {
+        // The gate `generate_layered_voxel_clouds_with_atmosphere`
+        // applies (`allow_clouds` + `density >= MIN_SKY_ATMOSPHERE`) plus
+        // the deck-mode switch: a closed gate or `Off` removes every
+        // deck — Nether/End/vacuum and orbit-ascent density dips can
+        // never matrix-slide a stale sheet.
+        let clouds_open =
+            self.world.dimension.has_skylight && self.tactile_atmosphere_density() >= 0.15;
+        if self.cloud_deck_mode == CloudDeckMode::Off || !clouds_open {
+            self.remove_cloud_decks();
+            return;
+        }
         let (cam_x, cam_z) = self
             .pose
             .map(|pose| (pose.feet[0] as f32, pose.feet[2] as f32))
@@ -5395,41 +5409,16 @@ impl LiveSession {
         let cell = f64::from(CLOUD_CELL_BLOCKS);
         let scroll_rate = f64::from(CLOUD_SCROLL_BLOCKS_PER_TICK);
         let scroll = time as f64 * scroll_rate;
-        let scroll_cell = (scroll / cell).floor() as i64;
-        // Canonical tick whose baked scroll lands on the cell grid:
-        // `generate` computes `min.x = cx*cell - ticks*rate`, so this tick
-        // makes the cached mesh carry only whole-cell offsets.
-        let canon_ticks = ((scroll_cell as f64 * cell) / scroll_rate)
-            .round()
-            .clamp(0.0, u64::MAX as f64) as u64;
-        let canon_scroll = canon_ticks as f64 * scroll_rate;
         let cam_x = if cam_x.is_finite() { cam_x } else { 0.0 };
         let cam_z = if cam_z.is_finite() { cam_z } else { 0.0 };
-        let cloud_cx = ((f64::from(cam_x) + canon_scroll) / cell).floor() as i64;
         let cloud_cz = (f64::from(cam_z) / cell).floor() as i64;
-        let nature = &self.vanilla_plus_cfg.nature;
-        // The gate `generate_layered_voxel_clouds_with_atmosphere`
-        // applies (`allow_clouds` + `density >= MIN_SKY_ATMOSPHERE`) must
-        // ride in the mesh key: without it the reuse branch below could
-        // keep a stale sheet alive through a dimension swap or the
-        // orbit-ascent fog blend crossing the threshold.
-        let clouds_open =
-            self.world.dimension.has_skylight && self.tactile_atmosphere_density() >= 0.15;
-        let key = (
-            cloud_cx,
-            cloud_cz,
-            scroll_cell,
-            u32::from(nature.effective_cloud_layers()),
-            nature.effective_cloud_height().to_bits(),
-            clouds_open,
-        );
-        // Sub-cell drift this frame: the model matrix slides the cached
-        // mesh by the fraction of a cell scrolled since the last boundary.
-        let slide_x = -((scroll - canon_scroll) as f32);
-        let transform = SubWorldTransform {
-            position: [slide_x, 0.0, 0.0],
-            ..SubWorldTransform::IDENTITY
-        };
+        // Cloned so per-deck `self` mutation inside the loop can borrow
+        // mutably while generation re-reads the config.
+        let nature = self.vanilla_plus_cfg.nature.clone();
+        let cloud_layers = u32::from(nature.effective_cloud_layers());
+        let cloud_height = nature.effective_cloud_height().to_bits();
+        let density = self.tactile_atmosphere_density();
+        let has_skylight = self.world.dimension.has_skylight;
         // Vanilla celestial angle: 0 = sunrise, 6000 = noon, 18000 = midnight.
         let sun_elevation = ((time % 24_000) as f32 * (std::f32::consts::TAU / 24_000.0)).sin();
         let lighting = compute_cloud_lighting(
@@ -5438,34 +5427,95 @@ impl LiveSession {
             self.world.thunder_level,
         );
         let lighting_key = cloud_lighting_key(&lighting);
-        if self.cloud_mesh_key == Some(key)
-            && self.cloud_mesh_lighting_key == Some(lighting_key)
-            && self.subworlds.get(CLOUD_SUBWORLD_ID).is_some()
-        {
-            self.subworlds.set_transform(CLOUD_SUBWORLD_ID, transform);
-            self.cloud_mesh_reuses += 1;
-            return;
+        let hybrid = self.cloud_deck_mode == CloudDeckMode::Hybrid;
+        // World-time seconds drive the gentle bob/sway phases.
+        let time_sec = time as f32 / 20.0;
+        for deck in 0..CLOUD_DECK_IDS.len() {
+            let spec = cloud_deck_spec(deck);
+            if !hybrid && deck > 0 {
+                self.deactivate_cloud_deck(deck);
+                continue;
+            }
+            // Per-deck parallax: each hybrid deck scrolls at its own
+            // wind multiplier, so its canonical cell alignment (and mesh
+            // cache key) drifts independently — zero mesh rebuilds on
+            // sub-cell ticks.
+            let deck_scroll = scroll * f64::from(spec.wind_multiplier);
+            let scroll_cell = (deck_scroll / cell).floor() as i64;
+            // Canonical tick whose baked scroll lands on the cell grid:
+            // `generate` computes `min.x = cx*cell - ticks*rate`, so this
+            // tick makes the cached mesh carry only whole-cell offsets.
+            let canon_ticks = ((scroll_cell as f64 * cell) / scroll_rate)
+                .round()
+                .clamp(0.0, u64::MAX as f64) as u64;
+            let canon_scroll = canon_ticks as f64 * scroll_rate;
+            let cloud_cx = ((f64::from(cam_x) + canon_scroll) / cell).floor() as i64;
+            let key = (cloud_cx, cloud_cz, scroll_cell, cloud_layers, cloud_height);
+            // Sub-cell drift this frame: the model matrix slides the
+            // cached mesh by the fraction of a cell scrolled since the
+            // last boundary. Hybrid decks add a bounded sine bob + sway.
+            let slide_x = -((deck_scroll - canon_scroll) as f32);
+            let (lift_y, sway_z) = if hybrid {
+                (
+                    spec.y_offset
+                        + spec.bob_amplitude * (time_sec * spec.bob_freq + spec.phase).sin(),
+                    spec.sway_amplitude * (time_sec * spec.sway_freq + spec.phase * 1.7).sin(),
+                )
+            } else {
+                (0.0, 0.0)
+            };
+            let transform = SubWorldTransform {
+                position: [slide_x, lift_y, sway_z],
+                ..SubWorldTransform::IDENTITY
+            };
+            let cache = &self.cloud_deck_cache[deck];
+            if cache.mesh_key == Some(key)
+                && cache.lighting_key == Some(lighting_key)
+                && self.subworlds.get(spec.id).is_some()
+            {
+                self.subworlds.set_transform(spec.id, transform);
+                self.cloud_mesh_reuses += 1;
+                continue;
+            }
+            let cells = generate_layered_voxel_clouds_with_atmosphere(
+                &nature,
+                cam_x,
+                cam_z,
+                canon_ticks,
+                density,
+                has_skylight,
+            );
+            if cells.is_empty() {
+                self.subworlds.remove(spec.id);
+                self.cloud_deck_cache[deck] = CloudDeckCache::default();
+                continue;
+            }
+            let material_flags = if hybrid { MAT_FLAG_CLOUD } else { 0 };
+            let (vertices, indices) =
+                voxel_clouds_to_geometry_flagged(&cells, &lighting, material_flags);
+            let mut entry = SubWorldRenderEntry::new(spec.id, transform, vertices, indices);
+            entry.alpha = if hybrid { spec.alpha } else { CLOUD_RENDER_ALPHA };
+            self.subworlds.upsert(entry);
+            self.cloud_deck_cache[deck] = CloudDeckCache {
+                mesh_key: Some(key),
+                lighting_key: Some(lighting_key),
+            };
         }
-        let cells = generate_layered_voxel_clouds_with_atmosphere(
-            nature,
-            cam_x,
-            cam_z,
-            canon_ticks,
-            self.tactile_atmosphere_density(),
-            self.world.dimension.has_skylight,
-        );
-        if cells.is_empty() {
-            self.subworlds.remove(CLOUD_SUBWORLD_ID);
-            self.cloud_mesh_key = None;
-            self.cloud_mesh_lighting_key = None;
-            return;
+    }
+
+    /// Drop one cloud deck's subworld and invalidate its mesh cache.
+    fn deactivate_cloud_deck(&mut self, deck: usize) {
+        self.subworlds.remove(CLOUD_DECK_IDS[deck]);
+        self.cloud_deck_cache[deck] = CloudDeckCache::default();
+    }
+
+    /// Remove every cloud deck subworld and clear the per-deck mesh
+    /// caches — `CloudDeckMode::Off`, skylight-less dimensions and
+    /// dimension resets all route through here.
+    fn remove_cloud_decks(&mut self) {
+        for deck in 0..CLOUD_DECK_IDS.len() {
+            self.deactivate_cloud_deck(deck);
         }
-        let (vertices, indices) = voxel_clouds_to_geometry(&cells, &lighting);
-        let mut entry = SubWorldRenderEntry::new(CLOUD_SUBWORLD_ID, transform, vertices, indices);
-        entry.alpha = CLOUD_RENDER_ALPHA;
-        self.subworlds.upsert(entry);
-        self.cloud_mesh_key = Some(key);
-        self.cloud_mesh_lighting_key = Some(lighting_key);
     }
 
     /// Mirror `self.hud` into `hud` only when it changed since the last
@@ -7408,12 +7458,12 @@ impl LiveSession {
         self.atmosphere_blender.snap_to_target();
         // The atmosphere gate on layered voxel clouds flips with the
         // dimension (Nether/End/vacuum lose `has_skylight` and the fog
-        // blend restarts at a new density) — drop the cached sheet so the
-        // next `refresh_voxel_clouds` evaluates the gate fresh instead of
-        // matrix-sliding a stale overworld mesh.
-        self.subworlds.remove(CLOUD_SUBWORLD_ID);
-        self.cloud_mesh_key = None;
-        self.cloud_mesh_lighting_key = None;
+        // blend restarts at a new density) — drop the cached sheets so
+        // the next `refresh_voxel_clouds` evaluates the gate fresh
+        // instead of matrix-sliding a stale overworld mesh:
+        // `remove_cloud_decks` drops all three deck ids and their
+        // per-deck mesh caches.
+        self.remove_cloud_decks();
     }
 
     fn apply_custom(&mut self, channel: ClientCustomChannelEvent) -> Result<(), String> {
@@ -7941,6 +7991,118 @@ fn run_connection(
 /// Reserved `subworlds` id for the layered voxel-cloud sheet (kept clear of
 /// contraption ids, which allocate from 1 upward).
 pub const CLOUD_SUBWORLD_ID: u64 = u64::MAX;
+/// Altocumulus deck of the hybrid cloud set — same reserved-id scheme as
+/// [`CLOUD_SUBWORLD_ID`], one slot below.
+pub const CLOUD_SUBWORLD_ID_ALTO: u64 = u64::MAX - 1;
+/// Cirrus deck of the hybrid cloud set.
+pub const CLOUD_SUBWORLD_ID_CIRRUS: u64 = u64::MAX - 2;
+/// All three cloud deck ids in deck order: cumulus, altocumulus, cirrus.
+/// `Vanilla`/`Fast` cloud modes keep only index 0 resident.
+pub const CLOUD_DECK_IDS: [u64; 3] = [
+    CLOUD_SUBWORLD_ID,
+    CLOUD_SUBWORLD_ID_ALTO,
+    CLOUD_SUBWORLD_ID_CIRRUS,
+];
+
+/// `true` for every reserved cloud deck id — shadow-caster filters and
+/// dimension cleanup key on this so all three decks are managed as one
+/// family.
+pub fn is_cloud_subworld_id(id: u64) -> bool {
+    CLOUD_DECK_IDS.contains(&id)
+}
+
+/// How `refresh_voxel_clouds` manages the cloud decks — derived by
+/// `window.rs` from `CloudMode` x `VisualStylePreset`, never a user
+/// setting of its own.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum CloudDeckMode {
+    /// `Clouds: Off` — no cloud subworlds at all.
+    Off,
+    /// Classic single cubic deck: greedy-meshed for a 4x-8x lighter mesh
+    /// but otherwise the authentic vanilla look (no parallax decks, no
+    /// bob, no hybrid optics).
+    #[default]
+    Vanilla,
+    /// Three greedy-meshed decks (cumulus/altocumulus/cirrus) with
+    /// independent parallax wind, gentle sine bob/sway and
+    /// `MAT_FLAG_CLOUD` cubic x realistic hybrid optics.
+    Hybrid,
+}
+
+/// Per-deck hybrid-cloud tuning returned by [`cloud_deck_spec`].
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct CloudDeckSpec {
+    /// Reserved `subworlds` id for this deck.
+    pub id: u64,
+    /// Draw alpha: cumulus 0.82 > altocumulus 0.58 > cirrus 0.35.
+    pub alpha: f32,
+    /// Parallax wind-speed multiplier vs the base cloud scroll.
+    pub wind_multiplier: f32,
+    /// Extra height on top of the baked mesh base (blocks).
+    pub y_offset: f32,
+    /// Vertical bob amplitude (blocks).
+    pub bob_amplitude: f32,
+    /// Bob angular frequency (rad per world-second; 14-22s periods).
+    pub bob_freq: f32,
+    /// Cross-wind sway amplitude (blocks).
+    pub sway_amplitude: f32,
+    /// Sway angular frequency.
+    pub sway_freq: f32,
+    /// Phase offset so the decks never bob in lockstep.
+    pub phase: f32,
+}
+
+/// Tuning for one hybrid cloud deck by index into [`CLOUD_DECK_IDS`].
+/// Deck 0 is the backwards-compatible cumulus sheet every mode shares;
+/// decks 1-2 only exist under [`CloudDeckMode::Hybrid`].
+pub fn cloud_deck_spec(deck: usize) -> CloudDeckSpec {
+    const TAU: f32 = std::f32::consts::TAU;
+    match deck {
+        1 => CloudDeckSpec {
+            id: CLOUD_SUBWORLD_ID_ALTO,
+            alpha: 0.58,
+            wind_multiplier: 1.28,
+            y_offset: 14.0,
+            bob_amplitude: 0.42,
+            bob_freq: TAU / 16.0,
+            sway_amplitude: 0.35,
+            sway_freq: TAU / 23.0,
+            phase: 2.1,
+        },
+        2 => CloudDeckSpec {
+            id: CLOUD_SUBWORLD_ID_CIRRUS,
+            alpha: 0.35,
+            wind_multiplier: 1.62,
+            y_offset: 26.0,
+            bob_amplitude: 0.55,
+            bob_freq: TAU / 14.0,
+            sway_amplitude: 0.35,
+            sway_freq: TAU / 19.0,
+            phase: 4.2,
+        },
+        _ => CloudDeckSpec {
+            id: CLOUD_SUBWORLD_ID,
+            alpha: 0.82,
+            wind_multiplier: 1.0,
+            y_offset: 0.0,
+            bob_amplitude: 0.28,
+            bob_freq: TAU / 18.0,
+            sway_amplitude: 0.35,
+            sway_freq: TAU / 26.0,
+            phase: 0.0,
+        },
+    }
+}
+
+/// Per-deck cloud mesh cache slot: the integer-cell key the deck's mesh
+/// was last generated for plus the quantized (1/32) cloud-lighting key
+/// (weather or day-phase shifts that change the baked tint force a
+/// regenerate even inside one cell).
+#[derive(Clone, Copy, Default)]
+struct CloudDeckCache {
+    mesh_key: Option<(i64, i64, i64, u32, u32)>,
+    lighting_key: Option<[u32; 10]>,
+}
 
 /// SW6D v1 pose-flag bit marking the sub-world the local player rides and
 /// helms — the binding [`LiveSession::send_subworld_helm`] commands target.
@@ -12169,6 +12331,171 @@ mod tests {
         assert!(
             live.subworlds.get(CLOUD_SUBWORLD_ID).is_none(),
             "vacuum atmosphere must suppress voxel clouds"
+        );
+    }
+}
+
+// Re-opened for the hybrid cloud deck tests — kept adjacent to the
+// implementation so the required names stay easy to audit.
+#[cfg(test)]
+mod cloud_deck_tests {
+    use super::*;
+
+    /// Offline session with a hybrid cloud field over a camera where
+    /// `generate_layered_voxel_clouds` emits cells — same "walk until a
+    /// sheet exists" search the existing cloud-cache test uses.
+    fn hybrid_session() -> LiveSession {
+        let mut live = LiveSession::offline_with_null_audio();
+        live.vanilla_plus_cfg.nature.enabled = true;
+        live.vanilla_plus_cfg.nature.layered_voxel_clouds = true;
+        live.cloud_deck_mode = CloudDeckMode::Hybrid;
+        live.world.time_of_day = 6000;
+        for step in 0..32 {
+            live.pose = Some(PlayerPose {
+                feet: [0.0, 80.0, step as f64 * 96.0],
+                yaw: 0.0,
+                pitch: 0.0,
+            });
+            live.refresh_voxel_clouds();
+            if live.subworlds.get(CLOUD_SUBWORLD_ID).is_some() {
+                break;
+            }
+        }
+        live
+    }
+
+    #[test]
+    fn hybrid_cloud_decks_parallax_and_gentle_bob_reuse_mesh() {
+        let mut live = hybrid_session();
+        for &id in &CLOUD_DECK_IDS {
+            assert!(
+                live.subworlds.get(id).is_some(),
+                "hybrid mode must keep deck {id:#x} resident"
+            );
+        }
+        // Deck alphas follow the cumulus > alto > cirrus contract.
+        let alphas: Vec<f32> = CLOUD_DECK_IDS
+            .iter()
+            .map(|&id| live.subworlds.get(id).unwrap().alpha)
+            .collect();
+        assert!(
+            alphas[0] > alphas[1] && alphas[1] > alphas[2],
+            "deck opacities must descend cumulus>alto>cirrus: {alphas:?}"
+        );
+        assert!(
+            (alphas[0] - 0.82).abs() < 1e-6
+                && (alphas[1] - 0.58).abs() < 1e-6
+                && (alphas[2] - 0.35).abs() < 1e-6,
+            "deck opacities must be 0.82/0.58/0.35: {alphas:?}"
+        );
+        // Hybrid geometry carries MAT_FLAG_CLOUD on every vertex.
+        assert!(
+            live.subworlds
+                .get(CLOUD_SUBWORLD_ID)
+                .unwrap()
+                .vertices
+                .iter()
+                .all(|v| v.material_flags() == MAT_FLAG_CLOUD),
+            "hybrid cloud vertices must tag MAT_FLAG_CLOUD"
+        );
+
+        // Parallax + bob: five sub-cell ticks must be transform-only
+        // hits (no geometry rebuild) with distinct per-deck X slides and
+        // bounded vertical motion.
+        let base_reuses = live.cloud_mesh_reuses;
+        let mut x_slides: [Vec<f32>; 3] = [Vec::new(), Vec::new(), Vec::new()];
+        let mut y_lifts: [Vec<f32>; 3] = [Vec::new(), Vec::new(), Vec::new()];
+        for _ in 0..5 {
+            live.world.time_of_day += 1;
+            live.refresh_voxel_clouds();
+            for (deck, &id) in CLOUD_DECK_IDS.iter().enumerate() {
+                let t = live.subworlds.get(id).unwrap().transform.position;
+                x_slides[deck].push(t[0]);
+                y_lifts[deck].push(t[1]);
+            }
+        }
+        assert!(
+            live.cloud_mesh_reuses >= base_reuses + 12,
+            "in-cell parallax must reuse cached meshes: {}",
+            live.cloud_mesh_reuses
+        );
+        // Distinct wind multipliers give distinct cumulative X slides.
+        for (a, b) in [(0usize, 1usize), (1, 2), (0, 2)] {
+            let delta: f32 = x_slides[a]
+                .iter()
+                .zip(&x_slides[b])
+                .map(|(x, y)| (x - y).abs())
+                .sum();
+            assert!(
+                delta > 1e-5,
+                "decks {a} and {b} must parallax differently: {:?} vs {:?}",
+                x_slides[a],
+                x_slides[b]
+            );
+        }
+        // The gentle bob stays bounded inside each deck's amplitude band
+        // and never becomes dizzying (smooth small oscillation).
+        for (deck, spec) in (0..3).map(cloud_deck_spec).enumerate() {
+            for &y in &y_lifts[deck] {
+                let bob = (y - spec.y_offset).abs();
+                assert!(
+                    bob <= spec.bob_amplitude + 1e-5,
+                    "deck {deck} bob {bob} exceeded amplitude {}",
+                    spec.bob_amplitude
+                );
+            }
+        }
+        // Decks sit at distinct heights: 0, +14, +26 bands do not overlap.
+        assert!(y_lifts[0].iter().all(|&y| y.abs() <= 0.5));
+        assert!(y_lifts[1].iter().all(|&y| (13.0..=15.0).contains(&y)));
+        assert!(y_lifts[2].iter().all(|&y| (25.0..=27.0).contains(&y)));
+    }
+
+    #[test]
+    fn cloud_subworlds_clean_up_on_disable_or_dimension_swap() {
+        let mut live = hybrid_session();
+        assert!(CLOUD_DECK_IDS
+            .iter()
+            .all(|&id| live.subworlds.get(id).is_some()));
+
+        // Clouds: Off removes all three decks at once.
+        live.cloud_deck_mode = CloudDeckMode::Off;
+        live.refresh_voxel_clouds();
+        assert!(
+            CLOUD_DECK_IDS
+                .iter()
+                .all(|&id| live.subworlds.get(id).is_none()),
+            "Off must remove every cloud deck"
+        );
+
+        // Vanilla mode keeps only the classic cumulus deck.
+        live.cloud_deck_mode = CloudDeckMode::Vanilla;
+        live.refresh_voxel_clouds();
+        assert!(live.subworlds.get(CLOUD_SUBWORLD_ID).is_some());
+        assert!(live.subworlds.get(CLOUD_SUBWORLD_ID_ALTO).is_none());
+        assert!(live.subworlds.get(CLOUD_SUBWORLD_ID_CIRRUS).is_none());
+        assert!(
+            live.subworlds
+                .get(CLOUD_SUBWORLD_ID)
+                .unwrap()
+                .vertices
+                .iter()
+                .all(|v| v.material_flags() == 0),
+            "vanilla clouds must not tag MAT_FLAG_CLOUD"
+        );
+
+        // Back to hybrid, then a skylight-less dimension (Nether/End)
+        // drops all three decks on the next refresh.
+        live.cloud_deck_mode = CloudDeckMode::Hybrid;
+        live.refresh_voxel_clouds();
+        assert!(live.subworlds.get(CLOUD_SUBWORLD_ID_CIRRUS).is_some());
+        live.world.dimension.has_skylight = false;
+        live.refresh_voxel_clouds();
+        assert!(
+            CLOUD_DECK_IDS
+                .iter()
+                .all(|&id| live.subworlds.get(id).is_none()),
+            "a skylight-less dimension must remove every cloud deck"
         );
     }
 }

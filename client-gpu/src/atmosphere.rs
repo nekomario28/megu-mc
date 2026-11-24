@@ -15,7 +15,7 @@
 //!   [`planet_subworld_transform`] — convert `generate_layered_voxel_clouds`
 //!   and `build_3d_planet_mesh` output straight into GPU-ready geometry.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use megu_client_mesh::space_sky_bridge::{
     build_3d_planet_mesh, DimensionAdaptationPolicy, PlanetSkyBody, SkyBodyPlacement,
@@ -743,35 +743,297 @@ fn cloud_channel(v: f32) -> f32 {
     }
 }
 
-/// Emit one cloud cell's exposed quads into `vertices`/`indices`. Shading:
-/// top faces take `lighting.top_rgb`, bottoms `bottom_rgb`, sides
-/// `side_rgb`; `layer` adds the puffy-cap boost and `extra_boost` applies
-/// the styled path's forward-scatter silver lining. Non-finite or
-/// non-positive-size cells emit nothing.
-fn push_cloud_cell_geometry(
-    cell: &VoxelCloudCell,
+/// One axis-aligned merged cloud quad in world space: a maximal
+/// rectangle of coplanar same-orientation exposed cell faces (or a
+/// single cell face for grid-unaligned cells).
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct CloudRect {
+    /// Face index in `box_face_corners`/`CLOUD_FACE_BITS` order
+    /// (`0..6`: `+X`, `-X`, `+Y`, `-Y`, `+Z`, `-Z`).
+    face: usize,
+    /// Stratum index carried through for the puffy-cap albedo boost.
+    layer: u8,
+    /// Cell pitch used for world-proportional UVs.
+    size: [f32; 3],
+    /// Quad span.
+    min: [f32; 3],
+    /// Quad span.
+    max: [f32; 3],
+    /// `true` = unit `0..1` UVs per corner (loose fallback); `false` =
+    /// world-space UVs proportional to the merged extent.
+    unit_uv: bool,
+}
+
+/// One merge group: cells sharing `layer`, `min[1]` and `size` have the
+/// same voxel pitch and y-range, which is what face merging requires.
+#[derive(Default)]
+struct CloudGridGroup {
+    /// Shared fractional grid offset (the uniform scroll drift):
+    /// `min[0]/size[0] - frac_x` and `min[2]/size[2] - frac_z` are exact
+    /// integers for every cell in the group.
+    frac_x: f32,
+    frac_z: f32,
+    /// Grid cells `(gx, gz)` -> exposed face bits.
+    cells: BTreeMap<(i64, i64), u8>,
+    /// Cell pitch on each axis.
+    size: [f32; 3],
+    /// Shared cell y-range `[y0, y1]`.
+    y0: f32,
+    y1: f32,
+    /// World x/z of grid line 0.
+    base_x: f32,
+    base_z: f32,
+}
+
+/// `true` when `bit` is set in `mask` — the exposed-face test for one
+/// cell in one direction family.
+fn mask_has(mask: u8, bit: u8) -> bool {
+    mask & bit != 0
+}
+
+/// `min[0]/size[0]` and `min[2]/size[2]` for one cell — the raw grid
+/// ratios (uniformly offset by the baked scroll, so the group stores
+/// the shared fraction once rather than re-deriving it).
+fn cell_grid_ratio(cell: &VoxelCloudCell) -> (f32, f32) {
+    (cell.min[0] / cell.size[0], cell.min[2] / cell.size[2])
+}
+
+/// `group_cloud_cells` result: merge groups keyed by
+/// `(layer, min[1], size)` plus the grid-unaligned cells that take the
+/// one-quad-per-face fallback.
+struct CloudGrouping<'c> {
+    groups: BTreeMap<(u8, u32, u32, u32, u32), CloudGridGroup>,
+    loose: Vec<&'c VoxelCloudCell>,
+}
+
+/// Group cells by `(layer, min[1], size)` — the only cells that can
+/// share merged faces — then collect exposed faces into direction
+/// masks keyed by exact integer grid coordinates. Cells whose grid
+/// ratio disagrees with the group's shared fraction (a hand-built or
+/// degenerate field) fall out to `loose` and emit one quad per face.
+fn group_cloud_cells(cells: &[VoxelCloudCell]) -> CloudGrouping<'_> {
+    let mut grouping = CloudGrouping {
+        groups: BTreeMap::new(),
+        loose: Vec::new(),
+    };
+    let loose = &mut grouping.loose;
+    for cell in cells {
+        let max = [
+            cell.min[0] + cell.size[0],
+            cell.min[1] + cell.size[1],
+            cell.min[2] + cell.size[2],
+        ];
+        if !cell.min.iter().chain(max.iter()).all(|v| v.is_finite())
+            || !cell.size.iter().all(|s| s.is_finite() && *s > 0.0)
+        {
+            continue;
+        }
+        let (gx_ratio, gz_ratio) = cell_grid_ratio(cell);
+        let key = (
+            cell.layer,
+            cell.min[1].to_bits(),
+            cell.size[0].to_bits(),
+            cell.size[1].to_bits(),
+            cell.size[2].to_bits(),
+        );
+        // `ratio - floor(ratio)` normalizes the grid fraction to
+        // `[0, 1)` — `fract()` would disagree across x/z = 0 (a cell at
+        // ratio -3.7 vs +2.3 shares the same 0.3 offset).
+        let group = grouping.groups.entry(key).or_insert_with(|| CloudGridGroup {
+            frac_x: gx_ratio - gx_ratio.floor(),
+            frac_z: gz_ratio - gz_ratio.floor(),
+            size: cell.size,
+            y0: cell.min[1],
+            y1: cell.min[1] + cell.size[1],
+            ..CloudGridGroup::default()
+        });
+        let gx_f = gx_ratio - group.frac_x;
+        let gz_f = gz_ratio - group.frac_z;
+        let gx = gx_f.round() as i64;
+        let gz = gz_f.round() as i64;
+        if (gx_f - gx as f32).abs() > 1.0e-3 || (gz_f - gz as f32).abs() > 1.0e-3 {
+            loose.push(cell);
+            continue;
+        }
+        if group.cells.is_empty() {
+            group.base_x = cell.min[0] - gx as f32 * cell.size[0];
+            group.base_z = cell.min[2] - gz as f32 * cell.size[2];
+        }
+        group.cells.insert((gx, gz), cell.exposed_faces);
+    }
+    grouping
+}
+
+/// Classic 2D greedy meshing over a cell mask: repeatedly takes the
+/// lowest unmerged cell, extends width along `x`, then depth along `z`
+/// while every `x` in the width is present, and emits the maximal
+/// `(x0, z0) -> (x1, z1)` rectangle. Deterministic because `BTreeSet`
+/// iterates in sorted order.
+fn greedy_rects(
+    mask: &mut BTreeSet<(i64, i64)>,
+    mut emit: impl FnMut(i64, i64, i64, i64),
+) {
+    while let Some(&(x0, z0)) = mask.iter().next() {
+        let mut w: i64 = 1;
+        while mask.contains(&(x0 + w, z0)) {
+            w += 1;
+        }
+        let mut d: i64 = 1;
+        'grow: loop {
+            for dx in 0..w {
+                if !mask.contains(&(x0 + dx, z0 + d)) {
+                    break 'grow;
+                }
+            }
+            d += 1;
+        }
+        for dz in 0..d {
+            for dx in 0..w {
+                mask.remove(&(x0 + dx, z0 + dz));
+            }
+        }
+        emit(x0, z0, x0 + w, z0 + d);
+    }
+}
+
+/// Maximal runs of consecutive values in a sorted set: `(4,5,6,9)` ->
+/// `[(4,7),(9,10)]` — the 1D side-face strip merger.
+fn runs(set: &BTreeSet<i64>, mut emit: impl FnMut(i64, i64)) {
+    let mut run: Option<(i64, i64)> = None;
+    for &v in set {
+        match run {
+            Some((start, end)) if v == end => run = Some((start, end + 1)),
+            _ => {
+                if let Some((start, end)) = run.take() {
+                    emit(start, end);
+                }
+                run = Some((v, v + 1));
+            }
+        }
+    }
+    if let Some((start, end)) = run {
+        emit(start, end);
+    }
+}
+
+/// Merge every exposed face of `cells` into maximal coplanar
+/// rectangles — the 2D greedy cloud mesher. Top/bottom faces merge
+/// across `(gx, gz)` rectangles inside each `(layer, min[1], size)`
+/// group; side faces merge into horizontal strips along the tangent
+/// axis. Grid-unaligned cells keep the one-quad-per-face fallback, so
+/// the union of output quads always covers the exact same voxel
+/// silhouette.
+fn merged_cloud_quads(cells: &[VoxelCloudCell]) -> Vec<CloudRect> {
+    let CloudGrouping { groups, loose } = group_cloud_cells(cells);
+    let mut quads = Vec::new();
+    for (key, group) in groups {
+        let layer = key.0;
+        let [s0, _s1, s2] = group.size;
+        let x_at = |gx: i64| group.base_x + gx as f32 * s0;
+        let z_at = |gz: i64| group.base_z + gz as f32 * s2;
+        let mut emit = |face: usize, min: [f32; 3], max: [f32; 3]| {
+            quads.push(CloudRect {
+                face,
+                layer,
+                size: group.size,
+                min,
+                max,
+                unit_uv: false,
+            });
+        };
+        // +Y tops and -Y bottoms: 2D greedy rectangles.
+        for (face, bit, y) in [(2usize, FACE_POS_Y, group.y1), (3, FACE_NEG_Y, group.y0)] {
+            let mut mask: BTreeSet<(i64, i64)> = group
+                .cells
+                .iter()
+                .filter(|(_, m)| mask_has(**m, bit))
+                .map(|(&g, _)| g)
+                .collect();
+            greedy_rects(&mut mask, |gx0, gz0, gx1, gz1| {
+                emit(face, [x_at(gx0), y, z_at(gz0)], [x_at(gx1), y, z_at(gz1)]);
+            });
+        }
+        // +X/-X sides: per-x-column runs along z.
+        for (face, bit, x_off) in [(0usize, FACE_POS_X, 1i64), (1, FACE_NEG_X, 0)] {
+            let mut columns: BTreeMap<i64, BTreeSet<i64>> = BTreeMap::new();
+            for (&(gx, gz), m) in &group.cells {
+                if mask_has(*m, bit) {
+                    columns.entry(gx).or_default().insert(gz);
+                }
+            }
+            for (gx, zs) in columns {
+                let x = x_at(gx + x_off);
+                runs(&zs, |z0, z1| {
+                    emit(face, [x, group.y0, z_at(z0)], [x, group.y1, z_at(z1)]);
+                });
+            }
+        }
+        // +Z/-Z sides: per-z-row runs along x.
+        for (face, bit, z_off) in [(4usize, FACE_POS_Z, 1i64), (5, FACE_NEG_Z, 0)] {
+            let mut rows: BTreeMap<i64, BTreeSet<i64>> = BTreeMap::new();
+            for (&(gx, gz), m) in &group.cells {
+                if mask_has(*m, bit) {
+                    rows.entry(gz).or_default().insert(gx);
+                }
+            }
+            for (gz, xs) in rows {
+                let z = z_at(gz + z_off);
+                runs(&xs, |x0, x1| {
+                    emit(face, [x_at(x0), group.y0, z], [x_at(x1), group.y1, z]);
+                });
+            }
+        }
+    }
+    // Loose cells keep the unmerged one-quad-per-face fallback.
+    for cell in loose {
+        for (face, &bit) in CLOUD_FACE_BITS.iter().enumerate() {
+            if mask_has(cell.exposed_faces, bit) {
+                quads.push(CloudRect {
+                    face,
+                    layer: cell.layer,
+                    size: cell.size,
+                    min: cell.min,
+                    max: [
+                        cell.min[0] + cell.size[0],
+                        cell.min[1] + cell.size[1],
+                        cell.min[2] + cell.size[2],
+                    ],
+                    unit_uv: true,
+                });
+            }
+        }
+    }
+    quads
+}
+
+/// World-space UV for a merged cloud quad: proportional to the rect's
+/// block extent on the face's tangent plane so shader effects stay
+/// continuous across merged quads without stretching.
+fn cloud_face_uv(face: usize, position: [f32; 3], size: [f32; 3]) -> [f32; 2] {
+    match face {
+        2 | 3 => [position[0] / size[0], position[2] / size[2]],
+        0 | 1 => [position[2] / size[2], position[1] / size[1]],
+        _ => [position[0] / size[0], position[1] / size[1]],
+    }
+}
+
+/// Emit greedily merged [`CloudRect`]s into `vertices`/`indices` using
+/// `lighting` face tints, a puffy-cap layer brightening scaled by
+/// `extra_boost` (styled-path silver lining; clamped `0..=1.25`), and a
+/// caller-selected `packed_albedo` material-flags byte (e.g.
+/// `MAT_FLAG_CLOUD` for the hybrid optics path, `0` for vanilla).
+fn emit_cloud_quads(
+    quads: &[CloudRect],
     lighting: &CloudLighting,
     extra_boost: f32,
+    material_flags: u8,
     vertices: &mut Vec<TerrainVertex>,
     indices: &mut Vec<u32>,
 ) {
-    let max = [
-        cell.min[0] + cell.size[0],
-        cell.min[1] + cell.size[1],
-        cell.min[2] + cell.size[2],
-    ];
-    if !cell.min.iter().chain(max.iter()).all(|v| v.is_finite())
-        || !cell.size.iter().all(|s| s.is_finite() && *s > 0.0)
-    {
-        return;
-    }
-    let cap_boost = (1.0 + 0.04 * f32::from(cell.layer)) * extra_boost.clamp(0.0, 1.25);
-    let faces = box_face_corners(cell.min, max);
-    for (face, (normal, corners)) in faces.iter().enumerate() {
-        if cell.exposed_faces & CLOUD_FACE_BITS[face] == 0 {
-            continue;
-        }
-        let rgb = match face {
+    let extra_boost = extra_boost.clamp(0.0, 1.25);
+    for quad in quads {
+        let cap_boost = (1.0 + 0.04 * f32::from(quad.layer)) * extra_boost;
+        let rgb = match quad.face {
             2 => lighting.top_rgb,
             3 => lighting.bottom_rgb,
             _ => lighting.side_rgb,
@@ -781,38 +1043,39 @@ fn push_cloud_cell_geometry(
             (cloud_channel(rgb[1]) * cap_boost).min(1.0),
             (cloud_channel(rgb[2]) * cap_boost).min(1.0),
         ];
+        let faces = box_face_corners(quad.min, quad.max);
+        let (normal, corners) = &faces[quad.face];
         let base = vertices.len() as u32;
         for (corner, &position) in corners.iter().enumerate() {
-            vertices.push(TerrainVertex::new(
-                position,
-                *normal,
-                albedo,
-                [[0.0, 0.0], [0.0, 1.0], [1.0, 1.0], [1.0, 0.0]][corner],
-                u32::MAX,
-            ));
+            let uv = if quad.unit_uv {
+                [[0.0, 0.0], [0.0, 1.0], [1.0, 1.0], [1.0, 0.0]][corner]
+            } else {
+                cloud_face_uv(quad.face, position, quad.size)
+            };
+            let mut vertex =
+                TerrainVertex::new(position, *normal, albedo, uv, u32::MAX);
+            vertex.set_material_flags(material_flags);
+            vertices.push(vertex);
         }
         indices.extend([base, base + 1, base + 2, base, base + 2, base + 3]);
     }
 }
 
-/// Convert [`generate_layered_voxel_clouds`] cells into lit geometry: one
-/// quad per exposed face, top faces tinted `lighting.top_rgb`, bottoms
-/// `bottom_rgb`, sides `side_rgb` (upper strata slightly brighter for the
-/// puffy-cap look). Upload the result as a [`SubWorldRenderEntry`] with
-/// `alpha = CLOUD_RENDER_ALPHA` and an identity transform — cell positions
-/// are already world-space.
+/// Convert [`generate_layered_voxel_clouds`] cells into lit geometry
+/// with a caller-selected `packed_albedo` material-flags byte (e.g.
+/// `MAT_FLAG_CLOUD` for the hybrid optics path, `0` for vanilla). Same
+/// greedy-merged output as [`voxel_clouds_to_geometry`].
 ///
 /// [`generate_layered_voxel_clouds`]: megu_client_mesh::vanilla_plus_nature::generate_layered_voxel_clouds
-pub fn voxel_clouds_to_geometry(
+pub fn voxel_clouds_to_geometry_flagged(
     cells: &[VoxelCloudCell],
     lighting: &CloudLighting,
+    material_flags: u8,
 ) -> (Vec<TerrainVertex>, Vec<u32>) {
-    let quads: usize = cells.iter().map(|c| c.quad_count() as usize).sum();
-    let mut vertices = Vec::with_capacity(quads * 4);
-    let mut indices = Vec::with_capacity(quads * 6);
-    for cell in cells {
-        push_cloud_cell_geometry(cell, lighting, 1.0, &mut vertices, &mut indices);
-    }
+    let quads = merged_cloud_quads(cells);
+    let mut vertices = Vec::with_capacity(quads.len() * 4);
+    let mut indices = Vec::with_capacity(quads.len() * 6);
+    emit_cloud_quads(&quads, lighting, 1.0, material_flags, &mut vertices, &mut indices);
     (vertices, indices)
 }
 
@@ -878,7 +1141,7 @@ pub fn voxel_clouds_to_geometry_styled(
     style: &CloudGeometryStyle,
 ) -> Vec<CloudGeometryBatch> {
     const FADE_BANDS: f32 = 4.0;
-    let mut batches: BTreeMap<(u8, u8), CloudGeometryBatch> = BTreeMap::new();
+    let mut groups: BTreeMap<(u8, u8), Vec<VoxelCloudCell>> = BTreeMap::new();
     for cell in cells {
         let cx = cell.min[0] + cell.size[0] * 0.5;
         let cz = cell.min[2] + cell.size[2] * 0.5;
@@ -889,20 +1152,50 @@ pub fn voxel_clouds_to_geometry_styled(
         if band == 0 {
             continue;
         }
-        let spec = cloud_deck_spec(cell.layer, style.layers);
-        // Soft forward-scatter silver lining on partially melted edges.
-        let lining = 1.0 + 0.10 * (1.0 - fade);
-        let key = (cell.layer, band);
-        let batch = batches.entry(key).or_insert_with(|| CloudGeometryBatch {
-            alpha: (spec.opacity * (band as f32 / FADE_BANDS)).clamp(0.0, 1.0),
-            vertices: Vec::new(),
-            indices: Vec::new(),
-            layer: cell.layer,
-            fade_band: band,
-        });
-        push_cloud_cell_geometry(cell, lighting, lining, &mut batch.vertices, &mut batch.indices);
+        groups.entry((cell.layer, band)).or_default().push(*cell);
     }
-    batches.into_values().collect()
+    groups
+        .into_iter()
+        .map(|((layer, band), group)| {
+            let spec = cloud_deck_spec(layer, style.layers);
+            let fade = band as f32 / FADE_BANDS;
+            // Soft forward-scatter silver lining on partially melted edges.
+            let lining = 1.0 + 0.10 * (1.0 - fade);
+            let quads = merged_cloud_quads(&group);
+            let mut batch = CloudGeometryBatch {
+                alpha: (spec.opacity * fade).clamp(0.0, 1.0),
+                vertices: Vec::with_capacity(quads.len() * 4),
+                indices: Vec::with_capacity(quads.len() * 6),
+                layer,
+                fade_band: band,
+            };
+            emit_cloud_quads(
+                &quads,
+                lighting,
+                lining,
+                0,
+                &mut batch.vertices,
+                &mut batch.indices,
+            );
+            batch
+        })
+        .collect()
+}
+
+/// Convert [`generate_layered_voxel_clouds`] cells into lit geometry:
+/// exposed faces are greedily merged into maximal rectangles (typically
+/// 4x-8x fewer quads than one quad per cell face), top faces tinted
+/// `lighting.top_rgb`, bottoms `bottom_rgb`, sides `side_rgb` (upper
+/// strata slightly brighter for the puffy-cap look). Upload the result
+/// as a [`SubWorldRenderEntry`] with `alpha = CLOUD_RENDER_ALPHA` and an
+/// identity transform — cell positions are already world-space.
+///
+/// [`generate_layered_voxel_clouds`]: megu_client_mesh::vanilla_plus_nature::generate_layered_voxel_clouds
+pub fn voxel_clouds_to_geometry(
+    cells: &[VoxelCloudCell],
+    lighting: &CloudLighting,
+) -> (Vec<TerrainVertex>, Vec<u32>) {
+    voxel_clouds_to_geometry_flagged(cells, lighting, 0)
 }
 
 // ---------------------------------------------------------------------------
@@ -1025,6 +1318,7 @@ pub fn planet_subworld_transform(placement: &SkyBodyPlacement, distance: f32) ->
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::subworld_render::MAT_FLAG_CLOUD;
     use megu_client_mesh::vanilla_plus_nature::{
         compute_cloud_lighting, generate_layered_voxel_clouds, VanillaPlusNatureConfig,
     };
@@ -1404,5 +1698,166 @@ mod tests {
             pre_rain_wind_boost: f32::NAN,
         });
         assert_eq!(nan, base.sanitized());
+    }
+
+    /// Deterministic cloud field: one contiguous 6x5 slab at a
+    /// fractional scroll offset plus two scattered cells, with
+    /// `exposed_faces` derived from the occupancy grid exactly the way
+    /// `generate_layered_voxel_clouds` computes them.
+    fn pinned_cloud_field() -> Vec<VoxelCloudCell> {
+        let mut grid: BTreeSet<(i64, i64)> = BTreeSet::new();
+        for gx in -2..4 {
+            for gz in 0..5 {
+                grid.insert((gx, gz));
+            }
+        }
+        grid.insert((7, 1));
+        grid.insert((-5, -3));
+        let drift = 0.31;
+        grid.iter()
+            .map(|&(gx, gz)| {
+                let mut exposed = FACE_POS_Y | FACE_NEG_Y;
+                if !grid.contains(&(gx + 1, gz)) {
+                    exposed |= FACE_POS_X;
+                }
+                if !grid.contains(&(gx - 1, gz)) {
+                    exposed |= FACE_NEG_X;
+                }
+                if !grid.contains(&(gx, gz + 1)) {
+                    exposed |= FACE_POS_Z;
+                }
+                if !grid.contains(&(gx, gz - 1)) {
+                    exposed |= FACE_NEG_Z;
+                }
+                VoxelCloudCell {
+                    min: [gx as f32 * 12.0 + drift, 192.0, gz as f32 * 12.0],
+                    size: [12.0, 4.0, 12.0],
+                    layer: 0,
+                    exposed_faces: exposed,
+                }
+            })
+            .collect()
+    }
+
+    /// World-space area of one emitted quad face.
+    fn face_area(face: usize, min: [f32; 3], max: [f32; 3]) -> f64 {
+        let d = [
+            f64::from(max[0] - min[0]),
+            f64::from(max[1] - min[1]),
+            f64::from(max[2] - min[2]),
+        ];
+        match face {
+            0 | 1 => d[2] * d[1],
+            2 | 3 => d[0] * d[2],
+            _ => d[0] * d[1],
+        }
+    }
+
+    /// Exposed surface area of the unmerged one-quad-per-face baseline.
+    fn unmerged_area(cells: &[VoxelCloudCell]) -> f64 {
+        cells
+            .iter()
+            .flat_map(|cell| {
+                (0..6).filter(move |&f| cell.exposed_faces & CLOUD_FACE_BITS[f] != 0).map(
+                    move |f| {
+                        face_area(
+                            f,
+                            cell.min,
+                            [
+                                cell.min[0] + cell.size[0],
+                                cell.min[1] + cell.size[1],
+                                cell.min[2] + cell.size[2],
+                            ],
+                        )
+                    },
+                )
+            })
+            .sum()
+    }
+
+    #[test]
+    fn greedy_cloud_meshing_dramatically_reduces_quads_preserving_area() {
+        let cells = pinned_cloud_field();
+        let unmerged_quads: usize = cells.iter().map(|c| c.quad_count() as usize).sum();
+        let merged = merged_cloud_quads(&cells);
+        let merged_area: f64 = merged.iter().map(|q| face_area(q.face, q.min, q.max)).sum();
+        // f32 world-space re-association (base + gx*size vs per-cell min)
+        // can shift the last ulp; the coverage stays identical.
+        assert!(
+            (merged_area - unmerged_area(&cells)).abs()
+                < unmerged_area(&cells) * 1.0e-6 + 1.0e-3,
+            "merged area {merged_area} must equal unmerged {}",
+            unmerged_area(&cells),
+        );
+        eprintln!(
+            "pinned field: {unmerged_quads} quads -> {} ({:.1}% reduction)",
+            merged.len(),
+            100.0 * (1.0 - merged.len() as f64 / unmerged_quads as f64),
+        );
+        assert!(
+            merged.len() * 2 <= unmerged_quads,
+            "greedy mesher emitted {} quads vs unmerged {unmerged_quads}",
+            merged.len(),
+        );
+
+        // Real generator output gets the same guarantee.
+        let config = VanillaPlusNatureConfig {
+            enabled: true,
+            layered_voxel_clouds: true,
+            cloud_layers: 3,
+            cloud_height: 192.0,
+            ..VanillaPlusNatureConfig::default()
+        };
+        let generated = generate_layered_voxel_clouds(&config, 8.0, 30.0, 6000);
+        assert!(!generated.is_empty(), "cloud field should emit cells");
+        let gen_unmerged: usize =
+            generated.iter().map(|c| c.quad_count() as usize).sum();
+        let gen_merged = merged_cloud_quads(&generated);
+        let gen_area: f64 = gen_merged
+            .iter()
+            .map(|q| face_area(q.face, q.min, q.max))
+            .sum();
+        assert!(
+            (gen_area - unmerged_area(&generated)).abs()
+                < unmerged_area(&generated) * 1.0e-6 + 1.0e-3,
+            "generator field area drifted: {gen_area} vs {}",
+            unmerged_area(&generated),
+        );
+        eprintln!(
+            "generated field: {gen_unmerged} quads -> {} ({:.1}% reduction)",
+            gen_merged.len(),
+            100.0 * (1.0 - gen_merged.len() as f64 / gen_unmerged as f64),
+        );
+        assert!(
+            gen_merged.len() * 2 <= gen_unmerged,
+            "generated field merged to {} quads vs unmerged {gen_unmerged}",
+            gen_merged.len(),
+        );
+
+        // Geometry buffers shrink proportionally and every vertex carries
+        // the requested material flag (0 for vanilla, MAT_FLAG_CLOUD for
+        // the hybrid path).
+        let lighting = CloudLighting {
+            top_rgb: [0.95, 0.96, 1.0],
+            side_rgb: [0.78, 0.82, 0.9],
+            bottom_rgb: [0.55, 0.58, 0.66],
+            rim_warmth: 0.0,
+        };
+        let (verts, idx) =
+            voxel_clouds_to_geometry_flagged(&cells, &lighting, MAT_FLAG_CLOUD);
+        assert_eq!(verts.len(), merged.len() * 4);
+        assert_eq!(idx.len(), merged.len() * 6);
+        assert!(
+            verts
+                .iter()
+                .all(|v| v.material_flags() == MAT_FLAG_CLOUD),
+            "flagged clouds must tag every vertex MAT_FLAG_CLOUD",
+        );
+        let (vanilla_verts, _) = voxel_clouds_to_geometry(&cells, &lighting);
+        assert_eq!(vanilla_verts.len(), verts.len());
+        assert!(
+            vanilla_verts.iter().all(|v| v.material_flags() == 0),
+            "vanilla clouds must keep material flags 0",
+        );
     }
 }

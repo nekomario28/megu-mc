@@ -171,6 +171,14 @@ pub fn unpack_normal_octahedral(packed: u32) -> [f32; 3] {
     }
 }
 
+/// Material-flags byte tag for the cubic x realistic hybrid cloud path:
+/// cloud deck vertices carry this bit so the lit fragment shader can
+/// branch into the analytic cloud optics (forward-scatter silver lining,
+/// crown-to-belly vertical shading, wispy shimmer, radial horizon
+/// dissolve) while every other lit draw keeps the plain pipeline.
+/// Vanilla-mode clouds leave the byte `0`.
+pub const MAT_FLAG_CLOUD: u8 = 0x01;
+
 /// `unorm8x3` rgb + flags byte (bits 24..32) — the CPU twin of the
 /// vertex shader's `unpack_unorm8_albedo`.
 fn pack_albedo_unorm8x4(albedo: [f32; 3], flags: u8) -> u32 {
@@ -1060,6 +1068,9 @@ mod subworld_sync_tests {
 
 /// GPU-resident copy of one [`SubWorldRenderEntry`].
 pub struct GpuSubWorldEntry {
+    /// Sub-world id mirrored from the bank (cloud decks and shadow
+    /// filters key on it).
+    pub id: u64,
     /// Transform mirrored from the bank.
     pub transform: SubWorldTransform,
     /// Global alpha multiplier.
@@ -1302,6 +1313,7 @@ impl SubWorldGpuCache {
                         None,
                     );
                     GpuSubWorldEntry {
+                        id: entry.id,
                         transform: entry.transform,
                         alpha: entry.alpha,
                         world_light: entry.world_light,
@@ -2075,6 +2087,7 @@ struct LitFragment {
     @location(4) uv: vec2<f32>,
     @location(5) @interpolate(flat) atlas_index: u32,
     @location(6) alpha: f32,
+    @location(7) @interpolate(flat) mat_flags: u32,
 };
 
 // GPU-instanced particle billboards: a static unit quad (slot 0) plus
@@ -2215,8 +2228,8 @@ fn unpack_oct_normal(packed: u32) -> vec3<f32> {
 }
 
 // `unorm8x3` albedo bytes — the vertex shader's twin of the CPU-side
-// `pack_albedo_unorm8x4` (byte 3 is a material-flags byte the shading
-// model does not consume yet).
+// `pack_albedo_unorm8x4` (byte 3 is the material-flags byte: bit 0 is
+// MAT_FLAG_CLOUD and switches `lit_fs` into the hybrid cloud optics).
 fn unpack_unorm8_albedo(packed: u32) -> vec3<f32> {
     return vec3<f32>(
         f32(packed & 0xffu) / 255.0,
@@ -2234,6 +2247,7 @@ fn lit_emit(
     uv: vec2<f32>,
     atlas_index: u32,
     alpha: f32,
+    mat_flags: u32,
 ) -> LitFragment {
     var out: LitFragment;
     out.clip = clip;
@@ -2244,6 +2258,7 @@ fn lit_emit(
     out.uv = uv;
     out.atlas_index = atlas_index;
     out.alpha = alpha;
+    out.mat_flags = mat_flags;
     return out;
 }
 
@@ -2260,6 +2275,7 @@ fn lit_vs(in: LitVertex) -> LitFragment {
         in.uv,
         in.atlas_index,
         1.0,
+        (in.packed_albedo >> 24u) & 0xffu,
     );
 }
 
@@ -2282,6 +2298,7 @@ fn inst_vs(in: LitVertex, inst: PartInstance) -> LitFragment {
         in.uv,
         in.atlas_index,
         1.0,
+        (in.packed_albedo >> 24u) & 0xffu,
     );
 }
 
@@ -2301,8 +2318,14 @@ fn billboard_vs(quad: BillboardQuadVertex, inst: BillboardInstance) -> LitFragme
         inst.uv_origin + c.x * inst.uv_du + c.y * inst.uv_dv,
         0xFFFFFFFFu,
         inst.color.a,
+        0u,
     );
 }
+
+// Bit 0 of the packed_albedo flags byte — MAT_FLAG_CLOUD on the CPU
+// side. Cloud-tagged fragments take the analytic hybrid optics branch
+// in `lit_fs`; every other material keeps the plain lit path.
+const MAT_FLAG_CLOUD_BIT: u32 = 1u;
 
 @fragment
 fn lit_fs(in: LitFragment) -> @location(0) vec4<f32> {
@@ -2348,6 +2371,48 @@ fn lit_fs(in: LitFragment) -> @location(0) vec4<f32> {
             * diffuse * falloff;
     }
     color = mix(color, color * env.depth_tint.rgb, env.depth_tint.w);
+    // Cubic x realistic hybrid cloud optics: crisp voxel silhouettes
+    // shaded by analytic light transport — a Henyey-Greenstein
+    // forward-scatter silver lining, a crown-to-belly vertical gradient,
+    // an ultra-subtle living wisp shimmer and a seamless radial horizon
+    // dissolve. Zero raymarching, zero noise textures; `frame._pad.x`
+    // carries world seconds for the shimmer.
+    var cloud_alpha = 1.0;
+    if (in.mat_flags & MAT_FLAG_CLOUD_BIT) != 0u {
+        let to_frag = in.world - frame.camera_pos;
+        let view_dir = to_frag / max(length(to_frag), 0.001);
+        let sun_dir = normalize(env.sun.xyz);
+        let cos_theta = clamp(dot(view_dir, sun_dir), -1.0, 1.0);
+        // HG phase (g = 0.56) renormalized so the forward peak is 1.0 —
+        // `silver` stays a bounded multiplier for any sun angle.
+        let g = 0.56;
+        let hg_den = max(1.0 + g * g - 2.0 * g * cos_theta, 0.0001);
+        let hg = (1.0 - g * g) / (hg_den * sqrt(hg_den));
+        let hg_peak = (1.0 + g) / ((1.0 - g) * (1.0 - g));
+        let silver = clamp(hg / hg_peak, 0.0, 1.0);
+        let edge_glow = pow(1.0 - abs(dot(view_dir, n)), 2.0);
+        let dusk = 1.0 - smoothstep(0.0, 0.45, abs(sun_dir.y));
+        let warm = vec3<f32>(1.0, 0.62, 0.38);
+        color += in.albedo
+            * mix(vec3<f32>(1.0), warm, dusk * 0.8)
+            * silver * (0.35 + 0.65 * edge_glow) * env.sun.w * 0.30;
+        // Crown-to-belly shading: tops lean sunlit-sky, undersides pick
+        // up ambient plus a warm low-sun under-glow.
+        let crown = clamp(n.y * 0.5 + 0.5, 0.0, 1.0);
+        color += in.albedo * env.ambient.rgb * crown * 0.08;
+        color += in.albedo * warm * (1.0 - crown) * dusk * 0.18;
+        // Wispy shimmer: two slow trig waves over world xz — ±3.5%
+        // luminance and a soft alpha breath, calm not dizzying.
+        let t = frame._pad.x;
+        let wisp = sin(in.world.x * 0.061 + t * 0.55)
+            + sin(in.world.z * 0.047 - t * 0.41);
+        color *= 1.0 + wisp * 0.0175;
+        cloud_alpha = 1.0 + wisp * 0.0125;
+        // Radial horizon dissolve melts all decks into the sky/fog
+        // before the fixed cloud window's hard edge.
+        let dist_xz = length(in.world.xz - frame.camera_pos.xz);
+        cloud_alpha *= 1.0 - smoothstep(60.0, 96.0, dist_xz);
+    }
     let dist = distance(in.world, frame.camera_pos);
     let linear = clamp(
         (dist - frame.fog_start) / max(frame.fog_end - frame.fog_start, 0.001),
@@ -2358,7 +2423,7 @@ fn lit_fs(in: LitFragment) -> @location(0) vec4<f32> {
     color = mix(color, frame.fog_color, clamp(max(linear, expo), 0.0, 1.0));
     let fade = clamp(draw.params.x, 0.0, 1.0);
     color = mix(frame.fog_color, color, fade);
-    return vec4<f32>(filmic(color), draw.params.y * fade * in.alpha);
+    return vec4<f32>(filmic(color), draw.params.y * fade * in.alpha * cloud_alpha);
 }
 ";
 
@@ -2425,6 +2490,37 @@ fn lit_fs(in: LitFragment) -> @location(0) vec4<f32> {
     }
     color += vec3<f32>(light16);
     color = mix(color, color * env.depth_tint.rgb, env.depth_tint.w);
+    // Cubic x realistic hybrid cloud optics — the f32-twin of the
+    // baseline `lit_fs` branch (MAT_FLAG_CLOUD): HG silver lining,
+    // crown-to-belly gradient, wisp shimmer, radial horizon dissolve.
+    var cloud_alpha = 1.0;
+    if (in.mat_flags & MAT_FLAG_CLOUD_BIT) != 0u {
+        let to_frag = in.world - frame.camera_pos;
+        let view_dir = to_frag / max(length(to_frag), 0.001);
+        let sun_dir = normalize(env.sun.xyz);
+        let cos_theta = clamp(dot(view_dir, sun_dir), -1.0, 1.0);
+        let g = 0.56;
+        let hg_den = max(1.0 + g * g - 2.0 * g * cos_theta, 0.0001);
+        let hg = (1.0 - g * g) / (hg_den * sqrt(hg_den));
+        let hg_peak = (1.0 + g) / ((1.0 - g) * (1.0 - g));
+        let silver = clamp(hg / hg_peak, 0.0, 1.0);
+        let edge_glow = pow(1.0 - abs(dot(view_dir, n)), 2.0);
+        let dusk = 1.0 - smoothstep(0.0, 0.45, abs(sun_dir.y));
+        let warm = vec3<f32>(1.0, 0.62, 0.38);
+        color += in.albedo
+            * mix(vec3<f32>(1.0), warm, dusk * 0.8)
+            * silver * (0.35 + 0.65 * edge_glow) * env.sun.w * 0.30;
+        let crown = clamp(n.y * 0.5 + 0.5, 0.0, 1.0);
+        color += in.albedo * env.ambient.rgb * crown * 0.08;
+        color += in.albedo * warm * (1.0 - crown) * dusk * 0.18;
+        let t = frame._pad.x;
+        let wisp = sin(in.world.x * 0.061 + t * 0.55)
+            + sin(in.world.z * 0.047 - t * 0.41);
+        color *= 1.0 + wisp * 0.0175;
+        cloud_alpha = 1.0 + wisp * 0.0125;
+        let dist_xz = length(in.world.xz - frame.camera_pos.xz);
+        cloud_alpha *= 1.0 - smoothstep(60.0, 96.0, dist_xz);
+    }
     let dist = distance(in.world, frame.camera_pos);
     let linear = clamp(
         (dist - frame.fog_start) / max(frame.fog_end - frame.fog_start, 0.001),
@@ -2435,7 +2531,7 @@ fn lit_fs(in: LitFragment) -> @location(0) vec4<f32> {
     color = mix(color, frame.fog_color, clamp(max(linear, expo), 0.0, 1.0));
     let fade = clamp(draw.params.x, 0.0, 1.0);
     color = mix(frame.fog_color, color, fade);
-    return vec4<f32>(filmic(color), draw.params.y * fade * in.alpha);
+    return vec4<f32>(filmic(color), draw.params.y * fade * in.alpha * cloud_alpha);
 }
 "#;
 

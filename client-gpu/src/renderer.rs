@@ -60,7 +60,7 @@ use crate::live_session::hw_adaptive_engine::{
     ComputeStrategy, GpuComputeParadigm, MemoryFootprintClass, MemoryTransferStrategy,
     detect_universal_hardware_profile, select_compute_strategy,
 };
-use crate::live_session::{ExternalSectionsDelta, LiveSession};
+use crate::live_session::{is_cloud_subworld_id, ExternalSectionsDelta, LiveSession};
 use crate::mat4_mul;
 use crate::mesh_pool::{
     HiZSplatSection, MeshJob, MeshJobPool, MeshResult, build_hiz_stream,
@@ -4838,8 +4838,10 @@ pub fn subworld_caster_digest(bank: &SubWorldRenderBank) -> u64 {
     for entry in bank.entries() {
         // Translucent sheets (voxel clouds, water planes) never draw into
         // the depth map — excluding them keeps their transform-only drift
-        // from churning the shadow-cache key.
-        if entry.alpha < 0.999 {
+        // from churning the shadow-cache key. The cloud deck ids are
+        // filtered explicitly too so a future opaque-alpha deck can
+        // never cast a bogus shadow.
+        if entry.alpha < 0.999 || is_cloud_subworld_id(entry.id) {
             continue;
         }
         fnv1a_u64(&mut hash, entry.id);
@@ -4885,7 +4887,7 @@ pub fn subworld_caster_digest(bank: &SubWorldRenderBank) -> u64 {
 
 fn subworld_casters_dirty(bank: &SubWorldRenderBank) -> bool {
     bank.entries()
-        .any(|entry| entry.dirty && entry.alpha >= 0.999)
+        .any(|entry| entry.dirty && entry.alpha >= 0.999 && !is_cloud_subworld_id(entry.id))
         || bank
             .batches()
             .any(|batch| batch.geometry_dirty || batch.instances_dirty)
@@ -5580,7 +5582,9 @@ fn record_shadow_cascade<'a>(
     pass.set_bind_group(1, Some(frame_bind_group), &[]);
     for (entry, offset) in subworld_gpu
         .entries()
-        .filter(|entry| entry.index_count > 0 && entry.alpha >= 0.999)
+        .filter(|entry| {
+            entry.index_count > 0 && entry.alpha >= 0.999 && !is_cloud_subworld_id(entry.id)
+        })
         .zip(entry_offsets)
     {
         pass.set_bind_group(2, Some(&shadow.draw_bg), &[*offset]);
@@ -11559,7 +11563,14 @@ impl GpuRenderer {
         let union_mask = self.lit_union_light_mask(&uniforms);
         let lights = VfxLightsGpu::from(&uniforms.with_region_light_mask(union_mask));
         self.write_lights_ubo_dedup(&lights);
-        self.write_frame_uniforms(&camera, aspect, atmo.fog_rgb, sky.fog_start, sky.fog_end);
+        self.write_frame_uniforms(
+            &camera,
+            aspect,
+            atmo.fog_rgb,
+            sky.fog_start,
+            sky.fog_end,
+            world_time_ticks,
+        );
         // Pending uploads may all be admitted by this frame's drain inside
         // `encode_composed_world`, so reserve draw slots for them too.
         // A bucketed section submits up to `DIRECTION_BUCKETS` opaque
@@ -12038,7 +12049,9 @@ impl GpuRenderer {
         entry_offsets.extend(
             self.subworld_gpu
                 .entries()
-                .filter(|entry| entry.index_count > 0 && entry.alpha >= 0.999)
+                .filter(|entry| {
+                    entry.index_count > 0 && entry.alpha >= 0.999 && !is_cloud_subworld_id(entry.id)
+                })
                 .map(|entry| push_shadow_model(&mut draws, entry.transform.model_matrix())),
         );
         batch_offsets.clear();
@@ -12106,7 +12119,9 @@ impl GpuRenderer {
         for entry in self
             .subworld_gpu
             .entries()
-            .filter(|entry| entry.index_count > 0 && entry.alpha >= 0.999)
+            .filter(|entry| {
+                entry.index_count > 0 && entry.alpha >= 0.999 && !is_cloud_subworld_id(entry.id)
+            })
         {
             fnv1a_u64(&mut casters, u64::from(entry.index_count));
             fnv1a_u32(&mut casters, entry.alpha.to_bits());
@@ -12396,6 +12411,7 @@ impl GpuRenderer {
         fog_rgb: [f32; 3],
         fog_start: f32,
         fog_end: f32,
+        world_time_ticks: u64,
     ) {
         let uniforms = FrameUniforms {
             view_proj: camera.view_projection(aspect),
@@ -12403,7 +12419,9 @@ impl GpuRenderer {
             fog_start,
             fog_color: fog_rgb,
             fog_end,
-            _pad: [0.0; 4],
+            // `_pad[0]` is `frame._pad.x` in the lit WGSL — world seconds
+            // driving the hybrid-cloud wisp shimmer.
+            _pad: [world_time_ticks as f32 / 20.0, 0.0, 0.0, 0.0],
         };
         self.write_frame_ubo_dedup(&uniforms);
     }
@@ -13384,7 +13402,10 @@ impl GpuRenderer {
             // contraptions).
             let mut drew_opaque_subworld = false;
             for entry in subworld_gpu.entries() {
-                if entry.index_count == 0 || entry.alpha < 0.999 {
+                if entry.index_count == 0
+                    || entry.alpha < 0.999
+                    || is_cloud_subworld_id(entry.id)
+                {
                     continue;
                 }
                 if !drew_opaque_subworld {
@@ -13630,7 +13651,14 @@ impl GpuRenderer {
 
         let atmo = frame.atmosphere.current();
         let view = camera.far.clamp(16.0, 2048.0);
-        self.write_frame_uniforms(camera, aspect, atmo.fog_rgb, view * 0.6, view);
+        self.write_frame_uniforms(
+            camera,
+            aspect,
+            atmo.fog_rgb,
+            view * 0.6,
+            view,
+            frame.world_time_ticks,
+        );
         self.write_env_uniforms(frame);
         // Worst case: `DIRECTION_BUCKETS` opaque buckets + one translucent
         // draw per live section + pending uploads admitted by this frame's
@@ -13938,5 +13966,47 @@ mod tests {
                 "{device_type:?}"
             );
         }
+    }
+
+    /// The hybrid-cloud WGSL branch (MAT_FLAG_CLOUD) must parse and
+    /// validate under naga in both the f32 baseline and the f16 splice,
+    /// and the CPU flag byte must match the shader constant without
+    /// colliding with the vertex ABI.
+    #[test]
+    fn hybrid_cloud_wgsl_parses_and_validates_with_mat_flag_cloud() {
+        use crate::subworld_render::{lit_wgsl_f16, COMPOSITE_LIT_WGSL, MAT_FLAG_CLOUD};
+        use wgpu::naga::{
+            front::wgsl,
+            valid::{Capabilities, ValidationFlags, Validator},
+        };
+        for (name, source) in [
+            ("COMPOSITE_LIT_WGSL", COMPOSITE_LIT_WGSL.to_string()),
+            ("lit_wgsl_f16", lit_wgsl_f16()),
+        ] {
+            let module = wgsl::parse_str(&source)
+                .unwrap_or_else(|err| panic!("{name}: {}", err.emit_to_string(&source)));
+            Validator::new(ValidationFlags::all(), Capabilities::all())
+                .validate(&module)
+                .unwrap_or_else(|err| panic!("{name}: {}", err.emit_to_string(&source)));
+        }
+        // The CPU-side flag byte is the shader's MAT_FLAG_CLOUD_BIT and
+        // the only claimed bit of the material-flags byte.
+        assert_eq!(MAT_FLAG_CLOUD, 0x01);
+        assert!(COMPOSITE_LIT_WGSL.contains("const MAT_FLAG_CLOUD_BIT: u32 = 1u;"));
+        assert_eq!(std::mem::size_of::<TerrainVertex>(), 32);
+        // Every cloud deck id is reserved and recognised by the family
+        // predicate; ordinary entity sub-worlds are not.
+        for (i, id) in [
+            crate::live_session::CLOUD_SUBWORLD_ID,
+            crate::live_session::CLOUD_SUBWORLD_ID_ALTO,
+            crate::live_session::CLOUD_SUBWORLD_ID_CIRRUS,
+        ]
+        .iter()
+        .enumerate()
+        {
+            assert!(is_cloud_subworld_id(*id), "deck {i} id must be a cloud id");
+        }
+        assert!(!is_cloud_subworld_id(1));
+        assert!(!is_cloud_subworld_id(u64::MAX - 3));
     }
 }
