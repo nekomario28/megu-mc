@@ -78,6 +78,7 @@ pub mod admin_cli;
 pub mod atomic;
 pub mod claims;
 pub mod claims_wire;
+pub mod custom_portal;
 pub mod directory;
 pub mod directional_shadow;
 pub mod eula;
