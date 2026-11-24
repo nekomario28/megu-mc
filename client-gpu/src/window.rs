@@ -92,8 +92,8 @@ use crate::atmosphere::{
 };
 use crate::clipboard::{ClipboardOutcome, SystemClipboard};
 use crate::live_session::{
-    CrosshairPick, EntityContactShadowQuad, LiveSession, PlayerMovement, PlayerPose, SessionPaths,
-    SessionStatus, jar_version_ids,
+    CLOUD_SUBWORLD_ID, CrosshairPick, EntityContactShadowQuad, LiveSession, PlayerMovement,
+    PlayerPose, SessionPaths, SessionStatus, jar_version_ids,
 };
 use crate::renderer::{GpuRenderer, request_gpu_device};
 use crate::subworld_sync::SubWorldHelmCmd;
@@ -4415,11 +4415,16 @@ impl GpuApp {
         }
 
         let planes = self.view_frustum_planes();
+        let mut seamless_portal_frames = Vec::new();
         if let Some(live) = &mut self.live {
             live.poll(
                 self.camera.position,
                 planes.as_ref().map_or(&[][..], |p| &p[..]),
             );
+            // `megu:portal_seamless_v1` (`MSP1`) frames captured by the
+            // session's custom-channel dispatch; applied below once the
+            // `live` borrow ends.
+            seamless_portal_frames = live.drain_seamless_portal_frames();
             if let Some(pose) = live.camera_sync.take() {
                 self.camera.position = [
                     pose.feet[0] as f32,
@@ -4438,6 +4443,12 @@ impl GpuApp {
             let atmo = live.atmosphere_blender.current();
             self.seamless_portal
                 .set_current_atmosphere(atmo.sky_horizon_rgb, atmo.fog_rgb);
+        }
+        // Forward this frame's drained MSP1 payloads into the seamless
+        // dimension-transfer state machine so live server prefetch hints
+        // and commit transfers drive the zero-loading-screen crossfade.
+        for bytes in seamless_portal_frames {
+            self.apply_seamless_portal_channel(SEAMLESS_PORTAL_CHANNEL, &bytes);
         }
         let rain_level = self
             .live
@@ -4594,6 +4605,26 @@ impl GpuApp {
             active
                 .renderer
                 .tick_atlas_animations(live.atlas_anim_tick());
+            // Moving contraptions and airships shade against the world
+            // they currently occupy: sample the cached chunk light at
+            // each sub-world anchor so cave transits darken and
+            // torch-side or daylight flight brightens the staged mesh.
+            // The reserved voxel-cloud sheet keeps its baked vertex
+            // lighting — a world-light word would double-shade it.
+            let subworld_lights: Vec<(u64, u8, u8)> = live
+                .subworlds
+                .entries()
+                .filter(|entry| entry.id != CLOUD_SUBWORLD_ID)
+                .map(|entry| {
+                    let p = entry.transform.position;
+                    let (block_light, sky_light) =
+                        live.sample_block_and_sky_light(p[0], p[1], p[2]);
+                    (entry.id, block_light, sky_light)
+                })
+                .collect();
+            for (id, block_light, sky_light) in subworld_lights {
+                live.subworlds.set_subworld_light(id, block_light, sky_light);
+            }
             active.renderer.sync_subworlds(&mut live.subworlds);
             // First live frame on this renderer (attach order or
             // surface/device re-creation): push the session's

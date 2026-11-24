@@ -71,6 +71,7 @@ use megu_kernel::qol_gameplay::{
 use megu_kernel::raycast::{
     EntityRayHit, FluidClipMode, RayBlockShapes, RayHit, raycast_blocks, raycast_entities,
 };
+use megu_proto::seamless_portal::SEAMLESS_PORTAL_CHANNEL;
 use megu_ui::create_goggles_hud::GogglesTargetTelemetry;
 use megu_ui::death_screen::DeathScreenState;
 use megu_ui::magic_hud::{CastBarState, CooldownSlotState, MagicHudState, StatusBadgeState};
@@ -1949,6 +1950,11 @@ pub struct LiveSession {
     pub atmosphere_blender: BiomeAtmosphereBlender,
     pub chunk_fades: ChunkFadeTracker,
     pub subworlds: SubWorldRenderBank,
+    /// Raw `megu:portal_seamless_v1` (`MSP1`) frames captured by
+    /// [`Self::apply_custom`], drained each frame by the window into the
+    /// seamless dimension-transfer state machine. Bounded so a burst
+    /// cannot grow without limit.
+    seamless_portal_frames: VecDeque<Vec<u8>>,
     subworld_sync_received_at: Option<Instant>,
     /// SW6D-flagged sub-world the local player pilots (pose `flags` bit
     /// [`SUBWORLD_POSE_PLAYER_ABOARD`]); `None` while the latest snapshot
@@ -2504,6 +2510,7 @@ impl LiveSession {
             atmosphere_blender: BiomeAtmosphereBlender::new(AtmosphereParams::default()),
             chunk_fades: ChunkFadeTracker::new(),
             subworlds: SubWorldRenderBank::new(),
+            seamless_portal_frames: VecDeque::new(),
             subworld_sync_received_at: None,
             player_subworld_id: None,
             hud_revision: 0,
@@ -7158,9 +7165,25 @@ impl LiveSession {
                         .map(|pose| pose.subworld_id);
                 }
             }
+            ClientCustomChannelEvent::Unknown { channel, payload }
+                if channel.as_str() == SEAMLESS_PORTAL_CHANNEL =>
+            {
+                const SEAMLESS_PORTAL_FRAME_CAP: usize = 16;
+                if self.seamless_portal_frames.len() >= SEAMLESS_PORTAL_FRAME_CAP {
+                    self.seamless_portal_frames.pop_front();
+                }
+                self.seamless_portal_frames.push_back(payload);
+            }
             ClientCustomChannelEvent::Unknown { .. } => {}
         }
         Ok(())
+    }
+
+    /// Drain queued `megu:portal_seamless_v1` (`MSP1`) channel payloads in
+    /// arrival order; the window forwards each raw frame into the
+    /// seamless dimension-transfer state machine.
+    pub fn drain_seamless_portal_frames(&mut self) -> Vec<Vec<u8>> {
+        self.seamless_portal_frames.drain(..).collect()
     }
 
     /// Route one decoded `SSN1` frame into the live season state: update
@@ -8240,6 +8263,37 @@ mod tests {
         assert!(wire.ends_with(&payload));
         assert_eq!(play_custom_payload_packet_id(767), 0x12);
         assert_eq!(play_custom_payload_packet_id(777), 0x16);
+    }
+
+    #[test]
+    fn seamless_portal_channel_frames_queue_and_drain_bounded() {
+        let (_incoming_tx, incoming) = mpsc::sync_channel(8);
+        let (outgoing, _outgoing_rx) = mpsc::sync_channel(8);
+        let mut live = LiveSession::with_channels(incoming, outgoing);
+        assert!(live.drain_seamless_portal_frames().is_empty());
+
+        live.apply_event(framed(SEAMLESS_PORTAL_CHANNEL, b"MSP1-frame-1"))
+            .unwrap();
+        live.apply_event(framed(SEAMLESS_PORTAL_CHANNEL, b"MSP1-frame-2"))
+            .unwrap();
+        // Unrelated custom channels must not enter the portal queue.
+        live.apply_event(framed("megu:other_v1", b"ignored"))
+            .unwrap();
+        assert_eq!(
+            live.drain_seamless_portal_frames(),
+            vec![b"MSP1-frame-1".to_vec(), b"MSP1-frame-2".to_vec()]
+        );
+        assert!(live.drain_seamless_portal_frames().is_empty());
+
+        // The queue is bounded: a burst keeps only the newest 16 frames.
+        for index in 0..20u8 {
+            live.apply_event(framed(SEAMLESS_PORTAL_CHANNEL, &[index]))
+                .unwrap();
+        }
+        let frames = live.drain_seamless_portal_frames();
+        assert_eq!(frames.len(), 16);
+        assert_eq!(frames.first().unwrap(), &vec![4u8]);
+        assert_eq!(frames.last().unwrap(), &vec![19u8]);
     }
 
     /// SW6D v1 builder for `(subworld_id, x, flags)` pose rows — the same
