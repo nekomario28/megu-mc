@@ -1339,10 +1339,11 @@ fn try_uniform_full_slice(
 /// all 16 slices. A face is accepted only when the existing full-slice rules
 /// prove it is one exact quad, or every adjacent cell fully occludes it. Any
 /// mixed occupancy or lighting falls back to the ordinary greedy mesher.
-fn try_uniform_boundary_box<S: QuadSink>(
+fn try_uniform_boundary_box<B: BorderStates, S: QuadSink>(
     block: Block,
     blocks: &[Block; SECTION_CELLS],
-    scratch: &MesherScratch,
+    borders: &B,
+    scratch: &mut MesherScratch,
     any_same_state_cull: bool,
     y_offset: f32,
     quads: &mut S,
@@ -1364,6 +1365,7 @@ fn try_uniform_boundary_box<S: QuadSink>(
         Direction::East,
     ];
     let mut faces = [None; 6];
+    let mut fallback = [false; 6];
     for (index, direction) in directions.into_iter().enumerate() {
         let slice = if direction.step() < 0 { 0 } else { EDGE - 1 };
         if let Some(face) = try_uniform_full_slice(
@@ -1381,7 +1383,7 @@ fn try_uniform_boundary_box<S: QuadSink>(
 
         let (pad_s, pad_u, pad_v, pad_step) = DIR_PAD_STRIDES[direction as usize];
         let pad_origin = (PAD_SLICE + PAD_EDGE + 1) as isize + slice as isize * pad_s;
-        let base = pad_origin + pad_step - pad_u - pad_v;
+        let base = pad_origin + pad_step;
         let opp_bit = direction.opposite().bit();
         let mut fully_occluded = true;
         'cells: for v in 0..EDGE {
@@ -1394,12 +1396,36 @@ fn try_uniform_boundary_box<S: QuadSink>(
             }
         }
         if !fully_occluded {
-            return false;
+            fallback[index] = true;
         }
     }
 
-    for face in faces.into_iter().flatten() {
-        quads.push(face);
+    let ctx = SliceCtx {
+        blocks,
+        borders,
+        any_same_state_cull,
+        y_offset,
+    };
+    for (index, direction) in directions.into_iter().enumerate() {
+        if fallback[index] {
+            let slice = if direction.step() < 0 { 0 } else { EDGE - 1 };
+            let (pad_s, pad_u, pad_v, pad_step) = DIR_PAD_STRIDES[direction as usize];
+            let pad_origin = (PAD_SLICE + PAD_EDGE + 1) as isize + slice as isize * pad_s;
+            let base = pad_origin + pad_step;
+            let opp_bit = direction.opposite().bit();
+            let mut vis_rows = [0u16; EDGE];
+            for (v, vis_row) in vis_rows.iter_mut().enumerate() {
+                for u in 0..EDGE {
+                    let idx = (base + v as isize * pad_v + u as isize * pad_u) as usize;
+                    if scratch.occ[idx] & opp_bit == 0 {
+                        *vis_row |= 1 << u;
+                    }
+                }
+            }
+            greedy_slice(&ctx, scratch, direction, slice, vis_rows, quads);
+        } else if let Some(face) = faces[index] {
+            quads.push(face);
+        }
     }
     true
 }
@@ -1698,6 +1724,7 @@ fn mesh_cubes_fast<B: BorderStates, S: QuadSink>(
         if try_uniform_boundary_box(
             block,
             blocks,
+            borders,
             scratch,
             scan.any_same_state_cull,
             y_offset,
