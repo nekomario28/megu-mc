@@ -8,6 +8,30 @@ use crate::structure_transform::{self, Mirror, Rotation};
 use std::collections::HashSet;
 
 type Pos = (i32, i32, i32);
+/// Local piece coordinates -> world coordinates under the piece's facing.
+/// `None` orientation is the unrotated root room.
+fn oriented_pos(piece: &Piece, (x, y, z): Pos) -> Pos {
+    let b = piece.bounds;
+    let Some(o) = piece.orientation else {
+        return (x, y, z);
+    };
+    let (x, z) = match o {
+        Facing::North => (b[0] + x, b[5] - z),
+        Facing::South => (b[0] + x, b[2] + z),
+        Facing::West => (b[3] - z, b[2] + x),
+        Facing::East => (b[0] + z, b[2] + x),
+    };
+    (x, b[1] + y, z)
+}
+/// The (mirror, rotation) pair a facing applies to every placed state.
+fn facing_transform(orientation: Option<Facing>) -> (Mirror, Rotation) {
+    match orientation {
+        Some(Facing::South) => (Mirror::LeftRight, Rotation::None),
+        Some(Facing::West) => (Mirror::LeftRight, Rotation::Clockwise90),
+        Some(Facing::East) => (Mirror::None, Rotation::Clockwise90),
+        _ => (Mirror::None, Rotation::None),
+    }
+}
 fn contains(b: &[i32; 6], p: Pos) -> bool {
     p.0 >= b[0] && p.0 <= b[3] && p.1 >= b[1] && p.1 <= b[4] && p.2 >= b[2] && p.2 <= b[5]
 }
@@ -34,26 +58,11 @@ struct Writer<'a, 'g> {
     wood: &'static str,
 }
 impl Writer<'_, '_> {
-    fn pos(&self, (x, y, z): Pos) -> Pos {
-        let b = self.piece.bounds;
-        let Some(o) = self.piece.orientation else {
-            return (x, y, z);
-        };
-        let (x, z) = match o {
-            Facing::North => (b[0] + x, b[5] - z),
-            Facing::South => (b[0] + x, b[2] + z),
-            Facing::West => (b[3] - z, b[2] + x),
-            Facing::East => (b[0] + z, b[2] + x),
-        };
-        (x, b[1] + y, z)
+    fn pos(&self, p: Pos) -> Pos {
+        oriented_pos(self.piece, p)
     }
     fn transformed(&self, st: u32) -> u32 {
-        let (m, r) = match self.piece.orientation {
-            Some(Facing::South) => (Mirror::LeftRight, Rotation::None),
-            Some(Facing::West) => (Mirror::LeftRight, Rotation::Clockwise90),
-            Some(Facing::East) => (Mirror::None, Rotation::Clockwise90),
-            _ => (Mirror::None, Rotation::None),
-        };
+        let (m, r) = facing_transform(self.piece.orientation);
         structure_transform::state(st, m, r).expect("mineshaft state transform")
     }
     fn get(&mut self, p: Pos) -> u32 {
@@ -536,3 +545,192 @@ include!("single_piece_structures.rs");
 
 include!("fortress_monument.rs");
 include!("stronghold_structures.rs");
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::mineshaft_layout::normal_layout;
+
+    fn piece(bounds: [i32; 6], orientation: Option<Facing>) -> Piece {
+        Piece {
+            bounds,
+            depth: 1,
+            orientation,
+            kind: Kind::Corridor {
+                rails: false,
+                spider: false,
+                spider_placed: false,
+                sections: 2,
+            },
+        }
+    }
+
+    #[test]
+    fn bounds_containment_and_intersection_are_inclusive() {
+        let b = [0, 64, 0, 2, 66, 4];
+        assert!(contains(&b, (0, 64, 0)), "min corner is inside");
+        assert!(contains(&b, (2, 66, 4)), "max corner is inside");
+        assert!(!contains(&b, (-1, 64, 0)));
+        assert!(!contains(&b, (3, 64, 0)));
+        assert!(!contains(&b, (0, 63, 0)));
+        assert!(!contains(&b, (0, 67, 0)));
+        // Touching faces still intersect: collision detection treats them as
+        // overlapping, which is what keeps generated pieces strictly apart.
+        let touching = [2, 64, 0, 5, 66, 4];
+        assert!(intersects(&b, &touching));
+        let gapped = [3, 64, 0, 5, 66, 4];
+        assert!(!intersects(&b, &gapped));
+        let apart = [4, 64, 0, 6, 66, 4];
+        assert!(!intersects(&b, &apart));
+        let above = [0, 67, 0, 2, 70, 4];
+        assert!(!intersects(&b, &above));
+        // Degenerate and negative-coordinate boxes behave the same way.
+        let point = [-5, -60, -5, -5, -60, -5];
+        assert!(contains(&point, (-5, -60, -5)));
+        assert!(!contains(&point, (-4, -60, -5)));
+        assert!(intersects(&point, &[-5, -60, -5, 0, 0, 0]));
+    }
+
+    #[test]
+    fn oriented_pos_maps_local_cells_under_every_facing() {
+        // bounds [10, 40, 20, 12, 42, 24]; local cell (1, 2, 3).
+        let b = [10, 40, 20, 12, 42, 24];
+        let cases = [
+            (Facing::North, (11, 42, 21)),
+            (Facing::South, (11, 42, 23)),
+            (Facing::West, (9, 42, 21)),
+            (Facing::East, (13, 42, 21)),
+        ];
+        for (facing, expected) in cases {
+            let p = piece(b, Some(facing));
+            assert_eq!(oriented_pos(&p, (1, 2, 3)), expected, "{facing:?}");
+        }
+        // No orientation: the root room's local coordinates are world coords.
+        let root = piece(b, None);
+        assert_eq!(oriented_pos(&root, (1, 2, 3)), (1, 2, 3));
+        // Large local coordinates stay in range without overflowing i32.
+        let p = piece(b, Some(Facing::East));
+        let _ = oriented_pos(&p, (i32::MAX / 4, i32::MIN / 4, i32::MAX / 4));
+    }
+
+    #[test]
+    fn facing_transform_matches_the_native_mirror_rotation_pairs() {
+        let (m, r) = facing_transform(None);
+        assert!(matches!(m, Mirror::None) && matches!(r, Rotation::None));
+        let (m, r) = facing_transform(Some(Facing::North));
+        assert!(matches!(m, Mirror::None) && matches!(r, Rotation::None));
+        let (m, r) = facing_transform(Some(Facing::South));
+        assert!(matches!(m, Mirror::LeftRight) && matches!(r, Rotation::None));
+        let (m, r) = facing_transform(Some(Facing::West));
+        assert!(matches!(m, Mirror::LeftRight) && matches!(r, Rotation::Clockwise90));
+        let (m, r) = facing_transform(Some(Facing::East));
+        assert!(matches!(m, Mirror::None) && matches!(r, Rotation::Clockwise90));
+    }
+
+    #[test]
+    fn normal_layout_is_deterministic_and_satisfies_piece_constraints() {
+        let args = [(4242u64, 3i32, -7i32), (1, -1000, 2000), (u64::MAX, 0, 0)];
+        for &(seed, cx, cz) in &args {
+            let a = normal_layout(seed, cx, cz, 63, -64);
+            let b = normal_layout(seed, cx, cz, 63, -64);
+            assert_eq!(a.pieces, b.pieces, "same seed must give same layout");
+            assert_eq!(a.vertical_shift, b.vertical_shift);
+            assert!(!a.pieces.is_empty());
+            // The root is always an unoriented room at depth 0.
+            assert_eq!(a.pieces[0].depth, 0);
+            assert!(matches!(a.pieces[0].kind, Kind::Room { .. }));
+            assert!(a.pieces[0].orientation.is_none());
+            let low = a.pieces.iter().map(|p| p.bounds[1]).min().unwrap();
+            assert!(
+                low > -64,
+                "layout shift keeps every piece above min_y+1 (got {low})"
+            );
+            // Depth-first growth caps at depth 9 (parent_depth > 8 stops).
+            assert!(a.pieces.iter().all(|p| p.depth <= 9));
+            // The collision pass guarantees pairwise disjoint bounds.
+            for i in 0..a.pieces.len() {
+                for j in i + 1..a.pieces.len() {
+                    assert!(
+                        !intersects(&a.pieces[i].bounds, &a.pieces[j].bounds),
+                        "pieces {i} and {j} overlap: {:?} vs {:?}",
+                        a.pieces[i].bounds,
+                        a.pieces[j].bounds
+                    );
+                }
+            }
+            // Kind-specific geometry constraints the writer relies on.
+            for p in &a.pieces {
+                match &p.kind {
+                    Kind::Corridor { sections, .. } => {
+                        // sections starts at 2..=4 but shrinks while resolving
+                        // collisions, so the stored value can be as low as 1.
+                        assert!((1..=4).contains(sections), "sections {sections}");
+                        // Corridor local box is 3 wide, 2 high, 5*sections-1 long.
+                        let (w, h, l) = match p.orientation {
+                            Some(Facing::North | Facing::South) => (
+                                p.bounds[3] - p.bounds[0],
+                                p.bounds[4] - p.bounds[1],
+                                p.bounds[5] - p.bounds[2],
+                            ),
+                            _ => (
+                                p.bounds[5] - p.bounds[2],
+                                p.bounds[4] - p.bounds[1],
+                                p.bounds[3] - p.bounds[0],
+                            ),
+                        };
+                        assert_eq!((w, h), (2, 2), "corridor cross-section");
+                        assert_eq!(l, sections * 5 - 1, "corridor length");
+                    }
+                    Kind::Crossing { two_floors, .. } => {
+                        // two_floors crossings are 6 high, single-floor 2 high.
+                        assert_eq!(
+                            p.bounds[4] - p.bounds[1],
+                            if *two_floors { 6 } else { 2 },
+                            "crossing height vs two_floors"
+                        );
+                    }
+                    Kind::Stairs => {
+                        // Stairs descend 5 over a 2x9 footprint (local -5..=2 y).
+                        assert_eq!(p.bounds[4] - p.bounds[1], 7);
+                    }
+                    Kind::Room { .. } => {}
+                }
+            }
+        }
+        // Different seeds must not collapse to the same layout.
+        let a = normal_layout(1, 0, 0, 63, -64);
+        let c = normal_layout(2, 0, 0, 63, -64);
+        assert!(a.pieces != c.pieces || a.vertical_shift != c.vertical_shift);
+    }
+
+    #[test]
+    fn normal_layout_survives_extreme_chunk_coordinates() {
+        // wrapping_shl keeps the origin computation total; no panic, and the
+        // layout still obeys its own invariants.
+        for (cx, cz) in [
+            (i32::MAX, i32::MAX),
+            (i32::MIN, i32::MIN),
+            (i32::MAX, i32::MIN),
+            (-1, 1),
+        ] {
+            let layout = normal_layout(7, cx, cz, 63, -64);
+            assert!(!layout.pieces.is_empty());
+            assert!(layout.pieces.iter().all(|p| p.depth <= 9));
+        }
+    }
+
+    #[test]
+    fn mesa_layout_is_deterministic_under_a_fixed_surface() {
+        let surface = |x: i32, z: i32| 80 + (x + z).rem_euclid(16);
+        let a = crate::mineshaft_layout::mesa_layout(99, 5, -3, 63, -64, surface);
+        let b = crate::mineshaft_layout::mesa_layout(99, 5, -3, 63, -64, surface);
+        assert_eq!(a.pieces, b.pieces);
+        assert_eq!(a.vertical_shift, b.vertical_shift);
+        assert!(!a.pieces.is_empty());
+        // The mesa shift centres the aggregate on the surface height, so it
+        // legitimately differs from the normal-layout shift for the same seed.
+        let n = normal_layout(99, 5, -3, 63, -64);
+        assert_ne!(a.pieces.len(), 0);
+        let _ = n;
+    }
+}

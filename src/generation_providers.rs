@@ -1220,3 +1220,618 @@ pub(crate) fn test_rt(rt: &RT, reg: &BReg, st: u32, y: i32, r: &mut Xor) -> bool
         RT::RandBlockState(s, p) => st == *s && r.next_f32() < *p,
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn j(s: &str) -> J {
+        crate::json::jparse(s.as_bytes()).expect("test JSON parses")
+    }
+    fn rng(seed: u64) -> Xor {
+        Xor::seed(seed)
+    }
+    /// Draw `n` samples from `ip` under one seeded stream.
+    fn draws(ip: &IP, seed: u64, n: usize) -> Vec<i32> {
+        let mut r = rng(seed);
+        (0..n).map(|_| ip.get(&mut r)).collect()
+    }
+
+    // ---------- IntProvider ----------
+
+    #[test]
+    fn ip_const_returns_value_without_consuming_rng() {
+        let ip = IP::Const(-42);
+        let mut r = rng(7);
+        let before = r.state128();
+        assert_eq!(ip.get(&mut r), -42);
+        assert_eq!(r.state128(), before, "constant provider draws nothing");
+        assert_eq!(ip.min_inclusive(), -42);
+        assert_eq!(ip.max_inclusive(), -42);
+    }
+
+    #[test]
+    fn ip_uniform_stays_in_bounds_and_is_deterministic() {
+        for (a, b) in [(0, 10), (-64, 320), (5, 5), (9, 3)] {
+            let ip = IP::Uniform(a, b);
+            let samples = draws(&ip, 1234, 500);
+            for &v in &samples {
+                // next_inbetween(min,max) with max<min returns min unclamped;
+                // Uniform passes (a,b) through, so a>b yields `a`.
+                if a <= b {
+                    assert!((a..=b).contains(&v), "uniform({a},{b}) gave {v}");
+                } else {
+                    assert_eq!(v, a, "inverted uniform returns the min operand");
+                }
+            }
+            if a <= b {
+                // A real range actually varies.
+                assert!(samples.iter().any(|&v| v != a) || b == a);
+            }
+            assert_eq!(draws(&ip, 1234, 500), samples, "same seed same stream");
+            assert_eq!(ip.min_inclusive(), a);
+            assert_eq!(ip.max_inclusive(), b);
+        }
+        // min == max still consumes its draw (nextInt(1)) but always yields it.
+        let ip = IP::Uniform(77, 77);
+        assert!(draws(&ip, 9, 20).iter().all(|&v| v == 77));
+    }
+
+    #[test]
+    fn ip_bias_bottom_skews_low_and_respects_bounds() {
+        let ip = IP::BiasBottom(0, 15);
+        let samples = draws(&ip, 555, 2000);
+        assert!(samples.iter().all(|&v| (0..=15).contains(&v)));
+        let zeros = samples.iter().filter(|&&v| v == 0).count();
+        let fifteens = samples.iter().filter(|&&v| v == 15).count();
+        assert!(
+            zeros > fifteens * 2,
+            "biased_to_bottom must favour the bottom (zeros={zeros}, fifteens={fifteens})"
+        );
+        // Degenerate range collapses to the single value.
+        let flat = IP::BiasBottom(4, 4);
+        assert!(draws(&flat, 1, 50).iter().all(|&v| v == 4));
+        assert_eq!(flat.min_inclusive(), 4);
+        assert_eq!(flat.max_inclusive(), 4);
+        assert_eq!(ip.min_inclusive(), 0);
+        assert_eq!(ip.max_inclusive(), 15);
+    }
+
+    #[test]
+    fn ip_very_bias_is_min_of_three_draws() {
+        let ip = IP::VeryBias(0, 100, 1);
+        let samples = draws(&ip, 77, 1000);
+        assert!(samples.iter().all(|&v| (0..=100).contains(&v)));
+        let mean = samples.iter().map(|&v| v as f64).sum::<f64>() / samples.len() as f64;
+        assert!(mean < 40.0, "min-of-3 skews far below the uniform mean 50 (got {mean})");
+        assert_eq!(draws(&ip, 77, 1000), samples);
+        // Degenerate min == max.
+        let ip = IP::VeryBias(9, 9, 1);
+        assert!(draws(&ip, 3, 30).iter().all(|&v| v == 9));
+    }
+
+    #[test]
+    fn ip_clamped_bounds_the_inner_provider() {
+        let inner = IP::Uniform(0, 100);
+        let ip = IP::Clamped(Box::new(inner), 10, 20);
+        let samples = draws(&ip, 42, 500);
+        assert!(samples.iter().all(|&v| (10..=20).contains(&v)));
+        // A constant outside the clamp range pins to the nearer bound.
+        assert_eq!(IP::Clamped(Box::new(IP::Const(5)), 10, 20).get(&mut rng(1)), 10);
+        assert_eq!(IP::Clamped(Box::new(IP::Const(99)), 10, 20).get(&mut rng(1)), 20);
+        // Equal clamp bounds collapse everything.
+        assert!(draws(&IP::Clamped(Box::new(IP::Uniform(0, 9)), 7, 7), 2, 20)
+            .iter()
+            .all(|&v| v == 7));
+        assert_eq!(ip.min_inclusive(), 10);
+        assert_eq!(ip.max_inclusive(), 20);
+    }
+
+    #[test]
+    fn ip_trapezoid_stays_in_range_and_plateau_degenerates() {
+        let ip = IP::Trap(0, 10, 4);
+        let samples = draws(&ip, 314, 1000);
+        assert!(samples.iter().all(|&v| (0..=10).contains(&v)));
+        assert_eq!(draws(&ip, 314, 1000), samples);
+        // plateau >= range: the reflection window is empty, output is uniform.
+        let ip = IP::Trap(0, 10, 10);
+        assert!(draws(&ip, 8, 500).iter().all(|&v| (0..=10).contains(&v)));
+        // b - a - plateau < 0 returns `a` without drawing.
+        let ip = IP::Trap(3, 3, 5);
+        let mut r = rng(1);
+        let before = r.state128();
+        assert_eq!(ip.get(&mut r), 3);
+        assert_eq!(r.state128(), before, "degenerate trapezoid draws nothing");
+        // min == max collapses.
+        assert!(draws(&IP::Trap(6, 6, 0), 4, 30).iter().all(|&v| v == 6));
+    }
+
+    #[test]
+    fn ip_norm_clamps_gaussian_to_declared_bounds() {
+        let ip = IP::Norm(0.0, 1.0, -5, 5);
+        let samples = draws(&ip, 2718, 300);
+        assert!(samples.iter().all(|&v| (-5..=5).contains(&v)));
+        // Huge mean/deviation still cannot escape the clamp: the gaussian can
+        // pull the f32 value below lo, so both clamp faces are reachable.
+        assert!(
+            draws(&IP::Norm(1e6, 1e6, 0, 10), 5, 50)
+                .iter()
+                .all(|&v| (0..=10).contains(&v))
+        );
+        assert!(draws(&IP::Norm(-1e6, 1.0, 0, 10), 5, 50).iter().all(|&v| v == 0));
+        // Zero deviation pins to the clamped mean.
+        assert!(draws(&IP::Norm(4.0, 0.0, 3, 7), 5, 20).iter().all(|&v| v == 4));
+        assert_eq!(draws(&ip, 2718, 300), samples);
+        assert_eq!(ip.min_inclusive(), -5);
+        assert_eq!(ip.max_inclusive(), 5);
+    }
+
+    #[test]
+    fn ip_weighted_selects_by_weight_and_handles_degenerate_weights() {
+        // Single entry always wins regardless of roll.
+        let ip = IP::Weighted(vec![(1, IP::Const(7))]);
+        assert!(draws(&ip, 1, 50).iter().all(|&v| v == 7));
+        // Zero/negative total weight yields 0 without touching entries.
+        let ip = IP::Weighted(vec![(0, IP::Const(1)), (-3, IP::Const(2))]);
+        assert!(draws(&ip, 1, 20).iter().all(|&v| v == 0));
+        let ip = IP::Weighted(vec![]);
+        assert!(draws(&ip, 1, 20).iter().all(|&v| v == 0));
+        // Negative weights count as zero: only the positive arm can fire.
+        let ip = IP::Weighted(vec![(-5, IP::Const(1)), (2, IP::Const(9))]);
+        assert!(draws(&ip, 6, 50).iter().all(|&v| v == 9));
+        // A real distribution produces both arms and is deterministic.
+        let ip = IP::Weighted(vec![(1, IP::Const(0)), (3, IP::Const(100))]);
+        let samples = draws(&ip, 11, 2000);
+        assert!(samples.contains(&0) && samples.contains(&100));
+        let zeros = samples.iter().filter(|&&v| v == 0).count();
+        assert!(
+            (zeros as f64 / samples.len() as f64 - 0.25).abs() < 0.1,
+            "weight 1/4 should fire ~25% (got {})",
+            zeros as f64 / samples.len() as f64
+        );
+        assert_eq!(draws(&ip, 11, 2000), samples);
+        // Nested providers evaluate per pick.
+        let ip = IP::Weighted(vec![(1, IP::Uniform(0, 1)), (1, IP::Const(50))]);
+        assert!(draws(&ip, 2, 200).iter().all(|&v| (0..=50).contains(&v)));
+        assert_eq!(ip.min_inclusive(), 0);
+        assert_eq!(ip.max_inclusive(), 50);
+    }
+
+    #[test]
+    fn ip_min_max_inclusive_track_every_variant() {
+        assert_eq!(IP::Trap(1, 9, 2).min_inclusive(), 1);
+        assert_eq!(IP::Trap(1, 9, 2).max_inclusive(), 9);
+        assert_eq!(IP::Norm(0.0, 1.0, -3, 8).min_inclusive(), -3);
+        assert_eq!(IP::Norm(0.0, 1.0, -3, 8).max_inclusive(), 8);
+        assert_eq!(IP::VeryBias(-4, 6, 1).min_inclusive(), -4);
+        assert_eq!(IP::VeryBias(-4, 6, 1).max_inclusive(), 6);
+        let w = IP::Weighted(vec![
+            (1, IP::Const(3)),
+            (1, IP::Uniform(-10, 20)),
+            (1, IP::Clamped(Box::new(IP::Const(99)), 0, 50)),
+        ]);
+        assert_eq!(w.min_inclusive(), -10);
+        assert_eq!(w.max_inclusive(), 50);
+        assert_eq!(IP::Weighted(vec![]).min_inclusive(), 0);
+        assert_eq!(IP::Weighted(vec![]).max_inclusive(), 0);
+    }
+
+    // ---------- VerticalAnchor / HeightProvider ----------
+
+    #[test]
+    fn vertical_anchor_resolves_against_negative_min_y() {
+        // 1.21 overworld-style window: min_y=-64, height=384.
+        assert_eq!(YA::Abs(70).get(-64, 384), 70);
+        assert_eq!(YA::AboveBottom(0).get(-64, 384), -64);
+        assert_eq!(YA::AboveBottom(320).get(-64, 384), 256);
+        // BELOW_TOP is the top *block*: min_y + height - 1 - offset.
+        assert_eq!(YA::BelowTop(0).get(-64, 384), 319);
+        assert_eq!(YA::BelowTop(64).get(-64, 384), 255);
+        // Sea-level-ish and nether windows resolve the same way.
+        assert_eq!(YA::BelowTop(0).get(0, 256), 255);
+        assert_eq!(YA::AboveBottom(32).get(0, 128), 32);
+        // Saturating arithmetic survives absurd offsets.
+        assert_eq!(
+            YA::AboveBottom(i32::MAX).get(-64, 384),
+            (-64i32).saturating_add(i32::MAX)
+        );
+        assert_eq!(
+            YA::BelowTop(i32::MAX).get(-64, 384),
+            319i32.saturating_sub(i32::MAX)
+        );
+    }
+
+    #[test]
+    fn hp_uniform_biased_trap_verybias_bounds_and_degenerates() {
+        let (min_y, height) = (-64, 384);
+        let lo = YA::AboveBottom(0);
+        let hi = YA::BelowTop(0);
+        // Uniform over the full window stays inside it and is deterministic.
+        let hp = HP::Uniform(lo.clone(), hi.clone());
+        let samples = {
+            let mut r = rng(123);
+            (0..2000).map(|_| hp.get(&mut r, min_y, height)).collect::<Vec<_>>()
+        };
+        assert!(samples.iter().all(|&y| (-64..=319).contains(&y)));
+        let mut r2 = rng(123);
+        assert_eq!(hp.get(&mut r2, min_y, height), samples[0]);
+        // Equal anchors: uniform still draws but always yields the anchor.
+        let hp = HP::Uniform(hi.clone(), hi.clone());
+        assert!(draws_hp(&hp, 9, 100).iter().all(|&y| y == 319));
+        // Inverted anchors return the lower operand without drawing.
+        let mut r = rng(1);
+        let before = r.state128();
+        assert_eq!(HP::Uniform(hi.clone(), lo.clone()).get(&mut r, min_y, height), 319);
+        assert_eq!(r.state128(), before);
+        // Biased: bounded, deterministic, and collapses when the window is
+        // smaller than `inner`.
+        let hp = HP::Biased(lo.clone(), hi.clone(), 8);
+        let samples = draws_hp(&hp, 77, 1000);
+        assert!(samples.iter().all(|&y| (-64..=319).contains(&y)));
+        assert_eq!(draws_hp(&hp, 77, 1000), samples);
+        let collapsed = HP::Biased(YA::Abs(10), YA::Abs(10), 8);
+        assert!(draws_hp(&collapsed, 5, 50).iter().all(|&y| y == 10));
+        // Trapezoid: plateau >= range degrades to uniform; bounded either way.
+        let hp = HP::Trap(lo.clone(), hi.clone(), 10_000);
+        assert!(draws_hp(&hp, 31, 500).iter().all(|&y| (-64..=319).contains(&y)));
+        let hp = HP::Trap(YA::Abs(0), YA::Abs(50), 0);
+        let samples = draws_hp(&hp, 32, 500);
+        assert!(samples.iter().all(|&y| (0..=50).contains(&y)));
+        // Inverted trapezoid returns `lo`.
+        let mut r = rng(2);
+        assert_eq!(HP::Trap(hi.clone(), lo.clone(), 0).get(&mut r, min_y, height), 319);
+        // VeryBias: bounded and deterministic.
+        let hp = HP::VeryBias(lo.clone(), hi.clone(), 8);
+        let samples = draws_hp(&hp, 55, 1000);
+        assert!(samples.iter().all(|&y| (-64..=319).contains(&y)));
+        assert_eq!(draws_hp(&hp, 55, 1000), samples);
+        let collapsed = HP::VeryBias(YA::Abs(3), YA::Abs(3), 8);
+        assert!(draws_hp(&collapsed, 5, 50).iter().all(|&y| y == 3));
+    }
+
+    fn draws_hp(hp: &HP, seed: u64, n: usize) -> Vec<i32> {
+        let mut r = rng(seed);
+        (0..n).map(|_| hp.get(&mut r, -64, 384)).collect()
+    }
+
+    // ---------- JSON parsing ----------
+
+    #[test]
+    fn p_ip_parses_every_provider_type_and_literal() {
+        // Bare number is a constant.
+        assert!(matches!(p_ip(&j("5")), Some(IP::Const(5))));
+        assert!(matches!(p_ip(&j("-12")), Some(IP::Const(-12))));
+        let cases: &[(&str, &str)] = &[
+            (r#"{"type":"constant","value":3}"#, "constant"),
+            (r#"{"type":"minecraft:uniform","min_inclusive":1,"max_inclusive":9}"#, "uniform"),
+            (r#"{"type":"biased_to_bottom","min":0,"max":4}"#, "biasbottom"),
+            (r#"{"type":"very_biased_to_bottom","min_inclusive":0,"max_inclusive":4,"inner":2}"#, "verybias"),
+            (r#"{"type":"clamped","source":{"type":"uniform","min_inclusive":0,"max_inclusive":9},"min_inclusive":2,"max_inclusive":6}"#, "clamped"),
+            (r#"{"type":"trapezoid","min_inclusive":0,"max_inclusive":8,"plateau":3}"#, "trap"),
+            (r#"{"type":"clamped_normal","mean":0.0,"deviation":1.0,"min_inclusive":-2,"max_inclusive":2}"#, "norm"),
+        ];
+        for &(json, tag) in cases {
+            let parsed = p_ip(&j(json)).unwrap_or_else(|| panic!("{tag} parses: {json}"));
+            match (tag, &parsed) {
+                ("constant", IP::Const(3))
+                | ("uniform", IP::Uniform(1, 9))
+                | ("biasbottom", IP::BiasBottom(0, 4))
+                | ("verybias", IP::VeryBias(0, 4, _))
+                | ("clamped", IP::Clamped(_, 2, 6))
+                | ("trap", IP::Trap(0, 8, 3))
+                | ("norm", IP::Norm(..)) => {}
+                _ => panic!("{tag} parsed to wrong variant: {parsed:?}"),
+            }
+        }
+        // Weighted list: two entries, one an inline constant.
+        let parsed = p_ip(&j(
+            r#"{"type":"weighted_list","distribution":[{"weight":1,"data":{"type":"constant","value":1}},{"weight":2,"data":4}]}"#,
+        ))
+        .unwrap();
+        assert!(matches!(parsed, IP::Weighted(ref v) if v.len() == 2));
+        // Unknown type and malformed payloads fail closed.
+        assert!(p_ip(&j(r#"{"type":"minecraft:no_such_provider"}"#)).is_none());
+        assert!(p_ip(&j(r#"{"type":"clamped"}"#)).is_none(), "missing source");
+        assert!(p_ip(&j(r#"{"type":"weighted_list"}"#)).is_none(), "missing distribution");
+        assert!(p_ip(&j(r#"{"type":"uniform"}"#)).is_some(), "defaults fill missing bounds");
+    }
+
+    #[test]
+    fn p_hp_parses_height_providers_with_anchor_objects() {
+        let hp = p_hp(&j(
+            r#"{"type":"uniform","min_inclusive":{"above_bottom":0},"max_inclusive":{"below_top":0}}"#,
+        ))
+        .unwrap();
+        assert!(matches!(hp, HP::Uniform(YA::AboveBottom(0), YA::BelowTop(0))));
+        let hp = p_hp(&j(
+            r#"{"type":"trapezoid","min_inclusive":{"absolute":-10},"max_inclusive":80,"plateau":4}"#,
+        ))
+        .unwrap();
+        assert!(matches!(hp, HP::Trap(YA::Abs(-10), YA::Abs(80), 4)));
+        let hp = p_hp(&j(
+            r#"{"type":"biased_to_bottom","min_inclusive":0,"max_inclusive":32,"inner":3}"#,
+        ))
+        .unwrap();
+        assert!(matches!(hp, HP::Biased(YA::Abs(0), YA::Abs(32), 3)));
+        let hp = p_hp(&j(
+            r#"{"type":"very_biased_to_bottom","min_inclusive":{"below_top":16},"max_inclusive":{"above_bottom":8}}"#,
+        ))
+        .unwrap();
+        // `inner` defaults to 1 when absent.
+        assert!(matches!(hp, HP::VeryBias(YA::BelowTop(16), YA::AboveBottom(8), 1)));
+        // constant height provider.
+        let hp = p_hp(&j(r#"{"type":"constant","value":{"absolute":42}}"#)).unwrap();
+        assert!(matches!(hp, HP::Uniform(YA::Abs(42), YA::Abs(42))));
+        assert!(p_hp(&j(r#"{"type":"nope"}"#)).is_none());
+        assert!(p_hp(&j(r#"{"type":"uniform"}"#)).is_none(), "anchors required");
+    }
+
+    #[test]
+    fn p_fp_parses_float_providers() {
+        assert!(matches!(p_fp(&j(r#"{"type":"constant","value":1.5}"#)), Some(FP::Const(v)) if v == 1.5));
+        assert!(matches!(
+            p_fp(&j(r#"{"type":"uniform","min_inclusive":0.5,"max_exclusive":2.5}"#)),
+            Some(FP::Uniform(0.5, 2.5))
+        ));
+        assert!(matches!(
+            p_fp(&j(r#"{"type":"clamped_normal","mean":1.0,"deviation":0.5,"min":0.0,"max":2.0}"#)),
+            Some(FP::Norm { mean: 1.0, .. })
+        ));
+        assert!(matches!(
+            p_fp(&j(r#"{"type":"trapezoid","min":0.0,"max":4.0,"plateau":1.0}"#)),
+            Some(FP::Trap { lo: 0.0, hi: 4.0, plateau: 1.0 })
+        ));
+        assert!(p_fp(&j(r#"{"type":"bogus"}"#)).is_none());
+        assert!(p_fp(&j("42")).is_none(), "bare numbers are not float providers");
+    }
+
+    // ---------- FloatProvider sampling ----------
+
+    #[test]
+    fn fp_get_respects_bounds_and_is_deterministic() {
+        // Uniform is [min, max): never reaches the exclusive top.
+        let fp = FP::Uniform(2.0, 5.0);
+        let mut r = rng(9);
+        for _ in 0..2000 {
+            let v = fp.get(&mut r);
+            assert!((2.0..5.0).contains(&v), "uniform float escaped: {v}");
+        }
+        let mut r1 = rng(9);
+        let mut r2 = rng(9);
+        for _ in 0..100 {
+            assert_eq!(fp.get(&mut r1), fp.get(&mut r2));
+        }
+        // Constant draws nothing.
+        let fp = FP::Const(3.25);
+        let mut r = rng(1);
+        let before = r.state128();
+        assert_eq!(fp.get(&mut r), 3.25);
+        assert_eq!(r.state128(), before);
+        // Trapezoid stays inside [lo, hi).
+        let fp = FP::Trap { lo: 1.0, hi: 9.0, plateau: 2.0 };
+        let mut r = rng(4);
+        for _ in 0..2000 {
+            let v = fp.get(&mut r);
+            assert!((1.0..9.0).contains(&v), "trapezoid float escaped: {v}");
+        }
+        // Clamped normal can never leave [lo, hi] even with absurd deviation.
+        let fp = FP::Norm { mean: 0.0, dev: 1e9, lo: -1.0, hi: 1.0 };
+        let mut r = rng(6);
+        for _ in 0..200 {
+            let v = fp.get(&mut r);
+            assert!((-1.0..=1.0).contains(&v));
+        }
+        // Degenerate lo == hi pins every draw.
+        let fp = FP::Norm { mean: 5.0, dev: 1.0, lo: 2.0, hi: 2.0 };
+        assert!(draws_fp(&fp, 3, 50).iter().all(|&v| v == 2.0));
+    }
+
+    fn draws_fp(fp: &FP, seed: u64, n: usize) -> Vec<f32> {
+        let mut r = rng(seed);
+        (0..n).map(|_| fp.get(&mut r)).collect()
+    }
+
+    #[test]
+    fn fp_clamped_normal_helper_matches_provider_semantics() {
+        // Direct helper: f64 gaussian clamped then truncated to f32.
+        let mut r = rng(17);
+        for _ in 0..500 {
+            let v = fp_clamped_normal(&mut r, 0.0, 1.0, -2.0, 2.0);
+            assert!((-2.0..=2.0).contains(&v));
+        }
+        // Same stream through FP::Norm consumes identically.
+        let mut r1 = rng(17);
+        let mut r2 = rng(17);
+        let fp = FP::Norm { mean: 0.0, dev: 1.0, lo: -2.0, hi: 2.0 };
+        for _ in 0..500 {
+            assert_eq!(fp_clamped_normal(&mut r1, 0.0, 1.0, -2.0, 2.0), fp.get(&mut r2));
+        }
+    }
+
+    // ---------- pure helpers ----------
+
+    #[test]
+    fn noise_state_maps_midpoint_into_state_list() {
+        let states = vec![10u32, 20, 30, 40];
+        assert_eq!(noise_state(&states, -1.0), 10, "bottom of range");
+        assert_eq!(noise_state(&states, -0.5), 20);
+        assert_eq!(noise_state(&states, 0.0), 30, "midpoint boundary");
+        assert_eq!(noise_state(&states, 0.5), 40);
+        assert_eq!(noise_state(&states, 1.0), 40, "top clamps into last slot");
+        assert_eq!(noise_state(&states, 99.0), 40);
+        assert_eq!(noise_state(&states, -99.0), 10);
+        // Single-state list always resolves to it.
+        assert_eq!(noise_state(&[7], -1.0), 7);
+        assert_eq!(noise_state(&[7], 1.0), 7);
+    }
+
+    #[test]
+    fn dir_off_covers_all_six_directions() {
+        assert_eq!(dir_off(0), (0, -1, 0));
+        assert_eq!(dir_off(1), (0, 1, 0));
+        assert_eq!(dir_off(2), (0, 0, -1));
+        assert_eq!(dir_off(3), (0, 0, 1));
+        assert_eq!(dir_off(4), (-1, 0, 0));
+        assert_eq!(dir_off(5), (1, 0, 0));
+        // Out-of-range direction ids fold to +x like the vanilla ordinal.
+        assert_eq!(dir_off(6), (1, 0, 0));
+        assert_eq!(dir_off(255), (1, 0, 0));
+    }
+
+    // ---------- predicate / modifier / rule-test parsing ----------
+
+    #[test]
+    fn p_pred_parses_native_predicate_shapes() {
+        assert!(matches!(p_pred(&j(r#"{"type":"true"}"#)), Some(Pr::True)));
+        assert!(matches!(
+            p_pred(&j(r#"{"type":"matching_blocks","blocks":["minecraft:stone","minecraft:dirt"]}"#)),
+            Some(Pr::Blocks(v)) if v.len() == 2
+        ));
+        // Single-string `blocks` is one entry, not a list.
+        assert!(matches!(
+            p_pred(&j(r#"{"type":"matching_blocks","blocks":"minecraft:grass_block"}"#)),
+            Some(Pr::Blocks(v)) if v == ["minecraft:grass_block"]
+        ));
+        assert!(matches!(
+            p_pred(&j(r#"{"type":"matching_fluids","fluids":"minecraft:water"}"#)),
+            Some(Pr::Fluids(v)) if v == ["minecraft:water"]
+        ));
+        assert!(matches!(p_pred(&j(r#"{"type":"solid"}"#)), Some(Pr::Solid)));
+        assert!(matches!(p_pred(&j(r#"{"type":"replaceable"}"#)), Some(Pr::Replaceable)));
+        assert!(matches!(
+            p_pred(&j(r#"{"type":"inside_world_bounds"}"#)),
+            Some(Pr::InsideWB)
+        ));
+        assert!(matches!(
+            p_pred(&j(r#"{"type":"unobstructed"}"#)),
+            Some(Pr::Unobstructed)
+        ));
+        assert!(matches!(
+            p_pred(&j(r#"{"type":"has_sturdy_face","direction":"down","offset":[0,-1,0]}"#)),
+            Some(Pr::HasSturdy([0, -1, 0], 0))
+        ));
+        // Offset wrapping: state predicates evaluate at pos + offset.
+        assert!(matches!(
+            p_pred(&j(r#"{"type":"solid","offset":[1,0,-2]}"#)),
+            Some(Pr::Offset(inner, [1, 0, -2])) if matches!(*inner, Pr::Solid)
+        ));
+        // Boolean combinators nest.
+        let pr = p_pred(&j(
+            r#"{"type":"any_of","predicates":[{"type":"solid"},{"type":"not","predicate":{"type":"replaceable"}}]}"#,
+        ))
+        .unwrap();
+        assert!(matches!(pr, Pr::Any(v) if v.len() == 2));
+        assert!(matches!(
+            p_pred(&j(r#"{"type":"all_of","predicates":[{"type":"solid"}]}"#)),
+            Some(Pr::All(v)) if v.len() == 1
+        ));
+        assert!(matches!(
+            p_pred(&j(r#"{"type":"not","predicate":{"type":"solid"}}"#)),
+            Some(Pr::Not(_))
+        ));
+        // Unknown predicate fails closed.
+        assert!(p_pred(&j(r#"{"type":"bogus_predicate"}"#)).is_none());
+        assert!(p_pred(&j(r#"{"type":"not"}"#)).is_none(), "missing predicate");
+    }
+
+    #[test]
+    fn p_mod_parses_placement_modifiers() {
+        let cases: &[(&str, &str)] = &[
+            (r#"{"type":"count","count":{"type":"uniform","min_inclusive":1,"max_inclusive":3}}"#, "count"),
+            (r#"{"type":"in_square"}"#, "insquare"),
+            (r#"{"type":"offset","x_spread":{"type":"uniform","min_inclusive":-2,"max_inclusive":2},"y_spread":{"type":"constant","value":1}}"#, "offset"),
+            (r#"{"type":"height_range","height":{"type":"uniform","min_inclusive":{"above_bottom":0},"max_inclusive":{"below_top":0}}}"#, "heightrange"),
+            (r#"{"type":"heightmap","heightmap":"WORLD_SURFACE_WG"}"#, "heightmap"),
+            (r#"{"type":"biome"}"#, "biome"),
+            (r#"{"type":"fixed_placement"}"#, "fixed"),
+            (r#"{"type":"block_predicate_filter","predicate":{"type":"solid"}}"#, "blockpred"),
+            (r#"{"type":"rarity_filter","chance":5}"#, "rarity"),
+            (r#"{"type":"random_chance","chance":0.25}"#, "chance"),
+            (r#"{"type":"carving_mask"}"#, "carving"),
+        ];
+        for &(json, tag) in cases {
+            assert!(p_mod(&j(json)).is_some(), "{tag} must parse: {json}");
+        }
+        assert!(matches!(p_mod(&j(r#"{"type":"count","count":2}"#)), Some(PM::Count(_))));
+        assert!(matches!(p_mod(&j(r#"{"type":"in_square"}"#)), Some(PM::InSquare)));
+        assert!(matches!(p_mod(&j(r#"{"type":"rarity_filter","chance":5}"#)), Some(PM::Rarity(5))));
+        assert!(matches!(p_mod(&j(r#"{"type":"random_chance","chance":0.25}"#)), Some(PM::RandomChance(c)) if (c - 0.25).abs() < 1e-6));
+        assert!(matches!(p_mod(&j(r#"{"type":"fixed_placement"}"#)), Some(PM::Fixed)));
+        assert!(matches!(p_mod(&j(r#"{"type":"carving_mask"}"#)), Some(PM::Carving)));
+        // Missing required provider fails closed; unknown type fails closed.
+        assert!(p_mod(&j(r#"{"type":"count"}"#)).is_none());
+        assert!(p_mod(&j(r#"{"type":"height_range"}"#)).is_none());
+        assert!(p_mod(&j(r#"{"type":"bogus_modifier"}"#)).is_none());
+        // `random_offset` is the 1.21.1 spelling of `offset`.
+        assert!(matches!(
+            p_mod(&j(r#"{"type":"random_offset","x":{"type":"constant","value":1},"y":{"type":"constant","value":2}}"#)),
+            Some(PM::Offset(_, _))
+        ));
+    }
+
+    #[test]
+    fn p_rt_parses_rule_tests_that_need_no_registry() {
+        assert!(matches!(p_rt(&j(r#"{"predicate_type":"always_true"}"#)), Some(RT::True)));
+        assert!(matches!(
+            p_rt(&j(r#"{"predicate_type":"tag_match","tag":"minecraft:ice"}"#)),
+            Some(RT::Tag(t)) if t == "minecraft:ice"
+        ));
+        assert!(matches!(
+            p_rt(&j(r#"{"predicate_type":"block_match","block":"minecraft:stone"}"#)),
+            Some(RT::Block(b)) if b == "minecraft:stone"
+        ));
+        assert!(matches!(
+            p_rt(&j(r#"{"predicate_type":"height_match","min_inclusive":60,"max_inclusive":100}"#)),
+            Some(RT::Height(60, 100))
+        ));
+        assert!(matches!(
+            p_rt(&j(r#"{"predicate_type":"random_block_match","block":"minecraft:tall_grass","probability":0.5}"#)),
+            Some(RT::RandBlock(b, p)) if b == "minecraft:tall_grass" && (p - 0.5).abs() < 1e-6
+        ));
+        // Combinators compose.
+        assert!(matches!(
+            p_rt(&j(r#"{"predicate_type":"any_of","rules":[{"predicate_type":"always_true"},{"predicate_type":"tag_match","tag":"x"}]}"#)),
+            Some(RT::Any(v)) if v.len() == 2
+        ));
+        assert!(matches!(
+            p_rt(&j(r#"{"predicate_type":"not","predicate":{"predicate_type":"always_true"}}"#)),
+            Some(RT::Not(_))
+        ));
+        assert!(p_rt(&j(r#"{"predicate_type":"bogus"}"#)).is_none());
+    }
+
+    // ---------- end-to-end provider evaluation through JSON ----------
+
+    #[test]
+    fn json_driven_int_and_height_providers_evaluate_in_bounds() {
+        // A datapack-shaped uniform provider end to end: parse -> sample.
+        let ip = p_ip(&j(
+            r#"{"type":"minecraft:uniform","min_inclusive":-20,"max_inclusive":20}"#,
+        ))
+        .unwrap();
+        assert!(draws(&ip, 2024, 1000).iter().all(|&v| (-20..=20).contains(&v)));
+        // Weighted list with nested clamped source.
+        let ip = p_ip(&j(
+            r#"{"type":"weighted_list","distribution":[
+                {"weight":1,"data":{"type":"clamped","source":{"type":"uniform","min_inclusive":0,"max_inclusive":100},"min_inclusive":10,"max_inclusive":20}},
+                {"weight":1,"data":{"type":"constant","value":-1}}
+            ]}"#,
+        ))
+        .unwrap();
+        let samples = draws(&ip, 88, 500);
+        assert!(samples.iter().all(|&v| v == -1 || (10..=20).contains(&v)));
+        assert!(samples.contains(&-1) && samples.iter().any(|&v| v != -1));
+        // Height provider over the vanilla overworld window.
+        let hp = p_hp(&j(
+            r#"{"type":"trapezoid","min_inclusive":{"above_bottom":0},"max_inclusive":{"below_top":0},"plateau":40}"#,
+        ))
+        .unwrap();
+        let samples = draws_hp_window(&hp, 66, 1000);
+        assert!(samples.iter().all(|&y| (-64..=319).contains(&y)));
+    }
+
+    fn draws_hp_window(hp: &HP, seed: u64, n: usize) -> Vec<i32> {
+        let mut r = rng(seed);
+        (0..n).map(|_| hp.get(&mut r, -64, 384)).collect()
+    }
+}

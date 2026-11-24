@@ -491,3 +491,210 @@ fn custom_payload_c2s(client: &Client, body: &[u8]) {
         }
     }
 }
+
+#[cfg(test)]
+mod lod_protocol_tests {
+    use super::*;
+
+    fn cells_filled(n: usize, top_y: i16) -> Vec<LodCellV1> {
+        (0..n)
+            .map(|i| LodCellV1 {
+                state_id: 0xfeed_0000 + i as u32,
+                tint: 0x00ff_00ff,
+                top_y,
+                light: 0xf0,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn lod_v1_frame_roundtrips_both_resolutions_and_negative_coords() {
+        for (resolution, n) in [(LOD_RES_COARSE, 16usize), (LOD_RES_FINE, 256)] {
+            for (cx, cz) in [(0, 0), (-1, -1), (i32::MIN, i32::MAX), (12345, -6789)] {
+                let cells = cells_filled(n, 64);
+                let frame = encode_lod_v1(cx, cz, resolution, &cells).expect("encodes");
+                assert_eq!(frame.len(), LOD_V1_HEADER + n * LOD_V1_CELL_BYTES);
+                assert_eq!(&frame[..4], b"LOD1");
+                assert_eq!(frame[4], LOD_V1_VERSION);
+                assert_eq!(frame[5], resolution);
+                assert_eq!(
+                    u16::from_le_bytes([frame[6], frame[7]]) as usize,
+                    n,
+                    "cell count is resolution*resolution"
+                );
+                let decoded = decode_lod_v1_frame(&frame).expect("decodes");
+                assert_eq!(decoded.cx, cx);
+                assert_eq!(decoded.cz, cz);
+                assert_eq!(decoded.resolution, resolution);
+                assert_eq!(decoded.cells, cells);
+            }
+        }
+        // The empty-cell sentinel (top_y = i16::MIN) round-trips too.
+        let cells = vec![LOD_CELL_EMPTY; 16];
+        let frame = encode_lod_v1(-7, 9, LOD_RES_COARSE, &cells).unwrap();
+        let decoded = decode_lod_v1_frame(&frame).unwrap();
+        assert!(decoded.cells.iter().all(|c| *c == LOD_CELL_EMPTY));
+        assert_eq!(decoded.cells[0].top_y, i16::MIN);
+    }
+
+    #[test]
+    fn lod_v1_encode_rejects_bad_resolution_and_cell_count() {
+        let cells = cells_filled(16, 0);
+        assert!(encode_lod_v1(0, 0, 8, &cells).is_none(), "unsupported resolution");
+        assert!(encode_lod_v1(0, 0, LOD_RES_COARSE, &cells[..15]).is_none());
+        assert!(encode_lod_v1(0, 0, LOD_RES_FINE, &cells).is_none());
+        assert!(encode_lod_v1(0, 0, LOD_RES_COARSE, &[]).is_none());
+        // A fine frame needs exactly 256 cells — neither 16 nor 255 pass.
+        assert!(encode_lod_v1(0, 0, LOD_RES_FINE, &cells_filled(255, 0)).is_none());
+    }
+
+    #[test]
+    fn lod_v1_decode_rejects_malformed_truncated_and_oversized_frames() {
+        let good = encode_lod_v1(3, -4, LOD_RES_COARSE, &cells_filled(16, 70)).unwrap();
+        let rejects = |f: &[u8]| decode_lod_v1_frame(f).is_none();
+        assert!(rejects(&[]));
+        assert!(rejects(&good[..LOD_V1_HEADER - 1]), "truncated header");
+        assert!(rejects(&good[..good.len() - 1]), "truncated last cell");
+        let mut bad = good.clone();
+        bad[0] = b'X';
+        assert!(rejects(&bad), "wrong magic");
+        let mut bad = good.clone();
+        bad[4] = 2;
+        assert!(rejects(&bad), "wrong version");
+        let mut bad = good.clone();
+        bad[5] = 8;
+        assert!(rejects(&bad), "unsupported resolution");
+        let mut bad = good.clone();
+        bad[6] = 15; // count 15 != 4*4
+        assert!(rejects(&bad), "cell count mismatch");
+        let mut bad = good.clone();
+        bad[7] = 1; // count 271 != 16
+        assert!(rejects(&bad), "cell count high byte");
+        let mut bad = good.clone();
+        bad.push(0);
+        assert!(rejects(&bad), "trailing byte");
+        // Count field consistent with resolution but body short: craft a fine
+        // header claiming 256 cells with only a coarse body.
+        let mut bad = encode_lod_v1(0, 0, LOD_RES_FINE, &cells_filled(256, 0)).unwrap();
+        bad.truncate(LOD_V1_HEADER + 10 * LOD_V1_CELL_BYTES);
+        assert!(rejects(&bad), "fine frame truncated mid-body");
+    }
+
+    #[test]
+    fn registered_channels_parses_nul_separated_plugin_names() {
+        let names: Vec<&str> = registered_channels(b"minecraft:register\0megu:lod_v1\0").collect();
+        assert_eq!(names, ["minecraft:register", "megu:lod_v1"]);
+        // Consecutive and leading NULs produce no empty entries.
+        let names: Vec<&str> = registered_channels(b"\0\0a\0\0b\0").collect();
+        assert_eq!(names, ["a", "b"]);
+        assert_eq!(registered_channels(b"").count(), 0);
+        assert_eq!(registered_channels(b"\0\0\0").count(), 0);
+        // Non-UTF-8 entries are skipped, valid neighbours survive.
+        let names: Vec<&str> = registered_channels(b"ok\0\xff\xfe\0also-ok\0").collect();
+        assert_eq!(names, ["ok", "also-ok"]);
+    }
+
+    #[test]
+    fn lod_v1_bucket_bursts_then_refills_at_per_sec_rate() {
+        let base = Instant::now();
+        let mut bucket = LodV1Bucket {
+            tokens: LOD_V1_REQ_BURST,
+            last: base,
+        };
+        for _ in 0..LOD_V1_REQ_BURST {
+            assert!(bucket.take(base), "burst token available");
+        }
+        assert!(!bucket.take(base), "burst exhausted");
+        // 500ms at 8/sec refills 4 tokens.
+        let t = base + Duration::from_millis(500);
+        for _ in 0..4 {
+            assert!(bucket.take(t));
+        }
+        assert!(!bucket.take(t));
+        // `last` advanced by exactly the granted tokens' worth of time, so
+        // sub-token remainders keep accruing: another 500ms grants 4 more.
+        let t2 = t + Duration::from_millis(500);
+        for _ in 0..4 {
+            assert!(bucket.take(t2));
+        }
+        assert!(!bucket.take(t2));
+        // A long idle refills only up to the burst cap.
+        let t3 = t2 + Duration::from_secs(3600);
+        assert!(bucket.take(t3));
+        for _ in 1..LOD_V1_REQ_BURST {
+            assert!(bucket.take(t3));
+        }
+        assert!(!bucket.take(t3), "cap is LOD_V1_REQ_BURST");
+    }
+
+    #[test]
+    fn lod_v1_rate_take_isolates_connections_and_recovers() {
+        let eid = 0x10d01i32;
+        let base = Instant::now();
+        for i in 0..LOD_V1_REQ_BURST {
+            assert!(lod_v1_rate_take(eid, base + Duration::from_millis(i as u64)), "burst {i}");
+        }
+        assert!(!lod_v1_rate_take(eid, base + Duration::from_millis(100)));
+        // One second later the bucket refilled at the per-second rate.
+        let later = base + Duration::from_secs(1);
+        let mut granted = 0;
+        for _ in 0..LOD_V1_REQ_PER_SEC {
+            if lod_v1_rate_take(eid, later) {
+                granted += 1;
+            }
+        }
+        assert_eq!(granted, LOD_V1_REQ_PER_SEC);
+        assert!(!lod_v1_rate_take(eid, later));
+        // Disconnect sweeps the bucket: a reconnect starts with a full burst.
+        lod_v1_forget(eid);
+        for i in 0..LOD_V1_REQ_BURST {
+            assert!(lod_v1_rate_take(eid, later + Duration::from_millis(i as u64)));
+        }
+        lod_v1_forget(eid);
+    }
+
+    // One test owns the shared frame cache end to end: the cap-eviction flood
+    // below would evict the epoch/invalidation entries if they ran in parallel.
+    #[test]
+    fn lod_v1_frame_cache_epoch_invalidation_and_eviction() {
+        let dim = DimId::End; // away from any live worldgen traffic in tests
+        let now = Instant::now();
+        let probe = encode_lod_v1(1, 2, LOD_RES_COARSE, &cells_filled(16, 90)).unwrap();
+        let key = (dim, i32::MAX - 1, i32::MIN + 1, LOD_RES_COARSE);
+        lod_v1_cache_insert(key, 41, &probe, now);
+        assert_eq!(lod_v1_cached(key, 41), Some(probe.clone()));
+        assert_eq!(lod_v1_cached(key, 42), None, "epoch mismatch misses");
+        // Invalidation drops every resolution for that chunk only.
+        let other_res = (dim, key.1, key.2, LOD_RES_FINE);
+        lod_v1_cache_insert(other_res, 41, &probe, now);
+        let neighbour = (dim, key.1 + 1, key.2, LOD_RES_COARSE);
+        lod_v1_cache_insert(neighbour, 41, &probe, now);
+        invalidate_lod_v1_chunk(dim, key.1, key.2);
+        assert_eq!(lod_v1_cached(key, 41), None);
+        assert_eq!(lod_v1_cached(other_res, 41), None);
+        assert_eq!(lod_v1_cached(neighbour, 41), Some(probe.clone()));
+        invalidate_lod_v1_chunk(dim, neighbour.1, neighbour.2);
+
+        // Fill to the cap with strictly increasing timestamps.
+        let frame = encode_lod_v1(0, 0, LOD_RES_COARSE, &cells_filled(16, 1)).unwrap();
+        for i in 0..LOD_V1_CACHE_CAP {
+            let key = (dim, 500_000 + i as i32, 0, LOD_RES_COARSE);
+            lod_v1_cache_insert(key, 1, &frame, now + Duration::from_millis(i as u64));
+        }
+        // One more insert evicts the oldest entry (i = 0) and keeps the cap.
+        let overflow = (dim, 600_000, 0, LOD_RES_COARSE);
+        lod_v1_cache_insert(overflow, 1, &frame, now + Duration::from_secs(1));
+        assert_eq!(lod_v1_cached((dim, 500_000, 0, LOD_RES_COARSE), 1), None);
+        assert!(lod_v1_cached((dim, 500_001, 0, LOD_RES_COARSE), 1).is_some());
+        assert_eq!(lod_v1_cached(overflow, 1), Some(frame.clone()));
+        // Re-inserting an existing key at cap does not evict: the key refreshes.
+        let existing = (dim, 500_001, 0, LOD_RES_COARSE);
+        lod_v1_cache_insert(existing, 2, &frame, now + Duration::from_secs(2));
+        assert_eq!(lod_v1_cached(existing, 2), Some(frame));
+        // Clean up the entries this test owns.
+        for i in 0..LOD_V1_CACHE_CAP {
+            invalidate_lod_v1_chunk(dim, 500_000 + i as i32, 0);
+        }
+        invalidate_lod_v1_chunk(dim, 600_000, 0);
+    }
+}

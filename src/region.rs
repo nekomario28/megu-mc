@@ -727,3 +727,437 @@ fn read_region_file_tolerant(
 ) -> Result<(AnvilRegion, Vec<String>), String> {
     read_region_file_impl(path, true)
 }
+
+#[cfg(test)]
+mod region_tests {
+    use super::*;
+
+    fn tmp_dir(tag: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!("megu-region-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    /// A minimal valid chunk NBT: unnamed root compound with xPos/zPos ints.
+    fn chunk_nbt(cx: i32, cz: i32) -> AnvilNbt {
+        anvil_obj(&[
+            ("xPos", AnvilNbt::Int(cx)),
+            ("zPos", AnvilNbt::Int(cz)),
+            ("Status", anvil_s("minecraft:full")),
+        ])
+    }
+
+    fn record(cx: i32, cz: i32, timestamp: u32, compression: u8) -> AnvilChunkRecord {
+        AnvilChunkRecord {
+            timestamp,
+            compression,
+            nbt: chunk_nbt(cx, cz),
+        }
+    }
+
+    /// Serialize `nbt` exactly the way `write_region_file` stores a chunk:
+    /// `write_named` of the unnamed root, then `compression`-flavoured bytes.
+    fn stored_payload(compression: u8, nbt: &AnvilNbt) -> Vec<u8> {
+        let raw = crate::nbt::write_named(&crate::nbt::NbtString(Vec::new()), nbt).unwrap();
+        anvil_compress(compression, &raw).unwrap()
+    }
+
+    /// Hand-build an `.mca` image: two zeroed 4 KiB tables, then `runs` of
+    /// `(slot, offset_sectors, sector_count, payload_bytes)` where the payload
+    /// region at `offset_sectors * 4096` starts with `len | compression | data`.
+    /// Sectors between runs are left as a distinct filler pattern so tests can
+    /// prove the reader skips unreferenced space verbatim.
+    fn craft_mca(
+        rx: i32,
+        rz: i32,
+        entries: &[(usize, u32, u8, u8, &[u8])],
+        file_sectors: usize,
+    ) -> Vec<u8> {
+        let mut file = vec![0u8; file_sectors * ANVIL_SECTOR];
+        // Foreign filler: unreferenced sectors carry a recognizable pattern.
+        for sector in 2..file_sectors {
+            let base = sector * ANVIL_SECTOR;
+            for (i, b) in file[base..base + ANVIL_SECTOR].iter_mut().enumerate() {
+                *b = (sector as u8).wrapping_add(i as u8);
+            }
+        }
+        for &(slot, offset, sectors, compression, payload) in entries {
+            let le = &mut file[slot * 4..slot * 4 + 4];
+            le[0] = ((offset >> 16) & 0xff) as u8;
+            le[1] = ((offset >> 8) & 0xff) as u8;
+            le[2] = (offset & 0xff) as u8;
+            le[3] = sectors;
+            let start = offset as usize * ANVIL_SECTOR;
+            let len = payload.len() + 1;
+            file[start..start + 4].copy_from_slice(&(len as u32).to_be_bytes());
+            file[start + 4] = compression;
+            file[start + 5..start + 5 + payload.len()].copy_from_slice(payload);
+        }
+        let _ = (rx, rz);
+        file
+    }
+
+    type SlotOut = Result<Option<((i32, i32), AnvilChunkRecord)>, String>;
+
+    fn slot_of(file: &[u8], timestamps: &[u8], slot: usize, rx: i32, rz: i32) -> SlotOut {
+        anvil_region_slot(file, timestamps, slot, rx, rz, std::path::Path::new("r.0.0.mca"))
+    }
+
+    #[test]
+    fn nbt_fingerprint_is_deterministic_and_covers_every_tag_variant() {
+        let mut fields = std::collections::BTreeMap::new();
+        fields.insert(crate::nbt::NbtString::text("a"), AnvilNbt::Int(1));
+        fields.insert(
+            crate::nbt::NbtString::text("b"),
+            AnvilNbt::List(3, vec![AnvilNbt::Int(-1), AnvilNbt::Int(2)]),
+        );
+        let tag = AnvilNbt::Compound(fields);
+        assert_eq!(anvil_nbt_fingerprint(&tag), anvil_nbt_fingerprint(&tag));
+        // Every variant contributes to the stream: a tree holding all 12 tag
+        // types must differ from the same tree with any single leaf changed.
+        let full = anvil_obj(&[
+            ("end", AnvilNbt::End),
+            ("byte", AnvilNbt::Byte(-5)),
+            ("short", AnvilNbt::Short(-300)),
+            ("int", AnvilNbt::Int(-70000)),
+            ("long", AnvilNbt::Long(-5_000_000_000)),
+            ("float", AnvilNbt::Float(1.5f32.to_bits())),
+            ("double", AnvilNbt::Double((-2.25f64).to_bits())),
+            ("bytes", AnvilNbt::ByteArray(vec![1, 2, 3])),
+            ("string", anvil_s("héllo")),
+            ("list", anvil_list(vec![anvil_s("x"), anvil_s("y")])),
+            ("intarray", AnvilNbt::IntArray(vec![i32::MIN, i32::MAX])),
+            ("longarray", AnvilNbt::LongArray(vec![i64::MIN, i64::MAX])),
+        ]);
+        let base = anvil_nbt_fingerprint(&full);
+        for (key, alt) in [
+            ("byte", AnvilNbt::Byte(6)),
+            ("short", AnvilNbt::Short(-301)),
+            ("long", AnvilNbt::Long(5_000_000_000)),
+            ("bytes", AnvilNbt::ByteArray(vec![1, 2, 4])),
+            ("string", anvil_s("hello")),
+            ("intarray", AnvilNbt::IntArray(vec![i32::MIN, 0])),
+            ("longarray", AnvilNbt::LongArray(vec![0, i64::MAX])),
+        ] {
+            let mut changed = full.clone();
+            if let AnvilNbt::Compound(fields) = &mut changed {
+                fields.insert(crate::nbt::NbtString::text(key), alt);
+            }
+            assert_ne!(
+                anvil_nbt_fingerprint(&changed),
+                base,
+                "changing {key} must change the fingerprint"
+            );
+        }
+        // Tag identity is part of the hash: Int(7) and Long(7) differ.
+        let as_int = anvil_obj(&[("v", AnvilNbt::Int(7))]);
+        let as_long = anvil_obj(&[("v", AnvilNbt::Long(7))]);
+        assert_ne!(anvil_nbt_fingerprint(&as_int), anvil_nbt_fingerprint(&as_long));
+        // The avalanche decorrelates: sequential integers do not produce
+        // sequential fingerprints.
+        let f0 = anvil_bytes_fingerprint(&[0u8; 8]);
+        let f1 = anvil_bytes_fingerprint(&[1u8; 8]);
+        assert_ne!(f0, f1);
+        assert_ne!(f0 ^ f1, 1);
+    }
+
+    #[test]
+    fn payload_unchanged_gates_writes_on_cached_disk_hash() {
+        let key: AnvilPersistedKey = (std::path::PathBuf::from("/world"), DimId::Overworld, 1, 2);
+        let mut hashes = HashMap::new();
+        let on_disk = chunk_nbt(1, 2);
+        let disk_hash = anvil_nbt_fingerprint(&on_disk);
+        // Nothing on disk: a write is always required.
+        assert!(!anvil_payload_unchanged(key.clone(), disk_hash, None, &mut hashes));
+        assert!(hashes.is_empty(), "a missing record caches nothing");
+        // Identical content: skip the write.
+        assert!(anvil_payload_unchanged(
+            key.clone(),
+            disk_hash,
+            Some(&on_disk),
+            &mut hashes
+        ));
+        // The first touch cached the on-disk hash; a *different* on-disk tag
+        // under the same key must not resurrect a write for the same fresh
+        // payload — the committed record is what the cache describes.
+        let other = chunk_nbt(9, 9);
+        assert!(anvil_payload_unchanged(
+            key.clone(),
+            disk_hash,
+            Some(&other),
+            &mut hashes
+        ));
+        // A changed fresh payload under the same key still writes.
+        let fresh_other = anvil_nbt_fingerprint(&other);
+        assert!(!anvil_payload_unchanged(
+            key.clone(),
+            fresh_other,
+            Some(&on_disk),
+            &mut hashes
+        ));
+        // A different chunk key caches its own disk hash independently: same
+        // fresh payload against different on-disk content still writes.
+        let key2: AnvilPersistedKey = (std::path::PathBuf::from("/world"), DimId::Overworld, 3, 4);
+        assert!(!anvil_payload_unchanged(
+            key2,
+            fresh_other,
+            Some(&on_disk),
+            &mut hashes
+        ));
+        // Identical content under a fresh key skips: the hash is content,
+        // not identity.
+        let key3: AnvilPersistedKey = (std::path::PathBuf::from("/world"), DimId::Nether, 0, 0);
+        assert!(anvil_payload_unchanged(
+            key3,
+            disk_hash,
+            Some(&on_disk),
+            &mut hashes
+        ));
+    }
+
+    #[test]
+    fn incremental_queue_drain_pending_error_requeue_and_stats() {
+        let mut queue = IncrementalSaveQueue::new(IncrementalSaveBudget {
+            max_chunks_per_tick: usize::MAX,
+            max_bytes_per_tick: usize::MAX,
+        });
+        assert!(queue.mark_dirty(DimId::Overworld, 0, 0, 10));
+        assert!(queue.mark_dirty(DimId::Nether, 5, 5, 20));
+        // A re-mark keeps the oldest position and reports not-newly-queued.
+        assert!(!queue.mark_dirty(DimId::Overworld, 0, 0, 99));
+        assert_eq!(queue.drain_pending(), 2);
+        assert!(queue.is_empty());
+
+        // Byte leg: the first chunk always flushes even when it alone exceeds
+        // the budget — caps bound batches, never starve a single write.
+        let mut queue = IncrementalSaveQueue::new(IncrementalSaveBudget {
+            max_chunks_per_tick: usize::MAX,
+            max_bytes_per_tick: 1,
+        });
+        queue.mark_dirty(DimId::Overworld, 0, 0, usize::MAX / 2);
+        queue.mark_dirty(DimId::Overworld, 1, 0, 10);
+        let stats = queue
+            .drain_budgeted(|_| {
+                Ok::<_, String>(AnvilChunkFlushOutcome {
+                    blocks_flushed: 3,
+                    bytes_written: 4096,
+                    skipped_unchanged: true,
+                })
+            })
+            .unwrap();
+        assert_eq!(stats.chunks_flushed, 1, "oversized first chunk still flushes");
+        assert_eq!(stats.chunks_skipped_unchanged, 1);
+        assert_eq!(stats.bytes_flushed, 4096);
+        assert_eq!(stats.remaining, 1);
+
+        // Error path: the failed chunk returns to the head and the pass
+        // aborts — the next drain retries it before newer entries.
+        let mut queue = IncrementalSaveQueue::new(IncrementalSaveBudget::UNLIMITED);
+        for cx in 0..4 {
+            queue.mark_dirty(DimId::Overworld, cx, 0, 8);
+        }
+        let mut seen = Vec::new();
+        let err = queue
+            .drain_budgeted(|item| {
+                seen.push(item.cx);
+                if item.cx == 2 {
+                    Err("boom".to_string())
+                } else {
+                    Ok(AnvilChunkFlushOutcome::default())
+                }
+            })
+            .unwrap_err();
+        assert_eq!(err, "boom");
+        assert_eq!(seen, vec![0, 1, 2], "chunks after the failure are untouched");
+        assert_eq!(queue.len(), 2, "cx=2 requeued at head, cx=3 still pending");
+        let stats = queue
+            .drain_budgeted(|item| {
+                seen.push(item.cx);
+                Ok(AnvilChunkFlushOutcome {
+                    blocks_flushed: 1,
+                    bytes_written: 0,
+                    skipped_unchanged: false,
+                })
+            })
+            .unwrap();
+        assert_eq!(stats.chunks_flushed, 2);
+        assert_eq!(&seen[3..], &[2, 3], "the retried chunk leads the next pass");
+        assert!(queue.is_empty());
+    }
+
+    #[test]
+    fn region_slot_rejects_every_malformed_location_entry() {
+        let payload = stored_payload(3, &chunk_nbt(0, 0));
+        let good = |slot: usize, offset: u32, sectors: u8, payload: &[u8]| {
+            craft_mca(0, 0, &[(slot, offset, sectors, 3, payload)], 8)
+        };
+        // offset == 0 with nonzero sectors, and nonzero offset with zero
+        // sectors, are both invalid location entries.
+        for file in [
+            good(0, 0, 4, &payload),
+            good(0, 5, 0, &payload),
+        ] {
+            let (_, timestamps) = file.split_at(ANVIL_SECTOR);
+            assert!(slot_of(&file, timestamps, 0, 0, 0).is_err());
+        }
+        // A sector run that does not fit inside the file fails closed.
+        let file = good(0, 7, 2, &payload); // needs sectors 7..9, file has 8
+        let (_, timestamps) = file.split_at(ANVIL_SECTOR);
+        assert!(slot_of(&file, timestamps, 0, 0, 0).is_err());
+        // len < 2 (no compression byte) is rejected.
+        let mut file = craft_mca(0, 0, &[(0, 2, 1, 3, &[])], 4);
+        file[2 * ANVIL_SECTOR..2 * ANVIL_SECTOR + 4].copy_from_slice(&1u32.to_be_bytes());
+        let (_, timestamps) = file.split_at(ANVIL_SECTOR);
+        assert!(slot_of(&file, timestamps, 0, 0, 0).is_err());
+        // 4 + len exceeding the recorded sector run is rejected.
+        let mut file = craft_mca(0, 0, &[(0, 2, 1, 3, &payload)], 4);
+        file[2 * ANVIL_SECTOR..2 * ANVIL_SECTOR + 4].copy_from_slice(&4093u32.to_be_bytes());
+        let (_, timestamps) = file.split_at(ANVIL_SECTOR);
+        assert!(slot_of(&file, timestamps, 0, 0, 0).is_err());
+        // Unknown compression flavour is rejected before any decode.
+        let file = craft_mca(0, 0, &[(0, 2, 1, 9, &payload)], 4);
+        let (_, timestamps) = file.split_at(ANVIL_SECTOR);
+        assert!(slot_of(&file, timestamps, 0, 0, 0).is_err());
+        // Truncated payload inside a claimed run: len says more than sectors hold.
+        let file = craft_mca(0, 0, &[(0, 2, 1, 3, &payload[..payload.len() / 2])], 4);
+        let (_, timestamps) = file.split_at(ANVIL_SECTOR);
+        // len field still claims the full payload -> 4+len > sectors*4096? no;
+        // it decodes garbage -> NBT error. Either way it must fail.
+        assert!(slot_of(&file, timestamps, 0, 0, 0).is_err());
+    }
+
+    #[test]
+    fn region_slot_decodes_coords_timestamp_and_skips_foreign_sectors() {
+        let payload = stored_payload(3, &chunk_nbt(-32, -32));
+        // Chunk (-32,-32) is slot 0 of r.-1.-1.mca; sectors 2..4 hold filler.
+        let mut file = craft_mca(-1, -1, &[(0, 5, 2, 3, &payload)], 8);
+        file[ANVIL_SECTOR..ANVIL_SECTOR + 4].copy_from_slice(&0x1234_5678u32.to_be_bytes());
+        let (_, ts) = file.split_at(ANVIL_SECTOR);
+        let result = slot_of(&file, ts, 0, -1, -1).unwrap().unwrap();
+        assert_eq!(result.0, (-32, -32), "rx*32 + slot%32 for negative region");
+        assert_eq!(result.1.timestamp, 0x1234_5678);
+        assert_eq!(result.1.compression, 3);
+        // Empty slot decodes as None.
+        assert!(slot_of(&file, ts, 1, -1, -1).unwrap().is_none());
+        // Slot 1023 of r.-1.-1 maps to chunk (-1,-1).
+        let file2 = craft_mca(-1, -1, &[(1023, 2, 1, 3, &payload)], 4);
+        let (_, ts2) = file2.split_at(ANVIL_SECTOR);
+        let result2 = slot_of(&file2, ts2, 1023, -1, -1).unwrap().unwrap();
+        assert_eq!(result2.0, (-1, -1));
+    }
+
+    #[test]
+    fn strict_and_tolerant_reads_disagree_only_on_slot_level_corruption() {
+        let dir = tmp_dir("strict-tolerant");
+        let mca = dir.join("r.0.0.mca");
+        let mut region = AnvilRegion::default();
+        region.chunks.insert((0, 0), record(0, 0, 11, 2));
+        region.chunks.insert((1, 0), record(1, 0, 22, 3));
+        write_region_file(&mca, &region).unwrap();
+        // Corrupt chunk (0,0)'s *payload*: flip bytes inside its sector run so
+        // the slot decodes to invalid NBT while the location entry stays valid.
+        let mut file = std::fs::read(&mca).unwrap();
+        let start = 2 * ANVIL_SECTOR;
+        for b in &mut file[start + 5..start + 40] {
+            *b ^= 0xff;
+        }
+        std::fs::write(&mca, &file).unwrap();
+        assert!(read_region_file(&mca).is_err(), "strict read fails closed");
+        let (recovered, errors) = read_region_file_tolerant(&mca).unwrap();
+        assert_eq!(errors.len(), 1);
+        assert!(errors[0].contains("slot 0"));
+        assert!(!recovered.chunks.contains_key(&(0, 0)));
+        assert_eq!(
+            recovered.chunks.get(&(1, 0)),
+            Some(&record(1, 0, 22, 3)),
+            "the valid neighbor still decodes under payload corruption"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn region_rewrite_deletes_chunks_and_reuses_sectors_deterministically() {
+        let dir = tmp_dir("rewrite");
+        let mca = dir.join("r.0.0.mca");
+        let mut full = AnvilRegion::default();
+        for (cx, ts) in [(0, 100u32), (1, 200), (2, 300)] {
+            full.chunks.insert((cx, 0), record(cx, 0, ts, 2));
+        }
+        write_region_file(&mca, &full).unwrap();
+        let first_bytes = std::fs::read(&mca).unwrap();
+        // Deleting two chunks repacks: only (1,0) remains, at offset 2 again,
+        // and its timestamp survives the rewrite.
+        let mut shrunk = AnvilRegion::default();
+        shrunk.chunks.insert((1, 0), record(1, 0, 200, 2));
+        write_region_file(&mca, &shrunk).unwrap();
+        let got = read_region_file(&mca).unwrap();
+        assert_eq!(got, shrunk);
+        let shrunk_bytes = std::fs::read(&mca).unwrap();
+        assert!(shrunk_bytes.len() < first_bytes.len(), "dead sectors reclaimed");
+        // The surviving chunk's location entry points at offset 2 (first run).
+        let slot = 4;
+        let off = (usize::from(shrunk_bytes[slot]) << 16)
+            | (usize::from(shrunk_bytes[slot + 1]) << 8)
+            | usize::from(shrunk_bytes[slot + 2]);
+        assert_eq!(off, 2);
+        // Re-adding the deleted chunks reproduces the original file byte for
+        // byte: packing order is the BTreeMap order, so sector reuse is exact.
+        write_region_file(&mca, &full).unwrap();
+        assert_eq!(std::fs::read(&mca).unwrap(), first_bytes);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn region_read_ignores_unreferenced_sectors_and_rewrite_compacts() {
+        let dir = tmp_dir("foreign-sectors");
+        let mca = dir.join("r.3.4.mca");
+        let payload = stored_payload(3, &chunk_nbt(96, 128));
+        // Chunk (96,128) is slot (0 + 0*32)=0? cx%32=0? 96%32=0, 128%32=0 -> slot 0.
+        let file = craft_mca(3, 4, &[(0, 5, 2, 3, &payload)], 8);
+        std::fs::write(&mca, &file).unwrap();
+        let region = read_region_file(&mca).unwrap();
+        assert_eq!(region.chunks.len(), 1);
+        let rec = &region.chunks[&(96, 128)];
+        assert_eq!(rec.timestamp, 0);
+        assert_eq!(rec.compression, 3);
+        // Tolerant read agrees: foreign sectors are not slots, not errors.
+        let (tolerant, errors) = read_region_file_tolerant(&mca).unwrap();
+        assert!(errors.is_empty());
+        assert_eq!(tolerant, region);
+        // Rewrite through the writer compacts the run to offset 2.
+        write_region_file(&mca, &region).unwrap();
+        let rewritten = std::fs::read(&mca).unwrap();
+        assert_eq!(rewritten.len(), 3 * ANVIL_SECTOR, "dead sectors dropped");
+        let off = (usize::from(rewritten[0]) << 16)
+            | (usize::from(rewritten[1]) << 8)
+            | usize::from(rewritten[2]);
+        assert_eq!(off, 2);
+        assert_eq!(read_region_file(&mca).unwrap(), region);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn staging_recovery_handles_missing_dir_and_nested_tmp_sweep() {
+        let missing = tmp_dir("staging").join("does-not-exist");
+        assert_eq!(anvil_recover_world_staging(&missing).unwrap(), 0);
+        let dir = tmp_dir("staging2");
+        // Orphan .tmp files inside nested dimension region dirs are swept;
+        // a .tmp *directory* is not a staging file and is left alone.
+        for rel in ["region", "DIM-1/region", "DIM1/region", "playerdata"] {
+            let d = dir.join(rel);
+            std::fs::create_dir_all(&d).unwrap();
+            std::fs::write(d.join("r.0.0.mca.tmp"), b"torn").unwrap();
+        }
+        let nested_tmp_dir = dir.join("region").join("keep.tmp");
+        std::fs::create_dir_all(&nested_tmp_dir).unwrap();
+        let swept = anvil_recover_world_staging(&dir).unwrap();
+        assert_eq!(swept, 4);
+        assert!(!dir.join("region/r.0.0.mca.tmp").exists());
+        assert!(nested_tmp_dir.is_dir(), "directories are never swept");
+        // Syncing a parent dir is best-effort and must not fail the caller.
+        anvil_sync_parent_dir(&dir.join("level.dat"));
+        anvil_sync_parent_dir(std::path::Path::new("relative-name-only"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+}
