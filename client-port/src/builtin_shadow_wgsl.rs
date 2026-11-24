@@ -431,6 +431,10 @@ pub struct ShadowUniforms {
     pub sun_color: [f32; 4],
     pub moon_color: [f32; 4],
     pub camera_position: [f32; 4],
+    /// xyz = view forward; w = packed lighting-feature bits
+    /// ([`pack_lighting_feature_flags`]). No built-in WGSL pass reads the
+    /// w lane — every consumer indexes `.xyz` only — so the legacy `0.0`
+    /// keeps both features enabled.
     pub camera_forward: [f32; 4],
     pub camera_right: [f32; 4],
     pub camera_up: [f32; 4],
@@ -448,6 +452,29 @@ impl ShadowUniforms {
         self.shadow_params[3] = layer.min(count.saturating_sub(1)) as f32;
         self
     }
+}
+
+/// `camera_forward.w` bit 0: disables the eye-comfort highlight roll-off
+/// in `MEGU_TERRAIN_LIT_WGSL` (Settings -> Video `comfort_exposure`).
+pub const RENDER_FLAG_DISABLE_COMFORT_EXPOSURE: u32 = 1 << 0;
+/// `camera_forward.w` bit 1: disables the dynamic-light indirect
+/// multi-bounce lobe in `MEGU_TERRAIN_LIT_WGSL` (Settings -> Video
+/// `indirect_light_bounce`).
+pub const RENDER_FLAG_DISABLE_INDIRECT_BOUNCE: u32 = 1 << 1;
+
+/// Pack the two live lighting toggles into the unused
+/// `camera_forward.w` uniform lane. Inverted *disable* bits keep `0.0` —
+/// the legacy value every existing writer already emits — meaning both
+/// features enabled, so golden uniforms and tests stay byte-identical.
+pub fn pack_lighting_feature_flags(comfort_exposure: bool, indirect_light_bounce: bool) -> f32 {
+    let mut bits = 0u32;
+    if !comfort_exposure {
+        bits |= RENDER_FLAG_DISABLE_COMFORT_EXPOSURE;
+    }
+    if !indirect_light_bounce {
+        bits |= RENDER_FLAG_DISABLE_INDIRECT_BOUNCE;
+    }
+    bits as f32
 }
 
 /// The terrain shader's std140-compatible 32-byte point-light record.
@@ -2043,6 +2070,11 @@ fn fs_main(input: TerrainOutput) -> @location(0) vec4<f32> {
                        + entrance_bounce) * ambient_dim,
                       vec3<f32>(0.008, 0.009, 0.014));
     let quality = shadow.render_params.x;
+    // Live Settings -> Video lighting toggles ride the unused
+    // camera_forward.w lane (inverted disable bits: legacy 0 = both on).
+    let feature_bits = u32(max(shadow.camera_forward.w, 0.0) + 0.5);
+    let use_comfort = (feature_bits & 1u) == 0u;
+    let use_bounce = (feature_bits & 2u) == 0u;
     var cloud_shadow = 1.0;
     if (quality >= 2.0) {
         cloud_shadow = cloud_shadow_visibility(
@@ -2135,16 +2167,18 @@ fn fs_main(input: TerrainOutput) -> @location(0) vec4<f32> {
         let radiance = point.color_intensity.xyz * point.color_intensity.w
                        * falloff * inei_boost;
         lantern_light += radiance * wrapped_diffuse;
-        // Indirect multi-bounce lobe: light scattered off neighbouring
-        // surfaces still reaches faces turned away from the emitter, so a
-        // room lit by a held torch never drops to pitch black. The lobe
-        // extends slightly past the direct radius and peaks on back-facing
-        // surfaces while staying far below the direct term on lit faces.
-        let bounce_falloff = pow2(max(1.0 - distance / (radius * 1.15), 0.0));
-        let indirect_bounce = 0.14 * (0.55 + 0.45 * (1.0 - max(dot(normal, L_dir), 0.0)))
-                              * bounce_falloff;
-        lantern_light += point.color_intensity.xyz * point.color_intensity.w
-                         * indirect_bounce * inei_boost;
+        if (use_bounce) {
+            // Indirect multi-bounce lobe: light scattered off neighbouring
+            // surfaces still reaches faces turned away from the emitter, so a
+            // room lit by a held torch never drops to pitch black. The lobe
+            // extends slightly past the direct radius and peaks on back-facing
+            // surfaces while staying far below the direct term on lit faces.
+            let bounce_falloff = pow2(max(1.0 - distance / (radius * 1.15), 0.0));
+            let indirect_bounce = 0.14 * (0.55 + 0.45 * (1.0 - max(dot(normal, L_dir), 0.0)))
+                                  * bounce_falloff;
+            lantern_light += point.color_intensity.xyz * point.color_intensity.w
+                             * indirect_bounce * inei_boost;
+        }
         // A small muted lacquer/aged-wood glint around nearby warm light.
         let half_vector = L_dir + view_dir;
         let half_vec = half_vector / max(length(half_vector), 0.0001);
@@ -2180,12 +2214,18 @@ fn fs_main(input: TerrainOutput) -> @location(0) vec4<f32> {
         color += shadow.sun_color.xyz * sun_temperature * air_tint * shafts;
     }
     if (shadow.render_params.x >= 3.0) {
-        // High keeps its ACES grade but eases it toward the comfort
-        // roll-off so long sessions stay gentle on the eyes.
-        color = mix(comfort_soft_shoulder(color), aces(color), 0.55);
-    } else {
+        if (use_comfort) {
+            // High keeps its ACES grade but eases it toward the comfort
+            // roll-off so long sessions stay gentle on the eyes.
+            color = mix(comfort_soft_shoulder(color), aces(color), 0.55);
+        } else {
+            // Comfort off at High: the raw ACES grade passes through.
+            color = aces(color);
+        }
+    } else if (use_comfort) {
         color = comfort_soft_shoulder(color);
     }
+    // Comfort off below High: linear color passes through untouched.
     return vec4<f32>(pow(max(color, vec3<f32>(0.0)),
                          vec3<f32>(1.0 / 2.2)), 1.0);
 }
@@ -3233,6 +3273,38 @@ mod tests {
             "no new uniform bindings allowed"
         );
         assert!(terrain.contains("array<PointLight, 64>"));
+    }
+
+    #[test]
+    fn lighting_feature_flags_pack_into_inverted_disable_bits() {
+        // 0.0 is the legacy/default value: both features stay enabled.
+        assert_eq!(pack_lighting_feature_flags(true, true), 0.0);
+        assert_eq!(
+            pack_lighting_feature_flags(false, true),
+            RENDER_FLAG_DISABLE_COMFORT_EXPOSURE as f32
+        );
+        assert_eq!(
+            pack_lighting_feature_flags(true, false),
+            RENDER_FLAG_DISABLE_INDIRECT_BOUNCE as f32
+        );
+        assert_eq!(pack_lighting_feature_flags(false, false), 3.0);
+        // The terrain shader decodes the same bits from camera_forward.w.
+        for needle in [
+            "let feature_bits = u32(max(shadow.camera_forward.w, 0.0) + 0.5);",
+            "let use_comfort = (feature_bits & 1u) == 0u;",
+            "let use_bounce = (feature_bits & 2u) == 0u;",
+            "if (use_bounce) {",
+            "color = aces(color);",
+        ] {
+            assert!(MEGU_TERRAIN_LIT_WGSL.contains(needle), "missing {needle}");
+        }
+        // Builders still emit the legacy 0.0 lane: enabled by default.
+        let uniforms = build_shadow_uniforms(
+            ShadowCamera::default(),
+            BuiltinShadowQuality::High.config(),
+            6000,
+        );
+        assert_eq!(uniforms.camera_forward[3], 0.0);
     }
 
     #[test]

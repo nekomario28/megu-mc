@@ -26,7 +26,7 @@ use megu_client_mesh::builtin_shadow_wgsl::{
     RenderScalePreset, ShadowCacheDecision, ShadowCamera, ShadowDirtyReason, ShadowUniforms,
     VfxLightUniforms, build_shadow_uniforms_celestial, compute_cascade_splits,
     compute_region_light_mask, compute_sun_direction, negotiate_builtin_shadow_quality,
-    pack_vfx1_lights,
+    pack_lighting_feature_flags, pack_vfx1_lights,
 };
 use megu_client_mesh::compact_vertex::{
     COMPACT_VERTEX_MAX_EDGE, COMPACT_VERTEX_MAX_STATE_ID, COMPACT_VERTEX_MAX_TINT,
@@ -3581,6 +3581,13 @@ pub struct GpuRenderer {
     /// `clamp(sun.y * 2 + 0.2, 0, 1)` day-brightness curve. Defaults to
     /// full daylight before the first frame encodes.
     entity_light_daylight: f32,
+    /// Settings -> Video `comfort_exposure` toggle — packed into the
+    /// `camera_forward.w` feature lane every `prepare_shadow` so the lit
+    /// terrain shader's roll-off gates live (default on).
+    comfort_exposure: bool,
+    /// Settings -> Video `indirect_light_bounce` toggle — same packed
+    /// lane, gating the dynamic-light multi-bounce lobe (default on).
+    indirect_light_bounce: bool,
     /// Pack-supplied `gbuffers_*` pipelines for Create sub-worlds and
     /// kinetic parts (`None` = built-in `COMPOSITE_LIT_WGSL` path).
     pack_subworld: Option<PackSubworldGpu>,
@@ -4490,6 +4497,20 @@ fn shadow_uniform_bytes(value: &ShadowUniforms) -> Vec<u8> {
     }
     assert_eq!(floats.len() * 4, std::mem::size_of::<ShadowUniforms>());
     bytemuck::cast_slice(&floats).to_vec()
+}
+
+/// Write the packed lighting-feature bits into the `camera_forward.w`
+/// lane. Every built-in WGSL pass reads only `.xyz` of `camera_forward`
+/// (verified across `builtin_shadow_wgsl.rs`), so the lane carries the
+/// Settings -> Video toggles to `MEGU_TERRAIN_LIT_WGSL` with zero
+/// uniform-layout or binding changes; `0.0` keeps both features on.
+fn apply_lighting_feature_flags(
+    uniforms: &mut ShadowUniforms,
+    comfort_exposure: bool,
+    indirect_light_bounce: bool,
+) {
+    uniforms.camera_forward[3] =
+        pack_lighting_feature_flags(comfort_exposure, indirect_light_bounce);
 }
 
 /// Minimal `ShadowUniforms` for the water pass when no shadow preset is
@@ -7340,6 +7361,8 @@ impl GpuRenderer {
             gamma_pct: 100,
             smooth_lighting: true,
             entity_light_daylight: 1.0,
+            comfort_exposure: true,
+            indirect_light_bounce: true,
             pack_subworld: None,
             notice: None,
         }
@@ -8546,6 +8569,24 @@ impl GpuRenderer {
     /// Existing section meshes are re-dirtied by the owning live session.
     pub fn set_smooth_lighting(&mut self, enabled: bool) {
         self.smooth_lighting = enabled;
+    }
+
+    /// Store the Settings -> Video lighting toggles. `prepare_shadow`
+    /// packs them into the shared shadow uniform's `camera_forward.w`
+    /// lane every frame, so flipping either switch gates the
+    /// `MEGU_TERRAIN_LIT_WGSL` comfort roll-off and indirect bounce on
+    /// the next encoded frame. A mid-frame call patches the already
+    /// built frame state so the toggle never waits a frame.
+    pub fn set_lighting_comfort_flags(&mut self, comfort_exposure: bool, indirect_light_bounce: bool) {
+        self.comfort_exposure = comfort_exposure;
+        self.indirect_light_bounce = indirect_light_bounce;
+        if let Some(stable) = self.frame_stable_shadow.as_mut() {
+            apply_lighting_feature_flags(
+                &mut stable.uniforms,
+                comfort_exposure,
+                indirect_light_bounce,
+            );
+        }
     }
 
     /// Return to the built-in shader path after a shaderpack toggle-off.
@@ -11757,6 +11798,16 @@ impl GpuRenderer {
             world_time_ticks,
             ((world_time_ticks / 24_000) % 8) as u8,
         ));
+        // The lighting toggles ride the shared uniform's unused
+        // `camera_forward.w` lane — rewritten every frame so a Settings ->
+        // Video flip gates the lit shader on this frame's encode.
+        if let Some(stable) = self.frame_stable_shadow.as_mut() {
+            apply_lighting_feature_flags(
+                &mut stable.uniforms,
+                self.comfort_exposure,
+                self.indirect_light_bounce,
+            );
+        }
         let valid_camera = camera.position.iter().all(|v| v.is_finite())
             && [
                 camera.yaw_deg,
@@ -13834,6 +13885,41 @@ mod tests {
         assert!(msg.contains("no software rasterizer"), "{msg}");
         assert!(msg.contains("Vulkan/DX12/Metal"), "{msg}");
         assert!(msg.contains("software rasterizer"), "{msg}");
+    }
+
+    /// `set_lighting_comfort_flags`/`prepare_shadow` write their toggles
+    /// through `apply_lighting_feature_flags`: the exact packed bit
+    /// pattern lands in `ShadowUniforms::camera_forward.w` while `.xyz`
+    /// (the real view vector every WGSL pass reads) stays untouched, and
+    /// the legacy `0.0` keeps both features enabled.
+    #[test]
+    fn lighting_comfort_flags_write_packed_bits_into_camera_forward_w() {
+        let mut uniforms = build_shadow_uniforms_celestial(
+            ShadowCamera::default(),
+            BuiltinShadowQuality::High.config(),
+            6000,
+            0,
+            EclipseMode::None,
+        );
+        assert_eq!(uniforms.camera_forward[3], 0.0);
+        let forward_xyz = uniforms.camera_forward[..3].to_vec();
+        for (comfort, bounce, expected) in [
+            (true, true, 0.0),
+            (false, true, 1.0),
+            (true, false, 2.0),
+            (false, false, 3.0),
+        ] {
+            apply_lighting_feature_flags(&mut uniforms, comfort, bounce);
+            assert_eq!(
+                uniforms.camera_forward[3], expected,
+                "comfort {comfort} bounce {bounce}"
+            );
+            assert_eq!(uniforms.camera_forward[..3], forward_xyz);
+            assert_eq!(
+                uniforms.camera_forward[3],
+                pack_lighting_feature_flags(comfort, bounce)
+            );
+        }
     }
 
     /// Only CPU-class adapters trigger the software-fallback warning;

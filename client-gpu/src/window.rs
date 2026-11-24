@@ -4516,6 +4516,14 @@ impl GpuApp {
         }
         let (w, h) = (active.size.width.max(1), active.size.height.max(1));
 
+        // Settings -> Video lighting toggles ride the shared shadow
+        // uniform's `camera_forward.w` lane; refreshing every frame makes
+        // each switch live on the same frame it flips.
+        active.renderer.set_lighting_comfort_flags(
+            self.ui.settings.video.comfort_exposure,
+            self.ui.settings.video.indirect_light_bounce,
+        );
+
         let mut goggles_draw: Option<UiDrawList> = None;
         if let Some(live) = &mut self.live {
             active.renderer.set_player_position(self.camera.position);
