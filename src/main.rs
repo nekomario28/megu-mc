@@ -84,6 +84,83 @@ type BlockPos = (i32, i32, i32);
 fn ow_block(pos: BlockPos) -> DimBlockPos {
     (DimId::Overworld, pos.0, pos.1, pos.2)
 }
+
+#[cfg(test)]
+mod main_wire_subsystem_tests {
+    use super::*;
+
+    #[cfg(feature = "create-offload")]
+    #[test]
+    fn subworld_sync_payload_uses_the_registered_play_channel_and_tick_drains() {
+        let body = subworld_sync_custom_payload(&[1, 2, 3]);
+        let channel_len = body[0] as usize;
+        assert_eq!(&body[1..1 + channel_len], b"megu:subworld_sync_v1");
+        assert_eq!(&body[1 + channel_len..], &[1, 2, 3]);
+        aeronautics_sync_tick();
+    }
+
+    #[test]
+    fn random_tick_dispatch_reaches_player_mechanism_block_ticks() {
+        let _guard = world_guard();
+        let key = (DimId::Overworld, i32::MIN + 31, i32::MIN + 32, i32::MIN + 33);
+        assert!(player_mechanism_random_tick(
+            key.0,
+            key.1,
+            key.2,
+            key.3,
+            "minecraft:suspicious_sand"
+        ));
+        brushable_tick_states()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(&key);
+    }
+
+    #[test]
+    fn spawn_radius_selection_scatter_uses_live_gamerule_radius() {
+        let spawn = [0, 72, 0];
+        let radius = spawn_radius_blocks();
+        let [x, y, z] = resolve_world_spawn_pos(spawn, radius, 0x51_4d_41_49_4e);
+        assert_eq!(y, spawn[1]);
+        assert!((x - spawn[0]).abs() <= radius.max(0));
+        assert!((z - spawn[2]).abs() <= radius.max(0));
+    }
+
+    #[test]
+    fn snowball_hit_damages_blazes_and_knocks_back_other_mobs() {
+        let _guard = world_guard();
+        let mut spawned = Vec::new();
+        for (etype, hp) in [(8, 20.0), (22, 20.0)] {
+            let mob = Arc::new(Mob {
+                dim: DimId::Overworld,
+                eid: NEXT_EID.fetch_add(1, Ordering::SeqCst),
+                uuid: [0; 16],
+                etype,
+                pos: Mutex::new((10.0, 72.0, 10.0, 0.0, 0.0)),
+                hp: Mutex::new(hp),
+                last_hit: Mutex::new(Instant::now()),
+                hurt_at: Mutex::new(Instant::now()),
+                last_hurt_tick: Mutex::new(None),
+                fuse: Mutex::new(0),
+                fire_ticks: Mutex::new(0),
+                love: Mutex::new(0),
+                air: Mutex::new(300),
+                vel: Mutex::new([0.0; 3]),
+            });
+            spawned.push(mob.clone());
+            mobs().lock().unwrap_or_else(|e| e.into_inner()).push(mob);
+        }
+        assert!(snowball_hit_mob(DimId::Overworld, spawned[0].eid, 1.0, 0.0));
+        assert_eq!(*spawned[0].hp.lock().unwrap_or_else(|e| e.into_inner()), 17.0);
+        assert!(snowball_hit_mob(DimId::Overworld, spawned[1].eid, 1.0, 0.0));
+        assert_eq!(*spawned[1].hp.lock().unwrap_or_else(|e| e.into_inner()), 20.0);
+        assert!(spawned[1].pos.lock().unwrap_or_else(|e| e.into_inner()).0 > 10.0);
+        mobs()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .retain(|mob| !spawned.iter().any(|spawned| spawned.eid == mob.eid));
+    }
+}
 /// A chunk column, for the maps keyed by chunk rather than by block.
 #[cfg(test)]
 type ChunkKey = (i32, i32);
@@ -1541,33 +1618,8 @@ fn environment_time_tick() {
                 mobs().lock().unwrap_or_else(|e| e.into_inner()).push(m);
             }
             if let Some(meid) = hit {
-                broadcast_seen(meid, |_c| (0x24, hurt_anim(meid)));
-                // vanilla: snowball/egg deal 0 damage but knock the target
-                // along the throw direction (~0.5 blocks + velocity)
-                let kl = (pdx * pdx + pdz * pdz).sqrt().max(0.01);
-                let (kx, kz) = (pdx / kl * 0.5, pdz / kl * 0.5);
-                if let Some(m) = mobs()
-                    .lock()
-                    .unwrap()
-                    .iter()
-                    .find(|m| m.eid == meid)
-                    .cloned()
-                {
-                    let (nx, ny, nz, yaw, pitch) = {
-                        let mut p = m.pos.lock().unwrap_or_else(|e| e.into_inner());
-                        p.0 += kx;
-                        p.2 += kz;
-                        *p
-                    };
-                    broadcast_seen(meid, |_c| {
-                        (
-                            0x5a,
-                            velocity_pkt(meid, (kx * 6400.0) as i16, 1600, (kz * 6400.0) as i16),
-                        )
-                    });
-                    broadcast_seen(meid, |_c| {
-                        (0x70, entity_teleport(meid, nx, ny, nz, yaw, pitch, true))
-                    });
+                if !snowball_hit_mob(dim, meid, pdx, pdz) {
+                    broadcast_seen(meid, |_c| (0x24, hurt_anim(meid)));
                 }
             }
         }
@@ -3863,6 +3915,7 @@ struct LiveMobProjectile {
     eid: i32,
     owner: i32,
     dim: DimId,
+    snowball: bool,
     kind: MobProjectileKind,
     pos: [f64; 3],
     velocity: [f64; 3],
@@ -3872,6 +3925,9 @@ struct LiveMobProjectile {
 
 impl LiveMobProjectile {
     fn entity_type(self) -> i64 {
+        if self.snowball {
+            return 97;
+        }
         let name = match self.kind {
             MobProjectileKind::SmallFireball => "small_fireball",
             MobProjectileKind::GhastFireball => "fireball",
@@ -3921,6 +3977,9 @@ fn live_mob_projectile_impact(
     hit: Option<&LiveMobPlayer<'_>>,
     players: &[LiveMobPlayer<'_>],
 ) {
+    if projectile.snowball {
+        return;
+    }
     use MobProjectileKind::*;
     match projectile.kind {
         SmallFireball => {
@@ -4054,6 +4113,24 @@ fn tick_live_mob_projectiles(reg: &crate::block_registry::BReg, players: &[LiveM
         let next = std::array::from_fn(|i| pos[i] + projectile.velocity[i]);
         let block = live_mob_block_hit(dim, reg, pos, next);
         let end = block.unwrap_or(next);
+        let snowball = projectile.snowball;
+        if snowball {
+            let target = {
+                let mobs = mobs().lock().unwrap_or_else(|e| e.into_inner());
+                mobs.iter()
+                    .filter(|mob| mob.dim == dim && mob.eid != projectile.owner)
+                    .find_map(|mob| {
+                        let (x, y, z, ..) = *mob.pos.lock().unwrap_or_else(|e| e.into_inner());
+                        let bounds = Aabb::new([x - 0.3, y - 0.1, z - 0.3], [x + 0.3, y + 1.8, z + 0.3]);
+                        bounds.clip(pos, end).map(|_| mob.eid)
+                    })
+            };
+            if let Some(target) = target {
+                let _ = snowball_hit_mob(dim, target, projectile.velocity[0], projectile.velocity[2]);
+                broadcast_seen_destroy(eid);
+                return false;
+            }
+        }
         let distance = |point| {
             let d = mob_behavior_delta(pos, point);
             mob_behavior_dot(d, d)
@@ -4090,7 +4167,9 @@ fn tick_live_mob_projectiles(reg: &crate::block_registry::BReg, players: &[LiveM
             live_mob_projectile_impact(*projectile, point, None, players);
         } else {
             projectile.pos = next;
-            if matches!(projectile.kind, MobProjectileKind::WitchSplash(_)) {
+            if snowball {
+                projectile.velocity[1] -= 0.03;
+            } else if matches!(projectile.kind, MobProjectileKind::WitchSplash(_)) {
                 projectile.velocity[1] -= 0.05;
             }
             let [x, y, z] = next;
@@ -4311,6 +4390,7 @@ fn apply_live_mob_effects(
                         eid: NEXT_EID.fetch_add(1, Ordering::SeqCst),
                         owner: mob.eid,
                         dim,
+                        snowball: false,
                         kind,
                         pos: origin,
                         velocity: dir.map(|axis| axis * speed),
@@ -5460,7 +5540,100 @@ fn mob_tick() {
                 );
             }
         }
+        mob_fire_and_persistence_tick();
     });
+}
+
+fn mob_fire_and_persistence_tick() {
+    let live = mobs().lock().unwrap_or_else(|e| e.into_inner()).clone();
+    let mut tick_mobs: Vec<Mob> = live
+        .iter()
+        .map(|mob| Mob {
+            dim: mob.dim,
+            eid: mob.eid,
+            uuid: mob.uuid,
+            etype: mob.etype,
+            pos: Mutex::new(*mob.pos.lock().unwrap_or_else(|e| e.into_inner())),
+            hp: Mutex::new(*mob.hp.lock().unwrap_or_else(|e| e.into_inner())),
+            last_hit: Mutex::new(*mob.last_hit.lock().unwrap_or_else(|e| e.into_inner())),
+            hurt_at: Mutex::new(*mob.hurt_at.lock().unwrap_or_else(|e| e.into_inner())),
+            last_hurt_tick: Mutex::new(
+                *mob.last_hurt_tick.lock().unwrap_or_else(|e| e.into_inner()),
+            ),
+            fuse: Mutex::new(*mob.fuse.lock().unwrap_or_else(|e| e.into_inner())),
+            fire_ticks: Mutex::new(*mob.fire_ticks.lock().unwrap_or_else(|e| e.into_inner())),
+            love: Mutex::new(*mob.love.lock().unwrap_or_else(|e| e.into_inner())),
+            air: Mutex::new(*mob.air.lock().unwrap_or_else(|e| e.into_inner())),
+            vel: Mutex::new(*mob.vel.lock().unwrap_or_else(|e| e.into_inner())),
+        })
+        .collect();
+    let candidates: Vec<_> = drops()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .iter()
+        .filter_map(|item| {
+            Some(DroppedItemCandidate {
+                item_eid: item.eid,
+                item_id: i32::try_from(item.item).ok()?,
+                dim: DimId::Overworld,
+                x: item.x,
+                y: item.y,
+                z: item.z,
+            })
+        })
+        .collect();
+    let outcome = mob_fire_and_persistence_tick_step(
+        &mut tick_mobs,
+        &candidates,
+        TICK_IDX.load(Ordering::Relaxed),
+        |mob| {
+            let (x, y, z, ..) = *mob.pos.lock().unwrap_or_else(|e| e.into_inner());
+            mob_in_water(mob.etype, x, y, z)
+                || (mob.dim == DimId::Overworld
+                    && RAINING.load(Ordering::Relaxed) != 0
+                    && y.floor() as i32 + 1 >= height_at(x.floor() as i32, z.floor() as i32))
+        },
+    );
+    for eid in outcome.fire_damaged {
+        let mob = live.iter().find(|mob| mob.eid == eid);
+        let Some(mob) = mob else { continue };
+        let hp = {
+            let mut hp = mob.hp.lock().unwrap_or_else(|e| e.into_inner());
+            *hp = (*hp - 1.0).max(0.0);
+            *hp
+        };
+        *mob.hurt_at.lock().unwrap_or_else(|e| e.into_inner()) = Instant::now();
+        *mob.last_hurt_tick.lock().unwrap_or_else(|e| e.into_inner()) =
+            Some(TICK_IDX.load(Ordering::Relaxed));
+        broadcast_seen(eid, |_| (0x24, hurt_anim(eid)));
+        if hp <= 0.0 && remove_live_mob(eid).is_some() {
+            let (x, y, z, ..) = *mob.pos.lock().unwrap_or_else(|e| e.into_inner());
+            mob_env_die(eid, mob.etype, x, y, z, true);
+            broadcast_seen_destroy(eid);
+        }
+    }
+    if !outcome.pickups.is_empty() {
+        let removed: HashSet<_> = outcome.pickups.iter().map(|pickup| pickup.item_eid).collect();
+        let mut world_drops = drops().lock().unwrap_or_else(|e| e.into_inner());
+        world_drops.retain(|item| !removed.contains(&item.eid));
+        drop(world_drops);
+        for eid in removed {
+            broadcast_seen_destroy(eid);
+        }
+        for pickup in outcome.pickups {
+            if let Some(item) = mob_picked_up_items()
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .get(&pickup.mob_eid)
+                .copied()
+            {
+                let mut equipment = EntityEquipment::default();
+                equipment.set(EquipmentSlot::MainHand, (i64::from(item), 1, Vec::new()));
+                let packet = encode_set_equipment(pickup.mob_eid, &equipment);
+                broadcast_seen(pickup.mob_eid, move |_| (0x5b, packet.clone()));
+            }
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -6249,6 +6422,29 @@ fn live_mob_tick_dimension(
                 profile.navigation.next_waypoint(&world).map(|p| p.1),
             )
         });
+        if let Some(RangedProjectileAction::Snowball { velocity, .. }) = result.ranged_attack {
+            let eid = NEXT_EID.fetch_add(1, Ordering::SeqCst);
+            let (x, y, z) = (pos[0], pos[1] + 1.6, pos[2]);
+            let (vx, vy, vz) = velocity;
+            let projectile = LiveMobProjectile {
+                eid,
+                owner: m.eid,
+                dim,
+                snowball: true,
+                kind: MobProjectileKind::WitchSplash(WitchPotion::WaterBreathing),
+                pos: [x, y, z],
+                velocity: [vx, vy, vz],
+                power: 0.0,
+                age: 0,
+            };
+            live_mob_projectiles()
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .push(projectile);
+            if let Some((_, packet)) = live_mob_projectile_packets(projectile).first() {
+                broadcast_entity_spawn_to_dim(dim, eid, packet);
+            }
+        }
         if m.etype == 23 {
             // Water must not clear an already-active fuse.
             let swell = result.swell.unwrap_or(false)
@@ -9563,6 +9759,14 @@ fn random_tick_pass() {
                         continue;
                     };
                     let z = cz * 16 + world_rng::next_below(16) as i32;
+                    let state = block_at_cached_dim(dim, x, y, z);
+                    let block_name = reg.name_of(state);
+                    if player_mechanism_random_tick(dim, x, y, z, block_name) {
+                        // This dispatcher owns leaves as well as copper, coral,
+                        // and brushable blocks. Its block mutations already
+                        // stage the dimension-aware block update.
+                        continue;
+                    }
                     if dim == DimId::Overworld {
                         on_random_tick(reg, x, y, z);
                     } else {
@@ -9574,10 +9778,85 @@ fn random_tick_pass() {
     }
 }
 
+fn player_mechanism_random_tick(
+    dim: DimId,
+    x: i32,
+    y: i32,
+    z: i32,
+    block_name: &str,
+) -> bool {
+    player_mechanisms_random_block_tick(
+        dim,
+        x,
+        y,
+        z,
+        block_name,
+        &mut || world_rng::next_below(1_000_000) as f32 / 1_000_000.0,
+    )
+    .is_some()
+}
+
 fn fox_mouth_set_equipment_packet(eid: i32, held: &Stack) -> Vec<u8> {
     let mut equipment = EntityEquipment::default();
     equipment.set(EquipmentSlot::MainHand, held.clone());
     encode_set_equipment(eid, &equipment)
+}
+
+fn broadcast_entity_spawn_to_dim(dim: DimId, eid: i32, packet: &[u8]) {
+    for client in client_snapshot() {
+        if *client.dim.lock().unwrap_or_else(|e| e.into_inner()) != dim {
+            continue;
+        }
+        client
+            .seen
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(eid);
+        if let Ok(mut socket) = client.sock.lock() {
+            let _ = send_packet(&mut socket, 0x01, packet.to_vec());
+        }
+    }
+}
+
+fn snowball_hit_mob(dim: DimId, eid: i32, dx: f64, dz: f64) -> bool {
+    let target = mobs()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .iter()
+        .find(|mob| mob.eid == eid && mob.dim == dim)
+        .cloned();
+    let Some(target) = target else { return false };
+    let kind = entity_spec_by_id(target.etype).map_or("", |spec| spec.name);
+    let (damage, knockback) = snowball_hit_effect(kind);
+    let hp = {
+        let mut hp = target.hp.lock().unwrap_or_else(|e| e.into_inner());
+        *hp = (*hp - damage).max(0.0);
+        *hp
+    };
+    *target.hurt_at.lock().unwrap_or_else(|e| e.into_inner()) = Instant::now();
+    *target.last_hurt_tick.lock().unwrap_or_else(|e| e.into_inner()) =
+        Some(TICK_IDX.load(Ordering::Relaxed));
+    broadcast_seen(eid, |_| (0x24, hurt_anim(eid)));
+    if knockback {
+        let length = (dx * dx + dz * dz).sqrt().max(0.01);
+        let (kx, kz) = (dx / length * 0.5, dz / length * 0.5);
+        let (x, y, z, yaw, pitch) = {
+            let mut pos = target.pos.lock().unwrap_or_else(|e| e.into_inner());
+            pos.0 += kx;
+            pos.2 += kz;
+            *pos
+        };
+        broadcast_seen(eid, |_| {
+            (0x5a, velocity_pkt(eid, (kx * 6400.0) as i16, 1600, (kz * 6400.0) as i16))
+        });
+        broadcast_seen(eid, |_| (0x70, entity_teleport(eid, x, y, z, yaw, pitch, true)));
+    }
+    if hp <= 0.0 && remove_live_mob(eid).is_some() {
+        let (x, y, z, ..) = *target.pos.lock().unwrap_or_else(|e| e.into_inner());
+        mob_env_die(eid, target.etype, x, y, z, false);
+        broadcast_seen_destroy(eid);
+    }
+    true
 }
 
 /// Fox pickup is owned by the utility-mob lane. This post-mob-tick bridge
@@ -20166,6 +20445,29 @@ fn block_entity_field_uuid(field: &Tag) -> Option<BlockEntityUuid> {
     block_entity_uuid(field)
 }
 
+#[cfg(feature = "create-offload")]
+fn subworld_sync_custom_payload(payload: &[u8]) -> Vec<u8> {
+    let mut body = Vec::with_capacity(payload.len() + 24);
+    write_str(&mut body, "megu:subworld_sync_v1");
+    body.extend_from_slice(payload);
+    body
+}
+
+#[cfg(feature = "create-offload")]
+fn aeronautics_sync_tick() {
+    for (dim, payload) in aeronautics_bridge_step_and_drain_sync_frames(0.05) {
+        let body = subworld_sync_custom_payload(&payload);
+        for client in client_snapshot()
+            .iter()
+            .filter(|client| *client.dim.lock().unwrap_or_else(|e| e.into_inner()) == dim)
+        {
+            if let Ok(mut socket) = client.sock.lock() {
+                let _ = send_packet(&mut socket, 0x19, body.clone());
+            }
+        }
+    }
+}
+
 fn game_tick(mut step: impl FnMut(&'static str, fn())) {
     // §5.2③: drain leftover coalesced WAL frames even when this tick is
     // frozen, so `/tick freeze` (or a skipped tick) cannot strand journaled
@@ -20232,6 +20534,8 @@ fn game_tick(mut step: impl FnMut(&'static str, fn())) {
     run("vehicles", w1_vehicle_tick);
     run("falling", falling_tick);
     run("mobs", mob_tick);
+    #[cfg(feature = "create-offload")]
+    run("aeronautics_sync", aeronautics_sync_tick);
     run("fox_mouth_equipment", fox_mouth_equipment_tick);
     // `Leashable.tickLeash` runs inside `Entity.tick`; an empty tether table
     // makes the stage a one-lock no-op.
@@ -20258,6 +20562,8 @@ fn game_tick(mut step: impl FnMut(&'static str, fn())) {
     run("player_menus", stage_player_menus);
     run("plugins", plugin_tick);
     run("actors", actor_tick);
+    #[cfg(feature = "mod-suite")]
+    run("live_cap_bus", live_cap_bus_step);
     #[cfg(feature = "neoforge-events")]
     run("neoforge_player_tick", neoforge_player_tick);
     run("block_updates", apply_queued_block_updates);
