@@ -2504,15 +2504,15 @@ fn live_anvil_save_dir(dir: &std::path::Path) -> Result<AnvilSaveSummary, String
         std::fs::create_dir_all(&region_dir)
             .map_err(|e| format!("cannot create {}: {e}", region_dir.display()))?;
         let region_path = region_dir.join(format!("r.{rx}.{rz}.mca"));
-        // Merge, never blindly overwrite: a region file that exists keeps its
+        // Merge, never blindly overwrite: an existing region file keeps its
         // untouched chunks; one that fails to read aborts the save outright —
-        // a partial file must never replace a good one.
-        let mut region = if region_path.is_file() {
-            read_region_file(&region_path)?
-        } else {
-            AnvilRegion::default()
-        };
-        let mut region_dirty = false;
+        // a partial file must never replace a good one. Only the dirty slots are
+        // decoded for the hash compare; every other slot is copied as its raw
+        // sector run by the updater, so a one-chunk edit no longer pays the
+        // 1,024-slot inflate/NBT/deflate cost.
+        let wanted: HashSet<(i32, i32)> = chunks.iter().copied().collect();
+        let (existing, on_disk) = read_region_file_selected(&region_path, &wanted)?;
+        let mut updates: HashMap<(i32, i32), AnvilChunkRecord> = HashMap::new();
         let mut committed_hashes: Vec<(AnvilPersistedKey, u64)> = Vec::new();
         for (cx, cz) in chunks {
             let overlay = snapshot
@@ -2539,13 +2539,13 @@ fn live_anvil_save_dir(dir: &std::path::Path) -> Result<AnvilSaveSummary, String
             if anvil_payload_unchanged(
                 key.clone(),
                 fresh_hash,
-                region.chunks.get(&(cx, cz)).map(|record| &record.nbt),
+                on_disk.get(&(cx, cz)).map(|record| &record.nbt),
                 &mut hashes,
             ) {
                 summary.skipped_unchanged_writes += 1;
                 continue;
             }
-            region.chunks.insert(
+            updates.insert(
                 (cx, cz),
                 AnvilChunkRecord {
                     timestamp,
@@ -2555,10 +2555,9 @@ fn live_anvil_save_dir(dir: &std::path::Path) -> Result<AnvilSaveSummary, String
             );
             committed_hashes.push((key, fresh_hash));
             summary.chunks_written += 1;
-            region_dirty = true;
         }
-        if region_dirty {
-            write_region_file(&region_path, &region)?;
+        if !updates.is_empty() {
+            update_region_file_raw_with_existing(&region_path, &updates, existing.as_deref())?;
             summary.region_files += 1;
             summary.region_bytes_written = summary
                 .region_bytes_written
@@ -2920,12 +2919,10 @@ fn flush_single_chunk_to_anvil_dir_outcome(
     ));
     // Merge, never blindly overwrite: an existing region file keeps its other
     // chunks; one that fails to read aborts the flush outright — a partial file
-    // must never replace a good one.
-    let mut region = if region_path.is_file() {
-        read_region_file(&region_path)?
-    } else {
-        AnvilRegion::default()
-    };
+    // must never replace a good one. Only this chunk's slot is decoded for the
+    // hash compare; every other slot is copied as its raw sector run.
+    let wanted = HashSet::from([(cx, cz)]);
+    let (existing, on_disk) = read_region_file_selected(&region_path, &wanted)?;
     let overlay = world()
         .get_cloned(&(dim, cx, cz))
         .unwrap_or_default();
@@ -2955,14 +2952,15 @@ fn flush_single_chunk_to_anvil_dir_outcome(
         if anvil_payload_unchanged(
             key.clone(),
             fresh_hash,
-            region.chunks.get(&(cx, cz)).map(|record| &record.nbt),
+            on_disk.get(&(cx, cz)).map(|record| &record.nbt),
             &mut hashes,
         ) {
             outcome.skipped_unchanged = true;
             return Ok(outcome);
         }
         let timestamp = (border_now_ms() / 1000).min(u64::from(u32::MAX)) as u32;
-        region.chunks.insert(
+        let mut updates = HashMap::new();
+        updates.insert(
             (cx, cz),
             AnvilChunkRecord {
                 timestamp,
@@ -2970,7 +2968,7 @@ fn flush_single_chunk_to_anvil_dir_outcome(
                 nbt: fresh_nbt,
             },
         );
-        write_region_file(&region_path, &region)?;
+        update_region_file_raw_with_existing(&region_path, &updates, existing.as_deref())?;
         outcome.bytes_written = anvil_file_len(&region_path);
         hashes.insert(key, fresh_hash);
     }
@@ -4925,6 +4923,81 @@ mod anvil_bit_packing_tests {
             anvil_nbt_fingerprint(&tag),
             anvil_fingerprint_final(ref_fnv1a(&stream)),
         );
+    }
+}
+
+#[cfg(test)]
+mod anvil_raw_region_tests {
+    use super::*;
+
+    fn raw_tmp_dir(tag: &str) -> std::path::PathBuf {
+        static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let dir = std::env::temp_dir().join(format!(
+            "megu-anvil-raw-{tag}-{}-{}",
+            std::process::id(),
+            SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    fn raw_chunk_nbt(marker: i32) -> AnvilNbt {
+        anvil_obj(&[("marker", AnvilNbt::Int(marker))])
+    }
+
+    #[test]
+    fn raw_region_update_copies_untouched_chunk_sectors_verbatim() {
+        let dir = raw_tmp_dir("update");
+        let region_path = dir.join("r.0.0.mca");
+        let mut region = AnvilRegion::default();
+        for (cx, timestamp) in [(0, 11), (1, 22), (2, 33)] {
+            region.chunks.insert(
+                (cx, 0),
+                AnvilChunkRecord {
+                    timestamp,
+                    compression: 2,
+                    nbt: raw_chunk_nbt(cx * 10),
+                },
+            );
+        }
+        write_region_file(&region_path, &region).unwrap();
+        let before = std::fs::read(&region_path).unwrap();
+        let run = |bytes: &[u8], cx: i32| {
+            let slot = (cx & 31) as usize;
+            let (_offset, sectors, start) = anvil_region_run(bytes, slot, &region_path)
+                .unwrap()
+                .expect("populated slot");
+            bytes[start..start + sectors * ANVIL_SECTOR].to_vec()
+        };
+        let untouched = [(0, run(&before, 0)), (2, run(&before, 2))];
+
+        let updates = HashMap::from([(
+            (1, 0),
+            AnvilChunkRecord {
+                timestamp: 44,
+                compression: 2,
+                nbt: raw_chunk_nbt(70),
+            },
+        )]);
+        let (existing, on_disk) =
+            read_region_file_selected(&region_path, &HashSet::from([(1, 0)])).unwrap();
+        assert!(on_disk.contains_key(&(1, 0)));
+        update_region_file_raw_with_existing(&region_path, &updates, existing.as_deref())
+            .unwrap();
+
+        let after = std::fs::read(&region_path).unwrap();
+        for (cx, expected) in untouched {
+            assert_eq!(run(&after, cx), expected, "chunk ({cx}, 0) raw run changed");
+        }
+        let decoded = read_region_file(&region_path).unwrap();
+        let updated = decoded.chunks.get(&(1, 0)).unwrap();
+        assert_eq!(updated.timestamp, 44);
+        assert_eq!(updated.nbt.get("marker"), Some(&AnvilNbt::Int(70)));
+        assert_eq!(decoded.chunks[&(0, 0)].timestamp, 11);
+        assert_eq!(decoded.chunks[&(2, 0)].timestamp, 33);
+        assert!(!dir.join("r.0.0.mca.tmp").exists());
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
 

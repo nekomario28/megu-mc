@@ -1351,28 +1351,72 @@ fn world_save_dir() -> std::path::PathBuf {
         .map_or_else(std::path::PathBuf::new, std::path::Path::to_path_buf)
 }
 
+/// Serialized chunk tables for a set of dimensions, captured from one whole-map
+/// read. `bytes` is the complete overlay payload (`count` plus every record);
+/// `count` is kept beside it so callers can keep the "empty dimension writes no
+/// file" rule without reparsing the varint.
+struct WorldChunkTables {
+    tables: HashMap<DimId, (usize, Vec<u8>)>,
+}
+
+impl WorldChunkTables {
+    /// Partition every requested dimension out of one `world().read_all()` pass.
+    /// The shard guards are held only while the overlay bytes are encoded; every
+    /// other save registry is read after they are released.
+    fn capture(dims: &[DimId]) -> Self {
+        let w = world().read_all();
+        let mut tables: HashMap<DimId, (usize, Vec<u8>)> = HashMap::with_capacity(dims.len());
+        for &dim in dims {
+            tables.entry(dim).or_insert((0, Vec::new()));
+        }
+        for (key, c) in w.iter() {
+            let Some((count, body)) = tables.get_mut(&key.0) else {
+                continue;
+            };
+            *count += 1;
+            let (_, cx, cz) = *key;
+            body.extend_from_slice(&cx.to_be_bytes());
+            body.extend_from_slice(&cz.to_be_bytes());
+            megu_core::varint::write_varlong_i64(c.len() as i64, &mut *body);
+            for (&idx, &st) in c.iter() {
+                body.extend_from_slice(&idx.to_be_bytes());
+                megu_core::varint::write_varlong_i64(st as i64, &mut *body);
+            }
+        }
+        drop(w);
+        for (count, body) in tables.values_mut() {
+            let mut framed = Vec::with_capacity(body.len() + 8);
+            megu_core::varint::write_varlong_i64(*count as i64, &mut framed);
+            framed.extend_from_slice(body);
+            *body = framed;
+        }
+        Self { tables }
+    }
+
+    /// The serialized table, or the one-byte zero count an empty dimension has
+    /// always written. The slice is only borrowed for the immediate append.
+    fn bytes(&self, dim: DimId) -> &[u8] {
+        self.tables
+            .get(&dim)
+            .map_or(&[0u8][..], |(_, bytes)| bytes.as_slice())
+    }
+
+    fn take(&mut self, dim: DimId) -> Option<(usize, Vec<u8>)> {
+        self.tables.remove(&dim)
+    }
+}
+
 /// One dimension's overlay, as a save payload: `count`, then per chunk `cx, cz, count` and its
 /// `idx, state` pairs. Returns how many chunks the table holds (0 = this dimension has no edits).
 ///
 /// There is deliberately one writer for both the legacy file's leading table and a companion
 /// file, and one reader for both, so "the Overworld's table" and "the same format for another
 /// dimension" cannot drift into two formats.
+#[allow(dead_code)]
 fn save_dim_overlay_into(dim: DimId, f: &mut Vec<u8>) -> usize {
-    let w = world().read_all();
-    let chunks: Vec<(&DimChunkKey, &HashMap<u32, u32>)> =
-        w.iter().filter(|(key, _)| key.0 == dim).collect();
-    let count = chunks.len();
-    megu_core::varint::write_varlong_i64(count as i64, &mut *f);
-    for (key, c) in chunks {
-        let (_, cx, cz) = *key;
-        (*f).extend_from_slice(&cx.to_be_bytes());
-        (*f).extend_from_slice(&cz.to_be_bytes());
-        megu_core::varint::write_varlong_i64(c.len() as i64, &mut *f);
-        for (&idx, &st) in c.iter() {
-            (*f).extend_from_slice(&idx.to_be_bytes());
-            megu_core::varint::write_varlong_i64(st as i64, &mut *f);
-        }
-    }
+    let mut tables = WorldChunkTables::capture(&[dim]);
+    let (count, bytes) = tables.take(dim).unwrap_or((0, vec![0u8]));
+    f.extend_from_slice(&bytes);
     count
 }
 
@@ -1838,9 +1882,11 @@ fn save_world_guarded(
     }
 }
 
+type WorldCompanionSlots = [(DimId, Option<Vec<u8>>); 2];
+
 struct WorldSaveSnapshot {
     overworld: Vec<u8>,
-    companions: [(DimId, Option<Vec<u8>>); 2],
+    companions: WorldCompanionSlots,
     /// `create_factory.bin` bytes when the live Create runtime is armed
     /// (`mod-suite`); `None` in every other build — no file is touched then.
     create_factory: Option<Vec<u8>>,
@@ -1849,12 +1895,8 @@ struct WorldSaveSnapshot {
 impl WorldSaveSnapshot {
     fn capture() -> Self {
         let mut overworld = Vec::new();
-        save_world_into(&mut overworld);
-        let companions = [DimId::Nether, DimId::End].map(|dim| {
-            let mut payload = Vec::new();
-            let count = save_dim_overlay_into(dim, &mut payload);
-            (dim, (count != 0).then_some(payload))
-        });
+        let mut companions: WorldCompanionSlots = [(DimId::Nether, None), (DimId::End, None)];
+        save_world_into_impl(&mut overworld, Some(&mut companions));
         Self {
             overworld,
             companions,
@@ -1962,9 +2004,219 @@ fn write_world_file(
         )
     })
 }
+
+// ---------- multi-file save batches ----------
+//
+// `AsyncSaveWorker` owns one coalescing slot for the protected Overworld file.
+// Companion dimensions need the same off-tick durability (`.bak` rotation,
+// fsync, atomic rename) without queueing unboundedly behind a slow disk, so the
+// batch path below keeps the same single-pending-slot discipline for a whole
+// `(path, bytes)` set. `submit_batch`/`submit_all` are the OPT-S4 wiring
+// surface; `submit`/`flush` keep their existing single-file meaning.
+
+#[allow(dead_code)]
+enum SaveBatchOp {
+    Write { path: std::path::PathBuf, bytes: Vec<u8> },
+    Remove(std::path::PathBuf),
+}
+
+#[allow(dead_code)]
+struct SaveBatchJob {
+    ops: Vec<SaveBatchOp>,
+    seq: u64,
+}
+
+#[allow(dead_code)]
+struct SaveBatchState {
+    pending: Option<SaveBatchJob>,
+    closing: bool,
+    paused: bool,
+    last_done: u64,
+    writes: u64,
+    last_error: Option<String>,
+}
+
+#[allow(dead_code)]
+struct SaveBatchWorker {
+    state: std::sync::Arc<(Mutex<SaveBatchState>, std::sync::Condvar)>,
+    next_seq: AtomicU64,
+}
+
+#[allow(dead_code)]
+impl SaveBatchWorker {
+    fn spawn() -> Self {
+        let state = std::sync::Arc::new((
+            Mutex::new(SaveBatchState {
+                pending: None,
+                closing: false,
+                paused: false,
+                last_done: 0,
+                writes: 0,
+                last_error: None,
+            }),
+            std::sync::Condvar::new(),
+        ));
+        let worker_state = std::sync::Arc::clone(&state);
+        thread::Builder::new()
+            .name("megu-save-batch".into())
+            .spawn(move || Self::run(&worker_state))
+            .expect("spawn save batch worker");
+        SaveBatchWorker {
+            state,
+            next_seq: AtomicU64::new(1),
+        }
+    }
+
+    fn run(state: &std::sync::Arc<(Mutex<SaveBatchState>, std::sync::Condvar)>) {
+        let (lock, cv) = &**state;
+        loop {
+            let job = {
+                let mut g = lock.lock().unwrap_or_else(|e| e.into_inner());
+                loop {
+                    if !g.paused || g.closing {
+                        if let Some(job) = g.pending.take() {
+                            break job;
+                        }
+                    }
+                    if g.closing {
+                        return;
+                    }
+                    g = cv.wait(g).unwrap();
+                }
+            };
+            let interval = connection_limits::backup_interval();
+            let mut first_error = None;
+            for op in &job.ops {
+                let (path, result) = match op {
+                    SaveBatchOp::Write { path, bytes } => {
+                        (path, write_world_file(path, bytes, interval))
+                    }
+                    SaveBatchOp::Remove(path) => (path, remove_world_save(path)),
+                };
+                if let Err(error) = result {
+                    if first_error.is_none() {
+                        first_error = Some(format!("{}: {error}", path.display()));
+                    }
+                    eprintln!("async save batch to {} failed: {error}", path.display());
+                }
+            }
+            let mut g = lock.lock().unwrap_or_else(|e| e.into_inner());
+            g.writes += 1;
+            g.last_done = job.seq;
+            if let Some(message) = first_error {
+                if g.last_error.is_none() {
+                    g.last_error = Some(message);
+                }
+            }
+            cv.notify_all();
+        }
+    }
+
+    fn submit_ops(&self, ops: Vec<SaveBatchOp>) -> u64 {
+        let seq = self.next_seq.fetch_add(1, Ordering::SeqCst);
+        let (lock, cv) = &*self.state;
+        lock.lock().unwrap_or_else(|e| e.into_inner()).pending = Some(SaveBatchJob { ops, seq });
+        cv.notify_one();
+        seq
+    }
+
+    fn submitted_seq(&self) -> u64 {
+        self.next_seq.load(Ordering::SeqCst) - 1
+    }
+
+    fn flush(&self) -> std::io::Result<()> {
+        let target = self.submitted_seq();
+        let (lock, cv) = &*self.state;
+        let mut g = lock.lock().unwrap_or_else(|e| e.into_inner());
+        while g.last_done < target {
+            g = cv.wait(g).unwrap();
+        }
+        match g.last_error.take() {
+            Some(message) => Err(std::io::Error::other(message)),
+            None => Ok(()),
+        }
+    }
+
+    #[cfg(test)]
+    fn set_paused(&self, paused: bool) {
+        let (lock, cv) = &*self.state;
+        lock.lock().unwrap_or_else(|e| e.into_inner()).paused = paused;
+        cv.notify_all();
+    }
+}
+
+#[allow(dead_code)]
+static SAVE_BATCH_WORKER: OnceLock<SaveBatchWorker> = OnceLock::new();
+
+#[allow(dead_code)]
+fn save_batch_worker() -> &'static SaveBatchWorker {
+    SAVE_BATCH_WORKER.get_or_init(SaveBatchWorker::spawn)
+}
+
+impl AsyncSaveWorker {
+    /// Queue `(path, bytes)` writes as one coalesced batch. Each file still gets
+    /// the `write_world_file` treatment on the worker: fsync, `.bak` rotation
+    /// and atomic rename — just not on the tick thread.
+    #[allow(dead_code)]
+    pub(crate) fn submit_batch(&self, files: Vec<(std::path::PathBuf, Vec<u8>)>) -> u64 {
+        save_batch_worker().submit_ops(
+            files
+                .into_iter()
+                .map(|(path, bytes)| SaveBatchOp::Write { path, bytes })
+                .collect(),
+        )
+    }
+
+    /// Queue a whole `WorldSaveSnapshot` — Overworld, companion overlays (or
+    /// their removals) and the Create sidecar — as one batch. Returns the batch
+    /// sequence for `flush_all`.
+    #[allow(dead_code)]
+    pub(crate) fn submit_all(&self, dir: &std::path::Path, snapshot: WorldSaveSnapshot) -> u64 {
+        let mut ops = Vec::with_capacity(4);
+        ops.push(SaveBatchOp::Write {
+            path: dim_overlay_path(dir, DimId::Overworld),
+            bytes: wrap_world_payload(&snapshot.overworld),
+        });
+        for (dim, payload) in snapshot.companions {
+            let path = dim_overlay_path(dir, dim);
+            match payload {
+                Some(payload) => ops.push(SaveBatchOp::Write {
+                    path,
+                    bytes: wrap_world_payload(&payload),
+                }),
+                None => ops.push(SaveBatchOp::Remove(path)),
+            }
+        }
+        if let Some(bytes) = snapshot.create_factory {
+            ops.push(SaveBatchOp::Write {
+                path: dir.join("create_factory.bin"),
+                bytes,
+            });
+        }
+        save_batch_worker().submit_ops(ops)
+    }
+
+    /// Wait for both the single-file queue and the batch queue to drain.
+    #[allow(dead_code)]
+    pub(crate) fn flush_all(&self) -> std::io::Result<()> {
+        self.flush()?;
+        save_batch_worker().flush()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn set_batch_paused(&self, paused: bool) {
+        save_batch_worker().set_paused(paused);
+    }
+}
+
 // Caller owns SAVE_LOCK (or is a single-threaded fixture). Some existing
 // callers hold the mutex directly, without the re-entrant thread-local guard.
+#[cfg(test)]
 fn save_world_into(f: &mut Vec<u8>) {
+    save_world_into_impl(f, None);
+}
+
+fn save_world_into_impl(f: &mut Vec<u8>, companion_sink: Option<&mut WorldCompanionSlots>) {
     let world_spawn = saved_value(&WORLD_SPAWN);
     let spawn_pitch = saved_value(&WORLD_SPAWN_PITCH);
     let (pending, sources, spider_flags) = worldgen::with_gen(|g| (
@@ -2001,10 +2253,30 @@ fn save_world_into(f: &mut Vec<u8>) {
     for (uuid, _, _, state) in &active_players {
         players.insert(*uuid, state.clone());
     }
+    // One whole-map read produces every dimension's overlay table: the Overworld's
+    // leading table, the companion files' payloads and the custom dimensions' DXT1
+    // tables all come from the same shard snapshot, so the former per-dimension
+    // rescans collapse into a single pass while every other registry stays outside
+    // the shard guards.
+    let custom_specs = worldgen::custom_dimension_specs();
+    let mut overlay_dims = Vec::with_capacity(custom_specs.len() + 3);
+    overlay_dims.push(DimId::Overworld);
+    if companion_sink.is_some() {
+        overlay_dims.push(DimId::Nether);
+        overlay_dims.push(DimId::End);
+    }
+    overlay_dims.extend(custom_specs.iter().map(|spec| spec.id));
+    let mut chunk_tables = WorldChunkTables::capture(&overlay_dims);
+    if let Some(sink) = companion_sink {
+        for (slot, dim) in [DimId::Nether, DimId::End].into_iter().enumerate() {
+            let (count, bytes) = chunk_tables.take(dim).unwrap_or((0, vec![0u8]));
+            sink[slot] = (dim, (count != 0).then_some(bytes));
+        }
+    }
     // The leading chunk table is the Overworld's, which is what the legacy file has always held:
     // its count, its keys and its bytes are unchanged, and another dimension's edits go to that
     // dimension's own companion file (`save_world_guarded_in`).
-    save_dim_overlay_into(DimId::Overworld, f);
+    f.extend_from_slice(chunk_tables.bytes(DimId::Overworld));
     // META section: mobs + world time + inventories (offline store + live).
     // MET4 = stacks carry component blobs and entity ages are server ticks.
     // MET2/MET3 stored those ages in milliseconds, which the loader converts.
@@ -2580,10 +2852,11 @@ fn save_world_into(f: &mut Vec<u8>) {
     append_mob_dimensions_footer(f, &mob_dimensions);
     // Everything a custom dimension owns, named by its canonical key so a
     // datapack added, removed or reordered between restarts cannot move it.
-    for spec in worldgen::custom_dimension_specs() {
-        let mut table = Vec::new();
-        if save_dim_overlay_into(spec.id, &mut table) > 0 {
-            dxt.overlays.push((spec.key.to_string(), table));
+    for spec in &custom_specs {
+        if let Some((count, table)) = chunk_tables.take(spec.id) {
+            if count != 0 {
+                dxt.overlays.push((spec.key.to_string(), table));
+            }
         }
     }
     for (uuid, state) in players.iter() {
@@ -6905,6 +7178,86 @@ mod save_backup_tests {
         let err = write_world_file(&world, b"new", Duration::ZERO).unwrap_err();
         assert!(err.contains("world.bin.tmp"), "{err}");
         assert_eq!(std::fs::read(&world).unwrap(), b"good");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn async_save_batch_writes_snapshot_paths_and_rotates_backups() {
+        let dir = scratch("batch");
+        let overworld = dim_overlay_path(&dir, DimId::Overworld);
+        let nether = dim_overlay_path(&dir, DimId::Nether);
+        let end = dim_overlay_path(&dir, DimId::End);
+        std::fs::write(&overworld, b"old-overworld").unwrap();
+        std::fs::write(&nether, b"old-nether").unwrap();
+        std::fs::write(&end, b"old-end").unwrap();
+        std::fs::write(dir.join("world_overlay_end.bin.bak"), b"stale-end-bak").unwrap();
+        std::fs::write(dir.join("create_factory.bin"), b"old-factory").unwrap();
+
+        let snapshot = WorldSaveSnapshot {
+            overworld: b"overworld-payload".to_vec(),
+            companions: [
+                (DimId::Nether, Some(b"nether-payload".to_vec())),
+                (DimId::End, None),
+            ],
+            create_factory: Some(b"factory-payload".to_vec()),
+        };
+        let worker = AsyncSaveWorker::spawn();
+        worker.submit_all(&dir, snapshot);
+        worker.flush_all().unwrap();
+
+        assert_eq!(
+            unwrap_world_payload(std::fs::read(&overworld).unwrap()).unwrap(),
+            b"overworld-payload".to_vec()
+        );
+        assert_eq!(
+            unwrap_world_payload(std::fs::read(&nether).unwrap()).unwrap(),
+            b"nether-payload".to_vec()
+        );
+        assert!(!end.exists(), "empty companion overlay is removed");
+        assert!(!dir.join("world_overlay_end.bin.bak").exists());
+        assert!(!dir.join("world_overlay_end.bin.tmp").exists());
+        assert_eq!(
+            std::fs::read(dir.join("world_overlay.bin.bak")).unwrap(),
+            b"old-overworld".to_vec()
+        );
+        assert_eq!(
+            std::fs::read(dir.join("world_overlay_nether.bin.bak")).unwrap(),
+            b"old-nether".to_vec()
+        );
+        assert_eq!(
+            std::fs::read(dir.join("create_factory.bin")).unwrap(),
+            b"factory-payload".to_vec()
+        );
+        assert_eq!(
+            std::fs::read(dir.join("create_factory.bin.bak")).unwrap(),
+            b"old-factory".to_vec()
+        );
+        assert!(!dir.join("world_overlay.bin.tmp").exists());
+        assert!(!dir.join("world_overlay_nether.bin.tmp").exists());
+
+        worker.submit_batch(vec![
+            (dir.join("batch-a.bin"), b"batch-a".to_vec()),
+            (dir.join("batch-b.bin"), b"batch-b".to_vec()),
+        ]);
+        worker.flush_all().unwrap();
+        assert_eq!(std::fs::read(dir.join("batch-a.bin")).unwrap(), b"batch-a".to_vec());
+        assert_eq!(std::fs::read(dir.join("batch-b.bin")).unwrap(), b"batch-b".to_vec());
+        assert!(!dir.join("batch-a.bin.tmp").exists());
+        assert!(!dir.join("batch-b.bin.tmp").exists());
+
+        // Like the single-file worker, a still-pending batch is displaced by the
+        // newest one instead of queueing an unbounded backlog behind a slow disk.
+        worker.set_batch_paused(true);
+        worker.submit_batch(vec![(dir.join("coalesce-a.bin"), b"coalesce-a".to_vec())]);
+        worker.submit_batch(vec![(dir.join("coalesce-b.bin"), b"coalesce-b".to_vec())]);
+        worker.set_batch_paused(false);
+        worker.flush_all().unwrap();
+        assert!(!dir.join("coalesce-a.bin").exists());
+        assert_eq!(
+            std::fs::read(dir.join("coalesce-b.bin")).unwrap(),
+            b"coalesce-b".to_vec()
+        );
+        drop(worker);
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

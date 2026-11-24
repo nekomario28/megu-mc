@@ -446,15 +446,17 @@ fn anvil_recover_world_staging(dir: &std::path::Path) -> Result<usize, String> {
 /// Decode one populated location-table slot. `Ok(None)` is an empty slot;
 /// `Err` carries the same message `read_region_file` would have aborted with.
 type RegionChunkRecord = ((i32, i32), AnvilChunkRecord);
+type RegionFileSelection = (Option<Vec<u8>>, HashMap<(i32, i32), AnvilChunkRecord>);
 
-fn anvil_region_slot(
+/// The location-table bounds of one populated slot: `(offset, sectors, byte start)`.
+/// This is the structural half of `anvil_region_slot` — it never touches the
+/// compressed payload, so the raw-update path can copy an untouched run without
+/// paying for inflate/NBT work it does not need.
+fn anvil_region_run(
     file: &[u8],
-    timestamps: &[u8],
     slot: usize,
-    rx: i32,
-    rz: i32,
     path: &std::path::Path,
-) -> Result<Option<RegionChunkRecord>, String> {
+) -> Result<Option<(usize, usize, usize)>, String> {
     let le = &file[slot * 4..slot * 4 + 4];
     let offset = (usize::from(le[0]) << 16) | (usize::from(le[1]) << 8) | usize::from(le[2]);
     let sectors = usize::from(le[3]);
@@ -471,8 +473,22 @@ fn anvil_region_slot(
     }
     let start = offset
         .checked_mul(ANVIL_SECTOR)
-        .filter(|&s| (offset + sectors) * ANVIL_SECTOR <= file.len() && s + 5 <= file.len())
+        .filter(|&s| (offset + sectors) * ANVIL_SECTOR <= file.len() && s + 4 <= file.len())
         .ok_or_else(|| format!("chunk sector run outside {}", path.display()))?;
+    Ok(Some((offset, sectors, start)))
+}
+
+fn anvil_region_slot(
+    file: &[u8],
+    timestamps: &[u8],
+    slot: usize,
+    rx: i32,
+    rz: i32,
+    path: &std::path::Path,
+) -> Result<Option<RegionChunkRecord>, String> {
+    let Some((_offset, sectors, start)) = anvil_region_run(file, slot, path)? else {
+        return Ok(None);
+    };
     let len = u32::from_be_bytes(file[start..start + 4].try_into().unwrap()) as usize;
     if len < 2 || 4 + len > sectors * ANVIL_SECTOR {
         return Err(format!(
@@ -530,6 +546,175 @@ fn read_region_file_impl(
         }
     }
     Ok((region, errors))
+}
+
+/// Decode only the requested chunk slots of `path`. Returns the raw file bytes
+/// alongside the records so a caller can hand the same bytes to the raw updater
+/// without a second read. A missing file is `(None, empty)`, not an error.
+fn read_region_file_selected(
+    path: &std::path::Path,
+    wanted: &HashSet<(i32, i32)>,
+) -> Result<RegionFileSelection, String> {
+    let (rx, rz) = anvil_region_coords(path)?;
+    if !path.is_file() {
+        return Ok((None, HashMap::new()));
+    }
+    let file = std::fs::read(path).map_err(|e| format!("cannot read {}: {e}", path.display()))?;
+    if file.len() < 2 * ANVIL_SECTOR {
+        return Err(format!("region file too small: {}", path.display()));
+    }
+    let (_, timestamps) = file.split_at(ANVIL_SECTOR);
+    let mut records = HashMap::new();
+    for &(cx, cz) in wanted {
+        if cx.div_euclid(32) != rx || cz.div_euclid(32) != rz {
+            continue;
+        }
+        let slot = ((cx & 31) + (cz & 31) * 32) as usize;
+        if let Some(((want_cx, want_cz), record)) =
+            anvil_region_slot(&file, timestamps, slot, rx, rz, path)?
+        {
+            debug_assert_eq!((want_cx, want_cz), (cx, cz));
+            records.insert((cx, cz), record);
+        }
+    }
+    Ok((Some(file), records))
+}
+
+/// Write one fresh chunk record into the packed body and point its slot at it.
+fn anvil_write_region_record(
+    body: &mut Vec<u8>,
+    locations: &mut [u8; ANVIL_SECTOR],
+    timestamps: &mut [u8; ANVIL_SECTOR],
+    slot: usize,
+    record: &AnvilChunkRecord,
+    path: &std::path::Path,
+) -> Result<(), String> {
+    let nbt = crate::nbt::write_named(&crate::nbt::NbtString(Vec::new()), &record.nbt)
+        .map_err(|e| format!("cannot encode chunk NBT for {path:?}: {e}"))?;
+    let compressed = anvil_compress(record.compression, &nbt)?;
+    let len = compressed.len() + 1;
+    let sectors = (4 + len).div_ceil(ANVIL_SECTOR);
+    if sectors > 255 {
+        let cx = path.display().to_string();
+        return Err(format!("chunk in {cx} exceeds 255 sectors"));
+    }
+    let offset = 2 + body.len() / ANVIL_SECTOR;
+    body.extend_from_slice(&(len as u32).to_be_bytes());
+    body.push(record.compression);
+    body.extend_from_slice(&compressed);
+    body.resize(body.len().div_ceil(ANVIL_SECTOR) * ANVIL_SECTOR, 0);
+    locations[slot * 4] = ((offset >> 16) & 0xff) as u8;
+    locations[slot * 4 + 1] = ((offset >> 8) & 0xff) as u8;
+    locations[slot * 4 + 2] = (offset & 0xff) as u8;
+    locations[slot * 4 + 3] = sectors as u8;
+    timestamps[slot * 4..slot * 4 + 4]
+        .copy_from_slice(&record.timestamp.to_be_bytes());
+    Ok(())
+}
+
+/// Copy one populated sector run byte-for-byte — length, compression byte,
+/// compressed payload and sector padding all stay exactly as they were on disk.
+/// The caller writes the slot's timestamp entry after a successful copy.
+fn anvil_copy_region_run(
+    file: &[u8],
+    body: &mut Vec<u8>,
+    locations: &mut [u8; ANVIL_SECTOR],
+    slot: usize,
+    sectors: usize,
+    start: usize,
+    path: &std::path::Path,
+) -> Result<(), String> {
+    let len = u32::from_be_bytes(file[start..start + 4].try_into().unwrap()) as usize;
+    if len < 2 || 4 + len > sectors * ANVIL_SECTOR {
+        return Err(format!(
+            "invalid chunk payload length {len} in {}",
+            path.display()
+        ));
+    }
+    let offset = 2 + body.len() / ANVIL_SECTOR;
+    body.extend_from_slice(&file[start..start + sectors * ANVIL_SECTOR]);
+    locations[slot * 4] = ((offset >> 16) & 0xff) as u8;
+    locations[slot * 4 + 1] = ((offset >> 8) & 0xff) as u8;
+    locations[slot * 4 + 2] = (offset & 0xff) as u8;
+    locations[slot * 4 + 3] = sectors as u8;
+    Ok(())
+}
+
+/// Merge `updates` into `path` without decoding or recompressing untouched
+/// chunks. `existing` must be the bytes of `path` as read for the merge (or
+/// `None` only when the file was verified absent); populated slots missing from
+/// `updates` are copied as their original sector runs, so a one-chunk edit stops
+/// paying the 1,024-slot inflate/NBT/deflate cost.
+fn update_region_file_raw_with_existing(
+    path: &std::path::Path,
+    updates: &HashMap<(i32, i32), AnvilChunkRecord>,
+    existing: Option<&[u8]>,
+) -> Result<(), String> {
+    let (rx, rz) = anvil_region_coords(path)?;
+    if let Some(file) = existing {
+        if file.len() < 2 * ANVIL_SECTOR {
+            return Err(format!("region file too small: {}", path.display()));
+        }
+    }
+    for &(cx, cz) in updates.keys() {
+        if cx.div_euclid(32) != rx || cz.div_euclid(32) != rz {
+            return Err(format!(
+                "chunk ({cx}, {cz}) does not belong in {}",
+                path.display()
+            ));
+        }
+    }
+    let mut locations = [0u8; ANVIL_SECTOR];
+    let mut timestamps = [0u8; ANVIL_SECTOR];
+    let mut body = Vec::new();
+    let source_timestamps = existing.map(|file| {
+        debug_assert!(file.len() >= 2 * ANVIL_SECTOR);
+        &file[ANVIL_SECTOR..2 * ANVIL_SECTOR]
+    });
+    for slot in 0..1024usize {
+        let cx = rx * 32 + (slot % 32) as i32;
+        let cz = rz * 32 + (slot / 32) as i32;
+        if let Some(record) = updates.get(&(cx, cz)) {
+            anvil_write_region_record(
+                &mut body,
+                &mut locations,
+                &mut timestamps,
+                slot,
+                record,
+                path,
+            )?;
+            continue;
+        }
+        let Some(file) = existing else { continue };
+        let Some((_offset, sectors, start)) = anvil_region_run(file, slot, path)? else {
+            continue;
+        };
+        let ts = source_timestamps.expect("existing file has timestamp table");
+        anvil_copy_region_run(file, &mut body, &mut locations, slot, sectors, start, path)?;
+        timestamps[slot * 4..slot * 4 + 4].copy_from_slice(&ts[slot * 4..slot * 4 + 4]);
+    }
+    let mut out = Vec::with_capacity(2 * ANVIL_SECTOR + body.len());
+    out.extend_from_slice(&locations);
+    out.extend_from_slice(&timestamps);
+    out.extend_from_slice(&body);
+    anvil_atomic_write(path, &out)
+}
+
+/// `update_region_file_raw_with_existing` for callers that have not already
+/// read the region file for a hash-compare pass.
+#[allow(dead_code)]
+fn update_region_file_raw(
+    path: &std::path::Path,
+    updates: &HashMap<(i32, i32), AnvilChunkRecord>,
+) -> Result<(), String> {
+    let existing = if path.is_file() {
+        Some(
+            std::fs::read(path).map_err(|e| format!("cannot read {}: {e}", path.display()))?,
+        )
+    } else {
+        None
+    };
+    update_region_file_raw_with_existing(path, updates, existing.as_deref())
 }
 
 /// The lenient half of the region reader: every decodable chunk returns,
