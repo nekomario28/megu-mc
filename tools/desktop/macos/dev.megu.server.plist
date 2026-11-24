@@ -1,0 +1,33 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  launchd agent for the Megu server on macOS.
+
+  Install (replace /Users/player with the installing user's home):
+
+      cp dev.megu.server.plist ~/Library/LaunchAgents/
+      launchctl load ~/Library/LaunchAgents/dev.megu.server.plist
+
+  Make sure `megu` is on the PATH launchd sees (e.g. /usr/local/bin or
+  /opt/homebrew/bin), or replace the program path below with an
+  absolute one.
+-->
+<plist version="1.0">
+<dict>
+	<key>Label</key>
+	<string>dev.megu.server</string>
+	<key>ProgramArguments</key>
+	<array>
+		<string>megu</string>
+		<string>--cli</string>
+	</array>
+	<key>RunAtLoad</key>
+	<true/>
+	<key>KeepAlive</key>
+	<true/>
+	<key>StandardOutPath</key>
+	<string>/Users/player/Library/Logs/megu/server.log</string>
+	<key>StandardErrorPath</key>
+	<string>/Users/player/Library/Logs/megu/server.log</string>
+</dict>
+</plist>

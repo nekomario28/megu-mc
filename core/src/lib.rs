@@ -146,6 +146,11 @@
 //!   live Omarchy `colors.toml` theme sync, and fail-silent
 //!   `xdg-open`/`notify-send` helpers that never surface an error to a
 //!   beginner on any OS.
+//! * [`os_desktop`] — zero-dependency Windows/macOS desktop
+//!   integration: [`os_desktop::OsThemePalette`] native theme sync
+//!   (Omarchy/macOS/Windows sources), injection-proof AppleScript and
+//!   Toast notification builders, `caffeinate` keep-awake args, and the
+//!   fail-silent [`os_desktop::detect_os_theme`] entrypoint.
 
 #![deny(unsafe_code)]
 
@@ -167,6 +172,7 @@ pub mod math_opt_engine;
 pub mod math_opt_foundation;
 pub mod morton;
 pub mod nbt_wire;
+pub mod os_desktop;
 pub mod perf_kit;
 pub mod random;
 pub mod romaji_ime;
