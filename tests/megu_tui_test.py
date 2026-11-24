@@ -191,12 +191,14 @@ class ModeSelectionTest(unittest.TestCase):
         return argparse.Namespace(**values)
 
     def test_want_tui_auto_detect_and_explicit_tui(self):
+        expected = (megu_tui.termios is not None and megu_tui.tty is not None
+                    and megu_tui.select is not None and os.name != "nt")
         env = {"TERM": "xterm-256color"}
-        self.assertTrue(megu_tui.want_tui(
-            self.namespace(), env, _FakeStream(True), _FakeStream(True)))
-        self.assertTrue(megu_tui.want_tui(
+        self.assertEqual(megu_tui.want_tui(
+            self.namespace(), env, _FakeStream(True), _FakeStream(True)), expected)
+        self.assertEqual(megu_tui.want_tui(
             self.namespace(tui=True), env,
-            _FakeStream(True), _FakeStream(True)))
+            _FakeStream(True), _FakeStream(True)), expected)
         self.assertFalse(megu_tui.want_tui(
             self.namespace(tui=True), env,
             _FakeStream(False), _FakeStream(True)))
