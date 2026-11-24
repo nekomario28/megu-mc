@@ -514,6 +514,23 @@ pub struct ClientSettings {
     pub particles: ParticleLevel,
     pub smooth_lighting: bool,
     pub entity_shadows: bool,
+    /// Eye-comfort exposure limiter: prevents harsh whiteout/glare on
+    /// snow, sand, and stacked torches while keeping warm Minecraft
+    /// colors. Default `true`.
+    pub comfort_exposure: bool,
+    /// Dynamic colored lights contributed by Vanilla + Redstone + modded
+    /// blocks, items, and mobs. Default `true`.
+    pub dynamic_lights: bool,
+    /// 3D & 2D enchanted item/armor shimmer. Default `true`.
+    pub enchantment_glint: bool,
+    /// Soft indirect bounce & hemisphere reflection so shadowed or
+    /// back-facing surfaces never drop to pitch black. Default `true`.
+    pub indirect_light_bounce: bool,
+    /// Opt-in realistic shadow-light gameplay for worlds this client
+    /// hosts or plays locally (mob spawning, undead daylight burn, crop
+    /// growth, dynamic-light spawn suppression). Remote servers keep
+    /// their own host settings. Default `false`.
+    pub directional_shadow_gameplay: bool,
     /// `30..=110` degrees.
     pub fov: u8,
     /// Mouse-look sensitivity percent `10..=200` (`100` = 1.0×).
@@ -610,6 +627,11 @@ impl ClientSettings {
             particles: ParticleLevel::All,
             smooth_lighting: true,
             entity_shadows: true,
+            comfort_exposure: true,
+            dynamic_lights: true,
+            enchantment_glint: true,
+            indirect_light_bounce: true,
+            directional_shadow_gameplay: false,
             fov: DEFAULT_FOV,
             mouse_sensitivity_pct: 100,
             volume_master: 100,
@@ -745,6 +767,11 @@ impl ClientSettings {
              particles = \"{}\"\n\
              smooth_lighting = {}\n\
              entity_shadows = {}\n\
+             comfort_exposure = {}\n\
+             dynamic_lights = {}\n\
+             enchantment_glint = {}\n\
+             indirect_light_bounce = {}\n\
+             directional_shadow_gameplay = {}\n\
              fov = {}\n\
              mouse_sensitivity_pct = {}\n\
              volume_master = {}\n\
@@ -795,6 +822,11 @@ impl ClientSettings {
             self.particles.as_str(),
             self.smooth_lighting,
             self.entity_shadows,
+            self.comfort_exposure,
+            self.dynamic_lights,
+            self.enchantment_glint,
+            self.indirect_light_bounce,
+            self.directional_shadow_gameplay,
             self.fov,
             self.mouse_sensitivity_pct,
             self.volume_master,
@@ -877,6 +909,16 @@ impl ClientSettings {
                 "particles" => self.particles = parsed.particles,
                 "smooth_lighting" => self.smooth_lighting = parsed.smooth_lighting,
                 "entity_shadows" => self.entity_shadows = parsed.entity_shadows,
+                "comfort_exposure" => self.comfort_exposure = parsed.comfort_exposure,
+                "dynamic_lights" => self.dynamic_lights = parsed.dynamic_lights,
+                "enchantment_glint" => self.enchantment_glint = parsed.enchantment_glint,
+                "indirect_light_bounce" => {
+                    self.indirect_light_bounce = parsed.indirect_light_bounce;
+                }
+                "directional_shadow_gameplay" => {
+                    self.directional_shadow_gameplay =
+                        parsed.directional_shadow_gameplay;
+                }
                 "fov" => self.fov = parsed.fov,
                 "mouse_sensitivity_pct" => {
                     self.mouse_sensitivity_pct = parsed.mouse_sensitivity_pct;
@@ -1116,6 +1158,41 @@ impl ClientSettings {
                     Some(b) => {
                         settings.entity_shadows = b;
                         seen.push("entity_shadows");
+                    }
+                    None => invalid(&mut warnings),
+                },
+                "comfort_exposure" => match parse_bool(value) {
+                    Some(b) => {
+                        settings.comfort_exposure = b;
+                        seen.push("comfort_exposure");
+                    }
+                    None => invalid(&mut warnings),
+                },
+                "dynamic_lights" => match parse_bool(value) {
+                    Some(b) => {
+                        settings.dynamic_lights = b;
+                        seen.push("dynamic_lights");
+                    }
+                    None => invalid(&mut warnings),
+                },
+                "enchantment_glint" => match parse_bool(value) {
+                    Some(b) => {
+                        settings.enchantment_glint = b;
+                        seen.push("enchantment_glint");
+                    }
+                    None => invalid(&mut warnings),
+                },
+                "indirect_light_bounce" => match parse_bool(value) {
+                    Some(b) => {
+                        settings.indirect_light_bounce = b;
+                        seen.push("indirect_light_bounce");
+                    }
+                    None => invalid(&mut warnings),
+                },
+                "directional_shadow_gameplay" => match parse_bool(value) {
+                    Some(b) => {
+                        settings.directional_shadow_gameplay = b;
+                        seen.push("directional_shadow_gameplay");
                     }
                     None => invalid(&mut warnings),
                 },
@@ -1927,6 +2004,11 @@ mod tests {
             particles: ParticleLevel::Minimal,
             smooth_lighting: false,
             entity_shadows: false,
+            comfort_exposure: false,
+            dynamic_lights: true,
+            enchantment_glint: false,
+            indirect_light_bounce: true,
+            directional_shadow_gameplay: true,
             fov: 90,
             mouse_sensitivity_pct: 150,
             volume_master: 80,
@@ -2093,6 +2175,54 @@ mod tests {
         s.apply_toml("gpu_backend = \"classic-low-spec\"\n");
         assert_eq!(s.gpu_backend, RenderBackendPreference::ClassicLowSpec);
         assert_eq!(s.preset, QualityPreset::Fast);
+    }
+
+    #[test]
+    fn lighting_comfort_settings_default_parse_and_round_trip() {
+        // Eye-friendly defaults: everything on except the opt-in
+        // shadow-light gameplay toggle.
+        let s = ClientSettings::default();
+        assert!(s.comfort_exposure);
+        assert!(s.dynamic_lights);
+        assert!(s.enchantment_glint);
+        assert!(s.indirect_light_bounce);
+        assert!(!s.directional_shadow_gameplay);
+
+        // Files written before these keys existed keep the defaults.
+        let (s, warnings) = ClientSettings::from_toml("view_distance = 20\n");
+        assert!(warnings.is_empty());
+        assert!(s.comfort_exposure);
+        assert!(s.dynamic_lights);
+        assert!(s.enchantment_glint);
+        assert!(s.indirect_light_bounce);
+        assert!(!s.directional_shadow_gameplay);
+
+        // Explicit values parse in both directions and round-trip.
+        let (s, warnings) = ClientSettings::from_toml(
+            "comfort_exposure = false\n\
+             dynamic_lights = false\n\
+             enchantment_glint = false\n\
+             indirect_light_bounce = false\n\
+             directional_shadow_gameplay = true\n",
+        );
+        assert!(warnings.is_empty(), "unexpected warnings: {warnings:?}");
+        assert!(!s.comfort_exposure);
+        assert!(!s.dynamic_lights);
+        assert!(!s.enchantment_glint);
+        assert!(!s.indirect_light_bounce);
+        assert!(s.directional_shadow_gameplay);
+        let (back, warnings) = ClientSettings::from_toml(&s.to_toml());
+        assert_eq!(back, s);
+        assert!(warnings.is_empty());
+
+        // apply_toml overlays only the keys a file defines.
+        let mut s = ClientSettings::default();
+        s.apply_toml("directional_shadow_gameplay = true\ncomfort_exposure = false\n");
+        assert!(s.directional_shadow_gameplay);
+        assert!(!s.comfort_exposure);
+        assert!(s.dynamic_lights);
+        assert!(s.enchantment_glint);
+        assert!(s.indirect_light_bounce);
     }
 
     #[test]

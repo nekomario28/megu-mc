@@ -1358,19 +1358,31 @@ fn video_tab(ctx: &mut Ctx, y0: i32) {
     let lang = ctx.lang;
     let v = &ctx.state.settings.video;
 
-    let (x, y) = row(ctx, 0, y0);
+    // Two 312px columns centered on the viewport (16px gutter) keep every
+    // control reachable at the smallest logical width: the left column
+    // holds the classic video controls, the right column the lighting &
+    // shadow-gameplay toggles. Both clip symmetrically on narrow screens
+    // and can never overlap because the gutter is constant.
+    let cx = ctx.w / 2;
+    let lx = cx - 320;
+    let rx = cx + 8;
+    let bw = 312;
+    let step = if ctx.h < 300 { 22 } else { 24 };
+    let vy = |i: i32| y0 + i * step;
+
+    let (x, y) = (lx, vy(0));
     ctx.btn(
         WidgetId::VideoPreset,
-        lr(x, y, 320, 20),
+        lr(x, y, bw, 20),
         &format!("{}: {}", tr(lang, "Preset", "プリセット"), v.preset.label()),
     );
-    ctx.dirty_dot(SettingKey::VideoPreset, x + 326, y + 6);
+    ctx.dirty_dot(SettingKey::VideoPreset, x + bw + 6, y + 6);
 
-    let (x, y) = row(ctx, 1, y0);
+    let (x, y) = (lx, vy(1));
     let frac = v.view_distance.saturating_sub(6) as f32 / 26.0;
     ctx.slider(
         WidgetId::VideoViewDistance,
-        lr(x, y, 320, 20),
+        lr(x, y, bw, 20),
         frac,
         &format!(
             "{}: {} {}",
@@ -1379,48 +1391,48 @@ fn video_tab(ctx: &mut Ctx, y0: i32) {
             tr(lang, "chunks", "チャンク")
         ),
     );
-    ctx.dirty_dot(SettingKey::VideoViewDistance, x + 326, y + 6);
+    ctx.dirty_dot(SettingKey::VideoViewDistance, x + bw + 6, y + 6);
 
-    let (x, y) = row(ctx, 2, y0);
+    let (x, y) = (lx, vy(2));
     ctx.btn(
         WidgetId::VideoLod,
-        lr(x, y, 320, 20),
+        lr(x, y, bw, 20),
         &format!("{}: {}", tr(lang, "Distant LOD", "遠景LOD"), v.lod.label()),
     );
-    ctx.dirty_dot(SettingKey::VideoLod, x + 326, y + 6);
+    ctx.dirty_dot(SettingKey::VideoLod, x + bw + 6, y + 6);
 
-    let (x, y) = row(ctx, 3, y0);
+    let (x, y) = (lx, vy(3));
     ctx.btn(
         WidgetId::VideoGpuBackend,
-        lr(x, y, 320, 20),
+        lr(x, y, bw, 20),
         &format!(
             "{}: {}",
             tr(lang, "GPU Backend", "GPUバックエンド"),
             v.gpu_backend.label()
         ),
     );
-    ctx.dirty_dot(SettingKey::VideoGpuBackend, x + 326, y + 6);
+    ctx.dirty_dot(SettingKey::VideoGpuBackend, x + bw + 6, y + 6);
 
     // FPS cap: slider + custom numeric field on the same row (no overlap).
-    let (x, y) = row(ctx, 4, y0);
+    let (x, y) = (lx, vy(4));
     let frac = v.fps_step_index() as f32 / (FPS_CAP_STEPS.len() - 1) as f32;
     ctx.slider(
         WidgetId::VideoFpsSlider,
-        lr(x, y, 210, 20),
+        lr(x, y, 200, 20),
         frac,
         &format!("{}: {}", tr(lang, "FPS Cap", "FPS上限"), v.fps_cap_label()),
     );
     ctx.textfield(
         WidgetId::VideoFpsField,
-        lr(x + 218, y, 102, 20),
+        lr(x + 208, y, 100, 20),
         ctx.state.fps_field_text(),
         ctx.state.fps_field_active(),
         tr(lang, "custom fps", "カスタムfps"),
     );
-    ctx.dirty_dot(SettingKey::VideoFpsCap, x + 326, y + 6);
+    ctx.dirty_dot(SettingKey::VideoFpsCap, x + bw + 6, y + 6);
     if ctx.state.fps_field_error() {
         ctx.text(
-            x + 218,
+            x + 208,
             y + 22,
             1,
             pal::DANGER,
@@ -1428,7 +1440,7 @@ fn video_tab(ctx: &mut Ctx, y0: i32) {
         );
     }
 
-    let (x, y) = row(ctx, 5, y0);
+    let (x, y) = (lx, vy(5));
     let bg_label = if v.background_fps == 0 {
         tr(lang, "Off", "オフ").to_string()
     } else {
@@ -1436,34 +1448,96 @@ fn video_tab(ctx: &mut Ctx, y0: i32) {
     };
     ctx.btn(
         WidgetId::VideoBackgroundFps,
-        lr(x, y, 320, 20),
+        lr(x, y, bw, 20),
         &format!(
             "{}: {}",
             tr(lang, "Background FPS", "バックグラウンドFPS"),
             bg_label
         ),
     );
-    ctx.dirty_dot(SettingKey::VideoBackgroundFps, x + 326, y + 6);
+    ctx.dirty_dot(SettingKey::VideoBackgroundFps, x + bw + 6, y + 6);
 
-    let (x, y) = row(ctx, 6, y0);
+    let (x, y) = (lx, vy(6));
     ctx.btn(
         WidgetId::VideoVsync,
-        lr(x, y, 320, 20),
+        lr(x, y, bw, 20),
         &format!("VSync: {}", onoff(v.vsync)),
     );
-    ctx.dirty_dot(SettingKey::VideoVsync, x + 326, y + 6);
+    ctx.dirty_dot(SettingKey::VideoVsync, x + bw + 6, y + 6);
 
-    let (x, y) = row(ctx, 7, y0);
+    let (x, y) = (lx, vy(7));
     ctx.btn(
         WidgetId::VideoSmoothLighting,
-        lr(x, y, 320, 20),
+        lr(x, y, bw, 20),
         &format!(
             "{}: {}",
             tr(lang, "Smooth Lighting", "スムースライティング"),
             onoff(v.smooth_lighting)
         ),
     );
-    ctx.dirty_dot(SettingKey::VideoSmoothLighting, x + 326, y + 6);
+    ctx.dirty_dot(SettingKey::VideoSmoothLighting, x + bw + 6, y + 6);
+
+    // --- Lighting & shadow gameplay (right column) ---------------------
+    let lighting: [(WidgetId, SettingKey, &str, &str, bool); 5] = [
+        (
+            WidgetId::VideoComfortExposure,
+            SettingKey::VideoComfortExposure,
+            "Eye-Comfort Exposure",
+            "まぶしさを抑制（ソフトグロー）",
+            v.comfort_exposure,
+        ),
+        (
+            WidgetId::VideoDynamicLights,
+            SettingKey::VideoDynamicLights,
+            "Dynamic Lights (All & Mods)",
+            "動くライト（全Mod対応）",
+            v.dynamic_lights,
+        ),
+        (
+            WidgetId::VideoEnchantmentGlint,
+            SettingKey::VideoEnchantmentGlint,
+            "Enchantment Glint",
+            "エンチャントきらめき",
+            v.enchantment_glint,
+        ),
+        (
+            WidgetId::VideoIndirectLightBounce,
+            SettingKey::VideoIndirectLightBounce,
+            "Indirect Light Bounce",
+            "間接バウンスライト",
+            v.indirect_light_bounce,
+        ),
+        (
+            WidgetId::VideoDirectionalShadowGameplay,
+            SettingKey::VideoDirectionalShadowGameplay,
+            "Shadow Light Gameplay (Local)",
+            "シャドウゲームプレイ（ローカル/ホスト）",
+            v.directional_shadow_gameplay,
+        ),
+    ];
+    ctx.text(rx, vy(0), 1, pal::ACCENT, tr(lang, "LIGHTING", "ライティング"));
+    for (i, (id, key, en, ja, on)) in lighting.iter().enumerate() {
+        let (x, y) = (rx, vy(i as i32 + 1));
+        ctx.btn(
+            *id,
+            lr(x, y, bw, 20),
+            &format!("{}: {}", tr(lang, en, ja), onoff(*on)),
+        );
+        ctx.dirty_dot(*key, x + bw + 6, y + 6);
+    }
+    // Scope hint for the opt-in gameplay toggle: local/hosted worlds
+    // only — remote servers keep their own host settings.
+    ctx.text(
+        rx,
+        vy(6) + 2,
+        1,
+        pal::TEXT_DIM,
+        tr(
+            lang,
+            "Shadow gameplay: Singleplayer / Friends Host worlds; remote servers use host settings",
+            "シャドウゲームプレイはシングルプレイとフレンドホストのワールドのみ。リモートサーバーはホスト設定です",
+        ),
+    );
 }
 
 fn controls_tab(ctx: &mut Ctx, y0: i32) {

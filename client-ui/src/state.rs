@@ -342,6 +342,22 @@ pub struct VideoSettings {
     pub background_fps: u16,
     pub vsync: bool,
     pub smooth_lighting: bool,
+    /// Eye-comfort exposure limiter (soft glow instead of glare on
+    /// snow/sand/stacked torches). Default `true`.
+    pub comfort_exposure: bool,
+    /// Dynamic colored lights from Vanilla + Redstone + modded
+    /// blocks/items/mobs. Default `true`.
+    pub dynamic_lights: bool,
+    /// 3D & 2D enchanted item/armor shimmer. Default `true`.
+    pub enchantment_glint: bool,
+    /// Soft indirect bounce & hemisphere reflection so shadowed surfaces
+    /// never drop to pitch black. Default `true`.
+    pub indirect_light_bounce: bool,
+    /// Opt-in realistic shadow-light gameplay for Singleplayer / Friends
+    /// Host worlds (mob spawning, undead daylight burn, crop growth,
+    /// dynamic-light spawn suppression). Remote servers keep their host
+    /// settings. Default `false`.
+    pub directional_shadow_gameplay: bool,
 }
 
 impl Default for VideoSettings {
@@ -355,6 +371,11 @@ impl Default for VideoSettings {
             background_fps: 15,
             vsync: true,
             smooth_lighting: true,
+            comfort_exposure: true,
+            dynamic_lights: true,
+            enchantment_glint: true,
+            indirect_light_bounce: true,
+            directional_shadow_gameplay: false,
         }
     }
 }
@@ -1077,6 +1098,11 @@ pub enum SettingKey {
     VideoBackgroundFps,
     VideoVsync,
     VideoSmoothLighting,
+    VideoComfortExposure,
+    VideoDynamicLights,
+    VideoEnchantmentGlint,
+    VideoIndirectLightBounce,
+    VideoDirectionalShadowGameplay,
     DisplayFullscreen,
     DisplayInvertY,
     DisplayGamma,
@@ -1157,6 +1183,23 @@ impl SettingsTransaction {
             K::VideoBackgroundFps => current.video.background_fps == opened.video.background_fps,
             K::VideoVsync => current.video.vsync == opened.video.vsync,
             K::VideoSmoothLighting => current.video.smooth_lighting == opened.video.smooth_lighting,
+            K::VideoComfortExposure => {
+                current.video.comfort_exposure == opened.video.comfort_exposure
+            }
+            K::VideoDynamicLights => {
+                current.video.dynamic_lights == opened.video.dynamic_lights
+            }
+            K::VideoEnchantmentGlint => {
+                current.video.enchantment_glint == opened.video.enchantment_glint
+            }
+            K::VideoIndirectLightBounce => {
+                current.video.indirect_light_bounce
+                    == opened.video.indirect_light_bounce
+            }
+            K::VideoDirectionalShadowGameplay => {
+                current.video.directional_shadow_gameplay
+                    == opened.video.directional_shadow_gameplay
+            }
             K::DisplayFullscreen => current.fullscreen == opened.fullscreen,
             K::DisplayInvertY => current.mouse_invert_y == opened.mouse_invert_y,
             K::DisplayGamma => current.gamma_pct == opened.gamma_pct,
@@ -1260,6 +1303,23 @@ impl SettingsTransaction {
             K::VideoBackgroundFps => current.video.background_fps = opened.video.background_fps,
             K::VideoVsync => current.video.vsync = opened.video.vsync,
             K::VideoSmoothLighting => current.video.smooth_lighting = opened.video.smooth_lighting,
+            K::VideoComfortExposure => {
+                current.video.comfort_exposure = opened.video.comfort_exposure
+            }
+            K::VideoDynamicLights => {
+                current.video.dynamic_lights = opened.video.dynamic_lights
+            }
+            K::VideoEnchantmentGlint => {
+                current.video.enchantment_glint = opened.video.enchantment_glint
+            }
+            K::VideoIndirectLightBounce => {
+                current.video.indirect_light_bounce =
+                    opened.video.indirect_light_bounce
+            }
+            K::VideoDirectionalShadowGameplay => {
+                current.video.directional_shadow_gameplay =
+                    opened.video.directional_shadow_gameplay
+            }
             K::DisplayFullscreen => current.fullscreen = opened.fullscreen,
             K::DisplayInvertY => current.mouse_invert_y = opened.mouse_invert_y,
             K::DisplayGamma => current.gamma_pct = opened.gamma_pct,
@@ -2192,6 +2252,11 @@ pub enum WidgetId {
     VideoBackgroundFps,
     VideoVsync,
     VideoSmoothLighting,
+    VideoComfortExposure,
+    VideoDynamicLights,
+    VideoEnchantmentGlint,
+    VideoIndirectLightBounce,
+    VideoDirectionalShadowGameplay,
     // Settings session toolbar (mistake-proof undo/redo/discard/reset)
     SettingsUndo,
     SettingsRedo,
@@ -4489,6 +4554,31 @@ impl UiState {
             }
             WidgetId::VideoSmoothLighting => {
                 v.smooth_lighting = !v.smooth_lighting;
+                v.preset = VideoPreset::Custom;
+                true
+            }
+            WidgetId::VideoComfortExposure => {
+                v.comfort_exposure = !v.comfort_exposure;
+                v.preset = VideoPreset::Custom;
+                true
+            }
+            WidgetId::VideoDynamicLights => {
+                v.dynamic_lights = !v.dynamic_lights;
+                v.preset = VideoPreset::Custom;
+                true
+            }
+            WidgetId::VideoEnchantmentGlint => {
+                v.enchantment_glint = !v.enchantment_glint;
+                v.preset = VideoPreset::Custom;
+                true
+            }
+            WidgetId::VideoIndirectLightBounce => {
+                v.indirect_light_bounce = !v.indirect_light_bounce;
+                v.preset = VideoPreset::Custom;
+                true
+            }
+            WidgetId::VideoDirectionalShadowGameplay => {
+                v.directional_shadow_gameplay = !v.directional_shadow_gameplay;
                 v.preset = VideoPreset::Custom;
                 true
             }
