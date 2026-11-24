@@ -109,13 +109,12 @@ type SignLines = [String; 4];
 type ChunkBlockEntity = (BlockPos, i64, Vec<u8>);
 /// A throwable's hit, carried out of the borrow before it is applied:
 /// (eid, mob hit, dx, dz, egg, x, y, z).
-type ThrowHit = (i32, Option<i32>, f64, f64, bool, f64, f64, f64);
+type ThrowHit = (DimId, i32, Option<i32>, f64, f64, bool, f64, f64, f64);
 /// The advancement tree: player -> advancement -> finished criteria.
 type Advancements = HashMap<String, HashMap<String, HashSet<String>>>;
 /// `PENDING_BLOCKS` regrouped per chunk for the batched `0x49` emission:
 /// chunk key -> section position -> section -> packed cell updates.
-type PendingBlocksByChunk =
-    BTreeMap<DimChunkKey, Vec<((i32, i32, i32), HashMap<u16, u32>)>>;
+type PendingBlocksByChunk = BTreeMap<DimChunkKey, Vec<((i32, i32, i32), HashMap<u16, u32>)>>;
 /// `set_blocks_bulk_dim`'s edit list grouped per `(cx, cz)` column.
 type BulkEditsByChunk = HashMap<(i32, i32), Vec<(i32, i32, i32, u32)>>;
 /// `placement_states`' ordered write set: cell position -> block state.
@@ -125,7 +124,6 @@ type PerTickWalBuffer = Mutex<BTreeMap<(DimId, i32, i32, i32), u32>>;
 /// The chunks a client has loaded, as (hot, warm) - the region snapshot.
 #[cfg(test)]
 type RegionSets = (HashSet<ChunkKey>, HashSet<ChunkKey>);
-
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 struct EntityAabb {
@@ -184,7 +182,6 @@ const XP_CAP: usize = 4096;
 // the cap is what bounds a placement bug that stages the same marker in every
 // chunk of a structure.
 const FRAME_CAP: usize = 4096;
-
 
 fn mob_snap_y(m: &Arc<Mob>, mp: &mut (f64, f64, f64, f32, f32)) -> Option<((i32, i32, i32), f32)> {
     // A mob in water or lava has its vertical motion owned by `LivingEntity.travel`
@@ -339,6 +336,7 @@ const CROP_GROWTH_DENOMINATOR: u64 = 30 * TICKS_PER_SECOND as u64;
 // vanilla game-tick value lets the cutover derive the server-tick form from the
 // single cadence owner instead of hunting for scattered numbers.
 const AUTOSAVE_GT: u64 = 600; // 30s
+const DEFAULT_LISTEN_PORT: u16 = 25565;
 static AUTOSAVE_ENABLED: AtomicBool = AtomicBool::new(true);
 static DEFAULT_GAME_MODE: AtomicU8 = AtomicU8::new(0);
 const SPAWN_CYCLE_GT: u64 = 200; // 10s
@@ -378,6 +376,7 @@ const TIME_NOTIFY_MS: u64 = 1_000; // day/night display sync
 const SIZE_LOG_MS: u64 = 5_000; // container-count watch (diagnostic)
 static TIME_NOTIFY_AT: OnceLock<Mutex<Instant>> = OnceLock::new();
 static SIZE_LOG_AT: OnceLock<Mutex<Instant>> = OnceLock::new();
+static ANVIL_AUTOSAVE_AT: OnceLock<Mutex<Instant>> = OnceLock::new();
 /// The tick loop's pacing rule, extracted so it can be held to a contract.
 /// Returns the next deadline given the current one and the work that just ran.
 /// `overrun` re-anchors instead of catching up, so an overloaded server cannot
@@ -515,9 +514,7 @@ fn gamerule_atomic_value(name: &str) -> Option<i32> {
         "showDeathMessages" => GR_SHOW_DEATH_MESSAGES.load(Ordering::Relaxed) as i32,
         "announceAdvancements" => GR_ANNOUNCE_ADVANCEMENTS.load(Ordering::Relaxed) as i32,
         "disableRaids" => GR_DISABLE_RAIDS.load(Ordering::Relaxed) as i32,
-        "playersSleepingPercentage" => {
-            GR_PLAYERS_SLEEPING_PERCENTAGE.load(Ordering::Relaxed)
-        }
+        "playersSleepingPercentage" => GR_PLAYERS_SLEEPING_PERCENTAGE.load(Ordering::Relaxed),
         "waterSourceConversion" => GR_WATER_SOURCE_CONVERSION.load(Ordering::Relaxed) as i32,
         "lavaSourceConversion" => GR_LAVA_SOURCE_CONVERSION.load(Ordering::Relaxed) as i32,
         "sendCommandFeedback" => GR_SEND_COMMAND_FEEDBACK.load(Ordering::Relaxed) as i32,
@@ -540,9 +537,7 @@ fn gamerule_atomic_store(name: &str, value: i32) -> bool {
         "maxEntityCramming" => GR_MAX_ENTITY_CRAMMING.store(value, Ordering::Relaxed),
         "randomTickSpeed" => GR_RANDOM_TICK_SPEED.store(value, Ordering::Relaxed),
         "doFireTick" => GR_DO_FIRE_TICK.store(value as u8, Ordering::Relaxed),
-        "snowAccumulationHeight" => {
-            GR_SNOW_ACCUMULATION_HEIGHT.store(value, Ordering::Relaxed)
-        }
+        "snowAccumulationHeight" => GR_SNOW_ACCUMULATION_HEIGHT.store(value, Ordering::Relaxed),
         "doTileDrops" => GR_DO_TILE_DROPS.store(value as u8, Ordering::Relaxed),
         "doEntityDrops" => GR_DO_ENTITY_DROPS.store(value as u8, Ordering::Relaxed),
         "fallDamage" => GR_FALL_DAMAGE.store(value as u8, Ordering::Relaxed),
@@ -551,22 +546,14 @@ fn gamerule_atomic_store(name: &str, value: i32) -> bool {
         "freezeDamage" => GR_FREEZE_DAMAGE.store(value as u8, Ordering::Relaxed),
         "doImmediateRespawn" => GR_DO_IMMEDIATE_RESPAWN.store(value as u8, Ordering::Relaxed),
         "showDeathMessages" => GR_SHOW_DEATH_MESSAGES.store(value as u8, Ordering::Relaxed),
-        "announceAdvancements" => {
-            GR_ANNOUNCE_ADVANCEMENTS.store(value as u8, Ordering::Relaxed)
-        }
+        "announceAdvancements" => GR_ANNOUNCE_ADVANCEMENTS.store(value as u8, Ordering::Relaxed),
         "disableRaids" => GR_DISABLE_RAIDS.store(value as u8, Ordering::Relaxed),
         "playersSleepingPercentage" => {
             GR_PLAYERS_SLEEPING_PERCENTAGE.store(value, Ordering::Relaxed)
         }
-        "waterSourceConversion" => {
-            GR_WATER_SOURCE_CONVERSION.store(value as u8, Ordering::Relaxed)
-        }
-        "lavaSourceConversion" => {
-            GR_LAVA_SOURCE_CONVERSION.store(value as u8, Ordering::Relaxed)
-        }
-        "sendCommandFeedback" => {
-            GR_SEND_COMMAND_FEEDBACK.store(value as u8, Ordering::Relaxed)
-        }
+        "waterSourceConversion" => GR_WATER_SOURCE_CONVERSION.store(value as u8, Ordering::Relaxed),
+        "lavaSourceConversion" => GR_LAVA_SOURCE_CONVERSION.store(value as u8, Ordering::Relaxed),
+        "sendCommandFeedback" => GR_SEND_COMMAND_FEEDBACK.store(value as u8, Ordering::Relaxed),
         "commandModificationBlockLimit" => {
             GR_COMMAND_MODIFICATION_BLOCK_LIMIT.store(value, Ordering::Relaxed)
         }
@@ -624,9 +611,7 @@ fn gr_do_mob_spawning() -> bool {
 /// `FlowableFluid.canConvertToSource` per kind, from the two conversion rules.
 fn source_conversion_enabled(kind: flowing_fluid::Kind) -> bool {
     match kind {
-        flowing_fluid::Kind::Water => {
-            GR_WATER_SOURCE_CONVERSION.load(Ordering::Relaxed) != 0
-        }
+        flowing_fluid::Kind::Water => GR_WATER_SOURCE_CONVERSION.load(Ordering::Relaxed) != 0,
         flowing_fluid::Kind::Lava => GR_LAVA_SOURCE_CONVERSION.load(Ordering::Relaxed) != 0,
     }
 }
@@ -671,7 +656,10 @@ fn environment_time_tick() {
     let env_clients = client_snapshot();
     __t = __prof.then(std::time::Instant::now);
     let t = TICK.fetch_add(1, Ordering::Relaxed);
-    world_border().lock().unwrap_or_else(|e| e.into_inner()).finish_lerp(border_now_ms());
+    world_border()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .finish_lerp(border_now_ms());
     {
         if let Some(t) = __t {
             tickprof::add("env/clock", t.elapsed());
@@ -790,7 +778,10 @@ fn environment_time_tick() {
                     let iv = c.inv.lock().unwrap_or_else(|e| e.into_inner());
                     iv.get(&6i16).map(|v| v.0).unwrap_or(0)
                 } == name_to_item("elytra").unwrap_or(-9);
-                let glide = !gnd && ely && py < ff - 0.1 && *c.hp.lock().unwrap_or_else(|e| e.into_inner()) > 0.0;
+                let glide = !gnd
+                    && ely
+                    && py < ff - 0.1
+                    && *c.hp.lock().unwrap_or_else(|e| e.into_inner()) > 0.0;
                 // vanilla: elytra pays 1 durability per second of glide
                 if glide && t.is_multiple_of(server_ticks(20)) && damage_inv_slot(c, 6) {
                     let st =
@@ -829,6 +820,20 @@ fn environment_time_tick() {
                     broadcast_seen(c.eid, |_c| (0x58, p.clone()));
                 }
             }
+            elytra_wall_collision_tick(
+                c,
+                *c.dim.lock().unwrap_or_else(|e| e.into_inner()),
+                px,
+                py,
+                pz,
+            );
+            elytra_wall_collision_tick(
+                c,
+                *c.dim.lock().unwrap_or_else(|e| e.into_inner()),
+                px,
+                py,
+                pz,
+            );
             // ServerPlayer decrements the damage cooldown on its own tick.
             {
                 let mut invulnerable = c.invulnerable.lock().unwrap_or_else(|e| e.into_inner());
@@ -847,7 +852,8 @@ fn environment_time_tick() {
             let fall_fly = *c.fall_fly.lock().unwrap_or_else(|e| e.into_inner());
             {
                 // drowning: 1.21.1 Entity.updateFluidOnEyes + LivingEntity.baseTick (!bubble_column)
-                let submerged = player_drowning_submerged(player_dim, px, py, pz, sneaking, fall_fly);
+                let submerged =
+                    player_drowning_submerged(player_dim, px, py, pz, sneaking, fall_fly);
                 let mut air = c.air.lock().unwrap_or_else(|e| e.into_inner());
                 if !submerged {
                     *air = server_ticks(AIR_SUPPLY_GT) as i32;
@@ -868,7 +874,8 @@ fn environment_time_tick() {
                     // vanilla: environmental damage arms the same timer, so a melee hit in
                     // the next ten ticks is measured against this amount
                     *c.last_hurt.lock().unwrap_or_else(|e| e.into_inner()) = 2.0;
-                    *c.invulnerable.lock().unwrap_or_else(|e| e.into_inner()) = server_ticks(20) as i32;
+                    *c.invulnerable.lock().unwrap_or_else(|e| e.into_inner()) =
+                        server_ticks(20) as i32;
                     if *h <= 0.0 {
                         drop(h);
                         totem_check(c);
@@ -878,7 +885,12 @@ fn environment_time_tick() {
             }
             {
                 // lava: 1.21.1 Entity.isInLava (fluidHeight[LAVA] > 0.0 with deflate(0.001))
-                let fire_immune = c.effs.lock().unwrap_or_else(|e| e.into_inner()).iter().any(|e| e.id == 11);
+                let fire_immune = c
+                    .effs
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .iter()
+                    .any(|e| e.id == 11);
                 let in_lava = !fire_immune
                     && GR_FIRE_DAMAGE.load(Ordering::Relaxed) != 0
                     && player_in_lava(player_dim, px, py, pz, sneaking, fall_fly);
@@ -887,8 +899,10 @@ fn environment_time_tick() {
                     dirty = true;
                     // vanilla: environmental damage arms the same timer, so a melee hit in
                     // the next ten ticks is measured against this amount
-                    *c.last_hurt.lock().unwrap_or_else(|e| e.into_inner()) = 4.0 * (1.0 - 0.04 * enchant_epf(c, 4) as f32);
-                    *c.invulnerable.lock().unwrap_or_else(|e| e.into_inner()) = server_ticks(20) as i32;
+                    *c.last_hurt.lock().unwrap_or_else(|e| e.into_inner()) =
+                        4.0 * (1.0 - 0.04 * enchant_epf(c, 4) as f32);
+                    *c.invulnerable.lock().unwrap_or_else(|e| e.into_inner()) =
+                        server_ticks(20) as i32;
                     if *h <= 0.0 {
                         drop(h);
                         totem_check(c);
@@ -900,14 +914,21 @@ fn environment_time_tick() {
                 let fst = name_to_state("fire").unwrap_or(u32::MAX);
                 let in_fire = !fire_immune
                     && GR_FIRE_DAMAGE.load(Ordering::Relaxed) != 0
-                    && (block_at_dim(player_dim, px.floor() as i32, py.floor() as i32, pz.floor() as i32) == fst);
+                    && (block_at_dim(
+                        player_dim,
+                        px.floor() as i32,
+                        py.floor() as i32,
+                        pz.floor() as i32,
+                    ) == fst);
                 if in_fire && t.is_multiple_of(server_ticks(20)) {
                     *h = (*h - 1.0 * (1.0 - 0.04 * enchant_epf(c, 4) as f32)).max(0.0);
                     dirty = true;
                     // vanilla: environmental damage arms the same timer, so a melee hit in
                     // the next ten ticks is measured against this amount
-                    *c.last_hurt.lock().unwrap_or_else(|e| e.into_inner()) = 1.0 * (1.0 - 0.04 * enchant_epf(c, 4) as f32);
-                    *c.invulnerable.lock().unwrap_or_else(|e| e.into_inner()) = server_ticks(20) as i32;
+                    *c.last_hurt.lock().unwrap_or_else(|e| e.into_inner()) =
+                        1.0 * (1.0 - 0.04 * enchant_epf(c, 4) as f32);
+                    *c.invulnerable.lock().unwrap_or_else(|e| e.into_inner()) =
+                        server_ticks(20) as i32;
                     if *h <= 0.0 {
                         drop(h);
                         totem_check(c);
@@ -927,7 +948,8 @@ fn environment_time_tick() {
                         ) == st
                     });
                     let frozen = {
-                        let mut timers = w1_frozen_ticks().lock().unwrap_or_else(|e| e.into_inner());
+                        let mut timers =
+                            w1_frozen_ticks().lock().unwrap_or_else(|e| e.into_inner());
                         if in_powder {
                             *timers.entry(c.eid).or_insert(0) += 1;
                             *timers.get(&c.eid).unwrap_or(&0)
@@ -945,7 +967,8 @@ fn environment_time_tick() {
                         // vanilla: environmental damage arms the same timer, so a melee hit in
                         // the next ten ticks is measured against this amount
                         *c.last_hurt.lock().unwrap_or_else(|e| e.into_inner()) = 1.0;
-                        *c.invulnerable.lock().unwrap_or_else(|e| e.into_inner()) = server_ticks(20) as i32;
+                        *c.invulnerable.lock().unwrap_or_else(|e| e.into_inner()) =
+                            server_ticks(20) as i32;
                         if *h <= 0.0 {
                             drop(h);
                             totem_check(c);
@@ -960,7 +983,8 @@ fn environment_time_tick() {
                     // vanilla: environmental damage arms the same timer, so a melee hit in
                     // the next ten ticks is measured against this amount
                     *c.last_hurt.lock().unwrap_or_else(|e| e.into_inner()) = 4.0;
-                    *c.invulnerable.lock().unwrap_or_else(|e| e.into_inner()) = server_ticks(20) as i32;
+                    *c.invulnerable.lock().unwrap_or_else(|e| e.into_inner()) =
+                        server_ticks(20) as i32;
                     if *h <= 0.0 {
                         drop(h);
                         totem_check(c);
@@ -980,7 +1004,8 @@ fn environment_time_tick() {
                         // vanilla: environmental damage arms the same timer, so a melee hit in
                         // the next ten ticks is measured against this amount
                         *c.last_hurt.lock().unwrap_or_else(|e| e.into_inner()) = 1.0;
-                        *c.invulnerable.lock().unwrap_or_else(|e| e.into_inner()) = server_ticks(20) as i32;
+                        *c.invulnerable.lock().unwrap_or_else(|e| e.into_inner()) =
+                            server_ticks(20) as i32;
                         if *h <= 0.0 {
                             drop(h);
                             totem_check(c);
@@ -1003,7 +1028,8 @@ fn environment_time_tick() {
                         // vanilla: environmental damage arms the same timer, so a melee hit in
                         // the next ten ticks is measured against this amount
                         *c.last_hurt.lock().unwrap_or_else(|e| e.into_inner()) = 1.0;
-                        *c.invulnerable.lock().unwrap_or_else(|e| e.into_inner()) = server_ticks(20) as i32;
+                        *c.invulnerable.lock().unwrap_or_else(|e| e.into_inner()) =
+                            server_ticks(20) as i32;
                         if *h <= 0.0 {
                             drop(h);
                             totem_check(c);
@@ -1022,7 +1048,8 @@ fn environment_time_tick() {
                         // the next ten ticks is measured against this amount
                         *c.last_hurt.lock().unwrap_or_else(|e| e.into_inner()) =
                             1.0 * (1.0 - 0.04 * enchant_epf(c, 4) as f32);
-                        *c.invulnerable.lock().unwrap_or_else(|e| e.into_inner()) = server_ticks(20) as i32;
+                        *c.invulnerable.lock().unwrap_or_else(|e| e.into_inner()) =
+                            server_ticks(20) as i32;
                         if *h <= 0.0 {
                             drop(h);
                             totem_check(c);
@@ -1038,7 +1065,8 @@ fn environment_time_tick() {
                         // vanilla: environmental damage arms the same timer, so a melee hit in
                         // the next ten ticks is measured against this amount
                         *c.last_hurt.lock().unwrap_or_else(|e| e.into_inner()) = 0.5;
-                        *c.invulnerable.lock().unwrap_or_else(|e| e.into_inner()) = server_ticks(20) as i32;
+                        *c.invulnerable.lock().unwrap_or_else(|e| e.into_inner()) =
+                            server_ticks(20) as i32;
                         if *h <= 0.0 {
                             drop(h);
                             totem_check(c);
@@ -1068,7 +1096,8 @@ fn environment_time_tick() {
     // powered at the even id, unpowered odd
     {
         let __tspots = __prof.then(std::time::Instant::now);
-        let mut spots: std::collections::HashSet<(i32, i32, i32)> = std::collections::HashSet::new();
+        let mut spots: std::collections::HashSet<(i32, i32, i32)> =
+            std::collections::HashSet::new();
         {
             for c in clients().lock().unwrap_or_else(|e| e.into_inner()).iter() {
                 let p = c.pos.lock().unwrap_or_else(|e| e.into_inner());
@@ -1076,7 +1105,12 @@ fn environment_time_tick() {
             }
         }
         {
-            for m in mobs().lock().unwrap_or_else(|e| e.into_inner()).iter().filter(|mob| mob.dim == DimId::Overworld) {
+            for m in mobs()
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .iter()
+                .filter(|mob| mob.dim == DimId::Overworld)
+            {
                 let p = m.pos.lock().unwrap_or_else(|e| e.into_inner());
                 spots.insert((p.0.floor() as i32, p.1.floor() as i32, p.2.floor() as i32));
             }
@@ -1182,8 +1216,14 @@ fn environment_time_tick() {
         if !env_clients.is_empty()
             || !mobs().lock().unwrap_or_else(|e| e.into_inner()).is_empty()
             || !drops().lock().unwrap_or_else(|e| e.into_inner()).is_empty()
-            || !arrows().lock().unwrap_or_else(|e| e.into_inner()).is_empty()
-            || !falling().lock().unwrap_or_else(|e| e.into_inner()).is_empty()
+            || !arrows()
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .is_empty()
+            || !falling()
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .is_empty()
             || !crops().lock().unwrap_or_else(|e| e.into_inner()).is_empty()
         {
             note_world_persist_dirty();
@@ -1235,13 +1275,22 @@ fn environment_time_tick() {
         // fishing bobbers: fly, land on water, bite after 3-7 s
         let mut fb = bobbers().lock().unwrap_or_else(|e| e.into_inner());
         for b in fb.iter_mut() {
+            let dim = env_clients
+                .iter()
+                .find(|client| client.eid == b.owner)
+                .map(|client| *client.dim.lock().unwrap_or_else(|e| e.into_inner()))
+                .unwrap_or(DimId::Overworld);
             if !region.is_hot(b.x as i32, b.z as i32) {
                 continue;
             }
             b.age += 1;
             let wst = name_to_state("water").unwrap_or(u32::MAX);
-            let in_water =
-                block_at(b.x.floor() as i32, b.y.floor() as i32, b.z.floor() as i32) == wst;
+            let in_water = block_at_dim(
+                dim,
+                b.x.floor() as i32,
+                b.y.floor() as i32,
+                b.z.floor() as i32,
+            ) == wst;
             if !in_water && b.dy.abs() + b.dx.abs() + b.dz.abs() > 0.01 {
                 // Drag belongs on the velocity, not on the displacement, or the
                 // horizontal velocity never decays. Values are unchanged here.
@@ -1366,10 +1415,7 @@ fn environment_time_tick() {
                 if is_end_gateway_state(hit_st) {
                     // A pearl that lands in a gateway beam warps its owner to
                     // the beam's exit: no pearl damage, no fall damage.
-                    end_gateway_warp(
-                        c,
-                        (tx.floor() as i32, ty.floor() as i32, tz.floor() as i32),
-                    );
+                    end_gateway_warp(c, (tx.floor() as i32, ty.floor() as i32, tz.floor() as i32));
                     continue;
                 }
                 // The endermite appears where the player was standing when the
@@ -1409,25 +1455,32 @@ fn environment_time_tick() {
         // snowballs: fly, hit mob -> hurt flash
         // Snapshot Overworld mob hitboxes once for the whole pass instead of
         // re-locking mobs() and every mob pos per projectile.
-        let mob_boxes: Vec<(i32, f64, f64, f64)> = mobs()
+        let mob_boxes: Vec<(DimId, i32, f64, f64, f64)> = mobs()
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .iter()
-            .filter(|mob| mob.dim == DimId::Overworld)
             .map(|m| {
                 let mp = m.pos.lock().unwrap_or_else(|e| e.into_inner());
-                (m.eid, mp.0, mp.1, mp.2)
+                (m.dim, m.eid, mp.0, mp.1, mp.2)
             })
             .collect();
         let mut sl2 = snowballs().lock().unwrap_or_else(|e| e.into_inner());
         let mut done: Vec<ThrowHit> = vec![];
         for p0 in sl2.iter_mut() {
+            let dim = env_clients
+                .iter()
+                .find(|client| client.eid == p0.owner)
+                .map(|client| *client.dim.lock().unwrap_or_else(|e| e.into_inner()))
+                .unwrap_or(DimId::Overworld);
             if !region.is_hot(p0.x as i32, p0.z as i32) {
                 continue;
             }
             p0.ttl -= 1;
             let mut hit_mob: Option<i32> = None;
-            for &(eid, mx, my, mz) in &mob_boxes {
+            for &(mob_dim, eid, mx, my, mz) in &mob_boxes {
+                if mob_dim != dim {
+                    continue;
+                }
                 if (mx - p0.x).abs() < 0.6
                     && (mz - p0.z).abs() < 0.6
                     && p0.y > my - 0.3
@@ -1437,13 +1490,14 @@ fn environment_time_tick() {
                     break;
                 }
             }
-            let blocked = block_at(
+            let blocked = block_at_dim(
+                dim,
                 p0.x.floor() as i32,
                 p0.y.floor() as i32,
                 p0.z.floor() as i32,
             ) != 0;
             if hit_mob.is_some() || blocked || p0.ttl <= 0 {
-                done.push((p0.eid, hit_mob, p0.dx, p0.dz, p0.egg, p0.x, p0.y, p0.z));
+                done.push((dim, p0.eid, hit_mob, p0.dx, p0.dz, p0.egg, p0.x, p0.y, p0.z));
             } else {
                 // Snowballs and eggs are ThrowableProjectile, like the pearl, so
                 // they scale the velocity by 0.99 and use the 0.03 gravity. This
@@ -1463,13 +1517,13 @@ fn environment_time_tick() {
                 });
             }
         }
-        for (seid, hit, pdx, pdz, is_egg, ix, iy, iz) in done {
+        for (dim, seid, hit, pdx, pdz, is_egg, ix, iy, iz) in done {
             sl2.retain(|p0| p0.eid != seid);
             broadcast_seen_destroy(seid);
             // vanilla: an egg that lands has a 1/8 chance to hatch a chicken
             if is_egg && world_rng::next_u64().is_multiple_of(8) {
                 let m = Arc::new(Mob {
-                    dim: DimId::Overworld,
+                    dim,
                     eid: NEXT_EID.fetch_add(1, Ordering::SeqCst),
                     uuid: [0u8; 16],
                     etype: 19,
@@ -1622,9 +1676,7 @@ fn live_mob_category(etype: i64) -> Option<MobCategory> {
         EntityMobCategory::Creature => MobCategory::Creature,
         EntityMobCategory::Ambient => MobCategory::Ambient,
         EntityMobCategory::Axolotls => MobCategory::Axolotls,
-        EntityMobCategory::UndergroundWaterCreature => {
-            MobCategory::UndergroundWaterCreature
-        }
+        EntityMobCategory::UndergroundWaterCreature => MobCategory::UndergroundWaterCreature,
         EntityMobCategory::WaterCreature => MobCategory::WaterCreature,
         EntityMobCategory::WaterAmbient => MobCategory::WaterAmbient,
         EntityMobCategory::Misc => return None,
@@ -1723,7 +1775,8 @@ fn live_spawn_anchors(clients: &[Arc<Client>], dim: DimId) -> Vec<[f64; 3]> {
     clients
         .iter()
         .filter_map(|client| {
-            if client.is_spectator() || *client.dim.lock().unwrap_or_else(|e| e.into_inner()) != dim {
+            if client.is_spectator() || *client.dim.lock().unwrap_or_else(|e| e.into_inner()) != dim
+            {
                 return None;
             }
             let (x, y, z, ..) = *client.pos.lock().unwrap_or_else(|e| e.into_inner());
@@ -1738,7 +1791,10 @@ fn live_spawn_chunks(players: &[[f64; 3]]) -> HashSet<(i32, i32)> {
     for &[x, _, z] in players {
         extend_chunk_square(
             &mut chunks,
-            ((x.floor() as i32).div_euclid(16), (z.floor() as i32).div_euclid(16)),
+            (
+                (x.floor() as i32).div_euclid(16),
+                (z.floor() as i32).div_euclid(16),
+            ),
             NATURAL_SPAWN_CHUNK_RADIUS,
         );
     }
@@ -1768,7 +1824,10 @@ fn live_spawn_position_ok(
     if nearest_squared <= SPAWN_MIN_PLAYER_DIST_SQ {
         return false;
     }
-    let (min_x, min_z, max_x, max_z) = world_border().lock().unwrap_or_else(|e| e.into_inner()).bounds(border_now_ms());
+    let (min_x, min_z, max_x, max_z) = world_border()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .bounds(border_now_ms());
     (min_x..max_x).contains(&f64::from(x)) && (min_z..max_z).contains(&f64::from(z))
 }
 
@@ -1790,7 +1849,13 @@ fn live_passive_spawn_attempt(x: i32, y: i32, z: i32, light: i32, cap: usize, ki
     live_natural_spawn(
         kind,
         DimId::Overworld,
-        (f64::from(x) + 0.5, f64::from(y), f64::from(z) + 0.5, 0.0, 0.0),
+        (
+            f64::from(x) + 0.5,
+            f64::from(y),
+            f64::from(z) + 0.5,
+            0.0,
+            0.0,
+        ),
     )
 }
 
@@ -1798,9 +1863,7 @@ fn live_passive_spawn_attempt(x: i32, y: i32, z: i32, light: i32, cap: usize, ki
 /// heightmap points at a tree canopy or a layer of vegetation.
 fn find_passive_ground_y(reg: &BReg, x: i32, z: i32) -> Option<i32> {
     let surface = surface_y(x, z).floor() as i32;
-    let scan_min = surface
-        .saturating_sub(24)
-        .max(DimId::Overworld.min_y());
+    let scan_min = surface.saturating_sub(24).max(DimId::Overworld.min_y());
     for ground_y in (scan_min..surface).rev() {
         let state = block_at(x, ground_y, z);
         let ground = matches!(
@@ -1837,10 +1900,10 @@ fn passive_spawn_candidate(
     attempt: u64,
     index: usize,
 ) -> (i32, i32) {
-    let rotation = (tick.wrapping_add(attempt) % PASSIVE_SPAWN_CANDIDATE_OFFSETS.len() as u64)
-        as usize;
-    let (dx, dz) = PASSIVE_SPAWN_CANDIDATE_OFFSETS
-        [(index + rotation) % PASSIVE_SPAWN_CANDIDATE_OFFSETS.len()];
+    let rotation =
+        (tick.wrapping_add(attempt) % PASSIVE_SPAWN_CANDIDATE_OFFSETS.len() as u64) as usize;
+    let (dx, dz) =
+        PASSIVE_SPAWN_CANDIDATE_OFFSETS[(index + rotation) % PASSIVE_SPAWN_CANDIDATE_OFFSETS.len()];
     (player_x.floor() as i32 + dx, player_z.floor() as i32 + dz)
 }
 
@@ -1886,11 +1949,9 @@ fn spawn_passive_natural(tick: u64) {
         {
             continue;
         }
-        let biome = worldgen::with_gen_dim(DimId::Overworld, |g| {
-            g.biome_name_at(bx, anchor_y, bz)
-        })
-        .flatten()
-        .unwrap_or_else(|| "minecraft:plains".to_string());
+        let biome = worldgen::with_gen_dim(DimId::Overworld, |g| g.biome_name_at(bx, anchor_y, bz))
+            .flatten()
+            .unwrap_or_else(|| "minecraft:plains".to_string());
         let entries: Vec<&feature::SpawnerData> = feature::spawners_for(&biome, "creature")
             .unwrap_or_default()
             .iter()
@@ -1943,9 +2004,7 @@ fn live_aquatic_spawn_attempt(
     cap: usize,
     kind: &str,
 ) -> bool {
-    if !(50..=63).contains(&y)
-        || live_category_count(DimId::Overworld, category) >= cap
-    {
+    if !(50..=63).contains(&y) || live_category_count(DimId::Overworld, category) >= cap {
         return false;
     }
     let Some(reg) = breg() else {
@@ -1957,7 +2016,13 @@ fn live_aquatic_spawn_attempt(
     live_natural_spawn(
         kind,
         DimId::Overworld,
-        (f64::from(x) + 0.5, f64::from(y), f64::from(z) + 0.5, 0.0, 0.0),
+        (
+            f64::from(x) + 0.5,
+            f64::from(y),
+            f64::from(z) + 0.5,
+            0.0,
+            0.0,
+        ),
     )
 }
 
@@ -2003,8 +2068,13 @@ fn live_underground_spawn_attempt(
     live_natural_spawn(
         &entry.kind,
         DimId::Overworld,
-        (f64::from(pos.x) + 0.5, f64::from(pos.y), f64::from(pos.z) + 0.5,
-         nightly_spawn_float() * 360.0, 0.0),
+        (
+            f64::from(pos.x) + 0.5,
+            f64::from(pos.y),
+            f64::from(pos.z) + 0.5,
+            nightly_spawn_float() * 360.0,
+            0.0,
+        ),
     )
 }
 
@@ -2022,7 +2092,8 @@ fn spawn_underground_natural(tick: u64) {
     let sea = worldgen::sea_level();
     let min_y = DimId::Overworld.min_y() + 1;
     let mut rng = generation_math::Lcg::new(
-        WORLD_SEED.load(Ordering::Relaxed)
+        WORLD_SEED
+            .load(Ordering::Relaxed)
             .wrapping_add(tick.wrapping_mul(0xD1B5_4A32_D192_ED03)),
     );
     for category in [
@@ -2054,13 +2125,14 @@ fn spawn_underground_natural(tick: u64) {
             if !live_spawn_position_ok(&players, &chunks, x, y, z) {
                 continue;
             }
-            let Some(biome) = worldgen::with_gen_dim(DimId::Overworld, |gen| {
-                gen.biome_name_at(x, y, z)
-            }).flatten() else {
+            let Some(biome) =
+                worldgen::with_gen_dim(DimId::Overworld, |gen| gen.biome_name_at(x, y, z))
+                    .flatten()
+            else {
                 continue;
             };
-            let entries = feature::spawners_for(&biome, mob_category_key(category))
-                .unwrap_or_default();
+            let entries =
+                feature::spawners_for(&biome, mob_category_key(category)).unwrap_or_default();
             let Some(entry) = choose_nightly_spawner(entries) else {
                 continue;
             };
@@ -2101,7 +2173,13 @@ fn live_end_spawn_attempt(x: i32, y: i32, z: i32, light: i32, cap: usize) -> boo
     live_natural_spawn(
         "enderman",
         DimId::End,
-        (f64::from(x) + 0.5, f64::from(y), f64::from(z) + 0.5, 0.0, 0.0),
+        (
+            f64::from(x) + 0.5,
+            f64::from(y),
+            f64::from(z) + 0.5,
+            0.0,
+            0.0,
+        ),
     )
 }
 
@@ -2136,9 +2214,10 @@ impl spawner::ChunkGenerationWorld for LiveChunkGenWorld {
                 (reg.name_of(state) == "minecraft:lava").then_some(state)
             }) {
                 let top = self.dim.min_y() + self.dim.height();
-                if let Some(y) = (self.dim.min_y()..top).rev().find(|&y| {
-                    block_at_dim(self.dim, x, y, z) == lava
-                }) {
+                if let Some(y) = (self.dim.min_y()..top)
+                    .rev()
+                    .find(|&y| block_at_dim(self.dim, x, y, z) == lava)
+                {
                     return y;
                 }
             }
@@ -2160,17 +2239,15 @@ impl spawner::ChunkGenerationWorld for LiveChunkGenWorld {
                 (base..self.dim.min_y() + self.dim.height())
                     .rev()
                     .find(|&y| {
-                        cells
-                            .get(&local_idx(x, y, z))
-                            .is_some_and(|&st| {
-                                reg.is_none_or(|reg| {
-                                    !reg.is_air(st)
-                                        && !reg.is_liquid(st)
-                                        && !reg.in_tag(st, "minecraft:leaves")
-                                        && !reg.name_of(st).ends_with("_leaves")
-                                        && reg.is_collision_shape_full_block(st)
-                                })
+                        cells.get(&local_idx(x, y, z)).is_some_and(|&st| {
+                            reg.is_none_or(|reg| {
+                                !reg.is_air(st)
+                                    && !reg.is_liquid(st)
+                                    && !reg.in_tag(st, "minecraft:leaves")
+                                    && !reg.name_of(st).ends_with("_leaves")
+                                    && reg.is_collision_shape_full_block(st)
                             })
+                        })
                     })
                     .map(|y| y + 1)
             })
@@ -2213,7 +2290,13 @@ impl spawner::ChunkGenerationWorld for LiveChunkGenWorld {
         if live_natural_spawn(
             kind.strip_prefix("minecraft:").unwrap_or(kind),
             self.dim,
-            (f64::from(pos.0) + 0.5, f64::from(pos.1), f64::from(pos.2) + 0.5, 0.0, 0.0),
+            (
+                f64::from(pos.0) + 0.5,
+                f64::from(pos.1),
+                f64::from(pos.2) + 0.5,
+                0.0,
+                0.0,
+            ),
         ) {
             self.added += 1;
         }
@@ -2226,7 +2309,11 @@ impl spawner::ChunkGenerationWorld for LiveChunkGenWorld {
 /// `doMobSpawning` was off does not retroactively spawn a herd, matching the
 /// vanilla chunk-creation attachment. Returns whether the pass ran.
 fn live_chunkgen_visit(dim: DimId, cx: i32, cz: i32) -> bool {
-    if !spawned_creature_chunks().lock().unwrap_or_else(|e| e.into_inner()).insert((dim, cx, cz)) {
+    if !spawned_creature_chunks()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .insert((dim, cx, cz))
+    {
         return false;
     }
     live_chunkgen_run(dim, cx, cz, None)
@@ -2292,7 +2379,10 @@ fn spawn_chunkgen_creatures(_tick: u64) {
         };
         extend_chunk_square(
             chunks,
-            ((x.floor() as i32).div_euclid(16), (z.floor() as i32).div_euclid(16)),
+            (
+                (x.floor() as i32).div_euclid(16),
+                (z.floor() as i32).div_euclid(16),
+            ),
             4,
         );
     }
@@ -2321,10 +2411,9 @@ fn grow_crops(t: u64, is_warm: impl Fn(i32, i32) -> bool) {
         let mut transitions = Vec::new();
         for pos @ (dim, x, y, z) in keys {
             let age = cg.get(&pos).copied().unwrap_or(0);
-            let hash = ((x as i64).wrapping_mul(31)
-                ^ (z as i64).wrapping_mul(37)
-                ^ (y as i64)
-                ^ t as i64) as u64;
+            let hash =
+                ((x as i64).wrapping_mul(31) ^ (z as i64).wrapping_mul(37) ^ (y as i64) ^ t as i64)
+                    as u64;
             if hash.is_multiple_of(CROP_GROWTH_DENOMINATOR) && age < 7 {
                 cg.insert(pos, age + 1);
                 transitions.push((dim, x, y, z, 4278 + age as u32 + 1));
@@ -2337,7 +2426,6 @@ fn grow_crops(t: u64, is_warm: impl Fn(i32, i32) -> bool) {
         note_block_update_dim(dim, x, y, z, state);
     }
 }
-
 
 // minimal redstone: lever powers 6 adjacent cells -> iron door opens/closes, piston pushes one block
 fn redstone_update(x: i32, y: i32, z: i32, powered: bool) {
@@ -2426,7 +2514,12 @@ fn actors() -> &'static Mutex<HashMap<String, Arc<Actor>>> {
     ACTORS.get_or_init(|| Mutex::new(HashMap::new()))
 }
 fn actor_tick() {
-    let acts: Vec<Arc<Actor>> = actors().lock().unwrap_or_else(|e| e.into_inner()).values().cloned().collect();
+    let acts: Vec<Arc<Actor>> = actors()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .values()
+        .cloned()
+        .collect();
     for a in acts {
         let act = *a.action.lock().unwrap_or_else(|e| e.into_inner());
         let look = *a.look.lock().unwrap_or_else(|e| e.into_inner());
@@ -2612,7 +2705,10 @@ fn lava_tick() {
         }
         let st = block_at(x, y, z);
         if !(96..=111).contains(&st) {
-            lavas().lock().unwrap_or_else(|e| e.into_inner()).remove(&(x, y, z));
+            lavas()
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .remove(&(x, y, z));
             continue;
         }
         let lvl = st - 96;
@@ -2667,7 +2763,10 @@ fn water_tick() {
         }
         let st = block_at(x, y, z);
         if !(80..=95).contains(&st) {
-            waters().lock().unwrap_or_else(|e| e.into_inner()).remove(&(x, y, z));
+            waters()
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .remove(&(x, y, z));
             continue;
         }
         let lvl = st - 80;
@@ -2793,7 +2892,10 @@ fn new_live_mob(
         behavior.size = size;
     }
     if state.behavior.is_some() {
-        live_mob_states().lock().unwrap_or_else(|e| e.into_inner()).insert(eid, state);
+        live_mob_states()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(eid, state);
     }
     // Entity IDs are unique within the running world, including split children.
     let mut uuid = [0; 16];
@@ -2820,7 +2922,10 @@ fn new_live_mob(
 fn remove_live_mob(eid: i32) -> Option<(Arc<Mob>, Option<LiveMobState>)> {
     let mut mobs = mobs().lock().unwrap_or_else(|e| e.into_inner());
     let index = mobs.iter().position(|mob| mob.eid == eid)?;
-    let state = live_mob_states().lock().unwrap_or_else(|e| e.into_inner()).remove(&eid);
+    let state = live_mob_states()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .remove(&eid);
     let mob = mobs.remove(index);
     shrink_if_sparse(&mut mobs);
     drop(mobs);
@@ -2850,7 +2955,10 @@ fn convert_live_mob(mob: &Mob, dim: DimId, etype: i64) {
     }
     let hp = default_mob_hp(entity_spec_by_id(etype).unwrap().name);
     *slot = new_live_mob(etype, dim, pos, hp, None);
-    live_mob_states().lock().unwrap_or_else(|e| e.into_inner()).remove(&mob.eid);
+    live_mob_states()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .remove(&mob.eid);
     drop(mobs);
     broadcast_seen_destroy(mob.eid);
 }
@@ -2952,11 +3060,7 @@ fn mob_tether_pos(eid: i32) -> Option<(DimId, f64, f64, f64)> {
 fn tether_anchor_pos(anchor: &TetherAnchor) -> Option<(DimId, f64, f64, f64)> {
     match *anchor {
         TetherAnchor::Entity(eid) => entity_pos_dim(eid),
-        TetherAnchor::FenceKnot {
-            dim,
-            pos,
-            knot_eid,
-        } => leash_knots()
+        TetherAnchor::FenceKnot { dim, pos, knot_eid } => leash_knots()
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .contains_key(&knot_eid)
@@ -3026,8 +3130,7 @@ fn detach_tethers_involving(eid: i32, drop_pos_of_eid: Option<(f64, f64, f64)>) 
         let map = entity_tethers().lock().unwrap_or_else(|e| e.into_inner());
         map.values()
             .filter(|t| {
-                t.target_eid == eid
-                    || matches!(t.anchor, TetherAnchor::Entity(a) if a == eid)
+                t.target_eid == eid || matches!(t.anchor, TetherAnchor::Entity(a) if a == eid)
             })
             .map(|t| (t.target_eid, t.target_eid == eid))
             .collect()
@@ -3084,11 +3187,7 @@ fn hitch_player_tethers(player_eid: i32, dim: DimId, pos: BlockPos) -> bool {
     for target in held {
         let mut map = entity_tethers().lock().unwrap_or_else(|e| e.into_inner());
         if let Some(t) = map.get_mut(&target) {
-            t.anchor = TetherAnchor::FenceKnot {
-                dim,
-                pos,
-                knot_eid,
-            };
+            t.anchor = TetherAnchor::FenceKnot { dim, pos, knot_eid };
         }
         drop(map);
         broadcast_seen(target, move |_c| {
@@ -3114,7 +3213,9 @@ fn break_leash_knot(knot_eid: i32) -> bool {
         .lock()
         .unwrap_or_else(|e| e.into_inner())
         .values()
-        .filter(|t| matches!(t.anchor, TetherAnchor::FenceKnot { knot_eid: k, .. } if k == knot_eid))
+        .filter(
+            |t| matches!(t.anchor, TetherAnchor::FenceKnot { knot_eid: k, .. } if k == knot_eid),
+        )
         .map(|t| t.target_eid)
         .collect();
     for target in anchored {
@@ -3230,11 +3331,7 @@ fn tether_step(tether: &EntityTether) {
         let impulse = |d: f64| 0.4 * d * d * d.signum();
         tether_move(
             tether.target_eid,
-            [
-                impulse(dx / dist),
-                impulse(dy / dist),
-                impulse(dz / dist),
-            ],
+            [impulse(dx / dist), impulse(dy / dist), impulse(dz / dist)],
         );
     }
 }
@@ -3288,7 +3385,13 @@ fn tether_tick() {
 
 fn live_mob_interact(client: &Client, target: i32, slot: i16) -> bool {
     let gm = *client.gm.lock().unwrap_or_else(|e| e.into_inner());
-    if gm == 3 || !client.seen.lock().unwrap_or_else(|e| e.into_inner()).contains(&target) {
+    if gm == 3
+        || !client
+            .seen
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .contains(&target)
+    {
         return false;
     }
     let mob = mobs()
@@ -3395,7 +3498,8 @@ impl<'a> LiveMobPlayer<'a> {
             pos: (x, y, z),
             dim: *client.dim.lock().unwrap_or_else(|e| e.into_inner()),
             held_item,
-            attackable: matches!(gm, 0 | 2) && *client.hp.lock().unwrap_or_else(|e| e.into_inner()) > 0.0,
+            attackable: matches!(gm, 0 | 2)
+                && *client.hp.lock().unwrap_or_else(|e| e.into_inner()) > 0.0,
         }
     }
 
@@ -3665,27 +3769,30 @@ fn live_skeleton_shoot(mob: &Mob, pos: [f64; 3], target: (f64, f64, f64)) {
     *last_hit = Instant::now();
     let [x, y, z] = [pos[0], pos[1] + 1.6, pos[2]];
     let [dx, dy, dz] = mob_behavior_unit([target.0 - x, target.1 + 1.2 - y, target.2 - z]);
-    arrows().lock().unwrap_or_else(|e| e.into_inner()).push(Arrow {
-        eid: NEXT_EID.fetch_add(1, Ordering::SeqCst),
-        owner: -1,
-        x,
-        y,
-        z,
-        dx,
-        dy,
-        dz,
-        ttl: server_ticks(MOB_ARROW_TTL_GT) as i32,
-        dmg: diff_mob_dmg(3.0),
-        fire: 0,
-        punch: 0,
-        kind: 0,
-        loy: 0,
-        ret_item: 0,
-        ret_comps: Vec::new(),
-        pierce: 0,
-        last_hit: -1,
-        stuck: false,
-    });
+    arrows()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .push(Arrow {
+            eid: NEXT_EID.fetch_add(1, Ordering::SeqCst),
+            owner: -1,
+            x,
+            y,
+            z,
+            dx,
+            dy,
+            dz,
+            ttl: server_ticks(MOB_ARROW_TTL_GT) as i32,
+            dmg: diff_mob_dmg(3.0),
+            fire: 0,
+            punch: 0,
+            kind: 0,
+            loy: 0,
+            ret_item: 0,
+            ret_comps: Vec::new(),
+            pierce: 0,
+            last_hit: -1,
+            stuck: false,
+        });
 }
 
 fn live_mob_metadata(eid: i32, index: u8, kind: u8, value: u8) -> Vec<u8> {
@@ -3715,7 +3822,11 @@ fn live_mob_spawn_packets(mob: &Mob) -> Vec<(i64, Vec<u8>)> {
         };
         packets.push((0x59, set_entity_link_pkt(mob.eid, holding)));
     }
-    if let Some(state) = live_mob_states().lock().unwrap_or_else(|e| e.into_inner()).get(&mob.eid) {
+    if let Some(state) = live_mob_states()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .get(&mob.eid)
+    {
         match &state.behavior {
             Some(MobBehaviorState::Slime { behavior, .. }) => {
                 packets.push((0x58, live_mob_metadata(mob.eid, 16, 1, behavior.size as u8)));
@@ -3903,7 +4014,9 @@ fn live_dragon_clouds() -> &'static Mutex<Vec<LiveDragonBreath>> {
 }
 
 fn live_dragon_breath(dim: DimId, pos: [f64; 3]) {
-    let mut clouds = live_dragon_clouds().lock().unwrap_or_else(|e| e.into_inner());
+    let mut clouds = live_dragon_clouds()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
     if clouds.len() < MOB_CAP {
         clouds.push(LiveDragonBreath {
             eid: NEXT_EID.fetch_add(1, Ordering::SeqCst),
@@ -3915,7 +4028,9 @@ fn live_dragon_breath(dim: DimId, pos: [f64; 3]) {
 }
 
 fn tick_live_mob_projectiles(reg: &crate::block_registry::BReg, players: &[LiveMobPlayer<'_>]) {
-    let mut projectiles = live_mob_projectiles().lock().unwrap_or_else(|e| e.into_inner());
+    let mut projectiles = live_mob_projectiles()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
     projectiles.retain_mut(|projectile| {
         let LiveMobProjectile { eid, dim, pos, .. } = *projectile;
         projectile.age += 1;
@@ -3963,9 +4078,8 @@ fn tick_live_mob_projectiles(reg: &crate::block_registry::BReg, players: &[LiveM
             // P6c / #215: the hit cell is one nudge past the surface point
             // along the shot; a `target` block there takes its
             // onProjectileHit hook.
-            let cell: [i32; 3] = std::array::from_fn(|i| {
-                (point[i] + projectile.velocity[i] * 1e-3).floor() as i32
-            });
+            let cell: [i32; 3] =
+                std::array::from_fn(|i| (point[i] + projectile.velocity[i] * 1e-3).floor() as i32);
             w1_live_target_projectile_hit(
                 dim,
                 RsPos(cell[0], cell[1], cell[2]),
@@ -3989,23 +4103,26 @@ fn tick_live_mob_projectiles(reg: &crate::block_registry::BReg, players: &[LiveM
         false
     });
     drop(projectiles);
-    live_dragon_clouds().lock().unwrap_or_else(|e| e.into_inner()).retain_mut(|cloud| {
-        cloud.left -= 1;
-        if cloud.left == 0 {
-            broadcast_seen_destroy(cloud.eid);
-            return false;
-        }
-        if cloud.left.is_multiple_of(20) {
-            let [x, y, z] = cloud.pos;
-            for player in players
-                .iter()
-                .filter(|p| p.dim == cloud.dim && entity_distance_sq(p.pos, (x, y, z)) < 9.0)
-            {
-                live_mob_damage_player(player.client, cloud.pos, 6.0, None, None);
+    live_dragon_clouds()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .retain_mut(|cloud| {
+            cloud.left -= 1;
+            if cloud.left == 0 {
+                broadcast_seen_destroy(cloud.eid);
+                return false;
             }
-        }
-        true
-    });
+            if cloud.left.is_multiple_of(20) {
+                let [x, y, z] = cloud.pos;
+                for player in players
+                    .iter()
+                    .filter(|p| p.dim == cloud.dim && entity_distance_sq(p.pos, (x, y, z)) < 9.0)
+                {
+                    live_mob_damage_player(player.client, cloud.pos, 6.0, None, None);
+                }
+            }
+            true
+        });
 }
 
 fn live_mob_behavior_step(
@@ -4056,7 +4173,13 @@ fn live_mob_behavior_step(
     } else {
         Vec::new()
     };
-    let shot_ready = || mob.last_hit.lock().unwrap_or_else(|e| e.into_inner()).elapsed() >= Duration::from_secs(2);
+    let shot_ready = || {
+        mob.last_hit
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .elapsed()
+            >= Duration::from_secs(2)
+    };
     let world = match behavior {
         MobBehaviorState::Blaze(_) => {
             ctx.on_fire = state.blaze_charged;
@@ -4152,7 +4275,11 @@ fn apply_live_mob_effects(
     for effect in effects {
         match effect {
             SetOnFire(charged) => {
-                if let Some(state) = live_mob_states().lock().unwrap_or_else(|e| e.into_inner()).get_mut(&mob.eid) {
+                if let Some(state) = live_mob_states()
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .get_mut(&mob.eid)
+                {
                     state.blaze_charged = charged;
                 }
                 broadcast_seen(mob.eid, |_| {
@@ -4176,7 +4303,9 @@ fn apply_live_mob_effects(
                 if matches!(kind, MobProjectileKind::WitchSplash(_)) {
                     dir[1] += 0.25;
                 }
-                let mut projectiles = live_mob_projectiles().lock().unwrap_or_else(|e| e.into_inner());
+                let mut projectiles = live_mob_projectiles()
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner());
                 if projectiles.len() < MOB_CAP {
                     projectiles.push(LiveMobProjectile {
                         eid: NEXT_EID.fetch_add(1, Ordering::SeqCst),
@@ -4258,7 +4387,11 @@ fn apply_live_mob_effects(
             } => {
                 if target_eid == mob.eid {
                     let ticks = server_ticks(u64::from(duration_ticks));
-                    if let Some(state) = live_mob_states().lock().unwrap_or_else(|e| e.into_inner()).get_mut(&mob.eid) {
+                    if let Some(state) = live_mob_states()
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .get_mut(&mob.eid)
+                    {
                         state.potions.retain(|&(old, _)| old != effect);
                         state
                             .potions
@@ -4430,13 +4563,16 @@ fn w1_wool_colors() -> &'static Mutex<HashMap<i32, u8>> {
 /// its destroy packet and leaves the tracker list.
 fn w1_evoker_fangs_tick() {
     let mut dead = Vec::new();
-    w1_evoker_fangs().lock().unwrap_or_else(|e| e.into_inner()).retain_mut(|(eid, left)| {
-        *left -= 1;
-        if *left <= 0 {
-            dead.push(*eid);
-        }
-        *left > 0
-    });
+    w1_evoker_fangs()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .retain_mut(|(eid, left)| {
+            *left -= 1;
+            if *left <= 0 {
+                dead.push(*eid);
+            }
+            *left > 0
+        });
     for eid in dead {
         broadcast_seen_destroy(eid);
     }
@@ -4544,10 +4680,8 @@ fn w1_live_target_projectile_hit(
         set_block_if_inner_dim(dim, x, y, z, state, None);
         note_block_update_dim(dim, x, y, z, block_at_dim(dim, x, y, z));
     }
-    if dim == DimId::Overworld {
-        for RsPos(x, y, z) in dispensers {
-            fire_dispenser(x, y, z, block_at(x, y, z));
-        }
+    for RsPos(x, y, z) in dispensers {
+        fire_dispenser_dim(dim, x, y, z, block_at_dim(dim, x, y, z));
     }
 }
 
@@ -4676,7 +4810,11 @@ fn w1_detector_power(dim: DimId, x: i32, y: i32, z: i32, on: bool) {
 /// boost/brake, detector signal), and rideable mobs steer off the driver's
 /// `PlayerInput`. Evaluator outputs move the live entity, re-seat its
 /// passengers, and broadcast a `0x70` teleport.
-type SeatSnapshot = (Option<PaddleBoatPacket>, Option<PlayerInputPacket>, Vec<i32>);
+type SeatSnapshot = (
+    Option<PaddleBoatPacket>,
+    Option<PlayerInputPacket>,
+    Vec<i32>,
+);
 fn w1_vehicle_tick() {
     let Some(reg) = breg() else { return };
     let snap: Vec<(Arc<Mob>, VehicleKind)> = mobs()
@@ -4796,8 +4934,11 @@ fn w1_vehicle_tick() {
             VehicleKind::Minecart => {
                 let has_passenger = !passengers.is_empty();
                 let mut vel = wm_minecart_slowdown(has_passenger, env.on_water, state.vel);
-                let (bx, by, bz) =
-                    (pos[0].floor() as i32, pos[1].floor() as i32, pos[2].floor() as i32);
+                let (bx, by, bz) = (
+                    pos[0].floor() as i32,
+                    pos[1].floor() as i32,
+                    pos[2].floor() as i32,
+                );
                 let rail = [by, by - 1].into_iter().find_map(|ry| {
                     let st = block_at_dim(dim, bx, ry, bz);
                     matches!(
@@ -4819,12 +4960,7 @@ fn w1_vehicle_tick() {
                                 _ => WmRailShape::Other,
                             };
                             let conductor = |dx: i32, dz: i32| {
-                                reg.is_redstone_conductor(block_at_dim(
-                                    dim,
-                                    bx + dx,
-                                    ry,
-                                    bz + dz,
-                                ))
+                                reg.is_redstone_conductor(block_at_dim(dim, bx + dx, ry, bz + dz))
                             };
                             let (neg, pos_conductor) = match shape {
                                 WmRailShape::EastWest => (conductor(1, 0), conductor(-1, 0)),
@@ -4853,9 +4989,7 @@ fn w1_vehicle_tick() {
                     // The rail carries y: the cart rides 0.0625 above the
                     // rail block's top face.
                     new_pos = [pos[0] + vel[0], f64::from(ry) + 0.0625, pos[2] + vel[2]];
-                    if name == "minecraft:detector_rail"
-                        && wm_detector_rail_signal(true) == 15
-                    {
+                    if name == "minecraft:detector_rail" && wm_detector_rail_signal(true) == 15 {
                         occupied_rails.insert((dim, bx, ry, bz));
                     }
                 } else {
@@ -4916,12 +5050,8 @@ fn w1_vehicle_tick() {
                     // The 0x26 packet is the instant-jump edge; vanilla's
                     // charge meter rides the jump action button instead.
                     let scale = wm_horse_jump_scale(100);
-                    state.vel[1] = wm_horse_jump_velocity(
-                        0.7,
-                        scale,
-                        1.0,
-                        wm_jump_boost_power(None),
-                    );
+                    state.vel[1] =
+                        wm_horse_jump_velocity(0.7, scale, 1.0, wm_jump_boost_power(None));
                     if fwd > 0.0 {
                         let (jx, jz) = wm_horse_jump_horizontal(driver_yaw, scale);
                         state.vel[0] += jx;
@@ -4952,7 +5082,8 @@ fn w1_vehicle_tick() {
                 state.vel[1] = 0.0;
             }
         }
-        *mob.pos.lock().unwrap_or_else(|e| e.into_inner()) = (new_pos[0], new_pos[1], new_pos[2], new_yaw, pitch);
+        *mob.pos.lock().unwrap_or_else(|e| e.into_inner()) =
+            (new_pos[0], new_pos[1], new_pos[2], new_yaw, pitch);
         // `Entity.positionRider`: every seated passenger follows the vehicle
         // and is credited for the carry.
         for (seat, &passenger) in passengers.iter().enumerate() {
@@ -4991,13 +5122,17 @@ fn w1_vehicle_tick() {
         broadcast_seen(mob.eid, |_| {
             (
                 0x70,
-                entity_teleport(mob.eid, new_pos[0], new_pos[1], new_pos[2], new_yaw, pitch, true),
+                entity_teleport(
+                    mob.eid, new_pos[0], new_pos[1], new_pos[2], new_yaw, pitch, true,
+                ),
             )
         });
     }
     drop(phys);
     // Detector rails emit 15 exactly while a live cart stands on them.
-    let mut rails = w1_detector_rails().lock().unwrap_or_else(|e| e.into_inner());
+    let mut rails = w1_detector_rails()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
     for key in &occupied_rails {
         if rails.insert(*key) {
             w1_detector_power(key.0, key.1, key.2, key.3, true);
@@ -5022,7 +5157,9 @@ fn w1_hostile_mob_tick(
     players: &[LiveMobPlayer<'_>],
     mobs_snap: &[Arc<Mob>],
 ) {
-    let visible = target.zip(perception).filter(|(_, seen)| seen.line_of_sight);
+    let visible = target
+        .zip(perception)
+        .filter(|(_, seen)| seen.line_of_sight);
     let mut states = w1_live_mob_ai().lock().unwrap_or_else(|e| e.into_inner());
     let ai = states
         .entry(m.eid)
@@ -5115,7 +5252,10 @@ fn w1_hostile_mob_tick(
                                 ),
                             )
                         });
-                        w1_evoker_fangs().lock().unwrap_or_else(|e| e.into_inner()).push((eid, 22));
+                        w1_evoker_fangs()
+                            .lock()
+                            .unwrap_or_else(|e| e.into_inner())
+                            .push((eid, 22));
                     }
                     for player in players.iter().filter(|p| p.dim == dim) {
                         let feet = (
@@ -5144,14 +5284,23 @@ fn w1_hostile_mob_tick(
                         insert_live_mob(
                             112,
                             dim,
-                            (pos[0] + angle.cos(), pos[1] + 1.5, pos[2] + angle.sin(), 0.0, 0.0),
+                            (
+                                pos[0] + angle.cos(),
+                                pos[1] + 1.5,
+                                pos[2] + angle.sin(),
+                                0.0,
+                                0.0,
+                            ),
                             vex_hp,
                             None,
                         );
                     }
                 }
                 Some(EvokerEvent::Wololo { target: sheep_eid }) => {
-                    w1_wool_colors().lock().unwrap_or_else(|e| e.into_inner()).insert(sheep_eid, 14);
+                    w1_wool_colors()
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .insert(sheep_eid, 14);
                     // Sheep color is metadata index 16 (byte); dye 14 = red.
                     let mut meta = Vec::new();
                     write_varint(&mut meta, sheep_eid as i64);
@@ -5406,8 +5555,7 @@ fn step_entity_move_dim(
 fn mob_has_support_dim(dim: DimId, etype: i64, x: f64, y: f64, z: f64) -> bool {
     let (w, h) = mob_dimensions(etype);
     let aabb = EntityAabb::from_dimensions(x, y, z, w, h);
-    entity_collide_world_dim(dim, aabb, [0.0, -1e-4, 0.0], false, 0.0, &[])
-        .vertical_collision_below
+    entity_collide_world_dim(dim, aabb, [0.0, -1e-4, 0.0], false, 0.0, &[]).vertical_collision_below
 }
 
 /// The non-Overworld `mob_snap_y`: sink the entity in quarter-block probes
@@ -5433,15 +5581,8 @@ fn mob_collide_move_dim(
 ) {
     let (w, h) = mob_dimensions(m.etype);
     let on_ground = mob_has_support_dim(dim, m.etype, mp.0, mp.1, mp.2);
-    let (next_pos, res) = step_entity_move_dim(
-        dim,
-        [mp.0, mp.1, mp.2],
-        w,
-        h,
-        [dx, 0.0, dz],
-        on_ground,
-        0.6,
-    );
+    let (next_pos, res) =
+        step_entity_move_dim(dim, [mp.0, mp.1, mp.2], w, h, [dx, 0.0, dz], on_ground, 0.6);
     mp.0 = next_pos[0];
     mp.1 = next_pos[1];
     mp.2 = next_pos[2];
@@ -5483,9 +5624,8 @@ fn apply_entity_push_step_dim(
 ) {
     if dim == DimId::Overworld {
         dead_by_cramming.clear();
-        dead_by_cramming.extend_from_slice(&apply_entity_push_step(
-            mobs_snap, cls_snap, region, grid,
-        ));
+        dead_by_cramming
+            .extend_from_slice(&apply_entity_push_step(mobs_snap, cls_snap, region, grid));
         return;
     }
     dead_by_cramming.clear();
@@ -5634,7 +5774,14 @@ fn live_mob_tick_dimension(
         // readers elsewhere (MEGA-W2 §3.3).
         dead_by_cramming.clear();
         dead_by_cramming.resize(mobs_snap.len(), false);
-        apply_entity_push_step_dim(dim, mobs_snap, dim_clients, &region, &grid, dead_by_cramming);
+        apply_entity_push_step_dim(
+            dim,
+            mobs_snap,
+            dim_clients,
+            &region,
+            &grid,
+            dead_by_cramming,
+        );
         hot.clear();
         hot.extend(
             grid.entities
@@ -5700,7 +5847,14 @@ fn live_mob_tick_dimension(
         if *m.hp.lock().unwrap_or_else(|e| e.into_inner()) <= 0.0 {
             let (mx, my, mz, ..) = *mp;
             drop(mp);
-            mob_env_die(m.eid, m.etype, mx, my, mz, *m.fire_ticks.lock().unwrap_or_else(|e| e.into_inner()) > 0);
+            mob_env_die(
+                m.eid,
+                m.etype,
+                mx,
+                my,
+                mz,
+                *m.fire_ticks.lock().unwrap_or_else(|e| e.into_inner()) > 0,
+            );
             continue;
         }
         if !hot[mob_idx] {
@@ -5708,13 +5862,12 @@ fn live_mob_tick_dimension(
         }
         if activation < LoadBudget::FULL.entity_activation_range
             && !players.iter().any(|p| {
-                p.dim == dim
-                    && {
-                        let dx = p.pos.0 - mp.0;
-                        let dy = p.pos.1 - mp.1;
-                        let dz = p.pos.2 - mp.2;
-                        dx * dx + dy * dy + dz * dz <= activation_sq
-                    }
+                p.dim == dim && {
+                    let dx = p.pos.0 - mp.0;
+                    let dy = p.pos.1 - mp.1;
+                    let dz = p.pos.2 - mp.2;
+                    dx * dx + dy * dy + dz * dz <= activation_sq
+                }
             })
         {
             continue;
@@ -5755,7 +5908,9 @@ fn live_mob_tick_dimension(
                         .as_ref()
                         .filter(|_| plans.epoch_fresh())
                         .and_then(|p| {
-                            p.pet.filter(|pp| pp.state == pet_state).map(|pp| pp.teleport)
+                            p.pet
+                                .filter(|pp| pp.state == pet_state)
+                                .map(|pp| pp.teleport)
                         })
                         .unwrap_or_else(|| {
                             pet_follow_teleport_step(
@@ -5770,10 +5925,7 @@ fn live_mob_tick_dimension(
                         let (yaw, pitch) = (mp.3, mp.4);
                         *mp = (tx, ty, tz, yaw, pitch);
                         drop(mp);
-                        m.vel
-                            .lock()
-                            .unwrap_or_else(|e| e.into_inner())
-                            .fill(0.0);
+                        m.vel.lock().unwrap_or_else(|e| e.into_inner()).fill(0.0);
                         broadcast_seen(m.eid, |_| {
                             (0x70, entity_teleport(m.eid, tx, ty, tz, yaw, pitch, true))
                         });
@@ -5828,10 +5980,7 @@ fn live_mob_tick_dimension(
             {
                 damage += 1.0;
             }
-            if in_lava
-                && !mob_fire_immune(m.etype)
-                && GR_FIRE_DAMAGE.load(Ordering::Relaxed) != 0
-            {
+            if in_lava && !mob_fire_immune(m.etype) && GR_FIRE_DAMAGE.load(Ordering::Relaxed) != 0 {
                 damage += 4.0;
             }
         }
@@ -5985,7 +6134,8 @@ fn live_mob_tick_dimension(
                     max_hp: spec.max_health,
                     in_water,
                     in_rain: raining
-                        && by + 1 >= mob_env.sky_height_or(plans.epoch_fresh(), || height_at(bx, bz)),
+                        && by + 1
+                            >= mob_env.sky_height_or(plans.epoch_fresh(), || height_at(bx, bz)),
                     on_fire: reg.name_of(feet_state) == "minecraft:fire",
                     nearest_target: target.zip(perception).map(|(target, seen)| {
                         MobTargetSnapshot {
@@ -6018,14 +6168,20 @@ fn live_mob_tick_dimension(
 
         if m.etype == 87
             && dim == DimId::Overworld
-            && sheared().lock().unwrap_or_else(|e| e.into_inner()).contains(&m.eid)
+            && sheared()
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .contains(&m.eid)
             && mob_env.below_or(plans.epoch_fresh(), || block_at(bx, by - 1, bz))
                 == name_to_state("grass_block").unwrap_or(u32::MAX)
             && ((m.eid as u64).wrapping_mul(1103515245) ^ tick)
                 .is_multiple_of(MOB_SPAWN_CHANCE_DENOMINATOR)
         {
             set_block(bx, by - 1, bz, name_to_state("dirt").unwrap_or(0));
-            sheared().lock().unwrap_or_else(|e| e.into_inner()).remove(&m.eid);
+            sheared()
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .remove(&m.eid);
             note_block_update(bx, by - 1, bz, name_to_state("dirt").unwrap_or(0));
         }
 
@@ -6035,21 +6191,16 @@ fn live_mob_tick_dimension(
             *love > 0
         };
         let mate = if in_love {
-            grid.query_radius_xz_into(
-                pos[0],
-                pos[2],
-                8.0,
-                m.eid,
-                &mut breed_scratch,
-                breed_cands,
-            );
+            grid.query_radius_xz_into(pos[0], pos[2], 8.0, m.eid, &mut breed_scratch, breed_cands);
             breed_cands.iter().find_map(|&slot| {
                 let entity = &grid.entities[slot as usize];
                 if !entity.is_mob || entity.etype != m.etype || dead_by_cramming[entity.idx] {
                     return None;
                 }
                 let mate = &mobs_snap[entity.idx];
-                if *mate.love.lock().unwrap_or_else(|e| e.into_inner()) <= 0 || *mate.hp.lock().unwrap_or_else(|e| e.into_inner()) <= 0.0 {
+                if *mate.love.lock().unwrap_or_else(|e| e.into_inner()) <= 0
+                    || *mate.hp.lock().unwrap_or_else(|e| e.into_inner()) <= 0.0
+                {
                     return None;
                 }
                 let (x, y, z, ..) = *mate.pos.lock().unwrap_or_else(|e| e.into_inner());
@@ -6076,7 +6227,12 @@ fn live_mob_tick_dimension(
             in_water,
             in_lava,
             on_fire: reg.name_of(feet_state) == "minecraft:fire",
-            recently_hurt: m.hurt_at.lock().unwrap_or_else(|e| e.into_inner()).elapsed() < Duration::from_secs(2),
+            recently_hurt: m
+                .hurt_at
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .elapsed()
+                < Duration::from_secs(2),
             in_love,
             target: perception
                 .filter(|p| entity_distance_sq(position, p.position) <= 24.0f64.powi(2)),
@@ -6340,10 +6496,7 @@ impl<V> ShardsWrite<'_, V> {
     fn get_mut(&mut self, key: &DimChunkKey) -> Option<&mut V> {
         self.guards[chunk_shard_of(key)].get_mut(key)
     }
-    fn entry(
-        &mut self,
-        key: DimChunkKey,
-    ) -> std::collections::hash_map::Entry<'_, DimChunkKey, V> {
+    fn entry(&mut self, key: DimChunkKey) -> std::collections::hash_map::Entry<'_, DimChunkKey, V> {
         self.guards[chunk_shard_of(&key)].entry(key)
     }
     #[cfg(test)]
@@ -6434,7 +6587,10 @@ impl<V> ShardedChunks<V> {
     fn read_all(&self) -> ShardsRead<'_, V> {
         ShardsRead {
             guards: std::array::from_fn(|i| {
-                self.shards[i].lock.read().unwrap_or_else(|e| e.into_inner())
+                self.shards[i]
+                    .lock
+                    .read()
+                    .unwrap_or_else(|e| e.into_inner())
             }),
         }
     }
@@ -6443,7 +6599,10 @@ impl<V> ShardedChunks<V> {
     fn write_all(&self) -> ShardsWrite<'_, V> {
         ShardsWrite {
             guards: std::array::from_fn(|i| {
-                self.shards[i].lock.write().unwrap_or_else(|e| e.into_inner())
+                self.shards[i]
+                    .lock
+                    .write()
+                    .unwrap_or_else(|e| e.into_inner())
             }),
         }
     }
@@ -6476,12 +6635,9 @@ impl<V> ShardedChunks<V> {
     #[cfg(test)]
     #[cfg_attr(not(megu_vanilla_data), allow(dead_code))]
     fn is_empty(&self) -> bool {
-        self.shards.iter().all(|s| {
-            s.lock
-                .read()
-                .unwrap_or_else(|e| e.into_inner())
-                .is_empty()
-        })
+        self.shards
+            .iter()
+            .all(|s| s.lock.read().unwrap_or_else(|e| e.into_inner()).is_empty())
     }
 
     /// `HashMap::get` on one key, cloning the value out under a read lock.
@@ -6739,14 +6895,17 @@ fn materialize_generation_payloads_inner(
                 // `RandomizableContainerBlockEntity` preserves `LootTable`/`LootTableSeed`
                 // on placed chests/barrels/pots/dispensers/hoppers until first non-spectator
                 // open, automation access, or destruction.
-                pending_block_loot().lock().unwrap_or_else(|e| e.into_inner()).insert(
-                    ow_block(pos),
-                    PendingBlockLoot {
-                        kind,
-                        loot_table,
-                        loot_seed,
-                    },
-                );
+                pending_block_loot()
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .insert(
+                        ow_block(pos),
+                        PendingBlockLoot {
+                            kind,
+                            loot_table,
+                            loot_seed,
+                        },
+                    );
             }
             crate::generation_payload::GenerationPayload::Container { .. }
             | crate::generation_payload::GenerationPayload::LootContainer { .. } => {
@@ -6764,8 +6923,7 @@ fn materialize_generation_payloads_inner(
                         loot_table,
                         loot_seed,
                     } => {
-                        let rolled_slots =
-                            roll_loot_container_slots(kind, &loot_table, loot_seed);
+                        let rolled_slots = roll_loot_container_slots(kind, &loot_table, loot_seed);
                         (kind, rolled_slots.into_iter().collect())
                     }
                     _ => unreachable!(),
@@ -6891,16 +7049,14 @@ fn materialize_generation_payloads_inner(
                     .carts
                     .push(generated_content::Cart::new(eid, uuid, pos, loot_seed));
             }
-            crate::generation_payload::GenerationPayload::ItemFrame {
-                glow,
-                facing,
-                item,
-            } => {
+            crate::generation_payload::GenerationPayload::ItemFrame { glow, facing, item } => {
                 // A hanging entity is not a mob: `Mob` carries hit points, air and a
                 // fuse, none of which a frame has. It goes into the generated-content
                 // store, so its UUID, facing and framed stack survive a save like a
                 // generated cart's loot does.
-                let mut gen = generated_content().lock().unwrap_or_else(|e| e.into_inner());
+                let mut gen = generated_content()
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner());
                 if gen.frames.len() >= FRAME_CAP {
                     continue;
                 }
@@ -6950,7 +7106,9 @@ fn roll_cart_loot(seed: i64) -> HashMap<i16, Stack> {
 fn unpack_cart_loot_if_needed(uuid: [u8; 16]) {
     with_save_guard(|| {
         let taken = {
-            let mut gen = generated_content().lock().unwrap_or_else(|e| e.into_inner());
+            let mut gen = generated_content()
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
             let Some(cart) = gen.carts.iter_mut().find(|c| c.uuid().ok() == Some(uuid)) else {
                 return;
             };
@@ -6977,7 +7135,9 @@ fn unpack_cart_loot_if_needed(uuid: [u8; 16]) {
 }
 fn break_generated_cart(target_eid: i32, drop_loot: bool) -> bool {
     let broken = with_save_guard(|| {
-        let mut gen = generated_content().lock().unwrap_or_else(|e| e.into_inner());
+        let mut gen = generated_content()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         let idx = gen.carts.iter().position(|c| c.eid == target_eid)?;
         let mut cart = gen.carts.remove(idx);
         let pos = cart.pos().unwrap_or([0.0, 0.0, 0.0]);
@@ -6986,7 +7146,11 @@ fn break_generated_cart(target_eid: i32, drop_loot: bool) -> bool {
         drop(gen);
         let mut spilled = Vec::new();
         if let Some(uuid) = uuid {
-            if let Some(slots) = chests().lock().unwrap_or_else(|e| e.into_inner()).remove(&ContainerKey::Cart(uuid)) {
+            if let Some(slots) = chests()
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .remove(&ContainerKey::Cart(uuid))
+            {
                 spilled.extend(
                     slots
                         .into_values()
@@ -7112,7 +7276,9 @@ fn cart_comparator_signal(slots: &HashMap<i16, Stack>) -> i32 {
     }
 }
 fn cart_in_water(pos: [f64; 3]) -> bool {
-    aabb_in_water(EntityAabb::from_dimensions(pos[0], pos[1], pos[2], 0.98, 0.7))
+    aabb_in_water(EntityAabb::from_dimensions(
+        pos[0], pos[1], pos[2], 0.98, 0.7,
+    ))
 }
 struct CartRuntimeWorld;
 impl crate::minecart::World for CartRuntimeWorld {
@@ -7154,7 +7320,9 @@ impl crate::minecart::World for CartRuntimeWorld {
 fn cart_tick() {
     let carts_snap: Vec<([u8; 16], i32, crate::minecart::State, bool)> = {
         let region = region_guard();
-        let gen = generated_content().lock().unwrap_or_else(|e| e.into_inner());
+        let gen = generated_content()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         gen.carts
             .iter()
             .filter_map(|c| {
@@ -7209,7 +7377,9 @@ fn cart_tick() {
         return;
     }
     let applied = with_save_guard(|| {
-        let mut gen = generated_content().lock().unwrap_or_else(|e| e.into_inner());
+        let mut gen = generated_content()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         let mut out = Vec::with_capacity(updates.len());
         for (uuid, eid, state, send_pos, send_vel) in updates {
             if let Some(cart) = gen.carts.iter_mut().find(|c| c.uuid().ok() == Some(uuid)) {
@@ -7356,8 +7526,7 @@ impl crate::spawner::World for SpawnerRuntimeWorld<'_> {
         let bl = nibble_at(bl_secs, bx, by, bz);
         let sl = nibble_at(sl_secs, bx, by, bz);
         if let Some(c) = custom {
-            return (c.block[0]..=c.block[1]).contains(&bl)
-                && (c.sky[0]..=c.sky[1]).contains(&sl);
+            return (c.block[0]..=c.block[1]).contains(&bl) && (c.sky[0]..=c.sky[1]).contains(&sl);
         }
         if sl > random.next_bound(32) {
             return false;
@@ -7388,7 +7557,11 @@ impl crate::spawner::World for SpawnerRuntimeWorld<'_> {
             .lock()
             .unwrap()
             .iter()
-            .filter(|m| m.dim == DimId::Overworld && m.etype == cave_spider && *m.hp.lock().unwrap_or_else(|e| e.into_inner()) > 0.0)
+            .filter(|m| {
+                m.dim == DimId::Overworld
+                    && m.etype == cave_spider
+                    && *m.hp.lock().unwrap_or_else(|e| e.into_inner()) > 0.0
+            })
             .filter(|m| {
                 let (mx, my, mz, ..) = *m.pos.lock().unwrap_or_else(|e| e.into_inner());
                 aabb_overlaps(Self::spider_aabb([mx, my, mz]), (box_min, box_max))
@@ -7401,7 +7574,10 @@ impl crate::spawner::World for SpawnerRuntimeWorld<'_> {
         if self.players.iter().any(|p| {
             aabb_overlaps(
                 bb,
-                ([p[0] - 0.3, p[1], p[2] - 0.3], [p[0] + 0.3, p[1] + 1.8, p[2] + 0.3]),
+                (
+                    [p[0] - 0.3, p[1], p[2] - 0.3],
+                    [p[0] + 0.3, p[1] + 1.8, p[2] + 0.3],
+                ),
             )
         }) {
             return false;
@@ -7410,7 +7586,9 @@ impl crate::spawner::World for SpawnerRuntimeWorld<'_> {
             .lock()
             .unwrap()
             .iter()
-            .filter(|m| m.dim == DimId::Overworld && *m.hp.lock().unwrap_or_else(|e| e.into_inner()) > 0.0)
+            .filter(|m| {
+                m.dim == DimId::Overworld && *m.hp.lock().unwrap_or_else(|e| e.into_inner()) > 0.0
+            })
             .any(|m| {
                 let (mx, my, mz, ..) = *m.pos.lock().unwrap_or_else(|e| e.into_inner());
                 let mb = if m.etype == cave_spider {
@@ -7472,27 +7650,56 @@ impl crate::spawner::World for SpawnerRuntimeWorld<'_> {
     }
 }
 fn spawner_tick() {
+    let clients_snap = client_snapshot();
+    let players: Vec<[f64; 3]> = clients_snap
+        .iter()
+        .filter(|c| {
+            !c.is_spectator()
+                && *c.dim.lock().unwrap_or_else(|e| e.into_inner()) == DimId::Overworld
+        })
+        .map(|c| {
+            let p = *c.pos.lock().unwrap_or_else(|e| e.into_inner());
+            [p.0, p.1, p.2]
+        })
+        .collect();
     let mut spawners_snap: Vec<(BlockPos, crate::nbt::Tag)> = {
         let region = region_guard();
-        let gen = generated_content().lock().unwrap_or_else(|e| e.into_inner());
+        let gen = generated_content()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         gen.spawners
             .iter()
-            .filter(|(pos, _)| region.is_hot(pos.0, pos.2))
+            .filter(|(pos, tag)| {
+                if !region.is_hot(pos.0, pos.2) {
+                    return false;
+                }
+                // `spawner::tick` exits before parsing or mutating NBT when no
+                // player is in RequiredPlayerRange. Apply that cheap guard
+                // before cloning the large SpawnData/SpawnPotentials tree.
+                let range = if tag.get("MaxNearbyEntities").is_some() {
+                    tag.get("RequiredPlayerRange")
+                        .and_then(|value| match value {
+                            crate::nbt::Tag::Short(value) => Some(i32::from(*value)),
+                            _ => None,
+                        })
+                        .unwrap_or(16)
+                } else {
+                    16
+                };
+                let range_sq = f64::from(range.max(0)).powi(2);
+                players.iter().any(|p| {
+                    (p[0] - (pos.0 as f64 + 0.5)).powi(2)
+                        + (p[1] - (pos.1 as f64 + 0.5)).powi(2)
+                        + (p[2] - (pos.2 as f64 + 0.5)).powi(2)
+                        <= range_sq
+                })
+            })
             .map(|(pos, tag)| (*pos, tag.clone()))
             .collect()
     };
     if spawners_snap.is_empty() {
         return;
     }
-    let clients_snap = client_snapshot();
-    let players: Vec<[f64; 3]> = clients_snap
-        .iter()
-        .filter(|c| !c.is_spectator() && *c.dim.lock().unwrap_or_else(|e| e.into_inner()) == DimId::Overworld)
-        .map(|c| {
-            let p = *c.pos.lock().unwrap_or_else(|e| e.into_inner());
-            [p.0, p.1, p.2]
-        })
-        .collect();
     let mut world_view = SpawnerRuntimeWorld {
         clients_snap: &clients_snap,
         players,
@@ -7506,7 +7713,9 @@ fn spawner_tick() {
         let _ = crate::spawner::tick(tag, *origin, &mut world_view, &mut rng);
     }
     with_save_guard(|| {
-        let mut gen = generated_content().lock().unwrap_or_else(|e| e.into_inner());
+        let mut gen = generated_content()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         for (origin, tag) in spawners_snap {
             if let Some(slot) = gen.spawners.get_mut(&origin) {
                 *slot = tag;
@@ -7743,7 +7952,10 @@ fn base_state_h(x: i32, y: i32, z: i32, h: i32) -> u32 {
 static HIDDEN: OnceLock<HashSet<u32>> = OnceLock::new();
 static EMPTY_HIDDEN: OnceLock<HashSet<u32>> = OnceLock::new();
 fn anti_xray_value_enabled(value: &str) -> bool {
-    !matches!(value.trim().to_ascii_lowercase().as_str(), "0" | "false" | "off" | "no")
+    !matches!(
+        value.trim().to_ascii_lowercase().as_str(),
+        "0" | "false" | "off" | "no"
+    )
 }
 /// `[anticheat] antixray` in `server.toml` (default: on); `MEGU_ANTI_XRAY` overrides.
 fn anti_xray_enabled() -> bool {
@@ -7791,7 +8003,11 @@ const HIDDEN_BLOCK_NAMES: &[&str] = &[
 fn hidden_states() -> &'static HashSet<u32> {
     HIDDEN.get_or_init(|| {
         // Load the environment's extra ids now, so `is_hidden` knows whether to look.
-        if !hidden_extra().lock().unwrap_or_else(|e| e.into_inner()).is_empty() {
+        if !hidden_extra()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .is_empty()
+        {
             HIDDEN_EXTRA_USED.store(true, Ordering::Relaxed);
         }
         let mut set: HashSet<u32> = HIDDEN_BLOCK_NAMES
@@ -7858,7 +8074,9 @@ fn register_hidden_tags_from_dir(root: &std::path::Path) -> usize {
                 .map(|c| c.to_string_lossy().into_owned())
                 .collect();
             // data/<ns>/tags/block/<tag>.json OR data/<ns>/tags/blocks/<tag>.json
-            if parts.len() < 4 || parts[1] != "tags" || (parts[2] != "block" && parts[2] != "blocks")
+            if parts.len() < 4
+                || parts[1] != "tags"
+                || (parts[2] != "block" && parts[2] != "blocks")
             {
                 continue;
             }
@@ -7898,12 +8116,7 @@ fn register_hidden_tags_from_dir(root: &std::path::Path) -> usize {
     let is_hidden_root_tag = |tag: &str| {
         matches!(
             tag,
-            "c:ores"
-                | "forge:ores"
-                | "c:chests"
-                | "forge:chests"
-                | "c:barrels"
-                | "forge:barrels"
+            "c:ores" | "forge:ores" | "c:chests" | "forge:chests" | "c:barrels" | "forge:barrels"
         ) || tag.starts_with("c:ores/")
             || tag.starts_with("forge:ores/")
             || tag.ends_with(":ores")
@@ -7977,7 +8190,10 @@ fn is_hidden(st: u32) -> bool {
     anti_xray_enabled()
         && (hidden_states().contains(&st)
             || (HIDDEN_EXTRA_USED.load(Ordering::Relaxed)
-                && hidden_extra().lock().unwrap_or_else(|e| e.into_inner()).contains(&st)))
+                && hidden_extra()
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .contains(&st)))
 }
 
 /// `is_hidden` for a whole chunk's encode loop: the same answer without taking the
@@ -7997,7 +8213,10 @@ impl HiddenSet {
         }
         HiddenSet {
             base: hidden_states(),
-            extra: hidden_extra().lock().unwrap_or_else(|e| e.into_inner()).clone(),
+            extra: hidden_extra()
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .clone(),
         }
     }
     fn contains(&self, st: u32) -> bool {
@@ -8189,7 +8408,12 @@ fn scheduled_tick_chunks() -> HashSet<(i32, i32)> {
         tickprof::HOT_N.fetch_add(chunks.len() as u64, std::sync::atomic::Ordering::Relaxed);
     }
     let __tf = tickprof::enabled().then(std::time::Instant::now);
-    let forced: Vec<(i32, i32)> = forceloaded().lock().unwrap_or_else(|e| e.into_inner()).iter().copied().collect();
+    let forced: Vec<(i32, i32)> = forceloaded()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .iter()
+        .copied()
+        .collect();
     for chunk in &forced {
         extend_chunk_square(&mut chunks, *chunk, 1);
     }
@@ -8254,9 +8478,7 @@ fn refresh_hot() {
     {
         let r = region().lock().unwrap_or_else(|e| e.into_inner());
         if let Some(sig) = &r.sig {
-            if sig.warm_radius == warm_radius
-                && sig.centers == centers
-                && sig.forced == forced_set
+            if sig.warm_radius == warm_radius && sig.centers == centers && sig.forced == forced_set
             {
                 return;
             }
@@ -8307,7 +8529,10 @@ fn refresh_hot() {
 // region().is_warm directly; this wrapper exists for the tests that pin the cold-furnace rule.
 #[cfg(test)]
 fn is_warm(x: i32, z: i32) -> bool {
-    region().lock().unwrap_or_else(|e| e.into_inner()).is_warm(x, z)
+    region()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .is_warm(x, z)
 }
 
 // generalized lazy-schedule primitive (the Create-generalization core):
@@ -8399,9 +8624,11 @@ fn read_states_batched(positions: &[(i32, i32, i32)]) -> Vec<u32> {
     for &(x, _, z) in positions {
         let key = (x >> 4, z >> 4);
         if let std::collections::hash_map::Entry::Vacant(e) = overlays.entry(key) {
-            if let Some(col) =
-                overworld_edits(&world().read(&(DimId::Overworld, key.0, key.1)), key.0, key.1)
-            {
+            if let Some(col) = overworld_edits(
+                &world().read(&(DimId::Overworld, key.0, key.1)),
+                key.0,
+                key.1,
+            ) {
                 e.insert(col.clone());
             }
         }
@@ -8528,7 +8755,8 @@ fn scheduled_block_tick_inner() {
             // its pending callback; replacing it with another block does.
             if reg.behaviour_of(st) == crate::block_registry::B_FALLING
                 && reg.name_of(st) == reg.name_of(tick.block)
-                && fallable_state(states[b + 1]) {
+                && fallable_state(states[b + 1])
+            {
                 spawn_fall(x, y, z, st);
             }
             continue;
@@ -8804,7 +9032,9 @@ fn fluid_from_block(st: u32) -> Option<flowing_fluid::Fluid> {
 
 /// SimpleWaterloggedBlock reports a WATER source without becoming LiquidBlock.
 fn waterlogged_source(st: u32) -> bool {
-    let Some(reg) = crate::block_registry::breg() else { return false };
+    let Some(reg) = crate::block_registry::breg() else {
+        return false;
+    };
     reg.has_water(st)
         && reg.get_prop(st, "waterlogged").as_deref() == Some("true")
         && reg.fluid_name(st) == "minecraft:water"
@@ -8818,7 +9048,10 @@ fn schedule_waterlogged_source(p: BlockPos) {
     let owner = GENERATED_FLUID_OWNER.get_or_init(|| Mutex::new(GeneratedFluidOwner::new()));
     owner.lock().unwrap_or_else(|e| e.into_inner()).schedule(
         p,
-        flowing_fluid::Fluid { kind: flowing_fluid::Kind::Water, level: 0 },
+        flowing_fluid::Fluid {
+            kind: flowing_fluid::Kind::Water,
+            level: 0,
+        },
         now,
         false, // Native SimpleWaterloggedBlock books a water tick 5 GT later.
     );
@@ -8895,7 +9128,13 @@ fn promotion_fluid_tick(
     };
     let plan = {
         let mut reader = PassFluidReader(&mut *world);
-        flowing_fluid::tick(&mut reader, pos, kind, level == 0, source_conversion_enabled(kind))
+        flowing_fluid::tick(
+            &mut reader,
+            pos,
+            kind,
+            level == 0,
+            source_conversion_enabled(kind),
+        )
     };
     let plan = match plan {
         Ok(plan) => plan,
@@ -9027,7 +9266,10 @@ fn requeue_fluid(queue: &Mutex<tick_queue::TickQueue>, pos: (i32, i32, i32), per
         Some((due, _)) if *due > now => (*due - now).div_ceil(period) as usize,
         _ => 1,
     };
-    queue.lock().unwrap_or_else(|e| e.into_inner()).schedule(pos, delay);
+    queue
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .schedule(pos, delay);
 }
 fn requeue_lava(x: i32, y: i32, z: i32) {
     requeue_fluid(lava_queue(), (x, y, z), server_ticks(FLUID_TICK_GT))
@@ -9065,35 +9307,51 @@ fn sched_result(x: i32, y: i32, z: i32, did_work: bool) {
 /// existing definition of where the world is simulated, and forceload marks chunks
 /// explicitly. No third notion of "loaded" is introduced.
 fn ticked_chunks() -> Vec<(i32, i32)> {
-    let mut out: Vec<(i32, i32)> = {
+    type ChunkList = Vec<(i32, i32)>;
+    static CACHE: OnceLock<Mutex<(ChunkList, ChunkList, ChunkList)>> = OnceLock::new();
+    let mut hot: Vec<(i32, i32)> = {
         let r = region_guard();
         r.hot.iter().copied().collect()
     };
-    out.extend(forceloaded().lock().unwrap_or_else(|e| e.into_inner()).iter().copied());
-    out.sort_unstable();
-    out.dedup();
-    out
+    let mut forced: Vec<(i32, i32)> = forceloaded()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .iter()
+        .copied()
+        .collect();
+    hot.sort_unstable();
+    forced.sort_unstable();
+    let cache = CACHE.get_or_init(|| Mutex::new((Vec::new(), Vec::new(), Vec::new())));
+    let mut cached = cache.lock().unwrap_or_else(|e| e.into_inner());
+    if cached.0 != hot || cached.1 != forced {
+        let mut chunks = hot.clone();
+        chunks.extend(forced.iter().copied());
+        chunks.sort_unstable();
+        chunks.dedup();
+        *cached = (hot, forced, chunks);
+    }
+    cached.2.clone()
 }
 
 /// Sections a random tick may land in for this chunk: the ones it has edits in, plus the
 /// band around its surface, which is where placed blocks sit. Uses published `SECTION_STORE`
 /// columns directly when available so the 20 TPS tick thread never stalls on `worldgen::chunk_cols`.
-fn ticked_sections(cx: i32, cz: i32) -> Vec<i32> {
+fn ticked_sections(dim: DimId, cx: i32, cz: i32) -> Vec<i32> {
     let mut out: Vec<i32> = Vec::new();
-    if let Some(c) = world().read(&(DimId::Overworld, cx, cz)).get(&(DimId::Overworld, cx, cz)) {
+    if let Some(c) = world().read(&(dim, cx, cz)).get(&(dim, cx, cz)) {
         for idx in c.keys() {
-            out.push(((*idx >> 8) as i32 + MIN_Y) >> 4);
+            out.push(((*idx >> 8) as i32 + dim.min_y()) >> 4);
         }
     }
     let surface_sy = {
         let store = section_store();
-        let key = (DimId::Overworld, cx, cz);
+        let key = (dim, cx, cz);
         store.map.read(&key).get(&key).map(|col| {
             col.iter()
                 .enumerate()
                 .rev()
                 .find(|(_, sec)| sec.as_ref().is_some_and(|s| s.non_air() > 0))
-                .map(|(i, _)| (MIN_Y >> 4) + i as i32)
+                .map(|(i, _)| (dim.min_y() >> 4) + i as i32)
                 .unwrap_or(0)
         })
     };
@@ -9101,13 +9359,172 @@ fn ticked_sections(cx: i32, cz: i32) -> Vec<i32> {
         out.push(sy - 1);
         out.push(sy);
     } else {
-        let surface = height_at(cx * 16 + 8, cz * 16 + 8);
+        let surface = height_at_dim(dim, cx * 16 + 8, cz * 16 + 8);
         out.push((surface - 16) >> 4);
         out.push((surface + 4) >> 4);
     }
     out.sort_unstable();
     out.dedup();
     out
+}
+
+fn random_tick_y(dim: DimId, section_y: i32, offset: u32) -> Option<i32> {
+    let y = section_y.checked_mul(16)?.checked_add(offset as i32)?;
+    (dim.min_y()..dim.min_y() + dim.height())
+        .contains(&y)
+        .then_some(y)
+}
+
+fn elytra_fly_into_wall_damage(horizontal_speed: f64) -> f32 {
+    ((horizontal_speed * 10.0) - 3.0).max(0.0) as f32
+}
+
+fn elytra_wall_impact_damage(
+    fall_flying: bool,
+    previous_speed: f64,
+    current_speed: f64,
+    wall_collision: bool,
+) -> Option<f32> {
+    if !fall_flying
+        || !wall_collision
+        || previous_speed <= 0.0
+        || current_speed >= previous_speed * 0.5
+    {
+        return None;
+    }
+    let damage = elytra_fly_into_wall_damage(previous_speed);
+    (damage > 0.0).then_some(damage)
+}
+
+#[derive(Clone, Copy)]
+struct ElytraMotionSample {
+    dim: DimId,
+    x: f64,
+    z: f64,
+    speed: f64,
+    fall_flying: bool,
+}
+
+fn elytra_motion_samples() -> &'static Mutex<HashMap<i32, ElytraMotionSample>> {
+    static SAMPLES: OnceLock<Mutex<HashMap<i32, ElytraMotionSample>>> = OnceLock::new();
+    SAMPLES.get_or_init(Mutex::default)
+}
+
+fn elytra_wall_collision_tick(client: &Arc<Client>, dim: DimId, x: f64, y: f64, z: f64) {
+    let fall_flying = *client.fall_fly.lock().unwrap_or_else(|e| e.into_inner());
+    let gm = *client.gm.lock().unwrap_or_else(|e| e.into_inner());
+    let alive = *client.hp.lock().unwrap_or_else(|e| e.into_inner()) > 0.0;
+    let mut samples = elytra_motion_samples()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    let previous = samples.get(&client.eid).copied();
+    let current_speed = previous
+        .filter(|sample| sample.dim == dim)
+        .map(|sample| ((x - sample.x).powi(2) + (z - sample.z).powi(2)).sqrt())
+        .unwrap_or(0.0);
+    let wall_collision = if fall_flying && previous.is_some_and(|sample| sample.dim == dim) {
+        any_block_collision_box_dim(
+            dim,
+            [x - 0.38, y + 0.15, z - 0.38],
+            [x + 0.38, y + 1.45, z + 0.38],
+        )
+    } else {
+        false
+    };
+    let damage = previous
+        .filter(|sample| sample.dim == dim && sample.fall_flying)
+        .and_then(|sample| {
+            elytra_wall_impact_damage(fall_flying, sample.speed, current_speed, wall_collision)
+        });
+    samples.insert(
+        client.eid,
+        ElytraMotionSample {
+            dim,
+            x,
+            z,
+            speed: current_speed,
+            fall_flying,
+        },
+    );
+    drop(samples);
+    if !alive || gm == 1 || gm == 3 {
+        return;
+    }
+    if let Some(damage) = damage {
+        if live_mob_damage_player(client, [x, y, z], damage, Some(0), None) {
+            broadcast_entity_sound(client.eid, "minecraft:entity.player.hurt", 5);
+            if *client.hp.lock().unwrap_or_else(|e| e.into_inner()) <= 0.0 {
+                drop_player_items_on_death(client);
+                if GR_SHOW_DEATH_MESSAGES.load(Ordering::Relaxed) != 0 {
+                    let line = system_chat(&format!("{} experienced kinetic energy", client.name));
+                    broadcast(0, |_observer| (0x6c, line.clone()));
+                }
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod main_perf_multidim_tests {
+    use super::*;
+
+    #[test]
+    fn default_listen_port_matches_vanilla_and_help() {
+        assert_eq!(DEFAULT_LISTEN_PORT, 25565);
+        assert!(MEGU_CLI_USAGE.contains("default: 25565"));
+        assert!(!MEGU_CLI_USAGE.contains("default: 25599"));
+    }
+
+    #[test]
+    fn fox_mouth_packet_contains_mainhand_slot_and_item() {
+        let item = name_to_item("sweet_berries").expect("sweet berries item");
+        let packet = fox_mouth_set_equipment_packet(42, &(item, 1, Vec::new()));
+        let (eid, slots) = decode_set_equipment(&packet).expect("SetEquipment payload");
+        assert_eq!(eid, 42);
+        assert_eq!(slots.len(), 1);
+        assert_eq!(slots[0].0, EquipmentSlot::MainHand as u8);
+        assert_eq!(slots[0].1 .0, item);
+    }
+
+    #[test]
+    fn elytra_fly_into_wall_requires_fast_horizontal_impact() {
+        assert_eq!(elytra_fly_into_wall_damage(0.2), 0.0);
+        assert_eq!(elytra_wall_impact_damage(true, 0.2, 0.0, true), None);
+        assert_eq!(elytra_wall_impact_damage(true, 1.0, 0.0, false), None);
+        assert!(elytra_wall_impact_damage(true, 1.0, 0.1, true).unwrap() > 0.0);
+    }
+
+    #[test]
+    fn random_tick_y_respects_each_registered_dimension_bounds() {
+        for dim in DimId::all_registered() {
+            let first_section = dim.min_y() >> 4;
+            assert_eq!(random_tick_y(dim, first_section, 0), Some(dim.min_y()));
+            assert_eq!(
+                random_tick_y(dim, first_section, 15),
+                Some(dim.min_y() + 15)
+            );
+            assert_eq!(
+                random_tick_y(dim, (dim.min_y() + dim.height()) >> 4, 0),
+                None
+            );
+        }
+    }
+
+    #[test]
+    fn redstone_tick_admission_throttles_only_quarantined_chunk() {
+        let q = ChunkHotspotQuarantine::with_policy(ChunkHotspotPolicy {
+            quarantine_threshold_us: 1,
+            hysteresis_exit_us: 0,
+            trigger_ticks: 1,
+            hysteresis_exit_ticks: 20,
+            cadence: 8,
+        });
+        q.record_chunk_cost_us(DimId::Nether, 3, -2, ChunkCostKind::Redstone, 10_000, 0);
+        q.record_chunk_cost_us(DimId::Nether, 3, -2, ChunkCostKind::Redstone, 10_000, 1);
+        assert!(!chunk_tick_due(&q, DimId::Nether, 3, -2, 2));
+        assert!(chunk_tick_due(&q, DimId::Nether, 3, -2, 8));
+        assert!(chunk_tick_due(&q, DimId::Nether, 4, -2, 2));
+    }
 }
 
 /// One pass of vanilla's random block ticks. A position is drawn per section rather than
@@ -9127,25 +9544,69 @@ fn random_tick_pass() {
     // player/world edits in `WORLD` (when worldgen is enabled), matching Vanilla's invariant
     // that random ticks never synchronously generate unloaded frontier chunks on the tick thread.
     let wg_on = worldgen::enabled();
-    for (cx, cz) in ticked_chunks() {
-        if wg_on {
-            let key = (DimId::Overworld, cx, cz);
-            let has_sections = section_store().map.read(&key).contains_key(&key);
-            if !has_sections {
-                let has_edits = world().read(&key).contains_key(&key);
-                if !has_edits {
-                    continue;
+    for dim in DimId::all_registered() {
+        for (cx, cz) in ticked_chunks() {
+            if wg_on {
+                let key = (dim, cx, cz);
+                let has_sections = section_store().map.read(&key).contains_key(&key);
+                if !has_sections {
+                    let has_edits = world().read(&key).contains_key(&key);
+                    if !has_edits {
+                        continue;
+                    }
+                }
+            }
+            for sy in ticked_sections(dim, cx, cz) {
+                for _ in 0..speed {
+                    let x = cx * 16 + world_rng::next_below(16) as i32;
+                    let Some(y) = random_tick_y(dim, sy, world_rng::next_below(16)) else {
+                        continue;
+                    };
+                    let z = cz * 16 + world_rng::next_below(16) as i32;
+                    if dim == DimId::Overworld {
+                        on_random_tick(reg, x, y, z);
+                    } else {
+                        on_random_tick_dim(reg, dim, x, y, z);
+                    }
                 }
             }
         }
-        for sy in ticked_sections(cx, cz) {
-            for _ in 0..speed {
-                let x = cx * 16 + world_rng::next_below(16) as i32;
-                let y = sy * 16 + world_rng::next_below(16) as i32;
-                let z = cz * 16 + world_rng::next_below(16) as i32;
-                on_random_tick(reg, x, y, z);
-            }
-        }
+    }
+}
+
+fn fox_mouth_set_equipment_packet(eid: i32, held: &Stack) -> Vec<u8> {
+    let mut equipment = EntityEquipment::default();
+    equipment.set(EquipmentSlot::MainHand, held.clone());
+    encode_set_equipment(eid, &equipment)
+}
+
+/// Fox pickup is owned by the utility-mob lane. This post-mob-tick bridge
+/// publishes the mouth item through the existing SetEquipment codec.
+fn fox_mouth_equipment_tick() {
+    static LAST_MOUTHS: OnceLock<Mutex<HashMap<i32, Stack>>> = OnceLock::new();
+    let mouths: HashMap<i32, Stack> = live_native_utility_states()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .iter()
+        .filter_map(|(&eid, state)| match state {
+            NativeUtilityState::Fox(fox) => fox.held.clone().map(|stack| (eid, stack)),
+            _ => None,
+        })
+        .collect();
+    let last = LAST_MOUTHS.get_or_init(|| Mutex::new(HashMap::new()));
+    let changed: Vec<(i32, Stack)> = {
+        let mut last = last.lock().unwrap_or_else(|e| e.into_inner());
+        let changed = mouths
+            .iter()
+            .filter(|(eid, stack)| last.get(eid) != Some(*stack))
+            .map(|(&eid, stack)| (eid, stack.clone()))
+            .collect();
+        *last = mouths;
+        changed
+    };
+    for (eid, stack) in changed {
+        let packet = fox_mouth_set_equipment_packet(eid, &stack);
+        broadcast_seen(eid, |_client| (0x5b, packet.clone()));
     }
 }
 
@@ -9173,18 +9634,20 @@ fn on_random_tick_dim(reg: &crate::block_registry::BReg, dim: DimId, x: i32, y: 
         return;
     }
     match reg.name_of(st) {
-        "minecraft:wheat" | "minecraft:carrots" | "minecraft:potatoes"
-        | "minecraft:beetroots" | "minecraft:nether_wart" | "minecraft:melon_stem"
-        | "minecraft:pumpkin_stem" | "minecraft:sweet_berry_bush" | "minecraft:cocoa" => {
-            crop_random_tick(reg, dim, x, y, z, st)
-        }
+        "minecraft:wheat"
+        | "minecraft:carrots"
+        | "minecraft:potatoes"
+        | "minecraft:beetroots"
+        | "minecraft:nether_wart"
+        | "minecraft:melon_stem"
+        | "minecraft:pumpkin_stem"
+        | "minecraft:sweet_berry_bush"
+        | "minecraft:cocoa" => crop_random_tick(reg, dim, x, y, z, st),
         "minecraft:fire" | "minecraft:soul_fire" => fire_random_tick(reg, dim, x, y, z, st),
         "minecraft:ice" => ice_random_tick(reg, dim, x, y, z),
         "minecraft:water" => water_random_tick(reg, dim, x, y, z, st),
         "minecraft:snow" => snow_random_tick(reg, dim, x, y, z, st),
-        "minecraft:grass_block" | "minecraft:mycelium" => {
-            grass_random_tick(reg, dim, x, y, z, st)
-        }
+        "minecraft:grass_block" | "minecraft:mycelium" => grass_random_tick(reg, dim, x, y, z, st),
         // `bamboo_sapling` must reach its own handler before the `_sapling`
         // suffix arm claims it for the tree-grow tick.
         _ if p2_plant_random_tick(reg, dim, x, y, z, st) => {}
@@ -9199,7 +9662,13 @@ fn on_random_tick_dim(reg: &crate::block_registry::BReg, dim: DimId, x: i32, y: 
 /// of attenuation. The light engine does not index cells a tick wrote, so the
 /// rules that want block light — ice melt, snow accumulation, fire spread —
 /// read the emissions of the written state instead.
-fn random_tick_block_light(reg: &crate::block_registry::BReg, dim: DimId, x: i32, y: i32, z: i32) -> u8 {
+fn random_tick_block_light(
+    reg: &crate::block_registry::BReg,
+    dim: DimId,
+    x: i32,
+    y: i32,
+    z: i32,
+) -> u8 {
     let mut light = reg.luminance_of(block_at_cached_dim(dim, x, y, z));
     for (dx, dy, dz) in [
         (1, 0, 0),
@@ -9275,7 +9744,13 @@ fn sugar_cane_random_tick(
         set_block_dim(dim, x, y + 1, z, reg.state_of("minecraft:sugar_cane", None));
         set_block_dim(dim, x, y, z, reg.with_prop(st, "age", "0"));
     } else {
-        set_block_dim(dim, x, y, z, reg.with_prop(st, "age", &(age + 1).to_string()));
+        set_block_dim(
+            dim,
+            x,
+            y,
+            z,
+            reg.with_prop(st, "age", &(age + 1).to_string()),
+        );
     }
 }
 
@@ -9283,7 +9758,14 @@ fn sugar_cane_random_tick(
 /// `age` back. Moisture and the 3x3 farmland context come from the cells the
 /// crop actually neighbours; the same-crop diagonal rule samples the four
 /// orthogonal neighbours.
-fn crop_random_tick(reg: &crate::block_registry::BReg, dim: DimId, x: i32, y: i32, z: i32, st: u32) {
+fn crop_random_tick(
+    reg: &crate::block_registry::BReg,
+    dim: DimId,
+    x: i32,
+    y: i32,
+    z: i32,
+    st: u32,
+) {
     let name = reg.name_of(st);
     let kind = match name {
         "minecraft:wheat" => CropKind::Wheat,
@@ -9359,7 +9841,14 @@ fn fire_flammable(reg: &crate::block_registry::BReg, st: u32) -> bool {
 /// `FireBlock.tick` reduced to its observable outcomes: rain and the
 /// `doFireTick` gamerule gate the whole pass; the evaluator owns the age,
 /// burnout and spread probabilities.
-fn fire_random_tick(reg: &crate::block_registry::BReg, dim: DimId, x: i32, y: i32, z: i32, st: u32) {
+fn fire_random_tick(
+    reg: &crate::block_registry::BReg,
+    dim: DimId,
+    x: i32,
+    y: i32,
+    z: i32,
+    st: u32,
+) {
     if GR_DO_FIRE_TICK.load(Ordering::Relaxed) == 0 {
         return;
     }
@@ -9424,7 +9913,14 @@ fn fire_random_tick(reg: &crate::block_registry::BReg, dim: DimId, x: i32, y: i3
 /// `LeavesBlock.randomTick`: a leaf with `persistent=false` and `distance=7`
 /// decays; one tick in twenty drops the block's loot. `doTileDrops` gates the
 /// drop, not the decay.
-fn leaf_random_tick(reg: &crate::block_registry::BReg, dim: DimId, x: i32, y: i32, z: i32, st: u32) {
+fn leaf_random_tick(
+    reg: &crate::block_registry::BReg,
+    dim: DimId,
+    x: i32,
+    y: i32,
+    z: i32,
+    st: u32,
+) {
     let persistent = reg.get_prop(st, "persistent").as_deref() == Some("true");
     let distance: u8 = reg
         .get_prop(st, "distance")
@@ -9472,8 +9968,7 @@ fn ice_random_tick(reg: &crate::block_registry::BReg, dim: DimId, x: i32, y: i32
         water_source: false,
         random_roll: world_rng::next_below(256) as u8,
     };
-    if eval_ice_freeze_melt(input, true) == SnowIceTickResult::MeltIce
-    {
+    if eval_ice_freeze_melt(input, true) == SnowIceTickResult::MeltIce {
         let out = if dim_ultrawarm(dim) {
             0
         } else {
@@ -9487,7 +9982,14 @@ fn ice_random_tick(reg: &crate::block_registry::BReg, dim: DimId, x: i32, y: i32
 /// `SnowAndFreezeCheck`/`LiquidBlock`: a water source in a biome cold enough to
 /// snow freezes to ice when it can see the sky and its block light stays under
 /// 11. Flowing water does not freeze.
-fn water_random_tick(reg: &crate::block_registry::BReg, dim: DimId, x: i32, y: i32, z: i32, st: u32) {
+fn water_random_tick(
+    reg: &crate::block_registry::BReg,
+    dim: DimId,
+    x: i32,
+    y: i32,
+    z: i32,
+    st: u32,
+) {
     let source = fluid_from_block(st).is_some_and(|f| f.source());
     if !source {
         return;
@@ -9500,9 +10002,7 @@ fn water_random_tick(reg: &crate::block_registry::BReg, dim: DimId, x: i32, y: i
         water_source: true,
         random_roll: world_rng::next_below(256) as u8,
     };
-    if eval_ice_freeze_melt(input, false)
-        == SnowIceTickResult::FreezeWater
-    {
+    if eval_ice_freeze_melt(input, false) == SnowIceTickResult::FreezeWater {
         let ice = reg.state_of("minecraft:ice", None);
         set_block_dim(dim, x, y, z, ice);
         note_block_update_dim(dim, x, y, z, ice);
@@ -9513,7 +10013,14 @@ fn water_random_tick(reg: &crate::block_registry::BReg, dim: DimId, x: i32, y: i
 /// the `snowAccumulationHeight` gamerule — and that depth still needs the same
 /// cold, sky and low-light conditions water needs to freeze, plus a full solid
 /// layer above to gather the fall. `0` disables accumulation entirely.
-fn snow_random_tick(reg: &crate::block_registry::BReg, dim: DimId, x: i32, y: i32, z: i32, st: u32) {
+fn snow_random_tick(
+    reg: &crate::block_registry::BReg,
+    dim: DimId,
+    x: i32,
+    y: i32,
+    z: i32,
+    st: u32,
+) {
     let cap = gr_snow_accumulation_height();
     if cap == 0 || RAINING.load(Ordering::Relaxed) == 0 || dim != DimId::Overworld {
         return;
@@ -9533,9 +10040,7 @@ fn snow_random_tick(reg: &crate::block_registry::BReg, dim: DimId, x: i32, y: i3
         water_source: false,
         random_roll: world_rng::next_below(256) as u8,
     };
-    if eval_snow_accumulation(input)
-        == SnowIceTickResult::AccumulateSnow
-    {
+    if eval_snow_accumulation(input) == SnowIceTickResult::AccumulateSnow {
         let next = reg.with_prop(st, "layers", &(layers + 1).to_string());
         set_block_dim(dim, x, y, z, next);
         note_block_update_dim(dim, x, y, z, next);
@@ -9545,7 +10050,14 @@ fn snow_random_tick(reg: &crate::block_registry::BReg, dim: DimId, x: i32, y: i3
 /// `SaplingBlock.randomTick`/`BonemealableFeaturePlaceSection`: a stage-0
 /// sapling under sky-equivalent light advances to stage 1; a stage-1 sapling
 /// with the headroom grows a tree. The roll matches vanilla's `nextInt(7)`.
-fn sapling_random_tick(reg: &crate::block_registry::BReg, dim: DimId, x: i32, y: i32, z: i32, st: u32) {
+fn sapling_random_tick(
+    reg: &crate::block_registry::BReg,
+    dim: DimId,
+    x: i32,
+    y: i32,
+    z: i32,
+    st: u32,
+) {
     let stage: u8 = reg
         .get_prop(st, "stage")
         .and_then(|s| s.parse().ok())
@@ -9591,7 +10103,14 @@ fn sapling_tree_blocks(name: &str) -> Option<(&'static str, &'static str)> {
 /// y+2 and y+3, and a plus of leaves at y+4. Leaves are placed
 /// `persistent=false, distance=1` so they behave like generated canopy. Only
 /// air and the sapling cell are replaced.
-fn grow_sapling_tree(reg: &crate::block_registry::BReg, dim: DimId, x: i32, y: i32, z: i32, name: &str) {
+fn grow_sapling_tree(
+    reg: &crate::block_registry::BReg,
+    dim: DimId,
+    x: i32,
+    y: i32,
+    z: i32,
+    name: &str,
+) {
     let Some((log_name, leaf_name)) = sapling_tree_blocks(name) else {
         return;
     };
@@ -9631,7 +10150,14 @@ fn grow_sapling_tree(reg: &crate::block_registry::BReg, dim: DimId, x: i32, y: i
 /// overhead with light below 4 kills the grass back to dirt; otherwise a lit
 /// grass block tries four random offsets and converts a dirt cell whose top is
 /// clear. The `snowy` flag follows a snow cover above the target.
-fn grass_random_tick(reg: &crate::block_registry::BReg, dim: DimId, x: i32, y: i32, z: i32, st: u32) {
+fn grass_random_tick(
+    reg: &crate::block_registry::BReg,
+    dim: DimId,
+    x: i32,
+    y: i32,
+    z: i32,
+    st: u32,
+) {
     let name = reg.name_of(st);
     let above = block_at_dim(dim, x, y + 1, z);
     let covered_opaque = reg.can_occlude(above);
@@ -9653,10 +10179,8 @@ fn grass_random_tick(reg: &crate::block_registry::BReg, dim: DimId, x: i32, y: i
         let ny = y + world_rng::next_below(5) as i32 - 3;
         let nz = z + world_rng::next_below(3) as i32 - 1;
         let target_above = block_at_dim(dim, nx, ny + 1, nz);
-        let target_is_dirt =
-            reg.name_of(block_at_dim(dim, nx, ny, nz)) == "minecraft:dirt";
-        let target_above_blocks =
-            reg.can_occlude(target_above) || reg.is_liquid(target_above);
+        let target_is_dirt = reg.name_of(block_at_dim(dim, nx, ny, nz)) == "minecraft:dirt";
+        let target_above_blocks = reg.can_occlude(target_above) || reg.is_liquid(target_above);
         if eval_grass_spread(input(target_is_dirt, target_above_blocks))
             != GrassSpreadResult::SpreadToNeighbor
         {
@@ -9693,19 +10217,31 @@ fn sched_invalidate(x: i32, y: i32, z: i32) {
             b.remove(&(DimId::Overworld, c.0, c.1, c.2));
         }
     }
-    if !water_queue().lock().unwrap_or_else(|e| e.into_inner()).is_empty() {
+    if !water_queue()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .is_empty()
+    {
         let mut q = water_queue().lock().unwrap_or_else(|e| e.into_inner());
         for c in cells {
             q.promote(c);
         }
     }
-    if !lava_queue().lock().unwrap_or_else(|e| e.into_inner()).is_empty() {
+    if !lava_queue()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .is_empty()
+    {
         let mut q = lava_queue().lock().unwrap_or_else(|e| e.into_inner());
         for c in cells {
             q.promote(c);
         }
     }
-    if !hopper_queue().lock().unwrap_or_else(|e| e.into_inner()).is_empty() {
+    if !hopper_queue()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .is_empty()
+    {
         let mut q = hopper_queue().lock().unwrap_or_else(|e| e.into_inner());
         for c in cells {
             q.promote(c);
@@ -9754,7 +10290,10 @@ impl PluginApi {
     /// reveal-on-expose apply to it exactly like the built-in set.
     pub fn mark_hidden(&mut self, st: u32) -> Result<(), &'static str> {
         self.spend()?;
-        hidden_extra().lock().unwrap_or_else(|e| e.into_inner()).insert(st);
+        hidden_extra()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(st);
         HIDDEN_EXTRA_USED.store(true, Ordering::Relaxed);
         Ok(())
     }
@@ -9974,12 +10513,7 @@ fn note_block_update_dim(dim: DimId, x: i32, y: i32, z: i32, st: u32) {
     pending_blocks()
         .lock()
         .unwrap()
-        .entry((
-            dim,
-            x.div_euclid(16),
-            y.div_euclid(16),
-            z.div_euclid(16),
-        ))
+        .entry((dim, x.div_euclid(16), y.div_euclid(16), z.div_euclid(16)))
         .or_default()
         .insert((((x & 15) << 8) | ((z & 15) << 4) | (y & 15)) as u16, out);
 }
@@ -9991,15 +10525,22 @@ fn apply_queued_block_updates() {
     // cell and `clicked + face` to the acting client at the end of every
     // use_on; they precede the dirty-cell batch like vanilla's tail sends.
     for c in client_snapshot() {
-        if let Some((dim, rx, ry, rz, rface)) =
-            c.use_on_resend.lock().unwrap_or_else(|e| e.into_inner()).take()
+        if let Some((dim, rx, ry, rz, rface)) = c
+            .use_on_resend
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .take()
         {
             let (fx, fy, fz) = FACE_OFF[(rface.clamp(0, 5)) as usize];
             for (px, py, pz) in [(rx, ry, rz), (rx + fx, ry + fy, rz + fz)] {
                 let mut p = Vec::with_capacity(13);
                 write_pos(&mut p, px, py, pz);
                 write_varint(&mut p, block_at_dim(dim, px, py, pz) as i64);
-                let _ = send_packet(&mut c.sock.lock().unwrap_or_else(|e| e.into_inner()), 0x09, p);
+                let _ = send_packet(
+                    &mut c.sock.lock().unwrap_or_else(|e| e.into_inner()),
+                    0x09,
+                    p,
+                );
             }
         }
     }
@@ -10162,8 +10703,8 @@ fn block_at_cached_dim(dim: DimId, x: i32, y: i32, z: i32) -> u32 {
     if let Some(st) = stored_state(dim, x, y, z) {
         return st;
     }
-    if let Some(st) = band_for(dim, x >> 4, z >> 4)
-        .and_then(|b| b.get(y, (x & 15) as usize, (z & 15) as usize))
+    if let Some(st) =
+        band_for(dim, x >> 4, z >> 4).and_then(|b| b.get(y, (x & 15) as usize, (z & 15) as usize))
     {
         return st;
     }
@@ -10185,14 +10726,7 @@ fn set_block(x: i32, y: i32, z: i32, st: u32) {
 /// and `block_updated`'s booking would persist a gravity block with no
 /// callback and leave it hanging after a reload. Re-entrant, so a nested
 /// write (a cascade placing another block) does not take the lock twice.
-fn set_block_if_dim(
-    dim: DimId,
-    x: i32,
-    y: i32,
-    z: i32,
-    st: u32,
-    expected: Option<u32>,
-) -> bool {
+fn set_block_if_dim(dim: DimId, x: i32, y: i32, z: i32, st: u32, expected: Option<u32>) -> bool {
     with_save_guard(|| set_block_if_inner_dim(dim, x, y, z, st, expected))
 }
 fn set_block_if(x: i32, y: i32, z: i32, st: u32, expected: Option<u32>) -> bool {
@@ -10234,7 +10768,11 @@ fn set_block_if_inner_dim(
     }
     drop(w);
     if Some(st) != name_to_state("spawner") {
-        generated_content().lock().unwrap_or_else(|e| e.into_inner()).spawners.remove(&(x,y,z));
+        generated_content()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .spawners
+            .remove(&(x, y, z));
     }
     // The band is a write-through view of the chunk, not an invalidated one: a leaf tick
     // writes every tick, so invalidating would rebuild a whole band per write (14 ms).
@@ -10255,9 +10793,11 @@ fn set_block_if_inner_dim(
             static N2: AtomicU64 = AtomicU64::new(0);
             let n = N2.fetch_add(1, Ordering::Relaxed);
             if n.is_multiple_of(32) {
-                eprintln!("[chunk-write] ({x},{y},{z}) {old}->{st} {} -> {}",
+                eprintln!(
+                    "[chunk-write] ({x},{y},{z}) {old}->{st} {} -> {}",
                     breg().map(|r| r.name_of(old)).unwrap_or("?"),
-                    breg().map(|r| r.name_of(st)).unwrap_or("?"));
+                    breg().map(|r| r.name_of(st)).unwrap_or("?")
+                );
             }
         }
     }
@@ -10298,12 +10838,9 @@ fn set_block_if_inner_dim(
                 store.remove(&(DimId::Overworld, x, y, z, 1));
             }
             #[cfg(test)]
-            signs()
-                .lock()
-                .unwrap()
-                .retain(|&(dim, sx, sy, sz, _), _| {
-                    !(dim == DimId::Overworld && sx == x && sy == y && sz == z)
-                });
+            signs().lock().unwrap().retain(|&(dim, sx, sy, sz, _), _| {
+                !(dim == DimId::Overworld && sx == x && sy == y && sz == z)
+            });
             // The halves this container was part of, read from the state it still had
             // as a block: the pair lives in the block state, so the *old* state is the
             // one that knows it.
@@ -10324,7 +10861,11 @@ fn set_block_if_inner_dim(
                         .cloned(),
                 );
             }
-            if let Some(f) = furnaces().lock().unwrap_or_else(|e| e.into_inner()).remove(&ow_block((x, y, z))) {
+            if let Some(f) = furnaces()
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .remove(&ow_block((x, y, z)))
+            {
                 // The block entity is gone: cancel its due-queue deadline so no
                 // ghost visit can fire for the removed furnace. The store key
                 // is Overworld-keyed like the chest/sign cleanup above.
@@ -10362,16 +10903,15 @@ fn set_block_if_inner_dim(
             // container the world no longer has is closed, and the opener counters of
             // the halves it counted drop (one BlockEvent per half that moved).
             let audience = client_snapshot();
-            invalidate_container_windows(
-                &audience,
-                ContainerKey::ow((x, y, z)),
-                &halves,
-            );
+            invalidate_container_windows(&audience, ContainerKey::ow((x, y, z)), &halves);
             if (7513..=7520).contains(&old) {
                 invalidate_ender_chest_windows(&audience, (x, y, z));
             }
             if !(4278..=4285).contains(&st) {
-                crops().lock().unwrap_or_else(|e| e.into_inner()).remove(&ow_block((x, y, z)));
+                crops()
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .remove(&ow_block((x, y, z)));
             }
         }
         // Chest pairing is block state, so the chests beside this cell re-derive it
@@ -10419,7 +10959,10 @@ fn register_overworld_scheduled(x: i32, y: i32, z: i32, st: u32, native_fluid_co
     if hopper_state_facing(st).is_some() {
         if hh.len() < DIM_SCHEDULED_CAP || hh.contains(&(x, y, z)) {
             hh.insert((x, y, z));
-            hopper_queue().lock().unwrap_or_else(|e| e.into_inner()).schedule((x, y, z), 1);
+            hopper_queue()
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .schedule((x, y, z), 1);
         }
     } else {
         hh.remove(&(x, y, z));
@@ -10430,7 +10973,10 @@ fn register_overworld_scheduled(x: i32, y: i32, z: i32, st: u32, native_fluid_co
         if wtr.len() < DIM_SCHEDULED_CAP || wtr.contains(&(x, y, z)) {
             wtr.insert((x, y, z));
             if !native_fluid_controlled {
-                water_queue().lock().unwrap_or_else(|e| e.into_inner()).schedule((x, y, z), 1);
+                water_queue()
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .schedule((x, y, z), 1);
             }
         }
     } else {
@@ -10442,7 +10988,10 @@ fn register_overworld_scheduled(x: i32, y: i32, z: i32, st: u32, native_fluid_co
         if lv.len() < DIM_SCHEDULED_CAP || lv.contains(&(x, y, z)) {
             lv.insert((x, y, z));
             if !native_fluid_controlled {
-                lava_queue().lock().unwrap_or_else(|e| e.into_inner()).schedule((x, y, z), 1);
+                lava_queue()
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .schedule((x, y, z), 1);
             }
         }
     } else {
@@ -10507,7 +11056,9 @@ fn set_block_if_dim_edit(
             // this path owns every other dimension, so the same rules have to run
             // here. Entries die with the block identity, not the state: a
             // same-block property write keeps them, a different block drops them.
-            let mut store = live_block_entities().lock().unwrap_or_else(|e| e.into_inner());
+            let mut store = live_block_entities()
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
             if let Some(&(id, _)) = store.entries.get(&(dim, x, y, z)) {
                 if reg.block_id_of(st) != Some(id) {
                     store.entries.remove(&(dim, x, y, z));
@@ -10597,7 +11148,10 @@ fn dim_queue_schedule(
         .schedule(pos, delay);
 }
 
-fn dim_queue_due(queues: &Mutex<HashMap<DimId, tick_queue::TickQueue>>, dim: DimId) -> Vec<(i32, i32, i32)> {
+fn dim_queue_due(
+    queues: &Mutex<HashMap<DimId, tick_queue::TickQueue>>,
+    dim: DimId,
+) -> Vec<(i32, i32, i32)> {
     queues
         .lock()
         .unwrap_or_else(|e| e.into_inner())
@@ -10634,7 +11188,11 @@ fn wake_hoppers_around((dim, x, y, z): DimBlockPos) {
         }
         backoffs.remove(&key);
         if dim == DimId::Overworld {
-            if hoppers().lock().unwrap_or_else(|e| e.into_inner()).contains(&pos) {
+            if hoppers()
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .contains(&pos)
+            {
                 hopper_queue()
                     .lock()
                     .unwrap_or_else(|e| e.into_inner())
@@ -10645,7 +11203,9 @@ fn wake_hoppers_around((dim, x, y, z): DimBlockPos) {
             .unwrap_or_else(|e| e.into_inner())
             .contains(&(dim, pos.0, pos.1, pos.2))
         {
-            let mut queues = dim_hopper_queues().lock().unwrap_or_else(|e| e.into_inner());
+            let mut queues = dim_hopper_queues()
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
             if let Some(queue) = queues.get_mut(&dim) {
                 queue.promote(pos);
             }
@@ -10863,7 +11423,12 @@ fn dim_lava_tick(dim: DimId) {
     let region = region_guard();
     for (x, y, z) in due {
         if !region.is_warm(x, z) || !sched_ready_dim(dim, x, y, z) {
-            requeue_fluid_dim(dim_lava_queues(), dim, (x, y, z), server_ticks(FLUID_TICK_GT));
+            requeue_fluid_dim(
+                dim_lava_queues(),
+                dim,
+                (x, y, z),
+                server_ticks(FLUID_TICK_GT),
+            );
             continue;
         }
         let st = block_at_dim(dim, x, y, z);
@@ -10882,12 +11447,22 @@ fn dim_lava_tick(dim: DimId) {
                 note_block_update_dim(dim, x, y - 1, z, 104);
             }
             sched_result_dim(dim, x, y, z, true);
-            requeue_fluid_dim(dim_lava_queues(), dim, (x, y, z), server_ticks(FLUID_TICK_GT));
+            requeue_fluid_dim(
+                dim_lava_queues(),
+                dim,
+                (x, y, z),
+                server_ticks(FLUID_TICK_GT),
+            );
             continue;
         }
         if lvl >= 3 || (8..=15).contains(&lvl) {
             sched_result_dim(dim, x, y, z, false);
-            requeue_fluid_dim(dim_lava_queues(), dim, (x, y, z), server_ticks(FLUID_TICK_GT));
+            requeue_fluid_dim(
+                dim_lava_queues(),
+                dim,
+                (x, y, z),
+                server_ticks(FLUID_TICK_GT),
+            );
             continue;
         }
         let mut spread = false;
@@ -10905,13 +11480,23 @@ fn dim_lava_tick(dim: DimId) {
             }
         }
         sched_result_dim(dim, x, y, z, spread);
-        requeue_fluid_dim(dim_lava_queues(), dim, (x, y, z), server_ticks(FLUID_TICK_GT));
+        requeue_fluid_dim(
+            dim_lava_queues(),
+            dim,
+            (x, y, z),
+            server_ticks(FLUID_TICK_GT),
+        );
     }
 }
 
 fn chest_partner_dim(dim: DimId, x: i32, y: i32, z: i32) -> Option<BlockPos> {
-    chest_pair_of_dim(dim, block_at_dim(dim, x, y, z), (x, y, z))
-        .map(|(right, left)| if (x, y, z) == right { left } else { right })
+    chest_pair_of_dim(dim, block_at_dim(dim, x, y, z), (x, y, z)).map(|(right, left)| {
+        if (x, y, z) == right {
+            left
+        } else {
+            right
+        }
+    })
 }
 
 fn dim_hopper_tick(dim: DimId) {
@@ -11023,7 +11608,10 @@ fn set_blocks_bulk_dim(dim: DimId, edits: &[(i32, i32, i32, u32)]) -> usize {
     // The last write per cell wins, matching a sequential `set_block` loop.
     let mut by_chunk: BulkEditsByChunk = HashMap::new();
     for &(x, y, z, st) in edits {
-        by_chunk.entry((x >> 4, z >> 4)).or_default().push((x, y, z, st));
+        by_chunk
+            .entry((x >> 4, z >> 4))
+            .or_default()
+            .push((x, y, z, st));
     }
     // (x, y, z, old, st) for every cell whose stored state actually moved.
     let mut changed: Vec<(i32, i32, i32, u32, u32)> = Vec::with_capacity(edits.len());
@@ -11035,7 +11623,14 @@ fn set_blocks_bulk_dim(dim: DimId, edits: &[(i32, i32, i32, u32)]) -> usize {
                 .iter()
                 .filter(|(_, y, _, _)| y.checked_sub(MIN_Y).is_some())
                 .map(|&(x, y, z, st)| {
-                    (x, y, z, st, local_idx(x, y, z), base_state_dim(dim, x, y, z))
+                    (
+                        x,
+                        y,
+                        z,
+                        st,
+                        local_idx(x, y, z),
+                        base_state_dim(dim, x, y, z),
+                    )
                 })
                 .collect();
             if prepared.is_empty() {
@@ -11134,8 +11729,9 @@ fn set_blocks_bulk_dim(dim: DimId, edits: &[(i32, i32, i32, u32)]) -> usize {
                         store.remove(&(dim, x, y, z, 1));
                     }
                     {
-                        let mut store =
-                            live_block_entities().lock().unwrap_or_else(|e| e.into_inner());
+                        let mut store = live_block_entities()
+                            .lock()
+                            .unwrap_or_else(|e| e.into_inner());
                         if let Some(&(id, _)) = store.entries.get(&(dim, x, y, z)) {
                             if reg.block_id_of(st) != Some(id) {
                                 store.entries.remove(&(dim, x, y, z));
@@ -11393,7 +11989,11 @@ fn live_block_changed(dim: DimId, pos @ RsPos(x, y, z): RsPos, old: u32, new: u3
     }
     let Some(reg) = breg() else { return };
     if reg.block_id_of(old) != reg.block_id_of(new) {
-        if let Some(state) = live_redstone().lock().unwrap_or_else(|e| e.into_inner()).get_mut(&dim) {
+        if let Some(state) = live_redstone()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get_mut(&dim)
+        {
             state.comparator_outputs.remove(&pos);
             state.torches.remove(&pos);
             if let Some(id) = reg.block_id_of(old) {
@@ -11482,9 +12082,40 @@ fn run_redstone_pass(dim: DimId, origin: RsPos, scheduled: Option<u32>) {
         set_block_if_inner_dim(dim, x, y, z, state, None);
         note_block_update_dim(dim, x, y, z, block_at_dim(dim, x, y, z));
     }
-    if dim == DimId::Overworld {
-        for RsPos(x, y, z) in dispensers {
-            fire_dispenser(x, y, z, block_at(x, y, z));
+    for RsPos(x, y, z) in dispensers {
+        fire_dispenser_dim(dim, x, y, z, block_at_dim(dim, x, y, z));
+    }
+    update_dim_pistons(dim, origin);
+}
+
+/// Piston neighbor updates use the same registered-dimension world view as
+/// redstone signal lookup and the canonical Vanilla structure resolver.
+fn update_dim_pistons(dim: DimId, origin: RsPos) {
+    let Some(reg) = breg() else { return };
+    let RsPos(x, y, z) = origin;
+    let world = placement_world(reg, dim);
+    for (dx, dy, dz) in [
+        (0, 0, 0),
+        (1, 0, 0),
+        (-1, 0, 0),
+        (0, 1, 0),
+        (0, -1, 0),
+        (0, 0, 1),
+        (0, 0, -1),
+    ] {
+        let (px, py, pz) = (x + dx, y + dy, z + dz);
+        let state = block_at_dim(dim, px, py, pz);
+        let RsBlock::Piston {
+            facing: _,
+            extended,
+            ..
+        } = rs_block_from_state(reg, state)
+        else {
+            continue;
+        };
+        let powered = rs_neighbor_signal(&world, RsPos(px, py, pz), true) != 0;
+        if powered != extended {
+            piston_set_extended_dim(dim, px, py, pz, state, powered);
         }
     }
 }
@@ -11493,12 +12124,26 @@ fn live_redstone_tick() {
     with_save_guard(|| {
         let now = TICK_IDX.load(Ordering::Relaxed);
         let mut due = Vec::new();
-        for (&dim, state) in live_redstone().lock().unwrap_or_else(|e| e.into_inner()).iter_mut() {
+        for (&dim, state) in live_redstone()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .iter_mut()
+        {
             while let Some(&Reverse((when, _, _, _, _))) = state.ticks.peek() {
                 if when > now {
                     break;
                 }
-                let Reverse((_, _, sequence, pos, id)) = state.ticks.pop().unwrap();
+                let Reverse((_, priority, sequence, pos, id)) = state.ticks.pop().unwrap();
+                if !chunk_tick_due(chunk_hotspot_quarantine(), dim, pos.0 >> 4, pos.2 >> 4, now) {
+                    state.ticks.push(Reverse((
+                        now.saturating_add(1),
+                        priority,
+                        sequence,
+                        pos,
+                        id,
+                    )));
+                    continue;
+                }
                 due.push((dim, sequence, pos, id));
             }
         }
@@ -11514,10 +12159,34 @@ fn live_redstone_tick() {
                 }
             };
             if pending {
+                let started = Instant::now();
                 with_redstone_origins(|| run_redstone_pass(dim, pos, Some(id)));
+                chunk_hotspot_quarantine().record_chunk_cost_us(
+                    dim,
+                    pos.0 >> 4,
+                    pos.2 >> 4,
+                    ChunkCostKind::Redstone,
+                    started.elapsed().as_micros().min(u128::from(u64::MAX)) as u64,
+                    now,
+                );
             }
         }
     });
+}
+
+fn chunk_hotspot_quarantine() -> &'static ChunkHotspotQuarantine {
+    static QUARANTINE: OnceLock<ChunkHotspotQuarantine> = OnceLock::new();
+    QUARANTINE.get_or_init(ChunkHotspotQuarantine::new)
+}
+
+fn chunk_tick_due(
+    quarantine: &ChunkHotspotQuarantine,
+    dim: DimId,
+    cx: i32,
+    cz: i32,
+    tick: u64,
+) -> bool {
+    quarantine.chunk_due(dim, cx, cz, tick)
 }
 
 fn use_redstone_component(c: &Client, (dim, x, y, z): DimBlockPos, state: u32) -> bool {
@@ -11527,8 +12196,7 @@ fn use_redstone_component(c: &Client, (dim, x, y, z): DimBlockPos, state: u32) -
         // `powered` and plays once; the held item is not consumed by tuning.
         "minecraft:note_block" => {
             if !c.is_spectator() {
-                if let Some((instrument, note, _pitch, played)) =
-                    note_block_use_dim(dim, (x, y, z))
+                if let Some((instrument, note, _pitch, played)) = note_block_use_dim(dim, (x, y, z))
                 {
                     if played {
                         broadcast_block_event_dim(
@@ -11559,8 +12227,7 @@ fn use_redstone_component(c: &Client, (dim, x, y, z): DimBlockPos, state: u32) -
                 .unwrap_or_else(|e| e.into_inner())
                 .get(&held_slot)
                 .and_then(|stack| item_to_name(stack.0).map(str::to_owned));
-            let Some(outcome) = cauldron_use(cauldron, held_name.as_deref().unwrap_or(""))
-            else {
+            let Some(outcome) = cauldron_use(cauldron, held_name.as_deref().unwrap_or("")) else {
                 return false;
             };
             if !c.is_spectator() {
@@ -11628,15 +12295,13 @@ fn use_redstone_component(c: &Client, (dim, x, y, z): DimBlockPos, state: u32) -
                 outcome @ (AnchorOutcome::Charged { .. } | AnchorOutcome::Full) => {
                     if !c.is_spectator() {
                         if let AnchorOutcome::Charged { charges: next } = outcome {
-                            let updated =
-                                reg.with_prop(state, "charges", &next.to_string());
+                            let updated = reg.with_prop(state, "charges", &next.to_string());
                             if set_block_if_dim(dim, x, y, z, updated, Some(state)) {
                                 note_block_update_dim(dim, x, y, z, updated);
                             }
                         }
                         if *c.gm.lock().unwrap_or_else(|e| e.into_inner()) != 1 {
-                            let mut inv =
-                                c.inv.lock().unwrap_or_else(|e| e.into_inner());
+                            let mut inv = c.inv.lock().unwrap_or_else(|e| e.into_inner());
                             if let Some(held) = inv.get(&held_slot).cloned() {
                                 if held.1 <= 1 {
                                     inv.remove(&held_slot);
@@ -11651,18 +12316,12 @@ fn use_redstone_component(c: &Client, (dim, x, y, z): DimBlockPos, state: u32) -
                 AnchorOutcome::RespawnSet => {
                     if !c.is_spectator() {
                         let angle = c.pos.lock().unwrap_or_else(|e| e.into_inner()).3;
-                        let position = (
-                            x as f64 + 0.5,
-                            y as f64 + 0.5,
-                            z as f64 + 0.5,
-                        );
+                        let position = (x as f64 + 0.5, y as f64 + 0.5, z as f64 + 0.5);
                         *c.spawn_pt.lock().unwrap_or_else(|e| e.into_inner()) =
                             Some((position.0, position.1, position.2, angle));
                         *c.spawn_dim.lock().unwrap_or_else(|e| e.into_inner()) = dim;
-                        let inventory =
-                            c.inv.lock().unwrap_or_else(|e| e.into_inner()).clone();
-                        let mut snapshot =
-                            PlayerSave::capture(c, client_dim_pos(c), &inventory);
+                        let inventory = c.inv.lock().unwrap_or_else(|e| e.into_inner()).clone();
+                        let mut snapshot = PlayerSave::capture(c, client_dim_pos(c), &inventory);
                         snapshot.respawn = Some(SpawnTarget {
                             kind: SpawnTargetKind::Anchor,
                             dim,
@@ -11689,7 +12348,8 @@ fn use_redstone_component(c: &Client, (dim, x, y, z): DimBlockPos, state: u32) -
                         if set_block_if_dim(dim, x, y, z, air, Some(state)) {
                             note_block_update_dim(dim, x, y, z, air);
                         }
-                        explode_at(
+                        explode_at_dim(
+                            dim,
                             x as f64 + 0.5,
                             y as f64 + 0.5,
                             z as f64 + 0.5,
@@ -11776,6 +12436,10 @@ impl PlacementWorld<'_> {
     }
 }
 impl RedstoneWorld for PlacementWorld<'_> {
+    fn build_height(&self) -> (i32, i32) {
+        (self.dim.min_y(), self.dim.min_y() + self.dim.height())
+    }
+
     fn redstone_block(&self, pos: RsPos) -> RsBlock {
         rs_block_from_state(self.reg, self.state(pos))
     }
@@ -11821,11 +12485,7 @@ fn slab_absorbs(reg: &BReg, clicked_state: u32, block_name: &str, ctx: &Placemen
 /// `BlockPlaceContext`: the write target. The clicked cell absorbs the block
 /// when it is replaceable or an absorbing same-slab; otherwise the click is
 /// offset one cell along the face.
-fn placement_target(
-    reg: &BReg,
-    item_name: &str,
-    mut ctx: PlacementCtx,
-) -> Option<PlacementCtx> {
+fn placement_target(reg: &BReg, item_name: &str, mut ctx: PlacementCtx) -> Option<PlacementCtx> {
     let (x, y, z) = ctx.clicked;
     let clicked = block_at_dim(ctx.dim, x, y, z);
     let name = placement_block_name(item_name, ctx.face)?;
@@ -11889,8 +12549,7 @@ fn placement_can_survive(reg: &BReg, dim: DimId, ctx: &PlacementCtx, st: u32) ->
     let name = reg.name_of(st);
     let (tx, ty, tz) = ctx.target;
     let below = block_at_dim(dim, tx, ty - 1, tz);
-    let up_sturdy =
-        |state: u32| reg.is_face_sturdy(state, 1, Support::Full);
+    let up_sturdy = |state: u32| reg.is_face_sturdy(state, 1, Support::Full);
     if name.ends_with("_lantern") || name == "minecraft:lantern" {
         return if reg.get_prop(st, "hanging").as_deref() == Some("true") {
             reg.is_face_sturdy(block_at_dim(dim, tx, ty + 1, tz), 0, Support::Center)
@@ -11907,13 +12566,13 @@ fn placement_can_survive(reg: &BReg, dim: DimId, ctx: &PlacementCtx, st: u32) ->
         return up_sturdy(below);
     }
     match name {
-        "minecraft:redstone_wire"
-        | "minecraft:repeater"
-        | "minecraft:comparator" => {
+        "minecraft:redstone_wire" | "minecraft:repeater" | "minecraft:comparator" => {
             up_sturdy(below) || reg.name_of(below) == "minecraft:hopper"
         }
         "minecraft:torch" | "minecraft:soul_torch" | "minecraft:redstone_torch" => up_sturdy(below),
-        "minecraft:redstone_wall_torch" | "minecraft:wall_torch" | "minecraft:soul_wall_torch"
+        "minecraft:redstone_wall_torch"
+        | "minecraft:wall_torch"
+        | "minecraft:soul_wall_torch"
         | "minecraft:ladder" => {
             let (x, y, z) = ctx.clicked;
             reg.is_face_sturdy(block_at_dim(dim, x, y, z), ctx.face, Support::Center)
@@ -11967,14 +12626,16 @@ fn placement_door_hinge(
         (tx + dx, ty + up, tz + dz)
     };
     let conductor = |pos: (i32, i32, i32)| reg.is_redstone_conductor(get(pos));
-    let i = -(conductor(at(facing.left(), 0)) as i32)
-        - (conductor(at(facing.left(), 1)) as i32)
+    let i = -(conductor(at(facing.left(), 0)) as i32) - (conductor(at(facing.left(), 1)) as i32)
         + conductor(at(facing.right(), 0)) as i32
         + conductor(at(facing.right(), 1)) as i32;
     let same_door = |pos: (i32, i32, i32)| {
         let s = get(pos);
         reg.name_of(s) == door_name
-            && reg.get_prop(s, "facing").and_then(|v| RsDir::from_property(&v)) == Some(facing)
+            && reg
+                .get_prop(s, "facing")
+                .and_then(|v| RsDir::from_property(&v))
+                == Some(facing)
             && reg.get_prop(s, "half").as_deref() == Some("lower")
     };
     let ccw_door = same_door(at(facing.left(), 0));
@@ -12032,11 +12693,7 @@ fn rail_connections(
     out
 }
 
-fn rail_shape_for(
-    reg: &BReg,
-    st: u32,
-    conns: &[(RsDir, bool)],
-) -> Option<&'static str> {
+fn rail_shape_for(reg: &BReg, st: u32, conns: &[(RsDir, bool)]) -> Option<&'static str> {
     let straight = matches!(
         reg.name_of(st),
         "minecraft:powered_rail" | "minecraft:detector_rail" | "minecraft:activator_rail"
@@ -12079,7 +12736,9 @@ fn rail_shape_for(
             }
         }
     }
-    if pair(RsDir::East, RsDir::West) || (has(RsDir::East) || has(RsDir::West)) && !has(RsDir::North) && !has(RsDir::South) {
+    if pair(RsDir::East, RsDir::West)
+        || (has(RsDir::East) || has(RsDir::West)) && !has(RsDir::North) && !has(RsDir::South)
+    {
         return Some("east_west");
     }
     Some("north_south")
@@ -12166,8 +12825,8 @@ fn placement_states(reg: &BReg, item_name: &str, ctx: &PlacementCtx) -> Option<P
             return Some(Vec::new());
         }
         let facing = look;
-        let powered = placement_powered(&world, (tx, ty, tz))
-            || placement_powered(&world, (tx, ty + 1, tz));
+        let powered =
+            placement_powered(&world, (tx, ty, tz)) || placement_powered(&world, (tx, ty + 1, tz));
         let hinge = placement_door_hinge(reg, &full, ctx, facing);
         for (half, pos) in [("lower", (tx, ty, tz)), ("upper", (tx, ty + 1, tz))] {
             let mut half_st = st;
@@ -12183,7 +12842,14 @@ fn placement_states(reg: &BReg, item_name: &str, ctx: &PlacementCtx) -> Option<P
             }
         }
     } else if matches!(n, "chest" | "trapped_chest" | "ender_chest") {
-        st = chest_placement_state_dim(ctx.dim, &full, (tx, ty, tz), ctx.yaw, ctx.sneaking, ctx.face);
+        st = chest_placement_state_dim(
+            ctx.dim,
+            &full,
+            (tx, ty, tz),
+            ctx.yaw,
+            ctx.sneaking,
+            ctx.face,
+        );
     } else if is("_trapdoor") {
         let facing = if ctx.face >= 2 { fdir } else { look.opposite() };
         st = reg.with_prop(st, "facing", facing.property());
@@ -12215,14 +12881,9 @@ fn placement_states(reg: &BReg, item_name: &str, ctx: &PlacementCtx) -> Option<P
             let nname = reg.name_of(nst);
             let connect = reg.is_face_sturdy(nst, dir.opposite() as u8, Support::Full)
                 || (nname.ends_with("_fence")
-                    && (nname == "minecraft:nether_brick_fence")
-                        == (n == "nether_brick_fence"))
+                    && (nname == "minecraft:nether_brick_fence") == (n == "nether_brick_fence"))
                 || nname.ends_with("_fence_gate");
-            st = reg.with_prop(
-                st,
-                dir.property(),
-                if connect { "true" } else { "false" },
-            );
+            st = reg.with_prop(st, dir.property(), if connect { "true" } else { "false" });
         }
     } else if (is("_pane") || n == "iron_bars") && reg.has_prop(&full, "north") {
         for dir in RsDir::HORIZONTAL {
@@ -12232,11 +12893,7 @@ fn placement_states(reg: &BReg, item_name: &str, ctx: &PlacementCtx) -> Option<P
             let connect = reg.is_face_sturdy(nst, dir.opposite() as u8, Support::Full)
                 || nname.ends_with("_pane")
                 || nname == "minecraft:iron_bars";
-            st = reg.with_prop(
-                st,
-                dir.property(),
-                if connect { "true" } else { "false" },
-            );
+            st = reg.with_prop(st, dir.property(), if connect { "true" } else { "false" });
         }
     } else if is("_wall") && reg.has_prop(&full, "up") {
         for dir in RsDir::HORIZONTAL {
@@ -12252,7 +12909,15 @@ fn placement_states(reg: &BReg, item_name: &str, ctx: &PlacementCtx) -> Option<P
         let straight = (v(RsDir::North) && v(RsDir::South) && !v(RsDir::East) && !v(RsDir::West))
             || (v(RsDir::East) && v(RsDir::West) && !v(RsDir::North) && !v(RsDir::South));
         let covered = reg.is_face_sturdy(get((tx, ty + 1, tz)), 0, Support::Full);
-        st = reg.with_prop(st, "up", if straight && !covered { "false" } else { "true" });
+        st = reg.with_prop(
+            st,
+            "up",
+            if straight && !covered {
+                "false"
+            } else {
+                "true"
+            },
+        );
     } else if n == "rail" || is("_rail") {
         let conns = rail_connections(reg, &get, (tx, ty, tz));
         if let Some(shape) = rail_shape_for(reg, st, &conns) {
@@ -12273,10 +12938,17 @@ fn placement_states(reg: &BReg, item_name: &str, ctx: &PlacementCtx) -> Option<P
     } else if n == "observer" {
         st = reg.with_prop(st, "facing", near.property());
         st = reg.with_prop(st, "powered", "false");
-    } else if matches!(n, "piston" | "sticky_piston" | "dispenser" | "dropper" | "barrel") {
+    } else if matches!(
+        n,
+        "piston" | "sticky_piston" | "dispenser" | "dropper" | "barrel"
+    ) {
         st = reg.with_prop(st, "facing", near.opposite().property());
     } else if n == "hopper" {
-        let facing = if ctx.face == 1 { RsDir::Down } else { fdir.opposite() };
+        let facing = if ctx.face == 1 {
+            RsDir::Down
+        } else {
+            fdir.opposite()
+        };
         st = reg.with_prop(st, "facing", facing.property());
     } else if n == "lever" || n == "grindstone" || reg.in_tag(st0, "minecraft:buttons") {
         let (mount, facing) = match fdir {
@@ -12309,7 +12981,11 @@ fn placement_states(reg: &BReg, item_name: &str, ctx: &PlacementCtx) -> Option<P
         st = reg.with_prop(st, "facing", look.property());
         st = reg.with_prop(st, "lit", "true");
         let signal_fire = reg.name_of(get((tx, ty - 1, tz))) == "minecraft:hay_block";
-        st = reg.with_prop(st, "signal_fire", if signal_fire { "true" } else { "false" });
+        st = reg.with_prop(
+            st,
+            "signal_fire",
+            if signal_fire { "true" } else { "false" },
+        );
     } else if is("_bed") {
         if !reg.is_replaceable(get((tx, ty, tz))) {
             return Some(Vec::new());
@@ -12326,7 +13002,12 @@ fn placement_states(reg: &BReg, item_name: &str, ctx: &PlacementCtx) -> Option<P
     } else if reg.has_prop(&full, "half")
         && matches!(
             n,
-            "tall_grass" | "large_fern" | "sunflower" | "lilac" | "rose_bush" | "peony"
+            "tall_grass"
+                | "large_fern"
+                | "sunflower"
+                | "lilac"
+                | "rose_bush"
+                | "peony"
                 | "pitcher_plant"
         )
     {
@@ -12354,19 +13035,30 @@ fn placement_states(reg: &BReg, item_name: &str, ctx: &PlacementCtx) -> Option<P
             _ => "down",
         };
         st = reg.with_prop(st, "tip_direction", dir);
-    } else if matches!(n, "lightning_rod" | "end_rod" | "amethyst_cluster")
-        || is("_amethyst_bud")
-    {
+    } else if matches!(n, "lightning_rod" | "end_rod" | "amethyst_cluster") || is("_amethyst_bud") {
         st = reg.with_prop(st, "facing", fdir.property());
     } else if reg.has_prop(&full, "rotation") {
         let rot = ((ctx.yaw as f64 * 16.0 / 360.0 + 0.5).floor() as i64) & 15;
         st = reg.with_prop(st, "rotation", &rot.to_string());
     } else if matches!(
         n,
-        "lectern" | "loom" | "stonecutter" | "furnace" | "smoker" | "blast_furnace"
-            | "carved_pumpkin" | "jack_o_lantern" | "end_portal_frame" | "bee_nest"
-            | "beehive" | "chiseled_bookshelf" | "decorated_pot" | "big_dripleaf"
-            | "small_dripleaf" | "mangrove_roots" | "jukebox"
+        "lectern"
+            | "loom"
+            | "stonecutter"
+            | "furnace"
+            | "smoker"
+            | "blast_furnace"
+            | "carved_pumpkin"
+            | "jack_o_lantern"
+            | "end_portal_frame"
+            | "bee_nest"
+            | "beehive"
+            | "chiseled_bookshelf"
+            | "decorated_pot"
+            | "big_dripleaf"
+            | "small_dripleaf"
+            | "mangrove_roots"
+            | "jukebox"
     ) || (n.ends_with("_glazed_terracotta") && reg.has_prop(&full, "facing"))
     {
         st = reg.with_prop(st, "facing", look.opposite().property());
@@ -12403,7 +13095,9 @@ fn try_live_block_placement(
     if live_create_item_name(item).is_some() {
         return live_create_block_place(c, (dim, x, y, z), face, held, item);
     }
-    let Some(item_name) = item_to_name(item) else { return false };
+    let Some(item_name) = item_to_name(item) else {
+        return false;
+    };
     if placement_block_name(item_name, face as u8).is_none() {
         return false;
     }
@@ -12490,7 +13184,10 @@ fn try_live_block_placement(
         return true;
     }
     if prof {
-        eprintln!("[place-prof] {item_name} target=({tx},{ty},{tz}) writes={}", writes.len());
+        eprintln!(
+            "[place-prof] {item_name} target=({tx},{ty},{tz}) writes={}",
+            writes.len()
+        );
     }
     #[cfg(feature = "neoforge-events")]
     if !neoforge_place_allowed(c, (dim, tx, ty, tz), ctx.target_old, writes[0].1, _against) {
@@ -12499,7 +13196,10 @@ fn try_live_block_placement(
     let __pt = prof.then(Instant::now);
     with_save_guard(|| {
         if let Some(t) = __pt {
-            eprintln!("[place-prof] {item_name} target=({tx},{ty},{tz}) guard-wait {:?}", t.elapsed());
+            eprintln!(
+                "[place-prof] {item_name} target=({tx},{ty},{tz}) guard-wait {:?}",
+                t.elapsed()
+            );
         }
         let mut wrote = false;
         for ((wx, wy, wz), state) in &writes {
@@ -12513,7 +13213,12 @@ fn try_live_block_placement(
             // Neighbor updateShape for the rail family: vanilla's RailState
             // cascades the shape recompute across connected cells.
             for (dx, dy, dz) in [
-                (1i32, 0, 0), (-1, 0, 0), (0, 0, 1), (0, 0, -1), (0, 1, 0), (0, -1, 0),
+                (1i32, 0, 0),
+                (-1, 0, 0),
+                (0, 0, 1),
+                (0, 0, -1),
+                (0, 1, 0),
+                (0, -1, 0),
             ] {
                 rail_update_at(reg, dim, (tx + dx, ty + dy, tz + dz));
             }
@@ -12528,11 +13233,15 @@ fn try_live_block_placement(
 fn is_power_source(x: i32, y: i32, z: i32) -> bool {
     let st = block_at(x, y, z);
     plate_powered(st)
-        || breg().is_some_and(|reg| matches!(
-            rs_block_from_state(reg, st),
-            RsBlock::RedstoneBlock | RsBlock::Lever { powered: true, .. }
-                | RsBlock::Observer { powered: true, .. } | RsBlock::Button { powered: true, .. }
-        ))
+        || breg().is_some_and(|reg| {
+            matches!(
+                rs_block_from_state(reg, st),
+                RsBlock::RedstoneBlock
+                    | RsBlock::Lever { powered: true, .. }
+                    | RsBlock::Observer { powered: true, .. }
+                    | RsBlock::Button { powered: true, .. }
+            )
+        })
 }
 fn piston_powered(px: i32, py: i32, pz: i32) -> bool {
     for (dx, dy, dz) in [
@@ -12556,6 +13265,10 @@ fn piston_powered(px: i32, py: i32, pz: i32) -> bool {
     false
 }
 fn piston_set_extended(bx: i32, by: i32, bz: i32, st: u32, extended: bool) {
+    piston_set_extended_dim(DimId::Overworld, bx, by, bz, st, extended)
+}
+
+fn piston_set_extended_dim(dim: DimId, bx: i32, by: i32, bz: i32, st: u32, extended: bool) {
     let lo = if (2011..=2022).contains(&st) {
         2011u32
     } else {
@@ -12576,45 +13289,69 @@ fn piston_set_extended(bx: i32, by: i32, bz: i32, st: u32, extended: bool) {
         _ => (0, -1, 0),
     };
     let (px, py, pz) = (bx + fx, by + fy, bz + fz);
+    let Some(reg) = breg() else { return };
+    let world = placement_world(reg, dim);
+    let direction = match facing {
+        0 => RsDir::North,
+        1 => RsDir::East,
+        2 => RsDir::South,
+        3 => RsDir::West,
+        4 => RsDir::Up,
+        _ => RsDir::Down,
+    };
     if extended {
-        set_block(bx, by, bz, st - 6);
-        note_block_update(bx, by, bz, st - 6);
-        let front = block_at(px, py, pz);
-        let (qx, qy, qz) = (bx + fx * 2, by + fy * 2, bz + fz * 2);
-        let head = 2023 + facing as u32 * 4;
-        // vanilla: blocks with block entities are immovable — pushing
-        // them would orphan/duplicate the contents store
-        let immovable = container_kind(front).is_some()
-            || (4295..=4302).contains(&front)                          // furnace
-            || (9345..=9356).contains(&front)                          // dispenser
-            || (523..=534).contains(&front)                            // dropper
-            || hopper_state_facing(front).is_some()                    // hopper
-            || signs()
-                .lock()
-                .unwrap()
-                .keys()
-                .any(|&(dim, sx, sy, sz, _)| {
-                    dim == DimId::Overworld && sx == px && sy == py && sz == pz
-                });
-        if front != 0 && !immovable && block_at(qx, qy, qz) == 0 {
-            place_block(qx, qy, qz, front);
-            place_block(px, py, pz, head);
-        } else if front == 0 {
-            set_block(px, py, pz, head);
-            note_block_update(px, py, pz, head);
+        let Some(plan) = rs_piston_resolve(&world, RsPos(bx, by, bz), direction, true) else {
+            return;
+        };
+        let moved: Vec<(RsPos, u32)> = plan
+            .to_move
+            .iter()
+            .map(|&pos @ RsPos(x, y, z)| (pos, block_at_dim(dim, x, y, z)))
+            .collect();
+        for RsPos(x, y, z) in plan.to_destroy.iter().chain(plan.to_move.iter()) {
+            set_block_dim(dim, *x, *y, *z, 0);
+            note_block_update_dim(dim, *x, *y, *z, 0);
         }
-        // immovable non-air front: base extends, no head (head can't
-        // occupy the block-entity cell) — matches vanilla's no-push
+        for (RsPos(x, y, z), state) in moved.into_iter().rev() {
+            let (nx, ny, nz) = (x + fx, y + fy, z + fz);
+            set_block_dim(dim, nx, ny, nz, state);
+            note_block_update_dim(dim, nx, ny, nz, state);
+        }
+        set_block_dim(dim, bx, by, bz, st - 6);
+        note_block_update_dim(dim, bx, by, bz, st - 6);
+        let head = 2023 + facing as u32 * 4;
+        set_block_dim(dim, px, py, pz, head);
+        note_block_update_dim(dim, px, py, pz, head);
     } else {
-        set_block(bx, by, bz, st + 6);
-        note_block_update(bx, by, bz, st + 6);
-        if (2023..=2046).contains(&block_at(px, py, pz)) {
-            set_block(px, py, pz, 0);
-            note_block_update(px, py, pz, 0);
+        let plan = if reg.name_of(st).contains("sticky_piston") {
+            rs_piston_resolve(&world, RsPos(bx, by, bz), direction, false)
+        } else {
+            Some(RsPistonPlan::default())
+        };
+        let Some(plan) = plan else { return };
+        let moved: Vec<(RsPos, u32)> = plan
+            .to_move
+            .iter()
+            .map(|&pos @ RsPos(x, y, z)| (pos, block_at_dim(dim, x, y, z)))
+            .collect();
+        for RsPos(x, y, z) in plan.to_destroy.iter().chain(plan.to_move.iter()) {
+            set_block_dim(dim, *x, *y, *z, 0);
+            note_block_update_dim(dim, *x, *y, *z, 0);
+        }
+        for (RsPos(x, y, z), state) in moved.into_iter().rev() {
+            let (nx, ny, nz) = (x - fx, y - fy, z - fz);
+            set_block_dim(dim, nx, ny, nz, state);
+            note_block_update_dim(dim, nx, ny, nz, state);
+        }
+        set_block_dim(dim, bx, by, bz, st + 6);
+        note_block_update_dim(dim, bx, by, bz, st + 6);
+        if (2023..=2046).contains(&block_at_dim(dim, px, py, pz)) {
+            set_block_dim(dim, px, py, pz, 0);
+            note_block_update_dim(dim, px, py, pz, 0);
         }
     }
 }
-fn fire_dispenser(dx: i32, dy: i32, dz: i32, st: u32) {
+fn fire_dispenser_dim(dim: DimId, dx: i32, dy: i32, dz: i32, st: u32) {
     let Some(reg) = breg() else { return };
     let facing = match rs_block_from_state(reg, st) {
         RsBlock::Dispenser { facing, .. } | RsBlock::Dropper { facing, .. } => facing,
@@ -12622,37 +13359,42 @@ fn fire_dispenser(dx: i32, dy: i32, dz: i32, st: u32) {
     };
     let (fx, fy, fz) = facing.offset();
     let (tx, ty, tz) = (dx + fx, dy + fy, dz + fz);
-    unpack_block_loot_if_needed(ow_block((dx, dy, dz)));
-    let first = chests().lock().unwrap_or_else(|e| e.into_inner()).get(&ContainerKey::ow((dx, dy, dz))).and_then(|m| {
-        m.iter()
-            .find(|(_, v)| v.1 > 0)
-            .map(|(k, v)| (*k, v.clone()))
-    });
+    let key = ContainerKey::Block((dim, dx, dy, dz));
+    unpack_block_loot_if_needed((dim, dx, dy, dz));
+    let first = chests()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .get(&key)
+        .and_then(|m| {
+            m.iter()
+                .find(|(_, v)| v.1 > 0)
+                .map(|(k, v)| (*k, v.clone()))
+        });
     let Some((slot, (item, _cnt, _fc))) = first else {
         return;
     };
     match item {
         909 => {
             // water_bucket -> place source
-            if block_at(tx, ty, tz) == 0 {
-                set_block(tx, ty, tz, 80);
-                note_block_update(tx, ty, tz, 80);
+            if block_at_dim(dim, tx, ty, tz) == 0 {
+                set_block_dim(dim, tx, ty, tz, 80);
+                note_block_update_dim(dim, tx, ty, tz, 80);
             }
         }
         960 => {
             // bone_meal -> grow crop at target
-            let cst = block_at(tx, ty, tz);
+            let cst = block_at_dim(dim, tx, ty, tz);
             if (4278..=4285).contains(&cst) {
                 let nst = (cst + 3).min(4285);
-                set_block(tx, ty, tz, nst);
-                note_block_update(tx, ty, tz, nst);
+                set_block_dim(dim, tx, ty, tz, nst);
+                note_block_update_dim(dim, tx, ty, tz, nst);
             } else if (4294..=4301).contains(&cst) {
                 let nst = (cst + 3).min(4301);
-                set_block(tx, ty, tz, nst);
-                note_block_update(tx, ty, tz, nst);
+                set_block_dim(dim, tx, ty, tz, nst);
+                note_block_update_dim(dim, tx, ty, tz, nst);
             }
             let mut ch = chests().lock().unwrap_or_else(|e| e.into_inner());
-            if let Some(m) = ch.get_mut(&ContainerKey::ow((dx, dy, dz))) {
+            if let Some(m) = ch.get_mut(&key) {
                 if let Some(v) = m.get_mut(&slot) {
                     v.1 = v.1.saturating_sub(1);
                     if v.1 == 0 {
@@ -12753,15 +13495,18 @@ fn note_falling(x: i32, y: i32, z: i32) {
         // Reserve first; no world write or falling entity is created until
         // the native-style delayed callback is actually collected.
         let sub_order = BLOCK_TICK_ORDER.fetch_add(1, Ordering::Relaxed);
-        block_ticks().lock().unwrap_or_else(|e| e.into_inner()).schedule(scheduled_ticks::ScheduledTick {
-            pos: (px, py, pz),
-            // Native ScheduledTick de-duplicates per block identity, independent
-            // of facing/waterlogged properties of the current state.
-            block: reg.state_of(reg.name_of(st), None),
-            due,
-            priority: 0,
-            sub_order,
-        });
+        block_ticks()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .schedule(scheduled_ticks::ScheduledTick {
+                pos: (px, py, pz),
+                // Native ScheduledTick de-duplicates per block identity, independent
+                // of facing/waterlogged properties of the current state.
+                block: reg.state_of(reg.name_of(st), None),
+                due,
+                priority: 0,
+                sub_order,
+            });
     }
 }
 
@@ -12780,15 +13525,18 @@ fn spawn_fall(px: i32, py: i32, pz: i32, st: u32) {
         }
         note_block_update(px, py, pz, 0);
         let eid = NEXT_EID.fetch_add(1, Ordering::SeqCst);
-        falling().lock().unwrap_or_else(|e| e.into_inner()).push(Fall {
-            eid,
-            x: px as f64 + 0.5,
-            y: py as f64,
-            z: pz as f64 + 0.5,
-            dy: 0.0,
-            state: st,
-            time: 0,
-        });
+        falling()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .push(Fall {
+                eid,
+                x: px as f64 + 0.5,
+                y: py as f64,
+                z: pz as f64 + 0.5,
+                dy: 0.0,
+                state: st,
+                time: 0,
+            });
     });
 }
 
@@ -12932,7 +13680,10 @@ fn falling_tick() {
     }
     with_save_guard(|| {
         if !below.is_empty() {
-            drops().lock().unwrap_or_else(|e| e.into_inner()).extend(below);
+            drops()
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .extend(below);
         }
         end_falling_tick(&processed, keep);
         for (fa, bx, top, bz) in landings {
@@ -12950,7 +13701,10 @@ fn falling_tick() {
                 let mut rest = fa;
                 rest.y = (top + 1) as f64;
                 rest.dy = 0.0;
-                falling().lock().unwrap_or_else(|e| e.into_inner()).push(rest);
+                falling()
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .push(rest);
             }
         }
     });
@@ -12983,12 +13737,7 @@ fn attach_face_toward(reg: &BReg, state: u32) -> u8 {
 /// Re-evaluate a neighbour's support rule as vanilla `updateShape` does: the
 /// block drops only when the changed cell sits on the side its family
 /// attaches to (`direction == support_side` and `!canSurvive`).
-fn neighbor_loses_support(
-    reg: &BReg,
-    state: u32,
-    toward: u8,
-    support: u32,
-) -> bool {
+fn neighbor_loses_support(reg: &BReg, state: u32, toward: u8, support: u32) -> bool {
     let name = reg.name_of(state);
     if reg.fragile_loses_support(state, toward, support) {
         return true;
@@ -12996,24 +13745,17 @@ fn neighbor_loses_support(
     let below_sturdy = |s: u32| reg.is_face_sturdy(s, 1, Support::Full);
     match name {
         // Attached below: the support is the cell under the block.
-        "minecraft:rail" | "minecraft:bell"
-            if toward == 0 =>
-        {
-            !below_sturdy(support)
-        }
+        "minecraft:rail" | "minecraft:bell" if toward == 0 => !below_sturdy(support),
         _ if name.ends_with("_rail") || name.ends_with("_pressure_plate") => {
             toward == 0 && !below_sturdy(support)
         }
         "minecraft:redstone_wire" | "minecraft:repeater" | "minecraft:comparator" => {
-            toward == 0
-                && !(below_sturdy(support) || reg.name_of(support) == "minecraft:hopper")
+            toward == 0 && !(below_sturdy(support) || reg.name_of(support) == "minecraft:hopper")
         }
         _ if name.ends_with("_carpet") => toward == 0 && !below_sturdy(support),
         // AttachFace blocks (lever, buttons, grindstone): face picks the support
         // direction — floor attaches below, ceiling above, wall toward `facing`.
-        "minecraft:lever" | "minecraft:grindstone"
-            if toward == attach_face_toward(reg, state) =>
-        {
+        "minecraft:lever" | "minecraft:grindstone" if toward == attach_face_toward(reg, state) => {
             !below_sturdy(support)
         }
         _ if name.ends_with("_button") && toward == attach_face_toward(reg, state) => {
@@ -13049,7 +13791,9 @@ fn neighbor_loses_support(
 /// compare-and-set that protects falling-block creation: repeated notifications
 /// and concurrent mutations may not duplicate drops.
 fn note_fragile_supports(x: i32, y: i32, z: i32) {
-    let Some(reg) = crate::block_registry::breg() else { return };
+    let Some(reg) = crate::block_registry::breg() else {
+        return;
+    };
     let support = block_at(x, y, z);
     for (dir, (dx, dy, dz)) in LEAF_NEIGHBORS.iter().copied().enumerate() {
         let q = (x.wrapping_add(dx), y.wrapping_add(dy), z.wrapping_add(dz));
@@ -13091,7 +13835,9 @@ fn note_fragile_supports(x: i32, y: i32, z: i32) {
 /// recursion and drains deep update chains. Never hold a world lock across
 /// set_block_if, which itself sends block and packet updates.
 fn note_connected_shapes(x: i32, y: i32, z: i32) {
-    let Some(reg) = crate::block_registry::breg() else { return };
+    let Some(reg) = crate::block_registry::breg() else {
+        return;
+    };
     let changed = block_at(x, y, z);
     let mut wet = Vec::new();
     if waterlogged_source(changed) {
@@ -13120,9 +13866,12 @@ fn note_connected_shapes(x: i32, y: i32, z: i32) {
         } else {
             0
         };
-        let updated = reg.connection_after_neighbor(old, changed, above, direction ^ 1)
+        let updated = reg
+            .connection_after_neighbor(old, changed, above, direction ^ 1)
             .or_else(|| {
-                if direction <= 1 || !name.ends_with("_stairs") { return None; }
+                if direction <= 1 || !name.ends_with("_stairs") {
+                    return None;
+                }
                 reg.stair_after_neighbors(old, q, |p| block_at(p.0, p.1, p.2))
             });
         if let Some(new_state) = updated {
@@ -13155,13 +13904,15 @@ fn note_doors(x: i32, y: i32, z: i32) {
             continue;
         }
         // The pair sits on the half's pairing side: upper looks down, lower up.
-        let (mine, want) = if toward == 0 { ("upper", "lower") } else { ("lower", "upper") };
+        let (mine, want) = if toward == 0 {
+            ("upper", "lower")
+        } else {
+            ("lower", "upper")
+        };
         if reg.get_prop(st, "half").as_deref() != Some(mine) {
             continue;
         }
-        if reg.name_of(changed) == name
-            && reg.get_prop(changed, "half").as_deref() == Some(want)
-        {
+        if reg.name_of(changed) == name && reg.get_prop(changed, "half").as_deref() == Some(want) {
             let mut next = st;
             for p in ["facing", "open", "hinge", "powered"] {
                 if let Some(v) = reg.get_prop(changed, p) {
@@ -13209,9 +13960,18 @@ fn block_updated_inner(x: i32, y: i32, z: i32) {
         // RailState cascades shape updates to every cell a rail could
         // connect to, including the diagonal-above run of a slope.
         for (dx, dy, dz) in [
-            (1, 0, 0), (-1, 0, 0), (0, 0, 1), (0, 0, -1),
-            (1, 1, 0), (-1, 1, 0), (0, 1, 1), (0, 1, -1),
-            (1, -1, 0), (-1, -1, 0), (0, -1, 1), (0, -1, -1),
+            (1, 0, 0),
+            (-1, 0, 0),
+            (0, 0, 1),
+            (0, 0, -1),
+            (1, 1, 0),
+            (-1, 1, 0),
+            (0, 1, 1),
+            (0, 1, -1),
+            (1, -1, 0),
+            (-1, -1, 0),
+            (0, -1, 1),
+            (0, -1, -1),
         ] {
             rail_update_at(reg, DimId::Overworld, (x + dx, y + dy, z + dz));
         }
@@ -13272,13 +14032,16 @@ fn block_updated_inner(x: i32, y: i32, z: i32) {
             set_block(bx, by, bz, 0);
             note_block_update(bx, by, bz, 0);
             let eid = NEXT_EID.fetch_add(1, Ordering::SeqCst);
-            primed().lock().unwrap_or_else(|e| e.into_inner()).push(Primed {
-                eid,
-                x: bx as f64 + 0.5,
-                y: by as f64,
-                z: bz as f64 + 0.5,
-                left: server_ticks(TNT_FUSE_GT) as i32,
-            });
+            primed()
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .push(Primed {
+                    eid,
+                    x: bx as f64 + 0.5,
+                    y: by as f64,
+                    z: bz as f64 + 0.5,
+                    left: server_ticks(TNT_FUSE_GT) as i32,
+                });
             // interest_tick delivers the arrow spawn to trackers
         }
     }
@@ -13294,14 +14057,17 @@ fn gc_backoff() {
     let cells = plugin_cells().lock().unwrap_or_else(|e| e.into_inner());
     // waters/hoppers are Overworld-only indexes. A non-Overworld backoff stays live only while a
     // plugin cell in that same dimension names its position; neither may answer for another dim.
-    backoff().lock().unwrap_or_else(|e| e.into_inner()).retain(|k, _| {
-        let (dim, x, y, z) = *k;
-        let plugin_live = cells.iter().any(|((cdim, _, _), bucket)| {
-            *cdim == dim && bucket.iter().any(|c| c.x == x && c.y == y && c.z == z)
+    backoff()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .retain(|k, _| {
+            let (dim, x, y, z) = *k;
+            let plugin_live = cells.iter().any(|((cdim, _, _), bucket)| {
+                *cdim == dim && bucket.iter().any(|c| c.x == x && c.y == y && c.z == z)
+            });
+            (dim == DimId::Overworld && (wtr.contains(&(x, y, z)) || hh.contains(&(x, y, z))))
+                || plugin_live
         });
-        (dim == DimId::Overworld && (wtr.contains(&(x, y, z)) || hh.contains(&(x, y, z))))
-            || plugin_live
-    });
     let mut pb = plugin_backoff().lock().unwrap_or_else(|e| e.into_inner());
     let live: std::collections::HashSet<CellKey> = cells
         .iter()
@@ -13313,8 +14079,6 @@ fn gc_backoff() {
         .collect();
     pb.retain(|k, _| live.contains(k));
 }
-
-
 
 /// Nightly hostile choice: use the pinned biome's weighted monster list for the
 /// four types this runtime can simulate, and keep the old rotation only when the
@@ -13441,12 +14205,9 @@ fn resource_pack_http_action(line: &[u8], target: &str) -> (u16, &'static str, b
         return (400, "Bad Request", false);
     };
     let mut fields = line.split_ascii_whitespace();
-    let (Some(method), Some(path), Some(version), None) = (
-        fields.next(),
-        fields.next(),
-        fields.next(),
-        fields.next(),
-    ) else {
+    let (Some(method), Some(path), Some(version), None) =
+        (fields.next(), fields.next(), fields.next(), fields.next())
+    else {
         return (400, "Bad Request", false);
     };
     if !matches!(version, "HTTP/1.0" | "HTTP/1.1") {
@@ -13490,12 +14251,15 @@ fn serve_resource_pack_http(
         }
         used += read;
     };
-    let (status, reason, send_body) = line_end.map_or(
-        (400, "Bad Request", false),
-        |end| resource_pack_http_action(&request[..end], canonical_target),
-    );
+    let (status, reason, send_body) = line_end.map_or((400, "Bad Request", false), |end| {
+        resource_pack_http_action(&request[..end], canonical_target)
+    });
     let content_length = if status == 200 { data.len() } else { 0 };
-    let allow = if status == 405 { "Allow: GET, HEAD\r\n" } else { "" };
+    let allow = if status == 405 {
+        "Allow: GET, HEAD\r\n"
+    } else {
+        ""
+    };
     let headers = format!(
         "HTTP/1.1 {status} {reason}\r\nContent-Type: application/zip\r\nContent-Length: {content_length}\r\n{allow}Connection: close\r\n\r\n"
     );
@@ -13883,6 +14647,11 @@ fn block_light_sections_from_dim(
     sources: &[((i32, i32, i32), u8)],
     opacity: impl Fn(i32, i32, i32) -> u8,
 ) -> Vec<[u8; 2048]> {
+    type BlockLightQueue = std::collections::VecDeque<((i32, i32, i32), u8)>;
+    thread_local! {
+        static BLOCK_LIGHT_SCRATCH: std::cell::RefCell<(Vec<u8>, Vec<u8>, BlockLightQueue)> =
+            std::cell::RefCell::new((Vec::new(), Vec::new(), BlockLightQueue::new()));
+    }
     let light_sections = dim.light_sections();
     let light_min_y = dim.light_min_y();
     let live: Vec<((i32, i32, i32), u8)> = sources
@@ -13920,16 +14689,20 @@ fn block_light_sections_from_dim(
         (z1 - z0 + 1) as usize,
         (y1 - y0 + 1) as usize,
     );
-    let mut light = vec![0u8; w * d * h];
+    let mut scratch = BLOCK_LIGHT_SCRATCH.with(|cell| std::mem::take(&mut *cell.borrow_mut()));
+    let (light, op, queue) = (&mut scratch.0, &mut scratch.1, &mut scratch.2);
+    let volume = w * d * h;
+    light.resize(volume, 0);
+    light.fill(0);
     // Opacity, read once per cell rather than once per neighbour. A visited cell is asked about
     // by each of its six neighbours, so the spread was reading the world six times for values it
     // had already seen. 0xff means "not looked up yet"; opacity is 0..15.
-    let mut op = vec![0xffu8; w * d * h];
+    op.resize(volume, 0xff);
+    op.fill(0xff);
     let idx = |x: i32, y: i32, z: i32| {
         ((y - y0) as usize * d + (z - z0) as usize) * w + (x - x0) as usize
     };
-    let mut queue: std::collections::VecDeque<((i32, i32, i32), u8)> =
-        std::collections::VecDeque::new();
+    queue.clear();
     for (p, l) in &live {
         let i = idx(p.0, p.1, p.2);
         if light[i] < *l {
@@ -13986,6 +14759,7 @@ fn block_light_sections_from_dim(
             light[idx(wx, wy, wz)]
         }));
     }
+    BLOCK_LIGHT_SCRATCH.with(|cell| *cell.borrow_mut() = scratch);
     out
 }
 
@@ -14010,7 +14784,12 @@ fn block_light_sections_dim(dim: DimId, cx: i32, cz: i32, gen: &GenSources) -> V
     // Nether chunk at the same coordinate. Generated Nether lava oceans are in `gen` instead.
     // It is still taken first and released before the world lock, so the lock order holds.
     let lava: Vec<(i32, i32, i32)> = if dim == DimId::Overworld {
-        lavas().lock().unwrap_or_else(|e| e.into_inner()).iter().copied().collect()
+        lavas()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .iter()
+            .copied()
+            .collect()
     } else {
         Vec::new()
     };
@@ -14304,10 +15083,7 @@ fn sky_spill(
     // Fourteen steps of reach in both directions, clipped to the world — plus the seeds
     // themselves, which a floor outside the world's range can put a block past that clip.
     let y0 = (smin.saturating_sub(14).max(dim.min_y())).min(smin);
-    let y1 = (smax
-        .saturating_add(14)
-        .min(dim.min_y() + dim.height() - 1))
-    .max(smax);
+    let y1 = (smax.saturating_add(14).min(dim.min_y() + dim.height() - 1)).max(smax);
     let h = (y1 - y0 + 1) as usize;
     let dark = |x: i32, y: i32, z: i32| -> bool { y <= floor_of(x, z) };
     let mut grid = SkySpill {
@@ -14524,10 +15300,7 @@ impl BandStore {
     #[cfg_attr(not(megu_vanilla_data), allow(dead_code))]
     fn clear(&self) {
         self.map.clear();
-        self.order
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .clear();
+        self.order.lock().unwrap_or_else(|e| e.into_inner()).clear();
     }
 }
 
@@ -14575,10 +15348,7 @@ impl SectionStore {
     #[cfg_attr(not(megu_vanilla_data), allow(dead_code))]
     fn clear(&self) {
         self.map.clear();
-        self.order
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .clear();
+        self.order.lock().unwrap_or_else(|e| e.into_inner()).clear();
     }
 
     /// Remove a column from the map and its slot in the eviction order.
@@ -14682,7 +15452,12 @@ fn publish_section(dim: DimId, cx: i32, cz: i32, sy: i32, sec: std::sync::Arc<Pa
 /// neighbours reads the same sections, so consuming one must not empty the store. The LRU
 /// bound is what keeps the memory in check. Returns the stored `Arc` itself, so the caller
 /// can publish and encode the same section without a 16 KB copy.
-fn take_published(dim: DimId, cx: i32, cz: i32, sy: i32) -> Option<std::sync::Arc<PalettedSection>> {
+fn take_published(
+    dim: DimId,
+    cx: i32,
+    cz: i32,
+    sy: i32,
+) -> Option<std::sync::Arc<PalettedSection>> {
     let idx = section_index_dim(dim, sy)?;
     let store = section_store();
     if !store_is_current(store) {
@@ -14714,7 +15489,12 @@ fn has_section(dim: DimId, cx: i32, cz: i32, sy: i32) -> bool {
 }
 
 /// The published section as a shared handle, for a scan that reads many of its cells.
-fn stored_section(dim: DimId, cx: i32, cz: i32, sy: i32) -> Option<std::sync::Arc<PalettedSection>> {
+fn stored_section(
+    dim: DimId,
+    cx: i32,
+    cz: i32,
+    sy: i32,
+) -> Option<std::sync::Arc<PalettedSection>> {
     let idx = section_index_dim(dim, sy)?;
     let store = section_store();
     if !store_is_current(store) {
@@ -14743,9 +15523,9 @@ fn stored_state(dim: DimId, x: i32, y: i32, z: i32) -> Option<u32> {
     let sections = store.map.read(&key);
     let sections = sections.get(&key)?;
     Some(
-        sections[idx].as_ref()?.get(
-            (((y & 15) as usize) << 8) | (((z & 15) as usize) << 4) | ((x & 15) as usize),
-        ),
+        sections[idx]
+            .as_ref()?
+            .get((((y & 15) as usize) << 8) | (((z & 15) as usize) << 4) | ((x & 15) as usize)),
     )
 }
 
@@ -14837,12 +15617,19 @@ fn band_range(dim: DimId, cx: i32, cz: i32) -> Option<(i32, i32)> {
 /// from worldgen later — measured at 13.6-15.7 ms per new band (~700 ns/cell) against
 /// the ~200 ns/cell the delivery pass pays, i.e. the same work done twice. Installing
 /// the rows here makes the band nearly free for a chunk that was just streamed.
-fn install_band_rows(dim: DimId, cx: i32, cz: i32, sy: i32, sec: &PalettedSection) {
+fn install_band_rows_with_bounds(
+    dim: DimId,
+    cx: i32,
+    cz: i32,
+    sy: i32,
+    sec: &PalettedSection,
+    bounds: Option<(i32, i32)>,
+) {
     if breg().is_none() {
         return;
     }
     let __tr = chunkprof::enabled().then(std::time::Instant::now);
-    let Some((y0, y1)) = band_range(dim, cx, cz) else {
+    let Some((y0, y1)) = bounds else {
         return;
     };
     if let Some(t) = __tr {
@@ -14893,6 +15680,10 @@ fn install_band_rows(dim: DimId, cx: i32, cz: i32, sy: i32, sec: &PalettedSectio
         chunkprof::add(&chunkprof::BAND_SEC_NS, t);
         chunkprof::BAND_CELLS.fetch_add((count * 256) as u64, Ordering::Relaxed);
     }
+}
+
+fn install_band_rows(dim: DimId, cx: i32, cz: i32, sy: i32, sec: &PalettedSection) {
+    install_band_rows_with_bounds(dim, cx, cz, sy, sec, band_range(dim, cx, cz));
 }
 
 /// Apply a chunk's overlay edits to its band: the overlay wins over generated state,
@@ -15000,13 +15791,15 @@ fn opacity_windowed_dim(dim: DimId, x: i32, y: i32, z: i32) -> u8 {
             SectionLightClass::Empty => 0,
             SectionLightClass::Opaque => 15,
             SectionLightClass::Mixed => {
-                let idx = (((y & 15) as usize) << 8) | (((z & 15) as usize) << 4) | ((x & 15) as usize);
+                let idx =
+                    (((y & 15) as usize) << 8) | (((z & 15) as usize) << 4) | ((x & 15) as usize);
                 reg.opacity_of(sec.get(idx))
             }
         },
-        Some(CellSource::Band(b)) => b
-            .get(y, (x & 15) as usize, (z & 15) as usize)
-            .map_or_else(|| reg.opacity_of(block_at_dim(dim, x, y, z)), |st| reg.opacity_of(st)),
+        Some(CellSource::Band(b)) => b.get(y, (x & 15) as usize, (z & 15) as usize).map_or_else(
+            || reg.opacity_of(block_at_dim(dim, x, y, z)),
+            |st| reg.opacity_of(st),
+        ),
         None => reg.opacity_of(block_at_dim(dim, x, y, z)),
     }
 }
@@ -15174,7 +15967,13 @@ struct BiomeColumnCache {
 
 static BIOME_COLUMN_CACHE: OnceLock<Mutex<BiomeColumnCache>> = OnceLock::new();
 
-fn cached_chunk_biomes(dim: DimId, cx: i32, cz: i32, sections: usize, min_y: i32) -> std::sync::Arc<Vec<[i64; 64]>> {
+fn cached_chunk_biomes(
+    dim: DimId,
+    cx: i32,
+    cz: i32,
+    sections: usize,
+    min_y: i32,
+) -> std::sync::Arc<Vec<[i64; 64]>> {
     let seq = current_gen_seq();
     let cache = BIOME_COLUMN_CACHE.get_or_init(|| Mutex::new(BiomeColumnCache::default()));
     {
@@ -15201,7 +16000,10 @@ fn cached_chunk_biomes(dim: DimId, cx: i32, cz: i32, sections: usize, min_y: i32
     let arc = std::sync::Arc::new(cols);
     let mut guard = cache.lock().unwrap_or_else(|e| e.into_inner());
     if guard.generation == seq
-        && guard.map.insert((dim, cx, cz), std::sync::Arc::clone(&arc)).is_none()
+        && guard
+            .map
+            .insert((dim, cx, cz), std::sync::Arc::clone(&arc))
+            .is_none()
     {
         guard.order.push_back((dim, cx, cz));
         while guard.order.len() > MAP_CHUNK_CACHE_CAP {
@@ -15298,9 +16100,7 @@ impl SkyFloorCells {
                     SectionLightClass::Empty => 0,
                     SectionLightClass::Opaque => 15,
                     SectionLightClass::Mixed => self.reg.opacity_of(sec.get(
-                        (((y & 15) as usize) << 8)
-                            | (((z & 15) as usize) << 4)
-                            | (x & 15) as usize,
+                        (((y & 15) as usize) << 8) | (((z & 15) as usize) << 4) | (x & 15) as usize,
                     )),
                 };
                 #[cfg(test)]
@@ -15331,7 +16131,11 @@ fn sky_floors_dim(
 ) -> [i32; 256] {
     let __t = chunkprof::enabled().then(std::time::Instant::now);
     let epoch = chunk_opacity_version_dim(dim, cx, cz);
-    if let Some(floors) = sky_floors_cache().lock().unwrap_or_else(|e| e.into_inner()).get((dim, cx, cz), epoch) {
+    if let Some(floors) = sky_floors_cache()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .get((dim, cx, cz), epoch)
+    {
         if let Some(t) = __t {
             chunkprof::add(&chunkprof::FLOORS, t);
         }
@@ -15367,10 +16171,9 @@ fn sky_floors_dim(
         for lz in 0..16usize {
             for lx in 0..16usize {
                 let i = (lz << 4) | lx;
-                let base = cols
-                    .as_ref()
-                    .map(|c| c.wtop(lx, lz))
-                    .unwrap_or_else(|| height_at_dim(dim, cx * 16 + lx as i32, cz * 16 + lz as i32));
+                let base = cols.as_ref().map(|c| c.wtop(lx, lz)).unwrap_or_else(|| {
+                    height_at_dim(dim, cx * 16 + lx as i32, cz * 16 + lz as i32)
+                });
                 starts[i] = base.max(feature[i]) + 1;
             }
         }
@@ -15411,23 +16214,21 @@ fn sky_floors_dim(
     // stragglers (below the grid, past the band) to the per-cell chain, which
     // is cheaper than taking the lock every scan.
     let under_one_lock = match (cells.as_ref(), breg()) {
-        (Some(cells), Some(reg)) if cells.sections.is_none() => {
-            worldgen::with_gen_dim(dim, |g| {
-                #[cfg(test)]
-                SKY_FLOORS_GEN_SCANS.fetch_add(1, Ordering::Relaxed);
-                scan(
-                    &mut |x, y, z| {
-                        cells.opacity_at(x, y, z).unwrap_or_else(|| {
-                            #[cfg(test)]
-                            SKY_FLOORS_GEN_CELLS.fetch_add(1, Ordering::Relaxed);
-                            reg.opacity_of(dim_gen_state(dim, g, x, y, z))
-                        })
-                    },
-                    &mut floors,
-                );
-            })
-            .is_some()
-        }
+        (Some(cells), Some(reg)) if cells.sections.is_none() => worldgen::with_gen_dim(dim, |g| {
+            #[cfg(test)]
+            SKY_FLOORS_GEN_SCANS.fetch_add(1, Ordering::Relaxed);
+            scan(
+                &mut |x, y, z| {
+                    cells.opacity_at(x, y, z).unwrap_or_else(|| {
+                        #[cfg(test)]
+                        SKY_FLOORS_GEN_CELLS.fetch_add(1, Ordering::Relaxed);
+                        reg.opacity_of(dim_gen_state(dim, g, x, y, z))
+                    })
+                },
+                &mut floors,
+            );
+        })
+        .is_some(),
         _ => false,
     };
     if !under_one_lock {
@@ -15623,13 +16424,7 @@ fn chunk_prefetch_enabled() -> bool {
 }
 
 #[cfg(test)]
-fn chunk_data_opt(
-    cx: i32,
-    cz: i32,
-    dim: DimId,
-    gen: &mut GenSources,
-    prefetch: bool,
-) -> Vec<u8> {
+fn chunk_data_opt(cx: i32, cz: i32, dim: DimId, gen: &mut GenSources, prefetch: bool) -> Vec<u8> {
     chunk_data_lane(cx, cz, dim, gen, prefetch, false)
 }
 
@@ -15744,6 +16539,9 @@ fn chunk_data_lane(
     let mut prev_base: Option<std::sync::Arc<PalettedSection>> = None;
     let __tb_all = chunkprof::enabled().then(std::time::Instant::now);
     let cached_biomes = cached_chunk_biomes(dim, cx, cz, sections as usize, min_y);
+    // One column scan per chunk. The surface band is invariant across all
+    // sections encoded below, so do not repeat it for every section.
+    let band_bounds = band_range(dim, cx, cz);
     if let Some(t) = __tb_all {
         chunkprof::add(&chunkprof::BIOMES, t);
     }
@@ -15860,7 +16658,7 @@ fn chunk_data_lane(
             // re-evaluate them through `block_state_at` later.
             if let Some(sec) = &base {
                 let __ti = chunkprof::enabled().then(std::time::Instant::now);
-                install_band_rows(dim, cx, cz, sy, sec);
+                install_band_rows_with_bounds(dim, cx, cz, sy, sec, band_bounds);
                 if let Some(t) = __ti {
                     chunkprof::add(&chunkprof::BAND_INSTALL, t);
                 }
@@ -15871,7 +16669,9 @@ fn chunk_data_lane(
             // scan, no hidden loop, no second palette build. An overlay or a `set()` patch
             // (which leaves stale palette entries behind) forces the legacy path below.
             let zero_repack = overlay_empty
-                && base.as_ref().is_some_and(|s| !s.has_hidden() && s.is_clean_wire());
+                && base
+                    .as_ref()
+                    .is_some_and(|s| !s.has_hidden() && s.is_clean_wire());
             let has_base = base.is_some();
             if zero_repack {
                 let sec = base.as_ref().expect("zero_repack requires a section");
@@ -15892,11 +16692,7 @@ fn chunk_data_lane(
                                 for lz in 0..16usize {
                                     for lx in 0..16usize {
                                         gen_sources_here.push((
-                                            (
-                                                cx * 16 + lx as i32,
-                                                sy + ly,
-                                                cz * 16 + lz as i32,
-                                            ),
+                                            (cx * 16 + lx as i32, sy + ly, cz * 16 + lz as i32),
                                             lum,
                                         ));
                                     }
@@ -15932,174 +16728,183 @@ fn chunk_data_lane(
                     sec.unpack_into(&mut arr);
                 }
                 {
-                // Neighbour reads (the anti-xray exposure test) go through a per-call
-                // lock instead of holding `world()` across all 4096 cells: the hold is
-                // what the tick thread queues behind, and `base_state` is called with no
-                // lock held at all.
-                // The anti-xray exposure test is the encode loop's cost: it reads six
-                // neighbours per hidden cell, and 6,795 of its 8,715 reads per chunk fell
-                // through to a full worldgen evaluation (`base_state`, ~5 µs each = 34 ms
-                // of the 45 ms). Almost all of those cells are ones this section's own
-                // `base` array already holds, so answer from it: same chunk and section ->
-                // the array (after the overlay, which wins), else the band (the surface
-                // window), else the overlay, else worldgen.
-                let mut read = |wx: i32, wy: i32, wz: i32| -> u32 {
-                    if chunkprof::enabled() {
-                        chunkprof::EXPOSURE_READS
-                            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                    }
-                    let __t = chunkprof::enabled().then(std::time::Instant::now);
-                    if (wx >> 4) == cx && (wz >> 4) == cz {
-                        if !overlay_empty {
-                            if let Some(&st) = overlay.get(&local_idx(wx, wy, wz)) {
-                                return st;
-                            }
+                    // Neighbour reads (the anti-xray exposure test) go through a per-call
+                    // lock instead of holding `world()` across all 4096 cells: the hold is
+                    // what the tick thread queues behind, and `base_state` is called with no
+                    // lock held at all.
+                    // The anti-xray exposure test is the encode loop's cost: it reads six
+                    // neighbours per hidden cell, and 6,795 of its 8,715 reads per chunk fell
+                    // through to a full worldgen evaluation (`base_state`, ~5 µs each = 34 ms
+                    // of the 45 ms). Almost all of those cells are ones this section's own
+                    // `base` array already holds, so answer from it: same chunk and section ->
+                    // the array (after the overlay, which wins), else the band (the surface
+                    // window), else the overlay, else worldgen.
+                    let mut read = |wx: i32, wy: i32, wz: i32| -> u32 {
+                        if chunkprof::enabled() {
+                            chunkprof::EXPOSURE_READS
+                                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                         }
-                        let lx = (wx & 15) as usize;
-                        let lz = (wz & 15) as usize;
-                        let section_of =
-                            |sec: &Option<std::sync::Arc<PalettedSection>>, dy: i32| -> Option<u32> {
+                        let __t = chunkprof::enabled().then(std::time::Instant::now);
+                        if (wx >> 4) == cx && (wz >> 4) == cz {
+                            if !overlay_empty {
+                                if let Some(&st) = overlay.get(&local_idx(wx, wy, wz)) {
+                                    return st;
+                                }
+                            }
+                            let lx = (wx & 15) as usize;
+                            let lz = (wz & 15) as usize;
+                            let section_of = |sec: &Option<std::sync::Arc<PalettedSection>>,
+                                              dy: i32|
+                             -> Option<u32> {
                                 let sec = sec.as_ref()?;
                                 let idx = ((dy as usize) << 8) | (lz << 4) | lx;
                                 Some(sec.get(idx))
                             };
-                        if wy >= sy && wy < sy + 16 {
-                            if let Some(v) = section_of(&base, wy - sy) {
-                                if let Some(t) = __t {
-                                    chunkprof::add(&chunkprof::READ_NS, t);
+                            if wy >= sy && wy < sy + 16 {
+                                if let Some(v) = section_of(&base, wy - sy) {
+                                    if let Some(t) = __t {
+                                        chunkprof::add(&chunkprof::READ_NS, t);
+                                    }
+                                    return v;
                                 }
-                                return v;
-                            }
-                        } else if wy == sy - 1 {
-                            if let Some(v) = section_of(&prev_base, 15) {
-                                if let Some(t) = __t {
-                                    chunkprof::add(&chunkprof::READ_NS, t);
+                            } else if wy == sy - 1 {
+                                if let Some(v) = section_of(&prev_base, 15) {
+                                    if let Some(t) = __t {
+                                        chunkprof::add(&chunkprof::READ_NS, t);
+                                    }
+                                    return v;
                                 }
-                                return v;
-                            }
-                        } else if wy == sy + 16 {
-                            if let Some(v) = section_of(&next_base, 0) {
-                                if let Some(t) = __t {
-                                    chunkprof::add(&chunkprof::READ_NS, t);
+                            } else if wy == sy + 16 {
+                                if let Some(v) = section_of(&next_base, 0) {
+                                    if let Some(t) = __t {
+                                        chunkprof::add(&chunkprof::READ_NS, t);
+                                    }
+                                    return v;
                                 }
-                                return v;
                             }
                         }
-                    }
-                    let __tb = chunkprof::enabled().then(std::time::Instant::now);
-                    if __tb.is_some() {
-                        chunkprof::READ_BAND_N.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                    }
-                    if let Some(st) = stored_state(dim, wx, wy, wz) {
+                        let __tb = chunkprof::enabled().then(std::time::Instant::now);
+                        if __tb.is_some() {
+                            chunkprof::READ_BAND_N
+                                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        }
+                        if let Some(st) = stored_state(dim, wx, wy, wz) {
+                            if let Some(t) = __t {
+                                chunkprof::add(&chunkprof::READ_NS, t);
+                            }
+                            return st;
+                        }
+                        let band = band_state_dim(dim, wx, wy, wz);
+                        if let Some(t) = __tb {
+                            chunkprof::add(&chunkprof::BAND_LOOKUP_NS, t);
+                        }
+                        let overlay_hit = if band.is_none() {
+                            let __to = chunkprof::enabled().then(std::time::Instant::now);
+                            let v = overlay_block_dim(dim, wx, wy, wz);
+                            if let Some(t) = __to {
+                                chunkprof::add(&chunkprof::OVERLAY_READ_NS, t);
+                            }
+                            v
+                        } else {
+                            None
+                        };
+                        let out = match band.or(overlay_hit) {
+                            Some(st) => st,
+                            None => {
+                                if chunkprof::enabled() {
+                                    chunkprof::EXPOSURE_READ_BASE
+                                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                                }
+                                if chunkprof::enabled() {
+                                    chunkprof::EXPOSURE_READS
+                                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                                }
+                                let __tbs = chunkprof::enabled().then(std::time::Instant::now);
+                                if __tbs.is_some() {
+                                    chunkprof::BASE_STATE_N
+                                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                                }
+                                let st = base_state_dim(dim, wx, wy, wz);
+                                if let Some(t) = __tbs {
+                                    chunkprof::add(&chunkprof::BASE_STATE_NS, t);
+                                }
+                                st
+                            }
+                        };
+                        if let Some(t) = __tb {
+                            chunkprof::add(&chunkprof::READ_BAND_NS, t);
+                        }
                         if let Some(t) = __t {
                             chunkprof::add(&chunkprof::READ_NS, t);
                         }
-                        return st;
-                    }
-                    let band = band_state_dim(dim, wx, wy, wz);
-                    if let Some(t) = __tb {
-                        chunkprof::add(&chunkprof::BAND_LOOKUP_NS, t);
-                    }
-                    let overlay_hit = if band.is_none() {
-                        let __to = chunkprof::enabled().then(std::time::Instant::now);
-                        let v = overlay_block_dim(dim, wx, wy, wz);
-                        if let Some(t) = __to {
-                            chunkprof::add(&chunkprof::OVERLAY_READ_NS, t);
-                        }
-                        v
-                    } else {
-                        None
+                        out
                     };
-                    let out = match band.or(overlay_hit) {
-                        Some(st) => st,
-                        None => {
-                            if chunkprof::enabled() {
-                                chunkprof::EXPOSURE_READ_BASE
-                                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                            }
-                            if chunkprof::enabled() {
-                                chunkprof::EXPOSURE_READS
-                                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                            }
-                            let __tbs = chunkprof::enabled().then(std::time::Instant::now);
-                            if __tbs.is_some() {
-                                chunkprof::BASE_STATE_N
-                                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                            }
-                            let st = base_state_dim(dim, wx, wy, wz);
-                            if let Some(t) = __tbs {
-                                chunkprof::add(&chunkprof::BASE_STATE_NS, t);
-                            }
-                            st
-                        }
-                    };
-                    if let Some(t) = __tb {
-                        chunkprof::add(&chunkprof::READ_BAND_NS, t);
-                    }
-                    if let Some(t) = __t {
-                        chunkprof::add(&chunkprof::READ_NS, t);
-                    }
-                    out
-                };
-                let hidden = HiddenSet::new();
-                for ly in 0..16 {
-                    for lz in 0..16 {
-                        for lx in 0..16 {
-                            let wx = cx * 16 + lx as i32;
-                            let wz = cz * 16 + lz as i32;
-                            let wy = sy + ly as i32;
-                            // Every cell of this loop is in this chunk, so the chunk's
-                            // own copy of its edits answers it.
-                            let ov = if overlay_empty {
-                                None
-                            } else {
-                                overlay.get(&local_idx(wx, wy, wz)).copied()
-                            };
-                            let gen = if has_base {
-                                arr[(ly << 8) | (lz << 4) | lx]
-                            } else {
-                                base_state_dim(dim, wx, wy, wz)
-                            };
-                            let st = ov.unwrap_or(gen);
-                            // Record the generated emitter even when an overlay edit covers it:
-                            // removing that edit re-exposes it, and the live-overlay filter in
-                            // `block_light_sections` suppresses it while the edit remains.
-                            if let Some(reg) = reg {
-                                let lum = reg.luminance_of(gen);
-                                if lum > 0 {
-                                    gen_sources_here.push(((wx, wy, wz), lum));
-                                }
-                            }
-                            // anti-xray + palette compression: buried hidden blocks sent as stone
-                            let mut hidden_cell = hidden.contains(st);
-                            if chunkprof::enabled() && hidden_cell {
-                                chunkprof::HIDDEN_N
-                                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                            }
-                            if hidden_cell {
-                                for (dx, dy, dz) in [
-                                    (1, 0, 0),
-                                    (-1, 0, 0),
-                                    (0, 1, 0),
-                                    (0, -1, 0),
-                                    (0, 0, 1),
-                                    (0, 0, -1),
-                                ] {
-                                    if exposes(read(wx + dx, wy + dy, wz + dz)) {
-                                        hidden_cell = false;
-                                        break;
+                    let hidden = HiddenSet::new();
+                    for ly in 0..16 {
+                        for lz in 0..16 {
+                            for lx in 0..16 {
+                                let wx = cx * 16 + lx as i32;
+                                let wz = cz * 16 + lz as i32;
+                                let wy = sy + ly as i32;
+                                // Every cell of this loop is in this chunk, so the chunk's
+                                // own copy of its edits answers it.
+                                let ov = if overlay_empty {
+                                    None
+                                } else {
+                                    overlay.get(&local_idx(wx, wy, wz)).copied()
+                                };
+                                let gen = if has_base {
+                                    arr[(ly << 8) | (lz << 4) | lx]
+                                } else {
+                                    base_state_dim(dim, wx, wy, wz)
+                                };
+                                let st = ov.unwrap_or(gen);
+                                // Record the generated emitter even when an overlay edit covers it:
+                                // removing that edit re-exposes it, and the live-overlay filter in
+                                // `block_light_sections` suppresses it while the edit remains.
+                                if let Some(reg) = reg {
+                                    let lum = reg.luminance_of(gen);
+                                    if lum > 0 {
+                                        gen_sources_here.push(((wx, wy, wz), lum));
                                     }
                                 }
+                                // anti-xray + palette compression: buried hidden blocks sent as stone
+                                let mut hidden_cell = hidden.contains(st);
+                                if chunkprof::enabled() && hidden_cell {
+                                    chunkprof::HIDDEN_N
+                                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                                }
+                                if hidden_cell {
+                                    for (dx, dy, dz) in [
+                                        (1, 0, 0),
+                                        (-1, 0, 0),
+                                        (0, 1, 0),
+                                        (0, -1, 0),
+                                        (0, 0, 1),
+                                        (0, 0, -1),
+                                    ] {
+                                        if exposes(read(wx + dx, wy + dy, wz + dz)) {
+                                            hidden_cell = false;
+                                            break;
+                                        }
+                                    }
+                                }
+                                let vis = if hidden_cell {
+                                    hidden_filler_with(
+                                        &mut read,
+                                        dim,
+                                        wx,
+                                        wy,
+                                        wz,
+                                        hs[(lz << 4) | lx],
+                                    )
+                                } else {
+                                    st
+                                };
+                                arr[(ly << 8) | (lz << 4) | lx] = vis;
                             }
-                            let vis = if hidden_cell {
-                                hidden_filler_with(&mut read, dim, wx, wy, wz, hs[(lz << 4) | lx])
-                            } else {
-                                st
-                            };
-                            arr[(ly << 8) | (lz << 4) | lx] = vis;
                         }
                     }
-                }
                 }
             }
             if let Some(t) = __te {
@@ -16262,7 +17067,10 @@ fn chunk_versions_3x3(dim: DimId, cx: i32, cz: i32) -> [u64; 9] {
             out[i] = if dx == 0 && dz == 0 {
                 center_ver
             } else {
-                light_guard.get(&(dim, cx + dx, cz + dz)).copied().unwrap_or(0)
+                light_guard
+                    .get(&(dim, cx + dx, cz + dz))
+                    .copied()
+                    .unwrap_or(0)
             };
             i += 1;
         }
@@ -16313,7 +17121,13 @@ fn map_chunk_sig(dim: DimId, cx: i32, cz: i32, gen: &GenSources) -> u64 {
     let mut h = OFFSET;
     let settled = settled_live_light(dim, cx, cz);
     let light_revision = settled.as_ref().map_or(0, |light| light.revision);
-    for v in [sign_acc, sign_count, spawner_acc, spawner_count, light_revision] {
+    for v in [
+        sign_acc,
+        sign_count,
+        spawner_acc,
+        spawner_count,
+        light_revision,
+    ] {
         h = (h ^ v).wrapping_mul(PRIME);
     }
     // `gen` emitters only reach the emitted bytes while live light is unsettled:
@@ -16346,15 +17160,37 @@ fn map_chunk_sig(dim: DimId, cx: i32, cz: i32, gen: &GenSources) -> u64 {
 #[cfg(test)]
 #[cfg_attr(not(megu_vanilla_data), allow(dead_code))]
 fn clear_chunk_caches_for_tests() {
-    map_chunk_cache().lock().unwrap_or_else(|e| e.into_inner()).map.clear();
-    map_chunk_cache().lock().unwrap_or_else(|e| e.into_inner()).order.clear();
+    map_chunk_cache()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .map
+        .clear();
+    map_chunk_cache()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .order
+        .clear();
     op_bands().clear();
     section_store().clear();
-    sky_floors_cache().lock().unwrap_or_else(|e| e.into_inner()).map.clear();
-    sky_floors_cache().lock().unwrap_or_else(|e| e.into_inner()).order.clear();
+    sky_floors_cache()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .map
+        .clear();
+    sky_floors_cache()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .order
+        .clear();
     *live_light_cache().lock().unwrap_or_else(|e| e.into_inner()) = LiveLightCache::default();
-    live_light_engines().lock().unwrap_or_else(|e| e.into_inner()).clear();
-    pending_light_edits().lock().unwrap_or_else(|e| e.into_inner()).clear();
+    live_light_engines()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .clear();
+    pending_light_edits()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .clear();
 }
 
 #[cfg(test)]
@@ -16363,13 +17199,7 @@ fn map_chunk(cx: i32, cz: i32, dim: DimId, gen: &mut GenSources) -> Vec<u8> {
     map_chunk_lane(cx, cz, dim, gen, false)
 }
 
-fn map_chunk_lane(
-    cx: i32,
-    cz: i32,
-    dim: DimId,
-    gen: &mut GenSources,
-    occluded: bool,
-) -> Vec<u8> {
+fn map_chunk_lane(cx: i32, cz: i32, dim: DimId, gen: &mut GenSources, occluded: bool) -> Vec<u8> {
     // M3 P5: the 0x27 payload is shared by every player that loads the same chunk at
     // matching 3x3 versions and entity/neighbor-light signatures; a hit also restores
     // `(cx, cz)`'s generated emitters into `gen` so downstream light updates stay exact.
@@ -16441,7 +17271,9 @@ fn build_map_chunk_lane(
     // The occluded lane's ceiling: decided by the same `hmin` `chunk_data_lane`
     // computes, so block entities and light are stripped over exactly the
     // sections the terrain encode masks.
-    let occlude_ceil_y = occluded.then(|| underground_occlude_ceil(dim, cx, cz)).flatten();
+    let occlude_ceil_y = occluded
+        .then(|| underground_occlude_ceil(dim, cx, cz))
+        .flatten();
     let mut p = Vec::new();
     p.extend_from_slice(&cx.to_be_bytes());
     p.extend_from_slice(&cz.to_be_bytes());
@@ -16717,8 +17549,7 @@ impl SealedCavities {
         .into_iter()
         .all(|(dx, dy, dz)| {
             let n = (p.0 + dx, p.1 + dy, p.2 + dz);
-            !self.inside(n)
-                && !self.passes(block_at_dim(self.dim, n.0, n.1, n.2))
+            !self.inside(n) && !self.passes(block_at_dim(self.dim, n.0, n.1, n.2))
                 || self.inside(n)
                     && (!self.passes(block_at_dim(self.dim, n.0, n.1, n.2))
                         || self.region_sealed(n))
@@ -16891,10 +17722,7 @@ fn write_light_arrays_lane(
         write_light_bitset(p, m);
     }
     for (sections, mask) in [(&sky, &sky_mask), (&block, &block_mask)] {
-        write_varint(
-            p,
-            mask.iter().map(|w| w.count_ones() as i64).sum::<i64>(),
-        );
+        write_varint(p, mask.iter().map(|w| w.count_ones() as i64).sum::<i64>());
         for (i, sec) in sections.iter().enumerate() {
             if mask[i / 64] & (1 << (i % 64)) != 0 {
                 write_varint(p, 2048);
@@ -16959,13 +17787,7 @@ fn encode_light_update<'a>(
 ) -> Vec<u8> {
     encode_light_update_multi(
         (cx, cz),
-        masks.map(|m| {
-            if m == 0 {
-                Vec::new()
-            } else {
-                vec![m]
-            }
-        }),
+        masks.map(|m| if m == 0 { Vec::new() } else { vec![m] }),
         sky,
         block,
     )
@@ -17214,7 +18036,11 @@ fn live_light_engines() -> &'static Mutex<HashMap<DimId, LiveLightEngine>> {
 /// `block_updates` flush just as long. The worker serializes passes itself,
 /// so this stage call is a single nonblocking send.
 fn apply_queued_light_updates() {
-    if pending_light_edits().lock().unwrap_or_else(|e| e.into_inner()).is_empty() {
+    if pending_light_edits()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .is_empty()
+    {
         return;
     }
     let _ = light_worker().send(());
@@ -17259,15 +18085,24 @@ struct LightPassPlan {
 }
 
 fn light_pass_once() {
-    let mut pending = std::mem::take(&mut *pending_light_edits().lock().unwrap_or_else(|e| e.into_inner()));
+    let mut pending = std::mem::take(
+        &mut *pending_light_edits()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner()),
+    );
     let audience = client_snapshot();
     let mut held: HashMap<DimId, HashSet<Chunk>> = HashMap::new();
     for client in &audience {
         // Do not hold the dimension lock while waiting on a chunk stream.
         let dim = *client.dim.lock().unwrap_or_else(|e| e.into_inner());
-        held.entry(dim)
-            .or_default()
-            .extend(client.chunks.lock().unwrap_or_else(|e| e.into_inner()).iter().copied());
+        held.entry(dim).or_default().extend(
+            client
+                .chunks
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .iter()
+                .copied(),
+        );
     }
     let Some(reg) = breg() else { return };
     let generation = current_gen_seq();
@@ -17284,7 +18119,9 @@ fn light_pass_once() {
     for attempt in 0.. {
         plans.clear();
         {
-            let engines = live_light_engines().lock().unwrap_or_else(|e| e.into_inner());
+            let engines = live_light_engines()
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
             for (&dim, edits) in &pending {
                 let (old, new): (HashMap<_, _>, Vec<_>) = edits
                     .iter()
@@ -17372,8 +18209,7 @@ fn light_pass_once() {
                 {
                     continue;
                 }
-                let blocks =
-                    pre_edit_light_chunk(plan.dim, chunk, reg, &mut props, &plan.old);
+                let blocks = pre_edit_light_chunk(plan.dim, chunk, reg, &mut props, &plan.old);
                 terrain.insert((plan.dim, cx, cz), (version, blocks));
             }
         }
@@ -17434,8 +18270,7 @@ fn light_pass_once() {
                         .iter()
                         .copied()
                         .filter(|chunk| {
-                            light_halo([*chunk])
-                                .all(|neighbor| plan.neighbors.contains(&neighbor))
+                            light_halo([*chunk]).all(|neighbor| plan.neighbors.contains(&neighbor))
                         })
                         .map(|(cx, cz)| ((cx, cz), chunk_versions_3x3(plan.dim, cx, cz)))
                         .collect()
@@ -17444,13 +18279,19 @@ fn light_pass_once() {
             break;
         }
         // Fold in edits queued while reading so the retry plans for them too.
-        let more = std::mem::take(&mut *pending_light_edits().lock().unwrap_or_else(|e| e.into_inner()));
+        let more = std::mem::take(
+            &mut *pending_light_edits()
+                .lock()
+                .unwrap_or_else(|e| e.into_inner()),
+        );
         for (dim, edits) in more {
             pending.entry(dim).or_default().extend(edits);
         }
     }
 
-    let mut engines = live_light_engines().lock().unwrap_or_else(|e| e.into_inner());
+    let mut engines = live_light_engines()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
     for (plan, snapshots) in plans.into_iter().zip(snapshots) {
         let LightPassPlan {
             dim,
@@ -17585,7 +18426,11 @@ fn light_pass_once() {
         let reveals = if held_targets.is_empty() {
             Vec::new()
         } else {
-            light_reveals().lock().unwrap_or_else(|e| e.into_inner()).remove(&dim).unwrap_or_default()
+            light_reveals()
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .remove(&dim)
+                .unwrap_or_default()
         };
         if !reveals.is_empty() {
             for &chunk @ (cx, cz) in &held_targets {
@@ -17728,16 +18573,9 @@ fn prefetch_terrain_group_dim(
     let jobs = workers.max(1);
     let resolver = worldgen::with_gen_dim(dim, |g| g.beard_resolver()).flatten();
     let cols = worldgen::prefetch_cols_with(&data, resolver, news, jobs, round);
-    let chunks =
-        worldgen::prefetch_terrain(&data, resolver, news, &cols, lo, hi, jobs, round);
+    let chunks = worldgen::prefetch_terrain(&data, resolver, news, &cols, lo, hi, jobs, round);
     let _ = worldgen::with_gen_dim(dim, |g| g.install_prefetched(chunks));
 }
-
-
-
-
-
-
 
 // ---------- RCON (parity-fixture control plane) ----------
 static RCON_AUTH: connection_limits::AuthThrottle = connection_limits::AuthThrottle::new();
@@ -17813,7 +18651,7 @@ fn rcon_conn(mut s: TcpStream, pass: String) {
                             x: 0.5,
                             y: 16.0,
                             z: 0.5,
-                                        },
+                        },
                         &format!("/{}", cmd.trim_start_matches('/')),
                         &mut None,
                     )
@@ -18153,7 +18991,9 @@ fn observe_live_tick(work: Duration) -> LoadBudget {
 /// The work budget currently in force: `LoadBudget::FULL` whenever the rolling
 /// mean tick is healthy, the smoother's tighter stage under real overload.
 fn current_load_budget() -> LoadBudget {
-    LOAD_BUDGETS[(LIVE_BUDGET_STAGE.load(Ordering::Relaxed).min(LOAD_STAGE_MAX)) as usize]
+    LOAD_BUDGETS[(LIVE_BUDGET_STAGE
+        .load(Ordering::Relaxed)
+        .min(LOAD_STAGE_MAX)) as usize]
 }
 
 #[cfg(test)]
@@ -18176,7 +19016,10 @@ fn operator_max_players() -> usize {
 /// process memory. Safe to call from console/RCON while the tick loop runs:
 /// the balancer and the region are each taken only inside their own lock.
 fn operator_health_snapshot() -> OperatorHealthSnapshot {
-    let mspt_ms = live_balancer().lock().unwrap_or_else(|e| e.into_inner()).mspt();
+    let mspt_ms = live_balancer()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .mspt();
     let players = client_snapshot();
     let loaded_chunks = region().lock().unwrap_or_else(|e| e.into_inner()).hot.len();
     OperatorHealthSnapshot {
@@ -18382,28 +19225,15 @@ fn rotate_save_backups(dir: &std::path::Path, snapshot: &WorldSaveSnapshot, forc
     }
 }
 
-/// Hand the captured snapshot to the save worker. The worker owns a single
-/// pending slot, so the protected overlay (the file a crash recovery reads)
-/// is the job it keeps; companion dimensions are small enough to write inline
-/// while a slow disk still absorbs the main file.
+/// Hand every overlay in the captured snapshot to the save worker as one
+/// coalesced batch, including companion dimensions and Create sidecar data.
 fn submit_world_snapshot(
     worker: &AsyncSaveWorker,
     snapshot: WorldSaveSnapshot,
     dir: &std::path::Path,
 ) -> Result<(), String> {
     rotate_save_backups(dir, &snapshot, false);
-    let path = dim_overlay_path(dir, DimId::Overworld);
-    worker.submit(path, wrap_world_payload(&snapshot.overworld).into());
-    let interval = connection_limits::backup_interval();
-    for (dim, payload) in snapshot.companions {
-        let path = dim_overlay_path(dir, dim);
-        match payload {
-            Some(payload) => {
-                write_world_file(&path, &wrap_world_payload(&payload), interval)?;
-            }
-            None => remove_world_save(&path)?,
-        }
-    }
+    worker.submit_all(dir, snapshot);
     Ok(())
 }
 
@@ -18520,7 +19350,13 @@ fn dwal_flush_pending() {
         }
         std::mem::take(&mut *pending)
             .into_iter()
-            .map(|((dim, x, y, z), state)| DeltaWalRecord::BlockSet { dim, x, y, z, state })
+            .map(|((dim, x, y, z), state)| DeltaWalRecord::BlockSet {
+                dim,
+                x,
+                y,
+                z,
+                state,
+            })
             .collect()
     };
     match wal.append_batch_and_flush(&records) {
@@ -18538,7 +19374,14 @@ fn dwal_flush_pending() {
                 .lock()
                 .unwrap_or_else(|e| e.into_inner());
             for record in records {
-                let DeltaWalRecord::BlockSet { dim, x, y, z, state } = record else {
+                let DeltaWalRecord::BlockSet {
+                    dim,
+                    x,
+                    y,
+                    z,
+                    state,
+                } = record
+                else {
                     continue;
                 };
                 pending.entry((dim, x, y, z)).or_insert(state);
@@ -18574,13 +19417,10 @@ fn dwal_note_block_set(dim: DimId, x: i32, y: i32, z: i32, state: u32) {
 /// A full save run as a WAL checkpoint. `compact_after_checkpoint` rewrites
 /// the log down to a single marker, so it may only run once the covering save
 /// is durable *and* the log cannot still gain frames the snapshot missed.
-/// Both properties come from one discipline: `SAVE_LOCK` is held from before
-/// the capture until the write has landed and the compaction is done, and the
-/// journal mutex is taken inside it — the same order every journaled block
-/// write uses (`SAVE_LOCK` then journal, via `set_block_if_dim` →
-/// `dwal_note_block_set`), so there is no lock inversion and no interleaving
-/// window. Writers simply wait out the save; a frame that lands afterwards is
-/// newer than the marker and survives.
+/// The snapshot and WAL sequence are captured under `SAVE_LOCK`, then disk
+/// serialization runs without it. Reacquiring the lock before compaction and
+/// compacting only through the captured sequence preserves newer frames while
+/// keeping fsync and region writes off the tick writers' critical section.
 ///
 /// This mirrors `save_world_guarded`'s `SAVE_WRITER`/flag discipline — the
 /// thread-local guard flag keeps a nested `with_save_guard` inside the
@@ -18594,9 +19434,8 @@ fn dwal_save_checkpointed(
     // The epoch is read before the write: an edit that lands while the
     // snapshot serializes still counts as unsaved, so the dirty-epoch gate
     // can only ever under-skip, never lose a change.
-    let epoch_at_start = WORLD_PERSIST_DIRTY_EPOCH.load(Ordering::Acquire);
     let _writer = SAVE_WRITER.lock().unwrap_or_else(|e| e.into_inner());
-    let _save = SAVE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let save = SAVE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     SAVE_GUARD.with(|g| g.set(true));
     struct Reset;
     impl std::ops::Drop for Reset {
@@ -18610,15 +19449,23 @@ fn dwal_save_checkpointed(
     // the snapshot is about to capture, and compacting before it lands would
     // leave a crash with neither the frame nor a save that covers it.
     dwal_flush_pending();
+    let epoch_at_start = WORLD_PERSIST_DIRTY_EPOCH.load(Ordering::Acquire);
     let snapshot = persistence_boundary("world snapshot panicked", || {
         Ok(WorldSaveSnapshot::capture())
     })
     .map_err(|e| e.to_string())?;
-    let mut journal = live_dwal().lock().unwrap_or_else(|e| e.into_inner());
+    drop(save);
     write(snapshot)?;
-    if let Some(wal) = journal.as_mut() {
-        let checkpoint_seq = wal.next_seq();
-        wal.compact_after_checkpoint(checkpoint_seq)?;
+    let _save = SAVE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let mut journal = live_dwal().lock().unwrap_or_else(|e| e.into_inner());
+    // If any persisted mutation landed while the snapshot was being written,
+    // its newer WAL frames must remain available for recovery. The next full
+    // checkpoint can compact them once they are included in its snapshot.
+    if WORLD_PERSIST_DIRTY_EPOCH.load(Ordering::Acquire) == epoch_at_start {
+        if let Some(wal) = journal.as_mut() {
+            let checkpoint_seq = wal.next_seq();
+            wal.compact_after_checkpoint(checkpoint_seq)?;
+        }
     }
     note_world_saved_through(epoch_at_start);
     Ok(())
@@ -18634,7 +19481,9 @@ fn dwal_autosave_checkpointed() {
     let result = match live_save_worker() {
         Some(worker) => dwal_save_checkpointed(|snapshot| {
             submit_world_snapshot(worker, snapshot, &dir)?;
-            worker.flush().map_err(|e| format!("async save flush: {e}"))
+            worker
+                .flush_all()
+                .map_err(|e| format!("async save flush: {e}"))
         }),
         None => dwal_save_checkpointed(|snapshot| snapshot.write(&dir)),
     };
@@ -18677,7 +19526,13 @@ fn dwal_boot_recover_and_arm() {
             let mut skipped = 0usize;
             for record in &report.records {
                 match *record {
-                    DeltaWalRecord::BlockSet { dim, x, y, z, state } => {
+                    DeltaWalRecord::BlockSet {
+                        dim,
+                        x,
+                        y,
+                        z,
+                        state,
+                    } => {
                         set_block_dim(dim, x, y, z, state);
                         replayed += 1;
                     }
@@ -18746,7 +19601,7 @@ fn autosave_world() {
     // this pass falls through and retries the save.
     let submitted = LAST_SUBMITTED_EPOCH.load(Ordering::Acquire);
     if dirty <= submitted {
-        match worker.flush() {
+        match worker.flush_all() {
             Ok(()) => note_world_saved_through(submitted),
             Err(error) => {
                 eprintln!("[spine] WORLD SAVE FAILED: {error}");
@@ -18759,8 +19614,7 @@ fn autosave_world() {
         }
     }
     let dir = world_save_dir();
-    if let Err(error) =
-        save_world_guarded(|snapshot| submit_world_snapshot(worker, snapshot, &dir))
+    if let Err(error) = save_world_guarded(|snapshot| submit_world_snapshot(worker, snapshot, &dir))
     {
         eprintln!("[spine] WORLD SAVE FAILED: {error}");
         return;
@@ -18773,7 +19627,7 @@ fn autosave_world() {
 /// No-op for tests and tool modes, which never queue one.
 fn flush_live_saves() {
     if let Some(worker) = live_save_worker() {
-        if let Err(error) = worker.flush() {
+        if let Err(error) = worker.flush_all() {
             eprintln!("[spine] WORLD SAVE FAILED: {error}");
         }
     }
@@ -18801,6 +19655,20 @@ fn shutdown_world_save() {
         Err(error) => eprintln!("[spine] WORLD SAVE FAILED: {error}"),
     }
     live_anvil_save_if_armed();
+}
+
+/// Run the final durable save on a helper thread and cap signal shutdown's
+/// wait. A slow filesystem is logged as an incomplete shutdown instead of
+/// holding the signal path (and connected clients) indefinitely.
+fn shutdown_world_save_bounded(deadline: Instant) -> bool {
+    let (done_tx, done_rx) = std::sync::mpsc::channel();
+    thread::spawn(move || {
+        shutdown_world_save();
+        let _ = done_tx.send(());
+    });
+    done_rx
+        .recv_timeout(deadline.saturating_duration_since(Instant::now()))
+        .is_ok()
 }
 
 /// Per-natural-spawn-pass fractional credit. `mob_spawn_scale` below 1.0 means
@@ -18842,7 +19710,11 @@ fn start_lan_announcer(port: u16) {
 }
 
 fn stop_lan_announcer() {
-    if let Some(announcer) = LAN_ANNOUNCER.lock().unwrap_or_else(|e| e.into_inner()).take() {
+    if let Some(announcer) = LAN_ANNOUNCER
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .take()
+    {
         announcer.stop();
     }
 }
@@ -18909,7 +19781,14 @@ fn start_gs4_query(bind: &str, game_port: u16) {
             .file_name()
             .map(|n| n.to_string_lossy().into_owned())
             .unwrap_or_else(|| "world".to_string());
-        gs4_vanilla_snapshot(motd, map, players, operator_max_players(), game_port, host_ip.clone())
+        gs4_vanilla_snapshot(
+            motd,
+            map,
+            players,
+            operator_max_players(),
+            game_port,
+            host_ip.clone(),
+        )
     });
     let stop = Arc::new(AtomicBool::new(false));
     match spawn_gs4_query_thread(&format!("{bind}:{port}"), snapshot_fn, stop.clone()) {
@@ -18961,8 +19840,7 @@ fn live_anvil_save_if_armed() {
 /// running — a fresh vanilla world can put (0, 0) under an ocean. The flat
 /// generator and wire tests keep their fixed spawn unless the flag says so.
 fn safe_spawn_search_enabled(fresh_world: bool) -> bool {
-    std::env::var("MEGU_SAFE_SPAWN").as_deref() == Ok("1")
-        || (fresh_world && worldgen::enabled())
+    std::env::var("MEGU_SAFE_SPAWN").as_deref() == Ok("1") || (fresh_world && worldgen::enabled())
 }
 
 /// Dry solid ground, two air cells of headroom, away from fluids and contact
@@ -19036,8 +19914,7 @@ fn world_block_entity_tick() {
             let players: Vec<Arc<Client>> = clients
                 .iter()
                 .filter(|c| {
-                    !c.is_spectator()
-                        && *c.dim.lock().unwrap_or_else(|e| e.into_inner()) == dim
+                    !c.is_spectator() && *c.dim.lock().unwrap_or_else(|e| e.into_inner()) == dim
                 })
                 .cloned()
                 .collect();
@@ -19096,8 +19973,7 @@ fn world_block_entity_tick() {
                         ..
                     } => {
                         if let Some(etype) = name_to_etype(&entity_id) {
-                            let mut ms =
-                                mobs().lock().unwrap_or_else(|e| e.into_inner());
+                            let mut ms = mobs().lock().unwrap_or_else(|e| e.into_inner());
                             if ms.len() < MOB_CAP {
                                 let mut uuid = [0u8; 16];
                                 assert!(os_fill_random(&mut uuid), "entity UUID entropy");
@@ -19109,15 +19985,15 @@ fn world_block_entity_tick() {
                                     uuid,
                                     etype,
                                     pos: Mutex::new((
-                                        location[0], location[1], location[2], 0.0, 0.0,
+                                        location[0],
+                                        location[1],
+                                        location[2],
+                                        0.0,
+                                        0.0,
                                     )),
                                     hp: Mutex::new(default_mob_hp(&entity_id)),
-                                    last_hit: Mutex::new(
-                                        Instant::now() - Duration::from_secs(10),
-                                    ),
-                                    hurt_at: Mutex::new(
-                                        Instant::now() - Duration::from_secs(10),
-                                    ),
+                                    last_hit: Mutex::new(Instant::now() - Duration::from_secs(10)),
+                                    hurt_at: Mutex::new(Instant::now() - Duration::from_secs(10)),
                                     last_hurt_tick: Mutex::new(None),
                                     vel: Mutex::new([0.0; 3]),
                                     fuse: Mutex::new(0),
@@ -19141,12 +20017,7 @@ fn world_block_entity_tick() {
                         let Some(id) = name_to_effect(&effect) else {
                             continue;
                         };
-                        w_be_grant_effect(
-                            client,
-                            id,
-                            i32::from(amplifier),
-                            duration_ticks,
-                        );
+                        w_be_grant_effect(client, id, i32::from(amplifier), duration_ticks);
                     }
                 }
             }
@@ -19303,7 +20174,11 @@ fn game_tick(mut step: impl FnMut(&'static str, fn())) {
     // `/tick freeze` skips world ticks unless `/tick step` or `/tick sprint`
     // queued budget; a sprint always runs. The default is unfrozen, so callers
     // (including tests) that never froze see no change.
-    if !tick_controller().lock().unwrap_or_else(|e| e.into_inner()).should_run_game_tick() {
+    if !tick_controller()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .should_run_game_tick()
+    {
         return;
     }
     // Wall-clock cost of the whole tick body, measured once with a monotonic
@@ -19357,6 +20232,7 @@ fn game_tick(mut step: impl FnMut(&'static str, fn())) {
     run("vehicles", w1_vehicle_tick);
     run("falling", falling_tick);
     run("mobs", mob_tick);
+    run("fox_mouth_equipment", fox_mouth_equipment_tick);
     // `Leashable.tickLeash` runs inside `Entity.tick`; an empty tether table
     // makes the stage a one-lock no-op.
     run("tethers", tether_tick);
@@ -19390,8 +20266,12 @@ fn game_tick(mut step: impl FnMut(&'static str, fn())) {
     run("mod_offload", mod_offload_tick);
     run("live_mods", live_mod_tick);
     run("live_create", live_create_tick);
+    run("anvil_save_tick", live_anvil_save_tick_if_enabled);
     run("gamerules", gamerule_watch_tick);
-    let wire_us = wire_tick_start.elapsed().as_micros().min(u128::from(u32::MAX)) as u32;
+    let wire_us = wire_tick_start
+        .elapsed()
+        .as_micros()
+        .min(u128::from(u32::MAX)) as u32;
     // Vanilla `MinecraftServer.pushTickTimeMetric`: the finished tick's cost is
     // the sample `debug_sample` subscribers are handed each tick.
     push_debug_tick_sample(wire_us);
@@ -19407,10 +20287,29 @@ fn game_tick(mut step: impl FnMut(&'static str, fn())) {
     dwal_flush_pending();
 }
 
+/// Incremental Anvil persistence is opt-in by directory and defaults to a
+/// five-minute cadence. `MEGU_AUTOSAVE_SECS=0` disables this path; positive
+/// values set its wall-clock interval without coupling it to tick rate.
+fn live_anvil_save_tick_if_enabled() {
+    let secs = std::env::var("MEGU_AUTOSAVE_SECS")
+        .ok()
+        .and_then(|value| value.parse::<u64>().ok())
+        .unwrap_or(300);
+    if secs == 0 || anvil_world_dir_from_env().is_none() {
+        return;
+    }
+    every_ms(&ANVIL_AUTOSAVE_AT, secs.saturating_mul(1000), || {
+        if let Some(dir) = anvil_world_dir_from_env() {
+            if let Err(error) = live_anvil_save_tick(&dir) {
+                eprintln!("[anvil] incremental autosave failed: {error}");
+            }
+        }
+    });
+}
+
 /// The line `--version` prints: the engine name, the build tag and the vanilla
 /// release/protocol pair it speaks.
-const MEGU_VERSION_LINE: &str =
-    "Megu (megu) 0.1.0-alpha.2 (Minecraft 1.21.1 / 26.3, Protocol 767)";
+const MEGU_VERSION_LINE: &str = "Megu (megu) 0.1.0-alpha.2 (Minecraft 1.21.1 / 26.3, Protocol 767)";
 
 /// `--help` output: every flag a first boot can take, and what each one does.
 /// Printed and exited before the world, the config or a socket exists.
@@ -19423,7 +20322,7 @@ USAGE:
 OPTIONS:
     --dir <path>     Server directory: its eula.txt, server.toml and world/ are
                      used (default: the current directory). Also --dir=<path>.
-    --port <u16>     Listen port (default: 25599; [server] port in server.toml
+    --port <u16>     Listen port (default: 25565; [server] port in server.toml
                      or MEGU_PORT can also set it).
     --bind <addr>    Bind address (default: 127.0.0.1; MEGU_BIND_ADDR).
     --no-banner      Suppress the interactive startup banner.
@@ -19497,7 +20396,9 @@ fn parse_startup_flags() -> Vec<String> {
             } else {
                 arg.strip_prefix("--port=").map(str::to_owned)
             };
-            let port = value.and_then(|v| v.parse::<u16>().ok()).filter(|p| *p != 0);
+            let port = value
+                .and_then(|v| v.parse::<u16>().ok())
+                .filter(|p| *p != 0);
             match port {
                 Some(port) => std::env::set_var("MEGU_PORT", port.to_string()),
                 None => {
@@ -19512,9 +20413,7 @@ fn parse_startup_flags() -> Vec<String> {
                 arg.strip_prefix("--bind=").map(str::to_owned)
             };
             match value {
-                Some(bind) if !bind.is_empty() => {
-                    std::env::set_var("MEGU_BIND_ADDR", bind)
-                }
+                Some(bind) if !bind.is_empty() => std::env::set_var("MEGU_BIND_ADDR", bind),
                 _ => {
                     eprintln!("megu: --bind requires an address (see --help)");
                     std::process::exit(2);
@@ -19645,9 +20544,7 @@ fn main() {
     // beardifier resolver is. Without it the pass would keep skipping marked fluid cells.
     structure_template::register_fluid_ticker(promotion_fluid_tick);
     // A dump request must never fall through to the live server/save path.
-    if std::env::var_os("MEGU_WG_DUMP").is_some()
-        && std::env::var_os("MEGU_WG_PROFILE").is_none()
-    {
+    if std::env::var_os("MEGU_WG_DUMP").is_some() && std::env::var_os("MEGU_WG_PROFILE").is_none() {
         eprintln!("[wgdump] MEGU_WG_DUMP requires MEGU_WG_PROFILE (use 0 for dump only)");
         std::process::exit(2);
     }
@@ -19665,8 +20562,8 @@ fn main() {
             2,
             "usage: --import-anvil <vanilla_world_dir>"
         );
-        let report = import_anvil_world(std::path::Path::new(&probe_args[1]))
-            .unwrap_or_else(|error| {
+        let report =
+            import_anvil_world(std::path::Path::new(&probe_args[1])).unwrap_or_else(|error| {
                 eprintln!("[anvil] import failed: {error}");
                 std::process::exit(2);
             });
@@ -19694,8 +20591,8 @@ fn main() {
             eprintln!("[anvil] export aborted — world save failed to load: {error}");
             std::process::exit(1);
         }
-        let report = export_anvil_world(std::path::Path::new(&probe_args[1]))
-            .unwrap_or_else(|error| {
+        let report =
+            export_anvil_world(std::path::Path::new(&probe_args[1])).unwrap_or_else(|error| {
                 eprintln!("[anvil] export failed: {error}");
                 std::process::exit(2);
             });
@@ -20091,9 +20988,7 @@ fn main() {
                     std::process::exit(2);
                 };
                 if std::env::var_os("MEGU_POP_REGION").is_some() {
-                    fail(
-                        "MEGU_POP_ORDER and MEGU_POP_REGION are mutually exclusive".into(),
-                    );
+                    fail("MEGU_POP_ORDER and MEGU_POP_REGION are mutually exclusive".into());
                 }
                 let text = std::fs::read_to_string(&order_path)
                     .unwrap_or_else(|error| fail(format!("{order_path}: {error}")));
@@ -20116,9 +21011,8 @@ fn main() {
                 // section the dump happens to ask for first.
                 prefetch_terrain_group(&plan.order, lo, hi, dump_workers, dump_round);
                 let requested = plan.order.len();
-                let executed =
-                    worldgen::with_gen(|g| g.populate_plan(plan, feature::populate))
-                        .unwrap_or_else(|| fail("generator not initialized".into()));
+                let executed = worldgen::with_gen(|g| g.populate_plan(plan, feature::populate))
+                    .unwrap_or_else(|| fail("generator not initialized".into()));
                 if executed != requested {
                     fail(format!("{executed} of {requested} chunks executed; plan overlaps prior population (use MEGU_WG_PROFILE=0)"));
                 }
@@ -20249,15 +21143,17 @@ fn main() {
                     region.sig = None;
                 }
                 let fluid_seeds = std::env::var("MEGU_WG_DIAG_FLUID_SEEDS").ok();
-                let fluid_native =
-                    std::env::var("MEGU_WG_DIAG_FLUID_NATIVE").as_deref() == Ok("1");
+                let fluid_native = std::env::var("MEGU_WG_DIAG_FLUID_NATIVE").as_deref() == Ok("1");
                 let production_fluid =
                     std::env::var("MEGU_WG_DIAG_PRODUCTION_FLUID").as_deref() == Ok("1");
                 let full_tick = std::env::var("MEGU_WG_DIAG_FULL_TICK").as_deref() == Ok("1");
                 if full_tick {
                     for x in ox..ox + n {
                         for z in oz..oz + n {
-                            forceloaded().lock().unwrap_or_else(|e| e.into_inner()).insert((x, z));
+                            forceloaded()
+                                .lock()
+                                .unwrap_or_else(|e| e.into_inner())
+                                .insert((x, z));
                         }
                     }
                 }
@@ -20597,12 +21493,10 @@ fn main() {
     }
     // datapack worldgen uses the saved seed by default. An explicit environment seed may only
     // select a new world's seed or confirm the existing one.
-    let requested_seed = std::env::var("MEGU_SEED")
-        .ok()
-        .map(|v| {
-            worldgen::parse_world_seed(&v)
-                .expect("MEGU_SEED must be a signed long or its unsigned bit pattern")
-        });
+    let requested_seed = std::env::var("MEGU_SEED").ok().map(|v| {
+        worldgen::parse_world_seed(&v)
+            .expect("MEGU_SEED must be a signed long or its unsigned bit pattern")
+    });
     let saved_seed = match load_world_seed_in(&world_save_dir()) {
         Ok(seed) => seed,
         Err(error) => {
@@ -20633,7 +21527,8 @@ fn main() {
                     );
                 }
             }
-            *WORLD_SPAWN.lock().unwrap_or_else(|e| e.into_inner()) = (0.5, worldgen::surface_of(0, 0) as f64 + 0.5, 0.5, 0.0);
+            *WORLD_SPAWN.lock().unwrap_or_else(|e| e.into_inner()) =
+                (0.5, worldgen::surface_of(0, 0) as f64 + 0.5, 0.5, 0.0);
             eprintln!("[wg] vanilla datapack worldgen active (seed {})", wg_seed);
             if let Ok(spec) = std::env::var("MEGU_DFDUMP") {
                 worldgen::dfdump(&spec);
@@ -20785,11 +21680,13 @@ fn main() {
         .expect("signal hook");
         thread::spawn(move || {
             if sigs.forever().next().is_some() {
+                let deadline = Instant::now() + Duration::from_millis(900);
+                disconnect_all_clients("Server closed");
                 stop_lan_announcer();
                 stop_gs4_query();
-                shutdown_world_save();
-                disconnect_all_clients("Server closed");
-                thread::sleep(Duration::from_millis(100));
+                if !shutdown_world_save_bounded(deadline) {
+                    eprintln!("[shutdown] save did not finish before the 900ms deadline");
+                }
                 #[cfg(feature = "neoforge-events")]
                 if let Some(runtime) = java_compat::NEOFORGE.get() {
                     runtime.cleanup_staged_mods();
@@ -20813,7 +21710,7 @@ fn main() {
     let port: u16 = std::env::var("MEGU_PORT")
         .ok()
         .and_then(|p| p.parse().ok())
-        .unwrap_or(25599);
+        .unwrap_or(DEFAULT_LISTEN_PORT);
     let l = TcpListener::bind((bind.as_str(), port)).expect("game listener bind failed");
     // Vanilla's "Open to LAN" multicast advertisement — opt-in, and only ever
     // armed on the port the listener actually owns.
@@ -20914,12 +21811,15 @@ static WORLD_TEST_LOCK: Mutex<()> = Mutex::new(());
 fn world_guard() -> std::sync::MutexGuard<'static, ()> {
     crate::test_support::global_world_test_guard()
 }
+#[cfg(test)]
+mod anticheat_world_tests;
 mod brigadier;
-mod brigadier_wire;
 #[cfg(test)]
 mod brigadier_tests;
+mod brigadier_wire;
 #[cfg(test)]
 mod brigadier_wire_tests;
+mod chest_loot;
 #[cfg(test)]
 mod command_tests;
 #[cfg(all(test, megu_vanilla_data))]
@@ -20935,8 +21835,14 @@ mod fanout_tests;
 mod flowing_fluid;
 #[cfg(test)]
 mod furnace_cache_tests;
+mod generated_content;
+mod generation_payload;
 #[cfg(test)]
 mod merge_tests;
+mod minecart;
+mod mineshaft;
+mod mineshaft_layout;
+mod mineshaft_piece;
 mod nbt;
 #[cfg(all(test, megu_vanilla_data))]
 mod persistence_tests;
@@ -20944,10 +21850,8 @@ mod persistence_tests;
 mod primitives_tests;
 #[cfg(all(test, megu_vanilla_data))]
 mod registry_tests;
-mod mineshaft_layout;
-mod mineshaft;
-mod mineshaft_piece;
 mod scheduled_ticks;
+mod spawner;
 mod structure_placement;
 mod structure_template;
 mod structure_transform;
@@ -20957,13 +21861,6 @@ mod tick_persistence;
 mod tick_queue;
 #[cfg(all(test, megu_vanilla_data))]
 mod tick_tests;
-#[cfg(test)]
-mod anticheat_world_tests;
-mod generation_payload;
-mod generated_content;
-mod chest_loot;
-mod minecart;
-mod spawner;
 mod voxel_faces;
 
 #[cfg(test)]
@@ -20985,22 +21882,46 @@ mod resource_pack_url_tests {
 
     #[test]
     fn resource_pack_http_target_matches_advertised_url() {
-        assert_eq!(resource_pack_http_target("http://127.0.0.1:25598/pack.zip"), "/pack.zip");
-        assert_eq!(resource_pack_http_target("https://packs.example.org/a.zip?key=1"), "/a.zip?key=1");
-        assert_eq!(resource_pack_http_target("https://packs.example.org?key=1"), "/?key=1");
+        assert_eq!(
+            resource_pack_http_target("http://127.0.0.1:25598/pack.zip"),
+            "/pack.zip"
+        );
+        assert_eq!(
+            resource_pack_http_target("https://packs.example.org/a.zip?key=1"),
+            "/a.zip?key=1"
+        );
+        assert_eq!(
+            resource_pack_http_target("https://packs.example.org?key=1"),
+            "/?key=1"
+        );
         assert_eq!(resource_pack_http_target("https://packs.example.org"), "/");
     }
 
     #[test]
     fn resource_pack_http_allows_only_get_head_and_advertised_path() {
         let target = "/pack.zip";
-        assert_eq!(resource_pack_http_action(b"GET /pack.zip HTTP/1.1\r", target), (200, "OK", true));
-        assert_eq!(resource_pack_http_action(b"HEAD /pack.zip HTTP/1.1\r", target), (200, "OK", false));
-        assert_eq!(resource_pack_http_action(b"POST /pack.zip HTTP/1.1", target).0, 405);
+        assert_eq!(
+            resource_pack_http_action(b"GET /pack.zip HTTP/1.1\r", target),
+            (200, "OK", true)
+        );
+        assert_eq!(
+            resource_pack_http_action(b"HEAD /pack.zip HTTP/1.1\r", target),
+            (200, "OK", false)
+        );
+        assert_eq!(
+            resource_pack_http_action(b"POST /pack.zip HTTP/1.1", target).0,
+            405
+        );
         assert_eq!(resource_pack_http_action(b"GET / HTTP/1.1", target).0, 404);
-        assert_eq!(resource_pack_http_action(b"GET /pack.zip?extra=1 HTTP/1.1", target).0, 404);
+        assert_eq!(
+            resource_pack_http_action(b"GET /pack.zip?extra=1 HTTP/1.1", target).0,
+            404
+        );
         assert_eq!(resource_pack_http_action(b"GET /pack.zip", target).0, 400);
-        assert_eq!(resource_pack_http_action(b"GET /pack.zip HTTP/2", target).0, 400);
+        assert_eq!(
+            resource_pack_http_action(b"GET /pack.zip HTTP/2", target).0,
+            400
+        );
     }
 }
 
@@ -21032,12 +21953,22 @@ mod mineshaft_runtime_tests {
             Self {
                 world: world().take_all(),
                 chests: std::mem::take(&mut *chests().lock().unwrap_or_else(|e| e.into_inner())),
-                pending_block_loot: std::mem::take(&mut *pending_block_loot().lock().unwrap_or_else(|e| e.into_inner())),
+                pending_block_loot: std::mem::take(
+                    &mut *pending_block_loot()
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner()),
+                ),
                 drops: std::mem::take(&mut *drops().lock().unwrap_or_else(|e| e.into_inner())),
                 mobs: std::mem::take(&mut *mobs().lock().unwrap_or_else(|e| e.into_inner())),
                 clients: std::mem::take(&mut *clients().lock().unwrap_or_else(|e| e.into_inner())),
-                forced: std::mem::take(&mut *forceloaded().lock().unwrap_or_else(|e| e.into_inner())),
-                generated: std::mem::take(&mut *generated_content().lock().unwrap_or_else(|e| e.into_inner())),
+                forced: std::mem::take(
+                    &mut *forceloaded().lock().unwrap_or_else(|e| e.into_inner()),
+                ),
+                generated: std::mem::take(
+                    &mut *generated_content()
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner()),
+                ),
                 region: test_region(),
                 world_time: WORLD_TIME.load(Ordering::Relaxed),
                 difficulty: DIFFICULTY.load(Ordering::Relaxed),
@@ -21045,8 +21976,9 @@ mod mineshaft_runtime_tests {
                 rng: world_rng::saved_state(),
                 spawn: *WORLD_SPAWN.lock().unwrap_or_else(|e| e.into_inner()),
                 special_spawn: {
-                    let mut state =
-                        special_spawn_state().lock().unwrap_or_else(|e| e.into_inner());
+                    let mut state = special_spawn_state()
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner());
                     let saved = std::mem::take(&mut *state);
                     // `SpecialSpawnState::default()` leaves every timer at 0, so
                     // the first `villager_raid` tick drains `trader_spawn_delay`
@@ -21067,22 +21999,27 @@ mod mineshaft_runtime_tests {
         fn drop(&mut self) {
             world().restore_all(std::mem::take(&mut self.world));
             *chests().lock().unwrap_or_else(|e| e.into_inner()) = std::mem::take(&mut self.chests);
-            *pending_block_loot().lock().unwrap_or_else(|e| e.into_inner()) =
-                std::mem::take(&mut self.pending_block_loot);
+            *pending_block_loot()
+                .lock()
+                .unwrap_or_else(|e| e.into_inner()) = std::mem::take(&mut self.pending_block_loot);
             *drops().lock().unwrap_or_else(|e| e.into_inner()) = std::mem::take(&mut self.drops);
             *mobs().lock().unwrap_or_else(|e| e.into_inner()) = std::mem::take(&mut self.mobs);
-            *clients().lock().unwrap_or_else(|e| e.into_inner()) = std::mem::take(&mut self.clients);
-            *forceloaded().lock().unwrap_or_else(|e| e.into_inner()) = std::mem::take(&mut self.forced);
-            *generated_content().lock().unwrap_or_else(|e| e.into_inner()) =
-                std::mem::take(&mut self.generated);
+            *clients().lock().unwrap_or_else(|e| e.into_inner()) =
+                std::mem::take(&mut self.clients);
+            *forceloaded().lock().unwrap_or_else(|e| e.into_inner()) =
+                std::mem::take(&mut self.forced);
+            *generated_content()
+                .lock()
+                .unwrap_or_else(|e| e.into_inner()) = std::mem::take(&mut self.generated);
             set_test_region(self.region.0.clone(), self.region.1.clone());
             WORLD_TIME.store(self.world_time, Ordering::Relaxed);
             DIFFICULTY.store(self.difficulty, Ordering::Relaxed);
             TICK_IDX.store(self.tick_idx, Ordering::Relaxed);
             world_rng::restore(self.rng);
             *WORLD_SPAWN.lock().unwrap_or_else(|e| e.into_inner()) = self.spawn;
-            *special_spawn_state().lock().unwrap_or_else(|e| e.into_inner()) =
-                std::mem::take(&mut self.special_spawn);
+            *special_spawn_state()
+                .lock()
+                .unwrap_or_else(|e| e.into_inner()) = std::mem::take(&mut self.special_spawn);
         }
     }
 
@@ -21108,7 +22045,10 @@ mod mineshaft_runtime_tests {
         Some((id, sl.to_vec()))
     }
 
-    fn connect_play_client(name: &str, uuid: [u8; 16]) -> (TcpStream, std::thread::JoinHandle<()>, Arc<Client>) {
+    fn connect_play_client(
+        name: &str,
+        uuid: [u8; 16],
+    ) -> (TcpStream, std::thread::JoinHandle<()>, Arc<Client>) {
         let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
         let addr = listener.local_addr().unwrap();
         let server_handle = std::thread::spawn(move || {
@@ -21170,7 +22110,8 @@ mod mineshaft_runtime_tests {
 
         // Play: wait until Synchronize Player Position (0x40), then wait briefly until handle() pushes Client.
         loop {
-            let (pid, body) = read_server_packet(&mut cli, deadline).expect("play initial position");
+            let (pid, body) =
+                read_server_packet(&mut cli, deadline).expect("play initial position");
             if pid == 0x40 {
                 send_packet(&mut cli, 0x00, body[33..].to_vec()).unwrap();
                 break;
@@ -21181,8 +22122,8 @@ mod mineshaft_runtime_tests {
         // read the next packet see the answer to their own action.
         let login_deadline = Instant::now() + Duration::from_secs(5);
         loop {
-            let (pid, _) = read_server_packet(&mut cli, login_deadline)
-                .expect("login window-0 content");
+            let (pid, _) =
+                read_server_packet(&mut cli, login_deadline).expect("login window-0 content");
             if pid == 0x13 {
                 break;
             }
@@ -21263,7 +22204,10 @@ mod mineshaft_runtime_tests {
         let _guard = world_guard();
         let _snap = RuntimeSnapshot::take();
         *WORLD_SPAWN.lock().unwrap_or_else(|e| e.into_inner()) = (0.5, 70.0, 1.5, 0.0);
-        forceloaded().lock().unwrap_or_else(|e| e.into_inner()).insert((0, 0));
+        forceloaded()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert((0, 0));
         refresh_hot();
 
         // Stage a seeded ChestMinecart (seed 1 has enchanted_book fire_aspect 1 at slot 7).
@@ -21272,13 +22216,18 @@ mod mineshaft_runtime_tests {
             crate::generation_payload::GenerationPayload::ChestMinecart { loot_seed: 1 },
         )]);
         let (cart_eid, cart_uuid) = {
-            let gen = generated_content().lock().unwrap_or_else(|e| e.into_inner());
+            let gen = generated_content()
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
             assert_eq!(gen.carts.len(), 1);
             assert!(gen.carts[0].has_loot_table());
             assert!(gen.carts[0].data.get("Items").is_none());
             (gen.carts[0].eid, gen.carts[0].uuid().unwrap())
         };
-        assert!(!chests().lock().unwrap_or_else(|e| e.into_inner()).contains_key(&ContainerKey::Cart(cart_uuid)));
+        assert!(!chests()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .contains_key(&ContainerKey::Cart(cart_uuid)));
 
         // Save before any interaction: cart keeps LootTable and no Items.
         let mut pre_open_save = Vec::new();
@@ -21290,11 +22239,9 @@ mod mineshaft_runtime_tests {
         let (p, _, _) = read_dim_footer(p).unwrap();
         let (p, _) = read_block_loot_footer(p).unwrap();
         let (p, _) = read_drop_owners_footer(p).unwrap();
-        let pre_snap = generated_content::Snapshot::read(
-            tick_persistence::prefix(p).unwrap(),
-        )
-        .unwrap()
-        .unwrap();
+        let pre_snap = generated_content::Snapshot::read(tick_persistence::prefix(p).unwrap())
+            .unwrap()
+            .unwrap();
         assert!(pre_snap.content.carts[0].has_loot_table());
         assert!(pre_snap.content.carts[0].data.get("Items").is_none());
 
@@ -21329,12 +22276,17 @@ mod mineshaft_runtime_tests {
             if let Some((ename, lvl)) = entry.enchantment {
                 assert_eq!(
                     comp_get(&st.2, COMP_STORED_ENCHANTMENTS),
-                    Some(enchantments_data(&[(enchant_id(ename).unwrap(), i64::from(lvl))], true).as_slice())
+                    Some(
+                        enchantments_data(&[(enchant_id(ename).unwrap(), i64::from(lvl))], true)
+                            .as_slice()
+                    )
                 );
             }
         }
         {
-            let gen = generated_content().lock().unwrap_or_else(|e| e.into_inner());
+            let gen = generated_content()
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
             assert!(!gen.carts[0].has_loot_table());
             assert!(gen.carts[0].data.get("Items").is_none());
         }
@@ -21350,17 +22302,33 @@ mod mineshaft_runtime_tests {
         send_packet(&mut sock, 0x0e, click).unwrap();
 
         let slot_update = wait_packet(&mut sock, 0x15);
-        assert_eq!(slot_read_wire(&slot_update[2..]), Some((book_entry.slot, (0, 0, Vec::new()))));
-        assert!(me.inv.lock().unwrap_or_else(|e| e.into_inner()).values().any(|st| {
-            st.0 == name_to_item("enchanted_book").unwrap()
-                && comp_get(&st.2, COMP_STORED_ENCHANTMENTS).is_some()
-        }));
+        assert_eq!(
+            slot_read_wire(&slot_update[2..]),
+            Some((book_entry.slot, (0, 0, Vec::new())))
+        );
+        assert!(me
+            .inv
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .values()
+            .any(|st| {
+                st.0 == name_to_item("enchanted_book").unwrap()
+                    && comp_get(&st.2, COMP_STORED_ENCHANTMENTS).is_some()
+            }));
 
         // Close window via 0x0f.
         send_packet(&mut sock, 0x0f, vec![1u8]).unwrap();
         let wait_close = Instant::now() + Duration::from_secs(2);
-        while me.open_chest.lock().unwrap_or_else(|e| e.into_inner()).is_some() {
-            assert!(Instant::now() < wait_close, "open_chest did not clear on 0x0f");
+        while me
+            .open_chest
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .is_some()
+        {
+            assert!(
+                Instant::now() < wait_close,
+                "open_chest did not clear on 0x0f"
+            );
             std::thread::sleep(Duration::from_millis(5));
         }
 
@@ -21376,17 +22344,26 @@ mod mineshaft_runtime_tests {
         assert!(!expected_after_take.contains_key(&book_entry.slot));
 
         chests().lock().unwrap_or_else(|e| e.into_inner()).clear();
-        generated_content().lock().unwrap_or_else(|e| e.into_inner()).carts.clear();
+        generated_content()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .carts
+            .clear();
         load_world_from(&mid_save).unwrap();
         let reloaded_eid = {
-            let gen = generated_content().lock().unwrap_or_else(|e| e.into_inner());
+            let gen = generated_content()
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
             assert_eq!(gen.carts.len(), 1);
             assert!(!gen.carts[0].has_loot_table());
             assert!(gen.carts[0].data.get("Items").is_none());
             gen.carts[0].eid
         };
         assert_eq!(
-            chests().lock().unwrap_or_else(|e| e.into_inner()).get(&ContainerKey::Cart(cart_uuid)),
+            chests()
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .get(&ContainerKey::Cart(cart_uuid)),
             Some(&expected_after_take)
         );
 
@@ -21402,14 +22379,25 @@ mod mineshaft_runtime_tests {
         assert_eq!(reopened_items[book_entry.slot as usize], (0, 0, Vec::new()));
 
         // Empty the cart completely -> save -> reload -> remains empty and does not re-roll.
-        chests().lock().unwrap_or_else(|e| e.into_inner()).get_mut(&ContainerKey::Cart(cart_uuid)).unwrap().clear();
+        chests()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get_mut(&ContainerKey::Cart(cart_uuid))
+            .unwrap()
+            .clear();
         let mut empty_save = Vec::new();
         save_world_into(&mut empty_save);
         chests().lock().unwrap_or_else(|e| e.into_inner()).clear();
-        generated_content().lock().unwrap_or_else(|e| e.into_inner()).carts.clear();
+        generated_content()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .carts
+            .clear();
         load_world_from(&empty_save).unwrap();
         let empty_reloaded_eid = {
-            let gen = generated_content().lock().unwrap_or_else(|e| e.into_inner());
+            let gen = generated_content()
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
             assert!(!gen.carts[0].has_loot_table());
             gen.carts[0].eid
         };
@@ -21437,7 +22425,10 @@ mod mineshaft_runtime_tests {
         let _ = wait_packet(&mut sock, 0x13);
 
         // Register cart as seen so 0x42 destroy reaches this client.
-        me.seen.lock().unwrap_or_else(|e| e.into_inner()).insert(empty_reloaded_eid);
+        me.seen
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(empty_reloaded_eid);
         let mut attack = Vec::new();
         write_varint(&mut attack, empty_reloaded_eid as i64);
         write_varint(&mut attack, 1);
@@ -21451,10 +22442,26 @@ mod mineshaft_runtime_tests {
         assert_eq!(read_varint(&mut dp), Some(1));
         assert_eq!(read_varint(&mut dp), Some(empty_reloaded_eid as i64));
 
-        assert!(generated_content().lock().unwrap_or_else(|e| e.into_inner()).carts.is_empty());
-        assert!(!chests().lock().unwrap_or_else(|e| e.into_inner()).contains_key(&ContainerKey::Cart(cart_uuid)));
-        assert!(me.open_chest.lock().unwrap_or_else(|e| e.into_inner()).is_none());
-        let dropped: Vec<(i64, u8)> = drops().lock().unwrap_or_else(|e| e.into_inner()).iter().map(|d| (d.item, d.cnt)).collect();
+        assert!(generated_content()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .carts
+            .is_empty());
+        assert!(!chests()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .contains_key(&ContainerKey::Cart(cart_uuid)));
+        assert!(me
+            .open_chest
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .is_none());
+        let dropped: Vec<(i64, u8)> = drops()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .iter()
+            .map(|d| (d.item, d.cnt))
+            .collect();
         assert!(dropped.contains(&(name_to_item("chest_minecart").unwrap(), 1)));
         assert!(dropped.contains(&(diamond, 2)));
 
@@ -21464,24 +22471,34 @@ mod mineshaft_runtime_tests {
             (0, 70, 0),
             crate::generation_payload::GenerationPayload::ChestMinecart { loot_seed: 3 },
         )]);
-        let unopened_eid = generated_content().lock().unwrap_or_else(|e| e.into_inner()).carts[0].eid;
+        let unopened_eid = generated_content()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .carts[0]
+            .eid;
         let mut attack_unopened = Vec::new();
         write_varint(&mut attack_unopened, unopened_eid as i64);
         write_varint(&mut attack_unopened, 1);
         attack_unopened.push(0);
         send_packet(&mut sock, 0x16, attack_unopened).unwrap();
         let wait_drop = Instant::now() + Duration::from_secs(2);
-        while !generated_content().lock().unwrap_or_else(|e| e.into_inner()).carts.is_empty() {
+        while !generated_content()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .carts
+            .is_empty()
+        {
             assert!(Instant::now() < wait_drop);
             std::thread::sleep(Duration::from_millis(5));
         }
-        let has_book = drops()
-            .lock()
-            .unwrap()
-            .iter()
-            .any(|d| d.item == name_to_item("enchanted_book").unwrap()
-                && comp_get(&d.comps, COMP_STORED_ENCHANTMENTS).is_some());
-        assert!(has_book, "breaking an unopened seeded cart in survival must spill rolled loot");
+        let has_book = drops().lock().unwrap().iter().any(|d| {
+            d.item == name_to_item("enchanted_book").unwrap()
+                && comp_get(&d.comps, COMP_STORED_ENCHANTMENTS).is_some()
+        });
+        assert!(
+            has_book,
+            "breaking an unopened seeded cart in survival must spill rolled loot"
+        );
 
         let _ = sock.shutdown(Shutdown::Both);
         drop(sock);
@@ -21572,8 +22589,17 @@ mod mineshaft_runtime_tests {
         *me.pos.lock().unwrap_or_else(|e| e.into_inner()) = (0.5, 71.0, 0.5, 0.0, 0.0, true);
         // Infinite blocks: a one-item stack placed twice.
         ac_place(&mut sock, (1, 70, 0), 1, 1);
-        assert_eq!(block_at(1, 71, 0), stone, "{name}: an honest placement must succeed");
-        let first_place_consumed = me.inv.lock().unwrap_or_else(|e| e.into_inner()).get(&36).is_none();
+        assert_eq!(
+            block_at(1, 71, 0),
+            stone,
+            "{name}: an honest placement must succeed"
+        );
+        let first_place_consumed = me
+            .inv
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(&36)
+            .is_none();
         ac_place(&mut sock, (1, 71, 0), 1, 2);
         let second_place_with_empty_hand = block_at(1, 72, 0) == stone;
         // Placing into a solid block, then against nothing.
@@ -21590,7 +22616,10 @@ mod mineshaft_runtime_tests {
         if teleport_accepted {
             ac_move(&mut sock, (0.5, 71.0, 0.5), true);
         } else {
-            assert!(ac_confirm_teleport(&mut sock), "{name}: a setback teleport must be sent");
+            assert!(
+                ac_confirm_teleport(&mut sock),
+                "{name}: a setback teleport must be sent"
+            );
         }
         // NoFall: fall 29 blocks while claiming to stand on the ground.
         *me.hp.lock().unwrap_or_else(|e| e.into_inner()) = 20.0;
@@ -21625,17 +22654,32 @@ mod mineshaft_runtime_tests {
         let _guard = world_guard();
         let _snap = RuntimeSnapshot::take();
         *WORLD_SPAWN.lock().unwrap_or_else(|e| e.into_inner()) = (0.5, 71.0, 0.5, 0.0);
-        forceloaded().lock().unwrap_or_else(|e| e.into_inner()).insert((0, 0));
+        forceloaded()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert((0, 0));
         refresh_hot();
         let off = ac_exploit_run("AcOff", [0x41u8; 16], AcPreset::Off);
         println!("ACLIVE off: {off:?}");
         let standard = ac_exploit_run("AcStandard", [0x42u8; 16], AcPreset::Standard);
         println!("ACLIVE standard: {standard:?}");
-        assert!(!off.first_place_consumed && off.second_place_with_empty_hand, "{off:?}");
-        assert!(off.placed_into_stone && off.air_placed && off.teleport_accepted, "{off:?}");
+        assert!(
+            !off.first_place_consumed && off.second_place_with_empty_hand,
+            "{off:?}"
+        );
+        assert!(
+            off.placed_into_stone && off.air_placed && off.teleport_accepted,
+            "{off:?}"
+        );
         assert_eq!(off.nofall_hp, 20.0, "{off:?}");
-        assert!(standard.first_place_consumed && !standard.second_place_with_empty_hand, "{standard:?}");
-        assert!(!standard.placed_into_stone && !standard.air_placed, "{standard:?}");
+        assert!(
+            standard.first_place_consumed && !standard.second_place_with_empty_hand,
+            "{standard:?}"
+        );
+        assert!(
+            !standard.placed_into_stone && !standard.air_placed,
+            "{standard:?}"
+        );
         assert!(!standard.teleport_accepted, "{standard:?}");
         assert!(standard.nofall_hp < 20.0, "{standard:?}");
     }
@@ -21654,7 +22698,11 @@ mod mineshaft_runtime_tests {
                 .entry(format!("p:{name}"))
                 .or_default()
                 .insert("generic.movement_speed".into(), 0.4);
-            me.effs.lock().unwrap_or_else(|e| e.into_inner()).push(Eff { id: 0, amp: 1, left: 1_000_000 });
+            me.effs.lock().unwrap_or_else(|e| e.into_inner()).push(Eff {
+                id: 0,
+                amp: 1,
+                left: 1_000_000,
+            });
         }
         *me.pos.lock().unwrap_or_else(|e| e.into_inner()) = (0.5, 71.0, 0.5, 0.0, 0.0, true);
         for i in 0..80 {
@@ -21663,7 +22711,10 @@ mod mineshaft_runtime_tests {
         }
         let flags = ac_flag_count(me.eid, AcCheckId::Movement);
         let vl = ac_violation_level(me.eid, AcCheckId::Movement);
-        attrs().lock().unwrap_or_else(|e| e.into_inner()).remove(&format!("p:{name}"));
+        attrs()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(&format!("p:{name}"));
         let _ = sock.shutdown(Shutdown::Both);
         drop(sock);
         let _ = server_thread.join();
@@ -21679,7 +22730,10 @@ mod mineshaft_runtime_tests {
         let _guard = world_guard();
         let _snap = RuntimeSnapshot::take();
         *WORLD_SPAWN.lock().unwrap_or_else(|e| e.into_inner()) = (0.5, 71.0, 0.5, 0.0);
-        forceloaded().lock().unwrap_or_else(|e| e.into_inner()).insert((0, 0));
+        forceloaded()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert((0, 0));
         refresh_hot();
         let boosted = ac_speed_run("AcBoosted", [0x43u8; 16], true);
         let plain = ac_speed_run("AcPlain", [0x44u8; 16], false);
@@ -21697,7 +22751,10 @@ mod mineshaft_runtime_tests {
         let _guard = world_guard();
         let _snap = RuntimeSnapshot::take();
         *WORLD_SPAWN.lock().unwrap_or_else(|e| e.into_inner()) = (0.5, 71.0, 0.5, 0.0);
-        forceloaded().lock().unwrap_or_else(|e| e.into_inner()).insert((0, 0));
+        forceloaded()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert((0, 0));
         refresh_hot();
         ac_floor();
         let x_of = |me: &Arc<Client>| me.pos.lock().unwrap_or_else(|e| e.into_inner()).0;
@@ -21706,7 +22763,10 @@ mod mineshaft_runtime_tests {
         let (mut sock, server_thread, me) = connect_play_client("AcBuilder", [0x45u8; 16]);
         *me.gm.lock().unwrap_or_else(|e| e.into_inner()) = 1;
         *me.pos.lock().unwrap_or_else(|e| e.into_inner()) = (0.5, 71.0, 0.5, 0.0, 0.0, true);
-        me.inv.lock().unwrap_or_else(|e| e.into_inner()).insert(36, (name_to_item("dirt").unwrap(), 1, Vec::new()));
+        me.inv
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(36, (name_to_item("dirt").unwrap(), 1, Vec::new()));
         // Creative: a 40-block flight in one packet and an air-placement are fine.
         ac_move(&mut sock, (40.5, 90.0, 0.5), false);
         assert_eq!(x_of(&me), 40.5, "creative flight must not be pulled back");
@@ -21722,12 +22782,20 @@ mod mineshaft_runtime_tests {
         *me.gm.lock().unwrap_or_else(|e| e.into_inner()) = 0;
         ac_move(&mut sock, (20.5, 71.0, 0.5), true);
         assert_eq!(ac_exemption(&me), Some("game mode change"));
-        assert_eq!(x_of(&me), 20.5, "the move right after leaving spectator is graced");
+        assert_eq!(
+            x_of(&me),
+            20.5,
+            "the move right after leaving spectator is graced"
+        );
         // ...and once the grace runs out survival is checked again.
         std::thread::sleep(Duration::from_millis(3200));
         assert_eq!(ac_exemption(&me), None);
         ac_move(&mut sock, (9000.5, 71.0, 0.5), true);
-        assert_eq!(x_of(&me), 20.5, "survival teleport must be pulled back after the grace");
+        assert_eq!(
+            x_of(&me),
+            20.5,
+            "survival teleport must be pulled back after the grace"
+        );
         assert!(ac_confirm_teleport(&mut sock));
         assert_eq!(ac_flag_count(me.eid, AcCheckId::Movement), 1);
         let _ = sock.shutdown(Shutdown::Both);
@@ -21761,7 +22829,10 @@ mod mineshaft_runtime_tests {
         let _guard = world_guard();
         let _snap = RuntimeSnapshot::take();
         *WORLD_SPAWN.lock().unwrap_or_else(|e| e.into_inner()) = (0.5, 70.0, 0.5, 0.0);
-        forceloaded().lock().unwrap_or_else(|e| e.into_inner()).insert((0, 0));
+        forceloaded()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert((0, 0));
         refresh_hot();
 
         let chest_st = name_to_state("chest").unwrap();
@@ -21770,8 +22841,18 @@ mod mineshaft_runtime_tests {
         let barrel_st = name_to_state("barrel").unwrap();
 
         let blocked_single: BlockPos = (2, 70, 0);
-        set_block(blocked_single.0, blocked_single.1, blocked_single.2, chest_st);
-        set_block(blocked_single.0, blocked_single.1 + 1, blocked_single.2, stone_st);
+        set_block(
+            blocked_single.0,
+            blocked_single.1,
+            blocked_single.2,
+            chest_st,
+        );
+        set_block(
+            blocked_single.0,
+            blocked_single.1 + 1,
+            blocked_single.2,
+            stone_st,
+        );
 
         let blocked_left: BlockPos = (2, 70, 3);
         let blocked_right: BlockPos = (3, 70, 3);
@@ -21786,7 +22867,12 @@ mod mineshaft_runtime_tests {
 
         let blocked_ender: BlockPos = (2, 70, 6);
         set_block(blocked_ender.0, blocked_ender.1, blocked_ender.2, ender_st);
-        set_block(blocked_ender.0, blocked_ender.1 + 1, blocked_ender.2, stone_st);
+        set_block(
+            blocked_ender.0,
+            blocked_ender.1 + 1,
+            blocked_ender.2,
+            stone_st,
+        );
 
         let barrel: BlockPos = (2, 70, 9);
         set_block(barrel.0, barrel.1, barrel.2, barrel_st);
@@ -21814,37 +22900,43 @@ mod mineshaft_runtime_tests {
             crate::generation_payload::GenerationPayload::ChestMinecart { loot_seed: 2 },
         )]);
         set_block(0, 71, 2, stone_st);
-        let cart_eid = generated_content().lock().unwrap_or_else(|e| e.into_inner()).carts[0].eid;
+        let cart_eid = generated_content()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .carts[0]
+            .eid;
 
         let (mut sock_a, th_a, alice) = connect_play_client("Alice", [0x11u8; 16]);
         let (mut sock_b, th_b, bob) = connect_play_client("Bob", [0x22u8; 16]);
         *alice.gm.lock().unwrap_or_else(|e| e.into_inner()) = 0;
         *bob.gm.lock().unwrap_or_else(|e| e.into_inner()) = 0;
 
-        let use_until_ack = |sock: &mut TcpStream, pos: BlockPos, seq: i64| -> Vec<(i64, Vec<u8>)> {
-            let mut pkt = Vec::new();
-            write_varint(&mut pkt, 0); // main hand
-            write_pos(&mut pkt, pos.0, pos.1, pos.2);
-            write_varint(&mut pkt, 1); // UP face
-            pkt.extend_from_slice(&0.5f32.to_be_bytes());
-            pkt.extend_from_slice(&1.0f32.to_be_bytes());
-            pkt.extend_from_slice(&0.5f32.to_be_bytes());
-            pkt.push(0);
-            write_varint(&mut pkt, seq);
-            send_packet(sock, 0x38, pkt).unwrap();
-            let deadline = Instant::now() + Duration::from_secs(5);
-            let mut seen = Vec::new();
-            loop {
-                let (pid, body) = read_server_packet(sock, deadline).expect("expected 0x05 ack");
-                if pid == 0x05 {
-                    let mut sl = &body[..];
-                    if read_varint(&mut sl) == Some(seq) {
-                        return seen;
+        let use_until_ack =
+            |sock: &mut TcpStream, pos: BlockPos, seq: i64| -> Vec<(i64, Vec<u8>)> {
+                let mut pkt = Vec::new();
+                write_varint(&mut pkt, 0); // main hand
+                write_pos(&mut pkt, pos.0, pos.1, pos.2);
+                write_varint(&mut pkt, 1); // UP face
+                pkt.extend_from_slice(&0.5f32.to_be_bytes());
+                pkt.extend_from_slice(&1.0f32.to_be_bytes());
+                pkt.extend_from_slice(&0.5f32.to_be_bytes());
+                pkt.push(0);
+                write_varint(&mut pkt, seq);
+                send_packet(sock, 0x38, pkt).unwrap();
+                let deadline = Instant::now() + Duration::from_secs(5);
+                let mut seen = Vec::new();
+                loop {
+                    let (pid, body) =
+                        read_server_packet(sock, deadline).expect("expected 0x05 ack");
+                    if pid == 0x05 {
+                        let mut sl = &body[..];
+                        if read_varint(&mut sl) == Some(seq) {
+                            return seen;
+                        }
                     }
+                    seen.push((pid, body));
                 }
-                seen.push((pid, body));
-            }
-        };
+            };
 
         // 1. Blocked single, blocked double (via left or right), and blocked ender chest refuse open.
         *alice.pos.lock().unwrap_or_else(|e| e.into_inner()) = (2.5, 70.0, 1.5, 0.0, 0.0, true);
@@ -21853,14 +22945,21 @@ mod mineshaft_runtime_tests {
             .enumerate()
         {
             if pos == blocked_ender {
-                *alice.pos.lock().unwrap_or_else(|e| e.into_inner()) = (2.5, 70.0, 5.5, 0.0, 0.0, true);
+                *alice.pos.lock().unwrap_or_else(|e| e.into_inner()) =
+                    (2.5, 70.0, 5.5, 0.0, 0.0, true);
             }
             let pkts = use_until_ack(&mut sock_a, pos, 100 + idx as i64);
             assert!(
-                !pkts.iter().any(|(pid, _)| matches!(*pid, 0x33 | 0x13 | 0x08)),
+                !pkts
+                    .iter()
+                    .any(|(pid, _)| matches!(*pid, 0x33 | 0x13 | 0x08)),
                 "blocked container at {pos:?} must not open or emit blockEvent"
             );
-            assert!(alice.open_chest.lock().unwrap_or_else(|e| e.into_inner()).is_none());
+            assert!(alice
+                .open_chest
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .is_none());
         }
 
         // 2. Barrel and minecart chest under stone still open normally.
@@ -21870,10 +22969,19 @@ mod mineshaft_runtime_tests {
             barrel_pkts.iter().any(|(pid, _)| *pid == 0x33),
             "barrel under stone must still open"
         );
-        assert!(alice.open_chest.lock().unwrap_or_else(|e| e.into_inner()).is_some());
+        assert!(alice
+            .open_chest
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .is_some());
         send_packet(&mut sock_a, 0x0f, vec![1u8]).unwrap();
         let wait_close = Instant::now() + Duration::from_secs(2);
-        while alice.open_chest.lock().unwrap_or_else(|e| e.into_inner()).is_some() {
+        while alice
+            .open_chest
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .is_some()
+        {
             assert!(Instant::now() < wait_close);
             std::thread::sleep(Duration::from_millis(5));
         }
@@ -21890,7 +22998,11 @@ mod mineshaft_runtime_tests {
         *alice.pos.lock().unwrap_or_else(|e| e.into_inner()) = (0.5, 70.0, 10.5, 0.0, 0.0, true);
         game_tick(|_, tick| tick());
         assert_eq!(wait_packet(&mut sock_a, 0x12), vec![1u8]);
-        assert!(alice.open_chest.lock().unwrap_or_else(|e| e.into_inner()).is_none());
+        assert!(alice
+            .open_chest
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .is_none());
 
         // 3. Alice & Bob open the unblocked double chest -> Alice clicks -> Bob gets 0x15 on tick.
         *alice.pos.lock().unwrap_or_else(|e| e.into_inner()) = (4.5, 70.0, 1.5, 0.0, 0.0, true);
@@ -21901,7 +23013,11 @@ mod mineshaft_runtime_tests {
         assert!(open_b.iter().any(|(pid, _)| *pid == 0x33));
 
         let diamond = name_to_item("diamond").unwrap();
-        alice.inv.lock().unwrap_or_else(|e| e.into_inner()).insert(9, (diamond, 1, Vec::new()));
+        alice
+            .inv
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(9, (diamond, 1, Vec::new()));
         let mut click1 = vec![1u8];
         write_varint(&mut click1, 0);
         click1.extend_from_slice(&54i16.to_be_bytes()); // inv slot 9 in 54-slot chest
@@ -21937,7 +23053,11 @@ mod mineshaft_runtime_tests {
         *alice.pos.lock().unwrap_or_else(|e| e.into_inner()) = (15.0, 70.0, 0.5, 0.0, 0.0, true);
         game_tick(|_, tick| tick());
         assert_eq!(wait_packet(&mut sock_a, 0x12), vec![1u8]);
-        assert!(alice.open_chest.lock().unwrap_or_else(|e| e.into_inner()).is_none());
+        assert!(alice
+            .open_chest
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .is_none());
 
         let mut dropped_counts = Vec::new();
         for _ in 0..2 {
@@ -21965,7 +23085,10 @@ mod mineshaft_runtime_tests {
         let _guard = world_guard();
         let _snap = RuntimeSnapshot::take();
         *WORLD_SPAWN.lock().unwrap_or_else(|e| e.into_inner()) = (0.5, 70.0, 0.5, 0.0);
-        forceloaded().lock().unwrap_or_else(|e| e.into_inner()).insert((0, 0));
+        forceloaded()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert((0, 0));
         refresh_hot();
 
         let reg = crate::block_registry::breg().expect("block registry");
@@ -22000,35 +23123,41 @@ mod mineshaft_runtime_tests {
                 crate::generation_payload::GenerationPayload::ChestMinecart { loot_seed: 9 },
             ),
         ]);
-        let cart_eid = generated_content().lock().unwrap_or_else(|e| e.into_inner()).carts[0].eid;
+        let cart_eid = generated_content()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .carts[0]
+            .eid;
 
         let (mut sock_a, th_a, alice) = connect_play_client("Alice", [0x11u8; 16]);
         let (mut sock_b, th_b, bob) = connect_play_client("Bob", [0x22u8; 16]);
 
-        let use_until_ack = |sock: &mut TcpStream, pos: BlockPos, seq: i64| -> Vec<(i64, Vec<u8>)> {
-            let mut pkt = Vec::new();
-            write_varint(&mut pkt, 0);
-            write_pos(&mut pkt, pos.0, pos.1, pos.2);
-            write_varint(&mut pkt, 1);
-            pkt.extend_from_slice(&0.5f32.to_be_bytes());
-            pkt.extend_from_slice(&1.0f32.to_be_bytes());
-            pkt.extend_from_slice(&0.5f32.to_be_bytes());
-            pkt.push(0);
-            write_varint(&mut pkt, seq);
-            send_packet(sock, 0x38, pkt).unwrap();
-            let deadline = Instant::now() + Duration::from_secs(5);
-            let mut seen = Vec::new();
-            loop {
-                let (pid, body) = read_server_packet(sock, deadline).expect("expected 0x05 ack");
-                if pid == 0x05 {
-                    let mut sl = &body[..];
-                    if read_varint(&mut sl) == Some(seq) {
-                        return seen;
+        let use_until_ack =
+            |sock: &mut TcpStream, pos: BlockPos, seq: i64| -> Vec<(i64, Vec<u8>)> {
+                let mut pkt = Vec::new();
+                write_varint(&mut pkt, 0);
+                write_pos(&mut pkt, pos.0, pos.1, pos.2);
+                write_varint(&mut pkt, 1);
+                pkt.extend_from_slice(&0.5f32.to_be_bytes());
+                pkt.extend_from_slice(&1.0f32.to_be_bytes());
+                pkt.extend_from_slice(&0.5f32.to_be_bytes());
+                pkt.push(0);
+                write_varint(&mut pkt, seq);
+                send_packet(sock, 0x38, pkt).unwrap();
+                let deadline = Instant::now() + Duration::from_secs(5);
+                let mut seen = Vec::new();
+                loop {
+                    let (pid, body) =
+                        read_server_packet(sock, deadline).expect("expected 0x05 ack");
+                    if pid == 0x05 {
+                        let mut sl = &body[..];
+                        if read_varint(&mut sl) == Some(seq) {
+                            return seen;
+                        }
                     }
+                    seen.push((pid, body));
                 }
-                seen.push((pid, body));
-            }
-        };
+            };
 
         // 1. Spectator cannot open or trigger lazy LootTable materialization; survival unpacks once.
         *alice.gm.lock().unwrap_or_else(|e| e.into_inner()) = 3;
@@ -22038,20 +23167,38 @@ mod mineshaft_runtime_tests {
             !spec_pkts.iter().any(|(pid, _)| matches!(*pid, 0x33 | 0x13)),
             "spectator must not open unopened loot chest"
         );
-        assert!(pending_block_loot().lock().unwrap_or_else(|e| e.into_inner()).contains_key(&ow_block(loot_chest)));
-        assert!(!chests().lock().unwrap_or_else(|e| e.into_inner()).contains_key(&ContainerKey::ow(loot_chest)));
+        assert!(pending_block_loot()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .contains_key(&ow_block(loot_chest)));
+        assert!(!chests()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .contains_key(&ContainerKey::ow(loot_chest)));
 
         *alice.gm.lock().unwrap_or_else(|e| e.into_inner()) = 0;
         let surv_pkts = use_until_ack(&mut sock_a, loot_chest, 2);
         assert!(surv_pkts.iter().any(|(pid, _)| *pid == 0x33));
-        assert!(!pending_block_loot().lock().unwrap_or_else(|e| e.into_inner()).contains_key(&ow_block(loot_chest)));
+        assert!(!pending_block_loot()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .contains_key(&ow_block(loot_chest)));
         assert_eq!(
-            chests().lock().unwrap_or_else(|e| e.into_inner()).get(&ContainerKey::ow(loot_chest)).cloned(),
+            chests()
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .get(&ContainerKey::ow(loot_chest))
+                .cloned(),
             Some(roll_cart_loot(77777))
         );
         send_packet(&mut sock_a, 0x0f, vec![1u8]).unwrap();
         let deadline = Instant::now() + Duration::from_secs(2);
-        while alice.open_chest.lock().unwrap_or_else(|e| e.into_inner()).is_some() {
+        while alice
+            .open_chest
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .is_some()
+        {
             assert!(Instant::now() < deadline);
             std::thread::sleep(Duration::from_millis(5));
         }
@@ -22102,7 +23249,11 @@ mod mineshaft_runtime_tests {
 
         set_block(ender_pos.0, ender_pos.1, ender_pos.2, 0);
         assert_eq!(wait_packet(&mut sock_a, 0x12), vec![1u8]);
-        assert!(alice.open_chest.lock().unwrap_or_else(|e| e.into_inner()).is_none());
+        assert!(alice
+            .open_chest
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .is_none());
         assert_eq!(
             chests()
                 .lock()
@@ -22183,7 +23334,10 @@ mod mineshaft_runtime_tests {
             Some(spawn_y),
             "ground search should pass the oak-leaf canopy and find the grass block"
         );
-        assert_eq!(reg.name_of(block_at(0, spawn_y - 1, 0)), "minecraft:grass_block");
+        assert_eq!(
+            reg.name_of(block_at(0, spawn_y - 1, 0)),
+            "minecraft:grass_block"
+        );
     }
 
     #[test]
@@ -22212,11 +23366,10 @@ mod mineshaft_runtime_tests {
             .skip(1)
             .find_map(|(index, &(x, z))| {
                 let top = surface_y(x, z).floor() as i32;
-                let biome = worldgen::with_gen_dim(DimId::Overworld, |g| {
-                    g.biome_name_at(x, top - 5, z)
-                })
-                .flatten()
-                .unwrap_or_else(|| "minecraft:plains".to_string());
+                let biome =
+                    worldgen::with_gen_dim(DimId::Overworld, |g| g.biome_name_at(x, top - 5, z))
+                        .flatten()
+                        .unwrap_or_else(|| "minecraft:plains".to_string());
                 let has_farm_animal = feature::spawners_for(&biome, "creature")
                     .unwrap_or_default()
                     .iter()
@@ -22255,7 +23408,13 @@ mod mineshaft_runtime_tests {
         let valid_spawn_y = find_passive_ground_y(reg, valid_x, valid_z)
             .expect("the later candidate should expose grass beneath its canopy");
         assert!(
-            live_light_at(&client_snapshot(), DimId::Overworld, valid_x, valid_spawn_y, valid_z) > 8,
+            live_light_at(
+                &client_snapshot(),
+                DimId::Overworld,
+                valid_x,
+                valid_spawn_y,
+                valid_z
+            ) > 8,
             "daytime sky light should permit an outdoor grass spawn under a sparse leaf canopy"
         );
 
@@ -22294,7 +23453,10 @@ mod mineshaft_runtime_tests {
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .extend((0..cap - 1).map(|_| filler.clone()));
-        assert_eq!(live_category_count(DimId::Overworld, MobCategory::Creature), cap - 1);
+        assert_eq!(
+            live_category_count(DimId::Overworld, MobCategory::Creature),
+            cap - 1
+        );
 
         spawn_passive_natural(tick);
 
@@ -22318,7 +23480,10 @@ mod mineshaft_runtime_tests {
         let _snap = RuntimeSnapshot::take();
         DIFFICULTY.store(2, Ordering::Relaxed);
         WORLD_TIME.store(6000, Ordering::Relaxed);
-        forceloaded().lock().unwrap_or_else(|e| e.into_inner()).insert((0, 0));
+        forceloaded()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert((0, 0));
         refresh_hot();
 
         // Carve an enclosed underground stone chamber well below surface terrain height (y >= 8)
@@ -22341,49 +23506,83 @@ mod mineshaft_runtime_tests {
                 crate::nbt::Tag::Short(2),
             );
         }
-        generated_content().lock().unwrap_or_else(|e| e.into_inner()).spawners.insert((0, -20, 0), sp_nbt);
+        generated_content()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .spawners
+            .insert((0, -20, 0), sp_nbt);
 
         let (client, mut receiver) = effect_tests::client_pair();
         *client.pos.lock().unwrap_or_else(|e| e.into_inner()) = (6.5, -20.0, 0.5, 0.0, 0.0, true);
         *client.gm.lock().unwrap_or_else(|e| e.into_inner()) = 0;
         let client = Arc::new(client);
-        clients().lock().unwrap_or_else(|e| e.into_inner()).push(client.clone());
+        clients()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .push(client.clone());
 
         // Delay 2 -> 1 -> 0 -> fire on 3rd tick
         game_tick(|_, tick| tick());
         assert_eq!(
-            generated_content().lock().unwrap_or_else(|e| e.into_inner()).spawners[&(0, -20, 0)]
+            generated_content()
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .spawners[&(0, -20, 0)]
                 .get("Delay")
-                .and_then(|t| match t { crate::nbt::Tag::Short(v) => Some(*v), _ => None }),
+                .and_then(|t| match t {
+                    crate::nbt::Tag::Short(v) => Some(*v),
+                    _ => None,
+                }),
             Some(1)
         );
         assert!(mobs().lock().unwrap_or_else(|e| e.into_inner()).is_empty());
 
         game_tick(|_, tick| tick());
         assert_eq!(
-            generated_content().lock().unwrap_or_else(|e| e.into_inner()).spawners[&(0, -20, 0)]
+            generated_content()
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .spawners[&(0, -20, 0)]
                 .get("Delay")
-                .and_then(|t| match t { crate::nbt::Tag::Short(v) => Some(*v), _ => None }),
+                .and_then(|t| match t {
+                    crate::nbt::Tag::Short(v) => Some(*v),
+                    _ => None,
+                }),
             Some(0)
         );
 
         let cave_spider = name_to_etype("cave_spider").unwrap();
         let mut spawned = false;
         for _ in 0..8 {
-            if let crate::nbt::Tag::Compound(ref mut f) =
-                generated_content().lock().unwrap_or_else(|e| e.into_inner()).spawners.get_mut(&(0, -20, 0)).unwrap()
+            if let crate::nbt::Tag::Compound(ref mut f) = generated_content()
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .spawners
+                .get_mut(&(0, -20, 0))
+                .unwrap()
             {
                 if !spawned {
-                    f.insert(crate::nbt::NbtString::text("Delay"), crate::nbt::Tag::Short(0));
+                    f.insert(
+                        crate::nbt::NbtString::text("Delay"),
+                        crate::nbt::Tag::Short(0),
+                    );
                 }
             }
             game_tick(|_, tick| tick());
-            if mobs().lock().unwrap_or_else(|e| e.into_inner()).iter().any(|m| m.etype == cave_spider) {
+            if mobs()
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .iter()
+                .any(|m| m.etype == cave_spider)
+            {
                 spawned = true;
                 break;
             }
         }
-        assert!(spawned, "spawner in dark enclosed chamber should insert cave_spider");
+        assert!(
+            spawned,
+            "spawner in dark enclosed chamber should insert cave_spider"
+        );
         let spider_hp = mobs()
             .lock()
             .unwrap()
@@ -22392,38 +23591,79 @@ mod mineshaft_runtime_tests {
             .map(|m| *m.hp.lock().unwrap_or_else(|e| e.into_inner()))
             .unwrap();
         assert_eq!(spider_hp, 12.0);
-        let reset_delay = generated_content().lock().unwrap_or_else(|e| e.into_inner()).spawners[&(0, -20, 0)]
+        let reset_delay = generated_content()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .spawners[&(0, -20, 0)]
             .get("Delay")
-            .and_then(|t| match t { crate::nbt::Tag::Short(v) => Some(*v), _ => None })
+            .and_then(|t| match t {
+                crate::nbt::Tag::Short(v) => Some(*v),
+                _ => None,
+            })
             .unwrap();
-        assert!((200..=800).contains(&reset_delay), "unexpected reset Delay={reset_delay}");
+        assert!(
+            (200..=800).contains(&reset_delay),
+            "unexpected reset Delay={reset_delay}"
+        );
 
         // Check world event 2004 packet sent to nearby player.
-        let _ = client.sock.lock().unwrap_or_else(|e| e.into_inner()).shutdown(Shutdown::Write);
+        let _ = client
+            .sock
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .shutdown(Shutdown::Write);
         let mut got_2004 = false;
-        while let Some((pid, body)) = read_packet(&mut receiver, Instant::now() + Duration::from_secs(1)) {
-            if pid == 0x28 && body.len() >= 4 && i32::from_be_bytes(body[..4].try_into().unwrap()) == 2004 {
+        while let Some((pid, body)) =
+            read_packet(&mut receiver, Instant::now() + Duration::from_secs(1))
+        {
+            if pid == 0x28
+                && body.len() >= 4
+                && i32::from_be_bytes(body[..4].try_into().unwrap()) == 2004
+            {
                 got_2004 = true;
                 break;
             }
         }
-        assert!(got_2004, "spawner spawn should broadcast 0x28 world event 2004");
+        assert!(
+            got_2004,
+            "spawner spawn should broadcast 0x28 world event 2004"
+        );
 
         // Save/load preserves mutated Delay and spawned cave spiders.
         let mut saved = Vec::new();
         save_world_into(&mut saved);
-        let spider_count_before = mobs().lock().unwrap_or_else(|e| e.into_inner()).iter().filter(|m| m.etype == cave_spider).count();
+        let spider_count_before = mobs()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .iter()
+            .filter(|m| m.etype == cave_spider)
+            .count();
         mobs().lock().unwrap_or_else(|e| e.into_inner()).clear();
-        generated_content().lock().unwrap_or_else(|e| e.into_inner()).spawners.clear();
+        generated_content()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .spawners
+            .clear();
         load_world_from(&saved).unwrap();
         assert_eq!(
-            generated_content().lock().unwrap_or_else(|e| e.into_inner()).spawners[&(0, -20, 0)]
+            generated_content()
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .spawners[&(0, -20, 0)]
                 .get("Delay")
-                .and_then(|t| match t { crate::nbt::Tag::Short(v) => Some(*v), _ => None }),
+                .and_then(|t| match t {
+                    crate::nbt::Tag::Short(v) => Some(*v),
+                    _ => None,
+                }),
             Some(reset_delay)
         );
         assert_eq!(
-            mobs().lock().unwrap_or_else(|e| e.into_inner()).iter().filter(|m| m.etype == cave_spider).count(),
+            mobs()
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .iter()
+                .filter(|m| m.etype == cave_spider)
+                .count(),
             spider_count_before
         );
 
@@ -22431,63 +23671,102 @@ mod mineshaft_runtime_tests {
         mobs().lock().unwrap_or_else(|e| e.into_inner()).clear();
         let torch = name_to_state("torch").unwrap();
         set_block(0, -19, 0, torch);
-        if let crate::nbt::Tag::Compound(ref mut f) =
-            generated_content().lock().unwrap_or_else(|e| e.into_inner()).spawners.get_mut(&(0, -20, 0)).unwrap()
+        if let crate::nbt::Tag::Compound(ref mut f) = generated_content()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .spawners
+            .get_mut(&(0, -20, 0))
+            .unwrap()
         {
-            f.insert(crate::nbt::NbtString::text("Delay"), crate::nbt::Tag::Short(0));
+            f.insert(
+                crate::nbt::NbtString::text("Delay"),
+                crate::nbt::Tag::Short(0),
+            );
         }
         spawner_tick();
-        assert!(mobs().lock().unwrap_or_else(|e| e.into_inner()).is_empty(), "torch light must suppress cave spider spawn");
+        assert!(
+            mobs().lock().unwrap_or_else(|e| e.into_inner()).is_empty(),
+            "torch light must suppress cave spider spawn"
+        );
         assert_eq!(
-            generated_content().lock().unwrap_or_else(|e| e.into_inner()).spawners[&(0, -20, 0)]
+            generated_content()
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .spawners[&(0, -20, 0)]
                 .get("Delay")
-                .and_then(|t| match t { crate::nbt::Tag::Short(v) => Some(*v), _ => None }),
+                .and_then(|t| match t {
+                    crate::nbt::Tag::Short(v) => Some(*v),
+                    _ => None,
+                }),
             Some(0)
         );
         set_block(0, -19, 0, 0);
 
         // MaxNearbyEntities=6 cap prevents spawning above 6 and resets Delay.
         for i in 0..6 {
-            mobs().lock().unwrap_or_else(|e| e.into_inner()).push(Arc::new(Mob {
-                dim: DimId::Overworld,
-                eid: NEXT_EID.fetch_add(1, Ordering::SeqCst),
-                uuid: [i as u8 + 10; 16],
-                etype: cave_spider,
-                pos: Mutex::new((0.5, -20.0, 0.5, 0.0, 0.0)),
-                hp: Mutex::new(12.0),
-                last_hit: Mutex::new(Instant::now()),
-                hurt_at: Mutex::new(Instant::now()),
-                last_hurt_tick: Mutex::new(None),
-                vel: Mutex::new([0.0; 3]),
-                fuse: Mutex::new(0),
-                fire_ticks: Mutex::new(0),
-                love: Mutex::new(0),
-                air: Mutex::new(60),
-            }));
+            mobs()
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .push(Arc::new(Mob {
+                    dim: DimId::Overworld,
+                    eid: NEXT_EID.fetch_add(1, Ordering::SeqCst),
+                    uuid: [i as u8 + 10; 16],
+                    etype: cave_spider,
+                    pos: Mutex::new((0.5, -20.0, 0.5, 0.0, 0.0)),
+                    hp: Mutex::new(12.0),
+                    last_hit: Mutex::new(Instant::now()),
+                    hurt_at: Mutex::new(Instant::now()),
+                    last_hurt_tick: Mutex::new(None),
+                    vel: Mutex::new([0.0; 3]),
+                    fuse: Mutex::new(0),
+                    fire_ticks: Mutex::new(0),
+                    love: Mutex::new(0),
+                    air: Mutex::new(60),
+                }));
         }
-        if let crate::nbt::Tag::Compound(ref mut f) =
-            generated_content().lock().unwrap_or_else(|e| e.into_inner()).spawners.get_mut(&(0, -20, 0)).unwrap()
+        if let crate::nbt::Tag::Compound(ref mut f) = generated_content()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .spawners
+            .get_mut(&(0, -20, 0))
+            .unwrap()
         {
-            f.insert(crate::nbt::NbtString::text("Delay"), crate::nbt::Tag::Short(0));
+            f.insert(
+                crate::nbt::NbtString::text("Delay"),
+                crate::nbt::Tag::Short(0),
+            );
         }
         spawner_tick();
         assert_eq!(mobs().lock().unwrap_or_else(|e| e.into_inner()).len(), 6);
-        let cap_delay = generated_content().lock().unwrap_or_else(|e| e.into_inner()).spawners[&(0, -20, 0)]
+        let cap_delay = generated_content()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .spawners[&(0, -20, 0)]
             .get("Delay")
-            .and_then(|t| match t { crate::nbt::Tag::Short(v) => Some(*v), _ => None })
+            .and_then(|t| match t {
+                crate::nbt::Tag::Short(v) => Some(*v),
+                _ => None,
+            })
             .unwrap();
         assert!((200..=800).contains(&cap_delay));
 
         // Breaking the spawner block removes its owned NBT entry.
         set_block(0, -20, 0, 0);
-        assert!(!generated_content().lock().unwrap_or_else(|e| e.into_inner()).spawners.contains_key(&(0, -20, 0)));
+        assert!(!generated_content()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .spawners
+            .contains_key(&(0, -20, 0)));
     }
 
     #[test]
     fn cart_runtime_tick_motion_collision_comparator_tracker_and_persistence() {
         let _guard = world_guard();
         let _snap = RuntimeSnapshot::take();
-        forceloaded().lock().unwrap_or_else(|e| e.into_inner()).insert((0, 0));
+        forceloaded()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert((0, 0));
         refresh_hot();
 
         let reg = crate::block_registry::breg().unwrap();
@@ -22500,7 +23779,10 @@ mod mineshaft_runtime_tests {
         let powered_east = reg
             .checked_state(
                 "minecraft:powered_rail",
-                &[("powered".into(), "true".into()), ("shape".into(), "east_west".into())],
+                &[
+                    ("powered".into(), "true".into()),
+                    ("shape".into(), "east_west".into()),
+                ],
             )
             .unwrap();
         let rail_east = reg
@@ -22517,32 +23799,52 @@ mod mineshaft_runtime_tests {
             crate::generation_payload::GenerationPayload::ChestMinecart { loot_seed: 1 },
         )]);
         let cart_eid = {
-            let mut gen = generated_content().lock().unwrap_or_else(|e| e.into_inner());
+            let mut gen = generated_content()
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
             gen.carts[0].set_pos([0.5, 70.0625, 0.5]);
             gen.carts[0].eid
         };
 
         let (client, mut receiver) = effect_tests::client_pair();
         *client.pos.lock().unwrap_or_else(|e| e.into_inner()) = (2.0, 70.0, 0.5, 0.0, 0.0, true);
-        client.chunks.lock().unwrap_or_else(|e| e.into_inner()).insert((0, 0));
+        client
+            .chunks
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert((0, 0));
         let client = Arc::new(client);
-        clients().lock().unwrap_or_else(|e| e.into_inner()).push(client.clone());
+        clients()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .push(client.clone());
 
         // Interest pass sends spawn packet; 2 game_ticks advance powered cart (tick 1 boosts vel=0.02, tick 2 moves east) and broadcast 0x70 + 0x5a.
         interest_tick();
         game_tick(|_, tick| tick());
         game_tick(|_, tick| tick());
         let (pos1, vel1) = {
-            let gen = generated_content().lock().unwrap_or_else(|e| e.into_inner());
+            let gen = generated_content()
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
             (gen.carts[0].pos().unwrap(), gen.carts[0].motion())
         };
-        assert!(pos1[0] > 0.5 && vel1[0] > 0.0, "powered rail with conductor must launch cart east: pos={pos1:?} vel={vel1:?}");
+        assert!(
+            pos1[0] > 0.5 && vel1[0] > 0.0,
+            "powered rail with conductor must launch cart east: pos={pos1:?} vel={vel1:?}"
+        );
 
-        let _ = client.sock.lock().unwrap_or_else(|e| e.into_inner()).shutdown(Shutdown::Write);
+        let _ = client
+            .sock
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .shutdown(Shutdown::Write);
         let mut saw_spawn = false;
         let mut saw_teleport = false;
         let mut saw_velocity = false;
-        while let Some((pid, body)) = read_packet(&mut receiver, Instant::now() + Duration::from_secs(1)) {
+        while let Some((pid, body)) =
+            read_packet(&mut receiver, Instant::now() + Duration::from_secs(1))
+        {
             if pid == 0x01 && !body.is_empty() {
                 saw_spawn = true;
             } else if pid == 0x70 && read_varint(&mut &body[..]) == Some(cart_eid as i64) {
@@ -22551,14 +23853,25 @@ mod mineshaft_runtime_tests {
                 saw_velocity = true;
             }
         }
-        assert!(saw_spawn && saw_teleport && saw_velocity, "tracker packets missing: spawn={saw_spawn} tp={saw_teleport} vel={saw_velocity}");
+        assert!(
+            saw_spawn && saw_teleport && saw_velocity,
+            "tracker packets missing: spawn={saw_spawn} tp={saw_teleport} vel={saw_velocity}"
+        );
 
         // Save/load preserves updated Pos and Motion, and spawn packet reflects motion.
         let mut saved = Vec::new();
         save_world_into(&mut saved);
-        generated_content().lock().unwrap_or_else(|e| e.into_inner()).carts.clear();
+        generated_content()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .carts
+            .clear();
         load_world_from(&saved).unwrap();
-        let reloaded = generated_content().lock().unwrap_or_else(|e| e.into_inner()).carts[0].clone();
+        let reloaded = generated_content()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .carts[0]
+            .clone();
         assert_eq!(reloaded.pos().unwrap(), pos1);
         assert_eq!(reloaded.motion(), vel1);
         let spawn_bytes = spawn_generated_cart(&reloaded);
@@ -22582,7 +23895,9 @@ mod mineshaft_runtime_tests {
                 .unwrap()
                 .insert(ContainerKey::Cart(uuid_c), full_slots);
 
-            let mut gen = generated_content().lock().unwrap_or_else(|e| e.into_inner());
+            let mut gen = generated_content()
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
             gen.carts.clear();
             let mut pending = generated_content::Cart::new(1001, uuid_a, (2, 70, 0), 1);
             pending.set_pos([2.5, 70.0625, 0.5]);
@@ -22601,35 +23916,55 @@ mod mineshaft_runtime_tests {
         }
         cart_tick();
         let (v_pending, v_empty, v_full) = {
-            let gen = generated_content().lock().unwrap_or_else(|e| e.into_inner());
+            let gen = generated_content()
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
             (
                 gen.carts[0].motion()[0],
                 gen.carts[1].motion()[0],
                 gen.carts[2].motion()[0],
             )
         };
-        assert!(v_empty > v_pending, "empty unpacked cart should preserve more speed ({v_empty} vs {v_pending})");
-        assert!(v_empty > v_full, "empty unpacked cart should outrun full unpacked cart ({v_empty} vs {v_full})");
-        assert!((v_full - v_pending).abs() < 1e-9, "full unpacked cart (signal=15) matches pending drag ({v_full} vs {v_pending})");
+        assert!(
+            v_empty > v_pending,
+            "empty unpacked cart should preserve more speed ({v_empty} vs {v_pending})"
+        );
+        assert!(
+            v_empty > v_full,
+            "empty unpacked cart should outrun full unpacked cart ({v_empty} vs {v_full})"
+        );
+        assert!(
+            (v_full - v_pending).abs() < 1e-9,
+            "full unpacked cart (signal=15) matches pending drag ({v_full} vs {v_pending})"
+        );
 
         // Obstacle collision stops cart along track.
         set_block(5, 70, 0, stone);
         {
-            let mut gen = generated_content().lock().unwrap_or_else(|e| e.into_inner());
+            let mut gen = generated_content()
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
             gen.carts.truncate(1);
             gen.carts[0].set_pos([4.45, 70.0625, 0.5]);
             gen.carts[0].set_motion([0.3, 0.0, 0.0]);
         }
         cart_tick();
         let (obs_pos, obs_vel) = {
-            let gen = generated_content().lock().unwrap_or_else(|e| e.into_inner());
+            let gen = generated_content()
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
             (gen.carts[0].pos().unwrap(), gen.carts[0].motion())
         };
-        assert!(obs_pos[0] <= 4.5101 && obs_vel[0] == 0.0, "obstacle should halt cart: pos={obs_pos:?} vel={obs_vel:?}");
+        assert!(
+            obs_pos[0] <= 4.5101 && obs_vel[0] == 0.0,
+            "obstacle should halt cart: pos={obs_pos:?} vel={obs_vel:?}"
+        );
 
         // Off-rail gravity & ground slowdown.
         {
-            let mut gen = generated_content().lock().unwrap_or_else(|e| e.into_inner());
+            let mut gen = generated_content()
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
             gen.carts[0].set_pos([0.5, 70.05, 2.5]);
             gen.carts[0].set_motion([0.2, 0.0, 0.0]);
             gen.carts[0].set_on_ground(false);
@@ -22637,9 +23972,20 @@ mod mineshaft_runtime_tests {
         cart_tick();
         cart_tick();
         cart_tick();
-        let off = generated_content().lock().unwrap_or_else(|e| e.into_inner()).carts[0].clone();
-        assert!(off.on_ground(), "cart falling onto stone floor should set OnGround=true");
-        assert!(off.motion()[0] <= 0.11, "ground slowdown should damp horizontal motion: {:?}", off.motion());
+        let off = generated_content()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .carts[0]
+            .clone();
+        assert!(
+            off.on_ground(),
+            "cart falling onto stone floor should set OnGround=true"
+        );
+        assert!(
+            off.motion()[0] <= 0.11,
+            "ground slowdown should damp horizontal motion: {:?}",
+            off.motion()
+        );
     }
 
     /// An end-ship `Elytra` frame reaches the runtime as a hanging entity: the store
@@ -22650,7 +23996,10 @@ mod mineshaft_runtime_tests {
     fn item_frame_payloads_materialize_spawn_and_survive_a_save() {
         let _guard = world_guard();
         let _snap = RuntimeSnapshot::take();
-        forceloaded().lock().unwrap_or_else(|e| e.into_inner()).insert((0, 0));
+        forceloaded()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert((0, 0));
         refresh_hot();
 
         materialize_generation_payloads_inner(vec![
@@ -22671,7 +24020,11 @@ mod mineshaft_runtime_tests {
                 },
             ),
         ]);
-        let frames = generated_content().lock().unwrap_or_else(|e| e.into_inner()).frames.clone();
+        let frames = generated_content()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .frames
+            .clone();
         assert_eq!(frames.len(), 2);
         assert_eq!(frames[0].pos().unwrap(), [4.5, 70.5, 4.5]);
         assert_eq!(frames[0].facing().unwrap(), 4);
@@ -22722,13 +24075,25 @@ mod mineshaft_runtime_tests {
         // A client in range is spawned the frame and sent its stack.
         let (client, mut receiver) = effect_tests::client_pair();
         *client.pos.lock().unwrap_or_else(|e| e.into_inner()) = (4.5, 70.0, 4.5, 0.0, 0.0, true);
-        client.chunks.lock().unwrap_or_else(|e| e.into_inner()).insert((0, 0));
+        client
+            .chunks
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert((0, 0));
         let client = Arc::new(client);
-        clients().lock().unwrap_or_else(|e| e.into_inner()).push(client.clone());
+        clients()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .push(client.clone());
         interest_tick();
-        let _ = client.sock.lock().unwrap_or_else(|e| e.into_inner()).shutdown(Shutdown::Write);
+        let _ = client
+            .sock
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .shutdown(Shutdown::Write);
         let (mut saw_spawn, mut saw_data, mut spawn_data) = (false, false, 0i64);
-        while let Some((pid, body)) = read_packet(&mut receiver, Instant::now() + Duration::from_secs(1))
+        while let Some((pid, body)) =
+            read_packet(&mut receiver, Instant::now() + Duration::from_secs(1))
         {
             if pid == 0x01 {
                 let (spawned, p) = read_varint_at(&body, 0);
@@ -22746,15 +24111,26 @@ mod mineshaft_runtime_tests {
                 }
             }
         }
-        assert!(saw_spawn && saw_data, "tracker sent spawn={saw_spawn} data={saw_data}");
+        assert!(
+            saw_spawn && saw_data,
+            "tracker sent spawn={saw_spawn} data={saw_data}"
+        );
         assert_eq!(spawn_data, 4, "the object data survives the tracker");
 
         // The generated-content section carries the frames across a save and load.
         let mut saved = Vec::new();
         save_world_into(&mut saved);
-        generated_content().lock().unwrap_or_else(|e| e.into_inner()).frames.clear();
+        generated_content()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .frames
+            .clear();
         load_world_from(&saved).unwrap();
-        let reloaded = generated_content().lock().unwrap_or_else(|e| e.into_inner()).frames.clone();
+        let reloaded = generated_content()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .frames
+            .clone();
         assert_eq!(reloaded.len(), 2);
         assert_eq!(reloaded[0].pos().unwrap(), [4.5, 70.5, 4.5]);
         assert_eq!(reloaded[0].facing().unwrap(), 4);
@@ -22777,24 +24153,47 @@ mod mineshaft_runtime_tests {
     fn spawner_entity_and_mob_payloads_materialize_and_tick_fails_closed() {
         let _guard = world_guard();
         let _snap = RuntimeSnapshot::take();
-        forceloaded().lock().unwrap_or_else(|e| e.into_inner()).insert((0, 0));
+        forceloaded()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert((0, 0));
         refresh_hot();
 
         let (client, _receiver) = effect_tests::client_pair();
         *client.pos.lock().unwrap_or_else(|e| e.into_inner()) = (0.5, 64.0, 0.5, 0.0, 0.0, true);
         *client.gm.lock().unwrap_or_else(|e| e.into_inner()) = 0;
-        clients().lock().unwrap_or_else(|e| e.into_inner()).push(Arc::new(client));
+        clients()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .push(Arc::new(client));
 
         // Direct spawner::tick accepts the general 1.21.1 monster mobs and
         // still refuses an entity id outside them without panicking.
         struct DummySpawnerWorld;
         impl spawner::World for DummySpawnerWorld {
-            fn active(&mut self, _: BlockPos, _: i32) -> bool { true }
-            fn no_collision(&mut self, _: [f64; 3]) -> bool { true }
-            fn rules(&mut self, _: [f64; 3], _: Option<spawner::LightRules>, _: &mut generation_math::Lcg) -> bool { true }
-            fn nearby(&mut self, _: BlockPos, _: i32) -> usize { 0 }
-            fn unobstructed(&mut self, _: [f64; 3]) -> bool { true }
-            fn insert(&mut self, _: [f64; 3], _: f32) -> bool { true }
+            fn active(&mut self, _: BlockPos, _: i32) -> bool {
+                true
+            }
+            fn no_collision(&mut self, _: [f64; 3]) -> bool {
+                true
+            }
+            fn rules(
+                &mut self,
+                _: [f64; 3],
+                _: Option<spawner::LightRules>,
+                _: &mut generation_math::Lcg,
+            ) -> bool {
+                true
+            }
+            fn nearby(&mut self, _: BlockPos, _: i32) -> usize {
+                0
+            }
+            fn unobstructed(&mut self, _: [f64; 3]) -> bool {
+                true
+            }
+            fn insert(&mut self, _: [f64; 3], _: f32) -> bool {
+                true
+            }
             fn effects(&mut self, _: BlockPos, _: [f64; 3]) {}
         }
         let mut rng = generation_math::Lcg::new(7);
@@ -22802,13 +24201,20 @@ mod mineshaft_runtime_tests {
         for id in ["minecraft:blaze", "minecraft:silverfish"] {
             let mut tag = generated_content::spawner_nbt_for((0, 64, 0), id);
             if let crate::nbt::Tag::Compound(ref mut map) = tag {
-                map.insert(crate::nbt::NbtString::text("Delay"), crate::nbt::Tag::Short(0));
+                map.insert(
+                    crate::nbt::NbtString::text("Delay"),
+                    crate::nbt::Tag::Short(0),
+                );
             }
             assert!(spawner::tick(&mut tag, (0, 64, 0), &mut dummy, &mut rng).is_ok());
         }
-        let mut unsupported = generated_content::spawner_nbt_for((0, 64, 0), "minecraft:unknown_mob");
+        let mut unsupported =
+            generated_content::spawner_nbt_for((0, 64, 0), "minecraft:unknown_mob");
         if let crate::nbt::Tag::Compound(ref mut map) = unsupported {
-            map.insert(crate::nbt::NbtString::text("Delay"), crate::nbt::Tag::Short(0));
+            map.insert(
+                crate::nbt::NbtString::text("Delay"),
+                crate::nbt::Tag::Short(0),
+            );
         }
         assert!(spawner::tick(&mut unsupported, (0, 64, 0), &mut dummy, &mut rng).is_err());
 
@@ -22816,11 +24222,15 @@ mod mineshaft_runtime_tests {
         let mut payloads = vec![
             (
                 (1, 64, 2),
-                crate::generation_payload::GenerationPayload::SpawnerEntity("minecraft:blaze".to_owned()),
+                crate::generation_payload::GenerationPayload::SpawnerEntity(
+                    "minecraft:blaze".to_owned(),
+                ),
             ),
             (
                 (3, 64, 4),
-                crate::generation_payload::GenerationPayload::SpawnerEntity("minecraft:silverfish".to_owned()),
+                crate::generation_payload::GenerationPayload::SpawnerEntity(
+                    "minecraft:silverfish".to_owned(),
+                ),
             ),
         ];
         let expected_mobs = [
@@ -22858,9 +24268,17 @@ mod mineshaft_runtime_tests {
         assert_eq!(block_at(1, 64, 2), spawner_state);
         assert_eq!(block_at(3, 64, 4), spawner_state);
         {
-            let mut gen = generated_content().lock().unwrap_or_else(|e| e.into_inner());
-            for (pos, expected_id) in [((1, 64, 2), "minecraft:blaze"), ((3, 64, 4), "minecraft:silverfish")] {
-                let tag = gen.spawners.get_mut(&pos).expect("materialized spawner NBT");
+            let mut gen = generated_content()
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            for (pos, expected_id) in [
+                ((1, 64, 2), "minecraft:blaze"),
+                ((3, 64, 4), "minecraft:silverfish"),
+            ] {
+                let tag = gen
+                    .spawners
+                    .get_mut(&pos)
+                    .expect("materialized spawner NBT");
                 let spawn_id = tag
                     .get("SpawnData")
                     .and_then(|d| d.get("entity"))
@@ -22868,7 +24286,10 @@ mod mineshaft_runtime_tests {
                     .and_then(crate::nbt::Tag::string);
                 assert_eq!(spawn_id, Some(&crate::nbt::NbtString::text(expected_id)));
                 if let crate::nbt::Tag::Compound(ref mut map) = tag {
-                    map.insert(crate::nbt::NbtString::text("Delay"), crate::nbt::Tag::Short(0));
+                    map.insert(
+                        crate::nbt::NbtString::text("Delay"),
+                        crate::nbt::Tag::Short(0),
+                    );
                 }
             }
         }
@@ -22879,8 +24300,14 @@ mod mineshaft_runtime_tests {
         assert_eq!(ms.len(), expected_mobs.len());
         for (i, (id, expected_hp)) in expected_mobs.iter().enumerate() {
             let etype = name_to_etype(id).unwrap();
-            let mob = ms.iter().find(|m| m.etype == etype).expect("materialized mob");
-            assert_eq!(*mob.hp.lock().unwrap_or_else(|e| e.into_inner()), *expected_hp);
+            let mob = ms
+                .iter()
+                .find(|m| m.etype == etype)
+                .expect("materialized mob");
+            assert_eq!(
+                *mob.hp.lock().unwrap_or_else(|e| e.into_inner()),
+                *expected_hp
+            );
             let p = *mob.pos.lock().unwrap_or_else(|e| e.into_inner());
             assert_eq!(p, (i as f64 + 0.5, 65.0, 5.5, 90.0, 0.0));
         }
@@ -22916,7 +24343,10 @@ mod mineshaft_runtime_tests {
                 yaw: 0.0,
             },
         )]);
-        assert_eq!(mobs().lock().unwrap_or_else(|e| e.into_inner()).len(), MOB_CAP);
+        assert_eq!(
+            mobs().lock().unwrap_or_else(|e| e.into_inner()).len(),
+            MOB_CAP
+        );
     }
 }
 
@@ -22935,7 +24365,11 @@ mod dim_block_entity_invalidation_tests {
         #[cfg_attr(not(megu_vanilla_data), allow(dead_code))]
         fn take() -> Self {
             Self {
-                store: std::mem::take(&mut *live_block_entities().lock().unwrap_or_else(|e| e.into_inner())),
+                store: std::mem::take(
+                    &mut *live_block_entities()
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner()),
+                ),
                 cells: Vec::new(),
                 signs: Vec::new(),
             }
@@ -22953,7 +24387,9 @@ mod dim_block_entity_invalidation_tests {
                     store.remove(key);
                 }
             }
-            *live_block_entities().lock().unwrap_or_else(|e| e.into_inner()) = std::mem::take(&mut self.store);
+            *live_block_entities()
+                .lock()
+                .unwrap_or_else(|e| e.into_inner()) = std::mem::take(&mut self.store);
         }
     }
 
@@ -22997,7 +24433,12 @@ mod dim_block_entity_invalidation_tests {
             restore.signs.push(sign_key);
             signs().lock().unwrap_or_else(|e| e.into_inner()).insert(
                 sign_key,
-                ["text".to_owned(), String::new(), String::new(), String::new()],
+                [
+                    "text".to_owned(),
+                    String::new(),
+                    String::new(),
+                    String::new(),
+                ],
             );
         }
 
@@ -23032,8 +24473,7 @@ mod wire_ops_tests {
     }
 
     fn wire_ops_dir(tag: &str) -> std::path::PathBuf {
-        let dir = std::env::temp_dir()
-            .join(format!("megu-wire-ops-{tag}-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("megu-wire-ops-{tag}-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         dir
@@ -23070,12 +24510,9 @@ mod wire_ops_tests {
         game_tick(|_, tick| tick());
         let last_us = {
             let profiler = wire_lock(live_hotspot_profiler());
-            assert_eq!(
-                profiler.ring_next,
-                (before + 1) % PROFILER_RING_CAPACITY
-            );
-            profiler.ring[(profiler.ring_next + PROFILER_RING_CAPACITY - 1)
-                % PROFILER_RING_CAPACITY]
+            assert_eq!(profiler.ring_next, (before + 1) % PROFILER_RING_CAPACITY);
+            profiler.ring
+                [(profiler.ring_next + PROFILER_RING_CAPACITY - 1) % PROFILER_RING_CAPACITY]
         };
         assert_eq!(ac_last_tick_ms(), last_us / 1000);
     }
@@ -23193,8 +24630,8 @@ mod ultra_disk_5_tests {
     }
 
     fn d5_dir(tag: &str) -> std::path::PathBuf {
-        let dir = std::env::temp_dir()
-            .join(format!("megu-ultra-disk-5-{tag}-{}", std::process::id()));
+        let dir =
+            std::env::temp_dir().join(format!("megu-ultra-disk-5-{tag}-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         dir
@@ -23345,10 +24782,7 @@ mod ultra_disk_5_tests {
             d5_lock(per_tick_wal_buffer()).is_empty(),
             "a full buffer auto-flushes at the cap"
         );
-        assert_eq!(
-            WAL_BATCH_FLUSHES.load(Ordering::Relaxed),
-            flushes0 + 2
-        );
+        assert_eq!(WAL_BATCH_FLUSHES.load(Ordering::Relaxed), flushes0 + 2);
 
         // A checkpointed save drains pending frames before the marker: an
         // unflushed edit followed by a save leaves an empty post-marker log.
@@ -23377,7 +24811,10 @@ mod ultra_disk_5_tests {
         let old_min = backup_rotate_min_ticks();
         // Reset global rotation state so earlier tests' rotations cannot
         // suppress this one's interval window.
-        backup_last_digests().lock().unwrap_or_else(|e| e.into_inner()).clear();
+        backup_last_digests()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clear();
         LAST_BACKUP_ROTATE_TICK.store(0, Ordering::Relaxed);
         set_backup_rotate_min_ticks(6000);
         std::env::set_var("MEGU_BACKUP_MAX_KEEP", "3");
@@ -23388,9 +24825,8 @@ mod ultra_disk_5_tests {
             companions: [(DimId::Nether, None), (DimId::End, None)],
             create_factory: None,
         };
-        let count_baks = |dir: &std::path::Path| {
-            std::fs::read_dir(dir).map(|rd| rd.count()).unwrap_or(0)
-        };
+        let count_baks =
+            |dir: &std::path::Path| std::fs::read_dir(dir).map(|rd| rd.count()).unwrap_or(0);
 
         // First rotation lands the newest generation.
         rotate_save_backups(&dir, &snapshot_of(1), false);
@@ -23437,7 +24873,10 @@ mod ultra_disk_5_tests {
             None => std::env::remove_var("MEGU_BACKUP_MAX_KEEP"),
         }
         set_backup_rotate_min_ticks(old_min);
-        backup_last_digests().lock().unwrap_or_else(|e| e.into_inner()).clear();
+        backup_last_digests()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clear();
         LAST_BACKUP_ROTATE_TICK.store(0, Ordering::Relaxed);
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -23601,11 +25040,7 @@ mod p8a_parity_tests {
             let mut chests = p8a_lock(chests());
             chests.insert(
                 key_nether,
-                HashMap::from([
-                    (0i16, stack.clone()),
-                    (1, stack.clone()),
-                    (2, stack),
-                ]),
+                HashMap::from([(0i16, stack.clone()), (1, stack.clone()), (2, stack)]),
             )
         };
         let prev_ow = p8a_lock(chests()).insert(key_ow, HashMap::new());
@@ -23662,8 +25097,16 @@ mod p8a_parity_tests {
                 }
             }
         }
-        assert_eq!(nether_signal, Some(2), "Nether comparator reads Nether chest");
-        assert_eq!(ow_signal, Some(0), "Overworld comparator reads Overworld chest");
+        assert_eq!(
+            nether_signal,
+            Some(2),
+            "Nether comparator reads Nether chest"
+        );
+        assert_eq!(
+            ow_signal,
+            Some(0),
+            "Overworld comparator reads Overworld chest"
+        );
     }
 
     /// #104: the chunk heightmap compound carries both `MOTION_BLOCKING` and
@@ -23875,9 +25318,7 @@ mod w3_live_wire_tests {
     /// registered in the live tick loop, without letting the whole world tick.
     fn run_tick_stage(stage: &'static str) {
         {
-            let mut ctl = tick_controller()
-                .lock()
-                .unwrap_or_else(|e| e.into_inner());
+            let mut ctl = tick_controller().lock().unwrap_or_else(|e| e.into_inner());
             ctl.frozen = false;
             ctl.step_remaining = 0;
             ctl.sprint_remaining = 0;
@@ -23952,12 +25393,10 @@ mod w3_live_wire_tests {
         );
         let mut fire = CampfireBlockEntity::default();
         assert!(fire.place("beef", 1).is_some());
-        assert!(register_world_block_entity(
-            dim,
-            fire_pos,
-            VanillaBlockEntity::Campfire(fire),
-        )
-        .is_none());
+        assert!(
+            register_world_block_entity(dim, fire_pos, VanillaBlockEntity::Campfire(fire),)
+                .is_none()
+        );
         assert!(register_world_block_entity(
             dim,
             box_pos,
@@ -24031,8 +25470,14 @@ mod w3_live_wire_tests {
         .is_none());
         let (mut client, _receiver) = crate::effect_tests::client_pair();
         client.eid = 0x7A33;
-        *client.pos.lock().unwrap_or_else(|e| e.into_inner()) =
-            (f64::from(pos.0) + 1.5, f64::from(pos.1) + 2.0, f64::from(pos.2) + 1.5, 0.0, 0.0, true);
+        *client.pos.lock().unwrap_or_else(|e| e.into_inner()) = (
+            f64::from(pos.0) + 1.5,
+            f64::from(pos.1) + 2.0,
+            f64::from(pos.2) + 1.5,
+            0.0,
+            0.0,
+            true,
+        );
         clients()
             .lock()
             .unwrap_or_else(|e| e.into_inner())
@@ -24072,8 +25517,7 @@ mod w3_live_wire_tests {
             "MEGU_ALLOW_CAVE_MAP",
             "MEGU_ALLOW_ENTITY_RADAR",
         ];
-        let saved_env: Vec<Option<std::ffi::OsString>> =
-            ENVS.iter().map(env::var_os).collect();
+        let saved_env: Vec<Option<std::ffi::OsString>> = ENVS.iter().map(env::var_os).collect();
         let saved_policy = live_server_policy()
             .lock()
             .unwrap_or_else(|e| e.into_inner())
@@ -24173,9 +25617,7 @@ mod w3_live_wire_tests {
         let entries: Vec<(u8, i32, i32)> = stats
             .counts
             .iter()
-            .map(|(&(category, stat_id), &value)| {
-                (category.id() as u8, stat_id, value)
-            })
+            .map(|(&(category, stat_id), &value)| (category.id() as u8, stat_id, value))
             .collect();
         let payload = encode_award_stats_0x04(&entries);
         assert_eq!(
@@ -24183,8 +25625,7 @@ mod w3_live_wire_tests {
             handle_client_stats_request(&stats),
             "the live handler must emit the same award_stats payload"
         );
-        let decoded =
-            decode_award_stats(&mut &payload[..]).expect("valid 0x04 payload");
+        let decoded = decode_award_stats(&mut &payload[..]).expect("valid 0x04 payload");
         assert_eq!(decoded.counts, stats.counts);
     }
 }
@@ -24216,7 +25657,13 @@ mod vanilla_leash_tests {
     }
 
     fn vl_spawn_mob(etype: i64, pos: (f64, f64, f64)) -> Arc<Mob> {
-        let mob = new_live_mob(etype, DimId::Overworld, (pos.0, pos.1, pos.2, 0.0, 0.0), 8.0, None);
+        let mob = new_live_mob(
+            etype,
+            DimId::Overworld,
+            (pos.0, pos.1, pos.2, 0.0, 0.0),
+            8.0,
+            None,
+        );
         mobs()
             .lock()
             .unwrap_or_else(|e| e.into_inner())
@@ -24266,10 +25713,7 @@ mod vanilla_leash_tests {
                 .lock()
                 .unwrap_or_else(|e| e.into_inner())
                 .clear();
-            drops()
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
-                .clear();
+            drops().lock().unwrap_or_else(|e| e.into_inner()).clear();
             let mut cls = clients().lock().unwrap_or_else(|e| e.into_inner());
             for &eid in &self.client_eids {
                 cls.retain(|c| c.eid != eid);
@@ -24354,7 +25798,10 @@ mod vanilla_leash_tests {
                 "elastic pull must move the mob 0.4 blocks, got z={}",
                 p.2
             );
-            assert_eq!(*mob.vel.lock().unwrap_or_else(|e| e.into_inner()), [0.0, 0.0, -0.4]);
+            assert_eq!(
+                *mob.vel.lock().unwrap_or_else(|e| e.into_inner()),
+                [0.0, 0.0, -0.4]
+            );
         }
         let (id, _) = vl_read(&mut peer); // 0x70 teleport for the pull
         assert_eq!(id, 0x70);
@@ -24372,9 +25819,7 @@ mod vanilla_leash_tests {
         assert_eq!(ds.len(), 1);
         assert_eq!((ds[0].item, ds[0].cnt), (lead, 1));
         assert!(
-            (ds[0].x - 0.0).abs() <= 1.6
-                && (ds[0].z - 11.0).abs() <= 1.6
-                && ds[0].y == 70.0,
+            (ds[0].x - 0.0).abs() <= 1.6 && (ds[0].z - 11.0).abs() <= 1.6 && ds[0].y == 70.0,
             "leash drop scatters within spawnAtLocation reach, got {:?}",
             (ds[0].x, ds[0].y, ds[0].z)
         );
@@ -24407,15 +25852,16 @@ mod vanilla_leash_tests {
         tether_tick();
         // 20 > 14, non-breaking: pulled onto the 14-block sphere, still held.
         let p = *mob.pos.lock().unwrap_or_else(|e| e.into_inner());
-        assert!((p.0 - 14.0).abs() < 1e-9, "clamped to max_length, x={}", p.0);
+        assert!(
+            (p.0 - 14.0).abs() < 1e-9,
+            "clamped to max_length, x={}",
+            p.0
+        );
         assert!(entity_tethers()
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .contains_key(&mob.eid));
-        assert!(drops()
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .is_empty());
+        assert!(drops().lock().unwrap_or_else(|e| e.into_inner()).is_empty());
         // A second tick at exactly max_length leaves the tether intact.
         tether_tick();
         assert!(entity_tethers()
@@ -24449,7 +25895,11 @@ mod vanilla_leash_tests {
 
         // Hitch to a fence: one knot entity is created at the block and the
         // tether re-anchors to it on the wire.
-        assert!(hitch_player_tethers(client.eid, DimId::Overworld, (5, 70, 5)));
+        assert!(hitch_player_tethers(
+            client.eid,
+            DimId::Overworld,
+            (5, 70, 5)
+        ));
         let knot = knot_eid_at(DimId::Overworld, (5, 70, 5)).expect("knot spawned");
         client
             .seen
@@ -24477,7 +25927,11 @@ mod vanilla_leash_tests {
             TetherAnchor::Entity(client.eid),
         ));
         let _ = vl_read(&mut peer);
-        assert!(hitch_player_tethers(client.eid, DimId::Overworld, (5, 70, 5)));
+        assert!(hitch_player_tethers(
+            client.eid,
+            DimId::Overworld,
+            (5, 70, 5)
+        ));
         assert_eq!(knot_eid_at(DimId::Overworld, (5, 70, 5)), Some(knot));
         let _ = vl_read(&mut peer); // re-anchor 0x59
 
@@ -24489,10 +25943,7 @@ mod vanilla_leash_tests {
             .unwrap_or_else(|e| e.into_inner())
             .is_empty());
         assert_eq!(vl_read(&mut peer), (0x59, set_entity_link_pkt(mob.eid, -1)));
-        assert_eq!(
-            vl_read(&mut peer),
-            (0x42, remove_entities_payload(&[knot]))
-        );
+        assert_eq!(vl_read(&mut peer), (0x42, remove_entities_payload(&[knot])));
         let ds = drops().lock().unwrap_or_else(|e| e.into_inner());
         assert_eq!(ds.len(), 1);
         assert_eq!(ds[0].item, name_to_item("lead").unwrap());
@@ -24741,8 +26192,14 @@ mod mega_w2_tests {
         set_block_dim(dim, bx, by, bz, sign);
         set_block_dim(dim, bx, by, bz, 0); // break the sign block
         let store = signs().lock().unwrap_or_else(|e| e.into_inner());
-        assert!(!store.contains_key(&(dim, bx, by, bz, 0)), "front face removed");
-        assert!(!store.contains_key(&(dim, bx, by, bz, 1)), "back face removed");
+        assert!(
+            !store.contains_key(&(dim, bx, by, bz, 0)),
+            "front face removed"
+        );
+        assert!(
+            !store.contains_key(&(dim, bx, by, bz, 1)),
+            "back face removed"
+        );
         assert_eq!(
             store.keys().filter(|k| k.0 == dim && k.2 == by).count(),
             2 * 1999,
@@ -24799,7 +26256,10 @@ mod mega_w2_tests {
         // 0x35: `§` formatting is stripped for non-operators, kept for ops;
         // control characters are stripped for everyone.
         assert_eq!(ac_sanitize_sign_line("\u{00a7}4red", 0).line, "red");
-        assert_eq!(ac_sanitize_sign_line("\u{00a7}4red", 4).line, "\u{00a7}4red");
+        assert_eq!(
+            ac_sanitize_sign_line("\u{00a7}4red", 4).line,
+            "\u{00a7}4red"
+        );
         assert_eq!(ac_sanitize_sign_line("a\u{0007}b", 4).line, "ab");
 
         // 0x32: a pasted `{"Command":"..."}` payload is stripped from a
@@ -24809,8 +26269,7 @@ mod mega_w2_tests {
             crate::nbt::NbtString::text("Command"),
             crate::nbt::Tag::String(crate::nbt::NbtString::text("/say hi")),
         );
-        let payload =
-            crate::nbt::write_network_nbt(&crate::nbt::Tag::Compound(cmd_nbt)).unwrap();
+        let payload = crate::nbt::write_network_nbt(&crate::nbt::Tag::Compound(cmd_nbt)).unwrap();
         let mut st: Stack = (1, 1, vec![(0, payload.clone())]);
         let r = ac_sanitize_creative_item(&mut st, 0);
         assert!(r.was_sanitized, "non-OP dangerous NBT is sanitized");
@@ -24851,7 +26310,13 @@ mod mega_w2_tests {
         // separate when the dim push step runs.
         let dim = DimId::Nether;
         for x in [5.0, 5.1] {
-            assert!(insert_live_mob(124, dim, (x, 70.0, 5.0, 0.0, 0.0), 20.0, None));
+            assert!(insert_live_mob(
+                124,
+                dim,
+                (x, 70.0, 5.0, 0.0, 0.0),
+                20.0,
+                None
+            ));
         }
         let snap: Vec<Arc<Mob>> = mobs()
             .lock()
@@ -24876,8 +26341,7 @@ mod mega_w2_tests {
                 (p.0, p.2)
             })
             .collect();
-        let sep = (positions[0].0 - positions[1].0)
-            .hypot(positions[0].1 - positions[1].1);
+        let sep = (positions[0].0 - positions[1].0).hypot(positions[0].1 - positions[1].1);
         assert!(
             sep > 0.0,
             "Nether push separated the overlapping mobs: {positions:?}"
