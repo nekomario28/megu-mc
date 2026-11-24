@@ -923,6 +923,12 @@ pub enum UpnpError {
     /// The XML contained `<!DOCTYPE` or `<!ENTITY` — XXE is refused
     /// outright.
     ForbiddenDoctype,
+    /// A field destined for an HTTP request line/header or an XML tag
+    /// held a byte that could inject or split it: CR, LF, NUL, a space,
+    /// a quote, a non-printable/non-ASCII byte, or a URL whose scheme or
+    /// authority is not the expected `http(s)` origin. Carries the field
+    /// name for logging.
+    InvalidToken(&'static str),
     /// The gateway answered a SOAP Fault; carries `<errorCode>` (e.g.
     /// 402 `Invalid Args`, 501 `Action Failed`, 718 `ConflictInMapping`).
     Soap { code: u32 },
@@ -936,6 +942,7 @@ impl fmt::Display for UpnpError {
             Self::NotResponse => write!(f, "not an SSDP success response"),
             Self::Missing(w) => write!(f, "UPnP response missing {w}"),
             Self::ForbiddenDoctype => write!(f, "UPnP XML declares a DOCTYPE/ENTITY"),
+            Self::InvalidToken(w) => write!(f, "UPnP {w} is not a safe token"),
             Self::Soap { code } => write!(f, "UPnP SOAP fault, errorCode {code}"),
         }
     }
@@ -1030,16 +1037,175 @@ fn xml_escape(text: &str) -> String {
     out
 }
 
+// ---------- HTTP/SOAP injection guards ----------
+//
+// Everything that lands in a request line, a header value or an XML tag
+// name is whitelisted byte-by-byte *before* formatting. A malicious IGD
+// answering SSDP with a doctored device description — `controlURL`
+// carrying `\r\nX-Injected:`, a `LOCATION` pointing at `file:` or a
+// quoted `host` — can never split a request or smuggle a second one.
+
+/// Bytes legal in an HTTP `authority` component: hostname, IPv4 literal,
+/// bracketed IPv6 literal, `:port`. Whitespace, `@` (userinfo smuggle),
+/// `/`, quotes and control bytes are all absent.
+fn is_authority_byte(b: u8) -> bool {
+    matches!(b,
+        b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'.' | b'-' | b':' | b'[' | b']')
+}
+
+/// Bytes legal in an origin-form request target: RFC 3986 `pchar`, `/`
+/// and `?`. No whitespace, controls, `"`, `<`, `>`, `\` or `#`.
+fn is_request_target_byte(b: u8) -> bool {
+    matches!(b,
+        b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9'
+        | b'-' | b'.' | b'_' | b'~' | b'!' | b'$' | b'&' | b'\'' | b'(' | b')'
+        | b'*' | b'+' | b',' | b';' | b'=' | b':' | b'@' | b'/' | b'?' | b'%')
+}
+
+/// Bytes legal inside a SOAP service URN or action name: printable ASCII
+/// except `"` (would escape the `SOAPACTION`/`xmlns` quotes), `<` and
+/// `>` (would escape the tag name).
+fn is_soap_token_byte(b: u8) -> bool {
+    (0x21..=0x7E).contains(&b) && !matches!(b, b'"' | b'<' | b'>')
+}
+
+fn validate_authority(host: &str) -> Result<&str, UpnpError> {
+    if host.is_empty() || host.len() > 255 || !host.bytes().all(is_authority_byte) {
+        return Err(UpnpError::InvalidToken("host"));
+    }
+    Ok(host)
+}
+
+fn validate_request_target(path: &str) -> Result<&str, UpnpError> {
+    // `//` would be a network-path reference (`//authority/path`), which
+    // some stacks reinterpret as an authority — refuse it outright.
+    if !path.starts_with('/')
+        || path.starts_with("//")
+        || path.len() > 2048
+        || !path.bytes().all(is_request_target_byte)
+    {
+        return Err(UpnpError::InvalidToken("control_path"));
+    }
+    Ok(path)
+}
+
+fn validate_soap_token<'a>(s: &'a str, field: &'static str) -> Result<&'a str, UpnpError> {
+    if s.is_empty() || s.len() > 256 || !s.bytes().all(is_soap_token_byte) {
+        return Err(UpnpError::InvalidToken(field));
+    }
+    Ok(s)
+}
+
+/// `true` when `url` opens with a URI scheme (`alpha *( alnum / "+" /
+/// "-" / "." ) ":"`) before any `/` — used to reject every scheme that
+/// is not `http`/`https`.
+fn has_foreign_scheme(url: &str) -> bool {
+    let Some(colon) = url.find(':') else {
+        return false;
+    };
+    if let Some(slash) = url.find('/') {
+        if slash < colon {
+            return false; // the ':' belongs to the path, not a scheme
+        }
+    }
+    let scheme = &url[..colon];
+    !scheme.is_empty()
+        && scheme
+            .bytes()
+            .enumerate()
+            .all(|(i, b)| {
+                if i == 0 {
+                    b.is_ascii_alphabetic()
+                } else {
+                    b.is_ascii_alphanumeric() || matches!(b, b'+' | b'-' | b'.')
+                }
+            })
+}
+
+/// Split an absolute `http://`/`https://` URL into its validated
+/// `(authority, request-target)` pair. `Ok(None)` means the input was
+/// not an absolute URL at all; any other scheme fails closed.
+fn split_http_url(url: &str) -> Result<Option<(String, String)>, UpnpError> {
+    let rest = if let Some(r) = url.strip_prefix("http://") {
+        r
+    } else if let Some(r) = url.strip_prefix("https://") {
+        r
+    } else {
+        if has_foreign_scheme(url) {
+            return Err(UpnpError::InvalidToken("url"));
+        }
+        return Ok(None);
+    };
+    let (authority, path) = match rest.find('/') {
+        Some(i) => (&rest[..i], &rest[i..]),
+        None => (rest, "/"),
+    };
+    validate_authority(authority)?;
+    validate_request_target(path)?;
+    Ok(Some((authority.to_string(), path.to_string())))
+}
+
+/// The validated `HOST` + request-target a SOAP POST is sent to.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct UpnpControlTarget {
+    /// HTTP `authority` (`host[:port]` or `[v6]:port`).
+    pub host: String,
+    /// Origin-form request target (`/path[?query]`).
+    pub path: String,
+}
+
+/// Resolve a `<controlURL>` against the SSDP `LOCATION` it was found in.
+/// Absolute control URLs keep their own origin — but only if that origin
+/// is `http`/`https` with a clean authority; any other scheme
+/// (`file:`, `gopher:`, `ftp:`, …) or any byte that could inject into
+/// the request line fails closed. Relative control URLs resolve against
+/// the location's directory, per the UPnP base rules.
+pub fn resolve_upnp_control_target(
+    control_url: &str,
+    device_location: &str,
+) -> Result<UpnpControlTarget, UpnpError> {
+    let control_url = control_url.trim();
+    if control_url.is_empty() {
+        return Err(UpnpError::InvalidToken("controlURL"));
+    }
+    if let Some((host, path)) = split_http_url(control_url)? {
+        return Ok(UpnpControlTarget { host, path });
+    }
+    let (base_host, base_path) =
+        split_http_url(device_location)?.ok_or(UpnpError::InvalidToken("LOCATION"))?;
+    let path = if control_url.starts_with('/') {
+        control_url.to_string()
+    } else {
+        let dir = match base_path.rfind('/') {
+            Some(i) => &base_path[..=i],
+            None => "/",
+        };
+        let mut p = String::with_capacity(dir.len() + control_url.len());
+        p.push_str(dir);
+        p.push_str(control_url);
+        p
+    };
+    validate_request_target(&path)?;
+    Ok(UpnpControlTarget {
+        host: base_host,
+        path,
+    })
+}
+
 /// Wrap `inner` (already-element XML) in a SOAP envelope for `action` on
-/// `service` (e.g. [`UPNP_WANIP_SERVICE`]).
-pub fn soap_envelope(service: &str, action: &str, inner: &str) -> String {
-    format!(
+/// `service` (e.g. [`UPNP_WANIP_SERVICE`]). `service` and `action` are
+/// whitelisted: they land inside a quoted `xmlns` attribute and a tag
+/// name, so `"`/`<`/`>` can never appear.
+pub fn soap_envelope(service: &str, action: &str, inner: &str) -> Result<String, UpnpError> {
+    let service = validate_soap_token(service, "service")?;
+    let action = validate_soap_token(action, "action")?;
+    Ok(format!(
         "<?xml version=\"1.0\"?>\r\n\
          <s:Envelope xmlns:s=\"http://schemas.xmlsoap.org/soap/envelope/\" \
          s:encodingStyle=\"http://schemas.xmlsoap.org/soap/encoding/\">\
          <s:Body><u:{action} xmlns:u=\"{service}\">{inner}</u:{action}>\
          </s:Body></s:Envelope>\r\n"
-    )
+    ))
 }
 
 /// SOAP body for `AddPortMapping`: `NewRemoteHost` may be `""` (wildcard
@@ -1052,7 +1218,7 @@ pub fn soap_add_port_mapping_body(
     internal_client: Ipv4Addr,
     description: &str,
     lease_secs: u32,
-) -> String {
+) -> Result<String, UpnpError> {
     let inner = format!(
         "<NewRemoteHost></NewRemoteHost>\
          <NewExternalPort>{external_port}</NewExternalPort>\
@@ -1074,7 +1240,7 @@ pub fn soap_delete_port_mapping_body(
     service: &str,
     external_port: u16,
     protocol: NatProtocol,
-) -> String {
+) -> Result<String, UpnpError> {
     let inner = format!(
         "<NewRemoteHost></NewRemoteHost>\
          <NewExternalPort>{external_port}</NewExternalPort>\
@@ -1085,15 +1251,24 @@ pub fn soap_delete_port_mapping_body(
 }
 
 /// A complete `POST` request for a SOAP action against `control_path` on
-/// `host` (the authority part of the SSDP `LOCATION`).
+/// `host` (the authority part of the SSDP `LOCATION`). Every field that
+/// lands on the request line or in a header is validated first:
+/// `host` must be a clean authority, `control_path` a clean origin-form
+/// target, `service`/`action` quote- and angle-bracket-free — CR, LF,
+/// NUL, whitespace, non-printable or non-ASCII bytes anywhere are an
+/// [`UpnpError::InvalidToken`], never a formatted request.
 pub fn upnp_http_post_request(
     host: &str,
     control_path: &str,
     service: &str,
     action: &str,
     body: &str,
-) -> Vec<u8> {
-    format!(
+) -> Result<Vec<u8>, UpnpError> {
+    let host = validate_authority(host)?;
+    let control_path = validate_request_target(control_path)?;
+    let service = validate_soap_token(service, "service")?;
+    let action = validate_soap_token(action, "action")?;
+    Ok(format!(
         "POST {control_path} HTTP/1.1\r\nHOST: {host}\r\n\
          CONTENT-TYPE: text/xml; charset=\"utf-8\"\r\n\
          CONTENT-LENGTH: {}\r\n\
@@ -1101,7 +1276,7 @@ pub fn upnp_http_post_request(
          CONNECTION: close\r\n\r\n{body}",
         body.len()
     )
-    .into_bytes()
+    .into_bytes())
 }
 
 fn xml_check_bounded(xml: &[u8]) -> Result<&str, UpnpError> {

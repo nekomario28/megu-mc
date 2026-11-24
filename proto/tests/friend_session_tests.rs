@@ -583,7 +583,8 @@ fn soap_add_body_has_all_fields() {
         Ipv4Addr::new(192, 168, 1, 50),
         "megu <world> & friends",
         3600,
-    );
+    )
+    .unwrap();
     for needle in [
         "AddPortMapping",
         "urn:schemas-upnp-org:service:WANIPConnection:1",
@@ -601,7 +602,7 @@ fn soap_add_body_has_all_fields() {
 
 #[test]
 fn soap_delete_body_has_minimal_fields() {
-    let body = soap_delete_port_mapping_body(UPNP_WANIP_SERVICE, 40000, NatProtocol::Udp);
+    let body = soap_delete_port_mapping_body(UPNP_WANIP_SERVICE, 40000, NatProtocol::Udp).unwrap();
     assert!(body.contains("DeletePortMapping"));
     assert!(body.contains("<NewExternalPort>40000</NewExternalPort>"));
     assert!(body.contains("<NewProtocol>UDP</NewProtocol>"));
@@ -610,14 +611,15 @@ fn soap_delete_body_has_minimal_fields() {
 
 #[test]
 fn upnp_post_request_shape() {
-    let body = soap_delete_port_mapping_body(UPNP_WANIP_SERVICE, 40000, NatProtocol::Udp);
+    let body = soap_delete_port_mapping_body(UPNP_WANIP_SERVICE, 40000, NatProtocol::Udp).unwrap();
     let req = upnp_http_post_request(
         "192.168.1.1:5000",
         "/ctl/IPConn",
         UPNP_WANIP_SERVICE,
         "DeletePortMapping",
         &body,
-    );
+    )
+    .unwrap();
     let text = String::from_utf8(req).unwrap();
     assert!(text.starts_with("POST /ctl/IPConn HTTP/1.1\r\n"));
     assert!(text.contains("SOAPACTION: \"urn:schemas-upnp-org:service:WANIPConnection:1#DeletePortMapping\""));
@@ -673,6 +675,160 @@ fn device_description_finds_control_url() {
         parse_device_description_control_url(xml, "urn:nope"),
         Err(UpnpError::Missing("serviceType"))
     );
+}
+
+// ---------- HTTP/SOAP injection hardening ----------
+
+#[test]
+fn post_request_rejects_crlf_in_every_field() {
+    let body = "<x/>";
+    for (host, path, service, action) in [
+        ("192.168.1.1\r\nX: 1", "/ctl", "urn:a", "Act"),
+        ("192.168.1.1:5000", "/ctl\r\nX: 1", "urn:a", "Act"),
+        ("192.168.1.1:5000", "/ctl", "urn:a\r\nX: 1", "Act"),
+        ("192.168.1.1:5000", "/ctl", "urn:a", "Act\r\nX: 1"),
+        ("192.168.1.1\nGET /x HTTP/1.1", "/ctl", "urn:a", "Act"),
+        ("192.168.1.1:5000", "/ctl\n\nGET / HTTP/1.1", "urn:a", "Act"),
+    ] {
+        assert!(
+            upnp_http_post_request(host, path, service, action, body).is_err(),
+            "accepted injected field: {host:?} {path:?} {service:?} {action:?}"
+        );
+    }
+}
+
+#[test]
+fn post_request_rejects_control_and_space_bytes() {
+    let body = "<x/>";
+    for bad in ["h\u{0}ost", "h ost", "h\u{7F}ost", "h\u{80}ost"] {
+        assert_eq!(
+            upnp_http_post_request(bad, "/ctl", "urn:a", "Act", body),
+            Err(UpnpError::InvalidToken("host"))
+        );
+    }
+    for bad in ["/c\u{0}tl", "/c tl", "/ctl\u{9}", "/ctl\u{1F}"] {
+        assert_eq!(
+            upnp_http_post_request("192.168.1.1", bad, "urn:a", "Act", body),
+            Err(UpnpError::InvalidToken("control_path"))
+        );
+    }
+    // Quote/angle escapes out of the SOAPACTION header value.
+    for bad in ["urn:a\"#x", "urn:<a", "urn:a>"] {
+        assert_eq!(
+            upnp_http_post_request("192.168.1.1", "/ctl", bad, "Act", body),
+            Err(UpnpError::InvalidToken("service"))
+        );
+        assert_eq!(
+            upnp_http_post_request("192.168.1.1", "/ctl", "urn:a", bad, body),
+            Err(UpnpError::InvalidToken("action"))
+        );
+    }
+}
+
+#[test]
+fn post_request_rejects_non_origin_target() {
+    // Absolute-URI or authority-looking targets are refused: the request
+    // line only ever carries origin-form `/path[?query]`.
+    for bad in [
+        "ctl/IPConn",
+        "http://evil.example/x",
+        "//evil.example/x",
+        "*",
+        "\\\\unc\\share",
+        "",
+    ] {
+        assert_eq!(
+            upnp_http_post_request("192.168.1.1", bad, "urn:a", "Act", "<x/>"),
+            Err(UpnpError::InvalidToken("control_path")),
+            "accepted target {bad:?}"
+        );
+    }
+}
+
+#[test]
+fn resolve_control_target_accepts_safe_forms() {
+    let loc = "http://192.168.1.1:5000/rootDesc.xml";
+    // Root-relative.
+    let t = resolve_upnp_control_target("/ctl/IPConn", loc).unwrap();
+    assert_eq!(t.host, "192.168.1.1:5000");
+    assert_eq!(t.path, "/ctl/IPConn");
+    // Base-relative.
+    let t = resolve_upnp_control_target("ctl/IPConn", loc).unwrap();
+    assert_eq!(t.path, "/ctl/IPConn");
+    // Absolute http(s) URL keeps its own clean origin.
+    let t = resolve_upnp_control_target("https://192.168.1.1:8443/c?x=1", loc).unwrap();
+    assert_eq!(t.host, "192.168.1.1:8443");
+    assert_eq!(t.path, "/c?x=1");
+    // IPv6 authority.
+    let t = resolve_upnp_control_target("http://[fd00::1]:5000/ctl", "http://[fd00::1]:5000/d.xml").unwrap();
+    assert_eq!(t.host, "[fd00::1]:5000");
+}
+
+#[test]
+fn resolve_control_target_rejects_injection() {
+    let loc = "http://192.168.1.1:5000/rootDesc.xml";
+    for bad in [
+        "/ctl\r\nX-Injected: 1",
+        "/ctl IPConn",
+        "/ctl\u{0}x",
+        "http://ok\r\nX: 1/x",
+        "http://user@evil.example/x",      // userinfo smuggle
+        "http://evil.example/a b",          // space in path
+        "file:///etc/passwd",
+        "gopher://evil.example/x",
+        "ftp://evil.example/x",
+        "javascript:alert(1)",
+        "HTTP://evil.example/",             // uppercase scheme: not http
+        "",
+        "   ",
+    ] {
+        assert!(
+            resolve_upnp_control_target(bad, loc).is_err(),
+            "accepted {bad:?}"
+        );
+    }
+    // A hostile LOCATION can never launder a relative controlURL.
+    assert!(resolve_upnp_control_target("/ctl", "file:///etc/passwd").is_err());
+    assert!(resolve_upnp_control_target("/ctl", "http://evil\r\nX:1/d").is_err());
+    assert!(resolve_upnp_control_target("/ctl", "not-a-url").is_err());
+}
+
+#[test]
+fn soap_body_builders_reject_unsafe_service() {
+    for bad in ["urn:a\"xmlns:b=\"x\"", "urn:<x>", "urn:a\nb"] {
+        assert!(
+            soap_add_port_mapping_body(
+                bad,
+                40000,
+                NatProtocol::Tcp,
+                25565,
+                Ipv4Addr::new(192, 168, 1, 50),
+                "w",
+                3600,
+            )
+            .is_err()
+        );
+        assert!(soap_delete_port_mapping_body(bad, 40000, NatProtocol::Udp).is_err());
+        assert!(soap_envelope(bad, "Act", "<x/>").is_err());
+        assert!(soap_envelope("urn:a", bad, "<x/>").is_err());
+    }
+}
+
+#[test]
+fn malicious_igd_control_url_cannot_smuggle() {
+    // An IGD description whose controlURL carries a second request: the
+    // extracted URL is handed to the resolver, which refuses it before
+    // any request bytes exist.
+    let xml = b"<root><device><serviceList>\
+        <service><serviceType>urn:schemas-upnp-org:service:WANIPConnection:1</serviceType>\
+        <controlURL>/ctl/IPConn&#13;&#10;POST /admin HTTP/1.1</controlURL></service>\
+        </serviceList></device></root>";
+    let url = parse_device_description_control_url(xml, UPNP_WANIP_SERVICE).unwrap();
+    assert!(resolve_upnp_control_target(
+        &url,
+        "http://192.168.1.1:5000/rootDesc.xml"
+    )
+    .is_err());
 }
 
 // ---------- PortLeaseGuard ----------
