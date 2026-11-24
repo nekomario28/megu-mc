@@ -89,6 +89,10 @@ use crate::subworld_render::{
     InstancedPartBatch, InstancedPartRecord, SubWorldRenderBank, SubWorldRenderEntry,
     SubWorldTransform, TerrainVertex, box_mesh, quat_from_axis_angle,
 };
+use crate::subworld_sync::{
+    decode_sync_frame, encode_helm_cmd, SubWorldHelmCmd, SUBWORLD_HELM_CHANNEL,
+    SUBWORLD_SYNC_CHANNEL,
+};
 use hw_adaptive_engine::{
     ComputeKernelMode, ComputeStrategy, DomainKind, DomainSpecializationPlan, HostHardwareCaps,
     KernelAutotuner, PagedSectionPool, SpeculativeChunkPrefetcher, SpeculativeState,
@@ -426,6 +430,8 @@ pub(crate) enum WorkerCommand {
     ClientInformation {
         view_distance: i8,
     },
+    /// Versioned Play C2S plugin/custom payload.
+    SendCustomPayload { channel: String, payload: Vec<u8> },
 }
 
 /// Live view of the server's open-container instruction: the decoded
@@ -1687,6 +1693,7 @@ pub struct LiveSession {
     pub atmosphere_blender: BiomeAtmosphereBlender,
     pub chunk_fades: ChunkFadeTracker,
     pub subworlds: SubWorldRenderBank,
+    subworld_sync_received_at: Option<Instant>,
     /// Monotone revision bumped whenever any HUD-visible field mutates
     /// (chat, scoreboard, actionbar, title, health/hunger/hotbar,
     /// subtitle, magic HUD). The window's sync skips the `HudState`
@@ -2190,6 +2197,7 @@ impl LiveSession {
             atmosphere_blender: BiomeAtmosphereBlender::new(AtmosphereParams::default()),
             chunk_fades: ChunkFadeTracker::new(),
             subworlds: SubWorldRenderBank::new(),
+            subworld_sync_received_at: None,
             hud_revision: 0,
             last_synced_hud_revision: u64::MAX,
             hud_sync_skips: 0,
@@ -2708,6 +2716,10 @@ impl LiveSession {
                     break;
                 }
             }
+        }
+        if let Some(received_at) = self.subworld_sync_received_at {
+            let alpha = (received_at.elapsed().as_secs_f32() / 0.05).clamp(0.0, 1.0);
+            self.subworlds.interpolate_poses(alpha);
         }
         // Synchronous pump only when no dedicated mix thread owns the
         // sink — `pump` would write to the null sink otherwise.
@@ -3387,6 +3399,17 @@ impl LiveSession {
         let _ = self
             .outgoing
             .try_send(WorkerCommand::ClientInformation { view_distance });
+    }
+
+    /// Queue one Aeronautics helm command for the connection worker.
+    /// Returns false when the bounded worker queue cannot accept it.
+    pub fn send_subworld_helm(&self, cmd: &SubWorldHelmCmd) -> bool {
+        self.outgoing
+            .try_send(WorkerCommand::SendCustomPayload {
+                channel: SUBWORLD_HELM_CHANNEL.to_owned(),
+                payload: encode_helm_cmd(cmd),
+            })
+            .is_ok()
     }
 
     /// One chat line into the bounded HUD scrollback (vanilla's 100-line
@@ -6264,6 +6287,14 @@ impl LiveSession {
                     Err(_) => self.mod_registry_rejected += 1,
                 }
             }
+            ClientCustomChannelEvent::Unknown { channel, payload }
+                if channel.as_str() == SUBWORLD_SYNC_CHANNEL =>
+            {
+                if let Ok(frame) = decode_sync_frame(&payload) {
+                    self.subworlds.apply_sync_frame(&frame);
+                    self.subworld_sync_received_at = Some(Instant::now());
+                }
+            }
             ClientCustomChannelEvent::Unknown { .. } => {}
         }
         Ok(())
@@ -6433,6 +6464,26 @@ fn run_worker(
     if let Err(error) = result {
         let _ = tx.send(WorkerMessage::Closed(error));
     }
+}
+
+fn encode_custom_payload_body(channel: &str, payload: &[u8]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(channel.len() + payload.len() + 5);
+    let mut value = channel.len() as u32;
+    loop {
+        if value & !0x7f == 0 {
+            out.push(value as u8);
+            break;
+        }
+        out.push(((value & 0x7f) | 0x80) as u8);
+        value >>= 7;
+    }
+    out.extend_from_slice(channel.as_bytes());
+    out.extend_from_slice(payload);
+    out
+}
+
+fn play_custom_payload_packet_id(protocol_number: i32) -> i32 {
+    if protocol_number == 777 { 0x16 } else { 0x12 }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -6608,6 +6659,11 @@ fn run_connection(
                 }
                 Ok(WorkerCommand::ClientInformation { view_distance }) => {
                     client.send_client_information(view_distance)?;
+                }
+                Ok(WorkerCommand::SendCustomPayload { channel, payload }) => {
+                    let wire = encode_custom_payload_body(&channel, &payload);
+                    let packet_id = play_custom_payload_packet_id(client.protocol_version.number());
+                    client.send_raw(packet_id, &wire)?;
                 }
                 Err(TryRecvError::Empty) => break,
                 Err(TryRecvError::Disconnected) => return Ok(()),
@@ -7232,6 +7288,36 @@ mod tests {
         let (tx, incoming) = mpsc::sync_channel(8);
         let (outgoing, _rx) = mpsc::sync_channel(8);
         (LiveSession::with_channels(incoming, outgoing), tx)
+    }
+
+    #[test]
+    fn subworld_custom_payload_channels_dispatch_inbound_and_outbound() {
+        let (_incoming_tx, incoming) = mpsc::sync_channel(8);
+        let (outgoing, outgoing_rx) = mpsc::sync_channel(8);
+        let mut live = LiveSession::with_channels(incoming, outgoing);
+        let mut sw6d = Vec::new();
+        sw6d.extend_from_slice(b"SW6D");
+        sw6d.push(1);
+        sw6d.extend_from_slice(&1u16.to_be_bytes());
+        sw6d.extend_from_slice(&77u64.to_be_bytes());
+        for value in [4.0f64, 5.0, 6.0] { sw6d.extend_from_slice(&value.to_be_bytes()); }
+        for value in [0.0f32, 0.0, 0.0, 1.0] { sw6d.extend_from_slice(&value.to_be_bytes()); }
+        for _ in 0..6 { sw6d.extend_from_slice(&0.0f32.to_be_bytes()); }
+        sw6d.push(0);
+        live.apply_event(framed(SUBWORLD_SYNC_CHANNEL, &sw6d)).unwrap();
+        assert_eq!(live.subworlds.get(77).unwrap().transform.position, [4.0, 5.0, 6.0]);
+
+        let cmd = SubWorldHelmCmd { subworld_id: 77, throttle: 0.25, ..Default::default() };
+        assert!(live.send_subworld_helm(&cmd));
+        let WorkerCommand::SendCustomPayload { channel, payload } = outgoing_rx.recv().unwrap() else {
+            panic!("helm helper must enqueue a custom payload")
+        };
+        assert_eq!(channel, SUBWORLD_HELM_CHANNEL);
+        assert_eq!(crate::subworld_sync::decode_helm_cmd(&payload).unwrap(), cmd);
+        let wire = encode_custom_payload_body(&channel, &payload);
+        assert!(wire.ends_with(&payload));
+        assert_eq!(play_custom_payload_packet_id(767), 0x12);
+        assert_eq!(play_custom_payload_packet_id(777), 0x16);
     }
 
     #[test]

@@ -25,6 +25,8 @@ use megu_client_mesh::ber_instancing::VanillaParticleQuad;
 use megu_client_mesh::builtin_shadow_wgsl::VfxLightUniforms;
 use megu_client_mesh::BerInstanceData;
 
+use crate::subworld_sync::{SubWorldPoseInterpolator, SubWorldSyncFrame};
+
 use crate::{mat4_mul, Mat4};
 
 // ---------------------------------------------------------------------------
@@ -734,12 +736,50 @@ impl InstancedPartBatch {
 pub struct SubWorldRenderBank {
     entries: BTreeMap<u64, SubWorldRenderEntry>,
     batches: BTreeMap<u32, InstancedPartBatch>,
+    pose_interpolator: SubWorldPoseInterpolator,
 }
 
 impl SubWorldRenderBank {
     /// Empty bank.
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Ingest one complete SW6D snapshot. Existing geometry remains attached
+    /// to surviving ids; new ids receive an empty, dirty render entry and ids
+    /// absent from the snapshot are removed.
+    pub fn apply_sync_frame(&mut self, frame: &SubWorldSyncFrame) {
+        self.pose_interpolator.ingest(frame);
+        let live: std::collections::BTreeSet<u64> =
+            frame.poses.iter().map(|pose| pose.subworld_id).collect();
+        self.entries.retain(|id, _| live.contains(id));
+        for pose in &frame.poses {
+            let transform = SubWorldTransform {
+                position: pose.pos.map(|value| value as f32),
+                quaternion: pose.quat,
+                scale: 1.0,
+            };
+            self.entries.entry(pose.subworld_id).or_insert_with(|| {
+                SubWorldRenderEntry::new(pose.subworld_id, transform, Vec::new(), Vec::new())
+            });
+            if let Some(entry) = self.entries.get_mut(&pose.subworld_id) {
+                entry.transform = transform;
+            }
+        }
+    }
+
+    /// Apply an interpolated point between the previous and current SW6D
+    /// snapshots. `alpha` is clamped to `[0, 1]`; callers can run this once
+    /// per render frame while server snapshots arrive at 20 Hz.
+    pub fn interpolate_poses(&mut self, alpha: f32) {
+        for (id, _) in self.pose_interpolator.poses() {
+            if let Some(pose) = self.pose_interpolator.interpolate(id, alpha) {
+                if let Some(entry) = self.entries.get_mut(&id) {
+                    entry.transform.position = pose.pos.map(|value| value as f32);
+                    entry.transform.quaternion = pose.quat;
+                }
+            }
+        }
     }
 
     /// Insert or replace an entry; the geometry is (re)uploaded on the next
@@ -889,6 +929,41 @@ impl SubWorldRenderBank {
 
     pub(crate) fn batches_mut(&mut self) -> impl Iterator<Item = &mut InstancedPartBatch> {
         self.batches.values_mut()
+    }
+}
+
+#[cfg(test)]
+mod subworld_sync_tests {
+    use super::*;
+    use crate::subworld_sync::{SubWorldPose, SubWorldSyncFrame};
+
+    fn pose(id: u64, x: f64, quat: [f32; 4]) -> SubWorldPose {
+        SubWorldPose {
+            subworld_id: id,
+            pos: [x, 0.0, 0.0],
+            quat,
+            vel: [0.0; 3],
+            ang_vel: [0.0; 3],
+            flags: 0,
+        }
+    }
+
+    #[test]
+    fn sync_snapshot_inserts_updates_removes_and_interpolates() {
+        let mut bank = SubWorldRenderBank::new();
+        bank.apply_sync_frame(&SubWorldSyncFrame {
+            poses: vec![pose(1, 0.0, [0.0, 0.0, 0.0, 1.0]), pose(2, 8.0, [0.0, 0.0, 0.0, 1.0])],
+        });
+        assert_eq!(bank.len(), 2);
+        bank.apply_sync_frame(&SubWorldSyncFrame {
+            poses: vec![pose(1, 10.0, [0.0, 0.0, 1.0, 0.0])],
+        });
+        assert_eq!(bank.len(), 1);
+        assert!(bank.get(2).is_none());
+        bank.interpolate_poses(0.5);
+        let transform = bank.get(1).unwrap().transform;
+        assert!((transform.position[0] - 5.0).abs() < 1e-5);
+        assert!((transform.quaternion.iter().map(|v| v * v).sum::<f32>() - 1.0).abs() < 1e-5);
     }
 }
 

@@ -24,6 +24,7 @@ pub mod recipe_ingest;
 pub mod renderer;
 pub mod replay_ring;
 pub mod subworld_render;
+pub mod subworld_sync;
 pub mod title_branding;
 pub mod vanilla_bootstrap;
 pub mod vanilla_jar;
