@@ -837,79 +837,7 @@ pub fn parse_uuid(input: &str) -> Result<[u8; 16], String> {
 
 /// Vanilla Minecraft offline-mode UUID v3 (`MD5("OfflinePlayer:" + name)`).
 pub fn offline_uuid(username: &str) -> [u8; 16] {
-    let mut input = Vec::with_capacity(14 + username.len());
-    input.extend_from_slice(b"OfflinePlayer:");
-    input.extend_from_slice(username.as_bytes());
-    let mut digest = md5(&input);
-    digest[6] = (digest[6] & 0x0f) | 0x30;
-    digest[8] = (digest[8] & 0x3f) | 0x80;
-    digest
-}
-
-fn md5(data: &[u8]) -> [u8; 16] {
-    const S: [u32; 64] = [
-        7, 12, 17, 22, 7, 12, 17, 22, 7, 12, 17, 22, 7, 12, 17, 22, 5, 9, 14, 20, 5, 9, 14, 20, 5,
-        9, 14, 20, 5, 9, 14, 20, 4, 11, 16, 23, 4, 11, 16, 23, 4, 11, 16, 23, 4, 11, 16, 23, 6, 10,
-        15, 21, 6, 10, 15, 21, 6, 10, 15, 21, 6, 10, 15, 21,
-    ];
-    const K: [u32; 64] = [
-        0xd76aa478, 0xe8c7b756, 0x242070db, 0xc1bdceee, 0xf57c0faf, 0x4787c62a, 0xa8304613,
-        0xfd469501, 0x698098d8, 0x8b44f7af, 0xffff5bb1, 0x895cd7be, 0x6b901122, 0xfd987193,
-        0xa679438e, 0x49b40821, 0xf61e2562, 0xc040b340, 0x265e5a51, 0xe9b6c7aa, 0xd62f105d,
-        0x02441453, 0xd8a1e681, 0xe7d3fbc8, 0x21e1cde6, 0xc33707d6, 0xf4d50d87, 0x455a14ed,
-        0xa9e3e905, 0xfcefa3f8, 0x676f02d9, 0x8d2a4c8a, 0xfffa3942, 0x8771f681, 0x6d9d6122,
-        0xfde5380c, 0xa4beea44, 0x4bdecfa9, 0xf6bb4b60, 0xbebfbc70, 0x289b7ec6, 0xeaa127fa,
-        0xd4ef3085, 0x04881d05, 0xd9d4d039, 0xe6db99e5, 0x1fa27cf8, 0xc4ac5665, 0xf4292244,
-        0x432aff97, 0xab9423a7, 0xfc93a039, 0x655b59c3, 0x8f0ccc92, 0xffeff47d, 0x85845dd1,
-        0x6fa87e4f, 0xfe2ce6e0, 0xa3014314, 0x4e0811a1, 0xf7537e82, 0xbd3af235, 0x2ad7d2bb,
-        0xeb86d391,
-    ];
-
-    let bit_len = (data.len() as u64).wrapping_mul(8);
-    let mut msg = data.to_vec();
-    msg.push(0x80);
-    while msg.len() % 64 != 56 {
-        msg.push(0);
-    }
-    msg.extend_from_slice(&bit_len.to_le_bytes());
-
-    let mut a0: u32 = 0x67452301;
-    let mut b0: u32 = 0xefcdab89;
-    let mut c0: u32 = 0x98badcfe;
-    let mut d0: u32 = 0x10325476;
-
-    for chunk in msg.as_chunks::<64>().0 {
-        let mut m = [0u32; 16];
-        for (i, word) in m.iter_mut().enumerate() {
-            *word = u32::from_le_bytes(chunk[i * 4..i * 4 + 4].try_into().unwrap());
-        }
-        let (mut a, mut b, mut c, mut d) = (a0, b0, c0, d0);
-        for i in 0..64 {
-            let (f, g) = match i {
-                0..=15 => ((b & c) | ((!b) & d), i),
-                16..=31 => ((d & b) | ((!d) & c), (5 * i + 1) % 16),
-                32..=47 => (b ^ c ^ d, (3 * i + 5) % 16),
-                _ => (c ^ (b | (!d)), (7 * i) % 16),
-            };
-            let temp = d;
-            d = c;
-            c = b;
-            let sum = a.wrapping_add(f).wrapping_add(K[i]).wrapping_add(m[g]);
-            b = b.wrapping_add(sum.rotate_left(S[i]));
-            a = temp;
-        }
-        a0 = a0.wrapping_add(a);
-        b0 = b0.wrapping_add(b);
-        c0 = c0.wrapping_add(c);
-        d0 = d0.wrapping_add(d);
-    }
-
-    let mut out = [0u8; 16];
-    out[0..4].copy_from_slice(&a0.to_le_bytes());
-    out[4..8].copy_from_slice(&b0.to_le_bytes());
-    out[8..12].copy_from_slice(&c0.to_le_bytes());
-    out[12..16].copy_from_slice(&d0.to_le_bytes());
-    out
+    megu_core::crypto::offline_player_uuid(username)
 }
 
 // ---------------------------------------------------------------------------
@@ -6992,246 +6920,35 @@ fn parse_status_json(text: &str) -> Result<JsonValue, String> {
 }
 
 /// Crate-shared minimal JSON parser (status ping, asset indexes,
-/// `sounds.json`). `max_nodes` bounds parser work on hostile input.
+/// `sounds.json`). `max_nodes` bounds parser work on hostile input; parsing
+/// itself is delegated to the canonical `megu_core::json` reader and lowered
+/// into this module's [`JsonValue`] so callers keep their shape.
 pub(crate) fn parse_json(text: &str, max_nodes: usize) -> Result<JsonValue, String> {
-    let mut parser = JsonParser {
-        bytes: text.as_bytes(),
-        pos: 0,
-        nodes: 0,
+    let limits = megu_core::json::JsonLimits {
+        max_depth: MAX_STATUS_JSON_DEPTH,
         max_nodes,
+        max_bytes: usize::MAX,
     };
-    parser.skip_ws();
-    let value = parser.value(0)?;
-    parser.skip_ws();
-    if parser.pos != parser.bytes.len() {
-        return Err("trailing bytes after status JSON document".to_string());
-    }
-    Ok(value)
+    megu_core::json::parse_json_with_limits(text, limits, false)
+        .map(json_value_from_core)
+        .map_err(|e| e.to_string())
 }
 
-struct JsonParser<'a> {
-    bytes: &'a [u8],
-    pos: usize,
-    nodes: usize,
-    max_nodes: usize,
-}
-
-impl<'a> JsonParser<'a> {
-    fn peek(&self) -> Option<u8> {
-        self.bytes.get(self.pos).copied()
-    }
-
-    fn skip_ws(&mut self) {
-        while matches!(self.peek(), Some(b' ' | b'\t' | b'\n' | b'\r')) {
-            self.pos += 1;
+fn json_value_from_core(value: megu_core::json::JsonValue) -> JsonValue {
+    match value {
+        megu_core::json::JsonValue::Null => JsonValue::Null,
+        megu_core::json::JsonValue::Bool(b) => JsonValue::Bool(b),
+        megu_core::json::JsonValue::Number(n) => JsonValue::Num(n),
+        megu_core::json::JsonValue::String(s) => JsonValue::Str(s),
+        megu_core::json::JsonValue::Array(items) => {
+            JsonValue::Arr(items.into_iter().map(json_value_from_core).collect())
         }
-    }
-
-    fn value(&mut self, depth: usize) -> Result<JsonValue, String> {
-        if depth >= MAX_STATUS_JSON_DEPTH {
-            return Err("status JSON nesting depth exceeded".to_string());
-        }
-        self.nodes += 1;
-        if self.nodes > self.max_nodes {
-            return Err("status JSON node budget exceeded".to_string());
-        }
-        match self.peek() {
-            Some(b'{') => self.object(depth),
-            Some(b'[') => self.array(depth),
-            Some(b'"') => Ok(JsonValue::Str(self.string()?)),
-            Some(b't') => self.literal(b"true", JsonValue::Bool(true)),
-            Some(b'f') => self.literal(b"false", JsonValue::Bool(false)),
-            Some(b'n') => self.literal(b"null", JsonValue::Null),
-            Some(b'-' | b'0'..=b'9') => self.number(),
-            Some(c) => Err(format!("unexpected byte 0x{c:02x} in status JSON")),
-            None => Err("truncated status JSON".to_string()),
-        }
-    }
-
-    fn literal(&mut self, lit: &[u8], value: JsonValue) -> Result<JsonValue, String> {
-        if self.bytes[self.pos..].starts_with(lit) {
-            self.pos += lit.len();
-            Ok(value)
-        } else {
-            Err("invalid JSON literal in status response".to_string())
-        }
-    }
-
-    fn number(&mut self) -> Result<JsonValue, String> {
-        let start = self.pos;
-        if self.peek() == Some(b'-') {
-            self.pos += 1;
-        }
-        while matches!(self.peek(), Some(b'0'..=b'9')) {
-            self.pos += 1;
-        }
-        if self.peek() == Some(b'.') {
-            self.pos += 1;
-            while matches!(self.peek(), Some(b'0'..=b'9')) {
-                self.pos += 1;
-            }
-        }
-        if matches!(self.peek(), Some(b'e' | b'E')) {
-            self.pos += 1;
-            if matches!(self.peek(), Some(b'+' | b'-')) {
-                self.pos += 1;
-            }
-            while matches!(self.peek(), Some(b'0'..=b'9')) {
-                self.pos += 1;
-            }
-        }
-        let text = std::str::from_utf8(&self.bytes[start..self.pos])
-            .map_err(|_| "invalid JSON number".to_string())?;
-        text.parse::<f64>()
-            .map(JsonValue::Num)
-            .map_err(|_| format!("invalid JSON number '{text}'"))
-    }
-
-    fn hex4(&mut self) -> Result<u32, String> {
-        let end = self.pos + 4;
-        if end > self.bytes.len() {
-            return Err("truncated \\u escape in status JSON".to_string());
-        }
-        let s = std::str::from_utf8(&self.bytes[self.pos..end])
-            .map_err(|_| "invalid \\u escape in status JSON".to_string())?;
-        let value = u32::from_str_radix(s, 16).map_err(|_| format!("invalid \\u escape '{s}'"))?;
-        self.pos = end;
-        Ok(value)
-    }
-
-    fn string(&mut self) -> Result<String, String> {
-        self.pos += 1; // opening quote
-        let mut out = String::new();
-        loop {
-            let Some(c) = self.peek() else {
-                return Err("unterminated string in status JSON".to_string());
-            };
-            self.pos += 1;
-            match c {
-                b'"' => return Ok(out),
-                b'\\' => {
-                    let Some(esc) = self.peek() else {
-                        return Err("unterminated escape in status JSON".to_string());
-                    };
-                    self.pos += 1;
-                    match esc {
-                        b'"' => out.push('"'),
-                        b'\\' => out.push('\\'),
-                        b'/' => out.push('/'),
-                        b'b' => out.push('\u{0008}'),
-                        b'f' => out.push('\u{000c}'),
-                        b'n' => out.push('\n'),
-                        b'r' => out.push('\r'),
-                        b't' => out.push('\t'),
-                        b'u' => {
-                            let hi = self.hex4()?;
-                            let mut ch = char::from_u32(hi).unwrap_or('\u{fffd}');
-                            if (0xD800..0xDC00).contains(&hi) {
-                                // A high surrogate only completes when a
-                                // `\uXXXX` low surrogate follows; otherwise
-                                // the lone surrogate renders as U+FFFD.
-                                ch = '\u{fffd}';
-                                let save = self.pos;
-                                if self.peek() == Some(b'\\') {
-                                    self.pos += 1;
-                                    if self.peek() == Some(b'u') {
-                                        self.pos += 1;
-                                        let lo = self.hex4()?;
-                                        if (0xDC00..0xE000).contains(&lo) {
-                                            ch = char::from_u32(
-                                                0x10000 + ((hi - 0xD800) << 10) + (lo - 0xDC00),
-                                            )
-                                            .unwrap_or('\u{fffd}');
-                                        } else {
-                                            self.pos = save;
-                                        }
-                                    } else {
-                                        self.pos = save;
-                                    }
-                                }
-                            } else if (0xDC00..0xE000).contains(&hi) {
-                                ch = '\u{fffd}';
-                            }
-                            out.push(ch);
-                        }
-                        other => {
-                            return Err(format!(
-                                "invalid escape '\\{}' in status JSON",
-                                other as char
-                            ))
-                        }
-                    }
-                }
-                c if c < 0x80 => out.push(c as char),
-                _ => {
-                    // `text` is already valid UTF-8, so this byte starts a
-                    // multi-byte scalar: decode it whole and keep going.
-                    let start = self.pos - 1;
-                    let tail = std::str::from_utf8(&self.bytes[start..])
-                        .map_err(|_| "invalid UTF-8 in status JSON".to_string())?;
-                    let ch = tail.chars().next().unwrap();
-                    out.push(ch);
-                    self.pos = start + ch.len_utf8();
-                }
-            }
-        }
-    }
-
-    fn array(&mut self, depth: usize) -> Result<JsonValue, String> {
-        self.pos += 1; // '['
-        let mut items = Vec::new();
-        self.skip_ws();
-        if self.peek() == Some(b']') {
-            self.pos += 1;
-            return Ok(JsonValue::Arr(items));
-        }
-        loop {
-            self.skip_ws();
-            items.push(self.value(depth + 1)?);
-            self.skip_ws();
-            match self.peek() {
-                Some(b',') => self.pos += 1,
-                Some(b']') => {
-                    self.pos += 1;
-                    return Ok(JsonValue::Arr(items));
-                }
-                _ => return Err("expected ',' or ']' in status JSON array".to_string()),
-            }
-        }
-    }
-
-    fn object(&mut self, depth: usize) -> Result<JsonValue, String> {
-        self.pos += 1; // '{'
-        let mut entries = Vec::new();
-        self.skip_ws();
-        if self.peek() == Some(b'}') {
-            self.pos += 1;
-            return Ok(JsonValue::Obj(entries));
-        }
-        loop {
-            self.skip_ws();
-            if self.peek() != Some(b'"') {
-                return Err("expected string key in status JSON object".to_string());
-            }
-            let key = self.string()?;
-            self.skip_ws();
-            if self.peek() != Some(b':') {
-                return Err("expected ':' in status JSON object".to_string());
-            }
-            self.pos += 1;
-            self.skip_ws();
-            let value = self.value(depth + 1)?;
-            entries.push((key, value));
-            self.skip_ws();
-            match self.peek() {
-                Some(b',') => self.pos += 1,
-                Some(b'}') => {
-                    self.pos += 1;
-                    return Ok(JsonValue::Obj(entries));
-                }
-                _ => return Err("expected ',' or '}' in status JSON object".to_string()),
-            }
-        }
+        megu_core::json::JsonValue::Object(entries) => JsonValue::Obj(
+            entries
+                .into_iter()
+                .map(|(key, value)| (key, json_value_from_core(value)))
+                .collect(),
+        ),
     }
 }
 

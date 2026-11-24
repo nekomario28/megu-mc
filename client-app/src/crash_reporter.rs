@@ -526,234 +526,34 @@ impl Json {
 const JSON_MAX_DEPTH: usize = 64;
 
 fn parse_json(text: &str) -> Result<Json, String> {
-    let mut p = JsonParser {
-        bytes: text.as_bytes(),
-        pos: 0,
+    // The canonical reader enforces `depth >= max_depth`; the historical
+    // bound here rejected only `depth > JSON_MAX_DEPTH`, so allow one more
+    // level to keep identical acceptance.
+    let limits = megu_core::json::JsonLimits {
+        max_depth: JSON_MAX_DEPTH + 1,
+        max_nodes: usize::MAX,
+        max_bytes: usize::MAX,
     };
-    p.skip_ws();
-    let value = p.value(0)?;
-    p.skip_ws();
-    if p.pos != p.bytes.len() {
-        return Err("trailing bytes after JSON value".to_string());
-    }
-    Ok(value)
+    megu_core::json::parse_json_with_limits(text, limits, false)
+        .map(json_from_core)
+        .map_err(|e| e.to_string())
 }
 
-struct JsonParser<'a> {
-    bytes: &'a [u8],
-    pos: usize,
-}
-
-impl JsonParser<'_> {
-    fn skip_ws(&mut self) {
-        while self.pos < self.bytes.len()
-            && matches!(self.bytes[self.pos], b' ' | b'\t' | b'\n' | b'\r')
-        {
-            self.pos += 1;
+fn json_from_core(value: megu_core::json::JsonValue) -> Json {
+    match value {
+        megu_core::json::JsonValue::Null => Json::Null,
+        megu_core::json::JsonValue::Bool(b) => Json::Bool(b),
+        megu_core::json::JsonValue::Number(n) => Json::Num(n),
+        megu_core::json::JsonValue::String(s) => Json::Str(s),
+        megu_core::json::JsonValue::Array(items) => {
+            Json::Arr(items.into_iter().map(json_from_core).collect())
         }
-    }
-
-    fn peek(&self) -> Option<u8> {
-        self.bytes.get(self.pos).copied()
-    }
-
-    fn value(&mut self, depth: usize) -> Result<Json, String> {
-        if depth > JSON_MAX_DEPTH {
-            return Err("JSON nesting too deep".to_string());
-        }
-        match self.peek() {
-            Some(b'{') => self.object(depth),
-            Some(b'[') => self.array(depth),
-            Some(b'"') => Ok(Json::Str(self.string()?)),
-            Some(b't') => self.literal(b"true", Json::Bool(true)),
-            Some(b'f') => self.literal(b"false", Json::Bool(false)),
-            Some(b'n') => self.literal(b"null", Json::Null),
-            Some(b'-') | Some(b'0'..=b'9') => self.number(),
-            other => Err(format!("unexpected byte {other:?} in JSON")),
-        }
-    }
-
-    fn literal(&mut self, lit: &[u8], value: Json) -> Result<Json, String> {
-        if self.bytes[self.pos..].starts_with(lit) {
-            self.pos += lit.len();
-            Ok(value)
-        } else {
-            Err("invalid JSON literal".to_string())
-        }
-    }
-
-    fn number(&mut self) -> Result<Json, String> {
-        let start = self.pos;
-        if self.peek() == Some(b'-') {
-            self.pos += 1;
-        }
-        while matches!(self.peek(), Some(b'0'..=b'9')) {
-            self.pos += 1;
-        }
-        if self.peek() == Some(b'.') {
-            self.pos += 1;
-            while matches!(self.peek(), Some(b'0'..=b'9')) {
-                self.pos += 1;
-            }
-        }
-        if matches!(self.peek(), Some(b'e') | Some(b'E')) {
-            self.pos += 1;
-            if matches!(self.peek(), Some(b'+') | Some(b'-')) {
-                self.pos += 1;
-            }
-            while matches!(self.peek(), Some(b'0'..=b'9')) {
-                self.pos += 1;
-            }
-        }
-        let text = std::str::from_utf8(&self.bytes[start..self.pos])
-            .map_err(|_| "invalid UTF-8 in number".to_string())?;
-        text.parse::<f64>()
-            .map(Json::Num)
-            .map_err(|_| format!("invalid JSON number {text:?}"))
-    }
-
-    fn hex4(&mut self) -> Result<u32, String> {
-        if self.pos + 4 > self.bytes.len() {
-            return Err("truncated \\u escape".to_string());
-        }
-        let mut value = 0u32;
-        for _ in 0..4 {
-            let b = self.bytes[self.pos];
-            self.pos += 1;
-            let digit = match b {
-                b'0'..=b'9' => u32::from(b - b'0'),
-                b'a'..=b'f' => u32::from(b - b'a') + 10,
-                b'A'..=b'F' => u32::from(b - b'A') + 10,
-                _ => return Err("invalid \\u escape".to_string()),
-            };
-            value = value * 16 + digit;
-        }
-        Ok(value)
-    }
-
-    fn string(&mut self) -> Result<String, String> {
-        if self.peek() != Some(b'"') {
-            return Err("expected string".to_string());
-        }
-        self.pos += 1;
-        let mut out = String::new();
-        loop {
-            let b = self.peek().ok_or_else(|| "unterminated string".to_string())?;
-            self.pos += 1;
-            match b {
-                b'"' => return Ok(out),
-                b'\\' => {
-                    let esc = self
-                        .peek()
-                        .ok_or_else(|| "unterminated escape".to_string())?;
-                    self.pos += 1;
-                    match esc {
-                        b'"' => out.push('"'),
-                        b'\\' => out.push('\\'),
-                        b'/' => out.push('/'),
-                        b'b' => out.push('\u{0008}'),
-                        b'f' => out.push('\u{000c}'),
-                        b'n' => out.push('\n'),
-                        b'r' => out.push('\r'),
-                        b't' => out.push('\t'),
-                        b'u' => {
-                            let hi = self.hex4()?;
-                            let ch = if (0xd800..0xdc00).contains(&hi)
-                                && self.bytes[self.pos..].starts_with(b"\\u")
-                            {
-                                self.pos += 2;
-                                let lo = self.hex4()?;
-                                let scalar =
-                                    0x1_0000 + ((hi - 0xd800) << 10) + (lo - 0xdc00);
-                                char::from_u32(scalar).unwrap_or('\u{fffd}')
-                            } else {
-                                char::from_u32(hi).unwrap_or('\u{fffd}')
-                            };
-                            out.push(ch);
-                        }
-                        _ => return Err("invalid string escape".to_string()),
-                    }
-                }
-                _ => {
-                    // Copy the full UTF-8 scalar starting at b.
-                    let start = self.pos - 1;
-                    let len = if b < 0x80 {
-                        1
-                    } else if b < 0xe0 {
-                        2
-                    } else if b < 0xf0 {
-                        3
-                    } else {
-                        4
-                    };
-                    let end = (start + len).min(self.bytes.len());
-                    match std::str::from_utf8(&self.bytes[start..end]) {
-                        Ok(s) => {
-                            out.push_str(s);
-                            self.pos = end;
-                        }
-                        Err(_) => {
-                            out.push('\u{fffd}');
-                            self.pos = start + 1;
-                        }
-                    }
-                }
-            }
-        }
-    }
-
-    fn array(&mut self, depth: usize) -> Result<Json, String> {
-        self.pos += 1; // '['
-        let mut items = Vec::new();
-        self.skip_ws();
-        if self.peek() == Some(b']') {
-            self.pos += 1;
-            return Ok(Json::Arr(items));
-        }
-        loop {
-            self.skip_ws();
-            items.push(self.value(depth + 1)?);
-            self.skip_ws();
-            match self.peek() {
-                Some(b',') => self.pos += 1,
-                Some(b']') => {
-                    self.pos += 1;
-                    return Ok(Json::Arr(items));
-                }
-                _ => return Err("expected ',' or ']' in array".to_string()),
-            }
-        }
-    }
-
-    fn object(&mut self, depth: usize) -> Result<Json, String> {
-        self.pos += 1; // '{'
-        let mut fields = Vec::new();
-        self.skip_ws();
-        if self.peek() == Some(b'}') {
-            self.pos += 1;
-            return Ok(Json::Obj(fields));
-        }
-        loop {
-            self.skip_ws();
-            let key = self.string()?;
-            self.skip_ws();
-            if self.peek() != Some(b':') {
-                return Err("expected ':' in object".to_string());
-            }
-            self.pos += 1;
-            self.skip_ws();
-            let value = self.value(depth + 1)?;
-            fields.push((key, value));
-            self.skip_ws();
-            match self.peek() {
-                Some(b',') => self.pos += 1,
-                Some(b'}') => {
-                    self.pos += 1;
-                    return Ok(Json::Obj(fields));
-                }
-                _ => return Err("expected ',' or '}' in object".to_string()),
-            }
-        }
+        megu_core::json::JsonValue::Object(entries) => Json::Obj(
+            entries
+                .into_iter()
+                .map(|(key, value)| (key, json_from_core(value)))
+                .collect(),
+        ),
     }
 }
 

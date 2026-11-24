@@ -376,121 +376,20 @@ impl<'a> Reader<'a> {
 
 fn parse_flat_json(bytes: &[u8]) -> Result<BTreeMap<String, String>, &'static str> {
     let s = std::str::from_utf8(bytes).map_err(|_| "invalid UTF-8")?;
-    let mut p = Json { s, i: 0 };
-    p.ws();
-    p.expect('{')?;
-    p.ws();
+    let value = megu_core::json::parse_json(s).map_err(|_| "invalid JSON syntax")?;
+    let megu_core::json::JsonValue::Object(entries) = value else {
+        return Err("invalid JSON syntax");
+    };
     let mut map = BTreeMap::new();
-    if p.peek() == Some('}') {
-        p.i += 1;
-    } else {
-        loop {
-            let k = p.string()?;
-            p.ws();
-            p.expect(':')?;
-            p.ws();
-            let v = p.string()?;
-            if k.is_empty() || v.is_empty() || map.insert(k, v).is_some() {
-                return Err("invalid or duplicate translation");
-            };
-            p.ws();
-            match p.peek() {
-                Some(',') => {
-                    p.i += 1;
-                    p.ws()
-                }
-                Some('}') => {
-                    p.i += 1;
-                    break;
-                }
-                _ => return Err("invalid JSON object"),
-            }
-        }
+    for (key, value) in entries {
+        let megu_core::json::JsonValue::String(value) = value else {
+            return Err("invalid JSON syntax");
+        };
+        if key.is_empty() || value.is_empty() || map.insert(key, value).is_some() {
+            return Err("invalid or duplicate translation");
+        };
     }
-    p.ws();
-    if p.i == s.len() {
-        Ok(map)
-    } else {
-        Err("trailing JSON content")
-    }
-}
-struct Json<'a> {
-    s: &'a str,
-    i: usize,
-}
-impl Json<'_> {
-    fn peek(&self) -> Option<char> {
-        self.s[self.i..].chars().next()
-    }
-    fn ws(&mut self) {
-        while self.peek().is_some_and(char::is_whitespace) {
-            self.i += self.peek().unwrap_or(' ').len_utf8()
-        }
-    }
-    fn expect(&mut self, c: char) -> Result<(), &'static str> {
-        if self.peek() == Some(c) {
-            self.i += c.len_utf8();
-            Ok(())
-        } else {
-            Err("invalid JSON syntax")
-        }
-    }
-    fn string(&mut self) -> Result<String, &'static str> {
-        self.expect('"')?;
-        let mut o = String::new();
-        loop {
-            let c = self.peek().ok_or("unterminated JSON string")?;
-            self.i += c.len_utf8();
-            match c {
-                '"' => return Ok(o),
-                '\\' => {
-                    let e = self.peek().ok_or("invalid JSON escape")?;
-                    self.i += e.len_utf8();
-                    let decoded = match e {
-                        '"' => '"',
-                        '\\' => '\\',
-                        '/' => '/',
-                        'b' => '\u{8}',
-                        'f' => '\u{c}',
-                        'n' => '\n',
-                        'r' => '\r',
-                        't' => '\t',
-                        'u' => {
-                            let first = self.hex4()?;
-                            let scalar = if (0xd800..=0xdbff).contains(&first) {
-                                self.expect('\\')?;
-                                self.expect('u')?;
-                                let second = self.hex4()?;
-                                if !(0xdc00..=0xdfff).contains(&second) {
-                                    return Err("invalid JSON surrogate pair");
-                                }
-                                0x10000 + ((u32::from(first) - 0xd800) << 10) + u32::from(second)
-                                    - 0xdc00
-                            } else {
-                                u32::from(first)
-                            };
-                            o.push(char::from_u32(scalar).ok_or("invalid JSON unicode escape")?);
-                            continue;
-                        }
-                        _ => return Err("invalid JSON escape"),
-                    };
-                    o.push(decoded);
-                }
-                c if c.is_control() => return Err("control character in JSON string"),
-                _ => o.push(c),
-            }
-        }
-    }
-
-    fn hex4(&mut self) -> Result<u16, &'static str> {
-        let mut value = 0u16;
-        for _ in 0..4 {
-            let c = self.peek().ok_or("truncated JSON unicode escape")?;
-            self.i += c.len_utf8();
-            value = (value << 4) | c.to_digit(16).ok_or("invalid JSON unicode escape")? as u16;
-        }
-        Ok(value)
-    }
+    Ok(map)
 }
 
 #[cfg(test)]

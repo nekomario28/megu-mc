@@ -557,7 +557,8 @@ fn classify_builtin(sid: u32) -> (Block, Vec<u16>, FluidCell, bool) {
 }
 
 // ---------------------------------------------------------------------------
-// Minimal zero-dependency JSON parser for assets/block_states_1211.json
+// assets/block_states_1211.json decoding on the canonical megu_core::json
+// reader (the file is machine-generated strict JSON)
 // ---------------------------------------------------------------------------
 
 struct ParsedBlockStates {
@@ -568,334 +569,154 @@ struct ParsedBlockStates {
     collision_shapes: Vec<Vec<u16>>,
 }
 
-struct JsonScanner<'a> {
-    data: &'a [u8],
-    pos: usize,
+fn json_u64(value: &megu_core::json::JsonValue, what: &str) -> Result<u64, String> {
+    match value {
+        megu_core::json::JsonValue::Number(n)
+            if n.fract() == 0.0 && *n >= 0.0 && *n <= u64::MAX as f64 =>
+        {
+            Ok(*n as u64)
+        }
+        _ => Err(format!(
+            "block_states_1211.json: expected integer for {what}"
+        )),
+    }
 }
 
-impl<'a> JsonScanner<'a> {
-    fn new(data: &'a [u8]) -> Self {
-        Self { data, pos: 0 }
-    }
+fn json_string(value: &megu_core::json::JsonValue, what: &str) -> Result<String, String> {
+    value
+        .as_str()
+        .map(str::to_owned)
+        .ok_or_else(|| format!("block_states_1211.json: expected string for {what}"))
+}
 
-    fn skip_ws(&mut self) {
-        while let Some(&b) = self.data.get(self.pos) {
-            if matches!(b, b' ' | b'\n' | b'\r' | b'\t') {
-                self.pos += 1;
-            } else {
-                break;
-            }
-        }
-    }
+fn json_array<'a>(
+    value: &'a megu_core::json::JsonValue,
+    what: &str,
+) -> Result<&'a [megu_core::json::JsonValue], String> {
+    value
+        .as_array()
+        .ok_or_else(|| format!("block_states_1211.json: expected array for {what}"))
+}
 
-    fn peek(&mut self) -> Option<u8> {
-        self.skip_ws();
-        self.data.get(self.pos).copied()
+fn parse_state_block_rows(
+    value: &megu_core::json::JsonValue,
+) -> Result<Vec<(String, u32, u32)>, String> {
+    let items = json_array(value, "blocks")?;
+    let mut out = Vec::with_capacity(items.len());
+    for (i, item) in items.iter().enumerate() {
+        let row = json_array(item, "blocks row").map_err(|_| {
+            format!("block_states_1211.json: malformed blocks row {i}")
+        })?;
+        if row.len() != 3 {
+            return Err(format!(
+                "block_states_1211.json: blocks row {i} is not a 3-tuple"
+            ));
+        }
+        out.push((
+            json_string(&row[0], "blocks row name")?,
+            json_u64(&row[1], "blocks row base")? as u32,
+            json_u64(&row[2], "blocks row length")? as u32,
+        ));
     }
+    Ok(out)
+}
 
-    fn expect(&mut self, expected: u8) -> Result<(), String> {
-        self.skip_ws();
-        match self.data.get(self.pos) {
-            Some(&b) if b == expected => {
-                self.pos += 1;
-                Ok(())
-            }
-            other => Err(format!(
-                "JSON syntax error at {}: expected '{}', got {:?}",
-                self.pos, expected as char, other
-            )),
-        }
-    }
+fn parse_u8_list(value: &megu_core::json::JsonValue, what: &str) -> Result<Vec<u8>, String> {
+    json_array(value, what)?
+        .iter()
+        .enumerate()
+        .map(|(i, v)| {
+            json_u64(v, what)
+                .map(|n| n as u8)
+                .map_err(|_| format!("block_states_1211.json: bad {what} entry {i}"))
+        })
+        .collect()
+}
 
-    fn parse_string(&mut self) -> Result<String, String> {
-        self.expect(b'"')?;
-        let mut out = String::new();
-        while let Some(&b) = self.data.get(self.pos) {
-            self.pos += 1;
-            match b {
-                b'"' => return Ok(out),
-                b'\\' => {
-                    let esc = *self
-                        .data
-                        .get(self.pos)
-                        .ok_or_else(|| "unterminated JSON string escape".to_string())?;
-                    self.pos += 1;
-                    match esc {
-                        b'"' => out.push('"'),
-                        b'\\' => out.push('\\'),
-                        b'/' => out.push('/'),
-                        b'b' => out.push('\x08'),
-                        b'f' => out.push('\x0c'),
-                        b'n' => out.push('\n'),
-                        b'r' => out.push('\r'),
-                        b't' => out.push('\t'),
-                        b'u' => {
-                            let hex = self
-                                .data
-                                .get(self.pos..self.pos + 4)
-                                .ok_or_else(|| "truncated unicode escape".to_string())?;
-                            self.pos += 4;
-                            let code = u32::from_str_radix(
-                                std::str::from_utf8(hex).map_err(|_| "bad unicode escape")?,
-                                16,
-                            )
-                            .map_err(|_| "bad unicode hex")?;
-                            if let Some(ch) = char::from_u32(code) {
-                                out.push(ch);
-                            }
-                        }
-                        _ => out.push(esc as char),
-                    }
-                }
-                _ => out.push(b as char),
-            }
+fn parse_shape_list(
+    value: &megu_core::json::JsonValue,
+) -> Result<Vec<LocalBox>, String> {
+    let items = json_array(value, "shapes")?;
+    let mut out = Vec::with_capacity(items.len());
+    for (i, item) in items.iter().enumerate() {
+        if !matches!(item, megu_core::json::JsonValue::Object(_)) {
+            return Err(format!(
+                "block_states_1211.json: shapes entry {i} is not an object"
+            ));
         }
-        Err("unterminated JSON string".to_string())
+        out.push(LocalBox {
+            min: shape_axis(item, "min", i)?,
+            max: shape_axis(item, "max", i)?,
+        });
     }
+    Ok(out)
+}
 
-    fn parse_u64(&mut self) -> Result<u64, String> {
-        self.skip_ws();
-        let start = self.pos;
-        while let Some(&b) = self.data.get(self.pos) {
-            if b.is_ascii_digit() {
-                self.pos += 1;
-            } else {
-                break;
-            }
-        }
-        if self.pos == start {
-            return Err(format!("expected integer at {}", self.pos));
-        }
-        std::str::from_utf8(&self.data[start..self.pos])
-            .map_err(|_| "invalid int UTF-8".to_string())?
-            .parse::<u64>()
-            .map_err(|_| "integer parse overflow".to_string())
+fn shape_axis(
+    shape: &megu_core::json::JsonValue,
+    key: &str,
+    index: usize,
+) -> Result<[f64; 3], String> {
+    let Some(axis) = shape.get(key) else {
+        return Ok([0.0; 3]);
+    };
+    let items = json_array(axis, "shape axis").map_err(|_| {
+        format!("block_states_1211.json: shapes entry {index} has a bad '{key}' axis")
+    })?;
+    if items.len() != 3 {
+        return Err(format!(
+            "block_states_1211.json: shapes entry {index} '{key}' is not a triple"
+        ));
     }
+    let mut out = [0.0; 3];
+    for (slot, item) in out.iter_mut().zip(items.iter()) {
+        *slot = item.as_f64().ok_or_else(|| {
+            format!("block_states_1211.json: shapes entry {index} '{key}' is not numeric")
+        })?;
+    }
+    Ok(out)
+}
 
-    fn parse_f64(&mut self) -> Result<f64, String> {
-        self.skip_ws();
-        let start = self.pos;
-        while let Some(&b) = self.data.get(self.pos) {
-            if b.is_ascii_digit() || matches!(b, b'-' | b'+' | b'.' | b'e' | b'E') {
-                self.pos += 1;
-            } else {
-                break;
-            }
+fn parse_collision_shapes(
+    value: &megu_core::json::JsonValue,
+) -> Result<Vec<Vec<u16>>, String> {
+    let items = json_array(value, "collision_shapes")?;
+    let mut out = Vec::with_capacity(items.len());
+    for (i, item) in items.iter().enumerate() {
+        let indices = json_array(item, "collision_shapes row").map_err(|_| {
+            format!("block_states_1211.json: malformed collision_shapes row {i}")
+        })?;
+        let mut list = Vec::with_capacity(indices.len());
+        for (j, index) in indices.iter().enumerate() {
+            list.push(
+                json_u64(index, "collision_shapes index")
+                    .map_err(|_| {
+                        format!(
+                            "block_states_1211.json: bad collision_shapes[{i}][{j}]"
+                        )
+                    })? as u16,
+            );
         }
-        if self.pos == start {
-            return Err(format!("expected float at {}", self.pos));
-        }
-        std::str::from_utf8(&self.data[start..self.pos])
-            .map_err(|_| "invalid float UTF-8".to_string())?
-            .parse::<f64>()
-            .map_err(|_| "float parse error".to_string())
+        out.push(list);
     }
-
-    fn skip_value(&mut self) -> Result<(), String> {
-        match self.peek() {
-            Some(b'"') => {
-                let _ = self.parse_string()?;
-                Ok(())
-            }
-            Some(b'{') => {
-                self.pos += 1;
-                if self.peek() == Some(b'}') {
-                    self.pos += 1;
-                    return Ok(());
-                }
-                loop {
-                    let _ = self.parse_string()?;
-                    self.expect(b':')?;
-                    self.skip_value()?;
-                    match self.peek() {
-                        Some(b',') => self.pos += 1,
-                        Some(b'}') => {
-                            self.pos += 1;
-                            return Ok(());
-                        }
-                        _ => return Err(format!("malformed object at {}", self.pos)),
-                    }
-                }
-            }
-            Some(b'[') => {
-                self.pos += 1;
-                if self.peek() == Some(b']') {
-                    self.pos += 1;
-                    return Ok(());
-                }
-                loop {
-                    self.skip_value()?;
-                    match self.peek() {
-                        Some(b',') => self.pos += 1,
-                        Some(b']') => {
-                            self.pos += 1;
-                            return Ok(());
-                        }
-                        _ => return Err(format!("malformed array at {}", self.pos)),
-                    }
-                }
-            }
-            Some(b't') => self.consume_literal(b"true"),
-            Some(b'f') => self.consume_literal(b"false"),
-            Some(b'n') => self.consume_literal(b"null"),
-            Some(b'-' | b'0'..=b'9') => {
-                let _ = self.parse_f64()?;
-                Ok(())
-            }
-            other => Err(format!("unexpected JSON token {:?} at {}", other, self.pos)),
-        }
-    }
-
-    fn consume_literal(&mut self, lit: &[u8]) -> Result<(), String> {
-        self.skip_ws();
-        if self.data.get(self.pos..self.pos + lit.len()) == Some(lit) {
-            self.pos += lit.len();
-            Ok(())
-        } else {
-            Err(format!("expected literal at {}", self.pos))
-        }
-    }
-
-    fn parse_u8_array(&mut self) -> Result<Vec<u8>, String> {
-        self.expect(b'[')?;
-        let mut out = Vec::new();
-        if self.peek() == Some(b']') {
-            self.pos += 1;
-            return Ok(out);
-        }
-        loop {
-            out.push(self.parse_u64()? as u8);
-            match self.peek() {
-                Some(b',') => self.pos += 1,
-                Some(b']') => {
-                    self.pos += 1;
-                    return Ok(out);
-                }
-                _ => return Err(format!("expected ',' or ']' at {}", self.pos)),
-            }
-        }
-    }
-
-    fn parse_f64_triple(&mut self) -> Result<[f64; 3], String> {
-        self.expect(b'[')?;
-        let a = self.parse_f64()?;
-        self.expect(b',')?;
-        let b = self.parse_f64()?;
-        self.expect(b',')?;
-        let c = self.parse_f64()?;
-        self.expect(b']')?;
-        Ok([a, b, c])
-    }
-
-    fn parse_blocks(&mut self) -> Result<Vec<(String, u32, u32)>, String> {
-        self.expect(b'[')?;
-        let mut out = Vec::new();
-        if self.peek() == Some(b']') {
-            self.pos += 1;
-            return Ok(out);
-        }
-        loop {
-            self.expect(b'[')?;
-            let name = self.parse_string()?;
-            self.expect(b',')?;
-            let base = self.parse_u64()? as u32;
-            self.expect(b',')?;
-            let len = self.parse_u64()? as u32;
-            self.expect(b']')?;
-            out.push((name, base, len));
-            match self.peek() {
-                Some(b',') => self.pos += 1,
-                Some(b']') => {
-                    self.pos += 1;
-                    return Ok(out);
-                }
-                _ => return Err(format!("expected ',' or ']' in blocks at {}", self.pos)),
-            }
-        }
-    }
-
-    fn parse_shapes(&mut self) -> Result<Vec<LocalBox>, String> {
-        self.expect(b'[')?;
-        let mut out = Vec::new();
-        if self.peek() == Some(b']') {
-            self.pos += 1;
-            return Ok(out);
-        }
-        loop {
-            self.expect(b'{')?;
-            let mut min = [0.0; 3];
-            let mut max = [0.0; 3];
-            if self.peek() != Some(b'}') {
-                loop {
-                    let key = self.parse_string()?;
-                    self.expect(b':')?;
-                    match key.as_str() {
-                        "min" => min = self.parse_f64_triple()?,
-                        "max" => max = self.parse_f64_triple()?,
-                        _ => self.skip_value()?,
-                    }
-                    match self.peek() {
-                        Some(b',') => self.pos += 1,
-                        Some(b'}') => break,
-                        _ => return Err(format!("malformed shape object at {}", self.pos)),
-                    }
-                }
-            }
-            self.expect(b'}')?;
-            out.push(LocalBox { min, max });
-            match self.peek() {
-                Some(b',') => self.pos += 1,
-                Some(b']') => {
-                    self.pos += 1;
-                    return Ok(out);
-                }
-                _ => return Err(format!("expected ',' or ']' in shapes at {}", self.pos)),
-            }
-        }
-    }
-
-    fn parse_collision_shapes(&mut self) -> Result<Vec<Vec<u16>>, String> {
-        self.expect(b'[')?;
-        let mut out = Vec::new();
-        if self.peek() == Some(b']') {
-            self.pos += 1;
-            return Ok(out);
-        }
-        loop {
-            self.expect(b'[')?;
-            let mut list = Vec::new();
-            if self.peek() != Some(b']') {
-                loop {
-                    list.push(self.parse_u64()? as u16);
-                    match self.peek() {
-                        Some(b',') => self.pos += 1,
-                        Some(b']') => break,
-                        _ => return Err(format!("malformed collision list at {}", self.pos)),
-                    }
-                }
-            }
-            self.expect(b']')?;
-            out.push(list);
-            match self.peek() {
-                Some(b',') => self.pos += 1,
-                Some(b']') => {
-                    self.pos += 1;
-                    return Ok(out);
-                }
-                _ => {
-                    return Err(format!(
-                        "expected ',' or ']' in collision_shapes at {}",
-                        self.pos
-                    ))
-                }
-            }
-        }
-    }
+    Ok(out)
 }
 
 fn parse_block_states_json(raw: &[u8]) -> Result<ParsedBlockStates, String> {
-    let mut scanner = JsonScanner::new(raw);
-    scanner.expect(b'{')?;
+    let text = std::str::from_utf8(raw)
+        .map_err(|_| "block_states_1211.json is not valid UTF-8".to_string())?;
+    // The asset holds ~26k states and ~300k values; bound depth and input but
+    // leave the node budget effectively unbounded like the old scanner did.
+    let limits = megu_core::json::JsonLimits {
+        max_depth: 64,
+        max_nodes: usize::MAX,
+        max_bytes: usize::MAX,
+    };
+    let root = megu_core::json::parse_json_with_limits(text, limits, false)
+        .map_err(|e| format!("block_states_1211.json: {e}"))?;
+    let Some(entries) = root.as_object() else {
+        return Err("block_states_1211.json: top level is not an object".to_string());
+    };
     let mut parsed = ParsedBlockStates {
         blocks: Vec::new(),
         flags: Vec::new(),
@@ -903,26 +724,17 @@ fn parse_block_states_json(raw: &[u8]) -> Result<ParsedBlockStates, String> {
         shapes: Vec::new(),
         collision_shapes: Vec::new(),
     };
-    if scanner.peek() == Some(b'}') {
-        return Ok(parsed);
-    }
-    loop {
-        let key = scanner.parse_string()?;
-        scanner.expect(b':')?;
+    for (key, value) in entries {
         match key.as_str() {
-            "blocks" => parsed.blocks = scanner.parse_blocks()?,
-            "flags" => parsed.flags = scanner.parse_u8_array()?,
-            "full_sides" => parsed.full_sides = scanner.parse_u8_array()?,
-            "shapes" => parsed.shapes = scanner.parse_shapes()?,
-            "collision_shapes" => parsed.collision_shapes = scanner.parse_collision_shapes()?,
-            _ => scanner.skip_value()?,
-        }
-        match scanner.peek() {
-            Some(b',') => scanner.pos += 1,
-            Some(b'}') => return Ok(parsed),
-            _ => return Err(format!("malformed top-level JSON at {}", scanner.pos)),
+            "blocks" => parsed.blocks = parse_state_block_rows(value)?,
+            "flags" => parsed.flags = parse_u8_list(value, "flags")?,
+            "full_sides" => parsed.full_sides = parse_u8_list(value, "full_sides")?,
+            "shapes" => parsed.shapes = parse_shape_list(value)?,
+            "collision_shapes" => parsed.collision_shapes = parse_collision_shapes(value)?,
+            _ => {}
         }
     }
+    Ok(parsed)
 }
 
 // ---------------------------------------------------------------------------
