@@ -1829,6 +1829,15 @@ fn hopper_probe_epoch_in_dim(dim: DimId, hx: i32, hy: i32, hz: i32, dst: (i32, i
         acc = mixv(acc, s.z.to_bits());
     }
     SUCTION_SNAP_SCRATCH.with(|s| scratch_return(s, snaps));
+    #[cfg(feature = "mod-suite")]
+    if hopper_cap_endpoint_present(dim, above) || hopper_cap_endpoint_present(dim, dst) {
+        // A capability-bus endpoint's contents live outside every watcher
+        // above: the bus has no revision to fold in, so the only honest
+        // fingerprint is one that can never repeat — a hopper facing a mod
+        // block re-scans every visit and the backoff ladder still bounds
+        // the idle cost.
+        acc = mixv(acc, HOPPER_CAP_PROBE_NONCE.fetch_add(1, Ordering::Relaxed));
+    }
     acc
 }
 /// Per-hopper sleep state: the fingerprint recorded after the last scan and
@@ -2199,6 +2208,14 @@ fn hopper_transfer_dim(dim: DimId, pos: BlockPos, state: u32) -> Option<(BlockPo
     }
     let mut did = hopper_push_dim(dim, pos.0, pos.1, pos.2, dst);
     did |= hopper_pull_dim(dim, pos.0, pos.1, pos.2);
+    // The Overworld `hopper_tick` runs the item-entity half of
+    // `suckInItems` itself after this returns (its sleep probe fingerprints
+    // that state), so `hopper_suck` stays a second call there.
+    // `dim_hopper_tick` has no second call site — non-Overworld hoppers
+    // take the same push-pull-suck order here instead.
+    if dim != DimId::Overworld {
+        did |= hopper_suck_in_dim(dim, pos.0, pos.1, pos.2);
+    }
     Some((dst, did))
 }
 
@@ -2298,6 +2315,263 @@ fn hopper_pull_furnace(pos: DimBlockPos) -> Option<(i64, Comps)> {
     hopper_furnace_sync(pos);
     Some(result)
 }
+
+// ---------------------------------------------------------------------------
+// XMOD1-HOPPER: vanilla hopper <-> BlockCapabilityBus bridge.
+// A hopper facing a block no vanilla container or furnace claims falls
+// through to these two entry points; under `mod-suite` they speak the same
+// `live_cap_insert_item`/`live_cap_extract_item` contract every mod endpoint
+// on the shared bus answers, so hoppers feed Create belts/depots/presses,
+// Farmer's Delight cooking pots and any profile-declared mod machine — and
+// pull their outputs back out. Without the feature the entry points are the
+// old early-exit `false` and nothing on the vanilla path changes.
+// ---------------------------------------------------------------------------
+
+/// Marker framing `write_comps` output inside a bus `raw_components` blob.
+/// A blob the hopper pushed itself decodes back to the exact `Comps`; one a
+/// foreign mod wrote keeps its opaque wrapper so a re-push emits it
+/// byte-identical.
+#[cfg(feature = "mod-suite")]
+const HOPPER_CAP_COMPS_TAG: &[u8; 4] = b"MCP1";
+/// Synthetic component type holding a foreign endpoint's opaque
+/// `raw_components` verbatim. No real 1.21.1 component id can collide with
+/// it, and the enforced single-entry shape makes the wrapper unforgeable.
+#[cfg(feature = "mod-suite")]
+const HOPPER_CAP_FOREIGN_COMP: i64 = i64::MAX;
+
+/// `Comps` -> the `raw_components` blob a capability endpoint carries: the
+/// foreign-blob wrapper unwraps verbatim, empty stays empty (so the Create
+/// duct fast path still applies), anything else encodes behind the tag.
+#[cfg(feature = "mod-suite")]
+fn hopper_cap_comps_encode(comps: &Comps) -> Vec<u8> {
+    if comps.len() == 1 && comps[0].0 == HOPPER_CAP_FOREIGN_COMP {
+        return comps[0].1.clone();
+    }
+    if comps.is_empty() {
+        return Vec::new();
+    }
+    let mut raw = Vec::with_capacity(comps.len().saturating_mul(8).saturating_add(4));
+    raw.extend_from_slice(HOPPER_CAP_COMPS_TAG);
+    write_comps(&mut raw, comps);
+    raw
+}
+
+/// `raw_components` -> `Comps`: only a blob that re-encodes byte-identical
+/// is accepted as our own tagged encoding — everything else becomes the
+/// opaque foreign wrapper so round-trips through the hopper never rewrite a
+/// mod's bytes.
+#[cfg(feature = "mod-suite")]
+fn hopper_cap_comps_decode(raw: &[u8]) -> Comps {
+    if let Some(body) = raw.strip_prefix(HOPPER_CAP_COMPS_TAG) {
+        let mut p = 0;
+        let comps = read_comps(body, &mut p);
+        if hopper_cap_comps_encode(&comps) == raw {
+            return comps;
+        }
+    }
+    if raw.is_empty() {
+        Vec::new()
+    } else {
+        vec![(HOPPER_CAP_FOREIGN_COMP, raw.to_vec())]
+    }
+}
+
+/// `ejectItems` fallback for a destination no vanilla container or furnace
+/// claims: under `mod-suite` the cell may host a capability-bus item
+/// endpoint. Vanilla scans the hopper's slots in order and ejects one item
+/// from the first the destination accepts — the same candidate order the
+/// container and furnace paths use — so a cell with no endpoint answers `0`
+/// for every slot and the whole probe costs the bus lookup alone.
+#[cfg(feature = "mod-suite")]
+fn hopper_push_mod_target(dim: DimId, hx: i32, hy: i32, hz: i32, dst: BlockPos) -> bool {
+    let source_pos = ContainerKey::Block((dim, hx, hy, hz));
+    let mut candidates: Vec<(i16, Stack)> = chests()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .get(&source_pos)
+        .into_iter()
+        .flat_map(|slots| slots.iter())
+        .filter(|(_, stack)| stack.1 > 0)
+        .map(|(slot, stack)| (*slot, stack.clone()))
+        .collect();
+    candidates.sort_by_key(|(slot, _)| *slot);
+    // The face the items enter through, read off the destination block: a
+    // hopper above a depot pushes through its Up face, one beside a press
+    // through its side.
+    let face = live_cap_face_of((hx - dst.0, hy - dst.1, hz - dst.2));
+    for (source_slot, (item, _, comps)) in candidates {
+        if live_cap_insert_item(
+            dim,
+            dst.0,
+            dst.1,
+            dst.2,
+            Some(face),
+            &live_cap_item_name(item),
+            1,
+            &hopper_cap_comps_encode(&comps),
+            false,
+        ) == 0
+        {
+            continue;
+        }
+        let mut all = chests().lock().unwrap_or_else(|e| e.into_inner());
+        let mut remove_source = false;
+        if let Some(source) = all
+            .get_mut(&source_pos)
+            .and_then(|slots| slots.get_mut(&source_slot))
+        {
+            // Re-check the slot identity before decrementing: a concurrent
+            // GUI move must never turn the accepted push into the loss of
+            // an unrelated stack.
+            if source.0 == item && source.2 == comps && source.1 > 0 {
+                source.1 -= 1;
+                remove_source = source.1 == 0;
+            }
+        }
+        if remove_source {
+            if let Some(slots) = all.get_mut(&source_pos) {
+                slots.remove(&source_slot);
+            }
+        }
+        return true;
+    }
+    false
+}
+
+/// Without `mod-suite` no capability bus exists, so a non-container
+/// destination still swallows nothing — the vanilla early exit verbatim.
+#[cfg(not(feature = "mod-suite"))]
+fn hopper_push_mod_target(_dim: DimId, _hx: i32, _hy: i32, _hz: i32, _dst: BlockPos) -> bool {
+    false
+}
+
+/// Whether `pos` hosts anything a hopper could move items through: a bus
+/// item endpoint, or a Create cell whose duct fast path bypasses the bus.
+/// Used by the sleep probe — a hopper watching a mod block must never
+/// trust an unchanged fingerprint, because the shared bus keeps no content
+/// revision the probe could fold in and its mutations are invisible to
+/// every watcher above.
+#[cfg(feature = "mod-suite")]
+fn hopper_cap_endpoint_present(dim: DimId, pos: BlockPos) -> bool {
+    let coord = live_cap_coord(dim, pos.0, pos.1, pos.2);
+    if live_cap_bus()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .item_endpoint(&coord)
+        .is_some()
+    {
+        return true;
+    }
+    let fpos = FactoryPos::new(dim.raw() as i32, pos.0, pos.1, pos.2);
+    live_cap_state()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .create_cells
+        .contains_key(&fpos)
+}
+
+/// Every call yields a fresh value: mixing one into a probe epoch makes it
+/// unmatchable, which is how a hopper facing a capability-bus block is
+/// kept re-scanning instead of sleeping through a mod machine's output.
+#[cfg(feature = "mod-suite")]
+static HOPPER_CAP_PROBE_NONCE: AtomicU64 = AtomicU64::new(0);
+
+/// `suckInItems` container fallback for a source block no vanilla container
+/// or furnace claims: under `mod-suite` it may expose a capability-bus item
+/// endpoint the hopper pulls finished items out of. The probe is
+/// simulate-then-commit — a full hopper, or a stack the internal item table
+/// cannot name, leaves the endpoint untouched so nothing duplicates or
+/// vanishes.
+#[cfg(feature = "mod-suite")]
+fn hopper_pull_mod_source(dim: DimId, hx: i32, hy: i32, hz: i32) -> bool {
+    let src = (hx, hy + 1, hz);
+    // The face of the SOURCE block the hopper pulls through: the hopper
+    // sits below it, so extraction goes through its Down face.
+    let face = FaceDirection::Down;
+    let Some(probe) = live_cap_extract_item(dim, src.0, src.1, src.2, Some(face), 1, true)
+    else {
+        return false;
+    };
+    let Some(probe_item) = name_to_item(&probe.item_id) else {
+        return false;
+    };
+    let probe_comps = hopper_cap_comps_decode(&probe.raw_components);
+    let own_pos = ContainerKey::Block((dim, hx, hy, hz));
+    // Capacity check mirrors the container path exactly: merge onto a
+    // partial matching stack first, else the first empty of the five slots.
+    let fits = {
+        let mut all = chests().lock().unwrap_or_else(|e| e.into_inner());
+        let own = all.entry(own_pos).or_default();
+        let max = item_stack_max(probe_item, &probe_comps) as u8;
+        own.iter()
+            .filter(|(slot, stack)| {
+                **slot < HOPPER_SLOTS
+                    && stack.0 == probe_item
+                    && stack.2 == probe_comps
+                    && stack.1 < max
+            })
+            .map(|(slot, _)| *slot)
+            .min()
+            .or_else(|| (0..HOPPER_SLOTS).find(|slot| !own.contains_key(slot)))
+            .is_some()
+    };
+    if !fits {
+        return false;
+    }
+    let Some(stack) = live_cap_extract_item(dim, src.0, src.1, src.2, Some(face), 1, false)
+    else {
+        return false;
+    };
+    // The committed stack is what actually lands — re-resolve it in case
+    // the endpoint's state raced the probe. Whatever cannot land is pushed
+    // straight back onto the bus so nothing is ever dropped or duplicated.
+    let mut moved = 0u32;
+    if let Some(item) = name_to_item(&stack.item_id) {
+        let comps = hopper_cap_comps_decode(&stack.raw_components);
+        let max = item_stack_max(item, &comps) as u8;
+        let mut all = chests().lock().unwrap_or_else(|e| e.into_inner());
+        let own = all.entry(own_pos).or_default();
+        let mut remaining = stack.count.min(u8::MAX as u32) as u8;
+        while remaining > 0 {
+            let slot = own
+                .iter()
+                .filter(|(s, v)| {
+                    **s < HOPPER_SLOTS && v.0 == item && v.2 == comps && v.1 < max
+                })
+                .map(|(s, _)| *s)
+                .min()
+                .or_else(|| (0..HOPPER_SLOTS).find(|s| !own.contains_key(s)));
+            let Some(slot) = slot else { break };
+            let cur = own.get(&slot).map(|v| v.1).unwrap_or(0);
+            let take = remaining.min(max - cur);
+            own.insert(slot, (item, cur + take, comps.clone()));
+            remaining -= take;
+        }
+        moved = u32::from(stack.count.min(u8::MAX as u32) as u8 - remaining);
+    }
+    if moved < stack.count {
+        live_cap_insert_item(
+            dim,
+            src.0,
+            src.1,
+            src.2,
+            Some(face),
+            &stack.item_id,
+            stack.count - moved,
+            &stack.raw_components,
+            false,
+        );
+    }
+    moved > 0
+}
+
+/// Without `mod-suite` no capability bus exists, so a non-container source
+/// still yields nothing — the vanilla early exit verbatim.
+#[cfg(not(feature = "mod-suite"))]
+fn hopper_pull_mod_source(_dim: DimId, _hx: i32, _hy: i32, _hz: i32) -> bool {
+    false
+}
+
 /// Vanilla `ejectItems`: one item from the hopper's first compatible slot into
 /// the facing container. The dimension is carried through every world and
 /// block-entity lookup, including custom registered dimensions.
@@ -2337,7 +2611,7 @@ fn hopper_push_dim(dim: DimId, hx: i32, hy: i32, hz: i32, dst: BlockPos) -> bool
     }
 
     let Some(dst_slots) = hopper_container_slots(dim, dst) else {
-        return false;
+        return hopper_push_mod_target(dim, hx, hy, hz, dst);
     };
     unpack_block_loot_if_needed((dim, dst.0, dst.1, dst.2));
     let partner = chest_partner_dim(dim, dst.0, dst.1, dst.2);
@@ -2419,7 +2693,7 @@ fn hopper_pull_dim(dim: DimId, hx: i32, hy: i32, hz: i32) -> bool {
     }
 
     let Some(src_slots) = hopper_container_slots(dim, src) else {
-        return false;
+        return hopper_pull_mod_source(dim, hx, hy, hz);
     };
     unpack_block_loot_if_needed((dim, src.0, src.1, src.2));
     let partner = chest_partner_dim(dim, src.0, src.1, src.2);
@@ -19549,5 +19823,249 @@ mod s5_multidim_tests {
         *c.open_chest.lock().unwrap_or_else(|e| e.into_inner()) = None;
         let mut all = chests().lock().unwrap_or_else(|e| e.into_inner());
         all.remove(&win.0);
+    }
+}
+
+/// XMOD1-HOPPER: vanilla hoppers against `BlockCapabilityBus` endpoints.
+/// `live_cap_register_slot_inventory` stands in for "any mod machine on the
+/// bus" — the hopper code cannot tell it apart from a Create depot or a
+/// cooking pot, which is exactly the seam under test. These tests need the
+/// bus and the flat container map only; no block registry is required
+/// because an unplaced (air) cell is never a vanilla container.
+#[cfg(all(test, feature = "mod-suite"))]
+mod xmod1_hopper_cap_tests {
+    use super::*;
+
+    fn hopper_put(dim: DimId, pos: BlockPos, slot: i16, stack: Stack) {
+        chests()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .entry(ContainerKey::at(dim, pos))
+            .or_default()
+            .insert(slot, stack);
+    }
+
+    fn hopper_stacks(dim: DimId, pos: BlockPos) -> Vec<(i16, Stack)> {
+        let mut stacks: Vec<_> = chests()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(&ContainerKey::at(dim, pos))
+            .into_iter()
+            .flat_map(|slots| slots.iter())
+            .filter(|(_, stack)| stack.1 > 0)
+            .map(|(slot, stack)| (*slot, stack.clone()))
+            .collect();
+        stacks.sort_by_key(|(slot, _)| *slot);
+        stacks
+    }
+
+    fn hopper_clear(dim: DimId, pos: BlockPos) {
+        chests()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(&ContainerKey::at(dim, pos));
+    }
+
+    /// One vanilla hopper ejects a single item into a registered bus
+    /// endpoint in every dimension flavour — Overworld, Nether and an
+    /// unregistered custom `DimId` — with strict item conservation, and the
+    /// vanilla eight-tick transfer cooldown lands through the shared
+    /// scheduler on success.
+    #[test]
+    fn hopper_pushes_into_capability_endpoint_across_dims() {
+        let _g = world_guard();
+        live_cap_reset();
+        let iron = name_to_item("iron_ingot").expect("iron ingot item");
+        for (i, dim) in [
+            DimId::Overworld,
+            DimId::Nether,
+            DimId::from_raw(7),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let hpos = (8_800_100 + i as i32 * 16, 70, -8_800_100);
+            let dst = (hpos.0, hpos.1 - 1, hpos.2); // hopper faces down
+            live_cap_register_slot_inventory(dim, dst.0, dst.1, dst.2, 4, 64);
+            hopper_put(dim, hpos, 0, (iron, 5, Vec::new()));
+            // A neighbouring cell with no endpoint answers `0` — the push
+            // leaves the hopper untouched, exactly like a vanilla air cell.
+            assert!(!hopper_push_dim(dim, hpos.0, hpos.1, hpos.2, (hpos.0 + 1, hpos.1, hpos.2)));
+            assert_eq!(hopper_stacks(dim, hpos), vec![(0, (iron, 5, Vec::new()))]);
+
+            assert!(hopper_push_dim(dim, hpos.0, hpos.1, hpos.2, dst));
+            assert_eq!(
+                hopper_stacks(dim, hpos),
+                vec![(0, (iron, 4, Vec::new()))],
+                "one item per activation, dim {dim:?}"
+            );
+            let landed = live_cap_extract_item(dim, dst.0, dst.1, dst.2, None, 64, false)
+                .expect("the endpoint received the ejected item");
+            assert_eq!(landed.item_id, "minecraft:iron_ingot");
+            assert_eq!(landed.count, 1, "zero duplication/loss across the hop");
+            assert!(landed.raw_components.is_empty());
+
+            // A successful move arms the vanilla 8-tick transfer cooldown.
+            hopper_sched_result(dim, hpos, true);
+            let now = TICK_IDX.load(Ordering::Relaxed);
+            assert_eq!(
+                backoff()
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .get(&(dim, hpos.0, hpos.1, hpos.2))
+                    .copied(),
+                Some((now + server_ticks(HOPPER_TRANSFER_COOLDOWN as u64), 0)),
+                "a successful push arms the 8-tick vanilla cooldown"
+            );
+            TICK_IDX.fetch_add(server_ticks(HOPPER_TRANSFER_COOLDOWN as u64 - 1), Ordering::Relaxed);
+            assert!(
+                !sched_ready_dim(dim, hpos.0, hpos.1, hpos.2),
+                "tick 7 of the cooldown must still block the hopper"
+            );
+            TICK_IDX.fetch_add(1, Ordering::Relaxed);
+            assert!(sched_ready_dim(dim, hpos.0, hpos.1, hpos.2));
+
+            backoff()
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .remove(&(dim, hpos.0, hpos.1, hpos.2));
+            live_cap_unregister(dim, dst.0, dst.1, dst.2);
+            hopper_clear(dim, hpos);
+        }
+        live_cap_reset();
+    }
+
+    /// A vanilla hopper under a bus endpoint pulls finished items out —
+    /// simulate-then-commit means a full hopper (or a stack the internal
+    /// item table cannot name) never deletes or duplicates cargo, and a
+    /// foreign `raw_components` blob rides the hopper's slots back onto the
+    /// bus byte-identical.
+    #[test]
+    fn hopper_pulls_from_capability_endpoint_simulate_first() {
+        let _g = world_guard();
+        live_cap_reset();
+        let dim = DimId::Nether;
+        let hpos = (8_800_200, 70, -8_800_200);
+        let src = (hpos.0, hpos.1 + 1, hpos.2);
+        let beef = name_to_item("cooked_beef").expect("cooked beef item");
+        let stone = name_to_item("stone").expect("stone item");
+        let iron = name_to_item("iron_ingot").expect("iron ingot item");
+        live_cap_register_slot_inventory(dim, src.0, src.1, src.2, 4, 64);
+        assert_eq!(
+            live_cap_insert_item(dim, src.0, src.1, src.2, None, "minecraft:cooked_beef", 3, &[], false),
+            3
+        );
+        // A foreign mod item with no internal id is not pullable — the
+        // probe sees it but the commit never runs, so nothing is lost.
+        assert_eq!(
+            live_cap_insert_item(dim, src.0, src.1, src.2, None, "mod_a:focus_gem", 1, &[0xAB, 0xCD], false),
+            1
+        );
+        // Five full slots of stone: the pull must report no room WITHOUT
+        // committing — the endpoint keeps every item.
+        for slot in 0..5 {
+            hopper_put(dim, hpos, slot, (stone, 64, Vec::new()));
+        }
+        assert!(!hopper_pull_dim(dim, hpos.0, hpos.1, hpos.2));
+        assert_eq!(
+            hopper_stacks(dim, hpos).iter().map(|(_, s)| (s.0, s.1)).collect::<Vec<_>>(),
+            vec![(stone, 64); 5],
+            "a refused pull leaves the hopper untouched"
+        );
+        let held = live_cap_extract_item(dim, src.0, src.1, src.2, None, 64, true)
+            .expect("endpoint still holds cargo after the refused pull");
+        assert_eq!(held.item_id, "minecraft:cooked_beef");
+        assert_eq!(held.count, 3, "simulate-before-commit: nothing was consumed");
+
+        // Room for one stack: the cooked beef lands, the foreign gem stays.
+        hopper_clear(dim, hpos);
+        for want in 1..=3u8 {
+            assert!(hopper_pull_dim(dim, hpos.0, hpos.1, hpos.2));
+            assert_eq!(
+                hopper_stacks(dim, hpos),
+                vec![(0, (beef, want, Vec::new()))],
+                "pulled beef merges onto the hopper's own stack"
+            );
+        }
+        // Only the unresolvable gem is left: the probe sees it, the commit
+        // never runs — the pull reports nothing and the endpoint keeps it.
+        assert!(!hopper_pull_dim(dim, hpos.0, hpos.1, hpos.2));
+        let mut drained = Vec::new();
+        while let Some(stack) =
+            live_cap_extract_item(dim, src.0, src.1, src.2, None, 64, false)
+        {
+            drained.push((stack.item_id, stack.count, stack.raw_components));
+        }
+        assert_eq!(
+            drained,
+            vec![("mod_a:focus_gem".to_string(), 1, vec![0xAB, 0xCD])],
+            "no duplication or loss across the refused and accepted pulls"
+        );
+
+        // A resolvable item carrying a foreign components blob keeps it
+        // verbatim through the pull AND a later re-push.
+        assert_eq!(
+            live_cap_insert_item(dim, src.0, src.1, src.2, None, "minecraft:iron_ingot", 1, &[7, 7, 7], false),
+            1
+        );
+        assert!(hopper_pull_dim(dim, hpos.0, hpos.1, hpos.2));
+        let wrapped = vec![(HOPPER_CAP_FOREIGN_COMP, vec![7, 7, 7])];
+        assert_eq!(
+            hopper_stacks(dim, hpos),
+            vec![(0, (beef, 3, Vec::new())), (1, (iron, 1, wrapped.clone()))]
+        );
+        let other = (hpos.0 + 1, hpos.1, hpos.2);
+        live_cap_register_slot_inventory(dim, other.0, other.1, other.2, 4, 64);
+        // Beef is the first non-empty slot — it ejects one per activation
+        // until it drains, then the component-wrapped iron goes, its
+        // foreign blob leaving the hopper byte-identical.
+        for _ in 0..3 {
+            assert!(hopper_push_mod_target(dim, hpos.0, hpos.1, hpos.2, other));
+        }
+        assert!(hopper_push_mod_target(dim, hpos.0, hpos.1, hpos.2, other));
+        assert!(hopper_stacks(dim, hpos).is_empty(), "the hopper drained");
+        let mut back = Vec::new();
+        while let Some(stack) =
+            live_cap_extract_item(dim, other.0, other.1, other.2, None, 64, false)
+        {
+            back.push((stack.item_id, stack.count, stack.raw_components));
+        }
+        assert_eq!(
+            back,
+            vec![
+                ("minecraft:cooked_beef".to_string(), 3, Vec::new()),
+                ("minecraft:iron_ingot".to_string(), 1, vec![7, 7, 7]),
+            ],
+            "a foreign blob round-trips through the hopper byte-identical"
+        );
+
+        live_cap_unregister(dim, src.0, src.1, src.2);
+        live_cap_unregister(dim, other.0, other.1, other.2);
+        hopper_clear(dim, hpos);
+        live_cap_reset();
+    }
+
+    /// The `Comps` <-> `raw_components` codec: a real component set encodes
+    /// behind the tag and decodes losslessly, the foreign wrapper unwraps
+    /// verbatim, and a blob that merely borrows the prefix stays opaque.
+    #[test]
+    fn hopper_cap_comps_codec_roundtrip() {
+        let comps: Comps = vec![(COMP_CUSTOM_NAME, vec![1, 2, 3]), (COMP_LORE, vec![4, 5])];
+        let raw = hopper_cap_comps_encode(&comps);
+        assert_eq!(&raw[..4], HOPPER_CAP_COMPS_TAG);
+        assert_eq!(hopper_cap_comps_decode(&raw), comps);
+        // Empty stays empty so the Create duct fast path still applies.
+        assert!(hopper_cap_comps_encode(&Vec::new()).is_empty());
+        assert_eq!(hopper_cap_comps_decode(&[]), Vec::<(i64, Vec<u8>)>::new());
+        // Foreign wrapper unwraps verbatim.
+        let wrapped: Comps = vec![(HOPPER_CAP_FOREIGN_COMP, vec![9, 9])];
+        assert_eq!(hopper_cap_comps_encode(&wrapped), vec![9, 9]);
+        // A blob that only borrows the prefix but is not our encoding stays
+        // opaque instead of misparsing.
+        let mut fake = HOPPER_CAP_COMPS_TAG.to_vec();
+        fake.extend_from_slice(&[0xFF, 0xFF, 0x7F]);
+        let decoded = hopper_cap_comps_decode(&fake);
+        assert_eq!(decoded, vec![(HOPPER_CAP_FOREIGN_COMP, fake.clone())]);
+        assert_eq!(hopper_cap_comps_encode(&decoded), fake);
     }
 }
