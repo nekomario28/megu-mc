@@ -16,6 +16,11 @@ impl ContainerKey {
     fn ow(pos: BlockPos) -> Self {
         ContainerKey::Block(ow_block(pos))
     }
+    /// The block key for `pos` in `dim` — the shape `ContainerKey::Block` carries natively, so a
+    /// Nether chest and an Overworld chest at the same coordinates stay separate containers.
+    fn at(dim: DimId, pos: BlockPos) -> Self {
+        ContainerKey::Block((dim, pos.0, pos.1, pos.2))
+    }
 }
 
 /// A smelting recipe from a datapack: ingredient, result, count, experience.
@@ -769,6 +774,38 @@ fn drops() -> &'static Mutex<Vec<Drop>> {
     DROPS.get_or_init(|| Mutex::new(Vec::new()))
 }
 
+/// Item entities are dimensionless in storage — `Drop` predates dimensions
+/// and every literal construction in `main.rs`/`play_protocol.rs` shares that
+/// shape — so the dimension an entity was spawned in rides in this side index
+/// keyed by eid. Unregistered eids answer `DimId::Overworld`, matching the
+/// world every pre-dim spawn meant. `drop_tick` prunes ids as they despawn.
+static DROP_DIMS: OnceLock<Mutex<HashMap<i32, DimId>>> = OnceLock::new();
+fn drop_dims() -> &'static Mutex<HashMap<i32, DimId>> {
+    DROP_DIMS.get_or_init(|| Mutex::new(HashMap::new()))
+}
+/// Record a spawn's dimension. Overworld stays implicit so the index holds
+/// only the exceptions and stays empty on an Overworld-only world.
+fn note_drop_dim(eid: i32, dim: DimId) {
+    if dim != DimId::Overworld {
+        drop_dims()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(eid, dim);
+    }
+}
+/// The dimension an eid's item entity lives in, `DimId::Overworld` when no
+/// non-Overworld spawn ever registered it. Readers that scan a whole pool
+/// hoist the `drop_dims()` lock instead; single-lookup callers use this.
+#[allow(dead_code)]
+fn drop_dim_of(eid: i32) -> DimId {
+    drop_dims()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .get(&eid)
+        .copied()
+        .unwrap_or(DimId::Overworld)
+}
+
 // blockstate -> dropped item id (vanilla: stone->cobblestone, grass->dirt)
 /// The item a block drops, owned by the block registry, which reads it from the same
 /// asset everything else comes from. The hand table this replaced listed 13 states out
@@ -1057,9 +1094,11 @@ fn drop_pending() -> &'static Mutex<HashSet<i32>> {
 /// `merge_drops` pass is already cheap and this path stays unobservable.
 const DROP_MERGE_FLOOR: usize = 256;
 
-/// Spawn an item entity, marking it merge-pending so the next `drop_tick`
-/// pass can collapse a spawn burst inside the same tick.
-fn drop_spawn(
+/// `drop_spawn` in `dim`: same spawn, plus the side-index entry that tells
+/// dimension-aware readers (hopper suction, chunk drains) which world the
+/// entity rests in.
+fn drop_spawn_in_dim(
+    dim: DimId,
     x: f64,
     y: f64,
     z: f64,
@@ -1083,11 +1122,28 @@ fn drop_spawn(
         target,
         thrower,
     });
+    note_drop_dim(eid, dim);
     drop_pending()
         .lock()
         .unwrap_or_else(|e| e.into_inner())
         .insert(eid);
     eid
+}
+
+/// Spawn an item entity, marking it merge-pending so the next `drop_tick`
+/// pass can collapse a spawn burst inside the same tick.
+fn drop_spawn(
+    x: f64,
+    y: f64,
+    z: f64,
+    item: i64,
+    cnt: u8,
+    comps: Comps,
+    age: i32,
+    target: Option<[u8; 16]>,
+    thrower: Option<[u8; 16]>,
+) -> i32 {
+    drop_spawn_in_dim(DimId::Overworld, x, y, z, item, cnt, comps, age, target, thrower)
 }
 
 /// `drop_spawn` for world drops: the vanilla `popResource` scatter runs first,
@@ -1121,6 +1177,7 @@ fn drop_spawn_scattered(
         }
         .world_scatter(dim),
     );
+    note_drop_dim(eid, dim);
     drop_pending()
         .lock()
         .unwrap_or_else(|e| e.into_inner())
@@ -1486,6 +1543,9 @@ fn ender_container_key(uuid: &[u8; 16]) -> ContainerKey {
 #[derive(Clone)]
 struct DropCellSnap {
     eid: i32,
+    /// Spawn dimension from the side index — the probe must not answer an
+    /// Overworld suction cell with a drop resting at the same Nether coords.
+    dim: DimId,
     x: f64,
     y: f64,
     z: f64,
@@ -1563,9 +1623,11 @@ fn ensure_drop_cells() {
     }
     let mut map: HashMap<(i32, i32, i32), Vec<DropCellSnap>> =
         HashMap::with_capacity(len.saturating_mul(2).saturating_add(8));
+    let dims = drop_dims().lock().unwrap_or_else(|e| e.into_inner());
     for d in dl.iter() {
         let snap = DropCellSnap {
             eid: d.eid,
+            dim: dims.get(&d.eid).copied().unwrap_or(DimId::Overworld),
             x: d.x,
             y: d.y,
             z: d.z,
@@ -1611,20 +1673,31 @@ fn each_suction_cell(hx: i32, hy: i32, hz: i32, mut f: impl FnMut(i32, i32, i32)
 /// Whether any snap sits in the suction cell — the O(1) idle exit for
 /// `hopper_suck`. A `false` here is only reached after `ensure_drop_cells`
 /// proved the index matches `drops()` membership.
+#[allow(dead_code)] // the Overworld view of `suction_nonempty_in`
 fn suction_nonempty(hx: i32, hy: i32, hz: i32) -> bool {
+    suction_nonempty_in(DimId::Overworld, hx, hy, hz)
+}
+/// `suction_nonempty` restricted to drops spawned in `dim`.
+fn suction_nonempty_in(dim: DimId, hx: i32, hy: i32, hz: i32) -> bool {
     ensure_drop_cells();
     let dc = drop_cells().lock().unwrap_or_else(|e| e.into_inner());
     each_suction_cell(hx, hy, hz, |cx, cy, cz| {
-        dc.map
-            .get(&(cx, cy, cz))
-            .is_some_and(|v| v.iter().any(|s| in_suction_cell(s.x, s.y, s.z, hx, hy, hz)))
+        dc.map.get(&(cx, cy, cz)).is_some_and(|v| {
+            v.iter()
+                .any(|s| s.dim == dim && in_suction_cell(s.x, s.y, s.z, hx, hy, hz))
+        })
     })
 }
 /// Drops resting in `pos`'s suction cell as spawn-time snapshots, sorted by
 /// eid — the same order `hopper_suck` scans them in. The caller owns `out`
 /// (a reusable scratch buffer in the probe) so an idle visit allocates
 /// nothing.
+#[allow(dead_code)] // the Overworld view of `suction_snaps_into_in`
 fn suction_snaps_into(hx: i32, hy: i32, hz: i32, out: &mut Vec<DropCellSnap>) {
+    suction_snaps_into_in(DimId::Overworld, hx, hy, hz, out)
+}
+/// `suction_snaps_into` restricted to drops spawned in `dim`.
+fn suction_snaps_into_in(dim: DimId, hx: i32, hy: i32, hz: i32, out: &mut Vec<DropCellSnap>) {
     ensure_drop_cells();
     let dc = drop_cells().lock().unwrap_or_else(|e| e.into_inner());
     out.clear();
@@ -1632,7 +1705,7 @@ fn suction_snaps_into(hx: i32, hy: i32, hz: i32, out: &mut Vec<DropCellSnap>) {
         if let Some(v) = dc.map.get(&(cx, cy, cz)) {
             out.extend(
                 v.iter()
-                    .filter(|s| in_suction_cell(s.x, s.y, s.z, hx, hy, hz))
+                    .filter(|s| s.dim == dim && in_suction_cell(s.x, s.y, s.z, hx, hy, hz))
                     .cloned(),
             );
         }
@@ -1682,8 +1755,8 @@ fn mix_container_map(acc: u128, map: Option<&HashMap<i16, Stack>>) -> u128 {
 /// `chest_partner` for a state the caller already read: identical pairing
 /// rules, minus the redundant `block_at` — the probe fingerprints the resolved
 /// position, which is everything the partner lookup can observe.
-fn probe_partner(st: u32, pos: (i32, i32, i32)) -> Option<(i32, i32, i32)> {
-    chest_pair_of_dim(DimId::Overworld, st, pos).map(|(right, left)| {
+fn probe_partner_dim(dim: DimId, st: u32, pos: (i32, i32, i32)) -> Option<(i32, i32, i32)> {
+    chest_pair_of_dim(dim, st, pos).map(|(right, left)| {
         if pos == right {
             left
         } else {
@@ -1700,12 +1773,17 @@ fn probe_partner(st: u32, pos: (i32, i32, i32)) -> Option<(i32, i32, i32)> {
 /// drop window. `content_revision` rides along so a datapack reload can never
 /// hide behind an unchanged world image.
 fn hopper_probe_epoch(hx: i32, hy: i32, hz: i32, dst: (i32, i32, i32)) -> u128 {
+    hopper_probe_epoch_in_dim(DimId::Overworld, hx, hy, hz, dst)
+}
+/// `hopper_probe_epoch` in `dim`: identical fingerprint, read against
+/// `dim`'s blocks, dim-keyed containers and drops spawned in `dim`.
+fn hopper_probe_epoch_in_dim(dim: DimId, hx: i32, hy: i32, hz: i32, dst: (i32, i32, i32)) -> u128 {
     let own = (hx, hy, hz);
     let above = (hx, hy + 1, hz);
-    let ast = block_at(above.0, above.1, above.2);
-    let dst_st = block_at(dst.0, dst.1, dst.2);
-    let ap = probe_partner(ast, above);
-    let dp = probe_partner(dst_st, dst);
+    let ast = block_at_dim(dim, above.0, above.1, above.2);
+    let dst_st = block_at_dim(dim, dst.0, dst.1, dst.2);
+    let ap = probe_partner_dim(dim, ast, above);
+    let dp = probe_partner_dim(dim, dst_st, dst);
     let mut acc = mixv(content_revision() as u128, 0x5BD1_E995_27D4_EB2F);
     acc = mixv(acc, ast as u64);
     acc = mixv(acc, dst_st as u64);
@@ -1713,14 +1791,14 @@ fn hopper_probe_epoch(hx: i32, hy: i32, hz: i32, dst: (i32, i32, i32)) -> u128 {
     acc = mix_pos(acc, dp);
     {
         let all = chests().lock().unwrap_or_else(|e| e.into_inner());
-        acc = mix_container_map(acc, all.get(&ContainerKey::ow(own)));
-        acc = mix_container_map(acc, all.get(&ContainerKey::ow(above)));
+        acc = mix_container_map(acc, all.get(&ContainerKey::at(dim, own)));
+        acc = mix_container_map(acc, all.get(&ContainerKey::at(dim, above)));
         if let Some(p) = ap {
-            acc = mix_container_map(acc, all.get(&ContainerKey::ow(p)));
+            acc = mix_container_map(acc, all.get(&ContainerKey::at(dim, p)));
         }
-        acc = mix_container_map(acc, all.get(&ContainerKey::ow(dst)));
+        acc = mix_container_map(acc, all.get(&ContainerKey::at(dim, dst)));
         if let Some(p) = dp {
-            acc = mix_container_map(acc, all.get(&ContainerKey::ow(p)));
+            acc = mix_container_map(acc, all.get(&ContainerKey::at(dim, p)));
         }
     }
     {
@@ -1729,11 +1807,11 @@ fn hopper_probe_epoch(hx: i32, hy: i32, hz: i32, dst: (i32, i32, i32)) -> u128 {
             .into_iter()
             .flatten()
         {
-            acc = mixv(acc, u64::from(pend.contains_key(&ow_block(pos))));
+            acc = mixv(acc, u64::from(pend.contains_key(&(dim, pos.0, pos.1, pos.2))));
         }
     }
     for pos in [above, dst] {
-        if let Some(furnace) = hopper_furnace_pos(DimId::Overworld, pos) {
+        if let Some(furnace) = hopper_furnace_pos(dim, pos) {
             let slots = furnace_slot_snapshot_dim(furnace.0, (furnace.1, furnace.2, furnace.3));
             for (slot, stack) in slots.iter().enumerate() {
                 acc = mix_stack_entry(acc, slot as i16, stack);
@@ -1741,7 +1819,7 @@ fn hopper_probe_epoch(hx: i32, hy: i32, hz: i32, dst: (i32, i32, i32)) -> u128 {
         }
     }
     let mut snaps = SUCTION_SNAP_SCRATCH.with(scratch_take);
-    suction_snaps_into(hx, hy, hz, &mut snaps);
+    suction_snaps_into_in(dim, hx, hy, hz, &mut snaps);
     for s in &snaps {
         acc = mixv(acc, s.eid as u64);
         acc = mixv(acc, s.item as u64);
@@ -2406,20 +2484,28 @@ fn hopper_pull_dim(dim: DimId, hx: i32, hy: i32, hz: i32) -> bool {
 /// remainder on the entity). One entity per activation, like the engine's
 /// `attempt_suck`.
 fn hopper_suck(hx: i32, hy: i32, hz: i32) -> bool {
+    hopper_suck_in_dim(DimId::Overworld, hx, hy, hz)
+}
+/// `hopper_suck` in `dim`: only drops spawned in `dim` are candidates — a
+/// Nether drop resting at the same coordinates as the Overworld suction cell
+/// is a different entity entirely.
+fn hopper_suck_in_dim(dim: DimId, hx: i32, hy: i32, hz: i32) -> bool {
     // O(1) idle exit: the spatial index proves no drop rests in the suction
     // cell, so the vanilla scan below — a full `drops()` walk — cannot find a
     // candidate. When the index says otherwise the original scan runs
     // verbatim, so a stale-extra entry costs one scan and never a wrong take.
-    if !suction_nonempty(hx, hy, hz) {
+    if !suction_nonempty_in(dim, hx, hy, hz) {
         return false;
     }
     let mut cell = HOPPER_CELL_SCRATCH.with(scratch_take);
     {
         let dl = drops().lock().unwrap_or_else(|e| e.into_inner());
+        let dims = drop_dims().lock().unwrap_or_else(|e| e.into_inner());
         cell.extend(
             dl.iter()
                 .filter(|d| {
-                    (d.x - (hx as f64 + 0.5)).abs() < 0.7
+                    dims.get(&d.eid).copied().unwrap_or(DimId::Overworld) == dim
+                        && (d.x - (hx as f64 + 0.5)).abs() < 0.7
                         && d.y > hy as f64 + 0.4
                         && d.y < hy as f64 + 1.6
                         && (d.z - (hz as f64 + 0.5)).abs() < 0.7
@@ -2434,7 +2520,7 @@ fn hopper_suck(hx: i32, hy: i32, hz: i32) -> bool {
         let mut remaining = cnt;
         let moved = {
             let mut all = chests().lock().unwrap_or_else(|e| e.into_inner());
-            let own = all.entry(ContainerKey::ow((hx, hy, hz))).or_default();
+            let own = all.entry(ContainerKey::at(dim, (hx, hy, hz))).or_default();
             let mut moved = 0u8;
             while remaining > 0 {
                 let slot = own
@@ -2757,6 +2843,13 @@ fn drop_tick() {
             tickprof::add("drops/merge_destroy", t.elapsed());
         }
         shrink_if_sparse(&mut dp);
+        // Retire eids that left the pool. The index only ever holds
+        // non-Overworld spawns, so this stays free on an Overworld world.
+        let mut dims = drop_dims().lock().unwrap_or_else(|e| e.into_inner());
+        if !dims.is_empty() {
+            let live: HashSet<i32> = dp.iter().map(|d| d.eid).collect();
+            dims.retain(|eid, _| live.contains(eid));
+        }
     }
 }
 
@@ -2776,14 +2869,24 @@ static FURNACES: Registry<DimBlockPos, Furnace> = OnceLock::new();
 fn furnaces() -> &'static LockedMap<DimBlockPos, Furnace> {
     FURNACES.get_or_init(|| Mutex::new(HashMap::new()))
 }
-// furnace block states 4295..=4302 (facing x lit); one store for
-// containers regardless of which interface touched them
+// furnace block states classify by registry name (`minecraft:furnace`); the
+// numeric range remains only as the no-registry fallback. One store for
+// containers regardless of which interface touched them.
 fn is_furnace_at(x: i32, y: i32, z: i32) -> bool {
-    (4295..=4302).contains(&block_at(x, y, z))
+    is_furnace_at_dim(DimId::Overworld, x, y, z)
+}
+fn is_furnace_at_dim(dim: DimId, x: i32, y: i32, z: i32) -> bool {
+    furnace_named(block_at_dim(dim, x, y, z))
 }
 fn furnace_slots(pos: (i32, i32, i32)) -> HashMap<i16, Stack> {
+    furnace_slots_dim(DimId::Overworld, pos)
+}
+/// `furnace_slots` in `dim`: the store is keyed `DimBlockPos`, so the lookup
+/// reads the furnace that lives in `dim`, not whatever shares its coords
+/// elsewhere.
+fn furnace_slots_dim(dim: DimId, pos: (i32, i32, i32)) -> HashMap<i16, Stack> {
     let fs = furnaces().lock().unwrap_or_else(|e| e.into_inner());
-    fs.get(&ow_block(pos))
+    fs.get(&(dim, pos.0, pos.1, pos.2))
         .map(|f| {
             let mut m = HashMap::new();
             if f.input.1 > 0 {
@@ -2979,7 +3082,7 @@ fn unpack_block_loot_if_needed(pos: DimBlockPos) -> bool {
                 let current = breg()
                     .and_then(|reg| reg.block_id_of(block_at_dim(pos.0, pos.1, pos.2, pos.3)));
                 if current != Some(id) {
-                    store.entries.remove(&pos);
+                    store.remove_entry(pos);
                 }
             }
         }
@@ -3238,34 +3341,7 @@ fn container_exists(key: ContainerKey) -> bool {
 /// `audience` hold a menu built on it. A paired window contains both halves, so both
 /// halves see the same viewers - which is what `CompoundContainer.startOpen` does.
 fn half_openers(audience: &[Arc<Client>], pos: BlockPos) -> u32 {
-    let key = ContainerKey::ow(pos);
-    audience
-        .iter()
-        .filter(|c| {
-            if c.is_spectator() {
-                return false;
-            }
-            let open = match c.open_chest.lock() {
-                Ok(g) => *g,
-                Err(_) => return false,
-            };
-            let Some((a, b)) = open else {
-                return false;
-            };
-            if a == key || b == Some(key) {
-                return true;
-            }
-            if matches!(a, ContainerKey::Block(ek) if is_ender_key((ek.1, ek.2, ek.3))) && b.is_none() {
-                return c
-                    .chest_sync
-                    .lock()
-                    .ok()
-                    .and_then(|s| s.as_ref().filter(|st| st.window == (a, b)).and_then(|st| st.anchor))
-                    == Some(pos);
-            }
-            false
-        })
-        .count() as u32
+    half_openers_dim(DimId::Overworld, audience, pos)
 }
 
 /// The opener count of every half before a window change, so the change can be
@@ -3374,7 +3450,12 @@ fn window_live(open: (ContainerKey, Option<ContainerKey>)) -> bool {
         return true;
     };
     // A pair is block state, so both halves must be in the same dimension.
-    rdim == ldim && chest_pair(rx, ry, rz) == Some(((rx, ry, rz), (lx, ly, lz)))
+    rdim == ldim
+        && chest_pair_of_dim(
+            rdim,
+            block_at_dim(rdim, rx, ry, rz),
+            (rx, ry, rz),
+        ) == Some(((rx, ry, rz), (lx, ly, lz)))
 }
 fn window_live_for(
     c: &Client,
@@ -3391,7 +3472,12 @@ fn window_live_for(
             .as_ref()
             .filter(|s| s.window == open)
             .and_then(|s| s.anchor);
-        return anchor.is_some_and(|pos| (7513..=7520).contains(&block_at(pos.0, pos.1, pos.2)));
+        // The anchor lives in the clicking client's dimension: the ender key
+        // is always filed under Overworld, so its block must be read where
+        // the window was actually opened.
+        let client_dim = *c.dim.lock().unwrap_or_else(|e| e.into_inner());
+        return anchor
+            .is_some_and(|pos| ender_chest_named(block_at_dim(client_dim, pos.0, pos.1, pos.2)));
     }
     true
 }
@@ -3429,9 +3515,53 @@ fn invalidate_container_windows(
     sync_chest_openers(audience, &before);
     closed
 }
-fn invalidate_ender_chest_windows(audience: &[Arc<Client>], pos: BlockPos) -> usize {
+/// `invalidate_container_windows` over dimensioned halves: same close loop,
+/// opener counts diffed through the `_dim` snapshot/sync pair.
+fn invalidate_container_windows_dim(
+    audience: &[Arc<Client>],
+    key: ContainerKey,
+    halves: &[DimBlockPos],
+) -> usize {
+    let before = chest_opener_snapshot_dim(audience, halves);
     let mut closed = 0;
     for c in audience {
+        let had = {
+            let mut open = c.open_chest.lock().unwrap_or_else(|e| e.into_inner());
+            if open.is_some_and(|(a, b)| a == key || b == Some(key)) {
+                *open = None;
+                true
+            } else {
+                false
+            }
+        };
+        if had {
+            *c.chest_sync.lock().unwrap_or_else(|e| e.into_inner()) = None;
+        }
+        if had {
+            if let Ok(mut w) = c.sock.lock() {
+                let _ = send_packet(&mut w, 0x12, vec![1u8]);
+            }
+            closed += 1;
+        }
+    }
+    sync_chest_openers_dim(audience, &before);
+    closed
+}
+fn invalidate_ender_chest_windows(audience: &[Arc<Client>], pos: BlockPos) -> usize {
+    invalidate_ender_chest_windows_dim(audience, DimId::Overworld, pos)
+}
+/// An ender window's anchor lives in the clicking client's dimension, so only
+/// clients in `dim` can hold a menu on the ender chest at `pos` there.
+fn invalidate_ender_chest_windows_dim(
+    audience: &[Arc<Client>],
+    dim: DimId,
+    pos: BlockPos,
+) -> usize {
+    let mut closed = 0;
+    for c in audience {
+        if *c.dim.lock().unwrap_or_else(|e| e.into_inner()) != dim {
+            continue;
+        }
         let had = {
             let mut open = c.open_chest.lock().unwrap_or_else(|e| e.into_inner());
             let mut sync = c.chest_sync.lock().unwrap_or_else(|e| e.into_inner());
@@ -3462,15 +3592,37 @@ fn invalidate_client_chest_window(
 ) {
     if matches!(open, (ContainerKey::Block(ek), None) if is_ender_key((ek.1, ek.2, ek.3))) {
         if let Some((_, Some(pos))) = client_open_window_and_anchor(me) {
-            invalidate_ender_chest_windows(audience, pos);
+            let dim = *me.dim.lock().unwrap_or_else(|e| e.into_inner());
+            invalidate_ender_chest_windows_dim(audience, dim, pos);
             return;
         }
     }
-    invalidate_container_windows(audience, open.0, &chest_window_halves(open));
+    invalidate_container_windows_dim(audience, open.0, &chest_window_halves_dim(open));
 }
 
+// ---------- block-state classification ----------
+//
+// Container/hopper/furnace classification asks the registry for the block
+// name and properties, never the raw state id: state ids shift between
+// versions and a mod suite renumbers them entirely, while `minecraft:chest`
+// keeps its name. The 1.21.1 numeric ranges remain as the fallback for when
+// the registry did not load — the same answer the arithmetic gave before
+// names were consulted.
+
 fn container_kind(st: u32) -> Option<&'static str> {
-    // 27-slot generic container blocks
+    if let Some(reg) = breg() {
+        return match reg.name_of(st) {
+            "minecraft:chest" | "minecraft:trapped_chest" => Some("Chest"),
+            "minecraft:barrel" => Some("Barrel"),
+            n if n == "minecraft:shulker_box"
+                || (n.starts_with("minecraft:") && n.ends_with("_shulker_box")) =>
+            {
+                Some("Shulker Box")
+            }
+            _ => None,
+        };
+    }
+    // 27-slot generic container blocks, 1.21.1 state ids
     if (2954..=2977).contains(&st) {
         return Some("Chest");
     }
@@ -3484,6 +3636,21 @@ fn container_kind(st: u32) -> Option<&'static str> {
         return Some("Shulker Box");
     }
     None
+}
+/// `minecraft:furnace`: the plain furnace only — blast furnace and smoker are
+/// separate block names and keep their own stores.
+fn furnace_named(st: u32) -> bool {
+    match breg() {
+        Some(reg) => reg.name_of(st) == "minecraft:furnace",
+        None => (4295..=4302).contains(&st),
+    }
+}
+/// `minecraft:ender_chest`: every facing state of the ender chest block.
+fn ender_chest_named(st: u32) -> bool {
+    match breg() {
+        Some(reg) => reg.name_of(st) == "minecraft:ender_chest",
+        None => (7513..=7520).contains(&st),
+    }
 }
 // ---------- chest world state (ChestBlock / ChestBlockEntity, 1.21.1) ----------
 //
@@ -3708,15 +3875,6 @@ fn chest_window_halves(open: (ContainerKey, Option<ContainerKey>)) -> Vec<BlockP
     }
     out
 }
-fn client_window_halves(
-    open: (ContainerKey, Option<ContainerKey>),
-    anchor: Option<BlockPos>,
-) -> Vec<BlockPos> {
-    if matches!(open, (ContainerKey::Block(ek), None) if is_ender_key((ek.1, ek.2, ek.3))) {
-        return anchor.into_iter().collect();
-    }
-    chest_window_halves(open)
-}
 type OpenWindowAnchor = ((ContainerKey, Option<ContainerKey>), Option<BlockPos>);
 
 fn client_open_window_and_anchor(c: &Client) -> Option<OpenWindowAnchor> {
@@ -3828,8 +3986,12 @@ fn chest_still_valid(
         (ContainerKey::Block((_dim, x, y, z)), second) => {
             let first = (x, y, z);
             let first_ok = if is_ender_key(first) {
+                // The anchor lives in the clicking client's dimension: the
+                // ender key is filed under Overworld, so the block check must
+                // read the dimension the window was opened in.
+                let client_dim = *c.dim.lock().unwrap_or_else(|e| e.into_inner());
                 anchor.is_some_and(|pos| {
-                    (7513..=7520).contains(&block_at(pos.0, pos.1, pos.2))
+                    ender_chest_named(block_at_dim(client_dim, pos.0, pos.1, pos.2))
                         && can_interact_with_block(c, pos, 4.0)
                 })
             } else {
@@ -3919,38 +4081,66 @@ fn chest_viewer_tick_on(audience: &[Arc<Client>]) {
             .filter(|s| s.window == win)
             .and_then(|s| s.anchor);
         if !chest_still_valid(c, win, anchor) {
-            let halves = client_window_halves(win, anchor);
-            let before = chest_opener_snapshot(audience, &halves);
+            // Anchor halves live in the clicking client's dimension; block
+            // halves carry their own dim in the key.
+            let client_dim = *c.dim.lock().unwrap_or_else(|e| e.into_inner());
+            let halves = client_window_halves_dim(win, anchor, client_dim);
+            let before = chest_opener_snapshot_dim(audience, &halves);
             *c.open_chest.lock().unwrap_or_else(|e| e.into_inner()) = None;
             *c.chest_sync.lock().unwrap_or_else(|e| e.into_inner()) = None;
             if let Ok(mut w) = c.sock.lock() {
                 let _ = send_packet(&mut w, 0x12, vec![1u8]);
             }
-            sync_chest_openers(audience, &before);
+            sync_chest_openers_dim(audience, &before);
             continue;
         }
-        let current = chest_window_slots(win);
+        // Borrow-diff: every slot read and the sync-state compare run under
+        // one `chests()` hold, so an unchanged window costs the lock plus the
+        // lookups — no per-tick clone of the slot map, no `Vec` rebuild. A
+        // `Stack` only clones when the slot actually changed.
+        let rows = if win.1.is_some() { 54usize } else { 27usize };
         updates.clear();
         {
+            let all = chests().lock().unwrap_or_else(|e| e.into_inner());
             let mut sync_guard = c.chest_sync.lock().unwrap_or_else(|e| e.into_inner());
             let sync = sync_guard.get_or_insert_with(|| ChestSyncState {
                 window: win,
                 anchor,
                 state_id: 0,
-                last_slots: vec![(0, 0, Vec::new()); current.len()],
+                last_slots: vec![Stack::default(); rows],
             });
-            if sync.window != win || sync.last_slots.len() != current.len() {
+            if sync.window != win || sync.last_slots.len() != rows {
                 sync.window = win;
                 sync.anchor = anchor;
                 sync.state_id = 0;
-                sync.last_slots = vec![(0, 0, Vec::new()); current.len()];
+                sync.last_slots = vec![Stack::default(); rows];
             }
-            for (idx, stack) in current.iter().enumerate() {
-                if sync.last_slots[idx] != *stack {
-                    sync.state_id = (sync.state_id + 1) & 0x7fff;
-                    sync.last_slots[idx] = stack.clone();
-                    updates.push((idx as i16, sync.state_id, stack.clone()));
+            for idx in 0..rows {
+                // `DoubleBlockCombiner` order: the first key owns slots
+                // 0..=26, the second 27..=53 — the layout `chest_window_slots`
+                // materialized as a `Vec`, read slot-wise instead.
+                let (key, slot) = match idx < 27 {
+                    true => (win.0, idx as i16),
+                    false => match win.1 {
+                        Some(k) => (k, (idx - 27) as i16),
+                        None => break,
+                    },
+                };
+                let stack = all
+                    .get(&key)
+                    .and_then(|m| m.get(&slot))
+                    .filter(|st| st.1 > 0);
+                let unchanged = match stack {
+                    Some(st) => *st == sync.last_slots[idx],
+                    None => sync.last_slots[idx].1 == 0,
+                };
+                if unchanged {
+                    continue;
                 }
+                let cur = stack.cloned().unwrap_or_default();
+                sync.state_id = (sync.state_id + 1) & 0x7fff;
+                sync.last_slots[idx] = cur.clone();
+                updates.push((idx as i16, sync.state_id, cur));
             }
         }
         if !updates.is_empty() {
@@ -8162,6 +8352,13 @@ struct LiveBlockEntityStore {
     // (block id, entity). Vanilla drops the block entity the moment the block
     // identity changes; same-block state writes (rotation, power) keep it.
     entries: HashMap<DimBlockPos, (i32, LiveBlockEntity)>,
+    /// `entries` positions bucketed by chunk: a maintained index so a
+    /// chunk-local query never walks the whole world map. `insert_entry`,
+    /// `remove_entry` and `at` keep it in step; `discover` re-derives every
+    /// changed chunk's bucket, which also picks up entries written through
+    /// `entries` directly (a path the save/restore code outside this impl
+    /// still takes).
+    chunk_index: HashMap<DimChunkKey, Vec<(i32, i32, i32)>>,
     chunk_versions: HashMap<DimChunkKey, u64>,
     scanned_at: u64,
 }
@@ -8172,19 +8369,97 @@ fn live_block_entities() -> &'static Mutex<LiveBlockEntityStore> {
 }
 
 impl LiveBlockEntityStore {
+    /// The chunk an entry position falls in. `div_euclid` matches the region
+    /// format for negative coordinates: x = -1 is chunk -1, not chunk 0.
+    fn chunk_of(key: DimBlockPos) -> DimChunkKey {
+        (key.0, key.1.div_euclid(16), key.3.div_euclid(16))
+    }
+    fn index_add(&mut self, key: DimBlockPos) {
+        let pos = (key.1, key.2, key.3);
+        let v = self.chunk_index.entry(Self::chunk_of(key)).or_default();
+        if !v.contains(&pos) {
+            v.push(pos);
+        }
+    }
+    fn index_drop(&mut self, key: DimBlockPos) {
+        let ckey = Self::chunk_of(key);
+        if let Some(v) = self.chunk_index.get_mut(&ckey) {
+            v.retain(|&p| p != (key.1, key.2, key.3));
+            if v.is_empty() {
+                self.chunk_index.remove(&ckey);
+            }
+        }
+    }
+    /// Insert or replace one entry, keeping the chunk index in step.
+    fn insert_entry(&mut self, key: DimBlockPos, entry: (i32, LiveBlockEntity)) {
+        if self.entries.insert(key, entry).is_none() {
+            self.index_add(key);
+        }
+    }
+    /// Remove one entry, keeping the chunk index in step.
+    fn remove_entry(&mut self, key: DimBlockPos) -> Option<(i32, LiveBlockEntity)> {
+        let out = self.entries.remove(&key);
+        if out.is_some() {
+            self.index_drop(key);
+        }
+        out
+    }
+    /// Positions of the entries inside chunk `(dim, cx, cz)` — an indexed
+    /// lookup, O(chunk population) instead of an O(world) scan. Each indexed
+    /// position is re-validated against `entries` on the way out, so a write
+    /// that bypassed `insert_entry`/`remove_entry` can never make this return
+    /// a cell the store no longer holds; `discover` rebuilds the bucket and
+    /// picks a missed entry back up. Chunk-local readers land here as the
+    /// callers are threaded per-dimension.
+    #[cfg_attr(not(test), allow(dead_code))]
+    fn entries_in_chunk(&self, dim: DimId, cx: i32, cz: i32) -> Vec<DimBlockPos> {
+        self.chunk_index
+            .get(&(dim, cx, cz))
+            .map(|v| {
+                v.iter()
+                    .filter(|&&(x, y, z)| self.entries.contains_key(&(dim, x, y, z)))
+                    .map(|&(x, y, z)| (dim, x, y, z))
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+    /// Rebuild the indexed buckets for `chunks` in one `entries` pass — the
+    /// drift repair for `retain` drops and for writers that reach `entries`
+    /// without the indexed mutators.
+    fn reindex_chunks(&mut self, chunks: &HashSet<DimChunkKey>) {
+        for &ckey in chunks {
+            self.chunk_index.remove(&ckey);
+        }
+        for &(dim, x, y, z) in self.entries.keys() {
+            let ckey = (dim, x.div_euclid(16), z.div_euclid(16));
+            if chunks.contains(&ckey) {
+                self.chunk_index.entry(ckey).or_default().push((x, y, z));
+            }
+        }
+    }
+    /// Whole-index rebuild: the first `discover` scan, when nothing about the
+    /// index can be trusted yet — `entries` may hold cells written before any
+    /// indexed mutator ran.
+    fn rebuild_index(&mut self) {
+        self.chunk_index.clear();
+        let keys: Vec<DimBlockPos> = self.entries.keys().copied().collect();
+        for key in keys {
+            self.index_add(key);
+        }
+    }
+
     fn at(&mut self, reg: &BReg, key: DimBlockPos, state: u32) -> Option<&mut LiveBlockEntity> {
         let block = reg.block_id_of(state)?;
         if self.entries.get(&key).is_some_and(|&(id, _)| id != block) {
-            self.entries.remove(&key);
+            self.remove_entry(key);
         }
         let id = live_block_entity_id(reg.name_of(state))?;
-        Some(
-            &mut self
-                .entries
-                .entry(key)
-                .or_insert_with(|| (block, LiveBlockEntity::load(reg, state, id, &Tag::End)))
-                .1,
-        )
+        if !self.entries.contains_key(&key) {
+            self.entries
+                .insert(key, (block, LiveBlockEntity::load(reg, state, id, &Tag::End)));
+            self.index_add(key);
+        }
+        Some(&mut self.entries.get_mut(&key)?.1)
     }
 
     // The world edit path already publishes per-chunk write versions. Read only
@@ -8231,6 +8506,15 @@ impl LiveBlockEntityStore {
             !changed.contains(&(dim, x >> 4, z >> 4))
                 || reg.block_id_of(block_at_dim(dim, x, y, z)) == Some(*id)
         });
+        // The retain may have dropped indexed positions, and writes that
+        // bypassed `insert_entry` may have added entries the index missed;
+        // every changed chunk's bucket is re-derived in one pass so neither
+        // drift reaches `entries_in_chunk`.
+        if first_scan {
+            self.rebuild_index();
+        } else {
+            self.reindex_chunks(&changed);
+        }
         for (key, state) in placements {
             self.at(reg, key, state);
         }
@@ -8274,8 +8558,7 @@ fn restore_live_block_entity(key @ (dim, x, y, z): DimBlockPos, tag: &Tag) -> bo
         live_block_entities()
             .lock()
             .unwrap_or_else(|e| e.into_inner())
-            .entries
-            .insert(key, (block, entity));
+            .insert_entry(key, (block, entity));
         true
     })
 }
@@ -8609,7 +8892,7 @@ fn use_live_block_entity(c: &Client, key @ (dim, x, y, z): DimBlockPos, state: u
                             next_state = reg.state_of(replacement, None);
                             ejected = loot;
                             brush_breaks = !creative;
-                            store.entries.remove(&key);
+                            store.remove_entry(key);
                         }
                     }
                     true
@@ -11369,10 +11652,12 @@ fn open_live_menu(c: &Client, anchor: Option<DimBlockPos>, menu: LiveMenu) {
     close_live_menu(c, false, false);
     if let Some((window, old_anchor)) = client_open_window_and_anchor(c) {
         let audience = client_snapshot();
-        let before = chest_opener_snapshot(&audience, &client_window_halves(window, old_anchor));
+        let client_dim = *c.dim.lock().unwrap_or_else(|e| e.into_inner());
+        let halves = client_window_halves_dim(window, old_anchor, client_dim);
+        let before = chest_opener_snapshot_dim(&audience, &halves);
         *c.open_chest.lock().unwrap_or_else(|e| e.into_inner()) = None;
         *c.chest_sync.lock().unwrap_or_else(|e| e.into_inner()) = None;
-        sync_chest_openers(&audience, &before);
+        sync_chest_openers_dim(&audience, &before);
     }
     *c.open_furnace.lock().unwrap_or_else(|e| e.into_inner()) = None;
     if std::mem::take(&mut *c.open_table.lock().unwrap_or_else(|e| e.into_inner())) {
@@ -14659,8 +14944,7 @@ mod w2_live_wire_tests {
         live_block_entities()
             .lock()
             .unwrap_or_else(|e| e.into_inner())
-            .entries
-            .insert(
+            .insert_entry(
                 (DimId::Overworld, x + 2, y, z),
                 (0, LiveBlockEntity::ChiseledBookshelf(live_shelf)),
             );
@@ -18883,5 +19167,387 @@ mod mega_scale_xp_tests {
             total_expected as i64,
             "the player must receive the exact conserved XP total"
         );
+    }
+}
+
+// ---------- S-MENUS-MULTIDIM-OPT tests ----------
+//
+// Multi-dim container keys, the drop-dimension side index, the per-chunk
+// live-block-entity index and the borrow-diffed chest viewer tick. Every
+// block read goes through the numeric-range fallbacks, so these tests run
+// registry-free (`breg() == None` is the supported no-fixture path).
+
+#[cfg(test)]
+mod s5_multidim_tests {
+    use super::*;
+    use std::io::Read;
+    use std::net::TcpStream;
+
+    /// A `DimCells` twin for tests that run without the vanilla data fixture:
+    /// writes a raw state into the overlay and restores the cell on drop.
+    struct OverlayCells(Vec<(DimId, i32, i32, i32, Option<u32>)>);
+    impl OverlayCells {
+        fn new() -> Self {
+            Self(Vec::new())
+        }
+        fn set(&mut self, dim: DimId, x: i32, y: i32, z: i32, st: u32) {
+            let key = (dim, x >> 4, z >> 4);
+            let cell = local_idx(x, y, z);
+            let prev = {
+                let mut w = world().write(&key);
+                let chunk = w.entry(key).or_default();
+                let prev = chunk.get(&cell).copied();
+                chunk.insert(cell, st);
+                prev
+            };
+            self.0.push((dim, x, y, z, prev));
+        }
+    }
+    impl std::ops::Drop for OverlayCells {
+        fn drop(&mut self) {
+            let mut w = world().write_all();
+            for (dim, x, y, z, prev) in self.0.drain(..).rev() {
+                if let Some(chunk) = w.get_mut(&(dim, x >> 4, z >> 4)) {
+                    match prev {
+                        Some(st) => {
+                            chunk.insert(local_idx(x, y, z), st);
+                        }
+                        None => {
+                            chunk.remove(&local_idx(x, y, z));
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /// Drain every frame the socket received; `read` hits the fixture's 1s
+    /// timeout once the batch is exhausted.
+    fn read_frames(rx: &mut TcpStream) -> Vec<(i64, Vec<u8>)> {
+        let mut buf = Vec::new();
+        let mut chunk = [0u8; 8192];
+        while let Ok(n) = rx.read(&mut chunk) {
+            if n == 0 {
+                break;
+            }
+            buf.extend_from_slice(&chunk[..n]);
+        }
+        let mut frames = Vec::new();
+        let mut rest = buf.as_slice();
+        while !rest.is_empty() {
+            let mut view = rest;
+            let Some(len) = read_varint(&mut view) else { break };
+            let len = len as usize;
+            if view.len() < len {
+                break;
+            }
+            let mut body = &view[..len];
+            rest = &view[len..];
+            let Some(id) = read_varint(&mut body) else { break };
+            frames.push((id, body.to_vec()));
+        }
+        frames
+    }
+
+    /// One `(x, y, z)`, three dimensions, three containers: the dim inside
+    /// `ContainerKey::Block` keeps a Nether chest and an Overworld chest at
+    /// the same coordinates as separate maps — and an unprovisioned
+    /// dimension reads empty rather than the Overworld's contents.
+    #[test]
+    fn container_keys_isolate_dimensions() {
+        let _guard = world_guard();
+        let pos = (8_700_001, 64, -8_700_001);
+        let stack: Stack = (803, 7, Vec::new());
+        {
+            let mut all = chests().lock().unwrap_or_else(|e| e.into_inner());
+            all.insert(
+                ContainerKey::at(DimId::Nether, pos),
+                HashMap::from([(0i16, stack.clone())]),
+            );
+            all.insert(
+                ContainerKey::ow(pos),
+                HashMap::from([(1i16, stack.clone())]),
+            );
+        }
+        {
+            let all = chests().lock().unwrap_or_else(|e| e.into_inner());
+            let nether = all.get(&ContainerKey::at(DimId::Nether, pos)).unwrap();
+            assert_eq!(nether.get(&0).map(|s| s.1), Some(7));
+            assert!(nether.get(&1).is_none(), "the Overworld slot leaked into the Nether key");
+            let ow = all.get(&ContainerKey::ow(pos)).unwrap();
+            assert_eq!(ow.get(&1).map(|s| s.1), Some(7));
+            assert!(ow.get(&0).is_none(), "the Nether slot leaked into the Overworld key");
+            assert!(
+                all.get(&ContainerKey::at(DimId::End, pos)).is_none(),
+                "a dimension with no container must not read the Overworld's"
+            );
+        }
+        let mut all = chests().lock().unwrap_or_else(|e| e.into_inner());
+        all.remove(&ContainerKey::at(DimId::Nether, pos));
+        all.remove(&ContainerKey::ow(pos));
+    }
+
+    /// `window_live` resolves `container_exists` against the key's own
+    /// dimension: a chest placed in the Overworld backs the Overworld window
+    /// and no other.
+    #[test]
+    fn window_live_checks_the_keys_own_dimension() {
+        let _guard = world_guard();
+        let pos = (8_700_003, 64, -8_700_003);
+        let mut cells = OverlayCells::new();
+        cells.set(DimId::Overworld, pos.0, pos.1, pos.2, 2954); // chest, no-registry fallback
+        assert!(window_live((ContainerKey::at(DimId::Overworld, pos), None)));
+        assert!(
+            !window_live((ContainerKey::at(DimId::Nether, pos), None)),
+            "the Nether must not see the Overworld chest at the same coords"
+        );
+        assert!(
+            !window_live((ContainerKey::at(DimId::End, pos), None)),
+            "the End must not see the Overworld chest at the same coords"
+        );
+    }
+
+    /// `hopper_push_dim` ejects into the container its own dimension holds:
+    /// a Nether hopper above a Nether chest moves items between the two
+    /// Nether keys and never materialises the Overworld keys.
+    #[test]
+    fn hopper_push_dim_moves_between_dim_keyed_containers() {
+        let _guard = world_guard();
+        let (hx, hy, hz) = (8_700_005, 64, -8_700_005);
+        let dst = (hx + 1, hy, hz);
+        let mut cells = OverlayCells::new();
+        cells.set(DimId::Nether, dst.0, dst.1, dst.2, 2954); // chest fallback range
+        {
+            let mut all = chests().lock().unwrap_or_else(|e| e.into_inner());
+            all.insert(
+                ContainerKey::at(DimId::Nether, (hx, hy, hz)),
+                HashMap::from([(0i16, (803i64, 5u8, Vec::new()) as Stack)]),
+            );
+        }
+        assert!(hopper_push_dim(DimId::Nether, hx, hy, hz, dst));
+        let mut all = chests().lock().unwrap_or_else(|e| e.into_inner());
+        let own = all.get(&ContainerKey::at(DimId::Nether, (hx, hy, hz))).unwrap();
+        assert_eq!(own.get(&0).map(|s| s.1), Some(4), "one item per activation");
+        let into = all.get(&ContainerKey::at(DimId::Nether, dst)).unwrap();
+        assert_eq!(into.get(&0).map(|s| s.1), Some(1));
+        assert!(
+            all.get(&ContainerKey::ow((hx, hy, hz))).is_none(),
+            "the Nether push must not create an Overworld hopper map"
+        );
+        all.remove(&ContainerKey::at(DimId::Nether, (hx, hy, hz)));
+        all.remove(&ContainerKey::at(DimId::Nether, dst));
+    }
+
+    /// The drop side index scopes suction to the spawn dimension: a drop
+    /// spawned in the Nether is a candidate for the Nether hopper at the same
+    /// coords and invisible to the Overworld hopper there.
+    #[test]
+    fn drop_spawn_dim_scopes_hopper_suction() {
+        let _guard = world_guard();
+        let (hx, hy, hz) = (8_700_007, 64, -8_700_007);
+        let eid = drop_spawn_in_dim(
+            DimId::Nether,
+            hx as f64 + 0.5,
+            hy as f64 + 1.2,
+            hz as f64 + 0.5,
+            803,
+            3,
+            Vec::new(),
+            0,
+            None,
+            None,
+        );
+        assert_eq!(drop_dim_of(eid), DimId::Nether);
+        assert!(suction_nonempty_in(DimId::Nether, hx, hy, hz));
+        assert!(
+            !suction_nonempty_in(DimId::Overworld, hx, hy, hz),
+            "the Nether drop must not enter the Overworld suction cell"
+        );
+        assert!(
+            !hopper_suck_in_dim(DimId::Overworld, hx, hy, hz),
+            "the Overworld hopper must not take the Nether drop"
+        );
+        assert!(hopper_suck_in_dim(DimId::Nether, hx, hy, hz));
+        {
+            let all = chests().lock().unwrap_or_else(|e| e.into_inner());
+            let own = all.get(&ContainerKey::at(DimId::Nether, (hx, hy, hz))).unwrap();
+            assert_eq!(own.get(&0).map(|s| s.1), Some(3));
+            assert!(all.get(&ContainerKey::ow((hx, hy, hz))).is_none());
+        }
+        assert!(drops().lock().unwrap_or_else(|e| e.into_inner()).iter().all(|d| d.eid != eid));
+        let mut all = chests().lock().unwrap_or_else(|e| e.into_inner());
+        all.remove(&ContainerKey::at(DimId::Nether, (hx, hy, hz)));
+        drop_dims().lock().unwrap_or_else(|e| e.into_inner()).remove(&eid);
+        drop_pending().lock().unwrap_or_else(|e| e.into_inner()).remove(&eid);
+    }
+
+    /// A Nether container change leaves the Overworld sleep-probe fingerprint
+    /// untouched; the matching Overworld write moves it.
+    #[test]
+    fn hopper_probe_epoch_fingerprints_its_own_dimension() {
+        let _guard = world_guard();
+        let (hx, hy, hz) = (8_700_009, 64, -8_700_009);
+        let dst = (hx + 1, hy, hz);
+        let e1 = hopper_probe_epoch_in_dim(DimId::Overworld, hx, hy, hz, dst);
+        {
+            let mut all = chests().lock().unwrap_or_else(|e| e.into_inner());
+            all.insert(
+                ContainerKey::at(DimId::Nether, (hx, hy, hz)),
+                HashMap::from([(0i16, (803i64, 5u8, Vec::new()) as Stack)]),
+            );
+        }
+        let e2 = hopper_probe_epoch_in_dim(DimId::Overworld, hx, hy, hz, dst);
+        assert_eq!(e1, e2, "a Nether write must not move the Overworld probe");
+        {
+            let mut all = chests().lock().unwrap_or_else(|e| e.into_inner());
+            all.insert(
+                ContainerKey::ow((hx, hy, hz)),
+                HashMap::from([(0i16, (803i64, 5u8, Vec::new()) as Stack)]),
+            );
+        }
+        let e3 = hopper_probe_epoch_in_dim(DimId::Overworld, hx, hy, hz, dst);
+        assert_ne!(e2, e3, "an Overworld write must move the Overworld probe");
+        let mut all = chests().lock().unwrap_or_else(|e| e.into_inner());
+        all.remove(&ContainerKey::at(DimId::Nether, (hx, hy, hz)));
+        all.remove(&ContainerKey::ow((hx, hy, hz)));
+    }
+
+    /// `entries_in_chunk`: insert, update, remove and drift cases across
+    /// dimensions and negative chunk coordinates (`div_euclid(16)`).
+    #[test]
+    fn live_store_entries_in_chunk_tracks_mutation() {
+        let mut store = LiveBlockEntityStore::default();
+        let entity = || (0, LiveBlockEntity::ChiseledBookshelf(ChiseledBookshelf::default()));
+        // insert: same coords in two dims stay in separate chunk buckets.
+        store.insert_entry((DimId::Overworld, 3, 70, 5), entity());
+        store.insert_entry((DimId::Nether, 3, 70, 5), entity());
+        // negative coords: -1 and -16 land in chunk -1, -17 in chunk -2.
+        store.insert_entry((DimId::Overworld, -1, 70, -1), entity());
+        store.insert_entry((DimId::Overworld, -16, 70, -16), entity());
+        store.insert_entry((DimId::Overworld, -17, 70, 0), entity());
+        assert_eq!(
+            store.entries_in_chunk(DimId::Overworld, 0, 0),
+            vec![(DimId::Overworld, 3, 70, 5)]
+        );
+        assert_eq!(
+            store.entries_in_chunk(DimId::Nether, 0, 0),
+            vec![(DimId::Nether, 3, 70, 5)]
+        );
+        let mut neg = store.entries_in_chunk(DimId::Overworld, -1, -1);
+        neg.sort();
+        assert_eq!(
+            neg,
+            vec![
+                (DimId::Overworld, -16, 70, -16),
+                (DimId::Overworld, -1, 70, -1)
+            ]
+        );
+        assert_eq!(
+            store.entries_in_chunk(DimId::Overworld, -2, 0),
+            vec![(DimId::Overworld, -17, 70, 0)]
+        );
+        // update: replacing an entry does not duplicate the index position.
+        store.insert_entry((DimId::Overworld, 3, 70, 5), entity());
+        assert_eq!(store.entries_in_chunk(DimId::Overworld, 0, 0).len(), 1);
+        // remove: the position leaves its chunk bucket.
+        store.remove_entry((DimId::Overworld, 3, 70, 5));
+        assert!(store.entries_in_chunk(DimId::Overworld, 0, 0).is_empty());
+        assert_eq!(
+            store.entries_in_chunk(DimId::Nether, 0, 0),
+            vec![(DimId::Nether, 3, 70, 5)],
+            "removing the Overworld entry leaves the Nether bucket alone"
+        );
+        // bypass writes: `entries` reached without the indexed mutators can
+        // never make a removed cell report — re-validation filters it — and
+        // `rebuild_index` picks a missed cell back up.
+        store.insert_entry((DimId::Overworld, 9, 70, 9), entity());
+        store.entries.remove(&(DimId::Overworld, 9, 70, 9)); // bypassed remove
+        assert!(
+            store.entries_in_chunk(DimId::Overworld, 0, 0).is_empty(),
+            "a bypassed remove must still read as removed"
+        );
+        store.entries.insert((DimId::Overworld, 10, 70, 10), entity()); // bypassed insert
+        assert!(
+            store.entries_in_chunk(DimId::Overworld, 0, 0).is_empty(),
+            "a bypassed insert is invisible until the bucket is rebuilt"
+        );
+        store.rebuild_index();
+        assert_eq!(
+            store.entries_in_chunk(DimId::Overworld, 0, 0),
+            vec![(DimId::Overworld, 10, 70, 10)]
+        );
+        // clear: wiping `entries` leaves every query empty — the index can
+        // never outlive the store it describes.
+        store.entries.clear();
+        assert!(store.entries_in_chunk(DimId::Overworld, 0, 0).is_empty());
+        assert!(store.entries_in_chunk(DimId::Nether, 0, 0).is_empty());
+        assert!(store.entries_in_chunk(DimId::Overworld, -1, -1).is_empty());
+    }
+
+    /// The borrow-diff: an untouched window produces no `0x15` on the wire,
+    /// a single-slot change produces exactly one, and removing a stack
+    /// produces the empty-slot update for just that slot.
+    #[test]
+    fn chest_viewer_tick_sends_only_changed_slots() {
+        let _guard = world_guard();
+        let pos = (8_700_011, 64, -8_700_011);
+        let mut cells = OverlayCells::new();
+        cells.set(DimId::Overworld, pos.0, pos.1, pos.2, 2954); // chest fallback range
+        let (client, mut rx) = crate::effect_tests::client_pair();
+        *client.pos.lock().unwrap_or_else(|e| e.into_inner()) = (
+            pos.0 as f64 + 0.5,
+            pos.1 as f64 + 1.0,
+            pos.2 as f64 + 0.5,
+            0.0,
+            0.0,
+            true,
+        );
+        let c = Arc::new(client);
+        let win = (ContainerKey::at(DimId::Overworld, pos), None);
+        *c.open_chest.lock().unwrap_or_else(|e| e.into_inner()) = Some(win);
+        {
+            let mut all = chests().lock().unwrap_or_else(|e| e.into_inner());
+            all.insert(win.0, HashMap::from([(0i16, (803i64, 3u8, Vec::new()) as Stack)]));
+        }
+        // First visit surfaces the seeded slot: one SetSlot frame.
+        chest_viewer_tick_on(&[c.clone()]);
+        let first = read_frames(&mut rx);
+        assert_eq!(first.len(), 1);
+        assert_eq!(first[0].0, 0x15);
+        {
+            let sync = c.chest_sync.lock().unwrap_or_else(|e| e.into_inner());
+            let sync = sync.as_ref().unwrap();
+            assert_eq!(sync.last_slots[0], (803, 3, Vec::new()));
+            assert_eq!(sync.last_slots.len(), 27);
+        }
+        // Unchanged: zero frames — the diff did no work.
+        chest_viewer_tick_on(&[c.clone()]);
+        assert!(read_frames(&mut rx).is_empty(), "an unchanged window must send nothing");
+        // One slot changed: exactly one frame.
+        {
+            let mut all = chests().lock().unwrap_or_else(|e| e.into_inner());
+            all.get_mut(&win.0)
+                .unwrap()
+                .insert(5i16, (804i64, 2u8, Vec::new()));
+        }
+        chest_viewer_tick_on(&[c.clone()]);
+        let changed = read_frames(&mut rx);
+        assert_eq!(changed.len(), 1);
+        assert_eq!(changed[0].0, 0x15);
+        // Slot removed: one frame carrying the empty slot.
+        {
+            let mut all = chests().lock().unwrap_or_else(|e| e.into_inner());
+            all.get_mut(&win.0).unwrap().remove(&0i16);
+        }
+        chest_viewer_tick_on(&[c.clone()]);
+        let removed = read_frames(&mut rx);
+        assert_eq!(removed.len(), 1);
+        assert_eq!(removed[0].0, 0x15);
+        // Idle again.
+        chest_viewer_tick_on(&[c.clone()]);
+        assert!(read_frames(&mut rx).is_empty());
+        *c.open_chest.lock().unwrap_or_else(|e| e.into_inner()) = None;
+        let mut all = chests().lock().unwrap_or_else(|e| e.into_inner());
+        all.remove(&win.0);
     }
 }
