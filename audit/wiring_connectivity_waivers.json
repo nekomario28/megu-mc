@@ -1,13 +1,13 @@
 {
   "version": 1,
-  "comment": "Currently-known unwired subsystems tolerated by tools/wiring_connectivity_audit.py. Every entry is a real 'implemented but never wired into live runtime' gap found at baseline; the audit FAILS on any NEW unwired tick/bridge/channel/save-tag/entrypoint. A landing wire makes its entry stale (warn by default, hard-fail under --fail-on-stale) — prune, never add silently. fn/bridge entries match on check+symbol+file; channel entries match on check+symbol (sites are documentation).",
+  "comment": "Currently-known unwired subsystems tolerated by tools/wiring_connectivity_audit.py. Every entry is a real 'implemented but never wired into live runtime' gap found at baseline; the audit FAILS on any NEW unwired tick/bridge/channel/save-tag/entrypoint. A landing wire makes its entry stale (warn by default, hard-fail under --fail-on-stale) \u2014 prune, never add silently. fn/bridge entries match on check+symbol+file; channel entries match on check+symbol (sites are documentation).",
   "waivers": [
     {
       "check": "asymmetric_save_tag",
       "symbol": "FAL1",
       "file": "src/save_v2.rs",
       "line": 5072,
-      "reason": "Legacy falling-block section tag decoded for backward compatibility; superseded by FAL2 writes — intentionally read-only.",
+      "reason": "Legacy falling-block section tag decoded for backward compatibility; superseded by FAL2 writes \u2014 intentionally read-only.",
       "lane": "SAVE-LEGACY",
       "date": "2026-11-24"
     },
@@ -16,7 +16,7 @@
       "symbol": "MET2",
       "file": "src/save_v2.rs",
       "line": 4244,
-      "reason": "Legacy metadata section tag accepted on read for old saves; only MET4 is written — intentionally decode-only.",
+      "reason": "Legacy metadata section tag accepted on read for old saves; only MET4 is written \u2014 intentionally decode-only.",
       "lane": "SAVE-LEGACY",
       "date": "2026-11-24"
     },
@@ -25,7 +25,7 @@
       "symbol": "MET3",
       "file": "src/save_v2.rs",
       "line": 4244,
-      "reason": "Legacy metadata section tag accepted on read for old saves; only MET4 is written — intentionally decode-only.",
+      "reason": "Legacy metadata section tag accepted on read for old saves; only MET4 is written \u2014 intentionally decode-only.",
       "lane": "SAVE-LEGACY",
       "date": "2026-11-24"
     },
@@ -88,7 +88,7 @@
       "symbol": "live_anvil_save_tick",
       "file": "src/anvil_io.rs",
       "line": 2609,
-      "reason": "Incremental anvil save (dirty-set enqueue + summary) is implemented and test-covered but never scheduled by the autosave path — the exact live_anvil_save_tick defect class.",
+      "reason": "Incremental anvil save (dirty-set enqueue + summary) is implemented and test-covered but never scheduled by the autosave path \u2014 the exact live_anvil_save_tick defect class.",
       "lane": "SAVE-INCREMENTAL",
       "date": "2026-11-24"
     },
@@ -456,7 +456,7 @@
       "check": "dead_tick_or_bridge",
       "symbol": "live_max_players",
       "file": "src/server_config.rs",
-      "reason": "Same unwired runtime-config getter as live_view_distance — stored at startup, never read (cap enforcement not wired).",
+      "reason": "Same unwired runtime-config getter as live_view_distance \u2014 stored at startup, never read (cap enforcement not wired).",
       "lane": "SERVER-CONFIG",
       "date": "2026-11-24",
       "line": 85
@@ -465,7 +465,7 @@
       "check": "dead_tick_or_bridge",
       "symbol": "live_simulation_distance",
       "file": "src/server_config.rs",
-      "reason": "Same unwired runtime-config getter as live_view_distance — stored at startup, never read.",
+      "reason": "Same unwired runtime-config getter as live_view_distance \u2014 stored at startup, never read.",
       "lane": "SERVER-CONFIG",
       "date": "2026-11-24",
       "line": 80
@@ -474,7 +474,7 @@
       "check": "dead_tick_or_bridge",
       "symbol": "live_view_distance",
       "file": "src/server_config.rs",
-      "reason": "Operator view-distance getter: apply_runtime_server_config stores the resolved value but no production path reads it back — the setting is installed but never honored.",
+      "reason": "Operator view-distance getter: apply_runtime_server_config stores the resolved value but no production path reads it back \u2014 the setting is installed but never honored.",
       "lane": "SERVER-CONFIG",
       "date": "2026-11-24",
       "line": 75
@@ -549,7 +549,7 @@
       "sites": [
         "proto/src/channel_router.rs:156"
       ],
-      "reason": "Router-classified accessory sync channel; exists only in the shared channel table — no server emitter, no client handler.",
+      "reason": "Router-classified accessory sync channel; exists only in the shared channel table \u2014 no server emitter, no client handler.",
       "lane": "MOD-SYNC",
       "date": "2026-11-24"
     },
@@ -560,7 +560,7 @@
         "client-app/src/protocol.rs:25",
         "client-kernel/src/skeletal_anim.rs:17"
       ],
-      "reason": "Client-side skeletal-animation channel decoder exists; the server emitter lives only in live_mod_bridge test code — the channel is never sent.",
+      "reason": "Client-side skeletal-animation channel decoder exists; the server emitter lives only in live_mod_bridge test code \u2014 the channel is never sent.",
       "lane": "ANIM-WIRE",
       "date": "2026-11-24"
     },
@@ -581,7 +581,7 @@
       "sites": [
         "src/lod_protocol.rs:12"
       ],
-      "reason": "Server LOD opt-in channel is live; client-app has the LOD codec (encode_lod_v1/decode_lod_v1) but never binds it to the channel name — the client can never opt in.",
+      "reason": "Server LOD opt-in channel is live; client-app has the LOD codec (encode_lod_v1/decode_lod_v1) but never binds it to the channel name \u2014 the client can never opt in.",
       "lane": "LOD-CLIENT",
       "date": "2026-11-24"
     },
@@ -662,6 +662,438 @@
       "line": 1342,
       "reason": "Antixray ore/chest tag fold staged for create-offload worldgen; never folded into generated chunks.",
       "lane": "CREATE-OFFLOAD-LIVE",
+      "date": "2026-11-24"
+    },
+    {
+      "check": "dead_server_config_field",
+      "symbol": "live_view_distance",
+      "file": "src/server_config.rs",
+      "line": 75,
+      "reason": "LIVE_VIEW_DISTANCE is written from the environment in apply_runtime_server_config (called by server_config_boot) but the accessor is #[allow(dead_code)] with zero non-test callers \u2014 the override is stored, never consumed.",
+      "lane": "SERVER-CONFIG",
+      "date": "2026-11-24"
+    },
+    {
+      "check": "dead_server_config_field",
+      "symbol": "live_simulation_distance",
+      "file": "src/server_config.rs",
+      "line": 80,
+      "reason": "LIVE_SIMULATION_DISTANCE is written from the environment in apply_runtime_server_config (called by server_config_boot) but the accessor is #[allow(dead_code)] with zero non-test callers \u2014 the override is stored, never consumed.",
+      "lane": "SERVER-CONFIG",
+      "date": "2026-11-24"
+    },
+    {
+      "check": "dead_server_config_field",
+      "symbol": "live_max_players",
+      "file": "src/server_config.rs",
+      "line": 85,
+      "reason": "LIVE_MAX_PLAYERS is written from the environment in apply_runtime_server_config (called by server_config_boot) but the accessor is #[allow(dead_code)] with zero non-test callers \u2014 the override is stored, never consumed.",
+      "lane": "SERVER-CONFIG",
+      "date": "2026-11-24"
+    },
+    {
+      "check": "dead_server_config_field",
+      "symbol": "RuntimeOpsConfig.online_mode",
+      "file": "src/server_config.rs",
+      "line": 655,
+      "reason": "RuntimeOpsConfig field resolved in from_doc and installed into RUNTIME_OPS, but runtime_ops() is #[allow(dead_code)] with zero callers \u2014 typed view never reaches a consumer.",
+      "lane": "SERVER-CONFIG",
+      "date": "2026-11-24"
+    },
+    {
+      "check": "dead_server_config_field",
+      "symbol": "RuntimeOpsConfig.velocity_forwarding",
+      "file": "src/server_config.rs",
+      "line": 659,
+      "reason": "RuntimeOpsConfig field resolved in from_doc and installed into RUNTIME_OPS, but runtime_ops() is #[allow(dead_code)] with zero callers \u2014 typed view never reaches a consumer.",
+      "lane": "SERVER-CONFIG",
+      "date": "2026-11-24"
+    },
+    {
+      "check": "dead_server_config_field",
+      "symbol": "RuntimeOpsConfig.velocity_forwarding_secret",
+      "file": "src/server_config.rs",
+      "line": 664,
+      "reason": "RuntimeOpsConfig field resolved in from_doc and installed into RUNTIME_OPS, but runtime_ops() is #[allow(dead_code)] with zero callers \u2014 typed view never reaches a consumer.",
+      "lane": "SERVER-CONFIG",
+      "date": "2026-11-24"
+    },
+    {
+      "check": "dead_server_config_field",
+      "symbol": "RuntimeOpsConfig.autosave_interval_secs",
+      "file": "src/server_config.rs",
+      "line": 668,
+      "reason": "RuntimeOpsConfig field resolved in from_doc and installed into RUNTIME_OPS, but runtime_ops() is #[allow(dead_code)] with zero callers \u2014 typed view never reaches a consumer.",
+      "lane": "SERVER-CONFIG",
+      "date": "2026-11-24"
+    },
+    {
+      "check": "dead_server_config_field",
+      "symbol": "RuntimeOpsConfig.backup_max_keep",
+      "file": "src/server_config.rs",
+      "line": 670,
+      "reason": "RuntimeOpsConfig field resolved in from_doc and installed into RUNTIME_OPS, but runtime_ops() is #[allow(dead_code)] with zero callers \u2014 typed view never reaches a consumer.",
+      "lane": "SERVER-CONFIG",
+      "date": "2026-11-24"
+    },
+    {
+      "check": "dead_server_config_field",
+      "symbol": "RuntimeOpsConfig.lan_broadcast",
+      "file": "src/server_config.rs",
+      "line": 673,
+      "reason": "RuntimeOpsConfig field resolved in from_doc and installed into RUNTIME_OPS, but runtime_ops() is #[allow(dead_code)] with zero callers \u2014 typed view never reaches a consumer.",
+      "lane": "SERVER-CONFIG",
+      "date": "2026-11-24"
+    },
+    {
+      "check": "dead_server_config_field",
+      "symbol": "RuntimeOpsConfig.auto_load_balance",
+      "file": "src/server_config.rs",
+      "line": 676,
+      "reason": "RuntimeOpsConfig field resolved in from_doc and installed into RUNTIME_OPS, but runtime_ops() is #[allow(dead_code)] with zero callers \u2014 typed view never reaches a consumer.",
+      "lane": "SERVER-CONFIG",
+      "date": "2026-11-24"
+    },
+    {
+      "check": "dead_server_config_field",
+      "symbol": "RuntimeOpsConfig.target_version",
+      "file": "src/server_config.rs",
+      "line": 680,
+      "reason": "RuntimeOpsConfig field resolved in from_doc and installed into RUNTIME_OPS, but runtime_ops() is #[allow(dead_code)] with zero callers \u2014 typed view never reaches a consumer.",
+      "lane": "SERVER-CONFIG",
+      "date": "2026-11-24"
+    },
+    {
+      "check": "dead_server_config_field",
+      "symbol": "RuntimeOpsConfig.version_pack_dir",
+      "file": "src/server_config.rs",
+      "line": 683,
+      "reason": "RuntimeOpsConfig field resolved in from_doc and installed into RUNTIME_OPS, but runtime_ops() is #[allow(dead_code)] with zero callers \u2014 typed view never reaches a consumer.",
+      "lane": "SERVER-CONFIG",
+      "date": "2026-11-24"
+    },
+    {
+      "check": "dead_server_config_field",
+      "symbol": "RuntimeOpsConfig.notes",
+      "file": "src/server_config.rs",
+      "line": 686,
+      "reason": "RuntimeOpsConfig field resolved in from_doc and installed into RUNTIME_OPS, but runtime_ops() is #[allow(dead_code)] with zero callers \u2014 typed view never reaches a consumer.",
+      "lane": "SERVER-CONFIG",
+      "date": "2026-11-24"
+    },
+    {
+      "check": "dead_server_config_field",
+      "symbol": "MEGU_AUTOSAVE_SECS",
+      "file": "src/server_config.rs",
+      "line": 472,
+      "reason": "[server] autosave_interval_secs exports here; the only reader is RuntimeOpsConfig::from_doc into a field whose runtime_ops() accessor is dead \u2014 no live autosave consumer reads the variable.",
+      "lane": "SERVER-CONFIG",
+      "date": "2026-11-24"
+    },
+    {
+      "check": "dead_server_config_field",
+      "symbol": "MEGU_AUTO_LOAD_BALANCE",
+      "file": "src/server_config.rs",
+      "line": 475,
+      "reason": "[server] auto_load_balance exports here; the only reader is RuntimeOpsConfig::from_doc into a dead-field typed view \u2014 no live load-balancer consumer reads the variable.",
+      "lane": "SERVER-CONFIG",
+      "date": "2026-11-24"
+    },
+    {
+      "check": "dead_server_config_field",
+      "symbol": "MEGU_WHITELIST_ENABLED",
+      "file": "src/server_config.rs",
+      "line": 294,
+      "reason": "server.properties white-list/enforce-whitelist export here but nothing reads the variable \u2014 no whitelist enforcement exists in the login path.",
+      "lane": "SERVER-CONFIG",
+      "date": "2026-11-24"
+    },
+    {
+      "check": "dead_server_config_field",
+      "symbol": "MEGU_DIFFICULTY",
+      "file": "src/server_config.rs",
+      "line": 296,
+      "reason": "server.properties difficulty exports here but nothing reads the variable \u2014 no difficulty application exists at runtime.",
+      "lane": "SERVER-CONFIG",
+      "date": "2026-11-24"
+    },
+    {
+      "check": "dead_server_config_field",
+      "symbol": "MEGU_DEFAULT_GAMEMODE",
+      "file": "src/server_config.rs",
+      "line": 297,
+      "reason": "server.properties gamemode exports here but nothing reads the variable \u2014 no default-gamemode application exists at runtime.",
+      "lane": "SERVER-CONFIG",
+      "date": "2026-11-24"
+    },
+    {
+      "check": "dead_server_config_field",
+      "symbol": "MEGU_VIEW_DISTANCE",
+      "file": "src/server_config.rs",
+      "line": 298,
+      "reason": "server.properties view-distance exports here; read only by server_config_boot into LIVE_VIEW_DISTANCE whose live_view_distance() accessor is dead (the client's command.env write into integrated servers is not a read).",
+      "lane": "SERVER-CONFIG",
+      "date": "2026-11-24"
+    },
+    {
+      "check": "dead_server_config_field",
+      "symbol": "MEGU_SIMULATION_DISTANCE",
+      "file": "src/server_config.rs",
+      "line": 299,
+      "reason": "server.properties simulation-distance exports here; read only by server_config_boot into LIVE_SIMULATION_DISTANCE whose live_simulation_distance() accessor is dead.",
+      "lane": "SERVER-CONFIG",
+      "date": "2026-11-24"
+    },
+    {
+      "check": "dead_server_config_field",
+      "symbol": "MEGU_RCON_PASSWORD",
+      "file": "src/server_config.rs",
+      "line": 301,
+      "reason": "server.properties rcon.password deliberately feeds both MEGU_RCON_PASSWORD and MEGU_RCON_PASS; the listener only reads MEGU_RCON_PASS \u2014 this is a documented dead alias.",
+      "lane": "SERVER-CONFIG",
+      "date": "2026-11-24"
+    },
+    {
+      "check": "dead_server_config_field",
+      "symbol": "MEGU_OP_PERMISSION_LEVEL",
+      "file": "src/server_config.rs",
+      "line": 306,
+      "reason": "server.properties op-permission-level exports here but nothing reads the variable \u2014 no permission-level application exists at runtime.",
+      "lane": "SERVER-CONFIG",
+      "date": "2026-11-24"
+    },
+    {
+      "check": "dead_server_config_field",
+      "symbol": "MEGU_PVP",
+      "file": "src/server_config.rs",
+      "line": 307,
+      "reason": "server.properties pvp exports here but nothing reads the variable \u2014 no PvP gate exists in combat.",
+      "lane": "SERVER-CONFIG",
+      "date": "2026-11-24"
+    },
+    {
+      "check": "dead_server_config_field",
+      "symbol": "MEGU_ALLOW_FLIGHT",
+      "file": "src/server_config.rs",
+      "line": 308,
+      "reason": "server.properties allow-flight exports here but nothing reads the variable \u2014 no flight-permission check exists at runtime.",
+      "lane": "SERVER-CONFIG",
+      "date": "2026-11-24"
+    },
+    {
+      "check": "dead_server_config_field",
+      "symbol": "ServerProperties.enable_query",
+      "file": "server-files/src/properties.rs",
+      "line": 752,
+      "reason": "GS4 query responder is not implemented; enable_query()/set_enable_query() only round-trip the file.",
+      "lane": "SERVER-PROPERTIES",
+      "date": "2026-11-24"
+    },
+    {
+      "check": "dead_server_config_field",
+      "symbol": "ServerProperties.query_port",
+      "file": "server-files/src/properties.rs",
+      "line": 762,
+      "reason": "GS4 query responder is not implemented; query_port()/set_query_port() only round-trip the file.",
+      "lane": "SERVER-PROPERTIES",
+      "date": "2026-11-24"
+    },
+    {
+      "check": "dead_server_config_field",
+      "symbol": "ServerProperties.enforce_secure_profile",
+      "file": "server-files/src/properties.rs",
+      "line": 772,
+      "reason": "Mojang signed-chat enforcement is not implemented; the accessor pair only round-trips the file.",
+      "lane": "SERVER-PROPERTIES",
+      "date": "2026-11-24"
+    },
+    {
+      "check": "dead_server_config_field",
+      "symbol": "ServerProperties.fair_play_policy",
+      "file": "server-files/src/properties.rs",
+      "line": 786,
+      "reason": "The whole-policy getter/setter is unused \u2014 server_init sets the five keys individually via doc_mut() and no runtime path reads fair_play_policy().",
+      "lane": "SERVER-PROPERTIES",
+      "date": "2026-11-24"
+    },
+    {
+      "check": "dead_server_config_field",
+      "symbol": "ServerFairPlayPolicy.minimap_mode",
+      "file": "server-files/src/properties.rs",
+      "line": 505,
+      "reason": "ServerFairPlayPolicy is parsed with permissive defaults but fair_play_policy() is never called outside properties.rs \u2014 the minimap/radar/waypoint policy never reaches the client or session code.",
+      "lane": "SERVER-PROPERTIES",
+      "date": "2026-11-24"
+    },
+    {
+      "check": "dead_server_config_field",
+      "symbol": "ServerFairPlayPolicy.allow_cave_map",
+      "file": "server-files/src/properties.rs",
+      "line": 507,
+      "reason": "ServerFairPlayPolicy is parsed with permissive defaults but fair_play_policy() is never called outside properties.rs \u2014 the minimap/radar/waypoint policy never reaches the client or session code.",
+      "lane": "SERVER-PROPERTIES",
+      "date": "2026-11-24"
+    },
+    {
+      "check": "dead_server_config_field",
+      "symbol": "ServerFairPlayPolicy.allow_mob_radar",
+      "file": "server-files/src/properties.rs",
+      "line": 509,
+      "reason": "ServerFairPlayPolicy is parsed with permissive defaults but fair_play_policy() is never called outside properties.rs \u2014 the minimap/radar/waypoint policy never reaches the client or session code.",
+      "lane": "SERVER-PROPERTIES",
+      "date": "2026-11-24"
+    },
+    {
+      "check": "dead_server_config_field",
+      "symbol": "ServerFairPlayPolicy.player_radar_scope",
+      "file": "server-files/src/properties.rs",
+      "line": 511,
+      "reason": "ServerFairPlayPolicy is parsed with permissive defaults but fair_play_policy() is never called outside properties.rs \u2014 the minimap/radar/waypoint policy never reaches the client or session code.",
+      "lane": "SERVER-PROPERTIES",
+      "date": "2026-11-24"
+    },
+    {
+      "check": "dead_server_config_field",
+      "symbol": "ServerFairPlayPolicy.allow_waypoint_teleport",
+      "file": "server-files/src/properties.rs",
+      "line": 514,
+      "reason": "ServerFairPlayPolicy is parsed with permissive defaults but fair_play_policy() is never called outside properties.rs \u2014 the minimap/radar/waypoint policy never reaches the client or session code.",
+      "lane": "SERVER-PROPERTIES",
+      "date": "2026-11-24"
+    },
+    {
+      "check": "dead_client_config_field",
+      "symbol": "ClientSettings.qol.chat_history_lines",
+      "file": "client-app/src/settings.rs",
+      "line": 395,
+      "reason": "Chat history capacity is serialized and bridged to UiSettings.qol but the chat log has no history-limit consumer.",
+      "lane": "CLIENT-SETTINGS",
+      "date": "2026-11-24"
+    },
+    {
+      "check": "dead_client_config_field",
+      "symbol": "ClientSettings.qol.prevent_tool_break",
+      "file": "client-app/src/settings.rs",
+      "line": 393,
+      "reason": "Tool-break guard is serialized and bridged to UiSettings.qol but no input/swing path consults it.",
+      "lane": "CLIENT-SETTINGS",
+      "date": "2026-11-24"
+    },
+    {
+      "check": "dead_client_config_field",
+      "symbol": "ClientSettings.qol.retain_chat_on_reconnect",
+      "file": "client-app/src/settings.rs",
+      "line": 397,
+      "reason": "Chat retention flag is serialized and bridged to UiSettings.qol but the disconnect path clears chat unconditionally.",
+      "lane": "CLIENT-SETTINGS",
+      "date": "2026-11-24"
+    },
+    {
+      "check": "dead_client_config_field",
+      "symbol": "ClientSettings.qol.tool_warn_percent",
+      "file": "client-app/src/settings.rs",
+      "line": 389,
+      "reason": "Tool-durability warning threshold is serialized and bridged to UiSettings.qol but no HUD/durability path reads it.",
+      "lane": "CLIENT-SETTINGS",
+      "date": "2026-11-24"
+    },
+    {
+      "check": "dead_client_config_field",
+      "symbol": "UiSettings.language",
+      "file": "client-ui/src/state.rs",
+      "line": 800,
+      "reason": "Legacy LanguageSetting kept synchronized for backward compatibility; all live translation paths read UiSettings.locale instead \u2014 .language is never read outside state.rs.",
+      "lane": "CLIENT-SETTINGS",
+      "date": "2026-11-24"
+    },
+    {
+      "check": "dead_client_config_field",
+      "symbol": "UiSettings.qol.chat_history_lines",
+      "file": "client-ui/src/state.rs",
+      "line": 455,
+      "reason": "Copied from ClientSettings.qol but only displayed in qol_tab; no chat-log consumer reads it.",
+      "lane": "CLIENT-SETTINGS",
+      "date": "2026-11-24"
+    },
+    {
+      "check": "dead_client_config_field",
+      "symbol": "UiSettings.qol.prevent_tool_break",
+      "file": "client-ui/src/state.rs",
+      "line": 453,
+      "reason": "Copied from ClientSettings.qol but only toggled in qol_tab; no input/swing path consults it.",
+      "lane": "CLIENT-SETTINGS",
+      "date": "2026-11-24"
+    },
+    {
+      "check": "dead_client_config_field",
+      "symbol": "UiSettings.qol.retain_chat_on_reconnect",
+      "file": "client-ui/src/state.rs",
+      "line": 457,
+      "reason": "Copied from ClientSettings.qol but only toggled in qol_tab; the disconnect path clears chat unconditionally.",
+      "lane": "CLIENT-SETTINGS",
+      "date": "2026-11-24"
+    },
+    {
+      "check": "dead_client_config_field",
+      "symbol": "UiSettings.qol.tool_warn_percent",
+      "file": "client-ui/src/state.rs",
+      "line": 451,
+      "reason": "Copied from ClientSettings.qol but only rendered in qol_tab; no HUD/durability path reads it.",
+      "lane": "CLIENT-SETTINGS",
+      "date": "2026-11-24"
+    },
+    {
+      "check": "dead_client_config_field",
+      "symbol": "UiSettings.qol_inventory_sort",
+      "file": "client-ui/src/state.rs",
+      "line": 796,
+      "reason": "Mouse Tweaks-style inventory sort toggle: builtin_inventory_sort_active() is never called and .qol_inventory_sort is never read outside state.rs \u2014 inventory sorting is not implemented.",
+      "lane": "CLIENT-SETTINGS",
+      "date": "2026-11-24"
+    },
+    {
+      "check": "dead_client_config_field",
+      "symbol": "UiSettings.qol_looking_at_hud",
+      "file": "client-ui/src/state.rs",
+      "line": 792,
+      "reason": "Jade-style looking-at HUD toggle: builtin_looking_at_hud_active() is never called and .qol_looking_at_hud is never read outside state.rs \u2014 the HUD feature is not implemented.",
+      "lane": "CLIENT-SETTINGS",
+      "date": "2026-11-24"
+    },
+    {
+      "check": "dead_client_config_field",
+      "symbol": "UiSettings.qol_mouse_tweaks",
+      "file": "client-ui/src/state.rs",
+      "line": 794,
+      "reason": "Mouse Tweaks-style drag tweaks toggle: builtin_mouse_tweaks_active() is never called and .qol_mouse_tweaks is never read outside state.rs \u2014 drag tweaks are not implemented.",
+      "lane": "CLIENT-SETTINGS",
+      "date": "2026-11-24"
+    },
+    {
+      "check": "dead_client_config_field",
+      "symbol": "UiSettings.shader_quick.shaders_enabled",
+      "file": "client-ui/src/state.rs",
+      "line": 642,
+      "reason": "Quick shader enable toggle is only read inside shaders_tab; no renderer path consults it.",
+      "lane": "CLIENT-SETTINGS",
+      "date": "2026-11-24"
+    },
+    {
+      "check": "dead_client_config_field",
+      "symbol": "UiSettings.visual.external_shader_pack_name",
+      "file": "client-ui/src/state.rs",
+      "line": 730,
+      "reason": "External shader-pack yield name is only read by external_shader_status()/builtin_shaders_yielded() inside the shaders tab; no renderer yield path consumes it.",
+      "lane": "CLIENT-SETTINGS",
+      "date": "2026-11-24"
+    },
+    {
+      "check": "dead_client_config_field",
+      "symbol": "UiSettings.zsh_command_bar",
+      "file": "client-ui/src/state.rs",
+      "line": 798,
+      "reason": "Zsh-style command bar toggle: .zsh_command_bar is never read outside state.rs \u2014 the command bar feature is not implemented.",
+      "lane": "CLIENT-SETTINGS",
       "date": "2026-11-24"
     }
   ]

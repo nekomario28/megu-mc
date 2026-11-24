@@ -471,6 +471,81 @@ WIRING_GHOST_WAIVER = {
     }],
 }
 
+# Check 5a fixture: a `[server]` key exported to `MEGU_FOO_LIMIT`, read by
+# boot into a `LIVE_*` atomic whose accessor is never called. Both the env
+# var and the accessor are findings until a non-test file reads
+# `live_foo_limit()`.
+WIRING_SERVER_CFG_DEAD = """\
+const SERVER_CONFIG_KEYS: &[(&str, &str)] = &[
+    ("foo_limit", "MEGU_FOO_LIMIT"),
+];
+static LIVE_FOO_LIMIT: std::sync::atomic::AtomicI32 =
+    std::sync::atomic::AtomicI32::new(8);
+fn server_config_boot() {
+    apply_runtime_server_config(
+        std::env::var("MEGU_FOO_LIMIT").ok().and_then(|v| v.parse().ok()),
+    );
+}
+pub(crate) fn apply_runtime_server_config(foo_limit: Option<i32>) {
+    LIVE_FOO_LIMIT.store(foo_limit.unwrap_or(8),
+        std::sync::atomic::Ordering::Relaxed);
+}
+#[allow(dead_code)]
+pub(crate) fn live_foo_limit() -> i32 {
+    LIVE_FOO_LIMIT.load(std::sync::atomic::Ordering::Relaxed)
+}
+"""
+
+WIRING_SERVER_CFG_READER = """\
+fn current_foo_limit() -> i32 {
+    crate::server_config::live_foo_limit()
+}
+"""
+
+# Check 5b fixture: `foo_enabled` only round-trips UI<->settings
+# (serialized in settings.rs, copied by both bridge bodies); `bar_enabled`
+# additionally reaches a live read in window.rs, so it — and its bridge
+# counterpart — must stay quiet.
+WIRING_CLIENT_SETTINGS = """\
+pub struct ClientSettings {
+    pub foo_enabled: bool,
+    pub bar_enabled: bool,
+}
+pub fn to_toml(s: &ClientSettings) -> String {
+    format!("foo={} bar={}", s.foo_enabled, s.bar_enabled)
+}
+"""
+
+WIRING_UI_SETTINGS = """\
+pub struct UiSettings {
+    pub foo_enabled_ui: bool,
+    pub bar_enabled_ui: bool,
+}
+"""
+
+WIRING_BRIDGE = """\
+fn apply_client_settings_to_ui(src: &ClientSettings, ui: &mut UiSettings) {
+    ui.foo_enabled_ui = src.foo_enabled;
+    ui.bar_enabled_ui = src.bar_enabled;
+}
+fn ui_to_client_settings(ui: &UiSettings, base: &ClientSettings)
+    -> ClientSettings {
+    let mut out = base.clone();
+    out.foo_enabled = ui.foo_enabled_ui;
+    out.bar_enabled = ui.bar_enabled_ui;
+    out
+}
+fn draw(&self, ui: &UiSettings) {
+    let _ = ui.bar_enabled_ui;
+}
+"""
+
+WIRING_CLIENT_READER = """\
+fn shade(&self, s: &ClientSettings) {
+    let _ = s.foo_enabled;
+}
+"""
+
 
 def wiring_fixture(root, files, waivers=None):
     for rel, text in files.items():
@@ -528,6 +603,26 @@ def wiring_audit_cases(keep_going):
          {"src/channels.rs": WIRING_GHOST_SERVER,
           "client-app/src/handle.rs": WIRING_GHOST_CLIENT},
          WIRING_GHOST_WAIVER, ("--fail-on-stale",), 1, "stale waivers"),
+        ("config stored in an uncalled live_* atomic is caught",
+         {"src/server_config.rs": WIRING_SERVER_CFG_DEAD}, None, (), 1,
+         "MEGU_FOO_LIMIT"),
+        ("live runtime read wires the config atomic",
+         {"src/server_config.rs": WIRING_SERVER_CFG_DEAD,
+          "src/play_protocol.rs": WIRING_SERVER_CFG_READER,
+          "src/save_v2.rs": WIRING_SAVE_V2_STUB}, None, (), 0,
+         None),
+        ("settings field round-tripping UI<->TOML is caught",
+         {"client-app/src/settings.rs": WIRING_CLIENT_SETTINGS,
+          "client-ui/src/state.rs": WIRING_UI_SETTINGS,
+          "client-gpu/src/window.rs": WIRING_BRIDGE}, None, (), 1,
+         "ClientSettings.foo_enabled"),
+        ("live renderer read wires the settings field",
+         {"client-app/src/settings.rs": WIRING_CLIENT_SETTINGS,
+          "client-ui/src/state.rs": WIRING_UI_SETTINGS,
+          "client-gpu/src/window.rs": WIRING_BRIDGE,
+          "client-app/src/render.rs": WIRING_CLIENT_READER,
+          "src/save_v2.rs": WIRING_SAVE_V2_STUB}, None, (), 0,
+         None),
     ]
     for name, files, waivers, argv, want_rc, marker in cases:
         with tempfile.TemporaryDirectory(prefix="wiring-audit-") as tmp:
