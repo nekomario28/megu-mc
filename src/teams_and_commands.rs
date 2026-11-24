@@ -5179,58 +5179,474 @@ fn run_clear_command(args: &[&str], me: Option<&Arc<Client>>) -> String {
 /// Vanilla 1.21.1 `DamageTypes` registry ids (the `minecraft:` prefix is
 /// implied). The `/damage` argument is a registry lookup, so unknown ids fail
 /// closed rather than silently re-typing the hit as `generic`.
+const VANILLA_DAMAGE_TYPES: &[&str] = &[
+    "arrow",
+    "bad_respawn_point",
+    "cactus",
+    "campfire",
+    "cramming",
+    "dragon_breath",
+    "drown",
+    "dry_out",
+    "ender_pearl",
+    "explosion",
+    "fall",
+    "falling_anvil",
+    "falling_block",
+    "falling_stalactite",
+    "fireball",
+    "fireworks",
+    "fly_into_wall",
+    "freeze",
+    "generic",
+    "generic_kill",
+    "hot_floor",
+    "in_fire",
+    "in_wall",
+    "indirect_magic",
+    "lava",
+    "lightning_bolt",
+    "magic",
+    "mob_attack",
+    "mob_attack_no_aggro",
+    "mob_projectile",
+    "on_fire",
+    "out_of_world",
+    "outside_border",
+    "player_attack",
+    "player_explosion",
+    "sonic_boom",
+    "spit",
+    "stalagmite",
+    "starve",
+    "sting",
+    "sweet_berry_bush",
+    "thorns",
+    "thrown",
+    "trident",
+    "unattributed_fireball",
+    "wind_charge",
+    "wither",
+    "wither_skull",
+];
+
 fn damage_type_known(name: &str) -> bool {
-    const TYPES: &[&str] = &[
-        "arrow",
-        "bad_respawn_point",
-        "cactus",
-        "campfire",
-        "cramming",
-        "dragon_breath",
-        "drown",
-        "dry_out",
-        "ender_pearl",
-        "explosion",
-        "fall",
-        "falling_anvil",
-        "falling_block",
-        "falling_stalactite",
-        "fireball",
-        "fireworks",
-        "fly_into_wall",
-        "freeze",
-        "generic",
-        "generic_kill",
-        "hot_floor",
-        "in_fire",
-        "in_wall",
-        "indirect_magic",
-        "lava",
-        "lightning_bolt",
-        "magic",
-        "mob_attack",
-        "mob_attack_no_aggro",
-        "mob_projectile",
-        "on_fire",
-        "out_of_world",
-        "outside_border",
-        "player_attack",
-        "player_explosion",
-        "sonic_boom",
-        "spit",
-        "stalagmite",
-        "starve",
-        "sting",
-        "sweet_berry_bush",
-        "thorns",
-        "thrown",
-        "trident",
-        "unattributed_fireball",
-        "wind_charge",
-        "wither",
-        "wither_skull",
-    ];
-    TYPES.contains(&name.trim_start_matches("minecraft:"))
+    VANILLA_DAMAGE_TYPES.contains(&name.trim_start_matches("minecraft:"))
+}
+
+/// Vanilla `DamageType` classification for the 1.21.1 registry: which
+/// `damage_type` tag sets the source belongs to. Membership follows the
+/// vanilla tag files; the classification drives `/damage`'s armor, shield,
+/// invulnerability and enchantment-protection wiring.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct DamageTypeFlags {
+    /// `#minecraft:bypasses_armor` — armor points do not reduce the hit.
+    pub(crate) bypasses_armor: bool,
+    /// `#minecraft:bypasses_invulnerability` — hurts creative-mode players and
+    /// ignores totem death protection (`out_of_world`, `generic_kill`).
+    pub(crate) bypasses_invulnerability: bool,
+    /// `#minecraft:is_fire` — burning sources (fire_protection EPF family).
+    pub(crate) is_fire: bool,
+    /// `#minecraft:is_explosion` (blast_protection EPF family).
+    pub(crate) is_explosion: bool,
+    /// `#minecraft:is_projectile` (projectile_protection EPF family).
+    pub(crate) is_projectile: bool,
+    /// `#minecraft:is_fall` (feather_falling EPF family).
+    pub(crate) is_fall: bool,
+    /// `#minecraft:witch_resistant_to` magic school, plus `dragon_breath`.
+    pub(crate) is_magic: bool,
+    /// `#minecraft:bypasses_shield` — a raised shield cannot block the hit.
+    pub(crate) bypasses_shield: bool,
+}
+
+// Vanilla `#minecraft:bypasses_armor` members (plus `dry_out`, the mob-only
+// environmental dehydration source the lane classifies with them).
+const DT_BYPASSES_ARMOR: &[&str] = &[
+    "on_fire",
+    "in_wall",
+    "cramming",
+    "drown",
+    "fly_into_wall",
+    "generic",
+    "wither",
+    "dragon_breath",
+    "starve",
+    "fall",
+    "freeze",
+    "stalagmite",
+    "magic",
+    "indirect_magic",
+    "out_of_world",
+    "generic_kill",
+    "sonic_boom",
+    "outside_border",
+    "dry_out",
+];
+const DT_BYPASSES_INVULNERABILITY: &[&str] = &["out_of_world", "generic_kill"];
+const DT_IS_FIRE: &[&str] = &[
+    "in_fire",
+    "campfire",
+    "on_fire",
+    "lava",
+    "hot_floor",
+    "unattributed_fireball",
+    "fireball",
+];
+const DT_IS_EXPLOSION: &[&str] = &[
+    "fireworks",
+    "explosion",
+    "player_explosion",
+    "bad_respawn_point",
+];
+const DT_IS_PROJECTILE: &[&str] = &[
+    "arrow",
+    "trident",
+    "mob_projectile",
+    "unattributed_fireball",
+    "fireball",
+    "wither_skull",
+    "thrown",
+    "wind_charge",
+    "spit",
+];
+const DT_IS_FALL: &[&str] = &["fall", "stalagmite", "ender_pearl"];
+const DT_IS_MAGIC: &[&str] = &[
+    "magic",
+    "indirect_magic",
+    "thorns",
+    "sonic_boom",
+    "dragon_breath",
+];
+/// `#minecraft:bypasses_shield` is `#bypasses_armor` plus these extras:
+/// falling blocks, burning/contact sources, lightning and thorns.
+const DT_BYPASSES_SHIELD_EXTRA: &[&str] = &[
+    "falling_anvil",
+    "falling_stalactite",
+    "in_fire",
+    "lava",
+    "hot_floor",
+    "campfire",
+    "cactus",
+    "sweet_berry_bush",
+    "lightning_bolt",
+    "thorns",
+];
+
+/// Tag lookup for a registry damage type id (an optional `minecraft:` prefix
+/// is normalised). Unknown ids flag nothing — `/damage` refuses them at the
+/// registry check before flags are ever consulted.
+pub(crate) fn damage_type_flags(damage_type: &str) -> DamageTypeFlags {
+    let ty = damage_type.trim_start_matches("minecraft:");
+    let in_set = |set: &[&str]| set.contains(&ty);
+    let bypasses_armor = in_set(DT_BYPASSES_ARMOR);
+    DamageTypeFlags {
+        bypasses_armor,
+        bypasses_invulnerability: in_set(DT_BYPASSES_INVULNERABILITY),
+        is_fire: in_set(DT_IS_FIRE),
+        is_explosion: in_set(DT_IS_EXPLOSION),
+        is_projectile: in_set(DT_IS_PROJECTILE),
+        is_fall: in_set(DT_IS_FALL),
+        is_magic: in_set(DT_IS_MAGIC),
+        bypasses_shield: bypasses_armor || in_set(DT_BYPASSES_SHIELD_EXTRA),
+    }
+}
+
+/// Vanilla `EnchantmentHelper.getDamageProtection` for a typed hit: the base
+/// `protection` EPF plus every specialised family whose tag the source is in
+/// (feather falling / blast / projectile / fire protection), capped at 20.
+fn damage_type_epf(c: &Client, flags: &DamageTypeFlags) -> i64 {
+    let base = enchant_epf(c, 0);
+    let mut epf = base;
+    for (covered, kind) in [
+        (flags.is_fall, 1u8),
+        (flags.is_explosion, 2),
+        (flags.is_projectile, 3),
+        (flags.is_fire, 4),
+    ] {
+        if covered {
+            epf += enchant_epf(c, kind) - base;
+        }
+    }
+    epf.min(20)
+}
+
+/// `LivingEntity.actuallyHurt`'s mitigation chain for a typed `/damage` hit:
+/// armor absorb is skipped for `bypasses_armor` sources, magic absorb (the
+/// EPF reduction) for `bypasses_invulnerability` and `bypasses_effects`
+/// (`starve` is the only BYPASSES_EFFECTS id in the 1.21.1 registry).
+fn damage_type_mitigated(c: &Client, amt: f32, dtype: &str, flags: &DamageTypeFlags) -> f32 {
+    if flags.bypasses_invulnerability || dtype == "starve" {
+        return amt;
+    }
+    let after_armor = if flags.bypasses_armor {
+        f64::from(amt)
+    } else {
+        f64::from(amt) * armor_dmg_factor(c, amt)
+    };
+    (after_armor * (1.0 - 0.04 * damage_type_epf(c, flags) as f64)) as f32
+}
+
+/// The display name a death message credits as `%2$s`: players keep their
+/// name, mobs are named by entity type the way Vanilla's translated
+/// `entity.minecraft.<type>` component would read.
+fn damage_attacker_name(eid: &str, cls_snap: &[Arc<Client>]) -> Option<String> {
+    if let Some(raw) = eid.strip_prefix("m:") {
+        let e = raw.parse::<i32>().ok()?;
+        let etype = mobs()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .iter()
+            .find(|m| m.eid == e)
+            .map(|m| m.etype)?;
+        Some(
+            entity_spec_by_id(etype)
+                .map_or("mob", |spec| {
+                    spec.name.strip_prefix("minecraft:").unwrap_or(spec.name)
+                })
+                .to_owned(),
+        )
+    } else {
+        cls_snap
+            .iter()
+            .find(|c| c.eid.to_string() == eid)
+            .map(|c| c.name.clone())
+    }
+}
+
+/// `(solo, attacker, attacker+held-item)` slots for each registry id's vanilla
+/// `message_id`, transcribed from the 1.21.1 `en_us` `death.attack.*` and
+/// `death.fell.*` keys (`{v}` victim, `{a}` attacker, `{w}` item). Vanilla has
+/// no solo translation for attacker-sourced types; those get a neutral
+/// article-free line so `/damage` without `by`/`from` still reads cleanly.
+fn vanilla_death_patterns(ty: &str) -> [&'static str; 3] {
+    match ty {
+        "arrow" => [
+            "{v} was shot",
+            "{v} was shot by {a}",
+            "{v} was shot by {a} using {w}",
+        ],
+        "bad_respawn_point" => ["{v} was killed by [Intentional Game Design]"; 3],
+        "cactus" => [
+            "{v} was pricked to death",
+            "{v} walked into a cactus while trying to escape {a}",
+            "{v} walked into a cactus while trying to escape {a}",
+        ],
+        // `campfire` shares the `inFire` message_id.
+        "campfire" | "in_fire" => [
+            "{v} went up in flames",
+            "{v} walked into fire while fighting {a}",
+            "{v} walked into fire while fighting {a}",
+        ],
+        "cramming" => [
+            "{v} was squished too much",
+            "{v} was squashed by {a}",
+            "{v} was squashed by {a}",
+        ],
+        "dragon_breath" => [
+            "{v} was roasted in dragon's breath",
+            "{v} was roasted in dragon's breath by {a}",
+            "{v} was roasted in dragon's breath by {a}",
+        ],
+        "drown" => [
+            "{v} drowned",
+            "{v} drowned while trying to escape {a}",
+            "{v} drowned while trying to escape {a}",
+        ],
+        "dry_out" => [
+            "{v} died from dehydration",
+            "{v} died from dehydration while trying to escape {a}",
+            "{v} died from dehydration while trying to escape {a}",
+        ],
+        // `fall` and `ender_pearl` carry `death_message_type: fall_variants`.
+        "ender_pearl" | "fall" => [
+            "{v} fell from a high place",
+            "{v} was doomed to fall by {a}",
+            "{v} was doomed to fall by {a} using {w}",
+        ],
+        // `player_explosion` uses the `explosion.player` message_id.
+        "explosion" | "player_explosion" => [
+            "{v} blew up",
+            "{v} was blown up by {a}",
+            "{v} was blown up by {a} using {w}",
+        ],
+        // `falling_anvil` uses the `anvil` message_id.
+        "falling_anvil" => [
+            "{v} was squashed by a falling anvil",
+            "{v} was squashed by a falling anvil while fighting {a}",
+            "{v} was squashed by a falling anvil while fighting {a}",
+        ],
+        "falling_block" => [
+            "{v} was squashed by a falling block",
+            "{v} was squashed by a falling block while fighting {a}",
+            "{v} was squashed by a falling block while fighting {a}",
+        ],
+        "falling_stalactite" => [
+            "{v} was skewered by a falling stalactite",
+            "{v} was skewered by a falling stalactite while fighting {a}",
+            "{v} was skewered by a falling stalactite while fighting {a}",
+        ],
+        "fireball" => [
+            "{v} was fireballed",
+            "{v} was fireballed by {a}",
+            "{v} was fireballed by {a} using {w}",
+        ],
+        "fireworks" => [
+            "{v} went off with a bang",
+            "{v} went off with a bang while fighting {a}",
+            "{v} went off with a bang due to a firework fired from {w} by {a}",
+        ],
+        "fly_into_wall" => [
+            "{v} experienced kinetic energy",
+            "{v} experienced kinetic energy while trying to escape {a}",
+            "{v} experienced kinetic energy while trying to escape {a}",
+        ],
+        "freeze" => [
+            "{v} froze to death",
+            "{v} was frozen to death by {a}",
+            "{v} was frozen to death by {a}",
+        ],
+        "generic" => [
+            "{v} died",
+            "{v} died because of {a}",
+            "{v} died because of {a}",
+        ],
+        "generic_kill" => [
+            "{v} was killed",
+            "{v} was killed while fighting {a}",
+            "{v} was killed while fighting {a}",
+        ],
+        "hot_floor" => [
+            "{v} discovered the floor was lava",
+            "{v} walked into the danger zone due to {a}",
+            "{v} walked into the danger zone due to {a}",
+        ],
+        "in_wall" => [
+            "{v} suffocated in a wall",
+            "{v} suffocated in a wall while fighting {a}",
+            "{v} suffocated in a wall while fighting {a}",
+        ],
+        "indirect_magic" => [
+            "{v} was killed by magic",
+            "{v} was killed by {a} using magic",
+            "{v} was killed by {a} using {w}",
+        ],
+        "lava" => [
+            "{v} tried to swim in lava",
+            "{v} tried to swim in lava to escape {a}",
+            "{v} tried to swim in lava to escape {a}",
+        ],
+        "lightning_bolt" => [
+            "{v} was struck by lightning",
+            "{v} was struck by lightning while fighting {a}",
+            "{v} was struck by lightning while fighting {a}",
+        ],
+        "magic" => [
+            "{v} was killed by magic",
+            "{v} was killed by magic while trying to escape {a}",
+            "{v} was killed by magic while trying to escape {a}",
+        ],
+        // `mob`, the message_id of mob/melee-attack, projectile, spit and
+        // wind-charge sources, and `player` share the slain-by line.
+        "mob_attack" | "mob_attack_no_aggro" | "mob_projectile" | "spit"
+        | "wind_charge" | "player_attack" => [
+            "{v} was slain",
+            "{v} was slain by {a}",
+            "{v} was slain by {a} using {w}",
+        ],
+        // `unattributed_fireball` shares the `onFire` message_id.
+        "on_fire" | "unattributed_fireball" => [
+            "{v} burned to death",
+            "{v} was burned to a crisp while fighting {a}",
+            "{v} was burned to a crisp while fighting {a} wielding {w}",
+        ],
+        "out_of_world" => [
+            "{v} fell out of the world",
+            "{v} didn't want to live in the same world as {a}",
+            "{v} didn't want to live in the same world as {a}",
+        ],
+        "outside_border" => [
+            "{v} left the confines of this world",
+            "{v} left the confines of this world while fighting {a}",
+            "{v} left the confines of this world while fighting {a}",
+        ],
+        "sonic_boom" => [
+            "{v} was obliterated by a sonically-charged shriek",
+            "{v} was obliterated by a sonically-charged shriek while trying to escape {a}",
+            "{v} was obliterated by a sonically-charged shriek while trying to escape {a} wielding {w}",
+        ],
+        "stalagmite" => [
+            "{v} was impaled on a stalagmite",
+            "{v} was impaled on a stalagmite while fighting {a}",
+            "{v} was impaled on a stalagmite while fighting {a}",
+        ],
+        "starve" => [
+            "{v} starved to death",
+            "{v} starved to death while fighting {a}",
+            "{v} starved to death while fighting {a}",
+        ],
+        "sting" => [
+            "{v} was stung to death",
+            "{v} was stung to death by {a}",
+            "{v} was stung to death by {a} using {w}",
+        ],
+        "sweet_berry_bush" => [
+            "{v} was poked to death by a sweet berry bush",
+            "{v} was poked to death by a sweet berry bush while trying to escape {a}",
+            "{v} was poked to death by a sweet berry bush while trying to escape {a}",
+        ],
+        "thorns" => [
+            "{v} was killed",
+            "{v} was killed while trying to hurt {a}",
+            "{v} was killed by {w} while trying to hurt {a}",
+        ],
+        "thrown" => [
+            "{v} was pummeled",
+            "{v} was pummeled by {a}",
+            "{v} was pummeled by {a} using {w}",
+        ],
+        "trident" => [
+            "{v} was impaled",
+            "{v} was impaled by {a}",
+            "{v} was impaled by {a} with {w}",
+        ],
+        "wither" => [
+            "{v} withered away",
+            "{v} withered away while fighting {a}",
+            "{v} withered away while fighting {a}",
+        ],
+        "wither_skull" => [
+            "{v} was shot by a skull",
+            "{v} was shot by a skull from {a}",
+            "{v} was shot by a skull from {a} using {w}",
+        ],
+        _ => vanilla_death_patterns("generic"),
+    }
+}
+
+/// Vanilla 1.21.1 English death message for a registry `damage_type`
+/// (`minecraft:` prefix optional). `attacker` fills the `%2$s` slot (the
+/// entity the kill is credited to) and `weapon` the `%3$s` held-item clause
+/// where a vanilla `.item` variant exists; both fall back to the
+/// shorter forms when absent.
+pub(crate) fn format_vanilla_death_message(
+    victim: &str,
+    damage_type: &str,
+    attacker: Option<&str>,
+    weapon: Option<&str>,
+) -> String {
+    let ty = damage_type.trim_start_matches("minecraft:");
+    let attacker = attacker.map(str::trim).filter(|a| !a.is_empty());
+    let weapon = weapon.map(str::trim).filter(|w| !w.is_empty());
+    let [solo, by, by_item] = vanilla_death_patterns(ty);
+    let pattern = match (attacker, weapon) {
+        (Some(_), Some(_)) => by_item,
+        (Some(_), None) => by,
+        _ => solo,
+    };
+    pattern
+        .replace("{v}", victim)
+        .replace("{a}", attacker.unwrap_or(""))
+        .replace("{w}", weapon.unwrap_or(""))
 }
 
 /// `by <entity>`/`from <entity>` each take Vanilla's single-entity argument:
@@ -5260,6 +5676,9 @@ fn run_damage_command(ctx: &CmdCtx, args: &[&str], me: Option<&Arc<Client>>) -> 
         _ => return format!("Invalid damage amount '{raw_amount}'"),
     };
     // The optional tail starts at the damage type; `at`/`by` require it.
+    // `by <entity>`/`from <cause>` also name the attacker the death message
+    // credits: the cause entity when both are given, the direct one otherwise.
+    let mut attacker_eid: Option<String> = None;
     match args.get(2..).unwrap_or_default() {
         [] | [_] => {}
         [_, "at", x, y, z] => {
@@ -5269,16 +5688,17 @@ fn run_damage_command(ctx: &CmdCtx, args: &[&str], me: Option<&Arc<Client>>) -> 
                 coord(z, ctx.z),
             );
         }
-        [_, "by", entity] => {
+        [_, "by", entity] => match damage_single_entity(entity, me) {
+            Ok(e) => attacker_eid = Some(e),
+            Err(e) => return e,
+        },
+        [_, "by", entity, "from", cause] => {
             if let Err(e) = damage_single_entity(entity, me) {
                 return e;
             }
-        }
-        [_, "by", entity, "from", cause] => {
-            for who in [entity, cause] {
-                if let Err(e) = damage_single_entity(who, me) {
-                    return e;
-                }
+            match damage_single_entity(cause, me) {
+                Ok(e) => attacker_eid = Some(e),
+                Err(e) => return e,
             }
         }
         _ => return USAGE.into(),
@@ -5288,6 +5708,14 @@ fn run_damage_command(ctx: &CmdCtx, args: &[&str], me: Option<&Arc<Client>>) -> 
             return format!("Invalid damage type '{dtype}'");
         }
     }
+    // The registry lookup passed: the declared type drives Vanilla's
+    // mitigation tags (armor, shield, creative invulnerability) and the
+    // enchantment-protection family on the hit.
+    let dtype = args
+        .get(2)
+        .map(|d| d.trim_start_matches("minecraft:"))
+        .unwrap_or("generic");
+    let flags = damage_type_flags(dtype);
     let tgts = if sel.starts_with('@') {
         resolve_selector(sel, me)
     } else {
@@ -5301,12 +5729,19 @@ fn run_damage_command(ctx: &CmdCtx, args: &[&str], me: Option<&Arc<Client>>) -> 
     };
     let mut n = 0;
     let cls_snap: Vec<Arc<Client>> = client_snapshot();
+    let attacker_name = attacker_eid
+        .as_deref()
+        .and_then(|eid| damage_attacker_name(eid, &cls_snap));
     let mut mob_hits: Vec<(i32, f32)> = Vec::new();
     for t in &tgts {
         if let Some(e) = t.strip_prefix("m:").and_then(|e| e.parse::<i32>().ok()) {
             mob_hits.push((e, amt));
         } else if let Some(c) = cls_snap.iter().find(|c| c.eid.to_string() == *t) {
-            if *c.gm.lock().unwrap_or_else(|e| e.into_inner()) == 1 {
+            // Creative immunity yields only to `bypasses_invulnerability`
+            // sources (`out_of_world`, `generic_kill`).
+            if *c.gm.lock().unwrap_or_else(|e| e.into_inner()) == 1
+                && !flags.bypasses_invulnerability
+            {
                 continue;
             }
             // OPS-SRE `party_friendly_fire` gate: a player-issued `/damage` on a
@@ -5318,16 +5753,43 @@ fn run_damage_command(ctx: &CmdCtx, args: &[&str], me: Option<&Arc<Client>>) -> 
                     continue;
                 }
             }
+            // `LivingEntity.hurt` → `isDamageSourceBlocked`: a raised shield
+            // negates a non-`bypasses_shield` source outright, so the target
+            // is not counted among the damaged ones.
+            if !flags.bypasses_shield
+                && *c.blocking.lock().unwrap_or_else(|e| e.into_inner())
+            {
+                continue;
+            }
             let mut h = c.hp.lock().unwrap_or_else(|e| e.into_inner());
-            *h = (*h - hurt_absorb(c, dmg_after(c, amt, 0))).max(0.0);
+            *h = (*h - hurt_absorb(c, damage_type_mitigated(c, amt, dtype, &flags)))
+                .max(0.0);
             if *h <= 0.0 {
                 drop(h);
-                totem_check(c);
+                // `checkTotemDeathProtection` never fires for sources that
+                // bypass invulnerability.
+                if !flags.bypasses_invulnerability {
+                    totem_check(c);
+                }
                 h = c.hp.lock().unwrap_or_else(|e| e.into_inner());
             }
             let hh = *h;
             drop(h);
-            damage_armor(c, amt);
+            // Armor durability is only spent on hits armor actually absorbed.
+            if !flags.bypasses_armor {
+                damage_armor(c, amt);
+            }
+            // Vanilla `showDeathMessages`: a typed player death reports the
+            // registry message for the declared source.
+            if hh <= 0.0 && GR_SHOW_DEATH_MESSAGES.load(Ordering::Relaxed) != 0 {
+                let line = system_chat(&format_vanilla_death_message(
+                    &c.name,
+                    dtype,
+                    attacker_name.as_deref(),
+                    None,
+                ));
+                broadcast(-1, |_| (0x6c, line.clone()));
+            }
             if let Ok(mut w) = c.sock.lock() {
                 let _ = send_packet(&mut w, 0x24, hurt_anim(c.eid));
                 let _ = send_packet(&mut w, 0x5d, health_pkt_c(hh, c));
@@ -5341,8 +5803,18 @@ fn run_damage_command(ctx: &CmdCtx, args: &[&str], me: Option<&Arc<Client>>) -> 
             ms.iter()
                 .find(|m| m.eid == eid)
                 .map(|m| {
+                    // Vanilla `Witch.hurt`: an 85% resistance to the
+                    // `witch_resistant_to` magic sources.
+                    let hit = if flags.is_magic
+                        && entity_spec_by_id(m.etype)
+                            .is_some_and(|spec| spec.name == "minecraft:witch")
+                    {
+                        amt * 0.15
+                    } else {
+                        amt
+                    };
                     let mut h = m.hp.lock().unwrap_or_else(|e| e.into_inner());
-                    *h -= amt;
+                    *h -= hit;
                     *h <= 0.0
                 })
                 .unwrap_or(false)
@@ -11080,5 +11552,418 @@ mod ops_admin_builtin_tests {
         assert_eq!(ops_run(&op, "/megu claim"), MEGU_USAGE);
         ops_deop("ops_misc_op");
         ops_reset_claims();
+    }
+}
+
+// ---------- Vanilla 1.21.1 damage-type classification: registry, flags,
+// death messages and the live /damage wiring ----------
+#[cfg(test)]
+mod damage_type_tests {
+    use super::*;
+    use std::net::TcpStream;
+
+    fn dt_client(eid: i32, name: &str) -> (Arc<Client>, TcpStream) {
+        let (mut client, receiver) = crate::effect_tests::client_pair();
+        client.eid = eid;
+        client.name = name.into();
+        *client.pos.lock().unwrap_or_else(|e| e.into_inner()) =
+            (0.5, 16.0, 0.5, 0.0, 0.0, true);
+        receiver
+            .set_read_timeout(Some(std::time::Duration::from_millis(300)))
+            .unwrap();
+        (Arc::new(client), receiver)
+    }
+
+    fn dt_ctx(me: Option<Arc<Client>>) -> CmdCtx {
+        CmdCtx {
+            me,
+            x: 0.5,
+            y: 16.0,
+            z: 0.5,
+        }
+    }
+
+    fn dt_run(ctx: &CmdCtx, msg: &str) -> String {
+        run_command_ctx(ctx, msg, &mut None)
+    }
+
+    fn dt_remove(eid: i32) {
+        clients()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .retain(|c| c.eid != eid);
+    }
+
+    #[test]
+    fn damage_type_registry_covers_all_48_vanilla_ids() {
+        assert_eq!(VANILLA_DAMAGE_TYPES.len(), 48);
+        for ty in VANILLA_DAMAGE_TYPES {
+            assert!(damage_type_known(ty), "{ty}");
+            assert!(damage_type_known(&format!("minecraft:{ty}")), "minecraft:{ty}");
+        }
+        assert!(!damage_type_known("not_a_type"));
+        assert!(!damage_type_known("minecraft:not_a_type"));
+    }
+
+    #[test]
+    fn damage_type_flags_match_vanilla_tag_membership() {
+        let f = damage_type_flags;
+        for ty in [
+            "on_fire",
+            "in_wall",
+            "cramming",
+            "drown",
+            "fly_into_wall",
+            "generic",
+            "wither",
+            "dragon_breath",
+            "starve",
+            "fall",
+            "freeze",
+            "stalagmite",
+            "magic",
+            "indirect_magic",
+            "out_of_world",
+            "generic_kill",
+            "sonic_boom",
+            "outside_border",
+            "dry_out",
+        ] {
+            assert!(f(ty).bypasses_armor, "{ty}");
+        }
+        for ty in ["arrow", "lava", "mob_attack", "falling_anvil", "explosion"] {
+            assert!(!f(ty).bypasses_armor, "{ty}");
+        }
+        for ty in ["out_of_world", "generic_kill"] {
+            assert!(f(ty).bypasses_invulnerability, "{ty}");
+        }
+        for ty in ["fall", "generic", "lava", "explosion"] {
+            assert!(!f(ty).bypasses_invulnerability, "{ty}");
+        }
+        for ty in [
+            "in_fire",
+            "campfire",
+            "on_fire",
+            "lava",
+            "hot_floor",
+            "unattributed_fireball",
+            "fireball",
+        ] {
+            assert!(f(ty).is_fire, "{ty}");
+        }
+        assert!(!f("freeze").is_fire);
+        for ty in ["explosion", "player_explosion", "bad_respawn_point", "fireworks"] {
+            assert!(f(ty).is_explosion, "{ty}");
+        }
+        assert!(!f("fireball").is_explosion);
+        for ty in [
+            "arrow",
+            "trident",
+            "mob_projectile",
+            "unattributed_fireball",
+            "fireball",
+            "wither_skull",
+            "thrown",
+            "wind_charge",
+            "spit",
+        ] {
+            assert!(f(ty).is_projectile, "{ty}");
+        }
+        assert!(!f("mob_attack").is_projectile);
+        for ty in ["fall", "stalagmite", "ender_pearl"] {
+            assert!(f(ty).is_fall, "{ty}");
+        }
+        assert!(!f("fly_into_wall").is_fall);
+        for ty in ["magic", "indirect_magic", "thorns", "sonic_boom", "dragon_breath"] {
+            assert!(f(ty).is_magic, "{ty}");
+        }
+        assert!(!f("arrow").is_magic);
+        // Every armor-bypassing source also bypasses shields; the burning,
+        // contact, falling-block, lightning and thorns extras are tagged too.
+        for ty in [
+            "in_fire",
+            "lava",
+            "hot_floor",
+            "campfire",
+            "cactus",
+            "sweet_berry_bush",
+            "lightning_bolt",
+            "thorns",
+            "falling_anvil",
+            "falling_stalactite",
+            "sonic_boom",
+        ] {
+            assert!(f(ty).bypasses_shield, "{ty}");
+        }
+        for ty in ["arrow", "mob_attack", "explosion", "trident"] {
+            assert!(!f(ty).bypasses_shield, "{ty}");
+        }
+        // The minecraft: prefix normalises; unknown ids flag nothing.
+        assert!(f("minecraft:fall").bypasses_armor);
+        assert!(f("minecraft:sonic_boom").bypasses_shield);
+        let none = f("not_a_type");
+        assert!(
+            !none.bypasses_armor
+                && !none.bypasses_invulnerability
+                && !none.is_fire
+                && !none.is_explosion
+                && !none.is_projectile
+                && !none.is_fall
+                && !none.is_magic
+                && !none.bypasses_shield,
+            "unknown id must flag nothing"
+        );
+    }
+
+    #[test]
+    fn vanilla_death_messages_cover_every_registry_id() {
+        for ty in VANILLA_DAMAGE_TYPES {
+            let solo = format_vanilla_death_message("dt_victim", ty, None, None);
+            assert!(!solo.is_empty() && solo.contains("dt_victim"), "{ty}: {solo}");
+            assert!(
+                !solo.contains("{v}") && !solo.contains("{a}") && !solo.contains("{w}"),
+                "{ty}: unfilled slot in {solo}"
+            );
+            let by = format_vanilla_death_message("dt_victim", ty, Some("dt_killer"), None);
+            assert!(by.contains("dt_victim"), "{ty}: {by}");
+            if *ty != "bad_respawn_point" {
+                assert!(by.contains("dt_killer"), "{ty}: {by}");
+            }
+            let both =
+                format_vanilla_death_message("dt_victim", ty, Some("dt_killer"), Some("Excalibur"));
+            assert!(both.contains("dt_victim"), "{ty}: {both}");
+        }
+        // The .item variants interpolate the held item (`%3$s`).
+        for ty in [
+            "arrow",
+            "ender_pearl",
+            "explosion",
+            "fall",
+            "fireball",
+            "fireworks",
+            "indirect_magic",
+            "mob_attack",
+            "mob_attack_no_aggro",
+            "mob_projectile",
+            "on_fire",
+            "player_attack",
+            "player_explosion",
+            "sonic_boom",
+            "spit",
+            "sting",
+            "thorns",
+            "thrown",
+            "trident",
+            "unattributed_fireball",
+            "wind_charge",
+            "wither_skull",
+        ] {
+            let both =
+                format_vanilla_death_message("v", ty, Some("a"), Some("w"));
+            assert!(both.contains('w'), "{ty}: {both}");
+        }
+    }
+
+    #[test]
+    fn vanilla_death_messages_canonical_lines() {
+        let f = format_vanilla_death_message;
+        assert_eq!(
+            f("Steve", "fly_into_wall", None, None),
+            "Steve experienced kinetic energy"
+        );
+        assert_eq!(f("Steve", "fall", None, None), "Steve fell from a high place");
+        assert_eq!(
+            f("Steve", "lava", None, None),
+            "Steve tried to swim in lava"
+        );
+        assert_eq!(
+            f("Steve", "bad_respawn_point", None, None),
+            "Steve was killed by [Intentional Game Design]"
+        );
+        assert_eq!(
+            f("Steve", "bad_respawn_point", Some("Alex"), None),
+            "Steve was killed by [Intentional Game Design]"
+        );
+        assert_eq!(
+            f("Steve", "mob_attack", Some("Alex"), None),
+            "Steve was slain by Alex"
+        );
+        assert_eq!(
+            f("Steve", "mob_attack", Some("Alex"), Some("Netherite Sword")),
+            "Steve was slain by Alex using Netherite Sword"
+        );
+        assert_eq!(
+            f("Steve", "player_attack", Some("Alex"), Some("Trident")),
+            "Steve was slain by Alex using Trident"
+        );
+        assert_eq!(f("Steve", "arrow", None, None), "Steve was shot");
+        assert_eq!(
+            f("Steve", "arrow", Some("Skeleton"), Some("Bow")),
+            "Steve was shot by Skeleton using Bow"
+        );
+        assert_eq!(
+            f("Steve", "thorns", Some("Alex"), Some("Thorns Mail")),
+            "Steve was killed by Thorns Mail while trying to hurt Alex"
+        );
+        assert_eq!(
+            f("Steve", "trident", Some("Drowned"), Some("Trident")),
+            "Steve was impaled by Drowned with Trident"
+        );
+        assert_eq!(f("Steve", "drown", None, None), "Steve drowned");
+        assert_eq!(
+            f("Steve", "drown", Some("Alex"), None),
+            "Steve drowned while trying to escape Alex"
+        );
+        assert_eq!(
+            f("Steve", "out_of_world", Some("Alex"), None),
+            "Steve didn't want to live in the same world as Alex"
+        );
+        assert_eq!(f("Steve", "generic_kill", None, None), "Steve was killed");
+        assert_eq!(
+            f("Steve", "campfire", None, None),
+            "Steve went up in flames"
+        );
+        assert_eq!(
+            f("Steve", "unattributed_fireball", None, None),
+            "Steve burned to death"
+        );
+        assert_eq!(
+            f("Steve", "sonic_boom", None, None),
+            "Steve was obliterated by a sonically-charged shriek"
+        );
+        assert_eq!(
+            f("Steve", "ender_pearl", Some("Alex"), None),
+            "Steve was doomed to fall by Alex"
+        );
+        assert_eq!(
+            f(
+                "Steve",
+                "fireworks",
+                Some("Alex"),
+                Some("Firework Rocket")
+            ),
+            "Steve went off with a bang due to a firework fired from Firework Rocket by Alex"
+        );
+        assert_eq!(
+            f("Steve", "wither_skull", Some("Wither"), None),
+            "Steve was shot by a skull from Wither"
+        );
+        // The minecraft: prefix does not change the message.
+        assert_eq!(
+            f("Steve", "minecraft:fall", None, None),
+            f("Steve", "fall", None, None)
+        );
+        assert_eq!(
+            f("Steve", "unknown_source", None, None),
+            "Steve died"
+        );
+    }
+
+    #[test]
+    fn damage_command_applies_type_flags_and_reports_death() {
+        let _world = world_guard();
+        let prev_gr = GR_SHOW_DEATH_MESSAGES.swap(1, Ordering::Relaxed);
+        let ctx = dt_ctx(None);
+
+        // `bypasses_invulnerability`: a creative-mode target ignores `generic`
+        // but `generic_kill` lands raw.
+        let (victim, _rv) = dt_client(99_700, "dt_creative");
+        *victim.gm.lock().unwrap_or_else(|e| e.into_inner()) = 1;
+        clients()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .push(victim.clone());
+        assert_eq!(
+            dt_run(&ctx, "/damage dt_creative 3 generic"),
+            "Applied 3 damage to 0 target(s)"
+        );
+        assert_eq!(*victim.hp.lock().unwrap_or_else(|e| e.into_inner()), 20.0);
+        assert_eq!(
+            dt_run(&ctx, "/damage dt_creative 5 generic_kill"),
+            "Applied 5 damage to 1 target(s)"
+        );
+        assert_eq!(*victim.hp.lock().unwrap_or_else(|e| e.into_inner()), 15.0);
+        dt_remove(99_700);
+
+        // `bypasses_shield`: a raised shield negates `arrow` but not `lava`.
+        let (shield, _rs) = dt_client(99_701, "dt_shield");
+        *shield.blocking.lock().unwrap_or_else(|e| e.into_inner()) = true;
+        clients()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .push(shield.clone());
+        assert_eq!(
+            dt_run(&ctx, "/damage dt_shield 5 arrow"),
+            "Applied 5 damage to 0 target(s)"
+        );
+        assert_eq!(*shield.hp.lock().unwrap_or_else(|e| e.into_inner()), 20.0);
+        assert_eq!(
+            dt_run(&ctx, "/damage dt_shield 4 lava"),
+            "Applied 4 damage to 1 target(s)"
+        );
+        assert_eq!(*shield.hp.lock().unwrap_or_else(|e| e.into_inner()), 16.0);
+        dt_remove(99_701);
+
+        // `bypasses_armor`: `drown` ignores 20 armor points that cut
+        // `mob_attack` to a fraction.
+        let (armored, _ra) = dt_client(99_702, "dt_armored");
+        *armored.armor_pts.lock().unwrap_or_else(|e| e.into_inner()) = 20;
+        clients()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .push(armored.clone());
+        assert_eq!(
+            dt_run(&ctx, "/damage dt_armored 10 mob_attack"),
+            "Applied 10 damage to 1 target(s)"
+        );
+        let after_melee = *armored.hp.lock().unwrap_or_else(|e| e.into_inner());
+        assert!(
+            after_melee > 10.0 && after_melee < 20.0,
+            "armor should mitigate melee: {after_melee}"
+        );
+        assert_eq!(
+            dt_run(&ctx, "/damage dt_armored 10 drown"),
+            "Applied 10 damage to 1 target(s)"
+        );
+        assert_eq!(
+            *armored.hp.lock().unwrap_or_else(|e| e.into_inner()),
+            after_melee - 10.0,
+            "drown must bypass the armor factor"
+        );
+        dt_remove(99_702);
+
+        // `format_vanilla_death_message` wired into the kill path: the typed
+        // death is broadcast as a 0x6c system chat line crediting `by`.
+        let (dead, mut rdead) = dt_client(99_703, "dt_victim");
+        let (killer, _rk) = dt_client(99_704, "dt_killer");
+        *dead.hp.lock().unwrap_or_else(|e| e.into_inner()) = 5.0;
+        clients()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .push(dead.clone());
+        clients()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .push(killer.clone());
+        assert_eq!(
+            dt_run(&ctx, "/damage dt_victim 100 mob_attack by dt_killer"),
+            "Applied 100 damage to 1 target(s)"
+        );
+        assert_eq!(*dead.hp.lock().unwrap_or_else(|e| e.into_inner()), 0.0);
+        let deadline = Instant::now() + Duration::from_millis(300);
+        let mut saw = false;
+        while let Some((id, payload)) = read_packet(&mut rdead, deadline) {
+            if id == 0x6c
+                && String::from_utf8_lossy(&payload)
+                    .contains("dt_victim was slain by dt_killer")
+            {
+                saw = true;
+                break;
+            }
+        }
+        assert!(saw, "typed death message was not broadcast");
+        dt_remove(99_703);
+        dt_remove(99_704);
+        GR_SHOW_DEATH_MESSAGES.store(prev_gr, Ordering::Relaxed);
     }
 }
