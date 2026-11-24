@@ -2,6 +2,7 @@
 //! Asynchronous live Protocol 767/777 session and renderer-facing world state.
 //! Socket operations happen on a worker thread; `poll` never performs I/O.
 
+use std::cell::RefCell;
 use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
 use std::path::PathBuf;
 use std::sync::mpsc::{self, Receiver, SyncSender, TryRecvError, TrySendError};
@@ -57,7 +58,8 @@ use megu_client_mesh::vanilla_plus_nature::{
     compute_cloud_lighting, generate_layered_voxel_clouds_with_atmosphere, tick_nature_ambience,
 };
 use megu_client_mesh::{
-    BuiltSectionMesh, DIRECTION_BUCKETS, DirectionBuckets, SectionCoord, box_in_frustum,
+    BuiltSectionMesh, DIRECTION_BUCKETS, DirectionBuckets, SECTION_CELLS, SectionCoord,
+    box_in_frustum, section_index,
 };
 use megu_kernel::Aabb;
 use megu_kernel::CommandDispatcher;
@@ -1510,6 +1512,192 @@ fn is_always_dark_signal_block(block_id: &str) -> bool {
 }
 
 // ---------------------------------------------------------------------------
+// Placed-block dynamic-light scan cache
+// ---------------------------------------------------------------------------
+
+/// One fully-resolved placed-block light inside the ±8 scan box. The
+/// block-state-derived fields (world position, emitter, flicker phase)
+/// freeze at scan time; only [`evaluate_modulated_intensity`] and the
+/// camera distance re-run on the cached path, so steady-state frames
+/// cost zero block/registry lookups.
+#[derive(Clone, Copy, Debug)]
+struct CachedPlacedLight {
+    pos: [f32; 3],
+    emitter: ResolvedLightEmitter,
+    phase: f32,
+}
+
+/// Everything besides `tick_time_sec` (flicker re-evaluates every call)
+/// and the sub-block camera position (distance re-measures every call)
+/// that can change [`LiveSession::placed_block_light_candidates`]'s
+/// output. `WorldState::section_mesh_revisions` alone cannot key the
+/// cache — they bump only when the mesh lane re-derives artifacts,
+/// which a bounded rebuild budget defers past the frame an edit landed
+/// on — so the world mutation counters ride along: they bump
+/// synchronously on every `apply_block_update*`, `apply_chunk` and
+/// column unload, and the per-section `Option<u64>` revisions keep a
+/// loaded-rev-0 section distinct from an unloaded (`None`) one.
+#[derive(Clone, Default, PartialEq)]
+struct PlacedLightScanKey {
+    /// Camera's integer block coordinate — the ±8 window anchor.
+    center_block: [i32; 3],
+    /// Address of the `Registry` inside `WorldState::registry` —
+    /// catches attach/detach of the whole `Option`.
+    registry_slot_ptr: usize,
+    /// Heap pointer into the registry's interned name storage —
+    /// catches in-place `Option<Registry>` replacement, which reuses
+    /// the same slot address.
+    registry_name_ptr: usize,
+    registry_state_count: usize,
+    /// `WorldState::state_count` palette bound (session/test reassigns
+    /// it next to `registry`).
+    world_state_count: usize,
+    block_updates: u64,
+    chunks_decoded: u64,
+    chunks_unloaded: u64,
+    /// `columns.len()` — catches direct `columns` inserts/removals and
+    /// `reset_dimension`'s wholesale clear.
+    loaded_columns: usize,
+    /// Per-section mesh revisions of the (always exactly eight)
+    /// sections the ±8 box overlaps, in fixed `sy/sz/sx` scan order.
+    section_revs: [((i32, i32, i32), Option<u64>); 8],
+}
+
+/// Per-frame reused result of the ±8 placed-light scan.
+#[derive(Default)]
+struct PlacedLightScanCache {
+    key: PlacedLightScanKey,
+    valid: bool,
+    entries: Vec<CachedPlacedLight>,
+    hits: u64,
+    misses: u64,
+}
+
+/// Per-state resolution memo for one scan pass: `facts`, the
+/// always-dark signal classification and the resolver output are all
+/// pure functions of `(state, registry)`, so a state repeated across
+/// thousands of cells resolves exactly once.
+#[derive(Clone, Copy)]
+struct PlacedStateEval {
+    emitter: ResolvedLightEmitter,
+    torch: bool,
+    wall_torch: bool,
+}
+
+/// How one overlapping section supplies block states to the scan.
+/// `Skip` covers cells `get_block_state` would answer `None` for
+/// (missing column or missing section payload); `Uniform`/`Dense`
+/// cover real palettes. Sections wholly outside the dimension's
+/// height range fold into `Uniform(0)` upstream, matching
+/// `get_block_state`'s out-of-range `Some(0)` air sentinel.
+#[derive(Clone, Copy)]
+enum PlacedSectionStates<'a> {
+    Skip,
+    Uniform(u32),
+    Dense(&'a megu_kernel::PalettedSection),
+}
+
+/// The (always exactly two) section coordinates and section-local cell
+/// ranges a ±[`PLACED_LIGHT_SCAN_RADIUS`] window covers along one
+/// axis: the span `c-8..=c+8` is exactly 17 cells, so the
+/// `div_euclid(16)` of its endpoints can only ever be adjacent
+/// sections — `(lo_s, lo.rem..=15)` then `(lo_s+1, 0..=hi.rem)`.
+fn placed_scan_axis(c: i32) -> [(i32, std::ops::RangeInclusive<i32>); 2] {
+    let lo = c.wrapping_sub(PLACED_LIGHT_SCAN_RADIUS);
+    let hi = c.wrapping_add(PLACED_LIGHT_SCAN_RADIUS);
+    [
+        (lo.div_euclid(16), lo.rem_euclid(16)..=15),
+        (
+            lo.div_euclid(16).wrapping_add(1),
+            0..=hi.rem_euclid(16),
+        ),
+    ]
+}
+
+/// Resolve one block state into its cacheable placed-light evaluation
+/// (base emitter before the per-cell wall-torch mount adjustment), or
+/// `None` when the state cannot emit — the exact gate sequence the
+/// uncached per-cell path applied.
+fn placed_state_eval(state: u32, registry: &megu_kernel::Registry) -> Option<PlacedStateEval> {
+    let facts = registry.facts(state).ok()?;
+    if facts.is_air != 0 {
+        return None;
+    }
+    let name = registry.state_name(state).unwrap_or_default();
+    let signal = is_always_dark_signal_block(name);
+    if facts.luminance == 0 && !signal {
+        return None;
+    }
+    // `properties` carries only what the per-state facts table can
+    // prove: waterlog status and — for the always-luminance-0 signal
+    // components — the `powered` cue the resolver needs (the registry
+    // keeps no per-state property strings, so an unpowered wire reads
+    // as its faint powered glow).
+    let mut props: [(&str, &str); 2] = [("", ""); 2];
+    let mut prop_len = 0usize;
+    if facts.is_waterlogged != 0 {
+        props[prop_len] = ("waterlogged", "true");
+        prop_len += 1;
+    }
+    if signal {
+        props[prop_len] = ("powered", "true");
+        prop_len += 1;
+    }
+    let input = BlockLightInput {
+        block_id: name,
+        properties: &props[..prop_len],
+        registry_luminance: facts.luminance,
+        texture_rgba: None,
+        submerged: facts.is_waterlogged != 0,
+    };
+    let emitter = resolve_block_light_emitter(&input)?;
+    if emitter.quenches_underwater {
+        return None;
+    }
+    Some(PlacedStateEval {
+        emitter,
+        torch: torch_flame_kind(name).is_some(),
+        wall_torch: name.contains("wall"),
+    })
+}
+
+/// Emit `(dist², light)` pairs for cached placed-light entries with the
+/// live `tick_time_sec` and sub-block camera — the per-frame work both
+/// the hit and miss paths share.
+fn push_cached_placed_lights(
+    entries: &[CachedPlacedLight],
+    camera: [f32; 3],
+    tick_time_sec: f32,
+    out: &mut Vec<(f32, megu_client_mesh::vfx_engine::DynamicColoredLight)>,
+) {
+    use megu_client_mesh::vfx_engine::DynamicColoredLight;
+    out.reserve(entries.len());
+    for entry in entries {
+        let intensity =
+            evaluate_modulated_intensity(&entry.emitter, tick_time_sec, entry.phase);
+        if !intensity.is_finite() || intensity <= 0.0 {
+            continue;
+        }
+        let delta = [
+            entry.pos[0] - camera[0],
+            entry.pos[1] - camera[1],
+            entry.pos[2] - camera[2],
+        ];
+        out.push((
+            delta[0] * delta[0] + delta[1] * delta[1] + delta[2] * delta[2],
+            DynamicColoredLight {
+                pos: entry.pos,
+                rgb: entry.emitter.rgb,
+                radius: entry.emitter.radius,
+                intensity,
+                ttl_ticks: 2,
+                priority: 1,
+            },
+        ));
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Grounded contact shadows beneath standing mobs
 // ---------------------------------------------------------------------------
 
@@ -2060,6 +2248,12 @@ pub struct LiveSession {
     /// and follows server `set_time` jumps).
     atlas_anim_clock: f64,
     last_atlas_anim_tick: Instant,
+    /// Section-revision + mutation-counter-keyed cache for the ±8
+    /// placed-block dynamic-light scan — `RefCell` so the
+    /// `&self`-only [`Self::collect_dynamic_lights`] signature stays
+    /// unchanged while steady-state frames skip the 4,913-cell sweep
+    /// entirely.
+    placed_light_scan: RefCell<PlacedLightScanCache>,
 }
 
 /// `client_information` view distance announced when a connect site has
@@ -2549,6 +2743,7 @@ impl LiveSession {
             last_animation_tick: Instant::now(),
             atlas_anim_clock: 0.0,
             last_atlas_anim_tick: Instant::now(),
+            placed_light_scan: RefCell::new(PlacedLightScanCache::default()),
         }
     }
 
@@ -2864,112 +3059,217 @@ impl LiveSession {
         vanilla_item_light_level(item_name)
     }
 
-    /// The 8-block Manhattan-free box scan of placed luminous blocks —
-    /// at most `(2*PLACED_LIGHT_SCAN_RADIUS+1)^3` = 4,913 cheap
-    /// `get_block_state` palette reads per frame, short-circuiting on
-    /// unloaded/air/non-luminous cells before any resolver work. Torch
-    /// families anchor at the exact [`torch_flame_world_offset`] flame
-    /// tip (wall torches infer their mount side from solid neighbors);
-    /// every other emitter anchors at the resolver's block-local
-    /// emission origin.
+    /// The 8-block Manhattan-free box scan of placed luminous blocks,
+    /// served from [`PlacedLightScanCache`]: while the camera stays in
+    /// the same block and no overlapping section/block mutation lands,
+    /// the frame's only work is re-modulating cached emitters — zero
+    /// `get_block_state` palette reads, zero registry lookups, zero
+    /// resolver calls. A miss re-scans section-by-section over the
+    /// (always exactly eight) overlapping sections: uniform/all-air
+    /// sections collapse to a single state evaluation and every
+    /// repeated state resolves once through a per-scan memo, so even
+    /// the miss path never re-runs `is_always_dark_signal_block` per
+    /// cell. Torch families anchor at the exact
+    /// [`torch_flame_world_offset`] flame tip (wall torches infer their
+    /// mount side from solid neighbors); every other emitter anchors at
+    /// the resolver's block-local emission origin.
     fn placed_block_light_candidates(
         &self,
         camera: [f32; 3],
         tick_time_sec: f32,
     ) -> Vec<(f32, megu_client_mesh::vfx_engine::DynamicColoredLight)> {
-        use megu_client_mesh::vfx_engine::DynamicColoredLight;
         let mut out = Vec::new();
-        let Some(registry) = self.world.registry.as_ref() else {
+        if self.world.registry.is_none() {
             return out;
-        };
-        let cx = camera[0].floor() as i32;
-        let cy = camera[1].floor() as i32;
-        let cz = camera[2].floor() as i32;
-        for dy in -PLACED_LIGHT_SCAN_RADIUS..=PLACED_LIGHT_SCAN_RADIUS {
-            for dz in -PLACED_LIGHT_SCAN_RADIUS..=PLACED_LIGHT_SCAN_RADIUS {
-                for dx in -PLACED_LIGHT_SCAN_RADIUS..=PLACED_LIGHT_SCAN_RADIUS {
-                    let (x, y, z) = (cx + dx, cy + dy, cz + dz);
-                    let Some(state) = self.world.get_block_state(x, y, z) else {
-                        continue;
-                    };
-                    let Ok(facts) = registry.facts(state) else {
-                        continue;
-                    };
-                    if facts.is_air != 0 {
-                        continue;
-                    }
-                    let name = registry.state_name(state).unwrap_or_default();
-                    let signal = is_always_dark_signal_block(name);
-                    if facts.luminance == 0 && !signal {
-                        continue;
-                    }
-                    // `properties` carries only what the per-state facts
-                    // table can prove: waterlog status and — for the
-                    // always-luminance-0 signal components — the
-                    // `powered` cue the resolver needs (the registry
-                    // keeps no per-state property strings, so an
-                    // unpowered wire reads as its faint powered glow).
-                    let mut props: [(&str, &str); 2] = [("", ""); 2];
-                    let mut prop_len = 0usize;
-                    if facts.is_waterlogged != 0 {
-                        props[prop_len] = ("waterlogged", "true");
-                        prop_len += 1;
-                    }
-                    if signal {
-                        props[prop_len] = ("powered", "true");
-                        prop_len += 1;
-                    }
-                    let input = BlockLightInput {
-                        block_id: name,
-                        properties: &props[..prop_len],
-                        registry_luminance: facts.luminance,
-                        texture_rgba: None,
-                        submerged: facts.is_waterlogged != 0,
-                    };
-                    let Some(mut emitter) = resolve_block_light_emitter(&input) else {
-                        continue;
-                    };
-                    if emitter.quenches_underwater {
-                        continue;
-                    }
-                    // Torch flames burn at the tip, not the block origin.
-                    if torch_flame_kind(name).is_some() {
-                        let wall_facing = if name.contains("wall") {
-                            self.torch_wall_facing(x, y, z, registry)
-                        } else {
-                            None
-                        };
-                        emitter.local_origin = torch_flame_world_offset(wall_facing);
-                    }
-                    let pos = [
-                        x as f32 + emitter.local_origin[0],
-                        y as f32 + emitter.local_origin[1],
-                        z as f32 + emitter.local_origin[2],
-                    ];
-                    // Position-keyed phase keeps neighbours out of sync.
-                    let phase = (x.wrapping_mul(31) ^ y.wrapping_mul(57) ^ z.wrapping_mul(13))
-                        as f32
-                        * 0.618_034;
-                    let intensity = evaluate_modulated_intensity(&emitter, tick_time_sec, phase);
-                    if !intensity.is_finite() || intensity <= 0.0 {
-                        continue;
-                    }
-                    let delta = [pos[0] - camera[0], pos[1] - camera[1], pos[2] - camera[2]];
-                    out.push((
-                        delta[0] * delta[0] + delta[1] * delta[1] + delta[2] * delta[2],
-                        DynamicColoredLight {
-                            pos,
-                            rgb: emitter.rgb,
-                            radius: emitter.radius,
-                            intensity,
-                            ttl_ticks: 2,
-                            priority: 1,
-                        },
-                    ));
+        }
+        let center = [
+            camera[0].floor() as i32,
+            camera[1].floor() as i32,
+            camera[2].floor() as i32,
+        ];
+        let key = self.placed_light_scan_key(center);
+        let mut cache = self.placed_light_scan.borrow_mut();
+        if cache.valid && cache.key == key {
+            cache.hits += 1;
+            push_cached_placed_lights(&cache.entries, camera, tick_time_sec, &mut out);
+            return out;
+        }
+        cache.misses += 1;
+        let entries = self.scan_placed_lights(center);
+        push_cached_placed_lights(&entries, camera, tick_time_sec, &mut out);
+        cache.key = key;
+        cache.entries = entries;
+        cache.valid = true;
+        out
+    }
+
+    /// `(hits, misses)` for the placed-block light scan cache — proves
+    /// the steady-state frame path serves from
+    /// [`PlacedLightScanCache`] without touching the world.
+    pub fn placed_light_cache_stats(&self) -> (u64, u64) {
+        let cache = self.placed_light_scan.borrow();
+        (cache.hits, cache.misses)
+    }
+
+    /// Build the [`PlacedLightScanKey`] for `center`: the registry
+    /// identity, the synchronous world mutation counters and the eight
+    /// overlapping sections' mesh revisions.
+    fn placed_light_scan_key(&self, center: [i32; 3]) -> PlacedLightScanKey {
+        let (slot_ptr, name_ptr, state_count) =
+            self.world.registry.as_ref().map_or((0, 0, 0), |registry| {
+                (
+                    registry as *const megu_kernel::Registry as usize,
+                    registry
+                        .state_name(0)
+                        .ok()
+                        .map_or(0usize, |name| name.as_ptr() as usize),
+                    registry.state_count(),
+                )
+            });
+        let mut section_revs = [((0, 0, 0), None); 8];
+        let mut slot = 0usize;
+        for (sy, _) in placed_scan_axis(center[1]) {
+            for (sz, _) in placed_scan_axis(center[2]) {
+                for (sx, _) in placed_scan_axis(center[0]) {
+                    section_revs[slot] = (
+                        (sx, sy, sz),
+                        self.world
+                            .section_mesh_revision(SectionCoord(sx, sy, sz)),
+                    );
+                    slot += 1;
                 }
             }
         }
-        out
+        PlacedLightScanKey {
+            center_block: center,
+            registry_slot_ptr: slot_ptr,
+            registry_name_ptr: name_ptr,
+            registry_state_count: state_count,
+            world_state_count: self.world.state_count,
+            block_updates: self.world.block_updates,
+            chunks_decoded: self.world.chunks_decoded,
+            chunks_unloaded: self.world.chunks_unloaded,
+            loaded_columns: self.world.columns.len(),
+            section_revs,
+        }
+    }
+
+    /// Re-scan the ±8 box around `center` into frozen
+    /// [`CachedPlacedLight`] entries. Iterates sections in `sy/sz/sx`
+    /// then cells `ly/lz/lx` order — the same global y-then-z-then-x
+    /// sequence the uncached triple loop produced, so candidate order
+    /// (and therefore the stable nearest-first sort's tie-breaking in
+    /// [`Self::collect_dynamic_lights`]) is bit-identical.
+    fn scan_placed_lights(&self, center: [i32; 3]) -> Vec<CachedPlacedLight> {
+        let mut entries = Vec::new();
+        let Some(registry) = self.world.registry.as_ref() else {
+            return entries;
+        };
+        let [cx, cy, cz] = center;
+        // `min_y`/`height` are server-controlled i32s; widen before
+        // adding so hostile values cannot overflow.
+        let min_y = i64::from(self.world.dimension.min_y);
+        let max_y = min_y + i64::from(self.world.dimension.height);
+        let min_sy = self.world.dimension.min_section_y();
+        let max_sy = min_sy + self.world.dimension.section_count() as i32;
+        let mut evals: HashMap<u32, Option<PlacedStateEval>> = HashMap::new();
+        for (sy, ys) in placed_scan_axis(cy) {
+            for (sz, zs) in placed_scan_axis(cz) {
+                for (sx, xs) in placed_scan_axis(cx) {
+                    let source = if sy < min_sy || sy >= max_sy {
+                        // Wholly outside the dimension's height window:
+                        // `get_block_state` answers `Some(0)` for every
+                        // cell before any column lookup.
+                        PlacedSectionStates::Uniform(0)
+                    } else {
+                        match self
+                            .world
+                            .columns
+                            .get(&(sx, sz))
+                            .and_then(|col| col.sections.get((sy - min_sy) as usize))
+                        {
+                            Some(sec) => match sec.palette.uniform_state() {
+                                Some(state) => PlacedSectionStates::Uniform(state),
+                                None => PlacedSectionStates::Dense(&sec.palette),
+                            },
+                            None => PlacedSectionStates::Skip,
+                        }
+                    };
+                    let mut dense = [0u32; SECTION_CELLS];
+                    match source {
+                        PlacedSectionStates::Skip => continue,
+                        PlacedSectionStates::Uniform(_) => {}
+                        PlacedSectionStates::Dense(palette) => {
+                            palette.unpack_into(&mut dense);
+                        }
+                    }
+                    for ly in ys.clone() {
+                        let y = sy.wrapping_mul(16).wrapping_add(ly);
+                        // Mirrors `get_block_state`'s y-window check:
+                        // inside it a missing section reads `None`
+                        // (skipped upstream), outside it reads the
+                        // `Some(0)` air sentinel.
+                        let in_dim =
+                            i64::from(y) >= min_y && i64::from(y) < max_y;
+                        for lz in zs.clone() {
+                            let z = sz.wrapping_mul(16).wrapping_add(lz);
+                            for lx in xs.clone() {
+                                let x = sx.wrapping_mul(16).wrapping_add(lx);
+                                let state = if in_dim {
+                                    match source {
+                                        PlacedSectionStates::Uniform(state) => state,
+                                        PlacedSectionStates::Dense(_) => dense
+                                            [section_index(
+                                                lx as usize,
+                                                ly as usize,
+                                                lz as usize,
+                                            )],
+                                        PlacedSectionStates::Skip => unreachable!(),
+                                    }
+                                } else {
+                                    0
+                                };
+                                let eval = evals
+                                    .entry(state)
+                                    .or_insert_with(|| placed_state_eval(state, registry));
+                                let Some(eval) = eval else {
+                                    continue;
+                                };
+                                let eval = *eval;
+                                let mut emitter = eval.emitter;
+                                // Torch flames burn at the tip, not the
+                                // block origin — the wall mount is a
+                                // per-cell neighbor query, so only the
+                                // base emitter is memoized.
+                                if eval.torch {
+                                    let wall_facing = if eval.wall_torch {
+                                        self.torch_wall_facing(x, y, z, registry)
+                                    } else {
+                                        None
+                                    };
+                                    emitter.local_origin =
+                                        torch_flame_world_offset(wall_facing);
+                                }
+                                let pos = [
+                                    x as f32 + emitter.local_origin[0],
+                                    y as f32 + emitter.local_origin[1],
+                                    z as f32 + emitter.local_origin[2],
+                                ];
+                                // Position-keyed phase keeps neighbours
+                                // out of sync.
+                                let phase = (x.wrapping_mul(31)
+                                    ^ y.wrapping_mul(57)
+                                    ^ z.wrapping_mul(13))
+                                    as f32
+                                    * 0.618_034;
+                                entries.push(CachedPlacedLight { pos, emitter, phase });
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        entries
     }
 
     /// Wall-mount inference for `*_wall_torch` cells: the first solid
@@ -7080,6 +7380,10 @@ impl LiveSession {
         self.clear_external_sections();
         self.offthread_candidates.clear();
         self.section_mesh_lane.clear();
+        // The dimension's whole block store swapped out under the same
+        // section coordinates — the placed-light scan cache cannot
+        // survive even if every key field happens to compare equal.
+        self.placed_light_scan.get_mut().valid = false;
         self.pose = None;
         self.last_motion_delta = [0.0; 2];
         self.chunk_fades = ChunkFadeTracker::new();
@@ -11512,6 +11816,198 @@ mod tests {
         // Torch flame is warm, lamp is warm-white, count is bounded.
         let torch = lights.iter().find(|l| l.pos == [0.5, 64.625, 0.5]).unwrap();
         assert_eq!(torch.rgb, [1.0, 0.62, 0.22]);
+    }
+
+    /// A torch-floored scan box: air column at `(0, 0)`, torch at
+    /// `[0, 64, 0]`, lit lamp at `[2, 64, 0]`.
+    fn seed_placed_light_fixture(live: &mut LiveSession) {
+        live.vanilla_plus_cfg.nature.enabled = true;
+        let registry = luminous_test_registry();
+        live.world.state_count = registry.state_count();
+        live.world.registry = Some(registry);
+        let state_count = live.world.state_count;
+        seed_air_column(live, state_count);
+        live.world.apply_block_update([0, 64, 0], 2).unwrap();
+        live.world.apply_block_update([2, 64, 0], 4).unwrap();
+    }
+
+    #[test]
+    fn placed_light_cache_hits_on_steady_camera_and_preserves_flicker() {
+        let (mut live, _tx) = session();
+        seed_placed_light_fixture(&mut live);
+
+        // First frame scans (miss); the next frames at the same
+        // integer block — different sub-block camera coords — must
+        // all hit with zero rescans.
+        live.world.time_of_day = 0;
+        let first = live.collect_dynamic_lights([0.4, 65.4, 0.4]);
+        assert_eq!(live.placed_light_cache_stats(), (0, 1));
+        let second = live.collect_dynamic_lights([0.9, 65.9, 0.9]);
+        let third = live.collect_dynamic_lights([0.0, 65.0, 0.0]);
+        assert_eq!(live.placed_light_cache_stats(), (2, 1));
+        // Positions/colors freeze at scan time and re-emit identically.
+        for lights in [&second, &third] {
+            assert_eq!(
+                lights
+                    .iter()
+                    .map(|l| (l.pos, l.rgb, l.radius))
+                    .collect::<Vec<_>>(),
+                first
+                    .iter()
+                    .map(|l| (l.pos, l.rgb, l.radius))
+                    .collect::<Vec<_>>()
+            );
+        }
+        assert!(first.iter().any(|l| l.pos == [0.5, 64.625, 0.5]));
+
+        // A forced rescan must reproduce the cached output bit-for-bit
+        // (same tick_time_sec, same camera).
+        live.placed_light_scan.get_mut().valid = false;
+        let rescanned = live.collect_dynamic_lights([0.4, 65.4, 0.4]);
+        assert_eq!(
+            first
+                .iter()
+                .map(|l| (l.pos, l.rgb, l.radius, l.intensity))
+                .collect::<Vec<_>>(),
+            rescanned
+                .iter()
+                .map(|l| (l.pos, l.rgb, l.radius, l.intensity))
+                .collect::<Vec<_>>()
+        );
+        assert_eq!(live.placed_light_cache_stats().1, 2);
+
+        // Advancing `tick_time_sec` stays on the hit path but flicker
+        // still animates — the open-flame modulation re-evaluates per
+        // frame instead of freezing at scan time.
+        let torch = |lights: &[megu_client_mesh::vfx_engine::DynamicColoredLight]| {
+            lights
+                .iter()
+                .find(|l| l.pos == [0.5, 64.625, 0.5])
+                .map(|l| l.intensity)
+                .expect("torch light present")
+        };
+        let mut distinct = std::collections::BTreeSet::new();
+        for &tick in &[0_i64, 37, 91, 153, 611] {
+            live.world.time_of_day = tick;
+            let lights = live.collect_dynamic_lights([0.4, 65.4, 0.4]);
+            distinct.insert(torch(&lights).to_bits());
+        }
+        assert!(
+            distinct.len() > 1,
+            "cached flicker must keep animating with tick time"
+        );
+        assert_eq!(live.placed_light_cache_stats().1, 2);
+    }
+
+    #[test]
+    fn placed_light_cache_invalidates_on_block_place_break_and_chunk_unload() {
+        let (mut live, _tx) = session();
+        live.vanilla_plus_cfg.nature.enabled = true;
+        let registry = luminous_test_registry();
+        live.world.state_count = registry.state_count();
+        live.world.registry = Some(registry);
+        let state_count = live.world.state_count;
+        seed_air_column(&mut live, state_count);
+
+        // Baseline: all-air box scans once, then hits.
+        let baseline = live.collect_dynamic_lights([0.0, 65.0, 0.0]);
+        assert!(baseline.is_empty());
+        let _ = live.collect_dynamic_lights([0.0, 65.0, 0.0]);
+        assert_eq!(live.placed_light_cache_stats(), (1, 1));
+
+        // Placing a torch under a still camera must invalidate on the
+        // very next frame — the world mutation counters move
+        // synchronously with `apply_block_update`.
+        live.world.apply_block_update([0, 64, 0], 2).unwrap();
+        let lit = live.collect_dynamic_lights([0.0, 65.0, 0.0]);
+        assert!(
+            lit.iter().any(|l| l.pos == [0.5, 64.625, 0.5]),
+            "placed torch must emit the same frame: {lit:?}"
+        );
+        assert_eq!(live.placed_light_cache_stats(), (1, 2));
+        let _ = live.collect_dynamic_lights([0.0, 65.0, 0.0]);
+        assert_eq!(live.placed_light_cache_stats(), (2, 2));
+
+        // Breaking it invalidates just as fast.
+        live.world.apply_block_update([0, 64, 0], 0).unwrap();
+        let dark = live.collect_dynamic_lights([0.0, 65.0, 0.0]);
+        assert!(dark.is_empty(), "broken torch must go dark: {dark:?}");
+        assert_eq!(live.placed_light_cache_stats(), (2, 3));
+
+        // Relight, then unload the whole column: every overlapping
+        // section disappears, so the cache drops and the box goes dark.
+        live.world.apply_block_update([0, 64, 0], 2).unwrap();
+        let _ = live.collect_dynamic_lights([0.0, 65.0, 0.0]);
+        let _ = live.collect_dynamic_lights([0.0, 65.0, 0.0]);
+        assert_eq!(live.placed_light_cache_stats(), (3, 4));
+        live.world.unload_chunk(0, 0);
+        let unloaded = live.collect_dynamic_lights([0.0, 65.0, 0.0]);
+        assert!(
+            unloaded.is_empty(),
+            "unloaded chunk emits no lights: {unloaded:?}"
+        );
+        assert_eq!(live.placed_light_cache_stats(), (3, 5));
+    }
+
+    #[test]
+    fn placed_light_cache_invalidates_on_camera_block_crossing() {
+        let (mut live, _tx) = session();
+        seed_placed_light_fixture(&mut live);
+
+        let _ = live.collect_dynamic_lights([0.9, 65.0, 0.9]);
+        assert_eq!(live.placed_light_cache_stats(), (0, 1));
+        // Sub-block drift inside block 0 stays cached.
+        let _ = live.collect_dynamic_lights([0.99, 65.9, 0.99]);
+        assert_eq!(live.placed_light_cache_stats(), (1, 1));
+        // Crossing into block 1 re-anchors the ±8 window: one miss,
+        // then hits again on the new center.
+        let _ = live.collect_dynamic_lights([1.1, 65.0, 0.9]);
+        assert_eq!(live.placed_light_cache_stats(), (1, 2));
+        let _ = live.collect_dynamic_lights([1.9, 65.0, 0.9]);
+        assert_eq!(live.placed_light_cache_stats(), (2, 2));
+        // Moving one block in y/z re-anchors as well.
+        let _ = live.collect_dynamic_lights([1.9, 66.1, 0.9]);
+        let _ = live.collect_dynamic_lights([1.9, 66.1, -0.1]);
+        assert_eq!(live.placed_light_cache_stats(), (2, 4));
+    }
+
+    #[test]
+    fn placed_light_overlapping_sections_always_bounded_by_eight() {
+        use std::collections::BTreeSet;
+        // For every `rem_euclid(16)` residue the ±8 axis window spans
+        // exactly two sections whose local ranges union to the full
+        // 17-cell window — so the 3-D box always overlaps exactly 8.
+        for base in [-32, -16, 0, 16, 160] {
+            for rem in 0..16 {
+                let c = base + rem;
+                let axis = placed_scan_axis(c);
+                assert_eq!(axis.len(), 2);
+                assert_eq!(axis[0].0 + 1, axis[1].0);
+                let mut cells = BTreeSet::new();
+                for (s, range) in &axis {
+                    for l in range.clone() {
+                        cells.insert(s * 16 + l);
+                    }
+                }
+                let expect: BTreeSet<i32> = (c - PLACED_LIGHT_SCAN_RADIUS
+                    ..=c + PLACED_LIGHT_SCAN_RADIUS)
+                    .collect();
+                assert_eq!(cells, expect, "axis coverage for c={c}");
+            }
+        }
+        // The 3-D sweep touches exactly eight distinct section coords
+        // for a spread of centers (including negative coords).
+        for center in [0, 7, 8, 15, -1, -9, 64, -64, 1000] {
+            let mut coords = BTreeSet::new();
+            for (sy, _) in placed_scan_axis(center) {
+                for (sz, _) in placed_scan_axis(center) {
+                    for (sx, _) in placed_scan_axis(center) {
+                        coords.insert((sx, sy, sz));
+                    }
+                }
+            }
+            assert_eq!(coords.len(), 8, "center={center}");
+        }
     }
 
     #[test]
