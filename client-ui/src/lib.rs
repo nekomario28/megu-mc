@@ -29,6 +29,12 @@
 //!   `GuiGraphics -> DrawCmd` draw ops, the read-only HUD snapshot mods
 //!   see, fair-play-capped container slot actions, the fail-closed
 //!   `GGB1` wire codec, and the lowering pass into the native draw list.
+//! * [`gamepad`] — the Controllable-class native gamepad engine: brand
+//!   profiles and bilingual prompt glyphs for Xbox / PlayStation /
+//!   Switch / Steam Deck, radial-deadzone stick processing, console
+//!   gameplay bindings, magnetic virtual-cursor UI navigation with
+//!   D-pad focus jumps, an 8-slice radial wheel, and a bounded rumble
+//!   queue.
 //!
 //! Typical frame loop for an embedder:
 //!
@@ -47,6 +53,7 @@ pub mod create_goggles_hud;
 pub mod death_screen;
 pub mod draw;
 pub mod font_cjk;
+pub mod gamepad;
 pub mod gui_bridge;
 pub mod hud_widgets;
 pub mod layout;
