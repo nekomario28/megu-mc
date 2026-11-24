@@ -11,6 +11,10 @@ use megu_core::perf_kit::{
     BoundedScratchVec, CoalescedDeltaBatch, DirtyFingerprintGate, FingerprintBuilder,
     FingerprintStats,
 };
+use mod_adapter_core::capability_bus::{
+    BlockCapabilityBus, BlockCoord, CapabilityFluidStack, CapabilityItemStack, FaceDirection,
+    FluidTransferHandler, ItemTransferHandler, SimpleFluidTank, SimpleSlotInventory,
+};
 use mod_offload::fluid_network::FluidError;
 use mod_offload::kinetic_graph::{GraphError, KineticNode, NetworkStatus, Solution};
 use mod_offload::recipe_processor::{Drive, Recipe, RecipeError, Stack};
@@ -912,6 +916,181 @@ fn canonical_pair(a: DimBlockPos, b: DimBlockPos) -> (DimBlockPos, DimBlockPos) 
         (a, b)
     } else {
         (b, a)
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Cross-mod capability endpoints (XMOD1-CORE)
+// ---------------------------------------------------------------------------
+
+/// Per-cell Create fluid storage a `create:fluid_tank` — and the
+/// pipe/pump cells buffering alongside it — exposes on the shared
+/// capability bus. Create's tank holds 8 000 mB per block.
+pub const CREATE_FLUID_TANK_CAPACITY_MB: u64 = 8_000;
+
+/// Item slots a `create:basin` exposes on the capability bus.
+pub const CREATE_BASIN_SLOTS: usize = 9;
+/// Staging-buffer slots a `create:chute` exposes.
+pub const CREATE_CHUTE_SLOTS: usize = 4;
+/// Working slots a mechanical processor (press, mixer, millstone, spout)
+/// shares with the block it works on.
+pub const CREATE_PROCESSOR_SLOTS: usize = 4;
+/// Max stack size every Create item endpoint honors (the vanilla 64).
+pub const CREATE_MAX_STACK: u32 = 64;
+
+/// [`ItemTransferHandler`] a placed Create block exposes on the shared
+/// cross-mod [`BlockCapabilityBus`]: belts carry their transit slot,
+/// chutes and funnels their staging buffers, depots and basins their
+/// storage, processors their working inventory. `raw_components` ride
+/// each slot untouched, so 1.21.1 Data Components survive every hop into
+/// or out of foreign mod storage.
+pub struct CreateItemEndpoint {
+    inner: SimpleSlotInventory,
+}
+
+impl CreateItemEndpoint {
+    fn new(slots: usize) -> Self {
+        Self {
+            inner: SimpleSlotInventory::new(slots, CREATE_MAX_STACK),
+        }
+    }
+
+    /// Slot storage for a `create:*` block id, or `None` for blocks that
+    /// expose no item capability (shafts, casings, cogwheels).
+    pub fn for_block_id(block_id: &str) -> Option<Self> {
+        let slots = match block_id {
+            "create:belt" | "create:depot" => 1,
+            "create:chute" => CREATE_CHUTE_SLOTS,
+            "create:andesite_funnel" | "create:brass_funnel"
+            | "create:andesite_belt_funnel" | "create:brass_belt_funnel" => 1,
+            "create:basin" => CREATE_BASIN_SLOTS,
+            "create:mechanical_press" | "create:mechanical_mixer"
+            | "create:millstone" | "create:spout" => CREATE_PROCESSOR_SLOTS,
+            _ => return None,
+        };
+        Some(Self::new(slots))
+    }
+}
+
+impl ItemTransferHandler for CreateItemEndpoint {
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
+    }
+
+    fn as_any_mut(&mut self) -> &mut dyn std::any::Any {
+        self
+    }
+
+    fn insert_item(
+        &mut self,
+        face: Option<FaceDirection>,
+        stack: &CapabilityItemStack,
+        simulate: bool,
+    ) -> CapabilityItemStack {
+        self.inner.insert_item(face, stack, simulate)
+    }
+
+    fn extract_item(
+        &mut self,
+        face: Option<FaceDirection>,
+        max_count: u32,
+        filter: Option<&dyn Fn(&CapabilityItemStack) -> bool>,
+        simulate: bool,
+    ) -> Option<CapabilityItemStack> {
+        self.inner.extract_item(face, max_count, filter, simulate)
+    }
+
+    fn slots(&self) -> usize {
+        self.inner.slots()
+    }
+}
+
+/// [`FluidTransferHandler`] for Create fluid cells: `create:fluid_tank`
+/// blocks and the `create:fluid_pipe`/`create:mechanical_pump` cells
+/// buffering flow between them, one 8-bucket tank per cell.
+pub struct CreateFluidEndpoint {
+    inner: SimpleFluidTank,
+}
+
+impl CreateFluidEndpoint {
+    /// Tank storage for a `create:*` block id, or `None` when the block
+    /// carries no fluid capability.
+    pub fn for_block_id(block_id: &str) -> Option<Self> {
+        matches!(
+            block_id,
+            "create:fluid_tank" | "create:fluid_pipe" | "create:mechanical_pump"
+        )
+        .then(|| Self {
+            inner: SimpleFluidTank::new(CREATE_FLUID_TANK_CAPACITY_MB),
+        })
+    }
+}
+
+impl FluidTransferHandler for CreateFluidEndpoint {
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
+    }
+
+    fn as_any_mut(&mut self) -> &mut dyn std::any::Any {
+        self
+    }
+
+    fn fill_fluid(
+        &mut self,
+        face: Option<FaceDirection>,
+        stack: &CapabilityFluidStack,
+        simulate: bool,
+    ) -> u64 {
+        self.inner.fill_fluid(face, stack, simulate)
+    }
+
+    fn drain_fluid(
+        &mut self,
+        face: Option<FaceDirection>,
+        max_mb: u64,
+        filter_fluid: Option<&str>,
+        simulate: bool,
+    ) -> Option<CapabilityFluidStack> {
+        self.inner.drain_fluid(face, max_mb, filter_fluid, simulate)
+    }
+}
+
+/// The capability surface one Create block id exposes on the shared
+/// cross-mod bus — at most one handler per kind, mirroring what a real
+/// Create block entity registers under NeoForge `BlockCapabilities`.
+#[derive(Default)]
+pub struct CreateCapabilityEndpoints {
+    pub item: Option<Box<dyn ItemTransferHandler + Send>>,
+    pub fluid: Option<Box<dyn FluidTransferHandler + Send>>,
+}
+
+impl CreateCapabilityEndpoints {
+    /// `true` when the block exposes no capability at all.
+    pub fn is_empty(&self) -> bool {
+        self.item.is_none() && self.fluid.is_none()
+    }
+
+    /// Register every non-empty handler onto `bus` at `coord`.
+    pub fn register_into(self, bus: &mut BlockCapabilityBus, coord: &BlockCoord) {
+        if let Some(handler) = self.item {
+            bus.register_item_handler(coord.clone(), handler);
+        }
+        if let Some(handler) = self.fluid {
+            bus.register_fluid_handler(coord.clone(), handler);
+        }
+    }
+}
+
+/// Map a `create:*` block id onto its live capability surface. Ducts and
+/// storage blocks expose item storage, fluid blocks a tank, kinetic-only
+/// blocks nothing — one shared lookup so the live bridge and any future
+/// declarative caller agree on a block's face contract.
+pub fn create_capability_endpoints_for(block_id: &str) -> CreateCapabilityEndpoints {
+    CreateCapabilityEndpoints {
+        item: CreateItemEndpoint::for_block_id(block_id)
+            .map(|ep| Box::new(ep) as Box<dyn ItemTransferHandler + Send>),
+        fluid: CreateFluidEndpoint::for_block_id(block_id)
+            .map(|ep| Box::new(ep) as Box<dyn FluidTransferHandler + Send>),
     }
 }
 

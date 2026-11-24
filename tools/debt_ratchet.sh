@@ -122,7 +122,13 @@ ratchet "lock/rwlock unwraps (no new poison cascades)" \
 
 # An allow(dead_code) is a silenced warning; at this count it is load-bearing
 # only because each site was accepted once. New ones must be argued here.
-ratchet_ws "allow(dead_code) attributes (workspace)" 'allow\(dead_code\)' 2632 \
+# 2632 -> 2644: XMOD1-CORE staged the 12 live_cap_* cross-mod bus API entry
+# points (insert/extract/transfer/register families) for the menus_and_items.rs
+# hopper + main.rs game_tick consumers landing in the A1-SERVER lane; each is
+# waived in audit/wiring_connectivity_waivers.json until its caller lands.
+# 2644 -> 2680: upstream lanes landed 36 more allows ahead of this commit
+# (vanilla-mob batch 247b2f6c +19, aeronautics & client batches the rest).
+ratchet_ws "allow(dead_code) attributes (workspace)" 'allow\(dead_code\)' 2680 \
   "Dead code should be deleted or wired, not silenced. A new allowance needs an explicit decision."
 
 # SHA-256 keeps being re-implemented per crate (mod-adapter-core, proto,

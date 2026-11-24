@@ -248,6 +248,12 @@ use mod_adapter_core::bytecode_subset_vm::{
     VerifiedMethod, VmError, VmValue, DEFAULT_FUEL,
 };
 #[cfg(feature = "mod-suite")]
+use mod_adapter_core::capability_bus::{
+    BlockCapabilityBus, BlockCoord, CapabilityFluidStack, CapabilityItemStack,
+    CookingPotItemAdapter, FaceDirection, ItemTransferHandler, SimpleEnergyBuffer,
+    SimpleFluidTank, SimpleSlotInventory,
+};
+#[cfg(feature = "mod-suite")]
 use mod_adapter_core::culinary_adapter::{
     CookResult, CookingPotState, CulinaryDiscoveryStats, CulinaryRegistry, CuttingOutcome,
 };
@@ -275,6 +281,8 @@ use mod_adapter_core::season_primitives::{
 };
 #[cfg(feature = "mod-suite")]
 use mod_adapter_core::unified_bundle::{DeclarativeModBundle, UnifiedModRuntime};
+#[cfg(feature = "mod-suite")]
+use mod_adapter_core::unified_tags::{TagDomain, UnifiedTagIndex};
 #[cfg(feature = "mod-suite")]
 use mod_adapter_core::vanilla_qol_and_holidays::{
     chest_holiday_variant, evaluate_right_click_harvest, roll_halloween_headgear, CalendarDate,
@@ -428,8 +436,19 @@ struct LiveModSuite {
     culinary: CulinaryRegistry,
     /// Aggregated discovery counters over `culinary` (for the boot report).
     culinary_stats: CulinaryDiscoveryStats,
-    /// Live pots are keyed by dimension and block position.
-    cooking_pots: HashMap<(DimId, i32, i32, i32), CookingPotState>,
+    /// Live pots are keyed by dimension and block position. Each pot lives
+    /// inside the same `CookingPotItemAdapter` the shared capability bus
+    /// points at (see `LiveCookingPotEndpoint`), so items a Create duct or
+    /// a foreign mod pushes through the bus land in the canonical state
+    /// the deadline scheduler advances — never a shadow copy.
+    cooking_pots: HashMap<(DimId, i32, i32, i32), Arc<Mutex<CookingPotItemAdapter>>>,
+    /// One merged `#c:`/`#forge:`/`#neoforge:` tag index over every
+    /// scanned mod JAR (Jar-in-Jar members folded in), seeded with the
+    /// Vanilla 1.21.1 `c:` baseline. `live_unified_tag_matches` answers
+    /// cross-mod membership probes off it, and `scan_mods_dir` folds its
+    /// flattened contents back into `culinary.tags` so nested-tag recipes
+    /// match uniformly on either spelling.
+    unified_tags: UnifiedTagIndex,
     /// Only active completion deadlines enter the scheduler. Idle pots have
     /// no entries and therefore cost no work during ticks.
     cooking_deadlines: std::collections::BTreeSet<(u64, DimId, i32, i32, i32)>,
@@ -500,6 +519,7 @@ impl LiveModSuite {
             culinary: CulinaryRegistry::new(),
             culinary_stats: CulinaryDiscoveryStats::default(),
             cooking_pots: HashMap::new(),
+            unified_tags: UnifiedTagIndex::vanilla_1_21_1_baseline(),
             cooking_deadlines: std::collections::BTreeSet::new(),
             accessories: HashMap::new(),
             barriers: ProgressionBarrierEngine::new(Vec::new()),
@@ -672,6 +692,16 @@ impl LiveModSuite {
                                 );
                             }
                         }
+                        // XMOD1: every bounded JAR feeds the shared tag index
+                        // (Tier 3 diagnostics keep their `data/` tag content
+                        // too), including bounded Jar-in-Jar recursion.
+                        if let Err(error) =
+                            self.unified_tags.ingest_jar_bytes(&bytes, file_name)
+                        {
+                            eprintln!(
+                                "[live-mods] {file_name}: unified tag scan skipped: {error}"
+                            );
+                        }
                         bounded_jars.push((file_name.clone(), bytes));
                     }
                 }
@@ -723,6 +753,16 @@ impl LiveModSuite {
             );
         }
         self.dual_loader = plan;
+        // XMOD1: fold the merged cross-mod index back into the culinary
+        // registry's flat `TagIndex` — nested `#` chains arrive
+        // pre-expanded and `c:` ids are also exported under their
+        // `forge:`/`neoforge:` spellings, so `tag_contains`-driven
+        // recipe/heat matching hits on either convention.
+        for domain in [TagDomain::Item, TagDomain::Block] {
+            for (tag_id, members) in self.unified_tags.export_flat(domain) {
+                self.culinary.tags.entry(tag_id).or_default().extend(members);
+            }
+        }
         // The scan may have changed every MRS1 input — `registry_plan`,
         // dual-loader content, adapted JAR tables — so the join-frame cache
         // must rebuild before the next client sees it.
@@ -815,6 +855,12 @@ impl LiveModSuite {
         if let Some(bundle) = &result.bundle {
             self.install_bundle(bundle, file_name);
         }
+        // XMOD1: fold this JAR's extracted `data/<ns>/tags/**` table into the
+        // shared index — equivalent to merging `result.data_bundle
+        // .unified_tag_index()`; `data_bundle.tags` already carries
+        // Jar-in-Jar inner-JAR tag files folded in by the extractor.
+        self.unified_tags
+            .merge_auto_adapter_tags(&result.data_bundle.tags);
         if let Some(stats) = &result.culinary {
             let agg = &mut self.culinary_stats;
             agg.jar_members += stats.jar_members;
@@ -940,21 +986,65 @@ impl LiveModSuite {
     fn set_cooking_pot(
         &mut self,
         key: (DimId, i32, i32, i32),
-        mut pot: CookingPotState,
+        pot: CookingPotState,
         tick: u64,
     ) {
         if let Some(previous) = self.cooking_pots.get(&key) {
-            if let Some(deadline) = previous.next_completion_tick {
+            if let Some(deadline) = previous
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .pot()
+                .next_completion_tick
+            {
                 self.cooking_deadlines
                     .remove(&(deadline, key.0, key.1, key.2, key.3));
             }
         }
-        pot.refresh(&self.culinary, tick);
-        if let Some(deadline) = pot.next_completion_tick {
+        let adapter = self
+            .cooking_pots
+            .entry(key)
+            .or_insert_with(|| Arc::new(Mutex::new(CookingPotItemAdapter::new())))
+            .clone();
+        {
+            let mut guard = adapter.lock().unwrap_or_else(|e| e.into_inner());
+            *guard.pot_mut() = pot;
+            guard.pot_mut().refresh(&self.culinary, tick);
+            if let Some(deadline) = guard.pot().next_completion_tick {
+                self.cooking_deadlines
+                    .insert((deadline, key.0, key.1, key.2, key.3));
+            }
+        }
+        // XMOD1: the canonical adapter doubles as this cell's live bus
+        // endpoint — items a Create duct or foreign mod pushes through
+        // `live_cap_insert_item`/`live_cap_bus_step` land in the same pot
+        // the scheduler just armed.
+        live_cap_bus()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .register_item_handler(
+                live_cap_coord(key.0, key.1, key.2, key.3),
+                Box::new(LiveCookingPotEndpoint { inner: adapter }),
+            );
+    }
+
+    /// Re-arm `key`'s completion deadline after its slots changed outside
+    /// [`Self::set_cooking_pot`] — the bus-faced path
+    /// (`live_cap_notify_pot_fed`) funnels here so an ingredient a duct
+    /// pushed in wakes a sleeping pot exactly like a manual insert.
+    fn refresh_cooking_pot(&mut self, key: (DimId, i32, i32, i32), tick: u64) {
+        let Some(adapter) = self.cooking_pots.get(&key).cloned() else {
+            return;
+        };
+        let mut guard = adapter.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(old) = guard.pot().next_completion_tick {
+            self.cooking_deadlines
+                .remove(&(old, key.0, key.1, key.2, key.3));
+        }
+        guard.pot_mut().refresh(&self.culinary, tick);
+        if let Some(deadline) = guard.pot().next_completion_tick {
             self.cooking_deadlines
                 .insert((deadline, key.0, key.1, key.2, key.3));
         }
-        self.cooking_pots.insert(key, pot);
     }
 
     fn tick_cooking_pots(&mut self, tick: u64) -> Vec<((DimId, i32, i32, i32), CookResult)> {
@@ -966,16 +1056,17 @@ impl LiveModSuite {
             }
             self.cooking_deadlines.pop_first();
             let key = (dim, x, y, z);
-            let Some(pot) = self.cooking_pots.get_mut(&key) else {
+            let Some(adapter) = self.cooking_pots.get(&key).cloned() else {
                 continue;
             };
-            if pot.next_completion_tick != Some(deadline) {
+            let mut guard = adapter.lock().unwrap_or_else(|e| e.into_inner());
+            if guard.pot().next_completion_tick != Some(deadline) {
                 continue;
             }
-            if let Some(result) = pot.advance_to(tick, &self.culinary) {
+            if let Some(result) = guard.advance_to(tick, &self.culinary) {
                 completed.push((key, result));
             }
-            if let Some(next) = pot.next_completion_tick {
+            if let Some(next) = guard.pot().next_completion_tick {
                 self.cooking_deadlines.insert((next, dim, x, y, z));
             }
         }
@@ -1474,10 +1565,21 @@ fn live_mod_set_cooking_pot(dim: DimId, x: i32, y: i32, z: i32, pot: CookingPotS
 #[allow(dead_code)]
 fn live_mod_remove_cooking_pot(dim: DimId, x: i32, y: i32, z: i32) {
     let mut suite = live_mod_suite().lock().unwrap_or_else(|e| e.into_inner());
-    if let Some(pot) = suite.cooking_pots.remove(&(dim, x, y, z)) {
-        if let Some(deadline) = pot.next_completion_tick {
+    if let Some(adapter) = suite.cooking_pots.remove(&(dim, x, y, z)) {
+        if let Some(deadline) = adapter
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .pot()
+            .next_completion_tick
+        {
             suite.cooking_deadlines.remove(&(deadline, dim, x, y, z));
         }
+        // The pot's shared-bus endpoint dies with it — a Create duct can
+        // never feed a phantom inventory.
+        live_cap_bus()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .unregister_item_handler(&live_cap_coord(dim, x, y, z));
     }
 }
 
@@ -1503,6 +1605,619 @@ fn live_mod_cutting_board_use(item: &str, tool: &str, seed: u64) -> Option<Cutti
         .active
         .then(|| suite.culinary.execute_cutting(item, tool, seed))
         .flatten()
+}
+
+// ---------------------------------------------------------------------------
+// XMOD1: one shared cross-mod capability bus + one shared tag index.
+// ---------------------------------------------------------------------------
+
+/// One shared `#c:*`/`#forge:*`/`#neoforge:*` membership probe over the
+/// merged index every scanned mod JAR (and Jar-in-Jar member) fed during
+/// `scan_mods_dir`, seeded with the Vanilla 1.21.1 `c:` baseline. Nested
+/// references expand at query time under the index's bounded-depth,
+/// fail-closed rules; `tag` accepts the bare path or an already-prefixed
+/// `#tag`/`ns:path` spelling the index canonicalizes.
+#[cfg(feature = "mod-suite")]
+fn live_unified_tag_matches(domain: TagDomain, tag: &str, id: &str) -> bool {
+    live_mod_suite()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .unified_tags
+        .matches(domain, tag, id)
+}
+
+/// The process-wide cross-mod capability bus: Create ducts and tanks,
+/// culinary cooking pots, generic storage endpoints, and every
+/// `ModOffloadProfile`-declared mod block register their
+/// item/fluid/energy handlers here so transfers between mods need zero
+/// per-mod glue. Poison-tolerant like every live bridge singleton.
+#[cfg(feature = "mod-suite")]
+fn live_cap_bus() -> &'static Mutex<BlockCapabilityBus> {
+    static BUS: OnceLock<Mutex<BlockCapabilityBus>> = OnceLock::new();
+    BUS.get_or_init(|| Mutex::new(BlockCapabilityBus::new()))
+}
+
+/// Endpoint-registration bookkeeping kept beside the bus: which cells
+/// currently expose a Create or declarative-profile handler, so block
+/// removal unregisters the right thing and plain state-id churn
+/// (facing/powered flips) never silently drops stored cargo.
+#[cfg(feature = "mod-suite")]
+#[derive(Default)]
+struct LiveCapState {
+    /// `FactoryPos -> block_id` for every Create cell with a live bus
+    /// endpoint.
+    create_cells: BTreeMap<FactoryPos, String>,
+    /// `BlockCoord`s registered from
+    /// `ModOffloadProfile::capability_endpoints_for`.
+    profile_cells: BTreeSet<BlockCoord>,
+}
+
+#[cfg(feature = "mod-suite")]
+fn live_cap_state() -> &'static Mutex<LiveCapState> {
+    static STATE: OnceLock<Mutex<LiveCapState>> = OnceLock::new();
+    STATE.get_or_init(|| Mutex::new(LiveCapState::default()))
+}
+
+/// Canonical `BlockCoord` for a world cell: vanilla dims keep their
+/// `"minecraft:*"` ids, registered custom dims their datapack key, and
+/// unregistered raw slots still get a stable unique id.
+#[cfg(feature = "mod-suite")]
+fn live_cap_coord(dim: DimId, x: i32, y: i32, z: i32) -> BlockCoord {
+    let id = dim.dimension_id();
+    BlockCoord::new(
+        if id.is_empty() {
+            format!("megu:dim_{}", dim.raw())
+        } else {
+            id.to_string()
+        },
+        x,
+        y,
+        z,
+    )
+}
+
+#[cfg(feature = "mod-suite")]
+fn live_cap_coord_of(pos: FactoryPos) -> BlockCoord {
+    live_cap_coord(DimId::from_raw(pos.dim as u32), pos.x, pos.y, pos.z)
+}
+
+/// `(dx,dy,dz)` -> the world face it points through.
+#[cfg(feature = "mod-suite")]
+fn live_cap_face_of(d: (i32, i32, i32)) -> FaceDirection {
+    match d {
+        (0, -1, 0) => FaceDirection::Down,
+        (0, 1, 0) => FaceDirection::Up,
+        (0, 0, -1) => FaceDirection::North,
+        (0, 0, 1) => FaceDirection::South,
+        (-1, 0, 0) => FaceDirection::West,
+        _ => FaceDirection::East,
+    }
+}
+
+/// Internal `i64` item id → the namespaced bus id. `item_to_name` yields
+/// bare vanilla paths ("wheat"); the bus speaks namespaced ids, so
+/// unqualified names re-qualify as `minecraft:*` while `create:*` and
+/// other already-namespaced names pass through untouched. Unknown ids
+/// get a stable `megu:item_*` placeholder so cargo never loses identity.
+#[cfg(feature = "mod-suite")]
+fn live_cap_item_name(item: i64) -> String {
+    item_to_name(item)
+        .map(|n| {
+            if n.contains(':') {
+                n.to_string()
+            } else {
+                format!("minecraft:{n}")
+            }
+        })
+        .unwrap_or_else(|| format!("megu:item_{item}"))
+}
+
+/// Items a single `live_cap_bus_step` lets one Create duct push into a
+/// foreign endpoint — one partial stack per tick, matching the staging
+/// cadence the transport layer uses.
+#[cfg(feature = "mod-suite")]
+const LIVE_CAP_STEP_ITEMS: u32 = 16;
+
+/// Fluid (mB) a `live_cap_bus_step` lets one Create pipe/pump push toward
+/// each adjacent fluid endpoint — one bucket per tick per face.
+#[cfg(feature = "mod-suite")]
+const LIVE_CAP_STEP_FLUID_MB: u64 = 1_000;
+
+/// [`ItemTransferHandler`] the bus holds for a live cooking pot: a thin
+/// lock shim over the *same* `CookingPotItemAdapter` the suite map owns,
+/// so items a Create duct pushes in land in the canonical pot the tick
+/// scheduler advances — no shadow state to reconcile.
+#[cfg(feature = "mod-suite")]
+struct LiveCookingPotEndpoint {
+    inner: Arc<Mutex<CookingPotItemAdapter>>,
+}
+
+#[cfg(feature = "mod-suite")]
+impl ItemTransferHandler for LiveCookingPotEndpoint {
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
+    }
+
+    fn as_any_mut(&mut self) -> &mut dyn std::any::Any {
+        self
+    }
+
+    fn insert_item(
+        &mut self,
+        face: Option<FaceDirection>,
+        stack: &CapabilityItemStack,
+        simulate: bool,
+    ) -> CapabilityItemStack {
+        self.inner
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert_item(face, stack, simulate)
+    }
+
+    fn extract_item(
+        &mut self,
+        face: Option<FaceDirection>,
+        max_count: u32,
+        filter: Option<&dyn Fn(&CapabilityItemStack) -> bool>,
+        simulate: bool,
+    ) -> Option<CapabilityItemStack> {
+        self.inner
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .extract_item(face, max_count, filter, simulate)
+    }
+
+    fn slots(&self) -> usize {
+        self.inner
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .slots()
+    }
+}
+
+/// Insert `count` of `item_id` (with lossless 1.21.1 `raw_components`)
+/// into the capability endpoint at `(dim, x, y, z)` through `face`
+/// (`None` = internal access). Returns the accepted count; `simulate`
+/// probes without mutating. `0` when no endpoint occupies the cell.
+///
+/// A live Create duct cell takes component-free stacks with a resolvable
+/// live item id straight through [`live_create_duct_insert`] — the
+/// transport FIFO for moving ducts, the `held` slot for depots/basins —
+/// the same hopper-insert path vanilla-adjacent consumers use. That call
+/// runs BEFORE the bus lock: it takes `live_create_state` internally and
+/// the bus never nests inside it. Component-tagged stacks and foreign
+/// item ids skip the duct and land in the endpoint's slot store where
+/// their bytes and ids survive losslessly.
+#[cfg(feature = "mod-suite")]
+#[allow(dead_code)]
+fn live_cap_insert_item(
+    dim: DimId,
+    x: i32,
+    y: i32,
+    z: i32,
+    face: Option<FaceDirection>,
+    item_id: &str,
+    count: u32,
+    raw_components: &[u8],
+    simulate: bool,
+) -> u32 {
+    let coord = live_cap_coord(dim, x, y, z);
+    let mut stack =
+        CapabilityItemStack::with_components(item_id, count, raw_components.to_vec());
+    let pos = FactoryPos::new(dim.raw() as i32, x, y, z);
+    if stack.raw_components.is_empty() {
+        let is_duct = {
+            let state = live_cap_state().lock().unwrap_or_else(|e| e.into_inner());
+            state
+                .create_cells
+                .get(&pos)
+                .is_some_and(|id| live_duct_kind(id).is_some())
+        };
+        if is_duct {
+            if let Some(item) = name_to_item(item_id) {
+                if simulate {
+                    // Read-only probe of the live duct's room: `held` slot
+                    // for depot/basin, staging-FIFO headroom elsewhere.
+                    let room = live_create_with(|rt| {
+                        let kind = rt.duct_kind_at(pos)?;
+                        Some(match kind {
+                            LiveDuctKind::Depot | LiveDuctKind::Basin => {
+                                kind.held_capacity().saturating_sub(
+                                    rt.held.get(&pos).map_or(0, |h| h.items.len()),
+                                ) as u32
+                            }
+                            _ => {
+                                let used = rt
+                                    .duct_machines
+                                    .get(&pos)
+                                    .and_then(|_| rt.duct_machine_state(pos))
+                                    .map(|m| m.input_items)
+                                    .unwrap_or(0);
+                                kind.capacity().saturating_sub(used as u32)
+                            }
+                        })
+                    })
+                    .flatten()
+                    .unwrap_or(0);
+                    stack.count = stack.count.saturating_sub(room);
+                } else {
+                    while stack.count > 0 && live_create_duct_insert(dim, x, y, z, item) {
+                        stack.count -= 1;
+                    }
+                }
+            }
+        }
+    }
+    if stack.count == 0 {
+        return count;
+    }
+    let refused = {
+        let mut bus = live_cap_bus().lock().unwrap_or_else(|e| e.into_inner());
+        bus.item_endpoint_mut(&coord).map_or(stack.count, |endpoint| {
+            endpoint.insert_item(face, &stack, simulate).count
+        })
+    };
+    let accepted = count.saturating_sub(refused);
+    if accepted > 0 && !simulate {
+        // A fed cooking pot may have become cookable — re-arm its
+        // deadline outside the bus lock.
+        live_cap_notify_pot_fed(&coord);
+    }
+    accepted
+}
+
+/// Extract up to `max_count` items from the endpoint at
+/// `(dim, x, y, z)` through `face`; the returned stack keeps its
+/// `raw_components` byte-identical. `None` when the cell hosts no
+/// endpoint or holds nothing extractable. Depot/basin cells additionally
+/// serve their `held` slot — hopper-style pulls read it here; cargo
+/// inside the transport machinery itself is not pullable, matching real
+/// Create.
+#[cfg(feature = "mod-suite")]
+#[allow(dead_code)]
+fn live_cap_extract_item(
+    dim: DimId,
+    x: i32,
+    y: i32,
+    z: i32,
+    face: Option<FaceDirection>,
+    max_count: u32,
+    simulate: bool,
+) -> Option<CapabilityItemStack> {
+    let coord = live_cap_coord(dim, x, y, z);
+    {
+        let mut bus = live_cap_bus().lock().unwrap_or_else(|e| e.into_inner());
+        if let out @ Some(_) = bus
+            .item_endpoint_mut(&coord)
+            .and_then(|ep| ep.extract_item(face, max_count, None, simulate))
+        {
+            return out;
+        }
+    }
+    let pos = FactoryPos::new(dim.raw() as i32, x, y, z);
+    let held_duct = {
+        let state = live_cap_state().lock().unwrap_or_else(|e| e.into_inner());
+        state.create_cells.get(&pos).is_some_and(|id| {
+            matches!(
+                live_duct_kind(id),
+                Some(LiveDuctKind::Depot | LiveDuctKind::Basin)
+            )
+        })
+    };
+    if !held_duct {
+        return None;
+    }
+    live_create_with(|rt| {
+        let &item = rt.held.get(&pos)?.items.last()?;
+        let name = live_cap_item_name(item);
+        if !simulate {
+            let h = rt.held.get_mut(&pos)?;
+            h.items.pop();
+            if h.items.is_empty() {
+                rt.held.remove(&pos);
+            }
+        }
+        Some(CapabilityItemStack::new(name, 1))
+    })
+    .flatten()
+}
+
+/// Atomically move up to `max_count` items between the endpoints at
+/// `from`/`to` inside `dim` — the bus's simulate-then-commit contract
+/// makes every hop all-or-nothing, so a full destination can never
+/// duplicate or vanish cargo.
+#[cfg(feature = "mod-suite")]
+#[allow(dead_code)]
+fn live_cap_transfer_adjacent(
+    dim: DimId,
+    from: [i32; 3],
+    from_face: FaceDirection,
+    to: [i32; 3],
+    to_face: FaceDirection,
+    max_count: u32,
+) -> u32 {
+    live_cap_bus()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .transfer_item_between(
+            &live_cap_coord(dim, from[0], from[1], from[2]),
+            Some(from_face),
+            &live_cap_coord(dim, to[0], to[1], to[2]),
+            Some(to_face),
+            max_count,
+            None,
+        )
+}
+
+/// Atomically move up to `max_mb` of fluid between two bus endpoints.
+#[cfg(feature = "mod-suite")]
+#[allow(dead_code)]
+fn live_cap_transfer_fluid(
+    dim: DimId,
+    from: [i32; 3],
+    from_face: FaceDirection,
+    to: [i32; 3],
+    to_face: FaceDirection,
+    max_mb: u64,
+) -> u64 {
+    live_cap_bus()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .transfer_fluid_between(
+            &live_cap_coord(dim, from[0], from[1], from[2]),
+            Some(from_face),
+            &live_cap_coord(dim, to[0], to[1], to[2]),
+            Some(to_face),
+            max_mb,
+        )
+}
+
+/// Atomically move up to `max_fe` of FE energy between two bus endpoints.
+#[cfg(feature = "mod-suite")]
+#[allow(dead_code)]
+fn live_cap_transfer_energy(
+    dim: DimId,
+    from: [i32; 3],
+    from_face: FaceDirection,
+    to: [i32; 3],
+    to_face: FaceDirection,
+    max_fe: u64,
+) -> u64 {
+    live_cap_bus()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .transfer_energy_between(
+            &live_cap_coord(dim, from[0], from[1], from[2]),
+            Some(from_face),
+            &live_cap_coord(dim, to[0], to[1], to[2]),
+            Some(to_face),
+            max_fe,
+        )
+}
+
+/// Fill the fluid endpoint at `(dim, x, y, z)` with `fluid_id`
+/// (component bytes preserved); returns accepted mB.
+#[cfg(feature = "mod-suite")]
+#[allow(dead_code)]
+fn live_cap_fill_fluid(
+    dim: DimId,
+    x: i32,
+    y: i32,
+    z: i32,
+    fluid_id: &str,
+    amount_mb: u64,
+    raw_components: &[u8],
+    simulate: bool,
+) -> u64 {
+    let stack = CapabilityFluidStack::with_components(fluid_id, amount_mb, raw_components.to_vec());
+    live_cap_bus()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .fluid_endpoint_mut(&live_cap_coord(dim, x, y, z))
+        .map_or(0, |ep| ep.fill_fluid(None, &stack, simulate))
+}
+
+/// Drain up to `max_mb` from the fluid endpoint at `(dim, x, y, z)`.
+#[cfg(feature = "mod-suite")]
+#[allow(dead_code)]
+fn live_cap_drain_fluid(
+    dim: DimId,
+    x: i32,
+    y: i32,
+    z: i32,
+    max_mb: u64,
+    simulate: bool,
+) -> Option<CapabilityFluidStack> {
+    live_cap_bus()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .fluid_endpoint_mut(&live_cap_coord(dim, x, y, z))?
+        .drain_fluid(None, max_mb, None, simulate)
+}
+
+/// Push `max_fe` into the energy endpoint at `(dim, x, y, z)`; returns
+/// accepted FE.
+#[cfg(feature = "mod-suite")]
+#[allow(dead_code)]
+fn live_cap_receive_energy(
+    dim: DimId,
+    x: i32,
+    y: i32,
+    z: i32,
+    max_fe: u64,
+    simulate: bool,
+) -> u64 {
+    live_cap_bus()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .energy_endpoint_mut(&live_cap_coord(dim, x, y, z))
+        .map_or(0, |ep| ep.receive_energy(None, max_fe, simulate))
+}
+
+/// Register a generic `slots`-deep item endpoint (hopper/chest-shaped
+/// storage — the shape vanilla containers and data-driven mod blocks
+/// share) at `(dim, x, y, z)`.
+#[cfg(feature = "mod-suite")]
+#[allow(dead_code)]
+fn live_cap_register_slot_inventory(
+    dim: DimId,
+    x: i32,
+    y: i32,
+    z: i32,
+    slots: usize,
+    max_stack: u32,
+) {
+    live_cap_bus()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .register_item_handler(
+            live_cap_coord(dim, x, y, z),
+            Box::new(SimpleSlotInventory::new(slots, max_stack)),
+        );
+}
+
+/// Register a generic `capacity_mb` fluid endpoint at `(dim, x, y, z)`.
+#[cfg(feature = "mod-suite")]
+#[allow(dead_code)]
+fn live_cap_register_fluid_tank(dim: DimId, x: i32, y: i32, z: i32, capacity_mb: u64) {
+    live_cap_bus()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .register_fluid_handler(
+            live_cap_coord(dim, x, y, z),
+            Box::new(SimpleFluidTank::new(capacity_mb)),
+        );
+}
+
+/// Register a generic `capacity_fe` FE buffer at `(dim, x, y, z)`.
+#[cfg(feature = "mod-suite")]
+#[allow(dead_code)]
+fn live_cap_register_energy_buffer(dim: DimId, x: i32, y: i32, z: i32, capacity_fe: u64) {
+    live_cap_bus()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .register_energy_handler(
+            live_cap_coord(dim, x, y, z),
+            Box::new(SimpleEnergyBuffer::new(capacity_fe)),
+        );
+}
+
+/// Drop every capability handler at `(dim, x, y, z)` and forget the cell
+/// in the registration table.
+#[cfg(feature = "mod-suite")]
+#[allow(dead_code)]
+fn live_cap_unregister(dim: DimId, x: i32, y: i32, z: i32) {
+    let coord = live_cap_coord(dim, x, y, z);
+    let mut bus = live_cap_bus().lock().unwrap_or_else(|e| e.into_inner());
+    bus.unregister_item_handler(&coord);
+    bus.unregister_fluid_handler(&coord);
+    bus.unregister_energy_handler(&coord);
+}
+
+/// The first non-empty endpoint set any loaded universal profile declares
+/// for `block_id` (`None` when no profile gives the block a capability —
+/// including builds without `create-offload`).
+#[cfg(feature = "mod-suite")]
+fn live_cap_profile_endpoints(
+    block_id: &str,
+) -> Option<mod_adapter_core::profile::ProfileCapabilityEndpoints> {
+    #[cfg(feature = "create-offload")]
+    {
+        let bridge = mod_offload_bridge().lock().unwrap_or_else(|e| e.into_inner());
+        for profile in &bridge.profiles {
+            let endpoints = profile.capability_endpoints_for(block_id);
+            if !endpoints.is_empty() {
+                return Some(endpoints);
+            }
+        }
+    }
+    #[cfg(not(feature = "create-offload"))]
+    let _ = block_id;
+    None
+}
+
+/// Register the endpoints `ModOffloadProfile::capability_endpoints_for`
+/// declares for `block_id` at `(dim, x, y, z)` on the shared bus — the
+/// first loaded profile declaring the block wins. `false` when the block
+/// carries no declared capability.
+#[cfg(feature = "mod-suite")]
+fn live_cap_register_profile_block(dim: DimId, x: i32, y: i32, z: i32, block_id: &str) -> bool {
+    let coord = live_cap_coord(dim, x, y, z);
+    let Some(endpoints) = live_cap_profile_endpoints(block_id) else {
+        return false;
+    };
+    let mut state = live_cap_state().lock().unwrap_or_else(|e| e.into_inner());
+    let mut bus = live_cap_bus().lock().unwrap_or_else(|e| e.into_inner());
+    endpoints.register_into(&mut bus, &coord);
+    state.profile_cells.insert(coord);
+    true
+}
+
+/// Mirror a block write onto the capability-bus profile table: a plan
+/// block id any loaded profile declares gets its endpoints (re)registered,
+/// and a cell that stops being a capability block drops them. Called from
+/// `live_create_on_block_set` after the Create runtime synced — a Create
+/// state resolves to `None` here, so the two registration tables never
+/// fight over a cell.
+#[cfg(feature = "mod-suite")]
+fn live_cap_sync_profile_endpoint(dim: DimId, x: i32, y: i32, z: i32, st: u32) {
+    let coord = live_cap_coord(dim, x, y, z);
+    let block_id = live_mod_name_for_state(st);
+    let registered = block_id
+        .as_deref()
+        .is_some_and(|id| live_cap_register_profile_block(dim, x, y, z, id));
+    if !registered {
+        let mut state = live_cap_state().lock().unwrap_or_else(|e| e.into_inner());
+        if state.profile_cells.remove(&coord) {
+            let mut bus = live_cap_bus().lock().unwrap_or_else(|e| e.into_inner());
+            bus.unregister_item_handler(&coord);
+            bus.unregister_fluid_handler(&coord);
+            bus.unregister_energy_handler(&coord);
+        }
+    }
+}
+
+/// `coord` received items through the bus — when it addresses a live
+/// cooking pot, re-arm its completion deadline so bus-fed ingredients
+/// wake a sleeping pot like a manual insert would.
+#[cfg(feature = "mod-suite")]
+fn live_cap_notify_pot_fed(coord: &BlockCoord) {
+    let mut suite = live_mod_suite().lock().unwrap_or_else(|e| e.into_inner());
+    if !suite.active {
+        return;
+    }
+    let tick = TICK_IDX.load(Ordering::Relaxed);
+    let key = suite
+        .cooking_pots
+        .keys()
+        .copied()
+        .find(|&(d, x, y, z)| live_cap_coord(d, x, y, z) == *coord);
+    if let Some(key) = key {
+        suite.refresh_cooking_pot(key, tick);
+    }
+}
+
+/// One cross-mod transfer pass: every armed Create duct pushes toward its
+/// live downstream cell when that cell hosts a *foreign* bus item endpoint
+/// (duct-to-duct flow stays on `SleepingTransport`), and Create fluid
+/// pipes/pumps push toward adjacent fluid endpoints. Called from
+/// `live_mod_tick`, so the ordinary game tick moves cargo between mods
+/// with zero per-mod glue.
+#[cfg(feature = "mod-suite")]
+fn live_cap_bus_step() {
+    let fed: Vec<BlockCoord> = live_create_with(|rt| rt.cap_bus_step()).unwrap_or_default();
+    for coord in &fed {
+        live_cap_notify_pot_fed(coord);
+    }
+}
+
+/// Drop every registered endpoint and the registration bookkeeping —
+/// suite (re)install and test isolation both run through here so a fresh
+/// boot never inherits stale handlers.
+#[cfg(feature = "mod-suite")]
+fn live_cap_reset() {
+    *live_cap_bus().lock().unwrap_or_else(|e| e.into_inner()) = BlockCapabilityBus::new();
+    *live_cap_state().lock().unwrap_or_else(|e| e.into_inner()) = LiveCapState::default();
 }
 
 /// Equip for a single player without affecting any other player's slots.
@@ -2076,6 +2791,9 @@ fn live_mod_suite_boot() {
     }
     suite.active = true;
     *live_mod_suite().lock().unwrap_or_else(|e| e.into_inner()) = suite;
+    // A fresh boot never inherits capability endpoints from a previous
+    // suite lifetime.
+    live_cap_reset();
     live_mod_refresh_hook_gate();
 }
 
@@ -2136,6 +2854,11 @@ fn live_mod_tick() {
         live_mod_fire_hook(StandardEventHook::ServerTickPre);
     }
     let _completed = live_mod_tick_cooking_pots(TICK_IDX.load(Ordering::Relaxed));
+    // XMOD1: one cross-mod transfer pass — armed Create ducts push into
+    // foreign bus endpoints (cooking pots, profile blocks, generic mod
+    // storage) and fluid cells push toward adjacent tanks, all through
+    // the same simulate-then-commit bus.
+    live_cap_bus_step();
     let players = clients().lock().unwrap_or_else(|e| e.into_inner()).clone();
     let connected: HashSet<[u8; 16]> = players.iter().map(|client| client.uuid).collect();
     {
@@ -2674,18 +3397,25 @@ fn live_create_is_water(st: u32) -> bool {
 }
 
 /// `create:pressing` — a powered `create:mechanical_press` two blocks above
-/// a depot or basin. `(&input_items, output_item)` names resolved once at
-/// arm-time through the real item tables into generic `Recipe`/`Stack`s.
+/// a depot or basin. `(&inputs, output)` accepts `#tag` spellings resolved
+/// against the shared cross-mod tag index: exact ids keep stock behavior
+/// with no mods loaded, while the conventional `c:`/`forge:` subtag lines
+/// let any mod ingot filed under `ingots/*` press like its vanilla
+/// counterpart.
 #[cfg(feature = "mod-suite")]
 const LIVE_CREATE_PRESSING: &[(&[&str], &str)] = &[
     (&["minecraft:iron_ingot"], "create:iron_sheet"),
     (&["minecraft:gold_ingot"], "create:gold_sheet"),
     (&["minecraft:copper_ingot"], "create:copper_sheet"),
     (&["create:brass_ingot"], "create:brass_sheet"),
+    (&["#c:ingots/iron"], "create:iron_sheet"),
+    (&["#c:ingots/gold"], "create:gold_sheet"),
+    (&["#c:ingots/copper"], "create:copper_sheet"),
+    (&["#c:ingots/brass"], "create:brass_sheet"),
 ];
 
 /// `create:mixing` — a powered `create:mechanical_mixer` two blocks above a
-/// basin. `(&input_items, output_item)`.
+/// basin. Same exact-id + `#tag` contract as [`LIVE_CREATE_PRESSING`].
 #[cfg(feature = "mod-suite")]
 const LIVE_CREATE_MIXING: &[(&[&str], &str)] = &[
     (
@@ -2696,6 +3426,10 @@ const LIVE_CREATE_MIXING: &[(&[&str], &str)] = &[
         &["minecraft:andesite", "minecraft:iron_nugget"],
         "create:andesite_alloy",
     ),
+    (
+        &["minecraft:andesite", "#c:nuggets/iron"],
+        "create:andesite_alloy",
+    ),
 ];
 
 /// Processing duration in ticks at `REFERENCE_RPM` — progress accrues in
@@ -2703,47 +3437,71 @@ const LIVE_CREATE_MIXING: &[(&[&str], &str)] = &[
 #[cfg(feature = "mod-suite")]
 const LIVE_CREATE_PROCESS_TICKS: u32 = 40;
 
-/// Resolve an item name into the generic `mod_offload::recipe_processor`
-/// stack type — live presses/mixers and `CreateFactory` processors share
-/// the one recipe model, so resolved recipes drop straight into
-/// `CreateFactory::add_processor` as well as the held-slot matcher.
+/// One processing ingredient: an exact item id, or a `#tag` membership
+/// probe resolved live against the shared cross-mod tag index so
+/// `#c:ingots/iron` and `#forge:ingots/iron` (and a mod JAR's nested
+/// equivalents) match uniformly.
 #[cfg(feature = "mod-suite")]
-fn live_create_item_stack(
-    name: &str,
-    amount: u32,
-) -> Option<mod_offload::recipe_processor::Stack> {
-    Some(mod_offload::recipe_processor::Stack {
-        resource: mod_offload::recipe_processor::Resource {
-            kind: mod_offload::recipe_processor::ResourceKind::Item,
-            id: u32::try_from(name_to_item(name)?).ok()?,
-        },
-        amount,
-    })
+#[derive(Clone, Debug)]
+enum LiveCreateIngredient {
+    Item(u32),
+    Tag(String),
 }
 
-/// One resolved generic recipe (`Recipe`/`Stack` from `recipe_processor`)
-/// per table entry; `id` keeps pressing and mixing key spaces disjoint for
-/// the `active` recipe pin on [`LiveCreateHeld`].
+/// One resolved live processing recipe. `id` keeps pressing and mixing
+/// key spaces disjoint for the `active` recipe pin on [`LiveCreateHeld`].
 #[cfg(feature = "mod-suite")]
-fn live_create_recipes(
-    table: &[(&[&str], &str)],
-    id_base: u32,
-) -> Vec<mod_offload::recipe_processor::Recipe> {
+#[derive(Clone, Debug)]
+struct LiveCreateRecipe {
+    id: u32,
+    base_ticks: u32,
+    inputs: Vec<(LiveCreateIngredient, u32)>,
+    outputs: Vec<(u32, u32)>,
+}
+
+/// Resolve the shared `(&inputs, output)` table form into
+/// [`LiveCreateRecipe`]s: `#`-prefixed inputs become tag probes (they
+/// never fail resolution — an absent tag simply matches nothing), plain
+/// names resolve through the live item tables exactly like before.
+#[cfg(feature = "mod-suite")]
+fn live_create_recipes(table: &[(&[&str], &str)], id_base: u32) -> Vec<LiveCreateRecipe> {
     table
         .iter()
         .enumerate()
         .filter_map(|(idx, &(inputs, output))| {
-            Some(mod_offload::recipe_processor::Recipe {
+            let inputs = inputs
+                .iter()
+                .map(|&name| {
+                    let ingredient = match name.strip_prefix('#') {
+                        Some(tag) => LiveCreateIngredient::Tag(tag.to_string()),
+                        None => LiveCreateIngredient::Item(
+                            u32::try_from(name_to_item(name)?).ok()?,
+                        ),
+                    };
+                    Some((ingredient, 1u32))
+                })
+                .collect::<Option<Vec<_>>>()?;
+            let out = u32::try_from(name_to_item(output)?).ok()?;
+            Some(LiveCreateRecipe {
                 id: id_base + idx as u32,
                 base_ticks: LIVE_CREATE_PROCESS_TICKS,
-                inputs: inputs
-                    .iter()
-                    .map(|&n| live_create_item_stack(n, 1))
-                    .collect::<Option<_>>()?,
-                outputs: vec![live_create_item_stack(output, 1)?],
+                inputs,
+                outputs: vec![(out, 1)],
             })
         })
         .collect()
+}
+
+/// `true` when the tracked item satisfies `ingredient`: exact ids compare
+/// numerically; `#tag` inputs probe the shared unified index through the
+/// live item name so a mod JAR's `#c:`/`#forge:` table decides.
+#[cfg(feature = "mod-suite")]
+fn live_create_ingredient_matches(ingredient: &LiveCreateIngredient, item: i64) -> bool {
+    match ingredient {
+        LiveCreateIngredient::Item(id) => u32::try_from(item).ok() == Some(*id),
+        LiveCreateIngredient::Tag(tag) => item_to_name(item)
+            .is_some_and(|name| live_unified_tag_matches(TagDomain::Item, tag, name)),
+    }
 }
 
 /// Items resting on a depot or inside a basin. `progress` accrues
@@ -2842,8 +3600,8 @@ struct LiveCreateRuntime {
     held: std::collections::BTreeMap<create_adapter::factory::DimBlockPos, LiveCreateHeld>,
     duct_machines: std::collections::BTreeMap<create_adapter::factory::DimBlockPos, u32>,
     next_machine_id: u32,
-    pressing: Vec<mod_offload::recipe_processor::Recipe>,
-    mixing: Vec<mod_offload::recipe_processor::Recipe>,
+    pressing: Vec<LiveCreateRecipe>,
+    mixing: Vec<LiveCreateRecipe>,
     /// Number of non-empty kinetic batches drained since boot (test hook).
     kinetic_batches_emitted: u64,
 }
@@ -2938,6 +3696,9 @@ impl LiveCreateRuntime {
             self.held.remove(&pos);
             self.duct_machines.remove(&pos);
             let _ = self.factory.remove_block(pos);
+            // The cell exposed no Create capability anymore — drop any
+            // bus endpoints it carried.
+            self.cap_sync_cell(pos);
             return;
         }
         // The block keeps its cell: drop slot/machine state the new state
@@ -2988,6 +3749,10 @@ impl LiveCreateRuntime {
             self.placed.insert(pos, st);
             self.dormant.insert(pos);
         }
+        // Register/drop the cell's capability-bus endpoints to match the
+        // new block id — `cap_sync_cell` no-ops when nothing changed, so
+        // facing/powered flips keep stored cargo.
+        self.cap_sync_cell(pos);
     }
 
     /// A water cell appeared/vanished at `pos`: re-evaluate every tracked
@@ -3029,6 +3794,21 @@ impl LiveCreateRuntime {
         self.held.clear();
         self.duct_machines.clear();
         self.next_machine_id = 1;
+        // Rebuilt runtime: drop every bus endpoint the previous graph
+        // owned; each `sync_cell` below re-registers the restored cells.
+        let stale: Vec<FactoryPos> = {
+            let mut state = live_cap_state().lock().unwrap_or_else(|e| e.into_inner());
+            std::mem::take(&mut state.create_cells).into_keys().collect()
+        };
+        if !stale.is_empty() {
+            let mut bus = live_cap_bus().lock().unwrap_or_else(|e| e.into_inner());
+            for pos in stale {
+                let coord = live_cap_coord_of(pos);
+                bus.unregister_item_handler(&coord);
+                bus.unregister_fluid_handler(&coord);
+                bus.unregister_energy_handler(&coord);
+            }
+        }
         for (pos, st, items) in entries {
             self.sync_cell(pos, st);
             if items.is_empty() {
@@ -3101,10 +3881,16 @@ impl LiveCreateRuntime {
     }
 
     /// The cell `pos`'s duct pushes items toward under the live topology,
-    /// or `None` for sinks, blocked ducts and powered-off funnels. The
-    /// target must itself be a duct cell — the machine it owns is what the
-    /// `SleepingTransport` link actually points at.
-    fn duct_downstream_pos(&self, pos: FactoryPos, st: u32) -> Option<FactoryPos> {
+    /// plus the direction the push travels — `None` for sinks, blocked
+    /// ducts and powered-off funnels. Unlike [`Self::duct_downstream_pos`]
+    /// the target is NOT required to be a duct cell: this is the
+    /// capability-bus counterpart, so a chute can feed a cooking pot or a
+    /// foreign mod's storage block.
+    fn cap_push_target(
+        &self,
+        pos: FactoryPos,
+        st: u32,
+    ) -> Option<(FactoryPos, (i32, i32, i32))> {
         let def = self.factory.registry().block_def_for_state(st)?;
         let kind = live_duct_kind(def.id.as_str())?;
         let entry = self.factory.registry().state(st)?;
@@ -3115,23 +3901,23 @@ impl LiveCreateRuntime {
             .property("facing")
             .and_then(live_facing_offset);
         let extracting = entry.property("extracting") == Some("true");
-        let target = match kind {
+        Some(match kind {
             // Belts run items toward their horizontal `facing` direction.
             LiveDuctKind::Belt => {
                 let d = facing?;
-                pos.offset(d.0, d.1, d.2)
+                (pos.offset(d.0, d.1, d.2), d)
             }
-            // Chutes are gravity ducts: straight down into the duct below.
-            LiveDuctKind::Chute => pos.offset(0, -1, 0),
+            // Chutes are gravity ducts: straight down into the cell below.
+            LiveDuctKind::Chute => (pos.offset(0, -1, 0), (0, -1, 0)),
             // Insert-mode funnels push out of the mouth (`facing`); in
             // extracting mode staged items ride back into the attached
             // container (the cell behind the mouth).
             LiveDuctKind::Funnel => {
                 let d = facing?;
                 if extracting {
-                    pos.offset(-d.0, -d.1, -d.2)
+                    (pos.offset(-d.0, -d.1, -d.2), (-d.0, -d.1, -d.2))
                 } else {
-                    pos.offset(d.0, d.1, d.2)
+                    (pos.offset(d.0, d.1, d.2), d)
                 }
             }
             // Belt funnels sit one cell over their belt. Insert mode drops
@@ -3140,15 +3926,189 @@ impl LiveCreateRuntime {
             LiveDuctKind::BeltFunnel => {
                 if extracting {
                     let d = facing?;
-                    pos.offset(d.0, d.1, d.2)
+                    (pos.offset(d.0, d.1, d.2), d)
                 } else {
-                    pos.offset(0, -1, 0)
+                    (pos.offset(0, -1, 0), (0, -1, 0))
                 }
             }
             LiveDuctKind::Depot | LiveDuctKind::Basin => return None,
-        };
+        })
+    }
+
+    /// The cell `pos`'s duct pushes items toward under the live topology,
+    /// or `None` for sinks, blocked ducts and powered-off funnels. The
+    /// target must itself be a duct cell — the machine it owns is what the
+    /// `SleepingTransport` link actually points at.
+    fn duct_downstream_pos(&self, pos: FactoryPos, st: u32) -> Option<FactoryPos> {
+        let (target, _) = self.cap_push_target(pos, st)?;
         self.duct_kind_at(target)?;
         Some(target)
+    }
+
+    /// Keep the shared capability bus in step with `pos`: register the
+    /// endpoints the placed block's id declares (first registration or
+    /// capability-shape change only — a mere facing/powered flip must not
+    /// drop stored cargo), unregister when the cell stops exposing any.
+    fn cap_sync_cell(&mut self, pos: FactoryPos) {
+        let block_id = self
+            .placed
+            .get(&pos)
+            .and_then(|&st| self.factory.registry().block_def_for_state(st))
+            .map(|def| def.id.clone());
+        let endpoints = block_id
+            .as_deref()
+            .map(create_adapter::factory::create_capability_endpoints_for)
+            .filter(|eps| !eps.is_empty());
+        let coord = live_cap_coord_of(pos);
+        // Lock order is global: cap_state -> bus.
+        let mut state = live_cap_state().lock().unwrap_or_else(|e| e.into_inner());
+        // A Create endpoint always wins the cell over a stale profile
+        // registration — the profile row can go, the bus handlers below
+        // get replaced in place.
+        state.profile_cells.remove(&coord);
+        let tracked = state.create_cells.get(&pos).map(String::as_str);
+        if tracked == block_id.as_deref().filter(|_| endpoints.is_some()) {
+            return;
+        }
+        let mut bus = live_cap_bus().lock().unwrap_or_else(|e| e.into_inner());
+        match (endpoints, block_id) {
+            (Some(eps), Some(id)) => {
+                eps.register_into(&mut bus, &coord);
+                state.create_cells.insert(pos, id);
+            }
+            _ => {
+                state.create_cells.remove(&pos);
+                bus.unregister_item_handler(&coord);
+                bus.unregister_fluid_handler(&coord);
+                bus.unregister_energy_handler(&coord);
+            }
+        }
+    }
+
+    /// One cross-mod transfer pass on the shared bus: every armed duct
+    /// pushes up to [`LIVE_CAP_STEP_ITEMS`] items toward its live
+    /// downstream cell when that cell hosts a foreign bus item endpoint
+    /// (duct-to-duct flow stays on `SleepingTransport`), and Create fluid
+    /// pipes/pumps push up to [`LIVE_CAP_STEP_FLUID_MB`] toward adjacent
+    /// fluid endpoints. The bus's simulate-then-commit keeps every hop
+    /// atomic. Returns the `BlockCoord`s that received items so callers
+    /// can re-arm cooking-pot deadlines outside the bus lock.
+    fn cap_bus_step(&mut self) -> Vec<BlockCoord> {
+        let cells: Vec<(FactoryPos, u32)> = {
+            let state = live_cap_state().lock().unwrap_or_else(|e| e.into_inner());
+            state
+                .create_cells
+                .keys()
+                .filter_map(|pos| self.placed.get(pos).map(|&st| (*pos, st)))
+                .collect()
+        };
+        if cells.is_empty() {
+            return Vec::new();
+        }
+        let mut fed = Vec::new();
+        let mut bus = live_cap_bus().lock().unwrap_or_else(|e| e.into_inner());
+        for (pos, st) in cells {
+            let from = live_cap_coord_of(pos);
+            if let Some((dst, push)) = self.cap_push_target(pos, st) {
+                // Only push into foreign endpoints — a duct target's items
+                // ride the `SleepingTransport` link, not the bus.
+                if self.duct_kind_at(dst).is_none() {
+                    let to = live_cap_coord_of(dst);
+                    if bus.item_endpoint(&to).is_some() {
+                        let to_face =
+                            live_cap_face_of((-push.0, -push.1, -push.2));
+                        let mut moved = 0u32;
+                        // (a) Staged transport output first — items that
+                        //     entered the duct through
+                        //     `live_create_duct_insert` ride the machine
+                        //     FIFO, not the slot store. A refused item
+                        //     recirculates through the input FIFO instead
+                        //     of vanishing.
+                        if let Some(&machine) = self.duct_machines.get(&pos) {
+                            while moved < LIVE_CAP_STEP_ITEMS {
+                                let Some(item) = self
+                                    .factory
+                                    .scheduler_mut()
+                                    .region_mut(pos.region_key())
+                                    .extract_output(machine)
+                                    .ok()
+                                    .flatten()
+                                else {
+                                    break;
+                                };
+                                let name = live_cap_item_name(i64::from(item));
+                                let stack = CapabilityItemStack::new(name, 1);
+                                let refused = bus
+                                    .item_endpoint_mut(&to)
+                                    .map(|ep| {
+                                        ep.insert_item(Some(to_face), &stack, true)
+                                            .count
+                                    })
+                                    .unwrap_or(1);
+                                if refused > 0 {
+                                    let _ = self
+                                        .factory
+                                        .insert_belt_item(pos, machine, item);
+                                    break;
+                                }
+                                if let Some(ep) = bus.item_endpoint_mut(&to) {
+                                    let _ = ep.insert_item(Some(to_face), &stack, false);
+                                }
+                                moved += 1;
+                            }
+                        }
+                        // (b) The endpoint slot store — component-tagged and
+                        //     foreign-id stacks the transport machinery
+                        //     cannot carry.
+                        if moved < LIVE_CAP_STEP_ITEMS {
+                            moved += bus.transfer_item_between(
+                                &from,
+                                Some(live_cap_face_of(push)),
+                                &to,
+                                Some(to_face),
+                                LIVE_CAP_STEP_ITEMS - moved,
+                                None,
+                            );
+                        }
+                        if moved > 0 {
+                            fed.push(to);
+                        }
+                    }
+                }
+            }
+            let fluid_pusher = self
+                .factory
+                .registry()
+                .block_def_for_state(st)
+                .is_some_and(|def| {
+                    matches!(
+                        def.id.as_str(),
+                        "create:fluid_pipe" | "create:mechanical_pump"
+                    )
+                });
+            if fluid_pusher && bus.fluid_endpoint(&from).is_some() {
+                for d in [
+                    (0i32, -1i32, 0i32),
+                    (0, 1, 0),
+                    (0, 0, -1),
+                    (0, 0, 1),
+                    (-1, 0, 0),
+                    (1, 0, 0),
+                ] {
+                    let to = live_cap_coord_of(pos.offset(d.0, d.1, d.2));
+                    if bus.fluid_endpoint(&to).is_some() {
+                        bus.transfer_fluid_between(
+                            &from,
+                            Some(live_cap_face_of(d)),
+                            &to,
+                            Some(live_cap_face_of((-d.0, -d.1, -d.2))),
+                            LIVE_CAP_STEP_FLUID_MB,
+                        );
+                    }
+                }
+            }
+        }
+        fed
     }
 
     /// Re-point every registered duct machine's downstream at the machine
@@ -3382,21 +4342,19 @@ impl LiveCreateRuntime {
             let Some(slot) = self.held.get_mut(&pos) else {
                 continue;
             };
-            // Generic `Recipe` match: every input `Stack` must be covered by
-            // `slot.items` (item ids stored as `i64`), honoring `amount`.
-            let count_item = |items: &[i64], stack: &mod_offload::recipe_processor::Stack| {
+            // Recipe match: every `(ingredient, amount)` input must be
+            // covered by `slot.items` — exact ids numerically, `#tag`
+            // inputs through the shared cross-mod index.
+            let count_item = |items: &[i64], need: &(LiveCreateIngredient, u32)| {
                 items
                     .iter()
-                    .filter(|item| {
-                        stack.resource.kind == mod_offload::recipe_processor::ResourceKind::Item
-                            && u32::try_from(**item).ok() == Some(stack.resource.id)
-                    })
+                    .filter(|item| live_create_ingredient_matches(&need.0, **item))
                     .count()
             };
             let Some(recipe) = recipes.iter().find(|r| {
                 r.inputs
                     .iter()
-                    .all(|need| count_item(&slot.items, need) >= need.amount as usize)
+                    .all(|need| count_item(&slot.items, need) >= need.1 as usize)
             }) else {
                 slot.progress = 0.0;
                 slot.active = None;
@@ -3413,20 +4371,20 @@ impl LiveCreateRuntime {
             if slot.progress < need {
                 continue;
             }
-            for input in &recipe.inputs {
-                for _ in 0..input.amount {
-                    if let Some(at) = slot.items.iter().position(|item| {
-                        u32::try_from(*item).ok() == Some(input.resource.id)
-                    }) {
+            for (ingredient, amount) in &recipe.inputs {
+                for _ in 0..*amount {
+                    if let Some(at) = slot
+                        .items
+                        .iter()
+                        .position(|item| live_create_ingredient_matches(ingredient, *item))
+                    {
                         slot.items.remove(at);
                     }
                 }
             }
-            for output in &recipe.outputs {
-                if output.resource.kind == mod_offload::recipe_processor::ResourceKind::Item {
-                    for _ in 0..output.amount {
-                        slot.items.push(i64::from(output.resource.id));
-                    }
+            for &(output, amount) in &recipe.outputs {
+                for _ in 0..amount {
+                    slot.items.push(i64::from(output));
                 }
             }
             slot.progress = 0.0;
@@ -3485,6 +4443,11 @@ fn live_create_on_block_set(dim: DimId, x: i32, y: i32, z: i32, old: u32, st: u3
             rt.reeval_wheel_neighbors(pos);
         }
     });
+    // XMOD1: generic plan blocks expose their declared profile endpoints
+    // on the shared bus (and a cell that stopped being one drops them).
+    if was_mod || is_mod {
+        live_cap_sync_profile_endpoint(dim, x, y, z, st);
+    }
 }
 
 /// `BlockItem.place` for `create:*` block items, invoked from
@@ -5028,6 +5991,7 @@ mod wire_mods_tests {
 
     fn fresh_suite() {
         *live_mod_suite().lock().unwrap_or_else(|e| e.into_inner()) = LiveModSuite::new();
+        live_cap_reset();
         live_mod_refresh_hook_gate();
     }
 
@@ -6865,7 +7829,11 @@ version="3.0.0"
         live_mod_set_cooking_pot(key.0, key.1, key.2, key.3, pot.clone(), 100);
         {
             let suite = live_mod_suite().lock().unwrap_or_else(|e| e.into_inner());
-            assert!(suite.cooking_pots[&key].is_sleeping());
+            assert!(suite.cooking_pots[&key]
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .pot()
+                .is_sleeping());
             assert!(suite.cooking_deadlines.is_empty());
         }
         assert!(live_mod_tick_cooking_pots(100_000).is_empty());
@@ -7178,6 +8146,9 @@ version="3.0.0"
     /// and the join hook must put zero bytes on the wire.
     #[test]
     fn wire_mods_mrs1_vanilla_emits_nothing() {
+        // Serializes against `live_create_tests`' world_guard too — this
+        // test mutates LIVE_CREATE_TEST_GATE, which the armed runtime reads.
+        let _g = world_guard();
         let _serial = WIRE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         fresh_suite();
         LIVE_CREATE_TEST_GATE.store(2, Ordering::Relaxed);
@@ -7197,6 +8168,9 @@ version="3.0.0"
     /// When `breg()` is loaded with the mod extension, block states join too.
     #[test]
     fn wire_mods_mrs1_create_armed_frame_decodes() {
+        // Serializes against `live_create_tests`' world_guard too — this
+        // test mutates LIVE_CREATE_TEST_GATE, which the armed runtime reads.
+        let _g = world_guard();
         let _serial = WIRE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         fresh_suite();
         LIVE_CREATE_TEST_GATE.store(1, Ordering::Relaxed);
@@ -7243,6 +8217,9 @@ version="3.0.0"
     /// produces byte-identical bytes for unchanged inputs.
     #[test]
     fn wire_mods_mrs1_frame_is_cached_and_rescan_rebuilds() {
+        // Serializes against `live_create_tests`' world_guard too — this
+        // test mutates LIVE_CREATE_TEST_GATE, which the armed runtime reads.
+        let _g = world_guard();
         let _serial = WIRE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         fresh_suite();
         LIVE_CREATE_TEST_GATE.store(1, Ordering::Relaxed);
@@ -7283,6 +8260,9 @@ version="3.0.0"
     /// dedicated generic id bases — disjoint from Create's ranges.
     #[test]
     fn wire_mods_mrs1_includes_mods_dir_registry_plan() {
+        // Serializes against `live_create_tests`' world_guard too — this
+        // test mutates LIVE_CREATE_TEST_GATE, which the armed runtime reads.
+        let _g = world_guard();
         let _serial = WIRE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         fresh_suite();
         LIVE_CREATE_TEST_GATE.store(2, Ordering::Relaxed);
@@ -7335,6 +8315,9 @@ version="3.0.0"
     /// `/setblock` (`state_from_arg`), and the state→name reverse mapping.
     #[test]
     fn wire_mods_generic_blocks_resolve_for_fill_setblock() {
+        // Serializes against `live_create_tests`' world_guard too — this
+        // test mutates LIVE_CREATE_TEST_GATE, which the armed runtime reads.
+        let _g = world_guard();
         let _serial = WIRE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         fresh_suite();
         LIVE_CREATE_TEST_GATE.store(2, Ordering::Relaxed);
@@ -7398,8 +8381,10 @@ version="3.0.0"
     /// whole sidecar.
     #[test]
     fn wire_mods_sidecar_plan_state_survives_roundtrip() {
-        let _serial = WIRE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        // Serializes against `live_create_tests`' world_guard too — this
+        // test mutates LIVE_CREATE_TEST_GATE, which the armed runtime reads.
         let _world = crate::world_guard();
+        let _serial = WIRE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         fresh_suite();
         LIVE_CREATE_TEST_GATE.store(1, Ordering::Relaxed);
         *live_create_state().lock().unwrap_or_else(|e| e.into_inner()) = None;
@@ -7464,6 +8449,465 @@ version="3.0.0"
         LIVE_CREATE_TEST_GATE.store(0, Ordering::Relaxed);
     }
 
+    // ---------- XMOD1: unified tags + shared cross-mod capability bus ----------
+
+    /// Synthetic-JAR nested tags: `#c:` and `#forge:`/`#neoforge:`
+    /// spellings, Jar-in-Jar members and the vanilla baseline all resolve
+    /// through ONE index, and the culinary `TagIndex` picks up the
+    /// flattened export on both spellings.
+    #[test]
+    fn wire_mods_xmod1_unified_tags_nested_cross_mod() {
+        let _g = world_guard();
+        let _serial = WIRE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        fresh_suite();
+        let dir = lmb_temp_dir("xmod1-tags");
+        // Mod A: `c:ingots` nested-references the shared
+        // `#forge:ingots/iron` subtag — the index resolves the chain
+        // uniformly across conventions.
+        std::fs::write(
+            dir.join("mod_a.jar"),
+            lmb_test_jar(&[
+                ("fabric.mod.json", lmb_fabric_manifest("mod_a").as_slice()),
+                (
+                    "data/c/tags/item/ingots.json",
+                    br##"{"values":["#forge:ingots/iron"]}"##.as_slice(),
+                ),
+            ]),
+        )
+        .unwrap();
+        // Mod B contributes the `forge:` subtag plus a `c:plates/brass`
+        // member, and nests an inner JAR whose `c:` tag must fold in
+        // through the bounded Jar-in-Jar recursion.
+        let inner = lmb_test_jar(&[(
+            "data/c/tags/item/gems/focus.json",
+            br#"{"values":["mod_inner:focus_gem"]}"#.as_slice(),
+        )]);
+        std::fs::write(
+            dir.join("mod_b.jar"),
+            lmb_test_jar(&[
+                ("fabric.mod.json", lmb_fabric_manifest("mod_b").as_slice()),
+                (
+                    "data/forge/tags/item/ingots/iron.json",
+                    br#"{"values":["mod_b:steel_ingot","minecraft:iron_ingot"]}"#
+                        .as_slice(),
+                ),
+                (
+                    "data/c/tags/item/plates/brass.json",
+                    br#"{"values":["mod_b:brass_plate"]}"#.as_slice(),
+                ),
+                ("META-INF/jarjar/inner.jar", inner.as_slice()),
+            ]),
+        )
+        .unwrap();
+        let mut suite = LiveModSuite::new();
+        suite.scan_mods_dir(&dir);
+        *live_mod_suite().lock().unwrap_or_else(|e| e.into_inner()) = suite;
+        live_mod_refresh_hook_gate();
+
+        // `c:`, `forge:` and `neoforge:` spellings hit the same canonical
+        // chain.
+        for tag in ["#c:ingots/iron", "#forge:ingots/iron", "#neoforge:ingots/iron"] {
+            assert!(
+                live_unified_tag_matches(TagDomain::Item, tag, "mod_b:steel_ingot"),
+                "{tag} must match the cross-mod member"
+            );
+        }
+        // Nested: `c:ingots` -> `#forge:ingots/iron`.
+        assert!(live_unified_tag_matches(
+            TagDomain::Item,
+            "#c:ingots",
+            "mod_b:steel_ingot"
+        ));
+        assert!(live_unified_tag_matches(
+            TagDomain::Item,
+            "#forge:plates/brass",
+            "mod_b:brass_plate"
+        ));
+        // Jar-in-Jar member tags merged too.
+        assert!(live_unified_tag_matches(
+            TagDomain::Item,
+            "#c:gems/focus",
+            "mod_inner:focus_gem"
+        ));
+        // The vanilla 1.21.1 `c:` baseline still applies with mods loaded.
+        assert!(live_unified_tag_matches(
+            TagDomain::Item,
+            "#c:crops",
+            "minecraft:carrot"
+        ));
+        assert!(!live_unified_tag_matches(
+            TagDomain::Item,
+            "#c:ingots",
+            "minecraft:stone"
+        ));
+        // The culinary flat `TagIndex` picked up the flattened export on
+        // both spellings — `#` chains pre-expanded.
+        {
+            let suite = live_mod_suite().lock().unwrap_or_else(|e| e.into_inner());
+            assert!(mod_adapter_core::culinary_adapter::tag_contains(
+                &suite.culinary.tags,
+                "c:ingots/iron",
+                "mod_b:steel_ingot"
+            ));
+            assert!(mod_adapter_core::culinary_adapter::tag_contains(
+                &suite.culinary.tags,
+                "forge:ingots/iron",
+                "mod_b:steel_ingot"
+            ));
+        }
+        let _ = std::fs::remove_dir_all(dir);
+        fresh_suite();
+    }
+
+    /// Mod A item carrying 1.21.1 `raw_components` bytes rides a Create
+    /// chute's bus endpoint into a foreign `SimpleSlotInventory` one bus
+    /// step later — byte-identical on extraction, in the Overworld, the
+    /// Nether and an unregistered custom `DimId`.
+    #[test]
+    fn wire_mods_xmod1_cap_bus_item_components_roundtrip() {
+        let _g = world_guard();
+        let _serial = WIRE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        fresh_suite();
+        LIVE_CREATE_TEST_GATE.store(1, Ordering::Relaxed);
+        *live_create_state().lock().unwrap_or_else(|e| e.into_inner()) = None;
+        live_cap_reset();
+
+        let reg = live_create_block_registry().expect("armed registry");
+        let chute_st = reg.default_state("create:chute").expect("create:chute");
+        for (dim, (x, y, z)) in [
+            (DimId::Overworld, (200, 70, 200)),
+            (DimId::Nether, (210, 70, 210)),
+            (DimId::from_raw(7), (220, 70, 220)),
+        ] {
+            live_create_on_block_set(dim, x, y, z, 0, chute_st);
+            // Mod B storage cell directly below the chute.
+            live_cap_register_slot_inventory(dim, x, y - 1, z, 4, 64);
+            let comps = vec![0xDE, 0xAD, 0xBE, 0xEF, x as u8];
+            assert_eq!(
+                live_cap_insert_item(
+                    dim,
+                    x,
+                    y,
+                    z,
+                    Some(FaceDirection::Up),
+                    "mod_a:focus_gem",
+                    3,
+                    &comps,
+                    false
+                ),
+                3,
+                "chute endpoint accepted the whole stack"
+            );
+            // A simulate probe leaves the stack in place.
+            assert_eq!(
+                live_cap_insert_item(
+                    dim,
+                    x,
+                    y,
+                    z,
+                    Some(FaceDirection::Up),
+                    "mod_a:focus_gem",
+                    1,
+                    &comps,
+                    true
+                ),
+                1
+            );
+            live_cap_bus_step();
+            let out = live_cap_extract_item(dim, x, y - 1, z, Some(FaceDirection::Up), 64, false)
+                .expect("mod B storage received the pushed stack");
+            assert_eq!(out.item_id, "mod_a:focus_gem");
+            assert_eq!(out.count, 3, "zero duplication/loss across the hop");
+            assert_eq!(
+                out.raw_components, comps,
+                "1.21.1 components must survive byte-identical"
+            );
+            assert!(
+                live_cap_extract_item(dim, x, y, z, None, 64, false).is_none(),
+                "the chute's endpoint is drained after the push"
+            );
+            live_cap_unregister(dim, x, y - 1, z);
+            live_create_on_block_set(dim, x, y, z, chute_st, 0);
+        }
+        LIVE_CREATE_TEST_GATE.store(0, Ordering::Relaxed);
+        fresh_suite();
+    }
+
+    /// The full cross-mod story with zero glue: a Create chute pushes a
+    /// component-tagged ingredient straight into a culinary cooking pot's
+    /// canonical state, the deadline scheduler cooks it, and the finished
+    /// meal is served back out through the same bus.
+    #[test]
+    fn wire_mods_xmod1_cap_bus_chute_feeds_cooking_pot() {
+        let _g = world_guard();
+        let _serial = WIRE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        fresh_suite();
+        LIVE_CREATE_TEST_GATE.store(1, Ordering::Relaxed);
+        *live_create_state().lock().unwrap_or_else(|e| e.into_inner()) = None;
+        live_cap_reset();
+
+        let dir = lmb_temp_dir("xmod1-pot");
+        std::fs::write(
+            dir.join("farmersdelight.jar"),
+            lmb_culinary_jar("farmersdelight"),
+        )
+        .unwrap();
+        let mut suite = LiveModSuite::new();
+        suite.scan_mods_dir(&dir);
+        suite.active = true;
+        *live_mod_suite().lock().unwrap_or_else(|e| e.into_inner()) = suite;
+        live_mod_refresh_hook_gate();
+
+        let reg = live_create_block_registry().expect("armed registry");
+        let chute_st = reg.default_state("create:chute").expect("create:chute");
+        let (px, py, pz) = (300, 64, 300);
+        let mut pot = CookingPotState::new();
+        pot.heated = true;
+        pot.container = Some(("minecraft:bowl".into(), 1));
+        TICK_IDX.store(0, Ordering::Relaxed);
+        live_mod_set_cooking_pot(DimId::Overworld, px, py, pz, pot, 0);
+        live_create_on_block_set(DimId::Overworld, px, py + 1, pz, 0, chute_st);
+
+        // A carrot with component bytes enters the chute; one bus step
+        // delivers it into the SAME adapter the deadline scheduler owns.
+        let comps = vec![0x0C, 0xA0];
+        assert_eq!(
+            live_cap_insert_item(
+                DimId::Overworld,
+                px,
+                py + 1,
+                pz,
+                None,
+                "minecraft:carrot",
+                1,
+                &comps,
+                false
+            ),
+            1
+        );
+        live_cap_bus_step();
+        let adapter = {
+            let suite = live_mod_suite().lock().unwrap_or_else(|e| e.into_inner());
+            suite.cooking_pots[&(DimId::Overworld, px, py, pz)].clone()
+        };
+        {
+            let guard = adapter.lock().unwrap_or_else(|e| e.into_inner());
+            assert!(guard.pot().inputs.iter().any(|s| {
+                s.as_ref()
+                    .is_some_and(|(id, c)| id == "minecraft:carrot" && *c == 1)
+            }));
+            // The bus-fed ingredient armed the cook deadline — the pot is
+            // no longer sleeping on its 200-tick recipe.
+            assert!(guard.pot().next_completion_tick.is_some());
+        }
+        let completed = live_mod_tick_cooking_pots(200);
+        assert_eq!(completed.len(), 1);
+        assert_eq!(completed[0].1.result_item, "farmersdelight:test_soup");
+        // …and the meal comes back out through the pot's Down face on the
+        // very same bus.
+        let meal = live_cap_extract_item(
+            DimId::Overworld,
+            px,
+            py,
+            pz,
+            Some(FaceDirection::Down),
+            1,
+            false,
+        )
+        .expect("the cooked meal is served through the bus");
+        assert_eq!(meal.item_id, "farmersdelight:test_soup");
+        assert_eq!(meal.count, 1);
+
+        live_mod_remove_cooking_pot(DimId::Overworld, px, py, pz);
+        live_create_on_block_set(DimId::Overworld, px, py + 1, pz, chute_st, 0);
+        LIVE_CREATE_TEST_GATE.store(0, Ordering::Relaxed);
+        let _ = std::fs::remove_dir_all(dir);
+        fresh_suite();
+    }
+
+    /// The `live_create_duct_insert` entry path: a component-free bus
+    /// insert into a depot lands in the live `held` slot (and pulls back
+    /// out through the bus), and the same insert into a chute rides the
+    /// transport FIFO until a bus step ejects it into the foreign
+    /// endpoint below — zero duplication, zero loss.
+    #[test]
+    fn wire_mods_xmod1_cap_bus_duct_insert_rides_transport() {
+        let _g = world_guard();
+        let _serial = WIRE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        fresh_suite();
+        LIVE_CREATE_TEST_GATE.store(1, Ordering::Relaxed);
+        *live_create_state().lock().unwrap_or_else(|e| e.into_inner()) = None;
+        live_cap_reset();
+        let reg = live_create_block_registry().expect("armed registry");
+        let chute_st = reg.default_state("create:chute").expect("create:chute");
+        let depot_st = reg.default_state("create:depot").expect("create:depot");
+        let dim = DimId::Overworld;
+        let (x, y, z) = (600, 70, 600);
+
+        // Depot: the hopper-style insert lands in the live `held` slot.
+        live_create_on_block_set(dim, x, y, z, 0, depot_st);
+        assert_eq!(
+            live_cap_insert_item(dim, x, y, z, None, "minecraft:carrot", 1, &[], false),
+            1
+        );
+        {
+            let guard = live_create_state().lock().unwrap_or_else(|e| e.into_inner());
+            let rt = guard.as_ref().expect("runtime armed");
+            let held = rt
+                .held
+                .get(&FactoryPos::new(0, x, y, z))
+                .expect("depot held slot populated");
+            assert_eq!(held.items.len(), 1);
+        }
+        // …and the same item pulls back out through the bus.
+        let pulled = live_cap_extract_item(dim, x, y, z, None, 64, false)
+            .expect("depot held slot serves bus pulls");
+        assert_eq!(pulled.item_id, "minecraft:carrot");
+        assert_eq!(pulled.count, 1);
+
+        // Chute: the insert enters the transport machine FIFO; one
+        // immediate bus step finds nothing staged in output yet.
+        live_create_on_block_set(dim, x, y + 2, z, 0, chute_st);
+        live_cap_register_slot_inventory(dim, x, y + 1, z, 4, 64);
+        assert_eq!(
+            live_cap_insert_item(dim, x, y + 2, z, None, "minecraft:wheat", 1, &[], false),
+            1
+        );
+        live_cap_bus_step();
+        assert!(live_cap_extract_item(dim, x, y + 1, z, Some(FaceDirection::Up), 64, false)
+            .is_none());
+        // Advance the transport clock past the chute's staging delay —
+        // the staged output then hops into the foreign endpoint on the
+        // next bus step.
+        let base = TICK_IDX.load(Ordering::Relaxed);
+        let mut delivered = None;
+        for i in 1..=16u64 {
+            TICK_IDX.store(base + i, Ordering::Relaxed);
+            let _ = live_create_tick_body();
+            live_cap_bus_step();
+            if let Some(stack) =
+                live_cap_extract_item(dim, x, y + 1, z, Some(FaceDirection::Up), 64, false)
+            {
+                delivered = Some(stack);
+                break;
+            }
+        }
+        let out = delivered.expect("wheat reached the foreign endpoint through the duct");
+        assert_eq!(out.item_id, "minecraft:wheat");
+        assert_eq!(out.count, 1);
+
+        live_cap_unregister(dim, x, y + 1, z);
+        live_create_on_block_set(dim, x, y + 2, z, chute_st, 0);
+        live_create_on_block_set(dim, x, y, z, depot_st, 0);
+        LIVE_CREATE_TEST_GATE.store(0, Ordering::Relaxed);
+        fresh_suite();
+    }
+
+    /// Cross-mod fluid + FE energy over the shared bus: a Mod A tank's
+    /// molten zinc (component bytes in tow) moves into a Mod B tank, and
+    /// FE hops between two generic buffers — all atomically.
+    #[test]
+    fn wire_mods_xmod1_cap_bus_fluid_energy_cross_mod() {
+        let _g = world_guard();
+        let _serial = WIRE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        fresh_suite();
+        let dim = DimId::Nether;
+        let (ax, ay, az) = (400, 70, 400);
+        let (bx, by, bz) = (401, 70, 400);
+        live_cap_register_fluid_tank(dim, ax, ay, az, 8_000);
+        live_cap_register_fluid_tank(dim, bx, by, bz, 16_000);
+        assert_eq!(
+            live_cap_fill_fluid(dim, ax, ay, az, "mod_a:molten_zinc", 3_000, &[7, 7, 7], false),
+            3_000
+        );
+        assert_eq!(
+            live_cap_transfer_fluid(
+                dim,
+                [ax, ay, az],
+                FaceDirection::East,
+                [bx, by, bz],
+                FaceDirection::West,
+                2_000
+            ),
+            2_000
+        );
+        let drained =
+            live_cap_drain_fluid(dim, bx, by, bz, 4_000, false).expect("mod B tank content");
+        assert_eq!(drained.fluid_id, "mod_a:molten_zinc");
+        assert_eq!(drained.amount_mb, 2_000);
+        assert_eq!(drained.raw_components, vec![7, 7, 7]);
+
+        live_cap_register_energy_buffer(dim, ax, ay, az, 10_000);
+        live_cap_register_energy_buffer(dim, bx, by, bz, 10_000);
+        assert_eq!(
+            live_cap_receive_energy(dim, ax, ay, az, 5_000, false),
+            5_000
+        );
+        assert_eq!(
+            live_cap_transfer_energy(
+                dim,
+                [ax, ay, az],
+                FaceDirection::East,
+                [bx, by, bz],
+                FaceDirection::West,
+                4_000
+            ),
+            4_000
+        );
+        live_cap_unregister(dim, ax, ay, az);
+        live_cap_unregister(dim, bx, by, bz);
+        fresh_suite();
+    }
+
+    /// A declarative `ModOffloadProfile` block drops its declared
+    /// endpoints straight onto the live bus — no mod-specific glue.
+    #[cfg(feature = "create-offload")]
+    #[test]
+    fn wire_mods_xmod1_cap_bus_profile_endpoint() {
+        let _g = world_guard();
+        let _serial = WIRE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        fresh_suite();
+        // Stage the Mekanism-class reference profile on the shared bridge,
+        // restoring whatever was loaded after the test.
+        let saved = {
+            let mut bridge = mod_offload_bridge().lock().unwrap_or_else(|e| e.into_inner());
+            std::mem::replace(
+                &mut bridge.profiles,
+                vec![mod_adapter_core::profile::mekanism_class_profile()],
+            )
+        };
+        let dim = DimId::Overworld;
+        let (x, y, z) = (500, 70, 500);
+        assert!(live_cap_register_profile_block(
+            dim,
+            x,
+            y,
+            z,
+            "mekanism:basic_fluid_tank"
+        ));
+        // Mekanism's basic tank declares 16 000 mB.
+        assert_eq!(
+            live_cap_fill_fluid(dim, x, y, z, "mekanism:water", 16_000, &[], false),
+            16_000
+        );
+        assert_eq!(
+            live_cap_fill_fluid(dim, x, y, z, "mekanism:water", 1, &[], false),
+            0,
+            "a full tank accepts nothing more"
+        );
+        let drained = live_cap_drain_fluid(dim, x, y, z, 16_000, false).expect("tank content");
+        assert_eq!(drained.fluid_id, "mekanism:water");
+        assert_eq!(drained.amount_mb, 16_000);
+        // A block id no profile declares registers nothing.
+        assert!(!live_cap_register_profile_block(dim, x, y, z + 1, "mekanism:unknown_block"));
+        live_cap_unregister(dim, x, y, z);
+        mod_offload_bridge()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .profiles = saved;
+        fresh_suite();
+    }
+
 }
 
 // ===========================================================================
@@ -7479,6 +8923,9 @@ mod live_create_tests {
     fn arm() {
         LIVE_CREATE_TEST_GATE.store(1, Ordering::Relaxed);
         *live_create_state().lock().unwrap_or_else(|e| e.into_inner()) = None;
+        // A rebuilt runtime owns no capability endpoints — drop the stale
+        // bus state the previous runtime left registered.
+        live_cap_reset();
     }
 
     fn registry() -> create_adapter::blockstates::CreateBlockRegistry {

@@ -1115,6 +1115,132 @@
       "reason": "Awaiting A1-CLIENT subworld sync receiver lane",
       "lane": "A1-SERVER",
       "date": "2026-11-24"
+    },
+    {
+      "check": "dead_tick_or_bridge",
+      "symbol": "live_cap_insert_item",
+      "file": "src/live_mod_bridge.rs",
+      "line": 1794,
+      "reason": "XMOD1-CORE staged bus insert API for vanilla hopper/dispenser consumers (menus_and_items.rs) and game_tick push paths (main.rs) \u2014 those files belong to the A1-SERVER lane; E2E cap_bus tests exercise this entry meanwhile.",
+      "lane": "XMOD1-CORE",
+      "date": "2026-11-24"
+    },
+    {
+      "check": "dead_tick_or_bridge",
+      "symbol": "live_cap_extract_item",
+      "file": "src/live_mod_bridge.rs",
+      "line": 1879,
+      "reason": "XMOD1-CORE staged bus extract API \u2014 pull side of the hopper/game_tick surface; consumers land with A1-SERVER outside this lane's allowed files.",
+      "lane": "XMOD1-CORE",
+      "date": "2026-11-24"
+    },
+    {
+      "check": "dead_tick_or_bridge",
+      "symbol": "live_cap_transfer_adjacent",
+      "file": "src/live_mod_bridge.rs",
+      "line": 1932,
+      "reason": "XMOD1-CORE staged atomic adjacent-transfer API for vanilla hopper push/pull; cap_bus_step holds the bus lock internally so external callers arrive via A1-SERVER consumers.",
+      "lane": "XMOD1-CORE",
+      "date": "2026-11-24"
+    },
+    {
+      "check": "dead_tick_or_bridge",
+      "symbol": "live_cap_transfer_fluid",
+      "file": "src/live_mod_bridge.rs",
+      "line": 1956,
+      "reason": "XMOD1-CORE staged fluid transfer API for cross-mod tank/pipe consumers; wired surface lands with the menus_and_items/main.rs lane.",
+      "lane": "XMOD1-CORE",
+      "date": "2026-11-24"
+    },
+    {
+      "check": "dead_tick_or_bridge",
+      "symbol": "live_cap_transfer_energy",
+      "file": "src/live_mod_bridge.rs",
+      "line": 1979,
+      "reason": "XMOD1-CORE staged FE transfer API for cross-mod generator/consumer endpoints; consumers land with the A1-SERVER lane.",
+      "lane": "XMOD1-CORE",
+      "date": "2026-11-24"
+    },
+    {
+      "check": "dead_tick_or_bridge",
+      "symbol": "live_cap_fill_fluid",
+      "file": "src/live_mod_bridge.rs",
+      "line": 2003,
+      "reason": "XMOD1-CORE staged fluid fill API (bucket/dispenser fills into bus tanks); consumers land with A1-SERVER outside this lane's allowed files.",
+      "lane": "XMOD1-CORE",
+      "date": "2026-11-24"
+    },
+    {
+      "check": "dead_tick_or_bridge",
+      "symbol": "live_cap_drain_fluid",
+      "file": "src/live_mod_bridge.rs",
+      "line": 2024,
+      "reason": "XMOD1-CORE staged fluid drain API (bucket pulls from bus tanks); consumers land with A1-SERVER outside this lane's allowed files.",
+      "lane": "XMOD1-CORE",
+      "date": "2026-11-24"
+    },
+    {
+      "check": "dead_tick_or_bridge",
+      "symbol": "live_cap_receive_energy",
+      "file": "src/live_mod_bridge.rs",
+      "line": 2043,
+      "reason": "XMOD1-CORE staged FE push API for adjacent generators/cables; consumers land with the A1-SERVER lane.",
+      "lane": "XMOD1-CORE",
+      "date": "2026-11-24"
+    },
+    {
+      "check": "dead_tick_or_bridge",
+      "symbol": "live_cap_register_slot_inventory",
+      "file": "src/live_mod_bridge.rs",
+      "line": 2063,
+      "reason": "XMOD1-CORE public endpoint registration for data-driven mod blocks; in-suite callers register via cap_sync_cell/ModOffloadProfile paths, external mods arrive with future lanes.",
+      "lane": "XMOD1-CORE",
+      "date": "2026-11-24"
+    },
+    {
+      "check": "dead_tick_or_bridge",
+      "symbol": "live_cap_register_fluid_tank",
+      "file": "src/live_mod_bridge.rs",
+      "line": 2083,
+      "reason": "XMOD1-CORE public fluid-tank endpoint registration for data-driven mod blocks; external registrars land with future lanes.",
+      "lane": "XMOD1-CORE",
+      "date": "2026-11-24"
+    },
+    {
+      "check": "dead_tick_or_bridge",
+      "symbol": "live_cap_register_energy_buffer",
+      "file": "src/live_mod_bridge.rs",
+      "line": 2096,
+      "reason": "XMOD1-CORE public energy-buffer endpoint registration for data-driven mod blocks; external registrars land with future lanes.",
+      "lane": "XMOD1-CORE",
+      "date": "2026-11-24"
+    },
+    {
+      "check": "dead_tick_or_bridge",
+      "symbol": "live_cap_unregister",
+      "file": "src/live_mod_bridge.rs",
+      "line": 2110,
+      "reason": "XMOD1-CORE endpoint teardown paired with the live_cap_register_* surface; block-break deregistration consumers land with A1-SERVER.",
+      "lane": "XMOD1-CORE",
+      "date": "2026-11-24"
+    },
+    {
+      "check": "dead_tick_or_bridge",
+      "symbol": "mob_fire_and_persistence_tick_step",
+      "file": "src/mob_despawn.rs",
+      "line": 365,
+      "reason": "Vanilla-mob batch 247b2f6c staged fire/persistence tick step; the mob tick-loop consumer lands in the owning lane's follow-up.",
+      "lane": "VANILLA-MOBS",
+      "date": "2026-11-24"
+    },
+    {
+      "check": "dead_tick_or_bridge",
+      "symbol": "player_mechanisms_random_block_tick",
+      "file": "src/player_mechanisms.rs",
+      "line": 5091,
+      "reason": "Vanilla-mob batch 247b2f6c staged random-block tick entry; the block-tick dispatch consumer lands in the owning lane's follow-up.",
+      "lane": "VANILLA-MOBS",
+      "date": "2026-11-24"
     }
   ]
 }
