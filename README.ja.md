@@ -3,13 +3,13 @@
   <h1>Megu</h1>
   <p><strong>Minecraft: Java Edition 1.21.1 向け クリーンルーム Rust サーバー＆ネイティブ GPU クライアント（Vulkan / DX12 / Metal）</strong></p>
   <p>
-    <a href="https://github.com/nekomario28/megu-mc/releases/latest"><img src="https://img.shields.io/github/v/release/nekomario28/megu-mc?include_prereleases&label=release&color=e05d44" alt="Latest Release"></a>
+    <a href="https://github.com/nekomario28/megu-mc/releases"><img src="https://img.shields.io/github/v/release/nekomario28/megu-mc?include_prereleases&label=release&color=e05d44" alt="Latest Release"></a>
     <a href="https://megu.megumin.tech/"><img src="https://img.shields.io/badge/minecraft-1.21.1%20(Protocol%20767)-2ea44f" alt="Minecraft 1.21.1"></a>
     <a href="LICENSE"><img src="https://img.shields.io/badge/license-LGPL--3.0--or--later-blue" alt="License: LGPL-3.0-or-later"></a>
     <a href="https://github.com/sponsors/nekomario28"><img src="https://img.shields.io/github/sponsors/nekomario28?label=Sponsors&color=db61a2" alt="GitHub Sponsors"></a>
   </p>
   <p>
-    <a href="README.md"><strong>English</strong></a> · <strong>日本語</strong> · <a href="https://megu.megumin.tech/"><strong>公式サイト</strong></a> · <a href="https://github.com/nekomario28/megu-mc/releases/latest"><strong>ダウンロード</strong></a> · <a href="docs/operator-guide.md"><strong>ドキュメント</strong></a>
+    <a href="README.md"><strong>English</strong></a> · <strong>日本語</strong> · <a href="https://megu.megumin.tech/"><strong>公式サイト</strong></a> · <a href="https://github.com/nekomario28/megu-mc/releases"><strong>ダウンロード</strong></a> · <a href="docs/operator-guide.md"><strong>ドキュメント</strong></a>
   </p>
 </div>
 
@@ -23,7 +23,7 @@ Megu は、省メモリ・高速起動・OpenGL 依存ゼロを目指して設�
 
 ## 使い方（プレイヤー向け）
 
-**[ダウンロードページ](https://megu.megumin.tech/#downloads)** または **[GitHub Releases](https://github.com/nekomario28/megu-mc/releases/latest)** から、プレイスタイルに合わせて **以下のカテゴリのどれか 1 つ** を選んで導入します（よく使われる順）：
+**[ダウンロードページ](https://megu.megumin.tech/#downloads)** または **[GitHub Releases](https://github.com/nekomario28/megu-mc/releases)** から、プレイスタイルに合わせて **以下のカテゴリのどれか 1 つ** を選んで導入します（よく使われる順）：
 
 ### 1. 公式ランチャー＆単体クライアント導入（`megu-installer` — GUI / CLI 両対応・Java 不要）
 
@@ -68,12 +68,15 @@ cd ./megu-server && ./megu --port 25565   # 引数なしの `megu` は既定で 
 ```
 
 - サーバー設定・外部公開時の注意点: **[運用ガイド](docs/operator-guide.md)** · **[SECURITY_NOTES.md](SECURITY_NOTES.md)**
+- ポート開放なしのフレンド招待・`FRL3` エンドツーエンド暗号化・信頼ストア: **[フレンドプレイと E2EE](docs/friend-play-e2ee.md)**
+- 既存 Fabric / NeoForge Mod・タグ・ケイパビリティ・Mod 入りセーブの扱い: **[Mod 互換性](docs/mod-compatibility.md)**
 - Docker ビルド: `docker build -f docker/Dockerfile .`
 
 ## 使い方（Mod・シェーダー作者向け）
 
 - データ駆動の Fabric / NeoForge Mod を `mods/` に配置するか、`megu-mod-check --scan-mods-dir ./mods`（またはブラウザ上の **[Modpack 診断](https://megu.megumin.tech/#checker)**）で JVM 不要の事前検査を行えます。
 - 制作ガイド・WGSL シェーダー仕様: **[Mod・シェーダー作者向けガイド](docs/mod-author-guide.md)**
+- 内包 JAR・タグ名前空間・Mod 同期・Mod 入りセーブの扱いの全体像: **[Mod 互換性](docs/mod-compatibility.md)**
 
 ## ソースからのビルド
 

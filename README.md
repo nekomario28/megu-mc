@@ -3,13 +3,13 @@
   <h1>Megu</h1>
   <p><strong>Clean-room Rust server &amp; native GPU client (Vulkan / DX12 / Metal) for Minecraft: Java Edition 1.21.1</strong></p>
   <p>
-    <a href="https://github.com/nekomario28/megu-mc/releases/latest"><img src="https://img.shields.io/github/v/release/nekomario28/megu-mc?include_prereleases&label=release&color=e05d44" alt="Latest Release"></a>
+    <a href="https://github.com/nekomario28/megu-mc/releases"><img src="https://img.shields.io/github/v/release/nekomario28/megu-mc?include_prereleases&label=release&color=e05d44" alt="Latest Release"></a>
     <a href="https://megu.megumin.tech/"><img src="https://img.shields.io/badge/minecraft-1.21.1%20(Protocol%20767)-2ea44f" alt="Minecraft 1.21.1"></a>
     <a href="LICENSE"><img src="https://img.shields.io/badge/license-LGPL--3.0--or--later-blue" alt="License: LGPL-3.0-or-later"></a>
     <a href="https://github.com/sponsors/nekomario28"><img src="https://img.shields.io/github/sponsors/nekomario28?label=Sponsors&color=db61a2" alt="GitHub Sponsors"></a>
   </p>
   <p>
-    <strong>English</strong> · <a href="README.ja.md"><strong>日本語</strong></a> · <a href="https://megu.megumin.tech/"><strong>Website</strong></a> · <a href="https://github.com/nekomario28/megu-mc/releases/latest"><strong>Downloads</strong></a> · <a href="docs/operator-guide.md"><strong>Docs</strong></a>
+    <strong>English</strong> · <a href="README.ja.md"><strong>日本語</strong></a> · <a href="https://megu.megumin.tech/"><strong>Website</strong></a> · <a href="https://github.com/nekomario28/megu-mc/releases"><strong>Downloads</strong></a> · <a href="docs/operator-guide.md"><strong>Docs</strong></a>
   </p>
 </div>
 
@@ -23,7 +23,7 @@ Megu is a free, open-source, clean-room Rust server and pure-`wgpu` native GPU c
 
 ## How To (Players)
 
-Choose **one** category below from the **[Downloads page](https://megu.megumin.tech/#downloads)** or **[GitHub Releases](https://github.com/nekomario28/megu-mc/releases/latest)** (ordered from most popular):
+Choose **one** category below from the **[Downloads page](https://megu.megumin.tech/#downloads)** or **[GitHub Releases](https://github.com/nekomario28/megu-mc/releases)** (ordered from most popular):
 
 ### 1. Official Launcher &amp; Standalone Client (`megu-installer` — GUI / CLI, No Java Needed)
 
@@ -68,12 +68,15 @@ cd ./megu-server && ./megu --port 25565   # bare `megu` defaults to port 25599
 ```
 
 - Documentation on configuring and hosting Megu: **[Operator Guide](docs/operator-guide.md)** · **[Security Notes](SECURITY_NOTES.md)**
+- Friend invites without port forwarding, `FRL3` end-to-end encryption and the trust store: **[Friend Play & E2EE](docs/friend-play-e2ee.md)**
+- How existing Fabric / NeoForge mods, tags, capabilities and modded saves are handled: **[Mod Compatibility](docs/mod-compatibility.md)**
 - Docker setup: `docker build -f docker/Dockerfile .`
 
 ## How To (Mod & Shader Authors)
 
 - Place data-driven Fabric / NeoForge mods in `mods/`, or pre-flight any modpack without a JVM using `megu-mod-check --scan-mods-dir ./mods` (or in your browser at **[megu.megumin.tech/#checker](https://megu.megumin.tech/#checker)**).
 - Authoring guide & WGSL shader specifications: **[Mod & Shader Author Guide](docs/mod-author-guide.md)**
+- End-to-end handling of embedded JARs, tag namespaces, mod sync and modded saves: **[Mod Compatibility](docs/mod-compatibility.md)**
 
 ## How To (Compiling From Source)
 

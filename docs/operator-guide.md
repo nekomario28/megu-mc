@@ -719,10 +719,19 @@ placeholder. A relay address is required with `--join-code`, supplied
 either by `--relay` or the `MEGU_RELAY` environment variable. Invite
 codes and host credentials do not travel the link in clear: guests prove
 possession of the code with a nonce-bound HMAC (`key_id`/`tag`), and
-hosts revoke with a MAC instead of resending their session key. The
-inner Minecraft stream itself is forwarded opaquely — the relay cannot
-read it, but an active MITM between peer and relay could still splice
-it; treat `FRL2` as proof-of-possession, not a tunnel cipher.
+hosts revoke with a MAC instead of resending their session key.
+
+`FRL2` is admission control, not a cipher. The end-to-end layer is `FRL3`
+([../proto/src/frl_e2ee.rs](../proto/src/frl_e2ee.rs)): an X25519 /
+HKDF-SHA256 / ChaCha20-Poly1305 record layer carried *inside* `StreamData`,
+with a 256-bit `megu-id:` static identity
+([../client-app/src/friends_store.rs](../client-app/src/friends_store.rs),
+`megu-identity.key`, `megu-friends.toml`), a six-digit SAS and a strictly
+one-hop friend allowlist. That layer is implemented in the client session
+(`FriendHostSession::register_e2ee_friends`) but is **not yet exposed as a
+CLI flag or an in-game screen** — `--join-code` still drives `FRL2`
+admission alone. Read [friend-play-e2ee.md](friend-play-e2ee.md) before
+describing friend play as encrypted to players.
 
 **GPU backend selection.** The native client supports the following
 backend preferences. `classic-low-spec` selects the 16 KiB UBO-batched
@@ -833,5 +842,8 @@ service.
 
 See also: [docs/development.md](development.md) for contributor setup and
 test tiers, [docs/architecture-crates.md](architecture-crates.md) for the
-crate map, and [tools/README.md](../tools/README.md) for the diagnostics
-and fixture tooling.
+crate map, [docs/mod-compatibility.md](mod-compatibility.md) for embedded
+JARs, loader tag namespaces, hash-verified mod sync and modded-save
+preservation, [docs/friend-play-e2ee.md](friend-play-e2ee.md) for friend
+invites and the `FRL3` record layer, and [tools/README.md](../tools/README.md)
+for the diagnostics and fixture tooling.
