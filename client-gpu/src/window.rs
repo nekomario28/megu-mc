@@ -601,6 +601,9 @@ pub struct GpuApp {
     /// spawns (`--gameDir`/`--assetsDir`/`--assetIndex`/`--version`/
     /// `--resourcePackDir`).
     session_paths: SessionPaths,
+    /// Confirmed, non-blocking server-scoped Modrinth synchronization.
+    mod_sync_worker: Option<crate::mod_sync_auto::ModSyncWorker>,
+    last_server_address: Option<String>,
     /// Boot-time recipe-browser ingest report (mod JARs + vanilla client
     /// JAR + datapacks); empty when no `--gameDir` was supplied.
     recipe_ingest: crate::recipe_ingest::IngestReport,
@@ -719,6 +722,7 @@ impl GpuApp {
             asset_index: config.asset_index.clone(),
             version_id: config.version_id.clone(),
             resource_pack_dir: config.resource_pack_dir.clone(),
+            server_mods_dir: None,
         };
         // Load options before starting quick play so the integrated host
         // receives the same fair-play policy as worlds started from the UI.
@@ -858,6 +862,8 @@ impl GpuApp {
             settings_path,
             inventory_sort: InventorySortState::default(),
             session_paths,
+            mod_sync_worker: None,
+            last_server_address: None,
             recipe_ingest: crate::recipe_ingest::IngestReport::default(),
             title_branding: TitleBrandingAssets::fallback(),
             splash_seed,
@@ -1338,6 +1344,15 @@ impl GpuApp {
             UiAction::JoinServer { address, port } => {
                 self.connect_to(address.clone(), *port);
             }
+            UiAction::ConfirmModSyncDownload => self.start_mod_sync_download(),
+            UiAction::CancelModSync => {
+                if let Some(worker) = &self.mod_sync_worker {
+                    worker.cancel();
+                }
+                self.mod_sync_worker = None;
+                self.ui.go_title();
+            }
+            UiAction::SaveInstantReplay => self.save_instant_replay(),
             UiAction::SaveServer {
                 name,
                 address,
@@ -1418,6 +1433,38 @@ impl GpuApp {
             UiAction::RecipeBrowser(action) => self.dispatch_recipe_browser_action(action),
             _ => {}
         }
+    }
+
+    /// Enter the mismatch flow when a caller has a structured server mod manifest.
+    pub fn open_mod_sync_prompt(
+        &mut self,
+        server_address: String,
+        required: &[crate::mod_sync_auto::ModRequirement],
+        installed: &std::collections::BTreeMap<String, String>,
+    ) {
+        self.last_server_address = Some(server_address.clone());
+        let mismatches = crate::mod_sync_auto::compute_missing_mods(required, installed);
+        let rows = mismatches.into_iter().filter_map(|entry| {
+            let requirement = required.iter().find(|requirement| requirement.mod_id == entry.mod_id)?;
+            let installed_version = match entry.kind {
+                crate::mod_sync_auto::ModMismatchKind::Missing => None,
+                crate::mod_sync_auto::ModMismatchKind::VersionMismatch { installed, .. } => Some(installed),
+            };
+            Some(megu_ui::state::ModSyncPromptRow {
+                mod_id: entry.mod_id,
+                required_version: requirement.required_version.clone(),
+                installed_version,
+                sha512: requirement.sha512.clone(),
+                sha256: requirement.sha256.clone(),
+                modrinth_slug: requirement.modrinth_slug.clone(),
+            })
+        }).collect();
+        self.ui.open_mod_sync_prompt(megu_ui::state::ModSyncPromptState {
+            server_address,
+            rows,
+            progress_label: "Waiting for confirmation".into(),
+            progress_percent: None,
+        });
     }
 
     /// Death-screen `Title Screen` button (also the only escape on
@@ -1763,6 +1810,11 @@ impl GpuApp {
 
     /// Spawn a session against `host:port` and switch the UI into gameplay.
     fn connect_to(&mut self, host: String, port: u16) {
+        let endpoint = format!("{host}:{port}");
+        if self.last_server_address.as_deref() != Some(endpoint.as_str()) {
+            self.session_paths.server_mods_dir = None;
+        }
+        self.last_server_address = Some(endpoint);
         let retained_chat = retained_chat_on_reconnect(
             self.ui.settings.qol.retain_chat_on_reconnect,
             &self.ui.hud.chat_lines,
@@ -1802,6 +1854,81 @@ impl GpuApp {
         }
         self.paused = false;
         self.maybe_regrab();
+    }
+
+    fn start_mod_sync_download(&mut self) {
+        if self.mod_sync_worker.is_some() {
+            return;
+        }
+        if megu_ui::state::parse_server_address(&self.ui.mod_sync_prompt.server_address).is_none() {
+            self.ui.mod_sync_prompt.progress_label = "Invalid server address".into();
+            return;
+        }
+        let requirements = self.ui.mod_sync_prompt.rows.iter().map(|row| crate::mod_sync_auto::ModRequirement {
+            mod_id: row.mod_id.clone(),
+            required_version: row.required_version.clone(),
+            sha512: row.sha512.clone(),
+            sha256: row.sha256.clone(),
+            modrinth_slug: row.modrinth_slug.clone(),
+        }).collect();
+        let game_dir = self.session_paths.game_dir.clone().unwrap_or_else(|| std::path::PathBuf::from("."));
+        let server_key = self.ui.mod_sync_prompt.server_address.clone();
+        self.mod_sync_worker = Some(crate::mod_sync_auto::spawn_modrinth_mod_sync(requirements, game_dir, server_key));
+        self.ui.mod_sync_prompt.progress_label = "Resolving mods on Modrinth...".into();
+        self.ui.mod_sync_prompt.progress_percent = None;
+    }
+
+    fn poll_mod_sync_worker(&mut self) {
+        use crate::mod_sync_auto::ModSyncProgress as P;
+        let Some(progress) = self.mod_sync_worker.as_ref().map(|worker| worker.task.progress()) else { return; };
+        match progress {
+            P::Resolving => {
+                self.ui.mod_sync_prompt.progress_label = "Resolving mods on Modrinth...".into();
+                self.ui.mod_sync_prompt.progress_percent = None;
+            }
+            P::Downloading { mod_id, file_index, total_files, downloaded_bytes, total_bytes } => {
+                self.ui.mod_sync_prompt.progress_label = format!("Downloading {mod_id} ({file_index}/{total_files}) - {downloaded_bytes} bytes");
+                self.ui.mod_sync_prompt.progress_percent = total_bytes.filter(|size| *size > 0).map(|size| ((downloaded_bytes.saturating_mul(100) / size).min(100)) as u8);
+            }
+            P::Verifying { mod_id } => {
+                self.ui.mod_sync_prompt.progress_label = format!("Verifying {mod_id}...");
+                self.ui.mod_sync_prompt.progress_percent = None;
+            }
+            P::Failed(reason) => {
+                self.mod_sync_worker = None;
+                self.ui.mod_sync_prompt.progress_label = reason;
+                self.ui.mod_sync_prompt.progress_percent = None;
+            }
+            P::Ready { mods_dir, downloaded_files } => {
+                self.mod_sync_worker = None;
+                self.session_paths.server_mods_dir = Some(mods_dir);
+                let endpoint = megu_ui::state::parse_server_address(&self.ui.mod_sync_prompt.server_address);
+                self.ui.mod_sync_prompt.progress_label = format!("Verified {downloaded_files} mods; reconnecting...");
+                if let Some((host, port)) = endpoint { self.connect_to(host, port); }
+                else { self.ui.mod_sync_prompt.progress_label = "Invalid server address".into(); }
+            }
+        }
+    }
+
+    fn save_instant_replay(&mut self) {
+        let game_dir = self.session_paths.game_dir.as_deref().unwrap_or_else(|| std::path::Path::new("."));
+        let Some(live) = self.live.as_ref() else {
+            self.status_line("No live session is available to save a replay");
+            return;
+        };
+        if live.replay_ring.frames().is_empty() {
+            self.status_line("No replay packets have been captured in this session");
+            return;
+        }
+        let replay_dir = game_dir.join("replays");
+        let next = std::fs::read_dir(&replay_dir).ok().into_iter().flatten().flatten()
+            .filter_map(|entry| entry.file_name().to_str().and_then(|name| name.strip_prefix("replay-")).and_then(|name| name.strip_suffix(".megu-replay")).and_then(|number| number.parse::<u64>().ok()))
+            .max().unwrap_or(0).saturating_add(1);
+        let path = replay_dir.join(format!("replay-{next}.megu-replay"));
+        match live.replay_ring.save_to_file(&path, self.config.mc_version.parse().unwrap_or(767), self.last_server_address.as_deref().unwrap_or("local world")) {
+            Ok(summary) => self.status_line(format!("Saved 60s replay ({} frames, {:.1} KB)", summary.frame_count, summary.payload_bytes as f64 / 1024.0)),
+            Err(error) => self.status_line(format!("Replay save failed: {error}")),
+        }
     }
 
     /// Launch the integrated server for world `world` (validated by
@@ -2915,9 +3042,9 @@ impl GpuApp {
         }
     }
 
-    /// `PlayEvent::Disconnect` / an unexpected session drop: extract the
-    /// exact reason, drop the live session and every in-game overlay,
-    /// and land on `Screen::Disconnected` with the reason on screen.
+    /// `PlayEvent::Disconnect` / an unexpected session drop: route a
+    /// recognizable missing-mod manifest to the explicit Modrinth prompt,
+    /// otherwise show the exact disconnect reason.
     /// Called after `live.poll` each frame so kicks surface within one
     /// frame; the pause/container/chat/cursor state cannot survive it.
     fn sync_disconnected_screen(&mut self) {
@@ -2925,6 +3052,7 @@ impl GpuApp {
             Some(SessionStatus::Disconnected(reason)) => reason.clone(),
             _ => return,
         };
+        let missing_mods = parse_missing_mod_disconnect(&reason);
         self.live = None;
         self.singleplayer_server = None;
         self.container_screen = None;
@@ -2933,11 +3061,17 @@ impl GpuApp {
         self.advancements_open = false;
         self.paused = false;
         self.keys = Keys::default();
-        self.ui.show_disconnected(DisconnectedScreenState {
-            title: "Disconnected".to_owned(),
-            reason,
-        });
-        debug_assert_eq!(self.ui.screen, Screen::Disconnected);
+        if let Some(requirements) = missing_mods.filter(|items| !items.is_empty()) {
+            let address = self.last_server_address.clone().unwrap_or_default();
+            self.open_mod_sync_prompt(address, &requirements, &std::collections::BTreeMap::new());
+            debug_assert_eq!(self.ui.screen, Screen::ModSyncPrompt);
+        } else {
+            self.ui.show_disconnected(DisconnectedScreenState {
+                title: "Disconnected".to_owned(),
+                reason,
+            });
+            debug_assert_eq!(self.ui.screen, Screen::Disconnected);
+        }
         self.maybe_regrab();
     }
 
@@ -3619,6 +3753,10 @@ impl GpuApp {
 
     fn handle_key(&mut self, code: KeyCode, state: ElementState, event_loop: &ActiveEventLoop) {
         let pressed = state == ElementState::Pressed;
+        if pressed && code == KeyCode::F8 {
+            self.save_instant_replay();
+            return;
+        }
         if let Some(index) = self.ui.capturing_key_binding {
             if pressed {
                 if code == KeyCode::Escape {
@@ -3919,6 +4057,39 @@ impl GpuApp {
             .surface
             .configure(&active.renderer.gpu().device, &cfg);
     }
+}
+
+/// Parse the simple `missing mods: id@version, ...` kick form used by
+/// server-side dependency gates. Unknown prose stays on the ordinary
+/// disconnect screen instead of being guessed into install requests.
+fn parse_missing_mod_disconnect(reason: &str) -> Option<Vec<crate::mod_sync_auto::ModRequirement>> {
+    let lower = reason.to_ascii_lowercase();
+    let marker = ["missing required mods:", "missing mods:", "mod mismatch:"]
+        .iter()
+        .find_map(|marker| lower.find(marker).map(|at| (at, marker.len())))?;
+    let tail = reason.get(marker.0 + marker.1..)?;
+    let tail = tail.split(['\n', '\r']).next().unwrap_or(tail);
+    let mut requirements = Vec::new();
+    for entry in tail.split([',', ';']) {
+        let entry = entry.trim().trim_matches(|c: char| matches!(c, '.' | ')' | ']' | '}' | '"' | '\''));
+        let Some((mod_id, version)) = entry.split_once('@').or_else(|| entry.split_once('=')) else { continue; };
+        let mod_id = mod_id.trim();
+        let version = version.trim().trim_matches(|c: char| matches!(c, '.' | ')' | ']' | '}' | '"' | '\''));
+        if mod_id.is_empty() || mod_id.len() > 128 || version.is_empty() || version.len() > 128
+            || !mod_id.bytes().all(|b| b.is_ascii_alphanumeric() || matches!(b, b'_' | b'-' | b'.' | b':'))
+            || !version.bytes().all(|b| b.is_ascii_alphanumeric() || matches!(b, b'_' | b'-' | b'.' | b'+'))
+        { continue; }
+        let slug = mod_id.rsplit(':').next().filter(|slug| !slug.is_empty()).map(str::to_owned);
+        requirements.push(crate::mod_sync_auto::ModRequirement {
+            mod_id: mod_id.to_owned(),
+            required_version: version.to_owned(),
+            sha512: None,
+            sha256: None,
+            modrinth_slug: slug,
+        });
+        if requirements.len() >= crate::mod_sync_auto::MAX_MODS { break; }
+    }
+    (!requirements.is_empty()).then_some(requirements)
 }
 
 /// The effective surface configuration for the current size/caps under the
@@ -4260,6 +4431,7 @@ impl ApplicationHandler for GpuApp {
             event_loop.exit();
             return;
         }
+        self.poll_mod_sync_worker();
         // Vanilla-JAR bootstrap poll is cheap and non-blocking; it runs
         // even while occluded so a download finishing in the background
         // still lands `Ready` and re-arms asset discovery.
@@ -5135,6 +5307,28 @@ pub fn run(config: GpuCliConfig) -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn missing_mod_disconnect_text_opens_structured_prompt() {
+        let requirements = parse_missing_mod_disconnect(
+            "Missing required mods: fabric-api@0.102.0, sodium@0.6.5",
+        ).expect("recognizable dependency kick");
+        assert_eq!(requirements.len(), 2);
+        assert_eq!(requirements[0].mod_id, "fabric-api");
+        assert_eq!(requirements[0].required_version, "0.102.0");
+        assert_eq!(requirements[1].modrinth_slug.as_deref(), Some("sodium"));
+        assert!(parse_missing_mod_disconnect("Kicked by an operator.").is_none());
+
+        let mut app = GpuApp::new(GpuCliConfig::default());
+        app.last_server_address = Some("example.test:25565".into());
+        let mut live = LiveSession::offline_with_null_audio();
+        live.status = SessionStatus::Disconnected("Missing mods: example@1.2.3".into());
+        app.live = Some(live);
+        app.sync_disconnected_screen();
+        assert_eq!(app.ui.screen, Screen::ModSyncPrompt);
+        assert_eq!(app.ui.mod_sync_prompt.server_address, "example.test:25565");
+        assert_eq!(app.ui.mod_sync_prompt.rows.len(), 1);
+    }
 
     #[test]
     fn remapped_key_binding_routes_to_vanilla_action_and_persists_capture_name() {

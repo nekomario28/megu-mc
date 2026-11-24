@@ -174,6 +174,8 @@ pub enum Screen {
     Friends,
     /// Explicit consent gate before a server's mod list is applied.
     ModSyncConsent,
+    /// Per-server missing/version-mismatched mod diagnosis and download.
+    ModSyncPrompt,
     /// Integrated ModMenu-style Mods & Packs manager — draw and input are
     /// delegated to [`UiState::mod_menu`].
     ModMenu,
@@ -1382,6 +1384,26 @@ pub struct ModSyncEntry {
     pub change: ModSyncChange,
 }
 
+/// One row in the one-screen reconnect diagnostic.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ModSyncPromptRow {
+    pub mod_id: String,
+    pub required_version: String,
+    pub installed_version: Option<String>,
+    pub sha512: Option<String>,
+    pub sha256: Option<String>,
+    pub modrinth_slug: Option<String>,
+}
+
+/// Host supplied display state for the explicit Modrinth download prompt.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct ModSyncPromptState {
+    pub server_address: String,
+    pub rows: Vec<ModSyncPromptRow>,
+    pub progress_label: String,
+    pub progress_percent: Option<u8>,
+}
+
 impl ModSyncEntry {
     pub fn added(name: impl Into<String>, sha256_hex: impl Into<String>) -> Self {
         Self {
@@ -1892,6 +1914,10 @@ pub enum UiAction {
     ApplyModSync(Vec<ModSyncEntry>),
     /// Player explicitly requested the missing dependencies from Modrinth.
     DownloadMissingFromModrinth(Vec<String>),
+    /// Player confirmed downloading the listed requirements and reconnecting.
+    ConfirmModSyncDownload,
+    /// Player cancelled the mod mismatch recovery flow.
+    CancelModSync,
     /// Player declined the pending mod sync.
     DeclineModSync,
     /// Player explicitly confirmed `"Send OK?"` on the crash screen.
@@ -1905,6 +1931,8 @@ pub enum UiAction {
     /// hardcore deaths): the host drops the live session and lands on
     /// [`Screen::Title`].
     LeaveWorld,
+    /// Save the current bounded packet history to the game directory.
+    SaveInstantReplay,
     /// The integrated Mods & Packs screen produced a host action (apply
     /// staged toggles, open the mods folder, fetch deps, ...). `Close`
     /// and `OpenUrl` are flattened into [`UiAction::Back`] /
@@ -2041,11 +2069,14 @@ pub enum WidgetId {
     ModSyncAccept,
     ModSyncDecline,
     ModSyncDownloadMissing,
+    ModSyncPromptConfirm,
+    ModSyncPromptCancel,
     // Pause
     PauseBackToGame,
     PauseSettings,
     PauseStatistics,
     PauseRecipeBrowser,
+    PauseSaveReplay,
     PauseInvite,
     PauseSaveQuit,
     PauseReportBug,
@@ -2366,6 +2397,8 @@ pub struct UiState {
     pub pending_mod_sync: Vec<ModSyncEntry>,
     /// Missing dependency IDs available for an explicit Modrinth request.
     pub missing_mod_deps: Vec<String>,
+    /// Mismatch diagnosis and download progress shown by `ModSyncPrompt`.
+    pub mod_sync_prompt: ModSyncPromptState,
     /// `Some(true)` = accepted, `Some(false)` = declined.
     pub mod_sync_decision: Option<bool>,
 
@@ -2455,6 +2488,7 @@ impl Default for UiState {
             join_error: false,
             pending_mod_sync: Vec::new(),
             missing_mod_deps: Vec::new(),
+            mod_sync_prompt: ModSyncPromptState::default(),
             mod_sync_decision: None,
             hud: HudState::default(),
             death: crate::death_screen::DeathScreenState::default(),
@@ -2795,6 +2829,15 @@ impl UiState {
         self.disconnected = state;
         self.nav_stack.clear();
         self.screen = Screen::Disconnected;
+        self.modal = None;
+        self.focus_index = None;
+    }
+
+    /// Open the explicit mod mismatch recovery screen and discard stale navigation.
+    pub fn open_mod_sync_prompt(&mut self, state: ModSyncPromptState) {
+        self.mod_sync_prompt = state;
+        self.nav_stack.clear();
+        self.screen = Screen::ModSyncPrompt;
         self.modal = None;
         self.focus_index = None;
     }
@@ -3607,6 +3650,11 @@ impl UiState {
                     )]
                 }
             }
+            WidgetId::ModSyncPromptConfirm => vec![UiAction::ConfirmModSyncDownload],
+            WidgetId::ModSyncPromptCancel => {
+                self.go_title();
+                vec![UiAction::CancelModSync]
+            }
 
             WidgetId::PauseBackToGame => {
                 self.back();
@@ -3619,6 +3667,7 @@ impl UiState {
             }
             WidgetId::PauseStatistics => vec![UiAction::ShowStatistics],
             WidgetId::PauseRecipeBrowser => self.open_recipe_browser(),
+            WidgetId::PauseSaveReplay => vec![UiAction::SaveInstantReplay],
             WidgetId::PauseInvite => {
                 self.navigate(Screen::Friends);
                 vec![UiAction::OpenScreen(Screen::Friends)]
@@ -3975,3 +4024,43 @@ fn clamp_i(v: i32, lo: i32, hi: i32) -> u8 {
 
 /// Re-export for tests/embedders: privacy redaction of free-form text.
 pub use megu_core::crash_report::redact_sensitive as ui_redact_sensitive;
+
+#[cfg(test)]
+mod mod_sync_prompt_tests {
+    use super::*;
+
+    #[test]
+    fn prompt_actions_are_explicit_and_cancellation_returns_to_title() {
+        let mut ui = UiState::default();
+        ui.open_mod_sync_prompt(ModSyncPromptState {
+            server_address: "example.test:25565".into(),
+            rows: vec![ModSyncPromptRow {
+                mod_id: "example".into(),
+                required_version: "2".into(),
+                installed_version: None,
+                sha512: None,
+                sha256: None,
+                modrinth_slug: None,
+            }],
+            progress_label: "Waiting for confirmation".into(),
+            progress_percent: None,
+        });
+        assert_eq!(ui.screen, Screen::ModSyncPrompt);
+        let list = ui.render(800, 600);
+        assert!(list.commands.iter().any(|command| matches!(command, crate::draw::UiCommand::Text { text, .. } if text.contains("example.test"))));
+        assert!(ui.hit_regions.iter().any(|region| region.id == WidgetId::ModSyncPromptConfirm));
+        assert!(ui.hit_regions.iter().any(|region| region.id == WidgetId::ModSyncPromptCancel));
+        assert_eq!(ui.activate(WidgetId::ModSyncPromptConfirm, 0, 0, UiRect::new(0, 0, 0, 0)), vec![UiAction::ConfirmModSyncDownload]);
+        assert_eq!(ui.activate(WidgetId::ModSyncPromptCancel, 0, 0, UiRect::new(0, 0, 0, 0)), vec![UiAction::CancelModSync]);
+        assert_eq!(ui.screen, Screen::Title);
+    }
+
+    #[test]
+    fn pause_replay_widget_emits_save_action() {
+        let mut ui = UiState { screen: Screen::Pause, ..UiState::default() };
+        let list = ui.render(800, 600);
+        assert!(list.commands.iter().any(|command| matches!(command, crate::draw::UiCommand::Text { text, .. } if text.contains("Save 60s Instant Replay"))));
+        assert!(ui.hit_regions.iter().any(|region| region.id == WidgetId::PauseSaveReplay));
+        assert_eq!(ui.activate(WidgetId::PauseSaveReplay, 0, 0, UiRect::new(0, 0, 0, 0)), vec![UiAction::SaveInstantReplay]);
+    }
+}

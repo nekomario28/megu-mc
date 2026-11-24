@@ -69,6 +69,7 @@ pub fn layout_screen_into(
         Screen::AboutMegu => about_megu(&mut ctx),
         Screen::Friends => friends(&mut ctx),
         Screen::ModSyncConsent => mod_sync(&mut ctx),
+        Screen::ModSyncPrompt => mod_sync_prompt(&mut ctx),
         Screen::ModMenu => embedded_mod_menu(&mut ctx),
         Screen::RecipeBrowser => embedded_recipe_browser(&mut ctx),
         Screen::InGameHud => hud(&mut ctx),
@@ -2066,6 +2067,42 @@ fn mod_sync(ctx: &mut Ctx) {
     }
 }
 
+fn mod_sync_prompt(ctx: &mut Ctx) {
+    ctx.menu_background();
+    let lang = ctx.lang;
+    let cx = ctx.w / 2;
+    ctx.ctext(cx, 8, 2, pal::TEXT, tr(lang, "Mod mismatch", "Mod mismatch"));
+    ctx.hud_text(cx - 190, 30, 1, pal::TEXT_DIM, &ctx.state.mod_sync_prompt.server_address, 48);
+    let pw = 400.min(ctx.w - 8).max(40);
+    let px = cx - pw / 2;
+    let rows = &ctx.state.mod_sync_prompt.rows;
+    let panel_h = (44 + rows.len().min(8) as i32 * 17).min((ctx.h - 112).max(44));
+    ctx.panel(px, 44, pw, panel_h);
+    ctx.text(px + 8, 48, 1, pal::TEXT_DIM, "MOD ID          REQUIRED       INSTALLED");
+    for (i, row) in rows.iter().take(8).enumerate() {
+        let y = 64 + i as i32 * 17;
+        let installed = row.installed_version.as_deref().unwrap_or("missing");
+        ctx.hud_text(px + 8, y, 1, pal::TEXT, &row.mod_id, 16);
+        ctx.hud_text(px + 144, y, 1, pal::WARNING, &row.required_version, 10);
+        ctx.hud_text(px + 240, y, 1, if row.installed_version.is_some() { pal::DANGER } else { pal::TEXT_DIM }, installed, 16);
+    }
+    if rows.len() > 8 {
+        ctx.text(px + 8, 44 + panel_h - 10, 1, pal::TEXT_DIM, &format!("... {} more", rows.len() - 8));
+    }
+    let progress_y = (44 + panel_h + 8).min(ctx.h - 62);
+    ctx.hud_text(px + 8, progress_y, 1, pal::TEXT, &ctx.state.mod_sync_prompt.progress_label, 48);
+    if let Some(percent) = ctx.state.mod_sync_prompt.progress_percent {
+        let x = px + 8;
+        let y = progress_y + 12;
+        let w = (pw - 16).max(0);
+        ctx.fill(x, y, w, 6, pal::TEXT_DARK);
+        ctx.fill(x, y, w * i32::from(percent.min(100)) / 100, 6, pal::ACCENT);
+    }
+    let by = ctx.h - 44;
+    ctx.btn(WidgetId::ModSyncPromptConfirm, lr(cx - 170, by, 220, 22), tr(lang, "Download from Modrinth & Reconnect", "Download & Reconnect"));
+    ctx.btn(WidgetId::ModSyncPromptCancel, lr(cx + 58, by, 112, 22), tr(lang, "Cancel", "Cancel"));
+}
+
 // ---------------------------------------------------------------------------
 // Embedded screens (ModMenu + recipe browser)
 //
@@ -3230,13 +3267,13 @@ fn pause(ctx: &mut Ctx) {
 
     let bw = 200.min(ctx.w - 8).max(24);
     let x = cx - bw / 2;
-    // Six buttons must clear the Report-Bug corner link at h-26; when
+    // Seven buttons must clear the Report-Bug corner link at h-26; when
     // the window is too short the stack hugs the top and the link hides.
     let wants_report = !ctx.state.report_url.is_empty();
     let reserve = if wants_report { 28 } else { 2 };
-    let step = 24.min((ctx.h - reserve - 20 - 76) / 5).max(4);
+    let step = 24.min((ctx.h - reserve - 20 - 84) / 6).max(4);
     let bh = 20.min(step);
-    let mut y = 76.min(ctx.h - reserve - 5 * step - bh).max(2);
+    let mut y = 76.min(ctx.h - reserve - 6 * step - bh).max(2);
     ctx.btn(
         WidgetId::PauseBackToGame,
         lr(x, y, bw, bh),
@@ -3265,6 +3302,12 @@ fn pause(ctx: &mut Ctx) {
         WidgetId::PauseInvite,
         lr(x, y, bw, bh),
         tr(lang, "Invite Friend", "フレンドを招待"),
+    );
+    y += step;
+    ctx.btn(
+        WidgetId::PauseSaveReplay,
+        lr(x, y, bw, bh),
+        tr(lang, "Save 60s Instant Replay", "Save 60s Replay"),
     );
     y += step;
     ctx.btn(

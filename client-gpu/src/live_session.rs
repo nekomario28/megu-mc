@@ -259,6 +259,8 @@ pub struct SessionPaths {
     /// `--resourcePackDir` — the launcher's pack folder; the env var
     /// `MEGU_RESOURCE_PACK_DIR` keeps its higher priority.
     pub resource_pack_dir: Option<PathBuf>,
+    /// Per-server verified mod JARs; kept outside the global `mods/` folder.
+    pub server_mods_dir: Option<PathBuf>,
 }
 
 /// One advancement tree entry mirrored for the `L`-key overlay: display
@@ -1320,6 +1322,9 @@ pub struct LiveSession {
     outgoing: SyncSender<WorkerCommand>,
     _offline_sender: Option<SyncSender<WorkerMessage>>,
     pub status: SessionStatus,
+    /// Bounded packet history reserved for instant replay capture.
+    pub replay_ring: crate::replay_ring::PacketReplayRing,
+    replay_started: Instant,
     pub world: WorldState,
     audio: AudioRuntime,
     acoustic_world: WorldAcousticSnapshot,
@@ -1790,6 +1795,105 @@ pub struct LiveSession {
 /// settings value through `connect_with_paths_and_auth` instead.
 pub const CONNECT_VIEW_DISTANCE: i8 = 10;
 
+/// Fixed stack encoder for replay event bodies. Large collections are reduced
+/// to bounded counts or prefixes before their data enters the 4 MiB ring.
+struct ReplayEventEncoder {
+    bytes: [u8; 512],
+    len: usize,
+}
+
+impl ReplayEventEncoder {
+    fn new() -> Self { Self { bytes: [0; 512], len: 0 } }
+    fn put(&mut self, value: &[u8]) {
+        let take = value.len().min(self.bytes.len().saturating_sub(self.len));
+        self.bytes[self.len..self.len + take].copy_from_slice(&value[..take]);
+        self.len += take;
+    }
+    fn i32(&mut self, value: i32) { self.put(&value.to_le_bytes()); }
+    fn u32(&mut self, value: u32) { self.put(&value.to_le_bytes()); }
+    fn i64(&mut self, value: i64) { self.put(&value.to_le_bytes()); }
+    fn f32(&mut self, value: f32) { self.put(&value.to_le_bytes()); }
+    fn f64(&mut self, value: f64) { self.put(&value.to_le_bytes()); }
+    fn flag(&mut self, value: bool) { self.put(&[u8::from(value)]); }
+    fn bytes(&mut self, value: &[u8]) {
+        let len = value.len().min(u16::MAX as usize).min(self.bytes.len().saturating_sub(self.len + 2));
+        self.put(&(len as u16).to_le_bytes());
+        self.put(&value[..len]);
+    }
+    fn text(&mut self, value: &str) { self.bytes(value.as_bytes()); }
+    fn finish(self, tag: u16) -> (i32, [u8; 512], usize) {
+        (0x4d52_0000 | i32::from(tag), self.bytes, self.len)
+    }
+}
+
+/// Stable compact event tags (0x4d52_0000 | tag) and little-endian bodies.
+/// This records decoded gameplay events without changing the packet decoder
+/// or retaining its potentially large temporary packet allocations.
+fn compact_replay_event(event: &PlayEvent) -> Option<(i32, [u8; 512], usize)> {
+    use PlayEvent as E;
+    let mut out = ReplayEventEncoder::new();
+    let tag = match event {
+        E::JoinGame { entity_id, dimension, hardcore } => { out.i32(*entity_id); out.text(&dimension.name); out.i32(dimension.min_y); out.i32(dimension.height); out.flag(dimension.has_skylight); out.flag(*hardcore); 1 }
+        E::Respawn { dimension } => { out.text(&dimension.name); out.i32(dimension.min_y); out.i32(dimension.height); out.flag(dimension.has_skylight); 2 }
+        E::KeepAlive(id) => { out.i64(*id); 3 }
+        E::Teleport(t) => { out.f64(t.x); out.f64(t.y); out.f64(t.z); out.f32(t.yaw); out.f32(t.pitch); out.i32(t.flags); out.i32(t.teleport_id); 4 }
+        E::ChunkBatchStart => 5,
+        E::ChunkData(chunk) => {
+            out.i32(chunk.cx); out.i32(chunk.cz); out.u32(chunk.sections.len().min(u32::MAX as usize) as u32);
+            let mut digest = 0xcbf2_9ce4_8422_2325u64;
+            for section in &chunk.sections { out.i32(i32::from(section.non_air)); for state in section.states.iter() { digest ^= u64::from(*state); digest = digest.wrapping_mul(0x100_0000_01b3); } }
+            out.put(&digest.to_le_bytes()); 6
+        }
+        E::ChunkBatchFinished(count) => { out.i32(*count); 7 }
+        E::UpdateLight { cx, cz, light } => { out.i32(*cx); out.i32(*cz); out.u32(light.sky_arrays.len() as u32); out.u32(light.block_arrays.len() as u32); 8 }
+        E::BlockUpdate { pos, state_id } => { for v in pos { out.i32(*v); } out.u32(*state_id); 9 }
+        E::SectionBlocksUpdate(entries) => { let n = entries.len().min(24); out.put(&[n as u8]); for (pos, state) in entries.iter().take(n) { for v in pos { out.i32(*v); } out.u32(*state); } 10 }
+        E::UnloadChunk { cx, cz } => { out.i32(*cx); out.i32(*cz); 11 }
+        E::SetCenterChunk { cx, cz } => { out.i32(*cx); out.i32(*cz); 12 }
+        E::SetHealth { health, food, saturation } => { out.f32(*health); out.i32(*food); out.f32(*saturation); 13 }
+        E::SystemChat { text, overlay } => { out.text(text); out.flag(*overlay); 14 }
+        E::AddEntity { eid, uuid, entity_type, x, y, z, pitch, yaw, head_yaw, data, vx, vy, vz } => { out.i32(*eid); out.put(uuid); out.i32(*entity_type); out.f64(*x); out.f64(*y); out.f64(*z); out.f32(*pitch); out.f32(*yaw); out.f32(*head_yaw); out.i32(*data); out.f64(*vx); out.f64(*vy); out.f64(*vz); 15 }
+        E::RemoveEntities { eids } => { let n = eids.len().min(80); out.put(&[n as u8]); for eid in eids.iter().take(n) { out.i32(*eid); } 16 }
+        E::MoveEntityPos { eid, dx, dy, dz, on_ground } => { out.i32(*eid); out.f64(*dx); out.f64(*dy); out.f64(*dz); out.flag(*on_ground); 17 }
+        E::MoveEntityPosRot { eid, dx, dy, dz, yaw, pitch, on_ground } => { out.i32(*eid); out.f64(*dx); out.f64(*dy); out.f64(*dz); out.f32(*yaw); out.f32(*pitch); out.flag(*on_ground); 18 }
+        E::MoveEntityRot { eid, yaw, pitch, on_ground } => { out.i32(*eid); out.f32(*yaw); out.f32(*pitch); out.flag(*on_ground); 19 }
+        E::TeleportEntity { eid, x, y, z, yaw, pitch, on_ground } => { out.i32(*eid); out.f64(*x); out.f64(*y); out.f64(*z); out.f32(*yaw); out.f32(*pitch); out.flag(*on_ground); 20 }
+        E::RotateHead { eid, head_yaw } => { out.i32(*eid); out.f32(*head_yaw); 21 }
+        E::SetEntityMotion { eid, vx, vy, vz } => { out.i32(*eid); out.f64(*vx); out.f64(*vy); out.f64(*vz); 22 }
+        E::EntityEvent { eid, status } => { out.i32(*eid); out.put(&[*status as u8]); 23 }
+        E::HurtAnimation { eid, yaw } => { out.i32(*eid); out.f32(*yaw); 24 }
+        E::SetEntityData { eid, raw_entries } => { out.i32(*eid); out.bytes(raw_entries); 25 }
+        E::SetTime { world_age, time_of_day } => { out.i64(*world_age); out.i64(*time_of_day); 26 }
+        E::GameEvent { event, value } => { out.put(&[*event]); out.f32(*value); 27 }
+        E::LevelEvent { event, pos, data, disable_relative_volume } => { out.i32(*event); for v in pos { out.i32(*v); } out.i32(*data); out.flag(*disable_relative_volume); 28 }
+        E::BlockDestruction { breaker_eid, pos, stage } => { out.i32(*breaker_eid); for v in pos { out.i32(*v); } out.put(&[*stage as u8]); 29 }
+        E::Explosion { x, y, z, power, records, knockback, block_interaction, small_particle_id, large_particle_id, .. } => { out.f64(*x); out.f64(*y); out.f64(*z); out.f32(*power); out.u32(records.len().min(u32::MAX as usize) as u32); for v in knockback { out.f32(*v); } out.i32(*block_interaction); out.i32(*small_particle_id); out.i32(*large_particle_id); 30 }
+        E::BlockEntityData { pos, kind, nbt_bytes } => { for v in pos { out.i32(*v); } out.i32(*kind); out.bytes(nbt_bytes); 31 }
+        E::ContainerSetContent { window_id, state_id, slot_count, raw_payload } => { out.put(&[*window_id]); out.i32(*state_id); out.i32(*slot_count); out.bytes(raw_payload); 32 }
+        E::ContainerSetSlot { window_id, state_id, slot, raw_item } => { out.put(&[*window_id]); out.i32(*state_id); out.put(&slot.to_le_bytes()); out.bytes(raw_item); 33 }
+        E::SetExperience { bar, level, total } => { out.f32(*bar); out.i32(*level); out.i32(*total); 34 }
+        E::UpdateMobEffect { eid, effect_id, amplifier, duration, flags } => { out.i32(*eid); out.i32(*effect_id); out.i32(*amplifier); out.i32(*duration); out.put(&[*flags]); 35 }
+        E::RemoveMobEffect { eid, effect_id } => { out.i32(*eid); out.i32(*effect_id); 36 }
+        E::SetActionBarText { nbt_bytes } => { out.bytes(nbt_bytes); 37 }
+        E::SetTitleText { nbt_bytes } => { out.bytes(nbt_bytes); 38 }
+        E::SetSubtitleText { nbt_bytes } => { out.bytes(nbt_bytes); 39 }
+        E::BossEvent { uuid, action, raw_payload } => { out.put(uuid); out.i32(*action); out.bytes(raw_payload); 40 }
+        E::SetPassengers { vehicle, passengers } => { out.i32(*vehicle); let n = passengers.len().min(80); out.put(&[n as u8]); for id in passengers.iter().take(n) { out.i32(*id); } 41 }
+        E::TakeItemEntity { item_entity, player, amount } => { out.i32(*item_entity); out.i32(*player); out.i32(*amount); 42 }
+        E::SetCamera { eid } => { out.i32(*eid); 43 }
+        E::PlayerChat { sender, index, text, nbt_bytes, .. } => { out.put(sender); out.i32(*index); out.text(text); out.bytes(nbt_bytes); 44 }
+        E::DisguisedChat { text, nbt_bytes } => { out.text(text); out.bytes(nbt_bytes); 45 }
+        E::Ping(id) => { out.i32(*id); 46 }
+        E::BlockChangedAck(id) => { out.i32(*id); 47 }
+        E::PlayerAbilities { flags, flying_speed, walking_speed } => { out.put(&[*flags]); out.f32(*flying_speed); out.f32(*walking_speed); 48 }
+        E::PlayerCombatKill { player_id, message_nbt } => { out.i32(*player_id); out.bytes(message_nbt); 49 }
+        E::Disconnect(reason) => { out.text(reason); 50 }
+        E::Other(packet_id) => { out.i32(*packet_id); 51 }
+        _ => return None,
+    };
+    Some(out.finish(tag))
+}
+
 impl LiveSession {
     pub fn connect(host: String, port: u16, username: String, version: String) -> Self {
         Self::connect_with_paths(host, port, username, version, SessionPaths::default())
@@ -1960,6 +2064,8 @@ impl LiveSession {
             outgoing,
             _offline_sender: None,
             status: SessionStatus::Connecting,
+            replay_ring: crate::replay_ring::PacketReplayRing::default(),
+            replay_started: Instant::now(),
             world,
             audio,
             acoustic_world,
@@ -4818,6 +4924,15 @@ impl LiveSession {
 
     /// Apply a decoded packet, also used by framed protocol regression tests.
     pub fn apply_event(&mut self, event: ClientPlayEvent) -> Result<(), String> {
+        if let ClientPlayEvent::Play(play) = &event {
+            if let Some((tag, payload, len)) = compact_replay_event(play) {
+                self.replay_ring.push(
+                    self.replay_started.elapsed().as_millis().min(u128::from(u64::MAX)) as u64,
+                    tag,
+                    &payload[..len],
+                );
+            }
+        }
         match event {
             ClientPlayEvent::Play(event) => self.apply_play(event),
             ClientPlayEvent::CustomChannel(channel) => self.apply_custom(channel),
@@ -6683,6 +6798,18 @@ pub fn discover_asset_layers(
         layers.extend(mod_layers);
     }
 
+    if let Some(server_mods_dir) = paths.server_mods_dir.as_deref() {
+        let (mod_layers, mod_report) = crate::vanilla_jar::load_mod_jar_layers(server_mods_dir);
+        report.zip_entries_seen += mod_report.entries_seen;
+        for path in mod_report.loaded {
+            report.pack_sources.push(path.display().to_string());
+        }
+        for (path, err) in mod_report.rejected {
+            report.notes.push(format!("server mod JAR {} skipped: {err}", path.display()));
+        }
+        layers.extend(mod_layers);
+    }
+
     // `options.txt`-configured packs, vanilla order: the file lists them
     // bottom-to-top, so each later layer overrides the earlier ones.
     if let Some(game_dir) = paths.game_dir.as_deref() {
@@ -7119,6 +7246,23 @@ mod tests {
         assert_eq!(live.prefetcher.pending_count(), 0);
         assert_eq!(live.frame_timings.frame_count(), 0);
         assert_eq!(live.subworlds.len(), 0);
+    }
+
+    #[test]
+    fn apply_event_records_stable_compact_block_update() {
+        let (mut live, _) = session();
+        live.apply_event(ClientPlayEvent::Play(PlayEvent::BlockUpdate {
+            pos: [12, 64, -3],
+            state_id: 0x1234,
+        }))
+        .unwrap();
+        let frame = live.replay_ring.frames().back().expect("captured play event");
+        assert_eq!(frame.packet_id, 0x4d52_0009);
+        assert_eq!(frame.payload.len(), 16);
+        assert_eq!(&frame.payload[0..4], &12i32.to_le_bytes());
+        assert_eq!(&frame.payload[4..8], &64i32.to_le_bytes());
+        assert_eq!(&frame.payload[8..12], &(-3i32).to_le_bytes());
+        assert_eq!(&frame.payload[12..16], &0x1234u32.to_le_bytes());
     }
 
     #[test]
