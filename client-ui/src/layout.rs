@@ -1795,8 +1795,12 @@ fn qol_tab(ctx: &mut Ctx, y0: i32) {
         ),
     );
 
-    // Seamless QoL toggles: the four opinionated gameplay helpers are
-    // default-OFF (opt-in), the three pure-UX improvements default ON.
+    // Engine-quality essentials only. The mod-overlapping helpers
+    // (auto-replenish, quick-stack, food/saturation preview, shulker
+    // peek) deliberately have no toggle here — `QolSettings` keeps the
+    // fields default-false for settings-file compatibility, and the
+    // footer points players at Mods > Recommended for the dedicated
+    // community mods that do those jobs better.
     pair(
         ctx,
         5,
@@ -1813,54 +1817,6 @@ fn qol_tab(ctx: &mut Ctx, y0: i32) {
         ctx,
         5,
         1,
-        WidgetId::QolAutoReplenish,
-        SettingKey::QolAutoReplenish,
-        &format!(
-            "{}: {}",
-            tr(lang, "Replenish", "リフィル"),
-            onoff(q.auto_replenish)
-        ),
-    );
-    pair(
-        ctx,
-        6,
-        0,
-        WidgetId::QolQuickStack,
-        SettingKey::QolQuickStack,
-        &format!(
-            "{}: {}",
-            tr(lang, "Quick Stack", "クイックスタック"),
-            onoff(q.quick_stack_nearby)
-        ),
-    );
-    pair(
-        ctx,
-        6,
-        1,
-        WidgetId::QolFoodPreview,
-        SettingKey::QolFoodPreview,
-        &format!(
-            "{}: {}",
-            tr(lang, "Food Saturation", "食料の回復量"),
-            onoff(q.food_saturation_preview)
-        ),
-    );
-    pair(
-        ctx,
-        7,
-        0,
-        WidgetId::QolShulkerPeek,
-        SettingKey::QolShulkerPeek,
-        &format!(
-            "{}: {}",
-            tr(lang, "Shulker Peek", "中身プレビュー"),
-            onoff(q.shulker_tooltip_peek)
-        ),
-    );
-    pair(
-        ctx,
-        7,
-        1,
         WidgetId::QolChatScrollLock,
         SettingKey::QolChatScrollLock,
         &format!(
@@ -1872,18 +1828,18 @@ fn qol_tab(ctx: &mut Ctx, y0: i32) {
 
     ctx.btn(
         WidgetId::QolCrashMode,
-        lr(x, qy(8), 320, bh),
+        lr(x, qy(6), 320, bh),
         &format!(
             "{}: {}",
             tr(lang, "Crash Report Mode", "クラッシュレポート"),
             q.crash_report_mode.label()
         ),
     );
-    ctx.dirty_dot(SettingKey::QolCrashReportMode, x + 326, qy(8) + (bh - 8) / 2);
+    ctx.dirty_dot(SettingKey::QolCrashReportMode, x + 326, qy(6) + (bh - 8) / 2);
 
     ctx.btn(
         WidgetId::QolShowSupportLinks,
-        lr(x, qy(9), 320, bh),
+        lr(x, qy(7), 320, bh),
         if q.show_support_links {
             tr(
                 lang,
@@ -1898,7 +1854,7 @@ fn qol_tab(ctx: &mut Ctx, y0: i32) {
             )
         },
     );
-    ctx.dirty_dot(SettingKey::QolShowSupportLinks, x + 326, qy(9) + (bh - 8) / 2);
+    ctx.dirty_dot(SettingKey::QolShowSupportLinks, x + 326, qy(7) + (bh - 8) / 2);
 
     // -- Controls: keybind conflict highlighting ---------------------
     let conflicts = crate::qol_helpers::detect_keybind_conflicts(&ctx.state.keybinds);
@@ -1908,7 +1864,7 @@ fn qol_tab(ctx: &mut Ctx, y0: i32) {
     // (red when a row collides more than once, amber otherwise), then
     // the unflagged table — two display-only columns clipped by the
     // footer band like every other row.
-    if qy(10) + 10 <= ctx.band_top {
+    if qy(8) + 10 <= ctx.band_top {
         let header = if conflicts.is_empty() {
             tr(lang, "Controls - no conflicts", "操作 — 重複なし").to_string()
         } else {
@@ -1936,7 +1892,7 @@ fn qol_tab(ctx: &mut Ctx, y0: i32) {
         (0..ctx.state.keybinds.entries.len()).filter(|i| !flagged.contains(i)),
     );
     for (row_i, chunk) in order.chunks(2).enumerate() {
-        let y = qy(11) + row_i as i32 * 10;
+        let y = qy(9) + row_i as i32 * 10;
         if y + 10 > ctx.band_top {
             break;
         }
@@ -1968,6 +1924,19 @@ fn qol_tab(ctx: &mut Ctx, y0: i32) {
     }
 
     if ctx.h >= 340 {
+        // Subtle footer: point players at the community catalog instead
+        // of stacking more built-in duplicates of respected mods.
+        ctx.ctext(
+            ctx.w / 2,
+            ctx.band_top - 22,
+            1,
+            pal::TEXT_DIM,
+            tr(
+                lang,
+                "Optional HUD/inventory mods: Mods > Recommended",
+                "追加のHUDやインベントリModは Mods > Recommended へ",
+            ),
+        );
         ctx.ctext(
             ctx.w / 2,
             ctx.band_top - 10,
@@ -4562,10 +4531,6 @@ mod tests {
         let (_draw, regions) = layout_screen(&ui, 1280, 720);
         for id in [
             WidgetId::QolAutoReconnect,
-            WidgetId::QolAutoReplenish,
-            WidgetId::QolQuickStack,
-            WidgetId::QolFoodPreview,
-            WidgetId::QolShulkerPeek,
             WidgetId::QolChatScrollLock,
             WidgetId::QolToasts,
         ] {
@@ -4573,6 +4538,58 @@ mod tests {
                 regions.iter().any(|r| r.id == id),
                 "missing hit region for {id:?}"
             );
+        }
+        // The mod-overlapping helpers stay out of Settings entirely —
+        // the community mods in Mods > Recommended do them better.
+        for id in [
+            WidgetId::QolAutoReplenish,
+            WidgetId::QolQuickStack,
+            WidgetId::QolFoodPreview,
+            WidgetId::QolShulkerPeek,
+        ] {
+            assert!(
+                !regions.iter().any(|r| r.id == id),
+                "mod-overlapping toggle {id:?} still rendered"
+            );
+        }
+    }
+
+    #[test]
+    fn qol_tab_footer_points_at_mods_recommended() {
+        let mut ui = UiState::default();
+        ui.navigate(Screen::Settings(SettingsTab::Qol));
+        let (draw, _regions) = layout_screen(&ui, 1280, 720);
+        let texts: Vec<&str> = draw
+            .commands
+            .iter()
+            .filter_map(|c| match c {
+                UiCommand::Text { text, .. } => Some(text.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert!(
+            texts
+                .iter()
+                .any(|t| t.contains("Mods > Recommended")),
+            "missing Mods > Recommended footer hint in {texts:?}"
+        );
+        ui.settings.language = crate::state::LanguageSetting::Japanese;
+        let (draw, _regions) = layout_screen(&ui, 1280, 720);
+        let texts: Vec<&str> = draw
+            .commands
+            .iter()
+            .filter_map(|c| match c {
+                UiCommand::Text { text, .. } => Some(text.as_str()),
+                _ => None,
+            })
+            .collect();
+        let hint = "追加のHUDやインベントリModは Mods > Recommended へ";
+        assert!(
+            texts.iter().any(|t| t.contains(hint)),
+            "missing JA footer hint in {texts:?}"
+        );
+        for c in hint.chars() {
+            assert!(crate::draw::glyph_is_covered(c), "uncovered glyph {c:?}");
         }
     }
 

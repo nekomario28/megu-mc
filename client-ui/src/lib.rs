@@ -25,6 +25,10 @@
 //!   Bundle tooltip peek summaries, food saturation previews,
 //!   keybind-conflict detection, inventory planners, and chat
 //!   scroll-lock.
+//! * [`gui_bridge`] — the Client Tier-2 2D GUI bridge ABI:
+//!   `GuiGraphics -> DrawCmd` draw ops, the read-only HUD snapshot mods
+//!   see, fair-play-capped container slot actions, the fail-closed
+//!   `GGB1` wire codec, and the lowering pass into the native draw list.
 //!
 //! Typical frame loop for an embedder:
 //!
@@ -43,6 +47,7 @@ pub mod create_goggles_hud;
 pub mod death_screen;
 pub mod draw;
 pub mod font_cjk;
+pub mod gui_bridge;
 pub mod hud_widgets;
 pub mod layout;
 pub mod magic_hud;

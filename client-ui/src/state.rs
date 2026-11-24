@@ -482,8 +482,10 @@ pub struct QolSettings {
     /// Opt-in hunger/saturation preview on food tooltips — `false` by
     /// default (yields to a dedicated food-stats mod install).
     pub food_saturation_preview: bool,
-    /// Shulker Box / Bundle contents inside the item tooltip — pure UX,
-    /// `true` by default.
+    /// Shulker Box / Bundle contents inside the item tooltip — `false`
+    /// by default (yields to dedicated shulker-tooltip mods; kept only
+    /// for settings-file backward compatibility and programmatic
+    /// toggles — the QoL settings tab no longer surfaces it).
     pub shulker_tooltip_peek: bool,
     /// Chat scroll-lock: reading older chat is never yanked to the
     /// bottom by new messages — pure UX, `true` by default.
@@ -505,12 +507,15 @@ impl Default for QolSettings {
             mini_hud: MiniHudConfig::default(),
             show_subtitles: false,
             // Opinionated gameplay helpers are strictly opt-in; pure-UX
-            // improvements ship on.
+            // improvements ship on. The four mod-overlapping helpers
+            // (replenish / quick-stack / food preview / shulker peek)
+            // stay defaulted off — Mods > Recommended points players at
+            // the dedicated community mods instead.
             auto_reconnect: false,
             auto_replenish: false,
             quick_stack_nearby: false,
             food_saturation_preview: false,
-            shulker_tooltip_peek: true,
+            shulker_tooltip_peek: false,
             chat_scroll_lock: true,
             toast_notifications: true,
         }
@@ -5175,8 +5180,10 @@ mod tests {
         assert!(!q.auto_replenish);
         assert!(!q.quick_stack_nearby);
         assert!(!q.food_saturation_preview);
+        // Shulker peek yields to dedicated community mods (kept only for
+        // settings-file compat, defaulted off like the other helpers).
+        assert!(!q.shulker_tooltip_peek);
         // Pure-UX improvements ship on.
-        assert!(q.shulker_tooltip_peek);
         assert!(q.chat_scroll_lock);
         assert!(q.toast_notifications);
     }
