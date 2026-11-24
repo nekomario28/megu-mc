@@ -18,7 +18,7 @@ use megu_client::friends_store::{
     FriendShareMode as StoreShareMode, FriendsStore, load_or_create_identity,
 };
 use megu_client::integrated;
-use megu_client::protocol::{NbtValue, WireReader, encode_slot_stack};
+use megu_client::protocol::{ItemStackComponents, NbtValue, WireReader, encode_slot_stack};
 use megu_client::render::{FrameBudgetGovernor, RenderConfig, ThrottleStage};
 use megu_client::server_list::{ServerEntry, ServerListStore};
 use megu_client::settings::{
@@ -33,7 +33,9 @@ use megu_client_mesh::ber_instancing::{
     VanillaBerFacing, VanillaBerKind, VanillaBerState, VanillaParticleQuad, VanillaParticleWorld,
     build_ber_mesh,
 };
-use megu_client_mesh::builtin_shadow_wgsl::{BuiltinShadowQuality, RenderScalePreset};
+use megu_client_mesh::builtin_shadow_wgsl::{
+    BuiltinShadowQuality, RenderScalePreset, enchantment_glint_rgb,
+};
 use megu_client_mesh::entity_rig::{
     EntityPose, EntityRigSpec, build_entity_rig_mesh_with_mouth_item,
 };
@@ -55,6 +57,7 @@ use megu_ui::container_screen::{
 };
 use megu_ui::draw::tessellate_draw_list;
 use megu_ui::draw::{UiColor, UiCommand, UiDrawList, UiRect, text_width};
+use megu_ui::gui_bridge::{GuiBridgeBatch, lower_bridge_batch_to_draw_cmds};
 use megu_ui::hud_widgets::ScoreboardEntry;
 use megu_ui::magic_hud::LookingAtBlockState;
 use megu_ui::magic_hud::build_magic_hud_draw_list;
@@ -848,6 +851,15 @@ pub struct GpuApp {
     /// so steady frames allocate nothing (text payloads recycle inside
     /// the list).
     ui_draw_list: UiDrawList,
+    /// Active Tier-2 mod GUI batch (`client-ui` `gui_bridge` ABI): a
+    /// client mod records its draw ops here and the HUD pass lowers them
+    /// straight into `ui_draw_list`. `Default` is empty, so the hook is
+    /// free until a mod host feeds it through [`Self::set_gui_bridge_batch`].
+    gui_bridge_batch: GuiBridgeBatch,
+    /// Monotonic epoch for time-driven 2D HUD shimmer (enchantment
+    /// glint): `Instant`, never `SystemTime`, so every overlay stays
+    /// deterministic under replay and headless tests.
+    ui_anim_epoch: Instant,
     /// Per-frame live-particle staging scratch (tactile + ambience + VFX1
     /// billboards) — cleared and refilled only while particles exist.
     particle_scratch: Vec<VanillaParticleQuad>,
@@ -1086,6 +1098,8 @@ impl GpuApp {
             last_subworld_helm: None,
             live_strategy_pending: true,
             ui_draw_list: UiDrawList::new(),
+            gui_bridge_batch: GuiBridgeBatch::default(),
+            ui_anim_epoch: Instant::now(),
             particle_scratch: Vec::new(),
             live_particles_staged: false,
             entity_render_cache: LiveEntityRenderCache::default(),
@@ -1273,6 +1287,13 @@ impl GpuApp {
     /// results, statistics summaries) — never silently dropped.
     pub fn status_messages(&self) -> &[String] {
         &self.debug_messages
+    }
+
+    /// Feed the frame's Tier-2 mod GUI batch (`gui_bridge` ABI) into the
+    /// HUD pass. An empty batch is free: the lowering hook skips it
+    /// before touching the draw list.
+    pub fn set_gui_bridge_batch(&mut self, batch: GuiBridgeBatch) {
+        self.gui_bridge_batch = batch;
     }
 
     /// The recipe/resource browser state (JEI/EMI/JER/Ponder index, tabs,
@@ -1538,6 +1559,10 @@ impl GpuApp {
             UiAction::Back => {
                 self.ui
                     .handle_input(UiInputEvent::KeyPressed(UiKey::Escape));
+                // Mod Menu Done/Back lands here (`ModMenuAction::Close`
+                // flattens to `Back`); a staged or applied
+                // non-hot-reload toggle kicks the in-process reload.
+                self.maybe_soft_reload_mods();
             }
             UiAction::SettingsChanged => {
                 let settings = self.ui.settings.clone();
@@ -1708,6 +1733,33 @@ impl GpuApp {
         // Screen navigations change whether IME is allowed — settle the
         // flag here so the headless dispatch path stays consistent.
         self.update_ime();
+    }
+
+    /// Mod Menu close hook: when a non-hot-reload mod was toggled or
+    /// applied, refresh mod assets + translations in-process (the window
+    /// never leaves the loop), surface the localized status line, then
+    /// acknowledge so a clean close stays cheap. Poll-style: the menu
+    /// owns the sticky flag, so this is a no-op on every other `Back`.
+    fn maybe_soft_reload_mods(&mut self) {
+        if !self.ui.mod_menu.needs_soft_reload_on_close() {
+            return;
+        }
+        if let Some(live) = &mut self.live {
+            // Re-arm asset-layer discovery so the next `ensure_asset_bundle`
+            // pass re-scans the mods dir's JARs (fresh metadata +
+            // textures) without a process restart.
+            live.refresh_asset_layers();
+            // `set_ui_locale` invalidates the cached `ModTranslationTable`
+            // only on a real locale change; the two-step hop through an
+            // unused tag drops it unconditionally so the next lookup
+            // re-reads the mod JAR lang files.
+            let locale = self.ui.settings.locale.code().to_owned();
+            live.set_ui_locale("und");
+            live.set_ui_locale(&locale);
+        }
+        let status = self.ui.mod_menu.soft_reload_status(self.ui.lang());
+        self.status_line(status);
+        self.ui.mod_menu.acknowledge_soft_reload();
     }
 
     /// Enter the mismatch flow when a caller has a structured server mod manifest.
@@ -2392,6 +2444,17 @@ impl GpuApp {
         cli.game_dir = config.game_dir.clone();
         cli.seed = config.seed;
         cli.client_settings = settings.clone();
+        // The child server reads `MEGU_DIRECTIONAL_SHADOW_LIGHT` at boot
+        // ([server] `directional_shadow_light` in server.toml fills the
+        // same var). `integrated::launch` never sets it, so the spawned
+        // `megu` inherits this process env — the Settings → Video toggle
+        // reaches local/hosted worlds with no config-file edit. The same
+        // spawn path serves friend-relay hosting, so the policy applies
+        // to every world this client hosts.
+        std::env::set_var(
+            "MEGU_DIRECTIONAL_SHADOW_LIGHT",
+            directional_shadow_light_env_value(settings.directional_shadow_gameplay),
+        );
         integrated::launch(&cli)
     }
 
@@ -4608,12 +4671,86 @@ impl GpuApp {
         if let Some(goggles) = goggles_draw {
             draw_list.commands.extend(goggles.commands);
         }
+        // Enchantment glint shimmer over enchanted 2D slots: the same
+        // `enchantment_glint_rgb` the 3D path runs, composited as a
+        // subtle translucent wash inside each slot cell. Hotbar/offhand
+        // read window-0 components directly (36..45 = hotbar, 45 =
+        // offhand) and only while the bare HUD is up — an open container
+        // re-draws every slot through its own overlay pass below.
+        let glint_on = self.ui.settings.video.enchantment_glint;
+        let glint_elapsed = frame_begin
+            .saturating_duration_since(self.ui_anim_epoch)
+            .as_secs_f32();
+        if glint_on
+            && self.ui.screen == Screen::InGameHud
+            && self.ui.hud.game_mode != 3
+            && self.container_screen.is_none()
+        {
+            if let Some(live) = &self.live {
+                let scale = self.ui.effective_scale(h);
+                let slots = (-1..9).map(|index| (index, if index < 0 { 45 } else { 36 + index }));
+                for (index, stack_slot) in slots {
+                    if let Some(stack) = live.player_inventory.get(&stack_slot) {
+                        let rect = hotbar_slot_rect(w, h, scale, index);
+                        if let Some(cmd) =
+                            enchant_glint_overlay_cmd(true, stack, rect, w, h, glint_elapsed)
+                        {
+                            draw_list.commands.push(cmd);
+                        }
+                    }
+                }
+            }
+        }
         // Server-driven container screen draws above the HUD.
         if let Some(screen) = &self.container_screen {
             screen.render(w as f32, h as f32, draw_list);
+            if glint_on {
+                // The window-0 inventory feeds slots straight from
+                // `live.player_inventory`; a server screen renders
+                // `live.open_screen.slots` instead. Every rendered cell
+                // has a `slot_rect`, so the pass emits one overlay per
+                // enchanted stack and skips empty/unmapped entries.
+                let components: Option<&std::collections::BTreeMap<i32, ItemStackComponents>> =
+                    if self.own_inventory_open {
+                        self.live.as_ref().map(|live| &live.player_inventory)
+                    } else {
+                        self.live
+                            .as_ref()
+                            .and_then(|live| live.open_screen.as_ref())
+                            .map(|open| &open.slots)
+                    };
+                if let Some(components) = components {
+                    let panel = screen.panel_rect(w as f32, h as f32);
+                    for (index, stack) in components {
+                        if let Some(rect) = i16::try_from(*index)
+                            .ok()
+                            .and_then(|index| screen.slot_rect(index, panel))
+                        {
+                            if let Some(cmd) = enchant_glint_overlay_cmd(
+                                true,
+                                stack,
+                                rect,
+                                w,
+                                h,
+                                glint_elapsed,
+                            ) {
+                                draw_list.commands.push(cmd);
+                            }
+                        }
+                    }
+                }
+            }
         }
         if self.advancements_open {
             Self::render_advancements_overlay(self.live.as_ref(), w as i32, h as i32, draw_list);
+        }
+        // Tier-2 mod GUI bridge: the active batch lowers straight into
+        // the native list (scissor-safe inside the frame's clip), zero
+        // cost while no mod recorded ops this frame.
+        if !self.gui_bridge_batch.ops.is_empty() {
+            draw_list
+                .commands
+                .extend(lower_bridge_batch_to_draw_cmds(&self.gui_bridge_batch, w, h));
         }
         // Dirty-only upload: unchanged HUD frames skip even the quad
         // tessellation; changed frames upload only the small dynamic
@@ -4647,10 +4784,15 @@ impl GpuApp {
                         // WGSL UBO with the server VFX1 lights —
                         // nearest-first, budget-capped inside
                         // `collect_dynamic_lights`, empty while the
-                        // world-effects setting is Off.
-                        vfx_frame
-                            .lights
-                            .extend(live.collect_dynamic_lights(render_camera.position));
+                        // world-effects setting is Off. The
+                        // `video.dynamic_lights` switch skips the collect
+                        // outright so the toggle kills every gameplay
+                        // light the same frame it flips.
+                        if self.ui.settings.video.dynamic_lights {
+                            vfx_frame
+                                .lights
+                                .extend(live.collect_dynamic_lights(render_camera.position));
+                        }
                         Self::stage_live_particles(
                             live,
                             &vfx_frame,
@@ -6017,6 +6159,11 @@ fn apply_client_settings_to_ui(src: &ClientSettings, ui: &mut UiSettings) {
     ui.video.background_fps = src.background_fps_limit;
     ui.video.vsync = src.vsync;
     ui.video.smooth_lighting = src.smooth_lighting;
+    ui.video.comfort_exposure = src.comfort_exposure;
+    ui.video.dynamic_lights = src.dynamic_lights;
+    ui.video.enchantment_glint = src.enchantment_glint;
+    ui.video.indirect_light_bounce = src.indirect_light_bounce;
+    ui.video.directional_shadow_gameplay = src.directional_shadow_gameplay;
     ui.audio.master = src.volume_master;
     ui.audio.music = src.volume_music;
     ui.audio.blocks = src.volume_blocks;
@@ -6049,6 +6196,82 @@ fn apply_client_settings_to_ui(src: &ClientSettings, ui: &mut UiSettings) {
         HostPlayerRadarScope::None => PlayerRadarScope::None,
     };
     ui.fair_play.allow_waypoint_teleport = src.map_fair_play.allow_waypoint_teleport;
+}
+
+/// `MEGU_DIRECTIONAL_SHADOW_LIGHT` value for the integrated/hosted
+/// server spawn: the server-side `ops_bool_str` reader accepts the full
+/// `1/true/yes/on` alphabet, but the env pair stays canonical `"1"` /
+/// `"0"` like the other boot switches.
+fn directional_shadow_light_env_value(on: bool) -> &'static str {
+    if on { "1" } else { "0" }
+}
+
+/// Overlay alpha for the 2D enchant-glint shimmer — subtle (~0.24) so
+/// item icons stay fully readable under the tint.
+const GLINT_OVERLAY_ALPHA: u8 = 61;
+
+/// Logical-px hotbar slot edge, matching `client-ui`'s `layout.rs`
+/// hotbar grid (`slot = 22`, offhand + 4 px gap + 9 slots).
+const HOTBAR_SLOT_PX: i32 = 22;
+
+/// Vanilla `ItemStack.hasFoil` on raw 767 component patches: a non-empty
+/// `minecraft:enchantments` (9) or `minecraft:stored_enchantments` (23)
+/// list — both wire a VarInt entry count first — or a set
+/// `minecraft:enchantment_glint_override` (18).
+fn stack_shows_enchant_glint(stack: &ItemStackComponents) -> bool {
+    stack.added.iter().any(|patch| match patch.type_id {
+        9 | 23 => patch.data.first().is_some_and(|count| *count != 0),
+        18 => patch.data.first().is_some_and(|flag| *flag != 0),
+        _ => false,
+    })
+}
+
+/// One 2D slot's subtle violet-lavender glint overlay, or `None` while
+/// the Settings → Video `enchantment_glint` switch is off or the stack
+/// shows no foil. The tint samples the same
+/// [`enchantment_glint_rgb`] the 3D WGSL path evaluates per fragment,
+/// keyed by the slot's normalized `[u, v]` (rect center over the
+/// viewport) at `elapsed_sec`, with [`GLINT_OVERLAY_ALPHA`] pinned so
+/// the icon below keeps 100% of its contrast.
+fn enchant_glint_overlay_cmd(
+    enabled: bool,
+    stack: &ItemStackComponents,
+    rect: UiRect,
+    viewport_w: u32,
+    viewport_h: u32,
+    elapsed_sec: f32,
+) -> Option<UiCommand> {
+    if !enabled || !stack_shows_enchant_glint(stack) {
+        return None;
+    }
+    let u = (rect.x as f32 + rect.w as f32 * 0.5) / viewport_w.max(1) as f32;
+    let v = (rect.y as f32 + rect.h as f32 * 0.5) / viewport_h.max(1) as f32;
+    let rgb = enchantment_glint_rgb([u, v], elapsed_sec);
+    let channel = |c: f32| (c.clamp(0.0, 1.0) * 255.0).round() as u8;
+    Some(UiCommand::FillRect {
+        rect,
+        color: UiColor::rgba(
+            channel(rgb[0]),
+            channel(rgb[1]),
+            channel(rgb[2]),
+            GLINT_OVERLAY_ALPHA,
+        ),
+    })
+}
+
+/// Physical-pixel rect of one bottom-row hotbar cell — `index` `0..=8`
+/// is a hotbar slot, `-1` the offhand cell — mirroring the `hud()`
+/// layout math in `client-ui`'s `layout.rs` so the glint lands exactly
+/// on the slot chrome that screen already drew.
+fn hotbar_slot_rect(viewport_w: u32, viewport_h: u32, scale: u32, index: i32) -> UiRect {
+    let s = scale.max(1) as i32;
+    let logical_w = viewport_w.min(i32::MAX as u32) as i32 / s;
+    let logical_h = viewport_h.min(i32::MAX as u32) as i32 / s;
+    let slot = HOTBAR_SLOT_PX;
+    let hx = logical_w / 2 - (9 * slot + slot + 4) / 2;
+    let hy = logical_h - slot - 4;
+    let x = if index < 0 { hx } else { hx + slot + 4 + index * slot };
+    UiRect::new(x * s, hy * s, (slot * s) as u32, (slot * s) as u32)
 }
 
 fn ui_gpu_backend(backend: GpuBackend) -> megu_client_mesh::RenderBackendPreference {
@@ -6130,6 +6353,11 @@ fn ui_to_client_settings(ui: &UiSettings, base: &ClientSettings) -> ClientSettin
     out.background_fps_limit = ui.video.background_fps;
     out.vsync = ui.video.vsync;
     out.smooth_lighting = ui.video.smooth_lighting;
+    out.comfort_exposure = ui.video.comfort_exposure;
+    out.dynamic_lights = ui.video.dynamic_lights;
+    out.enchantment_glint = ui.video.enchantment_glint;
+    out.indirect_light_bounce = ui.video.indirect_light_bounce;
+    out.directional_shadow_gameplay = ui.video.directional_shadow_gameplay;
     out.volume_master = ui.audio.master;
     out.volume_music = ui.audio.music;
     out.volume_blocks = ui.audio.blocks;
@@ -8415,6 +8643,123 @@ mod tests {
         assert_eq!(
             layers(VideoPreset::Balanced, VisualStylePreset::MeguNatural),
             3
+        );
+    }
+
+    /// CLIENT-GPU-SETTINGS-GLINT-RELOAD-WIRE: the five lighting/gameplay
+    /// switches ride `ClientSettings` -> `UiSettings` on load and
+    /// `UiSettings` -> `ClientSettings` on apply/save, so a TOML value
+    /// reaches the Video page and a page toggle persists.
+    #[test]
+    fn lighting_gameplay_settings_sync_bidirectionally() {
+        let client = ClientSettings {
+            comfort_exposure: false,
+            dynamic_lights: false,
+            enchantment_glint: false,
+            indirect_light_bounce: false,
+            directional_shadow_gameplay: true,
+            ..ClientSettings::default()
+        };
+
+        let mut ui = UiSettings::default();
+        apply_client_settings_to_ui(&client, &mut ui);
+        assert!(!ui.video.comfort_exposure);
+        assert!(!ui.video.dynamic_lights);
+        assert!(!ui.video.enchantment_glint);
+        assert!(!ui.video.indirect_light_bounce);
+        assert!(ui.video.directional_shadow_gameplay);
+
+        ui.video.comfort_exposure = true;
+        ui.video.dynamic_lights = true;
+        ui.video.enchantment_glint = true;
+        ui.video.indirect_light_bounce = true;
+        ui.video.directional_shadow_gameplay = false;
+        let out = ui_to_client_settings(&ui, &client);
+        assert!(out.comfort_exposure);
+        assert!(out.dynamic_lights);
+        assert!(out.enchantment_glint);
+        assert!(out.indirect_light_bounce);
+        assert!(!out.directional_shadow_gameplay);
+        // File-only fields ride `base` untouched through the overlay.
+        assert_eq!(out.shader_pack, client.shader_pack);
+        assert_eq!(out.report_endpoint, client.report_endpoint);
+    }
+
+    /// The hosted-server env pair stays canonical: `true` -> `"1"`,
+    /// `false` -> `"0"` (`ops_bool_str` accepts the wider alphabet, but
+    /// the spawn contract pins the short form).
+    #[test]
+    fn directional_shadow_gameplay_maps_to_env_flag() {
+        assert_eq!(directional_shadow_light_env_value(true), "1");
+        assert_eq!(directional_shadow_light_env_value(false), "0");
+    }
+
+    /// The 2D glint overlay emits a subtle non-zero shimmer over an
+    /// enchanted stack while enabled, and `None` when the switch is off
+    /// or the stack carries no foil — `enchantments`/`stored_enchantments`
+    /// need a non-empty VarInt count, `enchantment_glint_override` a set
+    /// byte.
+    #[test]
+    fn enchant_glint_overlay_is_subtle_shimmer_only_when_enabled_and_enchanted() {
+        fn stack(patch: Option<(i32, Vec<u8>)>) -> ItemStackComponents {
+            ItemStackComponents {
+                count: 1,
+                item_id: 5,
+                added: patch
+                    .map(|(type_id, data)| megu_client::protocol::ItemComponentPatch {
+                        type_id,
+                        data,
+                    })
+                    .into_iter()
+                    .collect(),
+                removed: Vec::new(),
+            }
+        }
+
+        let rect = UiRect::new(4, 6, 22, 22);
+        let enchanted = stack(Some((9, vec![1, 1, 1])));
+        let stored_enchanted = stack(Some((23, vec![1, 1, 1])));
+        let glint_override = stack(Some((18, vec![1])));
+        let empty_enchantments = stack(Some((9, vec![0, 1])));
+        let plain = stack(None);
+
+        // Enabled + enchanted: a FillRect at the slot with the pinned
+        // subtle alpha and the exact `enchantment_glint_rgb` tint at the
+        // slot's normalized center.
+        let cmd = enchant_glint_overlay_cmd(true, &enchanted, rect, 800, 600, 1.25)
+            .expect("enchanted stack must shimmer while enabled");
+        let expected = enchantment_glint_rgb(
+            [(4.0 + 11.0) / 800.0, (6.0 + 11.0) / 600.0],
+            1.25,
+        );
+        let channel = |c: f32| (c.clamp(0.0, 1.0) * 255.0).round() as u8;
+        assert_eq!(
+            cmd,
+            UiCommand::FillRect {
+                rect,
+                color: UiColor::rgba(
+                    channel(expected[0]),
+                    channel(expected[1]),
+                    channel(expected[2]),
+                    GLINT_OVERLAY_ALPHA,
+                ),
+            }
+        );
+        let UiCommand::FillRect { color, .. } = cmd else {
+            unreachable!()
+        };
+        assert_eq!(color.a, GLINT_OVERLAY_ALPHA);
+        assert!(color.r > 0 || color.g > 0 || color.b > 0);
+
+        // Stored enchantments and the explicit override shimmer too.
+        assert!(enchant_glint_overlay_cmd(true, &stored_enchanted, rect, 800, 600, 0.5).is_some());
+        assert!(enchant_glint_overlay_cmd(true, &glint_override, rect, 800, 600, 0.5).is_some());
+
+        // Disabled, unenchanted, and empty-list stacks emit nothing.
+        assert!(enchant_glint_overlay_cmd(false, &enchanted, rect, 800, 600, 1.25).is_none());
+        assert!(enchant_glint_overlay_cmd(true, &plain, rect, 800, 600, 1.25).is_none());
+        assert!(
+            enchant_glint_overlay_cmd(true, &empty_enchantments, rect, 800, 600, 1.25).is_none()
         );
     }
 }
