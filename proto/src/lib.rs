@@ -50,6 +50,15 @@
 //!   invite expiry, constant-time secret comparison and per-host stream
 //!   isolation, and the live non-blocking [`friend_relay::TcpFriendRelay`]
 //!   bridging one host tunnel to many guest TCP connections.
+//! * [`seamless_portal`] — Phase 1 Seamless Dimension Transfer
+//!   (`megu:portal_seamless_v1`, `MSP1`): the fail-closed packet codec
+//!   ([`seamless_portal::SeamlessPortalPacket`]), the generic portal
+//!   coordinate mapper ([`seamless_portal::resolve_portal_destination`]),
+//!   the nearest-first chunk prefetch planner
+//!   ([`seamless_portal::enumerate_prefetch_chunks`]), the server-side
+//!   hysteresis tracker ([`seamless_portal::PortalProximityTracker`]) and
+//!   the client-side zero-loading-screen crossfade machine
+//!   ([`seamless_portal::SeamlessDimTransitionState`]).
 //! * [`frl_e2ee`] — the `FRL3` zero-trust end-to-end encryption layer that
 //!   runs inside `friend_relay`'s `StreamData`: pure-Rust RFC 7748 X25519,
 //!   RFC 8439 ChaCha20-Poly1305 AEAD and HKDF-SHA256, an invite-PSK ephemeral
@@ -68,6 +77,7 @@ pub mod frl_auth;
 pub mod frl_e2ee;
 pub mod resolver;
 pub mod router;
+pub mod seamless_portal;
 pub mod session;
 pub mod table;
 pub mod version;
