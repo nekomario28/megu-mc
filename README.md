@@ -29,26 +29,33 @@ Automatically downloads/stages `megu-client-gpu` into `<minecraft_dir>/bin/` and
 
 | OS | File / Command | Description |
 | :--- | :--- | :--- |
-| **Windows (x86_64)** | **[`megu-installer-windows-x86_64.exe`](https://github.com/nekomario28/megu-mc/releases/latest/download/megu-installer-windows-x86_64.exe)** | Standalone `.exe` installer (`%APPDATA%\.minecraft` &amp; Microsoft Store Launcher; run `megu-installer-windows-x86_64.exe gui` for GUI mode) |
-| **Linux (x86_64)** | `curl -fsSL https://raw.githubusercontent.com/nekomario28/megu-mc/main/tools/install_linux.sh \| sh`<br>*(or **[`megu-installer-linux-x86_64`](https://github.com/nekomario28/megu-mc/releases/latest/download/megu-installer-linux-x86_64)**)* | Auto-detects standard `~/.minecraft` and Flatpak (`~/.var/app/com.mojang.Minecraft/.minecraft`) |
-| **macOS (Apple Silicon)** | **[`megu-installer-macos-arm64`](https://github.com/nekomario28/megu-mc/releases/latest/download/megu-installer-macos-arm64)** | Standalone native installer for `~/Library/Application Support/minecraft` |
+| **Windows (x86_64)** | **[`megu-installer-windows-x86_64.exe`](https://github.com/nekomario28/megu-mc/releases/download/v0.1.0-alpha.2/megu-installer-windows-x86_64.exe)** | Standalone `.exe` installer (`%APPDATA%\.minecraft` &amp; Microsoft Store Launcher; run `megu-installer-windows-x86_64.exe gui` for GUI mode) |
+| **Linux (x86_64)** | `curl -fsSL https://raw.githubusercontent.com/nekomario28/megu-mc/main/tools/install_linux.sh \| sh`<br>*(or **[`megu-installer-linux-x86_64`](https://github.com/nekomario28/megu-mc/releases/download/v0.1.0-alpha.2/megu-installer-linux-x86_64)**)* | Auto-detects standard `~/.minecraft` and Flatpak (`~/.var/app/com.mojang.Minecraft/.minecraft`) |
+| **macOS (Apple Silicon)** | **[`megu-installer-macos-arm64`](https://github.com/nekomario28/megu-mc/releases/download/v0.1.0-alpha.2/megu-installer-macos-arm64)** | Standalone native installer for `~/Library/Application Support/minecraft` |
 
 ### 2. Modrinth App &amp; Prism Launcher (Modpack / Instance Import)
 
 | Launcher | File / Command | Description |
 | :--- | :--- | :--- |
-| **Modrinth App / Prism Launcher** | **[`megu-1.21.1.mrpack`](https://github.com/nekomario28/megu-mc/releases/latest/download/megu-1.21.1.mrpack)** | Standard Modrinth `.mrpack` modpack — drag &amp; drop directly into your launcher |
-| **Prism Launcher (Native ZIP)** | **[`megu-prism-1.21.1.zip`](https://github.com/nekomario28/megu-mc/releases/latest/download/megu-prism-1.21.1.zip)** | Pre-configured Prism instance archive (or generate locally via `megu-installer prism`) |
+| **Modrinth App / Prism Launcher** | **[`megu-1.21.1.mrpack`](https://github.com/nekomario28/megu-mc/releases/download/v0.1.0-alpha.2/megu-1.21.1.mrpack)** | Standard Modrinth `.mrpack` modpack — drag &amp; drop directly into your launcher |
+| **Prism Launcher (Native ZIP)** | **[`megu-prism-1.21.1.zip`](https://github.com/nekomario28/megu-mc/releases/download/v0.1.0-alpha.2/megu-prism-1.21.1.zip)** | Pre-configured Prism instance archive (or generate locally via `megu-installer prism`) |
 
 ## How To (Server Admins &amp; Full CLI Suite)
 
-Download the full platform archive (`megu-<version>-<target>.tar.gz`, bundling `megu` dedicated server, `megu-client-gpu`, `megu-installer`, `megu-mod-check`, `megu-world-migrate`, `megu-init`, and `megu-admin`) from **[GitHub Releases](https://github.com/nekomario28/megu-mc/releases/latest)**. Eight targets are published per release: `linux-x86_64`, `linux-x86_64-musl`, `linux-arm64`, `linux-arm64-musl`, `macos-arm64`, `macos-x86_64`, `windows-x86_64`, and `windows-arm64`.
+Download the full platform archive (`megu-<version>-<target>.tar.gz`) from **[GitHub Releases](https://github.com/nekomario28/megu-mc/releases/tag/v0.1.0-alpha.2)** (`v0.1.0-alpha.2`). Eight targets are published per release: `windows-x86_64`, `windows-arm64`, `linux-x86_64`, `linux-arm64`, `linux-x86_64-musl`, `linux-arm64-musl`, `macos-arm64`, and `macos-x86_64`. Each archive bundles `megu` (dedicated server), `megu-client-gpu`, `megu-client`, `megu-installer`, `megu-mod-check`, `megu-world-migrate`, `megu-init`, and `megu-admin`; the `*-musl` archives are statically linked and **server-only** (`megu` + `megu-installer`).
 
-| OS | Full Archive | Included Binaries |
+| Target | Full Archive | Included Binaries |
 | :--- | :--- | :--- |
-| **Windows (x86_64)** | **[`megu-v0.1.0-alpha.2-windows-x86_64.tar.gz`](https://github.com/nekomario28/megu-mc/releases/latest/download/megu-v0.1.0-alpha.2-windows-x86_64.tar.gz)** | `megu.exe` (Server), `megu-client-gpu.exe` (GPU Client), `megu-installer.exe`, `megu-mod-check.exe`, `megu-world-migrate.exe`, `megu-init.exe`, `megu-admin.exe` |
-| **Linux (x86_64)** | **[`megu-v0.1.0-alpha.2-linux-x86_64.tar.gz`](https://github.com/nekomario28/megu-mc/releases/latest/download/megu-v0.1.0-alpha.2-linux-x86_64.tar.gz)** | `megu` (Server), `megu-client-gpu` (GPU Client), `megu-installer`, `megu-mod-check`, `megu-world-migrate`, `megu-init`, `megu-admin` |
-| **macOS (Apple Silicon)** | **[`megu-v0.1.0-alpha.2-macos-arm64.tar.gz`](https://github.com/nekomario28/megu-mc/releases/latest/download/megu-v0.1.0-alpha.2-macos-arm64.tar.gz)** | `megu` (Server), `megu-client-gpu` (GPU Client), `megu-installer`, `megu-mod-check`, `megu-world-migrate`, `megu-init`, `megu-admin` |
+| **`windows-x86_64`** | **[`megu-v0.1.0-alpha.2-windows-x86_64.tar.gz`](https://github.com/nekomario28/megu-mc/releases/download/v0.1.0-alpha.2/megu-v0.1.0-alpha.2-windows-x86_64.tar.gz)** | `megu.exe`, `megu-client-gpu.exe`, `megu-client.exe`, `megu-installer.exe`, `megu-mod-check.exe`, `megu-world-migrate.exe`, `megu-init.exe`, `megu-admin.exe` |
+| **`windows-arm64`** | **[`megu-v0.1.0-alpha.2-windows-arm64.tar.gz`](https://github.com/nekomario28/megu-mc/releases/download/v0.1.0-alpha.2/megu-v0.1.0-alpha.2-windows-arm64.tar.gz)** | `megu.exe`, `megu-client-gpu.exe`, `megu-client.exe`, `megu-installer.exe`, `megu-mod-check.exe`, `megu-world-migrate.exe`, `megu-init.exe`, `megu-admin.exe` |
+| **`linux-x86_64`** | **[`megu-v0.1.0-alpha.2-linux-x86_64.tar.gz`](https://github.com/nekomario28/megu-mc/releases/download/v0.1.0-alpha.2/megu-v0.1.0-alpha.2-linux-x86_64.tar.gz)** | `megu`, `megu-client-gpu`, `megu-client`, `megu-installer`, `megu-mod-check`, `megu-world-migrate`, `megu-init`, `megu-admin` |
+| **`linux-arm64`** | **[`megu-v0.1.0-alpha.2-linux-arm64.tar.gz`](https://github.com/nekomario28/megu-mc/releases/download/v0.1.0-alpha.2/megu-v0.1.0-alpha.2-linux-arm64.tar.gz)** | `megu`, `megu-client-gpu`, `megu-client`, `megu-installer`, `megu-mod-check`, `megu-world-migrate`, `megu-init`, `megu-admin` |
+| **`linux-x86_64-musl`** | **[`megu-v0.1.0-alpha.2-linux-x86_64-musl.tar.gz`](https://github.com/nekomario28/megu-mc/releases/download/v0.1.0-alpha.2/megu-v0.1.0-alpha.2-linux-x86_64-musl.tar.gz)** | Server-only (static): `megu`, `megu-installer` |
+| **`linux-arm64-musl`** | **[`megu-v0.1.0-alpha.2-linux-arm64-musl.tar.gz`](https://github.com/nekomario28/megu-mc/releases/download/v0.1.0-alpha.2/megu-v0.1.0-alpha.2-linux-arm64-musl.tar.gz)** | Server-only (static): `megu`, `megu-installer` |
+| **`macos-arm64`** | **[`megu-v0.1.0-alpha.2-macos-arm64.tar.gz`](https://github.com/nekomario28/megu-mc/releases/download/v0.1.0-alpha.2/megu-v0.1.0-alpha.2-macos-arm64.tar.gz)** | `megu`, `megu-client-gpu`, `megu-client`, `megu-installer`, `megu-mod-check`, `megu-world-migrate`, `megu-init`, `megu-admin` |
+| **`macos-x86_64`** | **[`megu-v0.1.0-alpha.2-macos-x86_64.tar.gz`](https://github.com/nekomario28/megu-mc/releases/download/v0.1.0-alpha.2/megu-v0.1.0-alpha.2-macos-x86_64.tar.gz)** | `megu`, `megu-client-gpu`, `megu-client`, `megu-installer`, `megu-mod-check`, `megu-world-migrate`, `megu-init`, `megu-admin` |
+
+> **Which binary do I run?** `megu-client-gpu` is the native GPU game client for playing (`megu-client` is the headless/CLI client), `megu` runs the dedicated server, and `megu-installer` fetches the required vanilla 1.21.1 assets cleanly on first run.
 
 ```sh
 ./megu-installer server --dir ./megu-server

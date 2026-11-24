@@ -357,7 +357,16 @@ jobs:
           RELEASE_VERSION: ${{ needs.preflight.outputs.version }}
           RELEASE_DRAFT: ${{ inputs.draft }}
         run: |
-          options=(--title "$RELEASE_VERSION" --generate-notes)
+          cat > release-notes.md <<'EOF'
+          ## Quick Start
+
+          - **Playing (GUI):** run `megu-client-gpu` — the native GPU game client (Vulkan / DX12 / Metal). `megu-client` is the headless/CLI client.
+          - **First-time setup:** `megu-installer` fetches the required vanilla 1.21.1 assets and registers the Megu profile.
+          - **Server:** `megu` runs the dedicated server.
+
+          `*-musl` archives are statically linked and **server-only** (`megu` + `megu-installer`).
+          EOF
+          options=(--title "$RELEASE_VERSION" --generate-notes --notes-file release-notes.md)
           if [[ "$GITHUB_EVENT_NAME" == push ]]; then
             options+=(--verify-tag)
           else
