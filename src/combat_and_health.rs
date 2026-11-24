@@ -1104,16 +1104,17 @@ fn wind_charge_trigger_at(dim: DimId, x: i32, y: i32, z: i32) -> bool {
         note_block_update_dim(dim, px, py, pz, nst);
         true
     };
-    if name == "minecraft:lever" {
+    if is_lever_name(name) {
         return set(st, "powered", if powered { "false" } else { "true" }, x, y, z);
     }
     if reg.in_tag(st, "minecraft:buttons") || name.ends_with("_button") {
         return !powered && set(st, "powered", "true", x, y, z);
     }
-    if name == "minecraft:bell" {
+    if is_bell_name(name) {
         return !powered && set(st, "powered", "true", x, y, z);
     }
-    let iron = name == "minecraft:iron_door" || name == "minecraft:iron_trapdoor";
+    let iron_path = block_path(name);
+    let iron = iron_path == "iron_door" || iron_path == "iron_trapdoor";
     let toggleable =
         name.ends_with("_door") || name.ends_with("_trapdoor") || name.ends_with("_fence_gate");
     if !toggleable || iron || powered {

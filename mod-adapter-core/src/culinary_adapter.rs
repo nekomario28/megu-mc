@@ -537,8 +537,9 @@ impl CookingPotState {
 /// Is the block directly under a pot/stove a heat source?
 ///
 /// Direct sources: `campfire`/`soul_campfire`/`fire`/`soul_fire`/
-/// `magma_block`/`lava`, everything in `#farmersdelight:heat_sources`, and
-/// `farmersdelight:stove[lit=true]`. A block in
+/// `magma_block`/`lava`, everything in `#farmersdelight:heat_sources` or the
+/// cross-mod `#c:heat_sources` union, lit `*:stove`/`*:cooktop`/`*:brazier`
+/// blocks in any namespace, and `farmersdelight:stove[lit=true]`. A block in
 /// `#farmersdelight:heat_conductors` conducts heat from a direct source
 /// one block further down (`block_two_below`).
 pub fn is_heated(block_below: &str, block_two_below: Option<&str>, tags: &TagIndex) -> bool {
@@ -547,8 +548,12 @@ pub fn is_heated(block_below: &str, block_two_below: Option<&str>, tags: &TagInd
         if state.contains("lit=false") {
             return false;
         }
-        if id == "farmersdelight:stove" {
-            return state.contains("lit=true");
+        // Lit-gated cooking blocks in any namespace: `stove`, `cooktop` and
+        // `brazier` paths heat while `lit=true` — or unconditionally when the
+        // block carries no `lit` property at all.
+        let path = id.rsplit(':').next().unwrap_or(id);
+        if matches!(path, "stove" | "cooktop" | "brazier") {
+            return state.contains("lit=true") || !state.contains("lit=");
         }
         const BUILTIN_HEAT: &[&str] = &[
             "minecraft:campfire",
@@ -559,7 +564,9 @@ pub fn is_heated(block_below: &str, block_two_below: Option<&str>, tags: &TagInd
             "minecraft:lava",
             "minecraft:lava_cauldron",
         ];
-        BUILTIN_HEAT.contains(&id) || tag_contains(tags, "farmersdelight:heat_sources", id)
+        BUILTIN_HEAT.contains(&id)
+            || tag_contains(tags, "farmersdelight:heat_sources", id)
+            || tag_contains(tags, "c:heat_sources", id)
     }
 
     let (id, state) = split_state(block_below);
@@ -1632,5 +1639,58 @@ fn write_slot_fp(f: &mut FingerprintBuilder, slot: &Option<SlotStack>) {
         Some((id, count)) => {
             f.write_u8(1).write_str(id).write_u16(*count);
         }
+    }
+}
+
+#[cfg(test)]
+mod heat_source_family_tests {
+    use super::*;
+    use std::collections::BTreeSet;
+
+    fn tag_index(entries: &[(&str, &[&str])]) -> TagIndex {
+        entries
+            .iter()
+            .map(|(tag, members)| {
+                (
+                    (*tag).to_string(),
+                    members.iter().map(|m| (*m).to_string()).collect::<BTreeSet<_>>(),
+                )
+            })
+            .collect()
+    }
+
+    #[test]
+    fn stove_cooktop_brazier_heat_in_any_namespace() {
+        let tags = TagIndex::new();
+        // Lit-gated blocks: lit=true heats, lit=false does not (the early
+        // return owns the unlit case for every source).
+        assert!(is_heated("farmersdelight:stove[lit=true]", None, &tags));
+        assert!(is_heated("mymod:cooktop[lit=true,facing=north]", None, &tags));
+        assert!(is_heated("othermod:brazier[lit=true]", None, &tags));
+        assert!(!is_heated("farmersdelight:stove[lit=false]", None, &tags));
+        assert!(!is_heated("mymod:cooktop[lit=false]", None, &tags));
+        assert!(!is_heated("othermod:brazier[lit=false]", None, &tags));
+        // A block with no lit property at all still counts as a heat block.
+        assert!(is_heated("mymod:brazier", None, &tags));
+        // Non-heat blocks stay cold.
+        assert!(!is_heated("minecraft:stone", None, &tags));
+        assert!(!is_heated("mymod:oven[lit=true]", None, &tags));
+    }
+
+    #[test]
+    fn c_heat_sources_tag_joins_the_heat_union() {
+        let tags = tag_index(&[(
+            "c:heat_sources",
+            &["mymod:oven", "#farmersdelight:heat_sources"],
+        )]);
+        let mut tags = tags;
+        tags.insert(
+            "farmersdelight:heat_sources".to_string(),
+            ["farmersdelight:stove".to_string()].into_iter().collect(),
+        );
+        assert!(is_heated("mymod:oven", None, &tags));
+        // Nested `#` members resolve through the same tag walk.
+        assert!(is_heated("farmersdelight:stove", None, &tags));
+        assert!(!is_heated("minecraft:stone", None, &tags));
     }
 }

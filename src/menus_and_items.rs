@@ -3264,20 +3264,110 @@ fn furnace_xp_pop(f: &mut Furnace, px: f64, py: f64, pz: f64) {
         xp_spawn(px, py + 1.0, pz, whole);
     }
 }
-fn fuel_ticks(item: i64) -> i32 {
-    for (n, t) in [
-        ("coal", 1600),
-        ("charcoal", 1600),
-        ("oak_log", 300),
-        ("oak_planks", 300),
-        ("stick", 100),
-        ("coal_block", 16000),
-    ] {
-        if name_to_item(n) == Some(item) {
-            return server_ticks(t) as i32;
-        }
+/// Whether `stem` names a wood family for fuel purposes: `{ns}:{stem}_planks`
+/// or `{ns}:{stem}_log` resolves to a real item — which covers every vanilla
+/// wood and any modded wood that ships the usual companions — plus the one
+/// mosaic wood that has no `_planks` form.
+fn fuel_wooden_stem(ns: &str, stem: &str) -> bool {
+    if stem == "bamboo_mosaic" {
+        return true;
     }
-    0
+    name_to_item(&format!("{ns}:{stem}_planks")).is_some()
+        || name_to_item(&format!("{ns}:{stem}_log")).is_some()
+}
+
+/// Vanilla 1.21.1 furnace fuel values in game ticks, namespace-agnostic:
+/// exact-path fuels match in any namespace, wood-family suffixes
+/// (`*_log`/`*_planks`/`*_stairs`/…) require a wooden stem so stone and
+/// iron variants stay cold, and modded woods/coals burn through the same
+/// rules.
+fn fuel_ticks(item: i64) -> i32 {
+    let Some(name) = item_to_name(item) else {
+        return 0;
+    };
+    let (ns, path) = name
+        .rsplit_once(':')
+        .map_or(("minecraft", name), |(ns, path)| (ns, path));
+    let wooden = |stem: &str| fuel_wooden_stem(ns, stem);
+    let suffix_stem = |suffix: &str| path.strip_suffix(suffix);
+    let ticks: u64 = match path {
+        "lava_bucket" => 20_000,
+        "coal_block" => 16_000,
+        "dried_kelp_block" => 4_000,
+        "blaze_rod" => 2_400,
+        "coal" | "charcoal" => 1_600,
+        _ => {
+            if path == "boat" || path.ends_with("_boat") || path.ends_with("_raft") {
+                1_200
+            } else if let Some(stem) = suffix_stem("_slab") {
+                if wooden(stem) {
+                    150
+                } else {
+                    0
+                }
+            } else if ["_log", "_wood", "_stem", "_hyphae", "_planks"]
+                .iter()
+                .any(|suffix| path.ends_with(suffix))
+                || [
+                    "_fence",
+                    "_fence_gate",
+                    "_stairs",
+                    "_trapdoor",
+                    "_door",
+                    "_button",
+                    "_pressure_plate",
+                ]
+                .iter()
+                .any(|suffix| {
+                    path.strip_suffix(suffix)
+                        .is_some_and(|stem| wooden(stem))
+                })
+            {
+                300
+            } else if path.ends_with("_hanging_sign") || path.ends_with("_sign") {
+                300
+            } else if matches!(
+                path,
+                "crafting_table"
+                    | "bookshelf"
+                    | "chiseled_bookshelf"
+                    | "lectern"
+                    | "composter"
+                    | "chest"
+                    | "trapped_chest"
+                    | "barrel"
+                    | "jukebox"
+                    | "note_block"
+                    | "loom"
+                    | "cartography_table"
+                    | "fletching_table"
+                    | "smithing_table"
+                    | "daylight_detector"
+                    | "bamboo_mosaic"
+            ) || path == "banner"
+                || path.ends_with("_banner")
+            {
+                300
+            } else if matches!(path, "stick" | "bamboo" | "bowl")
+                || path == "sapling"
+                || path.ends_with("_sapling")
+                || path.ends_with("_wool")
+                || path.ends_with("_carpet")
+                || path.starts_with("wooden_")
+            {
+                100
+            } else if path == "scaffolding" {
+                50
+            } else {
+                0
+            }
+        }
+    };
+    if ticks == 0 {
+        0
+    } else {
+        server_ticks(ticks) as i32
+    }
 }
 static CHESTS: Registry<ContainerKey, HashMap<i16, Stack>> = OnceLock::new();
 

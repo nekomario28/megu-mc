@@ -9892,13 +9892,7 @@ fn live_vehicle_env(dim: DimId, etype: i64, pos: [f64; 3], kind: VehicleKind) ->
                 level.floor() as i32,
                 z.floor() as i32,
             );
-            matches!(
-                reg.name_of(state),
-                "minecraft:rail"
-                    | "minecraft:powered_rail"
-                    | "minecraft:detector_rail"
-                    | "minecraft:activator_rail"
-            )
+            is_rail_name(reg.name_of(state))
         })
     });
     VehicleEnv {
@@ -12628,10 +12622,11 @@ fn handle_inner(mut s: TcpStream, live_eid: Arc<AtomicI32>) {
                         continue;
                     }
                 }
-                // bed: right-click at night skips to morning
+                // bed: right-click at night skips to morning — `#minecraft:beds`
+                // members plus any modded `*_bed` block (comforts, mymod, …).
                 if block_registry::breg().is_some_and(|registry| {
                     let name = registry.name_of(clicked);
-                    name.starts_with("minecraft:") && name.ends_with("_bed")
+                    registry.in_tag(clicked, "minecraft:beds") || name.ends_with("_bed")
                 }) {
                     let wt = WORLD_TIME.load(Ordering::Relaxed) % 24000;
                     // Vanilla sleeps at night or during a thunderstorm, and

@@ -2415,10 +2415,14 @@ impl spawner::ChunkGenerationWorld for LiveChunkGenWorld {
             return false;
         };
         let below = block_at_dim(self.dim, pos.0, pos.1 - 1, pos.2);
-        (reg.name_of(below) == "minecraft:grass_block"
+        let below_name = reg.name_of(below);
+        let below_path = block_path(below_name);
+        ((reg.in_tag(below, "minecraft:animals_spawnable_on")
+            || below_path == "grass_block"
+            || below_path.ends_with("_grass_block"))
             || (reg.side_solid(below, 1)
                 && !reg.in_tag(below, "minecraft:leaves")
-                && !reg.name_of(below).ends_with("_leaves")))
+                && !below_name.ends_with("_leaves")))
             && live_spawn_clear(reg, self.dim, pos.0, pos.1, pos.2)
     }
 
@@ -4917,7 +4921,7 @@ fn w1_arrow_tick_inner(before: &mut HashMap<i32, ([f64; 6], bool)>) {
             .map(|a| [a.x, a.y, a.z])
             .unwrap_or([prev[0] + prev[3], prev[1] + prev[4], prev[2] + prev[5]]);
         let cell = at.map(|coord| coord.floor() as i32);
-        if reg.name_of(block_at(cell[0], cell[1], cell[2])) == "minecraft:target" {
+        if is_target_name(reg.name_of(block_at(cell[0], cell[1], cell[2]))) {
             w1_live_target_projectile_hit(
                 DimId::Overworld,
                 RsPos(cell[0], cell[1], cell[2]),
@@ -4979,7 +4983,7 @@ fn w1_detector_rails() -> &'static Mutex<HashSet<DimBlockPos>> {
 fn w1_detector_power(dim: DimId, x: i32, y: i32, z: i32, on: bool) {
     let Some(reg) = breg() else { return };
     let st = block_at_dim(dim, x, y, z);
-    if reg.name_of(st) != "minecraft:detector_rail" {
+    if !is_detector_rail_name(reg.name_of(st)) {
         return;
     }
     let next = reg.with_prop(st, "powered", if on { "true" } else { "false" });
@@ -5125,18 +5129,11 @@ fn w1_vehicle_tick() {
                 );
                 let rail = [by, by - 1].into_iter().find_map(|ry| {
                     let st = block_at_dim(dim, bx, ry, bz);
-                    matches!(
-                        reg.name_of(st),
-                        "minecraft:rail"
-                            | "minecraft:powered_rail"
-                            | "minecraft:detector_rail"
-                            | "minecraft:activator_rail"
-                    )
-                    .then_some((ry, st))
+                    is_rail_name(reg.name_of(st)).then_some((ry, st))
                 });
                 if let Some((ry, st)) = rail {
                     let name = reg.name_of(st);
-                    if name == "minecraft:powered_rail" {
+                    if is_powered_rail_name(name) {
                         if reg.get_prop(st, "powered").as_deref() == Some("true") {
                             let shape = match reg.get_prop(st, "shape").as_deref() {
                                 Some("east_west") => WmRailShape::EastWest,
@@ -5173,7 +5170,7 @@ fn w1_vehicle_tick() {
                     // The rail carries y: the cart rides 0.0625 above the
                     // rail block's top face.
                     new_pos = [pos[0] + vel[0], f64::from(ry) + 0.0625, pos[2] + vel[2]];
-                    if name == "minecraft:detector_rail" && wm_detector_rail_signal(true) == 15 {
+                    if is_detector_rail_name(name) && wm_detector_rail_signal(true) == 15 {
                         occupied_rails.insert((dim, bx, ry, bz));
                     }
                 } else {
@@ -7605,12 +7602,13 @@ impl crate::minecart::World for CartRuntimeWorld {
     fn rail(&mut self, at: BlockPos) -> Option<crate::minecart::Rail> {
         let reg = crate::block_registry::breg()?;
         let st = block_at(at.0, at.1, at.2);
-        let powered = match reg.name_of(st) {
-            "minecraft:rail" | "minecraft:detector_rail" | "minecraft:activator_rail" => None,
-            "minecraft:powered_rail" => {
-                Some(reg.get_prop(st, "powered").as_deref() == Some("true"))
-            }
-            _ => return None,
+        let name = reg.name_of(st);
+        let powered = if is_powered_rail_name(name) {
+            Some(reg.get_prop(st, "powered").as_deref() == Some("true"))
+        } else if is_rail_name(name) {
+            None
+        } else {
+            return None;
         };
         let shape = match reg.get_prop(st, "shape")?.as_str() {
             "north_south" => crate::minecart::Shape::NorthSouth,
@@ -10053,6 +10051,17 @@ fn on_random_tick_dim(reg: &crate::block_registry::BReg, dim: DimId, x: i32, y: 
         _ if p2_plant_random_tick(reg, dim, x, y, z, st) => {}
         name if name.ends_with("_leaves") => leaf_random_tick(reg, dim, x, y, z, st),
         name if name.ends_with("_sapling") => sapling_random_tick(reg, dim, x, y, z, st),
+        // `#minecraft:crops` members (vanilla's torchflower/pitcher crops and
+        // datapack additions) plus any non-vanilla block carrying an `age`
+        // property get the same natural growth ticks — Farmer's Delight,
+        // Biomes O' Plenty and `.mmod` crops included.
+        crop_name
+            if reg.in_tag(st, "minecraft:crops")
+                || (!crop_name.starts_with("minecraft:")
+                    && reg.get_prop(st, "age").is_some()) =>
+        {
+            crop_random_tick(reg, dim, x, y, z, st)
+        }
         _ => {}
     }
 }
@@ -10176,7 +10185,8 @@ fn crop_random_tick(
         "minecraft:pumpkin_stem" => CropKind::PumpkinStem,
         "minecraft:sweet_berry_bush" => CropKind::SweetBerryBush,
         "minecraft:cocoa" => CropKind::Cocoa,
-        _ => CropKind::NetherWart,
+        "minecraft:nether_wart" => CropKind::NetherWart,
+        _ => CropKind::Modded,
     };
     let age: u8 = reg
         .get_prop(st, "age")
@@ -10227,7 +10237,17 @@ fn crop_random_tick(
             }
         }
         if allowed {
-            set_block_dim(dim, x, y, z, reg.with_prop(st, "age", &new_age.to_string()));
+            let next = reg.with_prop(st, "age", &new_age.to_string());
+            // Modded crops top out at their own `age` domain: `with_prop`
+            // leaves the state untouched for a value the block does not
+            // have, so a refused stage simply does not write.
+            if kind == CropKind::Modded
+                && reg.get_prop(next, "age").and_then(|v| v.parse::<u8>().ok())
+                    != Some(new_age)
+            {
+                return;
+            }
+            set_block_dim(dim, x, y, z, next);
             note_block_update_dim(dim, x, y, z, st);
         }
     }
@@ -10249,6 +10269,7 @@ fn fire_flammable(reg: &crate::block_registry::BReg, st: u32) -> bool {
         || (name.ends_with("_fence") || name.ends_with("_fence_gate"))
             && !name.contains("nether_brick")
         || name.ends_with("_bookshelf")
+        || is_target_name(name)
         || matches!(
             name,
             "minecraft:tnt"
@@ -10258,7 +10279,6 @@ fn fire_flammable(reg: &crate::block_registry::BReg, st: u32) -> bool {
                 | "minecraft:composter"
                 | "minecraft:beehive"
                 | "minecraft:bookshelf"
-                | "minecraft:target"
                 | "minecraft:bamboo"
         )
 }
@@ -10604,7 +10624,25 @@ fn grass_random_tick(
         let ny = y + world_rng::next_below(5) as i32 - 3;
         let nz = z + world_rng::next_below(3) as i32 - 1;
         let target_above = block_at_dim(dim, nx, ny + 1, nz);
-        let target_is_dirt = reg.name_of(block_at_dim(dim, nx, ny, nz)) == "minecraft:dirt";
+        let target_pos = block_at_dim(dim, nx, ny, nz);
+        let target_name = reg.name_of(target_pos);
+        // Vanilla spreads only onto `minecraft:dirt`; the `#minecraft:dirt`
+        // tag adds datapack/modded members, minus the tag's own non-plain
+        // entries (podzol, coarse/rooted dirt, mycelium, moss, mud) which
+        // vanilla never converts.
+        let target_is_dirt = target_name.ends_with(":dirt")
+            || (reg.in_tag(target_pos, "minecraft:dirt")
+                && !matches!(
+                    target_name,
+                    "minecraft:grass_block"
+                        | "minecraft:podzol"
+                        | "minecraft:coarse_dirt"
+                        | "minecraft:mycelium"
+                        | "minecraft:rooted_dirt"
+                        | "minecraft:moss_block"
+                        | "minecraft:mud"
+                        | "minecraft:muddy_mangrove_roots"
+                ));
         let target_above_blocks = reg.can_occlude(target_above) || reg.is_liquid(target_above);
         if eval_grass_spread(input(target_is_dirt, target_above_blocks))
             != GrassSpreadResult::SpreadToNeighbor
@@ -12361,11 +12399,11 @@ fn redstone_component(reg: &BReg, state: u32) -> bool {
             | "minecraft:comparator"
             | "minecraft:redstone_lamp"
             | "minecraft:observer"
-            | "minecraft:target"
             | "minecraft:hopper"
             | "minecraft:dispenser"
             | "minecraft:dropper"
-    ) || reg.in_tag(state, "minecraft:buttons")
+    ) || is_target_name(reg.name_of(state))
+        || reg.in_tag(state, "minecraft:buttons")
 }
 
 fn nearby_redstone(reg: &BReg, dim: DimId, RsPos(x, y, z): RsPos) -> bool {
@@ -12889,10 +12927,50 @@ fn placement_powered(world: &PlacementWorld, pos: (i32, i32, i32)) -> bool {
     rs_neighbor_signal(world, RsPos(pos.0, pos.1, pos.2), true) != 0
 }
 
+/// The block-name path after `namespace:` — `minecraft:oak_slab` and a
+/// modded `mymod:oak_slab` both reduce to `oak_slab`; a bare name passes
+/// through unchanged.
+fn block_path(name: &str) -> &str {
+    name.rsplit_once(':').map_or(name, |(_, path)| path)
+}
+
+/// `*_rail` families, namespace-agnostic: `minecraft:rail`, `mymod:rail`
+/// and `mymod:express_rail` all count as rails.
+fn is_rail_name(name: &str) -> bool {
+    let path = block_path(name);
+    path == "rail" || path.ends_with("_rail")
+}
+fn is_powered_rail_name(name: &str) -> bool {
+    let path = block_path(name);
+    path == "powered_rail" || path.ends_with("_powered_rail")
+}
+fn is_detector_rail_name(name: &str) -> bool {
+    let path = block_path(name);
+    path == "detector_rail" || path.ends_with("_detector_rail")
+}
+fn is_activator_rail_name(name: &str) -> bool {
+    let path = block_path(name);
+    path == "activator_rail" || path.ends_with("_activator_rail")
+}
+/// `TargetBlock`-family: `minecraft:target` plus modded `*:target`/`*_target`.
+fn is_target_name(name: &str) -> bool {
+    let path = block_path(name);
+    path == "target" || path.ends_with("_target")
+}
+/// Lever/bell families for the wind-charge trigger and support rules:
+/// `minecraft:lever`/`minecraft:bell` plus any modded `*:lever`, `*_lever`,
+/// `*:bell` or `*_bell` spelling.
+fn is_lever_name(name: &str) -> bool {
+    name.ends_with(":lever") || name.ends_with("_lever")
+}
+fn is_bell_name(name: &str) -> bool {
+    name.ends_with(":bell") || name.ends_with("_bell")
+}
+
 /// `ItemUtils.isSameStack` on the block id: the clicked slab absorbs only an
 /// identical slab item (`SlabBlock.canBeReplaced`).
 fn slab_absorbs(reg: &BReg, clicked_state: u32, block_name: &str, ctx: &PlacementCtx) -> bool {
-    if reg.name_of(clicked_state) != format!("minecraft:{block_name}")
+    if reg.name_of(clicked_state) != crate::block_registry::ns_name(block_name)
         || reg.get_prop(clicked_state, "type").as_deref() == Some("double")
     {
         return false;
@@ -12983,10 +13061,9 @@ fn placement_can_survive(reg: &BReg, dim: DimId, ctx: &PlacementCtx, st: u32) ->
         };
     }
     if name.ends_with("_door")
-        || name.ends_with("_rail")
-        || name == "minecraft:rail"
+        || is_rail_name(name)
         || name.ends_with("_pressure_plate")
-        || name == "minecraft:bell"
+        || is_bell_name(name)
     {
         return up_sturdy(below);
     }
@@ -13094,10 +13171,7 @@ fn rail_connections(
     get: &dyn Fn((i32, i32, i32)) -> u32,
     pos: (i32, i32, i32),
 ) -> Vec<(RsDir, bool)> {
-    let is_rail = |st: u32| {
-        let n = reg.name_of(st);
-        n == "minecraft:rail" || n.ends_with("_rail")
-    };
+    let is_rail = |st: u32| is_rail_name(reg.name_of(st));
     let mut out = Vec::new();
     for dir in RsDir::HORIZONTAL {
         let (dx, _, dz) = dir.offset();
@@ -13119,10 +13193,10 @@ fn rail_connections(
 }
 
 fn rail_shape_for(reg: &BReg, st: u32, conns: &[(RsDir, bool)]) -> Option<&'static str> {
-    let straight = matches!(
-        reg.name_of(st),
-        "minecraft:powered_rail" | "minecraft:detector_rail" | "minecraft:activator_rail"
-    );
+    let name = reg.name_of(st);
+    let straight = is_powered_rail_name(name)
+        || is_detector_rail_name(name)
+        || is_activator_rail_name(name);
     let has = |d: RsDir| conns.iter().any(|&(dir, _)| dir == d);
     let pair = |a: RsDir, b: RsDir| has(a) && has(b);
     if !straight {
@@ -13174,7 +13248,7 @@ fn rail_shape_for(reg: &BReg, st: u32, conns: &[(RsDir, bool)]) -> Option<&'stat
 fn rail_update_at(reg: &BReg, dim: DimId, pos: (i32, i32, i32)) {
     let st = block_at_dim(dim, pos.0, pos.1, pos.2);
     let st_name = reg.name_of(st);
-    if st_name != "minecraft:rail" && !st_name.ends_with("_rail") {
+    if !is_rail_name(st_name) {
         return;
     }
     let conns = rail_connections(reg, &|p| block_at_dim(dim, p.0, p.1, p.2), pos);
@@ -13192,7 +13266,7 @@ fn rail_update_at(reg: &BReg, dim: DimId, pos: (i32, i32, i32)) {
 /// second halves after). `None` means the item does not resolve to a block.
 fn placement_states(reg: &BReg, item_name: &str, ctx: &PlacementCtx) -> Option<PlacementWrites> {
     let name = placement_block_name(item_name, ctx.face)?;
-    let full = format!("minecraft:{name}");
+    let full = crate::block_registry::ns_name(&name);
     let st0 = reg.state_of(&full, None);
     if reg.name_of(st0) != full.as_str() {
         return None;
@@ -13527,7 +13601,7 @@ fn try_live_block_placement(
         return false;
     }
     let name = placement_block_name(item_name, face as u8).unwrap();
-    let full = format!("minecraft:{name}");
+    let full = crate::block_registry::ns_name(&name);
     let st0 = reg.state_of(&full, None);
     if reg.name_of(st0) != full {
         return false;
@@ -14170,17 +14244,19 @@ fn neighbor_loses_support(reg: &BReg, state: u32, toward: u8, support: u32) -> b
     let below_sturdy = |s: u32| reg.is_face_sturdy(s, 1, Support::Full);
     match name {
         // Attached below: the support is the cell under the block.
-        "minecraft:rail" | "minecraft:bell" if toward == 0 => !below_sturdy(support),
-        _ if name.ends_with("_rail") || name.ends_with("_pressure_plate") => {
-            toward == 0 && !below_sturdy(support)
+        _ if (is_rail_name(name) || is_bell_name(name)) && toward == 0 => {
+            !below_sturdy(support)
         }
+        _ if name.ends_with("_pressure_plate") => toward == 0 && !below_sturdy(support),
         "minecraft:redstone_wire" | "minecraft:repeater" | "minecraft:comparator" => {
             toward == 0 && !(below_sturdy(support) || reg.name_of(support) == "minecraft:hopper")
         }
         _ if name.ends_with("_carpet") => toward == 0 && !below_sturdy(support),
         // AttachFace blocks (lever, buttons, grindstone): face picks the support
         // direction — floor attaches below, ceiling above, wall toward `facing`.
-        "minecraft:lever" | "minecraft:grindstone" if toward == attach_face_toward(reg, state) => {
+        _ if (is_lever_name(name) || name == "minecraft:grindstone")
+            && toward == attach_face_toward(reg, state) =>
+        {
             !below_sturdy(support)
         }
         _ if name.ends_with("_button") && toward == attach_face_toward(reg, state) => {
@@ -27250,5 +27326,175 @@ mod directional_shadow_live_tests {
             light_level: 14,
         }];
         assert_eq!(effective_gameplay_light(&shaded, 0, &torch, [0, 64, 0], &cfg), 12);
+    }
+}
+
+#[cfg(test)]
+mod hardcode_fix_generic_rules_tests {
+    use super::*;
+
+    #[test]
+    fn rail_target_lever_bell_names_are_namespace_agnostic() {
+        for name in [
+            "minecraft:detector_rail",
+            "mymod:detector_rail",
+            "other:express_detector_rail",
+        ] {
+            assert!(is_detector_rail_name(name), "{name}");
+        }
+        assert!(!is_detector_rail_name("minecraft:rail"));
+        assert!(is_powered_rail_name("minecraft:powered_rail"));
+        assert!(is_powered_rail_name("mymod:gold_powered_rail"));
+        assert!(!is_powered_rail_name("minecraft:detector_rail"));
+        assert!(is_rail_name("minecraft:rail"));
+        assert!(is_rail_name("mymod:rail"));
+        assert!(is_rail_name("minecraft:activator_rail"));
+        assert!(!is_rail_name("minecraft:stone"));
+
+        assert!(is_target_name("minecraft:target"));
+        assert!(is_target_name("mymod:archery_target"));
+        assert!(is_target_name("other:target"));
+        assert!(!is_target_name("minecraft:hay_block"));
+
+        assert!(is_lever_name("minecraft:lever"));
+        assert!(is_lever_name("comforts:lever"));
+        assert!(is_lever_name("mymod:redstone_lever"));
+        assert!(!is_lever_name("minecraft:lever_block"));
+        // `block_path` strips the namespace so `*:iron_door` exclusions work.
+        assert_eq!(block_path("minecraft:iron_door"), "iron_door");
+        assert_eq!(block_path("mymod:iron_door"), "iron_door");
+        assert_eq!(block_path("minecraft:oak_door"), "oak_door");
+        assert!(is_bell_name("minecraft:bell"));
+        assert!(is_bell_name("mymod:school_bell"));
+        assert!(!is_bell_name("minecraft:doorbell_block"));
+    }
+
+    #[test]
+    fn fuel_ticks_covers_full_vanilla_table_and_rejects_nonfuels() {
+        let fuel = |name: &str| -> i32 {
+            let item = name_to_item(name).unwrap_or_else(|| panic!("missing item {name}"));
+            fuel_ticks(item)
+        };
+        // High-value fuels.
+        assert_eq!(fuel("lava_bucket"), server_ticks(20_000) as i32);
+        assert_eq!(fuel("coal_block"), server_ticks(16_000) as i32);
+        assert_eq!(fuel("dried_kelp_block"), server_ticks(4_000) as i32);
+        assert_eq!(fuel("blaze_rod"), server_ticks(2_400) as i32);
+        assert_eq!(fuel("coal"), server_ticks(1_600) as i32);
+        assert_eq!(fuel("charcoal"), server_ticks(1_600) as i32);
+        // Boats.
+        for name in ["oak_boat", "oak_chest_boat", "bamboo_raft"] {
+            assert_eq!(fuel(name), server_ticks(1_200) as i32, "{name}");
+        }
+        // 300-tick wood family and furniture.
+        for name in [
+            "oak_log",
+            "spruce_log",
+            "oak_wood",
+            "crimson_hyphae",
+            "warped_stem",
+            "crimson_stem",
+            "warped_hyphae",
+            "oak_planks",
+            "bamboo_mosaic",
+            "oak_fence",
+            "oak_fence_gate",
+            "oak_stairs",
+            "oak_trapdoor",
+            "oak_door",
+            "oak_button",
+            "oak_pressure_plate",
+            "oak_sign",
+            "oak_hanging_sign",
+            "crafting_table",
+            "bookshelf",
+            "chiseled_bookshelf",
+            "lectern",
+            "composter",
+            "chest",
+            "trapped_chest",
+            "barrel",
+            "jukebox",
+            "note_block",
+            "loom",
+            "cartography_table",
+            "fletching_table",
+            "smithing_table",
+            "daylight_detector",
+            "white_banner",
+        ] {
+            assert_eq!(fuel(name), server_ticks(300) as i32, "{name}");
+        }
+        // Wooden slabs burn at 150, stone slabs do not.
+        assert_eq!(fuel("oak_slab"), server_ticks(150) as i32);
+        assert_eq!(fuel("stone_slab"), 0);
+        // 100-tick group.
+        for name in [
+            "stick",
+            "bamboo",
+            "bowl",
+            "white_wool",
+            "white_carpet",
+            "oak_sapling",
+            "wooden_sword",
+        ] {
+            assert_eq!(fuel(name), server_ticks(100) as i32, "{name}");
+        }
+        assert_eq!(fuel("scaffolding"), server_ticks(50) as i32);
+        // Non-fuels: non-wood doors/trapdoors/buttons/plates/fences/stairs,
+        // and plain blocks/items.
+        for name in [
+            "iron_door",
+            "iron_trapdoor",
+            "stone_button",
+            "stone_pressure_plate",
+            "heavy_weighted_pressure_plate",
+            "nether_brick_fence",
+            "stone_stairs",
+            "stone",
+            "diamond",
+        ] {
+            assert_eq!(fuel(name), 0, "{name}");
+        }
+        // Unknown items are cold too.
+        assert_eq!(fuel_ticks(0), 0);
+        assert_eq!(fuel_ticks(-1), 0);
+    }
+
+    #[test]
+    fn fuel_wooden_stem_accepts_real_woods_and_rejects_stone() {
+        assert!(fuel_wooden_stem("minecraft", "oak"));
+        assert!(fuel_wooden_stem("minecraft", "bamboo_mosaic"));
+        assert!(!fuel_wooden_stem("minecraft", "stone"));
+        assert!(!fuel_wooden_stem("minecraft", "iron"));
+        assert!(!fuel_wooden_stem("minecraft", "nether_brick"));
+    }
+
+    #[test]
+    #[cfg(megu_vanilla_data)]
+    fn slab_absorbs_merges_namespaced_modded_slab_into_vanilla_double() {
+        crate::test_support::require_vanilla_data();
+        let reg = crate::block_registry::breg().expect("block registry");
+        let props = jparse(br#"{"type":"bottom"}"#).unwrap();
+        let oak = reg.state_of("minecraft:oak_slab", Some(&props));
+        let spruce = reg.state_of("minecraft:spruce_slab", Some(&props));
+        assert!(oak != 0 && spruce != 0);
+        // Clicking the top face of a bottom half-slab places the upper half;
+        // `block_name` arrives unqualified, so the check must go through the
+        // namespaced registry id — same-slab absorbs, other wood does not.
+        let ctx = PlacementCtx {
+            dim: DimId::Overworld,
+            clicked: (0, 0, 0),
+            face: 1,
+            cursor: (0.5, 0.5, 0.5),
+            yaw: 0.0,
+            pitch: 0.0,
+            sneaking: false,
+            target: (0, 1, 0),
+            target_old: 0,
+        };
+        assert!(slab_absorbs(reg, oak, "oak_slab", &ctx));
+        assert!(!slab_absorbs(reg, spruce, "oak_slab", &ctx));
+        assert!(!slab_absorbs(reg, oak, "stone_slab", &ctx));
     }
 }

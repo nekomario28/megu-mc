@@ -2772,6 +2772,12 @@ enum CropKind {
     PumpkinStem,
     SweetBerryBush,
     Cocoa,
+    /// `#minecraft:crops` members and non-vanilla `age` blocks the name table
+    /// does not know (Farmer's Delight, Biomes O' Plenty, `.mmod` crops).
+    /// Growth follows the generic `CropBlock` rule — light and the farmland
+    /// speed bound, no species cap — and the caller clamps the write to the
+    /// state's real `age` domain.
+    Modded,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -2818,6 +2824,8 @@ fn eval_crop_random_tick(input: CropTickInput) -> Option<u8> {
     let max_age = match input.kind {
         CropKind::Beetroots | CropKind::NetherWart | CropKind::SweetBerryBush => 3,
         CropKind::Cocoa => 2,
+        // The caller enforces the state's own `age` domain for modded crops.
+        CropKind::Modded => u8::MAX,
         _ => 7,
     };
     if input.age >= max_age {
@@ -2833,6 +2841,21 @@ fn eval_crop_random_tick(input: CropTickInput) -> Option<u8> {
         | CropKind::MelonStem
         | CropKind::PumpkinStem => {
             if input.light < 9 || !input.farmland_below {
+                return None;
+            }
+            let speed = crop_growth_speed(
+                input.farmland_3x3,
+                input.same_crop_north_south,
+                input.same_crop_east_west,
+            );
+            let bound = (25.0_f32 / speed) as u32 + 1;
+            input.random_value.is_multiple_of(bound)
+        }
+        // Vanilla `CropBlock.randomTick` does not require farmland to tick —
+        // only light and the growth-speed roll — so modded crops get the same
+        // rule without the `farmland_below` gate.
+        CropKind::Modded => {
+            if input.light < 9 {
                 return None;
             }
             let speed = crop_growth_speed(
