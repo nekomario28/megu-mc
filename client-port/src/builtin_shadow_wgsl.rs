@@ -926,6 +926,116 @@ pub fn enchantment_glint_rgb(uv: [f32; 2], time_seconds: f32) -> [f32; 3] {
     ]
 }
 
+/// Eye-comfort highlight roll-off mirrored by the WGSL
+/// `comfort_soft_shoulder` helper in [`MEGU_TERRAIN_LIT_WGSL`]. Colours
+/// whose Rec.709 luma sits at or below the 0.72 knee pass through 1:1 so
+/// vanilla block albedo keeps its iconic warmth and crisp contrast;
+/// brighter lumas ease toward the 0.97 ceiling along a rational,
+/// hue-preserving shoulder, so noon snow, quartz and sand roll off
+/// softly instead of clipping to a flat, glaring white.
+pub fn comfort_soft_shoulder(rgb: [f32; 3]) -> [f32; 3] {
+    const KNEE: f32 = 0.72;
+    const CEILING: f32 = 0.97;
+    let color = rgb.map(|channel| {
+        if channel.is_finite() {
+            channel.max(0.0)
+        } else {
+            0.0
+        }
+    });
+    let luma = color[0] * 0.2126 + color[1] * 0.7152 + color[2] * 0.0722;
+    if luma <= 0.0 {
+        return [0.0; 3];
+    }
+    let over = luma - KNEE;
+    let compressed = if over > 0.0 {
+        let span = CEILING - KNEE;
+        KNEE + span * over / (over + span)
+    } else {
+        luma
+    };
+    color.map(|channel| (channel * (compressed / luma)).clamp(0.0, 1.0))
+}
+
+/// Optical air-mass transmittance mirrored by the WGSL
+/// `atmosphere_sun_transmittance` helper shared by
+/// [`MEGU_TERRAIN_LIT_WGSL`] and [`MEGU_SKY_ATMOSPHERE_WGSL`]. Rayleigh
+/// lambda^-4 extinction slides direct sunlight from crisp warm-white at
+/// the zenith to soft honey-amber at low elevation. The dawn/dusk
+/// asymmetry tints overnight-settled, moist morning air toward pastel
+/// rose-apricot while aerosol-rich evening air deepens to amber-copper.
+/// Below the horizon the same curve crossfades (-0.18..0.08) into a
+/// silvery-blue Purkinje moonlight so night silhouettes stay readable.
+pub fn atmospheric_sun_transmittance(sun_dir: [f32; 3]) -> [f32; 3] {
+    const RAYLEIGH_EXTINCTION: [f32; 3] = [0.16, 0.38, 0.88];
+    const DUSK_TINT: [f32; 3] = [1.02, 0.88, 0.64];
+    const DAWN_TINT: [f32; 3] = [1.01, 0.94, 0.86];
+    const MOON_TINT: [f32; 3] = [0.62, 0.80, 1.12];
+    let sun = normalize(sun_dir, [0.0, 1.0, 0.0]);
+    let elevation = sun[1].max(0.0);
+    let air_mass = 1.0 / (elevation + 0.085);
+    let horizon = 1.0 - smooth01(elevation / 0.42);
+    let dawn_factor = smooth01((sun[0] + 0.25) / 0.5);
+    let mut transmittance = [0.0f32; 3];
+    for (channel, coefficient) in RAYLEIGH_EXTINCTION.iter().copied().enumerate() {
+        let tint =
+            DUSK_TINT[channel] + (DAWN_TINT[channel] - DUSK_TINT[channel]) * dawn_factor;
+        transmittance[channel] =
+            (-air_mass * 0.13 * coefficient).exp() * (1.0 + (tint - 1.0) * horizon);
+    }
+    let night = 1.0 - smooth01((sun[1] + 0.18) / 0.26);
+    let moon_mass = 1.0 / ((-sun[1]).max(0.0) + 0.085);
+    for (channel, coefficient) in RAYLEIGH_EXTINCTION.iter().copied().enumerate() {
+        let moonlight = (-moon_mass * 0.13 * coefficient).exp() * MOON_TINT[channel];
+        transmittance[channel] =
+            (transmittance[channel] * (1.0 - night) + moonlight * night).clamp(0.0, 4.0);
+    }
+    transmittance
+}
+
+/// Snell-refraction water optics mirrored by [`MEGU_WATER_SURFACE_WGSL`]:
+/// returns `(optical_depth, fresnel)` for a view-to-normal incidence
+/// cosine and a normalized water-column depth. `underwater` flips the
+/// interface to water->air where incidence inside the 48.6-degree
+/// critical cone (cos >= 0.661) transmits the Snell window and past it
+/// total internal reflection returns `fresnel = 1.0`. The path length
+/// follows the Snell-bent ray, so a face-on look reads as crystal-clear
+/// shallows while a grazing look crosses a longer, more absorbing column.
+pub fn water_refracted_optical_depth_and_fresnel(
+    cos_theta: f32,
+    depth: f32,
+    underwater: bool,
+) -> (f32, f32) {
+    const F0: f32 = 0.0204;
+    const CRITICAL_COS: f32 = 0.661;
+    let cos_theta = if cos_theta.is_finite() {
+        cos_theta.clamp(0.0, 1.0)
+    } else {
+        1.0
+    };
+    let depth = if depth.is_finite() {
+        depth.clamp(0.0, 4.0)
+    } else {
+        0.0
+    };
+    let fresnel = F0 + (1.0 - F0) * (1.0 - cos_theta).powi(5);
+    if underwater {
+        if cos_theta < CRITICAL_COS {
+            // Total internal reflection: the underside of the surface
+            // mirrors deep teal instead of transmitting the sky.
+            return (depth / 0.30, 1.0);
+        }
+        // Inside Snell's window the ray already travels through water,
+        // so its column length is the incidence path itself.
+        return (depth / cos_theta.max(0.30), fresnel);
+    }
+    // Air -> water bends toward the normal (eta = 1 / 1.333).
+    let eta = 1.0 / 1.333;
+    let sin2_t = eta * eta * (1.0 - cos_theta * cos_theta);
+    let cos_t = (1.0 - sin2_t).max(0.0).sqrt();
+    (depth / cos_t.max(0.30), fresnel)
+}
+
 /// Why a cached shadow map can no longer be reused this frame.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ShadowDirtyReason {
@@ -1835,10 +1945,54 @@ fn cave_bounce_color() -> vec3<f32> {
     let moon_bounce = vec3<f32>(0.035, 0.05, 0.10) * (0.3 + shadow.moon_color.w);
     return mix(moon_bounce, day_bounce, day);
 }
+// Eye-comfort highlight roll-off, mirrored by the Rust
+// `comfort_soft_shoulder`: albedo under the knee passes through 1:1 so
+// block textures keep their warmth and contrast, while brighter lumas
+// ease toward the ceiling along a hue-preserving rational shoulder —
+// noon snow and sand never clip to a flat, glaring white.
+fn comfort_soft_shoulder(c: vec3<f32>) -> vec3<f32> {
+    let luma = dot(c, vec3<f32>(0.2126, 0.7152, 0.0722));
+    if (luma <= 0.0) {
+        return vec3<f32>(0.0);
+    }
+    let knee = 0.72;
+    let span = 0.97 - knee;
+    let over = luma - knee;
+    var compressed = luma;
+    if (over > 0.0) {
+        compressed = knee + span * over / (over + span);
+    }
+    return clamp(c * (compressed / luma), vec3<f32>(0.0), vec3<f32>(1.0));
+}
+// Optical air-mass transmittance, mirrored by the Rust
+// `atmospheric_sun_transmittance`: Rayleigh extinction slides the sun
+// from crisp warm-white at noon to honey-amber at low elevation, the
+// dawn/dusk asymmetry separates moist rose-apricot mornings from
+// aerosol-rich amber-copper evenings, and below the horizon a smooth
+// crossfade hands off to silvery-blue Purkinje moonlight.
+fn atmosphere_sun_transmittance(sun_dir: vec3<f32>) -> vec3<f32> {
+    let sun = normalize(sun_dir);
+    let elevation = max(sun.y, 0.0);
+    let air_mass = 1.0 / (elevation + 0.085);
+    let horizon = 1.0 - smoothstep(0.0, 0.42, elevation);
+    let dawn_factor = smoothstep(-0.25, 0.25, sun.x);
+    let tint = mix(vec3<f32>(1.02, 0.88, 0.64),
+                   vec3<f32>(1.01, 0.94, 0.86), dawn_factor);
+    let daylight = exp(vec3<f32>(-air_mass * 0.13)
+                       * vec3<f32>(0.16, 0.38, 0.88))
+                   * mix(vec3<f32>(1.0), tint, horizon);
+    let night = 1.0 - smoothstep(-0.18, 0.08, sun.y);
+    let moon_mass = 1.0 / (max(-sun.y, 0.0) + 0.085);
+    let moonlight = exp(vec3<f32>(-moon_mass * 0.13)
+                        * vec3<f32>(0.16, 0.38, 0.88))
+                    * vec3<f32>(0.62, 0.80, 1.12);
+    return mix(daylight, moonlight, night);
+}
 @fragment
 fn fs_main(input: TerrainOutput) -> @location(0) vec4<f32> {
     let normal = normalize(input.normal);
     let to_sun = normalize(shadow.sun_direction.xyz);
+    let air_tint = atmosphere_sun_transmittance(to_sun);
     let sun_power = max(dot(normal, to_sun), 0.0);
     let moon_power = max(dot(normal, -to_sun), 0.0);
     var visibility = 1.0;
@@ -1910,11 +2064,13 @@ fn fs_main(input: TerrainOutput) -> @location(0) vec4<f32> {
     let sun_warmth = 1.0 - smoothstep(0.06, 0.46, max(shadow.sun_direction.y, 0.0));
     let sun_temperature = mix(vec3<f32>(1.0, 0.99, 0.96),
                               vec3<f32>(1.0, 0.64, 0.38), sun_warmth);
-    let light = ambient + shadow.sun_color.xyz * sun_temperature * sun_power
-                          * visibility * komorebi * cloud_shadow
+    // Air-mass transmittance tints sun and moonlight alike: warm-white
+    // at noon, honey-amber at low sun, silvery-blue past the horizon.
+    let light = ambient + shadow.sun_color.xyz * sun_temperature * air_tint
+                          * sun_power * visibility * komorebi * cloud_shadow
                           * direct_gate
-                + shadow.moon_color.xyz * moon_power * shadow.moon_color.w
-                  * lunar_visibility * direct_gate
+                + shadow.moon_color.xyz * air_tint * moon_power
+                  * shadow.moon_color.w * lunar_visibility * direct_gate
                 + block_glow;
     let view_dir = -view_offset / max(view_distance, 0.0001);
     // The unused sun-direction w lane carries live precipitation. Both sky
@@ -1995,6 +2151,10 @@ fn fs_main(input: TerrainOutput) -> @location(0) vec4<f32> {
         lacquer_sheen += radiance * vec3<f32>(1.0, 0.78, 0.52)
                          * pow12(max(dot(normal, half_vec), 0.0)) * 0.08;
     }
+    // Cozy lantern stacking: a packed room of torches pools into a warm,
+    // readable golden glow instead of a blinding whiteout.
+    let cozy_lantern = lantern_light / (vec3<f32>(1.0) + lantern_light * 0.42);
+    lantern_light = cozy_lantern;
     lit_color += rich_albedo * lantern_light + lacquer_sheen
                  + sky_ambient * grazing_sheen;
     let atmosphere = yugen_valley_mist(input.world_position.y, shadow.camera_position.y,
@@ -2017,10 +2177,14 @@ fn fs_main(input: TerrainOutput) -> @location(0) vec4<f32> {
         let beam = pow24(max(dot(toward, to_sun), 0.0));
         let opening = 1.0 - cloud_coverage(input.world_position.xz, shadow.render_params.y);
         let shafts = beam * atmosphere * opening * direct_gate * 0.055;
-        color += shadow.sun_color.xyz * sun_temperature * shafts;
+        color += shadow.sun_color.xyz * sun_temperature * air_tint * shafts;
     }
     if (shadow.render_params.x >= 3.0) {
-        color = aces(color);
+        // High keeps its ACES grade but eases it toward the comfort
+        // roll-off so long sessions stay gentle on the eyes.
+        color = mix(comfort_soft_shoulder(color), aces(color), 0.55);
+    } else {
+        color = comfort_soft_shoulder(color);
     }
     return vec4<f32>(pow(max(color, vec3<f32>(0.0)),
                          vec3<f32>(1.0 / 2.2)), 1.0);
@@ -2056,6 +2220,31 @@ fn pow260(x: f32) -> f32 {
     return pow4(pow4(pow4(x4))) * x4;
 }
 
+// Optical air-mass transmittance, mirrored by the Rust
+// `atmospheric_sun_transmittance`: Rayleigh extinction slides the sun
+// from crisp warm-white at noon to honey-amber at low elevation, the
+// dawn/dusk asymmetry separates moist rose-apricot mornings from
+// aerosol-rich amber-copper evenings, and below the horizon a smooth
+// crossfade hands off to silvery-blue Purkinje moonlight.
+fn atmosphere_sun_transmittance(sun_dir: vec3<f32>) -> vec3<f32> {
+    let sun = normalize(sun_dir);
+    let elevation = max(sun.y, 0.0);
+    let air_mass = 1.0 / (elevation + 0.085);
+    let horizon = 1.0 - smoothstep(0.0, 0.42, elevation);
+    let dawn_factor = smoothstep(-0.25, 0.25, sun.x);
+    let tint = mix(vec3<f32>(1.02, 0.88, 0.64),
+                   vec3<f32>(1.01, 0.94, 0.86), dawn_factor);
+    let daylight = exp(vec3<f32>(-air_mass * 0.13)
+                       * vec3<f32>(0.16, 0.38, 0.88))
+                   * mix(vec3<f32>(1.0), tint, horizon);
+    let night = 1.0 - smoothstep(-0.18, 0.08, sun.y);
+    let moon_mass = 1.0 / (max(-sun.y, 0.0) + 0.085);
+    let moonlight = exp(vec3<f32>(-moon_mass * 0.13)
+                        * vec3<f32>(0.16, 0.38, 0.88))
+                    * vec3<f32>(0.62, 0.80, 1.12);
+    return mix(daylight, moonlight, night);
+}
+
 struct SkyOutput {
     @builtin(position) position: vec4<f32>,
     @location(0) ndc: vec2<f32>,
@@ -2079,6 +2268,8 @@ fn fs_main(input: SkyOutput) -> @location(0) vec4<f32> {
     let mu = clamp(dot(view, sun), -1.0, 1.0);
     let horizon = pow3(1.0 - abs(view.y));
     let day = smoothstep(-0.12, 0.12, sun.y);
+    let air_tint = atmosphere_sun_transmittance(sun);
+    let dawn_factor = smoothstep(-0.25, 0.25, sun.x);
     // Tasogare: ai-iro above, restrained akane by the horizon.
     let twilight = 1.0 - smoothstep(0.0, 0.28, abs(sun.y));
     let night = vec3<f32>(0.006, 0.014, 0.034);
@@ -2093,9 +2284,14 @@ fn fs_main(input: SkyOutput) -> @location(0) vec4<f32> {
         let mie_g = 0.72;
         let denom = max(1.0 + mie_g * mie_g - 2.0 * mie_g * mu, 0.01);
         let mie = (1.0 - mie_g * mie_g) / (denom * sqrt(denom));
-        color += vec3<f32>(0.025, 0.072, 0.15) * rayleigh * day
+        // Air-mass extinction tints the in-scatter so the dome warms
+        // toward honey-amber near the horizon instead of a flat blue;
+        // dusk aerosols thicken the forward Mie lobe while cool, moist
+        // dawn air keeps it thinner.
+        color += vec3<f32>(0.025, 0.072, 0.15) * air_tint * rayleigh * day
                  * (1.0 - twilight * 0.65);
-        color += vec3<f32>(0.10, 0.075, 0.045) * mie * day * 0.1;
+        color += vec3<f32>(0.10, 0.075, 0.045) * air_tint * mie * day
+                 * 0.1 * (1.0 + (1.0 - dawn_factor) * twilight * 0.5);
         // Blocky voxel clouds drifting on the dome stay faithful to the
         // voxel world instead of adding a smooth billboard layer.
         if (view.y > 0.04 && view.y < 0.75) {
@@ -2128,7 +2324,12 @@ fn fs_main(input: SkyOutput) -> @location(0) vec4<f32> {
     let toward_sun = pow4(max(mu, 0.0));
     // Asa-moya lends the twilight horizon a moist, low-contrast veil.
     color = mix(color, vec3<f32>(0.24, 0.21, 0.23), twilight * horizon * 0.16);
-    color += vec3<f32>(0.42, 0.17, 0.10) * twilight * horizon * toward_sun;
+    // Dawn rises as a soft rose-apricot veil; dusk deepens into a
+    // richer amber-copper glow from the day's convective aerosols.
+    let dusk_glow = vec3<f32>(1.10, 0.92, 0.72);
+    let dawn_glow = vec3<f32>(0.94, 1.10, 1.14);
+    color += vec3<f32>(0.42, 0.17, 0.10) * mix(dusk_glow, dawn_glow, dawn_factor)
+             * twilight * horizon * toward_sun;
     // A solar eclipse dims the whole dome with the occluded disc.
     color *= 1.0 - shadow.celestial_params.w * 0.55;
     // Crisp pixel stars: chunky direction cells, no smooth sparkle noise.
@@ -2144,7 +2345,9 @@ fn fs_main(input: SkyOutput) -> @location(0) vec4<f32> {
     }
     let sun_disc = smoothstep(0.9998, 0.99998, mu);
     let moon_disc = smoothstep(0.99984, 0.99996, dot(view, -sun));
-    color += vec3<f32>(3.2, 2.55, 1.65) * day * sun_disc
+    // The disc itself reddens through the same air-mass extinction, so a
+    // setting sun glows deep amber instead of staying noon-white.
+    color += vec3<f32>(3.2, 2.55, 1.65) * air_tint * day * sun_disc
              * (1.0 - shadow.celestial_params.w);
     // The eclipse corona appears as a pale ring once the disc is covered.
     if (shadow.celestial_params.y > 0.001) {
@@ -2283,7 +2486,14 @@ fn fs_main(input: WaterOutput) -> @location(0) vec4<f32> {
     let to_camera = shadow.camera_position.xyz - input.world_position;
     let view = to_camera / max(length(to_camera), 0.0001);
     let reflected = reflect(-view, normal);
-    let absorption = exp(-depth * vec3<f32>(2.25, 1.18, 0.62));
+    // Snell refraction at the air->water boundary (n = 1.333): eta =
+    // 1/1.333 = 0.7501875, normal-incidence Fresnel F0 = 0.0204. The
+    // refracted ray's angle sets the water column it crosses, so looking
+    // straight down reads as crystal-clear shallows while grazing views
+    // cross a longer, stronger Beer-Lambert column.
+    let refracted_view = refract(-view, normal, 0.7501875);
+    let optical_depth = depth / max(abs(refracted_view.y), 0.30);
+    let absorption = exp(-optical_depth * vec3<f32>(2.25, 1.18, 0.62));
     let body_tint = water_body_tint(day, twilight);
     let seabed = vec3<f32>(0.12, 0.36, 0.31)
         * (0.42 + 0.58 * max(shadow.sun_direction.y, 0.0));
@@ -2304,8 +2514,9 @@ fn fs_main(input: WaterOutput) -> @location(0) vec4<f32> {
         return vec4<f32>(color + suigetsu, 0.88);
     }
     // Schlick dielectric Fresnel retains low reflectance face-on and a
-    // strong sky reflection at grazing angles.
-    let fresnel = 0.02 + 0.98 * pow5(1.0 - clamp(dot(normal, view), 0.0, 1.0));
+    // strong sky reflection at grazing angles (water F0 = 0.0204).
+    let cos_theta = clamp(dot(normal, view), 0.0, 1.0);
+    let fresnel = 0.0204 + 0.9796 * pow5(1.0 - cos_theta);
     color += vec3<f32>(0.10, 0.15, 0.18) * rain_rings * 0.045;
     let sun_warmth = (1.0 - smoothstep(0.06, 0.46, max(shadow.sun_direction.y, 0.0))) * day;
     let sun_temperature = mix(vec3<f32>(1.0, 0.99, 0.96),
@@ -2317,33 +2528,55 @@ fn fs_main(input: WaterOutput) -> @location(0) vec4<f32> {
     let sky = mix(night_sky, day_sky * sun_temperature, day);
     let sky_reflection = mix(sky * 0.58, sky, clamp(reflected.y, 0.0, 1.0))
         * mix(0.72, 1.0, cloud_open) * (1.0 - shadow.celestial_params.w * 0.55);
-    let half_vector = view + normalize(shadow.sun_direction.xyz);
-    let halfway = half_vector / max(length(half_vector), 0.0001);
-    let sparkle = pow180(max(dot(normal, halfway), 0.0));
-    let moon_reflection = shadow.moon_color.xyz * pow72(max(dot(reflected,
-        -normalize(shadow.sun_direction.xyz)), 0.0)) * (1.0 - day);
-    color = mix(color, sky_reflection, fresnel)
-            + shadow.sun_color.xyz * sun_temperature * sparkle * day * 0.8
+    if (view.y < 0.0) {
+        // Snell's window seen from underwater: inside the 48.6-degree
+        // critical cone (cos ~ 0.661) bright sky transmits, while past
+        // it total internal reflection shows only deep teal.
+        let under_cos = clamp(dot(view, -normal), 0.0, 1.0);
+        let snell_window = smoothstep(0.58, 0.72, under_cos);
+        color = mix(body_tint * vec3<f32>(0.30, 0.45, 0.55),
+                    sky_reflection * 1.25, snell_window);
+        color += suigetsu / (vec3<f32>(1.0) + suigetsu * 0.85) * 0.5;
+    } else {
+        let half_vector = view + normalize(shadow.sun_direction.xyz);
+        let halfway = half_vector / max(length(half_vector), 0.0001);
+        let sparkle = pow180(max(dot(normal, halfway), 0.0));
+        let moon_reflection = shadow.moon_color.xyz * pow72(max(dot(reflected,
+            -normalize(shadow.sun_direction.xyz)), 0.0)) * (1.0 - day);
+        if (quality >= 2.0) {
+            // Seabed caustics drift along the Snell-refracted sun ray
+            // and fade with optical depth and sun elevation.
+            let refracted_sun = refract(-shadow.sun_direction.xyz, normal,
+                                        0.7501875);
+            let shift = refracted_sun.xz
+                * (depth / max(abs(refracted_sun.y), 0.30));
+            let caustic_pos = flowed_position + shift;
+            let caustic_a = sin(dot(caustic_pos, vec2<f32>(1.7, 1.15)) + phase * 2.2)
+                * sin(dot(caustic_pos, vec2<f32>(-1.1, 1.9)) - phase * 1.4);
+            let caustic_b = sin(dot(caustic_pos * 1.83, vec2<f32>(1.2, -1.7)) - phase * 2.8)
+                * sin(dot(caustic_pos * 1.83, vec2<f32>(1.9, 0.8)) + phase * 1.9);
+            let web_a = pow3(max(caustic_a, 0.0));
+            let web_b = pow3(max(caustic_b, 0.0));
+            let caustic = (0.62 * web_a + 0.38 * web_b) * (1.0 - depth)
+                * exp(-optical_depth * 0.8)
+                * max(shadow.sun_direction.y, 0.0) * cloud_open;
+            color += vec3<f32>(0.05, 0.15, 0.13) * caustic;
+            // The water stream exposes sky-light depth rather than a scene-depth
+            // texture. This narrow, soft band uses that existing shallow-depth
+            // proxy for restrained edge foam without adding a binding.
+            let shallow_edge = exp(-abs(depth - 0.12) * 28.0);
+            let foam_breakup = smoothstep(0.05, 0.72,
+                sin(dot(caustic_pos, vec2<f32>(3.1, 2.7)))
+                * sin(dot(caustic_pos, vec2<f32>(-2.4, 3.6))));
+            let foam = shallow_edge * foam_breakup * 0.12;
+            color = mix(color, vec3<f32>(0.84, 0.91, 0.94), foam);
+        }
+        var spec = shadow.sun_color.xyz * sun_temperature * sparkle * day * 0.8
             + moon_reflection + suigetsu;
-    if (quality >= 3.0) {
-        let caustic_a = sin(dot(flowed_position, vec2<f32>(1.7, 1.15)) + phase * 2.2)
-            * sin(dot(flowed_position, vec2<f32>(-1.1, 1.9)) - phase * 1.4);
-        let caustic_b = sin(dot(flowed_position * 1.83, vec2<f32>(1.2, -1.7)) - phase * 2.8)
-            * sin(dot(flowed_position * 1.83, vec2<f32>(1.9, 0.8)) + phase * 1.9);
-        let web_a = pow3(max(caustic_a, 0.0));
-        let web_b = pow3(max(caustic_b, 0.0));
-        let caustic = (0.62 * web_a + 0.38 * web_b) * (1.0 - depth)
-            * max(shadow.sun_direction.y, 0.0) * cloud_open;
-        color += vec3<f32>(0.05, 0.15, 0.13) * caustic;
-        // The water stream exposes sky-light depth rather than a scene-depth
-        // texture. This narrow, soft band uses that existing shallow-depth
-        // proxy for restrained edge foam without adding a binding.
-        let shallow_edge = exp(-abs(depth - 0.12) * 28.0);
-        let foam_breakup = smoothstep(0.05, 0.72,
-            sin(dot(flowed_position, vec2<f32>(3.1, 2.7)))
-            * sin(dot(flowed_position, vec2<f32>(-2.4, 3.6))));
-        let foam = shallow_edge * foam_breakup * 0.12;
-        color = mix(color, vec3<f32>(0.84, 0.91, 0.94), foam);
+        // Anti-glare soft cap keeps sun and moon glints lively, never
+        // a blinding flash.
+        spec = spec / (vec3<f32>(1.0) + spec * 0.85);
+        color = mix(color, sky_reflection, fresnel) + spec;
     }
     return vec4<f32>(pow(max(color, vec3<f32>(0.0)),
                          vec3<f32>(1.0 / 2.2)), 0.93);
@@ -2885,6 +3118,103 @@ mod tests {
     }
 
     #[test]
+    fn comfort_soft_shoulder_rolls_off_highlights_without_whiteout() {
+        // Monotone non-decreasing, finite, and capped even far beyond
+        // the display range: a stacked-light whiteout can never form.
+        let mut previous = [0.0f32; 3];
+        for step in 0..=200 {
+            let v = step as f32 * 0.05;
+            let out = comfort_soft_shoulder([v, v, v]);
+            assert!(out.iter().all(|c| c.is_finite()), "v {v}: {out:?}");
+            assert!(
+                out.iter().all(|c| (0.0..=1.0).contains(c)),
+                "v {v}: {out:?}"
+            );
+            for (now, before) in out.iter().zip(previous) {
+                assert!(*now >= before - 1e-6, "not monotonic at {v}: {out:?}");
+            }
+            previous = out;
+        }
+        let blinding = comfort_soft_shoulder([5.0, 5.0, 5.0]);
+        assert!(blinding.iter().all(|c| *c <= 1.0));
+        assert!(blinding.iter().all(|c| *c < 0.97));
+        // Neutral input stays neutral through the shoulder.
+        assert_eq!(blinding, [blinding[0]; 3]);
+        // Midtone Minecraft colours sit far under the knee: exact 1:1
+        // fidelity, far below the 2% allowed drift.
+        let mid = [0.4, 0.5, 0.3];
+        let out = comfort_soft_shoulder(mid);
+        assert_eq!(out, mid);
+        for (mapped, original) in out.iter().zip(mid) {
+            assert!((mapped - original).abs() / original < 0.02);
+        }
+        // Non-finite input fails closed to finite, capped output.
+        let wild = comfort_soft_shoulder([f32::NAN, 1.0, f32::INFINITY]);
+        assert!(wild.iter().all(|c| c.is_finite() && (0.0..=1.0).contains(c)));
+        // The WGSL helper is present and uses the same knee/ceiling.
+        assert!(MEGU_TERRAIN_LIT_WGSL.contains("fn comfort_soft_shoulder("));
+        assert!(MEGU_TERRAIN_LIT_WGSL.contains("let knee = 0.72;"));
+        assert!(MEGU_TERRAIN_LIT_WGSL.contains("0.97 - knee"));
+        assert!(MEGU_TERRAIN_LIT_WGSL
+            .contains("lantern_light / (vec3<f32>(1.0) + lantern_light * 0.42)"));
+    }
+
+    #[test]
+    fn atmospheric_transmittance_separates_noon_dawn_dusk_and_night() {
+        // Noon is near-neutral balanced daylight, not a heavy colour cast.
+        let noon = atmospheric_sun_transmittance([0.0, 1.0, 0.0]);
+        assert!(
+            noon.iter().all(|c| (0.85..=1.0).contains(c)),
+            "noon {noon:?}"
+        );
+        let noon_ratio = noon[0] / noon[2];
+        assert!(noon_ratio < 1.15, "noon stays balanced: {noon:?}");
+
+        // Low sun: Rayleigh extinction boosts the red-to-blue ratio.
+        // (Azimuth-neutral direction: sun.x = 0 sits between dawn/dusk.)
+        let low = atmospheric_sun_transmittance([0.0, 0.15, 0.98]);
+        let low_ratio = low[0] / low[2];
+        assert!(
+            low_ratio > noon_ratio * 1.3,
+            "Rayleigh: low {low_ratio}, noon {noon_ratio}"
+        );
+
+        // Dawn vs dusk asymmetry: same elevation, opposite azimuths.
+        let dawn = atmospheric_sun_transmittance([0.98, 0.15, 0.0]);
+        let dusk = atmospheric_sun_transmittance([-0.98, 0.15, 0.0]);
+        assert_ne!(dawn, dusk);
+        // Dusk burns deeper amber-copper; dawn keeps a softer pastel
+        // rose-apricot with more surviving blue.
+        assert!(
+            dusk[0] / dusk[2] > dawn[0] / dawn[2],
+            "dawn {dawn:?} vs dusk {dusk:?}"
+        );
+        assert!(dawn[2] > dusk[2], "dawn {dawn:?} vs dusk {dusk:?}");
+
+        // Deep night lands on silvery-blue Purkinje moonlight.
+        let night = atmospheric_sun_transmittance([0.0, -1.0, 0.0]);
+        assert!(night[2] > night[0], "Purkinje blue shift: {night:?}");
+        // The horizon crossfade is smooth: no harsh flip. (Non-vertical
+        // directions keep their low elevation after normalization.)
+        let above = atmospheric_sun_transmittance([0.0, 0.05, 0.98]);
+        let below = atmospheric_sun_transmittance([0.0, -0.05, 0.98]);
+        for (a, b) in above.iter().zip(below) {
+            assert!((a - b).abs() < 0.35, "{above:?} vs {below:?}");
+        }
+        // Non-finite direction fails to the neutral noon fallback.
+        assert!(atmospheric_sun_transmittance([f32::NAN; 3])
+            .iter()
+            .all(|c| c.is_finite()));
+        // The shared WGSL helper exists in both scene passes.
+        for src in [MEGU_TERRAIN_LIT_WGSL, MEGU_SKY_ATMOSPHERE_WGSL] {
+            assert!(src.contains("fn atmosphere_sun_transmittance("));
+            assert!(src.contains("1.0 / (elevation + 0.085)"));
+            assert!(src.contains("smoothstep(-0.25, 0.25, sun.x)"));
+            assert!(src.contains("smoothstep(-0.18, 0.08, sun.y)"));
+        }
+    }
+
+    #[test]
     fn terrain_wgsl_bounce_lobe_keeps_bindings_and_direct_term() {
         let terrain = MEGU_TERRAIN_LIT_WGSL;
         for needle in [
@@ -2999,5 +3329,49 @@ mod tests {
             field_block(glint),
             "glint pass must share the terrain uniform layout"
         );
+    }
+
+    #[test]
+    fn water_optics_obey_snell_fresnel_and_total_internal_reflection() {
+        // Face-on air -> water: F0 = 0.0204, the column stays unbent.
+        let (optical, fresnel) =
+            water_refracted_optical_depth_and_fresnel(1.0, 0.6, false);
+        assert!((fresnel - 0.0204).abs() < 1e-4, "{fresnel}");
+        assert!((optical - 0.6).abs() < 1e-4, "{optical}");
+        // Grazing air -> water: much stronger reflection and a longer
+        // Beer-Lambert column than the face-on look.
+        let (grazing_optical, grazing_fresnel) =
+            water_refracted_optical_depth_and_fresnel(0.15, 0.6, false);
+        assert!(grazing_fresnel > 0.45, "{grazing_fresnel}");
+        assert!(
+            grazing_optical > optical,
+            "{grazing_optical} vs {optical}"
+        );
+        // Underwater past the 48.6-degree critical angle: total internal
+        // reflection.
+        let (_, tir) = water_refracted_optical_depth_and_fresnel(0.50, 0.6, true);
+        assert!(tir >= 0.99, "{tir}");
+        // Inside Snell's window the sky transmits instead.
+        let (window_optical, window_fresnel) =
+            water_refracted_optical_depth_and_fresnel(0.95, 0.6, true);
+        assert!(window_fresnel < 0.05, "{window_fresnel}");
+        assert!(window_optical.is_finite() && window_optical >= 0.6);
+        // Sanitization keeps every input finite-safe.
+        let (o, f) =
+            water_refracted_optical_depth_and_fresnel(f32::NAN, f32::INFINITY, false);
+        assert!(o.is_finite() && f.is_finite());
+        // The WGSL pass carries the same Snell/Fresnel terms.
+        let water = MEGU_WATER_SURFACE_WGSL;
+        for needle in [
+            "refract(-view, normal, 0.7501875)",
+            "depth / max(abs(refracted_view.y), 0.30)",
+            "vec3<f32>(2.25, 1.18, 0.62)",
+            "0.0204 + 0.9796 * pow5(1.0 - cos_theta)",
+            "smoothstep(0.58, 0.72, under_cos)",
+            "spec / (vec3<f32>(1.0) + spec * 0.85)",
+            "refract(-shadow.sun_direction.xyz, normal,",
+        ] {
+            assert!(water.contains(needle), "water WGSL missing {needle}");
+        }
     }
 }
