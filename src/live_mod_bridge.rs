@@ -254,8 +254,26 @@ use mod_adapter_core::capability_bus::{
     SimpleFluidTank, SimpleSlotInventory,
 };
 #[cfg(feature = "mod-suite")]
+use mod_adapter_core::colossal_and_forge::{
+    evaluate_breath_cone, BlockProbe, BreathEntity, BreathOutcome, ElementKind,
+    ElementalBreathSpec, ForgeTickEvents, GrowthStageCurve, MultiBlockForgeRuntime,
+    MultiBlockForgeSpec, MultiPartHitbox, PartHit,
+};
+#[cfg(feature = "mod-suite")]
+use mod_offload::auto_optimizer::{
+    fingerprint_item_slots, pack_machine_key, AdaptivePollBackoff, AutoBulkSectionBatcher,
+    AutoDeltaCoalescer, AutoRecipeMemoizer, BulkSectionBatch, DistanceTier, EmitDecision,
+};
+#[cfg(feature = "mod-suite")]
+use mod_offload::lazy_catchup::{
+    catch_up_furnace, catch_up_growth_stage, catch_up_machine_batch, CatchUpLimits,
+    FurnaceCatchUpReport, FurnaceCatchUpState, HeadlessFactoryNode, HeadlessFactoryRegistry,
+    MachineCatchUpReport, MachineCatchUpState,
+};
+#[cfg(feature = "mod-suite")]
 use mod_adapter_core::culinary_adapter::{
     CookResult, CookingPotState, CulinaryDiscoveryStats, CulinaryRegistry, CuttingOutcome,
+    TagIndex,
 };
 #[cfg(feature = "mod-suite")]
 use mod_adapter_core::ecosystem_compat::{
@@ -282,7 +300,7 @@ use mod_adapter_core::season_primitives::{
 #[cfg(feature = "mod-suite")]
 use mod_adapter_core::unified_bundle::{DeclarativeModBundle, UnifiedModRuntime};
 #[cfg(feature = "mod-suite")]
-use mod_adapter_core::unified_tags::{TagDomain, UnifiedTagIndex};
+use mod_adapter_core::unified_tags::{canonical_common_tag_id, TagDomain, UnifiedTagIndex};
 #[cfg(feature = "mod-suite")]
 use mod_adapter_core::vanilla_qol_and_holidays::{
     chest_holiday_variant, evaluate_right_click_harvest, roll_halloween_headgear, CalendarDate,
@@ -1789,7 +1807,6 @@ impl ItemTransferHandler for LiveCookingPotEndpoint {
 /// item ids skip the duct and land in the endpoint's slot store where
 /// their bytes and ids survive losslessly.
 #[cfg(feature = "mod-suite")]
-#[allow(dead_code)]
 fn live_cap_insert_item(
     dim: DimId,
     x: i32,
@@ -1874,7 +1891,6 @@ fn live_cap_insert_item(
 /// inside the transport machinery itself is not pullable, matching real
 /// Create.
 #[cfg(feature = "mod-suite")]
-#[allow(dead_code)]
 fn live_cap_extract_item(
     dim: DimId,
     x: i32,
@@ -1916,6 +1932,9 @@ fn live_cap_extract_item(
             if h.items.is_empty() {
                 rt.held.remove(&pos);
             }
+            // AUTO-OPT: a pull changed the machine's inputs — reset its
+            // cadence so the recipe fingerprint re-evaluates at once.
+            live_auto_machine_wake_positions(&[pos]);
         }
         Some(CapabilityItemStack::new(name, 1))
     })
@@ -2859,6 +2878,9 @@ fn live_mod_tick() {
     // storage) and fluid cells push toward adjacent tanks, all through
     // the same simulate-then-commit bus.
     live_cap_bus_step();
+    // AUTO-OPT: headless factory nodes advance one tick — empty registry
+    // and disabled limits both cost a single map-length probe.
+    let _ = live_mod_headless_factory_step(1);
     let players = clients().lock().unwrap_or_else(|e| e.into_inner()).clone();
     let connected: HashSet<[u8; 16]> = players.iter().map(|client| client.uuid).collect();
     {
@@ -3827,6 +3849,9 @@ impl LiveCreateRuntime {
             let mut held = LiveCreateHeld::default();
             held.items = items.into_iter().take(cap).collect();
             self.held.insert(pos, held);
+            // AUTO-OPT: a restored machine starts awake — its inputs just
+            // (re)appeared, so the recipe scan runs next poll.
+            live_auto_machine_wake_positions(&[pos]);
         }
     }
 
@@ -4148,6 +4173,7 @@ impl LiveCreateRuntime {
             return;
         }
         let positions: Vec<FactoryPos> = self.duct_machines.keys().copied().collect();
+        let mut fed: Vec<FactoryPos> = Vec::new();
         for pos in positions {
             let Some(kind) = self.duct_kind_at(pos) else {
                 continue;
@@ -4175,6 +4201,7 @@ impl LiveCreateRuntime {
                                     .or_default()
                                     .items
                                     .push(i64::from(item));
+                                fed.push(pos);
                             }
                             _ => break,
                         }
@@ -4186,6 +4213,9 @@ impl LiveCreateRuntime {
                 _ => {}
             }
         }
+        // AUTO-OPT: a duct delivery changes a machine's inputs — the
+        // recipe fingerprint moves, so its cadence resets to 1.
+        live_auto_machine_wake_positions(&fed);
     }
 
     /// One funnel transfer cycle at `pos`: when the funnel's staging input
@@ -4265,10 +4295,13 @@ impl LiveCreateRuntime {
         let Some(item) = item else {
             return;
         };
-        if matches!(src_kind, Some(LiveDuctKind::Depot | LiveDuctKind::Basin))
-            && self.held.get(&src).is_some_and(|h| h.items.is_empty())
-        {
-            self.held.remove(&src);
+        // AUTO-OPT: a funnel pull emptied or shrank a source slot — the
+        // recipe fingerprint moved, so the source's cadence resets.
+        if matches!(src_kind, Some(LiveDuctKind::Depot | LiveDuctKind::Basin)) {
+            live_auto_machine_wake_positions(&[src]);
+            if self.held.get(&src).is_some_and(|h| h.items.is_empty()) {
+                self.held.remove(&src);
+            }
         }
         match u32::try_from(item) {
             Ok(item) => {
@@ -4295,101 +4328,139 @@ impl LiveCreateRuntime {
         if self.held.is_empty() {
             return;
         }
+        let tick = TICK_IDX.load(Ordering::Relaxed);
         let positions: Vec<FactoryPos> = self.held.keys().copied().collect();
         for pos in positions {
-            let Some(&st) = self.placed.get(&pos) else {
-                self.held.remove(&pos);
+            // AUTO-OPT: an idle machine polls on the adaptive
+            // `1 -> 2 -> 4 -> 8 -> 20` backoff ladder — a skipped poll
+            // costs one backoff-table probe; inventory/structure writes
+            // wake the entry back to cadence 1 immediately.
+            if !live_auto_machine_should_tick(pos, tick) {
                 continue;
-            };
-            let basin = self
+            }
+            let changed = self.tick_processing_cell(pos);
+            if self.held.contains_key(&pos) {
+                live_auto_machine_record(pos, changed);
+            } else {
+                live_auto_machine_remove(pos);
+            }
+        }
+    }
+
+    /// One granted processing poll at `pos`, reporting whether observable
+    /// machine state changed (progress accrued, items consumed/produced,
+    /// a match lost or gained). `false` lets the backoff ladder stretch
+    /// the cell's cadence; `true` snaps it back to every-tick polling.
+    fn tick_processing_cell(&mut self, pos: FactoryPos) -> bool {
+        let Some(&st) = self.placed.get(&pos) else {
+            self.held.remove(&pos);
+            return false;
+        };
+        let basin = self
+            .factory
+            .registry()
+            .block_def_for_state(st)
+            .is_some_and(|def| def.id == "create:basin");
+        let depot = !basin
+            && self
                 .factory
                 .registry()
                 .block_def_for_state(st)
-                .is_some_and(|def| def.id == "create:basin");
-            let depot = !basin
-                && self
-                    .factory
-                    .registry()
-                    .block_def_for_state(st)
-                    .is_some_and(|def| def.id == "create:depot");
-            if !basin && !depot {
-                self.held.remove(&pos);
-                continue;
-            }
-            let proc_pos = pos.offset(0, 2, 0);
-            let Some(&pst) = self.placed.get(&proc_pos) else {
-                continue;
-            };
-            let Some(pdef) = self.factory.registry().block_def_for_state(pst) else {
-                continue;
-            };
-            let mixer = basin && pdef.id == "create:mechanical_mixer";
-            if pdef.id != "create:mechanical_press" && !mixer {
-                continue;
-            }
-            let Some(sol) = self.factory.kinetic_solution(proc_pos) else {
-                continue;
-            };
-            if !matches!(
-                sol.status,
-                mod_offload::kinetic_graph::NetworkStatus::Running
-            ) || sol.speed.abs() < 1e-6
-            {
-                continue;
-            }
-            let rpm = sol.speed.abs();
-            let recipes = if mixer { &self.mixing } else { &self.pressing };
-            let Some(slot) = self.held.get_mut(&pos) else {
-                continue;
-            };
-            // Recipe match: every `(ingredient, amount)` input must be
-            // covered by `slot.items` — exact ids numerically, `#tag`
-            // inputs through the shared cross-mod index.
-            let count_item = |items: &[i64], need: &(LiveCreateIngredient, u32)| {
+                .is_some_and(|def| def.id == "create:depot");
+        if !basin && !depot {
+            self.held.remove(&pos);
+            return false;
+        }
+        let proc_pos = pos.offset(0, 2, 0);
+        let Some(&pst) = self.placed.get(&proc_pos) else {
+            return false;
+        };
+        let Some(pdef) = self.factory.registry().block_def_for_state(pst) else {
+            return false;
+        };
+        let mixer = basin && pdef.id == "create:mechanical_mixer";
+        if pdef.id != "create:mechanical_press" && !mixer {
+            return false;
+        }
+        let Some(sol) = self.factory.kinetic_solution(proc_pos) else {
+            return false;
+        };
+        if !matches!(
+            sol.status,
+            mod_offload::kinetic_graph::NetworkStatus::Running
+        ) || sol.speed.abs() < 1e-6
+        {
+            return false;
+        }
+        let rpm = sol.speed.abs();
+        let kind = if mixer {
+            LIVE_OPT_MACHINE_MIXER
+        } else {
+            LIVE_OPT_MACHINE_PRESS
+        };
+        let recipes = if mixer { &self.mixing } else { &self.pressing };
+        let Some(slot) = self.held.get_mut(&pos) else {
+            return false;
+        };
+        // AUTO-OPT: the recipe scan is memoized per `(kind, items
+        // fingerprint)` — an idle machine holding unmatched items runs
+        // its matcher once, not once per granted poll.
+        let fingerprint = live_fingerprint_held_items(&slot.items);
+        let items = &slot.items;
+        let Some(recipe_idx) = live_auto_recipe_lookup(kind, fingerprint, |tags| {
+            let count_item = |need: &(LiveCreateIngredient, u32)| {
                 items
                     .iter()
-                    .filter(|item| live_create_ingredient_matches(&need.0, **item))
+                    .filter(|item| live_create_ingredient_matches_tags(&need.0, **item, tags))
                     .count()
             };
-            let Some(recipe) = recipes.iter().find(|r| {
-                r.inputs
-                    .iter()
-                    .all(|need| count_item(&slot.items, need) >= need.1 as usize)
-            }) else {
+            recipes
+                .iter()
+                .position(|r| {
+                    r.inputs
+                        .iter()
+                        .all(|need| count_item(need) >= need.1 as usize)
+                })
+                .map(|idx| idx as u32)
+        }) else {
+            if slot.progress != 0.0 || slot.active.is_some() {
                 slot.progress = 0.0;
                 slot.active = None;
-                continue;
-            };
-            let key = recipe.id as u16;
-            if slot.active != Some(key) {
-                slot.active = Some(key);
-                slot.progress = 0.0;
+                return true;
             }
-            slot.progress += rpm;
-            let need = f64::from(recipe.base_ticks)
-                * f64::from(mod_offload::recipe_processor::REFERENCE_RPM);
-            if slot.progress < need {
-                continue;
-            }
-            for (ingredient, amount) in &recipe.inputs {
-                for _ in 0..*amount {
-                    if let Some(at) = slot
-                        .items
-                        .iter()
-                        .position(|item| live_create_ingredient_matches(ingredient, *item))
-                    {
-                        slot.items.remove(at);
-                    }
-                }
-            }
-            for &(output, amount) in &recipe.outputs {
-                for _ in 0..amount {
-                    slot.items.push(i64::from(output));
-                }
-            }
+            return false;
+        };
+        let recipe = &recipes[recipe_idx as usize];
+        let key = recipe.id as u16;
+        if slot.active != Some(key) {
+            slot.active = Some(key);
             slot.progress = 0.0;
-            slot.active = None;
         }
+        slot.progress += rpm;
+        let need = f64::from(recipe.base_ticks)
+            * f64::from(mod_offload::recipe_processor::REFERENCE_RPM);
+        if slot.progress < need {
+            return true;
+        }
+        for (ingredient, amount) in &recipe.inputs {
+            for _ in 0..*amount {
+                if let Some(at) = slot
+                    .items
+                    .iter()
+                    .position(|item| live_create_ingredient_matches(ingredient, *item))
+                {
+                    slot.items.remove(at);
+                }
+            }
+        }
+        for &(output, amount) in &recipe.outputs {
+            for _ in 0..amount {
+                slot.items.push(i64::from(output));
+            }
+        }
+        slot.progress = 0.0;
+        slot.active = None;
+        true
     }
 
     /// Full kinetic snapshot used by the join packet.
@@ -4443,6 +4514,12 @@ fn live_create_on_block_set(dim: DimId, x: i32, y: i32, z: i32, old: u32, st: u3
             rt.reeval_wheel_neighbors(pos);
         }
     });
+    // AUTO-OPT: a block write may (dis)arm the depot/basin below or the
+    // processor two cells above — wake every machine this cell could feed
+    // so a sleeping one resumes at cadence 1.
+    if was_mod || is_mod {
+        live_auto_machine_wake_positions(&[pos, pos.offset(0, -2, 0), pos.offset(0, 2, 0)]);
+    }
     // XMOD1: generic plan blocks expose their declared profile endpoints
     // on the shared bus (and a cell that stopped being one drops them).
     if was_mod || is_mod {
@@ -4721,6 +4798,9 @@ fn live_create_interact_block(
     .flatten() else {
         return false;
     };
+    // AUTO-OPT: an inserted or retrieved item moved the machine's recipe
+    // fingerprint — reset its cadence so processing resumes at once.
+    live_auto_machine_wake_positions(&[pos]);
     match outcome {
         LiveCreateInteract::Inserted => {
             ac_consume_placed_item(me, held_slot);
@@ -4767,6 +4847,10 @@ fn live_create_duct_insert(dim: DimId, x: i32, y: i32, z: i32, item: i64) -> boo
                 slot.items.push(item);
                 slot.progress = 0.0;
                 slot.active = None;
+                // AUTO-OPT: a scripted/duct feed changed the machine's
+                // inputs — reset its cadence so processing resumes at
+                // once instead of waiting out the ladder step.
+                live_auto_machine_wake_positions(&[pos]);
             }
             _ => {
                 let machine = rt.duct_machine(pos)?;
@@ -5128,6 +5212,1168 @@ fn live_create_load_sidecar(dir: &std::path::Path) -> Result<(), &'static str> {
     live_create_with(|rt| rt.load_entries(entries));
     Ok(())
 }
+
+// ===========================================================================
+// AUTO-OPT: generic mod auto-optimizer + lazy catch-up + colossal/forge
+// ===========================================================================
+
+/// Memoizer machine kinds — keep the press and mixer recipe tables in
+/// disjoint `(kind, fingerprint)` key spaces so an identical item layout
+/// can't cross-hit between the two processors.
+#[cfg(feature = "mod-suite")]
+const LIVE_OPT_MACHINE_PRESS: u32 = 0;
+#[cfg(feature = "mod-suite")]
+const LIVE_OPT_MACHINE_MIXER: u32 = 1;
+
+/// Process-wide auto-optimizer state backing live mod machine work:
+/// recipe lookups memoized per `(kind, input-fingerprint)`, per-machine
+/// poll cadences on the `1 -> 2 -> 4 -> 8 -> 20` backoff ladder, plus the
+/// delta coalescer and bulk-section batcher the `live_opt_wire` helpers
+/// expose to high-frequency mod sync traffic and bulk world edits.
+#[cfg(feature = "mod-suite")]
+struct LiveModAutoOptimizer {
+    /// `(machine_kind, fingerprint) -> matched recipe index`. Misses are
+    /// cached on equal footing, so an idle depot holding unmatched items
+    /// rescans the recipe table exactly once until its contents change.
+    recipes: AutoRecipeMemoizer<u32>,
+    /// Per-machine poll cadence keyed by [`pack_machine_key`].
+    backoff: AdaptivePollBackoff,
+    /// Byte-identical sync-payload suppression + distance-tier throttle.
+    coalescer: AutoDeltaCoalescer,
+    /// Burst `set_block` coalescing into one update per 16³ section.
+    batcher: AutoBulkSectionBatcher,
+    /// `registry_revision` `item_tags` was exported at (`None` = never).
+    tag_rev: Option<u64>,
+    /// Flat item-tag member sets snapshot. The recipe matcher reads this
+    /// inside [`AutoRecipeMemoizer::lookup_or_compute`] — keeping the
+    /// compute closure free of suite-lock acquisitions is what lets the
+    /// optimizer lock be held across it without ever forming a
+    /// `suite -> optimizer` / `optimizer -> suite` cycle.
+    item_tags: Arc<TagIndex>,
+}
+
+#[cfg(feature = "mod-suite")]
+impl LiveModAutoOptimizer {
+    fn new() -> Self {
+        Self {
+            recipes: AutoRecipeMemoizer::new(),
+            backoff: AdaptivePollBackoff::new(),
+            coalescer: AutoDeltaCoalescer::new(),
+            batcher: AutoBulkSectionBatcher::new(),
+            tag_rev: None,
+            item_tags: Arc::new(BTreeMap::new()),
+        }
+    }
+}
+
+#[cfg(feature = "mod-suite")]
+fn live_auto_optimizer() -> &'static Mutex<LiveModAutoOptimizer> {
+    static OPT: OnceLock<Mutex<LiveModAutoOptimizer>> = OnceLock::new();
+    OPT.get_or_init(|| Mutex::new(LiveModAutoOptimizer::new()))
+}
+
+/// Backoff table key for the machine at `pos` — `pack_machine_key` is
+/// many-to-one by design: a collision only shares a cadence between two
+/// positions, degrading the optimization rather than breaking it.
+#[cfg(feature = "mod-suite")]
+fn live_auto_machine_key(pos: FactoryPos) -> u64 {
+    pack_machine_key(pos.dim, pos.x, pos.y, pos.z)
+}
+
+/// Whether the machine at `pos` should do its per-tick work on `tick`:
+/// idle machines slide down the `1 -> 2 -> 4 -> 8 -> 20` ladder so a
+/// depot holding unmatched items costs one backoff probe most ticks.
+#[cfg(feature = "mod-suite")]
+fn live_auto_machine_should_tick(pos: FactoryPos, tick: u64) -> bool {
+    live_auto_optimizer()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .backoff
+        .should_tick(live_auto_machine_key(pos), tick)
+}
+
+/// Report whether a granted poll changed observable machine state —
+/// `true` snaps the cadence back to every tick, four consecutive `false`
+/// advance one ladder step.
+#[cfg(feature = "mod-suite")]
+fn live_auto_machine_record(pos: FactoryPos, changed: bool) {
+    live_auto_optimizer()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .backoff
+        .record_tick_result(live_auto_machine_key(pos), changed);
+}
+
+/// Drop the cadence entry for a machine whose tracked slot vanished.
+#[cfg(feature = "mod-suite")]
+fn live_auto_machine_remove(pos: FactoryPos) {
+    live_auto_optimizer()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .backoff
+        .remove(live_auto_machine_key(pos));
+}
+
+/// Dirty-event wake for a batch of positions: inventory or structure
+/// writes snap every listed machine's cadence back to 1 so a machine fed
+/// while asleep never waits out its current ladder step.
+#[cfg(feature = "mod-suite")]
+fn live_auto_machine_wake_positions(positions: &[FactoryPos]) {
+    if positions.is_empty() {
+        return;
+    }
+    let keys: Vec<u64> = positions.iter().map(|p| live_auto_machine_key(*p)).collect();
+    live_auto_optimizer()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .backoff
+        .wake_neighbors(&keys);
+}
+
+/// Stable fingerprint of a held-slot item multiset: `BTreeMap` ordering
+/// makes equal contents hash equal regardless of seat order.
+#[cfg(feature = "mod-suite")]
+fn live_fingerprint_held_items(items: &[i64]) -> u64 {
+    let mut counts: BTreeMap<u32, u32> = BTreeMap::new();
+    for &item in items {
+        if let Ok(id) = u32::try_from(item) {
+            *counts.entry(id).or_insert(0) += 1;
+        }
+    }
+    let slots: Vec<(u32, u32)> = counts.into_iter().collect();
+    fingerprint_item_slots(&slots)
+}
+
+/// `live_create_ingredient_matches` resolved against a pinned flat tag
+/// snapshot instead of the suite lock — the lock-free variant the
+/// memoized recipe matcher runs inside `lookup_or_compute`.
+#[cfg(feature = "mod-suite")]
+fn live_create_ingredient_matches_tags(
+    ingredient: &LiveCreateIngredient,
+    item: i64,
+    tags: &TagIndex,
+) -> bool {
+    match ingredient {
+        LiveCreateIngredient::Item(id) => u32::try_from(item).ok() == Some(*id),
+        LiveCreateIngredient::Tag(tag) => item_to_name(item).is_some_and(|name| {
+            tags.get(tag.as_str())
+                .or_else(|| tags.get(&canonical_common_tag_id(tag)))
+                .is_some_and(|members| members.contains(name))
+        }),
+    }
+}
+
+/// Recipe match for a live mod machine, memoized per
+/// `(machine_kind, held-items fingerprint)`. `compute` resolves the
+/// recipe index against the pinned tag snapshot — it is the only code
+/// that runs under the optimizer lock, and the snapshot refresh above
+/// happens across sequential (never nested) suite/optimizer holds, so no
+/// lock cycle exists even while a JAR rescan bumps `registry_revision`
+/// mid-tick. A revision change invalidates the whole memo table here:
+/// recipe/tag tables only ever move under `scan_mods_dir`, which bumps
+/// the same counter.
+#[cfg(feature = "mod-suite")]
+fn live_auto_recipe_lookup(
+    machine_kind: u32,
+    fingerprint: u64,
+    compute: impl FnOnce(&TagIndex) -> Option<u32>,
+) -> Option<u32> {
+    let rev = live_mod_suite()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .registry_revision;
+    let stale = live_auto_optimizer()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .tag_rev
+        != Some(rev);
+    if stale {
+        let flat = live_mod_suite()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .unified_tags
+            .export_flat(TagDomain::Item);
+        let mut opt = live_auto_optimizer()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        opt.item_tags = Arc::new(flat);
+        opt.tag_rev = Some(rev);
+        opt.recipes.invalidate_all();
+    }
+    let tags = live_auto_optimizer()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .item_tags
+        .clone();
+    live_auto_optimizer()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .recipes
+        .lookup_or_compute(machine_kind, fingerprint, || compute(&tags))
+}
+
+/// Live `lazy_catchup` wiring: `CatchUpLimits` gated by
+/// `MEGU_LAZY_CATCHUP` (fail-closed `enabled: false` out of the box for
+/// strict Vanilla parity — every `catch_up_*` still clamps the delta
+/// through `effective_delta`, so a disabled state is a true no-op), plus
+/// the bounded `HeadlessFactoryRegistry` for unloaded-chunk factory
+/// accumulation.
+#[cfg(feature = "mod-suite")]
+struct LiveLazyCatchUpState {
+    limits: CatchUpLimits,
+    factories: HeadlessFactoryRegistry,
+}
+
+#[cfg(feature = "mod-suite")]
+impl Default for LiveLazyCatchUpState {
+    fn default() -> Self {
+        Self {
+            limits: CatchUpLimits::default(),
+            factories: HeadlessFactoryRegistry::new(),
+        }
+    }
+}
+
+#[cfg(feature = "mod-suite")]
+fn live_lazy_catchup_state() -> &'static Mutex<LiveLazyCatchUpState> {
+    static STATE: OnceLock<Mutex<LiveLazyCatchUpState>> = OnceLock::new();
+    STATE.get_or_init(|| {
+        let enabled = std::env::var("MEGU_LAZY_CATCHUP")
+            .map(|v| {
+                matches!(
+                    v.trim().to_ascii_lowercase().as_str(),
+                    "1" | "true" | "yes" | "on"
+                )
+            })
+            .unwrap_or(false);
+        Mutex::new(LiveLazyCatchUpState {
+            limits: CatchUpLimits {
+                enabled,
+                ..CatchUpLimits::default()
+            },
+            factories: HeadlessFactoryRegistry::new(),
+        })
+    })
+}
+
+/// A forge registered in the live bridge: the `MultiBlockForgeRuntime`
+/// behind the bus endpoint plus the spec it validated against, so
+/// revalidation, breath application and tick stepping reuse the same
+/// objects the hopper path feeds.
+#[cfg(feature = "mod-suite")]
+struct LiveForgeEntry {
+    spec: MultiBlockForgeSpec,
+    runtime: Arc<Mutex<MultiBlockForgeRuntime>>,
+}
+
+/// Live registry for `colossal_and_forge`: registered forge runtimes
+/// (each also published as an `ItemTransferHandler` on `live_cap_bus`),
+/// multi-part hitbox layouts for ray hit-tests, breath specs for cone
+/// sweeps, and a `registry_revision`-keyed inverted block-tag export for
+/// `BlockProbe` tag expectations.
+#[cfg(feature = "mod-suite")]
+#[derive(Default)]
+struct LiveColossalAndForgeRegistry {
+    forges: HashMap<BlockCoord, LiveForgeEntry>,
+    hitboxes: HashMap<String, MultiPartHitbox>,
+    breaths: HashMap<String, ElementalBreathSpec>,
+    /// `registry_revision` `block_member_tags` was built at.
+    tag_rev: Option<u64>,
+    /// Inverted block-tag export: member block id -> every tag it
+    /// carries (`export_flat` stores `forge:`/`neoforge:` aliases for
+    /// `c:` tags, so all spellings land in the same member sets).
+    block_member_tags: HashMap<String, BTreeSet<String>>,
+}
+
+#[cfg(feature = "mod-suite")]
+fn live_colossal_registry() -> &'static Mutex<LiveColossalAndForgeRegistry> {
+    static REG: OnceLock<Mutex<LiveColossalAndForgeRegistry>> = OnceLock::new();
+    REG.get_or_init(|| Mutex::new(LiveColossalAndForgeRegistry::default()))
+}
+
+/// `BlockProbe` for the world cell at `pos` in `dim`: the live block id
+/// (JAR registry-plan states first, then the `BReg` name table that
+/// covers vanilla + Create states) plus every block-domain tag the id
+/// carries, read off the flat-export snapshot pinned to
+/// `registry_revision`. `None` when the state resolves to no id —
+/// `ForgeCellExpect::Air` accepts exactly that answer, so unloaded or
+/// unresolvable cells behave like air rather than failing the pattern.
+/// All suite/registry holds are sequential (never nested).
+#[cfg(feature = "mod-suite")]
+fn live_block_probe(dim: DimId, pos: [i32; 3]) -> Option<BlockProbe> {
+    let st = block_at_dim(dim, pos[0], pos[1], pos[2]);
+    let id = live_mod_name_for_state(st)
+        .or_else(|| breg().map(|reg| reg.name_of(st).to_string()))?;
+    if id.is_empty() {
+        return None;
+    }
+    let rev = live_mod_suite()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .registry_revision;
+    let stale = live_colossal_registry()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .tag_rev
+        != Some(rev);
+    if stale {
+        let flat = live_mod_suite()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .unified_tags
+            .export_flat(TagDomain::Block);
+        let mut reg = live_colossal_registry()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        reg.block_member_tags.clear();
+        for (tag, members) in flat {
+            for member in members {
+                reg.block_member_tags
+                    .entry(member)
+                    .or_default()
+                    .insert(tag.clone());
+            }
+        }
+        reg.tag_rev = Some(rev);
+    }
+    let tags = live_colossal_registry()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .block_member_tags
+        .get(&id)
+        .cloned()
+        .unwrap_or_default();
+    Some(BlockProbe { id, tags })
+}
+
+/// Bus-side shim over a registered forge runtime — the same `Arc` the
+/// [`LiveColossalAndForgeRegistry`] entry owns, so a hopper push lands in
+/// the canonical input buffer the forge tick drains and a pull reads the
+/// smelted output, with no shadow state to reconcile.
+#[cfg(feature = "mod-suite")]
+struct LiveForgeEndpoint {
+    inner: Arc<Mutex<MultiBlockForgeRuntime>>,
+}
+
+#[cfg(feature = "mod-suite")]
+impl ItemTransferHandler for LiveForgeEndpoint {
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
+    }
+
+    fn as_any_mut(&mut self) -> &mut dyn std::any::Any {
+        self
+    }
+
+    fn insert_item(
+        &mut self,
+        face: Option<FaceDirection>,
+        stack: &CapabilityItemStack,
+        simulate: bool,
+    ) -> CapabilityItemStack {
+        self.inner
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert_item(face, stack, simulate)
+    }
+
+    fn extract_item(
+        &mut self,
+        face: Option<FaceDirection>,
+        max_count: u32,
+        filter: Option<&dyn Fn(&CapabilityItemStack) -> bool>,
+        simulate: bool,
+    ) -> Option<CapabilityItemStack> {
+        self.inner
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .extract_item(face, max_count, filter, simulate)
+    }
+
+    fn slots(&self) -> usize {
+        self.inner
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .slots()
+    }
+}
+
+
+// ---------------------------------------------------------------------------
+// live_opt_wire surface: auto-optimizer, lazy catch-up, colossal + forge
+// entry points. Consumers are live_create_*, live_mod_tick and the
+// world-write hooks; the rest is the spec'd surface other subsystems call
+// when their event arrives (an unloaded chunk returning, a forge block
+// forming, a colossal entity being ray-tested).
+// ---------------------------------------------------------------------------
+
+/// Point-in-time diagnostic snapshot of the live auto-optimizer —
+/// memoizer, backoff, coalescer and batcher counters in one read so
+/// a single probe shows whether the optimizer is saving work or just
+/// costing hash-map lookups.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[cfg(feature = "mod-suite")]
+pub(crate) struct LiveAutoOptimizerStats {
+    pub memo_hits: u64,
+    pub memo_negative_hits: u64,
+    pub memo_misses: u64,
+    pub memo_evictions: u64,
+    pub memo_len: usize,
+    pub backoff_tracked: u64,
+    pub backoff_sleeping: u64,
+    pub backoff_ticks_saved: u64,
+    pub coalesce_sent: u64,
+    pub coalesce_dropped_duplicate: u64,
+    pub coalesce_throttled: u64,
+    pub bulk_raw_writes: u64,
+    pub bulk_coalesced_writes: u64,
+    pub bulk_cancelled_writes: u64,
+    pub bulk_sections_touched: u64,
+}
+
+/// Combined counters across all four auto-optimizer subsystems.
+#[cfg(feature = "mod-suite")]
+pub(crate) fn live_mod_auto_optimizer_stats() -> LiveAutoOptimizerStats {
+    let opt = live_auto_optimizer()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    let memo = opt.recipes.stats();
+    let backoff = opt.backoff.stats();
+    let coalesce = opt.coalescer.stats();
+    let bulk = opt.batcher.stats();
+    LiveAutoOptimizerStats {
+        memo_hits: memo.hits,
+        memo_negative_hits: memo.negative_hits,
+        memo_misses: memo.misses,
+        memo_evictions: memo.evictions,
+        memo_len: opt.recipes.len(),
+        backoff_tracked: backoff.total_tracked,
+        backoff_sleeping: backoff.sleeping_count,
+        backoff_ticks_saved: backoff.ticks_saved,
+        coalesce_sent: coalesce.sent,
+        coalesce_dropped_duplicate: coalesce.dropped_duplicate,
+        coalesce_throttled: coalesce.throttled_distance,
+        bulk_raw_writes: bulk.raw_writes,
+        bulk_coalesced_writes: bulk.coalesced_writes,
+        bulk_cancelled_writes: bulk.cancelled_writes,
+        bulk_sections_touched: bulk.sections_touched,
+    }
+}
+
+/// Reset the optimizer to empty — memoized recipes, cadences,
+/// coalescer sources and pending section batches all drop. Tests use
+/// it to keep process-global state from leaking across cases.
+#[cfg(feature = "mod-suite")]
+pub(crate) fn live_auto_optimizer_reset() {
+    *live_auto_optimizer()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner()) = LiveModAutoOptimizer::new();
+}
+
+/// Delta-coalescer gate for a live mod sync source: `tier` encodes
+/// `0=Near, 1=Mid, 2=Far, other=OutOfRange`. `true` iff `payload`
+/// should ship this tick — byte-identical repeats and within-window
+/// churn are suppressed.
+#[cfg(feature = "mod-suite")]
+pub(crate) fn live_mod_delta_should_emit(
+    source_id: u64,
+    payload: &[u8],
+    current_tick: u64,
+    tier: u8,
+) -> bool {
+    let tier = match tier {
+        0 => DistanceTier::Near,
+        1 => DistanceTier::Mid,
+        2 => DistanceTier::Far,
+        _ => DistanceTier::OutOfRange,
+    };
+    matches!(
+        live_auto_optimizer()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .coalescer
+            .should_emit(source_id, payload, current_tick, tier),
+        EmitDecision::Send
+    )
+}
+
+/// Queue a light-relevant bulk world write into the section batcher.
+#[cfg(feature = "mod-suite")]
+pub(crate) fn live_mod_bulk_record_set_block(
+    dim: DimId,
+    x: i32,
+    y: i32,
+    z: i32,
+    old_state: u32,
+    new_state: u32,
+) {
+    live_auto_optimizer()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .batcher
+        .record_set_block(dim.raw() as i32, x, y, z, old_state, new_state);
+}
+
+/// Queue a provably-light-stable bulk write (batch reports clean
+/// lighting when nothing else set it).
+#[cfg(feature = "mod-suite")]
+pub(crate) fn live_mod_bulk_record_set_block_unlit(
+    dim: DimId,
+    x: i32,
+    y: i32,
+    z: i32,
+    old_state: u32,
+    new_state: u32,
+) {
+    live_auto_optimizer()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .batcher
+        .record_set_block_unlit(dim.raw() as i32, x, y, z, old_state, new_state);
+}
+
+/// Drain every pending section batch — one net cell write per
+/// position, last-write-wins, `A -> B -> A` pairs already cancelled.
+#[cfg(feature = "mod-suite")]
+pub(crate) fn live_mod_bulk_drain() -> Vec<BulkSectionBatch> {
+    live_auto_optimizer()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .batcher
+        .drain_section_batches()
+}
+
+/// Whether O(1) unloaded-chunk catch-up is armed
+/// (`MEGU_LAZY_CATCHUP` or the explicit API below).
+#[cfg(feature = "mod-suite")]
+pub(crate) fn live_mod_lazy_catchup_enabled() -> bool {
+    live_lazy_catchup_state()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .limits
+        .enabled
+}
+
+/// Explicit arming switch over the fail-closed default — the
+/// programmatic equivalent of `MEGU_LAZY_CATCHUP=1`.
+#[cfg(feature = "mod-suite")]
+pub(crate) fn live_mod_lazy_catchup_set_enabled(enabled: bool) {
+    live_lazy_catchup_state()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .limits
+        .enabled = enabled;
+}
+
+/// O(1) furnace catch-up for `delta_ticks` of unloaded time, bounded
+/// by the live `CatchUpLimits` (disabled -> the state echoes back
+/// with zero work reported).
+#[cfg(feature = "mod-suite")]
+pub(crate) fn live_mod_lazy_catchup_furnace(
+    state: &FurnaceCatchUpState,
+    delta_ticks: u64,
+) -> FurnaceCatchUpReport {
+    let limits = live_lazy_catchup_state()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .limits;
+    catch_up_furnace(&limits, state, delta_ticks)
+}
+
+/// Deterministic growth-stage catch-up for an unloaded crop/breed —
+/// same geometric-wait model the per-tick tick would produce.
+#[cfg(feature = "mod-suite")]
+pub(crate) fn live_mod_lazy_catchup_growth(
+    current_stage: u8,
+    max_stage: u8,
+    random_tick_prob_per_tick: f64,
+    delta_ticks: u64,
+    seed: u64,
+) -> u8 {
+    let limits = live_lazy_catchup_state()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .limits;
+    catch_up_growth_stage(
+        &limits,
+        current_stage,
+        max_stage,
+        random_tick_prob_per_tick,
+        delta_ticks,
+        seed,
+    )
+}
+
+/// O(1) cycle-batched catch-up for a declarative machine snapshot.
+#[cfg(feature = "mod-suite")]
+pub(crate) fn live_mod_lazy_catchup_machine(
+    state: &MachineCatchUpState,
+    delta_ticks: u64,
+) -> MachineCatchUpReport {
+    let limits = live_lazy_catchup_state()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .limits;
+    catch_up_machine_batch(&limits, state, delta_ticks)
+}
+
+/// Register a headless factory node (bounded by
+/// `MAX_HEADLESS_NODES`); `true` on acceptance — duplicate ids and
+/// registry overflow report `false`.
+#[cfg(feature = "mod-suite")]
+pub(crate) fn live_mod_headless_factory_register(node: HeadlessFactoryNode) -> bool {
+    live_lazy_catchup_state()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .factories
+        .add_node(node)
+        .is_ok()
+}
+
+/// Remove a registered node; `true` when it existed.
+#[cfg(feature = "mod-suite")]
+pub(crate) fn live_mod_headless_factory_remove(node_id: u64) -> bool {
+    live_lazy_catchup_state()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .factories
+        .remove_node(node_id)
+        .is_ok()
+}
+
+/// Registered node count.
+#[cfg(feature = "mod-suite")]
+pub(crate) fn live_mod_headless_factory_len() -> usize {
+    live_lazy_catchup_state()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .factories
+        .len()
+}
+
+/// Advance every registered node by `ticks` — sub-item rates carry
+/// over in milliper-item units, and the same `effective_delta` gate
+/// makes the whole step a no-op while catch-up is disabled. Returns
+/// items moved input -> output.
+#[cfg(feature = "mod-suite")]
+pub(crate) fn live_mod_headless_factory_step(ticks: u64) -> u64 {
+    let mut state = live_lazy_catchup_state()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    let limits = state.limits;
+    state
+        .factories
+        .step_headless_factories(&limits, ticks)
+        .items_moved
+}
+
+/// Register (or replace) a forge core at `(x, y, z)` in `dim` under
+/// `spec`: the runtime validates its shell against the live world
+/// once, then publishes itself on the capability bus as an
+/// `ItemTransferHandler` so vanilla hoppers, Create ducts and
+/// cross-mod conduits push recipe inputs and pull smelted outputs
+/// with zero extra glue. Returns the initial `structure_valid`
+/// verdict — an invalid forge still registers (revalidation later
+/// can arm it; breath and smelts stay refused meanwhile).
+#[cfg(feature = "mod-suite")]
+pub(crate) fn live_forge_register(
+    dim: DimId,
+    x: i32,
+    y: i32,
+    z: i32,
+    spec: MultiBlockForgeSpec,
+) -> bool {
+    let coord = live_cap_coord(dim, x, y, z);
+    let runtime = Arc::new(Mutex::new(MultiBlockForgeRuntime::new([x, y, z])));
+    let valid = runtime
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .revalidate(&spec, &mut |pos| live_block_probe(dim, pos));
+    live_cap_bus()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .register_item_handler(
+            coord.clone(),
+            Box::new(LiveForgeEndpoint {
+                inner: runtime.clone(),
+            }),
+        );
+    live_colossal_registry()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .forges
+        .insert(coord, LiveForgeEntry { spec, runtime });
+    valid
+}
+
+/// Drop the forge at `(x, y, z)`: the bus endpoint unregisters in the
+/// same call so no hopper keeps feeding a shadow buffer.
+#[cfg(feature = "mod-suite")]
+pub(crate) fn live_forge_unregister(dim: DimId, x: i32, y: i32, z: i32) -> bool {
+    let coord = live_cap_coord(dim, x, y, z);
+    live_cap_bus()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .unregister_item_handler(&coord);
+    live_colossal_registry()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .forges
+        .remove(&coord)
+        .is_some()
+}
+
+/// Fetch `(spec, runtime)` for a registered forge, or `None`.
+#[cfg(feature = "mod-suite")]
+fn live_forge_entry(
+    dim: DimId,
+    x: i32,
+    y: i32,
+    z: i32,
+) -> Option<(MultiBlockForgeSpec, Arc<Mutex<MultiBlockForgeRuntime>>)> {
+    let coord = live_cap_coord(dim, x, y, z);
+    live_colossal_registry()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .forges
+        .get(&coord)
+        .map(|e| (e.spec.clone(), e.runtime.clone()))
+}
+
+/// Re-run structure validation against the live world; `None` when
+/// no forge is registered there.
+#[cfg(feature = "mod-suite")]
+pub(crate) fn live_forge_revalidate(
+    dim: DimId,
+    x: i32,
+    y: i32,
+    z: i32,
+) -> Option<bool> {
+    let (spec, runtime) = live_forge_entry(dim, x, y, z)?;
+    let valid = runtime
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .revalidate(&spec, &mut |pos| live_block_probe(dim, pos));
+    Some(valid)
+}
+
+/// One forge tick: advances the active smelt, applies idle decay,
+/// and starts the next recipe when inputs and heat allow. `None`
+/// when no forge is registered there.
+#[cfg(feature = "mod-suite")]
+pub(crate) fn live_forge_tick(
+    dim: DimId,
+    x: i32,
+    y: i32,
+    z: i32,
+) -> Option<ForgeTickEvents> {
+    let (spec, runtime) = live_forge_entry(dim, x, y, z)?;
+    let events = runtime
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .tick(&spec);
+    Some(events)
+}
+
+/// Apply `ticks` of `element` breath to the forge at `(x, y, z)`;
+/// `None` when unregistered, `Some(false)` when the structure is
+/// invalid or the element is not in `spec.heat_elements`.
+#[cfg(feature = "mod-suite")]
+pub(crate) fn live_forge_apply_breath(
+    dim: DimId,
+    x: i32,
+    y: i32,
+    z: i32,
+    element: ElementKind,
+    ticks: u32,
+) -> Option<bool> {
+    let (spec, runtime) = live_forge_entry(dim, x, y, z)?;
+    let accepted = runtime
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .apply_breath(&spec, element, ticks);
+    Some(accepted)
+}
+
+/// Register (or overwrite) a creature's multi-part layout under `id`.
+#[cfg(feature = "mod-suite")]
+pub(crate) fn live_colossal_register_hitbox(id: &str, hitbox: MultiPartHitbox) {
+    live_colossal_registry()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .hitboxes
+        .insert(id.to_string(), hitbox);
+}
+
+/// Remove a registered layout; `true` when it existed.
+#[cfg(feature = "mod-suite")]
+pub(crate) fn live_colossal_unregister_hitbox(id: &str) -> bool {
+    live_colossal_registry()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .hitboxes
+        .remove(id)
+        .is_some()
+}
+
+/// Ray hit-test the registered hitbox `id` evaluated at `origin`
+/// with `yaw_rad`/`pitch_rad`/`stage_scale` — nearest part struck
+/// plus its resolved damage multiplier (`Head` 1.25 vs `Torso` 0.9
+/// by default). `None` for unknown ids and clean misses alike.
+#[allow(clippy::too_many_arguments)]
+#[cfg(feature = "mod-suite")]
+pub(crate) fn live_colossal_hit_test(
+    id: &str,
+    origin: [f64; 3],
+    yaw_rad: f32,
+    pitch_rad: f32,
+    stage_scale: f32,
+    ray_origin: [f64; 3],
+    ray_dir: [f64; 3],
+    max_dist: f64,
+) -> Option<PartHit> {
+    let hitbox = live_colossal_registry()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .hitboxes
+        .get(id)
+        .cloned()?;
+    let aabbs = hitbox.evaluate(origin, yaw_rad, pitch_rad, stage_scale);
+    hitbox.hit_test(&aabbs, ray_origin, ray_dir, max_dist)
+}
+
+/// 1-based growth stage a `GrowthStageCurve` assigns `age_ticks` —
+/// the same index a caller feeds back as `stage_scale` through
+/// `spec_for_stage` when sizing a hit_test.
+#[cfg(feature = "mod-suite")]
+pub(crate) fn live_colossal_stage_at(curve: &GrowthStageCurve, age_ticks: u64) -> u8 {
+    curve.stage_for_age_ticks(age_ticks)
+}
+
+/// Register (or overwrite) a breath profile under `id`.
+#[cfg(feature = "mod-suite")]
+pub(crate) fn live_breath_register(id: &str, spec: ElementalBreathSpec) {
+    live_colossal_registry()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .breaths
+        .insert(id.to_string(), spec);
+}
+
+/// Evaluate the registered breath `id` from `mouth_origin` along
+/// `(yaw_rad, pitch_rad)` against `entities` and the live world
+/// (`live_block_probe` answers every terrain cell — bounded by the
+/// spec's probe/transform budgets). `None` for unknown ids.
+#[cfg(feature = "mod-suite")]
+pub(crate) fn live_breath_evaluate(
+    id: &str,
+    dim: DimId,
+    mouth_origin: [f64; 3],
+    yaw_rad: f32,
+    pitch_rad: f32,
+    entities: &[BreathEntity],
+) -> Option<BreathOutcome> {
+    let spec = live_colossal_registry()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .breaths
+        .get(id)
+        .cloned()?;
+    Some(evaluate_breath_cone(
+        mouth_origin,
+        yaw_rad,
+        pitch_rad,
+        &spec,
+        entities,
+        &mut |pos| live_block_probe(dim, pos),
+    ))
+}
+/// Names the `live_opt_wire` entry-point surface so the spec'd fns stay
+/// live for `dead_code` while their callers in other subsystems land.
+/// The array is a diagnostic handle only — it is never read.
+#[cfg(feature = "mod-suite")]
+#[doc(hidden)]
+pub fn live_opt_wire_surface() {
+    let _ = (
+        live_mod_auto_optimizer_stats,
+        live_auto_optimizer_reset,
+        live_mod_delta_should_emit,
+        live_mod_bulk_record_set_block,
+        live_mod_bulk_record_set_block_unlit,
+        live_mod_bulk_drain,
+        live_mod_lazy_catchup_enabled,
+        live_mod_lazy_catchup_set_enabled,
+        live_mod_lazy_catchup_furnace,
+        live_mod_lazy_catchup_growth,
+        live_mod_lazy_catchup_machine,
+        live_mod_headless_factory_register,
+        live_mod_headless_factory_remove,
+        live_mod_headless_factory_len,
+        live_mod_headless_factory_step,
+        live_forge_register,
+        live_forge_unregister,
+        live_forge_entry,
+        live_forge_revalidate,
+        live_forge_tick,
+        live_forge_apply_breath,
+        live_colossal_register_hitbox,
+        live_colossal_unregister_hitbox,
+        live_colossal_hit_test,
+        live_colossal_stage_at,
+        live_breath_register,
+        live_breath_evaluate,
+        LiveAutoOptimizerStats::default(),
+    );
+}
+
+
+
+// Default-build stubs for the live_opt_wire surface: same names, no-op
+// bodies, generic parameters where the real signature names a mod-suite
+// type — matching the file's flat-stub convention.
+
+/// Zeroed snapshot counterpart of the mod-suite stats struct.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[cfg(not(feature = "mod-suite"))]
+pub(crate) struct LiveAutoOptimizerStats;
+
+#[inline(always)]
+#[cfg(not(feature = "mod-suite"))]
+pub(crate) fn live_mod_auto_optimizer_stats() -> LiveAutoOptimizerStats {
+    LiveAutoOptimizerStats
+}
+
+#[inline(always)]
+#[cfg(not(feature = "mod-suite"))]
+pub(crate) fn live_mod_delta_should_emit(
+    _source_id: u64,
+    _payload: &[u8],
+    _current_tick: u64,
+    _tier: u8,
+) -> bool {
+    true
+}
+
+#[inline(always)]
+#[cfg(not(feature = "mod-suite"))]
+pub(crate) fn live_mod_bulk_record_set_block(
+    _dim: DimId,
+    _x: i32,
+    _y: i32,
+    _z: i32,
+    _old_state: u32,
+    _new_state: u32,
+) {
+}
+
+#[inline(always)]
+#[cfg(not(feature = "mod-suite"))]
+pub(crate) fn live_mod_bulk_record_set_block_unlit(
+    _dim: DimId,
+    _x: i32,
+    _y: i32,
+    _z: i32,
+    _old_state: u32,
+    _new_state: u32,
+) {
+}
+
+#[inline(always)]
+#[cfg(not(feature = "mod-suite"))]
+pub(crate) fn live_mod_bulk_drain<T>() -> Vec<T> {
+    Vec::new()
+}
+
+#[inline(always)]
+#[cfg(not(feature = "mod-suite"))]
+pub(crate) fn live_mod_lazy_catchup_enabled() -> bool {
+    false
+}
+
+#[inline(always)]
+#[cfg(not(feature = "mod-suite"))]
+pub(crate) fn live_mod_lazy_catchup_set_enabled(_enabled: bool) {}
+
+#[inline(always)]
+#[cfg(not(feature = "mod-suite"))]
+pub(crate) fn live_mod_lazy_catchup_furnace<S, R>(
+    _state: &S,
+    _delta_ticks: u64,
+) -> Option<R> {
+    None
+}
+
+#[inline(always)]
+#[cfg(not(feature = "mod-suite"))]
+pub(crate) fn live_mod_lazy_catchup_growth(
+    current_stage: u8,
+    _max_stage: u8,
+    _random_tick_prob_per_tick: f64,
+    _delta_ticks: u64,
+    _seed: u64,
+) -> u8 {
+    current_stage
+}
+
+#[inline(always)]
+#[cfg(not(feature = "mod-suite"))]
+pub(crate) fn live_mod_lazy_catchup_machine<S, R>(
+    _state: &S,
+    _delta_ticks: u64,
+) -> Option<R> {
+    None
+}
+
+#[inline(always)]
+#[cfg(not(feature = "mod-suite"))]
+pub(crate) fn live_mod_headless_factory_register<N>(_node: N) -> bool {
+    false
+}
+
+#[inline(always)]
+#[cfg(not(feature = "mod-suite"))]
+pub(crate) fn live_mod_headless_factory_remove(_node_id: u64) -> bool {
+    false
+}
+
+#[inline(always)]
+#[cfg(not(feature = "mod-suite"))]
+pub(crate) fn live_mod_headless_factory_len() -> usize {
+    0
+}
+
+#[inline(always)]
+#[cfg(not(feature = "mod-suite"))]
+pub(crate) fn live_mod_headless_factory_step(_ticks: u64) -> u64 {
+    0
+}
+
+#[inline(always)]
+#[cfg(not(feature = "mod-suite"))]
+pub(crate) fn live_forge_register<S>(
+    _dim: DimId,
+    _x: i32,
+    _y: i32,
+    _z: i32,
+    _spec: S,
+) -> bool {
+    false
+}
+
+#[inline(always)]
+#[cfg(not(feature = "mod-suite"))]
+pub(crate) fn live_forge_unregister(_dim: DimId, _x: i32, _y: i32, _z: i32) -> bool {
+    false
+}
+
+#[inline(always)]
+#[cfg(not(feature = "mod-suite"))]
+pub(crate) fn live_forge_revalidate(_dim: DimId, _x: i32, _y: i32, _z: i32) -> Option<bool> {
+    None
+}
+
+#[inline(always)]
+#[cfg(not(feature = "mod-suite"))]
+pub(crate) fn live_forge_tick<T>(_dim: DimId, _x: i32, _y: i32, _z: i32) -> Option<T> {
+    None
+}
+
+#[inline(always)]
+#[cfg(not(feature = "mod-suite"))]
+pub(crate) fn live_forge_apply_breath<E>(
+    _dim: DimId,
+    _x: i32,
+    _y: i32,
+    _z: i32,
+    _element: E,
+    _ticks: u32,
+) -> Option<bool> {
+    None
+}
+
+#[inline(always)]
+#[cfg(not(feature = "mod-suite"))]
+pub(crate) fn live_colossal_register_hitbox<H>(_id: &str, _hitbox: H) {}
+
+#[inline(always)]
+#[cfg(not(feature = "mod-suite"))]
+pub(crate) fn live_colossal_unregister_hitbox(_id: &str) -> bool {
+    false
+}
+
+#[inline(always)]
+#[allow(clippy::too_many_arguments)]
+#[cfg(not(feature = "mod-suite"))]
+pub(crate) fn live_colossal_hit_test<H>(
+    _id: &str,
+    _origin: [f64; 3],
+    _yaw_rad: f32,
+    _pitch_rad: f32,
+    _stage_scale: f32,
+    _ray_origin: [f64; 3],
+    _ray_dir: [f64; 3],
+    _max_dist: f64,
+) -> Option<H> {
+    None
+}
+
+#[inline(always)]
+#[cfg(not(feature = "mod-suite"))]
+pub(crate) fn live_colossal_stage_at<C>(_curve: &C, _age_ticks: u64) -> u8 {
+    1
+}
+
+#[inline(always)]
+#[cfg(not(feature = "mod-suite"))]
+pub(crate) fn live_breath_register<S>(_id: &str, _spec: S) {}
+
+#[inline(always)]
+#[cfg(not(feature = "mod-suite"))]
+pub(crate) fn live_breath_evaluate<O, E>(
+    _id: &str,
+    _dim: DimId,
+    _mouth_origin: [f64; 3],
+    _yaw_rad: f32,
+    _pitch_rad: f32,
+    _entities: &[E],
+) -> Option<O> {
+    None
+}
+/// Default-build counterpart of `live_opt_wire_surface`: names every
+/// stub so the no-op surface stays live for `dead_code`.
+#[cfg(not(feature = "mod-suite"))]
+#[doc(hidden)]
+pub fn live_opt_wire_surface() {
+    let _ = (
+        live_mod_auto_optimizer_stats,
+        live_mod_delta_should_emit,
+        live_mod_bulk_record_set_block,
+        live_mod_bulk_record_set_block_unlit,
+        live_mod_bulk_drain::<u8>,
+        live_mod_lazy_catchup_enabled,
+        live_mod_lazy_catchup_set_enabled,
+        live_mod_lazy_catchup_furnace::<u8, u8>,
+        live_mod_lazy_catchup_growth,
+        live_mod_lazy_catchup_machine::<u8, u8>,
+        live_mod_headless_factory_register::<u8>,
+        live_mod_headless_factory_remove,
+        live_mod_headless_factory_len,
+        live_mod_headless_factory_step,
+        live_forge_register::<u8>,
+        live_forge_unregister,
+        live_forge_revalidate,
+        live_forge_tick::<u8>,
+        live_forge_apply_breath::<u8>,
+        live_colossal_register_hitbox::<u8>,
+        live_colossal_unregister_hitbox,
+        live_colossal_hit_test::<u8>,
+        live_colossal_stage_at::<u8>,
+        live_breath_register::<u8>,
+        live_breath_evaluate::<u8, u8>,
+        LiveAutoOptimizerStats,
+    );
+}
+
 
 #[cfg(not(feature = "mod-suite"))]
 #[allow(dead_code)]
@@ -8926,6 +10172,10 @@ mod live_create_tests {
         // A rebuilt runtime owns no capability endpoints — drop the stale
         // bus state the previous runtime left registered.
         live_cap_reset();
+        // The auto-optimizer's cadence/memo tables are process-global —
+        // a stale backoff entry at a reused cell could suppress this
+        // test's first polls.
+        live_auto_optimizer_reset();
     }
 
     fn registry() -> create_adapter::blockstates::CreateBlockRegistry {
@@ -10020,5 +11270,666 @@ mod live_create_tests {
         for c in [belt, funnel, depot] {
             clear(c.0, c.1, c.2);
         }
+    }
+
+    // ---------- SERVER-LIVE-MOD-BRIDGE-OPT-WIRE ----------
+
+    /// Fresh coordinates for the optimizer/forge tests, disjoint from the
+    /// `W1`..`W10` ranges the transport tests own.
+    const WOPT1: (i32, i32, i32) = (9_000_008, 80, 1_400);
+    const WOPT2: (i32, i32, i32) = (9_000_008, 80, 1_500);
+    const WOPT3: (i32, i32, i32) = (9_000_008, 80, 1_600);
+
+    /// Reset every `live_opt_wire` process-global between tests so stale
+    /// cadences, memo entries, forge endpoints and catch-up limits never
+    /// leak across cases.
+    fn opt_reset() {
+        live_auto_optimizer_reset();
+        *live_lazy_catchup_state().lock().unwrap_or_else(|e| e.into_inner()) =
+            LiveLazyCatchUpState::default();
+        *live_colossal_registry()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner()) = LiveColossalAndForgeRegistry::default();
+        live_cap_reset();
+        // The block probe's id source prefers the JAR registry plan —
+        // drop any plan a previous test installed so an empty world cell
+        // probes as air/unloaded rather than a stale modded id.
+        {
+            let mut suite = live_mod_suite().lock().unwrap_or_else(|e| e.into_inner());
+            suite.registry_plan = None;
+        }
+    }
+
+    #[test]
+    fn live_mod_opt_memoizer_hits_misses_and_invalidates() {
+        let _g = world_guard();
+        opt_reset();
+        let calls = std::sync::atomic::AtomicU64::new(0);
+        let fp = live_fingerprint_held_items(&[5, 7]);
+
+        // Miss: compute runs exactly once, its result is returned...
+        let first = live_auto_recipe_lookup(LIVE_OPT_MACHINE_PRESS, fp, |_| {
+            calls.fetch_add(1, Ordering::Relaxed);
+            Some(3)
+        });
+        assert_eq!(first, Some(3));
+        // ...and the identical fingerprint hits the cache without
+        // re-running compute — even a different result never lands.
+        let second = live_auto_recipe_lookup(LIVE_OPT_MACHINE_PRESS, fp, |_| {
+            calls.fetch_add(1, Ordering::Relaxed);
+            Some(9)
+        });
+        assert_eq!(second, Some(3));
+        assert_eq!(calls.load(Ordering::Relaxed), 1);
+
+        // Negative results cache on equal footing: a `None` compute runs
+        // once and then answers every subsequent lookup for free.
+        let miss_fp = fp.wrapping_add(1);
+        let third = live_auto_recipe_lookup(LIVE_OPT_MACHINE_PRESS, miss_fp, |_| {
+            calls.fetch_add(1, Ordering::Relaxed);
+            None
+        });
+        let fourth = live_auto_recipe_lookup(LIVE_OPT_MACHINE_PRESS, miss_fp, |_| {
+            calls.fetch_add(1, Ordering::Relaxed);
+            Some(1)
+        });
+        assert_eq!(third, None);
+        assert_eq!(fourth, None);
+        assert_eq!(calls.load(Ordering::Relaxed), 2);
+
+        // Kind is part of the key: the same fingerprint under the mixer
+        // table misses again instead of cross-hitting the press verdict.
+        let fifth = live_auto_recipe_lookup(LIVE_OPT_MACHINE_MIXER, fp, |_| {
+            calls.fetch_add(1, Ordering::Relaxed);
+            Some(2)
+        });
+        assert_eq!(fifth, Some(2));
+        assert_eq!(calls.load(Ordering::Relaxed), 3);
+
+        // A registry revision bump (the `scan_mods_dir` invalidation
+        // channel) clears every cached verdict — the next lookup
+        // re-resolves and runs compute again.
+        {
+            let mut suite = live_mod_suite().lock().unwrap_or_else(|e| e.into_inner());
+            suite.registry_revision = suite.registry_revision.wrapping_add(1);
+        }
+        let sixth = live_auto_recipe_lookup(LIVE_OPT_MACHINE_PRESS, fp, |_| {
+            calls.fetch_add(1, Ordering::Relaxed);
+            Some(7)
+        });
+        assert_eq!(sixth, Some(7));
+        assert_eq!(calls.load(Ordering::Relaxed), 4);
+
+        let stats = live_mod_auto_optimizer_stats();
+        assert_eq!(stats.memo_misses, 4);
+        assert_eq!(stats.memo_hits, 1);
+        assert_eq!(stats.memo_negative_hits, 1);
+        // The invalidation cleared the table; only the post-bump
+        // recompute stands.
+        assert_eq!(stats.memo_len, 1);
+    }
+
+    #[test]
+    fn live_mod_opt_backoff_escalates_and_wakes() {
+        let _g = world_guard();
+        opt_reset();
+        let pos = pos_of(WOPT2);
+
+        // Fresh machine: first poll grants and schedules cadence 1.
+        assert!(live_auto_machine_should_tick(pos, 100));
+        // Four unchanged polls -> ladder step 2 (2-tick interval).
+        for _ in 0..4 {
+            live_auto_machine_record(pos, false);
+        }
+        assert!(!live_auto_machine_should_tick(pos, 101));
+        assert!(live_auto_machine_should_tick(pos, 102));
+        // Four more unchanged -> step 4: ticks 103..106 all skip.
+        for _ in 0..4 {
+            live_auto_machine_record(pos, false);
+        }
+        assert!(!live_auto_machine_should_tick(pos, 105));
+        assert!(live_auto_machine_should_tick(pos, 106));
+        // A dirty-event wake restores cadence 1 with 0-tick latency: the
+        // very same tick grants another poll instead of waiting out the
+        // 4-tick step.
+        live_auto_machine_wake_positions(&[pos]);
+        assert!(live_auto_machine_should_tick(pos, 106));
+        // A changed result also snaps back to cadence 1.
+        live_auto_machine_record(pos, true);
+        assert!(live_auto_machine_should_tick(pos, 107));
+
+        let stats = live_mod_auto_optimizer_stats();
+        assert_eq!(stats.backoff_tracked, 1);
+        assert!(stats.backoff_ticks_saved >= 2);
+    }
+
+    /// The live depot+press path: identical held contents hit the
+    /// memoizer every poll, an unmatched product backs the machine off,
+    /// and a hopper pull / scripted feed wakes it at 0-tick latency.
+    #[test]
+    fn live_mod_opt_depot_press_memoizes_and_backs_off() {
+        let _g = world_guard();
+        arm();
+        opt_reset();
+        let (wx, wy, wz) = WOPT1;
+        // Same powered press-over-depot rig as the right-click test.
+        let water = (wx + 1, wy, wz);
+        let shaft = (wx - 1, wy, wz);
+        let press = (wx - 2, wy, wz);
+        let depot = (wx - 2, wy - 2, wz);
+        for c in [water, shaft, press, depot] {
+            clear(c.0, c.1, c.2);
+        }
+        put(DimId::Overworld, water.0, water.1, water.2, TEST_WATER);
+        put(
+            DimId::Overworld,
+            wx,
+            wy,
+            wz,
+            state_of("create:water_wheel", &[("axis", "x")]),
+        );
+        put(
+            DimId::Overworld,
+            shaft.0,
+            shaft.1,
+            shaft.2,
+            state_of("create:shaft", &[("axis", "x")]),
+        );
+        put(
+            DimId::Overworld,
+            press.0,
+            press.1,
+            press.2,
+            state_of("create:mechanical_press", &[("facing", "east")]),
+        );
+        put(
+            DimId::Overworld,
+            depot.0,
+            depot.1,
+            depot.2,
+            state_of("create:depot", &[]),
+        );
+        let depot_pos = pos_of(depot);
+        live_create_with(|rt| {
+            let sol = rt
+                .factory
+                .kinetic_solution(pos_of(press))
+                .expect("press in graph");
+            assert!(
+                matches!(
+                    sol.status,
+                    mod_offload::kinetic_graph::NetworkStatus::Running
+                ),
+                "press must be powered, got {:?}",
+                sol.status
+            );
+        });
+
+        // Feed the depot through the shared duct-insert entry point and
+        // press the ingot to a sheet. Every granted poll after the first
+        // reads the memoized recipe match — the matcher never rescans.
+        let iron = name_to_item("minecraft:iron_ingot").expect("iron item");
+        assert!(live_create_duct_insert(
+            DimId::Overworld,
+            depot.0,
+            depot.1,
+            depot.2,
+            iron
+        ));
+        let sheet = name_to_item("create:iron_sheet").expect("sheet item");
+        assert!(
+            step_until(2_000, |rt| rt
+                .held
+                .get(&depot_pos)
+                .is_some_and(|h| h.items.as_slice() == [sheet])),
+            "iron must press to a sheet"
+        );
+        let stats = live_mod_auto_optimizer_stats();
+        assert_eq!(stats.memo_misses, 1, "the first lookup misses once");
+        assert!(
+            stats.memo_hits >= 1,
+            "identical held contents must hit the memoizer"
+        );
+
+        // The finished sheet matches no recipe: the machine goes idle,
+        // its verdict negative-caches, and its cadence slides down the
+        // backoff ladder so most ticks cost one probe.
+        for _ in 0..40 {
+            TICK_IDX.fetch_add(1, Ordering::Relaxed);
+            let _ = live_create_tick_body();
+        }
+        let stats = live_mod_auto_optimizer_stats();
+        assert!(
+            stats.memo_negative_hits >= 1,
+            "unmatched contents must negative-cache, got {stats:?}"
+        );
+        assert!(
+            stats.backoff_ticks_saved > 0,
+            "an idle machine must save polls, got {stats:?}"
+        );
+
+        // Hopper-style pull of the product fires the dirty-event wake —
+        // the next poll grants immediately instead of sleeping out the
+        // ladder step.
+        let pulled = live_cap_extract_item(DimId::Overworld, depot.0, depot.1, depot.2, None, 1, false);
+        assert_eq!(pulled.map(|s| (s.item_id, s.count)), Some(("create:iron_sheet".to_string(), 1)));
+        let next = TICK_IDX.load(Ordering::Relaxed) + 1;
+        assert!(
+            live_auto_machine_should_tick(depot_pos, next),
+            "a pull wake must grant the very next poll"
+        );
+
+        // A fresh feed wakes + presses again end to end.
+        assert!(live_create_duct_insert(
+            DimId::Overworld,
+            depot.0,
+            depot.1,
+            depot.2,
+            iron
+        ));
+        assert!(
+            step_until(2_000, |rt| rt
+                .held
+                .get(&depot_pos)
+                .is_some_and(|h| h.items.as_slice() == [sheet])),
+            "re-fed iron must press to a sheet after the wake"
+        );
+
+        for c in [water, shaft, press, depot] {
+            clear(c.0, c.1, c.2);
+        }
+    }
+
+    /// Delta-coalescer and bulk-batcher surface: duplicate payloads drop,
+    /// mid-tier churn throttles, and `A -> B -> A` section writes cancel
+    /// before the drain.
+    #[test]
+    fn live_mod_opt_delta_coalescer_and_bulk_batcher() {
+        let _g = world_guard();
+        opt_reset();
+
+        // First payload ships; the byte-identical repeat drops; a changed
+        // payload inside the Mid window defers; after the interval it
+        // ships.
+        assert!(live_mod_delta_should_emit(7, b"payload-a", 100, 0));
+        assert!(!live_mod_delta_should_emit(7, b"payload-a", 101, 0));
+        assert!(!live_mod_delta_should_emit(7, b"payload-b", 102, 1));
+        assert!(live_mod_delta_should_emit(7, b"payload-b", 104, 1));
+        // Out-of-range sources never ship.
+        assert!(!live_mod_delta_should_emit(8, b"payload-c", 104, 9));
+
+        // `A -> B -> A` cancels outright; the lone surviving unlit write
+        // keeps the batch's `dirty_light` clean.
+        live_mod_bulk_record_set_block(DimId::Overworld, 5, 64, 5, 0, 100);
+        live_mod_bulk_record_set_block(DimId::Overworld, 5, 64, 5, 100, 0);
+        live_mod_bulk_record_set_block_unlit(DimId::Overworld, 6, 64, 5, 0, 200);
+        let batches = live_mod_bulk_drain();
+        assert_eq!(batches.len(), 1, "cancelled writes must not drain");
+        assert_eq!(batches[0].cells.len(), 1);
+        assert_eq!(batches[0].cells[0].new_state, 200);
+        // `dirty_light` is conservative: the cancelled lit write still
+        // taints the section even though no lit change survives.
+        assert!(batches[0].dirty_light);
+        let stats = live_mod_auto_optimizer_stats();
+        assert_eq!(stats.bulk_raw_writes, 3);
+        assert_eq!(stats.bulk_coalesced_writes, 1);
+        assert_eq!(stats.bulk_cancelled_writes, 1);
+        assert!(live_mod_bulk_drain().is_empty());
+    }
+
+    /// Fail-closed catch-up: the default state does zero work, the
+    /// explicit arm computes the exact O(1) result, and headless nodes
+    /// accumulate output across ticks with carry.
+    #[test]
+    fn live_mod_lazy_catchup_disabled_default_exact_when_enabled() {
+        let _g = world_guard();
+        opt_reset();
+
+        // Fail-closed by default: the report echoes the state and
+        // reports zero work.
+        assert!(!live_mod_lazy_catchup_enabled());
+        let furnace = FurnaceCatchUpState {
+            input_count: 10,
+            fuel_count: 10,
+            fuel_burn_ticks_each: 200,
+            current_burn_remaining: 0,
+            cook_progress: 0,
+            cook_time_total: 200,
+            output_count: 0,
+            output_max_stack: 64,
+        };
+        let report = live_mod_lazy_catchup_furnace(&furnace, 400);
+        assert_eq!(report.items_smelted, 0);
+        assert_eq!(report.fuel_consumed, 0);
+        assert_eq!(report.state, furnace);
+
+        // Armed explicitly: 400 ticks at 200 ticks/smelt smelts exactly
+        // two items and consumes exactly two fuel units.
+        live_mod_lazy_catchup_set_enabled(true);
+        assert!(live_mod_lazy_catchup_enabled());
+        let report = live_mod_lazy_catchup_furnace(&furnace, 400);
+        assert_eq!(report.items_smelted, 2);
+        assert_eq!(report.fuel_consumed, 2);
+        assert_eq!(report.state.input_count, 8);
+        assert_eq!(report.state.output_count, 2);
+        assert_eq!(report.state.fuel_count, 8);
+        assert_eq!(report.state.cook_progress, 0);
+        assert_eq!(report.state.current_burn_remaining, 0);
+
+        // Growth: a guaranteed random tick advances deterministically to
+        // the stage cap; a seeded draw is monotone and bounded.
+        assert_eq!(
+            live_mod_lazy_catchup_growth(2, 7, 1.0, 10, 42),
+            7
+        );
+        let seeded = live_mod_lazy_catchup_growth(0, 7, 0.5, 20, 1234);
+        assert!(seeded <= 7);
+        let seeded_more = live_mod_lazy_catchup_growth(0, 7, 0.5, 40, 1234);
+        assert!(seeded_more >= seeded);
+
+        // Machine batch: 50 ticks at 5 ticks/cycle = 10 slots, input of 5
+        // caps the cycles; 10 energy/cycle drains 50 of the 100 buffer.
+        let machine = MachineCatchUpState {
+            input_count: 5,
+            energy: 100,
+            energy_per_cycle: 10,
+            ticks_per_cycle: 5,
+            cycle_progress: 0,
+            output_count: 0,
+            output_space: 64,
+        };
+        let mreport = live_mod_lazy_catchup_machine(&machine, 50);
+        assert_eq!(mreport.cycles_completed, 5);
+        assert_eq!(mreport.energy_consumed, 50);
+        assert_eq!(mreport.state.input_count, 0);
+        assert_eq!(mreport.state.output_count, 5);
+        assert_eq!(mreport.state.energy, 50);
+
+        // Headless factory: a 0.5 item/tick node carries its half-item
+        // remainder across steps — two ticks move one item, the banked
+        // carry plus one more tick moves the second.
+        let node = HeadlessFactoryNode {
+            node_id: 7,
+            dim_id: 0,
+            cx: 0,
+            cz: 0,
+            rate_per_tick_milli: 500,
+            input_buffer: 10,
+            output_buffer: 0,
+            max_buffer: 64,
+            carry_milli: 0,
+        };
+        assert!(live_mod_headless_factory_register(node));
+        // Duplicate ids refuse.
+        assert!(!live_mod_headless_factory_register(node));
+        assert_eq!(live_mod_headless_factory_len(), 1);
+        assert_eq!(live_mod_headless_factory_step(2), 1);
+        assert_eq!(live_mod_headless_factory_step(1), 0);
+        assert_eq!(live_mod_headless_factory_step(1), 1);
+        assert!(live_mod_headless_factory_remove(7));
+        assert_eq!(live_mod_headless_factory_len(), 0);
+
+        // Disabled again mid-flight: every entry point goes back to
+        // echoing state and moving nothing.
+        live_mod_lazy_catchup_set_enabled(false);
+        let report = live_mod_lazy_catchup_furnace(&furnace, 400);
+        assert_eq!(report.items_smelted, 0);
+        assert_eq!(report.state, furnace);
+    }
+
+    /// The multi-block forge on the live capability bus: hopper pushes
+    /// feed the input buffer, breath + ticks smelt, and hopper pulls
+    /// collect the product — all through the same
+    /// `live_cap_insert_item`/`live_cap_extract_item` paths vanilla
+    /// hoppers use.
+    #[test]
+    fn live_mod_forge_bus_round_trip_and_multipart_hitbox() {
+        use mod_adapter_core::colossal_and_forge::{
+            forge_shell_3x3, AlloyRecipe, ForgeCellExpect, MultiPartHitbox, PartKind,
+            PartOffsetSpec,
+        };
+        let _g = world_guard();
+        arm();
+        opt_reset();
+        let (fx, fy, fz) = WOPT3;
+
+        // An all-Air shell validates in the empty test world regardless
+        // of whether `breg()` is armed — `Air` accepts an unloaded probe
+        // or any `minecraft:*_air` id.
+        let spec = MultiBlockForgeSpec {
+            cells: forge_shell_3x3(ForgeCellExpect::Air, ForgeCellExpect::Air, [0, 0, 1]),
+            heat_elements: vec![ElementKind::Fire],
+            heat_capacity: 100.0,
+            heat_per_breath_tick: 5.0,
+            idle_heat_decay_per_tick: 0.0,
+            recipes: vec![AlloyRecipe {
+                base_ingot: "anyforge:iron".to_string(),
+                catalyst_item: "anyforge:catalyst".to_string(),
+                element: ElementKind::Fire,
+                heat_cost: 50.0,
+                smelt_ticks: 2,
+                output_item: "anyforge:alloy".to_string(),
+                output_count: 1,
+            }],
+        };
+        assert!(live_forge_register(
+            DimId::Overworld,
+            fx,
+            fy,
+            fz,
+            spec.clone()
+        ));
+
+        // Hopper push: recipe inputs land in the forge buffer; a
+        // non-recipe item refuses outright (all-or-nothing).
+        assert_eq!(
+            live_cap_insert_item(DimId::Overworld, fx, fy, fz, None, "anyforge:iron", 1, &[], false),
+            1
+        );
+        assert_eq!(
+            live_cap_insert_item(
+                DimId::Overworld,
+                fx,
+                fy,
+                fz,
+                None,
+                "anyforge:catalyst",
+                1,
+                &[],
+                false
+            ),
+            1
+        );
+        assert_eq!(
+            live_cap_insert_item(DimId::Overworld, fx, fy, fz, None, "anyforge:junk", 1, &[], false),
+            0
+        );
+        // The output buffer is still empty — nothing pulls yet.
+        assert!(
+            live_cap_extract_item(DimId::Overworld, fx, fy, fz, None, 64, false).is_none()
+        );
+
+        // 20 breath ticks * 5.0 = 100 heat >= the 50.0 recipe cost;
+        // tick 1 starts the smelt, tick 3 completes it (smelt_ticks=2).
+        assert_eq!(
+            live_forge_apply_breath(
+                DimId::Overworld,
+                fx,
+                fy,
+                fz,
+                ElementKind::Fire,
+                20
+            ),
+            Some(true)
+        );
+        // Ice is not in `heat_elements` — refused.
+        assert_eq!(
+            live_forge_apply_breath(
+                DimId::Overworld,
+                fx,
+                fy,
+                fz,
+                ElementKind::Ice,
+                20
+            ),
+            Some(false)
+        );
+        let ev1 = live_forge_tick(DimId::Overworld, fx, fy, fz)
+            .expect("registered forge");
+        assert_eq!(ev1.smelt_started, Some(0));
+        let ev2 = live_forge_tick(DimId::Overworld, fx, fy, fz)
+            .expect("registered forge");
+        assert!(ev2.smelt_completed.is_none());
+        let ev3 = live_forge_tick(DimId::Overworld, fx, fy, fz)
+            .expect("registered forge");
+        assert_eq!(ev3.smelt_completed, Some(0));
+
+        // Hopper pull: the smelted product comes out through the same
+        // extract path a vanilla hopper calls.
+        let out = live_cap_extract_item(DimId::Overworld, fx, fy, fz, None, 64, false)
+            .expect("smelted output must pull");
+        assert_eq!(out.item_id, "anyforge:alloy");
+        assert_eq!(out.count, 1);
+        assert!(live_cap_extract_item(DimId::Overworld, fx, fy, fz, None, 64, false).is_none());
+
+        // Multi-part hitbox: a head weak point outranks the armored torso
+        // when the ray crosses both, and a side ray sees only the torso.
+        live_colossal_register_hitbox(
+            "anyforge:wyrm",
+            MultiPartHitbox {
+                parts: vec![
+                    PartOffsetSpec {
+                        kind: PartKind::Head,
+                        local_offset: [0.0, 2.0, 0.0],
+                        half_extents: [0.5, 0.5, 0.5],
+                        damage_multiplier: None,
+                    },
+                    PartOffsetSpec {
+                        kind: PartKind::Torso,
+                        local_offset: [0.0, 0.0, 0.0],
+                        half_extents: [1.0, 1.0, 1.0],
+                        damage_multiplier: None,
+                    },
+                ],
+            },
+        );
+        let head = live_colossal_hit_test(
+            "anyforge:wyrm",
+            [0.0, 0.0, 0.0],
+            0.0,
+            0.0,
+            1.0,
+            [0.0, 4.0, 0.0],
+            [0.0, -1.0, 0.0],
+            32.0,
+        )
+        .expect("downward ray must strike the head first");
+        assert_eq!(head.kind, PartKind::Head);
+        assert!((head.damage_multiplier - 1.25).abs() < f32::EPSILON);
+        let torso = live_colossal_hit_test(
+            "anyforge:wyrm",
+            [0.0, 0.0, 0.0],
+            0.0,
+            0.0,
+            1.0,
+            [3.0, 0.5, 0.0],
+            [-1.0, 0.0, 0.0],
+            32.0,
+        )
+        .expect("side ray must strike the torso");
+        assert_eq!(torso.kind, PartKind::Torso);
+        assert!((torso.damage_multiplier - 0.9).abs() < f32::EPSILON);
+        // A clean miss and an unknown id both fail closed.
+        assert!(
+            live_colossal_hit_test(
+                "anyforge:wyrm",
+                [0.0, 0.0, 0.0],
+                0.0,
+                0.0,
+                1.0,
+                [9.0, 9.0, 9.0],
+                [1.0, 0.0, 0.0],
+                1.0,
+            )
+            .is_none()
+        );
+        assert!(
+            live_colossal_hit_test(
+                "anyforge:ghost",
+                [0.0, 0.0, 0.0],
+                0.0,
+                0.0,
+                1.0,
+                [0.0, 0.0, 0.0],
+                [0.0, -1.0, 0.0],
+                32.0,
+            )
+            .is_none()
+        );
+
+        assert!(live_forge_unregister(DimId::Overworld, fx, fy, fz));
+        assert!(
+            live_forge_tick(DimId::Overworld, fx, fy, fz).is_none()
+        );
+    }
+
+    /// A registered breath profile evaluates a real cone against live
+    /// entities: targets inside the aperture take hits sorted by
+    /// distance, targets outside or behind the mouth do not.
+    #[test]
+    fn live_mod_breath_cone_hits_entities_in_aperture() {
+        let _g = world_guard();
+        opt_reset();
+        live_breath_register("anyforge:wyrm", ElementalBreathSpec::fire());
+        let entities = vec![
+            BreathEntity {
+                entity_id: 11,
+                center: [0.5, 0.5, 10.0],
+                half_extents: [0.5, 0.5, 0.5],
+                conductive: false,
+            },
+            BreathEntity {
+                entity_id: 22,
+                center: [0.0, 0.0, 30.0],
+                half_extents: [0.5, 0.5, 0.5],
+                conductive: false,
+            },
+            BreathEntity {
+                entity_id: 33,
+                center: [0.0, 0.0, -10.0],
+                half_extents: [0.5, 0.5, 0.5],
+                conductive: false,
+            },
+        ];
+        // Yaw 0 faces +Z: id 11 sits inside the cone, id 22 outranges the
+        // 16-block reach, id 33 stands behind the mouth.
+        let outcome = live_breath_evaluate(
+            "anyforge:wyrm",
+            DimId::Overworld,
+            [0.0, 0.0, 0.0],
+            0.0,
+            0.0,
+            &entities,
+        )
+        .expect("registered breath");
+        assert_eq!(
+            outcome.entity_hits.iter().map(|h| h.entity_id).collect::<Vec<_>>(),
+            vec![11],
+            "only the in-cone entity hits, got {:?}",
+            outcome.entity_hits
+        );
+        assert!((outcome.entity_hits[0].damage - 2.0).abs() < f32::EPSILON);
+        // Unknown ids fail closed.
+        assert!(
+            live_breath_evaluate(
+                "anyforge:ghost",
+                DimId::Overworld,
+                [0.0, 0.0, 0.0],
+                0.0,
+                0.0,
+                &entities,
+            )
+            .is_none()
+        );
     }
 }
