@@ -659,7 +659,7 @@ fn read_member(zip: &[u8], entry: &Entry) -> Result<Vec<u8>, PackThreat> {
     let data = if entry.method == 0 {
         input.to_vec()
     } else {
-        inflate_raw(input, entry.uncompressed_len)
+        crate::pack_loader::inflate_raw(input, entry.uncompressed_len)
             .map_err(|why| unsupported(&entry.name, format!("invalid DEFLATE member: {why}")))?
     };
     if data.len() != entry.uncompressed_len || crc32(&data) != entry.crc {
@@ -855,18 +855,4 @@ fn detect_graph_issue(
         }
     }
     Ok(())
-}
-
-fn inflate_raw(input: &[u8], expected: usize) -> Result<Vec<u8>, &'static str> {
-    let (out, consumed) = megu_core::zip_archive::inflate_raw_rfc1951_with_consumed(input, expected)
-        .map_err(|error| match error {
-            megu_core::zip_archive::ZipError::OutputCapExceeded => {
-                "inflated member exceeds declared length"
-            }
-            _ => "invalid DEFLATE stream",
-        })?;
-    if consumed != input.len() || out.len() != expected {
-        return Err("trailing DEFLATE bytes or uncompressed size mismatch");
-    }
-    Ok(out)
 }

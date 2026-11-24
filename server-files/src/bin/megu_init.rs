@@ -12,10 +12,6 @@ use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
-#[allow(dead_code)]
-#[path = "server_init.rs"]
-mod admin;
-
 const HELP: &str = "megu-init — create a Minecraft server directory\n\
 \n\
 USAGE:\n\
@@ -372,7 +368,7 @@ fn legacy_command(args: &[String]) -> Option<ExitCode> {
     ) {
         return None;
     }
-    Some(admin::run(args.to_vec()))
+    Some(megu_server_files::admin_cli::run(args.to_vec()))
 }
 
 fn main() -> ExitCode {
@@ -382,7 +378,7 @@ fn main() -> ExitCode {
         return ExitCode::SUCCESS;
     }
     if args.first().map(String::as_str) == Some("admin") {
-        return admin::run(args[1..].to_vec());
+        return megu_server_files::admin_cli::run(args[1..].to_vec());
     }
     if let Some(code) = legacy_command(&args) {
         return code;

@@ -11,11 +11,15 @@
 //!
 //! Layers:
 //!
+//! * [`admin_cli`] — the admin command line shared by the `megu-init` and
+//!   `megu-admin` binaries: `init`, `doctor`, `op`/`deop`, `ban`/`pardon`,
+//!   `whitelist` and `claims`, compiled once into the library.
 //! * [`atomic`] — [`atomic::write_atomic`]: sibling-temp-file, `sync_all`,
 //!   rename. A crash leaves the old file or the new one, never a truncated
 //!   one.
 //! * [`json`] — the minimal bounded-depth JSON reader/writer the admin
-//!   registries share. Malformed input is an error, never a partial document.
+//!   registries share, delegated to the canonical [`megu_core::json`].
+//!   Malformed input is an error, never a partial document.
 //! * [`properties`] — a lossless Java `.properties` document (comments and
 //!   entry order survive a parse/store round trip) and the typed
 //!   [`properties::ServerProperties`] view with Vanilla defaults, including
@@ -51,7 +55,7 @@
 //! * [`installer`] — the `megu-installer` lanes: Official Launcher
 //!   (`install_client`/`uninstall_client`), Prism Launcher
 //!   (`install_prism`) and dedicated-server (`install_server`) installs
-//!   plus pure cross-OS directory detection, an in-crate SHA-256 for
+//!   plus pure cross-OS directory detection, a `megu-core` SHA-256 for
 //!   `--client-bin` pinning and clock-free ISO-8601 stamps.
 //! * [`mods_dir`] — [`mods_dir::scan_mods_folder`], the launcher-grade
 //!   `mods/` scanner: deterministic `.jar` discovery (plus the optional
@@ -64,6 +68,7 @@
 //!   `SBC1` startup datapack/registry binary cache that fails closed to a
 //!   clean miss on any stale or corrupted input.
 
+pub mod admin_cli;
 pub mod atomic;
 pub mod claims;
 pub mod claims_wire;

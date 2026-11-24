@@ -490,7 +490,7 @@ fn crc32(data: &[u8]) -> u32 {
     megu_core::hash::crc32_ieee(data)
 }
 
-fn inflate_raw(input: &[u8], expected: usize) -> Result<Vec<u8>, &'static str> {
+pub(crate) fn inflate_raw(input: &[u8], expected: usize) -> Result<Vec<u8>, &'static str> {
     let (out, consumed) = megu_core::zip_archive::inflate_raw_rfc1951_with_consumed(input, expected)
         .map_err(|error| match error {
             megu_core::zip_archive::ZipError::OutputCapExceeded => {
