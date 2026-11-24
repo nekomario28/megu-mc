@@ -3847,6 +3847,7 @@ fn mega_blast_tick_drain() {
 
 /// `explode_at` for callers that predate per-entity dimensions: the blast
 /// lands in the Overworld, the dimension they always assumed.
+#[allow(dead_code)]
 fn explode_at(ex: f64, ey: f64, ez: f64, power: f64) {
     explode_at_dim(DimId::Overworld, ex, ey, ez, power);
 }

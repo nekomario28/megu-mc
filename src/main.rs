@@ -10838,7 +10838,7 @@ fn set_block_if_inner_dim(
                 store.remove(&(DimId::Overworld, x, y, z, 1));
             }
             #[cfg(test)]
-            signs().lock().unwrap().retain(|&(dim, sx, sy, sz, _), _| {
+            signs().lock().unwrap_or_else(|e| e.into_inner()).retain(|&(dim, sx, sy, sz, _), _| {
                 !(dim == DimId::Overworld && sx == x && sy == y && sz == z)
             });
             // The halves this container was part of, read from the state it still had
@@ -22491,7 +22491,7 @@ mod mineshaft_runtime_tests {
             assert!(Instant::now() < wait_drop);
             std::thread::sleep(Duration::from_millis(5));
         }
-        let has_book = drops().lock().unwrap().iter().any(|d| {
+        let has_book = drops().lock().unwrap_or_else(|e| e.into_inner()).iter().any(|d| {
             d.item == name_to_item("enchanted_book").unwrap()
                 && comp_get(&d.comps, COMP_STORED_ENCHANTMENTS).is_some()
         });

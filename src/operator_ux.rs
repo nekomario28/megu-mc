@@ -38,7 +38,6 @@ const SPAWN_DANGER: &[&str] = &[
     "minecraft:sweet_berry_bush",
 ];
 
-#[allow(dead_code)]
 fn spawn_cell_class(st: u32) -> SpawnCell {
     if st == 0 {
         return SpawnCell::Air;
@@ -76,7 +75,6 @@ fn spawn_cell_class(st: u32) -> SpawnCell {
 /// either convention in the tree (top solid y, or first air y), so both feet
 /// heights are probed with real block reads: two air cells of headroom over one
 /// `Solid` ground cell.
-#[allow(dead_code)]
 fn safe_feet_y(
     surface: &dyn Fn(i32, i32) -> i32,
     block: &dyn Fn(i32, i32, i32) -> u32,
@@ -106,7 +104,6 @@ fn safe_feet_y(
 /// Outward square spiral on a `step` lattice from (0, 0): (0,0), then east,
 /// turning left with legs of 1, 1, 2, 2, 3, 3 … cells until the column leaves
 /// `radius`. The ring bound is the termination guarantee — it cannot wander off.
-#[allow(dead_code)]
 fn find_safe_spawn_column(
     surface: &dyn Fn(i32, i32) -> i32,
     block: &dyn Fn(i32, i32, i32) -> u32,
@@ -146,7 +143,6 @@ fn find_safe_spawn_column(
 /// The search, then the guaranteed exit: the centre column's surface + 1 when no
 /// dry spot exists inside the radius (an all-ocean custom world still spawns the
 /// player instead of hanging).
-#[allow(dead_code)]
 fn safe_spawn_or_fallback(
     surface: &dyn Fn(i32, i32) -> i32,
     block: &dyn Fn(i32, i32, i32) -> u32,
@@ -171,7 +167,6 @@ fn safe_spawn_or_fallback(
 /// cells of headroom, no fluids or contact-damage blocks, and at or above the
 /// Overworld's reasonable-elevation floor of y 62 (other dimensions only have
 /// to be inside their own vertical bounds).
-#[allow(dead_code)]
 fn find_safe_world_spawn(dim: DimId) -> (f64, f64, f64) {
     let min_feet_y = if dim == DimId::Overworld {
         62
@@ -188,7 +183,6 @@ fn find_safe_world_spawn(dim: DimId) -> (f64, f64, f64) {
 
 /// RFC 4648 base64, standard alphabet, `=` padding — written out so the favicon
 /// path needs no external crate.
-#[allow(dead_code)]
 fn base64_encode(data: &[u8]) -> String {
     const ALPHABET: &[u8; 64] =
         b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
@@ -217,7 +211,6 @@ fn base64_encode(data: &[u8]) -> String {
 /// The `favicon` payload for the server list, or `None` when no
 /// `server-icon.png` sits next to the server. Errors are operator-readable:
 /// wrong size, wrong dimensions and unreadable files say so in words.
-#[allow(dead_code)]
 fn load_server_icon_favicon(path: &std::path::Path) -> Result<Option<String>, String> {
     let bytes = match std::fs::read(path) {
         Ok(bytes) => bytes,
@@ -256,7 +249,6 @@ fn load_server_icon_favicon(path: &std::path::Path) -> Result<Option<String>, St
 
 /// JSON string literal contents: the same escape set the existing status reply
 /// already applies to the motd.
-#[allow(dead_code)]
 fn status_json_text(s: &str) -> String {
     s.replace('\\', "\\\\")
         .replace('"', "\\\"")
@@ -266,7 +258,6 @@ fn status_json_text(s: &str) -> String {
 
 /// `xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx` — the lowercase hyphenated form the
 /// vanilla `players.sample` entries carry in `id`.
-#[allow(dead_code)]
 fn uuid_text(u: &[u8; 16]) -> String {
     let mut s = String::with_capacity(36);
     for (i, b) in u.iter().enumerate() {
@@ -281,7 +272,6 @@ fn uuid_text(u: &[u8; 16]) -> String {
 /// The vanilla 1.21.1 (protocol 767) server-list ping body: version, player
 /// counts, the hover `sample` (sorted by name, capped at 12 so the list stays
 /// readable), the motd, and the icon when one loaded.
-#[allow(dead_code)]
 fn build_status_json_rich(
     motd: &str,
     max_players: usize,
@@ -326,20 +316,17 @@ const LAN_MULTICAST_ADDR: &str = "224.0.2.60:4445";
 const LAN_PING_INTERVAL: Duration = Duration::from_millis(1500);
 
 /// The exact wire payload vanilla's `LanServerPinger` multicasts.
-#[allow(dead_code)]
 fn format_lan_announcement(motd: &str, port: u16) -> String {
     format!("[MOTD]{motd}[/MOTD][AD]{port}[/AD]")
 }
 
 /// Background thread multicasting the LAN payload until `stop()`ed. Sending is
 /// best-effort — a network without a multicast route must not kill the pinger.
-#[allow(dead_code)]
 struct LanAnnouncer {
     halt: Arc<AtomicBool>,
     thread: Option<thread::JoinHandle<()>>,
 }
 
-#[allow(dead_code)]
 impl LanAnnouncer {
     fn start(motd: &str, port: u16) -> std::io::Result<Self> {
         let sock = std::net::UdpSocket::bind(("0.0.0.0", 0))?;
@@ -388,7 +375,6 @@ impl std::ops::Drop for LanAnnouncer {
 
 /// Everything the `status` reply needs, already gathered — the formatter reads
 /// fields, it does not interrogate the server.
-#[allow(dead_code)]
 struct OperatorHealthSnapshot {
     /// Rolling mean tick time in milliseconds.
     mspt_ms: f64,
@@ -406,7 +392,6 @@ struct OperatorHealthSnapshot {
 
 /// The plain-language band an admin reads off one number. The thresholds are
 /// the same bands the load smoother watches, phrased as words.
-#[allow(dead_code)]
 fn health_label(mspt_ms: f64) -> &'static str {
     if mspt_ms <= 35.0 {
         "Smooth"
@@ -418,7 +403,6 @@ fn health_label(mspt_ms: f64) -> &'static str {
 }
 
 /// Observed TPS implied by a mean tick time: 20.0 while there is headroom.
-#[allow(dead_code)]
 fn tps_of(mspt_ms: f64) -> f64 {
     if mspt_ms <= 0.0 {
         return 20.0;
@@ -427,7 +411,6 @@ fn tps_of(mspt_ms: f64) -> f64 {
 }
 
 /// Resident memory from `/proc/self/statm` (Linux); `None` anywhere else.
-#[allow(dead_code)]
 fn memory_usage_mb() -> Option<u64> {
     let statm = std::fs::read_to_string("/proc/self/statm").ok()?;
     let resident_pages: u64 = statm.split_whitespace().nth(1)?.parse().ok()?;
@@ -435,7 +418,6 @@ fn memory_usage_mb() -> Option<u64> {
     Some(resident_pages * 4096 / (1024 * 1024))
 }
 
-#[allow(dead_code)]
 fn memory_line(mem: Option<u64>) -> String {
     match mem {
         Some(mb) => format!("{mb} MB"),
@@ -445,7 +427,6 @@ fn memory_line(mem: Option<u64>) -> String {
 
 /// The multi-line console/RCON `status` reply. Numbers are stated in their
 /// everyday units (TPS, ms/tick, MB); nothing internal leaks through.
-#[allow(dead_code)]
 fn format_operator_status(s: &OperatorHealthSnapshot) -> String {
     let mut lines = Vec::new();
     lines.push(format!(
@@ -483,7 +464,6 @@ fn format_operator_status(s: &OperatorHealthSnapshot) -> String {
 /// `mob_spawn_scale` multiply the background work rates; `entity_activation_range`
 /// is a block distance; `extra_view_trim` is chunks shaved off the view edge.
 #[derive(Clone, Copy, Debug, PartialEq)]
-#[allow(dead_code)]
 struct LoadBudget {
     chunk_send_scale: f64,
     mob_spawn_scale: f64,
@@ -495,7 +475,6 @@ struct LoadBudget {
 /// watch (chunk stream rate, distant mob spawns); the last two reach what a
 /// player could notice — view distance and activation range — and only run
 /// while the server is genuinely overloaded.
-#[allow(dead_code)]
 const LOAD_BUDGETS: [LoadBudget; 5] = [
     LoadBudget {
         chunk_send_scale: 1.0,
@@ -529,7 +508,6 @@ const LOAD_BUDGETS: [LoadBudget; 5] = [
     },
 ];
 
-#[allow(dead_code)]
 impl LoadBudget {
     const FULL: LoadBudget = LOAD_BUDGETS[0];
 }
@@ -554,14 +532,12 @@ const LOAD_CATASTROPHE_MS: f64 = 150.0;
 
 /// Always-on throttle: feed it one tick's work and read the budget back. No
 /// knobs, no wall clock — the caller passes `Duration`s.
-#[allow(dead_code)]
 struct AutoLoadBalancer {
     ewma_ms: f64,
     primed: bool,
     stage: u8,
 }
 
-#[allow(dead_code)]
 impl AutoLoadBalancer {
     fn new() -> Self {
         Self {
@@ -635,7 +611,6 @@ const GS4_CHALLENGE_CAP: usize = 4096;
 /// Everything a stat reply reports, gathered by the caller — the handler never
 /// reaches into live server state itself.
 #[derive(Clone, Debug, Default, PartialEq)]
-#[allow(dead_code)]
 struct Gs4StatusSnapshot {
     /// Server MOTD; the `hostname` key of the full reply.
     motd: String,
@@ -658,7 +633,6 @@ struct Gs4StatusSnapshot {
 
 /// A vanilla-flavoured snapshot: gametype "SMP", game_id "MINECRAFT", no
 /// plugins — the three fields a pure-vanilla server never varies.
-#[allow(dead_code)]
 fn gs4_vanilla_snapshot(
     motd: String,
     map: String,
@@ -692,7 +666,6 @@ struct Gs4Challenge {
 /// clock read arrives as an `Instant` argument, so expiry is testable without
 /// sleeping and the token stream is deterministic per handler salt — no
 /// wall-clock read anywhere in the protocol path.
-#[allow(dead_code)]
 struct Gs4QueryHandler {
     challenges: HashMap<std::net::IpAddr, Gs4Challenge>,
     /// Monotone issuance counter: the moving input of the token hash, so a
@@ -703,7 +676,6 @@ struct Gs4QueryHandler {
     salt: u64,
 }
 
-#[allow(dead_code)]
 impl Gs4QueryHandler {
     fn new(salt: u64) -> Self {
         Self {
@@ -829,7 +801,6 @@ impl Gs4QueryHandler {
 /// The 11-byte basic stat: `[0x00][session_id]` then MOTD, gametype, map and
 /// both player counts as `\0`-terminated text, the port as a little-endian
 /// u16 (the one non-text field on the wire) and the host address.
-#[allow(dead_code)]
 fn gs4_basic_stat(session_id: i32, snap: &Gs4StatusSnapshot) -> Vec<u8> {
     let num = snap.players.len().to_string();
     let max = snap.max_players.to_string();
@@ -854,7 +825,6 @@ fn gs4_basic_stat(session_id: i32, snap: &Gs4StatusSnapshot) -> Vec<u8> {
 
 /// The full stat: the `splitnum` K/V section in vanilla's fixed key order, then
 /// the `player_` section with every online name.
-#[allow(dead_code)]
 fn gs4_full_stat(session_id: i32, snap: &Gs4StatusSnapshot) -> Vec<u8> {
     let num = snap.players.len().to_string();
     let max = snap.max_players.to_string();
@@ -893,7 +863,6 @@ fn gs4_full_stat(session_id: i32, snap: &Gs4StatusSnapshot) -> Vec<u8> {
 /// A per-process salt for the live listener's token stream: the pid plus a
 /// stack address — no clock read, and tokens minted here cannot be replayed
 /// against a differently seeded handler.
-#[allow(dead_code)]
 fn gs4_runner_salt() -> u64 {
     let marker = 0u8;
     (u64::from(std::process::id()) << 32)
@@ -905,7 +874,6 @@ fn gs4_runner_salt() -> u64 {
 /// bind asked for `:0` — and the thread's join handle. The socket polls the
 /// flag every ~50 ms so `stop` lands promptly; send errors never kill the
 /// listener, exactly as the LAN announcer treats its multicast route.
-#[allow(dead_code)]
 fn spawn_gs4_query_thread(
     bind_addr: &str,
     snapshot_fn: Arc<dyn Fn() -> Gs4StatusSnapshot + Send + Sync>,
@@ -1693,7 +1661,6 @@ mod operator_ux_tests {
 // so `/perf` style output can name the chunk that is actually eating the tick.
 
 /// Ring capacity: 1,200 ticks is a 60-second window at the 20 TPS target.
-#[allow(dead_code)]
 const PROFILER_RING_CAPACITY: usize = 1_200;
 
 /// Bound on the per-chunk accumulator. A server can touch more chunks than
@@ -1704,7 +1671,6 @@ const PROFILER_MAX_CHUNKS: usize = 8_192;
 
 /// Subsystems chunk work is attributed to. The label is what operators see —
 /// plain words, no internal names.
-#[allow(dead_code)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 enum ProfilerSubsystem {
     Hoppers,
@@ -1717,7 +1683,6 @@ enum ProfilerSubsystem {
     Mods,
 }
 
-#[allow(dead_code)]
 impl ProfilerSubsystem {
     const ALL: [Self; 8] = [
         Self::Hoppers,
@@ -1751,7 +1716,6 @@ impl ProfilerSubsystem {
 
 /// Per-chunk work ledger: microseconds per subsystem plus the running total
 /// the hot-set eviction and top-N ranking read.
-#[allow(dead_code)]
 #[derive(Clone, Copy, Debug, Default)]
 struct ChunkWorkLedger {
     per_subsystem: [u64; 8],
@@ -1762,7 +1726,6 @@ struct ChunkWorkLedger {
 /// coordinates (`cx*16+8`, `cz*16+8` — where a `/tp` lands), the total
 /// microseconds attributed in the window, the mean cost per recorded tick,
 /// and the subsystem that dominates it.
-#[allow(dead_code)]
 #[derive(Clone, Debug)]
 struct ChunkHotspot {
     dim: DimId,
@@ -1779,7 +1742,6 @@ struct ChunkHotspot {
 /// and the MSPT percentiles, the subsystem percentage breakdown, and the
 /// hottest chunks. `format_human` is the console/report rendering; `to_json`
 /// is the same data for tooling.
-#[allow(dead_code)]
 #[derive(Clone, Debug)]
 struct ProfilerReport {
     ticks_recorded: usize,
@@ -1792,13 +1754,13 @@ struct ProfilerReport {
     /// `(subsystem, window microseconds, share of attributed work)` per
     /// subsystem, in `ProfilerSubsystem::ALL` order.
     subsystem_us: [(ProfilerSubsystem, u64, f64); 8],
+    #[allow(dead_code)]
     total_attributed_us: u64,
     top_chunks: Vec<ChunkHotspot>,
 }
 
 /// What an operator reads for a dimension: the friendly vanilla names, the
 /// registry id for custom dimensions.
-#[allow(dead_code)]
 fn profiler_dim_name(dim: DimId) -> String {
     match dim {
         DimId::Overworld => "Overworld".to_string(),
@@ -1855,6 +1817,7 @@ impl ProfilerReport {
 
     /// The same report as JSON — hand-built like the status reply, so nothing
     /// outside this file is needed.
+    #[allow(dead_code)]
     fn to_json(&self) -> String {
         let subsystems = self
             .subsystem_us
@@ -1905,7 +1868,6 @@ impl ProfilerReport {
 /// per-chunk work map. `record_*` calls are the only inputs; `summary` turns
 /// the window into a report. All times are microseconds — `Instant`-side
 /// callers convert once at the edge.
-#[allow(dead_code)]
 struct ServerHotspotProfiler {
     /// `ring[..ring_len]` is the valid window; before the first wrap that is
     /// `0..ring_next`, after it the whole array is valid.
@@ -1915,7 +1877,6 @@ struct ServerHotspotProfiler {
     chunks: HashMap<(DimId, i32, i32), ChunkWorkLedger>,
 }
 
-#[allow(dead_code)]
 impl Default for ServerHotspotProfiler {
     fn default() -> Self {
         Self {
@@ -2082,21 +2043,21 @@ impl ServerHotspotProfiler {
 /// How long the tick heartbeat has been silent, classified against the
 /// watchdog's warn/critical thresholds. `stall_ms` rides on the non-healthy
 /// arms so the diagnostic needs no second clock read.
-#[allow(dead_code)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[allow(dead_code)]
 enum WatchdogVerdict {
     Healthy,
     Warning { stall_ms: u64 },
     CriticalStall { stall_ms: u64 },
 }
 
-#[allow(dead_code)]
 impl WatchdogVerdict {
     /// The greppable one-liner for a non-healthy verdict. `MEGU-E-` is the
     /// operator-error tag family the crash reports already use; the 8-hex
     /// suffix is a small FNV-1a over the severity and stall so the same stall
     /// always renders the same tag. `Healthy` maps to `None`: a live tick
     /// emits nothing.
+    #[allow(dead_code)]
     fn diagnostic(self) -> Option<String> {
         let (severity, stall_ms) = match self {
             Self::Healthy => return None,
@@ -2115,7 +2076,9 @@ impl WatchdogVerdict {
 
 /// Default stall budgets: a 5 s silence is worth an operator note, 30 s
 /// means the tick loop is effectively dead.
+#[allow(dead_code)]
 const WATCHDOG_WARN_MS: u64 = 5_000;
+#[allow(dead_code)]
 const WATCHDOG_CRITICAL_MS: u64 = 30_000;
 
 /// Monotonic heartbeat for the server tick loop. `beat()` stamps every
@@ -2177,22 +2140,22 @@ impl TickWatchdog {
 
 /// Retention bounds for world backups: keep at most `max_backups` generations
 /// and never start a new one while free disk sits under `min_free_bytes`.
-#[allow(dead_code)]
 struct RollingBackupPolicy {
     max_backups: usize,
     min_free_bytes: u64,
 }
 
 /// The retention ceiling `max_backups` is validated against.
+#[allow(dead_code)]
 const BACKUP_MAX_BACKUPS_LIMIT: usize = 128;
 /// Vanilla-faithful defaults: a dozen generations, half a GiB of headroom.
 const BACKUP_DEFAULT_MAX_BACKUPS: usize = 12;
 const BACKUP_DEFAULT_MIN_FREE_BYTES: u64 = 512 * 1024 * 1024;
 
-#[allow(dead_code)]
 impl RollingBackupPolicy {
     /// `max_backups` must sit in `1..=128`; `min_free_bytes` is the disk-space
     /// guard — a backup that would leave the volume under it is refused.
+    #[allow(dead_code)]
     fn new(max_backups: usize, min_free_bytes: u64) -> Result<Self, String> {
         if !(1..=BACKUP_MAX_BACKUPS_LIMIT).contains(&max_backups) {
             return Err(format!(
@@ -2206,7 +2169,6 @@ impl RollingBackupPolicy {
     }
 }
 
-#[allow(dead_code)]
 impl Default for RollingBackupPolicy {
     fn default() -> Self {
         Self {
@@ -2217,8 +2179,8 @@ impl Default for RollingBackupPolicy {
 }
 
 /// What the rotator decided for one backup cycle.
-#[allow(dead_code)]
 #[derive(Clone, Debug, PartialEq, Eq)]
+#[allow(dead_code)]
 enum BackupVerdict {
     /// Disk guard passed: write the new backup, then prune `prune` (oldest
     /// sequence first) so the set never exceeds `max_backups`.
@@ -2240,7 +2202,6 @@ enum BackupVerdict {
 /// basenames, never paths — so `..`, separators, a missing suffix, an empty
 /// or non-digit sequence and sequence overflow all fail closed, and no
 /// symlink or traversal entry can ever be expressed.
-#[allow(dead_code)]
 fn backup_seq_of(name: &str) -> Option<u64> {
     let rest = name.strip_prefix("world-backup-")?;
     let digits = rest.strip_suffix(".tar.gz")?;
@@ -2279,7 +2240,6 @@ fn plan_backup_rotation(
 /// gathered by the caller — the same convention `OperatorHealthSnapshot` and
 /// `Gs4StatusSnapshot` already follow — so the formatter reads fields and
 /// never interrogates the server.
-#[allow(dead_code)]
 struct OperatorMetricsSnapshot {
     /// Observed ticks per second (20.0 nominal).
     tps: f64,
@@ -2295,7 +2255,6 @@ struct OperatorMetricsSnapshot {
     uptime_seconds: f64,
 }
 
-#[allow(dead_code)]
 impl OperatorMetricsSnapshot {
     /// Prometheus text exposition (0.0.4): a `# HELP`/`# TYPE` pair then one
     /// sample line per metric, every name `megu_`-prefixed for a
@@ -2932,8 +2891,8 @@ fn live_block_audit_len() -> usize {
 
 /// What one `/megu rollback` pass did, persisted so operators can audit the
 /// audit tool itself.
-#[allow(dead_code)]
 #[derive(Clone, Debug)]
+#[allow(dead_code)]
 struct LiveRollbackSummary {
     tick: u64,
     op: String,
@@ -3075,7 +3034,6 @@ fn claim_chunk_key(dim: DimId, x: i32, z: i32) -> (DimId, i32, i32) {
 /// enforcement wiring lives in `play_protocol.rs`, outside this lane's file
 /// ownership, so the predicate itself is `allow(dead_code)` until that lane
 /// lands — it is the single source of truth they must call.
-#[allow(dead_code)]
 fn can_player_modify_block(
     dim: DimId,
     x: i32,
@@ -3141,7 +3099,6 @@ fn backup_dir_listing(dir: &std::path::Path) -> Vec<String> {
 #[cfg(target_os = "linux")]
 fn backup_volume_free_bytes(dir: &std::path::Path) -> Option<u64> {
     #[repr(C)]
-    #[allow(dead_code)]
     struct Statvfs {
         f_bsize: u64,
         f_frsize: u64,
@@ -3295,4 +3252,1403 @@ fn live_operator_metrics_prometheus() -> String {
         uptime_seconds: TICK.load(Ordering::Relaxed) as f64 / f64::from(TICKS_PER_SECOND),
     }
     .format_prometheus()
+}
+
+// ---------------------------------------------------------------------------
+// Lane OPS-ADMIN-CORE: the server administration & lifecycle core.
+//
+//   * `ServerLifecycleController` — sleep-on-empty / optional auto-shutdown
+//     state machine with wake-on-join. All times arrive as `Instant`
+//     arguments, so tests drive the clock and production stays off
+//     wall-clock reads entirely.
+//   * `SupervisorPolicy` — crash auto-restart with exponential backoff and a
+//     5-in-60-seconds crash-loop guard, plus the `MEGU_RESTART_EXIT_CODE`
+//     clean-restart convention.
+//   * `RemoteControlServer` — opt-in, zero-dependency 4-button mobile remote:
+//     one non-blocking `poll_once` step over a plain `TcpListener`, scoped
+//     bearer tokens compared constant-time by their SHA-256 digests.
+//   * `SurvivalModRegistry` + `survival_mod_allows_command` — a moderation
+//     role below OP that can police players but can never touch the world.
+//   * `HubServerDirectory` / `MultiWorldRegistry` — the `[servers]` hub table
+//     used for stop/restart player transfer, and managed extra worlds that
+//     map onto the standard `dimensions/megu/<name>/region` layout.
+//   * `format_operator_status_summary` — the one-screen `/megu status` and
+//     startup summary.
+// ---------------------------------------------------------------------------
+
+// `admin_core_items!` stamps the dead-code allowance on every item below: the
+// same per-item allowance the rest of this file carries, applied in one
+// place so a wire-ready surface does not need the attribute restated on
+// each item. Every expanded item still carries it verbatim.
+macro_rules! admin_core_items {
+    ($($item:item)*) => {
+        $(#[allow(dead_code)] $item)*
+    };
+}
+
+admin_core_items! {
+
+// ----------------------------------------------------- lifecycle ----
+
+/// Exit code a megu process returns when the operator asked for a restart
+/// rather than a halt: the wrapper/supervisor relaunches immediately.
+const MEGU_RESTART_EXIT_CODE: i32 = 42;
+
+/// The MOTD the minimal sleeping listener answers pings with.
+const SLEEPING_LISTEN_MOTD: &str = "Sleeping — Join to wake!";
+
+/// Where the world server sits in its power lifecycle.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum LifecycleState {
+    /// World is loaded and ticking normally.
+    Running,
+    /// World saved and RAM released; a minimal listener keeps the slot
+    /// occupied and wakes the world on the next whitelisted join.
+    Sleeping,
+    /// Final state after `SaveAndShutdown` — nothing else happens.
+    Stopped,
+}
+
+/// What the supervisor must do after a lifecycle observation. Decisions
+/// stay here; the filesystem/network side effects belong to the caller.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum LifecycleAction {
+    /// Nothing to do.
+    None,
+    /// Save the world, release chunk RAM, keep the sleep listener.
+    SaveAndHibernate,
+    /// Save the world and terminate the process.
+    SaveAndShutdown,
+    /// Bring the world back up for an incoming player.
+    WakeWorld,
+    /// Refuse the handshake without touching the sleeping world.
+    RejectLogin,
+}
+
+/// Sleep-on-empty controller. While `online_players == 0` a monotonic
+/// timer runs: past `idle_sleep` the server hibernates, past the optional
+/// `idle_shutdown` (measured from the same empty start) it stops. Any
+/// player count above zero resets the clock.
+struct ServerLifecycleController {
+    state: LifecycleState,
+    idle_sleep: Duration,
+    idle_shutdown: Option<Duration>,
+    empty_since: Option<Instant>,
+}
+
+impl ServerLifecycleController {
+    fn new(idle_sleep_secs: u64, idle_shutdown_secs: Option<u64>) -> Self {
+        Self {
+            state: LifecycleState::Running,
+            idle_sleep: Duration::from_secs(idle_sleep_secs),
+            idle_shutdown: idle_shutdown_secs.map(Duration::from_secs),
+            empty_since: None,
+        }
+    }
+
+    fn state(&self) -> LifecycleState {
+        self.state
+    }
+
+    /// MOTD for the minimal listener kept while `Sleeping`.
+    fn sleeping_motd() -> &'static str {
+        SLEEPING_LISTEN_MOTD
+    }
+
+    /// Feed one observation of the online count. Call it once per tick or
+    /// per supervisor pass; `now` is the caller's monotonic clock.
+    fn update(&mut self, now: Instant, online_players: usize) -> LifecycleAction {
+        if online_players > 0 {
+            self.empty_since = None;
+            if self.state == LifecycleState::Sleeping {
+                // Someone is back online without a login handshake we saw
+                // (RCON session, proxy transfer): treat it as a wake.
+                self.state = LifecycleState::Running;
+                return LifecycleAction::WakeWorld;
+            }
+            return LifecycleAction::None;
+        }
+        if self.state == LifecycleState::Stopped {
+            return LifecycleAction::None;
+        }
+        let empty_since = *self.empty_since.get_or_insert(now);
+        let idle = now.saturating_duration_since(empty_since);
+        if let Some(limit) = self.idle_shutdown {
+            if idle >= limit {
+                self.state = LifecycleState::Stopped;
+                return LifecycleAction::SaveAndShutdown;
+            }
+        }
+        if self.state == LifecycleState::Running && idle >= self.idle_sleep {
+            self.state = LifecycleState::Sleeping;
+            return LifecycleAction::SaveAndHibernate;
+        }
+        LifecycleAction::None
+    }
+
+    /// A login packet arrived (at the normal or the sleep listener). A
+    /// non-whitelisted name is refused without waking anything; an
+    /// authorized one pulls the world back up when sleeping.
+    fn on_incoming_login_attempt(
+        &mut self,
+        _player_name: &str,
+        whitelist_allowed: bool,
+    ) -> LifecycleAction {
+        if !whitelist_allowed {
+            return LifecycleAction::RejectLogin;
+        }
+        self.empty_since = None;
+        if self.state == LifecycleState::Sleeping {
+            self.state = LifecycleState::Running;
+            return LifecycleAction::WakeWorld;
+        }
+        LifecycleAction::None
+    }
+}
+
+/// What the process supervisor does with an exit code.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum SupervisorDecision {
+    /// Exit 0: intended stop, do not relaunch.
+    Stop,
+    /// `MEGU_RESTART_EXIT_CODE`: operator asked for restart, relaunch now.
+    RestartImmediate,
+    /// Crash: relaunch after the given backoff.
+    RestartDelayed(Duration),
+    /// Too many crashes in the window — give up instead of looping.
+    HaltCrashLoop { crashes: usize, window_secs: u64 },
+}
+
+/// Crash auto-restart with exponential backoff (1s → 2s → 4s → 8s → 16s,
+/// capped at 30s) and a hard crash-loop guard: five crashes inside sixty
+/// seconds halt the supervisor instead of restart-looping forever. The
+/// backoff ladder only relaxes on a clean stop or an explicit restart
+/// request — a process that keeps dying keeps escalating to the cap.
+struct SupervisorPolicy {
+    crashes: VecDeque<Instant>,
+    backoff_step: u32,
+}
+
+impl SupervisorPolicy {
+    const CRASH_LOOP_COUNT: usize = 5;
+    const CRASH_LOOP_WINDOW: Duration = Duration::from_secs(60);
+    const BACKOFF_BASE: Duration = Duration::from_secs(1);
+    const BACKOFF_CAP: Duration = Duration::from_secs(30);
+
+    fn new() -> Self {
+        Self {
+            crashes: VecDeque::new(),
+            backoff_step: 0,
+        }
+    }
+
+    /// Classify one child exit. `now` is the caller's monotonic clock.
+    fn decide(&mut self, exit_code: i32, now: Instant) -> SupervisorDecision {
+        if exit_code == 0 {
+            self.reset();
+            return SupervisorDecision::Stop;
+        }
+        if exit_code == MEGU_RESTART_EXIT_CODE {
+            self.reset();
+            return SupervisorDecision::RestartImmediate;
+        }
+        while let Some(&oldest) = self.crashes.front() {
+            if now.saturating_duration_since(oldest) < Self::CRASH_LOOP_WINDOW {
+                break;
+            }
+            self.crashes.pop_front();
+        }
+        self.crashes.push_back(now);
+        if self.crashes.len() >= Self::CRASH_LOOP_COUNT {
+            let crashes = self.crashes.len();
+            // If an operator manually relaunches after a halt the window
+            // starts clean rather than instantly re-tripping.
+            self.crashes.clear();
+            self.backoff_step = 0;
+            return SupervisorDecision::HaltCrashLoop {
+                crashes,
+                window_secs: Self::CRASH_LOOP_WINDOW.as_secs(),
+            };
+        }
+        let step = self.backoff_step.min(5);
+        self.backoff_step = self.backoff_step.saturating_add(1);
+        let delay = (Self::BACKOFF_BASE * (1u32 << step)).min(Self::BACKOFF_CAP);
+        SupervisorDecision::RestartDelayed(delay)
+    }
+
+    fn reset(&mut self) {
+        self.crashes.clear();
+        self.backoff_step = 0;
+    }
+}
+
+// ------------------------------------------------ remote control ----
+
+/// Hard cap on one remote-control HTTP request, headers included.
+const REMOTE_REQ_CAP: usize = 8 * 1024;
+
+/// A side-effecting command the remote accepted; the caller runs it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum RemoteAction {
+    Start,
+    Restart,
+    Stop,
+}
+
+/// Which token presented the request.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum RemoteScope {
+    Admin,
+    StartOnly,
+}
+
+/// One answered request: status line, body, and the action to relay.
+struct RemoteReply {
+    status: u16,
+    content_type: &'static str,
+    body: Vec<u8>,
+    action: Option<RemoteAction>,
+}
+
+impl RemoteReply {
+    fn text(status: u16, body: &str) -> Self {
+        Self {
+            status,
+            content_type: "text/plain; charset=utf-8",
+            body: body.as_bytes().to_vec(),
+            action: None,
+        }
+    }
+
+    fn json(status: u16, body: String, action: Option<RemoteAction>) -> Self {
+        Self {
+            status,
+            content_type: "application/json; charset=utf-8",
+            body: body.into_bytes(),
+            action,
+        }
+    }
+
+    fn html(body: String) -> Self {
+        Self {
+            status: 200,
+            content_type: "text/html; charset=utf-8",
+            body: body.into_bytes(),
+            action: None,
+        }
+    }
+}
+
+/// Opt-in minimal remote control. Binds loopback by default; the operator
+/// chooses the address. Tokens are stored as SHA-256 digests only and
+/// compared in constant time — the raw tokens never touch the struct.
+///
+/// `poll_once` is a single strictly-bounded step: it drains the pending
+/// accept queue, answers each request, and returns the commands the
+/// caller should act on. No threads are spawned anywhere.
+struct RemoteControlServer {
+    listener: TcpListener,
+    admin_hash: [u8; 32],
+    start_only_hash: Option<[u8; 32]>,
+}
+
+impl RemoteControlServer {
+    fn bind(
+        addr: &str,
+        admin_token: &str,
+        start_only_token: Option<&str>,
+    ) -> std::io::Result<Self> {
+        let listener = TcpListener::bind(addr)?;
+        listener.set_nonblocking(true)?;
+        Ok(Self {
+            listener,
+            admin_hash: token_digest(admin_token),
+            start_only_hash: start_only_token.map(token_digest),
+        })
+    }
+
+    fn local_addr(&self) -> std::io::Result<std::net::SocketAddr> {
+        self.listener.local_addr()
+    }
+
+    /// One non-blocking step: answer every connection already in the
+    /// backlog and collect the authorized actions for the main loop.
+    /// `status_json` renders the `/api/status` body on demand.
+    fn poll_once(&mut self, status_json: &dyn Fn() -> String) -> Vec<RemoteAction> {
+        let mut actions = Vec::new();
+        loop {
+            let (mut stream, _) = match self.listener.accept() {
+                Ok(pair) => pair,
+                Err(_) => break, // WouldBlock or a real error: step ends
+            };
+            let raw = read_http_request(&mut stream);
+            let reply = self.handle_request(&raw, status_json);
+            let head = format!(
+                "HTTP/1.1 {} {}\r\nContent-Type: {}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                reply.status,
+                http_reason(reply.status),
+                reply.content_type,
+                reply.body.len()
+            );
+            let _ = stream.write_all(head.as_bytes());
+            let _ = stream.write_all(&reply.body);
+            let _ = stream.flush();
+            if let Some(action) = reply.action {
+                actions.push(action);
+            }
+        }
+        actions
+    }
+
+    /// Pure request → reply mapping, split out so the policy itself is
+    /// testable without a socket.
+    fn handle_request(
+        &self,
+        raw: &[u8],
+        status_json: &dyn Fn() -> String,
+    ) -> RemoteReply {
+        let Some((method, target)) = parse_request_line(raw) else {
+            return RemoteReply::text(400, "bad request");
+        };
+        let (path, query) = split_query(&target);
+        let token = header_value(raw, "authorization")
+            .and_then(|v| v.trim().strip_prefix("Bearer "))
+            .map(str::trim)
+            .or_else(|| query_param(query, "token"))
+            .unwrap_or("");
+        let Some(scope) = self.scope_for_token(token) else {
+            return RemoteReply::text(401, "unauthorized");
+        };
+        let admin = scope == RemoteScope::Admin;
+        let reply = match (method.as_str(), path.as_str()) {
+            ("GET", "/") => {
+                if !admin {
+                    RemoteReply::text(403, "forbidden")
+                } else {
+                    RemoteReply::html(render_remote_page(token))
+                }
+            }
+            ("GET", "/api/status") => RemoteReply::json(200, status_json(), None),
+            ("POST", "/api/start") => RemoteReply::json(
+                200,
+                "{\"ok\":true,\"action\":\"start\"}".to_string(),
+                Some(RemoteAction::Start),
+            ),
+            ("POST", "/api/restart") if admin => RemoteReply::json(
+                200,
+                "{\"ok\":true,\"action\":\"restart\"}".to_string(),
+                Some(RemoteAction::Restart),
+            ),
+            ("POST", "/api/stop") if admin => RemoteReply::json(
+                200,
+                "{\"ok\":true,\"action\":\"stop\"}".to_string(),
+                Some(RemoteAction::Stop),
+            ),
+            ("POST", "/api/restart") | ("POST", "/api/stop") => {
+                RemoteReply::text(403, "forbidden")
+            }
+            _ => RemoteReply::text(404, "not found"),
+        };
+        reply
+    }
+
+    /// The presented token hashed and compared constant-time against both
+    /// stored digests. Empty tokens never match.
+    fn scope_for_token(&self, token: &str) -> Option<RemoteScope> {
+        if token.is_empty() {
+            return None;
+        }
+        let digest = token_digest(token);
+        if ct_tag_eq(&digest, &self.admin_hash) {
+            return Some(RemoteScope::Admin);
+        }
+        if let Some(start_only) = self.start_only_hash {
+            if ct_tag_eq(&digest, &start_only) {
+                return Some(RemoteScope::StartOnly);
+            }
+        }
+        None
+    }
+}
+
+/// SHA-256 of a token — compare digests, never raw strings.
+fn token_digest(token: &str) -> [u8; 32] {
+    crate::generation_math::sha256(token.as_bytes())
+}
+
+fn http_reason(status: u16) -> &'static str {
+    match status {
+        200 => "OK",
+        400 => "Bad Request",
+        401 => "Unauthorized",
+        403 => "Forbidden",
+        404 => "Not Found",
+        _ => "Error",
+    }
+}
+
+/// Read one request, bounded: stop once the header block is complete, at
+/// the 8 KiB cap, or when the peer stalls past a short read timeout.
+fn read_http_request(stream: &mut TcpStream) -> Vec<u8> {
+    let _ = stream.set_read_timeout(Some(Duration::from_millis(250)));
+    let mut buf = Vec::with_capacity(1024);
+    let mut chunk = [0u8; 1024];
+    while buf.len() < REMOTE_REQ_CAP {
+        match stream.read(&mut chunk) {
+            Ok(0) => break,
+            Ok(n) => {
+                buf.extend_from_slice(&chunk[..n]);
+                if headers_complete(&buf) {
+                    break;
+                }
+            }
+            Err(_) => break,
+        }
+    }
+    buf.truncate(REMOTE_REQ_CAP);
+    buf
+}
+
+fn headers_complete(buf: &[u8]) -> bool {
+    buf.windows(4).any(|w| w == b"\r\n\r\n")
+        || buf.windows(2).any(|w| w == b"\n\n")
+}
+
+/// `METHOD SP request-target SP HTTP/x` from the first line.
+fn parse_request_line(raw: &[u8]) -> Option<(String, String)> {
+    let end = raw
+        .iter()
+        .position(|&b| b == b'\n')
+        .unwrap_or(raw.len());
+    let line = std::str::from_utf8(&raw[..end]).ok()?.trim_end_matches('\r');
+    let mut parts = line.split_whitespace();
+    let method = parts.next()?;
+    let target = parts.next()?;
+    let version = parts.next()?;
+    if !version.starts_with("HTTP/") {
+        return None;
+    }
+    Some((method.to_string(), target.to_string()))
+}
+
+/// `(path, query)` split of a request-target; query stays raw.
+fn split_query(target: &str) -> (String, &str) {
+    match target.split_once('?') {
+        Some((path, query)) => (path.to_string(), query),
+        None => (target.to_string(), ""),
+    }
+}
+
+/// `?name=value` lookup; percent-decoding is unnecessary for the token
+/// alphabet the CLI generates (hex/base64url).
+fn query_param<'a>(query: &'a str, name: &str) -> Option<&'a str> {
+    for pair in query.split('&') {
+        if let Some((k, v)) = pair.split_once('=') {
+            if k == name {
+                return Some(v);
+            }
+        }
+    }
+    None
+}
+
+/// Case-insensitive header lookup over the raw request.
+fn header_value<'a>(raw: &'a [u8], name: &str) -> Option<&'a str> {
+    let text = std::str::from_utf8(raw).ok()?;
+    for line in text.lines().skip(1) {
+        if line.trim().is_empty() {
+            break; // end of the header block
+        }
+        let Some((key, value)) = line.split_once(':') else {
+            continue;
+        };
+        if key.trim().eq_ignore_ascii_case(name) {
+            return Some(value.trim());
+        }
+    }
+    None
+}
+
+/// Minimal HTML-attribute escaping for the echoed token.
+fn html_attr_escape(s: &str) -> String {
+    s.replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
+        .replace('"', "&quot;")
+}
+
+/// The whole UI: four large form buttons, no scripts, no frameworks. The
+/// token travels in the form action so plain mobile browsers keep working
+/// without an Authorization header.
+fn render_remote_page(token: &str) -> String {
+    let t = html_attr_escape(token);
+    format!(
+        "<!doctype html><html><head><meta charset=\"utf-8\">\
+         <meta name=\"viewport\" content=\"width=device-width,initial-scale=1\">\
+         <title>Megu Remote</title><style>\
+         body{{font-family:system-ui,sans-serif;background:#111;color:#eee;\
+         max-width:22rem;margin:2rem auto;padding:0 1rem}}\
+         h1{{font-size:1.4rem;text-align:center}}\
+         form{{margin:.75rem 0}}button{{width:100%;font-size:1.25rem;\
+         padding:1rem;border:0;border-radius:.75rem;background:#2d6;\
+         color:#041;font-weight:700}}\
+         form.stop button{{background:#e55;color:#fff}}\
+         form.restart button{{background:#fa4;color:#210}}\
+         form.status button{{background:#39c;color:#012}}\
+         </style></head><body><h1>Megu Remote</h1>\
+         <form class=\"status\" method=\"get\" action=\"/api/status?token={t}\">\
+         <button type=\"submit\">Status</button></form>\
+         <form method=\"post\" action=\"/api/start?token={t}\">\
+         <button type=\"submit\">Start</button></form>\
+         <form class=\"restart\" method=\"post\" action=\"/api/restart?token={t}\">\
+         <button type=\"submit\">Restart</button></form>\
+         <form class=\"stop\" method=\"post\" action=\"/api/stop?token={t}\">\
+         <button type=\"submit\">Stop</button></form>\
+         </body></html>"
+    )
+}
+
+// ------------------------------------------------ survival mods ----
+
+/// Commands a Survival Moderator may run. The role exists so trusted
+/// players can police a survival server — kicks, bans, list/whitelist
+/// upkeep, chat announcements and read-only audit/status — while every
+/// world- or inventory-mutating command stays strictly out of reach.
+const SURVIVAL_MOD_ALLOWED: &[&str] = &[
+    "kick",
+    "ban",
+    "pardon",
+    "ban-ip",
+    "pardon-ip",
+    "banlist",
+    "whitelist",
+    "say",
+    "list",
+];
+
+/// `/megu` subcommands a Survival Moderator may run (read-only).
+const SURVIVAL_MOD_ALLOWED_MEGU: &[&str] = &["audit", "status"];
+
+/// Whether `cmd_name` is inside the Survival-Moderator allowlist. Anything
+/// not listed is denied: `megu rollback`, `megu snapshot`, `megu claim`,
+/// `gamemode`, `give`, `tp`, `teleport`, `fill`, `setblock`, `summon`,
+/// `xp`, `effect`, `op`, `deop`, `stop`, `save-all` — no item dupes and
+/// no world mutation from this role, ever. A leading `/` and extra
+/// arguments are accepted; comparison is case-insensitive.
+fn survival_mod_allows_command(cmd_name: &str) -> bool {
+    let cmd = cmd_name.trim().trim_start_matches('/').trim();
+    let mut parts = cmd.split_whitespace();
+    let Some(head) = parts.next() else {
+        return false;
+    };
+    if head.eq_ignore_ascii_case("megu") {
+        return parts
+            .next()
+            .is_some_and(|sub| {
+                SURVIVAL_MOD_ALLOWED_MEGU
+                    .iter()
+                    .any(|&allowed| sub.eq_ignore_ascii_case(allowed))
+            });
+    }
+    SURVIVAL_MOD_ALLOWED
+        .iter()
+        .any(|&allowed| head.eq_ignore_ascii_case(allowed))
+}
+
+/// Persistent set of Survival Moderator player names — the zero-cheat
+/// moderation role, deliberately separate from Vanilla OP levels 0–4.
+/// Serializes as `{"players":[…]}` through the shared crate JSON codec.
+struct SurvivalModRegistry {
+    players: BTreeSet<String>,
+}
+
+impl SurvivalModRegistry {
+    fn new() -> Self {
+        Self {
+            players: BTreeSet::new(),
+        }
+    }
+
+    fn add(&mut self, name: &str) -> bool {
+        self.players.insert(name.to_string())
+    }
+
+    fn remove(&mut self, name: &str) -> bool {
+        self.players.remove(name)
+    }
+
+    fn contains(&self, name: &str) -> bool {
+        self.players.contains(name)
+    }
+
+    fn len(&self) -> usize {
+        self.players.len()
+    }
+
+    fn is_empty(&self) -> bool {
+        self.players.is_empty()
+    }
+
+    fn names(&self) -> impl Iterator<Item = &str> {
+        self.players.iter().map(String::as_str)
+    }
+
+    /// Deterministic JSON (names sorted by the `BTreeSet`).
+    fn to_json(&self) -> String {
+        let names = self
+            .players
+            .iter()
+            .map(|n| format!("\"{}\"", status_json_text(n)))
+            .collect::<Vec<_>>()
+            .join(",");
+        format!("{{\"players\":[{names}]}}")
+    }
+
+    fn from_json(text: &str) -> Option<Self> {
+        let doc = crate::json::jparse(text.as_bytes())?;
+        let arr = doc.get("players")?.as_arr()?;
+        let mut registry = Self::new();
+        for entry in arr {
+            let crate::json::J::Str(name) = entry else {
+                return None;
+            };
+            registry.add(name);
+        }
+        Some(registry)
+    }
+
+    fn save_json(&self, path: &std::path::Path) -> std::io::Result<()> {
+        std::fs::write(path, self.to_json())
+    }
+
+    /// Missing file means an empty registry; a malformed one is an error
+    /// the operator sees instead of a silently dropped roster.
+    fn load_json(path: &std::path::Path) -> std::io::Result<Self> {
+        let text = match std::fs::read_to_string(path) {
+            Ok(text) => text,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                return Ok(Self::new());
+            }
+            Err(e) => return Err(e),
+        };
+        Self::from_json(&text).ok_or_else(|| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!("{} is not a survival-mod registry", path.display()),
+            )
+        })
+    }
+}
+
+// --------------------------------------------------- hub & worlds ----
+
+/// One `[servers]` row: a friendly name pointing at host:port.
+struct HubServerEntry {
+    host: String,
+    port: u16,
+}
+
+/// The hub `[servers]` directory. On `/stop` or `/megu restart` the
+/// `fallback_server` names where online players are transferred before
+/// the socket drops — typically the hub itself.
+struct HubServerDirectory {
+    servers: BTreeMap<String, HubServerEntry>,
+    fallback_server: Option<String>,
+}
+
+impl HubServerDirectory {
+    fn new() -> Self {
+        Self {
+            servers: BTreeMap::new(),
+            fallback_server: None,
+        }
+    }
+
+    /// Register or replace a server. Validation fails closed: bad names,
+    /// bad hosts and port 0 are errors, never silently stored.
+    fn add_server(&mut self, name: &str, host: &str, port: u16) -> Result<(), String> {
+        if !valid_directory_name(name) {
+            return Err(format!(
+                "server name {name:?} must be 1-32 of [a-z0-9_-]"
+            ));
+        }
+        if !valid_remote_host(host) {
+            return Err(format!("host {host:?} is not a valid hostname or IP"));
+        }
+        if port == 0 {
+            return Err("port 0 is not a connectable server address".to_string());
+        }
+        self.servers.insert(
+            name.to_string(),
+            HubServerEntry {
+                host: host.to_string(),
+                port,
+            },
+        );
+        Ok(())
+    }
+
+    fn remove_server(&mut self, name: &str) -> bool {
+        let removed = self.servers.remove(name).is_some();
+        if self.fallback_server.as_deref() == Some(name) {
+            self.fallback_server = None;
+        }
+        removed
+    }
+
+    /// `(host, port)` for a friendly name.
+    fn resolve(&self, name: &str) -> Option<(&str, u16)> {
+        self.servers.get(name).map(|e| (e.host.as_str(), e.port))
+    }
+
+    /// `(name, host, port)` players are transferred to on stop/restart.
+    fn fallback(&self) -> Option<(&str, &str, u16)> {
+        let name = self.fallback_server.as_deref()?;
+        let (host, port) = self.resolve(name)?;
+        Some((name, host, port))
+    }
+
+    /// The fallback must reference a registered server — a typo here would
+    /// otherwise only surface while players are being kicked.
+    fn set_fallback(&mut self, name: &str) -> Result<(), String> {
+        if !self.servers.contains_key(name) {
+            return Err(format!("no server named {name:?} is registered"));
+        }
+        self.fallback_server = Some(name.to_string());
+        Ok(())
+    }
+
+    fn len(&self) -> usize {
+        self.servers.len()
+    }
+}
+
+/// `[a-z0-9_-]{1,32}` — the friendly-name shape for `[servers]` rows and
+/// managed world ids alike.
+fn valid_directory_name(name: &str) -> bool {
+    !name.is_empty()
+        && name.len() <= 32
+        && name
+            .bytes()
+            .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-' || b == b'_')
+}
+
+/// Fail-closed host validation: a literal `IpAddr`, or a DNS name of
+/// `[a-zA-Z0-9-]` dot-separated labels (no leading/trailing hyphen).
+fn valid_remote_host(host: &str) -> bool {
+    if host.parse::<std::net::IpAddr>().is_ok() {
+        return true;
+    }
+    if host.is_empty() || host.len() > 253 {
+        return false;
+    }
+    host.split('.').all(|label| {
+        !label.is_empty()
+            && label.len() <= 63
+            && !label.starts_with('-')
+            && !label.ends_with('-')
+            && label.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-')
+    })
+}
+
+/// Generator preset for a managed extra world.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum WorldGenerator {
+    Overworld,
+    Flat,
+    Void,
+    Nether,
+    End,
+}
+
+/// The gamemode players land in when entering a managed world.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum WorldGameMode {
+    Survival,
+    Creative,
+    Adventure,
+    Spectator,
+}
+
+/// One `[[worlds]]` row. Worlds are plain dimensions on disk — the save
+/// layout is the standard Vanilla/NeoForge
+/// `dimensions/megu/<id>/region` tree, no custom format.
+struct ManagedWorld {
+    id: String,
+    generator: WorldGenerator,
+    seed: u64,
+    pvp: bool,
+    default_gamemode: WorldGameMode,
+    spawn: [f64; 3],
+}
+
+impl ManagedWorld {
+    /// The world directory relative to the save root.
+    fn dimension_dir(&self) -> String {
+        format!("dimensions/megu/{}", self.id)
+    }
+
+    /// The region directory holding this world's `.mca` files.
+    fn region_dir(&self) -> String {
+        format!("{}/region", self.dimension_dir())
+    }
+}
+
+/// Declared extra worlds, keyed by id.
+struct MultiWorldRegistry {
+    worlds: BTreeMap<String, ManagedWorld>,
+}
+
+impl MultiWorldRegistry {
+    fn new() -> Self {
+        Self {
+            worlds: BTreeMap::new(),
+        }
+    }
+
+    /// Register a world. Duplicate or malformed ids are rejected.
+    fn add(&mut self, world: ManagedWorld) -> Result<(), String> {
+        if !valid_directory_name(&world.id) {
+            return Err(format!(
+                "world id {:?} must be 1-32 of [a-z0-9_-]",
+                world.id
+            ));
+        }
+        if self.worlds.contains_key(&world.id) {
+            return Err(format!("world {:?} is already registered", world.id));
+        }
+        self.worlds.insert(world.id.clone(), world);
+        Ok(())
+    }
+
+    fn remove(&mut self, id: &str) -> bool {
+        self.worlds.remove(id).is_some()
+    }
+
+    fn get(&self, id: &str) -> Option<&ManagedWorld> {
+        self.worlds.get(id)
+    }
+
+    fn len(&self) -> usize {
+        self.worlds.len()
+    }
+
+    fn iter(&self) -> impl Iterator<Item = &ManagedWorld> {
+        self.worlds.values()
+    }
+}
+
+// ------------------------------------------------ status summary ----
+
+/// Everything the one-screen `/megu status` and the startup summary need,
+/// gathered by the caller.
+struct OperatorStatusSummary {
+    tps: f64,
+    mspt_p50: f64,
+    mspt_p95: f64,
+    players_online: usize,
+    players_max: usize,
+    loaded_chunks: usize,
+    rss_mb: Option<u64>,
+    active_worlds: usize,
+    hub_servers: usize,
+    survival_mods: usize,
+}
+
+/// The one-screen operator summary: TPS, MSPT p50/p95, players, chunks,
+/// RSS, worlds, hub servers and the Survival-Mod count. Plain units, no
+/// internal vocabulary.
+fn format_operator_status_summary(s: &OperatorStatusSummary) -> String {
+    let rss = match s.rss_mb {
+        Some(mb) => format!("{mb} MB"),
+        None => "N/A".to_string(),
+    };
+    format!(
+        "TPS: {:.1}   MSPT p50/p95: {:.1}/{:.1} ms\n\
+         Players: {}/{}   Chunks: {}   RSS: {}\n\
+         Worlds: {} active   Hub servers: {}   Survival mods: {}",
+        s.tps,
+        s.mspt_p50,
+        s.mspt_p95,
+        s.players_online,
+        s.players_max,
+        s.loaded_chunks,
+        rss,
+        s.active_worlds,
+        s.hub_servers,
+        s.survival_mods,
+    )
+}
+
+// ------------------------------------------------------------- tests ----
+
+#[cfg(test)]
+mod operator_ux_admin_core_tests {
+    use super::*;
+
+    #[test]
+    fn lifecycle_sleeps_after_idle_and_wakes_on_whitelisted_join() {
+        let t0 = Instant::now();
+        let mut ctl = ServerLifecycleController::new(60, None);
+        assert_eq!(ctl.update(t0, 3), LifecycleAction::None);
+        // The world empties at +10; hibernate fires 60s after that.
+        assert_eq!(ctl.update(t0 + Duration::from_secs(10), 0), LifecycleAction::None);
+        assert_eq!(ctl.update(t0 + Duration::from_secs(69), 0), LifecycleAction::None);
+        assert_eq!(ctl.state(), LifecycleState::Running);
+        assert_eq!(
+            ctl.update(t0 + Duration::from_secs(70), 0),
+            LifecycleAction::SaveAndHibernate
+        );
+        assert_eq!(ctl.state(), LifecycleState::Sleeping);
+        assert_eq!(
+            ServerLifecycleController::sleeping_motd(),
+            "Sleeping — Join to wake!"
+        );
+        // A non-whitelisted attempt must not wake the world.
+        assert_eq!(
+            ctl.on_incoming_login_attempt("mallory", false),
+            LifecycleAction::RejectLogin
+        );
+        assert_eq!(ctl.state(), LifecycleState::Sleeping);
+        // A whitelisted join wakes it immediately.
+        assert_eq!(
+            ctl.on_incoming_login_attempt("alice", true),
+            LifecycleAction::WakeWorld
+        );
+        assert_eq!(ctl.state(), LifecycleState::Running);
+        // The idle clock restarted at the wake: a fresh empty run needs
+        // a full 60s again before the next hibernate.
+        assert_eq!(ctl.update(t0 + Duration::from_secs(80), 0), LifecycleAction::None);
+        assert_eq!(ctl.update(t0 + Duration::from_secs(139), 0), LifecycleAction::None);
+        assert_eq!(
+            ctl.update(t0 + Duration::from_secs(140), 0),
+            LifecycleAction::SaveAndHibernate
+        );
+        // Players observed online while sleeping also wakes (defensive).
+        assert_eq!(ctl.update(t0 + Duration::from_secs(141), 1), LifecycleAction::WakeWorld);
+        assert_eq!(ctl.state(), LifecycleState::Running);
+    }
+
+    #[test]
+    fn lifecycle_shutdown_fires_after_longer_empty_window() {
+        let t0 = Instant::now();
+        let mut ctl = ServerLifecycleController::new(60, Some(300));
+        assert_eq!(ctl.update(t0, 0), LifecycleAction::None); // empty clock starts
+        assert_eq!(
+            ctl.update(t0 + Duration::from_secs(60), 0),
+            LifecycleAction::SaveAndHibernate
+        );
+        assert_eq!(
+            ctl.update(t0 + Duration::from_secs(299), 0),
+            LifecycleAction::None
+        );
+        assert_eq!(
+            ctl.update(t0 + Duration::from_secs(300), 0),
+            LifecycleAction::SaveAndShutdown
+        );
+        assert_eq!(ctl.state(), LifecycleState::Stopped);
+        // Terminal: neither more idle time nor login attempts change it.
+        assert_eq!(ctl.update(t0 + Duration::from_secs(600), 0), LifecycleAction::None);
+        assert_eq!(
+            ctl.on_incoming_login_attempt("alice", true),
+            LifecycleAction::None
+        );
+    }
+
+    #[test]
+    fn lifecycle_no_shutdown_when_not_configured() {
+        let t0 = Instant::now();
+        let mut ctl = ServerLifecycleController::new(60, None);
+        ctl.update(t0, 0); // empty clock starts
+        assert_eq!(
+            ctl.update(t0 + Duration::from_secs(60), 0),
+            LifecycleAction::SaveAndHibernate
+        );
+        for extra in [120, 600, 86_400] {
+            assert_eq!(
+                ctl.update(t0 + Duration::from_secs(extra), 0),
+                LifecycleAction::None
+            );
+            assert_eq!(ctl.state(), LifecycleState::Sleeping);
+        }
+    }
+
+    #[test]
+    fn supervisor_clean_exit_stops_and_code_42_restarts_immediately() {
+        let t0 = Instant::now();
+        let mut sup = SupervisorPolicy::new();
+        // Even after crashes, a clean exit means a real operator stop.
+        assert_eq!(
+            sup.decide(1, t0),
+            SupervisorDecision::RestartDelayed(Duration::from_secs(1))
+        );
+        assert_eq!(sup.decide(0, t0 + Duration::from_secs(1)), SupervisorDecision::Stop);
+        assert_eq!(
+            sup.decide(MEGU_RESTART_EXIT_CODE, t0 + Duration::from_secs(2)),
+            SupervisorDecision::RestartImmediate
+        );
+    }
+
+    #[test]
+    fn supervisor_backoff_doubles_then_crash_loop_halts() {
+        let t0 = Instant::now();
+        let mut sup = SupervisorPolicy::new();
+        for (i, expect_secs) in [1u64, 2, 4, 8].iter().enumerate() {
+            let at = t0 + Duration::from_secs(10 * i as u64);
+            assert_eq!(
+                sup.decide(1, at),
+                SupervisorDecision::RestartDelayed(Duration::from_secs(*expect_secs)),
+                "crash {} should delay {expect_secs}s",
+                i + 1
+            );
+        }
+        // Fifth crash inside 60s: the loop guard fires, no more restarts.
+        assert_eq!(
+            sup.decide(1, t0 + Duration::from_secs(40)),
+            SupervisorDecision::HaltCrashLoop {
+                crashes: 5,
+                window_secs: 60
+            }
+        );
+    }
+
+    #[test]
+    fn supervisor_backoff_escalates_across_windows_to_cap() {
+        let t0 = Instant::now();
+        let mut sup = SupervisorPolicy::new();
+        // Spaced crashes never reach 5-in-60, so restarts keep happening
+        // while the ladder escalates 1→2→4→8→16 and caps at 30s.
+        for (at, secs) in [
+            (0u64, 1u64),
+            (70, 2),
+            (71, 4),
+            (72, 8),
+            (73, 16),
+            (131, 30),
+            (192, 30),
+        ] {
+            assert_eq!(
+                sup.decide(1, t0 + Duration::from_secs(at)),
+                SupervisorDecision::RestartDelayed(Duration::from_secs(secs)),
+                "crash at +{at}s should delay {secs}s"
+            );
+        }
+    }
+
+    // --- remote control over a real loopback listener ---
+
+    fn remote_request(
+        srv: &mut RemoteControlServer,
+        request: &str,
+    ) -> (String, Vec<RemoteAction>) {
+        let addr = srv.local_addr().unwrap();
+        let mut client = TcpStream::connect(addr).unwrap();
+        client
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .unwrap();
+        client.write_all(request.as_bytes()).unwrap();
+        let actions = srv.poll_once(&|| "{\"tps\":20.0}".to_string());
+        let mut reply = String::new();
+        client.read_to_string(&mut reply).unwrap();
+        (reply, actions)
+    }
+
+    fn http_status(reply: &str) -> u16 {
+        reply
+            .split_whitespace()
+            .nth(1)
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(0)
+    }
+
+    #[test]
+    fn remote_control_token_scopes_and_actions() {
+        let mut srv = RemoteControlServer::bind(
+            "127.0.0.1:0",
+            "admin-secret",
+            Some("starter-secret"),
+        )
+        .unwrap();
+
+        // No token at all → 401.
+        let (reply, actions) =
+            remote_request(&mut srv, "GET /api/status HTTP/1.1\r\nHost: x\r\n\r\n");
+        assert_eq!(http_status(&reply), 401, "{reply}");
+        assert!(actions.is_empty());
+
+        // Wrong token → 401.
+        let (reply, _) = remote_request(
+            &mut srv,
+            "GET /api/status HTTP/1.1\r\nAuthorization: Bearer nope\r\n\r\n",
+        );
+        assert_eq!(http_status(&reply), 401, "{reply}");
+
+        // start_only token: status and start work…
+        let (reply, _) = remote_request(
+            &mut srv,
+            "GET /api/status HTTP/1.1\r\nAuthorization: Bearer starter-secret\r\n\r\n",
+        );
+        assert_eq!(http_status(&reply), 200, "{reply}");
+        assert!(reply.contains("{\"tps\":20.0}"), "{reply}");
+
+        let (reply, actions) = remote_request(
+            &mut srv,
+            "POST /api/start HTTP/1.1\r\nAuthorization: Bearer starter-secret\r\nContent-Length: 0\r\n\r\n",
+        );
+        assert_eq!(http_status(&reply), 200, "{reply}");
+        assert_eq!(actions, vec![RemoteAction::Start]);
+
+        // …but stop and restart are strictly forbidden for it.
+        for path in ["/api/stop", "/api/restart"] {
+            let (reply, actions) = remote_request(
+                &mut srv,
+                &format!(
+                    "POST {path} HTTP/1.1\r\nAuthorization: Bearer starter-secret\r\nContent-Length: 0\r\n\r\n"
+                ),
+            );
+            assert_eq!(http_status(&reply), 403, "{path}: {reply}");
+            assert!(actions.is_empty(), "{path}");
+        }
+        // The page is admin-only too.
+        let (reply, _) = remote_request(
+            &mut srv,
+            "GET / HTTP/1.1\r\nAuthorization: Bearer starter-secret\r\n\r\n",
+        );
+        assert_eq!(http_status(&reply), 403, "{reply}");
+
+        // Admin token: every action lands.
+        for (path, action) in [
+            ("/api/start", RemoteAction::Start),
+            ("/api/restart", RemoteAction::Restart),
+            ("/api/stop", RemoteAction::Stop),
+        ] {
+            let (reply, actions) = remote_request(
+                &mut srv,
+                &format!(
+                    "POST {path} HTTP/1.1\r\nAuthorization: Bearer admin-secret\r\nContent-Length: 0\r\n\r\n"
+                ),
+            );
+            assert_eq!(http_status(&reply), 200, "{path}: {reply}");
+            assert_eq!(actions, vec![action], "{path}");
+        }
+
+        // Query-token path (what the mobile page's forms use).
+        let (reply, actions) = remote_request(
+            &mut srv,
+            "POST /api/stop?token=admin-secret HTTP/1.1\r\nHost: x\r\nContent-Length: 0\r\n\r\n",
+        );
+        assert_eq!(http_status(&reply), 200, "{reply}");
+        assert_eq!(actions, vec![RemoteAction::Stop]);
+
+        // Unknown route → 404 even with a good token.
+        let (reply, _) = remote_request(
+            &mut srv,
+            "GET /api/nuke?token=admin-secret HTTP/1.1\r\nHost: x\r\n\r\n",
+        );
+        assert_eq!(http_status(&reply), 404, "{reply}");
+    }
+
+    #[test]
+    fn remote_control_page_renders_four_buttons() {
+        let mut srv =
+            RemoteControlServer::bind("127.0.0.1:0", "admin-secret", None).unwrap();
+        let (reply, _) = remote_request(
+            &mut srv,
+            "GET /?token=admin-secret HTTP/1.1\r\nHost: x\r\n\r\n",
+        );
+        assert_eq!(http_status(&reply), 200, "{reply}");
+        assert!(reply.contains("Content-Type: text/html"), "{reply}");
+        for button in [">Status<", ">Start<", ">Restart<", ">Stop<"] {
+            assert!(reply.contains(button), "missing {button}:\n{reply}");
+        }
+        assert!(reply.contains("viewport"), "{reply}");
+        assert!(!reply.contains("<script"), "{reply}");
+    }
+
+    #[test]
+    fn remote_control_without_start_token_denies_start_scope() {
+        let srv = RemoteControlServer::bind("127.0.0.1:0", "admin-secret", None).unwrap();
+        assert_eq!(srv.scope_for_token("admin-secret"), Some(RemoteScope::Admin));
+        assert_eq!(srv.scope_for_token("starter-secret"), None);
+        assert_eq!(srv.scope_for_token(""), None);
+    }
+
+    // --- survival moderators ---
+
+    #[test]
+    fn survival_mod_allowlist_polices_without_cheating() {
+        for allowed in [
+            "/kick",
+            "kick",
+            "kick griefer reason",
+            "/ban",
+            "/pardon",
+            "/ban-ip",
+            "/pardon-ip",
+            "/banlist",
+            "/whitelist",
+            "whitelist add alice",
+            "/say",
+            "/list",
+            "/megu audit",
+            "/megu status",
+            "MEGU STATUS",
+        ] {
+            assert!(
+                survival_mod_allows_command(allowed),
+                "{allowed} should be allowed"
+            );
+        }
+        for denied in [
+            "/megu rollback",
+            "/megu snapshot",
+            "/megu claim",
+            "/megu",
+            "/gamemode",
+            "/give",
+            "/tp",
+            "/teleport",
+            "/fill",
+            "/setblock",
+            "/summon",
+            "/xp",
+            "/effect",
+            "/op",
+            "/deop",
+            "/stop",
+            "/save-all",
+            "",
+        ] {
+            assert!(
+                !survival_mod_allows_command(denied),
+                "{denied} must be denied"
+            );
+        }
+    }
+
+    #[test]
+    fn survival_mod_registry_json_roundtrip() {
+        let mut reg = SurvivalModRegistry::new();
+        assert!(reg.is_empty());
+        assert!(reg.add("alice"));
+        assert!(reg.add("bob"));
+        assert!(!reg.add("alice"));
+        assert!(reg.contains("alice"));
+        assert_eq!(reg.len(), 2);
+
+        let json = reg.to_json();
+        assert_eq!(json, "{\"players\":[\"alice\",\"bob\"]}");
+        let back = SurvivalModRegistry::from_json(&json).unwrap();
+        assert_eq!(back.names().collect::<Vec<_>>(), vec!["alice", "bob"]);
+
+        // Malformed documents fail instead of silently emptying.
+        assert!(SurvivalModRegistry::from_json("{}").is_none());
+        assert!(SurvivalModRegistry::from_json("{\"players\":[1]}").is_none());
+        assert!(SurvivalModRegistry::from_json("not json").is_none());
+
+        // Save/load through a real file.
+        let dir = std::env::temp_dir().join(format!(
+            "megu-survmod-{}-{}",
+            std::process::id(),
+            "roundtrip"
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("survival-mods.json");
+        reg.save_json(&path).unwrap();
+        let loaded = SurvivalModRegistry::load_json(&path).unwrap();
+        assert_eq!(loaded.names().collect::<Vec<_>>(), vec!["alice", "bob"]);
+        // Missing file → empty registry, not an error.
+        let missing = SurvivalModRegistry::load_json(&dir.join("gone.json")).unwrap();
+        assert!(missing.is_empty());
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    // --- hub directory & multi-world registry ---
+
+    fn hub_world(id: &str) -> ManagedWorld {
+        ManagedWorld {
+            id: id.to_string(),
+            generator: WorldGenerator::Flat,
+            seed: 42,
+            pvp: false,
+            default_gamemode: WorldGameMode::Creative,
+            spawn: [0.5, 64.0, 0.5],
+        }
+    }
+
+    #[test]
+    fn hub_directory_validates_and_resolves_fallback() {
+        let mut dir = HubServerDirectory::new();
+        dir.add_server("hub", "127.0.0.1", 25565).unwrap();
+        dir.add_server("survival", "survival.example.net", 25566)
+            .unwrap();
+        assert_eq!(dir.len(), 2);
+        assert_eq!(dir.resolve("hub"), Some(("127.0.0.1", 25565)));
+
+        for (name, host, port) in [
+            ("", "h", 1),                 // empty name
+            ("Bad Name", "h", 1),         // illegal characters
+            ("ok", "", 1),                // empty host
+            ("ok", "-bad.example", 1),    // leading hyphen label
+            ("ok", "bad host!", 1),       // illegal characters
+            ("ok", "fine.example", 0),    // port zero
+        ] {
+            assert!(
+                dir.add_server(name, host, port).is_err(),
+                "{name}/{host}/{port} must be rejected"
+            );
+        }
+
+        // Fallback must point at a real server.
+        assert!(dir.set_fallback("missing").is_err());
+        dir.set_fallback("hub").unwrap();
+        assert_eq!(dir.fallback(), Some(("hub", "127.0.0.1", 25565)));
+        // Removing the fallback target clears the pointer.
+        assert!(dir.remove_server("hub"));
+        assert_eq!(dir.fallback(), None);
+    }
+
+    #[test]
+    fn multiworld_registry_maps_standard_dimension_paths() {
+        let mut reg = MultiWorldRegistry::new();
+        reg.add(hub_world("farm")).unwrap();
+        assert!(reg.add(hub_world("farm")).is_err());
+        assert!(reg.add(hub_world("Bad Id")).is_err());
+        assert_eq!(reg.len(), 1);
+        let world = reg.get("farm").unwrap();
+        assert_eq!(world.dimension_dir(), "dimensions/megu/farm");
+        assert_eq!(world.region_dir(), "dimensions/megu/farm/region");
+        assert_eq!(world.generator, WorldGenerator::Flat);
+        assert_eq!(world.default_gamemode, WorldGameMode::Creative);
+        assert_eq!(world.spawn, [0.5, 64.0, 0.5]);
+        assert!(reg.remove("farm"));
+        assert_eq!(reg.len(), 0);
+    }
+
+    #[test]
+    fn operator_status_summary_is_one_screen() {
+        let text = format_operator_status_summary(&OperatorStatusSummary {
+            tps: 19.94,
+            mspt_p50: 41.2,
+            mspt_p95: 48.9,
+            players_online: 3,
+            players_max: 20,
+            loaded_chunks: 1_842,
+            rss_mb: Some(512),
+            active_worlds: 4,
+            hub_servers: 2,
+            survival_mods: 5,
+        });
+        assert!(text.contains("TPS: 19.9"), "{text}");
+        assert!(text.contains("p50/p95: 41.2/48.9"), "{text}");
+        assert!(text.contains("Players: 3/20"), "{text}");
+        assert!(text.contains("Chunks: 1842"), "{text}");
+        assert!(text.contains("RSS: 512 MB"), "{text}");
+        assert!(text.contains("Worlds: 4 active"), "{text}");
+        assert!(text.contains("Hub servers: 2"), "{text}");
+        assert!(text.contains("Survival mods: 5"), "{text}");
+        let lines = text.lines().count();
+        assert!((2..=4).contains(&lines), "one screen, not a wall:\n{text}");
+    }
+}
 }
