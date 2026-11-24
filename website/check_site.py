@@ -270,7 +270,7 @@ def check_site_config_keys():
     elif not RELEASE_TAG_RE.match(release_tag):
         findings.append(
             f"site-config.js releaseTag '{release_tag}' is not a pinned "
-            "version tag (expected e.g. v0.1.0-alpha.2)")
+            "version tag (expected e.g. v0.1.0-alpha.3)")
     markup = (WEBSITE / "index.html").read_text(encoding="utf-8")
     ja = re.search(r"var JA\s*=\s*\{(.*?)\n\s*\};", markup, re.S)
     if not ja:

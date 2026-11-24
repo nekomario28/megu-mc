@@ -67,7 +67,7 @@ body:
     attributes:
       label: Megu / engine version
       description: "Commit SHA, release tag, or build identifier. (コミット SHA・リリースタグ等)"
-      placeholder: "e.g. v0.1.0-alpha.2 or git sha"
+      placeholder: "e.g. v0.1.0-alpha.3 or git sha"
     validations:
       required: true
 

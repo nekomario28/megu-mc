@@ -176,7 +176,7 @@ fn load_unifont_packs(
 ) -> bool {
     let mut loaded_any = false;
     for root in assets_roots {
-        for index in index_files(&root, paths) {
+        for index in index_files(root, paths) {
             let Ok(meta) = std::fs::metadata(&index) else {
                 continue;
             };
