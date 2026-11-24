@@ -2149,7 +2149,12 @@ fn water_body_tint(day: f32, twilight: f32) -> vec3<f32> {
     let underwater_teal = vec3<f32>(0.10, 0.30, 0.42);
     let moon_blue = vec3<f32>(0.055, 0.105, 0.20);
     let dusk_teal = vec3<f32>(0.16, 0.24, 0.34);
-    return mix(mix(moon_blue, underwater_teal, day), dusk_teal, twilight * 0.55);
+    let time_tint = mix(mix(moon_blue, underwater_teal, day), dusk_teal, twilight * 0.55);
+    // camera_right is unused by this water pass; the renderer places the
+    // same biome depth tint/filter here that underwater fog applies.
+    let biome_filter = mix(vec3<f32>(1.0), shadow.camera_right.xyz,
+                           clamp(shadow.camera_right.w, 0.0, 1.0));
+    return time_tint * biome_filter;
 }
 fn water_cloud_openness(world_xz: vec2<f32>, phase: f32) -> f32 {
     let p = world_xz * 0.018 + vec2<f32>(phase * 0.009, phase * 0.004);

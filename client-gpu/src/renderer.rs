@@ -3486,6 +3486,8 @@ pub struct GpuRenderer {
     /// Dedicated `MEGU_WATER_SURFACE_WGSL` pass — created the first frame
     /// any live section carries decoded water geometry, `None` otherwise.
     water: Option<WaterGpu>,
+    /// Current biome underwater tint/filter for the water-only uniform lane.
+    water_depth_tint: [f32; 4],
     /// `MEGU_TERRAIN_LIT_WGSL` receiver path: created lazily on the first
     /// [`Self::upload_lit_terrain`] call (the decoded-vertex stream is for
     /// explicit lit uploads, not the packed section path).
@@ -6961,6 +6963,7 @@ impl GpuRenderer {
             scaled_target: None,
             sharpen: None,
             water: None,
+            water_depth_tint: [1.0, 1.0, 1.0, 0.0],
             lit_terrain: None,
             shadow_gpu_epoch: 0,
             pending_stained_casters: Vec::new(),
@@ -11148,6 +11151,12 @@ impl GpuRenderer {
         self.dispatch_shadow_work(encoder, &camera, aspect, decision);
 
         let atmo = atmosphere.current();
+        self.water_depth_tint = [
+            atmo.depth_tint_rgb[0],
+            atmo.depth_tint_rgb[1],
+            atmo.depth_tint_rgb[2],
+            atmo.depth_tint_strength,
+        ];
         let sun = compute_sun_direction(world_time_ticks);
         let env = CompositeEnvUniforms {
             sun: [sun[0], sun[1], sun[2], atmo.sun_intensity],
@@ -12595,12 +12604,16 @@ impl GpuRenderer {
         // are active, else a local fallback from the live world clock).
         if self.water_sections > 0 {
             self.ensure_water();
-            let uniforms = self
+            let mut uniforms = self
                 .frame_stable_shadow
                 .map(|s| s.uniforms)
                 .unwrap_or_else(|| {
                     water_fallback_uniforms(view_proj, camera_position, world_time_ticks)
                 });
+            // The water shader does not use camera-right. Reuse its existing
+            // vec4 only in this water-specific UBO to pass the same biome
+            // depth tint/filter as underwater fog, without a new binding.
+            uniforms.camera_right = self.water_depth_tint;
             let water = self.water.as_ref().expect("ensured");
             self.ctx
                 .queue
