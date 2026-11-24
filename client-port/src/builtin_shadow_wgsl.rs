@@ -564,6 +564,53 @@ pub fn compute_region_light_mask(
     mask
 }
 
+/// CPU mirror of the per-light scalar terms in the `MEGU_TERRAIN_LIT_WGSL`
+/// dynamic point-light loop: `(direct, indirect_bounce)`, the two
+/// multipliers applied to `color * intensity * inei_boost`.
+///
+/// `direct` is the wrapped diffuse lobe (`wrap = 0.28`) under the quadratic
+/// `falloff`; it reaches `0.0` once `n_dot_l <= -0.28` or the fragment
+/// leaves `radius`. `indirect_bounce` is the subtle multi-bounce lobe that
+/// keeps walls and faces turned away from a held torch softly lit instead
+/// of pitch black: strongest on back-facing surfaces and fading to `0.0`
+/// just past the direct radius (`distance >= radius * 1.15`).
+pub fn dynamic_light_direct_and_bounce(
+    n_dot_l: f32,
+    distance: f32,
+    radius: f32,
+) -> (f32, f32) {
+    let n_dot_l = if n_dot_l.is_finite() {
+        n_dot_l.clamp(-1.0, 1.0)
+    } else {
+        0.0
+    };
+    // The shader never sees a non-finite distance (it is a sqrt), so any
+    // non-finite input is treated as infinitely far: no light contribution.
+    let distance = if distance.is_finite() {
+        distance.max(0.0)
+    } else {
+        f32::INFINITY
+    };
+    let radius = if radius.is_finite() && radius > 0.0 {
+        radius
+    } else {
+        0.01
+    };
+    let falloff = {
+        let f = 1.0 - distance / radius;
+        let f = f.max(0.0);
+        f * f
+    };
+    let wrapped_diffuse = ((n_dot_l + 0.28) / 1.28).clamp(0.0, 1.0);
+    let bounce_falloff = {
+        let f = 1.0 - distance / (radius * 1.15);
+        let f = f.max(0.0);
+        f * f
+    };
+    let indirect_bounce = 0.14 * (0.55 + 0.45 * (1.0 - n_dot_l.max(0.0))) * bounce_falloff;
+    (wrapped_diffuse * falloff, indirect_bounce)
+}
+
 fn dot(a: [f32; 3], b: [f32; 3]) -> f32 {
     a[0] * b[0] + a[1] * b[1] + a[2] * b[2]
 }
@@ -845,6 +892,38 @@ pub fn stained_glass_transmission_rgb(color_idx: u8) -> [f32; 3] {
         [0.09, 0.09, 0.10], // black
     ];
     TABLE[usize::from(color_idx.min(15))]
+}
+
+/// Deterministic diagonal scrolling enchantment glint RGB in linear `[0, 1]`
+/// space (subtle vanilla-faithful violet-magenta shimmer band).
+///
+/// Two opposing angled shimmer waves sweep `uv` as `time_seconds` advances —
+/// the same constants [`MEGU_ENCHANT_GLINT_WGSL`] evaluates per fragment, so
+/// 2D item icons and 3D armor/tools share one glint. The colour lerps inside
+/// the violet-lavender band `[0.58, 0.24, 0.96]`..`[0.86, 0.52, 1.0]` and the
+/// squared band product keeps the peak at ~0.32: present, never a wash over
+/// the underlying texture. All inputs are sanitized, so the result is always
+/// finite and non-negative.
+pub fn enchantment_glint_rgb(uv: [f32; 2], time_seconds: f32) -> [f32; 3] {
+    let u = if uv[0].is_finite() { uv[0] } else { 0.0 };
+    let v = if uv[1].is_finite() { uv[1] } else { 0.0 };
+    let t = if time_seconds.is_finite() {
+        time_seconds
+    } else {
+        0.0
+    };
+    // Two opposing diagonal waves: one band slides along u+v, the other
+    // crosses it along u-v in the opposite scroll direction.
+    let wave_a = (TAU * (u + v - t * 0.09)).sin();
+    let wave_b = (TAU * (u - v + t * 0.06)).sin();
+    let band = (0.5 + 0.5 * wave_a) * (0.5 + 0.5 * wave_b);
+    let shimmer = band * band;
+    let m = 0.5 + 0.5 * wave_b;
+    [
+        (0.58 + 0.28 * m) * shimmer * 0.32,
+        (0.24 + 0.28 * m) * shimmer * 0.32,
+        (0.96 + 0.04 * m) * shimmer * 0.32,
+    ]
 }
 
 /// Why a cached shadow map can no longer be reused this frame.
@@ -1900,6 +1979,16 @@ fn fs_main(input: TerrainOutput) -> @location(0) vec4<f32> {
         let radiance = point.color_intensity.xyz * point.color_intensity.w
                        * falloff * inei_boost;
         lantern_light += radiance * wrapped_diffuse;
+        // Indirect multi-bounce lobe: light scattered off neighbouring
+        // surfaces still reaches faces turned away from the emitter, so a
+        // room lit by a held torch never drops to pitch black. The lobe
+        // extends slightly past the direct radius and peaks on back-facing
+        // surfaces while staying far below the direct term on lit faces.
+        let bounce_falloff = pow2(max(1.0 - distance / (radius * 1.15), 0.0));
+        let indirect_bounce = 0.14 * (0.55 + 0.45 * (1.0 - max(dot(normal, L_dir), 0.0)))
+                              * bounce_falloff;
+        lantern_light += point.color_intensity.xyz * point.color_intensity.w
+                         * indirect_bounce * inei_boost;
         // A small muted lacquer/aged-wood glint around nearby warm light.
         let half_vector = L_dir + view_dir;
         let half_vec = half_vector / max(length(half_vector), 0.0001);
@@ -2558,6 +2647,82 @@ fn fs_stained(input: StainedOutput) -> @location(0) vec4<f32> {
 }
 "#;
 
+/// Additive scrolling enchantment glint pass for enchanted items, worn
+/// armor and held tools. It consumes the exact vertex layout of
+/// [`MEGU_TERRAIN_LIT_WGSL`] (`GlintInput` mirrors `TerrainInput`), so the
+/// pass can be layered over any lit-terrain-compatible vertex stream under
+/// additive blending, and it reads time from the shared `render_params.y`
+/// day-phase field — no new uniform structs or binding slots. The shimmer
+/// math is the WGSL twin of [`enchantment_glint_rgb`].
+pub const MEGU_ENCHANT_GLINT_WGSL: &str = r#"
+struct ShadowUniforms {
+    light_view_proj: array<mat4x4<f32>, 3>,
+    camera_view_proj: mat4x4<f32>,
+    cascade_splits: vec4<f32>,
+    sun_direction: vec4<f32>,
+    sun_color: vec4<f32>,
+    moon_color: vec4<f32>,
+    camera_position: vec4<f32>,
+    camera_forward: vec4<f32>,
+    camera_right: vec4<f32>,
+    camera_up: vec4<f32>,
+    shadow_params: vec4<f32>,
+    render_params: vec4<f32>,
+    celestial_params: vec4<f32>,
+};
+@group(0) @binding(0) var<uniform> shadow: ShadowUniforms;
+
+// Same attribute layout as MEGU_TERRAIN_LIT_WGSL's TerrainInput.
+struct GlintInput {
+    @location(0) world_position: vec3<f32>,
+    @location(1) normal: vec3<f32>,
+    @location(2) albedo: vec3<f32>,
+    @location(3) light_attr: u32,
+};
+struct GlintOutput {
+    @builtin(position) position: vec4<f32>,
+    @location(0) glint_uv: vec2<f32>,
+    @location(1) facing: f32,
+};
+
+@vertex
+fn vs_main(input: GlintInput) -> GlintOutput {
+    var out: GlintOutput;
+    let clip = shadow.camera_view_proj * vec4<f32>(input.world_position, 1.0);
+    out.position = clip;
+    // Screen-space diagonal band coordinates: the glint scrolls in a
+    // stable 2D space the way the vanilla item glint overlay does.
+    out.glint_uv = clip.xy / max(clip.w, 0.0001) * vec2<f32>(0.5, -0.5)
+                   + vec2<f32>(0.5, 0.5);
+    // Fade the shimmer at grazing angles so silhouettes do not streak.
+    let to_camera = shadow.camera_position.xyz - input.world_position;
+    let view_dir = to_camera / max(length(to_camera), 0.0001);
+    out.facing = clamp(abs(dot(normalize(input.normal), view_dir)), 0.0, 1.0);
+    return out;
+}
+
+// WGSL twin of enchantment_glint_rgb: two opposing angled shimmer waves,
+// violet-lavender band, peak held at ~0.32 so textures stay readable.
+fn enchant_glint_rgb(uv: vec2<f32>, time_seconds: f32) -> vec3<f32> {
+    let wave_a = sin(6.2831853 * (uv.x + uv.y - time_seconds * 0.09));
+    let wave_b = sin(6.2831853 * (uv.x - uv.y + time_seconds * 0.06));
+    let band = (0.5 + 0.5 * wave_a) * (0.5 + 0.5 * wave_b);
+    let shimmer = band * band;
+    let m = 0.5 + 0.5 * wave_b;
+    return vec3<f32>(0.58 + 0.28 * m, 0.24 + 0.28 * m, 0.96 + 0.04 * m)
+           * shimmer * 0.32;
+}
+
+@fragment
+fn fs_main(input: GlintOutput) -> @location(0) vec4<f32> {
+    // render_params.y is the shared 0..1 day phase; *1200 turns it into
+    // the same wall-free seconds the wind sway pass already uses.
+    let time_seconds = shadow.render_params.y * 1200.0;
+    let glint = enchant_glint_rgb(input.glint_uv, time_seconds) * input.facing;
+    return vec4<f32>(glint, 1.0);
+}
+"#;
+
 /// Optional shadow casters published alongside the builtin pack. The five
 /// [`BUILTIN_SHADOW_SHADERS`] passes are always present; these two are
 /// wired only when the scene actually has cutout or stained-glass casters,
@@ -2673,5 +2838,166 @@ mod realism_wgsl_tests {
             );
             assert!((0.35..=1.0).contains(&factor));
         }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Tests
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn dynamic_light_bounce_never_leaves_back_faces_pitch_black() {
+        // A surface facing the light is far brighter than one turned away,
+        // yet the back-facing surface still catches indirect bounce light.
+        let (face_direct, face_bounce) = dynamic_light_direct_and_bounce(1.0, 2.0, 8.0);
+        let (back_direct, back_bounce) = dynamic_light_direct_and_bounce(-1.0, 2.0, 8.0);
+        assert!(face_direct > 0.0);
+        assert!(face_direct + face_bounce > back_direct + back_bounce);
+        assert_eq!(back_direct, 0.0, "wrapped diffuse dies past n_dot_l = -0.28");
+        assert!(back_bounce > 0.0, "bounce must never collapse to 0.0 in radius");
+        assert!(back_bounce > face_bounce, "bounce peaks on back-facing surfaces");
+
+        // Past the direct radius but inside the extended bounce reach, only
+        // the indirect lobe survives.
+        let (direct, bounce) = dynamic_light_direct_and_bounce(-1.0, 8.5, 8.0);
+        assert_eq!(direct, 0.0);
+        assert!(bounce > 0.0);
+
+        // At and beyond radius * 1.15 the contribution is exactly zero.
+        assert_eq!(dynamic_light_direct_and_bounce(-1.0, 8.0 * 1.15, 8.0), (0.0, 0.0));
+        assert_eq!(dynamic_light_direct_and_bounce(1.0, 20.0, 8.0), (0.0, 0.0));
+        // A degenerate/non-finite radius or distance fails closed, never NaN.
+        assert_eq!(dynamic_light_direct_and_bounce(1.0, 2.0, 0.0), (0.0, 0.0));
+        assert_eq!(
+            dynamic_light_direct_and_bounce(0.5, f32::NAN, 8.0),
+            (0.0, 0.0)
+        );
+        for bad in [f32::NAN, f32::INFINITY, f32::NEG_INFINITY] {
+            let (d, b) = dynamic_light_direct_and_bounce(bad, 2.0, 8.0);
+            assert!(d.is_finite() && b.is_finite() && d >= 0.0 && b >= 0.0);
+            let (d, b) = dynamic_light_direct_and_bounce(1.0, 2.0, bad);
+            assert!(d.is_finite() && b.is_finite() && d >= 0.0 && b >= 0.0);
+        }
+    }
+
+    #[test]
+    fn terrain_wgsl_bounce_lobe_keeps_bindings_and_direct_term() {
+        let terrain = MEGU_TERRAIN_LIT_WGSL;
+        for needle in [
+            "let bounce_falloff = pow2(max(1.0 - distance / (radius * 1.15), 0.0));",
+            "let indirect_bounce = 0.14 * (0.55 + 0.45 * (1.0 - max(dot(normal, L_dir), 0.0)))",
+            "* indirect_bounce * inei_boost;",
+            // The crisp direct term is untouched.
+            "(dot(normal, L_dir) + wrap) / (1.0 + wrap)",
+            "lantern_light += radiance * wrapped_diffuse;",
+        ] {
+            assert!(terrain.contains(needle), "terrain WGSL missing {needle}");
+        }
+        assert_eq!(
+            terrain.matches("@binding(").count(),
+            4,
+            "no new uniform bindings allowed"
+        );
+        assert!(terrain.contains("array<PointLight, 64>"));
+    }
+
+    #[test]
+    fn enchantment_glint_is_finite_subtle_violet_and_animated() {
+        let mut varies_across_uv = false;
+        let mut max = [0.0f32; 3];
+        let base = enchantment_glint_rgb([0.3, 0.6], 4.0);
+        for u in [0.0, 0.25, 0.5, 0.9, 1.7, -0.4] {
+            for v in [0.0, 0.35, 0.8, -1.2] {
+                for t in [0.0, 1.37, 42.0, -3.0] {
+                    let c = enchantment_glint_rgb([u, v], t);
+                    assert!(
+                        c.iter().all(|x| x.is_finite() && *x >= 0.0),
+                        "glint must stay finite and non-negative: {c:?}"
+                    );
+                    for (i, &x) in c.iter().enumerate() {
+                        max[i] = max[i].max(x);
+                    }
+                    if c != base {
+                        varies_across_uv = true;
+                    }
+                }
+            }
+        }
+        // Subtle ceiling: never washes the texture out (peak ~0.32), and the
+        // violet-lavender tint band is never exceeded.
+        assert!(max[0] <= 0.86 * 0.32 + 1e-6, "red channel cap: {max:?}");
+        assert!(max[1] <= 0.52 * 0.32 + 1e-6, "green channel cap: {max:?}");
+        assert!(max[2] <= 0.32 + 1e-6, "blue channel cap: {max:?}");
+        assert!(max[2] > 0.0, "the shimmer band lights up somewhere");
+        assert!(varies_across_uv, "glint must vary over the surface");
+        assert_ne!(
+            enchantment_glint_rgb([0.3, 0.6], 4.5),
+            base,
+            "glint must scroll with time"
+        );
+        // Non-finite inputs fail closed to a finite glint.
+        for bad in [f32::NAN, f32::INFINITY, f32::NEG_INFINITY] {
+            for c in [
+                enchantment_glint_rgb([bad, 0.5], 1.0),
+                enchantment_glint_rgb([0.5, bad], 1.0),
+                enchantment_glint_rgb([0.5, 0.5], bad),
+            ] {
+                assert!(c.iter().all(|x| x.is_finite() && *x >= 0.0));
+            }
+        }
+    }
+
+    #[test]
+    fn enchant_glint_wgsl_mirrors_helper_and_reuses_terrain_layout() {
+        let glint = MEGU_ENCHANT_GLINT_WGSL;
+        // Balanced delimiters, same as the pack's WGSL syntax audit.
+        let mut brackets = Vec::new();
+        for ch in glint.chars() {
+            match ch {
+                '{' | '(' | '[' => brackets.push(ch),
+                '}' => assert_eq!(brackets.pop(), Some('{')),
+                ')' => assert_eq!(brackets.pop(), Some('(')),
+                ']' => assert_eq!(brackets.pop(), Some('[')),
+                _ => {}
+            }
+        }
+        assert!(brackets.is_empty(), "unclosed WGSL delimiter");
+        for needle in [
+            "@group(0) @binding(0) var<uniform> shadow: ShadowUniforms;",
+            "shadow.render_params.y * 1200.0",
+            "fn vs_main(",
+            "fn fs_main(",
+            "fn enchant_glint_rgb(",
+            // Same vertex layout as MEGU_TERRAIN_LIT_WGSL's TerrainInput.
+            "@location(0) world_position: vec3<f32>",
+            "@location(1) normal: vec3<f32>",
+            "@location(2) albedo: vec3<f32>",
+            "@location(3) light_attr: u32",
+            // Same shimmer constants as the pure Rust helper.
+            "vec3<f32>(0.58 + 0.28 * m, 0.24 + 0.28 * m, 0.96 + 0.04 * m)",
+        ] {
+            assert!(glint.contains(needle), "glint WGSL missing {needle}");
+        }
+        // One shared uniform binding: zero new uniform structs or slots.
+        assert_eq!(glint.matches("@binding(").count(), 1);
+        assert_eq!(glint.matches("@group(0)").count(), 1);
+        // The ShadowUniforms field list is byte-identical to the terrain pass.
+        fn field_block(src: &str) -> &str {
+            src.split("struct ShadowUniforms {")
+                .nth(1)
+                .unwrap()
+                .split("};")
+                .next()
+                .unwrap()
+        }
+        assert_eq!(
+            field_block(MEGU_TERRAIN_LIT_WGSL),
+            field_block(glint),
+            "glint pass must share the terrain uniform layout"
+        );
     }
 }

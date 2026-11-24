@@ -40,8 +40,8 @@ use crate::vanilla_plus_3d::{
     build_3d_crop_mesh, build_3d_cross_mesh, build_3d_crystal_mesh, build_3d_fixture_mesh,
     build_3d_ladder_mesh, build_3d_moon_mesh, build_3d_ore_relief, build_3d_rail_mesh,
     build_3d_sun_mesh, vanilla_plus_decision, BlockModelHint, Crop3dSpec, CrossLayout,
-    CrystalStage, ExtrudedMesh, FixtureKind, MeshUpgradeDecision, RailShape, VanillaPlus3dConfig,
-    VanillaPlusCategory,
+    CrystalStage, ExtrudedMesh, ExtrudedQuad, FixtureKind, MeshUpgradeDecision, RailShape,
+    VanillaPlus3dConfig, VanillaPlusCategory,
 };
 use crate::vanilla_plus_nature::{
     classify_leaf_block, classify_wind_sway_block, LeafParticleStyle, NatureModRegistry,
@@ -531,7 +531,18 @@ fn build_upgrade_mesh(input: &BlockVisualInput, category: VanillaPlusCategory) -
                 build_3d_rail_mesh(input.rail_shape, input.rail_powered)
             }
         }
-        VanillaPlusCategory::FixturesAndChains => build_3d_fixture_mesh(fixture_kind_for(path)),
+        VanillaPlusCategory::FixturesAndChains => {
+            let kind = fixture_kind_for(path);
+            let mut mesh = build_3d_fixture_mesh(kind);
+            // Torch-family ids get the flame-tip emissive split: only the
+            // glowing head is tagged, the wooden shaft stays shaded.
+            if kind == FixtureKind::Torch {
+                if let Some(flame) = torch_flame_kind(path) {
+                    tag_torch_flame_tip_quads(&mut mesh, flame);
+                }
+            }
+            mesh
+        }
         VanillaPlusCategory::Celestial3d => {
             if path == "moon" {
                 build_3d_moon_mesh(input.moon_phase)
@@ -618,6 +629,148 @@ fn fixture_kind_for(path: &str) -> FixtureKind {
     } else {
         FixtureKind::Torch
     }
+}
+
+// ---------------------------------------------------------------------------
+// Torch flame-tip emissive split
+// ---------------------------------------------------------------------------
+
+/// `tint_index` marker stamped on the emissive flame-tip quads of a warm
+/// torch upgrade mesh, so a dynamic-light hook can drive the glowing head
+/// at full `block_light` while the wooden shaft stays ordinarily shaded.
+/// Distinct from [`crate::vanilla_plus_visuals::RELIEF_TINT_EMISSIVE`] so
+/// consumers can pick the per-family flame tint.
+pub const TORCH_FLAME_WARM_TINT_INDEX: i32 = 80;
+/// `tint_index` marker for soul-torch cyan flame-tip quads.
+pub const TORCH_FLAME_SOUL_TINT_INDEX: i32 = 81;
+/// `tint_index` marker for redstone-torch ember flame-tip quads.
+pub const TORCH_FLAME_REDSTONE_TINT_INDEX: i32 = 82;
+
+/// Full vanilla emissive brightness carried by the tagged flame-tip quads:
+/// only the glowing head radiates; the shaft keeps ambient shading.
+pub const TORCH_FLAME_BLOCK_LIGHT: u8 = 15;
+
+/// Torch flame family for the emissive tip marking — warm coal flame,
+/// soul cyan, or redstone ember.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TorchFlameKind {
+    /// Ordinary torch / wall torch: warm incandescent flame.
+    Warm,
+    /// Soul torch: quiet cyan-blue flame.
+    Soul,
+    /// Redstone torch: deep ember-red tip.
+    Redstone,
+}
+
+impl TorchFlameKind {
+    /// `tint_index` marker stamped on the flame-tip quads by
+    /// [`tag_torch_flame_tip_quads`].
+    pub const fn tint_index(self) -> i32 {
+        match self {
+            Self::Warm => TORCH_FLAME_WARM_TINT_INDEX,
+            Self::Soul => TORCH_FLAME_SOUL_TINT_INDEX,
+            Self::Redstone => TORCH_FLAME_REDSTONE_TINT_INDEX,
+        }
+    }
+
+    /// Linear-space RGB highlight tint of the flame tip in `0..=1`.
+    pub const fn flame_rgb(self) -> [f32; 3] {
+        match self {
+            Self::Warm => [1.0, 0.58, 0.20],
+            Self::Soul => [0.35, 0.85, 0.90],
+            Self::Redstone => [1.0, 0.22, 0.10],
+        }
+    }
+}
+
+/// Inverse of [`TorchFlameKind::tint_index`]: the flame family a stamped
+/// `tint_index` marks, or `None` for ordinary tags.
+pub fn torch_flame_tint_kind(tint_index: i32) -> Option<TorchFlameKind> {
+    [
+        TorchFlameKind::Warm,
+        TorchFlameKind::Soul,
+        TorchFlameKind::Redstone,
+    ]
+    .into_iter()
+    .find(|kind| kind.tint_index() == tint_index)
+}
+
+/// Classifies a torch-family block id (path only, namespace stripped) into
+/// its flame family: `soul*torch*` → [`TorchFlameKind::Soul`],
+/// `redstone*torch*` → [`TorchFlameKind::Redstone`], every other `*torch`
+/// → [`TorchFlameKind::Warm`]. Non-torch ids return `None` — lanterns are
+/// meshed as full glowing bodies and need no tip split.
+pub fn torch_flame_kind(block_id: &str) -> Option<TorchFlameKind> {
+    let path = block_path(block_id);
+    if path != "torch" && !path.ends_with("_torch") {
+        return None;
+    }
+    Some(if path.contains("soul") {
+        TorchFlameKind::Soul
+    } else if path.contains("redstone") {
+        TorchFlameKind::Redstone
+    } else {
+        TorchFlameKind::Warm
+    })
+}
+
+/// Whether one quad of a torch [`ExtrudedMesh`] belongs to the glowing
+/// flame head rather than the wooden stick shaft. The fixture builder
+/// tags the slightly wider head box `tint_index = 0` (shaft `-1`), and an
+/// already-stamped flame marker also counts; for untagged meshes a
+/// geometric fallback detects the head: every vertex sits above the
+/// `10/16` stick top region and the quad's footprint reaches wider than
+/// the `2/16` stick cross-section.
+pub fn is_torch_flame_tip_quad(quad: &ExtrudedQuad) -> bool {
+    if quad.tint_index == 0 || torch_flame_tint_kind(quad.tint_index).is_some() {
+        return true;
+    }
+    let mut above_shaft = true;
+    let mut wider_than_shaft = false;
+    for p in quad.positions {
+        above_shaft &= p[1] > 0.60;
+        wider_than_shaft |= (p[0] - 0.5).abs() > 0.09 || (p[2] - 0.5).abs() > 0.09;
+    }
+    above_shaft && wider_than_shaft
+}
+
+/// Restamps every flame-tip quad of a torch upgrade mesh with `kind`'s
+/// emissive `tint_index` marker (see [`TorchFlameKind::tint_index`]). Only
+/// the glowing head is tagged — the handle quads keep their untinted `-1`
+/// tag so they render shaded by the surrounding ambient and block light
+/// instead of glowing like a neon stick.
+pub fn tag_torch_flame_tip_quads(mesh: &mut ExtrudedMesh, kind: TorchFlameKind) {
+    for quad in &mut mesh.quads {
+        if is_torch_flame_tip_quad(quad) {
+            quad.tint_index = kind.tint_index();
+        }
+    }
+}
+
+/// World-space offset within a `[0, 1]^3` block cell to the glowing flame
+/// tip of a standing (`wall_facing = None`) or wall-mounted torch
+/// (`Some(0)=north, 1=south, 2=west, 3=east`, matching vanilla facing).
+///
+/// A standing torch burns at the exact centre of its flame head — `[0.5,
+/// 0.625, 0.5]`, `10/16` up the stick. A wall torch leans into its mounted
+/// wall, so the tip offsets `0.27` blocks toward the wall (the side
+/// opposite `facing`, exactly where vanilla spawns the flame particles)
+/// and sits at the tilted tip height `y = 0.72`. Horizontal axes are
+/// clamped into `[0.1, 0.9]`; an unrecognised facing code falls back to a
+/// centred wall-torch tip.
+pub fn torch_flame_world_offset(wall_facing: Option<u8>) -> [f32; 3] {
+    let Some(facing) = wall_facing else {
+        return [0.5, 0.625, 0.5];
+    };
+    // 0.27 toward the mounted wall = opposite of the vanilla facing.
+    let (x, z): (f32, f32) = match facing {
+        0 => (0.5, 0.5 + 0.27), // faces north (-z); wall to the south
+        1 => (0.5, 0.5 - 0.27), // faces south (+z); wall to the north
+        2 => (0.5 + 0.27, 0.5), // faces west (-x); wall to the east
+        3 => (0.5 - 0.27, 0.5), // faces east (+x); wall to the west
+        _ => (0.5, 0.5),
+    };
+    [x.clamp(0.1, 0.9), 0.72, z.clamp(0.1, 0.9)]
 }
 
 // ---------------------------------------------------------------------------
@@ -912,4 +1065,192 @@ pub fn humanoid_skin_layer_parts(
             }
         })
         .collect()
+}
+
+// ---------------------------------------------------------------------------
+// Tests
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn enabled_cfg() -> VanillaPlusPipelineConfig {
+        let mut cfg = VanillaPlusPipelineConfig::default();
+        cfg.three_d.enabled = true;
+        cfg
+    }
+
+    fn torch_upgrade_mesh(block_id: &str) -> ExtrudedMesh {
+        evaluate_block_visual_pipeline(
+            &BlockVisualInput {
+                block_id,
+                distance_sq: 9.0,
+                ..Default::default()
+            },
+            &enabled_cfg(),
+            &NatureModRegistry::new(),
+        )
+        .upgrade_mesh
+        .expect("torch upgrade mesh")
+    }
+
+    #[test]
+    fn standing_torch_flame_tip_sits_at_the_ten_sixteenth_centre() {
+        assert_eq!(torch_flame_world_offset(None), [0.5, 0.625, 0.5]);
+    }
+
+    #[test]
+    fn wall_torch_flame_tip_leans_toward_the_mounted_wall() {
+        let standing = torch_flame_world_offset(None);
+        let mut seen = Vec::new();
+        for facing in 0u8..4 {
+            let tip = torch_flame_world_offset(Some(facing));
+            seen.push(tip);
+            // Tilted tip height, inside the block cell, and distinct from
+            // the standing flame origin.
+            assert!((tip[1] - 0.72).abs() < 1e-6);
+            assert!(tip[0] != 0.5 || tip[2] != 0.5);
+            assert_ne!(tip, standing);
+            for &c in &[tip[0], tip[1], tip[2]] {
+                assert!((0.0..=1.0).contains(&c), "tip escapes the cell: {tip:?}");
+            }
+            assert!((0.1..=0.9).contains(&tip[0]) && (0.1..=0.9).contains(&tip[2]));
+        }
+        // Each mounted wall produces a distinct lean direction.
+        for (i, a) in seen.iter().enumerate() {
+            for b in &seen[i + 1..] {
+                assert_ne!(a, b);
+            }
+        }
+        // Vanilla semantics: the tip moves toward the wall, i.e. opposite
+        // the torch's facing direction.
+        assert!(seen[0][2] > 0.5, "north-facing leans south, toward the wall");
+        assert!(seen[1][2] < 0.5, "south-facing leans north, toward the wall");
+        assert!(seen[2][0] > 0.5, "west-facing leans east, toward the wall");
+        assert!(seen[3][0] < 0.5, "east-facing leans west, toward the wall");
+        // An unknown facing code stays inside the cell at the wall height.
+        let fallback = torch_flame_world_offset(Some(9));
+        assert!((0.1..=0.9).contains(&fallback[0]));
+        assert!((0.1..=0.9).contains(&fallback[2]));
+        assert!((fallback[1] - 0.72).abs() < 1e-6);
+    }
+
+    #[test]
+    fn torch_fixture_mesh_separates_six_flame_quads_from_the_shaft() {
+        let mesh = build_3d_fixture_mesh(FixtureKind::Torch);
+        assert_eq!(mesh.quads.len(), 12);
+        let flame: Vec<&ExtrudedQuad> = mesh
+            .quads
+            .iter()
+            .filter(|q| is_torch_flame_tip_quad(q))
+            .collect();
+        // Exactly one box worth of faces (six) is the glowing head.
+        assert_eq!(flame.len(), 6);
+        // Every flame vertex floats above the shaft top; every shaft quad
+        // has at least one vertex at or below it.
+        for quad in flame {
+            assert!(quad.positions.iter().all(|p| p[1] > 0.60));
+        }
+        let shaft: Vec<&ExtrudedQuad> = mesh
+            .quads
+            .iter()
+            .filter(|q| !is_torch_flame_tip_quad(q))
+            .collect();
+        assert_eq!(shaft.len(), 6);
+        for quad in shaft {
+            assert!(quad.positions.iter().all(|p| p[0] >= 0.44 - 1e-6
+                && p[0] <= 0.56 + 1e-6
+                && p[2] >= 0.44 - 1e-6
+                && p[2] <= 0.56 + 1e-6));
+        }
+        // The standing tip offset sits inside the flame head bounds.
+        let tip = torch_flame_world_offset(None);
+        let (mut lo, mut hi) = ([f32::MAX; 3], [f32::MIN; 3]);
+        for quad in mesh.quads.iter().filter(|q| is_torch_flame_tip_quad(q)) {
+            for p in quad.positions {
+                for axis in 0..3 {
+                    lo[axis] = lo[axis].min(p[axis]);
+                    hi[axis] = hi[axis].max(p[axis]);
+                }
+            }
+        }
+        for axis in 0..3 {
+            assert!(tip[axis] >= lo[axis] && tip[axis] <= hi[axis],
+                "tip {tip:?} outside head bounds {lo:?}..{hi:?}");
+        }
+    }
+
+    #[test]
+    fn torch_upgrade_mesh_tags_only_the_flame_tip_as_emissive() {
+        for (block_id, kind) in [
+            ("minecraft:torch", TorchFlameKind::Warm),
+            ("minecraft:wall_torch", TorchFlameKind::Warm),
+            ("minecraft:soul_torch", TorchFlameKind::Soul),
+            ("minecraft:soul_wall_torch", TorchFlameKind::Soul),
+            ("minecraft:redstone_torch", TorchFlameKind::Redstone),
+            ("minecraft:redstone_wall_torch", TorchFlameKind::Redstone),
+        ] {
+            let mesh = torch_upgrade_mesh(block_id);
+            let tagged = mesh
+                .quads
+                .iter()
+                .filter(|q| q.tint_index == kind.tint_index())
+                .count();
+            assert_eq!(tagged, 6, "{block_id} must tag exactly the head box");
+            // The wooden shaft is never emissive-tagged: it stays shaded.
+            let other = mesh
+                .quads
+                .iter()
+                .filter(|q| q.tint_index != kind.tint_index())
+                .count();
+            assert_eq!(other, 6);
+            assert!(mesh
+                .quads
+                .iter()
+                .filter(|q| q.tint_index != kind.tint_index())
+                .all(|q| q.tint_index == -1));
+            // Every flame quad is recognisable to the light hook, and the
+            // family tint round-trips through the marker.
+            for quad in &mesh.quads {
+                if quad.tint_index == kind.tint_index() {
+                    assert!(is_torch_flame_tip_quad(quad));
+                    assert_eq!(
+                        torch_flame_tint_kind(quad.tint_index),
+                        Some(kind)
+                    );
+                }
+            }
+        }
+        assert_eq!(TORCH_FLAME_BLOCK_LIGHT, 15);
+        for kind in [
+            TorchFlameKind::Warm,
+            TorchFlameKind::Soul,
+            TorchFlameKind::Redstone,
+        ] {
+            assert!(kind.flame_rgb().iter().all(|c| (0.0..=1.0).contains(c)));
+        }
+        assert!(TorchFlameKind::Soul.flame_rgb()[2] > TorchFlameKind::Warm.flame_rgb()[2]);
+    }
+
+    #[test]
+    fn torch_flame_kind_only_claims_torch_ids() {
+        assert_eq!(
+            torch_flame_kind("minecraft:torch"),
+            Some(TorchFlameKind::Warm)
+        );
+        assert_eq!(
+            torch_flame_kind("minecraft:lantern"),
+            None,
+            "lanterns glow as full bodies, not tips"
+        );
+        assert_eq!(torch_flame_kind("minecraft:torchflower"), None);
+        assert_eq!(torch_flame_kind("minecraft:torchflower_crop"), None);
+        assert_eq!(torch_flame_kind("minecraft:chain"), None);
+        assert_eq!(torch_flame_kind(""), None);
+        assert_eq!(
+            torch_flame_kind("somemod:netherite_torch"),
+            Some(TorchFlameKind::Warm)
+        );
+    }
 }
