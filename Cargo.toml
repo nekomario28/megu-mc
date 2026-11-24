@@ -69,6 +69,7 @@ create-adapter = { path = "create-adapter", optional = true }
 # `megu-core` is a default dependency: `worldgen`'s `bg_scope!` batches run on
 # its resident `MeguTaskPool` in every build, not only under `mod-suite`.
 megu-core = { path = "core" }
+megu-server-files = { path = "server-files" }
 megu-state-store = { path = "state-store", optional = true }
 mod-offload = { path = "mod-offload", optional = true }
 ureq = { version = "3.4.2", features = ["rustls"] }

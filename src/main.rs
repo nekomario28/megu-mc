@@ -38,6 +38,7 @@ mod trace_env;
 mod tree;
 mod world_rng;
 mod worldgen;
+use megu_server_files::server_tui::*;
 include!("paletted.rs");
 include!("server_config.rs");
 include!("server_ops.rs");
@@ -919,6 +920,7 @@ fn environment_time_tick() {
             let exhaustion = player_movement_exhaustion(c, (px, py, pz));
             let mut h = c.hp.lock().unwrap_or_else(|e| e.into_inner());
             let mut dirty = tick_player_food(c, &mut h, max_hp_of(&c.name), exhaustion, t);
+            let mut lethal_damage_type: Option<&str> = None;
             if *h <= 0.0 {
                 drop(h);
                 totem_check(c);
@@ -947,6 +949,7 @@ fn environment_time_tick() {
                     && GR_DROWNING_DAMAGE.load(Ordering::Relaxed) != 0
                 {
                     *h = (*h - 2.0).max(0.0);
+                    lethal_damage_type = Some("drown");
                     dirty = true;
                     // vanilla: environmental damage arms the same timer, so a melee hit in
                     // the next ten ticks is measured against this amount
@@ -973,6 +976,7 @@ fn environment_time_tick() {
                     && player_in_lava(player_dim, px, py, pz, sneaking, fall_fly);
                 if in_lava && t.is_multiple_of(server_ticks(10)) {
                     *h = (*h - 4.0 * (1.0 - 0.04 * enchant_epf(c, 4) as f32)).max(0.0);
+                    lethal_damage_type = Some("lava");
                     dirty = true;
                     // vanilla: environmental damage arms the same timer, so a melee hit in
                     // the next ten ticks is measured against this amount
@@ -999,6 +1003,7 @@ fn environment_time_tick() {
                     ) == fst);
                 if in_fire && t.is_multiple_of(server_ticks(20)) {
                     *h = (*h - 1.0 * (1.0 - 0.04 * enchant_epf(c, 4) as f32)).max(0.0);
+                    lethal_damage_type = Some("in_fire");
                     dirty = true;
                     // vanilla: environmental damage arms the same timer, so a melee hit in
                     // the next ten ticks is measured against this amount
@@ -1040,6 +1045,7 @@ fn environment_time_tick() {
                         && GR_FREEZE_DAMAGE.load(Ordering::Relaxed) != 0
                     {
                         *h = (*h - 1.0).max(0.0);
+                        lethal_damage_type = Some("freeze");
                         dirty = true;
                         // vanilla: environmental damage arms the same timer, so a melee hit in
                         // the next ten ticks is measured against this amount
@@ -1056,6 +1062,7 @@ fn environment_time_tick() {
                 // void: 4hp per 0.5s below y=-64, ignores armor (vanilla)
                 if py < -64.0 && t.is_multiple_of(server_ticks(10)) {
                     *h = (*h - 4.0).max(0.0);
+                    lethal_damage_type = Some("out_of_world");
                     dirty = true;
                     // vanilla: environmental damage arms the same timer, so a melee hit in
                     // the next ten ticks is measured against this amount
@@ -1077,6 +1084,7 @@ fn environment_time_tick() {
                     );
                     if hb != u32::MAX && !mob_passable(hb) {
                         *h = (*h - 1.0).max(0.0);
+                        lethal_damage_type = Some("in_wall");
                         dirty = true;
                         // vanilla: environmental damage arms the same timer, so a melee hit in
                         // the next ten ticks is measured against this amount
@@ -1101,6 +1109,7 @@ fn environment_time_tick() {
                             .any(|&[dx, dz]| block_at(bx + dx, py.floor() as i32, bz + dz) == cst);
                     if near_cactus {
                         *h = (*h - 1.0).max(0.0);
+                        lethal_damage_type = Some("cactus");
                         dirty = true;
                         // vanilla: environmental damage arms the same timer, so a melee hit in
                         // the next ten ticks is measured against this amount
@@ -1120,6 +1129,7 @@ fn environment_time_tick() {
                         && block_at(bx, (py - 0.5).floor() as i32, bz) == mst;
                     if on_magma {
                         *h = (*h - 1.0 * (1.0 - 0.04 * enchant_epf(c, 4) as f32)).max(0.0);
+                        lethal_damage_type = Some("hot_floor");
                         dirty = true;
                         // vanilla: environmental damage arms the same timer, so a melee hit in
                         // the next ten ticks is measured against this amount
@@ -1138,6 +1148,7 @@ fn environment_time_tick() {
                         && block_at(bx, py.floor() as i32, bz) == bst
                     {
                         *h = (*h - 0.5).max(0.0);
+                        lethal_damage_type = Some("sweet_berry_bush");
                         dirty = true;
                         // vanilla: environmental damage arms the same timer, so a melee hit in
                         // the next ten ticks is measured against this amount
@@ -1155,6 +1166,10 @@ fn environment_time_tick() {
             if dirty {
                 let health = *h;
                 drop(h);
+                if health <= 0.0 {
+                    drop_player_items_on_death(c);
+                    player_death_broadcast(c.name.as_str(), lethal_damage_type.unwrap_or("starve"));
+                }
                 let packet = health_pkt_c(health, c);
                 if let Ok(mut w) = c.sock.lock() {
                     let _ = send_packet(&mut w, 0x5d, packet);
@@ -9651,10 +9666,7 @@ fn elytra_wall_collision_tick(client: &Arc<Client>, dim: DimId, x: f64, y: f64, 
             broadcast_entity_sound(client.eid, "minecraft:entity.player.hurt", 5);
             if *client.hp.lock().unwrap_or_else(|e| e.into_inner()) <= 0.0 {
                 drop_player_items_on_death(client);
-                if GR_SHOW_DEATH_MESSAGES.load(Ordering::Relaxed) != 0 {
-                    let line = system_chat(&format!("{} experienced kinetic energy", client.name));
-                    broadcast(0, |_observer| (0x6c, line.clone()));
-                }
+                player_death_broadcast(&client.name, "fly_into_wall");
             }
         }
     }
@@ -20473,6 +20485,19 @@ fn game_tick(mut step: impl FnMut(&'static str, fn())) {
     // frozen, so `/tick freeze` (or a skipped tick) cannot strand journaled
     // edits in RAM past the next save boundary. No-op while empty/disarmed.
     dwal_flush_pending();
+    let online_players = client_snapshot().len();
+    if lifecycle_on_tick(Instant::now(), online_players) == LifecycleAction::SaveAndHibernate {
+        save_world();
+        eprintln!("[sleep] SLEEPING until a player joins (wake-on-join)");
+    }
+    if server_lifecycle()
+        .lock()
+        .unwrap_or_else(|error| error.into_inner())
+        .state()
+        == LifecycleState::Sleeping
+    {
+        return;
+    }
     // `/tick freeze` skips world ticks unless `/tick step` or `/tick sprint`
     // queued budget; a sprint always runs. The default is unfrozen, so callers
     // (including tests) that never froze see no change.
@@ -20631,7 +20656,13 @@ OPTIONS:
     --port <u16>     Listen port (default: 25565; [server] port in server.toml
                      or MEGU_PORT can also set it).
     --bind <addr>    Bind address (default: 127.0.0.1; MEGU_BIND_ADDR).
-    --no-banner      Suppress the interactive startup banner.
+    --cli, --plain, --no-tui, --nogui
+                     Keep plain stdio logs; never start the dashboard.
+    --tui             Request the dashboard on a capable interactive terminal.
+    --no-banner       Suppress the startup banner.
+    --ascii           Use ASCII dashboard glyphs.
+    --log-filter <events|alerts|all>
+                     Choose the dashboard log filter (default: events).
     -V, --version    Print the version and exit.
     -h, --help       Print this help and exit.
 
@@ -20661,8 +20692,18 @@ Let's blow past 20 TPS!
 /// environment the listener already reads — set before `server_config_boot`, so a
 /// `server.toml` fill-in cannot override them.
 fn parse_startup_flags() -> Vec<String> {
+    let all_args: Vec<String> = std::env::args().skip(1).collect();
+    let (console_options, filtered_args) = ConsoleModeOptions::from_args(&all_args);
+    if filtered_args.iter().any(|arg| arg == "--log-filter" || arg.starts_with("--log-filter=")) {
+        eprintln!("megu: --log-filter requires events, alerts, or all (see --help)");
+        std::process::exit(2);
+    }
+    let _ = CONSOLE_OPTIONS.set(console_options.clone());
+    if console_options.no_banner {
+        std::env::set_var("MEGU_NO_BANNER", "1");
+    }
     let mut rest = Vec::new();
-    let mut args = std::env::args().skip(1);
+    let mut args = filtered_args.into_iter();
     while let Some(arg) = args.next() {
         if arg == "-h" || arg == "--help" {
             print!("{MEGU_CLI_USAGE}");
@@ -20670,10 +20711,6 @@ fn parse_startup_flags() -> Vec<String> {
         } else if arg == "-V" || arg == "--version" {
             println!("{MEGU_VERSION_LINE}");
             std::process::exit(0);
-        } else if arg == "--no-banner" {
-            // Set rather than returned: the banner gate reads one place, and a
-            // server the launcher spawns inherits the same suppression.
-            std::env::set_var("MEGU_NO_BANNER", "1");
         } else if arg == "--dir" || arg.starts_with("--dir=") {
             let dir = if arg == "--dir" {
                 match args.next() {
@@ -20732,6 +20769,138 @@ fn parse_startup_flags() -> Vec<String> {
     rest
 }
 
+static CONSOLE_OPTIONS: OnceLock<ConsoleModeOptions> = OnceLock::new();
+static LIVE_TUI: OnceLock<Arc<Mutex<ServerTuiState>>> = OnceLock::new();
+
+fn console_options() -> &'static ConsoleModeOptions {
+    CONSOLE_OPTIONS.get_or_init(ConsoleModeOptions::default)
+}
+
+fn resolved_console_mode() -> ServerConsoleMode {
+    resolve_console_mode_env(console_options())
+}
+
+static SERVER_LIFECYCLE: OnceLock<Mutex<ServerLifecycleController>> = OnceLock::new();
+
+fn server_lifecycle() -> &'static Mutex<ServerLifecycleController> {
+    SERVER_LIFECYCLE.get_or_init(|| {
+        let idle_secs = std::env::var("MEGU_IDLE_SLEEP_SECS")
+            .ok()
+            .and_then(|value| value.parse::<u64>().ok())
+            .unwrap_or(300);
+        Mutex::new(ServerLifecycleController::new(idle_secs, None))
+    })
+}
+
+fn lifecycle_on_tick(now: Instant, online_players: usize) -> LifecycleAction {
+    server_lifecycle()
+        .lock()
+        .unwrap_or_else(|error| error.into_inner())
+        .update(now, online_players)
+}
+
+fn lifecycle_wake_on_join() -> LifecycleAction {
+    server_lifecycle()
+        .lock()
+        .unwrap_or_else(|error| error.into_inner())
+        .on_incoming_login_attempt("incoming", true)
+}
+
+fn player_death_broadcast(victim: &str, damage_type: &str) {
+    if GR_SHOW_DEATH_MESSAGES.load(Ordering::Relaxed) == 0 {
+        return;
+    }
+    let line = system_chat(&format_vanilla_death_message(victim, damage_type, None, None));
+    broadcast(-1, |_| (0x6c, line.clone()));
+}
+
+#[cfg(test)]
+mod main_admin_tui_wire_tests {
+    use super::*;
+
+    #[test]
+    fn console_cli_and_tui_flags_parse_and_resolve_fail_closed() {
+        let args = [
+            "--cli",
+            "--nogui",
+            "--tui",
+            "--no-banner",
+            "--log-filter",
+            "alerts",
+            "--ascii",
+            "--port",
+            "25570",
+        ]
+        .map(str::to_owned);
+        let (options, rest) = ConsoleModeOptions::from_args(&args);
+        assert!(options.force_cli);
+        assert!(options.force_tui);
+        assert!(options.no_banner);
+        assert!(options.ascii_only);
+        assert_eq!(options.log_filter, LogFilterMode::Alerts);
+        assert_eq!(rest, ["--port", "25570"]);
+        assert_eq!(
+            resolve_console_mode(&options, true, true, Some("xterm-256color"), false),
+            ServerConsoleMode::PlainCli
+        );
+
+        let (tui_options, rest) = ConsoleModeOptions::from_args(&[
+            "--tui".to_owned(),
+            "--log-filter=all".to_owned(),
+        ]);
+        assert!(rest.is_empty());
+        assert_eq!(tui_options.log_filter, LogFilterMode::All);
+        assert_eq!(
+            resolve_console_mode(
+                &tui_options,
+                true,
+                true,
+                Some("xterm-256color"),
+                false,
+            ),
+            ServerConsoleMode::Tui
+        );
+        assert_eq!(
+            resolve_console_mode(
+                &tui_options,
+                false,
+                true,
+                Some("xterm-256color"),
+                false,
+            ),
+            ServerConsoleMode::PlainCli
+        );
+    }
+
+    #[test]
+    fn lifecycle_controller_sleeps_when_empty_and_wakes_on_join() {
+        let now = Instant::now();
+        let mut controller = ServerLifecycleController::new(3, None);
+        assert_eq!(controller.update(now, 0), LifecycleAction::None);
+        assert_eq!(
+            controller.update(now + Duration::from_secs(3), 0),
+            LifecycleAction::SaveAndHibernate
+        );
+        assert_eq!(controller.state(), LifecycleState::Sleeping);
+        assert_eq!(
+            controller.on_incoming_login_attempt("player", true),
+            LifecycleAction::WakeWorld
+        );
+        assert_eq!(controller.state(), LifecycleState::Running);
+    }
+
+    #[test]
+    fn elytra_wall_lethal_hit_formats_vanilla_kinetic_death_message() {
+        let damage = elytra_wall_impact_damage(true, 2.0, 0.0, true)
+            .expect("wall collision causes Elytra impact damage");
+        assert!(damage > 0.0);
+        assert_eq!(
+            format_vanilla_death_message("Player", "fly_into_wall", None, None),
+            "Player experienced kinetic energy"
+        );
+    }
+}
+
 /// A present `eula.txt` must accept the EULA, like Vanilla's `DedicatedServer.eula`
 /// check: `eula=true`, parsed with the same properties rules `server.properties`
 /// gets — UTF-8 BOM tolerated, `#`/`!` comments, `=`/`:` separators, escapes, a
@@ -20774,13 +20943,202 @@ fn eula_direct_launch_check() {
 /// non-TTY stdout (pipes, CI, tests, log collectors) gets zero extra lines.
 fn megu_startup_banner() {
     use std::io::IsTerminal;
-    if !std::io::stdout().is_terminal()
+    if resolved_console_mode() == ServerConsoleMode::Tui
+        || !std::io::stdout().is_terminal()
         || std::env::var("MEGU_NO_BANNER").as_deref() == Ok("1")
         || std::env::var("NO_BANNER").as_deref() == Ok("1")
     {
         return;
     }
     print!("{MEGU_BANNER}");
+}
+
+struct TuiAlternateScreen;
+
+impl TuiAlternateScreen {
+    fn enter() -> Self {
+        use std::io::Write;
+        let _ = std::io::stdout().write_all(b"\x1b[?1049h\x1b[?25l");
+        let _ = std::io::stdout().flush();
+        Self
+    }
+}
+
+impl std::ops::Drop for TuiAlternateScreen {
+    fn drop(&mut self) {
+        restore_tui_terminal();
+    }
+}
+
+fn restore_tui_terminal() {
+    use std::io::Write;
+    if resolved_console_mode() == ServerConsoleMode::Tui {
+        let _ = std::io::stdout().write_all(b"\x1b[0m\x1b[?25h\x1b[?1049l");
+        let _ = std::io::stdout().flush();
+    }
+}
+
+fn operator_status_summary() -> String {
+    let health = operator_health_snapshot();
+    let report = live_hotspot_profiler()
+        .lock()
+        .unwrap_or_else(|error| error.into_inner())
+        .summary(0);
+    format_operator_status_summary(&OperatorStatusSummary {
+        tps: report.tps,
+        mspt_p50: report.mspt_p50,
+        mspt_p95: report.mspt_p95,
+        players_online: health.players_online,
+        players_max: health.players_max,
+        loaded_chunks: health.loaded_chunks,
+        rss_mb: memory_usage_mb(),
+        active_worlds: 1,
+        hub_servers: 0,
+        survival_mods: 0,
+    })
+}
+
+fn tui_ingest_live_snapshot(state: &mut ServerTuiState) {
+    let health = operator_health_snapshot();
+    let report = live_hotspot_profiler()
+        .lock()
+        .unwrap_or_else(|error| error.into_inner())
+        .summary(5);
+    let lifecycle = server_lifecycle()
+        .lock()
+        .unwrap_or_else(|error| error.into_inner())
+        .state();
+    let label = if lifecycle == LifecycleState::Sleeping {
+        "Sleeping"
+    } else {
+        "Running"
+    };
+    state.ingest_log_line(&format!(
+        "Status: {label} ({:.1} TPS, {:.1} ms/tick)",
+        report.tps, report.mspt_mean
+    ));
+    let names = health.player_names.join(", ");
+    state.ingest_log_line(&format!(
+        "Players: {}/{} ({names})",
+        health.players_online, health.players_max
+    ));
+    state.ingest_log_line(&format!("Loaded chunks: {}", health.loaded_chunks));
+    if let Some(memory) = memory_usage_mb() {
+        state.ingest_log_line(&format!("Memory: {memory} MB"));
+    }
+    #[cfg(feature = "mod-suite")]
+    let scanned_mod_jars = live_mod_suite()
+        .lock()
+        .unwrap_or_else(|error| error.into_inner())
+        .reports
+        .len();
+    #[cfg(not(feature = "mod-suite"))]
+    let scanned_mod_jars = 0usize;
+    state.ingest_log_line(&format!(
+        "[live-mods] mods dir scanned: {scanned_mod_jars} jar(s)"
+    ));
+    state.ingest_log_line(&format!(
+        "[tick] observed_tps={:.2} avg_work_ms={:.2} max_work_ms={:.2} over_budget=0/1",
+        report.tps, report.mspt_p50, report.mspt_p95
+    ));
+    for hotspot in report.top_chunks {
+        state.ingest_log_line(&format!(
+            "[guard] chunk hotspot ({},{}) {:.1} ms/tick",
+            hotspot.chunk_x, hotspot.chunk_z, hotspot.ms_per_tick
+        ));
+    }
+}
+
+fn start_server_tui(bind: &str, port: u16, identity_mode: &str, startup_summary: &str) {
+    if resolved_console_mode() != ServerConsoleMode::Tui {
+        return;
+    }
+    let options = console_options().clone();
+    let state = Arc::new(Mutex::new(ServerTuiState::with_options(&options)));
+    state
+        .lock()
+        .unwrap_or_else(|error| error.into_inner())
+        .ingest_log_line(&format!("megu v0.6 listening {bind}:{port} ({identity_mode})"));
+    for line in startup_summary.lines() {
+        state
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .ingest_log_line(line);
+    }
+    let _ = LIVE_TUI.set(Arc::clone(&state));
+    thread::spawn(move || {
+        use std::io::Write;
+        let _screen = TuiAlternateScreen::enter();
+        let mut last_snapshot = Instant::now() - Duration::from_secs(2);
+        loop {
+            let (cols, rows) = (
+                std::env::var("COLUMNS").ok().and_then(|v| v.parse().ok()).unwrap_or(100),
+                std::env::var("LINES").ok().and_then(|v| v.parse().ok()).unwrap_or(30),
+            );
+            let frame = {
+                let mut state = state.lock().unwrap_or_else(|error| error.into_inner());
+                if last_snapshot.elapsed() >= Duration::from_secs(1) {
+                    tui_ingest_live_snapshot(&mut state);
+                    last_snapshot = Instant::now();
+                }
+                state.render_frame(
+                    cols,
+                    rows,
+                    !options.ascii_only && ansi_color_ok(
+                        std::env::var("TERM").ok().as_deref(),
+                        std::env::var_os("NO_COLOR").is_some(),
+                    ),
+                    options.ascii_only,
+                )
+            };
+            let mut output = String::from("\x1b[H");
+            for line in frame {
+                output.push_str(&line);
+                output.push_str("\x1b[K\r\n");
+            }
+            let _ = std::io::stdout().write_all(output.as_bytes());
+            let _ = std::io::stdout().flush();
+            thread::sleep(Duration::from_millis(250));
+        }
+    });
+    let input_state = LIVE_TUI.get().cloned();
+    if let Some(input_state) = input_state {
+        thread::spawn(move || {
+            use std::io::BufRead;
+            for line in std::io::stdin().lock().lines() {
+                let Ok(line) = line else { break };
+                let actions = {
+                    let mut state = input_state
+                        .lock()
+                        .unwrap_or_else(|error| error.into_inner());
+                    let mut bytes = line.into_bytes();
+                    bytes.push(b'\n');
+                    state.feed_input(&bytes)
+                };
+                for action in actions {
+                    match action {
+                        TuiAction::SubmitCommand(command) => {
+                            let mut none: Option<&Client> = None;
+                            run_command(None, &format!("/{command}"), &mut none);
+                        }
+                        TuiAction::RequestStop => {
+                            if let Some(state) = LIVE_TUI.get() {
+                                state
+                                    .lock()
+                                    .unwrap_or_else(|error| error.into_inner())
+                                    .mark_stopping();
+                            }
+                            restore_tui_terminal();
+                            let mut none: Option<&Client> = None;
+                            let _ = run_command(None, "/stop", &mut none);
+                            return;
+                        }
+                        TuiAction::None => {}
+                    }
+                }
+            }
+        });
+    }
 }
 
 /// Best-effort redacted crash report written to `crash-reports/` when the
@@ -21954,6 +22312,7 @@ fn main() {
             // must not replace the last good save. (The panic also poisons every
             // Mutex it held; the lock().unwrap() calls elsewhere are left as they are.)
             if let Err(msg) = connection_limits::catch_panic(|| game_tick(|_, tick| tick())) {
+                restore_tui_terminal();
                 write_server_fatal_crash_report(&msg);
                 eprintln!("[FATAL] tick thread panicked: {msg}; exiting so the server restarts");
                 std::process::exit(70);
@@ -21986,6 +22345,7 @@ fn main() {
         .expect("signal hook");
         thread::spawn(move || {
             if sigs.forever().next().is_some() {
+                restore_tui_terminal();
                 let deadline = Instant::now() + Duration::from_millis(900);
                 disconnect_all_clients("Server closed");
                 stop_lan_announcer();
@@ -22005,14 +22365,16 @@ fn main() {
     // has already returned). Lines run as level-4 console commands; `stop` ends
     // the loop (the dispatched `/stop` shuts the process down itself), and EOF
     // exits silently so headless/non-TTY runs are unaffected.
-    thread::spawn(|| {
-        let stdin = std::io::stdin();
-        let _ = run_stdin_console_loop(stdin.lock(), |line| {
-            let mut none: Option<&Client> = None;
-            run_command(None, &format!("/{line}"), &mut none);
-            String::new()
+    if resolved_console_mode() != ServerConsoleMode::Tui {
+        thread::spawn(|| {
+            let stdin = std::io::stdin();
+            let _ = run_stdin_console_loop(stdin.lock(), |line| {
+                let mut none: Option<&Client> = None;
+                run_command(None, &format!("/{line}"), &mut none);
+                String::new()
+            });
         });
-    });
+    }
     let port: u16 = std::env::var("MEGU_PORT")
         .ok()
         .and_then(|p| p.parse().ok())
@@ -22032,6 +22394,11 @@ fn main() {
         "offline identities; no Mojang authentication"
     };
     eprintln!("megu v0.6 listening {bind}:{port} ({identity_mode})");
+    let startup_summary = operator_status_summary();
+    if resolved_console_mode() == ServerConsoleMode::PlainCli {
+        println!("{startup_summary}");
+    }
+    start_server_tui(&bind, port, identity_mode, &startup_summary);
     if !connection_limits::is_loopback_bind(&bind) {
         eprintln!("[security] non-loopback bind (MEGU_ALLOW_PUBLIC_BIND set): restrict access with a firewall/private network");
     }
@@ -22057,6 +22424,9 @@ fn main() {
             },
             Err(_) => None,
         };
+        if lifecycle_wake_on_join() == LifecycleAction::WakeWorld {
+            eprintln!("[sleep] woke from sleep on incoming player connection");
+        }
         thread::spawn(move || {
             let _slot = ConnectionSlot(&ACTIVE);
             let _ip_slot = ip_slot;

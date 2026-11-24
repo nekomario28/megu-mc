@@ -295,6 +295,7 @@ dependencies = [
  "flate2",
  "jni",
  "megu-core",
+ "megu-server-files",
  "megu-state-store",
  "mod-adapter-core",
  "mod-offload",
@@ -307,6 +308,13 @@ dependencies = [
 [[package]]
 name = "megu-core"
 version = "0.1.0"
+
+[[package]]
+name = "megu-server-files"
+version = "0.1.0"
+dependencies = [
+ "megu-core",
+]
 
 [[package]]
 name = "megu-state-store"
