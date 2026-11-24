@@ -10416,7 +10416,7 @@ fn set_block_if_inner_dim(
 /// past the bound the block still lands, it just is not tick-scheduled.
 fn register_overworld_scheduled(x: i32, y: i32, z: i32, st: u32, native_fluid_controlled: bool) {
     let mut hh = hoppers().lock().unwrap_or_else(|e| e.into_inner());
-    if (9225..=9234).contains(&st) {
+    if hopper_state_facing(st).is_some() {
         if hh.len() < DIM_SCHEDULED_CAP || hh.contains(&(x, y, z)) {
             hh.insert((x, y, z));
             hopper_queue().lock().unwrap_or_else(|e| e.into_inner()).schedule((x, y, z), 1);
@@ -10606,6 +10606,53 @@ fn dim_queue_due(queues: &Mutex<HashMap<DimId, tick_queue::TickQueue>>, dim: Dim
         .unwrap_or_default()
 }
 
+/// Promote registered hoppers adjacent to a changed container. The legacy
+/// overworld queue and dimension queues share the same DimBlockPos backoff
+/// keys, so a machine update can wake only the hoppers in its own dimension.
+fn wake_hoppers_around((dim, x, y, z): DimBlockPos) {
+    let positions = [
+        (x, y, z),
+        (x + 1, y, z),
+        (x - 1, y, z),
+        (x, y + 1, z),
+        (x, y - 1, z),
+        (x, y, z + 1),
+        (x, y, z - 1),
+    ];
+    let mut backoffs = backoff().lock().unwrap_or_else(|e| e.into_inner());
+    for pos in positions {
+        if hopper_state_facing(block_at_dim(dim, pos.0, pos.1, pos.2)).is_none() {
+            continue;
+        }
+        let key = (dim, pos.0, pos.1, pos.2);
+        let now = TICK_IDX.load(Ordering::Relaxed);
+        if backoffs
+            .get(&key)
+            .is_some_and(|(due, fails)| *fails == 0 && *due > now)
+        {
+            continue;
+        }
+        backoffs.remove(&key);
+        if dim == DimId::Overworld {
+            if hoppers().lock().unwrap_or_else(|e| e.into_inner()).contains(&pos) {
+                hopper_queue()
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .promote(pos);
+            }
+        } else if dim_hoppers()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .contains(&(dim, pos.0, pos.1, pos.2))
+        {
+            let mut queues = dim_hopper_queues().lock().unwrap_or_else(|e| e.into_inner());
+            if let Some(queue) = queues.get_mut(&dim) {
+                queue.promote(pos);
+            }
+        }
+    }
+}
+
 /// Register or drop one non-Overworld write with the event-driven tick
 /// registries — the `set_block_if_dim_edit` twin of the Overworld
 /// registration inside `set_block_if_inner_dim`.
@@ -10617,7 +10664,7 @@ const DIM_SCHEDULED_CAP: usize = 1 << 18;
 fn register_dim_scheduled(dim: DimId, x: i32, y: i32, z: i32, st: u32) {
     {
         let mut hh = dim_hoppers().lock().unwrap_or_else(|e| e.into_inner());
-        if (9225..=9234).contains(&st) {
+        if hopper_state_facing(st).is_some() {
             if hh.len() < DIM_SCHEDULED_CAP || hh.contains(&(dim, x, y, z)) {
                 hh.insert((dim, x, y, z));
                 dim_queue_schedule(dim_hopper_queues(), dim, (x, y, z), 1);
@@ -10867,118 +10914,6 @@ fn chest_partner_dim(dim: DimId, x: i32, y: i32, z: i32) -> Option<BlockPos> {
         .map(|(right, left)| if (x, y, z) == right { left } else { right })
 }
 
-/// `hopper_push` for a non-Overworld dimension: same `ejectItems` order, with
-/// the container keys naming the dimension so a Nether chest and an Overworld
-/// chest at the same coordinates stay separate containers.
-fn dim_hopper_push(dim: DimId, hx: i32, hy: i32, hz: i32, dst: (i32, i32, i32)) -> bool {
-    let Some(dst_slots) = hopper_container_slots(block_at_dim(dim, dst.0, dst.1, dst.2)) else {
-        return false;
-    };
-    unpack_block_loot_if_needed((dim, dst.0, dst.1, dst.2));
-    let partner = chest_partner_dim(dim, dst.0, dst.1, dst.2);
-    if let Some(partner) = partner {
-        unpack_block_loot_if_needed((dim, partner.0, partner.1, partner.2));
-    }
-    let mut all = chests().lock().unwrap_or_else(|e| e.into_inner());
-    let own = all.get(&ContainerKey::Block((dim, hx, hy, hz))).and_then(|m| {
-        m.iter()
-            .filter(|(_, v)| v.1 > 0)
-            .map(|(k, v)| (*k, v.clone()))
-            .min_by_key(|(k, _)| *k)
-    });
-    let Some((k, (it, _, _cc))) = own else { return false };
-    let smax = item_stack_max(it, &_cc) as u8;
-    // vanilla merges double chests — push spills to the partner half when the
-    // facing half is full.
-    let dsts = [
-        (dst, dst_slots),
-        partner.map(|p| (p, 27)).unwrap_or((dst, dst_slots)),
-    ];
-    for (dp, limit) in dsts {
-        let dstm = all
-            .entry(ContainerKey::Block((dim, dp.0, dp.1, dp.2)))
-            .or_default();
-        let slot = dstm
-            .iter()
-            .filter(|(s, v)| **s < limit && v.0 == it && v.2 == _cc && v.1 < smax)
-            .map(|(s2, _)| *s2)
-            .min()
-            .or_else(|| (0..limit).find(|sl| !dstm.contains_key(sl)));
-        let Some(slot) = slot else { continue }; // full -> try partner
-        let cur = dstm.get(&slot).map(|v| v.1).unwrap_or(0);
-        dstm.insert(slot, (it, cur + 1, _cc.clone()));
-        if let Some(sm) = all.get_mut(&ContainerKey::Block((dim, hx, hy, hz))) {
-            if let Some(v) = sm.get_mut(&k) {
-                v.1 -= 1;
-                if v.1 == 0 {
-                    sm.remove(&k);
-                }
-            }
-        }
-        return true;
-    }
-    false
-}
-
-/// `hopper_pull` for a non-Overworld dimension: same `suckInItems` container
-/// half, dimension-keyed containers and a dimension-aware chest partner so a
-/// double chest in the Nether still reads as one merged container.
-fn dim_hopper_pull(dim: DimId, hx: i32, hy: i32, hz: i32) -> bool {
-    let src = (hx, hy + 1, hz);
-    let Some(src_slots) = hopper_container_slots(block_at_dim(dim, src.0, src.1, src.2)) else {
-        return false;
-    };
-    unpack_block_loot_if_needed((dim, src.0, src.1, src.2));
-    let partner = chest_partner_dim(dim, src.0, src.1, src.2);
-    if let Some(partner) = partner {
-        unpack_block_loot_if_needed((dim, partner.0, partner.1, partner.2));
-    }
-    let mut all = chests().lock().unwrap_or_else(|e| e.into_inner());
-    let srcs = [
-        (src, src_slots),
-        partner.map(|p| (p, 27)).unwrap_or((src, src_slots)),
-    ];
-    for (srcp, limit) in srcs {
-        let stacks: std::collections::BTreeMap<i16, Stack> = all
-            .get(&ContainerKey::Block((dim, srcp.0, srcp.1, srcp.2)))
-            .map(|ch| {
-                ch.iter()
-                    .filter(|(s, v)| **s < limit && v.1 > 0)
-                    .map(|(k, v)| (*k, v.clone()))
-                    .collect()
-            })
-            .unwrap_or_default();
-        for (k, (it, c, _xc)) in stacks {
-            let smax = item_stack_max(it, &_xc) as u8;
-            {
-                let own = all
-                    .entry(ContainerKey::Block((dim, hx, hy, hz)))
-                    .or_default();
-                let slot = own
-                    .iter()
-                    .filter(|(s, v)| {
-                        **s < HOPPER_SLOTS && v.0 == it && v.2 == _xc && v.1 < smax
-                    })
-                    .map(|(s, _)| *s)
-                    .min()
-                    .or_else(|| (0..HOPPER_SLOTS).find(|sl| !own.contains_key(sl)));
-                let Some(slot) = slot else { continue }; // hopper full -> next slot
-                let cur = own.get(&slot).map(|v| v.1).unwrap_or(0);
-                own.insert(slot, (it, cur + 1, _xc.clone()));
-            }
-            if let Some(srcm) = all.get_mut(&ContainerKey::Block((dim, srcp.0, srcp.1, srcp.2))) {
-                if c <= 1 {
-                    srcm.remove(&k);
-                } else {
-                    srcm.insert(k, (it, c - 1, _xc.clone()));
-                }
-            }
-            return true;
-        }
-    }
-    false
-}
-
 fn dim_hopper_tick(dim: DimId) {
     // `hopper_tick` with dimension-aware reads — the powered-hold, facing and
     // push-then-pull order are the same. The sleep probe and the item-entity
@@ -10995,31 +10930,23 @@ fn dim_hopper_tick(dim: DimId) {
             continue;
         }
         let st = block_at_dim(dim, hx, hy, hz);
-        if !(9225..=9234).contains(&st) {
+        let Some((facing, enabled)) = hopper_state_facing(st) else {
             dim_hoppers()
                 .lock()
                 .unwrap_or_else(|e| e.into_inner())
                 .remove(&(dim, hx, hy, hz));
             continue;
-        }
-        if st >= 9230 {
+        };
+        if !enabled {
             sched_result_dim(dim, hx, hy, hz, false);
             requeue_fluid_dim(dim_hopper_queues(), dim, (hx, hy, hz), 1);
             continue;
         } // powered(disabled) hopper holds items
-        let facing = st - 9225; // 0 down,1 n,2 s,3 w,4 e
-        let (dx, dy, dz) = match facing {
-            0 => (0, -1, 0),
-            1 => (0, 0, -1),
-            2 => (0, 0, 1),
-            3 => (-1, 0, 0),
-            _ => (1, 0, 0),
-        };
+        let (dx, dy, dz) = facing.offset();
         let dst = (hx + dx, hy + dy, hz + dz);
         unpack_block_loot_if_needed((dim, hx, hy, hz));
-        let mut did = dim_hopper_push(dim, hx, hy, hz, dst);
-        did |= dim_hopper_pull(dim, hx, hy, hz);
-        sched_result_dim(dim, hx, hy, hz, did);
+        let (_, did) = hopper_transfer_dim(dim, (hx, hy, hz), st).unwrap_or((dst, false));
+        hopper_sched_result(dim, (hx, hy, hz), did);
         requeue_fluid_dim(dim_hopper_queues(), dim, (hx, hy, hz), 1);
     }
 }
@@ -12661,7 +12588,7 @@ fn piston_set_extended(bx: i32, by: i32, bz: i32, st: u32, extended: bool) {
             || (4295..=4302).contains(&front)                          // furnace
             || (9345..=9356).contains(&front)                          // dispenser
             || (523..=534).contains(&front)                            // dropper
-            || (9225..=9234).contains(&front)                          // hopper
+            || hopper_state_facing(front).is_some()                    // hopper
             || signs()
                 .lock()
                 .unwrap()

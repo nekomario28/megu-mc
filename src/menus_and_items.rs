@@ -1409,6 +1409,9 @@ fn furnace_tick() {
         FURNACE_DIRTY_SCRATCH.with(|s| scratch_return(s, dirty_pos));
         return;
     }
+    for pos in &dirty_pos {
+        wake_hoppers_around(*pos);
+    }
     let cs: Vec<Arc<Client>> = client_snapshot();
     for c in cs {
         let fp = *c.open_furnace.lock().unwrap_or_else(|e| e.into_inner());
@@ -1689,7 +1692,7 @@ fn probe_partner(st: u32, pos: (i32, i32, i32)) -> Option<(i32, i32, i32)> {
     })
 }
 /// The watched-state fingerprint for one hopper visit: everything
-/// `hopper_push`, `hopper_pull` and `hopper_suck` can observe, and nothing
+/// `hopper_transfer_dim` and `hopper_suck` can observe, and nothing
 /// else. Block states cover container-ness and double-chest pairing; the
 /// resolved partner positions stand in for the neighbour reads `chest_pair`
 /// makes; container maps cover slot contents; pending-loot flags cover the
@@ -1727,6 +1730,14 @@ fn hopper_probe_epoch(hx: i32, hy: i32, hz: i32, dst: (i32, i32, i32)) -> u128 {
             .flatten()
         {
             acc = mixv(acc, u64::from(pend.contains_key(&ow_block(pos))));
+        }
+    }
+    for pos in [above, dst] {
+        if let Some(furnace) = hopper_furnace_pos(DimId::Overworld, pos) {
+            let slots = furnace_slot_snapshot_dim(furnace.0, (furnace.1, furnace.2, furnace.3));
+            for (slot, stack) in slots.iter().enumerate() {
+                acc = mix_stack_entry(acc, slot as i16, stack);
+            }
         }
     }
     let mut snaps = SUCTION_SNAP_SCRATCH.with(scratch_take);
@@ -1876,6 +1887,7 @@ fn wake_furnace_at(dim: DimId, x: i32, y: i32, z: i32) {
         .lock()
         .unwrap_or_else(|e| e.into_inner())
         .wake((dim, x, y, z), FURNACE_TICK_SEQ.load(Ordering::Relaxed));
+    wake_hoppers_around((dim, x, y, z));
 }
 
 /// The block entity at `(dim, x, y, z)` is gone: cancel its pending deadline so
@@ -1955,24 +1967,17 @@ fn hopper_tick() {
             continue;
         }
         let st = block_at(hx, hy, hz);
-        if !(9225..=9234).contains(&st) {
+        let Some((facing, enabled)) = hopper_state_facing(st) else {
             hoppers().lock().unwrap_or_else(|e| e.into_inner()).remove(&(hx, hy, hz));
             hopper_sleep().lock().unwrap_or_else(|e| e.into_inner()).remove(&(hx, hy, hz));
             continue;
-        }
-        if st >= 9230 {
+        };
+        if !enabled {
             sched_result(hx, hy, hz, false);
             requeue_hopper(hx, hy, hz);
             continue;
         } // powered(disabled) hopper holds items
-        let facing = st - 9225; // 0 down,1 n,2 s,3 w,4 e
-        let (dx, dy, dz) = match facing {
-            0 => (0, -1, 0),
-            1 => (0, 0, -1),
-            2 => (0, 0, 1),
-            3 => (-1, 0, 0),
-            _ => (1, 0, 0),
-        };
+        let (dx, dy, dz) = facing.offset();
         let dst = (hx + dx, hy + dy, hz + dz);
         // Idle-sleep probe: only a hopper whose last scan moved nothing can
         // skip, and only when the watched-state fingerprint is unchanged. The
@@ -1998,8 +2003,9 @@ fn hopper_tick() {
         // no container sits in front at all. `SleepingHopperEngine`'s
         // `attempt_transfers` encodes the same shape: push first, then the
         // container half of `suckInItems`, then the item-entity half.
-        let mut did = hopper_push(hx, hy, hz, dst);
-        did |= hopper_pull(hx, hy, hz) || hopper_suck(hx, hy, hz);
+        let (_, mut did) = hopper_transfer_dim(DimId::Overworld, (hx, hy, hz), st)
+            .unwrap_or((dst, false));
+        did |= hopper_suck(hx, hy, hz);
         {
             let mut sl = hopper_sleep().lock().unwrap_or_else(|e| e.into_inner());
             if sl.len() > HOPPER_SLEEP_MAX {
@@ -2021,7 +2027,7 @@ fn hopper_tick() {
                 },
             );
         }
-        sched_result(hx, hy, hz, did);
+        hopper_sched_result(DimId::Overworld, (hx, hy, hz), did);
         requeue_hopper(hx, hy, hz);
     }
 }
@@ -2030,122 +2036,370 @@ fn hopper_tick() {
 /// `HOPPER_INVENTORY_SIZE` wide — so hopper-to-hopper chains transfer through
 /// the same path as a hopper pushing into a chest.
 const HOPPER_SLOTS: i16 = HOPPER_INVENTORY_SIZE as i16;
-fn hopper_container_slots(st: u32) -> Option<i16> {
-    if (9225..=9234).contains(&st) {
+fn hopper_container_slots(dim: DimId, pos: BlockPos) -> Option<i16> {
+    let state = block_at_dim(dim, pos.0, pos.1, pos.2);
+    let Some(reg) = breg() else {
+        // Assetless unit tests keep their legacy fixture states; production
+        // classification below always resolves the registered block name.
+        #[cfg(test)]
+        {
+            if block_family_range("hopper")
+                .is_some_and(|(first, last)| (first..=last).contains(&state))
+            {
+                return Some(HOPPER_SLOTS);
+            }
+            return container_kind(state).map(|_| 27);
+        }
+        #[cfg(not(test))]
+        return None;
+    };
+    let name = reg.name_of(state);
+    if name == "minecraft:hopper" {
         Some(HOPPER_SLOTS)
+    } else if matches!(name, "minecraft:chest" | "minecraft:trapped_chest" | "minecraft:barrel")
+        || name.ends_with("_shulker_box")
+    {
+        Some(27)
     } else {
-        container_kind(st).map(|_| 27)
+        None
     }
 }
-/// Vanilla `ejectItems`: one item from the hopper's first non-empty slot into
-/// the facing container. Runs before any pull and independently of it.
-fn hopper_push(hx: i32, hy: i32, hz: i32, dst: (i32, i32, i32)) -> bool {
-    let Some(dst_slots) = hopper_container_slots(block_at(dst.0, dst.1, dst.2)) else {
+
+fn hopper_state_facing(state: u32) -> Option<(HopperFacing, bool)> {
+    let Some(reg) = breg() else {
+        // Keep the pre-registry unit fixtures compatible without baking state
+        // IDs into the production hopper path.
+        #[cfg(test)]
+        {
+            let (first, last) = block_family_range("hopper")?;
+            if !(first..=last).contains(&state) {
+                return None;
+            }
+            let encoded = state - first;
+            let facing = match encoded % 5 {
+                0 => HopperFacing::Down,
+                1 => HopperFacing::North,
+                2 => HopperFacing::South,
+                3 => HopperFacing::West,
+                _ => HopperFacing::East,
+            };
+            return Some((facing, encoded < 5));
+        }
+        #[cfg(not(test))]
+        return None;
+    };
+    if reg.name_of(state) != "minecraft:hopper" {
+        return None;
+    }
+    let facing = match reg.get_prop(state, "facing").as_deref()? {
+        "down" => HopperFacing::Down,
+        "north" => HopperFacing::North,
+        "south" => HopperFacing::South,
+        "west" => HopperFacing::West,
+        "east" => HopperFacing::East,
+        _ => return None,
+    };
+    let enabled = reg.get_prop(state, "enabled").as_deref() != Some("false");
+    Some((facing, enabled))
+}
+
+fn hopper_furnace_pos(dim: DimId, pos: BlockPos) -> Option<DimBlockPos> {
+    let name = breg()?.name_of(block_at_dim(dim, pos.0, pos.1, pos.2));
+    matches!(
+        name,
+        "minecraft:furnace" | "minecraft:smoker" | "minecraft:blast_furnace"
+    )
+    .then_some((dim, pos.0, pos.1, pos.2))
+}
+
+fn hopper_transfer_dim(dim: DimId, pos: BlockPos, state: u32) -> Option<(BlockPos, bool)> {
+    let (facing, enabled) = hopper_state_facing(state)?;
+    let (dx, dy, dz) = facing.offset();
+    let dst = (pos.0 + dx, pos.1 + dy, pos.2 + dz);
+    if !enabled {
+        return Some((dst, false));
+    }
+    let mut did = hopper_push_dim(dim, pos.0, pos.1, pos.2, dst);
+    did |= hopper_pull_dim(dim, pos.0, pos.1, pos.2);
+    Some((dst, did))
+}
+
+/// Record the vanilla transfer delay in the shared dimension-keyed scheduler
+/// backoff map. Event wakeups must not bypass a successful transfer's cooldown.
+fn hopper_sched_result(dim: DimId, pos: BlockPos, did_work: bool) {
+    sched_result_dim(dim, pos.0, pos.1, pos.2, did_work);
+    if did_work {
+        let due = TICK_IDX.load(Ordering::Relaxed) + server_ticks(HOPPER_TRANSFER_COOLDOWN as u64);
+        backoff()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert((dim, pos.0, pos.1, pos.2), (due, 0));
+    }
+}
+
+fn hopper_furnace_sync(pos: DimBlockPos) {
+    let slots = furnace_slot_snapshot_dim(pos.0, (pos.1, pos.2, pos.3));
+    for client in client_snapshot() {
+        if *client.open_furnace.lock().unwrap_or_else(|e| e.into_inner()) == Some(pos) {
+            let inv = client.inv.lock().unwrap_or_else(|e| e.into_inner()).clone();
+            furnace_push_items_snap(&client, &inv, &slots);
+        }
+    }
+}
+
+/// Sided `AbstractFurnaceBlockEntity` insertion used by hopper ejection.
+/// `face` is the face of the furnace the hopper targets: down is its top,
+/// horizontal faces are its sides. Exactly one item is moved per activation.
+fn hopper_push_furnace(pos: DimBlockPos, face: (i32, i32, i32), stack: &Stack) -> bool {
+    let slot = if face == (0, 1, 0) {
+        0
+    } else if face.1 == 0 {
+        1
+    } else {
         return false;
     };
-    unpack_block_loot_if_needed(ow_block(dst));
-    let partner = chest_partner(dst.0, dst.1, dst.2);
-    if let Some(partner) = partner {
-        unpack_block_loot_if_needed(ow_block(partner));
+    let (item, _, comps) = stack;
+    let mut fs = furnaces().lock().unwrap_or_else(|e| e.into_inner());
+    let Some(furnace) = fs.get_mut(&pos) else { return false };
+    let fuel_slot_holds_bucket = furnace.fuel.0 == name_to_item("bucket").unwrap_or(-2);
+    let target = if slot == 0 { &mut furnace.input } else { &mut furnace.fuel };
+    let accepted = slot == 0
+        || fuel_ticks(*item) > 0
+        || (*item == name_to_item("bucket").unwrap_or(-1) && fuel_slot_holds_bucket);
+    if !accepted || (target.1 > 0 && (target.0 != *item || target.2 != *comps))
+        || target.1 >= item_stack_max(*item, comps) as u8
+    {
+        return false;
     }
-    let mut all = chests().lock().unwrap_or_else(|e| e.into_inner());
-    let own = all.get(&ContainerKey::ow((hx, hy, hz))).and_then(|m| {
-        m.iter()
-            .filter(|(_, v)| v.1 > 0)
-            .map(|(k, v)| (*k, v.clone()))
-            .min_by_key(|(k, _)| *k)
-    });
-    let Some((k, (it, _, _cc))) = own else { return false };
-    let smax = item_stack_max(it, &_cc) as u8;
-    // vanilla merges double chests — push spills to the
-    // partner half when the facing half is full
-    let dsts = [
-        (dst, dst_slots),
-        partner.map(|p| (p, 27)).unwrap_or((dst, dst_slots)),
-    ];
-    for (dp, limit) in dsts {
-        let dstm = all.entry(ContainerKey::ow(dp)).or_default();
-        let slot = dstm
-            .iter()
-            .filter(|(s, v)| **s < limit && v.0 == it && v.2 == _cc && v.1 < smax)
-            .map(|(s2, _)| *s2)
-            .min()
-            .or_else(|| (0..limit).find(|sl| !dstm.contains_key(sl)));
-        let Some(slot) = slot else { continue }; // full -> try partner
-        let cur = dstm.get(&slot).map(|v| v.1).unwrap_or(0);
-        dstm.insert(slot, (it, cur + 1, _cc.clone()));
-        if let Some(sm) = all.get_mut(&ContainerKey::ow((hx, hy, hz))) {
-            if let Some(v) = sm.get_mut(&k) {
-                v.1 -= 1;
-                if v.1 == 0 {
-                    sm.remove(&k);
+    if target.1 == 0 {
+        *target = (*item, 1, comps.clone());
+    } else {
+        target.1 += 1;
+    }
+    drop(fs);
+    wake_furnace_at(pos.0, pos.1, pos.2, pos.3);
+    hopper_furnace_sync(pos);
+    true
+}
+
+/// Inspect the only furnace slots exposed to a hopper below it without
+/// consuming an item. `hopper_pull_dim` uses this to check hopper capacity
+/// before mutating the furnace inventory.
+fn hopper_furnace_peek(pos: DimBlockPos) -> Option<(i64, Comps)> {
+    let fs = furnaces().lock().unwrap_or_else(|e| e.into_inner());
+    let furnace = fs.get(&pos)?;
+    if furnace.output.1 > 0 {
+        Some((furnace.output.0, furnace.output.2.clone()))
+    } else if furnace.fuel.1 > 0 && furnace.fuel.0 == name_to_item("bucket").unwrap_or(-1) {
+        Some((furnace.fuel.0, furnace.fuel.2.clone()))
+    } else {
+        None
+    }
+}
+
+/// Sided `AbstractFurnaceBlockEntity` extraction for a hopper below the
+/// furnace. The output is always extractable; the fuel slot exposes only an
+/// empty bucket, which is the lava bucket return path.
+fn hopper_pull_furnace(pos: DimBlockPos) -> Option<(i64, Comps)> {
+    let mut fs = furnaces().lock().unwrap_or_else(|e| e.into_inner());
+    let furnace = fs.get_mut(&pos)?;
+    let slot = if furnace.output.1 > 0 {
+        &mut furnace.output
+    } else if furnace.fuel.1 > 0 && furnace.fuel.0 == name_to_item("bucket").unwrap_or(-1) {
+        &mut furnace.fuel
+    } else {
+        return None;
+    };
+    let result = (slot.0, slot.2.clone());
+    slot.1 -= 1;
+    if slot.1 == 0 {
+        *slot = (0, 0, Vec::new());
+    }
+    drop(fs);
+    wake_furnace_at(pos.0, pos.1, pos.2, pos.3);
+    hopper_furnace_sync(pos);
+    Some(result)
+}
+/// Vanilla `ejectItems`: one item from the hopper's first compatible slot into
+/// the facing container. The dimension is carried through every world and
+/// block-entity lookup, including custom registered dimensions.
+fn hopper_push_dim(dim: DimId, hx: i32, hy: i32, hz: i32, dst: BlockPos) -> bool {
+    let source_pos = ContainerKey::Block((dim, hx, hy, hz));
+    if let Some(furnace_pos) = hopper_furnace_pos(dim, dst) {
+        let mut candidates: Vec<(i16, Stack)> = chests()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(&source_pos)
+            .into_iter()
+            .flat_map(|slots| slots.iter())
+            .filter(|(_, stack)| stack.1 > 0)
+            .map(|(slot, stack)| (*slot, stack.clone()))
+            .collect();
+        candidates.sort_by_key(|(slot, _)| *slot);
+        for (source_slot, stack) in candidates {
+            if !hopper_push_furnace(
+                furnace_pos,
+                (hx - dst.0, hy - dst.1, hz - dst.2),
+                &stack,
+            ) {
+                continue;
+            }
+            let mut all = chests().lock().unwrap_or_else(|e| e.into_inner());
+            if let Some(slots) = all.get_mut(&source_pos) {
+                if let Some(source) = slots.get_mut(&source_slot) {
+                    source.1 -= 1;
+                    if source.1 == 0 {
+                        slots.remove(&source_slot);
+                    }
                 }
             }
+            return true;
+        }
+        return false;
+    }
+
+    let Some(dst_slots) = hopper_container_slots(dim, dst) else {
+        return false;
+    };
+    unpack_block_loot_if_needed((dim, dst.0, dst.1, dst.2));
+    let partner = chest_partner_dim(dim, dst.0, dst.1, dst.2);
+    if let Some(partner) = partner {
+        unpack_block_loot_if_needed((dim, partner.0, partner.1, partner.2));
+    }
+    let mut all = chests().lock().unwrap_or_else(|e| e.into_inner());
+    let own = all.get(&source_pos).and_then(|slots| {
+        slots.iter()
+            .filter(|(_, stack)| stack.1 > 0)
+            .map(|(slot, stack)| (*slot, stack.clone()))
+            .min_by_key(|(slot, _)| *slot)
+    });
+    let Some((source_slot, (item, _, comps))) = own else {
+        return false;
+    };
+    let stack_max = item_stack_max(item, &comps) as u8;
+    let mut destinations = vec![(dst, dst_slots)];
+    if let Some(partner) = partner {
+        destinations.push((partner, 27));
+    }
+    for (pos, limit) in destinations {
+        let target_pos = ContainerKey::Block((dim, pos.0, pos.1, pos.2));
+        let target = all.entry(target_pos).or_default();
+        let slot = target
+            .iter()
+            .filter(|(slot, stack)| {
+                **slot < limit && stack.0 == item && stack.2 == comps && stack.1 < stack_max
+            })
+            .map(|(slot, _)| *slot)
+            .min()
+            .or_else(|| (0..limit).find(|slot| !target.contains_key(slot)));
+        let Some(slot) = slot else { continue };
+        let count = target.get(&slot).map(|stack| stack.1).unwrap_or(0);
+        target.insert(slot, (item, count + 1, comps.clone()));
+        let mut remove_source = false;
+        if let Some(source) = all
+            .get_mut(&source_pos)
+            .and_then(|slots| slots.get_mut(&source_slot))
+        {
+            source.1 -= 1;
+            remove_source = source.1 == 0;
+        }
+        if remove_source {
+            all.get_mut(&source_pos).map(|slots| slots.remove(&source_slot));
         }
         return true;
     }
     false
 }
-/// Vanilla `suckInItems`' container half: one item from the first extractable
-/// slot of the container above into the hopper's own five slots — the pulled
-/// item joins the hopper's buffer, it does not skip ahead to the push target.
-fn hopper_pull(hx: i32, hy: i32, hz: i32) -> bool {
+
+/// Vanilla `suckInItems` container half: one item from the first extractable
+/// slot above the hopper, dimension-keyed through the same generic path.
+fn hopper_pull_dim(dim: DimId, hx: i32, hy: i32, hz: i32) -> bool {
     let src = (hx, hy + 1, hz);
-    let Some(src_slots) = hopper_container_slots(block_at(src.0, src.1, src.2)) else {
+    if let Some(furnace_pos) = hopper_furnace_pos(dim, src) {
+        let Some((item, comps)) = hopper_furnace_peek(furnace_pos) else {
+            return false;
+        };
+        let own_pos = ContainerKey::Block((dim, hx, hy, hz));
+        let mut all = chests().lock().unwrap_or_else(|e| e.into_inner());
+        let own = all.entry(own_pos).or_default();
+        let max = item_stack_max(item, &comps) as u8;
+        let slot = own
+            .iter()
+            .filter(|(slot, stack)| {
+                **slot < HOPPER_SLOTS && stack.0 == item && stack.2 == comps && stack.1 < max
+            })
+            .map(|(slot, _)| *slot)
+            .min()
+            .or_else(|| (0..HOPPER_SLOTS).find(|slot| !own.contains_key(slot)));
+        let Some(slot) = slot else { return false };
+        let count = own.get(&slot).map(|stack| stack.1).unwrap_or(0);
+        own.insert(slot, (item, count + 1, comps));
+        drop(all);
+        let removed = hopper_pull_furnace(furnace_pos);
+        debug_assert!(removed.is_some());
+        return removed.is_some();
+    }
+
+    let Some(src_slots) = hopper_container_slots(dim, src) else {
         return false;
     };
-    unpack_block_loot_if_needed(ow_block(src));
-    let partner = chest_partner(src.0, src.1, src.2);
+    unpack_block_loot_if_needed((dim, src.0, src.1, src.2));
+    let partner = chest_partner_dim(dim, src.0, src.1, src.2);
     if let Some(partner) = partner {
-        unpack_block_loot_if_needed(ow_block(partner));
+        unpack_block_loot_if_needed((dim, partner.0, partner.1, partner.2));
     }
     let mut all = chests().lock().unwrap_or_else(|e| e.into_inner());
-    // vanilla merges double chests into one container — a
-    // hopper under either half can pull from both
-    let srcs = [
-        (src, src_slots),
-        partner.map(|p| (p, 27)).unwrap_or((src, src_slots)),
-    ];
-    for (srcp, limit) in srcs {
+    let mut sources = vec![(src, src_slots)];
+    if let Some(partner) = partner {
+        sources.push((partner, 27));
+    }
+    for (src_pos, limit) in sources {
+        let key = ContainerKey::Block((dim, src_pos.0, src_pos.1, src_pos.2));
         let stacks: std::collections::BTreeMap<i16, Stack> = all
-            .get(&ContainerKey::ow(srcp))
-            .map(|ch| {
-                ch.iter()
-                    .filter(|(s, v)| **s < limit && v.1 > 0)
-                    .map(|(k, v)| (*k, v.clone()))
+            .get(&key)
+            .map(|slots| {
+                slots.iter()
+                    .filter(|(slot, stack)| **slot < limit && stack.1 > 0)
+                    .map(|(slot, stack)| (*slot, stack.clone()))
                     .collect()
             })
             .unwrap_or_default();
-        for (k, (it, c, _xc)) in stacks {
-            let smax = item_stack_max(it, &_xc) as u8;
+        for (source_slot, (item, count, comps)) in stacks {
+            let max = item_stack_max(item, &comps) as u8;
+            let own_key = ContainerKey::Block((dim, hx, hy, hz));
+            let own = all.entry(own_key).or_default();
+            let slot = own
+                .iter()
+                .filter(|(slot, stack)| {
+                    **slot < HOPPER_SLOTS && stack.0 == item && stack.2 == comps && stack.1 < max
+                })
+                .map(|(slot, _)| *slot)
+                .min()
+                .or_else(|| (0..HOPPER_SLOTS).find(|slot| !own.contains_key(slot)));
+            let Some(slot) = slot else { continue };
+            let current = own.get(&slot).map(|stack| stack.1).unwrap_or(0);
+            own.insert(slot, (item, current + 1, comps.clone()));
+            let source_key = ContainerKey::Block((dim, src_pos.0, src_pos.1, src_pos.2));
+            let mut remove_source = false;
+            if let Some(source) = all
+                .get_mut(&source_key)
+                .and_then(|slots| slots.get_mut(&source_slot))
             {
-                let own = all.entry(ContainerKey::ow((hx, hy, hz))).or_default();
-                // vanilla `addItem` order: merge onto a matching partial slot
-                // first, else take the first empty of the hopper's five slots
-                let slot = own
-                    .iter()
-                    .filter(|(s, v)| {
-                        **s < HOPPER_SLOTS && v.0 == it && v.2 == _xc && v.1 < smax
-                    })
-                    .map(|(s, _)| *s)
-                    .min()
-                    .or_else(|| (0..HOPPER_SLOTS).find(|sl| !own.contains_key(sl)));
-                let Some(slot) = slot else { continue }; // hopper full -> next slot
-                let cur = own.get(&slot).map(|v| v.1).unwrap_or(0);
-                own.insert(slot, (it, cur + 1, _xc.clone()));
-            }
-            if let Some(srcm) = all.get_mut(&ContainerKey::ow(srcp)) {
-                if c <= 1 {
-                    srcm.remove(&k);
+                if count <= 1 {
+                    remove_source = true;
                 } else {
-                    srcm.insert(k, (it, c - 1, _xc.clone()));
+                    source.1 -= 1;
                 }
+            }
+            if remove_source {
+                all.get_mut(&source_key).map(|slots| slots.remove(&source_slot));
             }
             return true;
         }
     }
     false
 }
+
 /// Vanilla `suckInItems`' entity half: the first dropped item entity resting in
 /// the cell above the hopper loses as much of its stack as the hopper's own
 /// five slots can hold (`Hopper.addItem` semantics — a partial take leaves the
@@ -3409,10 +3663,6 @@ fn chest_pair_of_dim(dim: DimId, st: u32, pos: BlockPos) -> Option<(BlockPos, Bl
         "right" => Some((pos, other)),
         _ => Some((other, pos)),
     }
-}
-/// The other half, or `None` when this chest is `single`.
-fn chest_partner(x: i32, y: i32, z: i32) -> Option<BlockPos> {
-    chest_pair(x, y, z).map(|(right, left)| if (x, y, z) == right { left } else { right })
 }
 /// The halves the crate at `pos` occupied while it still had state `st`: both halves
 /// of its pair, or just the cell when it was `single`. Read from the *old* state, so a
@@ -9997,6 +10247,17 @@ fn send_chest_slot(me: &Client, wslot: i16, st: &Stack) {
 fn resync_slot(me: &Client, wid: u8, wslot: i16, st: &Stack) {
     if wid == 1 {
         send_chest_slot(me, wslot, st);
+        if let Some((first, second)) = *me.open_chest.lock().unwrap_or_else(|e| e.into_inner()) {
+            let chest_rows = if second.is_some() { 54 } else { 27 };
+            if (0..chest_rows).contains(&wslot) {
+                let key = if wslot < 27 { first } else { second.unwrap_or(first) };
+                if let ContainerKey::Block((dim, x, y, z)) = key {
+                    if !is_ender_key((x, y, z)) {
+                        wake_hoppers_around((dim, x, y, z));
+                    }
+                }
+            }
+        }
         return;
     }
     let mut p = vec![wid];
@@ -13767,9 +14028,22 @@ mod p6c_hopper_parity_tests {
         assert_eq!(stacks_at((0, hy + 1, 0)), vec![(pull_item, 2)]);
         assert_eq!(stacks_at(HPOS), vec![(pull_item, 1)]);
 
+        for tick in 1..HOPPER_TRANSFER_COOLDOWN {
+            TICK_IDX.fetch_add(1, Ordering::Relaxed);
+            if tick == 1 {
+                wake_hoppers_around(ow_block((0, hy + 1, 0)));
+            }
+            hopper_tick();
+            assert_eq!(
+                stacks_at((0, hy - 1, 0)),
+                vec![(push_item, 1)],
+                "live transfer tick {tick} must remain inside the cooldown"
+            );
+        }
+        TICK_IDX.fetch_add(1, Ordering::Relaxed);
         hopper_tick();
-        // Second activation: the pulled item is the lowest occupied slot, so
-        // it is what gets pushed next while another item is pulled in.
+        // The eighth server tick activates the hopper again: the pulled item is
+        // the lowest occupied slot, so it pushes while another item is pulled.
         assert_eq!(stacks_at((0, hy - 1, 0)), vec![(pull_item, 1), (push_item, 1)]);
         assert_eq!(stacks_at((0, hy + 1, 0)), vec![(pull_item, 1)]);
         assert_eq!(stacks_at(HPOS), vec![(pull_item, 1)]);
@@ -13857,7 +14131,10 @@ mod p6c_hopper_parity_tests {
             target: None,
             thrower: None,
         });
-        hopper_tick();
+        for _ in 0..HOPPER_TRANSFER_COOLDOWN {
+            TICK_IDX.fetch_add(1, Ordering::Relaxed);
+            hopper_tick();
+        }
         // `addItem` fills the lowest partial first: slot 0 tops to 64 (63
         // taken), the 64th item lands on slot 1 — all of it fits.
         assert_eq!(
@@ -15264,6 +15541,337 @@ mod bot_hopper_tests {
             merge_us < 1000,
             "500-drop spatial merge must stay under 1ms, took {merge_us}us"
         );
+    }
+}
+
+#[cfg(all(test, megu_vanilla_data))]
+mod f2_hopper_furnace_tests {
+    use super::*;
+
+    struct SavedWorld {
+        blocks: Vec<(DimBlockPos, u32)>,
+        containers: HashMap<ContainerKey, HashMap<i16, Stack>>,
+        furnaces: HashMap<DimBlockPos, Furnace>,
+        furnace_due: tick_queue::DueMachineQueue<DimBlockPos>,
+        recipes: Vec<SmeltRecipe>,
+        furnace_seq: u64,
+        furnace_visits: u64,
+        content_revision: u64,
+        region: TestChunkRegion,
+        hoppers: HashSet<BlockPos>,
+        dim_hoppers: HashSet<DimBlockPos>,
+        hopper_queue: tick_queue::TickQueue,
+        dim_hopper_queues: HashMap<DimId, tick_queue::TickQueue>,
+        backoff: HashMap<DimBlockPos, (u64, u32)>,
+        hopper_sleep: HashMap<BlockPos, HopperSleep>,
+    }
+
+    impl SavedWorld {
+        fn take(blocks: &[DimBlockPos], warm: HashSet<(i32, i32)>) -> Self {
+            let old_blocks = blocks
+                .iter()
+                .map(|&(dim, x, y, z)| ((dim, x, y, z), block_at_dim(dim, x, y, z)))
+                .collect();
+            let furnace_due = std::mem::replace(
+                &mut *furnace_due_queue()
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner()),
+                tick_queue::DueMachineQueue::new(),
+            );
+            let saved = Self {
+                blocks: old_blocks,
+                containers: std::mem::take(&mut *chests().lock().unwrap_or_else(|e| e.into_inner())),
+                furnaces: std::mem::take(&mut *furnaces().lock().unwrap_or_else(|e| e.into_inner())),
+                furnace_due,
+                recipes: std::mem::take(&mut *json_smelts().lock().unwrap_or_else(|e| e.into_inner())),
+                furnace_seq: FURNACE_TICK_SEQ.swap(0, Ordering::Relaxed),
+                furnace_visits: FURNACE_TICK_VISITS.swap(0, Ordering::Relaxed),
+                content_revision: CONTENT_REVISION.swap(0, Ordering::Relaxed),
+                region: test_region(),
+                hoppers: std::mem::take(&mut *hoppers().lock().unwrap_or_else(|e| e.into_inner())),
+                dim_hoppers: std::mem::take(&mut *dim_hoppers().lock().unwrap_or_else(|e| e.into_inner())),
+                hopper_queue: std::mem::replace(
+                    &mut *hopper_queue().lock().unwrap_or_else(|e| e.into_inner()),
+                    tick_queue::TickQueue::new(),
+                ),
+                dim_hopper_queues: std::mem::take(
+                    &mut *dim_hopper_queues().lock().unwrap_or_else(|e| e.into_inner()),
+                ),
+                backoff: std::mem::take(&mut *backoff().lock().unwrap_or_else(|e| e.into_inner())),
+                hopper_sleep: std::mem::take(&mut *hopper_sleep().lock().unwrap_or_else(|e| e.into_inner())),
+            };
+            let hot = warm.clone();
+            set_test_region(hot, warm);
+            saved
+        }
+    }
+
+    impl std::ops::Drop for SavedWorld {
+        fn drop(&mut self) {
+            for &((dim, x, y, z), state) in &self.blocks {
+                set_block_dim(dim, x, y, z, state);
+            }
+            *chests().lock().unwrap_or_else(|e| e.into_inner()) =
+                std::mem::take(&mut self.containers);
+            *furnaces().lock().unwrap_or_else(|e| e.into_inner()) =
+                std::mem::take(&mut self.furnaces);
+            *furnace_due_queue().lock().unwrap_or_else(|e| e.into_inner()) =
+                std::mem::replace(&mut self.furnace_due, tick_queue::DueMachineQueue::new());
+            *json_smelts().lock().unwrap_or_else(|e| e.into_inner()) =
+                std::mem::take(&mut self.recipes);
+            *hoppers().lock().unwrap_or_else(|e| e.into_inner()) =
+                std::mem::take(&mut self.hoppers);
+            *dim_hoppers().lock().unwrap_or_else(|e| e.into_inner()) =
+                std::mem::take(&mut self.dim_hoppers);
+            *hopper_queue().lock().unwrap_or_else(|e| e.into_inner()) =
+                std::mem::replace(&mut self.hopper_queue, tick_queue::TickQueue::new());
+            *dim_hopper_queues().lock().unwrap_or_else(|e| e.into_inner()) =
+                std::mem::take(&mut self.dim_hopper_queues);
+            *backoff().lock().unwrap_or_else(|e| e.into_inner()) =
+                std::mem::take(&mut self.backoff);
+            *hopper_sleep().lock().unwrap_or_else(|e| e.into_inner()) =
+                std::mem::take(&mut self.hopper_sleep);
+            FURNACE_TICK_SEQ.store(self.furnace_seq, Ordering::Relaxed);
+            FURNACE_TICK_VISITS.store(self.furnace_visits, Ordering::Relaxed);
+            CONTENT_REVISION.store(self.content_revision, Ordering::Relaxed);
+            set_test_region(self.region.0.clone(), self.region.1.clone());
+        }
+    }
+
+    fn blank_furnace() -> Furnace {
+        Furnace {
+            input: (0, 0, Vec::new()),
+            fuel: (0, 0, Vec::new()),
+            output: (0, 0, Vec::new()),
+            burn_left: 0,
+            progress: 0,
+            dirty: false,
+            xp: 0.0,
+            recipe_cache: CachedLookup::default(),
+            fuel_cache: CachedLookup::default(),
+        }
+    }
+
+    fn states() -> (&'static crate::block_registry::BReg, u32, u32, u32) {
+        let reg = breg().expect("block registry is initialized for tests");
+        (
+            reg,
+            reg.state_of("minecraft:hopper", None),
+            reg.state_of("minecraft:furnace", None),
+            reg.state_of("minecraft:chest", None),
+        )
+    }
+
+    fn hopper_state(
+        reg: &crate::block_registry::BReg,
+        base: u32,
+        facing: &str,
+        enabled: bool,
+    ) -> u32 {
+        let state = reg.with_prop(base, "facing", facing);
+        reg.with_prop(state, "enabled", if enabled { "true" } else { "false" })
+    }
+
+    fn place(dim: DimId, pos: BlockPos, state: u32) {
+        set_block_dim(dim, pos.0, pos.1, pos.2, state);
+    }
+
+    fn put(dim: DimId, pos: BlockPos, slot: i16, stack: Stack) {
+        chests()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .entry(ContainerKey::Block((dim, pos.0, pos.1, pos.2)))
+            .or_default()
+            .insert(slot, stack);
+    }
+
+    fn items(dim: DimId, pos: BlockPos) -> Vec<(i64, u8)> {
+        let mut stacks: Vec<_> = chests()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(&ContainerKey::Block((dim, pos.0, pos.1, pos.2)))
+            .into_iter()
+            .flat_map(|slots| slots.values())
+            .filter(|stack| stack.1 > 0)
+            .map(|stack| (stack.0, stack.1))
+            .collect();
+        stacks.sort_unstable();
+        stacks
+    }
+
+    fn warm_for(blocks: &[DimBlockPos]) -> HashSet<(i32, i32)> {
+        blocks
+            .iter()
+            .map(|(_, x, _, z)| (x.div_euclid(16), z.div_euclid(16)))
+            .collect()
+    }
+
+    #[test]
+    fn f2_vertical_hoppers_wake_smelt_and_extract_output() {
+        let _guard = world_guard();
+        let dim = *DimId::all_registered().first().expect("overworld dimension exists");
+        let (reg, hopper, furnace_state, chest_state) = states();
+        let furnace = (3, 80, 3);
+        let top = (3, 81, 3);
+        let side = (2, 80, 3);
+        let bottom = (3, 79, 3);
+        let output_chest = (3, 78, 3);
+        let block_positions = [
+            (dim, furnace.0, furnace.1, furnace.2),
+            (dim, output_chest.0, output_chest.1, output_chest.2),
+        ];
+        let _saved = SavedWorld::take(&block_positions, warm_for(&block_positions));
+        place(dim, furnace, furnace_state);
+        place(dim, output_chest, chest_state);
+        let ore = name_to_item("iron_ore").expect("iron ore item");
+        let ingot = name_to_item("iron_ingot").expect("iron ingot item");
+        let coal = name_to_item("coal").expect("coal item");
+        json_smelts()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .push((Ingr::Item(ore), ingot, 1, 0.7));
+        CONTENT_REVISION.fetch_add(1, Ordering::Relaxed);
+        furnaces()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert((dim, furnace.0, furnace.1, furnace.2), blank_furnace());
+        wake_furnace_at(dim, furnace.0, furnace.1, furnace.2);
+        furnace_tick();
+        assert_eq!(
+            furnace_due_queue().lock().unwrap_or_else(|e| e.into_inner()).len(),
+            0,
+            "an idle furnace settles into sleep before hopper insertion"
+        );
+        put(dim, top, 0, (ore, 1, Vec::new()));
+        put(dim, side, 0, (coal, 1, Vec::new()));
+
+        let top_state = hopper_state(reg, hopper, "down", true);
+        let side_state = hopper_state(reg, hopper, "east", true);
+        let bottom_state = hopper_state(reg, hopper, "down", true);
+        assert!(hopper_transfer_dim(dim, top, top_state).unwrap().1);
+        assert!(hopper_transfer_dim(dim, side, side_state).unwrap().1);
+        assert!(items(dim, top).is_empty());
+        assert!(items(dim, side).is_empty());
+        assert_eq!(
+            furnace_due_queue().lock().unwrap_or_else(|e| e.into_inner()).len(),
+            1,
+            "hopper slot changes must wake the sleeping furnace"
+        );
+
+        for _ in 0..server_ticks(200) {
+            furnace_tick();
+        }
+        assert_eq!(
+            furnaces().lock().unwrap_or_else(|e| e.into_inner())
+                .get(&(dim, furnace.0, furnace.1, furnace.2)).unwrap().output,
+            (ingot, 1, Vec::new()),
+            "the slot wake must cook iron ore to an ingot over 200 ticks"
+        );
+        assert!(hopper_transfer_dim(dim, bottom, bottom_state).unwrap().1);
+        assert_eq!(items(dim, bottom), vec![(ingot, 1)]);
+        assert!(hopper_transfer_dim(dim, bottom, bottom_state).unwrap().1);
+        assert_eq!(items(dim, output_chest), vec![(ingot, 1)]);
+    }
+
+    #[test]
+    fn f2_sided_rules_reject_wrong_items_and_return_bucket() {
+        let _guard = world_guard();
+        let dim = *DimId::all_registered().first().expect("a registered dimension exists");
+        let (reg, hopper, furnace_state, _) = states();
+        let furnace = (5, 80, 5);
+        let side = (4, 80, 5);
+        let bottom = (5, 79, 5);
+        let block_positions = [(dim, furnace.0, furnace.1, furnace.2)];
+        let _saved = SavedWorld::take(&block_positions, warm_for(&block_positions));
+        place(dim, furnace, furnace_state);
+        let ore = name_to_item("raw_iron").expect("raw iron item");
+        let coal = name_to_item("coal").expect("coal item");
+        let stone = name_to_item("stone").expect("stone item");
+        let ingot = name_to_item("iron_ingot").expect("iron ingot item");
+        let bucket = name_to_item("bucket").expect("empty bucket item");
+        let mut f = blank_furnace();
+        f.input = (ore, 2, Vec::new());
+        f.fuel = (coal, 2, Vec::new());
+        furnaces()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert((dim, furnace.0, furnace.1, furnace.2), f);
+        put(dim, side, 0, (stone, 1, Vec::new()));
+
+        assert!(!hopper_transfer_dim(dim, side, hopper_state(reg, hopper, "east", true)).unwrap().1);
+        assert!(!hopper_transfer_dim(dim, bottom, hopper_state(reg, hopper, "down", true)).unwrap().1);
+        {
+            let fs = furnaces().lock().unwrap_or_else(|e| e.into_inner());
+            let f = fs.get(&(dim, furnace.0, furnace.1, furnace.2)).unwrap();
+            assert_eq!(f.input, (ore, 2, Vec::new()));
+            assert_eq!(f.fuel, (coal, 2, Vec::new()));
+        }
+
+        furnaces()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get_mut(&(dim, furnace.0, furnace.1, furnace.2)).unwrap().output =
+            (ingot, 1, Vec::new());
+        assert!(hopper_transfer_dim(dim, bottom, hopper_state(reg, hopper, "down", true)).unwrap().1);
+        assert_eq!(items(dim, bottom), vec![(ingot, 1)]);
+        furnaces()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get_mut(&(dim, furnace.0, furnace.1, furnace.2)).unwrap().fuel =
+            (bucket, 1, Vec::new());
+        assert!(hopper_transfer_dim(dim, bottom, hopper_state(reg, hopper, "down", true)).unwrap().1);
+        assert_eq!(items(dim, bottom), vec![(bucket, 1), (ingot, 1)]);
+    }
+
+    #[test]
+    fn f2_locked_hopper_and_distinct_dimensions_never_leak() {
+        let _guard = world_guard();
+        let dims = DimId::all_registered();
+        assert!(dims.len() >= 3, "the three vanilla dimensions are registered");
+        let (reg, hopper, furnace_state, _) = states();
+        let a = dims[0];
+        let b = dims[1];
+        let c = dims[2];
+        let furnace = (7, 80, 7);
+        let top = (7, 81, 7);
+        let side = (6, 80, 7);
+        let block_positions = [
+            (a, furnace.0, furnace.1, furnace.2),
+            (b, furnace.0, furnace.1, furnace.2),
+            (c, furnace.0, furnace.1, furnace.2),
+        ];
+        let _saved = SavedWorld::take(&block_positions, warm_for(&block_positions));
+        let station_states = [
+            furnace_state,
+            reg.state_of("minecraft:smoker", None),
+            reg.state_of("minecraft:blast_furnace", None),
+        ];
+        for (dim, state) in [a, b, c].into_iter().zip(station_states) {
+            place(dim, furnace, state);
+            furnaces()
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .insert((dim, furnace.0, furnace.1, furnace.2), blank_furnace());
+        }
+        let ore = name_to_item("raw_iron").expect("raw iron item");
+        let coal = name_to_item("coal").expect("coal item");
+        put(a, top, 0, (ore, 1, Vec::new()));
+        put(b, top, 0, (ore, 1, Vec::new()));
+        put(c, side, 0, (coal, 1, Vec::new()));
+
+        let locked = hopper_state(reg, hopper, "down", false);
+        let top_state = hopper_state(reg, hopper, "down", true);
+        let side_state = hopper_state(reg, hopper, "east", true);
+        assert!(!hopper_transfer_dim(a, top, locked).unwrap().1);
+        assert!(hopper_transfer_dim(b, top, top_state).unwrap().1);
+        assert!(hopper_transfer_dim(c, side, side_state).unwrap().1);
+        assert_eq!(items(a, top), vec![(ore, 1)], "locked hopper retains its item");
+        assert_eq!(items(b, top), Vec::<(i64, u8)>::new());
+        assert_eq!(items(c, side), Vec::<(i64, u8)>::new());
+        let fs = furnaces().lock().unwrap_or_else(|e| e.into_inner());
+        assert_eq!(fs.get(&(a, furnace.0, furnace.1, furnace.2)).unwrap().input.1, 0);
+        assert_eq!(fs.get(&(b, furnace.0, furnace.1, furnace.2)).unwrap().input, (ore, 1, Vec::new()));
+        assert_eq!(fs.get(&(c, furnace.0, furnace.1, furnace.2)).unwrap().fuel, (coal, 1, Vec::new()));
     }
 }
 
