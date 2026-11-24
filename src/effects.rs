@@ -352,6 +352,494 @@ pub(super) fn hero_trade_discount(level: i32) -> f32 {
     0.3 + 0.0625 * (level - 1).max(0) as f32
 }
 
+/// The inverse of [`effect_internal_id`]: the legacy `Eff.id` is the zero-based
+/// registry index for every effect except Hunger, which rides the
+/// `HUNGER_EFFECT` sentinel.
+fn effect_registry_id_of_internal(internal: i32) -> Option<i32> {
+    if internal == HUNGER_EFFECT {
+        return effect_registry_id("hunger");
+    }
+    let registry = internal.checked_add(1)?;
+    effect_registry_name(registry)?;
+    Some(registry)
+}
+
+/// One pass over the active `(registry id, amplifier)` pairs that condenses
+/// every status effect the rest of the tick machinery needs into a single
+/// view: client-facing flags, movement/gravity scalars, loot bonuses and the
+/// 1.21.1 Trial Chambers carriers.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub(super) struct EffectRuntimeSummary {
+    /// `MobEffects.NIGHT_VISION` — client brightening; the flag itself is the
+    /// server-side contract.
+    pub night_vision: bool,
+    /// `Entity.setInvisible` — shared-flags bit `0x20`.
+    pub invisible: bool,
+    /// `MobEffects.GLOWING` — shared-flags outline bit `0x40`.
+    pub outlined: bool,
+    /// Blindness or Darkness is dimming the fog client-side.
+    pub fog_darkened: bool,
+    /// `MobEffects.BLINDNESS` — also gates crits and sprint-knockback in
+    /// vanilla's attack paths.
+    pub blinded: bool,
+    /// `LivingEntity.travel`'s water slowdown factor: `0.96` with Dolphin's
+    /// Grace, `1.0` otherwise.
+    pub swim_slow_down: f32,
+    /// `MobEffects.SLOW_FALLING` empties the fall-damage arm.
+    pub negates_fall_damage: bool,
+    /// Effective gravity multiplier while falling (`0.125` slow falling).
+    pub gravity_scale: f32,
+    /// `Levitation.applyEffectTick`'s target upward velocity; `0.0` when the
+    /// effect is not carried.
+    pub levitation_velocity: f64,
+    /// `LivingEntity.getJumpBoostPower`: `0.1 * (amplifier + 1)`.
+    pub jump_boost_bonus_velocity: f32,
+    /// Net `generic.luck` for loot rolls: `+(amp + 1)` luck, `-(amp + 1)` unluck.
+    pub luck_bonus: f32,
+    /// Cobweb movement factor: Weaving raises vanilla's `0.25` to `0.5`.
+    pub cobweb_speed_scale: f32,
+    /// `MobEffects.TRIAL_OMEN` arms ominous trial spawners.
+    pub trial_omen_active: bool,
+    /// `MobEffects.INFESTED` — 1.21.1 on-hurt silverfish carrier.
+    pub has_infested: bool,
+    /// `MobEffects.OOZING` — 1.21.1 on-death slime carrier.
+    pub has_oozing: bool,
+    /// `MobEffects.WEAVING` — 1.21.1 on-death cobweb carrier.
+    pub has_weaving: bool,
+    /// `MobEffects.WIND_CHARGED` — 1.21.1 on-death wind-burst carrier.
+    pub has_wind_charged: bool,
+}
+
+/// Summarizes the active `(registry id, amplifier)` effect set in one pass,
+/// folding the per-effect helpers into a single runtime view.
+pub(super) fn summarize_active_effects(effects: &[(i32, i32)]) -> EffectRuntimeSummary {
+    let registry_ids: Vec<i32> = effects.iter().map(|&(id, _)| id).collect();
+    let levitation_amplifier = effects
+        .iter()
+        .filter(|&&(id, _)| effect_registry_name(id) == Some("levitation"))
+        .map(|&(_, amplifier)| amplifier)
+        .max();
+    EffectRuntimeSummary {
+        night_vision: effect_grants_night_vision(&registry_ids),
+        invisible: effect_is_invisible(&registry_ids),
+        outlined: effect_outlines_entity(&registry_ids),
+        fog_darkened: effect_darkens_view(&registry_ids)
+            || effect_named_present(&registry_ids, "blindness"),
+        blinded: effect_named_present(&registry_ids, "blindness"),
+        swim_slow_down: effect_swim_slow_down(&registry_ids),
+        negates_fall_damage: effect_negates_fall_damage(&registry_ids),
+        gravity_scale: effect_gravity_scale(&registry_ids),
+        levitation_velocity: levitation_amplifier.map_or(0.0, levitation_upward_velocity),
+        jump_boost_bonus_velocity: jump_boost_velocity_bonus(effects),
+        luck_bonus: luck_loot_bonus(effects),
+        cobweb_speed_scale: if effect_named_present(&registry_ids, "weaving") {
+            0.5
+        } else {
+            0.25
+        },
+        trial_omen_active: effect_named_present(&registry_ids, "trial_omen"),
+        has_infested: effect_named_present(&registry_ids, "infested"),
+        has_oozing: effect_named_present(&registry_ids, "oozing"),
+        has_weaving: effect_named_present(&registry_ids, "weaving"),
+        has_wind_charged: effect_named_present(&registry_ids, "wind_charged"),
+    }
+}
+
+/// Deterministic 64-bit mixer (splitmix64) for the reactive Trial Chambers
+/// rolls: a stable seed always yields the same outcome.
+fn fx_mix64(mut z: u64) -> u64 {
+    z = (z ^ (z >> 30)).wrapping_mul(0xbf58476d1ce4e5b9);
+    z = (z ^ (z >> 27)).wrapping_mul(0x94d049bb133111eb);
+    z ^ (z >> 31)
+}
+
+/// `InfestedMobEffect`: each accepted hurt has a 10% chance to release one or
+/// two silverfish. The `seed` roll is caller-supplied so the check stays pure.
+pub(super) fn infested_on_hurt_silverfish_count(seed: u64, has_infested: bool) -> u8 {
+    if !has_infested {
+        return 0;
+    }
+    let roll = fx_mix64(seed);
+    if roll % 10 != 0 {
+        return 0;
+    }
+    1 + ((roll >> 8) & 1) as u8
+}
+
+/// `OozingMobEffect.onMobRemoved`: up to two medium slimes at the death point,
+/// bounded by `maxEntityCramming` headroom (`0` disables the cap, matching the
+/// gamerule's disabled state).
+pub(super) fn oozing_on_death_slime_count(
+    nearby_slimes: usize,
+    max_entity_cramming: usize,
+    has_oozing: bool,
+) -> u8 {
+    if !has_oozing {
+        return 0;
+    }
+    let headroom = if max_entity_cramming == 0 {
+        2
+    } else {
+        max_entity_cramming.saturating_sub(nearby_slimes)
+    };
+    headroom.min(2) as u8
+}
+
+/// `WeavingMobEffect.onMobRemoved`: scatters two or three cobweb offsets in the
+/// 3x3x3 cell block around the death position. Offsets are unique, ordered by
+/// the deterministic `seed` draw.
+pub(super) fn weaving_on_death_cobweb_offsets(
+    seed: u64,
+    has_weaving: bool,
+) -> Vec<(i32, i32, i32)> {
+    if !has_weaving {
+        return Vec::new();
+    }
+    let mut state = fx_mix64(seed);
+    let count = 2 + (state % 2) as usize;
+    let mut offsets = Vec::with_capacity(count);
+    while offsets.len() < count {
+        state = fx_mix64(state ^ 0x9e3779b97f4a7c15);
+        let cell = (state % 27) as i32;
+        let offset = (cell % 3 - 1, (cell / 3) % 3 - 1, cell / 9 - 1);
+        if !offsets.contains(&offset) {
+            offsets.push(offset);
+        }
+    }
+    offsets
+}
+
+/// `WindChargedMobEffect.onMobRemoved`: the death wind burst knocks entities
+/// back across a 3.5-block radius; inactive carriers burst nothing.
+pub(super) fn wind_charged_on_death_burst_radius(has_wind_charged: bool) -> f32 {
+    if has_wind_charged {
+        3.5
+    } else {
+        0.0
+    }
+}
+
+/// `generic.luck` over the effect set: Luck adds `amplifier + 1`, Unluck
+/// subtracts it. Multiple instances collapse to the strongest of each, like
+/// vanilla's single-instance-per-effect map.
+pub(super) fn luck_loot_bonus(effects: &[(i32, i32)]) -> f32 {
+    let level = |name: &str| {
+        effects
+            .iter()
+            .filter(|&&(id, _)| effect_registry_name(id) == Some(name))
+            .map(|&(_, amplifier)| amplifier + 1)
+            .max()
+            .unwrap_or(0) as f32
+    };
+    level("luck") - level("unluck")
+}
+
+/// `LivingEntity.getJumpBoostPower`: `0.1 * (amplifier + 1)` from the strongest
+/// Jump Boost instance, `0.0` without one.
+pub(super) fn jump_boost_velocity_bonus(effects: &[(i32, i32)]) -> f32 {
+    effects
+        .iter()
+        .filter(|&&(id, _)| effect_registry_name(id) == Some("jump_boost"))
+        .map(|&(_, amplifier)| 0.1 * (amplifier as f32 + 1.0))
+        .fold(0.0, f32::max)
+}
+
+/// Per-player effect-tick state: the last broadcast shared-flags byte, the
+/// hurt-window snapshot feeding `infested`, and the death latch for the
+/// `oozing`/`weaving`/`wind_charged` on-death behaviours.
+#[derive(Default)]
+struct EffectTickState {
+    flags: u8,
+    last_hurt: f32,
+    invulnerable: i32,
+    dead: bool,
+}
+
+fn effect_runtime_states() -> &'static Mutex<HashMap<i32, EffectTickState>> {
+    static STATES: OnceLock<Mutex<HashMap<i32, EffectTickState>>> = OnceLock::new();
+    STATES.get_or_init(Mutex::default)
+}
+
+/// The `Entity` shared-flags byte (metadata index 0): invisibility `0x20` and
+/// the glowing outline `0x40` ride the same byte the entity-action writer
+/// composes from sneak `0x02`, sprint `0x08` and fall-flying `0x80`, so this
+/// pass rebroadcasts the full composition rather than its two bits alone.
+fn effect_shared_flags(c: &Client, summary: &EffectRuntimeSummary) -> u8 {
+    let mut flags = 0u8;
+    if *c.sneaking.lock().unwrap_or_else(|e| e.into_inner()) {
+        flags |= 0x02;
+    }
+    if *c.sprinting.lock().unwrap_or_else(|e| e.into_inner()) {
+        flags |= 0x08;
+    }
+    if summary.invisible {
+        flags |= 0x20;
+    }
+    if summary.outlined {
+        flags |= 0x40;
+    }
+    if *c.fall_fly.lock().unwrap_or_else(|e| e.into_inner()) {
+        flags |= 0x80;
+    }
+    flags
+}
+
+const SILVERFISH_ETYPE: i64 = 90;
+const SLIME_ETYPE: i64 = 93;
+
+/// `Explosion.hurtEntities`' knockback arm with the reach and multiplier
+/// supplied by the caller: `(1 - dist/reach)` falloff along the normalized
+/// direction to the target's eye. Entities at the exact burst centre are
+/// skipped, like vanilla.
+fn wind_burst_knockback(
+    impact: [f64; 3],
+    target: [f64; 3],
+    target_eye_y: f64,
+    reach: f64,
+    multiplier: f64,
+    knockback_resist: f64,
+) -> Option<[f64; 3]> {
+    if !impact.iter().all(|v| v.is_finite())
+        || !target.iter().all(|v| v.is_finite())
+        || !target_eye_y.is_finite()
+        || !knockback_resist.is_finite()
+    {
+        return None;
+    }
+    let d = [
+        target[0] - impact[0],
+        target_eye_y - impact[1],
+        target[2] - impact[2],
+    ];
+    let dist = (d[0] * d[0] + d[1] * d[1] + d[2] * d[2]).sqrt();
+    if dist <= 1e-9 || dist > reach {
+        return None;
+    }
+    let strength =
+        (1.0 - dist / reach) * multiplier * (1.0 - knockback_resist.clamp(0.0, 1.0));
+    Some([
+        d[0] / dist * strength,
+        d[1] / dist * strength,
+        d[2] / dist * strength,
+    ])
+}
+
+/// The Wind Charged death burst: `hurtEntities`-style knockback at the thrown
+/// wind charge's `1.22` multiplier over a `radius * 2` reach, then the TRIGGER
+/// block pass and the explosion broadcast. Mirrors `wind_charge_burst` with
+/// the death burst's own radius.
+fn wind_charged_death_burst(dim: DimId, impact: [f64; 3], radius: f32) {
+    const KNOCKBACK_MULTIPLIER: f64 = 1.22;
+    let reach = f64::from(radius) * 2.0;
+    for c in client_snapshot() {
+        if *c.dim.lock().unwrap_or_else(|e| e.into_inner()) != dim
+            || *c.gm.lock().unwrap_or_else(|e| e.into_inner()) == 3
+        {
+            continue;
+        }
+        let (x, y, z, ..) = *c.pos.lock().unwrap_or_else(|e| e.into_inner());
+        let eye = y
+            + f64::from(player_eye_height(
+                *c.sneaking.lock().unwrap_or_else(|e| e.into_inner()),
+                *c.fall_fly.lock().unwrap_or_else(|e| e.into_inner()),
+            ));
+        if let Some(dv) = wind_burst_knockback(
+            impact,
+            [x, y, z],
+            eye,
+            reach,
+            KNOCKBACK_MULTIPLIER,
+            knockback_resist_of(&c),
+        ) {
+            let pkt = velocity_pkt(
+                c.eid,
+                (dv[0] * 8000.0) as i16,
+                (dv[1] * 8000.0) as i16,
+                (dv[2] * 8000.0) as i16,
+            );
+            if let Ok(mut w) = c.sock.lock() {
+                let _ = send_packet(&mut w, 0x5a, pkt.clone());
+            }
+            broadcast_seen_ex(c.eid, c.eid, |_c| (0x5a, pkt.clone()));
+        }
+    }
+    for m in mobs().lock().unwrap_or_else(|e| e.into_inner()).iter() {
+        if m.dim != dim {
+            continue;
+        }
+        let (mx, my, mz, ..) = *m.pos.lock().unwrap_or_else(|e| e.into_inner());
+        let eye = my + f64::from(entity_eye_height_1211(m.etype));
+        if let Some(dv) =
+            wind_burst_knockback(impact, [mx, my, mz], eye, reach, KNOCKBACK_MULTIPLIER, 0.0)
+        {
+            let mut p = m.pos.lock().unwrap_or_else(|e| e.into_inner());
+            p.0 += dv[0];
+            p.1 += dv[1];
+            p.2 += dv[2];
+            let (nx, ny, nz, yaw, pitch) = *p;
+            drop(p);
+            broadcast_seen(m.eid, |_c| {
+                (0x70, entity_teleport(m.eid, nx, ny, nz, yaw, pitch, true))
+            });
+        }
+    }
+    wind_charge_trigger_blocks(dim, impact, f64::from(radius));
+    broadcast(-1, |_c| {
+        (
+            0x20,
+            explosion_pkt_with_power(impact[0], impact[1], impact[2], radius, &[]),
+        )
+    });
+    ac_note_explosion(dim, impact, f64::from(radius));
+}
+
+/// Per-call entropy for the reactive rolls: a splitmix64 sequence keyed by
+/// tick and entity id, so repeated deaths and hurts never replay one outcome.
+fn effect_fx_seed(eid: i32) -> u64 {
+    static SEQ: AtomicU64 = AtomicU64::new(0x9e3779b97f4a7c15);
+    SEQ.fetch_add(0x9e3779b97f4a7c15, Ordering::Relaxed)
+        ^ TICK.load(Ordering::Relaxed).wrapping_mul(0x100000001b3)
+        ^ (eid as u64).wrapping_mul(0x9e3779b185ebca87)
+}
+
+/// The `LivingEntity.die` arm of the 1.21.1 Trial Chambers effects: Oozing
+/// releases medium slimes under the cramming cap, Weaving scatters cobwebs
+/// into open cells, Wind Charged detonates its burst.
+fn apply_effect_death(c: &Client, summary: &EffectRuntimeSummary) {
+    let (x, y, z, ..) = *c.pos.lock().unwrap_or_else(|e| e.into_inner());
+    let dim = *c.dim.lock().unwrap_or_else(|e| e.into_inner());
+    let seed = effect_fx_seed(c.eid);
+    if summary.has_oozing {
+        let nearby = mobs()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .iter()
+            .filter(|m| {
+                m.etype == SLIME_ETYPE
+                    && m.dim == dim
+                    && {
+                        let (mx, my, mz, ..) = *m.pos.lock().unwrap_or_else(|e| e.into_inner());
+                        (mx - x).abs() < 1.0 && (my - y).abs() < 1.0 && (mz - z).abs() < 1.0
+                    }
+            })
+            .count();
+        let cramming = max_entity_cramming_limit().max(0) as usize;
+        let count = oozing_on_death_slime_count(nearby, cramming, true);
+        for i in 0..count {
+            let jx = ((seed >> (u64::from(i) * 13)) % 40) as f64 / 40.0 - 0.5;
+            let jz = ((seed >> (u64::from(i) * 13 + 7)) % 40) as f64 / 40.0 - 0.5;
+            // Medium slime: size 2, `size * size` health.
+            insert_live_mob(
+                SLIME_ETYPE,
+                dim,
+                (x + jx, y, z + jz, 0.0, 0.0),
+                4.0,
+                Some(SlimeSize::Medium),
+            );
+        }
+    }
+    // Cobwebs only take over open cells; the air check is the conservative
+    // core of vanilla's `canBeReplaced` and never overwrites another block.
+    if let Some(web) = name_to_state("cobweb") {
+        for (dx, dy, dz) in weaving_on_death_cobweb_offsets(seed, summary.has_weaving) {
+            let (bx, by, bz) = (
+                x.floor() as i32 + dx,
+                y.floor() as i32 + dy,
+                z.floor() as i32 + dz,
+            );
+            if block_at_dim(dim, bx, by, bz) == 0 {
+                set_block_dim(dim, bx, by, bz, web);
+            }
+        }
+    }
+    let radius = wind_charged_on_death_burst_radius(summary.has_wind_charged);
+    if radius > 0.0 {
+        wind_charged_death_burst(dim, [x, y + 0.5, z], radius);
+    }
+}
+
+/// `InfestedMobEffect` releases one or two silverfish next to the hurt entity.
+fn spawn_infested_silverfish(c: &Client, count: u8) {
+    if count == 0 {
+        return;
+    }
+    let (x, y, z, ..) = *c.pos.lock().unwrap_or_else(|e| e.into_inner());
+    let dim = *c.dim.lock().unwrap_or_else(|e| e.into_inner());
+    let seed = effect_fx_seed(c.eid);
+    for i in 0..count {
+        let jx = ((seed >> (u64::from(i) * 11)) % 40) as f64 / 40.0 - 0.5;
+        let jz = ((seed >> (u64::from(i) * 11 + 5)) % 40) as f64 / 40.0 - 0.5;
+        insert_live_mob(
+            SILVERFISH_ETYPE,
+            dim,
+            (x + jx, y, z + jz, 0.0, 0.0),
+            8.0,
+            None,
+        );
+    }
+}
+
+/// The per-tick consumer of [`summarize_active_effects`]: broadcasts the
+/// composed shared-flags byte when the effect bits move (and keeps
+/// rebroadcasting while an effect flag is up, because the entity-action writer
+/// resends the same byte without them), keeps `fall_from` honest under Slow
+/// Falling and Levitation, and fires the hurt/death edges for the Trial
+/// Chambers carriers.
+fn apply_effect_runtime(c: &Client, summary: &EffectRuntimeSummary) {
+    let flags = effect_shared_flags(c, summary);
+    let last_hurt = *c.last_hurt.lock().unwrap_or_else(|e| e.into_inner());
+    let invulnerable = *c.invulnerable.lock().unwrap_or_else(|e| e.into_inner());
+    let dead = *c.hp.lock().unwrap_or_else(|e| e.into_inner()) <= 0.0;
+    let (flag_change, hurt_edge, death_edge) = {
+        let mut states = effect_runtime_states()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let tick = TICK.load(Ordering::Relaxed);
+        if tick != 0 && tick.is_multiple_of(256) {
+            let live: HashSet<i32> = client_snapshot().iter().map(|cl| cl.eid).collect();
+            states.retain(|eid, _| live.contains(eid));
+        }
+        let state = states.entry(c.eid).or_insert(EffectTickState {
+            flags,
+            last_hurt,
+            invulnerable,
+            dead,
+        });
+        let edges = (
+            state.flags != flags,
+            last_hurt != state.last_hurt || invulnerable > state.invulnerable,
+            dead && !state.dead,
+        );
+        state.flags = flags;
+        state.last_hurt = last_hurt;
+        state.invulnerable = invulnerable;
+        state.dead = dead;
+        edges
+    };
+    if flag_change || flags & 0x60 != 0 {
+        broadcast_seen(c.eid, move |_c| {
+            (0x58, live_mob_metadata(c.eid, 0, 0, flags))
+        });
+    }
+    // Slow Falling and Levitation stop fall-distance accumulation while they
+    // carry: tracking the live height keeps `fall_from` at the point a landing
+    // after expiry is measured from.
+    if summary.negates_fall_damage || summary.levitation_velocity != 0.0 {
+        let (_, y, ..) = *c.pos.lock().unwrap_or_else(|e| e.into_inner());
+        *c.fall_from.lock().unwrap_or_else(|e| e.into_inner()) = y;
+    }
+    if hurt_edge {
+        let count = infested_on_hurt_silverfish_count(
+            effect_fx_seed(c.eid),
+            summary.has_infested,
+        );
+        spawn_infested_silverfish(c, count);
+    }
+    if death_edge {
+        apply_effect_death(c, summary);
+    }
+}
+
 pub(super) fn tick_effects(c: &Client) {
     let __t = crate::tickprof::enabled().then(std::time::Instant::now);
     adv_event(&c.name, "tick", None);
@@ -360,6 +848,8 @@ pub(super) fn tick_effects(c: &Client) {
     }
     let mut ef = c.effs.lock().unwrap_or_else(|e| e.into_inner());
     if ef.is_empty() {
+        drop(ef);
+        apply_effect_runtime(c, &summarize_active_effects(&[]));
         return;
     }
     let mut dirty2 = false;
@@ -490,6 +980,13 @@ pub(super) fn tick_effects(c: &Client) {
     if grant_totem {
         grant_totem_effects(c, &mut ef);
     }
+    let summary = summarize_active_effects(
+        &ef.iter()
+            .filter_map(|e| effect_registry_id_of_internal(e.id).map(|id| (id, e.amp)))
+            .collect::<Vec<_>>(),
+    );
+    drop(ef);
+    apply_effect_runtime(c, &summary);
 }
 
 #[cfg(test)]
@@ -591,5 +1088,298 @@ mod tests {
         tick_effects(&client);
         assert_eq!(*client.food.lock().unwrap_or_else(|e| e.into_inner()), 12);
         assert_eq!(*client.sat.lock().unwrap_or_else(|e| e.into_inner()), 4.0);
+    }
+
+    #[test]
+    fn v1211_runtime_summary_maps_every_remaining_status_effect() {
+        // One-based registry ids: blindness 15, darkness 33, dolphins_grace 30,
+        // glowing 24, infested 39, invisibility 14, jump_boost 8, levitation
+        // 25, luck 26, night_vision 16, oozing 38, slow_falling 28, trial_omen
+        // 34, unluck 27, weaving 37, wind_charged 36.
+        let effects: Vec<(i32, i32)> = vec![
+            (15, 0), (33, 0), (30, 0), (24, 0), (39, 0), (14, 0), (8, 2), (25, 1),
+            (26, 1), (16, 0), (38, 0), (28, 0), (34, 0), (27, 0), (37, 0), (36, 0),
+        ];
+        let s = summarize_active_effects(&effects);
+        assert!(s.night_vision);
+        assert!(s.invisible);
+        assert!(s.outlined);
+        assert!(s.fog_darkened);
+        assert!(s.blinded);
+        assert_eq!(s.swim_slow_down, 0.96);
+        assert!(s.negates_fall_damage);
+        assert_eq!(s.gravity_scale, 0.125);
+        assert_eq!(s.levitation_velocity, 0.10, "amplifier 1 -> 0.05 * 2");
+        assert!((s.jump_boost_bonus_velocity - 0.3).abs() < 1e-6);
+        assert_eq!(s.luck_bonus, 1.0, "luck 2 levels minus unluck 1 level");
+        assert_eq!(s.cobweb_speed_scale, 0.5);
+        assert!(s.trial_omen_active);
+        assert!(s.has_infested);
+        assert!(s.has_oozing);
+        assert!(s.has_weaving);
+        assert!(s.has_wind_charged);
+
+        let empty = summarize_active_effects(&[]);
+        assert_eq!(empty, EffectRuntimeSummary {
+            swim_slow_down: 1.0,
+            gravity_scale: 1.0,
+            cobweb_speed_scale: 0.25,
+            ..EffectRuntimeSummary::default()
+        });
+    }
+
+    #[test]
+    fn v1211_blindness_darkness_and_night_vision_summarize_independently() {
+        let blind = summarize_active_effects(&[(15, 0)]);
+        assert!(blind.fog_darkened && blind.blinded && !blind.night_vision);
+        let dark = summarize_active_effects(&[(33, 0)]);
+        assert!(dark.fog_darkened && !dark.blinded);
+        let night = summarize_active_effects(&[(16, 0)]);
+        assert!(night.night_vision && !night.fog_darkened && !night.blinded);
+    }
+
+    #[test]
+    fn v1211_luck_unluck_and_jump_boost_follow_vanilla_formulas() {
+        assert_eq!(luck_loot_bonus(&[]), 0.0);
+        assert_eq!(luck_loot_bonus(&[(26, 0)]), 1.0);
+        assert_eq!(luck_loot_bonus(&[(26, 2)]), 3.0);
+        assert_eq!(luck_loot_bonus(&[(27, 0)]), -1.0);
+        assert_eq!(luck_loot_bonus(&[(27, 1)]), -2.0);
+        assert_eq!(luck_loot_bonus(&[(26, 1), (27, 0)]), 1.0);
+        // Strongest instance wins, like vanilla's one-instance-per-effect map.
+        assert_eq!(luck_loot_bonus(&[(26, 0), (26, 4)]), 5.0);
+        assert_eq!(jump_boost_velocity_bonus(&[]), 0.0);
+        assert_eq!(jump_boost_velocity_bonus(&[(8, 0)]), 0.1);
+        assert!((jump_boost_velocity_bonus(&[(8, 1)]) - 0.2).abs() < 1e-6);
+        assert_eq!(jump_boost_velocity_bonus(&[(8, 0), (8, 3)]), 0.4);
+    }
+
+    #[test]
+    fn v1211_infested_oozing_weaving_wind_charged_rolls_are_deterministic() {
+        // Infested: exactly 10% of the deterministic seeds release 1..=2 fish.
+        assert_eq!(infested_on_hurt_silverfish_count(0, false), 0);
+        let mut releases = 0usize;
+        for seed in 0..10_000u64 {
+            let n = infested_on_hurt_silverfish_count(seed, true);
+            assert!(n <= 2);
+            releases += usize::from(n > 0);
+        }
+        assert!(
+            (900..=1100).contains(&releases),
+            "10% hurt roll must trigger for about a tenth of seeds, got {releases}"
+        );
+        let seeded: Vec<u8> = (0..32).map(|s| infested_on_hurt_silverfish_count(s, true)).collect();
+        assert_eq!(
+            seeded,
+            (0..32).map(|s| infested_on_hurt_silverfish_count(s, true)).collect::<Vec<_>>()
+        );
+
+        // Oozing: up to two medium slimes, capped by the cramming headroom.
+        assert_eq!(oozing_on_death_slime_count(0, 24, true), 2);
+        assert_eq!(oozing_on_death_slime_count(23, 24, true), 1);
+        assert_eq!(oozing_on_death_slime_count(24, 24, true), 0);
+        assert_eq!(oozing_on_death_slime_count(0, 1, true), 1);
+        assert_eq!(oozing_on_death_slime_count(0, 0, true), 2, "cramming disabled");
+        assert_eq!(oozing_on_death_slime_count(0, 24, false), 0);
+
+        // Weaving: 2..=3 unique offsets inside the 3x3x3 death cell.
+        for seed in 0..64u64 {
+            let offsets = weaving_on_death_cobweb_offsets(seed, true);
+            assert!((2..=3).contains(&offsets.len()), "seed {seed}");
+            let mut unique = offsets.clone();
+            unique.sort_unstable();
+            unique.dedup();
+            assert_eq!(unique.len(), offsets.len(), "seed {seed} duplicated a cell");
+            for &(dx, dy, dz) in &offsets {
+                assert!((-1..=1).contains(&dx) && (-1..=1).contains(&dy) && (-1..=1).contains(&dz));
+            }
+            assert_eq!(offsets, weaving_on_death_cobweb_offsets(seed, true));
+        }
+        assert!(weaving_on_death_cobweb_offsets(7, false).is_empty());
+
+        // Wind Charged: 3.5-block burst radius, nothing without the carrier.
+        assert_eq!(wind_charged_on_death_burst_radius(true), 3.5);
+        assert_eq!(wind_charged_on_death_burst_radius(false), 0.0);
+    }
+
+    #[test]
+    fn v1211_tick_effects_composes_invisible_glowing_flag_byte_live() {
+        let (client, _receiver) = crate::effect_tests::client_pair();
+        effect_runtime_states()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clear();
+        *client.sneaking.lock().unwrap_or_else(|e| e.into_inner()) = true;
+        let summary = summarize_active_effects(&[(14, 0), (24, 0)]);
+        assert_eq!(effect_shared_flags(&client, &summary), 0x02 | 0x20 | 0x40);
+        *client.sprinting.lock().unwrap_or_else(|e| e.into_inner()) = true;
+        *client.fall_fly.lock().unwrap_or_else(|e| e.into_inner()) = true;
+        assert_eq!(effect_shared_flags(&client, &summary), 0x02 | 0x08 | 0x20 | 0x40 | 0x80);
+        assert_eq!(effect_shared_flags(&client, &summarize_active_effects(&[])), 0x0a | 0x80);
+    }
+
+    #[test]
+    fn v1211_tick_effects_death_edge_runs_oozing_and_weaving_live() {
+        let (client, _receiver) = crate::effect_tests::client_pair();
+        effect_runtime_states()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clear();
+        *client.pos.lock().unwrap_or_else(|e| e.into_inner()) =
+            (47_000.5, 200.0, 47_000.5, 0.0, 0.0, false);
+        // First tick alive latches `dead=false`; the second observes the edge.
+        client
+            .effs
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .push(Eff { id: 37, amp: 0, left: 600 });
+        client
+            .effs
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .push(Eff { id: 36, amp: 0, left: 600 });
+        tick_effects(&client);
+        *client.hp.lock().unwrap_or_else(|e| e.into_inner()) = 0.0;
+        tick_effects(&client);
+
+        let spawned: Vec<i32> = mobs()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .iter()
+            .filter(|m| m.etype == SLIME_ETYPE && {
+                let (mx, my, mz, ..) = *m.pos.lock().unwrap_or_else(|e| e.into_inner());
+                (mx - 47_000.5).abs() < 2.0 && (my - 200.0).abs() < 2.0 && (mz - 47_000.5).abs() < 2.0
+            })
+            .map(|m| m.eid)
+            .collect();
+        assert!(
+            (1..=2).contains(&spawned.len()),
+            "oozing releases up to two medium slimes, got {spawned:?}"
+        );
+        for eid in &spawned {
+            let states = live_mob_states().lock().unwrap_or_else(|e| e.into_inner());
+            let state = states.get(eid).expect("slime state");
+            assert!(
+                matches!(
+                    state.behavior,
+                    Some(MobBehaviorState::Slime { behavior, .. })
+                        if behavior.size == SlimeSize::Medium
+                ),
+                "oozing releases medium slimes"
+            );
+        }
+        for eid in spawned {
+            remove_live_mob(eid);
+        }
+
+        let web = name_to_state("cobweb").unwrap();
+        let (bx, by, bz) = (47_000, 200, 47_000);
+        let mut placed = Vec::new();
+        for dx in -1..=1 {
+            for dy in -1..=1 {
+                for dz in -1..=1 {
+                    if block_at_dim(DimId::Overworld, bx + dx, by + dy, bz + dz) == web {
+                        placed.push((bx + dx, by + dy, bz + dz));
+                    }
+                }
+            }
+        }
+        assert!(
+            (2..=3).contains(&placed.len()),
+            "weaving scatters 2..=3 cobwebs, got {placed:?}"
+        );
+        for (x, y, z) in placed {
+            set_block_dim(DimId::Overworld, x, y, z, 0);
+        }
+    }
+
+    #[test]
+    fn v1211_tick_effects_fall_from_tracks_slow_falling_and_levitation() {
+        let (client, _receiver) = crate::effect_tests::client_pair();
+        effect_runtime_states()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clear();
+        *client.pos.lock().unwrap_or_else(|e| e.into_inner()) =
+            (0.0, 64.0, 0.0, 0.0, 0.0, false);
+        *client.fall_from.lock().unwrap_or_else(|e| e.into_inner()) = 120.0;
+        client
+            .effs
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .push(Eff { id: 27, amp: 0, left: 600 });
+        tick_effects(&client);
+        assert_eq!(
+            *client.fall_from.lock().unwrap_or_else(|e| e.into_inner()),
+            64.0,
+            "slow falling keeps fall distance at the live height"
+        );
+        *client.effs.lock().unwrap_or_else(|e| e.into_inner()) =
+            vec![Eff { id: 24, amp: 0, left: 600 }];
+        *client.fall_from.lock().unwrap_or_else(|e| e.into_inner()) = 120.0;
+        tick_effects(&client);
+        assert_eq!(
+            *client.fall_from.lock().unwrap_or_else(|e| e.into_inner()),
+            64.0,
+            "levitation re-arms the fall base while rising"
+        );
+        *client.effs.lock().unwrap_or_else(|e| e.into_inner()) = vec![Eff { id: 1, amp: 0, left: 600 }];
+        *client.fall_from.lock().unwrap_or_else(|e| e.into_inner()) = 120.0;
+        tick_effects(&client);
+        assert_eq!(
+            *client.fall_from.lock().unwrap_or_else(|e| e.into_inner()),
+            120.0,
+            "unrelated effects leave fall_from alone"
+        );
+    }
+
+    #[test]
+    fn v1211_infested_spawn_releases_the_rolled_silverfish_count() {
+        let (client, _receiver) = crate::effect_tests::client_pair();
+        *client.pos.lock().unwrap_or_else(|e| e.into_inner()) =
+            (48_000.5, 210.0, 48_000.5, 0.0, 0.0, false);
+        let before: HashSet<i32> = mobs()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .iter()
+            .map(|m| m.eid)
+            .collect();
+        spawn_infested_silverfish(&client, 2);
+        let spawned: Vec<i32> = mobs()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .iter()
+            .filter(|m| m.etype == SILVERFISH_ETYPE && !before.contains(&m.eid))
+            .map(|m| m.eid)
+            .collect();
+        assert_eq!(spawned.len(), 2);
+        for eid in spawned {
+            remove_live_mob(eid);
+        }
+        spawn_infested_silverfish(&client, 0);
+        let after: HashSet<i32> = mobs()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .iter()
+            .map(|m| m.eid)
+            .collect();
+        assert_eq!(after, before, "a zero roll spawns nothing");
+    }
+
+    #[test]
+    fn v1211_wind_charged_death_burst_knocks_back_live_mobs() {
+        let mob = new_live_mob(
+            SLIME_ETYPE,
+            DimId::Overworld,
+            (49_001.5, 200.0, 49_000.5, 0.0, 0.0),
+            4.0,
+            Some(SlimeSize::Medium),
+        );
+        let eid = mob.eid;
+        mobs().lock().unwrap_or_else(|e| e.into_inner()).push(mob.clone());
+        wind_charged_death_burst(DimId::Overworld, [49_000.5, 200.5, 49_000.5], 3.5);
+        let (mx, ..) = *mob.pos.lock().unwrap_or_else(|e| e.into_inner());
+        assert!(mx > 49_001.5, "the burst pushes the mob away, got {mx}");
+        remove_live_mob(eid);
     }
 }
