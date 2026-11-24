@@ -67,6 +67,12 @@
 //!   covering the exact Vanilla `(2d + 1)^2` square, and a hash-verified
 //!   `SBC1` startup datapack/registry binary cache that fails closed to a
 //!   clean miss on any stale or corrupted input.
+//! * [`server_tui`] — the native smart server console: the
+//!   `--cli`/`--tui`/`--no-banner` mode resolver that fails closed to plain
+//!   passthrough off a real terminal, the log-line decoder and noise-filtered
+//!   categorized log, the pinned three-line HUD renderer
+//!   ([`server_tui::ServerTuiState::render_frame`]), and the interactive key
+//!   map — a pure-`std` port of `tools/megu_tui.py`.
 
 pub mod admin_cli;
 pub mod atomic;
@@ -83,6 +89,7 @@ pub mod pack_loader;
 pub mod pack_router;
 pub mod perf_cache;
 pub mod properties;
+pub mod server_tui;
 pub mod usercache;
 
 pub use atomic::write_atomic;
@@ -134,5 +141,11 @@ pub use perf_cache::{
 pub use properties::{
     can_see_player_on_radar, players_are_party_or_allies, MalformedEscape, MinimapMode,
     PlayerRadarScope, PropertiesFile, ServerFairPlayPolicy, ServerProperties, PROPERTIES_FILE,
+};
+pub use server_tui::{
+    ansi_color_ok, is_banner_line, resolve_console_mode, resolve_console_mode_env, sparkline,
+    startup_banner, strip_ansi, vlen, ConsoleModeOptions, DualLoader, Hotspot, LogCategory,
+    LogEntry, LogFilterMode, LogLineKind, ModCounts, ModDetail, ServerConsoleMode,
+    ServerTuiState, TuiAction, TuiKey, TuiView, BANNER_ASCII, BANNER_UNICODE,
 };
 pub use usercache::{UserCache, UserCacheEntry, DEFAULT_CAPACITY, USERCACHE_FILE};
